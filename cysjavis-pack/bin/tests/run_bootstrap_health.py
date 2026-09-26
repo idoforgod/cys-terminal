@@ -7595,7 +7595,16 @@ def h_time_1():
     osrc = _read(os.path.join(BIN_DIR, "javis_orchestra.py"))
     need("_boot_node_outer_timeout()" in osrc, "_boot_one_node 가 예산 파생 외부 상한을 쓰지 않는다")
     need("timeout=130" not in osrc, "_boot_one_node 에 하드코딩 130s 잔존")
-    notes.append("소비처 하드코딩 timeout 제거")
+    # ★R3-2: phoenix spawn_production 의 `cys restore` 상한 — 종전 고정 90s(로스터 크기를 모르는 외부 상한)의
+    #   회귀 차단. 상한은 javis_budget.cys_restore_outer_s(단위) 파생만 쓴다.
+    psrc = _read(os.path.join(BIN_DIR, "javis_phoenix.py"))
+    pbody = _slice_between(psrc, "def spawn_production(", "\ndef spawn_fresh_production(",
+                           "H-TIME-1 phoenix spawn_production")
+    need(re.search(r"timeout\s*=\s*90\b", pbody) is None,
+         "phoenix spawn_production 에 하드코딩 90s 잔존(역할 수를 모르는 외부 상한 — S27b H5 4/8 유실)")
+    need("restore_spawn_timeout_s(" in pbody and "b.cys_restore_outer_s(" in psrc,
+         "phoenix `cys restore` 상한이 javis_budget 파생값을 쓰지 않는다")
+    notes.append("소비처 하드코딩 timeout 제거(phoenix restore 포함)")
     # ⓔ 데드라인 전파 — 하위가 자기 예산을 안다(내부 최악치 유계화·감액 0)
     need('"--timeout", "%.0f" % inner' in osrc, "boot_node 에 데드라인이 전파되지 않는다")
     bnsrc = _read(os.path.join(BIN_DIR, "javis_boot_node.py"))
@@ -7608,7 +7617,8 @@ def h_time_1():
     need("⑤check 재시도" in bsrc, "⑤ 재시도 하트비트가 없다")
     csrc = _repo_file(os.path.join("src", "bin", "cys.rs"))
     need("BUDGET_HEARTBEAT_INTERVAL_SECS" in csrc, "cys boot 하트비트 상수가 없다")
-    notes.append("하트비트 3지점(stderr)")
+    need("_spawn_heartbeat(" in pbody, "phoenix `cys restore` 대기(단위 비례 상한)에 진행 하트비트가 없다")
+    notes.append("하트비트 4지점(stderr 3 · phoenix 로그 1)")
     # ⓖ cysd 감독자 상수가 파리티 표에 **등재돼 있는가**(값 대조는 짝 검체 H-PRED-6 ⓓ 가 한다).
     #   ★이 축의 이유(2026-09-05 · master 지시): 감독자 임계가 표 밖에 있으면 python 이 값을 바꿔도
     #     조용히 드리프트한다 — 등재 자체가 무측정 방지의 첫 관문이다.

@@ -46,12 +46,42 @@ cys_require_surface
 if [ ! -t 0 ] && command -v cys >/dev/null 2>&1 && [ -n "$CYS_PY" ]; then
   # readline 한정 — stdin 전량 소비로 같은 stdin을 보는 후속 처리를 굶기지 않는다
   # (hook 입력 JSON은 단일 라인)
-  TP=$("$CYS_PY" -c 'import sys,json
+  # ★R3-1(0.14.42) 같은 한 줄에서 `source` 도 읽는다 — `<source>|<transcript_path>` 한 줄(source 는 알려진 값만,
+  #   아니면 빈 값). 경로 쪽 꼬리는 종전 `print(transcript_path)` 와 같은 바이트다(첫 `|` 뒤 전부 = 경로).
+  #   transcript_path 가 null 이면 빈 값 → 호출 0(종전은 문자열 "None" 으로 불러 데몬이 거부했다).
+  #   /clear 면 데몬이 resume 핀을 새 세션으로 바꾼다(좌석 최상위 claude 로 증명될 때만 — 판정은 데몬).
+  #   clear 가 아닌 SessionStart 는 종전 호출 그대로다(바이트 동일).
+  #   clear 호출의 실패 처리(실패 방향 = 종전 동작, 핀은 옛 대화로 남는다):
+  #   · 상한 10s(`cys_timeout_run` · 타임아웃 rc 124). 종전 단일 호출은 RPC 무진행 상한 40s 가 전부였다 — 이 훅의
+  #     뒤 단계(역할 예산 12s·--version 3s·claim 2s)와 합쳐 SessionStart 상한(30s) 안에 들게 한다.
+  #   · `CYS_NO_AUTOSTART=1` — 역할 조회 블록과 같은 규약(세션 시작 훅이 내려간 데몬을 되살리지 않는다).
+  #   · 플래그 없이 다시 부르는 것은 **rc 2 일 때만**: 옛 cys 가 `--source` 를 모르면 clap 사용 오류 rc 2 다.
+  #     요청 실패(데몬 오류·거부·데몬 부재)는 rc 1, 타임아웃은 124 — 그때 다시 부르면 같은 대기를 한 번 더 할 뿐이다.
+  #     rc 2 의 다른 원천(autostart 거절 · EXIT_AUTOSTART_REFUSED)은 즉시 끝나므로 재호출도 즉시 끝난다.
+  #   · rc 는 호출 바로 다음 줄에서 한 번만 읽는다(사이에 낀 명령이 `$?` 의 주인이 된다).
+  SS=$("$CYS_PY" -c 'import sys,json
 try:
-    print(json.loads(sys.stdin.readline()).get("transcript_path",""))
+    d=json.loads(sys.stdin.readline())
+    s=d.get("source")
+    s=s if s in ("startup","resume","clear","compact") else ""
+    print(s+"|"+str(d.get("transcript_path") or ""))
 except Exception:
     print("")' 2>/dev/null)
-  [ -n "$TP" ] && cys usage-register --transcript "$TP" >/dev/null 2>&1
+  SS_SRC=${SS%%|*}
+  TP=${SS#*|}
+  if [ -n "$TP" ]; then
+    if [ "$SS_SRC" = clear ]; then
+      ( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
+        cys_timeout_run 10 cys usage-register --transcript "$TP" --source clear </dev/null >/dev/null 2>&1 )
+      CYS_UR_RC=$?
+      if [ "$CYS_UR_RC" -eq 2 ]; then
+        ( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART
+          cys_timeout_run 10 cys usage-register --transcript "$TP" </dev/null >/dev/null 2>&1 )
+      fi
+    else
+      cys usage-register --transcript "$TP" >/dev/null 2>&1
+    fi
+  fi
 fi
 
 # ── G8: 부트 브리지 안내 명령을 **실행 가능한 문자열**로 조립 ──

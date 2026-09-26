@@ -293,6 +293,13 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     "scripts/deploy_gate.py",
     "scripts/installer-app/install-core.sh",
     "scripts/precompile-bundled-python.sh",
+    # ★2026-09-26 등재(0.14.42 · 11b8ddd9 FATAL-1 이 넣은 검체 — 그 뒤 이 census 가 5개 CI 팩 루프에서 적색이었다.
+    #   6371f8bd 기준에서도 같은 FAIL 1건이므로 R3 가 만든 적색이 아니다). **봉인 점검 결과(등재 = 이 선언)**:
+    #   새 python 진입점도 제품 강제점도 **아니다**. 이 검체가 띄우는 것은 샌드박스 cysd(Rust)·트립와이어 `cys`
+    #   스텁(sh)·`/bin/ps` 뿐이고, 니들은 그 샌드박스 env 를 짜는 한 줄(`PYTHONDONTWRITEBYTECODE="1"`)이다 —
+    #   `os.environ` 복사본 위에 봉인을 **상속 방향으로** 다시 건다(cysd 가 팩 python 을 띄워도 캐시를 쓰지 않게 ·
+    #   test_lane_redirect·test_role_authority_shell 과 같은 계급). 벗기는 줄은 0이다.
+    "scripts/tests/test_cysd_dispatch_storm_e2e.py",
     "scripts/verify-gatekeeper-user-path.sh",
     "src-tauri/src/main.rs",
     "src/app_bundle.rs",

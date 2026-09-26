@@ -118,6 +118,12 @@ enum Command {
         transcript: String,
         #[arg(long)]
         surface: Option<String>,
+        /// ★R3-1(0.14.42) SessionStart 훅 입력의 `source`(startup|resume|clear|compact). `clear` 면 데몬이 resume
+        /// 핀을 새 세션으로 교체할지 판정한다(좌석 최상위 claude 로 증명될 때만). 이 플래그를 모르는 옛 cys 는 clap
+        /// 사용 오류(rc 2)로 끝난다 — 훅은 **rc 2 일 때만** 플래그 없이 한 번 더 부른다(요청 실패 rc 1 은 재호출 없음).
+        /// 옛 데몬은 params 의 `source` 키를 무시한다.
+        #[arg(long)]
+        source: Option<String>,
     },
     /// T5 Phase 2-A: claude statusline stdin JSON을 읽어 usage.report로 push (cys-statusline.sh 전용 plumbing)
     UsageReportStdin {
@@ -4518,13 +4524,13 @@ fn run(command: Command) -> i32 {
             })
         }
 
-        Command::UsageRegister { transcript, surface } => {
+        Command::UsageRegister { transcript, surface, source } => {
             target_surface(&surface, &None).and_then(|sid| {
-                request(
-                    "usage.register",
-                    json!({"surface_id": sid, "transcript": transcript}),
-                )
-                .map(|_| println!("OK"))
+                let mut params = json!({"surface_id": sid, "transcript": transcript});
+                if let Some(src) = source {
+                    params["source"] = json!(src);
+                }
+                request("usage.register", params).map(|_| println!("OK"))
             })
         }
 
@@ -27147,6 +27153,67 @@ mod tests {
             assert!(!screen_is_bare_shell_on(&screen, false), "맨 셸로 읽힌다: {screen:?}");
             assert!(cys::readiness::composer_edit_region_empty(&screen, ">", None), "유휴 composer 판정이 깨졌다: {screen:?}");
         }
+    }
+
+    /// ★R3-1(0.14.42): `usage-register --source clear` 파싱 · 부재 시 None(params 에 키 없음) · 옛 CLI 스큐는 clap
+    /// 사용 오류 **rc 2** 다 — 훅(session-start.sh)이 플래그 없는 재호출을 rc 2 에만 거는 근거를 박는다.
+    /// 훅 본문: clear 경로 두 호출은 모두 `CYS_NO_AUTOSTART=1` 서브셸 + 10s 상한 · rc 는 첫 호출 바로 다음 줄에서
+    /// 포획 · 재호출은 rc 2 분기 안에만 · clear 가 아닌 SessionStart 는 종전 호출 그대로.
+    #[test]
+    fn r3_1_usage_register_source_flag_and_hook_fallback_contract() {
+        use clap::Parser;
+        match Cli::try_parse_from(["cys", "usage-register", "--transcript", "/x/a.jsonl", "--source", "clear"])
+            .map(|c| c.command)
+        {
+            Ok(Command::UsageRegister { transcript, surface, source }) => {
+                assert_eq!(transcript, "/x/a.jsonl");
+                assert!(surface.is_none());
+                assert_eq!(source.as_deref(), Some("clear"));
+            }
+            Ok(_) => panic!("다른 명령으로 파싱됐다"),
+            Err(e) => panic!("--source 가 파싱되지 않는다: {e}"),
+        }
+        match Cli::try_parse_from(["cys", "usage-register", "--transcript", "/x/a.jsonl"]).map(|c| c.command) {
+            Ok(Command::UsageRegister { source, .. }) => assert!(source.is_none(), "부재인데 값이 생겼다"),
+            _ => panic!("종전 형태가 파싱되지 않는다"),
+        }
+        let e = match Cli::try_parse_from(["cys", "usage-register", "--transcript", "/x/a.jsonl", "--source-x", "clear"]) {
+            Err(e) => e,
+            Ok(_) => panic!("알 수 없는 인자가 통과했다"),
+        };
+        assert_eq!(e.exit_code(), 2, "옛 CLI 스큐 rc 가 2 가 아니다 — 훅의 rc 2 한정 폴백 근거가 무너진다");
+        assert_eq!(EXIT_AUTOSTART_REFUSED, 2, "autostart 거절 rc — 훅 폴백과 겹치지만 즉시 끝나는 경로");
+
+        let sh = include_str!("../../cysjavis-pack/hooks/session-start.sh");
+        let code: Vec<&str> = sh.lines().filter(|l| !l.trim_start().starts_with('#')).collect();
+        let code = code.join("\n");
+        let first = code
+            .find("cys_timeout_run 10 cys usage-register --transcript \"$TP\" --source clear </dev/null")
+            .expect("clear 경로 호출(10s 상한 · --source clear) 소실");
+        let rc_cap = first + code[first..].find("CYS_UR_RC=$?").expect("clear 호출 rc 포획 소실");
+        assert_eq!(
+            code[first..rc_cap].matches('\n').count(),
+            1,
+            "rc 포획이 첫 호출 바로 다음 줄이 아니다 — 사이에 낀 명령이 $? 의 주인이 된다"
+        );
+        let gate = code.find("if [ \"$CYS_UR_RC\" -eq 2 ]; then").expect("재호출이 rc 2 한정이 아니다");
+        let fallback = code
+            .find("cys_timeout_run 10 cys usage-register --transcript \"$TP\" </dev/null")
+            .expect("rc 2 재호출(플래그 없음) 소실");
+        assert!(rc_cap < gate && gate < fallback, "재호출이 rc 2 분기 밖에 있다");
+        let calls: Vec<usize> = code.match_indices("cys_timeout_run 10 cys usage-register").map(|(i, _)| i).collect();
+        assert_eq!(calls.len(), 2, "clear 경로 호출 수가 2(본 호출 + rc 2 재호출)가 아니다");
+        for i in calls {
+            assert!(
+                code[..i].trim_end().ends_with("( CYS_NO_AUTOSTART=1; export CYS_NO_AUTOSTART"),
+                "clear 경로 호출이 NO_AUTOSTART 서브셸 밖에 있다"
+            );
+        }
+        assert_eq!(
+            code.matches("cys usage-register --transcript \"$TP\" >/dev/null 2>&1").count(),
+            1,
+            "clear 가 아닌 SessionStart 의 종전 호출이 바이트 그대로 1곳이 아니다"
+        );
     }
 
     /// ★0.14.42 agy 자동 연결: 연결 명령(`hooks/cys-agy-statusline.sh`)이 부르는 `usage-report-stdin --agy` 가 파싱된다 ·

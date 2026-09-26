@@ -2,10 +2,12 @@
 # 50-state-ledger.sh — PostToolUse.d 오버레이 (설계 §2 컴포넌트 3 배선 1·2·3 · 구현물 4a)
 #
 # 설치 위치: ~/.cys/local/hooks/PostToolUse.d/50-state-ledger.sh
-#   → 팩 cys-hook.sh(17-28행)가 hook_event_name 으로 디렉터리를 고르고 `sh "$f"` 로 후행 실행한다.
+#   → 팩 cys-hook.sh 의 '사용자 로컬 훅 오버레이' 절이 hook_event_name 으로 디렉터리를 고르고 `sh "$f"` 로 후행 실행한다.
+#     (행 번호 대신 절 이름으로 가리킨다 — 0.14.42 R3-4 에서 머리에 빠른 길이 들어와 행이 밀렸다. 오버레이 디렉터리가
+#      하나라도 있으면 cys-hook.sh 는 빠른 길을 건너뛰고 이 종전 경로로 돈다 — 이 파일이 설치된 좌석이 그렇다.)
 #     stdin = 훅 JSON 원문, stdout 은 러너가 /dev/null 로 폐기, exit code 는 무시(|| true).
 #
-# ★불변 상속(OBSERVABILITY 클래스 — cys-hook.sh 6-12행):
+# ★불변 상속(OBSERVABILITY 클래스 — cys-hook.sh 머리 주석의 ★불변):
 #   이 훅은 절대 에이전트를 막지 않는다. 모든 실패를 무해히 흘리고 항상 exit 0, 1초 내 종료.
 #   판정 실패·도구 부재·git 부재는 전부 '기록 안 함'으로 강등된다(fail-quiet).
 #

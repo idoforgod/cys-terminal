@@ -43,6 +43,7 @@ sleep)이 가정치와 어긋나 실효 대기가 25%+α 로 오차났다. 벽�
   python3 javis_budget.py --self-test
 """
 import json
+import math
 import os
 import sys
 
@@ -191,6 +192,72 @@ def launch_per_node_worst_s():
             + _leaf("RPC_SLACK_S"))
 
 
+# ★R3-2(0.14.42 · S27b H5): phoenix `spawn_production` 이 `cys restore` 에 씌우는 외부 상한 —
+#   **기동 단위 수 비례**. `cys restore`(cys.rs run_restore)는 죽은 역할을 **순차**로 세운다. phoenix 는
+#   그것을 고정 90s 로 감싸 로스터 크기를 모르는 역전이 남아 있었다(좌석 8 · 기동 15s → 역할당 ~23s × 8
+#   ≈ 184s 를 90s 에 SIGKILL · 뒤 4역할 유실 2/2회).
+#   ★항목별 Rust 앵커(한 항이라도 빠지면 과소계상 = 이 모듈이 없애려는 조기실패의 씨앗 — 계측 핀은
+#     tests/test_phoenix_r32_restore_budget.py ⑦ 이 cys.rs 소스와 대조한다):
+#     · 락 대기   : acquire_launch_lock 의 데드라인 = BUDGET_TICK_MS × 4 (역할마다 1회 · 좌석 내 경로도 1회)
+#     · readiness : budget_readiness_max(restore=true) = 캡 20s, 그리고 `while now < deadline { sleep(TICK) … }`
+#                   구조라 데드라인 직전에 들어간 마지막 틱이 **틱 1회만큼 넘친다**
+#     · 폴더신뢰  : Return 1발 뒤 BUDGET_TRUST_SETTLE_SECS (U-15 · 1발)
+#     · 안착      : BUDGET_POST_MARKER_SETTLE_SECS
+#     · ack       : BUDGET_ACK_WAIT_SECS, 같은 `while … sleep(TICK)` 구조라 틱 1회 넘침
+#     · RPC 여유  : 비유계 RPC 왕복(request() 는 읽기 상한 없음) + 주입 800ms 등 잔여 granularity
+#   ★빈 좌석 역할은 **2단위**다: 좌석 내 재연결이 LaunchFailed/Err 로 끝나면 같은 역할을 fresh
+#     (run_launch_agent_opts)로 다시 세운다 — 락 2회 · 기동 2회(cys.rs run_restore 의 in-seat 분기).
+#     단위 수는 phoenix 가 `cys restore` 와 같은 재료(topology.json entries + 생존 관측)로 센다.
+RESTORE_OUTER_FLOOR_S = 90          # 종전 리터럴(javis_phoenix.spawn_production 의 `timeout=90`) — 1단위 이하 불변
+RESTORE_REF_UNITS = 8               # 표·파리티 표기용 참조 로스터 = S27b H5 좌석 8(측정된 최대) — 집행값 아님
+
+
+def _tick_s():
+    return _leaf("LAUNCH_TICK_MS") / 1000.0
+
+
+def launch_lock_wait_max_s():
+    """acquire_launch_lock 유계 대기(cys.rs: `Instant::now() + from_millis(BUDGET_TICK_MS * 4)`)."""
+    return 4 * _tick_s()
+
+
+def restore_boot_once_worst_s():
+    """boot_agent_on_surface(restore=true) **1회**의 최악치 — 위 항목표에서 락을 뺀 합."""
+    return (launch_readiness_max_s(restore=True) + _tick_s()
+            + _leaf("LAUNCH_TRUST_SETTLE_S")
+            + _leaf("LAUNCH_POST_MARKER_SETTLE_S")
+            + _leaf("LAUNCH_ACK_WAIT_S") + _tick_s()
+            + _leaf("RPC_SLACK_S"))
+
+
+def restore_unit_worst_s():
+    """기동 1단위 = boot 락 대기 + 기동 1회. 죽은 역할 1개 = 1단위, 빈 좌석이 있는 역할 = 2단위."""
+    return launch_lock_wait_max_s() + restore_boot_once_worst_s()
+
+
+def cys_restore_inner_worst_s(units):
+    return max(1, int(units)) * restore_unit_worst_s()
+
+
+def cys_restore_outer_s(units):
+    """phoenix `spawn_production` 의 `cys restore` timeout(초) — Σ단위 최악치 + 마진, 하한 = 종전 90s."""
+    inner = cys_restore_inner_worst_s(units)
+    return int(math.ceil(max(RESTORE_OUTER_FLOOR_S, inner + _margin(inner))))
+
+
+def cys_restore_stall_s():
+    """★리뷰 F1·W4(0.14.42): phoenix 가 `cys restore` 에 씌우는 **무출력 상한**(초) — 진행 기반 행 판정.
+    cys_restore_outer_s 는 단위 수에 선형이고 절대 캡이 없다(45단위 ≈ 3078s). `cys restore` 가 멈추면(request() 는
+    읽기 상한이 없다) phoenix 는 공유 restore.lease 를 쥔 채 그만큼 기다리고, 그동안 cysd role.reclaim_auto 는 하드
+    Defer 다. 절대 캡은 큰 로스터의 정상 진행을 다시 자른다(R3-2 가 고친 유실). 그래서 **진행**을 본다:
+    run_restore(cys.rs)는 역할마다 기동 **전에** 한 줄을 찍는다(`· {role}: … 좌석 내 재연결…` · `… 재기동…` ·
+    폴백 줄) — 정상 진행의 무출력 창은 기동 1단위 최악치(락 대기 + 기동 1회)를 넘지 않는다.
+    = max(종전 90, 단위 최악치 + 마진). 하한이 종전 고정 상한이라 **한 창이 받는 시간은 종전 실행 전체가 받던
+    시간 이상**이다(현 leaf 에서 단위 57s + 마진 20 = 77 → 90)."""
+    unit = restore_unit_worst_s()
+    return int(math.ceil(max(RESTORE_OUTER_FLOOR_S, unit + _margin(unit))))
+
+
 def cys_boot_inner_worst_s():
     return _leaf("PLAN_ROLE_COUNT") * launch_per_node_worst_s()
 
@@ -248,6 +315,10 @@ def parity_pairs():
         ("boot-reviewers 슬롯합 ⊂ ④-b timeout",
          boot_reviewers_inner_worst_s(), boot_reviewers_outer_s()),
         ("cys boot 노드합 ⊂ ④ timeout", cys_boot_inner_worst_s(), cys_boot_outer_s()),
+        # ★R3-2: 구성상 참인 표기 쌍이다(outer = inner + 마진). 반증 가능한 검사는 단위 최악치를 cys.rs
+        #   소스와 대조하는 핀(test_phoenix_r32_restore_budget ⑦)과 phoenix 집행 경로 핀(H-TIME-1 ⓓ)이다.
+        ("cys restore %d단위(참조) ⊂ phoenix spawn timeout" % RESTORE_REF_UNITS,
+         cys_restore_inner_worst_s(RESTORE_REF_UNITS), cys_restore_outer_s(RESTORE_REF_UNITS)),
     ]
 
 
@@ -280,6 +351,15 @@ def table():
             "LAUNCH_PER_NODE_WORST_S": launch_per_node_worst_s(),
             "CYS_BOOT_INNER_WORST_S": cys_boot_inner_worst_s(),
             "CYS_BOOT_OUTER_S": cys_boot_outer_s(),
+            # ★R3-2: 단위 최악치와 하한만 싣는다. 실제 상한은 **실행마다** 단위 수로 정해지므로 로스터 총합을
+            #   하나의 숫자로 싣지 않는다(읽는 쪽이 그 숫자를 현재 상한으로 읽는다). 참조값은 이름에 REF 를 단다.
+            "LAUNCH_LOCK_WAIT_MAX_S": launch_lock_wait_max_s(),
+            "RESTORE_BOOT_ONCE_WORST_S": restore_boot_once_worst_s(),
+            "RESTORE_UNIT_WORST_S": restore_unit_worst_s(),
+            "RESTORE_OUTER_FLOOR_S": RESTORE_OUTER_FLOOR_S,
+            "CYS_RESTORE_OUTER_REF_S": cys_restore_outer_s(RESTORE_REF_UNITS),
+            "RESTORE_REF_UNITS": RESTORE_REF_UNITS,
+            "RESTORE_STALL_S": cys_restore_stall_s(),
             "PING_RETRY_WORST_S": ping_retry_worst_s(),
             "CHECK_WINDOW_S": check_window_s(),
             "CHECK_INNER_WORST_S": check_inner_worst_s(),
@@ -417,6 +497,28 @@ def self_test():
             assert _leaf("BOOT_NODE_TOTAL_S") == 200, "leaf 증액이 막혔다(외부 증액 방향 차단)"
         finally:
             del os.environ[_ENV_PREFIX + "BOOT_NODE_TOTAL_S"]
+        # ⑤-b ★R3-2: `cys restore` 외부 상한 — 하한은 종전 90 이상(정당한 leaf 상향이면 1단위도 90 을 넘을 수
+        #   있으므로 '==' 가 아니라 '>='), 단위 수에서 파생되며(참조 > 1), 단위 최악치가 Rust 구조 항을 모두 진다.
+        assert cys_restore_outer_s(1) >= RESTORE_OUTER_FLOOR_S, "restore 하한이 종전 90 미만(부트 도중 절단 회귀)"
+        # ⑤-c ★리뷰 F1: 무출력 상한은 정상 진행의 최대 무출력 창(기동 1단위)보다 크고, 하한이 종전 90 이다.
+        assert cys_restore_stall_s() >= max(RESTORE_OUTER_FLOOR_S, restore_unit_worst_s()), \
+            "restore 무출력 상한이 1단위 최악치·종전 90 미만(정상 진행을 행으로 오판해 자른다)"
+        assert cys_restore_outer_s(RESTORE_REF_UNITS) > cys_restore_outer_s(1), \
+            "restore 상한이 단위 수에서 파생되지 않는다(고정 상한 회귀)"
+        assert abs(restore_unit_worst_s() - restore_boot_once_worst_s() - launch_lock_wait_max_s()) < 1e-9 \
+            and launch_lock_wait_max_s() >= 4 * _tick_s(), "restore 단위에 boot 락 대기(TICK×4)가 없다"
+        assert restore_boot_once_worst_s() >= (launch_readiness_max_s(restore=True) + _leaf("LAUNCH_ACK_WAIT_S")
+                                               + 2 * _tick_s()), \
+            "restore 기동 1회에 readiness 캡·ack 창·틱 넘침(2회)이 다 들어 있지 않다"
+        _prev = os.environ.get(_ENV_PREFIX + "RPC_SLACK_S")
+        os.environ[_ENV_PREFIX + "RPC_SLACK_S"] = "40"
+        try:
+            assert cys_restore_outer_s(1) > RESTORE_OUTER_FLOOR_S, "leaf 상향이 restore 상한에 반영되지 않는다"
+        finally:
+            if _prev is None:
+                del os.environ[_ENV_PREFIX + "RPC_SLACK_S"]
+            else:
+                os.environ[_ENV_PREFIX + "RPC_SLACK_S"] = _prev
         # ⑤ restore 캡이 일반 상한을 넘지 않는다.
         assert launch_readiness_max_s(restore=True) <= launch_readiness_max_s(), \
             "restore 캡이 일반 readiness 상한 초과"

@@ -453,6 +453,49 @@ pub fn agent_alive_tri(has_meta: bool, seen: bool, exit_notified: bool) -> Optio
     Some(!exit_notified)
 }
 
+/// ★(0.14.42 · perf R3-6) 좌석 셸 pid 들의 **지금** 작업 디렉터리(`live_cwd`) — surface.list · org.status ·
+/// 좌석 회수 호출자 축의 **단일 관측**이다(사본 금지: 셋이 갈리면 GUI 제목 · 진행% · 회수 판정이
+/// 서로 다른 사실을 본다 — 핀 `live_cwd_goes_through_single_helper`).
+///
+/// 판독기만 OS·노브별로 다르다(`walk_caller_ancestry` 와 같은 모양 · 같은 노브):
+/// · macOS 기본: pid 마다 `state::proc_cwd`(PROC_PIDVNODEPATHINFO 1회 — libproc 직접 호출은 state.rs 한
+///   곳에 모은다). 종전 sysinfo 경로는 cwd 하나를 얻으려고 호출마다 전 프로세스 표와 좌석 argv·env
+///   전체를 읽었다.
+/// · 그 밖의 OS 와 노브 `CYS_PROC_PROBE_FAST=0`: 종전 sysinfo 경로 **그대로**(`live_cwds_legacy`).
+/// 실패 방향: 못 읽은 pid 는 결과에 없다 → 소비자는 `live_cwd: null`('모름')로 접는다(종전과 같다).
+/// 블로킹 syscall 이므로 **어떤 락도 쥐지 않고** 부른다.
+fn live_cwds(pids: &[u32]) -> std::collections::HashMap<u32, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if crate::state::proc_probe_fast_enabled() {
+            return pids
+                .iter()
+                .filter_map(|&p| crate::state::proc_cwd(p).map(|c| (p, c)))
+                .collect();
+        }
+    }
+    live_cwds_legacy(pids)
+}
+
+/// 종전 판독기(전 OS) — sysinfo `ProcessesToUpdate::Some` + cwd 만 명시 조회(cd 추적 = Always).
+fn live_cwds_legacy(pids: &[u32]) -> std::collections::HashMap<u32, String> {
+    let sp: Vec<sysinfo::Pid> = pids.iter().map(|p| sysinfo::Pid::from_u32(*p)).collect();
+    let mut sys = sysinfo::System::new();
+    // 기본 refresh_processes는 cwd를 갱신하지 않는다 — cwd만 명시 조회 (cd 추적 = Always)
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&sp),
+        false,
+        sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
+    );
+    pids.iter()
+        .filter_map(|&p| {
+            sys.process(sysinfo::Pid::from_u32(p))
+                .and_then(|x| x.cwd())
+                .map(|c| (p, c.display().to_string()))
+        })
+        .collect()
+}
+
 /// 단순 글롭 매칭: '*'만 와일드카드, 나머지는 리터럴 (역할 패턴용 — reviewer-*)
 pub fn glob_match(pattern: &str, value: &str) -> bool {
     let mut re = String::from("^");
@@ -1040,17 +1083,9 @@ fn reclaim_auto(
     let (caller_known_cwds, caller_live_cwd): (Vec<String>, Option<String>) = caller_seat
         .as_ref()
         .map(|s| {
-            let pid = sysinfo::Pid::from_u32(s.pid);
-            let mut sys = sysinfo::System::new();
-            sys.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::Some(&[pid]),
-                false,
-                sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
-            );
-            let live = sys
-                .process(pid)
-                .and_then(|p| p.cwd())
-                .map(|p| p.display().to_string())
+            // 관측은 surface.list 와 같은 단일 경로(live_cwds)다.
+            let live = live_cwds(&[s.pid])
+                .remove(&s.pid)
                 .filter(|c| !c.trim().is_empty());
             let mut known = vec![s.cwd.clone()];
             if let Some(l) = live.clone() {
@@ -4667,22 +4702,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 
         "surface.list" => {
             // 살아있는 셸 pid의 현재 작업 디렉토리 — UI pane 제목용 (cd 따라 변함)
-            // sysinfo 블로킹 syscall 동안 surfaces 락을 쥐지 않는다 (전 연산 일시정지 방지)
-            let pids: Vec<sysinfo::Pid> = daemon
+            // 블로킹 syscall 동안 surfaces 락을 쥐지 않는다 (전 연산 일시정지 방지) — 관측은 live_cwds 단일 경로.
+            let pids: Vec<u32> = daemon
                 .surfaces
                 .lock()
                 .unwrap()
                 .values()
                 .filter(|s| !s.exited.load(Ordering::Relaxed))
-                .map(|s| sysinfo::Pid::from_u32(s.pid))
+                .map(|s| s.pid)
                 .collect();
-            let mut sys = sysinfo::System::new();
-            // 기본 refresh_processes는 cwd를 갱신하지 않는다 — cwd만 명시 조회 (cd 추적 = Always)
-            sys.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::Some(&pids),
-                false,
-                sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
-            );
+            let live = live_cwds(&pids);
             // ★생성자 원장 스냅샷은 **surfaces 락을 잡기 전에** 뜬다 — `create_owner` 는 리프
             //   락이고 그 규약은 "surfaces/roles 를 쥔 채 잡지 않는다"이다(§creator_rollback_ok).
             //   락 순서 계약을 조회 편의로 어기지 않는다(AB-BA 는 한 번 생기면 무음으로 굳는다).
@@ -4691,10 +4720,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let mut list: Vec<Value> = surfaces
                 .values()
                 .map(|s| {
-                    let live_cwd = sys
-                        .process(sysinfo::Pid::from_u32(s.pid))
-                        .and_then(|p| p.cwd())
-                        .map(|p| p.display().to_string());
+                    let live_cwd = live.get(&s.pid).cloned();
                     // agent 이름과 agent_alive(presence)를 단일 락 1회로 함께 읽어 torn read 제거.
                     // ★M1: 산출은 3값 순수 술어 `agent_alive_tri` 하나가 소유한다(사본 금지 —
                     //   surface.list 와 org.status 가 갈리면 소비부가 좌석마다 다른 사실을 본다).
@@ -7980,13 +8006,125 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "transcript must be an absolute .jsonl path (no '..')",
                 ));
             }
-            *surface.registered_transcript.lock().unwrap() = Some(path.clone());
+            // ★R3-1: 덮어쓰기는 종전과 같다 — 직전 값을 함께 꺼내 clear 연속성 판정(ⓐ)에 쓴다.
+            let prev_registered = std::mem::replace(
+                &mut *surface.registered_transcript.lock().unwrap(),
+                Some(path.clone()),
+            );
             daemon.bus.publish(
                 "usage.session_registered",
                 "usage",
                 Some(sid),
                 json!({"transcript": path, "surface_ref": cys::surface_ref(sid)}),
             );
+            // ★R3-1(0.14.42): SessionStart `source=clear` 등록이 **좌석 최상위 claude** 의 것으로 증명되면 resume 핀을
+            //   새 세션으로 바꾸고 즉시 영속한다(판정 `usage::clear_repin_verdict` — 조건·실패 방향은 그 doc).
+            //   킬스위치 `CYS_CLEAR_REPIN=0` 이면 이 블록 전체가 없다(판정·계통 판독·persist·이벤트 0). 그 밖은 무변경.
+            //   /clear 1회당 늘어나는 것: 이벤트 최대 1건 · persist 최대 1회(핀이 실제로 바뀔 때만) · 계통 판독 최대 1회.
+            //   ★(리뷰 F3) 비 clear 등록(startup·resume·compact)도 연속성 기준 갱신에 계통 판독을 1회 쓴다(좌석 자손 발신 ·
+            //   claude 좌석 · 킬스위치 켜짐일 때만) — 실측(2026-09-26 · 샌드박스 · 좌석 안 발신 20회) 등록 왕복 p50
+            //   release 약 20ms(판독 없는 debug 종전 6.2ms). SessionStart 1회당 1번이고 블로킹 풀에서 락 없이 돈다.
+            let source = param_str(&params, "source");
+            let repin_on = crate::usage::clear_repin_enabled();
+            let meta = surface.agent_meta.lock().unwrap().clone();
+            let agent = meta.as_ref().map(|(a, _)| a.clone());
+            let agent_bin = meta
+                .as_ref()
+                .map(|(_, b)| b.rsplit(['/', '\\']).next().unwrap_or(b).to_string())
+                .unwrap_or_default();
+            // ★리뷰 F3: 연속성 기준(ⓐ) = 직전 등록 — 단 좌석 최상위 훅이 아니라고 **증명된** 등록(좌석 안 `claude -p`
+            //   헬퍼의 startup · 도구 셸의 직접 호출)은 건너뛴 값(`repin_anchor`). 기준이 아직 없으면 직전 등록(종전 의미).
+            let prev_anchor = surface.repin_anchor.lock().unwrap().clone().or_else(|| prev_registered.clone());
+            // 계통 판독은 락 밖 · 등록 1회당 최대 1번(판정·기준 갱신이 같은 값을 나눠 쓴다).
+            let root_pid = surface.pid;
+            let lineage_memo: std::cell::OnceCell<Option<(usize, bool)>> = std::cell::OnceCell::new();
+            let lineage = || {
+                *lineage_memo.get_or_init(|| {
+                    caller_pid.and_then(|cp| crate::usage::clear_lineage(root_pid, cp, &agent_bin))
+                })
+            };
+            if source.as_deref() == Some("clear") && repin_on {
+                let current = surface.agent_session_id.lock().unwrap().clone();
+                let prev_stem = prev_anchor
+                    .as_deref()
+                    .and_then(|p| crate::usage::extract_session_id("claude", std::path::Path::new(p)));
+                // 락 순서: surfaces → 좌석 필드(persist_topology 와 같다). 이 좌석의 락은 쥐고 있지 않다(위 값은 복사본).
+                // ★리뷰 F2/F3: 끝난(exited) 좌석이 쥔 세션도 그 좌석의 것이다 — /clear 가 만드는 새 세션 id 는 어느 좌석의
+                //   것과도 같을 수 없으므로 정상 경로에서는 늘 거짓이고, 막는 것은 남의(끝난 좌석의) 대화를 가져오는 경로뿐이다.
+                let held_by_other = |cand: &str| {
+                    daemon.surfaces.lock().unwrap().values().any(|o| {
+                        o.id != sid
+                            && (o.agent_session_id.lock().unwrap().as_deref() == Some(cand)
+                                || o.registered_transcript.lock().unwrap().as_deref().is_some_and(|p| {
+                                    std::path::Path::new(p).file_stem().and_then(|s| s.to_str())
+                                        == Some(cand)
+                                }))
+                    })
+                };
+                let fresh = || crate::usage::clear_transcript_fresh(&pb, std::time::SystemTime::now());
+                match crate::usage::clear_repin_verdict(
+                    source.as_deref(),
+                    caller_sid == Some(sid),
+                    agent.as_deref(),
+                    current.as_deref(),
+                    prev_anchor.as_deref().map(std::path::Path::new),
+                    &pb,
+                    held_by_other,
+                    fresh,
+                    lineage,
+                ) {
+                    Ok(new_sid) => {
+                        // 판정 뒤 교체는 비교-교체 — 그 사이 핀이 움직였으면(수집기 첫 핀·다른 등록) 덮지 않는다.
+                        let swapped = {
+                            let mut pin = surface.agent_session_id.lock().unwrap();
+                            if *pin == current {
+                                *pin = Some(new_sid.clone());
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if swapped {
+                            // 역할 좌석만 topology 에 실린다 — 가드는 별도 문장(role 락을 쥔 채 persist 하면 자기 교착).
+                            let has_role = surface.role.lock().unwrap().is_some();
+                            if has_role {
+                                crate::governance::persist_topology(daemon);
+                            }
+                            daemon.bus.publish(
+                                "usage.session_repinned",
+                                "usage",
+                                Some(sid),
+                                json!({"from": current, "to": new_sid, "source": "clear",
+                                       "persisted": has_role, "surface_ref": cys::surface_ref(sid)}),
+                            );
+                        } else {
+                            daemon.bus.publish(
+                                "usage.session_repin_skipped",
+                                "usage",
+                                Some(sid),
+                                json!({"reason": "raced", "pin": current, "prev": prev_stem,
+                                       "transcript": path, "surface_ref": cys::surface_ref(sid)}),
+                            );
+                        }
+                    }
+                    Err("unchanged") => {}
+                    Err(reason) => daemon.bus.publish(
+                        "usage.session_repin_skipped",
+                        "usage",
+                        Some(sid),
+                        json!({"reason": reason, "pin": current, "prev": prev_stem, "transcript": path,
+                               "surface_ref": cys::surface_ref(sid)}),
+                    ),
+                }
+            }
+            // ★리뷰 F3: 연속성 기준 갱신 — 좌석 최상위 훅이 아니라고 증명된 등록(이 좌석 자손 발신 · claude 좌석 ·
+            //   킬스위치 켜짐일 때만 판독)은 기준을 옮기지 않는다. 그 밖(판독 불가·익명·비 claude·꺼짐)은 종전처럼 옮긴다.
+            //   사용량 귀속(`registered_transcript`)은 위에서 종전대로 이미 덮었다 — 이 줄은 재핀 판정 기준만 다룬다.
+            let not_top = repin_on
+                && agent.as_deref() == Some("claude")
+                && caller_sid == Some(sid)
+                && crate::usage::lineage_proves_not_top_hook(lineage());
+            *surface.repin_anchor.lock().unwrap() = if not_top { prev_anchor } else { Some(path.clone()) };
             Reply::Single(ok_response(&id, json!({"surface_id": sid})))
         }
 
@@ -8266,30 +8404,22 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         // ─── T1-2 통합 관제 보드: read-screen 폴링 없이 1콜로 전 노드 상황 파악 ───
         "org.status" => {
             let now = crate::state::now_epoch();
-            // live_cwd(cd 추적): surfaces 락 밖에서 sysinfo 조회 — surface.list와 동일 패턴.
+            // live_cwd(cd 추적): surfaces 락 밖에서 조회 — surface.list와 같은 단일 관측(live_cwds).
             // 워커가 워크플로우 폴더 밖으로 cd해도 진행% 산출(javis_report)이 실제 _round를 찾게 한다.
-            let pids: Vec<sysinfo::Pid> = daemon
+            let pids: Vec<u32> = daemon
                 .surfaces
                 .lock()
                 .unwrap()
                 .values()
                 .filter(|s| !s.exited.load(Ordering::Relaxed))
-                .map(|s| sysinfo::Pid::from_u32(s.pid))
+                .map(|s| s.pid)
                 .collect();
-            let mut sys = sysinfo::System::new();
-            sys.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::Some(&pids),
-                false,
-                sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
-            );
+            let live = live_cwds(&pids);
             let surfaces = daemon.surfaces.lock().unwrap();
             let mut list: Vec<Value> = surfaces
                 .values()
                 .map(|s| {
-                    let live_cwd = sys
-                        .process(sysinfo::Pid::from_u32(s.pid))
-                        .and_then(|p| p.cwd())
-                        .map(|p| p.display().to_string());
+                    let live_cwd = live.get(&s.pid).cloned();
                     let status = s.agent_status.lock().unwrap().clone().map(|st| {
                         json!({"state": st.state, "context_pct": st.context_pct,
                                "task": st.task, "age_secs": (now - st.updated_at).max(0.0) as u64})
@@ -9972,6 +10102,116 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ★(0.14.42 · perf R3-6) live_cwd **단일 관측 · 단일 손잡이 핀**.
+    /// ① surface.list · org.status · 좌석 회수 호출자 축은 `live_cwds` 를 경유한다 — 운영 구간(테스트
+    ///   모듈 앞)의 sysinfo cwd 조회(`.with_cwd(`)는 `live_cwds_legacy` 한 곳뿐이어야 한다. 둘 이상이면
+    ///   사본이 생긴 것이다(셋이 갈리면 GUI 제목 · 진행% · 회수 판정이 서로 다른 사실을 본다).
+    /// ② macOS 경량 판독은 기존 노브(`CYS_PROC_PROBE_FAST`)를 **같이** 탄다 — 노브를 꺼도 cwd 만 새
+    ///   경로에 남으면 롤백이 두 갈래가 된다.
+    /// ③ libproc 직접 호출은 state.rs 한 곳에 모인다 — handlers.rs 운영 구간에는 없다.
+    #[test]
+    fn live_cwd_goes_through_single_helper() {
+        let src = include_str!("handlers.rs");
+        let prod = src.split("\n#[cfg(test)]\nmod tests {").next().unwrap();
+        let n = prod.matches(".with_cwd(").count();
+        assert_eq!(n, 1, "운영 코드의 sysinfo cwd 조회가 {n}곳 — live_cwds_legacy 한 곳만 허용");
+        let calls = prod.matches("live_cwds(&").count();
+        assert!(calls >= 3, "live_cwds 호출부(surface.list · org.status · 회수 호출자 축)가 {calls}곳뿐이다");
+        let head = &prod[prod.find("\nfn live_cwds(").expect("live_cwds 소실")..];
+        let body = &head[..head.find("\n}\n").expect("live_cwds 본문 경계 소실")];
+        assert!(
+            body.contains("crate::state::proc_probe_fast_enabled()")
+                && body.contains("crate::state::proc_cwd")
+                && body.contains("live_cwds_legacy(pids)"),
+            "live_cwds 가 노브(CYS_PROC_PROBE_FAST)를 거쳐 경량/종전 판독을 고르지 않는다 — 롤백이 두 갈래가 된다"
+        );
+        assert!(!prod.contains("libc::proc_pidinfo"), "handlers.rs 운영 구간에 libproc 직접 호출이 생겼다");
+        let state = include_str!("state.rs");
+        assert_eq!(
+            state.matches("libc::PROC_PIDVNODEPATHINFO").count(),
+            1,
+            "cwd 판독(proc_cwd)은 state.rs 한 곳이다"
+        );
+    }
+
+    /// ★(0.14.42 · perf R3-6) **결과 불변 핀** — `live_cwds` 는 종전 sysinfo 관측(System::new +
+    /// refresh_processes_specifics(Some, cwd Always))과 **같은 맵**을 낸다. 살아 있는 자식(서로 다른
+    /// cwd) · 거둔 자식(죽은 pid) · pid 1 · pid_max 밖의 pid 를 섞는다. 살아 있는 자식 셋이 모두
+    /// 잡혀야 한다(둘 다 빈 맵이면 공허한 초록이다). 오라클은 살아 있는 자식 셋을 모두 담을 때까지
+    /// 최대 5회 다시 뜬다 — sysinfo get_proc_list 가 None 이면 표 전체가 비어 무고한 적색이 나기
+    /// 때문이다(state.rs legacy_snapshot 과 같은 이유). 5회 모두 놓치면 비교 불가로 적색이다.
+    #[cfg(unix)]
+    #[test]
+    fn live_cwds_equals_sysinfo_observation() {
+        let base = std::env::temp_dir().join(format!("cys-r36-livecwd-{}", std::process::id()));
+        let mut kids = Vec::new();
+        let mut want = Vec::new();
+        for i in 0..3 {
+            let d = base.join(format!("seat-{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            want.push(std::fs::canonicalize(&d).unwrap());
+            kids.push(
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .current_dir(&d)
+                    .spawn()
+                    .unwrap(),
+            );
+        }
+        let mut dead = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let live: Vec<u32> = kids.iter().map(|k| k.id()).collect();
+        let mut pids = live.clone();
+        pids.extend([dead_pid, 1, 4_000_000]);
+        let oracle: std::collections::HashMap<u32, String> = {
+            let sp: Vec<sysinfo::Pid> = pids.iter().map(|p| sysinfo::Pid::from_u32(*p)).collect();
+            let mut found = None;
+            for _ in 0..5 {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&sp),
+                    false,
+                    sysinfo::ProcessRefreshKind::nothing().with_cwd(sysinfo::UpdateKind::Always),
+                );
+                let m: std::collections::HashMap<u32, String> = pids
+                    .iter()
+                    .filter_map(|&p| {
+                        sys.process(sysinfo::Pid::from_u32(p))
+                            .and_then(|x| x.cwd())
+                            .map(|c| (p, c.display().to_string()))
+                    })
+                    .collect();
+                if live.iter().all(|p| m.contains_key(p)) {
+                    found = Some(m);
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| {
+                for k in kids.iter_mut() {
+                    let _ = k.kill();
+                    let _ = k.wait();
+                }
+                panic!("sysinfo 오라클이 5회 연속 살아 있는 자식을 놓쳤다 — 비교 불가(red)")
+            })
+        };
+        let got = live_cwds(&pids);
+        for k in kids.iter_mut() {
+            let _ = k.kill();
+            let _ = k.wait();
+        }
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(got, oracle, "live_cwds 가 종전 sysinfo 관측과 갈렸다");
+        for (i, pid) in live.iter().enumerate() {
+            assert_eq!(
+                got.get(pid).map(std::path::PathBuf::from),
+                Some(want[i].clone()),
+                "살아 있는 좌석 {i} 의 cwd 를 못 잡았다(공허한 초록 방지)"
+            );
+        }
+        assert!(!got.contains_key(&dead_pid) && !got.contains_key(&4_000_000));
+    }
 
     /// ★(U-22) `hook.decide` 판정 **진리표** — A3 반전 allowlist 를 완전 열거로 못박는다.
     ///
@@ -18160,6 +18400,568 @@ mod tests {
                 .registered_transcript.lock().unwrap().as_deref(),
             Some("/Users/x/.claude/projects/-p/abc.jsonl")
         );
+    }
+
+    fn usage_register_src(
+        daemon: &Arc<Daemon>,
+        surface_id: u64,
+        transcript: &str,
+        source: Option<&str>,
+        caller_pid: Option<u32>,
+    ) -> Value {
+        let mut params = json!({ "surface_id": surface_id, "transcript": transcript });
+        if let Some(s) = source {
+            params["source"] = json!(s);
+        }
+        let req = Request { id: json!(1), method: "usage.register".into(), params };
+        let Reply::Single(resp) = dispatch(daemon, req, caller_pid) else {
+            panic!("expected single reply");
+        };
+        resp
+    }
+
+    /// claude 좌석 하나 — 역할·에이전트 메타·핀 A·**등록 A**(좌석 자신의 startup 등록)를 세운다(수집기가
+    /// 첫 틱에 등록 경로로 핀을 잡은 상태와 같다). 계통 이음매는 1(= 좌석 최상위 에이전트의 훅)로 둔다 —
+    /// 검체의 발신 pid 는 합성값이라 실제 조상 사슬이 없다. 계통 거부를 보는 검체만 값을 바꾼다.
+    /// 킬스위치 이음매는 '부재'(= 켜짐)로 고정한다 — 검체를 돌리는 셸의 `CYS_CLEAR_REPIN` 에 흔들리지 않게.
+    fn r3_1_seat(daemon: &Arc<Daemon>, role: &str, pin: &str, pid: u32) -> u64 {
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        crate::usage::clear_repin_env_seam::set(Some(None));
+        let sid = make_surface(daemon, Some(role));
+        let s = daemon.surfaces.lock().unwrap()[&sid].clone();
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        *s.agent_session_id.lock().unwrap() = Some(pin.into());
+        *s.registered_transcript.lock().unwrap() = Some(r3_1_path(pin));
+        bind_caller(daemon, pid, sid);
+        sid
+    }
+
+    fn r3_1_path(stem: &str) -> String {
+        format!("/Users/x/.claude/projects/-p/{stem}.jsonl")
+    }
+
+    /// 이 검체 스레드가 구독한 뒤 발행된 repin 계열 이벤트 (이름, reason) 목록.
+    fn r3_1_repin_events(rx: &mut tokio::sync::broadcast::Receiver<Value>) -> Vec<(String, Option<String>)> {
+        let mut out = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            let name = e["name"].as_str().unwrap_or_default().to_string();
+            if name == "usage.session_repinned" || name == "usage.session_repin_skipped" {
+                out.push((name, e["payload"]["reason"].as_str().map(String::from)));
+            }
+        }
+        out
+    }
+
+    fn r3_1_pin(daemon: &Arc<Daemon>, sid: u64) -> Option<String> {
+        daemon.surfaces.lock().unwrap()[&sid].agent_session_id.lock().unwrap().clone()
+    }
+
+    fn r3_1_topology_pin(daemon: &Arc<Daemon>, role: &str) -> Option<String> {
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("topology.json")).ok()?).ok()?;
+        v["entries"].as_array()?.iter().find(|e| e["role"] == json!(role))?["session_id"]
+            .as_str()
+            .map(String::from)
+    }
+
+    const R3_A: &str = "11111111-1111-4111-8111-111111111111";
+    const R3_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// ★R3-1(S27b H2 기전): /clear 뒤 SessionStart(`source=clear`) 등록은 핀을 새 세션으로 바꾸고 **디스크에** 남긴다.
+    /// 수정 전: 핀이 A 에 고정(is_none 가드) + 영속 트리거 없음 → 재기동 복원이 비운 대화 A 를 `--resume` 한다.
+    #[test]
+    fn r3_1_clear_register_repins_and_persists() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_101);
+        let mut rx = daemon.bus.subscribe();
+        let b = format!("/Users/x/.claude/projects/-p/{R3_B}.jsonl");
+        let resp = usage_register_src(&daemon, own, &b, Some("clear"), Some(994_101));
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "메모리 핀이 옛 대화에 남았다");
+        assert_eq!(
+            r3_1_topology_pin(&daemon, "worker-1").as_deref(),
+            Some(R3_B),
+            "topology.json 핀이 새 세션이 아니다 — 재기동이 옛 대화로 재개한다"
+        );
+        // 피드 기록: repinned 1건(from·to·persisted) — skipped 는 없다.
+        let mut repinned = Vec::new();
+        let mut skipped = 0usize;
+        while let Ok(e) = rx.try_recv() {
+            match e["name"].as_str() {
+                Some("usage.session_repinned") => repinned.push(e["payload"].clone()),
+                Some("usage.session_repin_skipped") => skipped += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(repinned.len(), 1, "repinned 이벤트가 정확히 1건이 아니다: {repinned:?}");
+        assert_eq!(skipped, 0);
+        let p = &repinned[0];
+        assert_eq!((p["from"].clone(), p["to"].clone()), (json!(R3_A), json!(R3_B)), "{p}");
+        assert_eq!(p["persisted"], json!(true), "역할 좌석인데 영속 표시가 없다: {p}");
+    }
+
+    /// 역할 없는 좌석(topology 에 실리지 않는다)은 핀만 바꾸고 persist 하지 않는다 — 이벤트는 persisted=false.
+    #[test]
+    fn r3_1_clear_on_roleless_seat_repins_without_persist() {
+        let daemon = isolated_daemon();
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        crate::usage::clear_repin_env_seam::set(Some(None));
+        let sid = make_surface(&daemon, None);
+        let s = daemon.surfaces.lock().unwrap()[&sid].clone();
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        *s.agent_session_id.lock().unwrap() = Some(R3_A.into());
+        *s.registered_transcript.lock().unwrap() = Some(r3_1_path(R3_A));
+        bind_caller(&daemon, 994_151, sid);
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let _ = std::fs::remove_file(dir.join("topology.json"));
+        let mut rx = daemon.bus.subscribe();
+        let _ = usage_register_src(&daemon, sid, &r3_1_path(R3_B), Some("clear"), Some(994_151));
+        assert_eq!(r3_1_pin(&daemon, sid).as_deref(), Some(R3_B));
+        assert!(!dir.join("topology.json").exists(), "역할 없는 좌석의 재핀이 topology 를 썼다");
+        let mut persisted = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            if e["name"] == json!("usage.session_repinned") {
+                persisted.push(e["payload"]["persisted"].clone());
+            }
+        }
+        assert_eq!(persisted, vec![json!(false)]);
+    }
+
+    /// clear 가 아닌 등록(부재·startup·resume·compact·모르는 값)은 핀을 건드리지 않는다 — 중첩 `claude -p` 의
+    /// startup/resume/compact 보고가 좌석 핀을 빼앗지 못한다(종전 동작 보존).
+    #[test]
+    fn r3_1_non_clear_sources_keep_pin() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_201);
+        let b = format!("/Users/x/.claude/projects/-p/{R3_B}.jsonl");
+        for src in [None, Some("startup"), Some("resume"), Some("compact"), Some("CLEAR"), Some("")] {
+            let resp = usage_register_src(&daemon, own, &b, src, Some(994_201));
+            assert_eq!(resp["ok"], json!(true), "{src:?}: {resp}");
+            assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "{src:?} 가 핀을 바꿨다");
+        }
+    }
+
+    /// 좌석·신원 결박: 좌석 밖(익명) 발신은 clear 라도 핀을 못 바꾸고, 남의 좌석 발신은 등록 자체가 거부된다.
+    #[test]
+    fn r3_1_clear_requires_bound_caller() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_301);
+        let other = r3_1_seat(&daemon, "worker-2", "33333333-3333-4333-8333-333333333333", 994_302);
+        let b = format!("/Users/x/.claude/projects/-p/{R3_B}.jsonl");
+        let anon = usage_register_src(&daemon, own, &b, Some("clear"), None);
+        assert_eq!(anon["ok"], json!(true), "익명 등록 자체는 종전대로 통과: {anon}");
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "좌석 밖 발신이 핀을 바꿨다");
+        let foreign = usage_register_src(&daemon, own, &b, Some("clear"), Some(994_302));
+        assert_eq!(foreign["error"]["code"], json!("usage_denied"), "{foreign}");
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A));
+        let _ = other;
+    }
+
+    /// 다른 좌석이 쥔 세션(핀 또는 등록)으로는 바꾸지 않는다 · 셸 메타문자 stem 은 핀이 되지 못한다.
+    #[test]
+    fn r3_1_clear_rejects_foreign_session_and_bad_stem() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_401);
+        let _other = r3_1_seat(&daemon, "worker-2", R3_B, 994_402);
+        let b = format!("/Users/x/.claude/projects/-p/{R3_B}.jsonl");
+        let _ = usage_register_src(&daemon, own, &b, Some("clear"), Some(994_401));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "남의 좌석 세션을 핀으로 가져왔다");
+        for bad in ["/Users/x/.claude/projects/-p/a;touch pwn.jsonl", "/Users/x/.claude/projects/-p/a b.jsonl"] {
+            let _ = usage_register_src(&daemon, own, bad, Some("clear"), Some(994_401));
+            assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "{bad:?} 가 핀이 됐다");
+        }
+    }
+
+    /// 다른 좌석이 **등록만** 한 세션(핀은 아직 다른 값)도 그 좌석의 것이다 — 핀으로 가져오지 않는다.
+    #[test]
+    fn r3_1_clear_rejects_session_registered_by_other_seat() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_451);
+        let other = r3_1_seat(&daemon, "worker-2", "33333333-3333-4333-8333-333333333333", 994_452);
+        let so = daemon.surfaces.lock().unwrap()[&other].clone();
+        *so.registered_transcript.lock().unwrap() = Some(r3_1_path(R3_B));
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        let mut rx = daemon.bus.subscribe();
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_451));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "남의 좌석 등록 세션을 핀으로 가져왔다");
+        assert_eq!(
+            r3_1_repin_events(&mut rx),
+            vec![("usage.session_repin_skipped".to_string(), Some("held_by_other_seat".to_string()))]
+        );
+    }
+
+    const R3_N: &str = "44444444-4444-4444-8444-444444444444";
+    const R3_B2: &str = "55555555-5555-4555-8555-555555555555";
+    const R3_C: &str = "66666666-6666-4666-8666-666666666666";
+
+    /// ★R3-1 개정: /clear 를 거듭하면 핀이 사슬을 따라간다(A→B→C) — 연속성 검사가 좌석 자신의 연속 clear 를
+    /// 막지 않는다(직전 등록 stem 이 곧 현재 핀이다).
+    #[test]
+    fn r3_1_successive_clears_follow_chain() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_501);
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_501));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_C), Some("clear"), Some(994_501));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_C), "두 번째 clear 를 못 따라갔다");
+        assert_eq!(r3_1_topology_pin(&daemon, "worker-1").as_deref(), Some(R3_C));
+    }
+
+    /// ★R3-1 개정(차단 1 · 연속성): 좌석 안 중첩 `claude -p "/clear"` 는 SessionStart 를 **startup(N) → clear(B')**
+    /// 순으로 두 번 낸다(실 CC 2.1.282 샌드박스 실측 · startup 훅 종료 뒤 clear 훅 시작). 둘 다 이 좌석 자손
+    /// 발신이라 소유 게이트·caller 결박을 통과한다. 계통 이음매를 1(= 속은 상태)로 두고 **연속성 단독**으로
+    /// 핀 A 를 지키는지 본다: clear 직전 등록은 N 이고 핀은 A 다 → discontinuous.
+    #[test]
+    fn r3_1_nested_startup_then_clear_keeps_pin() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_601);
+        let mut rx = daemon.bus.subscribe();
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_N), Some("startup"), Some(994_601));
+        let resp = usage_register_src(&daemon, own, &r3_1_path(R3_B2), Some("clear"), Some(994_601));
+        assert_eq!(resp["ok"], json!(true), "등록 자체는 종전대로 통과: {resp}");
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "중첩 헬퍼의 clear 가 좌석 핀을 빼앗았다");
+        assert_ne!(r3_1_topology_pin(&daemon, "worker-1").as_deref(), Some(R3_B2), "헬퍼 세션이 영속됐다");
+        let ev = r3_1_repin_events(&mut rx);
+        assert_eq!(
+            ev,
+            vec![("usage.session_repin_skipped".to_string(), Some("discontinuous".to_string()))],
+            "거부 사유가 피드에 남지 않았다"
+        );
+    }
+
+    /// ★R3-1 개정(결측은 값이 아니다): 핀은 있는데 직전 등록이 **없으면**(훅 미발화·구 데몬에서 이어진 좌석)
+    /// 연속성을 증명할 수 없다 → 거부. 핀이 **없으면**(수집기 첫 틱 전) 비교할 대상이 없으니 받는다 — 그 값은
+    /// 수집기가 다음 틱에 등록 경로로 잡을 값과 같다.
+    #[test]
+    fn r3_1_continuity_missing_values() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_701);
+        let s = daemon.surfaces.lock().unwrap()[&own].clone();
+        *s.registered_transcript.lock().unwrap() = None;
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_701));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "직전 등록 부재(None)를 연속으로 읽었다");
+
+        let other = r3_1_seat(&daemon, "worker-2", R3_C, 994_702);
+        let so = daemon.surfaces.lock().unwrap()[&other].clone();
+        *so.agent_session_id.lock().unwrap() = None;
+        *so.registered_transcript.lock().unwrap() = None;
+        let _ = usage_register_src(&daemon, other, &r3_1_path(R3_B2), Some("clear"), Some(994_702));
+        assert_eq!(r3_1_pin(&daemon, other).as_deref(), Some(R3_B2), "핀 부재 좌석의 clear 를 거부했다");
+    }
+
+    /// ★R3-1 개정(차단 1 · 계통): 발신 조상 사슬에 claude 실행이 둘 이상이면(중첩) 거부 — 연속성이 속는
+    /// 경로(`claude -p --resume A "/clear"` 처럼 직전 등록이 핀과 같아지는 재생)도 여기서 막힌다.
+    /// 판독 불가(None)·0 은 lineage_unverified(윈도우처럼 사슬이 안 풀리는 환경 = 종전 동작).
+    #[test]
+    fn r3_1_lineage_rejects_nested_or_unverified() {
+        // 좌석 하나를 재사용한다(행마다 핀·등록을 A 로 되돌림) — 전체 검체의 PTY 동시 점유(상한 511)를 늘리지 않는다.
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_801);
+        let s = daemon.surfaces.lock().unwrap()[&own].clone();
+        for (depth, reason) in [
+            (Some(2usize), "nested_agent"),
+            (Some(3), "nested_agent"),
+            (Some(0), "lineage_unverified"),
+            (None, "lineage_unverified"),
+        ] {
+            *s.agent_session_id.lock().unwrap() = Some(R3_A.into());
+            *s.registered_transcript.lock().unwrap() = Some(r3_1_path(R3_A));
+            *s.repin_anchor.lock().unwrap() = None;
+            crate::usage::clear_lineage_seam::set(Some(depth));
+            let mut rx = daemon.bus.subscribe();
+            let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_801));
+            assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "{depth:?} 인데 핀을 바꿨다");
+            assert_eq!(
+                r3_1_repin_events(&mut rx),
+                vec![("usage.session_repin_skipped".to_string(), Some(reason.to_string()))],
+                "{depth:?}"
+            );
+        }
+    }
+
+    /// ★R3-1 개정(필수 · 롤백 ①): `CYS_CLEAR_REPIN=0` 이면 clear 등록 뒤에도 핀 A · topology 무변경 ·
+    /// repin 계열 이벤트 0. 그 밖 값(부재·"1"·"")은 켜짐.
+    #[test]
+    fn r3_1_kill_switch_off_keeps_pin_without_persist_or_event() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_901);
+        crate::governance::persist_topology(&daemon);
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let before = std::fs::read_to_string(dir.join("topology.json")).unwrap();
+        crate::usage::clear_repin_env_seam::set(Some(Some("0".into())));
+        let mut rx = daemon.bus.subscribe();
+        let resp = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_901));
+        assert_eq!(resp["ok"], json!(true), "꺼짐에서도 등록은 종전대로: {resp}");
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "킬스위치 꺼짐인데 핀을 바꿨다");
+        let after = std::fs::read_to_string(dir.join("topology.json")).unwrap();
+        assert_eq!(before, after, "킬스위치 꺼짐인데 topology 를 다시 썼다");
+        assert!(r3_1_repin_events(&mut rx).is_empty(), "킬스위치 꺼짐인데 repin 이벤트가 나갔다");
+
+        let s = daemon.surfaces.lock().unwrap()[&own].clone();
+        for on in [None, Some("1".to_string()), Some(String::new())] {
+            *s.agent_session_id.lock().unwrap() = Some(R3_A.into());
+            *s.registered_transcript.lock().unwrap() = Some(r3_1_path(R3_A));
+            *s.repin_anchor.lock().unwrap() = None;
+            crate::usage::clear_repin_env_seam::set(Some(on.clone()));
+            let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_901));
+            assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "env={on:?} 는 켜짐이어야 한다");
+        }
+    }
+
+    /// ★리뷰 F2(R-M1 변이 생존 보완): pid 는 있는데 **어느 좌석에도 결박되지 않은** 발신(좌석 밖 프로세스 · 합성
+    /// pid)은 계통 이음매가 1(속은 상태)이어도 핀을 못 바꾼다 — `caller_sid == Some(sid)` 배선을 이 행이 진다.
+    /// 종전 검체는 익명(pid 없음) 행뿐이라 계통 클로저가 None → lineage_unverified 로 먼저 막혀 배선 변이가 살았다.
+    #[test]
+    fn r3_1_clear_rejects_unbound_caller_with_pid() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_311);
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        crate::usage::clear_lineage_seam::set_hook(None);
+        let mut rx = daemon.bus.subscribe();
+        let resp = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_399));
+        assert_eq!(resp["ok"], json!(true), "결박 없는 발신의 등록 자체는 종전대로 통과: {resp}");
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "좌석에 결박되지 않은 발신이 핀을 바꿨다");
+        assert_eq!(
+            r3_1_repin_events(&mut rx),
+            vec![("usage.session_repin_skipped".to_string(), Some("caller_unbound".to_string()))]
+        );
+    }
+
+    /// ★리뷰 F2: 새 세션 증거 — 좌석 안 아무 프로세스가 `--source clear` 로 **가득 찬 옛 대화**(큰 파일)를 등록해도
+    /// 다른 관문(결박·연속성·계통 1·훅 기원)을 모두 지난 상태에서 핀은 옛 대화로 바뀌지 않는다(not_fresh_session).
+    #[test]
+    fn r3_1_clear_rejects_old_full_conversation() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_321);
+        crate::usage::clear_lineage_seam::set_hook(None);
+        let dir = std::env::temp_dir().join(format!("cys-r31-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join(format!("{R3_B}.jsonl"));
+        std::fs::write(&old, vec![b'x'; crate::usage::CLEAR_FRESH_MAX_BYTES as usize + 1]).unwrap();
+        let mut rx = daemon.bus.subscribe();
+        let _ = usage_register_src(&daemon, own, old.to_str().unwrap(), Some("clear"), Some(994_321));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "옛 대화(큰 파일)로 재핀했다");
+        assert_eq!(
+            r3_1_repin_events(&mut rx),
+            vec![("usage.session_repin_skipped".to_string(), Some("not_fresh_session".to_string()))]
+        );
+        // 대조: 같은 자리의 방금 생긴 작은 파일(실 CC 모양)은 받는다.
+        std::fs::write(&old, b"{}\n").unwrap();
+        *daemon.surfaces.lock().unwrap()[&own].repin_anchor.lock().unwrap() = Some(r3_1_path(R3_A));
+        let _ = usage_register_src(&daemon, own, old.to_str().unwrap(), Some("clear"), Some(994_321));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "방금 생긴 작은 transcript 를 거부했다");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★리뷰 F2/F3: 훅 기원 — 계통 1(좌석 claude 아래)이어도 SessionStart 훅 밖(좌석 Bash 도구 셸의 직접 호출)이면
+    /// 거부(not_hook_origin)하고, 그 등록은 연속성 기준도 옮기지 않는다 — 뒤따르는 좌석 자신의 /clear 는 재핀된다.
+    #[test]
+    fn r3_1_tool_shell_direct_clear_is_rejected_and_does_not_break_chain() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_331);
+        let mut rx = daemon.bus.subscribe();
+        crate::usage::clear_lineage_seam::set_hook(Some(false));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_N), Some("clear"), Some(994_331));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "도구 셸 직접 호출이 핀을 바꿨다");
+        crate::usage::clear_lineage_seam::set_hook(None);
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_331));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "직접 호출 뒤 좌석 자신의 /clear 가 끊겼다");
+        assert_eq!(
+            r3_1_repin_events(&mut rx),
+            vec![
+                ("usage.session_repin_skipped".to_string(), Some("not_hook_origin".to_string())),
+                ("usage.session_repinned".to_string(), None),
+            ]
+        );
+    }
+
+    /// ★리뷰 F3: 좌석 안 `claude -p` 헬퍼(계통 2)의 **startup** 등록은 사용량 귀속은 종전대로 덮지만 연속성 기준은
+    /// 옮기지 않는다 — 수정 전: 헬퍼 1회 뒤 좌석 자신의 /clear 가 discontinuous 로 거부돼 재기동 때까지 재핀이 꺼졌다.
+    #[test]
+    fn r3_1_nested_helper_startup_does_not_disable_seat_clear() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_341);
+        let mut rx = daemon.bus.subscribe();
+        crate::usage::clear_lineage_seam::set(Some(Some(2)));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_N), Some("startup"), Some(994_341));
+        assert_eq!(
+            daemon.surfaces.lock().unwrap()[&own].registered_transcript.lock().unwrap().as_deref(),
+            Some(r3_1_path(R3_N).as_str()),
+            "사용량 귀속(registered_transcript)은 종전대로 매 등록 덮어야 한다(이 수정의 범위 밖)"
+        );
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_341));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "헬퍼 startup 뒤 좌석 자신의 /clear 가 거부됐다");
+        assert_eq!(r3_1_topology_pin(&daemon, "worker-1").as_deref(), Some(R3_B));
+        assert_eq!(r3_1_repin_events(&mut rx), vec![("usage.session_repinned".to_string(), None)]);
+        // 판독 불가(None · 윈도우 등) 등록은 종전처럼 기준을 옮긴다 — 뒤 clear 는 discontinuous(종전 동작).
+        crate::usage::clear_lineage_seam::set(Some(None));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_N), Some("startup"), Some(994_341));
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_C), Some("clear"), Some(994_341));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "판독 불가 등록 뒤에는 종전 동작(핀 유지)이어야 한다");
+    }
+
+    /// ★리뷰 F3: 끝난(exited) 좌석이 쥔 세션도 가져오지 않는다 — /clear 의 새 세션 id 는 어느 좌석과도 같을 수 없다.
+    #[test]
+    fn r3_1_clear_rejects_session_held_by_exited_seat() {
+        let daemon = isolated_daemon();
+        let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_351);
+        let other = r3_1_seat(&daemon, "worker-2", R3_B, 994_352);
+        crate::usage::clear_lineage_seam::set(Some(Some(1)));
+        daemon.surfaces.lock().unwrap()[&other].exited.store(true, Ordering::Relaxed);
+        let mut rx = daemon.bus.subscribe();
+        let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_351));
+        assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "끝난 좌석의 대화를 핀으로 가져왔다");
+        assert_eq!(
+            r3_1_repin_events(&mut rx),
+            vec![("usage.session_repin_skipped".to_string(), Some("held_by_other_seat".to_string()))]
+        );
+    }
+
+    /// ★리뷰 F2(R-M5·배선 변이 보완): 계통 이음매를 **끄고** 실제 프로세스 사슬로 판정한다 — surface.pid 는 실제 PTY
+    /// 자식이고 발신은 그 아래 `sleep`. agent_meta 의 bin 은 **전체 경로**로 두어 basename 파생까지 실제로 태운다.
+    /// 좌석 claude → hooks/session-start.sh → sleep = 재핀 · 훅 없음 = not_hook_origin · claude 두 겹 = nested_agent.
+    /// 인자 순서(root·caller)를 뒤바꾸거나 basename 파생을 빼는 변이는 이 행에서 lineage_unverified 로 적색이 된다.
+    #[cfg(unix)]
+    #[test]
+    fn r3_1_real_lineage_without_seam() {
+        let dir = std::env::temp_dir().join(format!("cys-r31-real-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("hooks")).unwrap();
+        let d = dir.to_str().unwrap().to_string();
+        let w = |name: &str, body: String| std::fs::write(dir.join(name), body).unwrap();
+        w("claude", "\"$@\"\nexit 0\n".to_string());
+        w("hooks/session-start.sh", "sleep 30\nexit 0\n".to_string());
+        w("leaf.sh", "sleep 30\nexit 0\n".to_string());
+        w("top_hook.sh", format!("/bin/sh '{d}/claude' /bin/sh '{d}/hooks/session-start.sh'\nexit 0\n"));
+        w("top_tool.sh", format!("/bin/sh '{d}/claude' /bin/sh '{d}/leaf.sh'\nexit 0\n"));
+        w("mid_hook.sh", format!("/bin/sh '{d}/claude' /bin/sh '{d}/hooks/session-start.sh'\nexit 0\n"));
+        w("nest_hook.sh", format!("/bin/sh '{d}/claude' /bin/sh '{d}/mid_hook.sh'\nexit 0\n"));
+        let daemon = isolated_daemon();
+        crate::usage::clear_repin_env_seam::set(Some(None));
+        for (i, (entry, want)) in [
+            ("top_hook.sh", None),
+            ("top_tool.sh", Some("not_hook_origin")),
+            ("nest_hook.sh", Some("nested_agent")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let s = daemon
+                .create_surface(None, Some(format!("/bin/sh '{d}/{entry}'")), None, Some(format!("worker-{}", i + 1)), 24, 80)
+                .expect("create surface");
+            daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+            let mut caller = None;
+            for _ in 0..200 {
+                let mut sys = sysinfo::System::new();
+                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+                let mut stack = vec![s.pid];
+                let mut seen = std::collections::HashSet::new();
+                while let Some(p) = stack.pop() {
+                    if !seen.insert(p) {
+                        continue;
+                    }
+                    for (cp, pr) in sys.processes() {
+                        if pr.parent().map(|x| x.as_u32()) == Some(p) {
+                            if pr.name().to_string_lossy() == "sleep" {
+                                caller = Some(cp.as_u32());
+                            }
+                            stack.push(cp.as_u32());
+                        }
+                    }
+                }
+                if caller.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let caller = caller.unwrap_or_else(|| panic!("{entry}: sleep 자손을 못 찾았다"));
+            crate::usage::clear_lineage_seam::set(None);
+            crate::usage::clear_lineage_seam::set_hook(None);
+            *s.agent_meta.lock().unwrap() = Some(("claude".into(), format!("{d}/claude")));
+            *s.agent_session_id.lock().unwrap() = Some(R3_A.into());
+            *s.registered_transcript.lock().unwrap() = Some(r3_1_path(R3_A));
+            bind_caller(&daemon, caller, s.id);
+            let mut rx = daemon.bus.subscribe();
+            let stems = [
+                "77777777-7777-4777-8777-777777777771",
+                "77777777-7777-4777-8777-777777777772",
+                "77777777-7777-4777-8777-777777777773",
+            ];
+            let b = format!("{d}/{}.jsonl", stems[i]);
+            let _ = usage_register_src(&daemon, s.id, &b, Some("clear"), Some(caller));
+            let ev = r3_1_repin_events(&mut rx);
+            unsafe {
+                libc::kill(-(s.pid as i32), libc::SIGKILL);
+            }
+            match want {
+                None => {
+                    assert_ne!(r3_1_pin(&daemon, s.id).as_deref(), Some(R3_A), "{entry}: 실제 좌석 훅 사슬인데 재핀하지 않았다 {ev:?}");
+                    assert_eq!(ev, vec![("usage.session_repinned".to_string(), None)], "{entry}");
+                }
+                Some(reason) => {
+                    assert_eq!(r3_1_pin(&daemon, s.id).as_deref(), Some(R3_A), "{entry}: 재핀했다 {ev:?}");
+                    assert_eq!(ev, vec![("usage.session_repin_skipped".to_string(), Some(reason.to_string()))], "{entry}");
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★R3-1c(0.14.42 · 현행 라이브 결함): 동시 `persist_topology` 는 같은 임시 파일(`.topology.json.tmp`)을 나눠
+    /// 써서 **찢어진 JSON** 을 원자 교체로 올릴 수 있다(짧은 스냅샷이 긴 스냅샷 위에 덮여 꼬리가 남는다). 찢어지면
+    /// `load_topology` 가 격리 후 빈 배열로 폴백해 복원 대상 전원·묘비가 사라진다. 동시 persist 는 오늘도 난다
+    /// (master·cso SessionStart 의 claim-role · 부트 폭풍의 동시 claim · watchdog·close·reinject).
+    /// 반복 수 8×50 — 락 없는 기준 코드에서 적색 검출이 남는 최소 규모(설계 실측 3/3 RED).
+    #[test]
+    fn r3_1c_concurrent_persist_never_tears_topology() {
+        let daemon = isolated_daemon();
+        let a = make_surface(&daemon, Some("worker-1"));
+        let _b = make_surface(&daemon, Some("worker-2"));
+        let sa = daemon.surfaces.lock().unwrap()[&a].clone();
+        let dir = crate::state::state_dir(&daemon.socket_path);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 스냅샷 길이를 흔든다 — 긴 스냅샷 위에 짧은 스냅샷이 겹쳐 쓰이면 꼬리가 남아 파싱이 깨진다.
+        let flipper = {
+            let (sa, stop) = (sa.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let long = "x".repeat(20_000);
+                let mut i = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    *sa.title.lock().unwrap() = if i % 2 == 0 { long.clone() } else { "s".into() };
+                    i += 1;
+                }
+            })
+        };
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let d = daemon.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..50 {
+                        crate::governance::persist_topology(&d);
+                    }
+                })
+            })
+            .collect();
+        let mut torn = 0usize;
+        let mut reads = 0usize;
+        while writers.iter().any(|w| !w.is_finished()) {
+            if let Ok(t) = std::fs::read_to_string(dir.join("topology.json")) {
+                reads += 1;
+                if serde_json::from_str::<Value>(&t).is_err() {
+                    torn += 1;
+                }
+            }
+        }
+        // 작성 스레드가 패닉해도 흔들개를 먼저 세운다(패닉 전파 전에 멈추지 않으면 계속 돈다).
+        let joined: Vec<_> = writers.into_iter().map(|w| w.join()).collect();
+        stop.store(true, Ordering::Relaxed);
+        flipper.join().unwrap();
+        assert!(joined.iter().all(|j| j.is_ok()), "persist_topology 작성 스레드가 패닉했다");
+        let fin = std::fs::read_to_string(dir.join("topology.json")).unwrap_or_default();
+        let fin_ok = serde_json::from_str::<Value>(&fin).is_ok();
+        assert!(torn == 0 && fin_ok, "찢어진 topology.json 관측 {torn}/{reads} 회 · 최종 파싱 {fin_ok}");
     }
 
     /// 경로 위생: 상대경로·비 .jsonl은 거부 — 수집기가 임의 파일을 tail하는 입력을 차단.
