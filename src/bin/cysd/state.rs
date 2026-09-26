@@ -1045,6 +1045,9 @@ pub struct InjectTrack {
     done_at: Mutex<Option<Instant>>,
     /// ★(R3SH-1) 마지막 **기계 본문**(데몬 Inject · CLI 기계 send) — 제출 CR 뒤에도 남는다. [`MachineBody`] doc.
     last_body: Mutex<Option<MachineBody>>,
+    /// ★(R1-F4) 지금 Inject arm 이 시작된 단조 시각 — writer 가 쓰기에 막혀(stdin 을 읽지 않는 에이전트 · PTY 입력 버퍼 포화)
+    /// `active` 가 내려오지 않는 것을 판정자가 가려낸다([`InjectTrack::stuck_over`]).
+    began_at: Mutex<Option<Instant>>,
 }
 
 /// ★(0.14.42 · R3SH-1) 좌석 입력줄에 마지막으로 쓴 **기계 본문**의 기록 — H0 기계 잔여 입증의 둘째 근거.
@@ -1099,7 +1102,24 @@ pub fn normalize_input_text(s: &str) -> String {
 impl InjectTrack {
     /// writer 전용 — Inject arm 의 첫 바이트 앞.
     pub(crate) fn begin(&self) {
+        *self.began_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
         self.active.store(true, Ordering::Release);
+    }
+
+    /// ★(R1-F4) Inject arm 이 `over` 보다 오래 쓰는 중인가 — writer 가 막혔다(정상 arm 은 붙여넣기 + cr_delay ≤ 1s 안팎).
+    pub(crate) fn stuck_over(&self, over: std::time::Duration) -> bool {
+        self.active.load(Ordering::Acquire)
+            && self
+                .began_at
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|t| t.elapsed() > over)
+    }
+
+    /// 검체 전용 — Inject arm 시작 시각을 과거로 옮긴다(막힌 writer 재현).
+    #[cfg(test)]
+    pub(crate) fn backdate_begin(&self, by: std::time::Duration) {
+        *self.began_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() - by);
     }
 
     /// writer 전용 — Inject arm 의 마지막 바이트(CR) 뒤. `done_at` 을 먼저 찍고 `active` 를 내린다

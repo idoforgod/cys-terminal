@@ -1547,6 +1547,11 @@ fn channel_hold_axes() -> crate::governance::MachineHoldAxes {
 /// 83d67185 의 일괄 ≈ 10s). 판정→CR 500ms 창(직접 주입 공통 잔여)은 행마다 남는다.
 const CHANNEL_ROW_GAP_MS: u64 = 1000;
 
+/// ★(R1-F4) master 좌석 writer 가 한 Inject arm 을 이만큼 넘게 쓰고 있으면 막힌 것이다(에이전트가 stdin 을 읽지 않음 ·
+/// SIGSTOP · PTY 입력 버퍼 포화). 그때는 간격 후속(500ms 재무장)을 걸지 않고 15s sweep 에 넘긴다 — 주입은 어차피 늘지
+/// 않고, 종료 조건 없는 2Hz 타이머·채널 락·SQLite 조회만 남기 때문이다.
+const CHANNEL_WRITER_STUCK_SECS: u64 = 10;
+
 /// master 좌석 writer 가 데몬 Inject 를 쓰는 중이거나 끝난 지 [`CHANNEL_ROW_GAP_MS`] 가 안 됐는가(자기·타 생산자 무관).
 fn master_inject_settling(surface: &crate::state::Surface) -> bool {
     surface
@@ -1579,10 +1584,15 @@ fn schedule_paced_followup(daemon: &Arc<Daemon>) {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&key);
         // 부서 데몬도 인바운드 즉시 시도(ingest)와 같은 배달만 한다 — sweep 의 재배달·재스폰은 돌리지 않는다.
-        let mut guard = d.channels.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(conn) = guard.as_mut() {
-            let _ = deliver_new_inbox_with(&d, conn);
-        }
+        // ★(R4-04) 본문(std 뮤텍스 channels · SQLite · 어댑터 파일 판독 · 파서 락 화면 관측)은 **블로킹 풀**에서 돈다 —
+        //   async 워커에서 돌리면 sweep(같은 락 보유)과 겹칠 때 저코어 기계에서 워커 둘이 선다.
+        let _ = tokio::task::spawn_blocking(move || {
+            let mut guard = d.channels.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(conn) = guard.as_mut() {
+                let _ = deliver_new_inbox_with(&d, conn);
+            }
+        })
+        .await;
     });
 }
 
@@ -1708,7 +1718,12 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
             && (!out.delivered.is_empty()
                 || daemon.get_surface(sid).is_some_and(|s| master_inject_settling(&s)))
         {
-            out.hold = Some(InboxHold::Paced);
+            // ★(R1-F4) writer 가 막혔으면(한 arm 이 [`CHANNEL_WRITER_STUCK_SECS`] 초과) 간격이 아니라 인계 정체다 —
+            //   후속 루프를 걸지 않는다(15s sweep 이 이어받는다 · 사유 writer_busy 로 보인다).
+            let stuck = daemon.get_surface(sid).is_some_and(|s| {
+                s.inject_track.stuck_over(std::time::Duration::from_secs(CHANNEL_WRITER_STUCK_SECS))
+            });
+            out.hold = Some(if stuck { InboxHold::WriterBusy } else { InboxHold::Paced });
             break;
         }
         // ① 주입 직전 재확인(행마다 — 루프 중 quiescing·모달·초안 봉합).
@@ -2495,7 +2510,9 @@ pub fn spawn_channel_sweep(daemon: Arc<Daemon>) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
         loop {
             tick.tick().await;
-            sweep_once(&daemon);
+            // ★(R4-04) sweep 본문(채널 std 뮤텍스 · SQLite · 행마다 화면 관측)은 블로킹 풀에서 — async 워커를 붙잡지 않는다.
+            let d = Arc::clone(&daemon);
+            let _ = tokio::task::spawn_blocking(move || sweep_once(&d)).await;
         }
     });
 }
@@ -4060,6 +4077,44 @@ mod tests {
     #[cfg(unix)]
     fn h3_done(m: &Arc<crate::state::Surface>) {
         let _ = m.child.lock().unwrap().kill();
+    }
+
+    /// ★(R1-F4) master 좌석 writer 가 한 Inject arm 에서 막혔다(에이전트가 stdin 을 읽지 않음 — `active` 가 내려오지 않는다) —
+    /// 배달 루프는 `Paced`(500ms 후속 재무장 → 종료 조건 없는 2Hz 루프)가 아니라 `WriterBusy` 로 멈춰 15s sweep 에 넘긴다.
+    /// 음성 대조: 방금 시작한 정상 arm 은 종전대로 `Paced`. RED(HEAD 1b614e47): 막힌 writer 에서도 Paced.
+    #[cfg(unix)]
+    #[test]
+    fn h3_stuck_master_writer_does_not_rearm_paced_followup() {
+        let (d, m) = h3_rig("h3-stuck");
+        let id = h3_seed(&d, "막힌 writer 뒤의 행", now());
+        m.inject_track.begin();
+        m.inject_track.backdate_begin(std::time::Duration::from_secs(CHANNEL_WRITER_STUCK_SECS + 20));
+        let hold = {
+            let mut g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(&d, g.as_mut().unwrap()).hold
+        };
+        assert!(hold == Some(InboxHold::WriterBusy), "막힌 writer 를 간격(Paced)으로 봤다 — 후속 루프가 무기한 재무장된다");
+        assert_eq!(h3_state(&d, id), "new", "행은 new 로 남아야 한다(유실 0)");
+        m.inject_track.backdate_begin(std::time::Duration::from_millis(10));
+        let hold = {
+            let mut g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(&d, g.as_mut().unwrap()).hold
+        };
+        assert!(hold == Some(InboxHold::Paced), "정상 arm 의 간격을 잃었다");
+        m.inject_track.end();
+        h3_done(&m);
+    }
+
+    /// ★(R4-04) 후속 루프·sweep 본문은 블로킹 풀에서 돈다(소스 핀 — async 워커에서 std 뮤텍스·SQLite 를 잡지 않는다).
+    #[test]
+    fn channel_followup_and_sweep_run_on_blocking_pool() {
+        let src = include_str!("channels.rs");
+        let f = src.find("fn schedule_paced_followup(").expect("후속 루프 소실");
+        let body = &src[f..f + src[f..].find("\n}\n").expect("끝")];
+        assert!(body.contains("tokio::task::spawn_blocking"), "후속 루프 본문이 async 워커에서 돈다");
+        let w = src.find("pub fn spawn_channel_sweep(").expect("sweep 소실");
+        let body = &src[w..w + src[w..].find("\n}\n").expect("끝")];
+        assert!(body.contains("spawn_blocking(move || sweep_once("), "sweep 본문이 async 워커에서 돈다");
     }
 
     /// ★(리뷰 F1-H3-batch-flush-stale-verdict) 간격(루프당 1행 · 앞 Inject + [`CHANNEL_ROW_GAP_MS`])을 지키며 배달
