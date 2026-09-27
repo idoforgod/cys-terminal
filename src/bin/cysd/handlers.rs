@@ -9070,7 +9070,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         updated_at: at,
                     });
                     // ★(R2NC-F3) 세운 호출자를 기록한다 — 그 프로세스가 해제 없이 죽으면 데몬이 곧바로 푼다.
-                    *surface.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner()) = caller_pid.map(|p| (p, at));
+                    // ★(수정 단계 후속) 단, 호출자가 `bind_owner: true` 로 **자기 수명을 창에 묶겠다고 밝힌 때만**(cycle-agent —
+                    //   창 전체를 한 프로세스로 산다). 수동 `cys quiesce` 는 표지만 세우고 곧바로 끝나는 단명 CLI 라, 묶으면 다음
+                    //   판독에서 'owner_exited' 로 풀려 문서화된 명령이 무동작이 된다(손으로 /clear 하며 세운 창에 주입 · ①).
+                    //   묶지 않은 창은 종전대로 상한(600s)·해제 호출로만 풀린다. 구 CLI(키 없음)도 같은 종전 경로 = 안전 방향.
+                    let bind_owner = params.get("bind_owner").and_then(|v| v.as_bool()).unwrap_or(false);
+                    *surface.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner()) =
+                        if bind_owner { caller_pid.map(|p| (p, at)) } else { None };
                 } else if cur.as_ref().map(|s| s.state == "quiescing").unwrap_or(false) {
                     // 아직 quiescing일 때만 해제(그 사이 master 자기보고가 있었으면 불간섭).
                     *cur = Some(crate::state::AgentStatus {

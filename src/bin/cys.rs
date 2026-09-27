@@ -18868,7 +18868,18 @@ fn resolve_role_or_surface(
 /// cycle-agent가 대상 surface를 quiescing(=채널 inbox 주입 보류)으로 마킹/해제한다(§2.2 S5).
 /// clear 직전 on, resume 후(또는 실패해도) off로 호출해 clear·복원 구간의 채널 주입을 봉한다.
 fn set_surface_quiescing(sid: u64, on: bool) -> Result<(), String> {
-    request("surface.quiesce", json!({"surface_id": sid, "on": on})).map(|_| ())
+    request("surface.quiesce", cycle_quiesce_params(sid, on)).map(|_| ())
+}
+
+/// ★(0.14.42 · R2NC-F3 후속) cycle-agent 의 quiescing 요청 인자 — 세울 때 `bind_owner: true` 로 **이 프로세스의 수명을 창에
+/// 묶는다**(해제 없이 죽으면 데몬이 곧바로 푼다 · SIGTERM·Bash 도구 시한). 수동 `cys quiesce`(단명 CLI)는 묶지 않는다 —
+/// 묶으면 CLI 가 끝나는 즉시 풀려 명령이 무동작이 된다(그 창은 종전대로 상한·해제 호출로만 풀린다).
+fn cycle_quiesce_params(sid: u64, on: bool) -> Value {
+    if on {
+        json!({"surface_id": sid, "on": true, "bind_owner": true})
+    } else {
+        json!({"surface_id": sid, "on": false})
+    }
 }
 
 /// C3 저장검증 대상 제외 판정 — 선언이 `retired`(은퇴) 또는 `foreign-scope`(실재하는 남의 팩)면 true.
@@ -35066,6 +35077,21 @@ mod tests {
         assert!(g.starts_with("[RESUME]") && g.contains("역할=master"), "{g}");
         assert!(!g.contains("이미 보유 중이니"), "거짓 고지(지침 이미 보유)가 남았다: {g}");
         assert!(g.contains("MASTER_DIRECTIVE.md") && g.contains("끝까지"), "지침 파일 읽기 안내가 없다: {g}");
+    }
+
+    /// ★(R2NC-F3 후속) cycle-agent 만 quiescing 창에 자기 수명을 묶는다(`bind_owner`) — 수동 `cys quiesce` 는 묶지 않는다
+    /// (단명 CLI 가 끝나자마자 데몬이 창을 풀어 명령이 무동작이 되던 것 · cysd h1_manual_quiesce_… 와 짝).
+    #[test]
+    fn only_cycle_agent_binds_its_lifetime_to_the_quiescing_window() {
+        assert_eq!(cycle_quiesce_params(7, true), json!({"surface_id": 7, "on": true, "bind_owner": true}));
+        assert_eq!(cycle_quiesce_params(7, false), json!({"surface_id": 7, "on": false}));
+        let src = include_str!("cys.rs");
+        let setter = refl_fn_body(src, "set_surface_quiescing");
+        assert!(setter.contains("cycle_quiesce_params(sid, on)"), "cycle-agent 설정기가 묶기 인자를 쓰지 않는다");
+        let arm_at = src.find("Command::Quiesce { surface, off } =>").expect("수동 quiesce 갈래");
+        let arm = &src[arm_at..arm_at + 400];
+        assert!(arm.contains("json!({\"surface_id\": sid, \"on\": !off})") && !arm.contains("bind_owner"),
+            "수동 `cys quiesce` 가 호출자 수명을 창에 묶는다(단명 CLI → 즉시 해제 · 무동작)");
     }
 
     /// 훅 발화 가능성 진리표: 실재하는 팩 훅만 인정하고 최근 레인 가드 무발화는 CLI 주입으로 강등한다.

@@ -22313,14 +22313,15 @@ mod h1_queue_quiesce_tests {
         let mut starve = HashMap::new();
         let mut stale = HashMap::new();
         // ① 살아 있는 호출자(이 검체 프로세스)가 세운 창 — 붙잡는다.
-        let r = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true}), Some(std::process::id()));
+        //   (cycle-agent 는 `bind_owner: true` 로 자기 수명을 창에 묶는다 — 수동 `cys quiesce` 는 묶지 않는다: 아래 음성 대조 검체)
+        let r = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true, "bind_owner": true}), Some(std::process::id()));
         assert_eq!(r["ok"], json!(true), "{r}");
         s.pending_queue.lock().unwrap().push_back(d.next_queue_entry("창 안 항목".into(), None, "test"));
         quiet(&s);
         deliver_queued(&d, &mut depth, &mut starve, &mut stale);
         assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "살아 있는 사이클 창을 풀었다");
         // ② 죽은 호출자가 세운 창(cycle-agent SIGTERM) — 다음 틱에 곧바로 풀고 배달한다.
-        let r = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true}), Some(dead_pid()));
+        let r = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true, "bind_owner": true}), Some(dead_pid()));
         assert_eq!(r["ok"], json!(true), "{r}");
         quiet(&s);
         deliver_queued(&d, &mut depth, &mut starve, &mut stale);
@@ -22335,9 +22336,49 @@ mod h1_queue_quiesce_tests {
             "고아 해제 사실이 드러나지 않았다"
         );
         // ③ H0 도 같은 판정(스케줄 push·CEO 자동결재 경로).
-        let _ = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true}), Some(dead_pid()));
+        let _ = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true, "bind_owner": true}), Some(dead_pid()));
         let axes = MachineHoldAxes { quiescing: true, ..MachineHoldAxes::NONE };
         assert_eq!(machine_direct_hold_masked(&d, &s, axes, axes), None, "H0 가 죽은 호출자의 창을 붙잡았다");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(수정 단계 후속 · 0d407e21 의 새 위험) 수동 `cys quiesce`(단명 CLI — 표지를 세우고 곧바로 끝난다)는 호출자 수명을 창에
+    /// 묶지 않는다(`bind_owner` 없음). 묶으면 그 CLI 가 끝나자마자 다음 판독에서 'owner_exited' 로 풀려, 문서화된 명령
+    /// ('surface 를 quiescing 으로 표시')이 사실상 무동작이 된다(사람이 손으로 /clear 하며 세운 창에 주입이 들어간다 · ①).
+    /// 그 창은 종전대로 상한(600s)·해제 호출로만 풀린다. RED(HEAD a96357d1): 죽은 CLI pid 로 곧바로 풀렸다.
+    #[cfg(unix)]
+    #[test]
+    fn h1_manual_quiesce_is_not_released_by_the_short_lived_cli_exit() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ReapEnvGuard::set(&[("CYS_QUEUE_STARVE_ALERT_SECS", "0"), ("CYS_QUEUE_MIN_INTERVAL_SECS", "0")]);
+        let (d, s) = rig("h1-manual");
+        let mut depth = HashMap::new();
+        let mut starve = HashMap::new();
+        let mut stale = HashMap::new();
+        let r = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true}), Some(dead_pid()));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        assert!(s.quiesce_owner.lock().unwrap().is_none(), "수동 표지에 호출자 수명이 묶였다");
+        s.pending_queue.lock().unwrap().push_back(d.next_queue_entry("수동 창 안 항목".into(), None, "test"));
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "수동 `cys quiesce` 창이 CLI 종료만으로 풀렸다(무동작 명령)");
+        assert_eq!(
+            s.agent_status.lock().unwrap().as_ref().map(|st| st.state.clone()).as_deref(),
+            Some("quiescing"),
+            "수동 표지가 해제됐다"
+        );
+        assert!(
+            !d.bus.tail(300).iter().any(|e| e["name"] == "surface.quiescing" && e["payload"]["reason"] == "owner_exited"),
+            "수동 표지를 owner_exited 로 풀었다"
+        );
+        let axes = MachineHoldAxes { quiescing: true, ..MachineHoldAxes::NONE };
+        assert!(machine_direct_hold_masked(&d, &s, axes, axes).is_some(), "H0 가 수동 창을 풀었다");
+        // 해제 호출은 종전대로 푼다.
+        let r = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": false}), Some(dead_pid()));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "해제 뒤 배달되지 않았다");
         let _ = s.child.lock().unwrap().kill();
     }
 
