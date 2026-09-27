@@ -1523,6 +1523,10 @@ pub struct Surface {
     /// true=발화 가능(임계 미만 관측됨). 분리하면 같은 교차에 두 경로가 각각 발화해
     /// master/CSO가 cycle-agent를 이중 집행한다. swap(false)가 원자적 1회 발화를 보장.
     pub ctx_threshold_armed: AtomicBool,
+    /// ★(0.14.42 · RV-R2NC-1) clear 직후 바닥 가드 — clear+지침 재주입 직후 바닥이 이미 임계를 막는 좌석(200K 창의
+    /// master·CEO)이 곧바로 재발화해 CSO 가 같은 좌석을 다시 clear 하는 재주입 고리를 끊는다. 판정은
+    /// `handlers::maybe_fire_context_threshold` 하나에서만 쓴다(`crate::usage::CtxLoopGuard` 독 코멘트).
+    pub ctx_loop_guard: Mutex<crate::usage::CtxLoopGuard>,
     /// (B2) OSC 9/99/777 알림 스캐너 carry — reader 스레드 전용(단일 스레드 접근이라 Mutex면 충분).
     /// strip 전 raw chunk를 누적해 완성 OSC 시퀀스만 추출한다(화면 렌더/strip 경로와 독립).
     pub osc_carry: Mutex<Vec<u8>>,
@@ -5653,6 +5657,7 @@ impl Daemon {
             config_dir_trusted,
             pack_reinject: Mutex::new(None),
             ctx_threshold_armed: AtomicBool::new(true),
+            ctx_loop_guard: Mutex::new(crate::usage::CtxLoopGuard::default()),
             // 능력 가드: 생성 시 역할에서 도출(reviewer-*=read/search, full=worker/master/cso,
             // 그 외 deny-by-default none). claim_role이 역할 전이 시 동기 재도출한다.
             caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),

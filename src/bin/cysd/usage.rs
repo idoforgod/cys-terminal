@@ -103,6 +103,131 @@ pub struct ObservedUsage {
     pub updated_at: f64,
 }
 
+// ───────────────── ★(0.14.42 · RV-R2NC-1) clear 직후 바닥 가드 — 재주입 고리 차단 ─────────────────
+//
+// 【왜】 918e7365 뒤 claude 좌석은 clear 사이클마다 합성 지침 **전문**(master 약 158KB ≈ 72K 토큰 · CEO 약 167KB ≈ 76K ·
+// worker 약 91KB ≈ 42K)을 붙여 넣는다. 1M 창에서는 clear 뒤 바닥이 약 10~13% 라 무해하지만, 200K 창(문서 기본
+// `CYS_CLAUDE_CTX_WINDOW`)에서는 master·CEO 의 바닥이 이미 60% 근처·이상이다(샌드박스 run-m200: 붙여넣기 전 30.4% →
+// 뒤 66.7% → 곧바로 `context.threshold` 재발화). 새 세션 파일이 래치를 재무장하므로(아래 `collect_for`) CSO 는 방금
+// clear 한 master 를 또 clear 하고, 같은 7만 토큰을 또 붙여 넣는다 — 시간당 경보 상한까지 도는 **재주입 고리**(①)이고
+// 그동안 master 는 일할 여유가 없다(② clear 헛돌기). 바닥이 임계 아래여도 여유가 6~8% 면 몇 턴마다 사이클이 돈다.
+//
+// 【무엇】 좌석마다 "마지막 발화 → 그 뒤 첫 세션 교체(clear) → 정착 창([`CTX_FLOOR_SETTLE_SECS`]) 안 최고치 = 바닥" 을
+// 잰다. 그 세션의 교차가 바닥에서 [`CTX_FLOOR_MIN_GROWTH`] 미만 자란 것이면(= 일한 만큼이 아니라 지침 크기만큼 찬 것)
+// 발화 대신 그 좌석 임계를 `바닥 + ROOM`(상한 [`CTX_FLOOR_CEIL`])으로 올리고 오너에게 알린다. 올린 임계를 넘으면 종전대로
+// 발화한다(무clear 아님). 1M 창 좌석은 clear 뒤 바닥이 낮아 교차 때 성장이 수십 %라 무변화다.
+//
+// 【실패 방향】 재료가 없으면(세션 교체 미관측 · 정착 창 안 관측 없음 · 발화 이력 없음) **종전대로 발화**한다 — 고리가
+// 남는 쪽이지 clear 가 멈추는 쪽이 아니다. 올린 임계는 [`CTX_FLOOR_CEIL`] 을 넘지 않고, 바닥이 그 위면 발화한다(②).
+// 정책(지침 크기·창별 임계)은 오너 결정으로 남는다 — 이 가드는 그 정책이 물리적으로 불가능한 좌석에서 고리만 끊는다.
+
+/// clear(세션 교체) 뒤 바닥을 재는 정착 창(초) — 재주입 대기(≤75s)·붙여넣기 처리·첫 응답을 덮는다.
+pub const CTX_FLOOR_SETTLE_SECS: f64 = 300.0;
+/// 교차가 '일해서 찬 것'으로 인정되는 바닥 대비 최소 성장(%p). 미만이면 바닥이 임계를 막은 것이다.
+pub const CTX_FLOOR_MIN_GROWTH: u8 = 10;
+/// 바닥이 임계를 막은 좌석에 주는 작업 여유(%p) — 올린 임계 = 바닥 + ROOM.
+pub const CTX_FLOOR_ROOM: u8 = 15;
+/// 올린 임계의 천장(%). 이 위로는 올리지 않는다 — 바닥이 여기 이상이면 발화한다(② 무clear 봉인).
+pub const CTX_FLOOR_CEIL: u8 = 85;
+
+/// 교차 판정 결과.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtxCrossVerdict {
+    /// 종전대로 `context.threshold` 발화. `floor_limited` = 바닥이 천장 근처라 올리지 못하고 발화함(오너 경고 대상).
+    Fire { floor_limited: bool },
+    /// 발화하지 않고 임계를 `raised_to` 로 올렸다(clear 직후 바닥 `floor`).
+    Suppress { floor: u8, raised_to: u8 },
+}
+
+/// 좌석별 clear 직후 바닥 가드(순수 상태 — 시각은 호출자가 단조 초로 준다). `Surface::ctx_loop_guard`.
+#[derive(Debug, Default, Clone)]
+pub struct CtxLoopGuard {
+    /// 마지막 `context.threshold` 발화 시각.
+    pub fired_at: Option<f64>,
+    /// 마지막 발화 **뒤 첫** 세션 교체 시각(정착 창의 시작).
+    pub reset_at: Option<f64>,
+    /// 정착 창 안에서 관측한 최고치 = 이번 세션의 바닥.
+    pub settle_peak: Option<u8>,
+    /// 이번 세션 교체에서 이미 한 번 올렸다(세션당 1회 — 같은 세션의 다음 교차는 발화).
+    pub suppressed_this_reset: bool,
+    /// 올린 임계(없으면 기본 임계).
+    pub raised: Option<u8>,
+    /// 올릴 때의 컨텍스트 창 — 창이 바뀌면(모델 교체 · 1M 전환) 올린 임계를 버린다.
+    pub raised_window: Option<u64>,
+    /// 천장 발화 경고를 이미 냈다(좌석당 1회 — feed 소음 금지).
+    pub ceiling_warned: bool,
+}
+
+impl CtxLoopGuard {
+    /// 세션 교체(clear·새 세션) 관측 — 마지막 발화 **뒤 첫** 교체만 정착 창을 연다(발화 이력이 없으면 무시).
+    pub fn note_session_change(&mut self, now: f64) {
+        let Some(fired) = self.fired_at else { return };
+        if self.reset_at.is_some_and(|r| r >= fired) {
+            return;
+        }
+        self.reset_at = Some(now);
+        self.settle_peak = None;
+        self.suppressed_this_reset = false;
+    }
+
+    /// 관측 1건 — 정착 창 안이면 바닥 후보(최고치)에 싣는다. 모든 보고에서 교차 판정 **전에** 부른다.
+    pub fn observe(&mut self, pct: u8, now: f64) {
+        if let Some(r) = self.reset_at {
+            if now >= r && now - r <= CTX_FLOOR_SETTLE_SECS {
+                self.settle_peak = Some(self.settle_peak.map_or(pct, |p| p.max(pct)));
+            }
+        }
+    }
+
+    /// 이 좌석의 실효 임계 = max(기본 임계, 올린 임계). 창이 바뀌었으면 올린 임계를 버린다(창 미상은 유지).
+    pub fn effective_threshold(&mut self, base: u8, window: Option<u64>) -> u8 {
+        if let (Some(w), Some(rw)) = (window, self.raised_window) {
+            if w != rw {
+                self.raised = None;
+                self.raised_window = None;
+            }
+        }
+        base.max(self.raised.unwrap_or(0))
+    }
+
+    /// 래치가 소진된 교차(`pct >= eff`) 1건의 판정. 발화면 발화 시각을 기록한다.
+    pub fn on_crossing(&mut self, pct: u8, eff: u8, window: Option<u64>, now: f64) -> CtxCrossVerdict {
+        let post_clear = matches!((self.fired_at, self.reset_at), (Some(f), Some(r)) if r >= f)
+            && !self.suppressed_this_reset;
+        if post_clear {
+            if let Some(floor) = self.settle_peak {
+                if pct.saturating_sub(floor) < CTX_FLOOR_MIN_GROWTH {
+                    let target = floor.saturating_add(CTX_FLOOR_ROOM).min(CTX_FLOOR_CEIL);
+                    if target > eff {
+                        self.raised = Some(target);
+                        self.raised_window = window;
+                        self.suppressed_this_reset = true;
+                        return CtxCrossVerdict::Suppress { floor, raised_to: target };
+                    }
+                    // 천장 — 더 올릴 수 없다. clear 가 유일한 처방이므로 발화한다(② 봉인).
+                    self.fired_at = Some(now);
+                    return CtxCrossVerdict::Fire { floor_limited: true };
+                }
+            }
+        }
+        self.fired_at = Some(now);
+        CtxCrossVerdict::Fire { floor_limited: false }
+    }
+}
+
+/// 두 관측의 세션 파일이 **다른 세션**인가 — 둘 다 비어 있지 않고 파일 줄기(세션 id)가 다를 때만 참.
+/// 경로 표기 차이(심링크·/private 접두)는 줄기가 같아 교체로 세지 않는다. 결측은 교체가 아니다(가드 비발동 = 종전 거동).
+pub(crate) fn session_file_changed(prev: &str, next: &str) -> bool {
+    if prev.trim().is_empty() || next.trim().is_empty() {
+        return false;
+    }
+    let stem = |p: &str| std::path::Path::new(p).file_stem().map(|s| s.to_os_string());
+    match (stem(prev), stem(next)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
 /// surface별 tail 진행 상태 (수집기 태스크 로컬 — 데몬 상태 오염 없음)
 struct TailState {
     path: PathBuf,
@@ -271,10 +396,19 @@ fn collect_for(
     // tail 상태 초기화/전환: 경로가 바뀌었으면 영속 오프셋(없으면 파일 끝 창)에서 새로 시작
     let need_reset = tails.get(&s.id).map(|t| t.path != path).unwrap_or(true);
     if need_reset {
+        let old_path = tails.get(&s.id).map(|t| t.path.to_string_lossy().into_owned());
         tails.insert(s.id, TailState::attach(daemon, path.clone(), heuristic, now));
         // 새 세션 파일 = 새 세션 — 에지 게이트 재무장. 직전 세션이 임계 위에서 끝났어도
         // 새 세션이 곧장 임계 이상으로 시작하면(거대 지침 재주입) 발화해야 한다.
         s.ctx_threshold_armed.store(true, Ordering::Relaxed);
+        // ★(RV-R2NC-1) 같은 교체를 clear 직후 바닥 가드에도 알린다 — 그 세션이 **바닥만으로** 임계를 넘으면
+        //   재발화 대신 임계를 올린다(`CtxLoopGuard`). 첫 부착(이전 tail 없음)은 교체 증거가 아니다(가드 비발동).
+        if old_path.is_some_and(|o| session_file_changed(&o, &path.to_string_lossy())) {
+            s.ctx_loop_guard
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .note_session_change(daemon.started_instant.elapsed().as_secs_f64());
+        }
     } else if let Some(t) = tails.get_mut(&s.id) {
         t.heuristic = heuristic;
         if heuristic {
@@ -2930,5 +3064,189 @@ mod r3_1_verdict_tests {
         for bad in ["a b", "a;b", "a$b", "a`b", "a/b", "한글", "a\nb", "a.b"] {
             assert!(!is_plausible_session_id(bad), "{bad:?}");
         }
+    }
+}
+
+/// ★(0.14.42 · RV-R2NC-1) clear 직후 바닥 가드의 순수 판정 핀 — 시각은 단조 초를 직접 준다.
+/// 통합 핀은 `handlers::tests::context_threshold_post_clear_floor_does_not_refire_the_clear_loop`.
+#[cfg(test)]
+mod ctx_loop_guard_tests {
+    use super::*;
+
+    /// 한 사이클을 흉내낸다: 교차(발화 여부 반환) — `maybe_fire_context_threshold` 와 같은 순서(관측 → 실효 임계 → 교차).
+    fn report(g: &mut CtxLoopGuard, armed: &mut bool, pct: u8, base: u8, window: Option<u64>, now: f64)
+        -> Option<CtxCrossVerdict> {
+        g.observe(pct, now);
+        let eff = g.effective_threshold(base, window);
+        if pct < eff {
+            *armed = true;
+            return None;
+        }
+        if !std::mem::replace(armed, false) {
+            return None;
+        }
+        let v = g.on_crossing(pct, eff, window, now);
+        if matches!(v, CtxCrossVerdict::Suppress { .. }) {
+            *armed = true; // 억제는 소진이 아니다(maybe_fire_context_threshold 가 래치를 다시 세운다).
+        }
+        Some(v)
+    }
+    const W200K: Option<u64> = Some(200_000);
+    const W1M: Option<u64> = Some(1_000_000);
+    const FIRE: Option<CtxCrossVerdict> = Some(CtxCrossVerdict::Fire { floor_limited: false });
+
+    /// 200K master(run-m200 모양): 발화 → clear → 30% → 붙여넣기 67% 는 발화하지 않고 82% 로 올린다 →
+    /// 82% 에서 한 번 발화 → 다음 clear 뒤 67% 는 조용하다(고리 없음).
+    #[test]
+    fn ctx_loop_guard_breaks_the_200k_master_reinject_loop() {
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE, "부트 뒤 첫 교차는 발화");
+        g.note_session_change(100.0);
+        armed = true; // 새 세션 파일 재무장(usage.rs)
+        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 100.5), None);
+        assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, 106.0),
+                   Some(CtxCrossVerdict::Suppress { floor: 67, raised_to: 82 }), "clear 직후 바닥에서 재발화했다(재주입 고리)");
+        assert_eq!(report(&mut g, &mut armed, 75, 60, W200K, 400.0), None, "올린 임계 아래에서 발화");
+        assert_eq!(report(&mut g, &mut armed, 82, 60, W200K, 2_000.0), FIRE, "올린 임계에서 발화하지 않았다(② 무clear)");
+        g.note_session_change(2_100.0);
+        armed = true;
+        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 2_100.5), None);
+        assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, 2_106.0), None, "다음 사이클에 고리가 다시 섰다");
+    }
+
+    /// 억제 직후 다음 보고가 올린 임계를 **한 번에 건너뛰어도**(큰 파일 읽기 한 번 · 67% → 90%) 발화한다 —
+    /// 억제가 래치를 소진했다면 그 세션 내내 발화하지 않는다(② 무clear).
+    #[test]
+    fn ctx_loop_guard_suppression_keeps_the_latch_armed() {
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
+        g.note_session_change(100.0);
+        armed = true;
+        assert!(matches!(report(&mut g, &mut armed, 67, 60, W200K, 106.0), Some(CtxCrossVerdict::Suppress { .. })));
+        assert!(armed, "억제가 래치를 소진했다");
+        assert_eq!(report(&mut g, &mut armed, 90, 60, W200K, 1_000.0), FIRE, "올린 임계를 건너뛴 보고에서 발화하지 않았다");
+    }
+
+    /// 1M 창(오너 좌석): clear 뒤 바닥 13% — 60% 교차는 성장이 크므로 종전대로 발화(정책 무변화).
+    #[test]
+    fn ctx_loop_guard_leaves_1m_seats_on_the_60_percent_policy() {
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 60, 60, W1M, 0.0), FIRE);
+        g.note_session_change(100.0);
+        armed = true;
+        assert_eq!(report(&mut g, &mut armed, 13, 60, W1M, 160.0), None);
+        assert_eq!(report(&mut g, &mut armed, 15, 60, W1M, 350.0), None);
+        assert_eq!(report(&mut g, &mut armed, 60, 60, W1M, 9_000.0), FIRE, "1M 좌석의 60% clear 가 막혔다");
+        assert_eq!(g.raised, None, "1M 좌석의 임계가 올라갔다");
+    }
+
+    /// 200K CEO 경량(여유 6%): 바닥 54~57% 에서 몇 턴 만에 60% — 몇 턴마다 도는 사이클도 올린다.
+    #[test]
+    fn ctx_loop_guard_raises_a_few_turn_cycle_too() {
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
+        g.note_session_change(100.0);
+        armed = true;
+        for (pct, t) in [(15, 101.0), (54, 160.0), (55, 200.0), (57, 250.0)] {
+            assert_eq!(report(&mut g, &mut armed, pct, 60, W200K, t), None);
+        }
+        assert_eq!(report(&mut g, &mut armed, 60, 60, W200K, 600.0),
+                   Some(CtxCrossVerdict::Suppress { floor: 57, raised_to: 72 }));
+    }
+
+    /// 200K 좌석이라도 바닥이 낮고(30%) 일해서 60% 에 닿았으면 종전대로 발화한다(오탐 금지).
+    #[test]
+    fn ctx_loop_guard_fires_when_the_seat_grew_by_real_work() {
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
+        g.note_session_change(100.0);
+        armed = true;
+        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 150.0), None);
+        assert_eq!(report(&mut g, &mut armed, 45, 60, W200K, 390.0), None, "정착 창 안의 빠른 성장");
+        assert_eq!(report(&mut g, &mut armed, 60, 60, W200K, 900.0), FIRE, "일해서 찬 교차가 억제됐다");
+        assert_eq!(g.raised, None);
+    }
+
+    /// 세션 교체가 없는 재교차(자기보고 흔들림 59↔61·압축)는 가드 대상이 아니다 — 종전대로 발화.
+    #[test]
+    fn ctx_loop_guard_ignores_recross_without_a_session_change() {
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, None, 0.0), FIRE);
+        assert_eq!(report(&mut g, &mut armed, 59, 60, None, 10.0), None);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, None, 20.0), FIRE);
+        // 발화 이력 없는 좌석의 세션 교체도 무시(부트·phoenix --resume 은 종전대로 발화).
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        g.note_session_change(5.0);
+        assert_eq!(report(&mut g, &mut armed, 70, 60, W1M, 6.0), FIRE, "발화 이력 없는 첫 교차가 억제됐다");
+    }
+
+    /// 천장: 바닥이 85% 근처면 더 올리지 않고 발화한다(② 봉인) · 정착 창 안 관측이 없으면 발화한다(실패 방향).
+    #[test]
+    fn ctx_loop_guard_never_raises_past_the_ceiling_and_fails_toward_firing() {
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
+        g.note_session_change(100.0);
+        armed = true;
+        assert_eq!(report(&mut g, &mut armed, 80, 60, W200K, 110.0),
+                   Some(CtxCrossVerdict::Suppress { floor: 80, raised_to: CTX_FLOOR_CEIL }));
+        assert_eq!(report(&mut g, &mut armed, 85, 60, W200K, 3_000.0), FIRE, "천장 임계에서 발화하지 않았다");
+        g.note_session_change(3_100.0);
+        armed = true;
+        assert_eq!(report(&mut g, &mut armed, 86, 60, W200K, 3_110.0),
+                   Some(CtxCrossVerdict::Fire { floor_limited: true }), "천장 위 바닥에서 발화를 막았다(② 무clear)");
+        // 역할 override 가 천장 이상(90)이면 올릴 곳이 없다 — 발화.
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 91, 90, W200K, 0.0), FIRE);
+        g.note_session_change(100.0);
+        armed = true;
+        assert_eq!(report(&mut g, &mut armed, 91, 90, W200K, 110.0), Some(CtxCrossVerdict::Fire { floor_limited: true }));
+        // 정착 창(300s) 안에 관측이 하나도 없으면 바닥 미상 = 종전대로 발화.
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
+        g.note_session_change(100.0);
+        armed = true;
+        assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, 100.0 + CTX_FLOOR_SETTLE_SECS + 1.0), FIRE);
+    }
+
+    /// 창이 바뀌면(1M 모델로 전환) 올린 임계를 버린다 · 창 미상은 유지한다.
+    #[test]
+    fn ctx_loop_guard_drops_the_raise_when_the_window_changes() {
+        let mut g = CtxLoopGuard { raised: Some(82), raised_window: W200K, ..Default::default() };
+        assert_eq!(g.effective_threshold(60, None), 82, "창 미상에서 올린 임계를 버렸다");
+        assert_eq!(g.effective_threshold(60, W200K), 82);
+        assert_eq!(g.effective_threshold(60, W1M), 60, "1M 전환 뒤에도 올린 임계가 남았다");
+        assert_eq!(g.raised, None);
+        let mut g = CtxLoopGuard { raised: Some(70), raised_window: W200K, ..Default::default() };
+        assert_eq!(g.effective_threshold(75, W200K), 75, "기본 임계가 더 높으면 그것을 쓴다");
+    }
+
+    /// 세션 교체 판정 — 줄기(세션 id)가 다를 때만 · 결측·표기 차이는 교체가 아니다.
+    #[test]
+    fn session_file_changed_compares_session_stems_only() {
+        assert!(session_file_changed("/p/proj/a.jsonl", "/p/proj/b.jsonl"));
+        assert!(!session_file_changed("/p/proj/a.jsonl", "/private/p/proj/a.jsonl"), "표기 차이를 교체로 셌다");
+        assert!(!session_file_changed("", "/p/proj/b.jsonl"), "결측을 교체로 셌다");
+        assert!(!session_file_changed("/p/proj/a.jsonl", ""), "결측을 교체로 셌다");
+        assert!(!session_file_changed("/p/proj/a.jsonl", "/p/proj/a.jsonl"));
+    }
+
+    /// 배선 핀: 두 관측 경로(transcript 수집기 · statusline 보고)가 세션 교체를 가드에 알리고, 발화 판정은 가드를
+    /// 거친다 — 한 곳이라도 빠지면 그 경로의 좌석에서 고리가 되살아난다.
+    #[test]
+    fn ctx_loop_guard_is_wired_into_both_observation_paths_and_the_gate() {
+        let usage = include_str!("usage.rs");
+        let collect = &usage[usage.find("fn collect_for(").expect("collect_for")..];
+        let collect = &collect[..collect.find("\n}\n").expect("collect_for 끝")];
+        assert!(collect.contains("session_file_changed(") && collect.contains(".note_session_change("),
+                "transcript 수집기의 세션 교체가 가드에 닿지 않는다");
+        let handlers = include_str!("handlers.rs");
+        let report = &handlers[handlers.find("\"usage.report\" =>").expect("usage.report")..];
+        let report = &report[..report.find("\"usage.report_account\" =>").expect("다음 팔")];
+        let note = report.find(".note_session_change(").expect("statusline 경로가 세션 교체를 가드에 알리지 않는다");
+        let fire = report.find("maybe_fire_context_threshold(").expect("statusline 발화");
+        assert!(note < fire, "세션 교체 통지가 발화 판정보다 뒤다(교차 보고에서 가드가 늦는다)");
+        let gate = &handlers[handlers.find("pub(crate) fn maybe_fire_context_threshold(").expect("gate")..];
+        let gate = &gate[..gate.find("\n}\n").expect("gate 끝")];
+        assert!(gate.contains(".observe(") && gate.contains(".on_crossing("), "발화 판정이 가드를 거치지 않는다");
     }
 }

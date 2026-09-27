@@ -3028,17 +3028,85 @@ pub(crate) fn maybe_fire_context_threshold(
         return;
     }
     let role = surface.role.lock().unwrap().clone();
-    let threshold = pick_context_threshold(
+    let base_threshold = pick_context_threshold(
         cys::overrides::context_clear_pct(role.as_deref().unwrap_or("")),
         context_threshold_pct(),
     );
-    if pct < threshold {
-        surface.ctx_threshold_armed.store(true, Ordering::Relaxed);
+    // ★(0.14.42 · RV-R2NC-1) clear 직후 바닥 가드 — 관측을 먼저 싣고(정착 창 최고치 = 바닥) 실효 임계를 받은 뒤, 래치
+    //   소진과 교차 판정까지 **가드 락 하나 안에서** 끝낸다. 나눠 쥐면 같은 좌석의 겹친 보고 둘(상태줄 프로세스 2개)이
+    //   둘 다 올리기 전 임계를 보고 하나는 억제·하나는 발화하는 경합이 된다(재주입 고리 1회 재발). 가드 락은 말단 락이다
+    //   — 안에서 다른 락을 잡지 않고(원자 변수뿐) 발행·feed 는 놓은 뒤에 한다. poison 은 관용한다 — 이 함수는 ②의
+    //   유일한 트리거라 부수 상태의 패닉이 발화를 막으면 안 된다.
+    let now_mono = daemon.started_instant.elapsed().as_secs_f64();
+    let window = surface
+        .observed_usage
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|u| u.ctx_window);
+    let decided = {
+        let mut g = surface.ctx_loop_guard.lock().unwrap_or_else(|e| e.into_inner());
+        g.observe(pct, now_mono);
+        let eff = g.effective_threshold(base_threshold, window);
+        if pct < eff {
+            surface.ctx_threshold_armed.store(true, Ordering::Relaxed);
+            None
+        } else if !surface.ctx_threshold_armed.swap(false, Ordering::Relaxed) {
+            None
+        } else {
+            let v = g.on_crossing(pct, eff, window, now_mono);
+            if matches!(v, crate::usage::CtxCrossVerdict::Suppress { .. }) {
+                // ★래치는 **다시 세운다** — 발화하지 않았으므로 소진된 것이 아니다. 세우지 않으면 다음 보고가 올린
+                //   임계를 한 번에 건너뛸 때(큰 파일 읽기 한 번) 그 세션 내내 발화하지 않는다(② 무clear).
+                surface.ctx_threshold_armed.store(true, Ordering::Relaxed);
+            }
+            Some((eff, v))
+        }
+    };
+    let Some((threshold, verdict)) = decided else {
         return;
-    }
-    if !surface.ctx_threshold_armed.swap(false, Ordering::Relaxed) {
-        return;
-    }
+    };
+    let floor_limited = match verdict {
+        crate::usage::CtxCrossVerdict::Suppress { floor, raised_to } => {
+            // 발화하지 않는다 — 방금 clear 한 좌석을 또 clear 해 봐야 같은 바닥으로 돌아온다(재주입 고리).
+            //   CSO 로 가지 않는 이름이다(alert_route::routable 밖 · `usage` 범주) — 관측·오너 feed 전용.
+            //   (래치 재무장은 위 가드 락 안에서 이미 했다.)
+            daemon.bus.publish(
+                "context.floor_raised",
+                "usage",
+                Some(surface.id),
+                json!({
+                    "role": role.clone(),
+                    "context_pct": pct,
+                    "floor_pct": floor,
+                    "threshold": threshold,
+                    "raised_to": raised_to,
+                    "ctx_window": window,
+                    "surface_ref": cys::surface_ref(surface.id),
+                    "source": source,
+                    "reason": "clear+지침 재주입 직후 바닥이 임계를 막는다 — 재발화하면 같은 좌석을 다시 clear 하는 재주입 고리",
+                }),
+            );
+            daemon.push_feed_notification(
+                "warn",
+                &format!(
+                    "{} 좌석 컨텍스트 임계 {threshold}%→{raised_to}% 자동 상향 ({})",
+                    role.as_deref().unwrap_or("(역할 없음)"),
+                    cys::surface_ref(surface.id)
+                ),
+                &format!(
+                    "clear 와 지침 재주입 직후 바닥이 이미 {floor}% 입니다(창 {}). 이 좌석을 {threshold}% 에서 다시 clear 하면 \
+                     같은 지침을 또 붙여 넣는 고리가 됩니다. 이 좌석은 {raised_to}% 에서 clear 합니다(상한 {}%). \
+                     근본 처방: 1M 컨텍스트 모델 사용 또는 지침 축소(오너 결정).",
+                    window.map_or_else(|| "미상".to_string(), |w| w.to_string()),
+                    crate::usage::CTX_FLOOR_CEIL
+                ),
+                Some(surface.id),
+            );
+            return;
+        }
+        crate::usage::CtxCrossVerdict::Fire { floor_limited } => floor_limited,
+    };
     let mut payload = json!({
         "role": role.clone(),
         "context_pct": pct,
@@ -3047,12 +3115,42 @@ pub(crate) fn maybe_fire_context_threshold(
         "source": source,
         "action": "cycle-agent(저장→검증→clear→복원) 집행 대상 — MASTER_DIRECTIVE §컨텍스트 사이클",
     });
+    if threshold != base_threshold {
+        payload["base_threshold"] = json!(base_threshold);
+    }
+    if floor_limited {
+        payload["floor_limited"] = json!(true);
+    }
     if let Some(a) = agent {
         payload["agent"] = json!(a);
     }
     daemon
         .bus
         .publish("context.threshold", "watchdog", Some(surface.id), payload);
+    // 천장 발화(바닥이 천장 근처라 더 올리지 못함) — 좌석당 1회 오너 경고(발화 자체는 위에서 이미 했다).
+    if floor_limited {
+        let first = {
+            let mut g = surface.ctx_loop_guard.lock().unwrap_or_else(|e| e.into_inner());
+            !std::mem::replace(&mut g.ceiling_warned, true)
+        };
+        if first {
+            daemon.push_feed_notification(
+                "warn",
+                &format!(
+                    "{} 좌석 컨텍스트 바닥이 {}% 이상 — clear 로 여유가 생기지 않음 ({})",
+                    role.as_deref().unwrap_or("(역할 없음)"),
+                    crate::usage::CTX_FLOOR_CEIL,
+                    cys::surface_ref(surface.id)
+                ),
+                &format!(
+                    "clear 와 지침 재주입 직후 바닥({pct}%)이 상향 천장({}%) 근처라 clear 를 해도 작업 여유가 거의 없습니다. \
+                     1M 컨텍스트 모델 사용 또는 지침 축소가 필요합니다(오너 결정).",
+                    crate::usage::CTX_FLOOR_CEIL
+                ),
+                Some(surface.id),
+            );
+        }
+    }
 }
 
 /// T6 Control Center 노드 상태 도출 — 스크롤백 최근 라인의 키워드(문서 로직)로 working/idle 판정,
@@ -8209,6 +8307,26 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 && surface.observed_usage.lock().unwrap().as_ref().is_some_and(|p| {
                     p.rate == rate && p.source == "statusline" && p.ctx_pct == ctx_pct
                 });
+            // ★(0.14.42 · RV-R2NC-1) 세션 교체(clear 뒤 새 transcript)를 clear 직후 바닥 가드에 알린다 — 이 보고가 곧
+            //   교차일 수 있으므로 발화 판정(`maybe_fire_context_threshold`) **전에**. 래치 재무장은 하지 않는다(종전 거동 ·
+            //   재무장은 transcript 수집기와 임계 미만 보고의 몫). 결측·같은 세션은 교체가 아니다(가드 비발동).
+            {
+                let prev_session = surface
+                    .observed_usage
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|p| p.session_file.clone())
+                    .unwrap_or_default();
+                let next_session = param_str(&params, "session_file").unwrap_or_default();
+                if crate::usage::session_file_changed(&prev_session, &next_session) {
+                    surface
+                        .ctx_loop_guard
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .note_session_change(daemon.started_instant.elapsed().as_secs_f64());
+                }
+            }
             *surface.observed_usage.lock().unwrap() = Some(crate::usage::ObservedUsage {
                 agent: agent.clone(),
                 ctx_tokens,
@@ -19707,6 +19825,126 @@ mod tests {
         status_set(&daemon, n3, "working", 10, "t", None);
         status_set(&daemon, n3, "working", 90, "t", None);
         assert_eq!(threshold_events(&daemon, n3).len(), 1, "관측이 선 뒤 자기보고가 래치를 만졌다");
+    }
+
+    /// ★(RV-R2NC-1 · 2026-09-27 · ①재주입 폭주·②clear 헛돌기) clear 직후 **바닥이 이미 임계 이상**인 좌석은
+    /// 곧바로 다시 `context.threshold` 를 내지 않는다. 918e7365 뒤 claude 좌석은 사이클마다 합성 지침 전문
+    /// (master 약 72K·CEO 약 76K 토큰)을 붙여 넣는다 — 200K 창(문서 기본)에서는 clear+재주입 직후가 이미 60%
+    /// 이상이라(샌드박스 run-m200: 30.4% → 66.7%), 새 세션 파일 재무장 → 즉시 재발화 → CSO 가 master 를 다시
+    /// clear → 같은 붙여넣기 … 의 고리가 된다(시간당 경보 상한까지). 대신 그 좌석의 임계를 **바닥+15(최대 85)**
+    /// 로 올리고(`context.floor_raised` + 오너 feed 경고 1건) 그 높이에서 한 번 clear 한다 — 1M 창(바닥 약 13%)은
+    /// 무변화다(순수 판정 검체 `ctx_loop_guard_*`).
+    /// 실패 방향: 판정 재료(세션 교체·정착 창 관측)가 없으면 **종전대로 발화**(루프 잔존 쪽 · 무clear 쪽 아님).
+    /// 올린 임계도 85 를 넘지 않고, 그 위의 바닥이면 발화한다(② 봉인).
+    #[test]
+    fn context_threshold_post_clear_floor_does_not_refire_the_clear_loop() {
+        let daemon = claim_daemon();
+        let node = make_surface(&daemon, Some("master"));
+        let rep = |pct: u64, sess: &str| {
+            usage_report(&daemon, node, json!({"ctx_pct": pct, "ctx_window": 200_000,
+                                               "session_file": format!("/p/proj/{sess}.jsonl")}), None)
+        };
+        let floor_events = |d: &Arc<Daemon>| -> Vec<Value> {
+            d.bus.replay_after(0).into_iter()
+                .filter(|e| e["name"].as_str() == Some("context.floor_raised") && e["surface_id"].as_u64() == Some(node))
+                .collect()
+        };
+        // ① 부트 뒤 첫 교차 — 종전대로 발화(CSO 가 master 를 clear 한다).
+        rep(61, "A");
+        assert_eq!(threshold_events(&daemon, node).len(), 1, "첫 교차는 발화해야 한다");
+        // ② clear(새 세션) → 붙여넣기 전 30% → 지침 전문 붙여넣기 뒤 67%.
+        rep(30, "B");
+        rep(67, "B");
+        assert_eq!(
+            threshold_events(&daemon, node).len(), 1,
+            "clear 직후 바닥(67%)에서 다시 발화했다 — CSO 가 master 를 또 clear 하는 재주입 고리(①·②)"
+        );
+        let fl = floor_events(&daemon);
+        assert_eq!(fl.len(), 1, "바닥 상향이 관측되지 않는다: {fl:?}");
+        assert_eq!(fl[0]["payload"]["floor_pct"].as_u64(), Some(67));
+        assert_eq!(fl[0]["payload"]["raised_to"].as_u64(), Some(82));
+        assert_eq!(fl[0]["payload"]["threshold"].as_u64(), Some(60));
+        assert!(
+            daemon.feed_items.lock().unwrap().iter().any(|i| i.kind == "warn" && i.surface_id == Some(node)),
+            "오너 feed 경고가 없다(침묵 금지)"
+        );
+        // ③ 올린 임계 아래에서는 조용하다 · 그 높이를 넘으면 한 번 발화한다(무clear 아님).
+        rep(75, "B");
+        assert_eq!(threshold_events(&daemon, node).len(), 1, "올린 임계 아래에서 발화했다");
+        rep(82, "B");
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 2, "올린 임계(82%)에서 발화하지 않았다(② 무clear)");
+        assert_eq!(evs[1]["payload"]["threshold"].as_u64(), Some(82));
+        assert_eq!(evs[1]["payload"]["base_threshold"].as_u64(), Some(60));
+        // ④ 다음 clear 뒤 바닥(67%)은 올린 임계 아래 — 고리가 다시 서지 않는다.
+        rep(30, "C");
+        rep(67, "C");
+        assert_eq!(threshold_events(&daemon, node).len(), 2, "다음 사이클에서 재주입 고리가 다시 섰다");
+        assert_eq!(floor_events(&daemon).len(), 1, "바닥 상향이 사이클마다 반복됐다(feed 소음)");
+        // ⑤ 억제는 래치를 소진하지 않는다 — 새 좌석에서 억제 직후 한 번에 올린 임계를 건너뛰는 보고(67→90)도 발화.
+        let n2 = make_surface(&daemon, Some("ceo"));
+        let rep2 = |pct: u64, sess: &str| {
+            usage_report(&daemon, n2, json!({"ctx_pct": pct, "ctx_window": 200_000,
+                                             "session_file": format!("/p/proj/{sess}.jsonl")}), None)
+        };
+        rep2(61, "X");
+        rep2(67, "Y"); // 붙여넣기 전 보고 없이 곧바로 바닥(실제 claude 의 첫 상태줄) — 재무장은 수집기 몫이라 여기선 무발화
+        assert_eq!(threshold_events(&daemon, n2).len(), 1);
+        daemon.get_surface(n2).unwrap().ctx_threshold_armed.store(true, Ordering::Relaxed); // 수집기의 새 세션 재무장
+        rep2(67, "Y");
+        assert_eq!(threshold_events(&daemon, n2).len(), 1, "clear 직후 바닥에서 재발화했다");
+        rep2(90, "Y");
+        assert_eq!(threshold_events(&daemon, n2).len(), 2, "억제 뒤 올린 임계를 건너뛴 보고에서 발화하지 않았다(② 무clear)");
+    }
+
+    /// ★(RV-R2NC-1 · 경합) 같은 좌석의 **겹친 보고**(상태줄 프로세스 여러 개가 같은 바닥 값을 동시에 보고)도 clear 직후
+    /// 바닥에서 발화하지 않는다 — 억제 1건 · 발화 0건. 판정(관측→실효 임계→래치 소진→교차)을 가드 락 하나로 묶지 않으면
+    /// 한 보고가 임계를 올리기 전에 다른 보고가 옛 임계로 래치를 소진해 발화한다(재주입 고리 1회 재발).
+    #[test]
+    fn context_threshold_post_clear_floor_is_decided_once_under_concurrent_reports() {
+        let daemon = claim_daemon();
+        for round in 0..20 {
+            let node = make_surface(&daemon, Some(if round % 2 == 0 { "master" } else { "ceo" }));
+            let s = daemon.get_surface(node).unwrap();
+            *s.observed_usage.lock().unwrap() = Some(crate::usage::ObservedUsage {
+                agent: "claude".into(),
+                ctx_tokens: Some(134_000),
+                ctx_window: Some(200_000),
+                ctx_pct: Some(67),
+                rate: vec![],
+                source: "statusline".into(),
+                session_file: "/p/proj/B.jsonl".into(),
+                updated_at: crate::state::now_epoch(),
+            });
+            {
+                // 직전 사이클의 발화 뒤 새 세션(clear)이 막 열린 상태 — 래치는 새 세션 재무장으로 서 있다.
+                let now = daemon.started_instant.elapsed().as_secs_f64();
+                let mut g = s.ctx_loop_guard.lock().unwrap();
+                g.fired_at = Some(now - 60.0);
+                g.note_session_change(now - 1.0);
+            }
+            s.ctx_threshold_armed.store(true, Ordering::Relaxed);
+            let barrier = Arc::new(std::sync::Barrier::new(8));
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let (d, s, b) = (daemon.clone(), s.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        b.wait();
+                        maybe_fire_context_threshold(&d, &s, 67, "statusline", Some("claude"));
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            let raised: Vec<Value> = daemon.bus.replay_after(0).into_iter()
+                .filter(|e| e["name"].as_str() == Some("context.floor_raised") && e["surface_id"].as_u64() == Some(node))
+                .collect();
+            assert_eq!(threshold_events(&daemon, node).len(), 0,
+                       "[round {round}] 겹친 보고 중 하나가 clear 직후 바닥에서 발화했다(재주입 고리)");
+            assert_eq!(raised.len(), 1, "[round {round}] 억제가 정확히 1회가 아니다: {raised:?}");
+        }
+        assert!(!crate::alert_route::routable("context.floor_raised"), "바닥 상향 관측이 CSO 로 라우팅된다");
     }
 
     /// 회귀 핀: 임계 env 파싱 규칙 — 1~100만 유효, 그 외 전부 기본 60.
