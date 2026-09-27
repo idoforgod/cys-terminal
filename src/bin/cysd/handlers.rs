@@ -3066,6 +3066,8 @@ pub(crate) fn maybe_fire_context_threshold(
     let Some((threshold, verdict)) = decided else {
         return;
     };
+    // ★(R2NC3-1) 이 창의 상향 천장(200K 75 · 1M 85 · 미상은 200K 로) — 판정과 같은 순수 함수에서 받는다(문안·payload 용).
+    let ceiling = crate::usage::ctx_floor_ceiling(window);
     let floor_limited = match verdict {
         crate::usage::CtxCrossVerdict::Suppress { floor, raised_to } => {
             // 발화하지 않는다 — 방금 clear 한 좌석을 또 clear 해 봐야 같은 바닥으로 돌아온다(재주입 고리).
@@ -3081,6 +3083,7 @@ pub(crate) fn maybe_fire_context_threshold(
                     "floor_pct": floor,
                     "threshold": threshold,
                     "raised_to": raised_to,
+                    "ceiling": ceiling,
                     "ctx_window": window,
                     "surface_ref": cys::surface_ref(surface.id),
                     "source": source,
@@ -3096,10 +3099,14 @@ pub(crate) fn maybe_fire_context_threshold(
                 ),
                 &format!(
                     "clear 와 지침 재주입 직후 바닥이 이미 {floor}% 입니다(창 {}). 이 좌석을 {threshold}% 에서 다시 clear 하면 \
-                     같은 지침을 또 붙여 넣는 고리가 됩니다. 이 좌석은 {raised_to}% 에서 clear 합니다(상한 {}%). \
-                     근본 처방: 1M 컨텍스트 모델 사용 또는 지침 축소(오너 결정).",
-                    window.map_or_else(|| "미상".to_string(), |w| w.to_string()),
-                    crate::usage::CTX_FLOOR_CEIL
+                     같은 지침을 또 붙여 넣는 고리가 됩니다. 이 좌석은 {raised_to}% 에서 clear 합니다(상한 {ceiling}% — 창에서 \
+                     유도: Claude Code 선제 압축점 '창−{}'·차단점 '창−{}' 아래로 사이클 여유 {} 토큰). 압축 창을 모델 창보다 \
+                     작게 준 좌석(CLAUDE_CODE_AUTO_COMPACT_WINDOW·CLAUDE_AUTOCOMPACT_PCT_OVERRIDE)은 이 상한 전에 Claude 가 먼저 \
+                     압축할 수 있습니다. 근본 처방: 1M 컨텍스트 모델 사용 또는 지침 축소(오너 결정).",
+                    window.map_or_else(|| "미상(200K 로 간주)".to_string(), |w| w.to_string()),
+                    crate::usage::CC_SUMMARY_RESERVE_TOKENS + crate::usage::CC_AUTOCOMPACT_BUFFER_TOKENS,
+                    crate::usage::CC_SUMMARY_RESERVE_TOKENS + crate::usage::CC_BLOCKING_BUFFER_TOKENS,
+                    crate::usage::CTX_FLOOR_CYCLE_MARGIN_TOKENS,
                 ),
                 Some(surface.id),
             );
@@ -3120,6 +3127,7 @@ pub(crate) fn maybe_fire_context_threshold(
     }
     if floor_limited {
         payload["floor_limited"] = json!(true);
+        payload["ceiling"] = json!(ceiling);
     }
     if let Some(a) = agent {
         payload["agent"] = json!(a);
@@ -3137,15 +3145,17 @@ pub(crate) fn maybe_fire_context_threshold(
             daemon.push_feed_notification(
                 "warn",
                 &format!(
-                    "{} 좌석 컨텍스트 바닥이 {}% 이상 — clear 로 여유가 생기지 않음 ({})",
+                    "{} 좌석 컨텍스트 바닥이 상향 천장({ceiling}%) 근처 — clear 로 여유가 생기지 않음 ({})",
                     role.as_deref().unwrap_or("(역할 없음)"),
-                    crate::usage::CTX_FLOOR_CEIL,
                     cys::surface_ref(surface.id)
                 ),
                 &format!(
-                    "clear 와 지침 재주입 직후 바닥({pct}%)이 상향 천장({}%) 근처라 clear 를 해도 작업 여유가 거의 없습니다. \
-                     1M 컨텍스트 모델 사용 또는 지침 축소가 필요합니다(오너 결정).",
-                    crate::usage::CTX_FLOOR_CEIL
+                    "clear 와 지침 재주입 직후 바닥({pct}%)이 상향 천장({ceiling}% · 창 {}) 근처라 임계를 올려도 작업 여유가 \
+                     {}%p 미만입니다 — 올리지 않고 {threshold}% 에서 clear 를 계속합니다(같은 지침을 다시 붙여 넣는 사이클이 \
+                     반복될 수 있음). 천장은 Claude Code 압축·차단점 아래로 창에서 유도합니다. 1M 컨텍스트 모델 사용 또는 \
+                     지침 축소가 필요합니다(오너 결정).",
+                    window.map_or_else(|| "미상(200K 로 간주)".to_string(), |w| w.to_string()),
+                    crate::usage::CTX_FLOOR_MIN_ROOM
                 ),
                 Some(surface.id),
             );
@@ -19831,11 +19841,13 @@ mod tests {
     /// 곧바로 다시 `context.threshold` 를 내지 않는다. 918e7365 뒤 claude 좌석은 사이클마다 합성 지침 전문
     /// (master 약 72K·CEO 약 76K 토큰)을 붙여 넣는다 — 200K 창(문서 기본)에서는 clear+재주입 직후가 이미 60%
     /// 이상이라(샌드박스 run-m200: 30.4% → 66.7%), 새 세션 파일 재무장 → 즉시 재발화 → CSO 가 master 를 다시
-    /// clear → 같은 붙여넣기 … 의 고리가 된다(시간당 경보 상한까지). 대신 그 좌석의 임계를 **바닥+15(최대 85)**
-    /// 로 올리고(`context.floor_raised` + 오너 feed 경고 1건) 그 높이에서 한 번 clear 한다 — 1M 창(바닥 약 13%)은
-    /// 무변화다(순수 판정 검체 `ctx_loop_guard_*`).
+    /// clear → 같은 붙여넣기 … 의 고리가 된다(시간당 경보 상한까지). 대신 그 좌석의 임계를 **바닥+15(창에서 유도한
+    /// 천장까지 — 200K 창 75 · 1M 창 85)** 로 올리고(`context.floor_raised` + 오너 feed 경고 1건) 그 높이에서 한 번
+    /// clear 한다 — 1M 창(바닥 약 13%)은 무변화다(순수 판정 검체 `ctx_loop_guard_*`).
     /// 실패 방향: 판정 재료(세션 교체·정착 창 관측)가 없으면 **종전대로 발화**(루프 잔존 쪽 · 무clear 쪽 아님).
-    /// 올린 임계도 85 를 넘지 않고, 그 위의 바닥이면 발화한다(② 봉인).
+    /// 올린 임계도 천장을 넘지 않고, 천장 아래 여유가 5%p 미만인 바닥이면 발화한다(② 봉인).
+    /// ★(R2NC3-1) 200K 천장이 85 이던 때는 올린 임계(82·84)가 Claude Code 선제 압축점(83.5%)·차단점(88.5%) 근처라
+    /// cys clear 가 영영 안 나거나(선제 압축) 사이클이 닿기 전에 좌석이 멈췄다(자동 압축 끔).
     #[test]
     fn context_threshold_post_clear_floor_does_not_refire_the_clear_loop() {
         let daemon = claim_daemon();
@@ -19862,19 +19874,22 @@ mod tests {
         let fl = floor_events(&daemon);
         assert_eq!(fl.len(), 1, "바닥 상향이 관측되지 않는다: {fl:?}");
         assert_eq!(fl[0]["payload"]["floor_pct"].as_u64(), Some(67));
-        assert_eq!(fl[0]["payload"]["raised_to"].as_u64(), Some(82));
+        assert_eq!(fl[0]["payload"]["raised_to"].as_u64(), Some(75), "200K 창에서 천장 75 를 넘겨 올렸다(R2NC3-1)");
+        assert_eq!(fl[0]["payload"]["ceiling"].as_u64(), Some(75), "천장이 창에서 유도되지 않았다");
         assert_eq!(fl[0]["payload"]["threshold"].as_u64(), Some(60));
         assert!(
-            daemon.feed_items.lock().unwrap().iter().any(|i| i.kind == "warn" && i.surface_id == Some(node)),
-            "오너 feed 경고가 없다(침묵 금지)"
+            daemon.feed_items.lock().unwrap().iter().any(|i| i.kind == "warn" && i.surface_id == Some(node)
+                && i.body.contains("75%") && !i.body.contains("85%")
+                && i.body.contains("창−33000") && i.body.contains("창−23000")),
+            "오너 feed 경고가 없거나 창에서 유도한 상한(75%)·Claude Code 압축점(창−33000)·차단점(창−23000)을 말하지 않는다(침묵 금지)"
         );
         // ③ 올린 임계 아래에서는 조용하다 · 그 높이를 넘으면 한 번 발화한다(무clear 아님).
-        rep(75, "B");
+        rep(74, "B");
         assert_eq!(threshold_events(&daemon, node).len(), 1, "올린 임계 아래에서 발화했다");
-        rep(82, "B");
+        rep(75, "B");
         let evs = threshold_events(&daemon, node);
-        assert_eq!(evs.len(), 2, "올린 임계(82%)에서 발화하지 않았다(② 무clear)");
-        assert_eq!(evs[1]["payload"]["threshold"].as_u64(), Some(82));
+        assert_eq!(evs.len(), 2, "올린 임계(75%)에서 발화하지 않았다(② 무clear)");
+        assert_eq!(evs[1]["payload"]["threshold"].as_u64(), Some(75));
         assert_eq!(evs[1]["payload"]["base_threshold"].as_u64(), Some(60));
         // ④ 다음 clear 뒤 바닥(67%)은 올린 임계 아래 — 고리가 다시 서지 않는다.
         rep(30, "C");
@@ -19895,6 +19910,37 @@ mod tests {
         assert_eq!(threshold_events(&daemon, n2).len(), 1, "clear 직후 바닥에서 재발화했다");
         rep2(90, "Y");
         assert_eq!(threshold_events(&daemon, n2).len(), 2, "억제 뒤 올린 임계를 건너뛴 보고에서 발화하지 않았다(② 무clear)");
+    }
+
+    /// ★(R2NC3-1 · ② 무clear 봉인) 200K 창에서 바닥이 창 유도 천장(75) 아래 여유 5%p 미만(72%)이면 올리지 않는다 —
+    /// 종전(고정 천장 85)이면 85 로 올려 Claude Code 선제 압축점(83.5%) 위라 cys clear 가 영영 안 났다. 이제는 종전대로
+    /// 발화하고(`floor_limited` + `ceiling` 75) 오너에게 창에서 유도한 상한을 말한다(고리 잔존 쪽 · 좌석이 멈추는 쪽 아님).
+    #[test]
+    fn context_threshold_floor_near_the_200k_ceiling_fires_instead_of_raising_past_claude_limits() {
+        let daemon = claim_daemon();
+        let node = make_surface(&daemon, Some("ceo"));
+        let rep = |pct: u64, sess: &str| {
+            usage_report(&daemon, node, json!({"ctx_pct": pct, "ctx_window": 200_000,
+                                               "session_file": format!("/p/proj/{sess}.jsonl")}), None)
+        };
+        rep(61, "A");
+        assert_eq!(threshold_events(&daemon, node).len(), 1);
+        rep(30, "B");
+        rep(72, "B");
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 2, "천장 근처 바닥(72%)에서 발화하지 않았다 — 올린 임계가 Claude 한계 근처로 갔다(② 무clear)");
+        assert_eq!(evs[1]["payload"]["floor_limited"].as_bool(), Some(true));
+        assert_eq!(evs[1]["payload"]["ceiling"].as_u64(), Some(75));
+        assert_eq!(evs[1]["payload"]["threshold"].as_u64(), Some(60));
+        let raised = daemon.bus.replay_after(0).into_iter()
+            .filter(|e| e["name"].as_str() == Some("context.floor_raised") && e["surface_id"].as_u64() == Some(node))
+            .count();
+        assert_eq!(raised, 0, "여유 3%p 틈으로 임계를 올렸다");
+        assert!(
+            daemon.feed_items.lock().unwrap().iter().any(|i| i.kind == "warn" && i.surface_id == Some(node)
+                && i.title.contains("75%") && i.body.contains("75%")),
+            "천장 경고가 창에서 유도한 상한(75%)을 말하지 않는다"
+        );
     }
 
     /// ★(RV-R2NC-1 · 경합) 같은 좌석의 **겹친 보고**(상태줄 프로세스 여러 개가 같은 바닥 값을 동시에 보고)도 clear 직후

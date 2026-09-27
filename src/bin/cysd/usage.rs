@@ -118,17 +118,55 @@ pub struct ObservedUsage {
 // 발화한다(무clear 아님). 1M 창 좌석은 clear 뒤 바닥이 낮아 교차 때 성장이 수십 %라 무변화다.
 //
 // 【실패 방향】 재료가 없으면(세션 교체 미관측 · 정착 창 안 관측 없음 · 발화 이력 없음) **종전대로 발화**한다 — 고리가
-// 남는 쪽이지 clear 가 멈추는 쪽이 아니다. 올린 임계는 [`CTX_FLOOR_CEIL`] 을 넘지 않고, 바닥이 그 위면 발화한다(②).
+// 남는 쪽이지 clear 가 멈추는 쪽이 아니다. 올린 임계는 창에서 유도한 천장([`ctx_floor_ceiling`])을 넘지 않고, 천장 아래
+// 여유가 [`CTX_FLOOR_MIN_ROOM`] 미만인 바닥이면 올리지 않고 발화한다(② · `floor_limited` 오너 경고).
 // 정책(지침 크기·창별 임계)은 오너 결정으로 남는다 — 이 가드는 그 정책이 물리적으로 불가능한 좌석에서 고리만 끊는다.
+//
+// 【천장 — ★R2NC3-1】 천장은 창 크기와 Claude Code 자체 한계에서 유도한다. Claude Code 2.1.282(설치본 strings 실측 ·
+// 실행 안 함): 유효 창 = 창 − min(최대 출력, 20000) · **선제 압축점** = 유효 창 − 13000(압축 창 source 가 `auto` 가
+// 아닐 때 — env `CLAUDE_CODE_AUTO_COMPACT_WINDOW`·settings·서버 clientdata/experiment, 그리고 opus-4-6/4-8/5/5-5·
+// sonnet-4-6 의 200K 창은 `model-default` 라 **기본값이 이쪽**) · **차단점** = 유효 창 − 3000(자동 압축 끔
+// `autoCompactEnabled=false`·`DISABLE_AUTO_COMPACT`·`DISABLE_COMPACT`, 또는 source≠auto — 프롬프트를 보내지 않는다).
+// 200K 창에서 83.5%·88.5% 다. 고정 천장 85(종전)는 그 위라, 올린 임계(82·84)가 선제 압축에 가려 cys clear 가 영영 안
+// 나거나, 자동 압축을 끈 좌석이 CSO 사이클이 닿기 전에 차단점에 닿아 저장 지시가 막히고(clear 미실행) 래치는 이미
+// 소진돼 재발화도 없었다(② 무clear · 샌드박스 run-m200blk). 이제 천장 = 창 − (20000 + 13000 + 사이클 여유 15000) 를
+// 상태줄 반올림까지 넣어 퍼센트로 내린 값(85 캡)이다 — 200K 75% · 1M 85%. 사용자가 압축 창을 모델 창보다 작게 준 좌석
+// (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`·`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`)은 데몬이 보지 못한다(USER-MANUAL 고지).
 
 /// clear(세션 교체) 뒤 바닥을 재는 정착 창(초) — 재주입 대기(≤75s)·붙여넣기 처리·첫 응답을 덮는다.
 pub const CTX_FLOOR_SETTLE_SECS: f64 = 300.0;
 /// 교차가 '일해서 찬 것'으로 인정되는 바닥 대비 최소 성장(%p). 미만이면 바닥이 임계를 막은 것이다.
 pub const CTX_FLOOR_MIN_GROWTH: u8 = 10;
-/// 바닥이 임계를 막은 좌석에 주는 작업 여유(%p) — 올린 임계 = 바닥 + ROOM.
+/// 바닥이 임계를 막은 좌석에 주는 작업 여유(%p) — 올린 임계 = 바닥 + ROOM(천장까지).
 pub const CTX_FLOOR_ROOM: u8 = 15;
-/// 올린 임계의 천장(%). 이 위로는 올리지 않는다 — 바닥이 여기 이상이면 발화한다(② 무clear 봉인).
+/// 올린 임계가 바닥(또는 교차 지점) 위로 최소한 줘야 하는 여유(%p). 천장 때문에 이보다 좁으면 올리지 않고 발화한다 —
+/// 바닥 1~4%p 위 임계는 한두 턴마다 사이클이 도는 고리와 같다(★R2NC3-1).
+pub const CTX_FLOOR_MIN_ROOM: u8 = 5;
+/// 올린 임계의 절대 캡(%) — 큰 창(1M)에서도 이 위로는 올리지 않는다. 실제 천장은 [`ctx_floor_ceiling`].
 pub const CTX_FLOOR_CEIL: u8 = 85;
+/// Claude Code 요약 출력 예약 상한 — 유효 창 = 창 − min(최대 출력, 이 값). 상한을 쓴다(보수 — 실제 예약은 이하).
+pub const CC_SUMMARY_RESERVE_TOKENS: u64 = 20_000;
+/// Claude Code 자동 압축 버퍼 — 선제 압축점 = 유효 창 − 이 값.
+pub const CC_AUTOCOMPACT_BUFFER_TOKENS: u64 = 13_000;
+/// Claude Code 차단 버퍼 — 차단점 = 유효 창 − 이 값(자동 압축 끔·비-auto 압축 창).
+pub const CC_BLOCKING_BUFFER_TOKENS: u64 = 3_000;
+/// 올린 임계에서 발화한 뒤 CSO 사이클의 저장 지시가 처리될 때까지 좌석이 더 쓰는 양의 여유(토큰).
+pub const CTX_FLOOR_CYCLE_MARGIN_TOKENS: u64 = 15_000;
+/// 창을 모를 때 가정하는 창 — claude 최소 창(200K). 작은 창을 가정해야 천장이 낮아져 발화 쪽으로 실패한다.
+pub const CTX_FLOOR_ASSUMED_WINDOW: u64 = 200_000;
+
+/// ★(R2NC3-1) 이 창에서 임계를 올릴 수 있는 천장(%) — 순수 · 핀 `ctx_floor_ceiling_*`.
+/// (천장 퍼센트로 **보이는** 최대 토큰) + 사이클 여유 ≤ Claude Code 선제 압축점(< 차단점)이 되는 가장 큰 정수 퍼센트,
+/// [`CTX_FLOOR_CEIL`] 캡. 상태줄 `used_percentage` 는 반올림이라 c% 는 (c+0.5)% 직전까지다 — 그래서
+/// c ≤ (200·(창 − 예약) − 창) / (2·창). 창 미상(None·0)은 [`CTX_FLOOR_ASSUMED_WINDOW`] 로 본다. 창이 예약보다 작으면 0
+/// (올릴 곳 없음 = 발화).
+pub fn ctx_floor_ceiling(window: Option<u64>) -> u8 {
+    let w = window.filter(|w| *w > 0).unwrap_or(CTX_FLOOR_ASSUMED_WINDOW);
+    let reserve = CC_SUMMARY_RESERVE_TOKENS + CC_AUTOCOMPACT_BUFFER_TOKENS + CTX_FLOOR_CYCLE_MARGIN_TOKENS;
+    let usable = w.saturating_sub(reserve);
+    let pct = usable.saturating_mul(200).saturating_sub(w) / w.saturating_mul(2);
+    pct.min(CTX_FLOOR_CEIL as u64) as u8
+}
 
 /// 교차 판정 결과.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,14 +235,16 @@ impl CtxLoopGuard {
         if post_clear {
             if let Some(floor) = self.settle_peak {
                 if pct.saturating_sub(floor) < CTX_FLOOR_MIN_GROWTH {
-                    let target = floor.saturating_add(CTX_FLOOR_ROOM).min(CTX_FLOOR_CEIL);
-                    if target > eff {
+                    // ★(R2NC3-1) 천장은 창에서 유도한다(200K 75 · 1M 85) — Claude Code 선제 압축점·차단점 아래 사이클 여유.
+                    //   여유는 바닥과 교차 지점 중 높은 쪽부터 잰다 — 이미 지난 높이로 올리는 것은 올린 것이 아니다.
+                    let target = floor.saturating_add(CTX_FLOOR_ROOM).min(ctx_floor_ceiling(window));
+                    if target > eff && target >= floor.max(pct).saturating_add(CTX_FLOOR_MIN_ROOM) {
                         self.raised = Some(target);
                         self.raised_window = window;
                         self.suppressed_this_reset = true;
                         return CtxCrossVerdict::Suppress { floor, raised_to: target };
                     }
-                    // 천장 — 더 올릴 수 없다. clear 가 유일한 처방이므로 발화한다(② 봉인).
+                    // 천장 — 더 올릴 수 없거나 올려도 여유가 없다. clear 가 유일한 처방이므로 발화한다(② 봉인 · 고리 잔존 쪽).
                     self.fired_at = Some(now);
                     return CtxCrossVerdict::Fire { floor_limited: true };
                 }
@@ -3095,8 +3135,8 @@ mod ctx_loop_guard_tests {
     const W1M: Option<u64> = Some(1_000_000);
     const FIRE: Option<CtxCrossVerdict> = Some(CtxCrossVerdict::Fire { floor_limited: false });
 
-    /// 200K master(run-m200 모양): 발화 → clear → 30% → 붙여넣기 67% 는 발화하지 않고 82% 로 올린다 →
-    /// 82% 에서 한 번 발화 → 다음 clear 뒤 67% 는 조용하다(고리 없음).
+    /// 200K master(run-m200 모양): 발화 → clear → 30% → 붙여넣기 67% 는 발화하지 않고 75% 로 올린다(바닥+15=82 는
+    /// 200K 창 천장 75 에 잘린다 · R2NC3-1) → 75% 에서 한 번 발화 → 다음 clear 뒤 67% 는 조용하다(고리 없음).
     #[test]
     fn ctx_loop_guard_breaks_the_200k_master_reinject_loop() {
         let (mut g, mut armed) = (CtxLoopGuard::default(), true);
@@ -3105,13 +3145,116 @@ mod ctx_loop_guard_tests {
         armed = true; // 새 세션 파일 재무장(usage.rs)
         assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 100.5), None);
         assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, 106.0),
-                   Some(CtxCrossVerdict::Suppress { floor: 67, raised_to: 82 }), "clear 직후 바닥에서 재발화했다(재주입 고리)");
-        assert_eq!(report(&mut g, &mut armed, 75, 60, W200K, 400.0), None, "올린 임계 아래에서 발화");
-        assert_eq!(report(&mut g, &mut armed, 82, 60, W200K, 2_000.0), FIRE, "올린 임계에서 발화하지 않았다(② 무clear)");
+                   Some(CtxCrossVerdict::Suppress { floor: 67, raised_to: 75 }), "clear 직후 바닥에서 재발화했거나 200K 천장을 넘겨 올렸다");
+        assert_eq!(report(&mut g, &mut armed, 74, 60, W200K, 400.0), None, "올린 임계 아래에서 발화");
+        assert_eq!(report(&mut g, &mut armed, 75, 60, W200K, 2_000.0), FIRE, "올린 임계에서 발화하지 않았다(② 무clear)");
         g.note_session_change(2_100.0);
         armed = true;
         assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 2_100.5), None);
         assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, 2_106.0), None, "다음 사이클에 고리가 다시 섰다");
+    }
+
+    /// 상태줄 `used_percentage` 는 반올림이다 — p% 로 보이는 최대 토큰(직전)은 (p+0.5)% 다. 사이클 여유는 거기서 잰다.
+    fn max_tokens_shown_as(pct: u8, window: u64) -> u64 {
+        (2 * pct as u64 + 1) * window / 200
+    }
+
+    /// ★(R2NC3-1 · ② 무clear) 200K CEO(run-ceo200 모양 · 바닥 69%): 종전에는 84% 로 올렸다 — Claude Code 2.1.282 의
+    /// 선제 압축점(창−20000−13000 = 83.5% · 압축 창 source 가 auto 가 아닐 때. opus-4-6/4-8/5/5-5·sonnet-4-6 의 200K
+    /// 창은 `model-default` 라 이것이 **기본값**이다)보다 위라 도달 불가 → cys clear 가 영영 안 났고, 자동 압축을 끈 좌석은
+    /// 차단점(창−20000−3000 = 88.5%)까지 4.5%p 뿐이라 사이클이 닿기 전에 좌석이 멈췄다. 이제 천장은 창에서 유도된 75%.
+    #[test]
+    fn ctx_loop_guard_200k_ceo_raise_stays_below_claude_code_limits() {
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
+        g.note_session_change(100.0);
+        armed = true;
+        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 100.5), None);
+        assert_eq!(report(&mut g, &mut armed, 69, 60, W200K, 106.0),
+                   Some(CtxCrossVerdict::Suppress { floor: 69, raised_to: 75 }), "200K CEO 가 천장 75 밖으로 올라갔다");
+        let raised = g.raised.expect("올린 임계");
+        let fire = max_tokens_shown_as(raised, 200_000);
+        assert!(fire + CTX_FLOOR_CYCLE_MARGIN_TOKENS <= 167_000,
+                "올린 임계({raised}%) + 사이클 여유가 Claude Code 선제 압축점(167000 = 83.5%)을 넘는다 — cys clear 가 안 난다");
+        assert!(fire + CTX_FLOOR_CYCLE_MARGIN_TOKENS < 177_000, "올린 임계({raised}%) + 사이클 여유가 차단점(177000 = 88.5%)에 닿는다");
+        assert_eq!(report(&mut g, &mut armed, 75, 60, W200K, 2_000.0), FIRE, "올린 임계에서 발화하지 않았다(② 무clear)");
+    }
+
+    /// ★(R2NC3-1) 천장은 창에서 유도한다 — 창 − (요약 출력 예약 20000 + 자동 압축 버퍼 13000 + 사이클 여유 15000) 를
+    /// 상태줄 반올림까지 넣어 퍼센트로 내림, 85 캡. 모든 창에서 (천장으로 보이는 최대 토큰) + 사이클 여유 ≤ Claude Code
+    /// 선제 압축점 < 차단점. 창을 모르면 claude 최소 창(200K)으로 본다(천장이 낮아지는 쪽 = 발화 쪽 실패).
+    #[test]
+    fn ctx_floor_ceiling_is_derived_from_the_window_below_claude_code_limits() {
+        assert_eq!(ctx_floor_ceiling(W200K), 75, "200K 창 천장");
+        assert_eq!(ctx_floor_ceiling(W1M), CTX_FLOOR_CEIL, "1M 창은 종전 85 캡");
+        assert_eq!(ctx_floor_ceiling(None), ctx_floor_ceiling(W200K), "창 미상은 200K 로 본다(보수)");
+        assert_eq!(ctx_floor_ceiling(Some(0)), ctx_floor_ceiling(W200K), "창 0 은 미상이다(결측은 값이 아니다)");
+        assert!(ctx_floor_ceiling(W200K) < 83, "200K 천장이 선제 압축점 83.5% 이상");
+        for w in [40_000u64, 48_000, 100_000, 128_000, 200_000, 272_000, 400_000, 500_000, 1_000_000, 2_000_000] {
+            let c = ctx_floor_ceiling(Some(w));
+            assert!(c <= CTX_FLOOR_CEIL, "창 {w}: 천장 {c} 가 85 캡을 넘는다");
+            if c == 0 {
+                continue;
+            }
+            let fire = max_tokens_shown_as(c, w);
+            let compact_at = w.saturating_sub(CC_SUMMARY_RESERVE_TOKENS + CC_AUTOCOMPACT_BUFFER_TOKENS);
+            let block_at = w.saturating_sub(CC_SUMMARY_RESERVE_TOKENS + CC_BLOCKING_BUFFER_TOKENS);
+            assert!(fire + CTX_FLOOR_CYCLE_MARGIN_TOKENS <= compact_at, "창 {w}: 천장 {c}% + 사이클 여유가 선제 압축점을 넘는다");
+            assert!(fire + CTX_FLOOR_CYCLE_MARGIN_TOKENS < block_at, "창 {w}: 천장 {c}% + 사이클 여유가 차단점에 닿는다");
+        }
+        assert_eq!(ctx_floor_ceiling(Some(40_000)), 0, "창이 예약보다 작으면 올릴 곳이 없다(발화)");
+    }
+
+    /// ★(R2NC3-1) 천장 때문에 여유가 [`CTX_FLOOR_MIN_ROOM`] 보다 좁으면 올리지 않는다 — 바닥 1~4%p 위 임계는 한두 턴마다
+    /// 사이클이 도는 고리와 같고, 그 대신 오너 경고(floor_limited)로 근본 처방(1M · 지침 축소)을 알린다.
+    /// 실패 방향 = 발화(고리 잔존 · 시간당 경보 상한이 묶는다) — 좌석이 멈추는 쪽이 아니다.
+    #[test]
+    fn ctx_loop_guard_does_not_raise_into_a_sliver_below_the_ceiling() {
+        for (floor, win) in [(71u8, W200K), (74, W200K), (80, W200K), (81, W1M)] {
+            let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+            assert_eq!(report(&mut g, &mut armed, 61, 60, win, 0.0), FIRE);
+            g.note_session_change(100.0);
+            armed = true;
+            assert_eq!(report(&mut g, &mut armed, floor, 60, win, 110.0),
+                       Some(CtxCrossVerdict::Fire { floor_limited: true }),
+                       "바닥 {floor}%(창 {win:?}) 에서 천장 아래 {}%p 틈으로 올렸다", ctx_floor_ceiling(win).saturating_sub(floor));
+            assert_eq!(g.raised, None);
+        }
+        // 바닥 70 · 200K: 천장 75 = 바닥+5 — 최소 여유 그대로면 올린다(경계).
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
+        g.note_session_change(100.0);
+        armed = true;
+        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 110.0), Some(CtxCrossVerdict::Suppress { floor: 70, raised_to: 75 }));
+        // 교차가 바닥 위에서 났으면(역할 임계 68 · 바닥 62 · 교차 71 — 성장 9 < 10) 여유는 교차 지점부터 잰다(75 < 71+5 → 발화).
+        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+        assert_eq!(report(&mut g, &mut armed, 69, 68, W200K, 0.0), FIRE);
+        g.note_session_change(100.0);
+        armed = true;
+        assert_eq!(report(&mut g, &mut armed, 62, 68, W200K, 150.0), None);
+        assert_eq!(report(&mut g, &mut armed, 71, 68, W200K, 900.0), Some(CtxCrossVerdict::Fire { floor_limited: true }),
+                   "교차 지점(71%) 위 4%p 로 올렸다");
+    }
+
+    /// ★(R2NC3-1) 성질 핀: 200K 창에서 어떤 바닥·교차 조합이든 올린 임계는 천장(75) 이하이고 교차 지점 위 최소 여유를 준다 —
+    /// Claude Code 선제 압축점(83.5)·차단점(88.5)에 닿지 않는다.
+    #[test]
+    fn ctx_loop_guard_never_raises_a_200k_seat_near_claude_code_limits() {
+        for floor in 0u8..=100 {
+            for grow in 0u8..10 {
+                let pct = floor.saturating_add(grow).min(100);
+                let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+                let _ = report(&mut g, &mut armed, 61, 60, W200K, 0.0);
+                g.note_session_change(100.0);
+                armed = true;
+                let _ = report(&mut g, &mut armed, floor, 101, W200K, 110.0); // 바닥만 싣는다(임계 101 = 무교차)
+                let _ = report(&mut g, &mut armed, pct, 60, W200K, 500.0);
+                if let Some(r) = g.raised {
+                    assert!(r <= ctx_floor_ceiling(W200K), "바닥 {floor} 교차 {pct}: {r}% 로 올렸다");
+                    assert!(r >= pct.max(floor) + CTX_FLOOR_MIN_ROOM, "바닥 {floor} 교차 {pct}: 여유 없는 {r}%");
+                }
+            }
+        }
     }
 
     /// 억제 직후 다음 보고가 올린 임계를 **한 번에 건너뛰어도**(큰 파일 읽기 한 번 · 67% → 90%) 발화한다 —
@@ -3180,19 +3323,20 @@ mod ctx_loop_guard_tests {
         assert_eq!(report(&mut g, &mut armed, 70, 60, W1M, 6.0), FIRE, "발화 이력 없는 첫 교차가 억제됐다");
     }
 
-    /// 천장: 바닥이 85% 근처면 더 올리지 않고 발화한다(② 봉인) · 정착 창 안 관측이 없으면 발화한다(실패 방향).
+    /// 천장: 바닥이 천장 근처면 더 올리지 않고 발화한다(② 봉인) · 정착 창 안 관측이 없으면 발화한다(실패 방향).
+    /// (1M 창 — 천장 85. 200K 창 천장 76 은 `ctx_floor_ceiling_*` · `*_sliver_*` 핀.)
     #[test]
     fn ctx_loop_guard_never_raises_past_the_ceiling_and_fails_toward_firing() {
         let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
+        assert_eq!(report(&mut g, &mut armed, 61, 60, W1M, 0.0), FIRE);
         g.note_session_change(100.0);
         armed = true;
-        assert_eq!(report(&mut g, &mut armed, 80, 60, W200K, 110.0),
-                   Some(CtxCrossVerdict::Suppress { floor: 80, raised_to: CTX_FLOOR_CEIL }));
-        assert_eq!(report(&mut g, &mut armed, 85, 60, W200K, 3_000.0), FIRE, "천장 임계에서 발화하지 않았다");
+        assert_eq!(report(&mut g, &mut armed, 78, 60, W1M, 110.0),
+                   Some(CtxCrossVerdict::Suppress { floor: 78, raised_to: CTX_FLOOR_CEIL }));
+        assert_eq!(report(&mut g, &mut armed, 85, 60, W1M, 3_000.0), FIRE, "천장 임계에서 발화하지 않았다");
         g.note_session_change(3_100.0);
         armed = true;
-        assert_eq!(report(&mut g, &mut armed, 86, 60, W200K, 3_110.0),
+        assert_eq!(report(&mut g, &mut armed, 86, 60, W1M, 3_110.0),
                    Some(CtxCrossVerdict::Fire { floor_limited: true }), "천장 위 바닥에서 발화를 막았다(② 무clear)");
         // 역할 override 가 천장 이상(90)이면 올릴 곳이 없다 — 발화.
         let (mut g, mut armed) = (CtxLoopGuard::default(), true);
