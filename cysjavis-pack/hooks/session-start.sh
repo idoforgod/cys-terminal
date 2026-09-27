@@ -531,8 +531,11 @@ echo "■ CYSJavis 역할 각성 (CYS_ROLE=$CYS_ROLE)"
 #   (라이브 transcript 실측: 10,485자 이상 SessionStart 출력은 clear 29/29 · resume 6/6 · startup 26/26 파일행). 역할 지침은
 #   전부 그보다 길다 — 이 줄은 미리보기 안(머리)에 있어야 하므로 지침 **앞**에 둔다. cycle-agent 는 clear 뒤 전문을 직접 붙여
 #   넣으므로(cys.rs hook_directive_fits_inline) 이 줄은 수동 /clear·compact·resume 에서 좌석이 지침 없이 앉지 않게 하는 몫이다.
+#   ★조건은 '전문이 이 대화에 없을 때만' 이다 — 훅 출력은 늘 파일로 빠지므로 '미리보기만 보이면' 하나로는 부트·사이클(CLI 가
+#   전문을 첫 제출로 붙여 넣는다)에서도 참이 되어, 모델이 같은 지침(~9.5만 B)·soul.md 를 한 번 더 Read 해 매 부트·사이클 컨텍스트가
+#   두 배로 든다(② · test_session_start_hook 22b). 줄 전체가 미리보기 창(앞 2,000자) 안에서 끝나야 한다.
 #   경로 줄은 printf(G8 — macOS /bin/sh 의 xpg_echo 가 윈도우 백슬래시 경로를 먹는다).
-printf '■ 이 출력이 길어 앞부분 미리보기만 보이면(나머지는 파일로 빠짐) 역할 지침 전문 %s 과 %s 를 Read 도구로 끝까지(offset·limit 로 나눠) 읽은 뒤에 행동하라 — 지침 없이 추측으로 움직이지 않는다.\n' "$(cys_native_path "$D" 2>/dev/null || printf '%s' "$D")" "$(cys_native_path "$JARVIS_DIR/soul.md" 2>/dev/null || printf '%s' "$JARVIS_DIR/soul.md")"
+printf '■ 이 출력이 길어 앞부분 미리보기만 보이고(나머지는 파일로 빠짐) 역할 지침 전문이 이 대화에 따로 없으면, 지침 전문 %s 과 %s 를 Read 도구로 끝까지(offset·limit 로 나눠) 읽은 뒤에 행동하라 — 전문이 이 대화에 이미 있으면(부트·사이클은 CLI 가 붙여 넣는다) 다시 읽지 않는다(같은 지침 중복 적재 금지) · 지침 없이 추측으로 움직이지 않는다.\n' "$(cys_native_path "$D" 2>/dev/null || printf '%s' "$D")" "$(cys_native_path "$JARVIS_DIR/soul.md" 2>/dev/null || printf '%s' "$JARVIS_DIR/soul.md")"
 cat "$D"
 # ★R13 부트 브리지(T2b 전 임시 — hook=system층이라 디렉티브(user-owned) 미개정 기계에도 전파):
 # 구 산문 §0만 아는 master는 부트 스크립트를 몰라 완료 마커가 안 생기고 CEO 승격이 영구

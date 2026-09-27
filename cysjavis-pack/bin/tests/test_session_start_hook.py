@@ -633,6 +633,17 @@ for _role, _body in (("master", "DIRECTIVE-BODY-MASTER"), ("worker", "DIRECTIVE-
     check("22 %s: 지침 전문 읽기 안내가 미리보기 창(앞 2,000자) 안 · 지침 본문 앞 · exit 0" % _role,
           code == 0 and 0 <= _i < 2000 and (_j < 0 or _i < _j) and "_DIRECTIVE.md" in out[max(0, _i - 400):_i + 200],
           "i=%d j=%d head=%r" % (_i, _j, out[:300]))
+    # ★(0.14.42 · 수정 단계 후속 — R2NC-F4 계열 ②) 부트·사이클은 CLI 가 지침 전문을 첫 제출로 **이미 붙여 넣는다**. 훅 출력은
+    #   늘 파일로 빠지므로 '미리보기만 보이면 읽어라' 조건은 그때도 참이다 — 조건이 그것뿐이면 모델이 붙여 넣은 전문을 두고
+    #   같은 지침(~9.5만 B)과 soul.md 를 한 번 더 Read 해 컨텍스트가 매 부트·사이클 두 배로 든다. 그래서 줄은 '전문이 이 대화에
+    #   이미 있으면 다시 읽지 않는다' 를 같은 줄에 싣고, 줄 전체가 미리보기 창(앞 2,000자) 안에 끝나야 한다.
+    #   RED(HEAD a96357d1): 그 조건이 없다.
+    _line = out[_i:].split("\n", 1)[0] if _i >= 0 else ""
+    _line_start = out.rfind("\n", 0, max(0, _i)) + 1 if _i >= 0 else -1
+    check("22b %s: 읽기 안내는 '전문이 이 대화에 이미 있으면 다시 읽지 않는다' 조건을 같은 줄에 싣고 미리보기 창 안에서 끝난다" % _role,
+          "이미 있으면" in _line and "다시 읽지 않는다" in _line
+          and 0 <= _line_start and _i + len(_line) < 2000,
+          "line=%r end=%d" % (out[_line_start:_i + len(_line)], _i + len(_line)))
 shutil.rmtree(tmp)
 
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
