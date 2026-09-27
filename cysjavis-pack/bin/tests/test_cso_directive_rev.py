@@ -385,6 +385,11 @@ SAFETY_CLAUSES = {
         ("선조치 범위", "**선조치의 범위 = §1-1 접두 목록 안의 행동뿐이다** — 목록 밖 명령은 시스템 위기라도 보류 + 승인이며\n"
                    "  (대체 명령·재시도로 우회하지 않는다), 승인 주체인 master 자신이 고장 대상일 때의 유일한 출구는\n"
                    "  §1-2(오너 채널)다."),
+        # ★(0.14.42 · ROLE-G1) master 는 cycle-agent 를 백그라운드로 돌린다 — 턴이 비어 보여도 다른 좌석을
+        #   clear·재주입하는 중일 수 있으므로 CSO 의 안전지점에 '사이클 진행 중 아님' 이 들어간다.
+        ("master 사이클 진행 중 보류", "②의 안전지점에는 **master 가 띄운 사이클이 진행 중이 아님**도 들어간다 — "
+                              "`cys status --json` 의 `surfaces[].status.state`\n"
+                              "  가 `quiescing` 인 좌석이 있거나 master 가 '사이클 진행 중'으로 회신했으면 보류하고 다음 판정에서 다시 본다"),
     ),
     "MASTER_DIRECTIVE.md": (
         ("정체 종결 휴면", "`javis_orchestra.py round-status --help` 에 `stop_reason`(그리고 `round-log`\n"
@@ -398,6 +403,15 @@ SAFETY_CLAUSES = {
                         "     또 `cys cycle-agent`는 **호출 시점에 새 기준선**을 잡고 **호출 이후의 파일 갱신**을 저장 증거로\n"
                         "     요구하므로, 저장 지시를 받지 못하는 hang에서는 `저장 검증 실패 … clear 미실행`이 종착점이고\n"
                         "     그때의 출구는 오너 채널 상신뿐이다 — 미실행을 '집행됨'으로 적지 마라"),
+        # ★(0.14.42 · ROLE-G1) 부서장은 턴 안에서 오래 기다리지 않는다(오너 절대 규칙 · 회신 큐 적체) — 한 사이클은
+        #   최대 약 8.5분이다. 전경 600000 은 백그라운드 수단이 없는 CLI 의 예외로만 남는다.
+        ("사이클 백그라운드 실행", "**백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`(도구 timeout 에 끊기지 않고\n"
+                        "  네 턴을 붙잡지 않는다). 전경 대기 금지"),
+    ),
+    # CEO_TEMPLATE 은 MASTER 전문을 바이트 연접한 생성물이다(gen_ceo_template.py) — 배포본에도 같은 문면이 있어야 한다.
+    "CEO_TEMPLATE.md": (
+        ("사이클 백그라운드 실행", "**백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`(도구 timeout 에 끊기지 않고\n"
+                        "  네 턴을 붙잡지 않는다). 전경 대기 금지"),
     ),
     "REVIEWER_DIRECTIVE.md": (
         ("정체 종결 휴면", "그 축을 내는 도구가 없는 버전이면 이 조항은 **휴면**이다 —\n"
@@ -619,6 +633,18 @@ def missing_safety_clauses(name: str, raw: str) -> list[str]:
     body = normalize(strip_html_comments(raw))
     return [label for label, clause in SAFETY_CLAUSES[name]
             if len(bounded_spans(body, normalize(clause))) != 1]
+
+
+# ★(0.14.42 · ROLE-G1) 7d5733d4 가 master·CEO 에게 준 전경 대기 문장 — 부서장이 한 사이클(최대 약 8.5분) 동안
+# 자기 턴을 붙잡아 회신 큐를 적체시킨다. CSO 는 부서장이 아니므로 자기 ④ 1콜의 전경 600000 을 유지한다.
+MANAGER_FOREGROUND_CYCLE = "Bash 도구 timeout 600000 으로 전경 실행한다(도구 기본 120초에 끊기면 clear 뒤 재개 포인터 없이 남는다)."
+MANAGER_DIRECTIVES = ("MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md")
+
+
+def manager_foreground_cycle_violations(raw: str) -> list[str]:
+    """부서장 지침에 cycle-agent 전경 대기 지시가 남아 있으면 그 문장(빈 목록이 합격)."""
+    body = normalize(strip_html_comments(raw))
+    return [MANAGER_FOREGROUND_CYCLE] if normalize(MANAGER_FOREGROUND_CYCLE) in body else []
 
 
 def override_carveout_violations(body: str) -> list[str]:
@@ -1831,6 +1857,26 @@ class CsoDirectiveRevision(unittest.TestCase):
             with self.subTest(directive=name):
                 self.assertEqual(missing_safety_clauses(name, self.raw[name]), [],
                                  "%s 안전 조항이 사라졌거나 뜻이 바뀌었다" % name)
+
+    def test_manager_cycle_agent_is_not_an_in_turn_wait(self):
+        """★(0.14.42 · ROLE-G1) master·CEO 는 cycle-agent 를 **백그라운드**로 돌린다 — 전경 600000 대기 문장이 부서장
+        지침에 남으면 한 사이클(최대 약 8.5분) 동안 그 턴이 멈춰 회신 큐가 적체된다(오너 절대 규칙 위반).
+        CSO 는 부서장이 아니므로 자기 ④ 1콜은 전경 600000 을 유지한다(그래야 master clear 가 도구 기본 120초에 끊기지 않는다).
+        실패 방향: 붉어지면 부서장이 턴 안 장시간 대기를 지시받는다(회신 큐 적체) 또는 CSO 의 master clear 가 120초에 끊긴다."""
+        for name in MANAGER_DIRECTIVES:
+            with self.subTest(directive=name):
+                self.assertEqual(manager_foreground_cycle_violations(self.raw[name]), [],
+                                 "%s 가 부서장에게 cycle-agent 전경 대기를 지시한다(회신 큐 적체)" % name)
+                self.assertIn("run_in_background: true", self.raw[name])
+        self.assertIn(normalize("④의 1콜은 Bash 도구 timeout 600000 · 전경으로 실행한다"),
+                      normalize(strip_html_comments(self.cso)), "CSO 의 master clear 1콜 전경 600000 이 사라졌다")
+        # 대조군: 수정 전 문장(7d5733d4)을 되돌려 넣으면 판정이 붉어져야 한다(공허한 검체 금지).
+        master = self.raw["MASTER_DIRECTIVE.md"]
+        lo = master.index("  **백그라운드로 실행한다**")
+        hi = master.index("  **저장 없이 clear 금지는 코드가 강제한다.**")
+        pre_fix = master[:lo] + "  " + MANAGER_FOREGROUND_CYCLE + "\n" + master[hi:]
+        self.assertNotEqual(pre_fix, master)
+        self.assertEqual(manager_foreground_cycle_violations(pre_fix), [MANAGER_FOREGROUND_CYCLE])
 
     def test_budget_exemption_covers_the_mandated_push_form(self):
         """★R2(리뷰 major): 머리글이 의무화한 push 형태가 예산 면제 접두로 실제 덮여야 한다.
