@@ -22285,6 +22285,8 @@ mod h1_queue_quiesce_tests {
         d.bus.tail(300).iter().filter(|ev| ev["name"] == name).count()
     }
 
+    // 소비자(h1_orphan_…·h1_manual_…)가 cfg(unix) 라 같은 게이트 — 윈도우 검사에서 dead_code 경고를 내지 않는다(`true` 도 유닉스 명령).
+    #[cfg(unix)]
     fn dead_pid() -> u32 {
         let mut c = std::process::Command::new("true").spawn().expect("자식");
         let pid = c.id();

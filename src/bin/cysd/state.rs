@@ -1116,8 +1116,8 @@ impl InjectTrack {
                 .is_some_and(|t| t.elapsed() > over)
     }
 
-    /// 검체 전용 — Inject arm 시작 시각을 과거로 옮긴다(막힌 writer 재현).
-    #[cfg(test)]
+    /// 검체 전용 — Inject arm 시작 시각을 과거로 옮긴다(막힌 writer 재현). 소비 검체(h3_stuck_…)가 cfg(unix) 라 같은 게이트.
+    #[cfg(all(test, unix))]
     pub(crate) fn backdate_begin(&self, by: std::time::Duration) {
         *self.began_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() - by);
     }
