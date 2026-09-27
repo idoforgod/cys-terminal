@@ -1350,6 +1350,10 @@ pub struct Surface {
     ingest: Mutex<IngestState>,
     pub out_tx: broadcast::Sender<Vec<u8>>,
     pub last_output: Mutex<Instant>,
+    /// ★(0.14.42 · clear 직후 바닥 가드) 마지막으로 **끝난** 출력의 조용한 틈 `(시작, 끝)` — 길이가
+    /// [`crate::usage::CTX_FLOOR_IDLE_QUIET_SECS`] 이상일 때만 reader 가 기록한다(턴 끝 → 다음 입력). 가드는 이것으로 clear
+    /// 사이클의 복원 턴이 끝난 시점을 알아 그 뒤 작업을 바닥에 싣지 않는다(`CtxLoopGuard::note_idle`). 휘발 · 말단 락.
+    pub last_output_gap: Mutex<Option<(Instant, Instant)>>,
     /// ★(0.14.31 · WP-1 H-1 · 리뷰 R1) **출력 세대** — reader 가 청크 하나를 발행하는 동안 홀수, 발행이 끝나면
     /// 짝수(seqlock 부호). `surface.read_text` 의 `quiet_secs` 는 화면/스크롤백 스냅샷 앞뒤로 이 값을 읽어
     /// 세대가 홀수였거나 달라졌으면 관측을 **버린다**(`quiet_secs = 0.0` — 출력이 흐르는 중). 스탬프
@@ -5611,6 +5615,7 @@ impl Daemon {
             }),
             out_tx,
             last_output: Mutex::new(Instant::now()),
+            last_output_gap: Mutex::new(None),
             output_gen: Arc::new(AtomicU64::new(0)),
             idle_notified: AtomicBool::new(false),
             last_recall_line: Mutex::new(String::new()),
@@ -5780,7 +5785,14 @@ impl Daemon {
                         //   `ingest_output` 뒤에서 올린다. 사람 입력·주입 자체는 여기 오지 않지만 그 **PTY
                         //   에코**는 출력이라 스탬프를 움직인다(보수 방향 — 주입 직후 밸브가 더 기다린다).
                         surf.output_gen.fetch_add(1, Ordering::AcqRel);
+                        // ★(clear 직후 바닥 가드) 스탬프 직전 값 = 이 청크 앞의 조용함이 시작된 시각(쓰기 주체는 이 reader 하나).
+                        let quiet_from = *surf.last_output.lock().unwrap();
                         *surf.last_output.lock().unwrap() = Instant::now();
+                        // 끝난 조용한 틈(턴 끝 → 다음 입력의 에코)을 기록 — 틈이 짧으면 건드리지 않는다(말단 락 · 끝 = 방금 스탬프).
+                        let out_at = *surf.last_output.lock().unwrap();
+                        if out_at.saturating_duration_since(quiet_from).as_secs_f64() >= crate::usage::CTX_FLOOR_IDLE_QUIET_SECS {
+                            *surf.last_output_gap.lock().unwrap_or_else(|e| e.into_inner()) = Some((quiet_from, out_at));
+                        }
                         // DSR cursor-position query: a real terminal must answer, or
                         // ConPTY(Windows)가 응답을 기다리며 입출력 펌프를 멈춘다.
                         // ★G5-④: 경계 분할 carry + 질의 '수' 계상은 순수 함수 단일 정의처
