@@ -24674,6 +24674,15 @@ mod tests {
         cys::resolve_claude_config_dir()
     }
 
+    /// ★검체 격리(2026-09-26 계측으로 확정) — 재결합 검체는 데몬이 **HOME 에서** 해소한 계정 dir
+    /// (`resolve_claude_config_dir`)을 후보 축으로 쓴다. 같은 프로세스의 승인·ACL 검체들(`PACK_ENV_LOCK` 보유)은
+    /// 서명 부작용 격리를 위해 HOME 을 잠시 바꾸므로, 그 창에 만든 좌석은 **다른 계정 dir** 을 갖고 후보에서
+    /// 빠진다 — 전량 병렬 실행에서 `raced_candidate_changed`·`no_candidate` 간헐 적색(좌석 cfg 가
+    /// `…/cys-acl-ttl-ext-…/.cys/claude` 로 찍힌 것을 계측으로 확인). 같은 잠금을 검체 전 구간 쥔다(판정 무변경).
+    fn rc_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 데몬이 호출 좌석에 대해 아는 축(테스트 대역) — `reclaim_commit` 재검증에 그대로 넘긴다.
     fn rc_axes(sid: u64) -> crate::reclaim::CallerAxes<'static> {
         // 테스트 수명 동안만 사는 값이 필요해 leak 한다(검체 프로세스 종료로 회수).
@@ -25037,6 +25046,7 @@ mod tests {
     /// (roles 맵만 갈아끼우면 `cys list` 에 같은 역할 좌석이 둘이 되고 큐 게이트가 오작동한다).
     #[test]
     fn reclaim_auto_binds_single_candidate_and_demotes_old_seat() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_101_u32;
@@ -25074,6 +25084,7 @@ mod tests {
     /// surface id 숫자가 겹치는 다른 부서 데몬의 좌석을 가져오는 것이 이 장치의 최악 오작동이다.
     #[test]
     fn reclaim_auto_ignores_other_account_dir_and_other_cwd() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         reclaim_seat(&daemon, "cso", RC_CWD, Some("/tmp/cys-test-account-dept2"), false);
         reclaim_seat(&daemon, "reviewer-codex", "/tmp/cys-test-other-proj", None, false);
@@ -25089,6 +25100,7 @@ mod tests {
     /// 후보 2 → **무결합**(어느 쪽을 골라도 절반은 틀린다). 두 역할 매핑 모두 불변.
     #[test]
     fn reclaim_auto_refuses_when_two_candidates() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let a = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let b = reclaim_seat(&daemon, "reviewer-codex", RC_CWD, None, false);
@@ -25112,6 +25124,7 @@ mod tests {
     /// 하나로 판정하므로 **두 값 모두**를 이 경로로 관통시킨다(핀을 넓혔다 = 안전 방향).
     #[test]
     fn reclaim_auto_excludes_freshly_spawned_seat() {
+        let _env = rc_env_lock();
         for injected in [true, false] {
             let daemon = isolated_daemon();
             let fresh = reclaim_seat(&daemon, "worker-2", RC_CWD, None, injected);
@@ -25142,6 +25155,7 @@ mod tests {
     /// 부활과 재결합이 같은 역할에 동시에 손대면 좌석이 둘이 되거나 서로의 결합을 덮는다.
     #[test]
     fn reclaim_auto_defers_while_restore_lease_is_held() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_105_u32;
@@ -25164,6 +25178,7 @@ mod tests {
     /// 그리고 그 역할은 `roles[role] == 나` 까지 대조한 **데몬 권위** 값이다.
     #[test]
     fn reclaim_auto_is_idempotent_for_already_roled_caller() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let other = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_106_u32;
@@ -25185,6 +25200,7 @@ mod tests {
     /// '역할 있음'으로 읽으면 이미 잃은 역할의 지침을 다시 주입하게 된다(두 좌석이 같은 역할).
     #[test]
     fn stale_surface_role_is_not_authoritative() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let pid = 970_107_u32;
         let me = reclaim_caller(&daemon, RC_CWD, pid);
@@ -25208,6 +25224,7 @@ mod tests {
     /// 축의 출처가 자기신고에서 데몬 지식으로 바뀐 것이다.
     #[test]
     fn reclaim_auto_uses_daemon_known_axes_not_reported_ones() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_108_u32;
@@ -25254,6 +25271,7 @@ mod tests {
     /// 발신 pid 미해석은 무결합.
     #[test]
     fn reclaim_auto_rejects_self_declared_surface_and_unresolved_caller() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_109_u32;
@@ -25283,6 +25301,7 @@ mod tests {
     /// 0"이라는 주장이 실측된 적이 없었다 — 취소 직전에 큐를 옮기는 회귀를 넣어도 초록이었다.
     #[test]
     fn reclaim_commit_aborts_on_every_race_without_partial_effect() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_110_u32;
@@ -25425,6 +25444,7 @@ mod tests {
     /// (이 WP 가 고치려는 증상의 다른 얼굴). 커밋은 그 stale 필드를 새 역할로 덮는다.
     #[test]
     fn stale_role_field_does_not_block_reclaim() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_112_u32;
@@ -25453,6 +25473,7 @@ mod tests {
     /// 사실이 있으면 승계는 어느 시점에도 정당하지 않다(아무도 모르는 승계 = 치명위험 ③).
     #[test]
     fn a_cancelled_attempt_never_commits() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_124_u32;
@@ -25495,6 +25516,7 @@ mod tests {
     /// 커밋을 **본다**는 것을 잰다(둘 중 어느 쪽이 이기든 답은 참이어야 한다).
     #[test]
     fn reconcile_reports_a_commit_that_landed_before_the_cancel() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_125_u32;
@@ -25523,6 +25545,7 @@ mod tests {
     /// 곳에 있는데 이 프로젝트의 역할을 주지 않는다 — codex 적대검증 R2 blocking).
     #[test]
     fn reclaim_auto_refuses_self_reported_axes_that_are_not_this_seats() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         const OTHER_CFG: &str = "/tmp/cys-test-account-dept3";
         const OTHER_CWD: &str = "/tmp/cys-test-other-proj";
@@ -25577,6 +25600,7 @@ mod tests {
     //   Windows 에서도 그대로 잰다.
     #[cfg(unix)]
     fn reported_cwd_cannot_widen_past_the_live_cwd() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         const CWD_A: &str = "/tmp/cys-triage-proj-a";
         const CWD_B: &str = "/tmp/cys-triage-proj-b";
@@ -25660,6 +25684,7 @@ mod tests {
     #[test]
     #[cfg(unix)] // 심링크 생성이 필요하다(Windows 는 권한·정책이 걸린다).
     fn reclaim_binds_across_two_representations_of_one_directory() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         // 기준 디렉터리부터 **해소된 표기**로 잡는다 — macOS 의 `/var` → `/private/var` 처럼
         // 상위가 이미 심링크면 세 번째 표기가 끼어들어 검체가 자기 주제를 못 잰다.
@@ -25786,6 +25811,7 @@ mod tests {
     /// 확인하는 경로다. **아무 상태도 바꾸지 않는다**: 후보가 있어도 결합하지 않는다.
     #[test]
     fn reclaim_reconcile_is_readonly_and_returns_authoritative_role() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_121_u32;
@@ -25810,6 +25836,7 @@ mod tests {
     /// 결합 판정에는 쓰이지 않는다 — 데몬이 그 이름의 **현재 보유자**를 조회할 뿐이다.)
     #[test]
     fn env_role_state_reports_who_actually_holds_the_role() {
+        let _env = rc_env_lock();
         // ★이 검체는 실 PTY 좌석 2개를 띄운다. 러너에 여유 PTY 가 없으면 잴 것이 없다 —
         //   자원 고갈을 결함으로 신고하지 않고 사유를 남기고 물러난다(0.14.32 · aarch64 ENXIO).
         if let Err(e) = pty_available() {
@@ -25856,6 +25883,7 @@ mod tests {
     /// 승계는 **아무도 모르는 승계**가 된다.
     #[test]
     fn reclaim_auto_refuses_to_commit_past_the_client_deadline() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let old = reclaim_seat(&daemon, "worker-2", RC_CWD, None, false);
         let pid = 970_123_u32;
@@ -25890,6 +25918,7 @@ mod tests {
     /// R2 major). 이 검체는 그 두 사실을 한 자리에서 잰다.
     #[test]
     fn reclaim_master_rearms_the_sign_cooldown() {
+        let _env = rc_env_lock();
         let daemon = isolated_daemon();
         let holder = reclaim_seat(&daemon, "master", RC_CWD, None, false);
         // 오래 전에 claim 된 안정 master 로 만든다(쿨다운 해제 상태).
