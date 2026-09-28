@@ -5136,6 +5136,10 @@ pub(crate) enum DraftGateDenied {
     ScreenOccupied,
     /// ★(0.14.41 · U8 P1) 질문·선택 창(모달)이 화면 전경이다 — Text 팔 전용(본문을 쓰지 않는다).
     Modal,
+    /// ★(0.14.42 · S21-SETTLE) 기계 제출 CR 이 writer 에 넘어가 아직 쓰이지 않았거나 방금 쓰인 분리 창 안이다 —
+    /// Text 팔 전용 · 핸들러만 만든다(`draft_gate_verdict` 는 만들지 않는다 · handlers `submit_settle_hold`).
+    /// 지금 본문을 넘기면 writer FIFO 에서 그 CR 바로 뒤에 붙어 `\r`+본문 한 덩이로 읽힌다(실 claude 병합).
+    SubmitSettling,
 }
 
 impl DraftGateDenied {
@@ -5145,6 +5149,7 @@ impl DraftGateDenied {
             Self::HumanDraft { .. } => "human_draft",
             Self::ScreenOccupied => "screen_occupied",
             Self::Modal => "modal",
+            Self::SubmitSettling => "submit_settling",
         }
     }
 }

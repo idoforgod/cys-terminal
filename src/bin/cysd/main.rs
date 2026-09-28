@@ -7104,3 +7104,8 @@ mod team_token_tests;
 // team_gate_tests 와 같은 이유로 파일 맨 끝에 둔다(부트스트랩 건강성 러너의 첫 #[cfg(test)] 앵커).
 #[cfg(test)]
 mod return_absorb_tests;
+
+// ★(0.14.42 · S21-SETTLE) 직접 send 제출 정착(분리 보류·정착 증명) RPC 회귀 핀 — 테스트 전용 모듈(프로덕션 코드 0).
+// team_gate_tests 와 같은 이유로 파일 맨 끝에 둔다(부트스트랩 건강성 러너의 첫 #[cfg(test)] 앵커).
+#[cfg(test)]
+mod send_settle_tests;

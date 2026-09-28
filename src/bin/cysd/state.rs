@@ -1048,6 +1048,36 @@ pub struct InjectTrack {
     /// ★(R1-F4) 지금 Inject arm 이 시작된 단조 시각 — writer 가 쓰기에 막혀(stdin 을 읽지 않는 에이전트 · PTY 입력 버퍼 포화)
     /// `active` 가 내려오지 않는 것을 판정자가 가려낸다([`InjectTrack::stuck_over`]).
     began_at: Mutex<Option<Instant>>,
+    /// ★(0.14.42 · S21-SETTLE) writer 에 넘겼으나 아직 소비하지 않은 **기계 제출 CR**(`WriteReq::SubmitAfterGap`) 수.
+    /// 올림 = 핸들러 send_key(input_gate 안 · 인계 직전) · 내림 = writer(소비 뒤) 또는 핸들러(인계 실패).
+    /// 원자 연산뿐이라 'input_gate 안에서는 pending_input leaf 만' 락 계약에 새 락을 더하지 않는다.
+    submit_pending: AtomicU64,
+    /// 마지막 제출 CR 을 writer 에 넘긴 정착 단조 ms([`settle_mono_ms`] · 0 = 없음) — 계수의 신선도 상한
+    /// (writer 가 PTY 닫힘으로 끝나 계수가 남아도 상한 뒤에는 '진행 중' 으로 보지 않는다).
+    submit_handed_ms: AtomicU64,
+    /// 마지막 제출 CR(`SubmitAfterGap` · Inject arm 의 끝 CR)을 PTY 에 **실제로 쓴** 정착 단조 ms(0 = 없음).
+    submit_written_ms: AtomicU64,
+    /// 지금 Inject arm 이 시작된 정착 단조 ms(0 = 없음) — `began_at` 의 원자 사본(게이트 안 판독용 · 신선도 상한).
+    inject_began_ms: AtomicU64,
+}
+
+/// ★(0.14.42 · S21-SETTLE) 좌석 제출 정착 판정의 단조 시계(ms) — 프로세스 기준점 경과 + 1(0 은 '없음' 표지).
+pub(crate) fn settle_mono_ms() -> u64 {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// ★(0.14.42 · S21-SETTLE) 한 좌석의 제출 정착 관측(원자 판독 1회분) — [`InjectTrack::submit_settle_obs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SubmitSettleObs {
+    /// writer 에 넘긴 제출 CR 이 아직 안 쓰였거나(신선도 상한 안) Inject arm 이 붙여넣기~CR 을 쓰는 중(상한 안)이다.
+    pub inflight: bool,
+    /// writer 대기 제출 CR 수(신선도 상한 밖이면 0 으로 본다).
+    pub pending: u64,
+    /// 마지막 제출 CR 을 넘긴 뒤 경과 ms(없으면 None).
+    pub handed_age_ms: Option<u64>,
+    /// 마지막 제출 CR 을 PTY 에 쓴 뒤 경과 ms(없으면 None).
+    pub since_written_ms: Option<u64>,
 }
 
 /// ★(0.14.42 · R3SH-1) 좌석 입력줄에 마지막으로 쓴 **기계 본문**의 기록 — H0 기계 잔여 입증의 둘째 근거.
@@ -1103,7 +1133,56 @@ impl InjectTrack {
     /// writer 전용 — Inject arm 의 첫 바이트 앞.
     pub(crate) fn begin(&self) {
         *self.began_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        self.inject_began_ms.store(settle_mono_ms(), Ordering::Release);
         self.active.store(true, Ordering::Release);
+    }
+
+    /// ★(0.14.42 · S21-SETTLE) 핸들러 전용 — 기계 제출 CR(`SubmitAfterGap`)을 writer 에 넘기기 **직전**.
+    /// input_gate 안에서 부른다(원자 연산뿐 — 락 계약 무변경). 인계에 실패하면 [`Self::submit_hand_failed`].
+    pub(crate) fn submit_handed(&self) {
+        self.submit_handed_ms.store(settle_mono_ms(), Ordering::Release);
+        self.submit_pending.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 핸들러 전용 — 넘기려던 제출 CR 이 채널 포화·writer 종료로 인계되지 않았다(계수 되돌림 · 0 아래로 안 내려감).
+    pub(crate) fn submit_hand_failed(&self) {
+        let _ = self
+            .submit_pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+    }
+
+    /// writer 전용 — 제출 CR arm 을 소비했다. `written` = PTY 쓰기 성공(그때만 '쓴 시각'을 찍는다 — 실패한 write 를
+    /// 기준 삼으면 화면에 없는 CR 때문에 다음 본문이 늦춰진다 · B2′ 기준점 규율과 같다).
+    pub(crate) fn submit_consumed(&self, written: bool) {
+        if written {
+            self.submit_written_ms.store(settle_mono_ms(), Ordering::Release);
+        }
+        self.submit_hand_failed();
+    }
+
+    /// writer 전용 — Inject arm 이 끝 CR 까지 썼다(큐 배달·clear_first 등 원자 주입도 기계 제출이다).
+    pub(crate) fn submit_written(&self) {
+        self.submit_written_ms.store(settle_mono_ms(), Ordering::Release);
+    }
+
+    /// ★(0.14.42 · S21-SETTLE) 제출 정착 관측 — 원자 판독뿐(input_gate 안에서 불러도 새 락 0).
+    /// `inflight_max_ms` = '진행 중' 신선도 상한(writer 가 PTY 닫힘으로 끝나 계수가 남거나 막힌 Inject 가 `active` 를
+    /// 내리지 못해도 상한 뒤에는 진행 중으로 보지 않는다 — 실패 방향은 종전 판정).
+    pub(crate) fn submit_settle_obs(&self, now_ms: u64, inflight_max_ms: u64) -> SubmitSettleObs {
+        let age = |x: u64| (x != 0).then(|| now_ms.saturating_sub(x));
+        let handed_age_ms = age(self.submit_handed_ms.load(Ordering::Acquire));
+        let pending = match handed_age_ms {
+            Some(a) if a <= inflight_max_ms => self.submit_pending.load(Ordering::Acquire),
+            _ => 0,
+        };
+        let inject_live = self.active.load(Ordering::Acquire)
+            && age(self.inject_began_ms.load(Ordering::Acquire)).is_some_and(|a| a <= inflight_max_ms);
+        SubmitSettleObs {
+            inflight: pending > 0 || inject_live,
+            pending,
+            handed_age_ms,
+            since_written_ms: age(self.submit_written_ms.load(Ordering::Acquire)),
+        }
     }
 
     /// ★(R1-F4) Inject arm 이 `over` 보다 오래 쓰는 중인가 — writer 가 막혔다(정상 arm 은 붙여넣기 + cr_delay ≤ 1s 안팎).
@@ -6446,6 +6525,11 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
                 if r.is_ok() {
                     last_program_write = Some(std::time::Instant::now());
                 }
+                // ★(0.14.42 · S21-SETTLE) 제출 정착 표식 — 대기 계수 내림 + (성공 시) 쓴 시각. 핸들러가 이것으로
+                //   '대기 CR 뒤에 다음 본문을 붙이지 않는다'(분리 보류)를 판정한다. 원자 쓰기뿐.
+                if let Some(t) = &track {
+                    t.submit_consumed(r.is_ok());
+                }
                 r
             }
             WriteReq::Inject {
@@ -6469,6 +6553,10 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
                 }
                 let r = inject_write(&mut writer, &text, cr_delay_ms, clear_first);
                 if let Some(t) = &track {
+                    // ★(0.14.42 · S21-SETTLE) 끝 CR 까지 썼으면 제출 CR 을 쓴 시각이다(분리 보류의 기준점).
+                    if r.is_ok() {
+                        t.submit_written();
+                    }
                     t.end();
                 }
                 r

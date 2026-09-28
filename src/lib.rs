@@ -660,6 +660,38 @@ pub const DRAFT_GATE_TAG: &str = "draft_gate";
 pub const MSG_DRAFT_GATE_CANCEL_KEY: &str =
     "human draft in this pane; cancel key refused (it would erase the draft) — wait for the human or let them clear the line";
 
+/// ★(0.14.42 · S21-SETTLE) 직접 send D-12 거부의 **정착 증명** 태그 — 거부 문구 끝에 ` [settle:<ms>]` 로 붙는다.
+///
+/// 뜻: "이 거부의 원인은 진행 중인 **기계 제출**(writer 에 넘긴 제출 CR · 방금 쓴 CR 의 분리 창 · 짝 Return 을
+/// 기다리는 새 기계 본문)이고, 약 `<ms>` 뒤 줄이 빈다". 데몬은 쓰기 0 이 확정된 명시 거부(원장·PTY 인계보다 앞 ·
+/// 또는 input_gate 안 쓰기 전)에만 붙인다. 사람 초안·모달·타이핑 가드에는 붙이지 않는다.
+/// 신 CLI(`cys send`)는 이 태그가 있을 때만 예산 안에서 같은 본문을 다시 보내고, 없으면 종전처럼 곧바로
+/// `--queued` 로 1회 전환한다. 구 CLI 는 거부 문구를 `contains(MSG_TYPING_GUARD)` 로만 보므로 종전 폴백 그대로다.
+/// 생산자(cysd handlers)와 소비자(cys)가 이 상수·아래 두 함수만 쓴다(문자열 계약 드리프트 방지 — RC1).
+pub const SEND_SETTLE_TAG: &str = "settle";
+
+/// 정착 증명 접미(` [settle:<ms>]`) — 생산자 단일 정의처.
+pub fn send_settle_suffix(hint_ms: u64) -> String {
+    format!(" [{SEND_SETTLE_TAG}:{hint_ms}]")
+}
+
+/// 거부 문구에서 정착 힌트(ms)를 읽는다(순수 · 소비자 단일 정의처). D-12 태그(`[draft_gate:…]`)와 정착 태그가
+/// **둘 다** 있을 때만 `Some` — 그 밖의 거부(전송 오류·ACL·큐 만석·태그 없는 타이핑 가드)는 `None`(재시도 0회).
+pub fn send_settle_hint_ms(msg: &str) -> Option<u64> {
+    if !msg.contains(&format!("[{DRAFT_GATE_TAG}:")) {
+        return None;
+    }
+    let key = format!("[{SEND_SETTLE_TAG}:");
+    let rest = &msg[msg.rfind(&key)? + key.len()..];
+    rest[..rest.find(']')?].trim().parse().ok()
+}
+
+/// 정착 재시도·증명 끔 스위치 값인가(순수) — `0`·`false`·`off`(대소문자·앞뒤 공백 무시). 데몬·CLI 공용
+/// (env `CYS_SEND_SETTLE`). 결측·그 밖의 값은 켬이다.
+pub fn send_settle_env_off(v: Option<&str>) -> bool {
+    v.is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off"))
+}
+
 /// `cys boot` 가 **무스폰 skip**(다른 boot 가 락 보유)을 낼 때의 종료코드 — EX_TEMPFAIL(75).
 ///
 /// ★(T-0147-7 W4 · G11·하드 제약 6-⑧) bare exit 계약: **0 = Fatal 없음(Degrade-only 포함) ·
@@ -2773,6 +2805,33 @@ pub mod mousereport {
 
 #[cfg(test)]
 mod tests {
+
+    /// ★(0.14.42 · S21-SETTLE) 정착 증명 문자열 계약 — 생산(접미)·소비(파서)·끔 스위치 판정이 한 곳에서 맞물린다.
+    #[test]
+    fn s21_send_settle_tag_roundtrip_and_env_off() {
+        let msg = format!(
+            "{} [{}:submit_settling]{}",
+            super::MSG_TYPING_GUARD,
+            super::DRAFT_GATE_TAG,
+            super::send_settle_suffix(137)
+        );
+        assert!(msg.ends_with(" [settle:137]"), "{msg}");
+        assert_eq!(super::send_settle_hint_ms(&msg), Some(137));
+        // 뒤에 다른 안내가 붙어도 읽는다(send_key 별칭 안내 자리).
+        assert_eq!(super::send_settle_hint_ms(&format!("{msg} (key hint)")), Some(137));
+        // D-12 태그 없는 문구의 settle 은 증명이 아니다(다른 거부·본문 인용 오인 차단).
+        assert_eq!(super::send_settle_hint_ms("human is typing [settle:5]"), None);
+        // 증명 없는 D-12 거부 · 깨진 값 · 결측.
+        assert_eq!(super::send_settle_hint_ms(&format!("x [{}:pending_input]", super::DRAFT_GATE_TAG)), None);
+        assert_eq!(super::send_settle_hint_ms("x [draft_gate:screen_occupied] [settle:abc]"), None);
+        assert_eq!(super::send_settle_hint_ms("x [draft_gate:screen_occupied] [settle:12"), None);
+        for off in ["0", "false", "OFF", " off "] {
+            assert!(super::send_settle_env_off(Some(off)), "{off}");
+        }
+        for on in [None, Some("1"), Some("on"), Some(""), Some("no")] {
+            assert!(!super::send_settle_env_off(on), "{on:?}");
+        }
+    }
 
     /// 소켓 환경변수 변경은 --test-threads=1 로 직렬 실행하며, 실패해도 원래 값을 복원한다.
     #[test]
