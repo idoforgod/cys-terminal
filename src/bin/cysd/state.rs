@@ -1035,14 +1035,18 @@ pub struct ReturnTicket {
 /// escalation 되던 결함(리뷰 F2 · 0.05~0.4s 간격 12/12). writer 는 단일 소비자라 뒤 Inject 가 앞 Inject 의 글자와
 /// 한 제출로 섞이지 않는다(종전 HEAD 도 연속 주입했다). 그래서 이 창의 화면 초안은 보류 근거가 아니다.
 ///
-/// 쓰기 = writer 스레드 단독([`run_writer_loop_tracked`] 의 Inject arm 이 begin/end). 읽기 = H0 판정·채널 배달 간격.
-/// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). 락: `done_at` 은 leaf.
+/// 쓰기 = writer 스레드 단독([`run_writer_loop_tracked`] 의 Inject arm 이 begin/end) — 예외 `handed_at`(채널 생산자 ·
+/// [`InjectTrack::note_handoff`]). 읽기 = H0 판정·채널 배달 간격.
+/// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). 락: `done_at`·`handed_at` 은 leaf.
 #[derive(Debug, Default)]
 pub struct InjectTrack {
     /// Inject arm 이 (선정리)·붙여넣기·cr_delay·CR 을 쓰는 중이다.
     active: AtomicBool,
     /// 마지막 Inject arm 이 끝난 단조 시각(성공·실패 무관 — 끝난 뒤에는 화면만 남는다).
     done_at: Mutex<Option<Instant>>,
+    /// ★(0.14.42 · H3 간격 경쟁) 채널 생산자가 Inject 를 writer 에 **넘긴**(try_send 직전) 단조 시각 —
+    /// [`InjectTrack::handoff_pending`]. 채널 행 간격 전용이다(H0 자기 붙여넣기 귀속은 읽지 않는다 — 인계만 된 본문은 화면에 없다).
+    handed_at: Mutex<Option<Instant>>,
     /// ★(R3SH-1) 마지막 **기계 본문**(데몬 Inject · CLI 기계 send) — 제출 CR 뒤에도 남는다. [`MachineBody`] doc.
     last_body: Mutex<Option<MachineBody>>,
     /// ★(R1-F4) 지금 Inject arm 이 시작된 단조 시각 — writer 가 쓰기에 막혀(stdin 을 읽지 않는 에이전트 · PTY 입력 버퍼 포화)
@@ -1229,6 +1233,56 @@ impl InjectTrack {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some_and(|t| t.elapsed() < within)
     }
+
+    /// ★(0.14.42 · H3 간격 경쟁 — 발행 준비 발견) 생산자 전용 — Inject 를 writer 에 넘기기(`try_send`) **직전**에 부른다.
+    ///
+    /// 【왜】 [`Self::busy_within`] 은 writer 가 arm 을 **시작한**(`begin`) 뒤부터만 참이다. 생산자가 넘긴 뒤 writer 가 집기 전
+    /// (선행 쓰기 적체 · 스레드 깨움 지연)에 다음 판정이 돌면 거짓이라, 채널 뒤 행이 앞 행 CR 에 간격 0 으로 붙고 그 판정은 앞
+    /// 행을 쓰기도 전의 화면을 본 것이 된다(S41 HG1 계급 · 검체 `h3_flush_rejudges_…` 간헐 적색). 넘긴 시각을 남겨 그 창을 메운다.
+    /// 【왜 넘기기 전인가】 넘긴 뒤에 찍으면 부하 중 writer 가 그 arm 을 먼저 끝낼 수 있다 — 끝난 arm 뒤의 표식은 영영 풀리지
+    /// 않는 '대기'가 된다. 인계에 실패하면 [`Self::undo_handoff`] 로 되돌린다.
+    pub(crate) fn note_handoff(&self) -> HandoffMark {
+        let mine = Instant::now();
+        let prev = self.handed_at.lock().unwrap_or_else(|e| e.into_inner()).replace(mine);
+        HandoffMark { prev, mine }
+    }
+
+    /// 생산자 전용 — [`Self::note_handoff`] 뒤 인계(`try_send`)가 실패했다(채널 포화·writer 종료). 그 사이 다른 인계가 표식을
+    /// 덮었으면 건드리지 않는다.
+    pub(crate) fn undo_handoff(&self, m: HandoffMark) {
+        let mut g = self.handed_at.lock().unwrap_or_else(|e| e.into_inner());
+        if *g == Some(m.mine) {
+            *g = m.prev;
+        }
+    }
+
+    /// 마지막 인계 뒤 **어떤 Inject arm 도 끝나지 않았으면** 그 인계의 경과 — 넘긴 Inject 가 대기열에 있거나 쓰는 중이다.
+    /// 끝난 arm 이 인계보다 뒤면(`done_at ≥ handed_at`) None: 간격은 종전 [`Self::busy_within`] 이 `done_at` 으로 잰다.
+    /// 판독 순서 = 인계 → 끝남(writer `end` 는 `done_at` 을 찍고 `active` 를 내린다) — 이 판정이 None 이면 호출부의
+    /// `busy_within` 이 이어받는다(빈틈 0). 원자 스냅숏은 아니다(leaf 락 둘).
+    ///
+    /// 실패 방향 = 보류(지연): 표식이 풀리지 않는 경우는 writer 가 끝내 그 arm 을 쓰지 못한 때뿐이다(막힘 · 종료). 호출부는
+    /// 경과가 막힘 문턱을 넘으면 막힌 writer 로 본다(채널 `CHANNEL_WRITER_STUCK_SECS` → `WriterBusy` · 15s sweep).
+    pub(crate) fn handoff_pending(&self) -> Option<std::time::Duration> {
+        let handed = (*self.handed_at.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let done = *self.done_at.lock().unwrap_or_else(|e| e.into_inner());
+        done.map_or(true, |d| d < handed).then(|| handed.elapsed())
+    }
+
+    /// 검체 전용 — 인계 시각을 과거로 옮긴다(writer 가 오래 집지 못한 인계 재현). 소비 검체(h3_handoff_stuck_…)가 cfg(unix) 라 같은 게이트.
+    #[cfg(all(test, unix))]
+    pub(crate) fn backdate_handoff(&self, by: std::time::Duration) {
+        if let Some(t) = self.handed_at.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            *t -= by;
+        }
+    }
+}
+
+/// [`InjectTrack::note_handoff`] 의 되돌림 증표(인계 실패 시 [`InjectTrack::undo_handoff`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HandoffMark {
+    prev: Option<Instant>,
+    mine: Instant,
 }
 
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
@@ -8153,6 +8207,49 @@ mod tests {
             "이미 {OVERWAIT_GAP_MS}ms 가 지났는데 CR 이 또 {took:?} 늦춰졌다 — 하한이어야 할 \
              간격이 상한처럼 동작한다(모든 제출이 매번 느려진다)"
         );
+    }
+
+    /// ★(0.14.42 · H3 간격 경쟁) 인계 표식의 생애 — 실제 표식판 writer 루프로 잰다. ① 넘긴 뒤 writer 가 집기 전(선행 쓰기
+    /// 적체)에는 `busy_within` 이 거짓이어도(종전 빈틈) `handoff_pending` 이 참 ② arm 이 끝 CR 을 쓰면 풀리고 간격은
+    /// 종전 `done_at` 이 잰다 ③ 인계 실패 되돌림 ④ 되돌림은 뒤에 덮은 표식을 건드리지 않는다 ⑤ 표식은 `active` 를
+    /// 세우지 않는다(H0 자기 붙여넣기 귀속 무변경).
+    #[test]
+    fn inject_track_handoff_pending_until_an_arm_ends() {
+        use std::sync::mpsc::sync_channel;
+        let ms = std::time::Duration::from_millis;
+        let track = Arc::new(InjectTrack::default());
+        assert!(track.handoff_pending().is_none(), "빈 좌석");
+        let (tx, rx) = sync_channel::<WriteReq>(8);
+        let stop = Arc::new(AtomicBool::new(false));
+        let t2 = Arc::clone(&track);
+        let handle = std::thread::spawn(move || run_writer_loop_tracked(std::io::sink(), rx, stop, Some(t2)));
+        tx.send(WriteReq::DataAfter { bytes: Vec::new(), delay_ms: 300 }).unwrap();
+        std::thread::sleep(ms(50));
+        let _mark = track.note_handoff();
+        tx.send(WriteReq::Inject { text: "행".into(), cr_delay_ms: 100, clear_first: false, guard: None })
+            .unwrap();
+        std::thread::sleep(ms(50));
+        assert!(!track.busy_within(ms(1000)), "전제: writer 가 아직 집지 않았다(begin 전 — 종전 판정의 빈틈)");
+        assert!(track.handoff_pending().is_some(), "넘겼으나 writer 가 집기 전인 창을 비웠다");
+        assert!(!track.stuck_over(ms(0)), "인계 표식이 active 를 세웠다(H0 자기 붙여넣기 귀속 오염)");
+        let t0 = std::time::Instant::now();
+        while track.handoff_pending().is_some() && t0.elapsed() < ms(3000) {
+            std::thread::sleep(ms(10));
+        }
+        assert!(track.handoff_pending().is_none(), "arm 이 끝났는데 인계 대기가 풀리지 않았다");
+        assert!(track.busy_within(ms(1000)), "끝난 직후 간격은 done_at 이 잰다(빈틈 0)");
+        // ③ 인계 실패 되돌림 — 종전 표식(이미 끝난 인계)으로 돌아간다.
+        let m = track.note_handoff();
+        assert!(track.handoff_pending().is_some());
+        track.undo_handoff(m);
+        assert!(track.handoff_pending().is_none(), "인계 실패인데 대기가 남았다(다음 행이 막힌다)");
+        // ④ 되돌림 사이에 다른 인계가 덮었으면 그 표식을 지우지 않는다.
+        let stale = track.note_handoff();
+        let _newer = track.note_handoff();
+        track.undo_handoff(stale);
+        assert!(track.handoff_pending().is_some(), "뒤 인계의 표식을 앞 인계의 되돌림이 지웠다");
+        drop(tx);
+        handle.join().ok();
     }
 
     /// ★B2 계약 박제 ②(0.14.24): writer 는 **단일 소비자**라 DataAfter 가 자는 동안 뒤따라
