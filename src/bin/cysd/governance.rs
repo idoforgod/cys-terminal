@@ -5140,6 +5140,11 @@ pub(crate) enum DraftGateDenied {
     /// Text 팔 전용 · 핸들러만 만든다(`draft_gate_verdict` 는 만들지 않는다 · handlers `submit_settle_hold`).
     /// 지금 본문을 넘기면 writer FIFO 에서 그 CR 바로 뒤에 붙어 `\r`+본문 한 덩이로 읽힌다(실 claude 병합).
     SubmitSettling,
+    /// ★(0.14.42 · 수정 2회차 FV1-1) kill-switch pause 중에 온 **정착 재시도**(`settle_retry:true`)다 — Text 팔 전용 ·
+    /// 핸들러만 만든다. 재시도는 정착 증명을 받은 뒤 pause 가 걸린 발신이다(수정 전 bc954dc2 에서는 같은 발신이 곧바로
+    /// `--queued` 로 넘어가 pause 동안 동결됐다). 줄이 비어 있어도 쓰지 않고 증명 없이 거부한다 → CLI 는 종전처럼
+    /// `--queued` 1회(동결). 첫 직접 요청은 종전 그대로 pause 판정 대상이 아니다(pause 중 보고 경로).
+    Paused,
 }
 
 impl DraftGateDenied {
@@ -5150,6 +5155,7 @@ impl DraftGateDenied {
             Self::ScreenOccupied => "screen_occupied",
             Self::Modal => "modal",
             Self::SubmitSettling => "submit_settling",
+            Self::Paused => "paused",
         }
     }
 }
@@ -5189,6 +5195,141 @@ pub(crate) fn seat_modal_foreground(s: &Arc<crate::state::Surface>) -> bool {
     };
     let obs = observe_prompt(s, &markers);
     obs_modal_foreground(&obs)
+}
+
+// ═══════════ ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 — 인계 뒤 뜬 질문·선택 창을 누르지 않는다 ═══════════
+//
+// 【무엇이 틀렸었나】 `send-key Return` 의 CR 은 writer 가 최소 간격(150ms) 뒤에 쓴다(`WriteReq::SubmitAfterGap`).
+// writer 는 간격을 잔 뒤 화면을 다시 보지 않았다 — 본문을 쓴 뒤·CR 을 쓰기 전에 에이전트가 권한·질문 창을 띄우면
+// 그 CR 이 창의 기본 선택지(`❯ 1. Yes`)를 눌렀다. 1인 발신에도 있던 창(본문→CR 150ms)인데, 0.14.42 정착 재시도
+// (S21-SETTLE)가 경쟁에서 진 본문을 **앞 제출 CR 바로 뒤**(≈80~120ms · 에이전트가 앞 제출에 반응하는 시점)에 넣으면서
+// 그 창에 체계적으로 떨어졌다(S92 x=90~250ms 26/31 · 수정 전 0/31). Modal 판정([`draft_gate_modal_verdict`])은 Text
+// 팔뿐이다 — SubmitKey 에 걸면 master 의 승인 Return·cycle `/clear` 가 막힌다(위 doc · X2 불변식).
+//
+// 【규칙 — X2 불변식을 지키는 좁은 판】 writer 가 제출 CR 을 쓰기 **직전**에 화면을 다시 보고, **질문·선택 창이 전경인데
+// 커서행이 우리 기계 본문으로 설명되지 않으면** 그 CR 을 쓰지 않는다(`queue.submit_withheld` 1건). 탐침을 거는 것은
+// 핸들러가 인계 시점에 정한다([`submit_cr_guard_armed`]):
+//   · 줄 위에 CLI 기계 본문(소유 각인 · 사람 바이트 0)이 있다 → 이 Return 은 그 본문을 제출하려는 것이다 → 건다.
+//   · 없고, 이미 창이 보인다 → 보이는 창에 대한 조작(master 승인 · 선택지 조작 뒤 Return)이다 → 걸지 않는다(종전).
+//   · 없고, 창이 안 보인다 → 인계 뒤에 뜨는 창은 이 Return 의 대상이 아니다 → 건다.
+// 권위 Return(부트 체인 · launch-agent·reinject)·cycle `/clear`(ClearFirst Inject)·셸 좌석·윈도우·킬 스위치 켬은 대상 밖.
+//
+// 【보류의 귀결 — 정직】 보류한 CR 은 버린다(writer 를 막아 두면 사람 키까지 멈춘다 — 창을 풀 수단이 사라진다). 본문은
+// 입력줄에 미제출로 남는다 = 'CR 이 TUI 에 삼켜진 잔여'(R3SH-1 [`MachineDraft::SubmittedResidue`])와 같은 상태이고, 그
+// 잔여의 기존 처리(데몬 주입의 병합 제출 · 사람 처리)를 탄다. 오승인(비가역)보다 미제출 잔여(가시 · 가역)가 안전 방향이다.
+// 【남는 창】 마지막 관측과 CR 쓰기 사이(µs) · TUI 가 창을 띄우기로 했으나 아직 그리지 않은 렌더 지연 — 어떤 탐침으로도
+// 남는다(InjectGuard doc 의 '남는 창'과 같은 성질).
+
+/// ★(F1) 순수 — 커서행 입력줄(선두 마커 뒤 · 커서 앞)이 마지막 기계 본문으로 **설명되는가**(포커스가 composer 이고 그
+/// 줄은 우리 글자다). 본문이 선택지 어휘(`1. Yes …`)로 시작하거나 창 문면을 인용하면 모달 판정이 composer 에서도
+/// 양성이 된다 — 그 줄이 우리 본문이면 CR 은 composer 를 제출한다(보류하면 조용한 미제출). 결측·빈 줄은 설명이 아니다.
+pub(crate) fn composer_line_is_machine_body(before_cursor: Option<&str>, body_norm: Option<&str>) -> bool {
+    let Some(before) = before_cursor else {
+        return false;
+    };
+    let screen = crate::state::normalize_input_text(before);
+    !screen.is_empty() && body_norm.is_some_and(|n| n.ends_with(screen.as_str()))
+}
+
+/// ★(F1) 순수 — 지금 CR 을 쓰면 composer 가 아니라 **질문·선택 창**을 누르는가.
+pub(crate) fn submit_cr_hits_dialog(modal_or_selector: bool, composer_is_machine_body: bool) -> bool {
+    modal_or_selector && !composer_is_machine_body
+}
+
+/// ★(F1) 순수 — 이 제출 CR 에 보류 탐침을 거는가(`Some(근거)`) · 걸지 않는가(`None` = 종전 동작).
+/// `machine_body_pending` = 인계 시점 줄 위에 CLI 기계 본문(소유 각인 ∧ 사람 바이트 0)이 있다.
+/// `dialog_at_handoff` = 인계 시점 화면에서 이미 CR 이 창을 누르는 상태였다([`submit_cr_hits_dialog`]).
+pub(crate) fn submit_cr_guard_armed(machine_body_pending: bool, dialog_at_handoff: bool) -> Option<&'static str> {
+    if machine_body_pending {
+        Some("machine_body")
+    } else if !dialog_at_handoff {
+        Some("no_dialog_at_handoff")
+    } else {
+        None
+    }
+}
+
+/// ★(F1) IO — 지금 이 좌석에 CR 을 쓰면 창을 누르는가(관측 1회 · agent_meta·파서·inject_track leaf 락을 차례로).
+/// 에이전트 생존이 관측되지 않은 좌석(죽은 좌석의 모달 잔상 아래 셸)은 `false` — D-12 Text 모달 축과 같은 술어.
+fn observe_submit_cr_hits_dialog(s: &Arc<crate::state::Surface>, markers: &[String]) -> bool {
+    if markers.is_empty() || !crate::alert_route::seat_is_agent_backed(s) {
+        return false;
+    }
+    let obs = observe_prompt(s, markers);
+    if !obs_modal_foreground(&obs) {
+        return false;
+    }
+    let body = s.inject_track.last_body();
+    submit_cr_hits_dialog(
+        true,
+        composer_line_is_machine_body(
+            obs.line.as_ref().map(|(before, _)| before.as_str()),
+            body.as_ref().map(|b| b.norm.as_str()),
+        ),
+    )
+}
+
+/// ★(F1) 제출 CR 보류의 인계 시점 재료 — 핸들러가 `input_gate` **밖**에서 1회 만든다(어댑터·파서 락).
+pub(crate) struct SubmitCrGuardCtx {
+    /// 탐침이 writer 스레드에서 다시 쓸 마커(어댑터 로드를 writer 에서 반복하지 않는다 — `inject_safety_probe` 규율).
+    pub(crate) markers: Vec<String>,
+    /// 인계 시점에 이미 CR 이 창을 누르는 화면이었는가.
+    pub(crate) dialog_at_handoff: bool,
+}
+
+/// ★(F1) 인계 재료(IO) — 마커를 풀 수 없는 좌석(어댑터 미등록·마커 미정의)은 `None`(= 탐침 없음 · 종전).
+/// 호출부 전제: 유닉스 ∧ 에이전트 생존 좌석 ∧ 킬 스위치 꺼짐(handlers send_key).
+pub(crate) fn submit_cr_guard_context(s: &Arc<crate::state::Surface>) -> Option<SubmitCrGuardCtx> {
+    let adapters = load_adapter_defs();
+    let (markers, _) = surface_prompt_marker(s, &adapters)?;
+    if markers.is_empty() {
+        return None;
+    }
+    let dialog_at_handoff = observe_submit_cr_hits_dialog(s, &markers);
+    Some(SubmitCrGuardCtx { markers, dialog_at_handoff })
+}
+
+/// ★(F1) writer 가 제출 CR 을 쓰기 직전 부르는 **보류 탐침** — `true` = 쓰지 않는다(이벤트 `queue.submit_withheld`
+/// 1건을 여기서 발행한다 · 탐침은 CR 1개당 정확히 한 번 불린다). `Weak` 로 잡아 채널의 요청이 좌석·데몬을 살려 두지
+/// 않는다. 데몬·좌석 소멸·관측 패닉은 `false`(= 종전처럼 쓴다 — 실패 방향은 수정 전 동작 · 패닉이 새면 writer 가 죽어
+/// pane 이 영구 무응답이 되므로 catch_unwind 로 가둔다 · 치명위험 ④).
+pub(crate) fn submit_cr_withhold_probe(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    markers: Vec<String>,
+    armed_by: &'static str,
+    from: Option<u64>,
+) -> crate::state::SafetyProbe {
+    let wd = Arc::downgrade(daemon);
+    let ws = Arc::downgrade(s);
+    let handed = std::time::Instant::now();
+    Arc::new(move || {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (Some(d), Some(s)) = (wd.upgrade(), ws.upgrade()) else {
+                return false;
+            };
+            if !observe_submit_cr_hits_dialog(&s, &markers) {
+                return false;
+            }
+            d.bus.publish(
+                "queue.submit_withheld",
+                "queue",
+                Some(s.id),
+                json!({
+                    "surface_ref": cys::surface_ref(s.id),
+                    "reason": "modal",
+                    "armed_by": armed_by,
+                    "from": from.map(cys::surface_ref),
+                    "handed_ms_ago": handed.elapsed().as_millis() as u64,
+                    "note": "제출 Return 을 넘긴 뒤 질문·선택 창이 전경이 됐다 — 그 CR 을 쓰지 않았다(쓰면 창의 기본 \
+                             선택지를 누른다). 본문은 입력줄에 미제출로 남는다(CR 삼킴 잔여와 같은 상태). 창을 먼저 \
+                             처리하라 — 보이는 창에 대한 Return 은 종전처럼 쓴다.",
+                }),
+            );
+            true
+        }))
+        .unwrap_or(false)
+    })
 }
 
 // ═══════════ ★(0.14.42 · 설계 H0) 게이트 없는 데몬 내부 주입자의 공용 하드축 판정 ═══════════
@@ -20597,6 +20738,55 @@ mod reflect_queue_tests {
             crate::state::INJECT_ABORTED,
             "가드가 ABORTED 로 결판나지 않았다 — 호출부가 항목을 큐에서 빼 버린다(유실)"
         );
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+    }
+
+    /// ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류의 순수 판정 표 — composer 설명 · 창을 누르는가 · 탐침을 거는가.
+    #[test]
+    fn f1_submit_cr_guard_pure_tables() {
+        use super::{
+            composer_line_is_machine_body as own, submit_cr_guard_armed as armed, submit_cr_hits_dialog as hits,
+        };
+        assert!(own(Some("1. Yes please"), Some("1. Yes please")), "선택지 어휘로 시작해도 우리 본문이면 composer");
+        assert!(own(Some(" M|x|AAA "), Some("M|x|AAA")), "양끝 공백 정규화");
+        assert!(own(Some("tail"), Some("a long body tail")), "커서행은 본문의 꼬리만 보인다");
+        assert!(!own(Some("1. Yes"), Some("M|x|AAA")), "창의 선택지 행은 우리 본문이 아니다");
+        assert!(!own(None, Some("x")), "커서행 선두 마커 없음(결측)은 설명이 아니다");
+        assert!(!own(Some("   "), Some("x")), "빈 줄은 설명이 아니다");
+        assert!(!own(Some("x"), None), "본문 기록 결측은 설명이 아니다(결측은 값이 아니다)");
+        assert!(hits(true, false), "창 전경 ∧ composer 아님 → 누른다");
+        assert!(!hits(true, true), "우리 본문 composer → 제출");
+        assert!(!hits(false, false) && !hits(false, true), "창 없음 → 제출");
+        assert_eq!(armed(true, true), Some("machine_body"), "본문 뒤·Return 앞에 뜬 창 — 발신자가 본 적 없는 창");
+        assert_eq!(armed(true, false), Some("machine_body"));
+        assert_eq!(armed(false, false), Some("no_dialog_at_handoff"), "인계 뒤에 뜰 창은 이 Return 의 대상이 아니다");
+        assert_eq!(armed(false, true), None, "보이는 창에 대한 Return = 승인·선택지 조작(막으면 워커 hang)");
+    }
+
+    /// ★(0.14.42 · 수정 2회차 F1) writer 보류 탐침 — 빈 composer·우리 본문 composer 는 통과, 창이면 보류(이벤트 1건),
+    /// 죽은 좌석(에이전트 종료 관측 — 모달 잔상 아래 셸)은 통과(D-12 Text 모달 축과 같은 술어).
+    #[test]
+    fn f1_submit_cr_withhold_probe_sees_dialog_not_own_composer() {
+        let (daemon, s, _pack) = probe_seat("f1probe");
+        let markers = vec!["❯".to_string()];
+        let probe = submit_cr_withhold_probe(&daemon, &s, markers.clone(), "no_dialog_at_handoff", Some(7));
+        paint(&s, &["❯ "], 0, 2, false);
+        assert!(!probe(), "빈 composer 에서 보류했다");
+        s.inject_track.note_body("1. Yes please", None);
+        paint(&s, &["────────", "❯ 1. Yes please", "────────"], 1, 15, false);
+        assert!(!probe(), "우리 본문 composer(선택지 어휘로 시작)를 창으로 오인했다 — 조용한 미제출");
+        let n0 = daemon.bus.tail(400).iter().filter(|e| e["name"] == "queue.submit_withheld").count();
+        paint(&s, &[" Do you want to proceed?", " ❯ 1. Yes", "   2. No", " Esc to cancel"], 1, 9, false);
+        assert!(probe(), "권한 창 위에서 통과했다 — CR 이 '1. Yes' 를 누른다");
+        let evs: Vec<_> =
+            daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "queue.submit_withheld").collect();
+        assert_eq!(evs.len() - n0, 1, "보류 1건 = 이벤트 1건: {evs:?}");
+        let ev = evs.last().unwrap();
+        assert_eq!(ev["payload"]["reason"], json!("modal"), "{ev}");
+        assert_eq!(ev["payload"]["armed_by"], json!("no_dialog_at_handoff"), "{ev}");
+        assert_eq!(ev["payload"]["from"], json!(cys::surface_ref(7)), "{ev}");
+        s.agent_exit_notified.store(true, Ordering::Relaxed);
+        assert!(!probe(), "에이전트가 죽은 좌석의 모달 잔상은 창이 아니다(셸 전경)");
         let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
     }
 

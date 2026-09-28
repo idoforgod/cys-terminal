@@ -1350,7 +1350,16 @@ pub enum WriteReq {
     /// 사이의 **시간**이 아니다. 그래서 적체 경로에서 최소 간격 보장이 통째로 붕괴했다.
     /// 기준을 enqueue 시각이 아니라 **writer 실기록 시각**으로 옮겨야 그 경로가 닫힌다.
     /// `last_program_write` 가 None(이 writer 가 아직 프로그램 본문을 쓴 적 없음)이면 즉시 쓴다.
-    SubmitAfterGap { bytes: Vec<u8>, min_gap_ms: u64 },
+    SubmitAfterGap {
+        bytes: Vec<u8>,
+        min_gap_ms: u64,
+        /// ★(0.14.42 · 수정 2회차 F1) **제출 CR 보류 탐침** — writer 가 최소 간격을 잔 **뒤 · 쓰기 직전** 한 번 부른다.
+        /// `true` = 이 CR 을 쓰지 않는다(인계 뒤 질문·선택 창이 전경이 됐다 — 쓰면 그 창의 기본 선택지를 누른다).
+        /// `None` = 종전 동작(검체·윈도우·셸 좌석·권위 Return·킬 스위치·보이는 창에 대한 승인 Return). 생성자는
+        /// `governance::submit_cr_withhold_probe` 하나다(규칙·귀결은 그 doc). 보류한 CR 은 표식상 '소비 · 미기록'이고
+        /// 최소 간격 기준점(`last_program_write`)도 찍지 않는다 — 화면에 없는 바이트를 기준 삼지 않는다(B2′ 규율).
+        withhold: Option<SafetyProbe>,
+    },
 }
 
 /// 청크 경계 상태: 미완성 ESC/UTF-8 꼬리·\r 덮어쓰기·진행 중 라인
@@ -6565,11 +6574,20 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
             }
             // ★B2′: 제출 CR — 잔여를 **여기서, 소비 시점에** 계산한다. 이 계산이 핸들러에
             // 있으면 적체 구간에서 간격이 붕괴한다(codex 감사 R1 · SubmitAfterGap doc 참조).
-            WriteReq::SubmitAfterGap { bytes, min_gap_ms } => {
+            WriteReq::SubmitAfterGap { bytes, min_gap_ms, withhold } => {
                 if let Some(delay) =
                     cr_gap_delay_ms(last_program_write.map(|t| t.elapsed()), min_gap_ms)
                 {
                     std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
+                // ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 — 간격을 잔 **뒤**(쓰기 직전) 화면을 다시 본다. 인계~쓰기 사이에
+                //   뜬 질문·선택 창에 CR 을 쓰면 기본 선택지를 누른다(오승인). 보류면 한 바이트도 쓰지 않고 기준점·쓴 시각을
+                //   찍지 않는다 — 대기 계수만 내린다(분리 보류가 영구화되지 않는다). writer 는 막지 않는다(사람 키가 창을 푼다).
+                if withhold.as_ref().is_some_and(|p| p()) {
+                    if let Some(t) = &track {
+                        t.submit_consumed(false);
+                    }
+                    continue;
                 }
                 let r = writer.write_all(&bytes).and_then(|_| writer.flush());
                 // ★B2″(agy 감사 R2-②): 쓴 CR **자신도** 기준점이 된다. 그러지 않으면 연속
@@ -7940,6 +7958,47 @@ mod tests {
         nth_write_time(log, needle, 0)
     }
 
+    /// ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 탐침 — 간격을 잔 **뒤** 부르고, `true` 면 CR 한 바이트도 쓰지 않는다
+    /// (뒤 요청은 순서대로 계속 나간다 = writer 를 막지 않는다). 표식: 대기 계수는 내리고 쓴 시각은 찍지 않는다. `false`·
+    /// `None` 은 종전 바이트. 탐침은 CR 1개당 정확히 한 번 불린다(이벤트 발행 1건의 전제).
+    #[test]
+    fn f1_submit_cr_withhold_probe_skips_only_the_cr() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc::sync_channel;
+        let run = |withhold: Option<SafetyProbe>| {
+            let log: WriteLog = Arc::new(Mutex::new(Vec::new()));
+            let (tx, rx) = sync_channel::<WriteReq>(8);
+            let stop = Arc::new(AtomicBool::new(false));
+            let track = Arc::new(InjectTrack::default());
+            let w = TimedBuf::new(&log);
+            let t2 = Arc::clone(&track);
+            let handle = std::thread::spawn(move || run_writer_loop_tracked(w, rx, stop, Some(t2)));
+            tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
+            track.submit_handed();
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 30, withhold }).unwrap();
+            tx.send(WriteReq::Data(b"k".to_vec())).unwrap();
+            drop(tx);
+            handle.join().ok();
+            let flat: Vec<u8> = log.lock().unwrap().iter().flat_map(|(_, b)| b.clone()).collect();
+            (flat, track.submit_settle_obs(settle_mono_ms(), 2000))
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::clone(&calls);
+        let (out, obs) = run(Some(Arc::new(move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+            true
+        })));
+        assert_eq!(out, b"BODYk".to_vec(), "보류면 CR 만 빠지고 뒤 요청은 나간다: {:?}", String::from_utf8_lossy(&out));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "탐침은 CR 1개당 한 번");
+        assert!(!obs.inflight && obs.pending == 0, "보류한 CR 도 소비로 센다(분리 보류 영구화 0): {obs:?}");
+        assert_eq!(obs.since_written_ms, None, "쓰지 않은 CR 은 쓴 시각이 없다: {obs:?}");
+        let (out, obs) = run(Some(Arc::new(|| false)));
+        assert_eq!(out, b"BODY\rk".to_vec(), "탐침 false 는 종전 바이트");
+        assert!(obs.since_written_ms.is_some(), "{obs:?}");
+        let (out, _) = run(None);
+        assert_eq!(out, b"BODY\rk".to_vec(), "탐침 없음은 종전 바이트");
+    }
+
     /// ★B2′ 핵심 회귀 핀(codex 감사 R1 — 적체 경로 붕괴).
     ///
     /// 종전 B2 는 핸들러가 `last_injected`(= **enqueue 한 시각**)로 잔여를 계산했다. writer 큐에
@@ -7971,7 +8030,7 @@ mod tests {
         tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
         // ③ 200ms 뒤 제출 CR — 핸들러 시계로는 본문 enqueue 후 이미 150ms 초과다.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
             .unwrap();
         drop(tx);
         handle.join().ok();
@@ -8059,7 +8118,7 @@ mod tests {
         tx.send(WriteReq::Inject { text: "hi".into(), cr_delay_ms: 0, clear_first: false, guard: None })
             .unwrap();
         let t_enqueue = std::time::Instant::now();
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
             .unwrap();
         drop(tx);
         handle.join().ok();
@@ -8088,7 +8147,7 @@ mod tests {
         let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
         tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
         for _ in 0..2 {
-            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
                 .unwrap();
         }
         drop(tx);
@@ -8133,7 +8192,7 @@ mod tests {
         // 사람 키(Data)는 기준점을 찍지 않는다 — Program 이 아니므로 여전히 '본문 없음'이다.
         tx.send(WriteReq::Data(b"typed".to_vec())).unwrap();
         let t0 = std::time::Instant::now();
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
             .unwrap();
         drop(tx);
         handle.join().ok();
@@ -8163,7 +8222,7 @@ mod tests {
             let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
             tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
                 .unwrap();
             drop(tx);
             handle.join().ok();
@@ -8195,6 +8254,7 @@ mod tests {
         tx.send(WriteReq::SubmitAfterGap {
             bytes: b"\r".to_vec(),
             min_gap_ms: OVERWAIT_GAP_MS,
+            withhold: None,
         })
         .unwrap();
         drop(tx);

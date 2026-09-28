@@ -358,3 +358,250 @@ fn settle_proven_denial_events_are_rate_limited_per_sender() {
     let evs: Vec<Value> = fx.daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "queue.draft_gate_denied").collect();
     assert_eq!(evs.len() - n0, 2, "Y 5회 → 1건 · Z 1회 → 1건: {evs:?}");
 }
+
+// ═══════════ ★(0.14.42 · 수정 2회차 FV1-1) kill-switch pause 와 정착 재시도 ═══════════
+//
+// 【무엇이 틀렸었나】 정착 증명은 pause 를 보지 않았다. pause 중 경쟁으로 거부된 발신도 증명을 받아 신 CLI 가 예산
+// (기본 3s · 최대 10s) 안에서 **재시도로 좌석에 직접** 썼고, 뒤따른 짝 Return 이 그 본문을 제출했다(S93 5/5 ·
+// pause 응답 뒤 309~490ms 기록). 수정 전(bc954dc2)에는 같은 거부가 곧바로 `--queued` 로 넘어가 pause 동안 동결됐다.
+// 직접 send 첫 요청은 원래부터 pause 판정 대상이 아니다(pause 중 '보고' 허용 — 종전 그대로). 막는 것은 **경쟁으로
+// 거부된 발신이 재시도로 pause 를 뚫는 창**뿐이다: ① pause 중 거부에는 증명을 붙이지 않는다(CLI 재시도 0회 → 종전 큐
+// 전환) ② 증명을 받은 뒤 pause 가 걸린 재시도(`settle_retry:true`)는 줄이 비어 있어도 쓰지 않고 증명 없이 거부한다.
+
+/// ① pause 중에는 어떤 거부에도 정착 증명이 없다 — 계수 축(짝 Return 을 기다리는 기계 본문)·분리 보류 둘 다.
+/// 분리 보류 거부 자체(쓰기 0)는 유지한다. resume 뒤에는 증명이 돌아온다(영구화 0).
+#[test]
+fn fv1_paused_daemon_gives_no_settle_proof_but_keeps_hold() {
+    let fx = fx("fv1-pause-proof");
+    let t = agent_pane(&fx, "worker-1", P + 90);
+    let _x = pane(&fx, "worker-2", P + 91);
+    let _y = pane(&fx, "worker-3", P + 92);
+    assert_eq!(direct(&fx, Some(P + 91), &t, "M|x|AAA")["ok"], json!(true)); // 짝 Return 을 기다리는 기계 본문
+    fx.daemon.paused.store(true, Ordering::SeqCst);
+    let before = counts(&t);
+    let yp = direct(&fx, Some(P + 92), &t, "M|y|BBB");
+    assert_eq!(yp["ok"], json!(false), "{yp}");
+    assert!(msg(&yp).contains(cys::MSG_TYPING_GUARD), "CLI 가 --queued 로 1회 전환하는 문구 접두: {yp}");
+    assert!(msg(&yp).contains("[draft_gate:pending_input]"), "사유는 종전 그대로: {yp}");
+    assert_eq!(settle_hint(&yp), None, "pause 중 거부에 정착 증명이 붙었다 — CLI 가 재시도로 pause 를 뚫는다: {yp}");
+    assert_eq!(cys::send_settle_hint_ms(&msg(&yp)), None, "lib 파서로도 증명 없음: {yp}");
+    let ev = last_denied(&fx).expect("거부 이벤트");
+    assert!(ev["payload"].get("settle_ms").is_none(), "pause 중 거부 이벤트에 증명 키가 없다: {ev}");
+    assert_eq!(counts(&t), before, "쓰기 0");
+    // 분리 보류 — X 의 짝 Return(send-key 는 pause 판정 대상이 아니다 · 종전 그대로) 직후 Y 는 여전히 보류(쓰기 0).
+    assert_eq!(pair_return(&fx, Some(P + 91), &t)["result"]["sent"], json!(true));
+    let before = counts(&t);
+    let yh = direct(&fx, Some(P + 92), &t, "M|y|BBB");
+    assert_eq!(yh["ok"], json!(false), "분리 보류는 pause 와 무관하게 유지(대기 CR 뒤에 붙이지 않는다): {yh}");
+    assert!(msg(&yh).contains("[draft_gate:submit_settling]"), "{yh}");
+    assert_eq!(settle_hint(&yh), None, "pause 중 보류 거부에도 증명 없음: {yh}");
+    let ev = last_denied(&fx).expect("보류 이벤트");
+    assert_eq!(ev["payload"]["reason"], json!("submit_settling"), "{ev}");
+    assert!(ev["payload"].get("settle_ms").is_none(), "{ev}");
+    assert_eq!(counts(&t), before, "보류는 쓰기 0");
+    assert_eq!(qlen(&t), 0, "보류는 적재하지 않는다(큐 전환은 CLI 몫)");
+    // resume 뒤 — 증명이 돌아온다(다음 짝 Return 대기 본문 위에서).
+    fx.daemon.paused.store(false, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(400)); // X 의 CR 이 쓰이고 분리 창이 지난다
+    assert_eq!(direct(&fx, Some(P + 91), &t, "M|x|CCC")["ok"], json!(true));
+    let yr = direct(&fx, Some(P + 92), &t, "M|y|BBB");
+    assert!(settle_hint(&yr).is_some(), "resume 뒤에는 증명이 돌아온다(pause 영구화 0): {yr}");
+}
+
+/// ② 증명을 받은 뒤 pause 가 걸린 **정착 재시도**(`settle_retry:true`)는 줄이 비어 있어도 쓰지 않는다 — 증명 없는
+/// 타이핑 가드 거부(`[draft_gate:paused]`)라 CLI 는 종전처럼 `--queued` 로 1회 넘기고 본문은 pause 동안 동결된다.
+/// 대조: pause 가 아니면 같은 재시도가 쓰이고, pause 중에도 **첫 요청**(재시도 아님)은 종전처럼 직접 쓰인다(보고 경로).
+#[test]
+fn fv1_settle_retry_refused_while_paused_even_on_free_line() {
+    let fx = fx("fv1-pause-retry");
+    let t = agent_pane(&fx, "worker-1", P + 100);
+    let t2 = agent_pane(&fx, "worker-4", P + 103);
+    let _y = pane(&fx, "worker-3", P + 102);
+    let retry = |t: &Arc<Surface>| {
+        rpc(&fx, Some(P + 102), "surface.send_text", json!({
+            "surface_id": t.id, "text": "M|y|BBB", "queued": false, "quiet": true, "settle_retry": true,
+        }))
+    };
+    fx.daemon.paused.store(true, Ordering::SeqCst);
+    let before = counts(&t);
+    let r = retry(&t);
+    assert_eq!(r["ok"], json!(false), "pause 중 정착 재시도가 빈 줄에 직접 쓰였다(pause 를 뚫는다): {r}");
+    let m = msg(&r);
+    assert!(m.contains(cys::MSG_TYPING_GUARD), "CLI 의 --queued 1회 전환 문구 접두: {m}");
+    assert!(m.contains("[draft_gate:paused]"), "사유 태그: {m}");
+    assert_eq!(cys::send_settle_hint_ms(&m), None, "증명 없음 → 재시도 0회: {m}");
+    assert_eq!(counts(&t), before, "쓰기 0(세대 불변)");
+    assert_eq!(qlen(&t), 0, "적재 0(큐 전환은 CLI 몫)");
+    let ev = last_denied(&fx).expect("거부 이벤트");
+    assert_eq!(ev["payload"]["reason"], json!("paused"), "{ev}");
+    assert!(ev["payload"].get("settle_ms").is_none(), "{ev}");
+    // pause 중 첫 요청(재시도 아님)은 종전 그대로 직접 쓴다 — 직접 send 는 원래 pause 판정 대상이 아니다.
+    let first = direct(&fx, Some(P + 102), &t2, "M|y|DDD");
+    assert_eq!(first["ok"], json!(true), "pause 중 첫 직접 send(보고)는 종전처럼 통과: {first}");
+    // 대조: resume 뒤 같은 재시도는 쓰인다.
+    fx.daemon.paused.store(false, Ordering::SeqCst);
+    let r2 = retry(&t);
+    assert_eq!(r2["ok"], json!(true), "pause 가 아니면 재시도는 종전처럼 쓴다: {r2}");
+    assert_ne!(counts(&t), before, "쓰기 1");
+}
+
+// ═══════════ ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 — 인계 뒤 뜬 질문·선택 창을 누르지 않는다 ═══════════
+//
+// 【무엇이 틀렸었나】 정착 재시도는 경쟁에서 진 본문을 앞 제출 CR 바로 뒤(≈80~120ms)에 직접 넣고, 그 짝 Return 의 CR 은
+// writer 가 최소 간격(150ms) 뒤에 쓴다. 에이전트가 앞 제출에 반응해 그 사이에 권한 창을 띄우면 CR 이 '1. Yes' 를
+// 누른다(S92 x=90~250ms 26/31 · 수정 전 0/31). Modal 판정은 Text 팔뿐이고, writer 의 SubmitAfterGap arm 은 간격을
+// 잔 뒤 화면을 다시 보지 않고 CR 을 썼다. 1인 발신의 같은 창(F3 · 본문→CR 사이 창)도 같은 자리에서 열려 있었다.
+// 【규칙】 writer 가 제출 CR 을 쓰기 **직전** 화면을 다시 본다 — 질문·선택 창이 전경이고 커서행이 우리 기계 본문으로
+// 설명되지 않으면 그 CR 을 쓰지 않는다(이벤트 `queue.submit_withheld`). 승인 조작은 막지 않는다: 인계 시점에 이미 창이
+// 보였고 줄 위에 우리 기계 본문이 없으면(= 보이는 창에 대한 Return · 선택지 조작 뒤 Return) 탐침을 걸지 않는다.
+
+/// vt100 파서에 화면을 직접 먹인다(PTY 프로그램 무관) — governance 검체 `paint` 와 같은 규율.
+fn paint(s: &Arc<Surface>, lines: &[&str], row: u16, col: u16) {
+    let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+    p.process(b"\x1b[2J\x1b[H");
+    for (i, l) in lines.iter().enumerate() {
+        p.process(format!("\x1b[{};1H{}", i + 1, l).as_bytes());
+    }
+    p.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+}
+
+/// 가짜 에이전트·실 claude 권한 창 모양 — 커서는 `❯ 1. Yes` 행 끝.
+const DIALOG: [&str; 4] = ["Do you want to proceed?", "❯ 1. Yes", "  2. No", "  Esc to cancel"];
+
+fn settle_obs(t: &Arc<Surface>) -> crate::state::SubmitSettleObs {
+    t.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 2000)
+}
+
+/// writer 가 인계된 제출 CR 요청을 소비할 때까지(최대 3s) — 소비 뒤 관측을 돌려준다.
+fn wait_submit_consumed(t: &Arc<Surface>) -> crate::state::SubmitSettleObs {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while settle_obs(t).inflight && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    settle_obs(t)
+}
+
+fn withheld(fx: &Fx) -> Vec<Value> {
+    fx.daemon.bus.tail(400).into_iter().filter(|e| e["name"] == "queue.submit_withheld").collect()
+}
+
+/// 로그인 초기 출력이 픽스처 화면을 덮지 않게 안정화한 에이전트 좌석(governance `probe_seat` 와 같은 규율).
+fn agent_pane_settled(fx: &Fx, role: &str, pid: u32) -> Arc<Surface> {
+    let s = agent_pane(fx, role, pid);
+    std::thread::sleep(Duration::from_millis(600));
+    s
+}
+
+/// 적색→녹색: X 의 본문이 쓰인 뒤·짝 Return 앞에 권한 창이 떴다(렌더 지연 창) — X 의 CR 은 쓰이지 않는다.
+/// 종전: writer 가 간격을 잔 뒤 화면을 보지 않고 CR 을 써 '1. Yes' 를 눌렀다(오승인).
+#[test]
+fn f1_submit_cr_withheld_when_dialog_rose_after_own_body() {
+    let fx = fx("f1-withhold");
+    let t = agent_pane_settled(&fx, "worker-1", P + 110);
+    let _x = pane(&fx, "worker-2", P + 111);
+    assert_eq!(direct(&fx, Some(P + 111), &t, "M|x|AAA")["ok"], json!(true));
+    std::thread::sleep(Duration::from_millis(60)); // 본문 PTY 에코가 파서에 닿은 뒤 화면을 덮는다
+    paint(&t, &DIALOG, 1, 8);
+    let xr = pair_return(&fx, Some(P + 111), &t);
+    assert_eq!(xr["result"]["sent"], json!(true), "Return 요청 응답은 종전 그대로(쓰기 결정은 writer 의 몫): {xr}");
+    let o = wait_submit_consumed(&t);
+    assert!(!o.inflight, "writer 가 CR 요청을 소비했다: {o:?}");
+    assert_eq!(o.since_written_ms, None, "창이 뜬 좌석에 제출 CR 을 썼다 — '1. Yes' 오승인: {o:?}");
+    let ev = withheld(&fx);
+    assert_eq!(ev.len(), 1, "보류 사실 1건: {ev:?}");
+    assert_eq!(ev[0]["payload"]["surface_ref"], json!(cys::surface_ref(t.id)), "{ev:?}");
+    assert_eq!(ev[0]["payload"]["armed_by"], json!("machine_body"), "{ev:?}");
+}
+
+/// 음성 대조(치명 방향 — 워커 hang): 이미 보이는 창에 대한 Return(master 의 승인 조작)은 쓴다.
+#[test]
+fn f1_approval_return_on_visible_dialog_is_written() {
+    let fx = fx("f1-approve");
+    let t = agent_pane_settled(&fx, "worker-1", P + 120);
+    let _m = pane(&fx, "master", P + 121);
+    paint(&t, &DIALOG, 1, 8);
+    let r = pair_return(&fx, Some(P + 121), &t);
+    assert_eq!(r["result"]["sent"], json!(true), "{r}");
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "보이는 창에 대한 Return 을 막았다 — 승인 수단 소실(워커 hang): {o:?}");
+    assert!(withheld(&fx).is_empty(), "승인 조작에 보류 이벤트: {:?}", withheld(&fx));
+}
+
+/// 음성 대조: 선택지 조작(`Down`) 뒤 Return 도 승인 조작이다 — 쓴다(키가 입력 세대를 올려 본문 소유가 끊긴다).
+#[test]
+fn f1_selector_navigation_then_return_is_written() {
+    let fx = fx("f1-nav");
+    let t = agent_pane_settled(&fx, "worker-1", P + 130);
+    let _m = pane(&fx, "master", P + 131);
+    paint(&t, &DIALOG, 1, 8);
+    assert_eq!(rpc(&fx, Some(P + 131), "surface.send_key", json!({"surface_id": t.id, "key": "Down"}))["ok"], json!(true));
+    paint(&t, &["Do you want to proceed?", "  1. Yes", "❯ 2. No", "  Esc to cancel"], 2, 7);
+    let r = pair_return(&fx, Some(P + 131), &t);
+    assert_eq!(r["result"]["sent"], json!(true), "{r}");
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "선택지 조작 뒤 Return 을 막았다: {o:?}");
+    assert!(withheld(&fx).is_empty(), "{:?}", withheld(&fx));
+}
+
+/// 음성 대조(조용한 유실 방향): 본문이 선택지 어휘(`1. Yes …`)로 시작해도 커서행이 **우리 본문**이면 composer 다 — 쓴다.
+#[test]
+fn f1_composer_body_that_looks_like_a_choice_is_submitted() {
+    let fx = fx("f1-quote");
+    let t = agent_pane_settled(&fx, "worker-1", P + 140);
+    let _x = pane(&fx, "worker-2", P + 141);
+    assert_eq!(direct(&fx, Some(P + 141), &t, "1. Yes please")["ok"], json!(true));
+    std::thread::sleep(Duration::from_millis(60));
+    paint(&t, &["────────", "❯ 1. Yes please", "────────"], 1, 15);
+    let r = pair_return(&fx, Some(P + 141), &t);
+    assert_eq!(r["result"]["sent"], json!(true), "{r}");
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "composer 의 우리 본문을 창으로 오인해 CR 을 막았다: {o:?}");
+    assert!(withheld(&fx).is_empty(), "{:?}", withheld(&fx));
+}
+
+/// 음성 대조: 평범한 유휴 composer(우리 본문) — 종전처럼 쓴다.
+#[test]
+fn f1_plain_composer_submit_is_written() {
+    let fx = fx("f1-plain");
+    let t = agent_pane_settled(&fx, "worker-1", P + 150);
+    let _x = pane(&fx, "worker-2", P + 151);
+    assert_eq!(direct(&fx, Some(P + 151), &t, "M|x|AAA")["ok"], json!(true));
+    std::thread::sleep(Duration::from_millis(60));
+    paint(&t, &["────────", "❯ M|x|AAA", "────────"], 1, 11);
+    assert_eq!(pair_return(&fx, Some(P + 151), &t)["result"]["sent"], json!(true));
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "{o:?}");
+    assert!(withheld(&fx).is_empty(), "{:?}", withheld(&fx));
+}
+
+/// 킬 스위치(`CYS_SEND_SETTLE=0`) — 제출 CR 보류도 끈다(0.14.42 A2 트리 동작 = 한 노브 롤백).
+#[test]
+fn f1_kill_switch_disables_submit_cr_withhold() {
+    let fx = fx("f1-kill");
+    std::env::set_var("CYS_SEND_SETTLE", "0");
+    let t = agent_pane_settled(&fx, "worker-1", P + 160);
+    let _x = pane(&fx, "worker-2", P + 161);
+    assert_eq!(direct(&fx, Some(P + 161), &t, "M|x|AAA")["ok"], json!(true));
+    std::thread::sleep(Duration::from_millis(60));
+    paint(&t, &DIALOG, 1, 8);
+    assert_eq!(pair_return(&fx, Some(P + 161), &t)["result"]["sent"], json!(true));
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "끔이면 종전처럼 쓴다: {o:?}");
+    assert!(withheld(&fx).is_empty());
+}
+
+/// 셸 좌석(agent_meta 없음)은 무변경 — 모달 판정 대상이 아니다.
+#[test]
+fn f1_shell_seat_submit_cr_unchanged() {
+    let fx = fx("f1-shell");
+    let t = pane(&fx, "worker-1", P + 170);
+    let _x = pane(&fx, "worker-2", P + 171);
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(direct(&fx, Some(P + 171), &t, "echo a")["ok"], json!(true));
+    std::thread::sleep(Duration::from_millis(60));
+    paint(&t, &DIALOG, 1, 8);
+    assert_eq!(pair_return(&fx, Some(P + 171), &t)["result"]["sent"], json!(true));
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "셸 좌석은 종전처럼 쓴다: {o:?}");
+    assert!(withheld(&fx).is_empty());
+}

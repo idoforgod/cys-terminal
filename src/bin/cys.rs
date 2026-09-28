@@ -2517,13 +2517,16 @@ struct SettleOutcome {
 /// 다음 요청으로 가는 것은 `cys::send_settle_hint_ms` 가 힌트를 읽는 거부뿐이다(D-12 태그 ∧ 정착 태그). 쉬는 시간 =
 /// 힌트를 [하한, 상한]으로 자른 값 + 지터, 남은 예산으로 다시 자른다. 예산을 다 쓰면 마지막 결과를 그대로 돌려준다
 /// (호출부가 종전처럼 `--queued` 로 1회 전환한다).
+/// ★(0.14.42 · 수정 2회차 FV1-1) `req` 의 인자 = **정착 재시도인가**(첫 요청 `false` · 그 뒤 `true`). 호출부는 재시도에만
+/// `settle_retry:true` 를 싣는다 — 데몬은 kill-switch pause 중 재시도를 쓰지 않고 증명 없이 거부하므로(`[draft_gate:paused]`)
+/// 이 루프가 멈추고 호출부의 `--queued` 1회(= pause 동안 동결)로 간다. 첫 요청은 종전 바이트 그대로다.
 fn send_text_settled(
-    mut req: impl FnMut() -> Result<Value, String>,
+    mut req: impl FnMut(bool) -> Result<Value, String>,
     mut sleep: impl FnMut(u64),
     budget_ms: u64,
     jitter: impl Fn(u32) -> u64,
 ) -> SettleOutcome {
-    let mut result = req();
+    let mut result = req(false);
     let (mut tries, mut waited_ms) = (1u32, 0u64);
     while tries < SEND_SETTLE_MAX_TRIES {
         let hint = match &result {
@@ -2542,7 +2545,7 @@ fn send_text_settled(
         .min(left);
         sleep(d);
         waited_ms += d;
-        result = req();
+        result = req(true);
         tries += 1;
     }
     SettleOutcome { result, tries, waited_ms }
@@ -2552,6 +2555,12 @@ fn send_text_settled(
 /// 재시도 성공·종전 경로·전송 오류는 무문구(전송 오류를 '점유' 로 오보하지 않는다). stdout(OK/QUEUED)과 무관하다.
 fn send_settle_stderr_line(o: &SettleOutcome, sid: u64) -> Option<String> {
     match &o.result {
+        // ★(수정 2회차 FV1-1) pause 중 재시도 거부는 '점유' 가 아니다 — 사실대로 적는다(큐 전환 뒤 pause 경고는 호출부가 따로 낸다).
+        Err(e) if o.tries > 1 && e.contains(&format!("[{}:paused]", cys::DRAFT_GATE_TAG)) => Some(format!(
+            "[send] 데몬 pause(kill-switch) 중 — 정착 재시도를 멈추고 큐로 전환(resume 뒤 배달 · 재시도 {}회) surface={}",
+            o.tries - 1,
+            surface_ref(sid)
+        )),
         Err(e) if o.tries > 1 && is_typing_guard_err(e) => Some(format!(
             "[send] 입력줄 정착 대기 {}ms(재시도 {}회) 뒤에도 점유 — 큐로 전환 surface={}",
             o.waited_ms,
@@ -4467,11 +4476,15 @@ fn run(command: Command) -> i32 {
                     //   명시 거부)에서만 힌트만큼 쉬고 다시 보낸다. 증명이 없거나 예산 0(윈도우·다중·큐·clear_first·끔)이면
                     //   재시도 0회로 아래 큐 전환에 그대로 간다(요청 순서 종전과 같음).
                     let settle = send_text_settled(
-                        || {
-                            request(
-                                "surface.send_text",
-                                json!({"surface_id": sid, "text": body, "from": from, "queued": queued, "clear_first": clear_first}),
-                            )
+                        |settle_retry| {
+                            let mut params =
+                                json!({"surface_id": sid, "text": body, "from": from, "queued": queued, "clear_first": clear_first});
+                            // ★(수정 2회차 FV1-1) 정착 재시도 표식 — 재시도에만 싣는다(첫 요청은 종전 바이트). 데몬은 pause 중
+                            //   재시도를 쓰지 않고 증명 없이 거부한다 → 아래 `--queued` 1회(= pause 동안 동결).
+                            if settle_retry {
+                                params["settle_retry"] = json!(true);
+                            }
+                            request("surface.send_text", params)
                         },
                         |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
                         send_settle_budget_ms(settle_off, settle_budget_env.as_deref(), cfg!(windows), multi, queued, clear_first),
@@ -28307,7 +28320,7 @@ mod tests {
             let seq = std::cell::RefCell::new(seq.into_iter());
             let slept = std::cell::RefCell::new(Vec::new());
             let o = send_text_settled(
-                || seq.borrow_mut().next().expect("요청 수 초과"),
+                |_retry| seq.borrow_mut().next().expect("요청 수 초과"),
                 |ms| slept.borrow_mut().push(ms),
                 budget,
                 |_| 0,
@@ -28332,6 +28345,47 @@ mod tests {
         assert_eq!(run(vec![proven(100)], 0), (false, 1, 0, vec![]));
         // 결과가 성공이면 곧바로 끝.
         assert_eq!(run(vec![Ok(json!({}))], 3000), (true, 1, 0, vec![]));
+    }
+
+    /// ★(0.14.42 · 수정 2회차 FV1-1) 재시도 표식 — 첫 요청은 `false`(종전 바이트) · 정착 재시도만 `true`. 데몬이 pause 중
+    /// 재시도를 증명 없이 거부하면(`[draft_gate:paused]`) 루프가 곧바로 멈추고(호출부 `--queued` 1회 = 동결) stderr 는
+    /// '점유' 가 아니라 pause 를 말한다. 배선: 재시도에만 `settle_retry:true` 를 싣는다(첫 요청 JSON 리터럴은 종전 그대로).
+    #[test]
+    fn fv1_settle_retry_flag_and_pause_stop() {
+        let tg = cys::MSG_TYPING_GUARD;
+        let proven = |ms: u64| Err(format!("{tg} [draft_gate:pending_input]{}", cys::send_settle_suffix(ms)));
+        let paused: Result<Value, String> = Err(format!("{tg} [draft_gate:paused]"));
+        let seq = std::cell::RefCell::new(vec![proven(100), proven(100), paused].into_iter());
+        let flags = std::cell::RefCell::new(Vec::new());
+        let o = send_text_settled(
+            |retry| {
+                flags.borrow_mut().push(retry);
+                seq.borrow_mut().next().expect("요청 수 초과 — pause 거부 뒤에도 재시도했다")
+            },
+            |_| {},
+            3000,
+            |_| 0,
+        );
+        assert_eq!(flags.into_inner(), vec![false, true, true], "첫 요청만 false · 재시도는 true");
+        assert_eq!(o.tries, 3, "pause 거부(증명 없음)에서 멈춘다");
+        assert!(should_queue_fallback_send(false, false, o.result.as_ref().unwrap_err()), "pause 거부 → --queued 1회(동결)");
+        let line = send_settle_stderr_line(&o, 7).expect("재시도 뒤 pause 거부는 한 줄 알린다");
+        assert!(line.contains("pause") && !line.contains("점유"), "pause 를 점유로 오보하지 않는다: {line}");
+        // 예산 소진(점유) 문구는 종전 그대로.
+        let busy = SettleOutcome { result: proven(100), tries: 3, waited_ms: 400 };
+        assert!(send_settle_stderr_line(&busy, 7).unwrap().contains("점유"));
+        // 배선 핀: 재시도 표식은 첫 직접 요청 클로저 안에서 `settle_retry` 인자로만 싣는다.
+        let src = include_str!("cys.rs");
+        let arm = src
+            .split("Command::Send { surface, to, queued, clear_first, stdin, file, text } => {")
+            .nth(1)
+            .expect("Command::Send arm");
+        let first = arm
+            .split("Err(e) if should_queue_fallback_send(queued, clear_first, &e) => {")
+            .next()
+            .unwrap();
+        assert!(first.contains("|settle_retry|") && first.contains("if settle_retry {"), "재시도 인자 배선");
+        assert_eq!(first.matches("params[\"settle_retry\"] = json!(true);").count(), 1, "재시도에만 표식");
     }
 
     /// ★(0.14.42 · S21-SETTLE) 배선 핀 — `cys send` 의 **첫 직접 요청만** 정착 재시도로 감싼다. 요청 JSON 은 종전 리터럴
