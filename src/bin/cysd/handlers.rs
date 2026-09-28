@@ -3082,11 +3082,14 @@ pub(crate) fn maybe_fire_context_threshold_at(
         //   바닥을 확정하므로, 그 입력이 부른 턴의 이 보고는 복원 끝 바닥에 들지 않는다.
         g.note_input(idle.last_input, now_mono);
         g.note_delivery(idle.last_queue_delivery, idle.inject_done, now_mono);
+        // ★(R2NC6-1 · RV-ROLE-CF42-1) 대기열에 남은 가장 오래된 항목 — 사이클이 붙잡았던 몰림이 끝났는지(조용함 판정 전).
+        g.note_queue(idle.queue_oldest);
         // 끝난 조용한 틈(복원 턴 끝 → 다음 입력)은 관측 **전** — 틈 뒤의 이 보고는 새 턴(작업)의 것이라 바닥에 싣지 않는다.
         if let Some((from, to)) = idle.last_gap {
             g.note_idle(from, to, now_mono);
         }
-        // ★(R2NC5-1 (b)) 관측이 Claude 자체 압축(같은 세션에서 잰 바닥보다 크게 낮음)을 보면 기본 임계로 재무장한다.
+        // ★(R2NC5-1 (b) · R1-RUNAWAY-1) 관측이 Claude 자체 압축(같은 세션에서 잰 바닥보다 크게 낮음)을 보면 재무장한다 — 압축 뒤
+        //   바닥(지침 재읽기 포함)을 다시 재고 그 위로 실제로 자란 뒤 발화한다(압축 뒤 수준에서 곧바로 발화하지 않는다).
         let rearm = g.observe(pct, window, now_mono);
         // 지금 이어지는 조용함은 관측 **뒤** — 조용한 동안 온 보고(수집기 지연)는 직전 턴의 끝이다.
         g.note_idle(idle.quiet_since, now_mono, now_mono);
@@ -3103,7 +3106,8 @@ pub(crate) fn maybe_fire_context_threshold_at(
         (rearm, decided)
     };
     if let Some(r) = rearm {
-        // 관측·진단 전용(`usage` 범주 — CSO 로 가지 않는다). 그 뒤 이 세션은 기본 임계에서 발화하고, 다음 clear 가 바닥을 다시 잰다.
+        // 관측·진단 전용(`usage` 범주 — CSO 로 가지 않는다). 그 뒤 이 세션은 압축 뒤 다시 잰 바닥 위로 자란 뒤 발화하고, 다음
+        // clear 가 바닥을 다시 잰다.
         daemon.bus.publish(
             "context.floor_rearmed",
             "usage",
@@ -3117,8 +3121,9 @@ pub(crate) fn maybe_fire_context_threshold_at(
                 "ctx_window": window,
                 "surface_ref": cys::surface_ref(surface.id),
                 "source": source,
-                "reason": "같은 세션에서 컨텍스트가 잰 바닥보다 크게 낮다 — Claude 자체 압축. 그 세션의 잰 바닥을 버리고 기본 \
-                           임계로 재무장한다(다음 clear 뒤 바닥을 다시 잰다 · 자동 clear 영구 중단 방지)",
+                "reason": "같은 세션에서 컨텍스트가 잰 바닥보다 크게 낮다 — Claude 자체 압축. 그 세션의 잰 바닥을 버리고 압축 뒤 \
+                           바닥(지침 재읽기 포함)을 다시 재 그 위로 실제로 자란 뒤 clear 한다(자동 clear 영구 중단 방지 · 압축 뒤 \
+                           수준에서 곧바로 재발화하는 고리 없음)",
             }),
         );
     }
@@ -3131,26 +3136,31 @@ pub(crate) fn maybe_fire_context_threshold_at(
             //   CSO 로 가지 않는 이름이다(alert_route::routable 밖 · `usage` 범주) — 관측·오너 feed 전용.
             use crate::usage::CtxFloorRegime as R;
             if n.event {
-                daemon.bus.publish(
-                    "context.floor_raised",
-                    "usage",
-                    Some(surface.id),
-                    json!({
-                        "role": role.clone(),
-                        "context_pct": pct,
-                        "floor_pct": n.floor,
-                        "settled_pct": n.settled,
-                        "threshold": base_threshold,
-                        "raised_to": n.bar,
-                        "regime": n.regime.as_str(),
-                        "ceiling": n.ceiling,
-                        "hard_cap": n.hard_cap,
-                        "ctx_window": window,
-                        "surface_ref": cys::surface_ref(surface.id),
-                        "source": source,
-                        "reason": "clear+지침 재주입 직후 바닥이 임계를 막는다 — 바닥에서 재발화하면 같은 좌석을 다시 clear 하는 재주입 고리",
-                    }),
-                );
+                let mut ev = json!({
+                    "role": role.clone(),
+                    "context_pct": pct,
+                    "floor_pct": n.floor,
+                    "settled_pct": n.settled,
+                    "threshold": base_threshold,
+                    "raised_to": n.bar,
+                    "regime": n.regime.as_str(),
+                    "ceiling": n.ceiling,
+                    "hard_cap": n.hard_cap,
+                    "ctx_window": window,
+                    "surface_ref": cys::surface_ref(surface.id),
+                    "source": source,
+                    "reason": "clear+지침 재주입 직후 바닥이 임계를 막는다 — 바닥에서 재발화하면 같은 좌석을 다시 clear 하는 재주입 고리",
+                });
+                if n.after_compaction {
+                    // ★(R1-RUNAWAY-1) 압축 뒤 다시 잰 바닥 — 그 수준(지침 재읽기 포함)에서 곧바로 발화하면 사이클의 붙여넣기가 다시
+                    //   압축을 부르는 고리다.
+                    ev["after_compaction"] = json!(true);
+                    ev["reason"] = json!(
+                        "Claude 자체 압축 직후(지침 재읽기 포함) 다시 잰 바닥이 임계를 막는다 — 그 수준에서 곧바로 발화하면 압축 → \
+                         재읽기 → 재발화 고리"
+                    );
+                }
+                daemon.bus.publish("context.floor_raised", "usage", Some(surface.id), ev);
             }
             if let Some(kind) = n.feed {
                 let sref = cys::surface_ref(surface.id);
@@ -3164,11 +3174,13 @@ pub(crate) fn maybe_fire_context_threshold_at(
                 } else {
                     String::new()
                 };
+                // ★(R1-RUNAWAY-1) 압축 뒤 다시 잰 바닥이면 그 사실을 말한다(clear 뒤 바닥이 아니다).
+                let lead = if n.after_compaction { "Claude 자동 압축(지침 재읽기 포함) 직후" } else { "clear 와 지침 재주입 직후" };
                 let (title, body) = match n.regime {
                     R::Raise => (
                         format!("{} 컨텍스트 임계 {base_threshold}%→{}% 자동 상향 ({sref})", who(), n.bar),
                         format!(
-                            "clear 와 지침 재주입 직후 바닥이 이미 {}% 입니다(창 {}). 이 좌석을 {base_threshold}% 에서 다시 clear \
+                            "{lead} 바닥이 이미 {}% 입니다(창 {}). 이 좌석을 {base_threshold}% 에서 다시 clear \
                              하면 같은 지침을 또 붙여 넣는 고리가 됩니다. 이 좌석은 잰 바닥 위로 실제로 자란 뒤 {}% 에서 clear \
                              합니다(상한 {}% — 창에서 유도: Claude Code 선제 압축점 '창−{}'·차단점 '창−{}' 아래로 사이클 여유 {} \
                              토큰). 압축 창을 모델 창보다 작게 준 좌석(CLAUDE_CODE_AUTO_COMPACT_WINDOW·\
@@ -3189,7 +3201,7 @@ pub(crate) fn maybe_fire_context_threshold_at(
                             who(), n.floor, n.ceiling, n.bar, n.count
                         ),
                         format!(
-                            "clear 와 지침 재주입 직후 바닥이 {}%{absorbed} 라(창 {}) 선제 압축 상한 {}% 아래로는 작업 여유 {}%p 를 줄 수 \
+                            "{lead} 바닥이 {}%{absorbed} 라(창 {}) 선제 압축 상한 {}% 아래로는 작업 여유 {}%p 를 줄 수 \
                              없습니다. {} 이 좌석은 {}% 에서 clear 합니다(차단 상한 {}% — Claude Code 차단점 '창−{}' 전에 사이클이 \
                              끝나는 높이 · Claude 가 먼저 자동 압축할 수는 있음). 바닥에서 자라지 않는 좌석은 다시 clear 하지 \
                              않습니다(재주입 고리 차단). 근본 처방: 1M 컨텍스트 모델 사용 또는 지침·메모리 색인 축소(오너 결정).",
@@ -3210,17 +3222,22 @@ pub(crate) fn maybe_fire_context_threshold_at(
                     ),
                     R::Stopped => (
                         format!(
-                            "{} 자동 clear 중단 — clear 해도 바닥이 {}% 로 돌아옴 ({sref} · {}번째)",
-                            who(), n.floor, n.count
+                            "{} 자동 clear 중단 — {} 바닥이 {}% ({sref} · {}번째)",
+                            who(),
+                            if n.after_compaction { "Claude 압축 뒤에도" } else { "clear 해도" },
+                            n.floor,
+                            n.count
                         ),
                         format!(
-                            "clear 와 지침 재주입 뒤 바닥이 연속으로 차단 상한 {}% 근처({}%{absorbed} · 창 {})라 cys clear 가 작업 여유를 \
+                            "{} 바닥이 연속으로 차단 상한 {}% 근처({}%{absorbed} · 창 {})라 cys clear 가 작업 여유를 \
                              만들지 못합니다. 같은 지침을 또 붙여 넣는 고리를 막으려고 이 좌석의 자동 clear 를 멈춥니다 — 바닥 \
                              위로 실제로 {}%p 자라 {}% 에 닿을 때만 다시 clear 합니다. 그 전에는 Claude Code 자체 자동 압축(선제 \
                              압축점 '창−{}')이 받습니다 — 자동 압축을 끈 좌석은 차단점 '창−{}' 에서 멈출 수 있습니다. Claude 가 \
-                             자동 압축하면(같은 세션에서 컨텍스트가 바닥보다 크게 낮아짐) 기본 임계로 한 번 재무장해 그 다음 clear \
-                             가 바닥을 다시 잽니다(영구 중단 아님). 처방: 1M 컨텍스트 모델로 바꾸거나 지침·메모리 색인을 줄인 뒤 이 \
-                             좌석을 clear·재기동하십시오(새 세션의 바닥을 다시 잽니다).",
+                             자동 압축하면(같은 세션에서 컨텍스트가 바닥보다 크게 낮아짐) 압축 뒤 바닥(지침 재읽기 포함)을 다시 재 그 \
+                             위로 실제로 자란 뒤 한 번 clear 하고, 그 clear 가 바닥을 다시 잽니다(영구 중단 아님 · 압축 뒤 수준에서 \
+                             곧바로 clear 하는 고리 없음). 처방: 1M 컨텍스트 모델로 바꾸거나 지침·메모리 색인을 줄인 뒤 이 좌석을 \
+                             clear·재기동하십시오(새 세션의 바닥을 다시 잽니다).",
+                            if n.after_compaction { "Claude 자동 압축(지침 재읽기 포함) 뒤 다시 잰" } else { "clear 와 지침 재주입 뒤" },
                             n.hard_cap,
                             n.floor,
                             win_label(),
@@ -20231,7 +20248,7 @@ mod tests {
                 idle_since = Some(t);
             }
             let idle = crate::usage::CtxIdleObs { quiet_since: t0 + idle_since.unwrap_or(t), last_gap, last_input: None,
-                                                 last_queue_delivery: None, inject_done: None };
+                                                 last_queue_delivery: None, inject_done: None, queue_oldest: None };
             if (t as u64) % 30 == 0 || session == Some(t) {
                 sim_report(daemon, sid, pct.round() as u8, window, &format!("{role}-{sid}-{gen}"), t0 + t, idle);
                 let n = threshold_events(daemon, sid).len();
@@ -20413,6 +20430,14 @@ mod tests {
     #[allow(clippy::too_many_arguments)]
     fn sim_seat_real(daemon: &Arc<Daemon>, role: &str, window: Option<u64>, paste: f64, restore: f64, restore_secs: f64,
                      backlog: f64, turns: u32, work: f64, q: f64, secs: f64) -> (u64, Vec<Value>, Vec<f64>) {
+        sim_seat_real_turn(daemon, role, window, paste, restore, restore_secs, backlog, turns, work, 20.0, q, secs)
+    }
+
+    /// [`sim_seat_real`] 에 작업 턴 길이 `turn`(매 분 · 턴 사이 틈 = 60 − turn 초)을 준 것 — ★(R2NC6-1) 대기열이 선 바쁜 좌석은
+    /// 틈이 2~15초뿐이다.
+    #[allow(clippy::too_many_arguments)]
+    fn sim_seat_real_turn(daemon: &Arc<Daemon>, role: &str, window: Option<u64>, paste: f64, restore: f64, restore_secs: f64,
+                          backlog: f64, turns: u32, work: f64, turn: f64, q: f64, secs: f64) -> (u64, Vec<Value>, Vec<f64>) {
         // q = 턴 끝 → 다음 대기열 배달(마커 없는 좌석 조용함 3초 · claude 프롬프트 경계 배달은 0.1~0.5초).
         const BT: f64 = 10.0;
         let sid = make_surface(daemon, Some(role));
@@ -20437,6 +20462,8 @@ mod tests {
                 set_quiescing(daemon, sid, true);
             }
             let (raw, busy, input): (Option<f64>, bool, Option<f64>);
+            // 사이클이 붙잡았던 배달(quiescing 동안 대기열에 든 항목 — enqueue = clear 1초 뒤)이 아직 남았는가.
+            let mut held_since: Option<f64> = None;
             if let Some(s) = session {
                 let paste_at = s + 15.0;
                 let quiescing = t < paste_at;
@@ -20445,6 +20472,9 @@ mod tests {
                 }
                 let restore_end = paste_at + restore_secs;
                 let start = |k: u32| restore_end + q + f64::from(k) * (BT + q);
+                if (0..turns).any(|k| start(k) > t) {
+                    held_since = Some(t0 + s + 1.0);
+                }
                 let backlog_end = if turns > 0 { start(turns - 1) + BT } else { restore_end };
                 let work_from = backlog_end + 20.0;
                 let mut inp = (paste_at > t - 1.0 && paste_at <= t).then_some(paste_at);
@@ -20471,7 +20501,7 @@ mod tests {
                         inp = Some(work_from + 60.0 * m);
                         queued = inp;
                     }
-                    (work * (m + (ph / 20.0).min(1.0)), ph < 20.0)
+                    (work * (m + (ph / turn).min(1.0)), ph < turn)
                 };
                 input = inp;
                 if let Some(d) = queued {
@@ -20511,7 +20541,7 @@ mod tests {
             }
             let quiescing = session.is_some_and(|s| t < s + 15.0);
             let idle = crate::usage::CtxIdleObs { quiet_since: t0 + idle_since.unwrap_or(t), last_gap, last_input,
-                                                 last_queue_delivery: last_queue, inject_done: last_input };
+                                                 last_queue_delivery: last_queue, inject_done: last_input, queue_oldest: held_since };
             if t == 0.0 || force || (was_busy && !busy) || t - last_report >= 30.0 {
                 last_report = t;
                 sim_report(daemon, sid, pct.round() as u8, window, &format!("{role}-{sid}-{gen}"), t0 + t, idle);
@@ -20579,9 +20609,10 @@ mod tests {
     }
 
     /// ★(R2NC5-1 (b) · 차단기 보존 · 통합) 참으로 가득 찬 200K CEO(복원 끝 78)는 배달 몰림이 있어도 1회 재시도 뒤 자동 clear 를
-    /// 멈춘다(Stopped · 오너 error feed — 설계). Claude 선제 압축(같은 세션 파일)이 오면 `context.floor_rearmed` 1건과 함께 기본
-    /// 임계로 재무장하고 60% 에서 `after_compaction` 발화 → 그 clear 가 바닥을 다시 재 다시 Stopped. 사이클 수는 압축 수 + 3
-    /// 이하(압축 뒤 기본 임계까지 실제 성장이 부른다 · 고리 없음).
+    /// 멈춘다(Stopped · 오너 error feed — 설계). Claude 선제 압축(같은 세션 파일)이 오면 `context.floor_rearmed` 1건과 함께
+    /// 재무장해 ★(R1-RUNAWAY-1) 압축 뒤 바닥(30 근처)을 다시 재고 그 위로 자란 뒤(max(기본 60, 바닥 + 15)) `after_compaction`
+    /// 발화(payload 에 압축 뒤 바닥·영역) → 그 clear 가 바닥을 다시 재 다시 Stopped. 사이클 수는 압축 수 + 3 이하(압축 뒤 바닥
+    /// 위 실제 성장이 부른다 · 고리 없음).
     #[test]
     fn context_threshold_floor_guard_claude_compaction_rearms_a_stopped_seat() {
         let daemon = isolated_daemon(); // feed 영속 파일을 다른 검체와 나누지 않는다(같은 초의 claim_daemon 은 dir 공유)
@@ -20590,14 +20621,18 @@ mod tests {
         let ctx = format!("{payloads:?} 압축 {compactions:?}");
         assert!(!compactions.is_empty(), "전제: Stopped 좌석이 선제 압축점까지 자란다 — {ctx}");
         assert!(payloads.len() <= compactions.len() + 3, "(①) 사이클이 Claude 압축보다 많다 — {ctx}");
-        let regimes: Vec<_> = payloads.iter().skip(1).map(|p| p["regime"].as_str().unwrap_or("-").to_string()).collect();
+        // clear 뒤 세션의 발화만(압축 뒤 발화의 영역은 압축 뒤 다시 잰 바닥의 것이다 — 아래에서 따로 본다).
+        let regimes: Vec<_> = payloads.iter().skip(1).filter(|p| p.get("after_compaction").is_none())
+            .map(|p| p["regime"].as_str().unwrap_or("-").to_string()).collect();
         assert_eq!(regimes.first().map(String::as_str), Some("probe"), "가득 찬 좌석의 1회 재시도 — {ctx}");
         assert!(!regimes.iter().any(|r| r == "limited" || r == "raise"), "가득 찬 좌석의 차단기가 풀렸다 — {ctx}");
         let after: Vec<_> = payloads.iter().filter(|p| p["after_compaction"].as_bool() == Some(true)).collect();
         assert!(!after.is_empty(), "(②) Stopped 좌석이 Claude 압축 뒤 cys 사이클을 다시 받지 못한다 — {ctx}");
         for p in &after {
             let pct = p["context_pct"].as_u64().unwrap();
-            assert!((60..=61).contains(&pct) && p.get("regime").is_none(), "재무장 발화는 기본 임계에서 — {ctx}");
+            let floor = p["floor_pct"].as_u64().expect("압축 뒤 발화에 압축 뒤 잰 바닥이 없다");
+            assert!((60..=61).contains(&pct) && p["regime"].as_str() == Some("raise") && floor < 50,
+                    "압축 뒤 발화는 압축 뒤 바닥(30 근처) + 여유 = 기본 임계에서 — {ctx}");
         }
         let rearmed: Vec<_> = daemon.bus.replay_after(0).into_iter()
             .filter(|e| e["name"].as_str() == Some("context.floor_rearmed") && e["surface_id"].as_u64() == Some(sid))
@@ -20608,6 +20643,185 @@ mod tests {
         let errors = daemon.feed_items.lock().unwrap().iter()
             .filter(|i| i.surface_id == Some(sid) && i.kind == "error" && i.title.contains("자동 clear 중단")).count();
         assert!(errors >= 1, "Stopped 오너 경보가 없다(설계 — 처방: 1M·지침 축소) — {ctx}");
+    }
+
+    /// ★(R2NC6-1 · RV-ROLE-CF42-1 · ② · 통합) **바쁜 여유 좌석**(참 바닥 72 master · 200K·창 미상) — 턴 사이 틈이 3~14초뿐인
+    /// 연속 작업(분당 1.3·2%p · 대기열 배달마다 한 턴)에 사이클이 붙잡았던 배달(0 또는 5%p/3턴)을 받는다. 운영 게이트·수집기
+    /// 틱·좌석 입력·대기열(`queue_oldest`)로: Claude 선제 압축 0 · clear 뒤 발화는 Raise·Limited · 81 이하. d9638152 는 복원 끝이
+    /// 확정되면 15초 조용함만 기다려 정착 창이 300~600초 열린 채 작업을 실었다(막대 82~86 · 둘째 세션부터 압축에 clear 를 빼앗김).
+    #[test]
+    fn context_threshold_floor_guard_busy_roomy_seat_with_short_gaps_is_cleared_before_compaction() {
+        let daemon = isolated_daemon(); // feed 영속 파일을 다른 검체와 나누지 않는다(같은 초의 claim_daemon 은 dir 공유)
+        for window in [Some(200_000u64), None] {
+            for (backlog, turns) in [(0.0, 0u32), (5.0, 3)] {
+                for (work, turn) in [(1.3, 57.0), (2.0, 46.0), (2.0, 57.0)] {
+                    let (sid, payloads, compactions) =
+                        sim_seat_real_turn(&daemon, "master", window, 63.3, 8.9, 30.0, backlog, turns, work, turn, 0.3, 3.0 * 3600.0);
+                    let ctx = format!("{window:?} 몰림 {backlog}/{turns} 분당 {work} 틈 {}s: {payloads:?} 압축 {compactions:?}", 60.0 - turn);
+                    assert!(payloads.len() >= 3, "(②) 일하는 좌석이 clear 되지 않았다 — {ctx}");
+                    assert!(compactions.is_empty(), "(②) Claude 선제 압축이 cys clear 보다 먼저 왔다 — {ctx}");
+                    for p in payloads.iter().skip(1) {
+                        let pct = p["context_pct"].as_u64().unwrap();
+                        let regime = p["regime"].as_str().unwrap_or("-");
+                        assert!(regime == "raise" || regime == "limited", "차단기 오판({regime}) — {ctx}");
+                        assert!(pct <= 81, "(②) {pct}% 까지 clear 가 늦었다 — {ctx}");
+                        assert!(p.get("after_compaction").is_none(), "{ctx}");
+                    }
+                    let rearmed = daemon.bus.replay_after(0).into_iter()
+                        .filter(|e| e["name"].as_str() == Some("context.floor_rearmed") && e["surface_id"].as_u64() == Some(sid))
+                        .count();
+                    assert_eq!(rearmed, 0, "{ctx}");
+                }
+            }
+        }
+    }
+
+    /// ★(R1-RUNAWAY-1 · 재검증자 반례 · 통합) 가짜 Claude 가 압축 뒤 SessionStart:compact 훅이 시킨 지침 재읽기(+`reread`%p ·
+    /// 20초 한 턴)를 하고, 좌석은 대기열 주기 신호(`hb`초마다 +`hb_pp`%p · 5초 턴) 말고는 유휴다. `sim_seat_real` 과 같은 가짜
+    /// CSO(발화 60초 뒤 사이클 · quiescing 15초 · 붙여넣기 `paste` + 복원 `restore`/30초). 반환 = (좌석 · 발화 payload · 압축 시각).
+    #[allow(clippy::too_many_arguments)]
+    fn r1_sim_seat_reread(daemon: &Arc<Daemon>, role: &str, window: Option<u64>, paste: f64, restore: f64,
+                          reread: f64, hb: f64, hb_pp: f64, secs: f64) -> (u64, Vec<Value>, Vec<f64>) {
+        let sid = make_surface(daemon, Some(role));
+        let t0 = daemon.started_instant.elapsed().as_secs_f64() + 10.0;
+        let w = window.unwrap_or(200_000) as f64;
+        let compact_at = (w - 33_000.0) * 100.0 / w;
+        let (mut pct, mut gen, mut pending, mut session): (f64, u32, Option<f64>, Option<f64>) = (70.0, 0, None, None);
+        let (mut idle_since, mut last_gap, mut last_input): (Option<f64>, Option<(f64, f64)>, Option<f64>) = (None, None, None);
+        let mut last_queue: Option<f64> = None;
+        let (mut dropped, mut was_busy, mut last_report, mut fired) = (0.0, false, -1e9, 0usize);
+        let (mut rr_at, mut rr_done): (Option<f64>, f64) = (None, 0.0);
+        let mut compactions = vec![];
+        let restore_secs = 30.0;
+        let mut t = 0.0;
+        while t <= secs {
+            let mut force = false;
+            if pending.is_some_and(|c| t >= c) {
+                pending = None;
+                session = Some(t);
+                gen += 1;
+                dropped = 0.0;
+                rr_at = None;
+                rr_done = 0.0;
+                force = true;
+                set_quiescing(daemon, sid, true);
+            }
+            let (raw, mut busy, input): (Option<f64>, bool, Option<f64>);
+            if let Some(s) = session {
+                let paste_at = s + 15.0;
+                let quiescing = t < paste_at;
+                if !quiescing {
+                    set_quiescing(daemon, sid, false);
+                }
+                let restore_end = paste_at + restore_secs;
+                let mut inp = (paste_at > t - 1.0 && paste_at <= t).then_some(paste_at);
+                let mut queued = None;
+                let mut hb_grown = 0.0;
+                let mut hb_turn = false;
+                if t >= restore_end + hb {
+                    let k = ((t - restore_end) / hb).floor();
+                    let at = restore_end + k * hb;
+                    hb_grown = hb_pp * (k - 1.0 + ((t - at) / 5.0).min(1.0));
+                    hb_turn = t - at < 5.0;
+                    if at > t - 1.0 && at <= t {
+                        inp = Some(at);
+                        queued = inp;
+                    }
+                }
+                input = inp;
+                if let Some(d) = queued {
+                    last_queue = Some(t0 + d);
+                }
+                if quiescing {
+                    (raw, busy) = (Some(3.0), true);
+                } else if t < restore_end {
+                    (raw, busy) = (Some(paste + restore * (t - paste_at) / restore_secs), true);
+                } else {
+                    (raw, busy) = (Some(paste + restore + hb_grown), hb_turn);
+                }
+            } else {
+                (raw, busy, input) = (pending.is_none().then_some(70.0), pending.is_some(), None);
+            }
+            let mut rr = rr_done;
+            if let Some(a) = rr_at {
+                if t < a + 20.0 {
+                    rr += reread * (t - a) / 20.0;
+                    busy = true;
+                } else {
+                    rr_done += reread;
+                    rr = rr_done;
+                    rr_at = None;
+                    force = true;
+                }
+            }
+            if let Some(i) = input {
+                last_input = Some(t0 + i);
+                if let Some(r) = raw {
+                    if r - dropped + rr >= compact_at {
+                        dropped = r - 30.0;
+                        rr_done = 0.0;
+                        rr = 0.0;
+                        rr_at = Some(t);
+                        busy = true;
+                        compactions.push(t);
+                        force = true;
+                    }
+                }
+            }
+            if let Some(r) = raw {
+                pct = (r - dropped + rr).clamp(0.0, 100.0);
+            }
+            if busy {
+                if let Some(from) = idle_since.take() {
+                    if t - from >= crate::usage::CTX_FLOOR_IDLE_QUIET_SECS {
+                        last_gap = Some((t0 + from, t0 + t));
+                    }
+                }
+            } else if idle_since.is_none() {
+                idle_since = Some(t);
+            }
+            let quiescing = session.is_some_and(|s| t < s + 15.0);
+            let idle = crate::usage::CtxIdleObs { quiet_since: t0 + idle_since.unwrap_or(t), last_gap, last_input,
+                                                 last_queue_delivery: last_queue, inject_done: last_input, queue_oldest: None };
+            // 상태줄은 활동 때만 보고한다 — 턴 끝 · 바쁜 동안 30초마다 · 사건.
+            if t == 0.0 || force || (was_busy && !busy) || (busy && t - last_report >= 30.0) {
+                last_report = t;
+                sim_report(daemon, sid, pct.round() as u8, window, &format!("{role}-{sid}-{gen}"), t0 + t, idle);
+                let n = threshold_events(daemon, sid).len();
+                if n > fired {
+                    fired = n;
+                    pending = Some(t + 60.0);
+                }
+            }
+            crate::usage::ctx_guard_tick_at(&daemon.get_surface(sid).unwrap(), t0 + t, quiescing, idle);
+            was_busy = busy;
+            t += 1.0;
+        }
+        let evs = threshold_events(daemon, sid);
+        (sid, evs.iter().map(|e| e["payload"].clone()).collect(), compactions)
+    }
+
+    /// ★(R1-RUNAWAY-1 · ① · 통합 — 재검증자 반례 그대로) clear + 지침 재주입 + 복원(76 + 9 = 85)이 이미 Claude 선제 압축점(83.5%)
+    /// 위인 **유휴** 200K CEO(10분마다 +0.3%p 주기 신호뿐) — 압축 뒤 지침 재읽기로 압축 뒤 수준이 63%(기본 60 위)여도 부트 +
+    /// 뒷문 1회 뒤 사이클이 없다(4시간 ≤ 3회). d9638152 는 재무장(기본 임계)이 63% 에서 곧바로 발화 → 붙여넣기 → 압축 →
+    /// 재읽기 → 재발화를 주기 신호마다 돌았다(4시간 21회 · 압축 19 · 재무장 19). 재읽기가 없으면(30%) 종전과 같다.
+    #[test]
+    fn context_threshold_floor_guard_post_compaction_reread_does_not_loop_an_idle_seat() {
+        for (reread, label) in [(0.0, "L=30"), (33.0, "L=63"), (45.0, "L=75")] {
+            let daemon = isolated_daemon();
+            let (sid, payloads, compactions) =
+                r1_sim_seat_reread(&daemon, "ceo", Some(200_000), 76.0, 9.0, reread, 600.0, 0.3, 4.0 * 3600.0);
+            let rearmed = daemon.bus.replay_after(0).into_iter()
+                .filter(|e| e["name"].as_str() == Some("context.floor_rearmed") && e["surface_id"].as_u64() == Some(sid))
+                .count();
+            let ctx = format!("{label}: 발화 {payloads:?} 압축 {compactions:?} 재무장 {rearmed}");
+            assert!(payloads.len() <= 3, "(①) 유휴 좌석이 압축 → 재읽기 → 재발화 고리를 돈다 — {ctx}");
+            for p in payloads.iter().filter(|p| p["after_compaction"].as_bool() == Some(true)) {
+                let (pct, floor) = (p["context_pct"].as_u64().unwrap(), p["floor_pct"].as_u64().expect("압축 뒤 잰 바닥"));
+                assert!(pct >= floor + u64::from(crate::usage::CTX_FLOOR_MIN_ROOM), "(①) 압축 뒤 바닥 {floor} 위 {pct} — {ctx}");
+            }
+            assert!(rearmed <= compactions.len(), "{ctx}");
+        }
     }
 
     /// ★(RR3-R1-1 · G3ROLE-1 · ① 재주입 고리) 200K(또는 창 미상) master·CEO 가 clear+지침 재주입 직후 바닥이 이미 창 유도
