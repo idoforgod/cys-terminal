@@ -1141,6 +1141,12 @@ impl InjectTrack {
         self.last_body.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// ★(0.14.42 · ROLE-R4-1 · R2NC5-1) 마지막 Inject arm 이 끝난 시각(없으면 None) — clear 직후 바닥 가드가 복원 턴 뒤
+    /// 첫 좌석 입력(대기열·채널·스케줄 배달)을 안다(`usage::last_input_of`). 읽기만(말단 락).
+    pub(crate) fn done_at(&self) -> Option<Instant> {
+        *self.done_at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 지금 Inject arm 이 쓰는 중이거나, 마지막 arm 이 끝난 지 `within` 이 안 됐는가.
     pub(crate) fn busy_within(&self, within: std::time::Duration) -> bool {
         self.active.load(Ordering::Acquire)
