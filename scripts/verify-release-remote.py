@@ -18,6 +18,9 @@
      ★낱말 grep(smartscreen/defender/…)은 **제거하지 않고 보조 축으로 AND** 유지한다
        (마커 껍데기만 남고 카피가 비는 사고 + 기존 루트 밴드 감시 축 보존).
   ⑥ SHA256SUMS.txt — 신버전 전수·구버전 0줄 + **실자산 바이트 해시 대조** (오너 지시 ⓑ)
+     ★2026-09-27(0.14.42 발행 준비): '전 자산' 을 **기준 목록 13종 전부 등재**로 기계화했다
+       (`expected_sums_names` — 버전 붙은 5종 + 무버전 8종 · 정본 scripts/release-verify.py 와 self-test 로
+       대조). 종전엔 배포 4종만 등재를 요구해 나머지 9종이 SUMS·서버에서 통째로 빠져도 PASS 였다.
   ⑧ 무버전 자산 버전 결속 — `latest.json` 의 version·플랫폼 URL 이 신버전을 가리키는지 +
      팩 미러 자기정합(pack-manifest.json 의 digest == 실제 pack.tar.gz 바이트).
      ★왜 필요한가(2026-09-04 W-C R2 ④): ⑥ 의 구버전 탐지 정규식은 'cys_<숫자>.<숫자>.<숫자>_' 라
@@ -84,6 +87,62 @@ VERSIONLESS_ASSETS = ("cys_aarch64.app.tar.gz", "cys_aarch64.app.tar.gz.sig",
                       "cys_x64.app.tar.gz", "cys_x64.app.tar.gz.sig",
                       "latest.json", "pack.tar.gz",
                       "pack-manifest.json", "pack-manifest.json.minisig")
+
+
+# ⑥ 기준 목록 — 버전 붙은 5종(배포 4종 + NSIS 설치본 업데이터 서명). 무버전 8종(VERSIONLESS_ASSETS)과 합쳐
+#   release-postprocess.py 가 SUMS 에 싣는 '자기 자신을 뺀 전 자산' 13종이 된다(v0.14.41 SUMS 실측 13줄 일치).
+VERSIONED_ASSETS = ("cys_{v}_aarch64.dmg", "cys_{v}_x64.dmg", "cys_{v}_x64-setup.exe",
+                    "cys_{v}_x64-setup.exe.sig", "cys_{v}_x64-setup.zip")
+OLD_VERSIONED_RE = re.compile(r"cys_\d+\.\d+\.\d+_")
+
+
+def expected_sums_names(ver):
+    """⑥ 가 SUMS 에 **전부** 있기를 요구하는 자산 이름 집합(순수)."""
+    return set(a.format(v=ver) for a in VERSIONED_ASSETS) | set(VERSIONLESS_ASSETS)
+
+
+def sums_coverage_verdict(lines, ver):
+    """⑥ 등재 판정 — 순수함수(네트워크 무접촉). lines = SHA256SUMS.txt 의 비지 않은 줄들.
+
+    통과 조건(AND): 줄이 있다 · 기준 13종이 **전부** 등재 · 구버전 버전 붙은 줄 0 · 형식 이상 줄 0.
+    해시가 실자산과 맞는지는 이 함수가 아니라 main 의 바이트 대조가 본다(여기는 목록만).
+    """
+    names, malformed = [], []
+    for l in lines:
+        p = l.split()
+        if len(p) == 2 and re.fullmatch(r"[0-9a-f]{64}", p[0]):
+            names.append(p[1])
+        else:
+            malformed.append(l[:60])
+    have = set(names)
+    missing = sorted(expected_sums_names(ver) - have)
+    old = sorted(n for n in names if OLD_VERSIONED_RE.search(n) and ("cys_%s_" % ver) not in n)
+    newn = sum(1 for n in names if ("cys_%s_" % ver) in n)
+    bad = []
+    if not lines:
+        bad.append("SUMS 비어 있음")
+    if missing:
+        bad.append("미등재 %d종 %s" % (len(missing), ", ".join(missing)))
+    if old:
+        bad.append("구버전 줄 %d %s" % (len(old), ", ".join(old)))
+    if malformed:
+        bad.append("형식 이상 줄 %d %s" % (len(malformed), malformed))
+    detail = "총 %d줄 · 신버전 %d · 구버전 %d · 기준 %d종 중 누락 %d" % (
+        len(lines), newn, len(old), len(expected_sums_names(ver)), len(missing))
+    return (not bad), (detail if not bad else detail + " — " + "; ".join(bad))
+
+
+def _load_release_verify():
+    """self-test 정본 대조용 — 같은 체크아웃의 scripts/release-verify.py 를 적재(없으면 None)."""
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "release-verify.py")
+    if not os.path.isfile(path):
+        return None
+    spec = importlib.util.spec_from_file_location("release_verify_for_remote", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def versionless_verdict(latest, manifest, pack_digest_ok, ver):
@@ -230,6 +289,37 @@ def self_test():
     #   이것이 종전 7축이 7/7 PASS 를 주던 바로 그 형상이다.
     v, d = versionless_verdict(mk(OLD, OLD), man, True, V)
     ok("⑧ⓖ ★무버전 자산만 구버전인 형상은 반드시 실패", not v, d)
+
+    # ── ⑥ SUMS 전 자산 등재(누락 0) — 2026-09-27 0.14.42 발행 준비 (오너 체크리스트 ⓑ) ──
+    # 종전 ⑥ 은 SUMS 에 **배포 4종**만 등재를 요구했다(`for f in four`). 그래서 SUMS 에서
+    # `cys_<V>_x64-setup.exe.sig`·업데이터 tar.gz·latest.json·팩 3종 같은 나머지 9종이 통째로
+    # 빠져도(= 서버에 올리지도 SUMS 에 싣지도 않아도) '신버전 ≥4 · 구버전 0 · 등재된 것은 전부 해시
+    # 일치' 로 PASS 였다 — 'SUMS 신버전 **전 자산** 갱신·누락 0' 의 '전 자산' 이 기계로 재지지 않았다.
+    full = sorted(expected_sums_names(V))
+    ok("⑥ⓐ 기준 목록은 13종(release-postprocess 관례와 같다)", len(full) == 13, "%d종" % len(full))
+    v, d = sums_coverage_verdict(["%s  %s" % ("0" * 64, n) for n in full], V)
+    ok("⑥ⓑ 13종 전부 등재면 통과", v, d)
+    for drop in ("cys_%s_x64-setup.exe.sig" % V, "cys_aarch64.app.tar.gz", "latest.json",
+                 "pack-manifest.json.minisig"):
+        v, d = sums_coverage_verdict(["%s  %s" % ("0" * 64, n) for n in full if n != drop], V)
+        ok("⑥ⓒ ★%s 하나만 빠진 SUMS 는 실패(종전 판정 PASS)" % drop, not v and drop in d, d)
+    v, d = sums_coverage_verdict(["%s  %s" % ("0" * 64, n) for n in full]
+                                 + ["%s  cys_%s_x64.dmg" % ("0" * 64, OLD)], V)
+    ok("⑥ⓓ 구버전 줄이 섞이면 실패", not v, d)
+    v, d = sums_coverage_verdict([], V)
+    ok("⑥ⓔ 빈 SUMS 는 통과가 아니라 실패", not v, d)
+    v, d = sums_coverage_verdict(["%s  %s" % ("0" * 64, n.replace(V, OLD)) for n in full], V)
+    ok("⑥ⓕ 버전 붙은 자산이 전부 구버전이면 실패", not v, d)
+    # 정본 대조 — 발행 전 관문(scripts/release-verify.py)의 기대 집합과 **같은 13종**인지 기계로 본다.
+    #   두 목록이 갈리면 '발행 전엔 통과 · 홈페이지 검증은 다른 기준' 이 된다(한쪽만 고치는 드리프트 차단).
+    rv = _load_release_verify()
+    if rv is None:
+        print("SKIP ⑥ⓖ scripts/release-verify.py 부재(체크아웃 밖 실행) — 정본 대조를 재지 않았다")
+    else:
+        upd = set(a.format(v=V) for a in rv.UPDATER_PLATFORMS.values())
+        canon = set(a.format(v=V) for a in rv.REQUIRED_ASSETS) | upd | set(a + ".sig" for a in upd)
+        ok("⑥ⓖ 기준 목록 = release-verify.py 정본(REQUIRED_ASSETS ∪ 업데이터 자산 ∪ 그 .sig)",
+           canon == set(full), "차집합 %s / %s" % (sorted(canon - set(full)), sorted(set(full) - canon)))
 
     # ── 인자 계약: 구버전 생략은 명시 플래그로만 (U4 C4-⑦ · 2026-09-23) ──
     # 종전엔 구버전을 빼먹으면 ① 을 조용히 빼고 분모 8→7 로 "7/7 PASS" 를 냈다 — 오너 문서의 합격
@@ -393,10 +483,8 @@ def main(argv):
     # ⑥ SHA256SUMS.txt
     sums = get("%s/downloads/SHA256SUMS.txt" % SITE)
     lines = [l for l in sums.splitlines() if l.strip()]
-    newn = sum(1 for l in lines if ("cys_%s_" % ver) in l)
-    oldn = sum(1 for l in lines if re.search(r"cys_\d+\.\d+\.\d+_", l) and ("cys_%s_" % ver) not in l)
-    ok6 = bool(lines) and newn >= 4 and oldn == 0
-    detail = "총 %d줄 · 신버전 %d · 구버전 %d" % (len(lines), newn, oldn)
+    # ★기준 13종 전부 등재(누락 0)·구버전 0·형식 이상 0 — sums_coverage_verdict(self-test ⑥ⓐ~ⓖ 로 고정).
+    ok6, detail = sums_coverage_verdict(lines, ver)
     # 실자산 바이트 해시 대조 — 표기만 갱신되고 바이트가 구버전인 사고 차단
     if ok6:
         want = {}

@@ -644,6 +644,13 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             curl -sO "$B/SHA256SUMS.txt" && shasum -a 256 -c SHA256SUMS.txt
             ```
             **4줄 전건 OK** 여야 한다. 1건이라도 FAILED 면 미완이다.
+            ★2026-09-27(0.14.42 발행 준비) — 위 손 명령은 배포 4종만 본다. **정본인 기계 검사**
+            (`verify-release-remote.py` ⑥)는 이제 SUMS 에 **기준 13종 전부**(버전 붙은 5종 =
+            aarch64.dmg·x64.dmg·x64-setup.exe·x64-setup.exe.sig·x64-setup.zip + 무버전 8종 =
+            업데이터 tar.gz 2·.sig 2·latest.json·pack.tar.gz·pack-manifest.json·.minisig)의 등재를
+            요구한다 — 종전엔 나머지 9종이 SUMS·서버에서 통째로 빠져도 ⑥ 이 PASS 였다(오너 지시 ⓑ
+            '전 자산 · 누락 0' 의 기계화). 기준 목록은 발행 전 관문 `release-verify.py` 의 정본과
+            같은지 `--self-test` ⑥ⓖ 가 대조한다.
 
       ⚠**이 6항목이 보지 않는 것 — 2026-08-01 사고의 정확한 사각지대**: 여기서 자산을 받는
       수단은 `curl` 이다. **`curl` 로 받은 파일에는 `com.apple.quarantine` 이 붙지 않는다.**
