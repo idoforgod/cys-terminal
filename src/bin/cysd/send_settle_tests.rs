@@ -513,6 +513,44 @@ fn f1_submit_cr_withheld_when_dialog_rose_after_own_body() {
     assert_eq!(ev[0]["payload"]["armed_by"], json!("machine_body"), "{ev:?}");
 }
 
+/// 적색→녹색(재개 · S94 실측): 좌석 캐시(watchdog 5초 틱)가 에이전트가 앉기 **전** 틱의 `Empty` 로 낡은 좌석 —
+/// 에이전트 미확인(set_meta 가 내린 `agent_seen=false`). 종전에는 탐침을 걸지 않아(생존 술어 거짓) 같은 창 경합에서
+/// CR 이 '1. Yes' 를 눌렀다(S94 좌석 empty 시행만 오승인). 커서가 선택지 행이면 쓰지 않는다.
+#[test]
+fn f1_submit_cr_withheld_on_stale_empty_seat_before_first_agent_sighting() {
+    let fx = fx("f1-stale");
+    let t = agent_pane_settled(&fx, "worker-1", P + 115);
+    t.seat_cache.store(crate::governance::SeatState::Empty.as_u8(), Ordering::Relaxed);
+    t.agent_seen.store(false, Ordering::Relaxed);
+    let _x = pane(&fx, "worker-2", P + 116);
+    assert_eq!(direct(&fx, Some(P + 116), &t, "M|x|AAA")["ok"], json!(true));
+    std::thread::sleep(Duration::from_millis(60));
+    paint(&t, &DIALOG, 1, 8);
+    assert_eq!(pair_return(&fx, Some(P + 116), &t)["result"]["sent"], json!(true));
+    let o = wait_submit_consumed(&t);
+    assert!(!o.inflight, "writer 가 CR 요청을 소비했다: {o:?}");
+    assert_eq!(o.since_written_ms, None, "낡은 Empty 좌석에서 창 위 제출 CR 을 썼다 — '1. Yes' 오승인: {o:?}");
+    let ev = withheld(&fx);
+    assert_eq!(ev.len(), 1, "보류 사실 1건: {ev:?}");
+}
+
+/// 음성 대조(③ 방향): 에이전트를 **본 뒤**의 `Empty`(사망 · 종료 통지 전) 좌석은 종전 — 창 잔상이 있어도 쓴다.
+#[test]
+fn f1_seat_empty_after_agent_was_seen_is_unchanged() {
+    let fx = fx("f1-deadseat");
+    let t = agent_pane_settled(&fx, "worker-1", P + 117);
+    t.seat_cache.store(crate::governance::SeatState::Empty.as_u8(), Ordering::Relaxed);
+    t.agent_seen.store(true, Ordering::Relaxed);
+    let _x = pane(&fx, "worker-2", P + 118);
+    assert_eq!(direct(&fx, Some(P + 118), &t, "M|x|AAA")["ok"], json!(true));
+    std::thread::sleep(Duration::from_millis(60));
+    paint(&t, &DIALOG, 1, 8);
+    assert_eq!(pair_return(&fx, Some(P + 118), &t)["result"]["sent"], json!(true));
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "사망 좌석(에이전트를 본 뒤 Empty)은 종전처럼 쓴다: {o:?}");
+    assert!(withheld(&fx).is_empty(), "{:?}", withheld(&fx));
+}
+
 /// 음성 대조(치명 방향 — 워커 hang): 이미 보이는 창에 대한 Return(master 의 승인 조작)은 쓴다.
 #[test]
 fn f1_approval_return_on_visible_dialog_is_written() {

@@ -5249,14 +5249,74 @@ pub(crate) fn submit_cr_guard_armed(machine_body_pending: bool, dialog_at_handof
     }
 }
 
+/// ★(F1 · 재개 S94) 제출 CR 보류 탐침이 좌석 화면에서 **무엇을 창으로 보는가** — 좌석 생존 등급별.
+///
+/// 【왜 등급인가】 생존 술어 [`crate::alert_route::seat_is_agent_backed`] 는 좌석 캐시(`seat_cache` · watchdog 5초 틱의
+/// 단일 writer)가 `Empty` 면 거짓이다. 그런데 에이전트가 앉기 **전** 틱이 찍은 `Empty` 는 다음 틱까지 남는다 — 기동 직후
+/// 최대 5초 동안 탐침이 꺼져 창의 '1. Yes' 를 눌렀다(S94 실측: 좌석 empty 시행만 보류 0 · 오승인 1 · unknown 시행 전부
+/// 보류). 그 `Empty` 를 그냥 생존으로 치면 안 된다 — 같은 상태가 '창을 띄운 채 죽은 좌석'(잔상 아래 셸 프롬프트)에도
+/// 나고, 그 화면의 전역 창 서명으로 보류하면 부트 체인이 치는 재기동 명령의 Return 이 막힌다(③ 자가치유 · D-12 REVIEW1
+/// F1 과 같은 구멍). 그래서 에이전트를 **아직 한 번도 확인하지 못한** 좌석의 `Empty` 에서는 **커서가 선택지 행**(커서행
+/// 선두 에이전트 마커 + `N. …` — 셸 프롬프트·재기동 명령 줄은 이 형상이 아니다)일 때만 창으로 본다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubmitGuardScope {
+    /// 에이전트 생존 좌석 — 전경 창 서명 ∨ 커서 선택지 행(D-12 Text 모달 축·큐 게이트 ②와 같은 술어).
+    Full,
+    /// 좌석 캐시가 에이전트 확인 전 틱의 `Empty` 일 수 있는 좌석(meta ∧ ¬종료 ∧ ¬종료 통지 ∧ ¬agent_seen) — 커서 선택지 행만.
+    SelectorRowOnly,
+    /// 대상 밖 — 셸 좌석(meta 없음) · 에이전트를 본 뒤의 `Empty`(사망 · 통지 전) · 종료 통지 · 종료된 좌석(종전).
+    Off,
+}
+
+/// ★(F1 · 재개) 순수 — [`SubmitGuardScope`] 판정표. `agent_backed` = `seat_is_agent_backed` 의 값.
+pub(crate) fn submit_guard_scope_of(
+    agent_backed: bool,
+    meta: bool,
+    exited: bool,
+    exit_notified: bool,
+    agent_seen: bool,
+    seat: SeatState,
+) -> SubmitGuardScope {
+    if agent_backed {
+        SubmitGuardScope::Full
+    } else if meta && !exited && !exit_notified && !agent_seen && seat == SeatState::Empty {
+        SubmitGuardScope::SelectorRowOnly
+    } else {
+        SubmitGuardScope::Off
+    }
+}
+
+/// ★(F1 · 재개) IO — 좌석의 탐침 등급(원자 판독 + agent_meta leaf 락을 차례로 · 중첩 없음).
+pub(crate) fn submit_guard_scope(s: &Arc<crate::state::Surface>) -> SubmitGuardScope {
+    let agent_backed = crate::alert_route::seat_is_agent_backed(s);
+    let meta = s.agent_meta.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    submit_guard_scope_of(
+        agent_backed,
+        meta,
+        s.exited.load(Ordering::Relaxed),
+        s.agent_exit_notified.load(Ordering::Relaxed),
+        s.agent_seen.load(Ordering::Relaxed),
+        SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)),
+    )
+}
+
 /// ★(F1) IO — 지금 이 좌석에 CR 을 쓰면 창을 누르는가(관측 1회 · agent_meta·파서·inject_track leaf 락을 차례로).
-/// 에이전트 생존이 관측되지 않은 좌석(죽은 좌석의 모달 잔상 아래 셸)은 `false` — D-12 Text 모달 축과 같은 술어.
+/// 대상 밖 좌석(죽은 좌석의 모달 잔상 아래 셸 등)은 `false` — 등급은 [`submit_guard_scope`].
 fn observe_submit_cr_hits_dialog(s: &Arc<crate::state::Surface>, markers: &[String]) -> bool {
-    if markers.is_empty() || !crate::alert_route::seat_is_agent_backed(s) {
+    if markers.is_empty() {
+        return false;
+    }
+    let scope = submit_guard_scope(s);
+    if scope == SubmitGuardScope::Off {
         return false;
     }
     let obs = observe_prompt(s, markers);
-    if !obs_modal_foreground(&obs) {
+    let dialog = match scope {
+        SubmitGuardScope::Full => obs_modal_foreground(&obs),
+        SubmitGuardScope::SelectorRowOnly => obs.selector_row,
+        SubmitGuardScope::Off => false,
+    };
+    if !dialog {
         return false;
     }
     let body = s.inject_track.last_body();
@@ -20761,6 +20821,17 @@ mod reflect_queue_tests {
         assert_eq!(armed(true, false), Some("machine_body"));
         assert_eq!(armed(false, false), Some("no_dialog_at_handoff"), "인계 뒤에 뜰 창은 이 Return 의 대상이 아니다");
         assert_eq!(armed(false, true), None, "보이는 창에 대한 Return = 승인·선택지 조작(막으면 워커 hang)");
+        // ★(재개 S94) 탐침 등급 — (agent_backed, meta, exited, exit_notified, agent_seen, seat)
+        use super::{submit_guard_scope_of as scope, SubmitGuardScope as G};
+        use SeatState::{Empty as E, Occupied as O, Unknown as U};
+        assert_eq!(scope(true, true, false, false, true, O), G::Full, "생존 좌석");
+        assert_eq!(scope(true, true, false, false, false, U), G::Full, "틱 전 새 좌석(Unknown)");
+        assert_eq!(scope(false, true, false, false, false, E), G::SelectorRowOnly, "에이전트 확인 전 틱의 낡은 Empty");
+        assert_eq!(scope(false, true, false, false, true, E), G::Off, "에이전트를 본 뒤의 Empty = 사망(통지 전) — 종전");
+        assert_eq!(scope(false, true, false, true, false, E), G::Off, "종료 통지 — 종전");
+        assert_eq!(scope(false, true, true, false, false, E), G::Off, "종료된 좌석 — 종전");
+        assert_eq!(scope(false, false, false, false, false, E), G::Off, "셸 좌석(meta 없음) — 종전");
+        assert_eq!(scope(false, true, false, true, false, O), G::Off, "backed 거짓의 다른 이유(종료 통지)는 구제하지 않는다");
     }
 
     /// ★(0.14.42 · 수정 2회차 F1) writer 보류 탐침 — 빈 composer·우리 본문 composer 는 통과, 창이면 보류(이벤트 1건),
@@ -20787,6 +20858,46 @@ mod reflect_queue_tests {
         assert_eq!(ev["payload"]["from"], json!(cys::surface_ref(7)), "{ev}");
         s.agent_exit_notified.store(true, Ordering::Relaxed);
         assert!(!probe(), "에이전트가 죽은 좌석의 모달 잔상은 창이 아니다(셸 전경)");
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+    }
+
+    /// ★(0.14.42 · 수정 2회차 F1 · 재개 S94) 좌석 캐시는 watchdog 틱(5초)에만 갱신된다 — 에이전트가 앉기 **전** 틱의
+    /// `Empty` 가 다음 틱까지 남은 좌석(에이전트 미확인 = launch 의 set_meta 가 내린 `agent_seen=false`)에서 탐침이 꺼져
+    /// 창의 '1. Yes' 를 눌렀다(S94 실측: 좌석 empty 시행만 보류 0 · 오승인 1 · 나머지 unknown 시행 전부 보류).
+    /// 규칙: 그런 좌석에서는 **커서가 선택지 행**(선두 마커 + `N. …`)일 때만 창으로 본다 — 화면 전역의 창 문면 서명만으로는
+    /// 보류하지 않는다(죽은 좌석의 창 잔상 아래 셸 프롬프트에 부트 체인이 치는 재기동 Return 을 막지 않는다 · ③ 자가치유).
+    /// 에이전트를 본 뒤의 `Empty`(사망 · 통지 전)와 종료 통지 좌석은 종전(대상 밖)이다.
+    #[test]
+    fn f1_probe_on_stale_empty_seat_sees_only_the_selector_row() {
+        let (daemon, s, _pack) = probe_seat("f1stale");
+        let markers = vec!["❯".to_string()];
+        let probe = submit_cr_withhold_probe(&daemon, &s, markers.clone(), "machine_body", Some(7));
+        let dialog = [" Do you want to proceed?", " ❯ 1. Yes", "   2. No", " Esc to cancel"];
+        // 죽은 좌석 잔상 형상 — 창 문면 아래 셸 프롬프트 + 재기동 명령(커서행 선두에 에이전트 마커 없음).
+        let residue = [" Do you want to proceed?", " ❯ 1. Yes", "   2. No", "user@host ~ % claude --resume x"];
+        // 대조 기준: 좌석 캐시가 비어 있지 않은(Unknown) 생존 좌석은 화면 전역 서명까지 본다(종전 탐침 그대로).
+        paint(&s, &residue, 3, 31, false);
+        let full_scope_sees_residue = probe();
+        assert!(
+            full_scope_sees_residue,
+            "형상 대조 실패: 생존 좌석의 전역 서명 판정이 잔상 형상을 창으로 보지 않는다 — 아래 ③ 대조가 무의미해진다"
+        );
+        s.seat_cache.store(SeatState::Empty.as_u8(), Ordering::Relaxed);
+        s.agent_seen.store(false, Ordering::Relaxed);
+        paint(&s, &dialog, 1, 9, false);
+        assert!(probe(), "기동 전 틱의 낡은 Empty 좌석에서 창 위 CR 을 썼다 — '1. Yes' 오승인");
+        paint(&s, &residue, 3, 31, false);
+        assert!(
+            !probe(),
+            "낡은 Empty 좌석에서 화면 전역 창 서명만으로 보류했다 — 죽은 좌석 재기동 Return 을 막는다(③) \
+             (Unknown 좌석 기준 {full_scope_sees_residue})"
+        );
+        s.agent_seen.store(true, Ordering::Relaxed);
+        paint(&s, &dialog, 1, 9, false);
+        assert!(!probe(), "에이전트를 본 뒤의 Empty(사망 · 통지 전) 좌석은 종전처럼 쓴다");
+        s.agent_seen.store(false, Ordering::Relaxed);
+        s.agent_exit_notified.store(true, Ordering::Relaxed);
+        assert!(!probe(), "종료 통지 좌석은 종전처럼 쓴다");
         let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
     }
 

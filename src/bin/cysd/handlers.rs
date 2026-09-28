@@ -5985,13 +5985,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 None => crate::state::WriteReq::Data(bytes),
             };
             // ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 탐침의 인계 재료 — 게이트 **밖** 1회(어댑터·파서·agent_meta 는
-            //   게이트 안 락 계약 밖이다). 대상: 비면제 SubmitKey 의 SubmitAfterGap · 유닉스 · 에이전트 생존 좌석 · 킬 스위치
-            //   꺼짐(`CYS_SEND_SETTLE=0`·`send-settle-off` 가 제출 정착 전체의 한 노브 롤백이다). 권위 Return(부트 체인)은
-            //   `gate_kind` 가 None 이라 대상 밖 · 윈도우·셸은 무변경. 거는지는 게이트 안에서 줄 위 본문을 보고 정한다.
+            //   게이트 안 락 계약 밖이다). 대상: 비면제 SubmitKey 의 SubmitAfterGap · 유닉스 · 에이전트 좌석(탐침 등급
+            //   `governance::submit_guard_scope` 가 Off 아님 — 생존 좌석 ∨ 좌석 캐시가 에이전트 확인 전 틱의 Empty 인 좌석(재개 S94))
+            //   · 킬 스위치 꺼짐(`CYS_SEND_SETTLE=0`·`send-settle-off` 가 제출 정착 전체의 한 노브 롤백이다). 권위 Return(부트
+            //   체인)은 `gate_kind` 가 None 이라 대상 밖 · 윈도우·셸은 무변경. 거는지는 게이트 안에서 줄 위 본문을 보고 정한다.
             let cr_guard_ctx = if gate_kind == Some(DirectSendKind::SubmitKey)
                 && matches!(write_req, crate::state::WriteReq::SubmitAfterGap { .. })
                 && cfg!(unix)
-                && crate::alert_route::seat_is_agent_backed(&surface)
+                && governance::submit_guard_scope(&surface) != governance::SubmitGuardScope::Off
                 && !send_settle_disabled(daemon)
             {
                 governance::submit_cr_guard_context(&surface)
@@ -15861,7 +15862,9 @@ mod tests {
         assert!(ctx < gate, "화면 관측은 게이트 밖");
         assert!(gate < armed && armed < handed, "탐침 판정은 게이트 안 · 인계 표식 앞");
         let in_gate = &karm[gate..handed];
-        for banned in ["submit_cr_guard_context(", "seat_is_agent_backed(", "observe_prompt(", "load_adapter_defs("] {
+        for banned in
+            ["submit_cr_guard_context(", "seat_is_agent_backed(", "submit_guard_scope(", "observe_prompt(", "load_adapter_defs("]
+        {
             assert!(!in_gate.contains(banned), "게이트 안에서 {banned} — 락 계약(pending_input leaf 만) 위반");
         }
     }
