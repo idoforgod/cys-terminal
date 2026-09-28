@@ -82,7 +82,14 @@ jobs:
       #   v0.14.40(126cfdd0)에는 없다(부재 실측: `TeamPropose` grep -c → 0, `ack_only` 실토큰 0,
       #   설치본 `cys 0.14.40`에 `--help`만 써서 두 명령 모두 rc 2 확인). 두 값 동일 계약이므로
       #   release.yml PACK_MIN_BINARY 와 같은 커밋에서 함께 올린다.
-      PACK_MIN_BINARY_OVERRIDE: '0.14.41'
+      # ★0.14.42 상향(2026-09-27) — 근거는 release.yml PACK_MIN_BINARY 주석과 같다: 이 세대 팩이
+      #   `cys-dept create --team-token`(→ `cys team-token consume|settle|inspect` · cys-dept:1749)·
+      #   `cys feed reply … --team-token`(MASTER_DIRECTIVE.md:356·CEO_TEMPLATE.md:437)·
+      #   `cys usage-report-stdin --agy`(hooks/cys-agy-statusline.sh:12)를 직접 지시하는데 셋 다
+      #   v0.14.41(cecf4c57)에는 없다(부재 실측: `TeamToken|team_token|team-token` grep -c → 0, 릴리스
+      #   0.14.41 바이너리 사본에 `--help` 만 써서 세 명령 모두 rc 2 확인). 두 값 동일 계약이므로
+      #   release.yml PACK_MIN_BINARY 와 같은 커밋에서 함께 올린다.
+      PACK_MIN_BINARY_OVERRIDE: '0.14.42'
     steps:
       - uses: actions/checkout@v4
 

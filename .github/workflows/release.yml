@@ -1082,7 +1082,22 @@ jobs:
       #   "unexpected argument"(상태 변경 없음, --help 만 사용). ≤0.14.40 바이너리는 지시대로
       #   실행하면 죽는다(기능 의존 — RELEASE.md 불변 규칙). pack-release.yml
       #   PACK_MIN_BINARY_OVERRIDE 와 같은 커밋에서 동시 상향(두 값 동일 계약).
-      PACK_MIN_BINARY: '0.14.41'
+      # ★0.14.42 상향(2026-09-27 · 소켓·전달 개선 + 팀 확인창 대화 승인 + 사용량 계정 통합 발행 준비).
+      #   이 세대 팩이 **0.14.42 에 처음 생긴 CLI 표면의 실행을 직접 지시**한다 —
+      #   MASTER_DIRECTIVE.md:351·CEO_TEMPLATE.md:432(`cys-dept create --team-token <토큰>` → cys-dept:1749
+      #   `cys team-token consume|settle|inspect`) · MASTER_DIRECTIVE.md:356·CEO_TEMPLATE.md:437
+      #   (`cys feed reply <id> allow --team-token <토큰>`) · hooks/cys-agy-statusline.sh:12
+      #   (`cys usage-report-stdin --agy`) · hooks/session-start.sh:78(`cys usage-register --source clear` —
+      #   이것만 rc 2 폴백이 있다). 부재 실측(2026-09-27 · v0.14.41=cecf4c57 대조):
+      #   `git show cecf4c57:src/bin/cys.rs | grep -cE 'TeamToken|team_token|team-token'` → 0.
+      #   릴리스 v0.14.41 바이너리 사본(`cys --version` = cys 0.14.41)에 `--help` 만 써서(상태 변경 0 ·
+      #   HOME 샌드박스 · CYS_NO_AUTOSTART=1): `team-token --help` → rc 2 "unrecognized subcommand",
+      #   `usage-report-stdin --agy --help` · `feed reply x allow --team-token t --help` ·
+      #   `usage-register --transcript /x --source clear --help` → 셋 다 rc 2 "unexpected argument"
+      #   (같은 명령이 0.14.42 통합 빌드에서는 rc 0). ≤0.14.41 바이너리는 지시대로 실행하면 죽는다 —
+      #   특히 대화 승인 팀 생성 ①·④ 단계(기능 의존 — RELEASE.md 불변 규칙). pack-release.yml
+      #   PACK_MIN_BINARY_OVERRIDE · docs/RELEASE.md §0-A 2단계 리터럴과 같은 커밋에서 동시 상향(두 값 동일 계약).
+      PACK_MIN_BINARY: '0.14.42'
     steps:
       - uses: actions/checkout@v4
 
