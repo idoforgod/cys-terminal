@@ -5210,8 +5210,8 @@ pub(crate) fn seat_modal_foreground(s: &Arc<crate::state::Surface>) -> bool {
 // 팔뿐이다 — SubmitKey 에 걸면 master 의 승인 Return·cycle `/clear` 가 막힌다(위 doc · X2 불변식).
 //
 // 【규칙 — X2 불변식을 지키는 좁은 판】 writer 가 제출 CR 을 쓰기 **직전**에 화면을 다시 보고, **질문·선택 창이 전경인데
-// 커서행이 우리 기계 본문으로 설명되지 않으면** 그 CR 을 쓰지 않는다(`queue.submit_withheld` 1건). 탐침을 거는 것은
-// 핸들러가 인계 시점에 정한다([`submit_cr_guard_armed`]):
+// 커서가 든 입력 블록이 우리 기계 본문으로 설명되지 않으면** 그 CR 을 쓰지 않는다(`queue.submit_withheld` 1건 · 판정표
+// [`submit_cr_hits_dialog`]). 탐침을 거는 것은 핸들러가 인계 시점에 정한다([`submit_cr_guard_armed`]):
 //   · 줄 위에 CLI 기계 본문(소유 각인 · 사람 바이트 0)이 있다 → 이 Return 은 그 본문을 제출하려는 것이다 → 건다.
 //   · 없고, 이미 창이 보인다 → 보이는 창에 대한 조작(master 승인 · 선택지 조작 뒤 Return)이다 → 걸지 않는다(종전).
 //   · 없고, 창이 안 보인다 → 인계 뒤에 뜨는 창은 이 Return 의 대상이 아니다 → 건다.
@@ -5223,20 +5223,226 @@ pub(crate) fn seat_modal_foreground(s: &Arc<crate::state::Surface>) -> bool {
 // 【남는 창】 마지막 관측과 CR 쓰기 사이(µs) · TUI 가 창을 띄우기로 했으나 아직 그리지 않은 렌더 지연 — 어떤 탐침으로도
 // 남는다(InjectGuard doc 의 '남는 창'과 같은 성질).
 
-/// ★(F1) 순수 — 커서행 입력줄(선두 마커 뒤 · 커서 앞)이 마지막 기계 본문으로 **설명되는가**(포커스가 composer 이고 그
-/// 줄은 우리 글자다). 본문이 선택지 어휘(`1. Yes …`)로 시작하거나 창 문면을 인용하면 모달 판정이 composer 에서도
-/// 양성이 된다 — 그 줄이 우리 본문이면 CR 은 composer 를 제출한다(보류하면 조용한 미제출). 결측·빈 줄은 설명이 아니다.
-pub(crate) fn composer_line_is_machine_body(before_cursor: Option<&str>, body_norm: Option<&str>) -> bool {
-    let Some(before) = before_cursor else {
-        return false;
-    };
-    let screen = crate::state::normalize_input_text(before);
-    !screen.is_empty() && body_norm.is_some_and(|n| n.ends_with(screen.as_str()))
+// ★(0.14.42 · 수정 3회차 FV2-1) 【무엇이 틀렸었나 — 적대 검증 2회차 · 실 claude 2.1.282 · Full 등급 좌석 15/15 보류 · 베이스
+// 0/9】 'composer 가 우리 본문이면 창이 아니다' 예외가 **커서행이 선두 마커로 시작할 때만** 성립했다. 실 claude 는 본문이 한
+// 줄에 다 들어가지 않으면(긴 줄 접힘 · 여러 줄) 커서를 마커 없는 **연속행**(2칸 들여쓰기)에 둔다 → 예외 불성립. 그런데 모달
+// 서명은 본문 첫 줄(`❯ 1. …`)이나 위에 남은 이전 메시지 에코(`❯ 1. …`)에서 나오고, `readiness::modal_left_behind` 는 입력줄이
+// 빈 대기 프롬프트일 때만 과거 서명을 면제한다 → 창이 없는데 제출 Return 을 보류했고, 재제출도 같은 술어라 `wait_dialog` 에
+// 영구히 머물렀다(그 좌석의 큐·H0 생산자·후속 직접 send 정지 · CLI 는 OK).
+// 【규칙】 ① composer 설명은 커서가 든 **입력 블록 전체**([`ComposerBlock`] — 선두 마커 행 ~ 커서 · 공백 무시 · claude
+// 붙여넣기 자리표시 인정)로 본다. ② 그 블록의 주인이 우리 기계 본문이면 포커스는 composer 다 — 블록 **위**의 서명(본문
+// 첫 줄 · 이력 에코)은 전경이 아니고, 블록 **아래**에 그려진 창 서명만 창이다. ③ 보류 기록에 수명 상한
+// ([`WITHHELD_SUBMIT_WAIT_CAP_SECS`]). 공유 전경 술어(`readiness::modal_foreground` — 큐 게이트·부트·재주입)는 바꾸지 않는다
+// (이 판은 '우리 본문을 아는' 두 소비처 — 보류 탐침·재제출 — 에만 있다).
+
+/// ★(0.14.42 · 수정 3회차 FV2-1) 커서가 든 **입력 블록**(composer) — 선두 마커 행(head)부터 커서까지.
+///
+/// 커서행이 선두 마커 행이면 블록은 그 한 행이다(`PromptObs::line` 의 앞 조각과 같다). 아니면 커서행에서 위로 **연속행**
+/// (빈 행 ∨ 공백으로 시작 — claude·codex 의 접힌/여러 줄 입력은 마커 폭만큼 들여 그린다)을 따라 올라가 선두 마커 행을
+/// 찾는다. 괘선·이력 행처럼 공백 아닌 글자로 시작하는 행을 만나거나 화면 위 끝·상한에 닿으면 블록이 아니다(`None` =
+/// 설명 불가 = 종전 판정). 블록이 틀리게 잡혀도 귀결은 '우리 본문으로 설명되지 않음'(= 보류 쪽)뿐이다 — 설명은 블록 전체가
+/// 본문의 꼬리와 글자 단위로 맞아야 성립한다([`composer_block_is_machine_body`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ComposerBlock {
+    /// 선두 마커 뒤 ~ 커서 앞(행 사이 `\n`).
+    pub(crate) before_cursor: String,
+    /// 커서행 **아래** 행들(입력 상자 아래 괘선·상태줄 — 또는 그 아래에 그려진 창).
+    pub(crate) below: String,
+    /// 이 블록을 **빈 대기 프롬프트**로 바꾼 화면 — 블록 위 행 전부 · 선두 행의 마커까지 · `below`.
+    pub(crate) as_empty_prompt: String,
 }
 
-/// ★(F1) 순수 — 지금 CR 을 쓰면 composer 가 아니라 **질문·선택 창**을 누르는가.
-pub(crate) fn submit_cr_hits_dialog(modal_or_selector: bool, composer_is_machine_body: bool) -> bool {
-    modal_or_selector && !composer_is_machine_body
+/// 입력 블록이 거슬러 오를 수 있는 연속행 상한 — 넘으면 블록이 아니다(설명 불가 = 종전 판정).
+const COMPOSER_BLOCK_MAX_ROWS: usize = 200;
+
+/// ★(FV2-1) 순수 — 화면 행(`vt100::Screen::rows`)·커서행·커서행의 커서 앞 조각에서 커서가 든 입력 블록을 찾는다.
+pub(crate) fn composer_block_of(
+    rows: &[String],
+    markers: &[String],
+    cr: usize,
+    before_cursor_row: &str,
+) -> Option<ComposerBlock> {
+    if cr >= rows.len() {
+        return None;
+    }
+    let continuation = |t: &str| t.is_empty() || t.starts_with(char::is_whitespace);
+    let (head, head_prefix, before_cursor) =
+        if let Some((m, idx)) = cys::agent_markers::pick_marker_leading(markers, before_cursor_row) {
+            let k = idx + m.len();
+            (cr, before_cursor_row[..k].to_string(), before_cursor_row[k..].to_string())
+        } else {
+            if !continuation(before_cursor_row) {
+                return None;
+            }
+            let mut parts: Vec<&str> = vec![before_cursor_row];
+            let mut r = cr;
+            loop {
+                if r == 0 || cr - r >= COMPOSER_BLOCK_MAX_ROWS {
+                    return None;
+                }
+                r -= 1;
+                let row = rows[r].as_str();
+                if let Some((m, idx)) = cys::agent_markers::pick_marker_leading(markers, row) {
+                    let k = idx + m.len();
+                    parts.push(&row[k..]);
+                    parts.reverse();
+                    break (r, row[..k].to_string(), parts.join("\n"));
+                }
+                if !continuation(row) {
+                    return None;
+                }
+                parts.push(row);
+            }
+        };
+    let below = rows[cr + 1..].join("\n").trim_end().to_string();
+    let mut as_empty_prompt: String = rows[..head].iter().map(|r| format!("{r}\n")).collect();
+    as_empty_prompt.push_str(&head_prefix);
+    if !below.is_empty() {
+        as_empty_prompt.push('\n');
+        as_empty_prompt.push_str(&below);
+    }
+    Some(ComposerBlock { before_cursor, below, as_empty_prompt })
+}
+
+/// claude 붙여넣기 자리표시(2.1.282 바이너리 실측 문자열 — `[Pasted text #N]` · `[Pasted text #N +M lines]` ·
+/// `[...Truncated text #N +M lines...]` · 800자 초과 ∨ 줄바꿈 2개 초과 붙여넣기)를 **공백 제거 공간**의 맨 앞에서 읽는다 —
+/// 맞으면 그 글자 수. 이미지·오디오 자리표시는 본문이 아니다(인정하지 않는다).
+fn paste_placeholder_len(flat: &[char]) -> Option<usize> {
+    fn lit(f: &[char], i: usize, s: &str) -> Option<usize> {
+        let n = s.chars().count();
+        (f.len() >= i + n && f[i..i + n].iter().copied().eq(s.chars())).then_some(i + n)
+    }
+    fn digits(f: &[char], i: usize) -> Option<usize> {
+        let j = i + f[i.min(f.len())..].iter().take_while(|c| c.is_ascii_digit()).count();
+        (j > i).then_some(j)
+    }
+    if let Some(i) = lit(flat, 0, "[Pastedtext#") {
+        let i = digits(flat, i)?;
+        if let Some(j) = lit(flat, i, "]") {
+            return Some(j);
+        }
+        let i = digits(flat, lit(flat, i, "+")?)?;
+        return lit(flat, i, "lines]");
+    }
+    let i = digits(flat, lit(flat, 0, "[...Truncatedtext#")?)?;
+    let i = digits(flat, lit(flat, i, "+")?)?;
+    lit(flat, i, "lines...]")
+}
+
+/// ★(F1 → 수정 3회차 FV2-1) 순수 — 커서가 든 입력 블록(선두 마커 뒤 ~ 커서 앞 · [`ComposerBlock::before_cursor`])이 마지막
+/// 기계 본문으로 **설명되는가**(포커스가 composer 이고 그 글자는 우리 것이다). 본문이 선택지 어휘(`1. Yes …`)로 시작하거나
+/// 창 문면을 인용하면 모달 판정이 composer 에서도 양성이 된다 — 그 블록이 우리 본문이면 CR 은 composer 를 제출한다(보류하면
+/// 조용한 미제출).
+///
+/// 대조는 **공백을 모두 지운 공간**에서 한다 — 접힌 행의 이음·연속행 들여쓰기·단어 안 줄바꿈(공백 없는 한글·긴 토큰)이
+/// 전부 흡수된다. 블록은 본문의 **꼬리**여야 한다(종전 규칙 — 앞쪽이 화면 밖일 수 있다). claude 붙여넣기 자리표시는 본문의
+/// 한 글자 이상에 대응한다(그 사이 글자 조각은 차례대로 맞아야 한다). 결측·빈 블록은 설명이 아니다(결측은 값이 아니다).
+pub(crate) fn composer_block_is_machine_body(block: Option<&str>, body_norm: Option<&str>) -> bool {
+    let (Some(block), Some(body)) = (block, body_norm) else {
+        return false;
+    };
+    let flat = |t: &str| -> Vec<char> { t.chars().filter(|c| !c.is_whitespace()).collect() };
+    let (b, body) = (flat(block), flat(body));
+    if b.is_empty() || body.is_empty() {
+        return false;
+    }
+    // 블록 = 글자 조각(Some)과 자리표시(None)의 열.
+    let mut toks: Vec<Option<Vec<char>>> = Vec::new();
+    let (mut cur, mut i) = (Vec::new(), 0usize);
+    while i < b.len() {
+        if b[i] == '[' {
+            if let Some(n) = paste_placeholder_len(&b[i..]) {
+                if !cur.is_empty() {
+                    toks.push(Some(std::mem::take(&mut cur)));
+                }
+                toks.push(None);
+                i += n;
+                continue;
+            }
+        }
+        cur.push(b[i]);
+        i += 1;
+    }
+    if !cur.is_empty() {
+        toks.push(Some(cur));
+    }
+    // 오른쪽부터 탐욕(가장 오른쪽 위치) 대조 — 맨 오른쪽 조각은 본문 끝에 붙고, 자리표시는 한 글자 이상을 먹는다.
+    let (mut end, mut gap, mut anchored) = (body.len(), 0usize, true);
+    for t in toks.iter().rev() {
+        match t {
+            None => {
+                gap += 1;
+                anchored = false;
+            }
+            Some(lit) => {
+                let Some(limit) = end.checked_sub(gap) else {
+                    return false;
+                };
+                if limit < lit.len() {
+                    return false;
+                }
+                let at = if anchored {
+                    (body[limit - lit.len()..limit] == lit[..]).then_some(limit - lit.len())
+                } else {
+                    (0..=limit - lit.len()).rev().find(|&j| body[j..j + lit.len()] == lit[..])
+                };
+                let Some(at) = at else {
+                    return false;
+                };
+                end = at;
+                gap = 0;
+                anchored = false;
+            }
+        }
+    }
+    end >= gap
+}
+
+/// ★(F1 → 수정 3회차 FV2-1) 순수 — 지금 CR 을 쓰면 composer 가 아니라 **질문·선택 창**을 누르는가.
+/// `dialog_on_screen` = 등급별 화면 판정(Full: 전경 창 서명 ∨ 커서 선택지 행 · SelectorRowOnly: 커서 선택지 행).
+/// `own_composer` = 커서가 든 입력 블록이 우리 기계 본문([`composer_block_is_machine_body`]) — 그러면 포커스는 composer 다:
+/// 블록 위의 서명(본문 첫 줄의 `❯ 1.` · 이력 에코)은 전경이 아니고, 블록 **아래**에 그려진 창 서명(`dialog_below`)만 창이다
+/// (Full 등급 · SelectorRowOnly 는 커서 선택지 행만 보므로 composer 안의 커서는 창이 아니다).
+pub(crate) fn submit_cr_hits_dialog(
+    scope: SubmitGuardScope,
+    dialog_on_screen: bool,
+    own_composer: bool,
+    dialog_below: bool,
+) -> bool {
+    match scope {
+        SubmitGuardScope::Off => false,
+        SubmitGuardScope::Full if own_composer => dialog_below,
+        SubmitGuardScope::SelectorRowOnly if own_composer => false,
+        SubmitGuardScope::Full | SubmitGuardScope::SelectorRowOnly => dialog_on_screen,
+    }
+}
+
+/// ★(FV2-1) 한 관측(같은 프레임)에서 낸 제출 CR 판정 — 보류 탐침·인계 재료·재제출 공용(판정 분리 금지).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubmitCrVerdict {
+    /// 지금 CR 을 쓰면 창을 누른다.
+    hits: bool,
+    /// 커서가 든 입력 블록이 우리 기계 본문이다.
+    own: bool,
+}
+
+fn submit_cr_verdict(scope: SubmitGuardScope, obs: &PromptObs, body_norm: Option<&str>) -> SubmitCrVerdict {
+    let own = composer_block_is_machine_body(obs.block.as_ref().map(|b| b.before_cursor.as_str()), body_norm);
+    let marker = (!obs.marker.is_empty()).then_some(obs.marker.as_str());
+    let (dialog_on_screen, dialog_below) = if own {
+        let below = obs.block.as_ref().is_some_and(|b| {
+            !b.below.is_empty() && cys::readiness::modal_signature_with_marker(&b.below, marker).is_some()
+        });
+        (false, below)
+    } else {
+        let on_screen = match scope {
+            SubmitGuardScope::Full => obs_modal_foreground(obs),
+            SubmitGuardScope::SelectorRowOnly => obs.selector_row,
+            SubmitGuardScope::Off => false,
+        };
+        (on_screen, false)
+    };
+    SubmitCrVerdict { hits: submit_cr_hits_dialog(scope, dialog_on_screen, own, dialog_below), own }
 }
 
 /// ★(F1) 순수 — 이 제출 CR 에 보류 탐침을 거는가(`Some(근거)`) · 걸지 않는가(`None` = 종전 동작).
@@ -5313,23 +5519,9 @@ fn observe_submit_cr_hits_dialog(s: &Arc<crate::state::Surface>, markers: &[Stri
     if scope == SubmitGuardScope::Off {
         return false;
     }
-    let obs = observe_prompt(s, markers);
-    let dialog = match scope {
-        SubmitGuardScope::Full => obs_modal_foreground(&obs),
-        SubmitGuardScope::SelectorRowOnly => obs.selector_row,
-        SubmitGuardScope::Off => false,
-    };
-    if !dialog {
-        return false;
-    }
+    let obs = observe_prompt_block(s, markers);
     let body = s.inject_track.last_body();
-    submit_cr_hits_dialog(
-        true,
-        composer_line_is_machine_body(
-            obs.line.as_ref().map(|(before, _)| before.as_str()),
-            body.as_ref().map(|b| b.norm.as_str()),
-        ),
-    )
+    submit_cr_verdict(scope, &obs, body.as_ref().map(|b| b.norm.as_str())).hits
 }
 
 /// ★(F1) 제출 CR 보류의 인계 시점 재료 — 핸들러가 `input_gate` **밖**에서 1회 만든다(어댑터·파서 락).
@@ -5405,6 +5597,14 @@ pub(crate) fn submit_cr_withhold_probe(
     })
 }
 
+/// ★(0.14.42 · 수정 3회차 FV2-1 ⓒ) 보류 기록의 **수명 상한**(초) — 재제출이 창(또는 창으로 보이는 화면)·입력줄·프롬프트
+/// 경계를 기다리는 동안의 상한. 넘으면 기록을 버리고 사유 `wait_cap` 을 1건 발행한다(쓰기 0 — 상한은 '다시 쓰지 않음'
+/// 쪽으로만 끝낸다 · 폭주 방지 장치 무변경). 종전 상한은 큐 TTL(6h)뿐이라 오판 한 번이 여섯 시간짜리 대기 기록이 됐다
+/// (FV2-1 W1dL: 160초 뒤에도 wait_dialog). 값은 사이클 창 보류 상한(`queue_quiesce_hold_secs` 기본 600s)과 같은 자다 — 사람이
+/// 창에 답하면 기록은 이미 `human` 으로 버려지고, master 승인은 분 단위다. 버린 뒤 입력줄에 남은 본문은 기존 잔여 처리
+/// (데몬 주입의 병합 제출 · 사람)를 탄다.
+pub(crate) const WITHHELD_SUBMIT_WAIT_CAP_SECS: u64 = 600;
+
 /// ★(0.14.42 · 수정 2회차 F1 · 재개 S91) 보류한 제출 CR 의 **재제출** — watchdog 틱(5초)마다 한 번(큐 배달 앞).
 ///
 /// 【왜】 보류한 CR 은 writer 가 버려 본문이 입력줄에 남는다. 큐 틱은 화면 입력줄 점유를 사람 초안과 똑같이 보아
@@ -5417,7 +5617,11 @@ pub(crate) fn submit_cr_withhold_probe(
 /// 같은 프롬프트 경계 판정(입력줄 점유 축만 뺀다 — 점유의 주인이 바로 이 본문이다)이 통과. 쓰기는 제출 CR 과 같은 길
 /// (`SubmitAfterGap` · 최소 간격 · 쓰기 직전 보류 탐침 — 그 사이 창이 다시 뜨면 또 보류하고 기록이 다시 선다)이고
 /// input_gate 안에서 넘긴다(직접 send 와 직렬). 기록이 무효가 되면(새 기계 본문 · 사람 손 · 입력줄 비었음 · 등급 Off ·
-/// 킬 스위치 · 상한 = 큐 TTL) 지우고 사유를 1건 발행한다(`queue.submit_withheld_dropped`). 폭주 0: 기록 1건 = 쓰기 최대 1회.
+/// 킬 스위치 · 큐 TTL · 수명 상한 [`WITHHELD_SUBMIT_WAIT_CAP_SECS`]) 지우고 사유를 1건 발행한다(`queue.submit_withheld_dropped`).
+/// 폭주 0: 기록 1건 = 쓰기 최대 1회.
+/// ★(수정 3회차 FV2-1) '입력줄이 그 본문 그대로'·'창 없음'은 보류 탐침과 **같은 판정**([`submit_cr_verdict`] — 커서가 든 입력
+/// 블록 전체 · 블록 위 서명은 전경 아님)이다. 종전에는 본문 첫 줄의 `❯ 1.`·이력 에코를 창으로 보아 `wait_dialog` 에 영구히
+/// 머물렀다(실 claude · 접힌 줄·여러 줄 본문).
 pub(crate) fn resubmit_withheld_submits(daemon: &Arc<Daemon>) {
     if daemon.paused.load(Ordering::Relaxed) {
         return;
@@ -5458,8 +5662,13 @@ fn resubmit_withheld_one(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -
         why
     };
     let ttl = crate::state::queue_ttl_default_secs();
-    if ttl > 0 && w.at.elapsed().as_secs() >= ttl {
+    let age = w.at.elapsed().as_secs();
+    if ttl > 0 && age >= ttl {
         return drop_it("expired");
+    }
+    // ★(수정 3회차 FV2-1 ⓒ) 기록 수명 상한 — 창(또는 창으로 보이는 화면)·입력줄·경계를 무기한 기다리지 않는다.
+    if age >= WITHHELD_SUBMIT_WAIT_CAP_SECS {
+        return drop_it("wait_cap");
     }
     if crate::handlers::send_settle_disabled(daemon) {
         return drop_it("kill_switch");
@@ -5490,25 +5699,29 @@ fn resubmit_withheld_one(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -
     if markers.is_empty() {
         return drop_it("unobservable");
     }
-    let obs = observe_prompt(s, &markers);
-    let dialog = match scope {
-        SubmitGuardScope::Full => obs_modal_foreground(&obs),
-        SubmitGuardScope::SelectorRowOnly => obs.selector_row,
-        SubmitGuardScope::Off => false,
-    };
-    if dialog || approval_or_gate_pending(daemon, s.id) {
+    let obs = observe_prompt_block(s, &markers);
+    let v = submit_cr_verdict(scope, &obs, Some(body.norm.as_str()));
+    if v.hits || approval_or_gate_pending(daemon, s.id) {
         return "wait_dialog";
     }
-    let before = obs.line.as_ref().map(|(b, _)| b.as_str());
-    if !composer_line_is_machine_body(before, Some(body.norm.as_str())) {
-        // 커서행이 선두 마커 뒤 빈 줄이면 누가 이미 제출·정리했다 — 기록은 끝났다. 그 밖(작업 출력 중 · 커서가 딴 데)은 기다린다.
-        if before.is_some_and(|b| crate::state::normalize_input_text(b).is_empty()) {
+    if !v.own {
+        // 커서가 든 입력 블록이 선두 마커 뒤 빈 줄이면 누가 이미 제출·정리했다 — 기록은 끝났다. 그 밖(작업 출력 중 · 커서가
+        // 딴 데)은 기다린다.
+        if obs.block.as_ref().is_some_and(|b| b.before_cursor.trim().is_empty()) {
             return drop_it("line_empty");
         }
         return "wait_line";
     }
-    let mut gate = prompt_gate_input(daemon, s, obs.marker.as_str(), placeholder.as_deref(), &obs);
+    // ★(수정 3회차 FV2-1 ②) 입력 블록의 주인이 이 본문이다 — 프롬프트 경계는 그 블록을 **빈 대기 프롬프트로 본 화면**에서
+    //   잰다(입력줄 점유의 주인이 바로 이 본문이고, 블록 위 서명은 전경이 아니며, 대체화면의 레이아웃 양성 증거 — 입력 상자
+    //   아래 괘선·상태줄 — 는 접힌 본문 연속행이 아니라 블록 아래에 있다). 블록 아래 창 서명은 위 `v.hits` 가 이미 걸렀다.
+    let Some(view) = obs.with_block_emptied() else {
+        return "wait_line";
+    };
+    let mut gate = prompt_gate_input(daemon, s, view.marker.as_str(), placeholder.as_deref(), &view);
     gate.input = InputLine::Empty;
+    gate.modal_foreground = false;
+    gate.selector_row = false;
     if prompt_gate_verdict(&gate) != PromptGate::Ready {
         return "wait_prompt";
     }
@@ -6630,6 +6843,9 @@ pub(crate) struct PromptObs {
     /// 스냅샷 시점의 대체화면 여부 — 화면과 **같은 관측**에서 읽는다(종전에는 판정 조립부가 따로
     /// 읽어, alt-screen 시절 화면을 비-alt 분기로 고르는 합성이 가능했다 · codex R5).
     pub(crate) alt_screen: bool,
+    /// ★(0.14.42 · 수정 3회차 FV2-1) 커서가 든 **입력 블록**([`ComposerBlock`]) — 요청한 관측([`observe_prompt_block`])만
+    /// 채운다(큐 틱 등 나머지 관측은 `None` · 비용 0). 커서가 입력 블록 안이 아니면 `None`.
+    pub(crate) block: Option<ComposerBlock>,
 }
 
 impl PromptObs {
@@ -6650,9 +6866,32 @@ impl PromptObs {
     pub(crate) fn frame_consistent(&self) -> bool {
         self.frame_published() && self.output_gen == self.output_gen_after
     }
+    /// ★(0.14.42 · 수정 3회차 FV2-1) 커서가 든 입력 블록을 **빈 대기 프롬프트**로 본 관측(화면 = [`ComposerBlock::as_empty_prompt`] ·
+    /// 커서행 = 마커 뒤 빈 줄 · 선택지 행 아님). 세대·정적·대체화면·작업 중 어휘는 같은 관측 그대로다. 블록이 없으면 `None`.
+    /// 소비처는 재제출 하나다 — 블록 주인이 우리 기계 본문으로 입증된 뒤에만 부른다.
+    pub(crate) fn with_block_emptied(&self) -> Option<PromptObs> {
+        let b = self.block.as_ref()?;
+        Some(PromptObs {
+            screen: b.as_empty_prompt.clone(),
+            line: Some((String::new(), String::new())),
+            selector_row: false,
+            block: None,
+            ..self.clone()
+        })
+    }
 }
 
 fn observe_prompt(s: &Arc<crate::state::Surface>, markers: &[String]) -> PromptObs {
+    observe_prompt_ext(s, markers, false)
+}
+
+/// ★(0.14.42 · 수정 3회차 FV2-1) [`observe_prompt`] + 커서가 든 입력 블록([`PromptObs::block`]) — 같은 파서 락 한 번(같은
+/// 프레임). 제출 CR 보류 탐침·재제출만 부른다(행 전량을 한 번 더 읽는 비용을 큐 틱에 얹지 않는다).
+fn observe_prompt_block(s: &Arc<crate::state::Surface>, markers: &[String]) -> PromptObs {
+    observe_prompt_ext(s, markers, true)
+}
+
+fn observe_prompt_ext(s: &Arc<crate::state::Surface>, markers: &[String], want_block: bool) -> PromptObs {
     // ★(0.14.31 · 리뷰 R5 · codex major) 세대는 파서 락 **밖·앞**에서 읽는다. 락 안에서 읽으면
     //   "락을 기다리는 동안 reader 가 새 청크를 반영했다" 는 창이 관측에 흡수돼 보이지 않는다 —
     //   밖에서 읽으면 그 변화까지 세대 불일치로 **거부**되므로 엄밀히 더 보수적이다. 발행 중(홀수)도
@@ -6682,6 +6921,7 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, markers: &[String]) -> PromptO
             output_gen_after,
             quiet_secs,
             alt_screen,
+            block: None,
         };
     }
     let before_all = screen.contents_between(cr, 0, cr, cc);
@@ -6716,6 +6956,12 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, markers: &[String]) -> PromptO
     let hi = (cr + PROMPT_BUSY_ROWS).min(rows.saturating_sub(1));
     let near = screen.contents_between(lo, 0, hi, cols).to_lowercase();
     let busy_near_cursor = PROMPT_BUSY_TOKENS.iter().any(|t| near.contains(t));
+    let block = if want_block {
+        let rows_text: Vec<String> = screen.rows(0, cols).collect();
+        composer_block_of(&rows_text, markers, usize::from(cr), &before_all)
+    } else {
+        None
+    };
     drop(p);
     let (quiet_secs, alt_screen, output_gen_after) = observe_tail(s);
     PromptObs {
@@ -6729,6 +6975,7 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, markers: &[String]) -> PromptO
         output_gen_after,
         quiet_secs,
         alt_screen,
+        block,
     }
 }
 
@@ -15040,6 +15287,7 @@ mod tests {
             output_gen_after: 2,
             quiet_secs,
             alt_screen: true,
+            block: None,
         };
         for knob in ["1", "3", "30"] {
             let _knob = QueueEnvGuard::set(&[("CYS_QUEUE_QUIET_SECS", knob)]);
@@ -20962,7 +21210,7 @@ mod reflect_queue_tests {
     #[test]
     fn f1_submit_cr_guard_pure_tables() {
         use super::{
-            composer_line_is_machine_body as own, submit_cr_guard_armed as armed, submit_cr_hits_dialog as hits,
+            composer_block_is_machine_body as own, submit_cr_guard_armed as armed, submit_cr_hits_dialog as hits,
         };
         assert!(own(Some("1. Yes please"), Some("1. Yes please")), "선택지 어휘로 시작해도 우리 본문이면 composer");
         assert!(own(Some(" M|x|AAA "), Some("M|x|AAA")), "양끝 공백 정규화");
@@ -20971,9 +21219,13 @@ mod reflect_queue_tests {
         assert!(!own(None, Some("x")), "커서행 선두 마커 없음(결측)은 설명이 아니다");
         assert!(!own(Some("   "), Some("x")), "빈 줄은 설명이 아니다");
         assert!(!own(Some("x"), None), "본문 기록 결측은 설명이 아니다(결측은 값이 아니다)");
-        assert!(hits(true, false), "창 전경 ∧ composer 아님 → 누른다");
-        assert!(!hits(true, true), "우리 본문 composer → 제출");
-        assert!(!hits(false, false) && !hits(false, true), "창 없음 → 제출");
+        use super::SubmitGuardScope::{Full, Off, SelectorRowOnly as Sel};
+        assert!(hits(Full, true, false, false), "창 전경 ∧ composer 아님 → 누른다");
+        assert!(!hits(Full, true, true, false), "우리 본문 composer(블록 위 서명은 전경 아님) → 제출");
+        assert!(hits(Full, false, true, true), "우리 composer 아래에 그려진 창 서명 → 누른다(보류)");
+        assert!(!hits(Full, false, false, false) && !hits(Full, false, true, false), "창 없음 → 제출");
+        assert!(hits(Sel, true, false, false) && !hits(Sel, true, true, true), "낡은 Empty 좌석: 커서 선택지 행만 · composer 안이면 아니다");
+        assert!(!hits(Off, true, false, true), "대상 밖 좌석 → 종전(쓴다)");
         assert_eq!(armed(true, true), Some("machine_body"), "본문 뒤·Return 앞에 뜬 창 — 발신자가 본 적 없는 창");
         assert_eq!(armed(true, false), Some("machine_body"));
         assert_eq!(armed(false, false), Some("no_dialog_at_handoff"), "인계 뒤에 뜰 창은 이 Return 의 대상이 아니다");
@@ -20989,6 +21241,95 @@ mod reflect_queue_tests {
         assert_eq!(scope(false, true, true, false, false, E), G::Off, "종료된 좌석 — 종전");
         assert_eq!(scope(false, false, false, false, false, E), G::Off, "셸 좌석(meta 없음) — 종전");
         assert_eq!(scope(false, true, false, true, false, O), G::Off, "backed 거짓의 다른 이유(종료 통지)는 구제하지 않는다");
+    }
+
+    /// ★(0.14.42 · 수정 3회차 FV2-1) 입력 블록 대조 표 — 공백 무시(접힌 행 이음·들여쓰기·단어 안 줄바꿈) · 꼬리 규칙 ·
+    /// claude 붙여넣기 자리표시(2.1.282 바이너리 실측 문자열). 음성: 창 행·사람 글자·순서 어긋남·이미지 자리표시.
+    #[test]
+    fn fv2_composer_block_matcher_table() {
+        use super::composer_block_is_machine_body as own;
+        let w1 = "1. W1BODY please review the following status report carefully and reply with a short acknowledgement when done";
+        assert!(
+            own(Some("1. W1BODY please review the following status report carefully and reply\n  with a short acknowledgement when done"), Some(w1)),
+            "접힌 두 행(연속행 2칸 들여쓰기)"
+        );
+        assert!(own(Some("1. MLBODY first\n  2. second\n  3. third"), Some("1. MLBODY first 2. second 3. third")), "여러 줄 번호 목록");
+        assert!(own(Some("1. 다음상태보고서를주의\n  깊게검토하고"), Some("1. 다음상태보고서를주의깊게검토하고")), "단어 안 줄바꿈(한글 무공백)");
+        assert!(own(Some("with a short acknowledgement when done"), Some(w1)), "블록은 본문의 꼬리(앞쪽 화면 밖)");
+        assert!(own(Some("[Pasted text #1 +3 lines] "), Some("a b c d")), "붙여넣기 자리표시 = 본문 한 글자 이상");
+        assert!(own(Some("[Pasted text #12]"), Some("x")), "줄 수 없는 자리표시(0줄)");
+        assert!(own(Some("[Pasted text #1 +3\n  lines]"), Some("x")), "접힌 자리표시");
+        assert!(own(Some("[...Truncated text #2 +40 lines...]"), Some("x")), "잘림 자리표시");
+        assert!(own(Some("intro [Pasted text #1 +3 lines] outro"), Some("intro pasted body lines outro")), "앞뒤 글자 + 자리표시");
+        assert!(own(Some("[Pasted text #1 +3 lines][Pasted text #2]"), Some("ab")), "연속 자리표시 = 각 한 글자 이상");
+        assert!(!own(Some("[Pasted text #1 +3 lines][Pasted text #2]"), Some("a")), "연속 자리표시가 본문보다 많다");
+        assert!(!own(Some("intro [Pasted text #1 +3 lines] outro"), Some("intro outro")), "자리표시는 빈 글자에 대응하지 않는다");
+        assert!(!own(Some("outro [Pasted text #1 +3 lines] intro"), Some("intro body outro")), "조각 순서 어긋남");
+        assert!(!own(Some("[Image #1]"), Some("x")), "이미지 자리표시는 본문이 아니다");
+        assert!(!own(Some("1. Yes\n   2. No"), Some(w1)), "창의 선택지 행 묶음은 우리 본문이 아니다");
+        assert!(!own(Some("human typed tail"), Some(w1)), "본문 꼬리가 아닌 글자(사람 초안 등)");
+        assert!(!own(Some("\n  \n"), Some(w1)), "공백뿐인 블록");
+    }
+
+    /// ★(0.14.42 · 수정 3회차 FV2-1) 입력 블록 찾기 표 — 커서행이 선두 마커 행 · 연속행(접힘·여러 줄 · 빈 행) · 블록 아님
+    /// (괘선·이력 행·창 아래 셸)과 '빈 대기 프롬프트로 본 화면'.
+    #[test]
+    fn fv2_composer_block_of_table() {
+        use super::composer_block_of as block;
+        let m = vec!["❯".to_string()];
+        let rows = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let rule = "────────────────────";
+        // 한 행 composer — 종전 `line` 과 같다.
+        let r = rows(&["❯ 1. earlier", "⏺ ok", rule, "❯ hello", rule, "  ⏸ manual mode on"]);
+        let b = block(&r, &m, 3, "❯ hello").expect("한 행 블록");
+        assert_eq!(b.before_cursor, " hello");
+        assert_eq!(b.below, format!("{rule}\n  ⏸ manual mode on"));
+        assert_eq!(b.as_empty_prompt, format!("❯ 1. earlier\n⏺ ok\n{rule}\n❯\n{rule}\n  ⏸ manual mode on"));
+        // 접힌 본문 — 커서가 마지막 연속행 · 위에 이전 번호 메시지 에코(FV2-1 W1·W2d 형상).
+        let v = [
+            "❯ 1. earlier item",
+            "⏺ ok",
+            rule,
+            "❯ 1. W1BODY please review",
+            "  the following report",
+            "  when done",
+            rule,
+            "  ⏸ manual mode on",
+        ];
+        let r = rows(&v);
+        let b = block(&r, &m, 5, "  when done").expect("접힌 블록");
+        assert_eq!(b.before_cursor, " 1. W1BODY please review\n  the following report\n  when done");
+        assert_eq!(b.as_empty_prompt, format!("❯ 1. earlier item\n⏺ ok\n{rule}\n❯\n{rule}\n  ⏸ manual mode on"));
+        assert!(
+            cys::readiness::modal_foreground(&v.join("\n"), Some("❯")).is_some(),
+            "형상 대조 실패: 원 화면이 공유 전경 술어에서 양성이 아니다(아래 대조가 무의미)"
+        );
+        assert!(
+            cys::readiness::modal_foreground(&b.as_empty_prompt, Some("❯")).is_none(),
+            "빈 대기 프롬프트로 본 화면에 본문 첫 줄·이력 에코의 서명이 전경으로 남았다"
+        );
+        // 빈 행이 낀 여러 줄 본문.
+        let r = rows(&["❯ para one", "", "  para two"]);
+        assert_eq!(block(&r, &m, 2, "  para two").expect("빈 행 포함").before_cursor, " para one\n\n  para two");
+        // 블록 아님 — 커서가 상태줄(위가 괘선) · 셸 프롬프트 행(공백 아닌 글자로 시작) · 화면 위 끝까지 마커 없음.
+        let r = rows(&[rule, "❯ x", rule, "  ⏸ manual mode on"]);
+        assert_eq!(block(&r, &m, 3, "  ⏸ manual mode on"), None, "괘선을 넘어 오르지 않는다");
+        let r = rows(&[" Do you want to proceed?", " ❯ 1. Yes", "   2. No", "user@host ~ % claude --resume x"]);
+        assert_eq!(block(&r, &m, 3, "user@host ~ % claude --resume x"), None, "셸 프롬프트 행은 연속행이 아니다");
+        let r = rows(&["  a", "  b"]);
+        assert_eq!(block(&r, &m, 1, "  b"), None, "위 끝까지 선두 마커 없음");
+        // 창의 아래 선택지(들여쓴 행)에 커서 — 블록은 잡히지만 창 문면이라 우리 본문으로 설명되지 않는다.
+        let r = rows(&[" Do you want to proceed?", " ❯ 1. Yes", "   2. No"]);
+        let b = block(&r, &m, 2, "   2. No").expect("창 행 블록");
+        assert!(!super::composer_block_is_machine_body(Some(b.before_cursor.as_str()), Some("M|x|AAA")));
+        assert_eq!(block(&r, &m, 9, "x"), None, "커서행이 화면 밖");
+    }
+
+    /// ★(0.14.42 · 수정 3회차 FV2-1 ⓒ) 보류 기록 수명 상한 핀 — 큐 TTL(6h)보다 훨씬 짧고(분 단위), 사이클 창 보류 상한과 같은 자.
+    #[test]
+    fn fv2_withheld_wait_cap_is_bounded() {
+        assert_eq!(super::WITHHELD_SUBMIT_WAIT_CAP_SECS, 600);
+        assert!(super::WITHHELD_SUBMIT_WAIT_CAP_SECS < crate::state::QUEUE_TTL_DEFAULT_SECS);
     }
 
     /// ★(0.14.42 · 수정 2회차 F1) writer 보류 탐침 — 빈 composer·우리 본문 composer 는 통과, 창이면 보류(이벤트 1건),

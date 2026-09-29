@@ -734,3 +734,282 @@ fn f1_shell_seat_submit_cr_unchanged() {
     assert!(o.since_written_ms.is_some(), "셸 좌석은 종전처럼 쓴다: {o:?}");
     assert!(withheld(&fx).is_empty());
 }
+
+// ═══════════ ★(0.14.42 · 수정 3회차 FV2-1) 접힌 줄·여러 줄 기계 본문의 제출 CR 을 창으로 오인하지 않는다 ═══════════
+//
+// 【무엇이 틀렸었나 — 적대 검증 2회차 FV2-1 · 실 claude 2.1.282 · Full 등급 좌석 15/15 보류(베이스 0/9)】 보류 탐침의
+// '우리 본문이면 창이 아니다' 예외는 **커서행이 선두 마커로 시작할 때만** 성립했다. 실 claude 는 본문이 한 줄에 다 들어가지
+// 않으면(긴 줄이 접힘 · 여러 줄) 커서를 마커 없는 **연속행**(2칸 들여쓰기)에 둔다 → 예외 불성립. 그런데 화면의 모달 어휘는
+// 본문 첫 줄(`❯ 1. …`)이나 위에 남은 이전 메시지 에코(`❯ 1. …`)에서 나오고, `modal_left_behind` 는 입력줄이 빈 대기
+// 프롬프트일 때만 과거 서명을 면제한다 → 창이 없는데 제출 Return 을 보류했다. 재제출도 같은 술어라 `wait_dialog` 에
+// 영구히 머물렀고(상한 = 큐 TTL 6h) 그동안 그 좌석의 큐·H0 생산자·후속 직접 send 가 모두 섰다.
+// 【규칙】 ① composer 설명은 **입력 블록 전체**(선두 마커 행 ~ 커서 · 연속행 이음 · 공백 무시 · claude 붙여넣기 자리표시
+// `[Pasted text #N …]` 인정)로 본다. ② 입력 블록의 주인이 우리 기계 본문이면 그 블록 **위**의 서명은 전경이 아니다 —
+// 블록 **아래**에 그려진 창 서명만 창이다. ③ 재제출 대기에 상한(기록 수명)을 둔다(넘으면 사유 이벤트와 함께 기록을 버린다).
+// 창을 누르는 보호(본문 뒤·Return 앞에 뜬 창 · 커서가 창 행)는 그대로다(아래 음성 대조).
+
+const RULE78: &str = "──────────────────────────────────────────────────────────────────────────────";
+
+fn wcol(c: char) -> usize {
+    if c.is_ascii() {
+        1
+    } else {
+        2
+    }
+}
+
+/// 한 논리 줄을 표시 폭 `width` 로 접는다 — 단어 경계(공백) 우선, 한 단어가 폭을 넘으면 글자 경계(한글 무공백·긴 토큰).
+fn fold(line: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let (mut cur, mut cw) = (String::new(), 0usize);
+    for word in line.split(' ') {
+        let ww: usize = word.chars().map(wcol).sum();
+        if !cur.is_empty() && cw + 1 + ww <= width {
+            cur.push(' ');
+            cur.push_str(word);
+            cw += 1 + ww;
+            continue;
+        }
+        if !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+            cw = 0;
+        }
+        for c in word.chars() {
+            if cw + wcol(c) > width {
+                out.push(std::mem::take(&mut cur));
+                cw = 0;
+            }
+            cur.push(c);
+            cw += wcol(c);
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// 실 claude 2.1.282 입력 상자 형상(fatal-v2 실측 screen-end) — 이력 행들 · 괘선 · 첫 행 `❯ ` · 접힌/여러 줄 연속행은
+/// 2칸 들여쓰기 · 괘선 · 상태줄 · (선택) 입력 상자 아래에 더 그린 행들. 커서는 본문 끝(마지막 composer 행의 글자 뒤).
+/// 반환 = (행들, 커서 행, 커서 열).
+fn claude_screen(history: &[&str], composer: &str, below_extra: &[&str]) -> (Vec<String>, u16, u16) {
+    let mut rows: Vec<String> = history.iter().map(|s| s.to_string()).collect();
+    rows.push(RULE78.to_string());
+    let mut first = true;
+    let (mut crow, mut ccol) = (0usize, 0usize);
+    for logical in composer.split('\n') {
+        for seg in fold(logical, 74) {
+            let prefix = if first { "❯ " } else { "  " };
+            first = false;
+            ccol = 2 + seg.chars().map(wcol).sum::<usize>();
+            rows.push(format!("{prefix}{seg}"));
+            crow = rows.len() - 1;
+        }
+    }
+    rows.push(RULE78.to_string());
+    rows.push("  ⏸ manual mode on".to_string());
+    rows.extend(below_extra.iter().map(|s| s.to_string()));
+    assert!(rows.len() <= 24, "픽스처가 24행 좌석을 넘는다: {}", rows.len());
+    (rows, crow as u16, ccol as u16)
+}
+
+fn paint_rows(t: &Arc<Surface>, sc: &(Vec<String>, u16, u16)) {
+    let lines: Vec<&str> = sc.0.iter().map(|s| s.as_str()).collect();
+    paint(t, &lines, sc.1, sc.2);
+}
+
+const W1: &str = "1. W1BODY please review the following status report carefully and reply with a short \
+                  acknowledgement when done please review the following status report carefully and reply \
+                  with a short acknowledgement when done";
+
+/// 발신 좌석의 본문 → (에코가 파서에 닿은 뒤) 화면 `sc` → 짝 Return. 반환 = CR 소비 뒤 관측.
+fn body_then_return(fx: &Fx, t: &Arc<Surface>, from: u32, body: &str, sc: &(Vec<String>, u16, u16)) -> crate::state::SubmitSettleObs {
+    let r = direct(fx, Some(from), t, body);
+    assert_eq!(r["ok"], json!(true), "전제: 본문 직접 send 통과: {r}");
+    std::thread::sleep(Duration::from_millis(60));
+    paint_rows(t, sc);
+    assert_eq!(pair_return(fx, Some(from), t)["result"]["sent"], json!(true));
+    let o = wait_submit_consumed(t);
+    assert!(!o.inflight, "writer 가 CR 요청을 소비했다: {o:?}");
+    o
+}
+
+/// 적색→녹색(FV2-1 W1·W1d·W1dL·W1dC·W1dS*): 번호로 시작하는 긴 본문이 접혀 커서가 연속행 — 창 없음. 종전: 보류(15/15).
+#[test]
+fn fv2_wrapped_numbered_body_on_full_seat_is_submitted() {
+    let fx = fx("fv2-w1");
+    let t = agent_pane_settled(&fx, "worker-1", P + 300);
+    let _x = pane(&fx, "worker-2", P + 301);
+    let sc = claude_screen(&[], W1, &[]);
+    assert!(sc.0.len() >= 5, "전제: 본문이 접혔다(연속행 ≥2): {:?}", sc.0);
+    let o = body_then_return(&fx, &t, P + 301, W1, &sc);
+    assert!(o.since_written_ms.is_some(), "창이 없는데 접힌 우리 본문의 제출 CR 을 보류했다(FV2-1): {o:?}");
+    assert!(withheld(&fx).is_empty(), "{:?}", withheld(&fx));
+}
+
+/// 적색→녹색(FV2-1 W2d): 위에 이전 메시지 에코 `❯ 1. …` 가 남은 화면 + 번호 없는 긴 본문(접힘). 종전: 보류.
+#[test]
+fn fv2_wrapped_body_under_numbered_echo_is_submitted() {
+    let fx = fx("fv2-w2");
+    let t = agent_pane_settled(&fx, "worker-1", P + 302);
+    let _x = pane(&fx, "worker-2", P + 303);
+    let body = "W2LONG please review the following status report carefully and reply with a short \
+                acknowledgement when done please review the following status report carefully";
+    let sc = claude_screen(&["❯ 1. W2SHORT item", "", "⏺ ok", "", "✻ Cooked for 0s · done 7:23 PM"], body, &[]);
+    let o = body_then_return(&fx, &t, P + 303, body, &sc);
+    assert!(o.since_written_ms.is_some(), "이력 에코 서명으로 접힌 우리 본문의 제출 CR 을 보류했다(FV2-1 W2d): {o:?}");
+    assert!(withheld(&fx).is_empty(), "{:?}", withheld(&fx));
+}
+
+/// 적색→녹색(FV2-1 M1·M1d): 3줄 번호 목록 — 줄마다 연속행 · 커서는 마지막 줄 끝. 종전: 보류.
+#[test]
+fn fv2_multiline_numbered_body_is_submitted() {
+    let fx = fx("fv2-m1");
+    let t = agent_pane_settled(&fx, "worker-1", P + 304);
+    let _x = pane(&fx, "worker-2", P + 305);
+    let body = "1. MLBODY first item of the report\n2. second item of the report\n3. third item of the report";
+    let sc = claude_screen(&[], body, &[]);
+    let o = body_then_return(&fx, &t, P + 305, body, &sc);
+    assert!(o.since_written_ms.is_some(), "여러 줄 번호 목록 본문의 제출 CR 을 보류했다(FV2-1 M1): {o:?}");
+    assert!(withheld(&fx).is_empty(), "{:?}", withheld(&fx));
+}
+
+/// 적색→녹색: 800자 초과 또는 줄바꿈 2개 초과 붙여넣기는 실 claude 가 `[Pasted text #N +M lines]` 로 접어 그린다(2.1.282
+/// 바이너리 실측 문자열 · 임계 O5=800자 · 줄바꿈 2). 이력에 번호 에코가 있으면 종전은 보류했다.
+/// (검체 좌석은 입력을 읽지 않는 `sleep` 이라 tty 입력 버퍼(≈1KiB)를 넘는 본문은 writer 를 막는다 — 줄 수 축으로 만든다.)
+#[test]
+fn fv2_pasted_text_placeholder_under_numbered_echo_is_submitted() {
+    let fx = fx("fv2-paste");
+    let t = agent_pane_settled(&fx, "worker-1", P + 306);
+    let _x = pane(&fx, "worker-2", P + 307);
+    let line = "PASTEBODY status line";
+    let body = format!("{line} a\n{line} b\n{line} c\n{line} d");
+    assert_eq!(body.matches('\n').count(), 3, "전제: 줄바꿈 3 > 2 → 자리표시");
+    let sc = claude_screen(&["❯ 1. earlier numbered request", "", "⏺ ok"], "[Pasted text #1 +3 lines] ", &[]);
+    let o = body_then_return(&fx, &t, P + 307, &body, &sc);
+    assert!(o.since_written_ms.is_some(), "붙여넣기 자리표시 composer 의 제출 CR 을 보류했다: {o:?}");
+    assert!(withheld(&fx).is_empty(), "{:?}", withheld(&fx));
+}
+
+/// 적색→녹색: 공백 없는 한글 본문은 글자 경계에서 접힌다(단어 안 줄바꿈) — 이음은 공백 무시로 대조한다.
+#[test]
+fn fv2_wrapped_korean_body_split_midword_is_submitted() {
+    let fx = fx("fv2-ko");
+    let t = agent_pane_settled(&fx, "worker-1", P + 308);
+    let _x = pane(&fx, "worker-2", P + 309);
+    let body = "1. 다음상태보고서를주의깊게검토하고끝나면짧은확인응답을보내주세요".repeat(3);
+    let sc = claude_screen(&["❯ 1. 앞선 번호 메시지"], &body, &[]);
+    assert!(sc.0.len() >= 6, "전제: 한글 본문이 단어 안에서 접혔다: {:?}", sc.0);
+    let o = body_then_return(&fx, &t, P + 309, &body, &sc);
+    assert!(o.since_written_ms.is_some(), "단어 안에서 접힌 한글 본문의 제출 CR 을 보류했다: {o:?}");
+    assert!(withheld(&fx).is_empty(), "{:?}", withheld(&fx));
+}
+
+/// 실 claude 권한 창(입력 상자를 대체) — 커서 행 선택 가능.
+fn claude_dialog(cursor_on_last_option: bool) -> (Vec<String>, u16, u16) {
+    let rows: Vec<String> = [
+        "⏺ Bash(rm -rf build)",
+        RULE78,
+        " Bash command",
+        "",
+        "   rm -rf build",
+        "",
+        " Do you want to proceed?",
+        " ❯ 1. Yes",
+        "   2. Yes, and don't ask again for rm commands in this project",
+        "   3. No, and tell Claude what to do differently (esc)",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if cursor_on_last_option {
+        (rows, 9, 55)
+    } else {
+        (rows, 7, 9)
+    }
+}
+
+/// 음성 대조(치명 방향 — 오승인): 접힌 우리 본문 뒤·Return 앞에 권한 창이 입력 상자를 대체했다 — 커서가 선택지 행이든
+/// 그 아래 선택지(들여쓴 연속행 모양)든 보류한다(블록 이음이 창 행을 우리 본문으로 설명하지 않는다).
+#[test]
+fn fv2_dialog_replacing_wrapped_body_is_still_withheld() {
+    for (i, last) in [false, true].into_iter().enumerate() {
+        let fx = fx("fv2-dlg");
+        let t = agent_pane_settled(&fx, "worker-1", P + 310 + 2 * i as u32);
+        let _x = pane(&fx, "worker-2", P + 311 + 2 * i as u32);
+        let o = body_then_return(&fx, &t, P + 311 + 2 * i as u32, W1, &claude_dialog(last));
+        assert_eq!(o.since_written_ms, None, "창 위 제출 CR 을 썼다 — 오승인(커서 마지막 선택지={last}): {o:?}");
+        assert_eq!(withheld(&fx).len(), 1, "보류 1건(커서 마지막 선택지={last})");
+    }
+}
+
+/// 음성 대조(② 의 경계): 입력 블록의 주인이 우리 본문이어도 블록 **아래**에 창 서명이 그려져 있으면 창이다(보류).
+#[test]
+fn fv2_dialog_drawn_below_own_composer_is_still_withheld() {
+    let fx = fx("fv2-below");
+    let t = agent_pane_settled(&fx, "worker-1", P + 320);
+    let _x = pane(&fx, "worker-2", P + 321);
+    let sc = claude_screen(&[], W1, &[" Do you want to proceed?", " ❯ 1. Yes", "   2. No"]);
+    let o = body_then_return(&fx, &t, P + 321, W1, &sc);
+    assert_eq!(o.since_written_ms, None, "우리 composer 아래 그려진 창 위에 제출 CR 을 썼다: {o:?}");
+    assert_eq!(withheld(&fx).len(), 1);
+}
+
+/// 권한 창으로 보류된 접힌 번호 본문 좌석(재제출 검체 전제).
+fn withheld_wrapped_seat(fx: &Fx, pid: u32) -> Arc<Surface> {
+    let t = agent_pane_settled(fx, "worker-1", pid);
+    let _x = pane(fx, "worker-2", pid + 1);
+    let o = body_then_return(fx, &t, pid + 1, W1, &claude_dialog(false));
+    assert_eq!(o.since_written_ms, None, "전제: 창 위 제출 CR 은 보류된다: {o:?}");
+    assert_eq!(withheld(fx).len(), 1, "전제: 보류 1건");
+    t
+}
+
+/// 적색→녹색(FV2-1 재제출 wait_dialog 영구): 창이 닫히고 접힌 우리 번호 본문이 입력 상자에 돌아왔다 — 한 번 다시 쓴다.
+/// 종전: 본문 첫 줄의 `❯ 1.` 서명을 창으로 보아 `wait_dialog` 에 영구히 머물렀다(상한 = 큐 TTL).
+#[test]
+fn fv2_withheld_wrapped_body_is_resubmitted_after_dialog_closes() {
+    let fx = fx("fv2-resub");
+    let t = withheld_wrapped_seat(&fx, P + 330);
+    paint_rows(&t, &claude_screen(&["❯ 1. earlier numbered request", "", "⏺ ok"], W1, &[]));
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "창이 닫힌 뒤 접힌 우리 본문의 보류 CR 을 다시 쓰지 않았다(wait_dialog 영구): {o:?}");
+    assert_eq!(named(&fx, "queue.submit_resubmitted").len(), 1);
+}
+
+/// 적색→녹색: 같은 재제출이 대체화면(실 claude 2.1.282 는 alt-screen 상주 · fatal-v2 surface.list alt_screen=true)에서도
+/// 된다 — 레이아웃 양성 증거를 '빈 대기 프롬프트로 본 화면'에서 잰다(접힌 본문 연속행은 입력 상자 아래 꼬리가 아니다).
+#[test]
+fn fv2_withheld_wrapped_body_is_resubmitted_on_alt_screen() {
+    let fx = fx("fv2-resub-alt");
+    let t = withheld_wrapped_seat(&fx, P + 340);
+    t.parser.lock().unwrap_or_else(|e| e.into_inner()).process(b"\x1b[?1049h");
+    t.alt_screen.store(true, Ordering::Relaxed);
+    *t.last_output.lock().unwrap() = Instant::now() - Duration::from_secs(30);
+    paint_rows(&t, &claude_screen(&[], W1, &[]));
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "대체화면에서 접힌 우리 본문의 보류 CR 을 다시 쓰지 않았다: {o:?}");
+    assert_eq!(named(&fx, "queue.submit_resubmitted").len(), 1);
+}
+
+/// 적색→녹색(FV2-1 fix ⓒ): 재제출 대기에 상한 — 창(또는 창으로 보이는 화면)이 오래 남으면 기록을 버리고 사유 1건.
+/// 종전 상한은 큐 TTL(6h)뿐이었다. 쓰기는 0 이다(상한은 쓰지 않는 방향으로만 끝낸다).
+#[test]
+fn fv2_withheld_record_dropped_at_wait_cap() {
+    let fx = fx("fv2-cap");
+    let t = withheld_wrapped_seat(&fx, P + 350);
+    let w = t.inject_track.withheld().expect("전제: 보류 기록");
+    // 창은 그대로 떠 있다 — 상한 전에는 기다린다(기록 유지 · 쓰기 0).
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(t.inject_track.withheld().is_some(), "상한 전인데 기록을 버렸다");
+    let old = crate::state::WithheldSubmit { at: w.at - Duration::from_secs(11 * 60), ..w };
+    t.inject_track.note_withheld(old);
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(t.inject_track.withheld().is_none(), "상한(10분)을 넘긴 보류 기록이 남았다 — 큐 TTL 까지 wait_dialog");
+    assert_eq!(settle_obs(&t).since_written_ms, None, "상한은 쓰지 않는 방향으로만 끝낸다");
+    let d = named(&fx, "queue.submit_withheld_dropped");
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0]["payload"]["reason"], json!("wait_cap"), "{d:?}");
+}
