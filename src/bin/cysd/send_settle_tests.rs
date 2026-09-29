@@ -30,6 +30,9 @@ use std::time::{Duration, Instant};
 struct Fx {
     daemon: Arc<Daemon>,
     dir: std::path::PathBuf,
+    /// ★(R3C-1) 보류 기록 시계의 가상 경과 — 재제출 틱에 `Instant::now() + 이 값`을 싣는다(큰 `Instant` 뺄셈 없이 분·시간
+    /// 경과를 모사 · 부팅 직후 CI 에서도 underflow 패닉 없음).
+    vclock: std::cell::Cell<Duration>,
     _g: MutexGuard<'static, ()>,
 }
 
@@ -62,7 +65,7 @@ fn fx(tag: &str) -> Fx {
     std::env::set_var(cys::pack::ENV_PACK_DIR, &dir);
     std::env::remove_var("CYS_SEND_SETTLE");
     let daemon = Daemon::new(dir.join("cysd.sock"));
-    Fx { daemon, dir, _g: g }
+    Fx { daemon, dir, vclock: std::cell::Cell::new(Duration::ZERO), _g: g }
 }
 
 /// 좌석 1개 + 그 좌석으로 해석되는 synthetic 발신 pid(커널 peer pid 대역).
@@ -994,24 +997,25 @@ fn fv2_withheld_wrapped_body_is_resubmitted_on_alt_screen() {
 
 /// 적색→녹색(FV2-1 fix ⓒ): 재제출 대기에 상한 — 창(또는 창으로 보이는 화면)이 오래 남으면 기록을 버리고 사유 1건.
 /// 종전 상한은 큐 TTL(6h)뿐이었다. 쓰기는 0 이다(상한은 쓰지 않는 방향으로만 끝낸다).
+/// (R3C-1: 상한은 창이 연달아 열린 시간만 잰다 — 창이 11분 떠 있는 것을 가상 시계로 모사한다.)
 #[test]
 fn fv2_withheld_record_dropped_at_wait_cap() {
     let fx = fx("fv2-cap");
     let t = withheld_wrapped_seat(&fx, P + 350);
-    let w = t.inject_track.withheld().expect("전제: 보류 기록");
     // 창은 그대로 떠 있다 — 상한 전에는 기다린다(기록 유지 · 쓰기 0).
-    crate::governance::resubmit_withheld_submits(&fx.daemon);
-    std::thread::sleep(Duration::from_millis(200));
+    tick(&fx);
     assert!(t.inject_track.withheld().is_some(), "상한 전인데 기록을 버렸다");
-    let old = crate::state::WithheldSubmit { at: w.at - Duration::from_secs(11 * 60), ..w };
-    t.inject_track.note_withheld(old);
-    crate::governance::resubmit_withheld_submits(&fx.daemon);
-    std::thread::sleep(Duration::from_millis(200));
+    elapse(&fx, Duration::from_secs(11 * 60)); // 창이 11분 떠 있다(그동안 5초 틱마다 wait_dialog)
+    tick(&fx);
     assert!(t.inject_track.withheld().is_none(), "상한(10분)을 넘긴 보류 기록이 남았다 — 큐 TTL 까지 wait_dialog");
     assert_eq!(settle_obs(&t).since_written_ms, None, "상한은 쓰지 않는 방향으로만 끝낸다");
     let d = named(&fx, "queue.submit_withheld_dropped");
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0]["payload"]["reason"], json!("wait_cap"), "{d:?}");
+    assert!(
+        d[0]["payload"]["dialog_open_ms"].as_u64().is_some_and(|ms| ms >= 600_000),
+        "버림 이벤트가 창이 열려 있던 시간(≥10분)을 싣지 않았다: {d:?}"
+    );
 }
 
 /// 적색→녹색(② 재제출 판정 일치): 입력 블록의 주인이 우리 본문이면 블록 **위** 서명은 전경이 아니다 — 입력 상자 아래에
@@ -1033,4 +1037,226 @@ fn fv2_resubmit_ignores_signatures_above_own_composer_without_trailer() {
     let o = wait_submit_consumed(&t);
     assert!(o.since_written_ms.is_some(), "블록 위 이력 서명 때문에 재제출이 멈췄다(탐침과 판정 불일치): {o:?}");
     assert_eq!(named(&fx, "queue.submit_resubmitted").len(), 1);
+}
+
+// ═══════════ ★(0.14.42 · 수정 4회차 R3C-1) 보류 기록의 창 대기 상한은 '창이 열려 있는 시간'만 잰다 ═══════════
+//
+// 【무엇이 틀렸었나】 수정 3회차(d59a1f5e)의 수명 상한 10분이 문서('창이 10분 안에 닫히지 않으면')와 달리 보류 시각부터
+// **모든** 대기에 걸렸다 — 창이 몇 초 만에 승인돼 닫혀도 에이전트가 그 작업을 10분 넘게 이어 가면(`wait_prompt`) 기록을
+// `wait_cap` 으로 버렸고, kill-switch pause 동안(틱이 곧바로 반환해 경과만 쌓임)에도 같았다. 상한 검사가 상태 검사보다
+// 앞이었다. 결과: 작업이 끝난 뒤 본문이 입력 상자에 미제출로 남고(CLI 는 이미 OK) 그 좌석 큐가 입력줄 점유로 섰다
+// (실 claude LT2 2/2 · 상한만 끈 진단판은 재제출·도달).
+// 【규칙】 상한은 재제출 틱이 창(질문·선택 창 ∨ 승인 대기)을 **연달아 열린 것으로 본** 시간에만 걸린다. 창이 닫힌 것을 본
+// 틱에서 그 시계는 0 으로 돌아가고(다음 창은 새 창), pause 동안은 멈춘다. 창이 닫힌 뒤 프롬프트 경계 복귀를 기다리는
+// 동안의 외곽 상한은 큐 TTL(큐 항목과 같은 pause 크레딧)이다. 그 긴 대기 중에도 사람 손·새 기계 본문·빈 줄이면 종전대로
+// 버리고, 재제출은 기록 1건당 한 번이다.
+
+/// 시간 경과 모사 — 재제출 틱의 가상 시계를 `d` 만큼 앞으로 민다(= 직전 틱 뒤로 `d` 가 흘렀다).
+fn elapse(fx: &Fx, d: Duration) {
+    fx.vclock.set(fx.vclock.get() + d);
+}
+
+/// 가상 시계의 재제출 틱 1회(watchdog 이 부르는 것과 같은 본체).
+fn tick_now(fx: &Fx) {
+    crate::governance::resubmit_withheld_submits_at(&fx.daemon, Instant::now() + fx.vclock.get());
+}
+
+/// 창이 닫혔고 에이전트가 그 작업을 하는 중(스피너) — 입력 상자에는 우리 본문이 그대로 있다.
+fn paint_working_own_composer(t: &Arc<Surface>) {
+    paint(t, &["✻ Cogitating… (esc to interrupt)", "────────", "❯ M|x|AAA", "────────"], 2, 11);
+}
+
+fn tick(fx: &Fx) {
+    tick_now(fx);
+    std::thread::sleep(Duration::from_millis(150));
+}
+
+fn dropped(fx: &Fx) -> Vec<Value> {
+    named(fx, "queue.submit_withheld_dropped")
+}
+
+/// 창이 2초 만에 승인돼 닫히고, 에이전트가 그 작업을 11분 한 뒤 유휴 — 기록은 남아 있다가 한 번 재제출된다.
+fn long_turn_after_quick_approval(fx: &Fx, pid: u32) -> Arc<Surface> {
+    let t = withheld_seat(fx, pid);
+    tick(fx); // 창이 떠 있다 — 기다린다
+    elapse(fx, Duration::from_secs(2));
+    paint_working_own_composer(&t); // 2초 뒤 승인 — 창이 닫히고 작업 시작
+    tick(fx);
+    assert!(named(fx, "queue.submit_resubmitted").is_empty(), "전제: 작업 중에는 다시 쓰지 않는다");
+    assert!(t.inject_track.withheld().is_some(), "전제: 작업 중 기록 유지");
+    elapse(fx, Duration::from_secs(11 * 60)); // 작업 11분(그동안 5초 틱마다 wait_prompt)
+    tick(fx);
+    assert!(
+        t.inject_track.withheld().is_some(),
+        "창은 2초 만에 닫혔는데 작업 대기 11분에 기록을 버렸다(창 대기 상한이 작업 대기에 산입): {:?}",
+        dropped(fx)
+    );
+    assert!(dropped(fx).is_empty(), "{:?}", dropped(fx));
+    assert_eq!(settle_obs(&t).since_written_ms, None, "작업 중에 보류 CR 을 썼다");
+    t
+}
+
+/// 적색→녹색(R3C-1 결과 1): 창 2초 승인 뒤 에이전트 11분 작업 → 유휴가 되면 한 번 재제출(두 번째는 없다).
+#[test]
+fn r3c_long_agent_turn_after_quick_approval_resubmits_once() {
+    let fx = fx("r3c-longturn");
+    let t = long_turn_after_quick_approval(&fx, P + 400);
+    paint_own_composer(&t); // 작업이 끝나 유휴 — 입력 상자는 우리 본문 그대로
+    tick_now(&fx);
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "장기 작업 뒤 유휴인데 보류 CR 을 다시 쓰지 않았다(조용한 미도달): {o:?}");
+    assert_eq!(named(&fx, "queue.submit_resubmitted").len(), 1);
+    // 1회성 — 그 CR 을 TUI 가 삼켜 입력줄이 그대로여도 다시 쓰지 않는다.
+    paint_own_composer(&t);
+    tick(&fx);
+    elapse(&fx, Duration::from_secs(60));
+    tick(&fx);
+    assert_eq!(named(&fx, "queue.submit_resubmitted").len(), 1, "보류 CR 을 두 번 썼다(폭주)");
+    assert!(dropped(&fx).is_empty(), "{:?}", dropped(&fx));
+}
+
+/// 적색→녹색(R3C-1 결과 3 · FV1-1 'pause 동안 동결 · resume 뒤 재개'): pause 11분 동안 창이 닫혔고 입력줄은 우리 본문
+/// 그대로 — pause 중에는 쓰지 않고, resume 뒤 한 번 재제출한다(pause 시간은 창 대기 상한에 들지 않는다).
+#[test]
+fn r3c_long_pause_then_resume_resubmits_once() {
+    let fx = fx("r3c-longpause");
+    let t = withheld_seat(&fx, P + 410);
+    tick(&fx); // 창이 떠 있다
+    fx.daemon.paused.store(true, Ordering::SeqCst);
+    elapse(&fx, Duration::from_secs(11 * 60));
+    paint_own_composer(&t); // pause 중에 창이 닫혔다
+    tick(&fx); // pause 중 틱(5초마다) — 아무것도 쓰지 않는다
+    assert_eq!(settle_obs(&t).since_written_ms, None, "pause 중에 보류 CR 을 썼다 — kill-switch 약화");
+    assert!(named(&fx, "queue.submit_resubmitted").is_empty());
+    assert!(t.inject_track.withheld().is_some(), "pause 중 기록 유지");
+    fx.daemon.paused.store(false, Ordering::SeqCst);
+    tick_now(&fx);
+    let o = wait_submit_consumed(&t);
+    assert!(
+        o.since_written_ms.is_some(),
+        "resume 뒤 유휴 입력줄(우리 본문)인데 재제출하지 않았다 — pause 시간이 상한에 산입: {:?}",
+        dropped(&fx)
+    );
+    assert_eq!(named(&fx, "queue.submit_resubmitted").len(), 1);
+    assert!(dropped(&fx).is_empty(), "{:?}", dropped(&fx));
+}
+
+/// 적색→녹색 + 상한 보존: 창이 6분 열린 채 pause 30분(창 그대로) → resume 뒤에도 기록 유지(pause 는 창 시계를 멈춘다) →
+/// 창이 5분 더 열려 누적 11분이면 `wait_cap` 으로 버린다(쓰기 0). 상한 자체(창이 10분 안에 닫히지 않으면)는 그대로다.
+#[test]
+fn r3c_pause_freezes_dialog_clock_and_cap_still_fires_on_open_window() {
+    let fx = fx("r3c-freeze");
+    let t = withheld_seat(&fx, P + 420);
+    tick(&fx);
+    elapse(&fx, Duration::from_secs(6 * 60));
+    tick(&fx); // 창이 6분째 열려 있다
+    assert!(t.inject_track.withheld().is_some(), "6분 — 상한 전");
+    fx.daemon.paused.store(true, Ordering::SeqCst);
+    elapse(&fx, Duration::from_secs(30 * 60));
+    tick(&fx); // pause 중 틱
+    fx.daemon.paused.store(false, Ordering::SeqCst);
+    tick(&fx); // resume — 창은 여전히 열려 있다(창 시계 약 6분)
+    assert!(
+        t.inject_track.withheld().is_some(),
+        "창이 열린 시간은 약 6분인데 pause 30분을 더해 기록을 버렸다: {:?}",
+        dropped(&fx)
+    );
+    assert!(dropped(&fx).is_empty(), "{:?}", dropped(&fx));
+    elapse(&fx, Duration::from_secs(5 * 60));
+    tick(&fx); // 창 누적 약 11분
+    assert!(t.inject_track.withheld().is_none(), "창이 11분 열려 있었는데 기록이 남았다(상한 소실)");
+    let d = dropped(&fx);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0]["payload"]["reason"], json!("wait_cap"), "{d:?}");
+    assert_eq!(settle_obs(&t).since_written_ms, None, "상한은 쓰지 않는 방향으로만 끝낸다");
+    assert!(named(&fx, "queue.submit_resubmitted").is_empty());
+}
+
+/// 적색→녹색: 상한은 **한 창**이 10분 안에 닫히지 않을 때다 — 8분 창이 닫히고(작업) 다음 창이 8분 열려 있어도 버리지
+/// 않는다. 두 번째 창이 닫히고 유휴가 되면 한 번 재제출한다.
+#[test]
+fn r3c_dialog_clock_restarts_when_window_closes() {
+    let fx = fx("r3c-rewin");
+    let t = withheld_seat(&fx, P + 430);
+    tick(&fx);
+    elapse(&fx, Duration::from_secs(8 * 60));
+    tick(&fx); // 첫 창 8분
+    paint_working_own_composer(&t); // 첫 창이 닫혔다
+    tick(&fx);
+    paint(&t, &DIALOG, 1, 8); // 두 번째 창
+    tick(&fx);
+    elapse(&fx, Duration::from_secs(8 * 60));
+    tick(&fx); // 두 번째 창 8분(보류 뒤 16분)
+    assert!(
+        t.inject_track.withheld().is_some(),
+        "어느 창도 10분을 넘지 않았는데 기록을 버렸다: {:?}",
+        dropped(&fx)
+    );
+    paint_own_composer(&t);
+    tick_now(&fx);
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "창이 닫히고 유휴인데 재제출하지 않았다: {o:?} {:?}", dropped(&fx));
+    assert_eq!(named(&fx, "queue.submit_resubmitted").len(), 1);
+}
+
+/// 음성 대조(종전대로 버림): 긴 작업 대기 중에도 사람 손 · 새 기계 본문 · 빈 줄이면 쓰지 않고 그 사유로 버린다.
+#[test]
+fn r3c_long_wait_still_yields_to_human_newer_body_and_empty_line() {
+    for (i, case) in ["human", "newer_body", "line_empty"].into_iter().enumerate() {
+        let fx = fx("r3c-yield");
+        let t = long_turn_after_quick_approval(&fx, P + 440 + 2 * i as u32);
+        match case {
+            "human" => {
+                *t.last_human_input.lock().unwrap() = Some(Instant::now());
+                paint_own_composer(&t);
+            }
+            "newer_body" => {
+                t.inject_track.note_body("M|y|BBB", None);
+                paint_own_composer(&t);
+            }
+            _ => paint(&t, &["────────", "❯ ", "────────"], 1, 2),
+        }
+        tick(&fx);
+        assert_eq!(settle_obs(&t).since_written_ms, None, "{case}: 보류 CR 을 썼다");
+        assert!(named(&fx, "queue.submit_resubmitted").is_empty(), "{case}");
+        let d = dropped(&fx);
+        assert_eq!(d.len(), 1, "{case}: {d:?}");
+        assert_eq!(d[0]["payload"]["reason"], json!(case), "{case}: {d:?}");
+        assert!(t.inject_track.withheld().is_none(), "{case}: 기록이 남았다");
+    }
+}
+
+/// 외곽 상한(큐 TTL)은 창이 닫힌 뒤 대기에도 그대로다 — pause 가 아닌 대기가 TTL 을 넘으면 `expired` 로 버린다(쓰기 0).
+/// 큐 항목과 같은 pause 크레딧: 긴 pause(TTL 초과) 뒤 resume 한 유휴 입력줄은 재제출한다.
+#[test]
+fn r3c_queue_ttl_bounds_post_close_wait_with_pause_credit() {
+    let ttl = crate::state::queue_ttl_default_secs();
+    assert!(ttl > 0, "전제: 큐 TTL 켜짐");
+    // (가) 작업이 TTL 을 넘게 이어졌다 — 버린다.
+    let fx1 = fx("r3c-ttl");
+    let t = long_turn_after_quick_approval(&fx1, P + 460);
+    elapse(&fx1, Duration::from_secs(ttl));
+    tick(&fx1);
+    let d = dropped(&fx1);
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0]["payload"]["reason"], json!("expired"), "{d:?}");
+    assert_eq!(settle_obs(&t).since_written_ms, None);
+    drop(fx1);
+    // (나) TTL 을 넘는 pause — pause 크레딧으로 버리지 않고 resume 뒤 재제출.
+    let fx2 = fx("r3c-ttl-pause");
+    let t = withheld_seat(&fx2, P + 470);
+    paint_own_composer(&t);
+    fx2.daemon.paused.store(true, Ordering::SeqCst);
+    tick(&fx2);
+    elapse(&fx2, Duration::from_secs(ttl + 3600));
+    tick(&fx2);
+    fx2.daemon.paused.store(false, Ordering::SeqCst);
+    tick_now(&fx2);
+    let o = wait_submit_consumed(&t);
+    assert!(
+        o.since_written_ms.is_some(),
+        "TTL 을 넘는 pause 뒤 유휴 입력줄에서 재제출하지 않았다(큐 항목은 pause 크레딧으로 산다): {:?}",
+        dropped(&fx2)
+    );
+    assert_eq!(named(&fx2, "queue.submit_resubmitted").len(), 1);
 }

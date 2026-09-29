@@ -1070,14 +1070,66 @@ pub struct InjectTrack {
 
 /// ★(0.14.42 · 수정 2회차 F1 · 재개) 쓰지 않은(보류한) 제출 CR 의 기록 — 보류는 **버림이 아니라 미룸**이다. 창이 닫히고
 /// 입력줄이 그대로 그 기계 본문이면 데몬이 그 CR 을 한 번 다시 쓴다(`governance::resubmit_withheld_submits`).
+///
+/// ★(수정 4회차 R3C-1) 기록은 시계 둘을 든다 — 재제출 틱(watchdog 5초)이 직전 틱 뒤 경과([`Self::advance`])를 나눠 더한다.
+/// ⓐ `live_ms` = pause 가 아닌 대기 전부(외곽 상한 = 큐 TTL · 큐 항목의 pause 크레딧과 같은 규칙) · ⓑ `dialog_ms` = 지금
+/// 열려 있는 창(질문·선택 창 ∨ 승인 대기)을 **연달아** 본 시간(창 대기 상한 `governance::WITHHELD_SUBMIT_WAIT_CAP_SECS` 은
+/// 이것만 잰다 — 창이 닫힌 것을 보면 0). 종전(d59a1f5e)에는 상한이 보류 시각부터의 벽시계라 창이 곧 닫혀도 에이전트의 긴
+/// 작업·pause 동안 기록을 버렸다(실 claude LT2 · 작업이 끝난 뒤 본문 미제출 · CLI 는 OK).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct WithheldSubmit {
-    /// 보류한 단조 시각(기록 식별 · 상한 판정).
+    /// 보류한 단조 시각(기록 식별 · 이벤트의 `withheld_ms_ago`).
     pub(crate) at: Instant,
     /// 보류 때 입력줄에 있던 마지막 기계 본문의 기록 시각([`MachineBody::at`]) — 그 뒤 새 기계 본문이 오면 기록은 낡았다.
     pub(crate) body_at: Instant,
     /// 보류한 Return 의 발신 좌석(이벤트 표기).
     pub(crate) from: Option<u64>,
+    /// 재제출 틱이 이 기록을 마지막으로 잰 시각(생성 = `at`). pause 중 틱은 경과를 버리고 이 시각만 옮긴다(두 시계 정지).
+    pub(crate) seen_at: Instant,
+    /// pause 가 아닌 대기의 합(ms) — 외곽 상한(큐 TTL)이 재는 나이.
+    pub(crate) live_ms: u64,
+    /// 지금 열려 있는 창을 연달아 본 시간(ms) — 창이 닫힌 것을 본 틱에서 0(다음 창은 새 창).
+    pub(crate) dialog_ms: u64,
+    /// 직전 관측이 '창 열림'이었는가 — 보류 탐침 자체가 창 관측이라 생성 = true. 못 본 틱(사이클 창)은 false(사슬만 끊음).
+    pub(crate) dialog_open: bool,
+}
+
+impl WithheldSubmit {
+    /// 보류 탐침이 창을 본 순간의 기록 — 두 시계 0 · 창 열림.
+    pub(crate) fn new(at: Instant, body_at: Instant, from: Option<u64>) -> Self {
+        Self { at, body_at, from, seen_at: at, live_ms: 0, dialog_ms: 0, dialog_open: true }
+    }
+
+    /// ★(R3C-1) 순수 — 틱 1회의 경과를 잰다: `seen_at` 을 `now` 로 옮기고, pause 가 아니면 `live_ms` 에 더한다.
+    /// 반환 = 이번 틱이 창 시계에 넘길 경과(ms · pause 면 0 — pause 동안 두 시계는 멈춘다). `now` 가 `seen_at` 보다
+    /// 이르면(시계 역행) 0.
+    pub(crate) fn advance(&mut self, now: Instant, paused: bool) -> u64 {
+        let d = u64::try_from(now.saturating_duration_since(self.seen_at).as_millis()).unwrap_or(u64::MAX);
+        self.seen_at = self.seen_at.max(now);
+        if paused {
+            return 0;
+        }
+        self.live_ms = self.live_ms.saturating_add(d);
+        d
+    }
+
+    /// ★(R3C-1) 순수 — 이번 틱의 창 관측을 창 시계에 반영한다. `Some(true)` 열림(직전 관측도 열림이면 경과를 더한다) ·
+    /// `Some(false)` 닫힘(0 · 다음 창은 새 창) · `None` 못 봄(사슬만 끊는다 — 그 구간은 더하지도 0 으로 돌리지도 않는다).
+    pub(crate) fn observe_dialog(&mut self, open: Option<bool>, elapsed_ms: u64) {
+        match open {
+            Some(true) => {
+                if self.dialog_open {
+                    self.dialog_ms = self.dialog_ms.saturating_add(elapsed_ms);
+                }
+                self.dialog_open = true;
+            }
+            Some(false) => {
+                self.dialog_ms = 0;
+                self.dialog_open = false;
+            }
+            None => self.dialog_open = false,
+        }
+    }
 }
 
 /// ★(0.14.42 · S21-SETTLE) 좌석 제출 정착 판정의 단조 시계(ms) — 프로세스 기준점 경과 + 1(0 은 '없음' 표지).
@@ -1251,12 +1303,28 @@ impl InjectTrack {
 
     /// ★(F1 · 재개) 그 기록(`at`)이 아직 남아 있을 때만 지운다 — 그 사이 새 보류가 섰으면 건드리지 않는다. 지웠으면 true.
     pub(crate) fn clear_withheld_if(&self, at: Instant) -> bool {
+        self.take_withheld_if(at).is_some()
+    }
+
+    /// ★(R3C-1) [`Self::clear_withheld_if`] 와 같되 지운 기록(시계 포함)을 돌려준다(버림 이벤트의 표기용).
+    pub(crate) fn take_withheld_if(&self, at: Instant) -> Option<WithheldSubmit> {
         let mut g = self.withheld.lock().unwrap_or_else(|e| e.into_inner());
         if g.is_some_and(|w| w.at == at) {
-            *g = None;
-            true
+            g.take()
         } else {
-            false
+            None
+        }
+    }
+
+    /// ★(R3C-1) 그 기록(`at`)이 아직 남아 있을 때만 고친다(재제출 틱의 시계 갱신) — 고친 뒤 값. 새 보류가 섰거나 지워졌으면 None.
+    pub(crate) fn update_withheld_if(&self, at: Instant, f: impl FnOnce(&mut WithheldSubmit)) -> Option<WithheldSubmit> {
+        let mut g = self.withheld.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_mut() {
+            Some(w) if w.at == at => {
+                f(w);
+                Some(*w)
+            }
+            _ => None,
         }
     }
 

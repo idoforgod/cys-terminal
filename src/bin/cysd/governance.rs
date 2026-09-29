@@ -5569,11 +5569,7 @@ pub(crate) fn submit_cr_withhold_probe(
             // ★(재개 S91) 보류는 미룸이다 — 입력줄에 남는 기계 본문을 기록해 창이 닫힌 뒤 watchdog 틱이 이 CR 을 한 번 다시
             //   쓴다([`resubmit_withheld_submits`]). 기계 본문 기록이 없으면(빈 줄 위 Return) 다시 쓸 것이 없다.
             if let Some(b) = s.inject_track.last_body() {
-                s.inject_track.note_withheld(crate::state::WithheldSubmit {
-                    at: std::time::Instant::now(),
-                    body_at: b.at,
-                    from,
-                });
+                s.inject_track.note_withheld(crate::state::WithheldSubmit::new(std::time::Instant::now(), b.at, from));
             }
             d.bus.publish(
                 "queue.submit_withheld",
@@ -5597,12 +5593,18 @@ pub(crate) fn submit_cr_withhold_probe(
     })
 }
 
-/// ★(0.14.42 · 수정 3회차 FV2-1 ⓒ) 보류 기록의 **수명 상한**(초) — 재제출이 창(또는 창으로 보이는 화면)·입력줄·프롬프트
-/// 경계를 기다리는 동안의 상한. 넘으면 기록을 버리고 사유 `wait_cap` 을 1건 발행한다(쓰기 0 — 상한은 '다시 쓰지 않음'
-/// 쪽으로만 끝낸다 · 폭주 방지 장치 무변경). 종전 상한은 큐 TTL(6h)뿐이라 오판 한 번이 여섯 시간짜리 대기 기록이 됐다
-/// (FV2-1 W1dL: 160초 뒤에도 wait_dialog). 값은 사이클 창 보류 상한(`queue_quiesce_hold_secs` 기본 600s)과 같은 자다 — 사람이
-/// 창에 답하면 기록은 이미 `human` 으로 버려지고, master 승인은 분 단위다. 버린 뒤 입력줄에 남은 본문은 기존 잔여 처리
-/// (데몬 주입의 병합 제출 · 사람)를 탄다.
+/// ★(0.14.42 · 수정 3회차 FV2-1 ⓒ · 수정 4회차 R3C-1) 보류 기록의 **창 대기 상한**(초) — 재제출 틱이 창(질문·선택 창 —
+/// 또는 창으로 보이는 화면 — ∨ 승인 대기)을 **연달아 열린 것으로 본** 시간([`crate::state::WithheldSubmit::dialog_ms`])이
+/// 이것을 넘으면 기록을 버리고 사유 `wait_cap` 을 1건 발행한다(쓰기 0 — 상한은 '다시 쓰지 않음' 쪽으로만 끝낸다 · 폭주
+/// 방지 장치 무변경). FV2-1 W1dL(창이 아닌 화면을 창으로 오판해 160초 뒤에도 wait_dialog)처럼 창 판정 한 번이 여섯 시간짜리
+/// 대기가 되는 것을 막는다. 값은 사이클 창 보류 상한(`queue_quiesce_hold_secs` 기본 600s)과 같은 자다 — 사람이 창에 답하면
+/// 기록은 이미 `human` 으로 버려지고, master 승인은 분 단위다.
+/// 【무엇을 재지 않나 — R3C-1】 창이 닫힌 것을 본 틱에서 이 시계는 0 이다(다음 창은 새 창). 창이 닫힌 뒤 프롬프트 경계
+/// 복귀(에이전트의 작업 · 사이클 창 · 입력줄)를 기다리는 시간과 kill-switch pause 동안은 재지 않는다 — 그 대기의 외곽 상한은
+/// 큐 TTL(pause 크레딧 · `expired`)이다. 종전(d59a1f5e)에는 보류 시각부터의 벽시계였고 상태 검사보다 앞이라, 창이 몇 초 만에
+/// 승인돼 닫혀도 에이전트가 10분 넘게 일하면(워커 좌석에서 흔함) · pause 가 10분을 넘으면 기록을 버렸다 — 작업이 끝난 뒤
+/// 본문은 입력 상자에 미제출로 남고(CLI 는 OK) 그 좌석 큐가 입력줄 점유로 섰다(실 claude LT2 2/2).
+/// 버린 뒤 입력줄에 남은 본문은 기존 잔여 처리(데몬 주입의 병합 제출 · 사람)를 탄다.
 pub(crate) const WITHHELD_SUBMIT_WAIT_CAP_SECS: u64 = 600;
 
 /// ★(0.14.42 · 수정 2회차 F1 · 재개 S91) 보류한 제출 CR 의 **재제출** — watchdog 틱(5초)마다 한 번(큐 배달 앞).
@@ -5617,15 +5619,23 @@ pub(crate) const WITHHELD_SUBMIT_WAIT_CAP_SECS: u64 = 600;
 /// 같은 프롬프트 경계 판정(입력줄 점유 축만 뺀다 — 점유의 주인이 바로 이 본문이다)이 통과. 쓰기는 제출 CR 과 같은 길
 /// (`SubmitAfterGap` · 최소 간격 · 쓰기 직전 보류 탐침 — 그 사이 창이 다시 뜨면 또 보류하고 기록이 다시 선다)이고
 /// input_gate 안에서 넘긴다(직접 send 와 직렬). 기록이 무효가 되면(새 기계 본문 · 사람 손 · 입력줄 비었음 · 등급 Off ·
-/// 킬 스위치 · 큐 TTL · 수명 상한 [`WITHHELD_SUBMIT_WAIT_CAP_SECS`]) 지우고 사유를 1건 발행한다(`queue.submit_withheld_dropped`).
+/// 킬 스위치 · 큐 TTL · 창 대기 상한 [`WITHHELD_SUBMIT_WAIT_CAP_SECS`]) 지우고 사유를 1건 발행한다(`queue.submit_withheld_dropped`).
 /// 폭주 0: 기록 1건 = 쓰기 최대 1회.
+/// ★(수정 4회차 R3C-1) 【시계】 틱마다 직전 틱 뒤 경과를 기록의 시계 둘에 나눠 더한다([`crate::state::WithheldSubmit`]) —
+/// pause 가 아닌 대기 전부(`live_ms` → 큐 TTL · `expired`)와, 창(질문·선택 창 ∨ 승인 대기)을 연달아 본 시간(`dialog_ms` →
+/// 창 대기 상한 · `wait_cap` · 창이 닫힌 것을 보면 0). pause 중 틱은 쓰지도 버리지도 않고 경과만 버린다(두 시계 정지).
+/// 종전(d59a1f5e)에는 상한이 보류 시각부터의 벽시계였고 상태 검사보다 앞이라, 창이 곧 닫혀도 긴 작업·pause 뒤 기록을 버렸다.
 /// ★(수정 3회차 FV2-1) '입력줄이 그 본문 그대로'·'창 없음'은 보류 탐침과 **같은 판정**([`submit_cr_verdict`] — 커서가 든 입력
 /// 블록 전체 · 블록 위 서명은 전경 아님)이다. 종전에는 본문 첫 줄의 `❯ 1.`·이력 에코를 창으로 보아 `wait_dialog` 에 영구히
 /// 머물렀다(실 claude · 접힌 줄·여러 줄 본문).
 pub(crate) fn resubmit_withheld_submits(daemon: &Arc<Daemon>) {
-    if daemon.paused.load(Ordering::Relaxed) {
-        return;
-    }
+    resubmit_withheld_submits_at(daemon, std::time::Instant::now());
+}
+
+/// ★(R3C-1) 재제출 틱 본체 — `now` = 이 틱의 시각(보류 기록의 시계만 이것으로 잰다 · 검체는 큰 `Instant` 뺄셈 없이 분·시간
+/// 경과를 모사하려고 앞선 시각을 싣는다). pause 판정이 좌석 순회보다 앞이다(kill-switch).
+pub(crate) fn resubmit_withheld_submits_at(daemon: &Arc<Daemon>, now: std::time::Instant) {
+    let paused = daemon.paused.load(Ordering::Relaxed);
     let seats: Vec<Arc<crate::state::Surface>> = daemon
         .surfaces
         .lock()
@@ -5634,18 +5644,40 @@ pub(crate) fn resubmit_withheld_submits(daemon: &Arc<Daemon>) {
         .filter(|s| s.inject_track.withheld().is_some())
         .cloned()
         .collect();
+    if paused {
+        // pause 는 배달 동결 — 쓰지도 버리지도 않는다. 기록의 시계만 멈춘다(경과를 버리고 잰 시각만 옮긴다 · FV1-1 'pause
+        // 동안 동결 · resume 뒤 재개'). 버림 판정·관측은 resume 뒤 첫 틱이 한다.
+        for s in seats {
+            if let Some(w) = s.inject_track.withheld() {
+                let _ = s.inject_track.update_withheld_if(w.at, |w| {
+                    w.advance(now, true);
+                });
+            }
+        }
+        return;
+    }
     for s in seats {
-        let _ = resubmit_withheld_one(daemon, &s);
+        let _ = resubmit_withheld_one(daemon, &s, now);
     }
 }
 
 /// [`resubmit_withheld_submits`] 의 좌석 1개 — 반환 = 결과 표지(검체·로그용).
-fn resubmit_withheld_one(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> &'static str {
-    let Some(w) = s.inject_track.withheld() else {
+fn resubmit_withheld_one(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    now: std::time::Instant,
+) -> &'static str {
+    let Some(w0) = s.inject_track.withheld() else {
         return "none";
     };
+    let (at, from) = (w0.at, w0.from);
+    // ★(R3C-1) 직전 틱 뒤 경과 — pause 아닌 나이(`live_ms`)에 더하고, 창 시계에 넘길 몫은 아래 창 관측이 쓴다.
+    let mut elapsed_ms = 0;
+    let Some(w) = s.inject_track.update_withheld_if(at, |w| elapsed_ms = w.advance(now, false)) else {
+        return "raced";
+    };
     let drop_it = |why: &'static str| -> &'static str {
-        if s.inject_track.clear_withheld_if(w.at) {
+        if let Some(gone) = s.inject_track.take_withheld_if(at) {
             daemon.bus.publish(
                 "queue.submit_withheld_dropped",
                 "queue",
@@ -5653,22 +5685,19 @@ fn resubmit_withheld_one(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -
                 json!({
                     "surface_ref": cys::surface_ref(s.id),
                     "reason": why,
-                    "from": w.from.map(cys::surface_ref),
-                    "withheld_ms_ago": w.at.elapsed().as_millis() as u64,
+                    "from": from.map(cys::surface_ref),
+                    "withheld_ms_ago": now.saturating_duration_since(at).as_millis() as u64,
+                    "dialog_open_ms": gone.dialog_ms,
                     "note": "보류한 제출 CR 을 다시 쓰지 않는다 — 입력줄의 본문은 그대로 둔다(사람·다음 주입이 처리).",
                 }),
             );
         }
         why
     };
+    // 외곽 상한 — 큐 TTL(큐 항목과 같은 pause 크레딧: pause 가 아닌 대기만 센다).
     let ttl = crate::state::queue_ttl_default_secs();
-    let age = w.at.elapsed().as_secs();
-    if ttl > 0 && age >= ttl {
+    if ttl > 0 && w.live_ms / 1000 >= ttl {
         return drop_it("expired");
-    }
-    // ★(수정 3회차 FV2-1 ⓒ) 기록 수명 상한 — 창(또는 창으로 보이는 화면)·입력줄·경계를 무기한 기다리지 않는다.
-    if age >= WITHHELD_SUBMIT_WAIT_CAP_SECS {
-        return drop_it("wait_cap");
     }
     if crate::handlers::send_settle_disabled(daemon) {
         return drop_it("kill_switch");
@@ -5690,6 +5719,8 @@ fn resubmit_withheld_one(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -
         return drop_it("human");
     }
     if effective_quiescing_since(daemon, s).is_some() {
+        // 창을 보지 않은 틱 — 창 시계는 더하지도 0 으로 돌리지도 않고 사슬만 끊는다.
+        let _ = s.inject_track.update_withheld_if(at, |w| w.observe_dialog(None, elapsed_ms));
         return "wait_quiescing";
     }
     let adapters = load_adapter_defs();
@@ -5701,7 +5732,15 @@ fn resubmit_withheld_one(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -
     }
     let obs = observe_prompt_block(s, &markers);
     let v = submit_cr_verdict(scope, &obs, Some(body.norm.as_str()));
-    if v.hits || approval_or_gate_pending(daemon, s.id) {
+    let dialog_open = v.hits || approval_or_gate_pending(daemon, s.id);
+    // ★(R3C-1) 창 대기 상한은 창이 **열려 있는** 시간만 잰다 — 닫힌 것을 보면 0(다음 창은 새 창).
+    let Some(w) = s.inject_track.update_withheld_if(at, |w| w.observe_dialog(Some(dialog_open), elapsed_ms)) else {
+        return "raced";
+    };
+    if dialog_open {
+        if w.dialog_ms / 1000 >= WITHHELD_SUBMIT_WAIT_CAP_SECS {
+            return drop_it("wait_cap");
+        }
         return "wait_dialog";
     }
     if !v.own {
@@ -5730,11 +5769,11 @@ fn resubmit_withheld_one(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -
         // 게이트 안 재확인(원자·leaf 판독뿐) — 관측과 인계 사이에 직접 send·사람 키가 끼었으면 이번 틱은 쓰지 않는다.
         if s.inject_track.last_body().map(|b| b.at) != Some(w.body_at)
             || s.pending_input_bytes.load(Ordering::Relaxed) != 0
-            || !s.inject_track.clear_withheld_if(w.at)
+            || !s.inject_track.clear_withheld_if(at)
         {
             return "raced";
         }
-        let probe = submit_cr_withhold_probe(daemon, s, markers, "resubmit", w.from);
+        let probe = submit_cr_withhold_probe(daemon, s, markers, "resubmit", from);
         let req = crate::state::WriteReq::SubmitAfterGap {
             bytes: b"\r".to_vec(),
             min_gap_ms: crate::handlers::cr_min_gap_ms(),
@@ -5754,8 +5793,8 @@ fn resubmit_withheld_one(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -
         Some(s.id),
         json!({
             "surface_ref": cys::surface_ref(s.id),
-            "from": w.from.map(cys::surface_ref),
-            "withheld_ms_ago": w.at.elapsed().as_millis() as u64,
+            "from": from.map(cys::surface_ref),
+            "withheld_ms_ago": now.saturating_duration_since(at).as_millis() as u64,
             "note": "창이 닫히고 입력줄이 보류한 기계 본문 그대로라 그 제출 CR 을 다시 썼다(쓰기 직전 창이 다시 뜨면 또 보류).",
         }),
     );
@@ -21330,6 +21369,53 @@ mod reflect_queue_tests {
     fn fv2_withheld_wait_cap_is_bounded() {
         assert_eq!(super::WITHHELD_SUBMIT_WAIT_CAP_SECS, 600);
         assert!(super::WITHHELD_SUBMIT_WAIT_CAP_SECS < crate::state::QUEUE_TTL_DEFAULT_SECS);
+    }
+
+    /// ★(0.14.42 · 수정 4회차 R3C-1) 보류 기록 시계(순수) — 창 시계는 창을 **연달아** 연 것으로 본 틱 사이만 더하고, 닫힘을
+    /// 보면 0, 못 본 틱은 사슬만 끊는다. pause 틱은 두 시계 모두 멈춘다(경과를 버림). 나이(`live_ms`)는 pause 가 아닌 경과 전부.
+    #[test]
+    fn r3c_withheld_clocks_measure_open_window_and_skip_pause() {
+        use std::time::{Duration, Instant};
+        let s = |n: u64| Duration::from_secs(n);
+        let t0 = Instant::now();
+        let mut w = crate::state::WithheldSubmit::new(t0, t0, None);
+        assert!(w.dialog_open && w.dialog_ms == 0 && w.live_ms == 0, "생성 = 창 관측(열림) · 시계 0: {w:?}");
+        // 창이 열린 채 5초.
+        let e = w.advance(t0 + s(5), false);
+        w.observe_dialog(Some(true), e);
+        assert_eq!((e, w.live_ms, w.dialog_ms), (5_000, 5_000, 5_000), "{w:?}");
+        // pause 60초(창 그대로) — 두 시계 정지.
+        let e = w.advance(t0 + s(65), true);
+        assert_eq!((e, w.live_ms, w.dialog_ms), (0, 5_000, 5_000), "pause 는 경과를 버린다: {w:?}");
+        let e = w.advance(t0 + s(70), false);
+        w.observe_dialog(Some(true), e);
+        assert_eq!((w.live_ms, w.dialog_ms), (10_000, 10_000), "resume 뒤는 마지막 pause 틱부터만 잰다: {w:?}");
+        // 창이 닫혔다 — 창 시계 0, 나이는 계속.
+        let e = w.advance(t0 + s(75), false);
+        w.observe_dialog(Some(false), e);
+        assert_eq!((w.live_ms, w.dialog_ms, w.dialog_open), (15_000, 0, false), "{w:?}");
+        // 닫힌 뒤 긴 작업(10분) — 창 시계는 0 그대로.
+        let e = w.advance(t0 + s(675), false);
+        w.observe_dialog(Some(false), e);
+        assert_eq!((w.live_ms, w.dialog_ms), (615_000, 0), "창이 닫힌 대기는 창 시계에 들지 않는다: {w:?}");
+        // 새 창 — 첫 관측은 직전이 닫힘이라 더하지 않고, 다음 틱부터 센다.
+        let e = w.advance(t0 + s(680), false);
+        w.observe_dialog(Some(true), e);
+        assert_eq!(w.dialog_ms, 0, "새 창의 첫 관측: {w:?}");
+        let e = w.advance(t0 + s(685), false);
+        w.observe_dialog(Some(true), e);
+        assert_eq!(w.dialog_ms, 5_000, "{w:?}");
+        // 못 본 틱(사이클 창) — 사슬만 끊는다(0 으로 돌리지도 더하지도 않는다).
+        let e = w.advance(t0 + s(700), false);
+        w.observe_dialog(None, e);
+        assert_eq!((w.dialog_ms, w.dialog_open), (5_000, false), "{w:?}");
+        let e = w.advance(t0 + s(705), false);
+        w.observe_dialog(Some(true), e);
+        assert_eq!(w.dialog_ms, 5_000, "못 본 구간 뒤 첫 관측은 더하지 않는다: {w:?}");
+        // 시계 역행(더 이른 now) — 경과 0 · 잰 시각은 뒤로 가지 않는다.
+        let before = w;
+        assert_eq!(w.advance(t0 + s(1), false), 0);
+        assert_eq!((w.seen_at, w.live_ms), (before.seen_at, before.live_ms), "{w:?}");
     }
 
     /// ★(0.14.42 · 수정 2회차 F1) writer 보류 탐침 — 빈 composer·우리 본문 composer 는 통과, 창이면 보류(이벤트 1건),

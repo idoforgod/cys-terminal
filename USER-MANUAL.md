@@ -742,8 +742,11 @@ cys send --queued --to worker "..."    # followup 큐: 대상이 조용해지면
     상자 전체를 본문과 대조합니다 · 그 입력 상자 위에 남은 `❯ 1. …` 같은 이전 메시지·본문 첫 줄은 창으로 보지 않습니다)
     그 CR 을 쓰지 않습니다(`queue.submit_withheld`). 본문은 입력줄에 남고, 창이 닫힌 뒤 입력줄이 여전히 그 본문 그대로면
     데몬이 그 CR 을 **한 번** 다시 씁니다(`queue.submit_resubmitted` · 5초 주기 점검 · pause 중에는 하지 않음 · 그 사이
-    사람이 그 줄에 손을 댔거나 다른 기계 본문이 들어왔으면 다시 쓰지 않고 `queue.submit_withheld_dropped` · 10분이 지나도
-    창이 닫히지 않으면 기다림을 그만두고 같은 이벤트 `reason:"wait_cap"` — 입력줄 본문은 그대로). 에이전트가 막 앉아 데몬이
+    사람이 그 줄에 손을 댔거나 다른 기계 본문이 들어왔으면 다시 쓰지 않고 `queue.submit_withheld_dropped` · 창이 10분 넘게
+    닫히지 않으면 기다림을 그만두고 같은 이벤트 `reason:"wait_cap"` — 입력줄 본문은 그대로). 10분은 **창이 열려 있는
+    시간만** 셉니다: 창이 닫힌 뒤 에이전트가 그 작업을 이어 가는 동안은 입력을 기다리는 상태로 돌아올 때까지 기다리고
+    (작업이 10분을 넘어도 끝난 뒤 한 번 다시 씀), kill-switch pause 동안은 시계가 멈춥니다. 창이 닫힌 뒤 기다림의 상한은 큐
+    TTL(기본 6시간 · pause 시간 제외 · 넘으면 `reason:"expired"`)입니다. 에이전트가 막 앉아 데몬이
     아직 좌석 점유를 확인하지 못한 동안(기동 뒤 최대 5초)에도 보류하되, 그때는 커서가 선택지 행(`❯ 1. …`)일 때만
     창으로 봅니다(죽은 좌석의 창 잔상 아래 셸에 치는 재기동 Return 은 막지 않음). **이미 보이는 창에 보내는
     Return(승인)·방향키 뒤 Return 은 종전처럼 씁니다.** 단, 창이 뜨기 전에 들어간 기계 본문이 입력줄에서 제출을
@@ -1504,8 +1507,10 @@ v0.14.42 가산분(S21 제출 정착 · 전부 additive):
 - `queue.submit_resubmitted` {surface_ref, from, withheld_ms_ago} — 창이 닫히고 입력줄이 보류한 기계 본문 그대로라 그
   제출 CR 을 한 번 다시 썼다(watchdog 5초 틱 · 큐 배달 앞 · pause 중 없음)
 - `queue.submit_withheld_dropped` {surface_ref, reason("human"·"newer_body"·"line_empty"·"seat_off"·"kill_switch"·
-  "unobservable"·"expired"·"wait_cap"), from, withheld_ms_ago} — 보류한 CR 을 다시 쓰지 않기로 했다(입력줄 본문은 그대로
-  둔다 · `wait_cap` = 보류 뒤 10분 안에 창이 닫히지 않았다)
+  "unobservable"·"expired"·"wait_cap"), from, withheld_ms_ago, dialog_open_ms} — 보류한 CR 을 다시 쓰지 않기로 했다(입력줄
+  본문은 그대로 둔다 · `wait_cap` = 질문·선택 창(또는 승인 대기)이 10분 넘게 연달아 열려 있었다 — 창이 닫힌 뒤의 작업
+  대기와 kill-switch pause 는 세지 않는다 · `expired` = pause 를 뺀 대기가 큐 TTL 을 넘었다 · `dialog_open_ms` = 버릴 때
+  창이 연달아 열려 있던 시간(창이 닫혀 있었으면 0))
 
 ---
 
