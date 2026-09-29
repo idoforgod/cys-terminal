@@ -128,7 +128,7 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
 | `watchdog.proc_count_high` | 한 surface의 자식 폭증 | 해당 노드 점검·경고, 필요 시 `close-surface`(자식 트리 전멸) 건의 |
 | `health.alert` (not_logged_in·token_expired 등) | 노드 인증·로그인 이상 | 해당 노드 작업 중단 안내 → master에 재로그인 필요 보고 |
 | `pane.idle` | 노드 장기 무출력 | read-screen으로 상태 확인 → hang이면 회생 조치(키 입력/재기동 건의)는 **§1-1 승인 안**에서만 — 대상이 master 자신이면 §1-2(오너 채널) |
-| `context.threshold` | 노드 컨텍스트 60% 도달(데몬 결정론 발화) | 핸드오프 집행 준비 — `cys cycle-agent`(저장→검증→clear→복원) 집행(§2). **master 본인 60%면 네가 개시 주체로 시점 판단·통보 → ack·검증 후 "주인 대신" `/clear` 집행**(self-clear는 코드+규칙 이중 차단·무응답 시 독립검증 후 조건부 집행 — §2) |
+| `context.threshold` | 노드 컨텍스트 60% 도달(데몬 결정론 발화 · clear 뒤에는 잰 수준 위로 자란 뒤에만) | 핸드오프 집행 준비 — `cys cycle-agent --fire <id>`(경보의 `fire=` · 저장→검증→clear→복원) 집행(§2) · exit 87 = 이미 처리됨(재집행 금지). **master 본인 60%면 네가 개시 주체로 시점 판단·통보 → ack·검증 후 "주인 대신" `/clear` 집행**(self-clear는 코드+규칙 이중 차단·무응답 시 독립검증 후 조건부 집행 — §2) |
 | `queue.depth_high` | 한 노드행 queued 배달이 막힌 채 적체(기본 depth 5+ · blocked_by에 사유) | read-screen으로 대상 노드 점검 → 막힘 원인(연속 출력·사람 입력·queue pause) 해소 또는 master 보고 |
 | `queue.starved` | 큐 **머리**가 임계 이상 배달이 막힌 채 장기 대기(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 0=비활성 · depth_high와 **별도 축** · blocked_by에 사유) | depth_high와 동일하게 원인(연속 출력·사람 입력·queue pause)을 해소하거나 master 보고. **★강제 배달 `cys queue deliver`는 사람 운영자 전용이다 — LLM 에이전트(CSO·master 포함)는 자동 강제배달 금지·사람 판단에 맡긴다**(경보는 발행뿐, 자동 조치 없음이 계약) |
 | `master.idle` | master **생존 확정 + 장기 침묵**(category=info · 사망 축 `master.deadman`과 분리 — idle은 alert가 아니다) | 정보층은 조치 불요(리포트 게이트 대장이 회수·기록). 게이트가 3×임계에서 critical push로 너를 깨우면 read-screen으로 master 상태 확인 → hang이면 **§1-2** 를 따른다(승인 주체가 고장 대상이므로 오너 채널 · 무승인 키 입력 금지) |
@@ -287,7 +287,7 @@ cysd 데몬이 기계적으로 감시하고, 너는 그 신호를 **판단하고
   (중복 수신은 같은 사건이다 — 먼저 상태를 조회한다). 집행 결과가 불명이면 **재집행하지 말고** 관측으로
   확인하고, 복원(재개) 확인에 실패하면 추가 자동 사이클을 **정지**하고 오너에 상신한다 — 실패한 회생을
   반복하는 것이 큐 폭주의 경로다. 집행 시점에 대상 role 이 다른 surface 로 옮겨졌으면 앞선 검증은
-  무효이며 처음부터 다시 판정한다.
+  무효이며 처음부터 다시 판정한다. 경보의 `fire=<id>` 를 ④의 1콜에 `--fire <id>` 로 넘긴다 — exit **87 = 이미 처리됨**(같은 좌석 사이클 진행 중 · 그 통보 뒤 사이클이 이미 끝남 · 송신 0건)이며 재집행하지 않는다. `context.clear_ineffective`·`context.level_measured` 는 오너 관측 feed 이지 clear 개시 신호가 아니다(개시 신호는 `context.threshold` 하나).
   **이 경계가 푸는 것은 ④의 보류 중 §2 사이클 집행 1콜뿐이다** — AUTOPILOT_PAUSED·오너 실시간 입력·
   master self-clear 금지·게이트 deny·§5-1 오살 금지는 그대로 적용된다. 그 밖의 회생(키 입력·`kill`·
   `close-surface`·재기동·잡 재등록)은 '사이클' 이라는 이름을 붙여도 이 경계가 아니다 — 판정은 명령

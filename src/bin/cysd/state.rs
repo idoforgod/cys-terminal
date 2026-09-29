@@ -1141,12 +1141,6 @@ impl InjectTrack {
         self.last_body.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// ★(0.14.42 · ROLE-R4-1 · R2NC5-1) 마지막 Inject arm 이 끝난 시각(없으면 None) — clear 직후 바닥 가드가 복원 턴 뒤
-    /// 첫 좌석 입력(대기열·채널·스케줄 배달)을 안다(`usage::last_input_of`). 읽기만(말단 락).
-    pub(crate) fn done_at(&self) -> Option<Instant> {
-        *self.done_at.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
     /// 지금 Inject arm 이 쓰는 중이거나, 마지막 arm 이 끝난 지 `within` 이 안 됐는가.
     pub(crate) fn busy_within(&self, within: std::time::Duration) -> bool {
         self.active.load(Ordering::Acquire)
@@ -1300,6 +1294,21 @@ pub struct BootAck {
     pub generation: u32,
 }
 
+/// ★(0.14.42 · clear 가드 v3) 사이클 단일 비행 점유 — `surface.cycle_claim` 이 기록한다(`Surface::cycle_claim`).
+#[derive(Debug, Clone)]
+pub struct CycleClaim {
+    /// 점유한 집행자(`cys cycle-agent`)의 peer pid — None = 미상(생존 판정 불가 → 상한만).
+    pub pid: Option<u32>,
+    /// 점유 시각(epoch 초).
+    pub since: f64,
+    /// 집행 중인 통보(`context.threshold` 의 `fire_id`) — 없으면 수동 사이클.
+    pub fire_id: Option<String>,
+}
+
+/// 사이클 점유 상한(초) — cycle-agent 한 사이클(최대 약 8.5분)보다 넉넉하게. 넘긴 점유는 버린다(점유가 굳어 사이클이 영구히
+/// 막히는 ② 방향 차단 · 산 집행자의 긴 사이클이면 중복 집행 1회로만 틀린다).
+pub const CYCLE_CLAIM_MAX_SECS: f64 = 1200.0;
+
 pub struct Surface {
     pub id: u64,
     /// (B5 · §2-8) 이 좌석에 arm 된 부트 논스 — arm 은 `boot.arm_nonce` RPC 로만 일어난다.
@@ -1356,10 +1365,6 @@ pub struct Surface {
     ingest: Mutex<IngestState>,
     pub out_tx: broadcast::Sender<Vec<u8>>,
     pub last_output: Mutex<Instant>,
-    /// ★(0.14.42 · clear 직후 바닥 가드) 마지막으로 **끝난** 출력의 조용한 틈 `(시작, 끝)` — 길이가
-    /// [`crate::usage::CTX_FLOOR_IDLE_QUIET_SECS`] 이상일 때만 reader 가 기록한다(턴 끝 → 다음 입력). 가드는 이것으로 clear
-    /// 사이클의 복원 턴이 끝난 시점을 알아 그 뒤 작업을 바닥에 싣지 않는다(`CtxLoopGuard::note_idle`). 휘발 · 말단 락.
-    pub last_output_gap: Mutex<Option<(Instant, Instant)>>,
     /// ★(0.14.31 · WP-1 H-1 · 리뷰 R1) **출력 세대** — reader 가 청크 하나를 발행하는 동안 홀수, 발행이 끝나면
     /// 짝수(seqlock 부호). `surface.read_text` 의 `quiet_secs` 는 화면/스크롤백 스냅샷 앞뒤로 이 값을 읽어
     /// 세대가 홀수였거나 달라졌으면 관측을 **버린다**(`quiet_secs = 0.0` — 출력이 흐르는 중). 스탬프
@@ -1529,14 +1534,16 @@ pub struct Surface {
     /// `reinject.mark` RPC(주입 성공 직후 컨트롤러만 호출). topology 영속·restore 복원으로
     /// 재기동을 견딘다. None=미주입(첫 pack-update에서 1회 주입). agent_session_id와 동일 위치 init.
     pub pack_reinject: Mutex<Option<PackReinject>>,
-    /// context.threshold 에지 게이트 — 자기보고(status.set)·관측(usage.rs) **공유**.
-    /// true=발화 가능(임계 미만 관측됨). 분리하면 같은 교차에 두 경로가 각각 발화해
-    /// master/CSO가 cycle-agent를 이중 집행한다. swap(false)가 원자적 1회 발화를 보장.
-    pub ctx_threshold_armed: AtomicBool,
-    /// ★(0.14.42 · RV-R2NC-1) clear 직후 바닥 가드 — clear+지침 재주입 직후 바닥이 이미 임계를 막는 좌석(200K 창의
-    /// master·CEO)이 곧바로 재발화해 CSO 가 같은 좌석을 다시 clear 하는 재주입 고리를 끊는다. 판정은
-    /// `handlers::maybe_fire_context_threshold` 하나에서만 쓴다(`crate::usage::CtxLoopGuard` 독 코멘트).
-    pub ctx_loop_guard: Mutex<crate::usage::CtxLoopGuard>,
+    /// ★(0.14.42 · clear 가드 v3) context.threshold 판정 상태기계 — 자기보고(status.set)·관측(usage.rs)·statusline
+    /// (usage.report) 세 경로가 **공유**하는 좌석당 하나(분리하면 같은 교차에 두 경로가 각각 발화해 master/CSO가 cycle-agent를
+    /// 이중 집행한다). 입력은 게이트(`handlers::maybe_fire_context_threshold`)·사이클 표지(`surface.quiesce` ·
+    /// `governance::release_quiescing`)·수집기 틱·단일 비행 질의(`surface.cycle_claim`)뿐이다. 말단 락(안에서 다른 락을 잡지
+    /// 않는다 · 발행은 놓은 뒤) · 휘발(데몬 재기동 = 새 세대 — 첫 교차는 기본 임계에서 1회 발화).
+    pub ctx_loop_guard: Mutex<crate::usage::clear_guard::ClearGuard>,
+    /// ★(0.14.42 · clear 가드 v3) 사이클 단일 비행 점유(`surface.cycle_claim`) — `cys cycle-agent` 가 0단계에서 잡고 끝날 때
+    /// 놓는다. 산 점유가 있으면 다른 집행은 busy(rc 87 건너뜀). 죽은 pid·[`CYCLE_CLAIM_MAX_SECS`] 를 넘긴 점유는 게으르게
+    /// 버린다. 휘발 · 말단 락(가드 락보다 먼저 잡는다).
+    pub cycle_claim: Mutex<Option<CycleClaim>>,
     /// (B2) OSC 9/99/777 알림 스캐너 carry — reader 스레드 전용(단일 스레드 접근이라 Mutex면 충분).
     /// strip 전 raw chunk를 누적해 완성 OSC 시퀀스만 추출한다(화면 렌더/strip 경로와 독립).
     pub osc_carry: Mutex<Vec<u8>>,
@@ -5621,7 +5628,6 @@ impl Daemon {
             }),
             out_tx,
             last_output: Mutex::new(Instant::now()),
-            last_output_gap: Mutex::new(None),
             output_gen: Arc::new(AtomicU64::new(0)),
             idle_notified: AtomicBool::new(false),
             last_recall_line: Mutex::new(String::new()),
@@ -5667,8 +5673,8 @@ impl Daemon {
             claude_config_dir: Mutex::new(Some(resolved_config_dir)),
             config_dir_trusted,
             pack_reinject: Mutex::new(None),
-            ctx_threshold_armed: AtomicBool::new(true),
-            ctx_loop_guard: Mutex::new(crate::usage::CtxLoopGuard::default()),
+            ctx_loop_guard: Mutex::new(crate::usage::clear_guard::ClearGuard::default()),
+            cycle_claim: Mutex::new(None),
             // 능력 가드: 생성 시 역할에서 도출(reviewer-*=read/search, full=worker/master/cso,
             // 그 외 deny-by-default none). claim_role이 역할 전이 시 동기 재도출한다.
             caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),
@@ -5791,14 +5797,7 @@ impl Daemon {
                         //   `ingest_output` 뒤에서 올린다. 사람 입력·주입 자체는 여기 오지 않지만 그 **PTY
                         //   에코**는 출력이라 스탬프를 움직인다(보수 방향 — 주입 직후 밸브가 더 기다린다).
                         surf.output_gen.fetch_add(1, Ordering::AcqRel);
-                        // ★(clear 직후 바닥 가드) 스탬프 직전 값 = 이 청크 앞의 조용함이 시작된 시각(쓰기 주체는 이 reader 하나).
-                        let quiet_from = *surf.last_output.lock().unwrap();
                         *surf.last_output.lock().unwrap() = Instant::now();
-                        // 끝난 조용한 틈(턴 끝 → 다음 입력의 에코)을 기록 — 틈이 짧으면 건드리지 않는다(말단 락 · 끝 = 방금 스탬프).
-                        let out_at = *surf.last_output.lock().unwrap();
-                        if out_at.saturating_duration_since(quiet_from).as_secs_f64() >= crate::usage::CTX_FLOOR_IDLE_QUIET_SECS {
-                            *surf.last_output_gap.lock().unwrap_or_else(|e| e.into_inner()) = Some((quiet_from, out_at));
-                        }
                         // DSR cursor-position query: a real terminal must answer, or
                         // ConPTY(Windows)가 응답을 기다리며 입출력 펌프를 멈춘다.
                         // ★G5-④: 경계 분할 carry + 질의 '수' 계상은 순수 함수 단일 정의처

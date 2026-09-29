@@ -1606,12 +1606,6 @@ fn master_hold(daemon: &Arc<Daemon>, sid: u64) -> Result<Arc<crate::state::Surfa
     }
     let surface = daemon.get_surface(sid).ok_or(InboxHold::Unavailable)?;
     if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Channel) {
-        // ★(0.14.42 · RV2NC-E20-2) clear 사이클의 복원 턴 동안은 보류한다(quiescing 의 연장 · 상한 120초) — 복원 턴 도중에 타이핑된
-        //   행은 Claude 가 복원 턴 뒤 조용함 없이 곧바로 처리해 그 턴이 clear 직후 바닥(복원 끝)에 든다: 여유 있는 master 가
-        //   Probe → Stopped 로 오판돼 cys clear 를 잃었다(드릴 rv-d3). 복원 턴 끝(≥2초 조용함) 뒤 sweep 이 배달한다.
-        if crate::usage::restore_turn_open(daemon, &surface) {
-            return Err(InboxHold::Gate(crate::governance::MachineHold::Quiescing));
-        }
         let axes = channel_hold_axes();
         if let Some(h) = crate::governance::machine_direct_hold(daemon, &surface, axes) {
             return Err(InboxHold::Gate(h));
@@ -3383,44 +3377,6 @@ mod tests {
                 .unwrap();
             assert_eq!(st, "injected");
         }
-        let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
-    }
-
-    /// ★(0.14.42 · RV2NC-E20-2 · ②) clear 사이클의 **복원 턴 동안**(quiescing 해제 뒤 · 복원 끝 전 · 상한 120초) 채널 행은 보류된다
-    /// — 복원 턴 도중에 타이핑된 행은 Claude 가 복원 턴 뒤 조용함 없이 곧바로 처리해 그 턴이 clear 직후 바닥에 들었다(드릴 rv-d3:
-    /// 참 바닥 72 master 가 76 → Probe → Stopped). 복원 턴 끝(≥2초 조용함)을 보면 곧바로 풀리고, 조용함이 오지 않아도 상한 뒤에는
-    /// 종전대로 배달한다(무기한 보류 없음). clear 뒤 세션이 아니면(발화 이력 없음) 보류하지 않는다.
-    #[cfg(unix)]
-    #[test]
-    fn restore_turn_holds_channel_rows_until_the_restore_turn_ends() {
-        let d = tmp_daemon("restore_hold");
-        let surface = d
-            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
-            .expect("surface");
-        let sid = surface.id;
-        d.roles.lock().unwrap().insert("master".into(), sid);
-        assert!(master_hold(&d, sid).is_ok(), "발화 이력 없는 좌석(부트)에 보류가 걸렸다");
-        let now = d.started_instant.elapsed().as_secs_f64();
-        {
-            let mut g = surface.ctx_loop_guard.lock().unwrap();
-            g.fired_at = Some(now - 200.0);
-            g.note_session_change(now - 100.0);
-            g.note_quiescing(now - 5.0); // 붙여넣기 직후 quiescing 해제 — 시작점
-            let _ = g.observe(64, Some(200_000), now - 4.0); // 복원 턴 보고(상승)
-        }
-        assert_eq!(master_hold(&d, sid).err(), Some(InboxHold::Gate(crate::governance::MachineHold::Quiescing)),
-                   "복원 턴 도중에 채널 행을 주입하려 했다");
-        // 복원 턴 끝(≥2초 조용함) — 곧바로 풀린다.
-        surface.ctx_loop_guard.lock().unwrap().note_idle(now - 3.0, now, now);
-        assert!(master_hold(&d, sid).is_ok(), "복원 턴이 끝났는데 보류가 풀리지 않았다");
-        // 조용함이 오지 않는 좌석 — 시작점 + 120초 뒤에는 종전대로 배달한다.
-        {
-            let mut g = surface.ctx_loop_guard.lock().unwrap();
-            g.fired_at = Some(now - 1_000.0);
-            g.note_session_change(now - 900.0);
-            g.note_quiescing(now - crate::usage::CTX_FLOOR_RESTORE_HOLD_SECS - 1.0);
-        }
-        assert!(master_hold(&d, sid).is_ok(), "보류 상한을 넘겨 채널 행을 무기한 붙잡았다(③)");
         let _ = crate::governance::close_surface(&d, sid, crate::governance::CloseCause::Reap);
     }
 

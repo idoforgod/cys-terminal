@@ -1871,21 +1871,6 @@ fn deliver_push(
         //   노브(`CYS_MACHINE_INJECT_HOLD` 에서 schedule 제외)면 종전 U8 P1 과 byte-identical 이다(상한 100 · TTL 없음).
         if crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Schedule) {
             use crate::governance::MachineHold as H;
-            // ★(0.14.42 · RV2NC-E20-2) clear 사이클의 복원 턴 동안은 좌석 큐로 우회한다(quiescing 의 연장 · 상한 120초) — 바쁨을
-            //   보지 않는 직접 주입은 Claude 가 복원 턴 뒤 곧바로 처리해 clear 직후 바닥(복원 끝)을 오염시킨다. 큐는 턴이 끝난 좌석에만
-            //   배달하므로 복원 턴 끝 뒤에 나간다(주기 잡 TTL · 병합은 다른 우회와 같다). fresh 잡(갓 띄운 좌석)은 해당 없음.
-            if !job.fresh && crate::usage::restore_turn_open(daemon, &surface) {
-                let enqueued = enqueue_schedule_divert(
-                    daemon,
-                    job,
-                    sid,
-                    text,
-                    role_guard,
-                    SCHEDULE_FALLBACK_HEADROOM,
-                    schedule_divert_ttl_secs(job),
-                )?;
-                return Ok(if enqueued { "queued(gate:restore)" } else { "queued(dedup)" });
-            }
             let hold = crate::governance::machine_direct_hold(daemon, &surface, schedule_hold_axes(job.fresh));
             // ★(R3SH-1 · R3SH-2) 초안 우회 추적 — 초안이 아닌 판정은 이 잡의 연속 기록을 끊는다.
             let draft_step = match hold {
@@ -4995,29 +4980,6 @@ mod h2_schedule_hold_tests {
         assert_eq!(q[0].from.as_deref(), Some("schedule:heartbeat-5m"));
         assert_eq!(q[0].ttl_secs, Some(300), "주기 잡 우회 항목 TTL = 주기");
         assert_eq!(classify_fire_result(&Ok("queued(gate:draft) to master".into())), JobResultKind::Queued);
-        done(&s);
-    }
-
-    /// ★(0.14.42 · RV2NC-E20-2 · ②) clear 사이클의 **복원 턴 동안** 직접 push 는 좌석 큐로 우회한다(`queued(gate:restore)` —
-    /// 대기열은 턴이 끝난 좌석에만 배달하므로 복원 턴 끝 뒤에 나간다). 복원 턴 끝(≥2초 조용함) 뒤에는 종전 직접 주입.
-    #[test]
-    fn restore_turn_diverts_direct_push_to_the_queue() {
-        let (d, s) = rig("restore-hold");
-        h_paint(&s, H_IDLE_SCREEN);
-        let now = d.started_instant.elapsed().as_secs_f64();
-        {
-            let mut g = s.ctx_loop_guard.lock().unwrap();
-            g.fired_at = Some(now - 200.0);
-            g.note_session_change(now - 100.0);
-            g.note_quiescing(now - 5.0);
-            let _ = g.observe(64, Some(200_000), now - 4.0);
-        }
-        assert_eq!(deliver_push(&d, &periodic("hb", 5), s.id, "[heartbeat] a", None), Ok("queued(gate:restore)"));
-        assert_eq!(h_ledger_count(&d, "schedule"), 0, "복원 턴 도중 직접 주입했다");
-        assert_eq!(queue(&s).len(), 1);
-        assert_eq!(classify_fire_result(&Ok("queued(gate:restore) to master".into())), JobResultKind::Queued);
-        s.ctx_loop_guard.lock().unwrap().note_idle(now - 3.0, now, now);
-        assert_eq!(deliver_push(&d, &periodic("hb2", 5), s.id, "[heartbeat] b", None), Ok("pushed"), "복원 턴 끝 뒤에도 우회했다");
         done(&s);
     }
 

@@ -1401,10 +1401,10 @@ pub fn summarize_payload(name: &str, payload: &Value) -> String {
             let role = identity_field(payload, "role").unwrap_or_else(|| "-".into());
             let pct = field(payload, "context_pct").unwrap_or_else(|| "?".into());
             let th = field(payload, "threshold").unwrap_or_else(|| "?".into());
-            // ★(RR3-R1-1) clear 뒤 바닥이 선제 압축 상한 위라 올린 임계가 그 위인 발화 — 받는 CSO 가 알도록 표지만 싣는다
-            //   (발화 자체는 데몬이 잰 바닥 위로 실제로 자란 뒤라 평소대로 1회 집행 대상이다).
-            let tag = if payload.get("floor_limited").and_then(Value::as_bool) == Some(true) { " floor_limited" } else { "" };
-            Some(format!("role={role} context={pct}% threshold={th}%{tag}"))
+            // ★(0.14.42 · clear 가드 v3) 발화 번호를 싣는다 — 받는 CSO·master 가 `cys cycle-agent --fire <id>` 로 넘겨 같은 통보의
+            //   중복 집행을 데몬이 건너뛰게 한다(rc 87). 문자열 값만 싣는다(없으면 종전 문면).
+            let fire = payload.get("fire_id").and_then(Value::as_str).filter(|f| !f.is_empty()).map_or_else(String::new, |f| format!(" fire={f}"));
+            Some(format!("role={role} context={pct}% threshold={th}%{fire}"))
         }
         "queue.depth_high" => {
             let depth = field(payload, "depth").unwrap_or_else(|| "?".into());
@@ -5602,13 +5602,13 @@ mod pure_tests {
             ("surface.exited", json!({"role": "worker", "agent": "codex"}), "role=worker agent=codex"),
             ("context.threshold", json!({"role": "worker", "context_pct": 75, "threshold": 60}),
                 "role=worker context=75% threshold=60%"),
-            // ★(RR3-R1-1) 선제 압축 상한 위에서 난 clear 뒤 발화는 받는 CSO 가 표지로 안다(거짓·문자열 값은 표지 아님).
-            ("context.threshold", json!({"role": "master", "context_pct": 80, "threshold": 80, "floor_limited": true}),
-                "role=master context=80% threshold=80% floor_limited"),
-            ("context.threshold", json!({"role": "master", "context_pct": 80, "threshold": 80, "floor_limited": "true"}),
-                "role=master context=80% threshold=80%"),
-            ("context.threshold", json!({"role": "master", "context_pct": 80, "threshold": 80, "floor_limited": false}),
-                "role=master context=80% threshold=80%"),
+            // ★(clear 가드 v3) 발화 번호는 요약에 실린다(문자열만 · 빈 값·다른 형은 표지 아님).
+            ("context.threshold", json!({"role": "master", "context_pct": 80, "threshold": 77, "fire_id": "1759112345:4:7"}),
+                "role=master context=80% threshold=77% fire=1759112345:4:7"),
+            ("context.threshold", json!({"role": "master", "context_pct": 80, "threshold": 77, "fire_id": ""}),
+                "role=master context=80% threshold=77%"),
+            ("context.threshold", json!({"role": "master", "context_pct": 80, "threshold": 77, "fire_id": 7}),
+                "role=master context=80% threshold=77%"),
             ("queue.depth_high", json!({"depth": 51, "threshold": 50, "blocked_by": "paused"}),
                 "depth=51/50 blocked_by=paused"),
         ];

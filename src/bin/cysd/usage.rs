@@ -103,1282 +103,742 @@ pub struct ObservedUsage {
     pub updated_at: f64,
 }
 
-// ───────────────── ★(0.14.42 · RV-R2NC-1 → RR3-R1-1 · G3ROLE-1) clear 직후 바닥 가드 — 재주입 고리 차단 ─────────────────
+// ───────────────── ★(0.14.42 · clear 가드 v3) 사이클 표지 기반 유한 상태기계 — 폭주·영구 무clear·유휴 발화 차단 ─────────────────
 //
-// 【왜】 918e7365 뒤 claude 좌석은 clear 사이클마다 합성 지침 **전문**(master 약 160KB · CEO 약 170~180KB — soul·메모리
-// 색인·스킬 색인 포함 · worker 약 91KB)을 붙여 넣고, 이어 복원(SESSION_STATE·복원 주입 읽기)으로 몇 %p 더 자란다. 1M
-// 창에서는 clear 뒤 바닥이 약 10~15% 라 무해하지만, 200K 창(문서 기본 `CYS_CLAUDE_CTX_WINDOW`)의 master·CEO 는 바닥이
-// 이미 60~78% 다. 새 세션 파일이 래치를 재무장하므로(아래 `collect_for`) 바닥이 임계 이상이면 곧바로 `context.threshold`
-// 가 다시 나고 CSO 는 방금 clear 한 좌석을 또 clear 해 같은 지침을 또 붙여 넣는다 — **유휴여도** 경보 쿨다운(5분)마다
-// 도는 재주입 고리(①)이고 그동안 부서장은 일하지 못한다(ROLE).
+// 【왜】 clear 사이클은 지침 전문을 다시 붙여 넣는다. 200K(또는 창 미상) master·CEO 는 그 붙여넣기와 복원만으로 60~78% 에 돌아와,
+// 기본 임계(60)의 에지 래치만으로는 유휴 좌석이 경보 쿨다운마다 clear·재주입을 되풀이했다(①). 6cda56b0 ~ 69e3dda6 은 바닥을
+// 추정·분류(영역 5종 · 정착 창 · 조용함 닫힘 · 몰림 추적 · 얇은 세션 속도 · 압축 뒤 들어올림)해 고쳤지만 고칠 때마다 새 반례가
+// 나왔고, 마지막 판은 여유 좌석을 막대 101 로 영구히 잠갔다(RV3NC-1 · ②). 설계 정본:
+// ceo/socket-bidir-2026-09-23/reports/final/clear-guard/clear-guard-redesign.md(v3) · 참조 구현 evidence/v3/model/src/cg3.rs.
 //
-// 【종전 수정의 한계】 6cda56b0·52b8c656 은 "교차 시점 바닥 + 고정 여유" 와 "창 유도 천장(200K 75)" 으로 임계를 올렸다.
-// 바닥이 천장 − 5 이상이면(200K 71~) 올리지 않고 **바닥에서 곧바로 발화**했고(RR3-R1-1: 바닥 72 유휴 좌석 7사이클/40분),
-// 판정을 교차 시점 바닥으로 해 복원 성장(+8%p)이 정착 창 안에서 올린 임계를 넘으면 작업 0 으로 발화했다(G3ROLE-1). 둘 다
-// 바닥 모형(지침 크기·복원 성장량·창)을 추정해 여유를 정한 탓이다.
+// 【무엇】 좌석마다 상태 넷(Free · Awaiting · Cycling · Measuring)과 입력 넷뿐이다 — `report`(관측 1건: 퍼센트·창·축·범위·기본
+// 임계·동결) · `cycle`(사이클 표지 = cys cycle-agent 의 quiescing 켬/끔 · `surface.quiesce` · `governance::release_quiescing`)
+// · `tick`(수집기 2초) · `stale`(집행자 단일 비행 질의). **세션 키는 입력이 아니다** — clear 의 유일한 증거는 사이클 표지이고,
+// 세션 파일 줄기는 낙폭(압축) 판정의 범위 이름일 뿐이다(헬퍼·휴리스틱 재발견·빈 경로가 수준·막대·발화에 닿는 길이 없다).
+//   · 표지 끔(재주입 직후)부터 600초 동안의 최고치를 **축별**(실측 = 상태줄·transcript·rollout / 자기보고 = status.set) 수준 R 로
+//     잰다. 창이 닫힌 뒤 그 축의 첫 관측을 R 에 접는다(창 끝의 관측 공백을 메운다 · 그 관측은 발화하지 않는다).
+//   · 발화 막대 = max(기본, min(R+5, max(S, R+1), C)) — S = 창 − 28K 토큰(200K 85 · 1M 96) · C = 창 − 23K 토큰(차단점 아래로
+//     보이는 가장 큰 정수 · 200K 88 · 1M 97). 막대는 C 를 넘지 않는다(101·NEVER 없음).
+//   · 같은 축·같은(확인된) 범위에서 10%p 이상 떨어지면 압축 — 90초 동안 다시 잰다(자동·수동 /compact·수동 /clear 구분 불가).
+//   · 연속 두 발화 사이 최소 600초(굴림 1시간 ≤ 6). 효과 없는 발화(사이클 뒤 다음 발화 전 압축 · 표지 없이 다시 발화)는
+//     **발화 1건당 한 번만** 세고 15·30·60·120분(상한)으로 미룬다. 사이클 전 압축은 효과 없음이 아니다.
+//   · 발화 → 표지 켬 시한 1200초는 잠정이다(늦은 표지도 그 발화의 clear) · 배달 동결(system.pause) 중에는 흐르지 않는다.
+//   · 틱은 가드 밖 값(observed_usage·agent_status·오버라이드 파일)을 읽지 않는다 — 시한 처리와, 보류해 둔 실측 관측의 보류
+//     만료 재판정뿐이다(보고가 끊긴 좌석도 발화한다 · 낡은 자기보고를 되살리지 않는다).
 //
-// 【무엇 — 구조적 불변식】 바닥을 추정하지 않고 **잰다**. 좌석마다 "마지막 발화 → 그 뒤 첫 세션 교체(clear) → 정착 창 안
-// 최고치 = 이 세션의 바닥" 을 기록하고, 그 세션의 발화 임계를 **바닥 + 여유**(히스테리시스 — [`ctx_floor_bar`])로 둔다.
-// 정착 창 = 시작점 + [`CTX_FLOOR_SETTLE_SECS`](시작점은 사이클의 quiescing 이 이어지는 동안 뒤로 밀린다), 그 뒤에도 바닥이
-// [`CTX_FLOOR_SETTLE_QUIET_SECS`] 안에 올랐으면(복원이 아직 도는 중) 최대 [`CTX_FLOOR_SETTLE_MAX_SECS`] 까지. 그 전에라도
-// **좌석 출력이 조용해지면**(clear 사이클 자신의 입력 = 붙여넣기 → 복원 턴이 끝남 · 시작점 + [`CTX_FLOOR_SETTLE_MIN_SECS`]
-// 이후 · [`CtxLoopGuard::note_idle`]) 닫힌다 — 그 뒤 들어온 작업(대기열 배달·push 는 조용함 3초 뒤라 언제나 틈이 있다)은
-// 바닥이 아니라 성장이다. 시간 창만으로 재면 바쁜 좌석의 바닥이 복원 뒤 몇 분의 작업만큼 부풀어(200K master 72 → 77~85)
-// 여유 있는 좌석이 차단기(Probe·Stopped — 바닥+10 = 선제 압축점 위)로 오판된다(② — 샌드박스 94.9%).
-//   (I1) clear 뒤 세션의 발화는 **잰 바닥 위로 실제로 자란 뒤**다 — 정상·Limited 는 [`CTX_FLOOR_MIN_ROOM`] 이상, Stopped 는
-//        [`CTX_FLOOR_MIN_GROWTH`] 이상, Probe 는 1%p 이상. 정착 창 안에서는 바닥이 관측을 따라 오르므로 발화가 없다(아래
-//        뒷문 하나만 예외). 따라서 유휴 좌석(바닥에서 자라지 않음)의 clear 직후 재발화는 창·지침 크기·복원 성장량과
-//        무관하게 **0** 이고, 사이클 수는 실제 성장량이 부른다(시간·경보 쿨다운이 아니라).
-//   (I2) 바닥 위로 [`CTX_FLOOR_ROOM`] 이상 실제로 자란 컨텍스트는 **반드시** 발화한다(② 무clear 금지). 올린 임계는 가능한
-//        한 Claude Code 한계 아래다 — 선제 압축 천장([`ctx_floor_ceiling`] · 200K 75)이 우선, 그 안에 최소 여유가 없으면
-//        차단 상한([`ctx_floor_hard_cap`] · 200K 80 — 사이클이 차단점 전에 끝난다), 그 안에도 없으면 clear 가 여유를 만들 수
-//        없는 좌석(Probe·Stopped)이다.
-//   (I3) 연속 clear 차단기: 차단 상한 근처 바닥은 **1회만** 다시 clear 해 보고(Probe — max(차단 상한, 바닥+1)), 다음 clear
-//        뒤에도 그러면 자동 clear 를 멈춘다(Stopped — 바닥 + [`CTX_FLOOR_MIN_GROWTH`] 까지 실제로 자랄 때만 재무장 · 그 전에는
-//        Claude Code 자체 자동 압축이 받는다) + 오너 경보(1·2·4·8…번째 — 무한 재시도·무음 둘 다 금지). 바쁜 좌석도
-//        같다 — 차단 상한 근처 바닥에서 바닥+1%p 마다 사이클을 도는 것은 작업 1%p 에 지침 전문 재주입이라 고리와 같다.
-//   (I4) 정착 창 뒷문(② 봉인): 창 안에서도 max(기본, 차단 상한)에서는 발화한다 — clear 직후 몇 분 만에 실제 작업으로 차단
-//        상한을 넘는 좌석이 창이 닫힐 때까지 끌려가지 않게. 뒷문은 한 번 쓰면 바닥이 차단 상한에서 먼 세션(정상·Limited)의
-//        창 밖 발화 뒤에야 다시 무장한다 — 붙여넣기·복원만으로 차단 상한을 넘는 유휴 좌석은 뒷문 1회 뒤 Stopped 로 멈추고,
-//        차단 상한 근처의 바쁜 좌석도 뒷문 1회 뒤에는 Stopped(바닥+10) 사이클만 돈다.
-//   창 미상은 200K 로 본다(천장·상한이 낮아지는 쪽). 창이 바뀌면(1M 전환) 잰 바닥을 토큰 비율로 옮긴다.
-//   (I5) ★(ROLE-R4-1 · R2NC5-1) 차단기(I3)의 재료는 **복원 턴 끝의 바닥**이다([`ctx_floor_bar_measured`]). 사이클은
-//        clear·재주입 동안 대기열·채널·스케줄 배달을 붙잡고(`MachineHold::Quiescing`) 붙여넣기 직후 풀기 때문에, 짧은 복원
-//        턴(라이브 master 14~53초) 뒤 붙잡혔던 배달이 조용함 3초마다 몰려 와 최소 창 60초 안에 처리된다 — 그 몫이 정착 창
-//        최고치에 들어 참 바닥 72 인 200K master 가 76~78 로 재여 Probe → Stopped(바닥+10 · 선제 압축점 위)로 가고 cys clear
-//        가 영영 나지 않았다. 복원 턴 끝은 둘 중 먼저 성립하는 것에서 확정한다: 복원 턴의 보고(시작점 뒤 상승) 뒤 **첫 대기열
-//        배달**(대기열은 턴이 끝난 좌석에만 인계한다 — claude 프롬프트 경계 배달은 조용함을 기다리지 않아 2초 틈이 없을 수
-//        있다 · 인계 뒤 그 배달이 제출(CR)되기 전 1초 안의 늦은 복원 끝 보고는 싣는다), 또는 그 뒤 처음 온 ≥2초 조용함 **다음의
-//        좌석 입력**(writer Inject 끝 · 직접 send · 사람 입력 — [`CtxIdleObs`]). 입력 없이 출력이 다시 흐른 틈은 같은 턴이다 —
-//        확정하지 않는다. 확정된 복원 끝에 여유가 있으면 정착 창 최고치가 차단기 높이여도 Limited(확인 없음 ·
-//        보고 바닥 = 복원 끝) · 막대는 정착 창 최고치의 미확인 막대(max(차단 상한, 최고치+1)) 그대로 — 어떤 막대도 앞당기지
-//        않는다. 확정 뒤 정착 창은 사이클이 붙잡았던 **대기열 항목**(시작점 = quiescing 해제 전에 들어온 것 ·
-//        [`CtxIdleObs::queue_oldest`])이 남아 있는 동안 몰림 조용함([`CTX_FLOOR_BURST_QUIET_SECS`] · 대기열 막힘)에서만 닫혀
-//        붙잡혔던 배달 전체가 최고치에 든다 — 배달만으로는 발화하지 않는다(몰림 길이·크기와 무관하게 사이클마다 도는 고리
-//        없음). ★(R2NC6-1 · RV-ROLE-CF42-1) 그 항목이 다 배달되면 마지막 배달 뒤 ≥2초 조용함에서 닫는다 — 시작점 뒤에 들어온
-//        배달은 새 작업이다(d9638152 는 확정 뒤 언제나 15초를 기다려, 턴 사이 틈이 2~15초뿐인 바쁜 좌석의 창이 300~600초
-//        열린 채 작업을 최고치에 실었다 — 막대 82~86 · 둘째 세션부터 Claude 선제 압축이 cys clear 를 가로챘다). 뒷문 재무장도
-//        복원 끝에 여유가 있고 막대가 차단 상한 이하인 창 밖 발화에서 한다(정착 창 최고치가 76~79 여도).
-//   (I6) ★(R2NC5-1 (b)) Claude 자체 압축(같은 세션 파일 · 컨텍스트가 잰 바닥보다 [`CTX_FLOOR_COMPACT_DROP`] 이상 낮음)을 본
-//        차단기 영역(또는 막대 > 차단 상한) 세션은 재무장한다 — Stopped 는 새 세션이 없으면 다시 재지 않아 오너가 손으로 clear
-//        할 때까지 cys 사이클(저장·지침 재주입)이 영영 없었다. ★(R1-RUNAWAY-1) 재무장은 기본 임계로 곧장 가지 않고 **압축 뒤
-//        바닥을 다시 잰다**(압축 관측 시각을 시작점으로 정착 창을 새로 연다 · 뒷문 없음) — 압축 뒤 SessionStart:compact 훅이
-//        지침 전문을 다시 읽게 해 압축 뒤 수준이 기본 임계 위(60~70%)일 수 있고, d9638152 는 그 수준에서 성장 0 으로 곧바로
-//        발화해 붙여넣기+복원이 선제 압축점 위인 좌석이 붙여넣기 → 압축 → 재읽기 → 발화를 주기 신호마다 돌았다(①). 이제
-//        압축 뒤 발화는 그 바닥 위로 실제로 자란 뒤(바닥 + 여유 · 천장·차단 상한)이고 그 clear 가 바닥을 다시 잰다(참으로 가득
-//        찬 좌석은 다시 Stopped — 압축 1회당 사이클 ≤ 1, 실제 성장이 부른다).
-//        ★(RV2-ROLE-1) 압축 뒤 바닥은 **재읽기 몫**만 잰다 — 압축 관측부터 [`CTX_FLOOR_REREAD_SECS`](90초 · 연장·조용함·몰림 규칙
-//        없음). 압축은 작업 턴 도중에 와 그 턴이 몇 분 이어질 수 있다(종전 clear 뒤 창 규칙은 480초 턴의 작업을 '압축 뒤 바닥'에
-//        실어 63~65 를 80 으로 쟀다). 그 창 안의 두 번째 압축도 다시 잰다 · clear 뒤 창 안의 압축(차단기 세션)도 창이 끝나길
-//        기다리지 않고 곧바로 재무장한다.
-//        ★(ADV2-R1-1) 압축 뒤 발화는 **clear 로 돌아오는 바닥**(압축 전 clear 세션의 복원 끝 + clear 마다 되풀이되는 몰림) + 1
-//        이상에서만 — 그보다 낮은 cys clear 는 컨텍스트를 오히려 올리고 그 붙여넣기가 다음 압축을 불러 성장 약 4.5%p 마다
-//        clear → 압축 → 재무장을 돌았다. 그 바닥이 선제 압축점 높이면(사이클 자신의 입력이 clear 뒤 창 안에서 압축을 불렀다)
-//        압축 뒤 cys 사이클을 걸지 않는다(Claude 압축이 받는다).
-//   (I7) ★(RV2NC-E20-1 · ①) 복원 끝엔 여유가 있지만 정착 창 최고치(사이클이 붙잡은 몰림 · 복원 턴 동안 선 회신 몰림 포함)가
-//        차단 상한 근처인 **얇은 세션**은 확인을 영구히 끄지 않는다 — 미확인 막대 max(차단 상한, 최고치 + 2)(실제 성장 ≥ 1%p 를
-//        입증하는 최소 막대)에서 발화하고, 그 발화를 **성장 속도**로 가른다([`CTX_FLOOR_THIN_SECS`] — 반올림 뺀 실제 성장 하한이
-//        분당 0.2%p 이상이면 일하는 좌석). 느리면(주기 신호·유휴) 다음 세션은 몰림을 바닥으로 확정해(Backlog) 그 위 실제 성장
-//        5%p 마다만 clear 한다 — 사이클 수 ≤ 2 + 성장/5(e20f1cb6 은 드릴 1시간 10~11회). 빠르면(분당 0.5%p 이상 일하는 좌석) 종전처럼
-//        차단 상한 근처에서 clear(선제 압축 전 · ②). 이것이 ①·② 사이의 명시적 빈도 상한이다. 대기열 몰림의 기준도 복원 끝을
-//        확정한 입력 시각까지 넓힌다(복원 턴 동안 선 항목 = 사이클의 몰림).
-//   (I8) ★(RV2NC-E20-2 · ②) 채널 inbox 행·스케줄 직접 push(바쁨을 보지 않는 기계 주입)는 clear 사이클의 **복원 턴 동안** 보류·큐
-//        우회한다([`CtxLoopGuard::restore_turn_open`] · 상한 [`CTX_FLOOR_RESTORE_HOLD_SECS`]) — 복원 턴 도중에 타이핑된 행은 Claude 가
-//        복원 턴 뒤 조용함 없이 곧바로 처리해 복원 끝 바닥을 오염시켰다(여유 있는 master 76 → Probe → Stopped). 그래도 복원 턴
-//        도중에 대기열 아닌 Inject 가 끝나면(다른 생산자) 복원 끝을 그 순간의 최고치(하한)로 확정하고 오염으로 적는다 — 차단기는
-//        그 하한이 차단 상한 근처일 때만.
-//
-// 【실패 방향】 재료가 없으면(세션 교체 미관측 · 정착 창 관측 없음 · 발화 이력 없음 = 부트·phoenix --resume 첫 교차)
-// **종전대로 기본 임계에서 발화**한다 — 사이클 1회(데몬 세대당)이지 무clear 가 아니다. clear 로 여유를 못 만드는 좌석
-// (Stopped)의 처방(1M · 지침 축소)은 오너 결정으로 남는다 — 자동 압축을 끈 좌석은 차단점에서 멈출 수 있음을 경보가 말한다.
-// 남은 한계(수치로 묶임): 복원 성장이 정착 창 최대 길이(붙여넣기 뒤 약 10분) 밖으로 이어지면 그만큼은 작업으로 센다 —
-// 그 좌석의 사이클은 복원 시간에 묶인다(경보 쿨다운 5분이 아니라 · 실측 복원은 300초 안). 복원 턴 끝이 확정되지 않는
-// 좌석(복원 뒤 입력 없음 · 출력이 한 번도 2초 이상 끊이지 않음 · 입력 기록 없는 `send-key` 단독 제출)은 종전대로 정착 창
-// 최고치로 판정한다 — 복원 턴 **안에서** 계속 일하거나(워커 RESUME 긴 턴) 복원 턴 중에 Claude 내부 대기열에 선 입력(채널
-// 행·스케줄 push 는 바쁨을 보지 않는다)이 곧바로 이어지면 그 몫은 바닥에 든다 — 그 좌석이 Stopped 로 가도 Claude 압축
-// 뒤 재무장(I6)이 사이클을 되돌린다. 차단 상한 근처 **복원 끝** 바닥(200K 에서 붙여넣기+복원 ≥ 76%)의 좌석은 1회 재시도
-// 뒤 자동 clear 를 멈추고(Stopped) 선제 압축점(83.5%)은 Claude 자동 압축이 받는다(압축마다 재무장 1회) — 처방(1M · 지침
-// 축소)은 오너 결정.
-//
-// 【천장 — ★R2NC3-1】 천장은 창 크기와 Claude Code 자체 한계에서 유도한다. Claude Code 2.1.282(설치본 strings 실측 ·
-// 실행 안 함): 유효 창 = 창 − min(최대 출력, 20000) · **선제 압축점** = 유효 창 − 13000(압축 창 source 가 `auto` 가
-// 아닐 때 — env `CLAUDE_CODE_AUTO_COMPACT_WINDOW`·settings·서버 clientdata/experiment, 그리고 opus-4-6/4-8/5/5-5·
-// sonnet-4-6 의 200K 창은 `model-default` 라 **기본값이 이쪽**) · **차단점** = 유효 창 − 3000(자동 압축 끔
-// `autoCompactEnabled=false`·`DISABLE_AUTO_COMPACT`·`DISABLE_COMPACT`, 또는 source≠auto — 프롬프트를 보내지 않는다).
-// 200K 창에서 83.5%·88.5% 다. 선제 압축 천장 = 창 − (20000 + 13000 + 사이클 여유 15000)(85 캡) — 200K 75% · 1M 85%.
-// 차단 상한 = 창 − (20000 + 3000 + 사이클 여유 15000) — 200K 80% · 1M 95%(그 퍼센트에서 발화해도 사이클이 차단점 전에
-// 끝난다 · 선제 압축이 먼저 올 수는 있다 — 그래도 교차는 압축점 전이라 cys clear 는 난다). 사용자가 압축 창을 모델 창보다
-// 작게 준 좌석(`CLAUDE_CODE_AUTO_COMPACT_WINDOW`·`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`)은 데몬이 보지 못한다(USER-MANUAL 고지).
+// 【불변식(좌석 · 데몬 세대당)】
+//   (I1 폭주 없음) 발화를 만드는 코드는 `decide` 하나이고 `now ≥ last_fire + 600` 일 때만 Fire → 굴림 1시간 ≤ 6. `decide` 에
+//        이르는 길은 게이트(`report` — 세 보고 경로 공용 · 가드 락 하나 안)와 틱(보류 재판정)뿐이다.
+//   (I2 영구 무clear 없음) 비-Free 상태는 시각만으로 끝난다(Awaiting ≤ 1200(+동결) · Cycling ≤ 660 · Measuring ≤ 600/90) ·
+//        Free 에서 막대 이상인 관측은 Fire 또는 Held{until − now ≤ 7200} · 막대 ≤ max(기본, C) < 차단점.
+//   (I3 유휴 무발화) 발화 ⇒ pct ≥ bar ≥ min(R+5, max(S, R+1), C) — 모든 cys 사이클이 R 을 다시 잰다(clear 효과의 관측 가능성과
+//        무관). 예외: 세대 첫 관측 · S 가장자리 · 표지 없는 clear(오너 수동 /clear · 재기동) 1회 · 자기보고 표본 착오.
+// 가드 상태는 휘발이다 — 데몬 재기동 뒤 각 축 첫 교차는 기본 임계에서 1회 발화한다(가드 전 f7f7a262 과 같다 · 실패 방향 = 발화).
 
-/// clear(세션 교체) 뒤 바닥을 재는 정착 창(초) — 재주입 대기(≤75s)·붙여넣기 처리·복원 읽기를 덮는다(실측 300초 안).
-pub const CTX_FLOOR_SETTLE_SECS: f64 = 300.0;
-/// 정착 창 연장 — 기본 창이 끝나도 바닥이 이 시간(초) 안에 올랐으면(복원이 아직 도는 중) 창을 연다.
-pub const CTX_FLOOR_SETTLE_QUIET_SECS: f64 = 120.0;
-/// 정착 창의 최대 길이(시작점부터 · 초) — 연장이 끝없이 이어져 발화가 막히지 않게(②). 실측 복원(≤300s)의 2배.
-pub const CTX_FLOOR_SETTLE_MAX_SECS: f64 = 600.0;
-/// 정착 창의 최소 길이(시작점부터 · 초) — 이보다 이른 조용함은 창을 닫지 않는다(붙여넣기 처리 시작 전의 틈 · 여러 입력으로
-/// 나뉜 복원). 좌석이 복원 턴을 이보다 일찍 끝내고 곧바로 일을 받으면 그 몫(이 시간 + 한 턴)만 바닥에 든다.
-pub const CTX_FLOOR_SETTLE_MIN_SECS: f64 = 60.0;
-/// 좌석 출력이 이만큼(초) 조용하면 턴이 끝난 것이다(작업 중 claude·codex TUI 는 스피너·경과 시간을 1초보다 잦게 그린다).
-/// 대기열 배달은 조용함 3초(`CYS_QUEUE_QUIET_SECS`) 뒤라 복원 턴과 다음 작업 사이에는 언제나 이만한 틈이 있다.
-pub const CTX_FLOOR_IDLE_QUIET_SECS: f64 = 2.0;
-/// ★(ROLE-R4-1 · R2NC5-1) 복원 끝 바닥이 확정된 뒤, 사이클이 붙잡았던 대기열 항목이 **아직 남아 있는 동안** 정착 창을 닫는
-/// 조용함(초) — 대기열 배달 사이 간격은 조용함 3초 · 최소 간격 10초(`CYS_QUEUE_MIN_INTERVAL_SECS` · 머리 대기가 길면 줄어든다)
-/// 안이라 몰림 속 틈은 이보다 짧다. 몰림 **전체**가 정착 창 최고치에 들어야 막대(≥ 최고치 + 1)가 몰림만으로 발화하지 않는다
-/// (몰림이 복원 끝 바닥의 여유보다 커도 사이클마다 도는 고리가 없다 · ①). 남은 항목이 이만큼 조용한데도 배달되지 않으면(대기열
-/// 막힘) 닫는다. ★(R2NC6-1 · RV-ROLE-CF42-1) 붙잡혔던 항목이 다 배달된 뒤에는 이 규칙이 아니다 — 마지막 배달 뒤 ≥
-/// [`CTX_FLOOR_IDLE_QUIET_SECS`] 조용함에서 닫는다([`CtxLoopGuard::note_idle`] · 종전 d9638152 는 확정 뒤 언제나 15초를 요구해
-/// 대기열이 선 바쁜 좌석(턴 사이 틈 2~15초 — 최소 간격 10초 · 프롬프트 경계 배달은 조용함을 기다리지 않는다)의 창이 시작점 +
-/// 300~600초까지 열린 채 작업을 최고치에 실었다 — 막대 = 최고치 + 1 이 82~86 으로 밀려 Claude 선제 압축이 cys clear 보다 먼저 왔다 · ②).
-pub const CTX_FLOOR_BURST_QUIET_SECS: f64 = 15.0;
-/// ★(ROLE-R4-1 · R2NC5-1) 대기열 배달(인계)로 복원 끝 바닥을 확정한 뒤, 그 배달의 **제출(CR)이 쓰이기 전**이고 이 시간(초)
-/// 안인 보고는 아직 복원 턴의 늦은 보고다 — 턴이 끝나고 상태줄 보고(디바운스 + 보고 명령)가 도착하기 전에 대기열이 프롬프트
-/// 경계에서 곧바로 인계할 수 있다. 제출(writer Inject 의 CR · `InjectTrack::done_at`) 뒤의 보고는 새 메시지를 담을 수 있어
-/// 싣지 않는다(샌드박스 반례: 인계 0.7초 뒤 보고가 22KB 배달을 담아 참 바닥 72 좌석이 77 로 재여 Stopped).
-pub const CTX_FLOOR_INPUT_GRACE_SECS: f64 = 1.0;
-/// ★(RV2NC-E20-1 · ①) **얇은 세션**(복원 끝엔 여유가 있지만 복원 뒤 배달·회신까지 담은 정착 창 최고치가 차단 상한 근처 —
-/// 최고치 + [`CTX_FLOOR_MIN_ROOM`] > 차단 상한)의 발화가 **일하는 좌석**의 것인가를 가르는 시간(초). 정착 창이 닫힌 뒤 발화까지
-/// **표시 성장 − 1**(1%p 반올림을 뺀 실제 성장의 하한)이 이 시간에 최소 여유(5%p)를 채우는 속도(분당 0.2%p) 이상이면 일하는
-/// 좌석이다. ★명시적 빈도 상한(①·② 사이의 선택): 그보다 느린 좌석(주기 신호·유휴 — 분당 0.03~0.15%p)의 얇은 사이클은 연속
-/// 두 세션에 걸쳐 주지 않는다 — 둘째 세션부터는 몰림을 바닥으로 확정해([`CtxFloorRegime::Backlog`]) 그 위 최소 여유 성장마다
-/// 한 번이다(사이클 수 ≤ 2 + 성장/5 · 종전 e20f1cb6 은 사이클마다 몰림이 최고치를 다시 채우는 유휴 좌석을 주기 신호 1~4%p
-/// 마다 돌렸다). 분당 0.5%p 이상 일하는 좌석은 종전대로 차단 상한 근처에서 clear 한다(Claude 선제 압축 전 · ②).
-pub const CTX_FLOOR_THIN_SECS: f64 = 1500.0;
-/// ★(RV2-ROLE-1) Claude 압축 뒤 바닥을 다시 재는 창(초 · 압축 관측 시각부터 · 연장 없음) — 압축 뒤 SessionStart:compact 훅이
-/// 시키는 지침 재읽기(모형 20초 · 100KB 지침 Read 몇 번)를 덮는다. 압축은 작업 턴 **도중**에 오고 그 턴은 몇 분 더 이어질 수
-/// 있어, 조용함(턴 끝)이나 clear 뒤 정착 창(최소 60초 · 최대 600초)을 기다리면 턴의 남은 작업이 '압축 뒤 바닥'에 들었다
-/// (재검증자 반례: 480초 턴 · 참 압축 뒤 수준 63~65 가 80 으로 재여 Stopped · 압축 두세 번에 사이클 한 번). 이 창 안에서는
-/// 발화가 없다(막대 ≥ 최고치 + 1) — 창이 짧아 뒷문이 필요 없다(분당 3%p 에서도 4.5%p).
-pub const CTX_FLOOR_REREAD_SECS: f64 = 90.0;
-/// ★(RV2NC-E20-2) 대기열 배달의 인계(`last_queue_delivery_at`) 뒤 그 배달의 제출(writer Inject 끝)까지로 보는 시간(초) — 이
-/// 안의 Inject 끝은 대기열 배달의 것이다(복원 턴 오염 재료가 아니다 · 붙여넣기 500ms + 큰 본문 쓰기).
-pub const CTX_FLOOR_QUEUE_CR_SECS: f64 = 5.0;
-/// ★(RV2NC-E20-2) clear 사이클의 복원 턴 동안 바쁨을 보지 않는 기계 주입(채널 inbox 행 · 스케줄 직접 push)을 보류하는 상한(초 ·
-/// 정착 창 시작점부터) — 라이브 복원 턴 14~53초의 두 배 남짓. 복원 턴 끝(≥2초 조용함)을 보면 곧바로 푼다 · 조용함이 오지 않는
-/// 좌석(끊김 없는 긴 턴)도 이 시간 뒤에는 종전대로 주입한다(③ 주기 신호·원격 steer 무기한 보류 없음).
-pub const CTX_FLOOR_RESTORE_HOLD_SECS: f64 = 120.0;
-/// 연속 clear 차단기(Stopped)가 자동 clear 를 다시 무장하는 실제 성장(%p) — 잰 바닥 + 이 값.
-pub const CTX_FLOOR_MIN_GROWTH: u8 = 10;
-/// ★(R2NC5-1 (b)) 같은 세션에서 컨텍스트가 잰 바닥보다 이만큼(%p) 이상 낮게 보고되면 Claude 자체 압축(자동·수동 /compact)
-/// 으로 본다 — 한 세션 안의 컨텍스트는 압축 말고는 줄지 않는다(실측 압축 83.5 → 20~35%).
-pub const CTX_FLOOR_COMPACT_DROP: u8 = 10;
-/// 바닥이 임계를 막은 좌석의 다음 clear 여유(%p) — 올린 임계 = 바닥 + ROOM(천장·차단 상한까지).
-pub const CTX_FLOOR_ROOM: u8 = 15;
-/// 올린 임계가 잰 바닥 위로 최소한 줘야 하는 여유(%p). 천장·차단 상한 때문에 이보다 좁으면 그 영역에서 올리지 않는다 —
-/// 바닥 1~4%p 위 임계는 주기 신호(heartbeat·각성 핑) 몇 개마다 사이클이 도는 고리와 같다(★R2NC3-1 · RR3-R1-1).
-pub const CTX_FLOOR_MIN_ROOM: u8 = 5;
-/// 선제 압축 천장의 절대 캡(%) — 큰 창(1M)에서도 이 위로는 Raise 하지 않는다. 실제 천장은 [`ctx_floor_ceiling`].
-pub const CTX_FLOOR_CEIL: u8 = 85;
-/// "발화하지 않음" 임계 — 퍼센트(≤100)가 닿을 수 없는 값. Stopped 의 바닥 + 성장이 100 을 넘을 때.
-pub const CTX_FLOOR_NEVER: u8 = 101;
+/// 잰 수준 위로 이만큼(%p · 표시값) 자라야 발화한다(G) — 표시 5%p = 참 성장 4%p 이상(반올림 두 번).
+pub const CTX_GUARD_GROWTH: u8 = 5;
+/// 사이클 표지 끔(재주입 직후)부터 수준을 재는 창(W · 초).
+pub const CTX_GUARD_MEASURE_SECS: f64 = 600.0;
+/// 압축(같은 범위 10%p 낙폭) 뒤 수준을 재는 창(초) — SessionStart:compact 훅이 시키는 지침 재읽기 몫.
+pub const CTX_GUARD_REREAD_SECS: f64 = 90.0;
+/// 압축으로 보는 같은 축·같은 범위의 낙폭(%p).
+pub const CTX_GUARD_COMPACT_DROP: u8 = 10;
+/// 연속 두 발화 사이 최소 간격(초) — I1 상한 그 자체(굴림 1시간 ≤ 6).
+pub const CTX_GUARD_MIN_SPACING_SECS: f64 = 600.0;
+/// 효과 없는 발화 k 번 연속 뒤 보류 = min(BASE · 2^(k−1), MAX)(초) — 7200 = I2 의 T 상한.
+pub const CTX_GUARD_BACKOFF_BASE_SECS: f64 = 900.0;
+pub const CTX_GUARD_BACKOFF_MAX_SECS: f64 = 7200.0;
+/// 발화 → 사이클 표지 켬 시한(초) — 라우터 유예·쿨다운 ≤300 + 사이클 1~4단계 ≤360 + 픽업 여유 540. 잠정 · 동결 중 정지.
+pub const CTX_GUARD_CLEAR_WAIT_SECS: f64 = 1200.0;
+/// 표지 켬 뒤 끔이 오지 않을 때의 상한(초) = quiescing 상한(`CYS_QUEUE_QUIESCE_HOLD_SECS` 기본 600) + 60.
+pub const CTX_GUARD_CYCLING_MAX_SECS: f64 = 660.0;
+/// S = 창 − (요약 예약 + 차단 버퍼 + 이것) 토큰 — 이 높이부터는 G 성장 없이 1%p 로 발화한다(자동 압축을 끈 좌석).
+pub const CTX_GUARD_STOP_MARGIN_TOKENS: u64 = 5_000;
+/// 축당 낙폭 판정 범위 보관 수 — 헬퍼·휴리스틱 교대 A→H→A 에서 좌석 범위의 최고치를 잃지 않는다.
+pub const CTX_GUARD_SCOPES_KEPT: usize = 4;
 /// Claude Code 요약 출력 예약 상한 — 유효 창 = 창 − min(최대 출력, 이 값). 상한을 쓴다(보수 — 실제 예약은 이하).
 pub const CC_SUMMARY_RESERVE_TOKENS: u64 = 20_000;
-/// Claude Code 자동 압축 버퍼 — 선제 압축점 = 유효 창 − 이 값.
+/// Claude Code 자동 압축 버퍼 — 선제 압축점 = 유효 창 − 이 값(feed 문구 전용).
 pub const CC_AUTOCOMPACT_BUFFER_TOKENS: u64 = 13_000;
 /// Claude Code 차단 버퍼 — 차단점 = 유효 창 − 이 값(자동 압축 끔·비-auto 압축 창).
 pub const CC_BLOCKING_BUFFER_TOKENS: u64 = 3_000;
-/// 올린 임계에서 발화한 뒤 CSO 사이클의 저장 지시가 처리될 때까지 좌석이 더 쓰는 양의 여유(토큰).
-pub const CTX_FLOOR_CYCLE_MARGIN_TOKENS: u64 = 15_000;
-/// 창을 모를 때 가정하는 창 — claude 최소 창(200K). 작은 창을 가정해야 천장이 낮아져 발화 쪽으로 실패한다.
-pub const CTX_FLOOR_ASSUMED_WINDOW: u64 = 200_000;
+/// 창을 모를 때 가정하는 창 — claude 최소 창(200K). 작은 창을 가정해야 S·C 가 낮아져 발화 쪽으로 실패한다.
+pub const CTX_ASSUMED_WINDOW: u64 = 200_000;
 
 /// (창 − 예약)으로 **보이는** 가장 큰 정수 퍼센트 — 상태줄 `used_percentage` 는 반올림이라 c% 는 (c+0.5)% 직전까지다.
-/// c ≤ (200·(창 − 예약) − 창) / (2·창). 창 미상(None·0)은 [`CTX_FLOOR_ASSUMED_WINDOW`]. 창이 예약보다 작으면 0.
-fn ctx_pct_below_reserve(window: Option<u64>, reserve: u64) -> u8 {
-    let w = window.filter(|w| *w > 0).unwrap_or(CTX_FLOOR_ASSUMED_WINDOW);
+/// c ≤ (200·(창 − 예약) − 창) / (2·창). 창 미상(None·0)은 [`CTX_ASSUMED_WINDOW`]. 창이 예약보다 작으면 0.
+pub(crate) fn ctx_pct_below_reserve(window: Option<u64>, reserve: u64) -> u8 {
+    let w = window.filter(|w| *w > 0).unwrap_or(CTX_ASSUMED_WINDOW);
     let usable = w.saturating_sub(reserve);
     let pct = usable.saturating_mul(200).saturating_sub(w) / w.saturating_mul(2);
     pct.min(100) as u8
 }
 
-/// ★(R2NC3-1) 선제 압축 천장(%) — 순수 · 핀 `ctx_floor_ceiling_*`. (천장 퍼센트로 보이는 최대 토큰) + 사이클 여유 ≤
-/// Claude Code 선제 압축점(< 차단점)이 되는 가장 큰 정수 퍼센트, [`CTX_FLOOR_CEIL`] 캡. 200K 75 · 1M 85 · 미상 = 200K.
-pub fn ctx_floor_ceiling(window: Option<u64>) -> u8 {
-    let reserve = CC_SUMMARY_RESERVE_TOKENS + CC_AUTOCOMPACT_BUFFER_TOKENS + CTX_FLOOR_CYCLE_MARGIN_TOKENS;
-    ctx_pct_below_reserve(window, reserve).min(CTX_FLOOR_CEIL)
-}
+/// clear 가드 v3 — 순수 상태기계(시각은 호출자가 데몬 단조 초로 준다 · 락·I/O 없음). 참조 구현 cg3.rs 를 파라미터만 상수로
+/// 옮겼다(발화 판정에 쓰이지 않는 발행 재료 몇 개 — `Verdict::Fire` 의 축·기본·창 · `Note::Ineffective` 의 발화 번호·시각 —
+/// 만 더했다).
+pub(crate) mod clear_guard {
+    use super::{
+        ctx_pct_below_reserve, CC_BLOCKING_BUFFER_TOKENS, CC_SUMMARY_RESERVE_TOKENS, CTX_GUARD_BACKOFF_BASE_SECS,
+        CTX_GUARD_BACKOFF_MAX_SECS, CTX_GUARD_CLEAR_WAIT_SECS, CTX_GUARD_COMPACT_DROP, CTX_GUARD_CYCLING_MAX_SECS,
+        CTX_GUARD_GROWTH, CTX_GUARD_MEASURE_SECS, CTX_GUARD_MIN_SPACING_SECS, CTX_GUARD_REREAD_SECS, CTX_GUARD_SCOPES_KEPT,
+        CTX_GUARD_STOP_MARGIN_TOKENS,
+    };
 
-/// ★(RR3-R1-1) 차단 상한(%) — 순수 · 핀 `ctx_floor_hard_cap_*`. (상한 퍼센트로 보이는 최대 토큰) + 사이클 여유 <
-/// Claude Code 차단점이 되는 가장 큰 정수 퍼센트 — 이 위에서 발화하면 자동 압축을 끈 좌석은 저장 지시가 차단점에 막혀
-/// 사이클이 끝나지 못한다. 200K 80 · 1M 95 · 미상 = 200K. 언제나 [`ctx_floor_ceiling`] 이상.
-pub fn ctx_floor_hard_cap(window: Option<u64>) -> u8 {
-    // +1 토큰 — 차단은 '도달'에서 일어나므로 상한으로 보이는 최대 토큰 + 여유가 차단점에 **미치지 않아야** 한다(엄격).
-    let reserve = CC_SUMMARY_RESERVE_TOKENS + CC_BLOCKING_BUFFER_TOKENS + CTX_FLOOR_CYCLE_MARGIN_TOKENS + 1;
-    ctx_pct_below_reserve(window, reserve).max(ctx_floor_ceiling(window))
-}
+    /// S — 이 높이부터는 G 성장 없이 1%p 로 발화한다(200K 85 · 1M 96 · 미상 85).
+    pub fn stop_cap(window: Option<u64>) -> u8 {
+        ctx_pct_below_reserve(window, CC_SUMMARY_RESERVE_TOKENS + CC_BLOCKING_BUFFER_TOKENS + CTX_GUARD_STOP_MARGIN_TOKENS)
+    }
 
-/// clear 뒤 세션의 바닥이 정한 발화 영역(순서 = 심각도).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum CtxFloorRegime {
-    /// 바닥 + 최소 여유가 선제 압축 천장 안 — 발화 = min(바닥 + ROOM, 천장).
-    Raise,
-    /// 천장 밖 · 차단 상한 안 — 발화 = min(바닥 + ROOM, 차단 상한). 선제 압축이 사이클보다 먼저 올 수 있다.
-    Limited,
-    /// ★(RV2NC-E20-1) 복원 끝에는 여유가 있지만 복원 뒤 배달·회신까지 담은 정착 창 최고치가 차단 상한 근처이고, 직전 clear
-    /// 세션도 차단 상한 근처였다(얇은 세션의 느린 발화 · 차단기 영역 — 확인) — clear 마다 되풀이되는 그 몰림을 바닥으로 보고
-    /// 최고치 위로 실제로 [`CTX_FLOOR_MIN_ROOM`] 자랄 때만(표시 최고치 + 6) 발화. 일하는 좌석의 빠른 발화가 확인을 푼다.
-    Backlog,
-    /// 차단 상한 안에도 최소 여유가 없다 · 아직 확인 전 — **1회만** max(차단 상한, 바닥 + 1)에서 다시 clear 해 본다.
-    Probe,
-    /// 직전 clear 세션도 그랬다(확인) — 자동 clear 중단 · 바닥 + [`CTX_FLOOR_MIN_GROWTH`] 까지 실제로 자랄 때만 발화.
-    Stopped,
-}
+    /// C — 막대의 절대 상한 = 차단점(창 − 23K) 아래로 보이는 가장 큰 정수(200K 88 · 1M 97 · 미상 88). 막대가 이 위로 가지
+    /// 않으므로 자동 압축을 끈 좌석도 막대에 닿을 수 있다.
+    pub fn block_cap(window: Option<u64>) -> u8 {
+        ctx_pct_below_reserve(window, CC_SUMMARY_RESERVE_TOKENS + CC_BLOCKING_BUFFER_TOKENS)
+    }
 
-impl CtxFloorRegime {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Raise => "raise",
-            Self::Limited => "limited",
-            Self::Backlog => "backlog",
-            Self::Probe => "probe",
-            Self::Stopped => "stopped",
+    /// (퍼센트, 그 창).
+    pub type Lv = (u8, Option<u64>);
+
+    /// 퍼센트를 창 `to` 기준으로 옮긴다(토큰 비율 · 올림 · 100 캡). 창이 같거나 한쪽이 미상이면 그대로.
+    pub fn rebase(v: Lv, to: Option<u64>) -> u8 {
+        match (v.1, to) {
+            (Some(fw), Some(w)) if fw != w && w > 0 => (u64::from(v.0).saturating_mul(fw).div_ceil(w)).min(100) as u8,
+            _ => v.0,
         }
     }
 
-    /// 선제 압축 천장 안에서 여유를 줄 수 없었다(오너 경고 대상 · `context.threshold` 의 `floor_limited`).
-    pub fn floor_limited(self) -> bool {
-        self != Self::Raise
-    }
-
-    fn tier3(self) -> bool {
-        matches!(self, Self::Probe | Self::Stopped)
-    }
-}
-
-/// ★(RR3-R1-1 · G3ROLE-1) clear 뒤 세션의 발화 임계(히스테리시스) — 순수 · 핀 `ctx_floor_bar_*`.
-/// `floor` = 잰 바닥(%) · `base` = 역할 임계 · `confirmed` = 직전 clear 세션의 바닥도 차단 상한 근처였다(Probe 소진).
-/// 반환 = (실효 임계 ≥ base, 영역). 불변식: 실효 임계 > base 이면 실효 임계 ≥ 바닥 + 1(Probe) · 그 밖은 ≥ 바닥 +
-/// [`CTX_FLOOR_MIN_ROOM`] · 실효 임계 ≤ max(base, 바닥 + [`CTX_FLOOR_ROOM`]) 또는 [`CTX_FLOOR_NEVER`](바닥 > 90).
-pub fn ctx_floor_bar(floor: u8, base: u8, window: Option<u64>, confirmed: bool) -> (u8, CtxFloorRegime) {
-    let f = u16::from(floor.min(100));
-    let c = u16::from(ctx_floor_ceiling(window));
-    let h = u16::from(ctx_floor_hard_cap(window));
-    let (room, min_room) = (u16::from(CTX_FLOOR_ROOM), u16::from(CTX_FLOOR_MIN_ROOM));
-    let (bar, regime) = if f + min_room <= c {
-        ((f + room).min(c), CtxFloorRegime::Raise)
-    } else if f + min_room <= h {
-        ((f + room).min(h), CtxFloorRegime::Limited)
-    } else if !confirmed {
-        (h.max(f + 1), CtxFloorRegime::Probe)
-    } else {
-        (f + u16::from(CTX_FLOOR_MIN_GROWTH), CtxFloorRegime::Stopped)
-    };
-    let bar = bar.min(u16::from(CTX_FLOOR_NEVER)) as u8;
-    (bar.max(base), regime)
-}
-
-/// clear 뒤 세션의 발화 판정 한 벌 — [`ctx_floor_bar_measured`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CtxFloorBar {
-    /// 실효 임계(≥ 기본).
-    pub bar: u8,
-    pub regime: CtxFloorRegime,
-    /// 영역을 정한 바닥(복원 끝 바닥이 차단기 영역을 풀었으면 그것 · 아니면 정착 창 최고치) — 고지·payload 의 `floor_pct`.
-    pub floor: u8,
-    /// 정착 창 최고치(막대의 기준 — 유휴 재발화 0 은 이 값 위에서 지킨다).
-    pub settled: u8,
-    /// ★(RV2NC-E20-1) 얇은 세션 — 복원 끝에 여유가 있지만 정착 창 최고치가 차단 상한 근처(최고치 + 최소 여유 > 차단 상한).
-    /// 그 발화는 성장 속도로 가른다([`CTX_FLOOR_THIN_SECS`]).
-    pub thin: bool,
-    /// ★(RV2NC-E20-2) 복원 턴 도중 바쁨을 보지 않는 기계 주입(채널 행·스케줄 직접 push·CEO 배달)이 들어와 복원 끝이 그 입력의
-    /// 턴과 섞였다 — 복원 끝 바닥은 그 입력 때의 최고치(하한)로만 차단기를 판정했다(보고 바닥 = 정착 창 최고치).
-    pub tainted: bool,
-    /// ★(ADV2-R1-1) Claude 압축 뒤 재무장한 세션의 막대를 끌어올린 **clear 로 돌아오는 바닥**(압축 전 clear 세션의 정착 창
-    /// 최고치) — 막대 = max(압축 뒤 막대, 이 값 + 1). 그보다 낮은 발화는 clear 가 컨텍스트를 오히려 올린다. 이 값이 선제 압축점
-    /// 높이(200K 83%)면 막대 = [`CTX_FLOOR_NEVER`] — 그 clear 는 곧바로 다음 압축을 부른다(압축 뒤 cys 사이클 없음).
-    pub lift: Option<u8>,
-}
-
-/// ★(ROLE-R4-1 · R2NC5-1) 잰 바닥 **둘**로 발화 판정을 정한다 — 순수 · 핀 `ctx_floor_bar_measured_*`.
-/// `settled` = 정착 창 최고치(종전 잰 바닥 — 막대의 기준) · `restore` = 복원 턴 끝의 바닥([`CtxLoopGuard::restore_peak`] —
-/// 복원 턴 뒤 첫 좌석 입력으로 확정됐을 때만).
-///
-/// 【왜】 사이클은 clear·재주입 동안 대기열·채널·스케줄 배달을 붙잡는다(`MachineHold::Quiescing`). 붙여넣기 직후 quiescing 이
-/// 풀리면 붙잡혔던 배달이 짧은 복원 턴(라이브 master 14~53초) 끝 + 조용함 3초에 풀리고, 정착 창(최소 60초)은 그 턴들까지
-/// 최고치에 싣는다 — 참 바닥 72 인 여유 있는 200K master 가 76~78 로 재여 Probe → Stopped(바닥+10 = 86~88 · Claude 선제
-/// 압축점 83.5% 위)로 가고, Stopped 는 새 세션이 없으면 다시 재지 않으므로 cys clear 가 영영 안 났다(② · ROLE-R4-1 ·
-/// R2NC5-1). 차단기(Probe·Stopped)는 "clear 해도 **clear 사이클 자신의 입력**(붙여넣기 → 복원 턴)만으로 차단 상한 근처"
-/// 인 좌석을 위한 것이다 — 그 판정은 복원 턴 끝의 바닥으로 해야 한다.
-///
-/// 【무엇】 복원 끝 바닥이 확정됐고 그 바닥에 차단 상한 안 여유가 있으면(정상·Limited) 차단기 영역이 아니다: 정착 창
-/// 최고치가 Probe·Stopped 높이여도 영역은 Limited · 확인(Stopped) 없음. 막대는 **정착 창 최고치의 미확인 막대**(= Probe 막대
-/// max(차단 상한, 최고치+1)) 그대로다 — 복원 끝 판정이 틀려도(낮게 잡혀도) 막대는 종전 미확인 막대보다 낮아지지 않는다(유휴
-/// 재발화 0 은 정착 창 최고치 위에서 그대로 · ①). 정착 창은 확정 뒤 몰림이 끝날 때까지 열려 있으므로([`CTX_FLOOR_BURST_QUIET_SECS`])
-/// 붙잡혔던 배달만으로는 발화하지 않는다. 불변식: 미확인 막대 ≤ 반환 막대 ≤ 종전 막대(확인 반영) — 이 판정은 Stopped 를 풀 수만
-/// 있고 어떤 막대도 앞당기지 않는다. 복원 끝 바닥이 차단기 높이면(참으로 가득 찬 좌석) 막대·영역은 종전 그대로(Probe 1회 →
-/// Stopped). 복원 끝 바닥이 없으면(유휴 · 입력 없음 · 조용함 신호 없음) 종전 그대로. 보고 바닥(`floor` — 오너 feed·payload)은
-/// 확정된 복원 끝이다(없으면 정착 창 최고치) — 배달을 바닥이라 부르지 않는다(R2NC5-1: 참 바닥 72 좌석에 '바닥 76% 로 돌아옴').
-///
-/// ★(RV2NC-E20-1 · ①) **얇은 세션**(복원 끝 여유 · 정착 창 최고치 + 최소 여유 > 차단 상한)은 확인을 영구히 끄지 않는다 —
-/// e20f1cb6 은 여유 있는 복원 끝이 확인(`confirmed`)을 늘 지워, 사이클마다 몰림(사이클이 붙잡은 배달·사이클이 부른 회신)이
-/// 최고치를 다시 채우는 유휴 좌석이 매 세션 최고치 + 1~4%p(주기 신호)에서 다시 발화했다(드릴 rv-d1 · rv-d1p — 1시간 10회).
-/// · 미확인: 막대 = max(차단 상한, 최고치 + **2**), 영역 Limited — 1%p 반올림 해상도에서 발화가 실제 성장 ≥ 1%p 를 입증하는
-///   최소 막대다(최고치 + 1 은 실제 성장 0.01%p 로도 닿는다 · 그 발화의 성장 속도를 가를 수 없다). 발화는 성장 속도로 가른다
-///   ([`CtxLoopGuard::on_crossing`] · [`CTX_FLOOR_THIN_SECS`]) — 느리면 이 세션이 다음 세션의 확인 재료가 된다.
-/// · 확인(`confirmed` — 직전 clear 세션이 차단 상한 근처였다): 막대 = 최고치 + [`CTX_FLOOR_MIN_ROOM`] + 1(표시 성장 − 1 이
-///   최소 여유 — 사이클 하나가 실제 성장 5%p 로 값을 치른다), 영역 [`CtxFloorRegime::Backlog`] — 몰림을 바닥으로 확정한다(Stopped
-///   의 + 10 이 아니다: 최고치 76~77 좌석은 선제 압축점 83.5% 아래에서 clear 되고 · 자동 압축을 끈 좌석도 최고치 82 까지는 차단점
-///   88.5% 아래에서 발화한다).
-/// 불변식(전수 핀): 미확인 막대 ≤ 반환 막대 · 반환 막대 ≤ 종전 막대(확인 반영) + 1(얇은 미확인의 +2 만 1%p 늦다) · 여유 있는
-/// 복원 끝이면 Probe·Stopped 아님.
-pub fn ctx_floor_bar_measured(settled: u8, restore: Option<u8>, base: u8, window: Option<u64>, confirmed: bool) -> CtxFloorBar {
-    let restore = restore.map(|r| r.min(settled));
-    let roomy = restore.is_some_and(|r| !ctx_floor_bar(r, base, window, false).1.tier3());
-    let (bar, regime) = ctx_floor_bar(settled, base, window, confirmed && !roomy);
-    // 보고 바닥 = 복원 끝(확정됐으면) — 오너에게 '바닥' 으로 말하는 값은 clear 사이클 자신의 입력이 끝난 높이다.
-    let floor = restore.unwrap_or(settled);
-    let (bar, regime, thin) = if roomy && regime.tier3() {
-        let s = u16::from(settled);
-        let (b, r) = if confirmed {
-            // + 1: 표시 성장 − 1(반올림을 뺀 실제 성장의 하한)이 최소 여유 — 사이클 하나가 실제 성장 5%p 로 값을 치른다.
-            (s + u16::from(CTX_FLOOR_MIN_ROOM) + 1, CtxFloorRegime::Backlog)
+    fn higher(a: Lv, b: Lv) -> Lv {
+        if rebase(a, b.1) >= b.0 {
+            (rebase(a, b.1), b.1)
         } else {
-            (u16::from(ctx_floor_hard_cap(window)).max(s + 2), CtxFloorRegime::Limited)
-        };
-        ((b.min(u16::from(CTX_FLOOR_NEVER)) as u8).max(base), r, true)
-    } else {
-        (bar, regime, false)
-    };
-    CtxFloorBar { bar, regime, floor, settled, thin, tainted: false, lift: None }
-}
-
-/// 발화 1건의 판정 재료(`context.threshold` payload) — clear 뒤 세션이 아니면(부트 첫 교차 등) 모두 None/false.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CtxFire {
-    pub floor: Option<u8>,
-    pub regime: Option<CtxFloorRegime>,
-    /// 정착 창 안 뒷문 발화(차단 상한 또는 학습한 바닥 상한 + 최소 여유를 넘음 — [`CtxLoopGuard::effective_threshold`]).
-    pub settle_backstop: bool,
-    /// 정착 창 최고치 — `floor` 와 다르면(복원 뒤 작업이 정착 창에 들었다) payload `settled_pct`.
-    pub settled: Option<u8>,
-    /// ★(R2NC5-1 (b)) Claude 자체 압축을 본 뒤 기본 임계로 재무장한 세션의 발화([`CtxLoopGuard::rearmed`]).
-    pub after_compaction: bool,
-}
-
-/// ★(R2NC5-1 (b)) Claude 자체 압축 관측으로 재무장한 1건 — `context.floor_rearmed` 재료.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CtxRearm {
-    /// 버린 바닥(복원 끝 바닥 또는 정착 창 최고치)과 그 영역.
-    pub floor: u8,
-    pub regime: CtxFloorRegime,
-}
-
-impl CtxFire {
-    pub fn floor_limited(&self) -> bool {
-        self.regime.is_some_and(CtxFloorRegime::floor_limited)
-    }
-}
-
-/// 보류(기본 임계는 넘었지만 바닥 + 여유 아래) 고지 1건 — 이벤트는 세션 안 영역 상승마다(같은 (영역, 임계)는 한 번) ·
-/// 오너 feed 는 정착 창이 닫힌 뒤 세션당 1번.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CtxHoldNotice {
-    pub floor: u8,
-    /// 정착 창 최고치(`floor` 와 다르면 복원 뒤 작업이 정착 창에 들었다).
-    pub settled: u8,
-    pub bar: u8,
-    pub regime: CtxFloorRegime,
-    pub ceiling: u8,
-    pub hard_cap: u8,
-    /// `context.floor_raised` 이벤트를 낸다(좌석의 직전 고지와 (영역, 임계)가 다르다).
-    pub event: bool,
-    /// 오너 feed 종류(없으면 무음) — Raise 는 좌석당 1회 · Limited·Probe·Stopped 는 1·2·4·8…번째 세션.
-    pub feed: Option<&'static str>,
-    /// 이 영역(Limited·Probe 합산 / Stopped)에 든 세션 수(오너 문안용).
-    pub count: u32,
-    /// ★(R1-RUNAWAY-1) 바닥이 clear 뒤가 아니라 Claude 자체 압축 뒤(지침 재읽기 포함)에 다시 잰 것이다(오너 문안용).
-    pub after_compaction: bool,
-    /// ★(RV2NC-E20-2) 복원 턴 도중 기계 주입이 섞여 복원 끝을 하한으로만 쟀다(오너 문안용 · [`CtxFloorBar::tainted`]).
-    pub tainted: bool,
-    /// ★(ADV2-R1-1) 압축 뒤 막대를 끌어올린 clear 로 돌아오는 바닥([`CtxFloorBar::lift`]).
-    pub lift: Option<u8>,
-}
-
-/// 좌석별 clear 직후 바닥 가드(순수 상태 — 시각은 호출자가 단조 초로 준다). `Surface::ctx_loop_guard`.
-#[derive(Debug, Default, Clone)]
-pub struct CtxLoopGuard {
-    /// 마지막 `context.threshold` 발화 시각.
-    pub fired_at: Option<f64>,
-    /// 마지막 발화 **뒤 첫** 세션 교체 시각(이 세션 = clear 뒤 세션). Stopped 좌석은 그 뒤 교체도 다시 잰다.
-    pub reset_at: Option<f64>,
-    /// 정착 창의 시작점 — 교체 시각에서 시작해 quiescing(사이클 진행 중) 관측이 뒤로 민다(교체 + 정착 창까지).
-    pub settle_anchor: Option<f64>,
-    /// 정착 창 안에서 관측한 최고치 = 이 세션의 바닥(`floor_window` 기준 퍼센트).
-    pub settle_peak: Option<u8>,
-    /// 바닥이 정착 창 안에서 마지막으로 오른 시각 — 기본 창 뒤에도 [`CTX_FLOOR_SETTLE_QUIET_SECS`] 안에 올랐으면 연장.
-    pub settle_rise_at: Option<f64>,
-    /// 정착 창 안 마지막 관측 시각(시작점 뒤 관측이 있어야 조용함으로 창을 닫는다 — 붙여넣기 턴의 보고 전 닫힘 금지).
-    pub settle_seen_at: Option<f64>,
-    /// 정착 창이 조용함(복원 턴 끝)으로 닫혔다 — 그 뒤 관측은 작업이다([`Self::note_idle`]).
-    pub settle_closed: bool,
-    /// 바닥을 잰 창(창이 바뀌면 바닥을 토큰 비율로 옮긴다 · 결측은 값이 아니다).
-    pub floor_window: Option<u64>,
-    /// 이 세션이 차단 상한 근처(Probe·Stopped 바닥 또는 정착 창 뒷문 발화)였다.
-    pub session_tier3: bool,
-    /// 직전에 잰 clear 세션이 그랬다 — 이번에도 그러면 확인(Stopped).
-    pub prev_tier3: bool,
-    /// 정착 창 뒷문을 이미 한 번 썼다 — 다음 clear 세션에는 뒷문이 없다(붙여넣기·복원만으로 차단 상한을 넘는 유휴 좌석이
-    /// 세션마다 뒷문으로 도는 고리 차단 · ①). 정착 창 **밖**의 정상·Limited 발화(바닥이 차단 상한에서 먼 좌석의 실제
-    /// 성장)가 나면 다시 무장한다.
-    pub backstop_spent: bool,
-    /// 이 세션에서 이미 고지한 가장 높은 영역 · 이 세션의 오너 feed 를 이미 판정했다(정착 창이 닫힌 뒤 1번).
-    pub session_notice: Option<CtxFloorRegime>,
-    pub session_fed: bool,
-    /// 좌석의 마지막 `context.floor_raised` (영역, 임계) — 사이클마다 같은 고지 반복 금지.
-    pub last_announced: Option<(CtxFloorRegime, u8)>,
-    /// Raise 오너 feed 를 이미 냈다(좌석당 1회).
-    pub raise_fed: bool,
-    /// Limited·Probe 에 든 세션 수 / Stopped 에 든 세션 수.
-    pub limited_count: u32,
-    pub stopped_count: u32,
-    /// ★(ROLE-R4-1 · R2NC5-1) 복원 턴이 보고됐다 — 정착 창 시작점 뒤 첫 **상승** 관측 시각(붙여넣기를 처리한 턴의 보고).
-    /// 시작점이 이 뒤로 밀리면 지운다(그 상승은 이 붙여넣기의 것이 아니다).
-    pub restore_rise_at: Option<f64>,
-    /// 복원 턴 끝 후보 — 상승 관측 뒤 처음 온 ≥ [`CTX_FLOOR_IDLE_QUIET_SECS`] 조용함의 시작 시각.
-    pub restore_quiet_from: Option<f64>,
-    /// 복원 턴 끝의 바닥(차단기 영역 판정용) — 후보 조용함 **뒤 첫 좌석 입력**(대기열·채널·스케줄 배달 · 직접 send · 사람
-    /// 입력)이 쓰인 순간의 정착 창 최고치. 그 뒤 관측은 새 턴(복원 뒤 작업)이다. 입력 없이 출력이 다시 흐르면(틈이 턴 끝이
-    /// 아니었다 — 같은 턴이 이어짐) 확정하지 않는다 — 정착 창 최고치를 그대로 따른다(종전 거동 · 실패 방향).
-    pub restore_peak: Option<u8>,
-    /// `restore_peak` 를 잰 창(창이 바뀌면 토큰 비율로 옮긴다).
-    pub restore_window: Option<u64>,
-    /// 복원 끝 바닥을 확정한 입력 시각.
-    pub restore_freeze_at: Option<f64>,
-    /// 대기열 인계로 확정했을 때만 — 그 배달의 제출(CR) 전 · [`CTX_FLOOR_INPUT_GRACE_SECS`] 안의 보고를 복원 턴의 늦은 보고로
-    /// 싣는 기한(인계 시각 + 유예).
-    pub restore_grace_until: Option<f64>,
-    /// 좌석 writer 의 마지막 Inject 끝(CR 기록) 시각([`CtxIdleObs::inject_done`]).
-    pub inject_done_at: Option<f64>,
-    /// 좌석에 마지막으로 입력이 쓰인 시각(데몬 단조 초 · [`CtxIdleObs::last_input`]) — 세션과 무관한 좌석 사실.
-    pub input_at: Option<f64>,
-    /// 좌석의 마지막 **대기열 배달** 시각([`CtxIdleObs::last_queue_delivery`]) — 대기열은 턴이 끝난 좌석(프롬프트 경계 ·
-    /// 바쁨 표지 없음 · 마커 없는 좌석은 조용함 3초)에만 배달하므로, 복원 턴의 보고 뒤 첫 배달은 복원 턴 끝의 증거다.
-    pub queue_at: Option<f64>,
-    /// ★(R2NC6-1 · RV-ROLE-CF42-1) 좌석 대기열에 남은 가장 오래된 항목의 enqueue 시각(데몬 단조 초 · 없으면 빈 대기열 ·
-    /// [`CtxIdleObs::queue_oldest`] 최신 관측) — 정착 창 시작점(사이클 quiescing 해제) **전**에 들어온 항목이 남아 있으면 사이클이
-    /// 붙잡았던 배달 몰림이 아직 끝나지 않았다([`Self::held_pending`]). 시작점 뒤에 들어온 항목은 새 작업이다.
-    pub queue_oldest: Option<f64>,
-    /// ★(R2NC5-1 (b)) Claude 자체 압축(같은 세션 파일에서 컨텍스트가 잰 바닥보다 [`CTX_FLOOR_COMPACT_DROP`] 이상 떨어짐)을
-    /// 봤다 — 이 세션의 잰 바닥을 버리고 재무장했다. ★(R1-RUNAWAY-1) 재무장은 압축 관측 시각부터 바닥을 **다시 잰다**(정착 창을
-    /// 새로 연다 · 뒷문 없음) — 발화는 압축 뒤 바닥 위로 실제로 자란 뒤다. 다음 세션 교체(발화 없는 교체 포함)가 다시 잰다.
-    pub rearmed: bool,
-    /// 마지막 세션 교체 통지(잰 것·무시한 것 모두 — 수집기의 늦은 중복 통지 포함) 뒤 관측 최고치와 그 창 — 압축 판정은 **같은
-    /// 세션** 안의 낙폭만 본다(발화 없이 바뀐 새 세션의 낮은 첫 보고는 압축이 아니다 · 결측은 값이 아니다).
-    pub session_peak: Option<u8>,
-    pub session_peak_window: Option<u64>,
-    /// ★(RV2NC-E20-1) 정착 창이 조용함으로 닫힌 시각 — 얇은 세션 발화의 성장 속도를 여기서부터 잰다(시간으로 끝난 창은 그 끝).
-    pub settle_closed_at: Option<f64>,
-    /// 마지막 관측 퍼센트와 그 창 — 발화 판정([`Self::on_crossing`])이 그 발화의 표시 높이를 본다.
-    pub last_pct: Option<(u8, Option<u64>)>,
-    /// ★(RV2NC-E20-1) 이 세션의 얇은 발화가 일하는 좌석의 빠른 성장이었다 — 다음 세션의 확인 재료에서 뺀다(확인을 푼다).
-    pub session_fast: bool,
-    /// ★(RV2NC-E20-2) 복원 턴 도중(시작점 뒤 · 복원 끝 전) 바쁨을 보지 않는 기계 주입이 들어왔다 — 복원 끝을 그 순간의 최고치
-    /// (하한)로 확정했다. 그 입력은 Claude 가 복원 턴 뒤에 곧바로(조용함 없이) 이어 처리하므로 조용함·배달 신호로는 복원 끝과
-    /// 그 입력의 턴을 가를 수 없다(드릴 rv-d3: 복원 끝 71.7 → 0.5초 뒤 채널 행 제출 → 76 이 복원 끝으로 재여 Probe → Stopped).
-    pub restore_tainted: bool,
-    /// 이 세션의 붙여넣기(시작점 뒤 첫 좌석 입력) 시각 — 복원 턴 오염 판정에서 붙여넣기 자신을 뺀다.
-    pub paste_input_at: Option<f64>,
-    /// ★(RV2NC-E20-1) 사이클 몰림의 기준 시각 — 복원 끝을 확정한 입력 시각(없으면 시작점). 이 전에 대기열에 들어온 항목은 복원
-    /// 턴이 끝나기 전에 쌓인 것(사이클이 붙잡은 배달 · 복원 턴 동안 선 회신 — rv-d1p)이라 다 배달될 때까지 창을 연다.
-    pub backlog_cutoff: Option<f64>,
-    /// ★(ADV2-R1-1) Claude 압축으로 재무장한 세션의 **clear 로 돌아오는 바닥**(압축 전 clear 세션의 정착 창 최고치)과 그 창 —
-    /// 압축 뒤 발화는 이 바닥 + 1 이상에서만(그보다 낮게 발화하면 cys clear 가 컨텍스트를 오히려 올린다 · 참으로 가득 찬 좌석의
-    /// clear → 압축 → 재무장 고리).
-    pub rearm_floor: Option<u8>,
-    pub rearm_floor_window: Option<u64>,
-    /// 재무장 전 세션이 얇은 세션(또는 Backlog)이었다 — 압축 뒤 발화도 성장 속도로 가른다.
-    pub rearm_thin: bool,
-    /// ★(ADV2-R1-1) clear 뒤 정착 창 안에서 **사이클 자신의 입력**(붙여넣기·복원 턴 · 사이클이 붙잡은 몰림)이 Claude 선제 압축을
-    /// 불렀다(창 최고치보다 낙폭 이상 낮은 관측 — 창 최고치는 압축점에서 잘린 값이다) — 그 clear 는 선제 압축점 위로 돌아온다.
-    pub window_compacted: bool,
-    /// 이 세션의 정착 창에 사이클이 붙잡은 대기열 몰림이 있었다([`Self::held_pending`] 을 한 번이라도 봤다) — 몰림의 마지막 턴
-    /// (대기열은 이미 비었지만 창이 아직 열린 동안)에 온 압축도 사이클 자신의 입력이 부른 것이다.
-    pub held_seen: bool,
-    /// 정착 창 시작점 + [`CTX_FLOOR_SETTLE_MIN_SECS`] 까지의 최고치와 그 창 — 복원 끝 신호(입력·조용함)가 하나도 없는 좌석(입력
-    /// 없이 끊김 없는 긴 턴)의 clear 로 돌아오는 바닥 추정(창 전체 최고치는 그 턴의 작업을 싣는다).
-    pub early_peak: Option<u8>,
-    pub early_peak_window: Option<u64>,
-}
-
-/// 퍼센트를 창 `from` 기준에서 `to` 기준으로 옮긴다(토큰 비율 · 올림 · 100 캡) — 창이 같거나 어느 쪽이 미상이면 그대로.
-fn rebase_pct(v: u8, from: Option<u64>, to: Option<u64>) -> u8 {
-    match (from, to) {
-        (Some(fw), Some(w)) if fw != w && w > 0 => (u64::from(v).saturating_mul(fw).div_ceil(w)).min(100) as u8,
-        _ => v,
-    }
-}
-
-impl CtxLoopGuard {
-    /// 지금 세션이 마지막 발화 뒤의 clear 세션인가.
-    fn post_clear(&self) -> bool {
-        matches!((self.fired_at, self.reset_at), (Some(f), Some(r)) if r >= f)
-    }
-
-    /// 잰 바닥을 `window` 기준 퍼센트로(창이 바뀌었으면 토큰 비율로 옮긴다 — 올림 · 100 캡).
-    fn floor_for(&self, window: Option<u64>) -> Option<u8> {
-        self.settle_peak.map(|f| rebase_pct(f, self.floor_window, window))
-    }
-
-    /// 확정된 복원 끝 바닥을 `window` 기준 퍼센트로.
-    fn restore_floor_for(&self, window: Option<u64>) -> Option<u8> {
-        self.restore_peak.map(|f| rebase_pct(f, self.restore_window, window))
-    }
-
-    /// clear 뒤 세션의 발화 판정 — 바닥 미상이면 None(기본 임계). Claude 자체 압축으로 재무장한 세션은 **압축 뒤 다시 잰
-    /// 바닥**으로 판정한다(★R1-RUNAWAY-1 — [`Self::note_compaction`]).
-    ///
-    /// ★(RV2NC-E20-2) 복원 턴이 기계 주입으로 오염된 세션은 복원 끝(그 입력 때의 최고치 — 하한)으로 차단기만 판정하고 보고
-    /// 바닥은 정착 창 최고치다. ★(ADV2-R1-1) 압축으로 재무장한 세션의 막대는 clear 로 돌아오는 바닥 + 1 아래로 내려가지 않는다.
-    fn bar(&self, base: u8, window: Option<u64>) -> Option<CtxFloorBar> {
-        if !self.post_clear() {
-            return None;
+            b
         }
-        let w = window.or(self.floor_window);
-        let settled = self.floor_for(w)?;
-        let mut b = ctx_floor_bar_measured(settled, self.restore_floor_for(w), base, w, self.prev_tier3);
-        if self.restore_tainted && self.restore_peak.is_some() {
-            b.tainted = true;
-            b.floor = b.settled;
+    }
+
+    fn lower(a: Lv, b: Lv) -> Lv {
+        if rebase(a, b.1) <= b.0 {
+            (rebase(a, b.1), b.1)
+        } else {
+            b
         }
-        if let Some(f) = self.rearm_floor_for(w).filter(|_| self.rearmed) {
-            // clear 로 돌아오는 바닥이 선제 압축점 높이면 그 clear 는 곧바로 다음 Claude 압축을 부른다(여유 0) — 압축 뒤 cys 사이클을
-            // 걸지 않는다(Claude 압축이 받는다 · 자동 압축을 끈 좌석은 압축이 없어 이 길에 오지 않는다).
-            let lift = if f >= ctx_pct_below_reserve(w, CC_SUMMARY_RESERVE_TOKENS + CC_AUTOCOMPACT_BUFFER_TOKENS) {
-                u16::from(CTX_FLOOR_NEVER)
-            } else {
-                u16::from(f) + 1
+    }
+
+    /// 발화 막대 = max(기본, min(R+G, max(S, R+1), C)) — R 미상이면 기본. ≤ C(≤ 97)이거나 기본. R 은 창 `window` 로 옮겨 잰다.
+    pub fn bar_of(level: Option<Lv>, base: u8, window: Option<u64>) -> u8 {
+        match level {
+            Some(l) => {
+                let r = rebase(l, window);
+                let grown = r.saturating_add(CTX_GUARD_GROWTH);
+                let edge = stop_cap(window).max(r.saturating_add(1));
+                base.max(grown.min(edge).min(block_cap(window)))
+            }
+            None => base,
+        }
+    }
+
+    /// 효과 없는 clear 연속 k 번 뒤 보류(초) = min(BASE · 2^(k−1), MAX).
+    pub fn backoff(k: u32) -> f64 {
+        if k == 0 {
+            return 0.0;
+        }
+        (CTX_GUARD_BACKOFF_BASE_SECS * 2f64.powi(k.min(16) as i32 - 1)).min(CTX_GUARD_BACKOFF_MAX_SECS)
+    }
+
+    /// 관측 축. 실측(상태줄·transcript·rollout) · 자기보고(status.set). 수준·낙폭 판정은 축 안에서만 한다.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Axis {
+        Measured = 0,
+        SelfReport = 1,
+    }
+    pub const AXES: [Axis; 2] = [Axis::Measured, Axis::SelfReport];
+
+    impl Axis {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Axis::Measured => "measured",
+                Axis::SelfReport => "self_report",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Kind {
+        AfterCycle,
+        AfterCompaction,
+    }
+
+    impl Kind {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Kind::AfterCycle => "after_cycle",
+                Kind::AfterCompaction => "after_compaction",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Default)]
+    pub enum Phase {
+        #[default]
+        Free,
+        /// 발화했다 — 사이클 표지(quiescing 켬)를 `deadline` 까지 기다린다.
+        Awaiting { at: f64, deadline: f64 },
+        /// 사이클 표지 켬 — clear·복원이 도는 중(관측은 판정·낙폭에 쓰지 않는다).
+        Cycling { since: f64 },
+        /// 사이클 끝·압축 뒤 [anchor, anchor+secs) 동안 축별 최고치를 잰다.
+        /// `hi` = 확인 전 S 이상 외톨이 보고(값 · 범위) · `peak_scope` = 최고치를 낸 범위.
+        Measuring {
+            anchor: f64,
+            secs: f64,
+            kind: Kind,
+            peak: [Option<Lv>; 2],
+            hi: [Option<(Lv, u64)>; 2],
+            first: [Option<Lv>; 2],
+            peak_scope: [u64; 2],
+        },
+    }
+
+    impl Phase {
+        pub fn as_str(&self) -> &'static str {
+            match self {
+                Phase::Free => "free",
+                Phase::Awaiting { .. } => "awaiting",
+                Phase::Cycling { .. } => "cycling",
+                Phase::Measuring { .. } => "measuring",
+            }
+        }
+    }
+
+    /// 범위 이름의 지문(FNV-1a · 0 은 '범위 없음'으로 쓰지 않도록 1 로 올린다).
+    pub fn scope_id(s: &str) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in s.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h.max(1)
+    }
+
+    /// 효과 없음의 사실(오너 feed 문구가 원인을 단정하지 않게 둘로 나눈다).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Why {
+        /// 발화 뒤 사이클이 끝났는데 다음 발화 전에 같은 범위에서 10%p 이상 떨어졌다(압축 — 자동·수동 구분 불가).
+        DropAfterCycle,
+        /// 직전 발화 뒤 사이클 표지가 한 번도 관측되지 않은 채 다시 발화 조건이 됐다(원인은 가드가 모른다).
+        NoCycle,
+    }
+
+    impl Why {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Why::DropAfterCycle => "drop_after_cycle",
+                Why::NoCycle => "no_cycle",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum Note {
+        /// 재는 창이 닫혔다 — 축별 새 수준(None = 창 안 관측 없음 → 그 축의 다음 관측이 수준) · 창의 첫 관측 · 최고치를 낸 관측의
+        /// 기본 임계(발행 재료 — 틱이 오버라이드 파일을 다시 읽지 않게).
+        Measured { kind: Kind, level: [Option<Lv>; 2], first: [Option<Lv>; 2], base: [Option<u8>; 2] },
+        /// 창이 닫힌 뒤 그 축의 첫 관측을 수준에 접었다(이 관측은 발화하지 않는다).
+        MeasuredLate { axis: Axis, level: Lv },
+        /// 효과 없는 발화 — 연속 `strikes` 번째 · 다음 발화는 `hold_until` 뒤. `at` = 판정 시각 · `fire_seq`·`fire_at` = 그 발화 ·
+        /// `level` = 그 축의 잰 수준(발행 재료).
+        Ineffective {
+            strikes: u32,
+            hold_until: f64,
+            at: f64,
+            why: Why,
+            drop: Option<(u8, u8)>,
+            fire_seq: u64,
+            fire_at: f64,
+            level: Option<Lv>,
+        },
+        /// 발화 뒤 사이클 전에 낙폭(압축)이 왔다 — 효과 없음이 아니다(발화 1건당 결과 1회 · strike 없음).
+        DropBeforeCycle { seq: u64, drop: (u8, u8) },
+        /// 발화 뒤 시한까지 사이클 표지가 없었다(잠정 — 이것만으로 효과 없음을 세지 않는다).
+        Unanswered { seq: u64, retry_after: f64 },
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub enum Verdict {
+        Quiet,
+        Held { bar: u8, until: f64 },
+        /// `axis`·`base`·`window` 는 발행 재료(판정에 쓰지 않는다 — 틱의 보류 재판정 발화도 가드 밖 값을 다시 읽지 않고 싣는다).
+        Fire {
+            pct: u8,
+            bar: u8,
+            level: Option<u8>,
+            strikes: u32,
+            seq: u64,
+            after_compaction: bool,
+            axis: Axis,
+            base: u8,
+            window: Option<u64>,
+        },
+    }
+
+    #[derive(Clone, Debug, Default, PartialEq)]
+    pub struct Out {
+        pub notes: Vec<Note>,
+        pub verdict: Option<Verdict>,
+    }
+
+    impl Out {
+        pub fn fired(&self) -> Option<Verdict> {
+            self.verdict.filter(|v| matches!(v, Verdict::Fire { .. }))
+        }
+    }
+
+    /// 관측 1건.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Rep<'a> {
+        pub pct: u8,
+        pub window: Option<u64>,
+        pub axis: Axis,
+        /// 낙폭 판정 범위(세션 파일 줄기 · 자기보고는 ""). 수준·발화에는 쓰지 않는다.
+        pub scope: &'a str,
+        /// 기본 임계(역할 오버라이드 · env · 60).
+        pub base: u8,
+        pub now: f64,
+        /// 배달 동결(system.pause) — Awaiting 시한이 흐르지 않는다.
+        pub frozen: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    pub struct FireRec {
+        pub seq: u64,
+        pub at: f64,
+        pub axis: Axis,
+        /// 이 발화 뒤 사이클 표지(켬→끔)를 봤다.
+        pub cleared: bool,
+        /// 결과가 정해졌다(효과 없음 1회 · 또는 사이클 전 낙폭) — 발화 1건당 결과는 한 번뿐.
+        pub evaluated: bool,
+        /// 시한까지 표지가 없었을 때의 잠정 보류(표지가 늦게라도 오면 사라진다).
+        pub tentative_until: Option<f64>,
+        /// 발화한 관측의 범위 · 퍼센트·창·기본(시한 뒤 재판정의 재료 — 같은 범위의 더 새 관측이 있으면 그것).
+        pub scope: u64,
+        obs: (u8, Option<u64>, u8),
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Held {
+        until: f64,
+        pct: u8,
+        window: Option<u64>,
+        axis: Axis,
+        base: u8,
+        scope: u64,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    pub struct ClearGuard {
+        pub phase: Phase,
+        /// 축별 잰 수준(R) · 그 창의 종류.
+        pub level: [Option<(Lv, Kind)>; 2],
+        /// 창이 닫힌 뒤 그 축의 첫 관측(창 최고치를 낸 범위의 것 · 창이 비었으면 아무 범위)을 수준에 접는다
+        /// (R := max(R, 그 관측) · 창이 비었으면 그 관측이 R) — 그 관측은 발화하지 않는다. 창 끝 무렵 관측이 끊겨(도구 호출·
+        /// 상태줄 공백) R 이 참 최고치보다 낮게 잡히는 것을 막는다. Some(0) = 아무 범위 · Some(h) = 그 범위.
+        pub fold: [Option<u64>; 2],
+        /// 축별 낙폭 판정 범위(최근 4개 · 범위 이름 → 최고치 · 확인됨 · 최근 관측). 범위의 첫 관측은 두 번째 관측이 10%p
+        /// 안에서 확인하기 전에는 낙폭 기준이 아니다(새 세션 첫 보고가 낡은 값이어도 다음 보고를 '압축'으로 오인하지 않는다).
+        scopes: [Vec<(String, Lv, bool, (u8, Option<u64>, u8))>; 2],
+        pub strikes: u32,
+        pub hold_until: f64,
+        pub last_fire: Option<f64>,
+        pub fire: Option<FireRec>,
+        pub seq: u64,
+        /// 이 번호 이하의 발화는 그 뒤 사이클이 이미 끝났다 — 집행자는 건너뛴다(중복 사이클 방지). 사이클 전 낙폭(압축)은
+        /// 건너뛰는 사유가 아니다 — 늦게라도 온 사이클은 압축된 좌석을 비우고 수준을 다시 잰다.
+        pub resolved_through: u64,
+        held: Option<Held>,
+        /// (발행 전용 · 판정 밖) 이 좌석의 `context.level_measured` 오너 feed 를 마지막으로 낸 단조 시각 — 좌석당 6시간 1회.
+        pub level_fed_at: Option<f64>,
+    }
+
+    impl ClearGuard {
+        /// 발화 막대(축별) = max(기본, min(R+G, max(S, R+1), C)) — R 미상이면 기본. ≤ C(≤ 97)이거나 기본.
+        pub fn bar(&self, axis: Axis, base: u8, window: Option<u64>) -> u8 {
+            bar_of(self.level[axis as usize].map(|(l, _)| l), base, window)
+        }
+
+        /// 집행자 단일 비행: 발화 `seq` 뒤에 사이클이 이미 끝났나(그 경보로 도는 사이클은 막 복원된 좌석을 다시 비운다).
+        /// 더 새 발화가 있다는 것만으로는 건너뛰지 않는다 — 느린 집행자가 매번 새 발화에 밀려 한 번도 집행하지 못한다.
+        pub fn stale(&self, seq: u64) -> bool {
+            seq <= self.resolved_through
+        }
+
+        fn strike(&mut self, at: f64, why: Why, drop: Option<(u8, u8)>, fire: (u64, f64), axis: Axis) -> Note {
+            self.strikes = self.strikes.saturating_add(1);
+            self.hold_until = self.hold_until.max(at + backoff(self.strikes));
+            Note::Ineffective {
+                strikes: self.strikes,
+                hold_until: self.hold_until,
+                at,
+                why,
+                drop,
+                fire_seq: fire.0,
+                fire_at: fire.1,
+                level: self.level[axis as usize].map(|(l, _)| l),
+            }
+        }
+
+        fn cycle_end(&mut self, at: f64) {
+            if let Some(f) = self.fire.as_mut() {
+                if !f.evaluated {
+                    f.cleared = true;
+                    f.tentative_until = None;
+                }
+            }
+            self.resolved_through = self.seq;
+            self.scopes = Default::default();
+            self.held = None;
+            self.phase = Phase::Measuring {
+                anchor: at,
+                secs: CTX_GUARD_MEASURE_SECS,
+                kind: Kind::AfterCycle,
+                peak: [None; 2],
+                hi: [None; 2],
+                first: [None; 2],
+                peak_scope: [0; 2],
             };
-            if lift > u16::from(b.bar) {
-                b.bar = lift.min(u16::from(CTX_FLOOR_NEVER)) as u8;
-                b.lift = Some(f);
+        }
+
+        /// 창을 닫는다. `except` 축(S 조기 닫힘을 부른 축)은 접지 않는다 — 그 보고로 곧바로 판정한다.
+        fn close(&mut self, kind: Kind, peak: [Option<Lv>; 2], first: [Option<Lv>; 2], peak_scope: [u64; 2], except: Option<Axis>) -> Note {
+            let mut base = [None; 2];
+            for a in AXES {
+                let i = a as usize;
+                if peak[i].is_some() {
+                    base[i] = self.scopes[i].iter().find(|e| scope_id(&e.0) == peak_scope[i]).map(|e| (e.3).2);
+                }
+                self.level[i] = peak[i].map(|l| (l, kind));
+                self.fold[i] = if Some(a) == except { None } else { Some(if peak[i].is_some() { peak_scope[i] } else { 0 }) };
             }
+            self.phase = Phase::Free;
+            Note::Measured { kind, level: peak, first, base }
         }
-        Some(b)
-    }
 
-    /// 압축 전 clear 세션의 clear 로 돌아오는 바닥을 `window` 기준 퍼센트로.
-    fn rearm_floor_for(&self, window: Option<u64>) -> Option<u8> {
-        self.rearm_floor.map(|f| rebase_pct(f, self.rearm_floor_window, window))
-    }
-
-    /// ★(RV2NC-E20-1) 정착 창이 끝난 시각 — 조용함으로 닫혔으면 그 시각, 아니면 시간 창의 끝(압축 뒤 창은 [`CTX_FLOOR_REREAD_SECS`]).
-    fn settle_end(&self) -> Option<f64> {
-        if let Some(c) = self.settle_closed_at {
-            return Some(c);
-        }
-        let a = self.settle_anchor?;
-        if self.rearmed {
-            return Some(a + CTX_FLOOR_REREAD_SECS);
-        }
-        let base = a + CTX_FLOOR_SETTLE_SECS;
-        Some(match self.settle_rise_at {
-            Some(r) if r + CTX_FLOOR_SETTLE_QUIET_SECS > base => (r + CTX_FLOOR_SETTLE_QUIET_SECS).min(a + CTX_FLOOR_SETTLE_MAX_SECS),
-            _ => base,
-        })
-    }
-
-    /// ★(RV2NC-E20-1) 얇은 세션의 이 발화가 **일하는 좌석**의 성장인가 — 정착 창이 끝난 뒤 발화까지 표시 성장 − 1(반올림을 뺀
-    /// 실제 성장의 하한)이 [`CTX_FLOOR_THIN_SECS`] 에 최소 여유를 채우는 속도(분당 0.2%p) 이상. 재료가 없으면 아니다(느린 쪽 —
-    /// 확인 재료가 된다 · 다음 세션은 몰림 위 최소 여유 성장마다 · ① 쪽 실패).
-    fn thin_growth_fast(&self, window: Option<u64>, now: f64) -> bool {
-        let w = window.or(self.floor_window);
-        let (Some(s), Some((p, pw)), Some(from)) = (self.floor_for(w), self.last_pct, self.settle_end()) else { return false };
-        let grown = u16::from(rebase_pct(p, pw, w)).saturating_sub(u16::from(s) + 1);
-        f64::from(grown) * CTX_FLOOR_THIN_SECS >= f64::from(CTX_FLOOR_MIN_ROOM) * (now - from).max(1.0)
-    }
-
-    /// 정착 창 최고치만으로 본 영역(확인 없이) — 뒷문 재무장 판정(복원 끝 판정과 무관하게 종전 규칙).
-    fn settled_regime(&self, window: Option<u64>) -> Option<CtxFloorRegime> {
-        if !self.post_clear() {
-            return None;
-        }
-        let w = window.or(self.floor_window);
-        self.floor_for(w).map(|f| ctx_floor_bar(f, 0, w, false).1)
-    }
-
-    /// 복원 끝 바닥이 확정됐고 차단 상한 안에 여유가 있다(정상·Limited 높이) — 이 세션은 차단기 재료가 아니다.
-    fn restore_roomy(&self, window: Option<u64>) -> bool {
-        let w = window.or(self.floor_window);
-        self.restore_floor_for(w).is_some_and(|r| !ctx_floor_bar(r, 0, w, false).1.tier3())
-    }
-
-    /// ★(RV2NC-E20-2 · ②) clear 사이클의 **복원 턴이 아직 도는 중**인가 — clear 뒤 세션 · 정착 창 안 · 복원 끝 미확정 · 복원 턴 끝
-    /// 후보(≥2초 조용함)도 아직 없음 · 시작점 + [`CTX_FLOOR_RESTORE_HOLD_SECS`] 안. 채널 inbox 행·스케줄 직접 push 는 바쁨을 보지
-    /// 않아, quiescing 이 풀린 직후 보류분이 복원 턴 **도중**에 타이핑되면 Claude 가 복원 턴 뒤 조용함 없이 곧바로 처리한다 —
-    /// 그 턴이 복원 끝 바닥에 들어 여유 있는 master(참 바닥 72)가 76 으로 재여 Probe → Stopped 였다(드릴 rv-d3). 이 동안 그 두
-    /// 생산자는 보류(채널 — 행 `new` 유지 · 15초 sweep 재시도)·좌석 큐 우회(스케줄 — 대기열은 턴이 끝난 좌석에만 배달)한다 —
-    /// 대기열 배달과 같은 순서(복원 턴 끝 뒤)라 복원 끝이 오염되지 않는다. Claude 는 그 입력을 어차피 복원 턴 뒤에 처리하므로
-    /// 늘어나는 지연은 조용함 판정(2초) + 재시도 간격뿐이다. 압축 뒤 재는 창은 복원 턴이 없다(보류 없음).
-    pub fn restore_turn_open(&self, now: f64) -> bool {
-        self.post_clear()
-            && !self.rearmed
-            && self.restore_peak.is_none()
-            && self.restore_quiet_from.is_none()
-            && self.settling(now)
-            && self.settle_anchor.is_some_and(|a| now >= a && now - a <= CTX_FLOOR_RESTORE_HOLD_SECS)
-    }
-
-    /// ★(ROLE-R4-1 · R2NC5-1) 좌석에 입력이 쓰인 시각(데몬 단조 초 · [`CtxIdleObs::last_input`]) — 모든 경로(운영 두 경로 ·
-    /// 수집기 틱)에서 관측·조용함 판정 **전에** 부른다. 복원 턴 끝 후보(조용함) 뒤 첫 입력이 복원 끝 바닥을 확정한다.
-    pub fn note_input(&mut self, at: Option<f64>, now: f64) {
-        if let Some(t) = at.filter(|t| t.is_finite()) {
-            self.input_at = Some(self.input_at.map_or(t, |p| p.max(t)));
-            // ★(RV2NC-E20-2) 시작점 뒤 첫 좌석 입력 = 이 세션의 붙여넣기(사이클이 붙여넣은 뒤 quiescing 을 푼다) — 복원 턴 오염
-            //   판정에서 뺀다.
-            if self.paste_input_at.is_none() && !self.rearmed && self.settle_anchor.is_some_and(|a| t > a) && self.settling(now) {
-                self.paste_input_at = Some(t);
-            }
-        }
-        self.freeze_restore(now);
-    }
-
-    /// ★(ROLE-R4-1 · R2NC5-1) 좌석의 마지막 대기열 배달 시각(데몬 단조 초 · [`CtxIdleObs::last_queue_delivery`]) — 입력이기도
-    /// 하다. [`Self::note_input`] 과 같은 자리(관측·조용함 판정 전)에서 부른다.
-    /// `inject_done` = writer 의 마지막 Inject 끝(CR 기록) — 인계한 배달이 실제로 제출된 시각(유예를 끝낸다).
-    pub fn note_delivery(&mut self, at: Option<f64>, inject_done: Option<f64>, now: f64) {
-        if let Some(t) = at.filter(|t| t.is_finite()) {
-            self.queue_at = Some(self.queue_at.map_or(t, |p| p.max(t)));
-            self.input_at = Some(self.input_at.map_or(t, |p| p.max(t)));
-        }
-        if let Some(t) = inject_done.filter(|t| t.is_finite()) {
-            self.inject_done_at = Some(self.inject_done_at.map_or(t, |p| p.max(t)));
-        }
-        self.freeze_restore(now);
-        self.note_taint(now);
-    }
-
-    /// ★(RV2NC-E20-2 · ②) 복원 턴 오염 — 붙여넣기 뒤·복원 끝(≥2초 조용함 · 대기열 배달) 전에 **대기열 배달이 아닌** writer Inject
-    /// (채널 행 · 스케줄 직접 push · CEO 배달 — 바쁨을 보지 않는다 · quiescing 해제 직후 보류분이 몰려 온다)가 끝났으면, Claude 는 그
-    /// 입력을 복원 턴 뒤에 조용함 없이 곧바로 처리한다 — 복원 끝과 그 입력의 턴을 가를 신호가 없다. 그때까지의 최고치(복원 끝의
-    /// **하한**)로 복원 끝을 확정하고 오염으로 적는다: 차단기(Probe·Stopped)는 그 하한이 차단 상한 근처일 때만(참으로 가득 찬 좌석),
-    /// 아니면 얇은 세션(몰림 = 정착 창 최고치 · 성장 속도로 가른다 — ① 은 거기서 묶인다). 종전(e20f1cb6)은 그 입력의 턴을 복원
-    /// 끝에 실어 여유 있는 master(참 바닥 72)가 76 으로 재여 Probe → Stopped(86 · 선제 압축점 위) — 매 세션 Claude 압축이 cys
-    /// clear 보다 먼저 왔고 자동 압축을 끈 좌석은 막대 89 가 차단점 88.5% 위였다(드릴 rv-d3·rv-d3n).
-    fn note_taint(&mut self, now: f64) {
-        if self.restore_peak.is_some() || self.restore_quiet_from.is_some() || self.rearmed || !self.settling(now) {
-            return;
-        }
-        let (Some(d), Some(a)) = (self.inject_done_at, self.settle_anchor) else { return };
-        let after_paste = d > a && self.paste_input_at.is_some_and(|p| d > p);
-        let queued = self.queue_at.is_some_and(|q| d >= q && d <= q + CTX_FLOOR_QUEUE_CR_SECS);
-        if !after_paste || queued {
-            return;
-        }
-        self.restore_peak = Some(self.settle_peak.unwrap_or(0));
-        self.restore_window = self.floor_window;
-        self.restore_freeze_at = Some(d);
-        self.restore_grace_until = None;
-        self.restore_tainted = true;
-    }
-
-    /// ★(R2NC6-1 · RV-ROLE-CF42-1) 좌석 대기열에 남은 가장 오래된 항목의 enqueue 시각(데몬 단조 초 · None = 빈 대기열 ·
-    /// [`CtxIdleObs::queue_oldest`]) — 조용함 판정 **전**에 부른다(최신 관측으로 덮는다).
-    pub fn note_queue(&mut self, oldest: Option<f64>) {
-        self.queue_oldest = oldest.filter(|t| t.is_finite());
-        if self.held_pending() && self.post_clear() && !self.rearmed && !self.settle_closed {
-            self.held_seen = true;
-        }
-    }
-
-    /// 사이클이 붙잡았던 대기열 항목(정착 창 시작점 = quiescing 해제 전에 들어온 것)이 아직 배달되지 않았다.
-    /// ★(RV2NC-E20-1) 기준은 시작점이 아니라 **복원 끝을 확정한 입력 시각**([`Self::backlog_cutoff`])까지 — 복원 턴 동안 대기열에
-    /// 선 항목(복원된 좌석이 부른 회신 몰림 · 드릴 rv-d1p: 붙여넣기 턴 끝 2초 뒤 3건)도 사이클의 몰림이다. 종전(시작점만)은 그
-    /// 몰림 한가운데서 창을 닫아 나머지를 성장으로 세어, 회신만으로 매 세션 발화했다(1시간 11회).
-    fn held_pending(&self) -> bool {
-        let cutoff = |a: f64| self.backlog_cutoff.map_or(a, |c| c.max(a));
-        matches!((self.queue_oldest, self.settle_anchor), (Some(o), Some(a)) if o <= cutoff(a))
-    }
-
-    /// 복원 끝 바닥 확정 — 둘 중 먼저 성립하는 것(정착 창 안에서만):
-    /// (가) 복원 턴의 보고(시작점 뒤 상승) **뒤에 온 대기열 배달** — 대기열은 턴이 끝난 좌석에만 배달한다(프롬프트 경계 ·
-    ///      바쁨 표지 없음). claude 좌석의 프롬프트 경계 배달은 조용함을 기다리지 않아 복원 턴 끝과 첫 배달 사이에 2초 틈이
-    ///      없을 수 있다(샌드박스 실측 0.1~0.5초) — 틈만으로는 그 배달 턴이 복원 끝 바닥에 든다.
-    /// (나) 후보 조용함(≥2초 · 복원 턴 끝) **시작 뒤**의 좌석 입력(직접 send · 사람 입력 · 채널 행 등).
-    /// 확정 값 = 그 순간까지의 정착 창 최고치(그 입력이 부른 턴의 보고는 아직 싣지 않았다 — 호출 순서가 관측 전이다) ·
-    /// (가)로 확정했으면 그 배달의 제출(CR) 전 · [`CTX_FLOOR_INPUT_GRACE_SECS`] 안의 보고는 복원 턴의 늦은 보고로 싣는다
-    /// ((나)는 입력 시각이 이미 제출 뒤라 유예가 없다). 입력 없이 출력이 다시 흐른 틈(같은 턴이 이어짐)은 확정하지 않는다 —
-    /// 다음 입력 때 그때까지의 최고치로 확정한다.
-    fn freeze_restore(&mut self, now: f64) {
-        // ★(RV2NC-E20-2) 오염으로 확정한 세션의 몰림 기준 — 복원 턴 뒤 첫 대기열 배달(복원 턴이 끝났다는 증거)에서 선다.
-        if self.restore_tainted && self.backlog_cutoff.is_none() {
-            if let (Some(q), Some(f)) = (self.queue_at, self.restore_freeze_at) {
-                if q > f && self.settling(now) {
-                    self.backlog_cutoff = Some(q);
+        /// 시한 처리 — 보고 없이도 부른다(수집기 틱). 한 번에 여러 시한이 지났으면 차례로 모두 처리한다.
+        fn expire(&mut self, now: f64, frozen: bool, notes: &mut Vec<Note>) {
+            for _ in 0..4 {
+                match self.phase {
+                    Phase::Awaiting { at, deadline } => {
+                        if frozen {
+                            // 배달 동결 중에는 사이클이 올 수 없다 — 시한을 멈춘다(재개 뒤 온전한 시한).
+                            self.phase = Phase::Awaiting { at, deadline: deadline.max(now + CTX_GUARD_CLEAR_WAIT_SECS) };
+                            return;
+                        }
+                        if now < deadline {
+                            return;
+                        }
+                        self.phase = Phase::Free;
+                        let k1 = self.strikes.saturating_add(1);
+                        let retry = deadline + backoff(k1);
+                        if let Some(f) = self.fire.as_mut() {
+                            if !f.cleared && !f.evaluated {
+                                f.tentative_until = Some(retry);
+                                notes.push(Note::Unanswered { seq: f.seq, retry_after: retry });
+                                // 발화 축(실측)의 마지막 관측을 다시 판정해 둔다(보고가 끊긴 좌석도 보류 만료에 재발화 — I2).
+                                // 자기보고 축은 다음 status.set 도착 때 판정한다.
+                                if f.axis == Axis::Measured {
+                                    let (pct, window, base) =
+                                        self.scopes[0].iter().find(|e| scope_id(&e.0) == f.scope).map_or(f.obs, |e| e.3);
+                                    self.held = Some(Held { until: retry, pct, window, axis: f.axis, base, scope: f.scope });
+                                }
+                            }
+                        }
+                    }
+                    Phase::Cycling { since } => {
+                        if now < since + CTX_GUARD_CYCLING_MAX_SECS {
+                            return;
+                        }
+                        self.cycle_end(since + CTX_GUARD_CYCLING_MAX_SECS);
+                    }
+                    Phase::Measuring { anchor, secs, kind, peak, first, peak_scope, .. } => {
+                        if now < anchor + secs {
+                            return;
+                        }
+                        notes.push(self.close(kind, peak, first, peak_scope, None));
+                    }
+                    Phase::Free => return,
                 }
             }
         }
-        // 압축 뒤 재는 창(R1-RUNAWAY-1 · RV2-ROLE-1)에는 복원 턴이 없다 — 압축 뒤 바닥은 짧은 창의 최고치다.
-        if self.restore_peak.is_some() || self.rearmed || !self.settling(now) {
-            return;
-        }
-        let Some(p) = self.settle_peak else { return };
-        let by_queue = match (self.queue_at, self.restore_rise_at) {
-            (Some(d), Some(r)) if d > r => Some(d),
-            _ => None,
-        };
-        let by_gap = match (self.restore_quiet_from, self.input_at) {
-            (Some(q), Some(i)) if i > q => Some(i),
-            _ => None,
-        };
-        let (at, grace) = match (by_queue, by_gap) {
-            (Some(a), Some(b)) if b < a => (b, None),
-            (Some(a), _) => (a, Some(a + CTX_FLOOR_INPUT_GRACE_SECS)),
-            (None, Some(b)) => (b, None),
-            (None, None) => return,
-        };
-        self.restore_peak = Some(p);
-        self.restore_window = self.floor_window;
-        self.restore_freeze_at = Some(at);
-        self.restore_grace_until = grace;
-        self.backlog_cutoff = Some(at);
-    }
 
-    /// 세션 교체(clear·새 세션) 관측 — 마지막 발화 **뒤 첫** 교체가 정착 창을 연다(발화 이력이 없으면 무시). 자동 clear 를
-    /// 멈춘(Stopped) 좌석은 그 뒤 교체(오너의 수동 clear·재기동)도 다시 잰다 — 처방 뒤 바닥이 내려가면 곧바로 정상 영역.
-    pub fn note_session_change(&mut self, now: f64) {
-        // 압축 판정의 '같은 세션' 기준은 어떤 교체 통지에서든 새로 시작한다(아래에서 잰 바닥을 유지하는 교체라도).
-        self.session_peak = None;
-        self.session_peak_window = None;
-        let Some(fired) = self.fired_at else { return };
-        // ★(RV2NC-E20-1) 몰림을 바닥으로 확정한 세션(Backlog)도 Stopped 처럼 그 뒤 교체(오너 clear)를 다시 잰다.
-        let stopped = self.bar(0, None).is_some_and(|b| matches!(b.regime, CtxFloorRegime::Stopped | CtxFloorRegime::Backlog));
-        // ★(R2NC5-1 (b)) Claude 압축으로 재무장한 세션도 그 뒤 교체(발화 없는 오너 clear 포함)를 다시 잰다.
-        if self.reset_at.is_some_and(|r| r >= fired) && !stopped && !self.rearmed {
-            return;
+        /// 사이클 표지 — `on` = quiescing 켬(cycle-agent 5단계 · clear 직전) · `!on` = 끔(재주입 뒤 · 실패 · 소유자 사망 해제).
+        pub fn cycle(&mut self, on: bool, now: f64, frozen: bool) -> Out {
+            let mut notes = vec![];
+            self.expire(now, frozen, &mut notes);
+            if on {
+                if !matches!(self.phase, Phase::Cycling { .. }) {
+                    self.phase = Phase::Cycling { since: now };
+                    self.held = None;
+                }
+            } else if matches!(self.phase, Phase::Cycling { .. }) {
+                self.cycle_end(now);
+            }
+            Out { notes, verdict: None }
         }
-        // 직전에 잰 clear 세션의 영역을 넘긴다(연속 확인 재료). 잰 적이 없으면(부트 첫 발화 뒤) 확인 아님. ★(RV2NC-E20-1) 얇은
-        // 세션의 발화가 일하는 좌석의 빠른 성장이었으면 확인 재료가 아니다(바쁜 여유 좌석은 차단 상한 근처에서 계속 clear · ②).
-        self.prev_tier3 = self.reset_at.is_some() && self.session_tier3 && !self.session_fast;
-        self.session_fast = false;
-        self.settle_closed_at = None;
-        self.restore_tainted = false;
-        self.paste_input_at = None;
-        self.backlog_cutoff = None;
-        self.rearm_floor = None;
-        self.rearm_floor_window = None;
-        self.rearm_thin = false;
-        self.window_compacted = false;
-        self.held_seen = false;
-        self.early_peak = None;
-        self.early_peak_window = None;
-        self.reset_at = Some(now);
-        self.settle_anchor = Some(now);
-        self.settle_peak = None;
-        self.settle_rise_at = None;
-        self.settle_seen_at = None;
-        self.settle_closed = false;
-        self.floor_window = None;
-        self.session_tier3 = false;
-        self.session_notice = None;
-        self.session_fed = false;
-        self.restore_rise_at = None;
-        self.restore_quiet_from = None;
-        self.restore_peak = None;
-        self.restore_window = None;
-        self.restore_freeze_at = None;
-        self.restore_grace_until = None;
-        self.rearmed = false;
-    }
 
-    /// 사이클 진행 중(quiescing) 관측 — 정착 창의 시작점을 뒤로 민다(재주입·붙여넣기가 끝난 뒤부터 복원을 잰다).
-    /// 교체 시각 + 정착 창까지만(멈춘 quiescing 이 창을 무한히 열어 두면 발화가 막힌다 — ②).
-    pub fn note_quiescing(&mut self, now: f64) {
-        if !self.post_clear() {
-            return;
+        /// 수집기 틱 — 시한 처리 · Free 이고 보류가 끝난 관측이 있으면 그 관측을 다시 판정한다(새 관측을 읽지 않는다).
+        pub fn tick(&mut self, now: f64, frozen: bool) -> Out {
+            let mut notes = vec![];
+            self.expire(now, frozen, &mut notes);
+            let mut verdict = None;
+            if self.phase == Phase::Free {
+                if let Some(h) = self.held {
+                    if now >= h.until {
+                        self.held = None;
+                        verdict = Some(self.decide(h.pct, h.window, h.axis, h.base, h.scope, now, &mut notes));
+                    }
+                }
+            }
+            Out { notes, verdict }
         }
-        if let (Some(r), Some(a)) = (self.reset_at, self.settle_anchor) {
-            if now >= a && now - a <= CTX_FLOOR_SETTLE_SECS {
-                let anchor = now.min(r + CTX_FLOOR_SETTLE_SECS);
-                self.settle_anchor = Some(anchor);
-                // 시작점이 밀렸다 — 그 앞의 상승·턴 끝 후보는 이 붙여넣기의 복원 턴 것이 아니다.
-                if self.restore_rise_at.is_some_and(|t| t < anchor) {
-                    self.restore_rise_at = None;
+
+        /// 낙폭 판정(같은 축 · 같은 범위). 참 = 압축(자동·수동 /compact · 수동 /clear 를 구분하지 못한다). (전, 후) 를 돌려준다.
+        fn scope_drop(&mut self, axis: Axis, scope: &str, lv: Lv, base: u8) -> Option<(u8, u8)> {
+            let sc = &mut self.scopes[axis as usize];
+            let last = (lv.0, lv.1, base);
+            match sc.iter().position(|e| e.0 == scope) {
+                Some(i) => {
+                    let (f, pk, confirmed, _) = sc.remove(i);
+                    let before = rebase(pk, lv.1);
+                    let low = u16::from(lv.0) + u16::from(CTX_GUARD_COMPACT_DROP) <= u16::from(before);
+                    let dropped = low && confirmed;
+                    // 확인 전 첫 관측보다 크게 낮으면 그 첫 관측을 버린다(낡은 값) · 아니면 확인된다.
+                    sc.insert(0, (f, if low { lv } else { higher(pk, lv) }, true, last));
+                    dropped.then_some((before, lv.0))
                 }
-                if self.restore_quiet_from.is_some_and(|t| t < anchor)
-                    || self.restore_freeze_at.is_some_and(|t| t < anchor)
-                {
-                    self.restore_quiet_from = None;
-                    self.restore_peak = None;
-                    self.restore_window = None;
-                    self.restore_freeze_at = None;
-                    self.restore_grace_until = None;
-                    self.restore_tainted = false;
-                    self.backlog_cutoff = None;
+                None => {
+                    sc.insert(0, (scope.to_string(), lv, false, last));
+                    sc.truncate(CTX_GUARD_SCOPES_KEPT);
+                    None
                 }
-                if self.paste_input_at.is_some_and(|t| t <= anchor) {
-                    self.paste_input_at = None;
-                }
-                self.early_peak = None;
             }
         }
-    }
 
-    /// 지금이 clear 뒤 세션의 정착 창 안인가 — 시작점 + [`CTX_FLOOR_SETTLE_SECS`], 그 뒤에도 바닥이 최근
-    /// [`CTX_FLOOR_SETTLE_QUIET_SECS`] 안에 올랐으면(복원이 아직 도는 중) 시작점 + [`CTX_FLOOR_SETTLE_MAX_SECS`] 까지.
-    /// 그 전에라도 좌석이 조용해지면(복원 턴 끝 — [`Self::note_idle`]) 닫힌다.
-    pub fn settling(&self, now: f64) -> bool {
-        if !self.post_clear() || self.settle_closed {
-            return false;
-        }
-        let (Some(r), Some(a)) = (self.reset_at, self.settle_anchor) else { return false };
-        if now < r {
-            return false;
-        }
-        // ★(RV2-ROLE-1) 압축 뒤 재는 창은 지침 재읽기 몫만 — 연장·최소 창·조용함 닫힘 없음.
-        if self.rearmed {
-            return now - a <= CTX_FLOOR_REREAD_SECS;
-        }
-        now - a <= CTX_FLOOR_SETTLE_SECS
-            || (now - a <= CTX_FLOOR_SETTLE_MAX_SECS
-                && self.settle_rise_at.is_some_and(|t| now - t <= CTX_FLOOR_SETTLE_QUIET_SECS))
-    }
-
-    /// ★(자기 반례 · 차단기 오판) 좌석 출력이 `idle_from` ~ `idle_to` 동안 조용했다(턴 끝) — 이 조용함이 정착 창 시작점
-    /// 뒤에 시작해 최소 창([`CTX_FLOOR_SETTLE_MIN_SECS`]) 이후까지 이어졌고 그 사이 관측이 있었으면 **정착 창을 닫는다**:
-    /// clear 사이클 자신의 입력(붙여넣기 → 복원 턴)이 끝난 높이가 바닥이고, 그 뒤 들어온 작업(대기열 배달·push 한 턴씩)은
-    /// 바닥이 아니라 성장이다. 시간 창만 쓰면 바쁜 좌석의 바닥이 복원 뒤 작업만큼 부풀어(200K master 72 → 77~85) 여유 있는
-    /// 좌석이 Probe·Stopped(바닥+10 = 선제 압축점 위)로 오판된다(② — cys clear 가 Claude 압축에 가린다).
-    /// 호출 순서(운영 두 경로·수집기 틱 공통): **끝난 틈은 관측 전**(틈 뒤 보고는 새 턴의 것 — 싣지 않는다) · **이어지는
-    /// 조용함은 관측 뒤**(조용한 동안 온 보고는 직전 턴의 끝이다). 실패 방향: 조용함 신호가 없으면(출력이 끊이지 않는 좌석 ·
-    /// 수집기 정지) 종전 시간 창 그대로 — 닫힘이 늦어질 뿐 이르지 않다. 닫힌 뒤에는 정착 창 뒷문도 없다(막대가 차단 상한 이하).
-    ///
-    /// ★(ROLE-R4-1 · R2NC5-1) 같은 조용함이 **복원 턴 끝 후보**도 정한다 — 시작점 뒤 상승 관측(복원 턴의 보고)이 이 조용함의
-    /// 끝 이전에 있었고 조용함이 시작점 뒤에 시작했으면(최소 창과 무관 — 사이클이 붙잡았던 배달은 복원 턴 끝 + 3초에 오고
-    /// 최소 창보다 이르다). 후보 뒤 첫 좌석 입력이 복원 끝 바닥을 확정한다([`Self::note_input`]).
-    pub fn note_idle(&mut self, idle_from: f64, idle_to: f64, now: f64) {
-        // ★(RV2-ROLE-1 (b)) 압축 뒤 재는 창은 조용함·몰림 규칙을 쓰지 않는다 — 시작점이 quiescing 해제가 아니라 압축 관측이라
-        //   평상 대기열(압축 전에 들어온 회신)을 사이클이 붙잡은 몰림으로 볼 이유가 없다 · 창은 [`CTX_FLOOR_REREAD_SECS`] 로 끝난다.
-        if idle_to - idle_from < CTX_FLOOR_IDLE_QUIET_SECS || self.rearmed || !self.settling(now) {
-            return;
-        }
-        let (Some(anchor), Some(seen)) = (self.settle_anchor, self.settle_seen_at) else { return };
-        if self.restore_quiet_from.is_none()
-            && idle_from >= anchor
-            && self.restore_rise_at.is_some_and(|t| t <= idle_to)
-        {
-            self.restore_quiet_from = Some(idle_from);
-            // 이 틈을 끝낸 입력(대기열 배달)이 이미 기록됐으면 곧바로 확정한다.
-            self.freeze_restore(now);
-        }
-        // 복원 끝 바닥이 확정됐으면(복원 뒤 입력이 흐르는 중):
-        //  · 사이클이 붙잡았던 대기열 항목(시작점 전에 들어온 것)이 남아 있으면 몰림 중 — 15초 조용함(대기열 막힘)에서만 닫는다.
-        //    몰림 전체가 최고치에 든다(몰림만으로 발화 없음 · 몰림 길이와 무관 · ①).
-        //  · 다 배달됐으면(★R2NC6-1 · RV-ROLE-CF42-1) **마지막 대기열 배달 뒤에 시작한** ≥2초 조용함(그 배달 턴의 끝)에서 닫는다 —
-        //    그 뒤 들어오는 배달(시작점 뒤에 들어온 항목)은 새 작업이라 바닥이 아니라 성장이다. 대기열이 선 바쁜 좌석(틈 2~15초)도
-        //    몰림이 끝나면 곧 닫힌다(d9638152 는 15초 조용함만 기다려 창이 300~600초 열린 채 작업을 실었다 · ②).
-        let (quiet, after) = match (self.restore_peak.is_some(), self.held_pending()) {
-            (true, true) => (CTX_FLOOR_BURST_QUIET_SECS, None),
-            (true, false) => (CTX_FLOOR_IDLE_QUIET_SECS, self.queue_at),
-            (false, _) => (CTX_FLOOR_IDLE_QUIET_SECS, None),
-        };
-        if idle_to - idle_from >= quiet
-            && after.is_none_or(|d| idle_from >= d)
-            && idle_from >= anchor
-            && idle_to >= anchor + CTX_FLOOR_SETTLE_MIN_SECS
-            && seen >= anchor
-            && self.settle_peak.is_some()
-        {
-            self.settle_closed = true;
-            self.settle_closed_at = Some(now);
-        }
-    }
-
-    /// 관측 1건 — 정착 창 안이면 바닥 후보(최고치)에 싣는다. 모든 보고에서 교차 판정 **전에** 부른다.
-    /// 정착 창 밖이면 Claude 자체 압축을 본다([`Self::note_compaction`] — 재무장했으면 Some).
-    pub fn observe(&mut self, pct: u8, window: Option<u64>, now: f64) -> Option<CtxRearm> {
-        let sw = window.or(self.session_peak_window);
-        let prior = self.session_peak.map(|p| rebase_pct(p, self.session_peak_window, sw));
-        self.session_peak = Some(prior.map_or(pct, |p| p.max(pct)));
-        self.session_peak_window = sw;
-        self.last_pct = Some((pct, window));
-        if !self.settling(now) {
-            return self.note_compaction(pct, window, prior, now);
-        }
-        let cur = self.floor_for(window);
-        let dropped = cur.is_some_and(|f| u16::from(pct) + u16::from(CTX_FLOOR_COMPACT_DROP) <= u16::from(f));
-        // ★(RV2-ROLE-1 (a)) 압축 뒤 재는 창 안의 두 번째 Claude 압축(창 최고치보다 낙폭 이상 낮음)도 압축이다 — 종전에는 창 안
-        //   관측을 압축으로 보지 않아 압축 전 최고치가 '압축 뒤 바닥'이 됐다. 그 시각에서 다시 잰다(clear 뒤 창은 종전대로 · 최고치).
-        if self.rearmed && dropped {
-            let b = self.bar(0, window);
-            self.restart_measure(pct, window, now);
-            return b.map(|b| CtxRearm { floor: b.settled, regime: b.regime });
-        }
-        // ★(ADV2-R1-1 · RV2-ROLE-1) clear 뒤 창 안의 Claude 압축(창 최고치보다 낙폭 이상 낮음 · 재무장 대상 세션 — 차단기 영역이거나
-        //   막대가 차단 상한 위 · 정상·Limited 세션의 수동 /compact 는 종전대로 최고치를 싣는다)은 곧바로 재무장한다 — 창이 끝날
-        //   때까지(최대 600초) 기다리면 그동안 자란 몫이 '압축 뒤 바닥'에 든다(재검증자 반례: 압축 뒤 수준 30 이 42 로 재임). 창
-        //   최고치가 선제 압축 천장 위였고 복원 턴 도중(시작점 + 최소 창 안 · 복원 끝 전)이나 사이클이 붙잡은 몰림 도중의 압축이면
-        //   사이클 자신의 입력이 선제 압축점을 넘긴 것이다 — 그 clear 는 압축점 위로 돌아온다(참으로 가득 참 · 확인 재료). 복원 끝
-        //   뒤 작업이 부른 압축은 아니다(clear 로 돌아오는 바닥 = 복원 끝).
-        if !self.rearmed && dropped {
-            let w = window.or(self.floor_window);
-            if let Some(b) = self.bar(0, window).filter(|b| b.regime.tier3() || b.bar > ctx_floor_hard_cap(w)) {
-                // 사이클 자신의 입력이 부른 압축 — 창 최고치가 선제 압축 천장 위였다(보고 간격 때문에 압축 직전 표시는 압축점보다
-                // 몇 %p 낮을 수 있다 · 천장 아래 높이의 수동 /compact 는 이 판정에서 뺀다).
-                let in_restore = self.restore_peak.is_none() && self.settle_anchor.is_some_and(|a| now - a <= CTX_FLOOR_SETTLE_MIN_SECS);
-                if cur.is_some_and(|f| f > ctx_floor_ceiling(w)) && (in_restore || self.held_pending() || self.held_seen) {
-                    self.window_compacted = true;
-                    self.session_tier3 = true;
+        /// 관측 1건 — 낙폭·창·수준을 처리하고 Free 면 발화를 판정한다.
+        pub fn report(&mut self, r: &Rep) -> Out {
+            let mut notes = vec![];
+            self.expire(r.now, r.frozen, &mut notes);
+            let i = r.axis as usize;
+            let lv = (r.pct, r.window);
+            let sid = scope_id(r.scope);
+            if matches!(self.phase, Phase::Cycling { .. }) {
+                // clear·복원 도중 — 이 관측은 수준도 낙폭도 아니다(clear 의 3% · 재주입 중간값 · 새 세션 첫 보고).
+                return Out { notes, verdict: Some(Verdict::Quiet) };
+            }
+            let s = stop_cap(r.window);
+            // S 이상 외톨이 보고(사이클 뒤 창에서 이 범위의 S 미만 보고도 앞선 S 이상 보고도 없다) — 확인 전에는 수준도 낙폭
+            // 기준도 아니다. 다른 범위(헬퍼·다른 파일)의 보고는 이 확인에 쓰지 않는다.
+            if let Phase::Measuring { kind: Kind::AfterCycle, ref peak, ref peak_scope, ref mut hi, .. } = self.phase {
+                let same_peak = peak[i].is_some() && peak_scope[i] == sid;
+                let same_hi = hi[i].is_some_and(|(_, h)| h == sid);
+                if r.pct >= s && !same_peak && !same_hi {
+                    hi[i] = Some((lv, sid));
+                    return Out { notes, verdict: Some(Verdict::Quiet) };
                 }
-                return Some(self.rearm_at(b, pct, window, now));
             }
-        }
-        if cur.is_none_or(|f| pct > f) {
-            self.settle_rise_at = Some(now);
-        }
-        // 복원 턴의 보고 — 시작점 뒤 처음으로 지금까지의 최고치(없으면 0)를 넘는 관측(붙여넣기를 처리한 턴이 보고됐다).
-        if self.restore_rise_at.is_none() && pct > cur.unwrap_or(0) && self.settle_anchor.is_some_and(|a| now >= a) {
-            self.restore_rise_at = Some(now);
-        }
-        self.settle_peak = Some(cur.map_or(pct, |f| f.max(pct)));
-        self.settle_seen_at = Some(now);
-        if !self.rearmed && self.settle_anchor.is_some_and(|a| now >= a && now - a <= CTX_FLOOR_SETTLE_MIN_SECS) {
-            self.early_peak = self.settle_peak;
-            self.early_peak_window = window.or(self.floor_window);
-        }
-        // 대기열 인계로 확정한 직후 · 그 배달이 제출(CR)되기 전의 보고는 복원 턴의 늦은 보고다(상태줄이 인계보다 늦게 도착) —
-        // 복원 끝 바닥에 싣는다. 제출 뒤 보고는 새 메시지를 담을 수 있다(싣지 않는다).
-        if let (Some(rp), Some(fa), Some(until)) = (self.restore_peak, self.restore_freeze_at, self.restore_grace_until) {
-            if now <= until && self.inject_done_at.is_none_or(|d| d <= fa) {
-                self.restore_peak = Some(rp.max(rebase_pct(pct, window, self.restore_window)));
+            if let Some(drop) = self.scope_drop(r.axis, r.scope, lv, r.base) {
+                // 압축(같은 범위 10%p 낙폭) — 발화 결과를 한 번만 정한다.
+                if let Some(f) = self.fire {
+                    if !f.evaluated {
+                        if let Some(fm) = self.fire.as_mut() {
+                            fm.evaluated = true;
+                            fm.tentative_until = None;
+                        }
+                        if f.cleared {
+                            // 사이클이 끝났는데 다음 발화 전에 압축 — 그 clear 는 압축을 막지 못했다.
+                            let n = self.strike(r.now, Why::DropAfterCycle, Some(drop), (f.seq, f.at), r.axis);
+                            notes.push(n);
+                        } else {
+                            // 사이클 전에 압축이 왔다(Claude 가 먼저 · 또는 오너 /compact) — 효과 없음이 아니다(결과 확정 · strike 없음).
+                            notes.push(Note::DropBeforeCycle { seq: f.seq, drop });
+                        }
+                    }
+                }
+                self.held = None;
+                let mut peak = [None; 2];
+                peak[i] = Some(lv);
+                let mut first = [None; 2];
+                first[i] = Some(lv);
+                let mut peak_scope = [0; 2];
+                peak_scope[i] = sid;
+                self.phase = Phase::Measuring {
+                    anchor: r.now,
+                    secs: CTX_GUARD_REREAD_SECS,
+                    kind: Kind::AfterCompaction,
+                    peak,
+                    hi: [None; 2],
+                    first,
+                    peak_scope,
+                };
+                return Out { notes, verdict: Some(Verdict::Quiet) };
             }
+            if let Phase::Measuring { anchor, secs, kind, mut peak, mut hi, mut first, mut peak_scope } = self.phase {
+                if first[i].is_none() {
+                    first[i] = Some(lv);
+                }
+                let early = kind == Kind::AfterCycle && r.pct >= s;
+                if early {
+                    // S 도달(자동 압축이 돌지 않는 좌석) — 확인된 수준으로 곧바로 닫는다(이 보고는 수준에 싣지 않는다).
+                    // 확인 = 같은 범위의 S 미만 보고가 창에 있다 · 또는 같은 범위의 두 번째 S 이상 보고(수준 = 둘 중 낮은 값).
+                    if let Some((h, hs)) = hi[i].filter(|(_, hs)| *hs == sid) {
+                        let conf = lower(h, lv);
+                        if peak[i].is_none_or(|pk| rebase(pk, conf.1) < conf.0) {
+                            peak[i] = Some(conf);
+                            peak_scope[i] = hs;
+                        }
+                    }
+                    notes.push(self.close(kind, peak, first, peak_scope, Some(r.axis)));
+                    // 닫힌 뒤 이 보고로 판정한다(아래).
+                } else {
+                    if hi[i].is_some_and(|(_, h)| h == sid) {
+                        hi[i] = None; // 같은 범위의 S 아래 보고가 오면 외톨이 S 보고는 버린다(낡은 첫 보고)
+                    }
+                    if peak[i].is_none_or(|pk| rebase(pk, lv.1) < lv.0) {
+                        peak_scope[i] = sid;
+                    }
+                    peak[i] = Some(peak[i].map_or(lv, |pk| higher(pk, lv)));
+                    self.phase = Phase::Measuring { anchor, secs, kind, peak, hi, first, peak_scope };
+                    return Out { notes, verdict: Some(Verdict::Quiet) };
+                }
+            }
+            if matches!(self.phase, Phase::Awaiting { .. }) {
+                return Out { notes, verdict: Some(Verdict::Quiet) };
+            }
+            // Free
+            if self.fold[i].is_some_and(|f| f == 0 || f == sid) {
+                self.fold[i] = None;
+                let (l, kind) = match self.level[i] {
+                    Some((l, k)) => (higher(l, lv), k),
+                    None => (lv, Kind::AfterCycle),
+                };
+                self.level[i] = Some((l, kind));
+                notes.push(Note::MeasuredLate { axis: r.axis, level: l });
+                return Out { notes, verdict: Some(Verdict::Quiet) };
+            }
+            let v = self.decide(r.pct, r.window, r.axis, r.base, sid, r.now, &mut notes);
+            Out { notes, verdict: Some(v) }
         }
-        if window.is_some() {
-            self.floor_window = window;
-        }
-        None
-    }
 
-    /// ★(R2NC5-1 (b)) 정착 창이 닫힌 clear 뒤 세션에서 컨텍스트가 잰 바닥(복원 끝 · 없으면 정착 창 최고치)보다
-    /// [`CTX_FLOOR_COMPACT_DROP`] 이상 낮게 보고되면 Claude 자체 압축(자동·수동 /compact — 세션 파일은 그대로)이다. 그 세션이
-    /// 차단기 영역(Probe·Stopped)이거나 막대가 차단 상한 위(선제 압축이 cys clear 보다 먼저 오는 높이)였으면 잰 바닥을 버리고
-    /// **재무장**한다 — Stopped 는 새 세션이 없으면 다시 재지 않으므로, 이것이 없으면 그 좌석은 오너가 손으로 clear·재기동할
-    /// 때까지 cys 사이클(저장·지침 재주입)을 영영 받지 못한다(②). 정상·Limited 세션(막대 ≤ 차단 상한 · 선제 압축점 아래)은
-    /// 건드리지 않는다. 창 전환(1M)은 바닥을 토큰 비율로 옮긴 뒤 비교하므로 압축으로 세지 않는다. 낙폭은 **같은 세션** 안이어야
-    /// 한다([`Self::session_peak`] — 발화 없이 바뀐 새 세션(잰 바닥을 유지하는 교체)의 낮은 첫 보고는 압축이 아니다 · 그 오판은
-    /// 유휴 좌석을 기본 임계로 되돌려 재주입 고리를 한 번 더 부른다 — ①).
-    ///
-    /// ★(R1-RUNAWAY-1 · ①) 재무장은 기본 임계로 곧장 가지 않고 **압축 뒤 바닥을 다시 잰다** — 압축 관측 시각을 시작점으로 정착
-    /// 창을 새로 연다(clear 뒤 세션과 같은 기계: 최고치 · 복원 턴 끝 · 몰림 · 조용함 닫힘 · 뒷문 없음). 압축 뒤 SessionStart:compact
-    /// 훅은 지침 전문(MASTER 96.7KB · CEO 105KB)을 다시 읽게 해 압축 뒤 수준이 30 + 30~40%p = 60~70% 다 — d9638152 는 그 수준이
-    /// 기본 임계(60) 위면 성장 0 으로 곧바로 발화했고, 그 사이클의 붙여넣기+복원이 선제 압축점(83.5%) 위인 좌석은 붙여넣기 →
-    /// 압축 → 재읽기 → 재무장 발화를 주기 신호마다 돌았다(유휴 4시간 19~21회). 이제 압축 뒤 발화는 그 바닥 위로 실제로 자란 뒤
-    /// ([`ctx_floor_bar_measured`] — 바닥 + 여유 · 천장·차단 상한)뿐이다: 압축 1회당 사이클 ≤ 1 · 그것도 실제 성장이 부른다.
-    /// 다시 잰 바닥도 차단기 높이면 다음 압축이 또 잰다(한 세션 여러 번 — 영구 중단 없음). 확인 재료(`prev_tier3`·`session_tier3`)
-    /// 와 뒷문 소진은 그대로 둔다(압축 뒤 바닥은 clear 사이클 자신의 입력이 아니다).
-    fn note_compaction(&mut self, pct: u8, window: Option<u64>, session_prior: Option<u8>, now: f64) -> Option<CtxRearm> {
-        // 같은 세션 안에서 떨어졌어야 한다 — 마지막 교체 통지(또는 재무장) 뒤 관측 최고치보다도 낙폭 이상 낮다.
-        let drop = u16::from(CTX_FLOOR_COMPACT_DROP);
-        if session_prior.is_none_or(|p| u16::from(pct) + drop > u16::from(p)) {
-            return None;
-        }
-        let w = window.or(self.floor_window);
-        let b = self.bar(0, w)?;
-        if !(b.regime.tier3() || b.bar > ctx_floor_hard_cap(w)) {
-            return None;
-        }
-        // 보고 바닥(복원 끝 · 오염이면 정착 창 최고치) 기준 낙폭.
-        if u16::from(pct) + drop > u16::from(b.floor) {
-            return None;
-        }
-        Some(self.rearm_at(b, pct, window, now))
-    }
-
-    /// 재무장 1건 — clear 로 돌아오는 바닥을 남기고 압축 관측 시각에서 바닥을 다시 잰다.
-    fn rearm_at(&mut self, b: CtxFloorBar, pct: u8, window: Option<u64>, now: f64) -> CtxRearm {
-        let w = window.or(self.floor_window);
-        // ★(ADV2-R1-1 · ①) 압축 전 clear 세션의 clear 로 돌아오는 바닥(정착 창 최고치 — 복원 + clear 마다 되풀이되는 몰림)을
-        //   남긴다 — 압축 뒤 발화는 그 + 1 이상에서만. 참으로 가득 찬 좌석(clear 바닥 76~85)에서 압축 뒤 바닥 63~70 위 75·80 발화는
-        //   cys clear 가 컨텍스트를 오히려 올리고 그 붙여넣기+복원이 다음 압축을 불러 성장 약 4.5%p 마다 clear → 압축 → 재무장을
-        //   돌았다(재검증자 24시간 발화 11 · 압축 10). 두 번째 이후 압축(재무장 세션 안)은 처음 남긴 값을 그대로 쓴다.
-        if !self.rearmed {
-            // clear 로 돌아오는 바닥: 사이클 자신의 입력이 창 안에서 압축을 불렀으면 선제 압축점 · 사이클이 붙잡은 몰림(복원 턴
-            // 동안 선 회신 포함)이 있었거나 복원 턴이 기계 주입으로 오염됐으면 정착 창 최고치(복원 끝 + clear 마다 되풀이되는 몰림) ·
-            // 몰림이 없으면 복원 끝(정착 창 최고치는 복원 뒤 첫 작업 턴 — 긴 턴이면 몇 %p — 을 실을 수 있다 · 그 몫까지 들어올리면
-            // 압축 뒤 발화가 선제 압축점 턱밑으로 밀려 압축이 cys clear 를 앞지른다) · 복원 끝 신호가 없으면 시작점 + 최소 창까지의
-            // 최고치.
-            self.rearm_floor = Some(if self.window_compacted {
-                ctx_pct_below_reserve(w, CC_SUMMARY_RESERVE_TOKENS + CC_AUTOCOMPACT_BUFFER_TOKENS)
-            } else if self.restore_peak.is_some() {
-                if self.held_seen || self.restore_tainted { b.settled } else { b.floor }
-            } else {
-                // 복원 끝 신호가 없고 창이 시간으로 닫혔다(끊김 없는 긴 턴) — 시작점 + 최소 창까지의 최고치(복원 턴 몫)로 추정.
-                self.early_peak.map_or(b.settled, |e| rebase_pct(e, self.early_peak_window, w).min(b.settled))
+        #[allow(clippy::too_many_arguments)]
+        fn decide(&mut self, pct: u8, window: Option<u64>, axis: Axis, base: u8, scope: u64, now: f64, notes: &mut Vec<Note>) -> Verdict {
+            debug_assert!(self.phase == Phase::Free);
+            let bar = self.bar(axis, base, window);
+            if pct < bar {
+                // 보류해 둔 관측과 같은 축·범위가 막대 아래로 내려왔을 때만 보류를 버린다(다른 범위 — 헬퍼·다른 파일 — 의 낮은
+                // 값이 좌석의 보류를 지우지 않는다).
+                if self.held.is_some_and(|h| h.axis == axis && h.scope == scope) {
+                    self.held = None;
+                }
+                return Verdict::Quiet;
+            }
+            let tentative =
+                self.fire.filter(|f| !f.cleared && !f.evaluated).and_then(|f| f.tentative_until).unwrap_or(f64::NEG_INFINITY);
+            let spacing = self.last_fire.map_or(f64::NEG_INFINITY, |f| f + CTX_GUARD_MIN_SPACING_SECS);
+            let until = self.hold_until.max(tentative).max(spacing);
+            if now < until {
+                // 틱의 재판정은 실측 축만(자기보고는 다음 status.set 도착 때 다시 판정한다 — 낡은 자기보고를 되살리지 않는다).
+                if axis == Axis::Measured {
+                    self.held = Some(Held { until, pct, window, axis, base, scope });
+                }
+                return Verdict::Held { bar, until };
+            }
+            // 직전 발화의 결과(아직 정해지지 않았으면): 사이클을 봤으면 효과 있음(연속 효과 없음 0) · 못 봤으면 효과 없음 +1.
+            if let Some(f) = self.fire {
+                if !f.evaluated {
+                    if f.cleared {
+                        self.strikes = 0;
+                    } else {
+                        let n = self.strike(now, Why::NoCycle, None, (f.seq, f.at), axis);
+                        notes.push(n);
+                    }
+                }
+            }
+            self.seq += 1;
+            self.fire = Some(FireRec {
+                seq: self.seq,
+                at: now,
+                axis,
+                cleared: false,
+                evaluated: false,
+                tentative_until: None,
+                scope,
+                obs: (pct, window, base),
             });
-            self.rearm_floor_window = w;
-            self.rearm_thin = b.thin || b.regime == CtxFloorRegime::Backlog;
-        }
-        self.restart_measure(pct, window, now);
-        CtxRearm { floor: b.floor, regime: b.regime }
-    }
-
-    /// Claude 압축 관측 시각에서 바닥을 다시 재기 시작한다([`CTX_FLOOR_REREAD_SECS`] 창 · 뒷문·복원 턴·몰림 규칙 없음).
-    fn restart_measure(&mut self, pct: u8, window: Option<u64>, now: f64) {
-        self.rearmed = true;
-        // 압축 관측 시각에서 바닥을 다시 잰다 — 시작점·교체 시각을 여기로(사이클 quiescing 이 시작점을 밀 때의 상한도 여기서 센다).
-        self.reset_at = Some(now);
-        self.settle_anchor = Some(now);
-        self.settle_peak = Some(pct);
-        if window.is_some() {
-            self.floor_window = window;
-        }
-        self.settle_rise_at = None;
-        self.settle_seen_at = Some(now);
-        self.settle_closed = false;
-        self.restore_rise_at = None;
-        self.restore_quiet_from = None;
-        self.restore_peak = None;
-        self.restore_window = None;
-        self.restore_freeze_at = None;
-        self.restore_grace_until = None;
-        self.session_notice = None;
-        self.session_fed = false;
-        self.restore_tainted = false;
-        self.paste_input_at = None;
-        self.backlog_cutoff = None;
-        self.settle_closed_at = None;
-        self.window_compacted = false;
-        self.held_seen = false;
-        self.early_peak = None;
-        self.early_peak_window = None;
-        // '같은 세션' 낙폭의 기준도 압축 뒤부터 — 다음 압축은 다시 잰 바닥 기준으로 본다.
-        self.session_peak = Some(pct);
-        self.session_peak_window = window.or(self.session_peak_window);
-    }
-
-    /// 이 좌석의 실효 임계 — clear 뒤 세션이면 max(기본, 바닥 + 여유)([`ctx_floor_bar`]) · 아니면 기본.
-    /// ★정착 창 안 뒷문(② 봉인): 창 안에서는 바닥이 관측을 따라 올라 발화가 없다 — clear 직후 몇 분 만에 실제 작업으로
-    /// 차단 상한(200K 80)을 넘는 좌석이 창이 닫힐 때까지(최대 10분) 끌려가지 않도록, 창 안에서도 max(기본, 차단 상한)
-    /// 에서는 발화한다. 뒷문은 **연속 두 세션에 걸쳐 쓰지 않는다**([`Self::backstop_spent`]) — 붙여넣기·복원만으로 차단
-    /// 상한을 넘는 유휴 좌석은 뒷문 1회 뒤 다음 세션에서 바닥이 증명돼 Stopped 로 멈춘다(①).
-    pub fn effective_threshold(&mut self, base: u8, window: Option<u64>, now: f64) -> u8 {
-        let Some(CtxFloorBar { bar, regime, .. }) = self.bar(base, window) else { return base };
-        // ★(RV2NC-E20-1) 몰림을 바닥으로 확정한 세션(Backlog)도 다음 세션의 확인 재료다 — 일하는 좌석의 빠른 발화만 푼다.
-        if regime.tier3() || regime == CtxFloorRegime::Backlog {
-            self.session_tier3 = true;
-        }
-        // 압축 뒤 다시 재는 세션(R1-RUNAWAY-1)의 창에는 뒷문이 없다 — 창 안에서는 바닥이 관측을 따라 올라 발화하지 않는다.
-        if self.settling(now) && !self.backstop_spent && !self.rearmed {
-            bar.min(base.max(ctx_floor_hard_cap(window.or(self.floor_window))))
-        } else {
-            bar
-        }
-    }
-
-    /// 기본 임계는 넘었지만 실효 임계 아래(`pct < 실효`)인 보고 1건의 고지 판정. 이벤트(`context.floor_raised`)는 같은
-    /// 세션 안에서 영역이 올라갈 때마다(좌석의 직전 (영역, 임계)와 다를 때만), 오너 feed 는 **정착 창이 닫힌 뒤** 세션당
-    /// 1번 — 복원 도중의 바닥(예: 72 → 78)으로 오너에게 말하지 않도록 잰 바닥이 정해진 뒤의 영역으로 센다.
-    pub fn hold_notice(&mut self, pct: u8, base: u8, window: Option<u64>, now: f64) -> Option<CtxHoldNotice> {
-        if pct < base {
-            return None;
-        }
-        let CtxFloorBar { bar, regime, floor, settled, tainted, lift, .. } = self.bar(base, window)?;
-        if pct >= bar {
-            return None;
-        }
-        let escalated = self.session_notice.is_none_or(|r| regime > r);
-        if escalated {
-            self.session_notice = Some(regime);
-        }
-        let event = escalated && self.last_announced != Some((regime, bar));
-        if event {
-            self.last_announced = Some((regime, bar));
-        }
-        let pow2 = |n: u32| n.is_power_of_two();
-        let mut count = 0;
-        let mut feed = None;
-        if !self.settling(now) && !std::mem::replace(&mut self.session_fed, true) {
-            (feed, count) = match regime {
-                CtxFloorRegime::Raise => (if std::mem::replace(&mut self.raise_fed, true) { None } else { Some("warn") }, 1),
-                CtxFloorRegime::Limited | CtxFloorRegime::Backlog | CtxFloorRegime::Probe => {
-                    self.limited_count += 1;
-                    (pow2(self.limited_count).then_some("warn"), self.limited_count)
-                }
-                CtxFloorRegime::Stopped => {
-                    self.stopped_count += 1;
-                    (pow2(self.stopped_count).then_some("error"), self.stopped_count)
-                }
-            };
-        }
-        if !event && feed.is_none() {
-            return None;
-        }
-        let w = window.or(self.floor_window);
-        Some(CtxHoldNotice {
-            floor,
-            settled,
-            bar,
-            regime,
-            ceiling: ctx_floor_ceiling(w),
-            hard_cap: ctx_floor_hard_cap(w),
-            event,
-            feed,
-            count,
-            after_compaction: self.rearmed,
-            tainted,
-            lift,
-        })
-    }
-
-    /// 래치가 소진된 교차(`pct >= 실효 임계`) 1건 — 언제나 발화다(보류는 실효 임계가 이미 했다). 발화 시각을 기록한다.
-    /// 정착 창 안의 발화는 뒷문뿐이다(창 안 바닥 ≥ pct 라 막대는 pct 위) — 이 세션을 차단 상한 근처로 세고(다음 세션
-    /// 확인 재료) 뒷문을 쓴 것으로 적는다. 창 밖의 **정상·Limited** 발화(바닥이 차단 상한에서 먼 좌석의 실제 성장)만
-    /// 뒷문을 다시 무장한다 — Probe·Stopped 좌석에 뒷문을 다시 주면 창 안 1~2%p 에 지침을 또 붙여 넣는 값싼 사이클이
-    /// Stopped 사이클과 번갈아 돈다(①).
-    ///
-    /// ★(ROLE-R4-1 · R2NC5-1) 복원 끝 바닥이 확정됐고 여유가 있으면(정상·Limited 높이) 창 안 뒷문 발화는 복원 뒤 작업(사이클이
-    /// 붙잡았던 배달)이 부른 것이라 이 세션을 차단 상한 근처로 세지 않는다. 뒷문을 쓴 것은 그대로 적고, 재무장도 종전처럼
-    /// 정착 창 최고치의 영역으로 판정한다 — 복원 끝 판정이 틀려도 뒷문이 연속 세션에 걸쳐 돌지 않는다(①).
-    pub fn on_crossing(&mut self, base: u8, window: Option<u64>, now: f64) -> CtxFire {
-        let info = self.bar(base, window);
-        // 압축 뒤 다시 잰 세션(R1-RUNAWAY-1)에는 뒷문이 없다 — 그 바닥은 clear 사이클 자신의 입력(붙여넣기·복원)이 아니다.
-        let settle_backstop = self.settling(now) && !self.rearmed;
-        if settle_backstop {
-            if !self.restore_roomy(window) {
-                self.session_tier3 = true;
+            self.last_fire = Some(now);
+            self.held = None;
+            self.phase = Phase::Awaiting { at: now, deadline: now + CTX_GUARD_CLEAR_WAIT_SECS };
+            let lvl = self.level[axis as usize];
+            Verdict::Fire {
+                pct,
+                bar,
+                level: lvl.map(|(l, _)| rebase(l, window)),
+                strikes: self.strikes,
+                seq: self.seq,
+                after_compaction: lvl.is_some_and(|(_, k)| k == Kind::AfterCompaction),
+                axis,
+                base,
+                window,
             }
-            self.backstop_spent = true;
-        } else if !self.rearmed
-            && (self.settled_regime(window).is_some_and(|r| matches!(r, CtxFloorRegime::Raise | CtxFloorRegime::Limited))
-                || (self.restore_roomy(window)
-                    && info.is_some_and(|b| b.settled < base.max(ctx_floor_hard_cap(window.or(self.floor_window))))))
-        {
-            // ★(R2NC6-1) 복원 끝에 여유가 있고 막대가 차단 상한 이하(정착 창 최고치 + 1 ≤ 차단 상한 — 몰림이 여유를 넘지 않았다)인
-            //   세션의 창 밖 발화도 다시 무장한다: 정착 창 최고치가 76~79 라 영역이 Probe 로 보여도 복원 끝은 차단기 재료가 아니다
-            //   (d9638152 는 그런 좌석의 뒷문을 첫 세션 뒤 영영 다시 주지 않았다). 최고치가 차단 상한 이상(몰림 ≥ 여유 · 막대 =
-            //   최고치 + 1)이면 다시 주지 않는다 — 몰림만으로 뒷문이 도는 세션과 성장 1%p 발화가 번갈아 도는 고리 없음(①).
-            self.backstop_spent = false;
-        }
-        // ★(RV2NC-E20-1 · ①·② 빈도 상한) 얇은 세션(또는 얇은 세션에서 압축으로 재무장한 세션)의 창 밖 발화는 성장 속도로 가른다 —
-        //   일하는 좌석(분당 0.2%p 이상 · 반올림 뺀 하한)이면 확인 재료에서 빼고(다음 세션도 차단 상한 근처에서 clear · ②), 느리면
-        //   (주기 신호·유휴) 이 세션을 확인 재료로 적는다(다음 세션은 몰림 위 최소 여유 성장마다 · ①).
-        let thin = info.is_some_and(|b| b.thin || b.regime == CtxFloorRegime::Backlog) || (self.rearmed && self.rearm_thin);
-        if thin && !settle_backstop && self.post_clear() {
-            if self.thin_growth_fast(window, now) {
-                self.session_fast = true;
-            } else {
-                self.session_tier3 = true;
-                self.session_fast = false;
-            }
-        }
-        let after_compaction = self.post_clear() && self.rearmed;
-        self.fired_at = Some(now);
-        CtxFire {
-            floor: info.map(|b| b.floor),
-            regime: info.map(|b| b.regime),
-            settle_backstop,
-            settled: info.map(|b| b.settled),
-            after_compaction,
         }
     }
 }
 
-/// 좌석 출력의 조용함 관측(데몬 단조 초) — [`CtxLoopGuard::note_idle`] 재료. `quiet_since` = 마지막 출력 시각(그때부터
-/// 지금까지 조용하다) · `last_gap` = 마지막으로 **끝난** 조용한 틈(길이 [`CTX_FLOOR_IDLE_QUIET_SECS`] 이상 — PTY reader 기록) ·
-/// `last_input` = 좌석에 마지막으로 입력이 쓰인 시각([`CtxLoopGuard::note_input`] 재료) · `last_queue_delivery` = 마지막
-/// 대기열 배달 인계 시각(`Surface::last_queue_delivery_at`) · `inject_done` = writer 의 마지막 Inject 끝(CR 기록 ·
-/// `InjectTrack::done_at`) — 둘 다 [`CtxLoopGuard::note_delivery`] 재료 · `queue_oldest` = 좌석 대기열(`Surface::pending_queue`)에
-/// 남은 가장 오래된 항목의 enqueue 시각(없으면 빈 대기열 — [`CtxLoopGuard::note_queue`] 재료).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CtxIdleObs {
-    pub quiet_since: f64,
-    pub last_gap: Option<(f64, f64)>,
-    pub last_input: Option<f64>,
-    pub last_queue_delivery: Option<f64>,
-    pub inject_done: Option<f64>,
-    pub queue_oldest: Option<f64>,
+/// 낙폭 판정 범위 = 관측의 세션 파일 **줄기**(세션 id) — 심링크·`/private` 표기 차이는 같은 범위다. 빈 경로는 "" 범위(자기보고와
+/// 이름이 같아도 축이 달라 섞이지 않는다). 범위는 수준·막대·발화에 쓰이지 않는다(세션 키는 가드 입력이 아니다).
+pub(crate) fn ctx_guard_scope(session_file: &str) -> String {
+    let t = session_file.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    std::path::Path::new(t).file_stem().map_or_else(|| t.to_string(), |s| s.to_string_lossy().into_owned())
 }
 
-impl CtxIdleObs {
-    /// 조용함 신호 없음(출력이 끊이지 않는 좌석과 같다) — 정착 창은 종전 시간 창대로.
-    #[cfg(test)]
-    pub const NONE: CtxIdleObs = CtxIdleObs {
-        quiet_since: f64::INFINITY,
-        last_gap: None,
-        last_input: None,
-        last_queue_delivery: None,
-        inject_done: None,
-        queue_oldest: None,
+/// 데몬 단조 초(`started_instant` 기준) — 가드의 시각.
+pub(crate) fn ctx_guard_now(daemon: &Daemon) -> f64 {
+    daemon.started_instant.elapsed().as_secs_f64()
+}
+
+/// ★(clear 가드 v3) 수집기 틱 — 시한 처리와 보류해 둔 실측 관측의 재판정 하나뿐이다. **가드 밖 값을 읽지 않는다**
+/// (observed_usage·agent_status·오버라이드 파일 무접촉 · 입력은 단조 시각과 배달 동결뿐). 발행은 가드 락을 놓은 뒤.
+pub(crate) fn ctx_guard_tick(daemon: &Daemon, s: &Surface) {
+    ctx_guard_tick_at(daemon, s, ctx_guard_now(daemon));
+}
+
+/// [`ctx_guard_tick`] 의 본체 — 단조 시각을 받는다(검체가 시한·보류를 실제로 기다리지 않게 · 운영 경로는 언제나 위의 현재 값).
+pub(crate) fn ctx_guard_tick_at(daemon: &Daemon, s: &Surface, now: f64) {
+    let frozen = daemon.paused.load(Ordering::Relaxed);
+    let out = s.ctx_loop_guard.lock().unwrap_or_else(|e| e.into_inner()).tick(now, frozen);
+    if out.verdict.is_some() || !out.notes.is_empty() {
+        crate::handlers::publish_ctx_guard(daemon, s, out, "held-retry", None);
+    }
+}
+
+/// ★(clear 가드 v3) 좌석 상태 JSON(`org.status` = `cys status --json` 행)의 `ctx_guard` — autopilot 게이트 3(미해결 발화)의
+/// 입력. `phase`(free|awaiting|cycling|measuring) · `fire_id`(마지막 발화) · `awaiting_since`(epoch · Awaiting 일 때) ·
+/// `level_pct`(실측 축 잰 수준) · `self_report_level_pct` · `strikes` · `resolved_through`. 막대는 싣지 않는다 — 기본 임계가 역할
+/// 오버라이드 파일이라 상태 조회마다 좌석 수만큼 파일을 열게 된다(막대는 `context.threshold`·`context.level_measured` 에 있다).
+pub(crate) fn ctx_guard_wire(daemon: &Daemon, s: &Surface) -> Value {
+    use clear_guard::Phase;
+    let g = s.ctx_loop_guard.lock().unwrap_or_else(|e| e.into_inner());
+    let awaiting_since = match g.phase {
+        Phase::Awaiting { at, .. } => Some(daemon.started_at + at),
+        _ => None,
     };
-
-    /// 좌석의 지금 관측 — 락은 하나씩 잡고 놓는다(출력 시각 → 틈 → 입력 시각 셋 → 대기열 · 전부 말단).
-    pub fn of(daemon: &Daemon, s: &Surface) -> Self {
-        let mono = |t: std::time::Instant| t.saturating_duration_since(daemon.started_instant).as_secs_f64();
-        let quiet_since = mono(*s.last_output.lock().unwrap_or_else(|e| e.into_inner()));
-        let last_gap = s.last_output_gap.lock().unwrap_or_else(|e| e.into_inner()).map(|(a, b)| (mono(a), mono(b)));
-        let last_queue_delivery = s.last_queue_delivery_at.lock().unwrap_or_else(|e| e.into_inner()).map(mono);
-        let inject_done = s.inject_track.done_at().map(mono);
-        // enqueue 시각은 벽시계(epoch 초)다 — 지금의 단조 초에서 경과만큼 뺀다(시계 조정은 몇 초 · 몰림 판정에 무해).
-        let oldest_epoch = s
-            .pending_queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .map(|e| e.enqueued_at)
-            .filter(|t| t.is_finite())
-            .reduce(f64::min);
-        let (now_mono, now_epoch) = (daemon.started_instant.elapsed().as_secs_f64(), crate::state::now_epoch());
-        let queue_oldest = oldest_epoch.map(|t| now_mono - (now_epoch - t).max(0.0));
-        CtxIdleObs { quiet_since, last_gap, last_input: last_input_of(s).map(mono), last_queue_delivery, inject_done, queue_oldest }
-    }
-}
-
-/// ★(ROLE-R4-1 · R2NC5-1) 좌석에 마지막으로 **입력이 쓰인** 시각 — 세 기록의 최댓값(결측은 값이 아니다 — 셋 다 없으면 None):
-/// writer 의 데몬 Inject 끝(`InjectTrack::done_at` — 대기열·채널·스케줄·CEO 배달·사이클 재주입 전부가 이 arm 을 지난다) ·
-/// 직접 기계 send(`last_injected` — `cys send` 본문) · 사람 입력(`last_human_input`). 직접 `send-key` 단독(미리 친 본문의
-/// Return)은 기록이 없다 — 그 제출은 입력으로 보이지 않아 복원 끝 바닥이 확정되지 않는다(정착 창 최고치 = 종전 거동 쪽).
-fn last_input_of(s: &Surface) -> Option<std::time::Instant> {
-    let inject = s.inject_track.done_at();
-    let machine = *s.last_injected.lock().unwrap_or_else(|e| e.into_inner());
-    let human = *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner());
-    [inject, machine, human].into_iter().flatten().max()
-}
-
-/// ★(RV2NC-E20-2) 좌석이 clear 사이클의 복원 턴 도중인가([`CtxLoopGuard::restore_turn_open`]) — 채널 inbox·스케줄 직접 push 의
-/// 보류 판정. 가드 락은 말단이다(호출부는 다른 락을 쥐지 않은 채 부른다).
-pub(crate) fn restore_turn_open(daemon: &Daemon, s: &Surface) -> bool {
-    let now = daemon.started_instant.elapsed().as_secs_f64();
-    s.ctx_loop_guard.lock().unwrap_or_else(|e| e.into_inner()).restore_turn_open(now)
-}
-
-/// ★(clear 직후 바닥 가드) 수집기 틱 — 보고가 없는 동안(유휴 좌석 · 대기열 틈)에도 사이클 진행(quiescing)으로 정착 창
-/// 시작점을 밀고, 좌석이 조용해지면(복원 턴 끝) 정착 창을 닫는다. 락은 하나씩(상태 → 출력 시각·틈 → 가드 · 가드는 말단).
-fn ctx_guard_tick(daemon: &Daemon, s: &Surface) {
-    let now = daemon.started_instant.elapsed().as_secs_f64();
-    let quiescing = s
-        .agent_status
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(|st| st.state == "quiescing");
-    ctx_guard_tick_at(s, now, quiescing, CtxIdleObs::of(daemon, s));
-}
-
-/// [`ctx_guard_tick`] 의 본체(시각·관측을 받는다 — 검체가 가짜 시각으로 수집기 틱을 흉내 낸다).
-pub(crate) fn ctx_guard_tick_at(s: &Surface, now: f64, quiescing: bool, idle: CtxIdleObs) {
-    let mut g = s.ctx_loop_guard.lock().unwrap_or_else(|e| e.into_inner());
-    if quiescing {
-        g.note_quiescing(now);
-    }
-    g.note_input(idle.last_input, now);
-    g.note_delivery(idle.last_queue_delivery, idle.inject_done, now);
-    g.note_queue(idle.queue_oldest);
-    if let Some((from, to)) = idle.last_gap {
-        g.note_idle(from, to, now);
-    }
-    g.note_idle(idle.quiet_since, now, now);
-}
-
-/// 두 관측의 세션 파일이 **다른 세션**인가 — 둘 다 비어 있지 않고 파일 줄기(세션 id)가 다를 때만 참.
-/// 경로 표기 차이(심링크·/private 접두)는 줄기가 같아 교체로 세지 않는다. 결측은 교체가 아니다(가드 비발동 = 종전 거동).
-pub(crate) fn session_file_changed(prev: &str, next: &str) -> bool {
-    if prev.trim().is_empty() || next.trim().is_empty() {
-        return false;
-    }
-    let stem = |p: &str| std::path::Path::new(p).file_stem().map(|s| s.to_os_string());
-    match (stem(prev), stem(next)) {
-        (Some(a), Some(b)) => a != b,
-        _ => false,
-    }
+    json!({
+        "phase": g.phase.as_str(),
+        "fire_id": g.fire.map(|f| crate::handlers::ctx_guard_fire_id(daemon, s.id, f.seq)),
+        "awaiting_since": awaiting_since,
+        "level_pct": g.level[0].map(|((p, _), _)| p),
+        "self_report_level_pct": g.level[1].map(|((p, _), _)| p),
+        "strikes": g.strikes,
+        "resolved_through": g.resolved_through,
+    })
 }
 
 /// surface별 tail 진행 상태 (수집기 태스크 로컬 — 데몬 상태 오염 없음)
@@ -1474,7 +934,7 @@ fn collect_tick(
         }
     }
     collect_external(daemon, ext, &surfaces, tails);
-    // 관측(위) 뒤에 — 같은 틱에 읽힌 복원 턴의 마지막 관측이 조용함으로 창이 닫히기 전에 실린다.
+    // ★(clear 가드 v3) 관측(위) 뒤에 — 시한(Awaiting·Cycling·Measuring)과 보류해 둔 실측 관측의 재판정(보고가 끊긴 좌석도 발화 · I2).
     for s in surfaces.iter().filter(|s| !s.exited.load(Ordering::Relaxed)) {
         ctx_guard_tick(daemon, s);
     }
@@ -1553,19 +1013,9 @@ fn collect_for(
     // tail 상태 초기화/전환: 경로가 바뀌었으면 영속 오프셋(없으면 파일 끝 창)에서 새로 시작
     let need_reset = tails.get(&s.id).map(|t| t.path != path).unwrap_or(true);
     if need_reset {
-        let old_path = tails.get(&s.id).map(|t| t.path.to_string_lossy().into_owned());
+        // ★(clear 가드 v3) 새 세션 파일은 가드 입력이 아니다(clear 의 증거는 사이클 표지뿐 — 헬퍼·휴리스틱 재발견이 경로를
+        //   바꿔도 수준·막대·발화에 닿지 않는다). 경로는 낙폭 판정 범위 이름으로만 게이트에 실린다(`ctx_guard_scope`).
         tails.insert(s.id, TailState::attach(daemon, path.clone(), heuristic, now));
-        // 새 세션 파일 = 새 세션 — 에지 게이트 재무장. 직전 세션이 임계 위에서 끝났어도
-        // 새 세션이 곧장 임계 이상으로 시작하면(거대 지침 재주입) 발화해야 한다.
-        s.ctx_threshold_armed.store(true, Ordering::Relaxed);
-        // ★(RV-R2NC-1) 같은 교체를 clear 직후 바닥 가드에도 알린다 — 그 세션이 **바닥만으로** 임계를 넘으면
-        //   재발화 대신 임계를 올린다(`CtxLoopGuard`). 첫 부착(이전 tail 없음)은 교체 증거가 아니다(가드 비발동).
-        if old_path.is_some_and(|o| session_file_changed(&o, &path.to_string_lossy())) {
-            s.ctx_loop_guard
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .note_session_change(daemon.started_instant.elapsed().as_secs_f64());
-        }
     } else if let Some(t) = tails.get_mut(&s.id) {
         t.heuristic = heuristic;
         if heuristic {
@@ -1781,8 +1231,8 @@ fn collect_for(
             }),
         );
     }
-    // 결정론 컨텍스트 임계 — 자기보고(status.set)와 **공유 에지 게이트**(ctx_threshold_armed)
-    // 로 발화한다. 분리된 에지 상태를 쓰면 같은 교차에 두 경로가 각각 발화해 master/CSO가
+    // 결정론 컨텍스트 임계 — 자기보고(status.set)·statusline 과 **공유 게이트**(좌석의 clear 가드 하나 · 가드 락 하나)
+    // 로 발화한다. 분리된 판정을 쓰면 같은 교차에 두 경로가 각각 발화해 master/CSO가
     // cycle-agent를 이중 집행한다. payload source:"observed"로 자기보고 발화와 구분.
     if let Some(p) = new.ctx_pct {
         crate::handlers::maybe_fire_context_threshold(daemon, s, p, "observed", Some(&new.agent));
@@ -4224,2378 +3674,1042 @@ mod r3_1_verdict_tests {
     }
 }
 
-/// ★(0.14.42 · RV-R2NC-1 → RR3-R1-1 · G3ROLE-1) clear 직후 바닥 가드의 순수 판정 핀 — 시각은 단조 초를 직접 준다.
-/// 통합 핀은 `handlers::tests::context_threshold_*floor*` · `context_threshold_floor_guard_*`.
+/// ★(0.14.42 · clear 가드 v3) 순수 상태기계 핀 — 시각은 단조 초를 직접 준다.
+///   ① 단위 검체 24종: 참조 구현 검체(evidence/v3/model/tests/cg3_unit.rs)를 이름·단언 그대로 옮겼다.
+///   ② 이전 반례 이름 검체: 반례의 좌석 모양을 작은 좌석 구동기([`drive`] — 1초 틱 · 대기열·턴·Claude 선제 압축·집행자 지연)의
+///      사건열(report · cycle · tick)로 옮겼다. 좌석 모형 전수 스윕(evidence/v3 · 재검증자 모형 sweep_idle·busy·chan · run_seat)은
+///      운영 코드를 그대로 발췌해 따로 돌린다(clear-guard 보고서).
+///   ③ 성질 검체: 무작위 사건열 1만 씨앗(결정론) — I1·I2·I3(차분 오라클). 참조 구현 prop.rs 이식.
+/// 통합 핀(게이트·표지·틱·claim·payload·배선)은 `handlers::tests::context_threshold_*` · `ctx_guard_*`.
 #[cfg(test)]
-mod ctx_loop_guard_tests {
+mod ctx_guard_tests {
+    use super::clear_guard::{self as cg, block_cap, stop_cap, Axis, ClearGuard, Kind, Note, Phase, Rep, Verdict, Why};
     use super::*;
 
-    const W200K: Option<u64> = Some(200_000);
-    const W1M: Option<u64> = Some(1_000_000);
-    const WINDOWS: [Option<u64>; 3] = [W200K, W1M, None];
-    /// 부트·첫 교차처럼 clear 뒤 세션이 아닌 발화.
-    const FIRE: Option<CtxFire> =
-        Some(CtxFire { floor: None, regime: None, settle_backstop: false, settled: None, after_compaction: false });
+    const W: Option<u64> = Some(200_000);
 
-    /// 게이트(`handlers::maybe_fire_context_threshold_at`)와 같은 순서: 관측 → 실효 임계 → (미만: 재무장 + 보류 고지 ·
-    /// 이상: 래치 소진 → 발화).
-    fn report(g: &mut CtxLoopGuard, armed: &mut bool, pct: u8, base: u8, window: Option<u64>, now: f64) -> Option<CtxFire> {
-        g.observe(pct, window, now);
-        let eff = g.effective_threshold(base, window, now);
-        if pct < eff {
-            *armed = true;
-            let _ = g.hold_notice(pct, base, window, now);
-            return None;
+    fn rep(g: &mut ClearGuard, pct: u8, scope: &str, now: f64) -> cg::Out {
+        g.report(&Rep { pct, window: W, axis: Axis::Measured, scope, base: 60, now, frozen: false })
+    }
+    fn srep(g: &mut ClearGuard, pct: u8, now: f64) -> cg::Out {
+        g.report(&Rep { pct, window: W, axis: Axis::SelfReport, scope: "", base: 60, now, frozen: false })
+    }
+    fn fired(o: &cg::Out) -> bool {
+        matches!(o.verdict, Some(Verdict::Fire { .. }))
+    }
+    fn strikes(o: &cg::Out) -> Vec<Why> {
+        o.notes.iter().filter_map(|n| if let Note::Ineffective { why, .. } = n { Some(*why) } else { None }).collect()
+    }
+    /// 부트 발화 → 사이클(켬 +60 · 끔 +120) → 창 동안 `floor` 보고 → 창 닫힘 + 접기 관측. 반환: 창이 닫힌 뒤 시각.
+    fn boot_and_cycle(g: &mut ClearGuard, floor: u8, scope: &str) -> f64 {
+        assert!(fired(&rep(g, floor.max(61), "s0", 0.0)), "부트 첫 교차는 기본 임계에서 발화");
+        g.cycle(true, 60.0, false);
+        g.cycle(false, 120.0, false);
+        let mut t = 130.0;
+        while t < 720.0 {
+            rep(g, floor, scope, t);
+            t += 30.0;
         }
-        if !std::mem::replace(armed, false) {
-            return None;
+        let _ = g.tick(730.0, false);
+        assert_eq!(g.phase, Phase::Free);
+        let o = rep(g, floor, scope, 740.0); // 접기(창 최고치 범위의 첫 관측)
+        assert!(!fired(&o));
+        750.0
+    }
+
+    // ───────────── ① 단위 검체 24종(참조 구현 cg3_unit.rs 이식 · 이름·단언 그대로) ─────────────
+
+    #[test]
+    fn rr3_r1_1_idle_floor_does_not_refire_without_growth() {
+        let mut g = ClearGuard::default();
+        let mut t = boot_and_cycle(&mut g, 72, "s1");
+        // 주기 신호(2분 0.15%p) 40분 — 표시값 72→73 · 막대 77
+        let mut x = 72.0f64;
+        while t < 750.0 + 2400.0 {
+            x += 0.15 / 120.0 * 30.0;
+            assert!(!fired(&rep(&mut g, x.round() as u8, "s1", t)));
+            let _ = g.tick(t, false);
+            t += 30.0;
         }
-        Some(g.on_crossing(base, window, now))
+        assert_eq!(g.bar(Axis::Measured, 60, W), 77);
     }
 
-    fn post(floor: u8, regime: CtxFloorRegime) -> Option<CtxFire> {
-        Some(CtxFire { floor: Some(floor), regime: Some(regime), settle_backstop: false, settled: Some(floor), after_compaction: false })
+    #[test]
+    fn marker_is_the_only_clear_signal_session_file_change_does_nothing() {
+        let mut g = ClearGuard::default();
+        let t = boot_and_cycle(&mut g, 72, "s1");
+        let lvl = g.level;
+        // 세션 파일이 A→B→A 로 바뀌어도(헬퍼·휴리스틱 재발견) 수준·막대·상태는 그대로다.
+        for (k, s) in ["s2", "s1", "s3", "s1"].iter().enumerate() {
+            let o = rep(&mut g, 74, s, t + 10.0 * k as f64);
+            assert!(!fired(&o));
+            assert_eq!(g.phase, Phase::Free);
+        }
+        assert_eq!(g.level, lvl);
     }
 
-    /// 복원 끝 바닥(`floor`)이 차단기를 푼 발화 — 정착 창 최고치 `settled` 는 복원 뒤 작업을 담았다.
-    fn post_split(floor: u8, settled: u8, regime: CtxFloorRegime) -> Option<CtxFire> {
-        Some(CtxFire { floor: Some(floor), regime: Some(regime), settle_backstop: false, settled: Some(settled), after_compaction: false })
+    #[test]
+    fn helper_scope_low_reports_are_not_compactions() {
+        let mut g = ClearGuard::default();
+        let t = boot_and_cycle(&mut g, 72, "s1");
+        rep(&mut g, 75, "s1", t);
+        let o = rep(&mut g, 10, "h1", t + 10.0); // 헬퍼 transcript
+        assert!(strikes(&o).is_empty());
+        assert_eq!(g.phase, Phase::Free, "다른 범위의 낮은 값은 압축이 아니다");
     }
 
-    fn backstop(floor: u8, regime: CtxFloorRegime) -> Option<CtxFire> {
-        Some(CtxFire { floor: Some(floor), regime: Some(regime), settle_backstop: true, settled: Some(floor), after_compaction: false })
+    #[test]
+    fn tick_never_reads_self_report_stale_value() {
+        // F1: 자기보고는 도착 때만 판정 — 틱은 가드 밖 값을 읽지 않는다(보류해 둔 실측 관측만 다시 판정).
+        let mut g = ClearGuard::default();
+        rep(&mut g, 20, "r0", 0.0);
+        for k in 1..2000 {
+            let o = g.tick(k as f64 * 2.0, false);
+            assert!(!fired(&o));
+        }
     }
 
-    /// clear(새 세션) — 수집기처럼 래치도 재무장한다(고리에 가장 불리한 쪽).
-    fn clear(g: &mut CtxLoopGuard, armed: &mut bool, now: f64) {
-        g.note_session_change(now);
-        *armed = true;
+    #[test]
+    fn self_report_axis_is_measured_after_cycle_by_its_own_first_report() {
+        // F1b/F3: 실측 축 수준(20)이 자기보고 축 막대를 낮추지 않는다 · 사이클 뒤 첫 자기보고가 그 축 수준.
+        let mut g = ClearGuard::default();
+        assert!(fired(&srep(&mut g, 65, 0.0))); // 자기보고 축 부트
+        g.cycle(true, 60.0, false);
+        g.cycle(false, 120.0, false);
+        rep(&mut g, 20, "r1", 200.0); // 실측(창 안)
+        let _ = g.tick(800.0, false);
+        assert!(!fired(&srep(&mut g, 65, 2000.0)), "창 뒤 첫 자기보고는 수준(접기) — 발화하지 않는다");
+        assert!(!fired(&srep(&mut g, 65, 3800.0)), "같은 값 되풀이 = 성장 없음");
+        assert_eq!(g.bar(Axis::SelfReport, 60, W), 70);
+        assert!(fired(&srep(&mut g, 70, 5600.0)));
     }
 
-    /// 상태줄 `used_percentage` 는 반올림이다 — p% 로 보이는 최대 토큰(직전)은 (p+0.5)% 다. 사이클 여유는 거기서 잰다.
-    fn max_tokens_shown_as(pct: u8, window: u64) -> u64 {
-        (2 * pct as u64 + 1) * window / 200
+    #[test]
+    fn self_report_seat_clear_is_seen_by_marker_without_drop() {
+        // F3: 자기보고 좌석은 복원 뒤에만 보고해도(낙폭 없음) 사이클 표지로 clear 를 안다 — 시한 strike 없음.
+        let mut g = ClearGuard::default();
+        assert!(fired(&srep(&mut g, 70, 0.0)));
+        g.cycle(true, 300.0, false);
+        g.cycle(false, 360.0, false);
+        let _ = g.tick(1000.0, false);
+        let o = srep(&mut g, 70, 1500.0);
+        assert!(!fired(&o) && strikes(&o).is_empty());
+        assert!(g.fire.unwrap().cleared);
     }
 
-    // ───────────── 좌석 모형(CSO 가 발화마다 사이클을 돈다) ─────────────
+    #[test]
+    fn timeout_is_tentative_and_late_marker_resets_strikes() {
+        let mut g = ClearGuard::default();
+        assert!(fired(&rep(&mut g, 78, "s0", 0.0)));
+        let o = g.tick(1200.0, false); // 시한 — 잠정
+        assert!(o.notes.iter().any(|n| matches!(n, Note::Unanswered { .. })));
+        assert!(strikes(&o).is_empty() && g.strikes == 0);
+        // 늦은 사이클(시한 뒤 · 다음 발화 전)
+        g.cycle(true, 1500.0, false);
+        g.cycle(false, 1560.0, false);
+        assert!(g.fire.unwrap().cleared);
+        let _ = g.tick(2200.0, false);
+        rep(&mut g, 72, "s1", 2210.0);
+        let o = rep(&mut g, 78, "s1", 4000.0);
+        assert!(fired(&o) && strikes(&o).is_empty() && g.strikes == 0);
+    }
 
-    /// 대기열 배달 전 좌석 조용함(초) — `CYS_QUEUE_QUIET_SECS` 기본. 사이클이 붙잡았던 배달은 복원 턴이 끝나고 이만큼 뒤에 온다.
-    const QUEUE_QUIET: f64 = 3.0;
+    #[test]
+    fn no_cycle_strike_only_at_next_fire() {
+        let mut g = ClearGuard::default();
+        assert!(fired(&rep(&mut g, 78, "s0", 0.0)));
+        let o = g.tick(1200.0, false);
+        assert!(strikes(&o).is_empty());
+        // 잠정 보류 = 1200 + 900 · 그 전 재판정은 보류
+        assert!(matches!(rep(&mut g, 78, "s0", 1500.0).verdict, Some(Verdict::Held { until, .. }) if (until - 2100.0).abs() < 1e-6));
+        let o = g.tick(2100.0, false); // 보류 만료 — 보류해 둔 실측 관측으로 재발화
+        assert!(fired(&o));
+        assert_eq!(strikes(&o), vec![Why::NoCycle]);
+    }
 
-    /// 좌석 한 대의 시나리오. 시각은 초 · 컨텍스트는 %(보고 때 반올림).
-    #[derive(Clone, Copy, Debug)]
+    #[test]
+    fn frozen_delivery_freezes_awaiting() {
+        let mut g = ClearGuard::default();
+        assert!(fired(&rep(&mut g, 78, "s0", 0.0)));
+        let mut t = 0.0;
+        while t < 7200.0 {
+            let o = g.tick(t, true);
+            assert!(o.notes.is_empty());
+            t += 2.0;
+        }
+        assert!(matches!(g.phase, Phase::Awaiting { .. }), "동결 중에는 시한이 흐르지 않는다");
+        g.cycle(true, 7300.0, false);
+        g.cycle(false, 7400.0, false);
+        assert_eq!(g.strikes, 0);
+        assert!(g.fire.unwrap().cleared);
+    }
+
+    #[test]
+    fn drop_in_awaiting_resolves_without_strike() {
+        let mut g = ClearGuard::default();
+        rep(&mut g, 72, "s0", 0.0); // 부트 발화
+        g.cycle(true, 10.0, false);
+        g.cycle(false, 20.0, false);
+        rep(&mut g, 72, "s1", 30.0);
+        rep(&mut g, 72, "s1", 40.0);
+        let _ = g.tick(700.0, false);
+        rep(&mut g, 72, "s1", 710.0);
+        assert!(fired(&rep(&mut g, 78, "s1", 1300.0)));
+        let seq = g.seq;
+        let o = rep(&mut g, 34, "s1", 1500.0); // 사이클 전에 압축
+        assert!(strikes(&o).is_empty());
+        assert!(o.notes.iter().any(|n| matches!(n, Note::DropBeforeCycle { .. })));
+        assert!(!g.stale(seq), "압축은 건너뛸 사유가 아니다 — 늦은 사이클은 수준을 다시 잰다");
+        let o = g.tick(5000.0, false);
+        assert!(strikes(&o).is_empty(), "시한 strike 도 없다(발화 1건당 결과 1회)");
+        // 늦게 온 사이클: 결과는 이미 정해졌다(strike 없음) · 수준은 다시 잰다.
+        g.cycle(true, 5100.0, false);
+        g.cycle(false, 5160.0, false);
+        assert!(g.stale(seq));
+        assert!(matches!(g.phase, Phase::Measuring { kind: Kind::AfterCycle, .. }));
+        assert_eq!(g.strikes, 0);
+    }
+
+    #[test]
+    fn drop_after_cycle_is_one_strike_per_fire() {
+        let mut g = ClearGuard::default();
+        let t = boot_and_cycle(&mut g, 80, "s1");
+        let o = rep(&mut g, 36, "s1", t + 30.0); // clear 뒤 다음 발화 전 압축
+        assert_eq!(strikes(&o), vec![Why::DropAfterCycle]);
+        assert!((g.hold_until - (t + 30.0 + 900.0)).abs() < 1e-6);
+        let o = rep(&mut g, 20, "s1", t + 60.0);
+        assert!(strikes(&o).is_empty(), "같은 발화에 두 번째 strike 없음");
+    }
+
+    #[test]
+    fn lone_stop_cap_report_is_not_level() {
+        // F4: 사이클 뒤 창의 첫 보고가 S 이상(낡은 값 88) → 수준도 낙폭 기준도 아니다.
+        let mut g = ClearGuard::default();
+        rep(&mut g, 86, "s0", 0.0);
+        g.cycle(true, 60.0, false);
+        g.cycle(false, 120.0, false);
+        rep(&mut g, 88, "s1", 130.0);
+        let mut t = 140.0;
+        while t < 720.0 {
+            rep(&mut g, 72, "s1", t);
+            t += 20.0;
+        }
+        let _ = g.tick(730.0, false);
+        rep(&mut g, 72, "s1", 735.0);
+        assert_eq!(g.level[0].map(|l| l.0 .0), Some(72));
+        assert_eq!(g.bar(Axis::Measured, 60, W), 77);
+    }
+
+    #[test]
+    fn bar_never_exceeds_block_cap() {
+        // 막대 = max(기본, min(R+5, max(S, R+1), C)) — R 이 아무리 높아도 C(차단점 아래 표시값) 이하.
+        for (w, c, want) in [(Some(200_000u64), 88u8, 88u8), (Some(1_000_000), 97, 96), (None, 88, 88)] {
+            assert_eq!(block_cap(w), c);
+            let mut g = ClearGuard::default();
+            g.level[0] = Some(((95, w), Kind::AfterCycle));
+            assert_eq!(g.bar(Axis::Measured, 60, w), want);
+            for r in 0..=100u8 {
+                g.level[0] = Some(((r, w), Kind::AfterCycle));
+                assert!(g.bar(Axis::Measured, 60, w) <= c.max(60));
+            }
+        }
+        assert_eq!((stop_cap(Some(200_000)), stop_cap(Some(1_000_000)), stop_cap(None)), (85, 96, 85));
+    }
+
+    #[test]
+    fn stale_first_report_is_not_a_compaction_baseline() {
+        let mut g = ClearGuard::default();
+        let t = boot_and_cycle(&mut g, 72, "s1");
+        // 새 범위의 첫 보고가 낡은 높은 값 → 다음 보고가 12%p 낮아도 압축이 아니다(확인 전 첫 관측).
+        rep(&mut g, 76, "s9", t);
+        let o = rep(&mut g, 64, "s9", t + 10.0);
+        assert!(strikes(&o).is_empty());
+        assert_eq!(g.phase, Phase::Free);
+    }
+
+    #[test]
+    fn fold_absorbs_unobserved_tail_growth_into_level() {
+        let mut g = ClearGuard::default();
+        rep(&mut g, 72, "s0", 0.0);
+        g.cycle(true, 60.0, false);
+        g.cycle(false, 120.0, false);
+        rep(&mut g, 72, "s1", 130.0);
+        rep(&mut g, 72, "s1", 140.0);
+        rep(&mut g, 10, "h1", 600.0); // 도구 호출(헬퍼) — 좌석 상태줄 공백
+        let _ = g.tick(730.0, false);
+        rep(&mut g, 10, "h1", 740.0); // 다른 범위 — 접지 않는다
+        rep(&mut g, 75, "s1", 800.0); // 좌석 첫 관측 — 접는다(R = 75)
+        assert_eq!(g.level[0].map(|l| l.0 .0), Some(75));
+        assert!(!fired(&rep(&mut g, 79, "s1", 900.0)));
+        assert!(fired(&rep(&mut g, 80, "s1", 1300.0)));
+    }
+
+    #[test]
+    fn held_retry_fires_after_backoff_without_new_reports() {
+        let mut g = ClearGuard::default();
+        let t = boot_and_cycle(&mut g, 80, "s1");
+        rep(&mut g, 66, "s1", t + 30.0); // 압축(14%p 낙폭) strike → 보류 900
+        let _ = g.tick(t + 200.0, false);
+        rep(&mut g, 66, "s1", t + 210.0); // 접기 → R 66 · 막대 71
+        let o = rep(&mut g, 71, "s1", t + 300.0);
+        let until = match o.verdict {
+            Some(Verdict::Held { until, .. }) => until,
+            v => panic!("보류여야 한다: {v:?}"),
+        };
+        rep(&mut g, 10, "h1", t + 400.0); // 다른 범위의 낮은 보고는 보류를 지우지 않는다
+        assert!(!fired(&g.tick(until - 1.0, false)));
+        assert!(fired(&g.tick(until, false)), "보고가 끊긴 좌석도 보류 만료에 발화(I2)");
+    }
+
+    #[test]
+    fn min_spacing_600() {
+        let mut g = ClearGuard::default();
+        assert!(fired(&rep(&mut g, 78, "s0", 0.0)));
+        g.cycle(true, 10.0, false);
+        g.cycle(false, 20.0, false);
+        rep(&mut g, 90, "s1", 25.0);
+        rep(&mut g, 90, "s1", 30.0); // S 이상 두 번 = 확인 → 조기 닫힘
+        let o = rep(&mut g, 91, "s1", 40.0);
+        assert!(matches!(o.verdict, Some(Verdict::Held { until, .. }) if (until - 600.0).abs() < 1e-6));
+    }
+
+    #[test]
+    fn backoff_doubles_to_7200_cap() {
+        assert_eq!([cg::backoff(1), cg::backoff(2), cg::backoff(3), cg::backoff(4), cg::backoff(9)], [900.0, 1800.0, 3600.0, 7200.0, 7200.0]);
+    }
+
+    #[test]
+    fn empty_scope_name_is_just_a_scope() {
+        let mut g = ClearGuard::default();
+        rep(&mut g, 55, "", 0.0);
+        assert!(fired(&rep(&mut g, 62, "", 10.0)));
+        g.cycle(true, 380.0, false);
+        rep(&mut g, 3, "", 390.0);
+        g.cycle(false, 400.0, false);
+        let o = rep(&mut g, 20, "", 410.0);
+        assert!(strikes(&o).is_empty() && g.strikes == 0);
+        assert!(matches!(g.phase, Phase::Measuring { kind: Kind::AfterCycle, .. }));
+    }
+
+    #[test]
+    fn window_switch_rebases_level() {
+        let mut g = ClearGuard::default();
+        g.level[0] = Some(((72, Some(200_000)), Kind::AfterCycle));
+        assert_eq!(g.bar(Axis::Measured, 10, Some(1_000_000)), 20); // 72%·200K = 14.4%·1M → 올림 15 + 5
+    }
+
+    #[test]
+    fn early_close_at_stop_cap_after_confirmation() {
+        let mut g = ClearGuard::default();
+        rep(&mut g, 80, "s0", 0.0);
+        g.cycle(true, 10.0, false);
+        g.cycle(false, 20.0, false);
+        rep(&mut g, 80, "s1", 30.0);
+        let o = rep(&mut g, 85, "s1", 40.0); // 같은 범위의 S 미만 보고가 창에 있다 → 곧바로 닫고 이 보고로 판정
+        assert_eq!(g.level[0].map(|l| l.0 .0), Some(80));
+        assert!(matches!(o.verdict, Some(Verdict::Fire { .. } | Verdict::Held { .. })));
+    }
+
+    #[test]
+    fn executor_single_flight_stale_query() {
+        let mut g = ClearGuard::default();
+        assert!(fired(&rep(&mut g, 78, "s0", 0.0)));
+        assert!(!g.stale(1));
+        g.cycle(true, 100.0, false);
+        g.cycle(false, 200.0, false);
+        assert!(g.stale(1), "사이클이 끝난 뒤의 같은 발화 경보는 건너뛴다");
+        assert!(!g.stale(2));
+        // 더 새 발화가 있다는 것만으로는 옛 경보를 건너뛰지 않는다(느린 집행자 굶음 방지) — 사이클이 끝나야 건너뛴다.
+        let _ = g.tick(900.0, false);
+        rep(&mut g, 78, "s1", 910.0);
+        assert!(fired(&rep(&mut g, 84, "s1", 1500.0)));
+        assert_eq!(g.seq, 2);
+        assert!(g.stale(1) && !g.stale(2));
+    }
+
+    #[test]
+    fn cycling_cap_closes_without_off() {
+        let mut g = ClearGuard::default();
+        assert!(fired(&rep(&mut g, 78, "s0", 0.0)));
+        g.cycle(true, 100.0, false);
+        let _ = g.tick(100.0 + 660.0, false);
+        assert!(matches!(g.phase, Phase::Measuring { kind: Kind::AfterCycle, .. }));
+        assert!(g.fire.unwrap().cleared);
+    }
+
+    #[test]
+    fn measuring_window_closes_by_time_without_reports() {
+        let mut g = ClearGuard::default();
+        assert!(fired(&rep(&mut g, 78, "s0", 0.0)));
+        g.cycle(true, 100.0, false);
+        g.cycle(false, 200.0, false);
+        let _ = g.tick(800.0, false);
+        assert_eq!(g.phase, Phase::Free);
+        assert_eq!(g.fold[0], Some(0), "창이 비었으면 다음 관측(아무 범위)이 수준");
+    }
+
+    // ───────────── 상수·범위 키·발행 재료 ─────────────
+
+    /// 파라미터는 설계 v3 §3 값이다(모형 스윕 param-sweep-v3.txt 로 고른 값 — 바꾸면 I1·I3 증명 수치가 달라진다).
+    #[test]
+    fn guard_constants_are_the_design_values() {
+        assert_eq!(CTX_GUARD_GROWTH, 5);
+        assert_eq!(
+            (CTX_GUARD_MEASURE_SECS, CTX_GUARD_REREAD_SECS, CTX_GUARD_MIN_SPACING_SECS, CTX_GUARD_CLEAR_WAIT_SECS, CTX_GUARD_CYCLING_MAX_SECS),
+            (600.0, 90.0, 600.0, 1200.0, 660.0)
+        );
+        assert_eq!((CTX_GUARD_BACKOFF_BASE_SECS, CTX_GUARD_BACKOFF_MAX_SECS), (900.0, 7200.0));
+        assert_eq!((CTX_GUARD_COMPACT_DROP, CTX_GUARD_STOP_MARGIN_TOKENS, CTX_GUARD_SCOPES_KEPT), (10, 5_000, 4));
+    }
+
+    /// 범위 = 세션 파일 줄기 — 심링크·`/private` 표기 차이는 같은 범위 · 빈 경로는 "" 범위.
+    #[test]
+    fn scope_is_the_session_file_stem() {
+        let a = ctx_guard_scope("/Users/x/.claude/projects/p/9f3a.jsonl");
+        assert_eq!(a, "9f3a");
+        assert_eq!(ctx_guard_scope("/private/var/folders/q/.claude/projects/p/9f3a.jsonl"), a);
+        assert_ne!(ctx_guard_scope("/Users/x/.claude/projects/p/7b21.jsonl"), a);
+        assert_eq!(ctx_guard_scope(""), "");
+        assert_eq!(ctx_guard_scope("   "), "");
+    }
+
+    /// 발행 재료 — 창이 닫힐 때 최고치를 낸 관측의 기본 임계를 싣고(틱이 오버라이드 파일을 다시 읽지 않는다), 효과 없음은 그
+    /// 발화 번호·축 수준을 싣는다.
+    #[test]
+    fn notes_carry_publish_materials_without_outside_reads() {
+        let mut g = ClearGuard::default();
+        assert!(fired(&g.report(&Rep { pct: 70, window: W, axis: Axis::Measured, scope: "s0", base: 65, now: 0.0, frozen: false })));
+        g.cycle(true, 60.0, false);
+        g.cycle(false, 120.0, false);
+        g.report(&Rep { pct: 72, window: W, axis: Axis::Measured, scope: "s1", base: 65, now: 130.0, frozen: false });
+        let o = g.tick(720.0, false);
+        assert!(
+            o.notes.iter().any(|n| matches!(n, Note::Measured { kind: Kind::AfterCycle, base, level, .. }
+                if base[0] == Some(65) && level[0] == Some((72, W)))),
+            "{o:?}"
+        );
+        g.report(&Rep { pct: 72, window: W, axis: Axis::Measured, scope: "s1", base: 65, now: 730.0, frozen: false });
+        let o = g.report(&Rep { pct: 40, window: W, axis: Axis::Measured, scope: "s1", base: 65, now: 800.0, frozen: false });
+        assert!(
+            o.notes.iter().any(|n| matches!(n, Note::Ineffective { why: Why::DropAfterCycle, fire_seq: 1, level: Some((72, _)), drop: Some((72, 40)), .. })),
+            "{o:?}"
+        );
+    }
+
+    // ───────────── ② 이전 반례 이름 검체 — 작은 좌석 구동기 ─────────────
+
+    /// 좌석 한 대의 모양(시각 초 · 컨텍스트 %p). 사이클: 발화 → `exec_delay` 뒤 표지 켬(clear 3%) → `quiesce` 뒤 붙여넣기
+    /// (`paste`) · 표지 끔 → 복원 턴(`restore`/`restore_secs`) → 사이클이 붙잡은 몰림(`burst` · 대기열) → 몰림 뒤 회신(`late`).
+    /// 입력은 대기열로 들어오고 턴 사이 1초 틈에 한 건씩 배달된다(사이클 동안 보류). Claude 선제 압축: 턴 도중·제출 때 컨텍스트가
+    /// 창 − 33000 토큰 이상이면 `keep` 으로 내리고 남은 턴 + 지침 재읽기(`reread` · 20초)를 이어 간다. 상태줄은 턴 도중 8초마다 ·
+    /// 턴 끝 · 압축 1초 뒤 보고한다. 수집기 틱 2초.
+    #[derive(Clone, Copy)]
     struct Seat {
-        base: u8,
         window: Option<u64>,
-        /// clear 뒤 지침 붙여넣기 직후 컨텍스트.
+        base: u8,
+        boot: f64,
         paste: f64,
-        /// 붙여넣기 뒤 복원 성장(%p)과 그 시간(초).
         restore: f64,
         restore_secs: f64,
-        /// 복원이 끝난 뒤 작업 시작까지 쉬는 시간(초) · 그 뒤 분당 성장(%p · 0 = 유휴).
-        work_after: f64,
-        work_per_min: f64,
-        /// 작업 구간의 매 분 가운데 턴(출력 중)인 초 — 나머지는 조용하다(대기열 배달 사이 · 60 = 끊김 없는 한 턴).
-        /// 성장은 턴 안에서만 일어난다.
-        turn_secs: f64,
-        /// 발화 → CSO 수신·저장 지시·검증까지(초) · clear 뒤 SessionStart·붙여넣기까지 quiescing(초).
-        cycle_delay: f64,
-        quiesce: f64,
-        /// 틱(초 · 종전 모형 5) — 대기열 조용함(3초)을 보려면 1초.
-        tick: f64,
-        /// ★(ROLE-R4-1 · R2NC5-1) 사이클(quiescing·복원) 동안 쌓여 **복원 턴 뒤** 대기열로 배달되는 몫(%p) · 배달 턴 수 · 한
-        /// 턴 길이(초) — 배달마다 좌석 조용함 [`QUEUE_QUIET`] 뒤 한 턴(좌석 입력). 작업은 그 뒤 `work_after` 부터.
-        backlog: f64,
-        backlog_turns: u32,
-        backlog_turn_secs: f64,
-        /// 운영 신호 모형 — 좌석 입력 시각을 기록하고(붙여넣기·배달·작업 턴 시작 = writer Inject·send 기록) 턴이 끝날 때마다
-        /// 보고한다(상태줄). 끄면 종전 모형(입력 신호 없음 · 30초 보고 — 복원 끝 바닥이 확정되지 않는다 = 종전 판정).
-        real: bool,
-        /// 복원 턴 가운데 출력이 멎는 틈(턴 시작부터 초, 길이 초) — 입력 없음(같은 턴이 이어진다 · 복원 끝 판정의 반례).
-        stall: Option<(f64, f64)>,
-        /// 턴 끝 → 다음 대기열 배달 사이(초) — 마커 없는 좌석은 조용함 3초 · claude 좌석의 프롬프트 경계 배달은 조용함을 기다리지
-        /// 않는다(샌드박스 실측 0.1~0.5초 — 2초 틈이 없다).
-        queue_gap: f64,
-        /// 복원 턴 가운데(턴 시작부터 초) 바쁨을 보지 않는 기계 입력(채널 행 · 스케줄 push — 대기열 배달 아님) 1건.
-        mid_input: Option<f64>,
-        /// Claude 자체 선제 압축점(%) — 제출(좌석 입력) 때 컨텍스트가 이 이상이면 같은 세션에서 `compact_to` 로 먼저 압축한다.
-        compact_at: Option<f64>,
-        compact_to: f64,
-        /// ★(R1-RUNAWAY-1) Claude 압축 뒤 SessionStart:compact 훅이 시키는 지침 전문 재읽기(%p) — 압축 직후 [`REREAD_SECS`]
-        /// 동안 한 턴(출력 중 · 좌석 입력 없음)으로 오른다. 압축 뒤 수준 = `compact_to` + 이것(MASTER 96.7KB·CEO 105KB ≈ 32~39%p).
-        /// 0 = 종전 모형(압축 뒤 `compact_to` 에 머문다).
+        burst: (u32, f64, f64),
+        late: Option<(f64, f64, f64)>,
+        hb: (f64, f64),
+        work: (f64, f64, f64),
+        autocompact: bool,
+        keep: f64,
         reread: f64,
-        /// ★(RV2NC-E20-1) 사이클 몰림을 **복원된 좌석이 부른 회신**으로 — 복원 턴 끝 이 초 뒤 대기열에 한꺼번에 든다(시작점 뒤 ·
-        /// quiescing 이 붙잡은 것이 아니다 · 드릴 rv-d1p). None = 종전(quiescing 동안 enqueue — clear 1초 뒤).
-        backlog_reply: Option<f64>,
-        /// ★(RV2NC-E20-2) 복원 턴 도중(붙여넣기부터 초) 바쁨을 보지 않는 기계 주입(채널 행 · writer Inject — 대기열 배달 아님) 1건
-        /// (주입 시각 오프셋, 성장 %p, 턴 초) — Claude 가 복원 턴 끝에 조용함 없이 곧바로 이어 처리한다(드릴 rv-d3).
-        chan: Option<(f64, f64, f64)>,
-        /// ★(RV2-ROLE-1) 작업 구간의 매 분 좌석 입력(대기열 배달) — false 면 입력 없이 이어지는 긴 에이전트 턴(도구 연쇄).
-        work_inputs: bool,
-        /// ★(RV2-ROLE-1) Claude 선제 압축을 제출 때만이 아니라 턴 도중(도구 호출 사이)에도 본다.
-        compact_midturn: bool,
+        exec_delay: f64,
+        exec_fail: bool,
+        quiesce: f64,
+        secs: f64,
     }
 
-    /// 압축 뒤 지침 재읽기 턴의 길이(초).
-    const REREAD_SECS: f64 = 20.0;
-
     impl Seat {
-        fn idle(base: u8, window: Option<u64>, paste: f64, restore: f64) -> Self {
-            Seat { base, window, paste, restore, restore_secs: 40.0, work_after: 0.0, work_per_min: 0.0, turn_secs: 60.0,
-                   cycle_delay: 60.0, quiesce: 15.0, tick: 5.0, backlog: 0.0, backlog_turns: 0, backlog_turn_secs: 10.0,
-                   real: false, stall: None, queue_gap: QUEUE_QUIET, mid_input: None, compact_at: None, compact_to: 30.0,
-                   reread: 0.0, backlog_reply: None, chan: None, work_inputs: true, compact_midturn: false }
+        /// 200K master(붙여넣기 63.3 + 복원 8.9 = 72.2) · 주기 신호 2분 0.15%p · 집행 60초 · quiescing 15초.
+        fn master200() -> Self {
+            Seat {
+                window: W,
+                base: 60,
+                boot: 70.0,
+                paste: 63.3,
+                restore: 8.9,
+                restore_secs: 30.0,
+                burst: (0, 0.0, 10.0),
+                late: None,
+                hb: (120.0, 0.15),
+                work: (0.0, 0.0, 10.0),
+                autocompact: true,
+                keep: 34.0,
+                reread: 30.0,
+                exec_delay: 60.0,
+                exec_fail: false,
+                quiesce: 15.0,
+                secs: 4.0 * 3600.0,
+            }
         }
-
-        /// 운영 신호 모형(1초 틱 · 입력 기록 · 턴 끝 보고 · Claude 선제 압축점 = 창 − 33000 토큰 · 창 미상은 200K 로 압축).
-        fn real(base: u8, window: Option<u64>, paste: f64, restore: f64) -> Self {
-            let w = window.unwrap_or(200_000) as f64;
-            let compact = (w - (CC_SUMMARY_RESERVE_TOKENS + CC_AUTOCOMPACT_BUFFER_TOKENS) as f64) * 100.0 / w;
-            Seat { tick: 1.0, real: true, compact_at: Some(compact), ..Seat::idle(base, window, paste, restore) }
+        fn growth(&self) -> f64 {
+            let per = |every: f64, pp: f64| if every > 0.0 { pp * self.secs / every } else { 0.0 };
+            per(self.hb.0, self.hb.1) + per(self.work.0, self.work.1)
         }
     }
 
     #[derive(Debug, Default)]
     struct Run {
-        /// (시각, 보고 pct, 판정, 그 세션의 복원 뒤 컨텍스트)
-        fires: Vec<(f64, u8, CtxFire, f64)>,
-        max_pct: u8,
-        /// 첫 clear 뒤(부트 교차 제외) 보고한 최고치.
-        max_post_clear: u8,
-        /// Claude 자체 압축 시각 · 가드의 재무장 수(R2NC5-1 (b)).
+        fires: Vec<(f64, u8)>,
+        clears: Vec<f64>,
         compactions: Vec<f64>,
-        rearms: usize,
+        max_after_first_clear: f64,
+        secs_above_block: f64,
+        max_bar: u8,
+        strikes: Vec<Why>,
     }
 
-    /// 부트(임계 위)에서 첫 교차 발화 → 발화마다 `cycle_delay` 뒤 clear(quiescing `quiesce` 초 · 3%) → 붙여넣기 →
-    /// 복원 성장(한 턴) → (사이클 동안 쌓인 대기열 배달 턴들) → `work_after` 쉬고 분당 `work_per_min` 성장(매 분 `turn_secs` 턴
-    /// 안에서만 · 100 캡). `tick` 초 틱 · 보고는 30초마다 + 사건 때(+ `real` 이면 턴 끝마다). 운영 두 경로와 같은 순서:
-    /// quiescing → 좌석 입력 시각 → 끝난 조용한 틈(보고 **전** — 틈 뒤 보고는 새 턴의 것) → 보고 → 지금 이어지는 조용함(보고
-    /// **뒤** — 조용한 동안의 보고는 직전 턴의 끝이다) — 수집기 틱과 같다. `compact_at` 이면 제출 때 Claude 가 먼저 압축한다.
-    fn run_seat(seat: Seat, secs: f64) -> Run {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
+    impl Run {
+        fn min_spacing(&self) -> f64 {
+            self.fires.windows(2).map(|w| w[1].0 - w[0].0).fold(f64::INFINITY, f64::min)
+        }
+        fn max_hour(&self) -> usize {
+            (0..self.fires.len()).map(|i| self.fires[i..].iter().take_while(|f| f.0 - self.fires[i].0 < 3600.0).count()).max().unwrap_or(0)
+        }
+        fn max_gap(&self, secs: f64) -> f64 {
+            let mut ts: Vec<f64> = self.fires.iter().map(|f| f.0).collect();
+            ts.push(secs);
+            ts.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max)
+        }
+    }
+
+    /// I2 상한(설계 §2): 보류 7200 + 시한 1200 + 창 600 + Cycling 60 여유.
+    const I2_BOUND: f64 = 7200.0 + 1200.0 + 600.0 + 60.0;
+
+    fn drive(seat: Seat) -> Run {
+        use std::collections::VecDeque;
+        let mut g = ClearGuard::default();
         let mut run = Run::default();
-        let boot = f64::from(seat.base.max(60).saturating_add(10).min(100));
-        let mut pct = boot;
-        let mut pending: Option<f64> = None; // 사이클 clear 예정 시각
-        let mut session: Option<f64> = None; // 이 세션의 clear 시각
-        let mut idle_since: Option<f64> = None; // 출력이 조용해진 시각(틱 해상도)
-        let mut last_report = -1e9;
-        let mut last_input: Option<f64> = None;
-        let mut last_queue: Option<f64> = None;
-        let (mut last_cr, mut pending_cr): (Option<f64>, Option<f64>) = (None, None);
-        let mut chan_inject: Option<f64> = None; // 채널 행 주입의 CR(writer Inject 끝)
-        let mut dropped = 0.0; // Claude 압축이 이 세션에서 내린 몫(%p)
-        let mut reread_from: Option<f64> = None; // 마지막 Claude 압축(= 지침 재읽기 턴 시작) 시각
-        // 지금까지 재읽은 몫(%p) — 압축마다 새로 0 에서 오른다.
-        let reread_at = |from: Option<f64>, t: f64| from.map_or(0.0, |a| seat.reread * ((t - a) / REREAD_SECS).clamp(0.0, 1.0));
-        let (mut was_busy, mut prev_t) = (false, f64::NEG_INFINITY);
-        let mut t = 0.0;
-        // 작업 구간(시작부터 dt 초)의 (성장 %p, 턴 중인가) — 매 분 turn_secs 동안만 일하고 자란다.
-        let work = |dt: f64| -> (f64, bool) {
-            if dt < 0.0 || seat.work_per_min <= 0.0 {
-                return (0.0, false);
+        let w = seat.window.unwrap_or(200_000) as f64;
+        let compact_at = (w - (CC_SUMMARY_RESERVE_TOKENS + CC_AUTOCOMPACT_BUFFER_TOKENS) as f64) * 100.0 / w;
+        let block_at = (w - (CC_SUMMARY_RESERVE_TOKENS + CC_BLOCKING_BUFFER_TOKENS) as f64) * 100.0 / w;
+        let mut pct = seat.boot;
+        let mut queue: VecDeque<(f64, f64)> = VecDeque::new();
+        let mut turn: Option<(f64, f64)> = None; // (끝, 초당 성장)
+        let mut last_turn_end = 0.0f64;
+        let mut held = false; // quiescing — 대기열 보류
+        let (mut cycle_on_at, mut cycle_off_at): (Option<f64>, Option<f64>) = (None, None);
+        let mut late_at: Option<f64> = None;
+        let mut sess = 0u32;
+        let mut next_report = f64::INFINITY;
+        let mut force_report: Option<f64> = Some(0.0);
+        let (mut next_hb, mut next_work) = (seat.hb.0, seat.work.0);
+        let mut t = 0.0f64;
+        while t <= seat.secs {
+            // 입력
+            if seat.hb.0 > 0.0 && t >= next_hb {
+                next_hb += seat.hb.0;
+                queue.push_back((seat.hb.1, 5.0));
             }
-            let (m, ph) = ((dt / 60.0).floor(), dt % 60.0);
-            (seat.work_per_min * (m + (ph / seat.turn_secs).min(1.0)), ph < seat.turn_secs)
-        };
-        // 작업 턴 시작(좌석 입력 = 대기열 배달)이 구간 (a, b] 안에 있으면 그 시각(가장 늦은 것).
-        let work_input = |from: f64, a: f64, b: f64| -> Option<f64> {
-            if seat.work_per_min <= 0.0 || b < from || !seat.work_inputs {
-                return None;
+            if seat.work.0 > 0.0 && t >= next_work {
+                next_work += seat.work.0;
+                queue.push_back((seat.work.1, seat.work.2));
             }
-            let at = from + 60.0 * ((b - from) / 60.0).floor();
-            (at > a).then_some(at)
-        };
-        let restored = (seat.paste + seat.restore).min(100.0);
-        let n = seat.backlog_turns;
-        let per = if n > 0 { seat.backlog / f64::from(n) } else { 0.0 };
-        while t <= secs {
-            let mut force = t == 0.0;
-            if pending.is_some_and(|c| t >= c) {
-                pending = None;
-                session = Some(t);
-                clear(&mut g, &mut armed, t);
-                force = true;
-                dropped = 0.0;
-                reread_from = None;
+            if late_at.is_some_and(|a| t >= a) {
+                late_at = None;
+                if let Some((_, pp, secs)) = seat.late {
+                    queue.push_back((pp, secs));
+                }
             }
-            let quiescing = session.is_some_and(|s| t < s + seat.quiesce);
-            // 이 틱의 (원시 컨텍스트 — 없으면 그대로, 출력 중, 구간 (prev_t, t] 안의 좌석 입력 · 그 가운데 대기열 배달)
-            let (raw, busy, input): (Option<f64>, bool, Option<f64>);
-            let mut queued: Option<f64> = None;
-            // 대기열에 남은 가장 오래된 항목 — 사이클이 붙잡았던 배달(quiescing 동안 enqueue · clear 1초 뒤)이 아직 남았으면 그
-            // 시각. 작업 턴의 배달은 들어오자마자 인계된다(대기열에 남지 않는다).
-            let mut queue_oldest: Option<f64> = None;
-            if let Some(s) = session {
-                let paste_at = s + seat.quiesce;
-                let restore_end = paste_at + seat.restore_secs;
-                // 채널 행 턴 — 복원 턴 끝(주입이 그 뒤면 주입 시각)에 조용함 없이 곧바로 이어진다.
-                let chan_turn = seat.chan.map(|(o, pp, secs)| {
-                    let st = restore_end.max(paste_at + o);
-                    (paste_at + o, st, st + secs, pp)
-                });
-                let after_restore = chan_turn.map_or(restore_end, |c| c.2);
-                // 회신 몰림(시작점 뒤 enqueue)이면 그 시각 뒤에 배달된다.
-                let enq = seat.backlog_reply.map(|d| restore_end + d);
-                let first = after_restore.max(enq.unwrap_or(after_restore));
-                let start = |k: u32| first + seat.queue_gap + f64::from(k) * (seat.backlog_turn_secs + seat.queue_gap);
-                if (0..n).any(|k| start(k) > t) {
-                    queue_oldest = match enq {
-                        None => Some(s + 1.0),
-                        Some(e) => (t >= e).then_some(e),
-                    };
+            // 사이클(집행자)
+            if cycle_on_at.is_some_and(|a| t >= a) {
+                cycle_on_at = None;
+                let _ = g.cycle(true, t, false);
+                run.clears.push(t);
+                pct = 3.0;
+                turn = None;
+                held = true;
+                for _ in 0..seat.burst.0 {
+                    queue.push_back((seat.burst.1, seat.burst.2));
                 }
-                let backlog_end = if n > 0 { start(n - 1) + seat.backlog_turn_secs } else { after_restore };
-                let work_from = backlog_end + seat.work_after;
-                let (grown, turn) = work(t - work_from);
-                let mut inp = (paste_at > prev_t && paste_at <= t).then_some(paste_at);
-                let mut delivered = 0.0;
-                let mut in_backlog_turn = false;
-                for k in 0..n {
-                    let (st, en) = (start(k), start(k) + seat.backlog_turn_secs);
-                    if t >= en {
-                        delivered += per;
-                    } else if t >= st {
-                        delivered += per * (t - st) / seat.backlog_turn_secs;
-                        in_backlog_turn = true;
-                    }
-                    if st > prev_t && st <= t {
-                        inp = Some(st);
-                        queued = Some(st);
-                    }
-                }
-                if let Some(w) = work_input(work_from, prev_t, t) {
-                    inp = Some(w);
-                    queued = Some(w);
-                }
-                if let Some(m) = seat.mid_input.map(|o| paste_at + o).filter(|m| *m > prev_t && *m <= t) {
-                    inp = Some(inp.map_or(m, |i: f64| i.max(m)));
-                }
-                let (mut chan_grown, mut in_chan_turn) = (0.0, false);
-                if let Some((at, st, en, pp)) = chan_turn {
-                    if at > prev_t && at <= t {
-                        inp = Some(inp.map_or(at, |i: f64| i.max(at)));
-                        chan_inject = Some(at + 0.4); // writer Inject 끝(CR) — 대기열 배달이 아니다
-                    }
-                    chan_grown = pp * ((t - st) / (en - st)).clamp(0.0, 1.0);
-                    in_chan_turn = t >= st && t < en;
-                }
-                input = inp;
-                if t < paste_at {
-                    (raw, busy) = (Some(3.0), quiescing);
-                } else if t < restore_end {
-                    let stalled = seat.stall.is_some_and(|(o, d)| t >= paste_at + o && t < paste_at + o + d);
-                    (raw, busy) = (Some(seat.paste + seat.restore * (t - paste_at) / seat.restore_secs), !stalled);
-                } else {
-                    (raw, busy) = (Some(restored + chan_grown + delivered + grown), in_backlog_turn || in_chan_turn || turn);
-                }
-            } else {
-                let (grown, turn) = work(t);
-                busy = turn || pending.is_some();
-                raw = pending.is_none().then_some(boot + grown);
-                input = if pending.is_none() { work_input(0.0, prev_t, t) } else { None };
-                queued = input;
+                cycle_off_at = Some(t + seat.quiesce);
             }
-            if let Some(i) = input {
-                if seat.real {
-                    last_input = Some(i);
-                    last_queue = queued.or(last_queue);
-                    // writer Inject: 붙여넣기 → cr_delay(0.4초) → CR — 제출은 다음 틱에 보인다.
-                    pending_cr = queued.map(|q| q + 0.4).or(chan_inject.take()).or(pending_cr);
+            if cycle_off_at.is_some_and(|a| t >= a) {
+                cycle_off_at = None;
+                sess += 1;
+                pct = seat.paste;
+                turn = Some((t + seat.restore_secs, seat.restore / seat.restore_secs));
+                held = false;
+                let _ = g.cycle(false, t, false);
+                // 몰림 뒤 회신: 복원 끝 + 몰림 턴들 뒤 지연.
+                if let Some((d, _, _)) = seat.late {
+                    let backlog = f64::from(seat.burst.0) * (seat.burst.2 + 1.0);
+                    late_at = Some(t + seat.restore_secs + backlog + d);
                 }
-                // Claude 자체 선제 압축 — 제출 때 컨텍스트가 압축점 이상이면 같은 세션에서 먼저 압축한다(세션 파일 그대로).
-                if let (Some(c), Some(r)) = (seat.compact_at, raw) {
-                    if r - dropped + reread_at(reread_from, t) >= c {
-                        dropped = r - seat.compact_to;
-                        reread_from = Some(t);
+                next_report = t + 8.0;
+            }
+            // Claude — 턴 진행 · 선제 압축
+            if let Some((end, rate)) = turn {
+                pct += rate;
+                if seat.autocompact && pct >= compact_at {
+                    let rem = (end - t).max(0.0);
+                    pct = seat.keep;
+                    let grow = rate * rem + seat.reread;
+                    let e2 = end.max(t) + 20.0;
+                    turn = Some((e2, grow / (e2 - t).max(1.0)));
+                    run.compactions.push(t);
+                    force_report = Some(t + 1.0);
+                }
+            }
+            if turn.is_some_and(|(end, _)| t >= end) {
+                turn = None;
+                last_turn_end = t;
+                force_report = Some(t);
+            }
+            if turn.is_none() && !held && t - last_turn_end >= 1.0 {
+                if let Some((pp, secs)) = queue.pop_front() {
+                    let mut grow = pp;
+                    let mut dur = secs;
+                    if seat.autocompact && pct >= compact_at {
+                        pct = seat.keep;
+                        grow += seat.reread;
+                        dur += 20.0;
                         run.compactions.push(t);
-                        force = true;
+                        force_report = Some(t + 1.0);
+                    } else if !seat.autocompact && pct >= block_at {
+                        grow = 0.0; // 차단점 — 프롬프트가 막힌다
+                    }
+                    turn = Some((t + dur, grow / dur));
+                    next_report = t + 8.0;
+                }
+            }
+            if run.clears.first().is_some_and(|c| t > *c) {
+                run.max_after_first_clear = run.max_after_first_clear.max(pct);
+            }
+            if pct >= block_at {
+                run.secs_above_block += 1.0;
+            }
+            // 상태줄 보고
+            let due = force_report.is_some_and(|f| t >= f) || (turn.is_some() && t >= next_report);
+            let mut verdicts = vec![];
+            if due && cycle_off_at.is_none() {
+                force_report = None;
+                next_report = t + 8.0;
+                let p = pct.round().clamp(0.0, 100.0) as u8;
+                let scope = format!("s{sess}");
+                let o = g.report(&Rep { pct: p, window: seat.window, axis: Axis::Measured, scope: &scope, base: seat.base, now: t, frozen: false });
+                verdicts.push(o);
+            }
+            // 수집기 틱(2초)
+            if (t as u64) % 2 == 0 {
+                verdicts.push(g.tick(t, false));
+            }
+            for o in verdicts {
+                run.strikes.extend(strikes(&o));
+                if let Some(Verdict::Fire { pct: p, bar, .. }) = o.verdict {
+                    run.fires.push((t, p));
+                    run.max_bar = run.max_bar.max(bar);
+                    if !seat.exec_fail && cycle_on_at.is_none() && cycle_off_at.is_none() {
+                        cycle_on_at = Some(t + seat.exec_delay);
                     }
                 }
             }
-            // ★(RV2-ROLE-1) 턴 도중(도구 호출 사이)의 Claude 선제 압축.
-            if seat.compact_midturn && input.is_none() && busy {
-                if let (Some(c), Some(r)) = (seat.compact_at, raw) {
-                    if r - dropped + reread_at(reread_from, t) >= c {
-                        dropped = r - seat.compact_to;
-                        reread_from = Some(t);
-                        run.compactions.push(t);
-                        force = true;
-                    }
-                }
-            }
-            if let Some(r) = raw {
-                pct = (r - dropped + reread_at(reread_from, t)).clamp(0.0, 100.0);
-            }
-            // 압축 뒤 지침 재읽기 턴 — 출력 중(입력 없음).
-            let busy = busy || (seat.reread > 0.0 && reread_from.is_some_and(|a| t < a + REREAD_SECS));
-            if quiescing {
-                g.note_quiescing(t);
-            }
-            if seat.real {
-                if pending_cr.is_some_and(|c| c <= t) {
-                    last_cr = pending_cr.take();
-                }
-                g.note_input(last_input, t);
-                g.note_delivery(last_queue, last_cr, t);
-                g.note_queue(queue_oldest);
-            }
-            if busy {
-                if let Some(s) = idle_since.take() {
-                    g.note_idle(s, t, t); // 끝난 틈 — 이 틱의 보고(새 턴)보다 먼저
-                }
-            } else if idle_since.is_none() {
-                idle_since = Some(t);
-            }
-            let turn_end = seat.real && was_busy && !busy;
-            if force || turn_end || t - last_report >= 30.0 {
-                last_report = t;
-                let p = pct.round() as u8;
-                run.max_pct = run.max_pct.max(p);
-                if session.is_some() {
-                    run.max_post_clear = run.max_post_clear.max(p);
-                }
-                let rearmed = g.rearmed;
-                if let Some(f) = report(&mut g, &mut armed, p, seat.base, seat.window, t) {
-                    run.fires.push((t, p, f, restored));
-                    pending = Some(t + seat.cycle_delay);
-                }
-                if g.rearmed && !rearmed {
-                    run.rearms += 1;
-                }
-            }
-            if let Some(s) = idle_since {
-                g.note_idle(s, t, t); // 이어지는 조용함 — 수집기 틱
-            }
-            was_busy = busy;
-            prev_t = t;
-            t += seat.tick;
+            run.max_bar = run.max_bar.max(g.bar(Axis::Measured, seat.base, seat.window));
+            t += 1.0;
         }
         run
     }
 
-    // ───────────── 천장·상한 유도 ─────────────
-
-    /// ★(R2NC3-1) 천장은 창에서 유도한다 — 창 − (요약 출력 예약 20000 + 자동 압축 버퍼 13000 + 사이클 여유 15000) 를
-    /// 상태줄 반올림까지 넣어 퍼센트로 내림, 85 캡. 모든 창에서 (천장으로 보이는 최대 토큰) + 사이클 여유 ≤ Claude Code
-    /// 선제 압축점 < 차단점. 창을 모르면 claude 최소 창(200K)으로 본다(천장이 낮아지는 쪽 = 발화 쪽 실패).
-    #[test]
-    fn ctx_floor_ceiling_is_derived_from_the_window_below_claude_code_limits() {
-        assert_eq!(ctx_floor_ceiling(W200K), 75, "200K 창 천장");
-        assert_eq!(ctx_floor_ceiling(W1M), CTX_FLOOR_CEIL, "1M 창은 종전 85 캡");
-        assert_eq!(ctx_floor_ceiling(None), ctx_floor_ceiling(W200K), "창 미상은 200K 로 본다(보수)");
-        assert_eq!(ctx_floor_ceiling(Some(0)), ctx_floor_ceiling(W200K), "창 0 은 미상이다(결측은 값이 아니다)");
-        assert!(ctx_floor_ceiling(W200K) < 83, "200K 천장이 선제 압축점 83.5% 이상");
-        for w in [40_000u64, 48_000, 100_000, 128_000, 200_000, 272_000, 400_000, 500_000, 1_000_000, 2_000_000] {
-            let c = ctx_floor_ceiling(Some(w));
-            assert!(c <= CTX_FLOOR_CEIL, "창 {w}: 천장 {c} 가 85 캡을 넘는다");
-            if c == 0 {
-                continue;
-            }
-            let fire = max_tokens_shown_as(c, w);
-            let compact_at = w.saturating_sub(CC_SUMMARY_RESERVE_TOKENS + CC_AUTOCOMPACT_BUFFER_TOKENS);
-            let block_at = w.saturating_sub(CC_SUMMARY_RESERVE_TOKENS + CC_BLOCKING_BUFFER_TOKENS);
-            assert!(fire + CTX_FLOOR_CYCLE_MARGIN_TOKENS <= compact_at, "창 {w}: 천장 {c}% + 사이클 여유가 선제 압축점을 넘는다");
-            assert!(fire + CTX_FLOOR_CYCLE_MARGIN_TOKENS < block_at, "창 {w}: 천장 {c}% + 사이클 여유가 차단점에 닿는다");
-        }
-        assert_eq!(ctx_floor_ceiling(Some(40_000)), 0, "창이 예약보다 작으면 올릴 곳이 없다(발화)");
+    fn assert_i1(run: &Run, what: &str) {
+        assert!(run.min_spacing() >= 600.0, "{what}: 최소 발화 간격 {} < 600 (I1)", run.min_spacing());
+        assert!(run.max_hour() <= 6, "{what}: 굴림 1시간 발화 {} > 6 (I1)", run.max_hour());
     }
 
-    /// ★(RR3-R1-1) 차단 상한 — 그 퍼센트에서 발화해도 CSO 사이클(여유 15000 토큰)이 Claude Code 차단점(창−23000) 전에
-    /// 끝난다. 200K 80 · 1M 95 · 미상 = 200K · 언제나 선제 압축 천장 이상 · 선제 압축점(83.5%) 아래(교차가 압축보다 먼저).
-    #[test]
-    fn ctx_floor_hard_cap_keeps_the_cycle_before_the_blocking_point() {
-        assert_eq!(ctx_floor_hard_cap(W200K), 80, "200K 차단 상한");
-        assert_eq!(ctx_floor_hard_cap(W1M), 95, "1M 차단 상한");
-        assert_eq!(ctx_floor_hard_cap(None), ctx_floor_hard_cap(W200K), "창 미상은 200K 로 본다(보수)");
-        assert_eq!(ctx_floor_hard_cap(Some(0)), ctx_floor_hard_cap(W200K));
-        assert!(max_tokens_shown_as(ctx_floor_hard_cap(W200K), 200_000) < 167_000,
-                "200K 차단 상한이 선제 압축점 위라 교차가 압축에 가린다");
-        for w in [40_000u64, 48_000, 100_000, 128_000, 200_000, 272_000, 400_000, 500_000, 1_000_000, 2_000_000] {
-            let (c, h) = (ctx_floor_ceiling(Some(w)), ctx_floor_hard_cap(Some(w)));
-            assert!(h >= c, "창 {w}: 차단 상한 {h} < 천장 {c}");
-            assert!(h <= 100);
-            if h == 0 {
-                continue;
-            }
-            let block_at = w.saturating_sub(CC_SUMMARY_RESERVE_TOKENS + CC_BLOCKING_BUFFER_TOKENS);
-            if h > c {
-                assert!(max_tokens_shown_as(h, w) + CTX_FLOOR_CYCLE_MARGIN_TOKENS < block_at,
-                        "창 {w}: 차단 상한 {h}% + 사이클 여유가 차단점에 닿는다");
-            }
-        }
+    fn assert_idle_bound(run: &Run, seat: &Seat, what: &str) {
+        let bound = 2.0 + seat.growth() / 5.0;
+        assert!(run.clears.len() as f64 <= bound, "{what}: 유휴 clear {} > {bound:.1} (I3) · 발화 {:?}", run.clears.len(), run.fires);
     }
 
-    // ───────────── 히스테리시스 막대(순수) ─────────────
-
-    /// 대표값 — 200K: 바닥 67·70 → 75(Raise) · 71·75 → 80(Limited) · 76·78 → 80 1회(Probe) → 확인 뒤 바닥+10(Stopped) ·
-    /// 91 확인 → 발화 없음. 1M: 바닥 13 → 기본 60 · 78 → 85 · 81 → 95(Limited). 창 미상은 200K 와 같다.
-    #[test]
-    fn ctx_floor_bar_maps_measured_floors_to_regimes() {
-        use CtxFloorRegime::*;
-        for win in [W200K, None] {
-            assert_eq!(ctx_floor_bar(57, 60, win, false), (72, Raise));
-            assert_eq!(ctx_floor_bar(67, 60, win, false), (75, Raise));
-            assert_eq!(ctx_floor_bar(70, 60, win, false), (75, Raise));
-            assert_eq!(ctx_floor_bar(71, 60, win, false), (80, Limited));
-            assert_eq!(ctx_floor_bar(75, 60, win, true), (80, Limited), "Limited 는 확인과 무관");
-            assert_eq!(ctx_floor_bar(76, 60, win, false), (80, Probe));
-            assert_eq!(ctx_floor_bar(78, 60, win, false), (80, Probe));
-            assert_eq!(ctx_floor_bar(80, 60, win, false), (81, Probe));
-            assert_eq!(ctx_floor_bar(76, 60, win, true), (86, Stopped));
-            assert_eq!(ctx_floor_bar(78, 60, win, true), (88, Stopped));
-            assert_eq!(ctx_floor_bar(91, 60, win, true), (CTX_FLOOR_NEVER, Stopped));
-            assert_eq!(ctx_floor_bar(100, 60, win, false), (CTX_FLOOR_NEVER, Probe));
-            assert_eq!(ctx_floor_bar(30, 60, win, false), (60, Raise), "바닥이 낮으면 기본 임계(무변화)");
-        }
-        assert_eq!(ctx_floor_bar(13, 60, W1M, false), (60, Raise), "1M 좌석의 60% 정책 무변화");
-        assert_eq!(ctx_floor_bar(78, 60, W1M, false), (85, Raise));
-        assert_eq!(ctx_floor_bar(81, 60, W1M, false), (95, Limited));
-        assert_eq!(ctx_floor_bar(67, 90, W200K, false), (90, Raise), "역할 override 가 더 높으면 그것");
+    fn assert_keeps_firing(run: &Run, seat: &Seat, min_fires: usize, what: &str) {
+        assert!(run.fires.len() >= min_fires, "{what}: 발화 {} < {min_fires} (②) · {:?}", run.fires.len(), run.fires);
+        let gap = run.max_gap(seat.secs);
+        assert!(gap <= I2_BOUND, "{what}: 최대 발화 간격 {gap:.0}s > {I2_BOUND} (I2 — 영구·장기 무clear) · {:?}", run.fires);
+        assert!(run.max_bar <= block_cap(seat.window).max(seat.base), "{what}: 막대 {} > C (101·NEVER 없음)", run.max_bar);
     }
 
-    /// ★성질 핀 — 바닥 0~100 × 기본 임계 × 창 × 확인 전수:
-    /// (I1) 실효 임계가 기본보다 높으면 잰 바닥 위로 최소 여유(Probe 만 1%p) — 유휴 좌석은 바닥에서 발화할 수 없다.
-    /// (I2) 실효 임계 ≤ max(기본, 바닥 + ROOM) — 바닥 위로 ROOM 만큼 실제로 자란 컨텍스트는 발화한다(100 을 넘는 것만 예외).
-    /// 영역별 상한: Raise ≤ 천장 · Limited ≤ 차단 상한 · Probe ≤ max(차단 상한, 바닥+1).
+    /// G3ROLE-1: 느린 복원(240초)·작업 0 — 복원 성장만으로는 발화하지 않는다(부트 1회뿐).
     #[test]
-    fn ctx_floor_bar_never_fires_at_the_floor_and_always_fires_on_real_growth() {
-        use CtxFloorRegime::*;
-        for win in WINDOWS {
-            let (c, h) = (ctx_floor_ceiling(win), ctx_floor_hard_cap(win));
-            for base in [1u8, 40, 60, 75, 80, 90, 100] {
-                for floor in 0u8..=100 {
-                    for confirmed in [false, true] {
-                        let (bar, regime) = ctx_floor_bar(floor, base, win, confirmed);
-                        let ctx = format!("창 {win:?} 기본 {base} 바닥 {floor} 확인 {confirmed}: {bar} {regime:?}");
-                        assert!(bar >= base, "{ctx}");
-                        if bar > base && bar < CTX_FLOOR_NEVER {
-                            let min_room = if regime == Probe { 1 } else { CTX_FLOOR_MIN_ROOM };
-                            assert!(u16::from(bar) >= u16::from(floor) + u16::from(min_room), "(I1) {ctx}");
-                        }
-                        let room_bar = (u16::from(floor) + u16::from(CTX_FLOOR_ROOM)).min(u16::from(CTX_FLOOR_NEVER)) as u8;
-                        assert!(bar <= base.max(room_bar), "(I2) {ctx}");
-                        match regime {
-                            Raise => assert!(bar <= base.max(c), "{ctx}"),
-                            Limited => assert!(bar <= base.max(h) && floor + CTX_FLOOR_MIN_ROOM > c, "{ctx}"),
-                            Probe => assert!(!confirmed && bar <= base.max(h.max(floor.saturating_add(1))), "{ctx}"),
-                            Stopped => assert!(confirmed && floor + CTX_FLOOR_MIN_ROOM > h, "{ctx}"),
-                            // 순수 `ctx_floor_bar` 는 Backlog 를 내지 않는다(복원 끝이 필요 — `ctx_floor_bar_measured`).
-                            Backlog => panic!("ctx_floor_bar 가 Backlog — {ctx}"),
-                        }
-                    }
-                }
-            }
-        }
+    fn g3role_1_slow_restore_growth_does_not_fire() {
+        let seat = Seat { restore_secs: 240.0, hb: (0.0, 0.0), secs: 3.0 * 3600.0, ..Seat::master200() };
+        let run = drive(seat);
+        assert_eq!(run.fires.len(), 1, "부트 뒤 발화 {:?}", run.fires);
+        assert_i1(&run, "G3ROLE-1");
     }
 
-    // ───────────── 좌석 모형 — ① 유휴 고리 0 · ② 필요 clear 누락 0 ─────────────
-
-    /// ★(RR3-R1-1 · G3ROLE-1 · ①) **유휴 좌석은 부트 첫 교차 1회 뒤 다시 발화하지 않는다** — clear 뒤 바닥 0~100% ×
-    /// 복원 성장(0·4·8.45·12%p) × 복원 시간(40·240·500초) × 창(200K·1M·미상) × 기본 임계(60·90), 유휴 3시간. 단 하나의
-    /// 예외: 붙여넣기·복원만으로 max(기본, 차단 상한)을 넘는 좌석은 정착 창 뒷문이 **1회** 더 clear 해 보고 멈춘다(총 2회).
-    /// 종전(52b8c656)은 200K 바닥 71 이상에서 CSO 사이클마다(여기선 약 90초마다) 끝없이 발화했다.
+    /// ROLE-R4-1·R2NC5-1: 여유 master + 사이클이 붙잡은 몰림 3×3%p + 분당 0.5%p — 차단기 오판으로 영구 무clear 가 되지 않는다.
     #[test]
-    fn ctx_loop_guard_idle_seat_never_reenters_the_clear_loop() {
-        for win in WINDOWS {
-            for base in [60u8, 90] {
-                for paste in (0..=100).step_by(1) {
-                    for (restore, restore_secs) in [(0.0, 40.0), (4.0, 40.0), (8.45, 240.0), (12.0, 500.0)] {
-                        let seat = Seat { restore_secs, ..Seat::idle(base, win, f64::from(paste), restore) };
-                        let run = run_seat(seat, 3.0 * 3600.0);
-                        let floor = (f64::from(paste) + restore).min(100.0).round().max(3.0) as u8;
-                        let expect = if floor >= base.max(ctx_floor_hard_cap(win)) { 2 } else { 1 };
-                        assert_eq!(run.fires.len(), expect,
-                                   "창 {win:?} 기본 {base} 붙여넣기 {paste} 복원 +{restore}/{restore_secs}s: 유휴 좌석 발화 {:?}",
-                                   run.fires);
-                    }
-                }
-            }
-        }
+    fn role_r4_1_roomy_master_with_held_backlog_keeps_clearing() {
+        let seat = Seat { restore_secs: 14.0, burst: (3, 3.0, 10.0), work: (60.0, 0.5, 30.0), secs: 6.0 * 3600.0, ..Seat::master200() };
+        let run = drive(seat);
+        assert_keeps_firing(&run, &seat, 4, "ROLE-R4-1");
+        assert_i1(&run, "ROLE-R4-1");
     }
 
-    /// ★(② 무clear 금지) **바닥 위로 실제로 자란 컨텍스트는 발화한다** — 같은 전수에서 복원·정착 뒤 쉬었다가 30초마다
-    /// 약 0.5%p 씩 자라는 좌석: 첫 clear 뒤 발화가 반드시 나고, 그 pct 는 max(기본, 바닥 + ROOM) 이하(100 초과 제외)·
-    /// 영역의 상한 이하이며, 바닥 위 성장은 최소 여유 이상(Probe 는 1%p 이상)이다.
+    /// RV2NC-E20-1: 유휴 + 되풀이 몰림 9%p + 주기 신호 — 몰림+주기 신호 고리 없음(clear ≤ 2 + 성장/5).
     #[test]
-    fn ctx_loop_guard_clears_every_seat_that_really_grows_past_its_floor() {
-        for win in WINDOWS {
-            for base in [60u8, 90] {
-                for paste in 0..=100u8 {
-                    let seat = Seat { work_after: 700.0, work_per_min: 1.0, ..Seat::idle(base, win, f64::from(paste), 0.0) };
-                    let run = run_seat(seat, 4.0 * 3600.0);
-                    let floor = paste.max(3); // 붙여넣기 전 clear 직후 3% 도 정착 창 안이다
-                    let (bar, regime) = ctx_floor_bar(floor, base, win, false);
-                    let ctx = format!("창 {win:?} 기본 {base} 바닥 {floor} → {bar} {regime:?}: {:?}", run.fires);
-                    if floor >= base.max(ctx_floor_hard_cap(win)) {
-                        // 붙여넣기만으로 뒷문 높이 위 — 정착 창 뒷문 1회(Probe) → 다음 세션은 증명·확인된 Stopped(바닥+10).
-                        assert_eq!(run.fires.get(1).map(|f| (f.1, f.2)), Some((floor, backstop(floor, CtxFloorRegime::Probe).unwrap())), "{ctx}");
-                        let stop = u16::from(floor) + u16::from(CTX_FLOOR_MIN_GROWTH);
-                        if stop <= 100 {
-                            assert_eq!(run.fires.get(2).map(|f| (f.1, f.2)), Some((stop as u8, post(floor, CtxFloorRegime::Stopped).unwrap())),
-                                       "(②) Stopped 좌석이 바닥+10 까지 자랐는데 clear 되지 않았다 — {ctx}");
-                        } else {
-                            assert_eq!(run.fires.len(), 2, "{ctx}");
-                        }
-                        continue;
-                    }
-                    if bar > 100 {
-                        assert_eq!(run.fires.len(), 1, "바닥 {floor}: 닿을 수 없는 임계에서 발화했다");
-                        continue;
-                    }
-                    assert!(run.fires.len() >= 2, "(②) 자란 좌석이 clear 되지 않았다 — {ctx}");
-                    let (_, p, f, _) = run.fires[1];
-                    assert_eq!(f.floor, Some(floor), "{ctx}");
-                    assert!(p >= bar && p <= bar + 1, "(②) 실효 임계 {bar} 에서 발화하지 않았다(pct {p}) — {ctx}");
-                    let room_bar = (u16::from(floor) + u16::from(CTX_FLOOR_ROOM)) as u8;
-                    assert!(p <= base.max(room_bar) + 1, "(②) 바닥+ROOM 을 넘도록 끌었다 — {ctx}");
-                    if bar > base {
-                        let min_room = if regime == CtxFloorRegime::Probe { 1 } else { CTX_FLOOR_MIN_ROOM };
-                        assert!(p >= floor + min_room, "(①) 바닥 위 성장 {}%p 로 발화 — {ctx}", p - floor);
-                    }
-                }
-            }
-        }
+    fn rv2nc_e20_1_idle_recurring_backlog_does_not_loop() {
+        let seat = Seat { burst: (3, 3.0, 10.0), ..Seat::master200() };
+        let run = drive(seat);
+        assert_idle_bound(&run, &seat, "RV2NC-E20-1");
+        assert_i1(&run, "RV2NC-E20-1");
     }
 
-    /// ★(① 작업이 사이클을 부른다) 일하는 좌석의 사이클 수는 실제 성장량 ÷ 최소 여유로 묶인다 — 200K master(바닥 63·72)·
-    /// CEO(바닥 69→복원 78)·worker(바닥 30) · 1M 각각 분당 0.2~2%p 로 6시간. 모든 clear 뒤 발화는 바닥 위 최소 여유 이상
-    /// 자란 뒤이고(Probe 는 연속 구간당 1회만 1%p 이상), 좌석이 실효 임계를 한 보고 넘게 넘어 끌려가지 않는다(②).
+    /// RV2NC-E20-2: 복원 턴 도중 들어온 입력(몰림 3×3.3%p)이 복원 끝에 곧바로 이어져도 + 분당 0.55%p — 계속 clear 한다
+    /// (가드 밖 채널 보류·스케줄 우회 없이).
     #[test]
-    fn ctx_loop_guard_working_seats_cycle_only_as_often_as_they_grow() {
-        let profiles = [
-            ("200K master", W200K, 63.3, 8.9),
-            ("200K master 72", W200K, 72.0, 0.0),
-            ("200K CEO", W200K, 68.9, 8.45),
-            ("200K worker", W200K, 25.0, 5.0),
-            ("1M master", W1M, 13.0, 2.0),
-            ("미상 CEO", None, 68.9, 8.45),
-        ];
-        for (name, win, paste, restore) in profiles {
-            for rate in [0.2, 0.5, 1.0, 2.0] {
-                let seat = Seat { restore_secs: 240.0, work_after: 0.0, work_per_min: rate, ..Seat::idle(60, win, paste, restore) };
-                let run = run_seat(seat, 6.0 * 3600.0);
-                let mut backstops_in_a_row = 0;
-                let mut prev_tier3 = false;
-                for (t, p, f, _) in run.fires.iter().skip(1) {
-                    let tier3 = f.settle_backstop || matches!(f.regime, Some(CtxFloorRegime::Probe | CtxFloorRegime::Stopped));
-                    assert!(!(prev_tier3 && f.regime == Some(CtxFloorRegime::Probe)),
-                            "{name} 분당 {rate}: 차단 상한 근처 세션 뒤 또 Probe — 바닥+1%p 마다 도는 고리(①) {:?}", run.fires);
-                    prev_tier3 = tier3;
-                    let floor = f.floor.expect("clear 뒤 발화에는 잰 바닥이 있다");
-                    let ctx = format!("{name} 분당 {rate}: t={t} pct={p} {f:?}");
-                    if f.settle_backstop {
-                        // 정착 창 뒷문 — clear 직후 차단 상한을 넘게 빠르게 자랐다(연속 세션에서 두 번 쓰지 않는다).
-                        backstops_in_a_row += 1;
-                        assert!(backstops_in_a_row <= 1 && *p >= ctx_floor_hard_cap(win), "{ctx}");
-                        continue;
-                    }
-                    backstops_in_a_row = 0;
-                    let min_room = if f.regime == Some(CtxFloorRegime::Probe) { 1 } else { CTX_FLOOR_MIN_ROOM };
-                    assert!(p.saturating_sub(floor) >= min_room, "(①) 바닥 {floor} 위 {}%p 로 발화 — {ctx}", p.saturating_sub(floor));
-                }
-                // 사이클 수는 성장량이 부른다(1%p 당 1회를 넘지 않는다 — 시간·경보 쿨다운이 아니라).
-                let grown = rate * 6.0 * 60.0;
-                assert!((run.fires.len() as f64) <= 2.0 + grown,
-                        "{name} 분당 {rate}: 사이클 {} 회 > 성장 {grown}%p — 작업보다 사이클이 많다", run.fires.len());
-                assert!(run.max_pct <= 100);
-            }
-        }
+    fn rv2nc_e20_2_input_during_restore_keeps_clearing() {
+        let seat = Seat { burst: (3, 3.3, 10.0), work: (60.0, 0.55, 30.0), ..Seat::master200() };
+        let run = drive(seat);
+        assert_keeps_firing(&run, &seat, 4, "RV2NC-E20-2");
+        assert_i1(&run, "RV2NC-E20-2");
     }
 
-    /// ★(RR3-R1-1 드릴 · 회귀 핀) 200K master 가 바닥 72 로 clear 된 뒤 40분 유휴 — 사이클 0(종전 7회/40분 · HEAD~1 1회).
-    /// 바닥 72 는 천장 75 아래 여유가 3%p 뿐이라 차단 상한 80 에서 clear 한다(Limited — 작업 8%p 마다).
+    /// RV2NC-E20-3: 사이클이 끝내 오지 않는 좌석(집행 실패 · CSO 부재 · 자동 압축 끔 — 압축도 없다) — 영구 정지 없이
+    /// 백오프(15·30·60·120분)로 다시 통보한다. (자동 압축이 켜진 좌석은 사이클 전 압축이 그 발화의 결과를 정한다 — 효과 없음
+    /// 아님 · `drop_in_awaiting_resolves_without_strike`.)
     #[test]
-    fn ctx_loop_guard_rr3_drill_idle_200k_master_at_floor_72_gets_no_cycle() {
-        for win in [W200K, None] {
-            let run = run_seat(Seat::idle(60, win, 72.0, 0.0), 40.0 * 60.0);
-            assert_eq!(run.fires.len(), 1, "창 {win:?}: {:?}", run.fires);
-        }
-        // 같은 좌석이 일하면 80% 에서 clear(바닥 72 위 8%p) — 무clear 아님.
-        let seat = Seat { work_after: 400.0, work_per_min: 1.0, ..Seat::idle(60, W200K, 72.0, 0.0) };
-        let run = run_seat(seat, 40.0 * 60.0);
-        assert!(run.fires.len() >= 2, "{:?}", run.fires);
-        assert_eq!((run.fires[1].1, run.fires[1].2), (80, post(72, CtxFloorRegime::Limited).unwrap()));
+    fn rv2nc_e20_3_failed_cycle_refires_after_backoff() {
+        let seat = Seat { exec_fail: true, autocompact: false, work: (60.0, 0.3, 20.0), secs: 12.0 * 3600.0, ..Seat::master200() };
+        let run = drive(seat);
+        assert!(run.fires.len() >= 5, "사이클 없는 좌석의 재통보 {:?}", run.fires);
+        assert!(run.strikes.iter().all(|w| *w == Why::NoCycle) && !run.strikes.is_empty(), "{:?}", run.strikes);
+        let gaps: Vec<f64> = run.fires.windows(2).map(|w| w[1].0 - w[0].0).collect();
+        assert!(gaps.iter().all(|g| *g <= 1200.0 + 7200.0 + 2.0), "백오프 상한(시한 + 120분)을 넘는 간격: {gaps:?}");
+        assert!(gaps.last().is_some_and(|g| *g >= 1200.0 + 7200.0 - 2.0), "연속 실패가 상한 백오프에 닿지 않았다: {gaps:?}");
+        assert_i1(&run, "RV2NC-E20-3");
     }
 
-    /// ★(G3ROLE-1) 200K CEO — 재주입 68.9% → 5분 안 복원 +8.45%p(77.35%): 종전은 교차 시점(69) 기준으로 75 로 올린 뒤
-    /// 복원 도중 75% 에서 작업 0 으로 발화했다(사이클마다). 이제 복원 끝까지 바닥으로 재므로(78 — 차단 상한 근처) 유휴면
-    /// 발화 0 · 일하면 1회 재시도(80%) 뒤 자동 clear 를 멈추고(Stopped) 바닥+10(88%)에서만 다시 clear 한다.
-    /// master(63.3 → 72.2)는 Limited — 80% 까지 약 8%p 일한 뒤에만 clear.
+    /// RV2-ROLE-1: 턴 도중 압축(480초 턴 16%p · 재읽기 33) — 압축 뒤 재측정으로 cys clear 를 계속 받는다.
     #[test]
-    fn ctx_loop_guard_g3role_restore_growth_is_part_of_the_floor() {
-        let ceo = Seat { restore_secs: 30.0, ..Seat::idle(60, W200K, 68.9, 8.45) };
-        assert_eq!(run_seat(ceo, 3600.0).fires.len(), 1, "200K CEO 유휴 재발화");
-        let run = run_seat(Seat { work_after: 700.0, work_per_min: 0.5, ..ceo }, 4.0 * 3600.0);
-        let post_clear: Vec<_> = run.fires.iter().skip(1).map(|(_, p, f, _)| (*p, f.regime)).collect();
-        assert_eq!(post_clear.first(), Some(&(80, Some(CtxFloorRegime::Probe))), "{post_clear:?}");
-        assert!(post_clear.iter().skip(1).all(|(p, r)| *r == Some(CtxFloorRegime::Stopped) && *p >= 87),
-                "Probe 뒤에는 Stopped(바닥+10)에서만 clear — {post_clear:?}");
-        let master = Seat { restore_secs: 240.0, ..Seat::idle(60, W200K, 63.3, 8.9) };
-        assert_eq!(run_seat(master, 3600.0).fires.len(), 1, "200K master 유휴 재발화");
-        let run = run_seat(Seat { work_after: 60.0, work_per_min: 0.5, ..master }, 3.0 * 3600.0);
-        assert!(run.fires.len() >= 3, "{:?}", run.fires);
-        for (_, p, f, restored) in run.fires.iter().skip(1) {
-            assert_eq!((*p, f.regime), (80, Some(CtxFloorRegime::Limited)), "{:?}", run.fires);
-            assert!(f64::from(*p) - restored >= 7.0, "master 가 복원 뒤 7%p 도 일하지 않고 clear 됐다: {:?}", run.fires);
-            assert!(p - f.floor.unwrap() >= CTX_FLOOR_MIN_ROOM, "{:?}", run.fires);
-        }
+    fn rv2_role_1_mid_turn_compaction_keeps_clearing() {
+        let seat = Seat { work: (480.0, 16.0, 480.0), reread: 33.0, secs: 6.0 * 3600.0, ..Seat::master200() };
+        let run = drive(seat);
+        assert_keeps_firing(&run, &seat, 3, "RV2-ROLE-1");
+        assert_i1(&run, "RV2-ROLE-1");
     }
 
-    /// ★(자기 반례 · ①) 차단 상한 근처 바닥(200K 78)의 **바쁜** 좌석 — 분당 0.3~1%p 가 복원 직후부터 이어진다(주기 신호·
-    /// 관리 작업). 재시도(Probe · 80%)는 1회뿐이고 그 뒤 세션은 확인된 Stopped(바닥+10)라, 작업 1~2%p 마다 지침 전문을
-    /// 다시 붙여 넣는 사이클이 없다(흡수한 작업이 바닥을 올려도 마찬가지).
+    /// ADV2-R1-1: 가득 찬 CEO(69.35 + 8.45 + 몰림 2×3.25 = 84.3) · 24시간 — clear→압축→재무장 고리가 백오프 상한에 묶인다.
     #[test]
-    fn ctx_loop_guard_busy_seat_near_the_hard_cap_does_not_probe_every_cycle() {
-        for rate in [0.3, 0.5, 1.0] {
-            let seat = Seat { restore_secs: 30.0, work_after: 0.0, work_per_min: rate, ..Seat::idle(60, W200K, 70.0, 8.0) };
-            let run = run_seat(seat, 6.0 * 3600.0);
-            let probes = run.fires.iter().filter(|f| f.2.regime == Some(CtxFloorRegime::Probe) && !f.2.settle_backstop).count();
-            let backstops = run.fires.iter().filter(|f| f.2.settle_backstop).count();
-            assert!(probes + backstops <= 1, "분당 {rate}: 재시도가 {probes}+{backstops} 회 — {:?}", run.fires);
-            for (_, p, f, _) in run.fires.iter().skip(2) {
-                assert_eq!(f.regime, Some(CtxFloorRegime::Stopped), "분당 {rate}: {:?}", run.fires);
-                assert!(p - f.floor.unwrap() >= CTX_FLOOR_MIN_GROWTH, "분당 {rate}: {:?}", run.fires);
-            }
-        }
+    fn adv2_r1_1_truly_full_ceo_is_bounded_by_backoff() {
+        let seat = Seat { paste: 69.35, restore: 8.45, burst: (2, 3.25, 10.0), reread: 33.0, secs: 24.0 * 3600.0, ..Seat::master200() };
+        let run = drive(seat);
+        let late = run.fires.iter().filter(|f| f.0 >= 12.0 * 3600.0).count();
+        assert!(!run.fires.is_empty() && late <= 7, "후반 12시간 발화 {late} > 7 · {:?}", run.fires);
+        assert_i1(&run, "ADV2-R1-1");
     }
 
-    /// ★(자기 반례 · ② · 차단기 오판) 바닥은 **clear 사이클 자신의 입력(붙여넣기 → 복원 턴)이 끝난 뒤** 정해진다 — 복원
-    /// 턴이 끝나 좌석 출력이 조용해지면 정착 창을 닫는다. 종전(시간 창만 · 오르는 동안 최대 600초)은 복원 뒤 곧바로 들어온
-    /// 작업(대기열 배달·push 한 턴씩)을 바닥에 흡수했다 — 바쁜 200K master(참 바닥 72)가 77~85 로 재여 Probe → Stopped
-    /// (바닥+10 = 86~95%)로 오판됐다(샌드박스 final-m200-work 94.9% · final-c200-work 97.9%): 선제 압축점(83.5%) 위라 cys
-    /// clear 가 안 나거나(Claude 압축이 먼저) 자동 압축을 끈 좌석은 차단점(88.5%)에서 멈춘다(R2NC3-1 의 재발).
-    /// 참 바닥에 여유가 있는 좌석은 일하는 동안 **언제나** 정상·Limited 영역에서 max(기본, 차단 상한) 이하로 clear 된다.
-    /// 복원이 최소 창([`CTX_FLOOR_SETTLE_MIN_SECS`])보다 짧고 작업이 그 안에 오면 그 몫(분당 성장 × 최소 창 + 한 턴)만 든다.
+    /// RV3NC-1·ROLE-R5-1·R1V3-3: 여유 master(72) + 붙잡힌 몰림 5%p + 몰림 직후 끊김 없는 긴 작업 턴(480초 · 8%p · 턴 도중 압축 ·
+    /// 재읽기 33) — 69e3dda6 은 막대 101 로 영구히 잠겼다(모형 360 조합 중 168). 영구·장기 무clear 없음(I2).
     #[test]
-    fn ctx_loop_guard_busy_seat_floor_is_the_restore_turn_not_the_work_after_it() {
-        let profiles = [
-            ("200K master", W200K, 63.3, 8.9, 80u8),
-            ("미상 master", None, 63.3, 8.9, 80),
-            ("200K master 70", W200K, 66.0, 4.0, 80),
-            ("200K worker", W200K, 25.0, 5.0, 60),
-            ("1M CEO", W1M, 14.0, 1.7, 60),
-        ];
-        for (name, win, paste, restore, cap) in profiles {
-            for rate in [0.5, 1.0, 2.0] {
-                for turn_secs in [20.0, 45.0] {
-                    for restore_secs in [30.0, 120.0, 280.0] {
-                        let seat = Seat { restore_secs, work_after: 5.0, work_per_min: rate, turn_secs,
-                                          ..Seat::idle(60, win, paste, restore) };
-                        let run = run_seat(seat, 6.0 * 3600.0);
-                        let restored = (paste + restore).round() as u8;
-                        // 복원이 최소 창보다 짧으면 그 안에 든 작업(최소 창 + 한 턴)까지는 바닥이다.
-                        let absorbed = if restore_secs < CTX_FLOOR_SETTLE_MIN_SECS {
-                            (rate * (CTX_FLOOR_SETTLE_MIN_SECS / 60.0 + 1.0)).ceil() as u8
-                        } else {
-                            0
-                        };
-                        let ctx = format!("{name} 분당 {rate} 턴 {turn_secs}s 복원 {restore_secs}s: {:?}", run.fires);
-                        assert!(run.fires.len() >= 3, "(②) 일하는 좌석이 clear 되지 않았다 — {ctx}");
-                        for (_, p, f, _) in run.fires.iter().skip(1) {
-                            let floor = f.floor.expect("clear 뒤 발화에는 잰 바닥이 있다");
-                            assert!(floor <= restored + absorbed + 1,
-                                    "바닥에 복원 턴 뒤 작업이 흡수됐다(잰 {floor} · 복원 끝 {restored}) — {ctx}");
-                            assert!(matches!(f.regime, Some(CtxFloorRegime::Raise | CtxFloorRegime::Limited)),
-                                    "차단기 오판 — 여유 있는 바쁜 좌석이 Probe·Stopped 로 갔다 — {ctx}");
-                            assert!(!f.settle_backstop, "{ctx}");
-                            assert!(*p <= cap + 1, "(②) {p}% 까지 clear 가 늦었다(상한 {cap}) — {ctx}");
-                        }
-                        assert!(run.max_post_clear <= cap + 1, "(②) 좌석이 {}% 까지 끌려갔다 — {ctx}", run.max_post_clear);
-                    }
-                }
-            }
-        }
-    }
-
-    /// ★(자기 반례 탐색 · 결정론 난수 1500 좌석) 붙여넣기 0~95% × 복원 0~15%p·20~300초 × 창(200K·1M·미상) × 기본 임계
-    /// 60·75 × 작업 0~3%p/분 · 턴 10~50초(매 분 · 턴 사이는 조용) × 사이클 지연 20~120초, 3시간:
-    /// (①) 유휴면 부트 1회(+ 붙여넣기·복원만으로 뒷문 높이 위면 1회) · 일하면 모든 clear 뒤 발화가 잰 바닥 위로 최소 여유
-    ///     (Probe 1%p) 이상 자란 뒤(뒷문 제외)이고 사이클 수 ≤ 2 + 실제 성장(%p).
-    /// (② · 오판) 참 바닥(복원 끝) + 흡수 몫(복원이 최소 창보다 짧을 때만) + 1 에 최소 여유가 있는 좌석은 Raise·Limited 로만
-    ///     clear 되고 그 pct 는 max(기본, 차단 상한) + 1 이하 · 잰 바닥은 참 바닥 + 흡수 몫 + 1 이하.
-    #[test]
-    fn ctx_loop_guard_randomized_seats_keep_both_invariants() {
-        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
-        let mut rnd = |lo: f64, hi: f64| {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            lo + (hi - lo) * ((state >> 11) as f64 / (1u64 << 53) as f64)
+    fn rv3nc_1_roomy_seat_long_turn_after_held_backlog_never_locks() {
+        let seat = Seat {
+            burst: (3, 1.67, 10.0),
+            late: Some((45.0, 8.0, 480.0)),
+            reread: 33.0,
+            work: (480.0, 8.0, 480.0),
+            secs: 6.0 * 3600.0,
+            ..Seat::master200()
         };
-        for case in 0..1500 {
-            let win = WINDOWS[(rnd(0.0, 3.0) as usize).min(2)];
-            let base = if rnd(0.0, 1.0) < 0.8 { 60 } else { 75 };
-            let paste = rnd(0.0, 95.0).round();
-            let restore = if rnd(0.0, 1.0) < 0.2 { 0.0 } else { rnd(0.0, 15.0) };
-            let restore_secs = rnd(20.0, 300.0);
-            let work_per_min = if rnd(0.0, 1.0) < 0.3 { 0.0 } else { rnd(0.1, 3.0) };
-            let turn_secs = rnd(10.0, 50.0);
-            let seat = Seat { base, window: win, paste, restore, restore_secs, work_after: rnd(5.0, 60.0), work_per_min, turn_secs,
-                              cycle_delay: rnd(20.0, 120.0), quiesce: rnd(5.0, 30.0), ..Seat::idle(base, win, paste, restore) };
-            let run = run_seat(seat, 3.0 * 3600.0);
-            let ctx = format!("case {case} {seat:?}: {:?}", run.fires);
-            let h = ctx_floor_hard_cap(win);
-            let restored = (paste + restore).min(100.0).round().max(3.0) as u16;
-            if work_per_min == 0.0 {
-                let expect = if restored >= u16::from(base.max(h)) { 2 } else { 1 };
-                assert!(run.fires.len() <= expect, "(①) 유휴 좌석 재발화 — {ctx}");
-                continue;
-            }
-            let grown = work_per_min * 3.0 * 60.0;
-            assert!((run.fires.len() as f64) <= 2.0 + grown, "(①) 사이클이 성장보다 많다 — {ctx}");
-            let absorbed = if restore_secs < CTX_FLOOR_SETTLE_MIN_SECS {
-                (work_per_min * (CTX_FLOOR_SETTLE_MIN_SECS / 60.0 + 1.0)).ceil() as u16
-            } else {
-                0
+        let run = drive(seat);
+        assert_keeps_firing(&run, &seat, 3, "RV3NC-1");
+        assert!(run.fires.last().is_some_and(|f| f.0 >= seat.secs - I2_BOUND), "마지막 발화가 너무 이르다(잠김) · {:?}", run.fires);
+        assert_i1(&run, "RV3NC-1");
+    }
+
+    /// RV3NC-2: 붙잡힌 몰림(5%p) + 몰림 뒤 회신 1건(200초 뒤 2.9%p) · 작업 0 — 회신 하나로 매 사이클 clear 되는 고리 없음.
+    #[test]
+    fn rv3nc_2_late_reply_after_backlog_does_not_loop() {
+        let seat = Seat { burst: (1, 5.0, 10.0), late: Some((200.0, 2.9, 10.0)), ..Seat::master200() };
+        let run = drive(seat);
+        assert_idle_bound(&run, &seat, "RV3NC-2");
+        assert_i1(&run, "RV3NC-2");
+    }
+
+    /// RV3NC-3·ROLE-R5-4: 자동 압축을 끈 여유 master + 몰림 5%p + 분당 0.5%p — 막대가 차단점(88.5%) 아래라 차단 전에 clear 된다.
+    #[test]
+    fn rv3nc_3_autocompact_off_is_cleared_below_the_blocking_point() {
+        let seat = Seat { autocompact: false, burst: (3, 1.67, 10.0), work: (60.0, 0.5, 60.0), secs: 6.0 * 3600.0, ..Seat::master200() };
+        let run = drive(seat);
+        assert_eq!(run.secs_above_block, 0.0, "차단점 위 체류 {}초 · {:?}", run.secs_above_block, run.fires);
+        assert_keeps_firing(&run, &seat, 4, "RV3NC-3");
+        assert_i1(&run, "RV3NC-3");
+    }
+
+    /// R1V3-1: 몰림 3×3%p + 60초마다 짧은 작업(약 0.39%p/분) — 사이클당 성장 2%p 마다 clear 되는 고리 없음(clear ≤ 2 + 성장/5).
+    #[test]
+    fn r1v3_1_small_steady_work_is_bounded_by_growth() {
+        let seat = Seat { burst: (3, 3.0, 10.0), work: (60.0, 0.39, 10.0), secs: 3.0 * 3600.0, ..Seat::master200() };
+        let run = drive(seat);
+        assert_idle_bound(&run, &seat, "R1V3-1");
+        assert_i1(&run, "R1V3-1");
+    }
+
+    /// R1V3-2: 같은 발화의 두 번째 배달(라우터 보류 뒤 · 사이클이 이미 끝났다)은 stale — 집행자가 건너뛴다. 사이클 도중·Awaiting
+    /// 동안의 재교차는 새 발화가 아니다.
+    #[test]
+    fn r1v3_2_duplicate_delivery_after_the_cycle_is_stale() {
+        let mut g = ClearGuard::default();
+        assert!(fired(&rep(&mut g, 81, "s0", 0.0)));
+        assert!(!fired(&rep(&mut g, 84, "s0", 300.0)), "Awaiting 중 재교차가 새 발화가 됐다");
+        g.cycle(true, 500.0, false);
+        assert!(!fired(&rep(&mut g, 33, "s0", 510.0)));
+        g.cycle(false, 530.0, false);
+        assert!(g.stale(1), "사이클이 끝난 뒤 도착한 같은 경보를 다시 집행한다(중복 사이클)");
+        assert!(!fired(&rep(&mut g, 64, "s1", 600.0)), "재주입 직후 수준(창 안)에서 기본 임계 재발화");
+    }
+
+    // ───────────── ③ 성질 검체(무작위 사건열 1만 씨앗 · 결정론) ─────────────
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn f(&mut self) -> f64 {
+            (self.next() % 1_000_000) as f64 / 1_000_000.0
+        }
+        fn pick(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PropStats {
+        seeds: u64,
+        fires: usize,
+        min_spacing: f64,
+        max_hour: usize,
+        v_await: usize,
+        v_cyc: usize,
+        v_meas: usize,
+        v_hold: usize,
+        v_retry: usize,
+        v_bar: usize,
+        retries_ok: usize,
+        v_i3: usize,
+    }
+
+    /// 참조 구현 prop.rs 이식 — 두 축 관측 · 범위 교대(헬퍼·다른 파일) · 낡은 자기보고 되풀이 · 압축 낙폭 · 사이클 표지(발화 뒤
+    /// 지연·실패·늦음·외부) · 배달 동결 · 창 전환 · 틱. 오라클은 가드의 창 시작·끝만 받고 값은 따로 센다(차분).
+    fn prop_run(seeds: u64) -> PropStats {
+        let mut st = PropStats { seeds, min_spacing: f64::INFINITY, ..Default::default() };
+        for seed in 1..=seeds {
+            let mut r = Rng(0x9E3779B97F4A7C15 ^ seed.wrapping_mul(0x2545F4914F6CDD1D));
+            let mut g = ClearGuard::default();
+            let mut t = 0.0f64;
+            let mut x: f64 = 20.0 + r.f() * 60.0;
+            let mut window = match r.pick(4) {
+                0 => None,
+                1 => Some(1_000_000u64),
+                _ => Some(200_000u64),
             };
-            let roomy = restored + absorbed + 1 + u16::from(CTX_FLOOR_MIN_ROOM) <= u16::from(h);
-            for (_, p, f, _) in run.fires.iter().skip(1) {
-                let floor = u16::from(f.floor.expect("clear 뒤 발화의 잰 바닥"));
-                let min_room = if f.regime == Some(CtxFloorRegime::Probe) { 1 } else { u16::from(CTX_FLOOR_MIN_ROOM) };
-                if !f.settle_backstop && f.regime != Some(CtxFloorRegime::Stopped) && u16::from(*p) < 100 {
-                    assert!(u16::from(*p) >= floor + min_room.min(100 - floor), "(①) 바닥 {floor} 위 {p} — {ctx}");
+            let base = [60u8, 60, 70, 80][r.pick(4) as usize];
+            let rate = [0.0, 0.05, 0.2, 0.5, 1.0, 3.0][r.pick(6) as usize] / 60.0;
+            let self_mode = r.pick(3);
+            let sr_stale: Option<u8> = if r.pick(3) == 0 { Some(40 + r.pick(50) as u8) } else { None };
+            let mut sess = 0u32;
+            let mut fires: Vec<f64> = vec![];
+            let mut sched: Vec<(f64, bool)> = vec![];
+            let mut frozen_until = -1.0f64;
+            let mut await_since: Option<f64> = None;
+            let mut last_frozen = -1e9f64;
+            let mut held_pending: Option<f64> = None;
+            // 오라클 창: (시작, 끝, 축별 S 미만 최고치, 열림, 창)
+            let mut win: (f64, f64, [Option<u8>; 2], bool, Option<u64>) = (0.0, 0.0, [None; 2], false, None);
+            let mut m_missing = false;
+            let horizon = 6.0 * 3600.0;
+            while t < horizon {
+                let dt = 1.0 + r.f() * 20.0;
+                let prev_t = t;
+                t += dt;
+                let frozen = t < frozen_until;
+                if frozen {
+                    last_frozen = t;
                 }
-                assert!(floor <= restored + absorbed + 1, "잰 바닥 {floor} > 참 바닥 {restored} + 흡수 {absorbed} + 1 — {ctx}");
-                if roomy {
-                    assert!(matches!(f.regime, Some(CtxFloorRegime::Raise | CtxFloorRegime::Limited)), "(오판) {ctx}");
-                    assert!(u16::from(*p) <= u16::from(base.max(h)) + 1, "(②) {p}% 까지 clear 가 늦었다 — {ctx}");
+                x += rate * dt;
+                if r.pick(60) == 0 {
+                    x += r.f() * 8.0;
                 }
-            }
-        }
-    }
-
-    /// 정착 창의 조용함 닫힘(`note_idle`) 세부 — 닫는 조건 넷(틈 길이 ≥ 2초 · 시작점 **뒤**에 시작 · 시작점 + 최소 창 이후까지
-    /// 이어짐 · 시작점 뒤 관측 있음)이 다 있어야 닫고, 닫힌 뒤의 관측은 바닥에 들지 않으며(막대는 닫힐 때 바닥에서) 정착 창
-    /// 뒷문도 없다. 다음 세션 교체는 다시 연다. 조용함 신호가 없으면(`NONE`) 종전 시간 창 그대로(실패 방향 — 늦게 닫힘).
-    #[test]
-    fn ctx_loop_guard_idle_closes_the_settle_window_only_after_the_restore_turn() {
-        let setup = || {
-            let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-            assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-            clear(&mut g, &mut armed, 100.0);
-            g.note_quiescing(110.0); // 사이클이 붙여넣기까지 — 시작점 110
-            (g, armed)
-        };
-        let min = CTX_FLOOR_SETTLE_MIN_SECS;
-        // ① 시작점 뒤 관측(복원 끝 72) + 최소 창 뒤까지 이어진 조용함 → 닫힘.
-        let (mut g, mut armed) = setup();
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, 150.0), None);
-        g.note_idle(150.0, 110.0 + min - 1.0, 110.0 + min - 1.0);
-        assert!(g.settling(110.0 + min - 1.0), "최소 창 전의 조용함이 창을 닫았다");
-        g.note_idle(150.0, 110.0 + min, 110.0 + min);
-        assert!(!g.settling(110.0 + min), "복원 턴이 끝난 조용함이 창을 닫지 않았다");
-        // 닫힌 뒤 작업(75·79)은 바닥에 들지 않는다 — 막대는 닫힌 바닥 72 에서(Limited 80) · 뒷문 없음.
-        assert_eq!(report(&mut g, &mut armed, 75, 60, W200K, 200.0), None);
-        assert_eq!(report(&mut g, &mut armed, 79, 60, W200K, 230.0), None);
-        assert_eq!(g.settle_peak, Some(72), "닫힌 뒤 작업이 바닥에 들었다");
-        assert_eq!(g.effective_threshold(60, W200K, 230.0), 80);
-        assert_eq!(report(&mut g, &mut armed, 80, 60, W200K, 260.0), post(72, CtxFloorRegime::Limited), "(②) 닫힌 바닥 위 성장");
-        // ② 짧은 틈(< 2초)·시작점 전에 시작한 틈·시작점 뒤 관측 없음은 닫지 않는다.
-        let (mut g, mut armed) = setup();
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, 150.0), None);
-        g.note_idle(300.0, 300.0 + CTX_FLOOR_IDLE_QUIET_SECS - 0.1, 301.0);
-        g.note_idle(105.0, 400.0, 400.0);
-        assert!(g.settling(400.0), "짧은 틈·시작점 전(사이클 중)부터의 조용함이 창을 닫았다");
-        let (mut g, mut armed) = setup();
-        assert_eq!(report(&mut g, &mut armed, 3, 60, W200K, 105.0), None); // 시작점 전 관측(clear 직후 3%)만
-        g.note_idle(115.0, 300.0, 300.0);
-        assert!(g.settling(300.0), "붙여넣기 턴의 보고 전에 창이 닫혔다(바닥 3% → 작업 0 발화 ①)");
-        // ③ 다음 세션 교체는 다시 연다 — 닫힘은 세션마다.
-        let (mut g, mut armed) = setup();
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, 150.0), None);
-        g.note_idle(150.0, 300.0, 300.0);
-        assert_eq!(report(&mut g, &mut armed, 80, 60, W200K, 400.0), post(72, CtxFloorRegime::Limited));
-        clear(&mut g, &mut armed, 500.0);
-        assert!(g.settling(505.0) && !g.settle_closed, "새 세션의 정착 창이 닫힌 채다");
-        // ④ 조용함 신호 없음 — 종전 시간 창(기본 300초 · 오르는 동안 최대 600초) 그대로.
-        let (mut g, mut armed) = setup();
-        let n = CtxIdleObs::NONE;
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, 150.0), None);
-        g.note_idle(n.quiet_since, 300.0, 300.0);
-        assert!(g.settling(300.0) && !g.settling(110.0 + CTX_FLOOR_SETTLE_SECS + 1.0), "신호 없음이 시간 창을 바꿨다");
-    }
-
-    // ───────────── ★(ROLE-R4-1 · R2NC5-1) 복원 끝 바닥 · 사이클이 붙잡은 배달 · Claude 압축 재무장 ─────────────
-
-    fn tier3_floor(floor: u8, window: Option<u64>) -> bool {
-        ctx_floor_bar(floor, 0, window, false).1.tier3()
-    }
-
-    /// ★(ROLE-R4-1 · R2NC5-1 · RV2NC-E20-1 · 성질 핀) 복원 끝 바닥은 **차단기만 풀고 어떤 막대도 앞당기지 않는다** — 정착 창
-    /// 최고치 0~100 × 복원 끝(없음 · 0~최고치) × 기본 임계 × 창 × 확인 전수:
-    /// (①) 막대 ≥ 정착 창 최고치의 미확인 막대(유휴 재발화 0 은 최고치 위에서 그대로 — 복원 끝 판정이 틀려 낮아도 고리 없음).
-    /// (②) 막대 ≤ 종전 막대(확인 반영) + 1 — 얇은 세션(복원 끝 여유 · 최고치 차단기 높이)의 미확인 막대만 max(차단 상한, 최고치 + 2)
-    ///     로 1%p 늦다(1%p 반올림에서 발화가 실제 성장 ≥ 1%p 를 입증하는 최소 막대 — 그 발화의 성장 속도로 확인을 가른다).
-    /// 복원 끝 바닥에 여유가 있으면(정상·Limited 높이) Probe·Stopped 가 아니다 — 얇은 세션은 미확인이면 Limited, ★(RV2NC-E20-1)
-    /// 확인(직전 clear 세션도 차단 상한 근처)이면 Backlog(최고치 + 최소 여유 — 몰림을 바닥으로 확정 · Stopped 의 + 10 보다 이르다) ·
-    /// Stopped 는 복원 끝도 차단기 높이일 때만 · 복원 끝이 없거나 최고치와 같으면 종전 판정 그대로.
-    #[test]
-    fn ctx_floor_bar_measured_only_lifts_the_breaker_never_a_bar() {
-        use CtxFloorRegime::*;
-        for win in WINDOWS {
-            let h = ctx_floor_hard_cap(win);
-            for base in [1u8, 40, 60, 75, 80, 90, 100] {
-                for settled in 0u8..=100 {
-                    for confirmed in [false, true] {
-                        let (lo, _) = ctx_floor_bar(settled, base, win, false);
-                        let old = ctx_floor_bar(settled, base, win, confirmed);
-                        assert_eq!(ctx_floor_bar_measured(settled, None, base, win, confirmed),
-                                   CtxFloorBar { bar: old.0, regime: old.1, floor: settled, settled, thin: false, tainted: false, lift: None },
-                                   "복원 끝 없음 = 종전");
-                        for r in 0u8..=settled {
-                            let m = ctx_floor_bar_measured(settled, Some(r), base, win, confirmed);
-                            let ctx = format!("창 {win:?} 기본 {base} 최고치 {settled} 복원 끝 {r} 확인 {confirmed}: {m:?}");
-                            assert!(m.bar >= lo && u16::from(m.bar) <= u16::from(old.0) + 1,
-                                    "(①·②) 막대가 미확인 막대 {lo} ~ 종전 {} + 1 밖 — {ctx}", old.0);
-                            assert_eq!((m.settled, m.floor), (settled, r), "보고 바닥은 복원 끝 — {ctx}");
-                            if m.bar > base && m.bar < CTX_FLOOR_NEVER {
-                                assert!(m.bar > settled, "(①) 정착 창 최고치에서 발화한다 — {ctx}");
+                if (x >= 83.5 && r.pick(3) == 0) || r.pick(3000) == 0 {
+                    x = 30.0 + r.f() * 40.0;
+                }
+                x = x.clamp(0.0, 100.0);
+                if r.pick(6000) == 0 {
+                    window = if window == Some(1_000_000) { Some(200_000) } else { Some(1_000_000) };
+                }
+                if r.pick(4000) == 0 {
+                    frozen_until = t + 600.0 + r.f() * 7200.0;
+                }
+                if r.pick(5000) == 0 {
+                    sched.push((t + r.f() * 60.0, true));
+                    sched.push((t + 60.0 + r.f() * 300.0, false));
+                }
+                if r.pick(300) == 0 {
+                    m_missing = !m_missing;
+                }
+                sched.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                while let Some(&(at, on)) = sched.first() {
+                    if at > t {
+                        break;
+                    }
+                    sched.remove(0);
+                    let _ = g.cycle(on, at.max(prev_t), frozen);
+                    if !on {
+                        sess += 1;
+                        x = 30.0 + r.f() * 60.0;
+                    }
+                }
+                let o = g.tick(t, frozen);
+                let fired_tick = matches!(o.verdict, Some(Verdict::Fire { .. }));
+                if let Some(h) = held_pending {
+                    if fired_tick {
+                        st.retries_ok += 1;
+                        held_pending = None;
+                    } else if t > h + 25.0 && g.phase == Phase::Free {
+                        st.v_retry += 1;
+                        held_pending = None;
+                    }
+                }
+                let mut fire_now = fired_tick;
+                if !fire_now && r.pick(3) != 0 {
+                    let (axis, scope, pct) = if self_mode == 1 || (self_mode == 2 && m_missing) {
+                        (Axis::SelfReport, String::new(), sr_stale.unwrap_or(x.round() as u8))
+                    } else if r.pick(12) == 0 {
+                        (Axis::Measured, format!("h{}", r.pick(3)), (5 + r.pick(40)) as u8)
+                    } else {
+                        (Axis::Measured, format!("s{sess}"), x.round().clamp(0.0, 100.0) as u8)
+                    };
+                    let o = g.report(&Rep { pct, window, axis, scope: &scope, base, now: t, frozen });
+                    held_pending = None;
+                    match o.verdict {
+                        Some(Verdict::Held { until, .. }) => {
+                            if until - t > CTX_GUARD_BACKOFF_MAX_SECS + 1e-6 {
+                                st.v_hold += 1;
                             }
-                            if tier3_floor(r, win) {
-                                assert_eq!((m.bar, m.regime, m.thin), (old.0, old.1, false), "참으로 가득 찬 좌석은 종전 그대로 — {ctx}");
-                            } else {
-                                assert!(!m.regime.tier3(), "여유 있는 복원 끝인데 차단기 영역 — {ctx}");
-                                if old.1.tier3() {
-                                    let s = u16::from(settled);
-                                    let want = if confirmed {
-                                        (((s + u16::from(CTX_FLOOR_MIN_ROOM) + 1).min(u16::from(CTX_FLOOR_NEVER)) as u8).max(base), Backlog)
-                                    } else {
-                                        ((u16::from(h).max(s + 2).min(u16::from(CTX_FLOOR_NEVER)) as u8).max(base), Limited)
-                                    };
-                                    assert_eq!((m.bar, m.regime, m.thin), (want.0, want.1, true), "얇은 세션 — {ctx}");
-                                    assert!(m.bar <= base || u16::from(m.bar) >= u16::from(settled) + 2 || m.bar == CTX_FLOOR_NEVER,
-                                            "(①) 얇은 세션의 발화가 실제 성장 1%p 를 입증하지 못한다 — {ctx}");
-                                } else {
-                                    assert_eq!((m.bar, m.regime, m.thin), (old.0, old.1, false), "정상·Limited 는 종전 그대로 — {ctx}");
+                            if axis == Axis::Measured && until - t < 3000.0 {
+                                held_pending = Some(until);
+                            }
+                        }
+                        Some(Verdict::Fire { pct: fp, .. }) => {
+                            if let Some(rp0) = win.2[axis as usize] {
+                                let rp = cg::rebase((rp0, win.4), window);
+                                if !win.3 {
+                                    let edge = stop_cap(window).max(rp.saturating_add(1));
+                                    let need = rp.saturating_add(CTX_GUARD_GROWTH).min(edge).min(block_cap(window)).max(base);
+                                    if fp < need {
+                                        st.v_i3 += 1;
+                                    }
                                 }
                             }
-                            if m.regime == Stopped {
-                                assert!(confirmed && tier3_floor(r, win), "{ctx}");
+                            fire_now = true;
+                        }
+                        _ => {}
+                    }
+                    if win.3 && t <= win.1 && pct < stop_cap(window) {
+                        if win.4 != window {
+                            for k in 0..2 {
+                                win.2[k] = win.2[k].map(|p| cg::rebase((p, win.4), window));
                             }
+                            win.4 = window;
+                        }
+                        let i = axis as usize;
+                        win.2[i] = Some(win.2[i].map_or(pct, |p| p.max(pct)));
+                    }
+                    if o.notes.iter().any(|n| matches!(n, Note::Measured { .. })) {
+                        win.3 = false;
+                    }
+                }
+                if let Phase::Measuring { anchor, secs, .. } = g.phase {
+                    if !win.3 || (win.0 - anchor).abs() > 1e-9 {
+                        win = (anchor, anchor + secs, [None; 2], true, window);
+                    }
+                } else if win.3 {
+                    win.3 = false;
+                }
+                if fire_now {
+                    st.fires += 1;
+                    if let Some(prev) = fires.last() {
+                        st.min_spacing = st.min_spacing.min(t - prev);
+                    }
+                    fires.push(t);
+                    if r.pick(8) != 0 {
+                        let d1 = 20.0 + r.f() * 1500.0;
+                        let d2 = 30.0 + r.f() * 400.0;
+                        sched.push((t + d1, true));
+                        sched.push((t + d1 + d2, false));
+                    }
+                }
+                match g.phase {
+                    Phase::Awaiting { at, .. } => {
+                        let from = *await_since.get_or_insert(at);
+                        if t - from.max(last_frozen) > CTX_GUARD_CLEAR_WAIT_SECS + 26.0 {
+                            st.v_await += 1;
                         }
                     }
-                }
-            }
-        }
-        // 대표값(200K) — 참 바닥 72 + 대기열 5%p(최고치 77): 종전 Probe 80 → 확인되면 Stopped 87 · 이제 미확인 Limited 80(바닥 72) ·
-        // 확인(직전 세션도 느린 얇은 발화)이면 Backlog 83(몰림 77 위 실제 성장 5%p — 표시 + 6).
-        assert_eq!(ctx_floor_bar(77, 60, W200K, true), (87, Stopped));
-        let bar = |bar, regime, floor, settled, thin| CtxFloorBar { bar, regime, floor, settled, thin, tainted: false, lift: None };
-        assert_eq!(ctx_floor_bar_measured(77, Some(72), 60, W200K, false), bar(80, Limited, 72, 77, true));
-        assert_eq!(ctx_floor_bar_measured(77, Some(72), 60, W200K, true), bar(83, Backlog, 72, 77, true));
-        assert_eq!(ctx_floor_bar_measured(77, Some(77), 60, W200K, true), bar(87, Stopped, 77, 77, false));
-        assert_eq!(ctx_floor_bar_measured(79, Some(72), 60, W200K, false), bar(81, Limited, 72, 79, true),
-                   "최고치 79 — 막대 80 은 실제 성장 0.01%p 로도 닿는다(최고치 + 2)");
-        assert_eq!(ctx_floor_bar_measured(83, Some(72), 60, W200K, false), bar(85, Limited, 72, 83, true),
-                   "정착 창에 차단 상한 넘게 든 작업 — 최고치 + 2");
-        assert_eq!(ctx_floor_bar_measured(83, Some(72), 60, W200K, true), bar(89, Backlog, 72, 83, true));
-    }
-
-    /// ★(R2NC5-1 반례 · 재검증자 검체 — 운영 입력 기록을 더함) 여유 있는 200K master(참 바닥 72 = 붙여넣기 64 + 복원 턴 30초)가
-    /// 사이클 동안 쌓인 대기열(백로그 4%p)을 복원 턴 3초 뒤 한 턴으로 받고 그 턴이 시작점 + 60초 전에 끝난다 — fba29db0 는 그
-    /// 백로그를 바닥에 실어(잰 76) Probe 80 → Stopped 86 → Stopped 86(선제 압축점 83.5% 위 · cys clear 없음)이었다(적색 로그
-    /// `r2-noclear-reverify-fba29db0-evidence/unit`). 배달은 writer Inject 라 그 시각이 좌석 입력으로 남는다(운영 신호 —
-    /// `note_input`). 이제 세 세션 모두 Limited 80 에서 clear · 보고 바닥 72 · 정착 창 최고치 76.
-    #[test]
-    fn r2nc5_backlog_after_short_restore_keeps_a_roomy_seat_clearing() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        let mut t0 = 60.0;
-        let mut fires = vec![];
-        for cycle in 0..3 {
-            clear(&mut g, &mut armed, t0);
-            g.note_quiescing(t0 + 10.0); // 붙여넣기 = 시작점
-            let a = t0 + 10.0;
-            g.note_input(Some(a), a); // 재주입 붙여넣기 자체(시작점과 같은 때 — 복원 턴의 입력)
-            // 복원 턴(30초 · 출력 계속) — 64 → 72
-            assert_eq!(report(&mut g, &mut armed, 64, 60, W200K, a + 5.0), None);
-            assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, a + 30.0), None);
-            // 조용함 3초 뒤 대기열 배달(좌석 입력) — 끝난 틈과 입력은 다음 보고 전에
-            g.note_delivery(Some(a + 33.0), None, a + 33.0);
-            g.note_idle(a + 30.0, a + 33.0, a + 33.0);
-            // 백로그 한 턴(12초) — 72 → 76
-            assert_eq!(report(&mut g, &mut armed, 74, 60, W200K, a + 40.0), None);
-            assert_eq!(report(&mut g, &mut armed, 76, 60, W200K, a + 45.0), None);
-            // 이어지는 조용함 — 수집기 틱(2초)
-            let mut t = a + 47.0;
-            while t <= a + 90.0 {
-                g.note_idle(a + 45.0, t, t);
-                t += 2.0;
-            }
-            // 이후 작업 분당 1%p — 77 → 90(가짜 Claude 압축 83.5 는 여기서 무시하고 발화 여부만 본다)
-            let mut fired = None;
-            for k in 0..14u8 {
-                let tt = a + 120.0 + 60.0 * f64::from(k);
-                g.note_delivery(Some(tt), None, tt);
-                if let Some(f) = report(&mut g, &mut armed, 77 + k, 60, W200K, tt) {
-                    fired = Some((77 + k, f));
-                    break;
-                }
-            }
-            fires.push((cycle, fired));
-            t0 = a + 120.0 + 60.0 * 14.0 + 60.0;
-        }
-        for (cycle, f) in &fires {
-            let (p, fire) = f.expect("발화 없음");
-            assert!(p <= 81, "(②) 참 바닥 72 좌석의 clear {cycle} 뒤 세션이 {p}% 에서야 발화({fire:?}) — 선제 압축점 83.5% 위 · 전체 {fires:?}");
-            assert_eq!(Some(fire), post_split(72, 76, CtxFloorRegime::Limited), "clear {cycle}: {fires:?}");
-        }
-    }
-
-    /// ★(ROLE-R4-1 · R2NC5-1 · ②) 운영 신호 모형(1초 틱 · 좌석 입력 기록 · 턴 끝 보고 · Claude 선제 압축 83.5%): 여유 있는
-    /// 200K·창 미상 master(참 바닥 72~74)가 **짧은 복원 턴**(라이브 14~53초) 뒤 사이클이 붙잡았던 배달 몰림(1~3건 · 3.3~7%p ·
-    /// 조용함 3초마다 한 턴)을 받고 그 뒤로도 일한다 — clear 뒤 모든 발화는 Raise·Limited(차단기 0) · 차단 상한 80(+1) 이하 ·
-    /// 보고 바닥은 참 바닥(+1 반올림) · 바닥 위 최소 여유 이상 자란 뒤(①)이고, Claude 압축이 cys clear 를 가로채지 않는다.
-    /// fba29db0 는 같은 모양(bl2-burst3 · rv4-bl-3x7300)에서 Probe → Stopped(86~88) → Claude 압축 · cys 사이클 0 이었다.
-    #[test]
-    fn ctx_loop_guard_role_r4_backlog_after_a_short_restore_never_trips_the_breaker() {
-        let profiles: [(&str, Option<u64>, f64, f64); 4] = [
-            ("200K master", W200K, 63.3, 8.9),
-            ("200K master 72", W200K, 72.0, 0.0),
-            ("미상 master", None, 63.3, 8.9),
-            ("200K master 74", W200K, 70.0, 4.0),
-        ];
-        for (name, win, paste, restore) in profiles {
-            for restore_secs in [14.0, 30.0, 53.0] {
-                for (backlog, turns) in [(3.3, 2u32), (5.0, 3), (5.0, 1), (7.0, 3)] {
-                    let restored = (paste + restore).round();
-                    if restored + backlog >= 79.0 {
-                        continue; // 배달만으로 차단 상한을 넘는 몰림은 아래 별도 검체(뒷문)
-                    }
-                    for (rate, queue_gap) in [(0.5, 0.3), (1.0, 0.3), (0.5, QUEUE_QUIET), (1.0, QUEUE_QUIET)] {
-                        let seat = Seat { restore_secs, backlog, backlog_turns: turns, work_after: 20.0, work_per_min: rate,
-                                          turn_secs: 20.0, queue_gap, ..Seat::real(60, win, paste, restore) };
-                        let run = run_seat(seat, 5.0 * 3600.0);
-                        let ctx = format!("{name} 복원 {restore_secs}s 배달 {backlog}%p/{turns} 간격 {queue_gap}s 분당 {rate}: {:?}", run.fires);
-                        assert!(run.fires.len() >= 3, "(②) 일하는 좌석이 clear 되지 않았다 — {ctx}");
-                        assert!(run.compactions.is_empty(), "(②) Claude 압축이 cys clear 보다 먼저 왔다 {:?} — {ctx}", run.compactions);
-                        for (_, p, f, _) in run.fires.iter().skip(1) {
-                            let floor = f.floor.expect("clear 뒤 발화의 잰 바닥");
-                            assert!(matches!(f.regime, Some(CtxFloorRegime::Raise | CtxFloorRegime::Limited)),
-                                    "차단기 오판 — 여유 있는 좌석이 Probe·Stopped 로 갔다 — {ctx}");
-                            assert!(!f.after_compaction, "{ctx}");
-                            assert!(f64::from(floor) <= restored + 1.0, "보고 바닥 {floor} 에 배달이 들었다(참 바닥 {restored}) — {ctx}");
-                            assert!(*p <= 81, "(②) {p}% 까지 clear 가 늦었다 — {ctx}");
-                            if !f.settle_backstop {
-                                assert!(p.saturating_sub(floor) >= CTX_FLOOR_MIN_ROOM, "(①) 바닥 {floor} 위 {p} — {ctx}");
-                            }
-                        }
-                        assert!(run.max_post_clear < 83, "(②) 좌석이 선제 압축점 근처({}%)까지 끌려갔다 — {ctx}", run.max_post_clear);
-                    }
-                }
-            }
-        }
-    }
-
-    /// ★(ROLE-R4-1 · ① 고리 0) 같은 여유 있는 좌석이 배달 몰림 뒤 **유휴**면(작업 0) clear 뒤 재발화가 없다 — 배달은 잰 바닥
-    /// 위 성장이지만 차단 상한(80) 아래에서 멎는다. 배달만으로 차단 상한을 넘는 몰림(참 바닥 74 + 7%p)은 정착 창 뒷문 1회
-    /// (80)뒤 멈춘다(뒷문은 연속 세션에 쓰지 않는다 · 차단기 영역으로는 가지 않는다).
-    #[test]
-    fn ctx_loop_guard_role_r4_backlog_on_an_idle_seat_does_not_loop() {
-        for win in [W200K, None] {
-            for (paste, restore, backlog, turns) in [(63.3, 8.9, 5.0, 3u32), (72.0, 0.0, 5.0, 1), (70.0, 4.0, 7.0, 3), (72.0, 0.0, 9.0, 3)] {
-                for (restore_secs, queue_gap) in [(14.0, 0.3), (53.0, 0.3), (14.0, QUEUE_QUIET), (53.0, QUEUE_QUIET)] {
-                    let seat = Seat { restore_secs, backlog, backlog_turns: turns, queue_gap, ..Seat::real(60, win, paste, restore) };
-                    let run = run_seat(seat, 3.0 * 3600.0);
-                    let ctx = format!("{win:?} 참 바닥 {} + 배달 {backlog}%p/{turns} 복원 {restore_secs}s 간격 {queue_gap}s: {:?}",
-                                      paste + restore, run.fires);
-                    let heavy = (paste + restore).round() + backlog >= 80.0;
-                    assert!(run.fires.len() <= if heavy { 2 } else { 1 }, "(①) 유휴 좌석 재발화 — {ctx}");
-                    for (_, p, f, _) in run.fires.iter().skip(1) {
-                        assert!(f.settle_backstop && *p >= 80 && *p <= 81, "뒷문 밖 발화 — {ctx}");
-                        assert!(!f.regime.is_some_and(CtxFloorRegime::tier3), "배달 몰림이 차단기 영역으로 갔다 — {ctx}");
-                    }
-                    assert!(run.compactions.is_empty(), "{ctx}");
-                }
-            }
-        }
-    }
-
-    /// ★(차단기 보존 · ①) 참으로 가득 찬 200K·창 미상 CEO(복원 끝 78 — 붙여넣기+복원만으로 차단 상한 근처)는 배달 몰림이
-    /// 있어도 종전처럼 1회 재시도 뒤 자동 clear 를 멈춘다(Stopped) — 복원 끝 바닥이 차단기 높이면 판정은 종전 그대로다.
-    /// Claude 선제 압축(83.5%)이 오면 그 세션은 **1회** 재무장하고(R2NC5-1 (b)) 그 사이클이 바닥을 다시 재 다시 Stopped — 사이클
-    /// 수는 압축 수 + 2 를 넘지 않고 Probe 는 연속 세션에 없다. ★(ADV2-R1-1) 압축 뒤 발화는 clear 로 돌아오는 바닥(정착 창 최고치
-    /// = 복원 끝 78 + 몰림) + 1 이상에서만 — cys clear 가 컨텍스트를 올리지 않는다. 그 높이가 선제 압축점 위(몰림 5%p → 84)면 압축 뒤
-    /// cys 사이클이 없다(그 clear 의 붙여넣기+몰림이 곧바로 다음 압축을 부른다 · Claude 압축이 받는다).
-    #[test]
-    fn ctx_loop_guard_truly_full_seat_still_stops_and_rearms_only_after_claude_compaction() {
-        for win in [W200K, None] {
-            for (backlog, turns, queue_gap) in [(0.0, 0u32, QUEUE_QUIET), (3.3, 2, 0.3), (5.0, 3, QUEUE_QUIET), (5.0, 3, 0.3)] {
-                let seat = Seat { restore_secs: 30.0, backlog, backlog_turns: turns, work_after: 20.0, work_per_min: 0.5,
-                                  turn_secs: 20.0, queue_gap, ..Seat::real(60, win, 69.5, 8.45) };
-                let run = run_seat(seat, 8.0 * 3600.0);
-                let ctx = format!("{win:?} 배달 {backlog}%p/{turns}: 발화 {:?} 압축 {:?}", run.fires, run.compactions);
-                // clear 로 돌아오는 바닥(복원 끝 + 사이클이 붙잡은 몰림).
-                let landing = (69.5 + 8.45 + backlog).round() as u8;
-                assert!(run.fires.len() >= if landing + 1 < 83 { 3 } else { 2 }, "(②) 일하는 좌석의 사이클이 멎었다 — {ctx}");
-                assert!(run.fires.len() <= run.compactions.len() + 3, "(①) 사이클이 Claude 압축보다 많다 — {ctx}");
-                assert!(run.rearms <= run.compactions.len(), "압축 없이 재무장했다 — {ctx}");
-                let mut prev_probe = false;
-                for (i, (t, p, f, _)) in run.fires.iter().enumerate().skip(1) {
-                    let probe = f.regime == Some(CtxFloorRegime::Probe);
-                    assert!(!(prev_probe && probe), "Probe 가 연속 세션에 났다(①) — {ctx}");
-                    prev_probe = probe;
-                    assert!(!(f.regime == Some(CtxFloorRegime::Limited) && f.settled != f.floor),
-                            "가득 찬 좌석을 배달 흡수로 오판해 차단기를 풀었다 — {ctx}");
-                    if f.after_compaction {
-                        let prev_t = run.fires[i - 1].0;
-                        assert!(run.compactions.iter().any(|c| *c > prev_t && c <= t), "압축 없는 재무장 발화 — {ctx}");
-                        assert!(*p > landing, "(ADV2-R1-1) 압축 뒤 발화 {p} 가 clear 로 돌아오는 바닥 {landing} 이하 — {ctx}");
-                    } else if f.regime == Some(CtxFloorRegime::Stopped) {
-                        assert!(p.saturating_sub(f.floor.unwrap()) >= CTX_FLOOR_MIN_GROWTH, "{ctx}");
-                    }
-                }
-                if landing + 1 < 83 {
-                    assert!(run.fires.iter().skip(2).any(|(_, _, f, _)| f.after_compaction),
-                            "Stopped 좌석이 Claude 압축 뒤에도 cys 사이클을 다시 받지 못한다(R2NC5-1 (b)) — {ctx}");
-                } else {
-                    assert!(!run.fires.iter().any(|(_, _, f, _)| f.after_compaction),
-                            "(ADV2-R1-1) clear 바닥이 선제 압축점 위인 좌석에 압축 뒤 cys 사이클 — 그 clear 가 다음 압축을 부른다 — {ctx}");
-                }
-            }
-        }
-        // 유휴면 부트 1회뿐(압축도 없다).
-        let run = run_seat(Seat { restore_secs: 30.0, backlog: 5.0, backlog_turns: 3, ..Seat::real(60, W200K, 69.5, 8.45) }, 3.0 * 3600.0);
-        assert!(run.fires.len() <= 2 && run.compactions.is_empty(), "{:?}", run.fires);
-    }
-
-    /// ★(복원 끝 판정의 반례 · ①) 복원 턴 **가운데** 출력이 멎는 틈(입력 없음)은 턴 끝이 아니다 — 그 틈에서 복원 끝 바닥을
-    /// 확정하면 가득 찬 좌석의 바닥이 낮게 잡혀 차단기가 풀린다. 확정은 틈 **뒤 첫 좌석 입력**에서만 한다: 입력 없이 출력이
-    /// 다시 흐르면 같은 턴이다 — 복원 끝(78)까지 따라가 확정한다.
-    #[test]
-    fn ctx_loop_guard_restore_stall_without_input_does_not_cut_the_floor_short() {
-        // 순수: 시작점 a · 복원 60 → (3초 멎음) → 70 → 78(턴 끝) → 3초 뒤 배달(입력) → 80·82.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        g.note_quiescing(110.0);
-        let a = 110.0;
-        g.note_input(Some(a), a);
-        assert_eq!(report(&mut g, &mut armed, 60, 60, W200K, a + 5.0), None);
-        g.note_idle(a + 10.0, a + 13.0, a + 13.0); // 멎음 — 입력 없음
-        assert_eq!(g.restore_quiet_from, Some(a + 10.0), "후보는 선다");
-        assert_eq!(g.restore_peak, None, "입력 없는 틈에서 복원 끝을 확정했다");
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, a + 20.0), None);
-        assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, a + 30.0), None);
-        g.note_delivery(Some(a + 33.0), None, a + 33.0); // 대기열 배달
-        assert_eq!(g.restore_peak, Some(78), "복원 끝(78)이 아니라 멎음 시점으로 확정했다");
-        assert_eq!(report(&mut g, &mut armed, 79, 60, W200K, a + 45.0), None);
-        let b = g.bar(60, W200K).unwrap();
-        assert_eq!((b.regime, b.floor, b.settled), (CtxFloorRegime::Probe, 78, 79), "가득 찬 좌석의 차단기가 풀렸다");
-        // 모형: 가득 찬 CEO(복원 끝 78)가 복원 턴 15초째에 3초 멎어도 Probe 1회 → Stopped · 여유 있는 master(72)는 Limited 80.
-        for (paste, restore, full) in [(69.5, 8.45, true), (63.3, 8.9, false)] {
-            let seat = Seat { restore_secs: 40.0, stall: Some((15.0, 3.0)), backlog: 5.0, backlog_turns: 3, work_after: 20.0,
-                              work_per_min: 0.5, turn_secs: 20.0, ..Seat::real(60, W200K, paste, restore) };
-            let run = run_seat(seat, 5.0 * 3600.0);
-            let regimes: Vec<_> = run.fires.iter().skip(1).filter(|f| !f.2.after_compaction).map(|f| f.2.regime).collect();
-            if full {
-                assert_eq!(regimes.first(), Some(&Some(CtxFloorRegime::Probe)), "{:?}", run.fires);
-                assert!(regimes.iter().skip(1).all(|r| *r == Some(CtxFloorRegime::Stopped)), "{:?}", run.fires);
-            } else {
-                assert!(regimes.len() >= 2 && regimes.iter().all(|r| *r == Some(CtxFloorRegime::Limited)), "{:?}", run.fires);
-                assert!(run.compactions.is_empty(), "{:?}", run.compactions);
-            }
-        }
-    }
-
-    /// ★(ROLE-R4-1 · 샌드박스 실측 반례) claude 좌석의 대기열은 **프롬프트 경계**(바쁨 표지 없는 빈 입력줄)에서 조용함을
-    /// 기다리지 않고 배달한다 — 복원 턴 끝과 첫 배달 사이에 2초 틈이 없을 수 있다(드릴 0.1~0.5초). 복원 턴의 보고 뒤 첫 대기열
-    /// 배달이 곧 복원 턴 끝의 증거다: 그 순간 최고치로 확정 · 배달 1초 안에 늦게 도착한 복원 끝 보고는 싣는다 · 그 뒤(배달이 부른
-    /// 턴)는 싣지 않는다. 대기열이 아닌 바쁨 무시 입력(채널 행)은 복원 턴 도중에 와도 확정하지 않고, 상승 보고 전의 배달(대기열로
-    /// 우회한 재주입 붙여넣기)도 확정 재료가 아니다.
-    #[test]
-    fn ctx_loop_guard_prompt_boundary_delivery_confirms_the_restore_end_without_a_gap() {
-        let setup = || {
-            let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-            assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-            clear(&mut g, &mut armed, 100.0);
-            g.note_quiescing(110.0);
-            (g, armed)
-        };
-        let a = 110.0;
-        // 틈 없는 인계(0.3초) + 제출(CR) 전에 늦게 도착한 복원 끝 보고(72) → 확정 72 · 그 뒤 배달 턴 76 은 작업.
-        let (mut g, mut armed) = setup();
-        g.note_delivery(Some(a - 50.0), Some(a - 49.6), a); // 지난 세션의 배달 — 재료 아님
-        assert_eq!(report(&mut g, &mut armed, 64, 60, W200K, a + 5.0), None);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, a + 29.0), None);
-        g.note_delivery(Some(a + 30.3), Some(a - 49.6), a + 30.3); // 인계 — 붙여넣기·CR 은 아직
-        assert_eq!(g.restore_peak, Some(70), "틈 없는 프롬프트 경계 배달로 확정하지 않았다");
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, a + 30.5), None); // CR 전에 늦게 도착한 복원 끝 보고
-        g.note_delivery(Some(a + 30.3), Some(a + 30.7), a + 30.7); // 배달 제출(CR)
-        assert_eq!(report(&mut g, &mut armed, 76, 60, W200K, a + 31.0), None); // 제출 뒤 보고 = 배달 메시지를 담음(1초 안이어도)
-        assert_eq!(report(&mut g, &mut armed, 77, 60, W200K, a + 40.0), None); // 배달이 부른 턴
-        assert_eq!(g.restore_peak, Some(72), "CR 전 복원 끝 보고를 싣지 않았거나 제출 뒤(배달 메시지) 보고를 실었다");
-        let b = g.bar(60, W200K).unwrap();
-        assert_eq!((b.bar, b.regime, b.floor, b.settled), (80, CtxFloorRegime::Limited, 72, 77));
-        // ★(샌드박스 반례 rv4-bl-1x22000 모양) 인계 1.5초 · 제출 0.4초 뒤 · 보고가 22KB 를 담아 0.7초 뒤 도착(77) — 복원 끝 72.
-        let (mut g, mut armed) = setup();
-        assert_eq!(report(&mut g, &mut armed, 63, 60, W200K, a + 0.5), None);
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, a + 20.5), None);
-        g.note_delivery(Some(a + 22.0), None, a + 22.0);
-        g.note_delivery(Some(a + 22.0), Some(a + 22.4), a + 22.4);
-        assert_eq!(report(&mut g, &mut armed, 77, 60, W200K, a + 22.7), None);
-        assert_eq!(g.restore_peak, Some(72), "제출된 배달을 담은 보고를 복원 끝 바닥에 실었다(참 바닥 72 → Stopped)");
-        // 복원 턴 도중 채널 행(바쁨 무시 · 대기열 아님)은 확정하지 않는다 — 복원 끝 뒤 배달에서 확정.
-        let (mut g, mut armed) = setup();
-        assert_eq!(report(&mut g, &mut armed, 60, 60, W200K, a + 5.0), None);
-        g.note_input(Some(a + 8.0), a + 8.0); // 채널 행
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, a + 20.0), None);
-        assert_eq!(g.restore_peak, None, "복원 턴 도중의 채널 행으로 확정했다(복원 끝 과소)");
-        assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, a + 30.0), None);
-        g.note_delivery(Some(a + 30.4), None, a + 30.4);
-        assert_eq!(g.restore_peak, Some(78));
-        // 상승 보고 전의 배달(대기열로 우회한 재주입 붙여넣기)은 재료가 아니다.
-        let (mut g, mut armed) = setup();
-        g.note_delivery(Some(a + 1.0), Some(a + 1.4), a + 1.0);
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, a + 20.0), None);
-        assert_eq!(g.restore_peak, None, "재주입 붙여넣기 배달로 확정했다");
-    }
-
-    /// ★(R2NC5-1 (b) · R1-RUNAWAY-1 · RV2-ROLE-1 · ADV2-R1-1) Claude 자체 압축 재무장 세부 — 차단기가 섰던 좌석(복원 끝 신호 없이
-    /// 정착 창이 배달을 흡수해 77 로 두 번 잼 → Stopped 87)은 Claude 압축(같은 세션 · 30%)을 보면 재무장하고 **압축 뒤 바닥을 다시
-    /// 잰다** — 압축 관측부터 [`CTX_FLOOR_REREAD_SECS`](90초 · 연장 없음) 창의 최고치(30 · 창 밖 45 는 성장). 막대 = max(압축 뒤 막대
-    /// 60, **clear 로 돌아오는 바닥 77 + 1**) = 78 — 그보다 낮은 발화는 clear 가 컨텍스트를 오히려 올린다(ADV2-R1-1: 참으로 가득 찬
-    /// 좌석의 clear → 압축 → 재무장 고리). 78 에서 발화(`after_compaction` · 바닥 30) → 그 clear 가 바닥을 다시 잰다(복원 끝 72 ·
-    /// 직전 세션이 차단기라 몰림 77 을 바닥으로 확정한 Backlog 82 · 그 발화가 일하는 좌석의 빠른 성장이면 다음 세션은 Limited 80).
-    /// 압축 뒤 수준(지침 재읽기)이 기본 임계 위(63)여도 곧바로 발화하지 않는다. 창 안의 두 번째 압축(창 최고치보다 10%p 이상 낮음)은
-    /// 다시 잰다(RV2-ROLE-1 (a)). 재무장하지 않는 경우: 낙폭 < 10%p · clear 뒤 정착 창 안 · 정상·Limited 세션(막대 ≤ 차단 상한) ·
-    /// 창 전환(1M — 바닥을 토큰 비율로 옮겨 비교). 재무장한 세션은 발화 없는 교체(오너 수동 clear)도 다시 잰다.
-    #[test]
-    fn ctx_loop_guard_claude_compaction_rearms_a_stopped_seat_once() {
-        let stopped_at_77 = || {
-            let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-            assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-            for (i, t) in [100.0, 1_000.0].into_iter().enumerate() {
-                clear(&mut g, &mut armed, t);
-                assert_eq!(report(&mut g, &mut armed, 77, 60, W200K, t + 10.0), None);
-                if i == 0 {
-                    assert_eq!(report(&mut g, &mut armed, 80, 60, W200K, t + 800.0), post(77, CtxFloorRegime::Probe));
-                }
-            }
-            assert_eq!(g.effective_threshold(60, W200K, 2_000.0), 87, "전제: Stopped");
-            (g, armed)
-        };
-        // 회복 경로.
-        let (mut g, mut armed) = stopped_at_77();
-        assert_eq!(report(&mut g, &mut armed, 84, 60, W200K, 2_100.0), None, "Stopped 87 아래");
-        assert_eq!(g.observe(68, W200K, 2_150.0), None, "낙폭 9%p 는 압축이 아니다");
-        let r = g.observe(30, W200K, 2_200.0).expect("Claude 압축(77 → 30)을 보지 못했다");
-        assert_eq!((r.floor, r.regime), (77, CtxFloorRegime::Stopped));
-        assert!(g.settling(2_210.0) && g.rearmed, "압축 뒤 바닥을 다시 재는 창이 열리지 않았다");
-        assert_eq!(g.observe(25, W200K, 2_210.0), None, "압축 뒤 창 안의 작은 낙폭(5%p)을 압축으로 봤다");
-        assert!(g.settling(2_200.0 + CTX_FLOOR_REREAD_SECS) && !g.settling(2_200.0 + CTX_FLOOR_REREAD_SECS + 1.0),
-                "압축 뒤 재는 창이 재읽기 몫({CTX_FLOOR_REREAD_SECS}초)이 아니다(RV2-ROLE-1)");
-        assert_eq!(g.effective_threshold(60, W200K, 2_220.0), 78, "(ADV2-R1-1) 막대가 clear 로 돌아오는 바닥 77 + 1 이 아니다");
-        assert_eq!(report(&mut g, &mut armed, 45, 60, W200K, 2_300.0), None);
-        assert_eq!(g.settle_peak, Some(30), "재읽기 창 밖(압축 100초 뒤) 성장이 압축 뒤 바닥에 들었다(RV2-ROLE-1)");
-        assert_eq!(report(&mut g, &mut armed, 77, 60, W200K, 3_900.0), None, "(ADV2-R1-1) clear 로 돌아오는 바닥(77)에서 발화했다");
-        let rearmed = Some(CtxFire { floor: Some(30), regime: Some(CtxFloorRegime::Raise), settle_backstop: false, settled: Some(30),
-                                     after_compaction: true });
-        assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, 4_000.0), rearmed, "(②) 압축 뒤 바닥 위 성장에서 cys 사이클이 나지 않았다");
-        // ★(R1-RUNAWAY-1) 압축 뒤 지침 재읽기로 기본 임계 위(63)에 서도 곧바로 발화하지 않는다 — 그 위로 자란 뒤(max(63 + 15 → 천장
-        //   75, clear 로 돌아오는 바닥 77 + 1) = 78).
-        let (mut g, mut armed) = stopped_at_77();
-        assert!(g.observe(30, W200K, 2_200.0).is_some());
-        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 2_201.0), None);
-        assert_eq!(report(&mut g, &mut armed, 63, 60, W200K, 2_220.0), None, "재읽기 턴(창 안)에서 발화했다");
-        assert_eq!(report(&mut g, &mut armed, 63, 60, W200K, 3_000.0), None, "압축 뒤 수준 63 에서 성장 0 으로 발화했다(재읽기 고리 · ①)");
-        assert_eq!(g.effective_threshold(60, W200K, 3_000.0), 78);
-        assert_eq!(report(&mut g, &mut armed, 77, 60, W200K, 5_000.0), None);
-        assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, 5_100.0),
-                   Some(CtxFire { floor: Some(63), regime: Some(CtxFloorRegime::Raise), settle_backstop: false, settled: Some(63),
-                                  after_compaction: true }),
-                   "(②) 압축 뒤 바닥 위로 자란 좌석을 clear 하지 않았다");
-        // ★(RV2-ROLE-1 (a)) 압축 뒤 재는 창 안의 두 번째 압축(재읽기 63 → 25)도 압축이다 — 그 시각에서 다시 잰다(압축 전 최고치 63 을
-        //   바닥으로 남기지 않는다) · clear 로 돌아오는 바닥은 처음 남긴 77 그대로.
-        let (mut g, mut armed) = stopped_at_77();
-        assert!(g.observe(30, W200K, 2_200.0).is_some());
-        assert_eq!(report(&mut g, &mut armed, 63, 60, W200K, 2_230.0), None);
-        let r2 = g.observe(25, W200K, 2_260.0).expect("창 안의 두 번째 압축(63 → 25)을 보지 못했다");
-        assert_eq!(r2.floor, 63);
-        assert_eq!((g.settle_anchor, g.settle_peak, g.rearm_floor), (Some(2_260.0), Some(25), Some(77)));
-        assert_eq!(report(&mut g, &mut armed, 40, 60, W200K, 2_260.0 + CTX_FLOOR_REREAD_SECS + 10.0), None);
-        assert_eq!(g.settle_peak, Some(25));
-        // 다시 잰 바닥이 차단기 높이(78 · 압축이 덜 내렸다)면 다음 압축이 또 잰다 — 한 세션 여러 번(영구 Stopped 없음).
-        let (mut g, mut armed) = stopped_at_77();
-        assert_eq!(report(&mut g, &mut armed, 86, 60, W200K, 2_100.0), None);
-        assert!(g.observe(66, W200K, 2_200.0).is_some(), "86 → 66 압축");
-        assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, 2_220.0), None);
-        assert_eq!(g.effective_threshold(60, W200K, 3_000.0), 88, "다시 잰 바닥 78(확인 유지) — Stopped");
-        assert_eq!(report(&mut g, &mut armed, 86, 60, W200K, 3_100.0), None);
-        assert!(g.observe(40, W200K, 3_200.0).is_some(), "두 번째 압축(86 → 40)을 다시 재지 않았다");
-        // 그 clear — 복원 끝이 확정되는 운영 신호가 있으면 참 바닥으로 다시 잰다(차단기 해제).
-        clear(&mut g, &mut armed, 4_100.0);
-        g.note_quiescing(4_110.0);
-        g.note_input(Some(4_110.0), 4_110.0);
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, 4_140.0), None);
-        g.note_delivery(Some(4_143.0), None, 4_143.0);
-        g.note_idle(4_140.0, 4_143.0, 4_143.0);
-        assert_eq!(report(&mut g, &mut armed, 77, 60, W200K, 4_160.0), None);
-        g.note_idle(4_160.0, 4_300.0, 4_300.0);
-        assert!(!g.settling(4_300.0));
-        // ★(RV2NC-E20-1) 직전 세션이 차단기(Stopped)였으므로 이 얇은 세션(복원 끝 72 · 몰림 77)은 몰림을 바닥으로 확정한다(Backlog
-        //   83 — Stopped 87 아님 · 선제 압축점 아래). 그 발화가 일하는 좌석의 빠른 성장이면 확인을 풀어 다음 세션은 Limited 80.
-        assert_eq!(g.effective_threshold(60, W200K, 4_300.0), 83, "회복하지 못했다(직전 Stopped 확인이 배달 흡수를 다시 Stopped 로)");
-        assert_eq!(report(&mut g, &mut armed, 83, 60, W200K, 4_400.0), post_split(72, 77, CtxFloorRegime::Backlog));
-        assert!(g.session_fast, "4%p 를 100초에 — 일하는 좌석의 빠른 성장");
-        clear(&mut g, &mut armed, 4_500.0);
-        g.note_quiescing(4_510.0);
-        g.note_input(Some(4_510.0), 4_510.0);
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, 4_540.0), None);
-        g.note_delivery(Some(4_543.0), None, 4_543.0);
-        g.note_idle(4_540.0, 4_543.0, 4_543.0);
-        assert_eq!(report(&mut g, &mut armed, 77, 60, W200K, 4_560.0), None);
-        g.note_idle(4_560.0, 4_700.0, 4_700.0);
-        assert_eq!(g.effective_threshold(60, W200K, 4_700.0), 80, "빠른 발화가 확인을 풀지 않았다");
-        assert_eq!(report(&mut g, &mut armed, 80, 60, W200K, 5_000.0), post_split(72, 77, CtxFloorRegime::Limited));
-        // ★(RV2-ROLE-1 · ADV2-R1-1) 정착 창 안의 압축(차단기 세션 · 창 최고치보다 낙폭 이상 낮음)도 곧바로 재무장한다 — 창이 끝날
-        //   때까지(최대 600초) 기다리면 그동안 자란 몫이 '압축 뒤 바닥'에 든다. 복원 끝 전(신호 없음)이고 최고치가 선제 압축 천장
-        //   위였으면 사이클 자신의 입력이 부른 압축이다 — clear 로 돌아오는 바닥 = 선제 압축점(압축 뒤 cys 사이클 없음).
-        let (mut g, mut armed) = stopped_at_77();
-        clear(&mut g, &mut armed, 3_000.0);
-        assert_eq!(report(&mut g, &mut armed, 77, 60, W200K, 3_010.0), None);
-        assert_eq!(g.observe(30, W200K, 3_020.0).map(|r| r.regime), Some(CtxFloorRegime::Stopped), "정착 창 안의 압축을 재무장하지 않았다");
-        assert!(g.rearmed && g.settle_peak == Some(30) && g.rearm_floor == Some(83), "{g:?}");
-        assert_eq!(g.effective_threshold(60, W200K, 3_500.0), CTX_FLOOR_NEVER, "clear 바닥이 압축점인 좌석의 압축 뒤 cys 사이클");
-        // 낮은 높이(천장 아래)의 수동 /compact 는 사이클 자신의 입력이 부른 압축이 아니다 — 정상 세션은 재무장 없이 최고치를 싣는다.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 64, 60, W200K, 110.0), None);
-        assert_eq!(g.observe(40, W200K, 120.0), None, "정상 세션 창 안의 수동 /compact 를 재무장했다");
-        assert_eq!(g.settle_peak, Some(64));
-        // 정상·Limited 세션(막대 80 ≤ 차단 상한)은 재무장하지 않는다 — cys clear 가 선제 압축점 전에 난다.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, 110.0), None);
-        assert_eq!(g.observe(30, W200K, 2_000.0), None, "Limited 세션을 재무장했다");
-        assert_eq!(g.effective_threshold(60, W200K, 2_000.0), 80);
-        // 창 전환(200K Stopped 77 → 1M 보고 15%)은 압축이 아니다 — 바닥을 1M 로 옮기면 16%.
-        let (mut g, _) = stopped_at_77();
-        assert_eq!(g.observe(15, W1M, 2_200.0), None, "창 전환을 압축으로 셌다");
-        // 발화 없이 바뀐 새 세션(잰 바닥을 유지하는 교체 — Probe 좌석 · 수집기의 늦은 통지)의 낮은 첫 보고는 압축이 아니다
-        // (handlers `context_threshold_idle_seat_with_a_floor_near_the_ceiling_does_not_refire` 의 모양 — 오판이면 유휴 좌석이
-        // 기본 임계로 돌아가 붙여넣기 78 에서 재발화한다 · ①). 그 새 세션 안에서 다시 떨어지면 그때는 압축이다.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, 110.0), None);
-        assert_eq!(g.effective_threshold(60, W200K, 2_000.0), 80, "전제: Probe(창 밖)");
-        clear(&mut g, &mut armed, 3_000.0); // 발화 없는 교체 — 잰 바닥 유지
-        assert!(!g.settling(3_001.0));
-        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 3_001.0), None, "새 세션의 첫 보고(30)를 압축으로 봤다");
-        assert!(!g.rearmed);
-        assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, 3_010.0), None, "유휴 좌석이 붙여넣기 높이에서 재발화했다(①)");
-        assert_eq!(report(&mut g, &mut armed, 79, 60, W200K, 3_500.0), None);
-        assert!(g.observe(40, W200K, 4_000.0).is_some(), "같은 세션 안의 압축(79 → 40)을 보지 못했다");
-        // 재무장 뒤 발화 없는 교체(오너 수동 clear)도 다시 잰다.
-        let (mut g, mut armed) = stopped_at_77();
-        assert!(g.observe(30, W200K, 2_200.0).is_some());
-        clear(&mut g, &mut armed, 2_500.0);
-        assert!(g.settling(2_510.0) && !g.rearmed, "재무장한 세션 뒤 교체를 다시 재지 않았다");
-    }
-
-    /// ★(자기 반례 탐색 · 운영 신호 모형 · 결정론 난수 400 좌석) 붙여넣기 0~90% × 복원 0~12%p·10~120초(가운데 멎음 20%) ×
-    /// 사이클이 붙잡은 배달(0 또는 0.5~4%p · 1~3턴 · 조용함 3초마다) × 창(200K·1M·미상) × 기본 60·75 × 작업 0~3%p/분 ·
-    /// 턴 10~50초 × 사이클 지연 20~120초 × Claude 선제 압축(창 − 33000), 3시간:
-    /// (①) 유휴(작업 0)면 부트 1회 + 뒷문 1회 이하 · 일하면 사이클 수 ≤ 3 + 실제 성장(%p) + 압축 수 · Probe 는 연속 세션에 없다 ·
-    ///     clear 뒤 발화는 뒷문·재무장·Stopped 가 아니면 보고 바닥 위 최소 여유(Probe 1%p) 이상 자란 뒤.
-    /// (② · 오판) **참 바닥**(복원 끝 · 흡수분을 빼지 않는다) + 1 + 최소 여유 ≤ 차단 상한인 좌석은 차단기 영역(Probe·Stopped)에
-    ///     가지 않고, 정착 창 최고치 + 1 ≤ 차단 상한이면 max(기본, 차단 상한) + 1 이하에서 clear · 보고 바닥 ≤ 참 바닥 + 1.
-    /// (재무장) 재무장 발화는 압축 뒤에만 · 재무장 수 ≤ 압축 수.
-    #[test]
-    fn ctx_loop_guard_realistic_randomized_seats_keep_both_invariants() {
-        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
-        let mut rnd = |lo: f64, hi: f64| {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            lo + (hi - lo) * ((state >> 11) as f64 / (1u64 << 53) as f64)
-        };
-        for case in 0..400 {
-            let win = WINDOWS[(rnd(0.0, 3.0) as usize).min(2)];
-            let base = if rnd(0.0, 1.0) < 0.8 { 60 } else { 75 };
-            let paste = rnd(0.0, 90.0).round();
-            let restore = if rnd(0.0, 1.0) < 0.2 { 0.0 } else { rnd(0.0, 12.0) };
-            let restore_secs = rnd(10.0, 120.0);
-            let stall = (rnd(0.0, 1.0) < 0.2).then(|| (rnd(1.0, restore_secs * 0.6), rnd(2.5, 6.0)));
-            let (backlog, backlog_turns) = if rnd(0.0, 1.0) < 0.3 { (0.0, 0) } else { (rnd(0.5, 4.0), rnd(1.0, 3.99) as u32) };
-            let work_per_min = if rnd(0.0, 1.0) < 0.3 { 0.0 } else { rnd(0.1, 3.0) };
-            let queue_gap = if rnd(0.0, 1.0) < 0.5 { rnd(0.1, 1.9) } else { rnd(2.0, 10.0) };
-            // 복원 턴 도중 바쁨을 보지 않는 입력(채널 행) — 멎음이 없으면 확정 재료가 아니다(멎음과 겹치는 드문 경우는 제외).
-            let mid_input = (stall.is_none() && rnd(0.0, 1.0) < 0.3).then(|| rnd(0.5, restore_secs * 0.9));
-            let seat = Seat { restore_secs, stall, backlog, backlog_turns, backlog_turn_secs: rnd(5.0, 20.0),
-                              work_after: rnd(queue_gap, 60.0), work_per_min, turn_secs: rnd(10.0, 50.0),
-                              cycle_delay: rnd(20.0, 120.0), quiesce: rnd(5.0, 30.0), queue_gap, mid_input,
-                              ..Seat::real(base, win, paste, restore) };
-            let run = run_seat(seat, 3.0 * 3600.0);
-            let ctx = format!("case {case} {seat:?}: 발화 {:?} 압축 {:?}", run.fires, run.compactions);
-            let h = ctx_floor_hard_cap(win);
-            let restored = (paste + restore).min(100.0).round().max(3.0) as u16;
-            assert!(run.rearms <= run.compactions.len(), "(재무장) 압축 없이 재무장 — {ctx}");
-            if work_per_min == 0.0 {
-                assert!(run.fires.len() <= 2 + usize::from(backlog > 0.0) + run.compactions.len(), "(①) 유휴 좌석 재발화 — {ctx}");
-                continue;
-            }
-            let grown = work_per_min * 3.0 * 60.0;
-            assert!((run.fires.len() as f64) <= 3.0 + grown + run.compactions.len() as f64, "(①) 사이클이 성장보다 많다 — {ctx}");
-            let roomy = restored + 1 + u16::from(CTX_FLOOR_MIN_ROOM) <= u16::from(h);
-            let mut prev_probe = false;
-            for (i, (t, p, f, _)) in run.fires.iter().enumerate().skip(1) {
-                if f.after_compaction {
-                    let prev_t = run.fires[i - 1].0;
-                    assert!(run.compactions.iter().any(|c| *c > prev_t && c <= t), "(재무장) 압축 없는 재무장 발화 — {ctx}");
-                    prev_probe = false;
-                    continue;
-                }
-                let probe = f.regime == Some(CtxFloorRegime::Probe) && !f.settle_backstop;
-                assert!(!(prev_probe && probe), "(①) Probe 가 연속 세션에 — {ctx}");
-                prev_probe = probe;
-                let floor = u16::from(f.floor.expect("clear 뒤 발화의 잰 바닥"));
-                let settled = u16::from(f.settled.expect("정착 창 최고치"));
-                let min_room = if f.regime == Some(CtxFloorRegime::Probe) { 1 } else { u16::from(CTX_FLOOR_MIN_ROOM) };
-                if !f.settle_backstop && f.regime != Some(CtxFloorRegime::Stopped) && u16::from(*p) < 100 {
-                    assert!(u16::from(*p) >= floor + min_room.min(100 - floor), "(①) 바닥 {floor} 위 {p} — {ctx}");
-                }
-                if roomy {
-                    assert!(matches!(f.regime, Some(CtxFloorRegime::Raise | CtxFloorRegime::Limited)), "(오판) 차단기 — {ctx}");
-                    // 붙여넣기가 clear 직후(3%)보다 보이게 오르지 않으면 복원 턴의 보고(상승)가 없어 복원 끝을 확정할 수 없다 —
-                    // 종전 판정(정착 창 최고치 · 최소 창 + 한 턴까지 흡수)으로 떨어진다(그 높이는 기본 임계 아래라 무해).
-                    if restored > 4 {
-                        assert!(floor <= restored + 1, "(오판) 보고 바닥 {floor} > 참 바닥 {restored} + 1 — {ctx}");
-                    }
-                    if settled + 1 <= u16::from(h) {
-                        // 보고는 턴 끝마다 — 한 턴(≤ 1분)의 성장만큼 넘어 보일 수 있다(모형 해상도 · + 반올림 1).
-                        let overshoot = work_per_min.ceil() as u16 + 1;
-                        assert!(u16::from(*p) <= u16::from(base.max(h)) + overshoot, "(②) {p}% 까지 clear 가 늦었다 — {ctx}");
-                    }
-                }
-            }
-        }
-    }
-
-    /// ★(① 회귀 · 운영 신호 모형) RR3-R1-1·G3ROLE-1 의 유휴 불변식을 운영 신호 모형으로 다시 — 붙여넣기 0~100% × 복원(0·4·
-    /// 8.45%p · 14·53·240초) × 창 × 기본 60·90, 유휴 2시간: 부트 1회(붙여넣기·복원만으로 max(기본, 차단 상한) 위면 뒷문 1회
-    /// 더). 입력 기록·턴 끝 보고·1초 틱이 유휴 좌석을 다시 고리로 넣지 않는다.
-    #[test]
-    fn ctx_loop_guard_realistic_idle_seats_never_reenter_the_clear_loop() {
-        for win in WINDOWS {
-            for base in [60u8, 90] {
-                for paste in (0..=100).step_by(4) {
-                    for (restore, restore_secs) in [(0.0, 14.0), (4.0, 53.0), (8.45, 240.0)] {
-                        let seat = Seat { restore_secs, ..Seat::real(base, win, f64::from(paste), restore) };
-                        let run = run_seat(seat, 2.0 * 3600.0);
-                        let floor = (f64::from(paste) + restore).min(100.0).round().max(3.0) as u8;
-                        let expect = if floor >= base.max(ctx_floor_hard_cap(win)) { 2 } else { 1 };
-                        assert!(run.fires.len() <= expect,
-                                "창 {win:?} 기본 {base} 붙여넣기 {paste} 복원 +{restore}/{restore_secs}s: 유휴 좌석 발화 {:?}", run.fires);
-                    }
-                }
-            }
-        }
-    }
-
-    // ───────────── 가드 세부 ─────────────
-
-    /// 200K master(run-m200 모양): 발화 → clear → 30% → 붙여넣기 67% 는 발화하지 않는다(실효 75 — 바닥+15=82 는 200K
-    /// 창 천장 75 에 잘린다) → 75% 에서 한 번 발화 → 다음 clear 뒤 67% 는 조용하다(고리 없음).
-    #[test]
-    fn ctx_loop_guard_breaks_the_200k_master_reinject_loop() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE, "부트 뒤 첫 교차는 발화");
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 100.5), None);
-        assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, 106.0), None, "clear 직후 바닥에서 재발화");
-        assert_eq!(g.effective_threshold(60, W200K, 106.0), 75, "200K 천장을 넘겨 올렸다");
-        assert_eq!(report(&mut g, &mut armed, 74, 60, W200K, 2_000.0), None, "실효 임계 아래에서 발화");
-        assert_eq!(report(&mut g, &mut armed, 75, 60, W200K, 2_010.0), post(67, CtxFloorRegime::Raise), "실효 임계에서 발화하지 않았다(② 무clear)");
-        clear(&mut g, &mut armed, 2_100.0);
-        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 2_100.5), None);
-        assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, 2_106.0), None, "다음 사이클에 고리가 다시 섰다");
-        assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, 9_000.0), None, "정착 뒤 유휴 보고에서 발화");
-    }
-
-    /// ★(R2NC3-1 · ② 무clear) 200K CEO(run-ceo200 모양 · 바닥 69%): 실효 임계 75 + 사이클 여유가 Claude Code 선제 압축점
-    /// (83.5%)·차단점(88.5%) 아래다(종전 84 는 압축점 위라 cys clear 가 영영 안 났다).
-    #[test]
-    fn ctx_loop_guard_200k_ceo_raise_stays_below_claude_code_limits() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 100.5), None);
-        assert_eq!(report(&mut g, &mut armed, 69, 60, W200K, 106.0), None);
-        let raised = g.effective_threshold(60, W200K, 106.0);
-        assert_eq!(raised, 75, "200K CEO 가 천장 75 밖으로 올라갔다");
-        let fire = max_tokens_shown_as(raised, 200_000);
-        assert!(fire + CTX_FLOOR_CYCLE_MARGIN_TOKENS <= 167_000,
-                "올린 임계({raised}%) + 사이클 여유가 Claude Code 선제 압축점(167000 = 83.5%)을 넘는다 — cys clear 가 안 난다");
-        assert!(fire + CTX_FLOOR_CYCLE_MARGIN_TOKENS < 177_000, "올린 임계({raised}%) + 사이클 여유가 차단점(177000 = 88.5%)에 닿는다");
-        assert_eq!(report(&mut g, &mut armed, 75, 60, W200K, 2_000.0), post(69, CtxFloorRegime::Raise), "올린 임계에서 발화하지 않았다(② 무clear)");
-    }
-
-    /// ★(RR3-R1-1) 천장 아래 여유가 최소 여유보다 좁은 바닥(200K 71~75 · 1M 81~90)은 **바닥에서 발화하지 않고** 차단
-    /// 상한(200K 80 · 1M 95)에서 clear 한다(Limited) — 종전(52b8c656)은 그 바닥에서 곧바로 발화해 유휴 좌석이 고리를 돌았다.
-    #[test]
-    fn ctx_loop_guard_floor_just_below_the_ceiling_waits_for_the_hard_cap() {
-        for (floor, win, cap) in [(71u8, W200K, 80u8), (72, W200K, 80), (74, W200K, 80), (75, W200K, 80), (72, None, 80),
-                                  (81, W1M, 95), (90, W1M, 95)] {
-            let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-            assert_eq!(report(&mut g, &mut armed, 61, 60, win, 0.0), FIRE);
-            clear(&mut g, &mut armed, 100.0);
-            assert_eq!(report(&mut g, &mut armed, floor, 60, win, 110.0), None, "바닥 {floor}({win:?}) 에서 재발화(① 고리)");
-            assert_eq!(report(&mut g, &mut armed, floor, 60, win, 5_000.0), None, "바닥 {floor}({win:?}) 유휴 보고에서 발화");
-            assert_eq!(report(&mut g, &mut armed, cap - 1, 60, win, 5_010.0), None);
-            assert_eq!(report(&mut g, &mut armed, cap, 60, win, 5_020.0), post(floor, CtxFloorRegime::Limited),
-                       "바닥 {floor}({win:?}) 가 차단 상한 {cap} 에서 clear 되지 않았다(② 무clear)");
-        }
-    }
-
-    /// ★(RR3-R1-1 · 연속 clear 차단기) 차단 상한 근처 바닥(200K 76~): 첫 세션은 **1회만** 차단 상한에서 재시도(Probe ·
-    /// 바닥에서 1%p 이상 자란 뒤), 다음 clear 뒤에도 그러면 자동 clear 중단(Stopped) — 바닥+10 까지 실제로 자랄 때만 발화.
-    /// 오너 고지: Probe(warn · Limited 계수 1) → Stopped(error · 1·2·4…번째) — 무한 재시도·무음 둘 다 금지.
-    #[test]
-    fn ctx_loop_guard_breaker_retries_once_then_stops_until_real_growth() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 100.5), None);
-        g.observe(78, W200K, 110.0);
-        assert_eq!(g.effective_threshold(60, W200K, 110.0), 80);
-        let n = g.hold_notice(78, 60, W200K, 110.0).expect("Probe 이벤트");
-        assert_eq!((n.regime, n.bar, n.feed, n.event), (CtxFloorRegime::Probe, 80, None, true), "복원 도중(정착 창 안)에 오너 feed");
-        let n = g.hold_notice(78, 60, W200K, 2_000.0).expect("정착 창이 닫힌 뒤 오너 고지");
-        assert_eq!((n.regime, n.bar, n.feed, n.count, n.event), (CtxFloorRegime::Probe, 80, Some("warn"), 1, false));
-        assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, 3_000.0), None, "유휴 Probe 좌석이 발화했다");
-        assert_eq!(report(&mut g, &mut armed, 80, 60, W200K, 3_010.0), post(78, CtxFloorRegime::Probe), "1회 재시도가 없다");
-        // 재시도 뒤 같은 바닥 — 확인 → 자동 clear 중단(정착 창이 닫힌 뒤 바닥+10).
-        clear(&mut g, &mut armed, 3_100.0);
-        g.observe(78, W200K, 3_110.0);
-        assert_eq!(g.effective_threshold(60, W200K, 3_110.0), 80,
-                   "정착 창 안 뒷문(재시도가 창 밖 발화라 다시 무장)이 차단 상한에 없다 — 창 안 빠른 실제 성장(②)");
-        g.observe(78, W200K, 3_110.0 + CTX_FLOOR_SETTLE_QUIET_SECS);
-        assert_eq!(g.effective_threshold(60, W200K, 3_500.0), 88, "확인된 바닥에서 자동 clear 가 멈추지 않았다");
-        let n = g.hold_notice(78, 60, W200K, 3_500.0).expect("Stopped 고지");
-        assert_eq!((n.regime, n.bar, n.feed, n.count), (CtxFloorRegime::Stopped, 88, Some("error"), 1));
-        for (i, p) in [80u8, 84, 87].into_iter().enumerate() {
-            assert_eq!(report(&mut g, &mut armed, p, 60, W200K, 4_000.0 + i as f64), None, "Stopped 좌석이 {p}% 에서 발화");
-        }
-        assert_eq!(report(&mut g, &mut armed, 88, 60, W200K, 4_100.0), post(78, CtxFloorRegime::Stopped),
-                   "실제로 바닥+10 자란 좌석을 clear 하지 않았다(②)");
-        // 다음 세션도 그대로면 곧바로 Stopped(재시도 없음) · 오너 고지는 2·4번째.
-        let mut feeds = vec![];
-        for k in 0..6 {
-            let t = 5_000.0 + 1_000.0 * k as f64;
-            clear(&mut g, &mut armed, t);
-            g.observe(78, W200K, t + 5.0);
-            g.observe(78, W200K, t + 200.0);
-            assert_eq!(g.effective_threshold(60, W200K, t + 500.0), 88);
-            feeds.push(g.hold_notice(78, 60, W200K, t + 500.0).and_then(|n| n.feed));
-            assert_eq!(report(&mut g, &mut armed, 88, 60, W200K, t + 900.0).map(|f| f.regime), Some(Some(CtxFloorRegime::Stopped)));
-        }
-        assert_eq!(feeds, vec![Some("error"), None, Some("error"), None, None, None], "Stopped 고지 주기(2·4·8…)");
-    }
-
-    /// 자동 clear 를 멈춘(Stopped) 좌석은 오너의 수동 clear·재기동(발화 없는 세션 교체)도 다시 잰다 — 처방(지침 축소) 뒤
-    /// 바닥이 내려가면 곧바로 정상 영역. 멈추지 않은 좌석은 발화 없는 교체를 무시한다(종전).
-    #[test]
-    fn ctx_loop_guard_stopped_seat_remeasures_on_any_new_session() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        for (t, _) in [(100.0, 0), (1_000.0, 1)] {
-            clear(&mut g, &mut armed, t);
-            report(&mut g, &mut armed, 78, 60, W200K, t + 10.0);
-            let _ = report(&mut g, &mut armed, 80, 60, W200K, t + 800.0);
-        }
-        assert_eq!(g.effective_threshold(60, W200K, 1_900.0), 88, "전제: Stopped");
-        clear(&mut g, &mut armed, 3_000.0); // 발화 없는 교체(오너 수동 clear)
-        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 3_010.0), None);
-        assert_eq!(g.effective_threshold(60, W200K, 3_010.0), 60, "처방 뒤 새 바닥(30)을 다시 재지 않았다");
-        assert_eq!(report(&mut g, &mut armed, 60, 60, W200K, 9_000.0), post(30, CtxFloorRegime::Raise));
-        // 멈추지 않은 좌석(Raise)은 발화 없는 두 번째 교체를 무시한다 — 세션 흔들림이 정착 창을 다시 열지 않는다.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        report(&mut g, &mut armed, 67, 60, W200K, 110.0);
-        clear(&mut g, &mut armed, 2_000.0);
-        assert!(!g.settling(2_010.0), "발화 없는 교체가 정착 창을 다시 열었다(흔들림이 발화를 막는다 — ②)");
-        assert_eq!(report(&mut g, &mut armed, 75, 60, W200K, 2_020.0), post(67, CtxFloorRegime::Raise));
-    }
-
-    /// 억제 직후 다음 보고가 실효 임계를 **한 번에 건너뛰어도**(큰 파일 읽기 한 번 · 67% → 90%) 발화한다 — 보류가
-    /// 래치를 소진했다면 그 세션 내내 발화하지 않는다(② 무clear).
-    #[test]
-    fn ctx_loop_guard_hold_keeps_the_latch_armed() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, 106.0), None);
-        assert!(armed, "보류가 래치를 소진했다");
-        assert_eq!(report(&mut g, &mut armed, 90, 60, W200K, 1_000.0), post(67, CtxFloorRegime::Raise),
-                   "실효 임계를 건너뛴 보고에서 발화하지 않았다");
-    }
-
-    /// 1M 창(오너 좌석): clear 뒤 바닥 13% — 60% 교차는 종전대로 발화(정책 무변화 · 보류 고지 없음).
-    #[test]
-    fn ctx_loop_guard_leaves_1m_seats_on_the_60_percent_policy() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 60, 60, W1M, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 13, 60, W1M, 160.0), None);
-        assert_eq!(report(&mut g, &mut armed, 15, 60, W1M, 350.0), None);
-        assert_eq!(g.hold_notice(59, 60, W1M, 400.0), None);
-        assert_eq!(report(&mut g, &mut armed, 60, 60, W1M, 9_000.0), post(15, CtxFloorRegime::Raise), "1M 좌석의 60% clear 가 막혔다");
-    }
-
-    /// 200K 좌석이라도 바닥이 낮고(30%) 일해서 60% 에 닿았으면 종전대로 발화한다(오탐 금지) — 정착 창 안의 빠른 성장은
-    /// 바닥에 들어가도(45) 실효 임계는 기본 60 이다.
-    #[test]
-    fn ctx_loop_guard_fires_when_the_seat_grew_by_real_work() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 30, 60, W200K, 150.0), None);
-        assert_eq!(report(&mut g, &mut armed, 45, 60, W200K, 390.0), None, "정착 창 안의 빠른 성장");
-        assert_eq!(report(&mut g, &mut armed, 60, 60, W200K, 900.0), post(45, CtxFloorRegime::Raise), "일해서 찬 교차가 보류됐다");
-    }
-
-    /// 세션 교체가 없는 재교차(자기보고 흔들림 59↔61)는 가드 대상이 아니다 — 종전대로 발화 · 발화 이력 없는 좌석의
-    /// 세션 교체도 무시(부트·phoenix --resume 첫 교차는 종전대로 발화 = 실패 방향).
-    #[test]
-    fn ctx_loop_guard_ignores_recross_without_a_session_change() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, None, 0.0), FIRE);
-        assert_eq!(report(&mut g, &mut armed, 59, 60, None, 10.0), None);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, None, 20.0), FIRE);
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        g.note_session_change(5.0);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W1M, 6.0), FIRE, "발화 이력 없는 첫 교차가 보류됐다");
-    }
-
-    /// 재료 결측 = 종전대로 발화: 정착 창 안 관측이 하나도 없으면(교체 뒤 첫 보고가 창 밖) 바닥 미상 → 기본 임계 ·
-    /// 역할 override 가 천장 이상(90)이면 그 임계가 우선(바닥 91 은 Probe — 91 에선 발화 없음 · 92 에서).
-    #[test]
-    fn ctx_loop_guard_missing_floor_fails_toward_firing() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, 100.0 + CTX_FLOOR_SETTLE_MAX_SECS + 1.0), FIRE);
-        // 붙여넣기만으로 뒷문 높이(max(기본 90, 차단 상한 80)) 위인 좌석: 뒷문 1회 → 다음 세션은 뒷문 없이 증명 → Stopped.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 91, 90, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 91, 90, W200K, 110.0), backstop(91, CtxFloorRegime::Probe), "뒷문 1회");
-        clear(&mut g, &mut armed, 200.0);
-        for t in [210.0, 240.0, 400.0, 5_000.0] {
-            assert_eq!(report(&mut g, &mut armed, 91, 90, W200K, t), None, "바닥 91 에서 뒷문을 연속으로 썼다(① 고리) t={t}");
-        }
-        assert_eq!(g.effective_threshold(90, W200K, 5_000.0), CTX_FLOOR_NEVER, "증명·확인된 바닥 91 — 자동 clear 중단");
-    }
-
-    /// 정착 창: 기본 300초 · 바닥이 최근 120초 안에 올랐으면 연장(복원이 도는 중) · 최대 600초(연장이 발화를 영영 막지
-    /// 않는다 — ②) · quiescing(사이클 진행 중) 관측이 시작점을 뒤로 민다(교체 + 300초까지만 — 멈춘 quiescing 무한 연장 금지).
-    #[test]
-    fn ctx_loop_guard_settle_window_follows_the_restore_but_is_bounded() {
-        // 느린 복원(30초마다 +1%p · 기본 창 300초를 넘는 8분) — 전부 바닥이다 · 멎고 120초 뒤 닫힌다.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        for k in 0..=16u8 {
-            assert_eq!(report(&mut g, &mut armed, 63 + k / 2, 60, W200K, 100.0 + 30.0 * f64::from(k)), None);
-        }
-        let last = 100.0 + 30.0 * 16.0; // 580 — 기본 창(400) 밖
-        assert_eq!(g.settle_peak, Some(71), "기본 창 밖으로 이어진 복원이 바닥에 들지 않았다");
-        assert!(g.settling(last + 100.0), "복원이 도는데 창이 닫혔다");
-        let (mut g2, mut armed2) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g2, &mut armed2, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g2, &mut armed2, 100.0);
-        for k in 0..=8u8 {
-            let _ = report(&mut g2, &mut armed2, 63 + k, 60, W200K, 100.0 + 30.0 * f64::from(k)); // 마지막 상승 340
-        }
-        assert!(g2.settling(340.0 + CTX_FLOOR_SETTLE_QUIET_SECS), "기본 창 밖 복원 연장이 없다");
-        assert!(!g2.settling(340.0 + CTX_FLOOR_SETTLE_QUIET_SECS + 1.0), "복원이 멎은 뒤에도 창이 열려 있다");
-        // 끝없이 오르는 좌석 — 600초에서 닫힌다(그 뒤 성장은 작업).
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W1M, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        for k in 0..100u32 {
-            let _ = report(&mut g, &mut armed, (10 + k).min(100) as u8, 60, W1M, 100.0 + 20.0 * f64::from(k));
-        }
-        assert!(!g.settling(100.0 + CTX_FLOOR_SETTLE_MAX_SECS + 1.0));
-        assert!(g.settle_peak.unwrap() <= 10 + (CTX_FLOOR_SETTLE_MAX_SECS / 20.0) as u8 + 1);
-        // quiescing 200초(붙여넣기 대기) 뒤 복원 250초 — 시작점이 밀려 복원 전체가 바닥이다.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        for k in 0..=20 {
-            g.note_quiescing(100.0 + 10.0 * f64::from(k));
-            let _ = report(&mut g, &mut armed, 3, 60, W200K, 100.0 + 10.0 * f64::from(k));
-        }
-        for k in 0..=10u8 {
-            let _ = report(&mut g, &mut armed, 60 + k, 60, W200K, 300.0 + 25.0 * f64::from(k));
-        }
-        assert_eq!(g.settle_peak, Some(70), "quiescing 뒤 복원이 바닥에 들지 않았다");
-        // 멈춘 quiescing — 시작점은 교체 + 300초 넘어 밀리지 않는다.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        for k in 0..400 {
-            g.note_quiescing(100.0 + 10.0 * f64::from(k));
-        }
-        assert!(g.settle_anchor.unwrap() <= 100.0 + CTX_FLOOR_SETTLE_SECS);
-        assert!(!g.settling(100.0 + 2.0 * CTX_FLOOR_SETTLE_SECS + CTX_FLOOR_SETTLE_MAX_SECS));
-    }
-
-    /// 창이 바뀌면(200K → 1M 전환) 잰 바닥을 토큰 비율로 옮긴다 — 72%(144K) 는 1M 에서 15% → 기본 60 정책.
-    /// 창 미상 보고는 바닥의 창을 유지한다(결측은 값이 아니다).
-    #[test]
-    fn ctx_loop_guard_moves_the_floor_when_the_window_changes() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, 110.0), None);
-        assert_eq!(g.effective_threshold(60, None, 5_000.0), 80, "창 미상 보고가 바닥의 창을 버렸다");
-        assert_eq!(g.effective_threshold(60, W200K, 5_000.0), 80);
-        assert_eq!(g.effective_threshold(60, W1M, 5_000.0), 60, "1M 전환 뒤에도 200K 바닥으로 올린 임계가 남았다");
-        assert_eq!(report(&mut g, &mut armed, 60, 60, W1M, 5_000.0), post(15, CtxFloorRegime::Raise));
-    }
-
-    /// 고지 — 이벤트는 같은 세션 안에서 영역이 올라갈 때만(사이클마다 같은 (영역, 임계)는 이벤트 없음) · 오너 feed 는
-    /// 정착 창이 닫힌 뒤(복원 도중의 바닥으로 말하지 않는다) 세션당 1번 · Raise feed 는 좌석당 1회.
-    #[test]
-    fn ctx_loop_guard_hold_notices_are_not_repeated_every_cycle() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 61, 60, W200K, 0.0), FIRE);
-        let (mut events, mut feeds) = (vec![], vec![]);
-        for k in 0..3 {
-            let t = 100.0 + 3_000.0 * f64::from(k);
-            clear(&mut g, &mut armed, t);
-            g.observe(67, W200K, t + 5.0);
-            let _ = g.effective_threshold(60, W200K, t + 5.0);
-            events.push(g.hold_notice(67, 60, W200K, t + 5.0).map(|n| (n.event, n.feed)));
-            assert_eq!(g.hold_notice(68, 60, W200K, t + 6.0), None, "같은 세션·같은 영역 이벤트가 반복됐다");
-            feeds.push(g.hold_notice(68, 60, W200K, t + 1_000.0).and_then(|n| n.feed));
-            assert_eq!(g.hold_notice(69, 60, W200K, t + 1_100.0), None, "같은 세션의 오너 feed 가 반복됐다");
-            assert_eq!(report(&mut g, &mut armed, 75, 60, W200K, t + 2_000.0).map(|f| f.regime), Some(Some(CtxFloorRegime::Raise)));
-        }
-        assert_eq!(events, vec![Some((true, None)), None, None], "정착 창 안 오너 feed · 사이클마다 같은 이벤트");
-        assert_eq!(feeds, vec![Some("warn"), None, None], "Raise 오너 feed 는 좌석당 1회");
-        // 기본 임계 아래 보고는 고지하지 않는다.
-        clear(&mut g, &mut armed, 20_000.0);
-        g.observe(50, W200K, 20_005.0);
-        assert_eq!(g.hold_notice(50, 60, W200K, 21_000.0), None);
-    }
-
-    /// 세션 교체 판정 — 줄기(세션 id)가 다를 때만 · 결측·표기 차이는 교체가 아니다.
-    #[test]
-    fn session_file_changed_compares_session_stems_only() {
-        assert!(session_file_changed("/p/proj/a.jsonl", "/p/proj/b.jsonl"));
-        assert!(!session_file_changed("/p/proj/a.jsonl", "/private/p/proj/a.jsonl"), "표기 차이를 교체로 셌다");
-        assert!(!session_file_changed("", "/p/proj/b.jsonl"), "결측을 교체로 셌다");
-        assert!(!session_file_changed("/p/proj/a.jsonl", ""), "결측을 교체로 셌다");
-        assert!(!session_file_changed("/p/proj/a.jsonl", "/p/proj/a.jsonl"));
-    }
-
-    /// 배선 핀: 두 관측 경로(transcript 수집기 · statusline 보고)가 세션 교체를 가드에 알리고, 발화 판정은 가드를
-    /// 거친다(관측 → 실효 임계 → 보류 고지 · 교차) — 한 곳이라도 빠지면 그 경로의 좌석에서 고리가 되살아난다.
-    #[test]
-    fn ctx_loop_guard_is_wired_into_both_observation_paths_and_the_gate() {
-        let usage = include_str!("usage.rs");
-        let collect = &usage[usage.find("fn collect_for(").expect("collect_for")..];
-        let collect = &collect[..collect.find("\n}\n").expect("collect_for 끝")];
-        assert!(collect.contains("session_file_changed(") && collect.contains(".note_session_change("),
-                "transcript 수집기의 세션 교체가 가드에 닿지 않는다");
-        let handlers = include_str!("handlers.rs");
-        let report = &handlers[handlers.find("\"usage.report\" =>").expect("usage.report")..];
-        let report = &report[..report.find("\"usage.report_account\" =>").expect("다음 팔")];
-        let note = report.find(".note_session_change(").expect("statusline 경로가 세션 교체를 가드에 알리지 않는다");
-        let fire = report.find("maybe_fire_context_threshold(").expect("statusline 발화");
-        assert!(note < fire, "세션 교체 통지가 발화 판정보다 뒤다(교차 보고에서 가드가 늦는다)");
-        let wrapper = &handlers[handlers.find("pub(crate) fn maybe_fire_context_threshold(").expect("gate")..];
-        let wrapper = &wrapper[..wrapper.find("\n}\n").expect("gate 끝")];
-        assert!(wrapper.contains("maybe_fire_context_threshold_at("), "운영 경로가 본체를 거치지 않는다");
-        let gate = &handlers[handlers.find("pub(crate) fn maybe_fire_context_threshold_at(").expect("gate 본체")..];
-        let gate = &gate[..gate.find("\n}\n").expect("gate 끝")];
-        for needle in [".note_quiescing(", ".observe(", ".effective_threshold(", ".hold_notice(", ".on_crossing("] {
-            assert!(gate.contains(needle), "발화 판정이 가드의 {needle} 를 거치지 않는다");
-        }
-        // 조용함 닫힘: 끝난 틈은 관측 전 · 이어지는 조용함은 관측 뒤(순서가 바뀌면 틈 뒤 작업이 바닥에 들거나 복원 끝이 빠진다).
-        let (gap, obs) = (gate.find("idle.last_gap").expect("게이트가 끝난 틈을 보지 않는다"), gate.find(".observe(").unwrap());
-        let ongoing = gate.find(".note_idle(idle.quiet_since").expect("게이트가 이어지는 조용함을 보지 않는다");
-        assert!(gap < obs && obs < ongoing, "조용함 닫힘 순서(틈 → 관측 → 이어지는 조용함)가 어긋났다");
-        assert!(wrapper.contains("CtxIdleObs::of("), "운영 경로가 좌석의 조용함 관측을 넘기지 않는다");
-        // ★(ROLE-R4-1 · R2NC5-1) 좌석 입력 시각은 틈·관측 **전** — 복원 턴 뒤 첫 입력(붙잡혔던 배달)이 복원 끝 바닥을 확정한다.
-        let input = gate.find(".note_input(idle.last_input").expect("게이트가 좌석 입력 시각을 가드에 넘기지 않는다");
-        assert!(input < gap && input < obs, "좌석 입력 → 틈 → 관측 순서가 어긋났다(배달이 부른 턴이 복원 끝 바닥에 든다)");
-        let deliv = gate.find(".note_delivery(idle.last_queue_delivery, idle.inject_done").expect("게이트가 대기열 배달·제출 시각을 가드에 넘기지 않는다");
-        assert!(deliv < gap && deliv < obs, "대기열 배달 → 틈 → 관측 순서가 어긋났다");
-        // ★(R2NC6-1) 대기열에 남은 항목(붙잡혔던 몰림이 끝났나)도 조용함 판정 전에.
-        let queue = gate.find(".note_queue(idle.queue_oldest)").expect("게이트가 대기열 잔여를 가드에 넘기지 않는다");
-        assert!(queue < gap && queue < obs, "대기열 잔여 → 틈 → 관측 순서가 어긋났다");
-        assert!(gate.contains("\"context.floor_rearmed\""), "Claude 압축 재무장이 관측되지 않는다");
-        let of = &usage[usage.find("pub fn of(daemon: &Daemon, s: &Surface)").expect("CtxIdleObs::of")..];
-        assert!(of[..of.find("\n    }\n").unwrap()].contains("last_input_of(s)"), "조용함 관측이 좌석 입력 시각을 싣지 않는다");
-        assert!(of[..of.find("\n    }\n").unwrap()].contains("last_queue_delivery_at"), "조용함 관측이 대기열 배달 시각을 싣지 않는다");
-        assert!(of[..of.find("\n    }\n").unwrap()].contains("inject_track.done_at()"), "조용함 관측이 배달 제출(CR) 시각을 싣지 않는다");
-        assert!(of[..of.find("\n    }\n").unwrap()].contains("pending_queue"), "조용함 관측이 대기열 잔여(enqueue 시각)를 싣지 않는다");
-        let lio = &usage[usage.find("fn last_input_of(").expect("last_input_of")..];
-        let lio = &lio[..lio.find("\n}\n").unwrap()];
-        for needle in ["inject_track.done_at()", "last_injected", "last_human_input"] {
-            assert!(lio.contains(needle), "좌석 입력 시각이 {needle} 를 보지 않는다");
-        }
-        // 수집기 틱이 보고 없는 유휴 좌석도 닫는다 · PTY reader 가 끝난 틈을 기록한다.
-        let tick = &usage[usage.find("fn collect_tick(").expect("collect_tick")..];
-        let tick = &tick[..tick.find("\n}\n").expect("collect_tick 끝")];
-        assert!(tick.contains("ctx_guard_tick("), "수집기 틱이 가드를 두드리지 않는다(유휴 좌석의 정착 창이 조용함으로 닫히지 않는다)");
-        let tick_at = &usage[usage.find("pub(crate) fn ctx_guard_tick_at(").expect("ctx_guard_tick_at")..];
-        let tick_at = &tick_at[..tick_at.find("\n}\n").unwrap()];
-        assert!(tick_at.find(".note_input(").is_some_and(|i| i < tick_at.find(".note_idle(").unwrap()),
-                "수집기 틱이 좌석 입력 시각을 조용함 판정 전에 넘기지 않는다");
-        assert!(tick_at.find(".note_delivery(").is_some_and(|i| i < tick_at.find(".note_idle(").unwrap()),
-                "수집기 틱이 대기열 배달 시각을 조용함 판정 전에 넘기지 않는다");
-        assert!(tick_at.find(".note_queue(").is_some_and(|i| i < tick_at.find(".note_idle(").unwrap()),
-                "수집기 틱이 대기열 잔여를 조용함 판정 전에 넘기지 않는다");
-        let state = include_str!("state.rs");
-        assert!(state.contains("last_output_gap.lock()") && state.contains("CTX_FLOOR_IDLE_QUIET_SECS"),
-                "PTY reader 가 끝난 조용한 틈을 기록하지 않는다");
-        assert!(state.contains("pub(crate) fn done_at(&self) -> Option<Instant>"), "writer Inject 끝 시각을 읽을 수 없다");
-    }
-
-    // ───────────── ★(R2NC6-1 · RV-ROLE-CF42-1 · R1-RUNAWAY-1) 재검증 2회차 반례 — 바쁜 여유 좌석 · 압축 뒤 재읽기 고리 ─────────────
-
-    /// 운영 신호 모형의 바쁜 좌석 — 복원 턴 30초 뒤 5초 쉬고 분당 `rate`%p(매 분 `turn`초 턴 · 턴 사이 틈 = 60 − turn 초 ·
-    /// 턴 시작마다 대기열 배달), 사이클이 붙잡았던 배달 `backlog`%p/`turns`턴.
-    fn busy_real(win: Option<u64>, paste: f64, restore: f64, rate: f64, turn: f64, backlog: f64, turns: u32) -> Seat {
-        Seat { restore_secs: 30.0, work_after: 5.0, work_per_min: rate, turn_secs: turn, backlog, backlog_turns: turns,
-               ..Seat::real(60, win, paste, restore) }
-    }
-
-    /// ★(R2NC6-1 · RV-ROLE-CF42-1 · ②) **바쁜 여유 좌석**(참 바닥 72 master · 56 worker · 200K·창 미상)은 턴 사이 틈이 2~15초뿐
-    /// 이어도(대기열 최소 간격 10초 · 프롬프트 경계 배달은 조용함을 기다리지 않는다 — 15초 조용함이 오지 않는다) Claude 선제
-    /// 압축(83.5%)보다 먼저 cys clear 된다: 압축 0 · clear 뒤 발화는 Raise·Limited · max(기본, 차단 상한) + 1 이하 · 좌석이
-    /// 선제 압축점 근처로 끌려가지 않는다. d9638152 는 복원 끝이 확정된 뒤 정착 창을 15초 조용함에서만 닫아, 창이 시작점 +
-    /// 300~600초까지 열린 채 작업을 최고치에 싣고(막대 = 최고치 + 1 → 82~86) 뒷문은 첫 세션에만 있어 둘째 세션부터 매번 Claude
-    /// 압축에 clear 를 빼앗겼다(재검증자 run_seat 반례 · 샌드박스 드릴 run-rvnc6-*). 틈 20초(15초 조용함이 온다)는 대조다.
-    #[test]
-    fn r2nc6_busy_roomy_seat_with_short_gaps_is_cleared_before_claude_compaction() {
-        let mut bad = vec![];
-        let mut check = |name: &str, seat: Seat, cap: u8| {
-            let run = run_seat(seat, 3.0 * 3600.0);
-            let post: Vec<_> = run.fires.iter().skip(1).map(|(t, p, f, _)| (*t as u32, *p, f.regime, f.floor, f.settled, f.settle_backstop)).collect();
-            let line = format!("{name} 발화 {} 압축 {:?} 최고 {} {post:?}", run.fires.len(), run.compactions, run.max_post_clear);
-            let late = run.fires.iter().skip(1).any(|(_, p, f, _)| {
-                *p > cap + 1 || f.after_compaction || !matches!(f.regime, Some(CtxFloorRegime::Raise | CtxFloorRegime::Limited))
-            });
-            if run.fires.len() < 3 || !run.compactions.is_empty() || late || run.max_post_clear >= 83 {
-                bad.push(line);
-            }
-        };
-        for win in [W200K, None] {
-            // 적체 없음 · 분당 1.0~3.0%p × 틈 3·8·14초(턴 57·52·46초) — 재검증자 반례 격자 + 대조 틈 20초.
-            for rate in [1.0, 1.3, 1.6, 2.0, 2.5, 3.0] {
-                for turn in [40.0, 46.0, 52.0, 57.0] {
-                    check(&format!("{win:?} master 72 분당 {rate} 틈 {}s", 60.0 - turn), busy_real(win, 63.3, 8.9, rate, turn, 0.0, 0), 80);
-                    // 참 바닥 56 worker(Raise — 천장 75).
-                    check(&format!("{win:?} worker 56 분당 {rate} 틈 {}s", 60.0 - turn), busy_real(win, 51.0, 5.0, rate, turn, 0.0, 0), 75);
-                }
-            }
-            // 사이클이 붙잡았던 배달 5%p(3턴) + 분당 0.8~1.3%p(RV-ROLE-CF42-1 '적체 5%p 를 더하면 분당 0.8%p 만으로도 압축 7').
-            for rate in [0.8, 1.0, 1.3] {
-                for turn in [46.0, 52.0, 57.0] {
-                    check(&format!("{win:?} master 72 적체 5 분당 {rate} 틈 {}s", 60.0 - turn), busy_real(win, 63.3, 8.9, rate, turn, 5.0, 3), 80);
-                }
-            }
-        }
-        assert!(bad.is_empty(), "(②) 바쁜 여유 좌석의 cys clear 가 늦었다(Claude 선제 압축 83.5% 가 먼저 오거나 차단 상한 위) — {} 건:\n{}",
-                bad.len(), bad.join("\n"));
-    }
-
-    /// ★(R2NC6-1 · ②) 같은 바쁜 여유 좌석에서 **자동 압축을 끈 좌석**(모형은 차단점 88.5% 위로도 자란다 — 실좌석은 거기서 프롬프트가
-    /// 멈춘다)은 차단 상한(80) + 1 이하에서 clear 되고 차단점 근처로 끌려가지 않는다. d9638152 는 88~100% 에서 발화했다(드릴
-    /// run-rvnc6-*-noac · 오너 feed '93% 에서 clear').
-    #[test]
-    fn r2nc6_busy_roomy_seat_without_autocompact_is_cleared_below_the_blocking_point() {
-        let mut bad = vec![];
-        for win in [W200K, None] {
-            for rate in [1.3, 1.6, 2.0, 2.5, 3.0] {
-                for turn in [46.0, 52.0, 57.0] {
-                    let seat = Seat { compact_at: None, ..busy_real(win, 63.3, 8.9, rate, turn, 0.0, 0) };
-                    let run = run_seat(seat, 3.0 * 3600.0);
-                    let post: Vec<_> = run.fires.iter().skip(1).map(|(t, p, f, _)| (*t as u32, *p, f.regime, f.settled)).collect();
-                    if run.fires.len() < 3 || run.fires.iter().skip(1).any(|(_, p, _, _)| *p > 81) || run.max_post_clear >= 88 {
-                        bad.push(format!("{win:?} 분당 {rate} 틈 {}s 최고 {} {post:?}", 60.0 - turn, run.max_post_clear));
-                    }
-                }
-            }
-        }
-        assert!(bad.is_empty(), "(②) 자동 압축을 끈 바쁜 여유 좌석이 차단점(88.5%) 근처까지 cys clear 없이 자랐다 — {} 건:\n{}",
-                bad.len(), bad.join("\n"));
-    }
-
-    /// ★(R2NC6-1 · RV-ROLE-CF42-1 · 대조 ①) 복원 끝 확정 뒤 정착 창 닫힘 세부 — 사이클이 붙잡았던 대기열 항목(시작점 = quiescing
-    /// 해제 **전**에 들어온 것)이 남아 있는 동안은 몰림 중이라 15초 조용함(대기열 막힘)에서만 닫는다(몰림 길이와 무관하게 몰림
-    /// 전체가 최고치에 든다 · 몰림만으로 발화 없음). 다 배달되면 **마지막 배달 뒤에 시작한** ≥2초 조용함(그 배달 턴의 끝)에서
-    /// 닫는다 — 배달 전부터 이어진 조용함(인계 직후 · 출력 전)은 닫지 않는다. 시작점 뒤에 들어온 항목(새 작업)은 몰림이 아니다.
-    #[test]
-    fn r2nc6_settle_window_closes_once_the_held_backlog_is_delivered() {
-        let a = 110.0;
-        let setup = |held: Option<f64>| {
-            let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-            assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-            clear(&mut g, &mut armed, 100.0);
-            g.note_quiescing(a); // 붙여넣기 = 시작점
-            g.note_queue(held);
-            g.note_input(Some(a), a);
-            assert_eq!(report(&mut g, &mut armed, 64, 60, W200K, a + 5.0), None);
-            assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, a + 30.0), None);
-            g.note_delivery(Some(a + 33.0), None, a + 33.0); // 복원 턴 뒤 첫 대기열 배달 — 복원 끝 72 확정
-            g.note_idle(a + 30.0, a + 33.0, a + 33.0);
-            assert_eq!((g.restore_peak, g.restore_freeze_at), (Some(72), Some(a + 33.0)));
-            assert_eq!(report(&mut g, &mut armed, 76, 60, W200K, a + 45.0), None);
-            (g, armed)
-        };
-        // 붙잡혔던 항목이 남았다(clear 1초 뒤 enqueue) — 시작점 + 최소 창 뒤의 14초 조용함도 닫지 않는다 · 15초는 닫는다.
-        let (mut g, _) = setup(Some(101.0));
-        g.note_idle(a + 100.0, a + 114.0, a + 114.0);
-        assert!(g.settling(a + 114.0), "붙잡혔던 배달이 남았는데 15초 미만 조용함이 창을 닫았다(몰림이 성장으로 셈 · ①)");
-        g.note_idle(a + 100.0, a + 115.0, a + 115.0);
-        assert!(!g.settling(a + 115.0), "대기열이 막힌 15초 조용함이 창을 닫지 않았다");
-        // 다 배달됐다(마지막 배달 a+80) — 그 배달 턴 뒤 3초 조용함이 닫는다. 그 뒤 작업은 성장(막대 = 최고치 78 의 미확인 막대 80).
-        let (mut g, mut armed) = setup(Some(101.0));
-        g.note_delivery(Some(a + 80.0), None, a + 80.0);
-        g.note_queue(None);
-        g.note_idle(a + 78.0, a + 81.0, a + 81.0);
-        assert!(g.settling(a + 81.0), "마지막 배달 전부터 이어진 조용함(인계 직후 · 턴 전)이 창을 닫았다");
-        assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, a + 90.0), None); // 마지막 배달의 턴
-        g.note_idle(a + 91.0, a + 94.0, a + 94.0);
-        assert!(!g.settling(a + 94.0), "몰림이 끝난 뒤의 3초 조용함이 창을 닫지 않았다(바쁜 좌석 작업이 바닥에 든다 · ②)");
-        assert_eq!(report(&mut g, &mut armed, 79, 60, W200K, a + 120.0), None);
-        assert_eq!(g.settle_peak, Some(78));
-        assert_eq!(report(&mut g, &mut armed, 80, 60, W200K, a + 150.0), post_split(72, 78, CtxFloorRegime::Limited));
-        // 남은 항목이 복원 끝(첫 배달 a+33 — 복원 끝 확정) **뒤**에 들어온 것(새 작업)이면 몰림이 아니다 — 3초 조용함이 닫는다.
-        let (mut g, _) = setup(None);
-        g.note_queue(Some(a + 40.0));
-        g.note_idle(a + 57.0, a + 60.0, a + 60.0);
-        assert!(!g.settling(a + 60.0), "복원 끝 뒤에 들어온 항목을 몰림으로 봤다");
-        // ★(RV2NC-E20-1) 복원 턴 **도중**(시작점 뒤 · 복원 끝 전 a+20)에 대기열에 선 항목은 몰림이다 — 복원된 좌석이 부른 회신
-        //   몰림(드릴 rv-d1p)이 그 모양이다. 종전(시작점 기준)은 몰림 한가운데서 닫아 나머지를 성장으로 셌다.
-        let (mut g, _) = setup(Some(a + 20.0));
-        g.note_idle(a + 57.0, a + 60.0, a + 60.0);
-        assert!(g.settling(a + 60.0), "복원 턴 도중에 선 항목(회신 몰림)을 새 작업으로 봤다");
-        g.note_idle(a + 60.0, a + 75.0, a + 75.0);
-        assert!(!g.settling(a + 75.0), "몰림이 막힌 15초 조용함이 창을 닫지 않았다");
-        // 1.9초 틈은 여전히 닫지 않는다 · 시작점 + 최소 창 전에도 닫지 않는다.
-        let (mut g, _) = setup(None);
-        g.note_idle(a + 57.1, a + 59.0, a + 59.0);
-        g.note_idle(a + 50.0, a + 59.0, a + 59.0);
-        assert!(g.settling(a + 59.0));
-    }
-
-    /// ★(R2NC6-1 · 뒷문) 복원 끝에 여유가 있는 세션이 차단 상한 **이하 막대**(정착 창 최고치 + 1 ≤ 차단 상한)에서 창 밖 발화하면
-    /// 뒷문을 다시 무장한다(정착 창 최고치가 76~79 라 영역이 Probe 로 보여도 — 복원 끝이 차단기 재료가 아니다). 최고치가 차단 상한
-    /// 이상(몰림이 여유보다 컸다 · 막대 = 최고치 + 1)인 세션은 다시 무장하지 않는다 — 몰림만으로 뒷문이 도는 교대 고리 없음(①).
-    #[test]
-    fn r2nc6_roomy_session_fire_at_the_hard_cap_rearms_the_backstop() {
-        for (settled, rearm) in [(76u8, true), (79, true), (80, false), (82, false)] {
-            let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-            assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-            g.backstop_spent = true;
-            clear(&mut g, &mut armed, 100.0);
-            g.note_quiescing(110.0);
-            let a = 110.0;
-            g.note_input(Some(a), a);
-            assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, a + 30.0), None);
-            g.note_delivery(Some(a + 33.0), None, a + 33.0);
-            g.note_idle(a + 30.0, a + 33.0, a + 33.0);
-            assert_eq!(report(&mut g, &mut armed, settled, 60, W200K, a + 45.0), None);
-            let to = a + 46.0 + CTX_FLOOR_BURST_QUIET_SECS;
-            g.note_idle(a + 46.0, to, to); // 몰림 뒤 15초 조용함 — 창 닫힘
-            assert!(!g.settling(to));
-            // ★(RV2NC-E20-1) 얇은 세션(최고치 ≥ 76)의 미확인 막대 = max(차단 상한, 최고치 + 2) — 발화가 실제 성장 ≥ 1%p 를 입증한다.
-            let bar = settled.saturating_add(2).max(80);
-            assert_eq!(g.effective_threshold(60, W200K, a + 899.0), bar, "최고치 {settled}");
-            let f = report(&mut g, &mut armed, bar, 60, W200K, a + 900.0).expect("여유 세션의 창 밖 발화");
-            assert_eq!((f.regime, f.floor, f.settle_backstop), (Some(CtxFloorRegime::Limited), Some(72), false));
-            assert_eq!(!g.backstop_spent, rearm, "최고치 {settled}: 뒷문 재무장 {rearm} 이어야 한다");
-        }
-    }
-
-    /// ★(R1-RUNAWAY-1 · ①) **압축 뒤 지침 재읽기 고리** — clear + 붙여넣기 + 복원이 이미 Claude 선제 압축점(83.5~90%) 위인 유휴
-    /// 좌석(주기 신호만 · 분당 0.03%p)에서, 압축 뒤 SessionStart:compact 훅이 시킨 지침 재읽기로 압축 뒤 수준이 기본 임계 위
-    /// (30 + 25~45%p = 55~75%)면 d9638152 는 재무장(기본 임계)이 그 수준에서 곧바로 발화 → 사이클의 붙여넣기가 다시 압축 →
-    /// 재읽기 → 재무장 → 발화를 주기 신호마다 돌았다(4시간 19~21회). 재무장은 압축 뒤 바닥(재읽기 턴까지)을 다시 재고 그 위로
-    /// 실제로 자란 뒤에만 발화한다 — 사이클 수는 실제 성장으로만 묶인다(압축 수로 셈하지 않는다 · R1-RUNAWAY-2).
-    /// 사이클 = 앞 발화의 clear 가 난 뒤의 발화. 앞 발화의 clear **전에** Claude 가 먼저 압축하고 재읽기가 기본 임계를 다시
-    /// 넘으면 그 교차가 한 번 더 난다(clear 뒤 세션이 아니다 = 기본 임계 · 종전 래치 거동 · 경보 라우터 쿨다운 5분이 접는다) —
-    /// 그것은 새 사이클이 아니므로 따로 세고 1회 이하로 묶는다.
-    #[test]
-    fn r1_runaway_post_compaction_reread_does_not_refire_an_idle_seat() {
-        let mut bad = vec![];
-        for win in [W200K, None] {
-            // 붙여넣기+복원만으로 선제 압축점 위(83.5~90) · 또는 참으로 가득 찬 CEO(77.8) + 사이클이 붙잡은 배달 6.5%p(3턴).
-            for (paste, restore, backlog, turns) in [(76.0, 7.5, 0.0, 0u32), (76.0, 9.0, 0.0, 0), (78.0, 12.0, 0.0, 0), (69.35, 8.45, 6.5, 3)] {
-                for reread in [0.0, 25.0, 30.0, 33.0, 40.0, 45.0] {
-                    for rate in [0.0, 0.03] {
-                        let seat = Seat { work_after: 20.0, work_per_min: rate, turn_secs: 5.0, reread, backlog, backlog_turns: turns,
-                                          ..Seat::real(60, win, paste, restore) };
-                        let run = run_seat(seat, 4.0 * 3600.0);
-                        let grown = rate * 4.0 * 60.0;
-                        let bound = 2 + (grown / f64::from(CTX_FLOOR_MIN_ROOM)).floor() as usize;
-                        // 앞 발화의 clear(발화 + cycle_delay) 전의 재교차는 새 사이클이 아니다.
-                        let refires = run.fires.windows(2).filter(|w| w[1].0 - w[0].0 < seat.cycle_delay).count();
-                        let cycles = run.fires.len() - refires;
-                        let fires: Vec<_> = run.fires.iter().map(|(t, p, f, _)| (*t as u32, *p, f.regime, f.floor, f.after_compaction)).collect();
-                        let line = format!("{win:?} 붙여넣기 {paste}+{restore} 몰림 {backlog} 재읽기 +{reread} 분당 {rate}: 사이클 {cycles} 재교차 {refires} 압축 {} \
-                                            재무장 {} {fires:?}", run.compactions.len(), run.rearms);
-                        if cycles > bound || refires > 1 {
-                            bad.push(line);
+                    Phase::Cycling { since } => {
+                        await_since = None;
+                        if t - since > CTX_GUARD_CYCLING_MAX_SECS + 25.0 {
+                            st.v_cyc += 1;
                         }
                     }
+                    Phase::Measuring { anchor, secs, .. } => {
+                        await_since = None;
+                        if t > anchor + secs + 25.0 {
+                            st.v_meas += 1;
+                        }
+                    }
+                    Phase::Free => await_since = None,
                 }
-            }
-        }
-        assert!(bad.is_empty(), "(①) 유휴 좌석이 압축 → 재읽기 → 재무장 발화 고리를 돈다 — {} 건:\n{}", bad.len(), bad.join("\n"));
-    }
-
-    /// ★(R1-RUNAWAY-1 · ① · ②) 일하는 좌석에서도 압축 뒤 발화는 **압축 뒤 잰 바닥 위로 실제로 자란 뒤**다 — 참으로 가득 찬
-    /// 200K·창 미상 CEO(복원 끝 77.8) · 배달 몰림 6.5%p(3턴) · 압축 뒤 재읽기 0·33%p · 분당 0.2%p(5분에 1%p) · 8시간:
-    /// 압축 뒤 발화의 pct ≥ 압축 뒤 잰 바닥 + 최소 여유(Probe 1%p) · 기본 임계 이상 · ★(ADV2-R1-1) clear 로 돌아오는 바닥 + 1 이상 ·
-    /// 사이클 수 ≤ 2 + 성장 ÷ 최소 여유(압축 수를 셈하지 않는다). Claude 압축은 여전히 재무장한다 — clear 바닥이 선제 압축점 아래면
-    /// 압축 뒤 cys 사이클이 난다(R2NC5-1 (b) 유지) · 위(몰림 6.5 → 84)면 없다(그 clear 가 곧바로 다음 압축을 부른다).
-    #[test]
-    fn r1_runaway_after_compaction_fire_needs_growth_above_the_post_compaction_floor() {
-        for win in [W200K, None] {
-            for reread in [0.0, 33.0] {
-                for (backlog, turns) in [(0.0, 0u32), (6.5, 3)] {
-                    let seat = Seat { restore_secs: 30.0, backlog, backlog_turns: turns, work_after: 20.0, work_per_min: 0.2, turn_secs: 20.0,
-                                      reread, ..Seat::real(60, win, 69.35, 8.45) };
-                    let run = run_seat(seat, 8.0 * 3600.0);
-                    let ctx = format!("{win:?} 재읽기 +{reread} 몰림 {backlog}: 발화 {:?} 압축 {:?}", run.fires, run.compactions);
-                    let grown = 0.2 * 8.0 * 60.0;
-                    assert!((run.fires.len() as f64) <= 2.0 + grown / f64::from(CTX_FLOOR_MIN_ROOM), "(①) 사이클이 성장보다 많다 — {ctx}");
-                    assert!(run.rearms <= run.compactions.len(), "{ctx}");
-                    let after: Vec<_> = run.fires.iter().filter(|f| f.2.after_compaction).collect();
-                    let landing = (69.35 + 8.45 + backlog).round() as u8;
-                    for (_, p, f, _) in &after {
-                        let floor = f.floor.expect("압축 뒤 발화에는 압축 뒤 잰 바닥이 있다");
-                        let min_room = if f.regime == Some(CtxFloorRegime::Probe) { 1 } else { CTX_FLOOR_MIN_ROOM };
-                        assert!(*p >= 60 && p.saturating_sub(floor) >= min_room, "(①) 압축 뒤 바닥 {floor} 위 {p} 에서 발화 — {ctx}");
-                        assert!(*p > landing, "(ADV2-R1-1) 압축 뒤 발화 {p} 가 clear 로 돌아오는 바닥 {landing} 이하 — {ctx}");
-                    }
-                    if !run.compactions.is_empty() && reread == 0.0 && landing + 1 < 83 {
-                        assert!(!after.is_empty(), "(②) Stopped 좌석이 압축 뒤 cys 사이클을 다시 받지 못한다 — {ctx}");
-                    }
-                    if landing + 1 >= 84 {
-                        assert!(after.is_empty(), "(ADV2-R1-1) clear 바닥이 선제 압축점 위인 좌석에 압축 뒤 cys 사이클 — {ctx}");
+                for a in [Axis::Measured, Axis::SelfReport] {
+                    if g.bar(a, base, window) > base.max(block_cap(window)) {
+                        st.v_bar += 1;
                     }
                 }
             }
+            for (i, a) in fires.iter().enumerate() {
+                st.max_hour = st.max_hour.max(fires[i..].iter().take_while(|b| **b - a < 3600.0).count());
+            }
         }
+        st
     }
 
-    /// ★(R2NC6-1 · RV-ROLE-CF42-1 · ① · ② 격자) 몰림 판정을 **대기열 사실**(시작점 전에 들어온 항목이 남았나)로 하면 몰림 길이와
-    /// 작업 틈에 무관하게 두 불변식이 함께 선다:
-    /// (①) 유휴 좌석(참 바닥 72~74)이 사이클마다 붙잡힌 배달 5~12%p 를 1~8턴 × 5~30초(몰림 5~264초)로 받아도 재발화 없음 —
-    ///     부트 1회 + 몰림이 차단 상한을 넘으면 뒷문 1회. (시간 수명 60초로 자르면 몰림이 60초를 넘는 160/1152 경우가 2시간에
-    ///     19~35회 도는 고리였다 — 기각한 설계.)
-    /// (②) 바쁜 여유 좌석(참 바닥 56~74 · 붙잡힌 배달 0~7%p · 분당 0.5~3%p · 턴 20~57초)은 Claude 선제 압축 0 · clear 는 82 이하
-    ///     (분당 3%p 에서 보고 간격만큼 넘어 보임). d9638152 는 같은 격자에서 282/660 이 83% 이상·압축이었다.
+    fn prop_stats() -> &'static PropStats {
+        static STATS: std::sync::OnceLock<PropStats> = std::sync::OnceLock::new();
+        STATS.get_or_init(|| prop_run(10_000))
+    }
+
+    /// I1 — 무작위 사건열 1만 씨앗에서 연속 두 발화 간격 ≥ 600초 · 굴림 1시간 ≤ 6.
     #[test]
-    fn r2nc6_held_backlog_of_any_length_is_absorbed_and_busy_seats_clear_before_compaction() {
-        let mut bad = vec![];
-        for win in [W200K, None] {
-            for (paste, restore) in [(63.3, 8.9), (72.0, 0.0), (70.0, 4.0)] {
-                for bl in [5.0, 8.0, 9.0, 12.0] {
-                    for bt in [1u32, 2, 3, 4, 6, 8] {
-                        for bts in [5.0, 10.0, 20.0, 30.0] {
-                            for (rs, qg) in [(14.0, 0.3), (53.0, 3.0)] {
-                                let seat = Seat { restore_secs: rs, backlog: bl, backlog_turns: bt, backlog_turn_secs: bts, queue_gap: qg,
-                                                  ..Seat::real(60, win, paste, restore) };
-                                let run = run_seat(seat, 2.0 * 3600.0);
-                                // (몰림만으로 선제 압축점 위(72 + 12)면 Claude 가 압축한다 — 그것은 고리가 아니다 · 발화 수만 본다.)
-                                if run.fires.len() > 2 {
-                                    bad.push(format!("(①) 유휴 {win:?} {paste}+{restore} 몰림 {bl}%p/{bt}×{bts}s: 발화 {:?}", run.fires));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            for (paste, restore) in [(63.3, 8.9), (70.0, 4.0), (51.0, 5.0)] {
-                for rate in [0.5, 0.8, 1.0, 1.3, 2.0, 3.0] {
-                    for turn in [20.0, 40.0, 46.0, 52.0, 57.0] {
-                        for (bl, bt) in [(0.0, 0u32), (3.3, 2), (5.0, 3), (7.0, 3)] {
-                            if paste + restore + bl >= 80.0 {
-                                continue; // 붙잡힌 배달만으로 차단 상한 위 — 여유 좌석이 아니다
-                            }
-                            let seat = Seat { restore_secs: 30.0, work_after: 5.0, work_per_min: rate, turn_secs: turn, backlog: bl,
-                                              backlog_turns: bt, ..Seat::real(60, win, paste, restore) };
-                            let run = run_seat(seat, 3.0 * 3600.0);
-                            let late = run.fires.iter().skip(1).any(|(_, p, f, _)| f.after_compaction || *p > 82);
-                            if run.fires.len() < 3 || !run.compactions.is_empty() || late {
-                                bad.push(format!("(②) 바쁜 {win:?} {paste}+{restore} 몰림 {bl}/{bt} 분당 {rate} 턴 {turn}s: 발화 {:?} 압축 {:?}",
-                                                 run.fires.iter().map(|f| (f.0 as u32, f.1)).collect::<Vec<_>>(), run.compactions));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(bad.is_empty(), "{} 건:\n{}", bad.len(), bad.join("\n"));
+    fn i1_min_spacing_property() {
+        let st = prop_stats();
+        assert!(st.fires > 10_000, "사건열이 발화를 충분히 만들지 않았다(검사가 공허): {st:?}");
+        assert!(st.min_spacing >= CTX_GUARD_MIN_SPACING_SECS - 1e-6 && st.max_hour <= 6, "{st:?}");
     }
 
-    // ───────────── ★(RV2NC-E20-1 · RV2NC-E20-2 · RV2-ROLE-1 · ADV2-R1-1) 재검증 3회차 반례 ─────────────
-
-    /// 사이클 수(부트 교차 포함) — 앞 발화의 clear(발화 + cycle_delay) **전의** 재교차는 새 사이클이 아니다(경보 라우터가 접는다).
-    fn cycles(run: &Run, seat: &Seat) -> usize {
-        let refires = run.fires.windows(2).filter(|w| w[1].0 - w[0].0 < seat.cycle_delay).count();
-        run.fires.len() - refires
-    }
-
-    /// ★(RV2NC-E20-1 · ① 회귀 · 재검증자 모형 그대로) **사이클마다 몰림이 정착 최고치를 다시 채우는 유휴 좌석**은 주기 신호만으로
-    /// 매 세션 다시 발화하지 않는다 — 작성자 유휴 검체의 좌석(참 바닥 72~74 · 사이클이 붙잡은 몰림 5~9%p)과 재검증자 격자(붙잡힌
-    /// 몰림 · **복원 끝 2초 뒤 한꺼번에 선 회신 몰림**(드릴 rv-d1p))에 주기 신호(분당 0.03·0.1·0.15%p · 5초 턴)를 더해 4시간:
-    /// 사이클 수 ≤ 2 + 성장/5(성장 = 주기 신호 몫만 — 몰림은 사이클이 부른 것이다). e20f1cb6 은 여유 있는 복원 끝이 확인을 영구히
-    /// 꺼 막대가 최고치 + 1 에 머물렀다(4시간 14~52회 · 드릴 1시간 10~11회). 얇은 세션은 1회 뒤 몰림을 바닥으로 확정한다(Backlog).
+    /// I2 — 비-Free 체류 상한(Awaiting ≤ 1200 + 동결 · Cycling ≤ 660 · Measuring ≤ 창) · 보류 ≤ 7200 · 보류된 실측 관측은 새
+    /// 관측이 없어도 보류 만료 뒤 첫 틱에 발화 · 막대 ≤ max(기본, C).
     #[test]
-    fn rv2nc_e20_idle_seat_with_a_recurring_backlog_does_not_loop_on_heartbeats() {
-        let mut bad = vec![];
-        let mut backlog_seen = 0;
-        for win in [W200K, None] {
-            for (paste, restore, backlog, turns) in [(63.3, 8.9, 5.0, 3u32), (72.0, 0.0, 5.0, 1), (70.0, 4.0, 7.0, 3), (72.0, 0.0, 9.0, 3),
-                                                     (63.3, 8.9, 8.0, 3), (70.0, 4.0, 5.0, 3), (68.0, 4.0, 6.0, 2)] {
-                for reply in [None, Some(2.0)] {
-                    for rate in [0.0, 0.03, 0.1, 0.15] {
-                        for (restore_secs, queue_gap) in [(30.0, 0.3), (14.0, QUEUE_QUIET)] {
-                            let seat = Seat { restore_secs, backlog, backlog_turns: turns, backlog_reply: reply, queue_gap, work_after: 20.0,
-                                              work_per_min: rate, turn_secs: 5.0, ..Seat::real(60, win, paste, restore) };
-                            let run = run_seat(seat, 4.0 * 3600.0);
-                            let bound = 2 + (rate * 240.0 / f64::from(CTX_FLOOR_MIN_ROOM)).floor() as usize;
-                            let n = cycles(&run, &seat);
-                            backlog_seen += run.fires.iter().filter(|f| f.2.regime == Some(CtxFloorRegime::Backlog)).count();
-                            if n > bound {
-                                bad.push(format!("{win:?} {paste}+{restore} 몰림 {backlog}/{turns} 회신 {reply:?} 분당 {rate} 복원 {restore_secs}s: \
-                                                  사이클 {n} > {bound} {:?}",
-                                                 run.fires.iter().map(|f| (f.0 as u32, f.1, f.2.regime, f.2.settled)).collect::<Vec<_>>()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(bad.is_empty(), "(①) 몰림이 되풀이되는 유휴 좌석이 주기 신호만으로 매 세션 발화한다 — {} 건:\n{}", bad.len(), bad.join("\n"));
-        assert!(backlog_seen > 0, "이 검체가 Backlog(몰림 확정) 발화를 한 번도 내지 않았다 — 반례 모양을 재현하지 못한다");
+    fn i2_bounded_latency_property() {
+        let st = prop_stats();
+        assert!(st.retries_ok > 100, "보류 재판정 발화가 거의 없다(검사가 공허): {st:?}");
+        assert_eq!((st.v_await, st.v_cyc, st.v_meas, st.v_hold, st.v_retry, st.v_bar), (0, 0, 0, 0, 0, 0), "{st:?}");
     }
 
-    /// ★(RV2NC-E20-1 · ② 대조 · 빈도 상한의 다른 쪽) 같은 몰림이 되풀이되는 좌석이라도 **일하면**(분당 0.5~3%p) 얇은 세션의 발화가
-    /// 빠른 성장이라 확인되지 않는다 — clear 는 차단 상한 근처(≤ 82)에서 · Claude 선제 압축 0 · Backlog 없음(R2NC6 바쁜 격자와 같은
-    /// 좌석 · 회신 몰림 포함). 종전 fba29db0 은 이 좌석을 Probe → Stopped(86~88)로 보내 매 세션 Claude 압축이 먼저 왔다.
+    /// I3 — 발화 퍼센트 ≥ 그 축의 '마지막 사이클 끝·압축 뒤 창 안 S 미만 관측 최고치'(오라클이 따로 센다) 기준 막대.
     #[test]
-    fn rv2nc_e20_busy_seat_with_a_recurring_backlog_keeps_clearing_near_the_hard_cap() {
-        let mut bad = vec![];
-        for win in [W200K, None] {
-            for (paste, restore) in [(63.3, 8.9), (70.0, 4.0)] {
-                for (bl, bt) in [(3.3, 2u32), (5.0, 3), (7.0, 3)] {
-                    if paste + restore + bl >= 80.0 {
-                        continue;
-                    }
-                    for reply in [None, Some(2.0)] {
-                        for rate in [0.5, 1.0, 2.0, 3.0] {
-                            for turn in [20.0, 46.0, 57.0] {
-                                let seat = Seat { restore_secs: 30.0, work_after: 5.0, work_per_min: rate, turn_secs: turn, backlog: bl,
-                                                  backlog_turns: bt, backlog_reply: reply, ..Seat::real(60, win, paste, restore) };
-                                let run = run_seat(seat, 3.0 * 3600.0);
-                                let late = run.fires.iter().skip(1).any(|(_, p, f, _)| {
-                                    f.after_compaction || *p > 82 || matches!(f.regime, Some(CtxFloorRegime::Backlog | CtxFloorRegime::Probe | CtxFloorRegime::Stopped))
-                                });
-                                if run.fires.len() < 3 || !run.compactions.is_empty() || late {
-                                    bad.push(format!("{win:?} {paste}+{restore} 몰림 {bl}/{bt} 회신 {reply:?} 분당 {rate} 턴 {turn}s: 발화 {:?} 압축 {:?}",
-                                                     run.fires.iter().map(|f| (f.0 as u32, f.1, f.2.regime)).collect::<Vec<_>>(), run.compactions));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(bad.is_empty(), "(②) 몰림이 되풀이되는 바쁜 좌석의 cys clear 가 늦었다 — {} 건:\n{}", bad.len(), bad.join("\n"));
-    }
-
-    /// ★(RV2NC-E20-1 · 세부) 얇은 세션의 발화 판정 — 미확인 막대는 최고치 + 2(79 → 81)이고, 정착 창이 닫힌 뒤 느린 성장(주기
-    /// 신호)으로 닿으면 다음 세션이 몰림을 바닥으로 확정(Backlog · 최고치 + 6) · 빠른 성장(일하는 좌석)이면 확인하지 않는다. Backlog
-    /// 세션의 빠른 발화도 확인을 푼다. 복원 끝이 차단기 높이인 세션(참으로 가득 참)은 종전대로 Probe → Stopped.
-    #[test]
-    fn rv2nc_e20_thin_session_fire_is_classified_by_growth_speed() {
-        // clear → 붙여넣기(시작점 a) → 복원 72 → 대기열 배달(복원 끝 확정) → 몰림 턴 → 15초 조용함(창 닫힘) 뒤 settled.
-        let session = |g: &mut CtxLoopGuard, armed: &mut bool, t0: f64, restore: u8, settled: u8| -> f64 {
-            clear(g, armed, t0);
-            let a = t0 + 10.0;
-            g.note_quiescing(a);
-            g.note_input(Some(a), a);
-            assert_eq!(report(g, armed, restore, 60, W200K, a + 30.0), None);
-            g.note_delivery(Some(a + 33.0), None, a + 33.0);
-            g.note_idle(a + 30.0, a + 33.0, a + 33.0);
-            assert_eq!(report(g, armed, settled, 60, W200K, a + 45.0), None);
-            g.note_idle(a + 46.0, a + 90.0, a + 90.0);
-            assert!(!g.settling(a + 90.0), "창이 닫히지 않았다");
-            a + 90.0
-        };
-        // 느린 얇은 발화(79 → 81 을 40분에) → 다음 세션 Backlog 85(79 + 6) → 빠른 Backlog 발화(85 를 3분에) → 다음 세션 Limited 81.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        let close = session(&mut g, &mut armed, 100.0, 72, 79);
-        assert_eq!(g.effective_threshold(60, W200K, close), 81, "얇은 미확인 막대 = 최고치 + 2");
-        assert_eq!(report(&mut g, &mut armed, 80, 60, W200K, close + 1_200.0), None);
-        assert_eq!(report(&mut g, &mut armed, 81, 60, W200K, close + 2_400.0), post_split(72, 79, CtxFloorRegime::Limited));
-        assert!(g.session_tier3 && !g.session_fast, "느린 얇은 발화가 확인 재료가 아니다");
-        let close = session(&mut g, &mut armed, 3_000.0, 72, 79);
-        assert_eq!(g.effective_threshold(60, W200K, close), 85, "몰림을 바닥으로 확정(Backlog 79 + 6)하지 않았다");
-        assert_eq!(report(&mut g, &mut armed, 85, 60, W200K, close + 180.0), post_split(72, 79, CtxFloorRegime::Backlog));
-        assert!(g.session_fast, "3분에 6%p — 일하는 좌석");
-        let close = session(&mut g, &mut armed, 4_000.0, 72, 79);
-        assert_eq!(g.effective_threshold(60, W200K, close), 81, "빠른 발화가 확인을 풀지 않았다");
-        // 빠른 얇은 발화(77 → 80 을 4분에 — 분당 0.5%p)는 확인 재료가 아니다 · 경계(표시 성장 − 1 = 2%p 를 10분 = 분당 0.2%p)는 빠르다.
-        for (dt, fast) in [(240.0, true), (600.0, true), (601.0, false), (1_800.0, false)] {
-            let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-            assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-            let close = session(&mut g, &mut armed, 100.0, 72, 77);
-            assert_eq!(g.effective_threshold(60, W200K, close), 80);
-            assert!(report(&mut g, &mut armed, 80, 60, W200K, close + dt).is_some());
-            assert_eq!((g.session_fast, g.session_tier3), (fast, !fast), "3%p 를 {dt}초 — 빠름 {fast}");
-        }
-        // 참으로 가득 찬 좌석(복원 끝 78) — 종전 그대로 Probe → Stopped(성장 속도와 무관).
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        let close = session(&mut g, &mut armed, 100.0, 78, 79);
-        assert_eq!(g.bar(60, W200K).map(|b| (b.bar, b.regime, b.thin)), Some((80, CtxFloorRegime::Probe, false)));
-        assert!(report(&mut g, &mut armed, 80, 60, W200K, close + 60.0).is_some());
-        let close = session(&mut g, &mut armed, 1_000.0, 78, 79);
-        assert_eq!(g.bar(60, W200K).map(|b| (b.bar, b.regime)), Some((89, CtxFloorRegime::Stopped)));
-        let _ = close;
-    }
-
-    /// ★(RV2NC-E20-2 · ②) 복원 턴 **도중** 바쁨을 보지 않는 기계 주입(채널 행 — quiescing 해제 직후 보류분 · writer Inject)은 Claude 가
-    /// 복원 턴 끝에 조용함 없이 곧바로 이어 처리한다 — 그 턴을 복원 끝에 실어 여유 있는 master(참 바닥 72)를 Probe → Stopped 로
-    /// 오판하지 않는다: 복원 턴 오염으로 적고 그 입력 때의 최고치(하한)로 차단기를 판정한다. 운영 신호 모형 · 200K·창 미상 · 채널
-    /// 3~6%p(주입: 붙여넣기 2~25초 뒤) · 일(분당 0.5·1%p) · 3시간: clear 뒤 발화는 Raise·Limited · 81 이하 · Claude 압축 0 · 자동
-    /// 압축을 끈 좌석도 차단점(88.5%) 근처로 끌려가지 않는다. 유휴(주기 신호만)면 고리 없음(사이클 ≤ 2 + 성장/5).
-    /// 종전 e20f1cb6 은 드릴 rv-d3(19.7KB 채널 행)에서 floor 76 probe → stopped 86 → Claude 압축 · 자동 압축 끔 rv-d3n 은 막대 89.
-    #[test]
-    fn rv2nc_e20_channel_row_during_the_restore_turn_does_not_trip_the_breaker() {
-        let mut bad = vec![];
-        for win in [W200K, None] {
-            for (paste, restore) in [(63.3, 8.9), (72.0, 0.0)] {
-                for (off, pp) in [(2.0, 4.3), (10.0, 3.0), (25.0, 6.0)] {
-                    for autocompact in [true, false] {
-                        for rate in [0.5, 1.0] {
-                            let base = Seat { restore_secs: 30.0, chan: Some((off, pp, 12.0)), work_after: 20.0, work_per_min: rate,
-                                              turn_secs: 20.0, ..Seat::real(60, win, paste, restore) };
-                            let seat = if autocompact { base } else { Seat { compact_at: None, ..base } };
-                            let run = run_seat(seat, 3.0 * 3600.0);
-                            let wrong = run.fires.iter().skip(1).any(|(_, p, f, _)| {
-                                *p > 81 || !matches!(f.regime, Some(CtxFloorRegime::Raise | CtxFloorRegime::Limited))
-                            });
-                            if run.fires.len() < 3 || !run.compactions.is_empty() || wrong || run.max_post_clear >= 84 {
-                                bad.push(format!("{win:?} {paste}+{restore} 채널 +{off}s {pp}%p 자동압축 {autocompact} 분당 {rate}: 발화 {:?} 압축 {:?} 최고 {}",
-                                                 run.fires.iter().map(|f| (f.0 as u32, f.1, f.2.regime, f.2.floor, f.2.settled)).collect::<Vec<_>>(),
-                                                 run.compactions, run.max_post_clear));
-                            }
-                        }
-                        // 유휴(주기 신호 분당 0.03·0.1%p) — 채널 행이 사이클마다 와도 고리 없음.
-                        for rate in [0.03, 0.1] {
-                            let base = Seat { restore_secs: 30.0, chan: Some((off, pp, 12.0)), work_after: 20.0, work_per_min: rate,
-                                              turn_secs: 5.0, ..Seat::real(60, win, paste, restore) };
-                            let seat = if autocompact { base } else { Seat { compact_at: None, ..base } };
-                            let run = run_seat(seat, 4.0 * 3600.0);
-                            let bound = 2 + (rate * 240.0 / f64::from(CTX_FLOOR_MIN_ROOM)).floor() as usize;
-                            if cycles(&run, &seat) > bound {
-                                bad.push(format!("(①) 유휴 {win:?} {paste}+{restore} 채널 +{off}s {pp}%p 분당 {rate}: 사이클 {} > {bound}",
-                                                 cycles(&run, &seat)));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(bad.is_empty(), "{} 건:\n{}", bad.len(), bad.join("\n"));
-        // 순수: 붙여넣기 뒤 채널 Inject(대기열 배달 아님) → 오염 · 하한 확정 · 그 입력의 턴(76)은 차단기 재료가 아니다.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        g.note_quiescing(110.0);
-        let a = 110.0;
-        g.note_input(Some(a + 0.5), a + 0.5); // 붙여넣기(직접 send)
-        assert_eq!(g.paste_input_at, Some(a + 0.5));
-        assert_eq!(report(&mut g, &mut armed, 67, 60, W200K, a + 15.0), None);
-        g.note_delivery(None, Some(a + 16.0), a + 16.0); // 채널 행 Inject 끝 — 복원 턴 도중
-        assert!(g.restore_tainted && g.restore_peak == Some(67), "복원 턴 도중 채널 Inject 를 오염으로 적지 않았다");
-        assert_eq!(report(&mut g, &mut armed, 72, 60, W200K, a + 30.0), None);
-        assert_eq!(report(&mut g, &mut armed, 76, 60, W200K, a + 36.0), None); // 채널 턴(조용함 없이 이어짐)
-        g.note_idle(a + 40.0, a + 80.0, a + 80.0);
-        let b = g.bar(60, W200K).unwrap();
-        assert_eq!((b.regime, b.floor, b.settled, b.tainted, b.bar), (CtxFloorRegime::Limited, 76, 76, true, 80), "{b:?}");
-        // 대기열 배달의 CR(인계 뒤 5초 안)은 오염 재료가 아니다 · 붙여넣기 자신(첫 입력)도 아니다.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        g.note_quiescing(110.0);
-        g.note_input(Some(a + 0.5), a + 0.5);
-        g.note_delivery(None, Some(a + 0.5), a + 1.0); // 붙여넣기 자신이 Inject 로 기록된 모형(검체·재검증자 모형)
-        assert!(!g.restore_tainted, "붙여넣기 자신을 오염으로 봤다");
-        g.note_delivery(Some(a + 2.0), Some(a + 2.4), a + 2.4); // 상승 보고 전 대기열 배달(우회한 붙여넣기)
-        assert!(!g.restore_tainted, "대기열 배달의 CR 을 오염으로 봤다");
-        // 참으로 가득 찬 좌석(붙여넣기 턴이 이미 77 을 보고한 뒤 채널 행) — 하한 77 이 차단기 높이라 종전대로 Probe.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        g.note_quiescing(110.0);
-        g.note_input(Some(a + 0.5), a + 0.5);
-        assert_eq!(report(&mut g, &mut armed, 77, 60, W200K, a + 20.0), None);
-        g.note_delivery(None, Some(a + 21.0), a + 21.0);
-        assert_eq!(report(&mut g, &mut armed, 79, 60, W200K, a + 40.0), None);
-        g.note_idle(a + 45.0, a + 80.0, a + 80.0);
-        assert_eq!(g.bar(60, W200K).map(|b| (b.regime, b.thin, b.tainted)), Some((CtxFloorRegime::Probe, false, true)));
-    }
-
-    /// ★(RV2NC-E20-2) 복원 턴 보류 판정(`restore_turn_open`) — clear 뒤 세션 · 시작점 뒤 · 복원 끝 전(≥2초 조용함 없음) · 상한 120초
-    /// 안에서만 참. 발화 이력 없음(부트)·압축 뒤 재는 창·복원 끝 확정 뒤·조용함 뒤·상한 뒤는 거짓(보류 없음).
-    #[test]
-    fn rv2nc_e20_restore_turn_hold_window() {
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert!(!g.restore_turn_open(10.0), "발화 이력 없는 좌석");
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        clear(&mut g, &mut armed, 100.0);
-        g.note_quiescing(110.0);
-        assert!(g.restore_turn_open(111.0) && g.restore_turn_open(110.0 + CTX_FLOOR_RESTORE_HOLD_SECS));
-        assert!(!g.restore_turn_open(110.0 + CTX_FLOOR_RESTORE_HOLD_SECS + 0.5), "상한 뒤에도 보류");
-        assert_eq!(report(&mut g, &mut armed, 64, 60, W200K, 120.0), None);
-        g.note_idle(130.0, 133.0, 133.0); // 복원 턴 끝 후보
-        assert!(!g.restore_turn_open(134.0), "복원 턴 끝 뒤에도 보류");
-        // 압축 뒤 재는 창에는 복원 턴이 없다.
-        let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-        assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-        for t0 in [100.0, 1_000.0] {
-            clear(&mut g, &mut armed, t0);
-            assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, t0 + 10.0), None);
-            if t0 < 500.0 {
-                assert!(report(&mut g, &mut armed, 80, 60, W200K, t0 + 700.0).is_some());
-            }
-        }
-        let _ = report(&mut g, &mut armed, 86, 60, W200K, 2_000.0);
-        assert!(g.observe(30, W200K, 2_100.0).is_some());
-        assert!(!g.restore_turn_open(2_101.0), "압축 뒤 재는 창에서 보류");
-    }
-
-    /// ★(RV2-ROLE-1 · ② · 재검증자 rv2_e4·rv2_h3 모양) Claude 압축이 **긴 작업 턴 도중**(입력 없이 이어지는 도구 연쇄 · 턴 안 분당
-    /// 1~3%p)에 와도 압축 뒤 바닥은 재읽기 몫(압축 + [`CTX_FLOOR_REREAD_SECS`])만 잰다 — 다시 잰 바닥 ≤ 압축 뒤 수준(30 + 재읽기) +
-    /// 분당 성장 × 1.5분 + 2. 종전(e20f1cb6)은 정착 창(최소 60초 · 최대 600초 · 조용함 대기)이 턴 끝까지 열려 참 압축 뒤 수준 63~65 를
-    /// 80 으로 재 Stopped · 압축 2~3회에 사이클 1회(또는 0회 — 6시간 압축만 26~52회)였다. clear 로 돌아오는 바닥(복원 끝 78)이
-    /// 선제 압축점 아래인 좌석은 압축마다 cys 사이클을 되찾는다(압축 수 ≤ 사이클 수 + 1). 몰림 6.5%p 로 clear 바닥이 선제
-    /// 압축점 위(84)인 좌석은 압축 뒤 cys 사이클이 없다(ADV2-R1-1 — 그 clear 가 곧바로 다음 압축을 부른다).
-    #[test]
-    fn rv2_role_mid_turn_compaction_remeasures_only_the_reread() {
-        let mut bad = vec![];
-        for win in [W200K, None] {
-            for reread in [0.0, 33.0] {
-                for rate in [1.0, 1.5, 2.0, 3.0] {
-                    for (backlog, turns) in [(0.0, 0u32), (6.5, 3)] {
-                        for inputs in [false, true] {
-                            let seat = Seat { restore_secs: 30.0, backlog, backlog_turns: turns, work_after: 20.0, work_per_min: rate,
-                                              turn_secs: 60.0, reread, work_inputs: inputs, compact_midturn: true,
-                                              ..Seat::real(60, win, 69.35, 8.45) };
-                            let run = run_seat(seat, 6.0 * 3600.0);
-                            let ctx = format!("{win:?} 재읽기 +{reread} 분당 {rate} 몰림 {backlog} 입력 {inputs}: 발화 {:?} 압축 {:?}",
-                                              run.fires.iter().map(|f| (f.0 as u32, f.1, f.2.regime, f.2.floor, f.2.after_compaction)).collect::<Vec<_>>(),
-                                              run.compactions.iter().map(|c| *c as u32).collect::<Vec<_>>());
-                            let level = 30.0 + reread;
-                            let landing = (69.35 + 8.45 + backlog).round() as u8;
-                            for (_, p, f, _) in run.fires.iter().filter(|f| f.2.after_compaction) {
-                                let floor = f64::from(f.floor.expect("압축 뒤 잰 바닥"));
-                                if floor > level + rate * 1.5 + 2.0 {
-                                    bad.push(format!("다시 잰 바닥 {floor} > 재읽기 수준 {level} + 몇 %p — {ctx}"));
-                                }
-                                if *p <= landing {
-                                    bad.push(format!("(ADV2-R1-1) 압축 뒤 발화 {p} ≤ clear 바닥 {landing} — {ctx}"));
-                                }
-                            }
-                            let after = run.fires.iter().filter(|f| f.2.after_compaction).count();
-                            if landing + 1 < 83 {
-                                if run.compactions.len() > after + 1 {
-                                    bad.push(format!("(②) 압축 {} 회에 압축 뒤 cys 사이클 {after} — {ctx}", run.compactions.len()));
-                                }
-                            } else if after > 0 {
-                                bad.push(format!("(ADV2-R1-1) clear 바닥 {landing} 좌석의 압축 뒤 cys 사이클 {after} — {ctx}"));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        assert!(bad.is_empty(), "{} 건:\n{}", bad.len(), bad.join("\n"));
-        // ★(RV2-ROLE-1 (b)) 압축 전에 들어와 남은 평상 대기열 항목(사이클 무관 회신 적체)이 압축 뒤 재는 창을 붙잡지 않는다 —
-        //   창은 재읽기 몫([`CTX_FLOOR_REREAD_SECS`])에서 끝난다(재검증자 rv2_e5: 종전 14초 조용함에도 닫히지 않음).
-        for aged in [None, Some(30.0)] {
-            let (mut g, mut armed) = (CtxLoopGuard::default(), true);
-            assert_eq!(report(&mut g, &mut armed, 70, 60, W200K, 0.0), FIRE);
-            for t0 in [100.0, 1_000.0] {
-                clear(&mut g, &mut armed, t0);
-                g.note_quiescing(t0 + 10.0);
-                assert_eq!(report(&mut g, &mut armed, 78, 60, W200K, t0 + 40.0), None);
-                g.note_idle(t0 + 45.0, t0 + 400.0, t0 + 400.0);
-                let _ = report(&mut g, &mut armed, 80, 60, W200K, t0 + 500.0);
-            }
-            assert_eq!(g.bar(60, W200K).map(|b| b.regime), Some(CtxFloorRegime::Stopped));
-            let _ = report(&mut g, &mut armed, 86, 60, W200K, 2_500.0);
-            let tc = 2_600.0;
-            assert!(g.observe(30, W200K, tc).is_some());
-            g.note_queue(aged.map(|a| tc - a));
-            let _ = report(&mut g, &mut armed, 63, 60, W200K, tc + 20.0);
-            g.note_delivery(Some(tc + 25.0), None, tc + 25.0);
-            g.note_idle(tc + 21.0, tc + 25.0, tc + 25.0);
-            assert_eq!(g.restore_peak, None, "압축 뒤 재는 창에서 복원 끝을 확정했다");
-            assert!(!g.settling(tc + CTX_FLOOR_REREAD_SECS + 1.0), "대기열 {aged:?}: 압축 뒤 재는 창이 재읽기 몫에서 끝나지 않았다");
-            assert_eq!(g.settle_peak, Some(63));
-        }
-    }
-
-    /// ★(ADV2-R1-1 · ① · 재검증자 장기 반례) **참으로 가득 찬 좌석**(clear 바닥 76~85 — CEO 77.8 · 재검증자 cfg 76+9 · 몰림 포함)이
-    /// 느리게 자라면(10분에 0.3%p ~ 분당 1%p) 24시간 동안: 압축 뒤 cys 발화는 언제나 clear 로 돌아오는 바닥 + 1 이상이다(그 clear 가
-    /// 컨텍스트를 올리지 않는다) · clear 바닥이 선제 압축점 높이면 압축 뒤 cys 사이클이 없다 · 사이클 수 ≤ 2 + 성장/5 · 재무장 ≤ 압축.
-    /// e20f1cb6 은 압축 뒤 바닥(63~70) 위 75·80 에서 발화해 그 clear 가 85 로 올라 곧바로 압축 → 재무장 → 발화를 성장 약 4.5%p 마다
-    /// 돌았다(24시간 발화 11 · 압축 10 · 분당 1%p 좌석 4시간 발화 22).
-    #[test]
-    fn adv2_r1_truly_full_seat_is_not_cleared_below_its_clear_floor_after_compaction() {
-        let mut bad = vec![];
-        for win in [W200K, None] {
-            for (paste, restore, backlog, turns) in [(76.0, 9.0, 0.0, 0u32), (69.35, 8.45, 0.0, 0), (69.35, 8.45, 3.3, 2), (70.0, 7.0, 0.0, 0)] {
-                for reread in [33.0, 40.0, 45.0] {
-                    for (rate, turn) in [(0.03, 5.0), (0.2, 20.0), (1.0, 20.0)] {
-                        let seat = Seat { restore_secs: 30.0, backlog, backlog_turns: turns, work_after: 20.0, work_per_min: rate, turn_secs: turn,
-                                          reread, compact_midturn: true, ..Seat::real(60, win, paste, restore) };
-                        let hours = if rate < 0.1 { 24.0 } else { 8.0 };
-                        let run = run_seat(seat, hours * 3600.0);
-                        let landing = (paste + restore + backlog).round() as u8;
-                        let ctx = format!("{win:?} {paste}+{restore} 몰림 {backlog} 재읽기 +{reread} 분당 {rate}: 발화 {:?} 압축 {}",
-                                          run.fires.iter().map(|f| (f.0 as u32, f.1, f.2.regime, f.2.after_compaction)).collect::<Vec<_>>(),
-                                          run.compactions.len());
-                        let bound = 2 + (rate * hours * 60.0 / f64::from(CTX_FLOOR_MIN_ROOM)).floor() as usize;
-                        if cycles(&run, &seat) > bound {
-                            bad.push(format!("(①) 사이클 {} > {bound} — {ctx}", cycles(&run, &seat)));
-                        }
-                        if run.rearms > run.compactions.len() {
-                            bad.push(format!("재무장 {} > 압축 — {ctx}", run.rearms));
-                        }
-                        for (_, p, f, _) in run.fires.iter().filter(|f| f.2.after_compaction) {
-                            if *p <= landing {
-                                bad.push(format!("(①) 압축 뒤 발화 {p} ≤ clear 바닥 {landing} — {ctx} {f:?}"));
-                            }
-                        }
-                        if landing >= 83 && run.fires.iter().any(|f| f.2.after_compaction) {
-                            bad.push(format!("(①) clear 바닥 {landing}(선제 압축점) 좌석의 압축 뒤 cys 사이클 — {ctx}"));
-                        }
-                    }
-                }
-            }
-        }
-        assert!(bad.is_empty(), "{} 건:\n{}", bad.len(), bad.join("\n"));
+    fn i3_fire_implies_growth_property() {
+        let st = prop_stats();
+        assert_eq!(st.v_i3, 0, "{st:?}");
+        assert_eq!(st.seeds, 10_000);
     }
 }

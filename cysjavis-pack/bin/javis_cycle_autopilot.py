@@ -414,6 +414,11 @@ PHASES = PHASES + (HELD_PHASE,)
 TERMINAL_PHASES = TERMINAL_PHASES + (HELD_PHASE,)
 PHASE_NEXT = dict(PHASE_NEXT, executor_exited=PHASE_NEXT["executor_exited"] + (HELD_PHASE,))
 PHASE_NEXT[HELD_PHASE] = ()
+# ★(0.14.42 · clear 가드 v3) cycle-agent rc 87 = 단일 비행 건너뜀(0단계 · 저장 지시·clear·quiescing 송신 0건) — 같은 좌석의 사이클이
+#   진행 중이거나(busy) 넘긴 --fire 통보 뒤 사이클이 이미 끝났다(stale). 실패가 아니다: held_noop 으로 종결하되 통지·재집행
+#   재촉을 하지 않는다(그 통보는 이미 처리됐다 — 새 통보가 오면 게이트 3 이 다시 연다).
+#   ★러스트 src/bin/cys.rs 의 EXIT_CYCLE_SKIPPED 와 같은 값이어야 한다(cargo 검체가 파싱 대조).
+SKIPPED_RC = 87
 
 
 # ── ★T-0147-2 층1 I3 — escalation 발행 경로를 javis_wakeup 큐로 수렴 ─────────────────
@@ -829,8 +834,12 @@ def resume_text(cycle_id, files=None):
     return "%s (nonce=%s)" % (head, nonce_for(cycle_id))
 
 
-def build_cycle_agent_argv(role, cycle_id, files):
+def build_cycle_agent_argv(role, cycle_id, files, fire_id=None):
     """cys cycle-agent argv(순수) — self-test 가 이 함수 결과를 박제한다.
+
+    ★(0.14.42 · clear 가드 v3) `fire_id` 는 게이트 3 이 연 **미해결 발화**의 번호다(`cys status --json` 의 `ctx_guard.fire_id`).
+      `--fire` 로 넘기면 데몬이 그 통보 뒤 사이클이 이미 끝났거나 같은 좌석 사이클이 진행 중일 때 rc 87 로 건너뛴다
+      (CSO·master 의 같은 통보 집행과 중복되지 않는다).
 
     [R2-A] `files` 는 **반드시 lease 에 저장된 목록**을 그대로 넘긴다. 여기서 다시 파생하면
       baseline·argv·검증자·사후검증이 각자 계산해 갈릴 수 있다(단일 출처 원칙).
@@ -841,11 +850,12 @@ def build_cycle_agent_argv(role, cycle_id, files):
     """
     if not files:
         raise ValueError("save-file 목록이 비었다 — lease 저장 목록을 넘겨라(단일 출처)")
+    fire = ["--fire", fire_id] if isinstance(fire_id, str) and fire_id else []
     return [CYS, "cycle-agent",
             "--role", role,
             "--verifier", VERIFIER_ROLE,
             "--timeout", str(CYCLE_AGENT_TIMEOUT),
-            "--resume-text", resume_text(cycle_id, files)] + \
+            "--resume-text", resume_text(cycle_id, files)] + fire + \
         [x for f in files for x in ("--save-file", f)]
 
 
@@ -940,11 +950,22 @@ def evaluate_gates(role, ctx, now_ts):
         add(2, "대상 유휴", ok,
             "idle=%s(>=%s) queue_depth=%s self_report=%s" % (idle, need, qd, st))
 
-    # 2-b. 측정(신선도·임계)
+    # 2-b. ★(0.14.42 · clear 가드 v3) 미해결 발화 — 개시 판정은 데몬 clear 가드의 발화 하나다(자체 임계 비교 없음).
+    #   `ctx_guard.phase == "awaiting"`(발화 뒤 사이클 표지 전) 이고 원장에 그 `fire_id` 의 집행 기록(비보류 종결)이 없을 때만.
+    #   `ctx_guard` 부재(구 데몬)·형식 불명은 실패(fail-closed — 오탐보다 미집행). 자체 임계 비교(over_threshold)는 뺐다 — 가드의
+    #   유휴 무발화·잰 수준 성장 조건을 우회해 RR3-R1-1 재주입 고리를 되살린다. 측정 **유효성**(statusline · 무효화 부재)은
+    #   남긴다 — 사후검증(post_verify)의 선결 조건이라, 빼면 검증 불능 좌석(rollout·transcript)을 집행해 indeterminate 로 레인을
+    #   잠근다(fail-closed · 가드를 우회하지 않는 추가 조건).
     m = ctx.get("measure") or {}
-    add(3, "측정 유효·임계 초과", bool(m.get("ok") and m.get("over_threshold")),
-        "ok=%s reason=%s ctx_pct=%s threshold=%s"
-        % (m.get("ok"), m.get("reason"), m.get("ctx_pct"), m.get("threshold")))
+    cg = (row or {}).get("ctx_guard") if isinstance(row, dict) else None
+    fid = cg.get("fire_id") if isinstance(cg, dict) else None
+    executed = led.get("fires_executed") or ()
+    open_fire = (isinstance(cg, dict) and cg.get("phase") == "awaiting"
+                 and isinstance(fid, str) and bool(fid) and fid not in executed)
+    add(3, "미해결 발화(clear 가드)·측정 유효", open_fire and bool(m.get("ok")),
+        "phase=%s fire_id=%s executed=%s · 측정 ok=%s reason=%s ctx_pct=%s"
+        % ((cg or {}).get("phase") if isinstance(cg, dict) else "부재(구 데몬 — fail-closed)", fid,
+           isinstance(fid, str) and fid in executed, m.get("ok"), m.get("reason"), m.get("ctx_pct")))
 
     # 3. 오너 존재 신호
     oam = ctx.get("owner_active_mtime")
@@ -1185,7 +1206,7 @@ def ledger_view(records, role, bad_lines):
     """
     view = {"cycles": 0, "last_terminal_phase": None, "last_terminal_ts": None,
             "last_reset_ts": None, "held_streak": 0, "held_structural_streak": 0,
-            "incomplete": False, "incomplete_cycle": None,
+            "incomplete": False, "incomplete_cycle": None, "fires_executed": set(),
             "corrupt": bool(bad_lines) and bad_lines != 0}
     if bad_lines and bad_lines != 0:
         view["corrupt"] = True
@@ -1208,6 +1229,16 @@ def ledger_view(records, role, bad_lines):
         by_cycle.setdefault(cid, []).append(r)
     if not by_cycle:
         return view
+    # ★(0.14.42 · clear 가드 v3) 집행된 발화 — 그 사이클이 보류(held_noop — 송신 0건·건너뜀) 아닌 종결을 가졌거나 아직 미완결인
+    #   fire_id(게이트 3 은 같은 통보를 두 번 집행하지 않는다 · 보류는 같은 통보의 재시도를 허용한다).
+    for recs in by_cycle.values():
+        fid = next((r.get("detail", {}).get("fire_id") for r in recs
+                    if isinstance(r.get("detail"), dict) and r.get("detail", {}).get("fire_id")), None)
+        if not isinstance(fid, str):
+            continue
+        terms = sorted((r for r in recs if r.get("phase") in TERMINAL_PHASES), key=lambda r: r.get("ts") or 0)
+        if not terms or terms[-1].get("phase") != HELD_PHASE:
+            view["fires_executed"].add(fid)
     view["cycles"] = len(by_cycle)
     last_cid = max(by_cycle)
     terminal = [r for r in by_cycle[last_cid] if r.get("phase") in TERMINAL_PHASES]
@@ -1352,6 +1383,7 @@ def cmd_tick(args):
         cid = new_cycle_id()
         surface = (ctx.get("row") or {}).get("surface_ref")
         m = ctx["measure"]
+        fire_id = ((ctx.get("row") or {}).get("ctx_guard") or {}).get("fire_id")
         # [R2-A] save-file 목록은 여기서 **대상 surface 기준으로 1회** 파생한다.
         #   이후 baseline·argv·검증자 매핑·사후검증 ⓓ 는 전부 lease 의 이 목록만 소비한다.
         sfr = resolve_save_files(role, ctx.get("row"))
@@ -1359,6 +1391,7 @@ def cmd_tick(args):
                   "threshold": m.get("threshold"), "session_file": m.get("session_file"),
                   "updated_at": m.get("updated_at"), "idle_secs": (ctx["row"] or {}).get("idle_secs"),
                   "queue_depth": (ctx["row"] or {}).get("queue_depth"),
+                  "fire_id": fire_id,
                   "save_files": sfr["files"], "save_files_origin": {
                       "cwd": sfr["cwd"], "cwd_source": sfr["cwd_source"],
                       "round_dir": sfr["round_dir"], "how": sfr["how"],
@@ -1372,7 +1405,7 @@ def cmd_tick(args):
                                    "save_files_origin": detail["save_files_origin"]}})
         if mode() == MODE_SHADOW:
             # [R2-A] shadow 증거: 실제로 넘어갈 argv 를 그대로 원장에 남긴다(음성대조용).
-            detail["cycle_agent_argv"] = build_cycle_agent_argv(role, cid, sfr["files"])
+            detail["cycle_agent_argv"] = build_cycle_agent_argv(role, cid, sfr["files"], fire_id)
             log_append({"ts": now_ts, "cycle_id": cid, "phase": "would_fire", "role": role,
                         "surface": surface, "detail": detail})
             print(json.dumps({"result": "would_fire(shadow)", "role": role, "cycle_id": cid,
@@ -1395,6 +1428,7 @@ def cmd_tick(args):
                                    "ctx_pct": m.get("ctx_pct"),
                                    "updated_at": m.get("updated_at")},
                            "save_files": sfr["files"],
+                           "fire_id": fire_id,
                            "save_files_origin": detail["save_files_origin"]}
             save_state(st)
         log_append({"ts": now_ts, "cycle_id": cid, "phase": "armed", "role": role,
@@ -1709,7 +1743,7 @@ def cmd_execute(args):
             save_state(st)
 
     # 3) cycle-agent 를 자식으로 — 1s 간격 kill-switch 폴링, 감지 즉시 SIGTERM
-    argv = build_cycle_agent_argv(role, cid, files)
+    argv = build_cycle_agent_argv(role, cid, files, lease.get("fire_id"))
     _set_phase(cid, role, surface, "fired",
                {"argv": argv, "baseline": bl["path"], "file_set": bl["file_set"],
                 "save_files_origin": lease.get("save_files_origin"),
@@ -1774,6 +1808,18 @@ def cmd_execute(args):
     _set_phase(cid, role, surface, "executor_exited",
                {"child_rc": rc, "tail": tail[-800:], "started_at": start_ts,
                 "residual_window_secs": sink["residual"]})
+    if rc == SKIPPED_RC:
+        # ★(0.14.42 · clear 가드 v3) 단일 비행 건너뜀 — 0단계라 저장 지시·clear·quiescing 모두 0건이다(quiesce 해제 불필요).
+        #   실패가 아니고 통지하지 않는다(같은 통보를 CSO·master 가 집행 중이거나 이미 끝났다). held_noop 으로 종결해 레인을
+        #   잠그지 않는다 — 다음 통보는 데몬 가드의 새 발화(새 fire_id)가 게이트 3 을 다시 연다.
+        _finalize(cid, role, surface, HELD_PHASE,
+                  {"child_rc": rc, "tail": tail[-800:], "skipped": True,
+                   "reason": "단일 비행 건너뜀(송신 0건 · 같은 좌석 사이클 진행 중 또는 그 통보 뒤 사이클이 이미 끝남)",
+                   "clear_sent": False, "structural": False, "fire_id": lease.get("fire_id"),
+                   "residual_window_secs": sink["residual"]})
+        ledger_append("cycle", "cycle-autopilot",
+                      {"phase": HELD_PHASE, "id": nonce_for(cid), "role": role})
+        return EXIT_OK
     if rc in HELD_RCS:
         # ★84는 quiesce-on 전, 85는 자식이 off 했지만 abort 와 같은 멱등 안전망을 둔다.
         release_quiesce(surface, cid, role, "held noop child rc=%d" % rc)
@@ -2514,7 +2560,8 @@ def cmd_self_test(args):
     base_row = {"role": "worker", "idle_secs": 300, "queue_depth": 0, "status": None,
                 "surface_ref": "surface:9",
                 "usage": {"source": "statusline", "ctx_pct": 70, "ctx_tokens": 700000,
-                          "session_file": sess, "updated_at": now_ts - 900}}
+                          "session_file": sess, "updated_at": now_ts - 900},
+                "ctx_guard": {"phase": "awaiting", "fire_id": "1759112345:9:1"}}
 
     def ctx_of(**kw):
         c = {"killed": False, "kill_reason": "", "row": dict(base_row),
@@ -2610,6 +2657,34 @@ def cmd_self_test(args):
     t.check("원장 손상 → exit 5", (not v["pass"]) and v["exit"] == EXIT_LEDGER)
     v = evaluate_gates("worker", ctx_of(row=None), now_ts)
     t.check("대상 surface 부재 → skip", not v["pass"])
+    # ★(0.14.42 · clear 가드 v3) 게이트 3 = 미해결 발화(데몬 가드) — 자체 임계 비교 없음 · 부재는 fail-closed.
+    g3 = lambda v: next(x for x in v["gates"] if x["id"] == 3)
+    v = evaluate_gates("worker", ctx_of(row_patch={"ctx_guard": None}), now_ts)
+    t.check("★[가드 v3] ctx_guard 부재(구 데몬) → 게이트 3 실패(fail-closed)", not v["pass"] and not g3(v)["ok"], v["reason"])
+    v = evaluate_gates("worker", ctx_of(row_patch={"ctx_guard": {"phase": "free", "fire_id": "1759112345:9:1"}}), now_ts)
+    t.check("★[가드 v3] 발화 없음(phase=free) → skip — 자체 임계 70≥60 이어도 개시하지 않는다", not v["pass"] and not g3(v)["ok"])
+    v = evaluate_gates("worker", ctx_of(row_patch={"ctx_guard": {"phase": "measuring", "fire_id": "1759112345:9:1"}}), now_ts)
+    t.check("★[가드 v3] 사이클 뒤 재는 창(phase=measuring) → skip", not v["pass"])
+    v = evaluate_gates("worker", ctx_of(row_patch={"ctx_guard": {"phase": "awaiting", "fire_id": None}}), now_ts)
+    t.check("★[가드 v3] fire_id 결측 → skip(결측은 값이 아니다)", not v["pass"])
+    v = evaluate_gates("worker", ctx_of(row_patch={"usage": {"source": "statusline", "ctx_pct": 30, "ctx_tokens": 1,
+                                                             "session_file": sess, "updated_at": now_ts - 900}}), now_ts)
+    t.check("★[가드 v3] 관측 30%(자체 임계 미만)여도 가드 발화면 개시 — 자체 임계는 게이트 입력이 아니다", v["pass"], v["reason"])
+    v = evaluate_gates("worker", ctx_of(ledger={"cycles": 2, "last_terminal_phase": SUCCESS_PHASE,
+                                                "last_terminal_ts": now_ts - 1500, "incomplete": False, "corrupt": False,
+                                                "fires_executed": {"1759112345:9:1"}}), now_ts)
+    t.check("★[가드 v3] 같은 fire_id 가 이미 집행됨 → skip(같은 통보 이중 집행 금지)", not v["pass"] and not g3(v)["ok"])
+    fx_recs = [
+        {"ts": 1.0, "cycle_id": 11, "phase": "armed", "role": "worker", "detail": {"fire_id": "G:9:1"}},
+        {"ts": 2.0, "cycle_id": 11, "phase": SUCCESS_PHASE, "role": "worker", "detail": {}},
+        {"ts": 3.0, "cycle_id": 12, "phase": "armed", "role": "worker", "detail": {"fire_id": "G:9:2"}},
+        {"ts": 4.0, "cycle_id": 12, "phase": HELD_PHASE, "role": "worker", "detail": {"child_rc": 84}},
+        {"ts": 5.0, "cycle_id": 13, "phase": "armed", "role": "worker", "detail": {"fire_id": "G:9:3"}},
+        {"ts": 6.0, "cycle_id": 13, "phase": "failed", "role": "worker", "detail": {}},
+    ]
+    fx_view = ledger_view(fx_recs, "worker", 0)
+    t.check("★[가드 v3] 원장 집행 발화 = 비보류 종결 사이클의 fire_id(보류는 같은 통보 재시도 허용)",
+            fx_view["fires_executed"] == {"G:9:1", "G:9:3"}, str(fx_view["fires_executed"]))
     v = evaluate_gates("worker", ctx_of(row_patch={"usage": {"source": "rollout:heuristic",
                                                              "ctx_pct": 90, "ctx_tokens": 1,
                                                              "session_file": sess,
@@ -3036,6 +3111,10 @@ def cmd_self_test(args):
     t.check("resume-text 에 nonce 포함",
             ("nonce=%s" % nonce_for(1234567)) in argv_w[argv_w.index("--resume-text") + 1])
     t.check("argv 에 lease 목록 전량 동봉", all(f in argv_m for f in sfr_m["files"]))
+    argv_f = build_cycle_agent_argv("master", 1234567, sfr_m["files"], "1759112345:4:7")
+    t.check("★[가드 v3] --fire <fire_id> 동봉(단일 비행 · 같은 통보 중복 집행 → rc 87 건너뜀)",
+            argv_f[argv_f.index("--fire") + 1] == "1759112345:4:7" and "--fire" not in argv_m
+            and "--fire" not in build_cycle_agent_argv("master", 1, sfr_m["files"], ""))
     t.check("★argv 가 자체 파생하지 않음(빈 목록이면 거부)",
             _raises(lambda: build_cycle_agent_argv("master", 1, [])))
     import inspect as _insp
@@ -3721,6 +3800,17 @@ def cmd_self_test(args):
             and all(r["phase"] != "held_noop" for r in fixture["observed"]))
     t.check("rc86: executor_exited 실측 residual_window_secs=12.3",
             fixture["exited"].get("residual_window_secs") == 12.3)
+
+    # ★(0.14.42 · clear 가드 v3) rc 87 = 단일 비행 건너뜀 — 송신 0건 · 실패 아님 · 통지·settle·사후검증·quiesce 해제 0회.
+    fixture = execute_fixture(SKIPPED_RC)
+    t.check("rc87: held_noop 종결(skipped) · EXIT_OK · 통지·settle·post_verify·quiesce 해제 0회",
+            fixture["terminal"].get("phase") == HELD_PHASE and fixture["detail"].get("skipped") is True
+            and fixture["detail"].get("clear_sent") is False and fixture["result"] == EXIT_OK
+            and not fixture["notifier"].called and not fixture["sleeper"].called
+            and not fixture["post"].called and not fixture["qrunner"].called
+            and "lease" not in fixture["state"], str(fixture["detail"]))
+    t.check("rc87 은 86(재주입 보류)과 다르다 — 86 은 clear 가 이미 나갔다",
+            SKIPPED_RC == 87 and SKIPPED_RC not in HELD_RCS)
 
     held_notify_every = globals().get("HELD_NOTIFY_EVERY")
     for streak in (2, 3, 4, 5, 6, 7):

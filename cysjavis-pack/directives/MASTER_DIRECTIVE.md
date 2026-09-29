@@ -606,7 +606,7 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
   조정)를 수치 비교해 `context.threshold` 이벤트를 push한다 — "무거워진 것 같다"는 감(感)은
   트리거가 아니다.
 - 이벤트 수신 시 master는 해당 노드에 `cys cycle-agent`를 집행한다: 저장 지시 → 저장 파일
-  결정론 검증(mtime+sha256) → 2-phase handshake → clear → 디렉티브 재주입·재개 포인터.
+  결정론 검증(mtime+sha256) → 2-phase handshake → clear → 디렉티브 재주입·재개 포인터. **발화 번호를 넘긴다** — `context.threshold` 의 `fire=<id>`(payload `fire_id`)를 `cys cycle-agent --fire <id>` 로 넘기고, exit **87 = 이미 처리됨**(같은 좌석 사이클 진행 중 · 그 통보 뒤 사이클이 이미 끝남 · 송신 0건)은 재집행하지 않는다. `context.clear_ineffective`·`context.level_measured` 는 오너 관측 feed 이지 clear 개시 신호가 아니다(개시 신호는 `context.threshold` 하나 — 데몬 clear 가드가 사이클 뒤 잰 수준 위로 자란 뒤에만 낸다).
   **백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`(도구 timeout 에 끊기지 않고 네 턴을 붙잡지 않는다). 전경 대기 금지: 한 사이클은 저장·handshake·유휴·clear 확인·재주입 대기로 최대 약 8.5분이고 그동안 네 턴이 멈춰 회신 큐가 적체된다(부서장은 턴 안에서 오래 기다리지 않는다). 완료 통지가 오면 exit code 로 판정하고, 그 전에는 대상 노드에 메시지를 보내거나 같은 대상의 사이클을 다시 시작하지 않는다(결과 불명 = 재집행 금지 · 관측으로 확인). 진행 중에 CSO 의 clear 통보(아래 6단계 ②)를 받으면 '준비 완료' 대신 '사이클 진행 중(대상·시작 시각)'으로 회신하고 완료 통지 뒤에 준비한다. 백그라운드 실행이 없는 CLI 에서만 예외로 도구 timeout 600000 전경 실행을 쓴다(도구 기본 120초에 끊기면 clear 뒤 재개 포인터 없이 남는다).
   **저장 없이 clear 금지는 코드가 강제한다.**
 - **★master 컨텍스트 clear = CSO 주도 "주인 대리" 핸드셰이크 (제품 기본 절차 · 오너가 바꾸지
