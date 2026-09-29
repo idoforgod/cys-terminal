@@ -420,9 +420,9 @@ PHASE_NEXT[HELD_PHASE] = ()
 #   ★러스트 src/bin/cys.rs 의 EXIT_CYCLE_SKIPPED 와 같은 값이어야 한다(cargo 검체가 파싱 대조).
 SKIPPED_RC = 87
 # ★(0.14.42 · RR1-ROLE-3) cycle-agent rc 88 = 다른 집행자(CSO·master)의 사이클이 진행 중(0단계 · 송신 0건) — 이미 처리됨이 **아니다**.
-#   cycle-agent 는 --fire 가 있으면 --timeout(CYCLE_AGENT_TIMEOUT)까지 점유자 종료를 기다렸다 다시 묻고(그 사이클이 clear 전에
-#   실패했으면 진행 · 끝났으면 87), 그래도 진행 중일 때만 88 이다 — 최악 예산 +CYCLE_AGENT_TIMEOUT(LEASE_TTL 900 안 · 산 실행은
-#   인계되지 않는다). held_noop(skipped)으로 종결한다: 그 통보가 아직 미해결(게이트 3 — phase awaiting)이면 보류 쿨다운 뒤 같은
+#   cycle-agent 는 --fire 가 있으면 단일 전체 시한(570초)이 남기는 만큼(기본 --timeout 120 에서 최대 30초 · 수정 4회차 RV3L-1)
+#   점유자 종료를 기다렸다 다시 묻고(그 사이클이 clear 전에 실패했으면 진행 · 끝났으면 87), 그래도 진행 중일 때만 88 이다 — 1콜 최악
+#   570초(LEASE_TTL 900 안 · 산 실행은 인계되지 않는다). held_noop(skipped)으로 종결한다: 그 통보가 아직 미해결(게이트 3 — phase awaiting)이면 보류 쿨다운 뒤 같은
 #   fire_id 로 다시 집행한다(보류 종결은 '집행됨'이 아니다) · 끝났으면 게이트 3 이 닫혀 있다.
 #   ★러스트 src/bin/cys.rs 의 EXIT_CYCLE_BUSY 와 같은 값이어야 한다(cargo 검체가 파싱 대조).
 BUSY_RC = 88

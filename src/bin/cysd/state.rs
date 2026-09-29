@@ -1305,7 +1305,7 @@ pub struct CycleClaim {
     pub fire_id: Option<String>,
 }
 
-/// 사이클 점유 상한(초) — cycle-agent 한 사이클(최대 약 8.5분)보다 넉넉하게. 넘긴 점유는 버린다(점유가 굳어 사이클이 영구히
+/// 사이클 점유 상한(초) — cycle-agent 한 사이클(단일 전체 시한 570초 · 약 9.5분)보다 넉넉하게. 넘긴 점유는 버린다(점유가 굳어 사이클이 영구히
 /// 막히는 ② 방향 차단 · 산 집행자의 긴 사이클이면 중복 집행 1회로만 틀린다).
 pub const CYCLE_CLAIM_MAX_SECS: f64 = 1200.0;
 
