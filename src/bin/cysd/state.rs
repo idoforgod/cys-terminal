@@ -1541,8 +1541,9 @@ pub struct Surface {
     /// 않는다 · 발행은 놓은 뒤) · 휘발(데몬 재기동 = 새 세대 — 첫 교차는 기본 임계에서 1회 발화).
     pub ctx_loop_guard: Mutex<crate::usage::clear_guard::ClearGuard>,
     /// ★(0.14.42 · clear 가드 v3) 사이클 단일 비행 점유(`surface.cycle_claim`) — `cys cycle-agent` 가 0단계에서 잡고 끝날 때
-    /// 놓는다. 산 점유가 있으면 다른 집행은 busy(rc 87 건너뜀). 죽은 pid·[`CYCLE_CLAIM_MAX_SECS`] 를 넘긴 점유는 게으르게
-    /// 버린다. 휘발 · 말단 락(가드 락보다 먼저 잡는다).
+    /// 놓는다. 산 점유가 있으면 다른 집행은 busy(cycle-agent 가 --fire 면 점유자 종료를 기다렸다 다시 묻고 · 그래도 진행 중이면
+    /// rc 88 — '이미 처리됨'(87 = stale)과 다르다). 죽은 pid·[`CYCLE_CLAIM_MAX_SECS`] 를 넘긴 점유는 게으르게 버린다. 휘발 ·
+    /// 말단 락(가드 락보다 먼저 잡는다).
     pub cycle_claim: Mutex<Option<CycleClaim>>,
     /// (B2) OSC 9/99/777 알림 스캐너 carry — reader 스레드 전용(단일 스레드 접근이라 Mutex면 충분).
     /// strip 전 raw chunk를 누적해 완성 OSC 시퀀스만 추출한다(화면 렌더/strip 경로와 독립).

@@ -414,11 +414,18 @@ PHASES = PHASES + (HELD_PHASE,)
 TERMINAL_PHASES = TERMINAL_PHASES + (HELD_PHASE,)
 PHASE_NEXT = dict(PHASE_NEXT, executor_exited=PHASE_NEXT["executor_exited"] + (HELD_PHASE,))
 PHASE_NEXT[HELD_PHASE] = ()
-# ★(0.14.42 · clear 가드 v3) cycle-agent rc 87 = 단일 비행 건너뜀(0단계 · 저장 지시·clear·quiescing 송신 0건) — 같은 좌석의 사이클이
-#   진행 중이거나(busy) 넘긴 --fire 통보 뒤 사이클이 이미 끝났다(stale). 실패가 아니다: held_noop 으로 종결하되 통지·재집행
-#   재촉을 하지 않는다(그 통보는 이미 처리됐다 — 새 통보가 오면 게이트 3 이 다시 연다).
+# ★(0.14.42 · clear 가드 v3) cycle-agent rc 87 = 단일 비행 건너뜀(0단계 · 저장 지시·clear·quiescing 송신 0건) — 넘긴 --fire 통보 뒤
+#   그 좌석의 사이클이 이미 끝났다(stale). 실패가 아니다: held_noop 으로 종결하되 통지·재집행 재촉을 하지 않는다(그 통보는 이미
+#   처리됐다 — 새 통보가 오면 게이트 3 이 다시 연다).
 #   ★러스트 src/bin/cys.rs 의 EXIT_CYCLE_SKIPPED 와 같은 값이어야 한다(cargo 검체가 파싱 대조).
 SKIPPED_RC = 87
+# ★(0.14.42 · RR1-ROLE-3) cycle-agent rc 88 = 다른 집행자(CSO·master)의 사이클이 진행 중(0단계 · 송신 0건) — 이미 처리됨이 **아니다**.
+#   cycle-agent 는 --fire 가 있으면 --timeout(CYCLE_AGENT_TIMEOUT)까지 점유자 종료를 기다렸다 다시 묻고(그 사이클이 clear 전에
+#   실패했으면 진행 · 끝났으면 87), 그래도 진행 중일 때만 88 이다 — 최악 예산 +CYCLE_AGENT_TIMEOUT(LEASE_TTL 900 안 · 산 실행은
+#   인계되지 않는다). held_noop(skipped)으로 종결한다: 그 통보가 아직 미해결(게이트 3 — phase awaiting)이면 보류 쿨다운 뒤 같은
+#   fire_id 로 다시 집행한다(보류 종결은 '집행됨'이 아니다) · 끝났으면 게이트 3 이 닫혀 있다.
+#   ★러스트 src/bin/cys.rs 의 EXIT_CYCLE_BUSY 와 같은 값이어야 한다(cargo 검체가 파싱 대조).
+BUSY_RC = 88
 
 
 # ── ★T-0147-2 층1 I3 — escalation 발행 경로를 javis_wakeup 큐로 수렴 ─────────────────
@@ -838,8 +845,8 @@ def build_cycle_agent_argv(role, cycle_id, files, fire_id=None):
     """cys cycle-agent argv(순수) — self-test 가 이 함수 결과를 박제한다.
 
     ★(0.14.42 · clear 가드 v3) `fire_id` 는 게이트 3 이 연 **미해결 발화**의 번호다(`cys status --json` 의 `ctx_guard.fire_id`).
-      `--fire` 로 넘기면 데몬이 그 통보 뒤 사이클이 이미 끝났거나 같은 좌석 사이클이 진행 중일 때 rc 87 로 건너뛴다
-      (CSO·master 의 같은 통보 집행과 중복되지 않는다).
+      `--fire` 로 넘기면 데몬이 그 통보 뒤 사이클이 이미 끝났을 때 rc 87 로 건너뛰고, 같은 좌석 사이클이 진행 중이면 끝나기를
+      기다렸다 다시 묻는다(그래도 진행 중이면 rc 88) — CSO·master 의 같은 통보 집행과 중복되지 않는다.
 
     [R2-A] `files` 는 **반드시 lease 에 저장된 목록**을 그대로 넘긴다. 여기서 다시 파생하면
       baseline·argv·검증자·사후검증이 각자 계산해 갈릴 수 있다(단일 출처 원칙).
@@ -1808,13 +1815,15 @@ def cmd_execute(args):
     _set_phase(cid, role, surface, "executor_exited",
                {"child_rc": rc, "tail": tail[-800:], "started_at": start_ts,
                 "residual_window_secs": sink["residual"]})
-    if rc == SKIPPED_RC:
+    if rc in (SKIPPED_RC, BUSY_RC):
         # ★(0.14.42 · clear 가드 v3) 단일 비행 건너뜀 — 0단계라 저장 지시·clear·quiescing 모두 0건이다(quiesce 해제 불필요).
-        #   실패가 아니고 통지하지 않는다(같은 통보를 CSO·master 가 집행 중이거나 이미 끝났다). held_noop 으로 종결해 레인을
-        #   잠그지 않는다 — 다음 통보는 데몬 가드의 새 발화(새 fire_id)가 게이트 3 을 다시 연다.
+        #   실패가 아니고 통지하지 않는다. held_noop 으로 종결해 레인을 잠그지 않는다 — 87(그 통보 뒤 사이클이 이미 끝남)이면 다음
+        #   통보는 데몬 가드의 새 발화(새 fire_id)가 게이트 3 을 다시 연다 · 88(다른 집행자의 사이클 진행 중)이면 그 통보가 아직
+        #   미해결일 때 보류 쿨다운 뒤 같은 fire_id 로 다시 집행한다(보류 종결은 '집행됨'이 아니다 — RR1-ROLE-3).
         _finalize(cid, role, surface, HELD_PHASE,
                   {"child_rc": rc, "tail": tail[-800:], "skipped": True,
-                   "reason": "단일 비행 건너뜀(송신 0건 · 같은 좌석 사이클 진행 중 또는 그 통보 뒤 사이클이 이미 끝남)",
+                   "reason": ("단일 비행 건너뜀(송신 0건 · 그 통보 뒤 사이클이 이미 끝남)" if rc == SKIPPED_RC else
+                              "단일 비행 진행 중(송신 0건 · 다른 집행자의 사이클 진행 중 — 통보가 미해결이면 쿨다운 뒤 재집행)"),
                    "clear_sent": False, "structural": False, "fire_id": lease.get("fire_id"),
                    "residual_window_secs": sink["residual"]})
         ledger_append("cycle", "cycle-autopilot",
@@ -2681,9 +2690,12 @@ def cmd_self_test(args):
         {"ts": 4.0, "cycle_id": 12, "phase": HELD_PHASE, "role": "worker", "detail": {"child_rc": 84}},
         {"ts": 5.0, "cycle_id": 13, "phase": "armed", "role": "worker", "detail": {"fire_id": "G:9:3"}},
         {"ts": 6.0, "cycle_id": 13, "phase": "failed", "role": "worker", "detail": {}},
+        # ★(RR1-ROLE-3) rc 88(다른 집행자 진행 중)도 보류 종결 — 그 통보가 미해결이면 같은 fire_id 를 다시 집행한다.
+        {"ts": 7.0, "cycle_id": 14, "phase": "armed", "role": "worker", "detail": {"fire_id": "G:9:4"}},
+        {"ts": 8.0, "cycle_id": 14, "phase": HELD_PHASE, "role": "worker", "detail": {"child_rc": 88, "skipped": True}},
     ]
     fx_view = ledger_view(fx_recs, "worker", 0)
-    t.check("★[가드 v3] 원장 집행 발화 = 비보류 종결 사이클의 fire_id(보류는 같은 통보 재시도 허용)",
+    t.check("★[가드 v3] 원장 집행 발화 = 비보류 종결 사이클의 fire_id(보류·rc 88 진행 중은 같은 통보 재시도 허용)",
             fx_view["fires_executed"] == {"G:9:1", "G:9:3"}, str(fx_view["fires_executed"]))
     v = evaluate_gates("worker", ctx_of(row_patch={"usage": {"source": "rollout:heuristic",
                                                              "ctx_pct": 90, "ctx_tokens": 1,
@@ -3811,6 +3823,17 @@ def cmd_self_test(args):
             and "lease" not in fixture["state"], str(fixture["detail"]))
     t.check("rc87 은 86(재주입 보류)과 다르다 — 86 은 clear 가 이미 나갔다",
             SKIPPED_RC == 87 and SKIPPED_RC not in HELD_RCS)
+    # ★(0.14.42 · RR1-ROLE-3) rc 88 = 다른 집행자의 사이클 진행 중 — 송신 0건 · 실패 아님 · 통지·settle·사후검증·quiesce 해제 0회 ·
+    #   보류 종결(held_noop)이라 '집행됨'이 아니다(그 통보가 미해결이면 쿨다운 뒤 게이트 3 이 같은 fire_id 를 다시 연다).
+    fixture = execute_fixture(BUSY_RC)
+    t.check("rc88: held_noop 종결(skipped · 진행 중) · EXIT_OK · 통지·settle·post_verify·quiesce 해제 0회",
+            fixture["terminal"].get("phase") == HELD_PHASE and fixture["detail"].get("skipped") is True
+            and fixture["detail"].get("clear_sent") is False and fixture["result"] == EXIT_OK
+            and "진행 중" in (fixture["detail"].get("reason") or "")
+            and not fixture["notifier"].called and not fixture["sleeper"].called
+            and not fixture["post"].called and not fixture["qrunner"].called
+            and "lease" not in fixture["state"], str(fixture["detail"]))
+    t.check("rc88 은 87·86·보류 코드와 다르다", BUSY_RC == 88 and BUSY_RC not in HELD_RCS + (SKIPPED_RC, 86))
 
     held_notify_every = globals().get("HELD_NOTIFY_EVERY")
     for streak in (2, 3, 4, 5, 6, 7):
