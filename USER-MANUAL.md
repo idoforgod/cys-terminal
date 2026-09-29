@@ -737,10 +737,13 @@ cys send --queued --to worker "..."    # followup 큐: 대상이 조용해지면
     쓰이지 않고(`[draft_gate:paused]` · 쓰기 0) 큐로 넘어갑니다(stderr `[send] 데몬 pause(kill-switch) 중 — 정착
     재시도를 멈추고 큐로 전환`). pause 중 **첫** 직접 `send`(보고)는 종전 그대로 곧바로 들어갑니다.
   - **제출 Return 이 나중에 뜬 창을 누르지 않습니다**: `send-key Return` 의 CR 은 데몬이 최소 간격 뒤에 쓰는데,
-    쓰기 직전에 질문·권한·선택 창이 새로 떠 있으면(그 줄이 우리가 보낸 본문이 아니면) 그 CR 을 쓰지 않습니다
-    (`queue.submit_withheld`). 본문은 입력줄에 남고, 창이 닫힌 뒤 입력줄이 여전히 그 본문 그대로면 데몬이 그 CR 을
-    **한 번** 다시 씁니다(`queue.submit_resubmitted` · 5초 주기 점검 · pause 중에는 하지 않음 · 그 사이 사람이 그 줄에
-    손을 댔거나 다른 기계 본문이 들어왔으면 다시 쓰지 않고 `queue.submit_withheld_dropped`). 에이전트가 막 앉아 데몬이
+    쓰기 직전에 질문·권한·선택 창이 새로 떠 있으면(커서가 든 입력 상자가 우리가 보낸 본문이 아니면 — 긴 줄이 접히거나
+    여러 줄이어서 커서가 둘째 줄 이하에 있어도, Claude 가 긴 붙여넣기를 `[Pasted text #N +M lines]` 로 접어 그려도 입력
+    상자 전체를 본문과 대조합니다 · 그 입력 상자 위에 남은 `❯ 1. …` 같은 이전 메시지·본문 첫 줄은 창으로 보지 않습니다)
+    그 CR 을 쓰지 않습니다(`queue.submit_withheld`). 본문은 입력줄에 남고, 창이 닫힌 뒤 입력줄이 여전히 그 본문 그대로면
+    데몬이 그 CR 을 **한 번** 다시 씁니다(`queue.submit_resubmitted` · 5초 주기 점검 · pause 중에는 하지 않음 · 그 사이
+    사람이 그 줄에 손을 댔거나 다른 기계 본문이 들어왔으면 다시 쓰지 않고 `queue.submit_withheld_dropped` · 10분이 지나도
+    창이 닫히지 않으면 기다림을 그만두고 같은 이벤트 `reason:"wait_cap"` — 입력줄 본문은 그대로). 에이전트가 막 앉아 데몬이
     아직 좌석 점유를 확인하지 못한 동안(기동 뒤 최대 5초)에도 보류하되, 그때는 커서가 선택지 행(`❯ 1. …`)일 때만
     창으로 봅니다(죽은 좌석의 창 잔상 아래 셸에 치는 재기동 Return 은 막지 않음). **이미 보이는 창에 보내는
     Return(승인)·방향키 뒤 Return 은 종전처럼 씁니다.** 단, 창이 뜨기 전에 들어간 기계 본문이 입력줄에서 제출을
@@ -1501,7 +1504,8 @@ v0.14.42 가산분(S21 제출 정착 · 전부 additive):
 - `queue.submit_resubmitted` {surface_ref, from, withheld_ms_ago} — 창이 닫히고 입력줄이 보류한 기계 본문 그대로라 그
   제출 CR 을 한 번 다시 썼다(watchdog 5초 틱 · 큐 배달 앞 · pause 중 없음)
 - `queue.submit_withheld_dropped` {surface_ref, reason("human"·"newer_body"·"line_empty"·"seat_off"·"kill_switch"·
-  "unobservable"·"expired"), from, withheld_ms_ago} — 보류한 CR 을 다시 쓰지 않기로 했다(입력줄 본문은 그대로 둔다)
+  "unobservable"·"expired"·"wait_cap"), from, withheld_ms_ago} — 보류한 CR 을 다시 쓰지 않기로 했다(입력줄 본문은 그대로
+  둔다 · `wait_cap` = 보류 뒤 10분 안에 창이 닫히지 않았다)
 
 ---
 
