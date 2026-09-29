@@ -1013,3 +1013,24 @@ fn fv2_withheld_record_dropped_at_wait_cap() {
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0]["payload"]["reason"], json!("wait_cap"), "{d:?}");
 }
+
+/// 적색→녹색(② 재제출 판정 일치): 입력 블록의 주인이 우리 본문이면 블록 **위** 서명은 전경이 아니다 — 입력 상자 아래에
+/// 괘선·상태줄 대신 레이아웃 증거가 아닌 안내 행(실 claude 2.1.282 실측 `paste again to expand`)만 보이는 프레임에서도
+/// 재제출은 보류 탐침과 같은 판정을 쓴다(공유 전경 술어로 재면 이력 에코 `❯ 1. …` 가 '과거'로 면제되지 않아 wait_prompt).
+#[test]
+fn fv2_resubmit_ignores_signatures_above_own_composer_without_trailer() {
+    let fx = fx("fv2-resub-notrail");
+    let t = withheld_wrapped_seat(&fx, P + 360);
+    let (mut rows, cr, cc) = claude_screen(&["❯ 1. earlier numbered request", "", "⏺ ok"], W1, &[]);
+    rows.truncate(cr as usize + 1); // 입력 상자 아래 괘선·상태줄 없음
+    rows.push("  paste again to expand".to_string());
+    assert!(
+        cys::readiness::modal_foreground(&rows.join("\n"), Some("❯")).is_some(),
+        "형상 대조 실패: 이 화면은 공유 전경 술어에서 양성이어야 한다(아래 판정이 무의미해진다)"
+    );
+    paint_rows(&t, &(rows, cr, cc));
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "블록 위 이력 서명 때문에 재제출이 멈췄다(탐침과 판정 불일치): {o:?}");
+    assert_eq!(named(&fx, "queue.submit_resubmitted").len(), 1);
+}
