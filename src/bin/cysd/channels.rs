@@ -1505,7 +1505,8 @@ enum InboxHold {
     /// writer 채널 포화·닫힘 — 기록을 되돌리고 멈춘다.
     WriterBusy,
     /// ★(리뷰 F1-H3-batch-flush-stale-verdict) 배달 간격 — 이 루프가 이미 1행을 주입했거나, master 좌석 writer 가 데몬
-    /// Inject 를 쓰는 중이거나 끝난 지 [`CHANNEL_ROW_GAP_MS`] 가 안 됐다. 다음 행은 간격 뒤 **새 판정**으로 나간다
+    /// Inject 를 쓰는 중이거나 끝난 지 [`CHANNEL_ROW_GAP_MS`] 가 안 됐다(★H3 간격 경쟁: 넘긴 앞 행을 writer 가 아직 집지
+    /// 않은 창 포함 — [`master_inject_settling`]). 다음 행은 간격 뒤 **새 판정**으로 나간다
     /// (후속 배달 루프 [`schedule_paced_followup`] · 없으면 15s sweep).
     Paced,
 }
@@ -1545,6 +1546,7 @@ fn channel_hold_axes() -> crate::governance::MachineHoldAxes {
 /// 끝난(CR 기록) 뒤** 이만큼 지나야 다음 행을 판정한다. 앞 행을 받은 에이전트가 권한·질문 창을 띄울 틈을 판정 앞에
 /// 둔다(판정은 그 뒤 화면을 본다). 20행 백로그 ≈ 20×(붙여넣기+500ms+1s) ≈ 30s(종전 1행/15s 스로틀 ≈ 5분 ·
 /// 83d67185 의 일괄 ≈ 10s). 판정→CR 500ms 창(직접 주입 공통 잔여)은 행마다 남는다.
+/// ★(0.14.42 · H3 간격 경쟁) 앞 행이 writer 대기열에만 있고 아직 쓰이지 않은 동안도 간격 안이다(인계 표식 — 종전은 그 창이 비었다).
 const CHANNEL_ROW_GAP_MS: u64 = 1000;
 
 /// ★(R1-F4) master 좌석 writer 가 한 Inject arm 을 이만큼 넘게 쓰고 있으면 막힌 것이다(에이전트가 stdin 을 읽지 않음 ·
@@ -1553,10 +1555,22 @@ const CHANNEL_ROW_GAP_MS: u64 = 1000;
 const CHANNEL_WRITER_STUCK_SECS: u64 = 10;
 
 /// master 좌석 writer 가 데몬 Inject 를 쓰는 중이거나 끝난 지 [`CHANNEL_ROW_GAP_MS`] 가 안 됐는가(자기·타 생산자 무관).
+/// ★(0.14.42 · H3 간격 경쟁) 채널이 넘긴 앞 행을 writer 가 **아직 집지 않은** 창도 포함한다
+/// ([`crate::state::InjectTrack::handoff_pending`] — 종전은 writer `begin()` 부터만 재서 그 창에 뒤 행이 간격 0 으로 들어갔다).
+/// 판독 순서 = 인계 표식 → `busy_within`(active → done_at) — 표식이 풀린 순간은 `done_at` 이 이어받는다.
 fn master_inject_settling(surface: &crate::state::Surface) -> bool {
-    surface
-        .inject_track
-        .busy_within(std::time::Duration::from_millis(CHANNEL_ROW_GAP_MS))
+    surface.inject_track.handoff_pending().is_some()
+        || surface
+            .inject_track
+            .busy_within(std::time::Duration::from_millis(CHANNEL_ROW_GAP_MS))
+}
+
+/// ★(R1-F4) master 좌석 writer 가 막혔는가 — 한 Inject arm 을 [`CHANNEL_WRITER_STUCK_SECS`] 넘게 쓰는 중이거나,
+/// ★(H3 간격 경쟁) 채널이 넘긴 앞 행을 그만큼 지나도록 집어 끝내지 못했다(선행 쓰기에서 막힘). 막혔으면 간격 후속을
+/// 걸지 않는다(15s sweep · `WriterBusy`) — 뒤 행을 더 넘겨도 대기열에 쌓일 뿐이고, 풀리는 순간 간격 없이 이어 쓰인다.
+fn master_writer_stuck(surface: &crate::state::Surface) -> bool {
+    let over = std::time::Duration::from_secs(CHANNEL_WRITER_STUCK_SECS);
+    surface.inject_track.stuck_over(over) || surface.inject_track.handoff_pending().is_some_and(|age| age > over)
 }
 
 /// ★(리뷰 F1-H3-batch-flush-stale-verdict) 간격으로 멈춘 배달의 **후속 루프 1회**를 예약한다 — 데몬(소켓)당 대기 중
@@ -1626,7 +1640,10 @@ fn inject_master_confirmed(daemon: &Arc<Daemon>, surface: &Arc<crate::state::Sur
         crate::delivery::Origin::Channel,
         None,
     );
-    surface
+    // ★(0.14.42 · H3 간격 경쟁) 인계 표식 — `try_send` **앞**(writer 가 집어 끝내기 전에 반드시 서 있어야 한다 ·
+    //   InjectTrack::note_handoff doc). 다음 배달 루프는 writer 가 이 행을 끝낸 뒤 + 간격까지 다음 행을 판정하지 않는다.
+    let mark = surface.inject_track.note_handoff();
+    let ok = surface
         .write_tx
         .try_send(crate::state::WriteReq::Inject {
             text: envelope.to_string(),
@@ -1634,7 +1651,11 @@ fn inject_master_confirmed(daemon: &Arc<Daemon>, surface: &Arc<crate::state::Sur
             clear_first: false,
             guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작 · 판정은 master_hold 가 앞에서 했다)
         })
-        .is_ok()
+        .is_ok();
+    if !ok {
+        surface.inject_track.undo_handoff(mark);
+    }
+    ok
 }
 
 /// ★(0.14.42 · 설계 H3) 상태 기록 실패 통지 — 데몬(소켓)별 쿨다운 [`INBOX_WRITE_FAILED_COOLDOWN_SECS`].
@@ -1718,11 +1739,9 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
             && (!out.delivered.is_empty()
                 || daemon.get_surface(sid).is_some_and(|s| master_inject_settling(&s)))
         {
-            // ★(R1-F4) writer 가 막혔으면(한 arm 이 [`CHANNEL_WRITER_STUCK_SECS`] 초과) 간격이 아니라 인계 정체다 —
-            //   후속 루프를 걸지 않는다(15s sweep 이 이어받는다 · 사유 writer_busy 로 보인다).
-            let stuck = daemon.get_surface(sid).is_some_and(|s| {
-                s.inject_track.stuck_over(std::time::Duration::from_secs(CHANNEL_WRITER_STUCK_SECS))
-            });
+            // ★(R1-F4) writer 가 막혔으면(한 arm 이 [`CHANNEL_WRITER_STUCK_SECS`] 초과 · 넘긴 앞 행을 그만큼 못 끝냄) 간격이
+            //   아니라 인계 정체다 — 후속 루프를 걸지 않는다(15s sweep 이 이어받는다 · 사유 writer_busy 로 보인다).
+            let stuck = daemon.get_surface(sid).is_some_and(|s| master_writer_stuck(&s));
             out.hold = Some(if stuck { InboxHold::WriterBusy } else { InboxHold::Paced });
             break;
         }
@@ -4269,6 +4288,96 @@ mod tests {
         }
         assert_eq!(rest, vec![ids[1], ids[2]], "나머지 FIFO");
         assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 3, "각 1회");
+        h3_done(&m);
+    }
+
+    /// ★(0.14.42 · H3 간격 경쟁 — 발행 준비 발견 · RUNBOOK §0-2b) 앞 행을 writer 에 **넘겼으나 writer 가 아직 집지 않은** 창에서
+    /// 돈 배달 루프는 다음 행을 판정·주입하지 않는다(`Paced`). 창을 결정론으로 연다 — writer 를 비-Inject 쓰기(선행 적체:
+    /// 직접 send 의 `SubmitAfterGap` 최소 간격 수면·큰 본문 쓰기와 같은 자리)로 붙잡아 앞 행 Inject 가 대기열에 서게 한다.
+    /// 다음 행은 앞 행의 끝 CR + [`CHANNEL_ROW_GAP_MS`] 뒤에 나간다(유실 0 · FIFO).
+    /// RED(HEAD c276cb73): 간격을 writer `begin()` 부터 재서 둘째 루프가 뒤 행을 곧바로 주입(두 행이 writer 에서 간격 없이 이어진다).
+    #[cfg(unix)]
+    #[test]
+    fn h3_row_handed_before_writer_pickup_paces_next_row() {
+        const HOLD_MS: u64 = 700;
+        let (d, m) = h3_rig("h3-handoff");
+        let ids = [h3_seed(&d, "q0", now()), h3_seed(&d, "q1", now())];
+        m.write_tx
+            .send(crate::state::WriteReq::DataAfter { bytes: Vec::new(), delay_ms: HOLD_MS })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50)); // writer 가 선행 쓰기를 집고 자는 중
+        let pass = |d: &Arc<Daemon>| {
+            let mut g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(d, g.as_mut().unwrap())
+        };
+        let r1 = pass(&d);
+        assert_eq!(r1.delivered, vec![ids[0]], "전제: 첫 행 인계");
+        let t_hand = std::time::Instant::now();
+        assert!(
+            !m.inject_track.busy_within(std::time::Duration::from_millis(CHANNEL_ROW_GAP_MS)),
+            "전제: writer 가 앞 행을 아직 집지 않았다(begin 전)"
+        );
+        let r2 = pass(&d);
+        assert!(r2.delivered.is_empty(), "writer 가 앞 행을 집기 전 창에서 다음 행을 주입했다(간격 0 · 낡은 판정)");
+        assert_eq!(r2.hold, Some(InboxHold::Paced), "인계 대기는 간격(Paced)이다 — 막힌 writer 가 아니다");
+        assert_eq!(h3_state(&d, ids[1]), "new");
+        assert_eq!(h3_drain(&d, 1), vec![ids[1]], "간격 뒤 다음 행(유실 0 · FIFO)");
+        let floor = std::time::Duration::from_millis(HOLD_MS - 50 + 500 + CHANNEL_ROW_GAP_MS);
+        assert!(t_hand.elapsed() >= floor, "다음 행이 앞 행 끝 CR + 간격 전에 나갔다: {:?} < {floor:?}", t_hand.elapsed());
+        assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 2, "각 1회");
+        h3_done(&m);
+    }
+
+    /// [H3 간격 경쟁 · R1-F4 짝] 넘긴 앞 행을 writer 가 [`CHANNEL_WRITER_STUCK_SECS`] 넘게 끝내지 못하면(선행 쓰기에서 막힘)
+    /// 간격(Paced · 500ms 후속 재무장)이 아니라 `WriterBusy`(후속 없음 · 15s sweep)다 — 뒤 행은 new 로 남는다(더 넘기면 대기열에
+    /// 쌓였다가 풀리는 순간 간격 없이 이어 쓰인다). 음성 대조: 방금 넘긴 인계는 `Paced`(인계 실패 되돌림은 state 검체).
+    #[cfg(unix)]
+    #[test]
+    fn h3_handoff_stuck_is_writer_busy_not_paced() {
+        let (d, m) = h3_rig("h3-handoff-stuck");
+        let id = h3_seed(&d, "막힌 인계 뒤의 행", now());
+        let pass = |d: &Arc<Daemon>| {
+            let mut g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(d, g.as_mut().unwrap())
+        };
+        let _mark = m.inject_track.note_handoff(); // writer 에 넘겼으나 집지 못한 앞 행(표식만 — 대기열 재현)
+        let r = pass(&d);
+        assert_eq!((r.delivered.is_empty(), r.hold), (true, Some(InboxHold::Paced)), "방금 넘긴 인계는 간격");
+        m.inject_track.backdate_handoff(std::time::Duration::from_secs(CHANNEL_WRITER_STUCK_SECS + 5));
+        let r = pass(&d);
+        assert_eq!(r.hold, Some(InboxHold::WriterBusy), "오래 못 끝낸 인계를 간격(Paced)으로 봤다 — 후속 루프가 재무장된다");
+        assert!(r.delivered.is_empty(), "막힌 writer 에 뒤 행을 더 넘겼다");
+        assert_eq!(h3_state(&d, id), "new", "행은 new 로 남아야 한다(유실 0)");
+        h3_done(&m);
+    }
+
+    /// [H3 간격 경쟁 음성 대조] 인계 표식은 **채널 간격 전용**이다 — writer 가 아직 집지 않은 앞 행은 화면에 한 글자도 없으므로
+    /// 그 창의 화면 초안은 우리 붙여넣기가 아니다. H0 자기 붙여넣기 귀속(`draft_machine_owned` · `busy_within`)은 그대로
+    /// Draft 로 본다(인계 표식을 `active` 로 세우면 사람 초안 위에 다른 생산자가 주입한다). 전후 GREEN(핀).
+    #[cfg(unix)]
+    #[test]
+    fn h3_handoff_window_draft_is_not_own_paste() {
+        let (d, m) = h3_rig("h3-handoff-draft");
+        let sid = m.id;
+        let id = h3_seed(&d, "대기열의 앞 행", now());
+        m.write_tx
+            .send(crate::state::WriteReq::DataAfter { bytes: Vec::new(), delay_ms: 600 })
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        {
+            let mut g = d.channels.lock().unwrap();
+            assert_eq!(deliver_new_inbox_with(&d, g.as_mut().unwrap()).delivered, vec![id], "전제: 인계");
+        }
+        crate::governance::h_paint(&m, crate::governance::H_DRAFT_SCREEN);
+        assert!(
+            crate::governance::draft_machine_owned(&m, Some(crate::governance::H_DRAFT_SCREEN)).is_none(),
+            "writer 가 집기 전 창의 화면 초안을 자기 붙여넣기로 귀속했다"
+        );
+        assert_eq!(
+            master_hold(&d, sid).err(),
+            Some(InboxHold::Gate(crate::governance::MachineHold::Draft)),
+            "인계 창에서도 H0 초안 축은 종전대로 본다"
+        );
         h3_done(&m);
     }
 

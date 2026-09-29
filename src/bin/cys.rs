@@ -2452,6 +2452,125 @@ fn should_queue_fallback_send(queued: bool, clear_first: bool, err: &str) -> boo
     !queued && !clear_first && is_typing_guard_err(err)
 }
 
+// ═══════════ ★(0.14.42 · S21-SETTLE) `cys send` 정착 재시도 ═══════════
+//
+// 데몬이 직접 본문 거부에 **정착 증명**(` [settle:<ms>]` · lib `SEND_SETTLE_TAG`)을 붙이면 "줄을 점유한 것은 진행 중인
+// 기계 제출(writer 대기 CR · 방금 쓴 CR 의 분리 창 · 짝 Return 을 기다리는 새 기계 본문)이고 곧 빈다" 는 뜻이다.
+// 그때만 같은 본문을 힌트만큼 쉬고 다시 보낸다 — 거부는 데몬의 쓰기 전 명시 거부라 중복 주입이 없다. 예산을 넘기면
+// 종전처럼 `--queued` 로 1회 전환한다. 증명이 없으면(사람 초안·모달·태그 없는 타이핑 가드·전송 오류) 재시도 0회로
+// 종전 경로 그대로다. 왜 필요한가: 거부된 본문은 큐로 가서 좌석당 최소 간격(10s)으로 한 건씩 나간다 — 여러 발신자가
+// 같은 좌석에 동시에 보내면(부서 보고 동시 도착 · 벤치 S21) 한 건당 수백 ms 면 직접 나갈 본문이 10초 단위로 밀리고
+// 큐 상한(100) 뒤로는 거절(queue_full)된다.
+
+/// 정착 재시도 예산 기본값(ms) — 한 `cys send` 가 줄이 비기를 기다리는 최대 시간. 큐 경로(조용함 3s + 최소 간격 10s)
+/// 보다 짧고, 실측 경쟁(좌석 하나에 발신자 8명 · 한 제출 ≈ 최소 간격 150ms + 분리 80ms)에서 대부분의 본문이 직접
+/// 나가는 폭이다. env `CYS_SEND_SETTLE_BUDGET_MS` 로 조정(0 = 재시도 끔 · 상한 10s).
+const SEND_SETTLE_BUDGET_MS_DEFAULT: u64 = 3000;
+/// 예산 env 상한(ms).
+const SEND_SETTLE_BUDGET_MS_MAX: u64 = 10_000;
+/// 한 번 쉬는 시간의 하한·상한(ms) — 데몬 힌트를 이 범위로 자른다(폭주 방지: 최소 20ms 간격 · 최대 [`SEND_SETTLE_MAX_TRIES`]회).
+const SEND_SETTLE_STEP_MIN_MS: u64 = 20;
+const SEND_SETTLE_STEP_MAX_MS: u64 = 300;
+/// 여러 발신자가 같은 시각에 다시 보내는 것을 흩는 지터 상한(ms).
+const SEND_SETTLE_JITTER_MS: u64 = 40;
+/// 한 `cys send`(대상 1곳)의 최대 요청 수(첫 요청 포함).
+const SEND_SETTLE_MAX_TRIES: u32 = 40;
+
+/// ★(S21-SETTLE) 정착 재시도 예산(순수). 끔(env `CYS_SEND_SETTLE`)·윈도우(요청 순서 무변경)·다중 대상(글롭 — 뒤 대상이
+/// 늦어진다)·명시 큐(직접 요청이 없다)·clear_first(원자 경로 — 무clear 방향 위험이 있는 경로는 재시도하지 않는다)면 0.
+/// 0 이면 요청 순서가 종전과 바이트 단위로 같다(직접 1회 → 거부면 `--queued` 1회).
+fn send_settle_budget_ms(
+    env_off: bool,
+    budget_env: Option<&str>,
+    windows: bool,
+    multi: bool,
+    queued: bool,
+    clear_first: bool,
+) -> u64 {
+    if env_off || windows || multi || queued || clear_first {
+        return 0;
+    }
+    budget_env
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|v| v.min(SEND_SETTLE_BUDGET_MS_MAX))
+        .unwrap_or(SEND_SETTLE_BUDGET_MS_DEFAULT)
+}
+
+/// 지터(ms · [0, `SEND_SETTLE_JITTER_MS`]) — pid·시계 나노초·시도 번호에서 파생(난수 크레이트 불요).
+fn send_settle_jitter_ms(try_no: u32) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    (nanos ^ (std::process::id() as u64).wrapping_mul(0x9E37_79B9) ^ u64::from(try_no))
+        % (SEND_SETTLE_JITTER_MS + 1)
+}
+
+/// ★(S21-SETTLE) 정착 재시도 결과 — 마지막 요청 결과 · 총 요청 수 · 총 대기(ms).
+struct SettleOutcome {
+    result: Result<Value, String>,
+    tries: u32,
+    waited_ms: u64,
+}
+
+/// ★(S21-SETTLE) 직접 본문 요청 + **증명된 재시도**(시임: 요청·수면·지터를 주입받는다).
+/// 다음 요청으로 가는 것은 `cys::send_settle_hint_ms` 가 힌트를 읽는 거부뿐이다(D-12 태그 ∧ 정착 태그). 쉬는 시간 =
+/// 힌트를 [하한, 상한]으로 자른 값 + 지터, 남은 예산으로 다시 자른다. 예산을 다 쓰면 마지막 결과를 그대로 돌려준다
+/// (호출부가 종전처럼 `--queued` 로 1회 전환한다).
+/// ★(0.14.42 · 수정 2회차 FV1-1) `req` 의 인자 = **정착 재시도인가**(첫 요청 `false` · 그 뒤 `true`). 호출부는 재시도에만
+/// `settle_retry:true` 를 싣는다 — 데몬은 kill-switch pause 중 재시도를 쓰지 않고 증명 없이 거부하므로(`[draft_gate:paused]`)
+/// 이 루프가 멈추고 호출부의 `--queued` 1회(= pause 동안 동결)로 간다. 첫 요청은 종전 바이트 그대로다.
+fn send_text_settled(
+    mut req: impl FnMut(bool) -> Result<Value, String>,
+    mut sleep: impl FnMut(u64),
+    budget_ms: u64,
+    jitter: impl Fn(u32) -> u64,
+) -> SettleOutcome {
+    let mut result = req(false);
+    let (mut tries, mut waited_ms) = (1u32, 0u64);
+    while tries < SEND_SETTLE_MAX_TRIES {
+        let hint = match &result {
+            Err(e) => match cys::send_settle_hint_ms(e) {
+                Some(h) => h,
+                None => break,
+            },
+            Ok(_) => break,
+        };
+        let left = budget_ms.saturating_sub(waited_ms);
+        if left == 0 {
+            break;
+        }
+        let d = (hint.clamp(SEND_SETTLE_STEP_MIN_MS, SEND_SETTLE_STEP_MAX_MS)
+            + jitter(tries).min(SEND_SETTLE_JITTER_MS))
+        .min(left);
+        sleep(d);
+        waited_ms += d;
+        result = req(true);
+        tries += 1;
+    }
+    SettleOutcome { result, tries, waited_ms }
+}
+
+/// ★(S21-SETTLE) 정착 재시도의 stderr 관측성 문구(순수) — 재시도 뒤에도 타이핑 가드 거부로 끝났을 때(예산 소진)만.
+/// 재시도 성공·종전 경로·전송 오류는 무문구(전송 오류를 '점유' 로 오보하지 않는다). stdout(OK/QUEUED)과 무관하다.
+fn send_settle_stderr_line(o: &SettleOutcome, sid: u64) -> Option<String> {
+    match &o.result {
+        // ★(수정 2회차 FV1-1) pause 중 재시도 거부는 '점유' 가 아니다 — 사실대로 적는다(큐 전환 뒤 pause 경고는 호출부가 따로 낸다).
+        Err(e) if o.tries > 1 && e.contains(&format!("[{}:paused]", cys::DRAFT_GATE_TAG)) => Some(format!(
+            "[send] 데몬 pause(kill-switch) 중 — 정착 재시도를 멈추고 큐로 전환(resume 뒤 배달 · 재시도 {}회) surface={}",
+            o.tries - 1,
+            surface_ref(sid)
+        )),
+        Err(e) if o.tries > 1 && is_typing_guard_err(e) => Some(format!(
+            "[send] 입력줄 정착 대기 {}ms(재시도 {}회) 뒤에도 점유 — 큐로 전환 surface={}",
+            o.waited_ms,
+            o.tries - 1,
+            surface_ref(sid)
+        )),
+        _ => None,
+    }
+}
+
 /// ★B3 #4 `cys send` 본문 결정(순수) — argv 대신 **바이트 전문**을 본문으로 삼는 경로.
 ///
 /// 왜 필요한가(실사고): 본문 채널이 argv 하나뿐이라 발신 셸이 큰따옴표 안의 백틱·`$( )`·
@@ -4343,6 +4462,9 @@ fn run(command: Command) -> i32 {
             resolve_targets(&surface, &to).and_then(|sids| {
                 let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
                 let multi = sids.len() > 1;
+                // ★(0.14.42 · S21-SETTLE) 정착 재시도 끔·예산 — 프로세스 단위(라이브 즉시 롤백은 데몬 센티널 `send-settle-off`).
+                let settle_off = cys::send_settle_env_off(std::env::var("CYS_SEND_SETTLE").ok().as_deref());
+                let settle_budget_env = std::env::var("CYS_SEND_SETTLE_BUDGET_MS").ok();
                 // ★B3 #4: 본문 채널은 argv·표준입력·파일 셋이며 결정은 한 곳에서 한다.
                 let body = read_send_body(&text, stdin, file.as_deref())?;
                 for sid in sids {
@@ -4350,10 +4472,28 @@ fn run(command: Command) -> i32 {
                     // T3-13 권위 전달: clear_first는 데몬이 원자적으로(Ctrl-U 선정리 → paste → CR)
                     // 집행한다. 클라측 C-u·150ms sleep·게이트는 제거 — 비원자 split·race를 없앤다.
                     // agent 등록 pane 게이트는 데몬 send_text가 집행(clear_first_unsupported).
-                    let r = match request(
-                        "surface.send_text",
-                        json!({"surface_id": sid, "text": body, "from": from, "queued": queued, "clear_first": clear_first}),
-                    ) {
+                    // ★(0.14.42 · S21-SETTLE) 첫 직접 요청만 정착 재시도로 감싼다 — 데몬이 정착 증명을 붙인 거부(쓰기 전
+                    //   명시 거부)에서만 힌트만큼 쉬고 다시 보낸다. 증명이 없거나 예산 0(윈도우·다중·큐·clear_first·끔)이면
+                    //   재시도 0회로 아래 큐 전환에 그대로 간다(요청 순서 종전과 같음).
+                    let settle = send_text_settled(
+                        |settle_retry| {
+                            let mut params =
+                                json!({"surface_id": sid, "text": body, "from": from, "queued": queued, "clear_first": clear_first});
+                            // ★(수정 2회차 FV1-1) 정착 재시도 표식 — 재시도에만 싣는다(첫 요청은 종전 바이트). 데몬은 pause 중
+                            //   재시도를 쓰지 않고 증명 없이 거부한다 → 아래 `--queued` 1회(= pause 동안 동결).
+                            if settle_retry {
+                                params["settle_retry"] = json!(true);
+                            }
+                            request("surface.send_text", params)
+                        },
+                        |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+                        send_settle_budget_ms(settle_off, settle_budget_env.as_deref(), cfg!(windows), multi, queued, clear_first),
+                        send_settle_jitter_ms,
+                    );
+                    if let Some(line) = send_settle_stderr_line(&settle, sid) {
+                        eprintln!("{line}");
+                    }
+                    let r = match settle.result {
                         Ok(r) => r,
                         // ★B3: 타이핑 가드 거부 → `--queued` 1회 전환(inject_text T-0147-6 동형).
                         //   종전엔 여기서 에러가 그대로 올라가 **본문이 소실**됐다. 큐 배달은
@@ -4361,7 +4501,8 @@ fn run(command: Command) -> i32 {
                         //   미완성 입력에 이어붙는 최악 경로가 구조적으로 불가능하다.
                         //   ★큐 배달은 CR 을 **포함**한다 — 이 명령 뒤에 오는 관례적
                         //     `cys send-key Return` 은 빈 프롬프트의 Enter 라 무해하다.
-                        //   재시도는 정확히 1회다(반복하면 중복 주입).
+                        //   큐 전환은 정확히 1회다(결과 불명 재전송 금지 — 반복하면 중복 주입). 위의 정착 재시도는
+                        //   데몬이 쓰기 0 을 확정하고 정착 증명을 붙인 명시 거부에만 돈다(S21-SETTLE).
                         Err(e) if should_queue_fallback_send(queued, clear_first, &e) => {
                             // ★(0.14.42 · A2 C1) 자동 전환(이 폴백)만 `absorb_return:true` 를 싣는다 —
                             //   데몬이 이 발신자의 **뒤따르는 짝 Return 1회**(TTL 안)를 흡수해 맨 CR·빈 큐
@@ -28149,6 +28290,131 @@ mod tests {
         assert!(arm.contains("send_key_request_params(sid, key, queued, pair, from)"), "첫 요청(헬퍼)");
         assert_eq!(send_key_request_params(1, "Return", false, true, None)["pair_return"], json!(true));
         assert!(arm.contains("!any_absorbed") && arm.contains("!sid_absorbed"), "흡수 시 OK 억제");
+    }
+
+    /// ★(0.14.42 · S21-SETTLE) 정착 재시도 예산(순수) — 끔·윈도우·다중 대상·명시 큐·clear_first 는 0(재시도 없음 =
+    /// 종전 요청 순서 바이트 동일). env 예산은 파싱·상한 10s · 잘못된 값은 기본.
+    #[test]
+    fn s21_send_settle_budget() {
+        let b = |off, env: Option<&str>, win, multi, q, cf| send_settle_budget_ms(off, env, win, multi, q, cf);
+        assert_eq!(b(false, None, false, false, false, false), SEND_SETTLE_BUDGET_MS_DEFAULT);
+        assert_eq!(SEND_SETTLE_BUDGET_MS_DEFAULT, 3000);
+        assert_eq!(b(true, None, false, false, false, false), 0, "끔");
+        assert_eq!(b(false, None, true, false, false, false), 0, "윈도우 무변경");
+        assert_eq!(b(false, None, false, true, false, false), 0, "다중 대상(글롭)은 재시도 없음");
+        assert_eq!(b(false, None, false, false, true, false), 0, "명시 --queued 는 직접 요청이 없다");
+        assert_eq!(b(false, None, false, false, false, true), 0, "clear_first(원자 경로)는 재시도 없음");
+        assert_eq!(b(false, Some("0"), false, false, false, false), 0, "예산 0 = 재시도 끔");
+        assert_eq!(b(false, Some(" 1500 "), false, false, false, false), 1500);
+        assert_eq!(b(false, Some("999999"), false, false, false, false), 10_000, "상한");
+        assert_eq!(b(false, Some("abc"), false, false, false, false), SEND_SETTLE_BUDGET_MS_DEFAULT, "잘못된 값 = 기본");
+    }
+
+    /// ★(0.14.42 · S21-SETTLE) 정착 재시도 실행기(시임) — **정착 증명이 붙은 D-12 거부에서만** 힌트만큼 쉬고 다시 보낸다.
+    /// 증명 없는 거부(사람 초안·모달·태그 없는 타이핑 가드)·전송 오류·성공은 재시도 0회. 예산을 넘지 않는다.
+    #[test]
+    fn s21_send_text_settled_retries_only_proven_denials() {
+        let tg = cys::MSG_TYPING_GUARD;
+        let proven = |ms: u64| Err(format!("{tg} [draft_gate:submit_settling]{}", cys::send_settle_suffix(ms)));
+        let run = |seq: Vec<Result<Value, String>>, budget: u64| {
+            let seq = std::cell::RefCell::new(seq.into_iter());
+            let slept = std::cell::RefCell::new(Vec::new());
+            let o = send_text_settled(
+                |_retry| seq.borrow_mut().next().expect("요청 수 초과"),
+                |ms| slept.borrow_mut().push(ms),
+                budget,
+                |_| 0,
+            );
+            (o.result.is_ok(), o.tries, o.waited_ms, slept.into_inner())
+        };
+        // 증명 둘 뒤 성공 — 힌트(하한·상한 안)만큼 쉰다.
+        assert_eq!(run(vec![proven(120), proven(40), Ok(json!({"sent": true}))], 3000), (true, 3, 160, vec![120, 40]));
+        // 힌트 하한 20 · 상한 300 으로 자른다.
+        assert_eq!(run(vec![proven(1), proven(5000), Ok(json!({}))], 3000), (true, 3, 320, vec![20, 300]));
+        // 증명 없는 거부(사람 초안) — 재시도 0회(종전: 곧바로 큐 전환).
+        let human = Err(format!("{tg} [draft_gate:pending_input]"));
+        assert_eq!(run(vec![human], 3000), (false, 1, 0, vec![]));
+        // 모달 — 증명 없음(창을 누르지 않는다 · 곧바로 큐).
+        assert_eq!(run(vec![Err(format!("{tg} [draft_gate:modal]"))], 3000), (false, 1, 0, vec![]));
+        // 전송 오류(결과 불명) — 재전송 금지.
+        assert_eq!(run(vec![Err("connection refused".into())], 3000), (false, 1, 0, vec![]));
+        // 예산 소진 — 마지막 대기는 남은 예산으로 자르고 그 뒤 1회만 더 본다.
+        let (ok, tries, waited, slept) = run(vec![proven(300), proven(300), proven(300)], 500);
+        assert_eq!((ok, tries, waited, slept), (false, 3, 500, vec![300, 200]));
+        // 예산 0 — 재시도 없음(윈도우·끔·다중 대상과 같은 경로).
+        assert_eq!(run(vec![proven(100)], 0), (false, 1, 0, vec![]));
+        // 결과가 성공이면 곧바로 끝.
+        assert_eq!(run(vec![Ok(json!({}))], 3000), (true, 1, 0, vec![]));
+    }
+
+    /// ★(0.14.42 · 수정 2회차 FV1-1) 재시도 표식 — 첫 요청은 `false`(종전 바이트) · 정착 재시도만 `true`. 데몬이 pause 중
+    /// 재시도를 증명 없이 거부하면(`[draft_gate:paused]`) 루프가 곧바로 멈추고(호출부 `--queued` 1회 = 동결) stderr 는
+    /// '점유' 가 아니라 pause 를 말한다. 배선: 재시도에만 `settle_retry:true` 를 싣는다(첫 요청 JSON 리터럴은 종전 그대로).
+    #[test]
+    fn fv1_settle_retry_flag_and_pause_stop() {
+        let tg = cys::MSG_TYPING_GUARD;
+        let proven = |ms: u64| Err(format!("{tg} [draft_gate:pending_input]{}", cys::send_settle_suffix(ms)));
+        let paused: Result<Value, String> = Err(format!("{tg} [draft_gate:paused]"));
+        let seq = std::cell::RefCell::new(vec![proven(100), proven(100), paused].into_iter());
+        let flags = std::cell::RefCell::new(Vec::new());
+        let o = send_text_settled(
+            |retry| {
+                flags.borrow_mut().push(retry);
+                seq.borrow_mut().next().expect("요청 수 초과 — pause 거부 뒤에도 재시도했다")
+            },
+            |_| {},
+            3000,
+            |_| 0,
+        );
+        assert_eq!(flags.into_inner(), vec![false, true, true], "첫 요청만 false · 재시도는 true");
+        assert_eq!(o.tries, 3, "pause 거부(증명 없음)에서 멈춘다");
+        assert!(should_queue_fallback_send(false, false, o.result.as_ref().unwrap_err()), "pause 거부 → --queued 1회(동결)");
+        let line = send_settle_stderr_line(&o, 7).expect("재시도 뒤 pause 거부는 한 줄 알린다");
+        assert!(line.contains("pause") && !line.contains("점유"), "pause 를 점유로 오보하지 않는다: {line}");
+        // 예산 소진(점유) 문구는 종전 그대로.
+        let busy = SettleOutcome { result: proven(100), tries: 3, waited_ms: 400 };
+        assert!(send_settle_stderr_line(&busy, 7).unwrap().contains("점유"));
+        // 배선 핀: 재시도 표식은 첫 직접 요청 클로저 안에서 `settle_retry` 인자로만 싣는다.
+        let src = include_str!("cys.rs");
+        let arm = src
+            .split("Command::Send { surface, to, queued, clear_first, stdin, file, text } => {")
+            .nth(1)
+            .expect("Command::Send arm");
+        let first = arm
+            .split("Err(e) if should_queue_fallback_send(queued, clear_first, &e) => {")
+            .next()
+            .unwrap();
+        assert!(first.contains("|settle_retry|") && first.contains("if settle_retry {"), "재시도 인자 배선");
+        assert_eq!(first.matches("params[\"settle_retry\"] = json!(true);").count(), 1, "재시도에만 표식");
+    }
+
+    /// ★(0.14.42 · S21-SETTLE) 배선 핀 — `cys send` 의 **첫 직접 요청만** 정착 재시도로 감싼다. 요청 JSON 은 종전 리터럴
+    /// 그대로(명시 `--queued` 흡수 표 비요청 핀 성립) · 예산은 윈도우·다중·큐·clear_first 에서 0 · 폴백 분기는 무변경.
+    #[test]
+    fn s21_send_settle_wired_on_first_direct_request_only() {
+        let src = include_str!("cys.rs");
+        let arm = src
+            .split("Command::Send { surface, to, queued, clear_first, stdin, file, text } => {")
+            .nth(1)
+            .expect("Command::Send arm");
+        let first = arm
+            .split("Err(e) if should_queue_fallback_send(queued, clear_first, &e) => {")
+            .next()
+            .unwrap();
+        assert!(first.contains("send_text_settled("), "첫 직접 요청 감싸기");
+        assert!(
+            first.contains("send_settle_budget_ms(settle_off, settle_budget_env.as_deref(), cfg!(windows), multi, queued, clear_first)"),
+            "예산 배선(윈도우·다중·큐·clear_first)"
+        );
+        assert_eq!(first.matches("\"surface.send_text\"").count(), 1, "직접 요청은 한 곳");
+        let fb = arm
+            .split("Err(e) if should_queue_fallback_send(queued, clear_first, &e) => {")
+            .nth(1)
+            .unwrap()
+            .split("Command::SendKey")
+            .next()
+            .unwrap();
+        assert!(!fb.contains("send_text_settled("), "큐 전환(r2)은 재시도하지 않는다(정확히 1회)");
     }
 
     /// ★(0.14.42 · 설계 C D4 · T11) CLI 디렉티브 주입의 봉투는 lib `paste_fence::wrap` 단일 정의처를 쓴다 —

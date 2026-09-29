@@ -2317,6 +2317,9 @@ fn typing_guard_secs() -> u64 {
 }
 
 /// D-12 거부 관측·응답의 단일 경로. leaf 락을 놓은 뒤 이벤트를 1건 발행한다.
+/// ★(0.14.42 · S21-SETTLE) `settle_hint` = 정착 증명(재시도 힌트 ms) — 있으면 문구 끝에 ` [settle:<ms>]`, 이벤트에
+/// 가산 키 `settle_ms`. 없으면(send_key·증명 없는 거부) 응답·이벤트 바이트가 종전과 같다.
+#[allow(clippy::too_many_arguments)]
 fn draft_gate_denied_response(
     daemon: &Daemon,
     surface: &crate::state::Surface,
@@ -2325,27 +2328,38 @@ fn draft_gate_denied_response(
     why: DraftGateDenied,
     verified_from: Option<u64>,
     hint: Option<&str>,
+    settle_hint: Option<u64>,
 ) -> Value {
+    // ★(0.14.42 · 수정 2회차 FV1-1) kill-switch pause 중에는 정착 증명을 붙이지 않는다 — 증명이 있으면 신 CLI 가 예산
+    //   안에서 재시도로 좌석에 **직접** 쓰고 짝 Return 이 제출한다(S93 5/5 · pause 응답 뒤 309~490ms 기록). 증명이
+    //   없으면 CLI 는 종전처럼 `--queued` 1회로 넘기고 본문은 pause 동안 동결된다(수정 전 bc954dc2 동작). 거부(쓰기 0)
+    //   자체는 그대로다. 단일 경로라 네 호출처(1차 D-12 · 1차 분리 보류 · 게이트 안 D-12 · 게이트 안 분리 보류)가 모두
+    //   여기서 걸러진다. 이벤트의 `settle_ms` 도 함께 빠진다(= 증명 없는 거부 · 요청마다 1건 발행).
+    let settle_hint = settle_hint.filter(|_| !daemon.paused.load(Ordering::Relaxed));
     let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
     let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
-    daemon.bus.publish(
-        "queue.draft_gate_denied",
-        "queue",
-        Some(surface.id),
-        json!({
-            "surface_ref": cys::surface_ref(surface.id),
-            "kind": match kind {
-                DirectSendKind::Text => "text",
-                DirectSendKind::SubmitKey => "submit_key",
-                DirectSendKind::ClearFirst => "clear_first",
-                DirectSendKind::CancelKey => "cancel_key",
-            },
-            "reason": why.as_str(),
-            "pending_input_bytes": pending,
-            "pending_input_human_bytes": human,
-            "from": verified_from.map(cys::surface_ref),
-        }),
-    );
+    let mut payload = json!({
+        "surface_ref": cys::surface_ref(surface.id),
+        "kind": match kind {
+            DirectSendKind::Text => "text",
+            DirectSendKind::SubmitKey => "submit_key",
+            DirectSendKind::ClearFirst => "clear_first",
+            DirectSendKind::CancelKey => "cancel_key",
+        },
+        "reason": why.as_str(),
+        "pending_input_bytes": pending,
+        "pending_input_human_bytes": human,
+        "from": verified_from.map(cys::surface_ref),
+    });
+    if let Some(ms) = settle_hint {
+        payload["settle_ms"] = json!(ms);
+    }
+    // ★(S21-SETTLE) 정착 증명 거부는 (좌석, 발신자)당 1초에 1건만 발행한다 — 신 CLI 가 힌트 간격으로 다시 보내므로
+    //   경쟁 중(발신자 여럿)에는 같은 사유가 초당 수십 건 쌓여 이벤트 링(4096)의 재생 창을 줄인다. 증명 없는 거부는
+    //   종전처럼 요청마다 1건이다(응답은 언제나 그대로 — 발행만 줄인다).
+    if settle_hint.is_none() || settle_denial_event_due(daemon, surface.id, verified_from) {
+        daemon.bus.publish("queue.draft_gate_denied", "queue", Some(surface.id), payload);
+    }
     // 기존 설치 CLI 의 --queued 폴백은 MSG_TYPING_GUARD contains 매칭이다(Text/SubmitKey/ClearFirst 접두 보존).
     // CancelKey 는 큐에 실을 수 없어 `--queued` 처방이 거짓이므로 전용 문구를 쓴다(코드는 유지 · 수정 라운드 3).
     let base = match kind {
@@ -2353,6 +2367,9 @@ fn draft_gate_denied_response(
         _ => cys::MSG_TYPING_GUARD,
     };
     let mut message = format!("{base} [{}:{}]", cys::DRAFT_GATE_TAG, why.as_str());
+    if let Some(ms) = settle_hint {
+        message.push_str(&cys::send_settle_suffix(ms));
+    }
     if let Some(hint) = hint {
         message.push(' ');
         message.push_str(hint);
@@ -2379,7 +2396,7 @@ fn draft_gate_denied_response(
 /// ③(10ms)은 너무 얕고 ④(400ms)는 대화형 체감을 해친다 — 직접 경로용으로 그 사이,
 /// clear_first 의 settle(150ms)과 같은 자릿수를 택했다. 이 값은 **상한이 아니라 하한**이다:
 /// 이미 그만큼 지난 뒤 온 Return 은 손대지 않는다(무지연).
-fn cr_min_gap_ms() -> u64 {
+pub(crate) fn cr_min_gap_ms() -> u64 {
     std::env::var("CYS_CR_MIN_GAP_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2403,6 +2420,167 @@ fn cr_min_gap_ms() -> u64 {
 /// 게이트만 바이트 축(우회 차단)이며, 별칭이 거부될 때는 문구가 `Return --queued` 를 처방한다(수정 라운드 3).
 fn submit_gap_for_key(key: &str, min_gap_ms: u64) -> Option<u64> {
     (min_gap_ms > 0 && matches!(key, "Return" | "Enter")).then_some(min_gap_ms)
+}
+
+// ═══════════ ★(0.14.42 · S21-SETTLE) 직접 send 의 제출 정착 — 분리 보류 + 정착 증명 ═══════════
+//
+// 【무엇이 문제였나】 `send-key Return` 은 계수를 **넘기는 순간** 0 으로 만들지만(아래 send_key `apply_pending_input`)
+// 실제 CR 은 writer 가 최소 간격(`cr_min_gap_ms` 150ms) 뒤에 쓴다. 그 창에 온 다음 직접 본문이 게이트를 지나면
+// writer FIFO 에서 그 대기 CR **바로 뒤**에 서고, writer 는 CR 과 본문을 이어 쓴다 → TUI 는 `\r`+본문을 한 read
+// 조각으로 받는다. 실 claude 는 그 조각을 붙여넣기로 읽어 CR 을 줄바꿈으로 바꾸고 두 본문을 한 초안으로 병합한다
+// (4cf1490a · 실 claude T13 조용한 유실). 화면 축(D-12 ScreenOccupied)은 이 창을 우연히만 막았다 — 렌더가 늦거나
+// writer 가 적체되면 화면에는 아직 본문이 없다. v0.14.41 은 맨 CR 적체 때문에 그 착시로 본문을 많이 받아 S21 N=8
+// 직접 수락 84/88 이 전부 `\rM|…` 붙음이었다. 0.14.42 A2 가 맨 CR 을 흡수해 적체가 사라지자 화면 축이 150ms 창을
+// 정직하게 막았고, 거부된 발신은 큐(최소 간격 10s · 상한 100)로 밀려 S21 제출 성공률이 21.6% → 13.2% 가 됐다.
+// 【규칙 두 개(에이전트 좌석 · Text 팔 · 유닉스 · 킬 스위치 꺼짐)】
+//   ① 분리 보류 — 대기 제출 CR 이 있거나(writer 미소비 · Inject 진행 중) 마지막 제출 CR 을 쓴 지
+//      [`SEND_SETTLE_MS`] 가 안 됐으면 본문을 받지 않는다(쓰기 0 · 사유 `submit_settling`). 추측이 아니라 writer 의
+//      실제 소비·쓰기 표식([`crate::state::InjectTrack::submit_settle_obs`])으로 판정한다.
+//   ② 정착 증명 — 거부 원인이 진행 중인 기계 제출(①의 창 · 짝 Return 을 기다리는 새 기계 본문 · 분리 직후 렌더 지연)
+//      이면 거부 문구에 ` [settle:<ms>]` 를 붙인다. 신 CLI 는 증명이 있을 때만 예산 안에서 다시 보낸다(큐로 밀려나지
+//      않는다). 사람 초안·모달·타이핑 가드에는 붙이지 않는다(재시도 0회 = 종전).
+// 【새 쓰기 0 · 새 락 0】 규칙은 거부를 더하거나(①) 거부에 글자를 더할 뿐(②) 쓰기 경로를 만들지 않는다. 판독은
+//   원자 변수와 기존 leaf 락뿐이고 input_gate 안에서는 원자 판독만 한다. 큐 상한·병합·최소 간격·STARVE·pause 무접촉.
+// 【범위 밖(종전 그대로)】 셸 좌석(agent_meta 없음 — 셸은 `\r`+다음 명령을 줄 단위로 읽는다) · 윈도우 · 사람 키 ·
+//   authoritative · clear_first · send_key · 큐 배달 · 데몬 내부 주입자.
+
+/// ★(S21-SETTLE) 제출 CR 을 쓴 뒤 다음 기계 본문을 넘기기까지의 최소 분리(ms). 근거: 실 claude 2.1.282 T13 에서
+/// 제출 스탬프 + CR 최소 간격 + 50ms(≈ CR 뒤 50~60ms) 분리로 20쌍 3/3 run 별개 제출·병합 0(4cf1490a R3-3b 시제품) —
+/// 여유를 더해 80 으로 둔다. TUI 가 CR 을 별도 read 로 받아 제출을 처리한 뒤에 다음 본문이 도착하게 한다.
+const SEND_SETTLE_MS: u64 = 80;
+/// ★(S21-SETTLE) '진행 중' 신선도 상한(ms) — 넘긴 제출 CR 은 보통 150ms 안에 쓰인다. writer 가 막혔거나 죽어 표식이
+/// 남아도 이 뒤로는 분리 보류·증명을 하지 않는다(종전 판정으로 떨어진다 = 실패 방향은 0.14.42 A2 트리).
+const SEND_SETTLE_INFLIGHT_MAX_MS: u64 = 2000;
+/// ★(S21-SETTLE) 분리 창 뒤 렌더 지연 증명 창(ms) — 화면 축이 방금 제출된 본문의 잔상을 아직 보는 동안만 증명한다.
+const SEND_SETTLE_RENDER_MS: u64 = 200;
+/// ★(S21-SETTLE) 짝 Return 을 기다리는 새 기계 본문의 증명 창(ms) — 스크립트 쌍(`send && send-key`)은 수십 ms 안에
+/// Return 이 온다. 그보다 오래된 본문(LLM 이 도구 호출을 나눔 · Return 누락 잔여)에는 증명하지 않는다(곧바로 큐).
+const SEND_SETTLE_PAIR_MS: u64 = 1000;
+/// ★(S21-SETTLE) 렌더 지연 증명의 재시도 힌트(ms).
+const SEND_SETTLE_RETRY_MIN_MS: u64 = 25;
+
+/// ★(S21-SETTLE) 킬 스위치 — env `CYS_SEND_SETTLE` 가 0/false/off 이거나, 데몬 상태 디렉터리(`state::state_dir(socket)` —
+/// 레인 격리)에 `send-settle-off` 가 있으면 끈다(재기동 불요). 파일 판정: 있음 → 끔 · 없음(NotFound) → 켬 · 그 밖의
+/// 오류 → 끔. 실패 방향은 0.14.42 A2 트리 동작(분리 보류·증명 0)이다. 호출은 에이전트 좌석 Text 직접 send · 비면제 제출
+/// Return 의 보류 탐침 인계 · 보류 CR 재제출(governance `resubmit_withheld_submits` — 보류 기록이 있는 좌석만) 때뿐이다.
+pub(crate) fn send_settle_disabled(daemon: &Daemon) -> bool {
+    if cys::send_settle_env_off(std::env::var("CYS_SEND_SETTLE").ok().as_deref()) {
+        return true;
+    }
+    let path = crate::state::state_dir(&daemon.socket_path).join("send-settle-off");
+    match std::fs::symlink_metadata(&path) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
+/// ★(S21-SETTLE) ① 분리 보류(순수) — 지금 Text 본문을 writer 에 넘기면 대기 제출 CR 바로 뒤, 또는 방금 쓴 CR 의
+/// 분리 창 안에 쓰이는가. `Some(hint_ms)` = 보류 + 대략 그만큼 뒤에 빈다(대기 CR 은 넘긴 뒤 `gap_ms` 안팎에 쓰인다 ·
+/// 둘 이상 대기면 CR→CR 간격도 `gap_ms` — writer B2″). `None` = 분리 무관(다른 게이트는 종전대로).
+fn submit_settle_hold(
+    obs: crate::state::SubmitSettleObs,
+    settle_ms: u64,
+    gap_ms: u64,
+) -> Option<u64> {
+    if obs.inflight {
+        let first = gap_ms.saturating_sub(obs.handed_age_ms.unwrap_or(0));
+        let rest = gap_ms.saturating_mul(obs.pending.saturating_sub(1));
+        return Some(first.saturating_add(rest).saturating_add(settle_ms).max(1));
+    }
+    match obs.since_written_ms {
+        Some(s) if s < settle_ms => Some(settle_ms - s),
+        _ => None,
+    }
+}
+
+/// ★(S21-SETTLE) ② 정착 증명(순수) — 이미 난 D-12 거부의 원인이 **진행 중인 기계 제출**인가 → 재시도 힌트(ms).
+/// 사람 바이트가 줄에 있으면(`human_pending > 0`) 어떤 경우에도 증명하지 않는다(사람 초안은 푸는 주체가 사람이다).
+/// 모달·사람 초안 거부도 증명하지 않는다. `machine_body_fresh` = 줄 위 본문이 검증·자기신고 발신자의 CLI 기계 본문이고
+/// 그 기록이 [`SEND_SETTLE_PAIR_MS`] 안이다(짝 Return 이 곧 온다).
+fn submit_settle_proof(
+    why: DraftGateDenied,
+    obs: crate::state::SubmitSettleObs,
+    human_pending: u64,
+    machine_body_fresh: bool,
+    settle_ms: u64,
+    gap_ms: u64,
+) -> Option<u64> {
+    if human_pending > 0 {
+        return None;
+    }
+    let held = submit_settle_hold(obs, settle_ms, gap_ms);
+    match why {
+        DraftGateDenied::SubmitSettling => held,
+        DraftGateDenied::PendingInput { .. } => {
+            held.or_else(|| machine_body_fresh.then(|| gap_ms.saturating_add(settle_ms)))
+        }
+        DraftGateDenied::ScreenOccupied => held.or_else(|| {
+            obs.since_written_ms
+                .is_some_and(|s| s <= settle_ms.saturating_add(SEND_SETTLE_RENDER_MS))
+                .then_some(SEND_SETTLE_RETRY_MIN_MS)
+        }),
+        // ★(수정 2회차 FV1-1) pause 중 정착 재시도 거부는 증명하지 않는다(재시도가 pause 를 뚫는다).
+        DraftGateDenied::HumanDraft { .. } | DraftGateDenied::Modal | DraftGateDenied::Paused => None,
+    }
+}
+
+/// ★(S21-SETTLE) 정착 판정을 이 요청에 적용하는가 — Text 팔 · 유닉스 · 에이전트 좌석(agent_meta — D-12 화면 축과 같은
+/// 좌석 술어) · 킬 스위치 꺼짐. 비싼 판정(stat)은 맨 뒤.
+fn send_settle_applies(
+    daemon: &Daemon,
+    surface: &crate::state::Surface,
+    gate_kind: Option<DirectSendKind>,
+) -> bool {
+    gate_kind == Some(DirectSendKind::Text)
+        && cfg!(unix)
+        && surface.agent_meta.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        && !send_settle_disabled(daemon)
+}
+
+/// ★(S21-SETTLE) 정착 증명 거부 이벤트의 발행 간격 — (데몬 소켓, 좌석, 발신자)당 1초에 1건. 단독 leaf 락(좌석 락을 쥔
+/// 채 부르지 않는다 · 호출처 `draft_gate_denied_response` 는 게이트를 놓은 뒤다). 표는 1024 행을 넘으면 1분 넘은 행을 버린다.
+fn settle_denial_event_due(daemon: &Daemon, sid: u64, from: Option<u64>) -> bool {
+    type Key = (std::path::PathBuf, u64, Option<u64>);
+    static LAST: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Key, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    let now = std::time::Instant::now();
+    let mut m = LAST.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    if m.len() > 1024 {
+        m.retain(|_, t| now.saturating_duration_since(*t) < std::time::Duration::from_secs(60));
+    }
+    let key = (daemon.socket_path.clone(), sid, from);
+    match m.get(&key) {
+        Some(t) if now.saturating_duration_since(*t) < std::time::Duration::from_millis(1000) => false,
+        _ => {
+            m.insert(key, now);
+            true
+        }
+    }
+}
+
+/// ★(S21-SETTLE) 지금의 제출 정착 관측(원자 판독뿐 — input_gate 안에서도 안전).
+fn submit_settle_obs_now(surface: &crate::state::Surface) -> crate::state::SubmitSettleObs {
+    surface
+        .inject_track
+        .submit_settle_obs(crate::state::settle_mono_ms(), SEND_SETTLE_INFLIGHT_MAX_MS)
+}
+
+/// ★(S21-SETTLE) D-12 거부에 붙일 정착 증명(IO 래퍼) — 게이트를 놓은 뒤 부른다(pending_input·inject_track leaf 락).
+fn submit_settle_proof_now(surface: &crate::state::Surface, why: DraftGateDenied) -> Option<u64> {
+    let obs = submit_settle_obs_now(surface);
+    let (pending, human) = {
+        let st = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+        let p = surface.pending_input_bytes.load(Ordering::Relaxed);
+        (p, st.human.min(p))
+    };
+    let machine_body_fresh = pending > 0
+        && human == 0
+        && surface.pending_input_owner().is_some()
+        && surface.inject_track.last_body().is_some_and(|b| {
+            b.owner.is_some() && b.at.elapsed() <= std::time::Duration::from_millis(SEND_SETTLE_PAIR_MS)
+        });
+    submit_settle_proof(why, obs, human, machine_body_fresh, SEND_SETTLE_MS, cr_min_gap_ms())
 }
 
 /// ★(0.14.42 · A2) 짝 Return 흡수 표의 수명(초) — `CYS_RETURN_ABSORB_SECS`, 기본 30.
@@ -5244,11 +5422,52 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let gate_kind = governance::direct_send_text_gate_kind(
                 human, machine_origin, clear_first, text_submits, text_cancels, exempt,
             );
+            // ★(0.14.42 · S21-SETTLE) 제출 정착 규칙 적용 여부(Text · 유닉스 · 에이전트 좌석 · 킬 스위치 꺼짐) — 1회 판정.
+            let settle_on = send_settle_applies(daemon, &surface, gate_kind);
+            // ★(0.14.42 · 수정 2회차 FV1-1) pause 중 **정착 재시도**(`settle_retry:true` — 신 CLI 가 정착 증명을 받은 뒤의
+            //   재요청에만 싣는다)는 줄이 비어 있어도 쓰지 않는다. 증명을 받은 뒤 pause 가 걸리면 다음 재시도가 빈 줄을 만나
+            //   pause 중에 직접 쓰이던 창(재시도 한 걸음 ≤ 340ms)을 닫는다. 증명 없는 타이핑 가드 문구라 CLI 는 종전처럼
+            //   `--queued` 1회(= pause 동안 동결)로 간다. 첫 요청(키 없음)은 종전 그대로 pause 판정 대상이 아니다(보고 경로).
+            //   원장 선기록·화면 관측보다 **앞**(쓰기 0 · 유령 원장 행 0). 킬 스위치와 무관하게 건다(재시도 자체가 신 경로다).
+            if gate_kind == Some(DirectSendKind::Text)
+                && params.get("settle_retry").and_then(|v| v.as_bool()).unwrap_or(false)
+                && daemon.paused.load(Ordering::Relaxed)
+            {
+                return Reply::Single(draft_gate_denied_response(
+                    daemon,
+                    &surface,
+                    &id,
+                    DirectSendKind::Text,
+                    DraftGateDenied::Paused,
+                    verified_from,
+                    None,
+                    None,
+                ));
+            }
             if let Some(kind) = gate_kind {
                 if let Some(why) = governance::draft_gate(daemon, &surface, kind) {
+                    let settle = settle_on.then(|| submit_settle_proof_now(&surface, why)).flatten();
                     return Reply::Single(draft_gate_denied_response(
-                        daemon, &surface, &id, kind, why, verified_from, None,
+                        daemon, &surface, &id, kind, why, verified_from, None, settle,
                     ));
+                }
+                // ★(S21-SETTLE ①) 분리 보류 — 대기 제출 CR 바로 뒤(또는 방금 쓴 CR 의 분리 창)에 본문을 붙이지 않는다.
+                //   원장 선기록보다 **앞**(유령 원장 행을 만들지 않는다). 권위 판정은 아래 input_gate 안 재확인이다.
+                if settle_on {
+                    if let Some(ms) =
+                        submit_settle_hold(submit_settle_obs_now(&surface), SEND_SETTLE_MS, cr_min_gap_ms())
+                    {
+                        return Reply::Single(draft_gate_denied_response(
+                            daemon,
+                            &surface,
+                            &id,
+                            kind,
+                            DraftGateDenied::SubmitSettling,
+                            verified_from,
+                            None,
+                            Some(ms),
+                        ));
+                    }
                 }
             }
             // ★R1 배달 원장 — **주입보다 반드시 앞**(delivery.rs 불변식 ①). try_write 는 writer
@@ -5366,9 +5585,32 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     kind, pending, human.min(pending), None, false, false,
                 ) {
                     drop(_gate);
+                    let settle = settle_on.then(|| submit_settle_proof_now(&surface, why)).flatten();
                     return Reply::Single(draft_gate_denied_response(
-                        daemon, &surface, &id, kind, why, verified_from, None,
+                        daemon, &surface, &id, kind, why, verified_from, None, settle,
                     ));
+                }
+                // ★(S21-SETTLE ①) 분리 보류의 **권위 판정** — send_key 의 제출 CR 인계도 이 게이트 안에서 표식을 올리므로
+                //   1차(게이트 밖) 판정 뒤에 넘어온 CR 을 여기서 정확히 본다(원자 판독뿐 — 게이트 안 락 계약 무변경).
+                //   ★검체 없음 고지: 1차와 같은 순수 함수라 결정론 검체로 구별되지 않는다(위 D-12 2차 검사와 같은 형식 —
+                //   경합 시임 없이는 고정 불가 · 소스 핀 `settle_hold_rechecked_inside_input_gate_source_pin` 이 위치만 고정).
+                //   유령 원장 행 고지: 여기서 보류되면 위 record_audited 한 줄이 남는다(D-12 2차 검사와 같은 기존 한계).
+                if settle_on {
+                    if let Some(ms) =
+                        submit_settle_hold(submit_settle_obs_now(&surface), SEND_SETTLE_MS, cr_min_gap_ms())
+                    {
+                        drop(_gate);
+                        return Reply::Single(draft_gate_denied_response(
+                            daemon,
+                            &surface,
+                            &id,
+                            kind,
+                            DraftGateDenied::SubmitSettling,
+                            verified_from,
+                            None,
+                            Some(ms),
+                        ));
+                    }
                 }
             }
             if let Some(err) = try_write(&surface, write_req, &id) {
@@ -5727,7 +5969,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             if let Some(kind) = gate_kind {
                 if let Some(why) = governance::draft_gate(daemon, &surface, kind) {
                     return Reply::Single(draft_gate_denied_response(
-                        daemon, &surface, &id, kind, why, verified_from, submit_alias_hint.as_deref(),
+                        daemon, &surface, &id, kind, why, verified_from, submit_alias_hint.as_deref(), None,
                     ));
                 }
             }
@@ -5740,8 +5982,23 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   지연은 writer 스레드에서 일어난다(단일 소비자 = 순서 보존 · 핸들러 무블로킹).
             let key_bytes = bytes.clone();
             let write_req = match submit_gap_for_key(&key, cr_min_gap_ms()) {
-                Some(min_gap_ms) => crate::state::WriteReq::SubmitAfterGap { bytes, min_gap_ms },
+                Some(min_gap_ms) => crate::state::WriteReq::SubmitAfterGap { bytes, min_gap_ms, withhold: None },
                 None => crate::state::WriteReq::Data(bytes),
+            };
+            // ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 탐침의 인계 재료 — 게이트 **밖** 1회(어댑터·파서·agent_meta 는
+            //   게이트 안 락 계약 밖이다). 대상: 비면제 SubmitKey 의 SubmitAfterGap · 유닉스 · 에이전트 좌석(탐침 등급
+            //   `governance::submit_guard_scope` 가 Off 아님 — 생존 좌석 ∨ 좌석 캐시가 에이전트 확인 전 틱의 Empty 인 좌석(재개 S94))
+            //   · 킬 스위치 꺼짐(`CYS_SEND_SETTLE=0`·`send-settle-off` 가 제출 정착 전체의 한 노브 롤백이다). 권위 Return(부트
+            //   체인)은 `gate_kind` 가 None 이라 대상 밖 · 윈도우·셸은 무변경. 거는지는 게이트 안에서 줄 위 본문을 보고 정한다.
+            let cr_guard_ctx = if gate_kind == Some(DirectSendKind::SubmitKey)
+                && matches!(write_req, crate::state::WriteReq::SubmitAfterGap { .. })
+                && cfg!(unix)
+                && governance::submit_guard_scope(&surface) != governance::SubmitGuardScope::Off
+                && !send_settle_disabled(daemon)
+            {
+                governance::submit_cr_guard_context(&surface)
+            } else {
+                None
             };
             // ★(0.14.42 · A2) 게이트 안 흡수 재확인 대상 — 1차가 PassThrough(기계 본문 위)였던 요청만.
             let mut absorb_recheck = match absorb {
@@ -5820,7 +6077,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ) {
                         drop(_gate);
                         return Reply::Single(draft_gate_denied_response(
-                            daemon, &surface, &id, kind, why, verified_from, submit_alias_hint.as_deref(),
+                            daemon, &surface, &id, kind, why, verified_from, submit_alias_hint.as_deref(), None,
                         ));
                     }
                 }
@@ -5834,8 +6091,36 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         .min(pending);
                     settle_snapshot = Some((pending, human, surface.pending_owner()));
                 }
-                let req = write_req.take().expect("write_req 는 쓰기 직전 1회만 꺼낸다");
+                let mut req = write_req.take().expect("write_req 는 쓰기 직전 1회만 꺼낸다");
+                // ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 탐침 — 인계 직전(게이트 안 · pending_input leaf·원자 판독뿐)에 이
+                //   Return 이 무엇을 누르려는지 정한다(`governance::submit_cr_guard_armed`): 줄 위 CLI 기계 본문(소유 각인 ∧
+                //   사람 바이트 0) → 그 본문의 제출 → 건다 · 없고 이미 창이 보임 → 승인·선택지 조작 → 걸지 않는다(종전 ·
+                //   막으면 워커 hang) · 없고 창 없음 → 건다. 탐침 생성은 약한 참조·시각뿐(락 0).
+                if let (Some(ctx), crate::state::WriteReq::SubmitAfterGap { withhold, .. }) = (&cr_guard_ctx, &mut req) {
+                    let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+                    let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+                    let machine_body = pending > 0 && human == 0 && surface.pending_input_owner().is_some();
+                    if let Some(armed_by) = governance::submit_cr_guard_armed(machine_body, ctx.dialog_at_handoff) {
+                        *withhold = Some(governance::submit_cr_withhold_probe(
+                            daemon,
+                            &surface,
+                            ctx.markers.clone(),
+                            armed_by,
+                            verified_from,
+                        ));
+                    }
+                }
+                // ★(0.14.42 · S21-SETTLE) 제출 CR 인계 표식 — 계수는 아래에서 곧바로 0 이 되지만 CR 은 writer 가 최소 간격
+                //   뒤에 쓴다. 그 사이 직접 본문이 이 CR 바로 뒤에 붙지 않도록(분리 보류) writer 소비 전까지 '진행 중' 이다.
+                //   원자 연산뿐(게이트 안 락 계약 무변경). 인계 실패면 되돌린다.
+                let submit_cr = matches!(req, crate::state::WriteReq::SubmitAfterGap { .. });
+                if submit_cr {
+                    surface.inject_track.submit_handed();
+                }
                 if let Some(err) = try_write(&surface, req, &id) {
+                    if submit_cr {
+                        surface.inject_track.submit_hand_failed();
+                    }
                     return Reply::Single(err);
                 }
                 // ★B1(0.14.30): 키도 같은 전이 규칙을 탄다 — Return/Enter(CR)는 제출, Ctrl-U·Ctrl-C 는
@@ -15486,6 +15771,135 @@ mod tests {
         assert!(obs < gate && gate < v2 && v2 < narrow2, "재확인: 관측(게이트 밖) → 게이트 → 판정 → 좁힘");
         let in_gate = &arm[gate..narrow2];
         assert!(!in_gate.contains("seat_approval_live("), "게이트 안에서 승인 관측 금지(락 계약)");
+    }
+
+    /// ★(0.14.42 · S21-SETTLE) ① 분리 보류 순수 표 — 대기 CR(계수·Inject)·분리 창·결측.
+    #[test]
+    fn s21_settle_hold_table() {
+        use crate::state::SubmitSettleObs as O;
+        let (settle, gap) = (80, 150);
+        // 대기 CR 1개 · 넘긴 지 20ms → 남은 간격 130 + 분리 80.
+        let o = O { inflight: true, pending: 1, handed_age_ms: Some(20), since_written_ms: None };
+        assert_eq!(submit_settle_hold(o, settle, gap), Some(210));
+        // 대기 CR 3개(적체) → 뒤 CR 둘도 CR→CR 간격(B2″)을 탄다.
+        let o = O { inflight: true, pending: 3, handed_age_ms: Some(0), since_written_ms: Some(5) };
+        assert_eq!(submit_settle_hold(o, settle, gap), Some(150 + 300 + 80));
+        // 넘긴 지 간격보다 오래(writer 적체) → 최소 분리만.
+        let o = O { inflight: true, pending: 1, handed_age_ms: Some(900), since_written_ms: None };
+        assert_eq!(submit_settle_hold(o, settle, gap), Some(80));
+        // Inject 진행 중(계수 0 · inflight) → 보류(힌트 ≥ 1).
+        let o = O { inflight: true, pending: 0, handed_age_ms: None, since_written_ms: None };
+        assert_eq!(submit_settle_hold(o, settle, gap), Some(230));
+        // 쓴 지 30ms → 분리 창 남은 50.
+        let o = O { inflight: false, pending: 0, handed_age_ms: Some(200), since_written_ms: Some(30) };
+        assert_eq!(submit_settle_hold(o, settle, gap), Some(50));
+        // 경계: 쓴 지 정확히 분리 창 → 보류 없음.
+        let o = O { inflight: false, pending: 0, handed_age_ms: Some(300), since_written_ms: Some(80) };
+        assert_eq!(submit_settle_hold(o, settle, gap), None);
+        // 결측(기록 없음)은 값이 아니다 — 보류 없음(종전).
+        assert_eq!(submit_settle_hold(O::default(), settle, gap), None);
+    }
+
+    /// ★(0.14.42 · S21-SETTLE) ② 정착 증명 순수 표 — 사람 초안·모달은 절대 증명하지 않는다(재시도 0 = 종전 큐 전환).
+    #[test]
+    fn s21_settle_proof_table() {
+        use crate::governance::DraftGateDenied as D;
+        use crate::state::SubmitSettleObs as O;
+        let (settle, gap) = (80, 150);
+        let idle = O::default();
+        let inflight = O { inflight: true, pending: 1, handed_age_ms: Some(10), since_written_ms: None };
+        let just_written = O { inflight: false, pending: 0, handed_age_ms: Some(170), since_written_ms: Some(120) };
+        let old = O { inflight: false, pending: 0, handed_age_ms: Some(900), since_written_ms: Some(700) };
+        let p = |why, o, human, fresh| submit_settle_proof(why, o, human, fresh, settle, gap);
+        // 사람 바이트가 줄에 있으면 어떤 창에서도 증명 없음.
+        for o in [idle, inflight, just_written, old] {
+            assert_eq!(p(D::PendingInput { bytes: 5 }, o, 2, true), None);
+            assert_eq!(p(D::ScreenOccupied, o, 1, false), None);
+            assert_eq!(p(D::HumanDraft { bytes: 3 }, o, 0, true), None, "사람 초안 거부는 증명 없음");
+            assert_eq!(p(D::Modal, o, 0, true), None, "모달은 증명 없음(창을 누르지 않는다)");
+        }
+        // 분리 보류 자체 → 보류 힌트 그대로.
+        assert_eq!(p(D::SubmitSettling, inflight, 0, false), Some(140 + 80));
+        // 계수 축: 짝 Return 을 기다리는 새 기계 본문 → 간격 + 분리.
+        assert_eq!(p(D::PendingInput { bytes: 9 }, idle, 0, true), Some(230));
+        assert_eq!(p(D::PendingInput { bytes: 9 }, idle, 0, false), None, "오래된·귀속 없는 잔여는 증명 없음");
+        assert_eq!(p(D::PendingInput { bytes: 9 }, inflight, 0, false), Some(220));
+        // 화면 축: 대기 CR → 보류 힌트 · 분리 직후 렌더 지연 창 → 짧은 힌트 · 창 밖 → 없음.
+        assert_eq!(p(D::ScreenOccupied, inflight, 0, false), Some(220));
+        assert_eq!(p(D::ScreenOccupied, just_written, 0, false), Some(SEND_SETTLE_RETRY_MIN_MS));
+        assert_eq!(p(D::ScreenOccupied, old, 0, false), None, "렌더 창 밖 화면 점유 = 진짜 점유(종전 큐 전환)");
+        assert_eq!(p(D::ScreenOccupied, idle, 0, false), None);
+        assert_eq!(D::SubmitSettling.as_str(), "submit_settling");
+    }
+
+    /// ★(0.14.42 · 수정 2회차 FV1-1 · F1) 배치 소스 핀 — pause 정착 재시도 거부·제출 CR 보류 탐침의 자리(락 계약).
+    #[test]
+    fn fv2_pause_retry_and_submit_cr_guard_placement_source_pin() {
+        // ★(0.14.42 · 수정 2회차 FV1-1 · F1) 배치 핀.
+        //   FV1-1: pause 정착 재시도 거부는 send_text 의 원장 선기록·D-12 화면 관측보다 **앞**(쓰기 0 · 유령 원장 행 0) ·
+        //          정착 증명은 `draft_gate_denied_response` 한 곳에서 pause 로 걸러진다(네 호출처 공통).
+        //   F1: 제출 CR 보류의 화면 관측(`submit_cr_guard_context`)은 send_key 의 input_gate **밖** · 탐침을 거는 판정은
+        //       게이트 안 · 제출 CR 인계 표식(`submit_handed`) 앞이다(게이트 안에서는 pending_input leaf·원자 판독뿐).
+        let src = include_str!("handlers.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let deny = prod.find("fn draft_gate_denied_response(").expect("거부 응답 단일 경로");
+        let deny_body = &prod[deny..deny + prod[deny..].find("\n}\n").expect("함수 끝")];
+        assert!(
+            deny_body.contains("let settle_hint = settle_hint.filter(|_| !daemon.paused.load(Ordering::Relaxed));"),
+            "정착 증명의 pause 걸름이 단일 경로에 없다"
+        );
+        let arm = &prod[prod.find("\"surface.send_text\" =>").expect("send_text arm")..];
+        let arm = &arm[..arm.find("\"surface.send_key\" =>").expect("다음 arm")];
+        let retry = arm.find("DraftGateDenied::Paused").expect("pause 정착 재시도 거부");
+        let d12 = arm.find("governance::draft_gate(daemon, &surface, kind)").expect("1차 D-12");
+        let ledger = arm.find("crate::delivery::record_audited(").expect("원장 선기록");
+        assert!(retry < d12 && retry < ledger, "pause 재시도 거부는 D-12 관측·원장 선기록 앞");
+        let karm = &prod[prod.find("\"surface.send_key\" =>").expect("send_key arm")..];
+        let karm = &karm[..karm.find("\"surface.read_text\" =>").expect("다음 arm")];
+        let ctx = karm.find("governance::submit_cr_guard_context(&surface)").expect("인계 재료(게이트 밖)");
+        let gate = karm.find("let _gate = surface.input_gate.lock().unwrap();").expect("게이트");
+        let armed = karm.find("governance::submit_cr_guard_armed(").expect("탐침 판정");
+        let handed = karm.find("surface.inject_track.submit_handed();").expect("인계 표식");
+        assert!(ctx < gate, "화면 관측은 게이트 밖");
+        assert!(gate < armed && armed < handed, "탐침 판정은 게이트 안 · 인계 표식 앞");
+        let in_gate = &karm[gate..handed];
+        for banned in
+            ["submit_cr_guard_context(", "seat_is_agent_backed(", "submit_guard_scope(", "observe_prompt(", "load_adapter_defs("]
+        {
+            assert!(!in_gate.contains(banned), "게이트 안에서 {banned} — 락 계약(pending_input leaf 만) 위반");
+        }
+    }
+
+    /// ★(0.14.42 · S21-SETTLE) 소스 핀 — send_text 의 분리 보류는 **원장 선기록 앞(게이트 밖 1차)과 input_gate 안
+    /// (권위 재확인)** 둘 다에 있다. 게이트 안 판정은 원자 판독(`submit_settle_obs_now`)만 쓰고, 정착 증명(leaf 락을
+    /// 잡는 `submit_settle_proof_now`)은 게이트를 놓은 뒤에만 부른다. send_key 는 제출 CR 인계 직전에 표식을 올린다.
+    #[test]
+    fn settle_hold_rechecked_inside_input_gate_source_pin() {
+        let src = include_str!("handlers.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커 소실")];
+        let arm = &prod[prod.find("\"surface.send_text\" =>").expect("send_text arm")..];
+        let arm = &arm[..arm.find("\"surface.send_key\" =>").expect("다음 arm")];
+        let first = arm.find("submit_settle_hold(").expect("1차 분리 보류");
+        let ledger = arm.find("crate::delivery::record_audited(").expect("원장 선기록");
+        let gate = arm.find("let _gate = surface.input_gate.lock().unwrap();").expect("게이트");
+        let second = arm[gate..].find("submit_settle_hold(").map(|i| gate + i).expect("게이트 안 재확인");
+        let write = arm.find("if let Some(err) = try_write(&surface, write_req, &id)").expect("쓰기");
+        assert!(first < ledger, "1차 보류는 원장 선기록 앞(유령 원장 행 0)");
+        assert!(gate < second && second < write, "게이트 안 재확인은 쓰기 앞");
+        let in_gate = &arm[gate..write];
+        for (i, _) in in_gate.match_indices("submit_settle_proof_now(") {
+            let before = &in_gate[..i];
+            assert!(
+                before.rfind("drop(_gate);").is_some_and(|d| !before[d..].contains("let _gate")),
+                "정착 증명(leaf 락)은 게이트를 놓은 뒤에만"
+            );
+        }
+        let karm = &prod[prod.find("\"surface.send_key\" =>").expect("send_key arm")..];
+        let karm = &karm[..karm.find("\"surface.read_text\" =>").expect("다음 arm")];
+        let handed = karm.find("surface.inject_track.submit_handed();").expect("제출 CR 인계 표식");
+        let tw = karm.find("if let Some(err) = try_write(&surface, req, &id)").expect("send_key 쓰기");
+        assert!(handed < tw, "표식은 인계 직전");
+        assert!(karm[tw..].contains("surface.inject_track.submit_hand_failed();"), "인계 실패 되돌림");
     }
 
     #[test]

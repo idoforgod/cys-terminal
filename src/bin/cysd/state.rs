@@ -1035,19 +1035,120 @@ pub struct ReturnTicket {
 /// escalation 되던 결함(리뷰 F2 · 0.05~0.4s 간격 12/12). writer 는 단일 소비자라 뒤 Inject 가 앞 Inject 의 글자와
 /// 한 제출로 섞이지 않는다(종전 HEAD 도 연속 주입했다). 그래서 이 창의 화면 초안은 보류 근거가 아니다.
 ///
-/// 쓰기 = writer 스레드 단독([`run_writer_loop_tracked`] 의 Inject arm 이 begin/end). 읽기 = H0 판정·채널 배달 간격.
-/// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). 락: `done_at` 은 leaf.
+/// 쓰기 = writer 스레드 단독([`run_writer_loop_tracked`] 의 Inject arm 이 begin/end) — 예외 `handed_at`(채널 생산자 ·
+/// [`InjectTrack::note_handoff`]). 읽기 = H0 판정·채널 배달 간격.
+/// 휘발(재기동·재생성 좌석은 빈 채로 출발 = 종전 동작). 락: `done_at`·`handed_at` 은 leaf.
 #[derive(Debug, Default)]
 pub struct InjectTrack {
     /// Inject arm 이 (선정리)·붙여넣기·cr_delay·CR 을 쓰는 중이다.
     active: AtomicBool,
     /// 마지막 Inject arm 이 끝난 단조 시각(성공·실패 무관 — 끝난 뒤에는 화면만 남는다).
     done_at: Mutex<Option<Instant>>,
+    /// ★(0.14.42 · H3 간격 경쟁) 채널 생산자가 Inject 를 writer 에 **넘긴**(try_send 직전) 단조 시각 —
+    /// [`InjectTrack::handoff_pending`]. 채널 행 간격 전용이다(H0 자기 붙여넣기 귀속은 읽지 않는다 — 인계만 된 본문은 화면에 없다).
+    handed_at: Mutex<Option<Instant>>,
     /// ★(R3SH-1) 마지막 **기계 본문**(데몬 Inject · CLI 기계 send) — 제출 CR 뒤에도 남는다. [`MachineBody`] doc.
     last_body: Mutex<Option<MachineBody>>,
     /// ★(R1-F4) 지금 Inject arm 이 시작된 단조 시각 — writer 가 쓰기에 막혀(stdin 을 읽지 않는 에이전트 · PTY 입력 버퍼 포화)
     /// `active` 가 내려오지 않는 것을 판정자가 가려낸다([`InjectTrack::stuck_over`]).
     began_at: Mutex<Option<Instant>>,
+    /// ★(0.14.42 · S21-SETTLE) writer 에 넘겼으나 아직 소비하지 않은 **기계 제출 CR**(`WriteReq::SubmitAfterGap`) 수.
+    /// 올림 = 핸들러 send_key(input_gate 안 · 인계 직전) · 내림 = writer(소비 뒤) 또는 핸들러(인계 실패).
+    /// 원자 연산뿐이라 'input_gate 안에서는 pending_input leaf 만' 락 계약에 새 락을 더하지 않는다.
+    submit_pending: AtomicU64,
+    /// 마지막 제출 CR 을 writer 에 넘긴 정착 단조 ms([`settle_mono_ms`] · 0 = 없음) — 계수의 신선도 상한
+    /// (writer 가 PTY 닫힘으로 끝나 계수가 남아도 상한 뒤에는 '진행 중' 으로 보지 않는다).
+    submit_handed_ms: AtomicU64,
+    /// 마지막 제출 CR(`SubmitAfterGap` · Inject arm 의 끝 CR)을 PTY 에 **실제로 쓴** 정착 단조 ms(0 = 없음).
+    submit_written_ms: AtomicU64,
+    /// 지금 Inject arm 이 시작된 정착 단조 ms(0 = 없음) — `began_at` 의 원자 사본(게이트 안 판독용 · 신선도 상한).
+    inject_began_ms: AtomicU64,
+    /// ★(0.14.42 · 수정 2회차 F1 · 재개) 보류한 제출 CR — [`WithheldSubmit`]. 쓰기 = writer 의 보류 탐침(적중 시) · 소비·폐기 =
+    /// watchdog 틱의 재제출(`governance::resubmit_withheld_submits`). leaf 락(다른 락을 쥔 채 잡지 않는다).
+    withheld: Mutex<Option<WithheldSubmit>>,
+}
+
+/// ★(0.14.42 · 수정 2회차 F1 · 재개) 쓰지 않은(보류한) 제출 CR 의 기록 — 보류는 **버림이 아니라 미룸**이다. 창이 닫히고
+/// 입력줄이 그대로 그 기계 본문이면 데몬이 그 CR 을 한 번 다시 쓴다(`governance::resubmit_withheld_submits`).
+///
+/// ★(수정 4회차 R3C-1) 기록은 시계 둘을 든다 — 재제출 틱(watchdog 5초)이 직전 틱 뒤 경과([`Self::advance`])를 나눠 더한다.
+/// ⓐ `live_ms` = pause 가 아닌 대기 전부(외곽 상한 = 큐 TTL · 큐 항목의 pause 크레딧과 같은 규칙) · ⓑ `dialog_ms` = 지금
+/// 열려 있는 창(질문·선택 창 ∨ 승인 대기)을 **연달아** 본 시간(창 대기 상한 `governance::WITHHELD_SUBMIT_WAIT_CAP_SECS` 은
+/// 이것만 잰다 — 창이 닫힌 것을 보면 0). 종전(d59a1f5e)에는 상한이 보류 시각부터의 벽시계라 창이 곧 닫혀도 에이전트의 긴
+/// 작업·pause 동안 기록을 버렸다(실 claude LT2 · 작업이 끝난 뒤 본문 미제출 · CLI 는 OK).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WithheldSubmit {
+    /// 보류한 단조 시각(기록 식별 · 이벤트의 `withheld_ms_ago`).
+    pub(crate) at: Instant,
+    /// 보류 때 입력줄에 있던 마지막 기계 본문의 기록 시각([`MachineBody::at`]) — 그 뒤 새 기계 본문이 오면 기록은 낡았다.
+    pub(crate) body_at: Instant,
+    /// 보류한 Return 의 발신 좌석(이벤트 표기).
+    pub(crate) from: Option<u64>,
+    /// 재제출 틱이 이 기록을 마지막으로 잰 시각(생성 = `at`). pause 중 틱은 경과를 버리고 이 시각만 옮긴다(두 시계 정지).
+    pub(crate) seen_at: Instant,
+    /// pause 가 아닌 대기의 합(ms) — 외곽 상한(큐 TTL)이 재는 나이.
+    pub(crate) live_ms: u64,
+    /// 지금 열려 있는 창을 연달아 본 시간(ms) — 창이 닫힌 것을 본 틱에서 0(다음 창은 새 창).
+    pub(crate) dialog_ms: u64,
+    /// 직전 관측이 '창 열림'이었는가 — 보류 탐침 자체가 창 관측이라 생성 = true. 못 본 틱(사이클 창)은 false(사슬만 끊음).
+    pub(crate) dialog_open: bool,
+}
+
+impl WithheldSubmit {
+    /// 보류 탐침이 창을 본 순간의 기록 — 두 시계 0 · 창 열림.
+    pub(crate) fn new(at: Instant, body_at: Instant, from: Option<u64>) -> Self {
+        Self { at, body_at, from, seen_at: at, live_ms: 0, dialog_ms: 0, dialog_open: true }
+    }
+
+    /// ★(R3C-1) 순수 — 틱 1회의 경과를 잰다: `seen_at` 을 `now` 로 옮기고, pause 가 아니면 `live_ms` 에 더한다.
+    /// 반환 = 이번 틱이 창 시계에 넘길 경과(ms · pause 면 0 — pause 동안 두 시계는 멈춘다). `now` 가 `seen_at` 보다
+    /// 이르면(시계 역행) 0.
+    pub(crate) fn advance(&mut self, now: Instant, paused: bool) -> u64 {
+        let d = u64::try_from(now.saturating_duration_since(self.seen_at).as_millis()).unwrap_or(u64::MAX);
+        self.seen_at = self.seen_at.max(now);
+        if paused {
+            return 0;
+        }
+        self.live_ms = self.live_ms.saturating_add(d);
+        d
+    }
+
+    /// ★(R3C-1) 순수 — 이번 틱의 창 관측을 창 시계에 반영한다. `Some(true)` 열림(직전 관측도 열림이면 경과를 더한다) ·
+    /// `Some(false)` 닫힘(0 · 다음 창은 새 창) · `None` 못 봄(사슬만 끊는다 — 그 구간은 더하지도 0 으로 돌리지도 않는다).
+    pub(crate) fn observe_dialog(&mut self, open: Option<bool>, elapsed_ms: u64) {
+        match open {
+            Some(true) => {
+                if self.dialog_open {
+                    self.dialog_ms = self.dialog_ms.saturating_add(elapsed_ms);
+                }
+                self.dialog_open = true;
+            }
+            Some(false) => {
+                self.dialog_ms = 0;
+                self.dialog_open = false;
+            }
+            None => self.dialog_open = false,
+        }
+    }
+}
+
+/// ★(0.14.42 · S21-SETTLE) 좌석 제출 정착 판정의 단조 시계(ms) — 프로세스 기준점 경과 + 1(0 은 '없음' 표지).
+pub(crate) fn settle_mono_ms() -> u64 {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// ★(0.14.42 · S21-SETTLE) 한 좌석의 제출 정착 관측(원자 판독 1회분) — [`InjectTrack::submit_settle_obs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SubmitSettleObs {
+    /// writer 에 넘긴 제출 CR 이 아직 안 쓰였거나(신선도 상한 안) Inject arm 이 붙여넣기~CR 을 쓰는 중(상한 안)이다.
+    pub inflight: bool,
+    /// writer 대기 제출 CR 수(신선도 상한 밖이면 0 으로 본다).
+    pub pending: u64,
+    /// 마지막 제출 CR 을 넘긴 뒤 경과 ms(없으면 None).
+    pub handed_age_ms: Option<u64>,
+    /// 마지막 제출 CR 을 PTY 에 쓴 뒤 경과 ms(없으면 None).
+    pub since_written_ms: Option<u64>,
 }
 
 /// ★(0.14.42 · R3SH-1) 좌석 입력줄에 마지막으로 쓴 **기계 본문**의 기록 — H0 기계 잔여 입증의 둘째 근거.
@@ -1103,7 +1204,56 @@ impl InjectTrack {
     /// writer 전용 — Inject arm 의 첫 바이트 앞.
     pub(crate) fn begin(&self) {
         *self.began_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        self.inject_began_ms.store(settle_mono_ms(), Ordering::Release);
         self.active.store(true, Ordering::Release);
+    }
+
+    /// ★(0.14.42 · S21-SETTLE) 핸들러 전용 — 기계 제출 CR(`SubmitAfterGap`)을 writer 에 넘기기 **직전**.
+    /// input_gate 안에서 부른다(원자 연산뿐 — 락 계약 무변경). 인계에 실패하면 [`Self::submit_hand_failed`].
+    pub(crate) fn submit_handed(&self) {
+        self.submit_handed_ms.store(settle_mono_ms(), Ordering::Release);
+        self.submit_pending.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// 핸들러 전용 — 넘기려던 제출 CR 이 채널 포화·writer 종료로 인계되지 않았다(계수 되돌림 · 0 아래로 안 내려감).
+    pub(crate) fn submit_hand_failed(&self) {
+        let _ = self
+            .submit_pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+    }
+
+    /// writer 전용 — 제출 CR arm 을 소비했다. `written` = PTY 쓰기 성공(그때만 '쓴 시각'을 찍는다 — 실패한 write 를
+    /// 기준 삼으면 화면에 없는 CR 때문에 다음 본문이 늦춰진다 · B2′ 기준점 규율과 같다).
+    pub(crate) fn submit_consumed(&self, written: bool) {
+        if written {
+            self.submit_written_ms.store(settle_mono_ms(), Ordering::Release);
+        }
+        self.submit_hand_failed();
+    }
+
+    /// writer 전용 — Inject arm 이 끝 CR 까지 썼다(큐 배달·clear_first 등 원자 주입도 기계 제출이다).
+    pub(crate) fn submit_written(&self) {
+        self.submit_written_ms.store(settle_mono_ms(), Ordering::Release);
+    }
+
+    /// ★(0.14.42 · S21-SETTLE) 제출 정착 관측 — 원자 판독뿐(input_gate 안에서 불러도 새 락 0).
+    /// `inflight_max_ms` = '진행 중' 신선도 상한(writer 가 PTY 닫힘으로 끝나 계수가 남거나 막힌 Inject 가 `active` 를
+    /// 내리지 못해도 상한 뒤에는 진행 중으로 보지 않는다 — 실패 방향은 종전 판정).
+    pub(crate) fn submit_settle_obs(&self, now_ms: u64, inflight_max_ms: u64) -> SubmitSettleObs {
+        let age = |x: u64| (x != 0).then(|| now_ms.saturating_sub(x));
+        let handed_age_ms = age(self.submit_handed_ms.load(Ordering::Acquire));
+        let pending = match handed_age_ms {
+            Some(a) if a <= inflight_max_ms => self.submit_pending.load(Ordering::Acquire),
+            _ => 0,
+        };
+        let inject_live = self.active.load(Ordering::Acquire)
+            && age(self.inject_began_ms.load(Ordering::Acquire)).is_some_and(|a| a <= inflight_max_ms);
+        SubmitSettleObs {
+            inflight: pending > 0 || inject_live,
+            pending,
+            handed_age_ms,
+            since_written_ms: age(self.submit_written_ms.load(Ordering::Acquire)),
+        }
     }
 
     /// ★(R1-F4) Inject arm 이 `over` 보다 오래 쓰는 중인가 — writer 가 막혔다(정상 arm 은 붙여넣기 + cr_delay ≤ 1s 안팎).
@@ -1141,6 +1291,43 @@ impl InjectTrack {
         self.last_body.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// ★(F1 · 재개) 보류 탐침 전용 — 보류 기록(덮어쓰기: 가장 최근 보류가 입력줄의 현재 사실이다).
+    pub(crate) fn note_withheld(&self, w: WithheldSubmit) {
+        *self.withheld.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
+    }
+
+    /// ★(F1 · 재개) 보류 기록(없으면 None).
+    pub(crate) fn withheld(&self) -> Option<WithheldSubmit> {
+        *self.withheld.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// ★(F1 · 재개) 그 기록(`at`)이 아직 남아 있을 때만 지운다 — 그 사이 새 보류가 섰으면 건드리지 않는다. 지웠으면 true.
+    pub(crate) fn clear_withheld_if(&self, at: Instant) -> bool {
+        self.take_withheld_if(at).is_some()
+    }
+
+    /// ★(R3C-1) [`Self::clear_withheld_if`] 와 같되 지운 기록(시계 포함)을 돌려준다(버림 이벤트의 표기용).
+    pub(crate) fn take_withheld_if(&self, at: Instant) -> Option<WithheldSubmit> {
+        let mut g = self.withheld.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_some_and(|w| w.at == at) {
+            g.take()
+        } else {
+            None
+        }
+    }
+
+    /// ★(R3C-1) 그 기록(`at`)이 아직 남아 있을 때만 고친다(재제출 틱의 시계 갱신) — 고친 뒤 값. 새 보류가 섰거나 지워졌으면 None.
+    pub(crate) fn update_withheld_if(&self, at: Instant, f: impl FnOnce(&mut WithheldSubmit)) -> Option<WithheldSubmit> {
+        let mut g = self.withheld.lock().unwrap_or_else(|e| e.into_inner());
+        match g.as_mut() {
+            Some(w) if w.at == at => {
+                f(w);
+                Some(*w)
+            }
+            _ => None,
+        }
+    }
+
     /// 지금 Inject arm 이 쓰는 중이거나, 마지막 arm 이 끝난 지 `within` 이 안 됐는가.
     pub(crate) fn busy_within(&self, within: std::time::Duration) -> bool {
         self.active.load(Ordering::Acquire)
@@ -1150,6 +1337,56 @@ impl InjectTrack {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some_and(|t| t.elapsed() < within)
     }
+
+    /// ★(0.14.42 · H3 간격 경쟁 — 발행 준비 발견) 생산자 전용 — Inject 를 writer 에 넘기기(`try_send`) **직전**에 부른다.
+    ///
+    /// 【왜】 [`Self::busy_within`] 은 writer 가 arm 을 **시작한**(`begin`) 뒤부터만 참이다. 생산자가 넘긴 뒤 writer 가 집기 전
+    /// (선행 쓰기 적체 · 스레드 깨움 지연)에 다음 판정이 돌면 거짓이라, 채널 뒤 행이 앞 행 CR 에 간격 0 으로 붙고 그 판정은 앞
+    /// 행을 쓰기도 전의 화면을 본 것이 된다(S41 HG1 계급 · 검체 `h3_flush_rejudges_…` 간헐 적색). 넘긴 시각을 남겨 그 창을 메운다.
+    /// 【왜 넘기기 전인가】 넘긴 뒤에 찍으면 부하 중 writer 가 그 arm 을 먼저 끝낼 수 있다 — 끝난 arm 뒤의 표식은 영영 풀리지
+    /// 않는 '대기'가 된다. 인계에 실패하면 [`Self::undo_handoff`] 로 되돌린다.
+    pub(crate) fn note_handoff(&self) -> HandoffMark {
+        let mine = Instant::now();
+        let prev = self.handed_at.lock().unwrap_or_else(|e| e.into_inner()).replace(mine);
+        HandoffMark { prev, mine }
+    }
+
+    /// 생산자 전용 — [`Self::note_handoff`] 뒤 인계(`try_send`)가 실패했다(채널 포화·writer 종료). 그 사이 다른 인계가 표식을
+    /// 덮었으면 건드리지 않는다.
+    pub(crate) fn undo_handoff(&self, m: HandoffMark) {
+        let mut g = self.handed_at.lock().unwrap_or_else(|e| e.into_inner());
+        if *g == Some(m.mine) {
+            *g = m.prev;
+        }
+    }
+
+    /// 마지막 인계 뒤 **어떤 Inject arm 도 끝나지 않았으면** 그 인계의 경과 — 넘긴 Inject 가 대기열에 있거나 쓰는 중이다.
+    /// 끝난 arm 이 인계보다 뒤면(`done_at ≥ handed_at`) None: 간격은 종전 [`Self::busy_within`] 이 `done_at` 으로 잰다.
+    /// 판독 순서 = 인계 → 끝남(writer `end` 는 `done_at` 을 찍고 `active` 를 내린다) — 이 판정이 None 이면 호출부의
+    /// `busy_within` 이 이어받는다(빈틈 0). 원자 스냅숏은 아니다(leaf 락 둘).
+    ///
+    /// 실패 방향 = 보류(지연): 표식이 풀리지 않는 경우는 writer 가 끝내 그 arm 을 쓰지 못한 때뿐이다(막힘 · 종료). 호출부는
+    /// 경과가 막힘 문턱을 넘으면 막힌 writer 로 본다(채널 `CHANNEL_WRITER_STUCK_SECS` → `WriterBusy` · 15s sweep).
+    pub(crate) fn handoff_pending(&self) -> Option<std::time::Duration> {
+        let handed = (*self.handed_at.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let done = *self.done_at.lock().unwrap_or_else(|e| e.into_inner());
+        done.map_or(true, |d| d < handed).then(|| handed.elapsed())
+    }
+
+    /// 검체 전용 — 인계 시각을 과거로 옮긴다(writer 가 오래 집지 못한 인계 재현). 소비 검체(h3_handoff_stuck_…)가 cfg(unix) 라 같은 게이트.
+    #[cfg(all(test, unix))]
+    pub(crate) fn backdate_handoff(&self, by: std::time::Duration) {
+        if let Some(t) = self.handed_at.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            *t -= by;
+        }
+    }
+}
+
+/// [`InjectTrack::note_handoff`] 의 되돌림 증표(인계 실패 시 [`InjectTrack::undo_handoff`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HandoffMark {
+    prev: Option<Instant>,
+    mine: Instant,
 }
 
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
@@ -1217,7 +1454,16 @@ pub enum WriteReq {
     /// 사이의 **시간**이 아니다. 그래서 적체 경로에서 최소 간격 보장이 통째로 붕괴했다.
     /// 기준을 enqueue 시각이 아니라 **writer 실기록 시각**으로 옮겨야 그 경로가 닫힌다.
     /// `last_program_write` 가 None(이 writer 가 아직 프로그램 본문을 쓴 적 없음)이면 즉시 쓴다.
-    SubmitAfterGap { bytes: Vec<u8>, min_gap_ms: u64 },
+    SubmitAfterGap {
+        bytes: Vec<u8>,
+        min_gap_ms: u64,
+        /// ★(0.14.42 · 수정 2회차 F1) **제출 CR 보류 탐침** — writer 가 최소 간격을 잔 **뒤 · 쓰기 직전** 한 번 부른다.
+        /// `true` = 이 CR 을 쓰지 않는다(인계 뒤 질문·선택 창이 전경이 됐다 — 쓰면 그 창의 기본 선택지를 누른다).
+        /// `None` = 종전 동작(검체·윈도우·셸 좌석·권위 Return·킬 스위치·보이는 창에 대한 승인 Return). 생성자는
+        /// `governance::submit_cr_withhold_probe` 하나다(규칙·귀결은 그 doc). 보류한 CR 은 표식상 '소비 · 미기록'이고
+        /// 최소 간격 기준점(`last_program_write`)도 찍지 않는다 — 화면에 없는 바이트를 기준 삼지 않는다(B2′ 규율).
+        withhold: Option<SafetyProbe>,
+    },
 }
 
 /// 청크 경계 상태: 미완성 ESC/UTF-8 꼬리·\r 덮어쓰기·진행 중 라인
@@ -6432,11 +6678,20 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
             }
             // ★B2′: 제출 CR — 잔여를 **여기서, 소비 시점에** 계산한다. 이 계산이 핸들러에
             // 있으면 적체 구간에서 간격이 붕괴한다(codex 감사 R1 · SubmitAfterGap doc 참조).
-            WriteReq::SubmitAfterGap { bytes, min_gap_ms } => {
+            WriteReq::SubmitAfterGap { bytes, min_gap_ms, withhold } => {
                 if let Some(delay) =
                     cr_gap_delay_ms(last_program_write.map(|t| t.elapsed()), min_gap_ms)
                 {
                     std::thread::sleep(std::time::Duration::from_millis(delay));
+                }
+                // ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 — 간격을 잔 **뒤**(쓰기 직전) 화면을 다시 본다. 인계~쓰기 사이에
+                //   뜬 질문·선택 창에 CR 을 쓰면 기본 선택지를 누른다(오승인). 보류면 한 바이트도 쓰지 않고 기준점·쓴 시각을
+                //   찍지 않는다 — 대기 계수만 내린다(분리 보류가 영구화되지 않는다). writer 는 막지 않는다(사람 키가 창을 푼다).
+                if withhold.as_ref().is_some_and(|p| p()) {
+                    if let Some(t) = &track {
+                        t.submit_consumed(false);
+                    }
+                    continue;
                 }
                 let r = writer.write_all(&bytes).and_then(|_| writer.flush());
                 // ★B2″(agy 감사 R2-②): 쓴 CR **자신도** 기준점이 된다. 그러지 않으면 연속
@@ -6445,6 +6700,11 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
                 // 않는다 — Program arm 과 같은 규율(화면에 없는 바이트를 기준 삼지 않는다).
                 if r.is_ok() {
                     last_program_write = Some(std::time::Instant::now());
+                }
+                // ★(0.14.42 · S21-SETTLE) 제출 정착 표식 — 대기 계수 내림 + (성공 시) 쓴 시각. 핸들러가 이것으로
+                //   '대기 CR 뒤에 다음 본문을 붙이지 않는다'(분리 보류)를 판정한다. 원자 쓰기뿐.
+                if let Some(t) = &track {
+                    t.submit_consumed(r.is_ok());
                 }
                 r
             }
@@ -6469,6 +6729,10 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
                 }
                 let r = inject_write(&mut writer, &text, cr_delay_ms, clear_first);
                 if let Some(t) = &track {
+                    // ★(0.14.42 · S21-SETTLE) 끝 CR 까지 썼으면 제출 CR 을 쓴 시각이다(분리 보류의 기준점).
+                    if r.is_ok() {
+                        t.submit_written();
+                    }
                     t.end();
                 }
                 r
@@ -7798,6 +8062,47 @@ mod tests {
         nth_write_time(log, needle, 0)
     }
 
+    /// ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 탐침 — 간격을 잔 **뒤** 부르고, `true` 면 CR 한 바이트도 쓰지 않는다
+    /// (뒤 요청은 순서대로 계속 나간다 = writer 를 막지 않는다). 표식: 대기 계수는 내리고 쓴 시각은 찍지 않는다. `false`·
+    /// `None` 은 종전 바이트. 탐침은 CR 1개당 정확히 한 번 불린다(이벤트 발행 1건의 전제).
+    #[test]
+    fn f1_submit_cr_withhold_probe_skips_only_the_cr() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc::sync_channel;
+        let run = |withhold: Option<SafetyProbe>| {
+            let log: WriteLog = Arc::new(Mutex::new(Vec::new()));
+            let (tx, rx) = sync_channel::<WriteReq>(8);
+            let stop = Arc::new(AtomicBool::new(false));
+            let track = Arc::new(InjectTrack::default());
+            let w = TimedBuf::new(&log);
+            let t2 = Arc::clone(&track);
+            let handle = std::thread::spawn(move || run_writer_loop_tracked(w, rx, stop, Some(t2)));
+            tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
+            track.submit_handed();
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 30, withhold }).unwrap();
+            tx.send(WriteReq::Data(b"k".to_vec())).unwrap();
+            drop(tx);
+            handle.join().ok();
+            let flat: Vec<u8> = log.lock().unwrap().iter().flat_map(|(_, b)| b.clone()).collect();
+            (flat, track.submit_settle_obs(settle_mono_ms(), 2000))
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c2 = Arc::clone(&calls);
+        let (out, obs) = run(Some(Arc::new(move || {
+            c2.fetch_add(1, Ordering::SeqCst);
+            true
+        })));
+        assert_eq!(out, b"BODYk".to_vec(), "보류면 CR 만 빠지고 뒤 요청은 나간다: {:?}", String::from_utf8_lossy(&out));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "탐침은 CR 1개당 한 번");
+        assert!(!obs.inflight && obs.pending == 0, "보류한 CR 도 소비로 센다(분리 보류 영구화 0): {obs:?}");
+        assert_eq!(obs.since_written_ms, None, "쓰지 않은 CR 은 쓴 시각이 없다: {obs:?}");
+        let (out, obs) = run(Some(Arc::new(|| false)));
+        assert_eq!(out, b"BODY\rk".to_vec(), "탐침 false 는 종전 바이트");
+        assert!(obs.since_written_ms.is_some(), "{obs:?}");
+        let (out, _) = run(None);
+        assert_eq!(out, b"BODY\rk".to_vec(), "탐침 없음은 종전 바이트");
+    }
+
     /// ★B2′ 핵심 회귀 핀(codex 감사 R1 — 적체 경로 붕괴).
     ///
     /// 종전 B2 는 핸들러가 `last_injected`(= **enqueue 한 시각**)로 잔여를 계산했다. writer 큐에
@@ -7829,7 +8134,7 @@ mod tests {
         tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
         // ③ 200ms 뒤 제출 CR — 핸들러 시계로는 본문 enqueue 후 이미 150ms 초과다.
         std::thread::sleep(std::time::Duration::from_millis(200));
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
             .unwrap();
         drop(tx);
         handle.join().ok();
@@ -7917,7 +8222,7 @@ mod tests {
         tx.send(WriteReq::Inject { text: "hi".into(), cr_delay_ms: 0, clear_first: false, guard: None })
             .unwrap();
         let t_enqueue = std::time::Instant::now();
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
             .unwrap();
         drop(tx);
         handle.join().ok();
@@ -7946,7 +8251,7 @@ mod tests {
         let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
         tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
         for _ in 0..2 {
-            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
                 .unwrap();
         }
         drop(tx);
@@ -7991,7 +8296,7 @@ mod tests {
         // 사람 키(Data)는 기준점을 찍지 않는다 — Program 이 아니므로 여전히 '본문 없음'이다.
         tx.send(WriteReq::Data(b"typed".to_vec())).unwrap();
         let t0 = std::time::Instant::now();
-        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+        tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
             .unwrap();
         drop(tx);
         handle.join().ok();
@@ -8021,7 +8326,7 @@ mod tests {
             let handle = std::thread::spawn(move || run_writer_loop(w, rx, stop));
             tx.send(WriteReq::Program(b"BODY".to_vec())).unwrap();
             std::thread::sleep(std::time::Duration::from_millis(wait_ms));
-            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS })
+            tx.send(WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: GAP_MS, withhold: None })
                 .unwrap();
             drop(tx);
             handle.join().ok();
@@ -8053,6 +8358,7 @@ mod tests {
         tx.send(WriteReq::SubmitAfterGap {
             bytes: b"\r".to_vec(),
             min_gap_ms: OVERWAIT_GAP_MS,
+            withhold: None,
         })
         .unwrap();
         drop(tx);
@@ -8065,6 +8371,49 @@ mod tests {
             "이미 {OVERWAIT_GAP_MS}ms 가 지났는데 CR 이 또 {took:?} 늦춰졌다 — 하한이어야 할 \
              간격이 상한처럼 동작한다(모든 제출이 매번 느려진다)"
         );
+    }
+
+    /// ★(0.14.42 · H3 간격 경쟁) 인계 표식의 생애 — 실제 표식판 writer 루프로 잰다. ① 넘긴 뒤 writer 가 집기 전(선행 쓰기
+    /// 적체)에는 `busy_within` 이 거짓이어도(종전 빈틈) `handoff_pending` 이 참 ② arm 이 끝 CR 을 쓰면 풀리고 간격은
+    /// 종전 `done_at` 이 잰다 ③ 인계 실패 되돌림 ④ 되돌림은 뒤에 덮은 표식을 건드리지 않는다 ⑤ 표식은 `active` 를
+    /// 세우지 않는다(H0 자기 붙여넣기 귀속 무변경).
+    #[test]
+    fn inject_track_handoff_pending_until_an_arm_ends() {
+        use std::sync::mpsc::sync_channel;
+        let ms = std::time::Duration::from_millis;
+        let track = Arc::new(InjectTrack::default());
+        assert!(track.handoff_pending().is_none(), "빈 좌석");
+        let (tx, rx) = sync_channel::<WriteReq>(8);
+        let stop = Arc::new(AtomicBool::new(false));
+        let t2 = Arc::clone(&track);
+        let handle = std::thread::spawn(move || run_writer_loop_tracked(std::io::sink(), rx, stop, Some(t2)));
+        tx.send(WriteReq::DataAfter { bytes: Vec::new(), delay_ms: 300 }).unwrap();
+        std::thread::sleep(ms(50));
+        let _mark = track.note_handoff();
+        tx.send(WriteReq::Inject { text: "행".into(), cr_delay_ms: 100, clear_first: false, guard: None })
+            .unwrap();
+        std::thread::sleep(ms(50));
+        assert!(!track.busy_within(ms(1000)), "전제: writer 가 아직 집지 않았다(begin 전 — 종전 판정의 빈틈)");
+        assert!(track.handoff_pending().is_some(), "넘겼으나 writer 가 집기 전인 창을 비웠다");
+        assert!(!track.stuck_over(ms(0)), "인계 표식이 active 를 세웠다(H0 자기 붙여넣기 귀속 오염)");
+        let t0 = std::time::Instant::now();
+        while track.handoff_pending().is_some() && t0.elapsed() < ms(3000) {
+            std::thread::sleep(ms(10));
+        }
+        assert!(track.handoff_pending().is_none(), "arm 이 끝났는데 인계 대기가 풀리지 않았다");
+        assert!(track.busy_within(ms(1000)), "끝난 직후 간격은 done_at 이 잰다(빈틈 0)");
+        // ③ 인계 실패 되돌림 — 종전 표식(이미 끝난 인계)으로 돌아간다.
+        let m = track.note_handoff();
+        assert!(track.handoff_pending().is_some());
+        track.undo_handoff(m);
+        assert!(track.handoff_pending().is_none(), "인계 실패인데 대기가 남았다(다음 행이 막힌다)");
+        // ④ 되돌림 사이에 다른 인계가 덮었으면 그 표식을 지우지 않는다.
+        let stale = track.note_handoff();
+        let _newer = track.note_handoff();
+        track.undo_handoff(stale);
+        assert!(track.handoff_pending().is_some(), "뒤 인계의 표식을 앞 인계의 되돌림이 지웠다");
+        drop(tx);
+        handle.join().ok();
     }
 
     /// ★B2 계약 박제 ②(0.14.24): writer 는 **단일 소비자**라 DataAfter 가 자는 동안 뒤따라

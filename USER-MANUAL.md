@@ -720,6 +720,42 @@ cys send --queued --to worker "..."    # followup 큐: 대상이 조용해지면
   - 질문·선택 창(모달) 때문에 전환됐다는 경고가 나오면 여전히 **Return 을 보내지 마세요** —
     흡수는 보조 안전망일 뿐입니다.
   - 끄기: `CYS_RETURN_ABSORB_SECS=0`(데몬 env · 종전 동작으로 완전 복귀).
+- **제출 정착 대기(0.14.42 · S21)**: 에이전트 좌석(claude 등 launch-agent 등록 좌석)에 다른 발신자의 본문이
+  방금 제출되는 중이면(그 `send-key Return` 의 CR 이 데몬 안에서 최소 간격 150ms 를 기다리는 중이거나, CR 을
+  쓴 지 80ms 가 안 됐거나, 새 기계 본문이 짝 Return 을 기다리는 중) 기본 `send` 는 곧바로 큐로 가지 않고
+  **줄이 빌 때까지 잠깐(기본 최대 3초) 기다렸다가 직접** 넣습니다. 앞 CR 바로 뒤에 다음 본문을 붙여 쓰면
+  Claude 가 둘을 한 덩이로 읽어 CR 을 줄바꿈으로 바꾸고 두 본문을 한 초안으로 합치기 때문입니다(조용한
+  유실). 기다려도 비지 않으면 종전처럼 `QUEUED` 로 전환하고 stderr 에
+  `[send] 입력줄 정착 대기 …ms(재시도 N회) 뒤에도 점유 — 큐로 전환` 한 줄을 남깁니다.
+  - 기다리는 것은 **기계 제출** 때문일 때뿐입니다. 사람 초안·질문 창(모달)·타이핑 가드에는 기다리지 않고
+    종전처럼 곧바로 큐로 갑니다. 셸 좌석·Windows·`--queued`·`--clear-first`·여러 대상(글롭)은 무변경입니다.
+  - 거부 사유 `submit_settling`(쓰기 0) 과, 기다려도 되는 거부의 정착 힌트(`queue.draft_gate_denied` 의
+    `settle_ms` · 거부 문구 끝 ` [settle:<ms>]`)가 관측 축입니다. 구 CLI 는 이 거부를 종전처럼 `--queued`
+    1회 전환으로 처리합니다.
+  - **kill-switch pause(`cys pause`) 중에는 기다리지 않습니다**: pause 중 거부에는 정착 힌트가 붙지 않아 종전처럼
+    곧바로 `--queued` 로 넘어가고(= resume 까지 동결), 기다리던 중에 pause 가 걸리면 다음 재요청이 빈 줄을 만나도
+    쓰이지 않고(`[draft_gate:paused]` · 쓰기 0) 큐로 넘어갑니다(stderr `[send] 데몬 pause(kill-switch) 중 — 정착
+    재시도를 멈추고 큐로 전환`). pause 중 **첫** 직접 `send`(보고)는 종전 그대로 곧바로 들어갑니다.
+  - **제출 Return 이 나중에 뜬 창을 누르지 않습니다**: `send-key Return` 의 CR 은 데몬이 최소 간격 뒤에 쓰는데,
+    쓰기 직전에 질문·권한·선택 창이 새로 떠 있으면(커서가 든 입력 상자가 우리가 보낸 본문이 아니면 — 긴 줄이 접히거나
+    여러 줄이어서 커서가 둘째 줄 이하에 있어도, Claude 가 긴 붙여넣기를 `[Pasted text #N +M lines]` 로 접어 그려도 입력
+    상자 전체를 본문과 대조합니다 · 그 입력 상자 위에 남은 `❯ 1. …` 같은 이전 메시지·본문 첫 줄은 창으로 보지 않습니다)
+    그 CR 을 쓰지 않습니다(`queue.submit_withheld`). 본문은 입력줄에 남고, 창이 닫힌 뒤 입력줄이 여전히 그 본문 그대로면
+    데몬이 그 CR 을 **한 번** 다시 씁니다(`queue.submit_resubmitted` · 5초 주기 점검 · pause 중에는 하지 않음 · 그 사이
+    사람이 그 줄에 손을 댔거나 다른 기계 본문이 들어왔으면 다시 쓰지 않고 `queue.submit_withheld_dropped` · 창이 10분 넘게
+    닫히지 않으면 기다림을 그만두고 같은 이벤트 `reason:"wait_cap"` — 입력줄 본문은 그대로). 10분은 **창이 열려 있는
+    시간만** 셉니다: 창이 닫힌 뒤 에이전트가 그 작업을 이어 가는 동안은 입력을 기다리는 상태로 돌아올 때까지 기다리고
+    (작업이 10분을 넘어도 끝난 뒤 한 번 다시 씀), kill-switch pause 동안은 시계가 멈춥니다. 창이 닫힌 뒤 기다림의 상한은 큐
+    TTL(기본 6시간 · pause 시간 제외 · 넘으면 `reason:"expired"`)입니다. 에이전트가 막 앉아 데몬이
+    아직 좌석 점유를 확인하지 못한 동안(기동 뒤 최대 5초)에도 보류하되, 그때는 커서가 선택지 행(`❯ 1. …`)일 때만
+    창으로 봅니다(죽은 좌석의 창 잔상 아래 셸에 치는 재기동 Return 은 막지 않음). **이미 보이는 창에 보내는
+    Return(승인)·방향키 뒤 Return 은 종전처럼 씁니다.** 단, 창이 뜨기 전에 들어간 기계 본문이 입력줄에서 제출을
+    기다리는 중이면 그 뒤 첫 Return 은 그 본문의 제출로 보고 쓰지 않습니다 — 창을 누르려는 것이었다면 한 번 더
+    보내세요(두 번째부터는 종전처럼 씁니다). 권위 Return(launch-agent·재주입)·`--clear-first`·셸 좌석·Windows 는
+    무변경입니다.
+  - 끄기: `CYS_SEND_SETTLE=0`(데몬·CLI env 둘 다 — 데몬 쪽을 끄면 분리 대기·힌트·제출 CR 보류가 모두 없어져 0.14.42 A2
+    동작) · 재기동 없이 데몬만 끄려면 데몬 상태 폴더에 `send-settle-off` 파일 · 기다리는 최대 시간은
+    `CYS_SEND_SETTLE_BUDGET_MS`(CLI · 0 = 기다리지 않음).
 - **같은 발신자의 연속 큐 항목 병합**: 같은 발신자가 연달아 큐에 쌓은 항목은 한 번에 배달되고
   (다이제스트), 병합 구간이 전부 빈 Return 항목이면 다이제스트 문안 대신 **빈 Enter 1회**만
   나갑니다(0.14.42 · 종전의 `[큐 다이제스트 N건 …]` 빈 문안 제출 제거). 빈 구분 항목이 줄면서
@@ -1202,7 +1238,9 @@ cys channel --json <액션>   # start·stop·register·inbound·outbound·receip
   {inbox_id, age_secs, reason} 이 납니다. 원격에서 master 의 초안을 치울 수단은 없습니다 — 좌석에서 비워야 풀립니다.
 - 쌓였던 메시지는 **한 번에 한 건씩** 나갑니다. 앞 메시지의 Enter 가 들어가고 1초가 지난 뒤에 다음 메시지를
   새로 판정하므로, 앞 메시지 때문에 뜬 권한·질문 창 위에 뒤 메시지가 떨어지지 않습니다(`hold_reason: "paced"` 는
-  이 간격 대기입니다 · 20건이면 약 30초). 판정한 뒤 Enter 까지의 0.5초 사이에 새로 뜨는 창은 여전히 막지
+  이 간격 대기입니다 · 20건이면 약 30초). 앞 메시지가 아직 좌석에 쓰이지 않고 쓰기 대기열에만 있는 동안도 같은
+  간격 대기입니다(두 건이 거의 동시에 와도 이어 붙지 않습니다). 앞 메시지를 10초 넘게 쓰지 못하면 좌석 쓰기가 막힌 것으로
+  보고 `hold_reason: "writer_busy"` 로 15초 재시도에 넘깁니다. 판정한 뒤 Enter 까지의 0.5초 사이에 새로 뜨는 창은 여전히 막지
   못합니다(모든 직접 주입에 공통인 알려진 잔여).
 - master 가 작업 중(busy)이면 종전대로 즉시 들어갑니다(원격 조향).
 - **재배달은 기본 꺼짐**입니다 — 메시지 1건은 1번만 주입됩니다. 종전에는 ack 가 없으면 10분마다 끝없이 다시
@@ -1274,6 +1312,8 @@ cys cost-baseline lock / diff   # 비용·효율 baseline 잠금·전후 비교
 | `CYS_MACHINE_INJECT_HOLD` | 전부 | 데몬 내부 주입의 화면 판정(0.14.42 · H · §5.3) — 미설정·`1`·`all` = 다섯 경로 전부 · `0`·`off` = 전부 종전 동작 · 목록(`schedule,channel,ceo,supervisor,takeover`) = 그 경로만. 재기동하면 적용 |
 | `CYS_MACHINE_INJECT_HOLD_AXES` | unix 전 축 · Windows draft 제외 | 판정 축(`pause,quiescing,shell,human,modal,draft`) — 빼면 그 축을 안 본다. `all` = 전 축(Windows draft 포함 · 명시 선택). Windows 기본에서 초안 축을 끈 이유는 ConPTY 입력줄 판정이 가장 약해서다(실측 전까지) |
 | `CYS_QUEUE_QUIESCE_HOLD_SECS` | 600 (0=off) | 사이클 창(quiescing) 보류 상한(0.14.42 · H1) — 큐 틱 배달과 스케줄·CEO·감독자의 quiescing 축이 쓴다. 넘긴 표시는 무시하고 `queue.quiesce_stale` 1회. 채널의 quiescing 보류(종전 무기한)는 이 값과 무관. 표시를 세운 `cys cycle-agent` 프로세스가 해제 없이 끝나면(강제 종료·도구 시한) 데몬이 상한을 기다리지 않고 곧바로 푼다(손으로 친 `cys quiesce` 표시는 그 CLI 수명에 묶지 않는다 — 상한·`cys quiesce --off` 로만 풀린다) — 같은 좌석에 새 에이전트가 앉거나 에이전트 종료가 관측될 때도 푼다(`surface.quiescing` 의 `reason`: `owner_exited`·`agent_relaunched`·`agent_exited`) |
+| `CYS_SEND_SETTLE` | 켬 (0/false/off=끔) | 직접 `send` 의 제출 정착(0.14.42 · S21 · §5.3) — 데몬: 에이전트 좌석에 기계 제출 CR 이 대기 중이거나 쓴 지 80ms 안이면 다음 본문을 받지 않고(`submit_settling`) 기계 제출 때문인 거부에 정착 힌트(`[settle:<ms>]`)를 붙인다(kill-switch pause 중에는 붙이지 않는다) · 제출 CR 을 쓰기 직전 새로 뜬 질문·선택 창이면 그 CR 을 쓰지 않고(`queue.submit_withheld`) 창이 닫힌 뒤 입력줄이 그 본문 그대로면 한 번 다시 쓴다(`queue.submit_resubmitted`) · CLI: 힌트가 있을 때만 다시 보낸다. 끄면 셋 다 종전(0.14.42 A2). **macOS·Linux 전용**(Windows 는 무변경). 재기동 없이 데몬만 끄려면 데몬 상태 폴더에 `send-settle-off` 파일 |
+| `CYS_SEND_SETTLE_BUDGET_MS` | 3000 (0=off · 상한 10000) | `cys send` 가 정착 힌트를 받고 기다리는 최대 시간(CLI · §5.3). 넘기면 종전처럼 `--queued` 1회 전환 |
 | `CYS_DIRECT_PASTE_FENCE` | 켬 (0/false/off=끔) | 직접 `send` 의 긴 본문 울타리(1000B 초과 평문 → 괄호붙여넣기 봉투)와 CRLF 본문 한 번 제출 수리(0.14.42 · 설계 C D5′ · S34). **macOS·Linux 전용** — Windows 직접 경로는 v0.14.41 과 같은 바이트다(ConPTY 실측 전 · CRLF 본문이 여러 번 나뉘어 제출되는 종전 결함이 Windows 에는 그대로 남아 있다). 재기동 없이 끄려면 데몬 상태 폴더에 `direct-paste-fence-off` 파일을 둔다 |
 | `CYS_CHANNEL_REDELIVER_MAX` | 0 | 채널 inbox 미-ack 재배달 횟수 상한(0.14.42 · H3 · §13). 0 = 재배달 없음(메시지 1건 = 주입 1회) |
 | `CYS_CHANNEL_REDELIVER_MAX_AGE_SECS` | 3600 | 재배달 대상의 접수 나이 상한 — 크게 두면 종전(무한 재배달)에 가까워진다 |
@@ -1455,6 +1495,22 @@ v0.14.42 가산분(설계 H · 전부 additive):
 - `boot_supervisor.pane_notice_skipped` {intent, reason, surface_id, why} — 무스폰 통보의 pane 줄 생략(Feed 는 나감)
 - `role.takeover` 에 `pane_notice`("sent"·"skipped_pending_input"·"skipped_surface_gone")
 - 스케줄 발화 결과 문자열: `queued(gate:quiescing|human|draft)` · `delivery_frozen: kill-switch paused between tick and push`
+
+v0.14.42 가산분(S21 제출 정착 · 전부 additive):
+- `queue.draft_gate_denied` 의 `reason` 에 `submit_settling`(기계 제출 CR 대기·분리 창 — 쓰기 0) 추가 · 기계 제출 때문인
+  거부에만 가산 키 `settle_ms`(다시 보내도 되는 대략의 시각 · 없으면 페이로드 종전 그대로 · kill-switch pause 중에는 없음)
+- `queue.draft_gate_denied` 의 `reason` 에 `paused`(kill-switch pause 중 도착한 정착 재시도 — 쓰기 0 · 증명 없음 → CLI 는
+  `--queued` 1회) 추가 · RPC `surface.send_text` 가산 파라미터 `settle_retry`(신 CLI 가 정착 재시도에만 싣는다)
+- `queue.submit_withheld` {surface_ref, reason:"modal", armed_by("machine_body"·"no_dialog_at_handoff"·"resubmit"), from,
+  handed_ms_ago} — 제출 Return 의 CR 을 쓰기 직전 새로 뜬 질문·선택 창이 있어 그 CR 을 쓰지 않았다(본문은 입력줄에
+  미제출로 남는다 · 보이는 창에 대한 Return 은 대상 아님)
+- `queue.submit_resubmitted` {surface_ref, from, withheld_ms_ago} — 창이 닫히고 입력줄이 보류한 기계 본문 그대로라 그
+  제출 CR 을 한 번 다시 썼다(watchdog 5초 틱 · 큐 배달 앞 · pause 중 없음)
+- `queue.submit_withheld_dropped` {surface_ref, reason("human"·"newer_body"·"line_empty"·"seat_off"·"kill_switch"·
+  "unobservable"·"expired"·"wait_cap"), from, withheld_ms_ago, dialog_open_ms} — 보류한 CR 을 다시 쓰지 않기로 했다(입력줄
+  본문은 그대로 둔다 · `wait_cap` = 질문·선택 창(또는 승인 대기)이 10분 넘게 연달아 열려 있었다 — 창이 닫힌 뒤의 작업
+  대기와 kill-switch pause 는 세지 않는다 · `expired` = pause 를 뺀 대기가 큐 TTL 을 넘었다 · `dialog_open_ms` = 버릴 때
+  창이 연달아 열려 있던 시간(창이 닫혀 있었으면 0))
 
 ---
 
