@@ -1404,7 +1404,9 @@ pub fn summarize_payload(name: &str, payload: &Value) -> String {
             // ★(0.14.42 · clear 가드 v3) 발화 번호를 싣는다 — 받는 CSO·master 가 `cys cycle-agent --fire <id>` 로 넘겨 같은 통보의
             //   중복 집행을 데몬이 건너뛰게 한다(rc 87). 문자열 값만 싣는다(없으면 종전 문면).
             let fire = payload.get("fire_id").and_then(Value::as_str).filter(|f| !f.is_empty()).map_or_else(String::new, |f| format!(" fire={f}"));
-            Some(format!("role={role} context={pct}% threshold={th}%{fire}"))
+            // ★(RR2-ROLE-2) 재배달 — 같은 통보(같은 fire)를 집행 시도가 사이클을 끝내지 못한 뒤 한 번 더 알린다(새 발화 아님).
+            let redelivery = if payload.get("redelivery").and_then(Value::as_bool) == Some(true) { " redelivery" } else { "" };
+            Some(format!("role={role} context={pct}% threshold={th}%{fire}{redelivery}"))
         }
         "queue.depth_high" => {
             let depth = field(payload, "depth").unwrap_or_else(|| "?".into());

@@ -3000,6 +3000,37 @@ class ClearGuardFireWiring(unittest.TestCase):
                 self.assertIn(squash("88 = 다른 집행자"), folded, name)
                 self.assertIn(squash("이미 처리됨이 아니다"), folded, "%s 가 88 이 '이미 처리됨'이 아님을 적지 않는다" % name)
 
+    # ★(0.14.42 · RR2-ROLE-2) rc 88 뒤 재집행 계기 — 옛 문면은 quiescing(5단계)·완료 통지를 봤다. 점유는 0단계(저장 지시 전)에
+    #   잡혀 1~4단계 동안 quiescing 이 꺼져 있으므로 '아님'을 보고 곧바로 재집행하면 다시 전경 --timeout 을 기다려 88 로 끝나고,
+    #   점유자가 뒤이어 clear 전에 실패하면 아무도 집행하지 않았다(드릴 rr2-C88 · clear 2134.8초 — 대조 632.1초).
+    OLD_RC88_TRIGGER = (
+        "그 좌석이 `quiescing` 이 아님을 본 뒤 같은 `--fire` 로 1회 다시 집행한다",
+        "완료 통지 뒤 같은 `--fire` 로 1회 다시 집행해도 된다",
+    )
+
+    def _rc88_violations(self, raw):
+        folded = squash(strip_html_comments(raw))
+        bad = [old for old in self.OLD_RC88_TRIGGER if squash(old) in folded]
+        for need in ("한 번 재배달", "ctx_guard.claim", "턴 안에서 기다리지"):
+            if squash(need) not in folded:
+                bad.append("missing:" + need)
+        return bad
+
+    def test_rc88_waits_for_redelivery_not_quiescing(self):
+        """rc 88 은 턴을 끝내고 데몬의 재배달(같은 fire=)을 다음 판정의 계기로 삼는다 — 진행 여부는 ctx_guard.claim 이다."""
+        for name in self.FILES:
+            with self.subTest(directive=name):
+                self.assertEqual(self._rc88_violations(self.raw[name]), [], name)
+
+    def test_rc88_negative_control(self):
+        """음성 대조 — CSO 문면을 옛 quiescing 절차로 되돌리면 위 검사가 잡는다."""
+        mutated = self.raw["CSO_DIRECTIVE.md"].replace("한 번 재배달", "재배달", 1)
+        self.assertNotEqual(mutated, self.raw["CSO_DIRECTIVE.md"], "음성 대조 치환이 적중하지 않았다")
+        self.assertIn("missing:한 번 재배달", self._rc88_violations(mutated) + self._rc88_violations(
+            mutated.replace("**한 번 재배달**", "재배달")))
+        old = mutated + "\n" + self.OLD_RC88_TRIGGER[0]
+        self.assertTrue(any(v == self.OLD_RC88_TRIGGER[0] for v in self._rc88_violations(old)))
+
     def test_negative_control_catches_a_dropped_fire(self):
         """음성 대조 — 호출 예 하나에서 --fire 를 지우면 위 검사가 잡는다(검사기가 공허하지 않다)."""
         mutated = self.raw["CSO_DIRECTIVE.md"].replace(

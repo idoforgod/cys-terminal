@@ -1309,6 +1309,13 @@ pub struct CycleClaim {
 /// 막히는 ② 방향 차단 · 산 집행자의 긴 사이클이면 중복 집행 1회로만 틀린다).
 pub const CYCLE_CLAIM_MAX_SECS: f64 = 1200.0;
 
+impl CycleClaim {
+    /// 죽은 점유 — 점유자 pid 가 죽었거나 상한([`CYCLE_CLAIM_MAX_SECS`])을 넘겼다(`now` = epoch 초). 게으르게 버린다.
+    pub fn expired(&self, now: f64) -> bool {
+        self.pid.is_some_and(|p| !pid_alive(p)) || now - self.since > CYCLE_CLAIM_MAX_SECS
+    }
+}
+
 pub struct Surface {
     pub id: u64,
     /// (B5 · §2-8) 이 좌석에 arm 된 부트 논스 — arm 은 `boot.arm_nonce` RPC 로만 일어난다.
@@ -1543,7 +1550,8 @@ pub struct Surface {
     /// ★(0.14.42 · clear 가드 v3) 사이클 단일 비행 점유(`surface.cycle_claim`) — `cys cycle-agent` 가 0단계에서 잡고 끝날 때
     /// 놓는다. 산 점유가 있으면 다른 집행은 busy(cycle-agent 가 --fire 면 점유자 종료를 기다렸다 다시 묻고 · 그래도 진행 중이면
     /// rc 88 — '이미 처리됨'(87 = stale)과 다르다). 죽은 pid·[`CYCLE_CLAIM_MAX_SECS`] 를 넘긴 점유는 게으르게 버린다. 휘발 ·
-    /// 말단 락(가드 락보다 먼저 잡는다).
+    /// 말단 락(가드 락보다 먼저 잡는다 · 가드 락을 쥔 채 잡지 않는다). ★(RR2-ROLE-2) 좌석 상태 JSON `ctx_guard.claim` 으로 보이고,
+    /// 점유가 끝났는데(해제 · 죽음) 그 통보가 미해결이면 데몬이 같은 통보를 한 번 재배달한다(`usage::ctx_guard_claim_ended`).
     pub cycle_claim: Mutex<Option<CycleClaim>>,
     /// (B2) OSC 9/99/777 알림 스캐너 carry — reader 스레드 전용(단일 스레드 접근이라 Mutex면 충분).
     /// strip 전 raw chunk를 누적해 완성 OSC 시퀀스만 추출한다(화면 렌더/strip 경로와 독립).

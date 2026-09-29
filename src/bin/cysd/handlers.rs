@@ -3100,6 +3100,12 @@ pub(crate) fn publish_ctx_guard(
     let now = crate::usage::ctx_guard_now(daemon);
     let axis_ko = |a: Axis| if a == Axis::Measured { "실측" } else { "자기보고" };
     let win_label = |w: Option<u64>| w.map_or_else(|| "미상(200K 로 간주)".to_string(), |w| w.to_string());
+    // 차단점(참값 · 소수 한 자리 — 200K 88.5 · 1M 97.7) — feed 문구 전용.
+    let block_point = |w: Option<u64>| {
+        let w = w.filter(|w| *w > 0).unwrap_or(crate::usage::CTX_ASSUMED_WINDOW) as f64;
+        let reserve = (crate::usage::CC_SUMMARY_RESERVE_TOKENS + crate::usage::CC_BLOCKING_BUFFER_TOKENS) as f64;
+        format!("{:.1}", (w - reserve) * 100.0 / w)
+    };
     // 선제 압축점(표시값) — feed 처방 문턱에만 쓴다.
     let compact_point = |w: Option<u64>| {
         crate::usage::ctx_pct_below_reserve(w, crate::usage::CC_SUMMARY_RESERVE_TOKENS + crate::usage::CC_AUTOCOMPACT_BUFFER_TOKENS)
@@ -3110,7 +3116,7 @@ pub(crate) fn publish_ctx_guard(
     };
     for n in &out.notes {
         match *n {
-            Note::Measured { kind, level, first, base, confirmed, span, cut } => {
+            Note::Measured { kind, level, first, base, confirmed, span, cut, edge } => {
                 // 주 축 = 실측(있으면) · 아니면 자기보고.
                 let primary = AXES.into_iter().find(|a| level[*a as usize].is_some());
                 let pick = |a: Option<Axis>, v: [Option<(u8, Option<u64>)>; 2]| a.and_then(|a| v[a as usize]).map(|l| l.0);
@@ -3146,10 +3152,12 @@ pub(crate) fn publish_ctx_guard(
                         // 창이 실제로 잰 초(시각으로 닫히면 창 길이 · S 도달·낙폭이면 그때까지) · 낙폭(압축)이 끊었나.
                         "span_secs": span.round() as u64,
                         "cut_by_compaction": cut,
+                        // ★(RNC5-1) S 가장자리에서 창을 닫은 보고(수준 밖 · 곧바로 판정됐다) — 없으면 null.
+                        "edge_pct": edge.map(|e| e.0),
                     }),
                 );
                 let (Some(a), Some(bar), Some(b)) = (primary, bar, base_p) else { continue };
-                if kind != Kind::AfterCycle || bar <= b {
+                if kind != Kind::AfterCycle || (bar <= b && edge.is_none()) {
                     continue;
                 }
                 // 오너 feed 는 좌석당 6시간 1회(가드 락은 말단 — 잠깐 잡고 놓는다).
@@ -3173,7 +3181,12 @@ pub(crate) fn publish_ctx_guard(
                 } else if cut {
                     format!("{}초(압축으로 끊김)", span.round() as u64)
                 } else {
-                    format!("{}초(가장자리 {}% 도달로 닫힘)", span.round() as u64, stop_cap(w))
+                    format!(
+                        "{}초(가장자리 {}% 도달로 닫힘{})",
+                        span.round() as u64,
+                        stop_cap(w),
+                        edge.map_or_else(String::new, |e| format!(" — 보고 {}%", e.0))
+                    )
                 };
                 // 표지 끔이 clear 실효 확인을 싣지 않았으면(측정 불능 · 데몬 해제 · 수동 quiesce · 구 CLI) clear 를 단정하지 않는다.
                 let what = if confirmed { "clear 뒤" } else { "사이클 표지 뒤(clear 실효 미확인)" };
@@ -3195,6 +3208,29 @@ pub(crate) fn publish_ctx_guard(
                         " 재주입 직후 수준 {}% 가 기본 임계 {b}% 이상 — 지침·복원 크기가 임계를 막는다(후보: 1M · 지침 축소 · 임계 \
                          상향 — 오너 결정).",
                         f.unwrap_or(0)
+                    ));
+                }
+                // ★(RNC5-1 · R2V3-1) S 가장자리 — 사이클 뒤 창 안에서 S 에 닿은 보고는 곧바로 판정됐다(자동 압축이 꺼진 좌석의
+                //   차단점 보호). 사이클마다 이렇게 돌아오면 최소 간격(10분)마다 clear 된다 — 복원·회신으로 돌아왔는지 작업인지 가드는
+                //   가르지 않는다(같은 관측값 열 · 설계 I3 예외 ⓑ). 처방은 사실(돌아온 높이)만 근거로 싣는다.
+                if let Some(e) = edge {
+                    body.push_str(&format!(
+                        " 사이클 뒤 {span} 에 가장자리 {}%(보고 {}%)에 닿아 곧바로 다음 clear 를 통보했습니다(차단점 {}% 보호 — \
+                         자동 압축이 꺼진 좌석). 사이클마다 10분 안에 이 높이로 돌아오면 10분마다 clear 됩니다 — 후보: 1M · 지침 \
+                         축소 · 자동 압축 켬(오너 결정).",
+                        stop_cap(w),
+                        e.0,
+                        block_point(w)
+                    ));
+                }
+                if bar <= r {
+                    // ★(R2V3-2) C 띠 — 다음 통보가 잰 수준 이하다: clear 로 이 좌석의 수준을 막대 아래로 낮추지 못해 최소 간격마다
+                    //   통보·clear 될 수 있다(차단점 바로 아래 · 설계 I3 예외 ⓒ · 사이클 뒤 창에서는 확인된 S 이상 짝으로만 생긴다).
+                    body.push_str(&format!(
+                        " 다음 통보 {bar}% 가 잰 수준 {r}% 이하입니다 — clear 뒤에도 이 좌석은 차단점 바로 아래({}%)로 돌아와 최소 \
+                         간격(10분)마다 통보·clear 될 수 있습니다(clear 로 낮출 수 없는 수준) — 후보: 1M · 지침 축소 · 자동 압축 \
+                         켬(오너 결정).",
+                        block_cap(w)
                     ));
                 }
                 daemon.push_feed_notification("warn", &title, &body, Some(sid));
@@ -3253,7 +3289,8 @@ pub(crate) fn publish_ctx_guard(
                             ((at - fire_at).max(0.0) / 60.0).round() as u64
                         ),
                         format!(
-                            "가드는 원인을 알지 못한다(가능: CSO 부재·집행 지연·저장 검증 실패·대상 바쁨·clear 송신 거부·clear 실효 미관측·차단점).{}",
+                            "가드는 원인을 알지 못한다(가능: CSO 부재·집행 지연·저장 검증 실패·대상 바쁨·clear 송신 거부·clear 실효 미관측·차단점·\
+                             표지 없는 clear(오너 손 /clear·재기동 — 가드는 새 세션의 현재 관측으로 판정했다)).{}",
                             fire_pct.map_or_else(String::new, |p| format!(" 컨텍스트 {p}%."))
                         ),
                     ),
@@ -3280,7 +3317,7 @@ pub(crate) fn publish_ctx_guard(
             }
         }
     }
-    let Some(Verdict::Fire { pct, bar, level, strikes, seq, after_compaction, axis, base, window }) = out.fired() else {
+    let Some(Verdict::Fire { pct, bar, level, strikes, seq, after_compaction, axis, base, window, observed_age }) = out.fired() else {
         return;
     };
     let fire_id = ctx_guard_fire_id(daemon, sid, seq);
@@ -3297,10 +3334,14 @@ pub(crate) fn publish_ctx_guard(
         "fire_id": fire_id,
         "surface_ref": sref,
         "source": source,
+        // ★(RR2-ROLE-1) 판정한 관측의 나이(초) — 보류 재판정이면 그 축의 가장 최근 관측이 온 뒤 흐른 시간.
+        "observed_age_secs": observed_age.round() as u64,
+        // ★(RR2-ROLE-2) 재배달 — 같은 통보(같은 fire_id)를 집행 시도가 사이클을 끝내지 못한 뒤 한 번 더 알린다(새 발화 아님).
+        "redelivery": source == "redelivery",
         "action": format!(
             "cys cycle-agent --fire {fire_id} (저장→검증→clear→복원) 집행 대상 — MASTER_DIRECTIVE §컨텍스트 사이클 · rc 87 = \
-             그 통보 뒤 사이클이 이미 끝남(재집행 금지) · rc 88 = 다른 집행자의 사이클이 진행 중(송신 0건 · 같은 --fire 재집행은 \
-             데몬이 판정)"
+             그 통보 뒤 사이클이 이미 끝남(재집행 금지) · rc 88 = 다른 집행자의 사이클이 진행 중(송신 0건 · 기다리거나 다시 \
+             집행하지 말고 턴을 끝낸다 — 그 시도가 clear 전에 끝나면 데몬이 이 통보를 한 번 재배달한다 · redelivery)"
         ),
     });
     if let Some(a) = agent {
@@ -9404,12 +9445,18 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 if mine {
                     *claim = None;
                 }
+                drop(claim);
+                // ★(RR2-ROLE-2) 시도가 끝났다 — 사이클을 끝내지 못했으면(가드가 아직 Awaiting) 같은 통보를 한 번 재배달한다(rc 88 로
+                //   물러난 집행자가 턴 안에서 기다리지 않아도 다시 받는다 · 끝난 사이클 뒤면 무동작). 점유 락을 놓은 뒤(가드 락은 말단).
+                if mine {
+                    crate::usage::ctx_guard_claim_ended(daemon, &surface);
+                }
                 let verdict = if mine { "released" } else { "not_holder" };
                 return Reply::Single(ok_response(&id, json!({"surface_id": sid, "claim": verdict})));
             }
-            if claim.as_ref().is_some_and(|c| {
-                c.pid.is_some_and(|p| !crate::state::pid_alive(p)) || now - c.since > crate::state::CYCLE_CLAIM_MAX_SECS
-            }) {
+            // 죽은 점유는 버린다 — 여기서는 재배달하지 않는다(지금 묻는 집행자가 곧 그 통보를 집행하거나 stale 로 건너뛴다 · 아무도
+            // 묻지 않으면 수집기 틱이 버리고 재배달한다).
+            if claim.as_ref().is_some_and(|c| c.expired(now)) {
                 *claim = None;
             }
             if let Some(c) = claim.as_ref().filter(|c| c.pid.is_none() || c.pid != caller_pid) {
@@ -20389,6 +20436,110 @@ mod tests {
         assert!(level_feed.0.contains("223초(압축으로 끊김) 최고치 83%"), "{level_feed:?}");
     }
 
+    /// ★(RNC5-1) S 가장자리 — 사이클 뒤 창 안의 확인된 S 이상 보고는 창을 닫고 **그 보고로 곧바로 판정된다**(최소 간격 보류 →
+    /// 만료 발화 · 막대 85). `context.level_measured` 는 `edge_pct` 를 싣고 오너 feed 는 사실(가장자리 도달 보고)과 비용(10분마다
+    /// clear 될 수 있다) · 처방 후보(1M · 지침 축소 · 자동 압축 켬)를 싣는다. 사이클 뒤 첫 두 보고가 C 이상 짝이면(C 띠) 다음 통보가
+    /// 잰 수준 이하라는 문장도 붙는다(R2V3-2). 실패 방향: 붉어지면 자동 압축을 끈 좌석이 작업 한 덩어리로 차단점을 넘거나(②) 오너가
+    /// 10분 clear 고리의 원인을 모른다.
+    #[test]
+    fn stop_cap_edge_is_decided_at_once_and_fed_to_the_owner() {
+        let _pack = crate::governance::HOutsidePack::new(); // 팩 격리(ACL 경합 없음) — 좌석 전에
+        let daemon = isolated_daemon(); // 상태 폴더 격리(동결·영속 공유 없음)
+        let feeds = |node: u64| {
+            daemon.feed_items.lock().unwrap().iter().filter(|f| f.surface_id == Some(node) && f.kind == "warn").map(|f| (f.title.clone(), f.body.clone())).collect::<Vec<_>>()
+        };
+        // ① S 가장자리(R 80 · 보고 86).
+        let node = make_surface(&daemon, Some("master"));
+        let s = daemon.get_surface(node).unwrap();
+        let t0 = crate::usage::ctx_guard_now(&daemon);
+        let at = |pct: u8, t: f64| maybe_fire_context_threshold_at(&daemon, &s, pct, "statusline", Some("claude"), t);
+        at(70, t0);
+        s.ctx_loop_guard.lock().unwrap().cycle_on(t0 + 60.0, false);
+        s.ctx_loop_guard.lock().unwrap().cycle_off(crate::usage::clear_guard::Outcome::Cleared, t0 + 75.0, false);
+        at(72, t0 + 90.0);
+        at(80, t0 + 110.0);
+        at(86, t0 + 130.0);
+        let lm = named_events(&daemon, node, "context.level_measured");
+        assert_eq!(lm.len(), 1, "{lm:?}");
+        let p = &lm[0]["payload"];
+        assert_eq!((p["level_pct"]["measured"].clone(), p["edge_pct"].clone(), p["threshold"].clone()), (json!(80), json!(86), json!(85)), "{p}");
+        let warn = feeds(node);
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        assert!(warn[0].0.contains("가장자리 85% 도달로 닫힘 — 보고 86%"), "{warn:?}");
+        assert!(warn[0].1.contains("곧바로 다음 clear 를 통보") && warn[0].1.contains("10분마다 clear") && warn[0].1.contains("자동 압축 켬"), "{warn:?}");
+        assert!(warn[0].1.contains("차단점 88.5%"), "{warn:?}");
+        assert_eq!(threshold_events(&daemon, node).len(), 1, "최소 간격 전에 발화했다");
+        crate::usage::ctx_guard_tick_at(&daemon, &s, t0 + 600.001);
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 2, "S 가장자리 보고가 최소 간격 만료에 발화하지 않았다(②): {evs:?}");
+        assert_eq!((evs[1]["payload"]["context_pct"].clone(), evs[1]["payload"]["threshold"].clone()), (json!(86), json!(85)));
+        // ② C 띠(사이클 뒤 첫 두 보고가 88 · 88 — 확인된 짝 · R 88 · 막대 88).
+        let n2 = make_surface(&daemon, Some("master"));
+        let s2 = daemon.get_surface(n2).unwrap();
+        let at2 = |pct: u8, t: f64| maybe_fire_context_threshold_at(&daemon, &s2, pct, "statusline", Some("claude"), t);
+        at2(70, t0);
+        s2.ctx_loop_guard.lock().unwrap().cycle_on(t0 + 60.0, false);
+        s2.ctx_loop_guard.lock().unwrap().cycle_off(crate::usage::clear_guard::Outcome::Cleared, t0 + 75.0, false);
+        at2(88, t0 + 90.0);
+        at2(88, t0 + 100.0);
+        let warn = feeds(n2);
+        assert_eq!(warn.len(), 1, "{warn:?}");
+        assert!(warn[0].1.contains("다음 통보 88% 가 잰 수준 88% 이하") && warn[0].1.contains("clear 로 낮출 수 없는 수준"), "{warn:?}");
+    }
+
+    /// ★(RR2-ROLE-1) 게이트 경로 — 발화 뒤 오너 손 /clear(표지 없음) → 새 세션(B)이 막대 아래로 보고하면 시한·잠정 보류 뒤의
+    /// 수집기 틱은 B 의 현재 관측을 판정해 재발화하지 않는다(종전: 2107초 71% 재발화 + no_cycle strike + '다시 임계를 넘었다'
+    /// feed · 좌석 39%). 음성 대조: 보고가 끊긴 좌석은 마지막 관측으로 재통보하고 payload 가 관측 나이를 싣는다.
+    #[test]
+    fn unmarked_clear_retry_judges_the_new_session_not_the_dead_one() {
+        let _pack = crate::governance::HOutsidePack::new(); // 팩 격리(ACL 경합 없음) — 좌석 전에
+        let daemon = isolated_daemon(); // 상태 폴더 격리(동결·영속 공유 없음)
+        let node = make_surface(&daemon, Some("master"));
+        let s = daemon.get_surface(node).unwrap();
+        let obs = |file: &str, pct: u8| {
+            *s.observed_usage.lock().unwrap() = Some(crate::usage::ObservedUsage {
+                agent: "claude".into(),
+                ctx_tokens: None,
+                ctx_window: Some(200_000),
+                ctx_pct: Some(pct),
+                rate: vec![],
+                source: "statusline".into(),
+                session_file: file.into(),
+                updated_at: crate::state::now_epoch(),
+            });
+        };
+        let t0 = crate::usage::ctx_guard_now(&daemon);
+        let at = |file: &str, pct: u8, t: f64| {
+            obs(file, pct);
+            maybe_fire_context_threshold_at(&daemon, &s, pct, "statusline", Some("claude"), t);
+        };
+        at("/p/a/A.jsonl", 70, t0 + 5.9);
+        at("/p/a/A.jsonl", 71, t0 + 200.0);
+        at("/p/a/B.jsonl", 27, t0 + 401.0); // 오너 손 /clear — 새 세션
+        at("/p/a/B.jsonl", 39, t0 + 900.0);
+        let mut t = t0 + 1000.0;
+        while t < t0 + 4000.0 {
+            crate::usage::ctx_guard_tick_at(&daemon, &s, t);
+            t += 2.0;
+        }
+        assert_eq!(threshold_events(&daemon, node).len(), 1, "죽은 세션의 값으로 재발화했다");
+        assert!(named_events(&daemon, node, "context.clear_ineffective").is_empty());
+        assert!(
+            !daemon.feed_items.lock().unwrap().iter().any(|f| f.surface_id == Some(node) && f.title.contains("다시 임계를 넘었다")),
+            "오진 feed"
+        );
+        // 음성 대조 — 보고가 끊긴 좌석(다른 좌석)은 마지막 관측으로 재통보 · 관측 나이.
+        let n2 = make_surface(&daemon, Some("master"));
+        let s2 = daemon.get_surface(n2).unwrap();
+        maybe_fire_context_threshold_at(&daemon, &s2, 72, "statusline", Some("claude"), t0);
+        crate::usage::ctx_guard_tick_at(&daemon, &s2, t0 + 2_100.001);
+        let evs = threshold_events(&daemon, n2);
+        assert_eq!(evs.len(), 2, "{evs:?}");
+        assert_eq!((evs[1]["payload"]["context_pct"].clone(), evs[1]["payload"]["source"].clone()), (json!(72), json!("held-retry")));
+        assert!(evs[1]["payload"]["observed_age_secs"].as_u64().is_some_and(|a| (2_099..=2_101).contains(&a)), "{}", evs[1]["payload"]);
+        assert_eq!((evs[0]["payload"]["observed_age_secs"].clone(), evs[0]["payload"]["redelivery"].clone()), (json!(0), json!(false)));
+    }
+
     #[cfg(unix)]
     /// `surface.cycle_claim` — 산 점유가 있으면 busy · 그 통보 뒤 사이클이 이미 끝났으면 stale · 죽은 pid 점유는 버린다 · 해제는
     /// 점유자만. 실패 방향: 붉어지면 같은 통보가 두 번 집행되거나(①) 점유가 굳어 사이클이 막힌다(②).
@@ -20427,6 +20578,117 @@ mod tests {
         assert_eq!(claim(Some(me), json!({"fire_id": fire_id})), json!("stale"));
         // 다른 세대의 번호는 판정하지 않는다(실패 방향 = 집행).
         assert_eq!(claim(Some(me), json!({"fire_id": format!("1:{node}:1")})), json!("claimed"));
+    }
+
+    /// ★(RR2-ROLE-2) 단일 비행 점유는 관측할 수 있고(`cys status --json` 좌석 행 `ctx_guard.claim` — holder_pid·since·fire_id),
+    /// 집행 시도가 사이클을 끝내지 못하고 물러나면(0~4단계 실패 = 표지 없이 점유 해제 · clear 안 됨 끔 뒤 해제 · 점유자 사망) 그
+    /// 통보가 아직 미해결(Awaiting)일 때 데몬이 **같은 통보를 한 번** 다시 알린다(`context.threshold` · 같은 fire_id ·
+    /// `redelivery: true` · 새 발화 아님). rc 88 을 받은 집행자(CSO·master)는 턴 안에서 기다리거나 폴링하지 않는다 — 재배달이 곧
+    /// 다음 판정의 계기다. 실패 방향: 붉어지면 점유자가 clear 전에 실패한 통보를 아무도 다시 집행하지 않아 시한(1200초)·잠정
+    /// 보류(+900초) 뒤 재발화까지 방치되고 거짓 no_cycle strike 가 붙는다(드릴 rr2-C88 · clear 2134.8초 — 대조 632.1초).
+    #[cfg(unix)]
+    #[test]
+    fn claim_is_observable_and_an_attempt_that_ends_without_a_cycle_redelivers_once() {
+        let _pack = crate::governance::HOutsidePack::new(); // 팩 격리(ACL 경합 없음) — 좌석 전에
+        let daemon = isolated_daemon(); // 상태 폴더 격리(동결·영속 공유 없음)
+        let node = make_surface(&daemon, Some("master"));
+        let s = daemon.get_surface(node).unwrap();
+        let me = std::process::id();
+        let other = std::os::unix::process::parent_id();
+        let claim = |pid: Option<u32>, extra: Value| {
+            let mut p = json!({"surface_id": node});
+            if let Some(o) = extra.as_object() {
+                for (k, v) in o {
+                    p[k] = v.clone();
+                }
+            }
+            rpc_call(&daemon, "surface.cycle_claim", p, pid)["result"]["claim"].clone()
+        };
+        usage_report(&daemon, node, json!({"ctx_pct": 75, "ctx_window": 200000, "session_file": "/p/a/A.jsonl"}), None);
+        let fire_id = threshold_events(&daemon, node)[0]["payload"]["fire_id"].as_str().unwrap().to_string();
+        assert_eq!(crate::usage::ctx_guard_wire(&daemon, &s)["claim"], Value::Null, "점유 없음");
+        // 점유자(autopilot 흉내)가 잡는다 — 좌석 행에 보인다.
+        assert_eq!(claim(Some(me), json!({"fire_id": fire_id})), json!("claimed"));
+        let w = crate::usage::ctx_guard_wire(&daemon, &s);
+        assert_eq!((w["claim"]["holder_pid"].clone(), w["claim"]["fire_id"].clone()), (json!(me), json!(fire_id)), "{w}");
+        assert!(w["claim"]["since"].as_f64().is_some_and(|t| (t - crate::state::now_epoch()).abs() < 60.0), "{w}");
+        assert_eq!(claim(Some(other), json!({"fire_id": fire_id})), json!("busy"), "다른 집행자(CSO)는 busy");
+        assert_eq!(threshold_events(&daemon, node).len(), 1, "busy 는 재배달 사유가 아니다(점유자가 아직 산다)");
+        // 점유자가 표지 없이(저장 검증 실패 등) 물러난다 → 같은 통보 재배달 1회.
+        assert_eq!(claim(Some(me), json!({"release": true})), json!("released"));
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 2, "clear 전에 물러난 시도 뒤 미해결 통보가 다시 알려지지 않았다: {evs:?}");
+        let p = &evs[1]["payload"];
+        assert_eq!((p["fire_id"].clone(), p["redelivery"].clone()), (json!(fire_id), json!(true)), "{p}");
+        assert_eq!(p["context_pct"], json!(75));
+        assert_eq!(
+            crate::alert_route::summarize_payload("context.threshold", p),
+            format!("role=master context=75% threshold=60% fire={fire_id} redelivery"),
+            "CSO 가 받는 경보 요약에 재배달 표지가 없다"
+        );
+        assert_eq!(crate::usage::ctx_guard_wire(&daemon, &s)["claim"], Value::Null);
+        assert_eq!(s.ctx_loop_guard.lock().unwrap().seq, 1, "재배달은 새 발화가 아니다(I1 무관)");
+        // 두 번째 실패 — 같은 통보는 한 번만 다시 알린다(재배달 고리 없음).
+        assert_eq!(claim(Some(me), json!({"fire_id": fire_id})), json!("claimed"));
+        claim(Some(me), json!({"release": true}));
+        assert_eq!(threshold_events(&daemon, node).len(), 2, "같은 통보를 두 번 재배달했다");
+        // 새 발화 → clear 안 됨 끔(rc 80·85) 뒤 해제도 미해결 — 재배달 1회. 사이클이 끝난 뒤의 해제는 재배달하지 않는다.
+        let t0 = crate::usage::ctx_guard_now(&daemon);
+        {
+            let mut g = s.ctx_loop_guard.lock().unwrap();
+            g.cycle_on(t0, false);
+            g.cycle_off(crate::usage::clear_guard::Outcome::Cleared, t0 + 1.0, false);
+        }
+        maybe_fire_context_threshold_at(&daemon, &s, 70, "statusline", Some("claude"), t0 + 5.0);
+        let _ = s.ctx_loop_guard.lock().unwrap().tick(t0 + 700.0, false);
+        maybe_fire_context_threshold_at(&daemon, &s, 70, "statusline", Some("claude"), t0 + 710.0); // 접기
+        maybe_fire_context_threshold_at(&daemon, &s, 80, "statusline", Some("claude"), t0 + 720.0);
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 3, "{evs:?}");
+        let fid2 = evs[2]["payload"]["fire_id"].as_str().unwrap().to_string();
+        assert_eq!(claim(Some(me), json!({"fire_id": fid2})), json!("claimed"));
+        rpc_call(&daemon, "surface.quiesce", json!({"surface_id": node, "on": true}), None);
+        rpc_call(&daemon, "surface.quiesce", json!({"surface_id": node, "on": false, "outcome": "not_cleared"}), None);
+        claim(Some(me), json!({"release": true}));
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 4, "clear 안 됨 끔 뒤 해제가 재배달하지 않았다: {evs:?}");
+        assert_eq!((evs[3]["payload"]["fire_id"].clone(), evs[3]["payload"]["redelivery"].clone()), (json!(fid2), json!(true)));
+        assert_eq!(claim(Some(me), json!({"fire_id": fid2})), json!("claimed"));
+        rpc_call(&daemon, "surface.quiesce", json!({"surface_id": node, "on": true}), None);
+        rpc_call(&daemon, "surface.quiesce", json!({"surface_id": node, "on": false, "outcome": "cleared"}), None);
+        claim(Some(me), json!({"release": true}));
+        assert_eq!(threshold_events(&daemon, node).len(), 4, "끝난 사이클 뒤 해제가 재배달했다(중복 사이클)");
+        // 첫 시도로 사이클이 끝난 통보(재배달 이력 없음)도 끝난 뒤 해제는 재배달하지 않는다.
+        let n3 = make_surface(&daemon, Some("master"));
+        usage_report(&daemon, n3, json!({"ctx_pct": 75, "ctx_window": 200000, "session_file": "/p/c/C.jsonl"}), None);
+        let f4 = threshold_events(&daemon, n3)[0]["payload"]["fire_id"].as_str().unwrap().to_string();
+        let claim3 = |extra: Value| {
+            let mut p = json!({"surface_id": n3});
+            for (k, v) in extra.as_object().unwrap() {
+                p[k] = v.clone();
+            }
+            rpc_call(&daemon, "surface.cycle_claim", p, Some(me))["result"]["claim"].clone()
+        };
+        assert_eq!(claim3(json!({"fire_id": f4})), json!("claimed"));
+        rpc_call(&daemon, "surface.quiesce", json!({"surface_id": n3, "on": true}), None);
+        rpc_call(&daemon, "surface.quiesce", json!({"surface_id": n3, "on": false, "outcome": "cleared"}), None);
+        assert_eq!(claim3(json!({"release": true})), json!("released"));
+        assert_eq!(threshold_events(&daemon, n3).len(), 1, "첫 시도로 끝난 사이클 뒤 해제가 재배달했다(중복 사이클)");
+        // 점유자가 죽으면(Drop 없이) 수집기 틱이 그 점유를 버리고 미해결 통보를 재배달한다.
+        let n2 = make_surface(&daemon, Some("master"));
+        let s2 = daemon.get_surface(n2).unwrap();
+        usage_report(&daemon, n2, json!({"ctx_pct": 75, "ctx_window": 200000, "session_file": "/p/b/B.jsonl"}), None);
+        let f3 = threshold_events(&daemon, n2)[0]["payload"]["fire_id"].as_str().unwrap().to_string();
+        let dead = exited_pid();
+        assert_eq!(
+            rpc_call(&daemon, "surface.cycle_claim", json!({"surface_id": n2, "fire_id": f3}), Some(dead))["result"]["claim"],
+            json!("claimed")
+        );
+        crate::usage::ctx_guard_tick(&daemon, &s2);
+        let evs = threshold_events(&daemon, n2);
+        assert_eq!(evs.len(), 2, "죽은 점유자의 미해결 통보가 재배달되지 않았다: {evs:?}");
+        assert_eq!(evs[1]["payload"]["redelivery"], json!(true));
+        assert_eq!(crate::usage::ctx_guard_wire(&daemon, &s2)["claim"], Value::Null, "죽은 점유가 좌석 행에 남았다");
     }
 
     /// 겹친 보고(상태줄 프로세스 둘 · transcript 수집기)가 같은 교차를 동시에 보고해도 발화는 1회 — 판정은 가드 락 하나 안.
