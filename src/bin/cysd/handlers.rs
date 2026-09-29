@@ -2396,7 +2396,7 @@ fn draft_gate_denied_response(
 /// ③(10ms)은 너무 얕고 ④(400ms)는 대화형 체감을 해친다 — 직접 경로용으로 그 사이,
 /// clear_first 의 settle(150ms)과 같은 자릿수를 택했다. 이 값은 **상한이 아니라 하한**이다:
 /// 이미 그만큼 지난 뒤 온 Return 은 손대지 않는다(무지연).
-fn cr_min_gap_ms() -> u64 {
+pub(crate) fn cr_min_gap_ms() -> u64 {
     std::env::var("CYS_CR_MIN_GAP_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -2461,8 +2461,9 @@ const SEND_SETTLE_RETRY_MIN_MS: u64 = 25;
 
 /// ★(S21-SETTLE) 킬 스위치 — env `CYS_SEND_SETTLE` 가 0/false/off 이거나, 데몬 상태 디렉터리(`state::state_dir(socket)` —
 /// 레인 격리)에 `send-settle-off` 가 있으면 끈다(재기동 불요). 파일 판정: 있음 → 끔 · 없음(NotFound) → 켬 · 그 밖의
-/// 오류 → 끔. 실패 방향은 0.14.42 A2 트리 동작(분리 보류·증명 0)이다. 호출은 에이전트 좌석 Text 직접 send 때만.
-fn send_settle_disabled(daemon: &Daemon) -> bool {
+/// 오류 → 끔. 실패 방향은 0.14.42 A2 트리 동작(분리 보류·증명 0)이다. 호출은 에이전트 좌석 Text 직접 send · 비면제 제출
+/// Return 의 보류 탐침 인계 · 보류 CR 재제출(governance `resubmit_withheld_submits` — 보류 기록이 있는 좌석만) 때뿐이다.
+pub(crate) fn send_settle_disabled(daemon: &Daemon) -> bool {
     if cys::send_settle_env_off(std::env::var("CYS_SEND_SETTLE").ok().as_deref()) {
         return true;
     }

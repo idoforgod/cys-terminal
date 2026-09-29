@@ -1063,6 +1063,21 @@ pub struct InjectTrack {
     submit_written_ms: AtomicU64,
     /// 지금 Inject arm 이 시작된 정착 단조 ms(0 = 없음) — `began_at` 의 원자 사본(게이트 안 판독용 · 신선도 상한).
     inject_began_ms: AtomicU64,
+    /// ★(0.14.42 · 수정 2회차 F1 · 재개) 보류한 제출 CR — [`WithheldSubmit`]. 쓰기 = writer 의 보류 탐침(적중 시) · 소비·폐기 =
+    /// watchdog 틱의 재제출(`governance::resubmit_withheld_submits`). leaf 락(다른 락을 쥔 채 잡지 않는다).
+    withheld: Mutex<Option<WithheldSubmit>>,
+}
+
+/// ★(0.14.42 · 수정 2회차 F1 · 재개) 쓰지 않은(보류한) 제출 CR 의 기록 — 보류는 **버림이 아니라 미룸**이다. 창이 닫히고
+/// 입력줄이 그대로 그 기계 본문이면 데몬이 그 CR 을 한 번 다시 쓴다(`governance::resubmit_withheld_submits`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WithheldSubmit {
+    /// 보류한 단조 시각(기록 식별 · 상한 판정).
+    pub(crate) at: Instant,
+    /// 보류 때 입력줄에 있던 마지막 기계 본문의 기록 시각([`MachineBody::at`]) — 그 뒤 새 기계 본문이 오면 기록은 낡았다.
+    pub(crate) body_at: Instant,
+    /// 보류한 Return 의 발신 좌석(이벤트 표기).
+    pub(crate) from: Option<u64>,
 }
 
 /// ★(0.14.42 · S21-SETTLE) 좌석 제출 정착 판정의 단조 시계(ms) — 프로세스 기준점 경과 + 1(0 은 '없음' 표지).
@@ -1222,6 +1237,27 @@ impl InjectTrack {
     /// ★(R3SH-1) 마지막 기계 본문 기록(없으면 None).
     pub(crate) fn last_body(&self) -> Option<MachineBody> {
         self.last_body.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// ★(F1 · 재개) 보류 탐침 전용 — 보류 기록(덮어쓰기: 가장 최근 보류가 입력줄의 현재 사실이다).
+    pub(crate) fn note_withheld(&self, w: WithheldSubmit) {
+        *self.withheld.lock().unwrap_or_else(|e| e.into_inner()) = Some(w);
+    }
+
+    /// ★(F1 · 재개) 보류 기록(없으면 None).
+    pub(crate) fn withheld(&self) -> Option<WithheldSubmit> {
+        *self.withheld.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// ★(F1 · 재개) 그 기록(`at`)이 아직 남아 있을 때만 지운다 — 그 사이 새 보류가 섰으면 건드리지 않는다. 지웠으면 true.
+    pub(crate) fn clear_withheld_if(&self, at: Instant) -> bool {
+        let mut g = self.withheld.lock().unwrap_or_else(|e| e.into_inner());
+        if g.is_some_and(|w| w.at == at) {
+            *g = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// 지금 Inject arm 이 쓰는 중이거나, 마지막 arm 이 끝난 지 `within` 이 안 됐는가.

@@ -198,6 +198,9 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_load(&daemon, &mut last_load_alert);
                 check_surfaces(&daemon, &sys, &mut last_dup_alert, &mut last_proc_alert);
                 check_idle(&daemon);
+                // ★(0.14.42 · 수정 2회차 F1 · 재개) 보류한 제출 CR 의 재제출 — 큐 배달 **앞**(입력줄 잔여가 그 좌석 큐를
+                //   세우지 않게). pause 중에는 아무것도 하지 않는다(기록 유지).
+                resubmit_withheld_submits(&daemon);
                 deliver_queued(
                     &daemon,
                     &mut queue_depth_alerted,
@@ -5371,6 +5374,15 @@ pub(crate) fn submit_cr_withhold_probe(
             if !observe_submit_cr_hits_dialog(&s, &markers) {
                 return false;
             }
+            // ★(재개 S91) 보류는 미룸이다 — 입력줄에 남는 기계 본문을 기록해 창이 닫힌 뒤 watchdog 틱이 이 CR 을 한 번 다시
+            //   쓴다([`resubmit_withheld_submits`]). 기계 본문 기록이 없으면(빈 줄 위 Return) 다시 쓸 것이 없다.
+            if let Some(b) = s.inject_track.last_body() {
+                s.inject_track.note_withheld(crate::state::WithheldSubmit {
+                    at: std::time::Instant::now(),
+                    body_at: b.at,
+                    from,
+                });
+            }
             d.bus.publish(
                 "queue.submit_withheld",
                 "queue",
@@ -5382,14 +5394,159 @@ pub(crate) fn submit_cr_withhold_probe(
                     "from": from.map(cys::surface_ref),
                     "handed_ms_ago": handed.elapsed().as_millis() as u64,
                     "note": "제출 Return 을 넘긴 뒤 질문·선택 창이 전경이 됐다 — 그 CR 을 쓰지 않았다(쓰면 창의 기본 \
-                             선택지를 누른다). 본문은 입력줄에 미제출로 남는다(CR 삼킴 잔여와 같은 상태). 창을 먼저 \
-                             처리하라 — 보이는 창에 대한 Return 은 종전처럼 쓴다.",
+                             선택지를 누른다). 본문은 입력줄에 미제출로 남는다. 창이 닫히고 입력줄이 그 본문 그대로면 \
+                             데몬이 그 CR 을 한 번 다시 쓴다(queue.submit_resubmitted). 보이는 창에 대한 Return 은 \
+                             종전처럼 쓴다.",
                 }),
             );
             true
         }))
         .unwrap_or(false)
     })
+}
+
+/// ★(0.14.42 · 수정 2회차 F1 · 재개 S91) 보류한 제출 CR 의 **재제출** — watchdog 틱(5초)마다 한 번(큐 배달 앞).
+///
+/// 【왜】 보류한 CR 은 writer 가 버려 본문이 입력줄에 남는다. 큐 틱은 화면 입력줄 점유를 사람 초안과 똑같이 보아
+/// (`BLOCKED_INPUT_PENDING`) 그 좌석의 큐를 통째로 세운다 — S91 dialog 폭풍 실측(88a63e22 · ba2bc1f3): 잔여 1건 뒤
+/// 150초 동안 큐 배달 0(수정 전 판은 같은 조건 10건). 보류는 **버림이 아니라 미룸**이어야 한다(적대 검증 F1 의 권고
+/// 'hold it or drop it' 중 hold).
+/// 【규칙】 창이 닫히고 입력줄이 여전히 그 기계 본문 그대로면 그 CR 을 **한 번** 다시 쓴다. 조건 — kill-switch pause 아님
+/// (pause 는 배달 동결 · 기록은 둔다) · 사이클 창(quiescing) 아님 · 킬 스위치(`CYS_SEND_SETTLE=0`) 꺼짐 · 탐침 등급 Off 아님 ·
+/// 기록 뒤 새 기계 본문 없음 · 사람 바이트·그 뒤 사람 입력 없음 · 커서행이 그 본문으로 설명됨 · 창·승인 대기 없음 · 큐와
+/// 같은 프롬프트 경계 판정(입력줄 점유 축만 뺀다 — 점유의 주인이 바로 이 본문이다)이 통과. 쓰기는 제출 CR 과 같은 길
+/// (`SubmitAfterGap` · 최소 간격 · 쓰기 직전 보류 탐침 — 그 사이 창이 다시 뜨면 또 보류하고 기록이 다시 선다)이고
+/// input_gate 안에서 넘긴다(직접 send 와 직렬). 기록이 무효가 되면(새 기계 본문 · 사람 손 · 입력줄 비었음 · 등급 Off ·
+/// 킬 스위치 · 상한 = 큐 TTL) 지우고 사유를 1건 발행한다(`queue.submit_withheld_dropped`). 폭주 0: 기록 1건 = 쓰기 최대 1회.
+pub(crate) fn resubmit_withheld_submits(daemon: &Arc<Daemon>) {
+    if daemon.paused.load(Ordering::Relaxed) {
+        return;
+    }
+    let seats: Vec<Arc<crate::state::Surface>> = daemon
+        .surfaces
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|s| s.inject_track.withheld().is_some())
+        .cloned()
+        .collect();
+    for s in seats {
+        let _ = resubmit_withheld_one(daemon, &s);
+    }
+}
+
+/// [`resubmit_withheld_submits`] 의 좌석 1개 — 반환 = 결과 표지(검체·로그용).
+fn resubmit_withheld_one(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> &'static str {
+    let Some(w) = s.inject_track.withheld() else {
+        return "none";
+    };
+    let drop_it = |why: &'static str| -> &'static str {
+        if s.inject_track.clear_withheld_if(w.at) {
+            daemon.bus.publish(
+                "queue.submit_withheld_dropped",
+                "queue",
+                Some(s.id),
+                json!({
+                    "surface_ref": cys::surface_ref(s.id),
+                    "reason": why,
+                    "from": w.from.map(cys::surface_ref),
+                    "withheld_ms_ago": w.at.elapsed().as_millis() as u64,
+                    "note": "보류한 제출 CR 을 다시 쓰지 않는다 — 입력줄의 본문은 그대로 둔다(사람·다음 주입이 처리).",
+                }),
+            );
+        }
+        why
+    };
+    let ttl = crate::state::queue_ttl_default_secs();
+    if ttl > 0 && w.at.elapsed().as_secs() >= ttl {
+        return drop_it("expired");
+    }
+    if crate::handlers::send_settle_disabled(daemon) {
+        return drop_it("kill_switch");
+    }
+    let scope = submit_guard_scope(s);
+    if scope == SubmitGuardScope::Off {
+        return drop_it("seat_off");
+    }
+    let Some(body) = s.inject_track.last_body() else {
+        return drop_it("newer_body");
+    };
+    if body.at != w.body_at {
+        return drop_it("newer_body");
+    }
+    let human_bytes = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+    let human_after =
+        s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| t > body.at);
+    if human_bytes != 0 || human_after {
+        return drop_it("human");
+    }
+    if effective_quiescing_since(daemon, s).is_some() {
+        return "wait_quiescing";
+    }
+    let adapters = load_adapter_defs();
+    let Some((markers, placeholder)) = surface_prompt_marker(s, &adapters) else {
+        return drop_it("unobservable");
+    };
+    if markers.is_empty() {
+        return drop_it("unobservable");
+    }
+    let obs = observe_prompt(s, &markers);
+    let dialog = match scope {
+        SubmitGuardScope::Full => obs_modal_foreground(&obs),
+        SubmitGuardScope::SelectorRowOnly => obs.selector_row,
+        SubmitGuardScope::Off => false,
+    };
+    if dialog || approval_or_gate_pending(daemon, s.id) {
+        return "wait_dialog";
+    }
+    let before = obs.line.as_ref().map(|(b, _)| b.as_str());
+    if !composer_line_is_machine_body(before, Some(body.norm.as_str())) {
+        // 커서행이 선두 마커 뒤 빈 줄이면 누가 이미 제출·정리했다 — 기록은 끝났다. 그 밖(작업 출력 중 · 커서가 딴 데)은 기다린다.
+        if before.is_some_and(|b| crate::state::normalize_input_text(b).is_empty()) {
+            return drop_it("line_empty");
+        }
+        return "wait_line";
+    }
+    let mut gate = prompt_gate_input(daemon, s, obs.marker.as_str(), placeholder.as_deref(), &obs);
+    gate.input = InputLine::Empty;
+    if prompt_gate_verdict(&gate) != PromptGate::Ready {
+        return "wait_prompt";
+    }
+    {
+        let _gate = s.input_gate.lock().unwrap();
+        // 게이트 안 재확인(원자·leaf 판독뿐) — 관측과 인계 사이에 직접 send·사람 키가 끼었으면 이번 틱은 쓰지 않는다.
+        if s.inject_track.last_body().map(|b| b.at) != Some(w.body_at)
+            || s.pending_input_bytes.load(Ordering::Relaxed) != 0
+            || !s.inject_track.clear_withheld_if(w.at)
+        {
+            return "raced";
+        }
+        let probe = submit_cr_withhold_probe(daemon, s, markers, "resubmit", w.from);
+        let req = crate::state::WriteReq::SubmitAfterGap {
+            bytes: b"\r".to_vec(),
+            min_gap_ms: crate::handlers::cr_min_gap_ms(),
+            withhold: Some(probe),
+        };
+        s.inject_track.submit_handed();
+        if s.write_tx.try_send(req).is_err() {
+            s.inject_track.submit_hand_failed();
+            s.inject_track.note_withheld(w); // 인계 실패 — 기록을 되살려 다음 틱이 다시 본다
+            return "write_failed";
+        }
+        s.apply_pending_input(b"\r", InputOrigin::Machine);
+    }
+    daemon.bus.publish(
+        "queue.submit_resubmitted",
+        "queue",
+        Some(s.id),
+        json!({
+            "surface_ref": cys::surface_ref(s.id),
+            "from": w.from.map(cys::surface_ref),
+            "withheld_ms_ago": w.at.elapsed().as_millis() as u64,
+            "note": "창이 닫히고 입력줄이 보류한 기계 본문 그대로라 그 제출 CR 을 다시 썼다(쓰기 직전 창이 다시 뜨면 또 보류).",
+        }),
+    );
+    "resubmitted"
 }
 
 // ═══════════ ★(0.14.42 · 설계 H0) 게이트 없는 데몬 내부 주입자의 공용 하드축 판정 ═══════════
@@ -20859,6 +21016,23 @@ mod reflect_queue_tests {
         s.agent_exit_notified.store(true, Ordering::Relaxed);
         assert!(!probe(), "에이전트가 죽은 좌석의 모달 잔상은 창이 아니다(셸 전경)");
         let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+    }
+
+    /// ★(0.14.42 · 수정 2회차 F1 · 재개 S91) 배선 핀 — watchdog 틱이 보류 CR 재제출을 좌석 캐시 갱신 **뒤** · 큐 배달
+    /// **앞**에 부른다(입력줄 잔여가 그 틱의 큐를 입력줄 점유로 세우지 않게 · 좌석 등급은 갓 갱신된 캐시로 본다).
+    #[test]
+    fn f1_resubmit_wired_into_watchdog_tick_before_queue_delivery() {
+        let src = include_str!("governance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let tick = &prod[prod.find("refresh_seat_cache(&daemon, &sys);").expect("틱 앵커(좌석 캐시 갱신)")..];
+        let re = tick.find("resubmit_withheld_submits(&daemon);").expect("보류 CR 재제출 배선 소실");
+        let dq = tick.find("deliver_queued(").expect("큐 배달");
+        assert!(re < dq, "재제출은 큐 배달 앞이다");
+        let body = &prod[prod.find("fn resubmit_withheld_submits(").expect("재제출 본체")..];
+        let body = &body[..body.find("\nfn resubmit_withheld_one(").expect("좌석 함수")];
+        let paused = body.find("daemon.paused.load(").expect("pause 판정");
+        let any = body.find("resubmit_withheld_one(").expect("좌석 순회");
+        assert!(paused < any, "pause 판정이 좌석 순회보다 앞이어야 한다(kill-switch 약화 금지)");
     }
 
     /// ★(0.14.42 · 수정 2회차 F1 · 재개 S94) 좌석 캐시는 watchdog 틱(5초)에만 갱신된다 — 에이전트가 앉기 **전** 틱의

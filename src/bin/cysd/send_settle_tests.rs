@@ -534,6 +534,97 @@ fn f1_submit_cr_withheld_on_stale_empty_seat_before_first_agent_sighting() {
     assert_eq!(ev.len(), 1, "보류 사실 1건: {ev:?}");
 }
 
+fn named(fx: &Fx, name: &str) -> Vec<Value> {
+    fx.daemon.bus.tail(400).into_iter().filter(|e| e["name"] == name).collect()
+}
+
+/// X 의 본문 → 권한 창 → X 의 짝 Return(보류)까지 만든 좌석. 반환 = 보류 뒤 관측(쓴 시각 없음 확인 끝).
+fn withheld_seat(fx: &Fx, pid: u32) -> Arc<Surface> {
+    let t = agent_pane_settled(fx, "worker-1", pid);
+    let _x = pane(fx, "worker-2", pid + 1);
+    assert_eq!(direct(fx, Some(pid + 1), &t, "M|x|AAA")["ok"], json!(true));
+    std::thread::sleep(Duration::from_millis(60));
+    paint(&t, &DIALOG, 1, 8);
+    assert_eq!(pair_return(fx, Some(pid + 1), &t)["result"]["sent"], json!(true));
+    let o = wait_submit_consumed(&t);
+    assert_eq!(o.since_written_ms, None, "전제: 창 위 제출 CR 은 보류된다: {o:?}");
+    assert_eq!(withheld(fx).len(), 1, "전제: 보류 1건");
+    t
+}
+
+/// 입력줄이 우리 본문 그대로인 유휴 composer(창이 닫힌 뒤의 화면).
+fn paint_own_composer(t: &Arc<Surface>) {
+    paint(t, &["────────", "❯ M|x|AAA", "────────"], 1, 11);
+}
+
+/// 적색→녹색(재개 · S91 dialog 실측): 보류한 제출 CR 은 **버림이 아니라 미룸**이다. 창이 닫히고 입력줄이 그 기계 본문
+/// 그대로면 watchdog 틱이 그 CR 을 **한 번** 다시 쓴다. 종전(88a63e22)에는 본문이 입력줄에 남아 큐 틱이 입력줄 점유로
+/// 그 좌석을 통째로 세웠다(S91 dialog 폭풍: 150초 동안 큐 배달 0 · 수정 전 판 10건).
+#[test]
+fn f1_withheld_submit_is_resubmitted_once_after_dialog_closes() {
+    let fx = fx("f1-resubmit");
+    let t = withheld_seat(&fx, P + 180);
+    // 창이 아직 떠 있으면 다시 쓰지 않는다(기록은 남긴다).
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(settle_obs(&t).since_written_ms, None, "창이 떠 있는데 보류 CR 을 다시 썼다 — 오승인");
+    assert!(named(&fx, "queue.submit_resubmitted").is_empty());
+    // 창이 닫히고 입력줄이 우리 본문 그대로 — 한 번 다시 쓴다.
+    paint_own_composer(&t);
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "창이 닫힌 뒤에도 보류 CR 을 다시 쓰지 않았다 — 입력줄 잔여로 큐가 선다: {o:?}");
+    let ev = named(&fx, "queue.submit_resubmitted");
+    assert_eq!(ev.len(), 1, "재제출 1건: {ev:?}");
+    assert_eq!(ev[0]["payload"]["surface_ref"], json!(cys::surface_ref(t.id)), "{ev:?}");
+    // 한 번뿐이다(기록 소비) — TUI 가 그 CR 을 삼켜 입력줄이 그대로여도 다시 쓰지 않는다(5초 틱마다 CR 을 되풀이하는 폭주 0).
+    std::thread::sleep(Duration::from_millis(200));
+    paint_own_composer(&t);
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(named(&fx, "queue.submit_resubmitted").len(), 1, "보류 CR 을 두 번 썼다");
+}
+
+/// 음성 대조: kill-switch pause 중에는 다시 쓰지 않고(기록 유지 — resume 뒤 재개), 사람 손이 닿은 줄은 버린다(사람 몫).
+#[test]
+fn f1_withheld_submit_waits_for_resume_and_yields_to_human() {
+    let fx = fx("f1-resubmit-guard");
+    let t = withheld_seat(&fx, P + 190);
+    paint_own_composer(&t);
+    fx.daemon.paused.store(true, Ordering::SeqCst);
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(settle_obs(&t).since_written_ms, None, "pause 중에 보류 CR 을 썼다 — kill-switch 약화");
+    fx.daemon.paused.store(false, Ordering::SeqCst);
+    // 사람이 본문 뒤에 손을 댔다 — 그 줄은 이제 사람 몫이다(쓰지 않고 기록을 버린다).
+    *t.last_human_input.lock().unwrap() = Some(Instant::now());
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(settle_obs(&t).since_written_ms, None, "사람 손이 닿은 줄에 보류 CR 을 썼다");
+    let d = named(&fx, "queue.submit_withheld_dropped");
+    assert_eq!(d.len(), 1, "버린 사실 1건: {d:?}");
+    assert_eq!(d[0]["payload"]["reason"], json!("human"), "{d:?}");
+    *t.last_human_input.lock().unwrap() = None;
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(named(&fx, "queue.submit_resubmitted").is_empty(), "버린 기록이 되살아났다");
+}
+
+/// 음성 대조: 보류 뒤 새 기계 본문이 들어왔으면(데몬 주입의 병합 제출 · 다른 send) 그 기록은 낡았다 — 버린다.
+#[test]
+fn f1_withheld_submit_dropped_after_newer_machine_body() {
+    let fx = fx("f1-resubmit-newer");
+    let t = withheld_seat(&fx, P + 200);
+    t.inject_track.note_body("M|y|BBB", None);
+    paint(&t, &["────────", "❯ M|x|AAA", "────────"], 1, 11);
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(settle_obs(&t).since_written_ms, None, "낡은 보류 기록으로 CR 을 썼다");
+    let d = named(&fx, "queue.submit_withheld_dropped");
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0]["payload"]["reason"], json!("newer_body"), "{d:?}");
+}
+
 /// 음성 대조(③ 방향): 에이전트를 **본 뒤**의 `Empty`(사망 · 종료 통지 전) 좌석은 종전 — 창 잔상이 있어도 쓴다.
 #[test]
 fn f1_seat_empty_after_agent_was_seen_is_unchanged() {
