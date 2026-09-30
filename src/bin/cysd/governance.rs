@@ -6166,6 +6166,15 @@ pub(crate) fn release_quiescing(daemon: &Arc<Daemon>, s: &crate::state::Surface,
             json!({"surface_id": s.id, "quiescing": false, "reason": reason, "owner_pid": owner.map(|(p, _)| p),
                    "note": "사이클 창 표지를 데몬이 풀었다(세운 호출자 사망 · 에이전트 종료·재기동) — 큐·주기 신호가 곧바로 재개된다"}),
         );
+        // ★(0.14.42 · clear 가드 v3) 데몬이 푼 것도 사이클 표지의 끝이다(소유자 사망·에이전트 재기동) — 가드는 수준을 다시 잰다.
+        //   결과는 모른다(clear 전에 죽었을 수도 · 뒤에 죽었을 수도 — `Outcome::Unknown` · feed 는 clear 를 단정하지 않는다).
+        //   agent_status 락은 위에서 놓았다(가드 락은 말단) · 발행은 가드 락 밖.
+        let out = s.ctx_loop_guard.lock().unwrap_or_else(|e| e.into_inner()).cycle_off(
+            crate::usage::clear_guard::Outcome::Unknown,
+            crate::usage::ctx_guard_now(daemon),
+            daemon.paused.load(Ordering::Relaxed),
+        );
+        crate::handlers::publish_ctx_guard(daemon, s, out, "cycle-marker", None);
     }
     released
 }

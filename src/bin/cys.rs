@@ -189,8 +189,11 @@ enum Command {
     /// 대상 턴 종료·빈 composer 확인→입력버퍼 정리+clear→clear 실효 확인→디렉티브·재개 포인터 재주입.
     /// exit: 0=실효 확인 · 80=실효 미관측(재주입 0건) · 81=실효 측정 불능 · 82/83=검증자 충돌·미해소 ·
     /// 84=대상이 유휴가 되지 않음(clear 송신 0건) · 85=사람 초안 보호(clear 송신 0건).
-    /// 84·85 는 clear 송신 0건 비파괴 보류(원자 clear 거부는 composer 무변경 · launch-agent 미등록 좌석의 3분할 폴백에서만 C-u 1키가 선행하거나 Return 거부로 clear 본문이 composer에 남을 수 있다) — autopilot 이 쿨다운 뒤 자동 재시도한다.
+    /// 84·85 는 clear 송신 0건 비파괴 보류(원자 clear 거부는 composer 무변경 · launch-agent 미등록 좌석의 3분할 폴백에서만 C-u 1키가 선행하거나 Return 거부로 clear 본문이 composer에 남을 수 있다) — autopilot 이 쿨다운 뒤 자동 재시도한다(5단계 85 도 사이클 표지 끔에 'clear 안 됨'을 실어 그 통보가 미해결로 남는다 · 80 도 같은 결과를 실어 같은 --fire 재집행이 가능하다).
     /// 86=실효 확인 뒤 재주입 보류: clear 는 이미 발효했다 — 손으로 다시 clear 하지 말고 재주입만 확인한다.
+    /// 87=건너뜀(송신 0건): --fire 의 통보 뒤 그 좌석의 사이클이 이미 끝났다 — 재집행하지 않는다.
+    /// 88=진행 중(송신 0건): 다른 집행자의 사이클이 진행 중이다(--fire 가 있으면 단일 전체 시한이 남기는 만큼 — 기본 --timeout 120 에서 최대 30초 — 끝나기를 기다린 뒤) — 이미 처리됨이 아니다. 턴 안에서 기다리거나 곧바로 재집행하지 말고 끝낸다: 그 사이클이 clear 전에 끝나면 데몬이 같은 통보를 한 번 재배달하고(redelivery) 그때 같은 --fire 로 다시 집행해도 된다(데몬이 판정 · 끝났으면 87).
+    /// 1콜 최악 시간 = 단일 전체 시한 570초(점유 대기 포함 · Claude Code Bash 도구 상한 600초 − 여유 30): clear 전 단계(0~4)는 570 − clear 뒤 몫(2×75 + 30)까지만 기다리므로 clear 가 나갔으면 clear 실효 확인·재주입 몫이 늘 남는다.
     CycleAgent {
         #[arg(long)]
         role: Option<String>,
@@ -213,6 +216,14 @@ enum Command {
         /// 저장 파일 검증 없이 진행 (위험 — 명시 opt-out)
         #[arg(long)]
         force_no_verify: bool,
+        /// 집행하는 통보의 발화 번호(`context.threshold` 의 fire_id · 경보 요약 `fire=<id>`) — 데몬이 그 통보 뒤 사이클이 이미
+        /// 끝났다고 답하면 rc 87 로 건너뛴다(같은 통보 중복 집행 차단). 다른 사이클이 진행 중이면 단일 전체 시한(570초)이 남기는
+        /// 만큼(570 − clear 뒤 몫 180 − 3×--timeout · 기본 30초 · --timeout 이하) 끝나기를 기다렸다 다시 묻는다(그 사이클이 clear
+        /// 전에 실패했으면 이 집행이 진행 · 끝났으면 87 · 계속 진행 중이면 88 — 88 뒤에는 기다리지 않는다: 그 사이클이 clear 전에
+        /// 끝나면 데몬이 같은 통보를 한 번 재배달한다).
+        /// 없으면 수동 사이클(진행 중 사이클은 기다리지 않고 88).
+        #[arg(long)]
+        fire: Option<String>,
     },
     /// T2-5 죽은 에이전트를 같은 surface에서 재기동 + 지침 재주입 + 복원 포인터
     NodeRecover {
@@ -1054,6 +1065,20 @@ const EXIT_CYCLE_HUMAN_DRAFT: i32 = 85;
 /// 송신하고(대기 메시지로 들어가도 새 세션이 읽는다), 사람 초안이 감지되면 송신 0건으로 보류한다.
 const EXIT_CYCLE_REINJECT_HELD: i32 = 86;
 const CYCLE_REINJECT_HELD_TOKEN: &str = "cycle-reinject-held:";
+/// ★(0.14.42 · clear 가드 v3) 이 사이클은 **건너뛰었다**(87) — 0단계(저장 지시 전) 단일 비행 질의(`surface.cycle_claim`)에서
+/// `--fire` 의 통보 뒤 그 좌석의 사이클이 이미 끝났다(stale). 아무것도 보내지 않았다(저장 지시·clear 0건) — 실패가 아니고
+/// 재집행하지 않는다(같은 통보의 중복 집행 차단). 86 은 재주입 보류가 이미 쓴다. 진행 중 사이클(busy)은 88 이다.
+const EXIT_CYCLE_SKIPPED: i32 = 87;
+const CYCLE_SKIPPED_TOKEN: &str = "cycle-skipped:";
+/// ★(0.14.42 · RR1-ROLE-3) 다른 집행자의 사이클이 **진행 중**이다(88) — 0단계 단일 비행 질의가 busy 였고, `--fire` 가 있으면
+/// 점유자가 끝나기를 `--timeout` 초까지 기다렸다 다시 물었는데도 busy 다(`--fire` 가 없으면 기다리지 않는다 — 점유자의 사이클 뒤
+/// 같은 통보인지 판정할 수 없어 기다린 뒤 집행하면 중복 사이클이 된다). 아무것도 보내지 않았다(저장 지시·clear 0건).
+/// 87 과 다르다 — 점유자는 clear 전에 실패할 수 있으므로(저장 검증 실패 · 대상 바쁨 · 검증자) **같은 `--fire` 로 다시 집행해도
+/// 된다**: 데몬이 판정한다(그 통보 뒤 사이클이 끝났으면 87 · 미해결이면 집행). ★(RR2-ROLE-2) 다만 턴 안에서 기다리거나 곧바로
+/// 재집행하지 않는다 — 점유(0단계)는 quiescing(5단계)보다 먼저 잡혀 '진행 중'을 상태로 판정할 수 없고, 점유자가 clear 전에 끝나면
+/// 데몬이 그 통보를 한 번 재배달한다(`context.threshold` · 같은 fire_id · redelivery) — 그 재배달이 다시 집행할 계기다.
+const EXIT_CYCLE_BUSY: i32 = 88;
+const CYCLE_BUSY_TOKEN: &str = "cycle-busy:";
 /// 유휴 대기 만료 머리표. 대상 턴 종료 뒤 재시도 또는 --timeout 연장.
 /// 자동 경로(javis_cycle_autopilot)는 84/85 를 `held_noop` 으로 종결하고
 /// held_cooldown_secs(지수 · 300→600→1200s 상한) 뒤 자동 재시도한다 · 구조적(구 데몬
@@ -1385,6 +1410,76 @@ fn clear_verify_secs() -> u64 {
     CLEAR_VERIFY_SECS
 }
 
+/// ★(0.14.42 · clear 가드 수정 4회차 RV3L-1) cycle-agent 1콜의 **단일 전체 시한**(초). CSO·master 는 이 1콜을 Claude Code Bash 도구
+/// (상한 600000ms · 전경)로 부른다 — 넘으면 도구가 clear 뒤·재주입 전에 프로세스를 죽여 대상이 지침·재개 포인터 없이 남는다(③ ·
+/// 재검증 rv3-f1x: 0단계 점유 대기 116초 + 2·3·4단계 각 새 --timeout + 6·7단계 → 600초 SIGTERM · 재주입 0건). 600 − 여유 30.
+/// 모든 대기(0단계 점유 대기 · 2·3·4단계 · 6·7단계)는 이 시한 안에서 남은 예산으로 잘린다([`CycleBudget`]).
+const CYCLE_AGENT_BUDGET_SECS: u64 = 570;
+/// clear 뒤 몫 중 두 관측 창(6단계 실효 확인 · 7단계 재주입 전 유휴)을 넘는 여유(초) — 재주입 붙여넣기·RPC 왕복·quiescing 해제.
+const CYCLE_REINJECT_MARGIN_SECS: u64 = 30;
+
+/// 단일 전체 시한 — 테스트 override(0=상수). 프로덕션은 항상 [`CYCLE_AGENT_BUDGET_SECS`]·[`CYCLE_REINJECT_MARGIN_SECS`].
+#[cfg(test)]
+static CYCLE_AGENT_BUDGET_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static CYCLE_REINJECT_MARGIN_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn cycle_agent_budget_secs() -> (u64, u64) {
+    #[cfg(test)]
+    {
+        let b = CYCLE_AGENT_BUDGET_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        let m = CYCLE_REINJECT_MARGIN_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if b != 0 {
+            return (b, m);
+        }
+    }
+    (CYCLE_AGENT_BUDGET_SECS, CYCLE_REINJECT_MARGIN_SECS)
+}
+
+/// 단일 전체 시한의 배분(순수 · 회귀 핀 대상) — (0단계 점유 대기 상한, clear 전 단계가 끝나야 하는 시각(시작 뒤 초)).
+/// clear 뒤 몫 = 2 × 관측 창 + 여유(6단계 실효 확인 · 7단계 재주입 전 유휴 · 붙여넣기). clear 전 몫 = 전체 − clear 뒤 몫.
+/// 점유 대기 = min(--timeout, clear 전 몫 − 3 × --timeout) — 뒤의 2·3·4단계가 각자 --timeout 을 다 써도 clear 전 몫 안에 든다.
+/// 그러므로 점유 대기 + 3·T + 2·관측 창 + 여유 ≤ 전체(기본: 30 + 360 + 150 + 30 = 570 ≤ 600 − 30).
+fn cycle_budget_plan(timeout: u64, clear_verify: u64, budget: u64, margin: u64) -> (u64, u64) {
+    let post_clear = clear_verify.saturating_mul(2).saturating_add(margin);
+    let pre_clear = budget.saturating_sub(post_clear);
+    let claim_wait = timeout.min(pre_clear.saturating_sub(timeout.saturating_mul(3)));
+    (claim_wait, pre_clear)
+}
+
+/// 1콜 단일 전체 시한(시작 시각 기준) — 각 단계의 대기 시한을 남은 전체 예산으로 자른다. clear 전 단계는 `pre_clear` 까지(clear 가
+/// 나가면 clear 뒤 몫이 늘 남는다) · clear 뒤 단계는 `end` 까지.
+struct CycleBudget {
+    end: std::time::Instant,
+    pre_clear: std::time::Instant,
+    claim_wait: u64,
+}
+
+impl CycleBudget {
+    fn new(timeout: u64) -> Self {
+        let start = std::time::Instant::now();
+        let (budget, margin) = cycle_agent_budget_secs();
+        let (claim_wait, pre_clear) = cycle_budget_plan(timeout, clear_verify_secs(), budget, margin);
+        CycleBudget {
+            end: start + std::time::Duration::from_secs(budget),
+            pre_clear: start + std::time::Duration::from_secs(pre_clear),
+            claim_wait,
+        }
+    }
+    /// clear 전 단계(2·3·4)의 대기 시한 = min(지금 + T, clear 전 시한).
+    fn stage(&self, timeout: u64) -> std::time::Instant {
+        (std::time::Instant::now() + std::time::Duration::from_secs(timeout)).min(self.pre_clear)
+    }
+    /// clear 뒤 단계(6·7)의 대기 시한 = min(지금 + 관측 창, 전체 시한).
+    fn post_clear(&self, secs: u64) -> std::time::Instant {
+        (std::time::Instant::now() + std::time::Duration::from_secs(secs)).min(self.end)
+    }
+    /// 시한까지 남은 초(문구용 · 올림).
+    fn secs_until(at: std::time::Instant) -> u64 {
+        at.saturating_duration_since(std::time::Instant::now()).as_secs_f64().ceil() as u64
+    }
+}
+
 /// cycle-agent 결과 → exit code(순수 · 회귀 핀 대상). 머리표 없는 에러는 종전대로 1.
 fn cycle_agent_exit(result: &Result<(), String>) -> i32 {
     match result {
@@ -1394,6 +1489,8 @@ fn cycle_agent_exit(result: &Result<(), String>) -> i32 {
         Err(e) if e.starts_with(CYCLE_TARGET_BUSY_TOKEN) => EXIT_CYCLE_TARGET_BUSY,
         Err(e) if e.starts_with(CYCLE_HUMAN_DRAFT_TOKEN) => EXIT_CYCLE_HUMAN_DRAFT,
         Err(e) if e.starts_with(CYCLE_REINJECT_HELD_TOKEN) => EXIT_CYCLE_REINJECT_HELD,
+        Err(e) if e.starts_with(CYCLE_SKIPPED_TOKEN) => EXIT_CYCLE_SKIPPED,
+        Err(e) if e.starts_with(CYCLE_BUSY_TOKEN) => EXIT_CYCLE_BUSY,
         Err(e) if e.starts_with(VERIFIER_COLLISION_TOKEN) => EXIT_VERIFIER_COLLISION,
         Err(e) if e.starts_with(VERIFIER_UNRESOLVED_TOKEN) => EXIT_VERIFIER_UNRESOLVED,
         Err(_) => 1,
@@ -4948,10 +5045,11 @@ fn run(command: Command) -> i32 {
             resume_text,
             timeout,
             force_no_verify,
+            fire,
         } => {
             return run_cycle_agent(
                 role, surface, verifier, save_files, clear_cmd, resume_text, timeout,
-                force_no_verify,
+                force_no_verify, fire,
             )
         }
 
@@ -19009,17 +19107,50 @@ fn resolve_role_or_surface(
 /// cycle-agent가 대상 surface를 quiescing(=채널 inbox 주입 보류)으로 마킹/해제한다(§2.2 S5).
 /// clear 직전 on, resume 후(또는 실패해도) off로 호출해 clear·복원 구간의 채널 주입을 봉한다.
 fn set_surface_quiescing(sid: u64, on: bool) -> Result<(), String> {
-    request("surface.quiesce", cycle_quiesce_params(sid, on)).map(|_| ())
+    request("surface.quiesce", cycle_quiesce_params(sid, on, None)).map(|_| ())
+}
+
+/// ★(0.14.42 · RR1-ROLE-1) 사이클 표지 끔이 싣는 결과 — 데몬 clear 가드는 이것으로 '사이클 끝'을 판정한다(추측하지 않는다).
+/// 종전에는 결과 없이 껐다 — 표지 켬 뒤 실패(clear 송신 거부 · 실효 미관측)도 clear 로 적혀 그 통보가 풀리고(같은 --fire 재집행
+/// rc 87 · autopilot 게이트 3 닫힘) clear 되지 않은 수준이 '사이클 뒤 수준'으로 재져 feed 가 오진했다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CycleOutcome {
+    /// clear 실효 확인(session_file 교체) — rc 0 · 86.
+    Cleared,
+    /// clear 가 나가지 않았다(송신 거부 — rc 85) · 실효가 관측되지 않았다(rc 80) — 그 통보는 미해결로 남는다(재집행 가능).
+    NotCleared,
+    /// 모른다 — 송신 여부 불명(RPC 오류) · 실효 측정 불능(rc 81).
+    Unknown,
+}
+
+impl CycleOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            CycleOutcome::Cleared => "cleared",
+            CycleOutcome::NotCleared => "not_cleared",
+            CycleOutcome::Unknown => "unknown",
+        }
+    }
+}
+
+/// 표지 끔 + 결과(RR1-ROLE-1). 구 데몬은 `outcome` 을 모르고 무시한다(종전 동작).
+fn end_surface_quiescing(sid: u64, outcome: CycleOutcome) -> Result<(), String> {
+    request("surface.quiesce", cycle_quiesce_params(sid, false, Some(outcome))).map(|_| ())
 }
 
 /// ★(0.14.42 · R2NC-F3 후속) cycle-agent 의 quiescing 요청 인자 — 세울 때 `bind_owner: true` 로 **이 프로세스의 수명을 창에
 /// 묶는다**(해제 없이 죽으면 데몬이 곧바로 푼다 · SIGTERM·Bash 도구 시한). 수동 `cys quiesce`(단명 CLI)는 묶지 않는다 —
 /// 묶으면 CLI 가 끝나는 즉시 풀려 명령이 무동작이 된다(그 창은 종전대로 상한·해제 호출로만 풀린다).
-fn cycle_quiesce_params(sid: u64, on: bool) -> Value {
+/// 끔은 결과(`outcome`)를 싣는다 — 없으면 싣지 않는다(데몬은 결과 모름으로 받는다).
+fn cycle_quiesce_params(sid: u64, on: bool, outcome: Option<CycleOutcome>) -> Value {
     if on {
         json!({"surface_id": sid, "on": true, "bind_owner": true})
     } else {
-        json!({"surface_id": sid, "on": false})
+        let mut p = json!({"surface_id": sid, "on": false});
+        if let Some(o) = outcome {
+            p["outcome"] = json!(o.as_str());
+        }
+        p
     }
 }
 
@@ -19541,6 +19672,90 @@ fn cycle_reinject_held(
 /// 저장 지시 → 저장 검증 → handshake → 턴 종료·빈 composer 확인 → clear → 실효 관측 → 재주입.
 /// D-16 실측: 진행 중 턴에 /clear가 대기 메시지로 들어가 89KB가 옛 세션에 얹히며 거짓 성공했다.
 /// 따라서 clear 전 유휴, 재주입 전 session_file 교체와 새 프롬프트·SessionStart 훅 종료를 확인한다.
+/// ★(0.14.42 · clear 가드 v3) cycle-agent 0단계 단일 비행 점유(`surface.cycle_claim`) — 살아 있는 동안 같은 좌석의 다른 집행을
+/// busy 로 막고, `--fire` 의 통보 뒤 사이클이 이미 끝났으면 stale 로 건너뛴다(rc 87 · 송신 0건 · 재집행 금지). 데몬이 이 RPC 를
+/// 모르거나(구 데몬 `method_not_found`) 질의가 실패하면 **종전처럼 진행한다**(실패 방향 = 집행 — 단일 비행만 빠진다). 해제는
+/// Drop(모든 종료 경로) · 이 프로세스가 죽으면 데몬이 죽은 pid 점유를 버린다.
+/// ★(RR1-ROLE-3) busy 는 '이미 처리됨'이 아니다 — 점유자는 clear 전에(저장 검증 실패 · 대상 바쁨 · 검증자) 실패할 수 있고, 그러면
+/// 통보는 미해결인데 물러난 집행자는 다시 보지 않아 시한(1200초)·잠정 보류(+900초)까지 방치되고 효과 없음 strike 가 쌓였다.
+/// 그래서 `--fire` 가 있으면 점유자가 끝나기를 `wait_secs` 까지 2초마다 다시 묻는다 — 끝났으면 데몬이 판정한다
+/// (그 통보 뒤 사이클이 끝났으면 stale → 87 · 아니면 claimed → 이 집행이 진행). 기다려도 busy 면 88(진행 중 · 송신 0건 · 같은
+/// --fire 재집행 가능). `--fire` 가 없으면 기다리지 않고 88 이다(점유자 뒤 같은 통보인지 판정할 수 없다 — 중복 사이클 방지).
+/// ★(수정 4회차 RV3L-1) `wait_secs` 는 단일 전체 시한이 남기는 만큼이다([`cycle_budget_plan`] · 기본 30초) — 종전 --timeout(120)을
+/// 따로 더해 1콜 최악 약 630초로 Bash 도구 상한(600)을 넘었다. 88 뒤의 다음 계기는 데몬 재배달이다(턴 안 장시간 대기 없음).
+struct CycleClaim {
+    sid: u64,
+    held: bool,
+}
+
+impl CycleClaim {
+    fn acquire(sid: u64, fire: Option<&str>, wait_secs: u64) -> Result<Self, String> {
+        let fire = fire.map(str::trim).filter(|f| !f.is_empty());
+        let mut params = json!({"surface_id": sid});
+        if let Some(f) = fire {
+            params["fire_id"] = json!(f);
+        }
+        let started = std::time::Instant::now();
+        let deadline = started + std::time::Duration::from_secs(wait_secs);
+        let mut announced = false;
+        loop {
+            let r = match request("surface.cycle_claim", params.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("[cycle 0/7] 단일 비행 점유 질의 불가({e}) — 종전처럼 진행한다(중복 집행 차단만 빠진다)");
+                    return Ok(CycleClaim { sid, held: false });
+                }
+            };
+            return match r["claim"].as_str() {
+                Some("busy") => {
+                    let now = std::time::Instant::now();
+                    if fire.is_some() && now < deadline {
+                        if !announced {
+                            eprintln!(
+                                "[cycle 0/7] surface:{sid} 에 다른 사이클이 진행 중(점유 pid {} · 통보 {}) — 끝나기를 기다렸다 다시 묻는다 \
+                                 (최대 {wait_secs}s · 송신 0건)",
+                                r["holder_pid"],
+                                r["holder_fire_id"].as_str().unwrap_or("-"),
+                            );
+                            announced = true;
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(2).min(deadline - now));
+                        continue;
+                    }
+                    Err(format!(
+                        "{CYCLE_BUSY_TOKEN} surface:{sid} 에 다른 집행자의 사이클이 진행 중이다(점유 pid {} · 통보 {}){} — 이 집행은 \
+                         아무것도 보내지 않고 끝낸다(저장 지시·clear 송신 0건). 기다리거나 곧바로 다시 집행하지 않는다 — 그 사이클이 \
+                         clear 전에 끝나면 데몬이 이 통보를 한 번 재배달한다(redelivery · 그때 같은 --fire 로 집행 · 데몬이 판정한다: \
+                         그 통보 뒤 사이클이 끝났으면 87)",
+                        r["holder_pid"],
+                        r["holder_fire_id"].as_str().unwrap_or("-"),
+                        if fire.is_some() {
+                            format!(" · {}s 기다려도 끝나지 않았다", started.elapsed().as_secs())
+                        } else {
+                            " · --fire 없는 수동 사이클이라 기다리지 않았다(점유자 뒤 같은 통보인지 판정할 수 없다)".to_string()
+                        },
+                    ))
+                }
+                Some("stale") => Err(format!(
+                    "{CYCLE_SKIPPED_TOKEN} 통보 {} 뒤 surface:{sid} 의 사이클이 이미 끝났다 — 같은 통보를 다시 집행하지 않는다(저장 지시·clear \
+                     송신 0건 · 재집행 금지)",
+                    fire.unwrap_or("-"),
+                )),
+                Some("claimed") => Ok(CycleClaim { sid, held: true }),
+                _ => Ok(CycleClaim { sid, held: false }),
+            };
+        }
+    }
+}
+
+impl Drop for CycleClaim {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = request("surface.cycle_claim", json!({"surface_id": self.sid, "release": true}));
+        }
+    }
+}
+
 fn run_cycle_agent(
     role: Option<String>,
     surface: Option<String>,
@@ -19550,6 +19765,7 @@ fn run_cycle_agent(
     resume_text: Option<String>,
     timeout: u64,
     force_no_verify: bool,
+    fire: Option<String>,
 ) -> i32 {
     let result = (|| -> Result<(), String> {
         let sid = resolve_role_or_surface(&role, &surface)?;
@@ -19565,6 +19781,10 @@ fn run_cycle_agent(
                     .into(),
             );
         }
+        // ★(0.14.42 · clear 가드 수정 4회차 RV3L-1) 1콜 단일 전체 시한 — 여기서부터 모든 대기가 이 시한 안이다(570초 · 점유 대기 포함).
+        let budget = CycleBudget::new(timeout);
+        // ★(0.14.42 · clear 가드 v3) 0단계 — 사이클 단일 비행 점유(저장 지시 전 · 송신 0건에서 건너뛴다). 끝날 때(모든 경로) 놓는다.
+        let _claim = CycleClaim::acquire(sid, fire.as_deref(), budget.claim_wait)?;
         // clear 명령 선확정 — 저장만 시키고 clear 못하는 어정쩡한 상태 방지
         let agent = entry["agent"].as_str().map(String::from);
         let spec = cycle_spec_or_explicit_clear(
@@ -19736,8 +19956,9 @@ fn run_cycle_agent(
         // 2) 파일 변화 게이트 (화면 마커는 참고 신호일 뿐 — reward-hack·stale 마커 차단)
         match cycle_verify_plan(force_no_verify, baseline.len()) {
             CycleVerifyPlan::Wait => {
-                eprintln!("[cycle 2/7] 저장 파일 검증 대기 (mtime+해시, 최대 {timeout}s)");
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+                let deadline = budget.stage(timeout);
+                let wait_secs = CycleBudget::secs_until(deadline);
+                eprintln!("[cycle 2/7] 저장 파일 검증 대기 (mtime+해시, 최대 {wait_secs}s · 단일 전체 시한 안)");
                 let mut verified = false;
                 while std::time::Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -19748,7 +19969,7 @@ fn run_cycle_agent(
                 }
                 if !verified {
                     return Err(format!(
-                        "저장 검증 실패 — {timeout}s 내 파일 갱신 없음. cycle 중단 (clear 미실행)"
+                        "저장 검증 실패 — {wait_secs}s 내 파일 갱신 없음. cycle 중단 (clear 미실행)"
                     ));
                 }
                 eprintln!("[cycle] 저장 검증 통과");
@@ -19788,7 +20009,7 @@ fn run_cycle_agent(
                 let _ = request("feed.reply", json!({"request_id": rid, "decision": decision}));
             });
             inject_text(vsid, &format!("[CYCLE-VERIFY] role '{role_name}'(surface:{sid})의 컨텍스트 순환 전 저장 검증 요청. SESSION_STATE/TODO 파일이 방금 갱신되었는지 확인하고 `cys feed reply {req_id} allow` 또는 `cys feed reply {req_id} deny`로 판정하라."))?;
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            let deadline = budget.stage(timeout);
             // ★W4-B(결함 7): 해소 항목을 발견해도 decision 문자열로 즉석 판정하지 않고 영수증
             // 검증(cycle_receipt_ok — resolver==지정 검증자 대조)에 넘긴다. Err 는 전부 clear
             // 미실행 안전 중단(아래 match)이고, timeout(None)의 안전 중단은 종전 그대로다.
@@ -19841,13 +20062,14 @@ fn run_cycle_agent(
         // 3.5) wait_cycle_target_idle → observe_cycle_target → cycle_target_state(...)로 판정한다.
         // 저장 지시가 만든 턴까지 끝난 뒤 잰다. CYCLE_TARGET_BUSY_TOKEN(84)·초안(85)은
         // quiescing·C-u보다 앞에서 거부하고, 재주입 전에도 같은 관측·대기 경로를 쓴다.
-        eprintln!("[cycle 4/7] 대상 턴 종료·빈 composer 확인 (최대 {timeout}s)");
+        let idle_deadline = budget.stage(timeout);
+        eprintln!("[cycle 4/7] 대상 턴 종료·빈 composer 확인 (최대 {}s · 단일 전체 시한 안)", CycleBudget::secs_until(idle_deadline));
         wait_cycle_target_idle(
             sid,
             &marker,
             placeholder.as_deref(),
             gates,
-            std::time::Instant::now() + std::time::Duration::from_secs(timeout),
+            idle_deadline,
             "clear 직전",
             true,
         )?;
@@ -19869,6 +20091,11 @@ fn run_cycle_agent(
             .as_ref()
             .and_then(statusline_session_file);
         set_surface_quiescing(sid, true)?;
+        // ★(0.14.42 · RR1-ROLE-1) 표지 끔이 싣는 결과 — 여기부터 clear 가 나갈 수 있으므로 기본은 모름(송신 여부 불명 RPC 오류 ·
+        //   실효 측정 불능 81). 실효 확인(0·86) = cleared · 실효 미관측(80) = not_cleared(그 통보는 미해결 → 같은 --fire 재집행 ·
+        //   autopilot 재시도 가능) · 사람 초안 거부(85 머리표 — 표지 켬 뒤 어느 단계든 clear 미제출) = not_cleared(클로저 뒤에서 접는다).
+        //   데몬 가드는 not_cleared 를 사이클 끝으로 보지 않는다(발화를 풀지 않고 수준을 다시 재지 않는다).
+        let mut outcome = CycleOutcome::Unknown;
         let clear_result = (|| -> Result<(), String> {
             // 5) 입력 버퍼 정리 + clear를 한 writer arm에서 원자 송신한다.
             // 종전 3분할은 본문 뒤 사람 입력이 끼어 Return만 거부되면 clear와 초안이 섞였다.
@@ -19937,8 +20164,7 @@ fn run_cycle_agent(
             let effect = match pre_session_file.as_deref() {
                 None => clear_effect_verdict(None, None),
                 Some(pre) => {
-                    let deadline = std::time::Instant::now()
-                        + std::time::Duration::from_secs(clear_verify_window);
+                    let deadline = budget.post_clear(clear_verify_window);
                     loop {
                         let post = surface_entry(sid)
                             .ok()
@@ -19954,14 +20180,14 @@ fn run_cycle_agent(
             };
             match effect {
                 ClearEffect::Verified => {
+                    outcome = CycleOutcome::Cleared;
                     // 새 세션 프롬프트와 SessionStart 훅이 끝나야 재주입할 수 있다.
                     match wait_cycle_target_idle(
                         sid,
                         &marker,
                         placeholder.as_deref(),
                         gates,
-                        std::time::Instant::now()
-                            + std::time::Duration::from_secs(clear_verify_window),
+                        budget.post_clear(clear_verify_window),
                         "재주입 직전",
                         false,
                     ) {
@@ -19985,12 +20211,17 @@ fn run_cycle_agent(
                         )),
                     }
                 }
-                ClearEffect::Unverified => Err(format!(
-                    "{CLEAR_UNVERIFIED_TOKEN} clear 를 송신했으나 {clear_verify_window}s 안에 \
-                     session_file 교체가 관측되지 않았다 — clear 실행을 확인하지 못했다(대상이 작업 \
-                     중이었다면 /clear 가 대기 메시지로 들어갔을 수 있다). \
-                     디렉티브·RESUME 을 재주입하지 않았다. 성공으로 읽지 마라"
-                )),
+                ClearEffect::Unverified => {
+                    // 가드는 이 통보를 풀지 않는다(같은 --fire 재집행 · autopilot 재시도 가능) — 늦게 발효한 clear 는 재주입이 없으므로
+                    // 재집행이 지침·재개 포인터를 넣는다.
+                    outcome = CycleOutcome::NotCleared;
+                    Err(format!(
+                        "{CLEAR_UNVERIFIED_TOKEN} clear 를 송신했으나 {clear_verify_window}s 안에 \
+                         session_file 교체가 관측되지 않았다 — clear 실행을 확인하지 못했다(대상이 작업 \
+                         중이었다면 /clear 가 대기 메시지로 들어갔을 수 있다). \
+                         디렉티브·RESUME 을 재주입하지 않았다. 성공으로 읽지 마라"
+                    ))
+                }
                 ClearEffect::Unmeasurable => {
                     // statusline 미보고 어댑터는 화면 유휴로 부트 체인을 복원하되 rc81을 유지한다.
                     match wait_cycle_target_idle(
@@ -19998,8 +20229,7 @@ fn run_cycle_agent(
                         &marker,
                         placeholder.as_deref(),
                         gates,
-                        std::time::Instant::now()
-                            + std::time::Duration::from_secs(clear_verify_window),
+                        budget.post_clear(clear_verify_window),
                         "재주입 직전(측정 불능)",
                         false,
                     ) {
@@ -20027,8 +20257,12 @@ fn run_cycle_agent(
             }
         })();
         // 재개 성공/실패와 무관하게 quiescing 해제 — 실패로 master가 quiescing에 갇혀 채널이
-        // 영구 보류되는 것을 막는다(master 자기보고 안전망과 별개의 결정론 해제).
-        let _ = set_surface_quiescing(sid, false);
+        // 영구 보류되는 것을 막는다(master 자기보고 안전망과 별개의 결정론 해제). 결과를 싣는다(RR1-ROLE-1).
+        // 사람 초안 거부(rc 85 머리표)는 표지 켬 뒤 어느 단계든 clear 가 제출되지 않았다(원자 거부 송신 0건 · 3분할 C-u·본문·Return 거부).
+        if clear_result.as_ref().is_err_and(|e| e.starts_with(CYCLE_HUMAN_DRAFT_TOKEN)) {
+            outcome = CycleOutcome::NotCleared;
+        }
+        let _ = end_surface_quiescing(sid, outcome);
         clear_result?;
         println!("cycle complete → surface:{sid} ({role_name}) · clear 실효 확인(session_file 교체)");
         Ok(())
@@ -35349,11 +35583,18 @@ mod tests {
     /// (단명 CLI 가 끝나자마자 데몬이 창을 풀어 명령이 무동작이 되던 것 · cysd h1_manual_quiesce_… 와 짝).
     #[test]
     fn only_cycle_agent_binds_its_lifetime_to_the_quiescing_window() {
-        assert_eq!(cycle_quiesce_params(7, true), json!({"surface_id": 7, "on": true, "bind_owner": true}));
-        assert_eq!(cycle_quiesce_params(7, false), json!({"surface_id": 7, "on": false}));
+        assert_eq!(cycle_quiesce_params(7, true, None), json!({"surface_id": 7, "on": true, "bind_owner": true}));
+        assert_eq!(cycle_quiesce_params(7, false, None), json!({"surface_id": 7, "on": false}));
+        // ★(RR1-ROLE-1) cycle-agent 의 끔은 결과를 싣는다(데몬이 clear 안 됨을 사이클 끝으로 적지 않게).
+        assert_eq!(
+            cycle_quiesce_params(7, false, Some(CycleOutcome::NotCleared)),
+            json!({"surface_id": 7, "on": false, "outcome": "not_cleared"})
+        );
         let src = include_str!("cys.rs");
         let setter = refl_fn_body(src, "set_surface_quiescing");
-        assert!(setter.contains("cycle_quiesce_params(sid, on)"), "cycle-agent 설정기가 묶기 인자를 쓰지 않는다");
+        assert!(setter.contains("cycle_quiesce_params(sid, on, None)"), "cycle-agent 설정기가 묶기 인자를 쓰지 않는다");
+        let ender = refl_fn_body(src, "end_surface_quiescing");
+        assert!(ender.contains("cycle_quiesce_params(sid, false, Some(outcome))"), "표지 끔이 결과를 싣지 않는다");
         let arm_at = src.find("Command::Quiesce { surface, off } =>").expect("수동 quiesce 갈래");
         let arm = &src[arm_at..arm_at + 400];
         assert!(arm.contains("json!({\"surface_id\": sid, \"on\": !off})") && !arm.contains("bind_owner"),
@@ -35963,6 +36204,8 @@ mod tests {
             (CYCLE_HUMAN_DRAFT_TOKEN, EXIT_CYCLE_HUMAN_DRAFT),
             (VERIFIER_COLLISION_TOKEN, EXIT_VERIFIER_COLLISION),
             (VERIFIER_UNRESOLVED_TOKEN, EXIT_VERIFIER_UNRESOLVED),
+            (CYCLE_SKIPPED_TOKEN, EXIT_CYCLE_SKIPPED),
+            (CYCLE_BUSY_TOKEN, EXIT_CYCLE_BUSY),
             (token, code),
         ];
         for &(prefix, expected) in &contracts {
@@ -35995,9 +36238,15 @@ mod tests {
             EXIT_CYCLE_TARGET_BUSY,
             EXIT_CYCLE_HUMAN_DRAFT,
             EXIT_CYCLE_REINJECT_HELD,
+            EXIT_CYCLE_SKIPPED,
+            EXIT_CYCLE_BUSY,
         ] {
             assert!(doc.contains(&format!("{code}=")), "help 에 exit {code} 설명 없음");
         }
+        // ★(RR1-ROLE-3) 87 과 88 은 문면이 갈린다 — 87 = 이미 끝남(재집행 금지) · 88 = 진행 중(같은 --fire 재집행 가능).
+        let line = |code: i32| doc.lines().find(|l| l.contains(&format!("{code}="))).unwrap_or("").to_string();
+        assert!(line(EXIT_CYCLE_SKIPPED).contains("이미 끝났다") && !line(EXIT_CYCLE_SKIPPED).contains("진행 중"), "{}", line(87));
+        assert!(line(EXIT_CYCLE_BUSY).contains("진행 중") && line(EXIT_CYCLE_BUSY).contains("다시 집행해도 된다"), "{}", line(88));
         assert!(doc.contains("7단계"), "help 가 옛 단계 수를 적고 있다");
         for stage in ["실효 확인", "빈 composer"] {
             assert!(doc.contains(stage), "help 에 '{stage}' 단계 없음");
@@ -36360,6 +36609,35 @@ mod tests {
         let old_daemon = cycle_quiet_timeout_diagnostic(true, false, true);
         assert!(old_daemon.contains("[diag=quiet_secs_unreported]"), "{consequence}: 구 데몬 우선순위 훼손: {old_daemon}");
         assert_eq!(cycle_quiet_timeout_diagnostic(true, true, false), "", "{consequence}");
+    }
+
+    /// ★(0.14.42 · clear 가드 v3) 건너뜀 rc 87 의 교차 언어 계약 — autopilot 의 `SKIPPED_RC` 가 러스트 `EXIT_CYCLE_SKIPPED` 와 같고
+    /// 보류 코드(HELD_RCS)와 섞이지 않으며 86(재주입 보류 — clear 가 이미 나갔다)과 다르다. 실패 방향: 붉어지면 autopilot 이
+    /// 건너뛴 사이클을 실패로 읽어 레인을 잠그거나(② 인접), clear 가 나간 86 을 건너뜀으로 읽어 사후검증을 거른다.
+    #[test]
+    fn cycle_skipped_rc_matches_autopilot() {
+        let autopilot = include_str!("../../cysjavis-pack/bin/javis_cycle_autopilot.py");
+        let skipped: i32 = autopilot
+            .lines()
+            .find_map(|line| line.strip_prefix("SKIPPED_RC = "))
+            .expect("파이썬 SKIPPED_RC 줄 시작 정수 리터럴")
+            .trim()
+            .parse()
+            .expect("SKIPPED_RC 정수");
+        assert_eq!(skipped, EXIT_CYCLE_SKIPPED);
+        assert_ne!(EXIT_CYCLE_SKIPPED, EXIT_CYCLE_REINJECT_HELD);
+        assert!(![EXIT_CYCLE_TARGET_BUSY, EXIT_CYCLE_HUMAN_DRAFT].contains(&EXIT_CYCLE_SKIPPED));
+        // ★(RR1-ROLE-3) rc 88(진행 중)도 같은 값으로 받고, 87 과 같은 송신 0건 보류 종결(재시도 허용)로 받는다.
+        let busy: i32 = autopilot
+            .lines()
+            .find_map(|line| line.strip_prefix("BUSY_RC = "))
+            .expect("파이썬 BUSY_RC 줄 시작 정수 리터럴")
+            .trim()
+            .parse()
+            .expect("BUSY_RC 정수");
+        assert_eq!(busy, EXIT_CYCLE_BUSY);
+        assert!(![EXIT_CYCLE_TARGET_BUSY, EXIT_CYCLE_HUMAN_DRAFT, EXIT_CYCLE_REINJECT_HELD, EXIT_CYCLE_SKIPPED].contains(&EXIT_CYCLE_BUSY));
+        assert!(autopilot.contains("if rc in (SKIPPED_RC, BUSY_RC):"), "autopilot 이 rc 87·88 을 따로 받지 않는다");
     }
 
     #[test]
@@ -36971,6 +37249,14 @@ mod tests {
         ));
         let listener = std::os::unix::net::UnixListener::bind(&socket).expect("가짜 소켓 bind");
         let calls: D16DaemonCalls = Arc::new(Mutex::new(Vec::new()));
+        // 점유 질의 답 — 쉼표로 이으면 차례로 답한다(마지막 값을 되풀이 · 예: "busy,claimed" = 첫 질의 busy · 다음부터 claimed).
+        let claim_verdicts: Vec<String> = std::env::var("CYS_TEST_FAKE_CLAIM")
+            .ok()
+            .map(|v| v.split(',').map(|x| x.trim().to_string()).collect())
+            .unwrap_or_default();
+        let mut claim_calls = 0usize;
+        // ★(RR1-ROLE-1) clear 송신을 데몬이 타이핑 가드로 거부한다(표지 켬 뒤 · clear 송신 0건 = rc 85 경로).
+        let refuse_clear = std::env::var("CYS_TEST_FAKE_CLEAR_REFUSE").is_ok();
         let recorded = Arc::clone(&calls);
         let server = std::thread::spawn(move || {
             let mut sessions = session_files.into_iter();
@@ -37021,11 +37307,29 @@ mod tests {
                         current_screen = screens.next().unwrap_or(current_screen);
                         json!({"text": screen, "quiet_secs": quiet, "line_count": 40})
                     }
+                    "surface.send_text" if req["params"]["text"] == "/clear" && refuse_clear => {
+                        let response = json!({"id": req["id"], "ok": false,
+                                              "error": {"code": cys::ERR_TYPING_GUARD, "message": cys::MSG_TYPING_GUARD}});
+                        let _ = writeln!(stream, "{response}");
+                        continue;
+                    }
                     "surface.send_text" if req["params"]["text"] == "/clear" => {
                         clear_sent = true;
                         json!({"ok": true})
                     }
                     "system.resolve_role" => json!({"surface_id": 9}),
+                    // ★(clear 가드 v3) 단일 비행 질의 — 검체가 CYS_TEST_FAKE_CLAIM 으로 답을 고른다(없으면 구 데몬처럼 모르는 필드).
+                    //   "method_not_found" 는 구 데몬의 거절(최상위 ok:false)을 흉내 낸다.
+                    "surface.cycle_claim" if !claim_verdicts.is_empty() && req["params"]["release"] != true => {
+                        let verdict = claim_verdicts[claim_calls.min(claim_verdicts.len() - 1)].clone();
+                        claim_calls += 1;
+                        if verdict == "method_not_found" {
+                            let response = json!({"id": req["id"], "ok": false, "error": {"code": "method_not_found", "message": "unknown method: surface.cycle_claim"}});
+                            let _ = writeln!(stream, "{response}");
+                            continue;
+                        }
+                        json!({"surface_id": 7, "claim": verdict, "holder_pid": 4242})
+                    }
                     _ => json!({"ok": true}),
                 };
                 let response = json!({"id": req["id"], "ok": true, "result": result});
@@ -37123,6 +37427,30 @@ mod tests {
         reports_usage: bool,
         missing_spec: bool,
     ) -> (i32, Vec<(String, Value)>) {
+        d16_cycle_fixture_scenario_fire(screens, session_files, reports_usage, missing_spec, None)
+    }
+
+    /// [`d16_cycle_fixture_scenario`] + `--fire <id>`(단일 비행 질의에 통보 번호를 싣는다 · 진행 중이면 --timeout 3초까지 기다린다).
+    #[cfg(unix)]
+    fn d16_cycle_fixture_scenario_fire(
+        screens: Vec<(&'static str, f64)>,
+        session_files: Vec<&'static str>,
+        reports_usage: bool,
+        missing_spec: bool,
+        fire: Option<&str>,
+    ) -> (i32, Vec<(String, Value)>) {
+        d16_cycle_fixture_scenario_timeout(screens, session_files, reports_usage, missing_spec, fire, 3)
+    }
+
+    #[cfg(unix)]
+    fn d16_cycle_fixture_scenario_timeout(
+        screens: Vec<(&'static str, f64)>,
+        session_files: Vec<&'static str>,
+        reports_usage: bool,
+        missing_spec: bool,
+        fire: Option<&str>,
+        timeout: u64,
+    ) -> (i32, Vec<(String, Value)>) {
         let fixture = D16CycleFixture::new();
         let rows = json!([{
             "surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude",
@@ -37139,10 +37467,192 @@ mod tests {
         let directive = compose_directive("worker").expect("fixture 디렉티브 합성 성공 전제");
         assert!(directive.starts_with('W') && directive.ends_with('R'));
         let clear_cmd = missing_spec.then(|| "/clear".into());
-        let exit = run_cycle_agent(None, Some("7".into()), None, vec![], clear_cmd, None, 3, true);
+        let exit = run_cycle_agent(None, Some("7".into()), None, vec![], clear_cmd, None, timeout, true, fire.map(String::from));
         drop(stop);
         let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
         (exit, recorded)
+    }
+
+    /// ★(0.14.42 · clear 가드 v3) 0단계 단일 비행 — 데몬이 `stale`(그 통보 뒤 사이클이 이미 끝났다)로 답하면 rc 87 로 건너뛴다:
+    /// 저장 지시·clear·quiescing 송신 0건(같은 통보의 중복 집행 차단 · 실패 아님). `busy`(진행 중 사이클)는 87 이 아니다 — `--fire`
+    /// 없는 수동 사이클은 기다리지 않고 88(진행 중 · 송신 0건)이다(RR1-ROLE-3). 실패 방향: 붉어지면 같은 경보의 두 번째 배달이
+    /// 방금 복원된 좌석을 다시 비우거나(①) 진행 중을 '이미 처리됨'으로 읽어 물러난다(②).
+    #[cfg(unix)]
+    #[test]
+    fn cycle_agent_skips_with_rc87_on_stale_fire() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (verdict, want) in [("stale", EXIT_CYCLE_SKIPPED), ("busy", EXIT_CYCLE_BUSY)] {
+            std::env::set_var("CYS_TEST_FAKE_CLAIM", verdict);
+            let (exit, calls) = d16_cycle_fixture_run(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0);
+            std::env::remove_var("CYS_TEST_FAKE_CLAIM");
+            assert_eq!(exit, want, "{verdict}: 건너뜀 코드");
+            let sent = calls
+                .iter()
+                .filter(|(m, _)| m == "surface.send_text" || m == "surface.send_key" || m == "surface.quiesce")
+                .count();
+            assert_eq!(sent, 0, "{verdict}: 건너뛴 사이클이 송신했다 {calls:?}");
+            assert_eq!(calls.iter().filter(|(m, _)| m == "surface.cycle_claim").count(), 1, "{verdict}: 점유 질의 1회(해제 없음)");
+        }
+    }
+
+    /// ★(0.14.42 · RR1-ROLE-3) `--fire` 가 있으면 busy 는 '이미 처리됨'이 아니다 — 점유자가 끝나기를 --timeout 초까지 2초마다 다시
+    /// 묻고 데몬이 판정한다: 점유자가 clear 전에 실패해 놓았으면 claimed → 이 집행이 진행(clear 1건) · 그 통보 뒤 사이클이 끝났으면
+    /// stale → 87(송신 0건) · 끝내 진행 중이면 88(송신 0건). 실패 방향: 붉어지면 점유자가 clear 전에 실패한 통보가 시한(1200초)·
+    /// 잠정 보류(+900초)까지 방치되고 효과 없음 strike 가 쌓인다(드릴 rrC 28분 지연 · ②).
+    #[cfg(unix)]
+    #[test]
+    fn cycle_agent_waits_out_a_busy_holder_then_lets_the_daemon_decide() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fire = Some("1759112345:7:3");
+        let sent = |calls: &[(String, Value)]| {
+            calls.iter().filter(|(m, _)| m == "surface.send_text" || m == "surface.send_key" || m == "surface.quiesce").count()
+        };
+        let queries = |calls: &[(String, Value)]| {
+            calls.iter().filter(|(m, p)| m == "surface.cycle_claim" && p["release"] != true).count()
+        };
+        // 점유자가 clear 전에 실패 → 점유 해제 → 두 번째 질의에서 claimed → 진행.
+        std::env::set_var("CYS_TEST_FAKE_CLAIM", "busy,claimed");
+        let (exit, calls) = d16_cycle_fixture_scenario_fire(
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0)], vec!["S1", "S2"], true, false, fire);
+        assert_eq!(exit, 0, "점유자가 놓은 뒤 이 집행이 진행하지 않았다 {calls:?}");
+        assert_eq!(queries(&calls), 2, "busy 뒤 다시 묻지 않았다");
+        assert!(calls.iter().all(|(m, p)| m != "surface.cycle_claim" || p["release"] == true || p["fire_id"] == json!(fire.unwrap())));
+        assert_eq!(calls.iter().filter(|(m, p)| m == "surface.send_text" && p["text"] == "/clear").count(), 1);
+        // 점유자의 사이클이 그 통보 뒤 끝났다 → stale → 87 · 송신 0건.
+        std::env::set_var("CYS_TEST_FAKE_CLAIM", "busy,stale");
+        let (exit, calls) = d16_cycle_fixture_scenario_fire(
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0)], vec!["S1", "S2"], true, false, fire);
+        assert_eq!((exit, sent(&calls), queries(&calls)), (EXIT_CYCLE_SKIPPED, 0, 2), "{calls:?}");
+        // 끝내 진행 중(--timeout 3초) → 88 · 송신 0건 · 기다리며 다시 물었다.
+        std::env::set_var("CYS_TEST_FAKE_CLAIM", "busy");
+        let t0 = std::time::Instant::now();
+        let (exit, calls) = d16_cycle_fixture_scenario_fire(
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0)], vec!["S1", "S2"], true, false, fire);
+        std::env::remove_var("CYS_TEST_FAKE_CLAIM");
+        assert_eq!((exit, sent(&calls)), (EXIT_CYCLE_BUSY, 0), "{calls:?}");
+        assert!(queries(&calls) >= 2, "기다리는 동안 다시 묻지 않았다 {calls:?}");
+        assert!(t0.elapsed() >= std::time::Duration::from_secs(3), "--timeout 만큼 기다리지 않았다");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(20), "대기가 --timeout 을 넘었다");
+    }
+
+    /// ★(0.14.42 · clear 가드 수정 4회차 RV3L-1) cycle-agent 1콜 최악 시간은 **단일 전체 시한** 570초 안이다(CSO·master 가 Claude Code
+    /// Bash 도구 상한 600초 · 전경으로 부른다) — 0단계 점유 대기를 따로 더하지 않는다: 대기 상한 + 3·T기본 + 2·CLEAR_VERIFY_SECS +
+    /// 여유 ≤ 570 ≤ 600 − 30. 모든 대기는 남은 예산으로 잘린다(clear 전 단계는 clear 뒤 몫을 남긴 시각까지). 실패 방향: 붉어지면 도구가
+    /// clear 뒤·재주입 전에 cycle-agent 를 죽여 대상이 지침·재개 포인터 없이 남는다(③ · 재검증 rv3-f1x 600초 SIGTERM · 재주입 0건).
+    #[test]
+    fn cycle_agent_single_deadline_fits_the_bash_cap() {
+        const BASH_TOOL_CAP_SECS: u64 = 600;
+        let (claim, pre) = cycle_budget_plan(120, CLEAR_VERIFY_SECS, CYCLE_AGENT_BUDGET_SECS, CYCLE_REINJECT_MARGIN_SECS);
+        assert_eq!((claim, pre), (30, 390), "기본 배분");
+        assert!(claim + 3 * 120 + 2 * CLEAR_VERIFY_SECS + CYCLE_REINJECT_MARGIN_SECS <= CYCLE_AGENT_BUDGET_SECS);
+        assert!(CYCLE_AGENT_BUDGET_SECS + 30 <= BASH_TOOL_CAP_SECS, "Bash 도구 상한 − 여유 30 을 넘는다");
+        // 어떤 --timeout 이어도: 대기 ≤ T · 대기 + 3·T ≤ clear 전 몫(또는 대기 0 — 뒤 단계는 clear 전 시한으로 잘린다) · clear 뒤 몫이 남는다.
+        for t in 0..=1000u64 {
+            let (c, p) = cycle_budget_plan(t, CLEAR_VERIFY_SECS, CYCLE_AGENT_BUDGET_SECS, CYCLE_REINJECT_MARGIN_SECS);
+            assert!(c <= t && (c == 0 || c + 3 * t <= p), "T {t}: 대기 {c} · clear 전 {p}");
+            assert_eq!(p + 2 * CLEAR_VERIFY_SECS + CYCLE_REINJECT_MARGIN_SECS, CYCLE_AGENT_BUDGET_SECS);
+        }
+        // 구조: run_cycle_agent 의 모든 대기 시한이 예산을 거친다(단계마다 새 now + --timeout 이 남으면 붉다).
+        let src = include_str!("cys.rs");
+        let body = &src[src.find("\nfn run_cycle_agent(").expect("run_cycle_agent")..];
+        let body = &body[..body.find("\n}\n").expect("fn 끝")];
+        assert!(body.contains("CycleClaim::acquire(sid, fire.as_deref(), budget.claim_wait)"), "0단계 대기가 예산 밖이다");
+        assert_eq!(body.matches("budget.stage(timeout)").count(), 3, "2·3·4단계 시한이 예산을 거치지 않는다");
+        assert_eq!(body.matches("budget.post_clear(clear_verify_window)").count(), 3, "6·7단계 시한이 예산을 거치지 않는다");
+        assert!(!body.contains("Duration::from_secs(timeout)"), "단계 시한이 남은 전체 예산과 무관하게 새로 잡힌다");
+        assert!(!body.contains("Duration::from_secs(clear_verify_window)"), "clear 뒤 시한이 전체 예산 밖이다");
+        // 지침·매뉴얼이 1콜 최악 시간을 이 상수로 적는다(CSO ④ 전경 1콜 · 부서장 백그라운드 · 두 언어 드리프트 핀).
+        let want = format!("단일 전체 시한 {CYCLE_AGENT_BUDGET_SECS}초");
+        for (name, doc) in [
+            ("CSO_DIRECTIVE", include_str!("../../cysjavis-pack/directives/CSO_DIRECTIVE.md")),
+            ("MASTER_DIRECTIVE", include_str!("../../cysjavis-pack/directives/MASTER_DIRECTIVE.md")),
+            ("USER-MANUAL", include_str!("../../USER-MANUAL.md")),
+        ] {
+            assert!(doc.contains(&want), "{name} 에 cycle-agent 1콜 최악 시간('{want}')이 없다");
+        }
+    }
+
+    /// ★(RV3L-1) 단일 전체 시한이 단계 시한을 자른다 — --timeout 100 이어도 clear 전 단계는 clear 뒤 몫을 남긴 시각에서 멈춘다(대상
+    /// 바쁨 84 · clear 송신 0건) · 점유 대기는 남는 예산이 없으면 곧바로 88(송신 0건 · 턴 안 대기 없음). 예산은 검체 override(전체
+    /// 12초 · 여유 2초 · 관측 창 2초 → clear 전 6초).
+    #[cfg(unix)]
+    #[test]
+    fn cycle_agent_stages_are_cut_by_the_single_deadline() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = (
+            CYCLE_AGENT_BUDGET_OVERRIDE.swap(12, std::sync::atomic::Ordering::Relaxed),
+            CYCLE_REINJECT_MARGIN_OVERRIDE.swap(2, std::sync::atomic::Ordering::Relaxed),
+        );
+        let t0 = std::time::Instant::now();
+        let (exit, calls) = d16_cycle_fixture_scenario_timeout(vec![("⠋ Thinking…\n  작업 중 출력 줄\n", 0.2)], vec!["S1"], true, false, None, 100);
+        let busy_elapsed = t0.elapsed();
+        std::env::set_var("CYS_TEST_FAKE_CLAIM", "busy");
+        let t1 = std::time::Instant::now();
+        let (exit88, calls88) = d16_cycle_fixture_scenario_timeout(
+            vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0)], vec!["S1", "S2"], true, false, Some("1759112345:7:3"), 100);
+        let claim_elapsed = t1.elapsed();
+        std::env::remove_var("CYS_TEST_FAKE_CLAIM");
+        CYCLE_AGENT_BUDGET_OVERRIDE.store(prev.0, std::sync::atomic::Ordering::Relaxed);
+        CYCLE_REINJECT_MARGIN_OVERRIDE.store(prev.1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(exit, EXIT_CYCLE_TARGET_BUSY, "{calls:?}");
+        assert!(!calls.iter().any(|(m, p)| m == "surface.send_text" && p["text"] == "/clear"), "바쁜 대상에 clear");
+        assert!(busy_elapsed < std::time::Duration::from_secs(12), "clear 전 단계가 --timeout 100 을 따라 전체 시한을 넘겼다: {busy_elapsed:?}");
+        assert!(busy_elapsed >= std::time::Duration::from_secs(4), "clear 전 시한(6초)보다 너무 일찍 끝났다: {busy_elapsed:?}");
+        let sent = calls88.iter().filter(|(m, _)| m == "surface.send_text" || m == "surface.send_key" || m == "surface.quiesce").count();
+        assert_eq!((exit88, sent), (EXIT_CYCLE_BUSY, 0), "{calls88:?}");
+        assert!(claim_elapsed < std::time::Duration::from_secs(3), "예산이 남기지 않는 점유 대기를 했다: {claim_elapsed:?}");
+    }
+
+    /// ★(0.14.42 · RR1-ROLE-1) 사이클 표지 끔은 결과를 싣는다 — 실효 확인(0 · 86) = cleared · 실효 미관측(80) = not_cleared ·
+    /// 표지 켬 뒤 clear 송신 거부(85) = not_cleared · 측정 불능(81) = unknown. 실패 방향: 붉어지면 clear 되지 않은 사이클이 데몬에서
+    /// clear 로 적혀 그 통보가 풀리고(같은 --fire 재집행 rc 87 · autopilot 게이트 3 닫힘) 수준·feed 가 오진한다(②).
+    #[cfg(unix)]
+    #[test]
+    fn cycle_agent_marks_quiesce_off_with_the_clear_outcome() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let idle = cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT;
+        let off = |calls: &[(String, Value)]| {
+            let offs: Vec<Value> =
+                calls.iter().filter(|(m, p)| m == "surface.quiesce" && p["on"] == false).map(|(_, p)| p["outcome"].clone()).collect();
+            assert_eq!(offs.len(), 1, "표지 끔은 정확히 1회: {calls:?}");
+            offs[0].clone()
+        };
+        let (exit, calls) = d16_cycle_fixture_scenario(vec![(idle, 5.0)], vec!["S1", "S2"], true, false);
+        assert_eq!((exit, off(&calls)), (0, json!("cleared")));
+        let (exit, calls) = d16_cycle_fixture_scenario(vec![(idle, 5.0), ("⠋ Thinking…\n", 0.2)], vec!["S1", "S2"], true, false);
+        assert_eq!((exit, off(&calls)), (EXIT_CYCLE_REINJECT_HELD, json!("cleared")), "clear 는 발효했다(재주입만 보류)");
+        let (exit, calls) = d16_cycle_fixture_scenario(vec![(idle, 5.0)], vec!["S1"], true, false);
+        assert_eq!((exit, off(&calls)), (EXIT_CLEAR_UNVERIFIED, json!("not_cleared")), "실효 미관측은 clear 가 아니다");
+        let (exit, calls) = d16_cycle_fixture_scenario(vec![(idle, 5.0)], vec!["S1"], false, false);
+        assert_eq!((exit, off(&calls)), (EXIT_CLEAR_UNMEASURABLE, json!("unknown")));
+        std::env::set_var("CYS_TEST_FAKE_CLEAR_REFUSE", "1");
+        let (exit, calls) = d16_cycle_fixture_scenario(vec![(idle, 5.0)], vec!["S1", "S2"], true, false);
+        std::env::remove_var("CYS_TEST_FAKE_CLEAR_REFUSE");
+        assert_eq!((exit, off(&calls)), (EXIT_CYCLE_HUMAN_DRAFT, json!("not_cleared")), "표지 켬 뒤 송신 거부(송신 0건)");
+        // 켬 뒤에만 끔 — 켬은 결과를 싣지 않는다(묶기 인자만).
+        let on = calls.iter().find(|(m, p)| m == "surface.quiesce" && p["on"] == true).expect("표지 켬");
+        assert!(on.1.get("outcome").is_none(), "{on:?}");
+    }
+
+    /// 구 데몬(`surface.cycle_claim` 모름 · method_not_found)·모르는 응답이면 종전처럼 집행한다(실패 방향 = 집행) — 점유를 잡았으면
+    /// 끝날 때 놓는다.
+    #[cfg(unix)]
+    #[test]
+    fn cycle_agent_proceeds_when_claim_rpc_missing() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for verdict in [Some("method_not_found"), None, Some("claimed")] {
+            match verdict {
+                Some(v) => std::env::set_var("CYS_TEST_FAKE_CLAIM", v),
+                None => std::env::remove_var("CYS_TEST_FAKE_CLAIM"),
+            }
+            let (exit, calls) = d16_cycle_fixture_run(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0);
+            std::env::remove_var("CYS_TEST_FAKE_CLAIM");
+            assert_ne!(exit, EXIT_CYCLE_SKIPPED, "{verdict:?}: 구 데몬 앞에서 건너뛰었다(② 무clear)");
+            let clears = calls.iter().filter(|(m, p)| m == "surface.send_text" && p["text"] == "/clear").count();
+            assert_eq!(clears, 1, "{verdict:?}: clear 가 나가지 않았다");
+            let releases = calls.iter().filter(|(m, p)| m == "surface.cycle_claim" && p["release"] == true).count();
+            assert_eq!(releases, usize::from(verdict == Some("claimed")), "{verdict:?}: 잡은 점유만 끝에 놓는다");
+        }
     }
 
     #[cfg(unix)]
@@ -37243,7 +37753,7 @@ mod tests {
                 vec!["S1", "S2"], true);
             let stop = D16DaemonStop(Some(Box::new(stop)));
             std::env::set_var("CYS_SOCKET", &socket);
-            let exit = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true);
+            let exit = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true, None);
             drop(stop);
             let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
             assert_eq!(exit, 0, "실효 clear 뒤 CLI 재주입: 설정={settings:?}");
@@ -37317,7 +37827,7 @@ mod tests {
         std::env::set_var("CYS_SOCKET", &socket);
         let directive = compose_directive("worker").expect("fixture 디렉티브 합성 성공 전제");
         assert!(directive.starts_with('W') && directive.ends_with('R'));
-        let exit = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true);
+        let exit = run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true, None);
         drop(stop);
         let recorded = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let counts = d16_cycle_send_counts(&recorded);

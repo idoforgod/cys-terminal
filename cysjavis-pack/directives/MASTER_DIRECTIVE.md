@@ -606,8 +606,8 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
   조정)를 수치 비교해 `context.threshold` 이벤트를 push한다 — "무거워진 것 같다"는 감(感)은
   트리거가 아니다.
 - 이벤트 수신 시 master는 해당 노드에 `cys cycle-agent`를 집행한다: 저장 지시 → 저장 파일
-  결정론 검증(mtime+sha256) → 2-phase handshake → clear → 디렉티브 재주입·재개 포인터.
-  **백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`(도구 timeout 에 끊기지 않고 네 턴을 붙잡지 않는다). 전경 대기 금지: 한 사이클은 저장·handshake·유휴·clear 확인·재주입 대기로 최대 약 8.5분이고 그동안 네 턴이 멈춰 회신 큐가 적체된다(부서장은 턴 안에서 오래 기다리지 않는다). 완료 통지가 오면 exit code 로 판정하고, 그 전에는 대상 노드에 메시지를 보내거나 같은 대상의 사이클을 다시 시작하지 않는다(결과 불명 = 재집행 금지 · 관측으로 확인). 진행 중에 CSO 의 clear 통보(아래 6단계 ②)를 받으면 '준비 완료' 대신 '사이클 진행 중(대상·시작 시각)'으로 회신하고 완료 통지 뒤에 준비한다. 백그라운드 실행이 없는 CLI 에서만 예외로 도구 timeout 600000 전경 실행을 쓴다(도구 기본 120초에 끊기면 clear 뒤 재개 포인터 없이 남는다).
+  결정론 검증(mtime+sha256) → 2-phase handshake → clear → 디렉티브 재주입·재개 포인터. **발화 번호를 넘긴다** — `context.threshold` 의 `fire=<id>`(payload `fire_id`)를 `cys cycle-agent --fire <id>` 로 넘기고, exit **87 = 그 통보 뒤 사이클이 이미 끝남**(송신 0건)은 재집행하지 않는다. exit **88 = 다른 집행자(CSO·autopilot)의 사이클이 진행 중**(송신 0건 · cycle-agent 가 단일 전체 시한이 남기는 만큼 — 기본 최대 30초 — 끝나기를 기다린 뒤다)은 이미 처리됨이 **아니다** — 그러나 곧바로 재집행하거나 턴 안에서 기다리지 않는다(점유는 저장 지시 전 0단계에 잡혀 `quiescing` 으로는 진행 여부를 판정할 수 없다 · 좌석 행 `ctx_guard.claim` 이 점유다). 그 사이클이 clear 전에 끝나면 데몬이 같은 통보를 **한 번 재배달**한다(`context.threshold` · 같은 `fire=` · `redelivery`) — 재배달을 받으면 같은 `--fire` 로 집행한다(데몬이 판정한다 — 끝났으면 87 · 아직 점유 중이면 88). `context.clear_ineffective`·`context.level_measured`·`context.edge_return` 는 오너 관측 feed 이지 clear 개시 신호가 아니다(개시 신호는 `context.threshold` 하나 — 데몬 clear 가드가 사이클 뒤 잰 수준 위로 자란 뒤에만 낸다 · 가장자리·C 띠 복귀 예외).
+  **백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`(도구 timeout 에 끊기지 않고 네 턴을 붙잡지 않는다). 전경 대기 금지: 한 사이클은 저장·handshake·유휴·clear 확인·재주입 대기로 최대 9.5분(단일 전체 시한 570초 · 점유 대기 포함)이고 그동안 네 턴이 멈춰 회신 큐가 적체된다(부서장은 턴 안에서 오래 기다리지 않는다). 완료 통지가 오면 exit code 로 판정하고, 그 전에는 대상 노드에 메시지를 보내거나 같은 대상의 사이클을 다시 시작하지 않는다(결과 불명 = 재집행 금지 · 관측으로 확인). 진행 중에 CSO 의 clear 통보(아래 6단계 ②)를 받으면 '준비 완료' 대신 '사이클 진행 중(대상·시작 시각)'으로 회신하고 완료 통지 뒤에 준비한다. 백그라운드 실행이 없는 CLI 에서만 예외로 도구 timeout 600000 전경 실행을 쓴다(도구 기본 120초에 끊기면 clear 뒤 재개 포인터 없이 남는다).
   **저장 없이 clear 금지는 코드가 강제한다.**
 - **★master 컨텍스트 clear = CSO 주도 "주인 대리" 핸드셰이크 (제품 기본 절차 · 오너가 바꾸지
   않는 한 적용)**:
@@ -617,7 +617,7 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
   guard.sh가 막지 못한다 → **이 규칙 자체가 유일한 안전장치**다. `/clear`는 SESSION_STATE가 충실한
   스냅샷일 때만 가역(낡으면 비가역 데이터 손실)이므로 검증 단계는 불가침이다. **6단계**:
   1. **자기보고(유지)**: master는 작업 단위마다 `cys set-status --context`로 60% 자기보고 — 데몬이
-     `context.threshold`를 CSO에 결정론 발화. (개시권만 CSO로 넘기고 숫자 자기보고는 master가 계속한다.)
+     `context.threshold`를 CSO에 결정론 발화 — CSO 는 경보의 `fire=<id>` 를 보관해 4단계에 넘긴다. (개시권만 CSO로 넘기고 숫자 자기보고는 master가 계속한다.)
   2. **CSO 시점 판단·통보(개시 주체 = CSO)**: CSO가 시점을 판단(60% 신호 + 안전지점 = 게이트/커밋
      중간 아님·오너 실시간 입력 중 아님)하여 master에 "[CSO·주인 대신] clear 시점 — 세션 재개
      준비하라"를 통보한다.
@@ -628,7 +628,7 @@ Antigravity CLI(agy) 이주). 예외적으로 승인 프롬프트가 뜨면 mast
      자연어 신뢰 금지·결정론) 후 `cys cycle-agent`로 master surface에
      `/clear`+Enter를 주인 대신 집행한다(surface는 role 주소로 해소·하드코딩 금지·master role 확인 후·
      `--force-no-verify` 평시 금지).
-     호출 예: `cys cycle-agent --role <산출자역할> --verifier worker` . 규칙 4:
+     호출 예: `cys cycle-agent --role <산출자역할> --verifier worker --fire <경보의 fire=>` (`--fire` 가 있어야 데몬이 그 통보 뒤 사이클이 이미 끝났는지 판정한다 — 같은 경보의 재배달·끝난 사이클 뒤의 핸드셰이크 완료가 방금 복원된 master 를 다시 clear 하지 않는다). 규칙 4:
      ①검증자 기본은 worker 다. ★CSO 를 검증자로 지정하지 마라 — role-capability-gate 의 feed 허용
      동사에 reply 가 없어 구조적으로 판정을 낼 수 없다.
      ②★호출자 ≠ 검증자. 자기가 호출하면서 자기를 검증자로 지정하면 동기 호출 중 블록돼 자기 inbox 의

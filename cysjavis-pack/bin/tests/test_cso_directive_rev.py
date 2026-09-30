@@ -355,7 +355,7 @@ SAFETY_CLAUSES = {
         ("사이클 경계 조건", "**전부** 충족되면 master 가 ack 를 보내지 못해도 §2 대로 집행한다 — ①데몬이 발화한\n"
                       "  `context.threshold`(60%) 수신 ②안전지점 확인(master 가 게이트·커밋 중간이 아님 · 오너 실시간 입력\n"
                       "  중 아님 · AUTOPILOT_PAUSED 아님) ③저장 상태의 **독립 검증**(checksum 대조·최신 mtime — master 의\n"
-                      "  자연어 진술은 근거가 아니다) ④집행은 `cys cycle-agent --role master --verifier worker` **1콜**\n"
+                      "  자연어 진술은 근거가 아니다) ④집행은 `cys cycle-agent --role master --verifier worker --fire <경보의 fire=>` **1콜**\n"
                       "  ★검증자에 ★너 자신(cso)을 지정하지 마라 — 두 가지 이유로 구조적으로 불가능하다. ①호출자==검증자는 동기 호출 중\n"
                       "  블록돼 자기 inbox 의 handshake 에 응답할 시점이 없다(2026-09-17 1회차 교착). 도구가 exit 82\n"
                       "  verifier-collision 으로 거부한다. ②CSO 는 role-capability-gate 의 feed 허용 동사에 reply 가 없어 판정을 낼\n"
@@ -2946,6 +2946,99 @@ class ConvergenceRoundTwo(unittest.TestCase):
                                  "%s 에 개정 문면이 정확히 1회로 있지 않다" % name)
         # 생성물은 MASTER 바이트 연접이다 — 재합성을 빠뜨리면 배포본만 옛 문면으로 남는다.
         self.assertIn(master, ceo, "CEO_TEMPLATE 이 현재 MASTER_DIRECTIVE 를 담고 있지 않다(재합성 누락)")
+
+
+class ClearGuardFireWiring(unittest.TestCase):
+    """★(0.14.42 · RR1-ROLE-4 · RR1-ROLE-3) clear 가드 v3 의 단일 비행은 `--fire` 가 있을 때만 판정한다.
+
+    ①master·CEO clear 정본 절차(CSO 주도 6단계 ④ · §1-2 ⑦ ④ · MASTER §11 4단계)의 호출 예가 `--fire` 를 빠뜨리면 가장 느린 경로
+    (통보→master 저장·ack→CSO 검증→집행)가 stale 판정을 받지 못해, 같은 통보가 다시 배달되거나 핸드셰이크가 이미 끝난 사이클
+    뒤에 완료되면 방금 복원된 master 를 한 번 더 clear 한다(①). 그래서 **모든** `cys cycle-agent` 역할 호출 예가 `--fire` 를 싣는지
+    본다(생성물 CEO_TEMPLATE 포함 — 재합성 누락도 여기서 붉어진다).
+    ②rc 87 = 그 통보 뒤 사이클이 이미 끝남(재집행 금지)과 rc 88 = 다른 집행자의 사이클 진행 중(이미 처리됨이 아님)을 가른다 —
+    옛 문면('87 = 이미 처리됨(같은 좌석 사이클 진행 중 …)')이 남으면 점유자가 clear 전에 실패한 통보를 아무도 다시 보지 않는다(②)."""
+
+    CALL_RE = re.compile(r"`(cys cycle-agent[^`]*)`")
+    FILES = ("CSO_DIRECTIVE.md", "MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md")
+    OLD_BUSY_AS_DONE = (
+        "exit 87 = 이미 처리됨(재집행 금지)",
+        "87 = 이미 처리됨**(같은 좌석 사이클 진행 중",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        CsoDirectiveRevision.setUpClass()
+        cls.raw = CsoDirectiveRevision.raw
+
+    def test_every_role_call_example_carries_fire(self):
+        for name in self.FILES:
+            calls = [c for c in self.CALL_RE.findall(strip_html_comments(self.raw[name]))
+                     if "--role" in c or "--verifier" in c]
+            with self.subTest(directive=name):
+                self.assertTrue(calls, "%s 에 cycle-agent 역할 호출 예가 없다(검사가 공허)" % name)
+                for call in calls:
+                    self.assertIn("--fire", call, "%s 의 호출 예에 --fire 가 없다: %r" % (name, call))
+
+    def test_fire_is_kept_from_step_one(self):
+        """6단계 ①(경보 수신)에서 fire=<id> 를 보관해 ④(집행)에 넘긴다 — 핸드셰이크 동안 잃지 않는다."""
+        pins = {
+            "CSO_DIRECTIVE.md": "①master의 `context.threshold`(60%) 수신 — 경보의 `fire=<id>` 를 보관해 ④에 넘긴다",
+            "MASTER_DIRECTIVE.md": "CSO 는 경보의 `fire=<id>` 를 보관해 4단계에 넘긴다",
+            "CEO_TEMPLATE.md": "CSO 는 경보의 `fire=<id>` 를 보관해 4단계에 넘긴다",
+        }
+        for name, pin in pins.items():
+            with self.subTest(directive=name):
+                self.assertIn(squash(pin), squash(strip_html_comments(self.raw[name])))
+
+    def test_rc87_and_rc88_are_split(self):
+        for name in self.FILES:
+            folded = squash(strip_html_comments(self.raw[name]))
+            with self.subTest(directive=name):
+                for old in self.OLD_BUSY_AS_DONE:
+                    self.assertNotIn(squash(old), folded, "%s 가 진행 중(busy)을 '이미 처리됨'으로 적는다: %r" % (name, old))
+                self.assertIn(squash("87 = 그 통보 뒤 사이클이 이미 끝남"), folded, name)
+                self.assertIn(squash("88 = 다른 집행자"), folded, name)
+                self.assertIn(squash("이미 처리됨이 아니다"), folded, "%s 가 88 이 '이미 처리됨'이 아님을 적지 않는다" % name)
+
+    # ★(0.14.42 · RR2-ROLE-2) rc 88 뒤 재집행 계기 — 옛 문면은 quiescing(5단계)·완료 통지를 봤다. 점유는 0단계(저장 지시 전)에
+    #   잡혀 1~4단계 동안 quiescing 이 꺼져 있으므로 '아님'을 보고 곧바로 재집행하면 다시 전경 --timeout 을 기다려 88 로 끝나고,
+    #   점유자가 뒤이어 clear 전에 실패하면 아무도 집행하지 않았다(드릴 rr2-C88 · clear 2134.8초 — 대조 632.1초).
+    OLD_RC88_TRIGGER = (
+        "그 좌석이 `quiescing` 이 아님을 본 뒤 같은 `--fire` 로 1회 다시 집행한다",
+        "완료 통지 뒤 같은 `--fire` 로 1회 다시 집행해도 된다",
+    )
+
+    def _rc88_violations(self, raw):
+        folded = squash(strip_html_comments(raw))
+        bad = [old for old in self.OLD_RC88_TRIGGER if squash(old) in folded]
+        for need in ("한 번 재배달", "ctx_guard.claim", "턴 안에서 기다리지"):
+            if squash(need) not in folded:
+                bad.append("missing:" + need)
+        return bad
+
+    def test_rc88_waits_for_redelivery_not_quiescing(self):
+        """rc 88 은 턴을 끝내고 데몬의 재배달(같은 fire=)을 다음 판정의 계기로 삼는다 — 진행 여부는 ctx_guard.claim 이다."""
+        for name in self.FILES:
+            with self.subTest(directive=name):
+                self.assertEqual(self._rc88_violations(self.raw[name]), [], name)
+
+    def test_rc88_negative_control(self):
+        """음성 대조 — CSO 문면을 옛 quiescing 절차로 되돌리면 위 검사가 잡는다."""
+        mutated = self.raw["CSO_DIRECTIVE.md"].replace("한 번 재배달", "재배달", 1)
+        self.assertNotEqual(mutated, self.raw["CSO_DIRECTIVE.md"], "음성 대조 치환이 적중하지 않았다")
+        self.assertIn("missing:한 번 재배달", self._rc88_violations(mutated) + self._rc88_violations(
+            mutated.replace("**한 번 재배달**", "재배달")))
+        old = mutated + "\n" + self.OLD_RC88_TRIGGER[0]
+        self.assertTrue(any(v == self.OLD_RC88_TRIGGER[0] for v in self._rc88_violations(old)))
+
+    def test_negative_control_catches_a_dropped_fire(self):
+        """음성 대조 — 호출 예 하나에서 --fire 를 지우면 위 검사가 잡는다(검사기가 공허하지 않다)."""
+        mutated = self.raw["CSO_DIRECTIVE.md"].replace(
+            "`cys cycle-agent --role master --verifier worker --fire <경보의 fire=>`로 주인",
+            "`cys cycle-agent --role master --verifier worker`로 주인", 1)
+        self.assertNotEqual(mutated, self.raw["CSO_DIRECTIVE.md"], "음성 대조 치환이 적중하지 않았다")
+        calls = [c for c in self.CALL_RE.findall(mutated) if "--role" in c or "--verifier" in c]
+        self.assertTrue(any("--fire" not in c for c in calls))
 
 
 if __name__ == "__main__":
