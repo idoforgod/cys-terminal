@@ -131,12 +131,15 @@ pub struct ObservedUsage {
 //     돌아온 좌석은 **같은 관측값 열**이라 가드가 가를 수 없다(창 안 관측의 시각은 판정 입력이 아니다 · 검체
 //     `edge_cannot_tell_restore_from_work_so_both_fire_every_cycle`). 이 고리는 최소 간격에 묶이고(≤ 6/시간 · 24시간 ≤ 144 ·
 //     차단점 위 0초) 오너가 결재한다(기본값 ② 우선 — 수정 4회차). 가드는 그 발화를 **가장자리·C 띠 복귀 발화**로 세어(연속 수
-//     `edge_run` · 24시간 사이클 수) 오너 error feed 를 연속 1·2·4·8번째에 낸다(6시간 제한 밖 · 처방 후보: 자동 압축 켬 · 1M · 지침
-//     축소 · 자기보고면 자기보고 정정·실측 축 확보).
-//   · **고착 자기보고**(수정 4회차 R3V3-1 ③): 자기보고 축 발화 뒤 끝난 사이클의 그 축 첫 보고가 발화 때와 **정확히 같은 C 이상
-//     값**이면 그 사이클은 그 축에서 효과 증거가 없다 — 효과 없음 1회(strike · 900·2^(k−1) ≤ 7200 · 영구 정지 없음). 값이 바뀌거나
-//     C 아래면 정상 규칙(S 아래는 같은 값으로 돌아와도 고리가 없다 · S~C 가장자리 띠는 느린 정직한 보고와 같은 관측이라 ② 우선).
-//     실측 축은 쓰지 않는다(관측 동치 — 실측 C 띠·가장자리 좌석은 ② 우선으로 최소 간격 고리를 유지한다).
+//     `edge_run` · 고리 회차 `edge_episode` · 24시간 복귀·사이클 수) 오너 error feed 를 **고리 회차**의 1·2·4·8·16·32·64·128…번째에
+//     낸다(수정 5회차 R1V4-1 — 회차는 24시간 공백 뒤에만 새로 센다 · 좌석당 24시간 ≤ 8건 · 6시간 제한 밖 · 처방 후보: 자동 압축 켬 ·
+//     1M · 지침 축소 · 자기보고면 자기보고 정정·실측 축 확보).
+//   · **고착 자기보고**(수정 4회차 R3V3-1 ③ · 수정 5회차 V41NC-1 범위): 자기보고 축 발화 뒤 끝난 사이클의 그 축 첫 보고가 발화 때와
+//     **정확히 같고 차단점 이상으로만 보이는 값**(B · 200K·미상 89 · 1M 99)이면 그 사이클은 그 축에서 효과 증거가 없다 — 효과 없음
+//     1회(strike · 900·2^(k−1) ≤ 7200). 값이 바뀌거나 B 아래면 정상 규칙 — B 아래(C 이하)는 차단점 전의 좌석이 보일 수 있는 값이라
+//     창보다 드문 정직한 보고의 재성장과 같은 관측이다(S 아래는 고리가 없고 · S~C 는 ② 우선 — C 를 고착으로 세면 보류 동안 차단점을
+//     넘은 정직한 좌석이 보고조차 못 해 영구 무clear 였다 · 060075e8). 실측 축은 쓰지 않는다(관측 동치 — 실측 C 띠·가장자리 좌석은
+//     ② 우선으로 최소 간격 고리를 유지한다).
 //   · 발화 막대 = max(기본, min(R+5, max(S, R+1), C)) — S = 창 − 28K 토큰(200K 85 · 1M 96) · C = 창 − 23K 토큰(차단점 아래로
 //     보이는 가장 큰 정수 · 200K 88 · 1M 97). 막대는 C 를 넘지 않는다(101·NEVER 없음).
 //   · 같은 축·같은(확인된) 범위에서 10%p 이상 떨어지면 압축 — 90초 동안 다시 잰다(자동·수동 /compact·수동 /clear 구분 불가).
@@ -160,11 +163,12 @@ pub struct ObservedUsage {
 //        관측 · 확인된 S 이상 외톨이 짝의 낮은 값 · 창 뒤 첫 S 미만 관측). 예외(명시): ⓐ 세대 첫 관측 · ⓑ S 가장자리 — 사이클 뒤
 //        창 안의 확인된 S 이상 관측과 창 뒤 첫 S 이상 관측(그 보고는 R 밖 → 사이클 뒤 창 안·창 끝 첫 보고로 S 에 돌아오는 좌석은
 //        사이클마다 1회 · ≤ 6/시간) · ⓒ C 띠 — R ≥ C 이면 막대 = C ≤ R(사이클 뒤 수준이 C 이상인 좌석은 최소 간격마다 · ≤ 6/시간)
-//        — C 이상을 상수로 보고하는 **자기보고** 좌석은 고착 자기보고 strike 가 백오프로 묶는다(24시간 ≤ 15 · 가장자리 띠 85~87 을 창보다
-//        드물게 보고하는 자기보고 좌석은 ⓑ 로 보고 간격마다 · 900초면 24시간 96) · ⓓ 표지 없는 clear
+//        — 차단점 이상으로만 보이는 값(B · 200K 89)을 상수로 보고하는 **자기보고** 좌석은 고착 자기보고 strike 가 백오프로 묶는다(24시간
+//        ≤ 15 · C(88) 상수는 정직한 재성장과 관측 동치라 ⓒ 고리 그대로 ≤ 144 · 가장자리 띠 85~87 을 창보다 드물게 보고하는 자기보고
+//        좌석은 ⓑ 로 보고 간격마다 — 900초면 24시간 96 · 간격이 창 끝 바로 뒤면 보고마다 ≤ 144) · ⓓ 표지 없는 clear
 //        (오너 수동 /clear · 재기동)는 R 을 다시 재지 않는다 — 좌석의 가장 최근 관측이 그 막대 이상일 때만 발화 · ⓔ 자기보고 표본
 //        착오. ⓑ·ⓒ 는 자동 압축이 꺼진 좌석(또는 C 이상을 보고하는 좌석)의 I2 대가다(clear 로 차단점 아래를 유지할 수 없는 좌석 —
-//        연속 1·2·4·8번째 오너 error feed · 오너 결정).
+//        고리 회차 1·2·4·8…번째 오너 error feed · 오너 결정).
 // 가드 상태는 휘발이다 — 데몬 재기동 뒤 각 축 첫 교차는 기본 임계에서 1회 발화한다(가드 전 f7f7a262 과 같다 · 실패 방향 = 발화).
 
 /// 잰 수준 위로 이만큼(%p · 표시값) 자라야 발화한다(G) — 표시 5%p = 참 성장 4%p 이상(반올림 두 번).
@@ -206,13 +210,24 @@ pub(crate) fn ctx_pct_below_reserve(window: Option<u64>, reserve: u64) -> u8 {
     pct.min(100) as u8
 }
 
+/// (창 − 예약) **이상으로만** 보이는 가장 작은 정수 퍼센트 — c% 는 (c−0.5)% 부터라 c ≥ (창 − 예약)/창·100 + 0.5.
+/// c = ⌈(200·(창 − 예약) + 창) / (2·창)⌉. [`ctx_pct_below_reserve`] 의 짝이다(그 값 + 1 이거나 + 2 — 경계가 반올림 칸 가운데를 지나면
+/// 두 칸 사이의 한 표시값이 경계 양쪽에 걸친다 · 1M 차단점 97.7 → 98 이 그렇다). 창 미상은 [`CTX_ASSUMED_WINDOW`]. 100 캡.
+pub(crate) fn ctx_pct_at_or_above_reserve(window: Option<u64>, reserve: u64) -> u8 {
+    let w = window.filter(|w| *w > 0).unwrap_or(CTX_ASSUMED_WINDOW);
+    let usable = w.saturating_sub(reserve);
+    let pct = usable.saturating_mul(200).saturating_add(w).div_ceil(w.saturating_mul(2));
+    pct.min(100) as u8
+}
+
 /// clear 가드 v3 — 순수 상태기계(시각은 호출자가 데몬 단조 초로 준다 · 락·I/O 없음). 참조 구현 cg3.rs 를 파라미터만 상수로
 /// 옮겼다(발화 판정에 쓰이지 않는 발행 재료 몇 개 — `Verdict::Fire` 의 축·기본·창 · `Note::Ineffective` 의 발화 번호·시각 —
 /// 만 더했다).
 pub(crate) mod clear_guard {
     use super::{
-        ctx_pct_below_reserve, CC_BLOCKING_BUFFER_TOKENS, CC_SUMMARY_RESERVE_TOKENS, CTX_GUARD_BACKOFF_BASE_SECS,
-        CTX_GUARD_BACKOFF_MAX_SECS, CTX_GUARD_CLEAR_WAIT_SECS, CTX_GUARD_COMPACT_DROP, CTX_GUARD_CYCLING_MAX_SECS,
+        ctx_pct_at_or_above_reserve, ctx_pct_below_reserve, CC_BLOCKING_BUFFER_TOKENS, CC_SUMMARY_RESERVE_TOKENS,
+        CTX_GUARD_BACKOFF_BASE_SECS, CTX_GUARD_BACKOFF_MAX_SECS, CTX_GUARD_CLEAR_WAIT_SECS, CTX_GUARD_COMPACT_DROP,
+        CTX_GUARD_CYCLING_MAX_SECS,
         CTX_GUARD_GROWTH, CTX_GUARD_MEASURE_SECS, CTX_GUARD_MIN_SPACING_SECS, CTX_GUARD_REREAD_SECS, CTX_GUARD_SCOPES_KEPT,
         CTX_GUARD_STOP_MARGIN_TOKENS,
     };
@@ -226,6 +241,13 @@ pub(crate) mod clear_guard {
     /// 않으므로 자동 압축을 끈 좌석도 막대에 닿을 수 있다.
     pub fn block_cap(window: Option<u64>) -> u8 {
         ctx_pct_below_reserve(window, CC_SUMMARY_RESERVE_TOKENS + CC_BLOCKING_BUFFER_TOKENS)
+    }
+
+    /// ★(수정 5회차 · V41NC-1) B — 차단점(창 − 23K) **이상으로만** 보이는 가장 작은 표시값(200K 89 · 1M 99 · 미상 89). 차단점 전의
+    /// 좌석은 이 값을 보일 수 없다(C 이하 · 1M 은 98 까지) — 고착 자기보고 규칙의 하한이다: 사이클 전후 같은 값이 이 아래면 정직한
+    /// 재성장(창보다 드문 보고가 복원 뒤 같은 값에 닿음)과 관측이 같다.
+    pub fn blocked_floor(window: Option<u64>) -> u8 {
+        ctx_pct_at_or_above_reserve(window, CC_SUMMARY_RESERVE_TOKENS + CC_BLOCKING_BUFFER_TOKENS)
     }
 
     /// (퍼센트, 그 창).
@@ -391,9 +413,10 @@ pub(crate) mod clear_guard {
         DropAfterCycle,
         /// 직전 발화 뒤 사이클 표지가 한 번도 관측되지 않은 채 다시 발화 조건이 됐다(원인은 가드가 모른다).
         NoCycle,
-        /// ★(수정 4회차 · R3V3-1 ③) 자기보고 축 발화 뒤 사이클이 끝났는데 **사이클 뒤 첫 자기보고가 발화 때와 정확히 같은 C 이상 값**
-        /// 이다 — 그 사이클의 효과를 그 축에서 볼 수 없다(고착 자기보고 · 원인은 가드가 모른다 — 갱신되지 않는 자기보고 · 정말로 clear
-        /// 로 낮출 수 없는 수준). 실측 축에는 쓰지 않는다(관측 동치 — 복원으로 돌아온 좌석과 작업 좌석이 같은 값 열이다 · ②).
+        /// ★(수정 4회차 · R3V3-1 ③ · 수정 5회차 V41NC-1 범위) 자기보고 축 발화 뒤 사이클이 끝났는데 **사이클 뒤 첫 자기보고가 발화 때와
+        /// 정확히 같고 차단점 이상으로만 보이는 값**([`blocked_floor`] 이상 · 200K 89)이다 — 그 사이클의 효과를 그 축에서 볼 수 없다
+        /// (고착 자기보고 · 원인은 가드가 모른다 — 갱신되지 않는 자기보고 · 정말로 clear 로 낮출 수 없는 수준). C 이하는 쓰지 않는다
+        /// (정직한 재성장과 관측 동치 · ②). 실측 축에는 쓰지 않는다(관측 동치 — 복원으로 돌아온 좌석과 작업 좌석이 같은 값 열이다 · ②).
         SelfReportUnchanged,
     }
 
@@ -445,11 +468,16 @@ pub(crate) mod clear_guard {
         /// 발화 뒤 시한까지 사이클 표지가 없었다(잠정 — 이것만으로 효과 없음을 세지 않는다).
         Unanswered { seq: u64, retry_after: f64 },
         /// ★(수정 4회차 · R3V3-1 ①②) 이 발화는 직전 발화 뒤 끝난 cys 사이클 뒤 잰 수준 위 G 성장을 기다리지 않는 예외로 났다 —
-        /// 사이클 뒤 창을 S 가장자리에서 닫은 보고 · 창 뒤 첫 관측이 S 이상(예외 ⓑ) · 또는 잰 수준이 C 이상(막대 = C · 예외 ⓒ). 판정에 쓰지 않는다(발행 재료 — 오너 feed 1·2·4·8번째 · 좌석 행).
-        /// `run` = 연속 수(성장으로 난 발화가 0 으로 끊는다) · `cycles_24h`·`confirmed_24h` = 이 좌석의 24시간 끝난 사이클 수·그중
+        /// 사이클 뒤 창을 S 가장자리에서 닫은 보고 · 창 뒤 첫 관측이 S 이상(예외 ⓑ) · 또는 잰 수준이 C 이상(막대 = C · 예외 ⓒ). 판정에 쓰지 않는다(발행 재료 — 오너 feed · 좌석 행).
+        /// `run` = 연속 수(성장으로 난 발화가 0 으로 끊는다 · 정보) · ★(수정 5회차 R1V4-1) `episode` = **고리 회차** — 이 좌석의 복귀
+        /// 발화 누적 수(직전 복귀 발화가 24시간보다 오래됐을 때만 1 부터 다시 센다 · 성장 발화로 끊기지 않는다 · 오너 error feed 는 이
+        /// 값이 2의 거듭제곱일 때만 — 어느 24시간 창도 한 회차의 연속 구간만 닿고 I1 이 그 안의 복귀 발화를 ≤ 144 로 묶으므로 ≤ 8건) ·
+        /// `returns_24h` = 24시간 복귀 발화 수(이 발화 포함) · `cycles_24h`·`confirmed_24h` = 이 좌석의 24시간 끝난 사이클 수·그중
         /// clear 실효 확인 수 · `confirmed` = 이 발화 직전 사이클의 clear 실효 확인 · `c_band` = 잰 수준 ≥ C.
         EdgeReturn {
             run: u32,
+            episode: u32,
+            returns_24h: u32,
             seq: u64,
             pct: u8,
             bar: u8,
@@ -578,11 +606,16 @@ pub(crate) mod clear_guard {
         /// 그 축의 다음 보고·다음 발화가 지운다.
         sr_probe: Option<(u64, u8, Option<u64>)>,
         /// ★(수정 4회차 · R3V3-1 ①) 축별 — 사이클 뒤 창을 S 가장자리에서 닫았다 · 또는 창 뒤 첫 관측이 S 이상이었다(그 축의 다음
-        /// 발화가 가장자리 복귀 발화 · 다른 창이 닫히면 지운다).
+        /// 발화가 가장자리 복귀 발화 · 다른 창이 닫히거나 그 축의 막대 아래 판정이 지운다 — 수정 5회차 V41R-2).
         edge_mark: [bool; 2],
         /// (발행 전용) 연속 가장자리·C 띠 복귀 발화 수 — 사이클 뒤 성장으로 난 발화가 0 으로 끊는다(사이클 없이 난 발화는 그대로 ·
-        /// 좌석 행 `edge_run` · feed 1·2·4·8번째).
+        /// 좌석 행 `edge_run` · 정보 — feed 조절에 쓰지 않는다: 성장 발화와 번갈면 늘 1 이다 · R1V4-1).
         pub edge_run: u32,
+        /// ★(수정 5회차 · R1V4-1 · 발행 전용) 고리 회차 — 복귀 발화 누적 수(직전 복귀 발화가 24시간 안에 없을 때만 새로 센다). 오너
+        /// error feed 는 이 값의 2의 거듭제곱 번째에만(좌석 행 `edge_episode`).
+        pub edge_episode: u32,
+        /// ★(수정 5회차 · R1V4-1 · 발행 전용) 복귀 발화 시각 — 24시간치(좌석 행 `edge_returns_24h` · feed · 회차 재시작 판정).
+        edge_log: std::collections::VecDeque<f64>,
         /// (발행 전용) 끝난 사이클의 (시각, clear 실효 확인) — 24시간치(좌석 행 `clears_24h` · feed).
         cycle_log: std::collections::VecDeque<(f64, bool)>,
     }
@@ -596,6 +629,11 @@ pub(crate) mod clear_guard {
         /// 최근 `secs` 초 안에 끝난 사이클 수 · 그중 clear 실효 확인 수(발행 재료 — 판정에 쓰지 않는다).
         pub fn cycles_within(&self, now: f64, secs: f64) -> (u32, u32) {
             self.cycle_log.iter().filter(|(t, _)| now - *t <= secs).fold((0, 0), |(n, c), (_, ok)| (n + 1, c + u32::from(*ok)))
+        }
+
+        /// 최근 `secs` 초 안의 가장자리·C 띠 복귀 발화 수(발행 재료 — 판정에 쓰지 않는다 · 수정 5회차 R1V4-1).
+        pub fn edge_returns_within(&self, now: f64, secs: f64) -> u32 {
+            self.edge_log.iter().filter(|t| now - **t <= secs).count() as u32
         }
 
         /// 집행자 단일 비행: 발화 `seq` 뒤에 사이클이 이미 끝났나(그 경보로 도는 사이클은 막 복원된 좌석을 다시 비운다).
@@ -852,17 +890,20 @@ pub(crate) mod clear_guard {
                 // clear·복원 도중 — 이 관측은 수준도 낙폭도 아니다(clear 의 3% · 재주입 중간값 · 새 세션 첫 보고).
                 return Out { notes, verdict: Some(Verdict::Quiet) };
             }
-            // ★(수정 4회차 · R3V3-1 ③) 고착 자기보고 — 자기보고 축 발화 뒤 끝난 사이클의 **그 축 첫 보고**가 발화 때와 정확히 같은 값이고
-            // 그 값이 C 이상이면(예외 ⓒ — 성장 없이 최소 간격마다 다시 발화하는 높이 · clear 로 차단점 아래를 되찾을 수 없는 높이) 그 사이클은
-            // 이 축에서 효과 증거가 없다: 그 발화의 결과를 효과 없음 1회로 정한다(strike · 지수 백오프 ≤ 7200 · 영구 정지 없음 · I2). C 아래는
-            // 쓰지 않는다 — S 아래는 같은 값으로 돌아와도 막대가 그 위라(G 성장) 고리가 없고(설계 단위 핀 F3), S~C 가장자리 띠는 느린
-            // 정직한 보고(창보다 긴 간격 — 복원이 같은 값에 닿는 좌석)와 고착 보고가 같은 관측이라 ② 우선(예외 ⓑ · 모형: S 까지 넓히면
-            // 정직한 느린 보고 행이 차단점 위로 간다). 값이 바뀌면(정직한 자기보고) 정상 규칙이다. 실측 축은 쓰지 않는다(관측 동치 · ②).
+            // ★(수정 4회차 · R3V3-1 ③ · 수정 5회차 V41NC-1) 고착 자기보고 — 자기보고 축 발화 뒤 끝난 사이클의 **그 축 첫 보고**가 발화 때와
+            // 정확히 같은 값이고 그 값이 **차단점 이상으로만 보이는 값**(B = `blocked_floor` · 200K·미상 89 · 1M 99)이면 그 사이클은 이 축에서
+            // 효과 증거가 없다: 그 발화의 결과를 효과 없음 1회로 정한다(strike · 지수 백오프 ≤ 7200 · I2). B 아래는 쓰지 않는다 — 차단점
+            // 전의 좌석이 보일 수 있는 값이라 정직한 재성장과 관측이 같다: S 아래는 막대가 그 위라(G 성장) 고리가 없고(설계 단위 핀 F3),
+            // S~C(가장자리 띠와 C — C 는 차단점 아래로 보이는 가장 큰 값)는 창보다 드문 정직한 보고가 복원 뒤 재성장으로 발화 값과 같은
+            // 첫 보고를 내는 좌석(주기 좌석은 매 사이클)과 고착 보고가 같은 관측이다 — 그 보고를 고착으로 세면 보류 동안 차단점을 넘은
+            // 정직한 좌석은 보고조차 못 해(자기보고 축은 보류 만료에 재판정하지 않는다) 영구 무clear 다(060075e8 의 C 이상 범위 · V41NC-1 ·
+            // 모형 44/4,440행 · 드릴 v41-srh 거부 59/54). 그래서 ② 우선(예외 ⓑ·ⓒ 의 최소 간격 고리 · 오너 결재 1). 값이 바뀌면 정상 규칙이다
+            // (단 이미 걸린 보류는 그 값과 무관하게 hold_until 까지다). 실측 축은 쓰지 않는다(관측 동치 · ②).
             // 이 보고는 아래에서 여느 관측처럼 수준·판정을 거친다(판정은 보류가 막는다).
             if r.axis == Axis::SelfReport {
                 if let Some((seq, p, w)) = self.sr_probe.take() {
                     if let Some(f) = self.fire.filter(|f| f.seq == seq && f.cleared && !f.evaluated) {
-                        if rebase((p, w), r.window) == r.pct && r.pct >= block_cap(r.window) {
+                        if rebase((p, w), r.window) == r.pct && r.pct >= blocked_floor(r.window) {
                             if let Some(fm) = self.fire.as_mut() {
                                 fm.evaluated = true;
                                 fm.tentative_until = None;
@@ -1012,6 +1053,10 @@ pub(crate) mod clear_guard {
             let bar = self.bar(axis, base, window);
             if pct < bar {
                 // 보류는 그대로 둔다 — 만료 때 그 축의 가장 최근 관측(바로 이 막대 아래 값 · 또는 그 뒤 관측)을 다시 판정한다.
+                // ★(수정 5회차 · V41R-2 · 발행 전용) 막대 아래 판정은 그 축의 가장자리 표시를 끝낸다 — 표시는 '이 축의 다음 판정이 가장자리
+                // 보고의 판정'이라는 뜻이고, 그 판정이 무발화로 끝났으면(표지 없는 clear 뒤 새 세션 · 압축된 좌석) 뒤이은 성장 발화는 복귀
+                // 발화가 아니다(종전: 표시가 남아 몇 시간 뒤 성장 발화가 '가장자리 복귀' error feed · 처방으로 나갔다 — 오진). 판정 무관.
+                self.edge_mark[axis as usize] = false;
                 return Verdict::Quiet;
             }
             let tentative =
@@ -1050,9 +1095,24 @@ pub(crate) mod clear_guard {
             self.sr_probe = None;
             if edge_fire {
                 self.edge_run = self.edge_run.saturating_add(1);
+                // ★(수정 5회차 · R1V4-1) 고리 회차 — 직전 복귀 발화가 24시간 안에 없으면 1 부터 다시 센다(시각만으로 끝난다 · 성장 발화는
+                // 회차를 끊지 않는다). 오너 error feed 는 회차의 2의 거듭제곱 번째에만 난다: 회차가 새로 시작하려면 24시간 공백이
+                // 있어야 하므로 어느 24시간 창도 한 회차의 연속 구간만 닿고, I1(최소 간격 600초)이 그 안의 복귀 발화를 ≤ 144 로 묶어
+                // 거듭제곱은 ≤ 8(1·2·4·…·128)이다 — 번갈이·속도 변동 좌석에서도 스톰이 없다(종전 연속 수는 성장 발화마다 0 으로 돌아가
+                // 가장자리 발화마다 '1번째'였다).
+                while self.edge_log.front().is_some_and(|t| now - *t > 86_400.0) || self.edge_log.len() > 1024 {
+                    self.edge_log.pop_front();
+                }
+                if self.edge_log.is_empty() {
+                    self.edge_episode = 0;
+                }
+                self.edge_episode = self.edge_episode.saturating_add(1);
+                self.edge_log.push_back(now);
                 let (cycles_24h, confirmed_24h) = self.cycles_within(now, 86_400.0);
                 notes.push(Note::EdgeReturn {
                     run: self.edge_run,
+                    episode: self.edge_episode,
+                    returns_24h: self.edge_returns_within(now, 86_400.0),
                     seq: self.seq,
                     pct,
                     bar,
@@ -1175,7 +1235,8 @@ pub(crate) fn ctx_guard_wire(daemon: &Daemon, s: &Surface) -> Value {
         Phase::Awaiting { at, .. } => Some(daemon.started_at + at),
         _ => None,
     };
-    let (clears_24h, confirmed_24h) = g.cycles_within(ctx_guard_now(daemon), 86_400.0);
+    let now = ctx_guard_now(daemon);
+    let (clears_24h, confirmed_24h) = g.cycles_within(now, 86_400.0);
     json!({
         "phase": g.phase.as_str(),
         "fire_id": g.fire.map(|f| crate::handlers::ctx_guard_fire_id(daemon, s.id, f.seq)),
@@ -1186,6 +1247,9 @@ pub(crate) fn ctx_guard_wire(daemon: &Daemon, s: &Surface) -> Value {
         "resolved_through": g.resolved_through,
         "claim": claim,
         "edge_run": g.edge_run,
+        // ★(수정 5회차 · R1V4-1) 고리 회차(24시간 공백 뒤 새로 셈 · feed 는 2의 거듭제곱 번째) · 24시간 복귀 발화 수.
+        "edge_episode": g.edge_episode,
+        "edge_returns_24h": g.edge_returns_within(now, 86_400.0),
         "clears_24h": clears_24h,
         "confirmed_clears_24h": confirmed_24h,
     })
@@ -5081,7 +5145,7 @@ mod ctx_guard_tests {
     /// 예외 ⓑ·ⓒ 로 사이클마다 한 번 발화한다 — 그 보고는 작업이 넘긴 보고와 같은 관측이라(검체 `edge_cannot_tell_restore_from_work_so_
     /// both_fire_every_cycle`) 실측 축은 줄이지 않는다. 수치 상한: 24시간 clear ≤ 144(최소 간격 · 부트 포함) · 차단점 위 0초 · 발화는
     /// 전부 S 이상 관측. 고착 자기보고(C 이상 상수 · 사이클 전후 같은 값)는 백오프 상한(24시간 15) 이하다(종전 144). 이 고리는
-    /// 오너 feed 가 연속 1·2·4·8번째에 알린다(`context.edge_return`).
+    /// 오너 feed 가 고리 회차의 1·2·4·8…번째에 알린다(`context.edge_return` · 수정 5회차 R1V4-1).
     #[test]
     fn r1v3_1_edge_and_stuck_loops_are_numerically_bounded() {
         let d24 = 24.0 * 3600.0;
@@ -5098,10 +5162,14 @@ mod ctx_guard_tests {
             assert!(run.fires.iter().skip(1).all(|f| f.1 >= stop_cap(W)), "{name}: S 아래 재발화 {:?}", run.fires);
         }
         let bound = backoff_bound(d24);
-        for v in [88u8, 100] {
+        for v in [89u8, 100] {
             let (fires, cycles, _) = drive_self(&|_, _| v, 60.0, cg::Outcome::Cleared, d24);
             assert!(cycles <= bound, "고착 자기보고 {v}: 24시간 clear {cycles} > 백오프 상한 {bound} · {fires:?}");
         }
+        // (수정 5회차 · V41NC-1) C(88) 상수 자기보고는 정직한 재성장과 관측이 같아 고착 strike 밖 — 가장자리·C 띠 고리(② 우선)와 같은
+        // 최소 간격 상한(24시간 ≤ 144 · strike 0).
+        let (fires, cycles, k) = drive_self(&|_, _| 88, 60.0, cg::Outcome::Cleared, d24);
+        assert!(cycles <= 144 && k == 0, "C 상수 자기보고: 24시간 clear {cycles} > 144 또는 strike {k} · {:?}", &fires[..fires.len().min(6)]);
     }
 
     /// RNC4-1(좌석): 집행자가 처음 두 번 부재(무응답 발화 둘 → strikes 2)였다가 복귀해 clear 에 성공한 뒤 작업이 분당 1%p 로
@@ -5398,6 +5466,117 @@ mod ctx_guard_tests {
         assert_eq!(g.cycles_within(t + 1300.0 + 86_400.0, 86_400.0).0, 0, "24시간 밖 사이클은 세지 않는다");
     }
 
+    /// R1V4-1(수정 5회차 · 순수 API): 오너 error feed 의 재료인 **고리 회차**(`Note::EdgeReturn.episode`)는 성장 발화로 끊기지 않고
+    /// 24시간 동안 복귀 발화가 없을 때만 1 부터 다시 센다 — 무작위 사건열(가장자리 복귀 · 성장 발화 · 0~30시간 공백을 섞은 5만 사이클)에서
+    /// 회차가 2의 거듭제곱인 복귀 발화(= error feed)는 어느 굴림 24시간에도 ≤ 8건이다(I1 이 24시간 복귀 발화를 ≤ 144 로 묶고 회차 재시작은
+    /// 24시간 공백을 요구한다). 연속 수(`run`)는 성장 발화가 0 으로 끊는 정보값이다(종전 feed 기준 — 번갈이 좌석에서 늘 1).
+    #[test]
+    fn r1v4_1_edge_episode_survives_growth_fires_and_restarts_only_after_a_24h_gap() {
+        let edge_of = |o: &cg::Out| {
+            o.notes.iter().find_map(|n| match n {
+                Note::EdgeReturn { run, episode, returns_24h, .. } => Some((*run, *episode, *returns_24h)),
+                _ => None,
+            })
+        };
+        let mut g = ClearGuard::default();
+        assert!(fired(&rep(&mut g, 70, "s0", 0.0)));
+        let mut t = 0.0; // 직전 발화 시각
+        let mut k = 0u32;
+        // 가장자리 복귀 발화(사이클 뒤 72·80·86 → 최소 간격 만료에 발화) · 성장 발화(62 → 접기 62 → 67).
+        let edge = |g: &mut ClearGuard, t: &mut f64, k: &mut u32| -> cg::Out {
+            *k += 1;
+            let sc = format!("e{k}");
+            g.cycle_on(*t + 60.0, false);
+            g.cycle_off(cg::Outcome::Cleared, *t + 75.0, false);
+            rep(g, 72, &sc, *t + 90.0);
+            rep(g, 80, &sc, *t + 110.0);
+            assert!(!fired(&rep(g, 86, &sc, *t + 130.0)));
+            let o = g.tick(*t + 600.001, false);
+            assert!(fired(&o), "{o:?}");
+            *t += 600.001;
+            o
+        };
+        let growth = |g: &mut ClearGuard, t: &mut f64, k: &mut u32, gap: f64| -> cg::Out {
+            *k += 1;
+            let sc = format!("g{k}");
+            g.cycle_on(*t + 60.0, false);
+            g.cycle_off(cg::Outcome::Cleared, *t + 75.0, false);
+            rep(g, 62, &sc, *t + 90.0);
+            let _ = g.tick(*t + 680.0, false);
+            rep(g, 62, &sc, *t + 700.0);
+            let o = rep(g, 67, &sc, *t + 1300.0 + gap);
+            assert!(fired(&o), "{o:?}");
+            *t += 1300.0 + gap;
+            o
+        };
+        // ① 번갈이 — 회차 1·2·3 이 이어지고 연속 수는 늘 1.
+        for n in 1..=3u32 {
+            let o = edge(&mut g, &mut t, &mut k);
+            assert_eq!(edge_of(&o), Some((1, n, n)), "{o:?}");
+            assert!(edge_of(&growth(&mut g, &mut t, &mut k, 0.0)).is_none());
+        }
+        // ② 24시간 이내 공백(성장 발화까지 23시간)은 회차를 끊지 않는다 · 24시간 넘는 공백 뒤 첫 복귀는 회차 1.
+        assert!(edge_of(&growth(&mut g, &mut t, &mut k, 23.0 * 3600.0 - 2000.0)).is_none());
+        let o = edge(&mut g, &mut t, &mut k);
+        assert_eq!(edge_of(&o).map(|e| e.1), Some(4), "24시간 안의 복귀는 같은 회차: {o:?}");
+        assert!(edge_of(&growth(&mut g, &mut t, &mut k, 25.0 * 3600.0)).is_none());
+        let o = edge(&mut g, &mut t, &mut k);
+        assert_eq!(edge_of(&o), Some((1, 1, 1)), "24시간 공백 뒤 첫 복귀는 회차 1: {o:?}");
+        assert_eq!(g.edge_episode, 1);
+        // ③ 무작위 5만 사이클 — 굴림 24시간 feed(회차 2의 거듭제곱) ≤ 8 · 회차 재시작 ⇔ 직전 복귀 발화가 24시간보다 오래.
+        let mut r = Rng(0xC1EA_F175);
+        let mut feeds: Vec<f64> = vec![];
+        let mut last_edge: Option<f64> = Some(t);
+        let mut prev_ep = g.edge_episode;
+        for _ in 0..50_000 {
+            let o = match r.pick(10) {
+                0..=5 => edge(&mut g, &mut t, &mut k),
+                6..=8 => growth(&mut g, &mut t, &mut k, 0.0),
+                _ => growth(&mut g, &mut t, &mut k, r.f() * 30.0 * 3600.0),
+            };
+            if let Some((_, ep, r24)) = edge_of(&o) {
+                let restarted = last_edge.is_none_or(|l| t - l > 86_400.0);
+                assert_eq!(ep, if restarted { 1 } else { prev_ep + 1 }, "회차 규칙 t={t}");
+                assert!(r24 >= 1 && r24 <= 145, "24시간 복귀 수 {r24}");
+                if ep.is_power_of_two() {
+                    feeds.push(t);
+                }
+                prev_ep = ep;
+                last_edge = Some(t);
+            }
+        }
+        let worst = (0..feeds.len()).map(|i| feeds[i..].iter().take_while(|x| **x - feeds[i] < 86_400.0).count()).max().unwrap_or(0);
+        assert!(worst <= 8 && feeds.len() > 50, "굴림 24시간 error feed 최대 {worst} > 8(스톰) · feed {}", feeds.len());
+    }
+
+    /// V41R-2(수정 5회차 · 연관 minor): 가장자리 표시는 그 축의 **막대 아래 판정**이 끝낸다 — 가장자리 보고가 최소 간격 보류 중일 때 오너
+    /// 손 /clear(표지 없음)로 새 세션이 막대 아래로 보고하면(판정 Quiet) 표시가 지워져, 몇 시간 뒤 새 세션의 성장 발화(86 ≥ 막대 85 =
+    /// R80+5)는 복귀 발화가 아니다(EdgeReturn 없음 · 연속·회차 0). 종전 표시가 남아 '가장자리 복귀' error feed 와 처방이 나갔다(오진).
+    /// 음성 대조: 표시 없는 같은 경로(재검증자 시나리오 C)와 결과가 같다.
+    #[test]
+    fn v41r_2_quiet_decision_ends_the_edge_mark() {
+        let mut g = ClearGuard::default();
+        assert!(fired(&rep(&mut g, 70, "A", 0.0)));
+        g.cycle_on(60.0, false);
+        g.cycle_off(cg::Outcome::Cleared, 75.0, false);
+        rep(&mut g, 72, "B", 90.0);
+        rep(&mut g, 80, "B", 110.0);
+        assert!(matches!(rep(&mut g, 86, "B", 130.0).verdict, Some(Verdict::Held { .. })), "전제: 가장자리 보고 최소 간격 보류");
+        assert!(matches!(rep(&mut g, 5, "C", 200.0).verdict, Some(Verdict::Quiet)), "표지 없는 clear 뒤 새 세션");
+        let mut t = 202.0;
+        while t < 700.0 {
+            assert!(!fired(&g.tick(t, false)));
+            t += 2.0;
+        }
+        for (p, at) in [(20u8, 1800.0), (40, 3000.0), (60, 4200.0), (75, 5400.0), (84, 6300.0)] {
+            assert!(!fired(&rep(&mut g, p, "C", at)));
+        }
+        let o = rep(&mut g, 86, "C", 6600.0);
+        assert!(fired(&o), "새 세션 성장 발화: {o:?}");
+        assert!(!o.notes.iter().any(|n| matches!(n, Note::EdgeReturn { .. })), "표지 없는 clear 뒤 성장 발화를 가장자리 복귀로 셌다(오진): {o:?}");
+        assert_eq!((g.edge_run, g.edge_episode), (0, 0));
+    }
+
     /// 자기보고 좌석 구동기(실측 축 없음 — agy·grok 류): status.set 이 `every` 초마다 `v(시각, 끝난 사이클 수)` 를 보고한다(사이클 도중
     /// 보고는 가드가 버린다). 집행자는 발화 60초 뒤 표지 켬 · 30초 뒤 끔(결과 `outcome`). 반환: (발화 시각, 사이클 수, 최대 strikes).
     fn drive_self(v: &dyn Fn(f64, usize) -> u8, every: f64, outcome: cg::Outcome, secs: f64) -> (Vec<f64>, usize, u32) {
@@ -5453,9 +5632,10 @@ mod ctx_guard_tests {
         }
     }
 
-    /// R3V3-1 ③(고착 자기보고): 자기보고 축 발화 뒤 사이클이 끝났는데 **사이클 뒤 첫 자기보고가 발화 때와 정확히 같은 C 이상 값**이면
-    /// 그 사이클은 그 축에서 효과 증거가 없다 — strike +1(지수 백오프 900·2^(k−1) ≤ 7200 · 영구 정지 없음 · I2). C(88) 이상을 상수로
-    /// 보고하는 좌석은 종전 24시간 144회(보고 60·300초 · 확인·모름 같음 · 재검증자 selfrep) clear 됐다 — 백오프 상한(15) 이하로 준다.
+    /// R3V3-1 ③(고착 자기보고 · 수정 5회차 V41NC-1 로 범위 조정): 자기보고 축 발화 뒤 사이클이 끝났는데 **사이클 뒤 첫 자기보고가 발화
+    /// 때와 정확히 같고 차단점 이상으로만 보이는 값**(200K·미상 89 이상)이면 그 사이클은 그 축에서 효과 증거가 없다 — strike +1(지수
+    /// 백오프 900·2^(k−1) ≤ 7200 · 영구 정지 없음 · I2). 그런 값을 상수로 보고하는 좌석은 종전 24시간 144회 clear 됐다 — 백오프 상한(15)
+    /// 이하로 준다. C(88) 이하는 정직한 재성장과 같은 관측이라 이 규칙 밖이다(`v41nc_1_*` · 가장자리·C 띠 고리 · ② 우선).
     /// v ≤ 87(짝 R = v · 막대 v+1)은 종전에도 1회였다.
     #[test]
     fn r3v3_1_stuck_self_report_backs_off_instead_of_looping() {
@@ -5463,7 +5643,7 @@ mod ctx_guard_tests {
         assert_eq!(bound, 15, "백오프 상한 계산(0 · 900 · 2700 · 6300 · 13500 + 7200·k ≤ 86400)");
         for outcome in [cg::Outcome::Cleared, cg::Outcome::Unknown] {
             for every in [60.0, 300.0] {
-                for v in [88u8, 90, 95, 100] {
+                for v in [89u8, 90, 95, 100] {
                     let (fires, cycles, k) = drive_self(&|_, _| v, every, outcome, 86_400.0);
                     let what = format!("v {v} · every {every} · {outcome:?}");
                     assert!(cycles <= bound, "{what}: 고착 자기보고 24시간 clear {cycles} > 백오프 상한 {bound} · 발화 {fires:?}");
@@ -5479,10 +5659,15 @@ mod ctx_guard_tests {
             }
             // 가장자리 값(85~87)을 창(600초)보다 드물게(900초) 보고하는 좌석 — 사이클 뒤 창이 비어 창 뒤 첫 보고가 S 이상이면 접지 않고
             // 판정한다(RNC6-1 · R 미상 → 막대 = 기본). 느린 정직한 보고(복원이 같은 값에 닿는 좌석)와 같은 관측이라 고착 규칙을 쓰지 않는다
-            // (② 우선 · 예외 ⓑ) — 수치 상한: 보고 간격마다 1회(24시간 ≤ 96 ≤ 144) · strike 없음.
+            // (② 우선 · 예외 ⓑ) — 수치 상한: 보고 간격마다 1회(900초면 24시간 ≤ 96) · strike 없음. 간격이 창 끝(발화 + 사이클 + 600초)
+            // 바로 뒤면 보고마다 발화한다(수정 5회차 문구 정정 · 재검증 R1V4-3: 700초 124) — 어느 간격이든 최소 간격 상한(≤ 144) 안이다.
             for v in [85u8, 86, 87] {
                 let (fires, cycles, k) = drive_self(&|_, _| v, 900.0, outcome, 86_400.0);
                 assert!(cycles <= 96 && k == 0, "가장자리 {v} · 900초 · {outcome:?}: 24시간 clear {cycles} > 96 또는 strike {k} · {fires:?}");
+                for every in [610.0, 700.0, 1200.0, 1800.0] {
+                    let (fires, cycles, k) = drive_self(&|_, _| v, every, outcome, 86_400.0);
+                    assert!(cycles <= 144 && k == 0, "가장자리 {v} · {every}초 · {outcome:?}: 24시간 clear {cycles} > 144 또는 strike {k} · {:?}", &fires[..fires.len().min(6)]);
+                }
             }
         }
     }
@@ -5515,6 +5700,113 @@ mod ctx_guard_tests {
         for v in [70u8, 86, 87] {
             let (fires, _, k) = drive_self(&|_, _| v, 60.0, cg::Outcome::Cleared, 6.0 * 3600.0);
             assert_eq!((k, fires.len()), (0, 1), "C 아래 {v}: {fires:?}");
+        }
+    }
+
+    // ───────────── ②-4 수정 5회차 반례 검체(V41NC-1) ─────────────
+
+    /// V41NC-1(순수 API · 재검증자 v41unit 모양): 자기보고 축 88(C) 통보 → cys 사이클 → 창 뒤 첫 자기보고가 **다시 88** 이다. C 는
+    /// 차단점(200K 88.5) 아래로 보이는 가장 큰 값이라, 자동 압축을 끈 좌석이 창보다 드물게 참값을 보고하면 복원 뒤 재성장으로 발화
+    /// 값과 정확히 같은 첫 보고가 나온다(주기 좌석은 매 사이클) — 고착과 관측이 같다. 그러므로 고착 strike 는 **차단점 이상으로만 보이는
+    /// 값**(200K·미상 89 · 1M 99)에만 쓴다: 88 은 곧바로 판정(발화 · strike 없음). 060075e8 은 여기서 strike · 보류 1900 이었고 자기보고
+    /// 축은 보류 만료에 재판정되지 않아, 그 사이 차단점을 넘은 좌석은 보고조차 못 해 영구 무clear 였다(②).
+    /// 1M 창: C 97 · 98 은 참값 97.5~97.7 로 차단점(97.7) 전일 수 있다 → strike 없음 · 99 부터 strike.
+    #[test]
+    fn v41nc_1_honest_regrowth_to_c_after_a_cycle_is_decided_not_struck() {
+        let run = |window: Option<u64>, v: u8| {
+            let mut g = ClearGuard::default();
+            let sr = |g: &mut ClearGuard, pct: u8, now: f64| g.report(&Rep { pct, window, axis: Axis::SelfReport, scope: "", base: 60, now, frozen: false });
+            assert!(fired(&sr(&mut g, v, 0.0)));
+            g.cycle(true, 60.0, false);
+            g.cycle(false, 120.0, false);
+            (sr(&mut g, v, 1000.0), g)
+        };
+        for (window, v) in [(None, 88u8), (W, 88), (Some(1_000_000), 97), (Some(1_000_000), 98)] {
+            let (o, g) = run(window, v);
+            assert!(strikes(&o).is_empty() && g.strikes == 0, "창 {window:?} · {v}: 정직한 재성장과 같은 관측인데 고착 strike: {o:?}");
+            assert!(matches!(o.verdict, Some(Verdict::Fire { pct, .. }) if pct == v), "창 {window:?} · {v}: 곧바로 판정(발화)해야 한다: {o:?}");
+        }
+        // 차단점 이상으로만 보이는 값(200K·미상 89 · 1M 99) — 사이클 전후 같으면 고착 strike(백오프 · 영구 정지 없음).
+        for (window, v) in [(None, 89u8), (W, 89), (W, 100), (Some(1_000_000), 99)] {
+            let (o, g) = run(window, v);
+            assert_eq!(strikes(&o), vec![Why::SelfReportUnchanged], "창 {window:?} · {v}: {o:?}");
+            assert!(matches!(o.verdict, Some(Verdict::Held { .. })) && g.strikes == 1, "창 {window:?} · {v}: {o:?}");
+        }
+    }
+
+    /// 정직한 자기보고 좌석 구동기(자동 압축 끔 · 실측 축 없음): 참값 x 는 사이클 뒤 `land` 로 돌아와 초당 `rate` %p 로 자란다. 차단점
+    /// (창 − 23K)에 닿으면 제출이 막혀 성장·보고가 멈추고, 집행의 저장 지시가 거부돼 표지 켬 전에 멈춘다(모형·드릴과 같은 실패 모양).
+    /// 자기보고는 `every` 초마다 round(x)(차단점 전만). 집행: 발화 60초 뒤 표지 켬 · 15초 뒤 끔(확인). 반환: (발화, 사이클, 차단점 위 초,
+    /// 저장 거부 수, 최대 strikes).
+    fn drive_honest_self(land: f64, rate: f64, every: f64, secs: f64) -> (Vec<(f64, u8)>, usize, f64, usize, u32) {
+        let block_at = (200_000.0 - (CC_SUMMARY_RESERVE_TOKENS + CC_BLOCKING_BUFFER_TOKENS) as f64) * 100.0 / 200_000.0;
+        let mut g = ClearGuard::default();
+        let (mut fires, mut cycles, mut above, mut failed, mut max_k) = (vec![], 0usize, 0.0f64, 0usize, 0u32);
+        let (mut on_at, mut off_at): (Option<f64>, Option<f64>) = (None, None);
+        let mut x = land;
+        let mut next = 1.0;
+        let mut t = 0.0f64;
+        while t <= secs {
+            let mut outs = vec![];
+            if on_at.is_some_and(|a| t >= a) {
+                on_at = None;
+                if x >= block_at {
+                    failed += 1;
+                } else {
+                    outs.push(g.cycle_on(t, false));
+                    x = 3.0;
+                    off_at = Some(t + 15.0);
+                }
+            }
+            if off_at.is_some_and(|a| t >= a) {
+                off_at = None;
+                outs.push(g.cycle_off(cg::Outcome::Cleared, t, false));
+                cycles += 1;
+                x = land;
+            }
+            if off_at.is_none() && x < block_at {
+                x += rate;
+            }
+            if x >= block_at {
+                above += 1.0;
+            }
+            if t >= next {
+                next += every;
+                if off_at.is_none() && x < block_at {
+                    outs.push(srep(&mut g, x.round() as u8, t));
+                }
+            }
+            if (t as u64) % 2 == 0 {
+                outs.push(g.tick(t, false));
+            }
+            for o in outs {
+                if let Some(Verdict::Fire { pct, .. }) = o.verdict {
+                    fires.push((t, pct));
+                    if on_at.is_none() && off_at.is_none() {
+                        on_at = Some(t + 60.0);
+                    }
+                }
+            }
+            max_k = max_k.max(g.strikes);
+            t += 1.0;
+        }
+        (fires, cycles, above, failed, max_k)
+    }
+
+    /// V41NC-1(좌석 · 재검증자 드릴 v41-srh 모양): 자동 압축을 끈 200K 자기보고 좌석이 복원 뒤 87.7 로 돌아와 천천히 자라고(차단점까지
+    /// 보고 한 간격 + 약 25%) 창(600초)보다 드문 간격(900·1200·1800초)으로 참값을 보고한다 — 사이클 뒤 첫 보고가 매번 발화 값 88 과
+    /// 같다(재성장). 그 보고로 곧바로 발화해야 차단점 전에 clear 된다: 차단점 위 0초 · 저장 거부 0 · strike 0 · 보고 간격마다 clear.
+    /// 060075e8 은 그 보고를 고착으로 세어(strike · 보류) 다음 보고 전에 차단점을 넘겨 끝까지 막혔다(드릴 new-a/b 거부 59/54 ·
+    /// 모형 44/4,440행). 실패 방향: 붉어지면 정직한 자기보고 좌석이 영구 무clear(②).
+    #[test]
+    fn v41nc_1_sparse_honest_self_report_seat_is_cleared_below_the_blocking_point() {
+        let d24 = 24.0 * 3600.0;
+        for every in [900.0, 1200.0, 1800.0] {
+            let (fires, cycles, above, failed, k) = drive_honest_self(87.7, 0.7 / every, every, d24);
+            let what = format!("보고 간격 {every}초");
+            assert_eq!((above, failed, k), (0.0, 0, 0), "{what}: 차단점 위 {above}초 · 저장 거부 {failed} · strikes {k} · 발화 {:?}", &fires[..fires.len().min(6)]);
+            assert!(fires.iter().all(|f| f.1 == 88), "{what}: 전제(재성장 첫 보고 = 88) {:?}", &fires[..fires.len().min(6)]);
+            assert!(cycles as f64 >= d24 / every - 2.0, "{what}: 사이클 {cycles} — 보고 간격마다 clear 되지 않았다");
         }
     }
 

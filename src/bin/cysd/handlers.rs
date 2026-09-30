@@ -3082,7 +3082,8 @@ const CTX_LEVEL_FEED_EVERY_SECS: f64 = 6.0 * 3600.0;
 ///     `axis`·`strikes`·`after_compaction`.
 ///   · `context.level_measured`·`context.clear_ineffective`(usage · 비라우팅) — 오너 feed(좌석당 6시간 1회 · 1·2·4·8…번째).
 ///   · `context.edge_return`(usage · 비라우팅 · ★수정 4회차 R3V3-1 ①) — 사이클 뒤 곧바로 가장자리·C 띠로 돌아와 난 발화마다 ·
-///     오너 error feed 는 연속 1·2·4·8번째(6시간 제한 밖 · 24시간 cys 사이클 수 · 연속 수 · 처방 후보).
+///     오너 error feed 는 고리 회차의 1·2·4·8·16·32·64·128…번째(★수정 5회차 R1V4-1 — 회차는 24시간 공백 뒤에만 새로 셈 · 좌석당
+///     24시간 ≤ 8건 · 6시간 제한 밖 · 24시간 복귀·cys 사이클 수 · 연속 수 · 처방 후보).
 ///   · `context.fire_unanswered`·`context.drop_before_cycle`(usage · 비라우팅 · 이벤트만).
 pub(crate) fn publish_ctx_guard(
     daemon: &Daemon,
@@ -3265,7 +3266,7 @@ pub(crate) fn publish_ctx_guard(
                 daemon.push_feed_notification("warn", &title, &body, Some(sid));
             }
             Note::MeasuredLate { .. } => {}
-            Note::EdgeReturn { run, seq, pct, bar, level, axis, window, c_band, cycles_24h, confirmed_24h, confirmed } => {
+            Note::EdgeReturn { run, episode, returns_24h, seq, pct, bar, level, axis, window, c_band, cycles_24h, confirmed_24h, confirmed } => {
                 daemon.bus.publish(
                     "context.edge_return",
                     "usage",
@@ -3275,6 +3276,8 @@ pub(crate) fn publish_ctx_guard(
                         "surface_ref": sref,
                         "fire_id": ctx_guard_fire_id(daemon, sid, seq),
                         "run": run,
+                        "episode": episode,
+                        "edge_returns_24h": returns_24h,
                         "context_pct": pct,
                         "threshold": bar,
                         "level_pct": level,
@@ -3286,9 +3289,11 @@ pub(crate) fn publish_ctx_guard(
                         "clear_confirmed": confirmed,
                     }),
                 );
-                // ★(R3V3-1 ①) 오너 error feed 는 연속 1·2·4·8번째(좌석당 6시간 제한 밖) — 사실(연속 수 · 24시간 사이클 수 · 돌아온
-                //   높이)과 조건부 처방만(자동 압축 상태·원인을 단정하지 않는다).
-                if !matches!(run, 1 | 2 | 4 | 8) {
+                // ★(R3V3-1 ① · 수정 5회차 R1V4-1) 오너 error feed 는 **고리 회차**(24시간 공백 뒤에만 새로 셈 · 성장 발화로 끊기지 않음)의
+                //   1·2·4·8·16·32·64·128…번째에만(좌석당 6시간 제한 밖 · 24시간 ≤ 8건 — 종전 연속 수는 성장 발화마다 0 으로 돌아가 번갈이
+                //   좌석에서 가장자리 발화마다 '1번째' 였다). 사실(회차 · 24시간 복귀·사이클 수 · 연속 수 · 돌아온 높이)과 조건부 처방만
+                //   (자동 압축 상태·원인을 단정하지 않는다).
+                if !episode.is_power_of_two() {
                     continue;
                 }
                 let self_axis = axis == Axis::SelfReport;
@@ -3298,15 +3303,17 @@ pub(crate) fn publish_ctx_guard(
                     format!("가장자리 {}%", stop_cap(window))
                 };
                 let title = format!(
-                    "{who} 사이클 뒤 {what} 높이에서 다시 clear 통보(성장을 기다리지 않는 예외) — 연속 {run}번째 · 24시간 cys 사이클 \
-                     {cycles_24h}회 ({sref})"
+                    "{who} 사이클 뒤 {what} 높이에서 다시 clear 통보(성장을 기다리지 않는 예외) — 이번 고리 {episode}번째 · 24시간 \
+                     {returns_24h}회 · 24시간 cys 사이클 {cycles_24h}회 ({sref})"
                 );
                 let mut body = format!(
                     "이 통보({} {pct}% · 막대 {bar}%)는 직전 cys 사이클 뒤 잰 수준 위 5%p 성장을 기다리지 않는 예외로 났다(사이클 뒤 10분 창 \
-                     안 가장자리 도달 · 창 뒤 첫 보고가 가장자리 이상 · 또는 잰 수준이 C 이상) — 성장으로 난 통보 없이 연속 {run}번째다. 이 좌석의 24시간 cys 사이클 {cycles_24h}회(그중 clear 실효 확인 \
-                     {confirmed_24h}회). 가드는 복원·회신으로 돌아왔는지 작업인지 가르지 않는다(같은 관측값 열) — 통보는 최소 간격(10분)에 \
-                     묶인다(시간당 ≤ 6 · 24시간 ≤ 144). 자동 압축이 꺼져 있다면 이 통보가 차단점 {}% 전의 저장 기회다(가드는 자동 압축 상태를 \
-                     모른다).",
+                     안 가장자리 도달 · 창 뒤 첫 보고가 가장자리 이상 · 또는 잰 수준이 C 이상). 이런 예외 통보가 이번 고리 {episode}번째 · \
+                     24시간 {returns_24h}회(성장으로 난 통보 없이 연속 {run}회)다. 이 좌석의 24시간 cys 사이클 {cycles_24h}회(그중 clear 실효 확인 \
+                     {confirmed_24h}회). 가드는 복원·회신으로 돌아왔는지 작업으로 올라왔는지 가르지 않는다(같은 관측값 열) — 통보는 최소 \
+                     간격(10분)에 묶인다(시간당 ≤ 6 · 24시간 ≤ 144). 이 feed 는 고리 회차의 1·2·4·8·16·32·64·128…번째에만 낸다(24시간 동안 \
+                     예외 통보가 없으면 회차를 새로 센다 · 좌석당 24시간 ≤ 8건 · 매 통보는 `context.edge_return` 이벤트와 좌석 행 \
+                     `ctx_guard.edge_returns_24h`). 자동 압축이 꺼져 있다면 이 통보가 차단점 {}% 전의 저장 기회다(가드는 자동 압축 상태를 모른다).",
                     axis_ko(axis),
                     block_point(window)
                 );
@@ -3377,14 +3384,16 @@ pub(crate) fn publish_ctx_guard(
                         let (v0, v1) = drop.unwrap_or((0, 0));
                         (
                             format!(
-                                "{who} cys 사이클 뒤 첫 자기보고가 통보 때와 같은 {v1}% — 자기보고로 clear 효과를 볼 수 없어 다음 자기보고 통보는 \
-                                 {d_min}분 뒤({strikes}번 연속) ({sref})"
+                                "{who} cys 사이클 뒤 첫 자기보고가 통보 때와 같은 {v1}%(차단점 이상으로만 보이는 값) — 자기보고로 clear 효과를 볼 수 \
+                                 없어 자기보고 통보를 {d_min}분 보류({strikes}번 연속) ({sref})"
                             ),
                             format!(
-                                "자기보고(status.set) 축 통보 {v0}% 뒤 cys 사이클이 끝났는데 사이클 뒤 첫 자기보고가 같은 {v1}% 다. 가드는 원인을 \
-                                 알지 못한다(가능: 자기보고가 갱신되지 않음 · clear 로 낮출 수 없는 수준). 통보를 미룬다(연속될수록 두 배 · 최대 \
-                                 {}분 · 영구 중단 없음 · 값이 바뀌면 곧바로 정상 규칙). 후보(오너 결정): 자기보고 값 정정(`cys set-status \
-                                 --context` 가 실제 값인지) · 실측 축(상태줄) 확보.",
+                                "자기보고(status.set) 축 통보 {v0}% 뒤 cys 사이클이 끝났는데 사이클 뒤 첫 자기보고가 같은 {v1}% 다({v1}% 는 차단점 이상으로만 \
+                                 보이는 값이다 — 차단점 전의 좌석은 이 값을 보일 수 없다 · 창 미상이면 200K 로 본다). 가드는 원인을 알지 못한다(가능: 자기보고가 갱신되지 않음 · 좌석이 \
+                                 이미 차단점에 있음 · clear 로 낮출 수 없는 수준). 자기보고 통보를 {d_min}분 보류한다(연속될수록 두 배 · 최대 {}분 · 보류 중 \
+                                 값이 바뀌어도 보류는 그대로다). 보류가 끝나면 **다음 자기보고가 올 때** 판정한다 — 자기보고 축은 보류 만료에 스스로 다시 \
+                                 판정하지 않으므로 좌석이 자기보고를 멈추면(차단점에서 제출이 막힌 좌석 포함) 이 축으로는 통보가 오지 않는다(그때는 오너 \
+                                 확인이 필요하다). 후보(오너 결정): 자기보고 값 정정(`cys set-status --context` 가 실제 값인지) · 실측 축(상태줄) 확보.",
                                 (crate::usage::CTX_GUARD_BACKOFF_MAX_SECS / 60.0) as u64,
                             ),
                         )
@@ -20662,10 +20671,11 @@ mod tests {
         }
     }
 
-    /// ★(수정 4회차 · R3V3-1 ①②) 사이클 뒤 곧바로 가장자리로 돌아와 난 발화마다 `context.edge_return`(연속 수 · 24시간 cys 사이클
-    /// 수) · 오너 **error** feed 는 연속 1·2·4·8번째만(좌석당 6시간 제한 밖 — level_measured feed 와 따로) · 좌석 행 `ctx_guard` 에
-    /// `edge_run`·`clears_24h`. 성장으로 난 발화가 연속을 끊는다(좌석 행 0). 실패 방향: 붉어지면 10분 clear 고리가 오너에게 6시간에
-    /// 1번만 보이거나(①의 비용 은폐) feed 가 스톰이 된다.
+    /// ★(수정 4회차 · R3V3-1 ①② · 수정 5회차 R1V4-1) 사이클 뒤 곧바로 가장자리로 돌아와 난 발화마다 `context.edge_return`(연속 수 ·
+    /// 고리 회차 · 24시간 복귀·cys 사이클 수) · 오너 **error** feed 는 고리 회차의 1·2·4·8…번째만(좌석당 6시간 제한 밖 — level_measured
+    /// feed 와 따로) · 좌석 행 `ctx_guard` 에 `edge_run`·`edge_episode`·`edge_returns_24h`·`clears_24h`. 성장으로 난 발화는 연속을 끊지만
+    /// (좌석 행 edge_run 0) 회차는 끊지 않는다. 실패 방향: 붉어지면 10분 clear 고리가 오너에게 6시간에 1번만 보이거나(①의 비용 은폐)
+    /// feed 가 스톰이 된다.
     #[test]
     fn edge_return_loop_is_fed_at_1_2_4_8_with_24h_counts() {
         let _pack = crate::governance::HOutsidePack::new(); // 팩 격리(ACL 경합 없음) — 좌석 전에
@@ -20695,13 +20705,15 @@ mod tests {
             .filter(|f| f.surface_id == Some(node) && f.kind == "error").map(|f| (f.title.clone(), f.body.clone())).collect();
         assert_eq!(errs.len(), 4, "1·2·4·8번째만: {errs:?}");
         for (k, (title, body)) in [1, 2, 4, 8].iter().zip(&errs) {
-            assert!(title.contains(&format!("연속 {k}번째")) && title.contains(&format!("24시간 cys 사이클 {k}회")), "{title}");
+            assert!(title.contains(&format!("이번 고리 {k}번째 · 24시간 {k}회")) && title.contains(&format!("24시간 cys 사이클 {k}회")), "{title}");
+            assert!(body.contains(&format!("연속 {k}회")) && body.contains("24시간 ≤ 8건"), "{body}");
             assert!(body.contains("처방 후보(오너 결정): 자동 압축 켬 · 1M 창 · 지침 축소") && body.contains("24시간 ≤ 144"), "{body}");
             assert!(!body.contains("자동 압축이 꺼진 좌석") && body.contains("자동 압축이 꺼져 있다면"), "자동 압축 상태 단정: {body}");
         }
         let w = crate::usage::ctx_guard_wire(&daemon, &s);
         assert_eq!((w["edge_run"].clone(), w["clears_24h"].clone(), w["confirmed_clears_24h"].clone()), (json!(9), json!(9), json!(9)), "{w}");
-        // 성장으로 난 발화 — 연속이 끊긴다(좌석 행 0 · edge_return 없음).
+        assert_eq!((w["edge_episode"].clone(), w["edge_returns_24h"].clone()), (json!(9), json!(9)), "{w}");
+        // 성장으로 난 발화 — 연속이 끊긴다(좌석 행 0 · edge_return 없음) · 고리 회차는 그대로(24시간 공백 뒤에만 새로 센다).
         s.ctx_loop_guard.lock().unwrap().cycle_on(t + 60.0, false);
         s.ctx_loop_guard.lock().unwrap().cycle_off(crate::usage::clear_guard::Outcome::Cleared, t + 75.0, false);
         at(62, t + 90.0);
@@ -20711,6 +20723,58 @@ mod tests {
         assert_eq!(threshold_events(&daemon, node).len(), 11);
         assert_eq!(named_events(&daemon, node, "context.edge_return").len(), 9);
         assert_eq!(crate::usage::ctx_guard_wire(&daemon, &s)["edge_run"], json!(0));
+        assert_eq!(crate::usage::ctx_guard_wire(&daemon, &s)["edge_episode"], json!(9));
+    }
+
+    /// ★(수정 5회차 · R1V4-1) 가장자리 복귀 발화와 성장 발화가 번갈아 나는 좌석(자동 압축 끔 200K · 작업 속도가 사이클마다 달라 10분 창
+    /// 안에 가장자리에 닿는 사이클과 못 닿는 사이클이 섞인다 — 재검증자 r1q-alt · feedstorm2)도 복귀 **error** feed 는 24시간 ≤ 8건이다:
+    /// feed 는 연속 수가 아니라 **고리 회차**(24시간 동안 복귀 발화가 없을 때만 새로 센다 · 성장 발화로 끊기지 않는다)의 1·2·4·8·16·32·
+    /// 64·128…번째에만 난다. 060075e8 은 연속 수가 성장 발화마다 0 으로 돌아가 가장자리 발화마다 '연속 1번째' error feed(토스트)를
+    /// 냈다(24시간 수십 건 · ① 오너 feed 스톰). 이벤트 `context.edge_return` 은 복귀 발화마다 그대로 난다(좌석 행·판독 재료).
+    #[test]
+    fn r1v4_1_edge_feed_is_bounded_when_edge_and_growth_fires_alternate() {
+        let _pack = crate::governance::HOutsidePack::new(); // 팩 격리(ACL 경합 없음) — 좌석 전에
+        let daemon = isolated_daemon(); // 상태 폴더 격리(동결·영속 공유 없음)
+        let node = make_surface(&daemon, Some("master"));
+        let s = daemon.get_surface(node).unwrap();
+        let t0 = crate::usage::ctx_guard_now(&daemon);
+        let at = |pct: u8, t: f64| maybe_fire_context_threshold_at(&daemon, &s, pct, "statusline", Some("claude"), t);
+        let cycle = |t: f64| {
+            s.ctx_loop_guard.lock().unwrap().cycle_on(t + 60.0, false);
+            let out = s.ctx_loop_guard.lock().unwrap().cycle_off(crate::usage::clear_guard::Outcome::Cleared, t + 75.0, false);
+            publish_ctx_guard(&daemon, &s, out, "cycle-marker", None);
+        };
+        at(70, t0);
+        let (mut t, mut edge_fires) = (t0, 0usize);
+        while t < t0 + 86_400.0 - 1900.0 {
+            // 가장자리 사이클: 사이클 뒤 72·80 → 86(창 안 가장자리 · 최소 간격 보류) → 발화 + 600 에 복귀 발화.
+            cycle(t);
+            at(72, t + 90.0);
+            at(80, t + 110.0);
+            at(86, t + 130.0);
+            crate::usage::ctx_guard_tick_at(&daemon, &s, t + 600.001);
+            t += 600.001;
+            edge_fires += 1;
+            // 성장 사이클: 사이클 뒤 62 → 창 닫힘 · 접기 62 → 67(막대 67) 성장 발화.
+            cycle(t);
+            at(62, t + 90.0);
+            crate::usage::ctx_guard_tick_at(&daemon, &s, t + 680.0);
+            at(62, t + 700.0);
+            at(67, t + 1300.0);
+            t += 1300.0;
+        }
+        assert_eq!(threshold_events(&daemon, node).len(), 1 + 2 * edge_fires, "전제: 부트 + 가장자리·성장 번갈이");
+        assert_eq!(named_events(&daemon, node, "context.edge_return").len(), edge_fires, "복귀 발화 이벤트는 발화마다");
+        let errs: Vec<(String, String)> = daemon.feed_items.lock().unwrap().iter()
+            .filter(|f| f.surface_id == Some(node) && f.kind == "error" && f.title.contains("가장자리"))
+            .map(|f| (f.title.clone(), f.body.clone())).collect();
+        assert!(errs.len() <= 8, "번갈이 좌석 24시간 복귀 error feed {} 건 > 8(① 오너 feed 스톰) · 복귀 발화 {edge_fires}", errs.len());
+        let expect = (1..=edge_fires).filter(|k| k.is_power_of_two()).count();
+        assert_eq!(errs.len(), expect, "고리 회차 1·2·4·8·16·32…번째에만: {:?}", errs.iter().map(|e| &e.0).collect::<Vec<_>>());
+        for ((title, body), k) in errs.iter().zip((1..=edge_fires).filter(|k| k.is_power_of_two())) {
+            assert!(title.contains(&format!("이번 고리 {k}번째")) && title.contains(&format!("24시간 {k}회")), "{title}");
+            assert!(body.contains("연속 1회") && body.contains("24시간 ≤ 8건"), "{body}");
+        }
     }
 
     /// ★(수정 4회차 · R3V3-1 ③) 고착 자기보고 — 자기보고 축 통보 뒤 cys 사이클이 끝났는데 사이클 뒤 첫 자기보고가 통보 때와 같은
@@ -20745,8 +20809,11 @@ mod tests {
         let warn: Vec<(String, String)> = daemon.feed_items.lock().unwrap().iter()
             .filter(|f| f.surface_id == Some(n) && f.kind == "warn" && f.title.contains("첫 자기보고")).map(|f| (f.title.clone(), f.body.clone())).collect();
         assert_eq!(warn.len(), 1, "{warn:?}");
-        assert!(warn[0].0.contains("같은 90%") && warn[0].0.contains("15분 뒤(1번 연속)"), "{warn:?}");
-        assert!(warn[0].1.contains("자기보고 값 정정") && warn[0].1.contains("영구 중단 없음"), "{warn:?}");
+        assert!(warn[0].0.contains("같은 90%") && warn[0].0.contains("15분 보류(1번 연속)"), "{warn:?}");
+        // (수정 5회차 · V41NC-2) 문구는 코드와 같아야 한다 — 보류는 값과 무관하게 끝까지 · 자기보고 축은 보류 만료에 스스로 재판정하지
+        // 않는다(보고를 멈춘 좌석은 이 축으로 통보가 오지 않는다). '영구 중단 없음 · 값이 바뀌면 곧바로 정상 규칙' 은 사실이 아니었다.
+        assert!(warn[0].1.contains("자기보고 값 정정") && warn[0].1.contains("다음 자기보고가 올 때") && warn[0].1.contains("보류는 그대로"), "{warn:?}");
+        assert!(!warn[0].1.contains("영구 중단 없음") && !warn[0].1.contains("곧바로 정상 규칙"), "코드와 다른 약속: {warn:?}");
         // 값이 바뀐 좌석(사이클 뒤 89) — strike 없음 · 최소 간격 뒤 C 띠 통보(예외 ⓒ 그대로).
         let (n2, _) = run(89);
         assert!(named_events(&daemon, n2, "context.clear_ineffective").is_empty());
