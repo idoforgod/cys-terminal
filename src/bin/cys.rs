@@ -194,6 +194,7 @@ enum Command {
     /// 87=건너뜀(송신 0건): --fire 의 통보 뒤 그 좌석의 사이클이 이미 끝났다 — 재집행하지 않는다.
     /// 88=진행 중(송신 0건): 다른 집행자의 사이클이 진행 중이다(--fire 가 있으면 단일 전체 시한이 남기는 만큼 — 기본 --timeout 120 에서 최대 30초 — 끝나기를 기다린 뒤) — 이미 처리됨이 아니다. 턴 안에서 기다리거나 곧바로 재집행하지 말고 끝낸다: 그 사이클이 clear 전에 끝나면 데몬이 같은 통보를 한 번 재배달하고(redelivery) 그때 같은 --fire 로 다시 집행해도 된다(데몬이 판정 · 끝났으면 87).
     /// 1콜 최악 시간 = 단일 전체 시한 570초(점유 대기 포함 · Claude Code Bash 도구 상한 600초 − 여유 30): clear 전 단계(0~4)는 570 − clear 뒤 몫(2×75 + 30)까지만 기다리므로 clear 가 나갔으면 clear 실효 확인·재주입 몫이 늘 남는다.
+    /// 89=접수(--detach): 데몬이 이 1콜을 대신 띄워 끝까지 붙든다(요청 좌석 신원 · 동시 상한 3 · master·CEO 먼저 · 좌석당 단일 비행) — 이 1콜은 곧바로 돌아온다(턴 안 대기 없음). 결과(위 종료코드와 사유 1줄)는 끝나면 요청 좌석의 큐로 한 번 온다(`[cycle-result] … rc=N`). --detach 에서 87 은 이미 끝난 통보 또는 이 좌석이 같은 통보를 이미 detach 로 집행해 88 밖 결과로 끝났다(재집행 금지) · 88 은 다른 집행자의 사이클·작업이 진행 중이다(기다리지 않고 곧바로 — 재배달을 기다린다).
     CycleAgent {
         #[arg(long)]
         role: Option<String>,
@@ -224,6 +225,15 @@ enum Command {
         /// 없으면 수동 사이클(진행 중 사이클은 기다리지 않고 88).
         #[arg(long)]
         fire: Option<String>,
+        /// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 비동기 집행 — 데몬에 접수만 하고 곧바로 돌아온다(rc 89). 데몬이 같은 사이클을
+        /// 자식으로 띄워 끝까지 붙들고(요청 좌석 신원 위임 · 동시 상한 3 · 한 칸은 master·CEO 몫 · 좌석당 단일 비행 · 630초 시한) 결과를
+        /// 요청 좌석의 큐로 한 번 보낸다(`[cycle-result] … rc=N` · 멱등). 좌석(pane) 안에서만 · 대상 ≠ 요청 좌석(self-clear 금지) ·
+        /// 동결 중 거부 · --force-no-verify·--clear-cmd 와 함께 쓸 수 없다. 구 데몬(RPC 없음)이면 rc 1 — 동기 1콜(Bash timeout 600000)로.
+        #[arg(long, conflicts_with_all = ["force_no_verify", "clear_cmd"])]
+        detach: bool,
+        /// (데몬 전용 · 숨김) 데몬이 띄운 비동기 사이클의 작업 번호 — stdin 의 `go` 한 줄(신원 위임 등록 뒤)을 받기 전에는 아무것도 보내지 않는다.
+        #[arg(long, hide = true)]
+        job: Option<String>,
     },
     /// T2-5 죽은 에이전트를 같은 surface에서 재기동 + 지침 재주입 + 복원 포인터
     NodeRecover {
@@ -1477,6 +1487,108 @@ impl CycleBudget {
     /// 시한까지 남은 초(문구용 · 올림).
     fn secs_until(at: std::time::Instant) -> u64 {
         at.saturating_duration_since(std::time::Instant::now()).as_secs_f64().ceil() as u64
+    }
+}
+
+/// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) `--detach` 접수(89) — 데몬이 사이클을 대신 띄웠다(또는 동시 상한 뒤 대기열). 이 1콜은
+/// 아무것도 보내지 않았다 — 결과는 요청 좌석의 큐로 온다(`[cycle-result] … rc=N`). 0(clear 실효 확인)과 섞지 않는다.
+const EXIT_CYCLE_DETACHED: i32 = 89;
+
+/// 데몬이 띄운 비동기 사이클의 시작 신호(순수) — 첫 줄이 정확히 `go` 일 때만(데몬 `cycle_jobs::GO_TOKEN` 과 같은 값).
+fn cycle_job_go_ok(line: &str) -> bool {
+    line.trim() == "go"
+}
+
+/// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) `cys cycle-agent --detach` — 동기 1콜과 같은 사전검사(대상 해소 · master 검증자 필수 ·
+/// 호출자==검증자) 뒤 데몬에 **접수만** 한다(`surface.cycle_detach`) · 곧바로 돌아온다. 결정(대상·통보·검증자)은 이 1콜이 했고 데몬은
+/// 그것을 대신 띄워 붙든다(스스로 사이클을 여는 경로 없음). 구 데몬은 자동으로 동기 1콜로 넘어가지 **않는다** — 요청자의 Bash 시한이
+/// 짧게 잡혀 있으면(detach 는 곧바로 돌아오므로) 동기 1콜이 clear 뒤·재주입 전에 끊길 수 있다(③).
+#[allow(clippy::too_many_arguments)]
+fn run_cycle_agent_detach(
+    role: Option<String>,
+    surface: Option<String>,
+    verifier: Option<String>,
+    save_files: Vec<String>,
+    resume_text: Option<String>,
+    timeout: u64,
+    fire: Option<String>,
+) -> i32 {
+    let result = (|| -> Result<i32, String> {
+        let sid = resolve_role_or_surface(&role, &surface)?;
+        let entry = surface_entry(sid)?;
+        if entry["exited"].as_bool() == Some(true) {
+            return Err(format!("surface:{sid} 이미 종료됨"));
+        }
+        let role_name = entry["role"].as_str().unwrap_or("worker").to_string();
+        if role_name == "master" && verifier.is_none() {
+            return Err("master cycle엔 --verifier <role>이 필수 (self-clear 금지 — 2-phase handshake)".into());
+        }
+        if let Some(v) = &verifier {
+            let vsid = request("system.resolve_role", json!({"role": v}))
+                .map_err(|e| e.to_string())
+                .and_then(|r| r["surface_id"].as_u64().ok_or_else(|| "bad verifier resolve".to_string()));
+            let caller_env = std::env::var("CYS_SURFACE_ID").ok();
+            verifier_precheck(caller_env.as_deref(), sid, v, &vsid)?;
+        }
+        let mut params = json!({"surface_id": sid, "timeout": timeout});
+        if let Some(f) = fire.as_deref().map(str::trim).filter(|f| !f.is_empty()) {
+            params["fire_id"] = json!(f);
+        }
+        if let Some(v) = &verifier {
+            params["verifier"] = json!(v);
+        }
+        if !save_files.is_empty() {
+            params["save_files"] = json!(save_files);
+        }
+        if let Some(r) = &resume_text {
+            params["resume_text"] = json!(r);
+        }
+        let r = request("surface.cycle_detach", params).map_err(|e| {
+            if e.starts_with("method_not_found") {
+                format!(
+                    "이 데몬은 --detach 를 모른다({e}) — 송신 0건. 동기 1콜(--detach 없이 · Bash 도구 timeout 600000 · 전경)로 집행하라                      (자동 전환하지 않는다 — 이 1콜의 도구 시한이 짧으면 clear 뒤·재주입 전에 끊길 수 있다)"
+                )
+            } else {
+                e
+            }
+        })?;
+        match r["detach"].as_str() {
+            Some("accepted") => {
+                let state = r["state"].as_str().unwrap_or("?");
+                eprintln!(
+                    "[cycle detach] 접수 — job {} · surface:{sid}({role_name}) · 통보 {} · {} — 데몬이 이 사이클을 띄워 끝까지 붙든다. 이 1콜은                      아무것도 보내지 않았다 · 결과는 네 큐로 온다([cycle-result] … rc=N) — 턴 안에서 기다리지 말고 턴을 끝낸다.",
+                    r["job"],
+                    fire.as_deref().unwrap_or("-"),
+                    if state == "running" { "진행 중".to_string() } else { format!("대기 {}번째(동시 상한)", r["position"]) },
+                );
+                println!("cycle detached → surface:{sid} ({role_name}) job {} {state}", r["job"]);
+                Ok(EXIT_CYCLE_DETACHED)
+            }
+            Some("stale") => Err(format!(
+                "{CYCLE_SKIPPED_TOKEN} 통보 {} 뒤 surface:{sid} 의 사이클이 이미 끝났다 — 같은 통보를 다시 집행하지 않는다(송신 0건 · 재집행 금지)",
+                fire.as_deref().unwrap_or("-")
+            )),
+            Some("repeat") => Err(format!(
+                "{CYCLE_SKIPPED_TOKEN} 통보 {} 는 이 좌석이 이미 detach 로 집행했다(job {} · rc {}) — 88 밖의 결과로 끝난 내 집행이라 재배달이 와도                  다시 집행하지 않는다(송신 0건 · 관측 확인·오너 상신 — 지침)",
+                fire.as_deref().unwrap_or("-"),
+                r["job"],
+                r["rc"]
+            )),
+            Some("busy") => Err(format!(
+                "{CYCLE_BUSY_TOKEN} surface:{sid} 에 다른 집행자의 사이클 또는 비동기 작업이 진행 중이다(점유 pid {} · 통보 {} · 작업 {}) — 접수하지                  않았다(송신 0건). 기다리지 말고 턴을 끝낸다 — 그 사이클이 clear 전에 끝나면 데몬이 이 통보를 한 번 재배달한다(같은 --fire 로                  다시 · 데몬이 판정한다)",
+                r["holder_pid"],
+                r["holder_fire_id"].as_str().unwrap_or("-"),
+                r["job"]
+            )),
+            other => Err(format!("알 수 없는 접수 응답({other:?}) — 송신 0건")),
+        }
+    })();
+    match result {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e}");
+            cycle_agent_exit(&Err(e))
+        }
     }
 }
 
@@ -5046,7 +5158,23 @@ fn run(command: Command) -> i32 {
             timeout,
             force_no_verify,
             fire,
+            detach,
+            job,
         } => {
+            if detach {
+                return run_cycle_agent_detach(role, surface, verifier, save_files, resume_text, timeout, fire);
+            }
+            if let Some(job) = job.as_deref() {
+                // ★(V42R-1) 데몬이 띄운 비동기 사이클 — 데몬이 이 프로세스의 신원 위임을 등록한 뒤 쓰는 `go` 한 줄 전에는 RPC 0건.
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                if !cycle_job_go_ok(&line) {
+                    eprintln!(
+                        "error: 비동기 사이클 작업 {job}: 데몬 신호(go) 없음 — 아무것도 보내지 않고 끝낸다(송신 0건 · --job 은 데몬 전용)"
+                    );
+                    return 1;
+                }
+            }
             return run_cycle_agent(
                 role, surface, verifier, save_files, clear_cmd, resume_text, timeout,
                 force_no_verify, fire,
@@ -19756,6 +19884,38 @@ impl Drop for CycleClaim {
     }
 }
 
+/// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 검증자 좌석 주입 직렬화(`surface.inject_lock`). 비동기 사이클(`--detach` · 데몬 동시 상한 3)이
+/// 같은 검증자 좌석에 `[CYCLE-VERIFY]` 를 거의 동시에 넣으면 붙여넣기 둘 뒤에 Return 이 와서 **한 제출로 합쳐진다**(드릴 v6-smoke 실측:
+/// 요청 셋이 한 제출 + 빈 CR 둘 · 검증자가 첫 요청만 답해 나머지 두 사이클이 '검증자 응답 없음'으로 clear 중단). 붙여넣기~Return 을
+/// 좌석당 하나씩 한다 — 기다림은 짧다(주입 1건 ≈ 1초 · 상한 20초 · 단계 시한 안). 구 데몬(RPC 없음)·질의 실패·시한이면 잠금 없이 종전처럼
+/// 곧바로 주입한다(실패 방향 = 주입 — 검증 요청을 막지 않는다). 해제는 Drop(모든 경로) · 점유자가 죽으면 데몬이 버린다.
+struct InjectLock {
+    sid: u64,
+    held: bool,
+}
+
+impl InjectLock {
+    fn acquire(sid: u64, deadline: std::time::Instant) -> Self {
+        loop {
+            match request("surface.inject_lock", json!({"surface_id": sid})) {
+                Ok(r) if r["lock"].as_str() == Some("locked") => return InjectLock { sid, held: true },
+                Ok(r) if r["lock"].as_str() == Some("busy") && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                _ => return InjectLock { sid, held: false },
+            }
+        }
+    }
+}
+
+impl Drop for InjectLock {
+    fn drop(&mut self) {
+        if self.held {
+            let _ = request("surface.inject_lock", json!({"surface_id": self.sid, "release": true}));
+        }
+    }
+}
+
 fn run_cycle_agent(
     role: Option<String>,
     surface: Option<String>,
@@ -20008,8 +20168,12 @@ fn run_cycle_agent(
             let mut verify_closer = CycleVerifyCloser::new(req_id.clone(), |rid: &str, decision: &str| {
                 let _ = request("feed.reply", json!({"request_id": rid, "decision": decision}));
             });
-            inject_text(vsid, &format!("[CYCLE-VERIFY] role '{role_name}'(surface:{sid})의 컨텍스트 순환 전 저장 검증 요청. SESSION_STATE/TODO 파일이 방금 갱신되었는지 확인하고 `cys feed reply {req_id} allow` 또는 `cys feed reply {req_id} deny`로 판정하라."))?;
+            // 3단계 시한 — 주입 잠금 대기(≤ 20초)와 판정 대기를 함께 묶는다(단일 전체 시한 안).
             let deadline = budget.stage(timeout);
+            // ★(수정 6회차 V42R-1) 검증자 좌석 주입 직렬화 — 붙여넣기~Return 을 좌석당 하나씩(동시 비동기 사이클의 요청 합체 차단).
+            let vlock = InjectLock::acquire(vsid, deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(20)));
+            inject_text(vsid, &format!("[CYCLE-VERIFY] role '{role_name}'(surface:{sid})의 컨텍스트 순환 전 저장 검증 요청. SESSION_STATE/TODO 파일이 방금 갱신되었는지 확인하고 `cys feed reply {req_id} allow` 또는 `cys feed reply {req_id} deny`로 판정하라."))?;
+            drop(vlock);
             // ★W4-B(결함 7): 해소 항목을 발견해도 decision 문자열로 즉석 판정하지 않고 영수증
             // 검증(cycle_receipt_ok — resolver==지정 검증자 대조)에 넘긴다. Err 는 전부 clear
             // 미실행 안전 중단(아래 match)이고, timeout(None)의 안전 중단은 종전 그대로다.
@@ -36240,9 +36404,13 @@ mod tests {
             EXIT_CYCLE_REINJECT_HELD,
             EXIT_CYCLE_SKIPPED,
             EXIT_CYCLE_BUSY,
+            EXIT_CYCLE_DETACHED,
         ] {
             assert!(doc.contains(&format!("{code}=")), "help 에 exit {code} 설명 없음");
         }
+        // ★(V42R-1) 89 = 접수(--detach) — 결과는 요청 좌석의 큐로 온다(0 과 섞지 않는다).
+        let l89 = doc.lines().find(|l| l.contains(&format!("{EXIT_CYCLE_DETACHED}="))).unwrap_or("");
+        assert!(l89.contains("--detach") && l89.contains("[cycle-result]") && l89.contains("곧바로 돌아온다"), "{l89}");
         // ★(RR1-ROLE-3) 87 과 88 은 문면이 갈린다 — 87 = 이미 끝남(재집행 금지) · 88 = 진행 중(같은 --fire 재집행 가능).
         let line = |code: i32| doc.lines().find(|l| l.contains(&format!("{code}="))).unwrap_or("").to_string();
         assert!(line(EXIT_CYCLE_SKIPPED).contains("이미 끝났다") && !line(EXIT_CYCLE_SKIPPED).contains("진행 중"), "{}", line(87));
@@ -37330,6 +37498,17 @@ mod tests {
                         }
                         json!({"surface_id": 7, "claim": verdict, "holder_pid": 4242})
                     }
+                    // ★(V42R-1) 비동기 접수 — 검체가 CYS_TEST_FAKE_DETACH 로 답을 고른다("method_not_found" = 구 데몬).
+                    "surface.cycle_detach" => {
+                        let verdict = std::env::var("CYS_TEST_FAKE_DETACH").unwrap_or_else(|_| "accepted".into());
+                        if verdict == "method_not_found" {
+                            let response = json!({"id": req["id"], "ok": false, "error": {"code": "method_not_found", "message": "unknown method: surface.cycle_detach"}});
+                            let _ = writeln!(stream, "{response}");
+                            continue;
+                        }
+                        json!({"surface_id": 7, "detach": verdict, "job": 5, "state": "running", "position": 0, "rc": 1,
+                               "holder_pid": 4242, "holder_fire_id": "1759112345:7:2"})
+                    }
                     _ => json!({"ok": true}),
                 };
                 let response = json!({"id": req["id"], "ok": true, "result": result});
@@ -37493,6 +37672,55 @@ mod tests {
             assert_eq!(sent, 0, "{verdict}: 건너뛴 사이클이 송신했다 {calls:?}");
             assert_eq!(calls.iter().filter(|(m, _)| m == "surface.cycle_claim").count(), 1, "{verdict}: 점유 질의 1회(해제 없음)");
         }
+    }
+
+    /// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) `--detach` 는 **접수만** 한다 — 사전검사(대상 해소 · 호출자==검증자) 뒤 `surface.cycle_detach`
+    /// 한 번 · 저장 지시·clear·표지·점유 송신 0건 · 곧바로 돌아온다(89 접수 · 87 끝난 통보/내 집행 반복 · 88 진행 중). 구 데몬(RPC 없음)은
+    /// 동기 1콜로 **자동 전환하지 않는다**(rc 1 · 송신 0건 — 요청자의 도구 시한이 짧으면 clear 뒤·재주입 전에 끊길 수 있다 · ③).
+    /// 실패 방향: 붉어지면 CSO 의 detach 1콜이 턴 안에서 사이클을 돌리거나(V42R-1 재발) 송신한 채 접수를 보고한다.
+    #[cfg(unix)]
+    #[test]
+    fn cycle_agent_detach_only_submits_and_returns() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let fire = "1759112345:7:3";
+        for (verdict, want) in [
+            ("accepted", EXIT_CYCLE_DETACHED),
+            ("stale", EXIT_CYCLE_SKIPPED),
+            ("repeat", EXIT_CYCLE_SKIPPED),
+            ("busy", EXIT_CYCLE_BUSY),
+            ("method_not_found", 1),
+        ] {
+            let fixture = D16CycleFixture::new();
+            let rows = json!([{
+                "surface_id": 7, "surface_ref": "surface:7", "role": "master", "agent": "claude",
+                "exited": false, "awakened_at": 1.0, "cwd": fixture.dir, "live_cwd": fixture.dir,
+                "usage": {"source": "statusline", "session_file": "S1"}
+            }]);
+            let (socket, calls, stop) = fake_daemon(rows, vec![(cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, 5.0)], vec!["S1"], true);
+            let stop = D16DaemonStop(Some(Box::new(stop)));
+            std::env::set_var("CYS_SOCKET", &socket);
+            std::env::set_var("CYS_TEST_FAKE_DETACH", verdict);
+            // master 는 검증자 필수 — 없으면 접수 전에 거부(송신 0 · RPC 0).
+            let t0 = std::time::Instant::now();
+            let no_verifier = run_cycle_agent_detach(None, Some("7".into()), None, vec![], None, 120, Some(fire.into()));
+            let exit = run_cycle_agent_detach(None, Some("7".into()), Some("worker".into()), vec![], None, 120, Some(fire.into()));
+            std::env::remove_var("CYS_TEST_FAKE_DETACH");
+            drop(stop);
+            let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            assert_eq!(no_verifier, 1, "{verdict}: master 검증자 없는 detach 를 받았다");
+            assert_eq!(exit, want, "{verdict}: {calls:?}");
+            assert!(t0.elapsed() < std::time::Duration::from_secs(10), "{verdict}: detach 1콜이 기다렸다");
+            let sent = calls
+                .iter()
+                .filter(|(m, _)| m == "surface.send_text" || m == "surface.send_key" || m == "surface.quiesce" || m == "surface.cycle_claim" || m == "feed.push")
+                .count();
+            assert_eq!(sent, 0, "{verdict}: detach 1콜이 사이클을 직접 돌렸다 {calls:?}");
+            let sub: Vec<&Value> = calls.iter().filter(|(m, _)| m == "surface.cycle_detach").map(|(_, p)| p).collect();
+            assert_eq!(sub.len(), 1, "{verdict}: 접수 1회 {calls:?}");
+            assert_eq!((sub[0]["surface_id"].clone(), sub[0]["fire_id"].clone(), sub[0]["verifier"].clone(), sub[0]["timeout"].clone()),
+                       (json!(7), json!(fire), json!("worker"), json!(120)), "{verdict}");
+        }
+        assert!(cycle_job_go_ok("go\n") && !cycle_job_go_ok("") && !cycle_job_go_ok("gogo") && !cycle_job_go_ok("no"));
     }
 
     /// ★(0.14.42 · RR1-ROLE-3) `--fire` 가 있으면 busy 는 '이미 처리됨'이 아니다 — 점유자가 끝나기를 --timeout 초까지 2초마다 다시

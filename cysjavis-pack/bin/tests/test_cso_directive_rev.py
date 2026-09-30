@@ -270,7 +270,10 @@ AFFIRMATIVE_SUBSCRIPTION_PHRASES = (
 # 안전 조항은 이제 **완결 문안**으로 핀한다(공백·줄바꿈·강조 표식만 무관하다 — normalize 참조).
 SAFETY_CLAUSES = {
     "CSO_DIRECTIVE.md": (
-        ("억제 파라미터", "억제 키는\n  **(이벤트명, surface)** — 5분 쿨다운·시간당 20건·네 자신의\n"
+        # ★(0.14.42 · clear 가드 수정 6회차 V42R-1 ④) '시간당 20건' 은 일반 몫이다 — master·CEO clear 개시 신호는 일반 몫이 찬 뒤
+        #   예약 26건을 더 쓴다(alert_route CLEAR_RESERVE · 합산 ≤ 46 < 보호선 50). 종전 문면은 실제 상한을 20 으로 적었다(재핀).
+        ("억제 파라미터", "억제 키는\n  **(이벤트명, surface)** — 5분 쿨다운·시간당 20건(일반 경보 몫 — master·CEO 의 clear 개시 신호 `context.threshold` 는\n"
+                      "  일반 몫이 찬 뒤 예약 26건을 더 쓴다 · 합산 시간당 ≤ 46 < 네 큐 보호선 50)·네 자신의\n"
                       "  surface 이벤트 제외·데몬 부트 300s 유예이며, 억제·유예·CSO 부재로 걸린 경보는 **폐기되지 않고\n"
                       "  보관**돼 재평가 시 1건으로 병합 적재된다(배달은 정상 큐 게이트) — **못 받은 경보를 구독으로 보충하려\n"
                       "  하지 마라.**"),
@@ -355,7 +358,7 @@ SAFETY_CLAUSES = {
         ("사이클 경계 조건", "**전부** 충족되면 master 가 ack 를 보내지 못해도 §2 대로 집행한다 — ①데몬이 발화한\n"
                       "  `context.threshold`(60%) 수신 ②안전지점 확인(master 가 게이트·커밋 중간이 아님 · 오너 실시간 입력\n"
                       "  중 아님 · AUTOPILOT_PAUSED 아님) ③저장 상태의 **독립 검증**(checksum 대조·최신 mtime — master 의\n"
-                      "  자연어 진술은 근거가 아니다) ④집행은 `cys cycle-agent --role master --verifier worker --fire <경보의 fire=>` **1콜**\n"
+                      "  자연어 진술은 근거가 아니다) ④집행은 `cys cycle-agent --role master --verifier worker --fire <경보의 fire=> --detach` **1콜**\n"
                       "  ★검증자에 ★너 자신(cso)을 지정하지 마라 — 두 가지 이유로 구조적으로 불가능하다. ①호출자==검증자는 동기 호출 중\n"
                       "  블록돼 자기 inbox 의 handshake 에 응답할 시점이 없다(2026-09-17 1회차 교착). 도구가 exit 82\n"
                       "  verifier-collision 으로 거부한다. ②CSO 는 role-capability-gate 의 feed 허용 동사에 reply 가 없어 판정을 낼\n"
@@ -3034,8 +3037,8 @@ class ClearGuardFireWiring(unittest.TestCase):
     def test_negative_control_catches_a_dropped_fire(self):
         """음성 대조 — 호출 예 하나에서 --fire 를 지우면 위 검사가 잡는다(검사기가 공허하지 않다)."""
         mutated = self.raw["CSO_DIRECTIVE.md"].replace(
-            "`cys cycle-agent --role master --verifier worker --fire <경보의 fire=>`로 주인",
-            "`cys cycle-agent --role master --verifier worker`로 주인", 1)
+            "`cys cycle-agent --role master --verifier worker --fire <경보의 fire=> --detach`로 주인",
+            "`cys cycle-agent --role master --verifier worker --detach`로 주인", 1)
         self.assertNotEqual(mutated, self.raw["CSO_DIRECTIVE.md"], "음성 대조 치환이 적중하지 않았다")
         calls = [c for c in self.CALL_RE.findall(mutated) if "--role" in c or "--verifier" in c]
         self.assertTrue(any("--fire" not in c for c in calls))

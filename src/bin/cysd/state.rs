@@ -3078,6 +3078,16 @@ pub struct Daemon {
     /// 두면 히트 경로가 caller_cache를 쥔 채 surfaces를 잡는 신설 락쌍이 생겨 기각됨).
     /// 재기동 간 혼동 없음(카운터·캐시 모두 데몬 인메모리 동수명). u64 오버플로 비실재.
     pub caller_gen: AtomicU64,
+    /// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 데몬이 띄운 사이클 1콜(`cys cycle-agent --detach` 의 자식) pid → 요청 좌석.
+    /// 발신자 해소(`handlers::walk_caller_ancestry`)가 조상 추적 0홉에서 이 표를 좌석 pid 와 같이 본다 — 그 자식의 모든 RPC(ACL ·
+    /// 권위 주입의 타이핑 가드 면제 · 점유·표지 소유)가 요청 좌석(CSO)이 손으로 부른 1콜과 같은 신원이다. 등록은 자식이 첫 RPC 를
+    /// 내기 전(stdin `go` 신호 전) · 해제는 자식을 거둔 직후(`cycle_jobs::monitor`). 말단 락.
+    pub delegated_callers: Mutex<HashMap<u32, u64>>,
+    /// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 비동기 사이클 작업표(`cycle_jobs`) — 진행·대기·최근 끝난 작업. 말단 락.
+    pub cycle_jobs: Mutex<crate::cycle_jobs::CycleJobs>,
+    /// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 좌석별 주입 잠금(`surface.inject_lock`) — 좌석 번호 → (점유자 peer pid · 시각).
+    /// cycle-agent 의 검증자 좌석 `[CYCLE-VERIFY]` 붙여넣기~Return 을 좌석당 하나씩(동시 비동기 사이클의 요청 합체 차단). 말단 락.
+    pub inject_locks: Mutex<HashMap<u64, (Option<u32>, f64)>>,
     /// (E-c) idempotencyKey → (surface_id, epoch초). 클라이언트 재시도가 같은 key면 기존 surface
     /// 재반환(추가 spawn 0). TTL(CREATE_IDEM_TTL_SECS) 만료 엔트리는 조회 시 lazy 제거.
     pub create_idem: Mutex<HashMap<String, (u64, f64)>>,
@@ -4906,6 +4916,9 @@ impl Daemon {
             todo_verdict: Mutex::new(HashMap::new()),
             caller_cache: Mutex::new(HashMap::new()),
             caller_gen: AtomicU64::new(0),
+            delegated_callers: Mutex::new(HashMap::new()),
+            cycle_jobs: Mutex::new(crate::cycle_jobs::CycleJobs::default()),
+            inject_locks: Mutex::new(HashMap::new()),
             create_idem: Mutex::new(HashMap::new()),
             create_owner: Mutex::new(HashMap::new()),
             reclaim_cancelled: Mutex::new(HashMap::new()),

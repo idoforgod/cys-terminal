@@ -3135,6 +3135,9 @@ def self_test():
                              "--save-file '/w/cwd/_round/SESSION_STATE.md' "
                              "--save-file '/w/pack/round/MASTER_TODO.md'"}),
         ("Bash", {"command": "cys cycle-agent --role master --verifier cso"}),
+        # ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 비동기 집행 — `--detach` 는 같은 사이클 필수 도구다(접수만 하고 곧바로 돌아온다 ·
+        #   데몬이 띄워 붙든다). 게이트의 백그라운드 금지(`run_in_background`)는 그대로 — 예외를 만들지 않았다(기각안 B).
+        ("Bash", {"command": "cys cycle-agent --role master --verifier worker --fire 1790000000:7:3 --detach"}),
         ("Bash", {"command": 'cys send --queued --to master "예산 소진 보고"'}),
         ("Bash", {"command": "cys status --json"}),
         ("Bash", {"command": "cys queue list"}),

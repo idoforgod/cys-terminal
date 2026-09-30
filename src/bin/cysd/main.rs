@@ -18,6 +18,7 @@ mod channels;
 mod classifier;
 mod cost;
 mod cwd_probe;
+mod cycle_jobs;
 mod deadman;
 mod delivery;
 mod events;

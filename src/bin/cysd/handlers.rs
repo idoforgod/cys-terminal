@@ -1619,13 +1619,18 @@ fn find_surface_by_seat_token(daemon: &Daemon, token: &str) -> Option<u64> {
 /// 깊이만큼의 syscall), 그 밖의 OS 와 노브 `CYS_PROC_PROBE_FAST=0` 은 종전 sysinfo 전체 표 판독.
 /// pid_to_sid 스냅샷을 먼저 뜨는 순서는 종전과 같다(gen_at_snapshot 선캡처 계약).
 fn walk_caller_ancestry(daemon: &Daemon, caller_pid: u32) -> (Option<u64>, Option<u64>) {
-    let pid_to_sid: std::collections::HashMap<u32, u64> = daemon
+    let mut pid_to_sid: std::collections::HashMap<u32, u64> = daemon
         .surfaces
         .lock()
         .unwrap()
         .values()
         .map(|s| (s.pid, s.id))
         .collect();
+    // ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 데몬이 띄운 사이클 1콜(`cys cycle-agent --detach` 의 자식)은 요청 좌석의 신원을 잇는다
+    //   (좌석 pid 가 우선 — 겹치지 않는다: 자식은 pane 이 아니다). 락은 surfaces 를 놓은 뒤 따로(말단).
+    for (pid, sid) in daemon.delegated_callers.lock().unwrap_or_else(|e| e.into_inner()).iter() {
+        pid_to_sid.entry(*pid).or_insert(*sid);
+    }
     #[cfg(target_os = "macos")]
     {
         if crate::state::proc_probe_fast_enabled() {
@@ -3143,6 +3148,37 @@ fn authoritative_caller_ok(daemon: &Daemon, from_sid: Option<u64>, caller_pid: O
     caller_pid.map_or(false, |pid| {
         caller_in_restore_root(daemon, pid, crate::state::peer_start_time)
     })
+}
+
+/// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 좌석 주입 잠금 판정(순수 — 생존 판정 주입). 점유 상한(초) — 붙여넣기~Return 한 번(≈ 1초)보다
+/// 넉넉하게. 넘긴 점유·죽은 점유자는 버린다(잠금이 굳어 검증 요청이 영구히 막히는 ② 방향 차단 — 그때는 합체 1회로만 틀린다).
+pub(crate) const INJECT_LOCK_MAX_SECS: f64 = 15.0;
+
+pub(crate) fn inject_lock_verdict(
+    locks: &mut std::collections::HashMap<u64, (Option<u32>, f64)>,
+    sid: u64,
+    caller: Option<u32>,
+    release: bool,
+    now: f64,
+    alive: impl Fn(u32) -> bool,
+) -> &'static str {
+    if release {
+        return match locks.get(&sid) {
+            Some((holder, _)) if *holder == caller => {
+                locks.remove(&sid);
+                "released"
+            }
+            _ => "not_holder",
+        };
+    }
+    if let Some((holder, since)) = locks.get(&sid).copied() {
+        let dead = holder.is_some_and(|p| !alive(p)) || now - since > INJECT_LOCK_MAX_SECS;
+        if !dead && holder != caller {
+            return "busy";
+        }
+    }
+    locks.insert(sid, (caller, now));
+    "locked"
 }
 
 /// 컨텍스트 임계(%) — 절대지침의 60% 사이클을 결정론으로 발화하는 기준.
@@ -9382,6 +9418,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "health_suppressed": health_suppressed,
                     "todo": todo,
                     "alert_route": alert_route,
+                    // ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 비동기 사이클(`cys cycle-agent --detach`) — 동시 상한·진행·대기·최근 결과.
+                    "cycle_jobs": crate::cycle_jobs::status_json(daemon),
                 }),
             ))
         }
@@ -9876,6 +9914,133 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             }
             *claim = Some(crate::state::CycleClaim { pid: caller_pid, since: now, fire_id: fire_id.clone() });
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "claim": "claimed", "fire_id": fire_id})))
+        }
+
+        // ─── ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 좌석 주입 잠금 — `{surface_id, release?}` → `lock`: "locked" | "busy" | "released" |
+        // "not_holder". cycle-agent 가 검증자 좌석에 `[CYCLE-VERIFY]` 를 붙여넣고 Return 할 때까지 잡는다(동시 비동기 사이클의 붙여넣기 둘이
+        // Return 하나로 합쳐지는 것을 막는다 · 드릴 실측). 죽은 점유자·15초 넘은 점유는 버린다(굳지 않는다). 인가는 send_text 와 같다.
+        "surface.inject_lock" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(&id, "not_found", &format!("surface {sid} not found")));
+            };
+            if let Err(e) = check_send_acl(daemon, caller_pid, &surface, &params) {
+                return Reply::Single(err_response(&id, "acl_denied", &e));
+            }
+            let release = params.get("release").and_then(|v| v.as_bool()).unwrap_or(false);
+            let now = crate::state::now_epoch();
+            let mut locks = daemon.inject_locks.lock().unwrap_or_else(|e| e.into_inner());
+            let verdict = inject_lock_verdict(&mut locks, sid, caller_pid, release, now, crate::state::pid_alive);
+            Reply::Single(ok_response(&id, json!({"surface_id": sid, "lock": verdict})))
+        }
+
+        // ─── ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 비동기 사이클 접수 — `cys cycle-agent --detach` ───
+        // `{surface_id, verifier?, timeout?, fire_id?, save_files?, resume_text?}` → `detach`: "accepted"(job · state running|pending ·
+        // position) | "stale"(그 통보 뒤 사이클이 이미 끝났다 → CLI 87) | "busy"(산 점유·같은 좌석 작업 → 88) | "repeat"(같은 요청 좌석이
+        // 같은 통보를 이미 detach 로 집행했고 88 밖 결과 → 87). 오류: detach_requires_seat(요청자가 좌석이 아니다 — 결과를 받을 곳이
+        // 없다) · self_clear_denied(요청 좌석 = 대상 — self-clear 금지) · paused(kill-switch — 송신 0건) · pending_full. 인가는
+        // surface.quiesce·cycle_claim 과 같다(check_send_acl). 데몬은 결정을 하지 않는다 — 요청 1콜이 정한 대상·통보·검증자를 그대로
+        // 띄우고 붙든다(`cycle_jobs` 머리 주석).
+        "surface.cycle_detach" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
+            };
+            let Some(surface) = daemon.get_surface(sid) else {
+                return Reply::Single(err_response(&id, "not_found", &format!("surface {sid} not found")));
+            };
+            if surface.exited.load(Ordering::Relaxed) {
+                return Reply::Single(err_response(&id, "process_exited", "surface process has exited"));
+            }
+            if let Err(e) = check_send_acl(daemon, caller_pid, &surface, &params) {
+                return Reply::Single(err_response(&id, "acl_denied", &e));
+            }
+            let Some(requester) = caller_pid.and_then(|p| resolve_caller_surface(daemon, p)) else {
+                return Reply::Single(err_response(
+                    &id,
+                    "detach_requires_seat",
+                    "cycle-agent --detach 는 좌석(pane) 안에서만 접수한다 — 결과([cycle-result])를 받을 좌석이 없다. 좌석 밖(스케줄 잡·오너 셸)은 \
+                     동기 1콜(--detach 없이)로 집행하라",
+                ));
+            };
+            if requester == sid {
+                return Reply::Single(err_response(
+                    &id,
+                    "self_clear_denied",
+                    &format!("대상 surface:{sid} 가 요청 좌석 자신이다 — self-clear 금지(clear 는 master↔CSO 상호 집행)"),
+                ));
+            }
+            if daemon.paused.load(Ordering::Relaxed) {
+                return Reply::Single(err_response(
+                    &id,
+                    "paused",
+                    "kill-switch 동결 중(system.pause) — 사이클을 접수하지 않는다(송신 0건 · 재개 뒤 다시 판정)",
+                ));
+            }
+            let fire_id = param_str(&params, "fire_id").map(|f| f.trim().to_string()).filter(|f| !f.is_empty());
+            let fire_seq = fire_id.as_deref().and_then(|f| ctx_guard_fire_seq(daemon, sid, f));
+            // 통보 판정·여유(가드 락 — 말단 · 잠깐).
+            let (stale, notice) = {
+                let g = surface.ctx_loop_guard.lock().unwrap_or_else(|e| e.into_inner());
+                (fire_seq.is_some_and(|q| g.stale(q)), fire_seq.and_then(|q| g.fire_notice(q)))
+            };
+            if stale {
+                return Reply::Single(ok_response(&id, json!({"surface_id": sid, "detach": "stale", "fire_id": fire_id})));
+            }
+            // 산 점유(다른 집행자의 동기 1콜 등) — 접수하지 않는다(88 · 그 사이클이 clear 전에 끝나면 데몬 재배달).
+            let holder = {
+                let c = surface.cycle_claim.lock().unwrap_or_else(|e| e.into_inner());
+                c.as_ref().filter(|c| !c.expired(crate::state::now_epoch())).map(|c| (c.pid, c.fire_id.clone()))
+            };
+            if let Some((hp, hf)) = holder {
+                return Reply::Single(ok_response(
+                    &id,
+                    json!({"surface_id": sid, "detach": "busy", "holder_pid": hp, "holder_fire_id": hf}),
+                ));
+            }
+            let role = surface.role.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let verifier = param_str(&params, "verifier").map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+            let verifier_sid = verifier.as_deref().and_then(|v| {
+                let r = daemon.roles.lock().unwrap().get(v).copied();
+                r.filter(|s| daemon.get_surface(*s).is_some_and(|x| !x.exited.load(Ordering::Relaxed)))
+            });
+            let headroom = notice.map_or(i32::MAX, |(pct, w)| {
+                i32::from(crate::usage::clear_guard::block_cap(w)) - i32::from(pct)
+            });
+            let spec = crate::cycle_jobs::Spec {
+                target: sid,
+                priority: role.as_deref().is_some_and(|r| crate::alert_route::CLEAR_SIGNAL_ROLES.contains(&r)),
+                target_role: role,
+                requester,
+                fire: fire_id.clone(),
+                verifier,
+                verifier_sid,
+                timeout: params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(120).clamp(1, 600),
+                save_files: params
+                    .get("save_files")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default(),
+                resume_text: param_str(&params, "resume_text").map(String::from),
+                headroom,
+            };
+            let (a, started, position) = crate::cycle_jobs::submit(daemon, spec);
+            use crate::cycle_jobs::Admit;
+            match a {
+                Admit::Accepted { job } => Reply::Single(ok_response(
+                    &id,
+                    json!({"surface_id": sid, "detach": "accepted", "job": job,
+                           "state": if started { "running" } else { "pending" }, "position": position,
+                           "fire_id": fire_id, "requester": requester}),
+                )),
+                Admit::BusyJob { job } => Reply::Single(ok_response(&id, json!({"surface_id": sid, "detach": "busy", "job": job}))),
+                Admit::Repeat { job, rc } => Reply::Single(ok_response(
+                    &id,
+                    json!({"surface_id": sid, "detach": "repeat", "job": job, "rc": rc, "fire_id": fire_id}),
+                )),
+                Admit::Full => Reply::Single(err_response(&id, "pending_full", "사이클 대기열이 가득 찼다 — 송신 0건")),
+            }
         }
 
         // ─── T4-15 kill-switch: 큐 배달·스케줄 발화 동결 (직접 send는 통과 = 신경 차단) ───
@@ -21006,7 +21171,9 @@ mod tests {
         let evs = threshold_events(&daemon, node);
         assert_eq!(evs.len(), 2, "S 가장자리 보고가 최소 간격 만료에 발화하지 않았다(②): {evs:?}");
         assert_eq!((evs[1]["payload"]["context_pct"].clone(), evs[1]["payload"]["threshold"].clone()), (json!(86), json!(85)));
-        // ② C 띠(사이클 뒤 첫 두 보고가 88 · 88 — 확인된 짝 · R 88 · 막대 88).
+        // ② 사이클 뒤 첫 두 보고가 88 · 88 — 확인된 가장자리 짝(수정 6회차 V42NC-1: 짝은 수준 밖 · 창 안 S 미만 관측이 없어 수준
+        //    미상 · 막대 = 기본). `context.level_measured` 는 수준 null · edge_pct 88 을 싣고(잰 수준이 없으니 수준 feed 는 없다),
+        //    최소 간격 만료에 그 보고로 발화한다 — 가장자리 복귀 error feed(고리 1번째)가 통보 값 88% 를 싣는다.
         let n2 = make_surface(&daemon, Some("master"));
         let s2 = daemon.get_surface(n2).unwrap();
         let at2 = |pct: u8, t: f64| maybe_fire_context_threshold_at(&daemon, &s2, pct, "statusline", Some("claude"), t);
@@ -21015,9 +21182,19 @@ mod tests {
         s2.ctx_loop_guard.lock().unwrap().cycle_off(crate::usage::clear_guard::Outcome::Cleared, t0 + 75.0, false);
         at2(88, t0 + 90.0);
         at2(88, t0 + 100.0);
-        let warn = feeds(n2);
-        assert_eq!(warn.len(), 1, "{warn:?}");
-        assert!(warn[0].1.contains("다음 통보 88% 가 잰 수준 88% 이하") && warn[0].1.contains("clear 로 낮출 수 없는 수준"), "{warn:?}");
+        let lm = named_events(&daemon, n2, "context.level_measured");
+        assert_eq!(lm.len(), 1, "{lm:?}");
+        let p = &lm[0]["payload"];
+        assert_eq!((p["level_pct"]["measured"].clone(), p["edge_pct"].clone(), p["threshold"].clone()), (json!(null), json!(88), json!(null)), "{p}");
+        assert!(feeds(n2).is_empty(), "잰 수준이 없는 창에 수준 feed 를 냈다: {:?}", feeds(n2));
+        crate::usage::ctx_guard_tick_at(&daemon, &s2, t0 + 600.001);
+        let evs = threshold_events(&daemon, n2);
+        assert_eq!(evs.len(), 2, "확인된 가장자리 짝이 최소 간격 만료에 발화하지 않았다(② · V42NC-1): {evs:?}");
+        assert_eq!(evs[1]["payload"]["context_pct"].clone(), json!(88));
+        let errs: Vec<(String, String)> = daemon.feed_items.lock().unwrap().iter()
+            .filter(|f| f.surface_id == Some(n2) && f.kind == "error").map(|f| (f.title.clone(), f.body.clone())).collect();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].0.contains("이번 고리 1번째") && errs[0].1.contains("88%"), "{errs:?}");
     }
 
     /// ★(RV3L-2) 가장자리 feed 문장은 그 보고의 **판정**(Out.verdict)에서 만든다 — Fire = '통보했습니다' · Held{until} = '약 N초 뒤
@@ -21062,16 +21239,39 @@ mod tests {
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].1.contains("통보했습니다"), "발화 판정인데 '통보했습니다'가 없다: {w:?}");
         assert_eq!(threshold_events(&daemon, n2).len(), 2);
-        // ③ Quiet — 사이클 뒤 첫 두 보고가 86·86(확인된 짝 · R 86 · 막대 87): 이 보고로는 통보하지 않았다.
-        let (n3, _) = seat(Outcome::Cleared, 60.0, 75.0, &[(86, 90.0), (86, 100.0)]);
+        // ③ Quiet — 가장자리 보고가 막대 아래로 판정된 창(기본 임계가 그 보고보다 높은 좌석 · 막대 90 · 보고 86): 이 보고로는 통보하지
+        //    않았다. (수정 6회차 V42NC-1: 사이클 뒤 첫 두 보고 86·86 은 확인된 가장자리 짝이라 수준 밖 · 막대 = 기본 — 종전 '막대 87% 미만'
+        //    무발화는 이제 없다 · `stop_cap_edge_is_decided_at_once_and_fed_to_the_owner` ②.) 문장 분기는 판정을 그대로 받는다.
+        let n3 = make_surface(&daemon, Some("master"));
+        let s3 = daemon.get_surface(n3).unwrap();
+        {
+            use crate::usage::clear_guard::{Kind, Note, Out, Verdict};
+            let w200 = Some(200_000u64);
+            let out = Out {
+                notes: vec![Note::Measured {
+                    kind: Kind::AfterCycle,
+                    level: [Some((80, w200)), None],
+                    first: [Some((72, w200)), None],
+                    base: [Some(90), None],
+                    confirmed: true,
+                    span: 55.0,
+                    cut: false,
+                    edge: Some((86, w200)),
+                    at: t0 + 130.0,
+                }],
+                verdict: Some(Verdict::Quiet),
+            };
+            publish_ctx_guard(&daemon, &s3, out, "statusline", Some("claude"));
+        }
         let w = feeds(n3);
         assert_eq!(w.len(), 1, "{w:?}");
-        assert!(w[0].1.contains("막대 87% 미만") && w[0].1.contains("통보하지 않았습니다"), "무발화 판정인데 문장이 다르다: {w:?}");
+        assert!(w[0].1.contains("막대 90% 미만") && w[0].1.contains("통보하지 않았습니다"), "무발화 판정인데 문장이 다르다: {w:?}");
         assert!(!w[0].1.contains("통보했습니다") && !w[0].1.contains("통보 예정"), "{w:?}");
-        // ④ 결과 모름(측정 불능) 끔 — 가장자리 사실은 싣되 처방 후보는 싣지 않는다(C 띠 짝 88·88 포함).
+        // ④ 결과 모름(측정 불능) 끔 — 가장자리 사실은 싣되 처방 후보는 싣지 않는다(짝 88·88 은 수준 밖이라 수준 feed 자체가 없다).
         let (n4, _) = seat(Outcome::Unknown, 60.0, 75.0, &[(72, 90.0), (80, 110.0), (86, 130.0)]);
         let (n5, _) = seat(Outcome::Unknown, 60.0, 75.0, &[(88, 90.0), (88, 100.0)]);
-        for n in [n4, n5] {
+        assert!(feeds(n5).is_empty(), "잰 수준이 없는 창(확인된 가장자리 짝)에 수준 feed: {:?}", feeds(n5));
+        for n in [n4] {
             let w = feeds(n);
             assert_eq!(w.len(), 1, "{w:?}");
             assert!(!w[0].1.contains("후보:"), "clear 실효 미확인 사이클에 처방: {w:?}");
@@ -21325,6 +21525,145 @@ mod tests {
         assert_eq!(claim(Some(me), json!({"fire_id": fire_id})), json!("stale"));
         // 다른 세대의 번호는 판정하지 않는다(실패 방향 = 집행).
         assert_eq!(claim(Some(me), json!({"fire_id": format!("1:{node}:1")})), json!("claimed"));
+    }
+
+    /// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 비동기 사이클 접수(`surface.cycle_detach`) — 좌석 밖 호출자·self-clear·동결은 거부
+    /// (송신 0건) · 끝난 통보는 stale · 산 점유·같은 좌석 작업은 busy · 같은 요청 좌석의 같은 통보가 88 밖 결과로 끝났으면 repeat ·
+    /// 동시 상한이 차 있으면 대기(pending — master 먼저 · 차단점까지 여유 = C − 통보 퍼센트). 데몬은 요청 1콜이 정한 대상·통보·검증자를
+    /// 그대로 싣는다. 실패 방향: 붉어지면 CSO 의 한 1콜 뒤에 다른 좌석이 줄을 서거나(V42R-1) 같은 통보를 두 번 집행하거나(①) self-clear 를
+    /// 받는다(거버넌스).
+    #[cfg(unix)]
+    #[test]
+    fn cycle_detach_admission_rpc() {
+        let _pack = crate::governance::HOutsidePack::new(); // 팩 격리(ACL 경합 없음) — 좌석 전에
+        let daemon = isolated_daemon(); // 상태 폴더 격리(동결·영속 공유 없음)
+        let cso = make_surface(&daemon, Some("cso"));
+        let master = make_surface(&daemon, Some("master"));
+        let verifier = make_surface(&daemon, Some("worker"));
+        daemon.roles.lock().unwrap().insert("worker".into(), verifier);
+        let cso_pid = daemon.get_surface(cso).unwrap().pid;
+        let detach = |pid: Option<u32>, target: u64, extra: Value| {
+            let mut p = json!({"surface_id": target, "timeout": 120});
+            if let Some(o) = extra.as_object() {
+                for (k, v) in o {
+                    p[k] = v.clone();
+                }
+            }
+            rpc_call(&daemon, "surface.cycle_detach", p, pid)
+        };
+        let code = |r: &Value| r["error"]["code"].as_str().unwrap_or("").to_string();
+        // 좌석 밖 호출자(결과 받을 곳 없음) · self-clear · 동결 — 거부(작업 0).
+        assert_eq!(code(&detach(None, master, json!({}))), "detach_requires_seat");
+        assert_eq!(code(&detach(Some(cso_pid), cso, json!({}))), "self_clear_denied");
+        daemon.paused.store(true, Ordering::Relaxed);
+        assert_eq!(code(&detach(Some(cso_pid), master, json!({}))), "paused");
+        daemon.paused.store(false, Ordering::Relaxed);
+        assert!(daemon.cycle_jobs.lock().unwrap().jobs.is_empty(), "거부가 작업을 남겼다");
+        // 통보(75%) → 사이클 끝 → 같은 통보 detach 는 stale(87).
+        usage_report(&daemon, master, json!({"ctx_pct": 75, "ctx_window": 200000}), None);
+        let fire1 = threshold_events(&daemon, master)[0]["payload"]["fire_id"].as_str().unwrap().to_string();
+        rpc_call(&daemon, "surface.quiesce", json!({"surface_id": master, "on": true}), None);
+        rpc_call(&daemon, "surface.quiesce", json!({"surface_id": master, "on": false, "outcome": "cleared"}), None);
+        assert_eq!(detach(Some(cso_pid), master, json!({"fire_id": fire1}))["result"]["detach"], json!("stale"));
+        // 산 점유(다른 집행자) — busy(88 · 접수 0).
+        let other = std::os::unix::process::parent_id();
+        assert_eq!(rpc_call(&daemon, "surface.cycle_claim", json!({"surface_id": master}), Some(other))["result"]["claim"], json!("claimed"));
+        assert_eq!(detach(Some(cso_pid), master, json!({}))["result"]["detach"], json!("busy"));
+        rpc_call(&daemon, "surface.cycle_claim", json!({"surface_id": master, "release": true}), Some(other));
+        // 동시 상한이 찼다(진행 중 3 — 자리표시) → 접수는 대기(pending) · master 먼저 · 여유 = C(88) − 통보 퍼센트.
+        {
+            let mut j = daemon.cycle_jobs.lock().unwrap();
+            for t in [9001u64, 9002, 9003] {
+                let spec = crate::cycle_jobs::Spec {
+                    target: t, target_role: None, requester: cso, fire: None, verifier: None, verifier_sid: None, timeout: 120,
+                    save_files: vec![], resume_text: None, priority: false, headroom: 1,
+                };
+                assert!(matches!(j.submit(spec, 0.0), crate::cycle_jobs::Admit::Accepted { .. }));
+            }
+            for x in j.jobs.iter_mut() {
+                x.state = crate::cycle_jobs::JobState::Running { pid: 0, since: 0.0 };
+            }
+        }
+        // 새 통보(사이클 뒤 창을 건너 최소 간격 뒤 — 가드 시각을 직접 쓰지 않고 새 좌석으로).
+        let m2 = make_surface(&daemon, Some("ceo"));
+        usage_report(&daemon, m2, json!({"ctx_pct": 86, "ctx_window": 200000}), None);
+        let fire2 = threshold_events(&daemon, m2)[0]["payload"]["fire_id"].as_str().unwrap().to_string();
+        let r = detach(Some(cso_pid), m2, json!({"fire_id": fire2, "verifier": "worker"}));
+        assert_eq!((r["result"]["detach"].clone(), r["result"]["state"].clone(), r["result"]["position"].clone()),
+                   (json!("accepted"), json!("pending"), json!(1)), "{r}");
+        {
+            let j = daemon.cycle_jobs.lock().unwrap();
+            let x = j.jobs.iter().find(|x| x.spec.target == m2).expect("대기 작업");
+            assert!(x.spec.priority, "CEO 좌석은 master·CEO 몫");
+            assert_eq!((x.spec.headroom, x.spec.verifier_sid, x.spec.requester, x.spec.fire.clone()), (88 - 86, Some(verifier), cso, Some(fire2.clone())));
+        }
+        // 같은 좌석 두 번째 — busy(작업) · 끝난 내 집행(rc 1)의 같은 통보 — repeat(87).
+        assert_eq!(detach(Some(cso_pid), m2, json!({"fire_id": fire2}))["result"]["detach"], json!("busy"));
+        {
+            let mut j = daemon.cycle_jobs.lock().unwrap();
+            j.jobs.retain(|x| x.spec.target != m2);
+            j.recent.push_back(crate::cycle_jobs::Done {
+                id: 77, target: m2, requester: cso, fire: Some(fire2.clone()), rc: Some(1), at: crate::state::now_epoch(), secs: 121.0,
+                summary: String::new(), delivered: true,
+            });
+        }
+        let r = detach(Some(cso_pid), m2, json!({"fire_id": fire2}));
+        assert_eq!((r["result"]["detach"].clone(), r["result"]["rc"].clone()), (json!("repeat"), json!(1)), "{r}");
+        // 상태 조회 — org.status 의 cycle_jobs · 좌석 행 ctx_guard.job.
+        let st = rpc_call(&daemon, "org.status", json!({}), None);
+        assert_eq!(st["result"]["cycle_jobs"]["max_running"], json!(crate::cycle_jobs::MAX_RUNNING), "{}", st["result"]["cycle_jobs"]);
+        assert_eq!(st["result"]["cycle_jobs"]["running"].as_array().map(Vec::len), Some(3));
+    }
+
+    /// ★(V42R-1) 좌석 주입 잠금 — 한 점유자만 · 같은 점유자 재질의는 멱등 · 다른 점유자는 busy · 죽은 점유자·15초 넘은 점유는 버린다 ·
+    /// 해제는 점유자만. RPC 도 같은 판정이다. 실패 방향: 붉어지면 동시 비동기 사이클의 검증 요청이 한 제출로 합쳐져(드릴 v6-smoke)
+    /// 검증자 무응답으로 clear 가 중단되거나(②) 잠금이 굳어 검증 요청이 막힌다.
+    #[cfg(unix)]
+    #[test]
+    fn inject_lock_serializes_verifier_pastes() {
+        let mut m = std::collections::HashMap::new();
+        let alive = |p: u32| p != 13;
+        assert_eq!(inject_lock_verdict(&mut m, 5, Some(1), false, 0.0, alive), "locked");
+        assert_eq!(inject_lock_verdict(&mut m, 5, Some(1), false, 1.0, alive), "locked", "같은 점유자 재질의");
+        assert_eq!(inject_lock_verdict(&mut m, 5, Some(2), false, 2.0, alive), "busy");
+        assert_eq!(inject_lock_verdict(&mut m, 6, Some(2), false, 2.0, alive), "locked", "다른 좌석은 따로");
+        assert_eq!(inject_lock_verdict(&mut m, 5, Some(2), true, 3.0, alive), "not_holder");
+        assert_eq!(inject_lock_verdict(&mut m, 5, Some(1), true, 3.0, alive), "released");
+        assert_eq!(inject_lock_verdict(&mut m, 5, Some(2), false, 4.0, alive), "locked");
+        assert_eq!(inject_lock_verdict(&mut m, 5, Some(3), false, 4.0 + INJECT_LOCK_MAX_SECS + 1.0, alive), "locked", "굳은 점유");
+        assert_eq!(inject_lock_verdict(&mut m, 7, Some(13), false, 0.0, alive), "locked");
+        assert_eq!(inject_lock_verdict(&mut m, 7, Some(14), false, 1.0, alive), "locked", "죽은 점유자");
+        let _pack = crate::governance::HOutsidePack::new();
+        let daemon = isolated_daemon();
+        let node = make_surface(&daemon, Some("worker"));
+        let me = std::process::id();
+        let other = std::os::unix::process::parent_id();
+        let l = |pid: u32, rel: bool| rpc_call(&daemon, "surface.inject_lock", json!({"surface_id": node, "release": rel}), Some(pid))["result"]["lock"].clone();
+        assert_eq!(l(me, false), json!("locked"));
+        assert_eq!(l(other, false), json!("busy"));
+        assert_eq!(l(me, true), json!("released"));
+        assert_eq!(l(other, false), json!("locked"));
+    }
+
+    /// ★(V42R-1) 신원 위임 — 데몬이 띄운 사이클 1콜(좌석 밖 프로세스)은 요청 좌석의 신원으로 해소된다(ACL · 권위 주입 면제가 CSO 가
+    /// 손으로 부른 1콜과 같다). 등록 전에는 좌석 밖이고, 등록(+ 음성 캐시 무효화)부터 그 좌석이며, 해제 뒤에는 새 해석이 좌석 밖이다.
+    #[cfg(unix)]
+    #[test]
+    fn delegated_cycle_child_resolves_to_the_requester_seat() {
+        let daemon = isolated_daemon();
+        let cso = make_surface(&daemon, Some("cso"));
+        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().expect("spawn sleep");
+        let pid = child.id();
+        assert_eq!(resolve_caller_surface(&daemon, pid), None, "위임 전에는 좌석 밖");
+        daemon.delegated_callers.lock().unwrap().insert(pid, cso);
+        daemon.caller_gen.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(resolve_caller_surface(&daemon, pid), Some(cso), "위임된 자식이 요청 좌석으로 해소되지 않는다");
+        assert!(authoritative_caller_ok(&daemon, Some(cso), Some(pid)), "CSO 신원의 권위 주입 면제");
+        daemon.delegated_callers.lock().unwrap().remove(&pid);
+        daemon.caller_cache.lock().unwrap().clear();
+        assert_eq!(resolve_caller_surface(&daemon, pid), None, "해제 뒤에도 좌석으로 남았다");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// ★(RR2-ROLE-2) 단일 비행 점유는 관측할 수 있고(`cys status --json` 좌석 행 `ctx_guard.claim` — holder_pid·since·fire_id),
