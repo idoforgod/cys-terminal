@@ -1465,6 +1465,15 @@ v0.14.42 가산분(additive):
 - `usage.report` 에 `reporter:"agy"`(agy 상태줄 훅) — agy 좌석(agent gemini)에서만 받는다(아니면 `invalid_params`)
 - `usage.accounts` 행: `source` 값 `statusline-outside`(창 밖 · 표시용 · 경보 제외)·`agy-statusline` 추가 ·
   `source_error` 코드 `agy_csrf_required` 추가
+- clear 가드(§16 `CYS_CONTEXT_THRESHOLD_PCT`): `surface.cycle_claim` {surface_id, fire_id?, release?} — `cys cycle-agent`
+  0단계 단일 비행 점유 · 응답 `claim` = claimed | busy(`holder_pid`·`holder_fire_id`·`since`) | stale(그 통보 뒤 사이클이
+  이미 끝남) | released | not_holder · 인가는 `surface.quiesce` 와 같다. `surface.quiesce` 끔의 `outcome`
+  (cleared | not_cleared | unknown — 부재·모르는 값은 unknown)과 `surface.quiescing` 이벤트의 `outcome`. 좌석 상태 JSON
+  `ctx_guard`(phase·fire_id·awaiting_since·level_pct·self_report_level_pct·strikes·resolved_through·claim·edge_run·
+  edge_episode·edge_returns_24h·clears_24h·confirmed_clears_24h). 이벤트 `context.level_measured`·
+  `context.clear_ineffective`·`context.edge_return`·`context.fire_unanswered`·`context.drop_before_cycle` ·
+  `context.threshold` 가산 키 `fire_id`·`level_pct`·`base_threshold`·`axis`·`strikes`·`after_compaction`·
+  `observed_age_secs`·`redelivery`
 
 v0.14.22 가산분(전부 additive — 기존 소비자 무해):
 - `queue.rehomed` {role, count, queue_entry_ids, reordered} — WAL 복원 항목의 같은 role 생존

@@ -10,8 +10,11 @@
 > ### ★ 먼저 하실 것 — 지침 병합 (`cys pack-merge`)
 >
 > 이번 판은 **사용자 소유(user-owned) 지침 두 개**를 고칩니다 — `directives/MASTER_DIRECTIVE.md`(대화 승인으로
-> 팀 만들기 §4-A·§4-A-2)와 `directives/CSO_DIRECTIVE.md`(대표의 사이클이 도는 동안 clear 보류). 이 등급은
+> 팀 만들기 §4-A·§4-A-2 · clear 통보 번호 `cycle-agent --fire`)와 `directives/CSO_DIRECTIVE.md`(대표의 사이클이 도는
+> 동안 clear 보류 · `--fire` · exit 87/88 · §5 clear 가드). 이 등급은
 > 기존 설치에 **덮이지 않고** `<파일>.new` 로 나란히 도착합니다. 한 번 병합해 주셔야 새 절차가 발효됩니다.
+> 병합하지 않은 대표 자리는 `--fire` 없이 사이클을 집행하므로 '그 통보 뒤 사이클이 이미 끝났는지'(exit 87) 판정이
+> 빠집니다(자동 사이클 도구 `javis_cycle_autopilot.py` 는 시스템 소유라 자동 갱신되어 `--fire` 를 스스로 넘깁니다).
 >
 > ```
 > cys pack-merge                                                    # 병합 대기 목록
@@ -39,6 +42,7 @@
 | S2 | 데몬 소켓 처리 비용·연결 오류 | **포함** | 신원 판독 O(깊이) · fd 한도 · accept 오류 분류 · 동시 조회 폭주 차단 | §4 |
 | S3 | 긴 본문·CRLF 본문이 조각나 제출 | **포함**(macOS·Linux) | 울타리 살균 + 직접 경로 울타리 + CRLF 한 번 제출 | §4 |
 | S4 | 여러 발신자 동시 제출 성공률 | **포함**(macOS·Linux) | 제출 정착 — 대기 제출 CR 바로 뒤에 본문을 붙이지 않고, 곧 비는 줄은 큐 대신 잠깐(최대 3초) 기다렸다 직접 넣음 | §4-1 |
+| C1 | clear 뒤 같은 지침 재주입 고리 · 필요한 clear 가 막힘 | **포함** | clear 가드 v3 — 사이클 표지 기반 상태기계(사이클 뒤 잰 수준 위로 자란 뒤에만 재통보 · 최소 간격 10분 · 영구 정지 없음) | §5 |
 
 전체 변경: v0.14.41(`cecf4c57`) 이후 **커밋 112 · 파일 78**(버전 범프·이 노트 커밋 제외). 세 작업(팀 확인창 ·
 사용량 계정 · 소켓/전달 성능)을 각각 치명위험 게이트(①폭주 ②무clear ③주기 자가치유 전멸 ④전 pane 사망 ·
@@ -336,13 +340,29 @@ S92 발신자 2 + 첫 제출 뒤 x ms 창(x=0~400) 오승인 **0/45** · S94 오
 ## 5. 부트 체인·치명위험 게이트에서 더 닫은 것
 
 통합 트리에 게이트 재검토를 돌려 잡은 것들입니다(요지).
-- **clear 직후 바닥 가드**: 200K 창 대표(master·CEO)가 clear 뒤 지침을 다시 붙여 넣으면 바닥이 이미 70%대라,
-  유휴여도 경보 쿨다운마다 clear·재주입을 되풀이하던 고리를 닫았습니다 — clear 뒤 정착 창에서 바닥을 재고,
-  바닥 위로 실제로 자란 뒤에만 다시 통보하며(히스테리시스), 여유가 없는 좌석은 1회만 다시 clear 해 보고 그래도
-  같으면 자동 clear 를 멈춥니다(Claude Code 자체 압축이 받습니다 · 오너 feed 경보).
-- master·CEO 의 clear 신호가 경보 라우터 예약분 때문에 시간당 5번째부터 최대 약 1시간 보류되던 것.
-- 대표의 `cycle-agent` 는 백그라운드로 — 전경 대기로 대표 턴이 한 사이클(최대 약 8.5분) 멈춰 회신 큐가
-  적체되던 것. CSO 는 대표의 사이클이 도는 동안(`quiescing` 좌석) 대표를 clear 하지 않습니다.
+- **clear 가드 v3**(발행 전 병합 · `perf/0.14.42-clear-floor` · 종전 'clear 직후 바닥 가드'를 대체): 200K 창
+  대표(master·CEO)가 clear 뒤 지침을 다시 붙여 넣으면 바닥이 이미 70%대라, 유휴여도 경보 쿨다운마다 clear·재주입을
+  되풀이하던 고리를 닫습니다. 좌석마다 상태 넷(Free·Awaiting·Cycling·Measuring)만 두고, clear 의 증거는
+  `cys cycle-agent` 의 **사이클 표지**(quiescing 켬→끔 — 끔이 결과 cleared·not_cleared·unknown 을 싣습니다) 하나입니다.
+  사이클이 끝나면 10분 동안의 최고치를 **사이클 뒤 수준**으로 재고(실측·자기보고 따로), 다음 통보는
+  max(임계, 수준 + 5%p)에서 합니다(200K 에서 수준이 80% 위면 85% 또는 수준 + 1 · 막대는 88%·1M 97% 를 넘지 않음).
+  종전 가드의 '1회 더 clear 해 보고 그래도 같으면 자동 clear 정지'는 없어졌습니다 — 그 정지가 여유 있는 대표를
+  오판해 cys clear 가 영영 나지 않던 경로(②무clear)였습니다. 통보 사이 최소 10분(좌석당 시간당 ≤ 6 · 24시간 ≤ 144) ·
+  효과 없는 통보는 15·30·60·120분 미룸(영구 정지 없음) · 통보 뒤 20분 안에 사이클이 시작되지 않으면 잠정 보류 뒤 재통보 ·
+  같은 통보의 중복 집행은 `cycle-agent --fire <id>` 로 데몬이 가립니다(exit 87 = 그 통보 뒤 사이클이 이미 끝남 · 88 = 다른
+  집행자의 사이클 진행 중 · 둘 다 송신 0건) · 집행이 사이클 없이 끝나면 같은 통보를 한 번 재배달합니다.
+- **가장자리 예외**: 자동 압축을 끈 200K 좌석의 차단점(88.5%)을 지키려고, 사이클 뒤 10분 안 또는 그 창 뒤 첫 보고가
+  85% 이상(1M 96%)이면 수준에 접지 않고 곧바로 판정합니다. 대가로 복원·붙잡혔던 회신만으로 매 사이클 85% 이상에
+  돌아오는 좌석은 10분마다 clear 될 수 있습니다(작업으로 돌아온 좌석과 가드가 가를 수 없음 · 시간당 ≤ 6). 그런 복귀마다
+  이벤트 `context.edge_return` 이 나가고, 오너 **error** feed 는 고리 회차의 1·2·4·8·16…번째에만 나갑니다(좌석당 24시간
+  ≤ 8건). 차단점 이상으로만 보이는 값(200K·창 미상 89% · 1M 99%)을 사이클 전후 똑같이 보고하는 **고착 자기보고**만
+  15·30·60·120분 백오프합니다. 세부 규칙은 USER-MANUAL §16 `CYS_CONTEXT_THRESHOLD_PCT` 행이 정본입니다(기본값 세 가지는
+  오너 결재 대기 · §9-9).
+- master·CEO 의 clear 개시 신호가 경보 라우터의 시간당 상한에 보류되던 것 — 예약분을 4 → **26**(두 좌석 × 키당
+  쿨다운 한계 13/시간)으로 잡아 일반 경보가 상한을 채운 시간에도 보류 0 입니다(합산 상한 46 < CSO 큐 보호선 50).
+- 대표의 `cycle-agent` 는 백그라운드로 — 전경 대기로 대표 턴이 한 사이클(최대 9.5분 — 1콜 단일 전체 시한 570초 ·
+  점유 대기 포함 · Claude Code Bash 도구 상한 600초 안) 멈춰 회신 큐가 적체되던 것. CSO 는 대표의 사이클이 도는
+  동안(`quiescing` 좌석) 대표를 clear 하지 않습니다.
 - clear 뒤 좌석이 지침 전문 없이 앉던 경로(훅 출력 1만 자 상한) · 같은 지침을 부트·사이클마다 한 번 더 읽던
   이중 적재.
 - CR 이 삼켜진 기계 잔여 때문에 heartbeat·wakeup·report_gate 가 무기한 멈추던 경로 · 부트 감독자 통보가 순간
@@ -377,7 +397,7 @@ S92 발신자 2 + 첫 제출 뒤 x ms 창(x=0~400) 오승인 **0/45** · S94 오
 | `CYS_ACCEPT_ERROR_GATE` | 켬 | `0` | accept 오류 분류(종전 정책) |
 | `CYS_AGY_STATUSLINE` | 켬 | `0` · 또는 `~/.cys/agy-statusline-off` 파일 | agy 상태줄 자동 연결(cys 가 넣은 것만 뺌) |
 | `CYS_OUTSIDE_USAGE` | 켬 | `0`(창 밖 세션 쪽 환경) | 창 밖 Claude 사용량 보고 |
-| `CYS_CONTEXT_THRESHOLD_PCT` | 60 | — | clear 직후 바닥 가드의 기준 임계(가드 자체의 끄기 노브는 없음 · USER-MANUAL §16) |
+| `CYS_CONTEXT_THRESHOLD_PCT` | 60 | — | clear 가드(v3 · §5)의 기준 임계(가드 자체의 끄기 노브는 없음 · USER-MANUAL §16) |
 
 **판 전체 되돌리기**: 본체를 v0.14.41 설치본으로 다시 설치하면 됩니다(세션·부서·직원 유지). 이번 팩은
 0.14.42 본체를 전제로 하므로(§7) 본체만 되돌리면 앱이 "팩이 더 새것" 상태로 동작합니다 — 이때 대화 승인은
@@ -395,8 +415,20 @@ S92 발신자 2 + 첫 제출 뒤 x ms 창(x=0~400) 오승인 **0/45** · S94 오
   새 훅: `hooks/teamtoken-issue.sh`(UserPromptSubmit) · `hooks/cys-agy-statusline.sh`(agy 상태줄 명령).
 - RPC(additive): `team.token.consume`·`team.token.settle`·`team.token.inspect` · `usage.report_account` ·
   이벤트 가산분(`queue.return_absorbed`·`queue.return_absorb_bypassed`·`queue.return_absorb_expired` ·
-  `machine_inject.*` · `channel.message.stalled` · `queue.quiesce_stale` · `usage.session_repinned` ·
-  `context.floor_raised` 등 — USER-MANUAL §17 이벤트 표).
+  `machine_inject.*` · `channel.message.stalled` · `queue.quiesce_stale` · `usage.session_repinned` 등 — USER-MANUAL
+  §17 이벤트 표).
+- **clear 가드 v3(§5)**: RPC `surface.cycle_claim {surface_id, fire_id?, release?}` → `claim` = claimed · busy(`holder_pid` ·
+  `holder_fire_id` · `since`) · stale · released · not_holder(인가는 `surface.quiesce` 와 같음) · `surface.quiesce` 끔의
+  `outcome`(cleared · not_cleared · unknown — 없거나 모르는 값은 unknown · 구 CLI 도 unknown 이라 clear 를 단정하지 않음)과
+  `surface.quiescing` 이벤트의 `outcome` · 좌석 상태 JSON `ctx_guard`(phase · fire_id · 수준 · strikes · claim · edge_run ·
+  edge_episode · edge_returns_24h · clears_24h · confirmed_clears_24h) · 이벤트 `context.level_measured` ·
+  `context.clear_ineffective` · `context.edge_return` · `context.fire_unanswered` · `context.drop_before_cycle` ·
+  `context.threshold` 가산 키 `fire_id` · `level_pct` · `base_threshold` · `axis` · `strikes` · `after_compaction` ·
+  `observed_age_secs` · `redelivery`(경보 요약에 `fire=<id>` · 재배달이면 ` redelivery`) · `cys cycle-agent --fire <id>` ·
+  새 exit 87(건너뜀)·88(진행 중). 종전 가드의 `context.floor_raised` 와 `context.threshold` 의 `floor_pct`·`regime`·
+  `floor_limited` 는 없어졌습니다.
+- **계약 변경(clear 가드)**: `context.threshold` 는 clear 뒤 잰 수준 위로 자란 뒤(또는 가장자리 예외)에만 다시 나갑니다 ·
+  cycle-agent 1콜은 단일 전체 시한 570초 안에 끝납니다(점유 대기 포함 · 각 단계 `--timeout` 은 남은 예산으로 잘림).
 - **계약 변경**: 채널 재배달 기본 0(메시지 1건 = 주입 1회) · 큐 다이제스트 구간이 전부 빈 Return 이면 문안 대신
   빈 Enter 1회.
 - **계약 변경(제출 정착 · macOS·Linux)**: 에이전트 좌석으로의 직접 `send` 가 대기 제출 CR 창에서 거부될 수 있습니다
@@ -484,14 +516,23 @@ macOS·Linux 에서 고쳤습니다(§4-1 · 실측 20/20 별개 제출 ×2). **
 믿는다는 전제 · USER-MANUAL §4).
 
 **9) 오너 결재가 남은 문안**: 팀 만들기 대화 승인 지침 문안(MASTER §4-A-2 등) 확정 · CEO 합성 지침 크기
-(제출 단위 상한 근접) · 채널 재배달 기본 0 계약 변경.
+(제출 단위 상한 근접) · 채널 재배달 기본 0 계약 변경 · clear 가드(§5)의 기본값 세 가지 — ① 가장자리·C 띠 고리를
+②무clear 우선으로 둠(좌석당 시간당 ≤ 6 · 24시간 ≤ 144 · 오너 error feed 는 고리 회차 2의 거듭제곱 · 24시간 ≤ 8건)
+② 고착 자기보고 백오프 범위(차단점 이상으로만 보이는 값 — 200K·창 미상 89 · 1M 99 이상) ③ 가장자리 85~87 을 10분
+창보다 드물게 보고하는 자기보고 좌석은 보고 간격마다 통보될 수 있음(24시간 ≤ 144).
 
 **10) 측정으로 확인하지 못한 것**: `/clear` 뒤 새 대화 재개(R3-1)는 벤치의 가짜 claude 가 새 훅 계약을 흉내 내지
 않아 이 측정으로 효과를 잴 수 없었습니다. 실제 Claude Code 좌석·UI(WKWebView·WebView2) 실기 확인이 남았습니다.
 
-**11) 병렬로 진행 중인 수정**: clear 직후 바닥 가드의 잔여 2건(복원 뒤 배달이 바닥에 섞여 여유 있는 대표가
-"자동 clear 정지"로 오판될 수 있는 경로 · ②무clear 계열)을 별도 브랜치(`perf/0.14.42-clear-floor`)에서 고치는
-중입니다. 발행 전에 병합되면 이 절과 §5 를 갱신합니다.
+**11) clear 가드 — 발행 전에 병합했습니다(§5).** 종전 'clear 직후 바닥 가드'의 잔여 2건(복원 뒤 배달이 바닥에
+섞여 여유 있는 대표가 "자동 clear 정지"로 오판될 수 있는 경로 · ②무clear 계열)은 별도 브랜치(`perf/0.14.42-clear-floor`)
+에서 가드를 사이클 표지 기반 상태기계(v3)로 바꿔 구조로 닫았습니다(자동 clear 정지 자체가 없습니다). 남은 것:
+기본값 세 가지의 오너 결재(§9-9) · 재배달과 'clear 안 됨' 결과가 겹치면 통보 1건당 사이클이 최대 2회 · 자기보고 축의
+보류는 만료에 스스로 재판정하지 않음(차단점 이상 값을 보고한 뒤 보고를 멈춘 좌석은 그 축으로 통보가 오지 않음 —
+feed 가 그 사실을 적습니다) · worker 의 clear 신호는 경보 라우터 일반 상한(20/시간) 안에서 나이순(master 의
+`cys events` 직접 구독에도 닿음) · 자동 압축을 끈 200K 좌석이 설계 경계 밖(분당 1.5%p 초과 성장 · 긴 끊김 없는 턴 ·
+사이클 뒤 차단점 1.5%p 안 복귀 + 성장)이면 최소 간격(10분) 보류 중 차단점을 넘을 수 있음. 검증은 좌석 모형·가짜 에이전트 드릴·결정론 검체이고 실제 Claude 좌석
+실기 확인은 아직입니다.
 
 **12) 원격 채널 메시지가 거의 동시에 두 건 들어올 때의 간격 — 발행 전에 고쳤습니다(§4 · §10).** 채널 행 사이 1초
 간격을 "앞 행을 좌석 writer 가 쓰기 시작한 뒤"부터 재서, 앞 행이 writer 대기열에만 있는 순간에 다음 배달 판정이 돌면 두
@@ -585,6 +626,19 @@ macOS·Linux 에서 고쳤습니다(§4-1 · 실측 20/20 별개 제출 ×2). **
 커밋의 메시지에 단계별 rc 로 적었습니다. 번들 파이썬 캐시 차단(SEAL-1) 인구조사에는 이번 판이 새로 만든 번들
 파이썬 기동 지점(데몬의 팀 토큰 판정 자식)을 강제점으로 등재했습니다.
 
+clear 가드 통합(`perf/0.14.42-clear-floor` 병합 `53bd2881`, 2026-09-30 PDT)은 발행 준비 판(`bc954dc2`)을 같은 조건(HOME
+샌드박스 · 트립와이어 PATH · `--test-threads=1` · 짧은 임시 폴더)으로 나란히 돌려 대조했습니다 — 기준선 → 통합:
+`cargo test --lib` 672 → 673 / 0(1 무시) · `--bin cys` 425 → 436 / 0 · `--bin cysd` 1745 → 1853 / 0(6 무시) — 통합의 검체
+이름 집합은 기준선에 두 브랜치의 증감(clear 가드 cysd +87 −37 · cys +7 / 발행 전 수정 cysd +58 · cys +4 · lib +1)을 더한
+것과 이름까지 같습니다(빠진 검체 0) · `-p cys-app --bins` 176 → 176 / 0 · `bun test` 1548 / 0 · `tsc` 오류 0 · `win-typecheck.sh`
+오류 0(경고 29 — 줄 번호를 뺀 목록이 기준선과 같음) · debug·release 빌드 경고 3(같은 목록) · `run_bootstrap_health.py`
+GREEN 163 / 0 / 1 skip(양쪽) · `gen_ceo_template.py --check` GREEN · doc contract OK · `javis_cycle_autopilot.py self-test`
+331 → 343 / 0 · lane-parity(strict · self-test) rc 0 · secret 스캐너 2종 clean 1064 → 1065 · OK. 팩 스위트 128 파일은 125 통과 ·
+3건은 통합과 무관함을 기준선에서 같은 모양으로 재현했습니다 — phoenix 하네스 검체 둘(`c6_reap` · `w2_untomb_fullcycle`)은
+격리 데몬 두 개가 동시에 뜨면 debug 데몬 기동이 약 16초(단독 약 9초 · 두 판 같음)라 하네스 기동 대기 12초를 넘는 것이고
+(단독 재실행 통과 · 기준선도 둘을 함께 돌리면 같은 실패), `session_start_hook` 은 샌드박스의 `CYS_NO_AUTOSTART=1` 인공물
+(그 변수 없이 ALL PASS)입니다. 트립와이어 적중은 러너가 일부러 부르는 스텁 호출뿐이고 양쪽 수가 같습니다.
+
 ---
 
 ## 11. Windows
@@ -597,6 +651,9 @@ macOS·Linux 에서 고쳤습니다(§4-1 · 실측 20/20 별개 제출 ×2). **
   보류 기록이 생기지 않는 경로 · 교차 타입체크 오류 0 · 실기 확인은 아직). 2회차 수정(§4-1-2 — 입력 상자 대조 · 수명 상한)과
   3회차 수정(§4-1-3 — 창 대기 상한의 시계)도 같은 탐침·재제출 안의 판정이라 Windows 에서는 쓰이지 않습니다(교차 타입체크
   오류 0 · 경고 목록 불변).
+- clear 가드 v3(§5)는 **운영체제 공통 코드**입니다(데몬 상태기계 · `surface.cycle_claim` · cycle-agent 단일 전체 시한 ·
+  경보 라우터 예산 — Windows 전용 분기 없음 · 점유자 생존은 Windows 에서 명명 파이프 peer pid 와 프로세스 핸들로 판정).
+  교차 타입체크 오류 0 · 경고 목록 불변으로 확인했고 Windows 실기 확인은 아직입니다.
 - 채널 메시지 간격 빈틈 수정(§4 · §9-12)은 **Windows 에도 똑같이 적용됩니다** — 좌석 writer 는 운영체제 공통 경로이고
   수정은 채널이 넘긴 시각 기록 하나뿐입니다(쓰는 바이트 무변경). 교차 타입체크 오류 0 으로 확인했고 실기 확인은 아직입니다.
 - `docs/WDSI_SUBMISSION.md` 의 절차는 그대로입니다 — 바이너리 해시가 바뀌므로 이전 판정은 이번 빌드에 적용되지
