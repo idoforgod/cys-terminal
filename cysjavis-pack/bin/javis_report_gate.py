@@ -86,6 +86,13 @@ try:
 except Exception as _e:                       # noqa: BLE001
     _pick_node_ctx, _REPORT_IMPORT_ERR = None, str(_e)[:120]
     CTX_SELF_REPORT_MAX_AGE_S = None  # 실패 방향: 측정 수단 부재 → 두 CTX 축 모두 판정 안 함.
+#   javis_report.ctx_alert_nodes : ★(0.14.42 · RV3L-7) clear 가드 좌석은 60% 가 아니라 가드의 미해결 통보로 — 판정 한 벌.
+#     따로 import 한다: 부분갱신 스큐(구 보고 모듈 · 이 이름 없음)면 None 이고 아래 extract_warnings 가 종전 60% 판정으로
+#     떨어진다(pick_node_ctx 는 그대로 살아 있다 — 한 이름의 부재가 CTX 축 전체를 끄지 않는다).
+try:
+    from javis_report import ctx_alert_nodes as _ctx_alert_nodes, CTX_FIRE_PENDING_ALERT_S as _CTX_FIRE_PENDING_ALERT_S
+except Exception:                             # noqa: BLE001
+    _ctx_alert_nodes, _CTX_FIRE_PENDING_ALERT_S = None, None
 
 # javis_report.py IDLE_ALERT_SECS와 동일(절대지침 B3: idle 5분+). 자기보고가 아닌 데몬 실측
 # idle_secs로만 판정한다(memory: stale self-report 함정). 여기 재정의(수집 실패 시에도 상수 필요).
@@ -148,6 +155,8 @@ BLACKLIST_KEYS = frozenset({
     # ★WP6-2: `usage_ctx_pct` 는 `usage_ctx_tokens` 의 백분율 파생값이라 같은 이유로 제외한다
     #   (60% 판정은 정규화 '전' 원문 live_nodes 에서 하므로 감지 능력은 손실되지 않는다).
     "usage_ctx_pct",
+    # ★(0.14.42 · RV3L-7) 미해결 통보 경과 초 — 시간파생(같은 통보면 매 주기 증가). 통보 id(`ctx_fire_pending`)는 diff 대상이다.
+    "ctx_fire_pending_age_s",
 })
 
 VERDICT_WARN, VERDICT_DELTA, VERDICT_QUIET, VERDICT_NOCHG = "WARN", "DELTA", "QUIET", "NOCHG"
@@ -1047,22 +1056,37 @@ def extract_warnings(report, counters=None, now=0, edge_cooldown=EDGE_COOLDOWN_S
     # ★WP6-2 — 60% 판정선은 javis_report.pick_node_ctx 한 벌(실측 > 신선한 자기보고 · 결측 None).
     #   낡은 자기보고가 더 이상 60% 를 못 울리므로 경보가 **줄 수 있다** — 의도한 감소다(회귀 아님).
     #   헬퍼 부재는 판정 불가 = 경보 없음(위 import 주석 · reasons `report_module_missing`).
-    high = []
+    # ★(0.14.42 · RV3L-7) clear 가드 좌석(새 데몬)은 60% 가 아니라 가드의 미해결 통보(CTX_FIRE_PENDING_ALERT_S+)로만 —
+    #   javis_report.ctx_alert_nodes 한 벌. 그 이름이 없는 구 보고 모듈(스큐)이면 종전 60% 판정 그대로.
+    high, pend = [], []
     if _pick_node_ctx is not None:
-        for n in (report.get("live_nodes") or []):
-            p, src = _pick_node_ctx(n)
-            if p is not None and p >= 60:
-                high.append((n, p, src))
-    if high:
-        roles = ",".join("%s(%d%% %s)" % (n.get("role", "?"), p, "실측" if src == "measured" else "추정")
-                         for n, p, src in high)
+        if _ctx_alert_nodes is not None:
+            high, pend = _ctx_alert_nodes(report.get("live_nodes") or [])
+        else:
+            for n in (report.get("live_nodes") or []):
+                p, src = _pick_node_ctx(n)
+                if p is not None and p >= 60:
+                    high.append((n, p, src))
+    if high or pend:
+        parts, reasons_ = [], []
+        if high:
+            roles = ",".join("%s(%d%% %s)" % (n.get("role", "?"), p, "실측" if src == "measured" else "추정")
+                             for n, p, src in high)
+            parts.append("%s 컨텍스트 60%%+ — cycle-agent 집행 검토" % roles)
+            reasons_.append("ctx_60:%s" % roles)
+        if pend:
+            proles = ",".join("%s(fire=%s · %d분)" % (n.get("role", "?"), fid, age // 60) for n, fid, age, _p, _s in pend)
+            parts.append("%s clear 통보 미집행 %d분+ — CSO 집행 확인(`cys cycle-agent --fire <fire> --detach` · "
+                         "손 집행도 --fire 필수)" % (proles, _CTX_FIRE_PENDING_ALERT_S // 60))
+            reasons_.append("ctx_fire_pending:%s" % proles)
         warns.append(apply_policy({
             "trigger": "context",
             "task": "gate-context",
-            "reason": "ctx_60:%s" % roles,
-            "wake_body": "[gate] context: %s 컨텍스트 60%%+ — cycle-agent 집행 검토.%s" % (roles, tail),
+            "reason": " ".join(reasons_),
+            "wake_body": "[gate] context: %s.%s" % (" · ".join(parts), tail),
             "evt_type": None, "evt_fields": None,
-            "idem": "gate-context-%s" % ",".join(n.get("role", "?") for n, _p, _s in high),
+            "idem": "gate-context-%s" % ",".join([n.get("role", "?") for n, _p, _s in high]
+                                                 + [n.get("role", "?") for n, _f, _a, _p, _s in pend]),
         }))
     feed = report.get("feed_pending")
     if isinstance(feed, int) and feed > 0:

@@ -3323,6 +3323,13 @@ pub(crate) fn publish_ctx_guard(
         let reserve = (crate::usage::CC_SUMMARY_RESERVE_TOKENS + crate::usage::CC_BLOCKING_BUFFER_TOKENS) as f64;
         format!("{:.1}", (w - reserve) * 100.0 / w)
     };
+    // ★(통합 minor 정리 · V42R-3) 가드 상태는 휘발이라(재기동 뒤 0 부터) '24시간' 수치는 **이 데몬 세대 안**의 수다 — 세대가 24시간이
+    //   안 됐으면 그 사실을 수치 옆에 싣는다(재기동 직후 '이번 고리 1번째 · 24시간 1회' 를 오너가 '처음'으로 읽지 않게).
+    let gen_note = if now < 86_400.0 {
+        format!("(데몬 기동 뒤 {}시간치 — 가드 기록은 재기동마다 0 부터)", (now / 3600.0).floor() as u64)
+    } else {
+        String::new()
+    };
     // 선제 압축점(표시값) — feed 처방 문턱에만 쓴다.
     let compact_point = |w: Option<u64>| {
         crate::usage::ctx_pct_below_reserve(w, crate::usage::CC_SUMMARY_RESERVE_TOKENS + crate::usage::CC_AUTOCOMPACT_BUFFER_TOKENS)
@@ -3518,7 +3525,7 @@ pub(crate) fn publish_ctx_guard(
                 };
                 let title = format!(
                     "{who} 사이클 뒤 {what} 높이에서 다시 clear 통보(성장을 기다리지 않는 예외) — 이번 고리 {episode}번째 · 24시간 \
-                     {returns_24h}회 · 24시간 cys 사이클 {cycles_24h}회 ({sref})"
+                     {returns_24h}회 · 24시간 cys 사이클 {cycles_24h}회{gen_note} ({sref})"
                 );
                 let mut body = format!(
                     "이 통보({} {pct}% · 막대 {bar}%)는 직전 cys 사이클 뒤 잰 수준 위 5%p 성장을 기다리지 않는 예외로 났다(사이클 뒤 10분 창 \
@@ -3527,7 +3534,8 @@ pub(crate) fn publish_ctx_guard(
                      {confirmed_24h}회). 가드는 복원·회신으로 돌아왔는지 작업으로 올라왔는지 가르지 않는다(같은 관측값 열) — 통보는 최소 \
                      간격(10분)에 묶인다(시간당 ≤ 6 · 24시간 ≤ 144). 이 feed 는 고리 회차의 1·2·4·8·16·32·64·128…번째에만 낸다(24시간 동안 \
                      예외 통보가 없으면 회차를 새로 센다 · 좌석당 24시간 ≤ 8건 · 매 통보는 `context.edge_return` 이벤트와 좌석 행 \
-                     `ctx_guard.edge_returns_24h`). 자동 압축이 꺼져 있다면 이 통보가 차단점 {}% 전의 저장 기회다(가드는 자동 압축 상태를 모른다).",
+                     `ctx_guard.edge_returns_24h` · 회차·24시간 수는 이 데몬 세대 안의 수다 — 가드 기록은 휘발이라 재기동 뒤 0 부터 · 재기동마다 \
+                     회차 1번째 feed 가 한 번 더 날 수 있다). 자동 압축이 꺼져 있다면 이 통보가 차단점 {}% 전의 저장 기회다(가드는 자동 압축 상태를 모른다).",
                     axis_ko(axis),
                     block_point(window)
                 );
@@ -3548,7 +3556,7 @@ pub(crate) fn publish_ctx_guard(
                 }
                 daemon.push_feed_notification("error", &title, &body, Some(sid));
             }
-            Note::Ineffective { strikes, hold_until, at, why, drop, fire_seq, fire_at, level } => {
+            Note::Ineffective { strikes, episode, ineffective_24h, hold_until, at, why, drop, fire_seq, fire_at, level } => {
                 let hold_secs = (hold_until - at).max(0.0);
                 daemon.bus.publish(
                     "context.clear_ineffective",
@@ -3563,13 +3571,26 @@ pub(crate) fn publish_ctx_guard(
                         "why": why.as_str(),
                         "drop": drop.map(|(b, a)| json!([b, a])),
                         "level_pct": level.map(|l| l.0),
+                        // ★(통합 minor 정리 · R1V42-3) 효과 없음 회차(24시간 공백 뒤 새로 셈 · 효과 있는 발화로 끊기지 않음) · 24시간 수.
+                        "episode": episode,
+                        "ineffective_24h": ineffective_24h,
                     }),
                 );
-                if !strikes.is_power_of_two() {
+                // ★(통합 minor 정리 · R1V42-3) 오너 feed 는 **효과 없음 회차**의 1·2·4·8·16…번째에만(좌석당 어느 24시간에도 ≤ 8건 —
+                //   회차는 24시간 공백 뒤에만 새로 시작하므로 한 24시간 창은 한 회차의 연속 구간만 닿고 백오프·최소 간격이 그 안의 수를
+                //   묶는다). 종전은 연속 수(strikes)의 거듭제곱이라 효과 있는 발화가 연속을 0 으로 돌릴 때마다 'strike 1' warn 이 새로 나갔다
+                //   (경보를 가끔 놓치는 집행자 좌석 24시간 15~22건). 연속 효과 없음(끊김 없는 streak)은 회차 = 연속 수라 종전과 같다.
+                //   이벤트 `context.clear_ineffective` 는 매번 그대로다. 등급은 종전대로 연속 수(1 = warn · 2 이상 = error).
+                if !episode.is_power_of_two() {
                     continue;
                 }
                 let kind = if strikes == 1 { "warn" } else { "error" };
                 let d_min = (hold_secs / 60.0).round() as u64;
+                let ep_note = if episode > strikes {
+                    format!(" · 24시간 효과 없음 {ineffective_24h}회(누적 {episode}번째 — 이 feed 는 누적 1·2·4·8…번째에만){gen_note}")
+                } else {
+                    String::new()
+                };
                 let (title, body) = match why {
                     Why::DropAfterCycle => {
                         let (b, a) = drop.unwrap_or((0, 0));
@@ -3589,22 +3610,54 @@ pub(crate) fn publish_ctx_guard(
                         (
                             format!(
                                 "{who} cys clear 뒤 다음 통보 전에 컨텍스트 10%p 이상 하락({b}%→{a}%) — 압축(자동·수동 /compact·수동 \
-                                 /clear 구분 불가) · 다음 자동 clear 통보는 {d_min}분 뒤({strikes}번 연속) ({sref})"
+                                 /clear 구분 불가) · 다음 자동 clear 통보는 {d_min}분 뒤({strikes}번 연속{ep_note}) ({sref})"
                             ),
                             body,
                         )
                     }
                     Why::SelfReportUnchanged => {
                         let (v0, v1) = drop.unwrap_or((0, 0));
+                        // ★(통합 minor 정리 · V42R-2) '차단점' 단정은 **창을 아는 Claude 좌석**에만 — 차단점(창 − 23K)은 Claude Code 의 개념이고
+                        //   자기보고 축은 실측 축(상태줄)이 없는 좌석(주로 codex·agy·grok)에서만 판정된다. 그 좌석의 B(89%) 는 '200K Claude 로
+                        //   보았을 때' 의 값일 뿐이다(창 미상 Claude 는 1M 일 수도 있다 — 그러면 89% 는 차단점 전이다). 사실(사이클 전후 같은 값)과
+                        //   가드가 쓴 가정만 적는다.
+                        let seat_agent: Option<String> = agent.map(str::to_string).or_else(|| {
+                            surface.agent_meta.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|(a, _)| a.clone())
+                        });
+                        let window_known = surface
+                            .observed_usage
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                            .is_some_and(|u| u.ctx_window.is_some());
+                        let claude_known = seat_agent.as_deref() == Some("claude") && window_known;
+                        let (tag, fact, causes) = if claude_known {
+                            (
+                                "(차단점 이상으로만 보이는 값)".to_string(),
+                                format!("{v1}% 는 차단점 이상으로만 보이는 값이다 — 차단점 전의 좌석은 이 값을 보일 수 없다"),
+                                "자기보고가 갱신되지 않음 · 좌석이 이미 차단점에 있음 · clear 로 낮출 수 없는 수준",
+                            )
+                        } else {
+                            let who_agent = seat_agent.as_deref().map_or_else(|| "에이전트 미상".to_string(), |a| format!("agent={a}"));
+                            let assume = if seat_agent.as_deref() == Some("claude") {
+                                "창을 모르는 Claude 좌석이라 200K 로 보았다(1M 이면 이 값은 차단점 전이다)".to_string()
+                            } else {
+                                format!("이 좌석({who_agent})에는 Claude Code 차단점이 없을 수 있다 — 가드는 창 미상 좌석을 200K Claude 로 보는 보수 규칙으로 판정했다")
+                            };
+                            (
+                                String::new(),
+                                format!("가드는 이 규칙을 200K Claude 기준 차단점 이상으로만 보이는 값({v1}% · B 이상)에 쓴다 — {assume} · 차단점 단정은 하지 않는다"),
+                                "자기보고가 갱신되지 않음 · clear 로 낮출 수 없는 수준",
+                            )
+                        };
                         (
                             format!(
-                                "{who} cys 사이클 뒤 첫 자기보고가 통보 때와 같은 {v1}%(차단점 이상으로만 보이는 값) — 자기보고로 clear 효과를 볼 수 \
-                                 없어 자기보고 통보를 {d_min}분 보류({strikes}번 연속) ({sref})"
+                                "{who} cys 사이클 뒤 첫 자기보고가 통보 때와 같은 {v1}%{tag} — 자기보고로 clear 효과를 볼 수 \
+                                 없어 자기보고 통보를 {d_min}분 보류({strikes}번 연속{ep_note}) ({sref})"
                             ),
                             format!(
-                                "자기보고(status.set) 축 통보 {v0}% 뒤 cys 사이클이 끝났는데 사이클 뒤 첫 자기보고가 같은 {v1}% 다({v1}% 는 차단점 이상으로만 \
-                                 보이는 값이다 — 차단점 전의 좌석은 이 값을 보일 수 없다 · 창 미상이면 200K 로 본다). 가드는 원인을 알지 못한다(가능: 자기보고가 갱신되지 않음 · 좌석이 \
-                                 이미 차단점에 있음 · clear 로 낮출 수 없는 수준). 자기보고 통보를 {d_min}분 보류한다(연속될수록 두 배 · 최대 {}분 · 보류 중 \
+                                "자기보고(status.set) 축 통보 {v0}% 뒤 cys 사이클이 끝났는데 사이클 뒤 첫 자기보고가 같은 {v1}% 다({fact}). 가드는 원인을 \
+                                 알지 못한다(가능: {causes}). 자기보고 통보를 {d_min}분 보류한다(연속될수록 두 배 · 최대 {}분 · 보류 중 \
                                  값이 바뀌어도 보류는 그대로다). 보류가 끝나면 **다음 자기보고가 올 때** 판정한다 — 자기보고 축은 보류 만료에 스스로 다시 \
                                  판정하지 않으므로 좌석이 자기보고를 멈추면(차단점에서 제출이 막힌 좌석 포함) 이 축으로는 통보가 오지 않는다(그때는 오너 \
                                  확인이 필요하다). 후보(오너 결정): 자기보고 값 정정(`cys set-status --context` 가 실제 값인지) · 실측 축(상태줄) 확보.",
@@ -3615,7 +3668,7 @@ pub(crate) fn publish_ctx_guard(
                     Why::NoCycle => (
                         format!(
                             "{who} 직전 통보({}분 전) 뒤 끝난 cys 사이클이 없는 채(clear 안 됨으로 끝난 시도 포함) 다시 임계를 넘었다 — \
-                             다음 통보는 {d_min}분 뒤({strikes}번 연속) ({sref})",
+                             다음 통보는 {d_min}분 뒤({strikes}번 연속{ep_note}) ({sref})",
                             ((at - fire_at).max(0.0) / 60.0).round() as u64
                         ),
                         format!(
@@ -21432,6 +21485,142 @@ mod tests {
         let (n2, _) = run(89);
         assert!(named_events(&daemon, n2, "context.clear_ineffective").is_empty());
         assert_eq!(threshold_events(&daemon, n2).len(), 2, "값이 바뀐 자기보고의 통보가 막혔다(②)");
+    }
+
+    /// ★(통합 minor 정리 · V42R-2) 고착 자기보고 feed 의 '차단점' 단정은 **창을 아는 Claude 좌석**에만 — 자기보고 축은 실측 축(상태줄)이
+    /// 없는 좌석(주로 codex·agy·grok)에서 판정되고 그 좌석에는 Claude Code 차단점(창 − 23K)이 없다(창 미상 Claude 도 1M 이면 89% 는
+    /// 차단점 전이다). 그 좌석의 feed 는 사실(사이클 전후 같은 값)과 가드가 쓴 가정(200K Claude 로 봄)만 싣는다. 판정(strike·보류)은 같다.
+    /// 실패 방향: 붉어지면 오너 feed 가 사실이 아닌 원인('좌석이 이미 차단점에 있음')을 사실로 적는다.
+    #[test]
+    fn v42r_2_stuck_self_report_feed_asserts_the_blocking_point_only_for_claude_seats_with_a_known_window() {
+        let _pack = crate::governance::HOutsidePack::new(); // 팩 격리(ACL 경합 없음) — 좌석 전에
+        let daemon = isolated_daemon(); // 상태 폴더 격리(동결·영속 공유 없음)
+        let t0 = crate::usage::ctx_guard_now(&daemon);
+        let run = |role: &str, agent: Option<&str>, window: Option<u64>| -> (u64, String, String) {
+            let node = make_surface(&daemon, Some(role));
+            let s = daemon.get_surface(node).unwrap();
+            if let Some(a) = agent {
+                *s.agent_meta.lock().unwrap() = Some((a.to_string(), a.to_string()));
+            }
+            if let Some(w) = window {
+                // 실측 퍼센트 없음(자기보고가 게이트 입력) · 창만 안다(낡은 실측 축이 창을 남긴 좌석).
+                *s.observed_usage.lock().unwrap() = Some(crate::usage::ObservedUsage {
+                    agent: agent.unwrap_or("").to_string(),
+                    ctx_tokens: None,
+                    ctx_window: Some(w),
+                    ctx_pct: None,
+                    rate: vec![],
+                    source: "transcript".into(),
+                    session_file: String::new(),
+                    updated_at: 0.0,
+                });
+            }
+            let at = |pct: u8, t: f64| maybe_fire_context_threshold_at(&daemon, &s, pct, "self-report", None, t);
+            at(90, t0);
+            s.ctx_loop_guard.lock().unwrap().cycle_on(t0 + 60.0, false);
+            s.ctx_loop_guard.lock().unwrap().cycle_off(crate::usage::clear_guard::Outcome::Unknown, t0 + 90.0, false);
+            at(90, t0 + 100.0);
+            let feed: Vec<(String, String)> = daemon.feed_items.lock().unwrap().iter()
+                .filter(|f| f.surface_id == Some(node) && f.title.contains("첫 자기보고")).map(|f| (f.title.clone(), f.body.clone())).collect();
+            assert_eq!(feed.len(), 1, "{role}: {feed:?}");
+            assert_eq!(named_events(&daemon, node, "context.clear_ineffective").len(), 1, "{role}: 판정은 같다(strike 1)");
+            (node, feed[0].0.clone(), feed[0].1.clone())
+        };
+        for (role, agent, window) in [("reviewer-codex", Some("codex"), None), ("agy-seat", Some("gemini"), Some(200_000)),
+                                      ("claude-nowin", Some("claude"), None), ("unknown-seat", None, None)] {
+            let (_, title, body) = run(role, agent, window);
+            assert!(!body.contains("차단점 전의 좌석은 이 값을 보일 수 없다") && !body.contains("좌석이 이미 차단점에 있음")
+                && !title.contains("차단점 이상으로만 보이는 값"), "{role}: 차단점 단정: {title} / {body}");
+            assert!(body.contains("차단점 단정은 하지 않는다") && body.contains("200K"), "{role}: 가드가 쓴 가정이 없다: {body}");
+            assert!(title.contains("같은 90%") && body.contains("다음 자기보고가 올 때"), "{role}: {title} / {body}");
+        }
+        // 대조 — 창을 아는 Claude 좌석은 종전 문구(단정) 그대로.
+        let (_, title, body) = run("claude-200k", Some("claude"), Some(200_000));
+        assert!(title.contains("(차단점 이상으로만 보이는 값)") && body.contains("차단점 전의 좌석은 이 값을 보일 수 없다")
+            && body.contains("좌석이 이미 차단점에 있음"), "{title} / {body}");
+    }
+
+    /// ★(통합 minor 정리 · R1V42-3) `context.clear_ineffective` 오너 feed 는 **효과 없음 회차**(24시간 공백 뒤 새로 셈 · 효과 있는 발화로
+    /// 끊기지 않음)의 2의 거듭제곱 번째에만 — 경보를 둘 중 하나만 집행하는 좌석(늘 strike 1)의 feed 가 24시간 ≤ 8건(종전 연속 수 기준 놓칠
+    /// 때마다 1건 · 24시간 15~22건). 이벤트는 효과 없음마다 그대로(회차·24시간 수를 싣는다) · 좌석 행 `ineffective_episode`·`ineffective_24h`.
+    /// ★(V42R-3) 24시간 수는 데몬 세대 안의 수다 — 좌석 행 `counts_since`(기동 epoch) · 세대가 24시간 미만이면 feed 가 그 사실을 싣는다.
+    #[test]
+    fn r1v42_3_intermittent_executor_ineffective_feed_is_bounded_per_24h() {
+        let _pack = crate::governance::HOutsidePack::new(); // 팩 격리(ACL 경합 없음) — 좌석 전에
+        let daemon = isolated_daemon(); // 상태 폴더 격리(동결·영속 공유 없음)
+        let node = make_surface(&daemon, Some("worker-intermittent"));
+        let s = daemon.get_surface(node).unwrap();
+        let t0 = crate::usage::ctx_guard_now(&daemon);
+        let at = |pct: u8, t: f64| maybe_fire_context_threshold_at(&daemon, &s, pct, "statusline", Some("claude"), t);
+        let mut pct = 30.0f64;
+        let (mut on_at, mut off_at): (Option<f64>, Option<f64>) = (None, None);
+        let mut fires_seen = 0usize;
+        let mut t = 0.0f64;
+        while t <= 24.0 * 3600.0 {
+            if on_at.is_some_and(|a| t >= a) {
+                s.ctx_loop_guard.lock().unwrap().cycle_on(t0 + t, false);
+                on_at = None;
+                off_at = Some(t + 60.0);
+            }
+            if off_at.is_some_and(|a| t >= a) {
+                let out = s.ctx_loop_guard.lock().unwrap().cycle_off(crate::usage::clear_guard::Outcome::Cleared, t0 + t, false);
+                publish_ctx_guard(&daemon, &s, out, "cycle-marker", None);
+                off_at = None;
+                pct = 30.0;
+            }
+            if (t as u64) % 30 == 0 {
+                pct = (pct + 0.5).min(99.0);
+                at(pct.round() as u8, t0 + t);
+            }
+            if (t as u64) % 2 == 0 {
+                crate::usage::ctx_guard_tick_at(&daemon, &s, t0 + t);
+            }
+            let n = threshold_events(&daemon, node).len();
+            if n > fires_seen {
+                fires_seen = n;
+                if n % 2 == 0 && on_at.is_none() && off_at.is_none() {
+                    on_at = Some(t + 120.0); // 둘 중 하나만 집행
+                }
+            }
+            t += 1.0;
+        }
+        let ci = named_events(&daemon, node, "context.clear_ineffective");
+        assert!(ci.len() >= 15, "전제: 효과 없음이 되풀이된다: {}", ci.len());
+        assert!(ci.iter().all(|e| e["payload"]["strikes"] == json!(1)), "전제: 늘 strike 1(효과 있는 발화가 연속을 끊는다)");
+        let eps: Vec<u64> = ci.iter().map(|e| e["payload"]["episode"].as_u64().unwrap()).collect();
+        assert_eq!(eps, (1..=ci.len() as u64).collect::<Vec<u64>>(), "회차가 끊겼다: {eps:?}");
+        let feeds: Vec<String> = daemon.feed_items.lock().unwrap().iter()
+            .filter(|f| f.surface_id == Some(node) && f.title.contains("끝난 cys 사이클이 없는 채")).map(|f| f.title.clone()).collect();
+        assert!(!feeds.is_empty() && feeds.len() <= 8, "효과 없음 오너 feed 24시간 {}건(≤ 8): {feeds:?}", feeds.len());
+        assert!(feeds.iter().skip(1).all(|f| f.contains("24시간 효과 없음") && f.contains("누적")), "누적 수·24시간 수가 없다: {feeds:?}");
+        let w = crate::usage::ctx_guard_wire(&daemon, &s);
+        assert_eq!(w["ineffective_episode"], json!(ci.len() as u64), "{w}");
+        assert!(w["ineffective_24h"].as_u64().is_some_and(|n| n >= 1) && w["counts_since"] == json!(daemon.started_at), "{w}");
+    }
+
+    /// ★(통합 minor 정리 · V42R-3) 가장자리 복귀 feed 의 '24시간' 수치는 데몬 세대 안의 수다(가드 상태는 휘발 — 재기동 뒤 0 부터). 세대가
+    /// 24시간이 안 됐으면 제목이 그 사실(기동 뒤 N시간치)을 싣고 본문이 '재기동마다 회차 1번째 feed 가 한 번 더 날 수 있다' 를 싣는다.
+    #[test]
+    fn v42r_3_edge_feed_counts_are_scoped_to_the_daemon_generation() {
+        let _pack = crate::governance::HOutsidePack::new(); // 팩 격리(ACL 경합 없음) — 좌석 전에
+        let daemon = isolated_daemon(); // 상태 폴더 격리(동결·영속 공유 없음)
+        let node = make_surface(&daemon, Some("master"));
+        let s = daemon.get_surface(node).unwrap();
+        let t0 = crate::usage::ctx_guard_now(&daemon);
+        let at = |pct: u8, t: f64| maybe_fire_context_threshold_at(&daemon, &s, pct, "statusline", Some("claude"), t);
+        at(70, t0);
+        s.ctx_loop_guard.lock().unwrap().cycle_on(t0 + 60.0, false);
+        let out = s.ctx_loop_guard.lock().unwrap().cycle_off(crate::usage::clear_guard::Outcome::Cleared, t0 + 75.0, false);
+        publish_ctx_guard(&daemon, &s, out, "cycle-marker", None);
+        at(72, t0 + 90.0);
+        at(80, t0 + 110.0);
+        at(86, t0 + 130.0);
+        crate::usage::ctx_guard_tick_at(&daemon, &s, t0 + 600.001);
+        let errs: Vec<(String, String)> = daemon.feed_items.lock().unwrap().iter()
+            .filter(|f| f.surface_id == Some(node) && f.kind == "error").map(|f| (f.title.clone(), f.body.clone())).collect();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].0.contains("이번 고리 1번째") && errs[0].0.contains("데몬 기동 뒤 0시간치"), "{}", errs[0].0);
+        assert!(errs[0].1.contains("이 데몬 세대 안의 수") && errs[0].1.contains("재기동 뒤 0 부터"), "{}", errs[0].1);
     }
 
     /// ★(RR2-ROLE-1) 게이트 경로 — 발화 뒤 오너 손 /clear(표지 없음) → 새 세션(B)이 막대 아래로 보고하면 시한·잠정 보류 뒤의

@@ -193,7 +193,7 @@ enum Command {
     /// 86=실효 확인 뒤 재주입 보류: clear 는 이미 발효했다 — 손으로 다시 clear 하지 말고 재주입만 확인한다.
     /// 87=건너뜀(송신 0건): --fire 의 통보 뒤 그 좌석의 사이클이 이미 끝났다 — 재집행하지 않는다.
     /// 88=진행 중(송신 0건): 다른 집행자의 사이클이 진행 중이다(--fire 가 있으면 단일 전체 시한이 남기는 만큼 — 기본 --timeout 120 에서 최대 30초 — 끝나기를 기다린 뒤) — 이미 처리됨이 아니다. 턴 안에서 기다리거나 곧바로 재집행하지 말고 끝낸다: 그 사이클이 clear 전에 끝나면 데몬이 같은 통보를 한 번 재배달하고(redelivery) 그때 같은 --fire 로 다시 집행해도 된다(데몬이 판정 · 끝났으면 87).
-    /// 1콜 최악 시간 = 단일 전체 시한 570초(점유 대기 포함 · Claude Code Bash 도구 상한 600초 − 여유 30): clear 전 단계(0~4)는 570 − clear 뒤 몫(2×75 + 30)까지만 기다리므로 clear 가 나갔으면 clear 실효 확인·재주입 몫이 늘 남는다.
+    /// 1콜 최악 시간 = 단일 전체 시한 570초(점유 대기 포함 · Claude Code Bash 도구 상한 600초 − 여유 30 · 데몬이 응답하는 가정 — RPC 왕복·clear 송신·재주입 붙여넣기는 각 무진행 상한 40초로 따로 묶이며 예산 밖이라, 데몬이 굳으면 그만큼 넘을 수 있다): clear 전 단계(0~4)는 570 − clear 뒤 몫(2×75 + 30)까지만 기다리므로 clear 가 나갔으면 clear 실효 확인·재주입 몫이 늘 남는다.
     /// 89=접수(--detach): 데몬이 이 1콜을 대신 띄워 끝까지 붙든다(요청 좌석 신원 · 동시 상한 3 · master·CEO 먼저 · 좌석당 단일 비행) — 이 1콜은 곧바로 돌아온다(턴 안 대기 없음). 결과(위 종료코드와 사유 1줄)는 끝나면 요청 좌석의 큐로 한 번 온다(`[cycle-result] … rc=N`). --detach 에서 87 은 이미 끝난 통보 또는 이 좌석이 같은 통보를 이미 detach 로 집행해 88 밖 결과로 끝났다(재집행 금지) · 88 은 다른 집행자의 사이클·작업이 진행 중이다(기다리지 않고 곧바로 — 재배달을 기다린다).
     CycleAgent {
         #[arg(long)]
@@ -2780,6 +2780,46 @@ fn send_settle_stderr_line(o: &SettleOutcome, sid: u64) -> Option<String> {
     }
 }
 
+/// ★(0.14.42 · S21-SETTLE · 통합 minor 정리 — 원시 RPC `surface.send_text` 내부 호출자 전수) **권위 직접 붙여넣기 1요청 +
+/// 증명된 정착 재시도.** `inject_text`(기본 소켓 지침·과업 주입) · `inject_text_on`(부서 소켓 — `drain --verify` 저장 지시) ·
+/// `boot_agent_on_surface`(기동 명령)는 `authoritative:true` 로 원시 `surface.send_text` 를 불렀다. 데몬은 권위를 호출자 신원
+/// (`authoritative_caller_ok` — master·CSO·복원 뿌리 자손)으로만 면제하므로, 좌석 밖·비권위 호출자(부서 데몬 앞의 본부 CLI ·
+/// 좌석 없는 스크립트)의 붙여넣기는 D-12·제출 정착 게이트를 지난다. 그 좌석에 진행 중인 기계 제출(writer 대기 CR · 방금 쓴
+/// CR 의 분리 창)이 있으면 데몬은 **쓰기 0** 으로 거부하고 정착 증명(` [settle:<ms>]`)을 붙인다 — `cys send` 는 그 증명이
+/// 있을 때만 예산 안에서 다시 보내지만 이 세 호출자는 재시도하지 않아 곧 비는 줄 앞에서 실패했다(`inject_text` 는 큐 1회
+/// 전환 → 조용함 대기·최소 간격 10초 뒤 배달 · `inject_text_on` 은 Err → `drain --verify` 가 '소켓 hung' 오분류).
+/// 규칙은 `cys send` 와 같다: 첫 요청은 종전 바이트 그대로 · 증명이 있는 거부에서만 힌트만큼 쉬고 다시 보낸다(재시도에만
+/// `settle_retry:true` — 데몬은 kill-switch pause 중 재시도를 쓰지 않고 증명 없이 거부한다) · 증명 없는 거부(사람 초안·모달·
+/// 태그 없는 타이핑 가드·전송 오류)·권위 면제 경로(거부 자체가 없다)·윈도우·끔(`CYS_SEND_SETTLE=0`)은 재시도 0회로 종전과 같다.
+/// 예산은 `cys send` 와 같은 `send_settle_budget_ms`(기본 3초 · `CYS_SEND_SETTLE_BUDGET_MS` · 상한 10초 · 요청 ≤ 40).
+/// 새 쓰기 경로 0 — 거부는 데몬의 쓰기 전 명시 거부라 중복 주입이 없다.
+fn authoritative_paste_settled(
+    mut req: impl FnMut(Value) -> Result<Value, String>,
+    params: Value,
+) -> Result<Value, String> {
+    let budget = send_settle_budget_ms(
+        cys::send_settle_env_off(std::env::var("CYS_SEND_SETTLE").ok().as_deref()),
+        std::env::var("CYS_SEND_SETTLE_BUDGET_MS").ok().as_deref(),
+        cfg!(windows),
+        false,
+        false,
+        false,
+    );
+    send_text_settled(
+        |settle_retry| {
+            let mut p = params.clone();
+            if settle_retry {
+                p["settle_retry"] = json!(true);
+            }
+            req(p)
+        },
+        |ms| std::thread::sleep(std::time::Duration::from_millis(ms)),
+        budget,
+        send_settle_jitter_ms,
+    )
+    .result
+}
+
 /// ★B3 #4 `cys send` 본문 결정(순수) — argv 대신 **바이트 전문**을 본문으로 삼는 경로.
 ///
 /// 왜 필요한가(실사고): 본문 채널이 argv 하나뿐이라 발신 셸이 큰따옴표 안의 백틱·`$( )`·
@@ -3345,8 +3385,10 @@ fn inject_text(sid: u64, text: &str) -> Result<(), String> {
     // authoritative: 디렉티브·과업 주입은 타이핑 가드를 면제한다 — 막 기동한 에이전트
     // pane에 사람 미완성 입력이 없고, GUI 활성 pane의 사람-입력 잔향이 주입을 영구
     // 차단하던 경로(human is typing 무한)를 끊는다. ACL은 데몬에서 그대로 집행된다.
-    match request(
-        "surface.send_text",
+    // ★(0.14.42 · 통합 minor 정리) 정착 증명 거부(곧 비는 줄)는 `cys send` 와 같은 예산 안에서 다시 보낸 뒤에만 아래 큐 1회
+    //   전환으로 간다(`authoritative_paste_settled` — 증명 없는 거부·권위 면제는 첫 요청 그대로).
+    match authoritative_paste_settled(
+        |p| request("surface.send_text", p),
         json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
     ) {
         Ok(_) => {}
@@ -14172,8 +14214,10 @@ fn boot_agent_on_surface(
         .find(|s| s["surface_id"].as_u64() == Some(sid))
         .and_then(|s| s["line_count"].as_u64())
         .unwrap_or(0);
-    request(
-        "surface.send_text",
+    // ★(0.14.42 · 통합 minor 정리) node-recover 의 기존 좌석(에이전트 등록 유지)에 비권위 호출자가 기동 명령을 넣으면 제출
+    //   정착 게이트를 지난다 — 정착 증명 거부는 `cys send` 와 같은 예산 안에서 다시 보낸다(권위 면제면 첫 요청 그대로).
+    authoritative_paste_settled(
+        |p| request("surface.send_text", p),
         json!({"surface_id": sid, "text": send, "quiet": true, "authoritative": true}),
     )?;
     request(
@@ -18444,11 +18488,11 @@ fn inject_text_on(
     gate_guard_check_on(socket, sid, timeout, "디렉티브 주입(부서)")?;
     // ★(0.14.42 · 설계 C D4) `inject_text` 와 같은 lib 봉투(단일 정의처).
     let wrapped = cys::paste_fence::wrap(text);
-    request_on_timeout(
-        socket,
-        "surface.send_text",
+    // ★(0.14.42 · 통합 minor 정리) 좌석 밖 호출자(본부 CLI → 부서 데몬)는 권위 면제가 아니다 — 정착 증명 거부는 `cys send`
+    //   와 같은 예산 안에서 다시 보낸다(종전: 재시도 없이 Err → `drain --verify` 가 '소켓 hung' 으로 오분류).
+    authoritative_paste_settled(
+        |p| request_on_timeout(socket, "surface.send_text", p, timeout),
         json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
-        timeout,
     )?;
     std::thread::sleep(std::time::Duration::from_millis(800));
     gate_guard_check_on(socket, sid, timeout, "제출 Return(부서)")?;
@@ -18619,6 +18663,14 @@ fn verify_one_node(
             return (
                 VerifyOutcome::Unverifiable,
                 format!("관문 보류 — 저장 지시 미주입(좌석 보존 · Return 0발): {e}"),
+            );
+        }
+        // ★(0.14.42 · 통합 minor 정리) 데몬의 D-12 거부(입력줄 점유 — 사람 초안·모달·정착 예산 소진 · 쓰기 0)도 소켓 hung 이
+        //   아니다 — 데몬이 받지 않았다. 지시 전달 실패(`delivery_failed` · 입력 미제출)로 사실대로 적는다(안전 방향 같음).
+        if is_typing_guard_err(&e) {
+            return (
+                VerifyOutcome::DeliveryFailed,
+                format!("입력줄 점유 — 데몬이 저장 지시 직접 주입을 거부(D-12 · 쓰기 0 · Return 0발): {e}"),
             );
         }
         // 소켓 hung(RPC 타임아웃) — delivery_failed(노드 wedge)와 구분해 timeout으로 분류
@@ -32288,6 +32340,9 @@ mod tests {
         Hung,
         /// (U-14) 관문 가드가 주입을 **보류**시킨 노드 — 소켓은 멀쩡하고 우리가 안 보낸 것이다.
         GateHeld,
+        /// ★(0.14.42 · 내부 호출자 전수) 데몬이 직접 주입을 **D-12 로 거부**한 노드(사람 초안 · 정착 증명 없음 · 쓰기 0) —
+        /// 소켓은 멀쩡하고 데몬이 입력줄 점유로 받지 않았다(소켓 hung 이 아니다).
+        DraftRefused,
     }
 
     struct FakeVerifyIo {
@@ -32370,6 +32425,14 @@ mod tests {
                     return Err(format!(
                         "{} 관문 보류(gate=bypass-disclaimer)",
                         cys::inject_guard::HOLD_TOKEN
+                    ))
+                }
+                Some(FakeScenario::DraftRefused) => {
+                    return Err(format!(
+                        "{}: {} [{}:human_draft]",
+                        cys::ERR_TYPING_GUARD,
+                        cys::MSG_TYPING_GUARD,
+                        cys::DRAFT_GATE_TAG
                     ))
                 }
                 Some(FakeScenario::Cooperative) => fake_write_marker(text, file),
@@ -32678,6 +32741,28 @@ mod tests {
         assert_eq!(o, VerifyOutcome::Unverifiable, "관문 보류가 소켓 hung 으로 오분류됐다");
         assert!(d.contains("관문 보류"), "사유가 관문 보류로 보고되지 않는다: {d}");
         assert_eq!(rc, 0, "보류인데 Return 재전송이 나갔다(rc={rc}) — 관문 위젯을 누른다");
+    }
+
+    /// ★(0.14.42 · 통합 minor 정리 — 원시 RPC 내부 호출자 전수) 데몬의 **D-12 거부**(입력줄 점유 · 쓰기 0 · 타이핑 가드
+    /// 접두)는 소켓 hung 이 아니다 → `delivery_failed`(지시 전달 실패 · 입력 미제출) + 사유에 '입력줄 점유'. 종전에는 관문
+    /// 보류가 아닌 모든 주입 오류를 '소켓 hung — 저장 지시 RPC 타임아웃'(timeout)으로 접어 사람이 소켓·데몬을 뒤졌다.
+    /// 안전 방향은 같다(Saved 아님 → `all_saved` 거짓 · 재시작 게이트 그대로 막힘) · Return 재전송 0(본문이 안 들어갔다).
+    #[test]
+    fn drain_verify_d12_refusal_is_delivery_failed_not_socket_hung() {
+        let td = std::env::temp_dir().join(format!("cys-dv-d12-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let round = td.join("_round");
+        std::fs::create_dir_all(&round).unwrap();
+        std::fs::write(round.join("SESSION_STATE.md"), "# 상태\n").unwrap();
+        let io = FakeVerifyIo::new();
+        io.add(4, FakeScenario::DraftRefused, round.join("SESSION_STATE.md"));
+        let t = mk_target(4, td.join("cys.sock"), Some(td.to_string_lossy().into_owned()));
+        let (o, d) = verify_one_node(&io, &t, "run1", std::time::Duration::from_secs(1), 100);
+        let rc = io.return_count(4);
+        let _ = std::fs::remove_dir_all(&td);
+        assert_eq!(o, VerifyOutcome::DeliveryFailed, "D-12 거부가 소켓 hung(timeout)으로 오분류됐다: {d}");
+        assert!(d.contains("입력줄 점유") && !d.contains("소켓 hung"), "사유가 D-12 거부로 보고되지 않는다: {d}");
+        assert_eq!(rc, 0, "본문이 안 들어갔는데 Return 재전송이 나갔다(rc={rc})");
     }
 
     /// ③ 미제출 wedge → delivery_failed(timeout과 구분).
@@ -33893,6 +33978,183 @@ mod tests {
         let pos = |m: &str| calls.iter().position(|c| c == m).unwrap_or_else(|| panic!("{m} 부재: {calls:?}"));
         assert!(pos("surface.send_text") < pos("surface.send_key"), "순서: 붙여넣기 → Return");
         assert_eq!(calls.iter().filter(|m| *m == "surface.read_text").count(), 2);
+    }
+
+    /// ★(0.14.42 · 통합 minor 정리 — 원시 RPC `surface.send_text` 내부 호출자 전수) 정착 증명 거부를 받는 스크립트 가짜 데몬.
+    /// `send_text` 의 처음 `refusals` 요청은 `refusal`(데몬 문구 그대로 · 쓰기 0) · 그 뒤는 ok. 화면은 늘 건강한 프롬프트.
+    /// 돌려주는 것: (소켓 경로, (메서드, params) 기록, 정지 함수).
+    #[cfg(unix)]
+    fn scripted_settle_daemon(
+        refusals: usize,
+        refusal: String,
+    ) -> (std::path::PathBuf, std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>, impl FnOnce()) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let sock = std::path::Path::new("/tmp").join(format!(
+            ".settle-{}-{}.sock",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("가짜 소켓 bind");
+        let calls: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&calls);
+        let server = std::thread::spawn(move || {
+            let mut refused = 0usize;
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let mut reader = BufReader::new(match stream.try_clone() { Ok(s) => s, Err(_) => break });
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                if method == "__stop" {
+                    break;
+                }
+                rec.lock().unwrap_or_else(|e| e.into_inner()).push((method.clone(), req["params"].clone()));
+                let mut w = stream;
+                if method == "surface.send_text" && req["params"]["queued"] != true && refused < refusals {
+                    refused += 1;
+                    let resp = json!({"id": req["id"], "ok": false,
+                                      "error": {"code": cys::ERR_TYPING_GUARD, "message": refusal}});
+                    let _ = writeln!(w, "{resp}");
+                    continue;
+                }
+                let result = match method.as_str() {
+                    "surface.list" => json!({"surfaces": [{
+                        "surface_id": 7, "surface_ref": "surface:7", "awakened_at": 1.0,
+                        "agent": "claude", "agent_alive": true, "exited": false, "gate_pending": null}]}),
+                    "surface.read_text" => json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                  "quiet_secs": 5.0, "line_count": 40}),
+                    "surface.send_text" if req["params"]["queued"] == true => json!({"queued": true, "depth": 1}),
+                    _ => json!({"ok": true}),
+                };
+                let _ = writeln!(w, "{}", json!({"id": req["id"], "ok": true, "result": result}));
+            }
+        });
+        let stop_sock = sock.clone();
+        let stop = move || {
+            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&stop_sock) {
+                use std::io::Write;
+                let _ = writeln!(s, "{}", json!({"id": 1, "method": "__stop", "params": {}}));
+            }
+            let _ = server.join();
+            let _ = std::fs::remove_file(&stop_sock);
+        };
+        (sock, calls, stop)
+    }
+
+    /// 정착 증명 거부 문구(데몬 `submit_settle_proof` 가 붙이는 그대로 — lib 단일 정의처).
+    #[cfg(unix)]
+    fn settle_refusal(hint_ms: u64) -> String {
+        format!(
+            "{} [{}:submit_settling]{}",
+            cys::MSG_TYPING_GUARD,
+            cys::DRAFT_GATE_TAG,
+            cys::send_settle_suffix(hint_ms)
+        )
+    }
+
+    /// ★(0.14.42 · 통합 minor 정리 — 원시 RPC 내부 호출자 전수) `inject_text_on`(부서 소켓 권위 주입 · `drain --verify` 의
+    /// 저장 지시)은 원시 `surface.send_text` 를 **재시도 없이** 불렀다. 좌석 밖 호출자(본부 CLI → 부서 데몬)는 권위 면제가
+    /// 아니라 D-12·제출 정착 게이트를 지나고, 대상 좌석에 진행 중인 기계 제출이 있으면 데몬은 쓰기 0 으로 거부하며 정착
+    /// 증명(` [settle:<ms>]`)을 붙인다 — 그 거부가 곧바로 Err 로 올라가 `drain --verify` 가 '소켓 hung'(timeout)으로 끝났다.
+    /// 이제 증명이 있을 때만 `cys send` 와 같은 예산 안에서 다시 보내고(재시도에만 `settle_retry:true`), 증명 없는 거부는
+    /// 첫 요청 그대로 올린다(재시도 0회). 실패 방향: 붉어지면 정착 창에 걸린 저장 지시가 유실된다(재시작 게이트 거짓 차단).
+    #[cfg(unix)]
+    #[test]
+    fn inject_text_on_retries_a_settle_proven_refusal_then_submits() {
+        use std::time::Duration;
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CYS_SEND_SETTLE");
+        std::env::remove_var("CYS_SEND_SETTLE_BUDGET_MS");
+        let (sock, calls, stop) = scripted_settle_daemon(2, settle_refusal(30));
+        let r = inject_text_on(&sock, 7, "SAVE NOW", Duration::from_secs(3));
+        stop();
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(r.is_ok(), "정착 증명 거부 뒤 재시도하지 않았다: {r:?} {calls:?}");
+        let sends: Vec<&Value> = calls.iter().filter(|(m, _)| m == "surface.send_text").map(|(_, p)| p).collect();
+        assert_eq!(sends.len(), 3, "첫 요청 + 증명 재시도 2회여야 한다: {calls:?}");
+        assert!(sends[0].get("settle_retry").is_none(), "첫 요청은 종전 바이트(재시도 표식 없음): {}", sends[0]);
+        assert!(sends[1..].iter().all(|p| p["settle_retry"] == true), "재시도에는 settle_retry:true(pause 중 쓰기 0): {sends:?}");
+        assert!(sends.iter().all(|p| p["authoritative"] == true && p["queued"] != true), "권위 직접 붙여넣기 그대로: {sends:?}");
+        let pos = |m: &str| calls.iter().rposition(|(c, _)| c == m).unwrap_or_else(|| panic!("{m} 부재: {calls:?}"));
+        assert!(pos("surface.send_text") < pos("surface.send_key"), "붙여넣기 성공 뒤 Return: {calls:?}");
+        // 대조군: 증명 없는 D-12 거부(사람 초안)는 재시도 0회로 그대로 Err(사람 초안 앞에서 다시 밀지 않는다).
+        let draft = format!("{} [{}:human_draft]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG);
+        let (sock, calls, stop) = scripted_settle_daemon(1, draft);
+        let r = inject_text_on(&sock, 7, "SAVE NOW", Duration::from_secs(3));
+        stop();
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(r.is_err(), "사람 초안 거부가 통과했다: {calls:?}");
+        assert_eq!(calls.iter().filter(|(m, _)| m == "surface.send_text").count(), 1, "증명 없는 거부를 재시도했다: {calls:?}");
+        assert!(!calls.iter().any(|(m, _)| m == "surface.send_key"), "본문이 거부됐는데 Return 이 나갔다: {calls:?}");
+    }
+
+    /// ★(0.14.42 · 통합 minor 정리) `inject_text`(기본 소켓 권위 주입 — launch-agent 지침·과업 · 비권위 호출자면 게이트를
+    /// 지난다)도 같은 정착 재시도를 거친 뒤에만 `--queued` 1회 전환한다. 종전에는 정착 증명 거부(곧 비는 줄)도 곧바로 큐로
+    /// 밀려 조용함 대기·최소 간격(10초) 뒤에야 배달됐다(지침 각성 지연 · 부트 체인 ack 지연). 증명 없는 타이핑 가드 거부는
+    /// 종전 그대로 큐 1회(사람 초안에 이어 붙이지 않는다).
+    #[cfg(unix)]
+    #[test]
+    fn inject_text_retries_a_settle_proven_refusal_before_the_queue_fallback() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("CYS_SEND_SETTLE");
+        std::env::remove_var("CYS_SEND_SETTLE_BUDGET_MS");
+        let saved = std::env::var_os(cys::ENV_SOCKET);
+        let (sock, calls, stop) = scripted_settle_daemon(1, settle_refusal(25));
+        std::env::set_var(cys::ENV_SOCKET, &sock);
+        let r = inject_text(7, "DIRECTIVE BODY");
+        stop();
+        match &saved {
+            Some(v) => std::env::set_var(cys::ENV_SOCKET, v),
+            None => std::env::remove_var(cys::ENV_SOCKET),
+        }
+        let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        assert!(r.is_ok(), "{r:?} {calls:?}");
+        let sends: Vec<&Value> = calls.iter().filter(|(m, _)| m == "surface.send_text").map(|(_, p)| p).collect();
+        assert_eq!(sends.len(), 2, "첫 요청 + 증명 재시도 1회(큐 전환 없음): {calls:?}");
+        assert!(sends.iter().all(|p| p["queued"] != true), "정착 창 거부가 큐로 밀렸다: {sends:?}");
+        assert_eq!(sends[1]["settle_retry"], json!(true), "{sends:?}");
+        assert!(calls.iter().any(|(m, p)| m == "surface.send_key" && p["key"] == "Return"), "직접 제출 Return: {calls:?}");
+    }
+
+    /// ★(0.14.42 · 통합 minor 정리) 소스 핀 — 비테스트 코드의 **모든 권위 직접 붙여넣기**(`"text": … "authoritative": true`)가
+    /// `authoritative_paste_settled` 를 거친다(정착 증명 거부를 재시도 없이 받는 원시 호출자 0). 새 주입 경로가 원시
+    /// `request("surface.send_text", …authoritative…)` 로 생기면 적색 — 좌석 밖 호출자에서 정착 창에 걸린 주입이 유실된다.
+    #[test]
+    fn authoritative_direct_pastes_all_go_through_the_settle_helper_source_pin() {
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests").unwrap_or(src.len())];
+        let needle = "\"authoritative\": true})";
+        let mut n = 0usize;
+        let mut at = 0usize;
+        while let Some(i) = prod[at..].find(needle) {
+            let pos = at + i;
+            let line_start = prod[..pos].rfind('\n').map_or(0, |x| x + 1);
+            if prod[line_start..pos].contains("\"text\":") {
+                n += 1;
+                // 앞 6줄(줄 경계 = 문자 경계 · 멀티바이트 주석 안전).
+                let from = prod[..pos].rmatch_indices('\n').nth(6).map_or(0, |(i, _)| i);
+                let ctx = &prod[from..pos];
+                assert!(
+                    ctx.contains("authoritative_paste_settled("),
+                    "정착 재시도 없는 원시 권위 붙여넣기: {}",
+                    &prod[line_start..pos + needle.len()]
+                );
+            }
+            at = pos + needle.len();
+        }
+        assert!(n >= 3, "권위 붙여넣기 지점(inject_text · inject_text_on · boot_agent_on_surface)을 찾지 못했다: {n}");
+        let helper = item_body(src, "\nfn authoritative_paste_settled(");
+        assert!(
+            helper.contains("send_text_settled(") && helper.contains("p[\"settle_retry\"] = json!(true)"),
+            "도우미가 증명된 재시도(send_text_settled · 재시도 표식)를 쓰지 않는다"
+        );
     }
 
     /// ★계측 타당성(negation): **상한을 끄면 같은 목에서 유계 종료하지 않는다.**

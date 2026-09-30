@@ -407,7 +407,7 @@ SAFETY_CLAUSES = {
                         "     요구하므로, 저장 지시를 받지 못하는 hang에서는 `저장 검증 실패 … clear 미실행`이 종착점이고\n"
                         "     그때의 출구는 오너 채널 상신뿐이다 — 미실행을 '집행됨'으로 적지 마라"),
         # ★(0.14.42 · ROLE-G1) 부서장은 턴 안에서 오래 기다리지 않는다(오너 절대 규칙 · 회신 큐 적체) — 한 사이클은
-        #   최대 약 8.5분이다. 전경 600000 은 백그라운드 수단이 없는 CLI 의 예외로만 남는다.
+        #   최대 약 9.5분 — 1콜 단일 전체 시한 570초이다. 전경 600000 은 백그라운드 수단이 없는 CLI 의 예외로만 남는다.
         ("사이클 백그라운드 실행", "**백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`(도구 timeout 에 끊기지 않고\n"
                         "  네 턴을 붙잡지 않는다). 전경 대기 금지"),
     ),
@@ -638,7 +638,7 @@ def missing_safety_clauses(name: str, raw: str) -> list[str]:
             if len(bounded_spans(body, normalize(clause))) != 1]
 
 
-# ★(0.14.42 · ROLE-G1) 7d5733d4 가 master·CEO 에게 준 전경 대기 문장 — 부서장이 한 사이클(최대 약 8.5분) 동안
+# ★(0.14.42 · ROLE-G1) 7d5733d4 가 master·CEO 에게 준 전경 대기 문장 — 부서장이 한 사이클(최대 약 9.5분 — 1콜 단일 전체 시한 570초) 동안
 # 자기 턴을 붙잡아 회신 큐를 적체시킨다. CSO 는 부서장이 아니므로 자기 ④ 1콜의 전경 600000 을 유지한다.
 MANAGER_FOREGROUND_CYCLE = "Bash 도구 timeout 600000 으로 전경 실행한다(도구 기본 120초에 끊기면 clear 뒤 재개 포인터 없이 남는다)."
 MANAGER_DIRECTIVES = ("MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md")
@@ -1863,7 +1863,7 @@ class CsoDirectiveRevision(unittest.TestCase):
 
     def test_manager_cycle_agent_is_not_an_in_turn_wait(self):
         """★(0.14.42 · ROLE-G1) master·CEO 는 cycle-agent 를 **백그라운드**로 돌린다 — 전경 600000 대기 문장이 부서장
-        지침에 남으면 한 사이클(최대 약 8.5분) 동안 그 턴이 멈춰 회신 큐가 적체된다(오너 절대 규칙 위반).
+        지침에 남으면 한 사이클(최대 약 9.5분 — 1콜 단일 전체 시한 570초) 동안 그 턴이 멈춰 회신 큐가 적체된다(오너 절대 규칙 위반).
         CSO 는 부서장이 아니므로 자기 ④ 1콜은 전경 600000 을 유지한다(그래야 master clear 가 도구 기본 120초에 끊기지 않는다).
         실패 방향: 붉어지면 부서장이 턴 안 장시간 대기를 지시받는다(회신 큐 적체) 또는 CSO 의 master clear 가 120초에 끊긴다."""
         for name in MANAGER_DIRECTIVES:

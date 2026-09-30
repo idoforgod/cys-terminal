@@ -372,6 +372,15 @@ S92 발신자 2 + 첫 제출 뒤 x ms 창(x=0~400) 오승인 **0/45** · S94 오
   좌석당 하나 · 결과는 CSO 큐로 한 번(`[cycle-result] … rc=N`). 결정(어느 좌석·어느 통보·검증자)은 여전히 CSO 1콜이
   하고 데몬이 스스로 사이클을 여는 경로는 없습니다(self-clear 금지 · master↔CSO 상호 집행 그대로). 같은 모형에서 막힘
   0/40(좌석 1~5 · 1콜 21~231초), 실 바이너리 드릴(좌석 셋 · 1콜 약 220초)에서 master 저장 지시 거부 0 입니다(§10).
+- **clear 가드 통합 minor 정리(발행 전 · 판정 무변경 — 좌석 모형 핀·성질 10만·스윕 6h/24h·r3 비교가 수정 6회차와
+  바이트 동일)**: 헬퍼 세션(`claude -p`)의 낮은 상태줄 한 건이나 자기보고의 1~2%p 흔들림이 계속 도는 가장자리 고리를
+  복귀 계수·오너 error feed·좌석 행에서 지우던 것(순수 모형 24시간 복귀 0 → 144) · 경보를 가끔 놓치는 집행자 좌석에서
+  '효과 없음' 오너 feed 가 놓칠 때마다 새로 나가던 것(순수 모형 24시간 21건 → 5건 · 좌석당 ≤ 8) · codex·agy 등 자기보고
+  좌석의 고착 feed 가 Claude 차단점을 원인으로 단정하던 것 · 24시간 수치가 데몬 재기동 뒤 0 부터라는 사실을 싣지 않던 것
+  (좌석 행 `counts_since` · 세대가 24시간 미만이면 feed 제목에 '데몬 기동 뒤 N시간치'). 5분 진행 보고와 보고 게이트는
+  가드가 있는 좌석에 고정 60% 경보('⚠ 컨텍스트 60%+ … cycle-agent 집행 검토')를 더 띄우지 않고, 가드의 **미해결 통보가
+  10분 넘게 집행되지 않을 때만** fire id·경과·`--fire` 처방으로 알립니다(200K 대표가 사이클 뒤 68~84% 에 머무는 것은
+  설계된 정상 — 종전 문구는 영구 경보이자 `--fire` 없는 수동 cycle-agent 를 권했습니다 · 구 데몬 좌석은 종전 60% 그대로).
 - clear 뒤 좌석이 지침 전문 없이 앉던 경로(훅 출력 1만 자 상한) · 같은 지침을 부트·사이클마다 한 번 더 읽던
   이중 적재.
 - CR 이 삼켜진 기계 잔여 때문에 heartbeat·wakeup·report_gate 가 무기한 멈추던 경로 · 부트 감독자 통보가 순간
@@ -430,8 +439,10 @@ S92 발신자 2 + 첫 제출 뒤 x ms 창(x=0~400) 오승인 **0/45** · S94 오
   `holder_fire_id` · `since`) · stale · released · not_holder(인가는 `surface.quiesce` 와 같음) · `surface.quiesce` 끔의
   `outcome`(cleared · not_cleared · unknown — 없거나 모르는 값은 unknown · 구 CLI 도 unknown 이라 clear 를 단정하지 않음)과
   `surface.quiescing` 이벤트의 `outcome` · 좌석 상태 JSON `ctx_guard`(phase · fire_id · 수준 · strikes · claim · edge_run ·
-  edge_episode · edge_returns_24h · clears_24h · confirmed_clears_24h) · 이벤트 `context.level_measured` ·
-  `context.clear_ineffective` · `context.edge_return` · `context.fire_unanswered` · `context.drop_before_cycle` ·
+  edge_episode · edge_returns_24h · clears_24h · confirmed_clears_24h · 통합 minor 정리 가산 ineffective_episode ·
+  ineffective_24h · counts_since) · 이벤트 `context.level_measured` · `context.clear_ineffective`(가산 키 `episode` ·
+  `ineffective_24h` — 오너 feed 는 효과 없음 회차의 2의 거듭제곱 번째만) · `context.edge_return` · `context.fire_unanswered` ·
+  `context.drop_before_cycle` ·
   `context.threshold` 가산 키 `fire_id` · `level_pct` · `base_threshold` · `axis` · `strikes` · `after_compaction` ·
   `observed_age_secs` · `redelivery`(경보 요약에 `fire=<id>` · 재배달이면 ` redelivery`) · `cys cycle-agent --fire <id>` ·
   새 exit 87(건너뜀)·88(진행 중). 종전 가드의 `context.floor_raised` 와 `context.threshold` 의 `floor_pct`·`regime`·
@@ -441,13 +452,18 @@ S92 발신자 2 + 첫 제출 뒤 x ms 창(x=0~400) 오승인 **0/45** · S94 오
   `cycle.detach_accepted`·`cycle.detach_started`·`cycle.detach_done`·`cycle.detach_result_undelivered` · 큐 항목 출처
   `cycle-agent --detach`(USER-MANUAL §17).
 - **계약 변경(clear 가드)**: `context.threshold` 는 clear 뒤 잰 수준 위로 자란 뒤(또는 가장자리 예외)에만 다시 나갑니다 ·
-  cycle-agent 1콜은 단일 전체 시한 570초 안에 끝납니다(점유 대기 포함 · 각 단계 `--timeout` 은 남은 예산으로 잘림).
+  cycle-agent 1콜은 단일 전체 시한 570초 안에 끝납니다(점유 대기 포함 · 각 단계 `--timeout` 은 남은 예산으로 잘림 ·
+  데몬이 응답하는 가정 — 데몬이 굳으면 RPC 한 번이 무진행 상한 40초까지 더 걸릴 수 있음).
 - **계약 변경**: 채널 재배달 기본 0(메시지 1건 = 주입 1회) · 큐 다이제스트 구간이 전부 빈 Return 이면 문안 대신
   빈 Enter 1회.
 - **계약 변경(제출 정착 · macOS·Linux)**: 에이전트 좌석으로의 직접 `send` 가 대기 제출 CR 창에서 거부될 수 있습니다
   (`queue.draft_gate_denied` 사유 `submit_settling` · 쓰기 0 · 문구는 종전 타이핑 가드 접두라 구 CLI 는 `--queued` 1회 전환).
   기계 제출 때문인 거부에는 문구 끝 ` [settle:<ms>]` · 이벤트 가산 키 `settle_ms`(발행은 좌석·발신자당 1초 1건).
   새 `cys send` 는 그 증명이 있을 때만 최대 3초 기다립니다(셸 좌석·Windows·`--queued`·`--clear-first`·여러 대상은 무변경).
+  CLI 의 권위 주입(`launch-agent` 지침·과업 · `node-recover` 기동 명령 · `drain --verify` 부서 저장 지시)도 게이트를 지나는
+  호출자(master·CSO·복원 경로가 아닌 호출자)면 같은 증명·예산으로 다시 보냅니다(통합 minor 정리 — 원시 RPC 를 재시도 없이
+  부르던 내부 호출자 전수) · `drain --verify` 는 데몬이 입력줄 점유로 거부한 노드를 `delivery_failed`(사유 '입력줄 점유')로
+  적습니다(종전 '소켓 hung' · `timeout`).
   가산분(적대 검증 수정 · §4-1-1): kill-switch pause 중 거부에는 증명이 없음 · RPC `surface.send_text` 가산 파라미터
   `settle_retry`(새 CLI 가 정착 재시도에만 싣는다 — pause 중이면 거부 사유 `paused`) · 이벤트 `queue.submit_withheld`
   (제출 CR 을 쓰기 직전 새로 뜬 창이라 쓰지 않음) · `queue.submit_resubmitted`(창이 닫힌 뒤 한 번 다시 씀) ·
@@ -541,7 +557,14 @@ macOS·Linux 에서 고쳤습니다(§4-1 · 실측 20/20 별개 제출 ×2). **
 **11) clear 가드 — 발행 전에 병합했습니다(§5).** 종전 'clear 직후 바닥 가드'의 잔여 2건(복원 뒤 배달이 바닥에
 섞여 여유 있는 대표가 "자동 clear 정지"로 오판될 수 있는 경로 · ②무clear 계열)은 별도 브랜치(`perf/0.14.42-clear-floor`)
 에서 가드를 사이클 표지 기반 상태기계(v3)로 바꿔 구조로 닫았습니다(자동 clear 정지 자체가 없습니다). 남은 것:
-기본값 세 가지의 오너 결재(§9-9) · 재배달과 'clear 안 됨' 결과가 겹치면 통보 1건당 사이클이 최대 2회 · 자기보고 축의
+기본값 세 가지의 오너 결재(§9-9) · 재배달과 'clear 안 됨' 결과가 겹치면 통보 1건당 사이클이 최대 2회(rc 80 — clear 는
+나갔으나 실효 미관측 — 뒤 늦게 발효한 clear 에 지침·재개 포인터를 넣는 의도된 복구 · CSO `--detach` 는 자기 실패 뒤 같은
+통보 재접수를 repeat 87 로 막음) · 자동 압축이 켜진 좌석에 집행자가 없으면 사이클 전 압축이 그 통보의 결과를 정해 백오프
+없이 압축 주기(약 20분)마다 다시 통보됨(시간당 ≤ 6 · 결과를 미루는 규칙으로 바꾸면 좌석 모형 스윕 6시간 214행·24시간 295행(전부 자동 압축 켬 · 차단점 위 0초 그대로)에서 통보가 늦어지고
+배달 동결 중 거짓 '효과 없음'이 나 고치지 않음 — 대신 5분 보고가 10분 넘은 미해결 통보를 알림) · 사이클 뒤 10분 창에 본체
+관측 없이 헬퍼 값만 있으면 그 값이 수준이 되어 사이클마다 무성장 통보 1회(헬퍼의 85% 이상 값은 수준에 들지 않음) · 보류
+재판정은 그 축의 가장 최근 관측이라 헬퍼 한 건이 끼면 본체의 다음 보고에서 판정 · 1%p 흔들리는 고착 자기보고(89/90 등)는
+'정확히 같은 값' 규칙을 비켜 감(오너 결재 ②의 범위) · 자기보고 축의
 보류는 만료에 스스로 재판정하지 않음(차단점 이상 값을 보고한 뒤 보고를 멈춘 좌석은 그 축으로 통보가 오지 않음 —
 feed 가 그 사실을 적습니다) · worker 의 clear 신호는 경보 라우터 일반 상한(20/시간) 안에서 나이순(master 의
 `cys events` 직접 구독에도 닿음) · 자동 압축을 끈 200K 좌석이 설계 경계 밖(분당 1.5%p 초과 성장 · 긴 끊김 없는 턴 ·

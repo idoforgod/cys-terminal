@@ -218,6 +218,72 @@ rep2["live_nodes"][0]["usage_ctx_pct"] = 79
 check("usage_ctx_pct 만 바뀐 보고는 정규화 스냅샷이 같다",
       RG.normalize(rep) == RG.normalize(rep2))
 
+# ── ⑦ ★(0.14.42 · 통합 minor 정리 RV3L-7) clear 가드 v3 좌석 — 고정 60% 가 아니라 **가드의 미해결 통보**로 알린다 ──
+# 새 데몬의 좌석 행에는 `ctx_guard`(phase · fire_id · awaiting_since · job)가 실린다. 가드는 사이클 뒤 잰 수준 위로 자란 뒤에만
+# 통보하므로 200K master·CEO 가 사이클 뒤 68~84% 에 머무는 것은 설계된 정상(통보 없음)이다 — 그 좌석에 '⚠ 컨텍스트 60%+ …
+# cycle-agent 집행 검토' 를 영구히 띄우면 오너·CSO 가 `--fire` 없는 수동 cycle-agent(가드 우회 · 유휴 재주입 고리)로 간다.
+# 계약: 가드 좌석은 미해결 통보(phase awaiting)가 CTX_FIRE_PENDING_ALERT_S(600초) 이상 집행되지 않을 때만 알린다(fire id ·
+# 경과 분 · 컨텍스트 · 비동기 작업 상태 · `--fire` 처방) · 가드 없는 구 데몬 좌석은 종전 60% 그대로 · 두 소비자 같은 판정.
+NOW = 1_700_000_000.0
+GSTATUS = {
+    "surfaces": [
+        # 가드 좌석 · 사이클 뒤 84% 에 머무는 master — 통보 없음(Free · 막대 위 아님) → 경보 없음(종전: 60%+ 영구 경보)
+        {"role": "master", "cwd": None, "idle_secs": 0, "agent_alive": True,
+         "status": {}, "usage": {"agent": "claude", "ctx_pct": 84, "ctx_tokens": 168000, "ctx_window": 200000},
+         "ctx_guard": {"phase": "free", "fire_id": "1699990000:2:4", "awaiting_since": None, "job": None}},
+        # 가드 좌석 · 통보 미해결 12분(비동기 작업 대기) → 경보(fire id · 12분 · 86% 실측)
+        {"role": "ceo", "cwd": None, "idle_secs": 0, "agent_alive": True,
+         "status": {}, "usage": {"agent": "claude", "ctx_pct": 86, "ctx_tokens": 172000, "ctx_window": 200000},
+         "ctx_guard": {"phase": "awaiting", "fire_id": "1699990000:3:7", "awaiting_since": NOW - 720,
+                       "job": {"job": 5, "requester": 4, "fire_id": "1699990000:3:7", "state": "pending"}}},
+        # 가드 좌석 · 통보 미해결 3분(집행 중일 수 있음) → 아직 경보 없음
+        {"role": "worker", "cwd": None, "idle_secs": 0, "agent_alive": True,
+         "status": {}, "usage": {"agent": "claude", "ctx_pct": 66, "ctx_tokens": 132000, "ctx_window": 200000},
+         "ctx_guard": {"phase": "awaiting", "fire_id": "1699990000:5:2", "awaiting_since": NOW - 180, "job": None}},
+        # 가드 좌석 · 죽은 좌석의 미해결 통보 → 경보 없음(사망은 death 축)
+        {"role": "ghost", "cwd": None, "idle_secs": 0, "agent_alive": False, "exited": False,
+         "status": {}, "usage": {"agent": "claude", "ctx_pct": 90, "ctx_tokens": 180000, "ctx_window": 200000},
+         "ctx_guard": {"phase": "awaiting", "fire_id": "1699990000:6:1", "awaiting_since": NOW - 3000, "job": None}},
+        # 구 데몬 좌석(ctx_guard 키 없음) · 실측 70 → 종전 60% 경보 그대로
+        {"role": "reviewer", "cwd": None, "idle_secs": 0, "agent_alive": True,
+         "status": {}, "usage": {"agent": "claude", "ctx_pct": 70, "ctx_tokens": 140000, "ctx_window": 200000}},
+    ],
+    "feed": {"pending": 0}, "paused": False,
+}
+grep_ = RP.build_report(GSTATUS, [], now=NOW, sampled_at=NOW)
+gby = {n["role"]: n for n in grep_["live_nodes"]}
+check("⑦ 가드 상수가 한 벌이다(보고 모듈 · 600초)",
+      getattr(RP, "CTX_FIRE_PENDING_ALERT_S", None) == 600)
+check("⑦ live_nodes 에 가드 필드가 실린다(가드 좌석 True · 구 데몬 None · 미해결 통보 id · 경과 초)",
+      gby["ceo"].get("ctx_guarded") is True and gby["reviewer"].get("ctx_guarded") is None
+      and gby["ceo"].get("ctx_fire_pending") == "1699990000:3:7" and gby["ceo"].get("ctx_fire_pending_age_s") == 720
+      and gby["master"].get("ctx_fire_pending") is None and gby["ceo"].get("ctx_fire_job") == "pending",
+      str({r: (n.get("ctx_guarded"), n.get("ctx_fire_pending"), n.get("ctx_fire_pending_age_s"), n.get("ctx_fire_job"))
+           for r, n in gby.items()}))
+gtext = RP.render_text(grep_)
+check("⑦ 텍스트: 가드 좌석의 사이클 뒤 수준(84%)은 60% 경보가 아니다",
+      "master(" not in gtext, gtext)
+check("⑦ 텍스트: 미해결 통보 10분+ 좌석은 fire id · 경과 · 컨텍스트 · --fire 처방으로 알린다",
+      "ceo(fire=1699990000:3:7 · 12분 · 86% 실측 · 비동기 작업 pending)" in gtext and "--fire" in gtext
+      and "clear 통보 미집행" in gtext, gtext)
+check("⑦ 텍스트: 미해결 3분 좌석·죽은 좌석은 아직 알리지 않는다",
+      "worker(" not in gtext and "ghost(" not in gtext, gtext)
+check("⑦ 텍스트: 구 데몬 좌석은 종전 60% 문구 그대로",
+      "reviewer(70% 실측)" in gtext and "컨텍스트 60%+" in gtext, gtext)
+gw = [w for w in RG.extract_warnings(grep_) if w.get("task") == "gate-context"]
+check("⑦ 게이트: gate-context 경보 1건(가드 미해결 + 구 데몬 60%)", len(gw) == 1, str(gw))
+gbody = gw[0]["wake_body"] if gw else ""
+check("⑦ 게이트: 미해결 통보는 fire id · 경과로 · 구 데몬은 60% 로 · 가드 좌석 수준은 없다",
+      "ceo(fire=1699990000:3:7 · 12분)" in gbody and "reviewer(70% 실측)" in gbody
+      and "master(" not in gbody and "worker(" not in gbody and "ghost(" not in gbody, gbody)
+check("⑦ 게이트: idem 은 role 나열(종전 형태)",
+      gw and gw[0]["idem"] == "gate-context-reviewer,ceo", str(gw))
+only_guard = dict(grep_, live_nodes=[gby["master"], gby["worker"]], role_measurements=[])
+check("⑦ 게이트: 가드 좌석만 있고 미해결 10분+ 가 없으면 경보 0건(종전: master 84% 영구 경보)",
+      not [w for w in RG.extract_warnings(only_guard) if w.get("task") == "gate-context"])
+check("⑦ 정규화: 미해결 경과 초는 시간파생(BLACKLIST) — 같은 통보의 경과만 바뀐 보고는 스냅샷이 같다",
+      "ctx_fire_pending_age_s" in RG.BLACKLIST_KEYS)
+
 if fails:
     print("FAILED %d: %s" % (len(fails), ", ".join(fails)))
     sys.exit(1)
