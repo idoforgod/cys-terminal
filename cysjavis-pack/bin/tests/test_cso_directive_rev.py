@@ -272,8 +272,10 @@ SAFETY_CLAUSES = {
     "CSO_DIRECTIVE.md": (
         # ★(0.14.42 · clear 가드 수정 6회차 V42R-1 ④) '시간당 20건' 은 일반 몫이다 — master·CEO clear 개시 신호는 일반 몫이 찬 뒤
         #   예약 26건을 더 쓴다(alert_route CLEAR_RESERVE · 합산 ≤ 46 < 보호선 50). 종전 문면은 실제 상한을 20 으로 적었다(재핀).
+        # ★(게이트 수정 1회차 R1R3-2 · 의식적 재핀) 두 몫이 완전히 갈렸다 — clear 개시 신호는 일반 몫(20)을 쓰지 않고 자기 몫(26)에서만
+        #   센다(가장자리 고리 clear 신호가 좌석 종료·health·watchdog 경보를 보류시키던 것 · 합산 봉인 46 < 50 그대로).
         ("억제 파라미터", "억제 키는\n  **(이벤트명, surface)** — 5분 쿨다운·시간당 20건(일반 경보 몫 — master·CEO 의 clear 개시 신호 `context.threshold` 는\n"
-                      "  일반 몫이 찬 뒤 예약 26건을 더 쓴다 · 합산 시간당 ≤ 46 < 네 큐 보호선 50)·네 자신의\n"
+                      "  이 몫을 쓰지 않고 따로 시간당 26건 몫에서 센다 · 합산 시간당 ≤ 46 < 네 큐 보호선 50)·네 자신의\n"
                       "  surface 이벤트 제외·데몬 부트 300s 유예이며, 억제·유예·CSO 부재로 걸린 경보는 **폐기되지 않고\n"
                       "  보관**돼 재평가 시 1건으로 병합 적재된다(배달은 정상 큐 게이트) — **못 받은 경보를 구독으로 보충하려\n"
                       "  하지 마라.**"),
@@ -390,9 +392,19 @@ SAFETY_CLAUSES = {
                    "  §1-2(오너 채널)다."),
         # ★(0.14.42 · ROLE-G1) master 는 cycle-agent 를 백그라운드로 돌린다 — 턴이 비어 보여도 다른 좌석을
         #   clear·재주입하는 중일 수 있으므로 CSO 의 안전지점에 '사이클 진행 중 아님' 이 들어간다.
+        # ★(게이트 수정 1회차 GR2-1·ROLE-G1 · 의식적 재핀) 보류는 **데몬 밖의 동기 1콜**(`ctx_guard.job` 없는 quiescing 좌석 · master 의
+        #   '사이클 진행 중' 회신)만이다. 데몬이 붙든 `--detach` 작업(CSO 자기 것 · master 것)은 master clear 로 끊기지 않으므로 보류 사유가
+        #   아니다 — 종전 문면('quiescing 좌석이 있으면')은 CSO 가 같은 턴에 띄운 워커 detach 사이클에도 걸려 master clear 가 다른 좌석
+        #   1콜 뒤에서 기다렸다(V42R-1 이 지침층에서 재발 · 드릴 g2-hold-b 185초 보류 · 88.4%).
         ("master 사이클 진행 중 보류", "②의 안전지점에는 **master 가 띄운 사이클이 진행 중이 아님**도 들어간다 — "
-                              "`cys status --json` 의 `surfaces[].status.state`\n"
-                              "  가 `quiescing` 인 좌석이 있거나 master 가 '사이클 진행 중'으로 회신했으면 보류하고 다음 판정에서 다시 본다"),
+                              "`cys status --json` 의 `surfaces[].status.state` 가 `quiescing` 이고 좌석 행 `ctx_guard.job` 이 **없는** 좌석"
+                              "(데몬 밖의 동기 1콜 — master 의 백그라운드 1콜일 수 있다)이 있거나 master 가 '사이클 진행 중'으로 회신했으면 보류하고 "
+                              "다음 판정에서 다시 본다"),
+        ("detach 작업은 보류 사유 아님", "**`ctx_guard.job` 이 있는 좌석(데몬이 붙든 `--detach` 작업 — 네가 띄웠든 master 가 띄웠든)은 "
+                                  "보류 사유가 아니다** — 데몬이 그 1콜을 끝까지 붙들어 master clear 로 끊기지 않는다"),
+        # ★(게이트 수정 1회차 ROLE-G1) 동시 경보 순서가 master·CEO 핸드셰이크(②통보 → ③ack → ④)와 맞물리는 방식.
+        ("동시 경보 핸드셰이크 순서", "**master·CEO\n  먼저**(master·CEO 는 그 턴에 ②안전지점 확인·②통보를 **먼저** 내고, ④ `--detach` 1콜은 ③ ack·재독 "
+                               "검증 뒤의 턴에 낸다 — 무응답이면 §2 무응답 정책"),
     ),
     "MASTER_DIRECTIVE.md": (
         ("정체 종결 휴면", "`javis_orchestra.py round-status --help` 에 `stop_reason`(그리고 `round-log`\n"
@@ -408,13 +420,23 @@ SAFETY_CLAUSES = {
                         "     그때의 출구는 오너 채널 상신뿐이다 — 미실행을 '집행됨'으로 적지 마라"),
         # ★(0.14.42 · ROLE-G1) 부서장은 턴 안에서 오래 기다리지 않는다(오너 절대 규칙 · 회신 큐 적체) — 한 사이클은
         #   최대 약 9.5분 — 1콜 단일 전체 시한 570초이다. 전경 600000 은 백그라운드 수단이 없는 CLI 의 예외로만 남는다.
-        ("사이클 백그라운드 실행", "**백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`(도구 timeout 에 끊기지 않고\n"
-                        "  네 턴을 붙잡지 않는다). 전경 대기 금지"),
+        # ★(게이트 수정 1회차 GR2-1 · 의식적 재핀) 부서장의 사이클 1콜은 이제 `--detach`(데몬이 붙든다 — master 가 CSO 에게 clear 돼도
+        #   끊기지 않아 CSO ② 의 보류 근거가 사라진다) · 백그라운드는 `--detach` 를 모르는 구 데몬의 폴백이다.
+        ("사이클 detach 집행", "**`--detach` 로 부른다**(게이트 수정 1회차 GR2-1): `cys cycle-agent --role <역할> --fire <경보의 fire=> --detach` "
+                           "1콜은 곧바로 rc 89(접수 · 송신 0건)로 돌아오고 데몬이 그 사이클을 끝까지 붙든다(신원 = 너 · 동시 상한 3 · 좌석당 단일 "
+                           "비행 — 네가 CSO 에게 clear 돼도 끊기지 않는다)"),
+        ("detach 사이클은 보류 사유 아님", "detach 로 띄운 사이클은 CSO 의 clear 통보(아래 6단계 ②)의 보류 사유가 아니다 — 곧바로 준비한다"),
+        ("사이클 백그라운드 실행", "같은 1콜을 `--detach` 없이 **백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`"
+                        "(도구 timeout 에 끊기지 않고\n  네 턴을 붙잡지 않는다). 전경 대기 금지"),
     ),
     # CEO_TEMPLATE 은 MASTER 전문을 바이트 연접한 생성물이다(gen_ceo_template.py) — 배포본에도 같은 문면이 있어야 한다.
     "CEO_TEMPLATE.md": (
-        ("사이클 백그라운드 실행", "**백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`(도구 timeout 에 끊기지 않고\n"
-                        "  네 턴을 붙잡지 않는다). 전경 대기 금지"),
+        ("사이클 detach 집행", "**`--detach` 로 부른다**(게이트 수정 1회차 GR2-1): `cys cycle-agent --role <역할> --fire <경보의 fire=> --detach` "
+                           "1콜은 곧바로 rc 89(접수 · 송신 0건)로 돌아오고 데몬이 그 사이클을 끝까지 붙든다(신원 = 너 · 동시 상한 3 · 좌석당 단일 "
+                           "비행 — 네가 CSO 에게 clear 돼도 끊기지 않는다)"),
+        ("detach 사이클은 보류 사유 아님", "detach 로 띄운 사이클은 CSO 의 clear 통보(아래 6단계 ②)의 보류 사유가 아니다 — 곧바로 준비한다"),
+        ("사이클 백그라운드 실행", "같은 1콜을 `--detach` 없이 **백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`"
+                        "(도구 timeout 에 끊기지 않고\n  네 턴을 붙잡지 않는다). 전경 대기 금지"),
     ),
     "REVIEWER_DIRECTIVE.md": (
         ("정체 종결 휴면", "그 축을 내는 도구가 없는 버전이면 이 조항은 **휴면**이다 —\n"
@@ -1875,7 +1897,7 @@ class CsoDirectiveRevision(unittest.TestCase):
                       normalize(strip_html_comments(self.cso)), "CSO 의 master clear 1콜 전경 600000 이 사라졌다")
         # 대조군: 수정 전 문장(7d5733d4)을 되돌려 넣으면 판정이 붉어져야 한다(공허한 검체 금지).
         master = self.raw["MASTER_DIRECTIVE.md"]
-        lo = master.index("  **백그라운드로 실행한다**")
+        lo = master.index("  **`--detach` 로 부른다**")
         hi = master.index("  **저장 없이 clear 금지는 코드가 강제한다.**")
         pre_fix = master[:lo] + "  " + MANAGER_FOREGROUND_CYCLE + "\n" + master[hi:]
         self.assertNotEqual(pre_fix, master)
@@ -3033,6 +3055,31 @@ class ClearGuardFireWiring(unittest.TestCase):
             mutated.replace("**한 번 재배달**", "재배달")))
         old = mutated + "\n" + self.OLD_RC88_TRIGGER[0]
         self.assertTrue(any(v == self.OLD_RC88_TRIGGER[0] for v in self._rc88_violations(old)))
+
+    def test_master_clear_hold_excludes_daemon_held_detach_jobs(self):
+        """★(게이트 수정 1회차 GR2-1·ROLE-G1) CSO 의 master clear 보류(§1-2 ⑦ ② · §2)는 **데몬 밖의 동기 1콜**만 본다 — `quiescing` 좌석이라도
+        좌석 행 `ctx_guard.job`(데몬이 붙든 `--detach` 작업)이 있으면 보류 사유가 아니다. 부서장(MASTER·CEO)의 워커 사이클은 `--detach`
+        이고 백그라운드는 구 데몬 폴백이다. 종전 문면('`quiescing` 인 좌석이 있거나')은 CSO 가 같은 턴에 띄운 워커 detach 작업이나
+        master 의 백그라운드 1콜에 걸려 master clear 가 다른 좌석 1콜 뒤에서 기다렸다(재검토 드릴 g2-hold-b · 185초 보류 · 88.4% ·
+        모형 g2_mexec master 막힘 54). 실패 방향: 붉어지면 V42R-1(master 가 다른 좌석 사이클 뒤에서 차단점을 넘음)이 지침층에서 재발한다."""
+        OLD_BROAD_HOLD = "`quiescing` 인 좌석이 있거나 master 가 '사이클 진행 중'으로 회신했으면 보류"
+        cso = squash(strip_html_comments(self.raw["CSO_DIRECTIVE.md"]))
+        self.assertNotIn(squash(OLD_BROAD_HOLD), cso, "CSO ② 가 detach 작업까지 보류 사유로 본다(V42R-1 재발)")
+        self.assertIn(squash("`quiescing` 이고 좌석 행 `ctx_guard.job` 이 **없는** 좌석"), cso)
+        self.assertIn(squash("`ctx_guard.job` 없는 `quiescing` 좌석"), cso, "§2 보충 문장이 좁혀지지 않았다")
+        for name in ("MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md"):
+            body = squash(strip_html_comments(self.raw[name]))
+            with self.subTest(directive=name):
+                lo = body.index(squash("**`--detach` 로 부른다**"))
+                hi = body.index(squash("**백그라운드로 실행한다**"))
+                self.assertLess(lo, hi, "%s: detach 가 기본이고 백그라운드가 구 데몬 폴백이어야 한다" % name)
+                self.assertIn(squash("cys cycle-agent --role <역할> --fire <경보의 fire=> --detach"), body)
+        # 음성 대조 — 종전 문면을 되돌려 넣으면 잡는다.
+        old = self.raw["CSO_DIRECTIVE.md"].replace(
+            "`quiescing` 이고 좌석 행 `ctx_guard.job` 이 **없는** 좌석(데몬 밖의 동기 1콜 — master 의 백그라운드 1콜일 수 있다)이 있거나",
+            "`quiescing` 인 좌석이 있거나", 1)
+        self.assertNotEqual(old, self.raw["CSO_DIRECTIVE.md"], "음성 대조 치환이 적중하지 않았다")
+        self.assertIn(squash(OLD_BROAD_HOLD), squash(strip_html_comments(old)))
 
     def test_negative_control_catches_a_dropped_fire(self):
         """음성 대조 — 호출 예 하나에서 --fire 를 지우면 위 검사가 잡는다(검사기가 공허하지 않다)."""

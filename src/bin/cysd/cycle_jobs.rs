@@ -27,7 +27,11 @@
 //!     기다리지 않는다(그 대기가 V42R-1 자체다 · 사이클 4단계가 검증자 좌석의 유휴를 기다리므로 검증 요청은 clear 전에 처리된다).
 //!   · kill-switch: 동결(`system.pause`) 중에는 접수하지 않고(rc 1 · 송신 0건) 대기 작업도 시작하지 않는다(재개 뒤 수집기 틱이 시작).
 //!   · 시한: 자식은 자기 단일 전체 시한(570초)으로 끝난다 — 데몬은 [`KILL_AFTER_SECS`](630) 뒤에도 살아 있으면 죽인다(점유·표지는
-//!     죽은 pid 로 데몬이 푼다 · 결과는 '시한 초과로 종료').
+//!     죽은 pid 로 데몬이 푼다 · 결과는 '시한 초과로 종료'). ★(게이트 수정 1회차 R1R3-1·R4W-1) 630초는 **자식과 같은 단조 시계**
+//!     (`Instant` — macOS `CLOCK_UPTIME_RAW` · 절전 중 멈춘다)로 잰다. 종전에는 벽시계(`now_epoch`)로 재서, 사이클 도중 랩톱이 절전하면
+//!     깨어난 첫 폴링에서 예산이 남은 자식을 죽였다(단계 무관 — /clear 뒤·재주입 전이면 지침·재개 포인터 없는 좌석 · 그 전이면 rc 없음이
+//!     repeat 87 에 걸려 다음 통보까지 clear 지연). 같은 시계라 '자식은 자기 570초로 끝나고 데몬은 630초 뒤에도 살아 있을 때만 죽인다'가
+//!     절전을 가로질러도 성립한다(실패 방향: 절전 중에는 두 시계가 같이 멈춘다 — 늦게 죽이는 쪽으로만 틀린다).
 //!   · 윈도우: 자식은 `ChildLifetime::Attached`(창 숨김만 · 세션·그룹 분리 없음 — 데몬과 함께 죽는 유계 자식)이고 stdin·stderr 파이프,
 //!     `Child::try_wait`·`kill` 만 쓴다(OS 분기 0 · 새 분리 코드 0). 자식의 peer pid(Windows named pipe `GetNamedPipeClientProcessId`)
 //!     = `Child::id()` 라 위임 해소가 같다.
@@ -46,8 +50,15 @@ pub const MAX_RUNNING: usize = 3;
 pub const MAX_RUNNING_GENERAL: usize = 2;
 /// 대기열 상한(좌석당 하나라 실제로는 좌석 수 이하).
 pub const MAX_PENDING: usize = 16;
-/// 자식 강제 종료 시한(초) — cycle-agent 단일 전체 시한 570 + 60.
+/// 자식 강제 종료 시한(초) — cycle-agent 단일 전체 시한 570 + 60. **단조 시계**(`Instant` · 자식의 `CycleBudget` 과 같은 시계)로 잰다
+/// ([`kill_due`] · 게이트 수정 1회차 R1R3-1·R4W-1).
 pub const KILL_AFTER_SECS: f64 = 630.0;
+
+/// 데몬이 자식을 강제 종료할 때인가(순수 — 회귀 핀 대상). `started` = 자식을 띄운 **단조** 시각 · `now` = 지금의 단조 시각. 벽시계는
+/// 입력이 아니다 — 절전으로 벽시계만 뛴 뒤에도 자식의 단일 전체 시한(570초 · `Instant`)이 남은 산 자식을 죽이지 않는다.
+pub fn kill_due(started: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(started).as_secs_f64() > KILL_AFTER_SECS
+}
 /// 자식이 첫 RPC 전에 기다리는 stdin 신호(데몬이 신원 위임을 등록한 뒤에 쓴다).
 pub const GO_TOKEN: &str = "go";
 /// 결과 큐 항목의 머리표·출처.
@@ -373,7 +384,9 @@ pub fn pump(daemon: &Arc<Daemon>) {
 
 fn start(daemon: &Arc<Daemon>, job: Job) {
     use cys::SpawnPolicy;
+    // 벽시계 시각은 표시(`since`)용 · 시한·경과는 단조 시각으로만(R1R3-1·R4W-1).
     let started = crate::state::now_epoch();
+    let started_mono = std::time::Instant::now();
     let spawned = std::process::Command::new(crate::state::sibling_cli_path())
         .args(child_args(&job.spec, job.id))
         .env(cys::ENV_SOCKET, daemon.socket_path.to_string_lossy().as_ref())
@@ -389,7 +402,7 @@ fn start(daemon: &Arc<Daemon>, job: Job) {
     let mut child = match spawned {
         Ok(c) => c,
         Err(e) => {
-            finish(daemon, &job, None, started, format!("cycle-agent 를 띄우지 못했다: {e}"));
+            finish(daemon, &job, None, started_mono.elapsed().as_secs_f64(), format!("cycle-agent 를 띄우지 못했다: {e}"));
             return;
         }
     };
@@ -413,10 +426,11 @@ fn start(daemon: &Arc<Daemon>, job: Job) {
         let _ = writeln!(stdin, "{GO_TOKEN}");
     }
     let d = daemon.clone();
-    std::thread::spawn(move || monitor(d, job, child, started));
+    std::thread::spawn(move || monitor(d, job, child, started_mono));
 }
 
-fn monitor(daemon: Arc<Daemon>, job: Job, mut child: std::process::Child, started: f64) {
+/// 자식을 끝까지 붙든다 — 200ms 폴링 · [`kill_due`](단조 시계) 이면 한 번 죽인다 · 거둔 뒤 위임 신원 해제 · 결과 기록.
+fn monitor(daemon: Arc<Daemon>, job: Job, mut child: std::process::Child, started_mono: std::time::Instant) {
     // stderr 는 끝까지 비운다(파이프가 차서 자식이 멈추지 않게) — 마지막 40줄만 남긴다.
     let reader = child.stderr.take().map(|err| {
         std::thread::spawn(move || {
@@ -437,7 +451,7 @@ fn monitor(daemon: Arc<Daemon>, job: Job, mut child: std::process::Child, starte
             Ok(None) => {}
             Err(_) => break None,
         }
-        if !killed && crate::state::now_epoch() - started > KILL_AFTER_SECS {
+        if !killed && kill_due(started_mono, std::time::Instant::now()) {
             let _ = child.kill();
             killed = true;
         }
@@ -450,11 +464,11 @@ fn monitor(daemon: Arc<Daemon>, job: Job, mut child: std::process::Child, starte
     if killed {
         summary = format!("데몬이 {}초 시한으로 강제 종료했다 — {summary}", KILL_AFTER_SECS as u64);
     }
-    finish(&daemon, &job, status.and_then(|s| s.code()), started, summary);
+    finish(&daemon, &job, status.and_then(|s| s.code()), started_mono.elapsed().as_secs_f64(), summary);
 }
 
-/// 작업 끝 — 기록 · 발행 · 다음 대기 작업 시작 · 결과 큐 적재(1회 · 동결·가득이면 재시도).
-fn finish(daemon: &Arc<Daemon>, job: &Job, rc: Option<i32>, started: f64, summary: String) {
+/// 작업 끝 — 기록 · 발행 · 다음 대기 작업 시작 · 결과 큐 적재(1회 · 동결·가득이면 재시도). `secs` = 단조 경과(초).
+fn finish(daemon: &Arc<Daemon>, job: &Job, rc: Option<i32>, secs: f64, summary: String) {
     let now = crate::state::now_epoch();
     let done = Done {
         id: job.id,
@@ -463,7 +477,7 @@ fn finish(daemon: &Arc<Daemon>, job: &Job, rc: Option<i32>, started: f64, summar
         fire: job.spec.fire.clone(),
         rc,
         at: now,
-        secs: (now - started).max(0.0),
+        secs: secs.max(0.0),
         summary,
         delivered: false,
     };
@@ -638,6 +652,43 @@ mod tests {
                 .to_vec()
         );
         assert!(!a.iter().any(|x| x == "--force-no-verify" || x == "--clear-cmd" || x == "--detach"));
+    }
+
+    /// ★(게이트 수정 1회차 R1R3-1·R4W-1) 강제 종료 시한은 자식(`CycleBudget` · `Instant`)과 **같은 단조 시계**로 잰다 — ⓐ 순수:
+    /// 단조 경과 629초는 죽이지 않고 631초는 죽인다 · 시각이 거꾸로면 죽이지 않는다 ⓑ 절전 모사: 벽시계로는 1만 초 전에 띄운(`since`
+    /// 표시값) 산 자식도 단조 시계로 방금이면 죽이지 않는다 — 제 시각에 스스로 끝나 rc 0 · '강제 종료' 사유 없음 · 경과는 단조 초.
+    /// 종전(벽시계 630초)은 사이클 도중 랩톱이 절전하면 깨어난 첫 폴링에서 예산이 남은 자식을 SIGKILL 했다(rc 없음 → repeat 87 ·
+    /// /clear 뒤·재주입 전이면 지침·재개 포인터 없는 좌석). 실패 방향: 붉어지면 절전을 가로지른 비동기 사이클이 깨어나자마자 끊긴다.
+    #[test]
+    fn kill_deadline_uses_the_monotonic_clock_across_sleep() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        assert!(!kill_due(t0, t0 + Duration::from_secs(629)), "단조 629초에 죽였다");
+        assert!(kill_due(t0, t0 + Duration::from_secs(631)), "단조 631초에도 살려 두었다(굳은 자식 봉인 없음)");
+        assert!(!kill_due(t0 + Duration::from_secs(5), t0), "시각이 거꾸로인데 죽였다");
+        #[cfg(unix)]
+        {
+            let dir = std::env::temp_dir().join(format!("cys-cj-sleep-{}-{}", std::process::id(), crate::state::now_epoch() as u64));
+            let _ = std::fs::create_dir_all(&dir);
+            let daemon = Daemon::new(dir.join("cysd.sock"));
+            let wall_start = crate::state::now_epoch() - 10_000.0; // 벽시계로는 1만 초 전(그 사이 절전)
+            let job = Job { id: 7, spec: spec(51, false, 1, None), state: JobState::Running { pid: 0, since: wall_start }, accepted_at: wall_start };
+            daemon.cycle_jobs.lock().unwrap().jobs.push(job.clone());
+            let child = std::process::Command::new("/bin/sh")
+                .args(["-c", "sleep 1; echo '[cycle 7/7] 재주입 완료' >&2; exit 0"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn sh");
+            monitor(daemon.clone(), job, child, Instant::now());
+            let d = daemon.cycle_jobs.lock().unwrap().recent.back().cloned().expect("끝난 작업 기록");
+            assert_eq!(d.rc, Some(0), "절전(벽시계만 뜀) 뒤 산 자식을 죽였다: {d:?}");
+            assert!(!d.summary.contains("강제 종료"), "{d:?}");
+            assert!(d.secs < 60.0, "경과를 벽시계로 쟀다: {d:?}");
+            assert!(daemon.cycle_jobs.lock().unwrap().jobs.is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[test]

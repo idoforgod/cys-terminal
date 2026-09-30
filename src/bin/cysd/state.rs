@@ -1545,20 +1545,25 @@ pub struct BootAck {
 pub struct CycleClaim {
     /// 점유한 집행자(`cys cycle-agent`)의 peer pid — None = 미상(생존 판정 불가 → 상한만).
     pub pid: Option<u32>,
-    /// 점유 시각(epoch 초).
+    /// 점유 시각(epoch 초) — **표시 전용**(좌석 행 `ctx_guard.claim.since` · busy 응답). 판정에 쓰지 않는다.
     pub since: f64,
+    /// ★(게이트 수정 1회차 R1R3-1·R4W-1) 점유 시각 — 데몬 **단조** 초(`usage::ctx_guard_now` · 가드와 같은 시계). 상한 판정은 이것으로만.
+    pub mono: f64,
     /// 집행 중인 통보(`context.threshold` 의 `fire_id`) — 없으면 수동 사이클.
     pub fire_id: Option<String>,
 }
 
 /// 사이클 점유 상한(초) — cycle-agent 한 사이클(단일 전체 시한 570초 · 약 9.5분)보다 넉넉하게. 넘긴 점유는 버린다(점유가 굳어 사이클이 영구히
-/// 막히는 ② 방향 차단 · 산 집행자의 긴 사이클이면 중복 집행 1회로만 틀린다).
+/// 막히는 ② 방향 차단 · 산 집행자의 긴 사이클이면 중복 집행 1회로만 틀린다). **단조 초**다 — 집행자의 시한(`Instant`)과 가드 시계가
+/// 절전 중 멈추므로 상한도 같은 시계로 재야 한다(종전 벽시계는 20분 넘는 절전 뒤 수집기 틱이 산 집행자의 점유를 버려 재배달 →
+/// 같은 좌석 이중 사이클 · 게이트 수정 1회차 R1R3-1·R4W-1).
 pub const CYCLE_CLAIM_MAX_SECS: f64 = 1200.0;
 
 impl CycleClaim {
-    /// 죽은 점유 — 점유자 pid 가 죽었거나 상한([`CYCLE_CLAIM_MAX_SECS`])을 넘겼다(`now` = epoch 초). 게으르게 버린다.
-    pub fn expired(&self, now: f64) -> bool {
-        self.pid.is_some_and(|p| !pid_alive(p)) || now - self.since > CYCLE_CLAIM_MAX_SECS
+    /// 죽은 점유 — 점유자 pid 가 죽었거나 상한([`CYCLE_CLAIM_MAX_SECS`])을 넘겼다. `mono_now` = 데몬 **단조** 초(`usage::ctx_guard_now`)
+    /// — 벽시계는 입력이 아니다(절전 뒤에도 산 집행자의 점유를 나이로 버리지 않는다). 게으르게 버린다.
+    pub fn expired(&self, mono_now: f64) -> bool {
+        self.pid.is_some_and(|p| !pid_alive(p)) || mono_now - self.mono > CYCLE_CLAIM_MAX_SECS
     }
 }
 
@@ -1638,10 +1643,12 @@ pub struct Surface {
     pub pending_queue: Mutex<std::collections::VecDeque<QueueEntry>>,
     /// T1-1 자기보고 상태 (`status.set` RPC)
     pub agent_status: Mutex<Option<AgentStatus>>,
-    /// ★(0.14.42 · R2NC-F3 · R3SH-4) quiescing 을 세운 호출자 `(peer pid, 그때의 updated_at)` — cycle-agent 가 /clear~RESUME
-    /// 창에서 죽으면(SIGTERM·Bash 도구 시한·SIGKILL) 해제 호출이 영영 오지 않는다. 데몬이 이 pid 의 사망을 보면 즉시 푼다
+    /// ★(0.14.42 · R2NC-F3 · R3SH-4) quiescing 을 세운 호출자 `(peer pid, 그때의 updated_at, 그때의 데몬 단조 초)` — cycle-agent 가
+    /// /clear~RESUME 창에서 죽으면(SIGTERM·Bash 도구 시한·SIGKILL) 해제 호출이 영영 오지 않는다. 데몬이 이 pid 의 사망을 보면 즉시 푼다
     /// (`governance::effective_quiescing_since`). 휘발 · pid 미상(peer pid 결측)이면 None = 종전 상한(600s)만.
-    pub quiesce_owner: Mutex<Option<(u32, f64)>>,
+    /// ★(게이트 수정 1회차 · R1R3-1 과 같은 부류) 셋째 값 = 표지를 세운 **단조** 시각 — 그 창의 나이(보류 상한 600s)를 단조 시계로 잰다
+    /// (`governance::quiescing_since_and_age` · 절전으로 벽시계만 뛰어 산 사이클 창이 '고아'로 보여 창 안에 큐 항목이 나가던 것).
+    pub quiesce_owner: Mutex<Option<(u32, f64, f64)>>,
     /// T2-5 에이전트 메타: launch-agent가 등록한 (agent 이름, 실행 바이너리)
     pub agent_meta: Mutex<Option<(String, String)>>,
     /// T2-5 사망 감지 상태머신: 자식 트리에서 agent 바이너리를 처음 본 뒤 사라지면 발화
@@ -3085,7 +3092,8 @@ pub struct Daemon {
     pub delegated_callers: Mutex<HashMap<u32, u64>>,
     /// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 비동기 사이클 작업표(`cycle_jobs`) — 진행·대기·최근 끝난 작업. 말단 락.
     pub cycle_jobs: Mutex<crate::cycle_jobs::CycleJobs>,
-    /// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 좌석별 주입 잠금(`surface.inject_lock`) — 좌석 번호 → (점유자 peer pid · 시각).
+    /// ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 좌석별 주입 잠금(`surface.inject_lock`) — 좌석 번호 → (점유자 peer pid · 시각 = 데몬 **단조**
+    /// 초 · 게이트 수정 1회차 R1R3-1 — 15초 상한이 절전으로 뛴 벽시계에 풀리지 않게).
     /// cycle-agent 의 검증자 좌석 `[CYCLE-VERIFY]` 붙여넣기~Return 을 좌석당 하나씩(동시 비동기 사이클의 요청 합체 차단). 말단 락.
     pub inject_locks: Mutex<HashMap<u64, (Option<u32>, f64)>>,
     /// (E-c) idempotencyKey → (surface_id, epoch초). 클라이언트 재시도가 같은 key면 기존 surface

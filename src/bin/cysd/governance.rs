@@ -6135,12 +6135,27 @@ pub(crate) fn effective_quiescing_since(daemon: &Arc<Daemon>, s: &crate::state::
         .filter(|st| st.state == "quiescing")
         .map(|st| st.updated_at)?;
     let owner = *s.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((pid, at)) = owner {
+    if let Some((pid, at, _)) = owner {
         if at == since && !crate::state::pid_alive(pid) && release_quiescing(daemon, s, "owner_exited") {
             return None;
         }
     }
     Some(since)
+}
+
+/// ★(게이트 수정 1회차 · R1R3-1·R4W-1 과 같은 부류) quiescing 의 실효 시작 epoch 와 **나이**(초). 나이는 그 창을 세운 cycle-agent 가
+/// 수명을 묶은 창(`quiesce_owner` 가 이 표지와 같은 세대)이면 데몬 **단조** 시계로 잰다 — macOS 단조 시계는 절전 중 멈추므로, 사이클
+/// 도중 랩톱이 절전해도 깨어난 뒤 산 창이 보류 상한(600s)을 넘긴 '고아'로 보이지 않는다(종전 벽시계 나이는 절전만큼 뛰어 /clear~재주입
+/// 창 안에 큐 항목·스케줄 push 가 나갔다 — 지침 없는 새 세션에 떨어진다 · H1 이 막던 것). 묶지 않은 창(수동 `cys quiesce` · 자기보고
+/// quiescing)은 종전대로 벽시계 나이다(세운 단조 시각이 없다).
+pub(crate) fn quiescing_since_and_age(daemon: &Arc<Daemon>, s: &crate::state::Surface) -> Option<(f64, f64)> {
+    let since = effective_quiescing_since(daemon, s)?;
+    let owner = *s.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner());
+    let age = match owner {
+        Some((_, at, mono)) if at == since => (crate::usage::ctx_guard_now(daemon) - mono).max(0.0),
+        _ => now_epoch() - since,
+    };
+    Some((since, age))
 }
 
 /// ★(0.14.42 · R2NC-F3 · R3SH-4) quiescing 해제(아직 quiescing 일 때만 — 그 사이 자기보고가 있었으면 불간섭 · `surface.quiesce
@@ -6163,7 +6178,7 @@ pub(crate) fn release_quiescing(daemon: &Arc<Daemon>, s: &crate::state::Surface,
             "surface.quiescing",
             "channel",
             Some(s.id),
-            json!({"surface_id": s.id, "quiescing": false, "reason": reason, "owner_pid": owner.map(|(p, _)| p),
+            json!({"surface_id": s.id, "quiescing": false, "reason": reason, "owner_pid": owner.map(|(p, _, _)| p),
                    "note": "사이클 창 표지를 데몬이 풀었다(세운 호출자 사망 · 에이전트 종료·재기동) — 큐·주기 신호가 곧바로 재개된다"}),
         );
         // ★(0.14.42 · clear 가드 v3) 데몬이 푼 것도 사이클 표지의 끝이다(소유자 사망·에이전트 재기동) — 가드는 수준을 다시 잰다.
@@ -6184,7 +6199,7 @@ fn machine_hold_probe(
     s: &Arc<crate::state::Surface>,
     axes: &MachineHoldAxes,
 ) -> Option<MachineHold> {
-    let quiescing_age_secs = effective_quiescing_since(daemon, s).map(|since| now_epoch() - since);
+    let quiescing_age_secs = quiescing_since_and_age(daemon, s).map(|(_, age)| age);
     let mut input = MachineHoldInput {
         paused: daemon.paused.load(Ordering::Relaxed),
         quiescing_age_secs,
@@ -10024,9 +10039,8 @@ fn deliver_queued(
         //   【범위】 틱만이다. 운영자 강제 배달(`force_deliver_entry`)·직접 send 는 무변경(운영자 권한 · ② 무clear 방지).
         //   【부분 봉합】 에이전트 `set-status` 가 quiescing 을 덮어쓰면 일찍 풀린다 — 그때는 종전 동작이다.
         // ★(R2NC-F3) 세운 cycle-agent 가 죽었으면 여기서 곧바로 풀린다(상한 600s 를 기다리지 않는다).
-        let quiescing_since = effective_quiescing_since(daemon, &s);
-        if let Some(since) = quiescing_since {
-            let age = now_epoch() - since;
+        let quiescing_since = quiescing_since_and_age(daemon, &s);
+        if let Some((since, age)) = quiescing_since {
             if quiesce_hold_active(Some(age), quiesce_hold) {
                 block(BLOCKED_QUIESCING);
                 continue;
@@ -23257,6 +23271,51 @@ mod h1_queue_quiesce_tests {
         let _ = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true, "bind_owner": true}), Some(dead_pid()));
         let axes = MachineHoldAxes { quiescing: true, ..MachineHoldAxes::NONE };
         assert_eq!(machine_direct_hold_masked(&d, &s, axes, axes), None, "H0 가 죽은 호출자의 창을 붙잡았다");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(게이트 수정 1회차 · R1R3-1·R4W-1 과 같은 부류) 절전 모사 — cycle-agent(산 호출자)가 수명을 묶은 사이클 창은 벽시계가 절전만큼
+    /// 뛰어도(표지 시각이 5,000초 과거로 보임) 보류 상한(600s)을 넘긴 고아가 아니다: 큐 틱은 계속 보류하고(BLOCKED_QUIESCING · 인계 0) H0 도
+    /// 붙잡는다 · `queue.quiesce_stale` 없음. 창의 나이는 세운 단조 시각으로 잰다. 대조: 단조 시각으로 상한을 넘긴 창은 종전대로 무시하고
+    /// 배달한다(굳은 표지 봉인). 종전(벽시계 나이)은 절전 뒤 산 창 안(/clear~재주입)에 큐 항목을 넣었다. 실패 방향: 붉어지면 절전을 가로지른
+    /// 사이클의 /clear~재주입 창에 큐 항목이 들어가 지침 없는 새 세션에 떨어진다.
+    #[cfg(unix)]
+    #[test]
+    fn h1_owner_bound_quiescing_age_uses_the_monotonic_clock_across_sleep() {
+        let _g = PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = ReapEnvGuard::set(&[("CYS_QUEUE_STARVE_ALERT_SECS", "0"), ("CYS_QUEUE_MIN_INTERVAL_SECS", "0")]);
+        let (d, s) = rig("h1-sleep");
+        let mut depth = HashMap::new();
+        let mut starve = HashMap::new();
+        let mut stale = HashMap::new();
+        let r = rpc(&d, "surface.quiesce", json!({"surface_id": s.id, "on": true, "bind_owner": true}), Some(std::process::id()));
+        assert_eq!(r["ok"], json!(true), "{r}");
+        // 벽시계가 5,000초 뛰었다(단조 시계는 그대로) — 표지 시각과 소유 기록의 세대 시각을 같이 과거로 민다(같은 세대).
+        {
+            let mut st = s.agent_status.lock().unwrap();
+            st.as_mut().unwrap().updated_at -= 5_000.0;
+            let mut o = s.quiesce_owner.lock().unwrap();
+            let (p, at, m) = o.unwrap();
+            *o = Some((p, at - 5_000.0, m));
+        }
+        s.pending_queue.lock().unwrap().push_back(d.next_queue_entry("절전 뒤 창 안 항목".into(), None, "test"));
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "절전(벽시계만 뜀) 뒤 산 사이클 창을 고아로 보고 배달했다");
+        assert_eq!(s.queue_blocked.lock().unwrap().as_ref().map(|(w, _)| w.clone()), Some(BLOCKED_QUIESCING.to_string()));
+        assert_eq!(events(&d, "queue.quiesce_stale"), 0, "산 창을 quiesce_stale 로 알렸다");
+        let axes = MachineHoldAxes { quiescing: true, ..MachineHoldAxes::NONE };
+        assert!(machine_direct_hold_masked(&d, &s, axes, axes).is_some(), "H0 가 절전 뒤 산 창을 풀었다");
+        // 대조 — 단조 시각으로 상한을 넘긴 창(굳은 표지)은 종전대로 무시하고 배달한다.
+        {
+            let mut o = s.quiesce_owner.lock().unwrap();
+            let (p, at, m) = o.unwrap();
+            *o = Some((p, at, m - (queue_quiesce_hold_secs() as f64 + 100.0)));
+        }
+        quiet(&s);
+        deliver_queued(&d, &mut depth, &mut starve, &mut stale);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "단조 상한을 넘긴 굳은 창이 큐를 붙잡았다");
+        assert_eq!(events(&d, "queue.quiesce_stale"), 1);
         let _ = s.child.lock().unwrap().kill();
     }
 

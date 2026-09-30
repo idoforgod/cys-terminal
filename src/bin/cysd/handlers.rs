@@ -9865,7 +9865,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     //   묶지 않은 창은 종전대로 상한(600s)·해제 호출로만 풀린다. 구 CLI(키 없음)도 같은 종전 경로 = 안전 방향.
                     let bind_owner = params.get("bind_owner").and_then(|v| v.as_bool()).unwrap_or(false);
                     *surface.quiesce_owner.lock().unwrap_or_else(|e| e.into_inner()) =
-                        if bind_owner { caller_pid.map(|p| (p, at)) } else { None };
+                        if bind_owner { caller_pid.map(|p| (p, at, crate::usage::ctx_guard_now(daemon))) } else { None };
                 } else if cur.as_ref().map(|s| s.state == "quiescing").unwrap_or(false) {
                     // 아직 quiescing일 때만 해제(그 사이 master 자기보고가 있었으면 불간섭).
                     *cur = Some(crate::state::AgentStatus {
@@ -9930,7 +9930,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             }
             let release = params.get("release").and_then(|v| v.as_bool()).unwrap_or(false);
             let fire_id = param_str(&params, "fire_id").map(|f| f.trim().to_string()).filter(|f| !f.is_empty());
+            // 표시 시각은 벽시계 · 상한 판정은 데몬 단조 초(게이트 수정 1회차 R1R3-1·R4W-1).
             let now = crate::state::now_epoch();
+            let mono = crate::usage::ctx_guard_now(daemon);
             let mut claim = surface.cycle_claim.lock().unwrap_or_else(|e| e.into_inner());
             if release {
                 let mine = claim.as_ref().is_some_and(|c| c.pid.is_none() || c.pid == caller_pid);
@@ -9948,7 +9950,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             }
             // 죽은 점유는 버린다 — 여기서는 재배달하지 않는다(지금 묻는 집행자가 곧 그 통보를 집행하거나 stale 로 건너뛴다 · 아무도
             // 묻지 않으면 수집기 틱이 버리고 재배달한다).
-            if claim.as_ref().is_some_and(|c| c.expired(now)) {
+            if claim.as_ref().is_some_and(|c| c.expired(mono)) {
                 *claim = None;
             }
             if let Some(c) = claim.as_ref().filter(|c| c.pid.is_none() || c.pid != caller_pid) {
@@ -9965,7 +9967,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             if stale {
                 return Reply::Single(ok_response(&id, json!({"surface_id": sid, "claim": "stale", "fire_id": fire_id})));
             }
-            *claim = Some(crate::state::CycleClaim { pid: caller_pid, since: now, fire_id: fire_id.clone() });
+            *claim = Some(crate::state::CycleClaim { pid: caller_pid, since: now, mono, fire_id: fire_id.clone() });
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "claim": "claimed", "fire_id": fire_id})))
         }
 
@@ -9983,7 +9985,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 return Reply::Single(err_response(&id, "acl_denied", &e));
             }
             let release = params.get("release").and_then(|v| v.as_bool()).unwrap_or(false);
-            let now = crate::state::now_epoch();
+            // 데몬 단조 초 — 15초 상한이 절전으로 뛴 벽시계에 풀리지 않게(게이트 수정 1회차 R1R3-1).
+            let now = crate::usage::ctx_guard_now(daemon);
             let mut locks = daemon.inject_locks.lock().unwrap_or_else(|e| e.into_inner());
             let verdict = inject_lock_verdict(&mut locks, sid, caller_pid, release, now, crate::state::pid_alive);
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "lock": verdict})))
@@ -10044,7 +10047,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // 산 점유(다른 집행자의 동기 1콜 등) — 접수하지 않는다(88 · 그 사이클이 clear 전에 끝나면 데몬 재배달).
             let holder = {
                 let c = surface.cycle_claim.lock().unwrap_or_else(|e| e.into_inner());
-                c.as_ref().filter(|c| !c.expired(crate::state::now_epoch())).map(|c| (c.pid, c.fire_id.clone()))
+                c.as_ref().filter(|c| !c.expired(crate::usage::ctx_guard_now(daemon))).map(|c| (c.pid, c.fire_id.clone()))
             };
             if let Some((hp, hf)) = holder {
                 return Reply::Single(ok_response(
@@ -21832,6 +21835,79 @@ mod tests {
         assert_eq!(l(other, false), json!("busy"));
         assert_eq!(l(me, true), json!("released"));
         assert_eq!(l(other, false), json!("locked"));
+    }
+
+    /// ★(게이트 수정 1회차 R1R3-1·R4W-1) 절전 모사 — 벽시계만 앞으로 뛰고(macOS 단조 시계는 절전 중 멈춘다) 단조 시계는 그대로인 좌석에서
+    /// ⓐ 산 집행자의 단일 비행 점유를 수집기 틱이 나이로 버리지 않는다(재배달 0 · 다른 집행자는 여전히 busy · 좌석 행 `ctx_guard.claim`
+    /// 그대로) ⓑ 단조 초로 상한(1200)을 넘긴 점유는 여전히 버린다(② 방향 봉인 유지 — 버리면 미해결 통보를 한 번 재배달) ⓒ 주입 잠금의
+    /// 시각 축은 데몬 단조 초다(15초 상한이 절전으로 뛴 벽시계에 풀리지 않는다). 종전(벽시계): 20분 넘는 절전 뒤 첫 틱이 산 점유를
+    /// 버리고 재배달 → 재배달을 받은 CSO detach 가 같은 좌석을 다시 점유(동시 사이클 · 이중 저장 지시 · 이중 /clear).
+    /// 실패 방향: 붉어지면 절전을 가로지른 사이클의 단일 비행이 풀린다(①) 또는 굳은 점유가 영구히 남는다(②).
+    #[cfg(unix)]
+    #[test]
+    fn sleep_skew_does_not_expire_live_claims_or_inject_locks() {
+        let _pack = crate::governance::HOutsidePack::new(); // 팩 격리(ACL 경합 없음) — 좌석 전에
+        let daemon = isolated_daemon();
+        let node = make_surface(&daemon, Some("worker-sleep"));
+        let s = daemon.get_surface(node).unwrap();
+        let me = std::process::id();
+        let other = std::os::unix::process::parent_id();
+        let claim = |pid: u32, extra: Value| {
+            let mut p = json!({"surface_id": node});
+            if let Some(o) = extra.as_object() {
+                for (k, v) in o {
+                    p[k] = v.clone();
+                }
+            }
+            rpc_call(&daemon, "surface.cycle_claim", p, Some(pid))["result"]["claim"].clone()
+        };
+        usage_report(&daemon, node, json!({"ctx_pct": 75}), None);
+        let fire_id = threshold_events(&daemon, node)[0]["payload"]["fire_id"].as_str().unwrap().to_string();
+        assert_eq!(claim(me, json!({"fire_id": fire_id})), json!("claimed"));
+        // ⓐ 점유 뒤 벽시계가 5,000초 앞으로 뛰었다(단조 시계는 그대로) — 표시 시각만 과거가 된다.
+        s.cycle_claim.lock().unwrap().as_mut().unwrap().since -= 5_000.0;
+        crate::usage::ctx_guard_tick(&daemon, &s);
+        assert!(s.cycle_claim.lock().unwrap().is_some(), "절전(벽시계만 뜀) 뒤 수집기 틱이 산 집행자의 점유를 버렸다");
+        assert_eq!(threshold_events(&daemon, node).len(), 1, "산 점유를 버리고 같은 통보를 재배달했다(이중 집행의 계기)");
+        assert_eq!(claim(other, json!({"fire_id": fire_id})), json!("busy"), "절전 뒤 두 번째 집행자가 같은 좌석을 점유했다");
+        assert!(!crate::usage::ctx_guard_wire(&daemon, &s)["claim"].is_null(), "좌석 행이 산 점유를 숨겼다");
+        // ⓑ 단조 초로 상한을 넘긴 점유는 버린다(굳은 점유 봉인) — 미해결 통보 재배달 1회.
+        s.cycle_claim.lock().unwrap().as_mut().unwrap().mono -= crate::state::CYCLE_CLAIM_MAX_SECS + 1.0;
+        crate::usage::ctx_guard_tick(&daemon, &s);
+        assert!(s.cycle_claim.lock().unwrap().is_none(), "단조 상한을 넘긴 점유가 남았다(②)");
+        let evs = threshold_events(&daemon, node);
+        assert_eq!(evs.len(), 2, "상한을 넘긴 점유를 버린 뒤 재배달이 없다");
+        assert_eq!(evs[1]["payload"]["redelivery"], json!(true));
+        // ⓒ 주입 잠금 시각 = 데몬 단조 초.
+        let l = |pid: u32| rpc_call(&daemon, "surface.inject_lock", json!({"surface_id": node}), Some(pid))["result"]["lock"].clone();
+        assert_eq!(l(me), json!("locked"));
+        let (_, at) = *daemon.inject_locks.lock().unwrap().get(&node).unwrap();
+        assert!(
+            (at - crate::usage::ctx_guard_now(&daemon)).abs() < 5.0,
+            "주입 잠금 시각 {at} 가 데몬 단조 초가 아니다(벽시계면 절전 뒤 15초 상한이 곧바로 풀린다)"
+        );
+        assert_eq!(l(other), json!("busy"));
+    }
+
+    /// ★(게이트 수정 1회차 R1R3-1) 좌석 행 `ctx_guard.awaiting_since`(5분 보고의 'clear 통보 미집행 N분+' 재료)는 데몬 기동 뒤 누적 절전에
+    /// 밀리지 않는다 — 기동 시각(`started_at`)을 벽시계 1만 초만큼 과거로 둔 데몬(기동 뒤 절전 1만 초 모사: 벽시계가 단조 시계보다 앞섬)에서
+    /// 방금 난 통보의 awaiting_since 가 지금이다. 종전 `started_at + 단조 at` 은 1만 초 과거를 냈다(방금 통보를 '미집행 166분+' 로 오보).
+    #[test]
+    fn awaiting_since_is_not_shifted_by_sleep_since_daemon_start() {
+        let _pack = crate::governance::HOutsidePack::new();
+        let mut daemon = isolated_daemon();
+        Arc::get_mut(&mut daemon).expect("fresh daemon should be uniquely owned").started_at -= 10_000.0;
+        let node = make_surface(&daemon, Some("worker-sleep-a"));
+        usage_report(&daemon, node, json!({"ctx_pct": 75, "ctx_window": 200000, "session_file": "/p/a/A.jsonl"}), None);
+        assert_eq!(threshold_events(&daemon, node).len(), 1);
+        let s = daemon.get_surface(node).unwrap();
+        let w = crate::usage::ctx_guard_wire(&daemon, &s);
+        let since = w["awaiting_since"].as_f64().expect("awaiting_since");
+        let lag = crate::state::now_epoch() - since;
+        assert!((-1.0..60.0).contains(&lag), "방금 난 통보의 awaiting_since 가 {lag:.0}초 과거다(기동 뒤 누적 절전만큼 밀림)");
+        // 순수 — 지금 epoch − 단조 경과(음수 경과는 0).
+        assert_eq!(crate::usage::awaiting_since_epoch(2_000_000_000.0, 100.0, 40.0), 2_000_000_000.0 - 60.0);
+        assert_eq!(crate::usage::awaiting_since_epoch(2_000_000_000.0, 40.0, 100.0), 2_000_000_000.0);
     }
 
     /// ★(V42R-1) 신원 위임 — 데몬이 띄운 사이클 1콜(좌석 밖 프로세스)은 요청 좌석의 신원으로 해소된다(ACL · 권위 주입 면제가 CSO 가

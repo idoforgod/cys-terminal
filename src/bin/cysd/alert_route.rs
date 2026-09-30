@@ -21,7 +21,7 @@
 //!      쓰므로(예산 내구 확인 뒤 적재 · 접힘 보존 뒤 원본 제거 · 뒤늦은 제외의 보존 뒤 소비)
 //!      I/O 를 큐에 걸면 그 계약이 한꺼번에 깨진다. 실행 장소만 옮기고 순서는 그대로 둔다.
 //!
-//! 【폭주 봉인(§7 ①)】 (name,surface,detail) 5분 쿨다운 · 시간당 20건 상한 · CSO 좌석 결속
+//! 【폭주 봉인(§7 ①)】 (name,surface,detail) 5분 쿨다운 · 시간당 20건 상한(일반 몫 · master·CEO clear 개시 신호는 따로 26건 몫 — 게이트 수정 1회차) · CSO 좌석 결속
 //! **전체**의 자기 이벤트 제외 · 데몬 부트 300초 유예 · CSO 활성 큐 보호선(50). 억제된 것은
 //! **버리지 않고** [`RouteState::pending`] 에 키 단위로 병합해 두었다가 유예 종료·CSO 착석·
 //! 쿨다운 만료 시 재평가해 **키당 정확히 1건**으로 적재한다. `context.threshold` 는 에지 1회
@@ -61,15 +61,27 @@ pub const ENV_ALERT_ROUTE: &str = "CYS_ALERT_ROUTE";
 
 /// 키 쿨다운(초) — 같은 사실을 5분 안에 두 번 밀지 않는다.
 pub const COOLDOWN_SECS: f64 = 300.0;
-/// 시간당 적재 상한(건) — 전 키 합산. 넘으면 **보류**(폐기 아님).
+/// 시간당 적재 상한(건) — **일반 몫**: master·CEO 의 clear 개시 신호([`is_clear_signal`])를 뺀 모든 키의 합산. 넘으면 **보류**(폐기 아님).
+/// ★(게이트 수정 1회차 R1R3-2) clear 개시 신호는 이 몫을 쓰지 않는다([`CLEAR_RESERVE`] 의 별도 몫) — 종전에는 clear 신호도 이 계수에
+/// 실려(예약분 하한 규칙), v3 가드가 허용하는 master·CEO 가장자리 고리(좌석당 ≤ 6/시간 + 재배달)가 한 시간 창을 채우면 좌석 종료
+/// (`surface.exited` — 노드 사망 → 회생)·`health.alert`·`watchdog.*` 같은 자가치유 경보가 창이 지날 때까지 보류됐다(실데몬 드릴 최대
+/// 1805초 · 대조 5.2초 · 치명위험 ③).
 pub const HOURLY_CAP: usize = 20;
-/// ★fatal-fix P1 → ★(R1-F1 · R1-F2 · 2026-09-26) **clear 개시 신호 전용** 시간당 예약분(건) — master·CEO 좌석의
-/// `context.threshold`([`is_clear_signal`])만 쓴다. 계수는 전 키 합산([`RouteState::routed_1h`])과 **별도**
-/// ([`RouteState::clear_1h`])라서 일반 경보든 에지 사실(좌석 종료·worker 임계·재생 갭)이든 [`HOURLY_CAP`] 을 채워도 master 의
-/// clear 신호가 보류되지 않는다.
+/// ★fatal-fix P1 → ★(R1-F1 · R1-F2 · 2026-09-26) **clear 개시 신호 전용** 시간당 몫(건) — master·CEO 좌석의
+/// `context.threshold`([`is_clear_signal`])만 쓴다. 계수([`RouteState::clear_1h`])는 일반 몫([`RouteState::general_1h`] ·
+/// [`HOURLY_CAP`])과 **완전히 따로**다 — 일반 경보든 에지 사실(좌석 종료·worker 임계·재생 갭)이든 일반 몫을 채워도 master 의 clear
+/// 신호가 보류되지 않고, 거꾸로 clear 신호가 아무리 많아도 일반 몫(자가치유 경보)을 먹지 않는다.
 ///
-/// ★(RV1-R1-N1 · 2026-09-27) 예약분은 **하한이지 상한이 아니다**: clear 신호는 먼저 일반 계수 안에서 배차되고(기준선
-/// 0.14.41 거동 · 일반 경보와 같은 몫 = 우선순위), **일반 계수가 찬 뒤에만** 예약분을 쓴다. 예약 계수(`clear_window`)도
+/// ★(게이트 수정 1회차 R1R3-2 · 2026-09-30) **두 몫을 완전히 가른다**: 종전(RV1-R1-N1)은 clear 신호를 먼저 일반 계수 안에서 배차하고
+/// 일반 계수가 찬 뒤에만 이 몫을 썼다(아래 옛 사유). 그 규칙은 예약분이 4 일 때의 것이었다 — 조용한 시간의 clear 신호가 작은
+/// 예약분을 먹어 두면 폭풍 뒤 master 신호가 보류됐다. 수정 5회차가 이 몫을 clear 신호의 **구조적 상한**(26 = 2 좌석 × 키당 쿨다운
+/// 13/시간)으로 올린 뒤로는 그 걱정이 성립하지 않는다(clear 신호가 이 몫을 다 쓸 수 없다). 대신 clear 신호가 일반 계수에 실리는
+/// 부작용만 남았다: 가장자리 고리 master·CEO(좌석당 ≤ 6/시간 + 재배달)가 일반 창을 채우면 `surface.exited`·`health.alert`·`watchdog.*`
+/// 가 창이 지날 때까지 보류됐다(실데몬 드릴 surface.exited 1805·1505·1205·905·605초 보류 · 대조 5.2초 · ③ 자가치유). 그래서 이제 clear
+/// 신호는 이 몫에서만 세고 일반 몫(20)은 그 밖의 키만 센다 — 합산 봉인은 그대로 `HOURLY_CAP + CLEAR_RESERVE` = 46 < 보호선 50 이다.
+/// (옛 사유 — RV1-R1-N1) 예약분은 하한이지 상한이 아니었다: clear 신호는 먼저 일반 계수 안에서 배차되고(기준선
+///
+/// 0.14.41 거동 · 일반 경보와 같은 몫 = 우선순위), **일반 계수가 찬 뒤에만** 예약분을 썼다. 예약 계수(`clear_window`)도
 /// 그때 배차된 것만 싣는다 — 조용한 시간에 일반 계수로 나간 clear 신호가 예약분을 먹어 두면, 같은 한 시간 뒤의 폭풍이
 /// 일반 계수를 채웠을 때 master 신호가 다시 약 1시간 보류된다(S5b 무clear 재발). 종전(1d815805)은 clear 신호를 예약
 /// 계수로만 막아 조용한 데몬에서도 한 시간 5번째부터 보류했다(D6q·D6r 실측 · ② 무clear).
@@ -84,10 +96,10 @@ pub const HOURLY_CAP: usize = 20;
 /// '두 좌석이 한 시간에 각각 두 번 60% 를 교차'(clear 뒤 재무장) 가정이었는데, 가장자리·C 띠 고리(오너 결재 1 · 좌석당 ≤ 6/시간)가 그
 /// 가정을 넘어 폭풍 시간에 master·CEO 신호가 최대 약 40분 보류됐다(재검증 4-1 ROLE — 그동안 자동 압축을 끈 master 가 가장자리
 /// 86%에서 차단점 88.5 를 넘으면 저장 지시가 거부된다 · ②). 합산 상한은 `HOURLY_CAP + CLEAR_RESERVE` = 46 으로 CSO 큐 보호선
-/// ([`CSO_QUEUE_HEADROOM`] 50) 아래다(예약분 적재는 일반 계수가 찬 뒤에만 일어나므로 어느 한 시간 창에서도 21번째 이후 적재는 전부
-/// 예약분이다 · 핀 `clear_reserve_covers_both_clear_seats_at_the_router_cooldown`).
-/// 실패 방향: 일반 계수와 예약분이 **둘 다** 찬 clear 신호는 **보류**(폐기 아님 · 창이 지나면 나이순 배차) — 위 상한 밖(좌석 수·
-/// 쿨다운이 바뀐 경우)의 봉인이다.
+/// ([`CSO_QUEUE_HEADROOM`] 50) 아래다(두 몫이 따로 세므로 어느 한 시간 창에서도 일반 ≤ 20 · clear 신호 ≤ 26 · 핀
+/// `clear_reserve_covers_both_clear_seats_at_the_router_cooldown`).
+/// 실패 방향: 이 몫이 찬 clear 신호는 **보류**(폐기 아님 · 창이 지나면 나이순 배차) — 위 상한 밖(좌석 수·쿨다운이 바뀐 경우 · 역할이
+/// 한 시간 안에 다른 좌석으로 옮겨 키가 늘어난 경우)의 봉인이다.
 pub const CLEAR_RESERVE: usize = 26;
 /// clear 개시 신호를 내는 좌석 역할(정확 일치) — master clear 의 개시 신호는 이 좌석들의 `context.threshold` 다.
 pub const CLEAR_SIGNAL_ROLES: [&str; 2] = ["master", "ceo"];
@@ -472,11 +484,11 @@ pub struct RouteState {
     /// (룰 10종이면 시간당 1,200줄). 발행에도 같은 쿨다운을 걸어 "억제도 보이되 소음이 되지는 않게"
     /// 한다. **판정에는 쓰이지 않는다**(제외는 시간이 지나도 제외다).
     pub last_ignored: HashMap<AlertKey, f64>,
-    /// 최근 적재 단조 시각들(상한 창) — 상한(20/h) 자체가 길이를 유계로 만든다.
+    /// 최근 적재 단조 시각들(상한 창 · **전 키 합산** — 관측 `routed_1h`) — 두 몫의 상한(20 + 26/h)이 길이를 유계로 만든다.
     pub routed_window: VecDeque<f64>,
-    /// ★(R1-F1 · RV1-R1-N1) **예약분으로** 배차된 clear 개시 신호([`is_clear_signal`])의 단조 시각들 — [`CLEAR_RESERVE`] 의
-    /// 별도 계수. 일반 계수에 여유가 있어 그 안에서 나간 clear 신호는 여기 싣지 않는다(예약분은 하한 — 일반 계수가 찬
-    /// 뒤를 위해 남겨 둔다). 모든 적재는 `routed_window` 에도 들어간다(합산 계수 · 일반 경보의 몫을 먼저 쓴다 = 우선순위).
+    /// ★(R1-F1 · 게이트 수정 1회차 R1R3-2) 배차된 **모든** clear 개시 신호([`is_clear_signal`])의 단조 시각들 — [`CLEAR_RESERVE`] 몫의
+    /// 계수. 모든 적재는 `routed_window` 에도 들어가고, 일반 몫([`RouteState::general_1h`])은 합산에서 이것을 뺀 수다(clear 신호가
+    /// 자가치유 경보의 몫을 먹지 않는다). 종전(RV1-R1-N1)은 일반 계수가 찬 뒤 배차된 것만 실었다.
     pub clear_window: VecDeque<f64>,
     /// 최근 보류 계수(분 버킷 — 입력 폭풍에 메모리가 자라지 않는다).
     pub suppressed_window: MinuteWindow,
@@ -568,9 +580,15 @@ impl RouteState {
         self.routed_window.iter().filter(|t| mono - **t <= WINDOW_SECS).count()
     }
 
-    /// ★(R1-F1 · RV1-R1-N1) 최근 한 시간에 **예약분으로** 배차된 clear 개시 신호 수([`CLEAR_RESERVE`] 의 계수).
+    /// ★(R1-F1 · 게이트 수정 1회차 R1R3-2) 최근 한 시간에 배차된 clear 개시 신호 수([`CLEAR_RESERVE`] 몫의 계수).
     pub fn clear_1h(&self, mono: f64) -> usize {
         self.clear_window.iter().filter(|t| mono - **t <= WINDOW_SECS).count()
+    }
+
+    /// ★(게이트 수정 1회차 R1R3-2) 최근 한 시간의 **일반 몫** 배차 수([`HOURLY_CAP`] 의 계수) = 합산 − clear 개시 신호. clear 신호는 자기
+    /// 몫([`CLEAR_RESERVE`])에서만 세므로 master·CEO 가장자리 고리가 좌석 종료·health·watchdog 경보를 보류시키지 않는다.
+    pub fn general_1h(&self, mono: f64) -> usize {
+        self.routed_1h(mono).saturating_sub(self.clear_1h(mono))
     }
 
     pub fn suppressed_1h(&self, mono: f64) -> usize {
@@ -597,12 +615,11 @@ impl RouteState {
         self.reserve_admission_as(key, mono, false).0
     }
 
-    /// [`RouteState::reserve_admission`] + ★(R1-F1 · RV1-R1-N1) clear 개시 신호가 **일반 계수가 찬 상태에서** 배차되면
-    /// 예약분 계수([`RouteState::clear_1h`])에도 싣는다. 반환 둘째 값 = 예약분을 썼는가(되돌리기에 그대로 넘긴다).
-    /// 판정은 이 적재를 합산 창에 넣기 **전**의 계수로 한다([`decide`] 가 본 것과 같은 수).
+    /// [`RouteState::reserve_admission`] + ★(R1-F1 · 게이트 수정 1회차 R1R3-2) clear 개시 신호는 **언제나** clear 몫 계수
+    /// ([`RouteState::clear_1h`])에도 싣는다(일반 몫에서 빠진다). 반환 둘째 값 = clear 몫에 실었는가(되돌리기에 그대로 넘긴다).
     pub fn reserve_admission_as(&mut self, key: &AlertKey, mono: f64, clear_signal: bool) -> (Option<f64>, bool) {
         self.prune(mono);
-        let used_reserve = clear_signal && self.routed_1h(mono) >= HOURLY_CAP;
+        let used_reserve = clear_signal;
         let prev = self.last_routed.insert(key.clone(), mono);
         self.routed_window.push_back(mono);
         if used_reserve {
@@ -1000,7 +1017,9 @@ impl RouteState {
             .collect();
         let to_epoch = |m: f64| now.epoch - (now.mono - m);
         let routed_at: Vec<f64> = self.routed_window.iter().map(|m| to_epoch(*m)).collect();
-        let clear_routed_at: Vec<f64> = self.clear_window.iter().map(|m| to_epoch(*m)).collect();
+        // ★(게이트 수정 1회차 R1R3-2) clear 몫 계수는 이제 **모든** clear 신호다 — 뜻이 바뀌었으므로 새 이름(`clear_signal_routed_at`)으로
+        //   싣는다. 구 이름(`clear_routed_at` = 일반 계수가 찬 뒤의 것만)을 구 데몬이 이 뜻으로 읽으면 clear 신호를 더 보류한다(②).
+        let clear_signal_routed_at: Vec<f64> = self.clear_window.iter().map(|m| to_epoch(*m)).collect();
         let cooldowns: Vec<Value> = self
             .last_routed
             .iter()
@@ -1009,7 +1028,7 @@ impl RouteState {
             })
             .collect();
         json!({"v": PENDING_SCHEMA, "saved_at": now.epoch, "pending": rows,
-               "routed_at": routed_at, "clear_routed_at": clear_routed_at, "cooldowns": cooldowns})
+               "routed_at": routed_at, "clear_signal_routed_at": clear_signal_routed_at, "cooldowns": cooldowns})
     }
 
     /// 영속 복원(순수) — 복원분의 `first_mono` 는 `0.0` 이다: 재기동 전부터 기다린 것이므로
@@ -1046,9 +1065,15 @@ impl RouteState {
             monos.truncate(HOURLY_CAP * 4); // 손상 파일이 메모리를 밀지 못하게
             self.routed_window.extend(monos);
         }
-        // ①′ ★(R1-F1) clear 예약분 계수 — 같은 규칙(창 안 · 음수 나이 자름 · 유계). 필드 없는 구 파일 = 빈 계수
-        //    (구 세대에는 이 예약분이 없었으므로 거짓 소진이 아니다).
-        if let Some(rs) = doc.get("clear_routed_at").and_then(|v| v.as_array()) {
+        // ①′ ★(R1-F1 · 게이트 수정 1회차 R1R3-2) clear 몫 계수 — 같은 규칙(창 안 · 음수 나이 자름 · 유계). 새 필드
+        //    (`clear_signal_routed_at` = 모든 clear 신호)가 없으면 구 필드(`clear_routed_at` = 일반 계수가 찬 뒤의 것만 · 그 부분집합)를
+        //    읽는다 — 부분집합이라 일반 몫(합산 − clear)은 많게 세어져 재기동 뒤 한 시간까지 일반 경보를 더 보류하는 쪽(보수)으로만
+        //    틀린다(합산 봉인 불변). 둘 다 없는 구 파일 = 빈 계수(구 세대에는 이 몫이 없었다).
+        if let Some(rs) = doc
+            .get("clear_signal_routed_at")
+            .or_else(|| doc.get("clear_routed_at"))
+            .and_then(|v| v.as_array())
+        {
             let mut monos: Vec<f64> = rs
                 .iter()
                 .filter_map(|v| v.as_f64())
@@ -1161,15 +1186,14 @@ pub fn decide(state: &RouteState, key: &AlertKey, ctx: &RouteCtx) -> Verdict {
             return Verdict::Hold(HoldReason::Cooldown);
         }
     }
-    // ★(R1-F1 · R1-F2 · RV1-R1-N1) master·CEO 의 clear 개시 신호는 **일반 계수와 예약분이 둘 다 찼을 때만** 막힌다 —
-    //   예약분([`CLEAR_RESERVE`])은 하한이다(일반 계수에 여유가 있으면 그 안에서 · 차면 별도 계수의 예약분으로). 일반
-    //   경보든 에지 사실 폭풍이든 합산 상한을 채워도 이 신호는 곧바로 보류되지 않는다. 그 밖의 모든 키는 기준선과 같은
-    //   합산 상한([`HOURLY_CAP`] · clear 신호 적재분 포함 = 우선순위)에서 멈춘다.
-    let general_full = state.routed_1h(ctx.now) >= HOURLY_CAP;
+    // ★(R1-F1 · R1-F2 · 게이트 수정 1회차 R1R3-2) 몫이 둘이고 서로 먹지 않는다 — master·CEO 의 clear 개시 신호는 자기 몫
+    //   ([`CLEAR_RESERVE`] · 구조적 상한 = 2 좌석 × 키당 13/시간)이 찼을 때만 막히고, 그 밖의 모든 키는 **clear 신호를 뺀** 일반 몫
+    //   ([`HOURLY_CAP`])에서 멈춘다. 일반 경보·에지 사실 폭풍은 master clear 를 막지 못하고, 가장자리 고리 clear 신호는 좌석 종료·
+    //   health·watchdog 경보(자가치유)를 막지 못한다. 합산 ≤ 46 < 큐 보호선 50.
     let capped = if is_clear_signal(key, ctx) {
-        general_full && state.clear_1h(ctx.now) >= CLEAR_RESERVE
+        state.clear_1h(ctx.now) >= CLEAR_RESERVE
     } else {
-        general_full
+        state.general_1h(ctx.now) >= HOURLY_CAP
     };
     if capped {
         return Verdict::Hold(HoldReason::HourlyCap);
@@ -3019,7 +3043,7 @@ pub fn drain_folded(daemon: &Arc<Daemon>, now: Now) -> usize {
 ///
 /// 영속을 **적재마다 강제**하는 이유(codex blocking): 예산 기록이 최소 간격에 눌리면
 /// "20건 적재 → 크래시 → 복원된 예산 1건 → 다시 19건" 으로 같은 실제 한 시간에 상한이 깨진다.
-/// 적재는 시간당 20건이 상한이라 강제 fsync 도 그만큼으로 유계다(입력 폭풍과 무관).
+/// 적재는 시간당 46건(일반 20 + clear 개시 신호 26)이 상한이라 강제 fsync 도 그만큼으로 유계다(입력 폭풍과 무관).
 fn commit_routed(
     daemon: &Arc<Daemon>,
     item: &AlertItem,
@@ -3263,10 +3287,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, now: Now) -> usize {
     //   (`RoleGuard`·`seat_is_agent_backed`·[`FreezeGuard`])이 잡아 **보류로** 되돌린다 —
     //   즉 이 캐시는 낙관적이되 실패 방향이 안전하다(폐기가 아니라 보류).
     let mut ctx = route_ctx(daemon, now);
-    // ★(R1-F1 · RV1-R1-N1) 시간당 상한은 이제 **두 계수**다(합산 · clear 예약분) — 한쪽이 찼다고 순회를 끝내면 다른 쪽
-    //   키가 굶는다(일반 상한이 찬 뒤 뒤에 선 master 의 clear 신호). 그래서 상한 보류는 전역 끝냄이 아니라 **같은 계수의
-    //   뒤 키만 건너뛴다**(판정 재호출 없이 — 같은 답이다). clear 신호의 보류는 두 계수가 **모두** 찼다는 뜻이다(예약분 =
-    //   하한) — 그때는 일반 키도 같은 답이므로 함께 끝낸다.
+    // ★(R1-F1 · 게이트 수정 1회차 R1R3-2) 시간당 상한은 **두 몫**이다(일반 · clear 신호) — 한쪽이 찼다고 순회를 끝내면 다른 쪽
+    //   키가 굶는다(일반 몫이 찬 뒤 뒤에 선 master 의 clear 신호 · clear 몫이 찬 뒤 뒤에 선 좌석 종료). 그래서 상한 보류는 전역
+    //   끝냄이 아니라 **같은 몫의 뒤 키만 건너뛴다**(판정 재호출 없이 — 같은 답이다). 두 몫이 모두 찼을 때만 끝낸다.
     let mut general_capped = false;
     let mut clear_capped = false;
     for (key, p) in batch {
@@ -3284,10 +3307,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, now: Now) -> usize {
         match verdict {
             Verdict::Hold(HoldReason::HourlyCap) => {
                 state_lock(daemon).note_reason(&item.key, HoldReason::HourlyCap);
+                // [`decide`] 의 두 몫은 따로 찬다 — 보류된 키의 몫만 표시한다.
                 if clear_signal {
-                    // [`decide`] 의 clear 보류 = 일반 계수 ∧ 예약분 모두 찬 상태 → 일반 키도 같은 답.
                     clear_capped = true;
-                    general_capped = true;
                 } else {
                     general_capped = true;
                 }
@@ -4432,15 +4454,13 @@ mod drills {
         }
     }
 
-    /// ★(RV1-R1-N1 · 2026-09-27) **예약분은 하한이지 상한이 아니다** — 일반 계수([`HOURLY_CAP`])에 여유가 있으면
-    /// master·CEO 의 clear 개시 신호는 그 안에서 배차된다(기준선 0.14.41 과 같은 거동). 1d815805 는 clear 신호를
-    /// 예약분 계수로만 막아, 다른 경보가 거의 없는 조용한 데몬에서도 한 시간 5번째 clear 신호부터 최대 약 1시간을
-    /// `hourly_cap` 으로 보류했다(D6q·D6r 샌드박스 실측 — 일반 계수 20 중 4~8 만 쓴 채). 그동안 master 는 임계를 넘어
-    /// 계속 쌓인다(② 무clear).
-    /// 실패 방향(폭주 봉인): 일반 계수가 차면 clear 신호도 예약분([`CLEAR_RESERVE`])까지만 — 합산 상한 24 는 그대로다
-    /// (`drill_clear_reserve_is_bounded_and_survives_restart`).
+    /// ★(RV1-R1-N1 · 2026-09-27 → 게이트 수정 1회차 R1R3-2 재핀) 조용한 데몬에서 master·CEO 의 clear 개시 신호는 한 시간 5번째에도
+    /// 곧바로 배차된다. 1d815805 는 clear 신호를 작은 예약분(4)으로만 막아, 다른 경보가 거의 없는 조용한 데몬에서도 한 시간 5번째 clear
+    /// 신호부터 최대 약 1시간을 `hourly_cap` 으로 보류했다(D6q·D6r 샌드박스 실측). 지금은 clear 신호 전용 몫([`CLEAR_RESERVE`] 26 =
+    /// 구조적 상한)에서만 세고 **일반 몫([`HOURLY_CAP`])을 쓰지 않는다**(자가치유 경보의 몫을 먹지 않는다 — R1R3-2).
+    /// 실패 방향(폭주 봉인): clear 몫도 유계다(`drill_clear_reserve_is_bounded_and_survives_restart`) · 합산 ≤ 46.
     #[test]
-    fn drill_clear_signals_route_in_the_general_pool_while_it_has_room() {
+    fn drill_clear_signals_route_in_their_own_pool_in_a_quiet_hour() {
         // 【D6r 모양】 master·ceo 가 번갈아 교차(키당 쿨다운 300s 준수 · t=0·3·305·308·611s).
         let daemon = drill_daemon("clear-general-r");
         let cso = seat(&daemon, "cso");
@@ -4473,17 +4493,17 @@ mod drills {
                 Now::at(t0.mono + (COOLDOWN_SECS + 1.0) * n as f64),
             );
         }
-        assert_eq!(depth(&daemon, cso), 5, "같은 master 의 5번째 교차가 일반 계수 여유 속에서 보류됐다");
-        // 일반 계수 안에서 배차된 clear 신호는 예약분을 쓰지 않았다.
-        assert_eq!(daemon.alert_route.lock().unwrap().clear_1h(t0.mono + 5.0 * COOLDOWN_SECS), 0,
-                   "일반 계수 안의 clear 배차가 예약분을 소모했다");
+        assert_eq!(depth(&daemon, cso), 5, "같은 master 의 5번째 교차가 조용한 데몬에서 보류됐다");
+        // clear 신호는 자기 몫에서만 센다 — 일반 몫(자가치유 경보의 몫)은 그대로 0.
+        let st = daemon.alert_route.lock().unwrap();
+        let at = t0.mono + 5.0 * COOLDOWN_SECS;
+        assert_eq!((st.clear_1h(at), st.general_1h(at), st.routed_1h(at)), (5, 0, 5), "clear 배차가 일반 몫을 먹었다(R1R3-2)");
     }
 
-    /// ★(RV1-R1-N1 보강) 조용한 시간에 일반 계수 안에서 배차된 clear 신호는 **예약분을 먹지 않는다** — 같은 한 시간
-    /// 뒤에 에지 사실·일반 경보가 일반 계수를 채워도 master 의 다음 clear 신호는 예약분으로 곧바로 닿는다.
-    /// 제안된 수정(술어만 `clear≥4 ∧ routed≥20` · 적재는 두 창 모두 기록)대로면 조용한 시간의 clear 4건이 예약 계수를
-    /// 채워 두어, 폭풍 뒤 master 신호가 다시 약 1시간 보류된다(S5b 의 무clear 가 되살아난다). 예약 계수는 **일반 계수가
-    /// 찬 상태에서 배차된 clear 신호만** 싣는다.
+    /// ★(RV1-R1-N1 보강 → 게이트 수정 1회차 R1R3-2 재핀) 조용한 시간에 배차된 clear 신호가 있어도 같은 한 시간 뒤의 폭풍에서 master 의
+    /// 다음 clear 신호는 곧바로 닿는다(S5b 무clear 재발 없음) — clear 몫(26)은 구조적 상한이라 한 좌석이 다 쓸 수 없다. 거꾸로 조용한
+    /// 시간의 clear 신호는 **일반 몫을 먹지 않는다**: 뒤이은 일반 경보는 20건 전부 배차되고 21번째부터 보류된다(종전 = clear 4건이 일반
+    /// 계수를 먹어 일반 경보 16건 뒤 보류).
     /// 실패 방향(폭주 봉인): 합산 유입은 여전히 `HOURLY_CAP + CLEAR_RESERVE` 를 넘지 않는다(이 검체 끝에서 계수).
     #[test]
     fn drill_quiet_hour_clear_signals_leave_the_reserve_intact() {
@@ -4495,43 +4515,121 @@ mod drills {
             ev("context.threshold", Some(master), json!({"role": "master", "context_pct": 61 + n, "threshold": 60}))
         };
         let at = |n: u64| Now::at(t0.mono + (COOLDOWN_SECS + 1.0) * n as f64);
-        // ① 조용한 시간 — master 가 4번 교차(일반 계수 안에서 배차).
+        // ① 조용한 시간 — master 가 4번 교차(clear 몫에서 배차).
         let quiet = 4u64;
         for n in 0..quiet {
             handle_event(&daemon, &cross(n), at(n));
         }
         assert_eq!(depth(&daemon, cso), quiet as usize);
-        // ② 같은 한 시간 안에 일반 경보가 일반 계수를 채우고 몇 건은 보류된다.
+        // ② 같은 한 시간 안에 일반 경보가 일반 몫을 채우고 3건은 보류된다 — clear 신호는 일반 몫을 먹지 않았다(20건 전부 배차).
         let fill_at = Now::at(at(quiet - 1).mono + 10.0);
-        for i in 0..(HOURLY_CAP as u64 - quiet + 3) {
+        for i in 0..(HOURLY_CAP as u64 + 3) {
             handle_event(&daemon, &ev("health.alert", Some(700 + i), json!({"rule": "fill"})), fill_at);
         }
-        assert_eq!(depth(&daemon, cso), HOURLY_CAP, "일반 상한이 새었다");
-        // ③ master 의 다음 교차 — 예약분이 온전해야 곧바로 닿는다.
+        assert_eq!(depth(&daemon, cso), quiet as usize + HOURLY_CAP, "clear 신호가 일반 몫을 먹었거나 일반 상한이 새었다(R1R3-2)");
+        // ③ master 의 다음 교차 — clear 몫이 남아 곧바로 닿는다.
         handle_event(&daemon, &cross(quiet), at(quiet));
-        assert_eq!(depth(&daemon, cso), HOURLY_CAP + 1,
-                   "조용한 시간의 clear 배차가 예약분을 먹어 폭풍 뒤 master 신호가 보류됐다(② 무clear)");
-        // ④ 같은 한 시간의 나머지 교차도 전부 예약분으로 곧바로 닿는다(키당 쿨다운 한계 — 수정 5회차 V41R-1). 예약 계수는 예약분으로
-        //    배차된 것만 싣고 일반 경보 보류는 그대로다(합산 ≤ HOURLY_CAP + CLEAR_RESERVE).
+        assert_eq!(depth(&daemon, cso), quiet as usize + HOURLY_CAP + 1,
+                   "조용한 시간의 clear 배차 뒤 폭풍에서 master 신호가 보류됐다(② 무clear)");
+        // ④ 같은 한 시간의 나머지 교차도 전부 곧바로 닿는다(키당 쿨다운 한계 — 수정 5회차 V41R-1). 일반 경보 보류는 그대로다
+        //    (합산 ≤ HOURLY_CAP + CLEAR_RESERVE).
         let mut n = quiet + 1;
         while at(n).mono - t0.mono < WINDOW_SECS {
             handle_event(&daemon, &cross(n), at(n));
             n += 1;
         }
         let last = at(n - 1);
-        let reserve_used = (n - quiet) as usize;
-        assert_eq!(depth(&daemon, cso), HOURLY_CAP + reserve_used, "한 시간 안의 master clear 신호가 보류됐다(② 무clear)");
+        let clear_routed = n as usize;
+        assert_eq!(depth(&daemon, cso), HOURLY_CAP + clear_routed, "한 시간 안의 master clear 신호가 보류됐다(② 무clear)");
         assert!(depth(&daemon, cso) <= HOURLY_CAP + CLEAR_RESERVE, "합산 상한이 새었다(폭주 봉인 완화)");
         assert!(
             !daemon.alert_route.lock().unwrap().pending.keys().any(|k| k.name == "context.threshold"),
             "clear 신호가 보류에 남았다"
         );
-        assert_eq!(daemon.alert_route.lock().unwrap().clear_1h(last.mono), reserve_used);
+        assert_eq!(daemon.alert_route.lock().unwrap().clear_1h(last.mono), clear_routed);
+        assert_eq!(daemon.alert_route.lock().unwrap().general_1h(last.mono), HOURLY_CAP);
         assert_eq!(
             daemon.alert_route.lock().unwrap().pending.keys().filter(|k| k.name == "health.alert").count(),
             3,
             "일반 경보 보류가 예약분으로 새었다"
         );
+    }
+
+    /// ★(게이트 수정 1회차 R1R3-2 · 재검토자 router/gate_test_mod 모양) master·CEO 가 **키당 쿨다운 한계(301초)마다** clear 개시 신호를 내는
+    /// 두 시간(시간당 24건 — 가드 최소 간격 600초 + 발화당 재배달 1회보다 촘촘한 최악) 동안 좌석 종료(`surface.exited` · 시간당 12건 —
+    /// 노드 사망 → 회생의 1회성 신호)와 `health.alert`(시간당 4건)가 **도착한 그 시각에** CSO 큐에 닿는다(보류 0 · 폐기 0). 종전은
+    /// clear 신호가 일반 계수(20)에 실려 창이 차면 좌석 종료가 창이 지날 때까지 보류됐다(재검토자 순수 사건열 S1 — 종료 24/36 배달 ·
+    /// p50 1530초 · max 3060초 · 실데몬 드릴 surface.exited 1805초). 실패 방향(폭주 봉인): 굴림 한 시간 합산 유입 ≤ `HOURLY_CAP +
+    /// CLEAR_RESERVE` · 일반 몫 ≤ 20 · clear 몫 ≤ 26.
+    #[test]
+    fn drill_clear_signal_load_does_not_hold_self_heal_alerts() {
+        let daemon = drill_daemon("clear-vs-selfheal");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let ceo = seat(&daemon, "ceo");
+        let t0 = after_grace(&daemon);
+        let drain = |d: &Arc<Daemon>| -> Vec<String> {
+            let s = d.get_surface(cso).unwrap();
+            let mut q = s.pending_queue.lock().unwrap();
+            let v: Vec<String> = q.iter().map(|e| e.text.clone()).collect();
+            q.clear();
+            v
+        };
+        let (mut sent, mut got): (Vec<(u64, String)>, Vec<(u64, String)>) = (vec![], vec![]);
+        let mut routed_at: Vec<f64> = vec![];
+        for t in 0..=(2 * 3600u64) {
+            let at = Now::at(t0.mono + t as f64);
+            if t % 301 == 0 {
+                for (sid, role) in [(master, "master"), (ceo, "ceo")] {
+                    handle_event(&daemon, &ev("context.threshold", Some(sid), json!({"role": role, "context_pct": 86, "threshold": 85})), at);
+                    sent.push((t, format!("context.threshold surface:{sid} ")));
+                }
+            }
+            if t % 300 == 150 {
+                let sid = 9_000 + t;
+                handle_event(&daemon, &ev("surface.exited", Some(sid), json!({"role": "worker-x", "agent": "claude"})), at);
+                sent.push((t, format!("surface.exited surface:{sid} ")));
+            }
+            if t % 900 == 450 {
+                let sid = 8_000 + t;
+                handle_event(&daemon, &ev("health.alert", Some(sid), json!({"rule": "not_logged_in"})), at);
+                sent.push((t, format!("health.alert surface:{sid} ")));
+            }
+            if t % 30 == 0 {
+                reevaluate(&daemon, at);
+            }
+            for txt in drain(&daemon) {
+                routed_at.push(t as f64);
+                if let Some((_, k)) = sent.iter().find(|(_, k)| {
+                    let (name, sref) = k.split_once(' ').unwrap();
+                    txt.contains(name) && txt.contains(sref)
+                }) {
+                    got.push((t, k.clone()));
+                }
+            }
+        }
+        let delay = |k: &str| -> Option<u64> {
+            let s = sent.iter().find(|(_, x)| x == k)?.0;
+            got.iter().find(|(_, x)| x == k).map(|(t, _)| t - s)
+        };
+        let exits: Vec<&(u64, String)> = sent.iter().filter(|(_, k)| k.starts_with("surface.exited")).collect();
+        assert_eq!(exits.len(), 24, "전제: 좌석 종료 24건");
+        let late: Vec<(String, Option<u64>)> =
+            sent.iter().filter(|(_, k)| !k.starts_with("context.threshold")).map(|(_, k)| (k.clone(), delay(k))).filter(|(_, d)| *d != Some(0)).collect();
+        assert!(late.is_empty(), "clear 신호 부하가 자가치유 경보를 보류시켰다(③): {late:?}");
+        // clear 신호는 같은 키가 쿨다운 뒤 다시 오므로 배차 수로 센다 — 전부 도착 시각에 닿았다.
+        let clear_sent = sent.iter().filter(|(_, k)| k.starts_with("context.threshold")).count();
+        let clear_got = got.iter().filter(|(_, k)| k.starts_with("context.threshold")).count();
+        assert_eq!(clear_got, clear_sent, "clear 개시 신호가 보류됐다(②)");
+        let worst = (0..routed_at.len())
+            .map(|i| routed_at[i..].iter().take_while(|x| **x - routed_at[i] < WINDOW_SECS).count())
+            .max()
+            .unwrap_or(0);
+        assert!(worst <= HOURLY_CAP + CLEAR_RESERVE, "굴림 한 시간 유입 {worst} > {}", HOURLY_CAP + CLEAR_RESERVE);
+        let st = daemon.alert_route.lock().unwrap();
+        let end = t0.mono + 2.0 * 3600.0;
+        assert!(st.general_1h(end) <= HOURLY_CAP && st.clear_1h(end) <= CLEAR_RESERVE);
+        assert!(st.pending.is_empty(), "보류가 남았다: {:?}", st.pending.keys().collect::<Vec<_>>());
     }
 
     /// ★인계 경쟁(리뷰 R1 · codex blocking): 대상 선택과 적재 사이에 `claim_role` 이 끝나면

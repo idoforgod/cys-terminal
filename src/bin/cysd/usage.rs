@@ -615,6 +615,11 @@ pub(crate) mod clear_guard {
         /// 센다(헬퍼 세션의 낮은 상태줄 한 건이 본체의 가장자리 표시를 지워 고리가 복귀 계수·feed·좌석 행에서 사라지던 것 · 표지 없는
         /// clear 뒤 새 세션(다른 범위)의 성장 발화는 여전히 복귀가 아니다).
         edge_mark: [Option<u64>; 2],
+        /// ★(게이트 수정 1회차 ROLE-G2 · 발행 전용) 축별 — 이 사이클 뒤 창(또는 창 뒤 첫 관측)에서 **예외 ⓑ 가장자리 관측이 있었던 범위**
+        /// (`edge_mark` 와 같이 선다). `edge_mark` 와 달리 막대 아래 판정이 지우지 않는다 — 같은 범위가 가장자리에 닿은 뒤 1~2%p 아래로
+        /// 흔들렸다 다시 난 발화(자기보고 86/84)를 복귀로 세는 재료다. 새 창(`close`)과 발화가 지운다. 가장자리 관측이 없던 사이클(창이
+        /// S 아래에서 시각으로 닫히고 작업 성장으로 막대 = max(S, R+1) 에 닿은 발화 — 사이클 뒤 81~84)은 여기 없다(복귀 아님).
+        edge_seen: [Option<u64>; 2],
         /// (발행 전용) 연속 가장자리·C 띠 복귀 발화 수 — 사이클 뒤 성장으로 난 발화가 0 으로 끊는다(사이클 없이 난 발화는 그대로 ·
         /// 좌석 행 `edge_run` · 정보 — feed 조절에 쓰지 않는다: 성장 발화와 번갈면 늘 1 이다 · R1V4-1).
         pub edge_run: u32,
@@ -760,6 +765,7 @@ pub(crate) mod clear_guard {
                 self.fold[i] = Some(if peak[i].is_some() { peak_scope[i] } else { 0 });
                 // 새 창이 수준을 다시 쟀다 — 앞 창의 가장자리 표시는 끝났다(가장자리 닫힘이면 부른 쪽이 그 축을 다시 세운다).
                 self.edge_mark[i] = None;
+                self.edge_seen[i] = None;
             }
             self.phase = Phase::Free;
             Note::Measured { kind, level: peak, first, base, confirmed, span, cut, edge, at: anchor + span }
@@ -1031,6 +1037,7 @@ pub(crate) mod clear_guard {
                     self.fold[i] = None;
                     // 이 축의 다음 발화는 가장자리 복귀 발화다(R3V3-1 ① — 연속 수·오너 feed · 판정 무관) — 이 보고의 범위로(R1V42-1).
                     self.edge_mark[i] = Some(sid);
+                    self.edge_seen[i] = Some(sid);
                 } else {
                     if hi[i].is_some_and(|(_, h)| h == sid) {
                         hi[i] = None; // 같은 범위의 S 아래 보고가 오면 외톨이 S 보고는 버린다(낡은 첫 보고)
@@ -1066,6 +1073,7 @@ pub(crate) mod clear_guard {
                 // 창 뒤 첫 관측이 가장자리 이상 — 예외 ⓑ(창 뒤)의 발화다: 복귀 계수에 넣는다(발행 재료 · 판정 무관 — 창보다 드물게
                 // 보고하는 좌석의 가장자리 고리도 오너 feed 에 보인다) — 이 관측의 범위로(R1V42-1).
                 self.edge_mark[i] = Some(sid);
+                self.edge_seen[i] = Some(sid);
             }
             let v = self.decide(r.pct, r.window, r.axis, r.base, sid, r.now, r.now, &mut notes);
             Out { notes, verdict: Some(v) }
@@ -1131,12 +1139,19 @@ pub(crate) mod clear_guard {
             let level_now = lvl.map(|(l, _)| rebase(l, window));
             let c_band = level_now.is_some_and(|l| l >= block_cap(window));
             let after_cycle = self.fire.is_some_and(|f| f.cleared);
-            // ★(통합 minor 정리 · R1V42-1 · 발행 재료 — 판정 무관) 복귀 = 그 축의 가장자리 표시가 **이 관측의 범위**다 · C 띠 · 또는 잰
-            // 수준 R 이 있고 통보 퍼센트가 R + G 미만이다(G 성장을 기다리지 않은 발화 — 막대가 max(S, R+1) 또는 C 로 내려와 난 발화 = 예외
-            // ⓑ·ⓒ 의 정의 그대로 · 자기보고 축처럼 범위가 하나인 좌석의 ±1~2 흔들림이 표시를 지워도 셈이 남는다).
-            let below_growth = level_now.is_some_and(|l| u16::from(pct) < u16::from(l) + u16::from(CTX_GUARD_GROWTH));
+            // ★(통합 minor 정리 · R1V42-1 · 발행 재료 — 판정 무관) 복귀 = 그 축의 가장자리 표시가 **이 관측의 범위**다 · C 띠 · 또는 이
+            // 사이클 뒤 **같은 범위가 가장자리(예외 ⓑ)에 닿았고** 잰 수준 R 이 있고 통보 퍼센트가 R + G 미만이다(자기보고 축처럼 범위가 하나인
+            // 좌석이 가장자리에 닿은 뒤 ±1~2 흔들림으로 표시를 지워도 셈이 남는다).
+            // ★(게이트 수정 1회차 ROLE-G2) 'R + G 미만'만으로는 세지 않는다 — 사이클 뒤 수준 81~84(200K · 설계가 정상이라 적은 68~84 대역)
+            // 에서는 R + 5 가 S(85)를 넘어 막대가 max(S, R+1) = 85 로 묶이므로, 가장자리 관측 없이 작업으로 1~4%p 자라 난 **성장 발화**도
+            // 통보 퍼센트 < R + G 다. 종전(ddad22d9)은 그 발화를 가장자리 복귀로 세어 오너 **error** feed(회차 1)를 내고 본문이 일어나지 않은
+            // 원인('창 안 가장자리 도달 · 창 뒤 첫 보고가 가장자리 이상 · 또는 C 이상')을 단정했다. 이제 그 사이클 뒤 같은 범위의 가장자리
+            // 관측(`edge_seen`)이 있어야 수치 기준이 든다 — 복귀로 세는 모든 발화는 feed 본문의 세 원인 중 하나를 실제로 거쳤다.
+            let below_growth = self.edge_seen[axis as usize] == Some(scope)
+                && level_now.is_some_and(|l| u16::from(pct) < u16::from(l) + u16::from(CTX_GUARD_GROWTH));
             let edge_fire = after_cycle && (self.edge_mark[axis as usize] == Some(scope) || c_band || below_growth);
             self.edge_mark[axis as usize] = None;
+            self.edge_seen[axis as usize] = None;
             self.sr_probe = None;
             if edge_fire {
                 self.edge_run = self.edge_run.saturating_add(1);
@@ -1218,6 +1233,12 @@ pub(crate) fn ctx_guard_now(daemon: &Daemon) -> f64 {
     daemon.started_instant.elapsed().as_secs_f64()
 }
 
+/// ★(게이트 수정 1회차 R1R3-1 · 순수) 단조 시각 `at_mono`(가드 발화 시각)의 epoch 표시값 = 지금 epoch − (지금 단조 − `at_mono`). 데몬 기동
+/// 시각(`started_at`)을 더하지 않는다 — 기동 뒤 누적 절전만큼 벽시계가 단조 시계보다 앞서 있어 그 합은 과거로 밀린다.
+pub(crate) fn awaiting_since_epoch(wall_now: f64, mono_now: f64, at_mono: f64) -> f64 {
+    wall_now - (mono_now - at_mono).max(0.0)
+}
+
 /// ★(clear 가드 v3) 수집기 틱 — 시한 처리와 보류해 둔 실측 관측의 재판정 하나뿐이다. **가드 밖 값을 읽지 않는다**
 /// (observed_usage·agent_status·오버라이드 파일 무접촉 · 입력은 단조 시각과 배달 동결뿐). 발행은 가드 락을 놓은 뒤.
 pub(crate) fn ctx_guard_tick(daemon: &Daemon, s: &Surface) {
@@ -1233,10 +1254,11 @@ pub(crate) fn ctx_guard_tick_at(daemon: &Daemon, s: &Surface, now: f64) {
     if out.verdict.is_some() || !out.notes.is_empty() {
         crate::handlers::publish_ctx_guard(daemon, s, out, "held-retry", None);
     }
-    // 점유 락은 가드 락을 놓은 뒤 따로(가드 락은 말단 — 중첩 없음).
+    // 점유 락은 가드 락을 놓은 뒤 따로(가드 락은 말단 — 중첩 없음). 점유 나이는 데몬 **단조** 초의 현재 값으로 잰다(점유가 그 시계로
+    // 찍혔다 · 게이트 수정 1회차 R1R3-1 — 벽시계는 절전만큼 뛰어 산 집행자의 점유를 버렸다).
     let swept = {
         let mut c = s.cycle_claim.lock().unwrap_or_else(|e| e.into_inner());
-        let dead = c.as_ref().is_some_and(|c| c.expired(crate::state::now_epoch()));
+        let dead = c.as_ref().is_some_and(|c| c.expired(ctx_guard_now(daemon)));
         if dead {
             *c = None;
         }
@@ -1274,15 +1296,18 @@ pub(crate) fn ctx_guard_wire(daemon: &Daemon, s: &Surface) -> Value {
     let claim = {
         let c = s.cycle_claim.lock().unwrap_or_else(|e| e.into_inner());
         c.as_ref()
-            .filter(|c| !c.expired(crate::state::now_epoch()))
+            .filter(|c| !c.expired(ctx_guard_now(daemon)))
             .map(|c| json!({"holder_pid": c.pid, "since": c.since, "fire_id": c.fire_id}))
     };
     let g = s.ctx_loop_guard.lock().unwrap_or_else(|e| e.into_inner());
+    let now = ctx_guard_now(daemon);
+    // ★(게이트 수정 1회차 R1R3-1) 발화 시각(단조 `at`)의 epoch 는 **지금에서 단조 경과를 뺀 값**이다. 종전 `started_at + at` 은 데몬 기동
+    // 뒤 누적 절전만큼 과거로 밀려(macOS 단조 시계는 절전 중 멈춘다) 5분 보고가 방금 난 통보를 'clear 통보 미집행 N분+' 로 찍었다.
+    // 경과는 가드 시한(1200초)·cycle-agent 예산과 같은 단조 경과다(통보 뒤 절전은 미집행 시간에 넣지 않는다 — 그동안 집행자도 잤다).
     let awaiting_since = match g.phase {
-        Phase::Awaiting { at, .. } => Some(daemon.started_at + at),
+        Phase::Awaiting { at, .. } => Some(awaiting_since_epoch(crate::state::now_epoch(), now, at)),
         _ => None,
     };
-    let now = ctx_guard_now(daemon);
     let (clears_24h, confirmed_24h) = g.cycles_within(now, 86_400.0);
     json!({
         "phase": g.phase.as_str(),
@@ -5695,6 +5720,79 @@ mod ctx_guard_tests {
         let o = rep(&mut g, 86, "a", 1300.0);
         assert!(fired(&o) && !edge_of(&o), "성장 발화를 복귀로 셌다(오진): {o:?}");
         assert_eq!(g.edge_run, 0);
+    }
+
+    /// ★(게이트 수정 1회차 ROLE-G2 · 발행 재료 — 판정 무관) 사이클 뒤 잰 수준 R 이 81~84(200K · 설계가 정상이라 적은 68~84 대역)인 좌석이
+    /// **가장자리 관측 없이**(창은 S 아래에서 시각으로 닫히고 창 뒤 첫 보고도 S 아래 — 접힘) 작업으로 1~4%p 자라 막대 max(S, R+1) = 85 에서
+    /// 난 **성장 발화**는 가장자리 복귀가 아니다(`Note::EdgeReturn` 없음 → 오너 error feed 없음 · 연속·회차 0) — 실측·자기보고 두 축 모두.
+    /// 종전(ddad22d9)은 '통보 퍼센트 < R + G'만으로 복귀로 세어 회차 1 error feed 와 일어나지 않은 원인('창 안 가장자리 도달 · 창 뒤 첫
+    /// 보고가 가장자리 이상 · 또는 C 이상')을 냈다(재검토자 growth_edge: R 81·82·83·84 모두 Some((1, 1, false))). 대조: R 78·80(성장 5%p)
+    /// 은 원래 복귀가 아니고, 같은 범위가 가장자리에 닿은 뒤 흔들렸다 난 발화(자기보고 86/84 · R1V42-1 ⓑ)는 여전히 복귀다. 발화 시각·수
+    /// (판정)는 바뀌지 않는다. 실패 방향: 붉어지면 정상 대역의 성장 발화마다 오진 error feed 가 나간다(오너 feed 오진 · 결재 ① 비용 과대).
+    #[test]
+    fn role_g2_growth_fire_from_r81_to_r84_is_not_an_edge_return() {
+        let edge_of = |o: &cg::Out| o.notes.iter().find_map(|n| match n {
+            Note::EdgeReturn { run, episode, c_band, .. } => Some((*run, *episode, *c_band)),
+            _ => None,
+        });
+        for self_axis in [false, true] {
+            for (r, step) in [(78u8, 0.5f64), (80, 0.5), (81, 0.5), (82, 0.5), (83, 0.5), (84, 0.25)] {
+                let mut g = ClearGuard::default();
+                let say = |g: &mut ClearGuard, pct: u8, now: f64| if self_axis { srep(g, pct, now) } else { rep(g, pct, "body", now) };
+                assert!(fired(&say(&mut g, 70, 0.0)));
+                g.cycle_on(60.0, false);
+                g.cycle_off(cg::Outcome::Cleared, 90.0, false);
+                // 창(90..690): 72 → R(S 미만만) — 가장자리 보고 없음.
+                let (mut t, mut p) = (150.0, 72.0f64);
+                while t < 690.0 {
+                    let o = say(&mut g, (p.round() as u8).min(r), t);
+                    assert!(edge_of(&o).is_none() && !fired(&o));
+                    p += (f64::from(r) - 72.0) / 8.0;
+                    t += 60.0;
+                }
+                let _ = g.tick(692.0, false); // 창 닫힘
+                // 창 뒤 첫 보고 R(S 미만 → 접힘) · 그 뒤 작업 성장.
+                let mut p = f64::from(r);
+                t = 750.0;
+                let mut fire = None;
+                while t < 4_000.0 && fire.is_none() {
+                    let o = say(&mut g, p.round().min(99.0) as u8, t);
+                    let _ = g.tick(t + 1.0, false);
+                    if let Some(Verdict::Fire { pct, bar, level, .. }) = o.verdict {
+                        fire = Some((pct, bar, level, edge_of(&o)));
+                    }
+                    p += step;
+                    t += 60.0;
+                }
+                let (pct, bar, level, edge) = fire.expect("성장 발화");
+                assert_eq!(level, Some(r), "전제: 잰 수준 R");
+                if r >= 81 {
+                    assert_eq!((pct, bar), (85, 85), "전제: 막대 max(S, R+1) = 85 · 통보 퍼센트 < R + G");
+                }
+                assert_eq!(edge, None, "축 {} R {r}: 가장자리 관측 없는 성장 발화({pct}% · 막대 {bar})를 가장자리 복귀로 셌다(오진 error feed)",
+                           if self_axis { "자기보고" } else { "실측" });
+                assert_eq!((g.edge_run, g.edge_episode), (0, 0));
+            }
+        }
+        // 대조 — 같은 범위가 사이클 뒤 창 안에서 가장자리(86)에 닿은 뒤 84 로 흔들렸다 86 에서 난 발화는 여전히 복귀다(R1V42-1 ⓑ · R 83).
+        let mut g = ClearGuard::default();
+        assert!(fired(&srep(&mut g, 70, 0.0)));
+        g.cycle_on(60.0, false);
+        g.cycle_off(cg::Outcome::Cleared, 75.0, false);
+        srep(&mut g, 72, 90.0);
+        srep(&mut g, 83, 110.0);
+        assert!(matches!(srep(&mut g, 86, 130.0).verdict, Some(Verdict::Held { .. })));
+        assert!(matches!(srep(&mut g, 84, 400.0).verdict, Some(Verdict::Quiet)));
+        let o = srep(&mut g, 86, 720.0);
+        assert!(fired(&o) && edge_of(&o) == Some((1, 1, false)), "가장자리에 닿았다 흔들린 좌석의 발화를 복귀에서 뺐다: {o:?}");
+        // 대조 — 가장자리 관측 뒤 **새 창**(다음 사이클)이 S 아래에서 닫히면 그 뒤 성장 발화는 복귀가 아니다(가장자리 기록은 창마다 새로).
+        g.cycle_on(780.0, false);
+        g.cycle_off(cg::Outcome::Cleared, 800.0, false);
+        srep(&mut g, 82, 900.0);
+        let _ = g.tick(1_410.0, false);
+        srep(&mut g, 82, 1_500.0); // 접기
+        let o = srep(&mut g, 85, 2_000.0);
+        assert!(fired(&o) && edge_of(&o).is_none(), "앞 사이클의 가장자리 기록이 다음 사이클의 성장 발화를 복귀로 셌다: {o:?}");
     }
 
     /// ★(통합 minor 정리 · R1V42-3 · 발행 재료) 효과 없음 회차 — 효과 있는 발화가 연속 수(strikes)를 0 으로 돌려도 회차는 끊기지 않고,
