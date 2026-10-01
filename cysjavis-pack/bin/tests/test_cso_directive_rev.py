@@ -422,9 +422,13 @@ SAFETY_CLAUSES = {
         #   최대 약 9.5분 — 1콜 단일 전체 시한 570초이다. 전경 600000 은 백그라운드 수단이 없는 CLI 의 예외로만 남는다.
         # ★(게이트 수정 1회차 GR2-1 · 의식적 재핀) 부서장의 사이클 1콜은 이제 `--detach`(데몬이 붙든다 — master 가 CSO 에게 clear 돼도
         #   끊기지 않아 CSO ② 의 보류 근거가 사라진다) · 백그라운드는 `--detach` 를 모르는 구 데몬의 폴백이다.
+        # ★(게이트 수정 2회차 GRR1-1 · 의식적 재핀) '동시 상한 3' 은 CSO 좌석(master 만 clear)을 일반 칸에 세웠다 — master 가 detach 로 낸
+        #   CSO 좌석 사이클이 워커 작업 둘 뒤에서 188초 기다려 자동 압축을 끈 CSO 가 차단점 88.5 를 넘었다(재검토 드릴 rb-burst-new).
+        #   이제 데몬의 우선 칸(master·CEO·CSO)이 따로 있고 일반은 동시 2 그대로 — 문면이 그것을 말한다.
         ("사이클 detach 집행", "**`--detach` 로 부른다**(게이트 수정 1회차 GR2-1): `cys cycle-agent --role <역할> --fire <경보의 fire=> --detach` "
-                           "1콜은 곧바로 rc 89(접수 · 송신 0건)로 돌아오고 데몬이 그 사이클을 끝까지 붙든다(신원 = 너 · 동시 상한 3 · 좌석당 단일 "
-                           "비행 — 네가 CSO 에게 clear 돼도 끊기지 않는다)"),
+                           "1콜은 곧바로 rc 89(접수 · 송신 0건)로 돌아오고 데몬이 그 사이클을 끝까지 붙든다(신원 = 너 · 좌석당 단일 비행 — 네가 CSO "
+                           "에게 clear 돼도 끊기지 않는다 · 일반 좌석은 동시 2 · master·CEO·CSO 좌석은 따로 칸이 있어 워커 사이클 뒤에서 기다리지 "
+                           "않는다 — CSO 좌석 사이클도 이 1콜이다(CSO 는 너만 clear 한다 · 게이트 수정 2회차 GRR1-1))"),
         ("detach 사이클은 보류 사유 아님", "detach 로 띄운 사이클은 CSO 의 clear 통보(아래 6단계 ②)의 보류 사유가 아니다 — 곧바로 준비한다"),
         ("사이클 백그라운드 실행", "같은 1콜을 `--detach` 없이 **백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`"
                         "(도구 timeout 에 끊기지 않고\n  네 턴을 붙잡지 않는다). 전경 대기 금지"),
@@ -432,8 +436,9 @@ SAFETY_CLAUSES = {
     # CEO_TEMPLATE 은 MASTER 전문을 바이트 연접한 생성물이다(gen_ceo_template.py) — 배포본에도 같은 문면이 있어야 한다.
     "CEO_TEMPLATE.md": (
         ("사이클 detach 집행", "**`--detach` 로 부른다**(게이트 수정 1회차 GR2-1): `cys cycle-agent --role <역할> --fire <경보의 fire=> --detach` "
-                           "1콜은 곧바로 rc 89(접수 · 송신 0건)로 돌아오고 데몬이 그 사이클을 끝까지 붙든다(신원 = 너 · 동시 상한 3 · 좌석당 단일 "
-                           "비행 — 네가 CSO 에게 clear 돼도 끊기지 않는다)"),
+                           "1콜은 곧바로 rc 89(접수 · 송신 0건)로 돌아오고 데몬이 그 사이클을 끝까지 붙든다(신원 = 너 · 좌석당 단일 비행 — 네가 CSO "
+                           "에게 clear 돼도 끊기지 않는다 · 일반 좌석은 동시 2 · master·CEO·CSO 좌석은 따로 칸이 있어 워커 사이클 뒤에서 기다리지 "
+                           "않는다 — CSO 좌석 사이클도 이 1콜이다(CSO 는 너만 clear 한다 · 게이트 수정 2회차 GRR1-1))"),
         ("detach 사이클은 보류 사유 아님", "detach 로 띄운 사이클은 CSO 의 clear 통보(아래 6단계 ②)의 보류 사유가 아니다 — 곧바로 준비한다"),
         ("사이클 백그라운드 실행", "같은 1콜을 `--detach` 없이 **백그라운드로 실행한다** — Claude Code 는 Bash 도구 `run_in_background: true`"
                         "(도구 timeout 에 끊기지 않고\n  네 턴을 붙잡지 않는다). 전경 대기 금지"),
@@ -3055,6 +3060,40 @@ class ClearGuardFireWiring(unittest.TestCase):
             mutated.replace("**한 번 재배달**", "재배달")))
         old = mutated + "\n" + self.OLD_RC88_TRIGGER[0]
         self.assertTrue(any(v == self.OLD_RC88_TRIGGER[0] for v in self._rc88_violations(old)))
+
+    def test_cso_seat_cycle_is_masters_detach_in_a_priority_slot(self):
+        """★(게이트 수정 2회차 GRR1-1) CSO 좌석의 사이클은 master 만 낸다(clear 는 master↔CSO 상호 집행 · CSO 가 자기 좌석을 detach 하면
+        self_clear_denied · 라우터는 CSO 자기 경보를 CSO 에게 보내지 않는다) — 부서장(MASTER·CEO) §11 은 그 사이클도 같은 `--detach`
+        1콜이라고 말하고, 그 1콜이 데몬의 **우선 칸**(master·CEO·CSO — 워커 사이클 뒤에서 기다리지 않는다)에 선다고 말해야 한다. CSO 지침도
+        '동시 상한 3(그중 한 칸은 늘 master·CEO 몫)' 이 아니라 master·CEO·CSO 의 따로 칸을 말한다. 종전 문면('동시 상한 3')은 CSO 좌석을
+        일반 칸 2 에 세운 데몬과 짝이었다(재검토 드릴 rb-burst-new — CSO 좌석 작업 189.7초 대기 · 87.5% 에서 시작 · 저장 지시 88.8% 거부 ·
+        rc 1 · 차단점 위 691초). 실패 방향: 붉어지면 부서장이 CSO 좌석 사이클을 다른 길(대기 있는 칸)로 내거나 지침이 데몬 계약과 어긋난다."""
+        OLD_CAP = ("동시 상한 3", "그중 한 칸은 늘 master·CEO 몫")
+        for name in ("MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md"):
+            body = squash(strip_html_comments(self.raw[name]))
+            with self.subTest(directive=name):
+                lo = body.index(squash("**`--detach` 로 부른다**"))
+                hi = body.index(squash("**백그라운드로 실행한다**"))
+                sect = body[lo:hi]
+                self.assertIn(squash("master·CEO·CSO 좌석은 따로 칸이 있어 워커 사이클 뒤에서 기다리지 않는다"), sect)
+                self.assertIn(squash("CSO 좌석 사이클도 이 1콜이다(CSO 는 너만 clear 한다"), sect)
+                self.assertIn(squash("일반 좌석은 동시 2"), sect, "%s: 일반 몫(폭주 봉인)이 문면에서 사라졌다" % name)
+                for old in OLD_CAP:
+                    self.assertNotIn(squash(old), sect, "%s: 종전 상한 문면(CSO 좌석 = 일반 칸)이 남았다: %s" % (name, old))
+        cso = squash(strip_html_comments(self.raw["CSO_DIRECTIVE.md"]))
+        self.assertIn(squash("master·CEO·CSO 좌석은 따로 칸이 있어 다른 좌석 1콜 뒤에서 기다리지 않는다(네 좌석의 사이클은 master 가 낸다"), cso)
+        self.assertNotIn(squash("동시 상한 3(그중 한 칸은 늘 master·CEO 몫)"), cso, "CSO 지침에 종전 상한 문면이 남았다")
+        # 음성 대조 — 종전 문면을 되돌려 넣으면 잡는다(공허한 검체 금지).
+        master = self.raw["MASTER_DIRECTIVE.md"]
+        new_frag = ("(신원 = 너 · 좌석당 단일 비행 — 네가 CSO 에게 clear 돼도 끊기지 않는다 · 일반 좌석은 동시 2 · master·CEO·CSO 좌석은 "
+                    "따로 칸이 있어 워커 사이클 뒤에서 기다리지 않는다 — CSO 좌석 사이클도 이 1콜이다(CSO 는 너만 clear 한다 · 게이트 수정 "
+                    "2회차 GRR1-1))")
+        self.assertEqual(master.count(new_frag), 1, "음성 대조 치환 대상이 정확히 하나가 아니다")
+        old = master.replace(new_frag, "(신원 = 너 · 동시 상한 3 · 좌석당 단일 비행 — 네가 CSO 에게 clear 돼도 끊기지 않는다)", 1)
+        o = squash(strip_html_comments(old))
+        sect = o[o.index(squash("**`--detach` 로 부른다**")):o.index(squash("**백그라운드로 실행한다**"))]
+        self.assertIn(squash(OLD_CAP[0]), sect)
+        self.assertNotIn(squash("CSO 좌석 사이클도 이 1콜이다"), sect)
 
     def test_master_clear_hold_excludes_daemon_held_detach_jobs(self):
         """★(게이트 수정 1회차 GR2-1·ROLE-G1) CSO 의 master clear 보류(§1-2 ⑦ ② · §2)는 **데몬 밖의 동기 1콜**만 본다 — `quiescing` 좌석이라도

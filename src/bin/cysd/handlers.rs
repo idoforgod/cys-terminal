@@ -10066,7 +10066,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             });
             let spec = crate::cycle_jobs::Spec {
                 target: sid,
-                priority: role.as_deref().is_some_and(|r| crate::alert_route::CLEAR_SIGNAL_ROLES.contains(&r)),
+                // ★(게이트 수정 2회차 GRR1-1) 우선 좌석 = 역할 맵이 master·CEO·CSO 로 가리키는 좌석(CSO 좌석은 master 만 clear 한다 —
+                //   일반 칸이면 워커 1콜 뒤에서 기다려 자동 압축을 끈 CSO 가 차단점을 넘는다).
+                priority: crate::cycle_jobs::is_priority_seat(daemon, sid),
                 target_role: role,
                 requester,
                 fire: fire_id.clone(),
@@ -21762,10 +21764,10 @@ mod tests {
         assert_eq!(rpc_call(&daemon, "surface.cycle_claim", json!({"surface_id": master}), Some(other))["result"]["claim"], json!("claimed"));
         assert_eq!(detach(Some(cso_pid), master, json!({}))["result"]["detach"], json!("busy"));
         rpc_call(&daemon, "surface.cycle_claim", json!({"surface_id": master, "release": true}), Some(other));
-        // 동시 상한이 찼다(진행 중 3 — 자리표시) → 접수는 대기(pending) · master 먼저 · 여유 = C(88) − 통보 퍼센트.
+        // 동시 상한이 찼다(진행 중 = 전체 상한 — 자리표시) → 접수는 대기(pending) · 우선 좌석 먼저 · 여유 = C(88) − 통보 퍼센트.
         {
             let mut j = daemon.cycle_jobs.lock().unwrap();
-            for t in [9001u64, 9002, 9003] {
+            for t in (0..crate::cycle_jobs::MAX_RUNNING as u64).map(|k| 9001 + k) {
                 let spec = crate::cycle_jobs::Spec {
                     target: t, target_role: None, requester: cso, fire: None, verifier: None, verifier_sid: None, timeout: 120,
                     save_files: vec![], resume_text: None, priority: false, headroom: 1,
@@ -21786,7 +21788,7 @@ mod tests {
         {
             let j = daemon.cycle_jobs.lock().unwrap();
             let x = j.jobs.iter().find(|x| x.spec.target == m2).expect("대기 작업");
-            assert!(x.spec.priority, "CEO 좌석은 master·CEO 몫");
+            assert!(x.spec.priority, "CEO 좌석은 우선 좌석 몫");
             assert_eq!((x.spec.headroom, x.spec.verifier_sid, x.spec.requester, x.spec.fire.clone()), (88 - 86, Some(verifier), cso, Some(fire2.clone())));
         }
         // 같은 좌석 두 번째 — busy(작업) · 끝난 내 집행(rc 1)의 같은 통보 — repeat(87).
@@ -21804,7 +21806,72 @@ mod tests {
         // 상태 조회 — org.status 의 cycle_jobs · 좌석 행 ctx_guard.job.
         let st = rpc_call(&daemon, "org.status", json!({}), None);
         assert_eq!(st["result"]["cycle_jobs"]["max_running"], json!(crate::cycle_jobs::MAX_RUNNING), "{}", st["result"]["cycle_jobs"]);
-        assert_eq!(st["result"]["cycle_jobs"]["running"].as_array().map(Vec::len), Some(3));
+        assert_eq!(st["result"]["cycle_jobs"]["running"].as_array().map(Vec::len), Some(crate::cycle_jobs::MAX_RUNNING));
+        assert_eq!(st["result"]["cycle_jobs"]["max_running_priority"], json!(crate::cycle_jobs::MAX_RUNNING_PRIORITY));
+    }
+
+    /// ★(게이트 수정 2회차 GRR1-1 · 재검토 탐침 grr1b 모양) master 가 워커 사이클 둘을 `--detach` 로 띄워 둔 뒤(일반 칸 2 진행) CSO 좌석
+    /// (master 만 clear 한다 — self_clear_denied · 라우터는 CSO 자기 경보를 CSO 에게 보내지 않는다)의 가장자리 통보(200K 85%)를
+    /// master 가 `--detach` 로 내면, 그 작업은 **우선 칸**(master·CEO·CSO — 역할 맵 정확 일치)이라 일반 작업 뒤에서 기다리지 않는다.
+    /// 판정 재료: 접수 RPC 가 만든 Spec 의 priority(역할 맵의 CSO 좌석 = true) · 같은 표에서 `admit` 이 곧바로 시작시킨다. 역할 맵이 가리키지
+    /// 않는 낡은 역할 표지(`surface.role` 만 남은 좌석 — latest-wins)는 우선이 아니다(우선 좌석 ≤ 역할 수 — 우선 몫이 묶이지 않는 근거).
+    /// 자식을 띄우지 않으려고 우선 몫을 자리표시 셋으로 채운 채 접수하고(대기) · 자리표시를 거둔 표에서 입장을 순수 판정한다. 실패 방향:
+    /// 붉어지면 CSO 좌석 사이클이 워커 1콜 뒤에서 188초 기다려 자동 압축을 끈 200K CSO 가 차단점 88.5 를 넘는다(저장 지시 거부 · rc 1 ·
+    /// 같은 통보 repeat · 영구 무clear → 경보 처리·master clear 집행 정지).
+    #[cfg(unix)]
+    #[test]
+    fn grr1_1_master_detach_of_cso_seat_takes_a_priority_slot_beside_two_worker_jobs() {
+        use crate::cycle_jobs::{admit, Admit, JobState, Spec};
+        let _pack = crate::governance::HOutsidePack::new();
+        let daemon = isolated_daemon();
+        let cso = make_surface(&daemon, Some("cso"));
+        let master = make_surface(&daemon, Some("master"));
+        let w2 = make_surface(&daemon, Some("worker-2"));
+        let w3 = make_surface(&daemon, Some("worker-3"));
+        let master_pid = daemon.get_surface(master).unwrap().pid;
+        let placeholder = |t: u64, role: &str, priority: bool| Spec {
+            target: t, target_role: Some(role.into()), requester: master, fire: None, verifier: None, verifier_sid: None,
+            timeout: 120, save_files: vec![], resume_text: None, priority, headroom: 18,
+        };
+        {
+            let mut j = daemon.cycle_jobs.lock().unwrap();
+            // master 의 워커 detach 작업 둘(일반 칸 2 진행) + 자리표시 우선 작업 셋(자식을 띄우지 않으려고 — 아래에서 거둔다).
+            for s in [placeholder(w2, "worker-2", false), placeholder(w3, "worker-3", false), placeholder(9201, "p1", true),
+                      placeholder(9202, "p2", true), placeholder(9203, "p3", true)] {
+                assert!(matches!(j.submit(s, 0.0), Admit::Accepted { .. }));
+            }
+            for x in j.jobs.iter_mut() {
+                x.state = JobState::Running { pid: 0, since: 0.0 };
+            }
+        }
+        usage_report(&daemon, cso, json!({"ctx_pct": 85, "ctx_window": 200000}), None);
+        let fire = threshold_events(&daemon, cso)[0]["payload"]["fire_id"].as_str().unwrap().to_string();
+        let r = rpc_call(&daemon, "surface.cycle_detach", json!({"surface_id": cso, "fire_id": fire, "timeout": 120}), Some(master_pid));
+        assert_eq!((r["result"]["detach"].clone(), r["result"]["state"].clone(), r["result"]["position"].clone()),
+                   (json!("accepted"), json!("pending"), json!(1)), "{r}");
+        let mut jobs = daemon.cycle_jobs.lock().unwrap().jobs.clone();
+        let job = jobs.iter().find(|x| x.spec.target == cso).expect("CSO 좌석 작업").clone();
+        assert!(job.spec.priority, "CSO 좌석(master 만 clear)이 일반 칸에 섰다 — 워커 1콜 뒤에서 기다린다(GRR1-1): {:?}", job.spec);
+        assert_eq!((job.spec.headroom, job.spec.requester), (3, master));
+        // 자리표시 우선 셋이 끝난 표 = 재검토 탐침 모양(일반 2 진행 · 진행 2 < 전체 상한) — CSO 좌석 작업이 곧바로 시작한다.
+        jobs.retain(|x| x.spec.target < 9200 || x.spec.target > 9299);
+        assert_eq!(jobs.iter().filter(|x| matches!(x.state, JobState::Running { .. })).count(), 2);
+        assert_eq!(admit(&jobs, false), vec![job.id], "일반 작업 둘이 진행 중이라 CSO 좌석 사이클이 기다린다(GRR1-1)");
+        // 음성 대조 — 같은 표에서 우선 표지를 떼면 기다린다(판정이 표지에 달려 있다 · 공허한 검체 금지).
+        let mut general = jobs.clone();
+        for x in general.iter_mut().filter(|x| x.id == job.id) {
+            x.spec.priority = false;
+        }
+        assert!(admit(&general, false).is_empty());
+        // 역할 맵 정확 일치: master 역할을 다른 좌석으로 옮기면(latest-wins — 옛 좌석에 `surface.role` 표지만 남는다) 옛 좌석은 우선이 아니고
+        // 새 보유자는 우선이다. 워커 좌석은 언제나 일반이다.
+        let new_master = make_surface(&daemon, Some("master"));
+        assert_eq!(daemon.roles.lock().unwrap().get("master").copied(), Some(new_master));
+        assert_eq!(daemon.get_surface(master).unwrap().role.lock().unwrap().as_deref(), Some("master"), "낡은 표지 전제");
+        assert!(!crate::cycle_jobs::is_priority_seat(&daemon, master), "역할 맵이 가리키지 않는 낡은 master 표지가 우선 칸을 받았다");
+        assert!(crate::cycle_jobs::is_priority_seat(&daemon, new_master));
+        assert!(crate::cycle_jobs::is_priority_seat(&daemon, cso));
+        assert!(!crate::cycle_jobs::is_priority_seat(&daemon, w2));
     }
 
     /// ★(V42R-1) 좌석 주입 잠금 — 한 점유자만 · 같은 점유자 재질의는 멱등 · 다른 점유자는 busy · 죽은 점유자·15초 넘은 점유는 버린다 ·

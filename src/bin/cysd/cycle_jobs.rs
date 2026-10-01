@@ -15,15 +15,17 @@
 //!   · 신원 위임: 데몬이 띄운 자식 pid 는 **요청 좌석의 신원**으로 해소된다(`Daemon::delegated_callers` · 조상 추적 0홉) — ACL ·
 //!     권위 주입의 타이핑 가드 면제 · 점유(`surface.cycle_claim`)·표지(`bind_owner`)의 소유자가 CSO 가 손으로 부른 1콜과 같다.
 //!     등록은 자식이 첫 RPC 를 내기 **전**이다(자식은 stdin 의 `go` 한 줄을 받을 때까지 아무것도 보내지 않는다 — 경합 0).
-//!   · 동시 상한: 진행 중 ≤ [`MAX_RUNNING`](3) · 그중 master·CEO 밖 좌석은 ≤ [`MAX_RUNNING_GENERAL`](2) — 한 칸은 늘 master·CEO
-//!     (라우터 `CLEAR_SIGNAL_ROLES`) 몫이다. 넘치면 데몬 안에서 기다린다(대기열 ≤ [`MAX_PENDING`] · 좌석당 하나) — 순서는 master·CEO
-//!     먼저 → 차단점까지 여유(C − 통보 퍼센트)가 작은 좌석 먼저 → 접수 순. 기다림은 CSO 의 턴이 아니다.
+//!   · 동시 상한: 일반 좌석 ≤ [`MAX_RUNNING_GENERAL`](2) · 우선 좌석(master·CEO·CSO — [`CYCLE_PRIORITY_ROLES`] · 역할 맵 정확 일치)
+//!     ≤ [`MAX_RUNNING_PRIORITY`](3 = 우선 역할 수) · 전체 ≤ [`MAX_RUNNING`](5) — 두 몫은 서로 빌리지 않는다. 우선 몫은 우선 역할 수라
+//!     정상 상태에서 묶이지 않는다 — 우선 좌석은 칸 때문에 기다리지 않는다(★게이트 수정 2회차 GRR1-1 · 종전 전체 3 · 우선 한 칸은
+//!     master 가 detach 로 낸 CSO 좌석 사이클을 워커 작업 둘 뒤에 세웠다). 일반이 넘치면 데몬 안에서 기다린다(대기열 ≤ [`MAX_PENDING`]
+//!     · 좌석당 하나) — 순서는 우선 좌석 먼저 → 차단점까지 여유(C − 통보 퍼센트)가 작은 좌석 먼저 → 접수 순. 기다림은 요청 좌석의 턴이 아니다.
 //!   · 좌석당 단일 비행: 같은 좌석에 산 점유(`cycle_claim`)나 진행·대기 작업이 있으면 접수하지 않는다(rc 88 — 종전 계약 그대로 ·
 //!     그 사이클이 clear 전에 끝나면 데몬 재배달). 통보 뒤 사이클이 이미 끝났으면 rc 87. 같은 요청 좌석이 같은 통보를 이미
 //!     detach 로 집행했고 88 밖의 결과였으면 다시 접수하지 않는다(rc 87 · CSO 지침 '내 집행 실패 통보의 재배달은 재집행하지 않는다'의
 //!     기계 집행 — 폭주 ① 없음).
 //!   · 검증자 교차: 진행 중 작업의 검증자 좌석을 **대상**으로 하는 작업은 그 작업이 끝날 때까지 기다린다(검증 중인 좌석을 비우지 않는다) ·
-//!     master·CEO 밖 작업은 검증자가 진행 중 사이클의 대상이면 기다린다(비워지는 좌석으로 검증 요청을 보내지 않는다) — master·CEO 는
+//!     우선 좌석 밖 작업은 검증자가 진행 중 사이클의 대상이면 기다린다(비워지는 좌석으로 검증 요청을 보내지 않는다) — 우선 좌석은
 //!     기다리지 않는다(그 대기가 V42R-1 자체다 · 사이클 4단계가 검증자 좌석의 유휴를 기다리므로 검증 요청은 clear 전에 처리된다).
 //!   · kill-switch: 동결(`system.pause`) 중에는 접수하지 않고(rc 1 · 송신 0건) 대기 작업도 시작하지 않는다(재개 뒤 수집기 틱이 시작).
 //!   · 시한: 자식은 자기 단일 전체 시한(570초)으로 끝난다 — 데몬은 [`KILL_AFTER_SECS`](630) 뒤에도 살아 있으면 죽인다(점유·표지는
@@ -44,10 +46,35 @@ use std::io::{BufRead, Write};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// 동시 진행 상한(전체).
-pub const MAX_RUNNING: usize = 3;
-/// 동시 진행 상한 중 master·CEO 밖 좌석 몫 — 한 칸은 늘 master·CEO 몫으로 남는다.
+/// ★(게이트 수정 2회차 GRR1-1) 사이클 **우선 좌석** 역할(역할 맵 정확 일치) — master·CEO(라우터 [`CLEAR_SIGNAL_ROLES`]) + **CSO**.
+/// CSO 좌석은 master 만 clear 한다(clear 는 master↔CSO 상호 집행 · CSO 가 자기 좌석을 detach 하면 self_clear_denied · 라우터는 CSO
+/// 자기 경보를 CSO 에게 보내지 않는다) — 게이트 수정 1회차(MASTER·CEO §11 '해당 노드' 사이클 전부 `--detach`)로 그 사이클이 처음
+/// 작업표에 들어왔는데 일반 칸이라, master·CSO 의 워커 작업 둘 뒤에서 188초 기다리는 동안 자동 압축을 끈 200K CSO 가 가장자리 85 에서
+/// 차단점 88.5 를 넘어 저장 지시가 거부됐다(재검토 드릴 rb-burst-new · 88.8% · 차단점 위 691초 · rc 1 · 같은 통보 repeat — 영구 무clear →
+/// 경보 처리·master clear 집행 정지). 라우터의 clear 신호 몫([`CLEAR_SIGNAL_ROLES`] · 예약 26 = 2 좌석 × 13)은 이 목록과 별개다(그대로).
+///
+/// [`CLEAR_SIGNAL_ROLES`]: crate::alert_route::CLEAR_SIGNAL_ROLES
+pub const CYCLE_PRIORITY_ROLES: [&str; 3] = ["master", "ceo", "cso"];
+/// 동시 진행 상한 중 우선 좌석 밖(일반) 몫 — 워커처럼 수가 정해지지 않은 좌석의 동시 사이클 봉인(폭주 ① · 그대로 2). 일반 작업은
+/// 우선 칸을 빌리지 않는다.
 pub const MAX_RUNNING_GENERAL: usize = 2;
+/// 동시 진행 상한 중 우선 좌석 몫 = 우선 역할 수. 역할 맵은 한 역할에 한 좌석이고([`is_priority_seat`]) 좌석당 단일 비행이라 정상
+/// 상태의 우선 작업은 이 수를 넘지 못한다 — 그래서 우선 좌석은 **칸 때문에 기다리지 않는다**(일반 작업 뒤에서도 · 서로의 뒤에서도).
+/// 역할 이동 직후처럼 구조 밖이면 이 봉인에 걸려 기다린다(실패 방향 = 대기 · 전체 상한 안).
+pub const MAX_RUNNING_PRIORITY: usize = CYCLE_PRIORITY_ROLES.len();
+/// 동시 진행 상한(전체) = 일반 몫 + 우선 몫. 종전 3(일반 2 + master·CEO 한 칸 · CSO 는 일반)은 CSO 좌석을 일반 작업 뒤에, 우선 좌석
+/// 둘째를 다른 우선 1콜 뒤에 세웠다.
+pub const MAX_RUNNING: usize = MAX_RUNNING_GENERAL + MAX_RUNNING_PRIORITY;
+
+/// 그 좌석이 사이클 우선 좌석인가 — **역할 맵**이 [`CYCLE_PRIORITY_ROLES`] 의 한 역할로 그 좌석을 가리킬 때만(정확 일치 · 권위 기준).
+/// `surface.role` 표지만으로는 판정하지 않는다: latest-wins 로 역할이 옮겨 간 옛 좌석에 표지가 남으면(맵은 새 보유자) 우선 좌석이
+/// 역할 수보다 많아져 [`MAX_RUNNING_PRIORITY`] 가 묶이고, 진짜 보유자가 낡은 좌석의 1콜 뒤에서 기다릴 수 있다. 라우터의 clear 신호
+/// 좌석 판정(`route_ctx` — 역할 맵 정확 일치)과 같은 술어다.
+pub fn is_priority_seat(daemon: &Daemon, sid: u64) -> bool {
+    let roles = daemon.roles.lock().unwrap_or_else(|e| e.into_inner());
+    CYCLE_PRIORITY_ROLES.iter().any(|r| roles.get(*r) == Some(&sid))
+}
+
 /// 대기열 상한(좌석당 하나라 실제로는 좌석 수 이하).
 pub const MAX_PENDING: usize = 16;
 /// 자식 강제 종료 시한(초) — cycle-agent 단일 전체 시한 570 + 60. **단조 시계**(`Instant` · 자식의 `CycleBudget` 과 같은 시계)로 잰다
@@ -89,7 +116,7 @@ pub struct Spec {
     pub timeout: u64,
     pub save_files: Vec<String>,
     pub resume_text: Option<String>,
-    /// master·CEO 좌석(라우터 `CLEAR_SIGNAL_ROLES` 정확 일치).
+    /// 우선 좌석(master·CEO·CSO — [`is_priority_seat`] · 역할 맵 정확 일치 · 접수 때 판정).
     pub priority: bool,
     /// 차단점까지 여유 = C − 통보 퍼센트(작을수록 먼저 · 모르면 최대).
     pub headroom: i32,
@@ -189,7 +216,7 @@ impl CycleJobs {
     }
 }
 
-/// 대기 작업 정렬 열쇠 — master·CEO 먼저 · 여유 작은 순 · 접수 순.
+/// 대기 작업 정렬 열쇠 — 우선 좌석(master·CEO·CSO) 먼저 · 여유 작은 순 · 접수 순.
 fn order_key(j: &Job) -> (u8, i32, f64, u64) {
     (u8::from(!j.spec.priority), j.spec.headroom, j.accepted_at, j.id)
 }
@@ -202,6 +229,7 @@ pub fn admit(jobs: &[Job], paused: bool) -> Vec<u64> {
     let running: Vec<&Job> = jobs.iter().filter(|j| matches!(j.state, JobState::Running { .. })).collect();
     let mut n = running.len();
     let mut general = running.iter().filter(|j| !j.spec.priority).count();
+    let mut prio = n - general;
     let mut targets: Vec<u64> = running.iter().map(|j| j.spec.target).collect();
     let mut verifiers: Vec<u64> = running.iter().filter_map(|j| j.spec.verifier_sid).collect();
     let mut pend: Vec<&Job> = jobs.iter().filter(|j| j.state == JobState::Pending).collect();
@@ -211,20 +239,26 @@ pub fn admit(jobs: &[Job], paused: bool) -> Vec<u64> {
         if n >= MAX_RUNNING {
             break;
         }
+        // 몫은 서로 빌리지 않는다 — 일반은 일반 몫 2 · 우선은 우선 몫(= 우선 역할 수 · GRR1-1).
         if !j.spec.priority && general >= MAX_RUNNING_GENERAL {
+            continue;
+        }
+        if j.spec.priority && prio >= MAX_RUNNING_PRIORITY {
             continue;
         }
         // 검증 중인 좌석을 비우지 않는다.
         if verifiers.contains(&j.spec.target) {
             continue;
         }
-        // master·CEO 밖 작업은 비워지는 좌석에 검증을 맡기지 않는다(master·CEO 는 기다리지 않는다).
+        // 우선 좌석 밖 작업은 비워지는 좌석에 검증을 맡기지 않는다(우선 좌석은 기다리지 않는다).
         if !j.spec.priority && j.spec.verifier_sid.is_some_and(|v| targets.contains(&v)) {
             continue;
         }
         out.push(j.id);
         n += 1;
-        if !j.spec.priority {
+        if j.spec.priority {
+            prio += 1;
+        } else {
             general += 1;
         }
         targets.push(j.spec.target);
@@ -327,6 +361,8 @@ pub fn status_json(daemon: &Daemon) -> Value {
     json!({
         "max_running": MAX_RUNNING,
         "max_running_general": MAX_RUNNING_GENERAL,
+        "max_running_priority": MAX_RUNNING_PRIORITY,
+        "priority_roles": CYCLE_PRIORITY_ROLES,
         "running": j.jobs.iter().filter(|x| matches!(x.state, JobState::Running { .. })).map(row).collect::<Vec<_>>(),
         "pending": j.jobs.iter().filter(|x| x.state == JobState::Pending).map(row).collect::<Vec<_>>(),
         "recent": j.recent.iter().rev().take(8).map(|d| json!({"job": d.id, "surface_id": d.target, "requester": d.requester,
@@ -559,8 +595,8 @@ mod tests {
         }
     }
 
-    /// V42R-1 ①(좌석 간 격리): 다른 좌석 1콜이 도는 동안 master 의 통보는 곧바로 시작한다 — 일반 좌석이 둘 진행 중이어도(상한 3 중
-    /// 한 칸은 master·CEO 몫). 일반 좌석 셋째는 기다린다(일반 몫 2). 동결 중에는 아무것도 시작하지 않는다.
+    /// V42R-1 ①(좌석 간 격리): 다른 좌석 1콜이 도는 동안 master 의 통보는 곧바로 시작한다 — 일반 좌석이 둘 진행 중이어도(우선 몫은
+    /// 일반 몫과 따로 · GRR1-1). 일반 좌석 셋째는 기다린다(일반 몫 2). 동결 중에는 아무것도 시작하지 않는다.
     #[test]
     fn master_is_never_queued_behind_other_seats_cycles() {
         let mut j = CycleJobs::default();
@@ -569,18 +605,71 @@ mod tests {
         assert_eq!(admit(&j.jobs, false), vec![w1, w2]);
         running(&mut j, &[w1, w2]);
         let w3 = match j.submit(spec(13, false, 1, None), 2.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
-        assert!(admit(&j.jobs, false).is_empty(), "일반 좌석 셋째가 master·CEO 몫을 썼다");
+        assert!(admit(&j.jobs, false).is_empty(), "일반 좌석 셋째가 우선 좌석 몫을 썼다");
         let m = match j.submit(spec(10, true, 3, Some(20)), 3.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
         assert_eq!(admit(&j.jobs, false), vec![m], "master 가 다른 좌석 1콜 뒤에서 기다린다(V42R-1)");
         assert!(admit(&j.jobs, true).is_empty(), "동결 중 시작");
         running(&mut j, &[m]);
-        assert!(admit(&j.jobs, false).is_empty(), "상한 3 초과");
+        assert!(admit(&j.jobs, false).is_empty(), "일반 몫 2 초과");
         // 끝나면 대기(w3) 가 시작된다.
         j.finish(Done { id: w1, target: 11, requester: 99, fire: None, rc: Some(0), at: 10.0, secs: 10.0, summary: String::new(), delivered: false });
         assert_eq!(admit(&j.jobs, false), vec![w3]);
     }
 
-    /// 대기 순서: master·CEO 먼저 → 차단점까지 여유 작은 순 → 접수 순.
+    /// ★(게이트 수정 2회차 GRR1-1) 우선 좌석(master·CEO·CSO)의 사이클은 **칸 때문에 기다리지 않는다** — 일반 작업 둘이 진행 중이어도
+    /// 우선 좌석 셋이 한꺼번에 들어오면 셋 다 곧바로 시작한다(우선 몫 = 우선 역할 수 · 역할 맵 한 역할 한 좌석 · 좌석당 단일 비행이라
+    /// 이 몫은 정상 상태에서 묶이지 않는다). 일반 셋째는 여전히 기다리고(일반 몫 2 그대로 — 우선 칸을 빌리지 않는다) · 우선 넷째(역할
+    /// 이동 직후처럼 구조 밖)는 봉인에 걸려 기다린다 · 전체 ≤ [`MAX_RUNNING`]. 종전(상한 3 · 우선 칸 1)은 master 가 `--detach` 로 낸 CSO
+    /// 좌석 사이클이 master·CSO 의 워커 작업 둘 뒤에서 188초 기다려, 자동 압축을 끈 200K CSO 가 가장자리 85 에서 차단점 88.5 를 넘고
+    /// 저장 지시가 거부됐다(재검토 드릴 rb-burst-new · 88.8% · 차단점 위 691초 · 영구 무clear). 실패 방향: 붉어지면 clear 집행자·경보
+    /// 수신 좌석(CSO)의 clear 가 다른 좌석 1콜 뒤에서 기다린다(② → ③ 연쇄).
+    #[test]
+    fn priority_seats_never_wait_for_a_slot_behind_general_or_each_other() {
+        let mut j = CycleJobs::default();
+        let w1 = match j.submit(spec(61, false, 18, None), 0.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
+        let w2 = match j.submit(spec(62, false, 20, None), 1.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
+        assert_eq!(admit(&j.jobs, false), vec![w1, w2]);
+        running(&mut j, &[w1, w2]);
+        let w3 = match j.submit(spec(63, false, 1, None), 2.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
+        // 우선 좌석 셋(master · CEO · CSO — CSO 좌석은 master 만 clear 한다) — 한꺼번에 도착.
+        let cso = match j.submit(spec(70, true, 3, None), 3.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
+        let m = match j.submit(spec(71, true, 4, Some(64)), 4.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
+        let ceo = match j.submit(spec(72, true, 5, Some(64)), 5.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
+        assert_eq!(admit(&j.jobs, false), vec![cso, m, ceo], "우선 좌석이 일반 작업 둘 뒤나 다른 우선 좌석 뒤에서 기다린다(GRR1-1)");
+        running(&mut j, &[cso, m, ceo]);
+        let n = j.jobs.iter().filter(|x| matches!(x.state, JobState::Running { .. })).count();
+        assert!(n <= MAX_RUNNING, "전체 상한 {MAX_RUNNING} 초과: {n}");
+        assert!(!admit(&j.jobs, false).contains(&w3), "일반 셋째가 우선 칸을 빌렸다(일반 몫 2 약화)");
+        // 구조 밖 우선 넷째(역할 이동 직후 등) — 우선 몫 봉인에 걸린다(전체 상한 안).
+        let extra = match j.submit(spec(73, true, 1, None), 6.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
+        assert!(admit(&j.jobs, false).is_empty(), "우선 몫({MAX_RUNNING_PRIORITY})을 넘겨 {extra} 를 시작했다");
+        // 우선 하나가 끝나면 넷째가 · 일반 하나가 끝나면 일반 셋째가 시작한다(서로의 칸을 쓰지 않는다).
+        j.finish(Done { id: cso, target: 70, requester: 99, fire: None, rc: Some(0), at: 9.0, secs: 9.0, summary: String::new(), delivered: false });
+        assert_eq!(admit(&j.jobs, false), vec![extra]);
+        running(&mut j, &[extra]);
+        j.finish(Done { id: w1, target: 61, requester: 99, fire: None, rc: Some(0), at: 10.0, secs: 10.0, summary: String::new(), delivered: false });
+        assert_eq!(admit(&j.jobs, false), vec![w3]);
+        // 우선 좌석도 일반 칸을 빌리지 않는다 — 일반이 비어 있어도 구조 밖 우선 넷째는 기다리고, 일반 작업은 제 몫 2 로 곧바로 시작한다
+        // (낡은 우선 작업이 쌓여도 워커 사이클이 굶지 않는다).
+        let mut k = CycleJobs::default();
+        let ps: Vec<u64> = (0..MAX_RUNNING_PRIORITY as u64)
+            .map(|i| match k.submit(spec(80 + i, true, 2, None), i as f64) { Admit::Accepted { job } => job, a => panic!("{a:?}") })
+            .collect();
+        running(&mut k, &ps);
+        let p4 = match k.submit(spec(89, true, 1, None), 9.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
+        let g1 = match k.submit(spec(90, false, 30, None), 10.0) { Admit::Accepted { job } => job, a => panic!("{a:?}") };
+        assert_eq!(admit(&k.jobs, false), vec![g1], "우선 넷째 {p4} 가 일반 칸을 빌렸거나 일반 작업이 우선 작업 뒤에서 기다린다");
+        assert_eq!(MAX_RUNNING, MAX_RUNNING_GENERAL + MAX_RUNNING_PRIORITY);
+        assert_eq!(MAX_RUNNING_GENERAL, 2, "일반 몫(폭주 봉인)이 바뀌었다");
+        assert_eq!(MAX_RUNNING_PRIORITY, CYCLE_PRIORITY_ROLES.len());
+        assert!(CYCLE_PRIORITY_ROLES.contains(&"cso"), "CSO 좌석(master 만 clear)이 우선 칸 밖이다(GRR1-1)");
+        for r in crate::alert_route::CLEAR_SIGNAL_ROLES {
+            assert!(CYCLE_PRIORITY_ROLES.contains(&r), "라우터 clear 신호 좌석 {r} 이 사이클 우선 칸 밖이다");
+        }
+        assert_eq!(crate::alert_route::CLEAR_SIGNAL_ROLES, ["master", "ceo"], "라우터 clear 몫(26 = 2 좌석 × 13)은 그대로여야 한다");
+    }
+
+    /// 대기 순서: 우선 좌석(master·CEO·CSO) 먼저 → 차단점까지 여유 작은 순 → 접수 순.
     #[test]
     fn pending_order_is_priority_then_headroom_then_arrival() {
         let mut j = CycleJobs::default();
@@ -589,7 +678,7 @@ mod tests {
         let c = match j.submit(spec(23, false, 1, None), 2.0) { Admit::Accepted { job } => job, x => panic!("{x:?}") };
         let m = match j.submit(spec(24, true, 9, None), 3.0) { Admit::Accepted { job } => job, x => panic!("{x:?}") };
         assert_eq!([j.position(m), j.position(b), j.position(c), j.position(a)], [1, 2, 3, 4]);
-        assert_eq!(admit(&j.jobs, false), vec![m, b, c], "상한 3 · 일반 2");
+        assert_eq!(admit(&j.jobs, false), vec![m, b, c], "일반 2 · 우선 좌석 먼저");
     }
 
     /// 좌석당 단일 비행 · 자기 실패 뒤 같은 통보 재집행 금지(88 만 다시 받는다) · 대기열 상한.
