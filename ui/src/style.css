@@ -209,7 +209,9 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #wsbar-usage .usage-sum.warn { color: var(--warn); }
-#wsbar-usage .usage-acct { font-weight: 600; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#wsbar-usage .usage-sum.crit { color: var(--error); } /* 0.14.43 headlineSev — 주 계정 창 최고 심각도(오래된 값이면 클래스 없음) */
+#wsbar-usage .usage-acct { display: flex; align-items: baseline; gap: 6px; min-width: 0; font-weight: 600; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#wsbar-usage .usage-acct-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #wsbar-usage .usage-win { display: flex; align-items: baseline; gap: 6px; margin-top: 3px; min-width: 0; }
 #wsbar-usage .usage-win-lab { flex: none; width: 2.2em; color: #8b949e; }
 #wsbar-usage .usage-win-pct { flex: none; font-weight: 600; }
@@ -237,6 +239,12 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 }
 #wsbar-usage .dim { opacity: .55; }
 #wsbar-usage .usage-other.unobs .usage-other-txt { font-style: italic; } /* 관측 전·관측 실패 줄 — 값이 아니라 상태 */
+/* ★0.14.43 '● 사용 중' — 지금 로그인돼 쓰이는 계정(in_use). 강조색은 게이지와 같은 --ok 재사용(새 색 정의 없음). 배지는 이름 옆 flex 항목이라 이름이
+   줄어들며 늘 보이고, 점은 라벨 칸 안의 인라인이라 줄의 말줄임(라벨 칸 max-width 45%)은 그대로다. */
+#wsbar-usage .usage-inuse { flex: none; color: var(--ok); font-weight: 600; font-size: .92em; white-space: nowrap; }
+#wsbar-usage .usage-inuse-dot { color: var(--ok); margin-right: 3px; font-weight: 400; }
+#wsbar-usage .usage-other .usage-other-txt.usage-fold { text-align: left; } /* 잘려 나간 관측 전 계정 나열 — 라벨 목록이라 왼쪽 정렬 */
+#wsbar-usage .usage-hidden { margin-top: 4px; color: #8b949e; overflow-wrap: anywhere; } /* 숨긴 계정 N — 다시 보이게 하는 곳 안내 */
 /* U17 전문가용 칸 — 토글(기본 접힘) + 본문(팀 직접 만들기). 본문은 hidden 으로 접는다. */
 #wsbar-expert { font-size: calc(11px * var(--wsbar-font, 1)); border-top: 1px solid var(--hairline); padding-top: 2px; }
 #btn-expert-toggle .expert-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -979,6 +987,11 @@ body.cc-office #cc-view-office { flex: 1; min-height: 0; }
 .cc-acct-badges { display: flex; flex-wrap: wrap; gap: 4px; flex: none; }
 .cc-acct-badge { font-size: 10px; padding: 1px 7px; border-radius: 8px; background: rgba(100,116,139,.18); color: #94a3b8; }
 .cc-acct-badge.warn { background: rgba(245,158,11,.16); color: #f59e0b; }
+/* ★0.14.43 계정 행 — '● 사용 중' 배지(.on · 게이지와 같은 초록) · 오래된 관측(30분 초과·스냅샷)·숨긴 계정은 행 전체 흐림 · 숨기기/보이기 단추 */
+.cc-acct-badge.on { background: rgba(34,197,94,.16); color: #22c55e; }
+.cc-acct-row.dim { opacity: .55; }
+.cc-acct-hide { flex: none; margin-left: auto; font-size: 10px; padding: 1px 8px; border-radius: 8px; border: 1px solid rgba(148,163,184,.3); background: none; color: #94a3b8; cursor: pointer; }
+.cc-acct-hide:hover { color: #e2e8f0; border-color: rgba(226,232,240,.5); }
 #btn-cc-acct-redact { background: none; border: none; cursor: pointer; font-size: 12px; opacity: .5; padding: 0 4px; }
 #btn-cc-acct-redact.active { opacity: 1; }
 

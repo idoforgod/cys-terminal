@@ -236,3 +236,190 @@ describe("새 순수 모듈 — 구형 WKWebView 파싱 실패·최상위 부수
     });
   }
 });
+
+// ═════════ 0.14.43 (티켓 UI1) — 별명·'● 사용 중'·숨기기·접힘 줄·KPI 후보 배선 핀 ═════════
+// 순수 판정(별명 라벨·주 계정 선정·오래됨·제공자 요약·숨김 제외·KPI 후보)은 usagebar.test.ts 가 표로 잡는다 — 여기는 main.ts·style.css 가
+// 그 모델을 **어떻게 옮기는가**(textContent 만 · 저장소는 main.ts 만·try/catch 안 · CC 의 ccEsc · 위임 리스너)를 기계로 못박는다.
+describe("0.14.43 UI1 — 사이드바 본문 배선(모델의 가산 필드를 화면으로)", () => {
+  const body = () => fnBody("renderUsageBar");
+  it("모델의 가산 필드를 전부 쓴다(쓰지 않으면 데몬·모델이 만든 표식이 화면에서 조용히 사라진다)", () => {
+    const b = body();
+    for (const needle of ["p.inUse", "o.inUse", "headlineSev", "headlineTitle", "unobservedFold", "moreTooltip", "hiddenCount"])
+      expect({ 필드: needle, 사용: b.includes(needle) }).toEqual({ 필드: needle, 사용: true });
+  });
+  it("접힘 줄 '관측 없음 ${' 을 재도입하지 않는다 · 줄은 o.unobserved 를 반영한다(관측 전 계정 한 줄씩)", () => {
+    const b = body();
+    expect(code.includes("관측 없음 ${")).toBe(false);
+    expect(b.includes("관측 없음")).toBe(false);
+    expect(/"usage-other" \+ \(o\.dim[^;]*o\.unobserved/.test(b)).toBe(true);
+  });
+  it("'● 사용 중' 배지(.usage-inuse)·점(.usage-inuse-dot)은 textContent 로 · 같은 툴팁 · innerHTML 금지", () => {
+    const b = body();
+    expect(b.includes("innerHTML")).toBe(false);
+    expect(b.includes('inUseMark("usage-inuse", "● 사용 중")')).toBe(true);
+    expect(b.includes('inUseMark("usage-inuse-dot", "●")')).toBe(true);
+    expect(code.includes('const USAGE_INUSE_TIP = "지금 로그인돼 쓰이고 있는 계정";')).toBe(true);
+    const mark = b.slice(b.indexOf("const inUseMark ="), b.indexOf("const p = model.primary;"));
+    for (const needle of ["s.className = cls;", "s.textContent = text;", "s.title = USAGE_INUSE_TIP;"])
+      expect({ 구현: needle, 있음: mark.includes(needle) }).toEqual({ 구현: needle, 있음: true });
+  });
+  it("배지는 주 계정(p.inUse)에서만 · 점은 다른 줄(o.inUse)에서만 — 서로 바뀌지 않는다", () => {
+    const b = body();
+    expect(/if \(p\.inUse\) acctRow\.appendChild\(inUseMark\("usage-inuse", /.test(b)).toBe(true);
+    expect(/if \(o\.inUse\) lab\.appendChild\(inUseMark\("usage-inuse-dot", /.test(b)).toBe(true);
+  });
+  it("잘려 나간 관측 전 접힘 줄(.usage-other.unobs.dim · title = tooltip)이 '외 N개' 줄 앞에 · 그 줄에는 title = moreTooltip", () => {
+    const b = body();
+    const fold = b.indexOf("if (model.unobservedFold) {");
+    const more = b.indexOf('el("usage-more"');
+    expect({ 접힘줄: fold >= 0, 외N개: more >= 0, 접힘줄이_앞: fold >= 0 && fold < more }).toEqual({ 접힘줄: true, 외N개: true, 접힘줄이_앞: true });
+    expect(b.slice(fold, more).includes('el("usage-other unobs dim", "", model.unobservedFold.tooltip)')).toBe(true);
+    expect(b.slice(more, b.indexOf(");", more)).includes("model.moreTooltip")).toBe(true);
+    // 접힘 줄만 있어도(관측 줄이 상한 안) 줄 묶음 상자가 만들어진다
+    expect(b.includes("if (model.others.length || model.moreCount || model.unobservedFold) {")).toBe(true);
+  });
+  it("숨김 안내(.usage-hidden)는 hiddenCount > 0 일 때만 · 본문 맨 끝(꼬리 경고 뒤)", () => {
+    const b = body();
+    const foot = b.indexOf('el("usage-foot"');
+    const hid = b.indexOf('el("usage-hidden"');
+    const rep = b.indexOf("body.replaceChildren(");
+    expect({ 순서: foot >= 0 && foot < hid && hid < rep }).toEqual({ 순서: true });
+    expect(b.slice(b.lastIndexOf("if (", hid), hid).includes("model.hiddenCount > 0")).toBe(true);
+    expect(b.slice(hid, b.indexOf(");", hid)).includes("Control Center > Live 에서 다시 보이기")).toBe(true);
+  });
+  it("요약 줄: headlineSev 로 warn/crit 토글(응답 없음 경고와 같은 칸 · crit 가 이김) · headlineTitle 로 title 설정/제거", () => {
+    const b = body();
+    expect(b.includes('sumEl.classList.toggle("warn", !!model.footer || model.headlineSev === "warn");')).toBe(true);
+    expect(b.includes('sumEl.classList.toggle("crit", model.headlineSev === "crit");')).toBe(true);
+    expect(b.includes("sumEl.title = model.headlineTitle")).toBe(true);
+    expect(b.includes('sumEl.removeAttribute("title")')).toBe(true);
+  });
+  it("모델 호출의 마지막 인자가 뷰어별 숨김 목록(usageHidden) — 🔒 가림 인자 뒤", () => {
+    const b = body();
+    const call = b.slice(b.indexOf("buildUsageBarModel("), b.indexOf(");", b.indexOf("ccAcctLabel,")) + 2);
+    expect(call.indexOf("ccAcctLabel,") < call.indexOf("ccAcctRedact,") && call.indexOf("ccAcctRedact,") < call.indexOf("usageHidden,")).toBe(true);
+  });
+  it("🔒 가림 함수 ccHash6 는 usagebar.test.ts 의 겹침 꼬리표 대조용 사본과 같은 알고리즘(두 화면의 #hash6 가 같다)", () => {
+    const b = fnBody("ccHash6");
+    for (const needle of ["let h = 5381;", "h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;", 'h.toString(16).padStart(8, "0").slice(0, 6)'])
+      expect({ 알고리즘: needle, 있음: b.includes(needle) }).toEqual({ 알고리즘: needle, 있음: true });
+  });
+});
+
+describe("0.14.43 UI1 — 숨김 저장소(main.ts 만 · try/catch 안 · 값 검증은 순수 함수)", () => {
+  it("키는 cys-usage-hidden · JSON 문자열 배열로 저장", () => {
+    expect(code.includes('const USAGE_HIDDEN_KEY = "cys-usage-hidden";')).toBe(true);
+    expect(code.includes("JSON.stringify([...usageHidden])")).toBe(true);
+  });
+  it("저장소 접근은 정확히 읽기 1곳·쓰기 1곳이고 둘 다 try 안 — 차단·깨진 JSON 이어도 패널은 숨김 없음으로 정상", () => {
+    expect(code.split("localStorage.getItem(USAGE_HIDDEN_KEY").length - 1).toBe(1);
+    expect(code.split("localStorage.setItem(USAGE_HIDDEN_KEY").length - 1).toBe(1);
+    expect(/\ntry \{\n\s*usageHidden = sanitizeHiddenKeys\(JSON\.parse\(localStorage\.getItem\(USAGE_HIDDEN_KEY\) \|\| "\[\]"\)\);\n\} catch/.test(code)).toBe(true);
+    expect(/\n\s*try \{\n\s*localStorage\.setItem\(USAGE_HIDDEN_KEY, JSON\.stringify\(\[\.\.\.usageHidden\]\)\);\n\s*\} catch/.test(code)).toBe(true);
+  });
+  it("값 검증(배열·문자열·최대 개수)은 순수 함수 sanitizeHiddenKeys — 읽은 값을 그대로 쓰지 않는다", () => {
+    expect(code.includes("sanitizeHiddenKeys(JSON.parse(")).toBe(true);
+    expect(fnBody("toggleUsageAcctHidden")).toContain("USAGE_HIDDEN_MAX");
+  });
+  it("usageHidden 선언은 첫 최상위 renderUsageBar() 호출보다 앞(TDZ 면 renderUsageBar 가 catch 로 삼켜 패널이 빈 채로 남는다)", () => {
+    const decl = code.indexOf("let usageHidden:");
+    const firstTop = code.indexOf("\nrenderUsageBar();");
+    expect({ 선언: decl >= 0, 선언이_먼저: decl >= 0 && decl < firstTop }).toEqual({ 선언: true, 선언이_먼저: true });
+  });
+  it("usagebar.ts 에는 저장소 접근 표면이 0 — 숨김 목록은 main.ts 가 읽어 인자로 넘긴다", () => {
+    expect(read("./usagebar.ts").includes("localStorage")).toBe(false); // 주석 포함 원문 기준(티켓 문면: `localStorage` 문자열 0)
+    const m = stripComments(read("./usagebar.ts").replace(/\/\*[\s\S]*?\*\//g, ""));
+    for (const bad of ["localStorage", "sessionStorage", "indexedDB", "document.", "window."])
+      expect({ 표면: bad, 있음: m.includes(bad) }).toEqual({ 표면: bad, 있음: false });
+  });
+});
+
+describe("0.14.43 UI1 — Control Center Live 계정 섹션·KPI 배선", () => {
+  it("KPI 후보는 순수 함수 kpiCandidates 로 거른다(숨김 목록 포함) — 계정을 직접 순회해 최댓값을 고르지 않는다", () => {
+    const b = fnBody("ccAcctMax");
+    expect(b.includes("for (const a of kpiCandidates(ccAccounts, label, Date.now() / 1000, usageHidden)) {")).toBe(true);
+    expect(/of ccAccounts\b/.test(b)).toBe(false);
+  });
+  it("후보가 없으면 null — renderLiveBody 는 null 을 종전 '없음' 경로(ccAggRate 폴백 → 0%)로 그린다(경로 불변 핀)", () => {
+    const b = fnBody("renderLiveBody");
+    expect(b.includes("const used = m ? Math.round(m.used) : w ? Math.round(w.used) : 0;")).toBe(true);
+    expect(b.includes("const sub = m ? ccAcctLabel(m.acct) : w ? ccReset(lab, w.reset) : \"\";")).toBe(true);
+  });
+  it("행 라벨 — 별명이 있으면 `별명 (이메일/해시)` · 둘 다 ccEsc · 이메일은 기존 ccAcctLabel 가림을 거친다", () => {
+    const b = fnBody("renderAccounts");
+    expect(b.includes("const who = ccEsc(ccAcctLabel(String(a.label ?? a.account_id ?? \"?\")));")).toBe(true);
+    expect(b.includes("const alias = acctAlias(a);")).toBe(true);
+    expect(b.includes("alias ? `${ccEsc(alias)} (${who})` : who")).toBe(true);
+  });
+  it("배지 문구 — '● 사용 중' · '이전 로그인' · '오래됨' · '관측 전'(종전 '관측 없음' 폐기 · 사이드바·설명서와 통일)", () => {
+    const b = fnBody("renderAccounts");
+    for (const needle of ["● 사용 중", "이전 로그인", ">오래됨<", ">관측 전<", "a.in_use === true", "isPreviousLogin(a)", "isOldObservation(a, nowSec)"])
+      expect({ 문구: needle, 있음: b.includes(needle) }).toEqual({ 문구: needle, 있음: true });
+    expect(b.includes(">관측 없음<")).toBe(false);
+    expect(code.includes('<span class="cc-acct-badge">관측 없음</span>')).toBe(false);
+    // 종전 'N분 전 관측' 배지는 유지
+    expect(b.includes("분 전 관측")).toBe(true);
+  });
+  it("게이지는 windowView 규칙(리셋 지남 → 폭 0·'리셋됨'·경고색 없음) — 종전 sevClass(used, 70, 90) 직접 판정을 쓰지 않는다", () => {
+    const b = fnBody("renderAccounts");
+    expect(b.includes("windowView(a, lab, nowSec)")).toBe(true);
+    expect(b.includes('v.state === "ok" ?')).toBe(true);
+    expect(b.includes("sevClass(")).toBe(false);
+    expect(b.includes("ccEsc(v.text)") && b.includes("ccEsc(v.resetText)")).toBe(true);
+  });
+  it("행 흐림 — 오래된 관측(30분 초과·스냅샷)·숨긴 계정 → .dim", () => {
+    const b = fnBody("renderAccounts");
+    expect(b.includes('class="cc-acct-row${old || hiddenNow ? " dim" : ""}"')).toBe(true);
+  });
+  it("숨기기/보이기 단추(.cc-acct-hide · data-acct-key) — 키는 ccEsc · 문구는 숨김 상태에 따라", () => {
+    const b = fnBody("renderAccounts");
+    expect(b.includes('class="cc-acct-hide" data-acct-key="${ccEsc(key)}"')).toBe(true);
+    expect(b.includes('hiddenNow ? "보이기" : "숨기기"')).toBe(true);
+    expect(b.includes("const key = acctKey(a);")).toBe(true);
+  });
+  it("클릭은 호스트 하나에 위임(행은 5초마다 innerHTML 로 다시 그려진다) — 저장소 갱신 뒤 사이드바·CC 를 다시 그린다", () => {
+    expect(fnBody("renderAccounts").includes("addEventListener")).toBe(false); // 행마다 리스너를 달지 않는다
+    const i = code.indexOf('ccAcctHost.addEventListener("click"');
+    expect(i).toBeGreaterThan(0);
+    const h = code.slice(i, code.indexOf("\n  });", i));
+    for (const needle of ['.closest(".cc-acct-hide")', 'getAttribute("data-acct-key")', "toggleUsageAcctHidden(key);", "renderAccounts();", "renderUsageBar();", "void refreshControlCenter();"])
+      expect({ 핸들러: needle, 있음: h.includes(needle) }).toEqual({ 핸들러: needle, 있음: true });
+    expect(h.includes("refreshAccountsShared")).toBe(false); // 조회 호출 지점 핀(사이드바 틱·CC 두 곳뿐)을 건드리지 않는다
+  });
+  it("renderAccounts 의 데이터 보간은 ccEsc — 별명·이메일·키·source_error·plan 은 로컬 파일·IPC 에서 온다", () => {
+    const b = fnBody("renderAccounts");
+    for (const needle of ["ccEsc(alias)", "ccEsc(ccAcctLabel(", "ccEsc(key)", "ccEsc(a.source_error)", "ccEsc(String(a.plan))", "ccEsc(String(a.provider ?? \"?\"))"])
+      expect({ 이스케이프: needle, 있음: b.includes(needle) }).toEqual({ 이스케이프: needle, 있음: true });
+  });
+});
+
+describe("0.14.43 UI1 — style.css(기존 강조색 재사용 · 사이드바 줄 말줄임 보존)", () => {
+  const flat = css.replace(/\s+/g, " ");
+  const rule = (sel: string): string => {
+    const i = flat.indexOf(`${sel} {`);
+    expect({ 규칙: sel, 존재: i >= 0 }).toEqual({ 규칙: sel, 존재: true });
+    return flat.slice(i, flat.indexOf("}", i) + 1);
+  };
+  it("새 규칙이 모두 있다(.usage-inuse · .usage-inuse-dot · .usage-hidden · .usage-sum.crit · .cc-acct-row.dim · .cc-acct-hide)", () => {
+    for (const sel of ["#wsbar-usage .usage-inuse", "#wsbar-usage .usage-inuse-dot", "#wsbar-usage .usage-hidden", "#wsbar-usage .usage-sum.crit", ".cc-acct-row.dim", ".cc-acct-hide"]) rule(sel);
+  });
+  it("사용 중 배지·점의 색은 기존 --ok 재사용(새 색 정의 없음) · 크롬 표면이라 --canvas-text 금지", () => {
+    expect(rule("#wsbar-usage .usage-inuse")).toContain("var(--ok)");
+    expect(rule("#wsbar-usage .usage-inuse-dot")).toContain("var(--ok)");
+    expect(/#[0-9a-fA-F]{3,6}\b/.test(rule("#wsbar-usage .usage-inuse") + rule("#wsbar-usage .usage-inuse-dot"))).toBe(false);
+    for (const sel of ["#wsbar-usage .usage-inuse", "#wsbar-usage .usage-inuse-dot", "#wsbar-usage .usage-hidden"]) expect(rule(sel).includes("--canvas-text")).toBe(false);
+  });
+  it("사이드바 줄의 말줄임을 깨지 않는다 — 라벨 칸 max-width 45% · 이름은 줄어들고(말줄임) 배지는 flex:none", () => {
+    const lab = rule("#wsbar-usage .usage-other-lab");
+    for (const decl of ["flex: none", "max-width: 45%", "text-overflow: ellipsis", "overflow: hidden"]) expect({ 선언: decl, 있음: lab.includes(decl) }).toEqual({ 선언: decl, 있음: true });
+    expect(rule("#wsbar-usage .usage-acct-name")).toContain("text-overflow: ellipsis");
+    expect(rule("#wsbar-usage .usage-inuse")).toContain("flex: none");
+  });
+  it("요약 줄 crit 는 warn 규칙 뒤에(같은 특이도 — 응답 없음 warn 과 겹쳐도 crit 가 이긴다)", () => {
+    expect(flat.indexOf("#wsbar-usage .usage-sum.crit {")).toBeGreaterThan(flat.indexOf("#wsbar-usage .usage-sum.warn {"));
+  });
+  it("흐린 행은 opacity 로(오래된 관측·숨긴 계정) · 단추는 flex:none", () => {
+    expect(rule(".cc-acct-row.dim")).toContain("opacity:");
+    expect(rule(".cc-acct-hide")).toContain("flex: none");
+  });
+});

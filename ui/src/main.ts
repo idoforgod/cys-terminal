@@ -137,7 +137,18 @@ import {
 } from "./seatsig";
 import { makeAlertsTracker, readAlerts, makeFeedSwitchScheduler, type AlertsView } from "./probefail";
 import { clampWsbarWidth, clampWsbarFont, WSBAR_W_DEFAULT, WSBAR_FONT_STEP } from "./wsbar";
-import { buildUsageBarModel, shouldFetchAccounts } from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정)
+import {
+  buildUsageBarModel,
+  shouldFetchAccounts,
+  windowView,
+  acctAlias,
+  acctKey,
+  isOldObservation,
+  isPreviousLogin,
+  kpiCandidates,
+  sanitizeHiddenKeys,
+  USAGE_HIDDEN_MAX,
+} from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
@@ -468,6 +479,26 @@ let ccSessionSelected: string | null = null;
 let ccAccounts: any[] = [];
 // 계정 라벨(이메일) 가림 토글 — 스크린샷 공유용. 결정론 해시 6자로 치환.
 let ccAcctRedact = localStorage.getItem("cys-cc-acct-redact") === "1";
+// ★0.14.43 뷰어별 숨김 계정(키 = provider:account_id) — 사이드바 사용량 패널과 Control Center Live(KPI·계정 표)가 공유한다. 저장소는 main.ts 만
+// 만진다(usagebar.ts 는 순수 — 값 검증 sanitizeHiddenKeys 만 거기 있다). 읽기·쓰기 전부 try/catch — 저장소 차단·깨진 JSON 이어도 패널은 숨김 없음으로 정상.
+const USAGE_HIDDEN_KEY = "cys-usage-hidden";
+let usageHidden: Set<string> = new Set();
+try {
+  usageHidden = sanitizeHiddenKeys(JSON.parse(localStorage.getItem(USAGE_HIDDEN_KEY) || "[]"));
+} catch {
+  /* 저장소 차단·깨진 JSON — 숨김 없음으로 시작 */
+}
+/** 계정 하나의 숨김을 뒤집고 저장한다(최대 USAGE_HIDDEN_MAX). 저장이 막혀도 이번 실행 동안은 유지된다. */
+function toggleUsageAcctHidden(key: string): void {
+  if (!key) return;
+  if (usageHidden.has(key)) usageHidden.delete(key);
+  else if (usageHidden.size < USAGE_HIDDEN_MAX) usageHidden.add(key);
+  try {
+    localStorage.setItem(USAGE_HIDDEN_KEY, JSON.stringify([...usageHidden]));
+  } catch {
+    /* 저장소 차단 — 이번 실행 동안만 유지 */
+  }
+}
 // 스킬 보드 카탈로그 캐시 + 검색어 — 검색은 재fetch 없이 renderBoardDomains 재렌더(깜빡임 방지).
 let ccBoardCatalog: any = { domains: [], actions: [] };
 let ccBoardSearch = "";
@@ -547,9 +578,12 @@ function ccHash6(s: string): string {
 }
 const ccAcctLabel = (label: string): string => (ccAcctRedact ? `#${ccHash6(label)}` : label);
 // 지정 rate 라벨(5h/7d)에서 사용률 최고 계정 — Live KPI/게이지의 "최고 사용 계정 기준" 값.
+// ★0.14.43: 후보를 제한한다(kpiCandidates — usagebar.ts 순수 판정): 숨기지 않았고 ∧ 리셋 안 지났고 ∧ (사용 중 ∨ 관측 나이 ≤ 30분 ∧ 스냅샷 아님).
+//   옛 계정의 지난 100% 가 KPI 를 빨갛게 만들지 않게 한다. 후보가 없으면 null — renderLiveBody 가 종전 '없음' 경로를 탄다
+//   (계정 병합 값이 없을 때와 같다: ccAggRate 의 전 노드 최대값 폴백 → 그것도 없으면 0%·빈 부제).
 function ccAcctMax(label: string): { used: number; reset: number | null; acct: string } | null {
   let best: { used: number; reset: number | null; acct: string } | null = null;
-  for (const a of ccAccounts) {
+  for (const a of kpiCandidates(ccAccounts, label, Date.now() / 1000, usageHidden)) {
     for (const r of a.rate ?? []) {
       if (r.label !== label) continue;
       const used = Number(r.used_pct);
@@ -562,6 +596,8 @@ function ccAcctMax(label: string): { used: number; reset: number | null; acct: s
 }
 
 // 계정 Rate Limit 섹션 — 전 조직 병합 계정을 provider·라벨·plan·5h/7d 게이지·리셋·관측 뱃지로 렌더.
+// ★0.14.43: 별명(alias)·'● 사용 중'·'이전 로그인'·'오래됨' 배지 · 게이지는 사이드바와 같은 windowView 규칙(리셋 지남 → 폭 0·'리셋됨'·경고색 없음) ·
+//   오래된 관측(30분 초과·스냅샷)과 숨긴 계정은 흐리게 · 행마다 숨기기/보이기 단추(뷰어별 — 사이드바와 같은 저장소 · 클릭은 호스트 위임 리스너).
 function renderAccounts() {
   const host = document.getElementById("cc-accounts");
   if (!host) return;
@@ -569,31 +605,42 @@ function renderAccounts() {
     host.innerHTML = `<div class="cc-empty">관측된 계정 없음</div>`;
     return;
   }
+  const nowSec = Date.now() / 1000;
   host.innerHTML = ccAccounts
     .map((a) => {
       const prov = ccEsc(String(a.provider ?? "?"));
-      const label = ccEsc(ccAcctLabel(String(a.label ?? a.account_id ?? "?")));
+      const who = ccEsc(ccAcctLabel(String(a.label ?? a.account_id ?? "?"))); // 이메일(🔒 가림 거침) 또는 account_id
+      const alias = acctAlias(a);
+      const label = alias ? `${ccEsc(alias)} (${who})` : who; // 별명이 있으면 `별명 (이메일/해시)`
+      const key = acctKey(a);
+      const hiddenNow = usageHidden.has(key);
+      const old = isOldObservation(a, nowSec);
       const plan = a.plan ? `<span class="cc-acct-plan">${ccEsc(String(a.plan))}</span>` : "";
-      // 게이지 — rate limit 임계(70/90)로 sevClass. cc-tbar 재사용.
+      // 게이지 — windowView 규칙(사이드바와 같다): 리셋 지남 → 폭 0·'리셋됨'·경고색 없음 · 값 없음 → '—' · 임계 70/90 은 windowView 가 판정. cc-tbar 재사용.
       const gauges = ["5h", "7d"]
         .map((lab) => {
-          const r = (a.rate ?? []).find((x: any) => x.label === lab);
-          const used = r ? Math.round(Number(r.used_pct)) : 0;
-          const reset = r && r.resets_at != null ? ccReset(lab, r.resets_at) : "";
-          const fill = r ? `<span class="cc-tbar-fill ${sevClass(used, 70, 90)}" style="width:${Math.min(100, used)}%"></span>` : "";
-          return `<div class="cc-tbar"><span class="cc-tbar-lab">${lab}</span><span class="cc-tbar-track">${fill}</span><span class="cc-tbar-pct">${r ? used + "%" : "—"}</span><span class="cc-tbar-reset">${reset}</span></div>`;
+          const v = windowView(a, lab, nowSec);
+          const fill = v.state === "ok" ? `<span class="cc-tbar-fill ${v.sev}" style="width:${v.pct ?? 0}%"></span>` : "";
+          return `<div class="cc-tbar"><span class="cc-tbar-lab">${lab}</span><span class="cc-tbar-track">${fill}</span><span class="cc-tbar-pct">${ccEsc(v.text)}</span><span class="cc-tbar-reset">${ccEsc(v.resetText)}</span></div>`;
         })
         .join("");
       const badges: string[] = [];
-      if (a.updated_at == null) badges.push(`<span class="cc-acct-badge">관측 없음</span>`);
-      // 0.14.42: 관측 경로 고장(예: agy_http_401)은 '관측 없음'과 구별해 코드째 보인다(사이드바와 같은 source_error).
+      if (a.in_use === true) badges.push(`<span class="cc-acct-badge on">● 사용 중</span>`);
+      if (isPreviousLogin(a)) badges.push(`<span class="cc-acct-badge">이전 로그인</span>`); // claude · current_profiles 가 빈 배열
+      if (a.updated_at == null) badges.push(`<span class="cc-acct-badge">관측 전</span>`);
+      // 0.14.42: 관측 경로 고장(예: agy_http_401)은 '관측 전'과 구별해 코드째 보인다(사이드바와 같은 source_error).
       if (typeof a.source_error === "string" && a.source_error)
         badges.push(`<span class="cc-acct-badge warn">관측 실패 ${ccEsc(a.source_error)}</span>`);
       if (a.adapter === false) badges.push(`<span class="cc-acct-badge">관측 어댑터 없음</span>`);
+      if (old) badges.push(`<span class="cc-acct-badge">오래됨</span>`); // 관측 나이 > 30분 또는 스냅샷 — 행 전체도 흐리게
       const stale = Number(a.stale_secs);
       if (Number.isFinite(stale) && stale > 120) badges.push(`<span class="cc-acct-badge">${Math.round(stale / 60)}분 전 관측</span>`);
       if (a.exhaust_at != null) badges.push(`<span class="cc-acct-badge warn">이 속도면 ${ccHHMM(Number(a.exhaust_at))} 소진</span>`);
-      return `<div class="cc-acct-row"><span class="cc-acct-prov">[${prov}]</span><span class="cc-acct-label">${label}</span>${plan}<div class="cc-acct-gauges">${gauges}</div><span class="cc-acct-badges">${badges.join("")}</span></div>`;
+      const hideTip = hiddenNow
+        ? "사이드바 사용량 패널과 위 KPI 에 이 계정을 다시 넣습니다"
+        : "사이드바 사용량 패널과 위 KPI 에서 이 계정을 뺍니다(이 표에는 흐리게 남습니다)";
+      const hideBtn = `<button type="button" class="cc-acct-hide" data-acct-key="${ccEsc(key)}" title="${hideTip}">${hiddenNow ? "보이기" : "숨기기"}</button>`;
+      return `<div class="cc-acct-row${old || hiddenNow ? " dim" : ""}"><span class="cc-acct-prov">[${prov}]</span><span class="cc-acct-label">${label}</span>${plan}<div class="cc-acct-gauges">${gauges}</div><span class="cc-acct-badges">${badges.join("")}</span>${hideBtn}</div>`;
     })
     .join("");
 }
@@ -4164,6 +4211,7 @@ let acctFailStreak = 0;
 // (이메일·집계 범위)이 사라진다. 모델에는 '관측 N분 전'·리셋 지남이 들어 있어 값이 바뀌면 그대로 다시 그린다.
 let usageBodySig = "";
 const USAGE_COLLAPSED_KEY = "cys-wsbar-usage-collapsed"; // 뷰어별 편의 설정(접힘) — 저장 실패는 무시
+const USAGE_INUSE_TIP = "지금 로그인돼 쓰이고 있는 계정"; // '● 사용 중' 배지·점 공용 툴팁(0.14.43)
 let usageCollapsed = false;
 try {
   usageCollapsed = localStorage.getItem(USAGE_COLLAPSED_KEY) === "1";
@@ -4246,8 +4294,9 @@ function renderUsageBar(): void {
       ccAccounts,
       Date.now() / 1000,
       { everOk: acctOkAtMs !== null, failStreak: acctFailStreak, okAtSec: acctOkAtMs === null ? null : acctOkAtMs / 1000 },
-      ccAcctLabel, // 🔒 가림(CC 와 같은 키 cys-cc-acct-redact) — 이메일은 툴팁에만 나온다
+      ccAcctLabel, // 🔒 가림(CC 와 같은 키 cys-cc-acct-redact) — 이메일은 툴팁과 겹침 꼬리표에만 나온다(꼬리표도 이 가림을 거친다)
       ccAcctRedact, // 🔒 가림이면 툴팁의 설정 폴더도 끝 이름만(윈도우 절대경로의 OS 사용자명 — 리뷰1 M9)
+      usageHidden, // ★0.14.43 뷰어별 숨김 계정 — 후보·줄·요약에서 뺀다(저장소는 main.ts 만 읽는다)
     );
     // 머리줄은 값이 바뀔 때만 건드린다(같은 값 재대입도 호버 중인 요소의 텍스트 노드를 갈아 끼운다).
     const setText = (el: HTMLElement, t: string) => {
@@ -4260,7 +4309,13 @@ function renderUsageBar(): void {
     const sumEl = head.querySelector(".usage-sum") as HTMLElement;
     // 조회 연속 실패면 요약 줄에도 표시한다(접힌 채로도 보이게) — 첫 조회 전 실패는 headline 자체가 "응답 없음"이다.
     setText(sumEl, model.footer && model.headline !== "응답 없음" ? `${model.headline} · 응답 없음` : model.headline);
-    sumEl.classList.toggle("warn", !!model.footer);
+    // ★0.14.43: 요약 줄 색 = 주 계정 창들의 최고 심각도(headlineSev — 오래된 값이면 ""). 응답 없음 경고(warn)와 같은 칸을 쓰되 crit 가 이긴다.
+    sumEl.classList.toggle("warn", !!model.footer || model.headlineSev === "warn");
+    sumEl.classList.toggle("crit", model.headlineSev === "crit");
+    // 제공자별 약식(`C 5h12%·7d30% │ X 7d50%`)이면 풀이를 툴팁으로 — 없으면 title 제거(머리 단추 자체의 title 이 보이게).
+    if (model.headlineTitle) {
+      if (sumEl.title !== model.headlineTitle) sumEl.title = model.headlineTitle;
+    } else if (sumEl.hasAttribute("title")) sumEl.removeAttribute("title");
     host.classList.toggle("collapsed", usageCollapsed);
     body.hidden = usageCollapsed;
     const sig = JSON.stringify(model);
@@ -4273,10 +4328,25 @@ function renderUsageBar(): void {
       if (title) d.title = title;
       return d;
     };
+    // '사용 중' 표식(0.14.43) — 주 계정은 배지(`● 사용 중`), 다른 줄은 라벨 앞 점(`●`). 둘 다 textContent·같은 툴팁.
+    const inUseMark = (cls: string, text: string): HTMLElement => {
+      const s = document.createElement("span");
+      s.className = cls;
+      s.textContent = text;
+      s.title = USAGE_INUSE_TIP;
+      return s;
+    };
     const p = model.primary;
     if (p) {
       const box = el("usage-primary" + (p.fresh.level === "stale" ? " dim" : ""), "", p.tooltip);
-      box.appendChild(el("usage-acct", p.label));
+      // 계정 이름 옆 '● 사용 중' 배지(in_use === true 일 때만). 이름은 줄어들고(말줄임) 배지는 늘 보인다.
+      const acctRow = el("usage-acct", "");
+      const acctName = document.createElement("span");
+      acctName.className = "usage-acct-name";
+      acctName.textContent = p.label;
+      acctRow.appendChild(acctName);
+      if (p.inUse) acctRow.appendChild(inUseMark("usage-inuse", "● 사용 중"));
+      box.appendChild(acctRow);
       for (const w of p.windows) {
         const row = el("usage-win", "");
         const lab = document.createElement("span");
@@ -4302,24 +4372,37 @@ function renderUsageBar(): void {
       kids.push(box);
     }
     if (model.message) kids.push(el("usage-msg", model.message));
-    if (model.others.length || model.moreCount) {
+    if (model.others.length || model.moreCount || model.unobservedFold) {
       const box = el("usage-others", "");
       for (const o of model.others) {
         // 관측 전 계정도 한 줄씩(0.14.42 — 개수로 접지 않는다). 값 대신 "관측 전·관측 실패 · 사유".
         const row = el("usage-other" + (o.dim ? " dim" : "") + (o.unobserved ? " unobs" : ""), "", o.tooltip);
         const lab = document.createElement("span");
         lab.className = "usage-other-lab";
-        lab.textContent = o.label;
+        if (o.inUse) lab.appendChild(inUseMark("usage-inuse-dot", "●")); // ★0.14.43 사용 중인 계정 — 라벨 앞 점
+        lab.appendChild(document.createTextNode(o.label));
         const txt = document.createElement("span");
         txt.className = "usage-other-txt";
         txt.textContent = o.text;
         row.append(lab, txt);
         box.appendChild(row);
       }
-      if (model.moreCount) box.appendChild(el("usage-more", `외 ${model.moreCount}개 — Control Center > Live`));
+      // ★0.14.43 줄 상한에 잘려 나간 관측 전 계정 — 개수로만 사라지지 않게 라벨을 나열한 접힘 줄(툴팁 = 전체 나열). '외 N개' 줄 앞.
+      if (model.unobservedFold) {
+        const row = el("usage-other unobs dim", "", model.unobservedFold.tooltip);
+        const txt = document.createElement("span");
+        txt.className = "usage-other-txt usage-fold";
+        txt.textContent = model.unobservedFold.text;
+        row.appendChild(txt);
+        box.appendChild(row);
+      }
+      // 잘려 나간 **관측 줄** 수 — 툴팁에 그 라벨들(관측 전 계정은 위 접힘 줄이 맡는다).
+      if (model.moreCount) box.appendChild(el("usage-more", `외 ${model.moreCount}개 — Control Center > Live`, model.moreTooltip));
       kids.push(box);
     }
     if (model.footer) kids.push(el("usage-foot", model.footer));
+    // ★0.14.43 숨긴 계정이 있으면 본문 끝에 한 줄 — 다시 보이게 하는 곳(Control Center > Live 계정 표의 '보이기')을 알린다.
+    if (model.hiddenCount > 0) kids.push(el("usage-hidden", `숨김 ${model.hiddenCount}계정 — Control Center > Live 에서 다시 보이기`));
     body.replaceChildren(...kids);
     usageBodySig = sig; // 다 그린 뒤에만 기록 — 중간에 던지면 다음 호출이 다시 그린다
   } catch {
@@ -9475,6 +9558,19 @@ acctRedactBtn.addEventListener("click", (e) => {
   refreshControlCenter();
   renderUsageBar(); // U1: 사이드바 사용량 패널 툴팁의 이메일도 같은 가림을 따른다
 });
+// ★0.14.43 계정 숨기기/보이기 — 행은 5초마다 innerHTML 로 다시 그려지므로 리스너는 호스트 하나에 위임한다. 숨김은 뷰어별(localStorage ·
+// 사이드바와 같은 키). 단추 문구·흐림과 사이드바는 바로 다시 그리고, KPI·토큰 막대는 refreshControlCenter 가 다시 그린다(🔒 토글과 같은 경로).
+const ccAcctHost = document.getElementById("cc-accounts");
+if (ccAcctHost)
+  ccAcctHost.addEventListener("click", (e) => {
+    const btn = e.target instanceof Element ? e.target.closest(".cc-acct-hide") : null;
+    const key = btn ? btn.getAttribute("data-acct-key") : null;
+    if (!key) return;
+    toggleUsageAcctHidden(key);
+    renderAccounts();
+    renderUsageBar();
+    void refreshControlCenter();
+  });
 // 스킬 보드 검색 — 카탈로그 버튼 필터(재fetch 없이 renderBoardDomains 재렌더).
 document.getElementById("cc-board-search")!.addEventListener("input", (e) => {
   ccBoardSearch = (e.currentTarget as HTMLInputElement).value;

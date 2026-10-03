@@ -18,9 +18,14 @@
 //     "관측 실패 · 사유"(source_error) — 값(%)은 지어내지 않는다. 라벨·🔒 가림 규칙은 관측 행과 같다.
 //   · ★(0.14.42 RC4-b · RC2-b) 값의 새 출처 둘: cys 창 밖 Claude 세션(source "statusline-outside" — 표시용·경보
 //     제외)과 agy 상태줄 훅(source "agy-statusline"). 둘 다 라이브 관측이며 툴팁 출처 줄은 사람 말로 적는다.
+//   · ★(0.14.43 · 오너 제보 "다른 계정으로 다시 로그인했는데 옛 계정이 계속 주 계정으로 뜬다") 데몬이 보내는 가산 키로
+//     '지금'을 읽는다 — 별명(alias)·현재 로그인 폴더(current_profiles)로 라벨을 만들고, 지금 쓰이는 계정(in_use)에
+//     '● 사용 중' 표식을 단다. 주 계정은 사용 중 → 관측 신선도 순이다. 30분 넘은 관측·스냅샷은 경고색 없이 '오래됨'으로
+//     적는다(값·게이지 폭은 그대로 — 지난 값을 빨갛게 외치지 않는다). 숨긴 계정(뷰어별 목록은 main.ts 가 읽어 인자로
+//     넘긴다)은 후보·줄·요약에서 뺀다. 가산 키가 없으면(구버전 데몬) 종전 규칙으로 폴백한다 — IPC 데이터라 전부 의심한다.
 //
 // ★이 모듈의 불변식(usagewiring.test.ts 가 핀으로 고정):
-//   · 최상위 부수효과 0 — 선언(export/const/function/type)만. localStorage·document·window·타이머 접근 0.
+//   · 최상위 부수효과 0 — 선언(export/const/function/type)만. 브라우저 저장소(local·session)·document·window·타이머 접근 0.
 //     main.js 는 번들 하나라 여기서 평가 중 예외가 나면 앱 전체가 백지가 된다(④).
 //   · 구형 WKWebView 가 파싱하지 못하는 문법 0 — 정규식 lookbehind, `.at(`, findLast, structuredClone,
 //     Object.hasOwn, replaceAll. `bun build --target browser` 는 다운레벨하지 않으므로 파싱 실패가 곧 백지다.
@@ -30,6 +35,8 @@ export interface AcctRateWindow {
   label: string;
   used_pct: number;
   resets_at: number | null;
+  /** 0.14.43(B3 가산) 경보 입력 적격 — 표시 판정에는 쓰지 않는다(데몬이 경보에 쓸지 정한 값). 구버전은 키 없음. */
+  alert_eligible?: boolean;
 }
 /** usage_accounts_all 병합 행(`accounts.rs::local_json` 계약). IPC 데이터라 모든 필드를 의심한다. */
 export interface AcctRow {
@@ -45,6 +52,15 @@ export interface AcctRow {
   adapter?: boolean;
   exhaust_at?: number | null; // 신선한 5h 창의 선형 소진 예측(epoch 초)
   source_error?: string | null; // 관측 경로 고장 코드(예: "agy_http_403") · null = 고장 없음(0.14.42)
+  /** 0.14.43(B1 가산) 지금 이 계정으로 로그인돼 있는 설정 폴더(profiles 와 같은 표기). **배열로 있으면 그것만**이 '현재'다
+   *  (빈 배열 = 어느 폴더에도 로그인돼 있지 않은 이전 계정). 키가 없으면 구버전 데몬 — profiles 로 폴백한다. */
+  current_profiles?: string[];
+  /** 0.14.43(B1) 오너가 적어 둔 별명(데몬이 24자로 자른다) — 표시 전용. null·키 없음 = 별명 없음. */
+  alias?: string | null;
+  /** 0.14.43(B3) 지금 로그인돼 쓰이는 계정인가 — true/false/null(판정 불가) · 키 없음 = 구버전. **true 일 때만** '사용 중'. */
+  in_use?: boolean | null;
+  /** 0.14.43(B3) 경보 입력이 된 rate 의 관측 시각(epoch 초). 사이드바의 관측 나이는 계속 updated_at 으로 센다. */
+  rate_observed_at?: number | null;
 }
 
 export const USAGE_WARN_PCT = 70; // pane 헤더 배지·CC 계정 섹션과 같은 선(main.ts sevClass(…, 70, 90))
@@ -61,6 +77,12 @@ export const USAGE_FAIL_STREAK_WARN = 3;
  *  0.14.42: 4 → 8. 한 사용자의 실사용 계정(2026-09-23 실측: Claude 4 + Codex + Antigravity = 6)이 전부
  *  보여야 한다. 꼬리는 자체 스크롤(#wsbar-foot max-height)이라 줄이 늘어도 탭 목록을 밀지 않는다. */
 export const USAGE_OTHERS_MAX = 8;
+/** 별명 표시 상한(글자 수) — 데몬의 절단(24자)과 같은 값. 구버전·이상 값이 길게 와도 화면은 이 수까지만. */
+export const USAGE_ALIAS_MAX = 24;
+/** 뷰어별 숨김 목록의 최대 항목 수 — main.ts 저장소 검증(sanitizeHiddenKeys)과 숨기기 단추가 같이 쓴다. */
+export const USAGE_HIDDEN_MAX = 64;
+/** '관측 전 N계정 — …' 접힘 줄의 말줄임 기준(글자 수). 전체 라벨은 툴팁에 있다. */
+export const USAGE_FOLD_TEXT_MAX = 60;
 
 const p2 = (x: number): string => String(x).padStart(2, "0");
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
@@ -119,15 +141,47 @@ export function providerLabel(provider: unknown): string {
   return p || "계정";
 }
 
-/** 계정의 화면 라벨 — 프로필명(claude-N > 좌석 > 부서 x) > 제공자. **이메일(label 필드)은 절대 쓰지 않는다.** */
-export function accountShortLabel(a: AcctRow): string {
+/** 별명 — 문자열이고 앞뒤 공백을 걷은 뒤 비어 있지 않을 때만(24자 초과분은 자른다). 없으면 빈 문자열. 타입부터 의심한다. */
+export function acctAlias(a: AcctRow): string {
+  const v: unknown = isObj(a) ? a.alias : undefined;
+  if (typeof v !== "string") return "";
+  const t = v.trim();
+  if (!t) return "";
+  const cs = Array.from(t); // 코드 포인트 단위 — 이모지 같은 서로게이트 쌍을 반으로 자르지 않는다
+  return cs.length > USAGE_ALIAS_MAX ? cs.slice(0, USAGE_ALIAS_MAX).join("") : t;
+}
+
+/** claude 계정이 지금 어느 폴더에도 로그인돼 있지 않은가 — current_profiles 가 (쓸 수 있는 원소가 없는) **배열로 있을 때만**.
+ *  키가 없는 구버전 데몬은 판정하지 않는다(false). Control Center 의 '이전 로그인' 배지가 쓴다. */
+export function isPreviousLogin(a: AcctRow): boolean {
+  return a.provider === "claude" && Array.isArray(a.current_profiles) && normalizeProfiles(a.current_profiles).length === 0;
+}
+
+/** 프로필 집합에서 만든 폴더 라벨(claude-N > 좌석 > 부서 x). 만들 수 없으면 null. */
+function folderLabel(profiles: unknown): string | null {
   let best: { rank: number; label: string } | null = null;
-  for (const p of normalizeProfiles(a.profiles)) {
+  for (const p of normalizeProfiles(profiles)) {
     const pl = profileLabel(p);
     if (!pl) continue;
     if (!best || pl.rank < best.rank || (pl.rank === best.rank && pl.label < best.label)) best = pl;
   }
-  return best ? best.label : providerLabel(a.provider);
+  return best ? best.label : null;
+}
+
+/** 계정의 화면 라벨 — 별명 > 현재 로그인 폴더(claude-N > 좌석 > 부서 x) > 제공자. **이메일(label 필드)은 절대 쓰지 않는다.**
+ *  · current_profiles 가 배열로 있으면 **그것만**으로 폴더 라벨을 만든다(profiles 는 추가 전용이라 옛 로그인 폴더가 남아 있다).
+ *    폴더 라벨을 하나도 못 만들면(보통 빈 배열 = 지금은 어느 폴더에도 로그인돼 있지 않다) claude 는 'Claude (이전 로그인)',
+ *    그 밖은 제공자 라벨.
+ *  · 키가 없으면(구버전 데몬) 종전처럼 profiles 로 만든다. */
+export function accountShortLabel(a: AcctRow): string {
+  const alias = acctAlias(a);
+  if (alias) return alias;
+  if (Array.isArray(a.current_profiles)) {
+    const cur = folderLabel(a.current_profiles);
+    if (cur) return cur;
+    return a.provider === "claude" ? `${providerLabel(a.provider)} (이전 로그인)` : providerLabel(a.provider);
+  }
+  return folderLabel(a.profiles) ?? providerLabel(a.provider);
 }
 
 /** 좌석(또는 부서 포크) 폴더를 쓰는 계정인가 — 동률 해소용. 비앵커·두 구분자. */
@@ -206,21 +260,92 @@ export function freshness(a: AcctRow, nowSec: number): Freshness {
 
 /** 순위용 사용률 — 표시 가능한 값(0~100 클램프)만, 누락·리셋 지남은 -1(값 있는 쪽 아래로). */
 const rankPct = (a: AcctRow, label: string, nowSec: number): number => windowView(a, label, nowSec).pct ?? -1;
-const acctKey = (a: AcctRow): string => `${String(a.provider ?? "")}:${String(a.account_id ?? "")}`;
+/** 계정 키 — `provider:account_id`. 숨김 목록·정렬 동률 해소·겹침 꼬리표의 공통 키(main.ts 도 이 함수로 만든다). */
+export const acctKey = (a: AcctRow): string => `${String(a.provider ?? "")}:${String(a.account_id ?? "")}`;
+/** 뷰어가 숨긴 계정인가 — hidden 이 없거나 Set 모양이 아니면 숨김 없음(던지지 않는다). */
+const isHiddenAcct = (a: AcctRow, hidden: ReadonlySet<string> | undefined): boolean =>
+  !!hidden && typeof hidden.has === "function" && hidden.has(acctKey(a));
 
-/** 주 계정: 라이브 관측 > 스냅샷. 같은 무리 안에서 5h ↓ → 7d ↓ → 최신 관측 ↓ → 좌석 경로 → 키(결정론). */
-export function pickPrimaryAccount(accounts: AcctRow[], nowSec: number): AcctRow | null {
-  const list = (Array.isArray(accounts) ? accounts : []).filter((a) => isObj(a) && isObserved(a));
-  const live = list.filter(isLiveAccount);
-  const pool = live.length ? live : list;
-  if (!pool.length) return null;
-  const sorted = [...pool].sort((x, y) => {
-    const d5 = rankPct(y, "5h", nowSec) - rankPct(x, "5h", nowSec);
-    if (d5) return d5;
-    const d7 = rankPct(y, "7d", nowSec) - rankPct(x, "7d", nowSec);
-    if (d7) return d7;
+/** 저장소에서 읽은 숨김 목록의 검증 — 배열 · 문자열 원소 · 최대 USAGE_HIDDEN_MAX 개. 저장소 접근은 main.ts 만 하고 여기는 값만 본다. */
+export function sanitizeHiddenKeys(raw: unknown): Set<string> {
+  const out = new Set<string>();
+  if (!Array.isArray(raw)) return out;
+  for (const k of raw) {
+    if (out.size >= USAGE_HIDDEN_MAX) break;
+    if (typeof k === "string" && k !== "") out.add(k);
+  }
+  return out;
+}
+
+/** 관측 나이(초) — updated_at 이 유효할 때만(아니면 null). 시계가 뒤로 가도 음수가 되지 않는다. */
+function obsAgeSecs(a: AcctRow, nowSec: number): number | null {
+  const u = finiteNum(a.updated_at);
+  return u !== null && u > 0 ? Math.max(0, nowSec - u) : null;
+}
+
+/** 관측 신선도 등급(주 계정 선정용) — 라이브(30분 안: fresh·recent) 2 > 오래됨(stale · 30분 초과) 1 > 스냅샷 0. 관측 전은 -1(후보 아님).
+ *  fresh 와 recent 는 **한 등급**이다 — 2분 경계로 가르면 리뷰어 좌석처럼 가끔만 보고하는 계정이 fresh↔recent 를 수 분 간격으로
+ *  오가며 주 계정이 깜빡이고, 한도에 가까운 계정이 2분만 조용해도 요약 줄에서 밀려난다. 라이브 안에서는 종전(0.14.42)처럼 5h 순이다.
+ *  source "snapshot"(부트 예열)은 나이와 무관하게 0 — 종전 '라이브 무리 우선' 규칙이 이 등급에 흡수된다. */
+function freshGrade(a: AcctRow, nowSec: number): number {
+  if (!isObserved(a)) return -1;
+  if (a.source === "snapshot") return 0;
+  const lv = freshness(a, nowSec).level;
+  return lv === "fresh" || lv === "recent" ? 2 : lv === "stale" ? 1 : -1;
+}
+/** 오래된 값(등급 stale·snapshot) — 경고색을 걷고 '오래됨'으로 적는 대상. */
+const isStaleGrade = (g: number): boolean => g === 0 || g === 1;
+
+/** 화면용 신선도 — 오래된 값(stale · 스냅샷이 아닌 쪽)은 '오래됨 · ' 머리말을 붙인다. 스냅샷은 종전 '지난 기록 · …' 그대로.
+ *  freshness() 자체는 종전 그대로다(그 문구를 핀이 잡고 있고, 머리말은 화면 모델의 몫). */
+function displayFresh(a: AcctRow, nowSec: number): Freshness {
+  const f = freshness(a, nowSec);
+  return f.level === "stale" && a.source !== "snapshot" ? { level: f.level, note: `오래됨 · ${f.note}` } : f;
+}
+
+/** 창 표기 묶음 — 오래된 값(등급 stale·snapshot)은 경고색(sev)을 걷는다. 값(text)·게이지 폭(pct)은 그대로다. */
+function acctWindowViews(a: AcctRow, nowSec: number): WindowView[] {
+  const stale = isStaleGrade(freshGrade(a, nowSec));
+  return USAGE_WINDOWS.map((l) => {
+    const v = windowView(a, l, nowSec);
+    if (!stale || !v.sev) return v;
+    const calm: WindowView = { ...v, sev: "" };
+    return calm;
+  });
+}
+
+/** 사용 중 순위 — true 2 · 판정 불가(null·키 없음·모르는 값) 1 · false 0. */
+const inUseRank = (a: AcctRow): number => (a.in_use === true ? 2 : a.in_use === false ? 0 : 1);
+
+/** 주 계정 — 관측된 계정(숨김 제외) 가운데:
+ *  ① 사용 중인 계정이 하나라도 있으면 사용 중 순위 ↓(하나도 없으면 — 전부 구버전·판정 불가 — 이 키는 건너뛴다)
+ *  ② 신선도 등급 ↓ — 라이브(fresh·recent = 30분 안) > 오래됨(stale) > 스냅샷. fresh·recent 는 한 등급이라 2분 경계가 순위를 바꾸지 않는다
+ *  ③ 라이브면 5h ↓ → 7d ↓ → 최신 관측 ↓ · 오래됨·스냅샷이면 최신 관측 ↓ → 5h ↓ → 7d ↓
+ *  ④ 좌석 경로 → 키 사전순(결정론). 좌석 경로 정규식은 동률 해소용일 뿐이다(반박 D1). */
+export function pickPrimaryAccount(accounts: AcctRow[], nowSec: number, hidden?: ReadonlySet<string>): AcctRow | null {
+  const list = (Array.isArray(accounts) ? accounts : []).filter((a) => isObj(a) && isObserved(a) && !isHiddenAcct(a, hidden));
+  if (!list.length) return null;
+  const anyInUse = list.some((a) => a.in_use === true);
+  const sorted = [...list].sort((x, y) => {
+    if (anyInUse) {
+      const di = inUseRank(y) - inUseRank(x);
+      if (di) return di;
+    }
+    const gx = freshGrade(x, nowSec);
+    const gy = freshGrade(y, nowSec);
+    if (gx !== gy) return gy - gx;
     const du = (finiteNum(y.updated_at) ?? 0) - (finiteNum(x.updated_at) ?? 0);
-    if (du) return du;
+    const d5 = rankPct(y, "5h", nowSec) - rankPct(x, "5h", nowSec);
+    const d7 = rankPct(y, "7d", nowSec) - rankPct(x, "7d", nowSec);
+    if (isStaleGrade(gx)) {
+      if (du) return du;
+      if (d5) return d5;
+      if (d7) return d7;
+    } else {
+      if (d5) return d5;
+      if (d7) return d7;
+      if (du) return du;
+    }
     const ds = Number(hasSeatProfile(y)) - Number(hasSeatProfile(x));
     if (ds) return ds;
     return acctKey(x) < acctKey(y) ? -1 : acctKey(x) > acctKey(y) ? 1 : 0;
@@ -245,6 +370,8 @@ export interface UsageLine {
   dim: boolean;
   /** 한 번도 관측되지 않은 계정의 줄(값 없음 — "관측 전·관측 실패·어댑터 없음"). */
   unobserved: boolean;
+  /** 지금 로그인돼 쓰이는 계정 — in_use === true 일 때만 true(null·false·키 없음은 false). 줄 앞에 '●' 표식. */
+  inUse: boolean;
 }
 export interface UsagePrimary {
   label: string;
@@ -252,15 +379,28 @@ export interface UsagePrimary {
   windows: WindowView[];
   fresh: Freshness;
   exhaust: string;
+  /** 지금 로그인돼 쓰이는 계정(in_use === true) — 이름 옆에 '● 사용 중' 배지. */
+  inUse: boolean;
 }
 export interface UsageBarModel {
   /** 접힘 상태·헤더 요약 한 줄. */
   headline: string;
+  /** 요약 줄 색 — 주 계정 창들의 최고 심각도(오래된 값이면 ""). */
+  headlineSev: "" | "warn" | "crit";
+  /** 요약 줄 툴팁 — 제공자별 약식(`C 5h12%·7d30% │ X 7d50%`)일 때 풀이. 아니면 빈 문자열. */
+  headlineTitle: string;
   primary: UsagePrimary | null;
   others: UsageLine[];
+  /** 상한에 잘려 나간 **관측 줄** 수(관측 전 계정은 unobservedFold 가 따로 맡는다). */
   moreCount: number;
-  /** 관측 전 계정 수(그 계정들도 others 에 한 줄씩 있다 — 개수로 접지 않는다). */
+  /** 잘려 나간 관측 줄의 라벨 나열(툴팁). */
+  moreTooltip: string;
+  /** 상한에 잘려 나간 관측 전 계정 — 개수로만 사라지지 않게 라벨을 나열한 한 줄(없으면 null). */
+  unobservedFold: { text: string; tooltip: string } | null;
+  /** 관측 전 계정 수(그 계정들도 others 에 한 줄씩 있다 — 개수로 접지 않는다). 숨긴 계정은 뺀다. */
   unobservedCount: number;
+  /** 뷰어가 숨긴 계정 수(현재 목록에 있는 것만) — 0 이면 표시 없음. */
+  hiddenCount: number;
   /** 주 계정이 없을 때 본문 대신 보일 한 줄(빈 문자열이면 없음). */
   message: string;
   /** 조회 연속 실패 경고(빈 문자열이면 없음) — 값은 지우지 않고 기준 시각을 밝힌다. */
@@ -374,16 +514,111 @@ function tooltipFor(
   return lines.join("\n");
 }
 
+/** 라벨이 겹치는 계정의 구분 꼬리표 — 이메일(label)이 있으면 🔒 가림 함수를 거친 값이다(🔒 끔 = 원문 · 켬 = Control Center 계정 표와
+ *  같은 `#hash6` 라 두 화면을 대조할 수 있다). 이메일이 없으면 종전 결정론 tag4. 사이드바 본문에 이메일이 나올 수 있는 **유일한** 경로. */
+function overlapTag(a: AcctRow, redactEmail: (s: string) => string): string {
+  const raw = typeof a.label === "string" ? a.label : "";
+  if (raw.trim()) {
+    const r = redactEmail(raw);
+    if (typeof r === "string" && r.trim()) return r;
+  }
+  return tag4(acctKey(a));
+}
+
+/** 줄 상한에 잘려 나간 관측 전 계정 — 개수로만 사라지지 않게 라벨을 나열한다(전체 줄이 60자를 넘으면 말줄임 · 툴팁은 전체 나열). */
+function unobservedFoldOf(cut: UsageLine[]): { text: string; tooltip: string } | null {
+  if (!cut.length) return null;
+  const names = cut.map((l) => l.label).join(" · ");
+  const chars = Array.from(`관측 전 ${cut.length}계정 — ${names}`);
+  return {
+    text: chars.length > USAGE_FOLD_TEXT_MAX ? `${chars.slice(0, USAGE_FOLD_TEXT_MAX - 1).join("")}…` : chars.join(""),
+    tooltip: names,
+  };
+}
+
+/** 제공자 묶음 키 — 옛 표기 gemini 는 데몬의 실제 키 antigravity 와 한 무리다(둘 다 머리글자 A). */
+const provGroup = (a: AcctRow): string => {
+  const p = typeof a.provider === "string" ? a.provider : "";
+  return p === "gemini" ? "antigravity" : p;
+};
+const groupRank = (key: string): number => {
+  const i = PROVIDER_ORDER.indexOf(key);
+  return i < 0 ? PROVIDER_ORDER.length : i;
+};
+/** 제공자 머리글자 — C=claude · X=codex · A=antigravity(gemini) · 그 밖은 표시명 첫 글자 대문자. */
+function providerInitial(key: string): string {
+  if (key === "claude") return "C";
+  if (key === "codex") return "X";
+  if (key === "antigravity" || key === "gemini") return "A";
+  const first = Array.from(providerLabel(key))[0];
+  return first ? first.toUpperCase() : "?";
+}
+/** 비교용 값 — 100% 초과('100%+')는 100% 위. */
+const viewRank = (v: WindowView): number => (v.text === "100%+" ? 101 : v.pct ?? 0);
+
+/** 한 제공자의 한 창 — 오래되지 않은(fresh·recent) 계정들의 최댓값. 그런 계정에 값이 없으면 오래된 계정들의 최댓값(stale=true →
+ *  호출측이 `?`). 리셋 지난 창은 '리셋됨'. 값 없는 창은 null(생략). */
+function providerWindow(accts: AcctRow[], label: string, nowSec: number): { text: string; stale: boolean } | null {
+  const pick = (list: AcctRow[]): WindowView | null => {
+    let top: WindowView | null = null;
+    let rolled: WindowView | null = null;
+    for (const a of list) {
+      const v = windowView(a, label, nowSec);
+      if (v.state === "ok") {
+        if (!top || viewRank(v) > viewRank(top)) top = v;
+      } else if (v.state === "rolled" && !rolled) rolled = v;
+    }
+    return top ?? rolled;
+  };
+  const live = pick(accts.filter((a) => !isStaleGrade(freshGrade(a, nowSec))));
+  if (live) return { text: live.text, stale: false };
+  const old = pick(accts.filter((a) => isStaleGrade(freshGrade(a, nowSec))));
+  return old ? { text: old.text, stale: old.state === "ok" } : null;
+}
+
+/** 제공자별 접힘 요약 — 관측 계정이 두 제공자 이상에 걸칠 때만(아니면 null → 종전 형식). 예 `C 5h12%·7d30% │ X 7d50%`.
+ *  풀이(title)는 `Claude 5h 12% · 7d 30% / Codex 7d 50%`. 제공자 순서는 PROVIDER_ORDER. */
+function providerSummary(observed: AcctRow[], nowSec: number): { short: string; title: string } | null {
+  const groups = new Map<string, AcctRow[]>();
+  for (const a of observed) {
+    const k = provGroup(a);
+    const g = groups.get(k);
+    if (g) g.push(a);
+    else groups.set(k, [a]);
+  }
+  if (groups.size < 2) return null;
+  const keys = [...groups.keys()].sort((x, y) => groupRank(x) - groupRank(y) || (x < y ? -1 : x > y ? 1 : 0));
+  const shorts: string[] = [];
+  const titles: string[] = [];
+  for (const k of keys) {
+    const segs: string[] = [];
+    const full: string[] = [];
+    for (const l of USAGE_WINDOWS) {
+      const w = providerWindow(groups.get(k)!, l, nowSec);
+      if (!w) continue;
+      segs.push(`${l}${w.text}${w.stale ? "?" : ""}`);
+      full.push(`${l} ${w.text}${w.stale ? " (오래됨)" : ""}`);
+    }
+    shorts.push(`${providerInitial(k)} ${segs.length ? segs.join("·") : "—"}`);
+    titles.push(`${providerLabel(k)} ${full.length ? full.join(" · ") : "—"}`);
+  }
+  return { short: shorts.join(" │ "), title: titles.join(" / ") };
+}
+
 /** 렌더용 모델. main.ts 는 이 모델을 textContent 로만 옮긴다.
- *  redactEmail = CC 🔒 가림 함수(신원 줄) · hidePaths = 🔒 가림 상태(설정 폴더를 끝 이름으로 — 리뷰1 M9). */
+ *  redactEmail = CC 🔒 가림 함수(신원 줄·겹침 꼬리표) · hidePaths = 🔒 가림 상태(설정 폴더를 끝 이름으로 — 리뷰1 M9) ·
+ *  hidden = 뷰어가 숨긴 계정 키(`provider:account_id`) 집합 — 후보·줄·제공자 요약에서 뺀다(저장소는 main.ts 만 읽는다). */
 export function buildUsageBarModel(
   accounts: AcctRow[],
   nowSec: number,
   fetch: UsageFetchState,
   redactEmail: (s: string) => string,
   hidePaths = false,
+  hidden?: ReadonlySet<string>,
 ): UsageBarModel {
-  const list = (Array.isArray(accounts) ? accounts : []).filter(isObj) as AcctRow[];
+  const everyone = (Array.isArray(accounts) ? accounts : []).filter(isObj) as AcctRow[];
+  const list = everyone.filter((a) => !isHiddenAcct(a, hidden)); // 이하 list = 화면에 나올 계정
+  const hiddenCount = everyone.length - list.length;
   const failing = fetch.failStreak >= USAGE_FAIL_STREAK_WARN;
   const footer = !failing
     ? ""
@@ -392,10 +627,15 @@ export function buildUsageBarModel(
       : "데몬 응답 없음 — 사용량을 가져오지 못했습니다(자동 재시도 중)";
   const empty: UsageBarModel = {
     headline: "",
+    headlineSev: "",
+    headlineTitle: "",
     primary: null,
     others: [],
     moreCount: 0,
+    moreTooltip: "",
+    unobservedFold: null,
     unobservedCount: 0,
+    hiddenCount,
     message: "",
     footer,
   };
@@ -407,17 +647,25 @@ export function buildUsageBarModel(
         { ...empty, headline: "대기 중", message: "사용량 확인 대기 중 — 바로 보려면 Control Center > Live" };
   }
 
-  // 라벨: 겹치면 결정론 꼬리표로 구분(둘 다 "Claude" 로 보이지 않게).
-  const labels = new Map<AcctRow, string>();
-  const count = new Map<string, number>();
+  // 라벨: 겹치면 구분 꼬리표로(둘 다 "Claude" 로 보이지 않게) — 이메일(🔒 가림 거침)로 먼저, 그래도 같으면(같은 이메일·이메일 없음)
+  // 종전 결정론 tag4. 숨긴 계정은 화면에 없으므로 겹침 계산에서도 뺀다.
+  const base = new Map<AcctRow, string>();
+  const baseCount = new Map<string, number>();
   for (const a of list) {
     const l = accountShortLabel(a);
+    base.set(a, l);
+    baseCount.set(l, (baseCount.get(l) ?? 0) + 1);
+  }
+  const labels = new Map<AcctRow, string>();
+  const labelCount = new Map<string, number>();
+  for (const a of list) {
+    const b = base.get(a)!;
+    const l = (baseCount.get(b) ?? 0) > 1 ? `${b} ·${overlapTag(a, redactEmail)}` : b;
     labels.set(a, l);
-    count.set(l, (count.get(l) ?? 0) + 1);
+    labelCount.set(l, (labelCount.get(l) ?? 0) + 1);
   }
   for (const a of list) {
-    const l = labels.get(a)!;
-    if ((count.get(l) ?? 0) > 1) labels.set(a, `${l} ·${tag4(acctKey(a))}`);
+    if ((labelCount.get(labels.get(a)!) ?? 0) > 1) labels.set(a, `${base.get(a)!} ·${tag4(acctKey(a))}`);
   }
 
   // 관측 전 계정 — 개수로 접지 않고 한 줄씩(0.14.42). 제공자 순(claude·codex·antigravity) → 라벨 순(결정론).
@@ -433,22 +681,27 @@ export function buildUsageBarModel(
       tooltip: tooltipFor(a, v, freshness(a, nowSec), redactEmail, hidePaths, st.detail),
       dim: true,
       unobserved: true,
+      inUse: a.in_use === true,
     };
   });
   const primaryAcct = pickPrimaryAccount(list, nowSec);
   if (!primaryAcct) {
+    // 관측된 계정이 없다. 관측 전 계정이 있으면 그 수를 요약에(0.14.43 A4 — '관측 없음' 은 계정이 아예 없을 때만).
+    // 화면에 나올 계정이 하나도 없는데 숨긴 계정만 있으면 '관측 없음' 이 거짓이므로 숨김 수를 적는다.
+    const allHidden = list.length === 0 && hiddenCount > 0;
     return {
       ...empty,
-      headline: "관측 없음",
+      headline: unobserved.length ? `관측 전 ${unobserved.length}계정` : allHidden ? `숨김 ${hiddenCount}계정` : "관측 없음",
       others: unobservedLines.slice(0, USAGE_OTHERS_MAX),
-      moreCount: Math.max(0, unobservedLines.length - USAGE_OTHERS_MAX),
+      unobservedFold: unobservedFoldOf(unobservedLines.slice(USAGE_OTHERS_MAX)),
       unobservedCount: unobserved.length,
-      message: "아직 관측된 사용량 없음 — 에이전트 첫 응답 후 표시",
+      message: allHidden ? "" : "아직 관측된 사용량 없음 — 에이전트 첫 응답 후 표시",
     };
   }
 
-  const pv = USAGE_WINDOWS.map((l) => windowView(primaryAcct, l, nowSec));
-  const pf = freshness(primaryAcct, nowSec);
+  const pv = acctWindowViews(primaryAcct, nowSec);
+  const pf = displayFresh(primaryAcct, nowSec);
+  const primaryStale = isStaleGrade(freshGrade(primaryAcct, nowSec));
   const ex = finiteNum(primaryAcct.exhaust_at);
   const primary: UsagePrimary = {
     label: labels.get(primaryAcct)!,
@@ -456,6 +709,7 @@ export function buildUsageBarModel(
     windows: pv,
     fresh: pf,
     exhaust: ex !== null && ex > nowSec && (pf.level === "fresh" || pf.level === "recent") ? `이 속도면 ${hhmm(ex)} 소진` : "",
+    inUse: primaryAcct.in_use === true,
   };
 
   const rest = list
@@ -466,8 +720,8 @@ export function buildUsageBarModel(
       return (finiteNum(y.updated_at) ?? 0) - (finiteNum(x.updated_at) ?? 0);
     });
   const observedLines: UsageLine[] = rest.map((a) => {
-    const v = USAGE_WINDOWS.map((l) => windowView(a, l, nowSec));
-    const f = freshness(a, nowSec);
+    const v = acctWindowViews(a, nowSec);
+    const f = displayFresh(a, nowSec);
     const txt = v.map((w) => `${w.label} ${w.text}`).join(" · ");
     return {
       label: labels.get(a)!,
@@ -475,20 +729,64 @@ export function buildUsageBarModel(
       tooltip: tooltipFor(a, v, f, redactEmail, hidePaths),
       dim: f.level === "stale",
       unobserved: false,
+      inUse: a.in_use === true,
     };
   });
-  // 관측 행이 먼저 — 상한이 관측값을 밀어내지 않는다. "외 N개"는 관측·관측 전 구분 없이 같은 규칙.
+  // 관측 행이 먼저 — 상한이 관측값을 밀어내지 않는다. 잘려 나간 줄은 종류별로 따로 알린다: 관측 줄은 개수(외 N개 · 툴팁에 라벨),
+  // 관측 전 계정은 라벨을 나열한 접힘 줄(개수로만 사라지지 않게).
   const all = observedLines.concat(unobservedLines);
+  const cut = all.slice(USAGE_OTHERS_MAX);
+  const cutObserved = cut.filter((l) => !l.unobserved);
+
+  // 접힘 요약 — 관측 계정이 두 제공자 이상이면 제공자별 약식, 아니면 종전 형식(주 계정의 두 창). 주 계정이 오래된 값이면 끝에 '(오래됨)'.
+  const sum = providerSummary(list.filter(isObserved), nowSec);
+  const headline = (sum ? sum.short : pv.map((w) => `${w.label} ${w.text}`).join(" · ")) + (primaryStale ? " (오래됨)" : "");
+  const headlineSev: UsageBarModel["headlineSev"] = pv.some((w) => w.sev === "crit") ? "crit" : pv.some((w) => w.sev === "warn") ? "warn" : "";
 
   return {
-    headline: pv.map((w) => `${w.label} ${w.text}`).join(" · "),
+    headline,
+    headlineSev,
+    headlineTitle: sum ? sum.title : "",
     primary,
     others: all.slice(0, USAGE_OTHERS_MAX),
-    moreCount: Math.max(0, all.length - USAGE_OTHERS_MAX),
+    moreCount: cutObserved.length,
+    moreTooltip: cutObserved.map((l) => l.label).join(" · "),
+    unobservedFold: unobservedFoldOf(cut.filter((l) => l.unobserved)),
     unobservedCount: unobserved.length,
+    hiddenCount,
     message: "",
     footer,
   };
+}
+
+/** Control Center 계정 행의 '오래된 관측' — 관측 나이 > 30분 또는 스냅샷(부트 예열). 관측 전 계정은 아니다(그쪽은 '관측 전' 배지). */
+export function isOldObservation(a: AcctRow, nowSec: number): boolean {
+  if (!isObserved(a)) return false;
+  if (a.source === "snapshot") return true;
+  const age = obsAgeSecs(a, nowSec);
+  return age !== null && age > USAGE_STALE_SECS;
+}
+
+/** Control Center Live KPI('세션 5h'·'주간 7d' 대표값) 후보 계정 — **숨기지 않았고 ∧ 그 창이 리셋 전이고 ∧ (사용 중 ∨ 관측 나이 ≤ 30분 ∧ 스냅샷 아님)**.
+ *  옛 계정의 지난 100% 가 '최고 사용 계정'으로 KPI 를 빨갛게 만들지 않게 한다. 사용 중은 나이와 무관하게 후보(활동 중인 계정은 값이 곧
+ *  갱신된다). 관측 나이를 알 수 없고 사용 중도 아니면 후보가 아니다(지난 값일 수 있다). 후보의 행을 그대로 돌려준다 — 대표값(최댓값)은
+ *  호출측(main.ts ccAcctMax)이 종전 순회로 고른다. */
+export function kpiCandidates(accounts: AcctRow[], label: string, nowSec: number, hidden?: ReadonlySet<string>): AcctRow[] {
+  const out: AcctRow[] = [];
+  for (const a of Array.isArray(accounts) ? accounts : []) {
+    if (!isObj(a) || isHiddenAcct(a, hidden)) continue;
+    const rate = Array.isArray(a.rate) ? a.rate : [];
+    const w = rate.find((x) => isObj(x) && x.label === label);
+    if (!w || finiteNum(w.used_pct) === null) continue;
+    const resets = finiteNum(w.resets_at);
+    if (resets !== null && resets > 0 && nowSec >= resets) continue; // 리셋 지난 창 = 옛 값
+    if (a.in_use !== true) {
+      const age = obsAgeSecs(a, nowSec);
+      if (age === null || age > USAGE_STALE_SECS || a.source === "snapshot") continue;
+    }
+    out.push(a);
+  }
+  return out;
 }
 
 export interface FetchGate {
