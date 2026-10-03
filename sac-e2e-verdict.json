@@ -1,0 +1,36 @@
+{
+    "app_probe":  {
+                      "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                      "ok":  false,
+                      "ret":  0,
+                      "ret_meaning":  null,
+                      "last_error":  4551,
+                      "last_error_hex":  "0x000011C7",
+                      "last_error_text":  "An Application Control policy has blocked this file",
+                      "first_wait_timed_out":  false,
+                      "timed_out":  false,
+                      "completed":  true,
+                      "had_process_handle":  false,
+                      "note":  ""
+                  },
+    "ran":  false,
+    "app_blocked":  true,
+    "skipped_reason":  "the installed cys-app.exe itself is blocked under the enforced rules",
+    "shell_execute_ex_app":  {
+                                 "api":  "ShellExecuteExW(NOCLOSEPROCESS|NO_UI|NOASYNC)",
+                                 "ok":  false,
+                                 "ret":  5,
+                                 "ret_meaning":  "SE_ERR_ACCESSDENIED",
+                                 "last_error":  4551,
+                                 "last_error_hex":  "0x000011C7",
+                                 "last_error_text":  "An Application Control policy has blocked this file",
+                                 "first_wait_timed_out":  false,
+                                 "timed_out":  false,
+                                 "completed":  true,
+                                 "had_process_handle":  false,
+                                 "note":  ""
+                             },
+    "verdict":  null,
+    "why":  null,
+    "run":  null
+}

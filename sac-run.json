@@ -1,0 +1,724 @@
+{
+    "started":  "2026-10-03T20:06:16.626Z",
+    "matrix_os":  "windows-11-arm",
+    "measurable":  true,
+    "policy":  {
+                   "ok":  true,
+                   "error":  null,
+                   "example":  "C:\\Windows\\schemas\\CodeIntegrity\\ExamplePolicies\\SmartAppControl.xml",
+                   "missing_cmdlets":  [
+
+                                       ],
+                   "policy_id":  "{05816C37-6C90-4734-8C14-A44FD3B17EC2}",
+                   "base_policy_id":  "{05816C37-6C90-4734-8C14-A44FD3B17EC2}",
+                   "options_example":  [
+                                           "Enabled:Unsigned System Integrity Policy",
+                                           "Enabled:Advanced Boot Options Menu",
+                                           "Enabled:UMCI",
+                                           "Enabled:Inherit Default Policy",
+                                           "Enabled:Update Policy No Reboot",
+                                           "Enabled:Intelligent Security Graph Authorization",
+                                           "Enabled:Developer Mode Dynamic Code Trust",
+                                           "Enabled:Revoked Expired As Unsigned",
+                                           "Enabled:Allow Supplemental Policies",
+                                           "Disabled:Script Enforcement",
+                                           "Enabled:Conditional Windows Lockdown Policy"
+                                       ],
+                   "options_base":  [
+                                        "Enabled:Unsigned System Integrity Policy",
+                                        "Enabled:Advanced Boot Options Menu",
+                                        "Enabled:UMCI",
+                                        "Enabled:Inherit Default Policy",
+                                        "Enabled:Update Policy No Reboot",
+                                        "Enabled:Intelligent Security Graph Authorization",
+                                        "Enabled:Developer Mode Dynamic Code Trust",
+                                        "Enabled:Revoked Expired As Unsigned",
+                                        "Enabled:Allow Supplemental Policies",
+                                        "Disabled:Script Enforcement"
+                                    ],
+                   "options_audit":  [
+                                         "Enabled:Unsigned System Integrity Policy",
+                                         "Enabled:Advanced Boot Options Menu",
+                                         "Enabled:UMCI",
+                                         "Enabled:Inherit Default Policy",
+                                         "Enabled:Update Policy No Reboot",
+                                         "Enabled:Intelligent Security Graph Authorization",
+                                         "Enabled:Developer Mode Dynamic Code Trust",
+                                         "Enabled:Revoked Expired As Unsigned",
+                                         "Enabled:Allow Supplemental Policies",
+                                         "Disabled:Script Enforcement",
+                                         "Enabled:Audit Mode"
+                                     ],
+                   "options_enforce":  [
+                                           "Enabled:Unsigned System Integrity Policy",
+                                           "Enabled:Advanced Boot Options Menu",
+                                           "Enabled:UMCI",
+                                           "Enabled:Inherit Default Policy",
+                                           "Enabled:Update Policy No Reboot",
+                                           "Enabled:Intelligent Security Graph Authorization",
+                                           "Enabled:Developer Mode Dynamic Code Trust",
+                                           "Enabled:Revoked Expired As Unsigned",
+                                           "Enabled:Allow Supplemental Policies",
+                                           "Disabled:Script Enforcement"
+                                       ],
+                   "conditional_lockdown_removed":  true,
+                   "added_options":  [
+
+                                     ],
+                   "audit_cip":  "C:\\a\\_temp\\diag-work\\sacpol\\audit\\{05816C37-6C90-4734-8C14-A44FD3B17EC2}.cip",
+                   "enforce_cip":  "C:\\a\\_temp\\diag-work\\sacpol\\enforce\\{05816C37-6C90-4734-8C14-A44FD3B17EC2}.cip",
+                   "neutral_cip":  "C:\\a\\_temp\\diag-work\\sacpol\\neutral\\{05816C37-6C90-4734-8C14-A44FD3B17EC2}.cip",
+                   "steps":  [
+                                 "Set-CIPolicyIdInfo -PolicyName DIAG-SAC-RULES -ResetPolicyID: ok",
+                                 "Set-CIPolicyVersion 1.0.0.1: ok",
+                                 "audit variant: Set-RuleOption 3 + ConvertFrom-CIPolicy: ok",
+                                 "enforce variant: Set-RuleOption 3 -Delete + version 1.0.0.2 + ConvertFrom-CIPolicy: ok",
+                                 "neutral variant (audit, version 1.0.0.3): ok"
+                             ]
+               },
+    "t0_audit_deploy_utc":  "2026-10-03T20:06:19.080Z",
+    "t1_enforce_deploy_utc":  "2026-10-03T20:10:16.056Z",
+    "stages":  {
+                   "prepare":  {
+                                   "started":  "2026-10-03T20:06:16.642Z",
+                                   "ended":  "2026-10-03T20:06:18.542Z",
+                                   "ok":  true,
+                                   "error":  null,
+                                   "language_mode_at_end":  "FullLanguage"
+                               },
+                   "policy-build":  {
+                                        "started":  "2026-10-03T20:06:18.576Z",
+                                        "ended":  "2026-10-03T20:06:19.080Z",
+                                        "ok":  true,
+                                        "error":  null,
+                                        "language_mode_at_end":  "FullLanguage"
+                                    },
+                   "audit-deploy":  {
+                                        "started":  "2026-10-03T20:06:19.080Z",
+                                        "ended":  "2026-10-03T20:06:22.717Z",
+                                        "ok":  true,
+                                        "error":  null,
+                                        "language_mode_at_end":  "FullLanguage"
+                                    },
+                   "audit-probe":  {
+                                       "started":  "2026-10-03T20:06:22.723Z",
+                                       "ended":  "2026-10-03T20:08:52.344Z",
+                                       "ok":  true,
+                                       "error":  null,
+                                       "language_mode_at_end":  "FullLanguage"
+                                   },
+                   "audit-ea":  {
+                                    "started":  "2026-10-03T20:08:52.349Z",
+                                    "ended":  "2026-10-03T20:08:53.023Z",
+                                    "ok":  true,
+                                    "error":  null,
+                                    "language_mode_at_end":  "FullLanguage"
+                                },
+                   "audit-installs":  {
+                                          "started":  "2026-10-03T20:08:53.023Z",
+                                          "ended":  "2026-10-03T20:09:56.851Z",
+                                          "ok":  true,
+                                          "error":  null,
+                                          "language_mode_at_end":  "FullLanguage"
+                                      },
+                   "audit-events":  {
+                                        "started":  "2026-10-03T20:09:56.851Z",
+                                        "ended":  "2026-10-03T20:10:16.040Z",
+                                        "ok":  true,
+                                        "error":  null,
+                                        "language_mode_at_end":  "FullLanguage"
+                                    },
+                   "enforce-deploy":  {
+                                          "started":  "2026-10-03T20:10:16.056Z",
+                                          "ended":  "2026-10-03T20:10:24.535Z",
+                                          "ok":  true,
+                                          "error":  null,
+                                          "language_mode_at_end":  "FullLanguage"
+                                      },
+                   "enforce-probe":  {
+                                         "started":  "2026-10-03T20:10:24.541Z",
+                                         "ended":  "2026-10-03T20:11:24.868Z",
+                                         "ok":  true,
+                                         "error":  null,
+                                         "language_mode_at_end":  "FullLanguage"
+                                     },
+                   "enforce-e2e":  {
+                                       "started":  "2026-10-03T20:11:24.871Z",
+                                       "ended":  "2026-10-03T20:11:25.501Z",
+                                       "ok":  true,
+                                       "error":  null,
+                                       "language_mode_at_end":  "FullLanguage"
+                                   },
+                   "cleanup-remove":  {
+                                          "started":  "2026-10-03T20:11:25.501Z",
+                                          "ended":  "2026-10-03T20:11:29.028Z",
+                                          "ok":  true,
+                                          "error":  null,
+                                          "language_mode_at_end":  "FullLanguage"
+                                      },
+                   "cleanup-events":  {
+                                          "started":  "2026-10-03T20:11:29.028Z",
+                                          "ended":  "2026-10-03T20:11:35.156Z",
+                                          "ok":  true,
+                                          "error":  null,
+                                          "language_mode_at_end":  "FullLanguage"
+                                      }
+               },
+    "qc":  {
+               "installer 0.14.42":  {
+                                         "label":  "installer 0.14.42",
+                                         "path":  "C:\\a\\_temp\\diag-work\\subj\\inst-0.14.42.exe",
+                                         "createprocess":  {
+                                                               "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                               "ok":  false,
+                                                               "ret":  0,
+                                                               "ret_meaning":  null,
+                                                               "last_error":  4551,
+                                                               "last_error_hex":  "0x000011C7",
+                                                               "last_error_text":  "An Application Control policy has blocked this file",
+                                                               "first_wait_timed_out":  false,
+                                                               "timed_out":  false,
+                                                               "completed":  true,
+                                                               "had_process_handle":  false,
+                                                               "note":  ""
+                                                           },
+                                         "createprocess_recheck":  {
+                                                                       "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                                       "ok":  false,
+                                                                       "ret":  0,
+                                                                       "ret_meaning":  null,
+                                                                       "last_error":  4551,
+                                                                       "last_error_hex":  "0x000011C7",
+                                                                       "last_error_text":  "An Application Control policy has blocked this file",
+                                                                       "first_wait_timed_out":  false,
+                                                                       "timed_out":  false,
+                                                                       "completed":  true,
+                                                                       "had_process_handle":  false,
+                                                                       "note":  ""
+                                                                   },
+                                         "blocked":  true,
+                                         "shell_execute_ex":  {
+                                                                  "api":  "ShellExecuteExW(NOCLOSEPROCESS|NO_UI|NOASYNC)",
+                                                                  "ok":  false,
+                                                                  "ret":  5,
+                                                                  "ret_meaning":  "SE_ERR_ACCESSDENIED",
+                                                                  "last_error":  4551,
+                                                                  "last_error_hex":  "0x000011C7",
+                                                                  "last_error_text":  "An Application Control policy has blocked this file",
+                                                                  "first_wait_timed_out":  false,
+                                                                  "timed_out":  false,
+                                                                  "completed":  true,
+                                                                  "had_process_handle":  false,
+                                                                  "note":  ""
+                                                              },
+                                         "shell_execute_w":  {
+                                                                 "api":  "ShellExecuteW(open,SW_SHOW)",
+                                                                 "ok":  false,
+                                                                 "ret":  5,
+                                                                 "ret_meaning":  "SE_ERR_ACCESSDENIED",
+                                                                 "last_error":  4551,
+                                                                 "last_error_hex":  "0x000011C7",
+                                                                 "last_error_text":  "An Application Control policy has blocked this file",
+                                                                 "first_wait_timed_out":  false,
+                                                                 "timed_out":  false,
+                                                                 "completed":  true,
+                                                                 "had_process_handle":  false,
+                                                                 "note":  ""
+                                                             },
+                                         "shell_execute_w_ui_screenshot":  null,
+                                         "note":  null
+                                     },
+               "control NEG (fresh unsigned exe)":  {
+                                                        "label":  "control NEG (fresh unsigned exe)",
+                                                        "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-neg-fresh.exe",
+                                                        "createprocess":  {
+                                                                              "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                                              "ok":  false,
+                                                                              "ret":  0,
+                                                                              "ret_meaning":  null,
+                                                                              "last_error":  4551,
+                                                                              "last_error_hex":  "0x000011C7",
+                                                                              "last_error_text":  "An Application Control policy has blocked this file",
+                                                                              "first_wait_timed_out":  false,
+                                                                              "timed_out":  false,
+                                                                              "completed":  true,
+                                                                              "had_process_handle":  false,
+                                                                              "note":  ""
+                                                                          },
+                                                        "createprocess_recheck":  {
+                                                                                      "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                                                      "ok":  false,
+                                                                                      "ret":  0,
+                                                                                      "ret_meaning":  null,
+                                                                                      "last_error":  4551,
+                                                                                      "last_error_hex":  "0x000011C7",
+                                                                                      "last_error_text":  "An Application Control policy has blocked this file",
+                                                                                      "first_wait_timed_out":  false,
+                                                                                      "timed_out":  false,
+                                                                                      "completed":  true,
+                                                                                      "had_process_handle":  false,
+                                                                                      "note":  ""
+                                                                                  },
+                                                        "blocked":  true,
+                                                        "shell_execute_ex":  {
+                                                                                 "api":  "ShellExecuteExW(NOCLOSEPROCESS|NO_UI|NOASYNC)",
+                                                                                 "ok":  false,
+                                                                                 "ret":  5,
+                                                                                 "ret_meaning":  "SE_ERR_ACCESSDENIED",
+                                                                                 "last_error":  4551,
+                                                                                 "last_error_hex":  "0x000011C7",
+                                                                                 "last_error_text":  "An Application Control policy has blocked this file",
+                                                                                 "first_wait_timed_out":  false,
+                                                                                 "timed_out":  false,
+                                                                                 "completed":  true,
+                                                                                 "had_process_handle":  false,
+                                                                                 "note":  ""
+                                                                             },
+                                                        "shell_execute_w":  {
+                                                                                "api":  "ShellExecuteW(open,SW_SHOW)",
+                                                                                "ok":  false,
+                                                                                "ret":  5,
+                                                                                "ret_meaning":  "SE_ERR_ACCESSDENIED",
+                                                                                "last_error":  4551,
+                                                                                "last_error_hex":  "0x000011C7",
+                                                                                "last_error_text":  "An Application Control policy has blocked this file",
+                                                                                "first_wait_timed_out":  false,
+                                                                                "timed_out":  false,
+                                                                                "completed":  true,
+                                                                                "had_process_handle":  false,
+                                                                                "note":  ""
+                                                                            },
+                                                        "shell_execute_w_ui_screenshot":  null,
+                                                        "note":  null
+                                                    }
+           },
+    "qd":  {
+               "app_probe":  {
+                                 "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                 "ok":  false,
+                                 "ret":  0,
+                                 "ret_meaning":  null,
+                                 "last_error":  4551,
+                                 "last_error_hex":  "0x000011C7",
+                                 "last_error_text":  "An Application Control policy has blocked this file",
+                                 "first_wait_timed_out":  false,
+                                 "timed_out":  false,
+                                 "completed":  true,
+                                 "had_process_handle":  false,
+                                 "note":  ""
+                             },
+               "ran":  false,
+               "app_blocked":  true,
+               "skipped_reason":  "the installed cys-app.exe itself is blocked under the enforced rules",
+               "shell_execute_ex_app":  {
+                                            "api":  "ShellExecuteExW(NOCLOSEPROCESS|NO_UI|NOASYNC)",
+                                            "ok":  false,
+                                            "ret":  5,
+                                            "ret_meaning":  "SE_ERR_ACCESSDENIED",
+                                            "last_error":  4551,
+                                            "last_error_hex":  "0x000011C7",
+                                            "last_error_text":  "An Application Control policy has blocked this file",
+                                            "first_wait_timed_out":  false,
+                                            "timed_out":  false,
+                                            "completed":  true,
+                                            "had_process_handle":  false,
+                                            "note":  ""
+                                        },
+               "verdict":  null,
+               "why":  null,
+               "run":  null
+           },
+    "cleanup":  {
+                    "started":  "2026-10-03T20:11:25.501Z",
+                    "language_mode":  "FullLanguage",
+                    "remove":  {
+                                   "attempted":  true,
+                                   "remove":  {
+                                                  "tag":  "remove",
+                                                  "rc":  0,
+                                                  "timed_out":  false,
+                                                  "start_error":  null,
+                                                  "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                                  "err":  "",
+                                                  "attempts":  [
+                                                                   {
+                                                                       "args":  "--remove-policy \"{05816C37-6C90-4734-8C14-A44FD3B17EC2}\"",
+                                                                       "rc":  0,
+                                                                       "timed_out":  false,
+                                                                       "start_error":  null,
+                                                                       "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                                                       "err":  ""
+                                                                   }
+                                                               ]
+                                              },
+                                   "refresh":  {
+                                                   "rc":  0,
+                                                   "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                                   "err":  ""
+                                               },
+                                   "listing_found_after":  false,
+                                   "neg_probe_after":  {
+                                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                           "ok":  true,
+                                                           "ret":  0,
+                                                           "ret_meaning":  null,
+                                                           "last_error":  0,
+                                                           "last_error_hex":  "0x00000000",
+                                                           "last_error_text":  "",
+                                                           "first_wait_timed_out":  false,
+                                                           "timed_out":  false,
+                                                           "completed":  true,
+                                                           "had_process_handle":  true,
+                                                           "note":  ""
+                                                       },
+                                   "lifted":  true
+                               },
+                    "ci_state_after_remove":  {
+                                                  "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                  "options_hex":  "0x00282203",
+                                                  "flags":  [
+                                                                "ENABLED",
+                                                                "TESTSIGN",
+                                                                "FLIGHTING_ENABLED",
+                                                                "HVCI_IUM_ENABLED"
+                                                            ]
+                                              },
+                    "enforce_evtx_export":  {
+                                                "rc":  0,
+                                                "out":  "",
+                                                "err":  "",
+                                                "start_error":  null
+                                            },
+                    "enforce_event_note":  null,
+                    "enforce_event_counts":  {
+                                                 "3101":  3,
+                                                 "3105":  43,
+                                                 "3103":  3,
+                                                 "3096":  12,
+                                                 "3099":  1,
+                                                 "3102":  3,
+                                                 "3033":  179,
+                                                 "3089":  358,
+                                                 "3077":  179
+                                             },
+                    "enforce_control_interpretation":  "ISG appears to work and discriminates: NEG (fresh unsigned exe) is flagged, POS-UNSIGNED (widely used unsigned installer) is not",
+                    "enforce_events_about_updater_temp_installer":  [
+
+                                                                    ],
+                    "mp_threat_detections":  [
+
+                                             ],
+                    "finished":  "2026-10-03T20:11:35.156Z"
+                },
+    "checkpoints":  {
+                        "audit":  {
+                                      "rc":  0,
+                                      "out":  "publish-results: 25 files to upload, 0 skipped, out=C:\\a\\_temp\\diag-out\npublish-results: ok -\u003e refs/heads/diag-results/37150100607-1-sacrules-audit-windows-11-arm (commit 6e6156bc713b0961b38250d4226c00bf43c699f2), 25 files + manifest\n",
+                                      "err":  "",
+                                      "time":  "2026-10-03T20:10:16.040Z"
+                                  }
+                    },
+    "notes":  [
+
+              ],
+    "prepare":  {
+                    "native_ready":  true,
+                    "native_error":  null,
+                    "configci_import":  "ok",
+                    "language_mode":  "FullLanguage",
+                    "ci_state_before":  {
+                                            "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                            "options_hex":  "0x00282203",
+                                            "flags":  [
+                                                          "ENABLED",
+                                                          "TESTSIGN",
+                                                          "FLIGHTING_ENABLED",
+                                                          "HVCI_IUM_ENABLED"
+                                                      ]
+                                        },
+                    "subjects_loaded":  388,
+                    "ci_log_size":  {
+                                        "before":  "name: Microsoft-Windows-CodeIntegrity/Operational\r\nenabled: true\r\ntype: Operational\r\nowningPublisher: Microsoft-Windows-CodeIntegrity\r\nisolation: System\r\nchannelAccess: O:BAG:SYD:(A;;0xf0007;;;SY)(A;;0x7;;;BA)(A;;0x3;;;BO)(A;;0x5;;;SO)(A;;0x1;;;IU)(A;;0x3;;;SU)(A;;0x1;;;S-1-5-3)(A;;0x2;;;S-1-5-33)(A;;0x1;;;S-1-5-32-573)\r\nlogging:\r\n  logFileName: %SystemRoot%\\System32\\Winevt\\Logs\\Microsoft-Windows-CodeIntegrity%4Operational.evtx\r\n  retention: false\r\n  autoBackup: false\r\n  maxSize: 1052672\r\npublishing:\r\n  fileMax: 1\r\n",
+                                        "set_rc":  0,
+                                        "set_err":  "",
+                                        "after":  "name: Microsoft-Windows-CodeIntegrity/Operational\r\nenabled: true\r\ntype: Operational\r\nowningPublisher: Microsoft-Windows-CodeIntegrity\r\nisolation: System\r\nchannelAccess: O:BAG:SYD:(A;;0xf0007;;;SY)(A;;0x7;;;BA)(A;;0x3;;;BO)(A;;0x5;;;SO)(A;;0x1;;;IU)(A;;0x3;;;SU)(A;;0x1;;;S-1-5-3)(A;;0x2;;;S-1-5-33)(A;;0x1;;;S-1-5-32-573)\r\nlogging:\r\n  logFileName: %SystemRoot%\\System32\\Winevt\\Logs\\Microsoft-Windows-CodeIntegrity%4Operational.evtx\r\n  retention: false\r\n  autoBackup: false\r\n  maxSize: 134217728\r\npublishing:\r\n  fileMax: 1\r\n"
+                                    },
+                    "testflags_reg_add":  {
+                                              "rc":  0,
+                                              "out":  "The operation completed successfully.\r\r\n",
+                                              "err":  "",
+                                              "start_error":  null
+                                          },
+                    "appidtel_start":  {
+                                           "rc":  0,
+                                           "out":  "",
+                                           "err":  "",
+                                           "start_error":  null
+                                       },
+                    "appidsvc_query":  {
+                                           "rc":  0,
+                                           "out":  "\r\nSERVICE_NAME: appidsvc \r\n        TYPE               : 30  WIN32  \r\n        STATE              : 4  RUNNING \r\n                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)\r\n        WIN32_EXIT_CODE    : 0  (0x0)\r\n        SERVICE_EXIT_CODE  : 0  (0x0)\r\n        CHECKPOINT         : 0x0\r\n        WAIT_HINT          : 0x0\r\n",
+                                           "err":  ""
+                                       },
+                    "applockerfltr_query":  {
+                                                "rc":  0,
+                                                "out":  "\r\nSERVICE_NAME: AppLockerFltr \r\n        TYPE               : 1  KERNEL_DRIVER  \r\n        STATE              : 4  RUNNING \r\n                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)\r\n        WIN32_EXIT_CODE    : 0  (0x0)\r\n        SERVICE_EXIT_CODE  : 0  (0x0)\r\n        CHECKPOINT         : 0x0\r\n        WAIT_HINT          : 0x0\r\n",
+                                                "err":  ""
+                                            },
+                    "note_testflags":  "TestFlags=0x300 is documented to need a reboot; a hosted job cannot reboot, so events 3090-3092 may be absent. That is NOT evidence that ISG was not consulted: judge by 3076/3077, the probes and the $KERNEL.SMARTLOCKER.ORIGINCLAIM EA."
+                },
+    "audit_deploy":  {
+                         "tag":  "audit",
+                         "cip":  "C:\\a\\_temp\\diag-work\\sacpol\\audit\\{05816C37-6C90-4734-8C14-A44FD3B17EC2}.cip",
+                         "rc":  0,
+                         "timed_out":  false,
+                         "start_error":  null,
+                         "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                         "err":  "",
+                         "attempts":  [
+                                          {
+                                              "args":  "--update-policy \"C:\\a\\_temp\\diag-work\\sacpol\\audit\\{05816C37-6C90-4734-8C14-A44FD3B17EC2}.cip\"",
+                                              "rc":  0,
+                                              "timed_out":  false,
+                                              "start_error":  null,
+                                              "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                              "err":  ""
+                                          }
+                                      ],
+                         "listing":  {
+                                         "tag":  "after-audit-deploy",
+                                         "rc":  0,
+                                         "found":  true,
+                                         "parse_error":  null,
+                                         "objects":  [
+                                                         {
+                                                             "PolicyID":  "05816c37-6c90-4734-8c14-a44fd3b17ec2",
+                                                             "BasePolicyID":  "05816c37-6c90-4734-8c14-a44fd3b17ec2",
+                                                             "FriendlyName":  "DIAG-SAC-RULES",
+                                                             "Version":  281474976710657,
+                                                             "VersionString":  "1.0.0.1",
+                                                             "IsSystemPolicy":  false,
+                                                             "IsSignedPolicy":  false,
+                                                             "IsOnDisk":  true,
+                                                             "IsEnforced":  true,
+                                                             "IsAuthorized":  true,
+                                                             "PolicyOptions":  [
+                                                                                   "Enabled:UMCI",
+                                                                                   "Enabled:Intelligent Security Graph Authorization",
+                                                                                   "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                   "Enabled:Allow Supplemental Policies",
+                                                                                   "Enabled:Revoked Expired As Unsigned",
+                                                                                   "Enabled:Audit Mode",
+                                                                                   "Enabled:Inherit Default Policy",
+                                                                                   "Enabled:Unsigned System Integrity Policy",
+                                                                                   "Enabled:Advanced Boot Options Menu",
+                                                                                   "Disabled:Script Enforcement",
+                                                                                   "Enabled:Update Policy No Reboot"
+                                                                               ]
+                                                         }
+                                                     ]
+                                     }
+                     },
+    "ci_state_after_audit_deploy":  {
+                                        "raw":  "status=0x00000000;options=0x00282207;retLen=8",
+                                        "options_hex":  "0x00282207",
+                                        "flags":  [
+                                                      "ENABLED",
+                                                      "TESTSIGN",
+                                                      "UMCI_ENABLED",
+                                                      "FLIGHTING_ENABLED",
+                                                      "HVCI_IUM_ENABLED"
+                                                  ]
+                                    },
+    "audit_pass1":  {
+                        "pass":  "audit-pass1",
+                        "probed":  388,
+                        "skipped_for_budget":  0,
+                        "budget_sec":  240
+                    },
+    "audit_pass2":  {
+                        "pass":  "audit-pass2",
+                        "probed":  388,
+                        "skipped_for_budget":  0,
+                        "budget_sec":  240
+                    },
+    "audit_installs":  {
+                           "zip":  {
+                                       "rc":  0,
+                                       "timed_out":  false,
+                                       "start_error":  null,
+                                       "installed_7z_exists":  true,
+                                       "ea":  "rc=0 startError=\r\n\r\nExtended Attributes (EA) information for file C:\\a\\_temp\\diag-work\\7zinst\\7z.exe:\r\n\r\nTotal Ea Size: 0xf0      \r\n\r\nEa Buffer Offset: 0       \r\nEa Name: $KERNEL.SMARTLOCKER.ORIGINCLAIM\r\nEa Value Length: 9c      \r\n0000:  01 00 00 00 01 00 00 00  02 00 00 00 02 00 00 00  ................\r\n0010:  7d f1 9d c5 d6 c2 34 ee  e2 53 60 08 c3 33 f3 0c  }.....4..S`..3..\r\n0020:  0b 23 bf d9 e4 46 d6 be  b5 5d 6f d2 77 53 4a 18  .#...F...]o.wSJ.\r\n0030:  40 00 00 00 00 00 00 00  5c 00 00 00 5c 00 61 00  @.......\\...\\.a.\r\n0040:  5c 00 5f 00 74 00 65 00  6d 00 70 00 5c 00 64 00  \\._.t.e.m.p.\\.d.\r\n0050:  69 00 61 00 67 00 2d 00  77 00 6f 00 72 00 6b 00  i.a.g.-.w.o.r.k.\r\n0060:  5c 00 73 00 75 00 62 00  6a 00 5c 00 63 00 74 00  \\.s.u.b.j.\\.c.t.\r\n0070:  6c 00 2d 00 70 00 6f 00  73 00 2d 00 37 00 7a 00  l.-.p.o.s.-.7.z.\r\n0080:  69 00 70 00 2d 00 73 00  65 00 74 00 75 00 70 00  i.p.-.s.e.t.u.p.\r\n0090:  2e 00 65 00 78 00 65 00  00 00 00 00              ..e.x.e.....\r\n\r\nEa Buffer Offset: c4      \r\nEa Name: $KERNEL.PURGE.SMARTLOCKER.VALID\r\nEa Value Length: 4       \r\n0000:  53 4d 56 31                                       SMV1\r\n",
+                                       "probe":  {
+                                                     "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                     "ok":  true,
+                                                     "ret":  0,
+                                                     "ret_meaning":  null,
+                                                     "last_error":  0,
+                                                     "last_error_hex":  "0x00000000",
+                                                     "last_error_text":  "",
+                                                     "first_wait_timed_out":  false,
+                                                     "timed_out":  false,
+                                                     "completed":  true,
+                                                     "had_process_handle":  true,
+                                                     "note":  ""
+                                                 }
+                                   },
+                           "cys_0_14_37":  {
+                                               "version":  "0.14.37",
+                                               "installer":  "C:\\a\\_temp\\diag-work\\dl\\0.14.37\\cys_0.14.37_x64-setup.exe",
+                                               "started":  "2026-10-03T20:08:54.625Z",
+                                               "rc":  0,
+                                               "timed_out":  false,
+                                               "marker":  "0.14.37",
+                                               "failure_file":  null,
+                                               "file_version":  "0.14.37 / product 0.14.37",
+                                               "killed":  [
+
+                                                          ],
+                                               "error":  null,
+                                               "finished":  "2026-10-03T20:09:53.384Z"
+                                           },
+                           "installed_files":  {
+                                                   "cys-app.exe":  {
+                                                                       "ea":  "rc=0 startError=\r\n\r\nThe file C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe does not have extended attributes (EA).\r\n",
+                                                                       "probe":  {
+                                                                                     "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                                                     "ok":  true,
+                                                                                     "ret":  0,
+                                                                                     "ret_meaning":  null,
+                                                                                     "last_error":  0,
+                                                                                     "last_error_hex":  "0x00000000",
+                                                                                     "last_error_text":  "",
+                                                                                     "first_wait_timed_out":  false,
+                                                                                     "timed_out":  false,
+                                                                                     "completed":  true,
+                                                                                     "had_process_handle":  true,
+                                                                                     "note":  ""
+                                                                                 }
+                                                                   },
+                                                   "cysd.exe":  {
+                                                                    "ea":  "rc=0 startError=\r\n\r\nThe file C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe does not have extended attributes (EA).\r\n",
+                                                                    "probe":  {
+                                                                                  "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                                                  "ok":  true,
+                                                                                  "ret":  0,
+                                                                                  "ret_meaning":  null,
+                                                                                  "last_error":  0,
+                                                                                  "last_error_hex":  "0x00000000",
+                                                                                  "last_error_text":  "",
+                                                                                  "first_wait_timed_out":  false,
+                                                                                  "timed_out":  false,
+                                                                                  "completed":  true,
+                                                                                  "had_process_handle":  true,
+                                                                                  "note":  ""
+                                                                              }
+                                                                },
+                                                   "cys.exe":  {
+                                                                   "ea":  "rc=0 startError=\r\n\r\nThe file C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe does not have extended attributes (EA).\r\n",
+                                                                   "probe":  {
+                                                                                 "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                                                 "ok":  true,
+                                                                                 "ret":  0,
+                                                                                 "ret_meaning":  null,
+                                                                                 "last_error":  0,
+                                                                                 "last_error_hex":  "0x00000000",
+                                                                                 "last_error_text":  "",
+                                                                                 "first_wait_timed_out":  false,
+                                                                                 "timed_out":  false,
+                                                                                 "completed":  true,
+                                                                                 "had_process_handle":  true,
+                                                                                 "note":  ""
+                                                                             }
+                                                               }
+                                               }
+                       },
+    "audit_evtx_export":  {
+                              "rc":  0,
+                              "out":  "",
+                              "err":  "",
+                              "start_error":  null
+                          },
+    "audit_event_note":  null,
+    "audit_event_counts":  {
+                               "3101":  1,
+                               "3105":  15,
+                               "3103":  1,
+                               "3096":  4,
+                               "3099":  1,
+                               "3102":  1,
+                               "3076":  173,
+                               "3089":  173
+                           },
+    "audit_control_interpretation":  "ISG appears to work and discriminates: NEG (fresh unsigned exe) is flagged, POS-UNSIGNED (widely used unsigned installer) is not",
+    "enforce_deploy":  {
+                           "tag":  "enforce",
+                           "cip":  "C:\\a\\_temp\\diag-work\\sacpol\\enforce\\{05816C37-6C90-4734-8C14-A44FD3B17EC2}.cip",
+                           "rc":  0,
+                           "timed_out":  false,
+                           "start_error":  null,
+                           "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                           "err":  "",
+                           "attempts":  [
+                                            {
+                                                "args":  "--update-policy \"C:\\a\\_temp\\diag-work\\sacpol\\enforce\\{05816C37-6C90-4734-8C14-A44FD3B17EC2}.cip\"",
+                                                "rc":  0,
+                                                "timed_out":  false,
+                                                "start_error":  null,
+                                                "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                                "err":  ""
+                                            }
+                                        ],
+                           "listing":  {
+                                           "tag":  "after-enforce-deploy",
+                                           "rc":  0,
+                                           "found":  true,
+                                           "parse_error":  null,
+                                           "objects":  [
+                                                           {
+                                                               "PolicyID":  "05816c37-6c90-4734-8c14-a44fd3b17ec2",
+                                                               "BasePolicyID":  "05816c37-6c90-4734-8c14-a44fd3b17ec2",
+                                                               "FriendlyName":  "DIAG-SAC-RULES",
+                                                               "Version":  281474976710658,
+                                                               "VersionString":  "1.0.0.2",
+                                                               "IsSystemPolicy":  false,
+                                                               "IsSignedPolicy":  false,
+                                                               "IsOnDisk":  true,
+                                                               "IsEnforced":  true,
+                                                               "IsAuthorized":  true,
+                                                               "PolicyOptions":  [
+                                                                                     "Enabled:UMCI",
+                                                                                     "Enabled:Intelligent Security Graph Authorization",
+                                                                                     "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                     "Enabled:Allow Supplemental Policies",
+                                                                                     "Enabled:Revoked Expired As Unsigned",
+                                                                                     "Enabled:Inherit Default Policy",
+                                                                                     "Enabled:Unsigned System Integrity Policy",
+                                                                                     "Enabled:Advanced Boot Options Menu",
+                                                                                     "Disabled:Script Enforcement",
+                                                                                     "Enabled:Update Policy No Reboot"
+                                                                                 ]
+                                                           }
+                                                       ]
+                                       }
+                       },
+    "ci_state_after_enforce_deploy":  {
+                                          "raw":  "status=0x00000000;options=0x00282207;retLen=8",
+                                          "options_hex":  "0x00282207",
+                                          "flags":  [
+                                                        "ENABLED",
+                                                        "TESTSIGN",
+                                                        "UMCI_ENABLED",
+                                                        "FLIGHTING_ENABLED",
+                                                        "HVCI_IUM_ENABLED"
+                                                    ]
+                                      },
+    "language_mode_after_enforce_deploy":  "FullLanguage",
+    "enforce_pass":  {
+                         "pass":  "enforce",
+                         "probed":  392,
+                         "skipped_for_budget":  0,
+                         "budget_sec":  240
+                     },
+    "finished":  "2026-10-03T20:11:35.156Z"
+}

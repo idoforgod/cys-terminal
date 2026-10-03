@@ -1,0 +1,2 @@
+citool -lp -json returned 6763 characters
+leftover DIAG-SAC-RULES policies handled: 0
