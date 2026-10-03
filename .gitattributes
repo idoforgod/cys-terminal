@@ -1,0 +1,2 @@
+# The product module must reach the runner byte for byte (diag/product-launch.ps1 checks its sha256): no line-ending conversion.
+diag/product/*.rs -text

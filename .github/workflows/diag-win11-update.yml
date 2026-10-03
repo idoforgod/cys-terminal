@@ -1,6 +1,8 @@
 # Diagnostic harness: does the in-app update (0.14.37 -> 0.14.42) work on a REAL Windows 11?
 # See diag/README.md. Measurement steps never turn the job red (their result IS the data);
 # only a failing publish step stays red. Results go to branch diag-results/<run>-<attempt>-<job>-<os>.
+# Commit message tags choose the jobs: [product-only] -> only product-launch, [sacreal-only] -> only sacreal-e2e, no tag -> all jobs
+# (e2e and sacrules run only when neither tag is present).
 name: diag-win11-update
 
 on:
@@ -17,7 +19,7 @@ concurrency:
 jobs:
   e2e:
     name: 'e2e (${{ matrix.os }})'
-    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 55
     strategy:
@@ -154,7 +156,7 @@ jobs:
 
   sacrules:
     name: 'sacrules (${{ matrix.os }})'
-    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -322,10 +324,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # The full reproduction with REAL Smart App Control (diag/sacreal-e2e.ps1, windows-11-arm only). Add [sacreal-only] to the
-  # commit message to run ONLY this job (the two jobs above are skipped then); this job always runs.
+  # The full reproduction with REAL Smart App Control (diag/sacreal-e2e.ps1, windows-11-arm only). [sacreal-only] in the commit
+  # message runs ONLY this job; it is skipped by [product-only] alone (and runs when both tags are present).
   sacreal-e2e:
     name: 'sacreal-e2e (windows-11-arm)'
+    if: ${{ !contains(github.event.head_commit.message, '[product-only]') || contains(github.event.head_commit.message, '[sacreal-only]') }}
     runs-on: windows-11-arm
     timeout-minutes: 50
     env:
@@ -451,6 +454,141 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: diag-sacreal-e2e-windows-11-arm
+          path: ${{ runner.temp }}\diag-out
+          if-no-files-found: warn
+          retention-days: 14
+
+  # The PRODUCT's installer-launch module (diag/product/update_launch.rs = src/update_launch.rs, byte for byte) on REAL Smart App
+  # Control (diag/product-launch.ps1, windows-11-arm only). [product-only] in the commit message runs ONLY this job; it is skipped by
+  # [sacreal-only] alone (and runs when both tags are present).
+  product-launch:
+    name: 'product-launch (windows-11-arm)'
+    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') || contains(github.event.head_commit.message, '[product-only]') }}
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    env:
+      DIAG_MATRIX_OS: windows-11-arm
+      DIAG_JOB_LIMIT_MIN: '26'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        continue-on-error: true
+        with:
+          node-version: '22'
+
+      # Windows PowerShell 5.1 parser over every diag script: a parse error would stop a script before it writes anything
+      - name: syntax-check
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = Join-Path $env:RUNNER_TEMP 'diag-out'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $lines = New-Object System.Collections.Generic.List[string]
+          $lines.Add(('PowerShell {0} on {1}' -f $PSVersionTable.PSVersion, $env:PROCESSOR_ARCHITECTURE))
+          foreach ($f in (Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'diag') -Filter '*.ps1')) {
+            $tokens = $null
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errs)
+            if ($errs -and $errs.Count -gt 0) {
+              foreach ($e in $errs) { $lines.Add(('PARSE ERROR {0}:{1}:{2} {3}' -f $f.Name, $e.Extent.StartLineNumber, $e.Extent.StartColumnNumber, $e.Message)) }
+            } else {
+              $lines.Add(('ok {0}' -f $f.Name))
+            }
+          }
+          $lines | ForEach-Object { Write-Host $_ }
+          [System.IO.File]::WriteAllText((Join-Path $out 'syntax-check.txt'), (($lines.ToArray()) -join "`r`n"))
+          exit 0
+
+      - name: p0-facts
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\p0-facts.ps1"
+          Write-Host "p0-facts exit code: $LASTEXITCODE"
+          exit 0
+
+      - name: p1-assets
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\p1-assets.ps1"
+          Write-Host "p1-assets exit code: $LASTEXITCODE"
+          exit 0
+
+      # one step = one PowerShell process: build the two drivers (x64 = verdict, aarch64 = auxiliary) -> start them (OFF stage) ->
+      # checkpoint -> SAC ON -> go -> ON stage -> RESTORE (see diag/product-launch.ps1). GITHUB_TOKEN is only for the checkpoint
+      # upload the script makes before SAC is turned on.
+      - name: product-launch
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 17
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\product-launch.ps1"
+          Write-Host "product-launch exit code: $LASTEXITCODE"
+          exit 0
+
+      # Safety net that works even when the product-launch process died (or timed out) while SAC was on, and even when a NEW PowerShell
+      # would be in Constrained Language Mode: only cmd, reg.exe and CiTool.exe. Writes the value 0 if it is not 0, then refreshes.
+      - name: ensure-sac-restored
+        if: ${{ always() }}
+        shell: cmd
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          set "SACKEY=HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy"
+          set "SACVAL=VerifiedAndReputablePolicyState"
+          set "SACLOG=%RUNNER_TEMP%\diag-out\ensure-sac-restored.txt"
+          if not exist "%RUNNER_TEMP%\diag-out" mkdir "%RUNNER_TEMP%\diag-out"
+          echo ensure-sac-restored %DATE% %TIME% > "%SACLOG%"
+          reg query "%SACKEY%" /v %SACVAL% >> "%SACLOG%" 2>&1
+          set "SACCUR="
+          for /f "tokens=3" %%A in ('reg query "%SACKEY%" /v %SACVAL% 2^>nul ^| findstr /i "%SACVAL%"') do set "SACCUR=%%A"
+          echo value before = [%SACCUR%] >> "%SACLOG%"
+          if /i not "%SACCUR%"=="0x0" reg add "%SACKEY%" /v %SACVAL% /t REG_DWORD /d 0 /f >> "%SACLOG%" 2>&1
+          "%windir%\System32\CiTool.exe" -r < nul >> "%SACLOG%" 2>&1
+          echo CiTool refresh rc = %ERRORLEVEL% >> "%SACLOG%"
+          reg query "%SACKEY%" /v %SACVAL% >> "%SACLOG%" 2>&1
+          "%windir%\System32\CiTool.exe" -lp -json < nul > "%RUNNER_TEMP%\diag-out\ensure-sac-restored-citool-lp.json" 2>&1
+          type "%SACLOG%"
+          exit /b 0
+
+      - name: list-out
+        if: always()
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $d = Join-Path $env:RUNNER_TEMP 'diag-out'
+          if (Test-Path -LiteralPath $d) {
+            Get-ChildItem -LiteralPath $d -Recurse -File | ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.FullName.Substring($d.Length + 1) }
+          } else {
+            Write-Host "no diag-out folder"
+          }
+          exit 0
+
+      - name: publish-results
+        if: always()
+        shell: cmd
+        timeout-minutes: 8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node diag\publish-results.mjs --job product-launch --os windows-11-arm --out "%RUNNER_TEMP%\diag-out"
+
+      - name: upload-artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-product-launch-windows-11-arm
           path: ${{ runner.temp }}\diag-out
           if-no-files-found: warn
           retention-days: 14

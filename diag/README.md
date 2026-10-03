@@ -13,14 +13,16 @@
 | QE | 진짜 SAC 를 레지스트리 + `CiTool -r` 로 켤 수 있는가 (값 1·2 를 모두 시험 — 값의 뜻이 자료마다 달라 `citool` 정책명·`SmartAppControlState` 로 판정) | `sac-real.json` |
 | QF | `ShellExecuteW` 직후 `exit(0)` 가 설치기 기동을 놓치는가 (40회 반복) | `replica.json` · `replica-summary.txt` |
 | QG (2차) | **진짜 SAC 를 켠 채로** 전체 재현: 켠 뒤 설치기·앱 exe·설치된 exe 가 무엇이 막히는가, 이미 떠 있던 앱의 `install_update` 는 어떻게 되는가(A), 설치된 앱을 새로 띄우면(B) | `sacreal-summary.txt`(10줄) · `sacreal-matrix.txt`(+`.json`) · `sacreal-e2e-A-verdict.json` · `sacreal-e2e-B.json` |
+| QH (3차) | **제품 코드의 설치 파일 실행 모듈(`src/update_launch.rs`)을 진짜 SAC 에서 그대로** 시험: 켜기 전 성공 경로(서명된 cmd.exe 사본) · 켠 뒤 진짜 0.14.42 설치기는 `Err 4551 / shell_ret 5 / AppControl` · `remove_installer` 정리 · 서명된 대조는 통과 | `product-launch-summary.txt`(10줄) · `product-launch-x64.jsonl`(본 판정) · `product-launch-aarch64.jsonl`(보조) · `product-launch-verdict.json` · `product-3077.json` |
 
 ## 구성
 
-- `.github/workflows/diag-win11-update.yml` — 잡 `e2e`(win11-arm · 2025 · 2022), 잡 `sacrules`(win11-arm · 2025), 잡 `sacreal-e2e`(win11-arm, 2차). `diag/**` 브랜치 푸시로 돈다.
-  커밋 메시지에 `[sacreal-only]` 가 있으면 앞의 두 잡은 건너뛰고(`if:` 조건) `sacreal-e2e` 만 돈다. `sacreal-e2e` 는 조건 없이 항상 돈다.
+- `.github/workflows/diag-win11-update.yml` — 잡 `e2e`(win11-arm · 2025 · 2022), 잡 `sacrules`(win11-arm · 2025), 잡 `sacreal-e2e`(win11-arm, 2차), 잡 `product-launch`(win11-arm, 3차). `diag/**` 브랜치 푸시로 돈다.
+  **커밋 메시지 태그로 잡을 고른다**: `[product-only]` → `product-launch` 만 · `[sacreal-only]` → `sacreal-e2e` 만 · 태그 없음 → 전부 · 두 태그 → 그 둘. `e2e`·`sacrules` 는 두 태그가 모두 없을 때만 돈다(`if:` 조건).
 - `diag/lib.ps1` 공통(+ 2차에서 `sacrules.ps1` 에서 글자 그대로 옮긴 매트릭스·이벤트 도우미 10개) · `p0-facts.ps1` 환경 사실 · `p1-assets.ps1` 내려받기·추출·대조군 ·
   `e2e-update.ps1` + `cdp-update.mjs` QA · `replica.ps1` + `replica/*.rs` QF · `sacrules.ps1` QB·QC·QD · `sac-real.ps1` QE ·
-  `sacreal-e2e.ps1` QG · `publish-results.mjs` 결과 업로드.
+  `sacreal-e2e.ps1` QG · `sac-lib.ps1`(sacreal-e2e 에서 글자 그대로 옮긴 진짜 SAC 켜기·복구·체크포인트·이벤트 도우미 — 3차가 같이 쓴다) ·
+  `product-launch.ps1` + `product/`(`update_launch.rs` = 제품 파일 사본 · `main.rs` = 드라이버) QH · `publish-results.mjs` 결과 업로드.
 
 ## 결과 읽는 법
 
@@ -58,3 +60,17 @@ SAC 를 켠 뒤에는 서명된 `node.exe` 와 시스템 도구만 새로 실행
 - 같은 브랜치에 연달아 푸시하면 앞 런이 취소된다(워크플로의 `concurrency`). SAC 를 켠 구간에서 취소되면 스크립트의 `finally` 는 돌지 못하고 `ensure-sac-restored`(`if: always()`)가 복구한다. 그 사이 결과는 마지막 체크포인트까지만 남는다 — 푸시는 한 번만.
 - 지시된 순서(매트릭스 → A) 때문에 0.14.42 설치기는 A 의 `install_update` 보다 먼저 `CreateProcessW` 시험을 받는다. 평판(ISG) 판정이 그 사이 캐시됐을 수 있으니 A 결과는 그 점을 감안해 읽는다.
 - 이벤트(`sacreal-events-final.json`·`sacreal-3077-final.json`·`sacreal-final-matrix.*`)는 **복구 뒤에** 지속 로그에서 읽는다(복구 시작 이후 이벤트는 개수만 적고 목록에서 뺀다). `sacreal-ci-final.evtx` 는 복구 이벤트까지 전부 담는다.
+
+## 3차: `product-launch` (제품의 설치 파일 실행 모듈을 진짜 SAC 에서 그대로)
+
+제품 쪽 `src/update_launch.rs`(커밋 `aa0b1adb` · std 만 쓰는 독립 모듈)를 **한 글자도 고치지 않고** `diag/product/update_launch.rs` 에 복사해 두고(sha256 **`570476c28df10e9280036cee4da37301175d2fd215a49f5cb16627fd00e88ddc`** · `product-launch.ps1` 이 실행 때 다시 계산해 결과 파일에 적는다 · `.gitattributes` 로 줄바꿈 변환을 막았다), `diag/product/main.rs`(드라이버)가 `mod update_launch;` 로 그 파일을 그대로 포함해 앱과 **같은 호출**(`write_installer` → `launch_installer(file, nsis_update_params(&[]))` → `remove_installer`)을 한다.
+
+- 드라이버 `sac-launch.exe <work_dir> <cmd_exe_path> <installer_path>` 는 **SAC 를 켜기 전에** 떠서 신호 파일을 기다린다(켠 뒤에 새로 뜨는 미서명 exe 는 막히므로).
+  - OFF 단계(뜨자마자): ① `write_installer(work_dir, "cys", "0.0.0-diag", <cmd.exe 바이트>)`(경로 꼴 기록) → `launch_installer(그 파일, "/c exit 0")` 기대 **Ok**(서명된 cmd.exe 사본 = 성공 경로) ② `product-launch.jsonl`(한 줄 한 JSON)에 기록하고 `ready` 파일 생성.
+  - `go` 파일이 생길 때까지 대기(최대 10분 · 0.5초 폴링 · `abort` 파일이면 일찍 끝냄).
+  - ON 단계(PowerShell 이 그 사이 진짜 SAC 를 켠 뒤): ③ `write_installer(…, "0.14.42", <진짜 설치 파일 바이트>)` → `launch_installer(…, nsis_update_params(&[]))` 기대 **Err · os_code 4551 · shell_ret 5 · block()=AppControl · Display `installer_launch_failed:4551:5`** → `remove_installer` 뒤 파일·폴더 소멸 기록 ④ 대조: cmd.exe 사본 다시 `write_installer` + `launch_installer(…, "/c exit 0")` 기대 **Ok** ⑤ 호출마다 소요 ms(5초 초과면 `slow`)·`driver_alive_through_on_stage` 기록, `done` 파일, 종료 코드 0.
+  - 실제 반환값을 그대로 적는다(`expect`/`matches` 가 옆에 붙지만 **판정은 PowerShell 요약**이 한다). MZ 머리가 없는 파일과 호출 직전에 사라진 파일(검사기가 치웠다면)은 띄우지 않고 기록한다(Windows 가 모달 오류 창을 띄움). 각 `launch_installer` 호출은 자기 스레드에서 돌고 40초 안에 안 돌아오면 `timed_out` 으로 적고 파일은 그대로 둔 채 계속한다(모달 창에 붙잡혀도 `done` 은 쓴다). 서명 대조(`cmd.exe` 사본)가 실패하면 원본 `System32\cmd.exe` 를 한 번 더 띄워 비교한다(진단용 · 기대 아님).
+- `product-launch.ps1`: 한 PowerShell 프로세스 — 빌드(`rustc --edition 2021 -O -C target-feature=+crt-static`, **x64**(`--target x86_64-pc-windows-msvc` · 본 판정)와 **aarch64**(호스트 · 보조); 한쪽이 안 지어지면 사유 기록) → 두 드라이버 기동·`ready` 확인(OFF 결과) → 체크포인트 게시 → 진짜 SAC 켬(2차와 같은 3상태 확인 · 안 켜지면 `measurable:false`) → `go` → `done` 대기(최대 3분) → 출력·jsonl 수집 → 스크린샷 1장 → 복구(값 0 + `CiTool -r` + 확인 + NEG 대조군 실행) → 3077 이벤트(경로에 `cys-0.14.42-updater-` 가 있는 것 표시) → 판정 → 요약 `product-launch-summary.txt`(10줄).
+- **판정(PASS)** = x64 드라이버(없으면 aarch64 만 · 근거 표시)의 ① OFF 성공 경로 Ok ② ON 차단이 정확히 `Err 4551 / 5 / AppControl` ③ 정리 완료 ④ 서명 대조 Ok ⑤ ON 단계 끝까지 도달, 그리고 SAC 켜짐 확인. 하나라도 어긋나면 FAIL + 이유. 5초 넘은 호출 · 경로가 플러그인 꼴이 아님 · 즉시는 안 지워졌지만 3초 안에 사라짐 · 복구 미확인은 판정을 바꾸지 않는 NOTE.
+- 결과 읽는 순서: `product-launch-summary.txt` → `product-launch-x64.jsonl`(호출마다 한 줄 · SAC 켜기 전 체크포인트 때의 OFF 단계 기록은 `product-launch-<arch>-off.jsonl`) → `product-launch-verdict.json` → `product-state-*.json`(3상태) → `product-3077.json`(이벤트 원본) → `ensure-sac-restored.txt`.
+- 로컬 확인(맥): `rustc --edition 2021 --test diag/product/main.rs` — 드라이버 시험 14개 + 제품 모듈 자체 시험 17개 = 31개 통과(비윈도우 갈래의 시험용 대역 사용), `--target x86_64-pc-windows-msvc --emit=metadata` 로 윈도우 갈래 타입 체크. 윈도우 실기는 러너에서 처음 돈다.
