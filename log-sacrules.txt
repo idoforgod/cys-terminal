@@ -1,0 +1,9 @@
+2026-10-03T20:06:16.610Z [INFO] === sacrules start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-03T20:06:16.689Z [INFO] --- stage prepare (minutes left 48.9, language mode FullLanguage) ---
+2026-10-03T20:06:18.578Z [INFO] --- stage policy-build (minutes left 48.8, language mode FullLanguage) ---
+2026-10-03T20:06:19.080Z [INFO] --- stage audit-deploy (minutes left 48.8, language mode FullLanguage) ---
+2026-10-03T20:06:22.723Z [INFO] --- stage audit-probe (minutes left 48.8, language mode FullLanguage) ---
+2026-10-03T20:07:19.295Z [INFO] sleeping 90 s for late reputation answers
+2026-10-03T20:08:52.351Z [INFO] --- stage audit-ea (minutes left 46.3, language mode FullLanguage) ---
+2026-10-03T20:08:53.023Z [INFO] --- stage audit-installs (minutes left 46.3, language mode FullLanguage) ---
+2026-10-03T20:09:56.851Z [INFO] --- stage audit-events (minutes left 45.2, language mode FullLanguage) ---
