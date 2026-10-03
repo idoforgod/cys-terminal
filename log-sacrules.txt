@@ -1,0 +1,19 @@
+2026-10-03T20:04:27.792Z [INFO] === sacrules start (PowerShell 5.1.26100.33438, LanguageMode FullLanguage) ===
+2026-10-03T20:04:27.859Z [INFO] --- stage prepare (minutes left 49.7, language mode FullLanguage) ---
+2026-10-03T20:04:29.452Z [INFO] --- stage policy-build (minutes left 49.6, language mode FullLanguage) ---
+2026-10-03T20:04:29.775Z [INFO] --- stage audit-deploy (minutes left 49.6, language mode FullLanguage) ---
+2026-10-03T20:04:33.189Z [INFO] --- stage audit-probe (minutes left 49.6, language mode FullLanguage) ---
+2026-10-03T20:05:23.141Z [INFO] sleeping 90 s for late reputation answers
+2026-10-03T20:06:53.999Z [INFO] --- stage audit-ea (minutes left 47.2, language mode FullLanguage) ---
+2026-10-03T20:06:54.436Z [INFO] --- stage audit-installs (minutes left 47.2, language mode FullLanguage) ---
+2026-10-03T20:08:12.457Z [INFO] --- stage audit-events (minutes left 45.9, language mode FullLanguage) ---
+2026-10-03T20:08:30.518Z [INFO] checkpoint audit: rc=0 publish-results: 25 files to upload, 0 skipped, out=D:\a\_temp\diag-out
+publish-results: ok -> refs/heads/diag-results/37150100607-1-sacrules-audit-windows-2025 (commit 526b40ba0dfe6cc015cb1bdd8a4b03eb6ce33b2a), 25 files + manifest
+2026-10-03T20:08:30.526Z [INFO] --- stage enforce-deploy (minutes left 45.6, language mode FullLanguage) ---
+2026-10-03T20:08:38.760Z [INFO] --- stage enforce-probe (minutes left 45.5, language mode FullLanguage) ---
+2026-10-03T20:09:50.782Z [INFO] --- stage enforce-e2e (minutes left 44.3, language mode FullLanguage) ---
+2026-10-03T20:09:51.545Z [INFO] --- stage cleanup-remove (minutes left 44.3, language mode FullLanguage) ---
+2026-10-03T20:09:54.843Z [INFO] --- stage cleanup-events (minutes left 44.2, language mode FullLanguage) ---
+2026-10-03T20:10:05.549Z [INFO] checkpoint after-enforce: rc=0 publish-results: 37 files to upload, 0 skipped, out=D:\a\_temp\diag-out
+publish-results: ok -> refs/heads/diag-results/37150100607-1-sacrules-after-enforce-windows-2025 (commit e072dc3a40f27dbc37ac0fb165ebf9bf26b5fb1b), 37 files + manifest
+2026-10-03T20:10:05.555Z [INFO] === sacrules end ===
