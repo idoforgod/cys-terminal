@@ -209,6 +209,45 @@ fn settle_proof_on_pending_machine_body_awaiting_its_return() {
     assert!(ev["payload"]["settle_ms"].is_u64(), "{ev}");
 }
 
+/// ★(0.14.43 · C5) 정착 증명이 붙은 거부에는 유령 계수 처방(Ctrl-U)을 붙이지 않는다 — 증명 = 기계 제출이 진행 중이라 줄이 곧 빈다. 그 순간의
+/// 빈 입력줄은 유령이 아니다(처방하면 곧 풀릴 줄에 사람이 Ctrl-U 를 누르게 된다). 증명 접미(`[settle:<ms>]`)는 여전히 문구 맨 끝이다.
+#[test]
+fn c5_settle_proof_denial_never_carries_the_ghost_prescription() {
+    let fx = fx("c5-settle");
+    let t = agent_pane(&fx, "worker-1", P + 50);
+    let _x = pane(&fx, "worker-2", P + 51);
+    let _y = pane(&fx, "worker-3", P + 52);
+    assert_eq!(direct(&fx, Some(P + 51), &t, "M|x|AAA")["ok"], json!(true));
+    // 짝 Return 이 오기 전 — 계수는 남아 있다. 에코가 닿은 뒤 화면을 '빈 프롬프트' 로 칠하면 유령처럼 보이는 순간이다.
+    // (PTY 에코가 화면에 닿을 때까지 유계로 기다린다 — 늦게 닿은 에코가 칠한 픽스처를 덮지 않게. 부하가 큰 전량 실행에서도 안정.)
+    let echo_deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < echo_deadline && !t.parser.lock().unwrap().screen().contents().contains("M|x|AAA") {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    {
+        let mut p = t.parser.lock().unwrap();
+        p.process(b"\x1b[2J\x1b[H");
+        p.process("❯ ".as_bytes());
+    }
+    assert_eq!(
+        crate::governance::seat_input_line_visibility(&t).0,
+        Some(false),
+        "전제: 입력줄이 비어 보인다(증명이 없었다면 유령 처방 대상)"
+    );
+    assert!(counts(&t).0 > 0, "전제: 계수가 남아 있다");
+    let y = direct(&fx, Some(P + 52), &t, "M|y|BBB");
+    assert_eq!(y["ok"], json!(false), "{y}");
+    let m = msg(&y);
+    let h = settle_hint(&y).expect("전제: 정착 증명이 붙은 거부");
+    assert!(m.contains("[draft_gate:pending_input]"), "{m}");
+    assert!(!m.contains("Ctrl-U") && !m.contains("유령"), "증명이 붙은 거부에는 유령 처방이 없다: {m}");
+    assert!(m.ends_with(&cys::send_settle_suffix(h)), "증명 접미가 여전히 맨 끝: {m}");
+    let ev = last_denied(&fx).expect("거부 이벤트");
+    assert!(ev["payload"]["draft_visible"].is_null() && ev["payload"]["remedy_code"].is_null(), "{ev}");
+    assert!(ev["payload"]["settle_ms"].is_u64(), "{ev}");
+}
+
 // ─────────────────────────── 음성 대조(치명 방향) ───────────────────────────
 
 /// 사람 초안 앞에서는 증명이 없다 — 재시도 0회로 곧바로 큐(종전 바이트 · 이벤트 페이로드 불변).

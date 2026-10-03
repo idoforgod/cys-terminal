@@ -409,14 +409,44 @@ pub fn queue_delivered_payload(
 /// 에이전트다: hint 가 강제 배달 명령을 직접 지시하면 '경보 → 반사적 강제 드레인' 폭주
 /// 회로가 열린다. 문구는 **운영자(사람) 판단 전제**를 명시하고 자동 반응을 금지해야 하며,
 /// 이 상수의 문면은 아래 payload 핀 테스트가 고정한다(임의 수정 = 계약 변경).
-pub const QUEUE_STARVED_HINT: &str = "큐 머리가 장기 대기 중(게이트에 막힘) — 운영자(사람) \
+///
+/// ★(0.14.43 · C5) 문면 정정 — 종전 문면("운영자 판단 하에 cys queue deliver 로 강제 배달 가능")은 틀린 안내였다: 강제 배달은 quiet·간격
+/// 대기만 건너뛰고 초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다(`prompt gate refused … 면제 불가`). 의미(운영자(사람) 판단 전제 ·
+/// LLM 자동 반응 금지)는 그대로 두고 **조치는 `remedy` 를 보라** 고 가리킨다. 종전 문면은 [`QUEUE_STARVED_HINT_LEGACY`] 로 보존하고 env
+/// `CYS_QUEUE_STARVED_HINT_LEGACY=1` 이면 그것을 싣는다(롤백 노브 · [`starved_hint_for`]).
+pub const QUEUE_STARVED_HINT: &str = "큐 머리가 장기 대기 중(게이트에 막힘) — 조치는 remedy 참조. \
+     강제 배달(cys queue deliver)은 quiet·간격 대기만 건너뛰고 초안·모달·승인·전체화면·작업 중 \
+     게이트는 면제하지 않는다(운영자(사람) 판단 전제). LLM 에이전트는 이 경보에 자동 반응(강제 \
+     배달·드레인) 금지";
+
+/// ★(0.14.43 · C5) 종전(0.14.42 이하) hint 문면 — 바이트 보존. `CYS_QUEUE_STARVED_HINT_LEGACY=1` 로 되돌릴 때만 쓴다.
+pub const QUEUE_STARVED_HINT_LEGACY: &str = "큐 머리가 장기 대기 중(게이트에 막힘) — 운영자(사람) \
      판단 하에 cys queue deliver 로 강제 배달 가능. LLM 에이전트는 이 경보에 자동 반응(강제 \
      배달·드레인) 금지";
+
+/// hint 문면 선택(순수) — `legacy` 면 종전 문면, 아니면 정정 문면. env 를 읽지 않는다(검체는 이 함수로 두 갈래를 고정한다).
+pub fn starved_hint_for(legacy: bool) -> &'static str {
+    if legacy {
+        QUEUE_STARVED_HINT_LEGACY
+    } else {
+        QUEUE_STARVED_HINT
+    }
+}
+
+/// env `CYS_QUEUE_STARVED_HINT_LEGACY` 값 해석(순수) — 앞뒤 공백을 무시한 `1` 만 종전 문면이다(그 밖·부재 = 정정 문면).
+pub fn starved_hint_legacy_from_env(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("1")
+}
 
 /// queue.starved payload — 기아 경보(신규 이벤트·G1 W2-D). depth_high(적체 **양** 경보)와
 /// 별도 축: depth 1이라도 머리가 오래 막혀 있으면 기아다. waited_secs 는 uptime 클램프
 /// (governance::queue_head_wait_secs) 값 — 부트 전 대기는 세지 않는다. 발행 전용
 /// 쿨다운(5분)은 governance 발행처가 관리한다.
+///
+/// ★(0.14.43 · C5) 가산 키 8개 — `pending_input_bytes`·`pending_input_human_bytes`·`draft_visible`·`ghost_after_cursor`·`parser_panics`·
+/// `input_model`(좌석 진단 스냅샷 = [`crate::governance::QueueBlockDiag`])과 `remedy_code`·`remedy`(무엇을 하면 풀리는가 —
+/// [`crate::governance::queue_remedy`]). 기존 키(`surface_ref`·`role`·`head_entry_id`·`waited_secs`·`depth`·`blocked_by`·`hint`)는
+/// 이름·의미 불변이다. `draft_visible`·`ghost_after_cursor` 는 관측 불능이면 `null`(결측은 값이 아니다).
 pub fn queue_starved_payload(
     surface_ref: &str,
     role: Option<String>,
@@ -424,7 +454,9 @@ pub fn queue_starved_payload(
     waited_secs: u64,
     depth: usize,
     blocked_by: &str,
+    diag: &crate::governance::QueueBlockDiag,
 ) -> Value {
+    let (remedy_code, remedy) = crate::governance::queue_remedy(blocked_by, diag);
     json!({
         "surface_ref": surface_ref,
         "role": role,
@@ -432,7 +464,17 @@ pub fn queue_starved_payload(
         "waited_secs": waited_secs,
         "depth": depth,
         "blocked_by": blocked_by,
-        "hint": QUEUE_STARVED_HINT,
+        "hint": starved_hint_for(starved_hint_legacy_from_env(
+            std::env::var("CYS_QUEUE_STARVED_HINT_LEGACY").ok().as_deref(),
+        )),
+        "pending_input_bytes": diag.pending_input_bytes,
+        "pending_input_human_bytes": diag.pending_input_human_bytes,
+        "draft_visible": diag.draft_visible,
+        "ghost_after_cursor": diag.ghost_after_cursor,
+        "parser_panics": diag.parser_panics,
+        "input_model": diag.input_model,
+        "remedy_code": remedy_code,
+        "remedy": remedy,
     })
 }
 
@@ -3266,6 +3308,12 @@ pub struct Daemon {
     /// 승인된 메시지가 사라진다(일시적 공유 위반·권한 오류만으로 유실). 표식 + 틱 재시도는
     /// 유실 창을 "실패 후 다음 틱(≤5s) 안의 크래시" 로 줄이고, 응답에는 `durable` 로 사실을 싣는다.
     pub queue_persist_dirty: AtomicBool,
+    /// ★(0.14.43 · C5) `queue-blocked.json`(막힘 사유 영속 파일 — `queue-state.json` 과 같은 폴더) **마지막 기록의 서명**
+    /// (좌석·사유·사유 시작 시각 — `governance::queue_blocked_sig`). `None` = 이 부트에서 아직 쓰지 않았다(첫 큐 틱이 1회 쓴다 —
+    /// 막힌 좌석이 없으면 빈 목록: 낡은 파일이 '지금 막힘' 으로 읽히지 않게). 기록은 큐 틱(단일 watchdog 흐름)에서만 한다.
+    pub queue_blocked_sig: Mutex<Option<String>>,
+    /// ★(0.14.43 · C5) 사유 파일 **강제 기록 요청** — 기아 경보(`queue.starved`)를 낸 틱·쓰기 실패 뒤에 선다. 큐 틱 끝이 소비한다.
+    pub queue_blocked_dirty: AtomicBool,
     /// ★(0.14.31 · 독립 판정 triage X4) **부팅이 큐 WAL 을 온전히 복원하지 못했다.**
     /// `queue_wal_durable`(=마지막 쓰기가 디스크에 닿았는가)과 **다른 사실**이다: 이 비트는
     /// "지금 메모리에 있는 큐가 재기동 이전의 전부인가" 를 말한다. false 로 시작하지 않고
@@ -4962,6 +5010,8 @@ impl Daemon {
             queue_expired_persisted: Mutex::new(expired_persisted_seed),
             queue_tick_at: Mutex::new(None),
             queue_persist_dirty: AtomicBool::new(false),
+            queue_blocked_sig: Mutex::new(None),
+            queue_blocked_dirty: AtomicBool::new(false),
             queue_restore_incomplete: AtomicBool::new(queue_restore_incomplete),
             queue_wal_unpreserved: Mutex::new(queue_wal_unpreserved),
             config: Config::from_env(),
@@ -10512,6 +10562,7 @@ mod tests {
     #[test]
     fn queue_starved_payload_pins_schema_and_operator_only_hint() {
         let head = w2b_entry("qs.3", 3, "오래 기다린 머리", 50.0);
+        let diag = c5_diag(None);
         let p = queue_starved_payload(
             "surface:7",
             Some("worker".into()),
@@ -10519,6 +10570,7 @@ mod tests {
             700,
             2,
             "busy(출력 중)",
+            &diag,
         );
         assert_eq!(p["surface_ref"], json!("surface:7"));
         assert_eq!(p["role"], json!("worker"));
@@ -10532,8 +10584,107 @@ mod tests {
         assert!(QUEUE_STARVED_HINT.contains("자동 반응"), "자동 반응 금지 명시");
         assert!(QUEUE_STARVED_HINT.contains("금지"), "금지 문면 존재");
         // role 없는 맨 셸 = null (depth_high 의 role 직렬화 관례와 동형).
-        let p2 = queue_starved_payload("surface:8", None, &head, 700, 1, "queue_paused(헬스 조치)");
+        let p2 = queue_starved_payload("surface:8", None, &head, 700, 1, "queue_paused(헬스 조치)", &diag);
         assert_eq!(p2["role"], json!(null));
+    }
+
+    // ─── ★(0.14.43 · C5) queue.starved 진단 필드·remedy·hint 정정 핀 ───────────────────────────────
+
+    /// 진단 스냅샷 픽스처 — 계수 1(사람 1) · 커서 뒤 고스트 있음 · v3.
+    fn c5_diag(draft_visible: Option<bool>) -> crate::governance::QueueBlockDiag {
+        crate::governance::QueueBlockDiag {
+            pending_input_bytes: 1,
+            pending_input_human_bytes: 1,
+            draft_visible,
+            ghost_after_cursor: Some(true),
+            parser_panics: 0,
+            paused: false,
+            input_model: "v3",
+        }
+    }
+
+    /// 가산 키 8개가 payload 에 실리고(값 = 진단 스냅샷 · remedy = 순수 표) 기존 키 7개는 이름·의미가 그대로다.
+    /// 관측 불능(`draft_visible = None`)은 `null` 이다 — 결측은 값이 아니다(false 로 접지 않는다).
+    #[test]
+    fn c5_starved_payload_adds_diag_and_remedy_keys_and_keeps_old_keys() {
+        let head = w2b_entry("qs.9", 9, "머리", 50.0);
+        let blocked = crate::governance::BLOCKED_INPUT_PENDING;
+        let p = queue_starved_payload("surface:5", Some("cso".into()), &head, 4200, 3, blocked, &c5_diag(Some(false)));
+        // 기존 키 7개 — 이름·값 불변.
+        assert_eq!(p["surface_ref"], json!("surface:5"));
+        assert_eq!(p["role"], json!("cso"));
+        assert_eq!(p["head_entry_id"], json!("qs.9"));
+        assert_eq!(p["waited_secs"], json!(4200));
+        assert_eq!(p["depth"], json!(3));
+        assert_eq!(p["blocked_by"], json!(blocked));
+        assert_eq!(p["hint"], json!(QUEUE_STARVED_HINT));
+        // 가산 키 8개.
+        assert_eq!(p["pending_input_bytes"], json!(1));
+        assert_eq!(p["pending_input_human_bytes"], json!(1));
+        assert_eq!(p["draft_visible"], json!(false));
+        assert_eq!(p["ghost_after_cursor"], json!(true));
+        assert_eq!(p["parser_panics"], json!(0));
+        assert_eq!(p["input_model"], json!("v3"));
+        assert_eq!(p["remedy_code"], json!("phantom_count_ctrl_u"), "사람 계수 1 + 입력줄 빈 화면 = 유령 계수");
+        let remedy = p["remedy"].as_str().expect("remedy 문장");
+        assert!(remedy.contains("Ctrl-U"), "유령 계수 처방: {remedy}");
+        assert!(remedy.ends_with(crate::governance::REMEDY_LLM_SUFFIX), "자동 조치 금지 접미: {remedy}");
+        assert_eq!(p.as_object().unwrap().len(), 15, "기존 7 + 가산 8 — 그 밖의 키가 새면 계약 변경이다: {p}");
+        // 관측 불능 = null(false 로 접지 않는다) — 사람 계수가 있고(표 2행 아님) 화면을 못 읽었으니 표 5행(`input_pending_unknown`)이다.
+        let p_none = queue_starved_payload("surface:5", None, &head, 4200, 3, blocked, &c5_diag(None));
+        assert!(p_none["draft_visible"].is_null(), "관측 불능은 null: {p_none}");
+        assert_eq!(p_none["remedy_code"], json!("input_pending_unknown"));
+        let mut paused = c5_diag(Some(true));
+        paused.paused = true;
+        let p_paused = queue_starved_payload("surface:5", None, &head, 4200, 3, blocked, &paused);
+        assert_eq!(p_paused["remedy_code"], json!("paused"), "동결은 어느 사유보다 앞선다");
+    }
+
+    /// hint 문면 정정 — 종전 문면의 "강제 배달 가능" 오류를 고치되 의미(운영자(사람) 판단 전제 · LLM 자동 반응 금지)는 유지하고,
+    /// 종전 문면은 LEGACY 로 바이트 보존한다. env 를 건드리지 않는다(`starved_hint_for` · `starved_hint_legacy_from_env` 순수 함수).
+    #[test]
+    fn c5_starved_hint_corrected_text_and_legacy_branch() {
+        assert_eq!(starved_hint_for(false), QUEUE_STARVED_HINT);
+        assert_eq!(starved_hint_for(true), QUEUE_STARVED_HINT_LEGACY);
+        assert_ne!(QUEUE_STARVED_HINT, QUEUE_STARVED_HINT_LEGACY);
+        // 정정 문면: 조치는 remedy 를 가리키고, 강제 배달이 면제하지 않는 게이트를 말하며, 의미(사람 판단·자동 반응 금지)는 유지한다.
+        for must in [
+            "조치는 remedy 참조",
+            "quiet·간격 대기만 건너뛰고",
+            "초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다",
+            "운영자(사람) 판단",
+            "자동 반응",
+            "금지",
+        ] {
+            assert!(QUEUE_STARVED_HINT.contains(must), "정정 문면에 {must:?} 가 있어야 한다: {QUEUE_STARVED_HINT}");
+        }
+        assert!(!QUEUE_STARVED_HINT.contains("강제 배달 가능"), "틀린 안내('강제 배달 가능')가 남았다");
+        assert_eq!(
+            QUEUE_STARVED_HINT,
+            "큐 머리가 장기 대기 중(게이트에 막힘) — 조치는 remedy 참조. 강제 배달(cys queue deliver)은 quiet·간격 대기만 건너뛰고 \
+             초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다(운영자(사람) 판단 전제). LLM 에이전트는 이 경보에 자동 반응(강제 \
+             배달·드레인) 금지",
+            "정정 문면 바이트 고정"
+        );
+        // 종전 문면 바이트 보존(롤백 노브가 되돌리는 값).
+        assert_eq!(
+            QUEUE_STARVED_HINT_LEGACY,
+            "큐 머리가 장기 대기 중(게이트에 막힘) — 운영자(사람) 판단 하에 cys queue deliver 로 강제 배달 가능. LLM 에이전트는 이 경보에 \
+             자동 반응(강제 배달·드레인) 금지",
+            "LEGACY 문면은 종전 바이트 그대로"
+        );
+        // env 해석 — 공백을 무시한 `1` 만 종전 문면이다.
+        for (v, want) in [
+            (Some("1"), true),
+            (Some(" 1 "), true),
+            (None, false),
+            (Some("0"), false),
+            (Some(""), false),
+            (Some("true"), false),
+            (Some("11"), false),
+        ] {
+            assert_eq!(starved_hint_legacy_from_env(v), want, "{v:?}");
+        }
     }
 
     // ═══════════ ★(0.14.31 · WP-5) TTL 순수 규칙·WAL 왕복·만료 파일 분리·순서 키 검체(wp5_*) ═══════════

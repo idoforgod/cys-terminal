@@ -56,6 +56,32 @@ describe("재기동 주입 — 계수에 따라 제출 방식을 고르고 사�
     });
   }
 
+  // ★(0.14.43 · C5) 유령 계수 처방 — 계수는 남았는데 입력줄이 비어 보이면 사람이 그 창에서 Ctrl-U 한 번이면 풀린다.
+  test("사람 초안 보류 문구 끝에 유령 계수 처방(그 창을 클릭하고 Ctrl-U 한 번)을 덧붙인다 — 앞 문구는 그대로", () => {
+    const plan = planRestartInject(cmd, { pending_input_bytes: 3, pending_input_human_bytes: 3 });
+    if (plan.mode !== "refuse") throw new Error("사람 초안이 있으면 재기동을 보류해야 한다");
+    const legacy = "사람이 작성 중인 초안이 있습니다. 초안을 제출하거나 삭제한 뒤 재시도하세요.";
+    const hint = "입력줄이 비어 보이면 그 창을 클릭하고 Ctrl-U 를 한 번 누르세요.";
+    expect(plan.reason).toBe(`${legacy} ${hint}`);
+    expect(plan.reason.startsWith(legacy)).toBe(true);
+    expect(plan.reason.endsWith(hint)).toBe(true);
+    // 사람이 하는 일이다 — 기계가 키를 보낸다는 문면이 아니다.
+    expect(plan.reason).toContain("누르세요");
+    expect(plan.reason).not.toContain("자동");
+  });
+
+  test("보류가 아닌 계획(계수 0 · 기계 잔여만)에는 처방 문구가 없다", () => {
+    for (const obs of [
+      { pending_input_bytes: 0, pending_input_human_bytes: 0 },
+      { pending_input_bytes: 24, pending_input_human_bytes: 0 },
+      {},
+    ]) {
+      const plan = planRestartInject(cmd, obs);
+      expect(plan.mode).not.toBe("refuse");
+      expect(JSON.stringify(plan)).not.toContain("Ctrl-U");
+    }
+  });
+
   const invalidCounts = [
     { label: "음수", value: -1 },
     { label: "숫자가 아닌 값", value: NaN },

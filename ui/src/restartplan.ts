@@ -21,9 +21,13 @@ export function planRestartInject(cmd: string, obs: {
   pending_input_human_bytes?: number | null;
 }): RestartInjectPlan {
   if (pendingCount(obs.pending_input_human_bytes) > 0) {
+    // ★(0.14.43 · C5) 계수가 남았는데 입력줄이 비어 보이면 유령 계수다(단독 Esc·Backspace·글자를 치고 전부 지운 줄 등) — 사람이 그 창에서
+    //   Ctrl-U 한 번이면 풀린다. 기계가 키를 보내는 길은 없다(사람이 누른다).
     return {
       mode: "refuse",
-      reason: "사람이 작성 중인 초안이 있습니다. 초안을 제출하거나 삭제한 뒤 재시도하세요.",
+      reason:
+        "사람이 작성 중인 초안이 있습니다. 초안을 제출하거나 삭제한 뒤 재시도하세요. " +
+        "입력줄이 비어 보이면 그 창을 클릭하고 Ctrl-U 를 한 번 누르세요.",
     };
   }
   if (pendingCount(obs.pending_input_bytes) > 0) {

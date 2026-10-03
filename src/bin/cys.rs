@@ -1850,9 +1850,121 @@ fn queue_list_full_block(e: &Value) -> Vec<String> {
     out
 }
 
+/// ★(0.14.43 · C5) `cys queue list` 텍스트 모드의 **막힘 안내**(순수) — 막힌 좌석당 1줄 `# surface:N blocked_by=… (Ns) → <remedy>`.
+///
+/// 어디로 나가나: **stderr** 다. stdout 의 6열 행 계약(`queue_list_row` · cols[3]=preview 를 javis_boot_node 가 파싱)은 한 글자도 바뀌지 않는다
+/// — 안내는 사람이 읽는 표면이고 행 파서는 stderr 를 보지 않는다. 좌석당 1줄(같은 좌석의 여러 행은 첫 행의 값 = 좌석 단위 값),
+/// 첫 등장 순서 보존. `blocked_by` 가 null 인 행(막히지 않은 좌석·만료·복원 행)은 건너뛴다. `(Ns)` = 막힌 지 N 초(`blocked_since` 벽시계 ·
+/// 표시용 — 시계 역행은 0 으로 접는다). `remedy` 키가 없으면(구 데몬) 화살표 뒷부분만 생략한다 — 줄바꿈·탭은 공백으로 접는다.
+fn queue_blocked_notice_lines(entries: &[Value], now: f64) -> Vec<String> {
+    let fold = |s: &str| s.replace(['\n', '\r', '\t'], " ");
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for e in entries {
+        let Some(blocked_by) = e["blocked_by"].as_str() else {
+            continue;
+        };
+        let sref = e["surface_ref"].as_str().unwrap_or("?");
+        if seen.contains(&sref) {
+            continue;
+        }
+        seen.push(sref);
+        let age = e["blocked_since"]
+            .as_f64()
+            .map(|t| format!(" ({}s)", (now - t).max(0.0) as u64))
+            .unwrap_or_default();
+        let remedy = e["remedy"].as_str().map(|r| format!(" → {}", fold(r))).unwrap_or_default();
+        out.push(format!("# {sref} blocked_by={}{age}{remedy}", fold(blocked_by)));
+    }
+    out
+}
+
 #[cfg(test)]
 mod queue_list_row_tests {
     use super::*;
+
+    /// ★(0.14.43 · C5) 막힘 안내(stderr) — 막힌 좌석당 1줄 `# surface:N blocked_by=… (Ns) → <remedy>`. 막히지 않은 좌석·만료·복원 행은 건너뛰고,
+    /// 같은 좌석의 여러 행은 한 줄이며, **stdout 의 6열 행 계약은 가산 키(remedy_code·remedy·draft_visible·ghost_after_cursor)에 영향받지 않는다.**
+    #[test]
+    fn c5_queue_blocked_notice_lines_one_per_blocked_seat_and_row_contract_unchanged() {
+        let blocked = |index: u64, id: &str| {
+            serde_json::json!({
+                "surface_ref": "surface:3", "index": index, "bytes": 12, "preview": "보고 본문", "id": id, "age_secs": 45,
+                "blocked_by": "input_pending(입력줄에 미제출 입력)", "blocked_since": 1000.0,
+                "remedy_code": "phantom_count_ctrl_u", "remedy": "입력줄은 비어 보이는데 미제출 계수가 남았다 · LLM 에이전트는 자동 조치 금지",
+                "draft_visible": false, "ghost_after_cursor": true,
+            })
+        };
+        let free = serde_json::json!({
+            "surface_ref": "surface:4", "index": 0, "bytes": 3, "preview": "x", "id": "q9", "age_secs": 1,
+            "blocked_by": null, "blocked_since": null, "remedy_code": null, "remedy": null,
+            "draft_visible": null, "ghost_after_cursor": null,
+        });
+        let expired = serde_json::json!({"surface_ref": "surface:5", "index": null, "expired": true, "bytes": 1, "preview": "e",
+            "id": "qe", "age_secs": 9, "blocked_by": null, "blocked_since": null});
+        let restored = serde_json::json!({"surface_id": 7, "restored": true, "mid": "m", "bytes": 1, "preview": "r"});
+        let entries = vec![blocked(0, "q1"), free, blocked(1, "q2"), expired, restored];
+        let lines = queue_blocked_notice_lines(&entries, 1030.4);
+        assert_eq!(
+            lines,
+            vec![
+                "# surface:3 blocked_by=input_pending(입력줄에 미제출 입력) (30s) → 입력줄은 비어 보이는데 미제출 계수가 남았다 · LLM 에이전트는 자동 조치 금지"
+                    .to_string()
+            ],
+            "막힌 좌석당 정확히 1줄(같은 좌석의 두 행은 한 줄)"
+        );
+        // 6열 행 계약 — 가산 키가 있어도 행은 한 글자도 바뀌지 않는다(열 위치 · cols[3]=preview).
+        for e in &entries {
+            let row = queue_list_row(e);
+            let mut stripped = e.clone();
+            if let Some(o) = stripped.as_object_mut() {
+                for k in ["blocked_by", "blocked_since", "remedy_code", "remedy", "draft_visible", "ghost_after_cursor"] {
+                    o.remove(k);
+                }
+            }
+            assert_eq!(row, queue_list_row(&stripped), "가산 키가 stdout 행을 바꿨다: {e}");
+            assert_eq!(row.split('\t').count(), 6, "6열: {row}");
+            assert!(!row.contains("blocked_by") && !row.contains('#'), "행에 안내가 섞였다: {row}");
+        }
+        // 막힌 좌석이 없으면 안내도 없다.
+        assert!(queue_blocked_notice_lines(&[], 1.0).is_empty());
+        assert!(queue_blocked_notice_lines(&entries[1..2], 1.0).is_empty());
+    }
+
+    /// 막힘 안내의 결측·구 데몬·경계 — remedy 키가 없으면 화살표만 생략, blocked_since 가 없으면 (Ns) 만 생략, 시계 역행은 0 으로 접고,
+    /// 개행·탭은 공백으로 접어 한 줄을 지킨다. 좌석 첫 등장 순서를 보존한다.
+    #[test]
+    fn c5_queue_blocked_notice_lines_tolerate_old_daemons_and_fold_whitespace() {
+        let old = serde_json::json!({"surface_ref": "surface:2", "index": 0, "blocked_by": "busy(출력 중)", "blocked_since": 500.0});
+        assert_eq!(
+            queue_blocked_notice_lines(std::slice::from_ref(&old), 560.9),
+            vec!["# surface:2 blocked_by=busy(출력 중) (60s)".to_string()],
+            "구 데몬(remedy 키 없음): 화살표만 생략"
+        );
+        let no_since = serde_json::json!({"surface_ref": "surface:2", "blocked_by": "busy(출력 중)", "remedy": "스스로 풀린다"});
+        assert_eq!(
+            queue_blocked_notice_lines(&[no_since], 10.0),
+            vec!["# surface:2 blocked_by=busy(출력 중) → 스스로 풀린다".to_string()],
+            "blocked_since 결측: (Ns) 만 생략"
+        );
+        assert_eq!(
+            queue_blocked_notice_lines(std::slice::from_ref(&old), 100.0),
+            vec!["# surface:2 blocked_by=busy(출력 중) (0s)".to_string()],
+            "시계 역행(now < since)은 0 으로 접는다"
+        );
+        let messy = serde_json::json!({"surface_ref": "surface:9", "blocked_by": "a\tb", "blocked_since": 1.0, "remedy": "줄1\n줄2\r\n줄3"});
+        let lines = queue_blocked_notice_lines(&[messy], 2.0);
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains('\n') && !lines[0].contains('\r') && !lines[0].contains('\t'), "한 줄 불변식: {:?}", lines[0]);
+        assert_eq!(lines[0], "# surface:9 blocked_by=a b (1s) → 줄1 줄2  줄3");
+        // 첫 등장 순서 보존(좌석 id 정렬이 아니다).
+        let mk = |sref: &str| serde_json::json!({"surface_ref": sref, "blocked_by": "busy(출력 중)", "blocked_since": 0.0});
+        let order: Vec<String> = queue_blocked_notice_lines(&[mk("surface:9"), mk("surface:2"), mk("surface:9")], 1.0)
+            .iter()
+            .map(|l| l.split(' ').nth(1).unwrap().to_string())
+            .collect();
+        assert_eq!(order, vec!["surface:9", "surface:2"]);
+    }
 
     /// ★B3 #11: 전문 블록은 줄 단위로 접두되고, `text` 부재(구 데몬)면 조용히 비어야 한다.
     #[test]
@@ -5068,6 +5180,8 @@ fn run(command: Command) -> i32 {
                         if entries.is_empty() {
                             println!("(queue empty)");
                         }
+                        // ★(0.14.43 · C5) 막힌 좌석 안내 — stderr(행 계약 불변 · 순수 도우미 `queue_blocked_notice_lines`).
+                        let notices = queue_blocked_notice_lines(&entries, now_secs_f64());
                         if full {
                             // ★B3 #11 운영자 안내(stdout 아닌 stderr — 행 파서 무오염):
                             //   "목록이 비었는데 본문은 어디 있나" 의 답이다. 미배달 본문의 정본은
@@ -5086,6 +5200,9 @@ fn run(command: Command) -> i32 {
                             for line in queue_list_full_block(&e) {
                                 println!("{line}");
                             }
+                        }
+                        for line in notices {
+                            eprintln!("{line}");
                         }
                         0
                     })

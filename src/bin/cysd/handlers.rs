@@ -2324,10 +2324,15 @@ fn typing_guard_secs() -> u64 {
 /// D-12 거부 관측·응답의 단일 경로. leaf 락을 놓은 뒤 이벤트를 1건 발행한다.
 /// ★(0.14.42 · S21-SETTLE) `settle_hint` = 정착 증명(재시도 힌트 ms) — 있으면 문구 끝에 ` [settle:<ms>]`, 이벤트에
 /// 가산 키 `settle_ms`. 없으면(send_key·증명 없는 거부) 응답·이벤트 바이트가 종전과 같다.
+/// ★(0.14.43 · C5) 유령 계수 처방 — 사유가 `pending_input`/`human_draft` 계열이고 입력줄이 **비어 보일 때만**(`draft_visible == Some(false)`) 응답 문구
+/// **맨 끝**에 [`governance::GHOST_CTRL_U_SUFFIX`](사람이 그 창에서 Ctrl-U 한 번)를 덧붙이고, 이벤트에 `draft_visible`·`remedy_code` 를 싣는다.
+/// 앞 문구(`MSG_TYPING_GUARD`·`MSG_DRAFT_GATE_CANCEL_KEY` 접두 · `[draft_gate:<reason>]` · settle 접미 · hint)의 위치·바이트는 불변이다 —
+/// 구 CLI 의 `contains(MSG_TYPING_GUARD)` 폴백과 신 CLI 의 settle 파서가 깨지지 않는다. 초안이 보이거나(`Some(true)`) 관측 불능(`None`)이거나
+/// 정착 증명이 붙은 거부(기계 제출이 진행 중 — 곧 비는 줄)이면 종전 문구 그대로다. 호출 지점은 전부 `input_gate` 를 **놓은 뒤**다(파서 락 안전).
 #[allow(clippy::too_many_arguments)]
 fn draft_gate_denied_response(
-    daemon: &Daemon,
-    surface: &crate::state::Surface,
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
     id: &Value,
     kind: DirectSendKind,
     why: DraftGateDenied,
@@ -2343,6 +2348,16 @@ fn draft_gate_denied_response(
     let settle_hint = settle_hint.filter(|_| !daemon.paused.load(Ordering::Relaxed));
     let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
     let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
+    // ★(0.14.43 · C5) 입력줄 가시성 — 계수 계열 사유에서만 화면을 읽는다(그 밖은 관측하지 않는다 · null). 정착 증명이 붙는 거부는 기계 제출이 진행
+    //   중이라 줄이 곧 빈다 — 그때의 빈 줄은 유령이 아니므로 관측하지 않는다(처방 없음).
+    let draft_visible: Option<bool> = if settle_hint.is_none()
+        && matches!(why, DraftGateDenied::PendingInput { .. } | DraftGateDenied::HumanDraft { .. })
+    {
+        governance::seat_input_line_visibility(surface).0
+    } else {
+        None
+    };
+    let ghost = draft_visible == Some(false);
     let mut payload = json!({
         "surface_ref": cys::surface_ref(surface.id),
         "kind": match kind {
@@ -2355,6 +2370,9 @@ fn draft_gate_denied_response(
         "pending_input_bytes": pending,
         "pending_input_human_bytes": human,
         "from": verified_from.map(cys::surface_ref),
+        // ★(0.14.43 · C5) 가산 키 — `remedy_code` 는 이 응답에 **처방이 붙었을 때만**(유령 계수) 값이 있다(`queue_remedy` 코드 어휘).
+        "draft_visible": draft_visible,
+        "remedy_code": ghost.then_some(governance::REMEDY_CODE_PHANTOM),
     });
     if let Some(ms) = settle_hint {
         payload["settle_ms"] = json!(ms);
@@ -2378,6 +2396,10 @@ fn draft_gate_denied_response(
     if let Some(hint) = hint {
         message.push(' ');
         message.push_str(hint);
+    }
+    // ★(0.14.43 · C5) 유령 계수 처방은 **맨 끝** — 위 접두·태그·접미·hint 의 위치와 바이트는 그대로다.
+    if ghost {
+        message.push_str(governance::GHOST_CTRL_U_SUFFIX);
     }
     err_response(id, cys::ERR_TYPING_GUARD, &message)
 }
@@ -9210,10 +9232,22 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .collect();
             let live = live_cwds(&pids);
             let surfaces = daemon.surfaces.lock().unwrap();
+            // ★(0.14.43 · C5) 막힌 좌석(이 순회에서 사유를 읽은 좌석)의 조치 코드는 `surfaces` 가드를 **놓은 뒤** 계산한다 — 진단이 파서·어댑터를
+            //   읽기 때문이다(좌석 맵 락을 쥔 채 파서 락을 잡지 않는다).
+            let mut remedy_todo: Vec<(Arc<crate::state::Surface>, String)> = Vec::new();
             let mut list: Vec<Value> = surfaces
                 .values()
                 .map(|s| {
                     let live_cwd = live.get(&s.pid).cloned();
+                    // ★(0.14.43 · C5) 큐 막힘 사유·시작 시각 — 큐가 비면 막힘이 아니다(낡은 사유 기록은 싣지 않는다 · null).
+                    //   (두 락을 겹쳐 쥐지 않는다 — `queue_blocked` 는 복제 뒤 놓고 `pending_queue` 는 그다음 순간만.)
+                    let queue_blocked = {
+                        let blocked = s.queue_blocked.lock().unwrap().clone();
+                        blocked.filter(|_| !s.pending_queue.lock().unwrap().is_empty())
+                    };
+                    if let Some((why, _)) = &queue_blocked {
+                        remedy_todo.push((s.clone(), why.clone()));
+                    }
                     let status = s.agent_status.lock().unwrap().clone().map(|st| {
                         json!({"state": st.state, "context_pct": st.context_pct,
                                "task": st.task, "age_secs": (now - st.updated_at).max(0.0) as u64})
@@ -9253,6 +9287,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "idle_secs": s.last_output.lock().unwrap().elapsed().as_secs(),
                         "queue_depth": s.pending_queue.lock().unwrap().len(),
                         "queue_paused": queue_paused,
+                        // ★(0.14.43 · C5) 가산 키 3개(막힘 없으면 null) — 조치 코드는 아래 `remedy_todo` 가 가드 해제 뒤 채운다.
+                        "queue_blocked_by": queue_blocked.as_ref().map(|(why, _)| why.clone()),
+                        "queue_blocked_since": queue_blocked.as_ref().map(|(_, at)| *at),
+                        "queue_remedy_code": Value::Null,
                         "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
                         "pending_input_human_bytes": pending_input_human_bytes,
                         "input_paste_open": input_paste_open,
@@ -9324,6 +9362,14 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .collect();
             drop(surfaces);
             list.sort_by_key(|v| v["surface_id"].as_u64().unwrap_or(0));
+            // ★(0.14.43 · C5) 막힌 좌석의 조치 코드 — 좌석 맵 락을 놓은 뒤 좌석당 진단 1회(파서 읽기 포함 · 큐 락 없음).
+            for (s, why) in &remedy_todo {
+                let diag = crate::governance::queue_block_diag(daemon, s);
+                let (code, _) = crate::governance::queue_remedy(why, &diag);
+                if let Some(v) = list.iter_mut().find(|v| v["surface_id"].as_u64() == Some(s.id)) {
+                    v["queue_remedy_code"] = json!(code);
+                }
+            }
             let (pending, oldest_age) = {
                 let items = daemon.feed_items.lock().unwrap();
                 let pending: Vec<&FeedItem> =
@@ -9452,6 +9498,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                "protocol_version": cys::pack::PHOENIX_PROTOCOL_VERSION,
                                // (W4) 데몬 전체 파서 패닉 격리 누적 — health 신호.
                                "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed),
+                               // ★(0.14.43 · C5) 입력줄 계수 모델("v2"|"v3") — 이 프로세스가 쓰는 값(env `CYS_PENDING_INPUT_MODEL` · 기동 1회 판독).
+                               "pending_input_model": crate::governance::PendingInputModel::current().as_str(),
                                // ★codex R1 #2 — T2-4 '경고만' 정책의 **폴링 소비자**.
                                //   pane 고지는 그 자리에 있던 사람만 보지만 preflight·doctor 는
                                //   이 축을 읽어 "봉인이 깨질 예정"을 상시 진단한다. 판정·술어는
@@ -10229,9 +10277,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 let now = crate::state::now_epoch();
                 // ★B1(0.14.30): 마지막 보류 사유·시각 — 운영자가 "왜 안 가나" 를 화면 폴링
                 //   없이 안다(경보는 쿨다운·임계에 걸려 매 틱 말하지 않는다). 배달되면 지워진다.
-                let (blocked_by, blocked_since) = match s.queue_blocked.lock().unwrap().clone() {
+                let blocked = s.queue_blocked.lock().unwrap().clone();
+                let (blocked_by, blocked_since) = match &blocked {
                     Some((why, at)) => (json!(why), json!(at)),
                     None => (Value::Null, Value::Null),
+                };
+                // ★(0.14.43 · C5) 막힌 좌석이면 진단 스냅샷을 **좌석당 1회**(같은 좌석 행은 같은 값) — 무엇을 하면 풀리는가(`remedy_code`·`remedy`)와
+                //   입력줄 가시성(`draft_visible`·`ghost_after_cursor` · 관측 불능 null). 파서·어댑터를 읽으므로 아래 `pending_queue` 락을 **잡기 전**에
+                //   뜬다(락 순서: 파서 락은 큐 락 밖). 큐가 비었거나 막히지 않은 좌석은 전부 null(진단 비용 0).
+                let (remedy_code, remedy, draft_visible, ghost_after_cursor) = match &blocked {
+                    Some((why, _)) if !s.pending_queue.lock().unwrap().is_empty() => {
+                        let diag = crate::governance::queue_block_diag(daemon, s);
+                        let (code, sentence) = crate::governance::queue_remedy(why, &diag);
+                        (json!(code), json!(sentence), json!(diag.draft_visible), json!(diag.ghost_after_cursor))
+                    }
+                    _ => (Value::Null, Value::Null, Value::Null, Value::Null),
                 };
                 // ★(0.14.39 · WP-C-input · D-01 v2 6항) 종전엔 reset 이벤트 stale_bytes 로만 관측 가능했다 · 소비자(팩·GUI)는 부재(null)를 '모름' 으로 접는다.
                 let (pending_input_human_bytes, input_paste_open) = {
@@ -10254,6 +10314,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
                         "pending_input_human_bytes": pending_input_human_bytes,
                         "input_paste_open": input_paste_open,
+                        // ★(0.14.43 · C5) 가산 키 4개 — 좌석 단위 값(위 진단 스냅샷).
+                        "remedy_code": remedy_code, "remedy": remedy,
+                        "draft_visible": draft_visible, "ghost_after_cursor": ghost_after_cursor,
                     });
                     if full {
                         row["text"] = json!(e.text);
@@ -10278,6 +10341,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "pending_input_bytes": s.pending_input_bytes.load(Ordering::Relaxed),
                             "pending_input_human_bytes": pending_input_human_bytes,
                             "input_paste_open": input_paste_open,
+                            // ★(0.14.43 · C5) 만료 행은 막힘이 없다 — 활성 행과 같은 키 집합(null).
+                            "remedy_code": Value::Null, "remedy": Value::Null,
+                            "draft_visible": Value::Null, "ghost_after_cursor": Value::Null,
                         });
                         if full {
                             row["text"] = json!(e.text);
@@ -16640,8 +16706,319 @@ mod tests {
                 "pending_input_bytes": 11,
                 "pending_input_human_bytes": 11,
                 "from": cys::surface_ref(sender.id),
+                // ★(0.14.43 · C5) 가산 키 — 이 좌석은 화면에 프롬프트 줄이 없어 입력줄을 관측하지 못했다(null = 결측은 값이 아니다).
+                "draft_visible": null,
+                "remedy_code": null,
             }));
         }
+    }
+
+    // ═══════════ ★(0.14.43 · C5) 큐 정체 진단 표면 — 직접 send 거부 문구 · queue.list · org.status ═══════════
+    //
+    // 어떤 게이트 판정도 바뀌지 않는다(거부/통과 결과 불변) — 문구·필드만 잰다.
+
+    /// 좌석 화면에 프롬프트 한 줄을 칠한다(PTY 쓰기 없음 — 에코가 픽스처를 덮지 않는다). `ghost` 는 커서 뒤에 남는 입력 추천 문구.
+    fn c5_paint_prompt(s: &Arc<crate::state::Surface>, typed: &str, ghost: &str) {
+        let mut p = s.parser.lock().unwrap();
+        p.process(b"\x1b[2J\x1b[H");
+        p.process(format!("❯ {typed}").as_bytes());
+        if !ghost.is_empty() {
+            // 열 계산을 손으로 하지 않는다 — 고스트를 쓰기 전 커서를 파서에게 물어 그 자리로 되돌린다(한글 = 2열).
+            let (row, col) = p.screen().cursor_position();
+            p.process(ghost.as_bytes());
+            p.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+        }
+    }
+
+    /// 에이전트 좌석(claude 어댑터 → 프롬프트 마커 `❯`) — 사람 계수 `human_bytes` 를 PTY 쓰기 없이 바로 건다.
+    fn c5_agent_seat(daemon: &Arc<Daemon>, role: &str, pid: u32, human_bytes: usize) -> Arc<crate::state::Surface> {
+        let t = v7_pane(daemon, role, pid);
+        *t.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
+        if human_bytes > 0 {
+            t.apply_pending_input(&vec![b'a'; human_bytes], crate::governance::InputOrigin::Human);
+        }
+        *t.last_human_input.lock().unwrap() = None;
+        t
+    }
+
+    /// 마지막 `queue.draft_gate_denied` 이벤트 payload.
+    fn c5_last_denied_payload(daemon: &Arc<Daemon>) -> Value {
+        daemon
+            .bus
+            .tail(400)
+            .into_iter()
+            .filter(|e| e["name"] == "queue.draft_gate_denied")
+            .last()
+            .map(|e| e["payload"].clone())
+            .expect("거부 이벤트")
+    }
+
+    /// 직접 send 거부 — **유령 계수**(계수 > 0 인데 입력줄이 비어 보임)에서만 응답 문구 맨 끝에 사람 처방(Ctrl-U)이 붙는다.
+    /// 앞 문구(`MSG_TYPING_GUARD` 접두 · `[draft_gate:<reason>]` 태그)는 위치·바이트 불변이고, 초안이 보이거나 관측 불능이면 종전 문구와 바이트 동일하다.
+    #[test]
+    fn c5_direct_send_denial_appends_ctrl_u_only_for_ghost_count() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("c5-ghost-deny", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_810;
+        let _sender = v7_pane(&daemon, "worker-9", pid);
+        let suffix = crate::governance::GHOST_CTRL_U_SUFFIX;
+        let text_params = |t: &Arc<crate::state::Surface>| {
+            json!({"surface_id": t.id, "text": "hello", "human": false, "queued": false, "quiet": true})
+        };
+        let legacy_text = |reason: &str| format!("{} [{}:{reason}]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG);
+
+        // ⓐ 유령 — 사람 계수 3 · 빈 입력줄(커서 뒤 고스트) → 문구 끝에 처방 · 이벤트에 draft_visible=false · remedy_code.
+        let ghost = c5_agent_seat(&daemon, "worker-1", pid + 1, 3);
+        c5_paint_prompt(&ghost, "", "버그 수정 착수한다. 브랜치는");
+        let before = d12_input_counts(&ghost);
+        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&ghost));
+        d12_assert_denied(&resp, "pending_input");
+        let m = resp["error"]["message"].as_str().unwrap().to_string();
+        assert_eq!(m, format!("{}{suffix}", legacy_text("pending_input")), "접두·태그는 그대로 · 처방은 맨 끝");
+        assert!(m.contains(cys::MSG_TYPING_GUARD) && m.starts_with(cys::MSG_TYPING_GUARD), "구 CLI 폴백 접두: {m}");
+        assert_eq!(d12_input_counts(&ghost), before, "거부는 쓰기 0(계수 불변)");
+        let ev = c5_last_denied_payload(&daemon);
+        assert_eq!(ev["draft_visible"], json!(false), "{ev}");
+        assert_eq!(ev["remedy_code"], json!("phantom_count_ctrl_u"), "{ev}");
+        assert_eq!(ev["reason"], json!("pending_input"), "기존 키 불변: {ev}");
+        assert_eq!(ev["pending_input_bytes"], json!(3));
+
+        // ⓑ 같은 유령에 send-key Return(SubmitKey · human_draft) · C-u(CancelKey · 전용 문구) — 접두·태그 뒤 맨 끝에 같은 처방.
+        //   `C-m` 은 별칭 키라 거부 문구에 실행 가능한 처방 hint 가 붙는다 — 유령 처방은 그 hint **뒤** 맨 끝이다.
+        let tag = cys::DRAFT_GATE_TAG;
+        for (key, expected) in [
+            ("Return", format!("{} [{tag}:human_draft]{suffix}", cys::MSG_TYPING_GUARD)),
+            ("C-u", format!("{} [{tag}:human_draft]{suffix}", cys::MSG_DRAFT_GATE_CANCEL_KEY)),
+            (
+                "C-m",
+                format!(
+                    "{} [{tag}:human_draft] (key \"C-m\" cannot be queued: use `Return --queued`){suffix}",
+                    cys::MSG_TYPING_GUARD
+                ),
+            ),
+        ] {
+            let r = d12_rpc(&daemon, pid, "surface.send_key", json!({"surface_id": ghost.id, "key": key, "queued": false}));
+            assert_eq!(r["ok"], json!(false), "key={key}: {r}");
+            assert_eq!(r["error"]["code"], json!(cys::ERR_TYPING_GUARD));
+            assert_eq!(r["error"]["message"].as_str().unwrap(), expected, "key={key}");
+        }
+        // clear_first(원자 주입)도 같은 규칙.
+        let r = d12_rpc(&daemon, pid, "surface.send_text", json!({
+            "surface_id": ghost.id, "text": "replace", "clear_first": true, "human": false, "queued": false, "quiet": true,
+        }));
+        assert_eq!(
+            r["error"]["message"].as_str().unwrap(),
+            format!("{} [{}:human_draft]{suffix}", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG)
+        );
+
+        // ⓒ 초안이 보인다(Some(true)) — 종전 문구와 바이트 동일 · 이벤트에 draft_visible=true · remedy_code null.
+        let visible = c5_agent_seat(&daemon, "worker-2", pid + 2, 3);
+        c5_paint_prompt(&visible, "aaa", "");
+        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&visible));
+        d12_assert_denied(&resp, "pending_input");
+        assert_eq!(resp["error"]["message"].as_str().unwrap(), legacy_text("pending_input"), "초안이 보이면 종전 문구 그대로");
+        let ev = c5_last_denied_payload(&daemon);
+        assert_eq!(ev["draft_visible"], json!(true), "{ev}");
+        assert!(ev["remedy_code"].is_null(), "{ev}");
+
+        // ⓓ 관측 불능(화면에 프롬프트 줄이 없다) — 종전 문구 그대로 · 두 키 null(결측은 값이 아니다).
+        let blind = c5_agent_seat(&daemon, "worker-3", pid + 3, 3);
+        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&blind));
+        d12_assert_denied(&resp, "pending_input");
+        assert_eq!(resp["error"]["message"].as_str().unwrap(), legacy_text("pending_input"), "관측 불능이면 Ctrl-U 를 권하지 않는다");
+        let ev = c5_last_denied_payload(&daemon);
+        assert!(ev["draft_visible"].is_null() && ev["remedy_code"].is_null(), "{ev}");
+
+        // ⓔ 마커 없는 좌석(agent_meta 없음 — 맨 셸) — 종전 문구 그대로.
+        let shell = v7_pane(&daemon, "worker-4", pid + 4);
+        shell.apply_pending_input(b"abc", crate::governance::InputOrigin::Human);
+        *shell.last_human_input.lock().unwrap() = None;
+        c5_paint_prompt(&shell, "", "");
+        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&shell));
+        d12_assert_denied(&resp, "pending_input");
+        assert_eq!(resp["error"]["message"].as_str().unwrap(), legacy_text("pending_input"));
+        assert!(c5_last_denied_payload(&daemon)["draft_visible"].is_null());
+
+        // ⓕ 계수 계열이 아닌 거부(화면 점유 · 모달)는 입력줄이 비었든 아니든 관측하지 않는다 — 처방 없음 · 두 키 null.
+        let screen_occ = c5_agent_seat(&daemon, "worker-5", pid + 5, 0);
+        c5_paint_prompt(&screen_occ, "owner draft", "");
+        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&screen_occ));
+        d12_assert_denied(&resp, "screen_occupied");
+        assert_eq!(resp["error"]["message"].as_str().unwrap(), legacy_text("screen_occupied"));
+        let ev = c5_last_denied_payload(&daemon);
+        assert!(ev["draft_visible"].is_null() && ev["remedy_code"].is_null(), "{ev}");
+        let modal_seat = c5_agent_seat(&daemon, "worker-6", pid + 6, 0);
+        {
+            let modal = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.replace('\n', "\r\n");
+            let mut parser = modal_seat.parser.lock().unwrap();
+            parser.process(b"\x1b[2J\x1b[H");
+            parser.process(modal.as_bytes());
+        }
+        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&modal_seat));
+        d12_assert_denied(&resp, "modal");
+        assert_eq!(resp["error"]["message"].as_str().unwrap(), legacy_text("modal"));
+        d12_cleanup(&daemon, &dir);
+    }
+
+    /// 거부 문구의 **앞부분은 처방 유무와 무관하게 같다** — 처방은 접미일 뿐이라 구 CLI 의 `contains(MSG_TYPING_GUARD)` 폴백과 신 CLI 의
+    /// 정착 파서(`send_settle_hint_ms`)가 그대로 읽는다. 처방이 붙은 문구에서도 두 파서가 같은 값을 낸다.
+    #[test]
+    fn c5_ghost_suffix_keeps_cli_fallback_and_settle_parsers_working() {
+        let suffix = crate::governance::GHOST_CTRL_U_SUFFIX;
+        let base = format!("{} [{}:pending_input]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG);
+        let with_ghost = format!("{base}{suffix}");
+        assert!(with_ghost.contains(cys::MSG_TYPING_GUARD), "구 CLI 폴백 판정");
+        assert!(with_ghost.starts_with(&base), "접두·태그 위치 불변");
+        assert_eq!(cys::send_settle_hint_ms(&with_ghost), cys::send_settle_hint_ms(&base), "증명 없는 문구는 증명 없음 그대로");
+        // 증명이 있는 문구 뒤에 (이론상) 처방이 와도 파서는 증명을 읽는다 — 처방 문장에 `[settle:` 가 없다.
+        let proven = format!("{base}{}{suffix}", cys::send_settle_suffix(137));
+        assert_eq!(cys::send_settle_hint_ms(&proven), Some(137));
+        assert!(!suffix.contains("[settle:") && !suffix.contains("[draft_gate:") && !suffix.contains(cys::MSG_TYPING_GUARD));
+    }
+
+    /// `queue.list` — 각 entry 에 `remedy_code`·`remedy`·`draft_visible`·`ghost_after_cursor` 가 **좌석 단위 값**으로 실린다(같은 좌석 행은 같은 값).
+    /// 막히지 않은 좌석·빈 큐의 낡은 사유는 진단하지 않는다(null). 기존 키는 불변이고 텍스트 모드 6열 행 계약은 CLI 쪽 검체가 지킨다.
+    #[test]
+    fn c5_queue_list_adds_remedy_and_diag_keys_per_seat() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("c5-qlist", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_830;
+        let blocked = c5_agent_seat(&daemon, "worker-1", pid, 3);
+        let free = c5_agent_seat(&daemon, "worker-2", pid + 1, 0);
+        let stale = c5_agent_seat(&daemon, "worker-3", pid + 2, 0);
+        c5_paint_prompt(&blocked, "", "버그 수정 착수한다. 브랜치는");
+        // 막히지 않은 좌석도 입력줄이 관측 가능한 화면(빈 프롬프트)이다 — 그래도 진단하지 않아 null 이어야 한다(진단 비용 0 · 거짓 값 금지).
+        c5_paint_prompt(&free, "", "");
+        for (seat, n) in [(&blocked, 2), (&free, 1)] {
+            for i in 0..n {
+                let e = daemon.next_queue_entry(format!("[보고] {} {i}", seat.id), Some("surface:1".into()), "send");
+                seat.pending_queue.lock().unwrap().push_back(e);
+            }
+        }
+        *blocked.queue_blocked.lock().unwrap() = Some((crate::governance::BLOCKED_INPUT_PENDING.to_string(), 1234.5));
+        // 낡은 사유가 남은 빈 큐 좌석 — 행이 없다.
+        *stale.queue_blocked.lock().unwrap() = Some((crate::governance::BLOCKED_BUSY.to_string(), 99.0));
+        // 만료 항목(opt-in `include_expired`)은 막힘이 없다 — 활성 행과 같은 키 집합(null)으로 나간다.
+        let mut x = daemon.next_queue_entry("[보고] 만료".into(), None, "send");
+        x.expired_at = Some(crate::state::now_epoch());
+        let expired_id = x.id.clone();
+        free.expired_queue.lock().unwrap().push_back(x);
+        let resp = d12_rpc(&daemon, pid, "queue.list", json!({}));
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        let rows = resp["result"]["entries"].as_array().expect("entries").clone();
+        let with_expired = d12_rpc(&daemon, pid, "queue.list", json!({"include_expired": true}));
+        let expired_rows: Vec<Value> = with_expired["result"]["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .filter(|r| r["id"] == json!(expired_id))
+            .cloned()
+            .collect();
+        d12_cleanup(&daemon, &dir);
+
+        assert!(rows.iter().all(|r| r["id"] != json!(expired_id)), "기본 응답에 만료 행이 섞였다");
+        assert_eq!(expired_rows.len(), 1, "만료 행 1건");
+        for k in ["remedy_code", "remedy", "draft_visible", "ghost_after_cursor", "blocked_by", "blocked_since"] {
+            assert!(expired_rows[0].get(k).is_some() && expired_rows[0][k].is_null(), "만료 행의 {k} 는 null(키는 있다): {}", expired_rows[0]);
+        }
+
+        let of = |sid: u64| -> Vec<&Value> { rows.iter().filter(|r| r["surface_id"] == json!(sid)).collect() };
+        let b = of(blocked.id);
+        assert_eq!(b.len(), 2, "막힌 좌석 행 2건");
+        let sentence = b[0]["remedy"].as_str().expect("remedy 문장").to_string();
+        assert!(sentence.contains("유령 계수") && sentence.contains("Ctrl-U"), "{sentence}");
+        assert!(sentence.ends_with(crate::governance::REMEDY_LLM_SUFFIX), "{sentence}");
+        for r in &b {
+            assert_eq!(r["remedy_code"], json!("phantom_count_ctrl_u"), "{r}");
+            assert_eq!(r["remedy"].as_str(), Some(sentence.as_str()), "같은 좌석 행은 같은 값");
+            assert_eq!(r["draft_visible"], json!(false), "{r}");
+            assert_eq!(r["ghost_after_cursor"], json!(true), "{r}");
+            // 기존 키 불변.
+            assert_eq!(r["blocked_by"], json!(crate::governance::BLOCKED_INPUT_PENDING));
+            assert_eq!(r["blocked_since"], json!(1234.5));
+            assert_eq!(r["pending_input_bytes"], json!(3));
+            assert_eq!(r["pending_input_human_bytes"], json!(3));
+        }
+        let f = of(free.id);
+        assert_eq!(f.len(), 1);
+        for k in ["remedy_code", "remedy", "draft_visible", "ghost_after_cursor", "blocked_by", "blocked_since"] {
+            assert!(f[0][k].is_null(), "막히지 않은 좌석의 {k} 는 null: {}", f[0]);
+            assert!(f[0].get(k).is_some(), "키는 항상 있다(null): {k}");
+        }
+        assert!(of(stale.id).is_empty(), "빈 큐의 낡은 사유는 행이 없다");
+    }
+
+    /// `queue.list` 소스 핀 — 진단은 **좌석당 1회**이고 `pending_queue` 락을 **잡기 전**에 뜬다(파서 락은 큐 락 밖).
+    #[test]
+    fn c5_queue_list_diag_is_once_per_seat_before_the_queue_lock() {
+        let src = include_str!("handlers.rs");
+        let start = src.find("\n        \"queue.list\" => {").expect("queue.list 아크 소실");
+        let end = start + src[start..].find("\n        \"queue.revive\" | \"queue.drop\" => {").expect("다음 아크 소실");
+        let arm = &src[start..end];
+        let calls: Vec<usize> = arm.match_indices("queue_block_diag(").map(|(i, _)| i).collect();
+        assert_eq!(calls.len(), 1, "진단은 좌석 루프 안 한 곳에서만 부른다(행마다 부르면 파서를 행 수만큼 읽는다)");
+        let lock = arm.find("let q = s.pending_queue.lock().unwrap();").expect("큐 락");
+        assert!(calls[0] < lock, "진단은 pending_queue 락을 잡기 전에 뜬다(락 순서)");
+        let in_rows = &arm[lock..];
+        assert!(!in_rows.contains("queue_block_diag(") && !in_rows.contains("observe_prompt("), "큐 락 안에서 파서를 읽지 않는다");
+    }
+
+    /// `org.status` — 좌석 객체에 `queue_blocked_by`·`queue_blocked_since`·`queue_remedy_code`(막힘 없으면 null) · `daemon.pending_input_model`.
+    #[test]
+    fn c5_org_status_adds_queue_blocked_keys_and_pending_input_model() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("c5-orgstatus", r#"{"default":"allow","rules":[]}"#);
+        let pid = 999_850;
+        let blocked = c5_agent_seat(&daemon, "worker-1", pid, 3);
+        let free = c5_agent_seat(&daemon, "worker-2", pid + 1, 0);
+        let stale = c5_agent_seat(&daemon, "worker-3", pid + 2, 0);
+        c5_paint_prompt(&blocked, "", "고스트");
+        let e = daemon.next_queue_entry("[보고] org".into(), None, "send");
+        blocked.pending_queue.lock().unwrap().push_back(e);
+        *blocked.queue_blocked.lock().unwrap() = Some((crate::governance::BLOCKED_INPUT_PENDING.to_string(), 777.25));
+        *stale.queue_blocked.lock().unwrap() = Some((crate::governance::BLOCKED_BUSY.to_string(), 5.0)); // 큐 비어 있음
+        let resp = d12_rpc(&daemon, pid, "org.status", json!({}));
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        let result = resp["result"].clone();
+        d12_cleanup(&daemon, &dir);
+
+        let seat = |sid: u64| -> Value {
+            result["surfaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["surface_id"] == json!(sid))
+                .unwrap_or_else(|| panic!("좌석 {sid} 없음: {result}"))
+                .clone()
+        };
+        let b = seat(blocked.id);
+        assert_eq!(b["queue_blocked_by"], json!(crate::governance::BLOCKED_INPUT_PENDING), "{b}");
+        assert_eq!(b["queue_blocked_since"], json!(777.25), "{b}");
+        assert_eq!(b["queue_remedy_code"], json!("phantom_count_ctrl_u"), "사람 계수 + 빈 입력줄: {b}");
+        assert_eq!(b["queue_depth"], json!(1), "기존 키 불변");
+        for sid in [free.id, stale.id] {
+            let s = seat(sid);
+            for k in ["queue_blocked_by", "queue_blocked_since", "queue_remedy_code"] {
+                assert!(s.get(k).is_some() && s[k].is_null(), "막힘 없는 좌석 {sid} 의 {k} 는 null(키는 있다): {s}");
+            }
+        }
+        let model = result["daemon"]["pending_input_model"].as_str().expect("daemon.pending_input_model");
+        assert_eq!(model, crate::governance::PendingInputModel::current().as_str());
+        assert!(matches!(model, "v2" | "v3"), "{model}");
+    }
+
+    /// `org.status` 소스 핀 — 조치 코드(파서 읽기)는 `surfaces` 가드를 **놓은 뒤**에 계산한다(좌석 맵 락을 쥔 채 파서 락을 잡지 않는다).
+    #[test]
+    fn c5_org_status_remedy_is_computed_after_the_surfaces_guard_is_dropped() {
+        let src = include_str!("handlers.rs");
+        let start = src.find("\n        \"org.status\" => {").expect("org.status 아크 소실");
+        let end = start + src[start..].find("\n        \"control.dashboard\" => {").expect("다음 아크 소실");
+        let arm = &src[start..end];
+        let guard = arm.find("let surfaces = daemon.surfaces.lock().unwrap();").expect("surfaces 가드");
+        let dropped = arm.find("drop(surfaces);").expect("가드 해제");
+        let diag = arm.find("queue_block_diag(").expect("진단 호출");
+        assert!(guard < dropped && dropped < diag, "진단은 surfaces 가드 해제 뒤");
+        assert_eq!(arm.matches("queue_block_diag(").count(), 1, "좌석당 1회(막힌 좌석 순회 한 곳)");
     }
 
     /// 비권위 clear_first 는 기계 잔여를 지우고 제출하되 사람 초안은 보존한다.

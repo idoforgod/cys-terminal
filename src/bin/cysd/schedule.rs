@@ -2088,6 +2088,9 @@ fn draft_divert_note_starved(daemon: &Arc<Daemon>, surface: &Arc<crate::state::S
         }
     };
     let role = surface.role.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    // ★(0.14.43 · C5) 좌석 진단 스냅샷 — 큐 락은 위 블록에서 이미 놓았다(파서·어댑터 읽기는 큐 락 밖). 이 사유(`schedule_divert`)는
+    //   `queue_remedy` 표의 어느 행에도 들지 않아 `unknown`(그 창 화면을 확인) 처방이 나간다 — 진단 값(계수·입력줄 가시성)은 실측이다.
+    let diag = crate::governance::queue_block_diag(daemon, surface);
     daemon.bus.publish(
         "queue.starved",
         "queue",
@@ -2099,6 +2102,7 @@ fn draft_divert_note_starved(daemon: &Arc<Daemon>, surface: &Arc<crate::state::S
             waited,
             depth,
             &format!("schedule_divert(gate:draft · job {})", job.id),
+            &diag,
         ),
     );
 }
