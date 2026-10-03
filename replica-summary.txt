@@ -1,0 +1,16 @@
+x64 main|marker|log: launched 40/40 (not launched 0); ret_dist={"42":40}; exit_code_dist={"0":40}
+x64 main|marker|nolog: launched 40/40 (not launched 0); ret_dist={}; exit_code_dist={"0":40}
+x64 main|cmd|log: launched 40/40 (not launched 0); ret_dist={"42":40}; exit_code_dist={"0":40}
+x64 main|cmd|nolog: launched 40/40 (not launched 0); ret_dist={}; exit_code_dist={"0":40}
+x64 thread|marker|log: launched 40/40 (not launched 0); ret_dist={"42":40}; exit_code_dist={"0":40}
+x64 thread|marker|nolog: launched 40/40 (not launched 0); ret_dist={}; exit_code_dist={"0":40}
+x64 thread|cmd|log: launched 40/40 (not launched 0); ret_dist={"42":40}; exit_code_dist={"0":40}
+x64 thread|cmd|nolog: launched 40/40 (not launched 0); ret_dist={}; exit_code_dist={"0":40}
+host main|marker|log: launched 40/40 (not launched 0); ret_dist={"42":40}; exit_code_dist={"0":40}
+host main|marker|nolog: launched 40/40 (not launched 0); ret_dist={}; exit_code_dist={"0":40}
+host main|cmd|log: launched 40/40 (not launched 0); ret_dist={"42":40}; exit_code_dist={"0":40}
+host main|cmd|nolog: launched 40/40 (not launched 0); ret_dist={}; exit_code_dist={"0":40}
+host thread|marker|log: launched 40/40 (not launched 0); ret_dist={"42":40}; exit_code_dist={"0":40}
+host thread|marker|nolog: launched 40/40 (not launched 0); ret_dist={}; exit_code_dist={"0":40}
+host thread|cmd|log: launched 40/40 (not launched 0); ret_dist={"42":40}; exit_code_dist={"0":40}
+host thread|cmd|nolog: launched 40/40 (not launched 0); ret_dist={}; exit_code_dist={"0":40}
