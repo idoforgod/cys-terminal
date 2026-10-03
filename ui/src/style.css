@@ -944,6 +944,9 @@ body.cc-glance #cc-view-feed .feed-item button { font-size: 16px; padding: 10px 
   animation: cc-sweep 0.9s linear infinite;
 }
 .dept-pending-msg { font-size: 13px; opacity: 0.8; }
+/* ★0.14.43(GU) 대기 화면의 단계 줄('지금: …') — 주 문구보다 한 단계 약하게. 비어 있으면(구 팩 · 단계 표지 전) 자리를 차지하지 않는다(:empty). */
+.dept-pending-stage { font-size: 12px; opacity: 0.65; margin-top: 6px; }
+.dept-pending-stage:empty { margin-top: 0; }
 /* 확보 못 한 부서 탭의 '지금 켜기' — 모달 버튼과 같은 관용구(비활성 시각화 포함).
    ★종전에는 이 상태가 아무것도 그리지 않는 백지였다(2026-09-17 성찰 3회). */
 .dept-idle-btn {

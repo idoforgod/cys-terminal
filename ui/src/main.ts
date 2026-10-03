@@ -153,6 +153,22 @@ import {
 import { starvedNotice, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
 import { planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
+import {
+  deptPendingText,
+  deptProgressId,
+  parseDeptProgressPayload,
+  deptFormationText,
+  deptFormationNoticeKey,
+  deptFormationCapped,
+  deptFormationToastId,
+  deptFormationStateOfKind,
+  deptFormationDetail,
+  deptFirstSeatPending,
+  deptFirstSeatRemainingMs,
+  DEPT_FORMATION_TOAST_PREFIX,
+  DEPT_FIRST_SEAT_TEXT,
+  type DeptFormationState,
+} from "./deptprogress"; // 0.14.43 GU 「팀 직접 만들기」 대기 문구(경과·단계)·팀원 부팅 안내(순수 문구·판정 · 표시 전용)
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
 import { MouseTrackingFilter, MOUSE_ALL_OFF } from "./trackfilter";
@@ -324,6 +340,14 @@ interface Workspace {
   // ★U2(0.14.41): 이 탭 트리의 sid 가 속한 데몬 세대(`started_at-pid`). 기동 때 지금 세대와 다르면 옛 sid 는
   //   살아 보여도 전부 죽은 것으로 보고 **역할로만** 결속한다(sid 재사용 방어). undefined = 모름. 저장된다.
   daemonEpoch?: string;
+  // ★0.14.43(GU) 「팀 직접 만들기」 대기 문구·팀원 부팅 안내용 **표시 전용** 필드 — 어떤 명령도 보내지 않고 판정에도 쓰지 않는다.
+  //   런타임 전용: saveLayout 이 직렬화에서만 턴다(저장되면 다음 기동이 옛 안내를 되살린다).
+  pendingSince?: number; // 대기 탭(pending)을 만든 시각(ms) — 대기 문구의 경과 시간
+  pendingStage?: string; // 팩이 마지막으로 알린 단계 키(dept-create-progress) — 대기 문구의 '지금: …' 줄
+  createdAt?: number; // 이 세션에서 **새로 만든** 팀의 생성 성공 시각(ms) — 멱등 합류·취소·실패 분기에는 세우지 않는다
+  formationDone?: boolean; // 팀원 부팅 안내를 더 갱신하지 않는다(완료·15분 상한·닫힌 탭)
+  // 마지막으로 낸 팀원 부팅 안내 — 열쇠(key)가 바뀔 때만 다시 낸다. muted = 사용자가 안내를 ×로 닫았다(주기 갱신만 멈춘다 · 편성 결과 이벤트는 그래도 낸다).
+  formationView?: { state: DeptFormationState; detail: string | null; key: string; muted?: boolean };
 }
 
 // 06: 워크스페이스 그룹 메타데이터. 진실원=localStorage(cys-layout-v2). 데몬은 모름(그룹=UI/solution 층).
@@ -2182,7 +2206,11 @@ function saveLayout() {
   //   탭째 배제하지만 `deleting`·`stopFailed` 는 **살아 있는 탭**의 일시 상태라 탭을 버릴 수 없다 — 대신
   //   직렬화에서만 턴다. 저장되면 다음 기동이 '삭제 중' 탭을 영영 입양 금지로 보거나(deleting) 이미 정리된
   //   부서에 종료 실패 안내를 계속 그린다(stopFailed). norm 의 원본 객체는 건드리지 않는다(복사본만).
-  const persisted = norm.map(({ deleting: _d, stopFailed: _s, ...w }) => w);
+  //   ★0.14.43(GU): 「팀 직접 만들기」 표시 전용 필드(pendingSince·pendingStage·createdAt·formationDone·formationView)도 같은 이유로 턴다 —
+  //   저장되면 다음 기동이 '이 세션에서 새로 만든 팀' 안내를 되살린다. 첫 map 은 위 핀(wswiring.test.ts)이 한 줄 그대로 못박는다.
+  const persisted = norm.map(({ deleting: _d, stopFailed: _s, ...w }) => w).map(
+    ({ pendingSince: _ps, pendingStage: _pg, createdAt: _ca, formationDone: _fd, formationView: _fv, ...w }) => w,
+  );
   localStorage.setItem(
     LAYOUT_KEY,
     JSON.stringify({ workspaces: persisted, groups: normG, active: a, counter: wsCounter, groupCounter }),
@@ -2468,6 +2496,12 @@ async function refreshPaneTitles() {
     for (const n of step.notices) stickyToast(n.id, "health", n.title, n.detail, () => openPrivacySettings(n.target));
   } catch {
     /* 안내 실패는 무음 — 다음 새 좌석에서 다시 시도한다 */
+  }
+  // ★0.14.43(GU): 방금 만든 팀의 팀원 부팅 안내 — 값(열쇠)이 바뀐 틱에만 갱신한다(새 타이머 0 · 이 3초 틱을 그대로 쓴다). 표시 전용이라 실패해도 루프는 멈추지 않는다.
+  try {
+    checkDeptFormationNotices();
+  } catch {
+    /* 안내 실패는 무음 — 다음 틱에서 다시 점검한다 */
   }
   updateFtRoot(); // cd 추적 — 파일 트리 루트도 따라간다
 }
@@ -3710,7 +3744,7 @@ function render() {
   const tree = ws?.tree;
   // ★U2(0.14.41): 트리가 있어도 **보이는 칸이 없으면**(기한 지난 구멍만) idle 패널로 — 구멍만 남은 탭이 백지가 되지 않게.
   if (tree && nodeShown(tree, holeShownFor(ws?.socket))) root.appendChild(renderNode(tree));
-  else if (ws?.pending) root.appendChild(renderDeptPending()); // WP-10: 부서 준비 중 빈 pane 스피너·안내
+  else if (ws?.pending) root.appendChild(renderDeptPending(ws)); // WP-10: 부서 준비 중 빈 pane 스피너·안내(★0.14.43 GU: 경과·단계 문구)
   else if (ws) root.appendChild(renderIdleWorkspace(ws)); // pane 0개 — 백지 대신 안내+손잡이
   renderWsTabs();
   requestAnimationFrame(() => {
@@ -3722,14 +3756,21 @@ function render() {
   saveLayout();
 }
 
-// WP-10: 부서 데몬 준비(~12초·tree:null) 동안 빈 pane 호스트에 중앙 스피너+안내 문구를 표시한다.
+// ★0.14.43(GU): 대기 화면(renderDeptPending)이 그려 둔 문구 갱신기 — 키 = 탭 번호. 단계 이벤트(onDeptCreateProgress)가 오면 전체 render() 대신
+// 이 갱신기만 불러 문구 노드만 고친다(render() 를 다시 부르면 스피너가 다시 만들어진다). 엘리먼트가 떨어지면 아래 타이머가 자기 항목을 지운다 — 누수 0.
+const deptPendingPainters = new Map<number, () => void>();
+
+// WP-10: 부서 데몬 준비(tree:null) 동안 빈 pane 호스트에 중앙 스피너+안내 문구를 표시한다.
 // 성공 시 tree가 채워져 자연 교체되고, 실패 시 placeholder 탭이 롤백된다(addDeptWorkspace 3분기 로직 불변).
-// aria-busy/aria-live 로 스크린리더에 진행/해소를 통지. 스피너 회전·정지는 CSS(prefers-reduced-motion)가 담당.
-function renderDeptPending(): HTMLElement {
+// aria-busy 로 스크린리더에 진행/해소를 통지. 스피너 회전·정지는 CSS(prefers-reduced-motion)가 담당.
+// ★0.14.43(GU): 문구는 deptprogress.ts 의 순수 함수가 만든다 — 주 문구(경과 시간 · 90초부터 '평소보다 오래')와 단계 줄('지금: …' · 팩이 단계를 알릴 때만)을
+//   따로 그린다. 옛 문구의 '곧 끝난다'는 짧은 약속은 거짓이었다(실측 25~30초 · 느린 PC 는 1분 이상). 1초마다 경과를 고치는 타이머는 **이 엘리먼트의 수명에 묶는다**
+//   (화면에서 떨어지면 — 탭 전환·render() 재생성·대기 종료 — 스스로 clearInterval · 누수 0). aria-live 는 주 문구가 아니라 **단계 줄에만** 건다
+//   (주 문구는 1초마다 바뀌므로 스크린리더가 매초 읽지 않게 off). 모든 문자열은 textContent 로만 그린다.
+function renderDeptPending(ws: Workspace): HTMLElement {
   const host = document.createElement("div");
   host.className = "pane dept-pending";
   host.setAttribute("aria-busy", "true");
-  host.setAttribute("aria-live", "polite");
   const box = document.createElement("div");
   box.className = "dept-pending-box";
   const spin = document.createElement("div");
@@ -3737,9 +3778,29 @@ function renderDeptPending(): HTMLElement {
   spin.setAttribute("aria-hidden", "true");
   const msg = document.createElement("div");
   msg.className = "dept-pending-msg";
-  msg.textContent = "부서를 준비하고 있습니다 — 최대 십여 초 걸릴 수 있어요";
-  box.append(spin, msg);
+  msg.setAttribute("aria-live", "off");
+  const stage = document.createElement("div");
+  stage.className = "dept-pending-stage";
+  stage.setAttribute("aria-live", "polite");
+  if (ws.pendingSince === undefined) ws.pendingSince = Date.now(); // 방어: addDeptWorkspace 밖에서 만든 대기 탭도 경과를 센다
+  const paint = () => {
+    const since = ws.pendingSince === undefined ? Date.now() : ws.pendingSince;
+    const t = deptPendingText((Date.now() - since) / 1000, ws.pendingStage);
+    msg.textContent = t.main;
+    stage.textContent = t.sub === null ? "" : t.sub;
+  };
+  paint();
+  box.append(spin, msg, stage);
   host.appendChild(box);
+  deptPendingPainters.set(ws.id, paint);
+  const timer = setInterval(() => {
+    if (!host.isConnected || !ws.pending) {
+      clearInterval(timer);
+      if (deptPendingPainters.get(ws.id) === paint) deptPendingPainters.delete(ws.id);
+      return;
+    }
+    paint();
+  }, 1000);
   return host;
 }
 
@@ -3761,11 +3822,23 @@ function renderIdleWorkspace(ws: Workspace): HTMLElement {
   // ★G5(2026-09-17 10라운드 · codex 5차 ⑤): 삭제했는데 **종료가 실패해 남은 탭**은 "앱을 다시 켜면
   //   준비됩니다"가 거짓이다 — 그 탭의 재시작은 '준비'가 아니라 **종료 재시도**이고, [지금 켜기]를 누르면
   //   `cys-dept launch` 가 묘비를 지워 **삭제 자체가 취소**된다. 실제 동작 그대로 말한다.
-  msg.textContent = isDept
-    ? ws.stopFailed
-      ? "종료 실패 — 탭을 다시 닫아 재시도 / 지금 켜기를 누르면 삭제가 취소됩니다"
-      : "이 부서는 아직 켜지 않았습니다 — 아래 버튼을 누르거나, 앱을 다시 켜면 준비됩니다."
-    : "이 워크스페이스에 아직 열린 창이 없습니다 — 아래 버튼을 누르면 새 셸이 열립니다.";
+  // ★0.14.43(GU): 이 세션에서 **방금 만든 팀**(만든 지 60초 안)의 빈 탭은 '아직 켜지 않았습니다' 가 거짓이다 — 첫 자리가 붙는 중이다. 분기 1개
+  //   (종료 실패 탭은 그대로 · 버튼은 그대로). 창이 끝나는 순간 문구를 한 번 다시 고친다(안 고치면 첫 자리가 영영 안 붙는 탭에 '붙이는 중' 이 남는다 —
+  //   그때는 아래 버튼 문구가 맞다). 엘리먼트가 떨어졌으면(탭 전환 등) 아무것도 하지 않는다 — 다시 그릴 때 새로 판정한다.
+  const idleText = (): string =>
+    isDept
+      ? ws.stopFailed
+        ? "종료 실패 — 탭을 다시 닫아 재시도 / 지금 켜기를 누르면 삭제가 취소됩니다"
+        : deptFirstSeatPending(ws.createdAt, Date.now())
+          ? DEPT_FIRST_SEAT_TEXT
+          : "이 부서는 아직 켜지 않았습니다 — 아래 버튼을 누르거나, 앱을 다시 켜면 준비됩니다."
+      : "이 워크스페이스에 아직 열린 창이 없습니다 — 아래 버튼을 누르면 새 셸이 열립니다.";
+  msg.textContent = idleText();
+  if (isDept && !ws.stopFailed && deptFirstSeatPending(ws.createdAt, Date.now())) {
+    setTimeout(() => {
+      if (host.isConnected) msg.textContent = idleText();
+    }, deptFirstSeatRemainingMs(ws.createdAt, Date.now()) + 50);
+  }
   const btn = document.createElement("button");
   btn.className = "dept-idle-btn";
   btn.textContent = isDept ? "지금 켜기" : "새 셸 열기";
@@ -5097,12 +5170,14 @@ async function addDeptWorkspace(catalogKey?: string, teamSpec?: TeamSpec): Promi
   // 클릭 즉시 placeholder 탭(tree:null·socket 미정) push+render — launch await 동안 시각 피드백 제공.
   // 번호는 백엔드 allocate(레지스트리 flock RMW)가 확정하므로 placeholder name은 미정("…")으로 두고
   // 반환 info.name으로 확정한다(UI 번호 계산 폐기 → lowest-unused 재사용·멀티창 충돌0).
-  const ws: Workspace = { id: wsCounter++, name: "…", tree: null, pending: true };
+  // ★0.14.43(GU): pendingSince = 대기 문구의 경과 시작 · progressId = 이 호출의 진행 id(Tauri 가 cys-dept 의 단계 표지를 이 id 로 올린다 · 호출마다 다르다).
+  const ws: Workspace = { id: wsCounter++, name: "…", tree: null, pending: true, pendingSince: Date.now() };
+  const progressId = deptProgressId(ws.id);
   workspaces.push(ws);
   activeWs = workspaces.length - 1;
   render();
   try {
-    const info = (await invoke("allocate_dept_daemon", { catalogKey, teamSpec })) as {
+    const info = (await invoke("allocate_dept_daemon", { catalogKey, teamSpec, progressId })) as {
       socket: string;
       socket_slug?: string;
       name: string;
@@ -5140,7 +5215,15 @@ async function addDeptWorkspace(catalogKey?: string, teamSpec?: TeamSpec): Promi
     // 탭이 await 중 닫혀도(close 핸들러가 socket 기준 데몬 teardown) 좀비 없음 — 별도 plain-셸 회수 불필요.
     ws.socket = info.socket;
     ws.pending = false;
+    // ★0.14.43(GU): 이 세션에서 **새로 만든** 팀 표지(표시 전용) — 성공 분기에서만 세운다(멱등 합류·취소·실패 분기에는 세우지 않는다). render() 보다 먼저 서야
+    //   빈 탭이 '아직 켜지 않았습니다'(방금 만든 팀에는 거짓)를 잠깐 비추지 않는다. 첫 안내는 성공 직후 한 번 — 표시 실패가 생성 성공을 뒤집지 않게 가둔다.
+    ws.createdAt = Date.now();
     render();
+    try {
+      showDeptFormation(ws, "booting", null);
+    } catch {
+      /* 안내 실패는 무음 — 생성은 이미 끝났다(아래 catch 의 롤백으로 새면 성공한 팀을 지운다) */
+    }
     await refreshPaneTitles(); // 방금 띄운 master surface를 즉시 입양(3초 인터벌 대기 없이). 부팅 실패 시
     //                            tree:null로 남고 master 등장 시 인터벌이 재입양(start()의 비활성 부서 처리와 정합).
     return ws;
@@ -5155,6 +5238,82 @@ async function addDeptWorkspace(catalogKey?: string, teamSpec?: TeamSpec): Promi
     if (ws.socket) await invoke("stop_dept_daemon_by_socket", { socket: ws.socket }).catch(() => {});
     render();
     throw e;
+  }
+}
+
+// ★0.14.43(GU) 「팀 직접 만들기」 단계 표지 · 팀원 부팅 안내 — 배선(문구·판정은 deptprogress.ts 의 순수 함수 · 이 안내는 **표시 전용**이라 어떤 명령도 보내지 않는다).
+
+/// 'dept-create-progress' 이벤트(Tauri 가 올린 팩의 `@stage` 표지): 진행 id 가 맞는 **대기 중** 탭의 단계만 고친다. payload 는 신뢰하지 않는다(parseDeptProgressPayload).
+/// 그 탭이 지금 보이면 문구 노드만 고친다(전체 render() 를 다시 부르면 스피너가 다시 만들어진다) — 안 보이면 값만 적어 두고 다시 그릴 때 보인다.
+function onDeptCreateProgress(payload: unknown): void {
+  const p = parseDeptProgressPayload(payload);
+  if (!p) return;
+  for (const ws of workspaces) {
+    if (!ws.pending || deptProgressId(ws.id) !== p.id) continue;
+    ws.pendingStage = p.stage;
+    const paint = deptPendingPainters.get(ws.id);
+    if (paint) paint();
+  }
+}
+
+/// 팀원 부팅 안내(sticky 토스트 · id `dept-formation:<소켓>`)를 한 번 낸다 — 같은 id 는 갱신이다. 낸 상태·사유·열쇠를 탭에 적어 두어
+/// 다음 틱(checkDeptFormationNotices)이 '값이 바뀔 때만' 다시 내게 한다. 매 호출이 알람 이력을 돌리므로 초 단위로 부르지 않는다.
+function showDeptFormation(ws: Workspace, state: DeptFormationState, detail: string | null): void {
+  if (!ws.socket || ws.createdAt === undefined) return;
+  const elapsedSec = Math.floor((Date.now() - ws.createdAt) / 1000);
+  const seats = collectSids(ws.tree).length;
+  const t = deptFormationText({ seats, elapsedSec, state, detail });
+  stickyToast(deptFormationToastId(ws.socket), state === "booting" || state === "complete" ? "feed" : "watchdog", t.title, t.body);
+  ws.formationView = { state, detail, key: deptFormationNoticeKey({ seats, elapsedSec, state }) };
+}
+
+/// 기존 3초 주기 refreshPaneTitles 끝에서 부르는 가벼운 점검(새 타이머 0): ① 닫힌 탭의 안내를 거둔다(탭이 어떤 경로로 사라졌든 — 탭 ×·그룹 삭제·롤백)
+/// ② 이 세션에서 새로 만든 탭의 안내를 **열쇠가 바뀔 때만** 다시 낸다(자리 수 · 경과 '분' · 45초 수명 칸) ③ 15분(DEPT_FORMATION_CAP_SECS)이 지나면 접는다
+/// ④ 사용자가 안내를 ×로 닫았으면 주기 갱신을 멈춘다(닫힌 안내를 되살리는 재점등 스팸 금지 — 편성 결과 이벤트는 onDeptFormationFeed 가 그래도 낸다).
+function checkDeptFormationNotices(): void {
+  const live = new Set<string>();
+  for (const w of workspaces) if (w.socket) live.add(deptFormationToastId(w.socket));
+  for (const id of [...stickyToasts.keys()]) {
+    if (id.startsWith(DEPT_FORMATION_TOAST_PREFIX) && !live.has(id)) dismissToast(id);
+  }
+  const now = Date.now();
+  for (const ws of workspaces) {
+    if (ws.pending || !ws.socket || ws.createdAt === undefined || ws.formationDone) continue;
+    const elapsedSec = Math.floor((now - ws.createdAt) / 1000);
+    if (deptFormationCapped(elapsedSec)) {
+      ws.formationDone = true;
+      continue;
+    }
+    const view = ws.formationView;
+    if (!view) {
+      showDeptFormation(ws, "booting", null); // 첫 안내가 아직 안 나갔다(성공 직후 한 번이 빠졌을 때의 안전망)
+      continue;
+    }
+    if (!stickyToasts.has(deptFormationToastId(ws.socket))) {
+      view.muted = true; // 사용자가 ×로 닫았다 — 되살리지 않는다(편성 결과 이벤트가 오면 새 안내가 다시 선다)
+      continue;
+    }
+    const seats = collectSids(ws.tree).length;
+    if (deptFormationNoticeKey({ seats, elapsedSec, state: view.state }) === view.key) continue;
+    showDeptFormation(ws, view.state, view.detail);
+  }
+}
+
+/// 편성 feed(`formation-*`)가 오면 그 팀의 팀원 안내를 갱신한다 — 데몬 이벤트의 socket_slug 가 **이 세션에서 새로 만든 탭**의 소켓으로 해석될 때만.
+/// slug 가 없거나 해석되지 않으면 아무것도 하지 않는다(다른 부서로 오인 금지). complete 는 완료 문구로 한 번 갱신하고 더 갱신하지 않는다(formationDone —
+/// 토스트는 수명대로 사라진다). partial·pending·failed 는 feed 의 본문(없으면 제목)을 사유로 실어 '확인 필요' 문구로 갱신하되 계속 추적한다. payload 는 신뢰하지 않는다.
+function onDeptFormationFeed(slug: unknown, kind: unknown, body: unknown, title: unknown): void {
+  const state = deptFormationStateOfKind(kind);
+  if (state === null || typeof slug !== "string" || slug === "") return;
+  const sock = socketForSlug.get(slug);
+  if (!sock) return;
+  const ws = workspaces.find((w) => !w.pending && w.socket === sock && w.createdAt !== undefined && !w.formationDone);
+  if (!ws) return;
+  if (state === "complete") {
+    showDeptFormation(ws, "complete", null);
+    ws.formationDone = true;
+  } else {
+    showDeptFormation(ws, state, deptFormationDetail(body, title));
   }
 }
 
@@ -8388,6 +8547,13 @@ function onDaemonEvent(event: Record<string, unknown>) {
       if (payload.kind === TEAM_CREATE_KIND)
         toast("feed", "팀 만들기 제안 1건", `${String(payload.title ?? "")} — Control Center 의 '승인 Feed' 탭 카드에서 [확인 창 열기]를 누르세요.`);
       else toast("feed", feedCreatedToastTitle(payload.kind), String(payload.title ?? ""));
+      // ★0.14.43(GU): 방금 만든 팀의 편성 결과(formation-*)를 그 팀의 팀원 부팅 안내에도 반영한다 — socket_slug 가 이 세션에서 새로 만든 탭의 소켓으로
+      //   해석될 때만(표시 전용 · 어떤 명령도 보내지 않는다). 표시 실패가 이 분기의 나머지를 막지 않게 가둔다.
+      try {
+        onDeptFormationFeed(event.socket_slug, payload.kind, payload.body, payload.title);
+      } catch {
+        /* 안내 실패는 무음 */
+      }
       // 즉시 전환하지 않는다 — master/CEO 자동 승인 유예 후에도 pending인 항목만
       // 사람 개입 필요로 보고 전환한다(자동 승인분은 무전환).
       // W3.4: auto_route 항목은 90초 기본 + CEO 활성 동적 연장, 비대상 wait 항목은 30초.
@@ -8579,6 +8745,9 @@ async function start() {
   setInterval(() => void checkVersionSkew(), 5 * 60_000);
 
   await listen("daemon-event", (e) => onDaemonEvent(e.payload as Record<string, unknown>));
+  // ★0.14.43(GU): 「팀 직접 만들기」 단계 표지 — Tauri(allocate_dept_daemon)가 cys-dept 의 stderr `[cys-dept] @stage <키>` 줄을 읽는 즉시 올린다.
+  //   진행 id 가 맞는 대기 탭의 '지금: …' 줄만 고친다(구 팩은 표지가 없다 — 이 이벤트가 안 오면 단계 줄 없이 경과만 보인다).
+  await listen("dept-create-progress", (e) => onDeptCreateProgress(e.payload));
 
   // ── 파일 드래그&드롭 → 드롭한 pane의 PTY에 경로 주입(iTerm2 동작) ──
   // dragDropEnabled 기본 활성이라 Tauri가 OS 드롭을 가로채 tauri://drag-drop로 준다(HTML5 drop 미발화).

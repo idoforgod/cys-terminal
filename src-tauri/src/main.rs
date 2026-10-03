@@ -5287,11 +5287,19 @@ async fn launch_dept_daemon(app: AppHandle, name: String) -> Result<Value, Strin
 ///      폴백은 이 사후 조건을 통과했을 때만 쓴다.
 ///   실패는 카탈로그 경로와 같은 `dept-create:<code>:` 형식(UI 가 사유를 분류해 보인다).
 ///   feed 응답(allow)은 여기서 하지 않는다 — UI 가 **생성 성공 뒤에만** 보낸다(실패 시 카드 pending 유지).
+///
+/// ★0.14.43(GU) 진행 표시: `progress_id`=Some 이면 자식을 **스트리밍**으로 돌린다 — cys-dept 가 stderr 에 내는 단계 표지 한 줄
+///   (`[cys-dept] @stage <키>`)을 읽는 즉시 'dept-create-progress' 이벤트 `{id, stage}` 로 올린다(화면의 대기 문구용 · 표시 전용 · 어떤 명령도 아니다).
+///   None 이면 종전과 같다(이벤트 없음). **종료 코드 해석·stdout 마지막 줄=부서 이름·`dept-create:<code>:<stderr>`·레지스트리 사후 조건은 한 줄도 바꾸지 않았다** —
+///   바뀐 것은 자식 실행 방식(`run_dept_child` — 종전 `cmd.output()` 과 같은 `Output`)뿐이다. 실패 메시지의 stderr 에서는 표지 줄을 뺀다
+///   (화면은 stderr 의 앞 300자만 보이므로 표지 5~6줄이 실패 사유를 밀어내지 않게 — `strip_stage_lines` · 스트리밍 판·종전 판 양쪽).
+///   되돌리기 노브 `CYS_DEPT_CREATE_STREAM=0` = 종전 `cmd.output()` 경로(`dept_create_stream_from_env`).
 #[tauri::command]
 async fn allocate_dept_daemon(
     app: AppHandle,
     catalog_key: Option<String>,
     team_spec: Option<cys::team_spec::TeamSpec>,
+    progress_id: Option<String>,
 ) -> Result<Value, String> {
     let team_b64 = match &team_spec {
         None => None,
@@ -5319,6 +5327,10 @@ async fn allocate_dept_daemon(
     let tool = dept_tool();
     let ck = catalog_key.clone();
     let tb = team_b64.clone();
+    // ★0.14.43(GU): 진행 id 가 있고 노브가 꺼져 있지 않을 때만 스트리밍 판 — 그 밖은 종전 경로(이벤트 없음). 판정 코드는 아래에서 그대로다.
+    let streaming = progress_id.is_some() && dept_create_stream_from_env(std::env::var("CYS_DEPT_CREATE_STREAM").ok().as_deref());
+    let emit_app = app.clone();
+    let emit_id = progress_id.clone();
     let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("bash");
         inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
@@ -5336,7 +5348,10 @@ async fn allocate_dept_daemon(
             } // 레거시: 번호만 발급(회귀 무변경)
         }
         no_console(&mut cmd);
-        cmd.output()
+        // ★0.14.43(GU): 실행 방식만 바뀐다 — 종전 `cmd.output()` 과 같은 `Output`(status·stdout·stderr · stderr 는 표지 줄만 뺀다)을 돌려준다.
+        run_dept_child(cmd, streaming, move |key: &str| {
+            let _ = emit_app.emit("dept-create-progress", json!({"id": emit_id, "stage": key}));
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -5397,6 +5412,151 @@ async fn allocate_dept_daemon(
         }
     }
     Ok(info)
+}
+
+// ───────── ★0.14.43(GU) 「팀 직접 만들기」 진행 표시 — cys-dept 단계 표지(`@stage`)의 스트리밍 판독 ─────────
+//
+// cys-dept 는 팀을 만드는 동안 stderr 에 `[cys-dept] @stage <키>` 한 줄씩을 낸다(키 7종 — 팩 `dept_stage` · reserve probe spawn wait up seat done).
+// 종전 `cmd.output()` 은 자식이 끝날 때까지 아무것도 돌려주지 않아 화면이 25~30초(느린 PC 는 1분+) 동안 경과·단계를 말할 수 없었다. 스트리밍 판은
+// stderr 를 **별도 스레드**가 줄 단위로 읽으며 표지 줄이면 콜백(= 'dept-create-progress' 이벤트)을 부르고, 본 스레드는 stdout 을 모으며 종료를 기다린다.
+// 결과는 종전 `Output` 과 같은 세 값(status·stdout·stderr)이라 호출부의 판정 코드는 한 줄도 달라지지 않는다.
+//
+// ★교착·행 방지 4항(스트리밍으로 바꾸면서 새로 생기는 위험 — 각각 아래 코드에 표지가 있다):
+//   (a) stdin 은 **명시적으로** null — `output()` 은 암묵으로 그렇게 했지만 `spawn()` 의 기본은 상속이다(`run_dept_child_streaming_with`).
+//   (b) stderr 는 **EOF 까지 끝까지** 읽는다 — 디코드 오류·콜백 실패(패닉 포함)가 나도 멈추지 않는다. `lines()` 는 UTF-8 이 아니면 Err 로 끊기므로
+//       쓰지 않고 `read_until(b'\n')` + `from_utf8_lossy` 로 읽는다(윈도우 cp949 출력)(`pump_dept_stderr`).
+//   (c) stdout 과 stderr 를 한 스레드에서 차례로 읽지 않는다 — 한쪽 파이프가 차면(64KiB 안팎) 자식이 멈추고 이쪽은 다른 파이프의 EOF 를 기다린다
+//       (`run_dept_child_streaming_with`: stderr = 전용 스레드 · stdout = 본 스레드).
+//   (d) 스레드 `join` 이 패닉이면 빈 stderr 로 접는다 — **status 는 그대로**다(실패를 성공으로 바꾸지 않는다)(`run_dept_child_streaming_with`).
+
+/// 팩의 단계 표지 한 줄 → 키. `[cys-dept] @stage <key>` 꼴이면 key(영소문자·숫자·`_`·`-` · 1~32자), 아니면 None.
+/// 줄 끝의 `\n`·`\r\n` 은 한 번씩 견딘다(윈도우 출력). 접두는 대소문자·공백까지 정확히 맞아야 한다 — ui/src/deptprogress.ts `parseDeptStageLine` 과 같은 규칙이다
+/// (같은 입력 벡터를 두 검체가 함께 잰다).
+fn parse_dept_stage_line(line: &str) -> Option<&str> {
+    let s = line.strip_suffix('\n').unwrap_or(line);
+    let s = s.strip_suffix('\r').unwrap_or(s);
+    let key = s.strip_prefix("[cys-dept] @stage ")?;
+    if (1..=32).contains(&key.len()) && key.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-')) {
+        Some(key)
+    } else {
+        None
+    }
+}
+
+/// stderr 에서 단계 표지 줄만 뺀다 — 나머지 바이트·순서·줄바꿈(CRLF 포함)은 그대로. 실패 메시지(`dept-create:<code>:<stderr>`)에 넣는 stderr 에 쓴다:
+/// 화면(ui/src/teamproposal.ts `teamCreateErrorText`)은 stderr 의 **앞 300자만** 보이므로 표지 5~6줄이 앞자리를 차지하면 정작 실패 사유(소켓 대기 N초·로그 경로·노브 안내)가 잘려 나간다.
+fn strip_stage_lines(stderr: &str) -> String {
+    let mut out = String::with_capacity(stderr.len());
+    for seg in stderr.split_inclusive('\n') {
+        if parse_dept_stage_line(seg).is_none() {
+            out.push_str(seg);
+        }
+    }
+    out
+}
+
+/// 되돌리기 노브 `CYS_DEPT_CREATE_STREAM` — 정확히 `0` 이면 종전 `cmd.output()` 경로(false), 그 밖(미설정·빈 값·다른 값)은 스트리밍(true).
+fn dept_create_stream_from_env(v: Option<&str>) -> bool {
+    v != Some("0")
+}
+
+/// (b) stderr 를 EOF 까지 줄 단위로 읽는다 — 전량을 모아 돌려주고, 표지 줄이면 콜백을 부른다. **어떤 줄도 읽기를 멈추게 하지 않는다**: `lines()` 가 아니라
+/// `read_until(b'\n')` 로 바이트를 받고 `from_utf8_lossy` 로 판정하므로 UTF-8 이 아닌 바이트가 섞여도 끝까지 읽고, 콜백의 패닉도 가둔다(이벤트 전달 실패가
+/// 읽기를 끊으면 파이프가 차서 자식이 멈춘다). 진짜 읽기 오류(EOF 가 아닌 Err)는 더 읽을 수 없으니 지금까지 모은 것을 돌려준다 — 이 함수가 끝나면 파이프가 닫혀
+/// 자식은 멈추는 대신 쓰기 오류를 받는다.
+fn pump_dept_stderr<R: std::io::Read>(reader: R, mut on_stage: impl FnMut(&str)) -> Vec<u8> {
+    use std::io::BufRead as _;
+    let mut br = std::io::BufReader::new(reader);
+    let mut all: Vec<u8> = Vec::new();
+    let mut line: Vec<u8> = Vec::new();
+    loop {
+        line.clear();
+        match br.read_until(b'\n', &mut line) {
+            Ok(0) => break, // EOF — 자식이 stderr 를 닫았다
+            Ok(_) => {
+                all.extend_from_slice(&line);
+                let text = String::from_utf8_lossy(&line);
+                if let Some(key) = parse_dept_stage_line(&text) {
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_stage(key)));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => {
+                all.extend_from_slice(&line);
+                break;
+            }
+        }
+    }
+    all
+}
+
+/// 종전 판 — `cmd.output()` 그대로(노브 `CYS_DEPT_CREATE_STREAM=0` · 진행 id 가 없을 때).
+fn run_dept_child_plain(mut cmd: std::process::Command) -> std::io::Result<std::process::Output> {
+    cmd.output()
+}
+
+/// 스트리밍 판의 본체 — stderr 를 읽는 함수(`pump`)를 주입받는다(검체가 패닉하는 판독기로 (d) 를 잰다). 종전 `output()` 과 같은 `Output` 을 돌려준다.
+fn run_dept_child_streaming_with<F>(mut cmd: std::process::Command, pump: F) -> std::io::Result<std::process::Output>
+where
+    F: FnOnce(std::process::ChildStderr) -> Vec<u8> + Send + 'static,
+{
+    // (a) stdin 은 명시적으로 null — `output()` 은 암묵으로 그렇게 했지만 `spawn()` 의 기본은 상속이다(자식이 입력을 기다리며 매달릴 수 있다).
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // (c) stderr 는 **별도 스레드**가 읽고 stdout 은 이 스레드가 읽는다 — 한 스레드가 두 파이프를 차례로 읽으면 한쪽이 차서 자식이 멈추고, 그 순간 이쪽은
+    //   다른 파이프의 EOF 를 기다려 서로 영원히 기다린다. 스레드는 **자식을 띄우기 전에** 만든다: 못 만들면 자식이 아직 없으니 종전 판으로 되돌아가면 되고,
+    //   만든 뒤 자식 기동이 실패해도 채널을 닫으면 스레드가 곧바로 끝난다(반쯤 만든 팀을 죽이는 일이 없다).
+    let (tx, rx) = std::sync::mpsc::channel::<std::process::ChildStderr>();
+    let reader = match std::thread::Builder::new().name("dept-create-stderr".into()).spawn(move || match rx.recv() {
+        Ok(pipe) => pump(pipe),
+        Err(_) => Vec::new(),
+    }) {
+        Ok(h) => h,
+        Err(_) => return cmd.output(),
+    };
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            drop(tx);
+            let _ = reader.join();
+            return Err(e);
+        }
+    };
+    if let Some(pipe) = child.stderr.take() {
+        let _ = tx.send(pipe);
+    }
+    drop(tx);
+    // 본 스레드: stdout 을 EOF 까지 모으고 종료를 기다린다(stdin 은 위에서 null · stderr 는 전용 스레드가 가져갔다 → 이쪽은 파이프 하나만 읽으므로 교착이 없다).
+    let waited = child.wait_with_output();
+    // (d) 스레드 join 이 패닉이면 빈 stderr 로 접는다 — status 는 그대로다(실패를 성공으로 바꾸지 않는다).
+    let stderr = reader.join().unwrap_or_default();
+    let done = waited?;
+    Ok(std::process::Output { status: done.status, stdout: done.stdout, stderr })
+}
+
+/// 스트리밍 판 — stderr 의 표지 줄마다 `on_stage(키)` 를 부른다(전용 스레드에서 · 이 함수가 돌아오기 전에 스레드는 끝난다).
+fn run_dept_child_streaming(
+    cmd: std::process::Command,
+    on_stage: impl FnMut(&str) + Send + 'static,
+) -> std::io::Result<std::process::Output> {
+    run_dept_child_streaming_with(cmd, move |pipe| pump_dept_stderr(pipe, on_stage))
+}
+
+/// 팀 만들기 자식 실행기 — 스트리밍 판(`stream`=true)과 종전 판(false)이 같은 세 값(status·stdout·stderr)을 낸다. 어느 판이든 stderr 에서는 표지 줄을 **여기서 한 번** 뺀다
+/// (실패 메시지가 앞 300자 안에 사유를 담도록 — `strip_stage_lines`). 종전 판에서는 콜백이 불리지 않는다.
+fn run_dept_child(
+    cmd: std::process::Command,
+    stream: bool,
+    on_stage: impl FnMut(&str) + Send + 'static,
+) -> std::io::Result<std::process::Output> {
+    let mut out = if stream {
+        run_dept_child_streaming(cmd, on_stage)?
+    } else {
+        run_dept_child_plain(cmd)?
+    };
+    out.stderr = strip_stage_lines(&String::from_utf8_lossy(&out.stderr)).into_bytes();
+    Ok(out)
 }
 
 /// ★REVIEW1 M-1 ①: cys-dept 파일이 팀 제안 인자(`--team-spec-b64`)를 아는지 정적으로 확인한다
@@ -7769,6 +7929,627 @@ mod tests {
             post_seg.contains("dept-create:2:"),
             "사후 조건 실패가 dept-create: 형식 오류로 UI 에 전달되지 않는다"
         );
+    }
+
+    // ───────── ★0.14.43(GU) 「팀 직접 만들기」 진행 표시 — 단계 표지 파서 · 표지 제거 · 스트리밍 실행기 검체 ─────────
+    //
+    // 규칙(티켓): 자식은 **임시 디렉터리의 셸 스크립트(`/bin/sh`)** 뿐이다 — 실제 cys-dept·cys·cysd 는 띄우지 않는다. 실행기 실측 검체는 unix 전용(`#[cfg(unix)]`)이고,
+    // 파서·표지 제거·판독기(`pump_dept_stderr` — 메모리 리더 위에서)·소스 핀은 모든 플랫폼에서 돈다. 교착을 재는 검체는 감시 스레드(`gu_within`)로 감싼다 —
+    // 멈추면 영원히 기다리지 않고 실패한다.
+
+    /// 단계 표지 파서의 입력 벡터 — **ui/src/deptprogress.test.ts 의 표와 같은 표**다(그 검체가 이 표를 소스에서 읽어 자기 표와 대조하고 `parseDeptStageLine` 으로도 돌린다
+    /// → 두 언어의 파서가 같은 입력에서 같은 답을 낸다). 형식 `[줄, 기대 키 | null]`(JSON). 표를 고치면 두 검체를 함께 고쳐야 한다.
+    const GU_STAGE_VECTORS: &str = r##"[
+ ["[cys-dept] @stage reserve", "reserve"],
+ ["[cys-dept] @stage probe", "probe"],
+ ["[cys-dept] @stage spawn", "spawn"],
+ ["[cys-dept] @stage wait", "wait"],
+ ["[cys-dept] @stage up", "up"],
+ ["[cys-dept] @stage seat", "seat"],
+ ["[cys-dept] @stage done", "done"],
+ ["[cys-dept] @stage reserve\n", "reserve"],
+ ["[cys-dept] @stage reserve\r\n", "reserve"],
+ ["[cys-dept] @stage reserve\r", "reserve"],
+ ["[cys-dept] @stage a1_b-2", "a1_b-2"],
+ ["[cys-dept] @stage -", "-"],
+ ["[cys-dept] @stage _", "_"],
+ ["[cys-dept] @stage 7", "7"],
+ ["[cys-dept] @stage abcdefghijklmnopqrstuvwxyz012345", "abcdefghijklmnopqrstuvwxyz012345"],
+ ["[cys-dept] @stage abcdefghijklmnopqrstuvwxyz0123456", null],
+ ["[cys-dept] @stage ", null],
+ ["[cys-dept] @stage", null],
+ ["[cys-dept] @stage reserve ", null],
+ ["[cys-dept] @stage  reserve", null],
+ ["[cys-dept] @stage re serve", null],
+ ["[cys-dept] @stage Reserve", null],
+ ["[cys-dept] @stage RESERVE", null],
+ ["[cys-dept] @stage 예약", null],
+ ["[cys-dept] @stage rés", null],
+ ["[cys-dept] @stage a.b", null],
+ ["[cys-dept] @stage a/b", null],
+ ["[cys-dept] @stage a\u0000b", null],
+ ["[cys-dept] @stage reserve\n\n", null],
+ ["[cys-dept] @stage reserve\r\r\n", null],
+ ["[cys-dept] @stage reserve extra", null],
+ ["[cys-dept] @stage=reserve", null],
+ ["[cys-dept] stage reserve", null],
+ ["cys-dept @stage reserve", null],
+ ["[cys-dept]  @stage reserve", null],
+ [" [cys-dept] @stage reserve", null],
+ ["x [cys-dept] @stage reserve", null],
+ ["[CYS-DEPT] @stage reserve", null],
+ ["[cys-dept] @STAGE reserve", null],
+ ["[cys-dept] allocate 완료", null],
+ ["", null],
+ ["\n", null]
+]"##;
+
+    /// 단계 표지 파서 — ts 와 같은 벡터표(위)를 그대로 돌린다. 키는 영소문자·숫자·`_`·`-` 1~32자만, 줄 끝의 `\n`·`\r\n`·`\r` 은 한 번만 견딘다.
+    #[test]
+    fn gu_parse_dept_stage_line_vectors_match_ts() {
+        let table: Vec<(String, Option<String>)> = serde_json::from_str::<Vec<(String, Option<String>)>>(GU_STAGE_VECTORS).expect("벡터표 JSON");
+        assert!(table.len() >= 35, "벡터표가 줄었다({}) — 두 언어가 같은 표를 잰다는 전제가 약해진다", table.len());
+        for (line, want) in &table {
+            assert_eq!(parse_dept_stage_line(line), want.as_deref(), "입력 {line:?}");
+        }
+        // 팩이 내는 7키는 전부 (줄바꿈 유무 무관) 그대로 나온다.
+        for key in ["reserve", "probe", "spawn", "wait", "up", "seat", "done"] {
+            assert_eq!(parse_dept_stage_line(&format!("[cys-dept] @stage {key}\n")), Some(key));
+        }
+    }
+
+    /// 표지 제거 — 표지 줄만 빠지고 나머지 바이트·순서·줄바꿈(CRLF 포함)은 그대로다. 마지막 줄이 줄바꿈 없는 표지여도 빠진다.
+    #[test]
+    fn gu_strip_stage_lines_removes_only_marker_lines_and_preserves_the_rest() {
+        let cases: &[(&str, &str)] = &[
+            ("", ""),
+            ("[cys-dept] @stage reserve\n", ""),
+            ("a\n[cys-dept] @stage reserve\nb\n", "a\nb\n"),
+            ("a\r\n[cys-dept] @stage reserve\r\nb\r\n", "a\r\nb\r\n"),
+            ("a\n[cys-dept] @stage done", "a\n"),
+            ("x\ny", "x\ny"),
+            ("no newline at all", "no newline at all"),
+            ("ERROR [cys-dept] @stage reserve\n", "ERROR [cys-dept] @stage reserve\n"),
+            (" [cys-dept] @stage reserve\n", " [cys-dept] @stage reserve\n"),
+            ("[cys-dept] @stage a\n[cys-dept] @stage b\n", ""),
+            ("\n\n[cys-dept] @stage x\n\n", "\n\n\n"),
+            ("[cys-dept] 예약 완료\n[cys-dept] @stage seat\n끝", "[cys-dept] 예약 완료\n끝"),
+            ("[cys-dept] @stage Reserve\n", "[cys-dept] @stage Reserve\n"),
+            ("[cys-dept] @stage \n", "[cys-dept] @stage \n"),
+            ("[cys-dept] @stage reserve\r\r\n", "[cys-dept] @stage reserve\r\r\n"),
+        ];
+        for (input, want) in cases {
+            let got = strip_stage_lines(input);
+            assert_eq!(&got, want, "입력 {input:?}");
+            assert_eq!(strip_stage_lines(&got), got, "두 번 걸러도 같아야 한다(멱등): {input:?}");
+        }
+        // 풀 조합 — 표지 아닌 조각은 전부(순서 그대로) 남고 표지 조각만 빠진다.
+        let pool = [
+            "[cys-dept] @stage reserve",
+            "[cys-dept] allocate 완료",
+            "plain",
+            "[cys-dept] @stage Done",
+            "",
+            "[cys-dept] ERROR: x 데몬 기동 실패 (소켓 대기 12초)",
+            "[cys-dept] @stage up",
+        ];
+        let mut seed: u32 = 0x1234_5678;
+        for round in 0..200 {
+            let mut input = String::new();
+            let mut want = String::new();
+            for _ in 0..(1 + round % 9) {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let seg = pool[(seed as usize) % pool.len()];
+                let end = if seed & 0x100 == 0 { "\n" } else { "\r\n" };
+                let full = format!("{seg}{end}");
+                if parse_dept_stage_line(&full).is_none() {
+                    want.push_str(&full);
+                }
+                input.push_str(&full);
+            }
+            assert_eq!(strip_stage_lines(&input), want, "round {round}: {input:?}");
+        }
+    }
+
+    /// ★실패 사유가 화면의 앞 300자 안에 온전히 들어온다 — 표지 6줄 + 실패 줄(팩이 실제로 내는 꼬리 포함)로 된 stderr 를 실행기에 통과시킨 결과로
+    /// `dept-create:<code>:<stderr>`(allocate_dept_daemon 이 만드는 그 모양)를 짓고, 화면(ui/src/teamproposal.ts `teamCreateErrorText` — trim 한 뒤 **앞 300자**)이
+    /// 보는 만큼을 잘라 본다. 통제: 표지를 안 걷었다면 같은 입력은 사유가 잘린다(이 검체에 이빨이 있다).
+    #[cfg(unix)]
+    #[test]
+    fn gu_failure_reason_survives_the_first_300_chars_after_marker_strip() {
+        let reason = "[cys-dept] ERROR: dept-3 데몬 기동 실패 (소켓 대기 12초 · 로그: /Users/very-long-user-name-example/Library/Caches/cys/state/cys-dept-dept-3/cysd.log · \
+                      느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)";
+        let units = |s: &str| s.encode_utf16().count();
+        assert!(units(reason) <= 300, "전제: 사유 줄 자체는 300자 안이다({})", units(reason));
+        let mut body = String::new();
+        for k in ["reserve", "probe", "spawn", "wait", "up", "seat"] {
+            body.push_str(&format!("printf '%s\\n' '[cys-dept] @stage {k}' >&2\n"));
+        }
+        body.push_str(&format!("printf '%s\\n' '{reason}' >&2\nexit 3\n"));
+        let sc = GuScript::new(&body);
+        let direct = sc.cmd().output().expect("직접 실행");
+        let raw_msg = format!("dept-create:3:{}", String::from_utf8_lossy(&direct.stderr));
+        let cmd = sc.cmd();
+        let out = gu_within(30, move || run_dept_child(cmd, true, |_k: &str| {})).expect("실행");
+        let msg = format!("dept-create:{}:{}", out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr));
+        // 화면이 보는 만큼: 접두 `dept-create:<code>:` 뒤 본문을 trim → 앞 300 UTF-16 단위.
+        let screen = |m: &str| -> String {
+            let body = m.splitn(3, ':').nth(2).unwrap_or("").trim().to_string();
+            let u: Vec<u16> = body.encode_utf16().take(300).collect();
+            String::from_utf16_lossy(&u)
+        };
+        assert!(screen(&msg).contains(reason), "표지를 걷은 뒤에도 사유가 앞 300자에 온전히 안 들어온다: {:?}", screen(&msg));
+        assert!(!screen(&raw_msg).contains(reason), "통제 실패 — 표지를 안 걷은 입력이 이미 사유를 온전히 보이면 이 검체는 아무것도 증명하지 못한다");
+        assert!(!msg.contains("@stage"), "실패 메시지에 표지 줄이 남았다: {msg}");
+        assert_eq!(out.status.code(), Some(3), "종료 코드는 그대로여야 한다(판정 코드의 입력)");
+    }
+
+    /// 노브 파서 — 정확히 `0` 만 종전 경로(false)이고 그 밖(미설정·빈 값·다른 값)은 스트리밍(true)이다.
+    #[test]
+    fn gu_dept_create_stream_knob_parser() {
+        assert!(dept_create_stream_from_env(None), "미설정 = 스트리밍(기본)");
+        assert!(!dept_create_stream_from_env(Some("0")), "0 = 종전 cmd.output() 경로");
+        for v in ["1", "", "00", " 0", "0 ", "false", "off", "no", "true", "x"] {
+            assert!(dept_create_stream_from_env(Some(v)), "{v:?} 는 노브를 끄지 않는다(정확히 `0` 만 끈다)");
+        }
+    }
+
+    /// 한 바이트씩만 돌려주는 리더 — 줄이 여러 번의 읽기에 걸쳐 조립되는지 잰다.
+    struct GuOneByteReader<R: std::io::Read>(R);
+    impl<R: std::io::Read> std::io::Read for GuOneByteReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(1);
+            self.0.read(&mut buf[..n])
+        }
+    }
+
+    /// 중간에 읽기 오류를 내는 리더(앞의 바이트는 돌려준 뒤) — 오류 전까지 모은 것은 잃지 않는다.
+    struct GuFailingReader {
+        data: Vec<u8>,
+        pos: usize,
+    }
+    impl std::io::Read for GuFailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, "gu: 읽기 오류"));
+            }
+            let n = buf.len().min(self.data.len() - self.pos).min(7);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    /// (b) 판독기 — UTF-8 이 아닌 바이트가 섞여도·줄이 여러 읽기에 걸쳐도·CRLF 여도·마지막 줄이 줄바꿈 없는 표지여도 **끝까지 읽고** 표지를 순서대로 알린다.
+    /// 돌연변이 M1(첫 디코드 오류에서 중단)이면 뒤의 표지와 바이트가 사라져 이 검체가 적색이 된다.
+    #[test]
+    fn gu_pump_reads_to_eof_through_invalid_utf8_and_reports_stages_in_order() {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"[cys-dept] @stage reserve\n");
+        bytes.extend_from_slice(b"bad:\xff\xfe tail\n"); // UTF-8 아님
+        bytes.extend_from_slice(b"[cys-dept] @stage probe\r\n");
+        bytes.extend_from_slice("[cys-dept] 예약 완료(dept-7)\n".as_bytes());
+        bytes.extend_from_slice(b"\xc3\x28 broken pair\n"); // 잘린 2바이트 열
+        bytes.extend_from_slice(b"[cys-dept] @stage up\n");
+        bytes.extend_from_slice(b"[cys-dept] @stage done"); // 줄바꿈 없는 마지막 표지
+        let want_keys = vec!["reserve", "probe", "up", "done"];
+        for one_byte in [false, true] {
+            let keys = std::cell::RefCell::new(Vec::<String>::new());
+            let got = if one_byte {
+                pump_dept_stderr(GuOneByteReader(std::io::Cursor::new(bytes.clone())), |k: &str| keys.borrow_mut().push(k.to_string()))
+            } else {
+                pump_dept_stderr(std::io::Cursor::new(bytes.clone()), |k: &str| keys.borrow_mut().push(k.to_string()))
+            };
+            assert_eq!(got, bytes, "읽은 바이트가 입력과 다르다(one_byte={one_byte}) — 끝까지 읽지 못했거나 변형했다");
+            assert_eq!(*keys.borrow(), want_keys, "표지 순서(one_byte={one_byte})");
+        }
+        // 64KiB 를 넘는 입력도 전량(파이프 용량과 무관한 판독기 수준의 확인).
+        let mut big: Vec<u8> = Vec::new();
+        for i in 0..4000u32 {
+            big.extend_from_slice(format!("L{i:062}\n").as_bytes());
+            if i % 1000 == 0 {
+                big.extend_from_slice(b"[cys-dept] @stage wait\n");
+            }
+        }
+        let n = std::cell::Cell::new(0usize);
+        let got = pump_dept_stderr(std::io::Cursor::new(big.clone()), |_k: &str| n.set(n.get() + 1));
+        assert_eq!(got.len(), big.len());
+        assert_eq!(n.get(), 4);
+    }
+
+    /// 판독기 — 진짜 읽기 오류(EOF 가 아닌 Err)가 나도 그때까지 모은 바이트는 돌려준다(표지는 이미 알린 뒤다).
+    #[test]
+    fn gu_pump_returns_what_it_collected_when_the_reader_errors() {
+        let data = b"[cys-dept] @stage reserve\nsome text\n[cys-dept] @stage probe\npartial-without-newline".to_vec();
+        let keys = std::cell::RefCell::new(Vec::<String>::new());
+        let got = pump_dept_stderr(GuFailingReader { data: data.clone(), pos: 0 }, |k: &str| keys.borrow_mut().push(k.to_string()));
+        assert_eq!(got, data, "오류 전까지 읽은 바이트(미완 줄 포함)를 잃었다");
+        assert_eq!(*keys.borrow(), vec!["reserve", "probe"]);
+    }
+
+    /// 콜백이 패닉해도 읽기는 멈추지 않는다(이벤트 전달 실패가 읽기를 끊으면 파이프가 차서 자식이 멈춘다).
+    #[test]
+    fn gu_pump_survives_a_panicking_callback() {
+        let calls = std::cell::Cell::new(0usize);
+        let data = b"[cys-dept] @stage reserve\nmid\n[cys-dept] @stage probe\nend\n".to_vec();
+        let got = pump_dept_stderr(std::io::Cursor::new(data.clone()), |_k: &str| {
+            calls.set(calls.get() + 1);
+            panic!("gu: 콜백 패닉(검체)");
+        });
+        assert_eq!(got, data, "콜백 패닉 뒤에 읽기가 멈췄다");
+        assert_eq!(calls.get(), 2, "두 번째 표지까지 콜백이 불려야 한다");
+    }
+
+    /// 임시 셸 스크립트 한 개 — `/bin/sh <스크립트>` 로만 실행한다(실행 비트 불필요). 드롭하면 디렉터리를 지운다.
+    #[cfg(unix)]
+    struct GuScript {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+    }
+    #[cfg(unix)]
+    impl GuScript {
+        fn new(body: &str) -> GuScript {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("cys-gu-{}-{}-{}", std::process::id(), nanos, SEQ.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir_all(&dir).expect("임시 디렉터리");
+            let path = dir.join("run.sh");
+            std::fs::write(&path, body).expect("스크립트 쓰기");
+            GuScript { dir, path }
+        }
+        fn cmd(&self) -> std::process::Command {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.arg(&self.path);
+            c
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for GuScript {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// 감시 스레드 — `secs` 안에 안 끝나면 영원히 기다리지 않고 실패한다(교착 검체용).
+    #[cfg(unix)]
+    fn gu_within<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+            Ok(v) => v,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!("{secs}초 안에 끝나지 않았다 — 교착 의심(스트리밍 실행기가 멈췄다)"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("실행기 스레드가 패닉했다"),
+        }
+    }
+
+    /// 표지 키를 모으는 콜백 — (모은 목록 핸들, 콜백).
+    #[cfg(unix)]
+    fn gu_collector() -> (std::sync::Arc<std::sync::Mutex<Vec<String>>>, impl FnMut(&str) + Send + 'static) {
+        let keys = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let k2 = keys.clone();
+        (keys, move |key: &str| k2.lock().unwrap().push(key.to_string()))
+    }
+
+    /// ★스트리밍 실행기 실측: stderr 에 표지 3줄 + 일반 줄, stdout 에 이름 1줄, 종료 코드 0/3 — `(status, stdout, stderr)` 가 `cmd.output()` 과 **같고**
+    /// 표지 콜백이 순서대로 3번 불린다.
+    #[cfg(unix)]
+    #[test]
+    fn gu_stream_matches_output_and_calls_back_in_order() {
+        for code in [0, 3] {
+            let sc = GuScript::new(&format!(
+                "printf '%s\\n' '[cys-dept] @stage reserve' >&2\n\
+                 echo '[cys-dept] 예약 완료(dept-7)' >&2\n\
+                 printf '%s\\n' '[cys-dept] @stage spawn' >&2\n\
+                 printf '%s\\n' '[cys-dept] @stage done' >&2\n\
+                 echo dept-7\n\
+                 exit {code}\n"
+            ));
+            let direct = sc.cmd().output().expect("직접 실행");
+            let (keys, cb) = gu_collector();
+            let cmd = sc.cmd();
+            let streamed = gu_within(30, move || run_dept_child_streaming(cmd, cb)).expect("스트리밍 실행");
+            assert_eq!(streamed.status, direct.status, "종료 상태(code={code})");
+            assert_eq!(streamed.status.code(), Some(code));
+            assert_eq!(streamed.stdout, direct.stdout, "stdout(code={code})");
+            assert_eq!(streamed.stdout, b"dept-7\n".to_vec());
+            assert_eq!(streamed.stderr, direct.stderr, "stderr(code={code}) — 표지 포함 원본이 output() 과 같아야 한다");
+            assert_eq!(*keys.lock().unwrap(), vec!["reserve", "spawn", "done"], "표지 콜백 순서(code={code})");
+        }
+    }
+
+    /// (c) stdout 과 stderr 를 **둘 다 파이프 용량(64KiB)보다 훨씬 많이** 쏟아도 멈추지 않는다 — 한 스레드가 두 파이프를 차례로 읽으면 여기서 교착한다.
+    #[cfg(unix)]
+    #[test]
+    fn gu_stream_does_not_hang_when_both_pipes_exceed_the_pipe_capacity() {
+        let sc = GuScript::new(
+            "i=0\n\
+             while [ $i -lt 3200 ]; do\n\
+               printf 'E%062d\\n' $i >&2\n\
+               printf 'O%062d\\n' $i\n\
+               i=$((i+1))\n\
+             done\n\
+             printf '%s\\n' '[cys-dept] @stage done' >&2\n\
+             echo dept-big\n\
+             exit 0\n",
+        );
+        let (keys, cb) = gu_collector();
+        let cmd = sc.cmd();
+        let out = gu_within(60, move || run_dept_child_streaming(cmd, cb)).expect("실행");
+        assert!(out.status.success());
+        assert_eq!(out.stderr.len(), 3200 * 64 + "[cys-dept] @stage done\n".len(), "stderr 전량");
+        assert_eq!(out.stdout.len(), 3200 * 64 + "dept-big\n".len(), "stdout 전량");
+        assert!(out.stdout.ends_with(b"dept-big\n"));
+        assert_eq!(*keys.lock().unwrap(), vec!["done"]);
+        // 같은 입력이 종전 판(output())과 같은 바이트를 낸다.
+        let direct = sc.cmd().output().expect("직접 실행");
+        assert_eq!(out.stdout, direct.stdout);
+        assert_eq!(out.stderr, direct.stderr);
+    }
+
+    /// (b) 실행기 수준 — UTF-8 이 아닌 바이트·여러 번에 걸쳐 쓴 줄·CRLF·줄바꿈 없는 마지막 표지가 섞여도 끝까지 읽고 `output()` 과 같은 바이트를 낸다.
+    #[cfg(unix)]
+    #[test]
+    fn gu_stream_reads_to_eof_through_non_utf8_bytes_and_split_writes() {
+        let sc = GuScript::new(
+            r#"printf '[cys-dept] @stage reserve\n' >&2
+printf 'bad:\377\376 tail\n' >&2
+printf '[cys-dept] @sta' >&2
+printf 'ge probe\n' >&2
+printf '[cys-dept] @stage up\r\n' >&2
+printf '[cys-dept] @stage done' >&2
+echo dept-8
+exit 0
+"#,
+        );
+        let direct = sc.cmd().output().expect("직접 실행");
+        let mut want: Vec<u8> = Vec::new();
+        want.extend_from_slice(b"[cys-dept] @stage reserve\n");
+        want.extend_from_slice(b"bad:\xff\xfe tail\n");
+        want.extend_from_slice(b"[cys-dept] @stage probe\n");
+        want.extend_from_slice(b"[cys-dept] @stage up\r\n");
+        want.extend_from_slice(b"[cys-dept] @stage done");
+        assert_eq!(direct.stderr, want, "전제: 스크립트가 낸 바이트");
+        let (keys, cb) = gu_collector();
+        let cmd = sc.cmd();
+        let out = gu_within(30, move || run_dept_child_streaming(cmd, cb)).expect("실행");
+        assert_eq!(out.stderr, want, "끝까지 읽지 못했다(디코드 오류에서 멈춘 것은 아닌가)");
+        assert_eq!(out.stdout, b"dept-8\n".to_vec());
+        assert_eq!(*keys.lock().unwrap(), vec!["reserve", "probe", "up", "done"]);
+    }
+
+    /// 콜백이 패닉해도 자식은 끝까지 쓰고 끝난다 — 읽기가 끊기지 않았다(전량 · 종료 상태 그대로).
+    #[cfg(unix)]
+    #[test]
+    fn gu_stream_survives_a_panicking_callback_end_to_end() {
+        let sc = GuScript::new(
+            "printf '%s\\n' '[cys-dept] @stage reserve' >&2\n\
+             printf '%s\\n' '[cys-dept] @stage probe' >&2\n\
+             echo 'tail line' >&2\n\
+             echo dept-9\n\
+             exit 3\n",
+        );
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let cmd = sc.cmd();
+        let out = gu_within(30, move || {
+            run_dept_child_streaming(cmd, move |_k: &str| {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                panic!("gu: 콜백 패닉(검체)");
+            })
+        })
+        .expect("실행");
+        assert_eq!(out.status.code(), Some(3), "종료 상태가 바뀌었다");
+        assert_eq!(out.stdout, b"dept-9\n".to_vec());
+        assert_eq!(out.stderr, b"[cys-dept] @stage reserve\n[cys-dept] @stage probe\ntail line\n".to_vec());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// (d) 스레드 join 이 패닉이면 빈 stderr 로 접고 **status·stdout 은 그대로**다 — 실패를 성공으로(성공을 실패로) 바꾸지 않는다.
+    #[cfg(unix)]
+    #[test]
+    fn gu_stream_join_failure_folds_stderr_but_keeps_status_and_stdout() {
+        for code in [0, 3] {
+            let sc = GuScript::new(&format!("echo dept-9\nexit {code}\n"));
+            let cmd = sc.cmd();
+            let out = gu_within(30, move || {
+                run_dept_child_streaming_with(cmd, |_pipe: std::process::ChildStderr| -> Vec<u8> { panic!("gu: 판독 스레드 패닉(검체)") })
+            })
+            .expect("판독 스레드가 죽어도 실행기는 결과를 돌려준다");
+            assert_eq!(out.status.code(), Some(code), "join 실패가 종료 상태를 바꿨다");
+            assert_eq!(out.stdout, b"dept-9\n".to_vec());
+            assert!(out.stderr.is_empty(), "패닉한 판독 스레드의 stderr 는 빈 값으로 접어야 한다");
+        }
+    }
+
+    /// 자식을 못 띄우면(없는 프로그램) `output()` 과 같은 종류의 오류를 돌려주고, 미리 만든 판독 스레드가 남아 영원히 기다리지 않는다(채널이 닫혀 곧바로 끝난다).
+    #[cfg(unix)]
+    #[test]
+    fn gu_stream_spawn_failure_matches_output_and_does_not_leave_the_reader_waiting() {
+        let direct = std::process::Command::new("/nonexistent/gu-missing-cmd").output().expect_err("없는 프로그램은 실패해야 한다");
+        let (keys, cb) = gu_collector();
+        let e = gu_within(30, move || run_dept_child_streaming(std::process::Command::new("/nonexistent/gu-missing-cmd"), cb))
+            .expect_err("스트리밍 판도 실패해야 한다");
+        assert_eq!(e.kind(), direct.kind());
+        assert!(keys.lock().unwrap().is_empty());
+        // 공용 실행기도 같다(두 판 모두).
+        for stream in [true, false] {
+            let e2 = gu_within(30, move || run_dept_child(std::process::Command::new("/nonexistent/gu-missing-cmd"), stream, |_k: &str| {}))
+                .expect_err("실패해야 한다");
+            assert_eq!(e2.kind(), direct.kind(), "stream={stream}");
+        }
+    }
+
+    /// (a) stdin 은 null — 자식이 보는 표준 입력이 /dev/null 이다(상속이면 입력을 기다리며 매달릴 수 있다). ※ 하네스의 stdin 이 이미 /dev/null 이면
+    /// 상속과 구별되지 않는다 — 돌연변이 실측은 stdin 을 열린 파이프로 두고 돌렸다(WORKLOG).
+    #[cfg(unix)]
+    #[test]
+    fn gu_stream_child_stdin_is_null() {
+        let sc = GuScript::new("if [ /dev/null -ef /dev/stdin ]; then echo STDIN_NULL; else echo STDIN_OTHER; fi\n");
+        let cmd = sc.cmd();
+        let out = gu_within(30, move || run_dept_child_streaming(cmd, |_k: &str| {})).expect("실행");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "STDIN_NULL");
+    }
+
+    /// 공용 실행기 — 두 판 모두 stderr 에서 표지 줄을 걷고, 나머지 `(status, stdout, stderr)` 는 서로·`output()` 과 같다. 종전 판(노브 0)에서는 콜백이 불리지 않는다.
+    /// (돌연변이 M2 — 노브를 무시하고 항상 스트리밍 — 이면 종전 판에서 콜백이 불려 적색.)
+    #[cfg(unix)]
+    #[test]
+    fn gu_run_dept_child_strips_markers_in_both_paths_and_the_knob_off_path_makes_no_callbacks() {
+        let sc = GuScript::new(
+            "printf '%s\\n' '[cys-dept] @stage reserve' >&2\n\
+             echo '[cys-dept] 예약 완료(dept-7)' >&2\n\
+             printf '%s\\n' '[cys-dept] @stage spawn' >&2\n\
+             echo '[cys-dept] ERROR: dept-7 데몬 기동 실패' >&2\n\
+             printf '%s\\n' '[cys-dept] @stage done' >&2\n\
+             echo dept-7\n\
+             exit 3\n",
+        );
+        let direct = sc.cmd().output().expect("직접 실행");
+        let want_stderr = strip_stage_lines(&String::from_utf8_lossy(&direct.stderr));
+        assert_eq!(want_stderr, "[cys-dept] 예약 완료(dept-7)\n[cys-dept] ERROR: dept-7 데몬 기동 실패\n", "전제");
+        let (keys_on, cb_on) = gu_collector();
+        let cmd_on = sc.cmd();
+        let on = gu_within(30, move || run_dept_child(cmd_on, true, cb_on)).expect("스트리밍");
+        let (keys_off, cb_off) = gu_collector();
+        let cmd_off = sc.cmd();
+        let off = gu_within(30, move || run_dept_child(cmd_off, false, cb_off)).expect("종전");
+        for (name, o) in [("스트리밍", &on), ("종전", &off)] {
+            assert_eq!(o.status, direct.status, "{name} status");
+            assert_eq!(o.stdout, direct.stdout, "{name} stdout");
+            assert_eq!(String::from_utf8_lossy(&o.stderr), want_stderr, "{name} stderr — 표지 줄만 빠져야 한다");
+        }
+        assert_eq!(*keys_on.lock().unwrap(), vec!["reserve", "spawn", "done"]);
+        assert!(keys_off.lock().unwrap().is_empty(), "종전 판(노브 0)에서 표지 콜백이 불렸다 — 노브가 무시되고 있다");
+    }
+
+    /// 코드 줄만 남긴다 — 주석 줄(`//`)·빈 줄을 뺀 소스 조각(소스 핀이 주석 속 낱말에 속지 않게).
+    fn gu_code_only(src: &str) -> String {
+        src.lines()
+            .map(|l| l.trim_end())
+            .filter(|l| !l.is_empty() && !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// 프로덕션 본문(테스트 모듈 앞)에서 `fn_head` 로 시작하는 최상위 함수의 소스(첫 `\n}\n` 까지).
+    fn gu_prod_fn(fn_head: &str) -> String {
+        let src = include_str!("main.rs");
+        let body = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let a = body.find(fn_head).unwrap_or_else(|| panic!("`{fn_head}` 소실"));
+        let end = a + body[a..].find("\n}\n").expect("함수 끝");
+        body[a..end].to_string()
+    }
+
+    /// FNV-1a 64 — 판정 코드 구간의 지문(표준 라이브러리만).
+    fn gu_fnv1a64(text: &str) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in text.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// ★`allocate_dept_daemon` 의 **판정 코드는 한 글자도 바뀌지 않았다** — 종료 코드 해석(`dept-create:<code>:<stderr>`)·stdout 마지막 줄=부서 이름·레지스트리 사후 조건.
+    /// 구간 = `if !out.status.success() {` 부터 함수 끝 직전까지의 **코드 줄**(주석·빈 줄 제외) 44줄의 FNV-1a-64 지문(원본 HEAD 4e839e4b 계열 f7f3dbf7 에서 잰 값).
+    /// 이 구간을 일부러 고쳤다면 지문을 새로 잰 사유를 남기고 값을 갱신한다. 그리고 자식 실행은 `run_dept_child` 를 지나고(직접 `.output()` 없음) 표지 제거는 한 곳에서만 일어난다.
+    #[test]
+    fn gu_allocate_dept_daemon_judgement_code_is_untouched_and_the_child_runs_through_run_dept_child() {
+        let f = gu_prod_fn("async fn allocate_dept_daemon(");
+        let marker = "    if !out.status.success() {\n        let stderr = String::from_utf8_lossy(&out.stderr).to_string();";
+        let at = f.find(marker).expect("판정 구간 시작 소실");
+        let judged = gu_code_only(&f[at..]);
+        assert_eq!(judged.lines().count(), 44, "판정 구간의 코드 줄 수가 달라졌다 — 판정 코드를 건드렸다:\n{judged}");
+        assert_eq!(
+            gu_fnv1a64(&judged),
+            0x2154_c645_6b63_5470,
+            "allocate_dept_daemon 의 판정 코드(종료 코드 해석·stdout 마지막 줄·dept-create:<code>:<stderr>·레지스트리 사후 조건)가 바뀌었다 — 티켓은 이 구간을 한 줄도 바꾸지 않는다:\n{judged}"
+        );
+        // 판정 구간의 핵심 줄은 문자열로도 박아 둔다(실패 시 어느 줄이 사라졌는지 바로 보이게).
+        for needle in [
+            "let code = out.status.code().unwrap_or(-1);",
+            "return Err(format!(\"dept-create:{code}:{stderr}\"));",
+            "return Err(stderr);",
+            ".filter(|l| !l.trim().is_empty())",
+            ".last()",
+            "return Err(\"allocate: empty name\".into());",
+            "match dept_team_proposal_id(&name) {",
+            "Some(tpid) if tpid == spec.id => {",
+        ] {
+            assert!(judged.contains(needle), "판정 코드 줄 소실: {needle}");
+        }
+        let code = gu_code_only(&f);
+        // 새 인자 · 실행 경로
+        assert!(code.contains("progress_id: Option<String>,"), "progress_id 인자 소실");
+        assert!(code.contains("run_dept_child(cmd, streaming, move |key: &str| {"), "자식 실행이 run_dept_child 를 지나지 않는다");
+        assert!(!code.contains(".output()"), "allocate_dept_daemon 이 직접 cmd.output() 을 부른다 — 종전 판 호출은 run_dept_child_plain 안에만 있어야 한다");
+        assert!(!code.contains("strip_stage_lines("), "표지 제거가 호출부에서 한 번 더 일어난다 — 공통 실행기(run_dept_child) 뒤에서 한 번이어야 한다");
+        assert!(code.contains("\"dept-create-progress\""), "진행 이벤트 이름 소실");
+        assert!(code.contains("json!({\"id\": emit_id, \"stage\": key})"), "진행 이벤트 payload 모양({{id, stage}}) 소실");
+        assert!(
+            code.contains("dept_create_stream_from_env(std::env::var(\"CYS_DEPT_CREATE_STREAM\").ok().as_deref())"),
+            "되돌리기 노브를 읽지 않는다"
+        );
+        assert!(code.contains("progress_id.is_some() &&"), "진행 id 가 없을 때 종전 경로로 가는 조건 소실");
+        // 명령줄 조립은 종전 그대로 — 순서까지.
+        let order = [
+            "let mut cmd = std::process::Command::new(\"bash\");",
+            "inject_runtime_path(&mut cmd);",
+            "cmd.arg(&tool);",
+            "cmd.arg(\"create\").arg(k);",
+            "cmd.arg(\"allocate\");",
+            "cmd.arg(\"--team-spec-b64\").arg(b);",
+            "no_console(&mut cmd);",
+            "run_dept_child(cmd, streaming,",
+        ];
+        let mut last = 0usize;
+        for n in order {
+            let i = code[last..].find(n).unwrap_or_else(|| panic!("명령줄 조립 줄이 없거나 순서가 바뀌었다: {n}")) + last;
+            last = i + n.len();
+        }
+        // 표지 제거는 공통 실행기 안에서 정확히 한 번.
+        let prod = {
+            let src = include_str!("main.rs");
+            gu_code_only(&src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")])
+        };
+        assert_eq!(prod.matches("out.stderr = strip_stage_lines(").count(), 1, "표지 제거 지점이 하나가 아니다");
+        let rdc = gu_code_only(&gu_prod_fn("fn run_dept_child("));
+        assert!(rdc.contains("out.stderr = strip_stage_lines(&String::from_utf8_lossy(&out.stderr)).into_bytes();"));
+    }
+
+    /// ★교착·행 방지 4항이 코드에 남아 있다(소스 핀 — 행동 검체가 못 보는 변형을 막는다): (a) stdin 명시 null (b) stderr 는 read_until + lossy 로 EOF 까지(lines() 금지 ·
+    /// 엄격 디코드 금지 · EOF 에서만 break) (c) stderr 전용 스레드 · 판독은 자식 기동 전에 만든 스레드 안에서 · stdout 은 본 스레드의 wait_with_output (d) join 실패는 빈 stderr · status 보존.
+    #[test]
+    fn gu_streaming_runner_keeps_the_four_deadlock_guards() {
+        let run = gu_code_only(&gu_prod_fn("fn run_dept_child_streaming_with"));
+        // (a)
+        assert!(run.contains(".stdin(std::process::Stdio::null())"), "(a) stdin 명시 null 소실");
+        assert!(run.contains(".stdout(std::process::Stdio::piped())") && run.contains(".stderr(std::process::Stdio::piped())"), "두 파이프 설정 소실");
+        // (c)
+        let t = run.find("std::thread::Builder::new()").expect("(c) 전용 판독 스레드 소실");
+        let p = run.find("pump(pipe)").expect("(c) 판독 호출 소실");
+        let s = run.find("cmd.spawn()").expect("자식 기동 소실");
+        assert!(t < p && p < s, "(c) 판독은 자식 기동 **전에** 만든 스레드 안에서 돌아야 한다(순서: 스레드 → 판독 호출 → 기동)");
+        assert!(run.contains("child.wait_with_output()"), "(c) stdout 수집 + 종료 대기(본 스레드) 소실");
+        assert!(run.contains("child.stderr.take()"), "(c) stderr 파이프를 전용 스레드로 넘기지 않는다 — wait_with_output 이 두 파이프를 한 스레드에서 읽게 된다");
+        // (d)
+        assert!(run.contains("reader.join().unwrap_or_default()"), "(d) join 실패 → 빈 stderr 소실");
+        assert!(run.contains("status: done.status"), "(d) status 보존 소실");
+        assert!(!run.contains("done.status.success()") && !run.contains("unwrap_or(true)"), "(d) join 실패를 성공으로 바꾸는 줄이 생겼다");
+        // (b)
+        let pump = gu_code_only(&gu_prod_fn("fn pump_dept_stderr"));
+        assert!(pump.contains("read_until(b'\\n', &mut line)"), "(b) read_until 소실");
+        assert!(pump.contains("String::from_utf8_lossy(&line)"), "(b) lossy 디코드 소실");
+        assert!(!pump.replace("from_utf8_lossy", "").contains("from_utf8"), "(b) 엄격 디코드가 들어왔다 — 비 UTF-8 바이트에서 읽기가 끊긴다");
+        assert!(!pump.contains(".lines()"), "(b) lines() 가 들어왔다 — UTF-8 이 아니면 Err 로 끊긴다");
+        assert!(pump.contains("Ok(0) => break"), "(b) EOF 에서만 끝나야 한다");
+        assert!(pump.contains("catch_unwind"), "(b) 콜백 패닉을 가두는 줄 소실");
+        assert_eq!(pump.matches("break").count(), 2, "(b) break 는 EOF 와 진짜 읽기 오류 둘뿐이어야 한다(디코드·콜백 실패로 끊는 길 금지)");
     }
 
     /// ★REVIEW1 m4: feed_reply 재시도 조건 배선 핀. 팀 제안 해소는 operator token 전용(team_spec::
