@@ -59,6 +59,23 @@ export function restartInvokeFailureReason(err: unknown): string {
   //   문면 상수의 정의처는 `src/lib.rs` 의 MSG_TYPING_GUARD 와 handlers.rs 의 clear_first_unsupported 문면이다.
   //   draft_gate 거부도 code 는 typing_guard 이고 message 에 [draft_gate:…] 가 붙는다 — 초안 게이트를
   //   먼저 보아야 더 정확한 제출·삭제 처방이 일반 타이핑 가드의 잠시 뒤 재시도로 덮이지 않는다.
+  // ★(0.14.43 · RQFIX F12 · I6 감사 N1) 초안 게이트 분기 **앞**에 세 갈래 — 이 셋도 문면에 `draft_gate` 가 붙어 있어 아래 일반 분기가 먼저 잡으면 더 정확한 처방이
+  //   '초안을 제출·삭제' 로 덮인다. 번역 조건 구절은 데몬 소스의 상수·리터럴에서 왔다(검체가 소스를 읽어 핀한다 — 상수가 바뀌면 검체가 적색):
+  //   · 모달 태그 `[draft_gate:modal]` — governance.rs `DraftGateDenied::Modal` 의 `as_str()` 와 lib.rs `DRAFT_GATE_TAG`
+  //   · 정착 창 태그 ` [settle:<ms>]` — lib.rs `SEND_SETTLE_TAG`(기계 제출이 진행 중이라 줄이 곧 빈다) / 사유 `submit_settling`
+  //   · 유령 계수 처방 접미 — lib.rs `GHOST_CTRL_U_SUFFIX`(입력줄이 비어 보이는데 미제출 계수가 남았다)
+  if (text.includes("draft_gate:modal")) {
+    return "질문·선택 창이 떠 있어 보류했습니다 — 그 창을 먼저 처리한 뒤 재시도";
+  }
+  if (text.includes("[settle:") || text.includes("draft_gate:submit_settling")) {
+    return "직전 제출이 처리되는 중이라 보류했습니다 — 잠시 뒤 다시 시도";
+  }
+  if (text.includes("입력줄이 비어 보이면 유령 계수다")) {
+    return (
+      "입력줄에 미제출 입력이 있다고 계수돼 보류했습니다 — 입력줄이 비어 보이면 그 창을 클릭하고 Ctrl-U 를 한 번 누른 뒤 재시도" +
+      "(글이 있으면 제출하거나 지운다)"
+    );
+  }
   if (text.includes("draft_gate") || text.includes("pending_input")) {
     return "대상 입력줄에 미제출 입력이 있어 보류했습니다 — 해당 pane 에서 초안을 제출·삭제한 뒤 재시도";
   }

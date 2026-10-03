@@ -405,19 +405,27 @@ pub fn queue_delivered_payload(
     })
 }
 
+/// ★(0.14.43 · RQFIX I-1) 사유 파일(`queue-blocked.json`) 쓰기 실패의 억제 상태 — [`Daemon::queue_blocked_retry`].
+/// `retry_after` = 다음 재시도 가능 시각(없으면 즉시 가능) · `last_err` = 마지막으로 **로그를 찍은** (오류 문구, 시각).
+#[derive(Debug, Default)]
+pub struct QueueBlockedRetry {
+    pub retry_after: Option<Instant>,
+    pub last_err: Option<(String, Instant)>,
+}
+
 /// queue.starved hint 문구 계약(성찰 BLOCKER) — 이 시스템의 이벤트 실소비자는 LLM
 /// 에이전트다: hint 가 강제 배달 명령을 직접 지시하면 '경보 → 반사적 강제 드레인' 폭주
 /// 회로가 열린다. 문구는 **운영자(사람) 판단 전제**를 명시하고 자동 반응을 금지해야 하며,
 /// 이 상수의 문면은 아래 payload 핀 테스트가 고정한다(임의 수정 = 계약 변경).
 ///
-/// ★(0.14.43 · C5) 문면 정정 — 종전 문면("운영자 판단 하에 cys queue deliver 로 강제 배달 가능")은 틀린 안내였다: 강제 배달은 quiet·간격
-/// 대기만 건너뛰고 초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다(`prompt gate refused … 면제 불가`). 의미(운영자(사람) 판단 전제 ·
-/// LLM 자동 반응 금지)는 그대로 두고 **조치는 `remedy` 를 보라** 고 가리킨다. 종전 문면은 [`QUEUE_STARVED_HINT_LEGACY`] 로 보존하고 env
-/// `CYS_QUEUE_STARVED_HINT_LEGACY=1` 이면 그것을 싣는다(롤백 노브 · [`starved_hint_for`]).
+/// ★(0.14.43 · C5 · RQFIX F7) 문면 정정 — 종전 문면("운영자 판단 하에 cys queue deliver 로 강제 배달 가능")은 틀린 안내였다: 강제 배달(`force_deliver_entry`)은
+/// **quiet(출력 정적) 대기만** 건너뛴다. 일시정지·빈 좌석·사람 입력 직후·배달 최소 간격·초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다
+/// (`prompt gate refused … 면제 불가` · 틱 배달과 같은 판정). 의미(운영자(사람) 판단 전제 · LLM 자동 반응 금지)는 그대로 두고 **조치는 `remedy` 를 보라** 고 가리킨다.
+/// 종전 문면은 [`QUEUE_STARVED_HINT_LEGACY`] 로 보존하고 env `CYS_QUEUE_STARVED_HINT_LEGACY=1` 이면 그것을 싣는다(롤백 노브 · [`starved_hint_for`]).
 pub const QUEUE_STARVED_HINT: &str = "큐 머리가 장기 대기 중(게이트에 막힘) — 조치는 remedy 참조. \
-     강제 배달(cys queue deliver)은 quiet·간격 대기만 건너뛰고 초안·모달·승인·전체화면·작업 중 \
-     게이트는 면제하지 않는다(운영자(사람) 판단 전제). LLM 에이전트는 이 경보에 자동 반응(강제 \
-     배달·드레인) 금지";
+     강제 배달(cys queue deliver)은 quiet 대기만 건너뛰고 일시정지·빈 좌석·사람 입력 직후·배달 최소 간격·\
+     초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다(운영자(사람) 판단 전제). LLM 에이전트는 \
+     이 경보에 자동 반응(강제 배달·드레인) 금지";
 
 /// ★(0.14.43 · C5) 종전(0.14.42 이하) hint 문면 — 바이트 보존. `CYS_QUEUE_STARVED_HINT_LEGACY=1` 로 되돌릴 때만 쓴다.
 pub const QUEUE_STARVED_HINT_LEGACY: &str = "큐 머리가 장기 대기 중(게이트에 막힘) — 운영자(사람) \
@@ -1703,10 +1711,27 @@ pub struct Surface {
     /// `governance::pending_input_step` 가 전이 규칙, `governance::input_line_state` 가 소비자).
     /// 휘발이므로 재기동 직후엔 0 이고, 그때는 화면 축(커서 앞 텍스트)이 2차로 판정한다.
     /// v2(0.14.39): 봉투 제외 · 봉투 안 개행 가산 · 봉투 밖 순수 자동응답 면제 · 표식 절단 이월 — 규칙은 governance::pending_input_step 하나.
+    /// v3(0.14.43 · RQFIX): 봉투 밖 단독 Esc·BS/DEL 비계수는 **좌석 표식 [`Surface::lone_key_exempt`] 가 참인 좌석**(살아 있는 에이전트 TUI)에서만 —
+    /// 표식이 거짓(맨 셸·죽은 에이전트·마커 없는 어댑터·표식 쓰기 전)이면 v2 규칙으로 센다([`Surface::pending_input_model`]).
     pub pending_input_bytes: AtomicU64,
     /// 미제출 입력 상태기계의 surface 별 상태. count 의 SOT 는 미러 atomic `pending_input_bytes`
     /// (락 없는 읽기 소비자·테스트 픽스처 직접 store 호환) · 나머지 필드의 SOT 는 이 Mutex.
     pub pending_input: Mutex<crate::governance::PendingInputState>,
+    /// ★(0.14.43 · RQFIX B-1) **좌석별 v3 표식** — "마지막 watchdog 틱이 이 좌석의 전경을 **살아 있는 에이전트 TUI**(단독 Esc·BS/DEL 을
+    /// 즉시 처리하고 줄 편집기 접두 상태를 남기지 않는 원시 모드 화면)라고 판정했다". [`Surface::apply_pending_input`] 이 이 표식으로
+    /// 계수 모델을 고른다 — 참이면 V3(봉투 밖 단독 Esc·BS/DEL 비계수) · 거짓이면 V2(종전 · 길이만큼 계수).
+    ///
+    /// **단일 writer = `governance::check_agent_death`**(watchdog 틱 · 좌석마다 에이전트 생존을 이미 판정하는 상태머신). 참 조건은
+    /// 전역 모델이 V3 ∧ 이번 틱 생존 판정 `alive` ∧ 그 에이전트 어댑터가 프롬프트 마커를 선언(`merged_prompt_marker` — 큐 게이트가 쓰는
+    /// `surface_prompt_marker` 와 같은 출처)이다. 맨 셸(`agent_meta` 없음)·종료 좌석·죽은 에이전트·마커 없는 어댑터는 거짓.
+    /// 맨 셸 줄 편집기(zsh·readline 계열)는 단독 ESC 를 Meta 조합의 첫 바이트로 받아 **다음 키를 무기한 기다린다**(화면에는 아무것도 없다) —
+    /// 그 좌석에서 v3 로 0 을 세면 큐 본문(`ESC[200~…`)이 그 접두와 합쳐져 붙여넣기 봉투가 깨진다(B-1 실측). 정규 모드 tty(`cat`·`read`·`sudo`)에서는
+    /// `^[`·`^H` 가 글자로도 남는다.
+    ///
+    /// **실패 방향**: 거짓인 동안(좌석 등록 직후 첫 틱 전 · 어댑터 프로브 미도달)은 V2 = 0.14.42 동작(보수 · fail-closed). 참으로 낡는 창은
+    /// 에이전트가 죽은 뒤 다음 틱까지(최대 `WATCHDOG_INTERVAL_SECS` = 5초)뿐이다. 휘발(재기동 직후 false)이며 영속하지 않는다.
+    /// 읽기는 원자 한 번(락 없음) — `input_gate` 안에서는 `pending_input` leaf 만 잡는다는 계약을 건드리지 않는다.
+    pub lone_key_exempt: AtomicBool,
     /// ★(0.14.31 · WP-5 B-2②) `pending_input_bytes` 의 **변이 세대** — 모든 쓰기(`set_pending_input`)
     /// 마다 +1. stale 리셋 판정이 "같은 바이트 수" 가 아니라 "같은 세대" 를 본다: 옛 초안을 제출하고
     /// 같은 길이의 새 초안을 친 ABA 를 바이트 수는 구분하지 못한다(codex 설계 검토 Q4).
@@ -2022,9 +2047,20 @@ impl Surface {
         self.input_gen.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// ★(0.14.43 · RQFIX B-1) 이 좌석에 **지금 적용되는** 미제출 입력 계수 모델 — [`Surface::lone_key_exempt`] 가 참이면 `V3`, 아니면 `V2`.
+    /// `apply_pending_input` 과 진단(`queue_block_diag` 의 `input_model`)이 이 한 곳을 읽는다. 원자 읽기 한 번(락 없음).
+    pub fn pending_input_model(&self) -> crate::governance::PendingInputModel {
+        if self.lone_key_exempt.load(Ordering::Relaxed) {
+            crate::governance::PendingInputModel::V3
+        } else {
+            crate::governance::PendingInputModel::V2
+        }
+    }
+
     /// 청크 1개를 상태기계에 적용하고 미러·세대를 갱신한다. 새 상태를 돌려준다.
     /// 호출자는 `input_gate` 안에서 부르는 것이 규약이다(handlers send_text/send_key ·
     /// governance 배달 임계영역 · stale 리셋).
+    /// 계수 모델은 **좌석 표식**으로 고른다([`Surface::pending_input_model`] — 전역 노브가 아니다).
     pub fn apply_pending_input(
         &self,
         chunk: &[u8],
@@ -2034,7 +2070,13 @@ impl Surface {
         st.count = self.pending_input_bytes.load(Ordering::Relaxed); // 미러가 count 의 SOT
         // count 만 바꾸는 경로(큐 Inject·롤백 `set_pending_input`)가 지나간 뒤 불변식 human ≤ count 를 복원 — human 은 D-12 Return 게이트 축이라 stale 하면 자기 본문 제출이 거부된다.
         st.human = st.human.min(st.count);
-        let next = crate::governance::pending_input_step(&st, chunk, origin, std::time::Instant::now());
+        let next = crate::governance::pending_input_step_model(
+            &st,
+            chunk,
+            origin,
+            std::time::Instant::now(),
+            self.pending_input_model(),
+        );
         *st = next.clone();
         drop(st);
         self.set_pending_input(next.count);
@@ -3314,6 +3356,11 @@ pub struct Daemon {
     pub queue_blocked_sig: Mutex<Option<String>>,
     /// ★(0.14.43 · C5) 사유 파일 **강제 기록 요청** — 기아 경보(`queue.starved`)를 낸 틱·쓰기 실패 뒤에 선다. 큐 틱 끝이 소비한다.
     pub queue_blocked_dirty: AtomicBool,
+    /// ★(0.14.43 · RQFIX I-1) 사유 파일 **쓰기 실패 억제 상태** — 실패하면 다음 재시도를 60초 뒤로 미루고(그 사이 틱은 좌석 진단·기록·로그를 하지 않는다) 마지막 실패 로그의
+    /// (오류 문구, 시각)을 기억해 같은 오류를 60초 안에 다시 찍지 않는다. 성공하면 비운다. **leaf 락**(잡은 채 다른 락을 잡지 않는다 · 큐 틱 단일 흐름에서만 쓴다).
+    pub queue_blocked_retry: Mutex<QueueBlockedRetry>,
+    /// ★(0.14.43 · RQFIX I-9) 이 부트에서 사유 파일의 **이전 세대 보존**(`queue-blocked.prev.json`)을 이미 시도했는가 — 부트당 한 번(첫 기록 직전).
+    pub queue_blocked_prev_rotated: AtomicBool,
     /// ★(0.14.31 · 독립 판정 triage X4) **부팅이 큐 WAL 을 온전히 복원하지 못했다.**
     /// `queue_wal_durable`(=마지막 쓰기가 디스크에 닿았는가)과 **다른 사실**이다: 이 비트는
     /// "지금 메모리에 있는 큐가 재기동 이전의 전부인가" 를 말한다. false 로 시작하지 않고
@@ -5012,6 +5059,8 @@ impl Daemon {
             queue_persist_dirty: AtomicBool::new(false),
             queue_blocked_sig: Mutex::new(None),
             queue_blocked_dirty: AtomicBool::new(false),
+            queue_blocked_retry: Mutex::new(QueueBlockedRetry::default()),
+            queue_blocked_prev_rotated: AtomicBool::new(false),
             queue_restore_incomplete: AtomicBool::new(queue_restore_incomplete),
             queue_wal_unpreserved: Mutex::new(queue_wal_unpreserved),
             config: Config::from_env(),
@@ -5976,6 +6025,8 @@ impl Daemon {
             last_human_input: Mutex::new(None),
             pending_input_bytes: AtomicU64::new(0),
             pending_input: Mutex::new(Default::default()),
+            // ★(0.14.43 · RQFIX B-1) 신생 좌석은 거짓(v2 = 종전 동작) — 첫 watchdog 틱의 생존·마커 판정이 확정한다.
+            lone_key_exempt: AtomicBool::new(false),
             input_gen: AtomicU64::new(0),
             input_gate: std::sync::Mutex::new(()),
             // ★(0.14.42 · A2) 흡수 표는 휘발 — 재기동·재생성 좌석은 빈 채로 출발(= 종전 동작).
@@ -10578,7 +10629,7 @@ mod tests {
         assert_eq!(p["waited_secs"], json!(700));
         assert_eq!(p["depth"], json!(2));
         assert_eq!(p["blocked_by"], json!("busy(출력 중)"));
-        assert_eq!(p["hint"], json!(QUEUE_STARVED_HINT), "hint 문구 = 상수 계약 그대로");
+        assert_eq!(p["hint"], json!(expected_starved_hint_for_env()), "hint 문구 = env 가 고른 상수 계약 그대로(LEGACY env 에서도 같은 사슬)");
         // 문구 계약의 핵심 2요소: ①운영자(사람) 판단 명시 ②자동 반응 금지 명시.
         assert!(QUEUE_STARVED_HINT.contains("운영자(사람) 판단"), "사람 판단 전제 명시");
         assert!(QUEUE_STARVED_HINT.contains("자동 반응"), "자동 반응 금지 명시");
@@ -10590,17 +10641,28 @@ mod tests {
 
     // ─── ★(0.14.43 · C5) queue.starved 진단 필드·remedy·hint 정정 핀 ───────────────────────────────
 
-    /// 진단 스냅샷 픽스처 — 계수 1(사람 1) · 커서 뒤 고스트 있음 · v3.
+    /// 진단 스냅샷 픽스처 — 계수 1(사람 1) · 커서 뒤 고스트 있음 · v3. 커서 뒤 판독을 바꾸려면 `c5_diag_ga`.
     fn c5_diag(draft_visible: Option<bool>) -> crate::governance::QueueBlockDiag {
+        c5_diag_ga(draft_visible, Some(true))
+    }
+
+    fn c5_diag_ga(draft_visible: Option<bool>, ghost_after_cursor: Option<bool>) -> crate::governance::QueueBlockDiag {
         crate::governance::QueueBlockDiag {
             pending_input_bytes: 1,
             pending_input_human_bytes: 1,
             draft_visible,
-            ghost_after_cursor: Some(true),
+            ghost_after_cursor,
             parser_panics: 0,
             paused: false,
+            kill_switch: false,
             input_model: "v3",
         }
+    }
+
+    /// ★(RQFIX I-11) payload 의 `hint` 가 **이 프로세스의 env** 가 고르는 문면이다 — `CYS_QUEUE_STARVED_HINT_LEGACY=1` 로 돌려도 이 기대값이 따라간다(제품과 같은 순수 함수 사슬).
+    /// 두 문면 자체의 바이트 고정은 `c5_starved_hint_corrected_text_and_legacy_branch` 가 env 없이 잰다.
+    fn expected_starved_hint_for_env() -> &'static str {
+        starved_hint_for(starved_hint_legacy_from_env(std::env::var("CYS_QUEUE_STARVED_HINT_LEGACY").ok().as_deref()))
     }
 
     /// 가산 키 8개가 payload 에 실리고(값 = 진단 스냅샷 · remedy = 순수 표) 기존 키 7개는 이름·의미가 그대로다.
@@ -10609,7 +10671,7 @@ mod tests {
     fn c5_starved_payload_adds_diag_and_remedy_keys_and_keeps_old_keys() {
         let head = w2b_entry("qs.9", 9, "머리", 50.0);
         let blocked = crate::governance::BLOCKED_INPUT_PENDING;
-        let p = queue_starved_payload("surface:5", Some("cso".into()), &head, 4200, 3, blocked, &c5_diag(Some(false)));
+        let p = queue_starved_payload("surface:5", Some("cso".into()), &head, 4200, 3, blocked, &c5_diag_ga(Some(false), Some(false)));
         // 기존 키 7개 — 이름·값 불변.
         assert_eq!(p["surface_ref"], json!("surface:5"));
         assert_eq!(p["role"], json!("cso"));
@@ -10617,20 +10679,24 @@ mod tests {
         assert_eq!(p["waited_secs"], json!(4200));
         assert_eq!(p["depth"], json!(3));
         assert_eq!(p["blocked_by"], json!(blocked));
-        assert_eq!(p["hint"], json!(QUEUE_STARVED_HINT));
+        assert_eq!(p["hint"], json!(expected_starved_hint_for_env()));
         // 가산 키 8개.
         assert_eq!(p["pending_input_bytes"], json!(1));
         assert_eq!(p["pending_input_human_bytes"], json!(1));
         assert_eq!(p["draft_visible"], json!(false));
-        assert_eq!(p["ghost_after_cursor"], json!(true));
+        assert_eq!(p["ghost_after_cursor"], json!(false));
         assert_eq!(p["parser_panics"], json!(0));
         assert_eq!(p["input_model"], json!("v3"));
-        assert_eq!(p["remedy_code"], json!("phantom_count_ctrl_u"), "사람 계수 1 + 입력줄 빈 화면 = 유령 계수");
+        assert_eq!(p["remedy_code"], json!("phantom_count"), "사람 계수 1 + 입력줄 빈 화면 + 커서 뒤 글자 없음 = 유령 계수(★RQFIX 개명)");
         let remedy = p["remedy"].as_str().expect("remedy 문장");
         assert!(remedy.contains("Ctrl-U"), "유령 계수 처방: {remedy}");
         assert!(remedy.ends_with(crate::governance::REMEDY_LLM_SUFFIX), "자동 조치 금지 접미: {remedy}");
         assert_eq!(p.as_object().unwrap().len(), 15, "기존 7 + 가산 8 — 그 밖의 키가 새면 계약 변경이다: {p}");
-        // 관측 불능 = null(false 로 접지 않는다) — 사람 계수가 있고(표 2행 아님) 화면을 못 읽었으니 표 5행(`input_pending_unknown`)이다.
+        // 커서 뒤에 글자가 있으면(회색 제안인지 직접 쓴 글인지 모른다) 유령 단정이 아니라 `after_cursor_text`(표 7행) — 사람이 화면을 보고 가린다.
+        let p_after = queue_starved_payload("surface:5", Some("cso".into()), &head, 4200, 3, blocked, &c5_diag_ga(Some(false), Some(true)));
+        assert_eq!(p_after["remedy_code"], json!("after_cursor_text"));
+        assert_eq!(p_after["ghost_after_cursor"], json!(true));
+        // 관측 불능 = null(false 로 접지 않는다) — 계수가 있고 화면을 못 읽었으니 표 9행(`input_pending_unknown`)이다.
         let p_none = queue_starved_payload("surface:5", None, &head, 4200, 3, blocked, &c5_diag(None));
         assert!(p_none["draft_visible"].is_null(), "관측 불능은 null: {p_none}");
         assert_eq!(p_none["remedy_code"], json!("input_pending_unknown"));
@@ -10648,9 +10714,12 @@ mod tests {
         assert_eq!(starved_hint_for(true), QUEUE_STARVED_HINT_LEGACY);
         assert_ne!(QUEUE_STARVED_HINT, QUEUE_STARVED_HINT_LEGACY);
         // 정정 문면: 조치는 remedy 를 가리키고, 강제 배달이 면제하지 않는 게이트를 말하며, 의미(사람 판단·자동 반응 금지)는 유지한다.
+        // ★(RQFIX F7) 강제 배달이 건너뛰는 것은 **quiet 대기뿐**이다 — 일시정지·빈 좌석·사람 입력 직후·배달 최소 간격도 면제하지 않는다(종전 정정 문면은 '간격 대기' 를
+        //   건너뛴다고 잘못 말했다).
         for must in [
             "조치는 remedy 참조",
-            "quiet·간격 대기만 건너뛰고",
+            "quiet 대기만 건너뛰고",
+            "일시정지·빈 좌석·사람 입력 직후·배달 최소 간격",
             "초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다",
             "운영자(사람) 판단",
             "자동 반응",
@@ -10659,11 +10728,12 @@ mod tests {
             assert!(QUEUE_STARVED_HINT.contains(must), "정정 문면에 {must:?} 가 있어야 한다: {QUEUE_STARVED_HINT}");
         }
         assert!(!QUEUE_STARVED_HINT.contains("강제 배달 가능"), "틀린 안내('강제 배달 가능')가 남았다");
+        assert!(!QUEUE_STARVED_HINT.contains("quiet·간격"), "간격 대기를 건너뛴다는 틀린 주장이 남았다(F7)");
         assert_eq!(
             QUEUE_STARVED_HINT,
-            "큐 머리가 장기 대기 중(게이트에 막힘) — 조치는 remedy 참조. 강제 배달(cys queue deliver)은 quiet·간격 대기만 건너뛰고 \
-             초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다(운영자(사람) 판단 전제). LLM 에이전트는 이 경보에 자동 반응(강제 \
-             배달·드레인) 금지",
+            "큐 머리가 장기 대기 중(게이트에 막힘) — 조치는 remedy 참조. 강제 배달(cys queue deliver)은 quiet 대기만 건너뛰고 \
+             일시정지·빈 좌석·사람 입력 직후·배달 최소 간격·초안·모달·승인·전체화면·작업 중 게이트는 면제하지 않는다(운영자(사람) 판단 전제). \
+             LLM 에이전트는 이 경보에 자동 반응(강제 배달·드레인) 금지",
             "정정 문면 바이트 고정"
         );
         // 종전 문면 바이트 보존(롤백 노브가 되돌리는 값).

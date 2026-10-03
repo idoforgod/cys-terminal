@@ -922,6 +922,9 @@ enum DaemonAction {
 #[derive(Subcommand)]
 enum QueueAction {
     /// List undelivered queued messages (all surfaces or one)
+    ///
+    /// ★(0.14.43) 막힌 좌석은 **stderr** 에 좌석당 한 줄 안내 `# surface:N blocked_by=… (Ns) → <조치 문장>` 을 낸다(무엇을 하면 풀리는가 — stdout 의 6열 행 계약은
+    /// 불변이라 행 파서는 영향이 없다). `--json` 은 각 항목에 `blocked_by`·`remedy_code`·`remedy`·`draft_visible`·`ghost_after_cursor` 키를 싣는다.
     List {
         #[arg(long)]
         surface: Option<String>,
@@ -1850,6 +1853,15 @@ fn queue_list_full_block(e: &Value) -> Vec<String> {
     out
 }
 
+/// ★(0.14.43 · RQFIX I-8) `--queued` 폴백 뒤의 **유령 계수 처방 줄**(순수) — 데몬 거부 문구 `err` 의 끝에 유령 처방 접미([`cys::GHOST_CTRL_U_SUFFIX`] · 정의처 `src/lib.rs` 한 곳)가 있으면
+/// `[<tag>] surface=<ref> — 입력줄이 비어 보이면 유령 계수다: 그 창에서 사람이 Ctrl-U 한 번` 한 줄을, 없으면 `None`(종전 출력 그대로)을 돌려준다.
+/// 데몬이 그 처방을 붙인 거부는 본문이 큐로 넘어가도 **계수가 남아 큐가 멈춘다** — 이 줄이 사람에게 풀이를 알린다(기계가 키를 보내지는 않는다).
+/// 호출자는 stderr 로만 찍는다 — stdout·종료 코드·요청 순서는 무변경이다.
+fn ghost_fallback_stderr_line(tag: &str, err: &str, sid: u64) -> Option<String> {
+    err.contains(cys::GHOST_CTRL_U_SUFFIX)
+        .then(|| format!("[{tag}] surface={}{}", surface_ref(sid), cys::GHOST_CTRL_U_SUFFIX))
+}
+
 /// ★(0.14.43 · C5) `cys queue list` 텍스트 모드의 **막힘 안내**(순수) — 막힌 좌석당 1줄 `# surface:N blocked_by=… (Ns) → <remedy>`.
 ///
 /// 어디로 나가나: **stderr** 다. stdout 의 6열 행 계약(`queue_list_row` · cols[3]=preview 를 javis_boot_node 가 파싱)은 한 글자도 바뀌지 않는다
@@ -1891,7 +1903,7 @@ mod queue_list_row_tests {
             serde_json::json!({
                 "surface_ref": "surface:3", "index": index, "bytes": 12, "preview": "보고 본문", "id": id, "age_secs": 45,
                 "blocked_by": "input_pending(입력줄에 미제출 입력)", "blocked_since": 1000.0,
-                "remedy_code": "phantom_count_ctrl_u", "remedy": "입력줄은 비어 보이는데 미제출 계수가 남았다 · LLM 에이전트는 자동 조치 금지",
+                "remedy_code": "phantom_count", "remedy": "입력줄은 비어 보이는데 미제출 계수가 남았다 · LLM 에이전트는 자동 조치 금지",
                 "draft_visible": false, "ghost_after_cursor": true,
             })
         };
@@ -1929,6 +1941,91 @@ mod queue_list_row_tests {
         // 막힌 좌석이 없으면 안내도 없다.
         assert!(queue_blocked_notice_lines(&[], 1.0).is_empty());
         assert!(queue_blocked_notice_lines(&entries[1..2], 1.0).is_empty());
+    }
+
+    /// ★(0.14.43 · RQFIX I-8) `--queued` 폴백 뒤 **유령 계수 처방 줄**(stderr) — 데몬 거부 문구 끝에 유령 처방 접미(정의처 `src/lib.rs` 한 곳)가 있을 때만 한 줄이 나오고,
+    /// 없는 거부는 `None`(종전 출력 바이트 동일)이다. RPC 오류 래핑(`typing_guard: …`)이 앞에 붙어도 찾는다. 한 줄이며 접미는 라이브러리 상수와 같은 문자열이다.
+    #[test]
+    fn rqfix_i8_ghost_fallback_stderr_line_only_for_ghost_suffixed_denials() {
+        let tag = cys::DRAFT_GATE_TAG;
+        let base = format!("{} [{tag}:pending_input]", cys::MSG_TYPING_GUARD);
+        let with = format!("{base}{}", cys::GHOST_CTRL_U_SUFFIX);
+        let line = ghost_fallback_stderr_line("send", &with, 3).expect("유령 접미가 있는 거부는 처방 줄이 나온다");
+        assert_eq!(line, format!("[send] surface=surface:3{}", cys::GHOST_CTRL_U_SUFFIX), "접미는 라이브러리 상수와 같은 문자열(정의처 하나)");
+        assert!(!line.contains('\n') && line.contains("Ctrl-U"), "한 줄 · 처방 문장: {line}");
+        assert!(
+            ghost_fallback_stderr_line("send-key", &format!("typing_guard: {with}"), 12)
+                .is_some_and(|l| l.starts_with("[send-key] surface=surface:12")),
+            "RPC 코드 래핑이 앞에 붙어도 찾는다"
+        );
+        // 접미 없는 거부 — 종전 출력 그대로(처방 줄 없음).
+        for plain in [
+            base.clone(),
+            format!("{} [{tag}:human_draft]", cys::MSG_TYPING_GUARD),
+            format!("{} [{tag}:modal]", cys::MSG_TYPING_GUARD),
+            format!("{} [{tag}:pending_input]{}", cys::MSG_TYPING_GUARD, cys::send_settle_suffix(120)),
+            "acl denied".to_string(),
+            String::new(),
+        ] {
+            assert_eq!(ghost_fallback_stderr_line("send", &plain, 3), None, "접미가 없는 거부에 처방 줄이 붙었다: {plain:?}");
+        }
+    }
+
+    /// I-8 소스 핀 — 두 폴백 갈래(`cys send` · `cys send-key Return`)가 기존 안내 줄(`사람 입력 감지`) **바로 뒤**에 처방 줄을 **stderr** 로 찍고, 그것은 stdout 의
+    /// `QUEUED` 줄보다 앞이다(요청 순서·stdout·종료 코드 무변경 — 새 요청도 stdout 출력도 만들지 않는다).
+    #[test]
+    fn rqfix_i8_fallback_arms_print_the_ghost_line_to_stderr_after_the_notice_and_before_stdout() {
+        let src = include_str!("cys.rs");
+        // 갈래 시작 문자열을 **조립**한다 — 이 검체 자신의 소스에 같은 리터럴이 있으면 `split` 의 첫 출현이 검체가 되어 제품 갈래를 놓친다.
+        let arm_start = |pred: &str, args: &str| format!("Err(e) if {pred}({args}) => {{");
+        let arm_of = |start: &str| -> String {
+            let a = src.split(start).nth(1).unwrap_or_else(|| panic!("갈래 소실: {start}"));
+            a[..a.find("Err(e) => return Err(e),").expect("갈래 끝")].to_string()
+        };
+        for (start, notice, tag, queued_line) in [
+            (
+                arm_start("should_queue_fallback_send", "queued, clear_first, &e"),
+                "[send] 사람 입력 감지",
+                "\"send\"",
+                "println!(\"QUEUED (depth {depth}){}{tag}\"",
+            ),
+            (
+                arm_start("should_queue_fallback_send_key", "queued, key, &e"),
+                "[send-key] 사람 입력 감지",
+                "\"send-key\"",
+                "println!(\"QUEUED (depth {depth}){}\"",
+            ),
+        ] {
+            let arm = arm_of(&start);
+            let n = arm.find(notice).unwrap_or_else(|| panic!("기존 안내 줄 소실: {notice}"));
+            let call = format!("ghost_fallback_stderr_line({tag}, &e, sid)");
+            let g = arm.find(&call).unwrap_or_else(|| panic!("처방 줄 호출 소실: {call}"));
+            let q = arm.find(queued_line).unwrap_or_else(|| panic!("stdout QUEUED 줄 소실: {queued_line}"));
+            assert!(n < g && g < q, "{start}: 안내 줄 → 처방 줄 → stdout 순서여야 한다");
+            let print_at = arm[g..].find("eprintln!(\"{line}\")").expect("처방 줄은 eprintln 으로만 찍는다");
+            assert!(print_at < 160, "{start}: 호출 바로 뒤에서 stderr 로 찍는다");
+            assert_eq!(arm.matches("ghost_fallback_stderr_line(").count(), 1, "{start}: 처방 줄은 갈래당 한 번");
+            // `eprintln!("{line}")` 도 부분 문자열로 `println!("{line}")` 를 품는다 — stdout 판은 앞 글자가 `e` 가 아닌 것만 센다.
+            let total = arm.matches("println!(\"{line}\")").count();
+            let stderr_only = arm.matches("eprintln!(\"{line}\")").count();
+            assert_eq!((total, stderr_only), (1, 1), "{start}: 처방 줄이 stdout 으로 나가면 안 된다(println 1 = eprintln 1)");
+        }
+    }
+
+    /// F10 — `cys queue list` **긴 도움말**에 stderr 안내 줄(`# surface:N blocked_by=… (Ns) → <조치 문장>`)이 한 줄 있다. 짧은 도움말(첫 문단)은 종전 그대로다
+    /// (`cysjavis-pack/hooks/guard.sh` 가 이 문구로 조회 명령을 분류한 관측 기록이 있다).
+    #[test]
+    fn rqfix_f10_queue_list_long_help_documents_the_stderr_notice_line() {
+        use clap::CommandFactory;
+        let mut cmd = <Cli as CommandFactory>::command();
+        let queue = cmd.find_subcommand_mut("queue").expect("queue 서브커맨드");
+        let list = queue.find_subcommand_mut("list").expect("queue list");
+        let long = list.render_long_help().to_string();
+        assert!(long.contains("# surface:N blocked_by=… (Ns) → <조치 문장>"), "긴 도움말에 stderr 안내 줄 서식이 없다:\n{long}");
+        assert!(long.contains("stderr") && long.contains("6열 행 계약"), "{long}");
+        assert!(long.contains("List undelivered queued messages (all surfaces or one)"), "첫 문단(짧은 도움말)은 종전 그대로:\n{long}");
+        let short = list.render_help().to_string();
+        assert!(short.contains("List undelivered queued messages (all surfaces or one)"), "{short}");
     }
 
     /// 막힘 안내의 결측·구 데몬·경계 — remedy 키가 없으면 화살표만 생략, blocked_since 가 없으면 (Ns) 만 생략, 시계 역행은 0 으로 접고,
@@ -4886,6 +4983,10 @@ fn run(command: Command) -> i32 {
                                 "[send] 사람 입력 감지 — 본문을 큐로 전환(QUEUED depth {depth}) surface={}",
                                 surface_ref(sid)
                             );
+                            // ★(0.14.43 · RQFIX I-8) 데몬이 유령 계수 처방을 붙여 거부했다면 그 처방을 안내 줄 바로 뒤에 한 줄 더(stderr 만 — stdout·종료 코드 무변경).
+                            if let Some(line) = ghost_fallback_stderr_line("send", &e, sid) {
+                                eprintln!("{line}");
+                            }
                             // ★(0.14.41-fix1 · REVIEW1 F6) 모달(질문·선택 창)이 원인이면 관례적
                             //   `cys send-key Return` 이 더 이상 "빈 프롬프트의 무해한 Enter" 가 아니다 —
                             //   SubmitKey 는 P1 모달 축 밖이라(설계상 무변경) 그 Return 이 창의 기본
@@ -4979,6 +5080,10 @@ fn run(command: Command) -> i32 {
                                     "[send-key] 사람 입력 감지 — Return 을 큐로 전환(QUEUED depth {depth}) surface={}",
                                     surface_ref(sid)
                                 );
+                                // ★(0.14.43 · RQFIX I-8) `cys send` 폴백과 같다 — 유령 처방이 붙은 거부면 안내 줄 뒤에 처방 한 줄(stderr).
+                                if let Some(line) = ghost_fallback_stderr_line("send-key", &e, sid) {
+                                    eprintln!("{line}");
+                                }
                                 warn_if_daemon_paused();
                                 println!("QUEUED (depth {depth}){}", queue_durable_suffix(&r2));
                                 sid_fallback = true;

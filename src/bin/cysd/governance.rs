@@ -588,15 +588,66 @@ pub fn agent_alive_from_liveness(liveness: AgentLiveness, strict_proven: bool) -
     }
 }
 
+/// ★(0.14.43 · RQFIX B-1) 좌석 v3 표식([`crate::state::Surface::lone_key_exempt`])의 **순수 판정** — 단독 Esc·BS/DEL 비계수(v3)를 적용해도 되는
+/// 좌석인가. 세 조건의 AND 다:
+///   · `model == V3` — 전역 노브(`CYS_PENDING_INPUT_MODEL` · unix 기본 V3 · 윈도우 기본 V2). V2 면 어떤 좌석도 참이 아니다.
+///   · `alive` — 이번 watchdog 틱의 에이전트 생존 판정. 죽은 에이전트(통지 여부 무관)·기동 전은 거짓 — 그 좌석의 전경은 맨 셸이다.
+///   · `has_marker` — 그 에이전트의 어댑터가 프롬프트 마커를 선언한다(`merged_prompt_marker` · 큐 게이트와 같은 출처). 마커를 선언하지 않는
+///     어댑터(예: grok)는 화면으로 원시 모드 TUI 임을 확인할 길이 없어 보수 쪽(v2)에 둔다.
+/// 맨 셸(`agent_meta` 없음)·종료 좌석은 호출자가 `alive`/`has_marker` 를 거짓으로 넘긴다.
+pub(crate) fn lone_key_exempt_for(model: PendingInputModel, alive: bool, has_marker: bool) -> bool {
+    model == PendingInputModel::V3 && alive && has_marker
+}
+
+/// ★(0.14.43 · RQFIX B-1) 좌석 표식 갱신 — [`check_agent_death`] 가 좌석마다 매 틱 부르는 **유일한 writer 본체**.
+/// `seat` = `Some((에이전트 이름, 이번 틱 생존 판정))` | `None`(맨 셸 · 종료 좌석 — 항상 거짓).
+/// 어댑터 정의는 **V3 이고 살아 있는 meta 좌석이 처음 나올 때 한 번만**(틱당 1회) 읽어 `adapters` 에 둔다 — 윈도우 기본(V2)·전 좌석이 죽었거나
+/// 맨 셸인 틱에서는 디스크를 읽지 않는다.
+fn sync_lone_key_exempt(
+    s: &crate::state::Surface,
+    model: PendingInputModel,
+    seat: Option<(&str, bool)>,
+    adapters: &mut Option<(serde_json::Value, serde_json::Value)>,
+) {
+    let (alive, has_marker) = match seat {
+        None => (false, false),
+        Some((agent, alive)) => {
+            let has_marker = model == PendingInputModel::V3 && alive && {
+                let (disk, embed) = adapters.get_or_insert_with(load_adapter_defs);
+                merged_prompt_marker(disk, embed, agent).is_some()
+            };
+            (alive, has_marker)
+        }
+    };
+    let exempt = lone_key_exempt_for(model, alive, has_marker);
+    s.lone_key_exempt.store(exempt, Ordering::Relaxed);
+}
+
 /// T2-5 에이전트 사망 감지: 셸은 살았는데 그 위의 에이전트 프로세스만 죽은 상태를
 /// 즉시 잡는다 (기존엔 pane.idle 300초가 최초 신호 — '생각 중'과 구분 불가).
 /// 판정: 자식 트리에서 agents.json 등록 바이너리가 '한 번 보였다가 사라짐' 전이.
+///
+/// ★(0.14.43 · RQFIX B-1) 같은 틱의 생존 판정으로 좌석 v3 표식(`Surface::lone_key_exempt`)도 갱신한다 — 이 함수가 그 **단일 writer** 다
+/// (좌석마다 매 틱: 종료 좌석·`agent_meta` 없음 → 거짓 · 그 밖 → [`lone_key_exempt_for`]). 전역 모델은 [`PendingInputModel::current`].
 fn check_agent_death(
     daemon: &Arc<Daemon>,
     sys: &System,
     restart_counts: &mut HashMap<u64, u32>,
     strict_proof: &mut HashMap<u64, Option<(String, u32)>>,
 ) {
+    check_agent_death_with_model(daemon, sys, restart_counts, strict_proof, PendingInputModel::current());
+}
+
+/// [`check_agent_death`] 의 **본체** — 전역 계수 모델을 인자로 받는다(검체는 OS·env 와 무관하게 모델을 못박는다).
+fn check_agent_death_with_model(
+    daemon: &Arc<Daemon>,
+    sys: &System,
+    restart_counts: &mut HashMap<u64, u32>,
+    strict_proof: &mut HashMap<u64, Option<(String, u32)>>,
+    model: PendingInputModel,
+) {
+    // ★(0.14.43 · RQFIX B-1) 어댑터 정의 — 표식 판정이 필요할 때(V3 ∧ 살아 있는 meta 좌석) 한 번만 읽는다([`sync_lone_key_exempt`]).
+    let mut adapters: Option<(serde_json::Value, serde_json::Value)> = None;
     // ★P3-6 좁힘 무장 임계(연속 틱). 0 = 좁힘 비활성(종전 거동). 기본 2 — watchdog 5초 주기라
     // 10초 연속 엄격 관측이면 증명이 선다(스치는 도우미 프로세스는 통과하지 못한다).
     let strict_arm_ticks = env_u32("CYS_AGENT_STRICT_PROOF_TICKS", 2);
@@ -608,6 +659,8 @@ fn check_agent_death(
     let now = now_epoch();
     for s in surfaces {
         if s.exited.load(Ordering::Relaxed) {
+            // ★(0.14.43 · RQFIX B-1) 종료 좌석은 표식을 내려 둔다(조기 continue 앞) — 남은 true 가 v3 로 계수하지 않게.
+            sync_lone_key_exempt(&s, model, None, &mut adapters);
             continue;
         }
         // ★G5-③(W5-A) claim_role 관측 등록의 2-표본째 확정 훅 — Windows arm 이 스테이징한
@@ -677,6 +730,8 @@ fn check_agent_death(
             }
         }
         let Some((agent, bin)) = s.agent_meta.lock().unwrap().clone() else {
+            // ★(0.14.43 · RQFIX B-1) 맨 셸(agent_meta 없음) — 줄 편집기 접두 대기가 있을 수 있어 v2 로 센다(표식 거짓).
+            sync_lone_key_exempt(&s, model, None, &mut adapters);
             continue;
         };
         let bin_base = bin.rsplit(['/', '\\']).next().unwrap_or(&bin).to_string();
@@ -700,6 +755,8 @@ fn check_agent_death(
             strict_arm_ticks,
         );
         let alive = agent_alive_from_liveness(liveness, strict_proven);
+        // ★(0.14.43 · RQFIX B-1) 이번 틱의 생존 판정으로 좌석 v3 표식을 쓴다(단일 writer · 조기 continue 앞에서 모든 갈래가 지난다).
+        sync_lone_key_exempt(&s, model, Some((&agent, alive)), &mut adapters);
         if alive {
             s.agent_seen.store(true, Ordering::Relaxed);
             if s.agent_exit_notified.swap(false, Ordering::Relaxed) {
@@ -5082,6 +5139,8 @@ pub(crate) enum DirectSendKind {
     /// ② 기계가 Backspace 를 반복 송신해 초안을 지우는 것은 사고(자동 흐름의 연접·제출·선정리)가 아니라
     ///    고의 경로이고 팩·GUI 호출자 0건(grep) — 그 방어는 ACL 층 몫이다.
     /// ③ 부분 편집 바이트는 기계 출처로 **가산**되어 그 좌석행 이후 기계 Text/Return 이 더 강하게 막힌다(fail-closed).
+    ///    단 0.14.43 v3 는 **살아 있는 에이전트 TUI 좌석**(`Surface::lone_key_exempt` 참 — 마커 선언 어댑터의 에이전트가 살아 있는 좌석)에서만
+    ///    봉투 밖 단독 BS/DEL·Esc 를 가산하지 않는다. 맨 셸·죽은 에이전트·마커 없는 어댑터 좌석은 종전(v2)대로 가산한다 — 줄 편집기가 ESC 접두를 쥐고 있을 수 있다.
     CancelKey,
 }
 
@@ -5812,8 +5871,8 @@ fn resubmit_withheld_one(
 // 【판정의 원칙 — 양성 관측만】 보류 근거는 **지금 양성으로 관측된** 하드 축뿐이다. 관측 불능(마커 미정의·
 // 커서행 미관측·SEAT Unknown·`pending_input_bytes` 단독)은 보류 근거가 아니다 → 호출부는 종전 직접 주입으로
 // 떨어진다. UI 가 깨져 판정이 불능이 되어도 스케줄 하트비트·wakeup 의 생명선은 끊기지 않는다(③).
-//   · `pending_input_bytes` 를 넣지 않는 이유: 이 계수는 stale 이 될 수 있고(Backspace·순수 Esc 가산 ·
-//     D-02 보류), 그 리셋은 화면이 관측될 때만 돈다(`maybe_reset_stale_pending_input`). 계수 단독을 근거로
+//   · `pending_input_bytes` 를 넣지 않는 이유: 이 계수는 stale 이 될 수 있고(Backspace·순수 Esc 가산 — v2 계수 좌석과
+//     v3 표식이 거짓인 좌석(맨 셸·죽은 에이전트)에서 · D-02 보류), 그 리셋은 화면이 관측될 때만 돈다(`maybe_reset_stale_pending_input`). 계수 단독을 근거로
 //     쓰면 UI 파손 때 영구 보류다.
 //   · 시간 기반 면제(ceiling)는 두지 않는다(§8-3: 새 신호로 게이트를 면제하지 않는다).
 //
@@ -6641,6 +6700,10 @@ pub(crate) const PASTE_OPEN_TTL_SECS: u64 = 5;
 ///   · `V3` — 단독 ESC(0x1b 정확히 1바이트)이거나 DEL/BS(0x7f·0x08)만으로 이뤄진 세그먼트는 계수에 더하지 않는다.
 /// 기본값은 [`PendingInputModel::os_default`] — unix 는 `V3`, 윈도우는 실기 확인 전이라 종전 `V2` 를 유지한다.
 /// env `CYS_PENDING_INPUT_MODEL`(`v2`/`v3`)로 프로세스 시작 때 한 번 덮어쓴다([`PendingInputModel::current`]).
+///
+/// ★(0.14.43 · RQFIX B-1) 이 노브는 전역 **허용 상한**일 뿐이다 — 좌석마다 V3 를 실제로 적용할지는 좌석 표식 `Surface::lone_key_exempt`
+/// (살아 있는 에이전트 TUI · 단일 writer `check_agent_death`)가 정한다. 표식이 거짓인 좌석(맨 셸·죽은 에이전트·마커 없는 어댑터·표식 쓰기 전)은 이 노브가
+/// V3 여도 V2 로 센다([`lone_key_exempt_for`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PendingInputModel {
     V2,
@@ -6721,16 +6784,25 @@ impl PendingInputModel {
 ///     Backspace(0x7f·0x08)도 길이만큼 가산한다. Claude Code 입력 추천(커서 뒤 고스트)이 떠 있으면 stale 리셋
 ///     (`maybe_reset_stale_pending_input` — 커서 앞·뒤 모두 빈 줄이어야 발동)이 불발해 그 좌석의 큐 배달·강제 배달·
 ///     직접 send 가 전부 `input_pending` 으로 거부된다.
-///   · V3(unix 기본): 봉투 **밖** 세그먼트가 단독 ESC(0x1b 정확히 1바이트)이거나 0x7f·0x08 만으로 이뤄졌으면
+///   · V3(unix 기본 · ★RQFIX B-1: **좌석 표식 `Surface::lone_key_exempt` 가 참인 좌석에만 적용** — 맨 셸·죽은 에이전트·마커 없는 어댑터 좌석은 V2):
+///     봉투 **밖** 세그먼트가 단독 ESC(0x1b 정확히 1바이트)이거나 0x7f·0x08 만으로 이뤄졌으면
 ///     count·human 에 더하지 않는다 — 순수 자동응답 면제와 같은 `continue` 이며 **리셋도 감산도 아니다**.
-///     출처(사람·기계)와 무관하다. Esc·BS·DEL 은 글자를 줄에 남기지 못하는 키라 이 세그먼트가 새 초안을 만들지 않는다.
+///     출처(사람·기계)와 무관하다. **살아 있는 에이전트 TUI(원시 모드)에서는** Esc·BS·DEL 이 글자를 줄에 남기지 못하는 키라 이 세그먼트가 새 초안을 만들지 않는다
+///     (반례: 맨 셸 줄 편집기는 단독 ESC 를 Meta 조합의 첫 바이트로 쥐고 다음 키를 무기한 기다리고, 정규 모드 tty — `cat`·`read`·`sudo`·파이썬 `input()` — 는
+///     `^[`·`^H` 를 글자로도 남긴다. 그런 좌석은 표식이 거짓이라 V2 가 센다).
+///     ★(RQFIX I-2) 면제 세그먼트가 **사람 출처**이고 그 시점 계수 > 0 이면 계수는 그대로 두고 `human` 만 최소 1 로 올린다(`human = max(human, 1)` ·
+///     human ≤ count 유지) — 사람이 손댄 기계 잔여(계수 n · 사람 0)를 기계의 뒤늦은 Return·스케줄 병합 제출이 그대로 제출하지 못하게 한다(V2 는 `HumanDraft` 로
+///     거부했다). 계수 0(빈 줄)이면 아무것도 바꾸지 않는다(감산 없음 원칙 유지).
 ///     글자를 넣을 수 있는 키(Tab·화살표 CSI·Ctrl-Y·그 밖 제어키)와 `ESC ESC`·`ESC DEL`(Meta-Backspace)·
 ///     글자+BS 한 세그먼트는 종전처럼 길이만큼 센다. 봉투 **안**·이월·Meta-Enter·리셋(CR/LF/^U/^C) 규칙은 무변경이다.
 ///     불변식 "계수 ≥ 화면에 보이는 미제출 글자 수" 를 지키려고 **감산은 하지 않는다**('abc' 뒤 BS×3 → 3 그대로 ·
 ///     과소 계수 = 초안 위 오주입 방향이라 만들지 않는다). 잔여 틈: 글자를 치고 전부 지운 줄은 계수가 남는다
 ///     (D-02 · `qs_a2_*` RED 자산은 그대로 보류).
 ///
-/// 이 함수는 [`PendingInputModel::current`] 로 [`pending_input_step_model`] 에 위임하는 얇은 래퍼다(호출처 무수정).
+/// 이 함수는 [`PendingInputModel::current`] 로 [`pending_input_step_model`] 에 위임하는 얇은 래퍼다.
+/// ★(RQFIX B-1) **제품 호출처는 없다** — `Surface::apply_pending_input` 은 좌석 표식으로 고른 모델(`Surface::pending_input_model`)을 본체에 직접 넘긴다.
+/// 이 래퍼는 검체 전용(전역 노브의 거동 핀)이라 비검체 빌드의 미사용 경고를 허용한다.
+#[allow(dead_code)]
 pub(crate) fn pending_input_step(
     prev: &PendingInputState,
     chunk: &[u8],
@@ -6825,6 +6897,12 @@ pub(crate) fn pending_input_step_model(
             let lone_esc = seg == [0x1b];
             let only_bs_del = !seg.is_empty() && seg.iter().all(|&b| matches!(b, 0x7f | 0x08));
             if model == PendingInputModel::V3 && (lone_esc || only_bs_del) {
+                // ★(RQFIX I-2) 사람이 이미 계수 > 0 인 줄(기계 잔여 포함)에 단독 Esc·BS/DEL 을 쳤다 — 계수는 그대로 두되 '사람이 손댄 줄' 로 표시한다
+                //   (human ≥ 1 · human ≤ count 유지). 기계의 뒤늦은 Return 이 사람이 고친 줄을 제출하지 못하게 한다(v2 `HumanDraft` 와 같은 방향).
+                //   계수 0(빈 줄)이면 건드리지 않는다 — 원 결함(빈 줄 Esc 로 남는 고착 계수) 수정과 감산 없음 원칙을 유지한다.
+                if is_human && st.count > 0 {
+                    st.human = st.human.max(1);
+                }
                 continue;
             }
             // carried 가드는 현재 봉투 밖 하한 2 아래에서는 도달 불가다(tail 의 끝은 ESC 가 아님).
@@ -7466,11 +7544,16 @@ fn mark_queue_blocked(s: &Arc<crate::state::Surface>, reason: &str) {
 
 /// 큐 막힘 진단 스냅샷 — 한 좌석의 "왜 안 가나" 를 사후에도 읽게 하는 **사실 묶음**(판정 입력이 아니다).
 ///
-/// · `draft_visible` = 프롬프트 마커 좌석에서 커서 행의 **커서 앞**(마커 뒤)에 글자가 있는가 — 게이트 `input_line_state` 와 같은 술어.
-///   `ghost_after_cursor` = 커서 **뒤**에 글자가 있는가(입력 추천·플레이스홀더 — 게이트 판정에는 쓰지 않는 축이고 stale 리셋만 이것에 막힌다).
+/// · `draft_visible` = 입력줄에 **글이 보이는가**(★RQFIX F6 · 편집 영역 전체) — 커서 **앞**(마커 뒤)에 글자가 있거나(게이트 `input_line_state` 와 같은 술어)
+///   마커 행 **아래**의 편집 영역이 비어 있지 않으면 `Some(true)`(멀티라인 초안의 둘째 행 이하 — 커서가 첫 행에 있어도 놓치지 않는다), 둘 다 아니면 `Some(false)`.
+///   아래 영역 판독은 stale 리셋(`maybe_reset_stale_pending_input`)이 쓰는 같은 술어(`readiness::composer_edit_region_empty` · 같은 인자 출처)에 맡긴다 —
+///   다만 마커 행의 글자(커서 앞·뒤)는 이 진단이 따로 말하므로 그 행은 마커 글리프만 남긴 복사본으로 묻는다([`composer_rest_empty`]).
+///   `ghost_after_cursor` = 커서 **뒤**에 글자가 있는가(입력 추천·플레이스홀더 — 게이트 판정에는 쓰지 않는 축이고 stale 리셋만 이것에 막힌다 · 종전 뜻).
 ///   마커 없는 좌석·화면 관측 불능(선택기 행·발행 중 프레임·파서 락 오염·패닉)은 `None` — **결측은 값이 아니다**.
-/// · `paused` = kill-switch(`daemon.paused`) ∨ 그 좌석 큐 pause([`queue_injection_paused`] 와 같은 OR).
-/// · `input_model` = 입력줄 계수 모델 — `"v2"` | `"v3"`([`PendingInputModel::current`]).
+/// · `paused` = kill-switch(`daemon.paused`) ∨ 그 좌석 큐 pause([`queue_injection_paused`] 와 같은 OR · 종전 뜻).
+///   `kill_switch`(★RQFIX F8) = 그중 kill-switch(`daemon.paused`)만 — 좌석 pause 와는 처방 문장이 다르다(해제 주체가 오너냐 시간이냐).
+/// · `input_model` = 이 좌석에 **지금 적용되는** 입력줄 계수 모델 — `"v2"` | `"v3"`([`crate::state::Surface::pending_input_model`] · 좌석 표식 `lone_key_exempt` 기준 ·
+///   전역 노브 값이 아니다. 전역 값은 `org.status` 의 `daemon.pending_input_model`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct QueueBlockDiag {
     pub(crate) pending_input_bytes: u64,
@@ -7479,57 +7562,158 @@ pub(crate) struct QueueBlockDiag {
     pub(crate) ghost_after_cursor: Option<bool>,
     pub(crate) parser_panics: u64,
     pub(crate) paused: bool,
+    pub(crate) kill_switch: bool,
     pub(crate) input_model: &'static str,
 }
 
-/// 커서 행의 입력줄 가시성(순수) — `(draft_visible, ghost_after_cursor)`. 새 판정을 만들지 않는다: 커서 앞 판독은
-/// 게이트의 [`input_line_state`] 를, 커서 뒤 판독은 [`maybe_reset_stale_pending_input`] 의 `after.trim().is_empty()` 와 같은 술어다.
-/// 커서 행이 composer 가 아니거나(선택기 행) 프레임이 발행 중이거나 마커 뒤 커서가 없으면 `(None, None)`.
-pub(crate) fn input_line_visibility(obs: &PromptObs) -> (Option<bool>, Option<bool>) {
+/// ★(0.14.43 · RQFIX F6) composer **편집 영역의 나머지**(마커 행 **아래**)가 비어 있는가 — `None` = 화면에 마커 행이 없다(관측 불능).
+///
+/// 술어는 `readiness::composer_edit_region_empty`(= stale 리셋이 쓰는 것)를 그대로 쓴다. 그런데 그 술어는 "마커 행에 글자가 있으면 거짓" 이라 커서 뒤 고스트(입력 추천)가
+/// 떠 있는 평범한 한 줄 composer 도 '비어 있지 않음' 으로 읽는다 — 그대로 쓰면 `Some(false)`(비어 보임)와 `ghost_after_cursor == Some(true)` 가 함께 설 수 없어
+/// 처방 표의 `after_cursor_text` 행이 도달 불가가 된다. 마커 행의 글자는 커서 앞·뒤 판독이 따로 말하므로, 마커 행에 (플레이스홀더가 아닌) 글자가 있으면
+/// 그 행을 **마커 글리프만 남긴 복사본**으로 바꿔 같은 술어를 부른다 — 그러면 술어는 마커 **아래**의 구조(괘선·상태줄뿐인가 · 초안 이어짐인가)만 답한다.
+/// 마커 행이 이미 비어 있거나 어댑터 플레이스홀더와 같으면 화면 그대로 부른다(플레이스홀더는 비어 있는 composer 에만 그려지는 약한 증거 — 술어가 그대로 인정한다).
+/// 실패 방향: 판독이 모호하면 술어가 거짓을 돌려주고 호출자는 `draft_visible = Some(true)` 로 접는다(= Ctrl-U 처방을 붙이지 않는 쪽).
+fn composer_rest_empty(screen: &str, marker: &str, placeholder: Option<&str>) -> Option<bool> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let li = lines
+        .iter()
+        .rposition(|l| cys::agent_markers::leading_marker_index(marker, l).is_some())?;
+    let line = lines[li];
+    let mi = cys::agent_markers::leading_marker_index(marker, line)?;
+    let rest = &line[mi + marker.len()..];
+    let placeholder_row = placeholder.is_some_and(|ph| {
+        let want = cys::first_run_gates::flatten(ph);
+        !want.is_empty() && cys::first_run_gates::flatten(rest) == want
+    });
+    if rest.trim().is_empty() || placeholder_row {
+        return Some(cys::readiness::composer_edit_region_empty(screen, marker, placeholder));
+    }
+    let bare = &line[..mi + marker.len()];
+    let copy = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| if i == li { bare } else { *l })
+        .collect::<Vec<&str>>()
+        .join("\n");
+    Some(cys::readiness::composer_edit_region_empty(&copy, marker, placeholder))
+}
+
+/// 입력줄 가시성(순수) — `(draft_visible, ghost_after_cursor)`. 새 판정을 만들지 않는다: 커서 앞 판독은 게이트의 [`input_line_state`] 를,
+/// 편집 영역 아래 판독은 [`composer_rest_empty`](= stale 리셋의 술어)를, 커서 뒤 판독은 [`maybe_reset_stale_pending_input`] 의 `after.trim().is_empty()` 와 같은 술어다.
+/// 커서 행이 composer 가 아니거나(선택기 행) 프레임이 발행 중이거나 마커 뒤 커서가 없으면 `(None, None)`. `placeholder` = 그 어댑터의 빈 composer 플레이스홀더
+/// (`surface_prompt_marker` 가 돌려주는 값 · stale 리셋과 같은 출처). 커서 앞에 글자가 있으면 아래 영역은 읽지 않는다(어차피 `Some(true)`).
+pub(crate) fn input_line_visibility(
+    obs: &PromptObs,
+    placeholder: Option<&str>,
+) -> (Option<bool>, Option<bool>) {
     if !obs.frame_published() || obs.selector_row {
         return (None, None);
     }
     match obs.line.as_ref() {
-        Some((before, after)) => (
-            Some(
-                input_line_state(
-                    0,
-                    Some(PromptLine { before_cursor: before, at_or_after_cursor: after }),
-                ) == InputLine::Occupied,
-            ),
-            Some(!after.trim().is_empty()),
-        ),
+        Some((before, after)) => {
+            let before_occupied = input_line_state(
+                0,
+                Some(PromptLine { before_cursor: before, at_or_after_cursor: after }),
+            ) == InputLine::Occupied;
+            let draft_visible = if before_occupied {
+                Some(true)
+            } else {
+                composer_rest_empty(&obs.screen, &obs.marker, placeholder).map(|empty| !empty)
+            };
+            (draft_visible, Some(!after.trim().is_empty()))
+        }
         None => (None, None),
     }
 }
 
+/// 진단용 어댑터 정의의 **신선도 창**(초) — watchdog 주기와 같다. 진단은 사실을 알리는 일이라 이 정도 낡음은 무해하다(게이트·배달 판정에는 쓰지 않는다).
+const DIAG_ADAPTER_TTL_SECS: u64 = 5;
+
+/// 진단용 어댑터 정의 캐시 슬롯 한 칸(팩 디렉터리가 바뀌면 새로 읽는다).
+struct DiagDefsEntry {
+    dir: std::path::PathBuf,
+    at: std::time::Instant,
+    defs: Arc<(serde_json::Value, serde_json::Value)>,
+}
+
+/// 진단용 어댑터 정의 캐시의 **순수 코어** — 슬롯·시계·팩 디렉터리·로더를 인자로 받는다(검체가 로더 호출 횟수를 센다). `ttl` 안이고 같은 디렉터리면
+/// 공유 `Arc` 를 돌려주고 로더를 부르지 않는다. 락은 이 함수 안에서만 잡는 leaf 이며 로더(파일 읽기)는 다른 락을 잡지 않는다.
+fn diag_defs_cached(
+    slot: &std::sync::Mutex<Option<DiagDefsEntry>>,
+    now: std::time::Instant,
+    dir: &std::path::Path,
+    ttl: Duration,
+    load: &mut dyn FnMut() -> (serde_json::Value, serde_json::Value),
+) -> Arc<(serde_json::Value, serde_json::Value)> {
+    let mut g = slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(e) = g.as_ref() {
+        if e.dir == dir && now.saturating_duration_since(e.at) < ttl {
+            return e.defs.clone();
+        }
+    }
+    let defs = Arc::new(load());
+    *g = Some(DiagDefsEntry { dir: dir.to_path_buf(), at: now, defs: defs.clone() });
+    defs
+}
+
+/// ★(0.14.43 · RQFIX F4) **진단 경로 전용** 어댑터 정의 — 프로세스 전역 5초 캐시(`Arc` 공유). 사유 파일 기록·`queue.list`·`org.status`·직접 send 거부 응답의
+/// 진단이 호출마다 `agents.json` 을 디스크에서 읽고 파싱하던 비용을 5초에 1회로 줄인다. **게이트·배달 판정 경로는 이것을 쓰지 않는다**(`load_adapter_defs` 를 직접 읽는다 —
+/// 캐시된 낡은 정의가 막힘/통과를 정하면 안 된다 · 소스 핀 `rqfix_diag_adapter_cache_is_not_used_by_gate_or_delivery_paths`). 큐 틱 안의 기아 경보 진단은 이것이 아니라
+/// 틱이 이미 든 정의를 넘겨 받는다(틱당 1회 규약).
+pub(crate) fn diag_adapter_defs() -> Arc<(serde_json::Value, serde_json::Value)> {
+    static SLOT: std::sync::Mutex<Option<DiagDefsEntry>> = std::sync::Mutex::new(None);
+    diag_defs_cached(
+        &SLOT,
+        std::time::Instant::now(),
+        &cys::pack::pack_dir(),
+        Duration::from_secs(DIAG_ADAPTER_TTL_SECS),
+        &mut load_adapter_defs,
+    )
+}
+
 /// 좌석 한 곳의 입력줄 가시성 관측(IO) — 마커 좌석만 화면을 읽는다(마커 없는 좌석 = `(None, None)`). 파서 락 오염·패닉도 결측으로 접는다
-/// (진단은 게이트가 아니다 — 관측 실패가 호출자를 죽이지 않는다). 호출자는 **큐 락을 쥐지 않아야** 한다.
-pub(crate) fn seat_input_line_visibility(
+/// (진단은 게이트가 아니다 — 관측 실패가 호출자를 죽이지 않는다). 호출자는 **큐 락을 쥐지 않아야** 한다. 어댑터 정의는 `defs` 로 받는다(진단 캐시 또는 틱의 것).
+/// ★(RQFIX F4) `agent_meta` 가 없는 좌석(맨 셸)은 어댑터를 읽기 **전에** `(None, None)` — 맨 셸 진단에서 디스크 판독은 0 이다.
+pub(crate) fn seat_input_line_visibility_with(
     s: &Arc<crate::state::Surface>,
+    defs: &dyn Fn() -> Arc<(serde_json::Value, serde_json::Value)>,
 ) -> (Option<bool>, Option<bool>) {
+    if s.agent_meta.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        return (None, None);
+    }
     if s.parser.is_poisoned() {
         return (None, None);
     }
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let adapters = load_adapter_defs();
+        let adapters = defs();
         match surface_prompt_marker(s, &adapters) {
-            Some((markers, _)) => input_line_visibility(&observe_prompt(s, &markers)),
+            Some((markers, placeholder)) => {
+                input_line_visibility(&observe_prompt(s, &markers), placeholder.as_deref())
+            }
             None => (None, None),
         }
     }))
     .unwrap_or((None, None))
 }
 
-/// 좌석 진단 스냅샷(관측 한 곳) — `queue.starved` 발행·`queue.list`·`org.status`·`queue-blocked.json` 이 모두 이 함수 하나를 쓴다.
+/// [`seat_input_line_visibility_with`] 의 진단 캐시 판 — 큐 틱 밖의 진단 경로(사유 파일·`queue.list`·`org.status`·직접 send 거부)가 쓴다.
+pub(crate) fn seat_input_line_visibility(
+    s: &Arc<crate::state::Surface>,
+) -> (Option<bool>, Option<bool>) {
+    seat_input_line_visibility_with(s, &diag_adapter_defs)
+}
+
+/// 좌석 진단 스냅샷(관측 한 곳) — `queue.starved` 발행·`queue.list`·`org.status`·`queue-blocked.json` 이 모두 이 함수 하나를 쓴다. 어댑터 정의는 `defs` 로 받는다.
 /// 큐 락(`pending_queue` 등)을 쥔 채 부르지 않는다(파서 락은 큐 락 밖 — 위 【락 순서】).
-pub(crate) fn queue_block_diag(
+pub(crate) fn queue_block_diag_with(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
+    defs: &dyn Fn() -> Arc<(serde_json::Value, serde_json::Value)>,
 ) -> QueueBlockDiag {
     let pending = s.pending_input_bytes.load(Ordering::Relaxed);
     let human = s.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
-    let (draft_visible, ghost_after_cursor) = seat_input_line_visibility(s);
+    let (draft_visible, ghost_after_cursor) = seat_input_line_visibility_with(s, defs);
     QueueBlockDiag {
         pending_input_bytes: pending,
         pending_input_human_bytes: human,
@@ -7537,35 +7721,50 @@ pub(crate) fn queue_block_diag(
         ghost_after_cursor,
         parser_panics: s.parser_panics.load(Ordering::Relaxed),
         paused: queue_injection_paused(daemon, s),
-        input_model: PendingInputModel::current().as_str(),
+        kill_switch: daemon.paused.load(Ordering::Relaxed),
+        input_model: s.pending_input_model().as_str(),
     }
 }
 
-/// `queue_remedy` 가 돌려주는 code 의 **전량**(허용 목록) — 소비자(경보 라우팅 요약)는 이 목록과 정확히 일치할 때만 싣는다
-/// (요약은 pane stdin 으로 가므로 payload 의 자유 문자열을 그대로 싣지 않는다).
-pub(crate) const QUEUE_REMEDY_CODES: [&str; 10] = [
+/// [`queue_block_diag_with`] 의 진단 캐시 판 — 큐 틱 밖의 진단 경로가 쓴다(사유 파일·`queue.list`·`org.status`·스케줄 초안 우회 경보).
+pub(crate) fn queue_block_diag(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+) -> QueueBlockDiag {
+    queue_block_diag_with(daemon, s, &diag_adapter_defs)
+}
+
+/// `queue_remedy` 가 돌려주는 code 의 **전량**(허용 목록 · 13종) — 소비자(경보 라우팅 요약)는 이 목록과 정확히 일치할 때만 싣는다
+/// (요약은 pane stdin 으로 가므로 payload 의 자유 문자열을 그대로 싣지 않는다). GUI(`ui/src/starvednotice.ts`)의 어휘 대조 검체가 이 선언의 배열 리터럴을
+/// 소스에서 읽는다 — 선언 꼴(상수 이름·`[&str; 개수]` 타입 표기·배열 리터럴)을 바꾸지 않고 배열 안에 닫는 대괄호를 쓰지 않는다.
+/// ★(RQFIX I-5) 유령 계수 코드는 `phantom_count` 다(옛 이름은 끝에 누를 키 이름이 붙어 있었다) — 요약의 `remedy=<code>` 는 금지 문구 없이 LLM 좌석으로 가는데 코드 이름이
+/// **누를 키**를 말했다(키 이름을 코드에서 뺐다. 사람용 문장에는 Ctrl-U 가 그대로 있다).
+pub(crate) const QUEUE_REMEDY_CODES: [&str; 13] = [
     "paused",
     "machine_residue",
-    "phantom_count_ctrl_u",
+    "phantom_count",
+    "after_cursor_text",
     "human_draft",
     "input_pending_unknown",
     "answer_modal",
     "approval",
     "alt_screen",
+    "empty_seat",
+    "prompt_unknown",
     "wait",
     "unknown",
 ];
 
-/// 유령 계수 처방의 code — `queue_remedy` 3행과 직접 send 거부 이벤트(`queue.draft_gate_denied.remedy_code`)가 **같은 값**을 쓴다(어휘 한 곳).
-pub(crate) const REMEDY_CODE_PHANTOM: &str = "phantom_count_ctrl_u";
+/// 유령 계수 처방의 code — `queue_remedy` 8행과 직접 send 거부 이벤트(`queue.draft_gate_denied.remedy_code`)가 **같은 값**을 쓴다(어휘 한 곳).
+pub(crate) const REMEDY_CODE_PHANTOM: &str = "phantom_count";
 
 /// 모든 조치 문장의 끝에 붙는 **폭주 회로 차단 계약**(경보 실소비자가 LLM — 조치 문장이 자동 반응을 부르지 않게).
-pub(crate) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입) 금지";
+/// ★(RQFIX I-4) 금지 목록에 `동결 해제`·`항목 삭제` 를 더했다. **앞부분 ` · LLM 에이전트는 자동 조치(` 는 바이트 그대로**다 — GUI 가 이 접두로 꼬리를 뗀다.
+pub(crate) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지";
 
 /// 유령 계수 처방 — 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙는다(앞 문구·접두·태그의 위치·바이트는 불변).
-/// 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다).
-pub(crate) const GHOST_CTRL_U_SUFFIX: &str =
-    " — 입력줄이 비어 보이면 유령 계수다: 그 창에서 사람이 Ctrl-U 한 번";
+/// 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다). ★(RQFIX I-8) 정의처는 `src/lib.rs` 다 — `cys` CLI 가 같은 문자열로 stderr 처방 줄을 찍는다(한 정의처 공유).
+pub(crate) use cys::GHOST_CTRL_U_SUFFIX;
 
 /// 막힘 사유 → `wait`(일시 보류 · 스스로 풀린다) 접두 목록. `queue_paused` 는 좌석 pause 가 **이미 만료된** 경우(진단 시점 `paused=false`)다.
 const REMEDY_WAIT_PREFIXES: [&str; 7] = [
@@ -7583,50 +7782,101 @@ pub(crate) fn blocked_is_input_pending(blocked_by: &str) -> bool {
     blocked_by.starts_with("input_pending")
 }
 
-/// ★(0.14.43 · C5) 막힘 사유 + 진단 → `(code, 조치 문장)` — 순수 표(위에서부터 **첫 일치**).
+/// ★(RQFIX) **입력줄 계열** 막힘 사유 — `input_pending…` 이거나, 스케줄 push 가 화면의 초안 때문에 큐로 돌려진 사유(`schedule_divert(gate:draft …` — `schedule.rs`).
+/// 두 사유는 같은 원인(입력줄)이라 같은 처방 행(3~9)을 쓴다. `schedule_divert` 의 그 밖 꼴은 이 계열이 아니다(미분류 `unknown`).
+pub(crate) fn blocked_is_input_line(blocked_by: &str) -> bool {
+    blocked_is_input_pending(blocked_by) || blocked_by.starts_with("schedule_divert(gate:draft")
+}
+
+/// kill-switch 동결 처방(표 1행) — 정체가 아니라 동결이다. 해제는 오너(사람)가 한다.
+const REMEDY_BODY_KILL_SWITCH: &str = "kill-switch 동결 중 — 정체가 아니라 동결이다. 해제는 오너(사람)가 한다. \
+     동결 시간은 TTL 에서 빠지므로 해제하면 묵은 항목이 차례로 배달된다 — 오너가 해제 전에 `cys queue list` 로 묵은 항목을 확인한다";
+/// 좌석 큐 pause(헬스 조치) 처방(표 2행) — 시간이 지나면 스스로 풀린다. kill-switch 문장(「해제」「drop」)을 쓰지 않는다.
+const REMEDY_BODY_SEAT_PAUSE: &str =
+    "이 좌석의 큐가 헬스 조치(pause-queue)로 일시정지됐다 — 정해진 시간이 지나면 스스로 풀린다(반복되면 그 창의 출력을 사람이 확인)";
+/// 사람이 쓰던 글이 입력줄에 있다(표 3·6행).
+const REMEDY_BODY_HUMAN_DRAFT: &str =
+    "입력줄에 제출되지 않은 글이 있다 — 기계는 지우지 않는다. 사람이 그 창에서 제출하거나 지운다(오너에게 알린다)";
+
+/// 일시정지 처방 문장(표 1·2행) — `(kill-switch, 일시정지 여부)` → 문장. 둘 다 아니면 `None`. 화면을 읽지 않는 순수 표라 `queue.list`·`org.status` 가
+/// 사유가 기록되지 않은 일시정지 좌석에서도 진단(파서 읽기) 없이 같은 문장을 쓴다.
+fn pause_remedy_body(kill_switch: bool, paused: bool) -> Option<&'static str> {
+    if kill_switch {
+        Some(REMEDY_BODY_KILL_SWITCH)
+    } else if paused {
+        Some(REMEDY_BODY_SEAT_PAUSE)
+    } else {
+        None
+    }
+}
+
+/// ★(RQFIX F3) 일시정지 좌석의 처방 — 사유(`queue_blocked`)가 기록되지 않았어도(일시정지 중에는 틱이 사유를 갱신하지 않는다) `(paused, 문장)` 을 낸다.
+/// 일시정지가 아니면 `None`. 화면·파서를 읽지 않는다(진단 비용 0). 소비자: `queue.list`·`org.status` 의 `remedy_code`/`queue_remedy_code`.
+pub(crate) fn paused_queue_remedy(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+) -> Option<(&'static str, String)> {
+    let kill = daemon.paused.load(Ordering::Relaxed);
+    let paused = kill || queue_injection_paused(daemon, s);
+    pause_remedy_body(kill, paused).map(|b| ("paused", format!("{b}{REMEDY_LLM_SUFFIX}")))
+}
+
+/// ★(0.14.43 · C5 · RQFIX 재작성) 막힘 사유 + 진단 → `(code, 조치 문장)` — 순수 표(위에서부터 **첫 일치** · 16행).
+/// 입력줄 계열 = [`blocked_is_input_line`] · c = 계수 · h = 사람 몫 · dv = `draft_visible` · ga = `ghost_after_cursor`.
 ///
-/// | 조건 | code |
-/// |---|---|
-/// | `d.paused` | `paused` |
-/// | `input_pending` ∧ 사람 바이트 0 ∧ 계수 > 0 | `machine_residue` |
-/// | `input_pending` ∧ `draft_visible == Some(false)` | `phantom_count_ctrl_u` |
-/// | `input_pending` ∧ `draft_visible == Some(true)` | `human_draft` |
-/// | `input_pending`(관측 불능) | `input_pending_unknown` |
-/// | `modal_pending` | `answer_modal` |
-/// | `approval_pending` | `approval` |
-/// | `alt_screen` | `alt_screen` |
-/// | `busy`·`delivery_interval`·`settle`·`quiescing`·`prompt_not_ready`·`human_typing`·`queue_paused` | `wait` |
-/// | 그 밖(`prompt_unknown`·`empty_seat`·`schedule_divert`·미등재) | `unknown` |
+/// | # | 조건 | code |
+/// |---|---|---|
+/// | 1 | `kill_switch` | `paused`(오너 문장) |
+/// | 2 | `paused`(좌석 pause 만) | `paused`(좌석 문장) |
+/// | 3 | 입력줄 ∧ c == 0 ∧ dv == Some(true) | `human_draft` |
+/// | 4 | 입력줄 ∧ c == 0 | `wait` |
+/// | 5 | 입력줄 ∧ dv == Some(true) ∧ h == 0 | `machine_residue` |
+/// | 6 | 입력줄 ∧ dv == Some(true) ∧ h > 0 | `human_draft` |
+/// | 7 | 입력줄 ∧ dv == Some(false) ∧ ga == Some(true) | `after_cursor_text` |
+/// | 8 | 입력줄 ∧ dv == Some(false) | `phantom_count` |
+/// | 9 | 입력줄 ∧ dv == None | `input_pending_unknown` |
+/// | 10 | `modal_pending` | `answer_modal` |
+/// | 11 | `approval_pending` | `approval` |
+/// | 12 | `alt_screen` | `alt_screen` |
+/// | 13 | `empty_seat` | `empty_seat` |
+/// | 14 | `prompt_unknown` | `prompt_unknown` |
+/// | 15 | `busy`·`delivery_interval`·`settle`·`quiescing`·`prompt_not_ready`·`human_typing`·`queue_paused` | `wait` |
+/// | 16 | 그 밖(`schedule_divert` 의 그 밖 꼴·미등재) | `unknown` |
 ///
 /// 모든 문장 끝에 [`REMEDY_LLM_SUFFIX`] 가 붙고, `d.parser_panics > 0` 이면 그 앞(문장 뒤)에 패닉 횟수 주석이 들어간다.
 /// 판정 입력이 아니라 **안내**다 — 이 표가 어떤 게이트도 바꾸지 않는다.
+/// 설계 메모: 1·2행(일시정지)이 맨 앞인 것은 정체가 아니라 동결이기 때문이다. 5행이 7·8행보다 앞인 것은 **글이 보일 때만** 기계 잔여로 단정하기 위해서다(F1 ·
+/// 입력줄이 비어 보이는데 사람 몫만 0 이라고 "기계가 넣은 본문" 이라 하지 않는다). 4행은 계수가 이미 0 이면 처방할 것이 없다는 뜻이다(I-7).
 pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static str, String) {
-    let input_pending = blocked_is_input_pending(blocked_by);
-    let (code, body): (&'static str, &str) = if d.paused {
-        (
-            "paused",
-            "kill-switch 동결 중 — 정체가 아니라 동결이다. 해제(cys resume) 전 `cys queue list` 로 묵은 항목을 확인하고 \
-             필요 없으면 `cys queue drop` (동결 시간은 TTL 에서 빠져 해제하면 묵은 항목이 차례로 배달된다)",
-        )
-    } else if input_pending && d.pending_input_human_bytes == 0 && d.pending_input_bytes > 0 {
+    let input_line = blocked_is_input_line(blocked_by);
+    let (code, body): (&'static str, &str) = if let Some(body) = pause_remedy_body(d.kill_switch, d.paused) {
+        ("paused", body)
+    } else if input_line && d.pending_input_bytes == 0 && d.draft_visible == Some(true) {
+        ("human_draft", REMEDY_BODY_HUMAN_DRAFT)
+    } else if input_line && d.pending_input_bytes == 0 {
+        ("wait", "입력줄 계수는 이미 0 이다 — 다음 틱에 다시 판정된다(스스로 풀린다)")
+    } else if input_line && d.draft_visible == Some(true) && d.pending_input_human_bytes == 0 {
         (
             "machine_residue",
-            "기계가 넣고 제출되지 않은 본문이 입력줄에 남아 있다 — 사람이 그 창을 확인하고 Enter 로 제출하거나 지운다",
+            "기계가 넣고 제출되지 않은 본문이 입력줄에 보인다 — 사람이 그 창을 확인하고 Enter 로 제출하거나 지운다",
         )
-    } else if input_pending && d.draft_visible == Some(false) {
+    } else if input_line && d.draft_visible == Some(true) {
+        ("human_draft", REMEDY_BODY_HUMAN_DRAFT)
+    } else if input_line && d.draft_visible == Some(false) && d.ghost_after_cursor == Some(true) {
+        (
+            "after_cursor_text",
+            "커서 앞은 비어 있는데 커서 뒤에 글자가 있다 — 회색 자동 제안이면 유령 계수다(사람이 그 창을 클릭하고 Ctrl-U 한 번). \
+             직접 쓴 글이면 초안이다(제출하거나 지운다). 사람이 화면을 보고 가린다",
+        )
+    } else if input_line && d.draft_visible == Some(false) {
         (
             REMEDY_CODE_PHANTOM,
-            "입력줄은 비어 보이는데 미제출 계수가 남았다(유령 계수) — 사람이 그 창을 클릭하고 Ctrl-U 한 번(약 30초 뒤 배달 재개)",
+            "입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) — 사람이 그 창을 클릭하고 Ctrl-U 한 번(잠시 뒤 배달 재개)",
         )
-    } else if input_pending && d.draft_visible == Some(true) {
-        (
-            "human_draft",
-            "사람이 쓰던 초안이 입력줄에 있다 — 기계는 지우지 않는다. 오너에게 알린다",
-        )
-    } else if input_pending {
+    } else if input_line {
         (
             "input_pending_unknown",
-            "입력줄에 미제출 입력이 있다고 계수됐으나 화면을 판독하지 못했다 — 사람이 그 창을 확인(비어 있으면 Ctrl-U)",
+            "입력줄에 미제출 입력이 있다고 계수됐으나 화면을 판독하지 못했다 — 사람이 그 창을 확인한다(비어 있으면 Ctrl-U · 글이 있으면 제출하거나 지운다)",
         )
     } else if blocked_by.starts_with("modal_pending") {
         ("answer_modal", "질문·선택 창이 떠 있다 — 사람이 답한다")
@@ -7640,6 +7890,16 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
             "alt_screen",
             "전체화면(대체 화면)이라 프롬프트를 확인하지 못한다 — 전체화면 프로그램을 끝내거나, Claude Code 면 `/tui default`; \
              Windows 는 `~/.cys/win-no-alt-screen` 파일을 만들고 새 pane 으로 띄운다",
+        )
+    } else if blocked_by.starts_with("empty_seat") {
+        (
+            "empty_seat",
+            "그 자리에 에이전트가 붙어 있지 않다(빈 셸) — 에이전트를 다시 띄우면 순서대로 배달된다",
+        )
+    } else if blocked_by.starts_with("prompt_unknown") {
+        (
+            "prompt_unknown",
+            "입력 대기 표지(프롬프트)를 화면에서 찾지 못했다 — 그 창이 입력을 기다리는 상태인지 사람이 확인한다(다른 화면이 떠 있거나 화면 판독이 어긋났을 수 있다)",
         )
     } else if REMEDY_WAIT_PREFIXES.iter().any(|p| blocked_by.starts_with(p)) {
         ("wait", "일시 보류 — 스스로 풀린다(오래 지속되면 그 창 화면을 확인)")
@@ -7655,19 +7915,39 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
 }
 
 /// 사유 영속 파일 이름 — 상태 디렉터리(`queue-state.json` 과 같은 폴더).
+///
+/// ★(RQFIX) 읽는 법: 이 파일의 **"얼마나 막혔나"는 `blocked_since` 가 아니라 `head_enqueued_at` 으로 읽는다** — `blocked_since` 는 사유가 바뀔 때마다 새로 찍히므로
+/// (같은 좌석이 `busy` → `input_pending` 으로 넘어가면 시계가 새로 시작한다) 큐 머리의 나이를 말하지 않는다. 머리의 나이는 `head_enqueued_at`(벽시계)이다.
 pub(crate) const QUEUE_BLOCKED_FILE: &str = "queue-blocked.json";
 
+/// ★(RQFIX I-9) 직전 부트의 마지막 사유 파일 **1세대 보존본** — 이 부트의 **첫 기록** 직전에 기존 파일이 있으면 이 이름으로 옮긴다(한 부트에 한 번 · 실패는 무시).
+/// 재기동 직후 첫 틱의 빈 목록 기록이 3.5일 정체 같은 사후 분석 재료(직전 부트의 막힘 사유)를 덮어쓰지 않게 한다.
+pub(crate) const QUEUE_BLOCKED_PREV_FILE: &str = "queue-blocked.prev.json";
+
+/// ★(RQFIX I-1) 기록 실패 뒤 다음 재시도까지의 최소 간격(초) — 이 사이의 틱은 좌석 진단·파일 쓰기·로그를 모두 건너뛴다. 실패 로그 최소 간격도 같다.
+const QUEUE_BLOCKED_RETRY_SECS: u64 = 60;
+
+/// ★(RQFIX F3) 일시정지(kill-switch) 중에 **기록된 사유가 없는** 좌석 행의 `blocked_by` — 일시정지 중에는 틱이 좌석을 순회하지 않아 `queue_blocked` 가 갱신되지 않는다.
+pub(crate) const BLOCKED_PAUSED_KILL_SWITCH: &str = "paused(kill-switch 동결)";
+
+/// 좌석 큐 pause(헬스 조치) 사유 — 큐 틱이 `block(…)` 으로 기록하는 문면과 사유 파일의 무기록 좌석 행이 **같은 상수**를 쓴다(어휘 한 곳).
+pub(crate) const BLOCKED_QUEUE_PAUSED: &str = "queue_paused(헬스 조치)";
+
 /// `queue-blocked.json` 의 한 행 재료 — 큐가 비었거나 막힘이 풀린 좌석은 만들어지지 않는다.
+/// ★(RQFIX F3) `since` 는 기록된 사유가 없는 일시정지 좌석이면 `None`(파일에서 `null`) · `paused` 는 그 좌석이 이 관측에서 일시정지였는가(서명 재료).
 struct BlockedSeat {
     s: Arc<crate::state::Surface>,
     blocked_by: String,
-    since: f64,
+    since: Option<f64>,
+    paused: bool,
     depth: usize,
     head: crate::state::QueueEntry,
 }
 
-/// 지금 막혀 있는 좌석 목록(id 오름차순) — 살아 있고 · `queue_blocked` 가 서 있고 · 큐가 비어 있지 않은 좌석만.
-/// 락: `surfaces` 는 `Arc` 복제 뒤 즉시 놓고, 좌석마다 `queue_blocked`(leaf · 복제 뒤 놓음) → `pending_queue`(머리·깊이 복제 뒤 놓음).
+/// 지금 막혀 있는 좌석 목록(id 오름차순) — 살아 있고 · 큐가 비어 있지 않고 · (`queue_blocked` 가 서 있거나 **일시정지 중**)인 좌석.
+/// ★(RQFIX F3) 일시정지 중(`queue_injection_paused`)에는 큐 틱이 좌석을 순회하지 않아 `queue_blocked` 가 None 일 수 있다 — 그래도 행을 만든다
+/// (`blocked_by` = 기록된 사유가 있으면 그것 · 없으면 kill-switch 는 [`BLOCKED_PAUSED_KILL_SWITCH`] · 좌석 pause 는 [`BLOCKED_QUEUE_PAUSED`] · `blocked_since` 는 null).
+/// 락: `surfaces` 는 `Arc` 복제 뒤 즉시 놓고, 좌석마다 `queue_blocked`(leaf · 복제 뒤 놓음) → `queue_paused_until`(leaf · 순간) → `pending_queue`(머리·깊이 복제 뒤 놓음).
 fn queue_blocked_seats(daemon: &Arc<Daemon>) -> Vec<BlockedSeat> {
     let mut seats: Vec<Arc<crate::state::Surface>> = daemon
         .surfaces
@@ -7682,11 +7962,11 @@ fn queue_blocked_seats(daemon: &Arc<Daemon>) -> Vec<BlockedSeat> {
         if s.exited.load(Ordering::Relaxed) {
             continue;
         }
-        let Some((blocked_by, since)) =
-            s.queue_blocked.lock().unwrap_or_else(|e| e.into_inner()).clone()
-        else {
+        let recorded = s.queue_blocked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let paused = queue_injection_paused(daemon, &s);
+        if recorded.is_none() && !paused {
             continue;
-        };
+        }
         let (head, depth) = {
             let q = s.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
             match q.front().cloned() {
@@ -7694,19 +7974,26 @@ fn queue_blocked_seats(daemon: &Arc<Daemon>) -> Vec<BlockedSeat> {
                 None => continue,
             }
         };
-        out.push(BlockedSeat { s, blocked_by, since, depth, head });
+        let (blocked_by, since) = match recorded {
+            Some((why, at)) => (why, Some(at)),
+            None if daemon.paused.load(Ordering::Relaxed) => (BLOCKED_PAUSED_KILL_SWITCH.to_string(), None),
+            None => (BLOCKED_QUEUE_PAUSED.to_string(), None),
+        };
+        out.push(BlockedSeat { s, blocked_by, since, paused, depth, head });
     }
     out
 }
 
-/// 변경 감지 서명 — (좌석, 사유, 사유 시작 시각). 사유가 바뀌면 `mark_queue_blocked` 가 새 시각을 찍으므로 서명이 달라진다
+/// 변경 감지 서명 — (kill-switch · 보존소 건수) + 좌석마다 (좌석, 사유, 사유 시작 시각, 일시정지 여부). 사유가 바뀌면 `mark_queue_blocked` 가 새 시각을 찍으므로 서명이 달라진다
 /// (같은 사유가 이어지는 동안은 시각이 보존되어 서명이 같다). 좌석이 사라지거나 막힘이 풀려도 달라진다.
-fn queue_blocked_sig(seats: &[BlockedSeat]) -> String {
-    seats
-        .iter()
-        .map(|r| format!("{}|{}|{:x}", r.s.id, r.blocked_by, r.since.to_bits()))
-        .collect::<Vec<String>>()
-        .join("\n")
+/// ★(RQFIX F3) 동결·해제·좌석 pause 변화와 보존소(`restored_queue`) 주차 건수 변화도 서명을 바꿔 파일을 다시 쓰게 한다.
+fn queue_blocked_sig(seats: &[BlockedSeat], daemon_paused: bool, restored_entries: usize) -> String {
+    let mut parts = vec![format!("dp={daemon_paused}|re={restored_entries}")];
+    parts.extend(seats.iter().map(|r| {
+        let since = r.since.map_or_else(|| "-".to_string(), |t| format!("{:x}", t.to_bits()));
+        format!("{}|{}|{}|p={}", r.s.id, r.blocked_by, since, r.paused)
+    }));
+    parts.join("\n")
 }
 
 /// 사유 파일의 한 행(본문·미리보기는 싣지 않는다 — 사유·수치·id 만).
@@ -7731,18 +8018,57 @@ fn queue_blocked_row(r: &BlockedSeat, d: &QueueBlockDiag) -> Value {
     })
 }
 
+/// 사유 파일 재시도가 **지금 도래했는가**(순수) — 직전 기록 실패가 정한 재시도 시각 전에는 거짓이다(I-1 · 시계 주입).
+pub(crate) fn queue_blocked_retry_due(retry_after: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    retry_after.is_none_or(|t| now >= t)
+}
+
+/// 사유 파일 기록 실패 로그를 **지금 찍어도 되는가**(순수) — 오류 문구가 바뀌었거나 마지막 로그에서 60초가 지났을 때만(I-1).
+fn queue_blocked_err_should_log(
+    last: Option<&(String, std::time::Instant)>,
+    err: &str,
+    now: std::time::Instant,
+) -> bool {
+    match last {
+        Some((prev, at))
+            if prev == err
+                && now.saturating_duration_since(*at) < Duration::from_secs(QUEUE_BLOCKED_RETRY_SECS) =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
 /// ★(0.14.43 · C5) 큐 틱 끝에서 부른다 — 막힘 사유 파일을 **바뀌었을 때만** 원자 기록한다(매 틱 쓰지 않는다).
 ///
 /// 쓰는 시점: ⓐ 좌석의 막힘 사유가 바뀌었을 때(서명) ⓑ 막힘이 풀렸을 때(서명 — 그 좌석이 목록에서 빠진다) ⓒ `queue.starved` 를 발행했을 때
 /// (더티 표식 — 최신 진단으로 다시 쓴다) ⓓ 좌석 종료·큐 소멸로 목록에서 빠질 때(서명) ⓔ 부트 직후 첫 틱(서명 기억 없음 — 막힌 좌석이 없으면
-/// 빈 목록을 한 번 쓴다: 낡은 파일이 '지금 막힘' 으로 읽히지 않게).
+/// 빈 목록을 한 번 쓴다: 낡은 파일이 '지금 막힘' 으로 읽히지 않게) ⓕ(RQFIX F3) kill-switch 동결·해제 · 좌석 pause 변화 · 보존소(`restored_queue`) 주차 건수 변화(서명).
 /// 판정 시계는 아니다 — `blocked_since` 는 벽시계(표시용)라 파일 머리에 `"clock":"wall"` 로 명시한다. 이 파일로 상태를 복원하지 않는다
-/// (사후 분석용 산출물 · 부트 시 삭제하지도 않는다 — 다음 기록이 덮는다). 기록 실패는 다음 틱에 다시 시도한다(침묵 금지 — 로그).
-/// 진단 패닉은 틱을 죽이지 않는다.
+/// (사후 분석용 산출물 · 부트 시 삭제하지도 않는다).
+/// ★(RQFIX) 머리에 `daemon_paused`(kill-switch)·`restored_entries`(데몬 보존소에 주차된 항목 수 — 좌석이 없어 행으로 나오지 않는 정체)를 싣는다. 일시정지 중인 좌석은
+/// 사유가 기록되지 않았어도 행이 있다([`queue_blocked_seats`]). **"얼마나 막혔나"는 `blocked_since` 가 아니라 `head_enqueued_at` 으로 읽는다**([`QUEUE_BLOCKED_FILE`]).
+/// ★(RQFIX I-9) 이 부트의 **첫 기록** 직전에 기존 파일이 있으면 [`QUEUE_BLOCKED_PREV_FILE`] 로 옮긴다(직전 부트 1세대 보존 · 한 부트에 한 번 · 실패는 무시).
+/// ★(RQFIX I-1) 기록 실패 뒤에는 다음 재시도를 60초 뒤로 미룬다 — 그 사이 틱은 좌석 진단·기록·로그를 하지 않는다. 실패 로그는 오류 문구가 바뀌었거나 마지막 로그에서
+/// 60초가 지났을 때만 찍는다. 성공하면 억제를 푼다. 진단 패닉은 틱을 죽이지 않는다.
 pub(crate) fn persist_queue_blocked_if_changed(daemon: &Arc<Daemon>) {
+    persist_queue_blocked_at(daemon, std::time::Instant::now());
+}
+
+/// [`persist_queue_blocked_if_changed`] 의 **본체** — 현재 시각을 인자로 받는다(검체가 시계를 주입해 재시도 억제를 잰다).
+pub(crate) fn persist_queue_blocked_at(daemon: &Arc<Daemon>, now: std::time::Instant) {
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // ★(RQFIX I-1) 쓰기 실패 직후의 억제 창 — 좌석 진단·파일 쓰기·로그 전부 건너뛴다(가장 먼저 판정한다).
+        let retry_after = daemon.queue_blocked_retry.lock().unwrap_or_else(|e| e.into_inner()).retry_after;
+        if !queue_blocked_retry_due(retry_after, now) {
+            return;
+        }
+        let daemon_paused = daemon.paused.load(Ordering::Relaxed);
+        // ★(RQFIX F3) 보존소 건수 — `restored_queue` 락은 건수만 읽고 **즉시 놓는다**(좌석 순회와 겹쳐 쥐지 않는다 · 락 순서 restored_queue → surfaces → … 방향 준수).
+        let restored_entries = daemon.restored_queue.lock().unwrap_or_else(|e| e.into_inner()).len();
         let seats = queue_blocked_seats(daemon);
-        let sig = queue_blocked_sig(&seats);
+        let sig = queue_blocked_sig(&seats, daemon_paused, restored_entries);
         let forced = daemon.queue_blocked_dirty.swap(false, Ordering::AcqRel);
         {
             let last = daemon.queue_blocked_sig.lock().unwrap_or_else(|e| e.into_inner());
@@ -7755,15 +8081,34 @@ pub(crate) fn persist_queue_blocked_if_changed(daemon: &Arc<Daemon>) {
             .iter()
             .map(|r| queue_blocked_row(r, &queue_block_diag(daemon, &r.s)))
             .collect();
-        let doc = json!({"v": 1, "saved_at": now_epoch(), "clock": "wall", "surfaces": rows});
+        let doc = json!({
+            "v": 1, "saved_at": now_epoch(), "clock": "wall",
+            "daemon_paused": daemon_paused, "restored_entries": restored_entries,
+            "surfaces": rows,
+        });
         let dir = crate::state::state_dir(&daemon.socket_path);
+        // ★(RQFIX I-9) 이 부트의 첫 기록 직전 — 직전 부트의 파일을 1세대 보존본으로 옮긴다(한 부트에 한 번 · 실패는 무시).
+        if !daemon.queue_blocked_prev_rotated.swap(true, Ordering::AcqRel) {
+            let cur = dir.join(QUEUE_BLOCKED_FILE);
+            if cur.is_file() {
+                let _ = std::fs::rename(&cur, dir.join(QUEUE_BLOCKED_PREV_FILE));
+            }
+        }
         match write_json_atomic(&dir, QUEUE_BLOCKED_FILE, &doc.to_string()) {
             Ok(()) => {
                 *daemon.queue_blocked_sig.lock().unwrap_or_else(|e| e.into_inner()) = Some(sig);
+                // 성공 — 억제를 푼다.
+                *daemon.queue_blocked_retry.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
             }
             Err(e) => {
                 daemon.queue_blocked_dirty.store(true, Ordering::Release);
-                eprintln!("[queue] {QUEUE_BLOCKED_FILE} 기록 실패 — {e} (다음 틱 재시도)");
+                let msg = e.to_string();
+                let mut st = daemon.queue_blocked_retry.lock().unwrap_or_else(|e| e.into_inner());
+                st.retry_after = Some(now + Duration::from_secs(QUEUE_BLOCKED_RETRY_SECS));
+                if queue_blocked_err_should_log(st.last_err.as_ref(), &msg, now) {
+                    st.last_err = Some((msg.clone(), now));
+                    eprintln!("[queue] {QUEUE_BLOCKED_FILE} 기록 실패 — {msg} ({QUEUE_BLOCKED_RETRY_SECS}초 뒤 재시도)");
+                }
             }
         }
     }));
@@ -7826,6 +8171,9 @@ fn alert_queue_depth_if_high(
 /// 모든 '막힘' 분기에서 depth 경보와 나란히 호출한다(한 분기라도 빠지면 그 사유의 기아가
 /// 침묵한다). 발행뿐 — 자동 조치 없음: 강제 배달(queue.deliver·W2-E)은 운영자(사람) 판단의
 /// 몫이다(hint 문구 계약 = state.rs::QUEUE_STARVED_HINT · LLM 자동 반응 유도 금지).
+///
+/// ★(0.14.43 · RQFIX F4) `defs` = **큐 틱이 이미 든 어댑터 정의**(틱당 1회 지연 로드 규약 유지) — 진단 캐시([`diag_adapter_defs`])가 아니다. 이 경보 진단은
+/// 큐 틱 안에서 돌고 틱은 그 정의로 게이트 판정을 하므로, 같은 틱의 판정과 진단이 같은 정의를 본다.
 fn alert_queue_starved_if_stalled(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
@@ -7834,6 +8182,7 @@ fn alert_queue_starved_if_stalled(
     head: &crate::state::QueueEntry,
     head_wait_secs: u64,
     depth: usize,
+    defs: &dyn Fn() -> Arc<(serde_json::Value, serde_json::Value)>,
 ) {
     let threshold = queue_starve_alert_secs();
     if threshold == 0 || head_wait_secs < threshold {
@@ -7846,7 +8195,7 @@ fn alert_queue_starved_if_stalled(
     }
     starve_alerted.insert(s.id, now);
     // ★(0.14.43 · C5) 진단 스냅샷은 쿨다운·임계 판정 **뒤**에만 뜬다 — 매 틱 파서를 읽지 않는다(좌석 락 아래 아님 · 큐 락 없음).
-    let diag = queue_block_diag(daemon, s);
+    let diag = queue_block_diag_with(daemon, s, defs);
     daemon.bus.publish(
         "queue.starved",
         "queue",
@@ -10195,7 +10544,7 @@ pub(crate) fn force_deliver_entry(
             let input = prompt_gate_input(daemon, s, obs.marker.as_str(), placeholder.as_deref(), &obs);
             if let PromptGate::Blocked(why) = prompt_gate_verdict(&input) {
                 // ★(0.14.43 · C5) 유령 계수 처방 — 판정(거부)과 **같은 관측**(`obs`)에서 읽는다(재관측 없음 · 거부 결과 불변 · 문구만).
-                if blocked_is_input_pending(why) && input_line_visibility(&obs).0 == Some(false) {
+                if blocked_is_input_pending(why) && input_line_visibility(&obs, placeholder.as_deref()).0 == Some(false) {
                     return Err(ForceDeliverDenied::PromptGateGhost(why));
                 }
                 return Err(ForceDeliverDenied::PromptGate(why));
@@ -10374,7 +10723,16 @@ fn deliver_queued(
     // ★B1(0.14.30): 어댑터 정의는 **틱당 1회**만 읽는다(좌석마다 읽으면 같은 틱 안에서 판정이
     //   갈린다 — check_approvals 의 env 1회 로드 규약과 동형). 큐가 전부 비면 아래 루프가
     //   먼저 continue 하므로 평시 비용은 0 이다(지연 로드).
-    let mut adapters: Option<(serde_json::Value, serde_json::Value)> = None;
+    //   ★(0.14.43 · RQFIX F4) `RefCell` 인 이유: 막힘 공통 처리(`block` 클로저 — 기아 경보 진단)와 마커 해소가 **같은 틱 정의**를 공유해야 하는데 둘이 동시에 살아 있다.
+    //   `Arc` 로 들고 있어 클로저가 복제를 돌려준다(JSON 복제 0).
+    let adapters: std::cell::RefCell<Option<Arc<(serde_json::Value, serde_json::Value)>>> =
+        std::cell::RefCell::new(None);
+    let tick_defs = || -> Arc<(serde_json::Value, serde_json::Value)> {
+        adapters
+            .borrow_mut()
+            .get_or_insert_with(|| Arc::new(load_adapter_defs()))
+            .clone()
+    };
     // ★(0.14.31 · triage 2026-09-08 · #7) 순회 순서를 **결정적**으로 두고(id 오름차순),
     //   예산 소진으로 건너뛴 좌석부터 다음 틱을 시작한다(라운드로빈). 종전에는 HashMap 순서를
     //   그대로 썼는데 그 순서는 프로세스 수명 동안 고정이라, 예산 소진이 반복되면 **언제나 같은
@@ -10424,7 +10782,7 @@ fn deliver_queued(
         let mut block = |why: &str| {
             mark_queue_blocked(&s, why);
             alert_queue_depth_if_high(daemon, &s, depth_alerted, why);
-            alert_queue_starved_if_stalled(daemon, &s, starve_alerted, why, &head, head_wait, depth);
+            alert_queue_starved_if_stalled(daemon, &s, starve_alerted, why, &head, head_wait, depth, &tick_defs);
         };
         // T4-17 헬스 조치: pause-queue 발동 중인 surface는 배달 보류 — 적체는 침묵 금지
         if s.queue_paused_until
@@ -10433,7 +10791,7 @@ fn deliver_queued(
             .map(|t| t > std::time::Instant::now())
             .unwrap_or(false)
         {
-            block("queue_paused(헬스 조치)");
+            block(BLOCKED_QUEUE_PAUSED);
             continue;
         }
         // ★SEAT 게이트(2026-07-17 실사고 수리): **role 좌석**인데 좌석이 비었으면(에이전트 없음)
@@ -10513,8 +10871,8 @@ fn deliver_queued(
         //   주입은 안전하다 — 벤더 문서상 처리 중 제출은 중단이 아니라 큐잉이고 다음 도구
         //   경계에서 모델에 전달된다(prompt_boundary_verdict doc 의 인용 참조).
         let marker = {
-            let defs = adapters.get_or_insert_with(load_adapter_defs);
-            surface_prompt_marker(&s, defs)
+            let defs = tick_defs();
+            surface_prompt_marker(&s, &defs)
         };
         // ★R1-blocking-2: 준비 판정이 **본** 입력줄 점유량. 배달 직전 임계영역에서 이 값이
         //   그대로인지 재확인해 판정↔주입 사이에 끼어든 직접 send 와의 합쳐짐을 막는다.
@@ -14765,8 +15123,8 @@ mod tests {
         }
     }
 
-    /// 핀 14 — 래퍼 `pending_input_step`(호출처 `Surface::apply_pending_input` 이 쓰는 것)은 `PendingInputModel::current()`
-    /// 로 본체에 위임한다 — 단계마다 같은 상태이고, 단독 Esc 는 현행 모델의 거동(V3 면 0 · V2 면 1)이다.
+    /// 핀 14 — 전역 래퍼 `pending_input_step`(★RQFIX B-1: 제품 호출처 없음 — `Surface::apply_pending_input` 은 좌석 표식 모델로 본체를 직접 부른다 · 이 래퍼는 검체 전용)은
+    /// `PendingInputModel::current()` 로 본체에 위임한다 — 단계마다 같은 상태이고, 단독 Esc 는 현행 모델의 거동(V3 면 0 · V2 면 1)이다.
     #[test]
     fn v3_wrapper_follows_current_model() {
         let now = std::time::Instant::now();
@@ -14873,7 +15231,9 @@ mod tests {
             ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
             ("CYS_QUEUE_QUIET_SECS", "1"),
         ]);
-        let (daemon, s) = wp5_seat("v3-ghost-esc", "claude");
+        // ★(0.14.43 · RQFIX B-1) v3 는 좌석 표식(`lone_key_exempt`)이 참인 좌석에만 적용된다 — 이 검체의 전제는 '살아 있는 claude 좌석'이므로
+        //   에이전트(`sleep`)가 자손으로 실제로 떠 있는 좌석을 쓴다(아래 ⓑ 가 writer 경로로 표식을 세운다).
+        let (daemon, s) = wp5_live_seat("v3-ghost-esc", "claude");
         let e = daemon.next_queue_entry("[보고] 고스트 + 단독 Esc".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         let ghost = "버그 수정 착수한다. 브랜치는";
@@ -14932,6 +15292,14 @@ mod tests {
             return;
         }
         assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0, "전제: 대조군 리셋 뒤 계수 0");
+        // ★(RQFIX B-1) 표식은 watchdog 틱(`check_agent_death`)이 쓴다 — 직접 store 하지 않고 writer 경로를 그대로 태운다.
+        assert!(!s.lone_key_exempt.load(AtomicOrdering::Relaxed), "전제: 표식은 틱 전에는 거짓(= v2 · 종전 동작)");
+        let sys = live_process_table(&[&s]);
+        death_tick(&daemon, &sys, PendingInputModel::V3);
+        assert!(
+            s.lone_key_exempt.load(AtomicOrdering::Relaxed),
+            "ⓑ 살아 있는 claude(마커 선언) 좌석의 표식을 writer 가 세웠다"
+        );
         let esc = s.apply_pending_input(b"\x1b", InputOrigin::Human);
         assert_eq!((esc.count, esc.human), (0, 0), "ⓑ 기본 모델에서 빈 줄 단독 Esc 의 계수는 0: {esc:?}");
         let bs = s.apply_pending_input(b"\x7f", InputOrigin::Human);
@@ -14945,6 +15313,323 @@ mod tests {
             "ⓑ 고스트가 떠 있어도 단독 Esc·BS 는 계수를 남기지 않아 큐가 배달된다"
         );
         assert_ne!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "ⓑ 게이트가 input_pending 이 아니다");
+    }
+
+    // ─────────── ★RQFIX 1부(0.14.43 · 리뷰 B-1·I-2): v3 는 "살아 있는 에이전트 TUI" 좌석에만 — 좌석 표식 `lone_key_exempt` ───────────
+    //
+    // 결함(적대 검증 B-1 · zsh 5.9 실측): v3 를 프로세스 전역으로 적용하자 맨 셸 좌석의 단독 Esc 도 0 으로 세어졌다. 맨 셸 줄 편집기는 단독 ESC 를 Meta 조합의
+    // 첫 바이트로 받아 **다음 키를 무기한 기다린다**(화면에는 아무것도 없다). 마커 없는 좌석의 초안 방어는 계수 하나(`no_marker_gate` 의 `pending_input_bytes > 0`)뿐이라
+    // 계수 0 이면 큐 본문(`ESC[200~…`)이 그 접두와 합쳐져 붙여넣기 봉투가 깨지고 줄바꿈마다 따로 실행된다. 설계 정본은 처음부터 "마커가 해소되는 좌석만 v3"였다.
+    // 수정: 좌석 표식(`Surface::lone_key_exempt` · 단일 writer `check_agent_death`)이 참일 때만 V3 — 거짓이면 V2(0.14.42 동작).
+    // 아래 핀: 순수 판정표 · 어댑터 지연 1회 로드 · writer 실틱(a)~(e)+종료 좌석 · `apply_pending_input` 표식 연동 · B-1 큐 핀 · I-2 · 단일 writer 소스 핀.
+
+    use super::lone_key_exempt_for;
+
+    /// 핀 R1 — 순수 판정표: 전역 V3 ∧ 살아 있음 ∧ 마커 선언, 세 조건의 AND 만 참이다(8행 전수).
+    #[test]
+    fn rqfix_lone_key_exempt_for_is_a_three_way_and() {
+        let mut trues = 0;
+        for model in [PendingInputModel::V2, PendingInputModel::V3] {
+            for alive in [false, true] {
+                for has_marker in [false, true] {
+                    let got = lone_key_exempt_for(model, alive, has_marker);
+                    let want = model == PendingInputModel::V3 && alive && has_marker;
+                    assert_eq!(got, want, "model={model:?} alive={alive} has_marker={has_marker}");
+                    trues += usize::from(got);
+                }
+            }
+        }
+        assert_eq!(trues, 1, "참인 행은 (V3·살아 있음·마커 선언) 하나뿐이다");
+    }
+
+    /// 핀 R2 — 표식 writer 본체의 어댑터 로드는 **지연 · 틱당 1회**다: V2·죽은 에이전트·맨 셸은 읽지 않고(`adapters` 가 비어 있는 채), V3 ∧ 살아 있는 meta 좌석이
+    /// 처음 나올 때 채운다. 이미 채워져 있으면 **다시 읽지 않는다**(가짜 정의를 미리 채워 그것이 쓰이는지로 증명 — 디스크·임베드 어느 쪽으로도 알 수 없는 이름 `zzz`).
+    #[test]
+    fn rqfix_sync_lone_key_exempt_loads_adapters_lazily_once() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("rqfix-lazy");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let daemon = drill_daemon("rqfix-lazy");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        let flag = || s.lone_key_exempt.load(AtomicOrdering::Relaxed);
+        let mut adapters: Option<(Value, Value)> = None;
+
+        // 읽을 필요가 없는 입력 — 디스크를 읽지 않는다(어댑터 None 유지).
+        s.lone_key_exempt.store(true, AtomicOrdering::Relaxed);
+        super::sync_lone_key_exempt(&s, PendingInputModel::V3, None, &mut adapters);
+        assert!(!flag() && adapters.is_none(), "맨 셸/종료 좌석: 표식 내림 · 읽지 않는다");
+        s.lone_key_exempt.store(true, AtomicOrdering::Relaxed);
+        super::sync_lone_key_exempt(&s, PendingInputModel::V3, Some(("claude", false)), &mut adapters);
+        assert!(!flag() && adapters.is_none(), "죽은 에이전트: 표식 내림 · 읽지 않는다");
+        s.lone_key_exempt.store(true, AtomicOrdering::Relaxed);
+        super::sync_lone_key_exempt(&s, PendingInputModel::V2, Some(("claude", true)), &mut adapters);
+        assert!(!flag() && adapters.is_none(), "전역 V2: 표식 내림 · 읽지 않는다(윈도우 기본에서 디스크 판독 0)");
+
+        // V3 ∧ 살아 있는 meta 좌석 — 처음 나올 때 한 번 읽어 채운다. 임베드 정의에 claude 는 마커가 있고 grok 은 없다.
+        super::sync_lone_key_exempt(&s, PendingInputModel::V3, Some(("claude", true)), &mut adapters);
+        assert!(flag() && adapters.is_some(), "claude(마커 선언): 참 · 정의를 채웠다");
+        super::sync_lone_key_exempt(&s, PendingInputModel::V3, Some(("grok", true)), &mut adapters);
+        assert!(!flag(), "grok(마커 없음): 거짓");
+
+        // 이미 채워진 정의는 다시 읽지 않는다 — 가짜 정의에서 `zzz` 는 마커 선언 · `claude` 는 미정의(= 새로 읽었다면 참이었을 것).
+        adapters = Some((json!({}), json!({"zzz": {"prompt_marker": "❯"}})));
+        super::sync_lone_key_exempt(&s, PendingInputModel::V3, Some(("zzz", true)), &mut adapters);
+        assert!(flag(), "채워진 정의로 판정(zzz 마커 선언 → 참)");
+        super::sync_lone_key_exempt(&s, PendingInputModel::V3, Some(("claude", true)), &mut adapters);
+        assert!(!flag(), "채워진 정의를 다시 읽지 않는다 — 디스크·임베드를 새로 읽었다면 claude 는 참이어야 한다");
+        kill_pid(s.pid);
+    }
+
+    /// 핀 R3 — 표식 writer 실틱 전수(실 프로세스): `check_agent_death` 가 좌석마다 매 틱 표식을 쓴다.
+    /// (a) 마커 선언 어댑터(claude)의 살아 있는 에이전트 좌석 → 참 · (b) 같은 좌석의 에이전트가 사망 판정 → 거짓(복귀하면 다시 참) · (c) 마커 없는 어댑터(grok) → 거짓 ·
+    /// (d) `agent_meta` 없음(맨 셸) → 거짓 · (e) 전역 모델 V2 → 전부 거짓 · 종료 좌석 → 거짓(조기 continue 앞에서 내린다).
+    #[cfg(unix)]
+    #[test]
+    fn rqfix_lone_key_exempt_writer_cases_on_a_live_process_table() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("rqfix-writer");
+        let _env = QueueEnvGuard::set(&[("CYS_PACK_DIR", pack.to_str().unwrap())]);
+        let daemon = drill_daemon("rqfix-writer");
+        let mk = |agent: Option<&str>| {
+            // `; :` 로 셸의 exec 최적화를 막아 `sleep`(= 에이전트 바이너리 이름)이 자식 프로세스로 갈라지게 한다.
+            let s = daemon
+                .create_surface(None, Some("sleep 30 ; :".into()), None, None, 24, 80)
+                .expect("create surface");
+            daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+            *s.agent_meta.lock().unwrap() = agent.map(|a| (a.to_string(), "sleep".to_string()));
+            s
+        };
+        let (claude, grok, bare) = (mk(Some("claude")), mk(Some("grok")), mk(None));
+        let flag = |s: &Arc<crate::state::Surface>| s.lone_key_exempt.load(AtomicOrdering::Relaxed);
+        let sys = live_process_table(&[&claude, &grok, &bare]);
+        assert!(!flag(&claude) && !flag(&grok) && !flag(&bare), "전제: 표식은 틱 전에 전부 거짓(신생 좌석 = v2)");
+
+        death_tick(&daemon, &sys, PendingInputModel::V3);
+        assert!(flag(&claude), "(a) 마커 선언 어댑터(claude)의 살아 있는 에이전트 좌석 → 틱 뒤 참");
+        assert!(!flag(&grok), "(c) 마커 없는 어댑터(grok) → 거짓(화면으로 원시 모드 TUI 임을 확인할 길이 없다)");
+        assert!(!flag(&bare), "(d) agent_meta 없음(맨 셸) → 거짓");
+        // 낡은 참 표식이 남은 맨 셸(에이전트 메타가 지워진 좌석)도 다음 틱에 내린다.
+        bare.lone_key_exempt.store(true, AtomicOrdering::Relaxed);
+        death_tick(&daemon, &sys, PendingInputModel::V3);
+        assert!(!flag(&bare), "(d') 낡은 참 표식이 남은 맨 셸 → 틱 뒤 거짓");
+
+        // (e) 전역 모델 V2 — 전부 내린다(참이던 claude 도).
+        death_tick(&daemon, &sys, PendingInputModel::V2);
+        assert!(!flag(&claude) && !flag(&grok) && !flag(&bare), "(e) 전역 V2 → 전부 거짓");
+        death_tick(&daemon, &sys, PendingInputModel::V3);
+        assert!(flag(&claude), "V3 로 돌아오면 다시 참(틱마다 재판정)");
+
+        // (b) 에이전트 사망 판정 — 등록된 에이전트 바이너리가 더는 보이지 않는다(NoEvidence → alive=false) → 틱 뒤 거짓.
+        *claude.agent_meta.lock().unwrap() = Some(("claude".to_string(), "no-such-agent-bin".to_string()));
+        death_tick(&daemon, &sys, PendingInputModel::V3);
+        assert!(!flag(&claude), "(b) 에이전트 사망 판정 → 틱 뒤 거짓");
+        *claude.agent_meta.lock().unwrap() = Some(("claude".to_string(), "sleep".to_string()));
+        death_tick(&daemon, &sys, PendingInputModel::V3);
+        assert!(flag(&claude), "에이전트 복귀(재기동 성공) → 틱 뒤 다시 참");
+
+        // 종료 좌석 — 표식이 참이던 좌석도 종료되면 조기 continue 앞에서 내린다.
+        claude.exited.store(true, AtomicOrdering::Relaxed);
+        death_tick(&daemon, &sys, PendingInputModel::V3);
+        assert!(!flag(&claude), "종료 좌석 → 거짓");
+        for s in [&claude, &grok, &bare] {
+            kill_pid(s.pid);
+        }
+    }
+
+    /// 핀 R4 — `apply_pending_input` 이 **좌석 표식**으로 모델을 고른다(같은 좌석에서 표식을 뒤집어 가며): 참 → 단독 Esc·BS 는 0(V3) · 거짓 → 1·길이만큼(V2).
+    /// 전역 노브(`PendingInputModel::current`)는 보지 않는다 — 어느 OS·env 에서든 같은 값이다.
+    #[test]
+    fn rqfix_apply_pending_input_follows_the_seat_flag() {
+        let daemon = drill_daemon("rqfix-apply");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        let set = |on: bool| s.lone_key_exempt.store(on, AtomicOrdering::Relaxed);
+
+        set(false);
+        assert_eq!(s.pending_input_model(), PendingInputModel::V2, "표식 거짓 = V2");
+        let esc = s.apply_pending_input(b"\x1b", InputOrigin::Human);
+        assert_eq!((esc.count, esc.human), (1, 1), "표식 거짓: 빈 줄 단독 Esc 는 1(줄 편집기 접두 대기를 지킨다)");
+        s.clear_pending_input();
+        let bs = s.apply_pending_input(b"\x7f\x7f", InputOrigin::Human);
+        assert_eq!((bs.count, bs.human), (2, 2), "표식 거짓: BS 는 길이만큼(V2)");
+        s.clear_pending_input();
+
+        set(true);
+        assert_eq!(s.pending_input_model(), PendingInputModel::V3, "표식 참 = V3");
+        let esc = s.apply_pending_input(b"\x1b", InputOrigin::Human);
+        assert_eq!((esc.count, esc.human), (0, 0), "표식 참: 빈 줄 단독 Esc 는 0(v3)");
+        let bs = s.apply_pending_input(b"\x7f", InputOrigin::Human);
+        assert_eq!((bs.count, bs.human), (0, 0), "표식 참: 빈 줄 BS 는 0(v3)");
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0, "표식 참: 계수 미러도 0");
+
+        // 같은 좌석에서 다시 거짓으로 — 즉시 V2 로 돌아온다(표식은 호출마다 읽는다).
+        set(false);
+        let esc = s.apply_pending_input(b"\x1b", InputOrigin::Human);
+        assert_eq!((esc.count, esc.human), (1, 1), "표식을 다시 내리면 V2 — 단독 Esc 1");
+
+        // 봉투·리셋 규칙은 두 모델이 같다 — 표식과 무관하게 CR 은 제출이다.
+        let cr = s.apply_pending_input(b"\r", InputOrigin::Human);
+        assert_eq!((cr.count, cr.human), (0, 0), "CR 제출은 표식과 무관");
+        kill_pid(s.pid);
+    }
+
+    /// 핀 R5(**B-1 핀** · 실측 재현의 큐 판) — 마커 없는 좌석(`agent_meta` 없음 = 맨 셸) + 사람 단독 Esc + 큐 항목 → 계수 1 · 여러 틱 뒤에도 **배달 0건** ·
+    /// `blocked_by` 는 `input_pending…`. 맨 셸 좌석의 초안 방어는 계수 하나뿐이다(`no_marker_gate`) — 계수가 0 이면 큐 본문(`ESC[200~…`)이
+    /// 줄 편집기의 ESC 접두 대기 위에 들어가 붙여넣기 봉투가 깨진다. 대조: 계수를 비우면 같은 좌석·같은 큐가 배달된다(막는 것은 계수뿐).
+    /// 전역 모델이 V3(unix 기본)여도 표식이 거짓이라 V2 로 센다 — v2 판(`CYS_PENDING_INPUT_MODEL=v2`)에서도 같은 값이다.
+    #[test]
+    fn rqfix_bare_shell_lone_escape_keeps_the_count_and_blocks_the_queue() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("rqfix-bare-esc");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = wp5_seat("rqfix-bare-esc", "claude");
+        *s.agent_meta.lock().unwrap() = None; // 맨 셸 — 표식 writer 가 거짓으로 둔다
+        assert!(!s.lone_key_exempt.load(AtomicOrdering::Relaxed), "전제: 맨 셸 좌석의 표식은 거짓");
+        let e = daemon.next_queue_entry("[보고] 맨 셸 단독 Esc — 여러 줄 본문".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+
+        let esc = s.apply_pending_input(b"\x1b", InputOrigin::Human);
+        assert_eq!((esc.count, esc.human), (1, 1), "맨 셸 좌석의 단독 Esc 는 계수 1(줄 편집기가 Meta 접두로 쥐고 있을 수 있다): {esc:?}");
+        for round in 0..4 {
+            quiet_since(&s, 10);
+            tick(&daemon);
+            if round == 1 {
+                std::thread::sleep(std::time::Duration::from_millis(1200));
+            }
+            assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "{round}틱 뒤에도 배달 0건이어야 한다");
+        }
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 1, "계수는 화면이 없어도 그대로 남는다(감산·stale 리셋은 마커 좌석 한정)");
+        assert!(
+            blocked_reason(&s).starts_with("input_pending"),
+            "막힘 사유는 input_pending…: {:?}",
+            blocked_reason(&s)
+        );
+
+        // 대조 — 계수를 비우면 같은 좌석이 배달된다(이 좌석을 막은 것은 계수 하나뿐이다).
+        s.clear_pending_input();
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "대조: 계수가 0 이면 같은 좌석·같은 큐가 배달된다");
+        kill_pid(s.pid);
+    }
+
+    /// 핀 R6(I-2) — 표식 참 좌석에서 사람이 **기계 잔여**(계수 n · 사람 0)에 BS/DEL·단독 Esc 를 치면 계수는 그대로 두고 사람 몫을 최소 1 로 올린다 →
+    /// 기계의 뒤늦은 Return 은 `HumanDraft` 로 거부된다(v3 가 이 키들을 사람 몫에서도 빼 사람이 고친 줄을 기계가 제출하던 틈). 빈 줄(계수 0)의 사람 BS 는 종전대로 0/0.
+    #[test]
+    fn rqfix_i2_human_edit_key_on_machine_residue_marks_the_line_human_touched() {
+        let daemon = drill_daemon("rqfix-i2");
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, None, 24, 80)
+            .expect("create surface");
+        s.lone_key_exempt.store(true, AtomicOrdering::Relaxed);
+        let gate = || super::draft_gate(&daemon, &s, DirectSendKind::SubmitKey);
+
+        // 기계가 Return 없이 남긴 본문 — 사람 몫 0 이라 기계 Return 은 (자기 본문) 통과다.
+        let m = s.apply_pending_input(b"hello", InputOrigin::Machine);
+        assert_eq!((m.count, m.human), (5, 0), "전제: 기계 잔여 = 계수 5 · 사람 0");
+        assert_eq!(gate(), None, "전제: 사람 몫이 0 이면 기계 Return 은 통과(자기 본문)");
+        // 사람이 Backspace — 계수는 그대로(감산 없음) · 사람 몫은 1 로 오른다 → 기계 Return 거부.
+        let h = s.apply_pending_input(b"\x7f", InputOrigin::Human);
+        assert_eq!((h.count, h.human), (5, 1), "사람 BS: 계수 불변 · 사람 몫 ≥ 1: {h:?}");
+        assert!(h.human <= h.count, "불변식 human ≤ count");
+        assert_eq!(
+            gate(),
+            Some(DraftGateDenied::HumanDraft { bytes: 1 }),
+            "사람이 손댄 기계 잔여를 기계 Return 이 제출하면 안 된다(HumanDraft)"
+        );
+
+        // 사람 단독 Esc 도 같다(새 기계 잔여 위).
+        s.clear_pending_input();
+        s.apply_pending_input(b"abc", InputOrigin::Machine);
+        let esc = s.apply_pending_input(b"\x1b", InputOrigin::Human);
+        assert_eq!((esc.count, esc.human), (3, 1), "사람 단독 Esc 도 사람 몫을 올린다: {esc:?}");
+        // 사람 몫이 이미 있으면 그대로 · 기계 출처의 BS 는 사람 몫을 올리지 않는다.
+        s.clear_pending_input();
+        s.apply_pending_input(b"xyz", InputOrigin::Human);
+        let again = s.apply_pending_input(b"\x7f\x7f", InputOrigin::Human);
+        assert_eq!((again.count, again.human), (3, 3), "사람 글자 위 BS 는 종전 그대로: {again:?}");
+        s.clear_pending_input();
+        s.apply_pending_input(b"mmm", InputOrigin::Machine);
+        let mbs = s.apply_pending_input(b"\x7f", InputOrigin::Machine);
+        assert_eq!((mbs.count, mbs.human), (3, 0), "기계 출처 BS 는 사람 몫을 올리지 않는다: {mbs:?}");
+
+        // 빈 줄(계수 0)의 사람 BS·Esc 는 아무것도 바꾸지 않는다(원 결함 수정 · 감산 없음 유지).
+        s.clear_pending_input();
+        for key in [&b"\x7f"[..], b"\x08", b"\x1b"] {
+            let st = s.apply_pending_input(key, InputOrigin::Human);
+            assert_eq!((st.count, st.human), (0, 0), "빈 줄 사람 {key:?} → 0/0(종전): {st:?}");
+        }
+        assert_eq!(gate(), None, "빈 줄이라 기계 Return 게이트는 열려 있다");
+
+        // 대조 — 순수 전이로도 같다: V3 만 사람 몫을 올리고(면제 분기), V2 는 키 길이를 계수·사람 몫에 모두 더한다.
+        let now = std::time::Instant::now();
+        let base = pending_input_step_model(
+            &PendingInputState::default(),
+            b"hello",
+            InputOrigin::Machine,
+            now,
+            PendingInputModel::V3,
+        );
+        let v3 = pending_input_step_model(&base, b"\x7f", InputOrigin::Human, now, PendingInputModel::V3);
+        let v2 = pending_input_step_model(&base, b"\x7f", InputOrigin::Human, now, PendingInputModel::V2);
+        assert_eq!((v3.count, v3.human), (5, 1), "V3: 계수 불변 · 사람 몫 1");
+        assert_eq!((v2.count, v2.human), (6, 1), "V2(대조): 길이만큼 가산 — 사람 몫 1(HumanDraft 로 거부되던 종전 방향)");
+        kill_pid(s.pid);
+    }
+
+    /// 핀 R7 — 단일 writer·배선 소스 핀: ① 표식 쓰기(`lone_key_exempt.store(`)는 생산 코드 어디에도 `sync_lone_key_exempt` 한 곳뿐이다(state·handlers·schedule·alert_route 포함)
+    /// ② 그 본체가 순수 판정 `lone_key_exempt_for` 를 부른다 ③ `check_agent_death_with_model` 이 세 갈래(종료 좌석 · meta 없음 · 생존 판정 직후)에서 writer 를 부르고,
+    /// 생존 판정 갈래는 `alive` 계산 뒤 `if alive` 조기 continue 앞이다 ④ 래퍼 `check_agent_death` 는 전역 모델(`PendingInputModel::current()`)을 넘긴다
+    /// ⑤ `apply_pending_input` 은 좌석 표식 모델(`self.pending_input_model()`)로 본체를 부르고 전역 래퍼 `pending_input_step(` 를 부르지 않는다
+    /// ⑥ 진단 `input_model` 은 좌석 표식에서 온다.
+    #[test]
+    fn rqfix_lone_key_exempt_single_writer_and_wiring_source_pin() {
+        let gov = include_str!("governance.rs");
+        let prod = &gov[..gov.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        assert_eq!(prod.matches("lone_key_exempt.store(").count(), 1, "① 표식 쓰기는 governance 생산 코드에 정확히 한 곳(sync_lone_key_exempt)");
+        for (name, text) in [
+            ("state", include_str!("state.rs")),
+            ("handlers", include_str!("handlers.rs")),
+            ("schedule", include_str!("schedule.rs")),
+            ("alert_route", include_str!("alert_route.rs")),
+        ] {
+            assert!(!text.contains("lone_key_exempt.store("), "① {name} 에 표식 쓰기가 있다 — 단일 writer 위반");
+        }
+        let sync = &prod[prod.find("fn sync_lone_key_exempt(").expect("writer 본체")..];
+        let sync = &sync[..sync.find("\n}\n").expect("writer 본체 끝")];
+        assert!(sync.contains("lone_key_exempt_for(model, alive, has_marker)"), "② writer 본체가 순수 판정을 부른다");
+        assert!(sync.contains("merged_prompt_marker("), "② 마커 출처는 큐 게이트와 같은 merged_prompt_marker");
+        let body = &prod[prod.find("fn check_agent_death_with_model(").expect("사망 감지 본체")..];
+        let body = &body[..body.find("\nfn learn_stuck_candidates(").expect("본체 끝 앵커")];
+        assert_eq!(body.matches("sync_lone_key_exempt(&s, model,").count(), 3, "③ writer 호출은 세 갈래(종료 · meta 없음 · 생존 판정)");
+        let exited = body.find("s.exited.load(").expect("종료 좌석 갈래");
+        let w_exited = body.find("sync_lone_key_exempt(&s, model, None").expect("종료 갈래 writer");
+        let cont_exited = body[exited..].find("continue;").expect("종료 갈래 continue") + exited;
+        assert!(exited < w_exited && w_exited < cont_exited, "③ 종료 좌석은 조기 continue 앞에서 표식을 내린다");
+        let alive_calc = body.find("let alive = agent_alive_from_liveness(").expect("alive 계산");
+        let w_alive = body.find("sync_lone_key_exempt(&s, model, Some((&agent, alive))").expect("생존 갈래 writer");
+        let if_alive = body.find("if alive {").expect("alive 분기");
+        assert!(alive_calc < w_alive && w_alive < if_alive, "③ 생존 갈래 writer 는 alive 계산 직후 · if alive 조기 continue 앞");
+        let wrapper = &prod[prod.find("fn check_agent_death(").expect("래퍼")..];
+        let wrapper = &wrapper[..wrapper.find("\n}\n").expect("래퍼 끝")];
+        assert!(wrapper.contains("PendingInputModel::current()"), "④ 래퍼는 전역 모델을 넘긴다");
+        let st = include_str!("state.rs");
+        let apply = &st[st.find("pub fn apply_pending_input(").expect("apply_pending_input")..];
+        let apply = &apply[..apply.find("\n    }\n").expect("apply 끝")];
+        assert!(apply.contains("self.pending_input_model()"), "⑤ 좌석 표식 모델로 본체를 부른다");
+        assert!(apply.contains("pending_input_step_model("), "⑤ 본체 직접 호출");
+        assert!(!apply.contains("pending_input_step("), "⑤ 전역 래퍼 호출 금지");
+        let diag = &prod[prod.find("pub(crate) fn queue_block_diag_with(").expect("진단 본체")..];
+        let diag = &diag[..diag.find("\n}\n").expect("진단 끝")];
+        assert!(diag.contains("s.pending_input_model().as_str()"), "⑥ 진단 input_model 은 좌석 표식에서 온다");
+        assert!(!diag.contains("PendingInputModel::current()"), "⑥ 진단이 전역 노브를 직접 읽지 않는다");
     }
 
     /// 네 축 AND — 하나라도 빠지면 NotReady(진리표 전수).
@@ -15315,6 +16000,39 @@ mod tests {
         // 초기 셸 출력(로그인 프로파일)이 픽스처를 덮지 않게 안정화.
         std::thread::sleep(std::time::Duration::from_millis(600));
         (daemon, s)
+    }
+
+    /// ★(0.14.43 · RQFIX B-1) `wp5_seat` 의 **살아 있는 에이전트** 판 — `sleep` 이 자손 프로세스로 떠 있고, 그 이름이 등록된 에이전트 바이너리(bin_base)다
+    /// (`check_agent_death` 가 생존으로 판정한다). `; :` 로 셸의 exec 최적화를 막아 `sleep` 이 자식으로 갈라지게 한다(`live_normal_formation_*` 와 같은 기법).
+    fn wp5_live_seat(tag: &str, agent: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        let daemon = drill_daemon(tag);
+        let s = daemon
+            .create_surface(None, Some("sleep 30 ; :".into()), None, None, 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some((agent.to_string(), "sleep".to_string()));
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        (daemon, s)
+    }
+
+    /// 좌석들의 자손 프로세스(`sleep`)가 **모두** 보이는 프로세스 표를 만든다 — 최대 ~5초 폴링, 끝내 못 보면 전제 실패 패닉(결측은 통과가 아니다).
+    fn live_process_table(seats: &[&Arc<crate::state::Surface>]) -> sysinfo::System {
+        let mut sys = sysinfo::System::new();
+        for _ in 0..50 {
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            if seats.iter().all(|s| !collect_descendants(&sys, s.pid).is_empty()) {
+                return sys;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("전제 실패: 좌석 자손(sleep)이 프로세스 표에 뜨지 않았다");
+    }
+
+    /// watchdog 의 사망 감지 틱 1회(모델 명시) — 표식 writer(`check_agent_death`)를 그대로 태운다. 재기동 카운터·엄격 증명 래치는 호출마다 새것이다.
+    fn death_tick(daemon: &Arc<Daemon>, sys: &sysinfo::System, model: PendingInputModel) {
+        let mut rc: HashMap<u64, u32> = HashMap::new();
+        let mut sp: HashMap<u64, Option<(String, u32)>> = HashMap::new();
+        super::check_agent_death_with_model(daemon, sys, &mut rc, &mut sp, model);
     }
 
     fn wp5_env(tag: &str) -> (std::path::PathBuf, QueueEnvGuard) {
@@ -19428,8 +20146,8 @@ mod tests {
         assert_eq!(ev["payload"]["blocked_by"], serde_json::json!("busy(출력 중)"));
         assert_eq!(
             ev["payload"]["hint"],
-            serde_json::json!(crate::state::QUEUE_STARVED_HINT),
-            "hint 문구 = 운영자(사람) 판단 계약 그대로(자동 반응 유도 금지)"
+            serde_json::json!(c5_expected_starved_hint()),
+            "hint 문구 = 운영자(사람) 판단 계약 그대로(자동 반응 유도 금지) — env 가 고르는 문면(★RQFIX I-11: LEGACY env 에서도 녹색)"
         );
         // 막힘 지속 → 쿨다운 내 재발행 억제.
         *s.last_output.lock().unwrap() = std::time::Instant::now();
@@ -21507,12 +22225,12 @@ mod tests {
     // 어떤 게이트 판정도 바뀌지 않는다 — 이 검체들은 **문구·필드·파일**만 잰다(막힘/통과 결과 불변은 기존 검체가 그대로 고정한다).
 
     use super::{
-        blocked_is_input_pending, input_line_visibility, persist_queue_blocked_if_changed, queue_block_diag,
-        queue_remedy, QueueBlockDiag, GHOST_CTRL_U_SUFFIX, QUEUE_BLOCKED_FILE, QUEUE_REMEDY_CODES,
+        blocked_is_input_line, blocked_is_input_pending, input_line_visibility, persist_queue_blocked_if_changed,
+        queue_block_diag, queue_remedy, QueueBlockDiag, GHOST_CTRL_U_SUFFIX, QUEUE_BLOCKED_FILE, QUEUE_REMEDY_CODES,
         REMEDY_LLM_SUFFIX,
     };
 
-    /// 진단 스냅샷 픽스처(순수) — 커서 뒤 판독·패닉·pause 는 기본 0/없음 · v3.
+    /// 진단 스냅샷 픽스처(순수) — 커서 뒤 판독·패닉·pause·kill-switch 는 기본 없음 · v3.
     fn c5_diag(pending: u64, human: u64, draft: Option<bool>) -> QueueBlockDiag {
         QueueBlockDiag {
             pending_input_bytes: pending,
@@ -21521,8 +22239,24 @@ mod tests {
             ghost_after_cursor: None,
             parser_panics: 0,
             paused: false,
+            kill_switch: false,
             input_model: "v3",
         }
+    }
+
+    /// ★(RQFIX I-11) `queue.starved` payload 의 `hint` 기대값 — **이 프로세스의 env**(`CYS_QUEUE_STARVED_HINT_LEGACY`)가 고르는 문면을 제품과 같은 순수 함수 사슬로 도출한다.
+    /// 상수를 직접 박으면 롤백 노브를 켠 구성의 전량 실행이 적색이 된다(문면 자체의 바이트 고정은 `state.rs` 의 순수 검체가 env 없이 잰다).
+    fn c5_expected_starved_hint() -> &'static str {
+        crate::state::starved_hint_for(crate::state::starved_hint_legacy_from_env(
+            std::env::var("CYS_QUEUE_STARVED_HINT_LEGACY").ok().as_deref(),
+        ))
+    }
+
+    /// `c5_diag` + 커서 뒤 판독(`ghost_after_cursor`) — 처방 표 7행(`after_cursor_text`)과 8행(`phantom_count`)을 가르는 축이다.
+    fn c5_diag_ga(pending: u64, human: u64, draft: Option<bool>, ghost: Option<bool>) -> QueueBlockDiag {
+        let mut d = c5_diag(pending, human, draft);
+        d.ghost_after_cursor = ghost;
+        d
     }
 
     /// 사유 영속 파일을 읽는다(없거나 JSON 이 아니면 원문과 함께 실패).
@@ -21532,11 +22266,13 @@ mod tests {
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{QUEUE_BLOCKED_FILE} 이 JSON 이 아니다: {e}\n{raw}"))
     }
 
-    /// `queue_remedy` 표의 전 행 — 위에서부터 첫 일치 · 모든 문장 끝 "LLM 에이전트는 자동 조치…" · code 어휘는 허용 목록 10종 전부.
+    /// `queue_remedy` 표의 **16행 전수** — 위에서부터 첫 일치 · 모든 문장 끝 "LLM 에이전트는 자동 조치…" · code 어휘는 허용 목록 13종 전부.
+    /// ★(RQFIX) 표가 재정의됐다: 입력줄 계열(`input_pending…`·`schedule_divert(gate:draft…`)은 계수 0 → 가시성 → 계수 → 커서 뒤 글자 순으로 갈린다.
     #[test]
     fn c5_queue_remedy_table_every_row_in_order() {
         use std::collections::BTreeSet;
         let ip = BLOCKED_INPUT_PENDING;
+        let sd = "schedule_divert(gate:draft · job j1)";
         let mut seen: BTreeSet<&'static str> = BTreeSet::new();
         let mut check = |blocked: &str, d: &QueueBlockDiag, code: &str, needles: &[&str]| {
             let (got, text) = queue_remedy(blocked, d);
@@ -21546,14 +22282,12 @@ mod tests {
             }
             assert!(text.ends_with(REMEDY_LLM_SUFFIX), "code={code}: 모든 문장 끝에 자동 조치 금지 접미: {text}");
             assert!(QUEUE_REMEDY_CODES.contains(&got), "code={got} 가 허용 목록 밖이다");
+            assert!(!text.contains("30초"), "code={code}: 노브 기본값(30초)을 박은 숫자는 문장에서 뺀다: {text}");
             seen.insert(got);
         };
-
-        // 1행 paused — kill-switch ∨ 좌석 pause 면 어느 사유보다 앞선다(입력줄 계열 포함).
-        let mut p = c5_diag(1, 1, Some(false));
-        p.paused = true;
-        for blocked in [
+        let every_reason = [
             ip,
+            sd,
             BLOCKED_MODAL,
             BLOCKED_APPROVAL,
             BLOCKED_ALT_SCREEN,
@@ -21562,31 +22296,104 @@ mod tests {
             "empty_seat(좌석에 에이전트 미연결)",
             "zzz",
             "",
-        ] {
-            check(blocked, &p, "paused", &["kill-switch 동결 중", "정체가 아니라 동결", "cys resume", "cys queue list", "cys queue drop"]);
+        ];
+
+        // 1행 paused(kill-switch) — 어느 사유보다 앞선다(입력줄 계열 포함). 해제는 오너(사람)가 하고 `drop` 처방은 없다(M-2 · I-4).
+        let mut ks = c5_diag_ga(1, 1, Some(false), None);
+        ks.paused = true;
+        ks.kill_switch = true;
+        for blocked in every_reason {
+            check(
+                blocked,
+                &ks,
+                "paused",
+                &["kill-switch 동결 중", "정체가 아니라 동결", "해제는 오너(사람)가 한다", "TTL 에서 빠지므로", "해제 전에", "`cys queue list`"],
+            );
+            let (_, text) = queue_remedy(blocked, &ks);
+            assert!(!text.contains("drop") && !text.contains("cys resume"), "오너 문장에 항목 삭제·해제 명령 처방이 없다: {text}");
+        }
+        // 2행 paused(좌석 pause 만) — 좌석 문장: kill-switch·해제 명령·drop 이 없다(좌석 pause 에 오너 문장을 쓰던 결함 · F8/M-2).
+        let mut sp = c5_diag_ga(1, 1, Some(false), None);
+        sp.paused = true;
+        for blocked in every_reason {
+            check(blocked, &sp, "paused", &["헬스 조치(pause-queue)", "스스로 풀린다", "반복되면 그 창의 출력을 사람이 확인"]);
+            let (_, text) = queue_remedy(blocked, &sp);
+            for banned in ["kill-switch", "cys resume", "drop", "해제는 오너"] {
+                assert!(!text.contains(banned), "좌석 pause 문장에 {banned:?} 가 있다: {text}");
+            }
         }
         // paused 가 아니면 같은 입력이 다른 행으로 간다(우선순위가 실제로 작동한다는 대조).
-        check(ip, &c5_diag(1, 1, Some(false)), "phantom_count_ctrl_u", &[]);
+        check(ip, &c5_diag_ga(1, 1, Some(false), None), "phantom_count", &[]);
 
-        // 2행 machine_residue — 입력줄 사유 ∧ 사람 바이트 0 ∧ 계수 > 0 (화면 관측값과 무관하게 이 행이 먼저다).
-        for draft in [Some(true), Some(false), None] {
-            check(ip, &c5_diag(5, 0, draft), "machine_residue", &["기계가 넣고 제출되지 않은 본문", "Enter 로 제출하거나 지운다"]);
+        // 3~9행 — 입력줄 계열(두 사유 모두): 계수 0 → 가시성 → 사람 몫 → 커서 뒤 글자.
+        for blocked in [ip, sd] {
+            // 3행 human_draft — 계수 0 인데 화면에 글이 보인다.
+            check(
+                blocked,
+                &c5_diag_ga(0, 0, Some(true), None),
+                "human_draft",
+                &["입력줄에 제출되지 않은 글이 있다", "기계는 지우지 않는다", "사람이 그 창에서 제출하거나 지운다", "오너에게 알린다"],
+            );
+            // 4행 wait(I-7) — 계수가 이미 0 이고 글도 안 보이거나 관측 불능이면 처방할 것이 없다.
+            for dv in [Some(false), None] {
+                for ga in [None, Some(false), Some(true)] {
+                    check(blocked, &c5_diag_ga(0, 0, dv, ga), "wait", &["입력줄 계수는 이미 0", "다음 틱에 다시 판정", "스스로 풀린다"]);
+                }
+            }
+            // 5행 machine_residue — 글이 보이고 사람 몫이 0.
+            check(
+                blocked,
+                &c5_diag_ga(5, 0, Some(true), None),
+                "machine_residue",
+                &["기계가 넣고 제출되지 않은 본문이 입력줄에 보인다", "Enter 로 제출하거나 지운다"],
+            );
+            // 6행 human_draft — 글이 보이고 사람 몫이 있다.
+            check(
+                blocked,
+                &c5_diag_ga(5, 2, Some(true), Some(true)),
+                "human_draft",
+                &["입력줄에 제출되지 않은 글이 있다", "오너에게 알린다"],
+            );
+            // 7행 after_cursor_text — 커서 앞은 비었는데 커서 뒤에 글자(사람 몫 무관).
+            for h in [0, 3] {
+                check(
+                    blocked,
+                    &c5_diag_ga(3, h, Some(false), Some(true)),
+                    "after_cursor_text",
+                    &[
+                        "커서 앞은 비어 있는데 커서 뒤에 글자가 있다",
+                        "회색 자동 제안이면 유령 계수다",
+                        "클릭하고 Ctrl-U 한 번",
+                        "직접 쓴 글이면 초안이다",
+                        "사람이 화면을 보고 가린다",
+                    ],
+                );
+            }
+            // 8행 phantom_count(F1) — 입력줄이 비어 보인다: 사람 몫이 0 이어도 '기계 잔여' 로 단정하지 않는다(글이 보이지 않는다).
+            for h in [0, 3] {
+                for ga in [None, Some(false)] {
+                    check(
+                        blocked,
+                        &c5_diag_ga(3, h, Some(false), ga),
+                        "phantom_count",
+                        &["입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수)", "클릭하고 Ctrl-U 한 번", "잠시 뒤 배달 재개"],
+                    );
+                }
+            }
+            // 9행 input_pending_unknown — 계수가 있는데 화면을 판독하지 못했다.
+            for h in [0, 3] {
+                for ga in [None, Some(false), Some(true)] {
+                    check(
+                        blocked,
+                        &c5_diag_ga(3, h, None, ga),
+                        "input_pending_unknown",
+                        &["화면을 판독하지 못했다", "비어 있으면 Ctrl-U", "글이 있으면 제출하거나 지운다"],
+                    );
+                }
+            }
         }
-        // 3행 phantom_count_ctrl_u — 입력줄 비어 보임 + 계수(사람 바이트 있음).
-        check(
-            ip,
-            &c5_diag(1, 1, Some(false)),
-            "phantom_count_ctrl_u",
-            &["입력줄은 비어 보이는데", "유령 계수", "클릭하고 Ctrl-U 한 번", "약 30초 뒤 배달 재개"],
-        );
-        check(ip, &c5_diag(0, 0, Some(false)), "phantom_count_ctrl_u", &["Ctrl-U"]);
-        // 4행 human_draft — 입력줄에 글자가 보인다(계수가 있든 없든).
-        check(ip, &c5_diag(3, 3, Some(true)), "human_draft", &["사람이 쓰던 초안", "기계는 지우지 않는다", "오너에게 알린다"]);
-        check(ip, &c5_diag(0, 0, Some(true)), "human_draft", &[]);
-        // 5행 input_pending_unknown — 관측 불능(사람 바이트가 있거나 계수 0).
-        check(ip, &c5_diag(3, 3, None), "input_pending_unknown", &["화면을 판독하지 못했다", "비어 있으면 Ctrl-U"]);
-        check(ip, &c5_diag(0, 0, None), "input_pending_unknown", &[]);
-        // 6~8행.
+
+        // 10~14행 — 사유별 고정 처방.
         let d0 = c5_diag(0, 0, None);
         check(BLOCKED_MODAL, &d0, "answer_modal", &["질문·선택 창이 떠 있다", "사람이 답한다"]);
         check(BLOCKED_APPROVAL, &d0, "approval", &["승인·관문 대기", "승인 절차(feed)", "큐로 승인을 누르지 않는다"]);
@@ -21596,7 +22403,19 @@ mod tests {
             "alt_screen",
             &["전체화면(대체 화면)", "`/tui default`", "~/.cys/win-no-alt-screen", "새 pane"],
         );
-        // 9행 wait — 일시 보류(스스로 풀린다).
+        check(
+            "empty_seat(좌석에 에이전트 미연결)",
+            &d0,
+            "empty_seat",
+            &["그 자리에 에이전트가 붙어 있지 않다(빈 셸)", "에이전트를 다시 띄우면 순서대로 배달된다"],
+        );
+        check(
+            BLOCKED_PROMPT_UNKNOWN,
+            &d0,
+            "prompt_unknown",
+            &["입력 대기 표지(프롬프트)를 화면에서 찾지 못했다", "사람이 확인한다", "화면 판독이 어긋났을 수 있다"],
+        );
+        // 15행 wait — 일시 보류(스스로 풀린다).
         for blocked in [
             BLOCKED_BUSY,
             BLOCKED_INTERVAL,
@@ -21604,18 +22423,21 @@ mod tests {
             super::BLOCKED_SETTLE_BUDGET,
             super::BLOCKED_PROMPT_NOT_READY,
             "human_typing(사람 입력 직후)",
-            "queue_paused(헬스 조치)",
+            super::BLOCKED_QUEUE_PAUSED,
         ] {
             check(blocked, &d0, "wait", &["일시 보류", "스스로 풀린다", "오래 지속되면 그 창 화면을 확인"]);
         }
-        // 10행 unknown — 그 밖(표에 없는 사유 · 빈 문자열 포함).
-        for blocked in [BLOCKED_PROMPT_UNKNOWN, "empty_seat(좌석에 에이전트 미연결)", "schedule_divert(gate:draft · job j1)", "zzz", ""] {
+        // 16행 unknown — 그 밖(표에 없는 사유 · `schedule_divert` 의 `gate:draft` 가 아닌 꼴 · 빈 문자열 포함).
+        for blocked in ["schedule_divert(gate:other · job j1)", "schedule_divert(other)", "zzz", ""] {
             check(blocked, &d0, "unknown", &["사유 미분류", "그 창 화면을 확인"]);
         }
+        assert!(blocked_is_input_line(ip) && blocked_is_input_line(sd), "입력줄 계열 술어");
+        assert!(!blocked_is_input_line("schedule_divert(other)") && !blocked_is_input_line(BLOCKED_BUSY));
+        assert_eq!(super::REMEDY_CODE_PHANTOM, "phantom_count", "와이어 어휘(소비자 계약) 고정 — 코드 이름은 누를 키를 말하지 않는다(I-5)");
         assert!(QUEUE_REMEDY_CODES.contains(&super::REMEDY_CODE_PHANTOM), "유령 처방 code 상수가 허용 목록 밖이다");
-        assert_eq!(super::REMEDY_CODE_PHANTOM, "phantom_count_ctrl_u", "와이어 어휘(소비자 계약) 고정");
-        // 표의 열 행이 전부 한 번 이상 나왔다(공허 방지 — 허용 목록 10종 = 실제로 낼 수 있는 code 전량).
+        // 표의 열세 code 가 전부 한 번 이상 나왔다(공허 방지 — 허용 목록 13종 = 실제로 낼 수 있는 code 전량).
         let want: BTreeSet<&str> = QUEUE_REMEDY_CODES.iter().copied().collect();
+        assert_eq!(QUEUE_REMEDY_CODES.len(), 13, "허용 목록은 13종");
         assert_eq!(seen.iter().copied().collect::<BTreeSet<&str>>(), want, "표가 내지 못하는 허용 목록 code 가 있다");
     }
 
@@ -21642,49 +22464,90 @@ mod tests {
         assert!(text.ends_with(&format!(" (이 좌석 화면 파서 패닉 1회 — 화면 판독이 순간 비었을 수 있다){REMEDY_LLM_SUFFIX}")), "{text}");
     }
 
-    /// blocked_by 전수 매핑(WORKLOG 표와 같다) — 상수 문면을 바꾸지 않고 **접두 일치**로 판정한다. 틱이 쓰는 문자열 리터럴 사유도 같은 표에 든다.
+    /// blocked_by 전수 매핑(WORKLOG 표와 같다) — 상수 문면을 바꾸지 않고 **접두 일치**로 판정한다. 틱이 쓰는 리터럴·상수·직접 `mark_queue_blocked` 호출·
+    /// 소스의 `BLOCKED_*` 상수 선언 **전부**가 같은 표에 든다(★RQFIX I-11: 종전 전수 가드는 `block("…")` 리터럴만 셌다 — 상수로 들어오는 사유와
+    /// `mark_queue_blocked(&s, …)` 직접 호출은 세지 못해, 새 사유가 표 밖에서 조용히 `unknown` 이 될 수 있었다).
     #[test]
     fn c5_blocked_by_reasons_map_to_the_documented_rows() {
-        let d0 = c5_diag(0, 0, None);
+        let d0 = c5_diag(0, 0, None); // 계수 0 · 관측 불능
+        let dpos = c5_diag(3, 3, None); // 계수 > 0 · 관측 불능
+        let mut ks = c5_diag(0, 0, None);
+        ks.paused = true;
+        ks.kill_switch = true;
+        // (상수 이름, 값, d0 에서의 code) — 소스의 `const BLOCKED_*` 선언과 **이름 집합이 같아야** 한다(아래 전수 가드).
+        let consts: [(&str, &str, &str); 12] = [
+            ("BLOCKED_APPROVAL", BLOCKED_APPROVAL, "approval"),
+            ("BLOCKED_MODAL", BLOCKED_MODAL, "answer_modal"),
+            ("BLOCKED_BUSY", BLOCKED_BUSY, "wait"),
+            ("BLOCKED_INPUT_PENDING", BLOCKED_INPUT_PENDING, "wait"), // 계수 0 → 4행(I-7). 계수 > 0 은 아래 dpos
+            ("BLOCKED_PROMPT_UNKNOWN", BLOCKED_PROMPT_UNKNOWN, "prompt_unknown"),
+            ("BLOCKED_PROMPT_NOT_READY", super::BLOCKED_PROMPT_NOT_READY, "wait"),
+            ("BLOCKED_ALT_SCREEN", BLOCKED_ALT_SCREEN, "alt_screen"),
+            ("BLOCKED_INTERVAL", BLOCKED_INTERVAL, "wait"),
+            ("BLOCKED_QUIESCING", super::BLOCKED_QUIESCING, "wait"),
+            ("BLOCKED_SETTLE_BUDGET", super::BLOCKED_SETTLE_BUDGET, "wait"),
+            ("BLOCKED_QUEUE_PAUSED", super::BLOCKED_QUEUE_PAUSED, "wait"), // 좌석 pause 가 진단 시점에 이미 만료(paused=false)
+            ("BLOCKED_PAUSED_KILL_SWITCH", super::BLOCKED_PAUSED_KILL_SWITCH, "unknown"), // kill_switch=false 인 d0 에서는 미분류 — 실사용은 아래 ks(1행)
+        ];
+        for (name, value, want) in consts {
+            assert_eq!(queue_remedy(value, &d0).0, want, "{name}={value}");
+        }
+        assert_eq!(queue_remedy(super::BLOCKED_PAUSED_KILL_SWITCH, &ks).0, "paused", "동결 중에는 어떤 사유 문면이든 1행");
+        assert_eq!(queue_remedy(BLOCKED_INPUT_PENDING, &dpos).0, "input_pending_unknown", "계수 > 0 · 관측 불능 → 9행");
+        // 리터럴 사유(틱이 `block("…")` 으로 기록 · schedule.rs 의 기아 경보 사유).
         for (blocked, want) in [
-            (BLOCKED_APPROVAL, "approval"),
-            (BLOCKED_MODAL, "answer_modal"),
-            (BLOCKED_BUSY, "wait"),
-            (BLOCKED_INPUT_PENDING, "input_pending_unknown"), // 계수 0 · 관측 불능
-            (BLOCKED_PROMPT_UNKNOWN, "unknown"),
-            (super::BLOCKED_PROMPT_NOT_READY, "wait"),
-            (BLOCKED_ALT_SCREEN, "alt_screen"),
-            (BLOCKED_INTERVAL, "wait"),
-            (super::BLOCKED_QUIESCING, "wait"),
-            (super::BLOCKED_SETTLE_BUDGET, "wait"),
-            ("queue_paused(헬스 조치)", "wait"), // 좌석 pause 가 진단 시점에 이미 만료(paused=false)
-            ("empty_seat(좌석에 에이전트 미연결)", "unknown"),
+            ("empty_seat(좌석에 에이전트 미연결)", "empty_seat"),
             ("human_typing(사람 입력 직후)", "wait"),
-            ("schedule_divert(gate:draft · job j1)", "unknown"), // schedule.rs 의 기아 경보 사유
+            ("schedule_divert(gate:draft · job j1)", "wait"), // 입력줄 계열 · d0 계수 0 → 4행
+            ("schedule_divert(other)", "unknown"),
         ] {
             assert_eq!(queue_remedy(blocked, &d0).0, want, "blocked_by={blocked}");
         }
+        assert_eq!(queue_remedy("schedule_divert(gate:draft · job j1)", &dpos).0, "input_pending_unknown", "스케줄 초안 우회도 입력줄 계열 표를 쓴다");
         assert!(blocked_is_input_pending(BLOCKED_INPUT_PENDING));
         assert!(!blocked_is_input_pending("prompt_not_ready(프롬프트 경계 미도달)"));
-        // 전수 가드 — 큐 틱(`deliver_queued`)이 쓰는 **문자열 리터럴** 사유는 위 표가 아는 것뿐이다. 새 리터럴 사유가 생기면 여기서 적색이
-        // 되어 `queue_remedy` 표의 어느 행에 들지 정하게 만든다(상수 사유는 `BLOCKED_*` 로 위에서 열거했다).
+
+        // ── 전수 가드 ① 소스의 `const BLOCKED_*` 선언 이름 집합 = 위 표의 이름 집합 — 새 상수는 표의 어느 행에 드는지 정하게 만든다.
         let src = include_str!("governance.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let mut declared: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (i, _) in prod.match_indices("const BLOCKED_") {
+            let rest = &prod[i + "const ".len()..];
+            declared.insert(rest[..rest.find(':').expect("상수 이름 끝")].to_string());
+        }
+        let documented: std::collections::BTreeSet<String> = consts.iter().map(|(n, _, _)| n.to_string()).collect();
+        assert_eq!(declared, documented, "BLOCKED_* 상수 선언과 처방 표 매핑이 어긋났다 — queue_remedy 표·WORKLOG 매핑을 갱신하라");
+        // ── 전수 가드 ② 큐 틱(`deliver_queued`)이 사유 기록에 넘기는 **인자 전부** — `block(…)`·`mark_queue_blocked(&s, …)` 의 리터럴 · 상수 · 변수.
         let start = src.find("\nfn deliver_queued(").expect("deliver_queued 소실");
         let body = &src[start..start + src[start..].find("\n}\n").expect("함수 끝")];
         let mut lits: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        for (i, _) in body.match_indices("block(\"") {
-            let rest = &body[i + "block(\"".len()..];
-            lits.insert(rest[..rest.find('"').expect("리터럴 끝")].to_string());
+        let mut idents: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut take = |arg: &str| {
+            if let Some(lit) = arg.strip_prefix('"') {
+                lits.insert(lit[..lit.find('"').expect("리터럴 끝")].to_string());
+            } else {
+                idents.insert(arg[..arg.find(')').expect("인자 끝")].to_string());
+            }
+        };
+        for (i, _) in body.match_indices("block(") {
+            if body[..i].chars().last().is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                continue; // `queue_blocked(` 같은 더 긴 식별자의 꼬리
+            }
+            take(&body[i + "block(".len()..]);
         }
-        let known: std::collections::BTreeSet<String> = [
-            "queue_paused(헬스 조치)",
-            "empty_seat(좌석에 에이전트 미연결)",
-            "human_typing(사람 입력 직후)",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        assert_eq!(lits, known, "틱의 리터럴 막힘 사유가 표와 어긋났다 — queue_remedy 표·WORKLOG 매핑을 갱신하라");
+        for (i, _) in body.match_indices("mark_queue_blocked(&s, ") {
+            take(&body[i + "mark_queue_blocked(&s, ".len()..]);
+        }
+        let known_lits: std::collections::BTreeSet<String> =
+            ["empty_seat(좌석에 에이전트 미연결)", "human_typing(사람 입력 직후)"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(lits, known_lits, "틱의 리터럴 막힘 사유가 표와 어긋났다 — queue_remedy 표·WORKLOG 매핑을 갱신하라");
+        // 상수 인자는 전부 위 표에 있는 이름이어야 하고, 변수 인자는 게이트 판정이 돌려준 사유(`why`) 하나뿐이다(그 값은 `BLOCKED_*` 상수다).
+        let known_idents: std::collections::BTreeSet<String> = documented.iter().cloned().chain(["why".to_string()]).collect();
+        let stray: Vec<&String> = idents.difference(&known_idents).collect();
+        assert!(stray.is_empty(), "틱이 표에 없는 식별자를 막힘 사유로 기록한다: {stray:?}");
+        for must in ["BLOCKED_QUEUE_PAUSED", "BLOCKED_QUIESCING", "BLOCKED_SETTLE_BUDGET", "BLOCKED_INTERVAL", "BLOCKED_INPUT_PENDING", "BLOCKED_BUSY", "why"] {
+            assert!(idents.contains(must), "전수 가드가 공허하다 — 틱에서 {must} 인자를 찾지 못했다(스캔이 깨졌다): {idents:?}");
+        }
     }
 
     /// 진단 스냅샷의 화면 관측 — 마커 좌석의 커서 행 앞/뒤 · 선택기 행 · 마커 없는 좌석 · 마커 없는 줄은 결측(None)이다.
@@ -21716,16 +22579,23 @@ mod tests {
         let d = queue_block_diag(&daemon, &s);
         assert_eq!((d.pending_input_bytes, d.pending_input_human_bytes), (3, 3), "{d:?}");
         assert_eq!(d.parser_panics, 2);
-        assert_eq!(d.input_model, PendingInputModel::current().as_str());
-        assert!(matches!(d.input_model, "v2" | "v3"));
-        assert!(!d.paused, "전제: 동결 아님");
+        // ★(RQFIX B-1) 진단의 input_model 은 이 좌석에 **지금 적용되는** 모델(좌석 표식 `lone_key_exempt` 기준)이다 — 전역 노브 값이 아니다.
+        assert_eq!(d.input_model, "v2", "표식 거짓(기본)인 좌석은 v2");
+        s.lone_key_exempt.store(true, AtomicOrdering::Relaxed);
+        assert_eq!(queue_block_diag(&daemon, &s).input_model, "v3", "표식 참인 좌석은 v3");
+        s.lone_key_exempt.store(false, AtomicOrdering::Relaxed);
+        assert_eq!(queue_block_diag(&daemon, &s).input_model, "v2", "표식을 내리면 v2 로 돌아온다");
+        assert!(!d.paused && !d.kill_switch, "전제: 동결 아님");
         daemon.paused.store(true, AtomicOrdering::Relaxed);
-        assert!(queue_block_diag(&daemon, &s).paused, "kill-switch 동결");
+        let d = queue_block_diag(&daemon, &s);
+        assert!(d.paused && d.kill_switch, "kill-switch 동결 — paused(OR)와 kill_switch 가 둘 다 선다: {d:?}");
         daemon.paused.store(false, AtomicOrdering::Relaxed);
         *s.queue_paused_until.lock().unwrap() = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
-        assert!(queue_block_diag(&daemon, &s).paused, "좌석 큐 pause(헬스 조치)");
+        let d = queue_block_diag(&daemon, &s);
+        assert!(d.paused && !d.kill_switch, "좌석 큐 pause(헬스 조치) — paused 만 선다(★RQFIX F8: kill_switch 는 거짓): {d:?}");
         *s.queue_paused_until.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
-        assert!(!queue_block_diag(&daemon, &s).paused, "만료된 좌석 pause 는 동결이 아니다");
+        let d = queue_block_diag(&daemon, &s);
+        assert!(!d.paused && !d.kill_switch, "만료된 좌석 pause 는 동결이 아니다: {d:?}");
         // 마커가 없는 줄(커서 행에 프롬프트 글리프 없음) = 결측 — false 로 접지 않는다.
         paint_screen(&s, &["그냥 출력 줄입니다"], 0, 10, false);
         let d = queue_block_diag(&daemon, &s);
@@ -21795,9 +22665,12 @@ mod tests {
         assert_eq!(v["clock"], json!("wall"), "blocked_since 는 벽시계(표시용)임을 파일 머리에 명시");
         assert!(v["saved_at"].as_f64().unwrap_or(0.0) > 1.0e9, "{v}");
         assert_eq!(v["surfaces"], json!([]), "막힌 좌석 없음 → 빈 목록");
+        // ★(RQFIX F3) 머리의 가산 키 — 동결 여부와 보존소(restored_queue)에 주차된 항목 수(평시 false · 0).
+        assert_eq!(v["daemon_paused"], json!(false), "{v}");
+        assert_eq!(v["restored_entries"], json!(0), "{v}");
         no_body("①");
 
-        // ② 막힘 발생 — 사람 계수 3 + 빈 줄(커서 뒤 고스트): 유령 계수. 좌석 1건.
+        // ② 막힘 발생 — 사람 계수 3 + 빈 줄(커서 뒤 고스트): 커서 앞은 비었고 커서 뒤에 글자 → 처방은 `after_cursor_text`(★RQFIX 7행). 좌석 1건.
         let e = daemon.next_queue_entry(format!("[보고] {secret}"), Some("surface:9".into()), "send");
         let (head_id, head_at) = (e.id.clone(), e.enqueued_at);
         s.pending_queue.lock().unwrap().push_back(e);
@@ -21824,8 +22697,12 @@ mod tests {
         assert_eq!(r["draft_visible"], json!(false));
         assert_eq!(r["ghost_after_cursor"], json!(true));
         assert_eq!(r["parser_panics"], json!(0));
-        assert_eq!(r["input_model"], json!(PendingInputModel::current().as_str()));
-        assert_eq!(r["remedy_code"], json!("phantom_count_ctrl_u"), "사람 계수 + 빈 입력줄 = 유령 계수");
+        assert_eq!(r["input_model"], json!("v2"), "이 좌석의 표식은 거짓 — 좌석에 적용되는 모델(전역 노브 아님)");
+        assert_eq!(
+            r["remedy_code"],
+            json!("after_cursor_text"),
+            "사람 계수 + 커서 앞 빈 줄 + 커서 뒤 글자(회색 제안일 수도 직접 쓴 글일 수도) — 유령 단정이 아니라 after_cursor_text(종전 phantom_count_ctrl_u 에서 변경 · F6/표 7행)"
+        );
         no_body("②");
 
         // ③ 같은 사유가 이어지면 다시 쓰지 않는다(매 틱 쓰지 않는다 — saved_at 이 그대로다).
@@ -21860,7 +22737,8 @@ mod tests {
         no_body("⑤");
     }
 
-    /// 낡은 파일은 '지금 막힘' 으로 읽히지 않는다 — 부트는 지우지도 않고(다음 기록이 덮는다), 첫 틱이 막힌 좌석 없음으로 덮는다.
+    /// 낡은 파일은 '지금 막힘' 으로 읽히지 않는다 — 부트는 지우지도 않고, 첫 틱이 막힌 좌석 없음으로 덮는다. ★(RQFIX I-9) 덮기 직전에 낡은 파일은
+    /// `queue-blocked.prev.json` 으로 보존된다(직전 부트 1세대 — 사후 분석 재료를 첫 틱의 빈 목록이 지우지 않게).
     #[test]
     fn c5_queue_blocked_file_boot_leaves_stale_file_then_first_tick_overwrites() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -21868,9 +22746,11 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let stale = r#"{"v":1,"saved_at":1.0,"clock":"wall","surfaces":[{"surface_id":99,"blocked_by":"stale_from_old_boot"}]}"#;
         let path = dir.join(QUEUE_BLOCKED_FILE);
+        let prev = dir.join(super::QUEUE_BLOCKED_PREV_FILE);
         std::fs::write(&path, stale).unwrap();
         let daemon = Daemon::new(dir.join("cysd.sock"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), stale, "부트가 낡은 파일을 지우거나 고치지 않는다");
+        assert!(!prev.exists(), "부트는 보존본도 만들지 않는다(첫 기록 직전에만)");
         // 이 파일로 상태를 복원하지 않는다 — 좌석 0 · 큐 0 · 막힘 0.
         assert!(daemon.surfaces.lock().unwrap().is_empty());
         assert!(daemon.queue_blocked_sig.lock().unwrap().is_none(), "부트 직후는 기록 서명이 없다(첫 틱이 쓴다)");
@@ -21878,26 +22758,34 @@ mod tests {
         let v = c5_read_blocked_file(&daemon);
         assert_eq!(v["surfaces"], json!([]), "첫 틱이 낡은 사유를 덮는다: {v}");
         assert!(!v.to_string().contains("stale_from_old_boot"));
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), stale, "★I-9: 덮이기 직전 낡은 파일은 .prev 로 바이트 그대로 보존된다");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 사유 파일 쓰기 실패는 틱을 죽이지 않고 다음 틱에 다시 시도한다 — 디렉터리가 복구되면 그 틱에 쓰인다.
+    /// 사유 파일 쓰기 실패는 틱을 죽이지 않고 다시 시도한다 — ★(RQFIX I-1) **60초 뒤**다(종전: 다음 틱 = 5초마다 좌석 진단·로그). 디렉터리가 복구돼도
+    /// 억제 창 안의 틱은 쓰지 않고, 창이 지나면 그 틱에 쓰이며 억제가 풀린다(시계 주입 `persist_queue_blocked_at`).
     #[test]
-    fn c5_queue_blocked_file_write_failure_retries_next_tick() {
+    fn c5_queue_blocked_file_write_failure_retries_after_the_suppression_window() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let daemon = drill_daemon("c5-retry");
         let dir = crate::state::state_dir(&daemon.socket_path);
         let path = dir.join(QUEUE_BLOCKED_FILE);
         // 같은 이름의 **디렉터리**가 있으면 원자 치환(rename)이 실패한다.
         std::fs::create_dir_all(&path).unwrap();
-        tick(&daemon);
+        let t0 = std::time::Instant::now();
+        super::persist_queue_blocked_at(&daemon, t0);
         assert!(path.is_dir(), "전제: 기록이 실패했다");
         assert!(daemon.queue_blocked_sig.lock().unwrap().is_none(), "실패한 기록의 서명은 기억하지 않는다");
         assert!(daemon.queue_blocked_dirty.load(AtomicOrdering::Acquire), "실패는 재시도 표식을 세운다");
         std::fs::remove_dir_all(&path).unwrap();
-        tick(&daemon);
-        assert_eq!(c5_read_blocked_file(&daemon)["surfaces"], json!([]), "다음 틱에 다시 쓴다");
+        // 억제 창(60초) 안 — 디렉터리가 복구됐어도 쓰지 않는다.
+        super::persist_queue_blocked_at(&daemon, t0 + std::time::Duration::from_secs(59));
+        assert!(!path.exists(), "59초 안의 틱은 기록하지 않는다(I-1)");
+        super::persist_queue_blocked_at(&daemon, t0 + std::time::Duration::from_secs(61));
+        assert_eq!(c5_read_blocked_file(&daemon)["surfaces"], json!([]), "창이 지나면 그 틱에 다시 쓴다");
         assert!(!daemon.queue_blocked_dirty.load(AtomicOrdering::Acquire));
+        let st = daemon.queue_blocked_retry.lock().unwrap();
+        assert!(st.retry_after.is_none() && st.last_err.is_none(), "성공하면 억제를 푼다: {st:?}");
     }
 
     /// 더티 표식(기아 경보 발행 · ⓒ)은 서명이 같아도 최신 진단으로 다시 쓰게 한다 — 표식은 한 번 소비된다.
@@ -21958,7 +22846,8 @@ mod tests {
         assert_eq!(p["head_entry_id"], json!(head_id));
         assert_eq!(p["blocked_by"], json!("busy(출력 중)"));
         assert_eq!(p["depth"], json!(1));
-        assert_eq!(p["hint"], json!(crate::state::QUEUE_STARVED_HINT));
+        // ★(RQFIX I-11) hint 는 env(`CYS_QUEUE_STARVED_HINT_LEGACY`)가 고르는 문면이다 — 제품과 같은 순수 함수 사슬로 기대값을 도출해 LEGACY env 에서도 녹색이다.
+        assert_eq!(p["hint"], json!(c5_expected_starved_hint()));
         assert!(p["waited_secs"].as_u64().unwrap() >= 1, "{p}");
         // 가산 키 — 진단 스냅샷.
         assert_eq!(p["pending_input_bytes"], json!(0));
@@ -21966,7 +22855,7 @@ mod tests {
         assert!(p["draft_visible"].is_null(), "마커 없는 좌석은 관측 불능(null): {p}");
         assert!(p["ghost_after_cursor"].is_null(), "{p}");
         assert_eq!(p["parser_panics"], json!(0));
-        assert_eq!(p["input_model"], json!(PendingInputModel::current().as_str()));
+        assert_eq!(p["input_model"], json!("v2"), "이 좌석의 표식은 거짓 — 좌석에 적용되는 모델(전역 노브 아님)");
         assert_eq!(p["remedy_code"], json!("wait"), "busy 는 일시 보류");
         let remedy = p["remedy"].as_str().expect("remedy 문장");
         assert!(remedy.contains("스스로 풀린다") && remedy.ends_with(REMEDY_LLM_SUFFIX), "{remedy}");
@@ -21978,7 +22867,8 @@ mod tests {
         // 발행처는 더티 표식을 세운다(ⓒ) — 쿨다운 때문에 같은 틱에 다시 부르면 억제되므로 발행 함수를 직접 부른다.
         let head = s.pending_queue.lock().unwrap().front().cloned().expect("머리");
         let mut starve: HashMap<u64, f64> = HashMap::new();
-        super::alert_queue_starved_if_stalled(&daemon, &s, &mut starve, "busy(출력 중)", &head, 5, 1);
+        let defs = || Arc::new(super::load_adapter_defs());
+        super::alert_queue_starved_if_stalled(&daemon, &s, &mut starve, "busy(출력 중)", &head, 5, 1, &defs);
         assert!(daemon.queue_blocked_dirty.load(AtomicOrdering::Acquire), "기아 경보 발행 = 사유 파일 강제 기록 요청");
         let n = daemon.bus.tail(200).iter().filter(|ev| ev["name"] == "queue.starved").count();
         assert_eq!(n, 2, "직접 호출한 발행이 이벤트를 1건 더 냈다(쿨다운 맵이 비어 있었다)");
@@ -22082,8 +22972,9 @@ mod tests {
         assert_eq!(c5_read_blocked_file(&daemon)["surfaces"], json!([]), "회수된 좌석은 빠진다");
     }
 
-    /// 소스 핀 — 진단 스냅샷은 **게이트 뒤**에서만 뜬다(매 틱 파서를 읽지 않는다): 기아 경보에서는 임계·쿨다운 조기 반환이 모두 `queue_block_diag(` 앞이고,
-    /// 사유 파일 기록에서는 변경 게이트(조기 반환) 뒤에서만 좌석마다 진단을 뜬다. 둘 다 진단 호출은 한 곳뿐이다.
+    /// 소스 핀 — 진단 스냅샷은 **게이트 뒤**에서만 뜬다(매 틱 파서를 읽지 않는다): 기아 경보에서는 임계·쿨다운 조기 반환이 모두 진단 호출 앞이고,
+    /// 사유 파일 기록에서는 쓰기 실패 억제(I-1)·변경 게이트(조기 반환) 뒤에서만 좌석마다 진단을 뜬다. 둘 다 진단 호출은 한 곳뿐이다.
+    /// ★(RQFIX F4) 기아 경보의 진단은 **큐 틱이 든 어댑터 정의**(`queue_block_diag_with` + `defs`)로 뜬다 — 진단 캐시 판(`queue_block_diag`)이 아니다.
     #[test]
     fn c5_diag_snapshots_are_taken_only_after_the_gates_source_pin() {
         let src = include_str!("governance.rs");
@@ -22091,29 +22982,37 @@ mod tests {
         let body = &src[f..f + src[f..].find("\n}\n").expect("함수 끝")];
         let thr = body.find("head_wait_secs < threshold").expect("임계 판정");
         let cool = body.find("now - last < QUEUE_ALERT_COOLDOWN_SECS").expect("쿨다운 판정");
-        let diag = body.find("queue_block_diag(").expect("진단 호출");
+        let diag = body.find("queue_block_diag_with(").expect("진단 호출(틱 정의 판)");
         let publish = body.find("queue_starved_payload(").expect("발행");
-        assert_eq!(body.matches("queue_block_diag(").count(), 1, "진단 호출은 한 곳");
+        assert_eq!(body.matches("queue_block_diag").count(), 1, "진단 호출은 한 곳 · 캐시 판(queue_block_diag)이 아니다");
         assert!(thr < diag && cool < diag && diag < publish, "진단은 임계·쿨다운 판정 뒤 · 발행 앞");
-        let p = src.find("\npub(crate) fn persist_queue_blocked_if_changed(").expect("사유 파일 기록 함수 소실");
+        let p = src.find("\npub(crate) fn persist_queue_blocked_at(").expect("사유 파일 기록 본체 소실");
         let pbody = &src[p..p + src[p..].find("\n}\n").expect("함수 끝")];
-        let gate = pbody.find("return;").expect("변경 게이트 조기 반환");
+        let suppress = pbody.find("queue_blocked_retry_due(").expect("★I-1 쓰기 실패 억제 판정");
+        let seats = pbody.find("queue_blocked_seats(").expect("좌석 목록 조회");
+        let gate_at = pbody.find("last.as_deref() == Some(sig.as_str())").expect("변경 게이트 판정");
+        let gate_ret = gate_at + pbody[gate_at..].find("return;").expect("변경 게이트 조기 반환");
         let diag2 = pbody.find("queue_block_diag(").expect("진단 호출");
         assert_eq!(pbody.matches("queue_block_diag(").count(), 1, "진단 호출은 한 곳");
-        assert!(gate < diag2, "진단은 변경 게이트(서명·더티 표식) 뒤에서만 뜬다 — 바뀌지 않은 틱은 파서를 읽지 않는다");
+        assert!(suppress < seats, "억제 창의 틱은 좌석 조회·진단 전에 돌아온다(I-1 — 매 틱 좌석 진단 금지)");
+        assert!(gate_ret < diag2, "진단은 변경 게이트(서명·더티 표식) 뒤에서만 뜬다 — 바뀌지 않은 틱은 파서를 읽지 않는다");
         // 파일 쓰기는 모든 락 밖이다 — 좌석 큐 락·surfaces 가드를 쥔 채 쓰지 않는다(조회 함수가 락을 전부 놓고 돌아온다).
         let write = pbody.find("write_json_atomic(").expect("원자 기록");
         assert!(diag2 < write, "진단 → 기록 순서");
+        // 위 본체를 부르는 얇은 래퍼가 틱 끝에서 불린다.
+        let wrapper = &src[src.find("\npub(crate) fn persist_queue_blocked_if_changed(").expect("래퍼")..];
+        assert!(wrapper[..wrapper.find("\n}\n").unwrap()].contains("persist_queue_blocked_at("), "래퍼는 본체에 시계를 넘긴다");
     }
 
-    /// 가시성 순수 판독 — 선택기 행·발행 중 프레임·마커 뒤 커서 없음은 결측이다.
+    /// 가시성 순수 판독 — 선택기 행·발행 중 프레임·마커 뒤 커서 없음은 결측이다. ★(RQFIX F6) 화면 재료(`screen`)는 한 줄 입력 상자(괘선 · 빈 프롬프트 · 괘선 · 상태줄)다 —
+    /// 편집 영역이 한 줄이라 아래 영역 판독은 '비어 있음' 이고 종전 기대값이 그대로 선다(편집 영역 전체 판독은 `rqfix_f6_*` 가 잰다).
     #[test]
     fn c5_input_line_visibility_pure_rules() {
         let base = || super::PromptObs {
             marker: "❯".into(),
             marker_seen: true,
             line: Some((String::new(), String::new())),
-            screen: String::new(),
+            screen: "────────────────────\n❯ \n────────────────────\n  ? for shortcuts".to_string(),
             selector_row: false,
             busy_near_cursor: false,
             output_gen: 2,
@@ -22122,32 +23021,496 @@ mod tests {
             alt_screen: false,
             block: None,
         };
-        assert_eq!(input_line_visibility(&base()), (Some(false), Some(false)));
+        assert_eq!(input_line_visibility(&base(), None), (Some(false), Some(false)));
         let mut o = base();
         o.line = Some(("  ".into(), " 고스트 ".into()));
-        assert_eq!(input_line_visibility(&o), (Some(false), Some(true)), "공백뿐인 커서 앞은 빈 줄이고 커서 뒤 글자는 고스트");
+        assert_eq!(input_line_visibility(&o, None), (Some(false), Some(true)), "공백뿐인 커서 앞은 빈 줄이고 커서 뒤 글자는 고스트");
         o.line = Some(("abc".into(), String::new()));
-        assert_eq!(input_line_visibility(&o), (Some(true), Some(false)));
+        assert_eq!(input_line_visibility(&o, None), (Some(true), Some(false)));
         let mut o = base();
         o.line = None;
-        assert_eq!(input_line_visibility(&o), (None, None), "마커 뒤 커서가 없으면 결측");
+        assert_eq!(input_line_visibility(&o, None), (None, None), "마커 뒤 커서가 없으면 결측");
         let mut o = base();
         o.selector_row = true;
-        assert_eq!(input_line_visibility(&o), (None, None), "선택기 행은 composer 가 아니다");
+        assert_eq!(input_line_visibility(&o, None), (None, None), "선택기 행은 composer 가 아니다");
         let mut o = base();
         o.output_gen = 3;
-        assert_eq!(input_line_visibility(&o), (None, None), "발행 중(홀수 세대) 프레임은 관측하지 않는다");
+        assert_eq!(input_line_visibility(&o, None), (None, None), "발행 중(홀수 세대) 프레임은 관측하지 않는다");
         let mut o = base();
         o.output_gen_after = 3;
-        assert_eq!(input_line_visibility(&o), (None, None), "후행 세대가 홀수여도 마찬가지");
+        assert_eq!(input_line_visibility(&o, None), (None, None), "후행 세대가 홀수여도 마찬가지");
         // 게이트의 입력줄 술어와 같다(새 판정을 만들지 않았다).
         for (before, want) in [("", false), (" ", false), ("x", true), (" x ", true)] {
             let gate = input_line_state(0, Some(PromptLine { before_cursor: before, at_or_after_cursor: "" })) == InputLine::Occupied;
             assert_eq!(gate, want);
             let mut o = base();
             o.line = Some((before.to_string(), String::new()));
-            assert_eq!(input_line_visibility(&o).0, Some(gate), "before={before:?}");
+            assert_eq!(input_line_visibility(&o, None).0, Some(gate), "before={before:?}");
         }
+    }
+
+    // ═══════════ ★(0.14.43 · RQFIX 2부) C5 수정 — 처방 표 재구성 · 진단 정확도 · 사유 파일(동결·보존·억제) ═══════════
+    //
+    // 어떤 게이트 판정도 바뀌지 않는다 — 문구·필드·파일만 잰다. (처방 표 16행 전수는 `c5_queue_remedy_table_every_row_in_order` 가 잰다.)
+
+    use super::{diag_adapter_defs, diag_defs_cached, seat_input_line_visibility_with, DiagDefsEntry};
+
+    /// 입력 상자 화면 재료 — 괘선 · 행들 · 괘선 · 상태줄(실 claude 2.1.263 레이아웃의 모양).
+    fn rqfix_boxed(rows: &[&str]) -> String {
+        let rule = "────────────────────────────────────────";
+        let mut v = vec![rule];
+        v.extend_from_slice(rows);
+        v.push(rule);
+        v.push("  ? for shortcuts");
+        v.join("\n")
+    }
+
+    fn rqfix_obs(screen: &str, marker: &str, before: &str, after: &str) -> super::PromptObs {
+        super::PromptObs {
+            marker: marker.into(),
+            marker_seen: true,
+            line: Some((before.into(), after.into())),
+            screen: screen.to_string(),
+            selector_row: false,
+            busy_near_cursor: false,
+            output_gen: 2,
+            output_gen_after: 2,
+            quiet_secs: 9,
+            alt_screen: false,
+            block: None,
+        }
+    }
+
+    /// F6 — `draft_visible` 는 **편집 영역 전체**다(감사 o1 · 적대 M-1). 커서 앞 글자 ∨ 마커 행 **아래**의 비어 있지 않은 편집 영역이면 `Some(true)`.
+    /// 커서 뒤 고스트(입력 추천)는 `draft_visible` 을 올리지 않는다 — 그래야 `Some(false) ∧ ghost_after_cursor == Some(true)`(처방 표 7행)가 도달 가능하다.
+    /// 종전엔 커서 행만 봐서 멀티라인 초안의 첫 행에 커서가 있으면 '비어 보임'(유령) 으로 읽고 **Ctrl-U(= 그 초안 삭제)를 권했다**.
+    #[test]
+    fn rqfix_f6_input_line_visibility_reads_the_whole_edit_region() {
+        // ① 한 줄 빈 프롬프트(상자 안) — 비어 보인다.
+        assert_eq!(input_line_visibility(&rqfix_obs(&rqfix_boxed(&["❯ "]), "❯", "", ""), None), (Some(false), Some(false)));
+        // ② 빈 프롬프트 + 커서 뒤 고스트 — 비어 보이고(Some(false)) 커서 뒤에 글자(Some(true)): 고스트가 draft_visible 을 올리면 표 7행이 도달 불가다.
+        let ghost = "버그 수정 착수한다. 브랜치는";
+        assert_eq!(
+            input_line_visibility(&rqfix_obs(&rqfix_boxed(&[&format!("❯ {ghost}")]), "❯", "", ghost), None),
+            (Some(false), Some(true))
+        );
+        // ③ 커서 앞에 글자 — 아래 영역과 무관하게 보인다.
+        assert_eq!(
+            input_line_visibility(&rqfix_obs(&rqfix_boxed(&["❯ abc"]), "❯", "abc", ""), None),
+            (Some(true), Some(false))
+        );
+        // ④ M-1 — 마커 행(커서 앞·뒤 빈) + 같은 입력 상자 안 아랫줄 초안: 보인다(종전엔 Some(false) = 유령 처방이 초안 삭제를 권했다).
+        assert_eq!(
+            input_line_visibility(&rqfix_obs(&rqfix_boxed(&["❯ ", "  둘째 행 초안"]), "❯", "", ""), None),
+            (Some(true), Some(false)),
+            "아랫줄 초안이 있는데 비어 보임으로 읽었다"
+        );
+        // ⑤ 커서를 첫 행 머리에 둔 멀티라인 초안(첫 행 글은 커서 뒤) — 아랫줄이 있으니 보인다.
+        assert_eq!(
+            input_line_visibility(&rqfix_obs(&rqfix_boxed(&["❯ 첫 행 초안", "  둘째 행 초안"]), "❯", "", "첫 행 초안"), None),
+            (Some(true), Some(true))
+        );
+        // ⑥ 괘선 없는 한 줄 화면(꼬리 비어 있음) — 비어 보인다.
+        assert_eq!(input_line_visibility(&rqfix_obs("❯ ", "❯", "", ""), None), (Some(false), Some(false)));
+        // ⑦ 화면에 마커 행이 없다(커서 행 판독과 화면이 어긋난 관측) — 아래 영역은 관측 불능(None) · 커서 뒤 판독은 그대로.
+        assert_eq!(input_line_visibility(&rqfix_obs("그냥 출력 줄", "❯", "", ""), None), (None, Some(false)));
+        // ⑧ 어댑터 플레이스홀더(codex) — 마커 행이 플레이스홀더뿐이면 그 약한 증거를 그대로 인정한다(placeholder 를 넘겨야 비어 보임).
+        let ph = Some("Ask Codex to do anything");
+        let codex = "» Ask Codex to do anything\n \n  gpt-6-astra ultra · ~";
+        assert_eq!(input_line_visibility(&rqfix_obs(codex, "»", "", "Ask Codex to do anything"), ph), (Some(false), Some(true)));
+        assert_eq!(
+            input_line_visibility(&rqfix_obs(codex, "»", "", "Ask Codex to do anything"), None).0,
+            Some(true),
+            "플레이스홀더를 넘기지 않으면 상태줄만으로는 편집 영역이 비었다고 읽지 못한다(보수 쪽 = Ctrl-U 처방 없음)"
+        );
+    }
+
+    /// F6 — 좌석 화면 4종이 처방 코드로 이어진다: 한 줄 빈 프롬프트 → `phantom_count` · 빈 프롬프트 + 커서 뒤 글자 → `after_cursor_text` · 마커 행 + 아랫줄 초안 →
+    /// 기계 계수면 `machine_residue` · 사람 계수면 `human_draft` · 커서를 줄 머리에 둔 한 줄 초안(커서 앞 빈 · 뒤 글) → `after_cursor_text`(유령 단정 아님) · 커서 앞 글자 → `human_draft`.
+    #[test]
+    fn rqfix_f6_seat_screens_map_to_the_documented_codes() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("rqfix-f6");
+        let (daemon, s) = wp5_seat("rqfix-f6", "claude");
+        let diag = || queue_block_diag(&daemon, &s);
+        let code = |d: &QueueBlockDiag| queue_remedy(BLOCKED_INPUT_PENDING, d).0;
+
+        s.apply_pending_input(b"abc", InputOrigin::Human);
+        // 1) 한 줄 빈 프롬프트 → 유령 계수.
+        paint_prompt(&s, "", "");
+        let d = diag();
+        assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(false)), "{d:?}");
+        assert_eq!(code(&d), "phantom_count");
+        // 2) 빈 프롬프트 + 커서 뒤 글자 → 회색 제안인지 직접 쓴 글인지 사람이 가린다.
+        paint_prompt(&s, "", "버그 수정 착수한다. 브랜치는");
+        let d = diag();
+        assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(true)), "{d:?}");
+        assert_eq!(code(&d), "after_cursor_text");
+        // 3) 마커 행(커서 앞·뒤 빈) + 아랫줄 초안 → 보인다(사람 계수 3 → human_draft).
+        paint_screen(&s, &["❯ ", "  초안 아랫줄"], 0, 2, false);
+        let d = diag();
+        assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(true), Some(false)), "{d:?}");
+        assert_eq!(code(&d), "human_draft", "사람 계수 + 아랫줄 초안: {d:?}");
+        // 3') 같은 화면 · 기계가 넣은 본문(사람 몫 0) → machine_residue(글이 보일 때만 기계 잔여로 단정한다).
+        s.clear_pending_input();
+        s.apply_pending_input(b"abc", InputOrigin::Machine);
+        let d = diag();
+        assert_eq!((d.pending_input_bytes, d.pending_input_human_bytes, d.draft_visible), (3, 0, Some(true)), "{d:?}");
+        assert_eq!(code(&d), "machine_residue");
+        // F1 — 같은 기계 계수인데 화면이 비어 보이면 machine_residue 가 아니라 유령 계수다(화면을 먼저 지운다 — 아랫줄 초안이 남으면 그것이 보인다).
+        paint_screen(&s, &["❯ "], 0, 2, false);
+        let d = diag();
+        assert_eq!((d.pending_input_human_bytes, d.draft_visible), (0, Some(false)), "{d:?}");
+        assert_eq!(code(&d), "phantom_count", "사람 몫 0 이라고 '기계 본문이 보인다' 고 단정하지 않는다(F1)");
+        // 4) 커서를 줄 머리에 둔 한 줄 초안(커서 앞 빈 · 커서 뒤 글) → 유령 단정이 아니다.
+        paint_screen(&s, &["❯ 직접 쓴 글"], 0, 2, false);
+        let d = diag();
+        assert_eq!((d.draft_visible, d.ghost_after_cursor), (Some(false), Some(true)), "{d:?}");
+        let (c, text) = queue_remedy(BLOCKED_INPUT_PENDING, &d);
+        assert_eq!(c, "after_cursor_text");
+        assert!(text.contains("직접 쓴 글이면 초안이다") && text.contains("사람이 화면을 보고 가린다"), "{text}");
+        // 5) 커서 앞에 글자 → 초안.
+        paint_prompt(&s, "abc", "");
+        let d = diag();
+        assert_eq!(d.draft_visible, Some(true), "{d:?}");
+        assert_eq!(code(&d), "machine_residue", "사람 몫 0 · 글이 보인다: {d:?}");
+    }
+
+    /// F4 — 진단 어댑터 캐시의 **순수 코어**: TTL 안 · 같은 팩 디렉터리면 로더를 부르지 않고 같은 `Arc` 를 돌려준다. TTL 경계·다른 디렉터리에서는 새로 읽는다.
+    #[test]
+    fn rqfix_f4_diag_adapter_cache_loads_once_per_ttl_and_dir() {
+        use std::cell::Cell;
+        let slot: std::sync::Mutex<Option<DiagDefsEntry>> = std::sync::Mutex::new(None);
+        let loads = Cell::new(0u32);
+        let mut load = || {
+            loads.set(loads.get() + 1);
+            (json!({"n": loads.get()}), json!({}))
+        };
+        let ttl = std::time::Duration::from_secs(5);
+        let t0 = std::time::Instant::now();
+        let a = std::path::Path::new("/rqfix/pack-a");
+        let first = diag_defs_cached(&slot, t0, a, ttl, &mut load);
+        assert_eq!(loads.get(), 1, "첫 호출은 읽는다");
+        let again = diag_defs_cached(&slot, t0 + std::time::Duration::from_secs(4), a, ttl, &mut load);
+        assert_eq!(loads.get(), 1, "5초 안 연속 진단 호출에 디스크 판독은 1회");
+        assert!(Arc::ptr_eq(&first, &again), "같은 Arc 를 공유한다");
+        let after = diag_defs_cached(&slot, t0 + ttl, a, ttl, &mut load);
+        assert_eq!(loads.get(), 2, "TTL 경계(정확히 5초)부터는 새로 읽는다");
+        assert!(!Arc::ptr_eq(&first, &after));
+        assert_eq!(after.0["n"], json!(2));
+        let other = diag_defs_cached(&slot, t0 + ttl, std::path::Path::new("/rqfix/pack-b"), ttl, &mut load);
+        assert_eq!(loads.get(), 3, "팩 디렉터리가 다르면 TTL 안이어도 새로 읽는다");
+        assert_eq!(other.0["n"], json!(3));
+        // 시계 역행(now < at)도 안전하다 — 신선한 것으로 본다(패닉·재읽기 폭주 없음).
+        let back = diag_defs_cached(&slot, t0, std::path::Path::new("/rqfix/pack-b"), ttl, &mut load);
+        assert_eq!(loads.get(), 3);
+        assert!(Arc::ptr_eq(&other, &back));
+    }
+
+    /// F4 — 좌석 진단의 어댑터 판독: **맨 셸(agent_meta 없음)은 0회**(읽기 전에 결측으로 접는다) · 마커 좌석은 1회. 진단 캐시 판(`seat_input_line_visibility`)도 같은 결과다.
+    #[test]
+    fn rqfix_f4_bare_shell_diag_reads_no_adapters() {
+        use std::cell::Cell;
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("rqfix-f4");
+        let (_daemon, s) = wp5_seat("rqfix-f4", "claude");
+        paint_prompt(&s, "", "");
+        let reads = Cell::new(0u32);
+        let provider = || {
+            reads.set(reads.get() + 1);
+            Arc::new(super::load_adapter_defs())
+        };
+        // 마커 좌석 — 읽고 관측한다.
+        assert_eq!(seat_input_line_visibility_with(&s, &provider), (Some(false), Some(false)));
+        assert_eq!(reads.get(), 1, "마커 좌석 진단은 정의를 1회 받는다");
+        // 맨 셸(에이전트 메타 없음) — 읽지 않는다.
+        *s.agent_meta.lock().unwrap() = None;
+        assert_eq!(seat_input_line_visibility_with(&s, &provider), (None, None));
+        assert_eq!(reads.get(), 1, "맨 셸 좌석 진단은 어댑터를 읽지 않는다(디스크 판독 0)");
+        assert_eq!(super::seat_input_line_visibility(&s), (None, None), "캐시 판도 같다");
+        // 캐시 판 — 같은 팩 디렉터리의 연속 진단은 전역 캐시를 공유한다(`Arc` 동일).
+        let c1 = diag_adapter_defs();
+        let c2 = diag_adapter_defs();
+        assert!(Arc::ptr_eq(&c1, &c2), "5초 안 연속 호출은 같은 정의를 돌려준다");
+    }
+
+    /// F4 소스 핀 — 진단 캐시(`diag_adapter_defs`)는 **진단 경로만** 쓴다: 게이트·배달 판정 경로(`prompt_gate_input`·`force_deliver_entry`·`deliver_queued`·`draft_gate`·
+    /// `seat_modal_foreground`·`seat_approval_live`·`maybe_reset_stale_pending_input`)와 handlers·schedule·alert_route 는 부르지 않는다(주석 제외). 캐시된 낡은 정의가 막힘/통과를 정하지 않는다.
+    /// 큐 틱 안의 기아 경보 진단은 캐시가 아니라 틱이 든 정의(`tick_defs`)를 넘겨 받는다.
+    #[test]
+    fn rqfix_diag_adapter_cache_is_not_used_by_gate_or_delivery_paths() {
+        let code_lines = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|l| l.contains("diag_adapter_defs") && !l.trim_start().starts_with("//"))
+                .map(|l| l.trim().to_string())
+                .collect()
+        };
+        let gov = include_str!("governance.rs");
+        let prod = &gov[..gov.find("#[cfg(test)]").expect("테스트 모듈 앵커")];
+        let lines = code_lines(prod);
+        let want = [
+            "pub(crate) fn diag_adapter_defs() -> Arc<(serde_json::Value, serde_json::Value)> {",
+            "seat_input_line_visibility_with(s, &diag_adapter_defs)",
+            "queue_block_diag_with(daemon, s, &diag_adapter_defs)",
+        ];
+        assert_eq!(lines, want, "진단 캐시 사용처는 정의 + 진단 래퍼 둘뿐이다: {lines:#?}");
+        for (name, text) in [
+            ("handlers", include_str!("handlers.rs")),
+            ("schedule", include_str!("schedule.rs")),
+            ("alert_route", include_str!("alert_route.rs")),
+            ("state", include_str!("state.rs")),
+        ] {
+            assert!(code_lines(text).is_empty(), "{name} 가 진단 캐시를 직접 쓴다: {:?}", code_lines(text));
+        }
+        // 틱: 기아 경보에 틱이 든 정의를 넘긴다(`&tick_defs`) — 캐시 판 호출이 없다.
+        let tick_start = prod.find("\nfn deliver_queued(").expect("deliver_queued");
+        let tick = &prod[tick_start..tick_start + prod[tick_start..].find("\n}\n").unwrap()];
+        assert!(tick.contains("alert_queue_starved_if_stalled(daemon, &s, starve_alerted, why, &head, head_wait, depth, &tick_defs)"), "틱 정의를 넘기지 않는다");
+        assert!(!tick.contains("queue_block_diag(") && !tick.contains("diag_adapter_defs"), "틱 안에서 진단 캐시 판을 부르면 틱당 1회 규약이 깨진다");
+        assert!(tick.contains("load_adapter_defs"), "틱의 판정 정의는 직접 읽는다(캐시 아님)");
+    }
+
+    /// F3 — 일시정지 중에는 틱이 좌석을 순회하지 않아 `queue_blocked` 가 갱신되지 않는다. 그래도 큐가 비어 있지 않은 살아 있는 좌석은 **행을 만들고**, 머리에
+    /// `daemon_paused` 가 선다. 해제하면 행이 사라지고 `daemon_paused:false` 로 다시 쓰인다(서명 변화). `restored_entries` 는 보존소에 주차된 항목 수다(I-9).
+    #[test]
+    fn rqfix_f3_blocked_file_lists_paused_seats_and_parked_entries() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("rqfix-f3");
+        let (daemon, s) = wp5_seat("rqfix-f3", "claude");
+        for i in 0..2 {
+            let e = daemon.next_queue_entry(format!("[보고] 동결 {i}"), None, "test");
+            s.pending_queue.lock().unwrap().push_back(e);
+        }
+        assert!(s.queue_blocked.lock().unwrap().is_none(), "전제: 기록된 사유가 없다(일시정지 중에는 틱이 사유를 갱신하지 않는다)");
+
+        // kill-switch 동결 — 틱은 좌석 순회 없이 돌아오지만 사유 파일은 쓴다.
+        daemon.paused.store(true, AtomicOrdering::Relaxed);
+        tick(&daemon);
+        let v = c5_read_blocked_file(&daemon);
+        assert_eq!(v["daemon_paused"], json!(true), "{v}");
+        assert_eq!(v["restored_entries"], json!(0), "{v}");
+        let rows = v["surfaces"].as_array().expect("surfaces");
+        assert_eq!(rows.len(), 1, "기록된 사유가 없어도 동결 좌석은 행이 있다: {v}");
+        let r = &rows[0];
+        assert_eq!(r["surface_id"], json!(s.id));
+        assert_eq!(r["blocked_by"], json!(super::BLOCKED_PAUSED_KILL_SWITCH), "{r}");
+        assert!(r["blocked_since"].is_null(), "사유 시작 시각이 없으면 null: {r}");
+        assert_eq!(r["depth"], json!(2));
+        assert_eq!(r["remedy_code"], json!("paused"));
+        // 같은 동결이 이어지면 다시 쓰지 않는다(서명 동일).
+        let saved = v["saved_at"].as_f64().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        tick(&daemon);
+        assert_eq!(c5_read_blocked_file(&daemon)["saved_at"].as_f64(), Some(saved), "동결이 같으면 재기록하지 않는다");
+
+        // 보존소 주차 건수 — 좌석이 없어 행으로 나오지 않는 정체를 머리 숫자로 드러낸다(서명 변화 → 재기록).
+        {
+            let mut parked = daemon.restored_queue.lock().unwrap();
+            for i in 0..3 {
+                parked.push(json!({"mid": format!("m{i}"), "role": "ghost-role", "text": "주차"}));
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        persist_queue_blocked_if_changed(&daemon);
+        let v = c5_read_blocked_file(&daemon);
+        assert_eq!(v["restored_entries"], json!(3), "restored_entries 는 주차 건수와 같다: {v}");
+        assert!(v["saved_at"].as_f64().unwrap() > saved, "보존소 건수 변화는 파일을 다시 쓰게 한다");
+        daemon.restored_queue.lock().unwrap().clear();
+
+        // 기록된 사유가 있으면 그 사유가 행의 blocked_by 다(동결이어도) · code 는 paused.
+        *s.queue_blocked.lock().unwrap() = Some((BLOCKED_BUSY.to_string(), 123.5));
+        persist_queue_blocked_if_changed(&daemon);
+        let v = c5_read_blocked_file(&daemon);
+        assert_eq!(v["restored_entries"], json!(0), "{v}");
+        let r = &v["surfaces"][0];
+        assert_eq!((r["blocked_by"].as_str(), r["blocked_since"].as_f64()), (Some(BLOCKED_BUSY), Some(123.5)), "{r}");
+        assert_eq!(r["remedy_code"], json!("paused"), "동결 중에는 기록된 사유가 busy 여도 처방은 paused: {r}");
+        *s.queue_blocked.lock().unwrap() = None;
+
+        // 해제 — 행이 사라지고 daemon_paused 가 내려간다(서명 변화로 재기록).
+        daemon.paused.store(false, AtomicOrdering::Relaxed);
+        persist_queue_blocked_if_changed(&daemon);
+        let v = c5_read_blocked_file(&daemon);
+        assert_eq!(v["daemon_paused"], json!(false), "{v}");
+        assert_eq!(v["surfaces"], json!([]), "해제 → 사유도 일시정지도 없는 좌석은 행이 없다: {v}");
+
+        // 좌석 큐 pause(헬스 조치)만 — 행이 생기고 사유 상수는 `queue_paused(헬스 조치)`(틱이 쓰는 문면과 같은 상수) · code paused · kill-switch 아님.
+        *s.queue_paused_until.lock().unwrap() = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        persist_queue_blocked_if_changed(&daemon);
+        let v = c5_read_blocked_file(&daemon);
+        assert_eq!(v["daemon_paused"], json!(false), "{v}");
+        let r = &v["surfaces"][0];
+        assert_eq!(r["blocked_by"], json!(super::BLOCKED_QUEUE_PAUSED), "{r}");
+        assert!(r["blocked_since"].is_null());
+        assert_eq!(r["remedy_code"], json!("paused"));
+        // 만료되면 행이 사라진다.
+        *s.queue_paused_until.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        persist_queue_blocked_if_changed(&daemon);
+        assert_eq!(c5_read_blocked_file(&daemon)["surfaces"], json!([]), "pause 만료 → 행 소멸");
+        // 빈 큐 좌석은 동결 중이어도 행이 없다.
+        s.pending_queue.lock().unwrap().clear();
+        daemon.paused.store(true, AtomicOrdering::Relaxed);
+        persist_queue_blocked_if_changed(&daemon);
+        assert_eq!(c5_read_blocked_file(&daemon)["surfaces"], json!([]), "큐가 비면 동결 좌석도 행이 아니다");
+    }
+
+    /// F3 서명 핀 — 동결·좌석 pause·보존소 건수는 서명에 들어간다(빠지면 그 변화가 파일에 반영되지 않는다).
+    #[test]
+    fn rqfix_f3_signature_carries_pause_and_parked_count() {
+        let sig = super::queue_blocked_sig;
+        let base = sig(&[], false, 0);
+        assert_ne!(base, sig(&[], true, 0), "kill-switch 변화가 서명에 없다");
+        assert_ne!(base, sig(&[], false, 1), "보존소 건수 변화가 서명에 없다");
+        assert_ne!(sig(&[], false, 1), sig(&[], false, 2));
+        assert_eq!(base, sig(&[], false, 0), "같은 입력은 같은 서명");
+    }
+
+    /// F3 — 사유가 **기록된** 좌석의 pause 가 켜지거나 풀리면 행(`blocked_by`·`blocked_since`)은 그대로여도 처방 코드가 달라진다(`wait` ↔ `paused`) — 좌석별 일시정지 여부가
+    /// 서명에 들어 있어야 파일이 다시 쓰인다(빠지면 pause 가 걸려도 낡은 `wait` 가 남는다 · 돌연변이 P2-F3b 가 이 검체의 존재 이유다).
+    #[test]
+    fn rqfix_f3_seat_pause_toggle_with_a_recorded_reason_rewrites_the_file() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("rqfix-f3-toggle");
+        let (daemon, s) = wp5_seat("rqfix-f3-toggle", "claude");
+        let e = daemon.next_queue_entry("[보고] pause 토글".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        *s.queue_blocked.lock().unwrap() = Some((BLOCKED_BUSY.to_string(), 50.0));
+        let row = |v: &Value| -> (Option<String>, Option<f64>, Option<String>) {
+            let r = &v["surfaces"][0];
+            (r["blocked_by"].as_str().map(str::to_string), r["blocked_since"].as_f64(), r["remedy_code"].as_str().map(str::to_string))
+        };
+        persist_queue_blocked_if_changed(&daemon);
+        let v1 = c5_read_blocked_file(&daemon);
+        assert_eq!(row(&v1), (Some(BLOCKED_BUSY.to_string()), Some(50.0), Some("wait".to_string())), "{v1}");
+        let saved1 = v1["saved_at"].as_f64().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // 좌석 pause 켜짐 — 사유·시각은 그대로인데 처방은 paused 가 된다 → 서명이 달라야 다시 쓴다.
+        *s.queue_paused_until.lock().unwrap() = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        persist_queue_blocked_if_changed(&daemon);
+        let v2 = c5_read_blocked_file(&daemon);
+        assert_eq!(row(&v2), (Some(BLOCKED_BUSY.to_string()), Some(50.0), Some("paused".to_string())), "{v2}");
+        assert!(v2["saved_at"].as_f64().unwrap() > saved1, "pause 가 걸렸는데 파일이 낡은 처방(wait)으로 남았다(좌석별 paused 가 서명에 없다)");
+        let saved2 = v2["saved_at"].as_f64().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        // 만료 — 다시 wait.
+        *s.queue_paused_until.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        persist_queue_blocked_if_changed(&daemon);
+        let v3 = c5_read_blocked_file(&daemon);
+        assert_eq!(row(&v3), (Some(BLOCKED_BUSY.to_string()), Some(50.0), Some("wait".to_string())), "{v3}");
+        assert!(v3["saved_at"].as_f64().unwrap() > saved2, "pause 가 풀렸는데 파일이 낡은 처방(paused)으로 남았다");
+    }
+
+    /// I-9 — 이 부트의 **첫 기록** 직전에 기존 파일이 있으면 `.prev.json` 으로 옮기고, **두 번째 기록에서는 옮기지 않는다**(한 부트에 한 번). 기존 파일이 없으면 보존본도 없다.
+    #[test]
+    fn rqfix_i9_first_write_of_a_boot_rotates_the_previous_file_exactly_once() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("cys-rqfix-i9-{}-{}", std::process::id(), now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(QUEUE_BLOCKED_FILE);
+        let prev = dir.join(super::QUEUE_BLOCKED_PREV_FILE);
+        let old = r#"{"v":1,"saved_at":2.0,"clock":"wall","surfaces":[{"surface_id":7,"blocked_by":"busy(출력 중)"}]}"#;
+        std::fs::write(&path, old).unwrap();
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        tick(&daemon); // 첫 기록
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), old, "첫 기록 직전에 직전 부트의 파일이 보존된다");
+        let first = c5_read_blocked_file(&daemon);
+        assert_eq!(first["surfaces"], json!([]));
+        // 두 번째 기록 — 보존본을 갈아치우지 않는다(이 부트가 쓴 파일이 직전 부트 파일을 덮어쓰면 보존의 의미가 없다).
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        daemon.queue_blocked_dirty.store(true, AtomicOrdering::Release);
+        persist_queue_blocked_if_changed(&daemon);
+        assert!(c5_read_blocked_file(&daemon)["saved_at"].as_f64().unwrap() > first["saved_at"].as_f64().unwrap(), "전제: 두 번째 기록이 일어났다");
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), old, "두 번째 기록은 보존본을 옮기지 않는다(한 부트에 한 번)");
+        // 기존 파일이 없던 부트 — 보존본도 없다.
+        let dir2 = std::env::temp_dir().join(format!("cys-rqfix-i9b-{}-{}", std::process::id(), now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir2);
+        let d2 = Daemon::new(dir2.join("cysd.sock"));
+        tick(&d2);
+        assert!(dir2.join(QUEUE_BLOCKED_FILE).exists() && !dir2.join(super::QUEUE_BLOCKED_PREV_FILE).exists(), "옮길 파일이 없으면 보존본을 만들지 않는다");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// I-1 — 쓰기 실패 억제의 순수 판정: 재시도 시각 전에는 도래하지 않고(경계 포함), 실패 로그는 오류 문구가 바뀌었거나 마지막 로그에서 60초가 지났을 때만 찍는다.
+    #[test]
+    fn rqfix_i1_retry_and_log_suppression_pure_rules() {
+        let t0 = std::time::Instant::now();
+        let s = |n: u64| std::time::Duration::from_secs(n);
+        assert!(super::queue_blocked_retry_due(None, t0), "억제 상태가 없으면 즉시 가능");
+        let due = Some(t0 + s(60));
+        assert!(!super::queue_blocked_retry_due(due, t0 + s(59)), "59초 안은 도래 전");
+        assert!(super::queue_blocked_retry_due(due, t0 + s(60)), "정확히 60초부터 도래");
+        assert!(super::queue_blocked_retry_due(due, t0 + s(61)));
+        let last = ("디스크 가득".to_string(), t0);
+        assert!(super::queue_blocked_err_should_log(None, "디스크 가득", t0), "처음은 찍는다");
+        assert!(!super::queue_blocked_err_should_log(Some(&last), "디스크 가득", t0 + s(59)), "같은 오류를 60초 안에 다시 찍지 않는다");
+        assert!(super::queue_blocked_err_should_log(Some(&last), "디스크 가득", t0 + s(60)), "60초가 지나면 같은 오류도 다시 찍는다");
+        assert!(super::queue_blocked_err_should_log(Some(&last), "권한 없음", t0 + s(1)), "오류 문구가 바뀌면 바로 찍는다");
+    }
+
+    /// 어휘 계약 — 허용 목록 13종 · 유령 처방 code 는 `phantom_count`(키 이름을 코드에서 뺐다) · 금지 접미의 **앞부분은 바이트 그대로**(GUI 가 이 접두로 꼬리를 뗀다) ·
+    /// GUI 어휘 대조가 읽는 두 선언의 꼴이 유지된다 · 유령 처방 접미의 정의처는 `src/lib.rs` 하나이며 제품 코드에 옛 코드 이름이 0건이다.
+    #[test]
+    fn rqfix_vocabulary_contract_for_codes_suffix_and_declarations() {
+        assert_eq!(QUEUE_REMEDY_CODES.len(), 13);
+        let uniq: std::collections::BTreeSet<&&str> = QUEUE_REMEDY_CODES.iter().collect();
+        assert_eq!(uniq.len(), 13, "중복 없음");
+        assert!(QUEUE_REMEDY_CODES.iter().all(|c| !c.contains("ctrl_u") && !c.contains("Ctrl")), "코드 이름이 누를 키를 말하지 않는다(I-5)");
+        for code in ["paused", "machine_residue", "phantom_count", "after_cursor_text", "human_draft", "input_pending_unknown", "answer_modal", "approval", "alt_screen", "empty_seat", "prompt_unknown", "wait", "unknown"] {
+            assert!(QUEUE_REMEDY_CODES.contains(&code), "{code}");
+        }
+        assert!(
+            REMEDY_LLM_SUFFIX.starts_with(" · LLM 에이전트는 자동 조치("),
+            "GUI(starvednotice.ts STARVED_LLM_TAIL)가 이 접두로 꼬리를 뗀다 — 바이트 그대로: {REMEDY_LLM_SUFFIX:?}"
+        );
+        assert_eq!(REMEDY_LLM_SUFFIX, " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지");
+        assert_eq!(GHOST_CTRL_U_SUFFIX, cys::GHOST_CTRL_U_SUFFIX, "한 정의처(src/lib.rs) — 데몬과 CLI 가 같은 문자열을 쓴다");
+        // GUI 어휘 대조(`ui/src/starvednotice.test.ts`)가 소스에서 읽는 두 선언의 꼴 — 같은 문법으로 파싱해 본다.
+        let src = include_str!("governance.rs");
+        let decl = "const QUEUE_REMEDY_CODES: [&str; 13] = [";
+        let a = src.find(decl).expect("선언 꼴(const QUEUE_REMEDY_CODES: [&str; 13] = [) 소실 — GUI 어휘 대조가 파싱하지 못한다") + decl.len();
+        let body = &src[a..a + src[a..].find("];").expect("배열 끝")];
+        assert!(!body.contains(']'), "배열 안에 닫는 대괄호가 있으면 GUI 정규식이 잘린다");
+        let parsed: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
+        assert_eq!(parsed, QUEUE_REMEDY_CODES.to_vec(), "선언 파싱 결과와 상수가 다르다");
+        let sd = "const REMEDY_LLM_SUFFIX: &str = \"";
+        let b = src.find(sd).expect("REMEDY_LLM_SUFFIX 선언 꼴 소실") + sd.len();
+        assert_eq!(&src[b..b + src[b..].find("\";").expect("닫는 따옴표")], REMEDY_LLM_SUFFIX, "한 줄 문자열 선언 꼴 유지(GUI 가 정규식으로 읽는다)");
+        // 제품 코드에 옛 코드 이름 0건(테스트 모듈 이전 구간).
+        for (name, text) in [
+            ("governance", src),
+            ("handlers", include_str!("handlers.rs")),
+            ("state", include_str!("state.rs")),
+            ("alert_route", include_str!("alert_route.rs")),
+            ("schedule", include_str!("schedule.rs")),
+        ] {
+            let prod = &text[..text.find("#[cfg(test)]").unwrap_or(text.len())];
+            let hits: Vec<&str> = prod.lines().filter(|l| l.contains("phantom_count_ctrl_u")).collect();
+            assert!(hits.is_empty(), "{name} 제품 구간에 옛 코드 이름이 남았다(주석 포함 0건): {hits:?}");
+        }
+    }
+
+    /// F3 — 일시정지 처방은 화면을 읽지 않는 순수 표(`paused_queue_remedy`)로도 나가며 표의 1·2행과 같은 문장이다. 일시정지가 아니면 `None`.
+    #[test]
+    fn rqfix_paused_queue_remedy_matches_table_rows_one_and_two() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("rqfix-paused-remedy");
+        let (daemon, s) = wp5_seat("rqfix-paused-remedy", "claude");
+        assert!(super::paused_queue_remedy(&daemon, &s).is_none(), "일시정지가 아니면 없다");
+        *s.queue_paused_until.lock().unwrap() = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let (code, seat_text) = super::paused_queue_remedy(&daemon, &s).expect("좌석 pause");
+        let mut sp = c5_diag(0, 0, None);
+        sp.paused = true;
+        assert_eq!((code, seat_text.clone()), (queue_remedy(BLOCKED_BUSY, &sp).0, queue_remedy(BLOCKED_BUSY, &sp).1), "표 2행과 같은 문장");
+        assert!(!seat_text.contains("kill-switch"), "{seat_text}");
+        daemon.paused.store(true, AtomicOrdering::Relaxed);
+        let (code, ks_text) = super::paused_queue_remedy(&daemon, &s).expect("kill-switch");
+        let mut ks = c5_diag(0, 0, None);
+        ks.paused = true;
+        ks.kill_switch = true;
+        assert_eq!((code, ks_text.clone()), (queue_remedy(BLOCKED_BUSY, &ks).0, queue_remedy(BLOCKED_BUSY, &ks).1), "표 1행과 같은 문장");
+        assert!(ks_text.contains("해제는 오너(사람)가 한다"), "{ks_text}");
+        assert_ne!(seat_text, ks_text, "좌석 pause 와 kill-switch 문장은 다르다(F8)");
     }
 }
 

@@ -1342,8 +1342,8 @@ fn summary_value_is_machine(k: &str, v: &str) -> bool {
     {
         return true;
     }
-    // ★(0.14.43 · C5) `remedy` 는 허용 목록(열거형) 정확 일치만 기계값이다 — 복원된 요약도 같은 문법을 지난다(`phantom_count_ctrl_u` 는
-    //   마디가 넷이라 `safe_identity` 로는 못 지나므로 별도 열거 검사).
+    // ★(0.14.43 · C5) `remedy` 는 허용 목록(열거형) 정확 일치만 기계값이다 — 복원된 요약도 같은 문법을 지난다(`input_pending_unknown`·`after_cursor_text` 는
+    //   마디가 셋이라 `safe_identity`(마디 ≤ 2)로는 못 지나므로 별도 열거 검사). 목록은 13종(RQFIX · 유령 계수 코드는 `phantom_count` — 옛 이름은 키 이름을 품고 있어 개명).
     if k == "remedy" {
         return crate::governance::QUEUE_REMEDY_CODES.contains(&v);
     }
@@ -5924,10 +5924,10 @@ mod pure_tests {
         let diag = c5_diag(None);
         let payload =
             crate::state::queue_starved_payload("surface:9", Some("worker".into()), &head, 120, 3, "empty_seat", &diag);
-        // ★(0.14.43 · C5) 끝에 ` remedy=<code>` 가 붙는다 — `empty_seat` 는 조치 표의 어느 행에도 들지 않아 `unknown`.
+        // ★(0.14.43 · C5 · RQFIX) 끝에 ` remedy=<code>` 가 붙는다 — `empty_seat` 는 처방 표 13행(`empty_seat`)이다(종전 `unknown` 에서 승격).
         assert_eq!(
             summarize_payload("queue.starved", &payload),
-            "depth=3 head_wait=120s blocked_by=empty_seat remedy=unknown",
+            "depth=3 head_wait=120s blocked_by=empty_seat remedy=empty_seat",
             "발행자의 waited_secs 를 읽지 못해 대기시간이 사라졌다"
         );
         // 운영자 안내 문장(hint)은 절대 요약에 실리지 않는다(자유 문장 = 지시로 읽힌다).
@@ -5936,20 +5936,25 @@ mod pure_tests {
 
     // ─── ★(0.14.43 · C5) queue.starved 요약의 `remedy=<code>` — 허용 목록 열거형만 ─────────────────────────
 
-    /// 진단 스냅샷 픽스처 — 계수 1(사람 1) · v3.
+    /// 진단 스냅샷 픽스처 — 계수 1(사람 1) · v3. `ghost_after_cursor` 는 기본 `Some(true)`(`c5_diag_ga` 로 바꾼다).
     fn c5_diag(draft_visible: Option<bool>) -> crate::governance::QueueBlockDiag {
+        c5_diag_ga(draft_visible, Some(true))
+    }
+
+    fn c5_diag_ga(draft_visible: Option<bool>, ghost_after_cursor: Option<bool>) -> crate::governance::QueueBlockDiag {
         crate::governance::QueueBlockDiag {
             pending_input_bytes: 1,
             pending_input_human_bytes: 1,
             draft_visible,
-            ghost_after_cursor: Some(true),
+            ghost_after_cursor,
             parser_panics: 0,
             paused: false,
+            kill_switch: false,
             input_model: "v3",
         }
     }
 
-    /// 발행자가 실제로 내는 payload(`queue_starved_payload`)의 요약에 `remedy=<code>` 가 붙는다 — 허용 목록 10종 전부.
+    /// 발행자가 실제로 내는 payload(`queue_starved_payload`)의 요약에 `remedy=<code>` 가 붙는다 — 허용 목록 13종 전부.
     /// `remedy` 문장·`hint`·진단 필드는 요약에 실리지 않는다(pane stdin 으로 가는 문안 — 자유 문자열 금지).
     #[test]
     fn c5_queue_starved_summary_appends_remedy_code_only() {
@@ -5959,14 +5964,17 @@ mod pure_tests {
         .expect("QueueEntry 역직렬화");
         // 사유별로 서로 다른 code 를 내는 대표 입력 — (blocked_by, 진단 조정, 기대 code)
         let blocked = crate::governance::BLOCKED_INPUT_PENDING;
-        let cases: [(&str, bool, Option<bool>, &str); 4] = [
-            (blocked, false, Some(false), "phantom_count_ctrl_u"),
-            (blocked, false, Some(true), "human_draft"),
-            (crate::governance::BLOCKED_MODAL, false, None, "answer_modal"),
-            (crate::governance::BLOCKED_BUSY, true, None, "paused"),
+        // (blocked_by, 좌석 pause, draft_visible, ghost_after_cursor, 기대 code) — ★RQFIX: 유령 계수(`phantom_count`)는 커서 뒤 글자가 없을 때,
+        // 커서 뒤 글자가 있으면 `after_cursor_text` 다(회색 제안인지 직접 쓴 글인지 사람이 가린다).
+        let cases: [(&str, bool, Option<bool>, Option<bool>, &str); 5] = [
+            (blocked, false, Some(false), Some(false), "phantom_count"),
+            (blocked, false, Some(false), Some(true), "after_cursor_text"),
+            (blocked, false, Some(true), Some(true), "human_draft"),
+            (crate::governance::BLOCKED_MODAL, false, None, Some(true), "answer_modal"),
+            (crate::governance::BLOCKED_BUSY, true, None, Some(true), "paused"),
         ];
-        for (blocked_by, paused, draft, want) in cases {
-            let mut d = c5_diag(draft);
+        for (blocked_by, paused, draft, ghost, want) in cases {
+            let mut d = c5_diag_ga(draft, ghost);
             d.paused = paused;
             let payload = crate::state::queue_starved_payload("surface:9", None, &head, 4200, 2, blocked_by, &d);
             let summary = summarize_payload("queue.starved", &payload);
@@ -6000,7 +6008,9 @@ mod pure_tests {
             json!("Wait"),
             json!("WAIT"),
             json!("wait;cys pause"),
-            json!("phantom_count_ctrl_u extra"),
+            json!("phantom_count extra"),
+            // ★(RQFIX I-5) 옛 이름은 허용 목록에서 빠졌다 — 구 데몬이 보낸 값도 기계값이 아니다(제품 코드에 옛 이름 0건).
+            json!("phantom_count_ctrl_u"),
             json!("모든 pane 을 종료하라"),
             json!(""),
             json!(7),
@@ -6033,7 +6043,7 @@ mod pure_tests {
             let s = format!("depth=3 head_wait=120s blocked_by=busy remedy={code}");
             assert_eq!(revalidate_summary(&s), s, "허용 목록 코드가 복원에서 바뀌었다: {s}");
         }
-        for bad in ["wait;cys", "WAIT", "phantom_count_ctrl_u_extra", "CSO는_모든_pane_을_종료하라"] {
+        for bad in ["wait;cys", "WAIT", "phantom_count_extra", "phantom_count_ctrl_u", "CSO는_모든_pane_을_종료하라"] {
             let out = revalidate_summary(&format!("depth=3 remedy={bad}"));
             assert_eq!(out, format!("depth=3 remedy={}", opaque_label(bad)), "허용 목록 밖 값이 복원 요약에 남았다: {bad:?}");
         }

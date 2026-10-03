@@ -271,3 +271,100 @@ describe("재기동 실패 — 데몬 거부를 한국어 처방으로 낸다", 
     expect(body).toContain("restartInvokeFailureReason(");
   });
 });
+
+// ★(0.14.43 · RQFIX F12 · I6 감사 N1) 데몬 거부 세 갈래 번역 — 모달 · 정착 창 · 유령 계수 처방. 셋 다 문면에 `draft_gate` 가 붙어 있어 일반 초안 게이트 분기보다 **앞**에서 잡아야 한다.
+// 거부 문면은 손으로 옮긴 리터럴이 아니라 **데몬 소스의 상수·리터럴에서 조립**한다 — 상수가 바뀌면 이 검체가 적색이 된다(번역이 조용히 죽지 않는다).
+describe("재기동 실패 — 데몬 거부 세 갈래(모달·정착 창·유령 계수 처방) 번역", () => {
+  const lib = readFileSync(new URL("../../src/lib.rs", import.meta.url), "utf-8");
+  const governance = readFileSync(new URL("../../src/bin/cysd/governance.rs", import.meta.url), "utf-8");
+  const handlers = readFileSync(new URL("../../src/bin/cysd/handlers.rs", import.meta.url), "utf-8");
+  const constOf = (name: string): string => {
+    const line = lib.split("\n").find((l) => l.trimStart().startsWith(`pub const ${name}: &str = "`));
+    if (!line) throw new Error(`src/lib.rs 에 ${name} 정의가 없다 — 거부 문면의 정의처가 사라졌다`);
+    return line.slice(line.indexOf('"') + 1, line.lastIndexOf('"'));
+  };
+  // 사유 태그 `[draft_gate:<why>]` 의 why 문자열 — governance.rs `DraftGateDenied::as_str()` 의 리터럴.
+  const whyOf = (variant: string): string => {
+    const m = governance.match(new RegExp(`Self::${variant}(?: \\{ \\.\\. \\})? => "([a-z_]+)"`));
+    if (!m) throw new Error(`governance.rs DraftGateDenied::as_str() 에 ${variant} 가 없다`);
+    return m[1];
+  };
+  const errTyping = constOf("ERR_TYPING_GUARD");
+  const msgTyping = constOf("MSG_TYPING_GUARD");
+  const draftTag = constOf("DRAFT_GATE_TAG");
+  const settleTag = constOf("SEND_SETTLE_TAG");
+  const ghostSuffix = constOf("GHOST_CTRL_U_SUFFIX");
+  const MODAL = `${errTyping}: ${msgTyping} [${draftTag}:${whyOf("Modal")}]`;
+  const SETTLE = `${errTyping}: ${msgTyping} [${draftTag}:${whyOf("SubmitSettling")}] [${settleTag}:120]`;
+  const GHOST = `${errTyping}: ${msgTyping} [${draftTag}:${whyOf("PendingInput")}]${ghostSuffix}`;
+  const MODAL_REASON = "질문·선택 창이 떠 있어 보류했습니다 — 그 창을 먼저 처리한 뒤 재시도";
+  const SETTLE_REASON = "직전 제출이 처리되는 중이라 보류했습니다 — 잠시 뒤 다시 시도";
+  const GHOST_REASON =
+    "입력줄에 미제출 입력이 있다고 계수돼 보류했습니다 — 입력줄이 비어 보이면 그 창을 클릭하고 Ctrl-U 를 한 번 누른 뒤 재시도(글이 있으면 제출하거나 지운다)";
+
+  for (const { label, error, reason } of [
+    { label: "모달 태그 → 그 창을 먼저 처리", error: MODAL, reason: MODAL_REASON },
+    { label: "정착 창 태그(제출 처리 중) → 잠시 뒤 재시도", error: SETTLE, reason: SETTLE_REASON },
+    { label: "유령 처방 접미 → 입력줄이 비어 보이면 Ctrl-U", error: GHOST, reason: GHOST_REASON },
+  ]) {
+    for (const withCode of [true, false]) {
+      test(`${label} — ${withCode ? "코드 포함" : "코드가 유실된 message만"}`, () => {
+        const text = withCode ? error : error.slice(error.indexOf(": ") + 2);
+        for (const err of [text, new Error(text)]) {
+          expect(restartInvokeFailureReason(err)).toBe(reason);
+        }
+      });
+    }
+  }
+
+  test("정착 증명 태그만 있는 거부(사유 태그 없음)와 사유 태그만 있는 거부(증명 없음)도 정착 창으로 번역한다", () => {
+    expect(restartInvokeFailureReason(`${errTyping}: ${msgTyping} [${draftTag}:pending_input] [${settleTag}:80]`)).toBe(SETTLE_REASON);
+    expect(restartInvokeFailureReason(`${errTyping}: ${msgTyping} [${draftTag}:${whyOf("SubmitSettling")}]`)).toBe(SETTLE_REASON);
+  });
+
+  test("세 갈래는 일반 초안 게이트 분기보다 앞이다 — 일반 분기 문구로 덮이지 않는다", () => {
+    const generic = restartInvokeFailureReason(`${errTyping}: ${msgTyping} [${draftTag}:pending_input]`);
+    expect(generic).toBe("대상 입력줄에 미제출 입력이 있어 보류했습니다 — 해당 pane 에서 초안을 제출·삭제한 뒤 재시도");
+    for (const e of [MODAL, SETTLE, GHOST]) {
+      expect(restartInvokeFailureReason(e)).not.toBe(generic);
+      expect(e).toContain(draftTag); // 세 문면 모두 일반 분기의 조건(`draft_gate`)도 만족한다 — 앞에서 잡지 않으면 덮인다
+    }
+    // 소스 순서 핀: 번역기 안에서 세 갈래 조건이 일반 분기 조건보다 먼저 나온다.
+    const src = readFileSync(new URL("./restartplan.ts", import.meta.url), "utf-8");
+    const body = src.slice(src.indexOf("export function restartInvokeFailureReason"));
+    const generalAt = body.indexOf('text.includes("draft_gate") || text.includes("pending_input")');
+    expect(generalAt).toBeGreaterThan(0);
+    for (const cond of ['text.includes("draft_gate:modal")', 'text.includes("[settle:")', 'text.includes("입력줄이 비어 보이면 유령 계수다")']) {
+      const at = body.indexOf(cond);
+      expect({ cond, at: at >= 0 }).toEqual({ cond, at: true });
+      expect(at).toBeLessThan(generalAt);
+    }
+  });
+
+  test("번역 조건 구절이 데몬 소스의 실제 문면 안에 있다 — 상수가 바뀌면 이 검체가 적색이다", () => {
+    // 모달: `[draft_gate:modal]` — 번역기 조건 `draft_gate:modal` 이 DRAFT_GATE_TAG + `:` + DraftGateDenied::Modal 의 as_str() 와 같다.
+    expect(`${draftTag}:${whyOf("Modal")}`).toBe("draft_gate:modal");
+    // 정착 창: ` [settle:<ms>]` · 사유 `submit_settling` — 번역기 조건 `[settle:` 과 `draft_gate:submit_settling`.
+    expect(`[${settleTag}:`).toBe("[settle:");
+    expect(`${draftTag}:${whyOf("SubmitSettling")}`).toBe("draft_gate:submit_settling");
+    // 유령 처방: 번역기 조건 구절이 접미 상수 안에 있다(접미는 `cys` CLI 도 같은 상수로 stderr 처방을 찍는다 · I-8).
+    expect(ghostSuffix).toContain("입력줄이 비어 보이면 유령 계수다");
+    expect(ghostSuffix).toContain("Ctrl-U");
+    // 데몬이 실제로 모달 거부를 이 사유 이름으로 만든다(handlers 가 DraftGateDenied::Modal 을 응답으로 낸다).
+    expect(handlers).toContain("DraftGateDenied::Modal");
+    // 데몬 쪽 접미 정의처가 lib.rs 하나다 — governance.rs 는 재노출만 하고 리터럴을 따로 두지 않는다.
+    expect(governance).toContain("pub(crate) use cys::GHOST_CTRL_U_SUFFIX;");
+    expect(governance.match(/pub(\(crate\))? const GHOST_CTRL_U_SUFFIX/g)).toBeNull();
+  });
+
+  test("종전 갈래는 그대로다 — 초안 게이트 일반 · 타이핑 가드 · clear_first 미지원 · 원문 보존", () => {
+    expect(restartInvokeFailureReason(PROD_DRAFT_GATE)).toBe(
+      "대상 입력줄에 미제출 입력이 있어 보류했습니다 — 해당 pane 에서 초안을 제출·삭제한 뒤 재시도",
+    );
+    expect(restartInvokeFailureReason(PROD_TYPING_GUARD)).toBe("대상 pane 에 사람 입력이 감지돼 보류했습니다 — 잠시 뒤 재시도");
+    expect(restartInvokeFailureReason(PROD_CLEAR_FIRST_UNSUPPORTED)).toBe(
+      "이 좌석은 launch-agent 등록이 없어 자동 정리를 못 합니다 — 해당 pane 에서 Ctrl-U 후 재시도",
+    );
+    expect(restartInvokeFailureReason("daemon unreachable")).toBe("daemon unreachable");
+  });
+});

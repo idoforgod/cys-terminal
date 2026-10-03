@@ -654,6 +654,10 @@ pub const ERR_TYPING_GUARD: &str = "typing_guard";
 pub const MSG_TYPING_GUARD: &str = "human is typing in this pane; retry later or use --queued";
 /// 직접 send 초안 거부의 사유 태그 — 기존 타이핑 가드 메시지 접두 뒤에 붙인다.
 pub const DRAFT_GATE_TAG: &str = "draft_gate";
+/// ★(0.14.43 · C5 · RQFIX I-8) 유령 계수 처방 — 데몬이 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙이고(앞 문구·접두·태그의 위치·바이트는 불변),
+/// `cys` CLI 가 `--queued` 폴백 안내 뒤에 같은 문자열로 stderr 처방 줄을 찍는다. 두 크레이트가 **이 한 정의처**만 쓴다(리터럴을 따로 들면 문구를 다듬는 순간
+/// CLI 의 처방 줄이 조용히 죽는다 — 위 `MSG_TYPING_GUARD` 와 같은 RC1 계약). 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다).
+pub const GHOST_CTRL_U_SUFFIX: &str = " — 입력줄이 비어 보이면 유령 계수다: 그 창에서 사람이 Ctrl-U 한 번";
 /// D-12 CancelKey(원시 Ctrl-U/Ctrl-C) 거부 문구 — `MSG_TYPING_GUARD` 와 달리 `--queued` 를
 /// 안내하지 않는다: 취소 키는 텍스트 큐에 실을 수 없어(send_key queued 는 Return/Enter 한정)
 /// 그 처방은 존재하지 않는 경로를 가리킨다(수정 라운드 3 · 감사 minor). 코드는 `ERR_TYPING_GUARD` 를 유지한다.
