@@ -1,0 +1,7 @@
+cmd: C:\Windows\System32\CiTool.exe --update-policy "C:\a\_temp\diag-work\sacpol\enforce\{05816C37-6C90-4734-8C14-A44FD3B17EC2}.cip"
+rc=0 timedOut=False ms=255 startError= pipes_not_drained=False
+--- stdout ---
+Operation Successful
+Press Enter to Continue
+
+

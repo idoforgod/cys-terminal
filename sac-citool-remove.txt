@@ -1,0 +1,7 @@
+cmd: C:\Windows\System32\CiTool.exe --remove-policy "{05816C37-6C90-4734-8C14-A44FD3B17EC2}"
+rc=0 timedOut=False ms=243 startError= pipes_not_drained=False
+--- stdout ---
+Operation Successful
+Press Enter to Continue
+
+
