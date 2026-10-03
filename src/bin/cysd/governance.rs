@@ -6634,6 +6634,47 @@ pub(crate) enum InputOrigin {
 /// 미종결 봉투 해제 TTL(초) — OPEN 뒤 이 시간이 지난 새 청크는 봉투 밖으로 본다.
 pub(crate) const PASTE_OPEN_TTL_SECS: u64 = 5;
 
+/// ★(0.14.43 · C2 · 오너 결재 A안) 미제출 입력 **계수 모델** — [`pending_input_step_model`] 의 노브.
+///
+/// 두 모델은 봉투 **밖** 세그먼트 한 갈래만 다르다(나머지 규칙은 바이트 단위로 같다).
+///   · `V2` — 종전(0.14.39~0.14.42). 단독 Esc·DEL/BS 도 길이만큼 계수에 더한다.
+///   · `V3` — 단독 ESC(0x1b 정확히 1바이트)이거나 DEL/BS(0x7f·0x08)만으로 이뤄진 세그먼트는 계수에 더하지 않는다.
+/// 기본값은 [`PendingInputModel::os_default`] — unix 는 `V3`, 윈도우는 실기 확인 전이라 종전 `V2` 를 유지한다.
+/// env `CYS_PENDING_INPUT_MODEL`(`v2`/`v3`)로 프로세스 시작 때 한 번 덮어쓴다([`PendingInputModel::current`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PendingInputModel {
+    V2,
+    V3,
+}
+
+impl PendingInputModel {
+    /// OS 별 기본 모델 — 윈도우는 `V2`(실기 확인 전 종전 유지), 그 밖은 `V3`. 런타임 분기(`cfg!`)다.
+    pub(crate) fn os_default() -> Self {
+        if cfg!(windows) {
+            PendingInputModel::V2
+        } else {
+            PendingInputModel::V3
+        }
+    }
+
+    /// env 값 해석(순수) — `v2`/`v3`(대소문자·앞뒤 공백 무시). 그 밖·부재는 [`Self::os_default`].
+    pub(crate) fn from_env_value(v: Option<&str>) -> Self {
+        match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("v2") => PendingInputModel::V2,
+            Some("v3") => PendingInputModel::V3,
+            _ => Self::os_default(),
+        }
+    }
+
+    /// 이 프로세스의 모델 — env `CYS_PENDING_INPUT_MODEL` 을 **프로세스 수명 1회** 판독한다(이후 env 변경은 무시).
+    pub(crate) fn current() -> Self {
+        static MODEL: std::sync::OnceLock<PendingInputModel> = std::sync::OnceLock::new();
+        *MODEL.get_or_init(|| {
+            Self::from_env_value(std::env::var("CYS_PENDING_INPUT_MODEL").ok().as_deref())
+        })
+    }
+}
+
 /// ★(0.14.39 · WP-C-input) 미제출 입력 청크의 순수 전이 — 계수 규칙의 단일 정의처.
 ///
 /// 괄호붙여넣기 OPEN/CLOSE 각 6바이트는 본문이 아니므로 제외한다. 종전에는 끝 개행 뒤
@@ -6664,14 +6705,41 @@ pub(crate) const PASTE_OPEN_TTL_SECS: u64 = 5;
 /// 보인다(`in_paste` 는 진단 키로만 나가고 `input_line_state`·`draft_gate_verdict` 어디서도 읽지 않는다).
 /// 이 창의 봉투 상태는 OPEN 뒤 5초 TTL 이 지난 다음 청크에서 해제된다. 제품 호출자(GUI
 /// `term.onData` 1회 전달)는 봉투를 분할하지 않으므로 실경로가 아니다.
-/// 단독 Esc 키(0x1b)는 1바이트 초안으로 남는다 — 빈 줄에서 슬래시 메뉴 닫기·턴 중단으로
-/// Esc 한 번만 눌러도 CR·Ctrl-C/U 또는 stale 리셋(빈 화면+정적 5초)까지 Occupied 로 보인다.
-/// fail-closed 이고 base 와 같은 거동이지만, D-12 이후 그 좌석행 직접 send·Return 이 거부된다.
+///
+/// ★(0.14.43 · C2 · 오너 결재 A안) **단독 Esc·BS/DEL 은 모델([`PendingInputModel`])에 따라 다르다** — 이 문단만 갈린다.
+///   · V2(종전 · 윈도우 기본): 단독 Esc 키(0x1b)는 1바이트 초안으로 남는다 — 빈 줄에서 슬래시 메뉴 닫기·턴 중단으로
+///     Esc 한 번만 눌러도 CR·Ctrl-C/U 또는 stale 리셋(빈 화면+정적 5초)까지 Occupied 로 보인다.
+///     fail-closed 이고 base 와 같은 거동이지만, D-12 이후 그 좌석행 직접 send·Return 이 거부된다.
+///     Backspace(0x7f·0x08)도 길이만큼 가산한다. Claude Code 입력 추천(커서 뒤 고스트)이 떠 있으면 stale 리셋
+///     (`maybe_reset_stale_pending_input` — 커서 앞·뒤 모두 빈 줄이어야 발동)이 불발해 그 좌석의 큐 배달·강제 배달·
+///     직접 send 가 전부 `input_pending` 으로 거부된다.
+///   · V3(unix 기본): 봉투 **밖** 세그먼트가 단독 ESC(0x1b 정확히 1바이트)이거나 0x7f·0x08 만으로 이뤄졌으면
+///     count·human 에 더하지 않는다 — 순수 자동응답 면제와 같은 `continue` 이며 **리셋도 감산도 아니다**.
+///     출처(사람·기계)와 무관하다. Esc·BS·DEL 은 글자를 줄에 남기지 못하는 키라 이 세그먼트가 새 초안을 만들지 않는다.
+///     글자를 넣을 수 있는 키(Tab·화살표 CSI·Ctrl-Y·그 밖 제어키)와 `ESC ESC`·`ESC DEL`(Meta-Backspace)·
+///     글자+BS 한 세그먼트는 종전처럼 길이만큼 센다. 봉투 **안**·이월·Meta-Enter·리셋(CR/LF/^U/^C) 규칙은 무변경이다.
+///     불변식 "계수 ≥ 화면에 보이는 미제출 글자 수" 를 지키려고 **감산은 하지 않는다**('abc' 뒤 BS×3 → 3 그대로 ·
+///     과소 계수 = 초안 위 오주입 방향이라 만들지 않는다). 잔여 틈: 글자를 치고 전부 지운 줄은 계수가 남는다
+///     (D-02 · `qs_a2_*` RED 자산은 그대로 보류).
+///
+/// 이 함수는 [`PendingInputModel::current`] 로 [`pending_input_step_model`] 에 위임하는 얇은 래퍼다(호출처 무수정).
 pub(crate) fn pending_input_step(
     prev: &PendingInputState,
     chunk: &[u8],
     origin: InputOrigin,
     now: std::time::Instant,
+) -> PendingInputState {
+    pending_input_step_model(prev, chunk, origin, now, PendingInputModel::current())
+}
+
+/// [`pending_input_step`] 의 **본체** — 계수 모델을 명시한다(검체는 OS·env 와 무관하게 모델을 못박는다).
+/// 규칙 설명은 [`pending_input_step`] 의 머리 주석이 정본이다.
+pub(crate) fn pending_input_step_model(
+    prev: &PendingInputState,
+    chunk: &[u8],
+    origin: InputOrigin,
+    now: std::time::Instant,
+    model: PendingInputModel,
 ) -> PendingInputState {
     const OPEN: &[u8] = b"\x1b[200~";
     const CLOSE: &[u8] = b"\x1b[201~";
@@ -6741,6 +6809,14 @@ pub(crate) fn pending_input_step(
                 .map(cys::mousereport::is_pure_terminal_autoreply)
                 .unwrap_or(false)
             {
+                continue;
+            }
+            // ★(0.14.43 · C2) V3 — 단독 ESC(정확히 1바이트)이거나 0x7f·0x08 만인 세그먼트는 글자를 남기지
+            //   못하는 키라 계수에 더하지 않는다. 자동응답 면제와 같은 `continue`(리셋·감산 아님 · 출처 무관).
+            //   `ESC ESC`·`ESC DEL`·`a DEL`·화살표 CSI·Tab·Ctrl-Y 는 여기에 걸리지 않아 종전대로 센다.
+            let lone_esc = seg == [0x1b];
+            let only_bs_del = !seg.is_empty() && seg.iter().all(|&b| matches!(b, 0x7f | 0x08));
+            if model == PendingInputModel::V3 && (lone_esc || only_bs_del) {
                 continue;
             }
             // carried 가드는 현재 봉투 밖 하한 2 아래에서는 도달 불가다(tail 의 끝은 ESC 가 아님).
@@ -13514,14 +13590,19 @@ mod tests {
     // 청크 계약: 핸들러는 RPC 1회당 `apply_pending_input` 으로 `pending_input_step` 을 **1번** 부른다
     // (handlers.rs:4422 send_text · :4634 send_key). 그래서 '호출 N번' 은 fold N번으로 모사한다.
 
-    /// 호출 1회 = 1청크. 단계별 계수를 돌려준다(마지막 원소가 최종 계수).
+    // ★(0.14.43 · C2) 아래 `v7_*`·`v2_*` 도우미와 직접 호출 검체는 **모델을 V2 로 못박는다** — 기본 모델(unix V3 ·
+    // 윈도우 V2)이 OS 마다 다른 값을 내지 않게, 종전 v2 기대값(6·1 등)을 OS 와 무관하게 그대로 지킨다. V3 는 `v3_*` 가 잰다.
+    use super::{pending_input_step_model, PendingInputModel};
+
+    /// 호출 1회 = 1청크. 단계별 계수를 돌려준다(마지막 원소가 최종 계수). 모델은 V2 명시(위 주석).
     fn v7_steps(prev: u64, chunks: &[&[u8]]) -> Vec<u64> {
         let mut state = PendingInputState { count: prev, human: prev, ..Default::default() };
         let now = std::time::Instant::now();
         chunks
             .iter()
             .map(|c| {
-                state = super::pending_input_step(&state, c, InputOrigin::Human, now);
+                state =
+                    pending_input_step_model(&state, c, InputOrigin::Human, now, PendingInputModel::V2);
                 state.count
             })
             .collect()
@@ -13535,11 +13616,12 @@ mod tests {
     fn v2_run(chunks: &[(&[u8], InputOrigin, u64 /* now 오프셋 초 */)]) -> PendingInputState {
         let now = std::time::Instant::now();
         chunks.iter().fold(PendingInputState::default(), |state, (chunk, origin, offset)| {
-            super::pending_input_step(
+            pending_input_step_model(
                 &state,
                 chunk,
                 *origin,
                 now + std::time::Duration::from_secs(*offset),
+                PendingInputModel::V2,
             )
         })
     }
@@ -13611,7 +13693,7 @@ mod tests {
 
     /// RED(문서 기대): 사람이 "abc" 를 치고 Backspace 3회 → 입력줄은 비었다 → 기대 0.
     #[test]
-    #[ignore = "D-02 보류(P3 · 설계 §5): 가산은 의도된 fail-closed 이고 계수는 >0 불리언으로만 쓰인다. v2 출하 후 stale_bytes 분포를 보고 재판단 — 검체는 RED 자산으로 보존한다"]
+    #[ignore = "D-02 보류(P3 · 설계 §5): 가산은 의도된 fail-closed 이고 계수는 >0 불리언으로만 쓰인다. v2 출하 후 stale_bytes 분포를 보고 재판단 — 검체는 RED 자산으로 보존한다 (0.14.43 A안: 비계수이지 감산 아님 — 여전히 RED)"]
     fn qs_a2_backspace_must_decrement_pending_input() {
         let got = v7_last(0, &[b"a", b"b", b"c", b"\x7f", b"\x7f", b"\x7f"]);
         eprintln!("V7OBS qs_a2_backspace got={got} expected=0");
@@ -13620,7 +13702,7 @@ mod tests {
 
     /// RED(문서 기대): "abc" + 순수 Esc(0x1b 단독) → Claude Code 는 입력줄을 비운다 → 기대 0.
     #[test]
-    #[ignore = "D-02 보류(P3 · 설계 §5): 순수 Esc 감산은 과소 계수(오주입) 방향 위험 — v2 출하 후 재판단 · RED 자산 보존"]
+    #[ignore = "D-02 보류(P3 · 설계 §5): 순수 Esc 감산은 과소 계수(오주입) 방향 위험 — v2 출하 후 재판단 · RED 자산 보존 (0.14.43 A안: 비계수이지 감산 아님 — 여전히 RED)"]
     fn qs_a2_bare_escape_clears_pending_input() {
         let got = v7_last(0, &[b"a", b"b", b"c", b"\x1b"]);
         eprintln!("V7OBS qs_a2_bare_escape got={got} expected=0");
@@ -13826,11 +13908,12 @@ mod tests {
             tail: vec![0x1b],
             ..Default::default()
         };
-        let next = super::pending_input_step(
+        let next = pending_input_step_model(
             &st,
             b"\r",
             InputOrigin::Human,
             std::time::Instant::now(),
+            PendingInputModel::V2,
         );
         assert_eq!((next.count, next.human), (0, 0), "이월 ESC 뒤 CR 은 제출: {next:?}");
 
@@ -13851,11 +13934,12 @@ mod tests {
             ..Default::default()
         };
         // TTL 만료 뒤 CR: 봉투가 먼저 닫히고(하한 2 복귀) 이월 ESC + CR 은 제출이다.
-        let expired = super::pending_input_step(
+        let expired = pending_input_step_model(
             &st,
             b"\r",
             InputOrigin::Human,
             now + std::time::Duration::from_secs(super::PASTE_OPEN_TTL_SECS),
+            PendingInputModel::V2,
         );
         assert_eq!(
             (expired.count, expired.human),
@@ -13866,7 +13950,7 @@ mod tests {
         assert!(expired.tail.is_empty(), "제출 뒤 이월 바이트가 없어야 한다: {expired:?}");
 
         // 대조: TTL 안이면 봉투 안이라 ESC·CR 모두 가산(3+2=5) · in_paste 유지.
-        let inside = super::pending_input_step(&st, b"\r", InputOrigin::Human, now);
+        let inside = pending_input_step_model(&st, b"\r", InputOrigin::Human, now, PendingInputModel::V2);
         assert_eq!(
             (inside.count, inside.human),
             (5, 5),
@@ -13990,6 +14074,524 @@ mod tests {
             let state = v2_run(&chunks[..=i]);
             assert_eq!((state.count, state.human), expected, "출처 계수 단계 {}", i + 1);
         }
+    }
+
+    // ─────────── ★C2(0.14.43 · 오너 결재 A안): 계수 모델 v3 — 단독 Esc·BS/DEL 비계수 핀(`v3_*`) ───────────
+    //
+    // 결함(실측 · 0.14.42 설치본 샌드박스 재현): GUI 에서 사람이 빈 입력줄에 Esc 한 번 또는 Backspace 를 누르면 종전 계수가
+    // 1(사람 1)로 남는다. Claude Code 입력 추천(커서 뒤 고스트)이 떠 있으면 stale 리셋(커서 앞·뒤가 모두 빈 줄이어야 발동)이
+    // 영원히 불발해 그 좌석의 큐 배달·강제 배달·직접 send 가 전부 `input_pending` 으로 거부된다.
+    // A안: 봉투 밖 세그먼트가 단독 ESC(정확히 1바이트)이거나 0x7f·0x08 만이면 계수에 더하지 않는다 — **리셋도 감산도 아니다**.
+    // 아래 핀은 모델을 명시(`v3_run` = V3 · `v2_run` = V2)해 OS·env 와 무관하게 값을 못박는다. 기본 모델(`current()`)을
+    // 타는 핀은 래퍼 핀·좌석 핀·자식 프로세스 핀뿐이다. 종전 v2 기대값(6·1 등)은 `v2_*` 핀이 V2 명시로 그대로 지킨다.
+
+    /// `v2_run` 의 V3 판 — 모델을 V3 로 못박는다.
+    fn v3_run(chunks: &[(&[u8], InputOrigin, u64 /* now 오프셋 초 */)]) -> PendingInputState {
+        let now = std::time::Instant::now();
+        chunks.iter().fold(PendingInputState::default(), |state, (chunk, origin, offset)| {
+            pending_input_step_model(
+                &state,
+                chunk,
+                *origin,
+                now + std::time::Duration::from_secs(*offset),
+                PendingInputModel::V3,
+            )
+        })
+    }
+
+    /// 한 출처의 청크열을 `model` 로 접으며 단계마다의 상태를 모은다 — 같은 `now` 로 두 모델을 나란히 비교하는 핀용.
+    fn model_steps(
+        model: PendingInputModel,
+        origin: InputOrigin,
+        now: std::time::Instant,
+        chunks: &[&[u8]],
+    ) -> Vec<PendingInputState> {
+        let mut state = PendingInputState::default();
+        chunks
+            .iter()
+            .map(|c| {
+                state = pending_input_step_model(&state, c, origin, now, model);
+                state.clone()
+            })
+            .collect()
+    }
+
+    /// 핀 1 — 빈 줄에서 사람이 Esc 한 번: V3 는 count·human 0 이고 이월 tail 도 봉투 상태도 없다(V2 는 종전대로 1).
+    #[test]
+    fn v3_lone_escape_on_empty_line_is_not_counted() {
+        let v3 = v3_run(&[(b"\x1b", InputOrigin::Human, 0)]);
+        assert_eq!((v3.count, v3.human), (0, 0), "빈 줄 단독 Esc 가 초안 1바이트로 남았다: {v3:?}");
+        assert!(v3.tail.is_empty() && !v3.in_paste, "단독 Esc 는 이월·봉투 상태를 만들지 않는다: {v3:?}");
+        let v2 = v2_run(&[(b"\x1b", InputOrigin::Human, 0)]);
+        assert_eq!((v2.count, v2.human), (1, 1), "대조: V2 는 종전대로 1바이트로 센다: {v2:?}");
+    }
+
+    /// 핀 2 — 글자 뒤 단독 Esc 청크는 계수에 더하지 않는다(오너 결재 문면 "6→5"). V2 는 6(종전 핀과 같은 값).
+    #[test]
+    fn v3_lone_escape_after_text_adds_nothing() {
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (b"hello", InputOrigin::Human, 0),
+            (b"\x1b", InputOrigin::Human, 0),
+        ];
+        let v3 = v3_run(chunks);
+        assert_eq!((v3.count, v3.human), (5, 5), "hello 뒤 단독 Esc 가 가산됐다(결재 문면 6→5): {v3:?}");
+        assert!(v3.tail.is_empty(), "단독 Esc 는 이월하지 않는다: {v3:?}");
+        let v2 = v2_run(chunks);
+        assert_eq!((v2.count, v2.human), (6, 6), "대조: V2 는 6 — 종전 핀과 같은 값: {v2:?}");
+    }
+
+    /// 핀 3 — 단독 Esc 뒤 포커스 보고: Esc 도 포커스 보고도 더하지 않고, 둘을 합쳐 읽지도 않는다(결재 문면 "1→0").
+    #[test]
+    fn v3_lone_escape_then_focus_report_stays_zero() {
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (b"\x1b", InputOrigin::Human, 0),
+            (b"\x1b[I", InputOrigin::Human, 0),
+        ];
+        let v3 = v3_run(chunks);
+        assert!(
+            v3.count == 0 && v3.human == 0 && v3.tail.is_empty(),
+            "단독 Esc + 포커스 보고는 0(결재 문면 1→0): {v3:?}"
+        );
+        let v2 = v2_run(chunks);
+        assert!(v2.count == 1 && v2.tail.is_empty(), "대조: V2 는 1: {v2:?}");
+    }
+
+    /// 핀 4 — 제출·취소 규칙은 불변: 글자·단독 Esc 뒤 CR/LF/Ctrl-U/Ctrl-C 는 출처와 무관하게 0/0 이다.
+    /// 같은 청크의 `ESC CR`(Meta-Enter)은 여전히 줄바꿈(제출 아님)이고 V2 와 같은 값이다.
+    #[test]
+    fn v3_escape_then_reset_keys_still_submit_for_both_origins() {
+        for origin in [InputOrigin::Human, InputOrigin::Machine] {
+            for reset in [&b"\r"[..], b"\n", b"\x15", b"\x03"] {
+                let st = v3_run(&[
+                    (b"hello", InputOrigin::Human, 0),
+                    (b"\x1b", InputOrigin::Human, 0),
+                    (reset, origin, 0),
+                ]);
+                assert!(
+                    st.count == 0 && st.human == 0,
+                    "단독 Esc 뒤 {origin:?} {reset:?} 은 제출·취소(0/0): {st:?}"
+                );
+            }
+        }
+        let meta_enter: &[(&[u8], InputOrigin, u64)] = &[
+            (b"abc", InputOrigin::Human, 0),
+            (b"\x1b\r", InputOrigin::Human, 0),
+        ];
+        let (v2, v3) = (v2_run(meta_enter), v3_run(meta_enter));
+        assert_eq!(v3.count, 5, "Meta-Enter(ESC CR 한 청크)는 줄바꿈 — 제출로 지우면 안 된다: {v3:?}");
+        assert_eq!((v3.count, v3.human), (v2.count, v2.human), "Meta-Enter 는 두 모델이 같다");
+    }
+
+    /// 핀 5 — 빈 줄 Backspace(0x7f)·Ctrl-H(0x08): 한 키·연타 한 청크·키마다 청크 모두 계수에 더하지 않는다(V2 는 길이만큼).
+    #[test]
+    fn v3_backspace_on_empty_line_is_not_counted() {
+        for chunk in [&b"\x7f"[..], b"\x08", b"\x7f\x7f\x7f", b"\x08\x08", b"\x7f\x08\x7f"] {
+            let v3 = v3_run(&[(chunk, InputOrigin::Human, 0)]);
+            assert!(
+                v3.count == 0 && v3.human == 0 && v3.tail.is_empty(),
+                "빈 줄 BS/DEL {chunk:?} 이 초안으로 남았다: {v3:?}"
+            );
+            let v2 = v2_run(&[(chunk, InputOrigin::Human, 0)]);
+            let len = chunk.len() as u64;
+            assert_eq!((v2.count, v2.human), (len, len), "대조: V2 는 길이만큼 센다: {v2:?}");
+        }
+        let per_key = v3_run(&[
+            (b"\x7f", InputOrigin::Human, 0),
+            (b"\x7f", InputOrigin::Human, 0),
+            (b"\x7f", InputOrigin::Human, 0),
+        ]);
+        assert_eq!((per_key.count, per_key.human), (0, 0), "키마다 청크로 온 BS×3 도 0: {per_key:?}");
+    }
+
+    /// 핀 6 — **감산은 없다**: 'abc' 뒤 BS×3 은 청크마다든 한 청크든 0x08 이든 3 그대로다. 과소 계수(초안이 있는데 0)는
+    /// 불변식 "계수 ≥ 화면에 보이는 미제출 글자 수" 를 깨므로 만들지 않는다(잔여 틈: 다 지운 줄은 계수가 남는다).
+    #[test]
+    fn v3_backspace_never_subtracts() {
+        for (name, bs) in [("DEL 0x7f", &b"\x7f"[..]), ("BS 0x08", &b"\x08"[..])] {
+            let chunks: [(&[u8], InputOrigin, u64); 4] = [
+                (b"abc", InputOrigin::Human, 0),
+                (bs, InputOrigin::Human, 0),
+                (bs, InputOrigin::Human, 0),
+                (bs, InputOrigin::Human, 0),
+            ];
+            for n in 1..=chunks.len() {
+                let st = v3_run(&chunks[..n]);
+                assert_eq!(
+                    (st.count, st.human),
+                    (3, 3),
+                    "{name}: abc 뒤 BS {} 번 — 감산하면 안 된다: {st:?}",
+                    n - 1
+                );
+            }
+        }
+        let one_chunk = v3_run(&[
+            (b"abc", InputOrigin::Human, 0),
+            (b"\x7f\x7f\x7f", InputOrigin::Human, 0),
+        ]);
+        assert_eq!((one_chunk.count, one_chunk.human), (3, 3), "BS×3 한 청크도 3 그대로: {one_chunk:?}");
+        // GUI onData 는 글자도 한 키씩 낸다.
+        let per_key = v3_run(&[
+            (b"a", InputOrigin::Human, 0),
+            (b"b", InputOrigin::Human, 0),
+            (b"c", InputOrigin::Human, 0),
+            (b"\x7f", InputOrigin::Human, 0),
+            (b"\x7f", InputOrigin::Human, 0),
+            (b"\x7f", InputOrigin::Human, 0),
+        ]);
+        assert_eq!((per_key.count, per_key.human), (3, 3), "키마다 청크: a,b,c,BS×3 → 3: {per_key:?}");
+    }
+
+    /// 핀 7 — 글자 뒤 단독 Esc 는 **리셋이 아니다**: 'abc' 뒤 Esc → 3/3. 줄을 비우는 것은 이어 오는 CR(제출)뿐이다.
+    #[test]
+    fn v3_escape_after_text_is_not_a_reset() {
+        let after_esc = v3_run(&[
+            (b"abc", InputOrigin::Human, 0),
+            (b"\x1b", InputOrigin::Human, 0),
+        ]);
+        assert_eq!((after_esc.count, after_esc.human), (3, 3), "Esc 가 계수를 지웠다(리셋 아님): {after_esc:?}");
+        let after_cr = v3_run(&[
+            (b"abc", InputOrigin::Human, 0),
+            (b"\x1b", InputOrigin::Human, 0),
+            (b"\r", InputOrigin::Human, 0),
+        ]);
+        assert_eq!((after_cr.count, after_cr.human), (0, 0), "Esc 뒤 CR 은 종전대로 제출: {after_cr:?}");
+    }
+
+    /// 핀 8 — **면제 아님**: 글자를 넣을 수 있는 키·두 바이트 이상 세그먼트는 종전처럼 길이만큼 센다(V2 와 같은 값).
+    #[test]
+    fn v3_keys_that_can_leave_text_still_count() {
+        let table: [(&str, &[u8], u64); 8] = [
+            ("ESC ESC(2바이트)", b"\x1b\x1b", 2),
+            ("ESC DEL(Meta-Backspace)", b"\x1b\x7f", 2),
+            ("글자+DEL 한 세그먼트", b"a\x7f", 2),
+            ("DEL+ESC 섞인 세그먼트", b"\x7f\x1b", 2),
+            ("위 화살표 CSI", b"\x1b[A", 3),
+            ("Tab", b"\t", 1),
+            ("Ctrl-Y", b"\x19", 1),
+            ("Ctrl-A", b"\x01", 1),
+        ];
+        for (name, chunk, want) in table {
+            let v3 = v3_run(&[(chunk, InputOrigin::Human, 0)]);
+            assert_eq!((v3.count, v3.human), (want, want), "{name}: 면제 대상이 아니다: {v3:?}");
+            let v2 = v2_run(&[(chunk, InputOrigin::Human, 0)]);
+            assert_eq!(v2.count, want, "대조: {name} 은 V2 도 같은 값");
+        }
+    }
+
+    /// 핀 9 — 출처 무관: 기계 출처(send-key 전부·기계 send)의 단독 Esc·BS/DEL 도 계수에 더하지 않는다(human 은 원래 0).
+    #[test]
+    fn v3_machine_origin_lone_escape_and_backspace_not_counted() {
+        for chunk in [&b"\x1b"[..], b"\x7f", b"\x08", b"\x7f\x7f"] {
+            let v3 = v3_run(&[(chunk, InputOrigin::Machine, 0)]);
+            assert_eq!((v3.count, v3.human), (0, 0), "기계 출처 {chunk:?} 가 계수에 더해졌다: {v3:?}");
+            let v2 = v2_run(&[(chunk, InputOrigin::Machine, 0)]);
+            assert_eq!((v2.count, v2.human), (chunk.len() as u64, 0), "대조: V2 는 기계 출처도 센다: {v2:?}");
+        }
+        // 사람이 쓴 초안 위의 기계 Esc(send-key Escape)도 계수를 늘리지 않는다.
+        let st = v3_run(&[
+            (b"hello", InputOrigin::Human, 0),
+            (b"\x1b", InputOrigin::Machine, 0),
+        ]);
+        assert_eq!((st.count, st.human), (5, 5), "사람 초안 위 기계 Esc: {st:?}");
+    }
+
+    /// 핀 10 — 봉투 **안**은 무변경: 붙여넣은 본문 속 DEL·ESC 는 글자로 센다 — 두 모델이 단계마다 같은 상태다.
+    #[test]
+    fn v3_inside_paste_envelope_counts_like_v2() {
+        let now = std::time::Instant::now();
+        let one_del = [V7_OPEN, b"\x7f", V7_CLOSE].concat();
+        let one_esc = [V7_OPEN, b"\x1b", V7_CLOSE].concat();
+        let three_del = [V7_OPEN, b"\x7f\x7f\x7f", V7_CLOSE].concat();
+        let cases: [(&str, &[&[u8]], u64); 5] = [
+            ("OPEN+DEL+CLOSE 한 청크", &[one_del.as_slice()], 1),
+            ("OPEN / DEL / CLOSE 세 청크", &[V7_OPEN, b"\x7f", V7_CLOSE], 1),
+            ("OPEN+ESC+CLOSE 한 청크", &[one_esc.as_slice()], 1),
+            ("OPEN / ESC / CLOSE 세 청크(이월 ESC)", &[V7_OPEN, b"\x1b", V7_CLOSE], 1),
+            ("OPEN+DEL×3+CLOSE 한 청크", &[three_del.as_slice()], 3),
+        ];
+        for origin in [InputOrigin::Human, InputOrigin::Machine] {
+            for (name, chunks, want) in cases {
+                let v2 = model_steps(PendingInputModel::V2, origin, now, chunks);
+                let v3 = model_steps(PendingInputModel::V3, origin, now, chunks);
+                assert_eq!(v2, v3, "{name}({origin:?}): 봉투 안은 두 모델이 단계마다 같아야 한다");
+                let last = v3.last().expect("청크 1개 이상");
+                assert_eq!(last.count, want, "{name}({origin:?}): 봉투 안 본문은 글자로 센다: {last:?}");
+                assert!(!last.in_paste && last.tail.is_empty(), "{name}({origin:?}): 봉투가 닫혀야 한다: {last:?}");
+            }
+        }
+    }
+
+    /// 핀 11 — 이월: `hello\x1b[`(tail 2바이트) 뒤에 온 `\x1b` 는 tail 과 합쳐 3바이트 세그먼트다 — 단독 ESC 가 아니라
+    /// 면제 대상이 아니고 V2 와 같은 값(8)이다.
+    #[test]
+    fn v3_escape_after_carried_tail_counts_like_v2() {
+        let chunks: &[(&[u8], InputOrigin, u64)] = &[
+            (b"hello\x1b[", InputOrigin::Human, 0),
+            (b"\x1b", InputOrigin::Human, 0),
+        ];
+        let shape = |s: &PendingInputState| (s.count, s.human, s.in_paste, s.tail.clone());
+        let (v2, v3) = (v2_run(chunks), v3_run(chunks));
+        assert_eq!(shape(&v3), shape(&v2), "이월 tail 뒤 ESC 는 두 모델이 같다: v2={v2:?} v3={v3:?}");
+        assert_eq!(v3.count, 8, "hello 5 + (tail ESC [ + ESC) 3 — 면제하면 5 로 줄어든다: {v3:?}");
+        // 그 앞 단계(tail 2바이트 보관)도 V3 와 V2 가 같다.
+        let (v2a, v3a) = (v2_run(&chunks[..1]), v3_run(&chunks[..1]));
+        assert_eq!(shape(&v3a), shape(&v2a), "tail 보관 단계도 같다");
+        assert_eq!(v3a.tail, b"\x1b[", "표식 접두 2바이트는 계수 없이 이월: {v3a:?}");
+    }
+
+    /// 핀 12 — 모델 선택: env 값 해석(순수)과 OS 기본값. `current()` 의 프로세스 수명 1회 판독은 자식 프로세스 핀이 잰다.
+    #[test]
+    fn v3_model_selection_from_env_value_and_os_default() {
+        let want_default = if cfg!(windows) { PendingInputModel::V2 } else { PendingInputModel::V3 };
+        assert_eq!(
+            PendingInputModel::os_default(),
+            want_default,
+            "OS 기본: 윈도우는 실기 확인 전이라 종전 V2 유지 · 그 밖은 V3"
+        );
+        for (v, want) in [
+            ("v2", PendingInputModel::V2),
+            ("V2", PendingInputModel::V2),
+            ("\tv2\n", PendingInputModel::V2),
+            ("v3", PendingInputModel::V3),
+            (" V3 ", PendingInputModel::V3),
+        ] {
+            assert_eq!(PendingInputModel::from_env_value(Some(v)), want, "{v:?}");
+        }
+        for junk in [Some("junk"), Some(""), Some("   "), Some("v4"), Some("v 3"), Some("3"), Some("v2v3"), None] {
+            assert_eq!(
+                PendingInputModel::from_env_value(junk),
+                want_default,
+                "{junk:?}: 그 밖·부재는 OS 기본"
+            );
+        }
+    }
+
+    /// 핀 13 — V2·V3 동치 성질: 단독 ESC 청크도 BS/DEL 전용 청크도 들어 있지 않은 청크열은 두 모델이 **단계마다 같은 상태**다
+    /// (붙여넣기·분할·포커스 보고·개행 제출·Meta-Enter·이월 시나리오). 대조: 그런 청크가 들어 있으면 갈린다(공허 방지).
+    #[test]
+    fn v3_equals_v2_when_no_lone_escape_or_backspace_chunk() {
+        let now = std::time::Instant::now();
+        const INJECT: &[u8] = b"\x1b[200~# D\nbody\n\x1b[201~"; // 상수여야 `&[INJECT]` 가 승격된다
+        let clicks: Vec<&[u8]> = (0..10).flat_map(|_| [&b"\x1b[I"[..], b"\x1b[O"]).collect();
+        let seqs: Vec<(&str, &[&[u8]])> = vec![
+            ("분할 A: OPEN / CPR / CLOSE", &[V7_OPEN, V7_CPR, V7_CLOSE]),
+            ("분할 C: 본문 안에서 끊김", &[b"\x1b[200~\x1b[24", b";80R", V7_CLOSE]),
+            ("분할 D: OPEN+CPR / CLOSE", &[b"\x1b[200~\x1b[24;80R", V7_CLOSE]),
+            ("분할 E: OPEN / CPR+CLOSE", &[V7_OPEN, b"\x1b[24;80R\x1b[201~"]),
+            ("분할 F: OPEN / 포커스 / CLOSE", &[V7_OPEN, b"\x1b[I", V7_CLOSE]),
+            ("분할 G: OPEN / hello / CLOSE", &[V7_OPEN, b"hello", V7_CLOSE]),
+            ("분할 I: 표식 중간 절단", &[b"\x1b[20", b"0~hello", V7_CLOSE]),
+            ("단일 호출 봉투 + 끝 개행", &[INJECT]),
+            ("글자 뒤 제출", &[b"hello", b"\r"]),
+            ("봉투 밖 개행", &[b"abc\n"]),
+            ("Meta-Enter(ESC CR 한 청크)", &[b"abc", b"\x1b\r"]),
+            ("화살표 CSI", &[b"a", b"b", b"c", b"\x1b[A"]),
+            ("포커스 보고 열 번", clicks.as_slice()),
+            ("이월 tail 뒤 ESC", &[b"hello\x1b[", b"\x1b"]),
+            ("ESC ESC · ESC DEL · 글자+DEL", &[b"\x1b\x1b", b"\x1b\x7f", b"a\x7f"]),
+        ];
+        for origin in [InputOrigin::Human, InputOrigin::Machine] {
+            for (name, chunks) in &seqs {
+                let v2 = model_steps(PendingInputModel::V2, origin, now, chunks);
+                let v3 = model_steps(PendingInputModel::V3, origin, now, chunks);
+                assert_eq!(v2, v3, "{name}({origin:?}): 단독 ESC·BS 청크가 없으면 두 모델은 같아야 한다");
+            }
+        }
+        let differs: [(&str, &[&[u8]]); 3] = [
+            ("글자 뒤 단독 Esc", &[b"hello", b"\x1b"]),
+            ("글자 뒤 BS", &[b"abc", b"\x7f"]),
+            ("빈 줄 Ctrl-H", &[b"\x08"]),
+        ];
+        for (name, chunks) in differs {
+            let v2 = model_steps(PendingInputModel::V2, InputOrigin::Human, now, chunks);
+            let v3 = model_steps(PendingInputModel::V3, InputOrigin::Human, now, chunks);
+            assert!(
+                v2.last().unwrap().count > v3.last().unwrap().count,
+                "대조({name}): 단독 ESC·BS 청크가 들어 있으면 V2 가 더 센다 — 동치 단언이 공허하지 않다는 증거"
+            );
+        }
+    }
+
+    /// 핀 14 — 래퍼 `pending_input_step`(호출처 `Surface::apply_pending_input` 이 쓰는 것)은 `PendingInputModel::current()`
+    /// 로 본체에 위임한다 — 단계마다 같은 상태이고, 단독 Esc 는 현행 모델의 거동(V3 면 0 · V2 면 1)이다.
+    #[test]
+    fn v3_wrapper_follows_current_model() {
+        let now = std::time::Instant::now();
+        let model = PendingInputModel::current();
+        assert_eq!(
+            model,
+            PendingInputModel::from_env_value(std::env::var("CYS_PENDING_INPUT_MODEL").ok().as_deref()),
+            "current() 는 env 값 해석(from_env_value)과 같아야 한다"
+        );
+        let seqs: [&[&[u8]]; 4] = [
+            &[b"hello", b"\x1b"],
+            &[b"abc", b"\x7f\x7f"],
+            &[V7_OPEN, b"\x7f", V7_CLOSE],
+            &[b"x", b"\x1b[A", b"\r"],
+        ];
+        for chunks in seqs {
+            let (mut wrapped, mut direct) = (PendingInputState::default(), PendingInputState::default());
+            for c in chunks {
+                wrapped = super::pending_input_step(&wrapped, c, InputOrigin::Human, now);
+                direct = pending_input_step_model(&direct, c, InputOrigin::Human, now, model);
+                assert_eq!(wrapped, direct, "래퍼가 current() 모델과 다르게 동작한다: chunk={c:?}");
+            }
+        }
+        let lone = super::pending_input_step(&PendingInputState::default(), b"\x1b", InputOrigin::Human, now);
+        let want = if model == PendingInputModel::V3 { 0 } else { 1 };
+        assert_eq!(lone.count, want, "단독 Esc: 현행 모델 {model:?} 의 거동이어야 한다: {lone:?}");
+    }
+
+    /// 자식 탐침 표식 env — 부모 검체가 같은 하네스를 다시 띄울 때만 켠다.
+    const V3_CHILD_ENV: &str = "CYS_V3_CHILD_PROBE";
+
+    /// 자식 전용 탐침 — 표식이 없으면(일반 전량 실행) 즉시 통과한다. 부모 `v3_current_reads_env_once_per_process` 가
+    /// env 를 달리해 같은 하네스를 `--exact` 로 다시 띄워 이 줄을 읽는다(`fdlimit` 검체와 같은 기법).
+    #[test]
+    fn v3_current_child_probe() {
+        if std::env::var_os(V3_CHILD_ENV).is_none() {
+            return;
+        }
+        let first = PendingInputModel::current();
+        // 판독 뒤에 env 를 바꿔도 값은 그대로다(프로세스 수명 1회).
+        std::env::set_var(
+            "CYS_PENDING_INPUT_MODEL",
+            if first == PendingInputModel::V2 { "v3" } else { "v2" },
+        );
+        let second = PendingInputModel::current();
+        println!("@@V3CUR {first:?} {second:?}");
+    }
+
+    /// 핀 15 — `current()` 는 env `CYS_PENDING_INPUT_MODEL` 을 **프로세스 시작 뒤 첫 호출에서 한 번** 읽는다(자식 프로세스로 잰다:
+    /// 이 프로세스의 OnceLock 은 이미 채워졌을 수 있고 env 변경이 형제 검체를 오염시키기 때문이다).
+    #[test]
+    fn v3_current_reads_env_once_per_process() {
+        if std::env::var_os(V3_CHILD_ENV).is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let run = |env: Option<&str>| -> String {
+            let mut cmd = std::process::Command::new(&exe);
+            cmd.args([
+                "--exact",
+                "governance::tests::v3_current_child_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(V3_CHILD_ENV, "1")
+            .env_remove("CYS_PENDING_INPUT_MODEL");
+            if let Some(v) = env {
+                cmd.env("CYS_PENDING_INPUT_MODEL", v);
+            }
+            let out = cmd.output().expect("자식 하네스 실행");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            // 줄 표식은 `@@V3CUR ` — libtest 가 검체 이름 뒤에 같은 줄로 붙여 찍어도 찾도록 줄 안 위치로 찾는다.
+            stdout
+                .lines()
+                .find_map(|l| l.find("@@V3CUR ").map(|i| l[i + "@@V3CUR ".len()..].trim().to_string()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "자식 검체 줄 누락(결측은 값이 아니다) — rc={:?}\nstdout:\n{stdout}\nstderr:\n{}",
+                        out.status.code(),
+                        String::from_utf8_lossy(&out.stderr)
+                    )
+                })
+        };
+        assert_eq!(run(Some("v2")), "V2 V2", "env=v2 → V2 · 이후 env 변경 무시");
+        assert_eq!(run(Some(" V3 ")), "V3 V3", "env=' V3 ' → V3 · 이후 env 변경 무시");
+        let d = PendingInputModel::os_default();
+        assert_eq!(run(None), format!("{d:?} {d:?}"), "env 부재 → OS 기본 · 이후 env 변경 무시");
+        assert_eq!(run(Some("junk")), format!("{d:?} {d:?}"), "env 쓰레기 값 → OS 기본");
+    }
+
+    /// ★(0.14.43 · C2) 좌석 수준 재현 — 입력 추천(커서 뒤 고스트)이 떠 있는 프롬프트에서 빈 줄 Esc 한 번.
+    ///
+    /// ⓐ 종전 모델(V2 · 윈도우 기본 상당): Esc 가 남긴 계수 1 은 stale 리셋(`maybe_reset_stale_pending_input` — 커서 앞·뒤가
+    ///    모두 빈 줄이어야 발동)이 고스트 때문에 영원히 불발해 큐 배달이 `input_pending` 으로 막힌다. 대조군: 고스트가 사라지면
+    ///    같은 계수가 stale 리셋으로 풀린다 — 막는 것은 고스트와 계수의 조합뿐이다.
+    /// ⓑ 기본 모델(V3 · unix): 같은 Esc·BS 를 `Surface::apply_pending_input` 으로 넣으면 계수 0 이라 고스트가 떠 있어도
+    ///    배달된다(`cfg!(windows)` 의 기본은 V2 라 이 반쪽은 건너뛴다).
+    #[test]
+    fn v3_ghost_plus_lone_escape_does_not_block_queue() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("v3-ghost-esc");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+            ("CYS_QUEUE_QUIET_SECS", "1"),
+        ]);
+        let (daemon, s) = wp5_seat("v3-ghost-esc", "claude");
+        let e = daemon.next_queue_entry("[보고] 고스트 + 단독 Esc".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        let ghost = "버그 수정 착수한다. 브랜치는";
+        let reset_events = |daemon: &Arc<Daemon>| {
+            daemon
+                .bus
+                .tail(80)
+                .into_iter()
+                .filter(|ev| ev["name"] == "queue.input_pending_reset")
+                .count()
+        };
+
+        // ⓐ V2 로 센 단독 Esc 의 잔여 1바이트 — 고스트가 떠 있어 stale 리셋이 불발한다.
+        let v2 = pending_input_step_model(
+            &PendingInputState::default(),
+            b"\x1b",
+            InputOrigin::Human,
+            std::time::Instant::now(),
+            PendingInputModel::V2,
+        );
+        assert_eq!((v2.count, v2.human), (1, 1), "전제: V2 는 빈 줄 단독 Esc 를 사람 1바이트로 센다");
+        s.set_pending_input(v2.count);
+        paint_prompt(&s, "", ghost);
+        quiet_since(&s, 10);
+        tick(&daemon); // 첫 틱
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        paint_prompt(&s, "", ghost);
+        quiet_since(&s, 10);
+        tick(&daemon); // 창 경과 — 그래도 리셋하지 못한다(고스트 = 커서 뒤 비어 있지 않음)
+        assert_eq!(
+            s.pending_input_bytes.load(AtomicOrdering::Relaxed),
+            1,
+            "ⓐ 고스트가 떠 있으면 stale 리셋이 불발해 단독 Esc 의 계수 1 이 남는다"
+        );
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "ⓐ 계수 1 때문에 큐 배달이 막힌다");
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "ⓐ 막힘 사유는 input_pending");
+        assert_eq!(reset_events(&daemon), 0, "ⓐ 고스트 화면에서는 리셋 이벤트가 없다");
+
+        // 대조군 — 고스트가 사라지면(빈 줄) 같은 계수가 종전대로 stale 리셋으로 풀린다.
+        paint_prompt(&s, "", "");
+        quiet_since(&s, 10);
+        tick(&daemon); // 스탬프
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        paint_prompt(&s, "", "");
+        quiet_since(&s, 10);
+        tick(&daemon); // 리셋(그 틱엔 배달 없음)
+        assert_eq!(
+            s.pending_input_bytes.load(AtomicOrdering::Relaxed),
+            0,
+            "대조군: 고스트 없는 빈 줄에서는 stale 리셋이 계수 1 을 푼다(막는 것은 고스트 + 계수의 조합뿐)"
+        );
+        assert_eq!(reset_events(&daemon), 1, "대조군: 리셋 이벤트 1건");
+
+        // ⓑ 기본 모델 — 윈도우 기본(V2)·env 로 V2 를 고른 실행은 이 반쪽을 건너뛴다.
+        if cfg!(windows) || PendingInputModel::current() != PendingInputModel::V3 {
+            return;
+        }
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0, "전제: 대조군 리셋 뒤 계수 0");
+        let esc = s.apply_pending_input(b"\x1b", InputOrigin::Human);
+        assert_eq!((esc.count, esc.human), (0, 0), "ⓑ 기본 모델에서 빈 줄 단독 Esc 의 계수는 0: {esc:?}");
+        let bs = s.apply_pending_input(b"\x7f", InputOrigin::Human);
+        assert_eq!((bs.count, bs.human), (0, 0), "ⓑ 기본 모델에서 빈 줄 Backspace 의 계수도 0: {bs:?}");
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), 0, "ⓑ 계수 미러도 0");
+        paint_prompt(&s, "", ghost);
+        quiet_since(&s, 10);
+        tick(&daemon);
+        assert!(
+            s.pending_queue.lock().unwrap().is_empty(),
+            "ⓑ 고스트가 떠 있어도 단독 Esc·BS 는 계수를 남기지 않아 큐가 배달된다"
+        );
+        assert_ne!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "ⓑ 게이트가 input_pending 이 아니다");
     }
 
     /// 네 축 AND — 하나라도 빠지면 NotReady(진리표 전수).
