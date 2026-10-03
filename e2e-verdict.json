@@ -1,0 +1,377 @@
+{
+    "os":  "windows-2022",
+    "os_product":  "Windows Server 2022 Datacenter 21H2 build 20348.5622",
+    "arch":  "AMD64",
+    "from_version":  "0.14.37",
+    "to_version":  "0.14.42",
+    "installed_before":  "0.14.37",
+    "cdp_attached":  true,
+    "check_update":  {
+                         "current":  "0.14.37",
+                         "notes":  "cys 터미널 v0.14.42. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.",
+                         "version":  "0.14.42"
+                     },
+    "install_update_outcome":  "socket_closed_app_exit",
+    "app_exited_at":  "2026-10-03T20:06:41.212Z",
+    "installer_seen":  true,
+    "version_after":  {
+                          "marker":  "0.14.42",
+                          "file_version":  "0.14.42 / product 0.14.42",
+                          "cdp_app_version":  "0.14.42"
+                      },
+    "app_relaunched":  true,
+    "verdict":  "updated",
+    "why":  "version marker became 0.14.42 (target 0.14.42); outcome=socket_closed_app_exit; installer_seen=True; app_relaunched=True",
+    "verdict_source":  "cdp",
+    "baseline_install":  {
+                             "version":  "0.14.37",
+                             "installer":  "D:\\a\\_temp\\diag-work\\dl\\0.14.37\\cys_0.14.37_x64-setup.exe",
+                             "started":  "2026-10-03T20:04:52.109Z",
+                             "rc":  0,
+                             "timed_out":  false,
+                             "marker":  "0.14.37",
+                             "failure_file":  null,
+                             "file_version":  "0.14.37 / product 0.14.37",
+                             "killed":  [
+
+                                        ],
+                             "error":  null,
+                             "finished":  "2026-10-03T20:05:52.959Z"
+                         },
+    "cdp_run":  {
+                    "prefix":  "e2e",
+                    "started":  "2026-10-03T20:05:52.990Z",
+                    "installed_before":  "0.14.37",
+                    "app_started":  true,
+                    "cdp_attached":  true,
+                    "check_update":  {
+                                         "current":  "0.14.37",
+                                         "notes":  "cys 터미널 v0.14.42. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.",
+                                         "version":  "0.14.42"
+                                     },
+                    "install_update_outcome":  "socket_closed_app_exit",
+                    "app_exited_at":  "2026-10-03T20:06:41.212Z",
+                    "installer_seen":  true,
+                    "version_after":  {
+                                          "marker":  "0.14.42",
+                                          "file_version":  "0.14.42 / product 0.14.42",
+                                          "cdp_app_version":  "0.14.42"
+                                      },
+                    "app_relaunched":  true,
+                    "verdict":  "updated",
+                    "why":  "version marker became 0.14.42 (target 0.14.42); outcome=socket_closed_app_exit; installer_seen=True; app_relaunched=True",
+                    "verdict_source":  "cdp",
+                    "observe":  {
+                                    "started":  "2026-10-03T20:06:03.020Z",
+                                    "ended":  "2026-10-03T20:07:15.209Z",
+                                    "end_reason":  "success: version marker reached the target and cys-app.exe is running",
+                                    "ticks":  15,
+                                    "node_exited_at":  "2026-10-03T20:06:43.503Z",
+                                    "node_exit_code":  0,
+                                    "app_alive_first_at":  "2026-10-03T20:06:03.130Z",
+                                    "app_gone_at":  "2026-10-03T20:06:43.550Z",
+                                    "app_relaunched":  true,
+                                    "installer_seen":  true,
+                                    "installer_first_seen_at":  "2026-10-03T20:06:43.550Z",
+                                    "installer_first_seen":  {
+                                                                 "name":  "cys-0.14.42-installer.exe",
+                                                                 "id":  1200,
+                                                                 "ppid":  2032,
+                                                                 "path":  "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cys-0.14.42-updater-8WwVM0\\cys-0.14.42-installer.exe",
+                                                                 "cmd":  "\"C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cys-0.14.42-updater-8WwVM0\\cys-0.14.42-installer.exe\" /P /R /UPDATE /ARGS"
+                                                             },
+                                    "marker_first":  "0.14.37",
+                                    "marker_last":  "0.14.42",
+                                    "marker_reached_target_at":  "2026-10-03T20:07:15.208Z",
+                                    "file_version_last":  "0.14.42 / product 0.14.42",
+                                    "updater_dir_max_bytes":  143202847,
+                                    "updater_dirs_seen":  [
+                                                              "cys-0.14.42-updater-8WwVM0"
+                                                          ],
+                                    "failure_file":  null,
+                                    "screenshots":  [
+                                                        {
+                                                            "name":  "e2e-screen-installer.png",
+                                                            "ok":  true,
+                                                            "error":  null,
+                                                            "width":  1024,
+                                                            "height":  768,
+                                                            "windows":  "cys-0.14.42-installer#1200:cys Setup  | hosted-compute-agent#7332:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | TextInputHost#3776:Windows Input Experience"
+                                                        },
+                                                        {
+                                                            "name":  "e2e-screen-20s.png",
+                                                            "ok":  true,
+                                                            "error":  null,
+                                                            "width":  1024,
+                                                            "height":  768,
+                                                            "windows":  "cys-0.14.42-installer#1200:cys Setup  | hosted-compute-agent#7332:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | TextInputHost#3776:Windows Input Experience"
+                                                        },
+                                                        {
+                                                            "name":  "e2e-screen-end.png",
+                                                            "ok":  true,
+                                                            "error":  null,
+                                                            "width":  1024,
+                                                            "height":  768,
+                                                            "windows":  "cys-0.14.42-installer#1200:cys Setup  | cys-app#7472:cys — CYSJavis Terminal | hosted-compute-agent#7332:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | TextInputHost#3776:Windows Input Experience"
+                                                        }
+                                                    ]
+                                },
+                    "cdp":  {
+                                "script":  "cdp-update.mjs",
+                                "node":  "v22.23.3",
+                                "mode":  "update",
+                                "port":  9333,
+                                "started":  "2026-10-03T20:06:06.954Z",
+                                "finished":  "2026-10-03T20:06:41.213Z",
+                                "has_native_websocket":  true,
+                                "ws_impl":  "mini",
+                                "has_fetch":  true,
+                                "targets":  [
+                                                {
+                                                    "type":  "page",
+                                                    "title":  "about:blank",
+                                                    "url":  "about:blank",
+                                                    "id":  "611BBF7A7E6D6E99827C8EA2FCA2952C"
+                                                }
+                                            ],
+                                "chosen_target":  {
+                                                      "url":  "about:blank",
+                                                      "title":  "about:blank",
+                                                      "id":  "611BBF7A7E6D6E99827C8EA2FCA2952C"
+                                                  },
+                                "attached":  true,
+                                "tauri_global":  null,
+                                "page_info":  {
+                                                  "href":  "http://tauri.localhost/",
+                                                  "title":  "cys — CYSJavis Terminal",
+                                                  "ua":  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+                                                  "tauri_keys":  [
+                                                                     "app",
+                                                                     "core",
+                                                                     "dpi",
+                                                                     "event",
+                                                                     "image",
+                                                                     "menu",
+                                                                     "mocks",
+                                                                     "path",
+                                                                     "tray",
+                                                                     "webview",
+                                                                     "webviewWindow",
+                                                                     "window"
+                                                                 ],
+                                                  "core_keys":  [
+                                                                    "Channel",
+                                                                    "PluginListener",
+                                                                    "Resource",
+                                                                    "SERIALIZE_TO_IPC_FN",
+                                                                    "addPluginListener",
+                                                                    "checkPermissions",
+                                                                    "convertFileSrc",
+                                                                    "invoke",
+                                                                    "isTauri",
+                                                                    "requestPermissions",
+                                                                    "transformCallback"
+                                                                ],
+                                                  "app_keys":  [
+                                                                   "BundleType",
+                                                                   "defaultWindowIcon",
+                                                                   "fetchDataStoreIdentifiers",
+                                                                   "getBundleType",
+                                                                   "getIdentifier",
+                                                                   "getName",
+                                                                   "getTauriVersion",
+                                                                   "getVersion",
+                                                                   "hide",
+                                                                   "onBackButtonPress",
+                                                                   "removeDataStore",
+                                                                   "setDockVisibility",
+                                                                   "setTheme",
+                                                                   "show",
+                                                                   "supportsMultipleWindows"
+                                                               ],
+                                                  "event_keys":  [
+                                                                     "TauriEvent",
+                                                                     "emit",
+                                                                     "emitTo",
+                                                                     "listen",
+                                                                     "once"
+                                                                 ]
+                                              },
+                                "app_version":  "0.14.37",
+                                "check_update":  {
+                                                     "current":  "0.14.37",
+                                                     "notes":  "cys 터미널 v0.14.42. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.",
+                                                     "version":  "0.14.42"
+                                                 },
+                                "check_update_error":  null,
+                                "listeners":  {
+                                                  "update-progress":  "ok",
+                                                  "update-error":  "ok",
+                                                  "update-available":  "ok",
+                                                  "update-downloaded":  "ok",
+                                                  "update-finished":  "ok",
+                                                  "update-installing":  "ok"
+                                              },
+                                "install_update_started_at":  "2026-10-03T20:06:11.686Z",
+                                "install_update_outcome":  "socket_closed_app_exit",
+                                "socket_closed_at":  "2026-10-03T20:06:41.212Z",
+                                "events":  {
+                                               "total":  0,
+                                               "progress_count":  0,
+                                               "progress_first":  null,
+                                               "progress_last":  null,
+                                               "non_progress":  [
+
+                                                                ]
+                                           },
+                                "steps":  [
+                                              {
+                                                  "t":  "2026-10-03T20:06:06.955Z",
+                                                  "name":  "start",
+                                                  "argv":  "--port 9333 --out D:\\a\\_temp\\diag-out --prefix e2e --max-wait-sec 720",
+                                                  "native_websocket":  true
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:07.323Z",
+                                                  "name":  "targets",
+                                                  "count":  1,
+                                                  "pages":  1
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:07.368Z",
+                                                  "name":  "connected",
+                                                  "url":  "about:blank",
+                                                  "title":  "about:blank",
+                                                  "ws_impl":  "mini"
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:11.135Z",
+                                                  "name":  "attached",
+                                                  "url":  "about:blank",
+                                                  "title":  "about:blank",
+                                                  "id":  "611BBF7A7E6D6E99827C8EA2FCA2952C"
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:11.138Z",
+                                                  "name":  "page_info",
+                                                  "href":  "http://tauri.localhost/"
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:11.154Z",
+                                                  "name":  "app_version",
+                                                  "value":  "0.14.37"
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:11.216Z",
+                                                  "name":  "screenshot",
+                                                  "file":  "e2e-before.png",
+                                                  "bytes":  17116
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:11.672Z",
+                                                  "name":  "check_update",
+                                                  "ok":  true,
+                                                  "value":  "{\"current\":\"0.14.37\",\"notes\":\"cys 터미널 v0.14.42. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.\",\"version\":\"0.14.42\"}"
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:11.685Z",
+                                                  "name":  "listeners",
+                                                  "update-progress":  "ok",
+                                                  "update-error":  "ok",
+                                                  "update-available":  "ok",
+                                                  "update-downloaded":  "ok",
+                                                  "update-finished":  "ok",
+                                                  "update-installing":  "ok"
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:11.686Z",
+                                                  "name":  "install_update invoking",
+                                                  "force":  true,
+                                                  "max_wait_ms":  720000
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:21.694Z",
+                                                  "name":  "progress",
+                                                  "events_total":  0,
+                                                  "progress_count":  0,
+                                                  "last_progress":  null,
+                                                  "socket_closed":  false
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:31.705Z",
+                                                  "name":  "progress",
+                                                  "events_total":  0,
+                                                  "progress_count":  0,
+                                                  "last_progress":  null,
+                                                  "socket_closed":  false
+                                              },
+                                              {
+                                                  "t":  "2026-10-03T20:06:41.213Z",
+                                                  "name":  "install_update outcome",
+                                                  "outcome":  "socket_closed_app_exit",
+                                                  "socket_closed":  true
+                                              }
+                                          ],
+                                "errors":  [
+
+                                           ]
+                            },
+                    "diagnostics":  {
+                                        "webview2_hklm_policy":  {
+                                                                     "key":  "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments",
+                                                                     "value_name":  "cys-app.exe",
+                                                                     "key_existed":  false,
+                                                                     "old_value_present":  false,
+                                                                     "old_value_query":  "",
+                                                                     "set_rc":  0,
+                                                                     "set_out":  "The operation completed successfully.",
+                                                                     "set_err":  "",
+                                                                     "verify_out":  "HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments\r\n    cys-app.exe    REG_SZ    --remote-debugging-port=9333 --remote-allow-origins=*"
+                                                                 },
+                                        "webview2_runtime_pv":  "131.0.2903.86",
+                                        "app_pid":  2032,
+                                        "cdp_json_version":  "{\r\n   \"Browser\": \"Edg/131.0.2903.86\",\r\n   \"Protocol-Version\": \"1.3\",\r\n   \"User-Agent\": \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0\",\r\n   \"V8-Version\": \"13.1.20.7\",\r\n   \"WebKit-Version\": \"537.36 (@cf5bf303997cad93d7a0bede234d3c3dc01cc63d)\",\r\n   \"webSocketDebuggerUrl\": \"ws://127.0.0.1:9333/devtools/browser/19affa09-4e1d-446b-99b5-6381f042cf9e\"\r\n}\r\n",
+                                        "cdp_wait_sec":  9,
+                                        "node_version":  "v22.23.3",
+                                        "node_pid":  848,
+                                        "post_update_cdp_rc":  0,
+                                        "webview2_hklm_policy_removed":  {
+                                                                             "value_deleted_rc":  0,
+                                                                             "key_deleted_rc":  0,
+                                                                             "note":  null
+                                                                         }
+                                    },
+                    "app_evidence":  {
+                                         "roots":  [
+                                                       "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal",
+                                                       "C:\\Users\\runneradmin\\AppData\\Local\\cys"
+                                                   ],
+                                         "copied":  [
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\shared_proto_db\\metadata\\000003.log",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Local Storage\\leveldb\\000003.log",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Session Storage\\000003.log",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Site Characteristics Database\\000003.log",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\shared_proto_db\\000003.log",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension State\\000003.log",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension Rules\\000003.log",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension Scripts\\000003.log",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Sync Data\\LevelDB\\000003.log",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-installed-version.txt",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\cys\\phoenix-restore.log",
+                                                        "C:\\Users\\runneradmin\\AppData\\Local\\cys\\office-bridge.log"
+                                                    ],
+                                         "error":  null
+                                     },
+                    "finished":  "2026-10-03T20:07:16.896Z"
+                },
+    "replica_run":  null,
+    "started":  "2026-10-03T20:04:52.109Z",
+    "final_cleanup_killed":  [
+                                 "cys-app.exe#7472",
+                                 "cys.exe#7084",
+                                 "cysd.exe#6388",
+                                 "cys.exe#1032"
+                             ],
+    "ci_events_during_run":  0,
+    "finished":  "2026-10-03T20:07:17.028Z"
+}

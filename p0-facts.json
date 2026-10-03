@@ -1,0 +1,205 @@
+{
+    "run_meta":  {
+                     "started":  "2026-10-03T20:03:18.437Z",
+                     "runner_os":  "Windows",
+                     "runner_arch":  "X64",
+                     "image_os":  "win22",
+                     "image_version":  "20260927.320.1",
+                     "github_run_id":  "37150100607",
+                     "github_run_attempt":  "1",
+                     "github_job":  "e2e",
+                     "github_sha":  "d770d690a1b539b6f0bfc212504731f75416f90b",
+                     "runner_temp":  "D:\\a\\_temp",
+                     "workspace":  "D:\\a\\cys-terminal\\cys-terminal",
+                     "localappdata":  "C:\\Users\\runneradmin\\AppData\\Local",
+                     "temp":  "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp",
+                     "diag_job_limit_min":  "50",
+                     "time_zone":  "UTC",
+                     "ps_version":  "5.1.20348.5622",
+                     "ps_edition":  "Desktop",
+                     "clr_version":  "4.0.30319.42000",
+                     "language_mode":  "FullLanguage"
+                 },
+    "ver":  "cmd: C:\\Windows\\System32\\cmd.exe /c ver\r\nrc=0 timedOut=False ms=69 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nMicrosoft Windows [Version 10.0.20348.5622]\r\n\r\n",
+    "nt_currentversion":  {
+                              "ProductName":  "Windows Server 2022 Datacenter",
+                              "DisplayVersion":  "21H2",
+                              "ReleaseId":  "2009",
+                              "CurrentBuild":  "20348",
+                              "CurrentBuildNumber":  "20348",
+                              "UBR":  5622,
+                              "EditionID":  "ServerDatacenter",
+                              "InstallationType":  "Server",
+                              "BuildLabEx":  "20348.1.amd64fre.fe_release.210507-1500",
+                              "CompositionEditionID":  "ServerDatacenter"
+                          },
+    "architecture":  {
+                         "PROCESSOR_ARCHITECTURE":  "AMD64",
+                         "PROCESSOR_ARCHITEW6432":  null,
+                         "PROCESSOR_IDENTIFIER":  "AMD64 Family 25 Model 17 Stepping 1, AuthenticAMD",
+                         "Is64BitOperatingSystem":  true,
+                         "Is64BitProcess":  true,
+                         "OSVersion":  "Microsoft Windows NT 10.0.20348.0",
+                         "ProcessorCount":  4
+                     },
+    "whoami_groups":  "is_admin_role=True integrity=High Mandatory Level user=runneradmin\r\ncmd: C:\\Windows\\System32\\whoami.exe /groups\r\nrc=0 timedOut=False ms=42 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nGROUP INFORMATION\r\n-----------------\r\n\r\nGroup Name                                                    Type             SID          Attributes                                                     \r\n============================================================= ================ ============ ===============================================================\r\nEveryone                                                      Well-known group S-1-1-0      Mandatory group, Enabled by default, Enabled group             \r\nNT AUTHORITY\\Local account and member of Administrators group Well-known group S-1-5-114    Mandatory group, Enabled by default, Enabled group             \r\nBUILTIN\\Administrators                                        Alias            S-1-5-32-544 Mandatory group, Enabled by default, Enabled group, Group owner\r\nBUILTIN\\Users                                                 Alias            S-1-5-32-545 Mandatory group, Enabled by default, Enabled group             \r\nNT AUTHORITY\\INTERACTIVE                                      Well-known group S-1-5-4      Mandatory group, Enabled by default, Enabled group             \r\nCONSOLE LOGON                                                 Well-known group S-1-2-1      Mandatory group, Enabled by default, Enabled group             \r\nNT AUTHORITY\\Authenticated Users                              Well-known group S-1-5-11     Mandatory group, Enabled by default, Enabled group             \r\nNT AUTHORITY\\This Organization                                Well-known group S-1-5-15     Mandatory group, Enabled by default, Enabled group             \r\nNT AUTHORITY\\Local account                                    Well-known group S-1-5-113    Mandatory group, Enabled by default, Enabled group             \r\nLOCAL                                                         Well-known group S-1-2-0      Mandatory group, Enabled by default, Enabled group             \r\nNT AUTHORITY\\NTLM Authentication                              Well-known group S-1-5-64-10  Mandatory group, Enabled by default, Enabled group             \r\nMandatory Label\\High Mandatory Level                          Label            S-1-16-12288                                                                \r\n\r\n",
+    "user_interactive":  {
+                             "UserInteractive":  true,
+                             "UserName":  "runneradmin",
+                             "UserDomainName":  "runnervmdlhio",
+                             "SESSIONNAME":  null,
+                             "MachineName":  "runnervmdlhio"
+                         },
+    "query_session":  "cmd: C:\\Windows\\System32\\query.exe session\r\nrc=1 timedOut=False ms=31 startError= pipes_not_drained=False\r\n--- stdout ---\r\n SESSIONNAME       USERNAME                 ID  STATE   TYPE        DEVICE \r\n services                                    0  Disc                        \r\n\u003econsole           runneradmin               2  Active                      \r\n 31c5ce94259d4...                        65536  Listen                      \r\n rdp-tcp                                 65537  Listen                      \r\n\r\n",
+    "mp_status":  {
+                      "AMRunningMode":  "Normal",
+                      "AMServiceEnabled":  true,
+                      "AntivirusEnabled":  true,
+                      "RealTimeProtectionEnabled":  false,
+                      "IsTamperProtected":  false,
+                      "SmartAppControlState":  "Off",
+                      "SmartAppControlExpiration":  null,
+                      "AMProductVersion":  "4.18.26080.4",
+                      "AMEngineVersion":  "1.1.26080.3",
+                      "AntivirusSignatureVersion":  "1.459.437.0",
+                      "NISEnabled":  false,
+                      "OnAccessProtectionEnabled":  false,
+                      "BehaviorMonitorEnabled":  false,
+                      "IoavProtectionEnabled":  false,
+                      "DefenderSignaturesOutOfDate":  false
+                  },
+    "mp_status_full":  {
+                           "value":  "\r\n\r\nAMEngineVersion                  : 1.1.26080.3\r\nAMProductVersion                 : 4.18.26080.4\r\nAMRunningMode                    : Normal\r\nAMServiceEnabled                 : True\r\nAMServiceVersion                 : 4.18.26080.4\r\nAntispywareEnabled               : True\r\nAntispywareSignatureAge          : 6\r\nAntispywareSignatureLastUpdated  : 9/27/2026 7:42:14 PM\r\nAntispywareSignatureVersion      : 1.459.437.0\r\nAntivirusEnabled                 : True\r\nAntivirusSignatureAge            : 6\r\nAntivirusSignatureLastUpdated    : 9/27/2026 7:42:14 PM\r\nAntivirusSignatureVersion        : 1.459.437.0\r\nBehaviorMonitorEnabled           : False\r\nComputerID                       : C5D6EFC0-6E01-4165-9023-B14B42AB2371\r\nComputerState                    : 0\r\nControlledConfigurationState     : 0\r\nDefenderSignaturesOutOfDate      : False\r\nDeviceControlDefaultEnforcement  : \r\nDeviceControlPoliciesLastUpdated : 1/1/1601 12:00:00 AM\r\nDeviceControlState               : Disabled\r\nFullScanAge                      : 4294967295\r\nFullScanEndTime                  : \r\nFullScanOverdue                  : False\r\nFullScanRequired                 : False\r\nFullScanSignatureVersion         : \r\nFullScanStartTime                : \r\nInitializationProgress           : ServiceStartedSuccessfully\r\nIoavProtectionEnabled            : False\r\nIsTamperProtected                : False\r\nIsVirtualMachine                 : False\r\nLastFullScanSource               : 0\r\nLastQuickScanSource              : 0\r\nNISEnabled                       : False\r\nNISEngineVersion                 : 0.0.0.0\r\nNISSignatureAge                  : 65535\r\nNISSignatureLastUpdated          : \r\nNISSignatureVersion              : \r\nOnAccessProtectionEnabled        : False\r\nProductStatus                    : 524288\r\nQuickScanAge                     : 4294967295\r\nQuickScanEndTime                 : \r\nQuickScanOverdue                 : False\r\nQuickScanSignatureVersion        : \r\nQuickScanStartTime               : \r\nRealTimeProtectionEnabled        : False\r\nRealTimeScanDirection            : 0\r\nRebootRequired                   : False\r\nSmartAppControlExpiration        : \r\nSmartAppControlState             : Off\r\nTamperProtectionSource           : Signatures\r\nTroubleShootingDailyMaxQuota     : \r\nTroubleShootingDailyQuotaLeft    : \r\nTroubleShootingEndTime           : \r\nTroubleShootingExpirationLeft    : \r\nTroubleShootingMode              : \r\nTroubleShootingModeSource        : \r\nTroubleShootingQuotaResetTime    : \r\nTroubleShootingStartTime         : \r\nPSComputerName                   : \r\nCimClass                         : ROOT/Microsoft/Windows/Defender:MSFT_MpComputerStatus\r\nCimInstanceProperties            : {AMEngineVersion, AMProductVersion, AMRunningMode, AMServiceEnabled...}\r\nCimSystemProperties              : Microsoft.Management.Infrastructure.CimSystemProperties\r\n\r\n\r\n\r\n",
+                           "PSComputerName":  "localhost",
+                           "RunspaceId":  "9c496eb7-cac6-4db4-b36e-4830fa986d35",
+                           "PSShowComputerName":  false
+                       },
+    "mp_preference":  {
+                          "DisableRealtimeMonitoring":  true,
+                          "MAPSReporting":  "0",
+                          "SubmitSamplesConsent":  "2",
+                          "CloudBlockLevel":  "0",
+                          "CloudExtendedTimeout":  0,
+                          "EnableNetworkProtection":  "0",
+                          "PUAProtection":  "0",
+                          "DisableBehaviorMonitoring":  true,
+                          "DisableIOAVProtection":  true,
+                          "DisableScriptScanning":  true
+                      },
+    "reg_ci_policy":  "cmd: C:\\Windows\\System32\\reg.exe query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\"\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    SkuPolicyRequired    REG_DWORD    0x0\r\n\r\n\r\n",
+    "reg_ci_protected":  "cmd: C:\\Windows\\System32\\reg.exe query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Protected\"\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Protected\r\n    Licensed    REG_DWORD    0x0\r\n\r\n\r\n",
+    "reg_ci":  "cmd: C:\\Windows\\System32\\reg.exe query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\"\r\nrc=0 timedOut=False ms=17 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Aggregation\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Config\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\NGEN\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Protected\r\n\r\n",
+    "reg_ci_testflags":  "cmd: C:\\Windows\\System32\\reg.exe query \"HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\" /v TestFlags\r\nrc=1 timedOut=False ms=23 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\n\r\n\r\n--- stderr ---\r\nERROR: The system was unable to find the specified registry key or value.\r\n\r\n",
+    "citool_lp_json":  "cmd: C:\\Windows\\System32\\CiTool.exe -lp -json\r\nrc= timedOut=False ms=35 startError=Exception calling \"Start\" with \"1\" argument(s): \"The system cannot find the file specified\" pipes_not_drained=False\r\n",
+    "citool_lp_text":  "cmd: C:\\Windows\\System32\\CiTool.exe -lp\r\nrc= timedOut=False ms=0 startError=Exception calling \"Start\" with \"1\" argument(s): \"The system cannot find the file specified\" pipes_not_drained=False\r\n",
+    "services":  "##### AppIDSvc\r\ncmd: C:\\Windows\\System32\\sc.exe query AppIDSvc\r\nrc=0 timedOut=False ms=23 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nSERVICE_NAME: AppIDSvc \r\n        TYPE               : 20  WIN32_SHARE_PROCESS  \r\n        STATE              : 1  STOPPED \r\n        WIN32_EXIT_CODE    : 1077  (0x435)\r\n        SERVICE_EXIT_CODE  : 0  (0x0)\r\n        CHECKPOINT         : 0x0\r\n        WAIT_HINT          : 0x0\r\n\r\n\r\ncmd: C:\\Windows\\System32\\sc.exe qc AppIDSvc\r\nrc=0 timedOut=False ms=17 startError= pipes_not_drained=False\r\n--- stdout ---\r\n[SC] QueryServiceConfig SUCCESS\r\n\r\nSERVICE_NAME: AppIDSvc\r\n        TYPE               : 20  WIN32_SHARE_PROCESS \r\n        START_TYPE         : 3   DEMAND_START\r\n        ERROR_CONTROL      : 1   NORMAL\r\n        BINARY_PATH_NAME   : C:\\Windows\\system32\\svchost.exe -k LocalServiceNetworkRestricted -p\r\n        LOAD_ORDER_GROUP   : ProfSvc_Group\r\n        TAG                : 0\r\n        DISPLAY_NAME       : Application Identity\r\n        DEPENDENCIES       : RpcSs\r\n                           : AppID\r\n                           : CryptSvc\r\n        SERVICE_START_NAME : NT Authority\\LocalService\r\n\r\n\r\n##### applockerfltr\r\ncmd: C:\\Windows\\System32\\sc.exe query applockerfltr\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nSERVICE_NAME: applockerfltr \r\n        TYPE               : 1  KERNEL_DRIVER  \r\n        STATE              : 1  STOPPED \r\n        WIN32_EXIT_CODE    : 1077  (0x435)\r\n        SERVICE_EXIT_CODE  : 0  (0x0)\r\n        CHECKPOINT         : 0x0\r\n        WAIT_HINT          : 0x0\r\n\r\n\r\ncmd: C:\\Windows\\System32\\sc.exe qc applockerfltr\r\nrc=0 timedOut=False ms=29 startError= pipes_not_drained=False\r\n--- stdout ---\r\n[SC] QueryServiceConfig SUCCESS\r\n\r\nSERVICE_NAME: applockerfltr\r\n        TYPE               : 1  KERNEL_DRIVER \r\n        START_TYPE         : 3   DEMAND_START\r\n        ERROR_CONTROL      : 1   NORMAL\r\n        BINARY_PATH_NAME   : system32\\drivers\\applockerfltr.sys\r\n        LOAD_ORDER_GROUP   : \r\n        TAG                : 0\r\n        DISPLAY_NAME       : Smartlocker Filter Driver\r\n        DEPENDENCIES       : FltMgr\r\n                           : AppID\r\n                           : AppIDSvc\r\n        SERVICE_START_NAME : \r\n\r\n\r\n##### appid\r\ncmd: C:\\Windows\\System32\\sc.exe query appid\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nSERVICE_NAME: appid \r\n        TYPE               : 1  KERNEL_DRIVER  \r\n        STATE              : 1  STOPPED \r\n        WIN32_EXIT_CODE    : 1077  (0x435)\r\n        SERVICE_EXIT_CODE  : 0  (0x0)\r\n        CHECKPOINT         : 0x0\r\n        WAIT_HINT          : 0x0\r\n\r\n\r\ncmd: C:\\Windows\\System32\\sc.exe qc appid\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n[SC] QueryServiceConfig SUCCESS\r\n\r\nSERVICE_NAME: appid\r\n        TYPE               : 1  KERNEL_DRIVER \r\n        START_TYPE         : 3   DEMAND_START\r\n        ERROR_CONTROL      : 1   NORMAL\r\n        BINARY_PATH_NAME   : system32\\drivers\\appid.sys\r\n        LOAD_ORDER_GROUP   : \r\n        TAG                : 0\r\n        DISPLAY_NAME       : AppID Driver\r\n        DEPENDENCIES       : FltMgr\r\n        SERVICE_START_NAME : \r\n\r\n\r\n##### WinDefend\r\ncmd: C:\\Windows\\System32\\sc.exe query WinDefend\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nSERVICE_NAME: WinDefend \r\n        TYPE               : 10  WIN32_OWN_PROCESS  \r\n        STATE              : 4  RUNNING \r\n                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)\r\n        WIN32_EXIT_CODE    : 0  (0x0)\r\n        SERVICE_EXIT_CODE  : 0  (0x0)\r\n        CHECKPOINT         : 0x0\r\n        WAIT_HINT          : 0x0\r\n\r\n\r\ncmd: C:\\Windows\\System32\\sc.exe qc WinDefend\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n[SC] QueryServiceConfig SUCCESS\r\n\r\nSERVICE_NAME: WinDefend\r\n        TYPE               : 10  WIN32_OWN_PROCESS \r\n        START_TYPE         : 2   AUTO_START\r\n        ERROR_CONTROL      : 1   NORMAL\r\n        BINARY_PATH_NAME   : \"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18.26080.4-0\\MsMpEng.exe\"\r\n        LOAD_ORDER_GROUP   : \r\n        TAG                : 0\r\n        DISPLAY_NAME       : Microsoft Defender Antivirus Service\r\n        DEPENDENCIES       : RpcSs\r\n        SERVICE_START_NAME : LocalSystem\r\n\r\n\r\n##### MDCoreSvc\r\ncmd: C:\\Windows\\System32\\sc.exe query MDCoreSvc\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nSERVICE_NAME: MDCoreSvc \r\n        TYPE               : 10  WIN32_OWN_PROCESS  \r\n        STATE              : 4  RUNNING \r\n                                (STOPPABLE, NOT_PAUSABLE, ACCEPTS_SHUTDOWN)\r\n        WIN32_EXIT_CODE    : 0  (0x0)\r\n        SERVICE_EXIT_CODE  : 0  (0x0)\r\n        CHECKPOINT         : 0x0\r\n        WAIT_HINT          : 0x0\r\n\r\n\r\ncmd: C:\\Windows\\System32\\sc.exe qc MDCoreSvc\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n[SC] QueryServiceConfig SUCCESS\r\n\r\nSERVICE_NAME: MDCoreSvc\r\n        TYPE               : 10  WIN32_OWN_PROCESS \r\n        START_TYPE         : 2   AUTO_START\r\n        ERROR_CONTROL      : 1   NORMAL\r\n        BINARY_PATH_NAME   : \"C:\\ProgramData\\Microsoft\\Windows Defender\\Platform\\4.18.26080.4-0\\MpDefenderCoreService.exe\"\r\n        LOAD_ORDER_GROUP   : \r\n        TAG                : 0\r\n        DISPLAY_NAME       : Microsoft Defender Core Service\r\n        DEPENDENCIES       : \r\n        SERVICE_START_NAME : LocalSystem\r\n\r\n\r\n##### SecurityHealthService\r\ncmd: C:\\Windows\\System32\\sc.exe query SecurityHealthService\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nSERVICE_NAME: SecurityHealthService \r\n        TYPE               : 10  WIN32_OWN_PROCESS  \r\n        STATE              : 1  STOPPED \r\n        WIN32_EXIT_CODE    : 1077  (0x435)\r\n        SERVICE_EXIT_CODE  : 0  (0x0)\r\n        CHECKPOINT         : 0x0\r\n        WAIT_HINT          : 0x0\r\n\r\n\r\ncmd: C:\\Windows\\System32\\sc.exe qc SecurityHealthService\r\nrc=0 timedOut=False ms=18 startError= pipes_not_drained=False\r\n--- stdout ---\r\n[SC] QueryServiceConfig SUCCESS\r\n\r\nSERVICE_NAME: SecurityHealthService\r\n        TYPE               : 10  WIN32_OWN_PROCESS \r\n        START_TYPE         : 3   DEMAND_START\r\n        ERROR_CONTROL      : 1   NORMAL\r\n        BINARY_PATH_NAME   : C:\\Windows\\system32\\SecurityHealthService.exe\r\n        LOAD_ORDER_GROUP   : \r\n        TAG                : 0\r\n        DISPLAY_NAME       : Windows Security Service\r\n        DEPENDENCIES       : RpcSs\r\n        SERVICE_START_NAME : LocalSystem\r\n\r\n\r\n##### wscsvc\r\ncmd: C:\\Windows\\System32\\sc.exe query wscsvc\r\nrc=1060 timedOut=False ms=17 startError= pipes_not_drained=False\r\n--- stdout ---\r\n[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\r\n\r\nThe specified service does not exist as an installed service.\r\n\r\n\r\n\r\ncmd: C:\\Windows\\System32\\sc.exe qc wscsvc\r\nrc=1060 timedOut=False ms=17 startError= pipes_not_drained=False\r\n--- stdout ---\r\n[SC] OpenService FAILED 1060:\r\n\r\nThe specified service does not exist as an installed service.\r\n\r\n\r\n\r\n",
+    "example_policies_folder":  {
+                                    "folder":  "C:\\Windows\\schemas\\CodeIntegrity\\ExamplePolicies",
+                                    "files":  [
+                                                  {
+                                                      "name":  "AllowAll.xml",
+                                                      "length":  1956,
+                                                      "last_write_utc":  "2021-05-08T08:14:56.767Z"
+                                                  },
+                                                  {
+                                                      "name":  "AllowAll_EnableHVCI.xml",
+                                                      "length":  2054,
+                                                      "last_write_utc":  "2021-05-08T08:14:56.767Z"
+                                                  },
+                                                  {
+                                                      "name":  "AllowMicrosoft.xml",
+                                                      "length":  7042,
+                                                      "last_write_utc":  "2021-05-08T08:14:56.767Z"
+                                                  },
+                                                  {
+                                                      "name":  "DefaultWindows_Audit.xml",
+                                                      "length":  11012,
+                                                      "last_write_utc":  "2021-05-08T08:14:56.767Z"
+                                                  },
+                                                  {
+                                                      "name":  "DefaultWindows_Enforced.xml",
+                                                      "length":  10951,
+                                                      "last_write_utc":  "2021-05-08T08:14:56.767Z"
+                                                  },
+                                                  {
+                                                      "name":  "DenyAllAudit.xml",
+                                                      "length":  1680,
+                                                      "last_write_utc":  "2021-05-08T08:14:56.767Z"
+                                                  },
+                                                  {
+                                                      "name":  "RecommendedDriverBlock_Enforced.xml",
+                                                      "length":  536783,
+                                                      "last_write_utc":  "2026-09-06T00:40:53.626Z"
+                                                  }
+                                              ]
+                                },
+    "example_policy_copy":  "SmartAppControl.xml not found at C:\\Windows\\schemas\\CodeIntegrity\\ExamplePolicies\\SmartAppControl.xml",
+    "ci_policy_files":  {
+                            "System32\\CodeIntegrity\\CiPolicies\\Active":  [
+
+                                                                            ],
+                            "System32\\CodeIntegrity":  [
+                                                            "driversipolicy.p7b (242130 bytes)",
+                                                            "VbsSiPolicy.p7b (76065 bytes)"
+                                                        ]
+                        },
+    "ci_cmdlets":  {
+                       "ConvertFrom-CIPolicy":  "ConvertFrom-CIPolicy (ConfigCI)",
+                       "Set-RuleOption":  "Set-RuleOption (ConfigCI)",
+                       "Set-CIPolicyIdInfo":  "Set-CIPolicyIdInfo (ConfigCI)",
+                       "Set-CIPolicyVersion":  "Set-CIPolicyVersion (ConfigCI)",
+                       "New-CIPolicy":  "New-CIPolicy (ConfigCI)",
+                       "Merge-CIPolicy":  "Merge-CIPolicy (ConfigCI)",
+                       "ConfigCI_module":  "ConfigCI 1.0 C:\\Windows\\system32\\WindowsPowerShell\\v1.0\\Modules\\ConfigCI\\ConfigCI.psd1"
+                   },
+    "webview2_runtime":  {
+                             "HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}":  "131.0.2903.86",
+                             "HKLM:\\SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}":  "absent",
+                             "HKCU:\\SOFTWARE\\Microsoft\\EdgeUpdate\\Clients\\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}":  "absent",
+                             "C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application":  "131.0.2903.86, SetupMetrics",
+                             "C:\\Program Files\\Microsoft\\EdgeWebView\\Application":  "folder not found"
+                         },
+    "device_guard":  {
+                         "SecurityServicesConfigured":  "0",
+                         "SecurityServicesRunning":  "0",
+                         "VirtualizationBasedSecurityStatus":  2,
+                         "CodeIntegrityPolicyEnforcementStatus":  2,
+                         "UsermodeCodeIntegrityPolicyEnforcementStatus":  0,
+                         "RequiredSecurityProperties":  "0",
+                         "AvailableSecurityProperties":  "1 5 7"
+                     },
+    "secure_boot":  "False",
+    "ci_log":  {
+                   "LogName":  "Microsoft-Windows-CodeIntegrity/Operational",
+                   "IsEnabled":  true,
+                   "LogMode":  "Circular",
+                   "RecordCount":  42,
+                   "FileSize":  69632,
+                   "MaximumSizeInBytes":  1052672
+               },
+    "appidtel_present":  "C:\\Windows\\System32\\appidtel.exe exists=True",
+    "native_helper":  {
+                          "ready":  true,
+                          "error":  null,
+                          "code_integrity":  {
+                                                 "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                 "options_hex":  "0x00282203",
+                                                 "flags":  [
+                                                               "ENABLED",
+                                                               "TESTSIGN",
+                                                               "FLIGHTING_ENABLED",
+                                                               "HVCI_IUM_ENABLED"
+                                                           ]
+                                             }
+                      },
+    "execution_policy":  "\r\n        Scope ExecutionPolicy\r\n        ----- ---------------\r\nMachinePolicy       Undefined\r\n   UserPolicy       Undefined\r\n      Process          Bypass\r\n  CurrentUser       Undefined\r\n LocalMachine    Unrestricted\r\n\r\n\r\n",
+    "tools":  {
+                  "node":  "cmd: C:\\hostedtoolcache\\windows\\node\\22.23.3\\x64\\node.exe --version\r\nrc=0 timedOut=False ms=26 startError= pipes_not_drained=False\r\n--- stdout ---\r\nv22.23.3\r\n\r\n",
+                  "rustc":  "cmd: C:\\Users\\runneradmin\\.cargo\\bin\\rustc.exe -vV\r\nrc=0 timedOut=False ms=4513 startError= pipes_not_drained=False\r\n--- stdout ---\r\nrustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: x86_64-pc-windows-msvc\nrelease: 1.98.1\nLLVM version: 22.1.8\n\r\n",
+                  "rustup_targets":  "cmd: C:\\Users\\runneradmin\\.cargo\\bin\\rustup.exe target list --installed\r\nrc=0 timedOut=False ms=1565 startError= pipes_not_drained=False\r\n--- stdout ---\r\ni686-pc-windows-msvc\nx86_64-pc-windows-gnu\nx86_64-pc-windows-msvc\n\r\n",
+                  "7z":  "C:\\ProgramData\\Chocolatey\\bin\\7z.exe",
+                  "curl":  "cmd: C:\\Windows\\System32\\curl.exe --version\r\nrc=0 timedOut=False ms=287 startError= pipes_not_drained=False\r\n--- stdout ---\r\ncurl 8.13.0 (Windows) libcurl/8.13.0 Schannel zlib/1.3.1 WinIDN\r\nRelease-Date: 2025-04-02\r\nProtocols: dict file ftp ftps http https imap imaps ipfs ipns mqtt pop3 pop3s smb smbs smtp smtps telnet tftp ws wss\r\nFeatures: alt-svc AsynchDNS HSTS HTTPS-proxy IDN IPv6 Kerberos Largefile libz NTLM SPNEGO SSL SSPI threadsafe Unicode UnixSockets\r\n\r\n"
+              },
+    "systeminfo":  "cmd: C:\\Windows\\System32\\systeminfo.exe \r\nrc=0 timedOut=False ms=1972 startError= pipes_not_drained=False\r\n--- stdout ---\r\n\r\nHost Name:                 runnervmdlhio\r\nOS Name:                   Microsoft Windows Server 2022 Datacenter\r\nOS Version:                10.0.20348 N/A Build 20348\r\nOS Manufacturer:           Microsoft Corporation\r\nOS Configuration:          Standalone Server\r\nOS Build Type:             Multiprocessor Free\r\nRegistered Owner:          N/A\r\nRegistered Organization:   N/A\r\nProduct ID:                00454-60000-00001-AA015\r\nOriginal Install Date:     9/28/2026, 1:53:27 AM\r\nSystem Boot Time:          10/3/2026, 7:53:34 PM\r\nSystem Manufacturer:       Microsoft Corporation\r\nSystem Model:              Virtual Machine\r\nSystem Type:               x64-based PC\r\nProcessor(s):              1 Processor(s) Installed.\r\n                           [01]: AMD64 Family 25 Model 17 Stepping 1 AuthenticAMD ~2596 Mhz\r\nBIOS Version:              Microsoft Corporation Hyper-V UEFI Release v4.1, 4/22/2026\r\nWindows Directory:         C:\\Windows\r\nSystem Directory:          C:\\Windows\\system32\r\nBoot Device:               \\Device\\HarddiskVolume3\r\nSystem Locale:             en-us;English (United States)\r\nInput Locale:              en-us;English (United States)\r\nTime Zone:                 (UTC) Coordinated Universal Time\r\nTotal Physical Memory:     16,379 MB\r\nAvailable Physical Memory: 13,905 MB\r\nVirtual Memory: Max Size:  19,323 MB\r\nVirtual Memory: Available: 16,894 MB\r\nVirtual Memory: In Use:    2,429 MB\r\nPage File Location(s):     C:\\pagefile.sys\r\nDomain:                    WORKGROUP\r\nLogon Server:              \\\\runnervmdlhio\r\nHotfix(s):                 5 Hotfix(s) Installed.\r\n                           [01]: KB5126422\r\n                           [02]: KB5126050\r\n                           [03]: KB5011048\r\n                           [04]: KB5122882\r\n                           [05]: KB5122881\r\nNetwork Card(s):           2 NIC(s) Installed.\r\n                           [01]: Mellanox ConnectX-5 Ex Virtual Adapter\r\n                                 Connection Name: Ethernet 4\r\n                                 DHCP Enabled:    No\r\n                                 IP address(es)\r\n                           [02]: Microsoft Hyper-V Network Adapter\r\n                                 Connection Name: Ethernet 3\r\n                                 DHCP Enabled:    Yes\r\n                                 DHCP Server:     168.63.129.16\r\n                                 IP address(es)\r\n                                 [01]: 10.1.0.107\r\n                                 [02]: fe80::cb13:a406:8f2a:246a\r\nHyper-V Requirements:      A hypervisor has been detected. Features required for Hyper-V will not be displayed.\r\n\r\n",
+    "_finished":  "2026-10-03T20:03:39.470Z"
+}

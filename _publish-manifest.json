@@ -1,0 +1,189 @@
+{
+  "generated": "2026-10-03T20:08:17.864Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37150100607",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37150100607",
+  "job": "e2e",
+  "os": "windows-2022",
+  "branch": "diag-results/37150100607-1-e2e-windows-2022",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "done-e2e-update.json",
+      "bytes": 142
+    },
+    {
+      "path": "done-p0-facts.json",
+      "bytes": 140
+    },
+    {
+      "path": "done-p1-assets.json",
+      "bytes": 141
+    },
+    {
+      "path": "done-replica.json",
+      "bytes": 139
+    },
+    {
+      "path": "e2e-appfile-01-000003.log",
+      "bytes": 680
+    },
+    {
+      "path": "e2e-appfile-02-000003.log",
+      "bytes": 287
+    },
+    {
+      "path": "e2e-appfile-03-000003.log",
+      "bytes": 349
+    },
+    {
+      "path": "e2e-appfile-04-000003.log",
+      "bytes": 112
+    },
+    {
+      "path": "e2e-appfile-05-000003.log",
+      "bytes": 50
+    },
+    {
+      "path": "e2e-appfile-06-000003.log",
+      "bytes": 114
+    },
+    {
+      "path": "e2e-appfile-07-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "e2e-appfile-08-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "e2e-appfile-09-000003.log",
+      "bytes": 46
+    },
+    {
+      "path": "e2e-appfile-10-cys-installed-version.txt",
+      "bytes": 7
+    },
+    {
+      "path": "e2e-appfile-11-phoenix-restore.log",
+      "bytes": 3371
+    },
+    {
+      "path": "e2e-appfile-12-office-bridge.log",
+      "bytes": 497
+    },
+    {
+      "path": "e2e-appfiles.txt",
+      "bytes": 48667
+    },
+    {
+      "path": "e2e-before.png",
+      "bytes": 12837
+    },
+    {
+      "path": "e2e-cdp-after.json",
+      "bytes": 3132
+    },
+    {
+      "path": "e2e-cdp-stdout.txt",
+      "bytes": 1694
+    },
+    {
+      "path": "e2e-cdp.json",
+      "bytes": 4932
+    },
+    {
+      "path": "e2e-ci-events.json",
+      "bytes": 87
+    },
+    {
+      "path": "e2e-eventlog-application.txt",
+      "bytes": 81
+    },
+    {
+      "path": "e2e-observe.json",
+      "bytes": 3053
+    },
+    {
+      "path": "e2e-screen-20s.png",
+      "bytes": 179530
+    },
+    {
+      "path": "e2e-screen-end.png",
+      "bytes": 26584
+    },
+    {
+      "path": "e2e-screen-installer.png",
+      "bytes": 179385
+    },
+    {
+      "path": "e2e-timeline.txt",
+      "bytes": 4313
+    },
+    {
+      "path": "e2e-verdict.json",
+      "bytes": 28467
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-e2e-update.txt",
+      "bytes": 169
+    },
+    {
+      "path": "log-p0-facts.txt",
+      "bytes": 165
+    },
+    {
+      "path": "log-p1-assets.txt",
+      "bytes": 167
+    },
+    {
+      "path": "log-replica.txt",
+      "bytes": 1711
+    },
+    {
+      "path": "p0-facts.json",
+      "bytes": 31762
+    },
+    {
+      "path": "p0-facts.txt",
+      "bytes": 26534
+    },
+    {
+      "path": "p1-assets.json",
+      "bytes": 20908
+    },
+    {
+      "path": "replica-build.json",
+      "bytes": 2074
+    },
+    {
+      "path": "replica-summary.txt",
+      "bytes": 774
+    },
+    {
+      "path": "replica.json",
+      "bytes": 76199
+    },
+    {
+      "path": "subjects.json",
+      "bytes": 182280
+    },
+    {
+      "path": "syntax-check.txt",
+      "bytes": 150
+    }
+  ],
+  "skipped": [
+    {
+      "path": "e2e-cdp-stderr.txt",
+      "reason": "empty file"
+    }
+  ],
+  "inline_files": 27,
+  "blob_files": 15
+}
