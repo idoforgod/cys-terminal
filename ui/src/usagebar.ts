@@ -23,6 +23,8 @@
 //     '● 사용 중' 표식을 단다. 주 계정은 사용 중 → 관측 신선도 순이다. 30분 넘은 관측·스냅샷은 경고색 없이 '오래됨'으로
 //     적는다(값·게이지 폭은 그대로 — 지난 값을 빨갛게 외치지 않는다). 숨긴 계정(뷰어별 목록은 main.ts 가 읽어 인자로
 //     넘긴다)은 후보·줄·요약에서 뺀다. 가산 키가 없으면(구버전 데몬) 종전 규칙으로 폴백한다 — IPC 데이터라 전부 의심한다.
+//   · ★(0.14.43 · UI2) Control Center Live KPI 의 '전 좌석 폴백'(계정 병합 값이 없을 때)도 옛 좌석 값을 되살리지 않는다 — aggSeatRates 가 경보 부적격(alert_eligible=false)
+//     창과 리셋 지난 창을 집계에서 뺀다. 구버전 데몬(키 없음)은 리셋 지난 창만 뺀다.
 //
 // ★이 모듈의 불변식(usagewiring.test.ts 가 핀으로 고정):
 //   · 최상위 부수효과 0 — 선언(export/const/function/type)만. 브라우저 저장소(local·session)·document·window·타이머 접근 0.
@@ -787,6 +789,39 @@ export function kpiCandidates(accounts: AcctRow[], label: string, nowSec: number
     out.push(a);
   }
   return out;
+}
+
+/** Control Center Live KPI 폴백('세션 5h'·'주간 7d' — 계정 병합 값이 없을 때 main.ts ccAggRate)의 전 좌석 집계 — 라벨별 사용률 최댓값·가장 이른 리셋.
+ *  좌석의 `usage.rate` 는 로그인을 바꾼 뒤에도 옛 계정의 마지막 값(예 99%)을 리셋 전까지 들고 있을 수 있어, 그대로 최댓값을 잡으면 폴백이 그 값을
+ *  대표값으로 되살린다(0.14.43 UI2). 그래서 **창 단위로 뺀다**:
+ *   · `alert_eligible === false` — 데몬(B3)의 경보 입력 부적격 판정(리셋 전 ∧ (사용 중 ∨ 관측 30분 이내)가 아니다). 키가 없는 구버전 데몬은 이 줄이 안 걸린다.
+ *   · 리셋 시각이 유효(유한한 양수)하고 `nowSec` 이 그 이후 — 리셋 지난 값(사이드바 windowView 의 '리셋됨' 규칙과 같다). 구버전 데몬은 이것만 걸린다.
+ *     `alert_eligible` 이 true 여도 리셋이 지났으면 뺀다(데몬이 판정한 시각과 지금 사이에 리셋이 지날 수 있다 — 지난 창은 어떤 경우에도 대표값이 아니다).
+ *   · `used_pct` 가 유한한 숫자가 아님(문자열·null·NaN·무한대) · 라벨이 비어 있지 않은 문자열이 아님.
+ *  나머지(최댓값 — 0 미만은 0 으로 접힌다 · 가장 이른 리셋)는 종전 main.ts ccAggRate 와 같다: 리셋 전 · 유한한 값만 있는 fleet 은 종전과 같은 결과다(동치 속성 검체).
+ *  fleet = `control.dashboard` 의 좌석 배열 — IPC 데이터라 모든 층을 의심하고(배열 아님·null·원시값) 던지지 않는다. 결과는 프로토타입 없는 객체다
+ *  (`__proto__`·`constructor` 같은 이상한 라벨이 와도 무해). */
+export function aggSeatRates(fleet: unknown, nowSec: number): Record<string, { used: number; reset: number | null }> {
+  const agg: Record<string, { used: number; reset: number | null }> = Object.create(null);
+  if (!Array.isArray(fleet)) return agg;
+  for (const seat of fleet) {
+    const usage: unknown = isObj(seat) ? seat.usage : undefined;
+    const rate: unknown = isObj(usage) ? usage.rate : undefined;
+    if (!Array.isArray(rate)) continue;
+    for (const w of rate) {
+      if (!isObj(w) || w.alert_eligible === false) continue;
+      const label = w.label;
+      const used = w.used_pct;
+      if (typeof label !== "string" || label === "" || typeof used !== "number" || !Number.isFinite(used)) continue;
+      const reset = typeof w.resets_at === "number" && Number.isFinite(w.resets_at) ? w.resets_at : null;
+      if (reset !== null && reset > 0 && nowSec >= reset) continue; // 리셋 지난 창 = 옛 값
+      const cur = agg[label] ?? { used: 0, reset: null };
+      if (used > cur.used) cur.used = used;
+      if (reset !== null && (cur.reset === null || reset < cur.reset)) cur.reset = reset;
+      agg[label] = cur;
+    }
+  }
+  return agg;
 }
 
 export interface FetchGate {

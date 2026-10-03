@@ -423,3 +423,29 @@ describe("0.14.43 UI1 — style.css(기존 강조색 재사용 · 사이드바 �
     expect(rule(".cc-acct-hide")).toContain("flex: none");
   });
 });
+
+// ═════════ 0.14.43 (티켓 UI2 · 추가 과제) — Control Center Live KPI 전 좌석 폴백 배선 ═════════
+// 순수 집계(경보 부적격·리셋 지난 창 제외 · 오염값 무해 · 종전 동치)는 usagebar.test.ts 의 aggSeatRates 가 표로 잡는다 — 여기는 main.ts 의 ccAggRate 가
+// 그것을 **실제로 부르는가**(옛 좌석 값을 되살리는 직접 순회를 되살리지 않았는가)만 기계로 못박는다.
+describe("0.14.43 UI2 — Control Center KPI 전 좌석 폴백 배선(ccAggRate → aggSeatRates)", () => {
+  it("ccAggRate 본문은 aggSeatRates(fleet, Date.now() / 1000) 를 돌려주는 한 줄 — 좌석 순회·usage.rate 직접 집계를 되살리지 않는다", () => {
+    const b = fnBody("ccAggRate");
+    expect(b.includes("return aggSeatRates(fleet, Date.now() / 1000);")).toBe(true);
+    for (const old of ["for (", "usage?.rate", ".resets_at", ".used_pct"]) expect({ 금지: old, 있음: b.includes(old) }).toEqual({ 금지: old, 있음: false });
+  });
+  it("main.ts 가 aggSeatRates 를 ./usagebar 에서 가져온다", () => {
+    const from = code.indexOf('} from "./usagebar"');
+    const open = code.lastIndexOf("import {", from);
+    expect(open >= 0 && from > open).toBe(true);
+    expect(code.slice(open, from).includes("  aggSeatRates,\n")).toBe(true);
+  });
+  it("renderLiveBody 는 여전히 ccAggRate(fleet) 로 폴백 값을 얻고 계정 병합 값(ccAcctMax)이 우선이다 — 경로 불변", () => {
+    const b = fnBody("renderLiveBody");
+    expect(b.includes("const agg = ccAggRate(fleet);")).toBe(true);
+    expect(b.includes("const m = ccAcctMax(lab);")).toBe(true);
+    expect(b.includes("const used = m ? Math.round(m.used) : w ? Math.round(w.used) : 0;")).toBe(true);
+  });
+  it("ccAggRate 호출 지점은 renderLiveBody 하나뿐 — 다른 곳이 옛 좌석 값을 다시 쓰지 않는다", () => {
+    expect(enclosingFns("ccAggRate(").filter((f) => f !== "ccAggRate")).toEqual(["renderLiveBody"]);
+  });
+});

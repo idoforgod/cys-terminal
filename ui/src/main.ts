@@ -146,9 +146,11 @@ import {
   isOldObservation,
   isPreviousLogin,
   kpiCandidates,
+  aggSeatRates,
   sanitizeHiddenKeys,
   USAGE_HIDDEN_MAX,
-} from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보
+} from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보·전 좌석 폴백 집계
+import { starvedNotice, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
@@ -543,16 +545,9 @@ function ccReset(label: string, epoch: number | null): string {
     : `리셋 ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 function ccAggRate(fleet: any[]): Record<string, { used: number; reset: number | null }> {
-  const agg: Record<string, { used: number; reset: number | null }> = {};
-  for (const f of fleet) {
-    for (const w of f.usage?.rate ?? []) {
-      const cur = agg[w.label] ?? { used: 0, reset: null };
-      if (w.used_pct > cur.used) cur.used = w.used_pct;
-      if (w.resets_at != null && (cur.reset == null || w.resets_at < cur.reset)) cur.reset = w.resets_at;
-      agg[w.label] = cur;
-    }
-  }
-  return agg;
+  // ★0.14.43(UI2): 순수 집계(usagebar.ts aggSeatRates) — 경보 부적격(alert_eligible=false)·리셋 지난 창을 뺀다. 좌석 usage.rate 는 로그인을 바꾼 뒤에도
+  //   옛 계정의 마지막 값(예 99%)을 리셋 전까지 들고 있어, 종전 '전 노드 최대값'이 그 값을 KPI 폴백의 대표값으로 되살렸다.
+  return aggSeatRates(fleet, Date.now() / 1000);
 }
 
 // 시:분(epoch 초) — 계정 소진 예상·최근 실행 시작시각의 간단 표기.
@@ -8197,6 +8192,34 @@ async function osBanner(title: string, body: string) {
   }
 }
 
+/// ★0.14.43(UI2): 그 좌석의 '큐 막힘' 토스트를 거둔다(없으면 무동작) — id 의 모양은 starvednotice.ts 한 곳이 정한다.
+function dismissStarvedToast(socketSlug: unknown, surfaceId: unknown): void {
+  const id = starvedDismissId(socketSlug, surfaceId);
+  if (id) dismissToast(id);
+}
+
+/// ★0.14.43(UI2): '큐 막힘' 토스트를 **눌렀을 때만** 그 좌석 pane 으로 간다(자동 전환·포커스 강탈 없음 — 클릭은 사람의 의사표시다).
+/// 좌석 = (데몬, 번호): 번호는 데몬마다 독립 발급이라 번호만으로 고르면 **다른 데몬의 같은 번호 좌석**이 열린다. 그래서 데몬을 먼저 확정한다
+/// (판정은 starvednotice.ts locateStarvedSeat — 순수·검체 있음): 부서 데몬은 socketForSlug 로, 본부 데몬은 socketForSlug 에 없으므로(부서만 등록)
+/// 백엔드가 본부 소켓·그 번호로 만든 attach 이벤트 이름(`surface-output-<slug>-<번호>`)에 이 slug 가 들어 있는지로 확인한다(attach_surface 는 이름만
+/// 돌려주는 순수 조회 — 스트림을 열지 않는다 · UI 가 slug 를 재계산하지 않는다). 확정 못 하면(탭 없는 부서의 경보 등)·좌석이 어느 탭에도 없으면·조회가
+/// 실패하면 무동작. 다른 워크스페이스(부서 탭)의 좌석이면 jumpToSurface 가 탭 전환까지 한다. Control Center 가 열려 있으면 pane 을 가리므로 닫는다
+/// (승인 Feed 의 '이 pane에서 직접 응답' 과 같은 규칙).
+async function focusStarvedSeat(socketSlug: string, sid: number): Promise<void> {
+  const seat = await locateStarvedSeat(socketSlug, sid, {
+    deptSocket: (slug) => socketForSlug.get(slug),
+    isBaseSlug: async (slug, id) => {
+      const ev = (await invoke("attach_surface", { socket: null, surfaceId: id })) as { output_event?: unknown };
+      return typeof ev?.output_event === "string" && ev.output_event.includes(slug);
+    },
+    hasSeat: (socket, id) =>
+      workspaces.some((w) => !w.pending && (w.socket ?? undefined) === socket && collectSids(w.tree).includes(id)),
+  });
+  if (!seat) return;
+  if (ccOpen) setCcOpen(false);
+  jumpToSurface(sid, seat.socket);
+}
+
 function onDaemonEvent(event: Record<string, unknown>) {
   const name = String(event.name ?? "");
   const category = String(event.category ?? "");
@@ -8295,6 +8318,30 @@ function onDaemonEvent(event: Record<string, unknown>) {
     osBanner("🚨 master 무응답(deadman)", `surface:${sid} ${payload.reason ?? ""}`); // B4 OS 배너(고우선)
     return;
   }
+  if (name === "queue.starved") {
+    // ★0.14.43(UI2): 큐 기아 경보 — 종전엔 이 이벤트를 아무도 소비하지 않았다: category "queue" 는 아래 폴백 3종(health·watchdog·feed)
+    //   어디에도 걸리지 않아 화면이 0 이었다. 좌석 큐 머리가 임계(기본 600초) 이상 막힌 것이고 조치는 대개 **사람**이 한다(그 창을 클릭해 Ctrl-U ·
+    //   질문 창에 답하기 …) — 알리는 표면이 없어 몇 시간씩 막혀도 아무도 몰랐다(CSO 좌석 자신의 경보는 라우터가 폐기한다).
+    //   ① 문구·분류·id 는 순수 starvedNotice(starvednotice.ts) — payload 는 신뢰하지 않는다(타입 검사·길이 절단). 화면에는 stickyToast(textContent)로만 간다.
+    //   ② 같은 좌석은 같은 id 하나로 갱신된다(데몬 쿨다운 5분이 빈도를 묶는다 — GUI 쪽 추가 타이머 없음). 풀리면 queue.delivered·좌석 종료가 거둔다(아래).
+    //   ③ 사람이 조치해야 하는 사유만 OS 배너를 겸한다(approval·paused·wait 는 토스트만 — 승인은 기존 승인 알림 경로).
+    //   ④ **자동 전환·포커스 강탈 없음** — 토스트를 눌렀을 때만 그 좌석으로 간다(다른 탭이면 탭 전환 포함 · 못 찾으면 무동작 · focusStarvedSeat).
+    //   ⑤ 끝의 return — 폴백 레인(category)을 타지 않는다(이중 표시 금지).
+    const starved = starvedNotice(payload, event.socket_slug);
+    if (starved) {
+      const seat = surfaceIdOfRef(payload.surface_ref);
+      const slug = typeof event.socket_slug === "string" ? event.socket_slug : "";
+      stickyToast(starved.id, "health", starved.title, starved.detail, seat === null ? undefined : () => void focusStarvedSeat(slug, seat));
+      if (starved.humanNeeded) osBanner(starved.title, starved.detail);
+    }
+    return;
+  }
+  if (name === "queue.delivered") {
+    // ★0.14.43(UI2): 그 좌석의 큐가 움직였다 = 막힘이 풀렸다 — 같은 좌석의 '큐 막힘' 토스트를 거둔다(없으면 무동작). 다른 처리는 없다
+    //   (category "queue" 는 폴백 레인이 없어 종전에도 화면 0 이었다 — return 으로 달라지는 것 없음).
+    dismissStarvedToast(event.socket_slug, sid);
+    return;
+  }
   if (name === "status.changed" || name === "task.changed") {
     if (name === "status.changed") refreshSidebarStatus(); // toast 없음(빈도 높음) — 사이드바만
     // Tasks Control Center 실시간 갱신: 부서(socket_slug)×노드(surface_id) 셀 패치. 폴링 없이 즉시.
@@ -8332,6 +8379,7 @@ function onDaemonEvent(event: Record<string, unknown>) {
     refreshFeed();
     refreshSidebarStatus(); // 피드 이벤트 시 집계 배지 갱신(멀티부서 정합)
   } else if (name === "surface.exited" || name === "surface.closed" || name === "surface.reaped") {
+    dismissStarvedToast(event.socket_slug, sid); // ★0.14.43(UI2): 끝난 좌석의 '큐 막힘' 토스트를 거둔다 — 아래 slug 미해석 조기 return 보다 앞(id 는 slug 문자열만으로 정해진다)
     // 종료 즉시 죽은 pane 자동 제거 (A안) — 데몬 reap을 기다리지 않는다. 멱등.
     // 멀티마스터 F4: 출처 데몬을 socket_slug로 특정해 그 부서 pane만 제거(타 부서 같은 sid 보호).
     const sock = event.socket_slug ? socketForSlug.get(String(event.socket_slug)) : undefined;

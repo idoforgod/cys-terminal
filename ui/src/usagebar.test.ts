@@ -23,6 +23,7 @@ import {
   isOldObservation,
   isPreviousLogin,
   kpiCandidates,
+  aggSeatRates,
   sanitizeHiddenKeys,
   USAGE_OTHERS_MAX,
   USAGE_ALIAS_MAX,
@@ -1147,5 +1148,209 @@ describe("isOldObservation — Control Center 행의 '오래됨' 판정(30분 �
     expect(isOldObservation(R("a", { age: 1801 }), NOW)).toBe(true);
     expect(isOldObservation(R("a", { age: 5, src: "snapshot" }), NOW)).toBe(true);
     expect(isOldObservation(acct({ updated_at: null, source: "" }), NOW)).toBe(false);
+  });
+});
+
+// ═════════ 0.14.43 (티켓 UI2 · 추가 과제) — Control Center Live KPI 전 좌석 폴백(aggSeatRates) ═════════
+// 계정 병합 값이 없을 때 KPI '세션(5h)'·'주간(7d)' 는 전 좌석 usage.rate 의 최댓값으로 폴백한다. 좌석의 usage.rate 는 로그인을 바꾼 뒤에도 옛 계정의
+// 마지막 값(예 99%)을 리셋 전까지 들고 있어, 그 값이 대표값으로 되살아났다(UI1 잔여 위험 R2). 창 단위로 뺀다: alert_eligible === false · 리셋 지난 창 ·
+// 유한한 숫자가 아닌 사용률. 나머지(최댓값·가장 이른 리셋)는 종전과 같다.
+describe("aggSeatRates — 전 좌석 폴백 집계(옛 좌석 값을 되살리지 않는다)", () => {
+  type AggRow = { label?: unknown; used_pct?: unknown; resets_at?: unknown; alert_eligible?: unknown };
+  const seat = (rate: unknown, extra: Record<string, unknown> = {}) => ({ role: "worker", state: "working", usage: { ctx_pct: 10, rate, ...extra } });
+  const w = (label: string, used_pct: number, resets_at: number | null = NOW + 3600, alert_eligible?: boolean): AggRow => ({
+    label,
+    used_pct,
+    resets_at,
+    ...(alert_eligible === undefined ? {} : { alert_eligible }),
+  });
+  /** 종전 main.ts ccAggRate 본문 그대로(0.14.43 UI2 이전) — 동치 속성 검체의 기준. */
+  function legacyAggRate(fleet: any[]): Record<string, { used: number; reset: number | null }> {
+    const agg: Record<string, { used: number; reset: number | null }> = {};
+    for (const f of fleet) {
+      for (const x of f.usage?.rate ?? []) {
+        const cur = agg[x.label] ?? { used: 0, reset: null };
+        if (x.used_pct > cur.used) cur.used = x.used_pct;
+        if (x.resets_at != null && (cur.reset == null || x.resets_at < cur.reset)) cur.reset = x.resets_at;
+        agg[x.label] = cur;
+      }
+    }
+    return agg;
+  }
+
+  it("★alert_eligible:false 창은 뺀다 — 로그인을 바꾼 옛 좌석의 99% 가 대표값이 되지 않는다", () => {
+    const fleet = [seat([w("5h", 99, NOW + 600, false)]), seat([w("5h", 12, NOW + 600, true)])];
+    expect(aggSeatRates(fleet, NOW)).toEqual({ "5h": { used: 12, reset: NOW + 600 } });
+    // 종전에는 99 가 이겼다 — 그 차이가 이 과제의 전부다
+    expect(legacyAggRate(fleet)["5h"].used).toBe(99);
+  });
+  it("부적격 창만 있으면 그 라벨은 아예 없다(0% 로 위장하지 않는다 — 호출측이 '값 없음' 경로를 탄다)", () => {
+    expect(aggSeatRates([seat([w("5h", 99, NOW + 600, false), w("7d", 80, NOW + 600, false)])], NOW)).toEqual({});
+    // 같은 좌석에서 한 창만 부적격이면 다른 창은 남는다
+    expect(aggSeatRates([seat([w("5h", 99, NOW + 600, false), w("7d", 40, NOW + 600, true)])], NOW)).toEqual({ "7d": { used: 40, reset: NOW + 600 } });
+  });
+  it("alert_eligible 가 true 이거나 키가 없으면 넣는다(구버전 데몬은 키가 없다) · 부적격(false)이 아닌 값(null·0·문자열)도 '키 없음'처럼 넣는다", () => {
+    expect(aggSeatRates([seat([w("5h", 30, NOW + 60, true)])], NOW)).toEqual({ "5h": { used: 30, reset: NOW + 60 } });
+    expect(aggSeatRates([seat([w("5h", 30, NOW + 60)])], NOW)).toEqual({ "5h": { used: 30, reset: NOW + 60 } });
+    for (const v of [null, 0, "false", "", undefined])
+      expect({ 값: String(v), 결과: aggSeatRates([seat([{ label: "5h", used_pct: 30, resets_at: NOW + 60, alert_eligible: v }])], NOW) }).toEqual({
+        값: String(v),
+        결과: { "5h": { used: 30, reset: NOW + 60 } },
+      });
+  });
+  it("★리셋 지난 창은 뺀다 — 키가 없는 구버전도 · alert_eligible:true 여도(데몬 판정 뒤에 리셋이 지났을 수 있다)", () => {
+    for (const ae of [undefined, true] as const) {
+      expect({ ae: String(ae), 결과: aggSeatRates([seat([w("5h", 99, NOW - 1, ae), w("7d", 88, NOW - 3600, ae)])], NOW) }).toEqual({ ae: String(ae), 결과: {} });
+    }
+    // 같은 라벨의 리셋 전 값이 있으면 그것만 남는다
+    expect(aggSeatRates([seat([w("5h", 99, NOW - 1)]), seat([w("5h", 20, NOW + 100)])], NOW)).toEqual({ "5h": { used: 20, reset: NOW + 100 } });
+  });
+  it("리셋 경계 — windowView 의 '리셋됨' 규칙과 같다: nowSec ≥ resets_at 이면 뺀다 · 1초 전이면 넣는다", () => {
+    expect(aggSeatRates([seat([w("5h", 50, NOW)])], NOW)).toEqual({}); // 같은 초 = 리셋됨
+    expect(aggSeatRates([seat([w("5h", 50, NOW + 1)])], NOW)).toEqual({ "5h": { used: 50, reset: NOW + 1 } });
+    expect(windowView(acct({ rate: [win("5h", 50, NOW)] }), "5h", NOW).state).toBe("rolled"); // 같은 경계를 사이드바가 이미 쓴다
+    // 시계가 리셋 전이면(되돌린 시계) 넣는다
+    expect(aggSeatRates([seat([w("5h", 50, NOW)])], NOW - 10)).toEqual({ "5h": { used: 50, reset: NOW } });
+  });
+  it("리셋 시각이 없거나(null·키 없음) 쓸 수 없는 값(문자열·NaN)이면 리셋 판정 없이 넣는다 — reset 은 null", () => {
+    for (const r of [null, undefined, "soon", Number.NaN, Infinity]) {
+      expect({ 리셋: String(r), 결과: aggSeatRates([seat([{ label: "5h", used_pct: 61, resets_at: r }])], NOW) }).toEqual({
+        리셋: String(r),
+        결과: { "5h": { used: 61, reset: null } },
+      });
+    }
+    // 0·음수는 '유효한 리셋 시각'이 아니라 리셋 지남 판정에서 빠진다(windowView 와 같다) — 값은 넣는다
+    for (const r of [0, -5]) expect(aggSeatRates([seat([{ label: "5h", used_pct: 61, resets_at: r }])], NOW)["5h"].used).toBe(61);
+  });
+  it("used_pct 가 유한한 숫자가 아니면 뺀다(문자열·null·undefined·NaN·±Infinity·불리언·객체·배열)", () => {
+    for (const v of ["50", "99%", "", null, undefined, Number.NaN, Infinity, -Infinity, true, false, {}, [50], [], () => 1])
+      expect({ 값: String(v), 결과: aggSeatRates([seat([{ label: "5h", used_pct: v, resets_at: NOW + 60 }])], NOW) }).toEqual({ 값: String(v), 결과: {} });
+    // 오염된 창이 정상 창의 집계를 오염시키지 않는다
+    expect(aggSeatRates([seat([{ label: "5h", used_pct: "99", resets_at: NOW + 60 }, w("5h", 7, NOW + 60)])], NOW)).toEqual({ "5h": { used: 7, reset: NOW + 60 } });
+  });
+  it("라벨이 비어 있지 않은 문자열이 아니면 뺀다(숫자·null·빈 문자열·객체)", () => {
+    for (const l of [7, null, undefined, "", {}, [], true])
+      expect({ 라벨: String(l), 결과: aggSeatRates([seat([{ label: l, used_pct: 50, resets_at: NOW + 60 }])], NOW) }).toEqual({ 라벨: String(l), 결과: {} });
+    // 알 수 없는 라벨도 라벨대로 집계한다(종전과 같다)
+    expect(aggSeatRates([seat([w("30d", 11, NOW + 60)])], NOW)).toEqual({ "30d": { used: 11, reset: NOW + 60 } });
+  });
+  it("집계 — 라벨별 사용률 최댓값 · 가장 이른 리셋(좌석이 여러 개) · 0 미만은 0 으로 접힌다(종전과 같다)", () => {
+    const fleet = [
+      seat([w("5h", 40, NOW + 900), w("7d", 10, NOW + 90000)]),
+      seat([w("5h", 75, NOW + 300), w("7d", 55, NOW + 80000)]),
+      seat([w("5h", 20, NOW + 100)]),
+      seat([w("5h", -3, NOW + 5000)]),
+    ];
+    expect(aggSeatRates(fleet, NOW)).toEqual({ "5h": { used: 75, reset: NOW + 100 }, "7d": { used: 55, reset: NOW + 80000 } });
+    expect(aggSeatRates([seat([w("5h", -3, NOW + 5000)])], NOW)).toEqual({ "5h": { used: 0, reset: NOW + 5000 } });
+    // 리셋이 없는 창은 가장 이른 리셋 계산에 끼지 않는다
+    expect(aggSeatRates([seat([w("5h", 10, null)]), seat([w("5h", 5, NOW + 77)])], NOW)).toEqual({ "5h": { used: 10, reset: NOW + 77 } });
+  });
+  it("★오염값 무해 — fleet 이 배열이 아니거나 좌석·usage·rate·창이 이상해도 던지지 않고 빈 집계", () => {
+    for (const f of [null, undefined, {}, "x", 7, true, { length: 3 }, () => 1])
+      expect({ fleet: String(f), 결과: aggSeatRates(f, NOW) }).toEqual({ fleet: String(f), 결과: {} });
+    const junk = [
+      null,
+      7,
+      "x",
+      [],
+      {},
+      { usage: null },
+      { usage: 7 },
+      { usage: "x" },
+      { usage: {} },
+      { usage: { rate: null } },
+      { usage: { rate: "x" } },
+      { usage: { rate: {} } },
+      { usage: { rate: 7 } },
+      { usage: { rate: [null, 3, "x", [], {}, { label: "5h" }, { used_pct: 5 }] } },
+    ];
+    expect(aggSeatRates(junk, NOW)).toEqual({});
+    // 정상 좌석이 섞여 있으면 그것만 남는다
+    expect(aggSeatRates([...junk, seat([w("5h", 33, NOW + 60)])], NOW)).toEqual({ "5h": { used: 33, reset: NOW + 60 } });
+    // 시계가 이상해도(NaN) 던지지 않는다 — 리셋 지남 판정이 안 걸릴 뿐이다
+    expect(aggSeatRates([seat([w("5h", 33, NOW - 1000)])], Number.NaN)).toEqual({ "5h": { used: 33, reset: NOW - 1000 } });
+  });
+  it("프로토타입 없는 결과 — __proto__·constructor 같은 이상한 라벨이 와도 전역 객체를 건드리지 않고 그 라벨대로 집계된다", () => {
+    const evil = ["__proto__", "constructor", "toString", "hasOwnProperty", "prototype"];
+    const out = aggSeatRates([seat(evil.map((l, i) => w(l, 10 + i, NOW + 100)))], NOW);
+    expect(Object.keys(out).sort()).toEqual([...evil].sort());
+    for (const l of evil) expect(out[l].used).toBe(10 + evil.indexOf(l));
+    expect(({} as Record<string, unknown>)["used"]).toBeUndefined(); // Object.prototype 이 오염되지 않았다
+    expect(({} as Record<string, unknown>)["reset"]).toBeUndefined();
+    expect(typeof Object.prototype.toString).toBe("function");
+  });
+  it("입력을 바꾸지 않는다 · 결과는 입력의 창 객체를 공유하지 않는다", () => {
+    const fleet = [seat([w("5h", 40, NOW + 900, true), w("5h", 99, NOW - 5, false)]), seat([w("7d", 12, null)])];
+    const before = JSON.stringify(fleet);
+    const out = aggSeatRates(fleet, NOW);
+    expect(JSON.stringify(fleet)).toBe(before);
+    out["5h"].used = 1234;
+    expect(JSON.stringify(fleet)).toBe(before);
+  });
+  it("★종전 동치 — 가산 키가 없고 리셋 전 · 유한한 값만 있는 fleet 은 종전 ccAggRate 와 같은 결과(결정론 난수 100판 · 가산 키 true 판 100판 추가)", () => {
+    let s = 20261003 >>> 0;
+    const rnd = (): number => {
+      s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+      return s / 4294967296;
+    };
+    const pickN = (n: number): number => Math.floor(rnd() * n);
+    const LABELS = ["5h", "7d", "30d"];
+    const makeFleet = (eligibleKey: boolean): unknown[] => {
+      const fleet: unknown[] = [];
+      const seats = pickN(7);
+      for (let i = 0; i < seats; i++) {
+        const t = rnd();
+        if (t < 0.12) {
+          fleet.push({ role: "r" + i, state: "idle" }); // usage 없음
+          continue;
+        }
+        if (t < 0.2) {
+          fleet.push({ role: "r" + i, usage: null });
+          continue;
+        }
+        if (t < 0.28) {
+          fleet.push({ role: "r" + i, usage: { ctx_pct: 5 } }); // rate 없음
+          continue;
+        }
+        const rate: Record<string, unknown>[] = [];
+        const n = pickN(5);
+        for (let j = 0; j < n; j++) {
+          const used = rnd() < 0.15 ? -pickN(4) : rnd() < 0.5 ? pickN(131) : Math.round(rnd() * 13000) / 100;
+          const win: Record<string, unknown> = { label: LABELS[pickN(LABELS.length)], used_pct: used };
+          const r = rnd();
+          if (r < 0.25) win.resets_at = null;
+          else if (r >= 0.35) win.resets_at = NOW + 1 + pickN(1_000_000); // 리셋 전
+          // 0.25 ≤ r < 0.35: 키 없음
+          if (eligibleKey) win.alert_eligible = true;
+          rate.push(win);
+        }
+        fleet.push({ role: "r" + i, usage: { ctx_pct: pickN(100), rate } });
+      }
+      return fleet;
+    };
+    let nonEmpty = 0;
+    for (const eligibleKey of [false, true])
+      for (let k = 0; k < 100; k++) {
+        const fleet = makeFleet(eligibleKey);
+        const got = aggSeatRates(fleet, NOW);
+        const want = legacyAggRate(fleet);
+        expect({ 판: `${eligibleKey ? "true키" : "키없음"}#${k}`, 결과: got }).toEqual({ 판: `${eligibleKey ? "true키" : "키없음"}#${k}`, 결과: want });
+        if (Object.keys(want).length) nonEmpty++;
+      }
+    expect(nonEmpty).toBeGreaterThan(120); // 시험이 공허하지 않다(빈 집계끼리만 맞은 것이 아니다)
+  });
+  it("종전과 달라지는 곳은 정확히 셋 — 부적격 창 · 리셋 지난 창 · 유한하지 않은 사용률(그 밖의 입력은 같다)", () => {
+    const base = [w("5h", 30, NOW + 600)];
+    const cases: [string, AggRow][] = [
+      ["부적격", w("5h", 99, NOW + 600, false)],
+      ["리셋 지남", w("5h", 99, NOW - 1)],
+      ["문자열 사용률", { label: "5h", used_pct: "99", resets_at: NOW + 600 }],
+    ];
+    for (const [name, extra] of cases) {
+      const fleet = [seat(base), seat([extra])];
+      expect({ 사례: name, 새: aggSeatRates(fleet, NOW)["5h"].used }).toEqual({ 사례: name, 새: 30 });
+      expect({ 사례: name, 종전이_다르다: legacyAggRate(fleet)["5h"].used !== 30 }).toEqual({ 사례: name, 종전이_다르다: true });
+    }
   });
 });
