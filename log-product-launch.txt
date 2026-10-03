@@ -1,0 +1,5 @@
+2026-10-03T23:28:29.737Z [INFO] === product-launch start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-03T23:28:29.818Z [INFO] --- step prepare (minutes left 19.8, language mode FullLanguage) ---
+2026-10-03T23:28:33.681Z [INFO] --- step build (minutes left 19.7, language mode FullLanguage) ---
+2026-10-03T23:28:48.977Z [INFO] --- step start-drivers (minutes left 19.5, language mode FullLanguage) ---
+2026-10-03T23:28:50.149Z [INFO] --- step checkpoint-pre-sac (minutes left 19.5, language mode FullLanguage) ---

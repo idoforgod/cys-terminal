@@ -1,0 +1,44 @@
+{
+    "started":  "2026-10-03T23:28:33.693Z",
+    "rustc":  "C:\\Users\\runneradmin\\.cargo\\bin\\rustc.exe",
+    "rustc_version":  "rustc 1.98.1 (48a229cea 2026-09-01)\nbinary: rustc\ncommit-hash: 48a229ceaefd4985c50990b14116b6d856af0985\ncommit-date: 2026-09-01\nhost: aarch64-pc-windows-msvc\nrelease: 1.98.1\nLLVM version: 22.1.8",
+    "host_triple":  "aarch64-pc-windows-msvc",
+    "variants":  {
+                     "x64":  {
+                                 "arch":  "x64",
+                                 "role":  "verdict",
+                                 "target":  "x86_64-pc-windows-msvc",
+                                 "ok":  true,
+                                 "exe":  "C:\\a\\_temp\\diag-work\\product\\bin\\sac-launch-x64.exe",
+                                 "rc":  0,
+                                 "start_error":  null,
+                                 "size":  429568,
+                                 "sha256":  "b807ddb115738728ef8fde2946abc466b5f05b44837310bc4b096a833a9f93c9",
+                                 "err_tail":  "",
+                                 "reason":  null
+                             },
+                     "aarch64":  {
+                                     "arch":  "aarch64",
+                                     "role":  "auxiliary (host)",
+                                     "target":  "",
+                                     "ok":  true,
+                                     "exe":  "C:\\a\\_temp\\diag-work\\product\\bin\\sac-launch-aarch64.exe",
+                                     "rc":  0,
+                                     "start_error":  null,
+                                     "size":  408576,
+                                     "sha256":  "cd958e42cb8575608c6c646e6e581d243340f5b71b983d8380802aa0c3aa0008",
+                                     "err_tail":  "",
+                                     "reason":  null
+                                 }
+                 },
+    "log":  [
+                {
+                    "step":  "rustup target add x86_64-pc-windows-msvc",
+                    "rc":  0,
+                    "out":  "",
+                    "err":  "info: downloading component rust-std\n",
+                    "startError":  null
+                }
+            ],
+    "finished":  "2026-10-03T23:28:48.963Z"
+}
