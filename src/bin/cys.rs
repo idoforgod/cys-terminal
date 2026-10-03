@@ -5217,35 +5217,12 @@ fn run(command: Command) -> i32 {
 
         Command::UsageEventStdin { surface } => return run_usage_event_stdin(&surface),
 
-        Command::UsageAccounts { json: as_json } => request("usage.accounts", json!({}))
-            .map(|r| {
-                if as_json {
-                    println!("{}", serde_json::to_string_pretty(&r).unwrap_or_default());
-                } else {
-                    for a in r["accounts"].as_array().into_iter().flatten() {
-                        let label = a["label"].as_str().unwrap_or("?");
-                        let provider = a["provider"].as_str().unwrap_or("?");
-                        let rate: Vec<String> = a["rate"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .map(|w| {
-                                format!(
-                                    "{} {:.0}%",
-                                    w["label"].as_str().unwrap_or("?"),
-                                    w["used_pct"].as_f64().unwrap_or(0.0)
-                                )
-                            })
-                            .collect();
-                        let obs = if a["updated_at"].is_null() {
-                            "관측 없음".to_string()
-                        } else {
-                            rate.join(" · ")
-                        };
-                        println!("{provider:<12} {label:<32} {obs}");
-                    }
-                }
-            }),
+        Command::UsageAccounts { json: as_json } => request("usage.accounts", json!({})).map(|r| {
+            // ★0.14.43(B6): 출력 전체는 순수 함수가 만든다(stdout = 계정 행뿐 · 텍스트 모드의 안내 한 줄은 stderr).
+            let (out, err) = usage_accounts_output(&r, as_json, now_secs_f64());
+            print!("{out}");
+            eprint!("{err}");
+        }),
 
         Command::LearnCheckpoint => {
             let mut buf = String::new();
@@ -18319,6 +18296,93 @@ fn agy_statusline_human_line(v: &Value) -> String {
         .collect();
     parts.push("cys".to_string());
     parts.join(" · ")
+}
+
+/// ★0.14.43(B6) `cys usage-accounts` 텍스트 모드의 마지막 안내(stderr) — 이 명령은 **이 데몬 하나**의 계정만 보여 준다(부서 데몬 계정은 Control Center 의 병합 뷰).
+const USAGE_ACCOUNTS_SCOPE_NOTE: &str = "# 본부 데몬 기준 — 부서 데몬의 계정은 Control Center > Live 에서 합쳐 봅니다";
+/// 관측 나이가 이 초를 **넘으면** `오래됨` 을 덧붙인다(경보 신선도 규칙의 기본 상한 1800초와 같다 — 데몬 `accounts::ACCOUNT_ALERT_STALE_SECS_DEFAULT`).
+const USAGE_ACCOUNTS_OLD_SECS: f64 = 1800.0;
+
+/// 관측 나이 표기(순수) — `N초 전`(60초 미만) · `N분 전`(1시간 미만) · `N시간 전` · 1800초를 넘으면 뒤에 ` · 오래됨`. 음수·비유한은 0초로 본다.
+fn usage_accounts_age_text(secs: f64) -> String {
+    let s = if secs.is_finite() && secs > 0.0 { secs as u64 } else { 0 };
+    let base = if s < 60 {
+        format!("{s}초 전")
+    } else if s < 3600 {
+        format!("{}분 전", s / 60)
+    } else {
+        format!("{}시간 전", s / 3600)
+    };
+    if secs > USAGE_ACCOUNTS_OLD_SECS {
+        format!("{base} · 오래됨")
+    } else {
+        base
+    }
+}
+
+/// ★0.14.43(B6) `cys usage-accounts` 텍스트 모드의 한 줄(순수 — 검체가 핀한다). 기존 3열(`{provider:<12} {label:<32} {관측}`)은 **그대로 두고** 같은 줄 뒤에 ` | ` 구분으로 덧붙인다 —
+/// `● 사용 중`/`○`(`in_use` · null·부재는 생략) · `현재: <current_profiles>`(빈 배열이면 `현재: —` · 키 부재(구 데몬)는 생략) · 관측 나이(`stale_secs` — [`usage_accounts_age_text`]) · `별명: <alias>`.
+/// 창 표기는 `resets_at` 이 지났으면 `(리셋됨)` 을 붙인다(UI windowView 와 같은 규칙: 유효한 양수이고 `now` 가 그 이후 — 종전엔 리셋이 지나도 값만 찍었다).
+/// 별명·폴더 이름의 제어 문자는 터미널로 흘리지 않는다(기존 3열의 값은 종전 그대로).
+fn usage_accounts_line(a: &Value, now: f64) -> String {
+    let label = a["label"].as_str().unwrap_or("?");
+    let provider = a["provider"].as_str().unwrap_or("?");
+    let rate: Vec<String> = a["rate"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|w| {
+            let rolled = w["resets_at"].as_f64().is_some_and(|r| r.is_finite() && r > 0.0 && now >= r);
+            format!(
+                "{} {:.0}%{}",
+                w["label"].as_str().unwrap_or("?"),
+                w["used_pct"].as_f64().unwrap_or(0.0),
+                if rolled { " (리셋됨)" } else { "" }
+            )
+        })
+        .collect();
+    let obs = if a["updated_at"].is_null() {
+        "관측 없음".to_string()
+    } else {
+        rate.join(" · ")
+    };
+    let mut line = format!("{provider:<12} {label:<32} {obs}");
+    let safe = |s: &str| -> String { s.chars().filter(|c| !c.is_control()).collect() };
+    let mut extra: Vec<String> = Vec::new();
+    match a["in_use"].as_bool() {
+        Some(true) => extra.push("● 사용 중".to_string()),
+        Some(false) => extra.push("○".to_string()),
+        None => {}
+    }
+    if let Some(cur) = a["current_profiles"].as_array() {
+        let names: Vec<String> = cur.iter().filter_map(Value::as_str).map(safe).filter(|n| !n.is_empty()).collect();
+        extra.push(if names.is_empty() { "현재: —".to_string() } else { format!("현재: {}", names.join(", ")) });
+    }
+    if let Some(secs) = a["stale_secs"].as_f64() {
+        extra.push(usage_accounts_age_text(secs));
+    }
+    if let Some(alias) = a["alias"].as_str().map(safe).filter(|n| !n.trim().is_empty()) {
+        extra.push(format!("별명: {}", alias.trim()));
+    }
+    for e in extra {
+        line.push_str(" | ");
+        line.push_str(&e);
+    }
+    line
+}
+
+/// `cys usage-accounts` 의 출력 전체(순수) → (stdout, stderr). `--json` 은 RPC 원문 그대로(가산 키가 자동으로 보인다 · stderr 없음) ·
+/// 텍스트 모드는 stdout 에 계정 행만, stderr 에 [`USAGE_ACCOUNTS_SCOPE_NOTE`] 한 줄.
+fn usage_accounts_output(r: &Value, as_json: bool, now: f64) -> (String, String) {
+    if as_json {
+        return (format!("{}\n", serde_json::to_string_pretty(r).unwrap_or_default()), String::new());
+    }
+    let mut out = String::new();
+    for a in r["accounts"].as_array().into_iter().flatten() {
+        out.push_str(&usage_accounts_line(a, now));
+        out.push('\n');
+    }
+    (out, format!("{USAGE_ACCOUNTS_SCOPE_NOTE}\n"))
 }
 
 /// cys-statusline.sh 래퍼 전용 — stdin의 claude statusline JSON을 읽어 usage.report로 push하고,
@@ -40733,5 +40797,200 @@ mod team_token_cli_tests {
         let (v, rc) = team_token_outcome(Err("cannot connect to cysd at /x/cys.sock: No such file or directory (os error 2)".into()));
         assert_eq!(rc, 3);
         assert_eq!(v["code"], json!("daemon_unreachable"));
+    }
+}
+
+// ★0.14.43(B6) `cys usage-accounts` 텍스트 줄 — 순수 함수 핀. 데몬의 가산 키(`in_use`·`current_profiles`·`alias`)와 `stale_secs` 로 사람이 읽는 줄을 만든다.
+// 기존 3열(`{provider:<12} {label:<32} {관측}`)이 종전 출력과 바이트 동일한 **접두**로 남는 것이 핵심 계약이다(스크립트·눈이 익은 열). 픽스처는 전부 합성값이다.
+#[cfg(test)]
+mod usage_accounts_line_tests {
+    use super::*;
+
+    const NOW: f64 = 1_800_000_000.0;
+
+    /// 종전(0.14.42) 3열 출력 — 종전 핸들러 본문 그대로(이 검체가 '기존 3열 바이트 동일'을 재는 기준).
+    fn old_three_columns(a: &Value) -> String {
+        let label = a["label"].as_str().unwrap_or("?");
+        let provider = a["provider"].as_str().unwrap_or("?");
+        let rate: Vec<String> = a["rate"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|w| format!("{} {:.0}%", w["label"].as_str().unwrap_or("?"), w["used_pct"].as_f64().unwrap_or(0.0)))
+            .collect();
+        let obs = if a["updated_at"].is_null() { "관측 없음".to_string() } else { rate.join(" · ") };
+        format!("{provider:<12} {label:<32} {obs}")
+    }
+
+    /// 구 데몬이 내던 행 모양(가산 키 없음 · `stale_secs` 120초).
+    fn base() -> Value {
+        json!({
+            "provider": "claude", "account_id": "u-1", "label": "a-b1@example.test", "plan": null, "profiles": [".cys/claude"],
+            "rate": [{"label": "5h", "used_pct": 12.4, "resets_at": NOW + 3600.0}, {"label": "7d", "used_pct": 40.0, "resets_at": NOW + 86400.0}],
+            "updated_at": NOW - 120.0, "stale_secs": 120.0, "source": "statusline", "adapter": true, "source_error": null
+        })
+    }
+
+    fn with(mut a: Value, kv: &[(&str, Value)]) -> Value {
+        for (k, v) in kv {
+            a[*k] = v.clone();
+        }
+        a
+    }
+
+    #[test]
+    fn usage_accounts_line_keeps_the_old_three_columns_as_a_byte_identical_prefix() {
+        // 구 데몬 행(가산 키 없음) — 3열 + 관측 나이만 덧붙는다
+        let a = base();
+        assert_eq!(usage_accounts_line(&a, NOW), format!("{} | 2분 전", old_three_columns(&a)));
+        assert_eq!(old_three_columns(&a), format!("{:<12} {:<32} {}", "claude", "a-b1@example.test", "5h 12% · 7d 40%"), "기준 구현이 종전 출력과 다르다(픽스처 점검)");
+        // 관측 없음 행(stale_secs null) — 종전 출력과 바이트 동일(덧붙임 0)
+        let none = json!({"provider": "codex", "account_id": "default", "label": "OpenAI Codex", "profiles": [".codex"], "rate": [], "updated_at": null, "stale_secs": null, "source": "", "adapter": true, "source_error": null});
+        assert_eq!(usage_accounts_line(&none, NOW), old_three_columns(&none));
+        assert_eq!(usage_accounts_line(&none, NOW), format!("{:<12} {:<32} {}", "codex", "OpenAI Codex", "관측 없음"));
+        // 어떤 모양에서도 3열 접두는 종전 그대로 — 긴 라벨(32자 초과) · 한글 라벨 · 키 부재('?') · 빈 rate · 값 없는 관측
+        let shapes = [
+            with(base(), &[("label", json!("가".repeat(40)))]),
+            with(base(), &[("label", json!("업무 계정"))]),
+            json!({}),
+            json!({"updated_at": 1.0}),
+            with(base(), &[("rate", json!([]))]),
+            with(base(), &[("rate", json!([{"label": "5h"}, {"used_pct": 7.6}]))]),
+            with(base(), &[("in_use", json!(true)), ("current_profiles", json!([".cys/claude"])), ("alias", json!("별명"))]),
+        ];
+        for a in &shapes {
+            let l = usage_accounts_line(a, NOW);
+            assert!(l.starts_with(&old_three_columns(a)), "3열 접두가 종전 출력과 다르다:\n  줄   {l:?}\n  종전 {:?}", old_three_columns(a));
+        }
+    }
+
+    #[test]
+    fn usage_accounts_line_adds_the_columns_in_a_fixed_order() {
+        let a = with(
+            base(),
+            &[("in_use", json!(true)), ("current_profiles", json!([".claude-2", ".cys/claude"])), ("alias", json!("업무용"))],
+        );
+        assert_eq!(
+            usage_accounts_line(&a, NOW),
+            format!("{} | ● 사용 중 | 현재: .claude-2, .cys/claude | 2분 전 | 별명: 업무용", old_three_columns(&a)),
+            "열 순서(사용 중 · 현재 · 관측 나이 · 별명) 또는 구분자(` | `)가 다르다"
+        );
+    }
+
+    #[test]
+    fn usage_accounts_line_in_use_current_and_alias_table() {
+        let tail = |a: &Value| usage_accounts_line(a, NOW).strip_prefix(&old_three_columns(a)).unwrap_or_else(|| panic!("접두 불일치")).to_string();
+        // in_use — true/false/null/부재
+        assert_eq!(tail(&with(base(), &[("in_use", json!(true))])), " | ● 사용 중 | 2분 전");
+        assert_eq!(tail(&with(base(), &[("in_use", json!(false))])), " | ○ | 2분 전");
+        assert_eq!(tail(&with(base(), &[("in_use", Value::Null)])), " | 2분 전", "null 은 생략");
+        assert_eq!(tail(&base()), " | 2분 전", "부재(구 데몬)는 생략");
+        assert_eq!(tail(&with(base(), &[("in_use", json!("true"))])), " | 2분 전", "문자열 true 는 불린이 아니다 — 생략");
+        // current_profiles — 목록 · 빈 배열 · 키 부재 · 배열이 아님 · 쓸 수 없는 원소
+        assert_eq!(tail(&with(base(), &[("current_profiles", json!([".cys/claude"]))])), " | 현재: .cys/claude | 2분 전");
+        assert_eq!(tail(&with(base(), &[("current_profiles", json!([]))])), " | 현재: — | 2분 전", "빈 배열은 '현재: —'");
+        assert_eq!(tail(&with(base(), &[("current_profiles", Value::Null)])), " | 2분 전", "null 은 키 부재와 같다 — 생략");
+        assert_eq!(tail(&with(base(), &[("current_profiles", json!(".cys/claude"))])), " | 2분 전", "배열이 아니면 생략");
+        assert_eq!(tail(&with(base(), &[("current_profiles", json!([1, null, ""]))])), " | 현재: — | 2분 전", "쓸 수 있는 원소가 없으면 빈 배열과 같다");
+        // alias — 있음 · null · 빈 문자열 · 공백뿐 · 문자열 아님 · 제어 문자
+        assert_eq!(tail(&with(base(), &[("alias", json!("업무용"))])), " | 2분 전 | 별명: 업무용");
+        for none in [Value::Null, json!(""), json!("   "), json!(5), json!(["x"])] {
+            assert_eq!(tail(&with(base(), &[("alias", none.clone())])), " | 2분 전", "별명 {none} 은 없는 것");
+        }
+        assert_eq!(tail(&with(base(), &[("alias", json!("a\u{1b}[31mb\n"))])), " | 2분 전 | 별명: a[31mb", "별명의 제어 문자는 터미널로 흘리지 않는다");
+        assert_eq!(tail(&with(base(), &[("current_profiles", json!([".x\u{1b}[0m"]))])), " | 현재: .x[0m | 2분 전", "폴더 이름의 제어 문자도 같다");
+    }
+
+    #[test]
+    fn usage_accounts_age_text_units_and_the_old_marker() {
+        let age = usage_accounts_age_text;
+        assert_eq!(age(0.0), "0초 전");
+        assert_eq!(age(59.9), "59초 전");
+        assert_eq!(age(60.0), "1분 전");
+        assert_eq!(age(120.0), "2분 전");
+        assert_eq!(age(1799.0), "29분 전");
+        assert_eq!(age(1800.0), "30분 전", "1800초는 아직 '오래됨'이 아니다(초과일 때만)");
+        assert_eq!(age(1800.5), "30분 전 · 오래됨");
+        assert_eq!(age(1801.0), "30분 전 · 오래됨");
+        assert_eq!(age(3599.9), "59분 전 · 오래됨");
+        assert_eq!(age(3600.0), "1시간 전 · 오래됨");
+        assert_eq!(age(7300.0), "2시간 전 · 오래됨");
+        assert_eq!(age(259_200.0), "72시간 전 · 오래됨");
+        assert_eq!(age(-5.0), "0초 전", "음수는 0초");
+        assert_eq!(age(f64::NAN), "0초 전");
+        // 줄에서: stale_secs 가 없거나 null 이면 생략
+        let a = with(base(), &[("stale_secs", Value::Null)]);
+        assert_eq!(usage_accounts_line(&a, NOW), old_three_columns(&a));
+        let a = with(base(), &[("stale_secs", json!(1801.0))]);
+        assert!(usage_accounts_line(&a, NOW).ends_with(" | 30분 전 · 오래됨"));
+        let a = json!({"provider": "claude", "label": "x", "updated_at": 1.0, "rate": []});
+        assert_eq!(usage_accounts_line(&a, NOW), old_three_columns(&a), "stale_secs 키가 없으면 생략");
+    }
+
+    #[test]
+    fn usage_accounts_line_marks_windows_whose_reset_has_passed() {
+        let win = |label: &str, pct: f64, resets: Value| json!({"label": label, "used_pct": pct, "resets_at": resets});
+        let line = |rate: Value| {
+            let a = with(base(), &[("rate", rate), ("stale_secs", Value::Null)]);
+            usage_accounts_line(&a, NOW).strip_prefix(&format!("{:<12} {:<32} ", "claude", "a-b1@example.test")).unwrap().to_string()
+        };
+        assert_eq!(line(json!([win("5h", 12.4, json!(NOW - 1.0))])), "5h 12% (리셋됨)", "리셋이 1초 지났다");
+        assert_eq!(line(json!([win("5h", 12.4, json!(NOW))])), "5h 12% (리셋됨)", "같은 초 = 리셋됨(UI windowView 와 같은 경계)");
+        assert_eq!(line(json!([win("5h", 12.4, json!(NOW + 1.0))])), "5h 12%", "리셋 1초 전은 아직");
+        assert_eq!(line(json!([win("5h", 12.4, Value::Null)])), "5h 12%", "리셋 시각 없음");
+        assert_eq!(line(json!([win("5h", 12.4, json!(0.0))])), "5h 12%", "0 은 유효한 리셋 시각이 아니다");
+        assert_eq!(line(json!([win("5h", 12.4, json!(-5.0))])), "5h 12%");
+        assert_eq!(line(json!([win("5h", 12.4, json!("x"))])), "5h 12%", "숫자가 아닌 리셋 시각");
+        assert_eq!(
+            line(json!([win("5h", 12.4, json!(NOW - 60.0)), win("7d", 40.0, json!(NOW + 86400.0))])),
+            "5h 12% (리셋됨) · 7d 40%",
+            "창마다 따로 판정한다"
+        );
+        // 관측 없음이면 창을 찍지 않는다(리셋됨 표기도 없음)
+        let a = with(base(), &[("updated_at", Value::Null), ("rate", json!([win("5h", 12.4, json!(NOW - 1.0))]))]);
+        assert!(usage_accounts_line(&a, NOW).starts_with(&format!("{:<12} {:<32} 관측 없음", "claude", "a-b1@example.test")));
+        assert!(!usage_accounts_line(&a, NOW).contains("리셋됨"));
+        // 리셋됨 표기가 붙어도 앞 두 열은 종전 그대로
+        let a = with(base(), &[("rate", json!([win("5h", 12.4, json!(NOW - 1.0))]))]);
+        assert!(usage_accounts_line(&a, NOW).starts_with(&format!("{:<12} {:<32} 5h 12%", "claude", "a-b1@example.test")));
+    }
+
+    /// 출력 분리 — 텍스트 모드는 stdout 에 계정 행만, stderr 에 안내 한 줄(정확한 문구) · `--json` 은 RPC 원문 그대로이고 stderr 가 없다.
+    #[test]
+    fn usage_accounts_output_splits_rows_from_the_scope_note_and_leaves_json_untouched() {
+        let r = json!({"accounts": [with(base(), &[("in_use", json!(true))]), json!({"provider": "codex", "label": "OpenAI Codex", "updated_at": null})]});
+        let (out, err) = usage_accounts_output(&r, false, NOW);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "stdout 은 계정 행만: {out:?}");
+        assert!(out.ends_with('\n') && !out.contains('#'), "stdout 에 안내가 섞였다: {out:?}");
+        assert_eq!(lines[0], usage_accounts_line(&r["accounts"][0], NOW));
+        assert_eq!(lines[1], usage_accounts_line(&r["accounts"][1], NOW));
+        assert_eq!(err, "# 본부 데몬 기준 — 부서 데몬의 계정은 Control Center > Live 에서 합쳐 봅니다\n", "stderr 안내 문구");
+        // 계정이 없어도(빈 배열·키 부재) stdout 은 비고 안내만 stderr 로
+        for empty in [json!({"accounts": []}), json!({})] {
+            let (out, err) = usage_accounts_output(&empty, false, NOW);
+            assert_eq!((out.as_str(), err.starts_with("# 본부 데몬 기준")), ("", true));
+        }
+        // --json: 종전 `println!("{}", to_string_pretty(&r))` 와 바이트 동일 · stderr 없음(스크립트가 `2>&1` 로 받아도 JSON 이 깨지지 않는다)
+        let (out, err) = usage_accounts_output(&r, true, NOW);
+        assert_eq!(out, format!("{}\n", serde_json::to_string_pretty(&r).unwrap()));
+        assert_eq!(err, "");
+        let back: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(back, r, "--json 이 RPC 원문과 다르다(가산 키가 그대로 보여야 한다)");
+    }
+
+    /// 배선 핀(소스): 명령 분기가 순수 출력 함수 하나를 부르고, 안내는 stderr(`eprint!`)로 · stdout 은 `print!` 로만 쓴다 — `println!` 로 안내를 섞지 않는다.
+    #[test]
+    fn usage_accounts_arm_prints_rows_to_stdout_and_the_note_to_stderr_source_pin() {
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        let i = prod.find("Command::UsageAccounts { json: as_json }").expect("UsageAccounts 분기가 사라졌다");
+        let arm = &prod[i..i + prod[i..].find("Command::LearnCheckpoint").expect("분기 끝 앵커")];
+        assert!(arm.contains("usage_accounts_output(&r, as_json, now_secs_f64())"), "분기가 순수 출력 함수를 쓰지 않는다");
+        assert!(arm.contains("print!(\"{out}\")") && arm.contains("eprint!(\"{err}\")"), "stdout/stderr 분리가 사라졌다");
+        assert!(!arm.contains("println!"), "분기가 직접 println! 한다(안내가 stdout 으로 샐 수 있다)");
+        let f = &prod[prod.find("fn usage_accounts_output(").expect("순수 출력 함수")..];
+        let f = &f[..f.find("\n}\n").expect("함수 끝")];
+        assert!(f.contains("USAGE_ACCOUNTS_SCOPE_NOTE") && f.contains("as_json"), "안내 상수 또는 --json 분기 소실");
     }
 }

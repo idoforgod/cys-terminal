@@ -38,6 +38,11 @@
 //!   ① `surfaces` 락(좌석 표만 복사 · 파일 IO 없음) → **해제** → ② 폴더별 신원 판독(어떤 락도 쥐지 않은 채 · 60초 하한 캐시 `Daemon::seat_ident_cache` 는
 //!   조회·기록 때만 순간 잡는다 · 캐시 락 안에서 다른 락을 잡지 않는다 · 실판독 `claude_identity_unlocked` 는 종전 규율대로 accounts 락을 순간만) →
 //!   ③ `accounts` 락(메모리 연산뿐 — `alert_rates_with`·`local_json` 행 조립). surfaces 와 accounts 를 동시에 쥐는 곳은 없다.
+//!
+//! ★0.14.43(B1 · 현재 로그인 폴더·별명 — 오너 결정): `usage.accounts` 행에 가산 키 둘 — `current_profiles`(그 계정이 **지금** 로그인된 설정 폴더 · `profiles` 는 추가 전용이라 로그인을 바꾼 뒤에도 옛 계정에
+//! 폴더가 남는다) · `alias`(`~/.cys/accounts.json` 의 `aliases` 객체 — **표시 전용**: 경보 키·라벨·이벤트·`alert_inputs` 에 쓰지 않는다). **락 간선은 새로 만들지 않는다** — `local_json` 은 accounts 락을 잡기
+//! **전에** ① 알려진 프로필 폴더의 현재 신원 표([`known_profile_identities`] — 열거 정본 `cys::profile_gate::enumerate_profile_dirs` + B3 의 폴더별 60초 캐시 [`folder_identity`] 재사용 · 새 캐시 없음) ② 별명 표 갱신
+//! ([`refresh_aliases`] — 60초 하한 · 파일 mtime 이 바뀔 때만 판독 · accounts 락은 하한 판정·저장 때만 순간) 을 끝내고, 락 안에서는 메모리 연산뿐이다(소스 핀 `b1_lock_order_wiring_pins`).
 
 use crate::state::{Daemon, HideConsole};
 use crate::usage::{ObservedUsage, RateWindow};
@@ -106,6 +111,8 @@ pub struct AccountsState {
     outside_pre: HashMap<String, f64>,
     /// 선상한 전역 토큰 버킷 — (남은 토큰, 마지막 보충 시각). None = 가득.
     outside_pre_bucket: Option<(f64, f64)>,
+    /// ★0.14.43(B1): 별명 표(표시 전용 · `~/.cys/accounts.json` 의 `aliases`) — [`refresh_aliases`] 가 락 밖에서 판독한 결과를 짧게 싣는다. 경보 입력과 무관하다.
+    alias: AliasState,
 }
 
 /// agy 상태줄 훅이 좌석 `usage.report` 로 보낸 값의 계정 출처 라벨.
@@ -674,7 +681,7 @@ fn note_resolved(daemon: &Arc<Daemon>, resolved: Resolution, rate: &[RateWindow]
 /// ② analytics 마지막 스냅샷(7d)으로 rate 예열(source:"snapshot"·stale 표시),
 /// ③ ~/.cys/accounts.json 선언 계정 등록(미래 provider — adapter:"none"은 '관측 없음' 상주).
 pub fn seed_known(daemon: &Arc<Daemon>) {
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = account_home() {
         // ★fatal-fix R4-F3: 발견(파일 IO)은 락 밖에서 끝내고, 락 안에서는 메모리에 싣기만 한다. 이 함수는 소켓 bind
         //   **전에** 동기로 돈다 — 종전에는 신원 파일 하나가 막히면(FIFO 등) 락을 쥔 채 부트 체인 전체가 섰다.
         let found = discover_at(&home);
@@ -682,6 +689,8 @@ pub fn seed_known(daemon: &Arc<Daemon>) {
             let mut st = daemon.accounts.lock().unwrap();
             apply_discovered(&mut st, &home, found);
         }
+        // ★0.14.43(B1): 별명 표 부트 판독 1회(파일 IO 는 락 밖 · 실패·비정규 파일은 별명 없음) — 이후는 `local_json` 이 파일 mtime 이 바뀔 때만(60초 하한) 다시 읽는다. 선언 계정 판독은 아래 종전 그대로.
+        refresh_aliases(daemon, Some(&home), crate::state::now_epoch());
         // 선언 계정(~/.cys/accounts.json — pack 밖: pack 스윕/치유 사정권 회피)
         let decl = home.join(".cys/accounts.json");
         if let Ok(s) = std::fs::read_to_string(&decl) {
@@ -1320,10 +1329,15 @@ const PREDICT_FRESH_SECS: f64 = 600.0;
 /// 리셋 후 소진이면 생략(정직한 공백). 잠금 순서: accounts → 해제 → analytics.
 /// ★0.14.43(B3): 행마다 가산 키 3개 — `in_use`(true/false/null · [`account_in_use`]) · `rate_observed_at`(경보 입력의 관측 시각 — 없으면 null) ·
 /// `rate[]` 원소의 `alert_eligible`(그 창이 경보 입력으로 적격인가 — 경보 입력이 없는 창(창 밖 표시용 값 등)은 false). 표시 승자·기존 키는 불변이다.
-/// 좌석 신원 표(파일 IO)는 **accounts 락을 잡기 전에** 만든다.
+/// ★0.14.43(B1): 행마다 가산 키 2개 — `current_profiles`(배열 · [`current_profiles_for`]: claude 는 **지금** 이 계정으로 로그인된 알려진 프로필 폴더 · 그 밖은 `profiles` 그대로 · 구 데몬 응답엔 키가 없다) ·
+/// `alias`(문자열|null · [`alias_for`] — 표시 전용). `profiles` 는 종전처럼 추가 전용이다.
+/// 좌석 신원 표·알려진 프로필 폴더 신원 표·별명 표 갱신(전부 파일 IO)은 **accounts 락을 잡기 전에** 만든다.
 pub fn local_json(daemon: &Arc<Daemon>, now: f64) -> Value {
     let view = seat_identity_view_at(daemon, now);
     let stale_secs = account_alert_stale_secs();
+    let home = account_home();
+    let known = known_profile_identities(daemon, home.as_deref(), now);
+    refresh_aliases(daemon, home.as_deref(), now);
     let mut rows: Vec<Value> = {
         let st = daemon.accounts.lock().unwrap();
         let mut views: Vec<&AccountView> = st.views.values().collect();
@@ -1367,6 +1381,9 @@ pub fn local_json(daemon: &Arc<Daemon>, now: f64) -> Value {
                     // ★0.14.43(B3) 가산 키 — true/false/null(판정 불가) · 경보 입력의 관측 시각(없으면 null).
                     "in_use": in_use,
                     "rate_observed_at": input.map_or(Value::Null, |i| json!(i.at)),
+                    // ★0.14.43(B1) 가산 키 — 이 계정이 지금 로그인된 설정 폴더(표기는 `profiles` 와 같은 `profile_short`) · 별명(표시 전용 · 없으면 null).
+                    "current_profiles": current_profiles_for(&v.key.provider, &v.key.account_id, &v.profiles, &known),
+                    "alias": alias_for(&st.alias.table, &v.key.account_id, &v.label),
                 })
             })
             .collect()
@@ -1839,6 +1856,210 @@ pub fn seat_usage_wire(
         }
     }
     v
+}
+
+// ───────────────── ★0.14.43(B1) 현재 로그인 폴더(`current_profiles`) · 별명(`alias`) — `usage.accounts` 행의 표시 전용 가산 키 ─────────────────
+
+/// 별명 파일(`~/.cys/accounts.json`)의 확인 주기 하한(초) — 이 안에서는 stat 도 하지 않는다(사용량 RPC 폴링이 파일 접근을 늘리지 않게). 시계가 뒤로 가면(now < 마지막 확인) 만료로 본다.
+const ALIAS_CHECK_SECS: f64 = 60.0;
+/// 별명 파일 크기 상한(바이트) — 넘으면 별명 없음(병적 입력이 판독 시간·메모리를 밀지 못하게).
+const ALIAS_FILE_MAX_BYTES: u64 = 64 * 1024;
+/// 별명 길이 상한(char 기준) — 사이드바·툴팁을 밀지 못하게(화면의 `acctAlias` 도 같은 24자).
+const ALIAS_MAX_CHARS: usize = 24;
+
+/// 이 구역의 파일 판독(알려진 프로필 열거 · 별명 파일)이 보는 홈 — 운영은 `dirs::home_dir()` 하나다. 시험은 [`test_home`] 이음매로 **이 스레드에서만** 임시 홈으로 바꾼다.
+fn account_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(h) = test_home::get() {
+        return Some(h);
+    }
+    dirs::home_dir()
+}
+
+/// 검체 이음매(테스트 전용) — [`account_home`] 을 이 스레드에서만 임시 홈으로 대체한다(프로세스 env `HOME` 은 병렬 검체끼리 공유되므로 바꾸지 않는다 · 실제 홈의 파일을 읽지 않는다). 가드가 떨어지면 원복.
+#[cfg(test)]
+pub(crate) mod test_home {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    thread_local! {
+        static HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+    pub(crate) struct Guard;
+    pub(crate) fn set(h: &Path) -> Guard {
+        HOME.with(|c| *c.borrow_mut() = Some(h.to_path_buf()));
+        Guard
+    }
+    pub(crate) fn get() -> Option<PathBuf> {
+        HOME.with(|c| c.borrow().clone())
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOME.with(|c| *c.borrow_mut() = None);
+        }
+    }
+}
+
+/// 별명 표 상태([`AccountsState::alias`]) — 정제된 표 · 마지막으로 본 파일 서명 · 마지막 확인 시각 · 계측(검체·진단).
+#[derive(Default)]
+struct AliasState {
+    /// 정제된 표 — 키(accountUuid 또는 이메일) 원문 → 정제된 별명([`sanitize_alias`]).
+    table: HashMap<String, String>,
+    /// 표를 만든 파일의 서명 (mtime 초, 바이트 수) — None = 읽을 수 있는 일반 파일이 없다(부재·FIFO 등 비정규·64KiB 초과·메타 실패·열기 실패).
+    sig: Option<(f64, u64)>,
+    /// 마지막 확인(stat 시도) 시각 — None = 아직 확인 전.
+    checked_at: Option<f64>,
+    /// 계측 — stat 시도 수 / 실제 판독 수(60초 하한 안에서는 둘 다 늘지 않는다).
+    stats: u64,
+    reads: u64,
+}
+
+/// ★순수: 별명 값 정제 — 제어 문자(`char::is_control`) 제거 → 앞뒤 공백 제거 → 비면 None → 최대 24자(char 기준)로 자른다(절단이 공백에서 끝나면 그 공백도 걷는다). 표시 전용.
+fn sanitize_alias(raw: &str) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let t = cleaned.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let cut: String = t.chars().take(ALIAS_MAX_CHARS).collect();
+    let cut = cut.trim_end();
+    (!cut.is_empty()).then(|| cut.to_string())
+}
+
+/// ★순수: `accounts.json` 본문 → 별명 표. 형식 `{"aliases": {"<accountUuid 또는 이메일>": "업무용"}}`(키는 [`alias_for`] 가 account_id → label 순으로 찾는다).
+/// JSON 오류(UTF-8 아님 포함)·루트가 객체가 아님·`aliases` 가 객체가 아님 = 빈 표. 값이 문자열이 아니거나 정제 뒤 비면 그 항목만 버린다(키가 빈 문자열인 항목도).
+/// 선언 계정(`accounts` 배열)은 여기서 읽지 않는다 — `seed_known` 이 종전 그대로 읽는다.
+fn parse_alias_table(body: &[u8]) -> HashMap<String, String> {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return HashMap::new();
+    };
+    let Some(obj) = v.get("aliases").and_then(Value::as_object) else {
+        return HashMap::new();
+    };
+    obj.iter()
+        .filter(|(k, _)| !k.is_empty())
+        .filter_map(|(k, val)| val.as_str().and_then(sanitize_alias).map(|a| (k.clone(), a)))
+        .collect()
+}
+
+/// 별명 파일의 서명 — **메타데이터만** 본다(내용 무접촉 · 락 밖). 읽을 수 있는 일반 파일(크기 ≤ 64KiB)이 아니면(부재·FIFO·장치·디렉터리·초과) None —
+/// 그런 것은 **열지 않는다**(FIFO 는 여는 순간 쓰는 쪽이 올 때까지 막힌다).
+fn alias_file_sig(path: &Path) -> Option<(f64, u64)> {
+    let md = std::fs::metadata(path).ok()?;
+    if !md.is_file() || md.len() > ALIAS_FILE_MAX_BYTES {
+        return None;
+    }
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0.0, |d| d.as_secs_f64());
+    Some((mtime, md.len()))
+}
+
+/// 별명 파일 판독 — **락 밖 전용**. 여는 것도 막히지 않게 연다(unix `O_NONBLOCK` — 일반 파일 읽기에는 영향이 없다)고, 연 뒤 fstat 으로 **일반 파일**·크기를 다시 확인한다
+/// (stat 과 open 사이에 FIFO 로 바뀌는 경쟁 차단 — [`read_identity_file`] 과 같은 규율). None = 열기·읽기 실패·비정규·초과(호출부가 '별명 없음 · 다음 확인에 재시도'로 읽는다).
+fn read_alias_file(f: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts.open(f).ok()?;
+    let md = file.metadata().ok()?;
+    if !md.is_file() || md.len() > ALIAS_FILE_MAX_BYTES {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(ALIAS_FILE_MAX_BYTES + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > ALIAS_FILE_MAX_BYTES {
+        return None;
+    }
+    Some(buf)
+}
+
+/// 별명 표 갱신 — 부트(`seed_known`)에서 1회 · 이후 `local_json` 이 부른다. ① **60초 하한**: 마지막 확인에서 60초가 안 지났으면 stat 도 하지 않고 돌아온다(시계 역행은 만료) ·
+/// ② 하한이 지났으면 파일 **서명(mtime·크기)** 만 본다 — 마지막 판독 때와 같으면 재판독 없음 · 바뀌었을 때만 읽는다 · ③ 읽을 수 없는 파일(부재·FIFO 등 비정규·64KiB 초과·JSON 오류·
+/// `aliases` 가 객체 아님)은 **별명 없음**이고 기존 표는 비운다(조용히 — 어떤 경우에도 RPC 를 세우지 않는다).
+/// 락: accounts 락은 ①의 하한 판정·③의 저장 때만 **순간** 잡는다(메모리뿐) — 파일 IO(stat·open·read)는 어떤 락도 쥐지 않은 채 한다. 다른 락을 쥔 채 부르지 않는다.
+fn refresh_aliases(daemon: &Arc<Daemon>, home: Option<&Path>, now: f64) {
+    // ① 하한 판정 + 검사권 선점(같은 틱의 동시 호출이 중복 판독하지 않게) — 락은 순간 · 파일 IO 없음
+    let prev = {
+        let mut st = daemon.accounts.lock().unwrap();
+        let a = &mut st.alias;
+        if a.checked_at.is_some_and(|at| now >= at && now - at < ALIAS_CHECK_SECS) {
+            return;
+        }
+        a.checked_at = Some(now);
+        a.stats += 1;
+        a.sig
+    };
+    // ② 락 밖 — 서명(stat) → 바뀌었을 때만 내용을 읽는다
+    let path = home.map(|h| h.join(".cys").join("accounts.json"));
+    let seen = path.as_deref().and_then(alias_file_sig);
+    if seen == prev {
+        return; // 변화 없음(부재 → 부재 포함) — 표는 이미 그 파일의 것이다
+    }
+    let mut did_read = false;
+    let (table, sig) = match (path.as_deref(), seen) {
+        (Some(p), Some(_)) => {
+            did_read = true;
+            match read_alias_file(p) {
+                Some(body) => (parse_alias_table(&body), seen),
+                None => (HashMap::new(), None), // 열기·읽기 실패 — 별명 없음 · 다음 확인(60초 뒤)에 다시 읽는다
+            }
+        }
+        _ => (HashMap::new(), None), // 부재·비정규·초과 — 별명 없음
+    };
+    // ③ 저장 — 락은 순간(메모리뿐)
+    let mut st = daemon.accounts.lock().unwrap();
+    st.alias.table = table;
+    st.alias.sig = sig;
+    st.alias.reads += u64::from(did_read);
+}
+
+/// ★순수: 행의 별명 — `account_id` 키가 `label`(이메일) 키보다 우선한다. 없으면 None. (표시 전용 — 경보 키·라벨·이벤트에 쓰지 않는다.)
+fn alias_for<'a>(table: &'a HashMap<String, String>, account_id: &str, label: &str) -> Option<&'a str> {
+    table.get(account_id).or_else(|| table.get(label)).map(String::as_str)
+}
+
+/// 알려진 claude 프로필 폴더와 각 폴더의 **현재** 신원 account_id — (표시 표기, 신원 | None). 폴더 목록은 부트 시드(`discover_at`)와 **같은 열거 정본**
+/// (`cys::profile_gate::enumerate_profile_dirs` — 기본 프로필 `~/.claude` 포함)이고, 표기는 `profiles` 원소를 만드는 `profile_short` 다. 신원은 B3 의 폴더별 60초 하한 캐시
+/// ([`folder_identity`])로 읽는다(새 캐시 없음 — 같은 폴더를 좌석 신원 표가 이미 읽었으면 적중). 판독 실패(파일 없음·FIFO·파싱 실패)는 None — 어느 계정과도 일치하지 않는다.
+/// 파일 IO(열거 + 신원)는 어떤 락도 쥐지 않은 채 한다 — 부른 쪽이 accounts 락을 잡기 **전에** 부른다.
+fn known_profile_identities(daemon: &Arc<Daemon>, home: Option<&Path>, now: f64) -> Vec<(String, Option<String>)> {
+    let Some(h) = home else {
+        return Vec::new();
+    };
+    cys::profile_gate::enumerate_profile_dirs(h)
+        .into_iter()
+        .map(|dir| {
+            let who = folder_identity(daemon, home, &dir.to_string_lossy(), now);
+            (profile_short(home, &dir), who)
+        })
+        .collect()
+}
+
+/// ★순수: 행의 `current_profiles` — claude 는 **현재 신원이 이 계정**인 알려진 폴더만(정렬·중복 제거 · 판독 실패 폴더는 누구의 것도 아니다 — `None == None` 을 '같다'로 치지 않는다).
+/// 그 밖 provider(codex·agy·선언 계정)는 폴더당 계정 1개이고 신원 전환이 없으므로 그 행의 `profiles` 그대로. `profiles` 자체는 건드리지 않는다(추가 전용 · 이관·삭제 없음).
+fn current_profiles_for(
+    provider: &str,
+    account_id: &str,
+    profiles: &BTreeSet<String>,
+    known: &[(String, Option<String>)],
+) -> Vec<String> {
+    if provider != "claude" {
+        return profiles.iter().cloned().collect();
+    }
+    known
+        .iter()
+        .filter(|(_, who)| who.as_deref() == Some(account_id))
+        .map(|(p, _)| p.clone())
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
@@ -3556,6 +3777,597 @@ mod tests {
             assert_eq!(evs[0]["isolate"], json!(true));
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    // ═════════ ★0.14.43(B1) — 현재 로그인 폴더(`current_profiles`) · 별명(`alias`) ═════════
+    // 픽스처는 전부 합성값이다(u-b1-a · a-b1@example.test 등) — 실계정 식별자 금지. 홈은 임시 폴더이고 [`test_home`] 이음매가 **이 스레드의** `account_home()` 만 바꾼다
+    // (실제 홈의 파일·`~/.cys/accounts.json` 을 읽지 않는다). 시각은 주입한다(실시간 대기 없음 — 60초 하한은 `now` 로 센다).
+    mod b1_units {
+        use super::b3_scenarios::{b3_login, b3_seat};
+        use super::*;
+
+        const KEY_A: &str = "account_rate:a-b1@example.test:5h";
+
+        fn row(rows: &Value, id: &str) -> Value {
+            rows.as_array().unwrap().iter().find(|r| r["account_id"] == id).cloned().unwrap_or_else(|| panic!("행 {id} 없음: {rows}"))
+        }
+
+        /// 문자열 배열 → 정렬·중복 제거한 목록. 윈도우에서는 열거 경로(`\`)와 보고 경로(`/`)가 섞여 오므로 구분자를 `/` 로 접는다(화면의 `normalizeProfile` 과 같다 — 맥·리눅스는 그대로).
+        fn strs(v: &Value) -> Vec<String> {
+            v.as_array()
+                .unwrap_or_else(|| panic!("배열이 아니다: {v}"))
+                .iter()
+                .map(|x| x.as_str().unwrap().replace('\\', "/"))
+                .collect::<BTreeSet<String>>()
+                .into_iter()
+                .collect()
+        }
+
+        fn s(items: &[&str]) -> Vec<String> {
+            items.iter().map(|x| x.to_string()).collect()
+        }
+
+        /// 별명 파일을 쓴다 — mtime 을 `bump` 로 맞춘다(같은 초 안에 다시 써도 mtime 이 달라지게).
+        fn put_alias_bytes(home: &Path, body: &[u8], bump: u64) {
+            let f = home.join(".cys/accounts.json");
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(&f, body).unwrap();
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_100_000 + bump);
+            std::fs::File::options().write(true).open(&f).unwrap().set_modified(t).unwrap();
+        }
+
+        fn put_aliases(home: &Path, body: &str, bump: u64) {
+            put_alias_bytes(home, body.as_bytes(), bump);
+        }
+
+        /// 별명 상태 한 장 — (stat 시도 수, 실제 판독 수, 이 키의 별명).
+        fn alias_snap(d: &Arc<Daemon>, key: &str) -> (u64, u64, Option<String>) {
+            let st = d.accounts.lock().unwrap();
+            (st.alias.stats, st.alias.reads, st.alias.table.get(key).cloned())
+        }
+
+        fn known(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
+            pairs.iter().map(|(p, w)| (p.to_string(), w.map(str::to_string))).collect()
+        }
+
+        // ───────────────────────── current_profiles ─────────────────────────
+
+        /// ★핵심 시나리오(오너 제보): 좌석 폴더의 로그인을 A → B 로 바꾸면 `profiles`(추가 전용)에는 옛 계정에도 폴더가 남지만 `current_profiles` 는 지금 로그인된 쪽만 갖는다.
+        /// 판독 실패 폴더는 누구의 current 에도 없고 · codex 행은 profiles 그대로다. 신원 판독은 B3 의 60초 캐시를 타므로 시각을 주입한다.
+        #[test]
+        fn b1_current_profiles_follow_the_folder_login_while_profiles_stay_additive() {
+            let dir = tmp("b1-s1-daemon");
+            let home = tmp("b1-s1-home");
+            let _h = test_home::set(&home);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let fa = b3_login(&home, ".cys/claude-b1", "u-b1-a", "a-b1@example.test", 1);
+            b3_login(&home, ".claude-b1x", "u-b1-b", "b-b1@example.test", 1); // B 는 다른 폴더에 로그인 — 부트 발견으로 행이 생긴다(좌석 폴더에서 보고하기 전)
+            write(&home.join(".claude-b1bad/.claude.json"), "{not json"); // 신원 판독 실패 폴더
+            std::fs::create_dir_all(home.join(".codex")).unwrap();
+            {
+                let mut st = d.accounts.lock().unwrap();
+                seed_discovered(&mut st, &home);
+            }
+            let t0 = crate::state::now_epoch();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 40.0, Some(t0 + 7200.0))], "statusline", t0));
+            // ① 로그인 A: 행 A 는 좌석 폴더가 현재 · 행 B 는 자기 폴더 · codex 는 profiles 그대로 · 판독 실패 폴더는 누구에게도 없다
+            let rows = local_json(&d, t0 + 1.0);
+            let (a, b, cx) = (row(&rows, "u-b1-a"), row(&rows, "u-b1-b"), row(&rows, "default"));
+            assert_eq!(strs(&a["current_profiles"]), s(&[".cys/claude-b1"]));
+            assert_eq!(strs(&b["current_profiles"]), s(&[".claude-b1x"]));
+            assert_eq!((cx["provider"].clone(), strs(&cx["current_profiles"])), (json!("codex"), s(&[".codex"])), "codex 는 폴더당 계정 1개 — profiles 그대로");
+            assert_eq!(strs(&cx["current_profiles"]), strs(&cx["profiles"]));
+            for r in rows.as_array().unwrap() {
+                assert!(!strs(&r["current_profiles"]).iter().any(|p| p.contains("b1bad")), "신원 판독 실패 폴더가 어느 계정의 current 에 들어갔다: {r}");
+            }
+            // ② 같은 폴더의 로그인을 B 로 바꾼다 — 60초 캐시 하한이 지난 뒤 행 A 는 current 에서 빠지고(profiles 는 그대로) 행 B 가 폴더를 갖는다
+            b3_login(&home, ".cys/claude-b1", "u-b1-b", "b-b1@example.test", 2);
+            let rows = local_json(&d, t0 + 1.0 + SEAT_IDENT_CACHE_SECS);
+            let (a, b) = (row(&rows, "u-b1-a"), row(&rows, "u-b1-b"));
+            assert_eq!(strs(&a["current_profiles"]), Vec::<String>::new(), "로그인을 B 로 바꿨는데 옛 계정 A 에 현재 폴더가 남았다");
+            assert_eq!(strs(&a["profiles"]), s(&[".cys/claude-b1"]), "profiles 는 추가 전용 — 이관·삭제 없음(동작 무변)");
+            assert_eq!(strs(&b["current_profiles"]), s(&[".claude-b1x", ".cys/claude-b1"]), "새 계정 B(보고 전 발견 시드 행)가 좌석 폴더를 현재로 갖지 못했다");
+            assert_eq!(strs(&b["profiles"]), s(&[".claude-b1x"]), "current_profiles 가 profiles 를 건드렸다(보고 전이라 좌석 폴더가 아직 없어야 한다)");
+            // ③ B 가 좌석 폴더에서 보고하면 — 옛 계정과 새 계정 둘 다 profiles 에 좌석 폴더를 갖는다(제보된 결함 모양) · current 가 둘을 가른다
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 10.0, Some(t0 + 9000.0))], "statusline", t0 + 62.0));
+            let rows = local_json(&d, t0 + 63.0);
+            let (a, b) = (row(&rows, "u-b1-a"), row(&rows, "u-b1-b"));
+            assert_eq!(strs(&a["profiles"]), s(&[".cys/claude-b1"]));
+            assert_eq!(strs(&b["profiles"]), s(&[".claude-b1x", ".cys/claude-b1"]));
+            assert_eq!(strs(&a["current_profiles"]), Vec::<String>::new());
+            assert_eq!(strs(&b["current_profiles"]), s(&[".claude-b1x", ".cys/claude-b1"]));
+            // 기존 키는 불변(가산뿐)
+            for k in ["provider", "account_id", "label", "plan", "profiles", "rate", "updated_at", "stale_secs", "source", "adapter", "source_error", "in_use", "rate_observed_at"] {
+                assert!(a.get(k).is_some(), "기존 키 {k} 소실: {a}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// `current_profiles_for` 순수 표 — claude: 현재 신원이 이 계정인 폴더만(정렬·중복 제거) · 판독 실패(None)는 누구의 것도 아니다(`None == None` 함정 포함) ·
+        /// 그 밖 provider: profiles 그대로 · 폴더 목록이 비면(홈 불명) 빈 배열.
+        #[test]
+        fn b1_current_profiles_for_table() {
+            let profiles: BTreeSet<String> = s(&[".cys/claude-b1", ".claude-b1z"]).into_iter().collect();
+            let k = known(&[(".cys/claude-b1", Some("A")), (".claude-b1x", Some("B")), (".claude-b1bad", None), (".claude-b1y", Some("A")), (".cys/claude-b1", Some("A"))]);
+            assert_eq!(current_profiles_for("claude", "A", &profiles, &k), s(&[".claude-b1y", ".cys/claude-b1"]), "일치하는 폴더만 · 정렬 · 중복 제거");
+            assert_eq!(current_profiles_for("claude", "B", &profiles, &k), s(&[".claude-b1x"]));
+            assert!(current_profiles_for("claude", "C", &profiles, &k).is_empty(), "아무 폴더도 아니면 빈 배열(profiles 에 남은 폴더는 무관)");
+            assert!(current_profiles_for("claude", "", &profiles, &k).is_empty(), "판독 실패(None) 폴더가 빈 account_id 와 같다고 읽혔다(None==None 함정)");
+            assert!(!current_profiles_for("claude", "A", &profiles, &k).iter().any(|p| p.contains("bad")), "판독 실패 폴더가 current 에 들어갔다");
+            assert!(current_profiles_for("claude", "A", &profiles, &[]).is_empty(), "알려진 폴더가 없으면(홈 불명) 빈 배열");
+            let codex: BTreeSet<String> = s(&[".codex"]).into_iter().collect();
+            assert_eq!(current_profiles_for("codex", "default", &codex, &k), s(&[".codex"]), "codex 는 profiles 그대로");
+            let agy: BTreeSet<String> = s(&[".gemini/antigravity-cli", ".antigravity"]).into_iter().collect();
+            assert_eq!(current_profiles_for("antigravity", "default", &agy, &k), s(&[".antigravity", ".gemini/antigravity-cli"]), "agy 는 profiles 그대로(정렬된 집합)");
+            assert!(current_profiles_for("codex", "default", &BTreeSet::new(), &k).is_empty(), "profiles 가 비면 빈 배열");
+            assert!(current_profiles_for("grok", "default", &BTreeSet::new(), &k).is_empty(), "선언 계정(그 밖 provider)도 profiles 그대로");
+        }
+
+        /// 알려진 프로필 폴더 표 — 열거 정본(기본 프로필 `~/.claude` 포함)·`profile_short` 표기·B3 의 60초 캐시 재사용(좌석 신원 표가 이미 읽은 폴더는 다시 stat 하지 않는다 · 새 캐시 없음)·
+        /// 기본 프로필의 신원은 홈 직하 `~/.claude.json` · 홈 불명이면 빈 표.
+        #[test]
+        fn b1_known_profile_identities_reuse_the_b3_cache_and_read_the_default_profile_login() {
+            let dir = tmp("b1-u3-daemon");
+            let home = tmp("b1-u3-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let fa = b3_login(&home, ".cys/claude-b1", "u-b1-a", "a-b1@example.test", 1);
+            b3_login(&home, ".claude-b1x", "u-b1-b", "b-b1@example.test", 2);
+            std::fs::create_dir_all(home.join(".claude")).unwrap(); // 기본 프로필 — 폴더 안에는 신원 파일이 없고 홈 직하 `.claude.json` 이 신원이다
+            write(&home.join(".claude.json"), r#"{"oauthAccount":{"accountUuid":"u-b1-d","emailAddress":"d-b1@example.test"}}"#);
+            write(&home.join(".claude-b1bad/.claude.json"), "{not json");
+            let _seat = b3_seat(&d, "worker-b1", "claude", Some(&fa));
+            let t0 = crate::state::now_epoch();
+            let sorted = |v: Vec<(String, Option<String>)>| {
+                let mut v: Vec<(String, Option<String>)> = v.into_iter().map(|(p, w)| (p.replace('\\', "/"), w)).collect(); // 윈도우 열거 경로의 `\` 를 접는다
+                v.sort();
+                v
+            };
+            // 좌석 신원 표가 좌석 폴더를 먼저 읽는다 → 같은 캐시이므로 알려진 폴더 표는 그 폴더를 다시 읽지 않는다
+            let _ = seat_identity_view_in(&d, Some(&home), t0);
+            assert_eq!(d.seat_ident_cache.lock().unwrap().reads, 1);
+            let got = sorted(known_profile_identities(&d, Some(&home), t0 + 1.0));
+            assert_eq!(
+                got,
+                known(&[(".claude", Some("u-b1-d")), (".claude-b1bad", None), (".claude-b1x", Some("u-b1-b")), (".cys/claude-b1", Some("u-b1-a"))]),
+                "열거 정본·표기·기본 프로필(홈 직하 신원)·판독 실패(None)"
+            );
+            {
+                let c = d.seat_ident_cache.lock().unwrap();
+                assert_eq!((c.reads, c.hits), (4, 1), "좌석 폴더 1 + 나머지 3 = 실판독 4 · 좌석 폴더는 적중 1 — 캐시가 갈렸거나 새 캐시를 만들었다");
+            }
+            // 60초 안의 연속 호출은 stat 0회
+            for dt in [5.0, 30.0, 59.0] {
+                let _ = known_profile_identities(&d, Some(&home), t0 + dt);
+            }
+            assert_eq!(d.seat_ident_cache.lock().unwrap().reads, 4, "60초 하한 안에서 폴더를 다시 판독했다");
+            // 파일을 지워도(= 관측) 하한 안에서는 옛 신원 · 하한이 지나면 다시 본다
+            std::fs::remove_file(home.join(".claude.json")).unwrap();
+            let got = sorted(known_profile_identities(&d, Some(&home), t0 + 59.5));
+            assert_eq!(got[0], (".claude".to_string(), Some("u-b1-d".to_string())), "하한 안인데 기본 프로필 신원이 바뀌었다");
+            let got = sorted(known_profile_identities(&d, Some(&home), t0 + 200.0));
+            assert_eq!(got[0], (".claude".to_string(), None), "하한이 지났는데 지워진 신원이 그대로다");
+            // 홈 불명 → 빈 표(파일을 보지 않는다)
+            assert!(known_profile_identities(&d, None, t0).is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// FIFO 신원 파일을 가진 **알려진 프로필 폴더**(좌석이 쓰지 않는 폴더)가 `usage.accounts`(`local_json`)를 세우지 않고, 그 폴더는 누구의 current 에도 없다(R4-F2 패턴).
+        #[cfg(unix)]
+        #[test]
+        fn b1_fifo_identity_in_a_known_profile_folder_blocks_nothing_and_is_nobodys_current() {
+            let dir = tmp("b1-u4-daemon");
+            let home = tmp("b1-u4-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let fa = b3_login(&home, ".cys/claude-b1", "u-b1-a", "a-b1@example.test", 1);
+            let fifo = home.join(".claude-b1fifo/.claude.json");
+            mkfifo(&fifo);
+            let t0 = crate::state::now_epoch();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 40.0, Some(t0 + 7200.0))], "statusline", t0));
+            let (tx, rx) = std::sync::mpsc::channel();
+            {
+                let (d, home) = (d.clone(), home.clone());
+                std::thread::spawn(move || {
+                    let _h = test_home::set(&home);
+                    let _ = tx.send(local_json(&d, t0 + 1.0));
+                });
+            }
+            let out = rx.recv_timeout(std::time::Duration::from_secs(5));
+            release_fifo(&fifo);
+            let rows = out.expect("FIFO 신원을 가진 알려진 프로필 폴더가 usage.accounts 를 멈췄다");
+            assert_eq!(strs(&row(&rows, "u-b1-a")["current_profiles"]), s(&[".cys/claude-b1"]));
+            for r in rows.as_array().unwrap() {
+                assert!(!strs(&r["current_profiles"]).iter().any(|p| p.contains("b1fifo")), "신원 판독 실패(FIFO) 폴더가 current 에 들어갔다: {r}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        // ───────────────────────── alias ─────────────────────────
+
+        /// 별명 값 정제 표 — 제어 문자 제거 · 앞뒤 공백 제거 · 빈 값 무시 · 최대 24자(char 기준) 절단.
+        #[test]
+        fn b1_sanitize_alias_table() {
+            let long_mix = format!("{}\n{}", "가".repeat(20), "나".repeat(20));
+            let cases: Vec<(&str, String, Option<String>)> = vec![
+                ("평문", "업무용".into(), Some("업무용".into())),
+                ("앞뒤 공백", "  개인  ".into(), Some("개인".into())),
+                ("탭·개행·CR 은 제어 문자 — 제거", "\t업무\n용\r\n".into(), Some("업무용".into())),
+                ("NUL·BEL·DEL·C1(0x85) 제거", "a\u{0}b\u{7}c\u{7f}d\u{85}e".into(), Some("abcde".into())),
+                ("ESC 시퀀스의 제어 바이트 제거(터미널 오염 차단)", "x\u{1b}[31my".into(), Some("x[31my".into())),
+                ("내부 공백은 유지", "업무 용".into(), Some("업무 용".into())),
+                ("빈 문자열", "".into(), None),
+                ("공백뿐(전각 공백 포함)", "   \u{3000} ".into(), None),
+                ("제어 문자뿐", "\u{0}\u{1}\n".into(), None),
+                ("정확히 24자", "가".repeat(24), Some("가".repeat(24))),
+                ("25자 → 24자", "가".repeat(25), Some("가".repeat(24))),
+                ("30자 ASCII → 24자", "a".repeat(30), Some("a".repeat(24))),
+                ("이모지 30개 → 24개(char 기준)", "😀".repeat(30), Some("😀".repeat(24))),
+                ("제어 문자를 걷은 뒤 24자", long_mix, Some(format!("{}{}", "가".repeat(20), "나".repeat(4)))),
+                ("절단이 공백에서 끝나면 그 공백도 걷는다", format!("{} bbb", "a".repeat(23)), Some("a".repeat(23))),
+            ];
+            for (what, raw, want) in cases {
+                assert_eq!(sanitize_alias(&raw), want, "{what}");
+                if let Some(w) = want {
+                    assert!(w.chars().count() <= 24 && !w.chars().any(char::is_control), "{what}: 결과가 정제 규칙을 어겼다");
+                }
+            }
+        }
+
+        /// 별명 표 파서 — 값이 문자열이 아니거나 정제 뒤 비면 그 항목만 버린다 · 키가 빈 문자열이면 버린다 · `aliases` 가 객체가 아니거나 루트가 객체가 아니거나 JSON 오류·UTF-8 아님이면 빈 표 ·
+        /// 같은 파일의 `accounts` 배열(선언 계정)은 읽지 않는다.
+        #[test]
+        fn b1_parse_alias_table_shapes() {
+            let p = |t: &str| parse_alias_table(t.as_bytes());
+            let want: HashMap<String, String> = [("k1", "업무"), ("k10", "가")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            assert_eq!(
+                p(r#"{"aliases":{"k1":"  업무  ","k2":5,"k3":null,"k4":["x"],"k5":{"a":1},"k6":true,"k7":"","k8":"   ","k9":"\u0007\u0000","":"빈키","k10":"가"}}"#),
+                want,
+                "문자열이 아니거나 정제 뒤 비는 값 · 빈 키는 그 항목만 버린다"
+            );
+            assert_eq!(p(r#"{"accounts":[{"provider":"grok","label":"Grok","adapter":"none"}],"aliases":{"k1":"업무"}}"#).len(), 1, "accounts 배열은 별명 표와 무관하다");
+            for bad in [
+                r#"{"accounts":[{"provider":"grok"}]}"#, // aliases 없음
+                r#"{"aliases":["a","b"]}"#,
+                r#"{"aliases":"x"}"#,
+                r#"{"aliases":null}"#,
+                r#"{"aliases":7}"#,
+                r#"["aliases"]"#,
+                r#""aliases""#,
+                "null",
+                "{not json",
+                "",
+            ] {
+                assert!(p(bad).is_empty(), "{bad:?} 는 빈 표여야 한다");
+            }
+            assert!(parse_alias_table(&[0x7b, 0xff, 0xfe, 0x7d]).is_empty(), "UTF-8 이 아닌 본문");
+            // 별명 표는 정제 규칙을 통과한 값만 담는다(24자 절단 포함)
+            let long = format!(r#"{{"aliases":{{"u":"{}"}}}}"#, "가".repeat(30));
+            assert_eq!(p(&long).get("u").map(|v| v.chars().count()), Some(24));
+        }
+
+        /// `alias_for` 우선순위 — account_id 키가 label(이메일) 키보다 우선 · 어느 쪽만 있어도 찾는다 · 비 claude 행은 label(예: `OpenAI Codex`)로 찾는다.
+        #[test]
+        fn b1_alias_for_prefers_account_id_over_label() {
+            let t: HashMap<String, String> =
+                [("u-b1-a", "ID별명"), ("a-b1@example.test", "메일별명"), ("OpenAI Codex", "코덱스")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            assert_eq!(alias_for(&t, "u-b1-a", "a-b1@example.test"), Some("ID별명"), "둘 다 있으면 account_id 가 이긴다");
+            assert_eq!(alias_for(&t, "u-b1-zzz", "a-b1@example.test"), Some("메일별명"), "이메일 키만");
+            assert_eq!(alias_for(&t, "u-b1-a", "other@example.test"), Some("ID별명"), "account_id 키만");
+            assert_eq!(alias_for(&t, "default", "OpenAI Codex"), Some("코덱스"), "비 claude 행은 라벨 키로");
+            assert_eq!(alias_for(&t, "u-none", "none@example.test"), None);
+            assert_eq!(alias_for(&HashMap::new(), "u-b1-a", "a-b1@example.test"), None);
+        }
+
+        /// 끝에서 끝까지(부트 시드 → `usage.accounts` 행): account_id 키 · 이메일 키 · 둘 다(account_id 우선) · 라벨 키(codex·선언 계정) · 별명 없는 행은 null.
+        /// 부트에서 1회 판독하고(stat 1 · read 1) 하한 안의 RPC 는 stat 도 하지 않는다. 선언 계정(`accounts` 배열) 판독은 종전 그대로다.
+        #[test]
+        fn b1_boot_seed_loads_aliases_once_and_rows_carry_the_alias() {
+            let dir = tmp("b1-u7-daemon");
+            let home = tmp("b1-u7-home");
+            let _h = test_home::set(&home);
+            b3_login(&home, ".cys/claude-b1", "u-b1-a", "a-b1@example.test", 1);
+            b3_login(&home, ".claude-b1x", "u-b1-b", "b-b1@example.test", 1);
+            b3_login(&home, ".claude-b1y", "u-b1-c", "c-b1@example.test", 1);
+            b3_login(&home, ".claude-b1w", "u-b1-w", "w-b1@example.test", 1);
+            std::fs::create_dir_all(home.join(".codex")).unwrap();
+            put_aliases(
+                &home,
+                r#"{"accounts":[{"provider":"grok","label":"Grok Test","adapter":"none"}],
+                    "aliases":{"u-b1-a":"ID별명A","a-b1@example.test":"메일별명A","b-b1@example.test":"메일별명B","u-b1-c":"ID별명C",
+                               "OpenAI Codex":"코덱스","Grok Test":"그록","no-such":"없는계정"}}"#,
+                1,
+            );
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            seed_known(&d);
+            assert_eq!(alias_snap(&d, "u-b1-a"), (1, 1, Some("ID별명A".to_string())), "부트 시드가 별명을 1회 판독하지 않았다");
+            let boot_at = d.accounts.lock().unwrap().alias.checked_at.expect("부트 시드가 별명 확인 시각을 남기지 않았다");
+            for dt in [1.0, 2.0, 30.0] {
+                let _ = local_json(&d, boot_at + dt);
+            }
+            assert_eq!((alias_snap(&d, "u-b1-a").0, alias_snap(&d, "u-b1-a").1), (1, 1), "부트 직후 60초 안의 RPC 가 stat 을 했다");
+            let rows = local_json(&d, boot_at + 31.0);
+            let al = |id: &str| row(&rows, id)["alias"].clone();
+            assert_eq!(al("u-b1-a"), json!("ID별명A"), "둘 다 있으면 account_id 우선");
+            assert_eq!(al("u-b1-b"), json!("메일별명B"), "이메일 키만");
+            assert_eq!(al("u-b1-c"), json!("ID별명C"), "account_id 키만");
+            assert_eq!(al("u-b1-w"), Value::Null, "별명이 없는 행은 null");
+            let others: Vec<(String, Value)> = rows
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["provider"] != "claude")
+                .map(|r| (r["provider"].as_str().unwrap().to_string(), r["alias"].clone()))
+                .collect();
+            assert!(others.contains(&("codex".to_string(), json!("코덱스"))), "라벨 키로 찾는 codex 행: {others:?}");
+            assert!(others.contains(&("grok".to_string(), json!("그록"))), "선언 계정은 종전처럼 로드되고 라벨 키로 별명을 찾는다: {others:?}");
+            // 별명 파일을 바꿔도 60초 안에는 반영되지 않고(stat 0회) · 60초 뒤 mtime 이 바뀐 것을 보고 반영한다
+            put_aliases(&home, r#"{"aliases":{"u-b1-a":"새별명"}}"#, 2);
+            assert_eq!(row(&local_json(&d, boot_at + 59.0), "u-b1-a")["alias"], json!("ID별명A"));
+            assert_eq!(row(&local_json(&d, boot_at + 61.0), "u-b1-a")["alias"], json!("새별명"));
+            assert_eq!(row(&local_json(&d, boot_at + 61.0), "u-b1-b")["alias"], Value::Null, "파일에서 빠진 별명이 남았다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 재판독 규율 — 부트 1회 + 파일 mtime(서명)이 바뀔 때만 · 60초 하한 안에서는 stat 0회 · 변화가 없으면 stat 은 하되 재판독은 없다 · 시계가 뒤로 가면 만료로 본다.
+        #[test]
+        fn b1_alias_file_is_reread_only_when_the_file_changes_and_never_checked_inside_sixty_seconds() {
+            let dir = tmp("b1-u8-daemon");
+            let home = tmp("b1-u8-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            put_aliases(&home, r#"{"aliases":{"u-b1-a":"첫째"}}"#, 1);
+            let t0 = crate::state::now_epoch();
+            refresh_aliases(&d, Some(&home), t0);
+            assert_eq!(alias_snap(&d, "u-b1-a"), (1, 1, Some("첫째".to_string())));
+            // 새 내용·새 mtime 으로 바꿔도 60초 안에는 stat 도 하지 않는다(별명이 옛 값 그대로 = 파일을 다시 보지 않았다는 관측)
+            put_aliases(&home, r#"{"aliases":{"u-b1-a":"둘째"}}"#, 2);
+            for dt in [0.0, 1.0, 30.0, 59.9] {
+                refresh_aliases(&d, Some(&home), t0 + dt);
+            }
+            assert_eq!(alias_snap(&d, "u-b1-a"), (1, 1, Some("첫째".to_string())), "60초 하한 안에서 stat 을 했다");
+            // 60초가 되면 확인 → mtime 이 바뀌었으니 재판독
+            refresh_aliases(&d, Some(&home), t0 + 60.0);
+            assert_eq!(alias_snap(&d, "u-b1-a"), (2, 2, Some("둘째".to_string())));
+            // 변화 없음 — 확인(stat)은 하되 재판독은 없다
+            refresh_aliases(&d, Some(&home), t0 + 120.0);
+            refresh_aliases(&d, Some(&home), t0 + 180.0);
+            assert_eq!(alias_snap(&d, "u-b1-a"), (4, 2, Some("둘째".to_string())), "mtime 이 같은데 재판독했다");
+            // 시계 역행(now < 마지막 확인)은 만료 — 하한이 영구히 붙지 않는다
+            refresh_aliases(&d, Some(&home), t0 + 10.0);
+            assert_eq!(alias_snap(&d, "u-b1-a").0, 5);
+            // 파일이 사라지면(부재) 별명 표는 비워진다 · 부재 → 부재는 재판독 없음
+            std::fs::remove_file(home.join(".cys/accounts.json")).unwrap();
+            refresh_aliases(&d, Some(&home), t0 + 100.0);
+            assert_eq!(alias_snap(&d, "u-b1-a"), (6, 2, None), "부재는 stat 만 하고 파일을 읽지 않는다");
+            refresh_aliases(&d, Some(&home), t0 + 200.0);
+            assert_eq!(alias_snap(&d, "u-b1-a"), (7, 2, None), "부재 → 부재인데 재판독했다");
+            // 홈 불명이면 파일을 보지 않는다(별명 없음)
+            refresh_aliases(&d, None, t0 + 300.0);
+            assert_eq!(alias_snap(&d, "u-b1-a"), (8, 2, None));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 쓸 수 없는 별명 파일(JSON 오류 · 빈 파일 · `aliases` 가 객체 아님 · 루트가 배열 · UTF-8 아님 · 64KiB 초과 · 디렉터리) = 별명 없음 + **기존 별명 표는 비운다** ·
+        /// 정확히 64KiB 는 유효(양성 대조).
+        #[test]
+        fn b1_unusable_alias_files_mean_no_aliases_and_clear_the_old_table() {
+            let dir = tmp("b1-u9-daemon");
+            let home = tmp("b1-u9-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let stem = r#"{"aliases":{"u-b1-a":"한계"},"pad":""}"#;
+            let exact = format!(r#"{{"aliases":{{"u-b1-a":"한계"}},"pad":"{}"}}"#, "p".repeat(65536 - stem.len()));
+            assert_eq!(exact.len() as u64, ALIAS_FILE_MAX_BYTES, "픽스처 계산 오류");
+            let over = format!("{exact}\n");
+            let cases: Vec<(&str, Vec<u8>)> = vec![
+                ("JSON 오류", b"{not json".to_vec()),
+                ("빈 파일", Vec::new()),
+                ("루트가 배열", b"[1,2]".to_vec()),
+                ("aliases 가 배열", br#"{"aliases":["a"]}"#.to_vec()),
+                ("aliases 가 문자열", br#"{"aliases":"a"}"#.to_vec()),
+                ("aliases 가 null", br#"{"aliases":null}"#.to_vec()),
+                ("UTF-8 아님", vec![0x7b, 0xff, 0xfe, 0x7d]),
+                ("64KiB 초과(1바이트)", over.into_bytes()),
+            ];
+            let mut t = crate::state::now_epoch();
+            let mut bump = 10u64;
+            for (what, body) in cases {
+                // 유효한 별명을 먼저 싣고(양성 대조) → 쓸 수 없는 내용으로 바꾸면 표가 비워진다
+                bump += 1;
+                put_aliases(&home, r#"{"aliases":{"u-b1-a":"유효"}}"#, bump);
+                t += 100.0;
+                refresh_aliases(&d, Some(&home), t);
+                assert_eq!(alias_snap(&d, "u-b1-a").2, Some("유효".to_string()), "{what}: 양성 대조 실패");
+                bump += 1;
+                put_alias_bytes(&home, &body, bump);
+                t += 100.0;
+                refresh_aliases(&d, Some(&home), t);
+                assert_eq!(alias_snap(&d, "u-b1-a").2, None, "{what}: 쓸 수 없는 파일인데 옛 별명이 남았다");
+                assert!(d.accounts.lock().unwrap().alias.table.is_empty(), "{what}: 표가 비워지지 않았다");
+            }
+            // 디렉터리(비정규) — 열지 않는다
+            bump += 1;
+            put_aliases(&home, r#"{"aliases":{"u-b1-a":"유효"}}"#, bump);
+            t += 100.0;
+            refresh_aliases(&d, Some(&home), t);
+            assert_eq!(alias_snap(&d, "u-b1-a").2, Some("유효".to_string()));
+            std::fs::remove_file(home.join(".cys/accounts.json")).unwrap();
+            std::fs::create_dir_all(home.join(".cys/accounts.json")).unwrap();
+            t += 100.0;
+            refresh_aliases(&d, Some(&home), t);
+            assert_eq!(alias_snap(&d, "u-b1-a").2, None, "디렉터리인 accounts.json 에서 옛 별명이 남았다");
+            std::fs::remove_dir_all(home.join(".cys/accounts.json")).unwrap();
+            // 정확히 64KiB 는 유효
+            bump += 1;
+            put_aliases(&home, &exact, bump);
+            t += 100.0;
+            refresh_aliases(&d, Some(&home), t);
+            assert_eq!(alias_snap(&d, "u-b1-a").2, Some("한계".to_string()), "정확히 64KiB 파일을 거절했다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 별명 파일이 FIFO 여도(읽으면 막히는 파일) 부트 판독 경로·`usage.accounts`·재판독이 멈추지 않는다 — 별명 없음 + RPC 무정지.
+        #[cfg(unix)]
+        #[test]
+        fn b1_fifo_alias_file_blocks_nothing() {
+            let dir = tmp("b1-u10-daemon");
+            let home = tmp("b1-u10-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let fa = b3_login(&home, ".cys/claude-b1", "u-b1-a", "a-b1@example.test", 1);
+            let fifo = home.join(".cys/accounts.json");
+            mkfifo(&fifo);
+            let t0 = crate::state::now_epoch();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 40.0, Some(t0 + 7200.0))], "statusline", t0));
+            let (tx, rx) = std::sync::mpsc::channel();
+            {
+                let (d, home) = (d.clone(), home.clone());
+                std::thread::spawn(move || {
+                    let _h = test_home::set(&home);
+                    refresh_aliases(&d, Some(&home), t0);
+                    let r1 = local_json(&d, t0 + 1.0);
+                    let r2 = local_json(&d, t0 + 100.0); // 하한이 지난 두 번째 확인도 막히지 않는다
+                    let _ = tx.send((r1, r2));
+                });
+            }
+            let out = rx.recv_timeout(std::time::Duration::from_secs(5));
+            release_fifo(&fifo);
+            let (r1, r2) = out.expect("FIFO 별명 파일이 별명 판독·usage.accounts 를 멈췄다");
+            for r in [&r1, &r2] {
+                assert_eq!(row(r, "u-b1-a")["alias"], Value::Null, "FIFO 별명 파일인데 별명이 실렸다");
+            }
+            assert_eq!(d.accounts.lock().unwrap().alias.reads, 0, "FIFO 를 열어 읽으려 했다(비정규 파일은 열지 않는다)");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 별명은 표시 전용이다 — 경보 키·라벨·이벤트 payload(key·message·detail)·`alert_inputs` 에 나타나지 않는다. 별명이 정말 실려 있는 상태에서(음성 대조: 행에는 보인다) 경보 틱을 돌려
+        /// 발행된 모든 이벤트에 별명 문자열이 0이고, 경보 키·라벨은 이메일 그대로다.
+        #[test]
+        fn b1_alias_is_display_only_and_never_reaches_alert_keys_labels_or_events() {
+            let dir = tmp("b1-u11-daemon");
+            let home = tmp("b1-u11-home");
+            let _h = test_home::set(&home);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let fa = b3_login(&home, ".cys/claude-b1", "u-b1-a", "a-b1@example.test", 1);
+            put_aliases(&home, r#"{"aliases":{"u-b1-a":"ZZ별칭-ID","a-b1@example.test":"ZZ별칭-MAIL"}}"#, 1);
+            let _seat = b3_seat(&d, "worker-b1", "claude", Some(&fa));
+            let cfg = crate::alerts::AlertConfig::default();
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            let t0 = crate::state::now_epoch();
+            let seq0 = d.bus.latest_seq();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+            refresh_aliases(&d, Some(&home), t0);
+            assert_eq!(row(&local_json(&d, t0 + 1.0), "u-b1-a")["alias"], json!("ZZ별칭-ID"), "전제: 별명이 행에 실려 있어야 이 검체가 의미 있다");
+            for dt in [1.0, 1801.0] {
+                crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + dt);
+            }
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 2, "경보 키는 별명이 아니라 이메일 라벨이다(REMIND 까지 2건)");
+            let all = serde_json::to_string(&d.bus.replay_after(seq0)).unwrap();
+            assert!(all.contains("account_rate"), "전제: 경보 이벤트가 발행돼 있어야 한다");
+            assert!(!all.contains("ZZ별칭"), "별명이 이벤트(key·message·detail)에 새었다: {all}");
+            assert!(fired.keys().all(|k| !k.contains("ZZ별칭")), "별명이 fired 키에 새었다: {:?}", fired.keys().collect::<Vec<_>>());
+            let ev = d.bus.replay_after(seq0).into_iter().find(|e| e["name"] == "alert.account_rate").expect("경보 이벤트");
+            assert_eq!(ev["payload"]["detail"]["account"], json!("a-b1@example.test"), "경보 라벨이 이메일이 아니다");
+            // 경보 입력(alert_inputs)의 라벨·경보 행(alert_rates_with)의 라벨도 이메일 그대로
+            {
+                let st = d.accounts.lock().unwrap();
+                let key = AccountKey { provider: "claude".into(), account_id: "u-b1-a".into() };
+                assert_eq!(st.alert_inputs.get(&key).map(|i| i.label.as_str()), Some("a-b1@example.test"));
+            }
+            let view = seat_identity_view_in(&d, Some(&home), t0 + 1.0);
+            let rows = alert_rates_with(&d, &view, t0 + 1.0, 1800.0);
+            assert!(!rows.is_empty() && rows.iter().all(|r| r.label == "a-b1@example.test"), "경보 행의 라벨이 이메일이 아니다: {rows:?}");
+            // 경보 틱이 쓰는 순수 평가가 만든 Alert 자체(key · message · detail)도 같다 — 별명 문자열 0 · 키·문구의 계정 이름은 이메일
+            let alerts = crate::alerts::evaluate(&crate::alerts::snapshot_with_stale(&d, t0 + 1.0, 1800.0), &cfg);
+            let acct: Vec<&crate::alerts::Alert> = alerts.iter().filter(|a| a.kind == "account_rate").collect();
+            assert_eq!(acct.len(), 1, "전제: 계정 경보 1건이 평가돼야 한다: {alerts:?}");
+            assert_eq!((acct[0].key.as_str(), acct[0].message.as_str()), (KEY_A, "계정 a-b1@example.test 5h rate 99%"));
+            for a in &alerts {
+                let one = a.to_value().to_string();
+                assert!(!one.contains("ZZ별칭"), "별명이 Alert(key·message·detail)에 새었다: {one}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 락 순서·배선 핀(소스) — `local_json` 은 accounts 락을 잡기 **전에** 알려진 프로필 신원 표와 별명 표 갱신(파일 IO)을 끝내고, 락 안에서는 순수 함수만 부른다 ·
+        /// `refresh_aliases` 는 파일 IO 를 두 번의 순간 락 **사이**에서 한다 · `known_profile_identities` 는 새 캐시·직접 락 없이 B3 의 `folder_identity` 만 쓴다 · 순수 함수에는 파일 IO·락이 없다.
+        #[test]
+        fn b1_lock_order_wiring_pins() {
+            let src = include_str!("accounts.rs");
+            let func = |head: &str| -> String {
+                let body = src.split(head).nth(1).unwrap_or_else(|| panic!("{head} 소실"));
+                body[..body.find("\n}\n").unwrap_or_else(|| panic!("{head} 끝"))].to_string()
+            };
+            let lj = func("pub fn local_json(");
+            let lock = lj.find("daemon.accounts.lock()").expect("local_json 의 accounts 락");
+            for pre in ["seat_identity_view_at(", "known_profile_identities(", "refresh_aliases("] {
+                let at = lj.find(pre).unwrap_or_else(|| panic!("local_json 이 {pre} 를 부르지 않는다"));
+                assert!(at < lock, "local_json 이 accounts 락을 잡은 **뒤에** {pre} 를 부른다(파일 IO 가 락 안)");
+            }
+            let under_lock = &lj[lock..];
+            for io in ["std::fs::", "enumerate_profile_dirs(", "folder_identity(", "known_profile_identities(", "refresh_aliases(", "alias_file_sig(", "read_alias_file(", "account_home("] {
+                assert!(!under_lock.contains(io), "local_json 의 accounts 락 안에서 {io} 를 부른다");
+            }
+            assert!(under_lock.contains("current_profiles_for(") && under_lock.contains("alias_for("), "행 가산 키가 순수 함수에서 오지 않는다");
+            // refresh_aliases: 락 1(하한 판정 — 블록으로 닫힘) → 파일 IO → 락 2(저장)
+            let r = func("fn refresh_aliases(");
+            let (l1, l2) = (r.find("daemon.accounts.lock()").expect("락 1"), r.rfind("daemon.accounts.lock()").expect("락 2"));
+            assert!(l1 < l2, "refresh_aliases 의 락이 한 번뿐이다(하한 판정·저장 분리 소실)");
+            for io in ["alias_file_sig", "read_alias_file("] {
+                let at = r.find(io).unwrap_or_else(|| panic!("refresh_aliases 가 {io} 를 부르지 않는다"));
+                assert!(l1 < at && at < l2, "{io} 가 두 순간 락 사이가 아니다(락을 쥔 채 파일 IO)");
+                assert!(r[l1..at].contains("\n    };"), "{io} 앞에서 하한 판정 락 블록이 닫히지 않았다(락을 쥔 채 파일 IO)");
+            }
+            // known_profile_identities: 열거 정본 + B3 캐시 도우미만 — 직접 락·직접 캐시 접근·신원 재구현 없음
+            let k = func("fn known_profile_identities(");
+            assert!(k.contains("cys::profile_gate::enumerate_profile_dirs(") && k.contains("folder_identity("), "열거 정본 또는 B3 캐시 도우미를 쓰지 않는다");
+            for bad in ["lock(", "seat_ident_cache", "claude_identity", "read_identity_file(", "identity_file_meta(", "HashMap"] {
+                assert!(!k.contains(bad), "known_profile_identities 가 {bad} 를 쓴다(새 캐시·새 락 간선)");
+            }
+            // 순수 함수: 파일 IO·락 없음
+            for head in ["fn sanitize_alias(", "fn parse_alias_table(", "fn alias_for<", "fn current_profiles_for("] {
+                let f = func(head);
+                for bad in ["std::fs::", "lock(", "dirs::", "OpenOptions"] {
+                    assert!(!f.contains(bad), "순수 함수 {head} 가 {bad} 를 쓴다");
+                }
+            }
+            // 홈은 한 곳(account_home)에서만 — 이 구역의 파일 판독이 dirs::home_dir 을 직접 부르지 않는다
+            assert!(func("fn account_home(").contains("dirs::home_dir()"));
+            assert!(!func("fn refresh_aliases(").contains("home_dir"), "refresh_aliases 가 홈을 직접 찾는다(시험 이음매 우회)");
+        }
+
+        /// 별명은 표시 전용 — 경보 경로(`alert_rates*`·`note_alert_input`·`merge_alert_windows`·`note_resolved`·스냅샷 복원)와 경보 모듈(alerts·governance·alert_route)이 별명 표를 참조하지 않는다(소스 핀).
+        #[test]
+        fn b1_alias_is_not_referenced_by_alert_code_source_pin() {
+            let src = include_str!("accounts.rs");
+            let func = |head: &str| -> String {
+                let body = src.split(head).nth(1).unwrap_or_else(|| panic!("{head} 소실"));
+                body[..body.find("\n}\n").unwrap_or_else(|| panic!("{head} 끝"))].to_string()
+            };
+            for head in [
+                "pub fn alert_rates_with(",
+                "pub fn alert_rates(",
+                "fn note_alert_input(",
+                "fn merge_alert_windows(",
+                "fn note_resolved(",
+                "fn restore_from_snapshots(",
+                "fn feeds_alerts(",
+            ] {
+                let f = func(head);
+                for bad in ["alias", "Alias"] {
+                    assert!(!f.contains(bad), "경보 경로 {head} 가 별명({bad})을 참조한다 — 별명은 표시 전용이다");
+                }
+            }
+            for (name, text) in [("alerts.rs", include_str!("alerts.rs")), ("governance.rs", include_str!("governance.rs")), ("alert_route.rs", include_str!("alert_route.rs"))] {
+                for bad in ["AliasState", "alias_for(", ".alias.", "refresh_aliases"] {
+                    assert!(!text.contains(bad), "{name} 가 별명 표({bad})를 참조한다 — 별명은 표시 전용이다");
+                }
+            }
         }
     }
 }
