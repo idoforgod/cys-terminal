@@ -7,7 +7,7 @@
 //
 // 이 모듈은 문구와 해석만 한다 — 화면·IPC·저장소·타이머를 모른다(main.ts 가 배선·렌더를 한다).
 // ★문구는 **사실만** 말한다. 스마트 앱 컨트롤을 끄라는 지시도, 끄는 방법도 어디에도 없다 — 그 판단은 사용자 몫이다
-//   (updatenotice.test.ts 가 낱말로 핀한다).
+//   (updatenotice.test.ts 가 낱말로 핀한다). ★WU(아래 installerLaunchFailure)의 4551 문구만 확인할 곳과 선택의 결과(보호 수준을 낮춘다)를 사실로 적는다 — 지시는 아니다.
 // ★백엔드 응답은 **신뢰할 수 없는 데이터**로 다룬다 — 모양부터 의심하고, 화면에 올릴 문자열은 제어문자를 걷고 길이를 자른다.
 //   렌더는 main.ts 가 stickyToast·확인 창(textContent)으로만 한다(HTML 삽입 없음).
 //
@@ -37,9 +37,9 @@ const VERSION_MAX = 40;
 
 /** 설치 전 안내 문단(스마트 앱 컨트롤이 **켜짐**일 때만) — 확인 창 본문 끝에 한 줄 띄우고 붙는다. */
 const SAC_PREFLIGHT_TEXT =
-  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 지금 cys 설치 파일에는 코드 서명이 없어 Windows 가 설치를 막을 수 있습니다. " +
-  "막히면 경고 없이 지금 버전이 그대로 남고, 앱을 다시 열면 '설치되지 않았습니다' 알림이 뜹니다. " +
-  "스마트 앱 컨트롤이 켜진 PC 에서는 홈페이지에서 받은 설치 파일도 같은 이유로 막힙니다.";
+  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 지금 cys 설치 파일에는 코드 서명이 없어 Windows 가 실행을 막습니다. " +
+  "막히면 업데이트는 설치되지 않고, 이 앱은 닫히지 않은 채 그 사실을 알려 드립니다. " +
+  "스마트 앱 컨트롤이 켜진 PC 에서는 홈페이지에서 받은 설치 파일도 같은 이유로 막히며, 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.";
 
 /** 제어문자·줄바꿈·양방향 제어·제로폭 문자 — 알림 한 줄을 속이거나 깨뜨릴 수 있는 것들. */
 const INVISIBLE = /[\u{0}-\u{1f}\u{7f}-\u{9f}\u{200b}-\u{200f}\u{2028}\u{2029}\u{202a}-\u{202e}\u{2066}-\u{2069}\u{feff}]/gu;
@@ -138,4 +138,80 @@ export function planUpdateAttemptReport(r: unknown): UpdateAttemptPlan {
     return { kind: "retry", delayMs: (secs + UPDATE_ATTEMPT_RETRY_SLACK_SECS) * 1000 };
   }
   return { kind: "none" };
+}
+
+// ── (0.14.43 · WU) 설치 파일 실행이 막혔을 때의 알림 ─────────────────────────────────────────────────────────────────
+//
+// 윈도우 인앱 업데이트가 설치 파일을 띄우지 못하면(스마트 앱 컨트롤 등 앱 제어 정책이 서명 없는 파일의 실행을 막음) 백엔드는 앱을 닫지 않고
+// 오류 `installer_launch_failed:<os_code>:<shell_ret>` 를 돌려준다. J2 의 알림은 앱이 **다시 뜬 뒤** 한 번 알리는 경로이고, 이쪽은 앱이 **살아 있는 채**
+// 바로 알리는 경로다 — 같은 사실(업데이트가 설치되지 않았다)이라 같은 알림 자리(토스트 id)를 쓴다. 이 함수는 문구만 만든다(화면은 main.ts).
+// ★문구는 사실만 말한다 — 막힌 이유(코드별)·업데이트가 설치되지 않았고 지금 버전이 그대로 실행 중이며 앱이 닫히지 않았다는 것·확인할 곳.
+//   J2 의 원칙(사실만 · 지시 없음)은 그대로다: 4551 문구의 마지막 줄은 확인할 곳과 선택의 결과를 적을 뿐 무엇을 하라고 말하지 않는다(판단은 사용자 몫).
+
+/**
+ * 설치 파일 실행 실패 알림의 sticky 토스트 id — J2 '설치되지 않았습니다' 알림(`UPDATE_FAILED_TOAST_ID`)과 **같은 id 값**이다.
+ * 같은 사실이 한 자리에 뜨고(두 알림이 겹치지 않는다), toastttl.ts 가 이 값에 거는 안내용 수명(10분)·만료 시 OS 배너 1회 규칙이 그대로 적용된다.
+ */
+export const INSTALLER_LAUNCH_FAILED_TOAST_ID = UPDATE_FAILED_TOAST_ID;
+
+/** 백엔드 오류 문자열의 꼴(Rust `LaunchError` 의 Display) — 자릿수를 묶어 이상하게 큰 수를 거른다. 앞뒤 공백·다른 접두는 이 꼴이 아니다. */
+const LAUNCH_FAILED_RE = /^installer_launch_failed:(\d{1,10}):(-?\d{1,10})$/;
+
+/**
+ * 설치 파일 실행 실패 오류 → 사람이 읽는 제목·본문. `err` 가 `installer_launch_failed:<os_code>:<shell_ret>` 꼴이 아니면 null(= 종전 토스트 그대로).
+ *  · 4551(앱 제어 정책 차단 — 스마트 앱 컨트롤 등) · 5(접근 거부) · 2·3(설치 파일 없음) · 225(보안 프로그램이 위험으로 판정) · 1223(취소) · 그 밖(코드 표시).
+ *  · 모든 본문이 같은 문장을 나눠 갖는다: 업데이트는 설치되지 않았고 지금 버전(`current`)이 그대로 실행 중이며 앱은 닫히지 않았다.
+ *  · `current`·`target` 은 화면에 올릴 수 있게 다듬는다(제어문자 제거·길이 제한·비면 "?") — 오류 문자열에서 오는 값은 숫자뿐이다.
+ */
+export function installerLaunchFailure(err: string, current: string, target: string): { title: string; body: string } | null {
+  if (typeof err !== "string") return null;
+  const m = LAUNCH_FAILED_RE.exec(err);
+  if (m === null) return null;
+  const code = Number(m[1]);
+  const ret = Number(m[2]);
+  const cur = version(current);
+  const tgt = version(target);
+  const kept = `업데이트는 설치되지 않았고 지금 버전(${cur})이 그대로 실행 중입니다. 앱은 닫히지 않았습니다.`;
+  const make = (title: string, lines: string[]): { title: string; body: string } => ({ title, body: lines.join("\n") });
+  switch (code) {
+    case 4551:
+      return make("설치 파일 실행이 차단되었습니다", [
+        `Windows 의 앱 제어 정책(스마트 앱 컨트롤 등)이 새 버전(${tgt}) 설치 파일의 실행을 막았습니다(오류 4551).`,
+        kept,
+        "이 설치 파일에는 코드 서명이 없습니다. 스마트 앱 컨트롤이 켜진 PC 에서는 서명 없는 프로그램이 실행되지 않습니다.",
+        "스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요.",
+        "확인하는 곳: Windows 보안 → 앱 및 브라우저 컨트롤 → 스마트 앱 컨트롤. " +
+          "스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택입니다(최근 Windows 는 다시 켤 수 있습니다).",
+      ]);
+    case 5:
+      return make("설치 파일 실행이 거부되었습니다(오류 5)", [
+        `Windows 가 새 버전(${tgt}) 설치 파일의 실행을 거부했습니다(오류 5).`,
+        kept,
+        "보안 프로그램이나 폴더 접근 권한이 임시 폴더의 설치 파일 실행을 막았을 수 있습니다.",
+      ]);
+    case 2:
+    case 3:
+      return make("설치 파일을 찾을 수 없습니다", [
+        `방금 받은 새 버전(${tgt}) 설치 파일을 임시 폴더에서 찾지 못했습니다(오류 ${code}).`,
+        kept,
+        "보안 프로그램이 설치 파일을 격리했거나 지웠을 수 있습니다.",
+      ]);
+    case 225:
+      return make("보안 프로그램이 설치 파일을 위험으로 판정했습니다", [
+        `보안 프로그램이 새 버전(${tgt}) 설치 파일을 위험한 파일로 판정해 실행을 막았습니다(오류 225).`,
+        kept,
+        "사용 중인 보안 프로그램의 검사·격리 기록을 확인해 주세요.",
+      ]);
+    case 1223:
+      return make("설치 파일 실행이 취소되었습니다", [
+        `새 버전(${tgt}) 설치 파일 실행이 취소되었습니다(오류 1223).`,
+        kept,
+        "다시 설치하려면 업데이트를 다시 시작해 주세요.",
+      ]);
+    default:
+      return make(`설치 파일을 실행하지 못했습니다(오류 ${code})`, [
+        `Windows 가 새 버전(${tgt}) 설치 파일을 실행하지 못했습니다(오류 ${code} · 셸 반환값 ${ret}).`,
+        kept,
+      ]);
+  }
 }

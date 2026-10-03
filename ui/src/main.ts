@@ -151,7 +151,7 @@ import {
   USAGE_HIDDEN_MAX,
 } from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보·전 좌석 폴백 집계
 import { starvedNotice, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
-import { planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지
+import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
 import {
   deptPendingText,
@@ -6639,8 +6639,8 @@ async function promptBinaryPatch() {
     return;
   }
   const v = ba.version;
-  // ★(0.14.43 · J2) 설치 전 사실 고지 — Windows 스마트 앱 컨트롤이 켜져 있으면 서명 없는 설치 파일이 막힐 수 있고, 막히면 경고 없이 지금
-  //   버전이 그대로 남는다. **켜짐일 때만** 확인 창 본문 끝에 한 문단을 붙인다 — 설치를 막지는 않는다(계속할지는 사용자가 정한다).
+  // ★(0.14.43 · J2) 설치 전 사실 고지 — Windows 스마트 앱 컨트롤이 켜져 있으면 서명 없는 설치 파일의 실행이 막히고, 막히면 업데이트는 설치되지 않은 채
+  //   이 앱이 닫히지 않고 그 사실을 알린다(WU — 아래 catch · 앱을 닫으면 다시 열 때도 막힐 수 있다). **켜짐일 때만** 확인 창 본문 끝에 한 문단을 붙인다 — 설치를 막지는 않는다(계속할지는 사용자가 정한다).
   //   조회는 정보일 뿐이라 실패·시간 초과는 '문단 없음'으로 접는다(T_SAC 상한 + catch). 문단이 없으면 본문은 종전과 바이트 동일하다.
   let sacNote: string | null = null;
   try {
@@ -6663,7 +6663,11 @@ async function promptBinaryPatch() {
     // 성공 시 백엔드가 app.restart()까지 수행 — 후속 UI 처리 없음(진행은 update-progress 리스너).
   } catch (e) {
     dismissToast("upd-bin");
-    toast("health", "패치 설치 실패", String(e));
+    // ★(0.14.43 · WU) 윈도우: 설치 파일 실행이 막혔으면(`installer_launch_failed:<코드>:<반환값>`) 앱은 닫히지 않은 채 여기로 온다 — J2 알림과 같은 자리·같은
+    //   지속 알림(수명 10분·만료 배너)으로 사람 말 문구를 보인다. 그 꼴이 아니면 종전 토스트 그대로다.
+    const lf = installerLaunchFailure(String(e), updAppVersion, v);
+    if (lf) stickyToast(INSTALLER_LAUNCH_FAILED_TOAST_ID, "health", lf.title, lf.body);
+    else toast("health", "패치 설치 실패", String(e));
   }
 }
 

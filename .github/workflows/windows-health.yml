@@ -190,7 +190,7 @@ jobs:
       - name: Rust 툴체인 (factory-reset Windows 계약 검증용)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: cargo test --lib factory_reset + readiness + inject_guard + first_run_gates (Windows 실기)
+      - name: cargo test --lib factory_reset + readiness + inject_guard + first_run_gates + update_launch (Windows 실기)
         shell: bash
         run: |
           set -euo pipefail
@@ -246,6 +246,14 @@ jobs:
           #   D10 '측정 ≥1 폐쇄' 와 한 스텝으로 묶어 0매치 초록도 차단한다.
           cargo_filter_count --lib first_run_gates::
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib first_run_gates:: -- --test-threads=1
+          # ★(0.14.43 · WU) 다섯째 모듈 `update_launch::` 편입 — 윈도우 인앱 업데이트가 설치 파일을 띄우는 호출(`ShellExecuteW` 반환값 판정)과
+          #   그 인자·임시 경로 계약이다. 순수 검체(인자 이스케이프·분류표·실패 판정·임시 파일 쓰기)는 mac 에서도 돌지만, 이 모듈의 **윈도우 전용 검체는
+          #   하나**다(실제 `ShellExecuteW` 로 `cmd.exe /c exit 0` 실행 성공) — Windows 실기에서만 돌고, mac 초록은 그 축의 증거가 아니다(정본 §8).
+          #   실패 판정(반환 5·오류 4551 등)은 순수 검체가 전 OS 에서 잰다: `ShellExecuteW` 는 대상 파일이 없으면 모달 오류 창을 띄워(`SEE_MASK_FLAG_NO_UI` 없음)
+          #   대화형 세션인 CI 러너에서 멈추므로 실패 경로는 실제 API 로 돌리지 않는다. 필터가 0 매치(모듈 경로 변경)면 `cargo_filter_count` 가 붉힌다.
+          #   이 두 줄에도 `if:` 를 달지 마라.
+          cargo_filter_count --lib update_launch::
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib update_launch:: -- --test-threads=1
 
       # ★D5 env 게이트의 Windows 파이프라인 실기 검증 (v0.14 품질 라인 · 적대검증 2R major 수리).
       #

@@ -3279,6 +3279,28 @@ fn update_verify_from_env(v: Option<&str>) -> bool {
     v != Some("0")
 }
 
+/// ★(0.14.43 · WU) `CYS_UPDATE_CHECKED_LAUNCH` 해석(되돌리기 노브) — `"0"` 만 끈다(그 밖의 값·빈 값·미설정은 켬). 끄면 윈도우 `install_update` 는
+/// 종전 경로(업데이터 플러그인의 `download_and_install` 그대로 — 설치기를 띄운 뒤 반환값을 보지 않고 곧바로 종료)를 쓴다. 읽는 곳은
+/// `install_update` 한 곳이다. 맥·리눅스는 이 노브를 보지 않는다(분기 자체가 컴파일되지 않는다).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn update_checked_launch_from_env(v: Option<&str>) -> bool {
+    v != Some("0")
+}
+
+/// ★(0.14.43 · WU) 설치기 실행 결과의 처리 정책(윈도우 `install_update` 분기가 쓴다 · 부작용 없는 순수 함수 — 시험은 맥에서도 돈다):
+/// 띄웠으면(`Ok`) 아무것도 하지 않고 `Ok` 를 돌려주고(그 뒤의 종료는 호출부 몫이다), 막혔으면(`Err`) `on_failed`(임시 설치 파일 정리·시도 기록 삭제)만
+/// 한 번 하고 `installer_launch_failed:<코드>:<반환값>` 오류 문자열을 돌려준다. **어느 쪽도 여기서 프로세스를 끝내지 않는다.**
+#[cfg_attr(not(windows), allow(dead_code))]
+fn settle_launch(launched: Result<(), cys::update_launch::LaunchError>, on_failed: impl FnOnce()) -> Result<(), String> {
+    match launched {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            on_failed();
+            Err(e.to_string())
+        }
+    }
+}
+
 /// 시도 기록 판정 — 부작용 없는 순수 함수(검체 대상). `now - at` 은 `saturating_sub` 라 시계가 거꾸로 간 기록(at > now)은
 /// 나이 0 으로 본다(→ TooYoung). 판독 실패는 호출부(`read_update_attempt_at`)가 기록을 지우고 `None` 으로 접는다.
 fn decide_update_attempt(attempt: Option<&UpdateAttempt>, current: &str, now: u64) -> AttemptVerdict {
@@ -7087,6 +7109,15 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
             unix_now_secs(),
         );
     }
+    // ★(0.14.43 · WU) 윈도우: 설치기를 띄운 **결과를 본다**. 플러그인의 설치는 `ShellExecuteW` 반환값을 보지 않고 곧바로 프로세스를 끝내므로 앱 제어 정책
+    //   (스마트 앱 컨트롤 등)이 서명 없는 설치 파일을 막으면 앱이 말없이 꺼지고 구버전이 남았다. 아래 분기는 같은 임시 경로·같은 인자·같은 호출로 설치기를
+    //   띄우되, 막혔으면(반환값 32 이하) 앱을 닫지 않고 오류(`installer_launch_failed:<코드>:<반환값>`)를 돌려주고 시도 기록을 지운다(설치기가 뜨지 않았으니
+    //   재시작 뒤 알림이 필요 없다). 성공하면 종전과 같이 곧바로 종료한다 — 그때 시도 기록은 그대로다(설치기가 뜬 뒤의 실패는 재시작 뒤 판정이 맡는다).
+    //   `CYS_UPDATE_CHECKED_LAUNCH=0` 이면 이 분기를 건너뛰고 종전 경로(바로 아래)를 그대로 쓴다. 맥·리눅스는 이 분기가 컴파일되지 않는다.
+    #[cfg(windows)]
+    if update_checked_launch_from_env(cys::env_compat("CYS_UPDATE_CHECKED_LAUNCH").as_deref()) {
+        return install_update_checked_windows(&app, &update, &attempt_path, verify_on).await;
+    }
     if let Err(e) = update
         .download_and_install(
             |chunk, total| {
@@ -7145,6 +7176,86 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     // 등록돼 있어 restart()의 신 프로세스가 구 프로세스의 인스턴스 락과 레이스할 수 있다(신 인스턴스가
     // 죽어가는 구 인스턴스로 포워딩 후 종료 → 앱 미복귀). 이 경로를 되살릴 때 반드시 실기기 검증하라.
     app.restart();
+}
+
+/// ★(0.14.43 · WU) 윈도우 인앱 업데이트 — 설치기를 띄우고 **그 결과를 본다**(`install_update` 의 윈도우 분기 · `CYS_UPDATE_CHECKED_LAUNCH` 기본 켬).
+///
+/// 종전(업데이터 플러그인 2.10.1 의 `download_and_install`)은 `ShellExecuteW` 반환값을 버리고 곧바로 `std::process::exit(0)` 해서, 앱 제어 정책이 설치 파일
+/// 실행을 막으면(오류 4551 · 반환값 5) 앱이 말없이 꺼지고 구버전이 남았다. 이 함수는 **같은 일**을 한다 — 받기·서명 검증(플러그인의 `download`) → 같은
+/// 임시 경로·파일명에 쓰기 → 같은 인자 문자열 → 같은 `ShellExecuteW` 호출 → 성공하면 같은 시점에 종료 — 다만 **실행 실패(반환값 32 이하)를 보면 앱을 닫지
+/// 않고** 임시 설치 파일과 시도 기록을 지운 뒤 `Err("installer_launch_failed:<코드>:<반환값>")` 을 돌려준다. 플러그인과의 대조표(`파일:줄`)는
+/// `_evidence/impl-0.14.43-20261003/WU/WORKLOG.md`.
+///  · 받은 바이트가 exe 가 아니면(zip·MSI 등 예상 밖 형식) 플러그인의 `install` 에 맡긴다(동작 불변).
+///  · 성공한 **뒤에만** `cleanup_before_exit()` 를 부르고 종료한다. 플러그인 기본 훅은 설치기를 띄우기 **앞에** 불렀다 — 이 훅은 트레이 아이콘·리소스 표를 비우고
+///    윈도우에서는 모든 창을 숨기므로, 실패했을 때 앱이 창만 숨은 채 남지 않게 순서만 옮겼다.
+///  · 설치기가 뜨기 전에 실패하는 모든 갈래는 같은 일을 한다: 시도 기록을 지우고(`verify_on` 일 때) 오류를 돌려준다. 설치기가 **뜬 뒤**에는 기록을 그대로 둔다.
+#[cfg_attr(not(windows), allow(dead_code))]
+async fn install_update_checked_windows(
+    app: &AppHandle,
+    update: &tauri_plugin_updater::Update,
+    attempt_path: &std::path::Path,
+    verify_on: bool,
+) -> Result<(), String> {
+    // 플랫폼 갈라짐은 **본문 안**에 둔다(BLOCK-B: 최상위 cfg 로 아이템을 지우지 않는다 — `no_console` 형태). 호출부(`install_update` 의 `#[cfg(windows)]` 분기)는
+    // 윈도우에서만 컴파일되므로 맥·리눅스의 아래 갈래는 닿지 않는다.
+    #[cfg(windows)]
+    {
+        let forget = || {
+            if verify_on {
+                clear_update_attempt_at(attempt_path);
+            }
+        };
+        // 받기 + 서명 검증은 플러그인의 `download` 가 한다 — 실패는 종전과 같은 Err(시도 기록 삭제).
+        let bytes = match update
+            .download(
+                |chunk, total| {
+                    let _ = app.emit(
+                        "update-progress",
+                        json!({"phase": "download", "chunk": chunk, "total": total}),
+                    );
+                },
+                || {},
+            )
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                forget();
+                return Err(e.to_string());
+            }
+        };
+        if !cys::update_launch::looks_like_exe(&bytes) {
+            // 예상 밖 형식(zip·MSI 등) — 종전 경로: 플러그인의 `install` 이 처리한다(성공하면 플러그인이 프로세스를 끝낸다).
+            if let Err(e) = update.install(&bytes) {
+                forget();
+                return Err(e.to_string());
+            }
+            return Ok(());
+        }
+        // exe — 플러그인과 같은 임시 경로·파일명(`%TEMP%\<앱>-<새버전>-updater-<난수>\<앱>-<새버전>-installer.exe`)에 쓴다. 앱 이름은 플러그인이 쓰는 값
+        // 그대로(`package_info().name`)다.
+        let file = match cys::update_launch::write_installer(&std::env::temp_dir(), &app.package_info().name, &update.version, &bytes) {
+            Ok(f) => f,
+            Err(e) => {
+                forget();
+                return Err(e.to_string());
+            }
+        };
+        let current_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let params = cys::update_launch::nsis_update_params(&current_args);
+        settle_launch(cys::update_launch::launch_installer(&file, &params), || {
+            cys::update_launch::remove_installer(&file);
+            forget();
+        })?;
+        // 여기부터는 설치기가 **떴을 때만** 도달한다 — 종전과 같은 시점에 종료한다.
+        app.cleanup_before_exit();
+        std::process::exit(0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, update, attempt_path, verify_on);
+        Err("install_update_checked_windows 는 윈도우 전용이다(맥·리눅스는 종전 경로)".to_string())
+    }
 }
 
 /// 데몬 세대교체(업데이트 없이) — Windows rename-swap 후 lame-duck 스큐(구 데몬 + 새 앱)의
@@ -10283,6 +10394,217 @@ exit 0
         // Err 분기는 종전처럼 오류 문자열을 돌려준다(화면의 '패치 설치 실패' 토스트 경로 불변)
         let tail = &body[clear..];
         assert!(tail.contains("return Err(e.to_string());"), "Err 분기가 오류를 돌려주지 않는다");
+    }
+
+    // ───────── ★(0.14.43 · WU) 윈도우 인앱 업데이트 — 설치기를 띄운 결과를 본다(막히면 앱을 닫지 않고 알린다) ─────────
+
+    /// WU 소스 핀 공용 — 테스트 모듈 앞의 제품 코드(`#[cfg(windows)]` 몸통도 소스로는 보인다 — 맥에서 컴파일되지는 않으므로 실제 컴파일은 win-typecheck·윈도우 CI 가 본다).
+    fn wu_prod() -> &'static str {
+        let src = include_str!("main.rs");
+        &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")]
+    }
+
+    /// 함수 하나(시작 문구부터 그 함수의 끝 `\n}\n` 앞까지).
+    fn wu_seg(start: &str) -> &'static str {
+        let prod = wu_prod();
+        let at = prod.find(start).unwrap_or_else(|| panic!("`{start}` 소실"));
+        &prod[at..at + prod[at..].find("\n}\n").expect("fn 끝")]
+    }
+
+    /// 한 줄 전체가 `//` 주석인 줄을 걷는다 — 주석에만 적힌 낱말로 핀이 통과·적발되지 않게.
+    fn wu_code(s: &str) -> String {
+        s.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn wu_checked_launch_knob_only_zero_turns_it_off() {
+        assert!(update_checked_launch_from_env(Option::None), "미설정 = 켬");
+        assert!(update_checked_launch_from_env(Some("1")), "\"1\" = 켬");
+        assert!(!update_checked_launch_from_env(Some("0")), "\"0\" = 끔(종전 경로)");
+        assert!(update_checked_launch_from_env(Some("")), "빈 값 = 켬");
+        for other in ["false", "off", "00", " 0", "0 ", "no", "2", "true"] {
+            assert!(update_checked_launch_from_env(Some(other)), "{other:?} 는 \"0\" 이 아니므로 켬(정확히 \"0\" 만 끈다)");
+        }
+    }
+
+    /// 실행 결과 정책: 띄웠으면(Ok) 정리도 오류도 없고 · 막혔으면(Err) 정리를 정확히 한 번 하고 UI 가 파싱하는 꼴의 오류를 돌려준다.
+    /// (이 함수는 어느 쪽에서도 프로세스를 끝내지 않는다 — 끝낸다면 이 검체 자체가 죽는다.)
+    #[test]
+    fn wu_settle_launch_cleans_up_only_when_the_launch_failed() {
+        use cys::update_launch::LaunchError;
+        // ★행동 검체보다 **먼저** 소스를 본다 — 누가 `settle_launch` 안에서 프로세스를 끝내게 바꾸면 아래 호출이 이 검체 프로세스째 끝내 버려
+        //   (종료 코드 0 — `cargo test` 가 초록으로 읽는 조용한 조기 종료) 아무 검체도 보고하지 못한다. 그 호출에 닿기 전에 같은 핀을 여기서 먼저 건다.
+        let policy_src = wu_code(wu_seg("fn settle_launch("));
+        assert!(
+            !policy_src.contains("process::exit") && !policy_src.contains("cleanup_before_exit"),
+            "settle_launch 가 프로세스를 끝낸다 — 호출하면 이 검체 프로세스째 죽는다(조용한 조기 종료)"
+        );
+        let cleaned = std::cell::Cell::new(0u32);
+        assert_eq!(settle_launch(Ok(()), || cleaned.set(cleaned.get() + 1)), Ok(()));
+        assert_eq!(cleaned.get(), 0, "설치기가 떴는데 정리했다 — 뜬 설치기가 쓰는 파일을 지운다");
+        // 스마트 앱 컨트롤 실측값: 반환 5 · 오류 4551
+        let blocked = settle_launch(Err(LaunchError { shell_ret: 5, os_code: 4551 }), || cleaned.set(cleaned.get() + 1));
+        assert_eq!(blocked, Err("installer_launch_failed:4551:5".to_string()));
+        assert_eq!(cleaned.get(), 1, "막혔는데 정리를 하지 않았거나 두 번 했다");
+        let missing = settle_launch(Err(LaunchError { shell_ret: 2, os_code: 2 }), || cleaned.set(cleaned.get() + 1));
+        assert_eq!(missing, Err("installer_launch_failed:2:2".to_string()));
+        assert_eq!(cleaned.get(), 2);
+    }
+
+    /// ★WU 배선 핀(install_update): 윈도우 분기는 시도 기록 쓰기 **뒤** · 종전 경로(`download_and_install`) **앞**에 있고, 노브가 켜졌을 때만 들어가 곧바로 돌려준다.
+    /// 종전 경로(노브 `0`)와 맥·리눅스 꼬리(번들 무결성 검사·drain·핸드오프·재시작)는 그대로다 — 설치기 실행·종료 호출은 `install_update` 에 없다(전부 윈도우 분기 함수 안).
+    #[test]
+    fn wu_install_update_has_a_checked_windows_branch_and_keeps_the_old_path() {
+        let body = wu_seg("async fn install_update(");
+        let code = wu_code(body);
+        let branch = "    #[cfg(windows)]\n    if update_checked_launch_from_env(cys::env_compat(\"CYS_UPDATE_CHECKED_LAUNCH\").as_deref()) {\n        return install_update_checked_windows(&app, &update, &attempt_path, verify_on).await;\n    }\n";
+        let b = code.find(branch).expect("윈도우 분기(노브 → install_update_checked_windows 호출 → 곧바로 돌려줌)가 소실됐거나 모양이 바뀌었다");
+        let write = code.find("write_update_attempt_at(").expect("시도 기록 쓰기");
+        let old = code.find(".download_and_install(").expect("종전 경로(download_and_install) 소실 — 노브 0 이 돌아갈 곳이 없다");
+        assert!(write < b && b < old, "순서: 시도 기록 쓰기 < 윈도우 분기 < 종전 경로");
+        // 윈도우 분기는 정확히 한 곳 — 다른 cfg(windows) 갈래가 끼어들지 않았다
+        assert_eq!(code.matches("#[cfg(windows)]").count(), 1);
+        // 설치기 실행·종료·종료 준비는 이 함수에 없다(윈도우 분기 함수 안에만)
+        for banned in ["launch_installer", "process::exit", "cleanup_before_exit", "write_installer", "settle_launch"] {
+            assert!(!code.contains(banned), "install_update 본문에 `{banned}` — 윈도우 분기 함수 밖으로 새면 맥·리눅스 경로가 바뀐다");
+        }
+        // 노브는 한 곳에서만 읽는다(제품 코드 전체에서)
+        assert_eq!(wu_code(wu_prod()).matches("cys::env_compat(\"CYS_UPDATE_CHECKED_LAUNCH\")").count(), 1, "노브를 읽는 곳이 한 곳이 아니다");
+        // 종전 꼬리(맥·리눅스 경로 — 이 티켓은 한 글자도 바꾸지 않는다): 종전 경로 머리부터 순서와 핵심 호출이 그대로다
+        let start = code.find("    if let Err(e) = update\n        .download_and_install(").expect("종전 경로 머리 소실");
+        let tail = &code[start..];
+        let mut pos = 0usize;
+        for token in [
+            ".download_and_install(",
+            "return Err(e.to_string());",
+            "#[cfg(target_os = \"macos\")]\n    if let Some(msg) = bundle_integrity_guidance() {",
+            "return Err(msg);",
+            "sealed_sidecar_cys(&[\"drain\"]).status()",
+            "std::fs::write(pending_restore_path(), \"\")",
+            "stop_running_daemon().await;",
+            "app.restart();",
+        ] {
+            let at = tail[pos..].find(token).unwrap_or_else(|| panic!("종전 꼬리 토큰 소실 또는 순서 변경: {token}")) + pos;
+            pos = at + token.len();
+        }
+        assert!(!tail.contains("update_checked_launch_from_env"), "종전 경로 안에 윈도우 분기 노브가 섞였다");
+    }
+
+    /// ★WU 배선 핀(윈도우 분기 함수): 받기(`download`) → exe 판정 → 같은 임시 경로 쓰기 → 같은 인자 → 띄우기 → (성공한 뒤에만) 종료 준비·종료.
+    /// 종료 준비·종료는 `settle_launch(...)?;` **뒤에 한 번씩**만 있고 실패 쪽(정리 클로저)에는 없다 · 실패하는 모든 갈래는 시도 기록을 지운다.
+    #[test]
+    fn wu_windows_branch_exits_only_after_a_successful_launch() {
+        let prod = wu_prod();
+        let at = prod.find("async fn install_update_checked_windows(").expect("윈도우 분기 함수 소실");
+        // BLOCK-B: 최상위 cfg 로 아이템을 지우지 않는다 — 함수는 모든 플랫폼에 존재하고 갈라짐은 본문 안이다(`blockb_no_new_file_level_cfg_gated_items` 와 같은 규율)
+        assert!(prod[..at].ends_with("#[cfg_attr(not(windows), allow(dead_code))]\n"), "윈도우 분기 함수 앞에는 dead_code 허용 속성만 있어야 한다(최상위 cfg 금지)");
+        let code = wu_code(wu_seg("async fn install_update_checked_windows("));
+        assert!(code.contains("    #[cfg(windows)]\n    {\n"), "본문 안의 윈도우 갈래 소실");
+        let stub = &code[code.find("    #[cfg(not(windows))]\n    {\n").expect("본문 안의 비윈도우 갈래 소실")..];
+        for banned in ["launch_installer", "process::exit", "cleanup_before_exit", "write_installer", "download"] {
+            assert!(!stub.contains(banned), "비윈도우 갈래에 `{banned}` — 맥·리눅스는 설치기를 띄우지 않는다");
+        }
+        assert!(stub.contains("Err("), "비윈도우 갈래는 오류를 돌려준다(닿지 않는 갈래)");
+        let norm = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let idx = |t: &str| code.find(t).unwrap_or_else(|| panic!("`{t}` 소실"));
+        let (dl, exe, wr, params, launch, settle, cleanup, exit) = (
+            idx(".download("),
+            idx("looks_like_exe(&bytes)"),
+            idx("write_installer("),
+            idx("nsis_update_params("),
+            idx("launch_installer(&file, &params)"),
+            idx("settle_launch("),
+            idx("app.cleanup_before_exit();"),
+            idx("std::process::exit(0)"),
+        );
+        assert!(dl < exe && exe < wr && wr < params && params < settle && settle < launch && launch < cleanup && cleanup < exit, "순서가 어긋났다: 받기 < exe 판정 < 쓰기 < 인자 < 띄우기 < 종료 준비 < 종료");
+        // 종료 준비·종료는 한 번씩, 둘 다 `settle_launch(...)?;` 문장 **뒤**에 있다 — 실패하면 `?` 가 먼저 돌려준다
+        assert_eq!(code.matches("cleanup_before_exit").count(), 1);
+        assert_eq!(code.matches("process::exit").count(), 1);
+        let end = settle + code[settle..].find("})?;").expect("settle_launch 문장 끝") + "})?;".len();
+        assert!(cleanup > end && exit > end, "종료 준비·종료가 `settle_launch(...)?;` 앞에 있다 — 실패해도 앱이 닫힌다");
+        let stmt = &code[settle..end];
+        for banned in ["cleanup_before_exit", "exit(", "return Ok"] {
+            assert!(!stmt.contains(banned), "실패 처리 클로저에 `{banned}` — 막혔을 때 종료하면 침묵 종료가 되살아난다");
+        }
+        assert!(stmt.contains("remove_installer(&file);") && stmt.contains("forget();"), "실패 처리는 임시 설치 파일 정리 + 시도 기록 삭제여야 한다");
+        // 플러그인과 같은 입력: 앱 이름 = package_info().name · 임시 루트 = temp_dir() · 인자 = 현재 실행 인자 [1..] · 새 버전 = update.version
+        assert!(code.contains("write_installer(&std::env::temp_dir(), &app.package_info().name, &update.version, &bytes)"), "임시 설치 파일 입력이 플러그인과 다르다");
+        assert!(!code.contains("\"cys\""), "앱 이름을 리터럴로 박았다 — 플러그인이 쓰는 package_info().name 이어야 한다");
+        assert!(code.contains("std::env::args_os().skip(1).collect()"), "현재 실행 인자 [1..] 가 아니다");
+        // 받기·서명 검증은 플러그인의 download — 진행 이벤트 모양은 종전과 같다
+        assert!(!code.contains("download_and_install"), "download_and_install 은 종전 경로(노브 0)에만 있다");
+        assert!(code.contains("json!({\"phase\": \"download\", \"chunk\": chunk, \"total\": total})"), "진행 이벤트 모양이 종전과 다르다");
+        assert!(code.contains("\"update-progress\""));
+        // 예상 밖 형식(zip·MSI)은 플러그인의 install 에 맡긴다(동작 불변)
+        assert!(code[exe..wr].contains("update.install(&bytes)"), "exe 가 아닌 형식(zip·MSI)은 플러그인의 install 에 맡겨야 한다");
+        assert!(code[..exe].ends_with("if !cys::update_launch::"), "exe 판정은 `if !…looks_like_exe(&bytes)` 로 비 exe 갈래를 열어야 한다");
+        // 설치기가 뜨기 전에 실패하는 모든 갈래(받기 · 설치 · 쓰기 · 실행)는 시도 기록을 지운다: forget 정의 1(노브 가드) + 호출 4
+        assert_eq!(code.matches("clear_update_attempt_at(").count(), 1, "시도 기록 삭제는 forget 클로저 한 곳이다");
+        assert!(norm(&code).contains("if verify_on { clear_update_attempt_at(attempt_path); }"), "삭제가 노브(verify_on) 분기 안에 있지 않다");
+        assert_eq!(code.matches("forget();").count(), 4, "실패 갈래(받기·비 exe 설치·쓰기·실행)마다 forget 이 있어야 한다");
+        assert_eq!(code.matches("return Err(e.to_string());").count(), 3, "설치기 실행 전 실패 갈래는 오류를 그대로 돌려준다(실행 실패는 settle_launch 의 `?`)");
+        // 핸드오프(drain·재시작)는 이 분기에 없다 — 윈도우에서는 설치기가 앱을 교체하고 그 뒤는 새 앱이 맡는다(종전과 같다)
+        for banned in ["drain", "restart", "stop_running_daemon", "pending_restore_path"] {
+            assert!(!code.contains(banned), "윈도우 분기에 `{banned}` — 종전 윈도우 경로에는 없던 동작이다");
+        }
+    }
+
+    /// ★WU: 순수 정책 함수(`settle_launch`)도 종료·종료 준비를 모른다 — 종료는 윈도우 분기 함수의 한 곳뿐이다.
+    #[test]
+    fn wu_settle_launch_never_exits() {
+        let code = wu_code(wu_seg("fn settle_launch("));
+        for banned in ["process::exit", "cleanup_before_exit", "restart", "app."] {
+            assert!(!code.contains(banned), "settle_launch 에 `{banned}`");
+        }
+        assert!(code.contains("on_failed();") && code.contains("Err(e.to_string())"));
+    }
+
+    /// ★WU: 새 모듈 `src/update_launch.rs` 는 std 만 쓰는 독립 파일이다(진짜 스마트 앱 컨트롤 러너에서 이 파일 하나를 단독 rustc 로 시험한다):
+    /// 외부 크레이트·`crate::`·windows-sys 0 · `use` 는 전부 `std` · 윈도우 API 는 `extern "system"` 직접 선언.
+    /// 그리고 이 변경이 기대는 사실 둘: 플러그인 2.10.1(대조표의 기준)에 고정돼 있다 · 앱 이름(`package_info().name`)은 productName `cys` 다.
+    #[test]
+    fn wu_update_launch_module_is_standalone_and_pinned_to_the_audited_plugin() {
+        let src = include_str!("../../src/update_launch.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("모듈 테스트 경계 소실")];
+        let code = wu_code(prod);
+        for banned in ["crate::", "super::", "extern crate", "windows_sys", "windows-sys", "serde", "tokio", "libc::", "tauri"] {
+            assert!(!code.contains(banned), "update_launch.rs 가 `{banned}` 에 기댄다 — std 만 쓰는 독립 모듈이어야 한다");
+        }
+        for line in code.lines().filter(|l| l.trim_start().starts_with("use ")) {
+            assert!(line.trim_start().starts_with("use std::"), "std 밖 import: {line}");
+        }
+        assert!(code.contains("extern \"system\"") && code.contains("#[link(name = \"shell32\")]"), "윈도우 API 직접 선언이 없다");
+        assert!(code.contains("#[cfg(windows)]\npub fn launch_installer("), "launch_installer 는 윈도우 전용이다");
+        // launch_installer: 호출 직전에 마지막 오류를 비우고 · ShellExecuteW 를 한 번 부르고 · **직후** 마지막 오류를 읽어 · `shell_result` 로 판정한다.
+        // 반환값을 버리고 Ok 를 돌려주면(상류 2.10.1 의 결함) 막힌 실행이 다시 침묵한다 — 맥에서 컴파일되지 않는 몸통이라 소스로 박는다.
+        let li = &code[code.find("pub fn launch_installer(").expect("launch_installer 소실")..];
+        let li = &li[..li.find("\n}\n").expect("launch_installer 끝")];
+        assert_eq!(li.matches("ShellExecuteW(").count(), 1, "ShellExecuteW 호출은 한 번이다");
+        let (set0, call, get, res) = (
+            li.find("sys::SetLastError(0)").expect("호출 전 마지막 오류 비우기 소실"),
+            li.find("sys::ShellExecuteW(").expect("ShellExecuteW 호출 소실"),
+            li.find("sys::GetLastError()").expect("호출 직후 마지막 오류 읽기 소실"),
+            li.find("shell_result(ret, last_error)").expect("판정(shell_result) 소실 — 반환값을 버리면 막힌 실행이 침묵한다"),
+        );
+        assert!(set0 < call && call < get && get < res, "순서: 오류 비우기 < 호출 < 직후 읽기 < 판정");
+        assert!(li.trim_end().ends_with("shell_result(ret, last_error)"), "launch_installer 의 값은 판정 결과여야 한다");
+        assert!(!li.contains("Ok(())"), "launch_installer 가 판정을 건너뛰고 Ok 를 돌려준다");
+        for banned in ["exit", "TerminateProcess", "ExitProcess"] {
+            assert!(!li.contains(banned), "launch_installer 에 `{banned}` — 이 함수는 프로세스를 끝내지 않는다(끝내는 것은 호출부)");
+        }
+        assert!(!code.contains("process::exit"), "update_launch.rs 에 프로세스 종료가 있다 — 종료는 호출부(윈도우 분기 함수) 한 곳뿐이다");
+        // 설치 파일 쓰기는 플러그인과 같은 열기 방식(새로 만들기 + 임시 속성)이다
+        assert!(code.contains("FILE_ATTRIBUTE_TEMPORARY: u32 = 0x0000_0100"), "임시 속성 상수 소실");
+        assert!(code.contains("o.custom_flags(FILE_ATTRIBUTE_TEMPORARY);"), "설치 파일을 임시 속성으로 만들지 않는다(플러그인의 tempfile 과 다르다)");
+        // 플러그인 버전 고정 — 올리면 이 검체가 붉어져 대조표(와 이 분기의 존속 여부)를 다시 보게 한다
+        let lock = include_str!("../../Cargo.lock");
+        assert!(
+            lock.contains("name = \"tauri-plugin-updater\"\nversion = \"2.10.1\"\n"),
+            "tauri-plugin-updater 가 2.10.1 이 아니다 — WU 의 플러그인 대조표(임시 경로·인자·호출)를 새 버전 소스로 다시 맞춰 보라(티켓 WU 의 조사로는 2.11.0 부터 상류가 반환값을 직접 본다)"
+        );
+        let conf = include_str!("../tauri.conf.json");
+        assert!(conf.contains("\"productName\": \"cys\""), "productName 이 cys 가 아니다 — 임시 설치 폴더·파일 이름이 달라진다(플러그인도 같은 이름을 쓴다)");
     }
 
     /// ★J2 배선 핀: 두 명령이 invoke_handler 에 등재돼 있다(누락 = 런타임 'command not found' — UI 의 pull 은 조용히 실패한다).

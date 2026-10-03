@@ -20,7 +20,10 @@ import {
   UPDATE_ATTEMPT_RETRY_SLACK_SECS,
   UPDATE_ATTEMPT_WAIT_DEFAULT_SECS,
   UPDATE_ATTEMPT_WAIT_MAX_SECS,
+  installerLaunchFailure,
+  INSTALLER_LAUNCH_FAILED_TOAST_ID,
 } from "./updatenotice";
+import { toastTtl, needsExpiryBanner, GUIDE_TTL_MS } from "./toastttl";
 
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf-8");
 
@@ -42,11 +45,15 @@ const fnBodyOf = (name: string): string => {
 };
 const count = (hay: string, needle: string): number => hay.split(needle).length - 1;
 
-/** 티켓이 정한 문안 전문 — 모듈의 문구가 바뀌면 이 핀이 빨개진다(손으로 옮긴 사본이 아니라 티켓 원문이다). */
+/**
+ * 설치 전 고지 문안 전문 — 모듈의 문구가 바뀌면 이 핀이 빨개진다(손으로 옮긴 사본이 아니라 지시 원문이다).
+ * ★WU 보충 지시(2026-10-04 · 2차 실측)로 바뀐 문구다: 종전 문구("막히면 경고 없이 지금 버전이 그대로 남고, 앱을 다시 열면 '설치되지 않았습니다' 알림이 뜹니다")는
+ * 설치 파일 실행 결과를 보게 된 뒤에는 틀린 말이 된다 — 이제 막히면 앱이 닫히지 않은 채 바로 알리고, 앱을 닫으면 다시 열 때도 막힐 수 있다(cys-app.exe 도 차단).
+ */
 const SAC_PREFLIGHT =
-  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 지금 cys 설치 파일에는 코드 서명이 없어 Windows 가 설치를 막을 수 있습니다. " +
-  "막히면 경고 없이 지금 버전이 그대로 남고, 앱을 다시 열면 '설치되지 않았습니다' 알림이 뜹니다. " +
-  "스마트 앱 컨트롤이 켜진 PC 에서는 홈페이지에서 받은 설치 파일도 같은 이유로 막힙니다.";
+  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 지금 cys 설치 파일에는 코드 서명이 없어 Windows 가 실행을 막습니다. " +
+  "막히면 업데이트는 설치되지 않고, 이 앱은 닫히지 않은 채 그 사실을 알려 드립니다. " +
+  "스마트 앱 컨트롤이 켜진 PC 에서는 홈페이지에서 받은 설치 파일도 같은 이유로 막히며, 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.";
 const WIN_PARAGRAPH =
   "Windows 가 서명 없는 설치 파일을 막았을 수 있습니다(스마트 앱 컨트롤 · Defender). " +
   "확인: 이벤트 뷰어 → 응용 프로그램 및 서비스 로그 → Microsoft → Windows → CodeIntegrity → Operational 의 이벤트 3033·3077. " +
@@ -85,6 +92,21 @@ describe("sacPreflightText — 켜짐(on)일 때만 문단", () => {
     const t = sacPreflightText("on") ?? "";
     expect(hasDisableWord(t)).toEqual([]);
     for (const w of ["금지", "불가", "중단", "하지 마"]) expect({ 낱말: w, 있음: t.includes(w) }).toEqual({ 낱말: w, 있음: false });
+  });
+
+  it("★WU 보충(2차 실측): 막히면 업데이트는 설치되지 않고 이 앱은 닫히지 않은 채 알려 준다 · 앱을 닫으면 다시 열 때도 막힐 수 있다 — 낡은 주장(경고 없이 그대로 남는다 · 다시 열면 알림이 뜬다)은 없다", () => {
+    const t = sacPreflightText("on") ?? "";
+    for (const w of [
+      "코드 서명이 없어 Windows 가 실행을 막습니다",
+      "업데이트는 설치되지 않고",
+      "이 앱은 닫히지 않은 채 그 사실을 알려 드립니다",
+      "홈페이지에서 받은 설치 파일도 같은 이유로 막히며",
+      "이 앱을 닫으면 다시 열 때도 막힐 수 있습니다",
+    ])
+      expect({ 낱말: w, 있음: t.includes(w) }).toEqual({ 낱말: w, 있음: true });
+    // 이 변경 전 문구가 한 말 — 설치 파일 실행 결과를 보게 된 뒤의 실제 동작(막히면 앱이 닫히지 않은 채 바로 알린다)과 어긋난다
+    for (const w of ["경고 없이", "그대로 남고", "알림이 뜹니다", "설치를 막을 수 있습니다", "다시 열면"])
+      expect({ 낡은낱말: w, 있음: t.includes(w) }).toEqual({ 낡은낱말: w, 있음: false });
   });
 });
 
@@ -612,6 +634,8 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     sacHangs?: boolean;
     ok?: boolean;
     installRejects?: boolean;
+    /** 설치 호출이 이 값으로 거부된다(WU — 백엔드가 돌려주는 오류 문자열을 흉내). */
+    installError?: unknown;
     blocked?: boolean;
     noBin?: boolean;
   };
@@ -622,6 +646,7 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     const toasts: unknown[][] = [];
     const dismissed: string[] = [];
     const caps: number[] = [];
+    const stickies: unknown[][] = [];
     const deps = {
       daemonActionBlocked: (): boolean => !!o.blocked,
       binActionable: (): { version: string } | null => (o.noBin ? null : { version: "0.14.43" }),
@@ -638,7 +663,10 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
           if (o.sacHangs) return new Promise<unknown>(() => {}); // 영영 안 끝나는 조회
           return o.sacRejects ? Promise.reject(new Error("boom")) : Promise.resolve(o.sac ?? null);
         }
-        if (cmd === "install_update") return o.installRejects ? Promise.reject("install boom") : Promise.resolve(undefined);
+        if (cmd === "install_update") {
+          if (o.installError !== undefined) return Promise.reject(o.installError);
+          return o.installRejects ? Promise.reject("install boom") : Promise.resolve(undefined);
+        }
         return Promise.resolve(null);
       },
       // rpcT 대역: 상한 값을 기록하고, 영영 안 끝나는 조회는 상한이 지난 것으로 보고 즉시 거부한다(진짜 rpcT 와 같은 계약).
@@ -658,6 +686,13 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
       toast: (...a: unknown[]): void => {
         toasts.push(a);
       },
+      // ★WU: 설치 실패 catch 가 쓰는 자유 변수들(실제 모듈의 함수·상수 그대로 + 지속 토스트 기록 + 현재 버전)
+      stickyToast: (...a: unknown[]): void => {
+        stickies.push(a);
+      },
+      updAppVersion: "0.14.42",
+      installerLaunchFailure,
+      INSTALLER_LAUNCH_FAILED_TOAST_ID,
     };
     let js = fnBodyOf("promptBinaryPatch") + "\n}";
     const strip: [string, string] = ["let sacNote: string | null = null;", "let sacNote = null;"];
@@ -665,7 +700,7 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     js = js.replace(strip[0], strip[1]);
     const fn = new Function("deps", `with (deps) {\n${js}\nreturn promptBinaryPatch;\n}`)(deps) as () => Promise<void>;
     await fn();
-    return { calls, modal, invokes, toasts, dismissed, caps };
+    return { calls, modal, invokes, toasts, dismissed, caps, stickies };
   }
 
   it("★켜짐(on): 확인 창 본문 맨 끝에 한 줄 띄우고 문단이 붙는다 — 제목·확인 라벨은 그대로 · 조회 상한은 T_SAC", async () => {
@@ -719,5 +754,301 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     const r = await runPrompt({ sac: "off", installRejects: true });
     expect(r.dismissed).toEqual(["upd-bin"]);
     expect(r.toasts).toEqual([["health", "패치 설치 실패", "install boom"]]);
+    expect(r.stickies).toEqual([]); // 종전 오류에는 지속 알림이 없다(WU 는 그 꼴일 때만)
+  });
+
+  // ── ★WU: 설치 파일 실행이 막혔을 때(백엔드 오류 `installer_launch_failed:<코드>:<반환값>`) ──
+
+  it("★4551 차단: 진행 토스트를 내리고 · 종전 토스트 대신 J2 와 같은 자리의 지속 알림(사람 말 문구 · 현재·새 버전 치환)을 낸다", async () => {
+    const r = await runPrompt({ sac: "on", installError: "installer_launch_failed:4551:5" });
+    expect(r.dismissed).toEqual(["upd-bin"]);
+    expect(r.toasts).toEqual([]); // 날것 '패치 설치 실패' 토스트는 없다
+    expect(r.stickies.length).toBe(1);
+    const [id, category, title, body] = r.stickies[0] as [string, string, string, string];
+    expect(id).toBe(UPDATE_FAILED_TOAST_ID); // 같은 id 값 — toastttl 의 10분·만료 배너 규칙이 그대로 걸린다
+    expect(category).toBe("health");
+    expect(title).toBe("설치 파일 실행이 차단되었습니다");
+    expect(body).toBe(installerLaunchFailure("installer_launch_failed:4551:5", "0.14.42", "0.14.43")?.body ?? "(문구 없음)");
+    expect(body.includes("새 버전(0.14.43)")).toBe(true); // 새 버전 = 확인 창이 보인 버전(ba.version)
+    expect(body.includes("지금 버전(0.14.42)")).toBe(true); // 현재 버전 = updAppVersion
+    expect(body.includes("닫히지 않았습니다")).toBe(true);
+    // 설치 요청은 한 번만 갔고(재시도 없음) 앱 종료를 흉내 내는 호출도 없다
+    expect(r.invokes.map((i) => i[0])).toEqual(["smart_app_control", "install_update"]);
+  });
+
+  it("★다른 코드도 사람 말 지속 알림(5 · 2 · 225 · 1223 · 그 밖) — 종전 토스트는 없다", async () => {
+    for (const code of [5, 2, 3, 225, 1223, 1155]) {
+      const r = await runPrompt({ sac: "off", installError: `installer_launch_failed:${code}:32` });
+      expect({ code, 토스트: r.toasts.length, 지속: r.stickies.length, 내림: r.dismissed }).toEqual({ code, 토스트: 0, 지속: 1, 내림: ["upd-bin"] });
+      const t = r.stickies[0][2] as string;
+      expect(t.length > 0).toBe(true);
+    }
+  });
+
+  it("★그 꼴이 아닌 오류(live_sessions·네트워크·서명 실패·Error 객체·빈 값)는 종전 토스트 그대로 — 지속 알림 없음", async () => {
+    for (const e of ["live_sessions:2", "Network error: timeout", "signature verification failed", "no update available", "installer_launch_failed:4551", new Error("installer_launch_failed:4551:5"), ""]) {
+      const r = await runPrompt({ sac: "off", installError: e });
+      const raw = String(e);
+      expect({ e: raw, 지속: r.stickies.length, 토스트: r.toasts }).toEqual({ e: raw, 지속: 0, 토스트: [["health", "패치 설치 실패", raw]] });
+      expect(r.dismissed).toEqual(["upd-bin"]);
+    }
+  });
+
+  it("★설치가 성공하면(거부 없음) 아무 알림도 내지 않는다 — 진행 토스트도 내리지 않는다(백엔드가 앱을 끝낸다)", async () => {
+    const r = await runPrompt({ sac: "off" });
+    expect({ 토스트: r.toasts.length, 지속: r.stickies.length, 내림: r.dismissed }).toEqual({ 토스트: 0, 지속: 0, 내림: [] });
+  });
+});
+
+// ── 0.14.43 WU — 설치 파일 실행이 막혔을 때 사람 말로 알린다(순수 문구 · 토스트 규칙 · main.ts 배선) ─────────────────────────────
+
+/** 백엔드 오류 문자열(Rust `LaunchError` 의 Display). */
+const LF = (code: number | string, ret: number | string = 5): string => `installer_launch_failed:${code}:${ret}`;
+/** 모든 실패 문구가 나눠 갖는 문장(티켓: 업데이트는 설치되지 않았고 지금 버전이 그대로 실행 중). */
+const KEPT = (cur: string): string => `업데이트는 설치되지 않았고 지금 버전(${cur})이 그대로 실행 중입니다. 앱은 닫히지 않았습니다.`;
+/**
+ * 4551 문구 — 티켓 문안 + WU 보충 지시의 한 문장(앱을 닫으면 다시 열 때도 막힐 수 있다 — 넷째 줄). 마지막 줄의 '끄면'은 기존 J2 낱말 핀(문자열 리터럴에
+ * 끄다 계열 낱말 0)과 충돌해 같은 뜻의 다른 낱말로 적었다(WORKLOG 기록).
+ */
+const L4551 = (cur: string, tgt: string): string[] => [
+  `Windows 의 앱 제어 정책(스마트 앱 컨트롤 등)이 새 버전(${tgt}) 설치 파일의 실행을 막았습니다(오류 4551).`,
+  KEPT(cur),
+  "이 설치 파일에는 코드 서명이 없습니다. 스마트 앱 컨트롤이 켜진 PC 에서는 서명 없는 프로그램이 실행되지 않습니다.",
+  "스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요.",
+  "확인하는 곳: Windows 보안 → 앱 및 브라우저 컨트롤 → 스마트 앱 컨트롤. " +
+    "스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택입니다(최근 Windows 는 다시 켤 수 있습니다).",
+];
+
+describe("installerLaunchFailure — 4551(앱 제어 정책 차단)", () => {
+  it("제목 · 본문 5줄(티켓 문안 + 보충 한 문장) — <current>·<target> 치환 · 줄바꿈은 줄 사이에만", () => {
+    const r = installerLaunchFailure(LF(4551, 5), "0.14.42", "0.14.43");
+    expect(r).not.toBeNull();
+    expect(r?.title).toBe("설치 파일 실행이 차단되었습니다");
+    expect(r?.body).toBe(L4551("0.14.42", "0.14.43").join("\n"));
+    expect((r?.body ?? "").split("\n").length).toBe(5);
+  });
+
+  it("★필수 낱말: 닫히지 않았습니다 · 4551 · 스마트 앱 컨트롤 · 코드 서명 · 설치되지 않았고 · 닫지 마세요 · 다시 열 때도 막힐 수 있 · 보호 수준 · 확인하는 곳", () => {
+    const b = installerLaunchFailure(LF(4551), "0.14.42", "0.14.43")?.body ?? "";
+    for (const w of ["닫히지 않았습니다", "4551", "스마트 앱 컨트롤", "코드 서명", "설치되지 않았고", "그대로 실행 중", "닫지 마세요", "다시 열 때도 막힐 수 있", "보호 수준", "확인하는 곳"])
+      expect({ 낱말: w, 있음: b.includes(w) }).toEqual({ 낱말: w, 있음: true });
+  });
+
+  it("셸 반환값이 달라도(5 가 아니어도) 4551 이면 같은 문구 — 문구는 오류 코드로 정해진다", () => {
+    const a = installerLaunchFailure(LF(4551, 5), "1.0.0", "1.0.1");
+    for (const ret of [0, 2, 31, 32, -1]) expect(installerLaunchFailure(LF(4551, ret), "1.0.0", "1.0.1")).toEqual(a);
+  });
+
+  it("지시가 아니라 사실이다 — 스마트 앱 컨트롤을 어떻게 하라는 명령형이 없다(끄·바꾸·해제·설정·누르 계열) · 당부는 '앱을 닫지 마세요' 하나뿐", () => {
+    const b = installerLaunchFailure(LF(4551), "0.14.42", "0.14.43")?.body ?? "";
+    for (const w of ["끄세요", "바꾸세요", "해제하세요", "설정하세요", "누르세요", "하세요", "해 주세요"])
+      expect({ 낱말: w, 있음: b.includes(w) }).toEqual({ 낱말: w, 있음: false });
+    expect(b.includes("작업을 마치기 전에는 앱을 닫지 마세요.")).toBe(true);
+    expect(count(b, "마세요")).toBe(1);
+  });
+
+  it("★보충 문장은 앱을 닫는 것에 대한 사실+당부이고 위치는 '코드 서명' 설명 줄 바로 뒤 · '확인하는 곳' 앞이다", () => {
+    const lines = (installerLaunchFailure(LF(4551), "0.14.42", "0.14.43")?.body ?? "").split("\n");
+    expect(lines[2].startsWith("이 설치 파일에는 코드 서명이 없습니다.")).toBe(true);
+    expect(lines[3]).toBe("스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요.");
+    expect(lines[4].startsWith("확인하는 곳:")).toBe(true);
+  });
+});
+
+describe("installerLaunchFailure — 코드별 문구", () => {
+  const all: [number, string][] = [
+    [4551, "설치 파일 실행이 차단되었습니다"],
+    [5, "설치 파일 실행이 거부되었습니다(오류 5)"],
+    [2, "설치 파일을 찾을 수 없습니다"],
+    [3, "설치 파일을 찾을 수 없습니다"],
+    [225, "보안 프로그램이 설치 파일을 위험으로 판정했습니다"],
+    [1223, "설치 파일 실행이 취소되었습니다"],
+    [1155, "설치 파일을 실행하지 못했습니다(오류 1155)"],
+    [193, "설치 파일을 실행하지 못했습니다(오류 193)"],
+    [0, "설치 파일을 실행하지 못했습니다(오류 0)"],
+    [4552, "설치 파일을 실행하지 못했습니다(오류 4552)"],
+  ];
+
+  it("제목 표(코드 → 제목)", () => {
+    for (const [code, title] of all) expect({ code, 제목: installerLaunchFailure(LF(code), "0.14.42", "0.14.43")?.title }).toEqual({ code, 제목: title });
+  });
+
+  it("5: 거부 · 보안 프로그램·권한 가능성 한 줄", () => {
+    const lines = (installerLaunchFailure(LF(5), "0.14.42", "0.14.43")?.body ?? "").split("\n");
+    expect(lines[0]).toBe("Windows 가 새 버전(0.14.43) 설치 파일의 실행을 거부했습니다(오류 5).");
+    expect(lines[2]).toBe("보안 프로그램이나 폴더 접근 권한이 임시 폴더의 설치 파일 실행을 막았을 수 있습니다.");
+    expect(lines.length).toBe(3);
+  });
+
+  it("2·3: 설치 파일을 찾을 수 없다 · 보안 프로그램이 격리했을 수 있다 · 코드 그대로 표시", () => {
+    for (const code of [2, 3]) {
+      const lines = (installerLaunchFailure(LF(code), "0.14.42", "0.14.43")?.body ?? "").split("\n");
+      expect(lines[0]).toBe(`방금 받은 새 버전(0.14.43) 설치 파일을 임시 폴더에서 찾지 못했습니다(오류 ${code}).`);
+      expect(lines[2]).toBe("보안 프로그램이 설치 파일을 격리했거나 지웠을 수 있습니다.");
+    }
+  });
+
+  it("225: 보안 프로그램이 위험으로 판정 · 1223: 취소", () => {
+    const v = (installerLaunchFailure(LF(225), "0.14.42", "0.14.43")?.body ?? "").split("\n");
+    expect(v[0]).toBe("보안 프로그램이 새 버전(0.14.43) 설치 파일을 위험한 파일로 판정해 실행을 막았습니다(오류 225).");
+    const c = (installerLaunchFailure(LF(1223), "0.14.42", "0.14.43")?.body ?? "").split("\n");
+    expect(c[0]).toBe("새 버전(0.14.43) 설치 파일 실행이 취소되었습니다(오류 1223).");
+  });
+
+  it("그 밖: 오류 코드와 셸 반환값을 그대로 보인다", () => {
+    const lines = (installerLaunchFailure(LF(1155, 31), "0.14.42", "0.14.43")?.body ?? "").split("\n");
+    expect(lines).toEqual(["Windows 가 새 버전(0.14.43) 설치 파일을 실행하지 못했습니다(오류 1155 · 셸 반환값 31).", KEPT("0.14.42")]);
+    // 음수 반환값(있을 수 없는 값)도 꼴만 맞으면 그대로 보인다
+    expect(installerLaunchFailure(LF(7, -1), "a", "b")?.body.includes("셸 반환값 -1")).toBe(true);
+  });
+
+  it("★모든 코드의 본문이 같은 문장을 공유한다 — 업데이트는 설치되지 않았고 지금 버전(<current>)이 그대로 실행 중 · 앱은 닫히지 않았다 · 새 버전 치환", () => {
+    for (const [code] of all) {
+      const r = installerLaunchFailure(LF(code), "0.14.42", "0.14.43");
+      const lines = (r?.body ?? "").split("\n");
+      expect({ code, 둘째줄: lines[1] }).toEqual({ code, 둘째줄: KEPT("0.14.42") });
+      expect({ code, 새버전: (r?.body ?? "").includes("0.14.43") }).toEqual({ code, 새버전: true });
+      // 자리표시자가 남지 않는다
+      expect({ code, 남은: /<current>|<target>|\$\{|undefined|null/.test((r?.title ?? "") + (r?.body ?? "")) }).toEqual({ code, 남은: false });
+    }
+  });
+
+  it("제목은 한 줄이고 본문은 줄바꿈 외 제어문자가 없다", () => {
+    const BAD = /[\u{0}-\u{9}\u{b}-\u{1f}\u{7f}-\u{9f}\u{200b}-\u{200f}\u{2028}\u{2029}\u{202a}-\u{202e}\u{2066}-\u{2069}\u{feff}]/u;
+    for (const [code] of all) {
+      const r = installerLaunchFailure(LF(code), "0.14.42", "0.14.43");
+      expect(/\n/.test(r?.title ?? "")).toBe(false);
+      expect(BAD.test(r?.title ?? "")).toBe(false);
+      expect(BAD.test(r?.body ?? "")).toBe(false);
+    }
+  });
+
+  it("돌려주는 객체의 키는 정확히 title·body", () => {
+    expect(Object.keys(installerLaunchFailure(LF(4551), "a", "b") ?? {}).sort()).toEqual(["body", "title"]);
+  });
+});
+
+describe("installerLaunchFailure — 형식이 다르면 null(= 종전 토스트 그대로)", () => {
+  it("꼴이 아닌 문자열 전부 null", () => {
+    const bad = [
+      "", "install boom", "live_sessions:2", "installer_launch_failed", "installer_launch_failed:", "installer_launch_failed:4551", "installer_launch_failed:4551:",
+      "installer_launch_failed::5", "installer_launch_failed:abc:5", "installer_launch_failed:4551:abc", "installer_launch_failed:4551:5:6", "installer_launch_failed:-1:5",
+      "installer_launch_failed:4551:5 ", " installer_launch_failed:4551:5", "installer_launch_failed:4551:5\n", "xinstaller_launch_failed:4551:5",
+      "Error: installer_launch_failed:4551:5", "INSTALLER_LAUNCH_FAILED:4551:5", "installer_launch_failed:4551.5:5", "installer_launch_failed:4551:5.5",
+      "installer_launch_failed:99999999999:5", "installer_launch_failed:4551:99999999999", "installer_launch_failed:0x11c7:5", "installer_launch_failed:+4551:5",
+      "installer_launch_failed:4551:--5", "installer launch failed:4551:5", "installer_launch_failed:4551;5",
+    ];
+    for (const e of bad) expect({ 입력: e, 결과: installerLaunchFailure(e, "0.14.42", "0.14.43") }).toEqual({ 입력: e, 결과: null });
+  });
+
+  it("문자열이 아닌 입력은 던지지 않고 null", () => {
+    for (const e of [null, undefined, 4551, true, {}, [], ["installer_launch_failed:4551:5"], new Error("installer_launch_failed:4551:5")])
+      expect({ 입력: String(e), 결과: installerLaunchFailure(e as unknown as string, "0.14.42", "0.14.43") }).toEqual({ 입력: String(e), 결과: null });
+  });
+
+  it("경계: 최대 10자리 숫자는 읽는다(오류 코드 4294967295 까지)", () => {
+    expect(installerLaunchFailure(LF(4294967295, -2147483648), "a", "b")?.title).toBe("설치 파일을 실행하지 못했습니다(오류 4294967295)");
+    expect(installerLaunchFailure(LF("0000004551", "0005"), "a", "b")?.title).toBe("설치 파일 실행이 차단되었습니다");
+  });
+});
+
+describe("installerLaunchFailure — 화면에 올리는 값 방어(버전 문자열 · 결정론 난수)", () => {
+  const BAD_CTRL = /[\u{0}-\u{9}\u{b}-\u{1f}\u{7f}-\u{9f}\u{200b}-\u{200f}\u{2028}\u{2029}\u{202a}-\u{202e}\u{2066}-\u{2069}\u{feff}]/u;
+
+  it("버전에 제어문자·줄바꿈이 있으면 걷어 한 줄로 접고, 비거나 문자열이 아니면 \"?\"", () => {
+    const r = installerLaunchFailure(LF(4551), "0.14.42\u0000\n\u202e", "0.14.43\r\nINJECT\tx");
+    const body = r?.body ?? "";
+    expect(body.split("\n").length).toBe(5); // 버전이 줄을 늘리지 못한다
+    expect(BAD_CTRL.test(body)).toBe(false);
+    expect(body.includes("새 버전(0.14.43 INJECT x)")).toBe(true);
+    for (const v of ["", "   ", null, undefined, 5, {}]) {
+      const rr = installerLaunchFailure(LF(4551), v as unknown as string, v as unknown as string);
+      expect(rr?.body.includes("새 버전(?)")).toBe(true);
+      expect(rr?.body.includes("지금 버전(?)")).toBe(true);
+    }
+  });
+
+  it("버전이 길면 40자(코드 포인트)로 자르고 …로 끝낸다", () => {
+    const r = installerLaunchFailure(LF(4551), "1".repeat(100), "😀".repeat(100));
+    const b = r?.body ?? "";
+    expect(b.includes("지금 버전(" + "1".repeat(39) + "…)")).toBe(true);
+    expect(b.includes("새 버전(" + "😀".repeat(39) + "…)")).toBe(true);
+  });
+
+  it("HTML 낱말이 와도 그대로 글자다 — 여기서 만드는 것은 문자열뿐이고 렌더는 textContent 경로다", () => {
+    const r = installerLaunchFailure(LF(5), "<b>x</b>", "<img src=x onerror=alert(1)>");
+    expect(r?.body.includes("<img src=x onerror=alert(1)>")).toBe(true); // 이스케이프하지 않는다(렌더가 textContent 라 글자로만 보인다)
+    expect(BAD_CTRL.test(r?.body ?? "")).toBe(false);
+  });
+
+  it("결정론 난수 500판 — 던지지 않고 null 이거나 {title(한 줄), body(개행 외 제어문자 0)}", () => {
+    let seed = 20261004;
+    const rnd = (n: number): number => {
+      seed = (seed * 1664525 + 1013904223) % 4294967296;
+      return seed % n;
+    };
+    const pool: unknown[] = [null, undefined, 0, -1, 4551, "", "x", "0.14.42", "a\nb", "\u0000\u001f", "‮", "😀".repeat(30), [], {}, "installer_launch_failed:4551:5", "installer_launch_failed:5:5", LF(2, 2), LF(1223, 0), LF(225, 32)];
+    const pick = (): unknown => pool[rnd(pool.length)];
+    for (let i = 0; i < 500; i++) {
+      const r = installerLaunchFailure(pick() as string, pick() as string, pick() as string);
+      if (r === null) continue;
+      expect(/\n/.test(r.title)).toBe(false);
+      expect(BAD_CTRL.test(r.title)).toBe(false);
+      expect(BAD_CTRL.test(r.body)).toBe(false);
+    }
+  });
+});
+
+describe("★WU 알림 자리 — J2 알림과 같은 id 값 · 10분 수명 · 만료 시 OS 배너(toastttl.ts 규칙을 그대로 받는다)", () => {
+  it("INSTALLER_LAUNCH_FAILED_TOAST_ID === UPDATE_FAILED_TOAST_ID === \"update-not-installed\"", () => {
+    expect(INSTALLER_LAUNCH_FAILED_TOAST_ID).toBe(UPDATE_FAILED_TOAST_ID);
+    expect(INSTALLER_LAUNCH_FAILED_TOAST_ID).toBe("update-not-installed");
+  });
+  it("그 id 의 지속 알림은 안내용 수명(GUIDE_TTL_MS = 10분)을 받고 만료되면 OS 배너로 한 번 더 알린다", () => {
+    expect(toastTtl("sticky", INSTALLER_LAUNCH_FAILED_TOAST_ID).ttlMs).toBe(GUIDE_TTL_MS);
+    expect(GUIDE_TTL_MS).toBe(600_000);
+    expect(needsExpiryBanner(INSTALLER_LAUNCH_FAILED_TOAST_ID)).toBe(true);
+  });
+});
+
+describe("main.ts 배선(WU) — promptBinaryPatch 의 catch 한 곳", () => {
+  const code = mainCode;
+  const body = fnBodyOf("promptBinaryPatch");
+  const catchAt = body.lastIndexOf("} catch (e) {");
+
+  it("순수 모듈의 함수·상수를 import 한다(J2 가 쓰던 이름도 그대로)", () => {
+    for (const name of ["installerLaunchFailure", "INSTALLER_LAUNCH_FAILED_TOAST_ID", "planUpdateAttemptReport", "sacPreflightText", "UPDATE_FAILED_TOAST_ID"])
+      expect({ 이름: name, 있음: new RegExp(`import\\s*\\{[^}]*\\b${name}\\b[^}]*\\}\\s*from\\s*["']\\./updatenotice["']`).test(code) }).toEqual({ 이름: name, 있음: true });
+  });
+
+  it("★catch: 진행 토스트를 내린 뒤 → 사람 말 문구가 있으면 지속 알림(같은 자리) · 없으면 종전 토스트 — 이 순서·이 인자", () => {
+    expect(catchAt).toBeGreaterThan(body.indexOf('await invoke("install_update", { force: true });'));
+    const c = body.slice(catchAt);
+    const dismiss = c.indexOf('dismissToast("upd-bin");');
+    const call = c.indexOf("installerLaunchFailure(String(e), updAppVersion, v)");
+    const sticky = c.indexOf('stickyToast(INSTALLER_LAUNCH_FAILED_TOAST_ID, "health", lf.title, lf.body)');
+    const legacy = c.indexOf('toast("health", "패치 설치 실패", String(e))');
+    expect(dismiss).toBeGreaterThanOrEqual(0);
+    expect(call).toBeGreaterThan(dismiss);
+    expect(sticky).toBeGreaterThan(call);
+    expect(legacy).toBeGreaterThan(sticky);
+    expect(c.includes("if (lf) stickyToast(")).toBe(true);
+    expect(/else\s+toast\(/.test(c)).toBe(true);
+    // 현재 버전은 확인 창이 쓰는 캐시(updAppVersion), 새 버전은 확인 창이 보인 값(v)
+    expect(body.includes("const v = ba.version;")).toBe(true);
+    expect(c.includes("innerHTML")).toBe(false);
+  });
+
+  it("★이 알림 id 를 쓰는 곳은 import 1 + 사용 1 — 다른 곳에서 같은 id 로 띄우지 않는다 · 호출·알림은 한 곳", () => {
+    expect(count(code, "INSTALLER_LAUNCH_FAILED_TOAST_ID")).toBe(2);
+    expect(count(code, "installerLaunchFailure(")).toBe(1);
+    expect(count(code, "stickyToast(INSTALLER_LAUNCH_FAILED_TOAST_ID")).toBe(1);
+    // J2 의 id 상수 사용은 종전 그대로(import 1 + pull 1)
+    expect(count(code, "UPDATE_FAILED_TOAST_ID")).toBe(2);
+  });
+
+  it("자동 테스트 경로(install_update 호출 둘째 곳)는 건드리지 않았다 — 종전 catch 그대로", () => {
+    expect(count(code, 'invoke("install_update"')).toBe(2);
+    expect(code.includes('toast("health", "자동 테스트 패치 실패", String(e));')).toBe(true);
   });
 });
