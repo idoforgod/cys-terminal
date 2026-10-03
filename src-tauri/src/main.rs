@@ -4344,6 +4344,15 @@ async fn fanout_usage_accounts(
 /// ★source_error(관측 경로 고장 코드): 승자가 **관측 전**(updated_at 없음)이고 자기 오류가 없으면 다른 데몬의
 /// 오류를 이어받는다 — 본부(좌석 없음 · 오류 없음)가 먼저 오면 부서 agy 의 거부 코드가 묻혔다. 관측된 승자에는
 /// 남의 오류를 덧씌우지 않는다.
+/// ★0.14.43 가산 키 셋(구버전 데몬은 키가 없다 — UI 가 키 부재·null·빈 배열을 다르게 읽으므로 병합은 셋을 뭉개지 않는다):
+///  · current_profiles(지금 이 계정으로 로그인된 설정 폴더): 승자와 무관하게 합집합(정렬·중복 제거 — profiles 와 같은 방식).
+///    어느 응답에도 이 키(배열)가 없으면(전부 구버전) 결과에도 만들지 않는다 — UI 는 '키 없음 → profiles 폴백',
+///    '빈 배열 → 이전 로그인'으로 읽는다. 일부 응답에만 있으면 있는 것들의 합집합. 배열이 아닌 값은 키 없음으로 본다.
+///  · in_use: 승자 값이 아니라 같은 계정 행 전체로 정한다 — 하나라도 true → true · 아니면 하나라도 null/키 부재 → null ·
+///    전부 false → false. 병합이 일어난 행은 전부 키 부재여도 null 이다(UI 는 null·키 없음을 같게 읽는다 · 데몬이 하나뿐이라
+///    병합할 것이 없는 행은 그대로).
+///  · alias: 승자의 값이 비어 있으면(null·키 부재·빈 문자열·문자열 아님) 다른 행의 비어 있지 않은 값을 이어받는다.
+///  · rate·rate_observed_at·updated_at·source 등 그 밖 키는 종전대로 승자(updated_at 큰 쪽) 값 그대로다.
 fn merge_account_rows(resps: &[Value]) -> Vec<Value> {
     let mut merged: std::collections::HashMap<(String, String), Value> =
         std::collections::HashMap::new();
@@ -4370,6 +4379,37 @@ fn merge_account_rows(resps: &[Value]) -> Vec<Value> {
                         .collect();
                     profs.sort();
                     profs.dedup();
+                    // ★0.14.43 current_profiles 합집합 — profiles 와 같은 방식이되 배열로 온 응답이 하나라도 있을 때만 만든다
+                    let (cur_cp, new_cp) = (cur["current_profiles"].as_array(), a["current_profiles"].as_array());
+                    let cprofs = (cur_cp.is_some() || new_cp.is_some()).then(|| {
+                        let mut v: Vec<String> = cur_cp
+                            .into_iter()
+                            .flatten()
+                            .chain(new_cp.into_iter().flatten())
+                            .filter_map(|p| p.as_str().map(String::from))
+                            .collect();
+                        v.sort();
+                        v.dedup();
+                        v
+                    });
+                    // ★0.14.43 in_use: true > (null · 키 부재 · 그 밖) > false — 두 행 가운데 큰 쪽(승자 값이 아니다)
+                    let use_rank = |v: &Value| match v {
+                        Value::Bool(true) => 2u8,
+                        Value::Bool(false) => 0,
+                        _ => 1,
+                    };
+                    let in_use = match use_rank(&cur["in_use"]).max(use_rank(&a["in_use"])) {
+                        2 => json!(true),
+                        0 => json!(false),
+                        _ => Value::Null,
+                    };
+                    // ★0.14.43 alias: 승자의 값이 비어 있으면 진 쪽의 비어 있지 않은 값을 이어받는다
+                    let alias_of = |v: &Value| v["alias"].as_str().filter(|t| !t.is_empty()).map(String::from);
+                    let alias = if new_ts > cur_ts {
+                        alias_of(a).or_else(|| alias_of(&*cur))
+                    } else {
+                        alias_of(&*cur).or_else(|| alias_of(a))
+                    };
                     let carried = [cur["source_error"].clone(), a["source_error"].clone()]
                         .into_iter()
                         .find(|e| e.as_str().map_or(false, |t| !t.is_empty()));
@@ -4377,6 +4417,13 @@ fn merge_account_rows(resps: &[Value]) -> Vec<Value> {
                         *cur = a.clone();
                     }
                     cur["profiles"] = json!(profs);
+                    if let Some(v) = cprofs {
+                        cur["current_profiles"] = json!(v);
+                    }
+                    cur["in_use"] = in_use;
+                    if let Some(t) = alias {
+                        cur["alias"] = json!(t);
+                    }
                     let unobserved = cur["updated_at"].as_f64().map_or(true, |t| t <= 0.0);
                     let own_err = cur["source_error"].as_str().map_or(false, |t| !t.is_empty());
                     if unobserved && !own_err {
@@ -9455,6 +9502,325 @@ mod tests {
             {"provider": "claude", "account_id": "u-2", "label": "b", "profiles": [".claude-2"], "updated_at": null}
         ]});
         assert_eq!(merge_account_rows(&[two]).len(), 2);
+    }
+
+    // ── 0.14.43 계정 병합 가산 키(current_profiles · in_use · alias) 검체 ──────────────
+    // 데몬 행의 새 키는 구버전 데몬에는 없다. UI 는 '키 부재'(구버전)·'null'(판정 불가)·'빈 배열'(이전 로그인)을 서로 다르게
+    // 읽으므로 병합은 이 셋을 뭉개지 않는다 — 없는 키를 지어내지도, 있는 값을 승자 값 하나로 덮지도 않는다.
+
+    /// 병합 검체용 claude 행 — 가산 키는 `extra`(객체)에 호출자가 넣은 것만 들어간다(구버전 행 = 가산 키 없음).
+    fn acct_merge_row(updated_at: f64, extra: Value) -> Value {
+        let mut row = json!({"provider": "claude", "account_id": "u-1", "label": "a@corp.example",
+            "profiles": [".claude-1"], "rate": [], "updated_at": updated_at, "source": "statusline"});
+        for (k, v) in extra.as_object().into_iter().flatten() {
+            row[k.as_str()] = v.clone();
+        }
+        row
+    }
+
+    /// 데몬 하나의 `usage.accounts` 응답.
+    fn acct_merge_resp(rows: Vec<Value>) -> Value {
+        json!({"accounts": rows})
+    }
+
+    /// 세 응답(본부 + 부서 둘)의 입력 순서·관측 시각 배정 6가지.
+    fn acct_merge_perms3() -> [[usize; 3]; 6] {
+        [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]
+    }
+
+    /// current_profiles 는 승자(updated_at 큰 쪽)와 무관하게 응답 전체의 합집합이다(정렬·중복 제거 — profiles 와 같은 방식).
+    /// 본부는 좌석 폴더에, 부서는 개인 폴더·좌석 폴더에 로그인된 것으로 본다 — 승자 값 하나만 남기면 다른 데몬이 본 폴더가 사라진다.
+    #[test]
+    fn merge_account_rows_unions_current_profiles_whoever_wins() {
+        for (hq_ts, dept_ts) in [(100.0, 200.0), (200.0, 100.0)] {
+            let hq = acct_merge_resp(vec![acct_merge_row(hq_ts, json!({"current_profiles": [".cys/claude"]}))]);
+            let dept = acct_merge_resp(vec![acct_merge_row(
+                dept_ts,
+                json!({"current_profiles": [".cys/claude", ".claude-2", ".cys/claude"]}),
+            )]);
+            for resps in [[hq.clone(), dept.clone()], [dept.clone(), hq.clone()]] {
+                let m = merge_account_rows(&resps);
+                assert_eq!(m.len(), 1);
+                assert_eq!(
+                    m[0]["current_profiles"],
+                    json!([".claude-2", ".cys/claude"]),
+                    "hq_ts={hq_ts} dept_ts={dept_ts}: 승자와 무관하게 합집합·정렬·중복 제거여야 한다: {}",
+                    m[0]
+                );
+            }
+        }
+        // 본부 + 부서 둘 — 가운데 부서가 구버전이고 가장 새 관측(승자)이어도 앞뒤 응답의 폴더가 합쳐진다. 입력 순서 6가지 모두 같다
+        let rows = [
+            acct_merge_resp(vec![acct_merge_row(100.0, json!({"current_profiles": [".cys/claude"]}))]),
+            acct_merge_resp(vec![acct_merge_row(300.0, json!({}))]), // 구버전 · 승자
+            acct_merge_resp(vec![acct_merge_row(
+                200.0,
+                json!({"current_profiles": [".cys/claude-default-dept-1", ".claude-2"]}),
+            )]),
+        ];
+        for ord in acct_merge_perms3() {
+            let resps: Vec<Value> = ord.iter().map(|&i| rows[i].clone()).collect();
+            let m = merge_account_rows(&resps);
+            assert_eq!(
+                m[0]["current_profiles"],
+                json!([".claude-2", ".cys/claude", ".cys/claude-default-dept-1"]),
+                "입력 순서 {ord:?}: {}",
+                m[0]
+            );
+            assert_eq!(m[0]["updated_at"], json!(300.0), "승자는 가장 새 관측이다(종전 규칙)");
+        }
+        // 빈 배열도 '키 있음'이다 — 둘 다 빈 배열이면 빈 배열이 남는다(지금은 어느 폴더에도 로그인돼 있지 않은 이전 계정이라는 신호.
+        // 키를 지우면 UI 가 profiles 로 폴백해 옛 로그인 폴더를 '현재'로 되살린다). 한쪽만 비었으면 다른 쪽 값.
+        let empty = |ts: f64| acct_merge_resp(vec![acct_merge_row(ts, json!({"current_profiles": []}))]);
+        let m = merge_account_rows(&[empty(100.0), empty(200.0)]);
+        assert_eq!(m[0].get("current_profiles"), Some(&json!([])), "둘 다 빈 배열이면 빈 배열이 남아야 한다: {}", m[0]);
+        let one = acct_merge_resp(vec![acct_merge_row(50.0, json!({"current_profiles": [".claude-2"]}))]);
+        for resps in [[empty(100.0), one.clone()], [one.clone(), empty(100.0)]] {
+            assert_eq!(merge_account_rows(&resps)[0]["current_profiles"], json!([".claude-2"]));
+        }
+    }
+
+    /// 어느 응답에도 current_profiles 가 없으면(전부 구버전) 병합 결과에도 키를 만들지 않는다 — UI 는 키 부재를
+    /// '구버전 → profiles 폴백'으로, 빈 배열을 '이전 로그인'으로 읽는다. 없는 키를 빈 배열로 만들면 모든 claude 계정이 '이전 로그인'이 된다.
+    #[test]
+    fn merge_account_rows_makes_no_current_profiles_key_when_every_response_is_legacy() {
+        let legacy = |ts: f64, profs: Value| acct_merge_resp(vec![acct_merge_row(ts, json!({"profiles": profs}))]);
+        for (hq_ts, dept_ts) in [(100.0, 200.0), (200.0, 100.0)] {
+            let m = merge_account_rows(&[
+                legacy(hq_ts, json!([".cys/claude"])),
+                legacy(dept_ts, json!([".claude-2"])),
+            ]);
+            assert_eq!(m.len(), 1);
+            assert!(
+                m[0].get("current_profiles").is_none(),
+                "hq_ts={hq_ts}: 구버전끼리의 병합이 current_profiles 키를 만들었다: {}",
+                m[0]
+            );
+            // profiles 합집합은 종전 그대로
+            assert_eq!(m[0]["profiles"], json!([".claude-2", ".cys/claude"]));
+        }
+        // 세 응답 모두 구버전이어도 같다
+        let m = merge_account_rows(&[
+            legacy(100.0, json!([".cys/claude"])),
+            legacy(300.0, json!([".claude-2"])),
+            legacy(200.0, json!([".claude-3"])),
+        ]);
+        assert!(m[0].get("current_profiles").is_none(), "세 응답 병합이 키를 만들었다: {}", m[0]);
+        // 데몬이 하나뿐이면 병합할 것이 없다 — 행이 그대로다(구버전이면 가산 키가 계속 없다)
+        let solo = acct_merge_row(100.0, json!({}));
+        assert_eq!(merge_account_rows(&[acct_merge_resp(vec![solo.clone()])]), vec![solo]);
+        // 배열이 아닌 값(IPC 오염 null)은 키 없음으로 본다 — 병합이 배열을 지어내지 않는다
+        let bad = |ts: f64| acct_merge_resp(vec![acct_merge_row(ts, json!({"current_profiles": null}))]);
+        let m = merge_account_rows(&[bad(100.0), bad(200.0)]);
+        assert!(!m[0]["current_profiles"].is_array(), "배열이 아닌 값뿐인데 배열이 만들어졌다: {}", m[0]);
+    }
+
+    /// 일부 응답에만 current_profiles 가 있으면 있는 것들의 합집합 — 구버전 행이 승자(더 새 관측)여도 새 데몬이 본 폴더가 남는다.
+    /// 세 가산 키가 한 병합에서 함께 움직이는 실제 모양(새 본부 + 구버전 부서)도 같이 핀한다.
+    #[test]
+    fn merge_account_rows_takes_current_profiles_from_the_only_daemon_that_reports_it() {
+        for (new_ts, old_ts) in [(100.0, 200.0), (200.0, 100.0)] {
+            let new = acct_merge_resp(vec![acct_merge_row(new_ts, json!({"current_profiles": [".cys/claude"]}))]);
+            let old = acct_merge_resp(vec![acct_merge_row(old_ts, json!({}))]);
+            for resps in [[new.clone(), old.clone()], [old.clone(), new.clone()]] {
+                let m = merge_account_rows(&resps);
+                assert_eq!(
+                    m[0]["current_profiles"],
+                    json!([".cys/claude"]),
+                    "new_ts={new_ts} old_ts={old_ts}: 있는 쪽 값이 남아야 한다: {}",
+                    m[0]
+                );
+            }
+        }
+        // 배열이 아닌 값(null)을 보낸 응답은 키 없는 응답과 같다 — 배열을 보낸 쪽 값이 그대로
+        let weird = acct_merge_resp(vec![acct_merge_row(300.0, json!({"current_profiles": null}))]);
+        let real = acct_merge_resp(vec![acct_merge_row(100.0, json!({"current_profiles": [".claude-2"]}))]);
+        for resps in [[weird.clone(), real.clone()], [real.clone(), weird.clone()]] {
+            assert_eq!(merge_account_rows(&resps)[0]["current_profiles"], json!([".claude-2"]));
+        }
+        // 실제 모양: 새 본부(오래된 관측 · 현재 폴더 · 사용 중 · 별명) + 구버전 부서(새 관측 = 승자 · 가산 키 없음)
+        let hq = acct_merge_resp(vec![acct_merge_row(
+            100.0,
+            json!({"current_profiles": [".cys/claude"], "in_use": true, "alias": "업무용"}),
+        )]);
+        let dept = acct_merge_resp(vec![acct_merge_row(
+            200.0,
+            json!({"profiles": [".cys/claude-default-dept-1"], "source": "rollout"}),
+        )]);
+        for resps in [[hq.clone(), dept.clone()], [dept.clone(), hq.clone()]] {
+            let m = merge_account_rows(&resps);
+            assert_eq!(m.len(), 1);
+            assert_eq!(m[0]["source"], "rollout", "승자는 구버전 부서 행이다(종전 규칙): {}", m[0]);
+            assert_eq!(m[0]["current_profiles"], json!([".cys/claude"]));
+            assert_eq!(m[0]["in_use"], json!(true));
+            assert_eq!(m[0]["alias"], "업무용");
+            assert_eq!(m[0]["profiles"], json!([".claude-1", ".cys/claude-default-dept-1"]));
+        }
+    }
+
+    /// in_use 는 승자 값이 아니라 같은 계정 행 전체로 정한다 — 하나라도 true → true · 아니면 하나라도 null/키 부재 → null ·
+    /// 전부 false → false. 한 데몬이라도 '지금 쓰는 중'이라 하면 쓰는 중이고, 판정하지 못한 데몬(null · 구버전)이 있으면
+    /// 'false(미사용)'로 단정하지 않는다. 4 상태 × 4 상태 × 승자 두 방향 = 32가지를 표로 못박는다.
+    #[test]
+    fn merge_account_rows_in_use_is_any_true_then_unknown_then_all_false() {
+        let (t, f, n) = (json!(true), json!(false), Value::Null);
+        // 상태: true · false · null · 키 부재(구버전 데몬 = None)
+        let states: [(&str, Option<Value>); 4] =
+            [("true", Some(t.clone())), ("false", Some(f.clone())), ("null", Some(n.clone())), ("부재", None)];
+        // 기대표 — 행 = 본부 상태 · 열 = 부서 상태(위와 같은 순서)
+        let expect: [[Value; 4]; 4] = [
+            [t.clone(), t.clone(), t.clone(), t.clone()], // 본부 true
+            [t.clone(), f.clone(), n.clone(), n.clone()], // 본부 false
+            [t.clone(), n.clone(), n.clone(), n.clone()], // 본부 null
+            [t.clone(), n.clone(), n.clone(), n.clone()], // 본부 부재
+        ];
+        let mk = |ts: f64, v: &Option<Value>| {
+            let extra = match v {
+                Some(v) => json!({"in_use": v}),
+                None => json!({}),
+            };
+            acct_merge_resp(vec![acct_merge_row(ts, extra)])
+        };
+        for (i, (hn, hv)) in states.iter().enumerate() {
+            for (j, (dn, dv)) in states.iter().enumerate() {
+                // 승자(updated_at 큰 쪽)를 양쪽 다 시험한다 — 승자 값만 따르면 어느 한 방향에서 어긋난다
+                for (hq_ts, dept_ts) in [(100.0, 200.0), (200.0, 100.0)] {
+                    let m = merge_account_rows(&[mk(hq_ts, hv), mk(dept_ts, dv)]);
+                    assert_eq!(m.len(), 1);
+                    assert_eq!(
+                        m[0].get("in_use"),
+                        Some(&expect[i][j]),
+                        "본부={hn} 부서={dn} (hq_ts={hq_ts} dept_ts={dept_ts}): {}",
+                        m[0]
+                    );
+                }
+            }
+        }
+        // 세 응답(본부 + 부서 둘)도 같은 규칙 — 입력 순서(6가지)와 관측 시각 배정(6가지)에 무관하다
+        let st = |name: &str| -> Option<Value> {
+            match name {
+                "true" => Some(json!(true)),
+                "false" => Some(json!(false)),
+                "null" => Some(Value::Null),
+                _ => None,
+            }
+        };
+        let triples: [([&str; 3], Value); 6] = [
+            (["false", "false", "false"], json!(false)),
+            (["false", "false", "null"], Value::Null),
+            (["false", "false", "부재"], Value::Null),
+            (["false", "true", "false"], json!(true)),
+            (["null", "null", "false"], Value::Null),
+            (["null", "false", "true"], json!(true)),
+        ];
+        for (names, want) in &triples {
+            for ord in acct_merge_perms3() {
+                for tsord in acct_merge_perms3() {
+                    let resps: Vec<Value> =
+                        ord.iter().map(|&i| mk(100.0 * (tsord[i] + 1) as f64, &st(names[i]))).collect();
+                    let m = merge_account_rows(&resps);
+                    assert_eq!(
+                        m[0].get("in_use"),
+                        Some(want),
+                        "{names:?} 입력 순서 {ord:?} 시각 배정 {tsord:?}: {}",
+                        m[0]
+                    );
+                }
+            }
+        }
+        // bool 도 null 도 아닌 값(IPC 오염)은 판정 불가와 같다 — true 로도 false 로도 읽지 않는다
+        for junk in [json!("yes"), json!(1), json!([])] {
+            for (hq_ts, dept_ts) in [(100.0, 200.0), (200.0, 100.0)] {
+                let m = merge_account_rows(&[mk(hq_ts, &Some(json!(false))), mk(dept_ts, &Some(junk.clone()))]);
+                assert_eq!(m[0].get("in_use"), Some(&Value::Null), "false + {junk} (hq_ts={hq_ts}): {}", m[0]);
+                let m = merge_account_rows(&[mk(hq_ts, &Some(junk.clone())), mk(dept_ts, &Some(json!(true)))]);
+                assert_eq!(m[0].get("in_use"), Some(&json!(true)), "{junk} + true (hq_ts={hq_ts}): {}", m[0]);
+            }
+        }
+        // 데몬이 하나뿐이면 병합할 것이 없다 — 값(false)이든 키 부재든 행이 그대로다
+        let only_false = acct_merge_row(100.0, json!({"in_use": false}));
+        assert_eq!(merge_account_rows(&[acct_merge_resp(vec![only_false.clone()])]), vec![only_false]);
+    }
+
+    /// alias: 승자 행의 값이 비어 있으면(null · 키 부재 · 빈 문자열 · 문자열 아님) 다른 행의 비어 있지 않은 값을 이어받는다.
+    /// 승자에게 값이 있으면 그것이 이긴다(진 쪽의 다른 별명이 덮지 않는다) · 둘 다 비면 지어내지 않는다.
+    #[test]
+    fn merge_account_rows_alias_is_inherited_only_when_the_winner_has_none() {
+        // 승자(더 새 관측)의 별명이 빈 네 가지 모양 × 진 쪽이 별명을 가진 경우 — 입력 순서 둘 다
+        for (shape, extra) in [
+            ("null", json!({"alias": null})),
+            ("부재", json!({})),
+            ("빈 문자열", json!({"alias": ""})),
+            ("문자열 아님", json!({"alias": 7})),
+        ] {
+            let win = acct_merge_resp(vec![acct_merge_row(200.0, extra)]);
+            let lose = acct_merge_resp(vec![acct_merge_row(100.0, json!({"alias": "업무용"}))]);
+            for resps in [[win.clone(), lose.clone()], [lose.clone(), win.clone()]] {
+                let m = merge_account_rows(&resps);
+                assert_eq!(m[0]["alias"], "업무용", "승자 별명이 {shape}: 이어받지 못했다: {}", m[0]);
+                assert_eq!(m[0]["updated_at"], json!(200.0), "승자는 더 새 관측이다(종전 규칙)");
+            }
+        }
+        // 승자에게 별명이 있으면 그 값 — 진 쪽이 다른 별명을 가져도 덮지 않는다
+        let win = acct_merge_resp(vec![acct_merge_row(200.0, json!({"alias": "새 별명"}))]);
+        let lose = acct_merge_resp(vec![acct_merge_row(100.0, json!({"alias": "옛 별명"}))]);
+        for resps in [[win.clone(), lose.clone()], [lose.clone(), win.clone()]] {
+            assert_eq!(merge_account_rows(&resps)[0]["alias"], "새 별명");
+        }
+        // 승자만 별명이 있고 진 쪽은 비었으면 그대로
+        let bare = acct_merge_resp(vec![acct_merge_row(100.0, json!({"alias": null}))]);
+        for resps in [[win.clone(), bare.clone()], [bare.clone(), win.clone()]] {
+            assert_eq!(merge_account_rows(&resps)[0]["alias"], "새 별명");
+        }
+        // 둘 다 비어 있으면 지어내지 않는다 — 키 부재는 부재 그대로 · null 은 null 그대로
+        let none_a = acct_merge_resp(vec![acct_merge_row(100.0, json!({}))]);
+        let none_b = acct_merge_resp(vec![acct_merge_row(200.0, json!({}))]);
+        let m = merge_account_rows(&[none_a, none_b]);
+        assert!(m[0].get("alias").is_none(), "별명이 어디에도 없는데 키가 생겼다: {}", m[0]);
+        let nul = |ts: f64| acct_merge_resp(vec![acct_merge_row(ts, json!({"alias": null}))]);
+        let m = merge_account_rows(&[nul(100.0), nul(200.0)]);
+        assert_eq!(m[0].get("alias"), Some(&Value::Null), "별명이 없는데 값이 생겼다: {}", m[0]);
+        // 세 응답: 본부(별명 · 가장 오래된 관측) + 구버전 부서 둘(더 새 관측) — 승자가 두 번 바뀌어도 별명이 이어진다
+        let rows = [
+            acct_merge_resp(vec![acct_merge_row(100.0, json!({"alias": "업무용"}))]),
+            acct_merge_resp(vec![acct_merge_row(200.0, json!({}))]),
+            acct_merge_resp(vec![acct_merge_row(300.0, json!({"alias": ""}))]),
+        ];
+        for ord in acct_merge_perms3() {
+            let resps: Vec<Value> = ord.iter().map(|&i| rows[i].clone()).collect();
+            let m = merge_account_rows(&resps);
+            assert_eq!(m[0]["alias"], "업무용", "입력 순서 {ord:?}: {}", m[0]);
+            assert_eq!(m[0]["updated_at"], json!(300.0));
+        }
+    }
+
+    /// 승자(updated_at 큰 쪽)가 정하는 종전 키는 그대로 승자 행의 값이다 — rate · rate_observed_at · updated_at · source 를
+    /// 섞어 쓰지 않는다. 가산 규칙이 세 키(current_profiles · in_use · alias)만 건드린다는 핀.
+    #[test]
+    fn merge_account_rows_other_keys_still_follow_the_winner_row() {
+        let old = acct_merge_row(
+            100.0,
+            json!({"rate": [{"label": "5h", "used_pct": 10.0, "resets_at": 9000.0, "alert_eligible": false}],
+                   "rate_observed_at": 100.0, "source": "rollout", "plan": "pro",
+                   "current_profiles": [".claude-2"], "in_use": false, "alias": "예비"}),
+        );
+        let new = acct_merge_row(
+            200.0,
+            json!({"rate": [{"label": "5h", "used_pct": 40.0, "resets_at": 9500.0, "alert_eligible": true}],
+                   "rate_observed_at": 190.0, "source": "statusline", "plan": "max",
+                   "current_profiles": [".cys/claude"], "in_use": false, "alias": "업무용"}),
+        );
+        for rows in [[old.clone(), new.clone()], [new.clone(), old.clone()]] {
+            let resps: Vec<Value> = rows.iter().map(|r| acct_merge_resp(vec![r.clone()])).collect();
+            let m = merge_account_rows(&resps);
+            assert_eq!(m.len(), 1);
+            for k in ["rate", "rate_observed_at", "updated_at", "source", "plan"] {
+                assert_eq!(m[0][k], new[k], "{k} 는 승자(updated_at 200) 행의 값이어야 한다: {}", m[0]);
+            }
+            assert_eq!(m[0]["alias"], "업무용", "승자의 별명이 있으면 그것: {}", m[0]);
+            assert_eq!(m[0]["in_use"], json!(false), "둘 다 false 면 false: {}", m[0]);
+            assert_eq!(m[0]["current_profiles"], json!([".claude-2", ".cys/claude"]));
+        }
     }
 
     /// 부서 fan-out 은 소켓마다 상한을 두되 **동시에** 묻는다 — 순차면 무응답 부서 N개가 N×상한만큼 전체를 늦춘다.
