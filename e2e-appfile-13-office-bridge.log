@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "C:\Users\runneradmin\.cys/pack\bin\javis_hud_bridge.py", line 1968, in <module>
+    main()
+  File "C:\Users\runneradmin\.cys/pack\bin\javis_hud_bridge.py", line 1960, in main
+    print(f"[hud-bridge] http://{BIND}:{PORT}  (\uc77d\uae30 \uc804\uc6a9 · 127.0.0.1 \ud55c\uc815)", flush=True)
+  File "encodings\cp1252.py", line 19, in encode
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 37-38: character maps to <undefined>

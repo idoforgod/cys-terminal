@@ -1,0 +1,2 @@
+2026-10-03T20:03:05.817Z [INFO] === p0-facts start (PowerShell 5.1.26100.33438, LanguageMode FullLanguage) ===
+2026-10-03T20:03:19.749Z [INFO] === p0-facts end ===

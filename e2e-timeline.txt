@@ -1,0 +1,17 @@
+# timeline start 2026-10-03T20:04:57.431Z target=0.14.42
+[    0s 2026-10-03T20:04:57.509Z] marker=0.14.37 appver=0.14.37 / product 0.14.37 cysapp=True installer=False procs=[cys-app.exe#5356] updater=[] failurefile=False
+[    5s 2026-10-03T20:05:02.573Z] marker=0.14.37 appver=0.14.37 / product 0.14.37 cysapp=True installer=False procs=[cys-app.exe#5356 cysd.exe#9220 cys.exe#8976 cys.exe#4800] updater=[] failurefile=False
+[   10s 2026-10-03T20:05:07.665Z] marker=0.14.37 appver=0.14.37 / product 0.14.37 cysapp=True installer=False procs=[cys-app.exe#5356 cysd.exe#9220 cys.exe#8976 cys.exe#4800] updater=[] failurefile=False
+[   15s 2026-10-03T20:05:12.710Z] marker=0.14.37 appver=0.14.37 / product 0.14.37 cysapp=True installer=False procs=[cys-app.exe#5356 cysd.exe#9220 cys.exe#8976] updater=[] failurefile=False
+[   20s 2026-10-03T20:05:17.746Z] marker=0.14.37 appver=0.14.37 / product 0.14.37 cysapp=True installer=False procs=[cys-app.exe#5356 cysd.exe#9220 cys.exe#8976] updater=[] failurefile=False
+[   25s 2026-10-03T20:05:22.792Z] marker=0.14.37 appver=0.14.37 / product 0.14.37 cysapp=True installer=False procs=[cys-app.exe#5356 cysd.exe#9220 cys.exe#5352] updater=[cys-0.14.42-updater-laO1zd:0B[cys-0.14.42-installer.exe]] failurefile=False
+# installer process first seen: cys-0.14.42-installer.exe pid=9740 path=C:\Users\RUNNER~1\AppData\Local\Temp\cys-0.14.42-updater-laO1zd\cys-0.14.42-installer.exe cmd="C:\Users\RUNNER~1\AppData\Local\Temp\cys-0.14.42-updater-laO1zd\cys-0.14.42-installer.exe" /P /R /UPDATE /ARGS
+[   30s 2026-10-03T20:05:27.847Z] marker=0.14.37 appver= / product  cysapp=False installer=True procs=[cysd.exe#9220 cys.exe#5352 cys-0.14.42-installer.exe#9740] updater=[cys-0.14.42-updater-laO1zd:143202847B[cys-0.14.42-installer.exe]] failurefile=False
+# screenshot installer: ok=True windows=cys-0.14.42-installer#9740:cys Setup  | WindowsTerminal#3480:C:\ProgramData\GitHub\HostedComputeAgent\hosted-compute-agent
+[   36s 2026-10-03T20:05:33.133Z] marker=0.14.37 appver=0.14.42 / product 0.14.42 cysapp=False installer=True procs=[cysd.exe#9220 cys.exe#5352 cys-0.14.42-installer.exe#9740] updater=[cys-0.14.42-updater-laO1zd:143202847B[cys-0.14.42-installer.exe]] failurefile=False
+[   41s 2026-10-03T20:05:38.189Z] marker=0.14.37 appver=0.14.42 / product 0.14.42 cysapp=False installer=True procs=[cysd.exe#9220 cys-0.14.42-installer.exe#9740] updater=[cys-0.14.42-updater-laO1zd:143202847B[cys-0.14.42-installer.exe]] failurefile=False
+[   46s 2026-10-03T20:05:43.230Z] marker=0.14.37 appver=0.14.42 / product 0.14.42 cysapp=False installer=True procs=[cysd.exe#9220 cys-0.14.42-installer.exe#9740] updater=[cys-0.14.42-updater-laO1zd:143202847B[cys-0.14.42-installer.exe]] failurefile=False
+[   51s 2026-10-03T20:05:48.297Z] marker=0.14.37 appver=0.14.42 / product 0.14.42 cysapp=False installer=True procs=[cysd.exe#9220 cys-0.14.42-installer.exe#9740] updater=[cys-0.14.42-updater-laO1zd:143202847B[cys-0.14.42-installer.exe]] failurefile=False
+# screenshot 20s: ok=True windows=cys-0.14.42-installer#9740:cys Setup  | WindowsTerminal#3480:C:\ProgramData\GitHub\HostedComputeAgent\hosted-compute-agent
+[   56s 2026-10-03T20:05:53.407Z] marker=0.14.42 appver=0.14.42 / product 0.14.42 cysapp=True installer=False procs=[cysd.exe#9220 cys-app.exe#5840 cys.exe#2664 cys.exe#4528] updater=[cys-0.14.42-updater-laO1zd:143202847B[cys-0.14.42-installer.exe]] failurefile=False
+# end: success: version marker reached the target and cys-app.exe is running

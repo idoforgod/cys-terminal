@@ -1,0 +1,8 @@
+PowerShell 5.1.26100.33438 on AMD64
+ok e2e-update.ps1
+ok lib.ps1
+ok p0-facts.ps1
+ok p1-assets.ps1
+ok replica.ps1
+ok sac-real.ps1
+ok sacrules.ps1
