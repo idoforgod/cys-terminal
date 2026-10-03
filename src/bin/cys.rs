@@ -2851,6 +2851,72 @@ fn send_key_request_params(
     p
 }
 
+/// ★(0.14.43 · J3) 검증되지 않은 발신자(pane 밖 — 사람 터미널·스크립트·GUI 가 띄운 `cys`)가 요청 `from` 에 싣는 **표시용 라벨**을 덧붙이는
+/// 선택 env 키. 값은 [`unverified_sender_label`] 이 살균한다(없으면 명령 종류만 쓴다). 라벨은 표시·원장용이다 — 좌석·역할 판정에 쓰이지 않는다.
+const ENV_SENDER_LABEL: &str = "CYS_SENDER_LABEL";
+
+/// 라벨 꼬리(`cli:` 뒤)의 최대 글자 수.
+const SENDER_LABEL_TAIL_MAX: usize = 32;
+
+/// ★(0.14.43 · J3) 검증되지 않은 발신자의 **표시용 라벨**(순수) — 늘 `cli` 또는 `cli:<꼬리>` 꼴이다.
+///
+/// 왜 필요한가(윈도우 사용자 제보 — 재시작 안내 `[DRAIN-VERIFY]` 메시지에 발신 표시가 없다): 데몬은 발신 좌석을 커널 peer pid → pane 조상 사슬로
+/// **검증**한다. pane 밖(CLI·스크립트·GUI)에서 보낸 요청은 검증할 좌석이 없고 `from` 도 비어(null) 있어, 큐 다이제스트 머리는 `발신 unknown` 으로,
+/// 직접 전송 이벤트·배달 원장의 `from` 은 null 로 남았다. 새 RPC 키는 만들지 않는다 — 기존 관례(타이핑 가드 폴백이 큐 전송에
+/// `from:"inject(typing_guard fallback)"` 을 싣는다)대로 **라벨 문자열을 `from` 에 싣는다**.
+///
+/// 규칙: `env_label`(env `CYS_SENDER_LABEL`)이 있으면 `[A-Za-z0-9._-]` 만 남기고(그 밖은 버린다) 앞 32자까지만 써서 `cli:<값>`(살균 뒤 비면 무시) ·
+/// 없으면 `kind`(코드 상수 — `send`·`inject`·`drain`)로 `cli:<kind>` · 그것도 비면 `cli`.
+/// ★접두 `cli` 고정이 이 함수의 존재 이유다 — 라벨은 순수 숫자·`surface:N`·역할 이름(master·worker·cso…)이 **될 수 없다**. 데몬은 검증 신원이 있으면
+/// 그것을 늘 우선하고, 없을 때도 `claimed_from_sid` 가 숫자·`surface:N` 만 좌석으로 읽으므로 라벨은 ACL·게이트·짝 Return·좌석 판정에 쓰이지 않는다
+/// (표시·원장 전용 — 데몬의 판정 경로는 무변경).
+fn unverified_sender_label(env_label: Option<&str>, kind: &str) -> String {
+    fn tail(s: &str) -> String {
+        s.chars()
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            .take(SENDER_LABEL_TAIL_MAX)
+            .collect()
+    }
+    match env_label.map(tail).filter(|t| !t.is_empty()).or_else(|| Some(tail(kind)).filter(|t| !t.is_empty())) {
+        Some(t) => format!("cli:{t}"),
+        None => "cli".to_string(),
+    }
+}
+
+/// ★(0.14.43 · J3) `cys send` 요청의 `from` 값(순수) — pane 안(자기 surface id 있음)이면 **종전 그대로 숫자**, pane 밖이면 표시용 라벨 문자열이다.
+/// 직접 요청·명시 `--queued`·타이핑 가드 큐 전환 폴백이 **같은 값**을 쓴다(호출부가 한 번 계산해 재사용). `send-key` 는 이 함수를 쓰지 않는다
+/// (기존 핀: 큐 요청에 from 없음 · 비큐는 숫자만 — `send_key_request_params`).
+fn send_from_param(self_sid: Option<u64>, env_label: Option<&str>) -> serde_json::Value {
+    match self_sid {
+        Some(n) => json!(n),
+        None => json!(unverified_sender_label(env_label, "send")),
+    }
+}
+
+/// ★(0.14.43 · J3) 직접 `surface.send_text`(inject 계열 — 지침·과업·저장 지시 주입)에 pane 밖 발신 라벨을 더한다(순수). **pane 안이면 아무것도 싣지
+/// 않는다**(종전 바이트 — 데몬은 어차피 검증 신원을 우선한다). 호출부 요청 리터럴에는 `from` 이 없으므로 이 함수가 키를 새로 만든다.
+fn with_unverified_sender(
+    mut params: serde_json::Value,
+    self_sid: Option<u64>,
+    env_label: Option<&str>,
+    kind: &str,
+) -> serde_json::Value {
+    if self_sid.is_none() {
+        params["from"] = json!(unverified_sender_label(env_label, kind));
+    }
+    params
+}
+
+/// [`with_unverified_sender`] 의 env 판독 래퍼 — 자기 surface id 는 `cys send` 와 같은 해석(`CYS_SURFACE_ID`), 라벨은 `CYS_SENDER_LABEL`.
+fn inject_params_with_sender(params: serde_json::Value, kind: &str) -> serde_json::Value {
+    with_unverified_sender(
+        params,
+        cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s)),
+        std::env::var(ENV_SENDER_LABEL).ok().as_deref(),
+        kind,
+    )
+}
+
 /// ★(0.14.42 · A2 C2) 흡수 응답의 stdout 한 줄(순수) — `OK`·`QUEUED` 로 시작하지 않는다(첫 줄만 읽는
 /// 소비 스크립트가 직접 제출·적재로 오독하지 않게). 본문 상태별 문구 셋 · 다중 대상 접미 `tag`.
 fn format_absorbed_line(r: &serde_json::Value, tag: &str) -> String {
@@ -3664,9 +3730,15 @@ fn inject_text(sid: u64, text: &str) -> Result<(), String> {
     // 차단하던 경로(human is typing 무한)를 끊는다. ACL은 데몬에서 그대로 집행된다.
     // ★(0.14.42 · 통합 minor 정리) 정착 증명 거부(곧 비는 줄)는 `cys send` 와 같은 예산 안에서 다시 보낸 뒤에만 아래 큐 1회
     //   전환으로 간다(`authoritative_paste_settled` — 증명 없는 거부·권위 면제는 첫 요청 그대로).
+    // ★(0.14.43 · J3) pane 밖 호출(스크립트·GUI·타 소켓 CLI)이면 직접 요청에 표시용 라벨 `cli:inject` 를 싣는다 — 데몬이 검증할 좌석이 없을 때
+    //   이벤트·원장의 `from` 이 null 로 남던 자리다(표시·원장 전용 — 판정에 쓰이지 않는다). pane 안이면 싣지 않는다(종전 바이트).
+    //   아래 타이핑 가드 폴백의 라벨 `inject(typing_guard fallback)` 과 제출 Return 요청은 무변경이다.
     match authoritative_paste_settled(
         |p| request("surface.send_text", p),
-        json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
+        inject_params_with_sender(
+            json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
+            "inject",
+        ),
     ) {
         Ok(_) => {}
         Err(e) if is_typing_guard_err(&e) => {
@@ -4988,7 +5060,13 @@ fn run(command: Command) -> i32 {
 
         Command::Send { surface, to, queued, clear_first, stdin, file, text } => {
             resolve_targets(&surface, &to).and_then(|sids| {
-                let from = cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s));
+                // ★(0.14.43 · J3) pane 안(자기 surface id 있음)이면 종전 그대로 숫자 · pane 밖이면 표시용 라벨 문자열(`cli:send` — env
+                //   `CYS_SENDER_LABEL` 이 있으면 `cli:<살균값>`). 직접 요청·명시 `--queued`·아래 큐 전환 폴백이 같은 값을 쓴다. 라벨은 표시·원장용이다 —
+                //   데몬은 검증 신원을 늘 우선하고 `claimed_from_sid` 는 숫자·`surface:N` 만 좌석으로 읽는다(ACL·게이트·짝 Return 무영향).
+                let from = send_from_param(
+                    cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s)),
+                    std::env::var(ENV_SENDER_LABEL).ok().as_deref(),
+                );
                 let multi = sids.len() > 1;
                 // ★(0.14.42 · S21-SETTLE) 정착 재시도 끔·예산 — 프로세스 단위(라이브 즉시 롤백은 데몬 센티널 `send-settle-off`).
                 let settle_off = cys::send_settle_env_off(std::env::var("CYS_SEND_SETTLE").ok().as_deref());
@@ -18830,11 +18908,14 @@ trait VerifyIo {
 
 /// 소켓 지정 주입(inject_text의 socket+timeout판): bracketed paste → 0.8s → Return. 기본 소켓 하드바인딩인
 /// inject_text와 달리 부서 소켓 대상[A1-F1] · request_on_timeout으로 hung 방어.
+/// ★(0.14.43 · J3) `kind` = pane 밖 호출일 때 요청 `from` 라벨(`cli:<kind>`)의 꼬리 — `drain --verify` 는 `"drain"`, 그 밖은 `"inject"`
+/// (pane 안이면 라벨을 싣지 않는다 — 종전 바이트).
 fn inject_text_on(
     socket: &std::path::Path,
     sid: u64,
     text: &str,
     timeout: std::time::Duration,
+    kind: &str,
 ) -> Result<(), String> {
     // ★U-14 관문 가드 — 부서 소켓 판. `inject_text` 와 **같은 술어**를 쓰되 관측만 소켓 경유다.
     //   실사용상 이 경로의 대상은 이미 각성한 노드라 창은 대개 닫혀 있지만, 그렇다고 그물에
@@ -18847,7 +18928,10 @@ fn inject_text_on(
     //   와 같은 예산 안에서 다시 보낸다(종전: 재시도 없이 Err → `drain --verify` 가 '소켓 hung' 으로 오분류).
     authoritative_paste_settled(
         |p| request_on_timeout(socket, "surface.send_text", p, timeout),
-        json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
+        inject_params_with_sender(
+            json!({"surface_id": sid, "text": wrapped, "quiet": true, "authoritative": true}),
+            kind,
+        ),
     )?;
     std::thread::sleep(std::time::Duration::from_millis(800));
     gate_guard_check_on(socket, sid, timeout, "제출 Return(부서)")?;
@@ -18934,7 +19018,7 @@ impl VerifyIo for RealVerifyIo {
         text: &str,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
-        inject_text_on(socket, sid, text, timeout)
+        inject_text_on(socket, sid, text, timeout, "drain")
     }
     fn read_screen(
         &self,
@@ -34306,7 +34390,7 @@ mod tests {
                     }
                 }
             });
-            let r = inject_text_on(&sock, 7, "DIRECTIVE BODY", Duration::from_secs(3));
+            let r = inject_text_on(&sock, 7, "DIRECTIVE BODY", Duration::from_secs(3), "inject");
             // 서버 정지(연결 1회 + 정지 요청).
             if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&sock) {
                 let _ = writeln!(s, "{}", json!({"id": 1, "method": "__stop", "params": {}}));
@@ -34428,7 +34512,7 @@ mod tests {
         std::env::remove_var("CYS_SEND_SETTLE");
         std::env::remove_var("CYS_SEND_SETTLE_BUDGET_MS");
         let (sock, calls, stop) = scripted_settle_daemon(2, settle_refusal(30));
-        let r = inject_text_on(&sock, 7, "SAVE NOW", Duration::from_secs(3));
+        let r = inject_text_on(&sock, 7, "SAVE NOW", Duration::from_secs(3), "inject");
         stop();
         let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert!(r.is_ok(), "정착 증명 거부 뒤 재시도하지 않았다: {r:?} {calls:?}");
@@ -34442,7 +34526,7 @@ mod tests {
         // 대조군: 증명 없는 D-12 거부(사람 초안)는 재시도 0회로 그대로 Err(사람 초안 앞에서 다시 밀지 않는다).
         let draft = format!("{} [{}:human_draft]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG);
         let (sock, calls, stop) = scripted_settle_daemon(1, draft);
-        let r = inject_text_on(&sock, 7, "SAVE NOW", Duration::from_secs(3));
+        let r = inject_text_on(&sock, 7, "SAVE NOW", Duration::from_secs(3), "inject");
         stop();
         let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
         assert!(r.is_err(), "사람 초안 거부가 통과했다: {calls:?}");
@@ -34476,6 +34560,295 @@ mod tests {
         assert!(sends.iter().all(|p| p["queued"] != true), "정착 창 거부가 큐로 밀렸다: {sends:?}");
         assert_eq!(sends[1]["settle_retry"], json!(true), "{sends:?}");
         assert!(calls.iter().any(|(m, p)| m == "surface.send_key" && p["key"] == "Return"), "직접 제출 Return: {calls:?}");
+    }
+
+    // ───────── ★(0.14.43 · J3) pane 밖에서 보낸 메시지의 발신자 표기(`from=null` · "발신 unknown") ─────────
+    //
+    // 데몬은 검증 신원이 있으면 그것을 늘 우선하고(커널 peer → pane 조상 사슬) 없을 때만 요청의 `from` 을 본다. pane 밖 CLI 는 검증할 좌석이 없어 `from` 이
+    // 비었다 — 이제 표시용 라벨 문자열(`cli:send` · `cli:inject` · `cli:drain` · env `CYS_SENDER_LABEL` 살균값)을 싣는다. 라벨은 늘 `cli`·`cli:<꼬리>` 꼴이라
+    // 좌석·역할로 읽히지 않는다(성질 핀). pane 안(자기 surface id 있음)은 종전 바이트 그대로이고 `send-key` 요청은 건드리지 않는다.
+
+    /// 정해진 벡터 — 수정 전에는 라벨 함수가 없다(pane 밖 `send`·inject 의 `from` 이 null 로만 나갔다).
+    #[test]
+    fn j3_unverified_sender_label_vectors() {
+        let l = unverified_sender_label;
+        assert_eq!(l(None, "send"), "cli:send");
+        assert_eq!(l(None, "inject"), "cli:inject");
+        assert_eq!(l(None, "drain"), "cli:drain");
+        assert_eq!(l(None, ""), "cli", "kind 도 비면 접두만");
+        assert_eq!(l(Some("backup job!"), "send"), "cli:backupjob", "허용 문자 밖(공백·느낌표)은 버린다");
+        assert_eq!(l(Some("master"), "send"), "cli:master", "역할 이름도 접두 때문에 역할과 같아질 수 없다");
+        assert_eq!(l(Some("surface:7"), "send"), "cli:surface7", "콜론이 버려져 surface:N 꼴이 될 수 없다");
+        assert_eq!(l(Some("7"), "send"), "cli:7", "순수 숫자도 접두 때문에 숫자가 될 수 없다");
+        let forty = "0123456789".repeat(4);
+        assert_eq!(l(Some(&forty), "send"), format!("cli:{}", &forty[..32]), "40자 입력은 꼬리 32자");
+        assert_eq!(l(Some("///"), "send"), "cli:send", "살균 뒤 빈 값은 무시하고 kind 로 간다");
+        assert_eq!(l(Some(""), "send"), "cli:send");
+        assert_eq!(l(Some("a.b_c-d"), "drain"), "cli:a.b_c-d", "허용 문자는 그대로");
+        assert_eq!(l(Some("한글라벨"), "send"), "cli:send", "비ASCII 는 전부 버려져 kind 로 간다");
+        assert_eq!(l(Some("a\nb\tc\u{1b}[31m"), "send"), "cli:abc31m", "제어문자·ESC 는 버린다 — 줄바꿈으로 머리말을 속일 수 없다");
+        let padded = format!("{}{}", "!".repeat(50), "x".repeat(40));
+        assert_eq!(l(Some(&padded), "send"), format!("cli:{}", "x".repeat(32)), "절단은 살균 뒤(허용 문자 32자)");
+        assert_eq!(l(None, "bad kind!"), "cli:badkind", "kind 도 같은 살균을 거친다");
+        assert_eq!(l(None, "!!!"), "cli");
+    }
+
+    /// ★(J3) 성질 핀 — **어떤 입력에서도** 라벨은 좌석·역할로 읽히지 않는다. 늘 `cli` 또는 `cli:<꼬리>`(꼬리 1~32자 · `[A-Za-z0-9._-]`) 꼴이고,
+    /// `cys::parse_surface_ref` 로 Some 이 되지 않으며 u64 로 파싱되지 않고 데몬 `claimed_from_sid` 의 해석(`surface:` 접두 제거 후 u64)도 못 넘는다.
+    /// 돌연변이 M1(`cli` 접두 제거)에서 적색이다 — 순수 숫자("7")·역할 이름("master")이 그대로 새어 나간다.
+    #[test]
+    fn j3_unverified_sender_label_property_never_seat_or_role() {
+        let roles = [
+            "master", "worker", "worker-1", "cso", "ceo", "owner", "creator", "external", "daemon", "system", "reviewer-gemini",
+            "reviewer-codex", "user", "human",
+        ];
+        let mut envs: Vec<Option<String>> = vec![None, Some(String::new())];
+        envs.extend(roles.iter().map(|r| Some(r.to_string())));
+        let long = "x".repeat(100);
+        for s in [
+            "0", "7", "31", "007", "surface:7", "surface:0", " 7 ", "-1", "18446744073709551615", "99999999999999999999", "cli", "cli:send", "a b c",
+            "///", "한글", "\n", "\u{0}", "surface", ":", "::", "9:9", long.as_str(),
+        ] {
+            envs.push(Some(s.to_string()));
+        }
+        let kinds = ["send", "inject", "drain", "", "7", "surface:7", "master", " ", "한글", "a/b"];
+        let allowed = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+        let claimed = |s: &str| s.strip_prefix("surface:").unwrap_or(s).parse::<u64>().ok();
+        for env in &envs {
+            for kind in kinds {
+                let l = unverified_sender_label(env.as_deref(), kind);
+                let ctx = format!("env={env:?} kind={kind:?} → {l:?}");
+                assert!(l == "cli" || l.starts_with("cli:"), "접두 `cli` 가 아니다: {ctx}");
+                if let Some(tail) = l.strip_prefix("cli:") {
+                    assert!(
+                        !tail.is_empty() && tail.chars().count() <= 32 && tail.chars().all(allowed),
+                        "꼬리 꼴 위반(1~32자 · [A-Za-z0-9._-]): {ctx}"
+                    );
+                }
+                assert!(cys::parse_surface_ref(&l).is_none(), "좌석 표기로 읽힌다: {ctx}");
+                assert!(l.parse::<u64>().is_err(), "u64 로 파싱된다: {ctx}");
+                assert!(claimed(&l).is_none(), "데몬 자기신고 해석(claimed_from_sid)이 좌석으로 읽는다: {ctx}");
+                assert!(!roles.contains(&l.as_str()), "역할 이름과 같다: {ctx}");
+            }
+        }
+    }
+
+    /// ★(J3) `cys send` 의 요청 `from`(순수) — pane 안(자기 surface id 있음)은 **종전 그대로 숫자** · pane 밖은 라벨 문자열. env 라벨은 pane 밖에서만 쓰인다.
+    #[test]
+    fn j3_send_from_param_pane_inside_keeps_number_outside_gets_label() {
+        assert_eq!(send_from_param(Some(9), None), json!(9), "pane 안 — 종전 그대로(숫자)");
+        assert_eq!(send_from_param(Some(9), Some("job")), json!(9), "pane 안이면 env 라벨은 쓰이지 않는다");
+        assert_eq!(send_from_param(None, None), json!("cli:send"));
+        assert_eq!(send_from_param(None, Some("backup job!")), json!("cli:backupjob"));
+        assert_eq!(
+            serde_json::to_string(&json!({"from": send_from_param(Some(9), None)})).unwrap(),
+            r#"{"from":9}"#,
+            "pane 안 직렬화 바이트는 종전과 같다(정수)"
+        );
+    }
+
+    /// ★(J3) inject 계열 요청 조립(순수) — pane 안이면 **한 바이트도 안 바뀐다** · pane 밖이면 `from` 키 **하나만** 늘어난다.
+    #[test]
+    fn j3_with_unverified_sender_adds_from_only_out_of_pane() {
+        let base = json!({"surface_id": 7, "text": "본문", "quiet": true, "authoritative": true});
+        let ser = |v: &Value| serde_json::to_string(v).unwrap();
+        assert_eq!(ser(&with_unverified_sender(base.clone(), Some(9), None, "inject")), ser(&base), "pane 안 — 종전 바이트");
+        assert_eq!(ser(&with_unverified_sender(base.clone(), Some(9), Some("job"), "inject")), ser(&base), "pane 안 — env 라벨 무시");
+        let p = with_unverified_sender(base.clone(), None, None, "inject");
+        let mut want = base.clone();
+        want["from"] = json!("cli:inject");
+        assert_eq!(ser(&p), ser(&want), "pane 밖 — from 하나만 늘어난다");
+        assert_eq!(with_unverified_sender(base.clone(), None, None, "drain")["from"], json!("cli:drain"));
+        assert_eq!(with_unverified_sender(base.clone(), None, Some("x y"), "drain")["from"], json!("cli:xy"));
+    }
+
+    /// `cys send` 를 실제 `run()` 으로 돌려 데몬이 받은 `surface.send_text` 요청을 캡처한다(가짜 데몬 — 유닉스 한정). `self_ref` = 자기 pane(`CYS_SURFACE_ID`) ·
+    /// `label` = `CYS_SENDER_LABEL` · `refusals`/`refusal` = 처음 N 번의 직접 요청을 거부하는 데몬 문구(큐 전환 폴백 관측). 정착 재시도 env 는 비운다.
+    #[cfg(unix)]
+    fn j3_run_send(
+        flags: &[&str],
+        self_ref: Option<&str>,
+        label: Option<&str>,
+        refusals: usize,
+        refusal: String,
+    ) -> (i32, Vec<Value>) {
+        let _lk = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (sock, calls, stop) = scripted_settle_daemon(refusals, refusal);
+        let _env = (
+            cys::pack::EnvGuard::set(cys::ENV_SOCKET, &sock),
+            cys::pack::EnvGuard::set_opt("CYS_SURFACE_ID", self_ref),
+            cys::pack::EnvGuard::remove("JAVIS_SURFACE_ID"),
+            cys::pack::EnvGuard::remove("AITERM_SURFACE_ID"),
+            cys::pack::EnvGuard::set_opt(ENV_SENDER_LABEL, label),
+            cys::pack::EnvGuard::remove("CYS_SEND_SETTLE"),
+            cys::pack::EnvGuard::remove("CYS_SEND_SETTLE_BUDGET_MS"),
+        );
+        let mut argv = vec!["cys", "send", "--surface", "surface:7"];
+        argv.extend_from_slice(flags);
+        argv.push("J3 본문");
+        let rc = run(Cli::parse_from(argv).command);
+        stop();
+        let sends = calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|(m, _)| m == "surface.send_text")
+            .map(|(_, p)| p.clone())
+            .collect();
+        (rc, sends)
+    }
+
+    /// ★(J3) `cys send` 전 경로의 요청 `from` — pane 밖: 직접·`--queued`·타이핑 가드 큐 전환 폴백 모두 `cli:send`(env 라벨이면 `cli:<살균값>`) ·
+    /// pane 안(`CYS_SURFACE_ID=surface:9`): 모두 정수 9(종전). 수정 전에는 pane 밖 요청의 `from` 이 null 이라 첫 단언에서 적색이다.
+    #[cfg(unix)]
+    #[test]
+    fn j3_cys_send_carries_label_out_of_pane_and_number_in_pane() {
+        let tg = cys::MSG_TYPING_GUARD;
+        let draft = format!("{tg} [{}:human_draft]", cys::DRAFT_GATE_TAG); // 정착 증명 없는 거부 → 재시도 없이 큐 전환
+        // ① pane 밖 · 직접
+        let (rc, s) = j3_run_send(&[], None, None, 0, String::new());
+        assert_eq!(rc, 0);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert_eq!(s[0]["from"], json!("cli:send"), "pane 밖 send 의 from 이 라벨이 아니다: {}", s[0]);
+        assert_eq!((s[0]["queued"].clone(), s[0]["text"].clone()), (json!(false), json!("J3 본문")));
+        // ② pane 밖 · 명시 --queued 도 같다
+        let (rc, s) = j3_run_send(&["--queued"], None, None, 0, String::new());
+        assert_eq!((rc, s.len()), (0, 1));
+        assert_eq!((s[0]["from"].clone(), s[0]["queued"].clone()), (json!("cli:send"), json!(true)), "{}", s[0]);
+        // ③ pane 안 — 종전 그대로 숫자(직접 · --queued)
+        for flags in [&[][..], &["--queued"][..]] {
+            let (rc, s) = j3_run_send(flags, Some("surface:9"), Some("ignored"), 0, String::new());
+            assert_eq!((rc, s.len()), (0, 1));
+            assert_eq!(s[0]["from"], json!(9), "pane 안 send 의 from 이 숫자가 아니다({flags:?}): {}", s[0]);
+        }
+        // ④ env 라벨 — 살균해 `cli:<값>`
+        let (_, s) = j3_run_send(&[], None, Some("backup job!"), 0, String::new());
+        assert_eq!(s[0]["from"], json!("cli:backupjob"), "{}", s[0]);
+        // ⑤ 타이핑 가드 거부 → 큐 전환 폴백 요청도 같은 값(pane 밖 라벨 · pane 안 숫자)
+        let (rc, s) = j3_run_send(&[], None, None, 1, draft.clone());
+        assert_eq!((rc, s.len()), (0, 2), "직접 1회 + 큐 전환 1회여야 한다: {s:?}");
+        assert_eq!((s[0]["from"].clone(), s[1]["from"].clone()), (json!("cli:send"), json!("cli:send")), "{s:?}");
+        assert_eq!((s[1]["queued"].clone(), s[1]["absorb_return"].clone()), (json!(true), json!(true)), "{}", s[1]);
+        let (rc, s) = j3_run_send(&[], Some("surface:9"), None, 1, draft);
+        assert_eq!((rc, s.len()), (0, 2));
+        assert_eq!((s[0]["from"].clone(), s[1]["from"].clone()), (json!(9), json!(9)), "{s:?}");
+    }
+
+    /// ★(J3) inject 계열 요청(`inject_text` 기본 소켓 · `inject_text_on` 부서 소켓 — `drain --verify` 의 `[DRAIN-VERIFY]` 가 이 길이다)의 `from` — pane 밖에서만
+    /// 직접 `surface.send_text` 에 라벨(`cli:inject` · drain 은 `cli:drain` · env 라벨이면 `cli:<살균값>`)을 싣고, pane 안이면 종전 바이트(from 키 없음)다.
+    /// 제출 Return(`surface.send_key`)은 어떤 경우에도 from 이 없고, 타이핑 가드 폴백의 기존 라벨 `inject(typing_guard fallback)` 은 무변경이다.
+    #[cfg(unix)]
+    #[test]
+    fn j3_inject_requests_carry_label_only_out_of_pane() {
+        use std::time::Duration;
+        let _lk = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // on = None → `inject_text`(기본 소켓) · Some(kind) → `inject_text_on(.., kind)`(소켓 지정).
+        let run_inject = |self_ref: Option<&str>, label: Option<&str>, refusals: usize, refusal: String, on: Option<&str>| {
+            let (sock, calls, stop) = scripted_settle_daemon(refusals, refusal);
+            let _env = (
+                cys::pack::EnvGuard::set(cys::ENV_SOCKET, &sock),
+                cys::pack::EnvGuard::set_opt("CYS_SURFACE_ID", self_ref),
+                cys::pack::EnvGuard::remove("JAVIS_SURFACE_ID"),
+                cys::pack::EnvGuard::remove("AITERM_SURFACE_ID"),
+                cys::pack::EnvGuard::set_opt(ENV_SENDER_LABEL, label),
+                cys::pack::EnvGuard::remove("CYS_SEND_SETTLE"),
+                cys::pack::EnvGuard::remove("CYS_SEND_SETTLE_BUDGET_MS"),
+            );
+            let r = match on {
+                Some(kind) => inject_text_on(&sock, 7, "DIRECTIVE BODY", Duration::from_secs(3), kind),
+                None => inject_text(7, "DIRECTIVE BODY"),
+            };
+            stop();
+            let calls = calls.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            (r, calls)
+        };
+        let sends = |calls: &[(String, Value)]| -> Vec<Value> {
+            calls.iter().filter(|(m, _)| m == "surface.send_text").map(|(_, p)| p.clone()).collect()
+        };
+        let no_from_on_keys = |calls: &[(String, Value)]| {
+            for (m, p) in calls.iter().filter(|(m, _)| m == "surface.send_key") {
+                assert!(p.get("from").is_none(), "{m} 요청에 from 이 실렸다(send-key 는 무변경): {p}");
+            }
+        };
+        // ① pane 밖 · `inject_text` → `cli:inject`(수정 전: from 키 없음)
+        let (r, calls) = run_inject(None, None, 0, String::new(), None);
+        assert!(r.is_ok(), "{r:?}");
+        let s = sends(&calls);
+        assert_eq!(s.len(), 1, "{calls:?}");
+        assert_eq!(s[0]["from"], json!("cli:inject"), "{}", s[0]);
+        assert_eq!((s[0]["authoritative"].clone(), s[0]["quiet"].clone()), (json!(true), json!(true)));
+        no_from_on_keys(&calls);
+        // ② pane 밖 · `drain --verify` 경로(inject_text_on · kind "drain") → `cli:drain`
+        let (r, calls) = run_inject(None, None, 0, String::new(), Some("drain"));
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(sends(&calls)[0]["from"], json!("cli:drain"));
+        no_from_on_keys(&calls);
+        // ③ pane 밖 · env 라벨 → 살균한 `cli:<값>`(kind 보다 env 가 이긴다)
+        let (r, calls) = run_inject(None, Some("backup job!"), 0, String::new(), Some("inject"));
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(sends(&calls)[0]["from"], json!("cli:backupjob"));
+        // ④ pane 안 — from 키 자체가 없다: 종전 바이트(요청 전문 일치)
+        let (r, calls) = run_inject(Some("surface:9"), Some("ignored"), 0, String::new(), None);
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(
+            sends(&calls)[0],
+            json!({"surface_id": 7, "text": cys::paste_fence::wrap("DIRECTIVE BODY"), "quiet": true, "authoritative": true}),
+            "pane 안 inject 요청 바이트가 달라졌다"
+        );
+        no_from_on_keys(&calls);
+        // ⑤ pane 밖 · 타이핑 가드 거부 → 큐 1회 전환: 직접 요청은 `cli:inject` · 폴백은 기존 라벨 그대로
+        let draft = format!("{} [{}:human_draft]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG);
+        let (r, calls) = run_inject(None, None, 1, draft, None);
+        assert!(r.is_ok(), "{r:?}");
+        let s = sends(&calls);
+        assert_eq!(s.len(), 2, "{calls:?}");
+        assert_eq!(s[0]["from"], json!("cli:inject"), "{}", s[0]);
+        assert_eq!(
+            (s[1]["queued"].clone(), s[1]["from"].clone()),
+            (json!(true), json!("inject(typing_guard fallback)")),
+            "타이핑 가드 폴백의 기존 라벨은 무변경: {}",
+            s[1]
+        );
+    }
+
+    /// ★(J3) 배선 소스 핀 — ⓐ `cys send` 의 직접 요청과 큐 전환 폴백이 **같은** `from`(`send_from_param`)을 쓴다 ⓑ inject 두 경로는 직접 `surface.send_text`
+    /// 한 곳만 라벨 래퍼를 지난다(제출 Return·큐 폴백 라벨 무변경) ⓒ `drain --verify`(`RealVerifyIo::inject`)는 kind `"drain"` ⓓ `send-key` 요청 조립에는
+    /// 라벨 코드가 없다(기존 핀 유지 — 큐 요청에 from 없음 · 비큐는 숫자만).
+    #[test]
+    fn j3_label_wiring_source_pin() {
+        let src = include_str!("cys.rs");
+        let arm = src
+            .split("Command::Send { surface, to, queued, clear_first, stdin, file, text } => {")
+            .nth(1)
+            .expect("Command::Send arm");
+        let arm = arm.split("Command::SendKey").next().unwrap();
+        assert!(arm.contains("let from = send_from_param("), "Send 의 from 이 라벨 판정을 거치지 않는다");
+        assert_eq!(arm.matches("\"from\": from,").count(), 2, "직접 요청과 큐 전환 폴백이 같은 from 값을 쓰지 않는다");
+        let it = item_body(src, "\nfn inject_text(sid: u64");
+        assert_eq!(it.matches("inject_params_with_sender(").count(), 1, "inject_text 의 라벨 래퍼는 직접 붙여넣기 요청 한 곳");
+        assert!(it.contains("\"inject\","), "inject_text 의 kind 는 inject");
+        assert!(it.contains("\"from\": \"inject(typing_guard fallback)\""), "타이핑 가드 폴백 라벨은 무변경");
+        let ot = item_body(src, "\nfn inject_text_on(");
+        assert_eq!(ot.matches("inject_params_with_sender(").count(), 1, "inject_text_on 의 라벨 래퍼는 직접 붙여넣기 요청 한 곳");
+        assert!(ot.contains("            kind,\n"), "inject_text_on 은 호출자가 준 kind 를 그대로 쓴다");
+        for body in [it, ot] {
+            for (i, _) in body.match_indices("\"surface.send_key\"") {
+                let req = &body[i..body[i..].find(')').map_or(body.len(), |e| i + e)];
+                assert!(!req.contains("from"), "제출 Return 요청에 from 이 실렸다: {req}");
+            }
+        }
+        let rv = src.split("impl VerifyIo for RealVerifyIo {").nth(1).expect("RealVerifyIo");
+        let rv = rv.split("\nstruct ").next().unwrap_or(rv);
+        let inject = &rv[..rv.find("fn read_screen(").expect("read_screen")];
+        assert!(inject.contains("inject_text_on(socket, sid, text, timeout, \"drain\")"), "drain --verify 경로의 kind 가 drain 이 아니다");
+        // send-key: 라벨 코드 없음.
+        let karm = src.split("Command::SendKey { surface, to, queued, keys } => {").nth(1).expect("SendKey arm");
+        let karm = karm.split("Command::SetStatus").next().unwrap();
+        let helper = item_body(src, "\nfn send_key_request_params(");
+        let helper = &helper[..helper.find("\n}\n").expect("함수 끝")]; // 뒤따르는 라벨 함수의 문서 주석은 제외
+        for banned in ["unverified_sender_label", "send_from_param", "with_unverified_sender", "inject_params_with_sender", "ENV_SENDER_LABEL"] {
+            assert!(!karm.contains(banned) && !helper.contains(banned), "send-key 경로에 라벨 코드({banned})가 들어왔다");
+        }
     }
 
     /// ★(0.14.42 · 통합 minor 정리) 소스 핀 — 비테스트 코드의 **모든 권위 직접 붙여넣기**(`"text": … "authoritative": true`)가

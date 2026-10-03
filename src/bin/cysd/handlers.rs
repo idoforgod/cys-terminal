@@ -2670,6 +2670,26 @@ fn claimed_from_sid(params: &Value) -> Option<u64> {
     })
 }
 
+/// ★(0.14.43 · J3) 직접 전송 배달 원장의 가산 키 `from_label` 재료(순수) — **검증 신원이 없고** 요청의 `from` 이 문자열이며 좌석 표기
+/// (`cys::parse_surface_ref` — `surface:N`·`N`)가 아닐 때만 그 문자열(제어문자 제거 · 64자 절단), 아니면 `None`.
+///
+/// 큐 경로의 `from_label`(`delivery::split_queue_from` — 임의 문자열은 원장 `from` 이 아니라 `from_label` 로)과 같은 뜻이다: pane 밖 CLI 가 싣는
+/// 표시용 라벨(`cli:send`·`cli:inject`·`cli:drain` …)을 원장에 남겨 "누가 보냈나" 가 null 로만 남지 않게 한다. 라벨은 **표시·감사용**이다 — 원장 `from`
+/// (검증 좌석, 없으면 `claimed_from_sid` 가 읽은 좌석 자기신고)의 값·의미는 그대로고, ACL·게이트·짝 Return·잔여 소유 판정은 이 값을 보지 않는다.
+/// 검증 신원이 있으면 요청의 `from`(라벨 포함)은 무시된다(커널 peer 가 이긴다 · 위조 불가) — 그래서 이 함수는 검증 신원이 있으면 `None` 이다.
+/// 라벨이 없는 행은 `from_label` 키를 싣지 않는다(종전 바이트 · 키 부재 = null 판독 — 원장은 회전 예산이 빠듯해 행마다 키를 늘리지 않는다).
+fn direct_send_from_label(verified_from: Option<u64>, params: &Value) -> Option<String> {
+    if verified_from.is_some() {
+        return None;
+    }
+    let s = params.get("from")?.as_str()?;
+    if cys::parse_surface_ref(s).is_some() {
+        return None; // 좌석 자기신고는 라벨이 아니다 — 원장 `from`(claimed_from_sid)이 이미 그 뜻을 담는다.
+    }
+    let clean: String = s.chars().filter(|c| !c.is_control()).take(64).collect();
+    (!clean.is_empty()).then_some(clean)
+}
+
 /// ★(0.14.42 · B2) 짝 Return 흡수 표의 발신자 키(순수) — 검증 신원이 있으면 **그것만**(`Verified` · 요청의 from
 /// 은 보지 않는다 = 로컬 좌석은 무엇을 자기신고해도 남의 표를 열거나 쓰지 못한다), 없을 때만 자기신고
 /// (`Claimed`). `claimed` 클로저는 검증 신원이 없을 때만 부른다.
@@ -5888,19 +5908,31 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // ★(B2) 자기신고 from 해석은 `claimed_from_sid` 단일 정의처(짝 Return 표의 Claimed 키와 같은 규칙 ·
                 //   의미 동일 치환 — u64 · "surface:N" · "N").
                 let from_sid = verified_from.or_else(|| claimed_from_sid(&params));
-                crate::delivery::record_audited(
-                    daemon,
-                    sid,
-                    &text,
-                    // ★R5: GUI 자동 주입은 `gui_auto` 로 남긴다 — 원장만 봐도 "사람이 친 것이
-                    //   아니라 UI 가 만든 문안"임이 드러나야 감사가 성립한다.
-                    if machine_origin {
-                        crate::delivery::Origin::GuiAuto
-                    } else {
-                        crate::delivery::Origin::Send
-                    },
-                    from_sid,
-                );
+                // ★R5: GUI 자동 주입은 `gui_auto` 로 남긴다 — 원장만 봐도 "사람이 친 것이
+                //   아니라 UI 가 만든 문안"임이 드러나야 감사가 성립한다.
+                let ledger_origin = if machine_origin {
+                    crate::delivery::Origin::GuiAuto
+                } else {
+                    crate::delivery::Origin::Send
+                };
+                // ★(0.14.43 · J3) 검증 신원이 없고 요청의 `from` 이 좌석 표기가 아닌 문자열(pane 밖 CLI 의 표시용 라벨 `cli:…`)이면 원장에
+                //   가산 키 `from_label` 로 남긴다 — `from`(좌석)의 값·의미는 무변경이고 판정(ACL·게이트·짝 Return)은 이 값을 보지 않는다.
+                //   라벨이 없는 행은 종전 호출 그대로(키 추가 0 · 종전 바이트).
+                match direct_send_from_label(verified_from, &params) {
+                    Some(label) => {
+                        crate::delivery::record_audited_with(
+                            daemon,
+                            sid,
+                            &text,
+                            ledger_origin,
+                            from_sid,
+                            &json!({"from_label": label}),
+                        );
+                    }
+                    None => {
+                        crate::delivery::record_audited(daemon, sid, &text, ledger_origin, from_sid);
+                    }
+                }
             }
             // clear_first면 원자 Inject(Ctrl-U 선정리 → paste → CR 제출)로, 아니면 현행 Data(원시
             // 바이트, 제출은 별도 send_key Return)로. 단일 try_send이라 부분 전달(clear만 들어가고
@@ -16359,6 +16391,273 @@ mod tests {
         assert_ne!(Verified(3), Claimed(3), "같은 번호라도 다른 키");
         assert_eq!(Claimed(7).sid(), 7);
         assert!(!Claimed(7).is_verified() && Verified(7).is_verified());
+    }
+
+    // ───────── ★(0.14.43 · J3) pane 밖 발신자의 표시용 라벨 — 데몬 쪽 핀 ─────────
+    //
+    // 데몬의 판정 경로(검증 신원 우선 · `claimed_from_sid` · ACL · 게이트 · 병합 규칙)는 **무변경**이다. CLI 가 pane 밖 요청의 `from` 에 라벨 문자열
+    // (`cli:send` · `cli:inject` · `cli:drain`)을 싣게 되면서 `None` → `Some("cli:…")` 로 바뀌는 입력의 소비처 전수(WORKLOG 감사 표)를 아래 검체가
+    // 실행으로 잠근다 — 달라지는 것은 표시(다이제스트 머리 · 이벤트·원장의 from 표기)뿐이고 허가·거부·귀속 판정은 같다.
+
+    /// 배달 원장(jsonl)의 레코드 전부를 JSON 으로 읽는다(격리 상태 디렉터리 · 조각 레코드 포함).
+    fn j3_ledger_rows(daemon: &Arc<Daemon>) -> Vec<Value> {
+        std::fs::read_to_string(crate::delivery::ledger_path(&daemon.socket_path))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect()
+    }
+
+    /// 본문 `text` 의 **전문 레코드**(조각 아님 · `part` 키 없음) — sha256 으로 찾는다.
+    fn j3_full_row(daemon: &Arc<Daemon>, text: &str) -> Value {
+        let want = json!(crate::delivery::digest(text));
+        j3_ledger_rows(daemon)
+            .into_iter()
+            .find(|r| r["sha256"] == want && r.get("part").is_none())
+            .unwrap_or_else(|| panic!("원장에 전문 레코드가 없다: {text}"))
+    }
+
+    /// 마지막으로 발행된 `name` 이벤트의 payload.
+    fn j3_last_event(daemon: &Arc<Daemon>, name: &str) -> Value {
+        daemon
+            .bus
+            .tail(200)
+            .into_iter()
+            .filter(|ev| ev["name"] == json!(name))
+            .last()
+            .map(|ev| ev["payload"].clone())
+            .unwrap_or_else(|| panic!("{name} 이벤트가 없다"))
+    }
+
+    /// ★(J3) pane 밖 `cys send --queued` 의 `from:"cli:send"` — 큐 항목 `from == Some("cli:send")` · `queue.enqueued` 의 from · 병합 배달 머리말
+    /// `발신 cli:send`(종전 `발신 unknown`) · 배달 원장 `from` null + `from_label == "cli:send"`. 큐 경로는 데몬 변경 0 이다 — 이 검체는 CLI 가 의존하는
+    /// 기존 거동의 박제이고(돌연변이 M3: 큐 경로가 요청의 from 문자열을 버리면 적색), 직접 전송 원장 키는 아래 검체가 새로 잠근다.
+    #[test]
+    fn j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("j3-queue", r#"{"default":"allow","rules":[]}"#);
+        let target = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-1".into()), 24, 80)
+            .expect("create target");
+        daemon.surfaces.lock().unwrap().insert(target.id, target.clone());
+        let enqueue = |text: &str, from: Value| {
+            let Reply::Single(r) = dispatch(
+                &daemon,
+                Request {
+                    id: json!(1),
+                    method: "surface.send_text".into(),
+                    params: json!({"surface_id": target.id, "text": text, "queued": true, "from": from}),
+                },
+                None, // pane 밖 — 검증할 좌석이 없다
+            ) else {
+                panic!("single reply")
+            };
+            assert_eq!(r["ok"], json!(true), "큐 전송이 성공해야 한다: {r}");
+        };
+        enqueue("J3 첫째", json!("cli:send"));
+        enqueue("J3 둘째", json!("cli:send"));
+        // ① 큐 항목 from == Some("cli:send") — 검증 신원이 없을 때만 요청의 from 문자열을 본다.
+        {
+            let q = target.pending_queue.lock().unwrap();
+            let froms: Vec<Option<String>> = q.iter().map(|e| e.from.clone()).collect();
+            assert_eq!(froms, vec![Some("cli:send".to_string()), Some("cli:send".to_string())]);
+        }
+        // ② queue.enqueued 페이로드의 from 은 요청 값 그대로.
+        assert_eq!(j3_last_event(&daemon, "queue.enqueued")["from"], json!("cli:send"));
+        // ③ 병합 배달 — 같은 라벨 둘은 한 턴 · 머리말 `발신 cli:send`.
+        let d = crate::governance::deliver_head_locked(&daemon, &target, false, false, None, None, None, None)
+            .expect("병합 배달");
+        assert_eq!(d.merged_ids.len(), 2, "같은 라벨 둘은 한 다이제스트로 묶인다");
+        assert!(d.body.starts_with("[큐 다이제스트 2건 · 발신 cli:send]\n"), "{}", d.body);
+        // ④ 원장: 좌석 from 은 null · 라벨은 from_label.
+        let rec = j3_full_row(&daemon, &d.body);
+        assert_eq!(rec["origin"], json!("queue"));
+        assert!(rec["from"].is_null(), "라벨은 원장 from(좌석)에 들어가지 않는다: {rec}");
+        assert_eq!(rec["from_label"], json!("cli:send"), "{rec}");
+        d12_cleanup(&daemon, &dir);
+    }
+
+    /// ★(J3) 직접 전송 원장의 가산 키 `from_label` — 검증 신원이 **없을 때만** 요청 `from` 의 라벨 문자열이 실린다. 검증 신원이 있으면 `from` 은 검증
+    /// 좌석이고 요청의 라벨은 무시된다(커널 peer 가 이긴다 · 위조 불가). 좌석 자기신고(`surface:N`·숫자)는 라벨이 아니라 종전대로 원장 `from`(claimed)이다.
+    /// 라벨 없는 행은 `from_label` 키가 없다(종전 바이트). 수정 전 코드에서는 첫 단언(`from_label == "cli:inject"`)에서 적색이다.
+    #[test]
+    fn j3_direct_send_ledger_from_label_only_without_verified_identity() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("j3-direct", r#"{"default":"allow","rules":[]}"#);
+        let send = |pid: Option<u32>, target: u64, text: &str, extra: Value| -> Value {
+            let mut params = json!({"surface_id": target, "text": text});
+            if let Some(o) = extra.as_object() {
+                for (k, v) in o {
+                    params[k.as_str()] = v.clone();
+                }
+            }
+            let Reply::Single(r) = dispatch(
+                &daemon,
+                Request { id: json!(1), method: "surface.send_text".into(), params },
+                pid,
+            ) else {
+                panic!("single reply")
+            };
+            assert_eq!(r["ok"], json!(true), "직접 전송이 성공해야 한다: {r}");
+            r
+        };
+        // ① 검증 신원 없음(pane 밖) + inject 계열 라벨 → 원장 `from` null · `from_label == "cli:inject"`.
+        let t1 = v7_pane(&daemon, "worker-1", 999_630);
+        send(None, t1.id, "J3 pane 밖 inject 본문", json!({"from": "cli:inject", "quiet": true, "authoritative": true}));
+        let rec = j3_full_row(&daemon, "J3 pane 밖 inject 본문");
+        assert_eq!(rec["origin"], json!("send"));
+        assert!(rec["from"].is_null(), "라벨은 원장 from(좌석)에 들어가지 않는다: {rec}");
+        assert_eq!(rec["from_label"], json!("cli:inject"), "{rec}");
+        // ② `cys send` 계열(비quiet): 원장 + `surface.input_injected` 이벤트의 from(원문 라벨 · from_verified=false).
+        let t2 = v7_pane(&daemon, "worker-2", 999_631);
+        send(None, t2.id, "J3 pane 밖 send 본문", json!({"from": "cli:send"}));
+        let rec = j3_full_row(&daemon, "J3 pane 밖 send 본문");
+        assert!(rec["from"].is_null() && rec["from_label"] == json!("cli:send"), "{rec}");
+        let ev = j3_last_event(&daemon, "surface.input_injected");
+        assert_eq!((ev["from"].clone(), ev["from_verified"].clone()), (json!("cli:send"), json!(false)), "{ev}");
+        // ③ 검증 신원 있음 — 요청이 라벨을 실어도 원장 `from` 은 검증 좌석 · `from_label` 은 없다. 이벤트도 검증 좌석이 이긴다.
+        let sender = v7_pane(&daemon, "worker-3", 999_632);
+        let t3 = v7_pane(&daemon, "worker-4", 999_633);
+        send(Some(999_632), t3.id, "J3 검증된 발신 본문", json!({"from": "cli:inject", "quiet": true}));
+        let rec = j3_full_row(&daemon, "J3 검증된 발신 본문");
+        assert_eq!(rec["from"], json!(sender.id.to_string()), "검증 좌석이 원장 from 이다: {rec}");
+        assert!(rec["from_label"].is_null(), "검증 신원이 있으면 요청의 라벨은 무시된다: {rec}");
+        let t4 = v7_pane(&daemon, "worker-5", 999_634);
+        send(Some(999_632), t4.id, "J3 검증된 발신 이벤트", json!({"from": "cli:send"}));
+        let ev = j3_last_event(&daemon, "surface.input_injected");
+        assert_eq!((ev["from"].clone(), ev["from_verified"].clone()), (json!(sender.id), json!(true)), "{ev}");
+        // ④ 좌석 자기신고(교차 소켓 CEO 등)는 라벨이 아니다 — 종전대로 원장 `from`(claimed) · `from_label` 없음.
+        let t5 = v7_pane(&daemon, "worker-6", 999_635);
+        send(None, t5.id, "J3 좌석 자기신고 본문", json!({"from": "surface:900"}));
+        let rec = j3_full_row(&daemon, "J3 좌석 자기신고 본문");
+        assert_eq!(rec["from"], json!("900"), "{rec}");
+        assert!(rec["from_label"].is_null(), "{rec}");
+        // ⑤ from 없음 — 종전 바이트(from null · from_label 키 자체가 없다).
+        let t6 = v7_pane(&daemon, "worker-7", 999_636);
+        send(None, t6.id, "J3 from 없는 본문", json!({}));
+        let rec = j3_full_row(&daemon, "J3 from 없는 본문");
+        assert!(rec["from"].is_null(), "{rec}");
+        assert!(rec.get("from_label").is_none(), "라벨 없는 행에 키가 늘었다(종전 바이트 훼손): {rec}");
+        d12_cleanup(&daemon, &dir);
+    }
+
+    /// ★(J3) `direct_send_from_label` 순수 진리표 — 검증 신원 우선 · 좌석 표기(`parse_surface_ref`)는 라벨이 아니다 · 제어문자 제거 · 64자 절단(글자 단위).
+    #[test]
+    fn j3_direct_send_from_label_truth_table() {
+        let l = |v: Option<u64>, p: Value| direct_send_from_label(v, &p);
+        assert_eq!(l(Some(3), json!({"from": "cli:inject"})), None, "검증 신원이 있으면 요청의 from 은 라벨이어도 무시");
+        assert_eq!(l(None, json!({"from": "cli:inject"})), Some("cli:inject".to_string()));
+        for seat in [json!("surface:7"), json!("7"), json!(7), json!(" 7 "), json!(0)] {
+            assert_eq!(l(None, json!({"from": seat.clone()})), None, "좌석 자기신고는 라벨이 아니다: {seat}");
+        }
+        for none in [json!({}), json!({"from": null}), json!({"from": ""}), json!({"from": true}), json!({"from": -3})] {
+            assert_eq!(l(None, none.clone()), None, "{none}");
+        }
+        assert_eq!(l(None, json!({"from": "cli:a\u{7}b\n\u{1b}[31mc"})), Some("cli:ab[31mc".to_string()), "제어문자(BEL·LF·ESC)는 제거");
+        assert_eq!(l(None, json!({"from": "\n\t\u{1b}"})), None, "제어문자뿐이면 라벨 없음");
+        let long = format!("cli:{}", "x".repeat(100));
+        let got = l(None, json!({"from": long})).expect("긴 라벨");
+        assert_eq!((got.chars().count(), got.starts_with("cli:xxx")), (64, true), "64자 절단: {got}");
+        let kr = l(None, json!({"from": "가".repeat(80)})).expect("멀티바이트 라벨");
+        assert_eq!(kr.chars().count(), 64, "글자 단위 절단(바이트 아님 — 문자 경계 패닉 없음)");
+    }
+
+    /// ★(J3) 감사의 실행판 — `None` → `Some("cli:…")` 가 되어도 **판정은 같다**. 라벨은 좌석 자기신고가 아니고(`claimed_from_sid`), 짝 Return 키·잔여 소유
+    /// 귀속·만료 통지 발신자·`queue.revive` 허가/거부·순서 역전 관측이 `from` 결측과 같게 흐른다. 달라지는 것은 ① 표시(다이제스트 머리 `unknown` → 라벨)
+    /// ② `queue.revive` **거부 사유 문자열**(`unknown_from_…` → `label_from_…` — 둘 다 master 전용 거부) ③ 같은-발신자 병합의 **입력**(라벨 둘은 묶이고
+    /// 라벨과 결측은 갈린다 — 규칙은 무변경)뿐이다. 돌연변이 M2/M3 와 별개로 이 표가 갈리면 그 소비처의 분기가 바뀐 것이다.
+    #[test]
+    fn j3_label_is_never_a_seat_claim_and_consumers_match_the_null_case() {
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("j3-audit", r#"{"default":"allow","rules":[]}"#);
+        let labels = ["cli", "cli:send", "cli:inject", "cli:drain", "cli:7", "cli:surface7", "cli:master", "cli:backupjob"];
+        // ⓐ 좌석 자기신고 해석(짝 Return 키·원장 from·잔여 소유의 재료) — 라벨은 결측과 같다(None).
+        for lb in labels {
+            let p = json!({"from": lb});
+            assert_eq!(claimed_from_sid(&p), None, "{lb}");
+            assert_eq!(claimed_from_sid(&p), claimed_from_sid(&json!({})), "{lb}");
+            // 짝 Return 표 키 — 결측과 같다(None). 대조군: 숫자 자기신고는 Claimed.
+            assert_eq!(request_pair_key(&daemon, None, &p), request_pair_key(&daemon, None, &json!({})), "{lb}");
+            assert_eq!(request_pair_key(&daemon, None, &p), None, "{lb}");
+            // 잔여 소유 귀속 — 결측과 같은 Unattributed(대조군: 숫자는 Claimed).
+            let owner = residue_owner(None, false, false, || false, || claimed_from_sid(&p));
+            assert_eq!(owner, Some(crate::governance::InputOwner::Unattributed), "{lb}");
+        }
+        assert_eq!(
+            request_pair_key(&daemon, None, &json!({"from": 900})),
+            Some(crate::state::PairKey::Claimed(900)),
+            "대조군: 숫자 자기신고는 여전히 Claimed 키"
+        );
+        assert_eq!(
+            residue_owner(None, false, false, || false, || claimed_from_sid(&json!({"from": 900}))),
+            Some(crate::governance::InputOwner::Claimed(900)),
+            "대조군: 숫자 자기신고는 여전히 Claimed 귀속"
+        );
+        // ⓑ 만료 통지 발신자(`split_queue_from(..).0`) — 라벨도 결측도 None(이벤트만으로 통지 완료).
+        for lb in labels {
+            assert_eq!(crate::delivery::split_queue_from(Some(lb)).0, crate::delivery::split_queue_from(None).0, "{lb}");
+            assert_eq!(crate::delivery::split_queue_from(Some(lb)), (None, Some(lb.to_string())), "라벨은 원장 from_label 로 분리: {lb}");
+        }
+        assert_eq!(crate::delivery::split_queue_from(None), (None, None));
+        // ⓒ queue.revive 허가/거부 — 호출자 부류 전부에서 라벨과 결측의 판정(허가/거부)이 같다. 갈리는 것은 거부 사유 문자열 하나.
+        let callers: [(Option<u32>, Option<u64>, Option<&str>); 6] = [
+            (None, None, None),                 // 데몬 내부·pane 밖 CLI — 통과
+            (Some(7), None, None),              // pid 는 있는데 좌석 미해석 — 거부(caller_unresolved)
+            (Some(7), Some(9), Some("master")), // master — 통과
+            (Some(7), Some(9), Some("worker")), // 일반 좌석 — 거부
+            (Some(7), Some(9), Some("cso")),    // cso — 거부(master 전용)
+            (Some(7), Some(9), None),           // 역할 없는 좌석 — 거부
+        ];
+        for (pid, csid, role) in callers {
+            let none = revive_denial(pid, csid, role, None);
+            let label = revive_denial(pid, csid, role, Some("cli:send"));
+            assert_eq!(none.is_some(), label.is_some(), "허가/거부 판정이 갈린다: {pid:?} {csid:?} {role:?}");
+        }
+        assert_eq!(revive_denial(Some(7), Some(9), Some("worker"), None), Some("unknown_from_requires_master"));
+        assert_eq!(
+            revive_denial(Some(7), Some(9), Some("worker"), Some("cli:send")),
+            Some("label_from_requires_master"),
+            "표시 사유 문자열만 갈린다(둘 다 master 전용 거부)"
+        );
+        // ⓓ 같은-발신자 병합(plan_queue_merge · render_queue_digest) — 규칙 무변경 · 입력만 라벨. 라벨 둘 = 묶임 · 결측 둘 = 묶임(종전) · 라벨↔결측 = 갈림.
+        let origins = vec!["send".to_string(), "send".to_string()];
+        let merge = |a: Option<&str>, b: Option<&str>| {
+            crate::governance::plan_queue_merge(
+                &[a.map(str::to_string), b.map(str::to_string)],
+                &origins,
+                &[5, 5],
+                5,
+                4000,
+            )
+        };
+        assert_eq!(merge(Some("cli:send"), Some("cli:send")), vec![0, 1]);
+        assert_eq!(merge(None, None), vec![0, 1], "종전: 결측 둘도 묶였다");
+        assert_eq!(merge(Some("cli:send"), None), vec![0]);
+        assert_eq!(merge(None, Some("cli:send")), vec![0]);
+        assert_eq!(merge(Some("cli:send"), Some("cli:inject")), vec![0], "다른 라벨은 묶이지 않는다");
+        let texts = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            crate::governance::render_queue_digest(Some("cli:send"), &texts),
+            "[큐 다이제스트 2건 · 발신 cli:send]\n[1/2] a\n[2/2] b\n"
+        );
+        assert!(crate::governance::render_queue_digest(None, &texts).starts_with("[큐 다이제스트 2건 · 발신 unknown]\n"));
+        // ⓔ 순서 역전 관측(`queue.order_inverted`) — 같은 *검증* 발신자의 대기분에만 걸린다. 라벨 항목은 어떤 검증 발신자와도 같지 않다(결측과 같다).
+        let order_inverted = |from: Option<String>, pid: u32| -> bool {
+            let target = v7_pane(&daemon, &format!("j3-target-{pid}"), pid);
+            let sender = v7_pane(&daemon, &format!("j3-sender-{pid}"), pid + 1);
+            let from = from.map(|f| f.replace("{sender}", &cys::surface_ref(sender.id)));
+            let e = daemon.next_queue_entry("[보고] 대기분".into(), from, "send");
+            target.pending_queue.lock().unwrap().push_back(e);
+            let r = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({"surface_id": target.id, "text": "[지시] 직접"}));
+            assert_eq!(r["ok"], json!(true), "{r}");
+            daemon.bus.tail(200).iter().any(|ev| {
+                ev["name"] == json!("queue.order_inverted") && ev["payload"]["surface_ref"] == json!(cys::surface_ref(target.id))
+            })
+        };
+        assert!(order_inverted(Some("{sender}".to_string()), 999_640), "대조군: 같은 검증 발신자의 대기분이면 관측된다");
+        assert!(!order_inverted(Some("cli:send".to_string()), 999_650), "라벨 항목은 역전 관측 대상이 아니다");
+        assert!(!order_inverted(None, 999_660), "결측 항목도 마찬가지(종전)");
+        d12_cleanup(&daemon, &dir);
     }
 
     /// 프로덕션 구간 소스 핀: 흡수 판정은 ACL **뒤**·queued 팔 **앞**이고, 표 락은 input_gate 안에서
