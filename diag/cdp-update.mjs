@@ -5,7 +5,11 @@
 // RFC 6455 over node:http upgrade, NO extensions offered) because Node's global WebSocket (undici) offers
 // 'permessage-deflate' and Chromium's DevTools server would accept it. The global WebSocket stays as a fallback.
 //
-//   node cdp-update.mjs --port 9333 --out <dir> [--prefix e2e] [--mode update|version] [--max-wait-sec 720] [--ws mini|native]
+//   node cdp-update.mjs --port 9333 --out <dir> [--prefix e2e] [--mode update|version|attach] [--max-wait-sec 720] [--ws mini|native]
+//   mode update (default): attach, app version, screenshot, check_update, listeners, install_update {force:true}
+//   mode version:          attach and read the app version only (<prefix>-cdp-after.json)
+//   mode attach:           attach, app version, screenshot, check_update - and STOP (install_update is NOT called);
+//                          used by sacreal-e2e.ps1 before Smart App Control is turned on
 //
 // Success path of install_update = the app exits by itself, so the socket closing is an expected result.
 // The result file <out>/<prefix>-cdp.json is rewritten after every step so partial results survive any kill.
@@ -701,6 +705,11 @@ async function main() {
   } catch (e) {
     R.check_update_error = String(e && e.message ? e.message : e);
     fail('check_update', e);
+  }
+
+  if (MODE === 'attach') {
+    step('attach mode: stopping before listeners / install_update');
+    return;
   }
 
   // 5. listeners

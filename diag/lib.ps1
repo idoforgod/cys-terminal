@@ -1053,3 +1053,242 @@ function Select-Props {
     }
     return $o
 }
+
+# ---------------------------------------------------------------------------
+# shared by sacrules.ps1 and sacreal-e2e.ps1: probe result helpers, event -> subject matrix, events json, id counts.
+# Moved VERBATIM from sacrules.ps1 (one copy instead of two); the text of every function is unchanged.
+# ---------------------------------------------------------------------------
+# probes, EA, event -> subject matching
+# ---------------------------------------------------------------------------
+# CreateProcessW failures that clearly are not an App Control block (missing file, sharing violation, bad image,
+# elevation, invalid parameter); everything else counts as 'blocked' for the control interpretation.
+function Test-ProbeBlocked {
+    param($Rec)
+    if ($null -eq $Rec) { return $false }
+    if ($Rec['ok'] -ne $false) { return $false }
+    $notBlock = @(2, 3, 32, 87, 123, 193, 216, 740)
+    return ($notBlock -notcontains [int]$Rec['last_error'])
+}
+
+function Get-ProbeShort {
+    param($Rec)
+    if ($null -eq $Rec) { return '-' }
+    if ($Rec['ok'] -eq $true) { return 'ok' }
+    if ($Rec['ok'] -eq $false) { return ('ERR{0}' -f $Rec['last_error']) }
+    return 'n/a'
+}
+
+function Invoke-ProbePass {
+    param([string]$PassName, $Subs, [int]$BudgetSec, $Store)
+    $deadline = (Get-Date).AddSeconds($BudgetSec)
+    $done = 0
+    $skipped = 0
+    $ordered = New-Object System.Collections.Generic.List[object]
+    foreach ($s in $Subs) { if ([string]$s.kind -ne 'bundled-0.14.42') { $ordered.Add($s) } }
+    foreach ($s in $Subs) { if ([string]$s.kind -eq 'bundled-0.14.42') { $ordered.Add($s) } }
+    foreach ($s in $ordered) {
+        if ((Get-Date) -gt $deadline) { $skipped++; continue }
+        $rec = Invoke-ProbeCreate ([string]$s.path)
+        $Store[[string]$s.label] = $rec
+        $done++
+    }
+    return [ordered]@{ pass = $PassName; probed = $done; skipped_for_budget = $skipped; budget_sec = $BudgetSec }
+}
+
+function Get-EaText {
+    param([string]$Path)
+    $fs = Join-Path $env:windir 'System32\fsutil.exe'
+    $r = Invoke-Proc -File $fs -Arguments ('file queryEA "{0}"' -f $Path) -TimeoutSec 30
+    return ('rc={0} startError={1}' -f $r.rc, $r.startError) + "`r`n" + [string]$r.out + [string]$r.err
+}
+
+function Get-NormPath {
+    param([string]$P)
+    if (-not $P) { return '' }
+    $x = $P.ToLowerInvariant()
+    $x = [regex]::Replace($x, '^\\device\\harddiskvolume\d+', '')
+    $x = [regex]::Replace($x, '^\\\?\?\\', '')
+    $x = [regex]::Replace($x, '^[a-z]:', '')
+    return $x
+}
+
+# candidate file paths of one event: prefer 'File Name'-like fields, else every path-like value
+function Get-EventPaths {
+    param($Ev)
+    $pref = New-Object System.Collections.Generic.List[string]
+    $any = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($k in $Ev.fields.Keys) {
+            $v = [string]$Ev.fields[$k]
+            if (-not $v) { continue }
+            if (($v.IndexOf('\') -ge 0) -and (($v -match '(?i)\.(exe|dll|sys|msi|ocx)\s*$') -or $v.StartsWith('\Device\'))) {
+                $any.Add($v)
+                if ([string]$k -match '(?i)^(file\s*name|filename|image\s*name|target\s*path|path)$') { $pref.Add($v) }
+            }
+        }
+        if ($any.Count -eq 0) {
+            foreach ($m in [regex]::Matches([string]$Ev.xml, '\\Device\\HarddiskVolume\d+\\[^<>"'']+')) { $any.Add($m.Value) }
+        }
+    } catch { }
+    if ($pref.Count -gt 0) { return $pref.ToArray() }
+    return $any.ToArray()
+}
+
+function Get-FieldValues {
+    param($Ev, [string]$KeyRegex)
+    $out = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($k in $Ev.fields.Keys) {
+            if ([string]$k -match $KeyRegex) { $out.Add([string]$Ev.fields[$k]) }
+        }
+    } catch { }
+    return $out.ToArray()
+}
+
+function Build-Matrix {
+    param($Subs, $Events, $Probe1, $Probe2, [string]$Phase, [string]$Prefix)
+    $byPath = @{}
+    $byName = @{}
+    $dupName = @{}
+    foreach ($s in $Subs) {
+        $np = Get-NormPath ([string]$s.path)
+        if ($np) { $byPath[$np] = [string]$s.label }
+        if ([string]$s.kind -ne 'bundled-0.14.42') {
+            $nm = [System.IO.Path]::GetFileName([string]$s.path).ToLowerInvariant()
+            if ($byName.ContainsKey($nm)) { $dupName[$nm] = $true } else { $byName[$nm] = [string]$s.label }
+        }
+    }
+    foreach ($k in @($dupName.Keys)) { $byName.Remove($k) }
+    $acc = @{}
+    foreach ($s in $Subs) {
+        $acc[[string]$s.label] = [ordered]@{ ev = [ordered]@{}; smartlocker = (New-Object System.Collections.Generic.List[string]); policies = (New-Object System.Collections.Generic.List[string]); via_activity = 0 }
+    }
+    $unmatched = [ordered]@{}
+    # pass 1: events that name a file (3076/3077 ...) are matched by path; remember their Correlation ActivityID
+    # pass 2: events without a file (3089 signature info correlates only through the ActivityID; 3090-3092 carry no path)
+    #         are attributed through that ActivityID
+    $items = New-Object System.Collections.Generic.List[object]
+    $actMap = @{}
+    foreach ($e in $Events) {
+        $label = $null
+        $paths = @(Get-EventPaths $e)
+        foreach ($raw in $paths) {
+            $np = Get-NormPath $raw
+            if ($byPath.ContainsKey($np)) { $label = $byPath[$np]; break }
+        }
+        if (-not $label) {
+            foreach ($raw in $paths) {
+                $nm = [System.IO.Path]::GetFileName(($raw -replace '/', '\')).ToLowerInvariant()
+                if ($nm -and $byName.ContainsKey($nm)) { $label = $byName[$nm]; break }
+            }
+        }
+        $act = ''
+        $am = [regex]::Match([string]$e.xml, 'ActivityID=[''"]([^''"]+)[''"]')
+        if ($am.Success) { $act = $am.Groups[1].Value }
+        if ($label -and $act -and (-not $actMap.ContainsKey($act))) { $actMap[$act] = $label }
+        $items.Add([pscustomobject]@{ e = $e; label = $label; act = $act; via = $false })
+    }
+    foreach ($it in $items) {
+        if ((-not $it.label) -and $it.act -and $actMap.ContainsKey($it.act)) { $it.label = $actMap[$it.act]; $it.via = $true }
+    }
+    foreach ($it in $items) {
+        $e = $it.e
+        $label = $it.label
+        $idk = [string]$e.id
+        if ($label) {
+            $a = $acc[$label]
+            if ($it.via) { $a['via_activity'] = [int]$a['via_activity'] + 1 }
+            if ($a['ev'].Contains($idk)) { $a['ev'][$idk] = [int]$a['ev'][$idk] + 1 } else { $a['ev'][$idk] = 1 }
+            $sv = @(Get-FieldValues $e '(?i)^PassesSmartlocker$')
+            if ($sv.Count -eq 0) { $sv = @(Get-FieldValues $e '(?i)smartlocker') }
+            foreach ($v in $sv) { if (-not $a['smartlocker'].Contains($v)) { $a['smartlocker'].Add($v) } }
+            foreach ($v in @(Get-FieldValues $e '(?i)policy\s*name')) { if (-not $a['policies'].Contains($v)) { $a['policies'].Add($v) } }
+        } else {
+            if ($unmatched.Contains($idk)) { $unmatched[$idk] = [int]$unmatched[$idk] + 1 } else { $unmatched[$idk] = 1 }
+        }
+    }
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($s in $Subs) {
+        $a = $acc[[string]$s.label]
+        $p1 = $null
+        $p2 = $null
+        if ($Probe1.ContainsKey([string]$s.label)) { $p1 = $Probe1[[string]$s.label] }
+        if ($Probe2.ContainsKey([string]$s.label)) { $p2 = $Probe2[[string]$s.label] }
+        $evs = $a['ev']
+        $rows.Add([ordered]@{
+            label = [string]$s.label; kind = [string]$s.kind; sig = [string]$s.sig; sha256 = [string]$s.sha256; path = [string]$s.path
+            probe1 = (Get-ProbeShort $p1); probe2 = (Get-ProbeShort $p2)
+            probe1_detail = $p1; probe2_detail = $p2
+            ev3076 = $(if ($evs.Contains('3076')) { [int]$evs['3076'] } else { 0 })
+            ev3077 = $(if ($evs.Contains('3077')) { [int]$evs['3077'] } else { 0 })
+            ev3089 = $(if ($evs.Contains('3089')) { [int]$evs['3089'] } else { 0 })
+            ev3090 = $(if ($evs.Contains('3090')) { [int]$evs['3090'] } else { 0 })
+            ev3091 = $(if ($evs.Contains('3091')) { [int]$evs['3091'] } else { 0 })
+            ev3092 = $(if ($evs.Contains('3092')) { [int]$evs['3092'] } else { 0 })
+            events_by_id = $evs
+            passesSmartlocker = $a['smartlocker'].ToArray()
+            policyNames = $a['policies'].ToArray()
+            events_attributed_via_activity_id = [int]$a['via_activity']
+        })
+    }
+    # control interpretation
+    $negRows = @($rows | Where-Object { $_['kind'] -eq 'control-neg' })
+    $posRows = @($rows | Where-Object { $_['kind'] -eq 'control-pos-unsigned' })
+    $blockEv = '3076'
+    if ($Phase -eq 'enforce') { $blockEv = '3077' }
+    $negBlocked = $false
+    foreach ($r0 in $negRows) { if ((($blockEv -eq '3076') -and ($r0['ev3076'] -gt 0)) -or (($blockEv -eq '3077') -and (($r0['ev3077'] -gt 0) -or (Test-ProbeBlocked $r0['probe1_detail'])))) { $negBlocked = $true } }
+    $posBlocked = $false
+    foreach ($r0 in $posRows) { if ((($blockEv -eq '3076') -and ($r0['ev3076'] -gt 0)) -or (($blockEv -eq '3077') -and (($r0['ev3077'] -gt 0) -or (Test-ProbeBlocked $r0['probe1_detail'])))) { $posBlocked = $true } }
+    $interp = 'indeterminate'
+    if ($negBlocked -and (-not $posBlocked)) { $interp = 'ISG appears to work and discriminates: NEG (fresh unsigned exe) is flagged, POS-UNSIGNED (widely used unsigned installer) is not' }
+    elseif ($negBlocked -and $posBlocked) { $interp = 'ISG NOT working (suspected): both NEG and POS-UNSIGNED are flagged - good reputation cannot be observed on this runner' }
+    elseif ((-not $negBlocked) -and (-not $posBlocked)) { $interp = 'POLICY NOT WORKING: neither NEG nor POS-UNSIGNED produced a block/audit-block signal' }
+    else { $interp = 'odd: POS-UNSIGNED flagged but NEG not flagged' }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine(('Matrix phase={0}  block event={1}  (p1/p2 = CreateProcessW(CREATE_SUSPENDED) pass 1 / pass 2; evXXXX = number of matching CodeIntegrity events)' -f $Phase, $blockEv))
+    [void]$sb.AppendLine('Control interpretation: ' + $interp)
+    [void]$sb.AppendLine('Note: events 3090-3092 (ISG / managed installer verdicts) may be absent on a hosted runner (TestFlags needs a reboot); their absence does not mean ISG was not consulted. 3089 and 309x are attributed to a file through the Correlation ActivityID of a path-matched 3076/3077.')
+    [void]$sb.AppendLine('')
+    $hdr = ('{0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9}' -f 'label'.PadRight(52), 'kind'.PadRight(20), 'sig'.PadRight(10), 'p1'.PadRight(8), 'p2'.PadRight(8), '3076', '3077', '309x(0/1/2)', '3089', 'passesSmartlocker')
+    [void]$sb.AppendLine($hdr)
+    foreach ($r0 in $rows) {
+        $lab = [string]$r0['label']
+        if ($lab.Length -gt 52) { $lab = $lab.Substring(0, 49) + '...' }
+        $sig = [string]$r0['sig']
+        if ($sig.Length -gt 10) { $sig = $sig.Substring(0, 10) }
+        $line = ('{0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8} | {9}' -f $lab.PadRight(52), ([string]$r0['kind']).PadRight(20), $sig.PadRight(10), ([string]$r0['probe1']).PadRight(8), ([string]$r0['probe2']).PadRight(8), $r0['ev3076'], $r0['ev3077'], ('{0}/{1}/{2}' -f $r0['ev3090'], $r0['ev3091'], $r0['ev3092']), $r0['ev3089'], (($r0['passesSmartlocker']) -join ','))
+        [void]$sb.AppendLine($line)
+    }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('events not matched to any subject (by id): ' + (ConvertTo-Json -InputObject $unmatched -Compress))
+    $matrix = [ordered]@{ phase = $Phase; generated = (Get-IsoNow); control_interpretation = $interp; neg_flagged = $negBlocked; pos_unsigned_flagged = $posBlocked; unmatched_event_ids = $unmatched; rows = $rows.ToArray() }
+    Save-Json ($Prefix + '-matrix.json') $matrix 7
+    Save-Text ($Prefix + '-matrix.txt') $sb.ToString()
+    return $matrix
+}
+
+function Save-EventsJson {
+    param($EventsObj, [string]$FileName)
+    $evs = @($EventsObj.events)
+    $o = [ordered]@{ note = $EventsObj.note; total = $evs.Count; truncated = $false; events = $null }
+    if ($evs.Count -gt 4000) {
+        $o['truncated'] = $true
+        $o['events'] = @($evs[0..1999]) + @($evs[($evs.Count - 2000)..($evs.Count - 1)])
+        $o['note'] = ([string]$EventsObj.note + ' | JSON keeps first 2000 + last 2000; the .evtx has all')
+    } else {
+        $o['events'] = $evs
+    }
+    Save-Json $FileName $o 6
+}
+
+function Get-IdCounts {
+    param($Events)
+    $cnt = [ordered]@{}
+    foreach ($e in @($Events)) {
+        $k = [string]$e.id
+        if ($cnt.Contains($k)) { $cnt[$k] = [int]$cnt[$k] + 1 } else { $cnt[$k] = 1 }
+    }
+    return $cnt
+}

@@ -5,6 +5,8 @@
 #   6. fallback (CDP could not attach): replica of the plugin call (se_exit.exe) instead of the app.
 # This file is also a LIBRARY: when dot-sourced (. e2e-update.ps1) it only defines functions
 # (Install-CysVersion, Invoke-AppUpdateRun, Watch-UpdateOutcome, ...) and runs no main.
+# Invoke-AppUpdateRun has an optional -BeforeNode script block (a step between "CDP answers" and "install_update is driven");
+# sacreal-e2e.ps1 uses it to turn REAL Smart App Control on while the app is already running. Without it nothing changes.
 $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'lib.ps1')
 
@@ -253,7 +255,10 @@ function Watch-UpdateOutcome {
         $NodeProc = $null,
         [int]$PostNodeSec = 480,
         [int]$QuietEndSec = 180,
-        [int]$MaxSec = 1500
+        [int]$MaxSec = 1500,
+        [int]$TickSec = 5,
+        [switch]$ShotAtExit,
+        [int]$ShotEverySec = 0
     )
     $obs = [ordered]@{
         started = (Get-IsoNow); ended = $null; end_reason = $null; ticks = 0
@@ -277,6 +282,8 @@ function Watch-UpdateOutcome {
     $shot20 = $false
     $shot60 = $false
     $shotInst = $false
+    $shotExit = $false
+    $lastPeriodicShot = 0
     $reason = $null
     $first = $true
     $seenDirs = New-Object System.Collections.Generic.List[string]
@@ -355,6 +362,20 @@ function Watch-UpdateOutcome {
                 try { Add-Utf8NoBom $tl ('# screenshot installer: ok={0} windows={1}' -f $sr['ok'], $sr['windows']) } catch { }
                 try { Add-Utf8NoBom $tl "`r`n" } catch { }
             }
+            # optional (sacreal-e2e.ps1): one screenshot as soon as the CDP session ended or the app is gone, so that a
+            # Windows block notification / dialog right after the failed installer start is on the picture
+            if ($ShotAtExit -and (-not $shotExit) -and (($null -ne $obs['node_exited_at']) -or $appGone)) {
+                $shotExit = $true
+                $sr = Save-Screenshot ($Prefix + '-screen-exit.png')
+                $obs['screenshots'].Add($sr)
+                try { Add-Utf8NoBom $tl (('# screenshot at exit: ok={0} windows={1}' -f $sr['ok'], $sr['windows']) + "`r`n") } catch { }
+            }
+            # optional: one screenshot every $ShotEverySec seconds (a transient notification or dialog can be anywhere in the flow)
+            if (($ShotEverySec -gt 0) -and (($elapsed - $lastPeriodicShot) -ge $ShotEverySec)) {
+                $lastPeriodicShot = $elapsed
+                $sr = Save-Screenshot ('{0}-screen-t{1:D4}s.png' -f $Prefix, $elapsed)
+                $obs['screenshots'].Add($sr)
+            }
             if ($null -ne $nodeExitAt) {
                 $sinceExit = ($now - $nodeExitAt).TotalSeconds
                 if (($sinceExit -ge 20) -and (-not $shot20)) {
@@ -380,7 +401,7 @@ function Watch-UpdateOutcome {
             }
             if ($elapsed -ge $MaxSec) { $reason = ('max watch seconds reached ({0})' -f $MaxSec); break }
             if ((Get-MinutesLeft) -lt 3) { $reason = 'job time budget exhausted'; break }
-            Start-Sleep -Seconds 5
+            Start-Sleep -Seconds $TickSec
         }
     } catch {
         $reason = 'watch loop exception: ' + $_.Exception.Message
@@ -406,7 +427,11 @@ function Invoke-AppUpdateRun {
         [int]$StartupWaitSec = 120,
         [int]$CdpMaxSec = 720,
         [int]$PostNodeSec = 480,
-        [string]$TargetVersion = '0.14.42'
+        [string]$TargetVersion = '0.14.42',
+        [scriptblock]$BeforeNode = $null,
+        [int]$WatchTickSec = 5,
+        [switch]$ShotAtExit,
+        [int]$WatchShotEverySec = 0
     )
     $v = [ordered]@{
         prefix = $Prefix; started = (Get-IsoNow); installed_before = $null; app_started = $false
@@ -486,8 +511,38 @@ function Invoke-AppUpdateRun {
             return $v
         }
 
+        # optional caller step between "CDP answers" and "drive install_update" (used by sacreal-e2e.ps1: attach + check_update,
+        # then turn Smart App Control on). It receives $v. It may return a dictionary with proceed = $false (+ why) to stop
+        # here, and node_exe = '<path>' to choose another (signed) node.exe for the driver. A throwing step also stops here.
+        $nodeOverride = ''
+        if ($null -ne $BeforeNode) {
+            $hookRes = $null
+            try {
+                $hookOut = @(& $BeforeNode $v)
+                if ($hookOut.Count -gt 0) { $hookRes = $hookOut[$hookOut.Count - 1] }
+            } catch {
+                $v['diagnostics']['before_node_error'] = Format-ErrorText $_
+                Add-DiagError ('Invoke-AppUpdateRun before-node step ' + $Prefix) $_
+                $v['verdict'] = 'inconclusive'
+                $v['why'] = 'before-node step failed: ' + $_.Exception.Message
+                return $v
+            }
+            if ($hookRes -is [System.Collections.IDictionary]) {
+                if ($hookRes.Contains('node_exe') -and $hookRes['node_exe']) { $nodeOverride = [string]$hookRes['node_exe'] }
+                if ($hookRes.Contains('proceed') -and ($hookRes['proceed'] -eq $false)) {
+                    $v['verdict'] = 'inconclusive'
+                    $v['why'] = 'stopped before install_update by the caller step: ' + [string]$hookRes['why']
+                    return $v
+                }
+            }
+        }
+
         # 3. CDP driver (node) runs in the background; the watch loop below observes meanwhile
         $nodeExe = Find-Exe 'node.exe'
+        if ($nodeOverride) {
+            $nodeExe = $nodeOverride
+            $v['diagnostics']['node_exe_override'] = $nodeOverride
+        }
         if (-not $nodeExe) {
             $v['why'] = 'node.exe not found'
             return $v
@@ -504,7 +559,7 @@ function Invoke-AppUpdateRun {
         $v['diagnostics']['node_pid'] = $nodeProc.Id
 
         # 4. observation
-        $obs = Watch-UpdateOutcome -Prefix $Prefix -TargetVersion $TargetVersion -NodeProc $nodeProc -PostNodeSec $PostNodeSec -MaxSec ($CdpMaxSec + $PostNodeSec + 60)
+        $obs = Watch-UpdateOutcome -Prefix $Prefix -TargetVersion $TargetVersion -NodeProc $nodeProc -PostNodeSec $PostNodeSec -MaxSec ($CdpMaxSec + $PostNodeSec + 60) -TickSec $WatchTickSec -ShotAtExit:$ShotAtExit -ShotEverySec $WatchShotEverySec
         $v['observe'] = $obs
         try { if (-not $nodeProc.HasExited) { Stop-ProcessTree -ProcessId $nodeProc.Id; $v['diagnostics']['node_killed'] = $true } } catch { }
 
