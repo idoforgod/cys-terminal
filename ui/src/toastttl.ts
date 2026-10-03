@@ -32,9 +32,17 @@ export const PROGRESS_TTL_MS = 180_000;
  * 60초면 설정 화면을 여는 사이에 사라졌다(phase1 U14 반박 M4). 여전히 유한하다(오너 요구 =
  * 종류 불문 소멸 — 무한 불변식 테스트가 이 id 도 함께 잰다). 접두는 folderaccess.ts 의
  * PERM_TOAST_PREFIX 와 같다(모듈 결합을 피하려 값만 같게 둔다 — 테스트가 두 값을 함께 잰다).
+ *
+ * ★(0.14.43 · J2) '업데이트가 설치되지 않았습니다'(sticky id `update-not-installed`)도 이 수명을 받는다 — 본문이 이벤트 뷰어 경로를
+ * 따라가며 읽는 안내이고, 앱을 다시 연 직후 1분 안에 못 보면 사용자가 실패 자체를 모르고 지나간다(이 알림은 시도 기록을 지우며 **1회만**
+ * 나온다 — 놓치면 다시 오지 않는다). 여전히 유한하다(10분). 이 id 는 updatenotice.ts 의 UPDATE_FAILED_TOAST_ID 와 같다(역시 모듈
+ * 결합을 피하려 값만 같게 둔다 — 테스트가 두 값을 함께 잰다).
  */
 export const GUIDE_TTL_MS = 600_000;
-const GUIDE_STICKY_PREFIX = "perm-";
+/** GUIDE_TTL_MS 를 받는 sticky id **접두**(폴더 접근 안내) — 접두가 우연히 겹치는 다른 id 는 연장하지 않는다(정확히 `perm-` 접두만). */
+const GUIDE_STICKY_PREFIXES = ["perm-"] as const;
+/** GUIDE_TTL_MS 를 받는 sticky id **정확 일치**(1회만 나오는 실패 안내) — 접두 일치가 아니다(`update-not-installed-x` 는 연장하지 않는다). */
+const GUIDE_STICKY_IDS = ["update-not-installed"] as const;
 
 /** 알람 이력 링버퍼 보관 건수. */
 export const ALARM_HISTORY_CAP = 200;
@@ -55,6 +63,11 @@ const PROGRESS_STICKY_IDS = [
  * D2b(purge-safety) 계열처럼 "놓치면 사용자가 실패 자체를 모르는" 고위험 실패 알람.
  */
 const BANNER_ON_EXPIRY_PREFIXES = ["purge-fail-"] as const;
+/**
+ * TTL 만료 시 OS 네이티브 배너로 1회 보강할 sticky id **정확 일치** — ★(0.14.43 · J2) 업데이트 미설치 알림은 시도 기록을 지우며 1회만
+ * 나오므로 10분 안에 못 본 채 만료되면 사용자가 '업데이트가 안 깔렸다'는 사실 자체를 모른다(값은 updatenotice.ts 의 UPDATE_FAILED_TOAST_ID).
+ */
+const BANNER_ON_EXPIRY_IDS = ["update-not-installed"] as const;
 
 export type ToastKind = "volatile" | "sticky";
 
@@ -62,7 +75,8 @@ export type ToastKind = "volatile" | "sticky";
 export function toastTtl(kind: ToastKind, id?: string): { ttlMs: number } {
   if (kind === "volatile") return { ttlMs: VOLATILE_TTL_MS };
   if (id && (PROGRESS_STICKY_IDS as readonly string[]).includes(id)) return { ttlMs: PROGRESS_TTL_MS };
-  if (id && id.startsWith(GUIDE_STICKY_PREFIX)) return { ttlMs: GUIDE_TTL_MS };
+  if (id && (GUIDE_STICKY_IDS as readonly string[]).includes(id)) return { ttlMs: GUIDE_TTL_MS };
+  if (id && GUIDE_STICKY_PREFIXES.some((p) => id.startsWith(p))) return { ttlMs: GUIDE_TTL_MS };
   return { ttlMs: STICKY_TTL_MS };
 }
 
@@ -80,9 +94,9 @@ export function toastTimerPlan(
   return { ttlMs, clearPrevious: kind === "sticky" && hadExisting };
 }
 
-/** 이 sticky가 조용히 만료될 때 OS 배너로 한 번 더 알려야 하는가. */
+/** 이 sticky가 조용히 만료될 때 OS 배너로 한 번 더 알려야 하는가(접두 일치 또는 정확 일치). */
 export function needsExpiryBanner(id: string): boolean {
-  return BANNER_ON_EXPIRY_PREFIXES.some((p) => id.startsWith(p));
+  return (BANNER_ON_EXPIRY_IDS as readonly string[]).includes(id) || BANNER_ON_EXPIRY_PREFIXES.some((p) => id.startsWith(p));
 }
 
 /** 만료 보강 배너 문구 — 토스트는 사라졌고 내용은 이력 탭에 있음을 명시(정직성). */

@@ -3240,6 +3240,225 @@ fn last_app_version_path() -> std::path::PathBuf {
     cys::home_dir().join(".cys/.last-app-version")
 }
 
+/// ★(0.14.43 · J2) 업데이트 '시도 기록' 경로 — 인앱 업데이트가 설치기를 띄우기 **직전**에 쓰고, 다시 뜬 앱의
+/// `update_attempt_report` 가 한 번 읽어 판정한다. 윈도우에서는 업데이터 플러그인이 설치기를 `ShellExecuteW` 로 띄운
+/// 뒤 반환값을 버리고 `std::process::exit(0)` 하므로, 설치기가 막혀도(스마트 앱 컨트롤 등) 앱은 이미 종료돼 있고
+/// `install_update` 의 그 아래 코드(검증·핸드오프)는 실행되지 않는다 — 이 파일이 '설치하려 했다'는 유일한 흔적이다.
+/// pending_restore_path 와 같은 ~/.cys 아래에 둔다(두 프로세스 공유).
+fn update_attempt_path() -> std::path::PathBuf {
+    cys::home_dir().join(".cys/.update-attempt.json")
+}
+
+/// 시도 기록 파일의 내용 — `{"from": 설치 직전 버전, "to": 설치하려던 버전, "at": 유닉스 초}`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct UpdateAttempt {
+    from: String,
+    to: String,
+    at: u64,
+}
+
+/// 기록 나이가 이 값(초) 미만이면 판정을 미룬다 — 설치기가 아직 도는 중일 수 있어 성급한 오보를 피한다.
+const UPDATE_ATTEMPT_MIN_AGE_SECS: u64 = 90;
+
+/// 재시작 뒤 1회 판정 결과 — 부작용 없는 순수 값(기록 파일 처리는 `update_attempt_report_at` 이 한다).
+#[derive(Debug, PartialEq, Eq)]
+enum AttemptVerdict {
+    /// 기록 없음(또는 판독 실패로 지워졌다) — 침묵.
+    None,
+    /// 알릴 것이 없다 — 현재 버전 ≠ 기록의 from: 새 버전이 깔렸거나 그 사이 다른 버전을 손으로 깔았다.
+    Moot,
+    /// 현재 버전 == from 인데 기록이 너무 젊다 — 설치기가 아직 도는 중일 수 있다. `wait_secs` 뒤에 다시 본다.
+    TooYoung { wait_secs: u64 },
+    /// 현재 버전 == from 이고 충분히 지났다 — 업데이트가 설치되지 않았다.
+    Failed { from: String, to: String, at: u64 },
+}
+
+/// `CYS_UPDATE_VERIFY` 해석(되돌리기 노브) — `"0"` 만 끈다(그 밖의 값·빈 값·미설정은 켬). 끄면 `install_update` 는
+/// 시도 기록을 쓰지 않고 `update_attempt_report` 는 늘 null 을 돌려준다(이 기능이 없던 때와 같은 거동).
+fn update_verify_from_env(v: Option<&str>) -> bool {
+    v != Some("0")
+}
+
+/// 시도 기록 판정 — 부작용 없는 순수 함수(검체 대상). `now - at` 은 `saturating_sub` 라 시계가 거꾸로 간 기록(at > now)은
+/// 나이 0 으로 본다(→ TooYoung). 판독 실패는 호출부(`read_update_attempt_at`)가 기록을 지우고 `None` 으로 접는다.
+fn decide_update_attempt(attempt: Option<&UpdateAttempt>, current: &str, now: u64) -> AttemptVerdict {
+    let Some(a) = attempt else {
+        return AttemptVerdict::None;
+    };
+    if current != a.from {
+        return AttemptVerdict::Moot;
+    }
+    let age = now.saturating_sub(a.at);
+    if age < UPDATE_ATTEMPT_MIN_AGE_SECS {
+        return AttemptVerdict::TooYoung {
+            wait_secs: UPDATE_ATTEMPT_MIN_AGE_SECS - age,
+        };
+    }
+    AttemptVerdict::Failed {
+        from: a.from.clone(),
+        to: a.to.clone(),
+        at: a.at,
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 시도 기록 쓰기(최선 노력 — 호출부는 실패를 무시하고 설치를 계속한다. 이 기록이 업데이트를 막아서는 안 된다).
+fn write_update_attempt_at(path: &std::path::Path, from: &str, to: &str, at: u64) -> std::io::Result<()> {
+    let rec = UpdateAttempt {
+        from: from.to_string(),
+        to: to.to_string(),
+        at,
+    };
+    let json = serde_json::to_string(&rec).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::write(path, json)
+}
+
+/// 시도 기록 삭제(최선 노력 · 없어도 무해).
+fn clear_update_attempt_at(path: &std::path::Path) {
+    let _ = std::fs::remove_file(path);
+}
+
+/// 시도 기록 읽기 — 파일이 없으면 None. **내용이 깨졌으면**(깨진 JSON·필드 누락·UTF-8 아님) 기록을 지우고 None(침묵 — 읽지 못한
+/// 기록으로 오보하지 않고, 같은 깨진 파일을 다음 기동에도 되풀이해 읽지 않는다). 내용이 아니라 **읽기 자체**가 일시적으로 실패하면
+/// (다른 프로그램이 잠근 파일·권한) None 만 돌려주고 기록은 남긴다 — 멀쩡한 기록을 일시 오류 때문에 지우지 않고 다음 기동에 다시 본다.
+fn read_update_attempt_at(path: &std::path::Path) -> Option<UpdateAttempt> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            clear_update_attempt_at(path); // UTF-8 이 아니다 = 깨진 내용
+            return None;
+        }
+        Err(_) => return None, // 일시적 읽기 오류 — 지우지 않는다
+    };
+    match serde_json::from_str::<UpdateAttempt>(&text) {
+        Ok(a) => Some(a),
+        Err(_) => {
+            clear_update_attempt_at(path);
+            None
+        }
+    }
+}
+
+/// 재시작 뒤 1회 보고(`update_attempt_report` 의 몸통 — 경로·시각·OS·SAC 조회를 인자로 받아 검체가 임시 디렉터리 위에서 돈다).
+///  · None → null · Moot → 기록 삭제 후 null
+///  · TooYoung → 기록 **유지** · `{"pending": true, "wait_secs": N}`
+///  · Failed → 기록 **삭제**(1회만 알린다 — 재시도·반복 알림 없음) · `{"failed": true, "from", "to", "at", "os", "sac"}`
+/// `sac`(스마트 앱 컨트롤 조회 — 윈도우에서는 `reg query` 1회)는 **Failed 일 때만** 부른다.
+fn update_attempt_report_at(
+    path: &std::path::Path,
+    current: &str,
+    now: u64,
+    os: &str,
+    sac: impl FnOnce() -> Option<&'static str>,
+) -> Option<Value> {
+    let attempt = read_update_attempt_at(path);
+    match decide_update_attempt(attempt.as_ref(), current, now) {
+        AttemptVerdict::None => None,
+        AttemptVerdict::Moot => {
+            clear_update_attempt_at(path);
+            None
+        }
+        AttemptVerdict::TooYoung { wait_secs } => Some(json!({"pending": true, "wait_secs": wait_secs})),
+        AttemptVerdict::Failed { from, to, at } => {
+            let report = json!({"failed": true, "from": from, "to": to, "at": at, "os": os, "sac": sac()});
+            clear_update_attempt_at(path);
+            Some(report)
+        }
+    }
+}
+
+/// `reg query` 출력에서 스마트 앱 컨트롤 상태를 읽는다 — `VerifiedAndReputablePolicyState    REG_DWORD    0x1` 꼴의 줄을 찾아
+/// `0x0` → "off" · `0x1` → "on" · `0x2` → "eval"(평가 모드) · 그 밖·줄 없음 → None. 값 이름은 대소문자를 가리지 않고 칸 사이의
+/// 공백은 가변이다. 순수 함수(검체 대상 — 양쪽 OS 에서 컴파일된다).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_sac_state(reg_stdout: &str) -> Option<&'static str> {
+    for line in reg_stdout.lines() {
+        let mut cols = line.split_whitespace();
+        let (Some(name), Some(kind), Some(value)) = (cols.next(), cols.next(), cols.next()) else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case("VerifiedAndReputablePolicyState") || !kind.eq_ignore_ascii_case("REG_DWORD") {
+            continue;
+        }
+        let hex = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X"))?;
+        return match u32::from_str_radix(hex, 16).ok()? {
+            0 => Some("off"),
+            1 => Some("on"),
+            2 => Some("eval"),
+            _ => None,
+        };
+    }
+    None
+}
+
+/// 이 PC 의 Windows 스마트 앱 컨트롤 상태 — "on" | "off" | "eval" | None(판정 불가·윈도우 아님). 읽기 전용 · 최선 노력.
+/// 플랫폼 갈라짐은 **본문 안**에 둔다(`bundle_integrity` 와 같은 형태 — 최상위 cfg 로 아이템을 지우지 않는다).
+/// `reg.exe` 는 콘솔 창이 번쩍이지 않게 `no_console` 을 건다. 실패·비 0 종료는 None(침묵 — 모르면 말하지 않는다).
+fn smart_app_control_state() -> Option<&'static str> {
+    #[cfg(windows)]
+    {
+        let reg = std::env::var_os("SystemRoot")
+            .map(|r| std::path::PathBuf::from(r).join("System32").join("reg.exe"))
+            .unwrap_or_else(|| std::path::PathBuf::from("reg.exe"));
+        let mut cmd = std::process::Command::new(reg);
+        cmd.args([
+            "query",
+            r"HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy",
+            "/v",
+            "VerifiedAndReputablePolicyState",
+        ]);
+        no_console(&mut cmd);
+        let out = cmd.output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        return parse_sac_state(&String::from_utf8_lossy(&out.stdout));
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
+/// ★(0.14.43 · J2) 재시작 뒤 1회 판정 pull — 기동 때 UI 가 부른다(emit 이 listen 등록 전에 유실되는 것을 pull 로 회수하는
+/// 저장소 관례). 응답: null(알릴 것 없음) · `{"pending": true, "wait_secs": N}`(설치기가 아직 도는 중일 수 있다 — 기록 유지)
+/// · `{"failed": true, "from", "to", "at", "os", "sac"}`(설치되지 않았다 — 기록은 이 호출이 지웠다: 1회만 알린다).
+/// `CYS_UPDATE_VERIFY=0` 이면 늘 null. 판독·조회 실패는 전부 null — 이 기능 때문에 부팅이나 업데이트가 막히지 않는다.
+#[tauri::command]
+async fn update_attempt_report() -> Option<Value> {
+    if !update_verify_from_env(cys::env_compat("CYS_UPDATE_VERIFY").as_deref()) {
+        return None;
+    }
+    tokio::task::spawn_blocking(|| {
+        update_attempt_report_at(
+            &update_attempt_path(),
+            env!("CARGO_PKG_VERSION"),
+            unix_now_secs(),
+            std::env::consts::OS,
+            smart_app_control_state,
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// ★(0.14.43 · J2) 이 PC 의 스마트 앱 컨트롤 상태 pull — 패치 설치 확인 창이 열리기 전에 UI 가 부른다. "on" | "off" | "eval" | null.
+/// 윈도우가 아니면 프로세스를 띄우지 않고 곧바로 null. 읽기 전용 · 실패는 null.
+#[tauri::command]
+async fn smart_app_control() -> Option<String> {
+    tokio::task::spawn_blocking(smart_app_control_state)
+        .await
+        .ok()
+        .flatten()
+        .map(str::to_string)
+}
+
 /// GUI 온보딩 완료 마커 — "이 GUI가 이 바이너리 버전에서 온보딩(팩+hook(+win: schtasks))을
 /// **성공** 완료했는가". writer는 GUI 온보딩 성공 경로 단 하나다 — CLI autostart·잔존 schtasks·
 /// ONLOGON 등 어떤 순서로 cysd가 먼저 돌아도 이 마커를 선점할 수 없다(0.12.52 cys-neo 회귀 시정:
@@ -6694,7 +6913,21 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .ok_or("no update available")?;
     let _ = app.emit("update-progress", json!({"phase": "download"}));
-    update
+    // ★(0.14.43 · J2) 설치 직전 시도 기록. 윈도우에서 `download_and_install` 은 설치기를 띄운 뒤 반환값을 버리고 프로세스를
+    //   끝내므로(tauri-plugin-updater 2.10.1) 설치기가 차단돼도(스마트 앱 컨트롤 등) 이 아래 코드는 실행되지 않는다 —
+    //   다시 뜬 앱의 `update_attempt_report` 가 이 기록으로 '설치되지 않았다'를 한 번 알린다. 최선 노력이다: 쓰기 실패는
+    //   무시하고 설치를 계속한다(이 기록이 업데이트를 막아서는 안 된다). `CYS_UPDATE_VERIFY=0` 이면 쓰지 않는다.
+    let attempt_path = update_attempt_path();
+    let verify_on = update_verify_from_env(cys::env_compat("CYS_UPDATE_VERIFY").as_deref());
+    if verify_on {
+        let _ = write_update_attempt_at(
+            &attempt_path,
+            env!("CARGO_PKG_VERSION"),
+            &update.version,
+            unix_now_secs(),
+        );
+    }
+    if let Err(e) = update
         .download_and_install(
             |chunk, total| {
                 let _ = app.emit(
@@ -6705,7 +6938,14 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
             || {},
         )
         .await
-        .map_err(|e| e.to_string())?;
+    {
+        // 다운로드·서명 검증 실패 등 — 설치기가 뜨지 않았다(오류는 아래로 돌려줘 화면에 이미 뜬다). 기록을 지운다.
+        // Ok 면 그대로 둔다: 재시작(맥·리눅스) 또는 설치기 종료(윈도우) 뒤 다시 뜬 앱이 판정한다.
+        if verify_on {
+            clear_update_attempt_at(&attempt_path);
+        }
+        return Err(e.to_string());
+    }
     // 2-b) ★설치 후 검증(ATOMIC-1 계약 ④의 대체 집행 · 2026-08-01 실사고).
     //   교체를 수행한 주체는 tauri-plugin-updater 이고 우리는 그 내부를 못 고친다. 실측된 결함:
     //   ⓐ `rename(현재 .app → TempDir)` 후 최종 rename 이 실패해도 **되돌리는 코드가 없다**
@@ -7226,6 +7466,9 @@ fn main() {
             check_pack_update,
             live_session_count,
             install_update,
+            // ★(0.14.43 · J2) 업데이트 미설치 알림 — 재시작 뒤 1회 판정 pull · 스마트 앱 컨트롤 상태 pull(둘 다 읽기 전용).
+            update_attempt_report,
+            smart_app_control,
             autotest_patch_install,
             rotate_daemon,
             drain_verify,
@@ -8932,6 +9175,396 @@ mod tests {
         assert_eq!(decide_pending_update(false, Some("0.12.50"), "0.12.51", true), Apply, "버전변경=Apply(prior_state 무관)");
         assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51", false), Skip, "동일 버전·마커 없음=Skip");
         assert_eq!(decide_pending_update(false, Some("0.12.51"), "0.12.51", true), Skip, "동일 버전=Skip(prior_state 무관)");
+    }
+
+    // ── ★(0.14.43 · J2) 업데이트 미설치 알림 — 시도 기록 · 재시작 뒤 1회 판정 · 스마트 앱 컨트롤 ──────────────────
+    //
+    // 윈도우에서 설치기가 스마트 앱 컨트롤에 막혀도 인앱 업데이트는 침묵했다(플러그인이 설치기를 띄운 뒤 곧바로 앱을 끝낸다).
+    // 설치 직전에 남긴 기록을 다시 뜬 앱이 한 번 읽어 '설치되지 않았다'를 알린다. 아래 검체는 전부 임시 디렉터리 위에서 돈다
+    // (경로를 인자로 받는 내부 함수 — 실제 ~/.cys 는 읽지도 쓰지도 않는다).
+
+    fn j2_attempt(from: &str, to: &str, at: u64) -> UpdateAttempt {
+        UpdateAttempt {
+            from: from.into(),
+            to: to.into(),
+            at,
+        }
+    }
+
+    /// 검체마다 고유한 빈 임시 디렉터리(프로세스 번호 + 꼬리표) — 단언이 실패해 일찍 끝나도 Drop 이 지운다(임시 폴더에 쌓이지 않는다).
+    struct J2Tmp(std::path::PathBuf);
+    impl J2Tmp {
+        fn new(tag: &str) -> Self {
+            let d = std::env::temp_dir().join(format!("cys-j2-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            J2Tmp(d)
+        }
+    }
+    impl std::ops::Deref for J2Tmp {
+        type Target = std::path::PathBuf;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl Drop for J2Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// SAC 조회 대역 — 불린 횟수를 센다(레지스트리 읽기가 Failed 에서만, 정확히 1회임을 잰다).
+    fn j2_sac<'a>(
+        calls: &'a std::cell::Cell<u32>,
+        v: Option<&'static str>,
+    ) -> impl FnOnce() -> Option<&'static str> + 'a {
+        move || {
+            calls.set(calls.get() + 1);
+            v
+        }
+    }
+
+    #[test]
+    fn j2_decide_update_attempt_truth_table() {
+        let a = j2_attempt("0.14.42", "0.14.43", 1_000_000);
+        let none = AttemptVerdict::None;
+        // 기록 없음 → None(현재 버전·시각과 무관)
+        assert_eq!(decide_update_attempt(Option::None, "0.14.42", 1_000_100), none, "기록 없음");
+        // 새 버전이 깔렸다(current == to) → Moot — 알릴 것이 없다
+        assert_eq!(decide_update_attempt(Some(&a), "0.14.43", 1_000_100), AttemptVerdict::Moot, "current == to");
+        // 그 사이 제3의 버전을 손으로 깔았다 → Moot(위·아래 어느 쪽이든)
+        assert_eq!(decide_update_attempt(Some(&a), "0.14.41", 1_000_100), AttemptVerdict::Moot, "제3 버전(아래)");
+        assert_eq!(decide_update_attempt(Some(&a), "0.15.0", 1_000_100), AttemptVerdict::Moot, "제3 버전(위)");
+        // Moot 은 나이와 무관 — 아주 오래된 기록도 현재 ≠ from 이면 알릴 것이 없다(오보 금지)
+        assert_eq!(decide_update_attempt(Some(&a), "0.14.43", 1_000_000 + 100_000), AttemptVerdict::Moot, "오래돼도 Moot");
+        assert_eq!(decide_update_attempt(Some(&a), "0.14.43", 1_000_000), AttemptVerdict::Moot, "나이 0 이어도 Moot");
+        // current == from · 나이 10초 → 설치기가 아직 도는 중일 수 있다 → TooYoung{80}
+        assert_eq!(
+            decide_update_attempt(Some(&a), "0.14.42", 1_000_010),
+            AttemptVerdict::TooYoung { wait_secs: 80 },
+            "나이 10초"
+        );
+        assert_eq!(
+            decide_update_attempt(Some(&a), "0.14.42", 1_000_000),
+            AttemptVerdict::TooYoung { wait_secs: 90 },
+            "나이 0초"
+        );
+        // 경계: 89초는 아직 젊고(남은 1초) · 90초부터 Failed
+        assert_eq!(
+            decide_update_attempt(Some(&a), "0.14.42", 1_000_089),
+            AttemptVerdict::TooYoung { wait_secs: 1 },
+            "나이 89초"
+        );
+        let failed = AttemptVerdict::Failed {
+            from: "0.14.42".into(),
+            to: "0.14.43".into(),
+            at: 1_000_000,
+        };
+        assert_eq!(decide_update_attempt(Some(&a), "0.14.42", 1_000_090), failed, "나이 90초");
+        assert_eq!(decide_update_attempt(Some(&a), "0.14.42", 1_000_000 + 100_000), failed, "나이 10만 초");
+        // at 이 미래(시계 역행)는 나이 0 으로 본다 → TooYoung{90}
+        let future = j2_attempt("0.14.42", "0.14.43", 2_000_000);
+        assert_eq!(
+            decide_update_attempt(Some(&future), "0.14.42", 1_000_000),
+            AttemptVerdict::TooYoung { wait_secs: 90 },
+            "at 이 미래"
+        );
+        assert_eq!(UPDATE_ATTEMPT_MIN_AGE_SECS, 90, "판정 보류 창은 90초(문서·알림 문구와 같은 값)");
+    }
+
+    #[test]
+    fn j2_update_attempt_record_roundtrip_and_broken_records_are_dropped() {
+        let dir = J2Tmp::new("roundtrip");
+        let p = dir.join(".update-attempt.json");
+        assert_eq!(read_update_attempt_at(&p), Option::None, "파일 없음 = None");
+        write_update_attempt_at(&p, "0.14.42", "0.14.43", 1_760_000_000).unwrap();
+        assert_eq!(
+            read_update_attempt_at(&p),
+            Some(j2_attempt("0.14.42", "0.14.43", 1_760_000_000)),
+            "쓴 값을 그대로 읽는다"
+        );
+        assert!(p.exists(), "정상 기록은 읽어도 지우지 않는다(지우는 것은 판정 결과를 보는 보고 함수의 몫)");
+        let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(
+            on_disk,
+            json!({"from": "0.14.42", "to": "0.14.43", "at": 1_760_000_000u64}),
+            "파일 모양은 {{from,to,at}} 세 키"
+        );
+        // 판독 실패는 기록을 지우고 None — 침묵(오보 금지) · 같은 깨진 파일을 다음 기동에 되풀이해 읽지 않는다
+        let broken: [(&str, Vec<u8>); 7] = [
+            ("깨진 JSON", b"{not json".to_vec()),
+            ("빈 파일", Vec::new()),
+            ("필드 누락", br#"{"from":"0.14.42","to":"0.14.43"}"#.to_vec()),
+            ("at 타입 틀림", br#"{"from":"a","to":"b","at":"x"}"#.to_vec()),
+            ("at 음수", br#"{"from":"a","to":"b","at":-5}"#.to_vec()),
+            ("UTF-8 아님", vec![0xff, 0xfe, 0x00, 0x80]),
+            ("객체가 아님", b"[]".to_vec()),
+        ];
+        for (label, bytes) in broken {
+            std::fs::write(&p, &bytes).unwrap();
+            assert_eq!(read_update_attempt_at(&p), Option::None, "{label}: None");
+            assert!(!p.exists(), "{label}: 판독 실패 기록은 지운다");
+        }
+        // 내용이 아니라 읽기 자체가 실패하면(권한·잠금) 멀쩡한 기록을 지우지 않는다 — None 만 돌려주고 다음 기동에 다시 본다
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            write_update_attempt_at(&p, "0.14.42", "0.14.43", 7).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // 이 프로세스가 권한을 무시하는 사용자(root)면 읽혀 버리므로 그때는 이 대목을 건너뛴다(정상 기록 읽기와 같다)
+            if std::fs::read_to_string(&p).is_err() {
+                assert_eq!(read_update_attempt_at(&p), Option::None, "읽기 오류 = None");
+                assert!(p.exists(), "일시적 읽기 오류가 기록을 지웠다 — 멀쩡한 기록을 잃는다");
+            }
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(read_update_attempt_at(&p), Some(j2_attempt("0.14.42", "0.14.43", 7)), "권한을 돌려주면 같은 기록을 읽는다");
+        }
+        // 지울 파일이 없어도 무해
+        clear_update_attempt_at(&p);
+        // 쓰기 실패(상위 디렉터리 없음)는 오류로 돌려줄 뿐 패닉하지 않는다 — 호출부가 무시하고 설치를 계속한다
+        assert!(write_update_attempt_at(&dir.join("no-such-dir").join("x.json"), "a", "b", 1).is_err());
+    }
+
+    #[test]
+    fn j2_update_attempt_report_tells_once_and_keeps_young_records() {
+        let dir = J2Tmp::new("report");
+        let p = dir.join(".update-attempt.json");
+        let calls = std::cell::Cell::new(0u32);
+
+        // (a) 기록 없음 → null · SAC 조회 0회
+        assert_eq!(update_attempt_report_at(&p, "0.14.42", 1_000_500, "windows", j2_sac(&calls, Some("on"))), Option::None);
+        assert_eq!(calls.get(), 0, "기록 없음에서 레지스트리를 읽었다");
+
+        // (b) Failed → 보고 + 기록 삭제 — 1회만 알린다(두 번째 호출은 null)
+        write_update_attempt_at(&p, "0.14.42", "0.14.43", 1_000_000).unwrap();
+        let r = update_attempt_report_at(&p, "0.14.42", 1_000_120, "windows", j2_sac(&calls, Some("on"))).expect("Failed 보고");
+        assert_eq!(
+            r,
+            json!({"failed": true, "from": "0.14.42", "to": "0.14.43", "at": 1_000_000u64, "os": "windows", "sac": "on"}),
+            "Failed 보고의 키·값"
+        );
+        assert_eq!(r.as_object().unwrap().len(), 6, "키 집합은 정확히 6개");
+        assert_eq!(calls.get(), 1, "SAC 조회는 Failed 에서 정확히 1회");
+        assert!(!p.exists(), "Failed 보고 뒤 기록이 남아 있다 — 반복 알림");
+        assert_eq!(
+            update_attempt_report_at(&p, "0.14.42", 1_000_500, "windows", j2_sac(&calls, Some("on"))),
+            Option::None,
+            "두 번째 호출은 알릴 것이 없다(1회만)"
+        );
+        assert_eq!(calls.get(), 1, "두 번째 호출이 레지스트리를 또 읽었다");
+
+        // (c) SAC 를 읽지 못하면(None) 키는 있되 값은 null · os 는 그대로 싣는다
+        write_update_attempt_at(&p, "0.14.42", "0.14.43", 1_000_000).unwrap();
+        let r = update_attempt_report_at(&p, "0.14.42", 1_000_090, "macos", || Option::None).expect("Failed 보고");
+        assert_eq!(r["sac"], Value::Null);
+        assert_eq!(r["os"], "macos");
+        assert_eq!(r["failed"], true);
+        assert!(!p.exists());
+
+        // (d) TooYoung → 기록 **유지** · pending 보고 · SAC 조회 0회 — 시간이 지나 90초가 되면 그때 Failed
+        write_update_attempt_at(&p, "0.14.42", "0.14.43", 1_000_000).unwrap();
+        let before = std::fs::read_to_string(&p).unwrap();
+        let calls_before = calls.get();
+        let r = update_attempt_report_at(&p, "0.14.42", 1_000_010, "windows", j2_sac(&calls, Some("on"))).expect("pending 보고");
+        assert_eq!(r, json!({"pending": true, "wait_secs": 80u64}), "pending 보고의 키·값");
+        assert_eq!(r.as_object().unwrap().len(), 2, "pending 키 집합은 정확히 2개");
+        assert!(p.exists(), "TooYoung 에서 기록을 지웠다 — 곧 알려야 할 실패를 잃는다");
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "TooYoung 은 기록을 건드리지 않는다");
+        assert_eq!(calls.get(), calls_before, "TooYoung 에서 레지스트리를 읽었다");
+        // 같은 시각에 또 불러도 같은 보고(멱등) — 그 사이 기록은 그대로
+        assert_eq!(
+            update_attempt_report_at(&p, "0.14.42", 1_000_010, "windows", j2_sac(&calls, Some("on"))),
+            Some(json!({"pending": true, "wait_secs": 80u64}))
+        );
+        // 나이가 90초가 되면 같은 기록이 Failed 로 보고되고 지워진다
+        let r = update_attempt_report_at(&p, "0.14.42", 1_000_090, "windows", j2_sac(&calls, Some("eval"))).expect("Failed 보고");
+        assert_eq!(r["failed"], true);
+        assert_eq!(r["sac"], "eval");
+        assert!(!p.exists());
+
+        // (e) Moot → 기록 삭제 후 null · SAC 조회 0회(새 버전이 깔렸다)
+        write_update_attempt_at(&p, "0.14.42", "0.14.43", 1_000_000).unwrap();
+        let calls_before = calls.get();
+        assert_eq!(update_attempt_report_at(&p, "0.14.43", 1_000_500, "windows", j2_sac(&calls, Some("on"))), Option::None);
+        assert!(!p.exists(), "Moot 기록이 남아 있다");
+        assert_eq!(calls.get(), calls_before, "Moot 에서 레지스트리를 읽었다");
+
+        // (f) 깨진 기록 → null + 삭제(침묵)
+        std::fs::write(&p, b"{broken").unwrap();
+        assert_eq!(update_attempt_report_at(&p, "0.14.42", 1_000_500, "windows", j2_sac(&calls, Some("on"))), Option::None);
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn j2_parse_sac_state_reads_reg_query_output() {
+        // 실제 `reg query` 출력의 모양 — 빈 줄 · 머리줄(키 경로) · 들여쓴 값 줄 · CRLF.
+        let head = "\r\nHKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n";
+        let sample = |hex: &str| format!("{head}    VerifiedAndReputablePolicyState    REG_DWORD    {hex}\r\n\r\n");
+        assert_eq!(parse_sac_state(&sample("0x0")), Some("off"));
+        assert_eq!(parse_sac_state(&sample("0x1")), Some("on"));
+        assert_eq!(parse_sac_state(&sample("0x2")), Some("eval"));
+        // LF 만 있는 출력 · 값 이름 대소문자 무시 · 칸 사이 공백 가변(탭 포함)
+        assert_eq!(
+            parse_sac_state("HKEY_LOCAL_MACHINE\\X\n    verifiedandreputablepolicystate\treg_dword\t0x1\n"),
+            Some("on")
+        );
+        assert_eq!(parse_sac_state("VERIFIEDANDREPUTABLEPOLICYSTATE REG_DWORD 0x2"), Some("eval"));
+        // 값 없음 · 빈 문자열 · 공백뿐
+        assert_eq!(
+            parse_sac_state("\r\nERROR: The system was unable to find the specified registry key or value.\r\n"),
+            Option::None
+        );
+        assert_eq!(parse_sac_state(""), Option::None);
+        assert_eq!(parse_sac_state("   \r\n\r\n"), Option::None);
+        // 엉뚱한 값 → None(모르는 값을 on/off 로 추측하지 않는다)
+        assert_eq!(parse_sac_state(&sample("0x7")), Option::None);
+        assert_eq!(parse_sac_state(&sample("0x")), Option::None);
+        assert_eq!(parse_sac_state(&sample("1")), Option::None, "0x 접두 없는 값은 읽지 않는다");
+        assert_eq!(
+            parse_sac_state("    VerifiedAndReputablePolicyState    REG_SZ    0x1\r\n"),
+            Option::None,
+            "REG_DWORD 가 아니면 읽지 않는다"
+        );
+        // 다른 값 이름의 줄은 무시한다(이름이 비슷해도 정확히 같아야 한다)
+        assert_eq!(
+            parse_sac_state("    VerifiedAndReputablePolicyStateX    REG_DWORD    0x1\r\n"),
+            Option::None
+        );
+        assert_eq!(parse_sac_state("    SomethingElse    REG_DWORD    0x1\r\n"), Option::None);
+        // 다른 줄이 앞에 있어도 해당 줄을 찾는다
+        assert_eq!(
+            parse_sac_state(&format!("{head}    Other    REG_DWORD    0x0\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x1\r\n")),
+            Some("on")
+        );
+    }
+
+    #[test]
+    fn j2_update_verify_knob_only_zero_turns_it_off() {
+        assert!(update_verify_from_env(Option::None), "미설정 = 켬");
+        assert!(update_verify_from_env(Some("1")), "\"1\" = 켬");
+        assert!(!update_verify_from_env(Some("0")), "\"0\" = 끔");
+        assert!(update_verify_from_env(Some("")), "빈 값 = 켬");
+        for other in ["false", "off", "00", " 0", "0 ", "no"] {
+            assert!(update_verify_from_env(Some(other)), "{other:?} 는 \"0\" 이 아니므로 켬(정확히 \"0\" 만 끈다)");
+        }
+    }
+
+    #[test]
+    fn j2_attempt_record_lives_beside_the_restore_marker() {
+        let p = update_attempt_path();
+        assert!(p.ends_with(".cys/.update-attempt.json"), "경로: {}", p.display());
+        assert_eq!(p.parent(), pending_restore_path().parent(), "복귀 마커와 같은 ~/.cys 아래(두 프로세스 공유)");
+    }
+
+    /// ★J2 배선 핀: 시도 기록은 `download_and_install` **앞**에 쓰이고(윈도우에서는 그 호출이 돌아오지 않는다), 지우는 곳은
+    /// `Err` 경로 한 곳뿐이다(`Ok` 면 그대로 둔다 — 재시작 뒤 판정). 쓰기 결과는 버린다(기록이 업데이트를 막아서는 안 된다).
+    #[test]
+    fn j2_install_update_records_before_download_and_clears_only_on_err() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let at = prod.find("async fn install_update(").expect("install_update 소실");
+        let end = at + prod[at..].find("\n}\n").expect("fn 끝");
+        let body = &prod[at..end];
+        let write = body.find("write_update_attempt_at(").expect("시도 기록 쓰기가 install_update 에 없다");
+        let download = body.find(".download_and_install(").expect("download_and_install 소실");
+        assert!(write < download, "시도 기록 쓰기가 download_and_install 보다 앞이어야 한다(윈도우에서는 그 호출이 돌아오지 않는다)");
+        assert!(
+            body.contains("let _ = write_update_attempt_at("),
+            "기록 쓰기 결과를 버려야 한다 — 쓰기 실패가 업데이트를 막으면 안 된다"
+        );
+        // 기록 인자: from = 지금 실행 중인 버전 · to = 받을 버전 · at = 지금 — 순서가 바뀌면 재시작 뒤 판정이 거꾸로 읽힌다
+        let call = &body[write..write + body[write..].find(");").expect("기록 호출 끝")];
+        let (cur, new_v, now) = (
+            call.find("env!(\"CARGO_PKG_VERSION\")").expect("from 인자(현재 버전) 소실"),
+            call.find("&update.version").expect("to 인자(받을 버전) 소실"),
+            call.find("unix_now_secs()").expect("at 인자(지금) 소실"),
+        );
+        assert!(cur < new_v && new_v < now, "기록 인자 순서는 (경로, from=현재 버전, to=받을 버전, at=지금) 이어야 한다: {call}");
+        assert!(call.contains("&attempt_path"), "기록 경로는 update_attempt_path() 에서 온 값이어야 한다: {call}");
+        assert!(body.contains("update_verify_from_env("), "CYS_UPDATE_VERIFY 노브가 설치 경로에 없다");
+        // 노브가 꺼지면 쓰기도 삭제도 건너뛴다 — 두 곳 모두 `if verify_on {` 바로 안쪽이어야 한다
+        assert!(
+            body.contains("if verify_on {\n        let _ = write_update_attempt_at("),
+            "기록 쓰기가 노브(verify_on) 분기 안에 있지 않다 — CYS_UPDATE_VERIFY=0 이 쓰기를 끄지 못한다"
+        );
+        assert!(
+            body.contains("if verify_on {\n            clear_update_attempt_at(&attempt_path);"),
+            "기록 삭제가 노브(verify_on) 분기 안에 있지 않다"
+        );
+        let err = body.find("if let Err(e) = update").expect("download_and_install 의 Err 분기 소실");
+        let clear = body.find("clear_update_attempt_at(").expect("Err 경로에 기록 삭제가 없다");
+        assert!(download < clear && err < clear, "기록 삭제는 download_and_install 의 Err 분기 안에 있어야 한다");
+        assert_eq!(
+            body.matches("clear_update_attempt_at(").count(),
+            1,
+            "삭제는 Err 경로 한 곳뿐이다 — Ok 면 기록을 그대로 둔다(재시작 뒤 판정)"
+        );
+        // Err 분기는 종전처럼 오류 문자열을 돌려준다(화면의 '패치 설치 실패' 토스트 경로 불변)
+        let tail = &body[clear..];
+        assert!(tail.contains("return Err(e.to_string());"), "Err 분기가 오류를 돌려주지 않는다");
+    }
+
+    /// ★J2 배선 핀: 두 명령이 invoke_handler 에 등재돼 있다(누락 = 런타임 'command not found' — UI 의 pull 은 조용히 실패한다).
+    #[test]
+    fn j2_commands_are_registered_in_invoke_handler() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let i = prod.find("tauri::generate_handler![").expect("invoke_handler 소실");
+        let reg = &prod[i..i + prod[i..].find("\n        ])").expect("핸들러 목록 끝")];
+        for name in ["update_attempt_report", "smart_app_control"] {
+            assert!(
+                reg.lines().any(|l| l.trim() == format!("{name},")),
+                "{name} 이 invoke_handler 에 등재되지 않았다"
+            );
+        }
+    }
+
+    /// ★J2 경계 핀: 설치 후 핸드오프·재시작 후 판정 함수(`decide_pending_update`·`maybe_apply_pending_update`)는 이 기능을 모른다
+    /// (동작 한 줄도 바꾸지 않는다) · 명령 두 개는 모두 노브·읽기 전용 · `reg` 는 query 만, 콘솔 창은 억제.
+    #[test]
+    fn j2_boundaries_untouched_and_registry_access_is_read_only() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let seg = |start: &str| -> &str {
+            let s = prod.find(start).unwrap_or_else(|| panic!("`{start}` 소실"));
+            &prod[s..s + prod[s..].find("\n}\n").expect("fn 끝")]
+        };
+        for f in ["fn decide_pending_update(", "fn maybe_apply_pending_update("] {
+            let b = seg(f);
+            assert!(
+                !b.contains("update_attempt") && !b.contains("smart_app_control"),
+                "{f} 에 J2 가 섞였다 — 설치 후 판정 동작은 바뀌면 안 된다"
+            );
+        }
+        let report = seg("async fn update_attempt_report(");
+        let knob = report.find("update_verify_from_env(").expect("update_attempt_report 에 노브가 없다");
+        let spawn = report.find("spawn_blocking(").expect("blocking 풀 경유 소실");
+        assert!(knob < spawn, "노브가 꺼졌으면 어떤 작업도 하기 전에 null 이어야 한다");
+        // 보고 명령의 입력: 경로·현재 버전·지금·OS·SAC 조회 — 하나라도 다른 값으로 바뀌면 판정이 엉뚱한 곳을 본다
+        for want in [
+            "&update_attempt_path()",
+            "env!(\"CARGO_PKG_VERSION\")",
+            "unix_now_secs()",
+            "std::env::consts::OS",
+            "smart_app_control_state",
+        ] {
+            assert!(report.contains(want), "update_attempt_report 가 `{want}` 를 쓰지 않는다 — 판정 입력이 바뀌었다");
+        }
+        let app_cmd = seg("async fn smart_app_control(");
+        assert!(app_cmd.contains("smart_app_control_state"), "smart_app_control 이 상태 판독 함수를 쓰지 않는다");
+        let sac = seg("fn smart_app_control_state(");
+        assert!(sac.contains("VerifiedAndReputablePolicyState") && sac.contains("\"query\""), "reg query 대상 소실");
+        assert!(
+            sac.contains("r\"HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\"") && sac.contains("\"/v\""),
+            "조회 대상 키 경로·값 지정(/v) 이 바뀌었다 — 스마트 앱 컨트롤 정책 키(CI\\Policy · VerifiedAndReputablePolicyState)"
+        );
+        assert!(sac.contains("no_console(&mut cmd)"), "reg.exe 호출에 no_console 이 없다 — 윈도우 콘솔 창이 번쩍인다");
+        for write_verb in ["\"add\"", "\"delete\"", "\"import\"", "\"save\"", "\"copy\"", "\"restore\""] {
+            assert!(!sac.contains(write_verb), "레지스트리 쓰기 동사 {write_verb} — 이 조회는 읽기 전용이다");
+        }
+        let cfg_at = sac.find("#[cfg(windows)]").expect("윈도우 분기(본문 안 cfg 블록) 소실");
+        let call_at = sac.find("Command::new(").expect("reg 호출 소실");
+        assert!(cfg_at < call_at, "reg 호출이 #[cfg(windows)] 블록 밖에 있다");
     }
 
     // HUD-2: open_url 화이트리스트 — https·허용 도메인만 통과, 위장 host(userinfo/서브도메인 사칭) 차단.

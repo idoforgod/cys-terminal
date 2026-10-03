@@ -151,6 +151,7 @@ import {
   USAGE_HIDDEN_MAX,
 } from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보·전 좌석 폴백 집계
 import { starvedNotice, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
+import { planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
@@ -3456,14 +3457,17 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
         if (destWs.tree) destWs.tree = replaceNode(destWs.tree, newSid, () => null);
       }
       render();
+      // ★(0.14.43 · J2 · I6 N2) 사유는 번역기를 거친다 — 데몬 원문의 'retry later or use --queued' 같은 처방은 GUI 사용자가 실행할 수 없다.
+      //   번역표에 없는 오류는 원문 그대로 돌려주므로 정보 손실은 없다(재기동 경로 restartNode 와 같은 restartInvokeFailureReason).
+      const why = restartInvokeFailureReason(e);
       toast(
         "watchdog",
         "전출 실패",
         !launchSent
-          ? `${e} — 원본 pane은 보존되고 새 pane은 회수했습니다`
+          ? `${why} — 원본 pane은 보존되고 새 pane은 회수했습니다`
           : agentSid == null
-            ? `${e} — 원본 pane은 보존됩니다. 목적지 런처 셸 surface:${newSid} 는 기동이 진행 중일 수 있어 남겨 두었습니다(확인 후 정리하세요)`
-            : `${e} — 원본 pane은 보존됩니다. 목적지에 기동된 surface:${agentSid} 와 런처 셸 surface:${newSid} 는 살아 있으니 확인 후 정리하세요`,
+            ? `${why} — 원본 pane은 보존됩니다. 목적지 런처 셸 surface:${newSid} 는 기동이 진행 중일 수 있어 남겨 두었습니다(확인 후 정리하세요)`
+            : `${why} — 원본 pane은 보존됩니다. 목적지에 기동된 surface:${agentSid} 와 런처 셸 surface:${newSid} 는 살아 있으니 확인 후 정리하세요`,
       );
       return;
     }
@@ -3473,7 +3477,7 @@ async function transferCrossDept(sid: number, srcWs: Workspace, destWs: Workspac
     render();
     toast("feed", "부서 전출 완료", `→ ${destWs.name || UNTITLED} (surface:${newSid})`);
   } catch (e) {
-    toast("watchdog", "전출 실패", `${e} — 원본 pane은 보존됩니다`);
+    toast("watchdog", "전출 실패", `${restartInvokeFailureReason(e)} — 원본 pane은 보존됩니다`); // ★J2·N2: 사유는 번역기를 거친다(위 inner catch 와 같다)
   } finally {
     // 인계 적재에 이르지 못한 전출은 기록을 남기지 않는다(다음 시도는 새 전출). 적재 뒤에는
     // `awaitHandoffAck` 가 기록의 다음 상태(해제·인수 대기)를 소유한다.
@@ -6269,6 +6273,10 @@ let updRefreshInFlight: Promise<void> | null = null;
 // 단일 비행을 영구히 붙잡는 것을 막는다. check_update·check_pack_update 는 부작용 없는 조회라 rpcT 의 전제를
 // 지킨다(진 쪽이 뒤늦게 끝나도 상태를 바꾸지 않는다 — 결과는 버려진다).
 const T_UPD_CHECK = winScaled(60_000);
+// ★(0.14.43 · J2) 패치 설치 확인 창을 열기 전 '스마트 앱 컨트롤 상태' 조회의 상한. 넘기면: 안내 문단 없이 확인 창을 연다(조회는 정보일 뿐
+// 설치를 막지 않는다 — 이 조회 때문에 창이 멈추면 안 된다). 맥·리눅스는 프로세스를 띄우지 않고 곧바로 null 이라 이 상한에 닿지 않는다.
+// 윈도우는 reg.exe 1회(Defender 콜드스타트가 겹쳐도 수 초 안)라 winScaled 로 2배(= 5초)다. 부작용 없는 읽기라 rpcT 의 전제를 지킨다.
+const T_SAC = winScaled(2_500);
 let updAppVersion = "";
 // 클릭 창(열려 있을 때만 존재) — 확인이 끝나면 같은 창을 다시 그린다(창 1개 상한).
 let updPanel: HTMLElement | null = null;
@@ -6472,11 +6480,22 @@ async function promptBinaryPatch() {
     return;
   }
   const v = ba.version;
+  // ★(0.14.43 · J2) 설치 전 사실 고지 — Windows 스마트 앱 컨트롤이 켜져 있으면 서명 없는 설치 파일이 막힐 수 있고, 막히면 경고 없이 지금
+  //   버전이 그대로 남는다. **켜짐일 때만** 확인 창 본문 끝에 한 문단을 붙인다 — 설치를 막지는 않는다(계속할지는 사용자가 정한다).
+  //   조회는 정보일 뿐이라 실패·시간 초과는 '문단 없음'으로 접는다(T_SAC 상한 + catch). 문단이 없으면 본문은 종전과 바이트 동일하다.
+  let sacNote: string | null = null;
+  try {
+    const sac = await rpcT(invoke("smart_app_control"), T_SAC);
+    sacNote = sacPreflightText(typeof sac === "string" ? sac : null);
+  } catch {
+    sacNote = null;
+  }
   const ok = await confirmModal(
     `새 본체 버전 ${v} — 패치 설치`,
     `새 본체(앱) ${v}을 패치 방식으로 설치합니다: 저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 ` +
       `재시작합니다. 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +
-      `있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)`,
+      `있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)` +
+      (sacNote ? `\n\n${sacNote}` : ""),
     "설치",
   );
   if (!ok) return;
@@ -8425,6 +8444,10 @@ async function start() {
   } catch {
     /* 비-macOS·번들 밖 실행은 해당 없음 */
   }
+  // ★업데이트 미설치 알림 pull(0.14.43 · J2): 설치본 무결성 pull **바로 뒤**. 데몬과 무관한 파일 판정이라 daemon-ready 대기 앞에 둔다.
+  //   fire-and-forget — 이후 부트 코드는 이 결과에 무의존이고, 윈도우에서는 스마트 앱 컨트롤 조회(reg 1회)가 붙을 수 있어 직렬 await 로
+  //   기동을 늦추지 않는다. 판정·재시도·실패 무시는 pullUpdateAttemptReport 가 한다(알림 id = UPDATE_FAILED_TOAST_ID).
+  void pullUpdateAttemptReport();
   // ★INST-1 온보딩 카드(P4-4 · claude CLI 미설치): 의무 CLI가 없으면 팀 부트가 통째로 서는데
   // 종전 신호(boot-warning 계열)는 실패 사실만 말하고 설치 방법이 없었다. 판정·문구는 백엔드
   // claude_missing_hint가 cys agent-detect 단일 오라클(CS-1③)의 typed installed:false + hint
@@ -9411,6 +9434,26 @@ async function start() {
   // 사이드바 노드 신호(B3): 시작 1회 + 10s idle 폴백(이벤트 구동은 onDaemonEvent에서). CC 5s 폴링보다 가벼움.
   refreshSidebarStatus();
   setInterval(refreshSidebarStatus, 10000);
+}
+
+/// ★(0.14.43 · J2) 재시작 뒤 1회 판정 pull — 인앱 업데이트를 눌렀는데 설치되지 않은 채 앱이 다시 열렸으면(윈도우 스마트 앱 컨트롤 차단 등)
+/// 한 번 알린다. 백엔드 `update_attempt_report` 가 설치 직전의 '시도 기록'을 읽어 판정한다 — 설치됐거나 기록이 없으면 null(무음).
+/// 설치기가 아직 도는 중일 수 있으면(pending) `wait_secs + 5` 초 뒤 **한 번만** 다시 당긴다 — 타이머 1개 · 그때도 보류면 더 하지 않는다
+/// (재귀·반복 없음). 응답의 해석(알림·재시도·무시)은 순수 함수 planUpdateAttemptReport 가 한다. 조회 실패는 전부 조용히 무시한다 —
+/// 이 알림 때문에 부팅이 막히거나 어긋나지 않는다(기동 pull 의 try/catch 관례).
+/// (정의는 start() 바로 아래다 — 호출은 start() 안, 설치본 무결성 pull 바로 뒤.)
+async function pullUpdateAttemptReport(): Promise<void> {
+  try {
+    let plan = planUpdateAttemptReport(await invoke("update_attempt_report"));
+    if (plan.kind === "retry") {
+      const delayMs = plan.delayMs;
+      await new Promise<void>((res) => setTimeout(res, delayMs)); // 타이머 1개 — 재-pull 은 이 한 번뿐
+      plan = planUpdateAttemptReport(await invoke("update_attempt_report"));
+    }
+    if (plan.kind === "notice") stickyToast(UPDATE_FAILED_TOAST_ID, "health", plan.title, plan.body); // 수명 10분·만료 배너 = toastttl.ts
+  } catch {
+    /* 구 백엔드·조회 실패 — 알림 없음 · 부팅 무영향 */
+  }
 }
 
 // ---------- ui wiring ----------
