@@ -1,0 +1,922 @@
+{
+    "phase":  "enforce",
+    "generated":  "2026-10-03T21:21:17.931Z",
+    "control_interpretation":  "ISG appears to work and discriminates: NEG (fresh unsigned exe) is flagged, POS-UNSIGNED (widely used unsigned installer) is not",
+    "neg_flagged":  true,
+    "pos_unsigned_flagged":  false,
+    "unmatched_event_ids":  {
+                                "3101":  1,
+                                "3105":  14,
+                                "3103":  1,
+                                "3096":  4,
+                                "3099":  3,
+                                "3116":  3,
+                                "3102":  1
+                            },
+    "rows":  [
+                 {
+                     "label":  "installer 0.14.37",
+                     "kind":  "installer",
+                     "sig":  "NotSigned",
+                     "sha256":  "e46b9f8d65ca65e2e90fafb516c255eae15ba4b5e2437ec79ca7e899627e22f7",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\inst-0.14.37.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "installer 0.14.41",
+                     "kind":  "installer",
+                     "sig":  "NotSigned",
+                     "sha256":  "e066e689d2806f085ac1f5a9c3321371489b6f843c55b411fb6793387782b10b",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\inst-0.14.41.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "installer 0.14.42",
+                     "kind":  "installer",
+                     "sig":  "NotSigned",
+                     "sha256":  "e0810a429c757d81e33c7b3655fd55aaa746be94ecfd68961e6c2d6da0eec37e",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\inst-0.14.42.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "app 0.14.37 cys-app.exe",
+                     "kind":  "app-main",
+                     "sig":  "NotSigned",
+                     "sha256":  "78e06dd599a054939ddf6d64d467eeeefd787be1a01a027cc92a14a160b5407e",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.37-cys-app.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "app 0.14.37 cys.exe",
+                     "kind":  "app-main",
+                     "sig":  "NotSigned",
+                     "sha256":  "98afc2e2a8a1fa174dc9fbbb93178b92dc1aae8f0c6a11db6127b820a0b7babf",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.37-cys.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "app 0.14.37 cysd.exe",
+                     "kind":  "app-main",
+                     "sig":  "NotSigned",
+                     "sha256":  "16c0c6432975496f732eb8ed70d57748194d16431984d895062aa0fa4685d31b",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.37-cysd.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "app 0.14.41 cys-app.exe",
+                     "kind":  "app-main",
+                     "sig":  "NotSigned",
+                     "sha256":  "42a255f0c5ac5dbb7268b4cf91d1ba95d8b8dfe5246ce1c8afdec2356e767340",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.41-cys-app.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "app 0.14.41 cys.exe",
+                     "kind":  "app-main",
+                     "sig":  "NotSigned",
+                     "sha256":  "90ddd46b2622cfaa6b1578ef7f1f7a6fe5319eece1bdbee88eca8dcea9a60c12",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.41-cys.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "app 0.14.41 cysd.exe",
+                     "kind":  "app-main",
+                     "sig":  "NotSigned",
+                     "sha256":  "e41745e7b07792b911cf91183987795b5a761ab1187a30c888d875c4f112fd70",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.41-cysd.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "app 0.14.42 cys-app.exe",
+                     "kind":  "app-main",
+                     "sig":  "NotSigned",
+                     "sha256":  "bc1c6e19bcf3e0dcd4abba8c363423525ee1e050b4929a31c49f7e56e2f142ab",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.42-cys-app.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "app 0.14.42 cys.exe",
+                     "kind":  "app-main",
+                     "sig":  "NotSigned",
+                     "sha256":  "c3d91129278246cf396a119e9f8addf9eb06af4d30053c3f5bc4f06c1857d2f2",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.42-cys.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "app 0.14.42 cysd.exe",
+                     "kind":  "app-main",
+                     "sig":  "NotSigned",
+                     "sha256":  "5286f08c891e7cbe5992509688bd4f69028f635f825391a1f899215680b3d8f9",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.42-cysd.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "control NEG (fresh unsigned exe)",
+                     "kind":  "control-neg",
+                     "sig":  "NotSigned",
+                     "sha256":  "9c2009a0b7303b6a7f6fdc78609da41cc5460b5a63bfd2560f476825e168a2e2",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-neg-fresh.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "control POS-UNSIGNED 7-Zip setup",
+                     "kind":  "control-pos-unsigned",
+                     "sig":  "NotSigned",
+                     "sha256":  "78afa2a1c773caf3cf7edf62f857d2a8a5da55fb0fff5da416074c0d28b2b55f",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-pos-7zip-setup.exe",
+                     "probe1":  "ok",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  true,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  0,
+                                           "last_error_hex":  "0x00000000",
+                                           "last_error_text":  "",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  true,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  0,
+                     "ev3089":  0,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+
+                                     ],
+                     "events_attributed_via_activity_id":  0
+                 },
+                 {
+                     "label":  "control POS-UNSIGNED 7z.exe",
+                     "kind":  "control-pos-unsigned",
+                     "sig":  "NotSigned",
+                     "sha256":  "4cd7d776c686427226a151789d2d61f0b2ed2c392148cc4e69c0238362fafecf",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-pos-7z.exe",
+                     "probe1":  "ok",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  true,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  0,
+                                           "last_error_hex":  "0x00000000",
+                                           "last_error_text":  "",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  true,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  0,
+                     "ev3089":  0,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+
+                                     ],
+                     "events_attributed_via_activity_id":  0
+                 },
+                 {
+                     "label":  "control POS-UNSIGNED 7zFM.exe",
+                     "kind":  "control-pos-unsigned",
+                     "sig":  "NotSigned",
+                     "sha256":  "5cbdf46a4ef4b462e63e53dc385c44c85af079f1aa23572d4420a653492b59f3",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-pos-7zFM.exe",
+                     "probe1":  "ok",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  true,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  0,
+                                           "last_error_hex":  "0x00000000",
+                                           "last_error_text":  "",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  true,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  0,
+                     "ev3089":  0,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+
+                                     ],
+                     "events_attributed_via_activity_id":  0
+                 },
+                 {
+                     "label":  "control POS-SIGNED node.exe (0.14.42 runtime)",
+                     "kind":  "control-signed",
+                     "sig":  "Valid",
+                     "sha256":  "0f1098a455c7058daaaccd660d3a71dfed1cc0ffe8bea826170a7807d36fcef2",
+                     "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-signed-node.exe",
+                     "probe1":  "ok",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  true,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  0,
+                                           "last_error_hex":  "0x00000000",
+                                           "last_error_text":  "",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  true,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  0,
+                     "ev3089":  0,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+
+                                     ],
+                     "events_attributed_via_activity_id":  0
+                 },
+                 {
+                     "label":  "installed 0.14.37 cys-app.exe",
+                     "kind":  "installed-0.14.37",
+                     "sig":  "NotSigned",
+                     "sha256":  "78e06dd599a054939ddf6d64d467eeeefd787be1a01a027cc92a14a160b5407e",
+                     "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "installed 0.14.37 cysd.exe",
+                     "kind":  "installed-0.14.37",
+                     "sig":  "NotSigned",
+                     "sha256":  "16c0c6432975496f732eb8ed70d57748194d16431984d895062aa0fa4685d31b",
+                     "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  1,
+                     "ev3089":  2,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  1,
+                                          "3089":  2,
+                                          "3077":  1,
+                                          "3118":  1
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  2
+                 },
+                 {
+                     "label":  "installed 0.14.37 cys.exe",
+                     "kind":  "installed-0.14.37",
+                     "sig":  "NotSigned",
+                     "sha256":  "98afc2e2a8a1fa174dc9fbbb93178b92dc1aae8f0c6a11db6127b820a0b7babf",
+                     "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                     "probe1":  "ERR4551",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  false,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  4551,
+                                           "last_error_hex":  "0x000011C7",
+                                           "last_error_text":  "An Application Control policy has blocked this file",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  false,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  13,
+                     "ev3089":  26,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+                                          "3033":  13,
+                                          "3089":  26,
+                                          "3077":  13,
+                                          "3118":  13
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+                                         "27",
+                                         "VerifiedAndReputableDesktop"
+                                     ],
+                     "events_attributed_via_activity_id":  26
+                 },
+                 {
+                     "label":  "control POS-SIGNED runner node.exe (setup-node)",
+                     "kind":  "control-signed-runner",
+                     "sig":  "Valid",
+                     "sha256":  "b5a3165ec6f24c0b1fe2a10fed58e03f6c1d7d141beb3b225ff030ceac6c5eb5",
+                     "path":  "C:\\hostedtoolcache\\windows\\node\\22.23.3\\arm64\\node.exe",
+                     "probe1":  "ok",
+                     "probe2":  "-",
+                     "probe1_detail":  {
+                                           "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                           "ok":  true,
+                                           "ret":  0,
+                                           "ret_meaning":  null,
+                                           "last_error":  0,
+                                           "last_error_hex":  "0x00000000",
+                                           "last_error_text":  "",
+                                           "first_wait_timed_out":  false,
+                                           "timed_out":  false,
+                                           "completed":  true,
+                                           "had_process_handle":  true,
+                                           "note":  ""
+                                       },
+                     "probe2_detail":  null,
+                     "ev3076":  0,
+                     "ev3077":  0,
+                     "ev3089":  0,
+                     "ev3090":  0,
+                     "ev3091":  0,
+                     "ev3092":  0,
+                     "events_by_id":  {
+
+                                      },
+                     "passesSmartlocker":  [
+
+                                           ],
+                     "policyNames":  [
+
+                                     ],
+                     "events_attributed_via_activity_id":  0
+                 }
+             ]
+}

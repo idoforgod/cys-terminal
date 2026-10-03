@@ -1,0 +1,27 @@
+2026-10-03T21:19:18.704Z [INFO] === sacreal-e2e start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-03T21:19:18.796Z [INFO] --- step prepare (minutes left 33.8, language mode FullLanguage) ---
+2026-10-03T21:19:24.482Z [INFO] --- step install-0.14.37 (minutes left 33.7, language mode FullLanguage) ---
+2026-10-03T21:20:23.277Z [INFO] --- step A (minutes left 32.7, language mode FullLanguage) ---
+2026-10-03T21:20:25.319Z [INFO] A: before-node step (language mode FullLanguage)
+2026-10-03T21:20:30.490Z [INFO] checkpoint pre-sac: rc=0 publish-results: 20 files to upload, 0 skipped, out=C:\a\_temp\diag-out
+publish-results: ok -> refs/heads/diag-results/37154484788-1-sacreal-e2e-pre-sac-windows-11-arm (commit 47ce1f30dc43d01e7bae2252716a4269ddce5b31), 20 files + manifest
+2026-10-03T21:23:02.211Z [INFO] --- step A-verdict (minutes left 30.1, language mode FullLanguage) ---
+2026-10-03T21:23:02.274Z [ERROR] STEP FAILED [step A-verdict]: System.ArgumentException: Argument types do not match At C:\a\cys-terminal\cys-terminal\diag\sacreal-e2e.ps1:697 char:29
++             foreach ($sr in @($ob['screenshots'])) {
++                             ~~~~~~~~~~~~~~~~~~~~~
+2026-10-03T21:23:02.294Z [INFO] --- step checkpoint-after-A (minutes left 30.1, language mode FullLanguage) ---
+2026-10-03T21:23:07.740Z [INFO] checkpoint after-A: rc=0 publish-results: 61 files to upload, 1 skipped, out=C:\a\_temp\diag-out
+publish-results: ok -> refs/heads/diag-results/37154484788-1-sacreal-e2e-after-A-windows-11-arm (commit 9c9e5bfd7e720f7730861380849841e88c58646c), 61 files + manifest
+2026-10-03T21:23:07.822Z [INFO] --- step B (minutes left 30, language mode FullLanguage) ---
+2026-10-03T21:23:16.015Z [INFO] --- step restore (minutes left 29.8, language mode FullLanguage) ---
+2026-10-03T21:23:23.618Z [INFO] --- step final-events (minutes left 29.7, language mode FullLanguage) ---
+2026-10-03T21:23:27.310Z [INFO] --- step summary (minutes left 29.7, language mode FullLanguage) ---
+2026-10-03T21:23:27.341Z [INFO] SUMMARY sacreal-e2e on windows-11-arm: measurable=True; SAC switched on at 2026-10-03T21:20:30.508Z; run 2026-10-03T21:19:18.731Z .. 2026-10-03T21:23:27.326Z
+2026-10-03T21:23:27.341Z [INFO] SUMMARY SAC on confirmed=True: registry value=1; CiTool VerifiedAndReputableDesktop IsEnforced=True; Defender SmartAppControlState=On; UMCI flag=True
+2026-10-03T21:23:27.341Z [INFO] SUMMARY matrix (CreateProcessW probes; blocked/allowed): installers 3/0 [ERR4551]; app exes 9/0 [ERR4551]; installed 0.14.37 exes 3/0 [ERR4551]
+2026-10-03T21:23:27.341Z [INFO] SUMMARY controls (blocked/allowed): NEG 1/0; POS-UNSIGNED 0/3; POS-SIGNED (cys runtime node) 0/1; runner node.exe 0/1; ISG appears to work and discriminates: NEG (fresh unsigned exe) is flagged, POS-UNSIGNED (widely used unsigned installer) is not
+2026-10-03T21:23:27.341Z [INFO] SUMMARY A: no verdict (scenario A did not run)
+2026-10-03T21:23:27.357Z [INFO] SUMMARY B (installed cys-app.exe started with Start-Process under SAC): started=False; Start-Process failed: is 4551=True (native error code , CreateProcessW probe last_error 4551): This command cannot be run due to the error: An Application Control policy has blocked this file.; alive after 60 s=; CDP attached=
+2026-10-03T21:23:27.357Z [INFO] SUMMARY B: cysd.exe --version: rc= startError=Exception calling "Start" with "1" argument(s): "An Application Control policy has blocked this file"; cys.exe --version: rc= startError=Exception calling "Start" with "1" argument(s): "An Application Control policy has blocked this file"
+2026-10-03T21:23:27.357Z [INFO] SUMMARY restore: ok=True; registry value=0; enforced=False; Defender SmartAppControlState=Off; NEG control runs again=True
+2026-10-03T21:23:27.373Z [INFO] === sacreal-e2e end ===

@@ -1,0 +1,10 @@
+{"t":"2026-10-03T21:20:25.507Z","name":"start","argv":"--mode attach --port 9333 --out C:\\a\\_temp\\diag-out --prefix sacreal-e2e-A-pre --max-wait-sec 120","native_websocket":true}
+{"t":"2026-10-03T21:20:25.529Z","name":"targets","count":1,"pages":1}
+{"t":"2026-10-03T21:20:25.538Z","name":"connected","url":"about:blank","title":"about:blank","ws_impl":"mini"}
+{"t":"2026-10-03T21:20:27.579Z","name":"attached","url":"about:blank","title":"about:blank","id":"B9388FCA5BAC47DF4EE5CA188DC67772"}
+{"t":"2026-10-03T21:20:27.582Z","name":"page_info","href":"http://tauri.localhost/"}
+{"t":"2026-10-03T21:20:27.588Z","name":"app_version","value":"0.14.37"}
+{"t":"2026-10-03T21:20:27.642Z","name":"screenshot","file":"sacreal-e2e-A-pre-before.png","bytes":16536}
+{"t":"2026-10-03T21:20:28.083Z","name":"check_update","ok":true,"value":"{\"current\":\"0.14.37\",\"notes\":\"cys 터미널 v0.14.42. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.\",\"version\":\"0.14.42\"}"}
+{"t":"2026-10-03T21:20:28.084Z","name":"attach mode: stopping before listeners / install_update"}
+

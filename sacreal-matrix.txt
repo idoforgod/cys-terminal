@@ -1,0 +1,29 @@
+REAL Smart App Control ON (VerifiedAndReputablePolicyState=1 + CiTool -r) on windows-11-arm; switched on at 2026-10-03T21:20:30.508Z; probe = CreateProcessW(CREATE_SUSPENDED) + TerminateProcess (no code runs). Rows: 3 installers, 9 app exes, controls, installed 0.14.37 exes, runner node.exe (bundled runtime files are not part of this matrix).
+Matrix phase=enforce  block event=3077  (p1/p2 = CreateProcessW(CREATE_SUSPENDED) pass 1 / pass 2; evXXXX = number of matching CodeIntegrity events)
+Control interpretation: ISG appears to work and discriminates: NEG (fresh unsigned exe) is flagged, POS-UNSIGNED (widely used unsigned installer) is not
+Note: events 3090-3092 (ISG / managed installer verdicts) may be absent on a hosted runner (TestFlags needs a reboot); their absence does not mean ISG was not consulted. 3089 and 309x are attributed to a file through the Correlation ActivityID of a path-matched 3076/3077.
+
+label                                                | kind                 | sig        | p1       | p2       | 3076 | 3077 | 309x(0/1/2) | 3089 | passesSmartlocker
+installer 0.14.37                                    | installer            | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+installer 0.14.41                                    | installer            | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+installer 0.14.42                                    | installer            | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+app 0.14.37 cys-app.exe                              | app-main             | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+app 0.14.37 cys.exe                                  | app-main             | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+app 0.14.37 cysd.exe                                 | app-main             | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+app 0.14.41 cys-app.exe                              | app-main             | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+app 0.14.41 cys.exe                                  | app-main             | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+app 0.14.41 cysd.exe                                 | app-main             | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+app 0.14.42 cys-app.exe                              | app-main             | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+app 0.14.42 cys.exe                                  | app-main             | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+app 0.14.42 cysd.exe                                 | app-main             | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+control NEG (fresh unsigned exe)                     | control-neg          | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+control POS-UNSIGNED 7-Zip setup                     | control-pos-unsigned | NotSigned  | ok       | -        | 0 | 0 | 0/0/0 | 0 | 
+control POS-UNSIGNED 7z.exe                          | control-pos-unsigned | NotSigned  | ok       | -        | 0 | 0 | 0/0/0 | 0 | 
+control POS-UNSIGNED 7zFM.exe                        | control-pos-unsigned | NotSigned  | ok       | -        | 0 | 0 | 0/0/0 | 0 | 
+control POS-SIGNED node.exe (0.14.42 runtime)        | control-signed       | Valid      | ok       | -        | 0 | 0 | 0/0/0 | 0 | 
+installed 0.14.37 cys-app.exe                        | installed-0.14.37    | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+installed 0.14.37 cysd.exe                           | installed-0.14.37    | NotSigned  | ERR4551  | -        | 0 | 1 | 0/0/0 | 2 | 
+installed 0.14.37 cys.exe                            | installed-0.14.37    | NotSigned  | ERR4551  | -        | 0 | 13 | 0/0/0 | 26 | 
+control POS-SIGNED runner node.exe (setup-node)      | control-signed-runner | Valid      | ok       | -        | 0 | 0 | 0/0/0 | 0 | 
+
+events not matched to any subject (by id): {"3101":1,"3105":14,"3103":1,"3096":4,"3099":3,"3116":3,"3102":1}

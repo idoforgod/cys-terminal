@@ -1,0 +1,20 @@
+{
+    "pre":  {
+                "started":  "2026-10-03T21:20:25.325Z",
+                "node_exe":  "C:\\hostedtoolcache\\windows\\node\\22.23.3\\arm64\\node.exe",
+                "rc":  0,
+                "attached":  true,
+                "app_version":  "0.14.37",
+                "check_update":  {
+                                     "current":  "0.14.37",
+                                     "notes":  "cys 터미널 v0.14.42. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.",
+                                     "version":  "0.14.42"
+                                 },
+                "check_update_error":  null,
+                "error_summary":  null,
+                "json_file":  "sacreal-e2e-A-pre-cdp.json",
+                "error":  null
+            },
+    "skipped_reason":  null,
+    "sac_enforced_at_install_call":  true
+}

@@ -1,0 +1,126 @@
+{
+    "scenario":  "B",
+    "description":  "after scenario A the leftover cys processes were killed (by install folder path); then the installed cys-app.exe is started for real (Start-Process) while Smart App Control is ON",
+    "started":  "2026-10-03T21:23:07.838Z",
+    "language_mode":  "FullLanguage",
+    "install_dir":  "C:\\Users\\runneradmin\\AppData\\Local\\cys",
+    "leftovers_killed":  [
+                             "cysd.exe#5784"
+                         ],
+    "processes_after_cleanup":  [
+
+                                ],
+    "createprocess_probe":  {
+                                "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                "ok":  false,
+                                "ret":  0,
+                                "ret_meaning":  null,
+                                "last_error":  4551,
+                                "last_error_hex":  "0x000011C7",
+                                "last_error_text":  "An Application Control policy has blocked this file",
+                                "first_wait_timed_out":  false,
+                                "timed_out":  false,
+                                "completed":  true,
+                                "had_process_handle":  false,
+                                "note":  ""
+                            },
+    "start":  {
+                  "ok":  false,
+                  "pid":  null,
+                  "error":  {
+                                "type":  "System.InvalidOperationException",
+                                "message":  "This command cannot be run due to the error: An Application Control policy has blocked this file.",
+                                "hresult":  "0x80131509",
+                                "native_error_code":  null,
+                                "is_4551":  true,
+                                "message_mentions_policy":  true,
+                                "inner":  [
+                                              "System.InvalidOperationException: This command cannot be run due to the error: An Application Control policy has blocked this file."
+                                          ],
+                                "fully_qualified_error_id":  "InvalidOperationException,Microsoft.PowerShell.Commands.StartProcessCommand",
+                                "raw":  "Start-Process : This command cannot be run due to the error: An Application Control policy has blocked this file.\r\nAt C:\\a\\cys-terminal\\cys-terminal\\diag\\sacreal-e2e.ps1:808 char:25\r\n+ ...     $proc = Start-Process -FilePath $exe -WorkingDirectory $dir -Pass ...\r\n+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : InvalidOperation: (:) [Start-Process], InvalidOperationException\r\n    + FullyQualifiedErrorId : InvalidOperationException,Microsoft.PowerShell.Commands.StartProcessCommand\r\n \r\n",
+                                "is_4551_basis":  "message text (the native code was not preserved by Start-Process)"
+                            },
+                  "time":  "2026-10-03T21:23:11.393Z",
+                  "createprocess_probe_last_error":  4551,
+                  "createprocess_probe_is_4551":  true
+              },
+    "samples":  null,
+    "after_60s":  null,
+    "cdp":  null,
+    "webview2_policy":  {
+                            "key":  "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments",
+                            "value_name":  "cys-app.exe",
+                            "key_existed":  false,
+                            "old_value_present":  false,
+                            "old_value_query":  "",
+                            "set_rc":  0,
+                            "set_out":  "The operation completed successfully.",
+                            "set_err":  "",
+                            "verify_out":  "HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments\r\n    cys-app.exe    REG_SZ    --remote-debugging-port=9333 --remote-allow-origins=*"
+                        },
+    "webview2_policy_removed":  {
+                                    "value_deleted_rc":  0,
+                                    "key_deleted_rc":  0,
+                                    "note":  null
+                                },
+    "killed_at_end":  [
+
+                      ],
+    "cysd_version":  {
+                         "exe":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                         "exists":  true,
+                         "createprocess_probe":  {
+                                                     "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                     "ok":  false,
+                                                     "ret":  0,
+                                                     "ret_meaning":  null,
+                                                     "last_error":  4551,
+                                                     "last_error_hex":  "0x000011C7",
+                                                     "last_error_text":  "An Application Control policy has blocked this file",
+                                                     "first_wait_timed_out":  false,
+                                                     "timed_out":  false,
+                                                     "completed":  true,
+                                                     "had_process_handle":  false,
+                                                     "note":  ""
+                                                 },
+                         "probe_blocked":  true,
+                         "run":  {
+                                     "rc":  null,
+                                     "timed_out":  false,
+                                     "start_error":  "Exception calling \"Start\" with \"1\" argument(s): \"An Application Control policy has blocked this file\"",
+                                     "stdout":  "",
+                                     "stderr":  "",
+                                     "ms":  1186
+                                 }
+                     },
+    "cys_version":  {
+                        "exe":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                        "exists":  true,
+                        "createprocess_probe":  {
+                                                    "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                    "ok":  false,
+                                                    "ret":  0,
+                                                    "ret_meaning":  null,
+                                                    "last_error":  4551,
+                                                    "last_error_hex":  "0x000011C7",
+                                                    "last_error_text":  "An Application Control policy has blocked this file",
+                                                    "first_wait_timed_out":  false,
+                                                    "timed_out":  false,
+                                                    "completed":  true,
+                                                    "had_process_handle":  false,
+                                                    "note":  ""
+                                                },
+                        "probe_blocked":  true,
+                        "run":  {
+                                    "rc":  null,
+                                    "timed_out":  false,
+                                    "start_error":  "Exception calling \"Start\" with \"1\" argument(s): \"An Application Control policy has blocked this file\"",
+                                    "stdout":  "",
+                                    "stderr":  "",
+                                    "ms":  993
+                                }
+                    },
+    "exception":  null,
+    "finished":  "2026-10-03T21:23:16.009Z"
+}

@@ -1,0 +1,8 @@
+sacreal-e2e on windows-11-arm: measurable=True; SAC switched on at 2026-10-03T21:20:30.508Z; run 2026-10-03T21:19:18.731Z .. 2026-10-03T21:23:27.326Z
+SAC on confirmed=True: registry value=1; CiTool VerifiedAndReputableDesktop IsEnforced=True; Defender SmartAppControlState=On; UMCI flag=True
+matrix (CreateProcessW probes; blocked/allowed): installers 3/0 [ERR4551]; app exes 9/0 [ERR4551]; installed 0.14.37 exes 3/0 [ERR4551]
+controls (blocked/allowed): NEG 1/0; POS-UNSIGNED 0/3; POS-SIGNED (cys runtime node) 0/1; runner node.exe 0/1; ISG appears to work and discriminates: NEG (fresh unsigned exe) is flagged, POS-UNSIGNED (widely used unsigned installer) is not
+A: no verdict (scenario A did not run)
+B (installed cys-app.exe started with Start-Process under SAC): started=False; Start-Process failed: is 4551=True (native error code , CreateProcessW probe last_error 4551): This command cannot be run due to the error: An Application Control policy has blocked this file.; alive after 60 s=; CDP attached=
+B: cysd.exe --version: rc= startError=Exception calling "Start" with "1" argument(s): "An Application Control policy has blocked this file"; cys.exe --version: rc= startError=Exception calling "Start" with "1" argument(s): "An Application Control policy has blocked this file"
+restore: ok=True; registry value=0; enforced=False; Defender SmartAppControlState=Off; NEG control runs again=True

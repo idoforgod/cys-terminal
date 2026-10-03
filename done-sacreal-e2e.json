@@ -1,0 +1,12 @@
+{
+    "script":  "sacreal-e2e",
+    "finished":  "2026-10-03T21:23:27.357Z",
+    "error_count":  1,
+    "errors":  [
+                   {
+                       "step":  "step A-verdict",
+                       "time":  "2026-10-03T21:23:02.274Z",
+                       "error":  "System.ArgumentException: Argument types do not match At C:\\a\\cys-terminal\\cys-terminal\\diag\\sacreal-e2e.ps1:697 char:29\r\n+             foreach ($sr in @($ob[\u0027screenshots\u0027])) {\r\n+                             ~~~~~~~~~~~~~~~~~~~~~"
+                   }
+               ]
+}

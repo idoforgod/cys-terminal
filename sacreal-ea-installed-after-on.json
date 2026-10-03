@@ -1,0 +1,5 @@
+{
+    "installed 0.14.37 cys-app.exe":  "rc=0 startError=\r\n\r\nThe file C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe does not have extended attributes (EA).\r\n",
+    "installed 0.14.37 cysd.exe":  "rc=0 startError=\r\n\r\nThe file C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe does not have extended attributes (EA).\r\n",
+    "installed 0.14.37 cys.exe":  "rc=0 startError=\r\n\r\nThe file C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe does not have extended attributes (EA).\r\n"
+}
