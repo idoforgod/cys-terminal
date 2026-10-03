@@ -3432,6 +3432,13 @@ pub struct Daemon {
     pub parser_panics_total: AtomicU64,
     /// CC v2 WS-A: 계정 단위 rate limit 집계 상태(뷰·신원 캐시·영속 스로틀) — accounts.rs 전담.
     pub accounts: Mutex<crate::accounts::AccountsState>,
+    /// ★0.14.43(B3): 좌석 설정 폴더 **현재 신원**의 60초 하한 캐시(폴더 → (확인 시각, account_id)) — 좌석 신원 표(`accounts::seat_identity_view`)가 쓴다.
+    /// 경보 틱·status 폴링·계정 조회가 같은 폴더를 초 단위로 다시 stat 하지 않게 한다. **말단 락** — 조회·기록 때만 순간 잡고 그 안에서 다른 락을
+    /// 잡지 않는다(파일 IO 는 이 락을 쥐지 않은 채). `accounts` 와 겹쳐 쥐지 않는다.
+    pub seat_ident_cache: Mutex<crate::accounts::SeatIdentCache>,
+    /// ★0.14.43(B3): 경보 틱이 **직전 틱에 신선도 규칙으로 빠뜨려 `fired` 에 붙들어 둔** 경보 키 — `usage.alert_resolved{reason:"stale"}` 를 처음 빠질 때
+    /// 한 번만 내기 위한 표식(`governance::check_alerts_with`). 단일 writer(워치독 틱) · 말단 락.
+    pub alert_stale_held: Mutex<std::collections::HashSet<String>>,
     /// CC v2 WS-C: learn.status assets(기억·스킬·directives fs 스캔) 60s 캐시 — (계산 시각, 값).
     pub learn_assets_cache: Mutex<Option<(f64, serde_json::Value)>>,
     /// CC v2 WS-C: canonical 학습 상태(~/.cys/state/learn) 쓰기 직렬화 — 데몬 단일 writer 불변식.
@@ -5109,6 +5116,8 @@ impl Daemon {
             channels: Mutex::new(channels_conn),
             parser_panics_total: AtomicU64::new(0),
             accounts: Mutex::new(Default::default()),
+            seat_ident_cache: Mutex::new(Default::default()),
+            alert_stale_held: Mutex::new(Default::default()),
             learn_assets_cache: Mutex::new(None),
             learn_write: Mutex::new(()),
             restore_roots: Mutex::new(Vec::new()),

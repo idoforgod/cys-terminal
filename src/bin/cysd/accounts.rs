@@ -31,12 +31,20 @@
 //! - 병합 = 창 벡터 통째 최신 승자(같은 계정 풀은 최신 관측이 진실).
 //!
 //! 잠금 순서 불변식: accounts → (해제) → analytics. 역순 금지(교착).
+//!
+//! ★0.14.43(B3 · 한도 경보 신선도 규칙 — 오너 결재): 경보 입력 = `rate_window_live` ∧ (사용 중 ∨ 관측 나이 ≤ 1800초). 로그인을 바꾼 뒤에도 옛
+//! 계정의 리셋 전 값(99%)이 30분마다 CSO 로 가던 결함의 처방이다. 판정 불가 = 사용 중(실패 방향 = 경보 유지).
+//! 좌석 신원 표([`seat_identity_view`])가 그 '사용 중'의 재료다 — **락 간선(새 간선 없음 · 겹쳐 쥐지 않는다)**:
+//!   ① `surfaces` 락(좌석 표만 복사 · 파일 IO 없음) → **해제** → ② 폴더별 신원 판독(어떤 락도 쥐지 않은 채 · 60초 하한 캐시 `Daemon::seat_ident_cache` 는
+//!   조회·기록 때만 순간 잡는다 · 캐시 락 안에서 다른 락을 잡지 않는다 · 실판독 `claude_identity_unlocked` 는 종전 규율대로 accounts 락을 순간만) →
+//!   ③ `accounts` 락(메모리 연산뿐 — `alert_rates_with`·`local_json` 행 조립). surfaces 와 accounts 를 동시에 쥐는 곳은 없다.
 
 use crate::state::{Daemon, HideConsole};
-use crate::usage::RateWindow;
+use crate::usage::{ObservedUsage, RateWindow};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 /// 스냅샷 영속 스로틀 — 같은 (계정,창)에서 pct 변화가 이 미만이면 INSERT 생략.
@@ -472,6 +480,19 @@ pub fn note_rate(
     note_rate_at(daemon, dirs::home_dir().as_deref(), agent, session_file, rate, source, now);
 }
 
+/// ★0.14.43(B3): [`note_rate`] 의 **귀속 계정 반환판** — 동작은 같고, 귀속된 account_id 를 돌려준다(None = rate 가 비었거나 신원 불명 —
+/// 아무것도 쓰지 않았다). 좌석 `ObservedUsage::rate_account`(로그인 전환 판정의 입력)가 이 값을 쓴다.
+pub fn note_rate_resolved(
+    daemon: &Arc<Daemon>,
+    agent: &str,
+    session_file: &str,
+    rate: &[RateWindow],
+    source: &str,
+    now: f64,
+) -> Option<String> {
+    note_rate_at_resolved(daemon, dirs::home_dir().as_deref(), agent, session_file, rate, source, now)
+}
+
 /// 홈을 인자로 받는 시험 이음매(동작은 `note_rate` 와 같다). 반환: 계정에 **귀속됐는가**
 /// (false = rate 가 비었거나 신원 불명 — 아무것도 쓰지 않았다).
 /// ★fatal-fix R4-F2: 신원 해석(파일 IO)은 accounts 락 **밖**에서 끝낸 뒤 락을 잡는다.
@@ -484,8 +505,21 @@ fn note_rate_at(
     source: &str,
     now: f64,
 ) -> bool {
+    note_rate_at_resolved(daemon, home, agent, session_file, rate, source, now).is_some()
+}
+
+/// [`note_rate_at`] 의 본체 — 귀속된 account_id 를 돌려준다(None = 미귀속).
+fn note_rate_at_resolved(
+    daemon: &Arc<Daemon>,
+    home: Option<&Path>,
+    agent: &str,
+    session_file: &str,
+    rate: &[RateWindow],
+    source: &str,
+    now: f64,
+) -> Option<String> {
     if rate.is_empty() {
-        return false;
+        return None;
     }
     let resolved = match agent {
         "claude" => profile_dir_from_session(session_file).and_then(|dir| {
@@ -494,19 +528,35 @@ fn note_rate_at(
         other => fixed_resolution(home, other),
     };
     let Some(resolved) = resolved else {
-        return false; // 미귀속(신원 불명) — 유령 계정을 만들지 않는다
+        return None; // 미귀속(신원 불명) — 유령 계정을 만들지 않는다
     };
-    note_resolved(daemon, resolved, rate, source, now)
+    let account_id = resolved.0.account_id.clone();
+    note_resolved(daemon, resolved, rate, source, now);
+    Some(account_id)
 }
 
 /// ★fatal-fix (a): claude 좌석 보고를 **좌석의 설정 폴더**(데몬이 그 좌석에 넣어 준 `CLAUDE_CONFIG_DIR`)로 귀속한다 —
 /// 호출자가 댄 transcript 경로로는 신원 파일을 고르지 않는다(호출자 경로로 파일시스템을 건드리지 않는다 · R4-F2 ③).
 /// 대조([`session_in_profile`])는 부른 쪽(handlers)이 먼저 끝낸다.
+#[cfg_attr(not(test), allow(dead_code))] // 운영 호출처는 귀속 계정 반환판(`_resolved`)으로 옮겼다 — bool 판은 종전 계약을 보존한다
 pub fn note_rate_for_profile(daemon: &Arc<Daemon>, profile_dir: &Path, rate: &[RateWindow], source: &str, now: f64) -> bool {
     note_rate_for_profile_at(daemon, dirs::home_dir().as_deref(), profile_dir, rate, source, now)
 }
 
+/// ★0.14.43(B3): [`note_rate_for_profile`] 의 **귀속 계정 반환판** — 좌석 설정 폴더의 **보고 시점 신원**으로 귀속한 account_id 를 돌려준다
+/// (None = rate 가 비었거나 신원 판독 실패 — 아무것도 쓰지 않았다). 호출자(`usage.report`)가 좌석 `rate_account` 에 싣는다.
+pub fn note_rate_for_profile_resolved(
+    daemon: &Arc<Daemon>,
+    profile_dir: &Path,
+    rate: &[RateWindow],
+    source: &str,
+    now: f64,
+) -> Option<String> {
+    note_rate_for_profile_at_resolved(daemon, dirs::home_dir().as_deref(), profile_dir, rate, source, now)
+}
+
 /// 홈을 인자로 받는 시험 이음매.
+#[cfg_attr(not(test), allow(dead_code))]
 fn note_rate_for_profile_at(
     daemon: &Arc<Daemon>,
     home: Option<&Path>,
@@ -515,13 +565,26 @@ fn note_rate_for_profile_at(
     source: &str,
     now: f64,
 ) -> bool {
+    note_rate_for_profile_at_resolved(daemon, home, profile_dir, rate, source, now).is_some()
+}
+
+/// [`note_rate_for_profile_at`] 의 본체 — 귀속된 account_id 를 돌려준다(None = 미귀속).
+fn note_rate_for_profile_at_resolved(
+    daemon: &Arc<Daemon>,
+    home: Option<&Path>,
+    profile_dir: &Path,
+    rate: &[RateWindow],
+    source: &str,
+    now: f64,
+) -> Option<String> {
     if rate.is_empty() {
-        return false;
+        return None;
     }
-    let Some(ident) = claude_identity_unlocked(&daemon.accounts, home, profile_dir) else {
-        return false;
-    };
-    note_resolved(daemon, claude_resolution(home, profile_dir, ident), rate, source, now)
+    let ident = claude_identity_unlocked(&daemon.accounts, home, profile_dir)?;
+    let resolved = claude_resolution(home, profile_dir, ident);
+    let account_id = resolved.0.account_id.clone();
+    note_resolved(daemon, resolved, rate, source, now);
+    Some(account_id)
 }
 
 /// 귀속이 정해진 관측을 계정 뷰·경보 입력·스냅샷에 싣는다(락 안은 메모리 연산뿐 · 파일 IO 없음).
@@ -1255,7 +1318,12 @@ const PREDICT_FRESH_SECS: f64 = 600.0;
 /// stale_secs는 읽기 시점 계산 — updated_at==0.0은 null(관측 전)로 정직 표기.
 /// 5h 창에는 소진 예측(exhaust_at)을 붙인다 — 최근 60분 선형 기울기, 표본 미달·기울기≤0·
 /// 리셋 후 소진이면 생략(정직한 공백). 잠금 순서: accounts → 해제 → analytics.
+/// ★0.14.43(B3): 행마다 가산 키 3개 — `in_use`(true/false/null · [`account_in_use`]) · `rate_observed_at`(경보 입력의 관측 시각 — 없으면 null) ·
+/// `rate[]` 원소의 `alert_eligible`(그 창이 경보 입력으로 적격인가 — 경보 입력이 없는 창(창 밖 표시용 값 등)은 false). 표시 승자·기존 키는 불변이다.
+/// 좌석 신원 표(파일 IO)는 **accounts 락을 잡기 전에** 만든다.
 pub fn local_json(daemon: &Arc<Daemon>, now: f64) -> Value {
+    let view = seat_identity_view_at(daemon, now);
+    let stale_secs = account_alert_stale_secs();
     let mut rows: Vec<Value> = {
         let st = daemon.accounts.lock().unwrap();
         let mut views: Vec<&AccountView> = st.views.values().collect();
@@ -1263,19 +1331,42 @@ pub fn local_json(daemon: &Arc<Daemon>, now: f64) -> Value {
         views
             .into_iter()
             .map(|v| {
+                let in_use = account_in_use(&v.key.provider, &v.key.account_id, &view);
+                let input = st.alert_inputs.get(&v.key).filter(|i| i.at > 0.0);
+                let age = input.map_or(0.0, |i| (now - i.at).max(0.0));
+                let rate: Vec<Value> = v
+                    .rate
+                    .iter()
+                    .map(|w| {
+                        // 같은 창 라벨의 **경보 입력**이 적격인가 — 경보 입력이 없으면(창 밖 표시용 값 · 관측 전) 경보 입력이 아니다.
+                        let eligible = input.is_some_and(|i| {
+                            i.rate.iter().find(|iw| iw.label == w.label).is_some_and(|iw| {
+                                alert_eligible(crate::usage::rate_window_live(iw, i.at, now), in_use, age, stale_secs)
+                            })
+                        });
+                        let mut o = serde_json::to_value(w).unwrap_or(Value::Null);
+                        if let Some(m) = o.as_object_mut() {
+                            m.insert("alert_eligible".into(), json!(eligible));
+                        }
+                        o
+                    })
+                    .collect();
                 json!({
                     "provider": v.key.provider,
                     "account_id": v.key.account_id,
                     "label": v.label,
                     "plan": v.plan,
                     "profiles": v.profiles.iter().collect::<Vec<_>>(),
-                    "rate": v.rate,
+                    "rate": rate,
                     "updated_at": if v.updated_at > 0.0 { json!(v.updated_at) } else { Value::Null },
                     "stale_secs": if v.updated_at > 0.0 { json!((now - v.updated_at).max(0.0)) } else { Value::Null },
                     "source": v.source,
                     "adapter": v.adapter,
                     // null = 경로 고장 없음(관측 전이거나 정상). 값 = 그 경로가 지금 고장(예: agy_http_403).
                     "source_error": v.source_error,
+                    // ★0.14.43(B3) 가산 키 — true/false/null(판정 불가) · 경보 입력의 관측 시각(없으면 null).
+                    "in_use": in_use,
+                    "rate_observed_at": input.map_or(Value::Null, |i| json!(i.at)),
                 })
             })
             .collect()
@@ -1343,6 +1434,350 @@ pub fn predict_exhaust(series: &[(f64, f64)], now: f64, resets_at: Option<f64>) 
     }
 }
 
+// ───────────────── ★0.14.43(B3) 경보 신선도 규칙 — 좌석 신원 표 · 순수 판정 · 계정 축 경보 입력 ─────────────────
+
+/// 노브 `CYS_ACCOUNT_ALERT_STALE_SECS` 의 기본값(초) — 경보 입력 적격의 '관측 나이' 상한(오너 결재 1800 = 경보 리마인드 간격과 같다).
+pub const ACCOUNT_ALERT_STALE_SECS_DEFAULT: f64 = 1800.0;
+/// 좌석 설정 폴더 신원의 재판독 하한(초) — 같은 폴더는 이 안에 다시 stat 하지 않는다(status 폴링이 파일 접근을 늘리지 않게).
+pub const SEAT_IDENT_CACHE_SECS: f64 = 60.0;
+/// 신원 캐시에서 확인한 지 이만큼(초) 지난 폴더 항목은 신원 표를 만들 때 걷는다(크기 유계) · 항목 수가 [`SEAT_IDENT_CACHE_MAX`] 를 넘으면 비운다(병적 입력 상한 — 정상은 폴더 수십 개).
+const SEAT_IDENT_PRUNE_SECS: f64 = 600.0;
+const SEAT_IDENT_CACHE_MAX: usize = 512;
+
+/// 노브 값 파서(순수 · 검체 대상). 미설정·빈 값·파싱 실패·음수·비유한 = 기본값(규칙은 켜진 채). `0` = 이 규칙 끔(0.14.42 동작 그대로).
+pub fn parse_stale_secs(raw: Option<&str>) -> f64 {
+    match raw.map(str::trim) {
+        None | Some("") => ACCOUNT_ALERT_STALE_SECS_DEFAULT,
+        Some(v) => match v.parse::<f64>() {
+            Ok(n) if n.is_finite() && n >= 0.0 => n,
+            _ => ACCOUNT_ALERT_STALE_SECS_DEFAULT,
+        },
+    }
+}
+
+/// `CYS_ACCOUNT_ALERT_STALE_SECS` 를 읽는 **유일한 자리**(env 래퍼 — 판정은 [`parse_stale_secs`]).
+pub fn account_alert_stale_secs() -> f64 {
+    parse_stale_secs(std::env::var("CYS_ACCOUNT_ALERT_STALE_SECS").ok().as_deref())
+}
+
+/// 살아 있는(종료되지 않은) 좌석에 에이전트가 있는가.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentsAlive {
+    pub claude: bool,
+    pub codex: bool,
+    /// agy(Antigravity) — 좌석의 agent 이름은 `gemini`.
+    pub gemini: bool,
+}
+
+/// 좌석 한 개의 신원 항목.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeatIdent {
+    pub surface_id: u64,
+    /// 좌석 에이전트 — `agent_meta` 이름, 없으면 관측 스냅샷의 agent. None = 모름(에이전트 증거 없는 셸 등).
+    pub agent: Option<String>,
+    /// 신원을 읽은 설정 폴더(claude 좌석만 · None = 폴더 미상).
+    pub folder: Option<String>,
+    /// 그 폴더의 **현재** 신원 account_id(None = 폴더 미상이거나 신원 판독 실패).
+    pub current_account: Option<String>,
+    /// 신원을 판독해 account_id 를 얻었는가(= `current_account.is_some()`).
+    pub known: bool,
+}
+
+/// 좌석 신원 표 — 경보·status·계정 조회가 '사용 중'을 가르는 재료. 파일 IO 로 만든 값을 락 밖에서 한 번 만들어 여럿이 나눠 쓴다.
+/// `Default`(= `collect_ok:false`)는 '수집 실패' — 모든 판정이 '모름'(실패 방향 = 경보 유지)이다.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeatIdentityView {
+    /// 살아 있는 claude 좌석들이 쓰는 설정 폴더(중복 제거 · 폴더 오름차순) → 그 폴더의 현재 신원(None = 판독 실패).
+    pub claude_folders: Vec<(String, Option<String>)>,
+    /// 살아 있는 claude 좌석 중 설정 폴더를 알 수 없는 좌석이 있다(`claude_config_dir` 도 transcript 경로도 없다).
+    pub claude_folder_unknown: bool,
+    pub agents_alive: AgentsAlive,
+    /// 좌석 목록 수집이 성공했는가(false = 락 오염 등 — 전부 '모름').
+    pub collect_ok: bool,
+    pub seats: Vec<SeatIdent>,
+}
+
+impl SeatIdentityView {
+    /// 좌석의 현재 폴더 신원 — None = 좌석이 표에 없거나(종료·그사이 생성) 폴더 미상이거나 판독 실패(전부 '모름').
+    pub fn current_for(&self, surface_id: u64) -> Option<&str> {
+        self.seats
+            .iter()
+            .find(|s| s.surface_id == surface_id)
+            .and_then(|s| s.current_account.as_deref())
+    }
+}
+
+/// 좌석 신원의 60초 하한 캐시 — 폴더 → (확인 시각, 그때의 신원). `Daemon::seat_ident_cache`. 실패(None)도 담는다(없는 파일을 매번 stat 하지 않는다).
+/// 크기: 신원 표를 만들 때 확인한 지 10분이 지난 항목을 걷고(상한 512 초과는 비운다) · 어느 소비자가 물은 폴더든 60초 하한 동안은 살아 있다.
+#[derive(Default)]
+pub struct SeatIdentCache {
+    entries: HashMap<PathBuf, (f64, Option<String>)>,
+    /// 계측(검체·진단) — 캐시 적중 수 / 실제로 신원을 확인한 수(stat 1회 이상).
+    pub hits: u64,
+    pub reads: u64,
+}
+
+#[cfg(test)]
+impl SeatIdentCache {
+    /// 시험 이음매 — 캐시를 비운다(60초 하한을 기다리지 않고 '신원이 바뀐 뒤'를 관측하게).
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+/// 좌석의 에이전트 이름이 claude 인가.
+fn agent_is_claude(agent: Option<&str>) -> bool {
+    agent == Some("claude")
+}
+
+/// 이 좌석 설정 폴더 — `claude_config_dir`(데몬이 좌석에 넣어 준 `CLAUDE_CONFIG_DIR`) · 없으면 관측 transcript 경로의 프로필 폴더 · 그것도
+/// 없으면 None(폴더 미상). 순수.
+fn resolve_seat_folder(config_dir: Option<&str>, session_file: &str) -> Option<String> {
+    if let Some(c) = config_dir.map(str::trim).filter(|c| !c.is_empty()) {
+        return Some(c.to_string());
+    }
+    if session_file.trim().is_empty() {
+        return None;
+    }
+    profile_dir_from_session(session_file).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// 좌석 표 복사(surfaces 락 안 — 메모리 복사뿐 · 파일 IO 없음). None = 수집 실패(락 오염).
+fn collect_seat_rows(daemon: &Arc<Daemon>) -> Option<Vec<(u64, Option<String>, Option<String>)>> {
+    let surfaces = daemon.surfaces.lock().ok()?;
+    let mut out = Vec::new();
+    for s in surfaces.values() {
+        if s.exited.load(Ordering::Relaxed) {
+            continue;
+        }
+        let meta_agent = s.agent_meta.lock().ok()?.as_ref().map(|(a, _)| a.clone());
+        let config_dir = s.claude_config_dir.lock().ok()?.clone();
+        let (obs_agent, session_file) = match s.observed_usage.lock().ok()?.as_ref() {
+            Some(u) => (Some(u.agent.clone()), u.session_file.clone()),
+            None => (None, String::new()),
+        };
+        let agent = meta_agent.or(obs_agent);
+        let folder = if agent_is_claude(agent.as_deref()) {
+            resolve_seat_folder(config_dir.as_deref(), &session_file)
+        } else {
+            None
+        };
+        out.push((s.id, agent, folder));
+    }
+    Some(out)
+}
+
+/// 폴더의 현재 신원(account_id) — 60초 하한 캐시 → 미스면 락 없이 신원 파일을 확인한다(`claude_identity_unlocked` — stat + mtime 캐시 · FIFO 등
+/// 일반 파일이 아니면 열지 않는다). 캐시 락은 조회·기록 때만 순간 잡는다(그 안에서 다른 락을 잡지 않는다).
+/// (`pub(crate)` — 알려진 프로필 폴더 전체의 현재 신원이 필요한 후속 소비자가 같은 60초 캐시를 재사용한다 · 새로 만들지 않는다.)
+pub(crate) fn folder_identity(daemon: &Arc<Daemon>, home: Option<&Path>, folder: &str, now: f64) -> Option<String> {
+    let key = PathBuf::from(folder);
+    {
+        let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, who)) = c.entries.get(&key).cloned() {
+            // 시계가 뒤로 가면(now < at) 만료로 본다 — 캐시가 영구히 붙지 않는다.
+            if now >= at && now - at < SEAT_IDENT_CACHE_SECS {
+                c.hits += 1;
+                return who;
+            }
+        }
+    }
+    let who = claude_identity_unlocked(&daemon.accounts, home, &key).map(|(uuid, _, _)| uuid);
+    let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
+    c.reads += 1;
+    c.entries.insert(key, (now, who.clone()));
+    who
+}
+
+/// 좌석 신원 표 — 지금 시각·실제 홈으로 만든다.
+#[cfg_attr(not(test), allow(dead_code))] // 운영 호출처는 시각 주입판(`_at`)을 쓴다(한 틱·한 응답 안에서 같은 `now` 를 나눠 쓴다)
+pub fn seat_identity_view(daemon: &Arc<Daemon>) -> SeatIdentityView {
+    seat_identity_view_at(daemon, crate::state::now_epoch())
+}
+
+/// [`seat_identity_view`] 의 시각 주입판(경보 틱·`local_json` 이 자기 `now` 로 부른다 · 캐시 하한도 이 시각으로 센다).
+pub fn seat_identity_view_at(daemon: &Arc<Daemon>, now: f64) -> SeatIdentityView {
+    seat_identity_view_in(daemon, dirs::home_dir().as_deref(), now)
+}
+
+/// 홈·시각을 인자로 받는 시험 이음매. 락 순서: surfaces(복사만) → 해제 → 폴더별 신원 판독(무락 · 60초 캐시) — accounts 락은 쥐지 않는다.
+pub(crate) fn seat_identity_view_in(daemon: &Arc<Daemon>, home: Option<&Path>, now: f64) -> SeatIdentityView {
+    let Some(rows) = collect_seat_rows(daemon) else {
+        return SeatIdentityView::default(); // 수집 실패 = 전부 '모름'
+    };
+    // 폴더별 현재 신원 — 같은 폴더는 한 번만(좌석 여럿이 한 폴더를 쓰는 것이 보통이다).
+    let mut by_folder: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (_, agent, folder) in &rows {
+        if let (true, Some(f)) = (agent_is_claude(agent.as_deref()), folder) {
+            if !by_folder.contains_key(f) {
+                let who = folder_identity(daemon, home, f, now);
+                by_folder.insert(f.clone(), who);
+            }
+        }
+    }
+    {
+        // **낡은 항목만** 걷는다(확인한 지 [`SEAT_IDENT_PRUNE_SECS`] 가 지난 폴더) — 좌석이 오가며 폴더가 바뀌어도 크기가 유계이고, 같은 캐시를 쓰는 다른 소비자(알려진 프로필
+        // 폴더 전체 등 — `folder_identity`)의 항목은 신원 표를 만들 때 지워지지 않는다(지우면 그 소비자의 60초 하한이 무력화돼 폴더를 매번 stat 한다).
+        let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
+        c.entries.retain(|_, (at, _)| now < *at || now - *at <= SEAT_IDENT_PRUNE_SECS);
+        if c.entries.len() > SEAT_IDENT_CACHE_MAX {
+            c.entries.clear();
+        }
+    }
+    let mut agents = AgentsAlive::default();
+    let mut claude_folder_unknown = false;
+    let mut seats = Vec::with_capacity(rows.len());
+    for (id, agent, folder) in rows {
+        match agent.as_deref() {
+            Some("claude") => {
+                agents.claude = true;
+                if folder.is_none() {
+                    claude_folder_unknown = true;
+                }
+            }
+            Some("codex") => agents.codex = true,
+            Some("gemini" | "agy" | "antigravity") => agents.gemini = true,
+            _ => {}
+        }
+        let current_account = folder.as_ref().and_then(|f| by_folder.get(f).cloned().flatten());
+        seats.push(SeatIdent {
+            surface_id: id,
+            agent,
+            folder,
+            known: current_account.is_some(),
+            current_account,
+        });
+    }
+    seats.sort_by_key(|s| s.surface_id);
+    SeatIdentityView {
+        claude_folders: by_folder.into_iter().collect(),
+        claude_folder_unknown,
+        agents_alive: agents,
+        collect_ok: true,
+        seats,
+    }
+}
+
+/// ★순수: 이 계정이 **지금 쓰이는가**(계정 축 `in_use`) — Some(true)/Some(false)/None(판정 불가). 판정 불가는 경보 쪽에서 '사용 중'으로 읽는다.
+///   · claude: 현재 신원이 이 계정인 살아 있는 claude 좌석이 있으면 Some(true)(다른 좌석이 모름이어도 — 참이 이긴다). 없고 살아 있는 claude 좌석 중
+///     폴더 미상 또는 신원 판독 실패가 하나라도 있으면 **모든 claude 계정에 None**. 전부 판독됐고 아무도 이 계정이 아니면 Some(false) ·
+///     살아 있는 claude 좌석이 0개여도 Some(false).
+///   · codex / antigravity(agy): 그 에이전트의 살아 있는 좌석이 있으면 Some(true), 없으면 Some(false).
+///   · 그 밖(선언 계정 등) · 좌석 목록 수집 실패: None.
+/// `None == None` 을 '같다'로 치지 않는다 — 판독 실패 폴더는 어느 계정과도 일치하지 않는다(모름이지 같음이 아니다).
+pub fn account_in_use(provider: &str, account_id: &str, view: &SeatIdentityView) -> Option<bool> {
+    if !view.collect_ok {
+        return None;
+    }
+    match provider {
+        "claude" => {
+            if view.claude_folders.iter().any(|(_, who)| who.as_deref() == Some(account_id)) {
+                return Some(true);
+            }
+            if view.claude_folder_unknown || view.claude_folders.iter().any(|(_, who)| who.is_none()) {
+                return None;
+            }
+            Some(false)
+        }
+        "codex" => Some(view.agents_alive.codex),
+        "antigravity" | "gemini" | "agy" => Some(view.agents_alive.gemini),
+        _ => None,
+    }
+}
+
+/// ★순수: 좌석의 rate 가 **지금 쓰이는 로그인의 것인가** — 3값(Some(false) = 로그인이 바뀐 뒤 아직 새로 보고하지 않은 좌석 · None = 판정 불가).
+/// 종료 좌석은 Some(false) · claude 가 아닌 좌석은 항상 Some(true). claude 는 보고 시점 귀속 계정(`rate_account`)과 현재 폴더 신원이 **둘 다 Some 이고
+/// 다를 때만** Some(false), 둘 다 Some 이고 같으면 Some(true), 하나라도 None 이면 None.
+pub fn seat_in_use_tri(rate_account: Option<&str>, current: Option<&str>, alive: bool, is_claude: bool) -> Option<bool> {
+    if !alive {
+        return Some(false);
+    }
+    if !is_claude {
+        return Some(true);
+    }
+    match (rate_account, current) {
+        (Some(a), Some(c)) => Some(a == c),
+        _ => None,
+    }
+}
+
+/// ★순수: 좌석 축 `seat_in_use` — 판정 불가는 '사용 중'이다(실패 방향 = 경보 유지). [`seat_in_use_tri`] 가 Some(false) 가 아닐 때 참.
+#[cfg_attr(not(test), allow(dead_code))] // 검체가 표로 핀하는 2값판 — 운영은 3값판(`seat_in_use_tri`)을 쓴다(status 의 null 을 위해)
+pub fn seat_in_use(rate_account: Option<&str>, current: Option<&str>, alive: bool, is_claude: bool) -> bool {
+    seat_in_use_tri(rate_account, current, alive, is_claude) != Some(false)
+}
+
+/// ★순수: 경보 적격 = `live` ∧ (`in_use != Some(false)` ∨ 관측 나이 ≤ `stale_secs`). `stale_secs == 0` 은 이 규칙을 끈다(`live` 만 — 0.14.42 동작).
+/// 판정 불가(`None`)는 사용 중으로 본다 · 나이가 비유한(NaN)이면 '넘지 않음'으로 본다(둘 다 경보를 지우는 쪽으로 오판하지 않는다).
+pub fn alert_eligible(live: bool, in_use: Option<bool>, age: f64, stale_secs: f64) -> bool {
+    if !live {
+        return false;
+    }
+    if stale_secs <= 0.0 {
+        return true;
+    }
+    in_use != Some(false) || !(age > stale_secs)
+}
+
+/// 계정 축 경보 입력 한 행(창 단위) — `rate_window_live` 인 창만 행이 된다. `eligible=false` 인 행이 '신선도 규칙으로 빠진' 창이다.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccountAlertRow {
+    pub label: String,
+    pub win: String,
+    pub used_pct: f64,
+    /// 경보 입력의 관측 시각(`AlertInput::at`).
+    pub observed_at: f64,
+    pub age_secs: f64,
+    pub in_use: Option<bool>,
+    pub resets_at: Option<f64>,
+    /// PEAK_HOLD 잔여(초) — 같은 리셋 창의 최댓값을 더 쥐는 시간. `peak_at` 이 있을 때만(복원분은 None).
+    pub held_secs: Option<f64>,
+    pub eligible: bool,
+}
+
+/// 계정 축 경보 입력(적격 여부 표시) — 락 순서: 신원 표는 부른 쪽이 락 밖에서 만든다. 이 함수는 accounts 락 안에서 메모리 연산만 한다.
+pub fn alert_rates_with(
+    daemon: &Arc<Daemon>,
+    view: &SeatIdentityView,
+    now: f64,
+    stale_secs: f64,
+) -> Vec<AccountAlertRow> {
+    let st = daemon.accounts.lock().unwrap();
+    let mut out = Vec::new();
+    for (key, input) in st.alert_inputs.iter() {
+        if input.at == 0.0 {
+            continue;
+        }
+        let in_use = account_in_use(&key.provider, &key.account_id, view);
+        let age = (now - input.at).max(0.0);
+        for w in &input.rate {
+            // ★fatal-fix R3-2 · ROLE-3: 리셋이 지난 창은 행이 아니다(경보 근거 아님 · 신선도 규칙과 무관).
+            if !crate::usage::rate_window_live(w, input.at, now) {
+                continue;
+            }
+            let held_secs = input.peak_at.get(&w.label).map(|p| (PEAK_HOLD_SECS - (now - *p)).max(0.0));
+            out.push(AccountAlertRow {
+                label: input.label.clone(),
+                win: w.label.clone(),
+                used_pct: w.used_pct,
+                observed_at: input.at,
+                age_secs: age,
+                in_use,
+                resets_at: w.resets_at,
+                held_secs,
+                eligible: alert_eligible(true, in_use, age, stale_secs),
+            });
+        }
+    }
+    // 결정론: (라벨, 창) 오름차순 · 같은 키(같은 이메일의 두 계정)는 사용률 큰 쪽이 먼저.
+    out.sort_by(|a, b| {
+        (&a.label, &a.win)
+            .cmp(&(&b.label, &b.win))
+            .then(b.used_pct.total_cmp(&a.used_pct))
+    });
+    out
+}
+
 /// alerts용 스냅샷: (라벨, 창, pct) — 경보 입력([`AccountsState::alert_inputs`])이 있는 계정만.
 /// 창 밖(표시용) 값은 경보 근거가 아니다 — 검증되지 않은 값이 경보를 흔들지 않게 하려는 것이다. 그래서 경보는
 /// 같은 계정의 **창 밖이 아닌 관측 중 가장 최근 값**으로 판정한다 — 창 밖 값이 더 최신이어도 그 값이 남는다
@@ -1353,23 +1788,57 @@ pub fn predict_exhaust(series: &[(f64, f64)], now: f64, resets_at: Option<f64>) 
 /// 덮을 수 있다(가짜 경보 · 진짜 경보 억제 둘 다). 위조 값은 좌석 출처로 스냅샷에 남아 재시작 뒤에도 복원된다.
 /// ★fatal-fix R3-2 · ROLE-3: 리셋 시각이 지난 창(리셋 시각이 없으면 창 길이보다 오래된 관측)은 싣지 않는다
 /// ([`crate::usage::rate_window_live`] — UI 의 '리셋됨'과 같은 규칙).
+/// ★0.14.43(B3): 신선도 규칙(리셋 전 ∧ (사용 중 ∨ 관측 나이 ≤ 1800초))에 **적격인 행만** 싣는다 — [`alert_rates_with`] 의 얇은 래퍼다(기존 호출처·검체 보존).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn alert_rates(daemon: &Arc<Daemon>) -> Vec<(String, String, f64)> {
     let now = crate::state::now_epoch();
-    let st = daemon.accounts.lock().unwrap();
-    let mut out = Vec::new();
-    for input in st.alert_inputs.values() {
-        if input.at == 0.0 {
-            continue;
-        }
-        for w in &input.rate {
-            if !crate::usage::rate_window_live(w, input.at, now) {
-                continue;
+    let view = seat_identity_view_at(daemon, now);
+    alert_rates_with(daemon, &view, now, account_alert_stale_secs())
+        .into_iter()
+        .filter(|r| r.eligible)
+        .map(|r| (r.label, r.win, r.used_pct))
+        .collect()
+}
+
+/// 좌석 `usage` 객체의 wire(JSON) — `surface.list` · `org.status` · `control.dashboard` 세 곳이 **이 도우미 하나**를 쓴다. 기존 직렬화(`ObservedUsage` 의 필드)에
+/// 계산 키를 **가산**한다: `rate_observed_at`(rate 가 새로 생산된 시각 · 모르면 null) · `rate_age_secs`(그 나이 · 모르면 null) · `rate_in_use`(true/false/null —
+/// 로그인이 바뀐 뒤 아직 새로 보고하지 않은 좌석이면 false · 판정 불가면 null) · `rate[]` 원소마다 `alert_eligible`(이 창이 경보 입력이 될 수 있는가).
+/// 원 uuid(`rate_account`)는 내보내지 않는다. `view` 는 부른 쪽이 **surfaces 락을 잡기 전에** 만든다(파일 IO).
+pub fn seat_usage_wire(
+    u: &ObservedUsage,
+    surface_id: u64,
+    alive: bool,
+    view: &SeatIdentityView,
+    now: f64,
+    stale_secs: f64,
+) -> Value {
+    let mut v = serde_json::to_value(u).unwrap_or(Value::Null);
+    let Some(obj) = v.as_object_mut() else {
+        return v;
+    };
+    let observed = u.rate_observed_at;
+    let known_at = observed.is_finite() && observed > 0.0;
+    let age = if known_at { (now - observed).max(0.0) } else { 0.0 };
+    obj.insert("rate_observed_at".into(), if known_at { json!(observed) } else { Value::Null });
+    obj.insert("rate_age_secs".into(), if known_at { json!(age as u64) } else { Value::Null });
+    let tri = seat_in_use_tri(
+        u.rate_account.as_deref(),
+        view.current_for(surface_id),
+        alive,
+        agent_is_claude(Some(u.agent.as_str())),
+    );
+    obj.insert("rate_in_use".into(), tri.map_or(Value::Null, Value::Bool));
+    // 관측 시각을 모르면(0) 나이 판정 없이 적격(종전 동작) · 창의 생사는 종전처럼 updated_at 으로 본다.
+    let live_at = if known_at { observed } else { u.updated_at };
+    if let Some(Value::Array(arr)) = obj.get_mut("rate") {
+        for (w, jv) in u.rate.iter().zip(arr.iter_mut()) {
+            let live = alive && crate::usage::rate_window_live(w, live_at, now);
+            if let Some(o) = jv.as_object_mut() {
+                o.insert("alert_eligible".into(), json!(alert_eligible(live, tri, age, stale_secs)));
             }
-            out.push((input.label.clone(), w.label.clone(), w.used_pct));
         }
     }
-    out.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    out
+    v
 }
 
 #[cfg(test)]
@@ -2413,5 +2882,680 @@ mod tests {
         assert_eq!(alert_rates(&d3).len(), 1, "단위가 다른 리셋 값으로 경보 입력을 지웠다");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ═════════ ★0.14.43(B3) 시나리오 — 경보 틱(`check_alerts_with`)에 시각을 주입해 본다(실시간 대기 없음) ═════════
+    // 이 모듈은 신규 API 에 기대지 않는다(기존 공개 면 — Daemon · check_alerts_with · note_* · local_json · 버스 이벤트뿐) — 수정 전 코드에 그대로 붙여
+    // 적색을 보이는 용도이기도 하다(WORKLOG 의 적색 로그). 픽스처는 전부 합성값이다(u-b3-a · a-b3@example.test 등) — 실계정 식별자 금지.
+    mod b3_scenarios {
+        use super::*;
+
+        /// 설정 폴더 `dir`(home 상대)의 로그인을 (uuid, email)로 쓴다. 신원 파일 mtime 을 `bump` 로 매번 다르게 맞춘다(mtime 캐시가 옛 신원을 붙들지 않게).
+        pub(super) fn b3_login(home: &Path, dir: &str, uuid: &str, email: &str, bump: u64) -> PathBuf {
+            let f = home.join(dir).join(".claude.json");
+            write(&f, &format!(r#"{{"oauthAccount":{{"accountUuid":"{uuid}","emailAddress":"{email}"}}}}"#));
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + bump);
+            std::fs::File::options().write(true).open(&f).unwrap().set_modified(t).unwrap();
+            home.join(dir)
+        }
+
+        /// 실제 PTY 좌석 하나(`sleep 30`) — 에이전트·설정 폴더를 지정한다. 신원 표가 보는 것은 이 두 필드(+관측 스냅샷)뿐이다.
+        pub(super) fn b3_seat(d: &Arc<Daemon>, role: &str, agent: &str, cfg: Option<&Path>) -> Arc<crate::state::Surface> {
+            let s = d
+                .create_surface(None, Some("sleep 30".into()), None, Some(role.to_string()), 24, 80)
+                .expect("create surface");
+            d.surfaces.lock().unwrap().insert(s.id, s.clone());
+            *s.agent_meta.lock().unwrap() = Some((agent.into(), agent.into()));
+            *s.claude_config_dir.lock().unwrap() = cfg.map(|c| c.to_string_lossy().into_owned());
+            s
+        }
+
+        /// 버스에서 이 이름의 이벤트 payload 들(seq0 이후).
+        pub(super) fn b3_events(d: &Arc<Daemon>, seq0: u64, name: &str) -> Vec<Value> {
+            d.bus.replay_after(seq0).into_iter().filter(|e| e["name"] == name).map(|e| e["payload"].clone()).collect()
+        }
+
+        /// `usage.alert_resolved` 이벤트의 (key, reason) 들 — 이 티켓이 다루는 한도 경보 키(`account_rate:`·`rate_limit:`)만. 프로세스 전역 게이트 신호(`alerts::GATE_SIGNALS`)와
+        /// 같은 초에 만든 데몬이 나눠 쓰는 analytics DB 가 병렬 검체에서 새어 들어와 만드는 다른 종류의 키(node_liveness · repeated_failure)는 이 검체의 관심사가 아니다.
+        pub(super) fn b3_resolved(d: &Arc<Daemon>, seq0: u64) -> Vec<(String, String)> {
+            b3_events(d, seq0, "usage.alert_resolved")
+                .iter()
+                .map(|p| (p["key"].as_str().unwrap_or("").to_string(), p["reason"].as_str().unwrap_or("").to_string()))
+                .filter(|(k, _)| k.starts_with("account_rate:") || k.starts_with("rate_limit:"))
+                .collect()
+        }
+
+        pub(super) fn b3_fixture(tag: &str) -> (Arc<Daemon>, PathBuf, PathBuf, PathBuf) {
+            let dir = tmp(&format!("b3-{tag}-daemon"));
+            let home = tmp(&format!("b3-{tag}-home"));
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let f = b3_login(&home, ".cys/claude-b3", "u-b3-a", "a-b3@example.test", 1);
+            (d, dir, home, f)
+        }
+
+        pub(super) const KEY_A: &str = "account_rate:a-b3@example.test:5h";
+        pub(super) const KEY_B: &str = "account_rate:b-b3@example.test:5h";
+
+        /// ★핵심 시나리오(오너 제보): 좌석 폴더의 로그인을 A → B 로 바꾼 뒤에도 A 의 옛 값(99% · 리셋 전)이 30분마다 울렸다. 이제:
+        /// 좌석이 A 로 99% 보고(리셋 +2h) → 발화 · 같은 폴더를 B 로 바꾸고 B 가 10% 보고 → +70·+1799초 A 유지(REMIND 재발행 0) · **+1801초 A 키 소멸** ·
+        /// `usage.alert_resolved{reason:"stale"}` 정확히 1건 · B 는 임계 미만이라 0건 · 이후 틱에 해소 알림이 되풀이되지 않는다.
+        #[test]
+        fn b3_login_switch_retires_the_old_account_alert_after_thirty_minutes() {
+            let (d, dir, home, f) = b3_fixture("s1");
+            let cfg = crate::alerts::AlertConfig::default();
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            let _seat = b3_seat(&d, "worker-b3", "claude", Some(&f));
+            let t0 = crate::state::now_epoch();
+            let seq0 = d.bus.latest_seq();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1.0);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 1, "A 99% 가 경보를 내지 않았다(전제)");
+            // 같은 폴더의 로그인을 B 로 바꾸고 B 가 10% 보고
+            b3_login(&home, ".cys/claude-b3", "u-b3-b", "b-b3@example.test", 2);
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 10.0, Some(t0 + 9000.0))], "statusline", t0 + 5.0));
+            for dt in [70.0, 600.0, 1799.0] {
+                crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + dt);
+            }
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 1, "관측 1800초 이내(+1799)인데 A 경보가 바뀌었다(재발행 또는 소멸)");
+            assert!(b3_resolved(&d, seq0).is_empty(), "+1799초에 해소 알림이 나갔다: {:?}", b3_resolved(&d, seq0));
+            // +1801초: 관측 나이 1801 > 1800 ∧ A 는 지금 쓰이지 않는다 → 입력에서 빠진다(REMIND 시각이 왔어도 재발행하지 않는다)
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1801.0);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 1, "+1801초에도 A 경보가 REMIND 로 다시 나갔다(옛 로그인의 99% 가 계속 울린다)");
+            assert_eq!(b3_resolved(&d, seq0), vec![(KEY_A.to_string(), "stale".to_string())], "붙들림 해소 알림은 정확히 1건(reason=stale)");
+            assert_eq!(account_alerts(&d, seq0, KEY_B), 0, "B 10% 는 임계 미만인데 경보가 났다");
+            // 이후 틱: 해소 알림이 되풀이되지 않는다
+            for dt in [1831.0, 1861.0, 3000.0] {
+                crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + dt);
+            }
+            assert_eq!(b3_resolved(&d, seq0).len(), 1, "붙들린 키의 해소 알림이 되풀이됐다");
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 1);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 음성 대조: 로그인을 바꾸지 않으면(+2h 유휴) A 경보는 리셋까지 유지된다(REMIND 리마인드도 종전대로). 리셋이 지나면 '해소'(cleared)다.
+        #[test]
+        fn b3_unchanged_login_keeps_the_account_alert_until_its_window_resets() {
+            let (d, dir, home, f) = b3_fixture("s2");
+            let cfg = crate::alerts::AlertConfig::default();
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            let _seat = b3_seat(&d, "worker-b3", "claude", Some(&f));
+            let t0 = crate::state::now_epoch();
+            let seq0 = d.bus.latest_seq();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+            for dt in [1.0, 70.0, 1799.0] {
+                crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + dt);
+            }
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 1);
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1801.0);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 2, "사용 중인 계정의 REMIND 리마인드가 사라졌다");
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 3601.0);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 3, "사용 중인 계정의 2회차 리마인드가 사라졌다(관측이 아무리 오래돼도 사용 중이면 유지)");
+            assert!(b3_resolved(&d, seq0).is_empty(), "사용 중 계정에 해소 알림이 나갔다");
+            // 리셋(+2h)이 지나면 창이 죽는다 — 신선도가 아니라 해소
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 7201.0);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 3);
+            assert_eq!(b3_resolved(&d, seq0), vec![(KEY_A.to_string(), "cleared".to_string())]);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 판정 불가 = 사용 중: 좌석 폴더의 신원 파일이 사라져 읽을 수 없으면(결측 ≠ 미사용) +1801초에도 경보를 유지한다(진짜 한도 경보를 지우는 쪽으로 오판하지 않는다).
+        #[test]
+        fn b3_unreadable_identity_keeps_the_account_alert() {
+            let (d, dir, home, f) = b3_fixture("s3");
+            let cfg = crate::alerts::AlertConfig::default();
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            let _seat = b3_seat(&d, "worker-b3", "claude", Some(&f));
+            let t0 = crate::state::now_epoch();
+            let seq0 = d.bus.latest_seq();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1.0);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 1);
+            std::fs::remove_file(f.join(".claude.json")).unwrap();
+            for dt in [70.0, 1799.0, 1801.0] {
+                crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + dt);
+            }
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 2, "신원 판독 불가인데 +1801초에 A 경보가 사라졌다(REMIND 도 나가야 한다)");
+            assert!(b3_resolved(&d, seq0).is_empty(), "판정 불가 계정에 해소 알림이 나갔다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 재시작 복원: 스냅샷으로 복원된 A(관측 2시간 전 · 리셋 전 · 사용 중 아님)는 발화 0 — 사용 중이면(그 폴더를 쓰는 살아 있는 좌석이 생기면) 발화한다.
+        #[test]
+        fn b3_restored_snapshot_without_a_user_stays_silent_and_with_a_user_fires() {
+            let dir = tmp("b3-s4-daemon");
+            let home = tmp("b3-s4-home");
+            let f = b3_login(&home, ".cys/claude-b3", "u-b3-a", "a-b3@example.test", 1);
+            let sock = dir.join("cysd.sock");
+            let cfg = crate::alerts::AlertConfig::default();
+            let t0 = crate::state::now_epoch();
+            {
+                let d1 = crate::state::Daemon::new(sock.clone());
+                assert!(note_rate_for_profile_at(&d1, Some(&home), &f, &[rw("5h", 97.0, Some(t0 + 7200.0))], "statusline", t0 - 7200.0));
+            }
+            let d2 = crate::state::Daemon::new(sock);
+            restore_from_snapshots(&d2, t0);
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            let seq0 = d2.bus.latest_seq();
+            crate::governance::check_alerts_with(&d2, &mut fired, &cfg, t0 + 1.0);
+            assert_eq!(account_alerts(&d2, seq0, KEY_A), 0, "사용 중이 아닌 2시간 전 복원값이 발화했다");
+            assert!(b3_resolved(&d2, seq0).is_empty(), "발화한 적 없는 키에 해소 알림이 나갔다");
+            let _seat = b3_seat(&d2, "worker-b3-r", "claude", Some(&f));
+            crate::governance::check_alerts_with(&d2, &mut fired, &cfg, t0 + 31.0);
+            assert_eq!(account_alerts(&d2, seq0, KEY_A), 1, "그 계정을 쓰는 좌석이 있는데 복원값이 발화하지 않았다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 깜빡임 금지: 신선도 규칙으로 빠진 키는 `fired` 시각을 유지한다 — 다시 적격이 돼도 마지막 발행에서 REMIND 가 지나기 전에는 재발행하지 않고,
+        /// REMIND 가 지나면 정상 재발행한다. (최악의 모양 — 방금 리마인드한 직후에 빠지는 경우 — 을 `fired` 시각 주입으로 재현한다.)
+        #[test]
+        fn b3_stale_hold_keeps_the_fired_time_so_re_eligibility_inside_remind_does_not_refire() {
+            let (d, dir, home, fa) = b3_fixture("s5");
+            let cfg = crate::alerts::AlertConfig::default();
+            // 좌석은 B 를 쓴다 — A 는 지금 쓰이지 않는다
+            let fb = b3_login(&home, ".cys/claude-b3-b", "u-b3-b", "b-b3@example.test", 2);
+            let _seat = b3_seat(&d, "worker-b3", "claude", Some(&fb));
+            let t0 = crate::state::now_epoch();
+            let seq0 = d.bus.latest_seq();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 99.0, Some(t0 + 20_000.0))], "statusline", t0));
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            fired.insert(KEY_A.to_string(), t0 + 1790.0); // A 가 마지막으로 발행된 시각 — REMIND 1800초 창이 아직 열려 있다
+            // 관측 1801초 → 부적격(붙들림): fired 시각 유지 · 해소 알림(stale) 1건 · 재발행 0
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1801.0);
+            assert_eq!(fired.get(KEY_A), Some(&(t0 + 1790.0)), "붙든 키의 fired 시각이 지워졌다/바뀌었다(재무장 → 깜빡임)");
+            assert_eq!(b3_resolved(&d, seq0), vec![(KEY_A.to_string(), "stale".to_string())]);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 0);
+            // A 가 다시 적격(새 관측 · 나이 0)이 됐다 — 마지막 발행(+1790)에서 30초뿐이라 재발행하지 않는다
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 99.0, Some(t0 + 20_000.0))], "statusline", t0 + 1810.0));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1820.0);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 0, "REMIND 안에 다시 적격이 되자 재발행했다(깜빡임)");
+            // REMIND(마지막 발행 + 1800 = +3590)가 지나면 종전처럼 한 번 낸다 — 음성 대조(리마인드가 영영 죽지 않았다)
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 3590.0);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 1, "REMIND 뒤에도 재발행하지 않는다(붙들림이 리마인드를 죽였다)");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 해소 알림의 사유: 신선도가 아니라 값이 내려가 풀리면 `cleared` — 정확히 1건. (같은 리셋 창의 최댓값은 마지막 확인 뒤 PEAK_HOLD 1800초까지 쥔다.)
+        #[test]
+        fn b3_resolved_reason_is_cleared_when_the_value_drops() {
+            let (d, dir, home, f) = b3_fixture("s6");
+            let cfg = crate::alerts::AlertConfig::default();
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            let _seat = b3_seat(&d, "worker-b3", "claude", Some(&f));
+            let t0 = crate::state::now_epoch();
+            let seq0 = d.bus.latest_seq();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1.0);
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 10.0, Some(t0 + 7200.0))], "statusline", t0 + 1900.0));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1910.0);
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1940.0);
+            assert_eq!(b3_resolved(&d, seq0), vec![(KEY_A.to_string(), "cleared".to_string())], "값이 내려가 풀린 키의 해소 알림이 1건이 아니거나 사유가 다르다");
+            assert!(!fired.contains_key(KEY_A), "해소된 키가 fired 에 남았다(재무장 실패)");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+    }
+
+    // ═════════ ★0.14.43(B3) 단위 — 순수 판정 표 · 좌석 신원 표 · 60초 캐시 · 계정 조회 가산 키 ═════════
+    // 픽스처는 전부 합성값이다(u-b3-a · a-b3@example.test 등) — 실계정 식별자 금지. 시각은 주입한다(실시간 대기 없음).
+    mod b3_units {
+        use super::b3_scenarios::{b3_events, b3_fixture, b3_login, b3_resolved, b3_seat, KEY_A};
+        use super::*;
+
+        fn view(folders: &[(&str, Option<&str>)], unknown: bool, codex: bool, gemini: bool, ok: bool) -> SeatIdentityView {
+            SeatIdentityView {
+                claude_folders: folders.iter().map(|(f, w)| (f.to_string(), w.map(str::to_string))).collect(),
+                claude_folder_unknown: unknown,
+                agents_alive: AgentsAlive { claude: !folders.is_empty() || unknown, codex, gemini },
+                collect_ok: ok,
+                seats: Vec::new(),
+            }
+        }
+
+        /// 계정 축 `in_use` 표 — claude(일치 · 불일치 · 폴더 미상 · 판독 실패 · 좌석 0) · codex·agy(생존 유무) · 그 밖 provider · 수집 실패.
+        #[test]
+        fn b3_account_in_use_table() {
+            let (a, b) = ("u-b3-a", "u-b3-b");
+            let cases: Vec<(&str, SeatIdentityView, &str, &str, Option<bool>)> = vec![
+                ("claude 일치", view(&[("/f1", Some(a))], false, false, false, true), "claude", a, Some(true)),
+                ("claude 전원 판독 · 아무도 이 계정이 아님", view(&[("/f1", Some(a))], false, false, false, true), "claude", b, Some(false)),
+                ("claude 두 좌석 두 계정 — a", view(&[("/f1", Some(a)), ("/f2", Some(b))], false, false, false, true), "claude", a, Some(true)),
+                ("claude 두 좌석 두 계정 — b", view(&[("/f1", Some(a)), ("/f2", Some(b))], false, false, false, true), "claude", b, Some(true)),
+                ("claude 폴더 미상 좌석 + 다른 좌석이 이 계정 → 참이 이긴다", view(&[("/f1", Some(a))], true, false, false, true), "claude", a, Some(true)),
+                ("claude 폴더 미상 좌석 · 이 계정 아님 → 판정 불가", view(&[("/f1", Some(a))], true, false, false, true), "claude", b, None),
+                ("claude 폴더 미상 좌석만 → 판정 불가", view(&[], true, false, false, true), "claude", a, None),
+                ("claude 신원 판독 실패 좌석 · 이 계정 아님 → 모든 claude 계정 판정 불가", view(&[("/f1", Some(a)), ("/f2", None)], false, false, false, true), "claude", b, None),
+                ("claude 신원 판독 실패 좌석이 있어도 다른 좌석이 이 계정이면 참", view(&[("/f1", Some(a)), ("/f2", None)], false, false, false, true), "claude", a, Some(true)),
+                ("claude 판독 실패(None)가 빈 account_id 와 '같다'로 읽히지 않는다(None==None 함정)", view(&[("/f1", None)], false, false, false, true), "claude", "", None),
+                ("claude 살아 있는 좌석 0 → 미사용", view(&[], false, false, false, true), "claude", a, Some(false)),
+                ("codex 좌석 있음", view(&[], false, true, false, true), "codex", "default", Some(true)),
+                ("codex 좌석 없음", view(&[], false, false, true, true), "codex", "default", Some(false)),
+                ("agy 좌석 있음", view(&[], false, false, true, true), "antigravity", "default", Some(true)),
+                ("agy 좌석 없음", view(&[], false, true, false, true), "antigravity", "default", Some(false)),
+                ("그 밖 provider(선언 계정)", view(&[("/f1", Some(a))], false, true, true, true), "grok", "default", None),
+                ("수집 실패 — claude", view(&[("/f1", Some(a))], false, true, true, false), "claude", a, None),
+                ("수집 실패 — codex", view(&[("/f1", Some(a))], false, true, true, false), "codex", "default", None),
+                ("수집 실패 — agy", view(&[("/f1", Some(a))], false, true, true, false), "antigravity", "default", None),
+            ];
+            for (what, v, provider, account, want) in cases {
+                assert_eq!(account_in_use(provider, account, &v), want, "{what}");
+            }
+            // 기본값(Default)은 '수집 실패' — 전부 모름
+            assert_eq!(account_in_use("claude", a, &SeatIdentityView::default()), None);
+        }
+
+        /// 좌석 축 `seat_in_use` 표 — (rate_account, 현재 신원) 조합 · 비 claude · 종료 좌석. 3값판이 status 의 null 을 만든다.
+        #[test]
+        fn b3_seat_in_use_table() {
+            let t = |ra: Option<&str>, cur: Option<&str>, alive: bool, claude: bool| {
+                (seat_in_use(ra, cur, alive, claude), seat_in_use_tri(ra, cur, alive, claude))
+            };
+            assert_eq!(t(None, None, true, true), (true, None), "None·None → 사용 중(판정 불가)");
+            assert_eq!(t(Some("A"), None, true, true), (true, None), "신원 판독 불가 → 사용 중");
+            assert_eq!(t(None, Some("B"), true, true), (true, None), "귀속 없음 → 사용 중");
+            assert_eq!(t(Some("A"), Some("A"), true, true), (true, Some(true)));
+            assert_eq!(t(Some("A"), Some("B"), true, true), (false, Some(false)), "둘 다 Some 이고 다를 때만 미사용");
+            assert_eq!(t(Some("A"), Some("B"), true, false), (true, Some(true)), "claude 가 아닌 좌석은 항상 사용 중");
+            assert_eq!(t(None, None, true, false), (true, Some(true)));
+            assert_eq!(t(Some("A"), Some("A"), false, true), (false, Some(false)), "종료 좌석은 미사용");
+            assert_eq!(t(None, None, false, false), (false, Some(false)));
+        }
+
+        /// 경보 적격 표 — stale 0(끔) · 경계(1799·1800·1801) · 판정 불가 · 리셋 지난 창 · 비유한 나이.
+        #[test]
+        fn b3_alert_eligible_table() {
+            let e = alert_eligible;
+            assert!(!e(false, Some(true), 0.0, 1800.0), "리셋 지난 창은 어떤 경우에도 부적격");
+            assert!(!e(false, None, 0.0, 0.0), "규칙을 꺼도 리셋 지난 창은 부적격");
+            assert!(e(true, Some(false), 99_999.0, 0.0), "stale 0 = 이 규칙 끔 → live 만");
+            assert!(e(true, Some(false), 1799.0, 1800.0));
+            assert!(e(true, Some(false), 1800.0, 1800.0), "관측 나이 ≤ 1800 — 경계는 적격");
+            assert!(!e(true, Some(false), 1801.0, 1800.0), "미사용 ∧ 1801초 → 부적격");
+            assert!(e(true, None, 99_999.0, 1800.0), "판정 불가 = 사용 중 — 나이와 무관하게 적격");
+            assert!(e(true, Some(true), 99_999.0, 1800.0), "사용 중이면 나이와 무관하게 적격");
+            assert!(e(true, Some(false), f64::NAN, 1800.0), "비유한 나이는 '넘지 않음' — 경보를 지우는 쪽으로 오판하지 않는다");
+            assert!(e(true, Some(false), -5.0, 1800.0), "시계 역행(음수 나이)도 적격");
+        }
+
+        /// 노브 `CYS_ACCOUNT_ALERT_STALE_SECS` 의 순수 파서 — 미설정·빈 값·쓰레기·음수·비유한 = 기본 1800(규칙은 켜진 채) · `0` = 끔.
+        #[test]
+        fn b3_stale_knob_parser() {
+            assert_eq!(parse_stale_secs(None), 1800.0);
+            for junk in ["", "  ", "abc", "-1", "NaN", "inf", "-inf", "1800abc", "1,800"] {
+                assert_eq!(parse_stale_secs(Some(junk)), 1800.0, "쓰레기 값 {junk:?} 은 기본값");
+            }
+            assert_eq!(parse_stale_secs(Some("0")), 0.0, "0 = 이 규칙 끔");
+            assert_eq!(parse_stale_secs(Some(" 900 ")), 900.0);
+            assert_eq!(parse_stale_secs(Some("1e3")), 1000.0);
+            assert_eq!(parse_stale_secs(Some("0.5")), 0.5);
+        }
+
+        /// 실제 좌석으로 만든 신원 표 — 살아 있는 claude 좌석의 폴더 신원 · 에이전트 생존 · 폴더 미상 · transcript 경로 폴백 · 종료 좌석 제외.
+        #[test]
+        fn b3_seat_identity_view_reads_the_current_folder_login_of_live_claude_seats() {
+            let dir = tmp("b3-u5-daemon");
+            let home = tmp("b3-u5-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let f1 = b3_login(&home, ".cys/claude-b3-1", "u-b3-a", "a-b3@example.test", 1);
+            let f2 = b3_login(&home, ".cys/claude-b3-2", "u-b3-b", "b-b3@example.test", 2);
+            let s1 = b3_seat(&d, "worker-b3-1", "claude", Some(&f1));
+            let s2 = b3_seat(&d, "worker-b3-2", "claude", Some(&f2));
+            let s_codex = b3_seat(&d, "reviewer-b3-codex", "codex", None);
+            // 에이전트 증거가 없는 셸 좌석 — claude 판정에 끼지 않는다
+            let shell = d
+                .create_surface(None, Some("sleep 30".into()), None, Some("shell-b3".into()), 24, 80)
+                .expect("create surface");
+            d.surfaces.lock().unwrap().insert(shell.id, shell.clone());
+            let t0 = crate::state::now_epoch();
+            let fs = |p: &Path| p.to_string_lossy().into_owned();
+            let v = seat_identity_view_in(&d, Some(&home), t0);
+            assert!(v.collect_ok && !v.claude_folder_unknown);
+            assert_eq!(
+                v.claude_folders,
+                vec![(fs(&f1), Some("u-b3-a".to_string())), (fs(&f2), Some("u-b3-b".to_string()))]
+            );
+            assert_eq!(v.agents_alive, AgentsAlive { claude: true, codex: true, gemini: false });
+            assert_eq!(v.current_for(s1.id), Some("u-b3-a"));
+            assert_eq!(v.current_for(s2.id), Some("u-b3-b"));
+            assert_eq!((v.current_for(s_codex.id), v.current_for(shell.id)), (None, None));
+            assert!(v.seats.iter().find(|s| s.surface_id == s1.id).is_some_and(|s| s.known && s.folder.as_deref() == Some(fs(&f1).as_str())));
+            assert!(v.seats.iter().any(|s| s.surface_id == shell.id && s.agent.is_none() && !s.known), "셸 좌석이 표에서 빠졌거나 claude 로 읽혔다");
+            assert_eq!(account_in_use("claude", "u-b3-a", &v), Some(true));
+            assert_eq!(account_in_use("claude", "u-b3-b", &v), Some(true));
+            assert_eq!(account_in_use("claude", "u-b3-zzz", &v), Some(false), "전원 판독됐고 아무도 아닌 계정은 미사용");
+            assert_eq!(account_in_use("codex", "default", &v), Some(true));
+            assert_eq!(account_in_use("antigravity", "default", &v), Some(false));
+            // 공개 래퍼(지금 시각·실제 홈)도 같은 표를 낸다 — 같은 60초 캐시를 쓰므로 방금 만든 표와 같다
+            let live = seat_identity_view(&d);
+            assert!(live.collect_ok);
+            assert_eq!(live.claude_folders, v.claude_folders);
+            assert_eq!(live.agents_alive, v.agents_alive);
+            // 폴더 미상 claude 좌석(설정 폴더 기록도 transcript 경로도 없다) → 모든 claude 계정 판정 불가(참이 이기는 계정은 제외)
+            let s3 = b3_seat(&d, "worker-b3-3", "claude", None);
+            let v = seat_identity_view_in(&d, Some(&home), t0 + SEAT_IDENT_CACHE_SECS);
+            assert!(v.claude_folder_unknown);
+            assert_eq!(account_in_use("claude", "u-b3-zzz", &v), None);
+            assert_eq!(account_in_use("claude", "u-b3-a", &v), Some(true));
+            // 그 좌석이 transcript 경로를 관측하면(session_file → 프로필 폴더) 폴더를 안다
+            *s3.observed_usage.lock().unwrap() = Some(ObservedUsage {
+                agent: "claude".into(),
+                ctx_tokens: None,
+                ctx_window: None,
+                ctx_pct: None,
+                rate: vec![],
+                source: "statusline".into(),
+                session_file: f1.join("projects/-w/s.jsonl").to_string_lossy().into_owned(),
+                updated_at: t0,
+                rate_observed_at: 0.0,
+                rate_account: None,
+            });
+            let v = seat_identity_view_in(&d, Some(&home), t0 + SEAT_IDENT_CACHE_SECS);
+            assert!(!v.claude_folder_unknown, "transcript 경로 폴백이 폴더를 알려 주지 않았다");
+            assert_eq!(v.current_for(s3.id), Some("u-b3-a"));
+            assert_eq!(account_in_use("claude", "u-b3-zzz", &v), Some(false));
+            // 종료된 좌석은 표에서 빠진다
+            for s in [&s1, &s3] {
+                s.exited.store(true, Ordering::Relaxed);
+            }
+            let v = seat_identity_view_in(&d, Some(&home), t0 + SEAT_IDENT_CACHE_SECS);
+            assert_eq!(v.claude_folders, vec![(fs(&f2), Some("u-b3-b".to_string()))]);
+            assert_eq!(account_in_use("claude", "u-b3-a", &v), Some(false), "종료된 좌석의 로그인이 '사용 중'으로 남았다");
+            assert_eq!(v.current_for(s1.id), None);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 60초 하한 캐시 — 같은 폴더는 60초 안에 다시 stat 하지 않는다(연속 호출 N회에 실판독 1회). 계측(`reads`·`hits`)과 **관측**(파일을 지워도 60초 안에는 옛 신원)
+        /// 둘로 핀한다. 시계가 뒤로 가면 캐시가 붙지 않는다.
+        #[test]
+        fn b3_view_checks_each_folder_at_most_once_per_sixty_seconds() {
+            let dir = tmp("b3-u6-daemon");
+            let home = tmp("b3-u6-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let f1 = b3_login(&home, ".cys/claude-b3-1", "u-b3-a", "a-b3@example.test", 1);
+            let s1 = b3_seat(&d, "worker-b3-1", "claude", Some(&f1));
+            let t0 = crate::state::now_epoch();
+            for i in 0..12 {
+                let v = seat_identity_view_in(&d, Some(&home), t0 + f64::from(i) * 4.0);
+                assert_eq!(v.current_for(s1.id), Some("u-b3-a"));
+            }
+            {
+                let c = d.seat_ident_cache.lock().unwrap();
+                assert_eq!((c.reads, c.hits), (1, 11), "연속 12회 호출에 실판독이 1회가 아니다(status 폴링이 stat 을 늘린다)");
+            }
+            // 파일을 지워도 60초 안에는 옛 신원(실제로 다시 보지 않았다는 관측) · 60초가 되면 다시 본다
+            std::fs::remove_file(f1.join(".claude.json")).unwrap();
+            assert_eq!(seat_identity_view_in(&d, Some(&home), t0 + 59.0).current_for(s1.id), Some("u-b3-a"));
+            assert_eq!(seat_identity_view_in(&d, Some(&home), t0 + 60.0).current_for(s1.id), None);
+            assert_eq!(d.seat_ident_cache.lock().unwrap().reads, 2);
+            // 시계가 뒤로 가면(now < 확인 시각) 만료로 본다 — 캐시가 영구히 붙지 않는다
+            let _ = seat_identity_view_in(&d, Some(&home), t0 - 5.0);
+            assert_eq!(d.seat_ident_cache.lock().unwrap().reads, 3);
+            // 좌석이 쓰지 않게 돼도 60초 하한 안의 항목은 걷지 않는다 — 같은 캐시를 쓰는 다른 소비자(알려진 프로필 폴더 전체 · `folder_identity`)의 항목이 신원 표 빌드에 지워지면 그 소비자가 폴더를 매번 stat 한다
+            s1.exited.store(true, Ordering::Relaxed);
+            let _ = seat_identity_view_in(&d, Some(&home), t0 + 200.0);
+            assert_eq!(d.seat_ident_cache.lock().unwrap().entries.len(), 1, "좌석이 쓰지 않는다고 하한 안의 항목을 걷었다");
+            let fo = b3_login(&home, ".cys/claude-b3-other", "u-b3-o", "o-b3@example.test", 3);
+            let key = fo.to_string_lossy().into_owned();
+            assert_eq!(folder_identity(&d, Some(&home), &key, t0 + 200.0).as_deref(), Some("u-b3-o"));
+            let reads = d.seat_ident_cache.lock().unwrap().reads;
+            let _ = seat_identity_view_in(&d, Some(&home), t0 + 230.0);
+            assert_eq!(folder_identity(&d, Some(&home), &key, t0 + 231.0).as_deref(), Some("u-b3-o"));
+            assert_eq!(d.seat_ident_cache.lock().unwrap().reads, reads, "신원 표 빌드가 다른 소비자의 캐시 항목을 걷어 다시 stat 했다");
+            // 확인한 지 10분이 지난 항목은 걷는다(크기 유계)
+            let _ = seat_identity_view_in(&d, Some(&home), t0 + 900.0);
+            assert!(d.seat_ident_cache.lock().unwrap().entries.is_empty(), "낡은 폴더 항목이 캐시에 남았다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// FIFO 신원 파일(읽으면 막히는 파일)을 가진 **좌석 폴더**가 신원 표·계정 조회(`local_json`)·경보 틱을 세우지 않는다(R4-F2 패턴 — 새 경로도 덮는다).
+        /// 신원 판독 불가 = 판정 불가 = 사용 중이므로 +1801초에도 A 경보는 발화한다(지우는 쪽 오판 금지).
+        #[cfg(unix)]
+        #[test]
+        fn b3_fifo_identity_in_a_seat_folder_blocks_nothing() {
+            let dir = tmp("b3-u7-daemon");
+            let home = tmp("b3-u7-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let fa = b3_login(&home, ".cys/claude-b3", "u-b3-a", "a-b3@example.test", 1);
+            let ff = home.join(".cys/claude-b3-fifo");
+            let fifo = ff.join(".claude.json");
+            mkfifo(&fifo);
+            let _seat = b3_seat(&d, "worker-b3", "claude", Some(&ff));
+            let t0 = crate::state::now_epoch();
+            let seq0 = d.bus.latest_seq();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+            let (tx, rx) = std::sync::mpsc::channel();
+            {
+                let (d, home) = (d.clone(), home.clone());
+                std::thread::spawn(move || {
+                    let v = seat_identity_view_in(&d, Some(&home), t0 + 1.0);
+                    let rows = local_json(&d, t0 + 1.0);
+                    let mut fired: HashMap<String, f64> = HashMap::new();
+                    crate::governance::check_alerts_with(&d, &mut fired, &crate::alerts::AlertConfig::default(), t0 + 1801.0);
+                    let _ = tx.send((v, rows.as_array().map(Vec::len), fired.contains_key(KEY_A)));
+                });
+            }
+            let out = rx.recv_timeout(std::time::Duration::from_secs(5));
+            release_fifo(&fifo);
+            let (v, rows_len, fired_a) = out.expect("FIFO 신원이 신원 표·계정 조회·경보 틱을 멈췄다");
+            assert!(v.collect_ok);
+            assert_eq!(v.claude_folders, vec![(ff.to_string_lossy().into_owned(), None)], "FIFO 신원은 판독 실패(None)여야 한다");
+            assert_eq!(account_in_use("claude", "u-b3-a", &v), None);
+            assert_eq!(rows_len, Some(1), "계정 조회가 행을 내지 못했다");
+            assert_eq!((fired_a, account_alerts(&d, seq0, KEY_A)), (true, 1), "판정 불가인데 +1801초 A 경보가 발화하지 않았다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// `usage.accounts` 행의 가산 키 — `in_use`(true/false/null) · `rate_observed_at`(경보 입력의 관측 시각 · 없으면 null) · `rate[].alert_eligible`.
+        /// 기존 키는 불변. 좌석 목록 수집 실패(락 오염)면 `in_use` 는 전부 null(실패 방향 = 경보 유지).
+        #[test]
+        fn b3_local_json_rows_carry_in_use_rate_observed_at_and_alert_eligible() {
+            let (d, dir, home, fa) = b3_fixture("u8");
+            let fb = b3_login(&home, ".cys/claude-b3-b", "u-b3-b", "b-b3@example.test", 2);
+            let seat = b3_seat(&d, "worker-b3", "claude", Some(&fa));
+            let outside_sess = outside_profile(&home, ".claude-9", "u-b3-c", "c-b3@example.test");
+            let t0 = crate::state::now_epoch();
+            // A: 지금 보고(좌석이 쓰는 로그인) · B: 2시간 전 관측(좌석이 쓰지 않는다 · 리셋 전)
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 97.0, Some(t0 + 7200.0))], "statusline", t0));
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fb, &[rw("5h", 90.0, Some(t0 + 3600.0))], "statusline", t0 - 7200.0));
+            // codex: 좌석 없음 · 관측은 1분 전(30분 안)
+            note_rate(&d, "codex", "", &[rw("7d", 40.0, Some(t0 + 86400.0))], "rollout", t0 - 60.0);
+            // 창 밖 표시용 값만 있는 계정 C(경보 입력 없음)
+            assert_eq!(report_outside_at(&d, Some(&home), &outside_sess, &[rw("5h", 50.0, None)], t0), Ok(OutsideOutcome::Accepted));
+            let rows = local_json(&d, t0 + 1.0);
+            let row = |id: &str| rows.as_array().unwrap().iter().find(|r| r["account_id"] == id).cloned().unwrap_or_else(|| panic!("행 {id} 없음: {rows}"));
+            let (a, b, c, cx) = (row("u-b3-a"), row("u-b3-b"), row("u-b3-c"), row("default"));
+            assert_eq!((a["in_use"].clone(), a["rate_observed_at"].clone(), a["rate"][0]["alert_eligible"].clone()), (json!(true), json!(t0), json!(true)));
+            assert_eq!((b["in_use"].clone(), b["rate_observed_at"].clone(), b["rate"][0]["alert_eligible"].clone()), (json!(false), json!(t0 - 7200.0), json!(false)), "미사용 · 2시간 전 관측은 부적격");
+            assert_eq!((c["in_use"].clone(), c["rate_observed_at"].clone(), c["rate"][0]["alert_eligible"].clone()), (json!(false), Value::Null, json!(false)), "창 밖 값만 있는 계정은 경보 입력이 아니다");
+            assert_eq!((cx["provider"].clone(), cx["in_use"].clone(), cx["rate"][0]["alert_eligible"].clone()), (json!("codex"), json!(false), json!(true)), "좌석 없는 codex · 관측 61초 → 나이 안이라 적격");
+            // 기존 키 불변(가산뿐)
+            for r in [&a, &b, &c, &cx] {
+                for k in ["provider", "account_id", "label", "plan", "profiles", "rate", "updated_at", "stale_secs", "source", "adapter", "source_error"] {
+                    assert!(r.get(k).is_some(), "기존 키 {k} 소실: {r}");
+                }
+                for k in ["label", "used_pct", "resets_at"] {
+                    assert!(r["rate"][0].get(k).is_some(), "rate 원소의 기존 키 {k} 소실: {r}");
+                }
+            }
+            assert_eq!(a["rate"][0]["used_pct"], json!(97.0));
+            // codex 좌석이 생기면 사용 중
+            let _codex_seat = b3_seat(&d, "reviewer-b3", "codex", None);
+            let cx = local_json(&d, t0 + 2.0).as_array().unwrap().iter().find(|r| r["provider"] == "codex").cloned().unwrap();
+            assert_eq!(cx["in_use"], json!(true));
+            // 좌석 목록 수집 실패(surfaces 락 오염) → in_use 는 전부 null
+            let dd = d.clone();
+            assert!(std::thread::spawn(move || {
+                let _g = dd.surfaces.lock().unwrap();
+                panic!("surfaces 락 오염(검체)");
+            })
+            .join()
+            .is_err());
+            let rows = local_json(&d, t0 + 3.0);
+            assert!(rows.as_array().unwrap().iter().all(|r| r["in_use"].is_null()), "수집 실패인데 in_use 가 판정됐다: {rows}");
+            drop(seat);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 계정 축 행(`alert_rates_with`) — 관측 시각·나이·in_use·리셋·PEAK_HOLD 잔여가 실리고, 적격 판정이 행마다 붙는다. 복원분은 held 가 없다.
+        #[test]
+        fn b3_alert_rows_carry_age_in_use_reset_and_held() {
+            let (d, dir, home, fa) = b3_fixture("u9");
+            let _seat = b3_seat(&d, "worker-b3", "claude", Some(&fa));
+            let t0 = crate::state::now_epoch();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0 + 100.0));
+            let view = seat_identity_view_in(&d, Some(&home), t0 + 400.0);
+            let rows = alert_rates_with(&d, &view, t0 + 400.0, 1800.0);
+            assert_eq!(rows.len(), 1);
+            let r = &rows[0];
+            assert_eq!((r.label.as_str(), r.win.as_str(), r.used_pct, r.in_use, r.eligible), ("a-b3@example.test", "5h", 99.0, Some(true), true));
+            assert_eq!((r.observed_at, r.age_secs, r.resets_at), (t0 + 100.0, 300.0, Some(t0 + 7200.0)));
+            assert_eq!(r.held_secs, Some(1500.0), "PEAK_HOLD 1800 − (마지막 확인 이후 300초)");
+            // 같은 시각을 stale 0(끔)으로 — 적격은 그대로, 나이 큰 미사용 입력도 적격(0.14.42 동작)
+            let v0 = SeatIdentityView { collect_ok: true, ..SeatIdentityView::default() };
+            let off = alert_rates_with(&d, &v0, t0 + 3000.0, 0.0);
+            assert!(!off.is_empty() && off.iter().all(|r| r.eligible), "노브 0 인데 부적격 행이 있다: {off:?}");
+            let on = alert_rates_with(&d, &v0, t0 + 3000.0, 1800.0);
+            assert!(!on.is_empty() && on.iter().all(|r| !r.eligible), "수집 성공 · 좌석 0 · 관측 2900초 → 부적격이어야 한다: {on:?}");
+            // 리셋이 지난 창은 행이 아니다(신선도와 무관)
+            assert!(alert_rates_with(&d, &view, t0 + 7201.0, 1800.0).is_empty());
+            // 복원분(peak_at 없음)은 held 가 없다
+            let rdir = tmp("b3-u9-restore");
+            let sock = rdir.join("cysd.sock");
+            {
+                let d1 = crate::state::Daemon::new(sock.clone());
+                assert!(note_rate_for_profile_at(&d1, Some(&home), &fa, &[rw("5h", 97.0, Some(t0 + 7200.0))], "statusline", t0 - 10.0));
+            }
+            let d2 = crate::state::Daemon::new(sock);
+            restore_from_snapshots(&d2, t0);
+            let rr = alert_rates_with(&d2, &v0, t0 + 1.0, 1800.0);
+            assert_eq!((rr.len(), rr[0].held_secs), (1, None), "복원분에 held 가 있다");
+            let _ = std::fs::remove_dir_all(&rdir);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 귀속 계정 반환판 — 좌석 설정 폴더의 보고 시점 신원을 돌려준다(None = 비었거나 판독 실패). bool 판은 종전 의미 그대로다.
+        #[test]
+        fn b3_note_rate_resolved_returns_the_attributed_account_and_bool_wrappers_keep_their_meaning() {
+            let (d, dir, home, fa) = b3_fixture("u10");
+            let t0 = crate::state::now_epoch();
+            let sess = fa.join("projects/-w/s.jsonl").to_string_lossy().into_owned();
+            write(&fa.join("projects/-w/s.jsonl"), "{}\n");
+            assert_eq!(
+                note_rate_for_profile_at_resolved(&d, Some(&home), &fa, &[rw("5h", 50.0, None)], "statusline", t0),
+                Some("u-b3-a".to_string())
+            );
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 50.0, None)], "statusline", t0 + 1.0), "bool 판은 귀속되면 true");
+            // 공개 래퍼(실제 홈 · 지금 시각) — `_at` 판과 같은 의미: bool 판 · 귀속 계정 반환판
+            assert!(note_rate_for_profile(&d, &fa, &[rw("5h", 51.0, None)], "statusline", crate::state::now_epoch()), "공개 bool 판은 귀속되면 true");
+            assert_eq!(
+                note_rate_for_profile_resolved(&d, &fa, &[rw("5h", 52.0, None)], "statusline", crate::state::now_epoch()),
+                Some("u-b3-a".to_string()),
+                "공개 귀속 계정 반환판"
+            );
+            assert_eq!(note_rate_at_resolved(&d, Some(&home), "claude", &sess, &[rw("5h", 50.0, None)], "statusline", t0 + 2.0), Some("u-b3-a".to_string()));
+            assert_eq!(note_rate_at_resolved(&d, Some(&home), "codex", "", &[rw("7d", 50.0, None)], "rollout", t0 + 3.0), Some("default".to_string()));
+            // 귀속 불가: 빈 rate · 신원 판독 불가 폴더 · 모르는 agent
+            assert_eq!(note_rate_for_profile_at_resolved(&d, Some(&home), &fa, &[], "statusline", t0), None);
+            assert!(!note_rate_for_profile_at(&d, Some(&home), &fa, &[], "statusline", t0), "bool 판은 빈 rate 면 false");
+            let nofolder = home.join(".cys/claude-b3-none");
+            assert_eq!(note_rate_for_profile_at_resolved(&d, Some(&home), &nofolder, &[rw("5h", 50.0, None)], "statusline", t0), None);
+            assert!(!note_rate_for_profile_at(&d, Some(&home), &nofolder, &[rw("5h", 50.0, None)], "statusline", t0));
+            assert_eq!(note_rate_at_resolved(&d, Some(&home), "nope", "", &[rw("5h", 50.0, None)], "statusline", t0), None);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 락 순서 배선 핀(소스): 신원 판독(파일 IO)은 어떤 락도 쥐지 않은 채 한다 — `local_json` 은 accounts 락을 잡기 **전에** 신원 표를 만들고, 좌석 표 복사
+        /// (`collect_seat_rows` · surfaces 락 안)는 파일 IO 를 부르지 않으며, 신원 표 본체는 그 복사가 끝난 **뒤에** 폴더를 판독한다. (표를 락 안에서 만들면
+        /// FIFO·느린 파일 하나가 사용량 RPC 전부와 워치독을 세운다 — R4-F2 전례.)
+        #[test]
+        fn b3_lock_order_wiring_pins() {
+            let src = include_str!("accounts.rs");
+            let func = |head: &str| -> String {
+                let body = src.split(head).nth(1).unwrap_or_else(|| panic!("{head} 소실"));
+                body[..body.find("\n}\n").unwrap_or_else(|| panic!("{head} 끝"))].to_string()
+            };
+            let lj = func("pub fn local_json(");
+            let view = lj.find("seat_identity_view_at(").expect("local_json 이 신원 표를 만들지 않는다");
+            let lock = lj.find("daemon.accounts.lock()").expect("local_json 의 accounts 락");
+            assert!(view < lock, "local_json 이 accounts 락을 잡은 **뒤에** 신원 표를 만든다(파일 IO 가 락 안)");
+            let c = func("fn collect_seat_rows(");
+            assert!(c.contains("daemon.surfaces.lock()"), "좌석 표 복사가 surfaces 락을 잡지 않는다(핀 앵커 소실)");
+            for io in ["folder_identity(", "claude_identity_unlocked(", "std::fs::", "read_identity_file(", "identity_file_meta(", "accounts.lock("] {
+                assert!(!c.contains(io), "surfaces 락 안(좌석 표 복사)에서 {io} 를 부른다");
+            }
+            let v = func("pub(crate) fn seat_identity_view_in(");
+            let (copy, read) = (v.find("collect_seat_rows(").expect("복사 호출"), v.find("folder_identity(").expect("판독 호출"));
+            assert!(copy < read, "신원 판독이 좌석 표 복사(surfaces 락 해제) 앞에 있다");
+            assert!(!v.contains("accounts.lock("), "신원 표 본체가 accounts 락을 직접 잡는다(겹쳐 쥐는 간선)");
+            let f = func("fn folder_identity(");
+            let cache_lock_end = f.find("let who = claude_identity_unlocked(").expect("실판독 호출");
+            assert!(f[..cache_lock_end].matches("seat_ident_cache.lock()").count() == 1 && f[cache_lock_end..].contains("seat_ident_cache.lock()"), "캐시 락은 조회·기록 때만 순간 잡는다(판독을 사이에 두고 두 번)");
+            let rw = func("pub fn alert_rates_with(");
+            assert!(!rw.contains("seat_identity_view") && !rw.contains("std::fs::"), "alert_rates_with 가 accounts 락 안에서 신원을 판독한다");
+        }
+
+        /// 노브 0 = 0.14.42 동작: 같은 로그인 전환 시나리오에서 `stale_secs=0` 이면 A 경보가 +1801초에도 REMIND 로 유지되고 해소 알림이 없다. 기본(1800)이면 소멸한다(음성 대조).
+        #[test]
+        fn b3_zero_knob_keeps_the_old_login_alert_and_the_default_retires_it() {
+            let run = |tag: &str, stale: f64| {
+                let (d, dir, home, f) = b3_fixture(tag);
+                let cfg = crate::alerts::AlertConfig::default();
+                let mut fired: HashMap<String, f64> = HashMap::new();
+                let _seat = b3_seat(&d, "worker-b3", "claude", Some(&f));
+                let t0 = crate::state::now_epoch();
+                let seq0 = d.bus.latest_seq();
+                assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+                crate::governance::check_alerts_with_stale(&d, &mut fired, &cfg, t0 + 1.0, stale);
+                b3_login(&home, ".cys/claude-b3", "u-b3-b", "b-b3@example.test", 2);
+                assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 10.0, Some(t0 + 9000.0))], "statusline", t0 + 5.0));
+                for dt in [70.0, 1799.0, 1801.0] {
+                    crate::governance::check_alerts_with_stale(&d, &mut fired, &cfg, t0 + dt, stale);
+                }
+                let out = (account_alerts(&d, seq0, KEY_A), b3_resolved(&d, seq0));
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&home);
+                out
+            };
+            assert_eq!(run("u11a", 0.0), (2, vec![]), "노브 0 인데 0.14.42 와 다르다(A 유지 + REMIND 1회 · 해소 알림 없음)");
+            assert_eq!(run("u11b", 1800.0), (1, vec![(KEY_A.to_string(), "stale".to_string())]));
+        }
+
+        /// 경보 `detail` 가산 키가 실제 틱 산출물(버스 이벤트 payload)에 실린다 — observed_at · age_secs · in_use · reset_in_secs · held_secs · 기존 키 불변.
+        #[test]
+        fn b3_fired_alert_detail_carries_observation_meta() {
+            let (d, dir, home, f) = b3_fixture("u12");
+            let cfg = crate::alerts::AlertConfig::default();
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            let _seat = b3_seat(&d, "worker-b3", "claude", Some(&f));
+            let t0 = crate::state::now_epoch();
+            let seq0 = d.bus.latest_seq();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 30.0);
+            let evs = b3_events(&d, seq0, "alert.account_rate");
+            assert_eq!(evs.len(), 1);
+            let det = &evs[0]["detail"];
+            assert_eq!(det["account"], json!("a-b3@example.test"));
+            assert_eq!((det["win"].clone(), det["used_pct"].clone()), (json!("5h"), json!(99.0)), "기존 detail 키가 바뀌었다");
+            assert_eq!(det["observed_at"], json!(t0));
+            assert_eq!(det["age_secs"], json!(30));
+            assert_eq!(det["in_use"], json!(true));
+            assert_eq!(det["reset_in_secs"], json!(7170));
+            assert_eq!(det["held_secs"], json!(1770));
+            assert_eq!(evs[0]["key"], json!(KEY_A));
+            assert_eq!(evs[0]["isolate"], json!(true));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
     }
 }

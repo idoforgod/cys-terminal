@@ -1314,6 +1314,9 @@ fn check_role_deadman(daemon: &Arc<Daemon>, tracker: &mut DeadmanTracker) {
 /// T7 E6 경보: rate 한도·주간 예산·반복실패를 순수 평가기(alerts.rs)로 판정해 **에지 발화**한다.
 /// fired 맵에 없는 키만 발행(첫 교차)하고, 해소된 키는 retain으로 제거해 재무장한다(다음 교차 시
 /// 재발화). 지속 조건은 30분 디바운스로 재격상(master가 놓치지 않게). ★자동응답 금지 — 이벤트만.
+/// ★0.14.43(B3): 신선도 규칙으로 입력에서 빠진 키(`Snapshot::stale_suppressed`)는 해소가 아니라 **붙들림**이다 — `fired` 시각을 유지해, 다시 적격이 돼도
+/// 마지막 발행에서 REMIND 가 지나기 전에는 재발행하지 않는다(깜빡임 금지). 직전 틱에 active 였다가 이번 틱에 빠진 키마다 `usage.alert_resolved{key,reason}` 를
+/// 한 건 낸다(reason = `stale`(붙들림) | `cleared`(그 밖)) — **이름에 `alert.` 접두를 쓰지 않는다**(`alert_route::routable` 이 `alert.*` 를 CSO 좌석 입력으로 보낸다).
 fn check_alerts(daemon: &Arc<Daemon>, fired: &mut HashMap<String, f64>) {
     check_alerts_with(daemon, fired, &crate::alerts::AlertConfig::load(), now_epoch());
 }
@@ -1328,11 +1331,24 @@ pub(crate) fn check_alerts_with(
     cfg: &crate::alerts::AlertConfig,
     now: f64,
 ) {
+    check_alerts_with_stale(daemon, fired, cfg, now, crate::accounts::account_alert_stale_secs());
+}
+
+/// [`check_alerts_with`] 의 시험 이음매 — 신선도 규칙의 나이 상한(초)을 인자로 받는다(`0` = 규칙 끔). 노브 환경변수를 만지지 않고 같은 시나리오를 노브 값별로 돌린다.
+pub(crate) fn check_alerts_with_stale(
+    daemon: &Arc<Daemon>,
+    fired: &mut HashMap<String, f64>,
+    cfg: &crate::alerts::AlertConfig,
+    now: f64,
+    stale_secs: f64,
+) {
     const REMIND_SECS: f64 = ALERT_REMIND_SECS;
-    let snap = crate::alerts::snapshot(daemon, now);
+    let snap = crate::alerts::snapshot_with_stale(daemon, now, stale_secs);
     let active = crate::alerts::evaluate(&snap, cfg);
     let active_keys: std::collections::HashSet<String> =
         active.iter().map(|a| a.key.clone()).collect();
+    let stale_keys: std::collections::HashSet<&str> =
+        snap.stale_suppressed.iter().map(String::as_str).collect();
     for a in &active {
         let due = fired.get(&a.key).is_none_or(|t| now - *t >= REMIND_SECS);
         if due {
@@ -1347,8 +1363,31 @@ pub(crate) fn check_alerts_with(
                 .publish(&format!("alert.{}", a.kind), "alert", None, payload);
         }
     }
-    // 해소된 경보 키 재무장(다음 교차 시 즉시 발화) — 태스크-로컬 맵 누수도 차단.
-    fired.retain(|k, _| active_keys.contains(k));
+    // ★0.14.43(B3) 해소 알림 — 직전 틱에 active 였다가 이번 틱에 빠진 키(`fired` 에 있고 지금 active 가 아닌 키 중, 직전 틱에도 붙들려 있던 키는 이미 알렸으므로 제외).
+    //   `usage.alert_resolved` 는 라우팅 대상이 아니다(`alert.` 접두 금지 · 좌석 입력으로 새지 않는다).
+    let prev_held: std::collections::HashSet<String> = std::mem::take(
+        &mut *daemon.alert_stale_held.lock().unwrap_or_else(|e| e.into_inner()),
+    );
+    let mut gone: Vec<&String> = fired
+        .keys()
+        .filter(|k| !active_keys.contains(*k) && !prev_held.contains(*k))
+        .collect();
+    gone.sort();
+    for k in gone {
+        let reason = if stale_keys.contains(k.as_str()) { "stale" } else { "cleared" };
+        daemon.bus.publish(
+            "usage.alert_resolved",
+            "usage",
+            None,
+            json!({"key": k, "reason": reason}),
+        );
+    }
+    // 해소된 경보 키 재무장(다음 교차 시 즉시 발화) — 태스크-로컬 맵 누수도 차단. 단 신선도 규칙으로 **붙든** 키는 `fired` 시각을 유지한다
+    // (다시 적격이 돼도 REMIND 안에는 재발행하지 않는다 — 깜빡임 금지).
+    fired.retain(|k, _| active_keys.contains(k) || stale_keys.contains(k.as_str()));
+    // 이번 틱에 붙든 키 = 남은 `fired` 중 active 가 아닌 키 — 다음 틱의 '처음 빠질 때 한 번만' 판정 재료.
+    *daemon.alert_stale_held.lock().unwrap_or_else(|e| e.into_inner()) =
+        fired.keys().filter(|k| !active_keys.contains(*k)).cloned().collect();
 }
 
 // CYS_TODO_DIRS 분해·스캔 루트 조립·파일 발견은 전부 **lib 계층 단일 구현**이다

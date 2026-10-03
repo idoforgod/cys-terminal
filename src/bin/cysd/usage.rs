@@ -101,6 +101,18 @@ pub struct ObservedUsage {
     pub source: String,
     pub session_file: String,
     pub updated_at: f64,
+    /// ★0.14.43(B3 · 오너 결재 "경보 입력 = 리셋 전 ∧ (사용 중 ∨ 관측 나이 ≤ 1800초)"): 이 `rate` 가 **새로 생산된** 시각(epoch 초 ·
+    /// 0.0 = 모름). 상태줄 보고(`usage.report`)·codex rollout 의 신선 rate = 그 순간이고, claude transcript tail 처럼 `prev.rate` 를
+    /// **이월**한 스냅샷은 이 값도 이월한다 — `updated_at` 은 이월에도 `now` 로 찍히므로 rate 의 나이가 아니다(이월이 유휴 좌석의
+    /// 옛 값을 신선한 것으로 둔갑시키던 통로). 경보 신선도 규칙 `accounts::alert_eligible` 의 나이 입력이다.
+    /// 원값은 직렬화하지 않는다 — status 에는 계산 키(`rate_observed_at`·`rate_age_secs`)만 싣는다(`accounts::seat_usage_wire`).
+    #[serde(skip)]
+    pub rate_observed_at: f64,
+    /// ★0.14.43(B3): 이 rate 가 귀속된 계정 id — 상태줄 보고를 좌석 설정 폴더의 **보고 시점 신원**으로 귀속한 결과(claude 좌석만 ·
+    /// 귀속 실패·창 밖 강등·비 claude = None). 이월이면 이월한다. 좌석 축 `seat_in_use` 의 입력("로그인이 바뀐 뒤 아직 새로 보고하지
+    /// 않은 좌석" 판정). 원 uuid 라 직렬화하지 않는다(status JSON 으로 내보내지 않는다).
+    #[serde(skip)]
+    pub rate_account: Option<String>,
 }
 
 // ───────────────── ★(0.14.42 · clear 가드 v3) 사이클 표지 기반 유한 상태기계 — 폭주·영구 무clear·유휴 발화 차단 ─────────────────
@@ -1574,19 +1586,20 @@ fn collect_for(
             "claude" => {
                 if let Some((ctx_tokens, model)) = parse_claude_line(line) {
                     let window = state.server_ctx_window.unwrap_or_else(|| claude_ctx_window(&model));
+                    // ★0.14.43(B3): claude transcript 는 rate 를 **이월**한다(rate 의 생산자는 상태줄뿐) — 값과 함께 관측 시각·귀속 계정도 이월한다.
+                    //   `updated_at: now` 는 이월에도 갱신되므로 rate 의 나이가 아니다(`ObservedUsage::rate_observed_at`).
+                    let (rate, rate_observed_at, rate_account) = carried_rate(next.as_ref(), prev.as_ref());
                     next = Some(ObservedUsage {
                         agent: agent.into(),
                         ctx_tokens: Some(ctx_tokens),
                         ctx_window: Some(window),
                         ctx_pct: pct(ctx_tokens, window),
-                        rate: next
-                            .as_ref()
-                            .map(|n| n.rate.clone())
-                            .or_else(|| prev.as_ref().map(|p| p.rate.clone()))
-                            .unwrap_or_default(),
+                        rate,
                         source: source_label("transcript", state.heuristic),
                         session_file: state.path.to_string_lossy().into_owned(),
                         updated_at: now,
+                        rate_observed_at,
+                        rate_account,
                     });
                 }
             }
@@ -1599,10 +1612,9 @@ fn collect_for(
                     let base = next.as_ref().or(prev.as_ref());
                     let ctx_tokens = obs.ctx_tokens.or(base.and_then(|b| b.ctx_tokens));
                     let ctx_window = obs.ctx_window.or(base.and_then(|b| b.ctx_window));
-                    let rate = obs
-                        .rate
-                        .or_else(|| base.map(|b| b.rate.clone()))
-                        .unwrap_or_default();
+                    // ★0.14.43(B3): 이 틱에 rollout 이 **새로 낸** rate 면 관측 시각 = now, 이월(base.rate 복사)이면 base 의 관측 시각을 이월한다.
+                    //   (codex 는 계정 귀속이 단일 홈 `default` 라 rate_account 는 두지 않는다 — 좌석 축 로그인 전환 판정은 claude 전용.)
+                    let (rate, rate_observed_at) = codex_rate_merge(obs.rate, base, now);
                     next = Some(ObservedUsage {
                         agent: agent.into(),
                         ctx_tokens,
@@ -1614,6 +1626,8 @@ fn collect_for(
                         source: source_label("rollout", state.heuristic),
                         session_file: state.path.to_string_lossy().into_owned(),
                         updated_at: now,
+                        rate_observed_at,
+                        rate_account: None,
                     });
                 }
             }
@@ -1922,6 +1936,26 @@ fn usage_max_session_age_secs() -> f64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(900.0)
+}
+
+/// ★0.14.43(B3) claude transcript tail 의 rate **이월**(순수 — 핀): 이번 틱에 앞서 만든 `next` 가 있으면 그것을, 없으면 직전 스냅샷 `prev` 를 따른다. 값뿐 아니라
+/// 관측 시각(`rate_observed_at`)과 귀속 계정(`rate_account`)도 함께 이월한다 — 이월에도 `updated_at` 은 now 로 갱신되므로, 관측 시각을 이월하지 않으면 유휴 좌석의 옛 rate 가
+/// 신선한 것으로 둔갑한다(경보 신선도 규칙을 무력화하는 통로). 어느 쪽도 없으면 빈 rate · 관측 시각 모름(0) · 귀속 없음.
+pub(crate) fn carried_rate(next: Option<&ObservedUsage>, prev: Option<&ObservedUsage>) -> (Vec<RateWindow>, f64, Option<String>) {
+    match (next, prev) {
+        (Some(n), _) => (n.rate.clone(), n.rate_observed_at, n.rate_account.clone()),
+        (None, Some(p)) => (p.rate.clone(), p.rate_observed_at, p.rate_account.clone()),
+        (None, None) => (Vec::new(), 0.0, None),
+    }
+}
+
+/// ★0.14.43(B3) codex rollout 틱의 rate 병합(순수 — 핀): 이 이벤트가 **새로 낸** rate 면 관측 시각 = `now`, 없어서 `base`(이번 틱 앞선 스냅샷 또는 직전 스냅샷)의 rate 를 이월하면
+/// base 의 관측 시각을 그대로 이월한다(없으면 빈 rate · 모름). codex 는 계정 귀속이 단일 홈이라 귀속 계정은 두지 않는다.
+pub(crate) fn codex_rate_merge(fresh: Option<Vec<RateWindow>>, base: Option<&ObservedUsage>, now: f64) -> (Vec<RateWindow>, f64) {
+    match fresh {
+        Some(r) => (r, now),
+        None => base.map_or((Vec::new(), 0.0), |b| (b.rate.clone(), b.rate_observed_at)),
+    }
 }
 
 /// 매핑 신선도 순수 판정자 — 시계·파일을 읽지 않는다(입력만으로 판정).
@@ -2983,6 +3017,9 @@ fn update_agy_usage(daemon: &Arc<Daemon>, s: &Arc<Surface>, rate: Vec<RateWindow
         source: "agy-rpc".into(),
         session_file: String::new(),
         updated_at: now_epoch(),
+        // ★0.14.43(B3): agy 프로브는 항상 신선 생산 — 관측 시각 = 지금(귀속 계정은 단일 홈이라 두지 않는다).
+        rate_observed_at: now_epoch(),
+        rate_account: None,
     };
     let changed = s
         .observed_usage
@@ -3230,6 +3267,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// ★0.14.43(B3) transcript tail 의 rate 이월 핀: 값과 함께 **관측 시각·귀속 계정이 이월**된다(`updated_at` 이 now 로 갱신돼도 rate 의 나이는 그대로) ·
+    /// 이번 틱의 앞선 스냅샷(`next`)이 직전(`prev`)보다 우선 · 둘 다 없으면 빈 rate·관측 시각 모름·귀속 없음. codex 는 새로 낸 rate 만 now, 이월은 base 의 시각.
+    #[test]
+    fn b3_rate_carryover_keeps_the_observation_time_and_the_attributed_account() {
+        let w = |pct: f64| vec![RateWindow { label: "5h".into(), used_pct: pct, resets_at: Some(9_999_999_999.0) }];
+        let snap = |pct: f64, at: f64, acct: Option<&str>, updated: f64| ObservedUsage {
+            agent: "claude".into(),
+            ctx_tokens: None,
+            ctx_window: None,
+            ctx_pct: None,
+            rate: w(pct),
+            source: "statusline".into(),
+            session_file: String::new(),
+            updated_at: updated,
+            rate_observed_at: at,
+            rate_account: acct.map(str::to_string),
+        };
+        let prev = snap(99.0, 1_000.0, Some("u-b3-a"), 5_000.0);
+        let (r, at, acct) = carried_rate(None, Some(&prev));
+        assert_eq!((r, at, acct.as_deref()), (w(99.0), 1_000.0, Some("u-b3-a")), "이월이 관측 시각·귀속 계정을 잃었다(updated_at 5000 이 아니라 rate 의 1000)");
+        let next = snap(50.0, 2_000.0, None, 5_000.0);
+        let (r, at, acct) = carried_rate(Some(&next), Some(&prev));
+        assert_eq!((r, at, acct), (w(50.0), 2_000.0, None), "이번 틱의 앞선 스냅샷이 직전보다 우선이다");
+        assert_eq!(carried_rate(None, None), (Vec::new(), 0.0, None));
+        // codex: 새로 낸 rate 는 now · 이월은 base 의 관측 시각(now 가 아니다) · base 없음은 모름
+        let base = snap(70.0, 3_000.0, None, 5_000.0);
+        assert_eq!(codex_rate_merge(Some(w(10.0)), Some(&base), 7_000.0), (w(10.0), 7_000.0));
+        assert_eq!(codex_rate_merge(None, Some(&base), 7_000.0), (w(70.0), 3_000.0), "codex 이월이 관측 시각을 now 로 둔갑시켰다");
+        assert_eq!(codex_rate_merge(None, None, 7_000.0), (Vec::new(), 0.0));
+        // 빈 새 rate(Some(빈 벡터))도 '새로 낸 것'이다(종전 `obs.rate.or_else` 와 같은 의미)
+        assert_eq!(codex_rate_merge(Some(Vec::new()), Some(&base), 7_000.0), (Vec::new(), 7_000.0));
+    }
+
     /// ★R1-blocking-1 (codex 감사 · 실패 먼저 잠금): **신규 줄이 없어도** 낡은 매핑은 값을
     /// 비워야 한다. 세션이 교체되면 옛 파일에는 더 이상 줄이 붙지 않으므로 "신규 줄 0" 은
     /// stale 의 **정상 증상**이다 — 그런데 collect_for 는 그 경우 freshness 검사 **전에**
@@ -3248,6 +3318,8 @@ mod tests {
             source: "rollout:heuristic".into(),
             session_file: "/x/rollout-old.jsonl".into(),
             updated_at: 1.0,
+            rate_observed_at: 0.0,
+            rate_account: None,
         };
         let now = crate::state::now_epoch();
         let old_mt = now - 20.9 * 3600.0; // dept-1 실측(20.9시간 정지)
@@ -3320,6 +3392,8 @@ mod tests {
             source: "rollout:heuristic".into(),
             session_file: "/x/rollout-old.jsonl".into(),
             updated_at: 1.0,
+            rate_observed_at: 0.0,
+            rate_account: None,
         };
         // 생산 코드와 같은 전이(값 비우기 + :stale 표기).
         u.ctx_tokens = None;

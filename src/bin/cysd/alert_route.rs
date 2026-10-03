@@ -1347,7 +1347,24 @@ fn summary_value_is_machine(k: &str, v: &str) -> bool {
     if k == "remedy" {
         return crate::governance::QUEUE_REMEDY_CODES.contains(&v);
     }
+    // ★(0.14.43 · B3) 한도 경보 요약의 가산 토큰 문법 — 창 라벨(`win`·`label`)은 허용 목록(`5h`·`7d`·`^[0-9]{1,3}[mhd]$`)에 들 때만 원문이고,
+    //   `in_use` 의 `na`(판정 불가)는 열거 값이다(`0`·`1`·`age`·`reset`·`held` 는 위 수치 규칙으로 이미 통과). 복원된 요약도 같은 문법을 지난다.
+    if matches!(k, "win" | "label") && is_window_label(v) {
+        return true;
+    }
+    if k == "in_use" && v == "na" {
+        return true;
+    }
     matches!(k, "role" | "agent" | "kind" | "severity" | "where" | "blocked_by") && safe_identity(v)
+}
+
+/// ★(0.14.43 · B3) 창 라벨 허용 목록 — `5h`·`7d` 와 일반형 `^[0-9]{1,3}[mhd]$`(숫자 1~3자리 + 단위 m·h·d). 신원 파일이 아니라 데몬 상수 어휘(`5h`·`7d`·`300m`)에서만 오는 값이라
+/// pane stdin 으로 가는 문안에 원문으로 실어도 되고, 그 밖의 모양은 종전처럼 불투명 해시로 접는다(모양으로 문장을 가릴 수 없다는 원칙 — 허용 목록 정확 일치만).
+fn is_window_label(s: &str) -> bool {
+    let b = s.as_bytes();
+    (2..=4).contains(&b.len())
+        && b[..b.len() - 1].iter().all(u8::is_ascii_digit)
+        && matches!(b[b.len() - 1], b'm' | b'h' | b'd')
 }
 
 /// ★(성찰 A8) **복원 경로의 요약 재검증.** `sanitize_line` 은 제어문자 제거이지 프롬프트 주입
@@ -1482,9 +1499,17 @@ pub fn summarize_payload(name: &str, payload: &Value) -> String {
             } else {
                 ""
             };
+            // ★(0.14.43 · B3) 한도 경보(`alert.account_rate`·`alert.rate_limit`)는 관측 메타 토큰(age·in_use·reset·held — 정수·열거 값뿐)을 더한다.
+            //   detail 키가 늘어도 `generic_summary` 의 4개 상한에 `used_pct`·`win` 이 밀려나지 않게 전용 렌더를 쓴다. 노브 `CYS_ALERT_SUMMARY_LEGACY=1` = 종전 바이트.
             let detail = payload
                 .get("detail")
-                .map(generic_summary)
+                .map(|d| {
+                    if matches!(n, "alert.account_rate" | "alert.rate_limit") {
+                        rate_alert_detail(d, alert_summary_legacy())
+                    } else {
+                        generic_summary(d)
+                    }
+                })
                 .filter(|d| !d.is_empty())
                 .map(|d| format!(" {d}"))
                 .unwrap_or_default();
@@ -1497,10 +1522,15 @@ pub fn summarize_payload(name: &str, payload: &Value) -> String {
 }
 
 fn generic_summary(payload: &Value) -> String {
+    generic_summary_by(payload, |_, v| generic_value(v))
+}
+
+/// [`generic_summary`] 의 본체 — 값 렌더만 키별로 갈아 끼울 수 있다(기본은 일반 값 규칙: 수치·불리언 원문 · 문자열 해시). 키 정렬·거부 키·4개 상한은 그대로다.
+fn generic_summary_by(payload: &Value, render: impl Fn(&str, &Value) -> Option<String>) -> String {
     let Some(map) = payload.as_object() else {
         // ★비객체 payload(문자열 통짜 등)도 **같은 값 검사**를 받는다 — 종전에는 여기만
         //   `scalar()` 로 빠져나가 자유 문장이 그대로 실렸다(codex 지적).
-        return generic_value(payload).unwrap_or_default();
+        return render("", payload).unwrap_or_default();
     };
     let mut keys: Vec<&String> = map
         .keys()
@@ -1508,10 +1538,66 @@ fn generic_summary(payload: &Value) -> String {
         .collect();
     keys.sort();
     keys.iter()
-        .filter_map(|k| map.get(*k).and_then(generic_value).map(|v| format!("{k}={v}")))
+        .filter_map(|k| map.get(*k).and_then(|v| render(k, v)).map(|v| format!("{k}={v}")))
         .take(4)
         .collect::<Vec<String>>()
         .join(" ")
+}
+
+/// 한도 경보 detail 에 B3 가 가산한 관측 메타 키 — 종전 요약(노브 LEGACY)은 이 키가 없던 detail 의 바이트를 그대로 내야 한다.
+const RATE_ALERT_META_KEYS: [&str; 5] = ["observed_at", "age_secs", "in_use", "reset_in_secs", "held_secs"];
+
+/// ★(0.14.43 · B3) 노브 `CYS_ALERT_SUMMARY_LEGACY=1` — 한도 경보 요약을 0.14.43 이전 바이트 그대로 낸다(다운스트림 파서 호환 안전판).
+fn alert_summary_legacy() -> bool {
+    std::env::var("CYS_ALERT_SUMMARY_LEGACY").is_ok_and(|v| v.trim() == "1")
+}
+
+/// 0 이상의 유한한 수치 → 정수 초(소수는 내림). 그 밖(음수·비수치·부재)은 None — 요약 토큰은 정수만 싣는다.
+fn summary_secs(v: Option<&Value>) -> Option<u64> {
+    v.and_then(Value::as_f64).filter(|x| x.is_finite() && *x >= 0.0).map(|x| x as u64)
+}
+
+/// ★(0.14.43 · B3) 한도 경보(`account_rate`·`rate_limit`)의 detail 요약.
+///   · 종전 키(account|role · label|win · used_pct)는 종전 규칙 — 수치·불리언 원문, 문자열 해시. 단 창 라벨(`win`·`label`)은 허용 목록([`is_window_label`])에 들면 원문이다.
+///     `account`·`role` 은 **종전 해시를 유지한다**(신원 파일의 이메일·좌석 이름이 pane stdin 으로 가는 통로를 만들지 않는다).
+///   · 그 뒤에 정수·열거 토큰만 가산한다: ` age=<초>` ` in_use=<0|1|na>` ` reset=<초>`(없으면 생략) ` held=<초>`(없으면 생략). 신원 파일에서 온 문자열은 싣지 않는다.
+///   · `legacy` 면 가산 키를 떼고 종전 렌더 그대로(바이트 동일).
+fn rate_alert_detail(detail: &Value, legacy: bool) -> String {
+    let mut base = detail.clone();
+    if let Some(m) = base.as_object_mut() {
+        for k in RATE_ALERT_META_KEYS {
+            m.remove(k);
+        }
+    }
+    if legacy {
+        return generic_summary(&base);
+    }
+    let mut out = generic_summary_by(&base, |k, v| match v {
+        Value::String(s) if matches!(k, "win" | "label") && is_window_label(s) => Some(s.clone()),
+        _ => generic_value(v),
+    });
+    let mut push = |tok: String| {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&tok);
+    };
+    if let Some(a) = summary_secs(detail.get("age_secs")) {
+        push(format!("age={a}"));
+    }
+    match detail.get("in_use") {
+        Some(Value::Bool(true)) => push("in_use=1".into()),
+        Some(Value::Bool(false)) => push("in_use=0".into()),
+        Some(Value::Null) => push("in_use=na".into()),
+        _ => {}
+    }
+    if let Some(r) = summary_secs(detail.get("reset_in_secs")) {
+        push(format!("reset={r}"));
+    }
+    if let Some(h) = summary_secs(detail.get("held_secs")) {
+        push(format!("held={h}"));
+    }
+    out
 }
 
 /// 키 판별자 — **이름 하나가 여러 사실을 다중화하는 이벤트**에서만 뽑는다.
@@ -8631,4 +8717,176 @@ mod converge_drills {
         );
     }
 
+}
+
+// ═════════ ★0.14.43(B3) 한도 경보 요약 — 정수·열거 토큰만 가산 · 창 라벨 허용 목록 · 종전 바이트 노브 · 해소 이벤트 비라우팅 ═════════
+// 픽스처는 전부 합성값이다(a-b3@example.test · worker-b3 등) — 실계정 식별자 금지.
+#[cfg(test)]
+mod b3_summary_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// `alerts::evaluate` 가 내는 payload 와 같은 모양(Alert::to_value + severity_class·isolate) — 한도 경보 한 건. `meta` 면 B3 가산 키가 실린다.
+    fn payload(account: bool, win: &str, meta: bool) -> Value {
+        let mut detail = if account {
+            json!({"account": "a-b3@example.test", "win": win, "used_pct": 96.0})
+        } else {
+            json!({"role": "worker-b3", "label": win, "used_pct": 96.0})
+        };
+        if meta {
+            detail["observed_at"] = json!(1_700_000_000.5);
+            detail["age_secs"] = json!(1801);
+            detail["in_use"] = json!(false);
+            detail["reset_in_secs"] = json!(5399);
+            detail["held_secs"] = json!(1799);
+        }
+        json!({"kind": if account { "account_rate" } else { "rate_limit" },
+               "key": if account { "account_rate:a-b3@example.test:5h" } else { "rate_limit:worker-b3:5h" },
+               "severity": "crit", "severity_class": "critical", "isolate": true,
+               "message": "synthetic", "detail": detail})
+    }
+
+    const ACCT: &str = "alert.account_rate";
+    const SEAT: &str = "alert.rate_limit";
+
+    /// 계정 축·좌석 축 요약에 정수·열거 토큰(age · in_use · reset · held)이 종전 요약 **뒤에** 붙는다. `account`·`role` 은 종전대로 해시(원문 0 · `@` 0).
+    #[test]
+    fn b3_rate_alert_summaries_carry_integer_tokens_after_the_legacy_part() {
+        let key_a = opaque_label("account_rate:a-b3@example.test:5h");
+        let acct = opaque_label("a-b3@example.test");
+        let s = summarize_payload(ACCT, &payload(true, "5h", true));
+        assert_eq!(
+            s,
+            format!("kind=account_rate severity=crit isolate=true key={key_a} account={acct} used_pct=96.0 win=5h age=1801 in_use=0 reset=5399 held=1799"),
+            "{s}"
+        );
+        assert!(!s.contains('@') && !s.contains("example") && !s.contains("a-b3"), "신원 파일 값이 pane 문안으로 갔다: {s}");
+        let key_s = opaque_label("rate_limit:worker-b3:5h");
+        let role = opaque_label("worker-b3");
+        let s = summarize_payload(SEAT, &payload(false, "5h", true));
+        assert_eq!(
+            s,
+            format!("kind=rate_limit severity=crit isolate=true key={key_s} label=5h role={role} used_pct=96.0 age=1801 in_use=0 reset=5399 held=1799"),
+            "{s}"
+        );
+        assert!(!s.contains("worker-b3"), "{s}");
+        // 메타가 없는 payload(종전 발행자 · 복원)는 종전 모양 그대로 — 가산 토큰이 지어지지 않는다
+        let old = summarize_payload(ACCT, &payload(true, "5h", false));
+        assert_eq!(old, format!("kind=account_rate severity=crit isolate=true key={key_a} account={acct} used_pct=96.0 win=5h"));
+    }
+
+    /// `in_use` 3값(true=1 · false=0 · null=na)과 생략 규칙 — null·음수·비수치는 토큰을 만들지 않는다. 문자열은 어떤 숫자 자리에도 실리지 않는다.
+    #[test]
+    fn b3_rate_alert_tokens_follow_the_tri_state_and_omit_what_is_unknown() {
+        let tail = |d: Value| {
+            let mut p = payload(true, "5h", false);
+            for (k, v) in d.as_object().unwrap() {
+                p["detail"][k] = v.clone();
+            }
+            let s = summarize_payload(ACCT, &p);
+            s.split_once("win=5h").map(|(_, t)| t.to_string()).unwrap_or_else(|| panic!("{s}"))
+        };
+        assert_eq!(tail(json!({"in_use": true})), " in_use=1");
+        assert_eq!(tail(json!({"in_use": false})), " in_use=0");
+        assert_eq!(tail(json!({"in_use": null})), " in_use=na");
+        assert_eq!(tail(json!({})), "", "키가 없으면 토큰도 없다");
+        assert_eq!(tail(json!({"age_secs": null, "reset_in_secs": null, "held_secs": null, "in_use": null})), " in_use=na");
+        assert_eq!(tail(json!({"reset_in_secs": -30})), "", "음수 리셋은 토큰을 만들지 않는다(정수·비음수만)");
+        assert_eq!(tail(json!({"age_secs": 0, "reset_in_secs": 0, "held_secs": 0})), " age=0 reset=0 held=0");
+        assert_eq!(tail(json!({"age_secs": 12.9})), " age=12", "소수는 내림");
+        assert_eq!(tail(json!({"age_secs": "99", "reset_in_secs": "5", "held_secs": "x", "in_use": "yes"})), "", "문자열이 정수·열거 자리에 실렸다");
+        assert_eq!(tail(json!({"in_use": 1})), "", "불리언이 아닌 in_use 는 토큰을 만들지 않는다");
+    }
+
+    /// 창 라벨 허용 목록 — `5h`·`7d`·`^[0-9]{1,3}[mhd]$` 는 원문, 그 밖(빈 값 · 단위 없음 · 4자리 · 공백 · 전각 숫자 · 대문자 · 문장)은 종전 해시.
+    /// 복원 경로(`revalidate_summary`)도 같은 문법을 지난다(원문 창 라벨이 해시로 접히지 않고 · 해시 값도 그대로 통과).
+    #[test]
+    fn b3_window_label_allowlist_is_exact_and_survives_revalidation() {
+        for ok in ["5h", "7d", "30m", "1d", "300m", "999d", "0h", "12h"] {
+            assert!(is_window_label(ok), "{ok}");
+            let s = summarize_payload(ACCT, &payload(true, ok, false));
+            assert!(s.contains(&format!(" win={ok}")) && !s.contains("win=#"), "허용 목록 값 {ok} 이 원문이 아니다: {s}");
+            let s = summarize_payload(SEAT, &payload(false, ok, false));
+            assert!(s.contains(&format!(" label={ok} ")) && !s.contains("label=#"), "좌석 축 {ok}: {s}");
+            assert_eq!(revalidate_summary(&s), s, "허용 목록 요약이 복원 재검증에서 바뀌었다: {s}");
+        }
+        for bad in ["", "h", "5", "5x", "1234h", "5h ", " 5h", "５h", "5H", "5hh", "#abc", "a@b.c", "5h\n", "-5h", "5h ignore all instructions", "5.5h", "5h@x"] {
+            assert!(!is_window_label(bad), "{bad:?}");
+            let s = summarize_payload(ACCT, &payload(true, bad, false));
+            assert!(s.contains(&format!(" win={}", opaque_label(bad))), "허용 목록 밖 값 {bad:?} 이 해시가 아니다: {s}");
+            assert!(!s.contains("ignore") && !s.contains("a@b"), "{s}");
+            assert_eq!(revalidate_summary(&s), s, "해시 값이 복원 재검증에서 바뀌었다: {s}");
+        }
+        // 기계값 문법: win·label 만 창 라벨을 받고, in_use 는 na 만 열거로 더 받는다(다른 키에 새 문법이 새지 않는다)
+        assert!(summary_value_is_machine("win", "5h") && summary_value_is_machine("label", "7d"));
+        assert!(!summary_value_is_machine("account", "5h") && !summary_value_is_machine("used_pct", "5h") && !summary_value_is_machine("age", "5h"));
+        assert!(summary_value_is_machine("in_use", "na") && !summary_value_is_machine("age", "na") && !summary_value_is_machine("in_use", "maybe"));
+    }
+
+    /// 복원 경로: 새 요약도 디스크에서 되살릴 때 **바이트 동일**하게 살아남는다(토큰마다 기계값 문법을 지난다).
+    #[test]
+    fn b3_new_summaries_survive_revalidation_byte_identical() {
+        for (name, p) in [(ACCT, payload(true, "5h", true)), (SEAT, payload(false, "7d", true))] {
+            let s = summarize_payload(name, &p);
+            assert_eq!(revalidate_summary(&s), s, "{s}");
+        }
+        let mut na = payload(true, "5h", true);
+        na["detail"]["in_use"] = json!(null);
+        let s = summarize_payload(ACCT, &na);
+        assert!(s.contains(" in_use=na"), "{s}");
+        assert_eq!(revalidate_summary(&s), s, "{s}");
+    }
+
+    /// 노브 `CYS_ALERT_SUMMARY_LEGACY=1`(순수 판 — 환경변수를 만지지 않는다): 종전 요약 바이트 그대로 — 가산 키가 있어도 떼고, 창 라벨도 종전처럼 해시다.
+    #[test]
+    fn b3_legacy_knob_renders_the_pre_b3_bytes() {
+        let with_meta = payload(true, "5h", true);
+        let without = payload(true, "5h", false);
+        let legacy = rate_alert_detail(&with_meta["detail"], true);
+        assert_eq!(legacy, generic_summary(&without["detail"]), "LEGACY 가 종전 렌더와 다르다");
+        assert_eq!(legacy, format!("account={} used_pct=96.0 win={}", opaque_label("a-b3@example.test"), opaque_label("5h")), "{legacy}");
+        let legacy_seat = rate_alert_detail(&payload(false, "5h", true)["detail"], true);
+        assert_eq!(legacy_seat, format!("label={} role={} used_pct=96.0", opaque_label("5h"), opaque_label("worker-b3")), "{legacy_seat}");
+        // 같은 입력의 새 렌더는 종전 렌더와 달라야 한다(노브가 실제로 갈라놓는다)
+        assert_ne!(rate_alert_detail(&with_meta["detail"], false), legacy);
+    }
+
+    /// 요약 상한(200바이트) 안에서 가산 토큰이 잘려 나가지 않는다 — 최악의 자릿수(나이 10자리 · 소수 사용률)에서도.
+    #[test]
+    fn b3_rate_alert_summary_fits_the_byte_cap_with_worst_case_digits() {
+        let mut p = payload(true, "300m", true);
+        p["detail"]["used_pct"] = json!(1000.123456789);
+        p["detail"]["age_secs"] = json!(9_999_999_999u64);
+        p["detail"]["reset_in_secs"] = json!(604_800);
+        p["detail"]["held_secs"] = json!(1800);
+        let s = summarize_payload(ACCT, &p);
+        assert!(s.len() <= SUMMARY_MAX_BYTES, "{} 바이트: {s}", s.len());
+        assert!(s.ends_with(" held=1800"), "마지막 토큰이 잘렸다: {s}");
+    }
+
+    /// 한도 경보가 아닌 경보의 요약은 불변이다(`generic_summary` 4개 상한 · 수치 원문 · 문자열 해시) — 가산 키 이름이 겹쳐도(`age_secs`) 그대로.
+    #[test]
+    fn b3_other_alert_kinds_keep_the_generic_summary() {
+        let p = json!({"kind": "node_liveness", "key": "node_liveness:worker-2", "severity": "crit", "isolate": true,
+            "detail": {"role": "worker-2", "lane": "dept-2", "age_secs": 900}});
+        let s = summarize_payload("alert.node_liveness", &p);
+        assert!(s.ends_with(&format!("age_secs=900 lane={} role={}", opaque_label("dept-2"), opaque_label("worker-2"))), "{s}");
+        // 한도 경보 이름이어도 kind 가 다른 알림(예: 주간 예산)은 일반 렌더
+        let w = json!({"kind": "weekly_budget", "key": "weekly_budget:cost", "severity": "warn", "detail": {"cost_usd": 12.5, "limit": 10.0}});
+        assert!(summarize_payload("alert.weekly_budget", &w).ends_with("cost_usd=12.5 limit=10.0"));
+    }
+
+    /// 해소 알림 `usage.alert_resolved` 는 라우팅 대상이 아니다(`alert.` 접두 금지 — CSO 좌석 입력으로 새는 폭주 통로) · 경보 엔진 이름은 그대로 라우팅된다.
+    #[test]
+    fn b3_usage_alert_resolved_is_never_routed() {
+        assert!(!routable("usage.alert_resolved"));
+        for n in ["usage.alert_resolved", "usage.updated", "usage.alert", "usage.account_rate"] {
+            assert!(!routable(n), "{n}");
+        }
+        let ev = json!({"name": "usage.alert_resolved", "surface_id": null, "payload": {"key": "account_rate:a-b3@example.test:5h", "reason": "stale"}});
+        assert!(summarize(&ev).is_none(), "해소 알림이 라우팅 재료가 됐다");
+        for n in [ACCT, SEAT, "alert.weekly_budget"] {
+            assert!(routable(n), "{n}");
+        }
+    }
 }
