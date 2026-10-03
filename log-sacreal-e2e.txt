@@ -1,0 +1,12 @@
+2026-10-03T21:19:18.704Z [INFO] === sacreal-e2e start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-03T21:19:18.796Z [INFO] --- step prepare (minutes left 33.8, language mode FullLanguage) ---
+2026-10-03T21:19:24.482Z [INFO] --- step install-0.14.37 (minutes left 33.7, language mode FullLanguage) ---
+2026-10-03T21:20:23.277Z [INFO] --- step A (minutes left 32.7, language mode FullLanguage) ---
+2026-10-03T21:20:25.319Z [INFO] A: before-node step (language mode FullLanguage)
+2026-10-03T21:20:30.490Z [INFO] checkpoint pre-sac: rc=0 publish-results: 20 files to upload, 0 skipped, out=C:\a\_temp\diag-out
+publish-results: ok -> refs/heads/diag-results/37154484788-1-sacreal-e2e-pre-sac-windows-11-arm (commit 47ce1f30dc43d01e7bae2252716a4269ddce5b31), 20 files + manifest
+2026-10-03T21:23:02.211Z [INFO] --- step A-verdict (minutes left 30.1, language mode FullLanguage) ---
+2026-10-03T21:23:02.274Z [ERROR] STEP FAILED [step A-verdict]: System.ArgumentException: Argument types do not match At C:\a\cys-terminal\cys-terminal\diag\sacreal-e2e.ps1:697 char:29
++             foreach ($sr in @($ob['screenshots'])) {
++                             ~~~~~~~~~~~~~~~~~~~~~
+2026-10-03T21:23:02.294Z [INFO] --- step checkpoint-after-A (minutes left 30.1, language mode FullLanguage) ---

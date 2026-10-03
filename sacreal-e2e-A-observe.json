@@ -1,0 +1,89 @@
+{
+    "started":  "2026-10-03T21:21:19.423Z",
+    "ended":  "2026-10-03T21:23:00.782Z",
+    "end_reason":  "observation window after CDP end elapsed (90s)",
+    "ticks":  49,
+    "node_exited_at":  "2026-10-03T21:21:30.233Z",
+    "node_exit_code":  0,
+    "app_alive_first_at":  "2026-10-03T21:21:19.573Z",
+    "app_gone_at":  "2026-10-03T21:21:30.311Z",
+    "app_relaunched":  false,
+    "installer_seen":  false,
+    "installer_first_seen_at":  null,
+    "installer_first_seen":  null,
+    "marker_first":  "0.14.37",
+    "marker_last":  "0.14.37",
+    "marker_reached_target_at":  null,
+    "file_version_last":  "0.14.37 / product 0.14.37",
+    "updater_dir_max_bytes":  143202847,
+    "updater_dirs_seen":  [
+                              "cys-0.14.42-updater-2egYeJ"
+                          ],
+    "failure_file":  null,
+    "screenshots":  [
+                        {
+                            "name":  "sacreal-e2e-A-screen-exit.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "hosted-compute-agent#6724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#4348:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "sacreal-e2e-A-screen-t0021s.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "hosted-compute-agent#6724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#4348:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "sacreal-e2e-A-screen-20s.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "hosted-compute-agent#6724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent"
+                        },
+                        {
+                            "name":  "sacreal-e2e-A-screen-t0043s.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "hosted-compute-agent#6724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent"
+                        },
+                        {
+                            "name":  "sacreal-e2e-A-screen-t0063s.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "hosted-compute-agent#6724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#6264:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "sacreal-e2e-A-screen-60s.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "hosted-compute-agent#6724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#6264:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "sacreal-e2e-A-screen-t0085s.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "hosted-compute-agent#6724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#6264:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "sacreal-e2e-A-screen-end.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "hosted-compute-agent#6724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#6264:C:\\Windows\\system32\\wsl.exe"
+                        }
+                    ]
+}

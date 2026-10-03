@@ -1,0 +1,23 @@
+{
+    "installed 0.14.37 cys-app.exe":  {
+                                          "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe",
+                                          "size":  15798272,
+                                          "sha256":  "78e06dd599a054939ddf6d64d467eeeefd787be1a01a027cc92a14a160b5407e",
+                                          "signature":  "NotSigned",
+                                          "ea":  "rc=0 startError=\r\n\r\nThe file C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe does not have extended attributes (EA).\r\n"
+                                      },
+    "installed 0.14.37 cysd.exe":  {
+                                       "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                       "size":  42604032,
+                                       "sha256":  "16c0c6432975496f732eb8ed70d57748194d16431984d895062aa0fa4685d31b",
+                                       "signature":  "NotSigned",
+                                       "ea":  "rc=0 startError=\r\n\r\nThe file C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe does not have extended attributes (EA).\r\n"
+                                   },
+    "installed 0.14.37 cys.exe":  {
+                                      "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                                      "size":  29387776,
+                                      "sha256":  "98afc2e2a8a1fa174dc9fbbb93178b92dc1aae8f0c6a11db6127b820a0b7babf",
+                                      "signature":  "NotSigned",
+                                      "ea":  "rc=0 startError=\r\n\r\nThe file C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe does not have extended attributes (EA).\r\n"
+                                  }
+}
