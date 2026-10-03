@@ -9513,6 +9513,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                "protocol_version": cys::pack::PHOENIX_PROTOCOL_VERSION,
                                // (W4) 데몬 전체 파서 패닉 격리 누적 — health 신호.
                                "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed),
+                               // ★(0.14.43 · K1) ABI producer 자기검증 계측(이 프로세스의 누적) — 폴백한 프레임 수.
+                               //   `abi_float_inexact_total` = 부동소수 표기 정밀도 차만으로 폴백(로그 없음 · 부동소수가 실리는 한 평시에도 늘어난다) ·
+                               //   `abi_drift_total` = **진짜** 불일치(구조·키·문자열·정수·비객체)로 폴백 — 0 이 아니면 와이어 결함(로그는 60초 1줄).
+                               "abi_float_inexact_total": crate::abi_float_inexact_total(),
+                               "abi_drift_total": crate::abi_drift_total(),
                                // ★(0.14.43 · C5) 입력줄 계수 모델("v2"|"v3") — 이 프로세스가 쓰는 값(env `CYS_PENDING_INPUT_MODEL` · 기동 1회 판독).
                                //   ★(RQFIX B-1) 전역 노브 값 그대로다 — 좌석별 **적용** 모델은 좌석 진단의 `input_model`(좌석 표식 `lone_key_exempt` 기준)을 본다.
                                "pending_input_model": crate::governance::PendingInputModel::current().as_str(),
@@ -17776,6 +17781,48 @@ mod tests {
             "org.status 가 실제 env 판정을 잃었다 — 필드가 상수로 굳으면 오염이 영영 안 보인다"
         );
     }
+
+    /// ★(0.14.43 · K1) `org.status.daemon` 가산 키 `abi_float_inexact_total`·`abi_drift_total`(둘 다 u64) — 기존 daemon 키는 불변.
+    /// 값은 살아 있는 전역 카운터를 그대로 싣는다: 하드코딩 0 이 통과하지 못하게 먼저 부동소수 정밀도 차 프레임 하나를 실제
+    /// `frame_line` 에 통과시켜 카운터를 올리고, 응답 값이 호출 전후 표본 사이에 끼는지 본다(단조 — 병렬 검체가 올려도 성립).
+    /// 소스 핀: 두 키가 상수가 아니라 접근자(`crate::abi_*_total()`)에서 온다.
+    #[test]
+    fn k1_org_status_daemon_carries_abi_counters() {
+        let _ = crate::frame_line(&crate::abi_frame_tests::inexact_frame());
+        let daemon = isolated_daemon();
+        let (lo_f, lo_d) = (crate::abi_float_inexact_total(), crate::abi_drift_total());
+        let req = Request { id: json!(1), method: "org.status".into(), params: json!({}) };
+        let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+            panic!("expected single reply");
+        };
+        let (hi_f, hi_d) = (crate::abi_float_inexact_total(), crate::abi_drift_total());
+        assert_eq!(resp["ok"], json!(true), "{resp}");
+        let d = &resp["result"]["daemon"];
+        let f = d["abi_float_inexact_total"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("daemon.abi_float_inexact_total(u64) 없음: {d}"));
+        let dr = d["abi_drift_total"].as_u64().unwrap_or_else(|| panic!("daemon.abi_drift_total(u64) 없음: {d}"));
+        assert!(f >= 1 && lo_f <= f && f <= hi_f, "float 카운터 {f} ∉ [{lo_f}, {hi_f}] — 상수이거나 다른 값을 싣고 있다");
+        assert!(lo_d <= dr && dr <= hi_d, "drift 카운터 {dr} ∉ [{lo_d}, {hi_d}]");
+        // 가산: 기존 daemon 키는 그대로.
+        for k in [
+            "version", "started_at", "paused", "latest_seq", "build_id", "embedded_pack_hash", "protocol_version",
+            "parser_panics", "pending_input_model", "npm_prefix_polluted",
+        ] {
+            assert!(d.get(k).is_some(), "기존 daemon 키 {k} 소실: {d}");
+        }
+        // 소스 핀 — org.status 아크 안에서 두 키가 접근자에 물려 있다(상수로 굳으면 와이어 결함이 영영 안 보인다).
+        let src = include_str!("handlers.rs");
+        let start = src.find("\n        \"org.status\" => {").expect("org.status 아크 소실");
+        let end = start + src[start..].find("\n        \"control.dashboard\" => {").expect("다음 아크 소실");
+        let arm = &src[start..end];
+        assert!(
+            arm.contains("\"abi_float_inexact_total\": crate::abi_float_inexact_total()")
+                && arm.contains("\"abi_drift_total\": crate::abi_drift_total()"),
+            "org.status 가 ABI 카운터 접근자를 잃었다"
+        );
+    }
+
     /// ★H-NPM-6(codex R1 #2 · 배선 소실 방지 소스 핀): `surface.create` 가 고지 호출을 잃으면
     /// 위 두 검체는 여전히 초록인데 **실사용에서는 아무 pane 도 경고를 못 받는다**.
     /// (state.rs `pane_children_inherit_no_bytecode_env` · boot_supervisor 순서 핀과 같은 관례.)

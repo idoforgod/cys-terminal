@@ -3307,17 +3307,140 @@ async fn handle_connection_capped(
 /// 통과시켜 round-trip 동일성(선언==실제 직렬화)을 검증하고 `_flen`/`_pv`를 additive하게
 /// 부착한다(top-level `ok`/`result`는 보존 → 구 디코더 호환). 위반은 T1-3 `Severity`로
 /// 사상해 fail-loud 기록한다(Drift/LenMismatch=Critical 격리, VersionSkew=Recoverable).
+/// ★(0.14.43 · K1) 부동소수 표기 정밀도 차(`FloatInexact`)만이면 Recoverable 이고 **로그 없이** 카운터만 올린다
+/// (진짜 `Drift` 는 카운터 + 프로세스 전역 60초 1줄 — [`abi_note`]).
 /// 검증 실패가 응답 자체를 삼켜 클라이언트를 무기한 대기시키지 않도록, 기록 후 legacy 직렬화로
 /// 폴백해 한 줄은 항상 내보낸다(가용성 보존 — 격리 판정은 Severity 로그가 담당).
 fn abi_severity(e: &cys::wire::AbiError) -> severity::Severity {
     match e {
         cys::wire::AbiError::Drift | cys::wire::AbiError::LenMismatch => severity::Severity::Critical,
-        cys::wire::AbiError::VersionSkew { .. } => severity::Severity::Recoverable,
+        // ★(0.14.43 · K1) 부동소수 표기 정밀도 차는 무결성 위반이 아니다(구조·키·문자열·정수는 동일) → Recoverable.
+        cys::wire::AbiError::FloatInexact | cys::wire::AbiError::VersionSkew { .. } => severity::Severity::Recoverable,
     }
 }
 
+/// ★(0.14.43 · K1) ABI 자기검증이 **부동소수 표기 정밀도 차만으로** 걸러 legacy 직렬화로 폴백한 프레임 누적(프로세스 전역).
+/// 로그는 없다 — `org.status.daemon.abi_float_inexact_total` 로만 보인다(부동소수가 실리는 한 평시에도 값에 따라 늘어나는 정상 신호).
+static ABI_FLOAT_INEXACT_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// ★(0.14.43 · K1) **진짜** ABI 불일치(구조·키·문자열·정수·비객체 …)로 폴백한 프레임 누적(프로세스 전역) —
+/// `org.status.daemon.abi_drift_total`. 0 이 아니면 와이어 결함이다(로그는 [`ABI_DRIFT_LOG_MIN_GAP`] 에 1줄).
+static ABI_DRIFT_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 진짜 Drift 로그의 프로세스 전역 최소 간격 — 폭주 차단(종전: 폴백마다 1줄 → 라이브 데몬 로그의 약 98%).
+const ABI_DRIFT_LOG_MIN_GAP: std::time::Duration = std::time::Duration::from_secs(60);
+/// 진짜 Drift 로그 게이트(프로세스 전역 1개).
+static ABI_DRIFT_LOG: AbiDriftLog = AbiDriftLog::new();
+
+/// `org.status.daemon.abi_float_inexact_total` — 부동소수 표기 정밀도 차로만 폴백한 프레임 누적(이 프로세스).
+fn abi_float_inexact_total() -> u64 {
+    ABI_FLOAT_INEXACT_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `org.status.daemon.abi_drift_total` — 진짜 ABI 불일치로 폴백한 프레임 누적(이 프로세스).
+fn abi_drift_total() -> u64 {
+    ABI_DRIFT_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 순수: 지금 진짜 Drift 로그를 한 줄 낼 차례인가 — 한 번도 안 냈거나(`last == None`) 마지막 로그 뒤
+/// [`ABI_DRIFT_LOG_MIN_GAP`] 이상 지났을 때. `now < last`(시계 역행)는 아직 아님(`saturating` — 패닉 없음).
+fn drift_log_due(now: std::time::Instant, last: Option<std::time::Instant>) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= ABI_DRIFT_LOG_MIN_GAP,
+    }
+}
+
+/// 진짜 Drift 로그 게이트 — 마지막으로 찍은 시각과 그 뒤 억제한 건수.
+struct AbiDriftLog {
+    last: std::sync::Mutex<Option<std::time::Instant>>,
+    suppressed: std::sync::atomic::AtomicU64,
+}
+
+impl AbiDriftLog {
+    const fn new() -> Self {
+        Self {
+            last: std::sync::Mutex::new(None),
+            suppressed: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Drift 한 건을 센다: 지금 찍을 차례면 `Some(그 사이 억제한 건수)`(억제 건수는 0 으로 되돌린다), 아니면 `None`(억제 +1).
+    /// 락은 시각 판정·갱신에만 짧게 잡는다(I/O·await 없음 · 중독돼도 그대로 쓴다 — 패닉 없음). 동시 호출에서도 승자는 하나다.
+    fn take_due(&self, now: impl FnOnce() -> std::time::Instant) -> Option<u64> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let due = {
+            let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
+            let now = now();
+            let due = drift_log_due(now, *last);
+            if due {
+                *last = Some(now);
+            }
+            due
+        };
+        if due {
+            Some(self.suppressed.swap(0, Relaxed))
+        } else {
+            self.suppressed.fetch_add(1, Relaxed);
+            None
+        }
+    }
+}
+
+/// 진짜 Drift 로그 한 줄 — 종전 문구 앞부분(`[cysd] ABI producer self-verify critical (Drift) — falling back to legacy serialization`)은
+/// 그대로(운영자 grep 호환)이고 뒤에 억제 건수만 붙인다.
+fn abi_drift_log_line(e: &cys::wire::AbiError, suppressed: u64) -> String {
+    format!(
+        "[cysd] ABI producer self-verify {} ({:?}) — falling back to legacy serialization (suppressed {suppressed} since last)",
+        abi_severity(e).as_str(),
+        e
+    )
+}
+
+/// ABI 자기검증 실패 한 건의 기록 — 계수하고, **지금 찍어야 할 로그 한 줄**이 있으면 돌려준다(출력은 호출자 몫 — 테스트가 줄 수를 센다).
+/// `FloatInexact` 는 카운터만 올리고 로그는 **없다**. 그 밖(`Drift` …)은 `drift` 카운터를 올리고 `gate` 가 허락할 때만 한 줄.
+/// 시각(`now`)은 로그 판정이 필요한 Drift 갈래에서만 잰다(정상 프레임·부동소수 갈래는 시계를 읽지 않는다).
+fn abi_note(
+    e: &cys::wire::AbiError,
+    now: impl FnOnce() -> std::time::Instant,
+    float_inexact: &std::sync::atomic::AtomicU64,
+    drift: &std::sync::atomic::AtomicU64,
+    gate: &AbiDriftLog,
+) -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if matches!(e, cys::wire::AbiError::FloatInexact) {
+        float_inexact.fetch_add(1, Relaxed);
+        return None;
+    }
+    drift.fetch_add(1, Relaxed);
+    gate.take_due(now).map(|suppressed| abi_drift_log_line(e, suppressed))
+}
+
 /// 응답 `Value` → 전송 프레임(개행 포함) — 응답 상한·ABI 자기검증을 거친다(종전 `write_line` 앞부분 그대로).
+/// ★(0.14.43 · K1) 계수·로그는 `abi_note` 한 곳에서 결정한다(전역 카운터·60초 1줄 게이트·stderr 출력). 로그 쓰기 실패
+/// (EPIPE·ENOSPC)는 무시한다 — `eprintln!` 은 그때 패닉하는데 모든 응답이 이 함수를 지나므로 로그 때문에 연결이 죽으면
+/// 안 된다(`note_write_stall` 과 같은 관례).
 fn frame_line(value: &serde_json::Value) -> String {
+    frame_line_with(
+        value,
+        std::time::Instant::now,
+        &ABI_FLOAT_INEXACT_TOTAL,
+        &ABI_DRIFT_TOTAL,
+        &ABI_DRIFT_LOG,
+        &mut |line| {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{line}");
+        },
+    )
+}
+
+/// [`frame_line`] 의 본체 — 시계·카운터·게이트·로그 출력구를 주입받는다(테스트가 격리 상태로 바이트·카운터·줄 수를 잰다).
+fn frame_line_with(
+    value: &serde_json::Value,
+    now: impl FnOnce() -> std::time::Instant,
+    float_inexact: &std::sync::atomic::AtomicU64,
+    drift: &std::sync::atomic::AtomicU64,
+    gate: &AbiDriftLog,
+    emit: &mut dyn FnMut(&str),
+) -> String {
     // T4-5A(==T5-6 strand-3, ONE guard): 단일 RPC 응답 바이트 상한. cap 초과 시 fail-loud
     // 트렁케이트 sentinel로 치환(컨텍스트/메모리 폭주 차단). 직교 가드 — watchdog와 별개 책임.
     let capped = cys::wire::cap_response(value);
@@ -3325,12 +3448,11 @@ fn frame_line(value: &serde_json::Value) -> String {
     match cys::wire::frame_response(value) {
         Ok(framed) => framed,
         Err(e) => {
-            let sev = abi_severity(&e);
-            eprintln!(
-                "[cysd] ABI producer self-verify {} ({:?}) — falling back to legacy serialization",
-                sev.as_str(),
-                e
-            );
+            if let Some(line) = abi_note(&e, now, float_inexact, drift, gate) {
+                emit(&line);
+            }
+            // legacy 직렬화 폴백 — `Drift`·`FloatInexact` 모두 종전 Drift 폴백과 바이트 동일(메타 `_flen`/`_pv` 없음 →
+            // 구 클라이언트도 무검증 수용).
             let mut body = serde_json::to_string(value).unwrap_or_default();
             body.push('\n');
             body
@@ -3690,6 +3812,223 @@ mod abi_severity_tests {
             local_pv: cys::wire::PROTO_PV
         })
         .is_critical());
+    }
+
+    /// ★(0.14.43 · K1) 부동소수 표기 정밀도 차(`FloatInexact`)는 무결성 위반이 아니다 → Recoverable(격리 안 함).
+    /// 진짜 불일치(`Drift`·`LenMismatch`)는 Critical 그대로. 적색(돌연변이 M5 = FloatInexact → Critical): 첫 단언이 깨진다.
+    #[test]
+    fn k1_float_inexact_is_not_critical_while_drift_still_is() {
+        let fi = super::abi_severity(&cys::wire::AbiError::FloatInexact);
+        assert_eq!(fi, Severity::Recoverable);
+        assert!(!fi.is_critical(), "FloatInexact 는 critical 이 아니다");
+        assert!(super::abi_severity(&cys::wire::AbiError::Drift).is_critical(), "Drift 는 critical");
+        assert!(super::abi_severity(&cys::wire::AbiError::LenMismatch).is_critical(), "LenMismatch 는 critical");
+    }
+}
+
+/// ★(0.14.43 · K1) ABI producer 자기검증의 부동소수 거짓 양성 — `frame_line` 의 판정·계수·로그·와이어 바이트 핀.
+///
+/// 증상(라이브 0.14.42): 데몬 로그의 약 98% 가 `ABI producer self-verify critical (Drift) — falling back to legacy serialization`
+/// 한 줄이었다. 원인: serde_json 기본 기능의 부동소수 재파싱이 best-effort 라 17자리 f64 가 1ulp 어긋나 `Drift` 로 잡힌다.
+/// 수리: 판정만 가른다(`FloatInexact` = 로그 없이 카운터만 · 진짜 `Drift` = 카운터 + 프로세스 전역 60초 1줄). **와이어 바이트는
+/// 종전과 같다**(`float_roundtrip` 을 켜지 않는다 — 켜면 구 클라이언트가 부동소수 프레임에서 `LenMismatch` 로 값에 따라 간헐 실패한다).
+/// 적색(수정 전 = 어긋나면 로그 한 줄·카운터 없음): `k1_frame_line_float_inexact_*`. 돌연변이: M4(FloatInexact 도 로그) ·
+/// M6(로그 게이트 항상 허용) · M7(폴백 바이트 변경) · M11(억제 건수 미초기화) · M12(float 카운터 미증가) · M14(전역 배선 뒤바뀜).
+#[cfg(test)]
+mod abi_frame_tests {
+    use super::{
+        abi_drift_log_line, abi_drift_total, abi_float_inexact_total, drift_log_due, frame_line, frame_line_with,
+        AbiDriftLog, ABI_DRIFT_LOG_MIN_GAP,
+    };
+    use cys::wire::AbiError;
+    use serde_json::{json, Value};
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+
+    /// 종전 로그 문구의 앞부분 — 운영자 grep 호환(바꾸지 않는다).
+    const LEGACY_PREFIX: &str =
+        "[cysd] ABI producer self-verify critical (Drift) — falling back to legacy serialization";
+
+    /// 이 빌드에서 round-trip 이 어긋나는 f64 하나 — 결정론 벡터 `92.2547419781119086`(최단 표기 `92.25474197811191` 이 1ulp 어긋남)를
+    /// 먼저 쓰고, 어긋나지 않으면 `1.0 + k*EPSILON`(k < 2000) 후보에서 첫 값을 쓴다. 둘 다 없으면 계측 무효(패닉).
+    pub(crate) fn inexact_frame() -> Value {
+        fn frame(x: f64) -> Value {
+            json!({"id": 1, "ok": true, "result": {"used_pct": x}})
+        }
+        fn reparse_differs(v: &Value) -> bool {
+            let back: Value = serde_json::from_str(&serde_json::to_string(v).unwrap()).unwrap();
+            back != *v
+        }
+        let brief = frame(92.2547419781119086_f64);
+        if reparse_differs(&brief) {
+            return brief;
+        }
+        (0..2000u32)
+            .map(|k| frame(1.0 + f64::from(k) * f64::EPSILON))
+            .find(reparse_differs)
+            .expect("계측 무효 — 이 빌드의 serde_json 은 재파싱이 어긋나는 f64 를 만들지 못한다(float_roundtrip 이 켜졌나?)")
+    }
+
+    /// `frame_line_with` 를 격리 상태(로컬 카운터·게이트·시계)로 돌려 (프레임, 찍힌 로그 줄들) 을 얻는다.
+    fn run(value: &Value, now: Instant, f: &AtomicU64, d: &AtomicU64, gate: &AbiDriftLog) -> (String, Vec<String>) {
+        let mut lines: Vec<String> = Vec::new();
+        let out = frame_line_with(value, move || now, f, d, gate, &mut |l| lines.push(l.to_string()));
+        (out, lines)
+    }
+
+    /// ★와이어 바이트 동일 핀 — 부동소수 정밀도 차(`FloatInexact`)로 폴백한 프레임은 종전 `Drift` 폴백이 내보내던 바이트
+    /// (`serde_json::to_string(value) + "\n"`)와 **한 바이트도 다르지 않다**(`_flen`·`_pv` 없음 → 구 클라이언트는 무검증 수용).
+    /// 그리고: float 카운터 +1 · drift 카운터 0 · 로그 0줄(몇 번을 반복해도) · 로그 게이트 무접촉.
+    #[test]
+    fn k1_frame_line_float_inexact_fallback_is_byte_identical_counts_and_never_logs() {
+        let v = inexact_frame();
+        let (f, d, gate) = (AtomicU64::new(0), AtomicU64::new(0), AbiDriftLog::new());
+        let t0 = Instant::now();
+        let legacy = format!("{}\n", serde_json::to_string(&v).unwrap());
+
+        let (out, lines) = run(&v, t0, &f, &d, &gate);
+        assert_eq!(out, legacy, "폴백 바이트가 종전 Drift 폴백과 다르다");
+        assert!(!out.contains("_flen") && !out.contains("_pv"), "폴백 프레임에 메타가 붙었다: {out}");
+        assert_eq!((f.load(Relaxed), d.load(Relaxed)), (1, 0), "FloatInexact 는 float 카운터만 +1");
+        assert!(lines.is_empty(), "FloatInexact 는 로그 0줄: {lines:?}");
+
+        for i in 1..1000u64 {
+            let (out, lines) = run(&v, t0 + Duration::from_secs(i), &f, &d, &gate);
+            assert_eq!(out, legacy);
+            assert!(lines.is_empty(), "반복 {i}회째 로그가 나왔다: {lines:?}");
+        }
+        assert_eq!((f.load(Relaxed), d.load(Relaxed)), (1000, 0));
+        assert_eq!(gate.suppressed.load(Relaxed), 0, "로그 게이트는 FloatInexact 에 무접촉");
+        assert!(gate.last.lock().unwrap().is_none(), "로그 게이트가 시각을 기록했다");
+    }
+
+    /// ★와이어 바이트 동일 핀(Ok 경로) — 검증을 통과한 프레임은 종전과 한 바이트도 다르지 않다(메타 `_flen`·`_pv` 부착) ·
+    /// 카운터 0 · 로그 0줄. (리터럴은 wire.rs `k1_wire_bytes_ok_path_golden` 과 같다.)
+    #[test]
+    fn k1_frame_line_ok_path_bytes_unchanged_and_silent() {
+        let v = json!({"id": 1, "ok": true, "result": {"used_pct": 92.5, "rows": [1, 2, 3]}});
+        let (f, d, gate) = (AtomicU64::new(0), AtomicU64::new(0), AbiDriftLog::new());
+        let (out, lines) = run(&v, Instant::now(), &f, &d, &gate);
+        assert_eq!(
+            out,
+            "{\"_flen\":32,\"_pv\":1,\"id\":1,\"ok\":true,\"result\":{\"rows\":[1,2,3],\"used_pct\":92.5}}\n"
+        );
+        assert_eq!((f.load(Relaxed), d.load(Relaxed)), (0, 0));
+        assert!(lines.is_empty(), "정상 프레임에 로그가 나왔다: {lines:?}");
+    }
+
+    /// 진짜 Drift(비-객체 응답 = 와이어 계약 위반)는 여전히 Drift — 폴백 바이트는 종전과 같고, drift 카운터가 매번 오르며,
+    /// 로그는 **프로세스 전역 60초에 1줄**이고 억제한 건수를 함께 찍는다(`… (suppressed N since last)`).
+    /// 적색(돌연변이 M6 = 게이트 항상 허용): 2번째 호출에서 줄이 또 나와 깨진다.
+    #[test]
+    fn k1_frame_line_real_drift_counts_and_logs_once_per_minute_with_suppressed_count() {
+        let v = json!([1, 2, 3]);
+        let (f, d, gate) = (AtomicU64::new(0), AtomicU64::new(0), AbiDriftLog::new());
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+
+        let (out, lines) = run(&v, at(0), &f, &d, &gate);
+        assert_eq!(out, "[1,2,3]\n", "Drift 폴백 바이트 불변(메타 없음)");
+        assert_eq!((f.load(Relaxed), d.load(Relaxed)), (0, 1));
+        assert_eq!(lines, vec![format!("{LEGACY_PREFIX} (suppressed 0 since last)")], "첫 Drift 는 바로 한 줄");
+
+        for s in [1, 2, 3, 4, 5, 59] {
+            let (out, lines) = run(&v, at(s), &f, &d, &gate);
+            assert_eq!(out, "[1,2,3]\n");
+            assert!(lines.is_empty(), "{s}초: 60초 안에는 찍지 않는다: {lines:?}");
+        }
+        assert_eq!(d.load(Relaxed), 7, "억제해도 센다");
+
+        let (_, lines) = run(&v, at(60), &f, &d, &gate);
+        assert_eq!(lines, vec![format!("{LEGACY_PREFIX} (suppressed 6 since last)")], "60초째: 한 줄 + 그 사이 억제 6건");
+        let (_, lines) = run(&v, at(61), &f, &d, &gate);
+        assert!(lines.is_empty());
+        let (_, lines) = run(&v, at(120), &f, &d, &gate);
+        assert_eq!(lines, vec![format!("{LEGACY_PREFIX} (suppressed 1 since last)")], "120초째: 직전 로그(60초) 뒤 억제는 61초의 1건");
+        assert_eq!((f.load(Relaxed), d.load(Relaxed)), (0, 10), "float 카운터는 Drift 에 무접촉");
+    }
+
+    /// 로그 상한 판정(순수) 진리표 — 한 번도 안 냈으면 항상 낼 차례 · 직전 로그 뒤 정확히 60초부터 · 시계 역행은 아직 아님.
+    #[test]
+    fn k1_drift_log_due_truth_table() {
+        let t = Instant::now();
+        assert!(drift_log_due(t, None), "한 번도 안 냈으면 낼 차례");
+        assert!(!drift_log_due(t, Some(t)), "같은 순간은 아직");
+        assert!(!drift_log_due(t + Duration::from_secs(1), Some(t)));
+        assert!(!drift_log_due(t + ABI_DRIFT_LOG_MIN_GAP - Duration::from_millis(1), Some(t)), "59.999초는 아직");
+        assert!(drift_log_due(t + ABI_DRIFT_LOG_MIN_GAP, Some(t)), "정확히 60초부터");
+        assert!(drift_log_due(t + ABI_DRIFT_LOG_MIN_GAP + Duration::from_secs(1), Some(t)));
+        assert!(!drift_log_due(t, Some(t + Duration::from_secs(5))), "시계 역행(now < last)은 아직 — 패닉 없음");
+        assert_eq!(ABI_DRIFT_LOG_MIN_GAP, Duration::from_secs(60), "상한은 60초 1줄");
+    }
+
+    /// 동시 호출에서도 한 창에 승자는 하나이고, 승자가 보고한 억제 건수 + 남은 억제 건수 = 승자를 뺀 전 호출 — 하나도 잃지 않는다.
+    #[test]
+    fn k1_drift_log_gate_admits_exactly_one_per_window_under_contention() {
+        const THREADS: u64 = 8;
+        const CALLS: u64 = 500;
+        let gate = AbiDriftLog::new();
+        let t0 = Instant::now();
+        let (winners, reported) = (AtomicU64::new(0), AtomicU64::new(0));
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    for _ in 0..CALLS {
+                        if let Some(n) = gate.take_due(move || t0) {
+                            winners.fetch_add(1, Relaxed);
+                            reported.fetch_add(n, Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(winners.load(Relaxed), 1, "한 창에 로그 승자는 정확히 하나");
+        assert_eq!(
+            reported.load(Relaxed) + gate.suppressed.load(Relaxed),
+            THREADS * CALLS - 1,
+            "억제 건수를 잃었다"
+        );
+    }
+
+    /// 로그 문구 핀 — 종전 문구의 앞부분은 한 글자도 바뀌지 않는다(운영자 grep 호환) · 뒤에 억제 건수만 붙는다.
+    #[test]
+    fn k1_drift_log_line_keeps_legacy_prefix_and_appends_suppressed_count() {
+        assert_eq!(abi_drift_log_line(&AbiError::Drift, 0), format!("{LEGACY_PREFIX} (suppressed 0 since last)"));
+        assert_eq!(abi_drift_log_line(&AbiError::Drift, 41), format!("{LEGACY_PREFIX} (suppressed 41 since last)"));
+        assert!(abi_drift_log_line(&AbiError::Drift, 7).starts_with(LEGACY_PREFIX));
+    }
+
+    /// 실제 전역 카운터 경로 — `frame_line`(운영 진입점)이 부동소수 정밀도 차 프레임을 종전 Drift 폴백과 같은 바이트로 내보내고
+    /// 전역 `ABI_FLOAT_INEXACT_TOTAL` 을 올린다(로그 출력은 FloatInexact 갈래에 없다). 병렬 검체도 올리므로 `>` 로 잰다(단조).
+    #[test]
+    fn k1_frame_line_real_globals_count_float_inexact_with_identical_bytes() {
+        let v = inexact_frame();
+        let before = abi_float_inexact_total();
+        let out = frame_line(&v);
+        assert_eq!(out, format!("{}\n", serde_json::to_string(&v).unwrap()));
+        assert!(abi_float_inexact_total() > before, "frame_line 이 전역 float 카운터를 올리지 않았다");
+        let _ = abi_drift_total(); // 접근자 실재(org.status 가 읽는다)
+    }
+
+    /// 배선 소스 핀 — `frame_line` 은 전역 카운터·게이트·시계를 `frame_line_with` 에 물리고, 어느 쪽 본문에도 `eprintln!`/`println!` 이
+    /// 없다(출력은 `emit` 한 곳 — 로그 쓰기 실패가 패닉이 되지 않게 `let _ = writeln!(stderr)`). 이 배선이 소실되면 위 격리 검체는
+    /// 초록인 채로 운영 진입점만 죽는다.
+    #[test]
+    fn k1_frame_line_wires_the_global_state_and_has_no_panicking_print() {
+        let src = include_str!("main.rs");
+        let start = src.find("\nfn frame_line(value: &serde_json::Value) -> String {").expect("frame_line 소실");
+        let mid = start + src[start..].find("\nfn frame_line_with(").expect("frame_line_with 소실");
+        let end = mid + src[mid..].find("\n}\n").expect("frame_line_with 끝");
+        let (wrapper, body) = (&src[start..mid], &src[mid..end]);
+        for must in ["&ABI_FLOAT_INEXACT_TOTAL", "&ABI_DRIFT_TOTAL", "&ABI_DRIFT_LOG", "std::time::Instant::now"] {
+            assert!(wrapper.contains(must), "frame_line 이 {must} 를 물리지 않는다");
+        }
+        assert!(wrapper.contains("let _ = writeln!(std::io::stderr()"), "로그 쓰기 실패를 무시하지 않는다");
+        for (name, text) in [("frame_line", wrapper), ("frame_line_with", body)] {
+            assert!(!text.contains("eprintln!") && !text.contains("println!"), "{name} 에 패닉 가능한 print 가 있다");
+        }
+        assert_eq!(body.matches("emit(").count(), 1, "로그 출력구는 한 곳");
+        assert_eq!(body.matches("abi_note(").count(), 1, "계수·로그 판정은 abi_note 한 곳");
     }
 }
 
