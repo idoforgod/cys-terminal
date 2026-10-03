@@ -933,6 +933,61 @@ seed_schedule(){
 # 부서 데몬은 첫 기동 시 pack install(수백 파일)로 listening까지 지연될 수 있어 폴링 간격을 둔다(최대 ~12s).
 ready(){ local s="$1" i; for i in $(seq 1 120); do CYS_SOCKET="$s" "$CYS" ping >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
 
+# ★0.14.43 GP — 「팀 직접 만들기」 단계 표지 · 스폰 뒤 소켓 대기 예산 노브(기본 무변경) · 실패 문구.
+#   배경(2026-09-30 이 맥 실측): GUI 의 팀 직접 만들기는 allocate/create 가 끝날 때까지 스피너만 돌았다 — 시작 → 소켓 청취까지 약 23초,
+#   그중 사전 검사 `ready`(이미 켜져 있나)가 새 이름에서는 늘 상한(약 12.8초)을 다 쓴다.
+#
+#   ① dept_stage — stderr 1줄 기계 판독 표지. 형식 `[cys-dept] @stage <키>` 고정(키 하나 · 공백·한글 없음 — GUI 가 키를 한글 문구로
+#      바꾼다 · **키 철자는 계약**이다). stdout 에는 절대 쓰지 않는다(stdout 마지막 비어 있지 않은 줄 = 부서 이름 계약 보호). 가산 전용 —
+#      기존 `[cys-dept] …` 줄의 문구·스트림·순서는 그대로다(Rust include_str! 핀·다른 검체가 문자열을 본다).
+#      키: reserve(이름·번호 등재 직후) · probe(사전 검사 `ready` 직전) · spawn(새 cysd 직전 · 재사용 분기엔 없음) ·
+#          wait(스폰 뒤 소켓 대기 직전 · 재사용 분기엔 없음) · up(소켓 응답 확인 직후 · 재사용이든 신규든) ·
+#          seat(부서장 자리 단계 직전 · 그 단계가 있는 경로만) · done(성공 종료 직전 = 이름을 stdout 에 내기 직전).
+#      넣은 동사: allocate·create 뿐(launch·rotate·down 등은 무변경). 순서: 신규 reserve→probe→spawn→wait→up→(seat)→done ·
+#      재사용 reserve→probe→up→(seat)→done · create 조기 반환(REUSE_UP·REUSE_BOOTING)은 reserve→done · 실패는 낸 데까지(done 없음).
+dept_stage(){ echo "[cys-dept] @stage $1" >&2; }
+
+#   ② 스폰 **뒤** 소켓 대기 예산 노브 `CYS_DEPT_READY_SECS`(정수 12~600 · 그 밖은 전부 12 = 종전). 스폰 뒤 대기 3곳(launch·allocate·create)
+#      만 `ready_wait` 로 읽는다. **사전 검사 3곳은 `ready` 그대로(12초 고정)** — 거기를 늘리면 새 팀마다 그만큼 더 기다린다.
+#      기본(미설정)에서 `ready_wait` 는 `ready` 와 같은 횟수(120)라 동작이 종전과 같다.
+#   ★왜 기본값을 올리지 않았나(유예와의 결합): create 의 예약 유예 `CYS_DEPT_RESERVE_GRACE`(기본 25초)는 "생성자가 부팅 중"으로 믿어 주는 창이다
+#      (REUSE_BOOTING). 유예가 지나고 소켓이 죽어 있으면 뒤따라온 호출이 REUSE_DEAD 로 **데몬을 다시 띄운다**. 25 는 사전 검사 12.8초 + 스폰 뒤
+#      대기 12.8초와 거의 같다 — 스폰 뒤 대기만 늘리면 유예 밖 구간이 생겨 **중복 기동 경합**이 열린다. 그래서 (a) 기본은 올리지 않았다(기본 상향은
+#      윈도우 실기 측정 뒤) (b) 노브를 12 보다 크게 올리면 아래 dept_reserve_grace 가 유예를 `노브 + 13`(13 = 사전 검사 상한)까지 따라 올린다 —
+#      노브가 12 이하(기본·무효 값 포함)면 유예는 종전 인라인 식 그대로다(명시한 낮은 값·비정수도 종전과 같다).
+#   ★한계: 유예는 **뒤따르는 호출**이 자기 프로세스의 env 로 계산한다. 뒤따르는 호출이 같은 `CYS_DEPT_READY_SECS`(와 같은 유예 설정)를 보지 못하면
+#      (첫 호출에만 환경변수를 준 경우) 결합은 성립하지 않는다 — 노브는 모든 호출이 같은 값을 보는 자리(로그인 환경 등)에 둔다.
+#
+# 순수 해석 함수(인자 없음 · 부작용 없음): stdout = 유효 초. 정수 12~600 만 유효 — 빈 값·문자·음수('-')·소수('.')·12 미만·600 초과는 전부 12.
+#   선행 0 은 10진으로 읽는다(`$(( ))` 에 날것으로 넣으면 08·09 가 8진 오류) — 선행 0 을 벗긴 뒤 3자리 이하만 비교에 넣는다(긴 숫자 넘침 방지).
+dept_ready_secs(){
+  local v="${CYS_DEPT_READY_SECS:-}"
+  case "$v" in ''|*[!0-9]*) echo 12; return 0 ;; esac
+  while [ "${#v}" -gt 1 ] && [ "${v#0}" != "$v" ]; do v="${v#0}"; done
+  if [ "${#v}" -le 3 ] && [ "$v" -ge 12 ] && [ "$v" -le 600 ]; then echo "$v"; else echo 12; fi
+}
+# `ready` 와 같은 모양(핑 + sleep 0.1)이되 반복 횟수 = dept_ready_secs × 10(기본 120 = `ready` 와 같다). 스폰 **뒤** 대기 전용.
+ready_wait(){ local s="$1" i n; n=$(( $(dept_ready_secs) * 10 )); for i in $(seq 1 "$n"); do CYS_SOCKET="$s" "$CYS" ping >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
+# create 의 예약 유예(초) — stdout = 파이썬 `CYS_GRACE` 로 넘길 값.
+#   노브(dept_ready_secs)가 12 이하(기본·무효 값 포함)면 종전 인라인 식 `${CYS_DEPT_RESERVE_GRACE:-25}` 를 **그대로** 낸다(같은 값 — 명시한 낮은 값·비정수도 종전과 같다).
+#   노브를 12 보다 크게 올렸을 때만 `max(설정값 또는 25, dept_ready_secs + 13)`(13 = 사전 검사 상한 ≈12.8초)을 낸다. 셸 정수 비교로 계산하고 파이썬 쪽 GRACE 판독부는 무변경이다.
+#   `CYS_DEPT_RESERVE_GRACE` 가 정수가 아니면(소수 등) 노브와 무관하게 종전처럼 그대로 넘긴다(파이썬이 판독 — 종전 동작 보존) — max 는 **정수일 때만** 취한다.
+#   ※ 노브를 올린 경우에만, 설정값이 정수이면서 `노브 + 13` 보다 작으면 그 아래로는 내려가지 못한다 — 유예 밖 구간을 만들지 않으려는 의도다(master 결정: 올림은 노브를 올렸을 때만).
+#   값은 `printf '%s\n'` 로 낸다(`echo` 는 `-n`·`-e` 같은 값을 옵션으로 삼킨다).
+dept_reserve_grace(){
+  local g="${CYS_DEPT_RESERVE_GRACE:-25}" secs d need
+  secs="$(dept_ready_secs)"
+  [ "$secs" -gt 12 ] || { printf '%s\n' "$g"; return 0; }
+  case "$g" in *[!0-9]*) printf '%s\n' "$g"; return 0 ;; esac
+  need=$(( secs + 13 ))
+  d="$g"; while [ "${#d}" -gt 1 ] && [ "${d#0}" != "$d" ]; do d="${d#0}"; done
+  if [ "${#d}" -le 9 ] && [ "$d" -lt "$need" ]; then printf '%s\n' "$need"; else printf '%s\n' "$g"; fi
+}
+#   ③ 스폰 뒤 대기 실패 문구의 꼬리(3곳 공통) — 기존 `[cys-dept] ERROR: <이름> 데몬 기동 실패` 를 접두로 **그대로** 두고 뒤에 붙인다(스트림·뒤따르는
+#      `sock_len_diag`·`reg_remove` 순서는 각 줄 종전 그대로). 로그 경로 = launch·allocate·create 의 cysd 스폰이 실제로 쓰는 리다이렉트 대상
+#      (`$(dept_logdir "$name")/cysd.log`)과 같다 — 세 곳 모두 그 표현이라 한 곳에서 만든다.
+ready_fail_note(){ printf ' (소켓 대기 %s초 · 로그: %s/cysd.log · 느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)' "$(dept_ready_secs)" "$(dept_logdir "$1")"; }
+
 # allocate 계정격리(Fix1'): 기본계정 base config dir 해석. 카탈로그 accounts 맵 우선(있으면), 없으면
 # ~/.cys/claude-<account> 규약 fallback. 항상 경로를 산출(빈 문자열이면 호출부가 fail-closed).
 resolve_default_base(){
@@ -1935,7 +1990,7 @@ launch_dept(){   # $1=name
       fi
       disown
       # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
-      ready "$sock" || { reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패"; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
+      ready_wait "$sock" || { reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")"; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만) · ★0.14.43 GP: 스폰 뒤 대기 예산 노브 + 실패 문구 꼬리
     fi
     seed_schedule "$pack"   # owner-progress-report 제거(부서는 최상위 보고 안 함) — 데몬 30초 핫리로드로 반영
     # ★G3: 시드 검증(+자기치유) — 데몬 env 전파에 의존하지 않는 belt(구 cysd·재기동 경로 대비).
@@ -2133,11 +2188,13 @@ PY
     case "$name" in
       "="*) name="${name#=}"; name="${name%$'\r'}"
             validate_dept_name "$name" "allocate"
+            dept_stage done   # ★0.14.43 GP: 성공 종료 직전 표지(이 갈래는 예약·스폰이 없어 done 만)
             echo "$name"   # stdout 마지막 줄 = 확정 이름(Tauri 파싱 계약) · 새 팀 0
             exit 0 ;;
     esac
     _dept_spawn_pid=""
     trap 'dept_creation_failed "$?" "$name" reserve' EXIT   # 예약 후 비정상종료=예약 회수(SIGKILL 제외)
+    dept_stage reserve   # ★0.14.43 GP: 단계 표지(stderr · 기계 판독) — 이름·번호 등재 직후
     # ★D3(i) 사후 assert: allocate name은 기계 생성(dept-N)이라 항상 정형이 정상 — 불변식 위반·
     #   slug 충돌(레거시 'DEPT-N' 등재 등)은 여기서 거부(exit 2·위 trap이 예약 회수). A2 공통 헬퍼.
     validate_dept_name "$name" "allocate"
@@ -2185,8 +2242,10 @@ PY
     fi
     seed_acl "$pack"
     _spawned=1   # ★⑦: 신규 스폰 여부(0=재사용) — 티켓 발급 로그 문면 구분용
+    dept_stage probe   # ★0.14.43 GP: 사전 검사(이미 켜진 데몬이 있나 · 12초 고정) 직전
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2; _spawned=0
     else
+      dept_stage spawn   # ★0.14.43 GP: 새 cysd 를 띄우기 직전(재사용 분기엔 없다)
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
       if _cys_detach_ok; then
         # ★fatal-fix X-R4-1: 대화 승인 토큰 경로 — 호출자(대표의 Bash 도구) 프로세스 그룹 밖 새 세션에서 띄운다(pid 불변 exec).
@@ -2195,8 +2254,10 @@ PY
       CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       fi
       _dept_spawn_pid=$!
-      ready "$sock" || { reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
+      dept_stage wait   # ★0.14.43 GP: 스폰 뒤 소켓 대기 시작 직전(재사용 분기엔 없다)
+      ready_wait "$sock" || { reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만) · ★0.14.43 GP: 스폰 뒤 대기 예산 노브 + 실패 문구 꼬리
     fi
+    dept_stage up   # ★0.14.43 GP: 데몬 소켓 응답 확인 직후(재사용이든 신규든)
     # 데몬 up 이후 일반 실패는 teardown, 판독 실패 10은 이번 호출의 자식만 회수한다.
     trap 'dept_creation_failed "$?" "$name" down' EXIT
     seed_schedule "$pack"
@@ -2222,6 +2283,7 @@ PY
     #   즉시 동작**(여기서 직접 각성시키지 않는다)으로 한정된다. 부서 생성의 최종 상태는 상비편성이며,
     #   실제 팀 완결은 성공 꼬리의 formation_ensure_async(→javis_formation ensure — 빈 셸 입양 포함)가
     #   담당한다. 즉 '자동 각성 폐지'는 이 인라인 경로의 폐지이지 편성 완결의 폐지가 아니다.
+    [ "${CYS_DEPT_NO_MASTER:-0}" = 1 ] || dept_stage seat   # ★0.14.43 GP: 부서장 자리 단계 직전 표지(빈 데몬 모드엔 그 단계가 없다)
     if [ "${CYS_DEPT_NO_MASTER:-0}" = 1 ]; then
       echo "[cys-dept] $name CYS_DEPT_NO_MASTER=1 — 셸 미생성(빈 데몬)" >&2
     elif dept_has_master "$sock"; then
@@ -2234,6 +2296,7 @@ PY
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 번호 재사용으로 묘비명과 충돌 시 보호 재편입
     formation_ensure_async "$name" "$sock" "$dept_cwd" "$TEAM_B64"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open) · R1: 시드와 같은 cwd · ★0.14.42: 팀 제안이면 편성 결판 알림 무장
     echo "[cys-dept] $name allocate 완료 (sock=$sock acct=$acctdir cwd=$dept_cwd)" >&2
+    dept_stage done   # ★0.14.43 GP: 성공 종료 직전 표지(이름을 stdout 에 내기 직전)
     echo "$name"   # ★stdout 마지막 줄 = 확정 name (Tauri 파싱). 진단은 전부 >&2
 }
 
@@ -2398,7 +2461,9 @@ PY
     # F3(codex): 멱등검사+예약을 단일 flock 원자. ★같은 mission_key 엔트리=청구됨 → REUSE(데몬 생사 무관·
     #   호출부가 ensure-ready). 신규는 lowest-unused 예약 + ★엔트리에 mission_key 기록(동시/부팅중 다른
     #   create가 즉시 발견 — codex: NEW 엔트리에 mission_key 누락 TOCTOU 해소).
-    res=$(reg_init; CYS_GRACE="${CYS_DEPT_RESERVE_GRACE:-25}" python3 - "$REG" "$mkey" "$cwd" "$acctdir" <<'PY'
+    #   ★0.14.43 GP: 노브(CYS_DEPT_READY_SECS)를 12 보다 크게 올렸을 때만 유예 = max(CYS_DEPT_RESERVE_GRACE 또는 25, 노브 + 13) — 스폰 뒤 대기를 늘리면 유예가 따라 올라가
+    #   유예 밖 구간(중복 기동 경합)이 열리지 않는다. 노브가 기본이면 종전 값 그대로다(25 · 명시한 낮은 값도 그대로 — 근거·한계는 dept_ready_secs 주석). 파이썬 GRACE 판독부는 무변경.
+    res=$(reg_init; CYS_GRACE="$(dept_reserve_grace)" python3 - "$REG" "$mkey" "$cwd" "$acctdir" <<'PY'
 import json,sys,os,re,time,socket as S
 try:
     import fcntl
@@ -2473,10 +2538,11 @@ PY
       exit 2
     fi
     sock="$(dept_sock "$name")"; pack="$(dept_pack "$name")"
+    dept_stage reserve   # ★0.14.43 GP: 단계 표지(stderr · 기계 판독) — 이름·번호 등재(예약) 직후(3분기 공통 · 조기 반환도 reserve 뒤 done)
     # 멱등 3분기 봉인(CSO): UP/BOOTING=즉시반환(boot tail 안 함=더블각성·더블미션 봉인)·DEAD=ensure-up revive·NEW=신규.
     case "$verb" in
-      REUSE_UP)      echo "[cys-dept] $key 이미 생존($name) — 재사용" >&2; echo "$name"; exit 0 ;;
-      REUSE_BOOTING) echo "[cys-dept] $key 생성자 부팅중($name) — 신뢰·재사용(중복부트 차단)" >&2; echo "$name"; exit 0 ;;
+      REUSE_UP)      echo "[cys-dept] $key 이미 생존($name) — 재사용" >&2; dept_stage done; echo "$name"; exit 0 ;;
+      REUSE_BOOTING) echo "[cys-dept] $key 생성자 부팅중($name) — 신뢰·재사용(중복부트 차단)" >&2; dept_stage done; echo "$name"; exit 0 ;;
       REUSE_DEAD)    echo "[cys-dept] $key 등록부 잔존($name)·데몬 사망(grace 경과) → ensure-up 재기동" >&2 ;;
       NEW)           : ;;
       *)             echo "[cys-dept] create: 미지 verb '$verb'" >&2; exit 1 ;;
@@ -2489,13 +2555,17 @@ PY
     mkdir -p "$(dept_logdir "$name")" "$pack/directives"
     seed_acl "$pack"
     _spawned=1   # ★⑦: 신규 스폰 여부(0=재사용·REUSE_DEAD 재기동 포함) — 티켓 발급 로그 문면 구분용
+    dept_stage probe   # ★0.14.43 GP: 사전 검사(이미 켜진 데몬이 있나 · 12초 고정) 직전
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 — 재사용" >&2; _spawned=0
     else
+      dept_stage spawn   # ★0.14.43 GP: 새 cysd 를 띄우기 직전(재사용 분기엔 없다)
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
       CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       _dept_spawn_pid=$!
-      ready "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name" || exit $?; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만)
+      dept_stage wait   # ★0.14.43 GP: 스폰 뒤 소켓 대기 시작 직전(재사용 분기엔 없다)
+      ready_wait "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name" || exit $?; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만) · ★0.14.43 GP: 스폰 뒤 대기 예산 노브 + 실패 문구 꼬리
     fi
+    dept_stage up   # ★0.14.43 GP: 데몬 소켓 응답 확인 직후(재사용이든 신규든)
     # NEW·REUSE_DEAD 공통: rc 10에서는 재사용 데몬 보호·새 자식만 회수(원본/묘비/CEO 무변경).
     trap 'dept_creation_failed "$?" "$name" down' EXIT
     seed_schedule "$pack"
@@ -2520,6 +2590,7 @@ PY
     #   ★후행 결정 갱신(T9·오너 ②a 상비편성(B) — 규범 이중화 방지): '빈 셸만'은 이 인라인 지점의 즉시
     #   동작 한정이다 — 최종 상태는 상비편성이고 팀 완결은 성공 꼬리의 formation_ensure_async 소관이다.
     # ★더블master guard(부트↔수동선언 경합 좀비 방지): 이미 live master surface가 있으면 셸 생성 생략(멱등).
+    dept_stage seat   # ★0.14.43 GP: 부서장 자리 단계 직전 표지(create 는 빈 데몬 모드가 없어 늘 있는 단계)
     if dept_has_master "$sock"; then
       echo "[cys-dept] $name 이미 live master surface 존재 — 셸 생성 생략(멱등 더블master 방지)" >&2
     elif CYS_SOCKET="$sock" "$CYS" new-surface --socket "$sock" --role master --cwd "$dept_cwd" >/dev/null 2>&1; then
@@ -2530,6 +2601,7 @@ PY
     dept_tombstone_remove "$name"   # WP-3·R6ⓒ: 삭제→동명 재생성 시 보호 재편입
     formation_ensure_async "$name" "$sock" "$dept_cwd"   # ★T9(P3-1 ⓐ): 상비편성 — 생성 직후 배선(fail-open) · R1: 시드와 같은 cwd
     echo "[cys-dept] create '$disp'($name) 완료 (account=$acctkey sock=$sock cwd=$dept_cwd)" >&2
+    dept_stage done   # ★0.14.43 GP: 성공 종료 직전 표지(이름을 stdout 에 내기 직전)
     echo "$name"   # stdout 마지막 = 확정 name(Tauri 파싱)
     ;;
   down)
