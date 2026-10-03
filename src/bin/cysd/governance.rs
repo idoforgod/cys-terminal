@@ -26073,6 +26073,14 @@ pub(crate) fn h_ledger_count(daemon: &Arc<Daemon>, origin: &str) -> usize {
         .count()
 }
 
+/// 검체 공용 — 큐 틱(`deliver_queued`) **1회**를 돌린다(다른 모듈의 검체가 "그 뒤 큐 틱이 배달한다" 를 재는 용도 · 틱 로컬 맵은 호출마다 새것).
+/// `deliver_queued` 자체는 이 파일 안에 사는 사설 함수라 시임만 연다 — 판정·배달 경로는 그대로다.
+#[cfg(test)]
+pub(crate) fn h_queue_tick(daemon: &Arc<Daemon>) {
+    let (mut depth, mut starve, mut stale) = (HashMap::new(), HashMap::new(), HashMap::new());
+    deliver_queued(daemon, &mut depth, &mut starve, &mut stale);
+}
+
 #[cfg(test)]
 mod h_machine_hold_tests {
     use super::*;

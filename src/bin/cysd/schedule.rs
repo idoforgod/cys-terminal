@@ -1912,7 +1912,11 @@ fn deliver_push(
             return enqueue_schedule_push(daemon, job, sid, text, role_guard, SCHEDULE_QUEUE_CAP, None)
                 .map(|_| "queued(modal)");
         }
-        inject_on(daemon, &surface, text)?;
+        // ★(0.14.43 · C8) 인계에 성공하면 `inject_on` 이 입력줄 계수를 "제출됨(0)" 으로 계상한다 — 계수가 실제로 0 이 아닌 값에서 내려갔을 때만 관측 이벤트 1건
+        //   (보류·전환 판정은 위 H0 가 이미 끝냈다 · 이 계상은 어떤 게이트도 바꾸지 않는다).
+        if let Some(cleared) = inject_on(daemon, &surface, text)? {
+            note_push_cleared_pending(daemon, &surface, job, cleared);
+        }
         return Ok("pushed");
     }
     enqueue_schedule_push(daemon, job, sid, text, role_guard, SCHEDULE_QUEUE_CAP, None).map(|_| "queued")
@@ -2288,11 +2292,26 @@ fn resolve_push_target(
 /// 전체 시퀀스가 writer 스레드의 단일 Inject 항목으로 직렬화돼
 /// 동시 발화·동시 배달과 섞이지 않는다 (메시지 병합·오염 차단).
 /// 확정된 좌석에 주입한다(조회를 다시 하지 않는다 — 확정과 주입 사이에 좌석이 바뀌지 않게).
+///
+/// ★(0.14.43 · C8) **인계에 성공하면 그 좌석의 미제출 입력 계수를 0 으로 계상한다** — 큐 배달 인계(`governance::deliver_head_locked`)와 같은 규약이다.
+/// Inject 는 본문+CR 을 원자로 보내 **줄을 제출**하므로 인계 뒤의 입력줄은 비어 있다. 종전에는 이 경로만 계수를 건드리지 않아, 유령 계수(윈도우·
+/// `CYS_PENDING_INPUT_MODEL=v2` 좌석의 단독 Esc · 글자를 치고 전부 지운 줄)가 있는 좌석에 하트비트가 들어가도 계수가 남아 그 좌석의 큐 배달이
+/// 계속 `input_pending` 으로 막혔다(실측: push 뒤 `pending=1·human=1` 잔존). **게이트(보류·전환 판정)는 이 함수 앞 `deliver_push` 의 H0 이고 무변경이다** —
+/// 여기서는 이미 통과한 주입의 사실만 계상한다. 노브 `CYS_SCHEDULE_PUSH_COUNTS_SUBMIT=0` 이면 종전(계수·게이트 무접촉)이다.
+///
+/// 【임계영역】 인계(`try_send`)와 계상을 **한 `input_gate` 안**에서 한다 — 큐 인계 지점과 같다. 갈라서 게이트 밖에서 계상하면 그 사이에 끼어든 직접 send
+/// (`send_text`: 게이트 안에서 쓰고 계수를 올린다)의 계수를 0 으로 덮어 과소 계수(= 초안 위 오주입 방향)를 만든다.
+/// 재진입·교착 없음(호출 사슬을 코드로 확인): `fire`(tick·`run_now` 가 띄운 태스크) → `fire_push` → `deliver_push` → 여기 — 이 파일에서 `input_gate` 를 잡는 곳은 여기 하나뿐이고
+/// 게이트를 쥔 호출자도 없다. 락 순서 `pending_queue → input_gate` 는 `pending_queue` 를 잡지 않으므로 지킨다. 게이트 안은 `try_send`(비차단) · 원자 판독/쓰기 ·
+/// `pending_input`(leaf) 뿐이다 — 원장 append(디스크 I/O)는 게이트 **앞**, 이벤트 발행은 게이트 **뒤**(호출자)다.
+/// `try_send` 실패(채널 가득·writer 종료)는 쓰이지 않았으므로 계수를 건드리지 않는다. 인계 뒤 좌석이 종료돼도 0 은 무해하다(종료 좌석의 계수는 판정에 쓰이지 않는다 — 틱은 `exited` 좌석을 건너뛴다).
+///
+/// 반환 `Some` = 계수가 **0 이 아닌 값에서** 0 으로 내려갔다(관측 이벤트 대상). `None` = 0→0 이거나 노브가 꺼졌다.
 fn inject_on(
     daemon: &Arc<Daemon>,
     surface: &Arc<crate::state::Surface>,
     text: &str,
-) -> Result<(), String> {
+) -> Result<Option<PushClearedPending>, String> {
     let sid = surface.id;
     // ★(0.14.42 · 설계 C D3) 잡 문안은 사용자 입력이다 — 원장 선기록 앞에서 살균해 원장과 주입 본문을 맞춘다
     //   (writer 백스톱과 같은 값 · 표지 없는 문안은 할당 0 · 바이트 동일).
@@ -2307,6 +2326,9 @@ fn inject_on(
         crate::delivery::Origin::Schedule,
         None,
     );
+    // ★(0.14.43 · C8) 게이트는 원장 선기록 **뒤** · 인계 **앞**에서 잡는다(디스크 I/O 를 게이트 안에 넣지 않는다). 노브가 꺼졌으면 잡지 않는다(종전 byte-identical).
+    let gate = schedule_push_counts_submit()
+        .then(|| surface.input_gate.lock().unwrap_or_else(|e| e.into_inner()));
     surface
         .write_tx
         .try_send(crate::state::WriteReq::Inject {
@@ -2320,7 +2342,67 @@ fn inject_on(
                 "surface write channel full (pane stalled)".to_string()
             }
             std::sync::mpsc::TrySendError::Disconnected(_) => "surface writer closed".to_string(),
-        })
+        })?;
+    // 인계 성공 — 노브가 꺼졌으면(게이트를 잡지 않았다) 종전 그대로 끝낸다(계수 무접촉).
+    if gate.is_none() {
+        return Ok(None);
+    }
+    // ★큐 인계 지점(`deliver_head_locked`)과 같은 계상 — 줄을 제출했으니 미제출 계수 0: `set_pending_input(0)` = 미러 0 · 세대 `input_gen` +1(owner 각인은 세대로 자동 무효).
+    //   `set_pending_input` 은 `PendingInputState.human` 을 건드리지 않는다(큐 인계는 계수 0 인 줄에서만 일어나 사람 몫도 이미 0 이다). 여기서는 0 이 아닌 줄을 0 으로 내리므로
+    //   사람 몫도 함께 0 으로 접는다 — 남기면 raw `human` 을 읽는 `draft_machine_owned`·`draft_divert_step` 이, 이 push 의 CR 이 삼켜져 남은 잔여를 사람 초안으로 오인한다.
+    let prev_bytes = surface.pending_input_bytes.load(std::sync::atomic::Ordering::Relaxed);
+    let prev_human_bytes = {
+        let mut st = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+        let human = st.human.min(prev_bytes);
+        st.human = 0;
+        human
+    };
+    surface.set_pending_input(0);
+    drop(gate);
+    Ok((prev_bytes != 0).then_some(PushClearedPending { prev_bytes, prev_human_bytes }))
+}
+
+/// ★(0.14.43 · C8) 직접 push 인계가 입력줄 미제출 계수를 **0 이 아닌 값에서** 0 으로 내렸다는 사실 — [`inject_on`] 이 돌려주고 [`note_push_cleared_pending`] 이 이벤트로 만든다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PushClearedPending {
+    /// 계상 전 `pending_input_bytes`(전체 미제출 계수).
+    prev_bytes: u64,
+    /// 그중 사람 몫 — 불변식 `human ≤ count` 로 접은 값(진단 표면 `pending_input_human_bytes` 와 같은 읽기).
+    prev_human_bytes: u64,
+}
+
+/// ★(0.14.43 · C8) 순수 파서 — 노브 `CYS_SCHEDULE_PUSH_COUNTS_SUBMIT`(직접 push 인계 뒤 입력줄 계수를 0 으로 계상할지 · 기본 켬). **정확히 `"0"` 일 때만 끈다**(= 종전 =
+/// 계수·게이트 무접촉). 미설정·빈 값·그 밖의 값은 켬 — 이 노브는 안전 게이트가 아니라 계상의 롤백 손잡이다.
+fn schedule_push_counts_submit_from_env(v: Option<&str>) -> bool {
+    v != Some("0")
+}
+
+/// env 래퍼 — 호출마다 읽는다(프로세스 수명 1회 캐시가 아니다 · 같은 push 경로의 `CYS_MACHINE_INJECT_HOLD` 와 같은 `h_knob` 관례. 검체는 스레드 로컬 덮개로 값을 준다).
+/// 발화(push)마다 1회라 틱 안 반복 읽기가 아니다.
+fn schedule_push_counts_submit() -> bool {
+    schedule_push_counts_submit_from_env(
+        crate::governance::h_knob("CYS_SCHEDULE_PUSH_COUNTS_SUBMIT").as_deref(),
+    )
+}
+
+/// ★(0.14.43 · C8) 직접 push 가 입력줄 계수를 0 으로 되돌렸다는 **관측용** 이벤트 1건 — 계수가 0 이 아닌 값에서 바뀐 경우에만 부른다([`inject_on`] 이 `None` 이면 호출되지 않는다).
+/// 이름이 `alert.` 접두도 `alert_route::routable` 허용 목록도 아니어서 라우팅되지 않는다(경보가 아니다 · 검체로 핀 · `queue.input_pending_reset` 과 다른 이름).
+fn note_push_cleared_pending(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
+    job: &Job,
+    cleared: PushClearedPending,
+) {
+    daemon.bus.publish(
+        "schedule.push_cleared_pending",
+        "schedule",
+        Some(surface.id),
+        json!({"surface_ref": cys::surface_ref(surface.id),
+               "prev_bytes": cleared.prev_bytes,
+               "prev_human_bytes": cleared.prev_human_bytes,
+               "job": job.id,
+               "note": "직접 push 가 본문+CR 로 입력줄을 제출했다 — 미제출 입력 계수를 0 으로 계상했다(유령 계수 해소 · 큐 배달 인계와 같은 규약)"}),
+    );
 }
 
 /// 부재 역할 자동 기동: 데몬이 형제 CLI의 launch-agent를 호출 (준비 폴링·지침 주입 재사용)
@@ -5459,5 +5541,397 @@ mod h2_schedule_hold_tests {
             settle();
         }
         done(&s);
+    }
+}
+
+// ═══════════ ★(0.14.43 · C8) 스케줄 직접 push(inject_on) 인계 뒤 입력줄 계수 계상 ═══════════
+//
+// 계약: 직접 push 인계(`try_send`)에 성공하면 큐 배달 인계와 같은 규약으로 미제출 계수를 0 으로 계상한다(`input_gate` 안 · 세대 +1) —
+// 유령 계수(v2 좌석의 단독 Esc 등)가 하트비트 push 뒤에도 남아 그 좌석의 큐 배달을 `input_pending` 으로 막던 것의 수리. 게이트(보류·전환)는 무변경.
+#[cfg(test)]
+mod c8_push_counts_submit_tests {
+    use super::*;
+    use crate::governance::{
+        h_ledger_count, h_paint, queue_block_diag, queue_remedy, HKnobGuard, InputOrigin, PendingInputModel,
+        BLOCKED_INPUT_PENDING, H_DRAFT_SCREEN, H_IDLE_SCREEN,
+    };
+    use serde_json::json;
+    use std::sync::atomic::Ordering;
+
+    /// 마커 좌석(master · claude) — H2 검체와 같은 장비. 틱 표식(`lone_key_exempt`)이 거짓이라 **v2 좌석**이다(유령 계수가 생긴다).
+    fn rig(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        rig_cmd(tag, "sleep 30")
+    }
+
+    /// `rig` 의 명령 지정판 — 자식을 죽여 PTY EOF(→ writer 종료)를 보려는 검체는 `exec sleep` 로 셸이 자식을 남기지 않게 한다.
+    fn rig_cmd(tag: &str, cmd: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        crate::delivery::tests::isolate_state_dir_for_thread(tag);
+        let daemon = super::tests::test_daemon();
+        let s = daemon
+            .create_surface(None, Some(cmd.into()), None, Some("master".into()), 24, 80)
+            .expect("좌석");
+        daemon.roles.lock().unwrap().insert("master".into(), s.id);
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        (daemon, s)
+    }
+
+    fn job(v: serde_json::Value) -> Job {
+        serde_json::from_value(v).expect("잡")
+    }
+
+    fn periodic(id: &str, every: u64) -> Job {
+        job(json!({"id": id, "every_minutes": every, "action": "push", "to": "master", "text": "x"}))
+    }
+
+    fn queue(s: &Arc<crate::state::Surface>) -> Vec<crate::state::QueueEntry> {
+        s.pending_queue.lock().unwrap().iter().cloned().collect()
+    }
+
+    fn events(d: &Arc<Daemon>, name: &str) -> Vec<serde_json::Value> {
+        d.bus.tail(5000).into_iter().filter(|e| e["name"] == name).collect()
+    }
+
+    fn blocked_reason(s: &Arc<crate::state::Surface>) -> String {
+        s.queue_blocked.lock().unwrap().as_ref().map(|(w, _)| w.clone()).unwrap_or_default()
+    }
+
+    fn done(s: &Arc<crate::state::Surface>) {
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// 직접 주입 뒤 writer(본문 → 500ms → CR)와 PTY 에코가 끝나기를 기다린다 — 다음 화면을 그리기 전에.
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_millis(900));
+    }
+
+    /// 이 좌석의 `(미제출 계수, 사람 몫 raw)` — 사람 몫은 진단의 `min(계수)` 접힘 **전** 원값이다(정규화까지 잰다).
+    fn counts(s: &Arc<crate::state::Surface>) -> (u64, u64) {
+        (s.pending_input_bytes.load(Ordering::Relaxed), s.pending_input.lock().unwrap().human)
+    }
+
+    /// v2 좌석의 유령 계수 — 사람의 단독 Esc 1회(글자는 없다)가 계수 1 · 사람 1 로 남는다(`CYS_PENDING_INPUT_MODEL=v2`·윈도우의 실측 모양).
+    fn make_ghost(s: &Arc<crate::state::Surface>) {
+        assert_eq!(s.pending_input_model(), PendingInputModel::V2, "전제: 틱 표식 없는 좌석 = v2");
+        let n = s.apply_pending_input(b"\x1b", InputOrigin::Human);
+        assert_eq!((n.count, n.human), (1, 1), "전제: v2 단독 Esc = 유령 계수 1(사람 1): {n:?}");
+        assert_eq!(counts(s), (1, 1));
+    }
+
+    /// [C8 본체] v2 좌석의 유령 계수(1 · 사람 1)가 있는 유휴 좌석에 직접 push → 계수 0(사람 몫 0 · 세대 증가) · `schedule.push_cleared_pending`
+    /// 정확히 1건 · 그 뒤 큐 틱이 `input_pending` 없이 배달한다(진단도 같은 사실을 읽는다).
+    /// RED(수정 전): push 뒤에도 계수 1 · 이벤트 0 · 큐 틱이 `input_pending` 으로 계속 보류.
+    #[test]
+    fn c8_push_clears_ghost_count_then_queue_tick_delivers_without_input_pending() {
+        let _g = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (d, s) = rig("c8-ghost");
+        h_paint(&s, H_IDLE_SCREEN);
+        make_ghost(&s);
+        // 대조(수정 전과 같은 사실) — 유령 계수가 큐 배달을 막는다. 진단(읽기만)도 같은 사실을 말한다(처방 = 유령 계수).
+        let diag = queue_block_diag(&d, &s);
+        assert_eq!((diag.pending_input_bytes, diag.pending_input_human_bytes, diag.input_model), (1, 1, "v2"));
+        assert_eq!(diag.draft_visible, Some(false), "전제: 화면은 빈 입력줄이다");
+        assert_eq!(queue_remedy(BLOCKED_INPUT_PENDING, &diag).0, "phantom_count", "전제: 유령 계수 처방이 서는 모양");
+        let entry = d.next_queue_entry("[보고] 큐 항목".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(entry);
+        crate::governance::h_queue_tick(&d);
+        assert_eq!(queue(&s).len(), 1, "전제: 유령 계수가 큐 배달을 막는다");
+        assert_eq!(blocked_reason(&s), BLOCKED_INPUT_PENDING, "전제: 막힘 사유 = input_pending");
+        // push — 게이트(H0)는 계수 단독을 관측 불능으로 보므로(화면은 빈 줄) 종전대로 직접 주입이다.
+        let gen0 = s.input_gen.load(Ordering::Acquire);
+        let j = periodic("hb-c8", 5);
+        assert_eq!(deliver_push(&d, &j, s.id, "[heartbeat] 5분 보고", None), Ok("pushed"));
+        assert_eq!(h_ledger_count(&d, "schedule"), 1, "직접 주입 원장");
+        // 계상 — 큐 인계 지점과 같은 규약(미러 0 · 세대 +1) + 사람 몫도 0.
+        assert_eq!(counts(&s), (0, 0), "push 뒤에도 유령 계수가 남았다(큐 배달이 계속 input_pending 으로 막힌다)");
+        assert!(s.input_gen.load(Ordering::Acquire) > gen0, "세대(input_gen)가 오르지 않았다 — 큐 인계 지점의 규약");
+        let evs = events(&d, "schedule.push_cleared_pending");
+        assert_eq!(evs.len(), 1, "관측 이벤트는 정확히 1건: {evs:?}");
+        let ev = &evs[0];
+        assert_eq!(ev["category"], json!("schedule"));
+        assert_eq!(ev["surface_id"], json!(s.id));
+        assert_eq!(ev["payload"]["surface_ref"], json!(cys::surface_ref(s.id)));
+        assert_eq!(ev["payload"]["prev_bytes"], json!(1));
+        assert_eq!(ev["payload"]["prev_human_bytes"], json!(1));
+        assert_eq!(ev["payload"]["job"], json!("hb-c8"));
+        let name = ev["name"].as_str().expect("이름");
+        assert!(!crate::alert_route::routable(name), "관측 이벤트가 라우팅 대상이다(CSO 좌석 입력으로 샌다)");
+        assert!(!name.starts_with(crate::alert_route::ALERT_ENGINE_PREFIX), "alert. 접두 금지");
+        assert_ne!(name, "queue.input_pending_reset", "다른 이름이어야 한다");
+        // 다음 틱 — 직접 주입의 붙여넣기 → CR 과 에코가 끝난 뒤 유휴 화면에서 큐 틱이 입력줄 점유 없이 배달한다.
+        settle();
+        h_paint(&s, H_IDLE_SCREEN);
+        let diag = queue_block_diag(&d, &s);
+        assert_eq!((diag.pending_input_bytes, diag.pending_input_human_bytes), (0, 0), "진단이 여전히 유령 계수를 읽는다");
+        crate::governance::h_queue_tick(&d);
+        assert!(queue(&s).is_empty(), "push 뒤 큐 틱이 배달하지 못했다(blocked={:?})", blocked_reason(&s));
+        assert_eq!(blocked_reason(&s), "", "낡은 input_pending 사유가 남았다");
+        assert_eq!(
+            events(&d, "queue.input_pending_reset").len(),
+            0,
+            "stale 리셋 경로가 아니라 push 의 계상으로 풀려야 한다"
+        );
+        done(&s);
+    }
+
+    /// [C8] 계수가 이미 0 인 좌석에 push → 이벤트 0건(0→0 은 사실이 바뀐 게 아니다) · 계수·사람 몫 0 · 주입은 종전대로.
+    #[test]
+    fn c8_push_on_zero_count_seat_emits_no_event() {
+        let (d, s) = rig("c8-zero");
+        h_paint(&s, H_IDLE_SCREEN);
+        assert_eq!(counts(&s), (0, 0), "전제");
+        assert_eq!(deliver_push(&d, &periodic("hb", 5), s.id, "[heartbeat] 5분 보고", None), Ok("pushed"));
+        assert_eq!(counts(&s), (0, 0));
+        assert!(events(&d, "schedule.push_cleared_pending").is_empty(), "0→0 인데 이벤트가 났다");
+        assert_eq!(h_ledger_count(&d, "schedule"), 1, "주입 자체는 종전대로");
+        done(&s);
+    }
+
+    /// [C8 노브] `CYS_SCHEDULE_PUSH_COUNTS_SUBMIT=0` → 계수 유지(종전 · 세대도 무접촉) · 이벤트 0건 · 주입은 그대로. 노브를 되돌리면(기본 켬) 같은 좌석의 같은 유령 계수가 풀린다(대조).
+    #[test]
+    fn c8_knob_zero_keeps_the_count_and_emits_nothing() {
+        let (d, s) = rig("c8-knob");
+        h_paint(&s, H_IDLE_SCREEN);
+        make_ghost(&s);
+        let gen0 = s.input_gen.load(Ordering::Acquire);
+        {
+            let _k = HKnobGuard::set(&[("CYS_SCHEDULE_PUSH_COUNTS_SUBMIT", "0")]);
+            assert!(!schedule_push_counts_submit(), "덮개 0 이 읽히지 않는다");
+            assert_eq!(deliver_push(&d, &periodic("hb", 5), s.id, "[heartbeat] 노브 0", None), Ok("pushed"));
+        }
+        assert_eq!(counts(&s), (1, 1), "노브 0 인데 계수를 건드렸다(종전 = 무접촉)");
+        assert_eq!(s.input_gen.load(Ordering::Acquire), gen0, "노브 0 인데 세대가 올랐다");
+        assert!(events(&d, "schedule.push_cleared_pending").is_empty(), "노브 0 인데 이벤트가 났다");
+        assert_eq!(h_ledger_count(&d, "schedule"), 1, "주입 자체는 종전대로");
+        // 대조 — 노브 기본(켬): 같은 좌석·같은 유령 계수가 풀린다.
+        settle();
+        h_paint(&s, H_IDLE_SCREEN);
+        assert_eq!(deliver_push(&d, &periodic("hb", 5), s.id, "[heartbeat] 노브 기본", None), Ok("pushed"));
+        assert_eq!(counts(&s), (0, 0));
+        assert_eq!(events(&d, "schedule.push_cleared_pending").len(), 1);
+        done(&s);
+    }
+
+    /// [C8 노브 파서] 순수 파서는 **정확히 `"0"`** 일 때만 끈다 — 미설정·빈 값·그 밖의 값은 켬. env 래퍼는 덮개(검체)·프로세스 env 를 호출마다 읽는다.
+    #[test]
+    fn c8_knob_parser_turns_off_only_on_exactly_zero() {
+        assert!(schedule_push_counts_submit_from_env(None), "미설정 = 켬(기본)");
+        assert!(!schedule_push_counts_submit_from_env(Some("0")));
+        for v in ["", "1", "on", "off", "false", "no", "00", " 0", "0 ", "2", "true", "OFF"] {
+            assert!(schedule_push_counts_submit_from_env(Some(v)), "{v:?} 는 끄는 값이 아니다");
+        }
+        // 래퍼 — 호출마다 읽는다(덮개 변경이 곧바로 반영 = 1회 캐시 아님).
+        for (v, want) in [("0", false), ("1", true), ("0", false), ("", true)] {
+            let _k = HKnobGuard::set(&[("CYS_SCHEDULE_PUSH_COUNTS_SUBMIT", v)]);
+            assert_eq!(schedule_push_counts_submit(), want, "{v:?}");
+        }
+        if std::env::var_os("CYS_SCHEDULE_PUSH_COUNTS_SUBMIT").is_none() {
+            assert!(schedule_push_counts_submit(), "env 미설정 = 켬");
+        }
+    }
+
+    /// [C8 인계 실패] `try_send` 실패(채널 가득 · writer 종료) → 계수·사람 몫·세대 유지 · 이벤트 0건 · Err 는 종전 문구 그대로.
+    /// (RED 돌연변이 M1 = 실패에도 계수를 0 으로 → 이 검체가 적색.)
+    #[test]
+    fn c8_handoff_failure_leaves_the_count_untouched() {
+        use crate::state::WriteReq;
+        use std::sync::mpsc::TrySendError;
+        // (가) 채널 가득 — writer 를 5s 재워(DataAfter) 뒤 요청이 쌓이게 한 뒤 용량(128)을 채운다.
+        let (d, s) = rig("c8-full");
+        h_paint(&s, H_IDLE_SCREEN);
+        make_ghost(&s);
+        s.write_tx.send(WriteReq::DataAfter { bytes: Vec::new(), delay_ms: 5_000 }).expect("writer");
+        std::thread::sleep(std::time::Duration::from_millis(150)); // writer 가 집어 자리에 들도록
+        for i in 0..128 {
+            s.write_tx.try_send(WriteReq::Data(Vec::new())).unwrap_or_else(|_| panic!("채널 채우기 #{i}"));
+        }
+        assert!(
+            matches!(s.write_tx.try_send(WriteReq::Data(Vec::new())), Err(TrySendError::Full(_))),
+            "전제: 채널이 가득 찼다"
+        );
+        let gen0 = s.input_gen.load(Ordering::Acquire);
+        let err = deliver_push(&d, &periodic("hb", 5), s.id, "[heartbeat] 가득", None)
+            .expect_err("가득 찬 채널에 인계가 성공했다");
+        assert!(err.contains("write channel full"), "{err}");
+        assert_eq!(counts(&s), (1, 1), "쓰이지 않았는데 계수를 0 으로 계상했다(채널 가득)");
+        assert_eq!(s.input_gen.load(Ordering::Acquire), gen0, "쓰이지 않았는데 세대가 올랐다");
+        assert!(events(&d, "schedule.push_cleared_pending").is_empty(), "쓰이지 않았는데 이벤트가 났다");
+        done(&s);
+        // (나) writer 종료 — 자식이 끝나 reader EOF → writer 루프가 끝나 수신자가 사라진다(`exec` 라 셸이 자식을 남기지 않는다).
+        let (d2, s2) = rig_cmd("c8-closed", "exec sleep 30");
+        h_paint(&s2, H_IDLE_SCREEN);
+        make_ghost(&s2);
+        done(&s2);
+        let t0 = std::time::Instant::now();
+        while !s2.exited.load(Ordering::Relaxed) {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(10), "전제 실패: reader 가 자식 종료(EOF)를 보지 못했다");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // writer 루프는 **유휴 200ms** 뒤에야 stop 표식을 본다 — 요청을 쉼 없이 보내면 그 시험이 영영 오지 않으므로 드문 간격으로만 닫힘을 확인한다.
+        let t1 = std::time::Instant::now();
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(450));
+            if matches!(s2.write_tx.try_send(WriteReq::Data(Vec::new())), Err(TrySendError::Disconnected(_))) {
+                break;
+            }
+            assert!(t1.elapsed() < std::time::Duration::from_secs(10), "전제 실패: writer 가 끝나지 않았다");
+        }
+        let gen0 = s2.input_gen.load(Ordering::Acquire);
+        let err = deliver_push(&d2, &periodic("hb", 5), s2.id, "[heartbeat] 종료", None)
+            .expect_err("종료된 writer 에 인계가 성공했다");
+        assert!(err.contains("writer closed"), "{err}");
+        assert_eq!(counts(&s2), (1, 1), "쓰이지 않았는데 계수를 0 으로 계상했다(writer 종료)");
+        assert_eq!(s2.input_gen.load(Ordering::Acquire), gen0);
+        assert!(events(&d2, "schedule.push_cleared_pending").is_empty());
+    }
+
+    /// [C8 게이트 불변] 사람 키 직후(30s 창) · 화면 초안 · 모달 전경 · kill-switch — 종전처럼 직접 주입하지 않고(큐로 전환 · Err) **계수는 그대로**다. 이벤트·원장 0.
+    /// (기존 H0/H2 검체가 판정 자체를 이미 핀한다 — 여기서는 전환·거부가 계수를 건드리지 않음을 잰다.)
+    #[test]
+    fn c8_diverted_or_refused_pushes_keep_the_count_gates_unchanged() {
+        let (d, s) = rig("c8-gates");
+        make_ghost(&s);
+        // ⓐ 사람 키 직후 10s → 큐로 전환
+        h_paint(&s, H_IDLE_SCREEN);
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(10));
+        assert_eq!(deliver_push(&d, &periodic("hb-h", 5), s.id, "[heartbeat] a", None), Ok("queued(gate:human)"));
+        assert_eq!(counts(&s), (1, 1), "사람 키 직후 전환이 계수를 건드렸다");
+        // ⓑ 화면에 초안이 보인다(사람 몫 1 이라 기계 잔여가 아니다) → 큐로 전환
+        *s.last_human_input.lock().unwrap() = None;
+        h_paint(&s, H_DRAFT_SCREEN);
+        assert_eq!(deliver_push(&d, &periodic("hb-d", 5), s.id, "[heartbeat] b", None), Ok("queued(gate:draft)"));
+        assert_eq!(counts(&s), (1, 1), "화면 초안 전환이 계수를 건드렸다");
+        // ⓒ 모달(질문·선택 창) 전경 → 큐로 전환
+        h_paint(&s, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+        assert_eq!(deliver_push(&d, &periodic("hb-m", 5), s.id, "[heartbeat] c", None), Ok("queued(modal)"));
+        assert_eq!(counts(&s), (1, 1), "모달 전환이 계수를 건드렸다");
+        // ⓓ kill-switch(틱과 push 사이의 늦은 pause) → Err(delivery_frozen)
+        h_paint(&s, H_IDLE_SCREEN);
+        d.paused.store(true, Ordering::Relaxed);
+        let err = deliver_push(&d, &periodic("hb-p", 5), s.id, "[heartbeat] d", None).expect_err("pause 중 주입");
+        assert!(err.starts_with("delivery_frozen"), "{err}");
+        d.paused.store(false, Ordering::Relaxed);
+        assert_eq!(counts(&s), (1, 1), "pause 거부가 계수를 건드렸다");
+        assert_eq!(queue(&s).len(), 3, "전환 항목 3(사람·초안·모달)");
+        assert_eq!(h_ledger_count(&d, "schedule"), 0, "직접 주입 0");
+        assert!(events(&d, "schedule.push_cleared_pending").is_empty(), "전환·거부에서 이벤트가 났다");
+        done(&s);
+    }
+
+    /// [C8 비라우팅] `schedule.push_cleared_pending` 은 경보가 아니다 — `alert_route::routable` 에 걸리지 않고(CSO 좌석 입력으로 새는 폭주 통로 금지 · `alert.` 접두 금지),
+    /// 요약 재료도 되지 않는다. 선례: `usage.alert_resolved`(B3). 기존 라우팅 이름은 그대로 라우팅된다(대조).
+    #[test]
+    fn c8_push_cleared_pending_is_observation_only_never_routed() {
+        let name = "schedule.push_cleared_pending";
+        assert!(!crate::alert_route::routable(name), "관측 이벤트가 라우팅 대상이다");
+        assert!(!name.starts_with(crate::alert_route::ALERT_ENGINE_PREFIX));
+        assert!(!crate::alert_route::routable("queue.input_pending_reset"), "대조: 종전 리셋 이벤트도 비라우팅");
+        let ev = json!({"name": name, "surface_id": 2, "payload": {"surface_ref": "surface:2", "prev_bytes": 1,
+                        "prev_human_bytes": 1, "job": "heartbeat-5m"}});
+        assert!(crate::alert_route::summarize(&ev).is_none(), "관측 이벤트가 라우팅 요약 재료가 됐다");
+        for n in ["queue.starved", "queue.depth_high", "alert.rate_limit", "watchdog.load_high"] {
+            assert!(crate::alert_route::routable(n), "대조: 라우팅 이름 {n} 이 막혔다");
+        }
+    }
+
+    /// [C8 자가치유 확장] 기계 잔여(검증 발신자 본문 · 계수 n · 사람 0 · owner 각인)가 남은 좌석에 H2 가 종전대로 직접 주입(병합 제출)하면 계수가 0 이 되고
+    /// owner 각인은 세대 변화로 무효가 된다 — 이벤트는 사람 몫 0 으로 1건. (종전: 병합 제출됐는데도 계수 n 이 남아 큐가 다음 stale 리셋까지 input_pending.)
+    #[test]
+    fn c8_machine_residue_push_clears_count_and_invalidates_owner() {
+        let (d, s) = rig("c8-residue");
+        s.apply_pending_input(b"WORKER-REPORT residue text", InputOrigin::Machine);
+        s.mark_pending_owner(9);
+        assert!(s.pending_owner().is_some(), "전제: owner 각인");
+        let n = s.pending_input_bytes.load(Ordering::Relaxed);
+        assert_eq!(n, 26, "전제: 잔여 26바이트");
+        h_paint(&s, &crate::governance::h_residue_screen("WORKER-REPORT residue text"));
+        assert_eq!(deliver_push(&d, &periodic("hb", 5), s.id, "[heartbeat] 5분 보고", None), Ok("pushed"));
+        assert_eq!(counts(&s), (0, 0), "병합 제출했는데 기계 잔여 계수가 남았다");
+        assert!(s.pending_owner().is_none() && s.pending_input_owner().is_none(), "owner 각인이 세대 변화로 무효가 되지 않았다");
+        let evs = events(&d, "schedule.push_cleared_pending");
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert_eq!(evs[0]["payload"]["prev_bytes"], json!(26));
+        assert_eq!(evs[0]["payload"]["prev_human_bytes"], json!(0), "기계 잔여의 사람 몫은 0");
+        done(&s);
+    }
+
+    /// [C8 임계영역 · 행동] 인계+계상은 `input_gate` 를 쥔 쪽(직접 send)이 끝난 **뒤**에 일어난다 — 게이트를 쥔 동안 push 는 지나가지 못하고(계수·세대 무변),
+    /// 놓으면 그 사이 올라간 직접 send 의 계수까지 제출(0)로 계상한다(소스 핀의 행동 짝). 계상이 게이트 밖이었다면 직접 send 의 계수를 덮어쓰거나 앞질러 계상한다.
+    /// 게이트를 쥔 호출자가 없다는 전제(재진입 없음)는 소스 핀이 재고, 놓은 뒤 push 가 **끝까지 돌아 나오는 것**(교착 없음)은 여기서 잰다.
+    #[test]
+    fn c8_inject_on_waits_for_the_input_gate_held_by_a_direct_send() {
+        let (d, s) = rig("c8-gate-wait");
+        h_paint(&s, H_IDLE_SCREEN);
+        // 직접 send(`send_text`)는 게이트 안에서 본문을 쓰고 계수를 올린다 — 여기서는 계수를 올린 채 게이트를 쥐고 있는다.
+        let gate = s.input_gate.lock().unwrap();
+        s.apply_pending_input(b"abc", InputOrigin::Machine);
+        let gen0 = s.input_gen.load(Ordering::Acquire);
+        let (d2, s2) = (Arc::clone(&d), Arc::clone(&s));
+        let pusher = std::thread::spawn(move || {
+            // 원장 선기록은 스레드 로컬 격리 상태 디렉터리를 쓴다 — 이 스레드도 새 격리를 쥔다.
+            crate::delivery::tests::isolate_state_dir_for_thread("c8-gate-wait-pusher");
+            inject_on(&d2, &s2, "[heartbeat] 게이트 대기")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!pusher.is_finished(), "게이트를 쥔 동안 push 가 지나갔다 — 인계·계상이 임계영역 밖이다");
+        assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 3, "게이트를 쥔 동안 계수가 바뀌었다");
+        assert_eq!(s.input_gen.load(Ordering::Acquire), gen0, "게이트를 쥔 동안 세대가 올랐다");
+        // 인계(`try_send`) 자체가 게이트 **안**이다 — 게이트를 쥔 동안에는 writer 가 push 본문을 집은 적도 없다(인계를 게이트 앞에서 하고 계상만 안에서 하면 적색).
+        assert!(s.inject_track.last_body().is_none(), "게이트를 쥔 동안 인계가 나갔다 — 인계가 게이트 밖이다");
+        drop(gate);
+        let got = pusher.join().expect("push 스레드").expect("인계");
+        assert_eq!(got, Some(PushClearedPending { prev_bytes: 3, prev_human_bytes: 0 }), "직접 send 의 계수까지 제출로 계상한다");
+        assert_eq!(counts(&s), (0, 0));
+        assert!(s.input_gen.load(Ordering::Acquire) > gen0);
+        done(&s);
+    }
+
+    /// [C8 소스 핀] 인계(`try_send`)와 계상(`set_pending_input(0)`)이 **한 `input_gate` 임계영역** 안이다 — 순서: 원장 선기록 → 노브 → 게이트 → 인계 → 계상 → 해제.
+    /// 게이트 안은 `pending_input`(leaf) 외 락 · 원장 append · 이벤트 발행 금지(락 계약 · 디스크 I/O 를 게이트 안에 넣지 않는다). 이 파일에서 `input_gate` 를 잡는 곳은 `inject_on` 하나뿐
+    /// (호출 사슬이 게이트를 쥐지 않는다는 재진입 없음 증명의 전제). 계상을 게이트 밖으로 내리면(M5) 그 사이의 직접 send 계수를 덮어쓴다.
+    #[test]
+    fn c8_inject_on_handoff_and_accounting_share_one_input_gate_source_pin() {
+        let src = include_str!("schedule.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
+        let at = prod.find("\nfn inject_on(").expect("inject_on 소실");
+        let body = &prod[at..at + prod[at..].find("\n}\n").expect("함수 끝")];
+        let code: String = body.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let ledger = code.find("record_audited(").expect("원장 선기록");
+        let knob = code.find("schedule_push_counts_submit()").expect("노브");
+        let gate = code.find("input_gate.lock()").expect("게이트");
+        let send = code.find(".try_send(").expect("인계");
+        let account = code.find("set_pending_input(0)").expect("계상");
+        let release = code.find("drop(gate)").expect("게이트 해제");
+        assert!(
+            ledger < knob && knob < gate && gate < send && send < account && account < release,
+            "순서가 깨졌다: 원장 {ledger} · 노브 {knob} · 게이트 {gate} · 인계 {send} · 계상 {account} · 해제 {release}"
+        );
+        let inside = &code[gate..release];
+        for banned in [
+            "record_audited(", "bus.publish", "pending_queue", "surfaces.lock", "roles.lock", "parser.lock", "agent_meta.lock",
+            "last_human_input", "queue_blocked",
+        ] {
+            assert!(!inside.contains(banned), "게이트 안에서 `{banned}` 를 쓴다(락 계약 위반)");
+        }
+        assert_eq!(
+            inside.matches(".lock()").count(),
+            2,
+            "게이트 안의 락은 input_gate 자신과 pending_input(leaf) 둘뿐이다: {inside}"
+        );
+        assert!(inside.contains("pending_input.lock()"), "사람 몫 정규화(leaf)가 게이트 안에 있다");
+        assert_eq!(
+            prod.matches("input_gate.lock()").count(),
+            1,
+            "이 파일에서 input_gate 를 잡는 곳은 inject_on 하나뿐이어야 한다(호출 사슬 재진입 없음의 전제)"
+        );
+        // 호출부: 계상 결과를 이벤트로만 쓴다 — 판정(H0) 뒤 · 게이트 판정은 그대로.
+        let dp = &prod[prod.find("\nfn deliver_push(").expect("deliver_push")..];
+        let dp = &dp[..dp.find("\n}\n").expect("끝")];
+        assert!(
+            dp.find("machine_direct_hold(").expect("H0 판정") < dp.find("inject_on(daemon, &surface, text)?").expect("인계 호출"),
+            "판정이 인계 뒤로 갔다"
+        );
+        assert!(dp.contains("note_push_cleared_pending(daemon, &surface, job, cleared)"), "이벤트 배선 소실");
     }
 }
