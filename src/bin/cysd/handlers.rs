@@ -2355,14 +2355,23 @@ fn draft_gate_denied_response(
     let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human.min(pending);
     // ★(0.14.43 · C5) 입력줄 가시성 — 계수 계열 사유에서만 화면을 읽는다(그 밖은 관측하지 않는다 · null). 정착 증명이 붙는 거부는 기계 제출이 진행
     //   중이라 줄이 곧 빈다 — 그때의 빈 줄은 유령이 아니므로 관측하지 않는다(처방 없음).
-    let draft_visible: Option<bool> = if !had_settle_proof
+    let (draft_visible, ghost_after_cursor): (Option<bool>, Option<bool>) = if !had_settle_proof
         && matches!(why, DraftGateDenied::PendingInput { .. } | DraftGateDenied::HumanDraft { .. })
     {
-        governance::seat_input_line_visibility(surface).0
+        governance::seat_input_line_visibility(surface)
     } else {
-        None
+        (None, None)
     };
     let ghost = draft_visible == Some(false) && pending > 0 && !had_settle_proof;
+    // ★(0.14.43 · RQFIX2 m-4) 이벤트 `remedy_code` 는 큐 쪽 처방 표(`queue_remedy` 7·8행)와 **같은 어휘**다 — 커서 뒤에 글자가 있으면(회색 제안인지 직접 쓴 글인지 사람이 가린다)
+    //   `after_cursor_text`, 아니면 `phantom_count`. 응답 문구(조건문 접미 "비어 보이면")는 그대로다.
+    let remedy_code: Option<&'static str> = ghost.then(|| {
+        if ghost_after_cursor == Some(true) {
+            governance::REMEDY_CODE_AFTER_CURSOR
+        } else {
+            governance::REMEDY_CODE_PHANTOM
+        }
+    });
     let mut payload = json!({
         "surface_ref": cys::surface_ref(surface.id),
         "kind": match kind {
@@ -2377,7 +2386,7 @@ fn draft_gate_denied_response(
         "from": verified_from.map(cys::surface_ref),
         // ★(0.14.43 · C5) 가산 키 — `remedy_code` 는 이 응답에 **처방이 붙었을 때만**(유령 계수) 값이 있다(`queue_remedy` 코드 어휘).
         "draft_visible": draft_visible,
-        "remedy_code": ghost.then_some(governance::REMEDY_CODE_PHANTOM),
+        "remedy_code": remedy_code,
     });
     if let Some(ms) = settle_hint {
         payload["settle_ms"] = json!(ms);
@@ -16808,9 +16817,23 @@ mod tests {
         assert_eq!(d12_input_counts(&ghost), before, "거부는 쓰기 0(계수 불변)");
         let ev = c5_last_denied_payload(&daemon);
         assert_eq!(ev["draft_visible"], json!(false), "{ev}");
-        assert_eq!(ev["remedy_code"], json!("phantom_count"), "{ev}");
+        // ★(RQFIX2 m-4) 커서 뒤에 글자(회색 제안인지 직접 쓴 글인지 사람이 가린다)가 있으면 큐 쪽 표(7행)와 같은 어휘 `after_cursor_text` — 응답 문구(조건문 접미)는 위에서 그대로임을 확인했다.
+        assert_eq!(ev["remedy_code"], json!("after_cursor_text"), "{ev}");
         assert_eq!(ev["reason"], json!("pending_input"), "기존 키 불변: {ev}");
         assert_eq!(ev["pending_input_bytes"], json!(3));
+
+        // ⓐ′ 커서 뒤 글자가 **없는** 유령(빈 프롬프트 한 줄) — 같은 문구 · 이벤트 code 는 `phantom_count`(큐 쪽 표 8행과 같은 어휘).
+        let blank = c5_agent_seat(&daemon, "worker-5", pid + 5, 3);
+        c5_paint_prompt(&blank, "", "");
+        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&blank));
+        d12_assert_denied(&resp, "pending_input");
+        assert_eq!(
+            resp["error"]["message"].as_str().unwrap(),
+            format!("{}{suffix}", legacy_text("pending_input")),
+            "문구는 커서 뒤 글자와 무관하게 같다(조건문 접미)"
+        );
+        let ev = c5_last_denied_payload(&daemon);
+        assert_eq!((ev["draft_visible"].as_bool(), ev["remedy_code"].as_str()), (Some(false), Some("phantom_count")), "{ev}");
 
         // ⓑ 같은 유령에 send-key Return(SubmitKey · human_draft) · C-u(CancelKey · 전용 문구) — 접두·태그 뒤 맨 끝에 같은 처방.
         //   `C-m` 은 별칭 키라 거부 문구에 실행 가능한 처방 hint 가 붙는다 — 유령 처방은 그 hint **뒤** 맨 끝이다.
@@ -26005,9 +26028,33 @@ mod tests {
             resolver_surface: Some(9),
             resolver_pid: Some(4242),
         };
-        let resp = json!({"id": 1, "ok": true, "result": {"item": item}});
+        let resp = json!({"id": 1, "ok": true, "result": {"item": item.clone()}});
         let framed = cys::wire::frame_response(&resp);
-        assert!(framed.is_ok(), "새 serde 필드가 ABI Drift 유발: {framed:?}");
+        // ★(0.14.43 · RQFIX2 K1 후속) 이 검체의 뜻은 "새 serde 필드가 **구조 Drift** 를 내지 않는다" 이다. `created_at: now_epoch()` 는 실시간 f64 라 ns·100ns 시계(리눅스·윈도우)에서는
+        //   17자리 표기의 재파싱이 1ulp 어긋나 `Err(FloatInexact)` 가 될 수 있다(K1 워커 시뮬레이션 약 22~24% · macOS 는 µs 시계라 통과) — 그것은 구조 Drift 가 아니라 부동소수 표기 정밀도 차다
+        //   (`wire.rs` 가 `FloatInexact` 로 분리했다). 그래서 `Ok` 또는 `Err(FloatInexact)` 는 허용하고 `Err(Drift)` 만 실패로 본다 — 약화가 아니라 플랫폼 의존 제거다.
+        assert!(
+            matches!(framed, Ok(_) | Err(cys::wire::AbiError::FloatInexact)),
+            "새 serde 필드가 ABI Drift 유발: {framed:?}"
+        );
+        // 대조(엄격 판 · 플랫폼 무관): 같은 항목을 **정확히 표현되는** 시각(고정 벡터)으로 싣으면 어느 시계에서도 `Ok` 여야 한다 — 구조는 이 쪽이 지킨다.
+        let mut exact = item;
+        exact.created_at = 1_700_000_000.5;
+        let exact_resp = json!({"id": 1, "ok": true, "result": {"item": exact.clone()}});
+        let exact_framed = cys::wire::frame_response(&exact_resp);
+        assert!(exact_framed.is_ok(), "고정 벡터(정확 표현 시각)는 어느 시계에서도 Ok 여야 한다: {exact_framed:?}");
+        // 대조(수용 갈래를 결정론으로 실행): 이 빌드에서 재파싱이 어긋나는 것이 알려진 f64(`inexact_frame` 의 값 — 시계가 아니라 파서의 정밀도 한계)를 시각으로 실으면
+        //   `Err(FloatInexact)` 다 — 구조 Drift 가 **아니다**. µs 시계(macOS)에서는 위 실시간 값이 늘 `Ok` 라 수용 갈래가 한 번도 돌지 않으므로 여기서 직접 돌려 본다.
+        let inexact = crate::abi_frame_tests::inexact_frame()["result"]["used_pct"].as_f64().expect("f64 시각 후보");
+        let mut skewed = exact;
+        skewed.created_at = inexact;
+        let skewed_framed = cys::wire::frame_response(&json!({"id": 1, "ok": true, "result": {"item": skewed}}));
+        assert_eq!(
+            skewed_framed,
+            Err(cys::wire::AbiError::FloatInexact),
+            "정밀도 어긋난 시각은 FloatInexact(구조 Drift 아님)여야 한다 — 이 값도 허용 판정이 받는다"
+        );
+        assert!(matches!(skewed_framed, Ok(_) | Err(cys::wire::AbiError::FloatInexact)), "수용 판정이 FloatInexact 를 받는다");
     }
 
     /// W3.6 back-pressure: 임계 초과 시 approval.backpressure 이벤트 + org.status 노출 + deny 카운터.

@@ -1866,14 +1866,29 @@ fn ghost_fallback_stderr_line(tag: &str, err: &str, sid: u64) -> Option<String> 
 ///
 /// 어디로 나가나: **stderr** 다. stdout 의 6열 행 계약(`queue_list_row` · cols[3]=preview 를 javis_boot_node 가 파싱)은 한 글자도 바뀌지 않는다
 /// — 안내는 사람이 읽는 표면이고 행 파서는 stderr 를 보지 않는다. 좌석당 1줄(같은 좌석의 여러 행은 첫 행의 값 = 좌석 단위 값),
-/// 첫 등장 순서 보존. `blocked_by` 가 null 인 행(막히지 않은 좌석·만료·복원 행)은 건너뛴다. `(Ns)` = 막힌 지 N 초(`blocked_since` 벽시계 ·
+/// 첫 등장 순서 보존. `blocked_by` 가 null 이고 `remedy_code`·`remedy` 도 없는 행(막히지 않은 좌석·만료·복원 행)은 건너뛴다. `(Ns)` = 막힌 지 N 초(`blocked_since` 벽시계 ·
 /// 표시용 — 시계 역행은 0 으로 접는다). `remedy` 키가 없으면(구 데몬) 화살표 뒷부분만 생략한다 — 줄바꿈·탭은 공백으로 접는다.
+/// ★(RQFIX2 m-5) **사유가 기록되지 않은 일시정지 좌석**(`blocked_by` null 이어도 `remedy_code`/`remedy` 가 있다 — 일시정지 중에는 틱이 사유를 갱신하지 않는다)도 한 줄을 낸다:
+/// `# surface:N <remedy_code> → <조치 문장>`(기존 줄과 같은 꼴 · `blocked_by=…` 자리에 코드). 기존 줄(`blocked_by` 가 있는 행)은 바이트 불변이다 — kill-switch 문장이 권하는
+/// "해제 전에 `cys queue list` 로 묵은 항목을 확인한다" 가 이 명령의 안내에서 보이게 한다.
 fn queue_blocked_notice_lines(entries: &[Value], now: f64) -> Vec<String> {
     let fold = |s: &str| s.replace(['\n', '\r', '\t'], " ");
     let mut seen: Vec<&str> = Vec::new();
     let mut out = Vec::new();
     for e in entries {
         let Some(blocked_by) = e["blocked_by"].as_str() else {
+            // ★(RQFIX2 m-5) 사유 무기록 일시정지 좌석 — 처방(코드·문장)이 있으면 한 줄. 둘 다 없으면 막히지 않은 행이다.
+            let (code, remedy) = (e["remedy_code"].as_str(), e["remedy"].as_str());
+            if code.is_none() && remedy.is_none() {
+                continue;
+            }
+            let sref = e["surface_ref"].as_str().unwrap_or("?");
+            if seen.contains(&sref) {
+                continue;
+            }
+            seen.push(sref);
+            let remedy = remedy.map(|r| format!(" → {}", fold(r))).unwrap_or_default();
+            out.push(format!("# {sref} {}{remedy}", fold(code.unwrap_or("-"))));
             continue;
         };
         let sref = e["surface_ref"].as_str().unwrap_or("?");
@@ -1941,6 +1956,59 @@ mod queue_list_row_tests {
         // 막힌 좌석이 없으면 안내도 없다.
         assert!(queue_blocked_notice_lines(&[], 1.0).is_empty());
         assert!(queue_blocked_notice_lines(&entries[1..2], 1.0).is_empty());
+    }
+
+    /// ★(0.14.43 · RQFIX2 m-5) 사유가 기록되지 않은 일시정지 좌석(`blocked_by` null 인데 `remedy_code`/`remedy` 가 있다)도 한 줄을 낸다 — `# surface:N <remedy_code> → <조치 문장>`.
+    /// 기존 줄(`blocked_by` 가 있는 행)은 바이트 불변이고, 막히지 않은 행(`remedy` 도 null)은 여전히 건너뛴다. 좌석당 한 줄(같은 좌석의 여러 행은 첫 행) · 첫 등장 순서 보존 · 줄바꿈·탭 접기.
+    #[test]
+    fn rqfix2_m5_notice_line_for_a_paused_seat_without_a_recorded_reason() {
+        let paused = |index: u64| {
+            serde_json::json!({
+                "surface_ref": "surface:6", "index": index, "bytes": 4, "preview": "동결", "id": format!("p{index}"), "age_secs": 9,
+                "blocked_by": null, "blocked_since": null,
+                "remedy_code": "paused", "remedy": "kill-switch 동결 중 — 정체가 아니라 동결이다.\n해제는 오너(사람)가 한다 · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지",
+                "draft_visible": null, "ghost_after_cursor": null,
+            })
+        };
+        let blocked = serde_json::json!({
+            "surface_ref": "surface:3", "index": 0, "bytes": 12, "preview": "보고", "id": "q1", "age_secs": 45,
+            "blocked_by": "input_pending(입력줄에 미제출 입력)", "blocked_since": 1000.0,
+            "remedy_code": "phantom_count", "remedy": "입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) · LLM 에이전트는 자동 조치 금지",
+            "draft_visible": false, "ghost_after_cursor": false,
+        });
+        let free = serde_json::json!({
+            "surface_ref": "surface:4", "index": 0, "bytes": 3, "preview": "x", "id": "q9", "age_secs": 1,
+            "blocked_by": null, "blocked_since": null, "remedy_code": null, "remedy": null, "draft_visible": null, "ghost_after_cursor": null,
+        });
+        let entries = vec![paused(0), blocked.clone(), free.clone(), paused(1)];
+        let lines = queue_blocked_notice_lines(&entries, 1030.4);
+        assert_eq!(
+            lines,
+            vec![
+                "# surface:6 paused → kill-switch 동결 중 — 정체가 아니라 동결이다. 해제는 오너(사람)가 한다 · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지"
+                    .to_string(),
+                "# surface:3 blocked_by=input_pending(입력줄에 미제출 입력) (30s) → 입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) · LLM 에이전트는 자동 조치 금지"
+                    .to_string(),
+            ],
+            "무기록 동결 좌석 한 줄(좌석당 1줄 · 첫 등장 순서) + 기존 줄 바이트 불변 + 막히지 않은 좌석 없음"
+        );
+        // 기존 줄은 이 가산이 없던 때와 바이트 동일하다 — 기록된 사유가 있는 행만 넣어 대조.
+        assert_eq!(
+            queue_blocked_notice_lines(&[blocked], 1030.4),
+            vec![lines[1].clone()],
+            "기존 줄 서식(blocked_by=… (Ns) → …)은 불변"
+        );
+        // 코드만 있고 문장이 없는 행(구 데몬 스큐) → 화살표 없이 코드만 · 둘 다 없으면 건너뛴다.
+        let code_only = serde_json::json!({"surface_ref": "surface:8", "blocked_by": null, "remedy_code": "paused"});
+        assert_eq!(queue_blocked_notice_lines(&[code_only], 1.0), vec!["# surface:8 paused".to_string()]);
+        let neither = serde_json::json!({"surface_ref": "surface:8", "blocked_by": null, "remedy_code": null, "remedy": null});
+        assert!(queue_blocked_notice_lines(&[neither], 1.0).is_empty());
+        // 한 줄 불변식 — 문장의 개행·탭은 공백으로 접힌다.
+        assert!(lines.iter().all(|l| !l.contains('\n') && !l.contains('\t')), "{lines:?}");
+        // stdout 6열 행 계약은 그대로다(안내는 stderr 만).
+        for e in &entries {
+            assert_eq!(queue_list_row(e).split('\t').count(), 6, "{e}");
+        }
     }
 
     /// ★(0.14.43 · RQFIX I-8) `--queued` 폴백 뒤 **유령 계수 처방 줄**(stderr) — 데몬 거부 문구 끝에 유령 처방 접미(정의처 `src/lib.rs` 한 곳)가 있을 때만 한 줄이 나오고,
