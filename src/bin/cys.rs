@@ -18298,8 +18298,9 @@ fn agy_statusline_human_line(v: &Value) -> String {
     parts.join(" · ")
 }
 
-/// ★0.14.43(B6) `cys usage-accounts` 텍스트 모드의 마지막 안내(stderr) — 이 명령은 **이 데몬 하나**의 계정만 보여 준다(부서 데몬 계정은 Control Center 의 병합 뷰).
-const USAGE_ACCOUNTS_SCOPE_NOTE: &str = "# 본부 데몬 기준 — 부서 데몬의 계정은 Control Center > Live 에서 합쳐 봅니다";
+/// ★0.14.43(B6) `cys usage-accounts` 텍스트 모드의 마지막 안내(stderr) — 이 명령은 **연결된 데몬 하나**의 계정만 보여 준다(본부 좌석이면 본부 데몬 · 부서 좌석이면 부서 데몬 — 다른 데몬의 계정은 Control Center 의 병합 뷰).
+/// (B1b 정정: 종전 문구는 본부 데몬만 가리켜 부서 좌석에서 실행하면 사실이 아니었다.)
+const USAGE_ACCOUNTS_SCOPE_NOTE: &str = "# 연결된 데몬 하나의 계정입니다 — 다른 데몬(본부·부서)의 계정은 Control Center > Live 에서 합쳐 봅니다";
 /// 관측 나이가 이 초를 **넘으면** `오래됨` 을 덧붙인다(경보 신선도 규칙의 기본 상한 1800초와 같다 — 데몬 `accounts::ACCOUNT_ALERT_STALE_SECS_DEFAULT`).
 const USAGE_ACCOUNTS_OLD_SECS: f64 = 1800.0;
 
@@ -40965,11 +40966,11 @@ mod usage_accounts_line_tests {
         assert!(out.ends_with('\n') && !out.contains('#'), "stdout 에 안내가 섞였다: {out:?}");
         assert_eq!(lines[0], usage_accounts_line(&r["accounts"][0], NOW));
         assert_eq!(lines[1], usage_accounts_line(&r["accounts"][1], NOW));
-        assert_eq!(err, "# 본부 데몬 기준 — 부서 데몬의 계정은 Control Center > Live 에서 합쳐 봅니다\n", "stderr 안내 문구");
+        assert_eq!(err, "# 연결된 데몬 하나의 계정입니다 — 다른 데몬(본부·부서)의 계정은 Control Center > Live 에서 합쳐 봅니다\n", "stderr 안내 문구");
         // 계정이 없어도(빈 배열·키 부재) stdout 은 비고 안내만 stderr 로
         for empty in [json!({"accounts": []}), json!({})] {
             let (out, err) = usage_accounts_output(&empty, false, NOW);
-            assert_eq!((out.as_str(), err.starts_with("# 본부 데몬 기준")), ("", true));
+            assert_eq!((out.as_str(), err.starts_with("# 연결된 데몬 하나의 계정입니다")), ("", true));
         }
         // --json: 종전 `println!("{}", to_string_pretty(&r))` 와 바이트 동일 · stderr 없음(스크립트가 `2>&1` 로 받아도 JSON 이 깨지지 않는다)
         let (out, err) = usage_accounts_output(&r, true, NOW);
@@ -40992,5 +40993,18 @@ mod usage_accounts_line_tests {
         let f = &prod[prod.find("fn usage_accounts_output(").expect("순수 출력 함수")..];
         let f = &f[..f.find("\n}\n").expect("함수 끝")];
         assert!(f.contains("USAGE_ACCOUNTS_SCOPE_NOTE") && f.contains("as_json"), "안내 상수 또는 --json 분기 소실");
+    }
+
+    /// ★B1b 정정: 안내 문구는 특정 데몬(본부)을 단정하지 않는다 — 부서 좌석에서 실행하면 연결된 소켓이 부서 데몬이다. 정확한 문구를 핀하고 · 옛 문구가 프로덕션 소스에 남아 있지 않다.
+    #[test]
+    fn usage_accounts_scope_note_names_no_specific_daemon() {
+        assert_eq!(
+            USAGE_ACCOUNTS_SCOPE_NOTE,
+            "# 연결된 데몬 하나의 계정입니다 — 다른 데몬(본부·부서)의 계정은 Control Center > Live 에서 합쳐 봅니다"
+        );
+        assert!(USAGE_ACCOUNTS_SCOPE_NOTE.starts_with("# ") && !USAGE_ACCOUNTS_SCOPE_NOTE.contains('\n'), "안내는 `# ` 로 시작하는 한 줄이다");
+        let src = include_str!("cys.rs");
+        let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+        assert!(!prod.contains("본부 데몬 기준"), "옛 안내 문구가 프로덕션에 남아 있다(부서 좌석에서 실행하면 틀린 말)");
     }
 }

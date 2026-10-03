@@ -689,11 +689,13 @@ pub fn seed_known(daemon: &Arc<Daemon>) {
             let mut st = daemon.accounts.lock().unwrap();
             apply_discovered(&mut st, &home, found);
         }
-        // ★0.14.43(B1): 별명 표 부트 판독 1회(파일 IO 는 락 밖 · 실패·비정규 파일은 별명 없음) — 이후는 `local_json` 이 파일 mtime 이 바뀔 때만(60초 하한) 다시 읽는다. 선언 계정 판독은 아래 종전 그대로.
+        // ★0.14.43(B1): 별명 표 부트 판독 1회(파일 IO 는 락 밖 · 실패·비정규 파일은 별명 없음) — 이후는 `local_json` 이 파일 mtime 이 바뀔 때만(60초 하한) 다시 읽는다. 선언 계정 파싱·적재는 아래 종전 그대로.
         refresh_aliases(daemon, Some(&home), crate::state::now_epoch());
         // 선언 계정(~/.cys/accounts.json — pack 밖: pack 스윕/치유 사정권 회피)
+        // ★0.14.43(B1b): 이 판독은 소켓 bind **전**에 동기로 돈다 — 종전의 무제한 문자열 판독은 이 경로가 FIFO 면 열기에서 영원히 막혀 부트 체인 전체가 섰다. 안전 판독(일반 파일만 ·
+        //   1MiB 상한)으로 바꿨고, 실패(부재·FIFO·디렉터리·초과·읽기 오류·UTF-8 아님)는 종전의 `Err` 와 같게 '선언 계정 없음'이다. 아래 파싱·적재는 무변경(같은 JSON → 같은 뷰).
         let decl = home.join(".cys/accounts.json");
-        if let Ok(s) = std::fs::read_to_string(&decl) {
+        if let Some(s) = read_declared_accounts_text(&decl) {
             if let Ok(v) = serde_json::from_str::<Value>(&s) {
                 let mut st = daemon.accounts.lock().unwrap();
                 for a in v.get("accounts").and_then(|x| x.as_array()).into_iter().flatten() {
@@ -891,9 +893,10 @@ fn seed_discovered(st: &mut AccountsState, home: &Path) {
 /// accounts.json의 adapter:"cmd" 계정 — 주기 실행해 rate JSON을 흡수하는 범용 풀 어댑터.
 /// 출력 계약: `[{"label":"5h","used_pct":12.3,"resets_at":1234.0}, …]`. grok/GLM CLI 합류 지점.
 pub fn spawn_custom_adapters(daemon: Arc<Daemon>) {
-    let Some(home) = dirs::home_dir() else { return };
+    let Some(home) = account_home() else { return };
     let decl = home.join(".cys/accounts.json");
-    let Ok(s) = std::fs::read_to_string(&decl) else { return };
+    // ★0.14.43(B1b): `seed_known` 바로 다음의 부트 단계(소켓 bind 전 · 동기) — 같은 파일이라 같은 안전 판독을 쓴다(FIFO 면 seed_known 을 고쳐도 여기서 부트가 선다). 실패는 종전처럼 어댑터 없음.
+    let Some(s) = read_declared_accounts_text(&decl) else { return };
     let Ok(v) = serde_json::from_str::<Value>(&s) else { return };
     for a in v.get("accounts").and_then(|x| x.as_array()).into_iter().flatten() {
         let (Some(provider), Some(cmd)) = (
@@ -1866,6 +1869,9 @@ const ALIAS_CHECK_SECS: f64 = 60.0;
 const ALIAS_FILE_MAX_BYTES: u64 = 64 * 1024;
 /// 별명 길이 상한(char 기준) — 사이드바·툴팁을 밀지 못하게(화면의 `acctAlias` 도 같은 24자).
 const ALIAS_MAX_CHARS: usize = 24;
+/// ★0.14.43(B1b): 선언 계정 파일(`~/.cys/accounts.json` 의 `accounts` 배열)의 크기 상한(바이트) — **별명의 64KiB([`ALIAS_FILE_MAX_BYTES`])와 별개**다. 정상 파일의 종전 동작(상한 없는 판독)을 바꾸지 않을
+/// 만큼 넉넉하게(1MiB) 두되, 병적 입력(거대·무한 파일)이 소켓 bind **전**의 부트 체인을 붙들지 못하게 한다.
+const DECLARED_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// 이 구역의 파일 판독(알려진 프로필 열거 · 별명 파일)이 보는 홈 — 운영은 `dirs::home_dir()` 하나다. 시험은 [`test_home`] 이음매로 **이 스레드에서만** 임시 홈으로 바꾼다.
 fn account_home() -> Option<PathBuf> {
@@ -1884,17 +1890,18 @@ pub(crate) mod test_home {
     thread_local! {
         static HOME: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     }
-    pub(crate) struct Guard;
+    /// 가드가 떨어지면 **이전 값**으로 되돌린다(중첩해서 걸어도 바깥 가드의 홈이 살아 있다).
+    pub(crate) struct Guard(Option<PathBuf>);
     pub(crate) fn set(h: &Path) -> Guard {
-        HOME.with(|c| *c.borrow_mut() = Some(h.to_path_buf()));
-        Guard
+        Guard(HOME.with(|c| c.borrow_mut().replace(h.to_path_buf())))
     }
     pub(crate) fn get() -> Option<PathBuf> {
         HOME.with(|c| c.borrow().clone())
     }
     impl Drop for Guard {
         fn drop(&mut self) {
-            HOME.with(|c| *c.borrow_mut() = None);
+            let prev = self.0.take();
+            HOME.with(|c| *c.borrow_mut() = prev);
         }
     }
 }
@@ -1956,9 +1963,10 @@ fn alias_file_sig(path: &Path) -> Option<(f64, u64)> {
     Some((mtime, md.len()))
 }
 
-/// 별명 파일 판독 — **락 밖 전용**. 여는 것도 막히지 않게 연다(unix `O_NONBLOCK` — 일반 파일 읽기에는 영향이 없다)고, 연 뒤 fstat 으로 **일반 파일**·크기를 다시 확인한다
-/// (stat 과 open 사이에 FIFO 로 바뀌는 경쟁 차단 — [`read_identity_file`] 과 같은 규율). None = 열기·읽기 실패·비정규·초과(호출부가 '별명 없음 · 다음 확인에 재시도'로 읽는다).
-fn read_alias_file(f: &Path) -> Option<Vec<u8>> {
+/// ★일반 파일 안전 판독(공용 · **락 밖 전용**) — 여는 것도 막히지 않게 연다(unix `O_NONBLOCK` — 일반 파일 읽기에는 영향이 없다)고, 연 뒤 fstat 으로 **일반 파일**·크기(`max_bytes`)를 다시 확인한다
+/// (stat 과 open 사이에 FIFO 로 바뀌는 경쟁 차단 — [`read_identity_file`] 과 같은 규율). FIFO·장치·디렉터리는 읽지 않는다(FIFO 는 여는 순간 쓰는 쪽이 올 때까지 막힌다).
+/// None = 열기·읽기 실패·비정규·`max_bytes` 초과 — 호출부가 각자의 '없음'으로 읽는다(별명: '별명 없음 · 다음 확인에 재시도' · 선언 계정: '선언 계정 없음').
+fn read_regular_file_capped(f: &Path, max_bytes: u64) -> Option<Vec<u8>> {
     use std::io::Read;
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -1969,15 +1977,26 @@ fn read_alias_file(f: &Path) -> Option<Vec<u8>> {
     }
     let file = opts.open(f).ok()?;
     let md = file.metadata().ok()?;
-    if !md.is_file() || md.len() > ALIAS_FILE_MAX_BYTES {
+    if !md.is_file() || md.len() > max_bytes {
         return None;
     }
     let mut buf = Vec::new();
-    file.take(ALIAS_FILE_MAX_BYTES + 1).read_to_end(&mut buf).ok()?;
-    if buf.len() as u64 > ALIAS_FILE_MAX_BYTES {
+    file.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > max_bytes {
         return None;
     }
     Some(buf)
+}
+
+/// 별명 파일 판독 — [`read_regular_file_capped`] 에 별명 상한(64KiB)을 준다.
+fn read_alias_file(f: &Path) -> Option<Vec<u8>> {
+    read_regular_file_capped(f, ALIAS_FILE_MAX_BYTES)
+}
+
+/// ★0.14.43(B1b): 선언 계정 파일 본문 — 부트 체인(소켓 bind **전**에 동기로 도는 `seed_known`·`spawn_custom_adapters`)이 쓴다. 종전의 무제한 문자열 판독은 FIFO 에서 영원히 막혀 부트 전체가 섰다 —
+/// 이제 일반 파일만(상한 [`DECLARED_FILE_MAX_BYTES`] 1MiB) 읽고, 부재·FIFO·디렉터리·초과·읽기 오류·UTF-8 아님은 모두 None = 종전의 `Err` 와 같은 '선언 계정 없음'이다(조용히). 락 밖 전용.
+fn read_declared_accounts_text(decl: &Path) -> Option<String> {
+    String::from_utf8(read_regular_file_capped(decl, DECLARED_FILE_MAX_BYTES)?).ok()
 }
 
 /// 별명 표 갱신 — 부트(`seed_known`)에서 1회 · 이후 `local_json` 이 부른다. ① **60초 하한**: 마지막 확인에서 60초가 안 지났으면 stat 도 하지 않고 돌아온다(시계 역행은 만료) ·
@@ -4368,6 +4387,305 @@ mod tests {
                     assert!(!text.contains(bad), "{name} 가 별명 표({bad})를 참조한다 — 별명은 표시 전용이다");
                 }
             }
+        }
+
+        // ───────────────────────── ★0.14.43(B1b) — 선언 계정 판독의 안전 판독(부트 체인) ─────────────────────────
+        // `seed_known`·`spawn_custom_adapters` 는 소켓 bind **전**에 동기로 돈다(main.rs). 종전의 무제한 문자열 판독은 `~/.cys/accounts.json` 이 FIFO 면 열기에서 영원히 막혀 부트 체인 전체가 섰다.
+        // 안전 판독: 일반 파일만(unix O_NONBLOCK + fstat) · 상한 1MiB(별명의 64KiB 와 별개) · 실패는 전부 '선언 계정 없음'(종전 `Err` 와 같다 · 파싱·적재는 무변경).
+        // 픽스처 크기는 **리터럴**로 센다(상수를 바꾼 돌연변이가 거대한 픽스처를 만들지 않게). 합성 provider 이름(grokb1b 등)만 쓴다.
+
+        const MIB: usize = 1024 * 1024;
+
+        /// 선언 계정 한 건 + `pad` 로 총 `total` 바이트를 맞춘 JSON 본문. `extra` 는 `accounts` 와 같은 객체에 들어가는 추가 필드(예: `"aliases":{…},`).
+        fn declared_body(entry: &str, extra: &str, total: usize) -> String {
+            let stem = format!(r#"{{"accounts":[{entry}],{extra}"pad":""}}"#);
+            assert!(stem.len() <= total, "픽스처가 너무 작다: {} > {total}", stem.len());
+            let body = format!(r#"{{"accounts":[{entry}],{extra}"pad":"{}"}}"#, "p".repeat(total - stem.len()));
+            assert_eq!(body.len(), total, "픽스처 크기 계산 오류");
+            body
+        }
+
+        const GROK_NONE: &str = r#"{"provider":"grokb1b","label":"Grok B1b","adapter":"none"}"#;
+        const GROK_CMD: &str = r#"{"provider":"grokb1b","label":"Grok B1b","adapter":"cmd","cmd":"true"}"#;
+
+        /// 임시 홈(선언 계정 파일 `body` 가 있으면 그 내용으로)에서 부트 시드를 돌리고 (데몬 · 데몬 폴더 · 홈 · 홈 가드) 를 돌려준다 — 이 스레드의 `account_home()` 만 바뀐다(가드를 쥐고 있는 동안).
+        fn boot_seed(tag: &str, body: Option<&[u8]>) -> (Arc<Daemon>, PathBuf, PathBuf, test_home::Guard) {
+            let dir = tmp(&format!("b1b-{tag}-daemon"));
+            let home = tmp(&format!("b1b-{tag}-home"));
+            if let Some(b) = body {
+                put_alias_bytes(&home, b, 1);
+            }
+            let guard = test_home::set(&home);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            seed_known(&d);
+            (d, dir, home, guard)
+        }
+
+        /// 선언 계정 뷰 표 — (provider, account_id) → (라벨, 어댑터 여부 · 프로필 수 · 관측 고장 코드). 선언 계정만 있는 임시 홈이면 전체 뷰와 같다.
+        fn view_table(d: &Arc<Daemon>) -> BTreeMap<(String, String), (String, bool, usize, Option<String>)> {
+            let st = d.accounts.lock().unwrap();
+            st.views
+                .iter()
+                .map(|(k, v)| ((k.provider.clone(), k.account_id.clone()), (v.label.clone(), v.adapter, v.profiles.len(), v.source_error.clone())))
+                .collect()
+        }
+
+        /// 종전(B1b 이전) 선언 계정 적재 — 무제한 문자열 판독 + 같은 파싱·적재. 이 검체의 **차분 기준**이다(본문은 종전 코드 그대로 · 새 판독이 같은 JSON 에서 같은 뷰를 만드는지 잰다).
+        fn old_declared_views(home: &Path) -> BTreeMap<(String, String), (String, bool, usize, Option<String>)> {
+            let mut st = AccountsState::default();
+            let decl = home.join(".cys/accounts.json");
+            if let Ok(s) = std::fs::read_to_string(&decl) {
+                if let Ok(v) = serde_json::from_str::<Value>(&s) {
+                    for a in v.get("accounts").and_then(|x| x.as_array()).into_iter().flatten() {
+                        let Some(provider) = a.get("provider").and_then(|x| x.as_str()) else {
+                            continue;
+                        };
+                        let label = a.get("label").and_then(|x| x.as_str()).unwrap_or(provider).to_string();
+                        let adapter = a.get("adapter").and_then(|x| x.as_str()).unwrap_or("none") != "none";
+                        let key = AccountKey { provider: provider.into(), account_id: "default".into() };
+                        st.views.entry(key.clone()).or_insert_with(|| AccountView {
+                            key,
+                            label,
+                            plan: None,
+                            profiles: BTreeSet::new(),
+                            rate: Vec::new(),
+                            updated_at: 0.0,
+                            source: String::new(),
+                            adapter,
+                            source_error: None,
+                        });
+                    }
+                }
+            }
+            st.views
+                .iter()
+                .map(|(k, v)| ((k.provider.clone(), k.account_id.clone()), (v.label.clone(), v.adapter, v.profiles.len(), v.source_error.clone())))
+                .collect()
+        }
+
+        /// 임시 홈의 `spawn_custom_adapters` 를 **돌지 않는 런타임** 안에서 부르고 살아 있는 어댑터 태스크 수를 돌려준다(런타임을 구동하지 않으므로 `sh` 는 뜨지 않는다 — 스폰된 태스크는 한 번도 폴링되지 않는다).
+        fn adapter_tasks(d: &Arc<Daemon>, home: &Path) -> usize {
+            let _h = test_home::set(home);
+            let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let _g = rt.enter();
+            spawn_custom_adapters(d.clone());
+            rt.metrics().num_alive_tasks()
+        }
+
+        /// ★(a) 일반 파일 — 종전과 같은 선언 계정 뷰(차분): 라벨 기본값(provider) · 어댑터 기본값(none) · `cmd` 어댑터 · provider 없음/문자열 아님/객체 아님은 건너뜀 · 중복 provider 는 첫 항목 ·
+        /// 문자열이 아닌 라벨은 무시. 같은 JSON 을 종전 코드(무제한 문자열 판독)로 적재한 뷰와 **같다**.
+        #[test]
+        fn b1b_declared_accounts_views_match_the_old_loader_on_a_regular_file() {
+            let body = r#"{"accounts":[
+                {"provider":"grokb1b","label":"Grok B1b","adapter":"none"},
+                {"provider":"glmb1b"},
+                {"provider":"cmdb1b","label":"Cmd B1b","adapter":"cmd","cmd":"true","interval_secs":120},
+                {"label":"제공자 없음"},
+                {"provider":7,"label":"숫자 제공자"},
+                {"provider":"dupb1b","label":"첫째"},
+                {"provider":"dupb1b","label":"둘째","adapter":"cmd"},
+                "문자열 항목",
+                null,
+                {"provider":"labelnumb1b","label":5}
+              ],"aliases":{"Grok B1b":"그록"}}"#;
+            let (d, dir, home, _h) = boot_seed("a", Some(body.as_bytes()));
+            let got = view_table(&d);
+            assert_eq!(got, old_declared_views(&home), "새 안전 판독이 종전과 다른 선언 계정 뷰를 만들었다");
+            // 차분 기준이 헛돌지 않게 값도 직접 핀한다
+            let k = |p: &str| (p.to_string(), "default".to_string());
+            assert_eq!(got.len(), 5, "건너뛰어야 할 항목이 적재됐거나 적재해야 할 항목이 빠졌다: {got:?}");
+            assert_eq!(got[&k("grokb1b")], ("Grok B1b".to_string(), false, 0, None));
+            assert_eq!(got[&k("glmb1b")], ("glmb1b".to_string(), false, 0, None), "라벨 기본값 = provider · 어댑터 기본값 none");
+            assert_eq!(got[&k("cmdb1b")], ("Cmd B1b".to_string(), true, 0, None));
+            assert_eq!(got[&k("dupb1b")].0, "첫째", "중복 provider 는 첫 항목이 이긴다(종전 or_insert)");
+            assert_eq!(got[&k("labelnumb1b")].0, "labelnumb1b", "문자열이 아닌 라벨은 무시");
+            // 같은 파일의 별명도 읽혔다(두 판독이 한 파일을 나눠 쓴다)
+            assert_eq!(alias_snap(&d, "Grok B1b").2, Some("그록".to_string()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// ★(b) 선언 계정 파일이 **FIFO** 여도 부트 시드(`seed_known`)가 멈추지 않는다 — 5초 안에 끝나고 선언 계정 0 · 별명 0 · 발견(프로필 폴더)은 그대로 진행된다. (종전 판독이면 열기에서 영원히 막힌다.)
+        #[cfg(unix)]
+        #[test]
+        fn b1b_fifo_accounts_json_does_not_stop_the_boot_seed() {
+            let dir = tmp("b1b-b-daemon");
+            let home = tmp("b1b-b-home");
+            b3_login(&home, ".cys/claude-b1b", "u-b1b-a", "a-b1b@example.test", 1); // 발견 대상 하나 — 부트가 계속 진행됐는지의 증거
+            let fifo = home.join(".cys/accounts.json");
+            mkfifo(&fifo);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let (tx, rx) = std::sync::mpsc::channel();
+            {
+                let (d, home) = (d.clone(), home.clone());
+                std::thread::spawn(move || {
+                    let _h = test_home::set(&home);
+                    seed_known(&d);
+                    let _ = tx.send(local_json(&d, crate::state::now_epoch()));
+                });
+            }
+            let out = rx.recv_timeout(std::time::Duration::from_secs(5));
+            release_fifo(&fifo);
+            let rows = out.expect("선언 계정 파일이 FIFO 인데 부트 시드(seed_known)가 멈췄다(소켓 bind 전 부트 체인 정지)");
+            assert_eq!(rows.as_array().map(Vec::len), Some(1), "FIFO 선언 계정 파일에서 선언 계정이 생겼다(또는 발견이 빠졌다): {rows}");
+            assert_eq!(row(&rows, "u-b1b-a")["alias"], Value::Null, "FIFO 에서 별명이 실렸다");
+            {
+                let st = d.accounts.lock().unwrap();
+                assert!(st.alias.table.is_empty() && st.alias.reads == 0, "FIFO 를 열어 읽으려 했다(별명)");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// ★(b') 같은 FIFO 에서 `spawn_custom_adapters`(부트에서 `seed_known` 바로 다음 단계 · 같은 파일을 읽는다)도 멈추지 않는다 — 5초 안에 끝나고 어댑터 태스크 0.
+        #[cfg(unix)]
+        #[test]
+        fn b1b_fifo_accounts_json_does_not_stop_spawn_custom_adapters() {
+            let dir = tmp("b1b-b2-daemon");
+            let home = tmp("b1b-b2-home");
+            let fifo = home.join(".cys/accounts.json");
+            mkfifo(&fifo);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let (tx, rx) = std::sync::mpsc::channel();
+            {
+                let (d, home) = (d.clone(), home.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(adapter_tasks(&d, &home));
+                });
+            }
+            let out = rx.recv_timeout(std::time::Duration::from_secs(5));
+            release_fifo(&fifo);
+            assert_eq!(out.expect("선언 계정 파일이 FIFO 인데 spawn_custom_adapters 가 멈췄다(소켓 bind 전 부트 체인 정지)"), 0, "FIFO 에서 어댑터가 떴다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// ★(c) 상한 1MiB — 정확히 1MiB 는 적재 · 1바이트 넘으면 선언 계정 0(별명 0 · 어댑터 0). 두 판독(`seed_known`·`spawn_custom_adapters`)이 같은 상한을 쓴다.
+        #[test]
+        fn b1b_declared_accounts_file_over_one_mebibyte_is_no_declared_accounts() {
+            let at = declared_body(GROK_CMD, "", MIB);
+            let over = declared_body(GROK_CMD, "", MIB + 1);
+            // 정확히 1MiB — 양성 대조
+            {
+                let (d, dir, home, _h) = boot_seed("c1", Some(at.as_bytes()));
+                assert_eq!(view_table(&d).keys().cloned().collect::<Vec<_>>(), vec![("grokb1b".to_string(), "default".to_string())], "정확히 1MiB 파일을 거절했다");
+                assert_eq!(adapter_tasks(&d, &home), 1, "정확히 1MiB 파일의 cmd 어댑터가 뜨지 않았다");
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&home);
+            }
+            // 1MiB + 1바이트
+            {
+                let (d, dir, home, _h) = boot_seed("c2", Some(over.as_bytes()));
+                assert!(view_table(&d).is_empty(), "1MiB 를 넘는 파일에서 선언 계정이 적재됐다: {:?}", view_table(&d));
+                assert_eq!(adapter_tasks(&d, &home), 0, "1MiB 를 넘는 파일에서 cmd 어댑터가 떴다");
+                assert!(d.accounts.lock().unwrap().alias.table.is_empty());
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&home);
+            }
+        }
+
+        /// ★(d) 두 상한은 **따로**다 — 64KiB 초과·1MiB 이하 파일은 선언 계정이 적재되고(1MiB 상한) 별명은 없다(64KiB 상한). 같은 파일을 64KiB 이하로 줄이면 별명이 나타난다(차이는 크기뿐).
+        #[test]
+        fn b1b_declared_accounts_between_the_two_caps_load_while_aliases_do_not() {
+            let big = declared_body(GROK_NONE, r#""aliases":{"Grok B1b":"그록"},"#, 100 * 1024);
+            assert!(big.len() > 64 * 1024 && big.len() <= MIB);
+            let (d, dir, home, _h) = boot_seed("d", Some(big.as_bytes()));
+            assert_eq!(view_table(&d).keys().cloned().collect::<Vec<_>>(), vec![("grokb1b".to_string(), "default".to_string())], "64KiB 를 넘는 파일의 선언 계정이 적재되지 않았다(상한이 별명과 같아졌다)");
+            assert_eq!(alias_snap(&d, "Grok B1b"), (1, 0, None), "64KiB 를 넘는 파일에서 별명이 읽혔다(상한이 선언 계정과 같아졌다)");
+            // 같은 내용을 64KiB 이하로 줄이면 별명이 나타난다
+            let boot_at = d.accounts.lock().unwrap().alias.checked_at.expect("부트 확인 시각");
+            put_aliases(&home, &declared_body(GROK_NONE, r#""aliases":{"Grok B1b":"그록"},"#, 2 * 1024), 2);
+            refresh_aliases(&d, Some(&home), boot_at + 61.0);
+            assert_eq!(alias_snap(&d, "Grok B1b"), (2, 1, Some("그록".to_string())), "파일을 줄였는데 별명이 나타나지 않았다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 읽을 수 없는 선언 계정 파일(디렉터리 · JSON 오류 · 빈 파일 · 루트가 배열 · `accounts` 가 배열 아님 · **UTF-8 아님**) = 선언 계정 없음(종전 `Err`/파싱 실패와 같다) — 두 판독 모두.
+        /// UTF-8 아님 픽스처는 손실 변환(`from_utf8_lossy`)하면 유효한 선언이 되도록 만들었다(엄격 판독이 종전 의미임을 핀).
+        #[test]
+        fn b1b_unreadable_declared_files_mean_no_declared_accounts() {
+            let mut bad_utf8 = br#"{"accounts":[{"provider":"grokb1b","label":""#.to_vec();
+            bad_utf8.push(0xff);
+            bad_utf8.extend_from_slice(br#"","adapter":"cmd","cmd":"true"}]}"#);
+            let cases: Vec<(&str, Option<Vec<u8>>)> = vec![
+                ("디렉터리", None),
+                ("JSON 오류", Some(b"{not json".to_vec())),
+                ("빈 파일", Some(Vec::new())),
+                ("루트가 배열", Some(b"[]".to_vec())),
+                ("accounts 가 배열 아님", Some(br#"{"accounts":{"provider":"grokb1b","adapter":"cmd","cmd":"true"}}"#.to_vec())),
+                ("UTF-8 아님", Some(bad_utf8)),
+            ];
+            for (i, (what, body)) in cases.into_iter().enumerate() {
+                let tag = format!("e{i}");
+                let dir = tmp(&format!("b1b-{tag}-daemon"));
+                let home = tmp(&format!("b1b-{tag}-home"));
+                match &body {
+                    Some(b) => put_alias_bytes(&home, b, 1),
+                    None => std::fs::create_dir_all(home.join(".cys/accounts.json")).unwrap(), // 디렉터리
+                }
+                let _h = test_home::set(&home);
+                let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+                seed_known(&d);
+                assert!(view_table(&d).is_empty(), "{what}: 선언 계정이 적재됐다: {:?}", view_table(&d));
+                assert_eq!(adapter_tasks(&d, &home), 0, "{what}: cmd 어댑터가 떴다");
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&home);
+            }
+        }
+
+        /// `spawn_custom_adapters` 가 안전 판독으로도 종전처럼 일반 파일의 `cmd` 어댑터를 띄운다(양성 대조 — 위 음성 검체들이 헛돌지 않는다): provider·cmd 문자열 ∧ `adapter == "cmd"` 인 항목만 · 그 밖은 건너뜀.
+        #[test]
+        fn b1b_spawn_custom_adapters_still_spawns_the_cmd_adapters_of_a_regular_file() {
+            let home = tmp("b1b-g-home");
+            let _h = test_home::set(&home);
+            put_aliases(
+                &home,
+                r#"{"accounts":[
+                    {"provider":"grokb1b","cmd":"true","adapter":"cmd"},
+                    {"provider":"glmb1b","cmd":"true","adapter":"cmd","interval_secs":10},
+                    {"provider":"nocmdb1b","adapter":"cmd"},
+                    {"provider":"noadapterb1b","cmd":"true"},
+                    {"provider":"nonecmdb1b","cmd":"true","adapter":"none"},
+                    {"cmd":"true","adapter":"cmd"},
+                    {"provider":"badcmdb1b","cmd":7,"adapter":"cmd"}
+                  ]}"#,
+                1,
+            );
+            let dir = tmp("b1b-g-daemon");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            assert_eq!(adapter_tasks(&d, &home), 2, "cmd 어댑터 2건(grokb1b·glmb1b)만 떠야 한다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 소스 핀: 부트 체인의 두 판독이 선언 계정 파일을 **안전 판독으로만** 연다 — 직접 판독·직접 열기 0 · 공용 안전 판독 하나(별명·선언 계정이 같은 구현을 부른다 — 복사본 금지) ·
+        /// 안전 판독의 규율(O_NONBLOCK · fstat 일반 파일 · 상한 인자) · 두 상한은 별개 값(선언 1MiB > 별명 64KiB).
+        #[test]
+        fn b1b_boot_chain_reads_declared_accounts_only_through_the_safe_reader_source_pin() {
+            let src = include_str!("accounts.rs");
+            let func = |head: &str| -> String {
+                let body = src.split(head).nth(1).unwrap_or_else(|| panic!("{head} 소실"));
+                body[..body.find("\n}\n").unwrap_or_else(|| panic!("{head} 끝"))].to_string()
+            };
+            for head in ["pub fn seed_known(", "pub fn spawn_custom_adapters("] {
+                let f = func(head);
+                assert!(f.contains("read_declared_accounts_text("), "{head} 가 안전 판독을 쓰지 않는다");
+                for bad in ["read_to_string", "std::fs::read", "File::open", "OpenOptions", "dirs::home_dir"] {
+                    assert!(!f.contains(bad), "{head} 가 {bad} 를 직접 쓴다 — 부트 체인의 FIFO 정지(안전 판독 우회) 또는 시험 이음매 우회");
+                }
+            }
+            let r = func("fn read_regular_file_capped(");
+            for must in ["O_NONBLOCK", "is_file()", "max_bytes", "take(max_bytes + 1)"] {
+                assert!(r.contains(must), "공용 안전 판독에서 {must} 가 사라졌다");
+            }
+            assert!(func("fn read_alias_file(").contains("read_regular_file_capped(f, ALIAS_FILE_MAX_BYTES)"), "별명 판독이 공용 안전 판독(별명 상한)을 부르지 않는다");
+            assert!(func("fn read_declared_accounts_text(").contains("read_regular_file_capped(decl, DECLARED_FILE_MAX_BYTES)"), "선언 계정 판독이 공용 안전 판독(선언 상한)을 부르지 않는다");
+            assert_eq!(DECLARED_FILE_MAX_BYTES, 1024 * 1024, "선언 계정 상한은 1MiB 다");
+            assert_eq!(ALIAS_FILE_MAX_BYTES, 64 * 1024, "별명 상한은 64KiB 다(선언 계정 상한과 별개)");
+            // 프로덕션 구간 전체에서 선언 계정 파일을 무제한 판독으로 여는 곳이 없다
+            let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
+            assert!(!prod.contains("read_to_string(&decl)"), "프로덕션에 선언 계정 파일의 무제한 판독이 남아 있다");
         }
     }
 }
