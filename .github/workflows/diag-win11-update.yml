@@ -1,0 +1,321 @@
+# Diagnostic harness: does the in-app update (0.14.37 -> 0.14.42) work on a REAL Windows 11?
+# See diag/README.md. Measurement steps never turn the job red (their result IS the data);
+# only a failing publish step stays red. Results go to branch diag-results/<run>-<attempt>-<job>-<os>.
+name: diag-win11-update
+
+on:
+  push:
+    branches: ['diag/**']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: diag-win11-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: 'e2e (${{ matrix.os }})'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-11-arm, windows-2025, windows-2022]
+    env:
+      DIAG_MATRIX_OS: ${{ matrix.os }}
+      DIAG_JOB_LIMIT_MIN: '50'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        continue-on-error: true
+        with:
+          node-version: '22'
+
+      # Windows PowerShell 5.1 parser over every diag script: a parse error would stop a script before it writes anything
+      - name: syntax-check
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = Join-Path $env:RUNNER_TEMP 'diag-out'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $lines = New-Object System.Collections.Generic.List[string]
+          $lines.Add(('PowerShell {0} on {1}' -f $PSVersionTable.PSVersion, $env:PROCESSOR_ARCHITECTURE))
+          foreach ($f in (Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'diag') -Filter '*.ps1')) {
+            $tokens = $null
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errs)
+            if ($errs -and $errs.Count -gt 0) {
+              foreach ($e in $errs) { $lines.Add(('PARSE ERROR {0}:{1}:{2} {3}' -f $f.Name, $e.Extent.StartLineNumber, $e.Extent.StartColumnNumber, $e.Message)) }
+            } else {
+              $lines.Add(('ok {0}' -f $f.Name))
+            }
+          }
+          $lines | ForEach-Object { Write-Host $_ }
+          [System.IO.File]::WriteAllText((Join-Path $out 'syntax-check.txt'), (($lines.ToArray()) -join "`r`n"))
+          exit 0
+
+      - name: p0-facts
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\p0-facts.ps1"
+          Write-Host "p0-facts exit code: $LASTEXITCODE"
+          exit 0
+
+      - name: p1-assets
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\p1-assets.ps1"
+          Write-Host "p1-assets exit code: $LASTEXITCODE"
+          exit 0
+
+      - name: e2e-update
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 30
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\e2e-update.ps1"
+          Write-Host "e2e-update exit code: $LASTEXITCODE"
+          exit 0
+
+      - name: replica
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\replica.ps1"
+          Write-Host "replica exit code: $LASTEXITCODE"
+          exit 0
+
+      # sac-real flips the real Smart App Control state: save everything measured so far first
+      - name: publish-checkpoint (before sac-real)
+        if: matrix.os == 'windows-11-arm'
+        shell: cmd
+        continue-on-error: true
+        timeout-minutes: 8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node diag\publish-results.mjs --job e2e-pre-sacreal --os ${{ matrix.os }} --out "%RUNNER_TEMP%\diag-out"
+
+      - name: sac-real
+        if: matrix.os == 'windows-11-arm'
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 8
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\sac-real.ps1"
+          Write-Host "sac-real exit code: $LASTEXITCODE"
+          exit 0
+
+      - name: list-out
+        if: always()
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $d = Join-Path $env:RUNNER_TEMP 'diag-out'
+          if (Test-Path -LiteralPath $d) {
+            Get-ChildItem -LiteralPath $d -Recurse -File | ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.FullName.Substring($d.Length + 1) }
+          } else {
+            Write-Host "no diag-out folder"
+          }
+          exit 0
+
+      - name: publish-results
+        if: always()
+        shell: cmd
+        timeout-minutes: 8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node diag\publish-results.mjs --job e2e --os ${{ matrix.os }} --out "%RUNNER_TEMP%\diag-out"
+
+      - name: upload-artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-e2e-${{ matrix.os }}
+          path: ${{ runner.temp }}\diag-out
+          if-no-files-found: warn
+          retention-days: 14
+
+  sacrules:
+    name: 'sacrules (${{ matrix.os }})'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-11-arm, windows-2025]
+    env:
+      DIAG_MATRIX_OS: ${{ matrix.os }}
+      DIAG_JOB_LIMIT_MIN: '55'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        continue-on-error: true
+        with:
+          node-version: '22'
+
+      # Windows PowerShell 5.1 parser over every diag script: a parse error would stop a script before it writes anything
+      - name: syntax-check
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $out = Join-Path $env:RUNNER_TEMP 'diag-out'
+          New-Item -ItemType Directory -Path $out -Force | Out-Null
+          $lines = New-Object System.Collections.Generic.List[string]
+          $lines.Add(('PowerShell {0} on {1}' -f $PSVersionTable.PSVersion, $env:PROCESSOR_ARCHITECTURE))
+          foreach ($f in (Get-ChildItem -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'diag') -Filter '*.ps1')) {
+            $tokens = $null
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$tokens, [ref]$errs)
+            if ($errs -and $errs.Count -gt 0) {
+              foreach ($e in $errs) { $lines.Add(('PARSE ERROR {0}:{1}:{2} {3}' -f $f.Name, $e.Extent.StartLineNumber, $e.Extent.StartColumnNumber, $e.Message)) }
+            } else {
+              $lines.Add(('ok {0}' -f $f.Name))
+            }
+          }
+          $lines | ForEach-Object { Write-Host $_ }
+          [System.IO.File]::WriteAllText((Join-Path $out 'syntax-check.txt'), (($lines.ToArray()) -join "`r`n"))
+          exit 0
+
+      - name: p0-facts
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\p0-facts.ps1"
+          Write-Host "p0-facts exit code: $LASTEXITCODE"
+          exit 0
+
+      - name: p1-assets
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\p1-assets.ps1"
+          Write-Host "p1-assets exit code: $LASTEXITCODE"
+          exit 0
+
+      # one step = one PowerShell process: audit -> enforce -> remove (see diag/sacrules.ps1).
+      # GITHUB_TOKEN is only for the checkpoint publishes sacrules.ps1 makes (before enforcing / after removing),
+      # so that the audit results survive even if an enforced policy kills the runner.
+      - name: sacrules
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 52
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\diag\sacrules.ps1"
+          Write-Host "sacrules exit code: $LASTEXITCODE"
+          exit 0
+
+      # Safety net that works even when the sacrules process died (or a NEW PowerShell is in Constrained Language Mode):
+      # only core cmdlets and external commands. Removes any leftover DIAG-SAC-RULES policy.
+      - name: ensure-policy-removed
+        if: always()
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $lines = @()
+          $ci = Join-Path $env:windir 'System32\CiTool.exe'
+          if (-not (Test-Path -LiteralPath $ci)) {
+            $lines += 'CiTool.exe not present: nothing to remove'
+          } else {
+            $raw = (& $ci -lp -json 2>&1 | Out-String)
+            $lines += ('citool -lp -json returned {0} characters' -f $raw.Length)
+            $found = 0
+            try {
+              $j = $raw | ConvertFrom-Json
+              foreach ($p in $j.Policies) {
+                if ($p.FriendlyName -eq 'DIAG-SAC-RULES') {
+                  $found = $found + 1
+                  $g = '{' + ([string]$p.PolicyID).Trim('{', '}') + '}'
+                  $lines += ('leftover policy found, removing ' + $g)
+                  $rm = (& $ci --remove-policy $g 2>&1 | Out-String)
+                  $lines += ('remove output: ' + $rm.Trim())
+                }
+              }
+            } catch {
+              $lines += ('parse or remove problem: ' + $_.Exception.Message)
+            }
+            $lines += ('leftover DIAG-SAC-RULES policies handled: {0}' -f $found)
+            if ($found -gt 0) {
+              $raw2 = (& $ci -lp -json 2>&1 | Out-String)
+              $still = $false
+              try {
+                $j2 = $raw2 | ConvertFrom-Json
+                foreach ($p2 in $j2.Policies) { if ($p2.FriendlyName -eq 'DIAG-SAC-RULES') { $still = $true } }
+              } catch { }
+              $lines += ('policy still listed after removal: {0}' -f $still)
+              if ($still) {
+                $neutralDir = Join-Path $env:RUNNER_TEMP 'diag-work\sacpol\neutral'
+                if (Test-Path -LiteralPath $neutralDir) {
+                  foreach ($cf in (Get-ChildItem -LiteralPath $neutralDir -Filter '*.cip')) {
+                    $up = (& $ci --update-policy $cf.FullName 2>&1 | Out-String)
+                    $lines += ('deployed neutral (audit mode) policy ' + $cf.Name + ': ' + $up.Trim())
+                  }
+                } else {
+                  $lines += 'no neutral policy folder found'
+                }
+              }
+            }
+          }
+          $lines | ForEach-Object { Write-Host $_ }
+          $dest = Join-Path $env:RUNNER_TEMP 'diag-out'
+          if (-not (Test-Path -LiteralPath $dest)) { New-Item -ItemType Directory -Path $dest -Force | Out-Null }
+          $lines | Set-Content -LiteralPath (Join-Path $dest 'ensure-policy-removed.txt')
+          exit 0
+
+      - name: list-out
+        if: always()
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $d = Join-Path $env:RUNNER_TEMP 'diag-out'
+          if (Test-Path -LiteralPath $d) {
+            Get-ChildItem -LiteralPath $d -Recurse -File | ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.FullName.Substring($d.Length + 1) }
+          } else {
+            Write-Host "no diag-out folder"
+          }
+          exit 0
+
+      - name: publish-results
+        if: always()
+        shell: cmd
+        timeout-minutes: 8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node diag\publish-results.mjs --job sacrules --os ${{ matrix.os }} --out "%RUNNER_TEMP%\diag-out"
+
+      - name: upload-artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-sacrules-${{ matrix.os }}
+          path: ${{ runner.temp }}\diag-out
+          if-no-files-found: warn
+          retention-days: 14
