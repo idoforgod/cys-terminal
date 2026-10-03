@@ -1,0 +1,5 @@
+2026-10-03T21:19:18.704Z [INFO] === sacreal-e2e start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-03T21:19:18.796Z [INFO] --- step prepare (minutes left 33.8, language mode FullLanguage) ---
+2026-10-03T21:19:24.482Z [INFO] --- step install-0.14.37 (minutes left 33.7, language mode FullLanguage) ---
+2026-10-03T21:20:23.277Z [INFO] --- step A (minutes left 32.7, language mode FullLanguage) ---
+2026-10-03T21:20:25.319Z [INFO] A: before-node step (language mode FullLanguage)
