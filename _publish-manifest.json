@@ -1,0 +1,181 @@
+{
+  "generated": "2026-10-03T23:29:24.647Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37161698165",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37161698165",
+  "job": "product-launch",
+  "os": "windows-11-arm",
+  "branch": "diag-results/37161698165-1-product-launch-windows-11-arm",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "done-p0-facts.json",
+      "bytes": 140
+    },
+    {
+      "path": "done-p1-assets.json",
+      "bytes": 141
+    },
+    {
+      "path": "done-product-launch.json",
+      "bytes": 146
+    },
+    {
+      "path": "ensure-sac-restored-citool-lp.json",
+      "bytes": 6761
+    },
+    {
+      "path": "ensure-sac-restored.txt",
+      "bytes": 391
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-p0-facts.txt",
+      "bytes": 165
+    },
+    {
+      "path": "log-p1-assets.txt",
+      "bytes": 167
+    },
+    {
+      "path": "log-product-launch.txt",
+      "bytes": 4586
+    },
+    {
+      "path": "p0-example-SmartAppControl.xml",
+      "bytes": 9489
+    },
+    {
+      "path": "p0-facts.json",
+      "bytes": 48856
+    },
+    {
+      "path": "p0-facts.txt",
+      "bytes": 42151
+    },
+    {
+      "path": "p1-assets.json",
+      "bytes": 20909
+    },
+    {
+      "path": "product-3077.json",
+      "bytes": 35446
+    },
+    {
+      "path": "product-build.json",
+      "bytes": 2350
+    },
+    {
+      "path": "product-ci.evtx",
+      "bytes": 69632
+    },
+    {
+      "path": "product-citool-lp-after-on-10s.json",
+      "bytes": 7236
+    },
+    {
+      "path": "product-citool-lp-final.json",
+      "bytes": 6761
+    },
+    {
+      "path": "product-citool-lp-initial.json",
+      "bytes": 6761
+    },
+    {
+      "path": "product-citool-lp-restore-final-1.json",
+      "bytes": 6761
+    },
+    {
+      "path": "product-citool-refresh-on.txt",
+      "bytes": 169
+    },
+    {
+      "path": "product-citool-refresh-restore-final-1.txt",
+      "bytes": 168
+    },
+    {
+      "path": "product-events.json",
+      "bytes": 116872
+    },
+    {
+      "path": "product-launch-aarch64-off.jsonl",
+      "bytes": 2293
+    },
+    {
+      "path": "product-launch-aarch64-stdout.txt",
+      "bytes": 6646
+    },
+    {
+      "path": "product-launch-aarch64.jsonl",
+      "bytes": 6646
+    },
+    {
+      "path": "product-launch-screen.png",
+      "bytes": 193228
+    },
+    {
+      "path": "product-launch-summary.txt",
+      "bytes": 2470
+    },
+    {
+      "path": "product-launch-verdict.json",
+      "bytes": 251
+    },
+    {
+      "path": "product-launch-x64-off.jsonl",
+      "bytes": 2269
+    },
+    {
+      "path": "product-launch-x64-stdout.txt",
+      "bytes": 6580
+    },
+    {
+      "path": "product-launch-x64.jsonl",
+      "bytes": 6580
+    },
+    {
+      "path": "product-launch.json",
+      "bytes": 79958
+    },
+    {
+      "path": "product-state-after-on-10s.json",
+      "bytes": 5817
+    },
+    {
+      "path": "product-state-final.json",
+      "bytes": 5519
+    },
+    {
+      "path": "product-state-initial.json",
+      "bytes": 5521
+    },
+    {
+      "path": "product-state-restore-final-1.json",
+      "bytes": 5529
+    },
+    {
+      "path": "subjects.json",
+      "bytes": 182280
+    },
+    {
+      "path": "syntax-check.txt",
+      "bytes": 209
+    }
+  ],
+  "skipped": [
+    {
+      "path": "product-launch-aarch64-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "product-launch-x64-stderr.txt",
+      "reason": "empty file"
+    }
+  ],
+  "inline_files": 37,
+  "blob_files": 2
+}

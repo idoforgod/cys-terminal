@@ -1,0 +1,26 @@
+2026-10-03T23:28:29.737Z [INFO] === product-launch start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-03T23:28:29.818Z [INFO] --- step prepare (minutes left 19.8, language mode FullLanguage) ---
+2026-10-03T23:28:33.681Z [INFO] --- step build (minutes left 19.7, language mode FullLanguage) ---
+2026-10-03T23:28:48.977Z [INFO] --- step start-drivers (minutes left 19.5, language mode FullLanguage) ---
+2026-10-03T23:28:50.149Z [INFO] --- step checkpoint-pre-sac (minutes left 19.5, language mode FullLanguage) ---
+2026-10-03T23:28:52.448Z [INFO] checkpoint pre-sac: rc=0 publish-results: 18 files to upload, 0 skipped, out=C:\a\_temp\diag-out
+publish-results: ok -> refs/heads/diag-results/37161698165-1-product-launch-pre-sac-windows-11-arm (commit b0d7e383e6a3fa1cd5e511310506e1d6427ce758), 18 files + manifest
+2026-10-03T23:28:52.475Z [INFO] --- step sac-on (minutes left 19.4, language mode FullLanguage) ---
+2026-10-03T23:29:05.219Z [INFO] --- step go-and-wait (minutes left 19.2, language mode FullLanguage) ---
+2026-10-03T23:29:13.062Z [INFO] --- step collect (minutes left 19.1, language mode FullLanguage) ---
+2026-10-03T23:29:13.216Z [INFO] --- step restore (minutes left 19.1, language mode FullLanguage) ---
+2026-10-03T23:29:20.905Z [INFO] --- step cleanup (minutes left 19, language mode FullLanguage) ---
+2026-10-03T23:29:20.982Z [INFO] --- step events (minutes left 19, language mode FullLanguage) ---
+2026-10-03T23:29:23.301Z [INFO] --- step verdict (minutes left 18.9, language mode FullLanguage) ---
+2026-10-03T23:29:23.317Z [INFO] --- step summary (minutes left 18.9, language mode FullLanguage) ---
+2026-10-03T23:29:23.364Z [INFO] SUMMARY product-launch on windows-11-arm: measurable=True; update_launch.rs sha256=570476c28df10e9280036cee4da37301175d2fd215a49f5cb16627fd00e88ddc (as expected=True); main.rs sha256=2ba3839b9a1b87eb2ae34c67a0d2647bbf5d5931aba2ebe038ca65aee00b930a; drivers built: x64=ok, aarch64=ok
+2026-10-03T23:29:23.364Z [INFO] SUMMARY SAC on confirmed=True: registry value=1; CiTool VerifiedAndReputableDesktop IsEnforced=True; Defender SmartAppControlState=On; UMCI flag=True
+2026-10-03T23:29:23.380Z [INFO] SUMMARY OFF stage, SAC off, launch of the signed cmd.exe copy through write_installer + launch_installer (expect Ok): x64 ok=True (417 ms); aarch64 ok=True (433 ms)
+2026-10-03T23:29:23.380Z [INFO] SUMMARY ON stage, REAL 0.14.42 installer through launch_installer (expect Err os_code 4551 / shell_ret 5 / AppControl): x64 as expected=True; ok=False shell_ret=5 os_code=4551 block=AppControl display=installer_launch_failed:4551:5 (4723 ms); timed_out=False; aarch64 as expected=True; ok=False shell_ret=5 os_code=4551 block=AppControl display=installer_launch_failed:4551:5 (4627 ms); timed_out=False
+2026-10-03T23:29:23.380Z [INFO] SUMMARY ON stage, signed control (cmd.exe copy, expect Ok): x64 ok=True (65 ms); original System32 cmd.exe launched (tried only when the copy failed)=; aarch64 ok=True (42 ms); original System32 cmd.exe launched (tried only when the copy failed)=
+2026-10-03T23:29:23.380Z [INFO] SUMMARY cleanup (remove_installer: file and folder gone) / installer path shape as the plugin writes it: x64 remove_installer ran=True; cleanup ok=True (after 3 s observation: True; file left=False, folder left=False); path shape ok=True; FILE_ATTRIBUTE_TEMPORARY=True; aarch64 remove_installer ran=True; cleanup ok=True (after 3 s observation: True; file left=False, folder left=False); path shape ok=True; FILE_ATTRIBUTE_TEMPORARY=True
+2026-10-03T23:29:23.387Z [INFO] SUMMARY drivers: x64 done=True; alive through the ON stage=True; exit code=0; a launch call timed out=False; slow calls (over 5 s)=; aarch64 done=True; alive through the ON stage=True; exit code=0; a launch call timed out=False; slow calls (over 5 s)=
+2026-10-03T23:29:23.387Z [INFO] SUMMARY events: 2 CodeIntegrity 3076/3077 event(s) name a cys-0.14.42-updater- path (blocked processes: \Device\HarddiskVolume4\a\_temp\diag-work\product\bin\sac-launch-x64.exe | \Device\HarddiskVolume4\a\_temp\diag-work\product\bin\sac-launch-aarch64.exe); screenshot: product-launch-screen.png ok=True
+2026-10-03T23:29:23.387Z [INFO] SUMMARY restore: ok=True; registry value=0; enforced=False; Defender SmartAppControlState=Off; NEG control runs again=True
+2026-10-03T23:29:23.387Z [INFO] SUMMARY VERDICT: PASS (basis: x64) - the product module behaves as expected on real SAC: Err 4551/5/AppControl for the unsigned installer, Ok for the signed copy, clean-up done
+2026-10-03T23:29:23.396Z [INFO] === product-launch end ===

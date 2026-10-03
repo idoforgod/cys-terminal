@@ -1,0 +1,7 @@
+{
+    "result":  "PASS",
+    "basis":  "x64",
+    "reasons":  [
+                    "the product module behaves as expected on real SAC: Err 4551/5/AppControl for the unsigned installer, Ok for the signed copy, clean-up done"
+                ]
+}

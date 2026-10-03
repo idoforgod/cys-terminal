@@ -1,0 +1,11 @@
+PowerShell 5.1.26100.9457 on ARM64
+ok e2e-update.ps1
+ok lib.ps1
+ok p0-facts.ps1
+ok p1-assets.ps1
+ok product-launch.ps1
+ok replica.ps1
+ok sac-lib.ps1
+ok sac-real.ps1
+ok sacreal-e2e.ps1
+ok sacrules.ps1

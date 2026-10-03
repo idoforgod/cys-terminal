@@ -1,0 +1,727 @@
+{
+    "note":  null,
+    "total":  37,
+    "truncated":  false,
+    "events":  [
+                   {
+                       "id":  3101,
+                       "time":  "2026-10-03T23:28:52.578Z",
+                       "level":  4,
+                       "fields":  {
+                                      "NumberOfPolicies":  "4"
+                                  },
+                       "message":  "Code Integrity policy refresh started for 4 policies.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3101\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5781806Z\u0027/\u003e\u003cEventRecordID\u003e215\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027NumberOfPolicies\u0027\u003e4\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.583Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{60fd87f8-4593-44a0-91b0-2e0da022f248}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {60fd87f8-4593-44a0-91b0-2e0da022f248}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5832740Z\u0027/\u003e\u003cEventRecordID\u003e216\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{60fd87f8-4593-44a0-91b0-2e0da022f248}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.583Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{82443e1e-8a39-4b4a-96a8-f40ddc00b9f3}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {82443e1e-8a39-4b4a-96a8-f40ddc00b9f3}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5835693Z\u0027/\u003e\u003cEventRecordID\u003e217\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{82443e1e-8a39-4b4a-96a8-f40ddc00b9f3}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.583Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{784c4414-79f4-4c32-a6a5-f0fb42a51d0d}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {784c4414-79f4-4c32-a6a5-f0fb42a51d0d}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5838822Z\u0027/\u003e\u003cEventRecordID\u003e218\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{784c4414-79f4-4c32-a6a5-f0fb42a51d0d}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.584Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{0283ac0f-fff1-49ae-ada1-8a933130cad6}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {0283ac0f-fff1-49ae-ada1-8a933130cad6}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5846210Z\u0027/\u003e\u003cEventRecordID\u003e219\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{0283ac0f-fff1-49ae-ada1-8a933130cad6}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.584Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{5951a96a-e0b5-4d3d-8fb8-3e5b61030784}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {5951a96a-e0b5-4d3d-8fb8-3e5b61030784}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5849246Z\u0027/\u003e\u003cEventRecordID\u003e220\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{5951a96a-e0b5-4d3d-8fb8-3e5b61030784}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.585Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{1283ac0f-fff1-49ae-ada1-8a933130cad6}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {1283ac0f-fff1-49ae-ada1-8a933130cad6}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5851803Z\u0027/\u003e\u003cEventRecordID\u003e221\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{1283ac0f-fff1-49ae-ada1-8a933130cad6}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.585Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{5951a96a-e0b5-4d3d-8fb8-3e5b61030784}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {5951a96a-e0b5-4d3d-8fb8-3e5b61030784}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5855792Z\u0027/\u003e\u003cEventRecordID\u003e222\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{5951a96a-e0b5-4d3d-8fb8-3e5b61030784}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3103,
+                       "time":  "2026-10-03T23:28:52.585Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{5951a96a-e0b5-4d3d-8fb8-3e5b61030784}",
+                                      "Status":  "0x0"
+                                  },
+                       "message":  "Ignoring refresh for Code Integrity policy ID {5951a96a-e0b5-4d3d-8fb8-3e5b61030784}. Status 0x0.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3103\u003c/EventID\u003e\u003cVersion\u003e1\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5858209Z\u0027/\u003e\u003cEventRecordID\u003e223\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{5951a96a-e0b5-4d3d-8fb8-3e5b61030784}\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0x0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.585Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{a072029f-588b-4b5e-b7f9-05aad67df687}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {a072029f-588b-4b5e-b7f9-05aad67df687}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5858212Z\u0027/\u003e\u003cEventRecordID\u003e224\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{a072029f-588b-4b5e-b7f9-05aad67df687}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.586Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{2678656c-05ef-481f-bc5b-ebd8c991502d}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {2678656c-05ef-481f-bc5b-ebd8c991502d}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5861812Z\u0027/\u003e\u003cEventRecordID\u003e225\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{2678656c-05ef-481f-bc5b-ebd8c991502d}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.586Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{5dac656c-21ad-4a02-ab49-649917162e70}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {5dac656c-21ad-4a02-ab49-649917162e70}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5864169Z\u0027/\u003e\u003cEventRecordID\u003e226\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{5dac656c-21ad-4a02-ab49-649917162e70}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.586Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{cdd5cb55-db68-4d71-aa38-3df2b6473a52}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {cdd5cb55-db68-4d71-aa38-3df2b6473a52}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5866533Z\u0027/\u003e\u003cEventRecordID\u003e227\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{cdd5cb55-db68-4d71-aa38-3df2b6473a52}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.586Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{0939ed82-bfd5-4d32-b58e-d31d3c49715a}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {0939ed82-bfd5-4d32-b58e-d31d3c49715a}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5868885Z\u0027/\u003e\u003cEventRecordID\u003e228\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{0939ed82-bfd5-4d32-b58e-d31d3c49715a}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.587Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{1678656c-05ef-481f-bc5b-ebd8c991502d}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {1678656c-05ef-481f-bc5b-ebd8c991502d}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5871108Z\u0027/\u003e\u003cEventRecordID\u003e229\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{1678656c-05ef-481f-bc5b-ebd8c991502d}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3105,
+                       "time":  "2026-10-03T23:28:52.587Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{1939ed82-bfd5-4d32-b58e-d31d3c49715a}"
+                                  },
+                       "message":  "Trying to refresh Code Integrity policy with policy ID {1939ed82-bfd5-4d32-b58e-d31d3c49715a}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3105\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5873404Z\u0027/\u003e\u003cEventRecordID\u003e230\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{1939ed82-bfd5-4d32-b58e-d31d3c49715a}\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3096,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyNameLength":  "42",
+                                      "PolicyNameBuffer":  "Microsoft Windows Endpoint Security Policy",
+                                      "PolicyIdLength":  "12",
+                                      "PolicyIdBuffer":  "10.0.29526.0",
+                                      "PolicyGUID":  "{60fd87f8-4593-44a0-91b0-2e0da022f248}",
+                                      "Status":  "0x0",
+                                      "Options":  "0x90802404",
+                                      "PolicyHashSize":  "32",
+                                      "PolicyHash":  "A3E2BB346698BC3C4706BF735DC5364EF0AC49D9CC604B491E0E6805C40BE350",
+                                      "OptionsV2":  "0x0"
+                                  },
+                       "message":  "No change in active Code Integrity policy {60fd87f8-4593-44a0-91b0-2e0da022f248} Microsoft Windows Endpoint Security Policy after refresh. id 10.0.29526.0. Status 0x0",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3096\u003c/EventID\u003e\u003cVersion\u003e2\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5951437Z\u0027/\u003e\u003cEventRecordID\u003e231\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyNameLength\u0027\u003e42\u003c/Data\u003e\u003cData Name=\u0027PolicyNameBuffer\u0027\u003eMicrosoft Windows Endpoint Security Policy\u003c/Data\u003e\u003cData Name=\u0027PolicyIdLength\u0027\u003e12\u003c/Data\u003e\u003cData Name=\u0027PolicyIdBuffer\u0027\u003e10.0.29526.0\u003c/Data\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{60fd87f8-4593-44a0-91b0-2e0da022f248}\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027Options\u0027\u003e0x90802404\u003c/Data\u003e\u003cData Name=\u0027PolicyHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PolicyHash\u0027\u003eA3E2BB346698BC3C4706BF735DC5364EF0AC49D9CC604B491E0E6805C40BE350\u003c/Data\u003e\u003cData Name=\u0027OptionsV2\u0027\u003e0x0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3096,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyNameLength":  "79",
+                                      "PolicyNameBuffer":  "Microsoft Windows Cross Certificates for Code Integrity Exceptions Audit Policy",
+                                      "PolicyIdLength":  "12",
+                                      "PolicyIdBuffer":  "10.29611.0.0",
+                                      "PolicyGUID":  "{784c4414-79f4-4c32-a6a5-f0fb42a51d0d}",
+                                      "Status":  "0x0",
+                                      "Options":  "0x90850000",
+                                      "PolicyHashSize":  "32",
+                                      "PolicyHash":  "2AEE7682C77A6459A0F66D6AE866D4E841E0A4AA5A4655D2E1D1AA8DBEDDEBA4",
+                                      "OptionsV2":  "0x0"
+                                  },
+                       "message":  "No change in active Code Integrity policy {784c4414-79f4-4c32-a6a5-f0fb42a51d0d} Microsoft Windows Cross Certificates for Code Integrity Exceptions Audit Policy after refresh. id 10.29611.0.0. Status 0x0",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3096\u003c/EventID\u003e\u003cVersion\u003e2\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5952722Z\u0027/\u003e\u003cEventRecordID\u003e232\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyNameLength\u0027\u003e79\u003c/Data\u003e\u003cData Name=\u0027PolicyNameBuffer\u0027\u003eMicrosoft Windows Cross Certificates for Code Integrity Exceptions Audit Policy\u003c/Data\u003e\u003cData Name=\u0027PolicyIdLength\u0027\u003e12\u003c/Data\u003e\u003cData Name=\u0027PolicyIdBuffer\u0027\u003e10.29611.0.0\u003c/Data\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{784c4414-79f4-4c32-a6a5-f0fb42a51d0d}\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027Options\u0027\u003e0x90850000\u003c/Data\u003e\u003cData Name=\u0027PolicyHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PolicyHash\u0027\u003e2AEE7682C77A6459A0F66D6AE866D4E841E0A4AA5A4655D2E1D1AA8DBEDDEBA4\u003c/Data\u003e\u003cData Name=\u0027OptionsV2\u0027\u003e0x0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3096,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyNameLength":  "54",
+                                      "PolicyNameBuffer":  "Microsoft Windows Virtualization Based Security Policy",
+                                      "PolicyIdLength":  "12",
+                                      "PolicyIdBuffer":  "10.0.29657.0",
+                                      "PolicyGUID":  "{a072029f-588b-4b5e-b7f9-05aad67df687}",
+                                      "Status":  "0x0",
+                                      "Options":  "0x90800000",
+                                      "PolicyHashSize":  "32",
+                                      "PolicyHash":  "8D96583ADA39981D3AADB3479ABB928EBA231013BA78BF3D2F73CA9D21B457CE",
+                                      "OptionsV2":  "0x0"
+                                  },
+                       "message":  "No change in active Code Integrity policy {a072029f-588b-4b5e-b7f9-05aad67df687} Microsoft Windows Virtualization Based Security Policy after refresh. id 10.0.29657.0. Status 0x0",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3096\u003c/EventID\u003e\u003cVersion\u003e2\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5953215Z\u0027/\u003e\u003cEventRecordID\u003e233\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyNameLength\u0027\u003e54\u003c/Data\u003e\u003cData Name=\u0027PolicyNameBuffer\u0027\u003eMicrosoft Windows Virtualization Based Security Policy\u003c/Data\u003e\u003cData Name=\u0027PolicyIdLength\u0027\u003e12\u003c/Data\u003e\u003cData Name=\u0027PolicyIdBuffer\u0027\u003e10.0.29657.0\u003c/Data\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{a072029f-588b-4b5e-b7f9-05aad67df687}\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027Options\u0027\u003e0x90800000\u003c/Data\u003e\u003cData Name=\u0027PolicyHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PolicyHash\u0027\u003e8D96583ADA39981D3AADB3479ABB928EBA231013BA78BF3D2F73CA9D21B457CE\u003c/Data\u003e\u003cData Name=\u0027OptionsV2\u0027\u003e0x0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3096,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyNameLength":  "31",
+                                      "PolicyNameBuffer":  "Microsoft Windows Driver Policy",
+                                      "PolicyIdLength":  "12",
+                                      "PolicyIdBuffer":  "10.0.29520.0",
+                                      "PolicyGUID":  "{d2bda982-ccf6-4344-ac5b-0b44427b6816}",
+                                      "Status":  "0x0",
+                                      "Options":  "0x80880200",
+                                      "PolicyHashSize":  "32",
+                                      "PolicyHash":  "F987874CA747F43CC85C74099EDD653E191D91F0F5118559AEADB8E3C81400C5",
+                                      "OptionsV2":  "0x0"
+                                  },
+                       "message":  "No change in active Code Integrity policy {d2bda982-ccf6-4344-ac5b-0b44427b6816} Microsoft Windows Driver Policy after refresh. id 10.0.29520.0. Status 0x0",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3096\u003c/EventID\u003e\u003cVersion\u003e2\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5954690Z\u0027/\u003e\u003cEventRecordID\u003e234\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyNameLength\u0027\u003e31\u003c/Data\u003e\u003cData Name=\u0027PolicyNameBuffer\u0027\u003eMicrosoft Windows Driver Policy\u003c/Data\u003e\u003cData Name=\u0027PolicyIdLength\u0027\u003e12\u003c/Data\u003e\u003cData Name=\u0027PolicyIdBuffer\u0027\u003e10.0.29520.0\u003c/Data\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{d2bda982-ccf6-4344-ac5b-0b44427b6816}\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027Options\u0027\u003e0x80880200\u003c/Data\u003e\u003cData Name=\u0027PolicyHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PolicyHash\u0027\u003eF987874CA747F43CC85C74099EDD653E191D91F0F5118559AEADB8E3C81400C5\u003c/Data\u003e\u003cData Name=\u0027OptionsV2\u0027\u003e0x0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3099,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyNameLength":  "27",
+                                      "PolicyNameBuffer":  "VerifiedAndReputableDesktop",
+                                      "PolicyIdLength":  "17",
+                                      "PolicyIdBuffer":  "27555.1000.240208",
+                                      "PolicyGUID":  "{0283ac0f-fff1-49ae-ada1-8a933130cad6}",
+                                      "Status":  "0x0",
+                                      "Options":  "0xb18c2714",
+                                      "PolicyHashSize":  "32",
+                                      "PolicyHash":  "2668895A5B233A80432D00D67251D7B7F52686A3FB13780F4B242C5A1F937A01",
+                                      "OptionsV2":  "0x0"
+                                  },
+                       "message":  "Refreshed and activated Code Integrity policy {0283ac0f-fff1-49ae-ada1-8a933130cad6} VerifiedAndReputableDesktop. id 27555.1000.240208. Status 0x0",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3099\u003c/EventID\u003e\u003cVersion\u003e2\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5954770Z\u0027/\u003e\u003cEventRecordID\u003e235\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyNameLength\u0027\u003e27\u003c/Data\u003e\u003cData Name=\u0027PolicyNameBuffer\u0027\u003eVerifiedAndReputableDesktop\u003c/Data\u003e\u003cData Name=\u0027PolicyIdLength\u0027\u003e17\u003c/Data\u003e\u003cData Name=\u0027PolicyIdBuffer\u0027\u003e27555.1000.240208\u003c/Data\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{0283ac0f-fff1-49ae-ada1-8a933130cad6}\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027Options\u0027\u003e0xb18c2714\u003c/Data\u003e\u003cData Name=\u0027PolicyHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PolicyHash\u0027\u003e2668895A5B233A80432D00D67251D7B7F52686A3FB13780F4B242C5A1F937A01\u003c/Data\u003e\u003cData Name=\u0027OptionsV2\u0027\u003e0x0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3116,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{0283ac0f-fff1-49ae-ada1-8a933130cad6}",
+                                      "PublisherNameLength":  "17",
+                                      "PublisherName":  "Microsoft Windows",
+                                      "IssuerNameLength":  "37",
+                                      "IssuerName":  "Microsoft Windows Production PCA 2011",
+                                      "PublisherTBSHashSize":  "32",
+                                      "PublisherTBSHash":  "7EEA6C24F02AF3ED4038C4E74491F687804FF0B4E49C8FDD7C5799E5CB096172",
+                                      "IssuerTBSHashSize":  "32",
+                                      "IssuerTBSHash":  "4E80BE107C860DE896384B3EFF50504DC2D76AC7151DF3102A4450637A032146",
+                                      "EKUsSize":  "21",
+                                      "EKUs":  "020A2B0601040182370A0306082B06010505070303",
+                                      "KnownRoot":  "6"
+                                  },
+                       "message":  "Signature information for Code Integrity policy ID {0283ac0f-fff1-49ae-ada1-8a933130cad6}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3116\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5954780Z\u0027/\u003e\u003cEventRecordID\u003e236\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{0283ac0f-fff1-49ae-ada1-8a933130cad6}\u003c/Data\u003e\u003cData Name=\u0027PublisherNameLength\u0027\u003e17\u003c/Data\u003e\u003cData Name=\u0027PublisherName\u0027\u003eMicrosoft Windows\u003c/Data\u003e\u003cData Name=\u0027IssuerNameLength\u0027\u003e37\u003c/Data\u003e\u003cData Name=\u0027IssuerName\u0027\u003eMicrosoft Windows Production PCA 2011\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHash\u0027\u003e7EEA6C24F02AF3ED4038C4E74491F687804FF0B4E49C8FDD7C5799E5CB096172\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHash\u0027\u003e4E80BE107C860DE896384B3EFF50504DC2D76AC7151DF3102A4450637A032146\u003c/Data\u003e\u003cData Name=\u0027EKUsSize\u0027\u003e21\u003c/Data\u003e\u003cData Name=\u0027EKUs\u0027\u003e020A2B0601040182370A0306082B06010505070303\u003c/Data\u003e\u003cData Name=\u0027KnownRoot\u0027\u003e6\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3099,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyNameLength":  "43",
+                                      "PolicyNameBuffer":  "VerifiedAndReputableDesktopTestSupplemental",
+                                      "PolicyIdLength":  "17",
+                                      "PolicyIdBuffer":  "22549.1000.220201",
+                                      "PolicyGUID":  "{0939ed82-bfd5-4d32-b58e-d31d3c49715a}",
+                                      "Status":  "0x0",
+                                      "Options":  "0xd9882b04",
+                                      "PolicyHashSize":  "32",
+                                      "PolicyHash":  "942D89E221816611B90E3F94E511F764DE7E70A82F133984E433EAF2C4649EEF",
+                                      "OptionsV2":  "0x0"
+                                  },
+                       "message":  "Refreshed and activated Code Integrity policy {0939ed82-bfd5-4d32-b58e-d31d3c49715a} VerifiedAndReputableDesktopTestSupplemental. id 22549.1000.220201. Status 0x0",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3099\u003c/EventID\u003e\u003cVersion\u003e2\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5954861Z\u0027/\u003e\u003cEventRecordID\u003e237\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyNameLength\u0027\u003e43\u003c/Data\u003e\u003cData Name=\u0027PolicyNameBuffer\u0027\u003eVerifiedAndReputableDesktopTestSupplemental\u003c/Data\u003e\u003cData Name=\u0027PolicyIdLength\u0027\u003e17\u003c/Data\u003e\u003cData Name=\u0027PolicyIdBuffer\u0027\u003e22549.1000.220201\u003c/Data\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{0939ed82-bfd5-4d32-b58e-d31d3c49715a}\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027Options\u0027\u003e0xd9882b04\u003c/Data\u003e\u003cData Name=\u0027PolicyHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PolicyHash\u0027\u003e942D89E221816611B90E3F94E511F764DE7E70A82F133984E433EAF2C4649EEF\u003c/Data\u003e\u003cData Name=\u0027OptionsV2\u0027\u003e0x0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3116,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{0939ed82-bfd5-4d32-b58e-d31d3c49715a}",
+                                      "PublisherNameLength":  "17",
+                                      "PublisherName":  "Microsoft Windows",
+                                      "IssuerNameLength":  "26",
+                                      "IssuerName":  "Microsoft Testing PCA 2010",
+                                      "PublisherTBSHashSize":  "32",
+                                      "PublisherTBSHash":  "BE46391C655C950E3BAFB8DDD82B060521233CE7F8A337CD5B076CA6C96B0285",
+                                      "IssuerTBSHashSize":  "32",
+                                      "IssuerTBSHash":  "F97717487E8C725B5403538C09B5CB8D919BDD618A6578E538CC5D2FF9442C06",
+                                      "EKUsSize":  "21",
+                                      "EKUs":  "02082B060105050703030A2B0601040182370A0306",
+                                      "KnownRoot":  "10"
+                                  },
+                       "message":  "Signature information for Code Integrity policy ID {0939ed82-bfd5-4d32-b58e-d31d3c49715a}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3116\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5954868Z\u0027/\u003e\u003cEventRecordID\u003e238\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{0939ed82-bfd5-4d32-b58e-d31d3c49715a}\u003c/Data\u003e\u003cData Name=\u0027PublisherNameLength\u0027\u003e17\u003c/Data\u003e\u003cData Name=\u0027PublisherName\u0027\u003eMicrosoft Windows\u003c/Data\u003e\u003cData Name=\u0027IssuerNameLength\u0027\u003e26\u003c/Data\u003e\u003cData Name=\u0027IssuerName\u0027\u003eMicrosoft Testing PCA 2010\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHash\u0027\u003eBE46391C655C950E3BAFB8DDD82B060521233CE7F8A337CD5B076CA6C96B0285\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHash\u0027\u003eF97717487E8C725B5403538C09B5CB8D919BDD618A6578E538CC5D2FF9442C06\u003c/Data\u003e\u003cData Name=\u0027EKUsSize\u0027\u003e21\u003c/Data\u003e\u003cData Name=\u0027EKUs\u0027\u003e02082B060105050703030A2B0601040182370A0306\u003c/Data\u003e\u003cData Name=\u0027KnownRoot\u0027\u003e10\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3099,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyNameLength":  "45",
+                                      "PolicyNameBuffer":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                      "PolicyIdLength":  "17",
+                                      "PolicyIdBuffer":  "27766.241221-1700",
+                                      "PolicyGUID":  "{1678656c-05ef-481f-bc5b-ebd8c991502d}",
+                                      "Status":  "0x0",
+                                      "Options":  "0xd1882304",
+                                      "PolicyHashSize":  "32",
+                                      "PolicyHash":  "140CE61A30A209A23B5D43906C9BF0E8AFCD7C2CFA952F5CD04E8058EBBFAFE2",
+                                      "OptionsV2":  "0x0"
+                                  },
+                       "message":  "Refreshed and activated Code Integrity policy {1678656c-05ef-481f-bc5b-ebd8c991502d} VerifiedAndReputableDesktopFlightSupplemental. id 27766.241221-1700. Status 0x0",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3099\u003c/EventID\u003e\u003cVersion\u003e2\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5954924Z\u0027/\u003e\u003cEventRecordID\u003e239\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyNameLength\u0027\u003e45\u003c/Data\u003e\u003cData Name=\u0027PolicyNameBuffer\u0027\u003eVerifiedAndReputableDesktopFlightSupplemental\u003c/Data\u003e\u003cData Name=\u0027PolicyIdLength\u0027\u003e17\u003c/Data\u003e\u003cData Name=\u0027PolicyIdBuffer\u0027\u003e27766.241221-1700\u003c/Data\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{1678656c-05ef-481f-bc5b-ebd8c991502d}\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027Options\u0027\u003e0xd1882304\u003c/Data\u003e\u003cData Name=\u0027PolicyHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PolicyHash\u0027\u003e140CE61A30A209A23B5D43906C9BF0E8AFCD7C2CFA952F5CD04E8058EBBFAFE2\u003c/Data\u003e\u003cData Name=\u0027OptionsV2\u0027\u003e0x0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3116,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "PolicyGUID":  "{1678656c-05ef-481f-bc5b-ebd8c991502d}",
+                                      "PublisherNameLength":  "17",
+                                      "PublisherName":  "Microsoft Windows",
+                                      "IssuerNameLength":  "37",
+                                      "IssuerName":  "Microsoft Windows Production PCA 2011",
+                                      "PublisherTBSHashSize":  "32",
+                                      "PublisherTBSHash":  "C410420868AA33AF46A70068BDE20161C863ECAABA0B74B2060923606CB6801C",
+                                      "IssuerTBSHashSize":  "32",
+                                      "IssuerTBSHash":  "4E80BE107C860DE896384B3EFF50504DC2D76AC7151DF3102A4450637A032146",
+                                      "EKUsSize":  "21",
+                                      "EKUs":  "020A2B0601040182370A0306082B06010505070303",
+                                      "KnownRoot":  "6"
+                                  },
+                       "message":  "Signature information for Code Integrity policy ID {1678656c-05ef-481f-bc5b-ebd8c991502d}.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3116\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5954931Z\u0027/\u003e\u003cEventRecordID\u003e240\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{1678656c-05ef-481f-bc5b-ebd8c991502d}\u003c/Data\u003e\u003cData Name=\u0027PublisherNameLength\u0027\u003e17\u003c/Data\u003e\u003cData Name=\u0027PublisherName\u0027\u003eMicrosoft Windows\u003c/Data\u003e\u003cData Name=\u0027IssuerNameLength\u0027\u003e37\u003c/Data\u003e\u003cData Name=\u0027IssuerName\u0027\u003eMicrosoft Windows Production PCA 2011\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHash\u0027\u003eC410420868AA33AF46A70068BDE20161C863ECAABA0B74B2060923606CB6801C\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHash\u0027\u003e4E80BE107C860DE896384B3EFF50504DC2D76AC7151DF3102A4450637A032146\u003c/Data\u003e\u003cData Name=\u0027EKUsSize\u0027\u003e21\u003c/Data\u003e\u003cData Name=\u0027EKUs\u0027\u003e020A2B0601040182370A0306082B06010505070303\u003c/Data\u003e\u003cData Name=\u0027KnownRoot\u0027\u003e6\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3102,
+                       "time":  "2026-10-03T23:28:52.595Z",
+                       "level":  4,
+                       "fields":  {
+                                      "NumberOfPolicies":  "7",
+                                      "Status":  "0x0"
+                                  },
+                       "message":  "Code Integrity policy refresh finished for 7 policies.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3102\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e21\u003c/Task\u003e\u003cOpcode\u003e131\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:28:52.5957066Z\u0027/\u003e\u003cEventRecordID\u003e241\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\u00274736\u0027 ThreadID=\u00277884\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027NumberOfPolicies\u0027\u003e7\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0x0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3033,
+                       "time":  "2026-10-03T23:29:11.714Z",
+                       "level":  2,
+                       "fields":  {
+                                      "FileNameLength":  "137",
+                                      "FileNameBuffer":  "\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\x64\\cys-0.14.42-updater-K9rtI2\\cys-0.14.42-installer.exe",
+                                      "ProcessNameLength":  "72",
+                                      "ProcessNameBuffer":  "\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-x64.exe",
+                                      "RequestedPolicy":  "2",
+                                      "ValidatedPolicy":  "1",
+                                      "Status":  "3236495362"
+                                  },
+                       "message":  "Code Integrity determined that a process (\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-x64.exe) attempted to load \\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\x64\\cys-0.14.42-updater-K9rtI2\\cys-0.14.42-installer.exe that did not meet the Enterprise signing level requirements.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3033\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e2\u003c/Level\u003e\u003cTask\u003e1\u003c/Task\u003e\u003cOpcode\u003e111\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:29:11.7142270Z\u0027/\u003e\u003cEventRecordID\u003e242\u003c/EventRecordID\u003e\u003cCorrelation ActivityID=\u0027{4b04d680-139f-0002-d982-920d8e53dd01}\u0027/\u003e\u003cExecution ProcessID=\u00274804\u0027 ThreadID=\u00272964\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027FileNameLength\u0027\u003e137\u003c/Data\u003e\u003cData Name=\u0027FileNameBuffer\u0027\u003e\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\x64\\cys-0.14.42-updater-K9rtI2\\cys-0.14.42-installer.exe\u003c/Data\u003e\u003cData Name=\u0027ProcessNameLength\u0027\u003e72\u003c/Data\u003e\u003cData Name=\u0027ProcessNameBuffer\u0027\u003e\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-x64.exe\u003c/Data\u003e\u003cData Name=\u0027RequestedPolicy\u0027\u003e2\u003c/Data\u003e\u003cData Name=\u0027ValidatedPolicy\u0027\u003e1\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e3236495362\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3089,
+                       "time":  "2026-10-03T23:29:11.714Z",
+                       "level":  4,
+                       "fields":  {
+                                      "TotalSignatureCount":  "0",
+                                      "Signature":  "0",
+                                      "CacheState":  "3",
+                                      "Hash Size":  "32",
+                                      "Hash":  "9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA",
+                                      "PageHash":  "false",
+                                      "SignatureType":  "0",
+                                      "ValidatedSigningLevel":  "0",
+                                      "VerificationError":  "0",
+                                      "Flags":  "0",
+                                      "PolicyBits":  "0",
+                                      "NotValidBefore":  "1601-01-01T00:00:00.0000000Z",
+                                      "NotValidAfter":  "1601-01-01T00:00:00.0000000Z",
+                                      "PublisherNameLength":  "7",
+                                      "PublisherName":  "Unknown",
+                                      "IssuerNameLength":  "7",
+                                      "IssuerName":  "Unknown",
+                                      "PublisherTBSHashSize":  "0",
+                                      "PublisherTBSHash":  "",
+                                      "IssuerTBSHashSize":  "0",
+                                      "IssuerTBSHash":  "",
+                                      "OPUSInfoLength":  "4",
+                                      "OPUSInfo":  "None",
+                                      "EKUsSize":  "0",
+                                      "EKUs":  "",
+                                      "KnownRoot":  "0"
+                                  },
+                       "message":  "Signature information for another event. Match using the Correlation Id.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3089\u003c/EventID\u003e\u003cVersion\u003e3\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e1\u003c/Task\u003e\u003cOpcode\u003e130\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:29:11.7142285Z\u0027/\u003e\u003cEventRecordID\u003e243\u003c/EventRecordID\u003e\u003cCorrelation ActivityID=\u0027{4b04d680-139f-0002-d982-920d8e53dd01}\u0027/\u003e\u003cExecution ProcessID=\u00274804\u0027 ThreadID=\u00272964\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027TotalSignatureCount\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027Signature\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027CacheState\u0027\u003e3\u003c/Data\u003e\u003cData Name=\u0027Hash Size\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027Hash\u0027\u003e9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA\u003c/Data\u003e\u003cData Name=\u0027PageHash\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027SignatureType\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027ValidatedSigningLevel\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027VerificationError\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027Flags\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PolicyBits\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027NotValidBefore\u0027\u003e1601-01-01T00:00:00.0000000Z\u003c/Data\u003e\u003cData Name=\u0027NotValidAfter\u0027\u003e1601-01-01T00:00:00.0000000Z\u003c/Data\u003e\u003cData Name=\u0027PublisherNameLength\u0027\u003e7\u003c/Data\u003e\u003cData Name=\u0027PublisherName\u0027\u003eUnknown\u003c/Data\u003e\u003cData Name=\u0027IssuerNameLength\u0027\u003e7\u003c/Data\u003e\u003cData Name=\u0027IssuerName\u0027\u003eUnknown\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHashSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHash\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHashSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHash\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027OPUSInfoLength\u0027\u003e4\u003c/Data\u003e\u003cData Name=\u0027OPUSInfo\u0027\u003eNone\u003c/Data\u003e\u003cData Name=\u0027EKUsSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027EKUs\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027KnownRoot\u0027\u003e0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3033,
+                       "time":  "2026-10-03T23:29:11.736Z",
+                       "level":  2,
+                       "fields":  {
+                                      "FileNameLength":  "141",
+                                      "FileNameBuffer":  "\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\aarch64\\cys-0.14.42-updater-eLRIzu\\cys-0.14.42-installer.exe",
+                                      "ProcessNameLength":  "76",
+                                      "ProcessNameBuffer":  "\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-aarch64.exe",
+                                      "RequestedPolicy":  "2",
+                                      "ValidatedPolicy":  "1",
+                                      "Status":  "3236495362"
+                                  },
+                       "message":  "Code Integrity determined that a process (\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-aarch64.exe) attempted to load \\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\aarch64\\cys-0.14.42-updater-eLRIzu\\cys-0.14.42-installer.exe that did not meet the Enterprise signing level requirements.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3033\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e2\u003c/Level\u003e\u003cTask\u003e1\u003c/Task\u003e\u003cOpcode\u003e111\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:29:11.7363826Z\u0027/\u003e\u003cEventRecordID\u003e244\u003c/EventRecordID\u003e\u003cCorrelation ActivityID=\u0027{4b04d680-139f-0001-4885-920d8e53dd01}\u0027/\u003e\u003cExecution ProcessID=\u00272296\u0027 ThreadID=\u00277268\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027FileNameLength\u0027\u003e141\u003c/Data\u003e\u003cData Name=\u0027FileNameBuffer\u0027\u003e\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\aarch64\\cys-0.14.42-updater-eLRIzu\\cys-0.14.42-installer.exe\u003c/Data\u003e\u003cData Name=\u0027ProcessNameLength\u0027\u003e76\u003c/Data\u003e\u003cData Name=\u0027ProcessNameBuffer\u0027\u003e\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-aarch64.exe\u003c/Data\u003e\u003cData Name=\u0027RequestedPolicy\u0027\u003e2\u003c/Data\u003e\u003cData Name=\u0027ValidatedPolicy\u0027\u003e1\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e3236495362\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3089,
+                       "time":  "2026-10-03T23:29:11.736Z",
+                       "level":  4,
+                       "fields":  {
+                                      "TotalSignatureCount":  "0",
+                                      "Signature":  "0",
+                                      "CacheState":  "3",
+                                      "Hash Size":  "32",
+                                      "Hash":  "9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA",
+                                      "PageHash":  "false",
+                                      "SignatureType":  "0",
+                                      "ValidatedSigningLevel":  "0",
+                                      "VerificationError":  "0",
+                                      "Flags":  "0",
+                                      "PolicyBits":  "0",
+                                      "NotValidBefore":  "1601-01-01T00:00:00.0000000Z",
+                                      "NotValidAfter":  "1601-01-01T00:00:00.0000000Z",
+                                      "PublisherNameLength":  "7",
+                                      "PublisherName":  "Unknown",
+                                      "IssuerNameLength":  "7",
+                                      "IssuerName":  "Unknown",
+                                      "PublisherTBSHashSize":  "0",
+                                      "PublisherTBSHash":  "",
+                                      "IssuerTBSHashSize":  "0",
+                                      "IssuerTBSHash":  "",
+                                      "OPUSInfoLength":  "4",
+                                      "OPUSInfo":  "None",
+                                      "EKUsSize":  "0",
+                                      "EKUs":  "",
+                                      "KnownRoot":  "0"
+                                  },
+                       "message":  "Signature information for another event. Match using the Correlation Id.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3089\u003c/EventID\u003e\u003cVersion\u003e3\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e1\u003c/Task\u003e\u003cOpcode\u003e130\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:29:11.7363839Z\u0027/\u003e\u003cEventRecordID\u003e245\u003c/EventRecordID\u003e\u003cCorrelation ActivityID=\u0027{4b04d680-139f-0001-4885-920d8e53dd01}\u0027/\u003e\u003cExecution ProcessID=\u00272296\u0027 ThreadID=\u00277268\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027TotalSignatureCount\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027Signature\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027CacheState\u0027\u003e3\u003c/Data\u003e\u003cData Name=\u0027Hash Size\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027Hash\u0027\u003e9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA\u003c/Data\u003e\u003cData Name=\u0027PageHash\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027SignatureType\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027ValidatedSigningLevel\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027VerificationError\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027Flags\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PolicyBits\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027NotValidBefore\u0027\u003e1601-01-01T00:00:00.0000000Z\u003c/Data\u003e\u003cData Name=\u0027NotValidAfter\u0027\u003e1601-01-01T00:00:00.0000000Z\u003c/Data\u003e\u003cData Name=\u0027PublisherNameLength\u0027\u003e7\u003c/Data\u003e\u003cData Name=\u0027PublisherName\u0027\u003eUnknown\u003c/Data\u003e\u003cData Name=\u0027IssuerNameLength\u0027\u003e7\u003c/Data\u003e\u003cData Name=\u0027IssuerName\u0027\u003eUnknown\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHashSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHash\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHashSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHash\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027OPUSInfoLength\u0027\u003e4\u003c/Data\u003e\u003cData Name=\u0027OPUSInfo\u0027\u003eNone\u003c/Data\u003e\u003cData Name=\u0027EKUsSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027EKUs\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027KnownRoot\u0027\u003e0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3077,
+                       "time":  "2026-10-03T23:29:12.541Z",
+                       "level":  2,
+                       "fields":  {
+                                      "FileNameLength":  "137",
+                                      "File Name":  "\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\x64\\cys-0.14.42-updater-K9rtI2\\cys-0.14.42-installer.exe",
+                                      "ProcessNameLength":  "72",
+                                      "Process Name":  "\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-x64.exe",
+                                      "Requested Signing Level":  "2",
+                                      "Validated Signing Level":  "1",
+                                      "Status":  "0xc0e90002",
+                                      "SHA1 Hash Size":  "20",
+                                      "SHA1 Hash":  "E12B2C16EEC1DA582F863A6949DB0B2E76C31751",
+                                      "SHA256 Hash Size":  "32",
+                                      "SHA256 Hash":  "9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA",
+                                      "SHA1 Flat Hash Size":  "20",
+                                      "SHA1 Flat Hash":  "A9B06BD0224C12C6027984CAC1B96C425EE205E8",
+                                      "SHA256 Flat Hash Size":  "32",
+                                      "SHA256 Flat Hash":  "E0810A429C757D81E33C7B3655FD55AAA746BE94ECFD68961E6C2D6DA0EEC37E",
+                                      "USN":  "663665640",
+                                      "SI Signing Scenario":  "1",
+                                      "PolicyNameLength":  "27",
+                                      "PolicyName":  "VerifiedAndReputableDesktop",
+                                      "PolicyIDLength":  "17",
+                                      "PolicyID":  "27555.1000.240208",
+                                      "PolicyHashSize":  "32",
+                                      "PolicyHash":  "2668895A5B233A80432D00D67251D7B7F52686A3FB13780F4B242C5A1F937A01",
+                                      "OriginalFileNameLength":  "0",
+                                      "OriginalFileName":  "",
+                                      "InternalNameLength":  "0",
+                                      "InternalName":  "",
+                                      "FileDescriptionLength":  "3",
+                                      "FileDescription":  "cys",
+                                      "ProductNameLength":  "3",
+                                      "ProductName":  "cys",
+                                      "FileVersion":  "0.14.42.0",
+                                      "PolicyGUID":  "{0283ac0f-fff1-49ae-ada1-8a933130cad6}",
+                                      "UserWriteable":  "true",
+                                      "PackageFamilyNameLength":  "0",
+                                      "PackageFamilyName":  ""
+                                  },
+                       "message":  "Code Integrity determined that a process (\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-x64.exe) attempted to load \\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\x64\\cys-0.14.42-updater-K9rtI2\\cys-0.14.42-installer.exe that did not meet the Enterprise signing level requirements or violated code integrity policy (Policy ID:{0283ac0f-fff1-49ae-ada1-8a933130cad6}).",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3077\u003c/EventID\u003e\u003cVersion\u003e5\u003c/Version\u003e\u003cLevel\u003e2\u003c/Level\u003e\u003cTask\u003e18\u003c/Task\u003e\u003cOpcode\u003e111\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:29:12.5419076Z\u0027/\u003e\u003cEventRecordID\u003e246\u003c/EventRecordID\u003e\u003cCorrelation ActivityID=\u0027{4b04d680-139f-0002-d982-920d8e53dd01}\u0027/\u003e\u003cExecution ProcessID=\u00274804\u0027 ThreadID=\u00272964\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027FileNameLength\u0027\u003e137\u003c/Data\u003e\u003cData Name=\u0027File Name\u0027\u003e\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\x64\\cys-0.14.42-updater-K9rtI2\\cys-0.14.42-installer.exe\u003c/Data\u003e\u003cData Name=\u0027ProcessNameLength\u0027\u003e72\u003c/Data\u003e\u003cData Name=\u0027Process Name\u0027\u003e\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-x64.exe\u003c/Data\u003e\u003cData Name=\u0027Requested Signing Level\u0027\u003e2\u003c/Data\u003e\u003cData Name=\u0027Validated Signing Level\u0027\u003e1\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0xc0e90002\u003c/Data\u003e\u003cData Name=\u0027SHA1 Hash Size\u0027\u003e20\u003c/Data\u003e\u003cData Name=\u0027SHA1 Hash\u0027\u003eE12B2C16EEC1DA582F863A6949DB0B2E76C31751\u003c/Data\u003e\u003cData Name=\u0027SHA256 Hash Size\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027SHA256 Hash\u0027\u003e9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA\u003c/Data\u003e\u003cData Name=\u0027SHA1 Flat Hash Size\u0027\u003e20\u003c/Data\u003e\u003cData Name=\u0027SHA1 Flat Hash\u0027\u003eA9B06BD0224C12C6027984CAC1B96C425EE205E8\u003c/Data\u003e\u003cData Name=\u0027SHA256 Flat Hash Size\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027SHA256 Flat Hash\u0027\u003eE0810A429C757D81E33C7B3655FD55AAA746BE94ECFD68961E6C2D6DA0EEC37E\u003c/Data\u003e\u003cData Name=\u0027USN\u0027\u003e663665640\u003c/Data\u003e\u003cData Name=\u0027SI Signing Scenario\u0027\u003e1\u003c/Data\u003e\u003cData Name=\u0027PolicyNameLength\u0027\u003e27\u003c/Data\u003e\u003cData Name=\u0027PolicyName\u0027\u003eVerifiedAndReputableDesktop\u003c/Data\u003e\u003cData Name=\u0027PolicyIDLength\u0027\u003e17\u003c/Data\u003e\u003cData Name=\u0027PolicyID\u0027\u003e27555.1000.240208\u003c/Data\u003e\u003cData Name=\u0027PolicyHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PolicyHash\u0027\u003e2668895A5B233A80432D00D67251D7B7F52686A3FB13780F4B242C5A1F937A01\u003c/Data\u003e\u003cData Name=\u0027OriginalFileNameLength\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027OriginalFileName\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027InternalNameLength\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027InternalName\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027FileDescriptionLength\u0027\u003e3\u003c/Data\u003e\u003cData Name=\u0027FileDescription\u0027\u003ecys\u003c/Data\u003e\u003cData Name=\u0027ProductNameLength\u0027\u003e3\u003c/Data\u003e\u003cData Name=\u0027ProductName\u0027\u003ecys\u003c/Data\u003e\u003cData Name=\u0027FileVersion\u0027\u003e0.14.42.0\u003c/Data\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{0283ac0f-fff1-49ae-ada1-8a933130cad6}\u003c/Data\u003e\u003cData Name=\u0027UserWriteable\u0027\u003etrue\u003c/Data\u003e\u003cData Name=\u0027PackageFamilyNameLength\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PackageFamilyName\u0027\u003e\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3089,
+                       "time":  "2026-10-03T23:29:12.541Z",
+                       "level":  4,
+                       "fields":  {
+                                      "TotalSignatureCount":  "0",
+                                      "Signature":  "0",
+                                      "CacheState":  "3",
+                                      "Hash Size":  "32",
+                                      "Hash":  "9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA",
+                                      "PageHash":  "false",
+                                      "SignatureType":  "0",
+                                      "ValidatedSigningLevel":  "0",
+                                      "VerificationError":  "0",
+                                      "Flags":  "0",
+                                      "PolicyBits":  "0",
+                                      "NotValidBefore":  "1601-01-01T00:00:00.0000000Z",
+                                      "NotValidAfter":  "1601-01-01T00:00:00.0000000Z",
+                                      "PublisherNameLength":  "7",
+                                      "PublisherName":  "Unknown",
+                                      "IssuerNameLength":  "7",
+                                      "IssuerName":  "Unknown",
+                                      "PublisherTBSHashSize":  "0",
+                                      "PublisherTBSHash":  "",
+                                      "IssuerTBSHashSize":  "0",
+                                      "IssuerTBSHash":  "",
+                                      "OPUSInfoLength":  "4",
+                                      "OPUSInfo":  "None",
+                                      "EKUsSize":  "0",
+                                      "EKUs":  "",
+                                      "KnownRoot":  "0"
+                                  },
+                       "message":  "Signature information for another event. Match using the Correlation Id.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3089\u003c/EventID\u003e\u003cVersion\u003e3\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e1\u003c/Task\u003e\u003cOpcode\u003e130\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:29:12.5419113Z\u0027/\u003e\u003cEventRecordID\u003e247\u003c/EventRecordID\u003e\u003cCorrelation ActivityID=\u0027{4b04d680-139f-0002-d982-920d8e53dd01}\u0027/\u003e\u003cExecution ProcessID=\u00274804\u0027 ThreadID=\u00272964\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027TotalSignatureCount\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027Signature\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027CacheState\u0027\u003e3\u003c/Data\u003e\u003cData Name=\u0027Hash Size\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027Hash\u0027\u003e9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA\u003c/Data\u003e\u003cData Name=\u0027PageHash\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027SignatureType\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027ValidatedSigningLevel\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027VerificationError\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027Flags\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PolicyBits\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027NotValidBefore\u0027\u003e1601-01-01T00:00:00.0000000Z\u003c/Data\u003e\u003cData Name=\u0027NotValidAfter\u0027\u003e1601-01-01T00:00:00.0000000Z\u003c/Data\u003e\u003cData Name=\u0027PublisherNameLength\u0027\u003e7\u003c/Data\u003e\u003cData Name=\u0027PublisherName\u0027\u003eUnknown\u003c/Data\u003e\u003cData Name=\u0027IssuerNameLength\u0027\u003e7\u003c/Data\u003e\u003cData Name=\u0027IssuerName\u0027\u003eUnknown\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHashSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHash\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHashSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHash\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027OPUSInfoLength\u0027\u003e4\u003c/Data\u003e\u003cData Name=\u0027OPUSInfo\u0027\u003eNone\u003c/Data\u003e\u003cData Name=\u0027EKUsSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027EKUs\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027KnownRoot\u0027\u003e0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3118,
+                       "time":  "2026-10-03T23:29:12.541Z",
+                       "level":  4,
+                       "fields":  {
+                                      "FileNameLength":  "137",
+                                      "FileNameBuffer":  "\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\x64\\cys-0.14.42-updater-K9rtI2\\cys-0.14.42-installer.exe",
+                                      "SHA256FlatHashSize":  "32",
+                                      "SHA256FlatHash":  "E0810A429C757D81E33C7B3655FD55AAA746BE94ECFD68961E6C2D6DA0EEC37E",
+                                      "DefenderStatusCode":  "0x0",
+                                      "DefenderCatDbFailureStage":  "0",
+                                      "DefenderCatDbFailure":  "0x0",
+                                      "DefenderTrust":  "-16777216",
+                                      "DefenderScanResultDetails":  "16777215",
+                                      "DefenderTrustExpiryTime ":  "-6935040687914090496",
+                                      "CachedDefenderTrust":  "122195",
+                                      "CachedDefenderTrustExpiryTime ":  "0",
+                                      "DefenderClientStatusCode":  "0",
+                                      "DefenderCloudHTTPCode":  "0x0",
+                                      "DefenderShellExecutedStatusCode":  "0x0",
+                                      "DefenderShellExecutedClientStatusCode":  "0",
+                                      "DefenderShellExecutedCloudHTTPCode":  "0x0",
+                                      "DefenderEngineReportGUID":  "{00000000-0000-0000-0000-000000000000}",
+                                      "DefenderShellExecutedEngineReportGUID":  "{00000000-0000-0000-0000-000000000000}",
+                                      "IsUnfriendlyFile":  "false",
+                                      "DefenderCalled":  "true",
+                                      "DefenderCallAttempted":  "true",
+                                      "DefenderCloudCallRequested":  "true",
+                                      "DefenderMadeCloudCall":  "false",
+                                      "DefenderShellExecutedCalled":  "false",
+                                      "DefenderShellExecutedMadeCloudCall":  "false",
+                                      "EADefenderTrustCached":  "false",
+                                      "TTLValid":  "false",
+                                      "DefenderDisabled":  "false",
+                                      "ExternalAuthorizationFlags":  "131104",
+                                      "EnablementSwitchType":  "0",
+                                      "PreviousEnablementState":  "-1",
+                                      "DefenderThreatNameLength":  "0",
+                                      "DefenderThreatName":  "",
+                                      "DefenderShellExecutedThreatNameLength":  "0",
+                                      "DefenderShellExecutedThreatName":  ""
+                                  },
+                       "message":  "Smart App Control Block Deteails",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3118\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e1\u003c/Task\u003e\u003cOpcode\u003e136\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:29:12.5419262Z\u0027/\u003e\u003cEventRecordID\u003e248\u003c/EventRecordID\u003e\u003cCorrelation ActivityID=\u0027{4b04d680-139f-0002-d982-920d8e53dd01}\u0027/\u003e\u003cExecution ProcessID=\u00274804\u0027 ThreadID=\u00272964\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027FileNameLength\u0027\u003e137\u003c/Data\u003e\u003cData Name=\u0027FileNameBuffer\u0027\u003e\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\x64\\cys-0.14.42-updater-K9rtI2\\cys-0.14.42-installer.exe\u003c/Data\u003e\u003cData Name=\u0027SHA256FlatHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027SHA256FlatHash\u0027\u003eE0810A429C757D81E33C7B3655FD55AAA746BE94ECFD68961E6C2D6DA0EEC37E\u003c/Data\u003e\u003cData Name=\u0027DefenderStatusCode\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027DefenderCatDbFailureStage\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderCatDbFailure\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027DefenderTrust\u0027\u003e-16777216\u003c/Data\u003e\u003cData Name=\u0027DefenderScanResultDetails\u0027\u003e16777215\u003c/Data\u003e\u003cData Name=\u0027DefenderTrustExpiryTime \u0027\u003e-6935040687914090496\u003c/Data\u003e\u003cData Name=\u0027CachedDefenderTrust\u0027\u003e122195\u003c/Data\u003e\u003cData Name=\u0027CachedDefenderTrustExpiryTime \u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderClientStatusCode\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderCloudHTTPCode\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedStatusCode\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedClientStatusCode\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedCloudHTTPCode\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027DefenderEngineReportGUID\u0027\u003e{00000000-0000-0000-0000-000000000000}\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedEngineReportGUID\u0027\u003e{00000000-0000-0000-0000-000000000000}\u003c/Data\u003e\u003cData Name=\u0027IsUnfriendlyFile\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027DefenderCalled\u0027\u003etrue\u003c/Data\u003e\u003cData Name=\u0027DefenderCallAttempted\u0027\u003etrue\u003c/Data\u003e\u003cData Name=\u0027DefenderCloudCallRequested\u0027\u003etrue\u003c/Data\u003e\u003cData Name=\u0027DefenderMadeCloudCall\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedCalled\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedMadeCloudCall\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027EADefenderTrustCached\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027TTLValid\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027DefenderDisabled\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027ExternalAuthorizationFlags\u0027\u003e131104\u003c/Data\u003e\u003cData Name=\u0027EnablementSwitchType\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PreviousEnablementState\u0027\u003e-1\u003c/Data\u003e\u003cData Name=\u0027DefenderThreatNameLength\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderThreatName\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedThreatNameLength\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedThreatName\u0027\u003e\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3077,
+                       "time":  "2026-10-03T23:29:12.571Z",
+                       "level":  2,
+                       "fields":  {
+                                      "FileNameLength":  "141",
+                                      "File Name":  "\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\aarch64\\cys-0.14.42-updater-eLRIzu\\cys-0.14.42-installer.exe",
+                                      "ProcessNameLength":  "76",
+                                      "Process Name":  "\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-aarch64.exe",
+                                      "Requested Signing Level":  "2",
+                                      "Validated Signing Level":  "1",
+                                      "Status":  "0xc0e90002",
+                                      "SHA1 Hash Size":  "20",
+                                      "SHA1 Hash":  "E12B2C16EEC1DA582F863A6949DB0B2E76C31751",
+                                      "SHA256 Hash Size":  "32",
+                                      "SHA256 Hash":  "9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA",
+                                      "SHA1 Flat Hash Size":  "20",
+                                      "SHA1 Flat Hash":  "A9B06BD0224C12C6027984CAC1B96C425EE205E8",
+                                      "SHA256 Flat Hash Size":  "32",
+                                      "SHA256 Flat Hash":  "E0810A429C757D81E33C7B3655FD55AAA746BE94ECFD68961E6C2D6DA0EEC37E",
+                                      "USN":  "663666168",
+                                      "SI Signing Scenario":  "1",
+                                      "PolicyNameLength":  "27",
+                                      "PolicyName":  "VerifiedAndReputableDesktop",
+                                      "PolicyIDLength":  "17",
+                                      "PolicyID":  "27555.1000.240208",
+                                      "PolicyHashSize":  "32",
+                                      "PolicyHash":  "2668895A5B233A80432D00D67251D7B7F52686A3FB13780F4B242C5A1F937A01",
+                                      "OriginalFileNameLength":  "0",
+                                      "OriginalFileName":  "",
+                                      "InternalNameLength":  "0",
+                                      "InternalName":  "",
+                                      "FileDescriptionLength":  "3",
+                                      "FileDescription":  "cys",
+                                      "ProductNameLength":  "3",
+                                      "ProductName":  "cys",
+                                      "FileVersion":  "0.14.42.0",
+                                      "PolicyGUID":  "{0283ac0f-fff1-49ae-ada1-8a933130cad6}",
+                                      "UserWriteable":  "true",
+                                      "PackageFamilyNameLength":  "0",
+                                      "PackageFamilyName":  ""
+                                  },
+                       "message":  "Code Integrity determined that a process (\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-aarch64.exe) attempted to load \\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\aarch64\\cys-0.14.42-updater-eLRIzu\\cys-0.14.42-installer.exe that did not meet the Enterprise signing level requirements or violated code integrity policy (Policy ID:{0283ac0f-fff1-49ae-ada1-8a933130cad6}).",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3077\u003c/EventID\u003e\u003cVersion\u003e5\u003c/Version\u003e\u003cLevel\u003e2\u003c/Level\u003e\u003cTask\u003e18\u003c/Task\u003e\u003cOpcode\u003e111\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:29:12.5714221Z\u0027/\u003e\u003cEventRecordID\u003e249\u003c/EventRecordID\u003e\u003cCorrelation ActivityID=\u0027{4b04d680-139f-0001-4885-920d8e53dd01}\u0027/\u003e\u003cExecution ProcessID=\u00272296\u0027 ThreadID=\u00277268\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027FileNameLength\u0027\u003e141\u003c/Data\u003e\u003cData Name=\u0027File Name\u0027\u003e\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\aarch64\\cys-0.14.42-updater-eLRIzu\\cys-0.14.42-installer.exe\u003c/Data\u003e\u003cData Name=\u0027ProcessNameLength\u0027\u003e76\u003c/Data\u003e\u003cData Name=\u0027Process Name\u0027\u003e\\Device\\HarddiskVolume4\\a\\_temp\\diag-work\\product\\bin\\sac-launch-aarch64.exe\u003c/Data\u003e\u003cData Name=\u0027Requested Signing Level\u0027\u003e2\u003c/Data\u003e\u003cData Name=\u0027Validated Signing Level\u0027\u003e1\u003c/Data\u003e\u003cData Name=\u0027Status\u0027\u003e0xc0e90002\u003c/Data\u003e\u003cData Name=\u0027SHA1 Hash Size\u0027\u003e20\u003c/Data\u003e\u003cData Name=\u0027SHA1 Hash\u0027\u003eE12B2C16EEC1DA582F863A6949DB0B2E76C31751\u003c/Data\u003e\u003cData Name=\u0027SHA256 Hash Size\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027SHA256 Hash\u0027\u003e9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA\u003c/Data\u003e\u003cData Name=\u0027SHA1 Flat Hash Size\u0027\u003e20\u003c/Data\u003e\u003cData Name=\u0027SHA1 Flat Hash\u0027\u003eA9B06BD0224C12C6027984CAC1B96C425EE205E8\u003c/Data\u003e\u003cData Name=\u0027SHA256 Flat Hash Size\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027SHA256 Flat Hash\u0027\u003eE0810A429C757D81E33C7B3655FD55AAA746BE94ECFD68961E6C2D6DA0EEC37E\u003c/Data\u003e\u003cData Name=\u0027USN\u0027\u003e663666168\u003c/Data\u003e\u003cData Name=\u0027SI Signing Scenario\u0027\u003e1\u003c/Data\u003e\u003cData Name=\u0027PolicyNameLength\u0027\u003e27\u003c/Data\u003e\u003cData Name=\u0027PolicyName\u0027\u003eVerifiedAndReputableDesktop\u003c/Data\u003e\u003cData Name=\u0027PolicyIDLength\u0027\u003e17\u003c/Data\u003e\u003cData Name=\u0027PolicyID\u0027\u003e27555.1000.240208\u003c/Data\u003e\u003cData Name=\u0027PolicyHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027PolicyHash\u0027\u003e2668895A5B233A80432D00D67251D7B7F52686A3FB13780F4B242C5A1F937A01\u003c/Data\u003e\u003cData Name=\u0027OriginalFileNameLength\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027OriginalFileName\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027InternalNameLength\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027InternalName\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027FileDescriptionLength\u0027\u003e3\u003c/Data\u003e\u003cData Name=\u0027FileDescription\u0027\u003ecys\u003c/Data\u003e\u003cData Name=\u0027ProductNameLength\u0027\u003e3\u003c/Data\u003e\u003cData Name=\u0027ProductName\u0027\u003ecys\u003c/Data\u003e\u003cData Name=\u0027FileVersion\u0027\u003e0.14.42.0\u003c/Data\u003e\u003cData Name=\u0027PolicyGUID\u0027\u003e{0283ac0f-fff1-49ae-ada1-8a933130cad6}\u003c/Data\u003e\u003cData Name=\u0027UserWriteable\u0027\u003etrue\u003c/Data\u003e\u003cData Name=\u0027PackageFamilyNameLength\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PackageFamilyName\u0027\u003e\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3089,
+                       "time":  "2026-10-03T23:29:12.571Z",
+                       "level":  4,
+                       "fields":  {
+                                      "TotalSignatureCount":  "0",
+                                      "Signature":  "0",
+                                      "CacheState":  "3",
+                                      "Hash Size":  "32",
+                                      "Hash":  "9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA",
+                                      "PageHash":  "false",
+                                      "SignatureType":  "0",
+                                      "ValidatedSigningLevel":  "0",
+                                      "VerificationError":  "0",
+                                      "Flags":  "0",
+                                      "PolicyBits":  "0",
+                                      "NotValidBefore":  "1601-01-01T00:00:00.0000000Z",
+                                      "NotValidAfter":  "1601-01-01T00:00:00.0000000Z",
+                                      "PublisherNameLength":  "7",
+                                      "PublisherName":  "Unknown",
+                                      "IssuerNameLength":  "7",
+                                      "IssuerName":  "Unknown",
+                                      "PublisherTBSHashSize":  "0",
+                                      "PublisherTBSHash":  "",
+                                      "IssuerTBSHashSize":  "0",
+                                      "IssuerTBSHash":  "",
+                                      "OPUSInfoLength":  "4",
+                                      "OPUSInfo":  "None",
+                                      "EKUsSize":  "0",
+                                      "EKUs":  "",
+                                      "KnownRoot":  "0"
+                                  },
+                       "message":  "Signature information for another event. Match using the Correlation Id.",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3089\u003c/EventID\u003e\u003cVersion\u003e3\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e1\u003c/Task\u003e\u003cOpcode\u003e130\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:29:12.5714664Z\u0027/\u003e\u003cEventRecordID\u003e250\u003c/EventRecordID\u003e\u003cCorrelation ActivityID=\u0027{4b04d680-139f-0001-4885-920d8e53dd01}\u0027/\u003e\u003cExecution ProcessID=\u00272296\u0027 ThreadID=\u00277268\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027TotalSignatureCount\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027Signature\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027CacheState\u0027\u003e3\u003c/Data\u003e\u003cData Name=\u0027Hash Size\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027Hash\u0027\u003e9DA8F304172E149633F4C5A38EA22E4DFE7D519454E36B0188101F209A1A44FA\u003c/Data\u003e\u003cData Name=\u0027PageHash\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027SignatureType\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027ValidatedSigningLevel\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027VerificationError\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027Flags\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PolicyBits\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027NotValidBefore\u0027\u003e1601-01-01T00:00:00.0000000Z\u003c/Data\u003e\u003cData Name=\u0027NotValidAfter\u0027\u003e1601-01-01T00:00:00.0000000Z\u003c/Data\u003e\u003cData Name=\u0027PublisherNameLength\u0027\u003e7\u003c/Data\u003e\u003cData Name=\u0027PublisherName\u0027\u003eUnknown\u003c/Data\u003e\u003cData Name=\u0027IssuerNameLength\u0027\u003e7\u003c/Data\u003e\u003cData Name=\u0027IssuerName\u0027\u003eUnknown\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHashSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PublisherTBSHash\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHashSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027IssuerTBSHash\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027OPUSInfoLength\u0027\u003e4\u003c/Data\u003e\u003cData Name=\u0027OPUSInfo\u0027\u003eNone\u003c/Data\u003e\u003cData Name=\u0027EKUsSize\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027EKUs\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027KnownRoot\u0027\u003e0\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   },
+                   {
+                       "id":  3118,
+                       "time":  "2026-10-03T23:29:12.571Z",
+                       "level":  4,
+                       "fields":  {
+                                      "FileNameLength":  "141",
+                                      "FileNameBuffer":  "\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\aarch64\\cys-0.14.42-updater-eLRIzu\\cys-0.14.42-installer.exe",
+                                      "SHA256FlatHashSize":  "32",
+                                      "SHA256FlatHash":  "E0810A429C757D81E33C7B3655FD55AAA746BE94ECFD68961E6C2D6DA0EEC37E",
+                                      "DefenderStatusCode":  "0x0",
+                                      "DefenderCatDbFailureStage":  "0",
+                                      "DefenderCatDbFailure":  "0x0",
+                                      "DefenderTrust":  "-16777216",
+                                      "DefenderScanResultDetails":  "33554431",
+                                      "DefenderTrustExpiryTime ":  "-6935033810262163456",
+                                      "CachedDefenderTrust":  "122195",
+                                      "CachedDefenderTrustExpiryTime ":  "0",
+                                      "DefenderClientStatusCode":  "0",
+                                      "DefenderCloudHTTPCode":  "0x0",
+                                      "DefenderShellExecutedStatusCode":  "0x0",
+                                      "DefenderShellExecutedClientStatusCode":  "0",
+                                      "DefenderShellExecutedCloudHTTPCode":  "0x0",
+                                      "DefenderEngineReportGUID":  "{00000000-0000-0000-0000-000000000000}",
+                                      "DefenderShellExecutedEngineReportGUID":  "{00000000-0000-0000-0000-000000000000}",
+                                      "IsUnfriendlyFile":  "false",
+                                      "DefenderCalled":  "true",
+                                      "DefenderCallAttempted":  "true",
+                                      "DefenderCloudCallRequested":  "true",
+                                      "DefenderMadeCloudCall":  "false",
+                                      "DefenderShellExecutedCalled":  "false",
+                                      "DefenderShellExecutedMadeCloudCall":  "false",
+                                      "EADefenderTrustCached":  "false",
+                                      "TTLValid":  "false",
+                                      "DefenderDisabled":  "false",
+                                      "ExternalAuthorizationFlags":  "131104",
+                                      "EnablementSwitchType":  "0",
+                                      "PreviousEnablementState":  "-1",
+                                      "DefenderThreatNameLength":  "0",
+                                      "DefenderThreatName":  "",
+                                      "DefenderShellExecutedThreatNameLength":  "0",
+                                      "DefenderShellExecutedThreatName":  ""
+                                  },
+                       "message":  "Smart App Control Block Deteails",
+                       "xml":  "\u003cEvent xmlns=\u0027http://schemas.microsoft.com/win/2004/08/events/event\u0027\u003e\u003cSystem\u003e\u003cProvider Name=\u0027Microsoft-Windows-CodeIntegrity\u0027 Guid=\u0027{4ee76bd8-3cf4-44a0-a0ac-3937643e37a3}\u0027/\u003e\u003cEventID\u003e3118\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e1\u003c/Task\u003e\u003cOpcode\u003e136\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\u00272026-10-03T23:29:12.5714844Z\u0027/\u003e\u003cEventRecordID\u003e251\u003c/EventRecordID\u003e\u003cCorrelation ActivityID=\u0027{4b04d680-139f-0001-4885-920d8e53dd01}\u0027/\u003e\u003cExecution ProcessID=\u00272296\u0027 ThreadID=\u00277268\u0027/\u003e\u003cChannel\u003eMicrosoft-Windows-CodeIntegrity/Operational\u003c/Channel\u003e\u003cComputer\u003erunnervma5ngn\u003c/Computer\u003e\u003cSecurity UserID=\u0027S-1-5-21-1530905139-369497675-3745501163-500\u0027/\u003e\u003c/System\u003e\u003cEventData\u003e\u003cData Name=\u0027FileNameLength\u0027\u003e141\u003c/Data\u003e\u003cData Name=\u0027FileNameBuffer\u0027\u003e\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\diag-product-launch\\aarch64\\cys-0.14.42-updater-eLRIzu\\cys-0.14.42-installer.exe\u003c/Data\u003e\u003cData Name=\u0027SHA256FlatHashSize\u0027\u003e32\u003c/Data\u003e\u003cData Name=\u0027SHA256FlatHash\u0027\u003eE0810A429C757D81E33C7B3655FD55AAA746BE94ECFD68961E6C2D6DA0EEC37E\u003c/Data\u003e\u003cData Name=\u0027DefenderStatusCode\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027DefenderCatDbFailureStage\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderCatDbFailure\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027DefenderTrust\u0027\u003e-16777216\u003c/Data\u003e\u003cData Name=\u0027DefenderScanResultDetails\u0027\u003e33554431\u003c/Data\u003e\u003cData Name=\u0027DefenderTrustExpiryTime \u0027\u003e-6935033810262163456\u003c/Data\u003e\u003cData Name=\u0027CachedDefenderTrust\u0027\u003e122195\u003c/Data\u003e\u003cData Name=\u0027CachedDefenderTrustExpiryTime \u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderClientStatusCode\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderCloudHTTPCode\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedStatusCode\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedClientStatusCode\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedCloudHTTPCode\u0027\u003e0x0\u003c/Data\u003e\u003cData Name=\u0027DefenderEngineReportGUID\u0027\u003e{00000000-0000-0000-0000-000000000000}\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedEngineReportGUID\u0027\u003e{00000000-0000-0000-0000-000000000000}\u003c/Data\u003e\u003cData Name=\u0027IsUnfriendlyFile\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027DefenderCalled\u0027\u003etrue\u003c/Data\u003e\u003cData Name=\u0027DefenderCallAttempted\u0027\u003etrue\u003c/Data\u003e\u003cData Name=\u0027DefenderCloudCallRequested\u0027\u003etrue\u003c/Data\u003e\u003cData Name=\u0027DefenderMadeCloudCall\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedCalled\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedMadeCloudCall\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027EADefenderTrustCached\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027TTLValid\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027DefenderDisabled\u0027\u003efalse\u003c/Data\u003e\u003cData Name=\u0027ExternalAuthorizationFlags\u0027\u003e131104\u003c/Data\u003e\u003cData Name=\u0027EnablementSwitchType\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027PreviousEnablementState\u0027\u003e-1\u003c/Data\u003e\u003cData Name=\u0027DefenderThreatNameLength\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderThreatName\u0027\u003e\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedThreatNameLength\u0027\u003e0\u003c/Data\u003e\u003cData Name=\u0027DefenderShellExecutedThreatName\u0027\u003e\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e"
+                   }
+               ]
+}
