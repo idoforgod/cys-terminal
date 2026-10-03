@@ -1,0 +1,1847 @@
+{
+    "started":  "2026-10-03T20:11:22.178Z",
+    "matrix_os":  "windows-11-arm",
+    "native_ready":  true,
+    "original_value":  0,
+    "original_present":  true,
+    "states":  {
+                   "initial":  {
+                                   "tag":  "initial",
+                                   "time":  "2026-10-03T20:11:22.494Z",
+                                   "reg_rc":  0,
+                                   "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                   "reg_value":  0,
+                                   "reg_present":  true,
+                                   "citool_rc":  0,
+                                   "verified_and_reputable_names":  [
+                                                                        "VerifiedAndReputableDesktop",
+                                                                        "VerifiedAndReputableDesktopEvaluation",
+                                                                        "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                        "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                        "VerifiedAndReputableDesktopTestSupplemental",
+                                                                        "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                                    ],
+                                   "citool_matching_objects":  [
+                                                                   {
+                                                                       "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                       "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                       "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                       "Version":  0,
+                                                                       "VersionString":  "0.0.0.0",
+                                                                       "IsSystemPolicy":  true,
+                                                                       "IsSignedPolicy":  true,
+                                                                       "IsOnDisk":  true,
+                                                                       "IsEnforced":  false,
+                                                                       "IsAuthorized":  false,
+                                                                       "PolicyOptions":  [
+                                                                                             "Disabled:Runtime FilePath Rule Protection",
+                                                                                             "Enabled:Managed Installer"
+                                                                                         ]
+                                                                   },
+                                                                   {
+                                                                       "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                       "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                       "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                       "Version":  0,
+                                                                       "VersionString":  "0.0.0.0",
+                                                                       "IsSystemPolicy":  true,
+                                                                       "IsSignedPolicy":  true,
+                                                                       "IsOnDisk":  true,
+                                                                       "IsEnforced":  false,
+                                                                       "IsAuthorized":  false,
+                                                                       "PolicyOptions":  [
+                                                                                             "Disabled:Runtime FilePath Rule Protection",
+                                                                                             "Enabled:Managed Installer"
+                                                                                         ]
+                                                                   },
+                                                                   {
+                                                                       "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                       "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                       "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                       "Version":  0,
+                                                                       "VersionString":  "0.0.0.0",
+                                                                       "IsSystemPolicy":  true,
+                                                                       "IsSignedPolicy":  true,
+                                                                       "IsOnDisk":  true,
+                                                                       "IsEnforced":  false,
+                                                                       "IsAuthorized":  false,
+                                                                       "PolicyOptions":  [
+
+                                                                                         ]
+                                                                   },
+                                                                   {
+                                                                       "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                       "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                       "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                       "Version":  0,
+                                                                       "VersionString":  "0.0.0.0",
+                                                                       "IsSystemPolicy":  true,
+                                                                       "IsSignedPolicy":  true,
+                                                                       "IsOnDisk":  true,
+                                                                       "IsEnforced":  false,
+                                                                       "IsAuthorized":  false,
+                                                                       "PolicyOptions":  [
+
+                                                                                         ]
+                                                                   },
+                                                                   {
+                                                                       "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                       "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                       "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                                       "Version":  0,
+                                                                       "VersionString":  "0.0.0.0",
+                                                                       "IsSystemPolicy":  true,
+                                                                       "IsSignedPolicy":  true,
+                                                                       "IsOnDisk":  true,
+                                                                       "IsEnforced":  false,
+                                                                       "IsAuthorized":  false,
+                                                                       "PolicyOptions":  [
+                                                                                             "Enabled:UMCI",
+                                                                                             "Enabled:Intelligent Security Graph Authorization",
+                                                                                             "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                             "Enabled:Allow Supplemental Policies",
+                                                                                             "Enabled:Revoked Expired As Unsigned",
+                                                                                             "Enabled:Audit Mode",
+                                                                                             "Enabled:Inherit Default Policy",
+                                                                                             "Enabled:Unsigned System Integrity Policy",
+                                                                                             "Enabled:Advanced Boot Options Menu",
+                                                                                             "Disabled:Script Enforcement",
+                                                                                             "Enabled:Update Policy No Reboot",
+                                                                                             "Enabled:Conditional Windows Lockdown Policy"
+                                                                                         ]
+                                                                   },
+                                                                   {
+                                                                       "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                       "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                       "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                                       "Version":  0,
+                                                                       "VersionString":  "0.0.0.0",
+                                                                       "IsSystemPolicy":  true,
+                                                                       "IsSignedPolicy":  true,
+                                                                       "IsOnDisk":  true,
+                                                                       "IsEnforced":  false,
+                                                                       "IsAuthorized":  false,
+                                                                       "PolicyOptions":  [
+                                                                                             "Enabled:UMCI",
+                                                                                             "Enabled:Intelligent Security Graph Authorization",
+                                                                                             "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                             "Enabled:Allow Supplemental Policies",
+                                                                                             "Enabled:Revoked Expired As Unsigned",
+                                                                                             "Enabled:Inherit Default Policy",
+                                                                                             "Enabled:Unsigned System Integrity Policy",
+                                                                                             "Enabled:Advanced Boot Options Menu",
+                                                                                             "Disabled:Script Enforcement",
+                                                                                             "Enabled:Update Policy No Reboot",
+                                                                                             "Enabled:Conditional Windows Lockdown Policy"
+                                                                                         ]
+                                                                   }
+                                                               ],
+                                   "mp_state":  {
+                                                    "SmartAppControlState":  "Off",
+                                                    "SmartAppControlExpiration":  null,
+                                                    "AMRunningMode":  "Normal",
+                                                    "RealTimeProtectionEnabled":  true
+                                                },
+                                   "ci_state":  {
+                                                    "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                    "options_hex":  "0x00282203",
+                                                    "flags":  [
+                                                                  "ENABLED",
+                                                                  "TESTSIGN",
+                                                                  "FLIGHTING_ENABLED",
+                                                                  "HVCI_IUM_ENABLED"
+                                                              ]
+                                                },
+                                   "mode_by_citool_names":  "evaluation policy listed"
+                               },
+                   "after-set-1":  {
+                                       "tag":  "after-set-1",
+                                       "time":  "2026-10-03T20:11:34.114Z",
+                                       "reg_rc":  0,
+                                       "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x1",
+                                       "reg_value":  1,
+                                       "reg_present":  true,
+                                       "citool_rc":  0,
+                                       "verified_and_reputable_names":  [
+                                                                            "VerifiedAndReputableDesktop",
+                                                                            "VerifiedAndReputableDesktopEvaluation",
+                                                                            "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                            "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                            "VerifiedAndReputableDesktopTestSupplemental",
+                                                                            "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                                        ],
+                                       "citool_matching_objects":  [
+                                                                       {
+                                                                           "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                           "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  false,
+                                                                           "IsAuthorized":  false,
+                                                                           "PolicyOptions":  [
+                                                                                                 "Disabled:Runtime FilePath Rule Protection",
+                                                                                                 "Enabled:Managed Installer"
+                                                                                             ]
+                                                                       },
+                                                                       {
+                                                                           "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                           "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  true,
+                                                                           "IsAuthorized":  true,
+                                                                           "PolicyOptions":  [
+                                                                                                 "Enabled:UMCI",
+                                                                                                 "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                 "Disabled:Runtime FilePath Rule Protection",
+                                                                                                 "Enabled:Revoked Expired As Unsigned",
+                                                                                                 "Enabled:Unsigned System Integrity Policy",
+                                                                                                 "Enabled:Advanced Boot Options Menu",
+                                                                                                 "Disabled:Script Enforcement",
+                                                                                                 "Enabled:Managed Installer",
+                                                                                                 "Enabled:Update Policy No Reboot"
+                                                                                             ]
+                                                                       },
+                                                                       {
+                                                                           "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                           "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  false,
+                                                                           "IsAuthorized":  false,
+                                                                           "PolicyOptions":  [
+
+                                                                                             ]
+                                                                       },
+                                                                       {
+                                                                           "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                           "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  true,
+                                                                           "IsAuthorized":  true,
+                                                                           "PolicyOptions":  [
+                                                                                                 "Enabled:UMCI",
+                                                                                                 "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                 "Enabled:Revoked Expired As Unsigned",
+                                                                                                 "Enabled:Unsigned System Integrity Policy",
+                                                                                                 "Enabled:Advanced Boot Options Menu",
+                                                                                                 "Disabled:Script Enforcement",
+                                                                                                 "Enabled:Update Policy No Reboot"
+                                                                                             ]
+                                                                       },
+                                                                       {
+                                                                           "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  false,
+                                                                           "IsAuthorized":  false,
+                                                                           "PolicyOptions":  [
+                                                                                                 "Enabled:UMCI",
+                                                                                                 "Enabled:Intelligent Security Graph Authorization",
+                                                                                                 "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                 "Enabled:Allow Supplemental Policies",
+                                                                                                 "Enabled:Revoked Expired As Unsigned",
+                                                                                                 "Enabled:Audit Mode",
+                                                                                                 "Enabled:Inherit Default Policy",
+                                                                                                 "Enabled:Unsigned System Integrity Policy",
+                                                                                                 "Enabled:Advanced Boot Options Menu",
+                                                                                                 "Disabled:Script Enforcement",
+                                                                                                 "Enabled:Update Policy No Reboot",
+                                                                                                 "Enabled:Conditional Windows Lockdown Policy"
+                                                                                             ]
+                                                                       },
+                                                                       {
+                                                                           "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  true,
+                                                                           "IsAuthorized":  true,
+                                                                           "PolicyOptions":  [
+                                                                                                 "Enabled:UMCI",
+                                                                                                 "Enabled:Intelligent Security Graph Authorization",
+                                                                                                 "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                 "Enabled:Allow Supplemental Policies",
+                                                                                                 "Enabled:Revoked Expired As Unsigned",
+                                                                                                 "Enabled:Inherit Default Policy",
+                                                                                                 "Enabled:Unsigned System Integrity Policy",
+                                                                                                 "Enabled:Advanced Boot Options Menu",
+                                                                                                 "Disabled:Script Enforcement",
+                                                                                                 "Enabled:Update Policy No Reboot",
+                                                                                                 "Enabled:Conditional Windows Lockdown Policy"
+                                                                                             ]
+                                                                       }
+                                                                   ],
+                                       "mp_state":  {
+                                                        "SmartAppControlState":  "On",
+                                                        "SmartAppControlExpiration":  null,
+                                                        "AMRunningMode":  "Normal",
+                                                        "RealTimeProtectionEnabled":  true
+                                                    },
+                                       "ci_state":  {
+                                                        "raw":  "status=0x00000000;options=0x00282207;retLen=8",
+                                                        "options_hex":  "0x00282207",
+                                                        "flags":  [
+                                                                      "ENABLED",
+                                                                      "TESTSIGN",
+                                                                      "UMCI_ENABLED",
+                                                                      "FLIGHTING_ENABLED",
+                                                                      "HVCI_IUM_ENABLED"
+                                                                  ]
+                                                    },
+                                       "mode_by_citool_names":  "evaluation policy listed"
+                                   },
+                   "restored-after-1":  {
+                                            "tag":  "restored-after-1",
+                                            "time":  "2026-10-03T20:11:49.005Z",
+                                            "reg_rc":  0,
+                                            "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                            "reg_value":  0,
+                                            "reg_present":  true,
+                                            "citool_rc":  0,
+                                            "verified_and_reputable_names":  [
+                                                                                 "VerifiedAndReputableDesktop",
+                                                                                 "VerifiedAndReputableDesktopEvaluation",
+                                                                                 "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                 "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                 "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                 "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                                             ],
+                                            "citool_matching_objects":  [
+                                                                            {
+                                                                                "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+                                                                                                      "Disabled:Runtime FilePath Rule Protection",
+                                                                                                      "Enabled:Managed Installer"
+                                                                                                  ]
+                                                                            },
+                                                                            {
+                                                                                "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+                                                                                                      "Disabled:Runtime FilePath Rule Protection",
+                                                                                                      "Enabled:Managed Installer"
+                                                                                                  ]
+                                                                            },
+                                                                            {
+                                                                                "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+
+                                                                                                  ]
+                                                                            },
+                                                                            {
+                                                                                "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+
+                                                                                                  ]
+                                                                            },
+                                                                            {
+                                                                                "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+                                                                                                      "Enabled:UMCI",
+                                                                                                      "Enabled:Intelligent Security Graph Authorization",
+                                                                                                      "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                      "Enabled:Allow Supplemental Policies",
+                                                                                                      "Enabled:Revoked Expired As Unsigned",
+                                                                                                      "Enabled:Audit Mode",
+                                                                                                      "Enabled:Inherit Default Policy",
+                                                                                                      "Enabled:Unsigned System Integrity Policy",
+                                                                                                      "Enabled:Advanced Boot Options Menu",
+                                                                                                      "Disabled:Script Enforcement",
+                                                                                                      "Enabled:Update Policy No Reboot",
+                                                                                                      "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                  ]
+                                                                            },
+                                                                            {
+                                                                                "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+                                                                                                      "Enabled:UMCI",
+                                                                                                      "Enabled:Intelligent Security Graph Authorization",
+                                                                                                      "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                      "Enabled:Allow Supplemental Policies",
+                                                                                                      "Enabled:Revoked Expired As Unsigned",
+                                                                                                      "Enabled:Inherit Default Policy",
+                                                                                                      "Enabled:Unsigned System Integrity Policy",
+                                                                                                      "Enabled:Advanced Boot Options Menu",
+                                                                                                      "Disabled:Script Enforcement",
+                                                                                                      "Enabled:Update Policy No Reboot",
+                                                                                                      "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                  ]
+                                                                            }
+                                                                        ],
+                                            "mp_state":  {
+                                                             "SmartAppControlState":  "Off",
+                                                             "SmartAppControlExpiration":  null,
+                                                             "AMRunningMode":  "Normal",
+                                                             "RealTimeProtectionEnabled":  true
+                                                         },
+                                            "ci_state":  {
+                                                             "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                             "options_hex":  "0x00282203",
+                                                             "flags":  [
+                                                                           "ENABLED",
+                                                                           "TESTSIGN",
+                                                                           "FLIGHTING_ENABLED",
+                                                                           "HVCI_IUM_ENABLED"
+                                                                       ]
+                                                         },
+                                            "mode_by_citool_names":  "evaluation policy listed"
+                                        },
+                   "after-set-2":  {
+                                       "tag":  "after-set-2",
+                                       "time":  "2026-10-03T20:12:00.234Z",
+                                       "reg_rc":  0,
+                                       "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                       "reg_value":  0,
+                                       "reg_present":  true,
+                                       "citool_rc":  0,
+                                       "verified_and_reputable_names":  [
+                                                                            "VerifiedAndReputableDesktop",
+                                                                            "VerifiedAndReputableDesktopEvaluation",
+                                                                            "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                            "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                            "VerifiedAndReputableDesktopTestSupplemental",
+                                                                            "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                                        ],
+                                       "citool_matching_objects":  [
+                                                                       {
+                                                                           "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                           "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  false,
+                                                                           "IsAuthorized":  false,
+                                                                           "PolicyOptions":  [
+                                                                                                 "Disabled:Runtime FilePath Rule Protection",
+                                                                                                 "Enabled:Managed Installer"
+                                                                                             ]
+                                                                       },
+                                                                       {
+                                                                           "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                           "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  false,
+                                                                           "IsAuthorized":  false,
+                                                                           "PolicyOptions":  [
+                                                                                                 "Disabled:Runtime FilePath Rule Protection",
+                                                                                                 "Enabled:Managed Installer"
+                                                                                             ]
+                                                                       },
+                                                                       {
+                                                                           "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                           "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  false,
+                                                                           "IsAuthorized":  false,
+                                                                           "PolicyOptions":  [
+
+                                                                                             ]
+                                                                       },
+                                                                       {
+                                                                           "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                           "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  false,
+                                                                           "IsAuthorized":  false,
+                                                                           "PolicyOptions":  [
+
+                                                                                             ]
+                                                                       },
+                                                                       {
+                                                                           "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  false,
+                                                                           "IsAuthorized":  false,
+                                                                           "PolicyOptions":  [
+                                                                                                 "Enabled:UMCI",
+                                                                                                 "Enabled:Intelligent Security Graph Authorization",
+                                                                                                 "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                 "Enabled:Allow Supplemental Policies",
+                                                                                                 "Enabled:Revoked Expired As Unsigned",
+                                                                                                 "Enabled:Audit Mode",
+                                                                                                 "Enabled:Inherit Default Policy",
+                                                                                                 "Enabled:Unsigned System Integrity Policy",
+                                                                                                 "Enabled:Advanced Boot Options Menu",
+                                                                                                 "Disabled:Script Enforcement",
+                                                                                                 "Enabled:Update Policy No Reboot",
+                                                                                                 "Enabled:Conditional Windows Lockdown Policy"
+                                                                                             ]
+                                                                       },
+                                                                       {
+                                                                           "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                           "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                                           "Version":  0,
+                                                                           "VersionString":  "0.0.0.0",
+                                                                           "IsSystemPolicy":  true,
+                                                                           "IsSignedPolicy":  true,
+                                                                           "IsOnDisk":  true,
+                                                                           "IsEnforced":  false,
+                                                                           "IsAuthorized":  false,
+                                                                           "PolicyOptions":  [
+                                                                                                 "Enabled:UMCI",
+                                                                                                 "Enabled:Intelligent Security Graph Authorization",
+                                                                                                 "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                 "Enabled:Allow Supplemental Policies",
+                                                                                                 "Enabled:Revoked Expired As Unsigned",
+                                                                                                 "Enabled:Inherit Default Policy",
+                                                                                                 "Enabled:Unsigned System Integrity Policy",
+                                                                                                 "Enabled:Advanced Boot Options Menu",
+                                                                                                 "Disabled:Script Enforcement",
+                                                                                                 "Enabled:Update Policy No Reboot",
+                                                                                                 "Enabled:Conditional Windows Lockdown Policy"
+                                                                                             ]
+                                                                       }
+                                                                   ],
+                                       "mp_state":  {
+                                                        "SmartAppControlState":  "Off",
+                                                        "SmartAppControlExpiration":  null,
+                                                        "AMRunningMode":  "Normal",
+                                                        "RealTimeProtectionEnabled":  true
+                                                    },
+                                       "ci_state":  {
+                                                        "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                        "options_hex":  "0x00282203",
+                                                        "flags":  [
+                                                                      "ENABLED",
+                                                                      "TESTSIGN",
+                                                                      "FLIGHTING_ENABLED",
+                                                                      "HVCI_IUM_ENABLED"
+                                                                  ]
+                                                    },
+                                       "mode_by_citool_names":  "evaluation policy listed"
+                                   },
+                   "restored-after-2":  {
+                                            "tag":  "restored-after-2",
+                                            "time":  "2026-10-03T20:12:09.532Z",
+                                            "reg_rc":  0,
+                                            "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                            "reg_value":  0,
+                                            "reg_present":  true,
+                                            "citool_rc":  0,
+                                            "verified_and_reputable_names":  [
+                                                                                 "VerifiedAndReputableDesktop",
+                                                                                 "VerifiedAndReputableDesktopEvaluation",
+                                                                                 "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                 "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                 "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                 "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                                             ],
+                                            "citool_matching_objects":  [
+                                                                            {
+                                                                                "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+                                                                                                      "Disabled:Runtime FilePath Rule Protection",
+                                                                                                      "Enabled:Managed Installer"
+                                                                                                  ]
+                                                                            },
+                                                                            {
+                                                                                "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+                                                                                                      "Disabled:Runtime FilePath Rule Protection",
+                                                                                                      "Enabled:Managed Installer"
+                                                                                                  ]
+                                                                            },
+                                                                            {
+                                                                                "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+
+                                                                                                  ]
+                                                                            },
+                                                                            {
+                                                                                "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+
+                                                                                                  ]
+                                                                            },
+                                                                            {
+                                                                                "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+                                                                                                      "Enabled:UMCI",
+                                                                                                      "Enabled:Intelligent Security Graph Authorization",
+                                                                                                      "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                      "Enabled:Allow Supplemental Policies",
+                                                                                                      "Enabled:Revoked Expired As Unsigned",
+                                                                                                      "Enabled:Audit Mode",
+                                                                                                      "Enabled:Inherit Default Policy",
+                                                                                                      "Enabled:Unsigned System Integrity Policy",
+                                                                                                      "Enabled:Advanced Boot Options Menu",
+                                                                                                      "Disabled:Script Enforcement",
+                                                                                                      "Enabled:Update Policy No Reboot",
+                                                                                                      "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                  ]
+                                                                            },
+                                                                            {
+                                                                                "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                                                "Version":  0,
+                                                                                "VersionString":  "0.0.0.0",
+                                                                                "IsSystemPolicy":  true,
+                                                                                "IsSignedPolicy":  true,
+                                                                                "IsOnDisk":  true,
+                                                                                "IsEnforced":  false,
+                                                                                "IsAuthorized":  false,
+                                                                                "PolicyOptions":  [
+                                                                                                      "Enabled:UMCI",
+                                                                                                      "Enabled:Intelligent Security Graph Authorization",
+                                                                                                      "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                      "Enabled:Allow Supplemental Policies",
+                                                                                                      "Enabled:Revoked Expired As Unsigned",
+                                                                                                      "Enabled:Inherit Default Policy",
+                                                                                                      "Enabled:Unsigned System Integrity Policy",
+                                                                                                      "Enabled:Advanced Boot Options Menu",
+                                                                                                      "Disabled:Script Enforcement",
+                                                                                                      "Enabled:Update Policy No Reboot",
+                                                                                                      "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                  ]
+                                                                            }
+                                                                        ],
+                                            "mp_state":  {
+                                                             "SmartAppControlState":  "Off",
+                                                             "SmartAppControlExpiration":  null,
+                                                             "AMRunningMode":  "Normal",
+                                                             "RealTimeProtectionEnabled":  true
+                                                         },
+                                            "ci_state":  {
+                                                             "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                             "options_hex":  "0x00282203",
+                                                             "flags":  [
+                                                                           "ENABLED",
+                                                                           "TESTSIGN",
+                                                                           "FLIGHTING_ENABLED",
+                                                                           "HVCI_IUM_ENABLED"
+                                                                       ]
+                                                         },
+                                            "mode_by_citool_names":  "evaluation policy listed"
+                                        },
+                   "final":  {
+                                 "tag":  "final",
+                                 "time":  "2026-10-03T20:12:10.593Z",
+                                 "reg_rc":  0,
+                                 "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                 "reg_value":  0,
+                                 "reg_present":  true,
+                                 "citool_rc":  0,
+                                 "verified_and_reputable_names":  [
+                                                                      "VerifiedAndReputableDesktop",
+                                                                      "VerifiedAndReputableDesktopEvaluation",
+                                                                      "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                      "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                      "VerifiedAndReputableDesktopTestSupplemental",
+                                                                      "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                                  ],
+                                 "citool_matching_objects":  [
+                                                                 {
+                                                                     "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                     "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                     "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                     "Version":  0,
+                                                                     "VersionString":  "0.0.0.0",
+                                                                     "IsSystemPolicy":  true,
+                                                                     "IsSignedPolicy":  true,
+                                                                     "IsOnDisk":  true,
+                                                                     "IsEnforced":  false,
+                                                                     "IsAuthorized":  false,
+                                                                     "PolicyOptions":  [
+                                                                                           "Disabled:Runtime FilePath Rule Protection",
+                                                                                           "Enabled:Managed Installer"
+                                                                                       ]
+                                                                 },
+                                                                 {
+                                                                     "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                     "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                     "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                     "Version":  0,
+                                                                     "VersionString":  "0.0.0.0",
+                                                                     "IsSystemPolicy":  true,
+                                                                     "IsSignedPolicy":  true,
+                                                                     "IsOnDisk":  true,
+                                                                     "IsEnforced":  false,
+                                                                     "IsAuthorized":  false,
+                                                                     "PolicyOptions":  [
+                                                                                           "Disabled:Runtime FilePath Rule Protection",
+                                                                                           "Enabled:Managed Installer"
+                                                                                       ]
+                                                                 },
+                                                                 {
+                                                                     "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                     "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                     "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                     "Version":  0,
+                                                                     "VersionString":  "0.0.0.0",
+                                                                     "IsSystemPolicy":  true,
+                                                                     "IsSignedPolicy":  true,
+                                                                     "IsOnDisk":  true,
+                                                                     "IsEnforced":  false,
+                                                                     "IsAuthorized":  false,
+                                                                     "PolicyOptions":  [
+
+                                                                                       ]
+                                                                 },
+                                                                 {
+                                                                     "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                     "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                     "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                     "Version":  0,
+                                                                     "VersionString":  "0.0.0.0",
+                                                                     "IsSystemPolicy":  true,
+                                                                     "IsSignedPolicy":  true,
+                                                                     "IsOnDisk":  true,
+                                                                     "IsEnforced":  false,
+                                                                     "IsAuthorized":  false,
+                                                                     "PolicyOptions":  [
+
+                                                                                       ]
+                                                                 },
+                                                                 {
+                                                                     "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                     "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                     "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                                     "Version":  0,
+                                                                     "VersionString":  "0.0.0.0",
+                                                                     "IsSystemPolicy":  true,
+                                                                     "IsSignedPolicy":  true,
+                                                                     "IsOnDisk":  true,
+                                                                     "IsEnforced":  false,
+                                                                     "IsAuthorized":  false,
+                                                                     "PolicyOptions":  [
+                                                                                           "Enabled:UMCI",
+                                                                                           "Enabled:Intelligent Security Graph Authorization",
+                                                                                           "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                           "Enabled:Allow Supplemental Policies",
+                                                                                           "Enabled:Revoked Expired As Unsigned",
+                                                                                           "Enabled:Audit Mode",
+                                                                                           "Enabled:Inherit Default Policy",
+                                                                                           "Enabled:Unsigned System Integrity Policy",
+                                                                                           "Enabled:Advanced Boot Options Menu",
+                                                                                           "Disabled:Script Enforcement",
+                                                                                           "Enabled:Update Policy No Reboot",
+                                                                                           "Enabled:Conditional Windows Lockdown Policy"
+                                                                                       ]
+                                                                 },
+                                                                 {
+                                                                     "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                     "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                     "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                                     "Version":  0,
+                                                                     "VersionString":  "0.0.0.0",
+                                                                     "IsSystemPolicy":  true,
+                                                                     "IsSignedPolicy":  true,
+                                                                     "IsOnDisk":  true,
+                                                                     "IsEnforced":  false,
+                                                                     "IsAuthorized":  false,
+                                                                     "PolicyOptions":  [
+                                                                                           "Enabled:UMCI",
+                                                                                           "Enabled:Intelligent Security Graph Authorization",
+                                                                                           "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                           "Enabled:Allow Supplemental Policies",
+                                                                                           "Enabled:Revoked Expired As Unsigned",
+                                                                                           "Enabled:Inherit Default Policy",
+                                                                                           "Enabled:Unsigned System Integrity Policy",
+                                                                                           "Enabled:Advanced Boot Options Menu",
+                                                                                           "Disabled:Script Enforcement",
+                                                                                           "Enabled:Update Policy No Reboot",
+                                                                                           "Enabled:Conditional Windows Lockdown Policy"
+                                                                                       ]
+                                                                 }
+                                                             ],
+                                 "mp_state":  {
+                                                  "SmartAppControlState":  "Off",
+                                                  "SmartAppControlExpiration":  null,
+                                                  "AMRunningMode":  "Normal",
+                                                  "RealTimeProtectionEnabled":  true
+                                              },
+                                 "ci_state":  {
+                                                  "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                  "options_hex":  "0x00282203",
+                                                  "flags":  [
+                                                                "ENABLED",
+                                                                "TESTSIGN",
+                                                                "FLIGHTING_ENABLED",
+                                                                "HVCI_IUM_ENABLED"
+                                                            ]
+                                              },
+                                 "mode_by_citool_names":  "evaluation policy listed"
+                             }
+               },
+    "passes":  {
+                   "1":  {
+                             "value":  1,
+                             "started":  "2026-10-03T20:11:23.919Z",
+                             "write":  {
+                                           "rc":  0,
+                                           "out":  "The operation completed successfully.\r\r\n",
+                                           "err":  "",
+                                           "start_error":  null,
+                                           "ok":  true
+                                       },
+                             "refresh":  {
+                                             "rc":  0,
+                                             "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                             "err":  "",
+                                             "start_error":  null
+                                         },
+                             "state_after":  {
+                                                 "tag":  "after-set-1",
+                                                 "time":  "2026-10-03T20:11:34.114Z",
+                                                 "reg_rc":  0,
+                                                 "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x1",
+                                                 "reg_value":  1,
+                                                 "reg_present":  true,
+                                                 "citool_rc":  0,
+                                                 "verified_and_reputable_names":  [
+                                                                                      "VerifiedAndReputableDesktop",
+                                                                                      "VerifiedAndReputableDesktopEvaluation",
+                                                                                      "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                      "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                      "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                      "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                                                  ],
+                                                 "citool_matching_objects":  [
+                                                                                 {
+                                                                                     "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                     "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  false,
+                                                                                     "IsAuthorized":  false,
+                                                                                     "PolicyOptions":  [
+                                                                                                           "Disabled:Runtime FilePath Rule Protection",
+                                                                                                           "Enabled:Managed Installer"
+                                                                                                       ]
+                                                                                 },
+                                                                                 {
+                                                                                     "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                     "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  true,
+                                                                                     "IsAuthorized":  true,
+                                                                                     "PolicyOptions":  [
+                                                                                                           "Enabled:UMCI",
+                                                                                                           "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                           "Disabled:Runtime FilePath Rule Protection",
+                                                                                                           "Enabled:Revoked Expired As Unsigned",
+                                                                                                           "Enabled:Unsigned System Integrity Policy",
+                                                                                                           "Enabled:Advanced Boot Options Menu",
+                                                                                                           "Disabled:Script Enforcement",
+                                                                                                           "Enabled:Managed Installer",
+                                                                                                           "Enabled:Update Policy No Reboot"
+                                                                                                       ]
+                                                                                 },
+                                                                                 {
+                                                                                     "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                     "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  false,
+                                                                                     "IsAuthorized":  false,
+                                                                                     "PolicyOptions":  [
+
+                                                                                                       ]
+                                                                                 },
+                                                                                 {
+                                                                                     "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                     "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  true,
+                                                                                     "IsAuthorized":  true,
+                                                                                     "PolicyOptions":  [
+                                                                                                           "Enabled:UMCI",
+                                                                                                           "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                           "Enabled:Revoked Expired As Unsigned",
+                                                                                                           "Enabled:Unsigned System Integrity Policy",
+                                                                                                           "Enabled:Advanced Boot Options Menu",
+                                                                                                           "Disabled:Script Enforcement",
+                                                                                                           "Enabled:Update Policy No Reboot"
+                                                                                                       ]
+                                                                                 },
+                                                                                 {
+                                                                                     "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  false,
+                                                                                     "IsAuthorized":  false,
+                                                                                     "PolicyOptions":  [
+                                                                                                           "Enabled:UMCI",
+                                                                                                           "Enabled:Intelligent Security Graph Authorization",
+                                                                                                           "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                           "Enabled:Allow Supplemental Policies",
+                                                                                                           "Enabled:Revoked Expired As Unsigned",
+                                                                                                           "Enabled:Audit Mode",
+                                                                                                           "Enabled:Inherit Default Policy",
+                                                                                                           "Enabled:Unsigned System Integrity Policy",
+                                                                                                           "Enabled:Advanced Boot Options Menu",
+                                                                                                           "Disabled:Script Enforcement",
+                                                                                                           "Enabled:Update Policy No Reboot",
+                                                                                                           "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                       ]
+                                                                                 },
+                                                                                 {
+                                                                                     "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  true,
+                                                                                     "IsAuthorized":  true,
+                                                                                     "PolicyOptions":  [
+                                                                                                           "Enabled:UMCI",
+                                                                                                           "Enabled:Intelligent Security Graph Authorization",
+                                                                                                           "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                           "Enabled:Allow Supplemental Policies",
+                                                                                                           "Enabled:Revoked Expired As Unsigned",
+                                                                                                           "Enabled:Inherit Default Policy",
+                                                                                                           "Enabled:Unsigned System Integrity Policy",
+                                                                                                           "Enabled:Advanced Boot Options Menu",
+                                                                                                           "Disabled:Script Enforcement",
+                                                                                                           "Enabled:Update Policy No Reboot",
+                                                                                                           "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                       ]
+                                                                                 }
+                                                                             ],
+                                                 "mp_state":  {
+                                                                  "SmartAppControlState":  "On",
+                                                                  "SmartAppControlExpiration":  null,
+                                                                  "AMRunningMode":  "Normal",
+                                                                  "RealTimeProtectionEnabled":  true
+                                                              },
+                                                 "ci_state":  {
+                                                                  "raw":  "status=0x00000000;options=0x00282207;retLen=8",
+                                                                  "options_hex":  "0x00282207",
+                                                                  "flags":  [
+                                                                                "ENABLED",
+                                                                                "TESTSIGN",
+                                                                                "UMCI_ENABLED",
+                                                                                "FLIGHTING_ENABLED",
+                                                                                "HVCI_IUM_ENABLED"
+                                                                            ]
+                                                              },
+                                                 "mode_by_citool_names":  "evaluation policy listed"
+                                             },
+                             "probes":  {
+                                            "control NEG (fresh unsigned exe)":  {
+                                                                                     "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                                                     "ok":  false,
+                                                                                     "ret":  0,
+                                                                                     "ret_meaning":  null,
+                                                                                     "last_error":  4551,
+                                                                                     "last_error_hex":  "0x000011C7",
+                                                                                     "last_error_text":  "An Application Control policy has blocked this file",
+                                                                                     "first_wait_timed_out":  false,
+                                                                                     "timed_out":  false,
+                                                                                     "completed":  true,
+                                                                                     "had_process_handle":  false,
+                                                                                     "note":  ""
+                                                                                 },
+                                            "installer 0.14.42":  {
+                                                                      "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                                      "ok":  false,
+                                                                      "ret":  0,
+                                                                      "ret_meaning":  null,
+                                                                      "last_error":  4551,
+                                                                      "last_error_hex":  "0x000011C7",
+                                                                      "last_error_text":  "An Application Control policy has blocked this file",
+                                                                      "first_wait_timed_out":  false,
+                                                                      "timed_out":  false,
+                                                                      "completed":  true,
+                                                                      "had_process_handle":  false,
+                                                                      "note":  ""
+                                                                  }
+                                        },
+                             "events":  {
+                                            "evtx_rc":  0,
+                                            "note":  null,
+                                            "counts_by_id":  {
+                                                                 "3101":  1,
+                                                                 "3105":  14,
+                                                                 "3103":  1,
+                                                                 "3096":  4,
+                                                                 "3099":  3,
+                                                                 "3116":  3,
+                                                                 "3102":  1,
+                                                                 "3033":  2,
+                                                                 "3089":  4,
+                                                                 "3077":  2,
+                                                                 "3118":  2
+                                                             },
+                                            "file":  "sac-real-events-1.json"
+                                        },
+                             "restore":  {
+                                             "why":  "pass1",
+                                             "time":  "2026-10-03T20:11:43.874Z",
+                                             "rc":  0,
+                                             "out":  "The operation completed successfully.\r\r\n",
+                                             "err":  "",
+                                             "skipped":  null,
+                                             "refresh":  {
+                                                             "rc":  0,
+                                                             "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                                             "err":  "",
+                                                             "start_error":  null
+                                                         }
+                                         },
+                             "state_restored":  {
+                                                    "tag":  "restored-after-1",
+                                                    "time":  "2026-10-03T20:11:49.005Z",
+                                                    "reg_rc":  0,
+                                                    "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                                    "reg_value":  0,
+                                                    "reg_present":  true,
+                                                    "citool_rc":  0,
+                                                    "verified_and_reputable_names":  [
+                                                                                         "VerifiedAndReputableDesktop",
+                                                                                         "VerifiedAndReputableDesktopEvaluation",
+                                                                                         "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                         "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                         "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                         "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                                                     ],
+                                                    "citool_matching_objects":  [
+                                                                                    {
+                                                                                        "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                        "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+                                                                                                              "Disabled:Runtime FilePath Rule Protection",
+                                                                                                              "Enabled:Managed Installer"
+                                                                                                          ]
+                                                                                    },
+                                                                                    {
+                                                                                        "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                        "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+                                                                                                              "Disabled:Runtime FilePath Rule Protection",
+                                                                                                              "Enabled:Managed Installer"
+                                                                                                          ]
+                                                                                    },
+                                                                                    {
+                                                                                        "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                        "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+
+                                                                                                          ]
+                                                                                    },
+                                                                                    {
+                                                                                        "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                        "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+
+                                                                                                          ]
+                                                                                    },
+                                                                                    {
+                                                                                        "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+                                                                                                              "Enabled:UMCI",
+                                                                                                              "Enabled:Intelligent Security Graph Authorization",
+                                                                                                              "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                              "Enabled:Allow Supplemental Policies",
+                                                                                                              "Enabled:Revoked Expired As Unsigned",
+                                                                                                              "Enabled:Audit Mode",
+                                                                                                              "Enabled:Inherit Default Policy",
+                                                                                                              "Enabled:Unsigned System Integrity Policy",
+                                                                                                              "Enabled:Advanced Boot Options Menu",
+                                                                                                              "Disabled:Script Enforcement",
+                                                                                                              "Enabled:Update Policy No Reboot",
+                                                                                                              "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                          ]
+                                                                                    },
+                                                                                    {
+                                                                                        "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+                                                                                                              "Enabled:UMCI",
+                                                                                                              "Enabled:Intelligent Security Graph Authorization",
+                                                                                                              "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                              "Enabled:Allow Supplemental Policies",
+                                                                                                              "Enabled:Revoked Expired As Unsigned",
+                                                                                                              "Enabled:Inherit Default Policy",
+                                                                                                              "Enabled:Unsigned System Integrity Policy",
+                                                                                                              "Enabled:Advanced Boot Options Menu",
+                                                                                                              "Disabled:Script Enforcement",
+                                                                                                              "Enabled:Update Policy No Reboot",
+                                                                                                              "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                          ]
+                                                                                    }
+                                                                                ],
+                                                    "mp_state":  {
+                                                                     "SmartAppControlState":  "Off",
+                                                                     "SmartAppControlExpiration":  null,
+                                                                     "AMRunningMode":  "Normal",
+                                                                     "RealTimeProtectionEnabled":  true
+                                                                 },
+                                                    "ci_state":  {
+                                                                     "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                                     "options_hex":  "0x00282203",
+                                                                     "flags":  [
+                                                                                   "ENABLED",
+                                                                                   "TESTSIGN",
+                                                                                   "FLIGHTING_ENABLED",
+                                                                                   "HVCI_IUM_ENABLED"
+                                                                               ]
+                                                                 },
+                                                    "mode_by_citool_names":  "evaluation policy listed"
+                                                },
+                             "finished":  "2026-10-03T20:11:50.118Z"
+                         },
+                   "2":  {
+                             "value":  2,
+                             "started":  "2026-10-03T20:11:50.126Z",
+                             "write":  {
+                                           "rc":  0,
+                                           "out":  "The operation completed successfully.\r\r\n",
+                                           "err":  "",
+                                           "start_error":  null,
+                                           "ok":  true
+                                       },
+                             "refresh":  {
+                                             "rc":  0,
+                                             "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                             "err":  "",
+                                             "start_error":  null
+                                         },
+                             "state_after":  {
+                                                 "tag":  "after-set-2",
+                                                 "time":  "2026-10-03T20:12:00.234Z",
+                                                 "reg_rc":  0,
+                                                 "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                                 "reg_value":  0,
+                                                 "reg_present":  true,
+                                                 "citool_rc":  0,
+                                                 "verified_and_reputable_names":  [
+                                                                                      "VerifiedAndReputableDesktop",
+                                                                                      "VerifiedAndReputableDesktopEvaluation",
+                                                                                      "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                      "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                      "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                      "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                                                  ],
+                                                 "citool_matching_objects":  [
+                                                                                 {
+                                                                                     "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                     "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  false,
+                                                                                     "IsAuthorized":  false,
+                                                                                     "PolicyOptions":  [
+                                                                                                           "Disabled:Runtime FilePath Rule Protection",
+                                                                                                           "Enabled:Managed Installer"
+                                                                                                       ]
+                                                                                 },
+                                                                                 {
+                                                                                     "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                     "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  false,
+                                                                                     "IsAuthorized":  false,
+                                                                                     "PolicyOptions":  [
+                                                                                                           "Disabled:Runtime FilePath Rule Protection",
+                                                                                                           "Enabled:Managed Installer"
+                                                                                                       ]
+                                                                                 },
+                                                                                 {
+                                                                                     "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                     "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  false,
+                                                                                     "IsAuthorized":  false,
+                                                                                     "PolicyOptions":  [
+
+                                                                                                       ]
+                                                                                 },
+                                                                                 {
+                                                                                     "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                     "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  false,
+                                                                                     "IsAuthorized":  false,
+                                                                                     "PolicyOptions":  [
+
+                                                                                                       ]
+                                                                                 },
+                                                                                 {
+                                                                                     "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  false,
+                                                                                     "IsAuthorized":  false,
+                                                                                     "PolicyOptions":  [
+                                                                                                           "Enabled:UMCI",
+                                                                                                           "Enabled:Intelligent Security Graph Authorization",
+                                                                                                           "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                           "Enabled:Allow Supplemental Policies",
+                                                                                                           "Enabled:Revoked Expired As Unsigned",
+                                                                                                           "Enabled:Audit Mode",
+                                                                                                           "Enabled:Inherit Default Policy",
+                                                                                                           "Enabled:Unsigned System Integrity Policy",
+                                                                                                           "Enabled:Advanced Boot Options Menu",
+                                                                                                           "Disabled:Script Enforcement",
+                                                                                                           "Enabled:Update Policy No Reboot",
+                                                                                                           "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                       ]
+                                                                                 },
+                                                                                 {
+                                                                                     "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                                                     "Version":  0,
+                                                                                     "VersionString":  "0.0.0.0",
+                                                                                     "IsSystemPolicy":  true,
+                                                                                     "IsSignedPolicy":  true,
+                                                                                     "IsOnDisk":  true,
+                                                                                     "IsEnforced":  false,
+                                                                                     "IsAuthorized":  false,
+                                                                                     "PolicyOptions":  [
+                                                                                                           "Enabled:UMCI",
+                                                                                                           "Enabled:Intelligent Security Graph Authorization",
+                                                                                                           "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                           "Enabled:Allow Supplemental Policies",
+                                                                                                           "Enabled:Revoked Expired As Unsigned",
+                                                                                                           "Enabled:Inherit Default Policy",
+                                                                                                           "Enabled:Unsigned System Integrity Policy",
+                                                                                                           "Enabled:Advanced Boot Options Menu",
+                                                                                                           "Disabled:Script Enforcement",
+                                                                                                           "Enabled:Update Policy No Reboot",
+                                                                                                           "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                       ]
+                                                                                 }
+                                                                             ],
+                                                 "mp_state":  {
+                                                                  "SmartAppControlState":  "Off",
+                                                                  "SmartAppControlExpiration":  null,
+                                                                  "AMRunningMode":  "Normal",
+                                                                  "RealTimeProtectionEnabled":  true
+                                                              },
+                                                 "ci_state":  {
+                                                                  "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                                  "options_hex":  "0x00282203",
+                                                                  "flags":  [
+                                                                                "ENABLED",
+                                                                                "TESTSIGN",
+                                                                                "FLIGHTING_ENABLED",
+                                                                                "HVCI_IUM_ENABLED"
+                                                                            ]
+                                                              },
+                                                 "mode_by_citool_names":  "evaluation policy listed"
+                                             },
+                             "probes":  {
+                                            "control NEG (fresh unsigned exe)":  {
+                                                                                     "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                                                     "ok":  true,
+                                                                                     "ret":  0,
+                                                                                     "ret_meaning":  null,
+                                                                                     "last_error":  0,
+                                                                                     "last_error_hex":  "0x00000000",
+                                                                                     "last_error_text":  "",
+                                                                                     "first_wait_timed_out":  false,
+                                                                                     "timed_out":  false,
+                                                                                     "completed":  true,
+                                                                                     "had_process_handle":  true,
+                                                                                     "note":  ""
+                                                                                 },
+                                            "installer 0.14.42":  {
+                                                                      "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                                                      "ok":  true,
+                                                                      "ret":  0,
+                                                                      "ret_meaning":  null,
+                                                                      "last_error":  0,
+                                                                      "last_error_hex":  "0x00000000",
+                                                                      "last_error_text":  "",
+                                                                      "first_wait_timed_out":  false,
+                                                                      "timed_out":  false,
+                                                                      "completed":  true,
+                                                                      "had_process_handle":  true,
+                                                                      "note":  ""
+                                                                  }
+                                        },
+                             "events":  {
+                                            "evtx_rc":  0,
+                                            "note":  null,
+                                            "counts_by_id":  {
+                                                                 "3101":  1,
+                                                                 "3105":  14,
+                                                                 "3103":  1,
+                                                                 "3096":  4,
+                                                                 "3102":  1
+                                                             },
+                                            "file":  "sac-real-events-2.json"
+                                        },
+                             "restore":  {
+                                             "why":  "pass2",
+                                             "time":  "2026-10-03T20:12:04.435Z",
+                                             "rc":  0,
+                                             "out":  "The operation completed successfully.\r\r\n",
+                                             "err":  "",
+                                             "skipped":  null,
+                                             "refresh":  {
+                                                             "rc":  0,
+                                                             "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                                             "err":  "",
+                                                             "start_error":  null
+                                                         }
+                                         },
+                             "state_restored":  {
+                                                    "tag":  "restored-after-2",
+                                                    "time":  "2026-10-03T20:12:09.532Z",
+                                                    "reg_rc":  0,
+                                                    "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                                    "reg_value":  0,
+                                                    "reg_present":  true,
+                                                    "citool_rc":  0,
+                                                    "verified_and_reputable_names":  [
+                                                                                         "VerifiedAndReputableDesktop",
+                                                                                         "VerifiedAndReputableDesktopEvaluation",
+                                                                                         "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                         "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                         "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                         "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                                                     ],
+                                                    "citool_matching_objects":  [
+                                                                                    {
+                                                                                        "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                        "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+                                                                                                              "Disabled:Runtime FilePath Rule Protection",
+                                                                                                              "Enabled:Managed Installer"
+                                                                                                          ]
+                                                                                    },
+                                                                                    {
+                                                                                        "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                        "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+                                                                                                              "Disabled:Runtime FilePath Rule Protection",
+                                                                                                              "Enabled:Managed Installer"
+                                                                                                          ]
+                                                                                    },
+                                                                                    {
+                                                                                        "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                        "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+
+                                                                                                          ]
+                                                                                    },
+                                                                                    {
+                                                                                        "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                        "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+
+                                                                                                          ]
+                                                                                    },
+                                                                                    {
+                                                                                        "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+                                                                                                              "Enabled:UMCI",
+                                                                                                              "Enabled:Intelligent Security Graph Authorization",
+                                                                                                              "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                              "Enabled:Allow Supplemental Policies",
+                                                                                                              "Enabled:Revoked Expired As Unsigned",
+                                                                                                              "Enabled:Audit Mode",
+                                                                                                              "Enabled:Inherit Default Policy",
+                                                                                                              "Enabled:Unsigned System Integrity Policy",
+                                                                                                              "Enabled:Advanced Boot Options Menu",
+                                                                                                              "Disabled:Script Enforcement",
+                                                                                                              "Enabled:Update Policy No Reboot",
+                                                                                                              "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                          ]
+                                                                                    },
+                                                                                    {
+                                                                                        "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                        "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                                                        "Version":  0,
+                                                                                        "VersionString":  "0.0.0.0",
+                                                                                        "IsSystemPolicy":  true,
+                                                                                        "IsSignedPolicy":  true,
+                                                                                        "IsOnDisk":  true,
+                                                                                        "IsEnforced":  false,
+                                                                                        "IsAuthorized":  false,
+                                                                                        "PolicyOptions":  [
+                                                                                                              "Enabled:UMCI",
+                                                                                                              "Enabled:Intelligent Security Graph Authorization",
+                                                                                                              "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                                              "Enabled:Allow Supplemental Policies",
+                                                                                                              "Enabled:Revoked Expired As Unsigned",
+                                                                                                              "Enabled:Inherit Default Policy",
+                                                                                                              "Enabled:Unsigned System Integrity Policy",
+                                                                                                              "Enabled:Advanced Boot Options Menu",
+                                                                                                              "Disabled:Script Enforcement",
+                                                                                                              "Enabled:Update Policy No Reboot",
+                                                                                                              "Enabled:Conditional Windows Lockdown Policy"
+                                                                                                          ]
+                                                                                    }
+                                                                                ],
+                                                    "mp_state":  {
+                                                                     "SmartAppControlState":  "Off",
+                                                                     "SmartAppControlExpiration":  null,
+                                                                     "AMRunningMode":  "Normal",
+                                                                     "RealTimeProtectionEnabled":  true
+                                                                 },
+                                                    "ci_state":  {
+                                                                     "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                                     "options_hex":  "0x00282203",
+                                                                     "flags":  [
+                                                                                   "ENABLED",
+                                                                                   "TESTSIGN",
+                                                                                   "FLIGHTING_ENABLED",
+                                                                                   "HVCI_IUM_ENABLED"
+                                                                               ]
+                                                                 },
+                                                    "mode_by_citool_names":  "evaluation policy listed"
+                                                },
+                             "finished":  "2026-10-03T20:12:10.593Z"
+                         }
+               },
+    "notes":  [
+
+              ],
+    "native_error":  null,
+    "final_restore":  {
+                          "why":  "final",
+                          "time":  "2026-10-03T20:12:10.593Z",
+                          "rc":  null,
+                          "out":  null,
+                          "err":  null,
+                          "skipped":  "value not changed by us, or already restored",
+                          "refresh":  null
+                      },
+    "final_state":  {
+                        "tag":  "final",
+                        "time":  "2026-10-03T20:12:10.593Z",
+                        "reg_rc":  0,
+                        "reg_out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                        "reg_value":  0,
+                        "reg_present":  true,
+                        "citool_rc":  0,
+                        "verified_and_reputable_names":  [
+                                                             "VerifiedAndReputableDesktop",
+                                                             "VerifiedAndReputableDesktopEvaluation",
+                                                             "VerifiedAndReputableDesktopFlightSupplemental",
+                                                             "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                             "VerifiedAndReputableDesktopTestSupplemental",
+                                                             "VerifiedAndReputableDesktopEvaluationTestSupplemental"
+                                                         ],
+                        "citool_matching_objects":  [
+                                                        {
+                                                            "PolicyID":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                            "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                            "FriendlyName":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                            "Version":  0,
+                                                            "VersionString":  "0.0.0.0",
+                                                            "IsSystemPolicy":  true,
+                                                            "IsSignedPolicy":  true,
+                                                            "IsOnDisk":  true,
+                                                            "IsEnforced":  false,
+                                                            "IsAuthorized":  false,
+                                                            "PolicyOptions":  [
+                                                                                  "Disabled:Runtime FilePath Rule Protection",
+                                                                                  "Enabled:Managed Installer"
+                                                                              ]
+                                                        },
+                                                        {
+                                                            "PolicyID":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                            "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                            "FriendlyName":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                            "Version":  0,
+                                                            "VersionString":  "0.0.0.0",
+                                                            "IsSystemPolicy":  true,
+                                                            "IsSignedPolicy":  true,
+                                                            "IsOnDisk":  true,
+                                                            "IsEnforced":  false,
+                                                            "IsAuthorized":  false,
+                                                            "PolicyOptions":  [
+                                                                                  "Disabled:Runtime FilePath Rule Protection",
+                                                                                  "Enabled:Managed Installer"
+                                                                              ]
+                                                        },
+                                                        {
+                                                            "PolicyID":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                            "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                            "FriendlyName":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                            "Version":  0,
+                                                            "VersionString":  "0.0.0.0",
+                                                            "IsSystemPolicy":  true,
+                                                            "IsSignedPolicy":  true,
+                                                            "IsOnDisk":  true,
+                                                            "IsEnforced":  false,
+                                                            "IsAuthorized":  false,
+                                                            "PolicyOptions":  [
+
+                                                                              ]
+                                                        },
+                                                        {
+                                                            "PolicyID":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                            "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                            "FriendlyName":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                            "Version":  0,
+                                                            "VersionString":  "0.0.0.0",
+                                                            "IsSystemPolicy":  true,
+                                                            "IsSignedPolicy":  true,
+                                                            "IsOnDisk":  true,
+                                                            "IsEnforced":  false,
+                                                            "IsAuthorized":  false,
+                                                            "PolicyOptions":  [
+
+                                                                              ]
+                                                        },
+                                                        {
+                                                            "PolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                            "BasePolicyID":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                            "FriendlyName":  "VerifiedAndReputableDesktopEvaluation",
+                                                            "Version":  0,
+                                                            "VersionString":  "0.0.0.0",
+                                                            "IsSystemPolicy":  true,
+                                                            "IsSignedPolicy":  true,
+                                                            "IsOnDisk":  true,
+                                                            "IsEnforced":  false,
+                                                            "IsAuthorized":  false,
+                                                            "PolicyOptions":  [
+                                                                                  "Enabled:UMCI",
+                                                                                  "Enabled:Intelligent Security Graph Authorization",
+                                                                                  "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                  "Enabled:Allow Supplemental Policies",
+                                                                                  "Enabled:Revoked Expired As Unsigned",
+                                                                                  "Enabled:Audit Mode",
+                                                                                  "Enabled:Inherit Default Policy",
+                                                                                  "Enabled:Unsigned System Integrity Policy",
+                                                                                  "Enabled:Advanced Boot Options Menu",
+                                                                                  "Disabled:Script Enforcement",
+                                                                                  "Enabled:Update Policy No Reboot",
+                                                                                  "Enabled:Conditional Windows Lockdown Policy"
+                                                                              ]
+                                                        },
+                                                        {
+                                                            "PolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                            "BasePolicyID":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                            "FriendlyName":  "VerifiedAndReputableDesktop",
+                                                            "Version":  0,
+                                                            "VersionString":  "0.0.0.0",
+                                                            "IsSystemPolicy":  true,
+                                                            "IsSignedPolicy":  true,
+                                                            "IsOnDisk":  true,
+                                                            "IsEnforced":  false,
+                                                            "IsAuthorized":  false,
+                                                            "PolicyOptions":  [
+                                                                                  "Enabled:UMCI",
+                                                                                  "Enabled:Intelligent Security Graph Authorization",
+                                                                                  "Enabled:Developer Mode Dynamic Code Trust",
+                                                                                  "Enabled:Allow Supplemental Policies",
+                                                                                  "Enabled:Revoked Expired As Unsigned",
+                                                                                  "Enabled:Inherit Default Policy",
+                                                                                  "Enabled:Unsigned System Integrity Policy",
+                                                                                  "Enabled:Advanced Boot Options Menu",
+                                                                                  "Disabled:Script Enforcement",
+                                                                                  "Enabled:Update Policy No Reboot",
+                                                                                  "Enabled:Conditional Windows Lockdown Policy"
+                                                                              ]
+                                                        }
+                                                    ],
+                        "mp_state":  {
+                                         "SmartAppControlState":  "Off",
+                                         "SmartAppControlExpiration":  null,
+                                         "AMRunningMode":  "Normal",
+                                         "RealTimeProtectionEnabled":  true
+                                     },
+                        "ci_state":  {
+                                         "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                         "options_hex":  "0x00282203",
+                                         "flags":  [
+                                                       "ENABLED",
+                                                       "TESTSIGN",
+                                                       "FLIGHTING_ENABLED",
+                                                       "HVCI_IUM_ENABLED"
+                                                   ]
+                                     },
+                        "mode_by_citool_names":  "evaluation policy listed"
+                    },
+    "still_dirty":  false,
+    "finished":  "2026-10-03T20:12:11.616Z"
+}

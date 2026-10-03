@@ -1,0 +1,265 @@
+{
+  "generated": "2026-10-03T20:12:12.418Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37150100607",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37150100607",
+  "job": "e2e",
+  "os": "windows-11-arm",
+  "branch": "diag-results/37150100607-1-e2e-windows-11-arm",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "done-e2e-update.json",
+      "bytes": 142
+    },
+    {
+      "path": "done-p0-facts.json",
+      "bytes": 140
+    },
+    {
+      "path": "done-p1-assets.json",
+      "bytes": 141
+    },
+    {
+      "path": "done-replica.json",
+      "bytes": 139
+    },
+    {
+      "path": "done-sac-real.json",
+      "bytes": 140
+    },
+    {
+      "path": "e2e-appfile-01-favorites_diagnostic.log",
+      "bytes": 1873
+    },
+    {
+      "path": "e2e-appfile-02-settings_diagnostic.log",
+      "bytes": 24455
+    },
+    {
+      "path": "e2e-appfile-03-000003.log",
+      "bytes": 30
+    },
+    {
+      "path": "e2e-appfile-04-000003.log",
+      "bytes": 112
+    },
+    {
+      "path": "e2e-appfile-05-000003.log",
+      "bytes": 306
+    },
+    {
+      "path": "e2e-appfile-06-000003.log",
+      "bytes": 5510
+    },
+    {
+      "path": "e2e-appfile-07-000003.log",
+      "bytes": 852
+    },
+    {
+      "path": "e2e-appfile-08-000003.log",
+      "bytes": 114
+    },
+    {
+      "path": "e2e-appfile-09-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "e2e-appfile-10-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "e2e-appfile-11-000003.log",
+      "bytes": 65
+    },
+    {
+      "path": "e2e-appfile-12-cys-installed-version.txt",
+      "bytes": 7
+    },
+    {
+      "path": "e2e-appfile-13-phoenix-restore.log",
+      "bytes": 3383
+    },
+    {
+      "path": "e2e-appfiles.txt",
+      "bytes": 49877
+    },
+    {
+      "path": "e2e-before.png",
+      "bytes": 12401
+    },
+    {
+      "path": "e2e-cdp-after.json",
+      "bytes": 3132
+    },
+    {
+      "path": "e2e-cdp-stdout.txt",
+      "bytes": 1975
+    },
+    {
+      "path": "e2e-cdp.json",
+      "bytes": 5840
+    },
+    {
+      "path": "e2e-ci-events.json",
+      "bytes": 87
+    },
+    {
+      "path": "e2e-eventlog-application.txt",
+      "bytes": 188
+    },
+    {
+      "path": "e2e-observe.json",
+      "bytes": 2917
+    },
+    {
+      "path": "e2e-screen-20s.png",
+      "bytes": 178616
+    },
+    {
+      "path": "e2e-screen-end.png",
+      "bytes": 178616
+    },
+    {
+      "path": "e2e-screen-installer.png",
+      "bytes": 178616
+    },
+    {
+      "path": "e2e-timeline.txt",
+      "bytes": 4994
+    },
+    {
+      "path": "e2e-verdict.json",
+      "bytes": 31827
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-e2e-update.txt",
+      "bytes": 169
+    },
+    {
+      "path": "log-p0-facts.txt",
+      "bytes": 165
+    },
+    {
+      "path": "log-p1-assets.txt",
+      "bytes": 167
+    },
+    {
+      "path": "log-replica.txt",
+      "bytes": 3243
+    },
+    {
+      "path": "log-sac-real.txt",
+      "bytes": 165
+    },
+    {
+      "path": "p0-example-SmartAppControl.xml",
+      "bytes": 9489
+    },
+    {
+      "path": "p0-facts.json",
+      "bytes": 48844
+    },
+    {
+      "path": "p0-facts.txt",
+      "bytes": 42139
+    },
+    {
+      "path": "p1-assets.json",
+      "bytes": 20907
+    },
+    {
+      "path": "replica-build.json",
+      "bytes": 3969
+    },
+    {
+      "path": "replica-summary.txt",
+      "bytes": 1542
+    },
+    {
+      "path": "replica.json",
+      "bytes": 151712
+    },
+    {
+      "path": "sac-real-1.evtx",
+      "bytes": 69632
+    },
+    {
+      "path": "sac-real-2.evtx",
+      "bytes": 69632
+    },
+    {
+      "path": "sac-real-citool-lp-after-set-1.json",
+      "bytes": 7236
+    },
+    {
+      "path": "sac-real-citool-lp-after-set-2.json",
+      "bytes": 6761
+    },
+    {
+      "path": "sac-real-citool-lp-final.json",
+      "bytes": 6761
+    },
+    {
+      "path": "sac-real-citool-lp-initial.json",
+      "bytes": 6761
+    },
+    {
+      "path": "sac-real-citool-lp-restored-after-1.json",
+      "bytes": 6761
+    },
+    {
+      "path": "sac-real-citool-lp-restored-after-2.json",
+      "bytes": 6761
+    },
+    {
+      "path": "sac-real-citool-refresh-restore-pass1.txt",
+      "bytes": 168
+    },
+    {
+      "path": "sac-real-citool-refresh-restore-pass2.txt",
+      "bytes": 168
+    },
+    {
+      "path": "sac-real-citool-refresh-set1.txt",
+      "bytes": 169
+    },
+    {
+      "path": "sac-real-citool-refresh-set2.txt",
+      "bytes": 168
+    },
+    {
+      "path": "sac-real-events-1.json",
+      "bytes": 16489
+    },
+    {
+      "path": "sac-real-events-2.json",
+      "bytes": 321
+    },
+    {
+      "path": "sac-real.json",
+      "bytes": 189439
+    },
+    {
+      "path": "subjects.json",
+      "bytes": 182280
+    },
+    {
+      "path": "syntax-check.txt",
+      "bytes": 150
+    }
+  ],
+  "skipped": [
+    {
+      "path": "e2e-cdp-stderr.txt",
+      "reason": "empty file"
+    }
+  ],
+  "inline_files": 45,
+  "blob_files": 16
+}
