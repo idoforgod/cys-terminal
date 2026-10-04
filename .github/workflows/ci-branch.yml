@@ -1187,16 +1187,39 @@ jobs:
       #   신설 표면(alert_route.rs 전량 · governance/state/delivery 의 WP-5 큐 생명주기)의 단위 검체
       #   1,228종이 브랜치 push 에서 0회 실행이고 **컴파일 실패조차** 안 잡혔다. 그 적색은 태그 push
       #   에서 처음 보이는데 그 시점엔 pack-artifacts 미실행 → 팩 자산 0 → 발행 0 이다(release.yml
-      #   이 그 인과를 스스로 적었다). `--skip hwmon::` 은 release.yml 과 같은 선례(가상 러너 GPU
-      #   부재 · 테스트 삭제 금지). 격리·직렬화 근거는 위 리허설 스텝과 같다.
+      #   이 그 인과를 스스로 적었다). skip 은 release.yml 의 hwmon 모듈 전체 skip 선례(가상 러너 GPU
+      #   부재 · 테스트 삭제 금지)를 **깨질 검체 하나로 좁혀** 쓴다(아래 R1F-PK 단락). 격리·직렬화 근거는
+      #   위 리허설 스텝과 같다.
       #   ★`if:` 를 달지 않는다 — 위 레인 대조 게이트의 MUST_RUN_TOKENS 가 이 토큰의 존재와 무조건
       #   실행을 핀한다(D9). 예산: 로컬 실측 2026-09-10(콜드 빌드 포함) 1226 passed · 0 failed ·
       #   2 filtered(hwmon) · 137s — 러너 캐시 히트 시 더 짧다.
+      #   ★(0.14.43 성찰 R1F-PK · S3 minor 7) hwmon **모듈 전체** skip 을 깨질 검체 하나의 정확한 이름
+      #   (`hwmon::tests::snapshot_has_all_sections`)으로 좁혔다. 종전에는 E2 가 더한 검체 15건(맥 기준)이 CI 어느
+      #   레인에서도 한 번도 돌지 않았다. 깨질 것으로 가린 하나는 GPU 코어 수·활용률·NPU 코어 수를 실기로 단언하는
+      #   그 검체다(가상 러너 실증: v0.12.21 릴리스 런 28792111282). 나머지 15건의 단언은 센서 유무와 무관(순수 함수·
+      #   소스 핀·실패 사유 판정)하거나 `CYS_HW_STRICT` 일 때만 켜진다 — 코드 읽기 근거이고 가상 러너 실측은 아직 없다
+      #   (로컬 맥 실기 16/16 통과). **이 좁힘 탓에 이 스텝이 붉어지면 이 한 줄을 되돌려라**(테스트 삭제 금지).
+      #   release.yml 의 skip 은 그대로다(발행 레인은 건드리지 않는다).
       - name: cargo test --bin cysd (데몬 단위 검체 · 브랜치 레인 편입 · macOS)
         shell: bash
         run: |
           set -euo pipefail
-          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::tests::snapshot_has_all_sections
+
+      # ★(0.14.43 성찰 R1F-PK · S3 minor 8) IOReport 강링크 **산출물** 게이트. E2 가 `hwmon.rs` 의 IOReport 강링크를 dlopen 지연
+      #   로딩으로 바꿨다(그 dylib 이 없는 맥에서 데몬이 뜨지 못하던 문제). 소스 핀(lib `e2_cysd_hwmon_source_has_no_ioreport_strong_link`)은
+      #   소스의 모양만 보지만 진짜 판정자는 산출물이다 — 이 스텝이 제품 cysd 를 만들어 `otool -L` 에 IOReport 가 없음을 확인한다
+      #   (scripts/check-no-ioreport-link.sh). 이 잡에는 제품 cysd 빌드가 없다(앞 스텝은 테스트 하네스 바이너리) → 여기서 한 번 만든다.
+      #   앞 스텝이 의존 크레이트와 lib 를 같은 개발 프로파일로 이미 컴파일했으므로 늘어나는 것은 cysd 비테스트 빌드뿐이다.
+      #   검사 경로: 이 잡은 호스트 네이티브(macos-latest · 타깃 트리플 지정 없음 · 유니버설 아님)라 `target/debug/cysd` 하나다.
+      #   (릴리스 레인은 레그별 — aarch64·x86_64 크로스 — `.app` 안 cysd 를 본다.) 개발 프로파일도 같은 링크 속성을 적용받는다.
+      #   ★`if:` 를 달지 않는다(돌지 않는 초록 금지). 스크립트는 맥이 아니거나 otool 이 없으면 '건너뜀'으로 통과하지만 이 잡은 macOS 전용이다.
+      - name: cysd 산출물 IOReport 링크 게이트 (otool -L · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --bin cysd
+          bash scripts/check-no-ioreport-link.sh target/debug/cysd
 
       # ★T6(v2 §12 이월 · merge3 CI 편입): cargo test --lib 완전 레인(macOS). 병합 엔진
       #   (merge3 golden 15종)과 pack 판정·실행부 스위트가 **브랜치 push 마다** 도는 유일한

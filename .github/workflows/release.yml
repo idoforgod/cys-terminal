@@ -769,6 +769,26 @@ jobs:
           PYEOF
           echo "✓ macOS 서명·공증 산출물 준비: $DST/dmg/cys_${VERSION}_${ARCH}.dmg + $DST/macos/cys.app.tar.gz(.sig)"
 
+      # ★(0.14.43 성찰 R1F-PK · S3 minor 8) IOReport 강링크 **산출물** 게이트 — 업로드 **전**. E2 가 `hwmon.rs` 의 IOReport 강링크를 dlopen 지연
+      #   로딩으로 바꿨다(그 dylib 이 없는 맥에서 cysd 가 main 에 닿기 전에 죽던 문제 = 데몬 기동 불능). 소스 핀은 소스의 모양만 보지만 진짜
+      #   판정자는 산출물이다 — 이 스텝이 **출하되는** cysd 를 `otool -L` 로 보고 IOReport 가 있으면 잡을 붉힌다(scripts/check-no-ioreport-link.sh).
+      #   검사 경로 = 레그가 방금 만든 `.app` 안의 cysd(`<번들 기준>/macos/cys.app/Contents/MacOS/cysd`) — 위 스텝이 수리 세대 마커를 보는 바로 그 파일이다.
+      #   번들 기준은 위 스텝과 같은 규칙이다: 호스트 타깃(arm64 러너의 aarch64 레그)은 `target/release/bundle`, 크로스(x86_64 레그)는
+      #   `target/<타깃>/release/bundle`. 유니버설(lipo)이 아니다 — 레그마다 자기 아키텍처 cysd 하나를 본다(otool 은 x86_64 슬라이스도 arm64 러너에서 읽는다).
+      #   ★위치: 빌드와 서명·공증이 `build-macos-signed.sh` 한 스텝(한 스크립트)이라 '빌드 뒤 · 서명 앞' 사이에는 스텝을 넣을 수 없다(다른 스텝을 고치지 않고는).
+      #   그래서 그 스텝 **바로 뒤**, Gatekeeper 게이트와 tauri-action 업로드 **앞**에 둔다 — 실패하면 업로드가 일어나지 않는다. 서명·공증은 로드 명령(의존 dylib)을 바꾸지
+      #   않으므로 서명 뒤에 봐도 같은 판정이다. 브랜치 CI(ci-branch.yml 맥 레인)가 같은 스크립트를 push 마다 먼저 돈다 — 여기는 최종 백스톱이다.
+      #   ★windows 레그에서는 이 스텝이 돌지 않는다(`if`) — 스크립트도 맥이 아니면 '건너뜀'으로 통과한다.
+      - name: cysd 산출물 IOReport 링크 게이트 (otool -L · macOS 전용 · 업로드 전)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TRIPLE="${{ matrix.target }}"
+          HOST_TRIPLE="$([ "$(uname -m)" = "arm64" ] && echo aarch64-apple-darwin || echo x86_64-apple-darwin)"
+          if [ "$TRIPLE" = "$HOST_TRIPLE" ]; then SRC="target/release/bundle"; else SRC="target/$TRIPLE/release/bundle"; fi
+          bash scripts/check-no-ioreport-link.sh "$SRC/macos/cys.app/Contents/MacOS/cysd"
+
       # ★macOS 격리 속성 + Gatekeeper 실평가 게이트 — 업로드 **전** (2026-08-13 신설).
       #   위 스텝이 서명·공증·staple 을 끝냈다. 그러나 그 산출물이 **실사용자 환경**에서 열리는지는
       #   아직 측정되지 않았다: 사용자는 브라우저로 받고, 그때 파일에 `com.apple.quarantine` 이 붙으며,

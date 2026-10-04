@@ -370,7 +370,12 @@ jobs:
           #   줄이 증거로 남는다. rc 는 파이프에 삼켜지지 않게 PIPESTATUS[0] 으로 직독한다.
           # ★--nocapture: --test-threads=1 이라 libtest 가 검체명을 실행 **전에** 찍는다 —
           #   멈춘 검체 이름이 마지막 줄에 남는다(그게 없으면 hang 위치를 영영 모른다).
-          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon:: 2>&1 | tee "$LOG"
+          # ★(0.14.43 성찰 R1F-PK · S3 minor 7) hwmon **모듈 전체** skip 을 깨질 검체 하나의 정확한 이름으로 좁혔다. 종전에는 비 macOS 스텁 검체
+          #   `e2_non_macos_stub_reports_platform`(맥에서는 컴파일되지 않는다)이 **어느 레인에서도 한 번도 실행되지 않았다** — 이 윈도우 실기가 그것이 도는 유일한 자리다.
+          #   남긴 skip = `hwmon::tests::snapshot_has_all_sections`: 윈도우에서는 GPU·NPU 단언이 컴파일되지 않지만(맥 전용 cfg) 코어 열거(PDH 카운터)가 이 러너에서
+          #   0개를 내는지는 재 본 적이 없다 — 확신이 없는 검체는 skip 에 남긴다. 나머지(순수 함수 2 · 소스 핀 1 · 스냅샷 계약 2)는 센서와 무관하다(코드 읽기 근거 — 윈도우 러너 실측은 아직 없다).
+          #   이 스텝은 비차단(continue-on-error)이라 좁힘이 틀려도 잡을 붉히지 않지만 아래 판독 스텝이 검체 이름을 드러낸다. release.yml 의 skip 은 그대로다.
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections 2>&1 | tee "$LOG"
           rc="${PIPESTATUS[0]}"
           echo "$rc" > "$CYSD_DIR/rc"
           [ "$rc" -eq 0 ] && exit 0

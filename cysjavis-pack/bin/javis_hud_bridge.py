@@ -282,6 +282,7 @@ def node_key(s):
 
 _SEAT_NUM = re.compile(r"\+?[0-9]+")      # 좌석 번호 문자열 — ASCII 숫자만(파이썬 isdigit/int 의 유니코드 숫자 배제)
 _U64_MAX = (1 << 64) - 1
+_U64_MAX_DIGITS = len(str(_U64_MAX))      # 20 — 선행 0 을 뺀 자릿수가 이보다 길면 u64 를 넘는다(좌석 번호일 수 없다)
 
 
 def injected_from_key(slug, raw):
@@ -306,7 +307,18 @@ def injected_from_key(slug, raw):
             t = t[len("surface:"):]
         if not _SEAT_NUM.fullmatch(t):
             return None
-        n = int(t)
+        # ★(0.14.43 · R1F-PK · S3 minor 1) 숫자 문자열 하나가 구독 스레드를 죽이지 못한다 — 파이썬 `int()` 는 4300자리를 넘는 십진
+        #   문자열에 `ValueError` 를 낸다(종전엔 이 예외가 `_reader` 밖으로 나가 이벤트 구독 스레드가 끝나고 다시 뜨지 않았다).
+        #   선행 0 을 뺀 자릿수가 u64 최대값(20자리)을 넘으면 `int()` 를 부르기 전에 '좌석 아님' 으로 거른다 — 데몬(`parse_surface_ref`)도
+        #   오버플로로 실패하는 값이다. 선행 0 은 값이 아니라 길이일 뿐이라 벗긴 뒤 변환한다(데몬의 u64 파싱은 `007` 도 7 로 받는다).
+        #   `try` 는 그래도 남겨 둔 방어선이다 — 이 함수는 어떤 입력에도 예외를 내지 않는다.
+        digits = t.lstrip("+").lstrip("0")
+        if len(digits) > _U64_MAX_DIGITS:
+            return None
+        try:
+            n = int(digits or "0")
+        except ValueError:
+            return None
     else:
         return None
     if not 0 <= n <= _U64_MAX:
@@ -1573,6 +1585,7 @@ class SubscriptionSupervisor:
                     ["events", "--reconnect", "--cursor-file", cursor]
         backoff = None    # W2: 직전에 잔 대기(초) — None = 첫 재수립(지수 백오프 상태)
         last_note = None  # W2: 같은 사유 연속 재종료는 1회만 로그(반복 억제)
+        last_evt_err = None  # R1F-PK: 이벤트 처리 예외도 같은 형이 연속이면 첫 1회만 로그(이벤트 폭주 시 로그 폭주 억제)
         while not stop.is_set():
             born = time.monotonic()
             proc = subprocess.Popen(args_base, stdout=subprocess.PIPE,
@@ -1582,20 +1595,39 @@ class SubscriptionSupervisor:
                 for line in proc.stdout:
                     if stop.is_set():
                         break
+                    # ★(0.14.43 · R1F-PK · S3 minor 1) 이벤트 **한 건**의 처리 예외가 구독 스레드를 죽이지 못한다 — 종전엔 이 자리에 `except` 가
+                    #   없어 예외 하나가 `_reader` 밖으로 나가면 스레드가 끝났고, `reconcile_targets` 는 스레드 생존을 보지 않아 다시 띄우지도
+                    #   않았다(그 구독의 HUD 표시가 영구히 멎는다). 그 이벤트만 건너뛰고 다음 줄을 처리한다.
+                    #   삼키는 것은 `Exception` 계열뿐이다 — KeyboardInterrupt·SystemExit(BaseException)은 그대로 통과한다. 종료 신호(`stop` ·
+                    #   위 break)와 자식 EOF(for 문 끝) 와 읽기 단계의 예외(for 문 머리)는 이 try 밖이라 종전 그대로다.
                     try:
-                        ev = json.loads(line)
-                    except ValueError:
-                        continue
-                    if ev.get("type") != "event":
-                        continue
-                    self.world.seq = max(self.world.seq, ev.get("seq") or 0)
-                    frames, want_poke = route_event(ev, self.world, self.coal, slug)
-                    for fr in frames:
-                        self.hub.publish(fr)
-                        if fr.get("t") in ("fx", "dog"):   # D4 강아지 fx 도 /history 리플레이 포함
-                            archive_fx(ev.get("timestamp"), fr)
-                    if want_poke:
-                        self.poke.set()
+                        try:
+                            ev = json.loads(line)
+                        except ValueError:
+                            continue
+                        if ev.get("type") != "event":
+                            continue
+                        self.world.seq = max(self.world.seq, ev.get("seq") or 0)
+                        frames, want_poke = route_event(ev, self.world, self.coal, slug)
+                        for fr in frames:
+                            self.hub.publish(fr)
+                            if fr.get("t") in ("fx", "dog"):   # D4 강아지 fx 도 /history 리플레이 포함
+                                archive_fx(ev.get("timestamp"), fr)
+                        if want_poke:
+                            self.poke.set()
+                    except Exception as e:
+                        # 삼킨 사실은 기존 로그 방식(stderr 한 줄)으로 남긴다 — 같은 예외 형이 연속이면 첫 1회만. 로그 쓰기 자체가
+                        # 실패해도(stderr 닫힘 등) 그것이 구독을 죽이지 못하게 가둔다.
+                        sig = type(e).__name__
+                        if sig != last_evt_err:
+                            last_evt_err = sig
+                            try:
+                                sys.stderr.write(
+                                    "[hud-bridge] 이벤트 처리 예외 — 그 이벤트만 건너뜀 (sub=%s %s: %s) — 같은 예외 연속분은 로그 생략\n"
+                                    % (slug, sig, " ".join(str(e).split())[:120]))
+                                sys.stderr.flush()
+                            except Exception:
+                                pass
             finally:
                 try:
                     proc.terminate()

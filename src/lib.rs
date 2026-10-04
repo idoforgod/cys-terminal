@@ -3198,33 +3198,144 @@ mod tests {
         assert_eq!(super::ENV_GATE_PENDING_CLOSE, "CYS_GATE_PENDING_CLOSE");
     }
 
-    /// ★(0.14.43 · E2 · 통합 9) 데몬 `hwmon.rs` 에 IOReport **강링크**(link 속성으로 묶기)가 다시 들어오지 않는다 — CI 가시판 핀.
-    /// 비공개 dylib(IOReport)을 링크 속성으로 묶으면 그 라이브러리가 사라진 macOS 에서 데몬이 **뜨지 않는다**(dyld 가 기동 전에 실패).
-    /// E2 는 이를 지연 로딩(dlopen)으로 바꿨고, 같은 핀이 `hwmon.rs` 안(`e2_source_has_no_ioreport_strong_link`)에도 있다. 그러나
-    /// 그 모듈의 검체는 CI 세 레인이 모두 `--skip hwmon::`(실 GPU 전제 검체 때문)으로 건너뛰어 **CI 에서는 돌지 않는다** —
-    /// 안 도는 핀은 게이트가 아니다. 그래서 같은 로직을 skip 에 걸리지 않는 이 자리(`state.rs` 소스 핀과 같은 `include_str!` 방식)에 둔다.
-    /// 금지 문자열은 조각으로 이어 붙인다 — `git grep` 으로 강링크를 찾는 사람에게 이 핀이 가짜 양성으로 잡히지 않게 한다
-    /// (스캔 대상은 `hwmon.rs` 뿐이라 자기참조는 없다).
+    /// ★(0.14.43 · E2 · 통합 9 · 성찰 R1F-PK) 데몬(`src/bin/cysd/*.rs` 전부)과 저장소의 빌드 스크립트(`build.rs`)에 IOReport **강링크**(link 속성으로 묶기)가
+    /// 다시 들어오지 않는다 — CI 가시판 핀. 비공개 dylib(IOReport)을 링크 속성으로 묶으면 그 라이브러리가 사라진 macOS 에서 데몬이 **뜨지 않는다**(dyld 가 기동 전에 실패).
+    /// E2 는 이를 지연 로딩(dlopen)으로 바꿨고, 같은 핀이 `hwmon.rs` 안(`e2_source_has_no_ioreport_strong_link`)에도 있다. 그러나 태그 레인(release.yml)은
+    /// `--skip hwmon::` 으로 그 모듈 전체를 건너뛰어 **거기서는 돌지 않는다**(브랜치 CI·윈도우 헬스는 성찰 R1F-PK 부터 깨질 검체 하나 — `snapshot_has_all_sections` — 만
+    /// 건너뛴다). 안 도는 핀은 게이트가 아니다 → 같은 로직을 skip 에 걸리지 않는 이 자리에 둔다(`cargo test --lib` 가 도는 레인).
+    ///
+    /// 넓힌 범위(S3 minor 8): ① `hwmon.rs` 하나가 아니라 `src/bin/cysd/` 의 `.rs` **전부**(새 파일 포함 — 디렉터리를 실행 시점에 훑는다) ② `#[link(…)]` 뿐 아니라
+    /// `cfg_attr(…, link(…))` 꼴 ③ 빌드 스크립트의 `cargo:rustc-link-lib`·`rustc-link-arg` + IOReport. 판정자가 **스캐너 자신**이라, 실제 소스를 보기 전에 합성한
+    /// 양성(잡아야 한다)·음성(잡으면 안 된다) 입력으로 스캐너가 정말 가르는지 먼저 확인한다(계측 유효성 — 측정 불능은 통과가 아니다).
+    /// 이 핀은 소스의 **모양**만 본다(조각으로 이어 붙인 `rustc-link-lib` 문자열·의존 크레이트가 들여온 링크는 못 본다) — 진짜 최종 판정자는 산출물이고,
+    /// `scripts/check-no-ioreport-link.sh`(`otool -L`)가 브랜치 CI 맥 레인과 릴리스 맥 레그에서 cysd 바이너리를 직접 본다.
+    /// 금지 문자열은 조각으로 이어 붙인다 — `git grep` 으로 강링크를 찾는 사람에게 이 핀이 가짜 양성으로 잡히지 않게 한다(스캔 대상에 이 파일은 없어 자기참조는 없다).
     #[test]
     fn e2_cysd_hwmon_source_has_no_ioreport_strong_link() {
-        let src = include_str!("bin/cysd/hwmon.rs"); // src/lib.rs 기준 경로
-        // 종전의 정확한 문구(공백 포함)
-        let literal = ["#[li", "nk(name = \"IO", "Report\""].concat();
-        assert!(!src.contains(&literal), "IOReport 강링크가 다시 들어왔다: {literal}");
-        // 공백·줄바꿈·인자 순서가 달라진 변형도 같은 강링크다 — 모든 link 속성에서 IOReport 를 찾는다.
-        let squashed: String = src.split_whitespace().collect();
-        let open = ["#[li", "nk("].concat();
-        let target = ["IO", "Report"].concat();
-        let (mut rest, mut seen) = (squashed.as_str(), 0);
-        while let Some(i) = rest.find(&open) {
-            let tail = &rest[i..];
-            let end = tail.find(")]").expect("link 속성이 닫히지 않았다");
-            assert!(!tail[..end].contains(&target), "link 속성이 IOReport 를 묶는다: {}", &tail[..end]);
-            seen += 1;
-            rest = &tail[end..];
+        // ── 스캐너(순수 함수) ──
+        // link 속성의 인자 문자열을 전부 돌려준다 — `#[link(…)]` 와 `cfg_attr(…, link(…))` 둘 다. 공백·줄바꿈을 지운 뒤 `link(` 를 찾되 앞 글자가 `[`·`,`·`(` 인
+        // 속성 문맥만 센다(`symlink(`·`read_link(` 같은 식별자 꼬리는 제외). 인자는 첫 `)` 까지다(`name = "…", kind = "…"` 에는 중첩 괄호가 없다).
+        fn link_attr_args(src: &str) -> Vec<String> {
+            let squashed: String = src.split_whitespace().collect();
+            let (mut out, mut from) = (Vec::new(), 0);
+            while let Some(i) = squashed[from..].find("link(") {
+                let at = from + i;
+                from = at + "link(".len();
+                if !matches!(squashed[..at].chars().next_back(), Some('[' | ',' | '(')) {
+                    continue;
+                }
+                let end = squashed[from..].find(')').map_or(squashed.len(), |e| from + e);
+                out.push(squashed[from..end].to_string());
+            }
+            out
         }
-        // 계측 유효성 — CoreFoundation 의 link 속성은 남아 있어야 한다(스캐너가 속성을 실제로 읽고 있다는 증거).
-        assert!(seen >= 1, "link 속성 스캐너가 아무것도 읽지 못했다");
+        // 그중 IOReport(대소문자 무시 — `target` 은 소문자)를 묶는 것만.
+        fn naming(args: &[String], target: &str) -> Vec<String> {
+            args.iter().filter(|a| a.to_ascii_lowercase().contains(target)).cloned().collect()
+        }
+        // 빌드 스크립트: 링크 지시(`rustc-link-lib`·`rustc-link-arg`)와 IOReport 가 **함께** 있으면 위반(어느 줄에 있든 — 변수에 담아 쓰는 꼴도 잡는다).
+        // 주석(`//`)은 걷는다: 설명문이 두 낱말을 같이 적어도 지시가 아니다(`build.rs` 의 링크 지시 줄에는 문자열 속 `//` 가 없다).
+        fn build_script_hits(src: &str, target: &str) -> Vec<&'static str> {
+            let code = src.lines().map(|l| l.split("//").next().unwrap_or("")).collect::<Vec<_>>().join("\n").to_ascii_lowercase();
+            let mut hits = Vec::new();
+            if code.contains(target) {
+                for directive in ["rustc-link-lib", "rustc-link-arg"] {
+                    if code.contains(directive) {
+                        hits.push(directive);
+                    }
+                }
+            }
+            hits
+        }
+
+        let io = ["IO", "Report"].concat();
+        let target = io.to_ascii_lowercase();
+
+        // ── 계측 유효성: 합성 입력으로 스캐너가 실제로 가르는지(양성 6 · 음성 3 · build.rs 양성 4 · 음성 3) ──
+        let bad_attrs = [
+            format!("#[link(name = \"{io}\", kind = \"dylib\")]\nextern \"C\" {{}}\n"),
+            format!("#[link(\n    kind = \"dylib\",\n    name = \"{io}\"\n)]\nextern \"C\" {{}}\n"), // 인자 순서·줄바꿈
+            format!("#[link(name = \"{target}\")]\nextern \"C\" {{}}\n"),                            // 대소문자
+            format!("#[link(name = \"{io}\", kind = \"framework\")]\nextern \"C\" {{}}\n"),
+            format!("#[cfg_attr(target_os = \"macos\", link(name = \"{io}\", kind = \"dylib\"))]\nextern \"C\" {{}}\n"), // cfg_attr
+            format!("#[cfg_attr(all(target_os = \"macos\", target_arch = \"aarch64\"), link(name = \"{io}\"))]\nextern \"C\" {{}}\n"),
+        ];
+        for s in &bad_attrs {
+            assert!(!naming(&link_attr_args(s), &target).is_empty(), "스캐너가 IOReport 강링크 변형을 못 잡는다(핀 무력화): {s}");
+        }
+        let good_attrs = [
+            "#[link(name = \"CoreFoundation\", kind = \"framework\")]\nextern \"C\" {}\n".to_string(),
+            format!("std::os::unix::fs::symlink(\"{io}\", \"x\").ok();\n"),
+            format!("// {io}CopyAllChannels 는 dlsym 으로 찾는다\nlet name = c\"{io}CopyAllChannels\";\n"),
+        ];
+        for s in &good_attrs {
+            assert!(naming(&link_attr_args(s), &target).is_empty(), "스캐너가 무해한 입력을 강링크로 오판한다: {s}");
+        }
+        assert_eq!(link_attr_args(&good_attrs[0]), ["name=\"CoreFoundation\",kind=\"framework\""], "스캐너가 link 속성을 읽지 못한다");
+        let bad_build = [
+            format!("println!(\"cargo:rustc-link-lib=dylib={io}\");"),
+            format!("println!(\"cargo:rustc-link-lib=framework={io}\");"),
+            format!("println!(\"cargo:rustc-link-arg=-l{io}\");"),
+            format!("let lib = \"{target}\";\nprintln!(\"cargo:rustc-link-lib={{lib}}\");"), // 변수에 담아 쓰는 꼴
+        ];
+        for s in &bad_build {
+            assert!(!build_script_hits(s, &target).is_empty(), "스캐너가 build.rs 의 IOReport 링크 지시를 못 잡는다(핀 무력화): {s}");
+        }
+        let good_build = [
+            "println!(\"cargo:rustc-link-lib=dylib=z\");".to_string(),
+            format!("// cargo:rustc-link-lib 는 {io} 에 쓰지 않는다\nprintln!(\"cargo:rerun-if-changed=build.rs\");"),
+            format!("println!(\"cargo:rustc-env=PROBE={io}\");"),
+        ];
+        for s in &good_build {
+            assert!(build_script_hits(s, &target).is_empty(), "스캐너가 무해한 build.rs 를 강링크로 오판한다: {s}");
+        }
+
+        // ── 실제 소스: `src/bin/cysd/` 의 `.rs` 전부 + 저장소 `build.rs`(있다면) ──
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    rs_files(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+        // 돌연변이 검증용 루트 — `CYS_E2_PIN_ROOT` 가 있으면 그 디렉터리(`src/bin/cysd/` 와 `build.rs` 의 변이 사본이 든 곳)를 훑는다(레인 대조 게이트의 `LANE_GATE_ROOT` 와 같은
+        // 관례: 변이를 넣어도 이 핀이 붉어지는지 재는 데 쓴다). CI 에서는 미설정 = 이 크레이트 루트다. 빈 디렉터리를 가리켜도 아래 계측 유효성 단언이 막는다(핀을 끌 수 없다).
+        let root_buf = std::env::var_os("CYS_E2_PIN_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let root = root_buf.as_path();
+        let mut files = Vec::new();
+        rs_files(&root.join("src").join("bin").join("cysd"), &mut files);
+        files.sort();
+        assert!(
+            files.len() >= 10 && files.iter().any(|p| p.ends_with("hwmon.rs")),
+            "cysd 소스 스캔 실패(files={}) — 측정 불능은 통과가 아니다",
+            files.len()
+        );
+        let (mut seen, mut hwmon_has_corefoundation) = (0, false);
+        for f in &files {
+            let src = std::fs::read_to_string(f).unwrap_or_else(|e| panic!("{} 를 읽지 못했다: {e}", f.display()));
+            let args = link_attr_args(&src);
+            seen += args.len();
+            if f.ends_with("hwmon.rs") {
+                hwmon_has_corefoundation = args.iter().any(|a| a.contains("CoreFoundation"));
+            }
+            let bad = naming(&args, &target);
+            assert!(bad.is_empty(), "{} 의 link 속성이 IOReport 를 묶는다(강링크 재발): {bad:?}", f.display());
+        }
+        // 계측 유효성 — CoreFoundation 의 link 속성은 hwmon.rs 에 남아 있어야 한다(스캐너가 실제 소스의 속성을 읽고 있다는 증거).
+        assert!(seen >= 1 && hwmon_has_corefoundation, "link 속성 스캐너가 실제 소스에서 아무것도 읽지 못했다(seen={seen})");
+        let build_rs = root.join("build.rs");
+        if build_rs.exists() {
+            let src = std::fs::read_to_string(&build_rs).unwrap_or_else(|e| panic!("build.rs 를 읽지 못했다: {e}"));
+            assert!(src.contains("fn main"), "build.rs 판독이 이상하다(측정 불능)");
+            let hits = build_script_hits(&src, &target);
+            assert!(hits.is_empty(), "build.rs 가 링크 지시({hits:?})와 IOReport 를 함께 담는다 — 강링크 재발");
+        }
     }
     use super::*;
 
