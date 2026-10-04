@@ -1,0 +1,9 @@
+{
+    "result":  "PASS",
+    "off":  "PASS",
+    "on":  "PASS",
+    "reasons":  [
+                    "OFF PASS: the real Update button flow downloaded the installer, started it, the app exited, the version marker changed and the app came back",
+                    "ON PASS: under real SAC the blocked update left the app running, no installer started, the notification named 4551, the temp folder and the attempt record were cleaned up"
+                ]
+}

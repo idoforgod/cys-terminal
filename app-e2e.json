@@ -1,0 +1,1220 @@
+{
+    "started":  "2026-10-04T04:42:28.049Z",
+    "matrix_os":  "windows-11-arm",
+    "inputs":  {
+                   "run_id":  "37175872925",
+                   "artifact":  "cys-windows-x64-nsis",
+                   "installer_dir":  "C:\\a\\_temp\\appe2e-installer",
+                   "manifest_url":  "https://raw.githubusercontent.com/idoforgod/cys-terminal/7d2dc8d67c9047dce50dcbe9ee8be30d2b401051/diag/appe2e-manifest.json",
+                   "commit":  "7d2dc8d67c9047dce50dcbe9ee8be30d2b401051",
+                   "no_input":  false,
+                   "installer":  {
+                                     "path":  "C:\\a\\_temp\\appe2e-installer\\cys_0.14.43_x64-setup.exe",
+                                     "name":  "cys_0.14.43_x64-setup.exe",
+                                     "size":  143298405,
+                                     "sha256":  "9969bc060f0c7f1d3e48c2f23200ff60204d53d777fdfd95d5d3696eafc27b28",
+                                     "signature":  "NotSigned",
+                                     "file_version":  "0.14.43",
+                                     "product_version":  "0.14.43"
+                                 },
+                   "installer_ok":  true,
+                   "from_version":  "0.14.43",
+                   "manifest":  {
+                                    "url":  "https://raw.githubusercontent.com/idoforgod/cys-terminal/7d2dc8d67c9047dce50dcbe9ee8be30d2b401051/diag/appe2e-manifest.json",
+                                    "attempts":  [
+                                                     {
+                                                         "n":  1,
+                                                         "ok":  true,
+                                                         "rc":  0,
+                                                         "size":  1451,
+                                                         "err":  ""
+                                                     }
+                                                 ],
+                                    "ok":  true,
+                                    "version":  "0.14.99",
+                                    "platform_keys":  [
+                                                          "windows-x86_64",
+                                                          "windows-x86_64-nsis"
+                                                      ],
+                                    "target_key":  "windows-x86_64-nsis",
+                                    "installer_url":  "https://github.com/idoforgod/cys-terminal/releases/download/v0.14.42/cys_0.14.42_x64-setup.exe",
+                                    "installer_version":  "0.14.42",
+                                    "signature_chars":  416,
+                                    "same_as_repo_copy":  true,
+                                    "error":  null
+                                },
+                   "problems":  [
+
+                                ]
+               },
+    "measurable":  true,
+    "sac_initially_enforced":  false,
+    "sac_on_confirmed":  true,
+    "sac_on_utc":  "2026-10-04T04:45:25.960Z",
+    "restore_ok":  true,
+    "verdict":  {
+                    "result":  "PASS",
+                    "off":  "PASS",
+                    "on":  "PASS",
+                    "reasons":  [
+                                    "OFF PASS: the real Update button flow downloaded the installer, started it, the app exited, the version marker changed and the app came back",
+                                    "ON PASS: under real SAC the blocked update left the app running, no installer started, the notification named 4551, the temp folder and the attempt record were cleaned up"
+                                ]
+                },
+    "steps":  {
+                  "prepare":  {
+                                  "started":  "2026-10-04T04:42:28.065Z",
+                                  "ended":  "2026-10-04T04:42:35.018Z",
+                                  "ok":  true,
+                                  "error":  null,
+                                  "language_mode_at_start":  "FullLanguage",
+                                  "language_mode_at_end":  "FullLanguage",
+                                  "minutes_left_at_start":  34.1
+                              },
+                  "install-off":  {
+                                      "started":  "2026-10-04T04:42:35.018Z",
+                                      "ended":  "2026-10-04T04:43:25.092Z",
+                                      "ok":  true,
+                                      "error":  null,
+                                      "language_mode_at_start":  "FullLanguage",
+                                      "language_mode_at_end":  "FullLanguage",
+                                      "minutes_left_at_start":  34
+                                  },
+                  "off-run":  {
+                                  "started":  "2026-10-04T04:43:25.092Z",
+                                  "ended":  "2026-10-04T04:44:41.407Z",
+                                  "ok":  true,
+                                  "error":  null,
+                                  "language_mode_at_start":  "FullLanguage",
+                                  "language_mode_at_end":  "FullLanguage",
+                                  "minutes_left_at_start":  33.1
+                              },
+                  "reinstall":  {
+                                    "started":  "2026-10-04T04:44:41.407Z",
+                                    "ended":  "2026-10-04T04:45:19.367Z",
+                                    "ok":  true,
+                                    "error":  null,
+                                    "language_mode_at_start":  "FullLanguage",
+                                    "language_mode_at_end":  "FullLanguage",
+                                    "minutes_left_at_start":  31.799999999999997
+                                },
+                  "on-pre":  {
+                                 "started":  "2026-10-04T04:45:19.369Z",
+                                 "ended":  "2026-10-04T04:45:20.449Z",
+                                 "ok":  true,
+                                 "error":  null,
+                                 "language_mode_at_start":  "FullLanguage",
+                                 "language_mode_at_end":  "FullLanguage",
+                                 "minutes_left_at_start":  31.200000000000003
+                             },
+                  "checkpoint-pre-sac":  {
+                                             "started":  "2026-10-04T04:45:20.449Z",
+                                             "ended":  "2026-10-04T04:45:25.951Z",
+                                             "ok":  true,
+                                             "error":  null,
+                                             "language_mode_at_start":  "FullLanguage",
+                                             "language_mode_at_end":  "FullLanguage",
+                                             "minutes_left_at_start":  31.200000000000003
+                                         },
+                  "sac-on":  {
+                                 "started":  "2026-10-04T04:45:25.956Z",
+                                 "ended":  "2026-10-04T04:45:38.460Z",
+                                 "ok":  true,
+                                 "error":  null,
+                                 "language_mode_at_start":  "FullLanguage",
+                                 "language_mode_at_end":  "FullLanguage",
+                                 "minutes_left_at_start":  31.1
+                             },
+                  "on-run":  {
+                                 "started":  "2026-10-04T04:45:38.462Z",
+                                 "ended":  "2026-10-04T04:47:23.202Z",
+                                 "ok":  true,
+                                 "error":  null,
+                                 "language_mode_at_start":  "FullLanguage",
+                                 "language_mode_at_end":  "FullLanguage",
+                                 "minutes_left_at_start":  30.9
+                             },
+                  "restore":  {
+                                  "started":  "2026-10-04T04:47:23.204Z",
+                                  "ended":  "2026-10-04T04:47:30.392Z",
+                                  "ok":  true,
+                                  "error":  null,
+                                  "language_mode_at_start":  "FullLanguage",
+                                  "language_mode_at_end":  "FullLanguage",
+                                  "minutes_left_at_start":  29.200000000000003
+                              },
+                  "cleanup":  {
+                                  "started":  "2026-10-04T04:47:30.392Z",
+                                  "ended":  "2026-10-04T04:47:34.382Z",
+                                  "ok":  true,
+                                  "error":  null,
+                                  "language_mode_at_start":  "FullLanguage",
+                                  "language_mode_at_end":  "FullLanguage",
+                                  "minutes_left_at_start":  29
+                              },
+                  "events":  {
+                                 "started":  "2026-10-04T04:47:34.398Z",
+                                 "ended":  "2026-10-04T04:47:36.891Z",
+                                 "ok":  true,
+                                 "error":  null,
+                                 "language_mode_at_start":  "FullLanguage",
+                                 "language_mode_at_end":  "FullLanguage",
+                                 "minutes_left_at_start":  29
+                             },
+                  "verdict":  {
+                                  "started":  "2026-10-04T04:47:36.891Z",
+                                  "ended":  "2026-10-04T04:47:36.922Z",
+                                  "ok":  true,
+                                  "error":  null,
+                                  "language_mode_at_start":  "FullLanguage",
+                                  "language_mode_at_end":  "FullLanguage",
+                                  "minutes_left_at_start":  28.9
+                              },
+                  "summary":  {
+                                  "started":  "2026-10-04T04:47:36.922Z",
+                                  "ended":  "2026-10-04T04:47:36.970Z",
+                                  "ok":  true,
+                                  "error":  null,
+                                  "language_mode_at_start":  "FullLanguage",
+                                  "language_mode_at_end":  "FullLanguage",
+                                  "minutes_left_at_start":  28.9
+                              }
+              },
+    "states":  {
+                   "initial":  {
+                                   "tag":  "initial",
+                                   "time":  "2026-10-04T04:42:31.676Z",
+                                   "language_mode":  "FullLanguage",
+                                   "registry":  {
+                                                    "rc":  0,
+                                                    "out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                                    "present":  true,
+                                                    "value":  0
+                                                },
+                                   "citool":  {
+                                                  "rc":  0,
+                                                  "json_parsed":  true,
+                                                  "error":  null,
+                                                  "desktop_policy":  {
+                                                                         "name":  "VerifiedAndReputableDesktop",
+                                                                         "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                         "is_enforced":  false,
+                                                                         "is_authorized":  false,
+                                                                         "is_on_disk":  true
+                                                                     },
+                                                  "enforced_names":  [
+
+                                                                     ],
+                                                  "verified_and_reputable":  [
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktop",
+                                                                                     "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 },
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                     "policy_id":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 },
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                     "policy_id":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 },
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                     "policy_id":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 },
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                     "policy_id":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 },
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                     "policy_id":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 }
+                                                                             ]
+                                              },
+                                   "defender":  {
+                                                    "SmartAppControlState":  "Off",
+                                                    "SmartAppControlExpiration":  null,
+                                                    "AMRunningMode":  "Normal",
+                                                    "RealTimeProtectionEnabled":  true
+                                                },
+                                   "ci_state":  {
+                                                    "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                    "options_hex":  "0x00282203",
+                                                    "flags":  [
+                                                                  "ENABLED",
+                                                                  "TESTSIGN",
+                                                                  "FLIGHTING_ENABLED",
+                                                                  "HVCI_IUM_ENABLED"
+                                                              ]
+                                                },
+                                   "signals":  {
+                                                   "registry_is_1":  false,
+                                                   "citool_desktop_enforced":  false,
+                                                   "defender_on":  false,
+                                                   "umci_flag":  false
+                                               },
+                                   "enforced":  false
+                               },
+                   "after-on-10s":  {
+                                        "tag":  "after-on-10s",
+                                        "time":  "2026-10-04T04:45:36.176Z",
+                                        "language_mode":  "FullLanguage",
+                                        "registry":  {
+                                                         "rc":  0,
+                                                         "out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x1",
+                                                         "present":  true,
+                                                         "value":  1
+                                                     },
+                                        "citool":  {
+                                                       "rc":  0,
+                                                       "json_parsed":  true,
+                                                       "error":  null,
+                                                       "desktop_policy":  {
+                                                                              "name":  "VerifiedAndReputableDesktop",
+                                                                              "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                              "is_enforced":  true,
+                                                                              "is_authorized":  true,
+                                                                              "is_on_disk":  true
+                                                                          },
+                                                       "enforced_names":  [
+                                                                              "VerifiedAndReputableDesktop",
+                                                                              "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                              "VerifiedAndReputableDesktopTestSupplemental"
+                                                                          ],
+                                                       "verified_and_reputable":  [
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktop",
+                                                                                          "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                          "is_enforced":  true,
+                                                                                          "is_authorized":  true,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                          "policy_id":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                          "policy_id":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                          "is_enforced":  true,
+                                                                                          "is_authorized":  true,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                          "policy_id":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                          "policy_id":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                          "is_enforced":  true,
+                                                                                          "is_authorized":  true,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                          "policy_id":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      }
+                                                                                  ]
+                                                   },
+                                        "defender":  {
+                                                         "SmartAppControlState":  "On",
+                                                         "SmartAppControlExpiration":  null,
+                                                         "AMRunningMode":  "Normal",
+                                                         "RealTimeProtectionEnabled":  true
+                                                     },
+                                        "ci_state":  {
+                                                         "raw":  "status=0x00000000;options=0x00282207;retLen=8",
+                                                         "options_hex":  "0x00282207",
+                                                         "flags":  [
+                                                                       "ENABLED",
+                                                                       "TESTSIGN",
+                                                                       "UMCI_ENABLED",
+                                                                       "FLIGHTING_ENABLED",
+                                                                       "HVCI_IUM_ENABLED"
+                                                                   ]
+                                                     },
+                                        "signals":  {
+                                                        "registry_is_1":  true,
+                                                        "citool_desktop_enforced":  true,
+                                                        "defender_on":  true,
+                                                        "umci_flag":  true
+                                                    },
+                                        "enforced":  true
+                                    },
+                   "before-click":  {
+                                        "tag":  "before-click",
+                                        "time":  "2026-10-04T04:45:41.797Z",
+                                        "language_mode":  "FullLanguage",
+                                        "registry":  {
+                                                         "rc":  0,
+                                                         "out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x1",
+                                                         "present":  true,
+                                                         "value":  1
+                                                     },
+                                        "citool":  {
+                                                       "rc":  0,
+                                                       "json_parsed":  true,
+                                                       "error":  null,
+                                                       "desktop_policy":  {
+                                                                              "name":  "VerifiedAndReputableDesktop",
+                                                                              "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                              "is_enforced":  true,
+                                                                              "is_authorized":  true,
+                                                                              "is_on_disk":  true
+                                                                          },
+                                                       "enforced_names":  [
+                                                                              "VerifiedAndReputableDesktop",
+                                                                              "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                              "VerifiedAndReputableDesktopTestSupplemental"
+                                                                          ],
+                                                       "verified_and_reputable":  [
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktop",
+                                                                                          "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                          "is_enforced":  true,
+                                                                                          "is_authorized":  true,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                          "policy_id":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                          "policy_id":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                          "is_enforced":  true,
+                                                                                          "is_authorized":  true,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                          "policy_id":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                          "policy_id":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                          "is_enforced":  true,
+                                                                                          "is_authorized":  true,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                          "policy_id":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      }
+                                                                                  ]
+                                                   },
+                                        "defender":  {
+                                                         "SmartAppControlState":  "On",
+                                                         "SmartAppControlExpiration":  null,
+                                                         "AMRunningMode":  "Normal",
+                                                         "RealTimeProtectionEnabled":  true
+                                                     },
+                                        "ci_state":  {
+                                                         "raw":  "status=0x00000000;options=0x00282207;retLen=8",
+                                                         "options_hex":  "0x00282207",
+                                                         "flags":  [
+                                                                       "ENABLED",
+                                                                       "TESTSIGN",
+                                                                       "UMCI_ENABLED",
+                                                                       "FLIGHTING_ENABLED",
+                                                                       "HVCI_IUM_ENABLED"
+                                                                   ]
+                                                     },
+                                        "signals":  {
+                                                        "registry_is_1":  true,
+                                                        "citool_desktop_enforced":  true,
+                                                        "defender_on":  true,
+                                                        "umci_flag":  true
+                                                    },
+                                        "enforced":  true
+                                    },
+                   "restore-final-1":  {
+                                           "tag":  "restore-final-1",
+                                           "time":  "2026-10-04T04:47:28.332Z",
+                                           "language_mode":  "FullLanguage",
+                                           "registry":  {
+                                                            "rc":  0,
+                                                            "out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                                            "present":  true,
+                                                            "value":  0
+                                                        },
+                                           "citool":  {
+                                                          "rc":  0,
+                                                          "json_parsed":  true,
+                                                          "error":  null,
+                                                          "desktop_policy":  {
+                                                                                 "name":  "VerifiedAndReputableDesktop",
+                                                                                 "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                 "is_enforced":  false,
+                                                                                 "is_authorized":  false,
+                                                                                 "is_on_disk":  true
+                                                                             },
+                                                          "enforced_names":  [
+
+                                                                             ],
+                                                          "verified_and_reputable":  [
+                                                                                         {
+                                                                                             "name":  "VerifiedAndReputableDesktop",
+                                                                                             "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                             "is_enforced":  false,
+                                                                                             "is_authorized":  false,
+                                                                                             "is_on_disk":  true
+                                                                                         },
+                                                                                         {
+                                                                                             "name":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                             "policy_id":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                             "is_enforced":  false,
+                                                                                             "is_authorized":  false,
+                                                                                             "is_on_disk":  true
+                                                                                         },
+                                                                                         {
+                                                                                             "name":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                             "policy_id":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                             "is_enforced":  false,
+                                                                                             "is_authorized":  false,
+                                                                                             "is_on_disk":  true
+                                                                                         },
+                                                                                         {
+                                                                                             "name":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                             "policy_id":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                             "is_enforced":  false,
+                                                                                             "is_authorized":  false,
+                                                                                             "is_on_disk":  true
+                                                                                         },
+                                                                                         {
+                                                                                             "name":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                             "policy_id":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                             "is_enforced":  false,
+                                                                                             "is_authorized":  false,
+                                                                                             "is_on_disk":  true
+                                                                                         },
+                                                                                         {
+                                                                                             "name":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                             "policy_id":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                             "is_enforced":  false,
+                                                                                             "is_authorized":  false,
+                                                                                             "is_on_disk":  true
+                                                                                         }
+                                                                                     ]
+                                                      },
+                                           "defender":  {
+                                                            "SmartAppControlState":  "Off",
+                                                            "SmartAppControlExpiration":  null,
+                                                            "AMRunningMode":  "Normal",
+                                                            "RealTimeProtectionEnabled":  true
+                                                        },
+                                           "ci_state":  {
+                                                            "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                            "options_hex":  "0x00282203",
+                                                            "flags":  [
+                                                                          "ENABLED",
+                                                                          "TESTSIGN",
+                                                                          "FLIGHTING_ENABLED",
+                                                                          "HVCI_IUM_ENABLED"
+                                                                      ]
+                                                        },
+                                           "signals":  {
+                                                           "registry_is_1":  false,
+                                                           "citool_desktop_enforced":  false,
+                                                           "defender_on":  false,
+                                                           "umci_flag":  false
+                                                       },
+                                           "enforced":  false
+                                       },
+                   "final":  {
+                                 "tag":  "final",
+                                 "time":  "2026-10-04T04:47:29.393Z",
+                                 "language_mode":  "FullLanguage",
+                                 "registry":  {
+                                                  "rc":  0,
+                                                  "out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                                  "present":  true,
+                                                  "value":  0
+                                              },
+                                 "citool":  {
+                                                "rc":  0,
+                                                "json_parsed":  true,
+                                                "error":  null,
+                                                "desktop_policy":  {
+                                                                       "name":  "VerifiedAndReputableDesktop",
+                                                                       "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                       "is_enforced":  false,
+                                                                       "is_authorized":  false,
+                                                                       "is_on_disk":  true
+                                                                   },
+                                                "enforced_names":  [
+
+                                                                   ],
+                                                "verified_and_reputable":  [
+                                                                               {
+                                                                                   "name":  "VerifiedAndReputableDesktop",
+                                                                                   "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                   "is_enforced":  false,
+                                                                                   "is_authorized":  false,
+                                                                                   "is_on_disk":  true
+                                                                               },
+                                                                               {
+                                                                                   "name":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                   "policy_id":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                   "is_enforced":  false,
+                                                                                   "is_authorized":  false,
+                                                                                   "is_on_disk":  true
+                                                                               },
+                                                                               {
+                                                                                   "name":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                   "policy_id":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                   "is_enforced":  false,
+                                                                                   "is_authorized":  false,
+                                                                                   "is_on_disk":  true
+                                                                               },
+                                                                               {
+                                                                                   "name":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                   "policy_id":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                   "is_enforced":  false,
+                                                                                   "is_authorized":  false,
+                                                                                   "is_on_disk":  true
+                                                                               },
+                                                                               {
+                                                                                   "name":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                   "policy_id":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                   "is_enforced":  false,
+                                                                                   "is_authorized":  false,
+                                                                                   "is_on_disk":  true
+                                                                               },
+                                                                               {
+                                                                                   "name":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                   "policy_id":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                   "is_enforced":  false,
+                                                                                   "is_authorized":  false,
+                                                                                   "is_on_disk":  true
+                                                                               }
+                                                                           ]
+                                            },
+                                 "defender":  {
+                                                  "SmartAppControlState":  "Off",
+                                                  "SmartAppControlExpiration":  null,
+                                                  "AMRunningMode":  "Normal",
+                                                  "RealTimeProtectionEnabled":  true
+                                              },
+                                 "ci_state":  {
+                                                  "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                  "options_hex":  "0x00282203",
+                                                  "flags":  [
+                                                                "ENABLED",
+                                                                "TESTSIGN",
+                                                                "FLIGHTING_ENABLED",
+                                                                "HVCI_IUM_ENABLED"
+                                                            ]
+                                              },
+                                 "signals":  {
+                                                 "registry_is_1":  false,
+                                                 "citool_desktop_enforced":  false,
+                                                 "defender_on":  false,
+                                                 "umci_flag":  false
+                                             },
+                                 "enforced":  false
+                             }
+               },
+    "checkpoints":  {
+                        "pre-sac":  {
+                                        "rc":  0,
+                                        "start_error":  null,
+                                        "out":  "publish-results: 47 files to upload, 1 skipped, out=C:\\a\\_temp\\diag-out\npublish-results: ok -\u003e refs/heads/diag-results/37177622639-1-app-e2e-pre-sac-windows-11-arm (commit d5bbcfef03a609f6b66545882e042536b8fd245d), 47 files + manifest\n",
+                                        "err":  "",
+                                        "time":  "2026-10-04T04:45:25.951Z"
+                                    }
+                    },
+    "notes":  [
+
+              ],
+    "prepare":  {
+                    "native_ready":  true,
+                    "native_error":  null,
+                    "language_mode":  "FullLanguage",
+                    "os_product":  "Windows 10 Enterprise 25H2 build 26200.9457",
+                    "node_exe":  "C:\\hostedtoolcache\\windows\\node\\22.23.3\\arm64\\node.exe",
+                    "subjects_loaded":  388,
+                    "ci_log_size_set_rc":  0
+                },
+    "reset_before_off":  {
+                             "why":  "before-off",
+                             "time":  "2026-10-04T04:42:35.033Z",
+                             "killed_under_install_dir":  [
+
+                                                          ],
+                             "killed_webview2":  [
+
+                                                 ],
+                             "killed_installers":  [
+
+                                                   ],
+                             "updater_dirs_removed":  [
+
+                                                      ],
+                             "attempt_before":  {
+                                                    "path":  "C:\\Users\\runneradmin\\.cys\\.update-attempt.json",
+                                                    "exists":  false,
+                                                    "text":  null
+                                                }
+                         },
+    "off_install":  {
+                        "installer":  "C:\\a\\_temp\\appe2e-installer\\cys_0.14.43_x64-setup.exe",
+                        "expect":  "0.14.43",
+                        "started":  "2026-10-04T04:42:37.196Z",
+                        "rc":  0,
+                        "timed_out":  false,
+                        "marker":  "0.14.43",
+                        "failure_file":  null,
+                        "file_version":  "0.14.43 / product 0.14.43",
+                        "killed":  [
+
+                                   ],
+                        "ok":  true,
+                        "error":  null,
+                        "finished":  "2026-10-04T04:43:25.092Z"
+                    },
+    "webview2_policy":  {
+                            "key":  "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments",
+                            "value_name":  "cys-app.exe",
+                            "key_existed":  false,
+                            "old_value_present":  false,
+                            "old_value_query":  "",
+                            "set_rc":  0,
+                            "set_out":  "The operation completed successfully.",
+                            "set_err":  "",
+                            "verify_out":  "HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments\r\n    cys-app.exe    REG_SZ    --remote-debugging-port=9333 --remote-allow-origins=*"
+                        },
+    "off_start":  {
+                      "prefix":  "appe2e-off",
+                      "started":  "2026-10-04T04:43:25.165Z",
+                      "ok":  true,
+                      "pid":  8712,
+                      "cdp_ready":  true,
+                      "cdp_wait_sec":  2,
+                      "installed_marker":  "0.14.43",
+                      "error":  null,
+                      "webview2_runtime":  "154.0.4258.37"
+                  },
+    "off_observe":  {
+                        "end_reason":  "success: the version marker reached the target and cys-app.exe is running again",
+                        "click_at":  "2026-10-04T04:43:30.921Z",
+                        "ticks":  34,
+                        "node_exited_at":  "2026-10-04T04:43:55.801Z",
+                        "node_exit_code":  0,
+                        "installer_seen":  true,
+                        "installer_first_seen":  {
+                                                     "name":  "cys-0.14.99-installer.exe",
+                                                     "id":  3144,
+                                                     "ppid":  8712,
+                                                     "path":  "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cys-0.14.99-updater-hDskzv\\cys-0.14.99-installer.exe",
+                                                     "cmd":  "\"C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cys-0.14.99-updater-hDskzv\\cys-0.14.99-installer.exe\" /P /R /UPDATE /ARGS"
+                                                 },
+                        "updater_dirs_seen":  [
+                                                  "cys-0.14.99-updater-hDskzv"
+                                              ],
+                        "updater_dir_max_bytes":  143202847,
+                        "updater_dirs_at_end":  [
+                                                    "cys-0.14.99-updater-hDskzv"
+                                                ],
+                        "app_gone_at":  "2026-10-04T04:43:55.895Z",
+                        "app_relaunched":  true,
+                        "alive_samples_after_click":  12,
+                        "dead_samples_after_click":  20,
+                        "last_alive_after_click_sec":  68,
+                        "attempt_seen":  true,
+                        "attempt_present_at_end":  true,
+                        "installer_alive_at_end":  false,
+                        "windows_at_end":  "cys-app#9400:cys — CYSJavis Terminal | hosted-compute-agent#5172:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent",
+                        "marker_initial":  "0.14.43",
+                        "marker_last":  "0.14.42",
+                        "marker_changed_at":  "2026-10-04T04:44:39.019Z",
+                        "marker_reached_target_at":  "2026-10-04T04:44:39.019Z"
+                    },
+    "off_attempt_after":  {
+                              "path":  "C:\\Users\\runneradmin\\.cys\\.update-attempt.json",
+                              "exists":  true,
+                              "text":  "{\"from\":\"0.14.43\",\"to\":\"0.14.99\",\"at\":1791089023}"
+                          },
+    "off_app_evidence":  {
+                             "roots":  [
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\cys"
+                                       ],
+                             "copied":  [
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Session Storage\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\settings_diagnostic.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\favorites_diagnostic.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Site Characteristics Database\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Local Storage\\leveldb\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\shared_proto_db\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\shared_proto_db\\metadata\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension State\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension Scripts\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension Rules\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Sync Data\\LevelDB\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-installed-version.txt",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\cys\\phoenix-restore.log"
+                                        ],
+                             "error":  null
+                         },
+    "off_verdict":  {
+                        "result":  "PASS",
+                        "reasons":  [
+                                        "the real Update button flow downloaded the installer, started it, the app exited, the version marker changed and the app came back"
+                                    ]
+                    },
+    "reset_before_on":  {
+                            "why":  "before-on",
+                            "time":  "2026-10-04T04:44:41.407Z",
+                            "killed_under_install_dir":  [
+                                                             "cys-app.exe#9400",
+                                                             "cys.exe#7612",
+                                                             "cysd.exe#1496",
+                                                             "cys.exe#3324",
+                                                             "python3.exe#7856"
+                                                         ],
+                            "killed_webview2":  [
+                                                    "msedgewebview2#4840",
+                                                    "msedgewebview2#2660",
+                                                    "msedgewebview2#6736",
+                                                    "msedgewebview2#9072",
+                                                    "msedgewebview2#9264",
+                                                    "msedgewebview2#10204"
+                                                ],
+                            "killed_installers":  [
+
+                                                  ],
+                            "updater_dirs_removed":  [
+                                                         "cys-0.14.99-updater-hDskzv"
+                                                     ],
+                            "attempt_before":  {
+                                                   "path":  "C:\\Users\\runneradmin\\.cys\\.update-attempt.json",
+                                                   "exists":  true,
+                                                   "text":  "{\"from\":\"0.14.43\",\"to\":\"0.14.99\",\"at\":1791089023}"
+                                               }
+                        },
+    "on_install":  {
+                       "installer":  "C:\\a\\_temp\\appe2e-installer\\cys_0.14.43_x64-setup.exe",
+                       "expect":  "0.14.43",
+                       "started":  "2026-10-04T04:44:44.168Z",
+                       "rc":  0,
+                       "timed_out":  false,
+                       "marker":  "0.14.43",
+                       "failure_file":  null,
+                       "file_version":  "0.14.43 / product 0.14.43",
+                       "killed":  [
+
+                                  ],
+                       "ok":  true,
+                       "error":  null,
+                       "finished":  "2026-10-04T04:45:19.365Z"
+                   },
+    "on_start":  {
+                     "prefix":  "appe2e-on",
+                     "started":  "2026-10-04T04:45:19.373Z",
+                     "ok":  true,
+                     "pid":  3480,
+                     "cdp_ready":  true,
+                     "cdp_wait_sec":  1,
+                     "installed_marker":  "0.14.43",
+                     "error":  null,
+                     "webview2_runtime":  "154.0.4258.37"
+                 },
+    "on_pre":  {
+                   "prefix":  "appe2e-on-pre",
+                   "node_exe":  "C:\\hostedtoolcache\\windows\\node\\22.23.3\\arm64\\node.exe",
+                   "rc":  0,
+                   "attached":  true,
+                   "ui_ready":  true,
+                   "app_version":  "0.14.43",
+                   "update_button":  {
+                                         "text":  "Update …",
+                                         "badge_text":  "…",
+                                         "badge_hidden":  true,
+                                         "badge_title":  ""
+                                     },
+                   "error":  null
+               },
+    "sac_on":  {
+                   "started":  "2026-10-04T04:45:25.960Z",
+                   "language_mode":  "FullLanguage",
+                   "set":  {
+                               "why":  "on",
+                               "value":  1,
+                               "time":  "2026-10-04T04:45:25.971Z",
+                               "write":  {
+                                             "rc":  0,
+                                             "out":  "The operation completed successfully.",
+                                             "err":  "",
+                                             "start_error":  null
+                                         },
+                               "refresh":  {
+                                               "rc":  0,
+                                               "timed_out":  false,
+                                               "start_error":  null,
+                                               "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                               "err":  ""
+                                           }
+                           },
+                   "after_10s":  {
+                                     "tag":  "after-on-10s",
+                                     "enforced":  true,
+                                     "signals":  {
+                                                     "registry_is_1":  true,
+                                                     "citool_desktop_enforced":  true,
+                                                     "defender_on":  true,
+                                                     "umci_flag":  true
+                                                 }
+                                 },
+                   "after_30s":  null,
+                   "confirmed":  true
+               },
+    "driver_node":  {
+                        "runner_node":  "C:\\hostedtoolcache\\windows\\node\\22.23.3\\arm64\\node.exe",
+                        "runner_probe":  {
+                                             "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                             "ok":  true,
+                                             "ret":  0,
+                                             "ret_meaning":  null,
+                                             "last_error":  0,
+                                             "last_error_hex":  "0x00000000",
+                                             "last_error_text":  "",
+                                             "first_wait_timed_out":  false,
+                                             "timed_out":  false,
+                                             "completed":  true,
+                                             "had_process_handle":  true,
+                                             "note":  ""
+                                         },
+                        "fallback_probe":  null,
+                        "chosen":  "C:\\hostedtoolcache\\windows\\node\\22.23.3\\arm64\\node.exe"
+                    },
+    "on_sac_enforced_before_click":  true,
+    "on_observe":  {
+                       "end_reason":  "the node driver finished its observation window after the click",
+                       "click_at":  "2026-10-04T04:45:44.918Z",
+                       "ticks":  48,
+                       "node_exited_at":  "2026-10-04T04:47:16.651Z",
+                       "node_exit_code":  0,
+                       "installer_seen":  false,
+                       "installer_first_seen":  null,
+                       "updater_dirs_seen":  [
+                                                 "cys-0.14.99-updater-Eob3Cu"
+                                             ],
+                       "updater_dir_max_bytes":  143202847,
+                       "updater_dirs_at_end":  [
+
+                                               ],
+                       "app_gone_at":  null,
+                       "app_relaunched":  false,
+                       "alive_samples_after_click":  47,
+                       "dead_samples_after_click":  0,
+                       "last_alive_after_click_sec":  98,
+                       "attempt_seen":  true,
+                       "attempt_present_at_end":  false,
+                       "installer_alive_at_end":  false,
+                       "windows_at_end":  "csrss#4300:bash.exe - Bad Image | cys-app#3480:cys — CYSJavis Terminal | hosted-compute-agent#5172:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent",
+                       "marker_initial":  "0.14.43",
+                       "marker_last":  "0.14.43",
+                       "marker_changed_at":  null,
+                       "marker_reached_target_at":  null
+                   },
+    "restore":  {
+                    "touched":  true,
+                    "started":  "2026-10-04T04:47:23.208Z",
+                    "result":  {
+                                   "why":  "final",
+                                   "started":  "2026-10-04T04:47:23.208Z",
+                                   "attempts":  [
+                                                    {
+                                                        "n":  1,
+                                                        "set":  {
+                                                                    "why":  "restore-final-1",
+                                                                    "value":  0,
+                                                                    "time":  "2026-10-04T04:47:23.208Z",
+                                                                    "write":  {
+                                                                                  "rc":  0,
+                                                                                  "out":  "The operation completed successfully.",
+                                                                                  "err":  "",
+                                                                                  "start_error":  null
+                                                                              },
+                                                                    "refresh":  {
+                                                                                    "rc":  0,
+                                                                                    "timed_out":  false,
+                                                                                    "start_error":  null,
+                                                                                    "out":  "Operation Successful\r\nPress Enter to Continue\r\n",
+                                                                                    "err":  ""
+                                                                                }
+                                                                },
+                                                        "value_after":  0,
+                                                        "enforced_after":  false
+                                                    }
+                                                ],
+                                   "restored":  true,
+                                   "finished":  "2026-10-04T04:47:29.393Z"
+                               },
+                    "final_state":  {
+                                        "tag":  "final",
+                                        "time":  "2026-10-04T04:47:29.393Z",
+                                        "language_mode":  "FullLanguage",
+                                        "registry":  {
+                                                         "rc":  0,
+                                                         "out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                                         "present":  true,
+                                                         "value":  0
+                                                     },
+                                        "citool":  {
+                                                       "rc":  0,
+                                                       "json_parsed":  true,
+                                                       "error":  null,
+                                                       "desktop_policy":  {
+                                                                              "name":  "VerifiedAndReputableDesktop",
+                                                                              "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                              "is_enforced":  false,
+                                                                              "is_authorized":  false,
+                                                                              "is_on_disk":  true
+                                                                          },
+                                                       "enforced_names":  [
+
+                                                                          ],
+                                                       "verified_and_reputable":  [
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktop",
+                                                                                          "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                          "policy_id":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                          "policy_id":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                          "policy_id":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                          "policy_id":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      },
+                                                                                      {
+                                                                                          "name":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                          "policy_id":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                          "is_enforced":  false,
+                                                                                          "is_authorized":  false,
+                                                                                          "is_on_disk":  true
+                                                                                      }
+                                                                                  ]
+                                                   },
+                                        "defender":  {
+                                                         "SmartAppControlState":  "Off",
+                                                         "SmartAppControlExpiration":  null,
+                                                         "AMRunningMode":  "Normal",
+                                                         "RealTimeProtectionEnabled":  true
+                                                     },
+                                        "ci_state":  {
+                                                         "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                         "options_hex":  "0x00282203",
+                                                         "flags":  [
+                                                                       "ENABLED",
+                                                                       "TESTSIGN",
+                                                                       "FLIGHTING_ENABLED",
+                                                                       "HVCI_IUM_ENABLED"
+                                                                   ]
+                                                     },
+                                        "signals":  {
+                                                        "registry_is_1":  false,
+                                                        "citool_desktop_enforced":  false,
+                                                        "defender_on":  false,
+                                                        "umci_flag":  false
+                                                    },
+                                        "enforced":  false
+                                    },
+                    "neg_control_probe":  {
+                                              "api":  "CreateProcessW(CREATE_SUSPENDED)",
+                                              "ok":  true,
+                                              "ret":  0,
+                                              "ret_meaning":  null,
+                                              "last_error":  0,
+                                              "last_error_hex":  "0x00000000",
+                                              "last_error_text":  "",
+                                              "first_wait_timed_out":  false,
+                                              "timed_out":  false,
+                                              "completed":  true,
+                                              "had_process_handle":  true,
+                                              "note":  ""
+                                          },
+                    "neg_control_run":  {
+                                            "rc":  0,
+                                            "timed_out":  false,
+                                            "start_error":  null,
+                                            "stdout":  "diag-neg cd9ad648-4366-4500-9922-51f7ac655e3e\n"
+                                        },
+                    "neg_control_runs_again":  true,
+                    "language_mode":  "FullLanguage",
+                    "finished":  "2026-10-04T04:47:30.392Z"
+                },
+    "cleanup":  {
+                    "node_killed":  [
+
+                                    ],
+                    "reset":  {
+                                  "why":  "final",
+                                  "time":  "2026-10-04T04:47:31.680Z",
+                                  "killed_under_install_dir":  [
+                                                                   "cys-app.exe#3480",
+                                                                   "cysd.exe#7408",
+                                                                   "bash.exe#10756",
+                                                                   "bash.exe#8624",
+                                                                   "bash.exe#8592",
+                                                                   "bash.exe#7384",
+                                                                   "bash.exe#10488",
+                                                                   "bash.exe#4660",
+                                                                   "bash.exe#4528"
+                                                               ],
+                                  "killed_webview2":  [
+                                                          "msedgewebview2#4720",
+                                                          "msedgewebview2#8320",
+                                                          "msedgewebview2#6572",
+                                                          "msedgewebview2#8064",
+                                                          "msedgewebview2#3608",
+                                                          "msedgewebview2#8196"
+                                                      ],
+                                  "killed_installers":  [
+
+                                                        ],
+                                  "updater_dirs_removed":  [
+
+                                                           ],
+                                  "attempt_before":  {
+                                                         "path":  "C:\\Users\\runneradmin\\.cys\\.update-attempt.json",
+                                                         "exists":  false,
+                                                         "text":  null
+                                                     }
+                              },
+                    "webview2_policy_removed":  {
+                                                    "value_deleted_rc":  0,
+                                                    "key_deleted_rc":  0,
+                                                    "note":  null
+                                                }
+                },
+    "on_app_evidence":  {
+                            "roots":  [
+                                          "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal",
+                                          "C:\\Users\\runneradmin\\AppData\\Local\\cys"
+                                      ],
+                            "copied":  [
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\settings_diagnostic.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\favorites_diagnostic.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Session Storage\\000003.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Local Storage\\leveldb\\000003.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Site Characteristics Database\\000003.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\shared_proto_db\\000003.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\shared_proto_db\\metadata\\000003.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension State\\000003.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension Rules\\000003.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension Scripts\\000003.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Sync Data\\LevelDB\\000003.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\cys\\phoenix-restore.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\cys\\office-bridge.log",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-installed-version.txt",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\LICENSES\\BUNDLED-RUNTIMES.txt"
+                                       ],
+                            "error":  null
+                        },
+    "events":  {
+                   "started":  "2026-10-04T04:47:36.400Z",
+                   "evtx_rc":  0,
+                   "note":  null,
+                   "counts_by_id":  {
+                                        "3101":  1,
+                                        "3105":  14,
+                                        "3103":  1,
+                                        "3096":  4,
+                                        "3099":  3,
+                                        "3116":  3,
+                                        "3102":  1,
+                                        "3033":  18,
+                                        "3089":  36,
+                                        "3077":  18,
+                                        "3118":  18
+                                    },
+                   "events_from_restore_start_left_out":  21,
+                   "installer_path_event_count":  1,
+                   "installer_path_events":  [
+                                                 {
+                                                     "id":  3077,
+                                                     "time":  "2026-10-04T04:45:53.023Z",
+                                                     "marked":  "path contains -updater-",
+                                                     "policy_names":  [
+                                                                          "VerifiedAndReputableDesktop"
+                                                                      ],
+                                                     "file_paths":  [
+                                                                        "\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\Temp\\cys-0.14.99-updater-Eob3Cu\\cys-0.14.99-installer.exe"
+                                                                    ],
+                                                     "process_names":  [
+                                                                           "\\Device\\HarddiskVolume4\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe"
+                                                                       ],
+                                                     "status":  [
+                                                                    "0xc0e90002"
+                                                                ]
+                                                 }
+                                             ],
+                   "cys_app_block_event_count":  2,
+                   "finished":  "2026-10-04T04:47:36.891Z"
+               },
+    "finished":  "2026-10-04T04:47:36.986Z"
+}

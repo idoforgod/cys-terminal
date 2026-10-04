@@ -1,0 +1,1 @@
+2026-10-04T04:47:25.309Z lvl=4 id=15 prov=SecurityCenter :: Updated Windows Defender status successfully to SECURITY_PRODUCT_STATE_ON.
