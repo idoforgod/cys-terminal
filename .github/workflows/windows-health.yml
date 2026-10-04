@@ -329,6 +329,7 @@ jobs:
       #   얽히므로 원인 판명 전에는 건드리지 않는다(반박 §3-3).
       #   ⚠ 명령에 축 필터가 **없다**(전량 `--bin cysd`) — 위 '★범위는 축 필터로 시작한다' 는 약속과 명령이
       #     어긋난 상태다. 필터 도입은 차단 승격과 한 묶음의 별도 결정이다(판독 스텝 요약이 그 근거 자료다).
+      #   ★(R1F-PK 후속 · 2026-10-04) 절단 지점이 특정됐다 — 두 런 모두 `attach_race_tests::…` 에서 멈춘다(아래 run 의 주석). 그 검체만 이 스텝에서 건너뛰어 뒤 검체의 도달 범위를 본다.
       - name: cargo test --bin cysd 감독자 축 (Windows 실기 · IG-31 · 비차단 A10 1단계)
         id: cysd_win
         continue-on-error: true
@@ -370,12 +371,18 @@ jobs:
           #   줄이 증거로 남는다. rc 는 파이프에 삼켜지지 않게 PIPESTATUS[0] 으로 직독한다.
           # ★--nocapture: --test-threads=1 이라 libtest 가 검체명을 실행 **전에** 찍는다 —
           #   멈춘 검체 이름이 마지막 줄에 남는다(그게 없으면 hang 위치를 영영 모른다).
-          # ★(0.14.43 성찰 R1F-PK · S3 minor 7) hwmon **모듈 전체** skip 을 깨질 검체 하나의 정확한 이름으로 좁혔다. 종전에는 비 macOS 스텁 검체
-          #   `e2_non_macos_stub_reports_platform`(맥에서는 컴파일되지 않는다)이 **어느 레인에서도 한 번도 실행되지 않았다** — 이 윈도우 실기가 그것이 도는 유일한 자리다.
+          # ★(0.14.43 성찰 R1F-PK · S3 minor 7) hwmon **모듈 전체** skip 을 깨질 검체 하나의 정확한 이름으로 좁혔다(release.yml 의 skip 은 그대로).
           #   남긴 skip = `hwmon::tests::snapshot_has_all_sections`: 윈도우에서는 GPU·NPU 단언이 컴파일되지 않지만(맥 전용 cfg) 코어 열거(PDH 카운터)가 이 러너에서
-          #   0개를 내는지는 재 본 적이 없다 — 확신이 없는 검체는 skip 에 남긴다. 나머지(순수 함수 2 · 소스 핀 1 · 스냅샷 계약 2)는 센서와 무관하다(코드 읽기 근거 — 윈도우 러너 실측은 아직 없다).
-          #   이 스텝은 비차단(continue-on-error)이라 좁힘이 틀려도 잡을 붉히지 않지만 아래 판독 스텝이 검체 이름을 드러낸다. release.yml 의 skip 은 그대로다.
-          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections 2>&1 | tee "$LOG"
+          #   0개를 내는지는 재 본 적이 없다 — 확신이 없는 검체는 skip 에 남긴다.
+          # ★(R1F-PK 후속 · 브랜치 CI 실측) ⚠ **이 스텝은 hwmon 검체에 닿지 못한다.** `--test-threads=1` 이라 검체가 이름순으로 도는데(accounts → alert_route → alerts →
+          #   … → approval_risk → attach_race_tests), 두 런(37175872869 = 커밋 9650334f · 37182205898 = 커밋 bde5e557) 모두 같은 자리에서 멈춘 채 30분 상한에 닿았다 — 판독 스텝 annotation:
+          #   "rc 표지 없음(cargo 가 끝나기 전에 종료) · outcome=failure · 경과 30분 8초(상한 30분) · 마지막으로 시작한 검체: attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery".
+          #   그 뒤 이름의 모듈(governance · handlers · hwmon · schedule · state …)은 윈도우 CI 에서 **한 번도 돌지 않았다**(이번 판 이전부터의 상태 — 9650334f 에서도 같다).
+          #   그래서 ① hwmon 검체는 이 스텝이 아니라 **아래 전용 스텝**이 잰다(이 스텝의 hwmon skip 은 같은 이름 하나로 둔다 — 언젠가 이 스텝이 hwmon 까지 가는 날에도 같은 판정).
+          #   ② `attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery` 를 **이 스텝에서만** 건너뛴다 — **그 뒤 검체들이 어디까지 가는지** 보이게 하려는 것이다.
+          #   이 검체는 윈도우에서 멈춘다 — **원인 미조사(기존 상태)**. skip 은 뒤 검체의 가시화를 위한 것이고 검체 삭제가 아니다(맥 레인 ci-branch·release 에서는 그대로 돈다).
+          #   30분 상한·비차단은 그대로다. 다음 멈춤이 나오면 판독 스텝의 '마지막으로 시작한 검체' 를 보고 같은 방식으로 한 건씩 드러낸다(원인 조사·수리는 별건).
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections --skip attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery 2>&1 | tee "$LOG"
           rc="${PIPESTATUS[0]}"
           echo "$rc" > "$CYSD_DIR/rc"
           [ "$rc" -eq 0 ] && exit 0
@@ -480,6 +487,152 @@ jobs:
             echo "| 마지막으로 시작한 검체 | ${last:-없음} |"
             echo ""
             echo "> 이 스텝은 **비차단**이다. 잡·런이 초록이어도 판정이 '완주·통과' 가 아니면 cysd Windows 검체는 통과가 아니다 — 초록을 셀 때 종류를 병기하라."
+          } >> "$SUM" 2>/dev/null
+          exit 0
+
+      # ★(0.14.43 성찰 R1F-PK 후속 · master 지시 · 브랜치 CI 실측) hwmon 전용 스텝. 위 cysd 전량 스텝은 `--test-threads=1` 이름순 실행이 `attach_race_tests::…` 에서 멈춘 채
+      #   30분 상한에 닿아(두 런 37175872869·37182205898 동일) 그 뒤 이름의 모듈 — hwmon 포함 — 에 **닿지 못한다**. E2 가 더한 hwmon 검체(특히 맥에서는 컴파일되지 않는 비 macOS
+      #   스텁 `e2_non_macos_stub_reports_platform`)가 Windows 에서 도는 길은 그래서 이 별개 스텝뿐이다. 필터 `hwmon::` 에서 `snapshot_has_all_sections` 하나만 건너뛴다 — 윈도우에서는
+      #   GPU·NPU 단언이 컴파일되지 않지만 코어 열거(PDH)가 이 러너에서 0개를 내는지 재 본 적이 없어 확신이 없다(확신 없는 검체는 skip 에 남긴다). 나머지 5건(순수 함수 2 · 소스 핀 1 ·
+      #   스냅샷 계약 2)은 센서와 무관하며(코드 읽기 근거) 이 러너에서 **처음** 돈다.
+      # ★위치(뒤)·제한시간(6분)의 근거 — 실측(익명 API · 두 런의 스텝 시각): 잡 총 33.9분(9650334f)·35.0분(bde5e557) = 앞 8스텝 3.7·4.8분 + cysd 전량 스텝 30.1분(상한에 걸림).
+      #   한도는 잡 `timeout-minutes: 55` 와 release `windows-health-gate` 의 45분(2700초 폴링 상한)이다.
+      #   · 뒤에 두면: 위 스텝이 `--bin cysd` 테스트 하네스를 이미 빌드해 둔 상태라 이 스텝은 거의 **실행만**(수십 초)이다 — 잡 총 ≈ 36분(두 한도에 각 19분·9분 여유).
+      #     최악(실행이 멈춘다)을 가정해도 35.0 + 6 = 41분 < 45분이다.
+      #   · 앞에 두면: 이 스텝이 테스트 빌드를 먹어 제한시간이 빌드를 덮어야 한다(예 12분) — 위 스텝은 빌드 시간을 되찾아도 어차피 상한까지 돌므로 합이 그만큼 늘고, 같은 최악 가정이면
+      #     4.8 + 12 + 30.1 ≈ 47분 > 45분이다(release 게이트가 '측정 불능'으로 적색).
+      #   · 6분의 근거: `cargo test --bin cys D5` 스텝(앞 스텝 · 0.6~0.7분)이 보이듯 이 러너의 `--bin` 테스트 빌드는 1분 안팎이라, 하네스가 없는 예외(위 스텝이 빌드 도중 잘린 경우)에도 빌드+실행을 덮는다.
+      # ★비차단(`continue-on-error: true`) — 윈도우에서 한 번도 돈 적이 없는 검체라 처음부터 잡을 붉히지 않는다(위 cysd 스텝과 같은 이유 · 같은 A10 1단계). 결과(통과·실패 수 · 실패 검체 이름)는
+      #   바로 다음 판독 스텝이 annotation·STEP_SUMMARY 로 드러낸다. 완주·통과가 관측되면 차단 승격(continue-on-error 제거)을 검토한다 — 영구 면제가 아니다.
+      # ★D10 '측정 ≥1' 폐쇄 — 필터형 실행이라 `cargo_filter_count`(함수 이름·같은 인자의 선행 호출)가 레인 게이트와의 계약이다. 이 스텝은 비차단이라 그 실패를 표지 파일로 남겨
+      #   판독 스텝이 '필터 실패'(= 무측정)로 읽게 한다.
+      #   ⚠이 스텝에 `if:` 조건을 달지 마라(잡 머리말의 '돌지 않는 초록 금지'와 같은 근거). 앞 스텝이 실패하면 `skipped` 로 남고 판독 스텝이 '미실행'으로 적는다.
+      - name: cargo test --bin cysd hwmon 검체 (Windows 실기 · 비차단 · 위 전량 스텝과 별개)
+        id: hwmon_win
+        continue-on-error: true
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          # 스텝 사이 전달용 고정 경로(다음 '판독' 스텝이 읽는다 · 위 cysd 스텝과 같은 방식). rc 파일은 cargo 가 **끝났을 때만** 생긴다.
+          HW_DIR="${RUNNER_TEMP:-/tmp}/hwmon-win"
+          rm -rf "$HW_DIR"
+          mkdir -p "$HW_DIR"
+          date +%s > "$HW_DIR/start"
+          LOG="$HW_DIR/cargo.log"
+          cargo_filter_count() {
+            local list="$HW_DIR/list.txt" n rc
+            if CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
+            if [ "$rc" -ne 0 ]; then
+              cat "$list"
+              echo "listing-rc=$rc" > "$HW_DIR/filter_fail"
+              echo "::error title=hwmon-win 필터 실패::cargo test $* -- --list 실패(rc=$rc) — 필터를 셀 수 없으면 실행도 근거가 없다(fail-closed)"
+              exit 1
+            fi
+            n=$(grep -c ': test$' "$list" || true)
+            if [ "${n:-0}" -lt 1 ]; then
+              tail -20 "$list"
+              echo "matched=0" > "$HW_DIR/filter_fail"
+              echo "::error title=hwmon-win 필터 0건::cargo test $* 필터에 걸리는 테스트가 0건 — 모듈 경로가 바뀌었다(돌지 않는 초록 금지)"
+              exit 1
+            fi
+            echo "$n" > "$HW_DIR/listed"
+            echo "[filter-count] cargo test $* → ${n}건"
+          }
+          cargo_filter_count --bin cysd hwmon::
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd hwmon:: -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections 2>&1 | tee "$LOG"
+          rc="${PIPESTATUS[0]}"
+          echo "$rc" > "$HW_DIR/rc"
+          [ "$rc" -eq 0 ] && exit 0
+          echo "::error title=hwmon-win 실패::rc=$rc — 아래 꼬리 20줄이 원문이다"
+          tail -20 "$LOG" | sed 's/^/::error title=hwmon-win 로그::/'
+          exit "$rc"
+
+      # ★hwmon 스텝 결과 판독(비차단 · 위 cysd 판독 스텝과 같은 구조). 위 스텝은 continue-on-error 라 실패·절단도 conclusion 이 success 다 — 이 스텝이 **진짜 결과**를 일곱 갈래로 가려
+      #   annotation(익명 REST 로 읽히는 유일한 채널)과 STEP_SUMMARY 에 남긴다: 완주·통과(notice) · 완주·실패(error — 통과·실패 수와 실패 검체 이름) · 통과 0건(error — rc=0 이어도 돈 검체가 없으면 무측정) ·
+      #   필터 실패(error — 0건·목록 실패 = 무측정) · 절단(error — rc 표지 없음 · 마지막으로 시작한 검체) · 판정 불가(error) · 미실행(warning — 앞 스텝 실패로 skipped). 자기가 실패하지 않는다(`exit 0` · `-e` 끔) · `timeout-minutes: 2` 는
+      #   위 판독 스텝과 같은 이유(멈춤은 continue-on-error 가 흡수하지 않는다 — 잡 상한·release 게이트와 얽힌다).
+      - name: hwmon-win 결과 판독 (비차단 · annotation + STEP_SUMMARY)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        shell: bash
+        env:
+          HW_OUTCOME: ${{ steps.hwmon_win.outcome }}
+          HW_CONCLUSION: ${{ steps.hwmon_win.conclusion }}
+        run: |
+          set +e
+          D="${RUNNER_TEMP:-/tmp}/hwmon-win"
+          LOG="$D/cargo.log"
+          SUM="${GITHUB_STEP_SUMMARY:-/dev/null}"
+          outcome="${HW_OUTCOME:-unknown}"
+          start="$(cat "$D/start" 2>/dev/null)"
+          rc="$(cat "$D/rc" 2>/dev/null)"
+          ff="$(cat "$D/filter_fail" 2>/dev/null)"
+          listed="$(cat "$D/listed" 2>/dev/null)"
+          if [ -n "$start" ]; then
+            el_s=$(( $(date +%s) - start ))
+            el="$(( el_s / 60 ))분 $(( el_s % 60 ))초"
+          else
+            el="측정 불가(시작 표지 없음)"
+          fi
+          summary=""; failed=""; passed=""; names=""; last=""; matched=""
+          if [ -f "$LOG" ]; then
+            summary="$(grep -E '^test result:' "$LOG" | tail -1)"
+            passed="$(printf '%s' "$summary" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')"
+            failed="$(printf '%s' "$summary" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+')"
+            names="$(awk '/^failures:$/{f=1;next} f&&/^    [a-zA-Z_]/{print $1} f&&/^$/{f=0}' "$LOG" | sort -u | head -20 | tr '\n' ' ')"
+            # --test-threads=1 --nocapture: libtest 가 검체명을 실행 **전에** 찍는다 → 마지막 'test X ...' = 멈춘 자리
+            last="$(grep -E '^test [^ ]+ \.\.\.' "$LOG" | tail -1 | sed -E 's/^test ([^ ]+) \.\.\..*/\1/')"
+          fi
+          # 필터 `hwmon::` 에 걸린 검체 이름(건너뛴 것 포함 — 실행 대상은 이 중 skip 1건을 뺀 것). 윈도우에서 **처음** 도는 검체의 이름을 기록으로 남긴다.
+          if [ -f "$D/list.txt" ]; then
+            matched="$(grep -E ': test$' "$D/list.txt" | sed -E 's/: test$//; s/^hwmon::tests:://' | tr '\n' ' ')"
+          fi
+          if [ "$outcome" = "skipped" ]; then
+            kind="미실행"; level="warning"
+            msg="앞 스텝 실패로 hwmon 스텝이 건너뛰어졌다 — 이 런의 hwmon Windows 검체는 무측정이다(통과 아님)"
+          elif [ -n "$ff" ]; then
+            kind="필터 실패"; level="error"
+            msg="${ff} — hwmon:: 에 걸리는 검체를 세지 못했거나 0건이다(빌드 실패·모듈 경로 변경) · 이 런의 hwmon Windows 검체는 무측정이다(통과 아님)"
+          elif [ "$rc" = "0" ] && [ "${passed:-0}" -lt 1 ]; then
+            kind="통과 0건"; level="error"
+            msg="rc=0 인데 통과한 검체가 0건이다(${summary:-요약 없음}) — 필터·skip 으로 실행된 검체가 없다(무측정 · 통과 아님)"
+          elif [ "$rc" = "0" ]; then
+            kind="완주·통과"; level="notice"
+            msg="rc=0 · passed=${passed:-?} failed=${failed:-0} · ${summary:-요약 없음} · 경과 ${el} · 필터에 걸린 검체 ${listed:-?}건(그중 snapshot_has_all_sections 는 skip): ${matched:-목록 없음} — 윈도우에서 처음 도는 검체의 첫 통과 기록(차단 승격 판단의 근거 1회)"
+          elif [ -n "$rc" ]; then
+            kind="완주·실패"; level="error"
+            msg="rc=${rc} · failed=${failed:-?} passed=${passed:-?} · 경과 ${el} · 실패 검체: ${names:-없음(하네스 이상 · 101=러스트 패닉 가능)} — 비차단이라 런은 초록이다"
+          elif [ "$outcome" = "success" ]; then
+            kind="판정 불가"; level="error"
+            msg="outcome=success 인데 rc 표지가 없다 — 스텝 구조가 바뀌었거나 표지 쓰기가 실패했다(통과로 읽지 마라)"
+          else
+            kind="절단"; level="error"
+            msg="rc 표지 없음(cargo 가 끝나기 전에 종료) · outcome=${outcome} · 경과 ${el}(상한 6분) · 마지막으로 시작한 검체: ${last:-판독 불가} — 비차단이라 런은 초록이다"
+          fi
+          # 워크플로 명령 이스케이프(% · CR · LF) — 로그에서 온 문자열이 주석을 깨지 않게.
+          esc() { printf '%s' "$1" | sed -e 's/%/%25/g' | tr -d '\r' | awk 'BEGIN{ORS="%0A"}{print}' | sed -e 's/%0A$//'; }
+          echo "::${level} title=hwmon-win ${kind}(비차단)::$(esc "$msg")"
+          if [ "$level" != "notice" ] && [ -f "$LOG" ]; then
+            echo "::${level} title=hwmon-win 로그 꼬리(비차단)::$(esc "$(tail -8 "$LOG")")"
+          fi
+          {
+            echo "### hwmon Windows 실기 (비차단) — ${kind}"
+            echo ""
+            echo "| 항목 | 값 |"
+            echo "|---|---|"
+            echo "| 스텝 outcome / conclusion | ${outcome} / ${HW_CONCLUSION:-?} — continue-on-error 라 실패·절단도 conclusion 은 success |"
+            echo "| cargo rc | ${rc:-없음(rc 표지 없음 — 미실행·필터 실패이거나 끝나기 전에 종료됨)} |"
+            echo "| 경과 | ${el} (스텝 상한 6분) |"
+            echo "| test result | ${summary:-없음} |"
+            echo "| 통과 / 실패 수 | ${passed:-?} / ${failed:-?} |"
+            echo "| 실패 검체 | ${names:-없음} |"
+            echo "| 필터 hwmon:: 에 걸린 검체(${listed:-?}건) | ${matched:-없음} |"
+            echo "| 마지막으로 시작한 검체 | ${last:-없음} |"
+            echo ""
+            echo "> 이 스텝은 **비차단**이다. 잡·런이 초록이어도 판정이 '완주·통과' 가 아니면 hwmon Windows 검체는 통과가 아니다 — 초록을 셀 때 종류를 병기하라."
           } >> "$SUM" 2>/dev/null
           exit 0
 
