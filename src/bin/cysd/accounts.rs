@@ -43,6 +43,15 @@
 //! 폴더가 남는다) · `alias`(`~/.cys/accounts.json` 의 `aliases` 객체 — **표시 전용**: 경보 키·라벨·이벤트·`alert_inputs` 에 쓰지 않는다). **락 간선은 새로 만들지 않는다** — `local_json` 은 accounts 락을 잡기
 //! **전에** ① 알려진 프로필 폴더의 현재 신원 표([`known_profile_identities`] — 열거 정본 `cys::profile_gate::enumerate_profile_dirs` + B3 의 폴더별 60초 캐시 [`folder_identity`] 재사용 · 새 캐시 없음) ② 별명 표 갱신
 //! ([`refresh_aliases`] — 60초 하한 · 파일 mtime 이 바뀔 때만 판독 · accounts 락은 하한 판정·저장 때만 순간) 을 끝내고, 락 안에서는 메모리 연산뿐이다(소스 핀 `b1_lock_order_wiring_pins`).
+//!
+//! ★0.14.43(R1F-US · 성찰 1회차 수정): **워치독 스레드는 신원 파일을 열지 않는다**(오너 절대 기준 ③ — 0.14.42 의 경보 점검은 이 경로에서 파일을 열지 않았다). 경보 틱은 **캐시 전용 조회**
+//! ([`seat_identity_view_cached`] — 항목이 있으면 **만료됐어도 마지막 값**, 없으면 None = 판정 불가 = 사용 중 · IO 0 · stat 0)만 쓴다. 캐시(`Daemon::seat_ident_cache`)는 ① 상태줄 보고(`usage.report` 의 귀속 경로가 이미 읽은
+//! 신원을 그대로 싣는다 — 추가 IO 0 · [`note_seat_identity`]) ② RPC 경로의 읽기-통과 조회([`folder_identity`] — 사용량·status·Control Center 호출)가 채운다. 읽기-통과는 캐시 미스일 때 IO **전에** `(now, 옛 값)` 으로
+//! 자리를 찍어(선점) 디스크가 멈춰도 폴더당 60초에 요청 하나만 묶인다. 알려진 프로필 폴더 열거(홈·`~/.cys` 의 `read_dir`)도 같은 캐시에 60초 하한·같은 선점 꼴로 둔다([`enumerated_profile_dirs`]).
+//! 신원 파일은 있는데(메타 성공) 이번 판독·파싱만 실패하면 직전 신원을 **한 주기만** 더 쓰고(연속 실패면 '읽지 못함'), `current_profiles` 는 이번에 신원을 **읽지 못한**(판독 실패가 유예 뒤까지 이어졌거나 처음 보는 폴더를 다른 요청이 아직
+//! 읽는 중인 — [`FolderWho::Unread`]) 폴더가 낀 행에서는 키를 내지 않는다(화면은 `profiles` 폴백). 로그아웃(`oauthAccount` 없음)·신원 파일 없음처럼 신원 없음이 **확정**인 폴더([`FolderWho::NoLogin`])는 읽지 못한 것이 아니라 '이 계정의 폴더가 아니다'로
+//! 세므로 그 계정의 다른 폴더가 없으면 `[]`(= 화면의 '이전 로그인')이 나온다(9650334f 와 같다).
+//! 대가: 창이 닫혀 있고 좌석이 전부 유휴면(보고도 조회도 없으면) 로그인 전환 감지가 다음 보고·조회까지 늦는다 — 그동안은 마지막 값/판정 불가(= 사용 중)라 경보는 유지된다(0.14.42 와 같은 방향).
 
 use crate::state::{Daemon, HideConsole};
 use crate::usage::{ObservedUsage, RateWindow};
@@ -323,10 +332,19 @@ fn identity_file_meta(home: Option<&Path>, dir: &Path) -> Option<(PathBuf, f64)>
     Some((f, mtime))
 }
 
-/// 신원 파일 판독·파싱 — **락 밖 전용**. 여는 것도 막히지 않게 연다(unix `O_NONBLOCK` — 일반 파일 읽기에는 영향이
-/// 없다)고, 연 뒤 fstat 으로 **일반 파일**인지 다시 확인한다(stat 과 open 사이에 FIFO 로 바뀌는 경쟁 차단).
-/// 크기 상한을 넘으면 읽지 않는다. 자격증명(.credentials.json)은 읽지 않는다.
-fn read_identity_file(f: &Path) -> Option<Ident> {
+/// ★R1F-US(m-2) 신원 파일 판독 결과 — 3값. '신원 없음(확정)'과 '이번엔 못 읽음(일시 실패일 수 있다)'을 가른다 — [`folder_identity`] 가 직전 신원을 한 주기 더 쓸지 이것으로 정한다.
+enum IdentRead {
+    /// `oauthAccount.accountUuid` 를 얻었다.
+    Found(Ident),
+    /// 신원 없음이 **확정**이다 — 신원 파일이 없거나 일반 파일이 아니고(메타 실패 · FIFO·장치·디렉터리 포함), 또는 파일은 읽혔고 JSON 인데 로그인 정보(`oauthAccount`·`accountUuid`)가 없다(로그아웃 등).
+    NoIdentity,
+    /// 신원 파일은 있는데(메타 성공) 이번 판독·파싱이 실패했다 — 열기·읽기 오류 · 열고 보니 일반 파일이 아님·크기 초과 · UTF-8 아님 · JSON 파싱 실패(쓰는 도중의 빈 파일·잘린 파일 포함).
+    Unreadable,
+}
+
+/// 신원 파일 판독·파싱(3값) — **락 밖 전용**. 여는 것도 막히지 않게 연다(unix `O_NONBLOCK` — 일반 파일 읽기에는 영향이 없다)고, 연 뒤 fstat 으로 **일반 파일**인지 다시 확인한다(stat 과 open 사이에 FIFO 로
+/// 바뀌는 경쟁 차단). 크기 상한을 넘으면 읽지 않는다. 자격증명(.credentials.json)은 읽지 않는다.
+fn read_identity_outcome(f: &Path) -> IdentRead {
     use std::io::Read;
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -335,24 +353,41 @@ fn read_identity_file(f: &Path) -> Option<Ident> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NONBLOCK);
     }
-    let file = opts.open(f).ok()?;
-    let md = file.metadata().ok()?;
+    let Ok(file) = opts.open(f) else {
+        return IdentRead::Unreadable;
+    };
+    let Ok(md) = file.metadata() else {
+        return IdentRead::Unreadable;
+    };
     if !md.is_file() || md.len() > IDENTITY_FILE_MAX_BYTES {
-        return None;
+        return IdentRead::Unreadable;
     }
     let mut s = String::new();
-    file.take(IDENTITY_FILE_MAX_BYTES + 1).read_to_string(&mut s).ok()?;
-    if s.len() as u64 > IDENTITY_FILE_MAX_BYTES {
-        return None;
+    if file.take(IDENTITY_FILE_MAX_BYTES + 1).read_to_string(&mut s).is_err() || s.len() as u64 > IDENTITY_FILE_MAX_BYTES {
+        return IdentRead::Unreadable;
     }
-    parse_identity(&s)
+    parse_identity_outcome(&s)
 }
 
-/// `.claude.json` 본문 → 신원(순수).
-fn parse_identity(s: &str) -> Option<Ident> {
-    let v = serde_json::from_str::<Value>(s).ok()?;
-    let oa = v.get("oauthAccount")?;
-    let uuid = oa.get("accountUuid")?.as_str()?.to_string();
+/// 신원 파일 판독·파싱 — [`read_identity_outcome`] 의 `Option` 판(종전 계약 그대로: 읽기 실패·신원 없음 모두 None).
+fn read_identity_file(f: &Path) -> Option<Ident> {
+    match read_identity_outcome(f) {
+        IdentRead::Found(ident) => Some(ident),
+        IdentRead::NoIdentity | IdentRead::Unreadable => None,
+    }
+}
+
+/// `.claude.json` 본문 → 신원(순수 · 3값). JSON 으로 파싱되지 않으면(빈 문자열·잘린 본문 포함) `Unreadable`, JSON 인데 `oauthAccount.accountUuid`(문자열)가 없으면 `NoIdentity`.
+fn parse_identity_outcome(s: &str) -> IdentRead {
+    let Ok(v) = serde_json::from_str::<Value>(s) else {
+        return IdentRead::Unreadable;
+    };
+    let Some(oa) = v.get("oauthAccount") else {
+        return IdentRead::NoIdentity;
+    };
+    let Some(uuid) = oa.get("accountUuid").and_then(|x| x.as_str()).map(str::to_string) else {
+        return IdentRead::NoIdentity;
+    };
     let email = oa
         .get("emailAddress")
         .and_then(|x| x.as_str())
@@ -364,7 +399,7 @@ fn parse_identity(s: &str) -> Option<Ident> {
         .iter()
         .find_map(|k| oa.get(*k).and_then(|x| x.as_str()).filter(|t| !t.is_empty()))
         .map(|s| s.to_string());
-    Some((uuid, email, plan))
+    IdentRead::Found((uuid, email, plan))
 }
 
 /// 캐시 조회(파일시스템 무접촉 — 락 안에서 불러도 된다). `Some(ident)` = 적중.
@@ -397,18 +432,36 @@ fn claude_identity_at(state: &mut AccountsState, home: Option<&Path>, dir: &Path
 }
 
 /// ★fatal-fix R4-F2: 운영 경로의 신원 해석 — 캐시 조회·기록만 짧게 락 안에서 하고 **파일 IO 는 전부 락 밖**이다.
-fn claude_identity_unlocked(accounts: &std::sync::Mutex<AccountsState>, home: Option<&Path>, dir: &Path) -> Option<Ident> {
-    let (f, mtime) = identity_file_meta(home, dir)?;
+/// ★R1F-US(m-2): 3값판([`IdentRead`]). 신원 파일의 메타가 안 잡히면(없음·FIFO 등 일반 파일 아님) `NoIdentity`. mtime 캐시에는 `Found`·`NoIdentity` 만 싣는다 — `Unreadable`(일시 실패일 수 있다)은 싣지 않아
+/// 다음 확인에 다시 읽는다.
+fn claude_identity_probe(accounts: &std::sync::Mutex<AccountsState>, home: Option<&Path>, dir: &Path) -> IdentRead {
+    let Some((f, mtime)) = identity_file_meta(home, dir) else {
+        return IdentRead::NoIdentity;
+    };
     let hit = {
         let st = accounts.lock().unwrap();
         ident_cached(&st, dir, &f, mtime)
     };
-    if let Some(hit) = hit {
-        return hit;
+    match hit {
+        Some(Some(ident)) => return IdentRead::Found(ident),
+        Some(None) => return IdentRead::NoIdentity,
+        None => {}
     }
-    let ident = read_identity_file(&f);
-    ident_store(&mut accounts.lock().unwrap(), dir, f, mtime, ident.clone());
-    ident
+    let read = read_identity_outcome(&f);
+    match &read {
+        IdentRead::Found(ident) => ident_store(&mut accounts.lock().unwrap(), dir, f, mtime, Some(ident.clone())),
+        IdentRead::NoIdentity => ident_store(&mut accounts.lock().unwrap(), dir, f, mtime, None),
+        IdentRead::Unreadable => {}
+    }
+    read
+}
+
+/// [`claude_identity_probe`] 의 `Option` 판(종전 계약 그대로 — 귀속 경로가 쓴다: 신원이 없거나 못 읽으면 None).
+fn claude_identity_unlocked(accounts: &std::sync::Mutex<AccountsState>, home: Option<&Path>, dir: &Path) -> Option<Ident> {
+    match claude_identity_probe(accounts, home, dir) {
+        IdentRead::Found(ident) => Some(ident),
+        IdentRead::NoIdentity | IdentRead::Unreadable => None,
+    }
 }
 
 /// 귀속 결과 — (키, 라벨, plan, 프로필 표기).
@@ -530,7 +583,13 @@ fn note_rate_at_resolved(
     }
     let resolved = match agent {
         "claude" => profile_dir_from_session(session_file).and_then(|dir| {
-            claude_identity_unlocked(&daemon.accounts, home, &dir).map(|ident| claude_resolution(home, &dir, ident))
+            claude_identity_unlocked(&daemon.accounts, home, &dir).map(|ident| {
+                // ★R1F-US(M-1): 이미 읽은 신원을 좌석 신원 캐시에 싣는다(추가 IO 0). 창 밖 보고는 싣지 않는다 — 좌석 폴더의 사실이 아니다.
+                if feeds_alerts(source) {
+                    note_seat_identity(daemon, &dir, &ident.0, now);
+                }
+                claude_resolution(home, &dir, ident)
+            })
         }),
         other => fixed_resolution(home, other),
     };
@@ -588,6 +647,10 @@ fn note_rate_for_profile_at_resolved(
         return None;
     }
     let ident = claude_identity_unlocked(&daemon.accounts, home, profile_dir)?;
+    // ★R1F-US(M-1·②): 보고가 좌석 신원 캐시를 채운다 — 방금 읽은 신원을 그대로 싣는다(추가 IO 0). 워치독은 파일을 읽지 않고 이 캐시를 본다.
+    if feeds_alerts(source) {
+        note_seat_identity(daemon, profile_dir, &ident.0, now);
+    }
     let resolved = claude_resolution(home, profile_dir, ident);
     let account_id = resolved.0.account_id.clone();
     note_resolved(daemon, resolved, rate, source, now);
@@ -1334,12 +1397,16 @@ const PREDICT_FRESH_SECS: f64 = 600.0;
 /// `rate[]` 원소의 `alert_eligible`(그 창이 경보 입력으로 적격인가 — 경보 입력이 없는 창(창 밖 표시용 값 등)은 false). 표시 승자·기존 키는 불변이다.
 /// ★0.14.43(B1): 행마다 가산 키 2개 — `current_profiles`(배열 · [`current_profiles_for`]: claude 는 **지금** 이 계정으로 로그인된 알려진 프로필 폴더 · 그 밖은 `profiles` 그대로 · 구 데몬 응답엔 키가 없다) ·
 /// `alias`(문자열|null · [`alias_for`] — 표시 전용). `profiles` 는 종전처럼 추가 전용이다.
+/// ★R1F-US(m-1·m-2): `current_profiles` 의 폴더 표는 열거(60초 하한 캐시)에 **이미 신원을 읽은 좌석 폴더**를 합친 것이고(열거 밖 폴더를 쓰는 계정이 `in_use:true` 인데 `current_profiles:[]` 가 되지 않게 · 추가 IO 0),
+/// 그 행의 `profiles` 에 든 폴더 가운데 이번에 신원을 **읽지 못한** 것(판독 실패가 유예 뒤까지 이어짐 · 처음 보는 폴더를 아직 읽는 중)이 있거나 열거가 실패하면 이 키를 **내지 않는다**(화면은 키 부재 → `profiles` 폴백 · 추가 전용 계약).
+/// 로그아웃·신원 파일 없음(신원 없음 **확정**)은 읽지 못한 것이 아니다 — '이 계정의 폴더가 아니다'로 세어 그 계정의 다른 폴더가 없으면 `[]` 이다(보정).
 /// 좌석 신원 표·알려진 프로필 폴더 신원 표·별명 표 갱신(전부 파일 IO)은 **accounts 락을 잡기 전에** 만든다.
 pub fn local_json(daemon: &Arc<Daemon>, now: f64) -> Value {
     let view = seat_identity_view_at(daemon, now);
     let stale_secs = account_alert_stale_secs();
     let home = account_home();
-    let known = known_profile_identities(daemon, home.as_deref(), now);
+    let seat_states = seat_folder_states(daemon, &view);
+    let known = known_profile_identities(daemon, home.as_deref(), now).map(|k| merge_seat_folders(k, home.as_deref(), &seat_states));
     refresh_aliases(daemon, home.as_deref(), now);
     let mut rows: Vec<Value> = {
         let st = daemon.accounts.lock().unwrap();
@@ -1368,7 +1435,7 @@ pub fn local_json(daemon: &Arc<Daemon>, now: f64) -> Value {
                         o
                     })
                     .collect();
-                json!({
+                let mut row = json!({
                     "provider": v.key.provider,
                     "account_id": v.key.account_id,
                     "label": v.label,
@@ -1384,10 +1451,14 @@ pub fn local_json(daemon: &Arc<Daemon>, now: f64) -> Value {
                     // ★0.14.43(B3) 가산 키 — true/false/null(판정 불가) · 경보 입력의 관측 시각(없으면 null).
                     "in_use": in_use,
                     "rate_observed_at": input.map_or(Value::Null, |i| json!(i.at)),
-                    // ★0.14.43(B1) 가산 키 — 이 계정이 지금 로그인된 설정 폴더(표기는 `profiles` 와 같은 `profile_short`) · 별명(표시 전용 · 없으면 null).
-                    "current_profiles": current_profiles_for(&v.key.provider, &v.key.account_id, &v.profiles, &known),
+                    // ★0.14.43(B1) 가산 키 — 별명(표시 전용 · 없으면 null). 이 계정이 지금 로그인된 설정 폴더 `current_profiles`(표기는 `profiles` 와 같은 `profile_short`)는 아래에서 조건부로 싣는다.
                     "alias": alias_for(&st.alias.table, &v.key.account_id, &v.label),
-                })
+                });
+                // ★R1F-US(m-2·ⓑ): 신원을 읽지 못한 폴더가 낀 행 · 열거 실패는 키 부재 — '이전 로그인'을 단정하지 않는다(화면은 `profiles` 폴백).
+                if let Some(cp) = current_profiles_for(&v.key.provider, &v.key.account_id, &v.profiles, known.as_deref()) {
+                    row["current_profiles"] = json!(cp);
+                }
+                row
             })
             .collect()
     };
@@ -1527,21 +1598,57 @@ impl SeatIdentityView {
     }
 }
 
-/// 좌석 신원의 60초 하한 캐시 — 폴더 → (확인 시각, 그때의 신원). `Daemon::seat_ident_cache`. 실패(None)도 담는다(없는 파일을 매번 stat 하지 않는다).
+/// ★R1F-US(보정 · m-2 ⓑ) 폴더 신원의 **3값** — `current_profiles` 가 '이 계정의 폴더가 아니다'(신원 없음 **확정**)와 '이번에 읽지 못했다'를 가른다. 워치독(`peek_folder_ident`)은 `Known` 만 신원으로 본다(나머지는 None = 판정 불가).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FolderWho {
+    /// 현재 신원(account_id)을 얻었다 — 판독이 한 번 실패해 직전 신원을 한 주기 더 쓰는 유예 중인 것도 여기다.
+    Known(String),
+    /// **신원 없음이 확정**이다 — 신원 파일이 없거나 일반 파일이 아니고(FIFO·장치·디렉터리 포함), 또는 파일은 읽혔는데 로그인 정보(`oauthAccount`·`accountUuid`)가 없다(로그아웃 등). 어느 계정의 폴더도 아니다.
+    NoLogin,
+    /// **이번에 읽지 못했다** — 판독 실패가 유예(한 주기) 뒤까지 이어졌거나, 처음 보는 폴더를 다른 요청이 아직 읽는 중이다(선점 자리 = '아직 모름' — 신원 없음 확정이 아니다). 누구의 폴더인지 모른다.
+    Unread,
+}
+
+impl FolderWho {
+    /// 현재 신원(account_id) — `Known` 일 때만.
+    fn account(&self) -> Option<&str> {
+        match self {
+            FolderWho::Known(a) => Some(a.as_str()),
+            FolderWho::NoLogin | FolderWho::Unread => None,
+        }
+    }
+}
+
+/// 좌석 신원 캐시 한 항목 — 마지막 확인 시각 · 그때의 신원 상태([`FolderWho`]) · 연속 일시 실패 수(0 = 직전 확인이 정상(또는 신원 없음 확정) · 1 = 판독 실패로 직전 신원을 한 주기 더 쓰는 중 · 2 이상 = 유예 뒤에도 못 읽음).
+/// 선점 자리(IO 전에 찍는 항목)는 옛 항목의 상태·실패 수를 그대로 싣고, 옛 항목이 없던(처음 보는) 폴더의 자리는 `Unread`(아직 모름)다.
+#[derive(Clone, Debug)]
+struct IdentSlot {
+    at: f64,
+    state: FolderWho,
+    misses: u8,
+}
+
+/// 좌석 신원의 60초 하한 캐시 — 폴더 → (확인 시각, 그때의 신원 상태 `FolderWho`). `Daemon::seat_ident_cache`. 신원 없음·읽지 못함도 담는다(없는 파일을 매번 stat 하지 않는다).
 /// 크기: 신원 표를 만들 때 확인한 지 10분이 지난 항목을 걷고(상한 512 초과는 비운다) · 어느 소비자가 물은 폴더든 60초 하한 동안은 살아 있다.
+/// ★R1F-US: 이 캐시는 세 길로 채워진다 — 읽기-통과 조회([`folder_identity`] · 미스 때 IO 전에 선점) · 상태줄 보고([`note_seat_identity`] · 귀속 경로가 읽은 신원을 그대로 · 추가 IO 0) ·
+/// 알려진 프로필 폴더 열거([`enumerated_profile_dirs`] · 같은 60초 하한·선점). **워치독은 읽기만 한다**([`peek_folder_ident`] · 만료돼도 마지막 값 · IO 0 · stat 0).
 #[derive(Default)]
 pub struct SeatIdentCache {
-    entries: HashMap<PathBuf, (f64, Option<String>)>,
-    /// 계측(검체·진단) — 캐시 적중 수 / 실제로 신원을 확인한 수(stat 1회 이상).
+    entries: HashMap<PathBuf, IdentSlot>,
+    /// ★R1F-US(m-5) 알려진 프로필 폴더 열거 결과 — (홈, 확인 시각, 목록 | None = 열거 실패). 홈이 다르면 미스다.
+    enumerated: Option<(PathBuf, f64, Option<Vec<PathBuf>>)>,
+    /// 계측(검체·진단) — 캐시 적중 수 / 실제로 신원을 확인한 수(stat 1회 이상) / 프로필 폴더 열거를 실제로 한 수.
     pub hits: u64,
     pub reads: u64,
+    pub enum_reads: u64,
 }
 
 #[cfg(test)]
 impl SeatIdentCache {
-    /// 시험 이음매 — 캐시를 비운다(60초 하한을 기다리지 않고 '신원이 바뀐 뒤'를 관측하게).
+    /// 시험 이음매 — 캐시를 비운다(60초 하한을 기다리지 않고 '신원이 바뀐 뒤'를 관측하게). 프로필 폴더 열거 결과도 함께 비운다.
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.enumerated = None;
     }
 }
 
@@ -1587,40 +1694,87 @@ fn collect_seat_rows(daemon: &Arc<Daemon>) -> Option<Vec<(u64, Option<String>, O
     Some(out)
 }
 
-/// 폴더의 현재 신원(account_id) — 60초 하한 캐시 → 미스면 락 없이 신원 파일을 확인한다(`claude_identity_unlocked` — stat + mtime 캐시 · FIFO 등
-/// 일반 파일이 아니면 열지 않는다). 캐시 락은 조회·기록 때만 순간 잡는다(그 안에서 다른 락을 잡지 않는다).
+/// 폴더의 현재 신원(account_id) — **읽기-통과**: [`folder_identity_state`] 의 `Option` 판(`Known` 이면 Some · 신원 없음 확정·읽지 못함은 None). 계약·락 규율은 본체 문서와 같다.
+/// **워치독(경보 틱)은 이 함수를 부르지 않는다**(파일을 연다) — 캐시 전용 [`peek_folder_ident`] 를 쓴다.
 /// (`pub(crate)` — 알려진 프로필 폴더 전체의 현재 신원이 필요한 후속 소비자가 같은 60초 캐시를 재사용한다 · 새로 만들지 않는다.)
 pub(crate) fn folder_identity(daemon: &Arc<Daemon>, home: Option<&Path>, folder: &str, now: f64) -> Option<String> {
-    let key = PathBuf::from(folder);
-    {
-        let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((at, who)) = c.entries.get(&key).cloned() {
-            // 시계가 뒤로 가면(now < at) 만료로 본다 — 캐시가 영구히 붙지 않는다.
-            if now >= at && now - at < SEAT_IDENT_CACHE_SECS {
-                c.hits += 1;
-                return who;
-            }
-        }
-    }
-    let who = claude_identity_unlocked(&daemon.accounts, home, &key).map(|(uuid, _, _)| uuid);
-    let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
-    c.reads += 1;
-    c.entries.insert(key, (now, who.clone()));
-    who
+    folder_identity_state(daemon, home, folder, now).account().map(str::to_string)
 }
 
-/// 좌석 신원 표 — 지금 시각·실제 홈으로 만든다.
+/// 폴더의 현재 신원 **상태**([`FolderWho`]) — **읽기-통과**: 60초 하한 캐시 → 미스면 락 없이 신원 파일을 확인한다(`claude_identity_probe` — stat + mtime 캐시 · FIFO 등 일반 파일이 아니면 열지 않는다).
+/// 캐시 락은 조회·기록 때만 순간 잡는다(그 안에서 다른 락을 잡지 않는다).
+/// ★R1F-US(M-1·③) **선점**: 미스(항목 없음·만료·시계 역행)면 IO **전에** `(now, 옛 값)` 으로 자리를 찍는다(`refresh_aliases` 와 같은 꼴) — 디스크가 멈춰도 그 폴더는 60초에 요청 하나만 묶이고, 그동안 다른 호출은 옛 값을
+/// 받는다(처음 보는 폴더는 `Unread` = '아직 모름' = 판정 불가 = 사용 중 — 신원 없음 확정(`NoLogin`)이 아니다).
+/// ★R1F-US(m-2·ⓐ) **일시 실패 내성**: 신원 파일은 있는데(메타 성공) 이번 판독·파싱만 실패했으면 직전 신원을 **한 주기(60초)만** 더 쓴다(`Known` 유지) — 연속 실패가 이어지면 다음 주기에는 `Unread`(무한 연장 없음).
+/// 파일이 없어졌거나 `oauthAccount` 가 없는 것(신원 없음 **확정**)은 즉시 `NoLogin` — 읽지 못한 것이 아니다(보정).
+pub(crate) fn folder_identity_state(daemon: &Arc<Daemon>, home: Option<&Path>, folder: &str, now: f64) -> FolderWho {
+    let key = PathBuf::from(folder);
+    let (old_state, old_misses) = {
+        let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = c.entries.get(&key).cloned();
+        if let Some(slot) = &prev {
+            // 시계가 뒤로 가면(now < at) 만료로 본다 — 캐시가 영구히 붙지 않는다.
+            if now >= slot.at && now - slot.at < SEAT_IDENT_CACHE_SECS {
+                c.hits += 1;
+                return slot.state.clone();
+            }
+        }
+        let (state, misses) = prev.map_or((FolderWho::Unread, 0), |s| (s.state, s.misses));
+        c.entries.insert(key.clone(), IdentSlot { at: now, state: state.clone(), misses });
+        (state, misses)
+    };
+    let (state, misses) = match claude_identity_probe(&daemon.accounts, home, &key) {
+        IdentRead::Found((uuid, _, _)) => (FolderWho::Known(uuid), 0),
+        IdentRead::NoIdentity => (FolderWho::NoLogin, 0),
+        IdentRead::Unreadable if matches!(old_state, FolderWho::Known(_)) && old_misses == 0 => (old_state, 1),
+        IdentRead::Unreadable => (FolderWho::Unread, old_misses.saturating_add(1)),
+    };
+    let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
+    c.reads += 1;
+    c.entries.insert(key, IdentSlot { at: now, state: state.clone(), misses });
+    state
+}
+
+/// ★R1F-US(M-1·①) **판독 금지** 조회 — IO 0 · stat 0(캐시 락 한 번 · 메모리뿐). 항목이 있으면 **만료됐어도 마지막 값**, 없으면 None(= 판정 불가 = 사용 중으로 취급 — 실패 방향은 경보 유지).
+/// 워치독(경보 틱)이 부르는 신원 표는 이것만 쓴다. 캐시에 쓰지 않는다(계측·항목 무변).
+fn peek_folder_ident(daemon: &Arc<Daemon>, folder: &str) -> Option<String> {
+    peek_folder_state(daemon, folder).account().map(str::to_string)
+}
+
+/// [`peek_folder_ident`] 의 3값판 — 같은 판독 금지 조회(IO 0 · 캐시 락 한 번 · 캐시에 쓰지 않는다)로 항목의 상태([`FolderWho`])를 돌려준다. 항목이 없으면 `Unread`(아직 모름). `local_json` 이 좌석 신원 표의 `None` 을
+/// '신원 없음 확정'과 '읽지 못함'으로 가르는 데 쓴다(추가 IO 0).
+fn peek_folder_state(daemon: &Arc<Daemon>, folder: &str) -> FolderWho {
+    let c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
+    c.entries.get(Path::new(folder)).map_or(FolderWho::Unread, |s| s.state.clone())
+}
+
+/// ★R1F-US(M-1·②) 보고가 캐시를 채운다 — `usage.report` 의 귀속 경로(`note_rate_for_profile_at_resolved`·`note_rate_at_resolved`)는 이미 그 좌석 폴더의 신원을 읽었다. 그 값을 같은 60초 캐시에 싣는다(**추가 IO 0**) —
+/// 창을 닫아 둬도 '보고하는 좌석의 폴더'는 늘 신선하다(워치독은 읽지 않고 이 캐시만 본다). 더 새로 기록된 항목(다른 소비자가 방금 확인 — 60초 안의 미래 시각)은 옛 보고 시각으로 덮지 않는다 · 그보다 먼 미래의 항목은
+/// 시계가 뒤로 간 것이라 만료로 보고 덮는다(`folder_identity` 와 같은 규율 — 캐시가 영구히 붙지 않는다) · 캐시가 가득(512)이면 새 폴더는 싣지 않는다(RPC 경로가 비운다). 일시 실패 카운트는 0 으로 돌아간다(방금 정상으로 읽었다).
+fn note_seat_identity(daemon: &Arc<Daemon>, folder: &Path, account_id: &str, now: f64) {
+    let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
+    match c.entries.get(folder) {
+        Some(slot) if slot.at > now && slot.at - now <= SEAT_IDENT_CACHE_SECS => {}
+        None if c.entries.len() >= SEAT_IDENT_CACHE_MAX => {}
+        _ => {
+            c.entries.insert(folder.to_path_buf(), IdentSlot { at: now, state: FolderWho::Known(account_id.to_string()), misses: 0 });
+        }
+    }
+}
+
+/// 좌석 신원 표(**읽기-통과** — RPC 경로) — 지금 시각·실제 홈으로 만든다.
 #[cfg_attr(not(test), allow(dead_code))] // 운영 호출처는 시각 주입판(`_at`)을 쓴다(한 틱·한 응답 안에서 같은 `now` 를 나눠 쓴다)
 pub fn seat_identity_view(daemon: &Arc<Daemon>) -> SeatIdentityView {
     seat_identity_view_at(daemon, crate::state::now_epoch())
 }
 
-/// [`seat_identity_view`] 의 시각 주입판(경보 틱·`local_json` 이 자기 `now` 로 부른다 · 캐시 하한도 이 시각으로 센다).
+/// [`seat_identity_view`] 의 시각 주입판(`local_json`·status 세 곳·`control.alerts` 의 스냅샷이 자기 `now` 로 부른다 · 캐시 하한도 이 시각으로 센다 · 읽기-통과: 미스면 신원 파일을 확인한다).
+/// **워치독(경보 틱)은 이 함수를 부르지 않는다** — 캐시 전용 [`seat_identity_view_cached`] 를 쓴다.
 pub fn seat_identity_view_at(daemon: &Arc<Daemon>, now: f64) -> SeatIdentityView {
     seat_identity_view_in(daemon, dirs::home_dir().as_deref(), now)
 }
 
-/// 홈·시각을 인자로 받는 시험 이음매. 락 순서: surfaces(복사만) → 해제 → 폴더별 신원 판독(무락 · 60초 캐시) — accounts 락은 쥐지 않는다.
+/// 홈·시각을 인자로 받는 시험 이음매(**읽기-통과** — RPC 경로가 쓴다). 락 순서: surfaces(복사만) → 해제 → 폴더별 신원 판독(무락 · 60초 캐시) — accounts 락은 쥐지 않는다.
 pub(crate) fn seat_identity_view_in(daemon: &Arc<Daemon>, home: Option<&Path>, now: f64) -> SeatIdentityView {
     let Some(rows) = collect_seat_rows(daemon) else {
         return SeatIdentityView::default(); // 수집 실패 = 전부 '모름'
@@ -1639,11 +1793,34 @@ pub(crate) fn seat_identity_view_in(daemon: &Arc<Daemon>, home: Option<&Path>, n
         // **낡은 항목만** 걷는다(확인한 지 [`SEAT_IDENT_PRUNE_SECS`] 가 지난 폴더) — 좌석이 오가며 폴더가 바뀌어도 크기가 유계이고, 같은 캐시를 쓰는 다른 소비자(알려진 프로필
         // 폴더 전체 등 — `folder_identity`)의 항목은 신원 표를 만들 때 지워지지 않는다(지우면 그 소비자의 60초 하한이 무력화돼 폴더를 매번 stat 한다).
         let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
-        c.entries.retain(|_, (at, _)| now < *at || now - *at <= SEAT_IDENT_PRUNE_SECS);
+        c.entries.retain(|_, s| now < s.at || now - s.at <= SEAT_IDENT_PRUNE_SECS);
         if c.entries.len() > SEAT_IDENT_CACHE_MAX {
             c.entries.clear();
         }
     }
+    assemble_seat_view(rows, by_folder)
+}
+
+/// ★R1F-US(M-1) **캐시 전용** 신원 표 — 워치독(경보 틱) 전용. 파일을 열지도 stat 하지도 않는다(IO 0): 폴더마다 [`peek_folder_ident`] 로 캐시의 **마지막 값**(만료됐어도)을 쓰고 항목이 없으면 None(= 판정 불가 = 사용 중)이다.
+/// 락 순서: surfaces(복사만) → 해제 → 캐시 락(순간 · 메모리뿐) — 겹쳐 쥐는 락 쌍이 없다. 캐시를 채우는 것은 상태줄 보고와 RPC 의 읽기-통과 조회다 · 이 함수는 캐시에 쓰지도 않는다(계측·항목·prune 무변).
+pub fn seat_identity_view_cached(daemon: &Arc<Daemon>) -> SeatIdentityView {
+    let Some(rows) = collect_seat_rows(daemon) else {
+        return SeatIdentityView::default(); // 수집 실패 = 전부 '모름'
+    };
+    let mut by_folder: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for (_, agent, folder) in &rows {
+        if let (true, Some(f)) = (agent_is_claude(agent.as_deref()), folder) {
+            if !by_folder.contains_key(f) {
+                let who = peek_folder_ident(daemon, f);
+                by_folder.insert(f.clone(), who);
+            }
+        }
+    }
+    assemble_seat_view(rows, by_folder)
+}
+
+/// 좌석 행 + 폴더별 신원 → 신원 표(순수 · 락 없음 · 파일 IO 없음) — 읽기-통과판과 캐시 전용판이 같은 조립을 쓴다.
+fn assemble_seat_view(rows: Vec<(u64, Option<String>, Option<String>)>, by_folder: BTreeMap<String, Option<String>>) -> SeatIdentityView {
     let mut agents = AgentsAlive::default();
     let mut claude_folder_unknown = false;
     let mut seats = Vec::with_capacity(rows.len());
@@ -1789,11 +1966,12 @@ pub fn alert_rates_with(
             });
         }
     }
-    // 결정론: (라벨, 창) 오름차순 · 같은 키(같은 이메일의 두 계정)는 사용률 큰 쪽이 먼저.
+    // 결정론: (라벨, 창) 오름차순 · 같은 키(같은 이메일의 두 계정)는 사용률 큰 쪽이 먼저 · 같은 값이면 관측 나이가 작은 쪽(R1F-US m-6: 스냅샷이 키당 값이 가장 큰 입력을 쥔다).
     out.sort_by(|a, b| {
         (&a.label, &a.win)
             .cmp(&(&b.label, &b.win))
             .then(b.used_pct.total_cmp(&a.used_pct))
+            .then(a.age_secs.total_cmp(&b.age_secs))
     });
     out
 }
@@ -1920,9 +2098,16 @@ struct AliasState {
     reads: u64,
 }
 
-/// ★순수: 별명 값 정제 — 제어 문자(`char::is_control`) 제거 → 앞뒤 공백 제거 → 비면 None → 최대 24자(char 기준)로 자른다(절단이 공백에서 끝나면 그 공백도 걷는다). 표시 전용.
+/// ★R1F-US(n-2): 별명에서 걷는 글자 — 제어 문자(`char::is_control`)에 더해 양방향 제어(U+202A~202E · U+2066~2069) · 제로폭(U+200B~200F · U+FEFF) · 줄/문단 구분자(U+2028·2029). 화면 `ui/src/starvednotice.ts` 의
+/// `INVISIBLE` 과 같은 집합이다(표시를 속이거나 깨뜨리는 것들).
+fn is_hidden_alias_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200B}'..='\u{200F}' | '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// ★순수: 별명 값 정제 — 제어 문자·양방향 제어·제로폭([`is_hidden_alias_char`]) 제거 → 앞뒤 공백 제거 → 비면 None → 최대 24자(char 기준)로 자른다(절단이 공백에서 끝나면 그 공백도 걷는다). 표시 전용.
 fn sanitize_alias(raw: &str) -> Option<String> {
-    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let cleaned: String = raw.chars().filter(|c| !is_hidden_alias_char(*c)).collect();
     let t = cleaned.trim();
     if t.is_empty() {
         return None;
@@ -2040,45 +2225,119 @@ fn refresh_aliases(daemon: &Arc<Daemon>, home: Option<&Path>, now: f64) {
 }
 
 /// ★순수: 행의 별명 — `account_id` 키가 `label`(이메일) 키보다 우선한다. 없으면 None. (표시 전용 — 경보 키·라벨·이벤트에 쓰지 않는다.)
+/// ★R1F-US(n-1): `account_id == "default"` 인 행(Codex·Antigravity·선언 계정 — 계정 id 가 전부 `default`)은 `label` 키를 **먼저** 본다 — `{"default":"X","OpenAI Codex":"코덱스"}` 에서 `default` 키가 라벨 키를 가리지 않는다
+/// (라벨 키가 없을 때만 `default` 키로 내려간다 · 그 밖 행은 종전 순서).
 fn alias_for<'a>(table: &'a HashMap<String, String>, account_id: &str, label: &str) -> Option<&'a str> {
-    table.get(account_id).or_else(|| table.get(label)).map(String::as_str)
+    let hit = if account_id == "default" {
+        table.get(label).or_else(|| table.get(account_id))
+    } else {
+        table.get(account_id).or_else(|| table.get(label))
+    };
+    hit.map(String::as_str)
 }
 
-/// 알려진 claude 프로필 폴더와 각 폴더의 **현재** 신원 account_id — (표시 표기, 신원 | None). 폴더 목록은 부트 시드(`discover_at`)와 **같은 열거 정본**
-/// (`cys::profile_gate::enumerate_profile_dirs` — 기본 프로필 `~/.claude` 포함)이고, 표기는 `profiles` 원소를 만드는 `profile_short` 다. 신원은 B3 의 폴더별 60초 하한 캐시
-/// ([`folder_identity`])로 읽는다(새 캐시 없음 — 같은 폴더를 좌석 신원 표가 이미 읽었으면 적중). 판독 실패(파일 없음·FIFO·파싱 실패)는 None — 어느 계정과도 일치하지 않는다.
+/// ★R1F-US(m-5) 알려진 프로필 폴더 열거 — 열거 정본(`cys::profile_gate::enumerate_profile_dirs`: 홈과 `~/.cys` 의 `read_dir`)을 **60초 하한**으로 캐시한다(`SeatIdentCache` · 신원 항목과 같은 선점 꼴: 미스(항목 없음·만료·
+/// 시계 역행·다른 홈)면 IO 전에 `(now, 옛 값)` 으로 자리를 찍는다 — 디스크가 멈춰도 요청 하나만 묶이고, 5초 폴링이 열거를 늘리지 않는다). 반환 None = **열거 실패**: 정본이 읽기 오류를 조용히 빈 목록으로 접으므로, 목록이 비었으면
+/// 홈 `read_dir` 가 되는지로 가른다(안 되면 실패 · 되면 `Some([])` = 정말 프로필 폴더가 없다). 선점 중 처음 보는 홈이면 None. 캐시 락은 조회·기록 때만 순간 잡는다(IO 는 락 밖).
+fn enumerated_profile_dirs(daemon: &Arc<Daemon>, home: &Path, now: f64) -> Option<Vec<PathBuf>> {
+    {
+        let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = c.enumerated.as_ref().filter(|(h, _, _)| h.as_path() == home).cloned();
+        if let Some((_, at, list)) = &prev {
+            // 시계가 뒤로 가면(now < at) 만료로 본다.
+            if now >= *at && now - *at < SEAT_IDENT_CACHE_SECS {
+                return list.clone();
+            }
+        }
+        let old = prev.and_then(|(_, _, list)| list);
+        c.enumerated = Some((home.to_path_buf(), now, old));
+    }
+    let list = cys::profile_gate::enumerate_profile_dirs(home);
+    let result = (!list.is_empty() || std::fs::read_dir(home).is_ok()).then_some(list);
+    let mut c = daemon.seat_ident_cache.lock().unwrap_or_else(|e| e.into_inner());
+    c.enum_reads += 1;
+    c.enumerated = Some((home.to_path_buf(), now, result.clone()));
+    result
+}
+
+/// 알려진 claude 프로필 폴더와 각 폴더의 **현재** 신원 상태([`FolderWho`]) — (표시 표기, 신원 상태). 폴더 목록은 부트 시드(`discover_at`)와 **같은 열거 정본**
+/// (`cys::profile_gate::enumerate_profile_dirs` — 기본 프로필 `~/.claude` 포함 · 60초 하한 캐시 [`enumerated_profile_dirs`])이고, 표기는 `profiles` 원소를 만드는 `profile_short` 다. 신원은 B3 의 폴더별 60초 하한 캐시
+/// ([`folder_identity_state`])로 읽는다(새 캐시 없음 — 같은 폴더를 좌석 신원 표가 이미 읽었으면 적중). 신원 없음 확정(파일 없음·FIFO·`oauthAccount` 없음 = `NoLogin`)과 읽지 못함(파싱·읽기 실패의 유예 뒤 = `Unread`)은 둘 다
+/// 어느 계정과도 일치하지 않지만 `current_profiles` 에서는 다르게 다룬다(보정).
+/// ★R1F-US: 반환 None = 폴더 목록을 못 얻었다(홈 불명 · 열거 실패) — 부른 쪽은 `current_profiles` 키를 내지 않는다.
 /// 파일 IO(열거 + 신원)는 어떤 락도 쥐지 않은 채 한다 — 부른 쪽이 accounts 락을 잡기 **전에** 부른다.
-fn known_profile_identities(daemon: &Arc<Daemon>, home: Option<&Path>, now: f64) -> Vec<(String, Option<String>)> {
-    let Some(h) = home else {
-        return Vec::new();
-    };
-    cys::profile_gate::enumerate_profile_dirs(h)
-        .into_iter()
-        .map(|dir| {
-            let who = folder_identity(daemon, home, &dir.to_string_lossy(), now);
-            (profile_short(home, &dir), who)
+fn known_profile_identities(daemon: &Arc<Daemon>, home: Option<&Path>, now: f64) -> Option<Vec<(String, FolderWho)>> {
+    let h = home?;
+    let dirs = enumerated_profile_dirs(daemon, h, now)?;
+    Some(
+        dirs.into_iter()
+            .map(|dir| {
+                let who = folder_identity_state(daemon, home, &dir.to_string_lossy(), now);
+                (profile_short(home, &dir), who)
+            })
+            .collect(),
+    )
+}
+
+/// 좌석 신원 표(`view.claude_folders`)의 폴더를 3값으로 — 신원을 읽은 폴더는 `Known`, 신원 표에서 None 인 폴더는 캐시 항목의 상태(`NoLogin`: 신원 없음 확정 · `Unread`: 읽지 못함)로 가른다(캐시 조회뿐 — 추가 IO 0 ·
+/// 항목이 없으면 `Unread` = 아직 모름). `local_json` 이 accounts 락을 잡기 **전에** 부른다.
+fn seat_folder_states(daemon: &Arc<Daemon>, view: &SeatIdentityView) -> Vec<(String, FolderWho)> {
+    view.claude_folders
+        .iter()
+        .map(|(folder, who)| {
+            let state = match who {
+                Some(account) => FolderWho::Known(account.clone()),
+                None => peek_folder_state(daemon, folder),
+            };
+            (folder.clone(), state)
         })
         .collect()
 }
 
-/// ★순수: 행의 `current_profiles` — claude 는 **현재 신원이 이 계정**인 알려진 폴더만(정렬·중복 제거 · 판독 실패 폴더는 누구의 것도 아니다 — `None == None` 을 '같다'로 치지 않는다).
+/// ★순수(R1F-US · m-1): 알려진 폴더 표에 **좌석 폴더**를 합친다 — 좌석 폴더의 3값 상태(`seat` — [`seat_folder_states`] · 이미 읽은 신원)를 같은 표기(`profile_short`)로 더한다(추가 IO 0). 열거 규칙 밖 좌석 폴더
+/// (`CYS_ACCOUNT_DIR=<임의>` · 부서 카탈로그의 임의 계정 폴더)를 쓰는 계정이 `in_use:true` 인데 `current_profiles:[]`(= 화면의 `● 사용 중` + `이전 로그인`)이 되는 모순을 없앤다. 같은 표기가 이미 있으면(열거된 폴더)
+/// 그대로 둔다 · 구분자(`\` 와 `/`)는 같은 것으로 본다(윈도우에서는 열거 경로와 보고 경로가 섞인다).
+fn merge_seat_folders(mut known: Vec<(String, FolderWho)>, home: Option<&Path>, seat: &[(String, FolderWho)]) -> Vec<(String, FolderWho)> {
+    for (folder, who) in seat {
+        let short = profile_short(home, Path::new(folder));
+        let norm = short.replace('\\', "/");
+        if !known.iter().any(|(p, _)| p.replace('\\', "/") == norm) {
+            known.push((short, who.clone()));
+        }
+    }
+    known
+}
+
+/// ★순수: 행의 `current_profiles` — claude 는 **현재 신원이 이 계정**인 알려진 폴더만(정렬·중복 제거 · 신원 없음·읽지 못함 폴더는 누구의 것도 아니다 — `None == None` 을 '같다'로 치지 않는다).
 /// 그 밖 provider(codex·agy·선언 계정)는 폴더당 계정 1개이고 신원 전환이 없으므로 그 행의 `profiles` 그대로. `profiles` 자체는 건드리지 않는다(추가 전용 · 이관·삭제 없음).
+/// ★R1F-US(m-2·ⓑ · 보정): **None = 키를 내지 않는다** — claude 행에서 ① 폴더 표를 못 얻었거나(`known` None — 홈 불명·열거 실패) ② 그 행의 `profiles` 에 든 폴더 가운데 이번에 신원을 **읽지 못한**
+/// 것(표에서 `Unread` — 판독 실패가 유예 뒤까지 이어졌거나 처음 보는 폴더를 아직 읽는 중)이 하나라도 있으면, `[]`(= 어디에도 로그인돼 있지 않음 = 화면의 '이전 로그인')을 단정하지 않는다(화면은 키 부재 → `profiles` 폴백).
+/// **신원 없음이 확정인 폴더(`NoLogin` — 로그아웃·신원 파일 없음)는 읽지 못한 것이 아니다** — '이 계정의 폴더가 아니다'로 세므로 그 계정의 다른 폴더가 없으면 `[]` 이다(9650334f 와 같다).
+/// 신원 판독이 일시 실패한 폴더는 [`folder_identity_state`] 가 직전 신원을 한 주기 더 쓰므로(`Known`) 여기까지 오지 않는다. `profiles` 와 표의 폴더는 구분자(`\` 와 `/`)를 같은 것으로 맞춰 비교한다(윈도우).
 fn current_profiles_for(
     provider: &str,
     account_id: &str,
     profiles: &BTreeSet<String>,
-    known: &[(String, Option<String>)],
-) -> Vec<String> {
+    known: Option<&[(String, FolderWho)]>,
+) -> Option<Vec<String>> {
     if provider != "claude" {
-        return profiles.iter().cloned().collect();
+        return Some(profiles.iter().cloned().collect());
     }
-    known
-        .iter()
-        .filter(|(_, who)| who.as_deref() == Some(account_id))
-        .map(|(p, _)| p.clone())
-        .collect::<BTreeSet<String>>()
-        .into_iter()
-        .collect()
+    let known = known?;
+    let norm = |p: &str| p.replace('\\', "/");
+    let unread: BTreeSet<String> = known.iter().filter(|(_, who)| *who == FolderWho::Unread).map(|(p, _)| norm(p)).collect();
+    if profiles.iter().any(|p| unread.contains(&norm(p))) {
+        return None;
+    }
+    Some(
+        known
+            .iter()
+            .filter(|(_, who)| who.account() == Some(account_id))
+            .map(|(p, _)| p.clone())
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -3253,6 +3512,8 @@ mod tests {
             crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1.0);
             assert_eq!(account_alerts(&d, seq0, KEY_A), 1);
             std::fs::remove_file(f.join(".claude.json")).unwrap();
+            // ★R1F-US: 워치독은 신원 파일을 읽지 않는다 — '판독 불가'가 캐시에 실리려면 RPC 의 읽기-통과 조회(60초 하한이 지난 뒤)가 한 번 지나가야 한다(이 검체의 전제를 채운다 · 단언은 그대로).
+            assert_eq!(seat_identity_view_in(&d, Some(&home), t0 + 61.0).current_for(_seat.id), None, "전제: 읽기-통과 조회가 지워진 신원을 판독 불가로 실었다");
             for dt in [70.0, 1799.0, 1801.0] {
                 crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + dt);
             }
@@ -3283,6 +3544,8 @@ mod tests {
             assert_eq!(account_alerts(&d2, seq0, KEY_A), 0, "사용 중이 아닌 2시간 전 복원값이 발화했다");
             assert!(b3_resolved(&d2, seq0).is_empty(), "발화한 적 없는 키에 해소 알림이 나갔다");
             let _seat = b3_seat(&d2, "worker-b3-r", "claude", Some(&f));
+            // ★R1F-US: 워치독은 캐시만 본다 — 좌석 폴더의 현재 신원(A)을 읽기-통과 조회로 먼저 실어, '일치하는 좌석이 있어서 발화'를 검체가 계속 본다(캐시가 비었어도 판정 불가 = 사용 중이라 발화는 하지만 이유가 다르다).
+            assert_eq!(seat_identity_view_in(&d2, Some(&home), t0 + 30.0).current_for(_seat.id), Some("u-b3-a"), "전제: 좌석 폴더의 현재 신원이 캐시에 실렸다");
             crate::governance::check_alerts_with(&d2, &mut fired, &cfg, t0 + 31.0);
             assert_eq!(account_alerts(&d2, seq0, KEY_A), 1, "그 계정을 쓰는 좌석이 있는데 복원값이 발화하지 않았다");
             let _ = std::fs::remove_dir_all(&dir);
@@ -3300,6 +3563,8 @@ mod tests {
             let _seat = b3_seat(&d, "worker-b3", "claude", Some(&fb));
             let t0 = crate::state::now_epoch();
             let seq0 = d.bus.latest_seq();
+            // ★R1F-US: 워치독은 신원 파일을 읽지 않고 캐시만 본다 — 좌석 폴더(fb)의 현재 신원(B)을 RPC 의 읽기-통과 조회로 먼저 캐시에 싣는다(이 검체의 전제를 채운다 · 단언은 그대로).
+            assert_eq!(seat_identity_view_in(&d, Some(&home), t0).current_for(_seat.id), Some("u-b3-b"), "전제: 좌석 폴더의 현재 신원이 캐시에 실렸다");
             assert!(note_rate_for_profile_at(&d, Some(&home), &fa, &[rw("5h", 99.0, Some(t0 + 20_000.0))], "statusline", t0));
             let mut fired: HashMap<String, f64> = HashMap::new();
             fired.insert(KEY_A.to_string(), t0 + 1790.0); // A 가 마지막으로 발행된 시각 — REMIND 1800초 창이 아직 열려 있다
@@ -3731,15 +3996,16 @@ mod tests {
             assert!(view < lock, "local_json 이 accounts 락을 잡은 **뒤에** 신원 표를 만든다(파일 IO 가 락 안)");
             let c = func("fn collect_seat_rows(");
             assert!(c.contains("daemon.surfaces.lock()"), "좌석 표 복사가 surfaces 락을 잡지 않는다(핀 앵커 소실)");
-            for io in ["folder_identity(", "claude_identity_unlocked(", "std::fs::", "read_identity_file(", "identity_file_meta(", "accounts.lock("] {
+            for io in ["folder_identity(", "claude_identity_unlocked(", "claude_identity_probe(", "peek_folder_ident(", "std::fs::", "read_identity_file(", "read_identity_outcome(", "identity_file_meta(", "accounts.lock("] {
                 assert!(!c.contains(io), "surfaces 락 안(좌석 표 복사)에서 {io} 를 부른다");
             }
             let v = func("pub(crate) fn seat_identity_view_in(");
             let (copy, read) = (v.find("collect_seat_rows(").expect("복사 호출"), v.find("folder_identity(").expect("판독 호출"));
             assert!(copy < read, "신원 판독이 좌석 표 복사(surfaces 락 해제) 앞에 있다");
             assert!(!v.contains("accounts.lock("), "신원 표 본체가 accounts 락을 직접 잡는다(겹쳐 쥐는 간선)");
-            let f = func("fn folder_identity(");
-            let cache_lock_end = f.find("let who = claude_identity_unlocked(").expect("실판독 호출");
+            let f = func("fn folder_identity_state(");
+            // ★R1F-US: 실판독 앵커가 `claude_identity_unlocked`(Option) → `claude_identity_probe`(3값)로 바뀌었다 — 계약(캐시 락은 조회·선점 한 번 · 기록 한 번, 판독은 그 사이 무락)은 그대로다.
+            let cache_lock_end = f.find("claude_identity_probe(").expect("실판독 호출");
             assert!(f[..cache_lock_end].matches("seat_ident_cache.lock()").count() == 1 && f[cache_lock_end..].contains("seat_ident_cache.lock()"), "캐시 락은 조회·기록 때만 순간 잡는다(판독을 사이에 두고 두 번)");
             let rw = func("pub fn alert_rates_with(");
             assert!(!rw.contains("seat_identity_view") && !rw.contains("std::fs::"), "alert_rates_with 가 accounts 락 안에서 신원을 판독한다");
@@ -3846,8 +4112,9 @@ mod tests {
             (st.alias.stats, st.alias.reads, st.alias.table.get(key).cloned())
         }
 
-        fn known(pairs: &[(&str, Option<&str>)]) -> Vec<(String, Option<String>)> {
-            pairs.iter().map(|(p, w)| (p.to_string(), w.map(str::to_string))).collect()
+        /// 폴더 표 한 장 — `Some(a)` = `Known(a)` · `None` = 신원 없음 확정(`NoLogin` — 어느 계정의 폴더도 아니다). 읽지 못함(`Unread`)은 새 검체(`r1f_*`)가 직접 만든다.
+        fn known(pairs: &[(&str, Option<&str>)]) -> Vec<(String, FolderWho)> {
+            pairs.iter().map(|(p, w)| (p.to_string(), w.map_or(FolderWho::NoLogin, |a| FolderWho::Known(a.to_string())))).collect()
         }
 
         // ───────────────────────── current_profiles ─────────────────────────
@@ -3908,20 +4175,25 @@ mod tests {
         /// 그 밖 provider: profiles 그대로 · 폴더 목록이 비면(홈 불명) 빈 배열.
         #[test]
         fn b1_current_profiles_for_table() {
+            // ★R1F-US: 반환형이 `Option<Vec<_>>`(None = 키를 내지 않는다) · 폴더 표가 `Option<&[_]>`(None = 홈 불명·열거 실패)로 바뀌었다. 아래 옛 단언은 '키를 내는' 경우(Some)를 **그대로** 본다 —
+            // 키 부재 경우는 새 검체 `r1f_current_profiles_key_is_absent_when_a_profiles_folder_is_unread_or_the_listing_failed`.
+            let cp = |p: &str, a: &str, pr: &BTreeSet<String>, k: &[(String, FolderWho)]| {
+                current_profiles_for(p, a, pr, Some(k)).expect("키를 내야 하는 경우인데 None")
+            };
             let profiles: BTreeSet<String> = s(&[".cys/claude-b1", ".claude-b1z"]).into_iter().collect();
             let k = known(&[(".cys/claude-b1", Some("A")), (".claude-b1x", Some("B")), (".claude-b1bad", None), (".claude-b1y", Some("A")), (".cys/claude-b1", Some("A"))]);
-            assert_eq!(current_profiles_for("claude", "A", &profiles, &k), s(&[".claude-b1y", ".cys/claude-b1"]), "일치하는 폴더만 · 정렬 · 중복 제거");
-            assert_eq!(current_profiles_for("claude", "B", &profiles, &k), s(&[".claude-b1x"]));
-            assert!(current_profiles_for("claude", "C", &profiles, &k).is_empty(), "아무 폴더도 아니면 빈 배열(profiles 에 남은 폴더는 무관)");
-            assert!(current_profiles_for("claude", "", &profiles, &k).is_empty(), "판독 실패(None) 폴더가 빈 account_id 와 같다고 읽혔다(None==None 함정)");
-            assert!(!current_profiles_for("claude", "A", &profiles, &k).iter().any(|p| p.contains("bad")), "판독 실패 폴더가 current 에 들어갔다");
-            assert!(current_profiles_for("claude", "A", &profiles, &[]).is_empty(), "알려진 폴더가 없으면(홈 불명) 빈 배열");
+            assert_eq!(cp("claude", "A", &profiles, &k), s(&[".claude-b1y", ".cys/claude-b1"]), "일치하는 폴더만 · 정렬 · 중복 제거");
+            assert_eq!(cp("claude", "B", &profiles, &k), s(&[".claude-b1x"]));
+            assert!(cp("claude", "C", &profiles, &k).is_empty(), "아무 폴더도 아니면 빈 배열(profiles 에 남은 폴더는 무관)");
+            assert!(cp("claude", "", &profiles, &k).is_empty(), "판독 실패(None) 폴더가 빈 account_id 와 같다고 읽혔다(None==None 함정)");
+            assert!(!cp("claude", "A", &profiles, &k).iter().any(|p| p.contains("bad")), "판독 실패 폴더가 current 에 들어갔다");
+            assert!(cp("claude", "A", &profiles, &[]).is_empty(), "열거는 성공했지만 알려진 폴더가 0개면 빈 배열");
             let codex: BTreeSet<String> = s(&[".codex"]).into_iter().collect();
-            assert_eq!(current_profiles_for("codex", "default", &codex, &k), s(&[".codex"]), "codex 는 profiles 그대로");
+            assert_eq!(cp("codex", "default", &codex, &k), s(&[".codex"]), "codex 는 profiles 그대로");
             let agy: BTreeSet<String> = s(&[".gemini/antigravity-cli", ".antigravity"]).into_iter().collect();
-            assert_eq!(current_profiles_for("antigravity", "default", &agy, &k), s(&[".antigravity", ".gemini/antigravity-cli"]), "agy 는 profiles 그대로(정렬된 집합)");
-            assert!(current_profiles_for("codex", "default", &BTreeSet::new(), &k).is_empty(), "profiles 가 비면 빈 배열");
-            assert!(current_profiles_for("grok", "default", &BTreeSet::new(), &k).is_empty(), "선언 계정(그 밖 provider)도 profiles 그대로");
+            assert_eq!(cp("antigravity", "default", &agy, &k), s(&[".antigravity", ".gemini/antigravity-cli"]), "agy 는 profiles 그대로(정렬된 집합)");
+            assert!(cp("codex", "default", &BTreeSet::new(), &k).is_empty(), "profiles 가 비면 빈 배열");
+            assert!(cp("grok", "default", &BTreeSet::new(), &k).is_empty(), "선언 계정(그 밖 provider)도 profiles 그대로");
         }
 
         /// 알려진 프로필 폴더 표 — 열거 정본(기본 프로필 `~/.claude` 포함)·`profile_short` 표기·B3 의 60초 캐시 재사용(좌석 신원 표가 이미 읽은 폴더는 다시 stat 하지 않는다 · 새 캐시 없음)·
@@ -3938,20 +4210,20 @@ mod tests {
             write(&home.join(".claude-b1bad/.claude.json"), "{not json");
             let _seat = b3_seat(&d, "worker-b1", "claude", Some(&fa));
             let t0 = crate::state::now_epoch();
-            let sorted = |v: Vec<(String, Option<String>)>| {
-                let mut v: Vec<(String, Option<String>)> = v.into_iter().map(|(p, w)| (p.replace('\\', "/"), w)).collect(); // 윈도우 열거 경로의 `\` 를 접는다
-                v.sort();
+            let sorted = |v: Vec<(String, FolderWho)>| {
+                let mut v: Vec<(String, FolderWho)> = v.into_iter().map(|(p, w)| (p.replace('\\', "/"), w)).collect(); // 윈도우 열거 경로의 `\` 를 접는다
+                v.sort_by(|a, b| a.0.cmp(&b.0));
                 v
             };
             // 좌석 신원 표가 좌석 폴더를 먼저 읽는다 → 같은 캐시이므로 알려진 폴더 표는 그 폴더를 다시 읽지 않는다
             let _ = seat_identity_view_in(&d, Some(&home), t0);
             assert_eq!(d.seat_ident_cache.lock().unwrap().reads, 1);
-            let got = sorted(known_profile_identities(&d, Some(&home), t0 + 1.0));
-            assert_eq!(
-                got,
-                known(&[(".claude", Some("u-b1-d")), (".claude-b1bad", None), (".claude-b1x", Some("u-b1-b")), (".cys/claude-b1", Some("u-b1-a"))]),
-                "열거 정본·표기·기본 프로필(홈 직하 신원)·판독 실패(None)"
-            );
+            let got = sorted(known_profile_identities(&d, Some(&home), t0 + 1.0).expect("열거 성공(R1F-US: 반환형 Option)"));
+            // ★R1F-US(보정): 표의 값이 3값이다 — 파싱이 안 되는 신원 파일(`{not json`)은 '읽지 못함'(`Unread` — 직전 신원이 없어 유예 없이)이고, 신원 없음 확정(`NoLogin`)과 다르다.
+            let mut want = known(&[(".claude", Some("u-b1-d")), (".claude-b1x", Some("u-b1-b")), (".cys/claude-b1", Some("u-b1-a"))]);
+            want.push((".claude-b1bad".to_string(), FolderWho::Unread));
+            want.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(got, want, "열거 정본·표기·기본 프로필(홈 직하 신원)·읽지 못함(Unread)");
             {
                 let c = d.seat_ident_cache.lock().unwrap();
                 assert_eq!((c.reads, c.hits), (4, 1), "좌석 폴더 1 + 나머지 3 = 실판독 4 · 좌석 폴더는 적중 1 — 캐시가 갈렸거나 새 캐시를 만들었다");
@@ -3963,12 +4235,12 @@ mod tests {
             assert_eq!(d.seat_ident_cache.lock().unwrap().reads, 4, "60초 하한 안에서 폴더를 다시 판독했다");
             // 파일을 지워도(= 관측) 하한 안에서는 옛 신원 · 하한이 지나면 다시 본다
             std::fs::remove_file(home.join(".claude.json")).unwrap();
-            let got = sorted(known_profile_identities(&d, Some(&home), t0 + 59.5));
-            assert_eq!(got[0], (".claude".to_string(), Some("u-b1-d".to_string())), "하한 안인데 기본 프로필 신원이 바뀌었다");
-            let got = sorted(known_profile_identities(&d, Some(&home), t0 + 200.0));
-            assert_eq!(got[0], (".claude".to_string(), None), "하한이 지났는데 지워진 신원이 그대로다");
+            let got = sorted(known_profile_identities(&d, Some(&home), t0 + 59.5).expect("열거 성공"));
+            assert_eq!(got[0], (".claude".to_string(), FolderWho::Known("u-b1-d".to_string())), "하한 안인데 기본 프로필 신원이 바뀌었다");
+            let got = sorted(known_profile_identities(&d, Some(&home), t0 + 200.0).expect("열거 성공"));
+            assert_eq!(got[0], (".claude".to_string(), FolderWho::NoLogin), "하한이 지났는데 지워진 신원이 그대로다(파일이 없어진 것은 신원 없음 확정 — 읽지 못함이 아니다)");
             // 홈 불명 → 빈 표(파일을 보지 않는다)
-            assert!(known_profile_identities(&d, None, t0).is_empty());
+            assert!(known_profile_identities(&d, None, t0).is_none(), "홈 불명은 목록을 못 얻은 것(None) — R1F-US: 부른 쪽이 current_profiles 키를 내지 않는다");
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -4329,7 +4601,19 @@ mod tests {
                 assert!(at < lock, "local_json 이 accounts 락을 잡은 **뒤에** {pre} 를 부른다(파일 IO 가 락 안)");
             }
             let under_lock = &lj[lock..];
-            for io in ["std::fs::", "enumerate_profile_dirs(", "folder_identity(", "known_profile_identities(", "refresh_aliases(", "alias_file_sig(", "read_alias_file(", "account_home("] {
+            for io in [
+                "std::fs::",
+                "enumerate_profile_dirs(",
+                "folder_identity(",
+                "folder_identity_state(",
+                "peek_folder_state(",
+                "seat_folder_states(",
+                "known_profile_identities(",
+                "refresh_aliases(",
+                "alias_file_sig(",
+                "read_alias_file(",
+                "account_home(",
+            ] {
                 assert!(!under_lock.contains(io), "local_json 의 accounts 락 안에서 {io} 를 부른다");
             }
             assert!(under_lock.contains("current_profiles_for(") && under_lock.contains("alias_for("), "행 가산 키가 순수 함수에서 오지 않는다");
@@ -4343,11 +4627,18 @@ mod tests {
                 assert!(r[l1..at].contains("\n    };"), "{io} 앞에서 하한 판정 락 블록이 닫히지 않았다(락을 쥔 채 파일 IO)");
             }
             // known_profile_identities: 열거 정본 + B3 캐시 도우미만 — 직접 락·직접 캐시 접근·신원 재구현 없음
+            // ★R1F-US(m-5): 열거도 같은 60초 하한 캐시에 둔다 — `known_profile_identities` 는 열거 캐시 도우미(`enumerated_profile_dirs`)와 B3 의 `folder_identity` 만 부르고(직접 락·직접 캐시 접근·열거 정본 직접 호출·신원 재구현 없음),
+            // 열거 정본 호출은 도우미 안에서 **두 번의 순간 캐시 락 사이**(선점 → IO → 기록)에서만 한다.
             let k = func("fn known_profile_identities(");
-            assert!(k.contains("cys::profile_gate::enumerate_profile_dirs(") && k.contains("folder_identity("), "열거 정본 또는 B3 캐시 도우미를 쓰지 않는다");
-            for bad in ["lock(", "seat_ident_cache", "claude_identity", "read_identity_file(", "identity_file_meta(", "HashMap"] {
-                assert!(!k.contains(bad), "known_profile_identities 가 {bad} 를 쓴다(새 캐시·새 락 간선)");
+            assert!(k.contains("enumerated_profile_dirs(") && k.contains("folder_identity_state("), "열거 캐시 도우미 또는 B3 캐시 도우미(3값 읽기-통과)를 쓰지 않는다");
+            for bad in ["lock(", "seat_ident_cache", "claude_identity", "read_identity_file(", "identity_file_meta(", "HashMap", "enumerate_profile_dirs(", "std::fs::"] {
+                assert!(!k.contains(bad), "known_profile_identities 가 {bad} 를 쓴다(새 캐시·새 락 간선 · 열거를 캐시 밖에서 한다)");
             }
+            let e = func("fn enumerated_profile_dirs(");
+            let (l1, io, l2) = (e.find("seat_ident_cache.lock()").expect("락 1"), e.find("cys::profile_gate::enumerate_profile_dirs(").expect("열거 정본"), e.rfind("seat_ident_cache.lock()").expect("락 2"));
+            assert!(l1 < io && io < l2, "열거 정본 호출이 두 순간 캐시 락 사이가 아니다(락을 쥔 채 read_dir)");
+            assert!(e[l1..io].contains("\n    }\n"), "열거 앞에서 조회·선점 락 블록이 닫히지 않았다(락을 쥔 채 read_dir)");
+            assert!(e[l1..io].contains("c.enumerated = Some("), "열거 전에 선점(`(now, 옛 값)`)이 없다 — 멈춘 디스크에서 호출마다 열거에 묶인다");
             // 순수 함수: 파일 IO·락 없음
             for head in ["fn sanitize_alias(", "fn parse_alias_table(", "fn alias_for<", "fn current_profiles_for("] {
                 let f = func(head);
@@ -4686,6 +4977,863 @@ mod tests {
             // 프로덕션 구간 전체에서 선언 계정 파일을 무제한 판독으로 여는 곳이 없다
             let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
             assert!(!prod.contains("read_to_string(&decl)"), "프로덕션에 선언 계정 파일의 무제한 판독이 남아 있다");
+        }
+    }
+
+    // ═════════ ★0.14.43(R1F-US · 성찰 1회차 수정) — 워치독의 신원 판독 제거 · 판독 실패 내성 · 열거 캐시 · 열거 밖 좌석 폴더 · 경보 키 메타 · 별명 ═════════
+    // 픽스처는 전부 합성값이다(u-b3-a · a-b3@example.test · u-r1-* 등) — 실계정 식별자 금지. 시각은 주입한다(실시간 대기 없음 — 60초 하한은 `now` 로 센다). 홈은 임시 폴더이고 [`test_home`] 이음매가 **이 스레드의**
+    // `account_home()` 만 바꾼다. 표시: 검체 이름 앞의 `r1f_` = 이 라운드의 새 검체(수정 전 코드에서 적색이거나 새 API 를 쓰는 것은 WORKLOG 의 돌연변이 표에 적색 로그를 붙였다).
+    mod r1f_us {
+        use super::b3_scenarios::{b3_events, b3_fixture, b3_login, b3_resolved, b3_seat, KEY_A};
+        use super::*;
+
+        fn row(rows: &Value, id: &str) -> Value {
+            rows.as_array().unwrap().iter().find(|r| r["account_id"] == id).cloned().unwrap_or_else(|| panic!("행 {id} 없음: {rows}"))
+        }
+
+        /// 문자열 배열 → 정렬·중복 제거한 목록(윈도우의 `\` 는 `/` 로 접는다 — 화면의 `normalizeProfile` 과 같다).
+        fn strs(v: &Value) -> Vec<String> {
+            v.as_array()
+                .unwrap_or_else(|| panic!("배열이 아니다: {v}"))
+                .iter()
+                .map(|x| x.as_str().unwrap().replace('\\', "/"))
+                .collect::<BTreeSet<String>>()
+                .into_iter()
+                .collect()
+        }
+
+        fn s(items: &[&str]) -> Vec<String> {
+            items.iter().map(|x| x.to_string()).collect()
+        }
+
+        /// 폴더 표 한 장 — 값 표기: `"A"` = `Known("A")` · `"-"` = `NoLogin`(신원 없음 확정) · `"?"` = `Unread`(이번에 읽지 못함).
+        fn known_pairs(pairs: &[(&str, &str)]) -> Vec<(String, FolderWho)> {
+            pairs
+                .iter()
+                .map(|(p, w)| {
+                    let who = match *w {
+                        "-" => FolderWho::NoLogin,
+                        "?" => FolderWho::Unread,
+                        a => FolderWho::Known(a.to_string()),
+                    };
+                    (p.to_string(), who)
+                })
+                .collect()
+        }
+
+        const ID_W: &str = r#"{"oauthAccount":{"accountUuid":"u-r1-w","emailAddress":"w-r1@example.test"}}"#;
+
+        /// 신원 파일을 임의 본문으로 쓴다(mtime 은 `bump` 로 맞춘다 — 같은 초 안에 다시 써도 mtime 이 달라지게).
+        fn put_body(folder: &Path, body: &str, bump: u64) {
+            let p = folder.join(".claude.json");
+            write(&p, body);
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + bump);
+            std::fs::File::options().write(true).open(&p).unwrap().set_modified(t).unwrap();
+        }
+
+        const ID_A: &str = r#"{"oauthAccount":{"accountUuid":"u-b3-a","emailAddress":"a-b3@example.test"}}"#;
+
+        /// 좌석의 관측 스냅샷을 직접 싣는다 — 좌석 축 경보 입력(`rate_account` = 보고 시점 신원 · `rate_observed_at` = rate 가 새로 생산된 시각).
+        fn put_usage(s: &Arc<crate::state::Surface>, pct: f64, resets: f64, observed_at: f64, rate_account: Option<&str>) {
+            *s.observed_usage.lock().unwrap() = Some(ObservedUsage {
+                agent: "claude".into(),
+                ctx_tokens: None,
+                ctx_window: None,
+                ctx_pct: None,
+                rate: vec![rw("5h", pct, Some(resets))],
+                source: "statusline".into(),
+                session_file: String::new(),
+                updated_at: observed_at,
+                rate_observed_at: observed_at,
+                rate_account: rate_account.map(str::to_string),
+            });
+        }
+
+        fn counters(d: &Arc<Daemon>) -> (u64, u64, usize) {
+            let c = d.seat_ident_cache.lock().unwrap();
+            (c.reads, c.hits, c.entries.len())
+        }
+
+        // ───────────────────────── [M-1] 워치독은 신원 파일을 읽지 않는다 ─────────────────────────
+
+        /// ★M-1·①: 워치독이 쓰는 신원 표(`seat_identity_view_cached`)는 **판독 금지**다 — 캐시가 비면 None(판정 불가 · 모든 claude 계정 `None` = 사용 중으로 취급), 항목이 있으면 만료됐어도 **마지막 값**
+        /// (신원 파일을 바꾸거나 지워도 본 값은 그대로 · 계측 `reads`·`hits`·항목 수 불변). 읽기-통과 조회가 지나가야 새 값이 실린다.
+        #[test]
+        fn r1f_watchdog_view_is_cache_only_an_empty_cache_is_unknown_and_an_expired_entry_keeps_its_last_value() {
+            let (d, dir, home, f) = b3_fixture("r1a");
+            let seat = b3_seat(&d, "worker-r1", "claude", Some(&f));
+            let key = f.to_string_lossy().into_owned();
+            // ① 캐시가 비었다 → 판정 불가(None) · 어떤 파일도 읽지 않았다
+            let v = seat_identity_view_cached(&d);
+            assert!(v.collect_ok);
+            assert_eq!(v.claude_folders, vec![(key.clone(), None)], "빈 캐시인데 폴더 신원이 판독됐다(워치독이 파일을 읽었다)");
+            assert_eq!(v.current_for(seat.id), None);
+            assert_eq!(account_in_use("claude", "u-b3-a", &v), None, "빈 캐시 = 판정 불가 = 사용 중으로 취급(경보 유지)");
+            assert_eq!(counters(&d), (0, 0, 0), "캐시 전용 조회가 계측·항목을 건드렸다");
+            // ② 읽기-통과 조회가 캐시를 채운다 — 아주 옛 시각(1970)으로 채워 '이미 만료된 항목'을 만든다
+            assert_eq!(seat_identity_view_in(&d, Some(&home), 1000.0).current_for(seat.id), Some("u-b3-a"));
+            assert_eq!(counters(&d), (1, 0, 1));
+            // ③ 만료된 항목도 마지막 값을 낸다 · 신원 파일을 B 로 바꾸거나 지워도 본 값은 그대로(파일을 열지도 stat 하지도 않는다) · 계측 불변
+            b3_login(&home, ".cys/claude-b3", "u-b3-b", "b-b3@example.test", 9);
+            assert_eq!(seat_identity_view_cached(&d).current_for(seat.id), Some("u-b3-a"), "워치독 조회가 바뀐 신원 파일을 읽었다");
+            std::fs::remove_file(f.join(".claude.json")).unwrap();
+            let v = seat_identity_view_cached(&d);
+            assert_eq!(v.current_for(seat.id), Some("u-b3-a"), "워치독 조회가 지워진 신원 파일을 봤다");
+            assert_eq!(account_in_use("claude", "u-b3-a", &v), Some(true));
+            assert_eq!(counters(&d), (1, 0, 1), "캐시 전용 조회가 계측·항목을 건드렸다");
+            // ④ 읽기-통과 조회(60초 하한이 지난 시각)가 지나가야 새 값이 실린다 — 지워진 신원은 판독 불가(None)
+            assert_eq!(seat_identity_view_in(&d, Some(&home), 2000.0).current_for(seat.id), None);
+            assert_eq!(seat_identity_view_cached(&d).current_for(seat.id), None);
+            assert_eq!(counters(&d).0, 2);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// ★M-1 핵심(동작): 경보 틱(`check_alerts_with`)은 신원 파일을 읽지 않는다 — 좌석이 A 로 보고한 뒤 폴더 로그인이 B 로 바뀌어도(보고·조회 없이) +1801초 틱은 캐시의 A 를 쓴다(A 는 사용 중 → 경보 유지 · REMIND 재발행).
+        /// 읽기-통과 조회(RPC)가 한 번 지나가면 그때 비로소 B 가 실려 A 가 소멸한다(해소 알림 stale 1건). 종전 코드는 틱이 만료된 캐시를 스스로 다시 읽어 +1801초에 A 를 소멸시켰다(적색).
+        #[test]
+        fn r1f_alert_tick_never_reads_the_identity_file_so_a_login_switch_is_seen_only_after_a_report_or_a_query() {
+            let (d, dir, home, f) = b3_fixture("r1b");
+            let cfg = crate::alerts::AlertConfig::default();
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            let _seat = b3_seat(&d, "worker-r1", "claude", Some(&f));
+            let t0 = crate::state::now_epoch();
+            let seq0 = d.bus.latest_seq();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1.0);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 1, "전제: A 99% 가 발화했다");
+            // 폴더 로그인을 B 로 바꾼다 — 그러나 보고도 조회도 없다
+            b3_login(&home, ".cys/claude-b3", "u-b3-b", "b-b3@example.test", 2);
+            for dt in [70.0, 1799.0, 1801.0] {
+                crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + dt);
+            }
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 2, "틱이 신원 파일을 다시 읽어 +1801초에 A 를 소멸시켰다(워치독이 파일을 읽는다) — 캐시의 A(사용 중)면 REMIND 재발행이 맞다");
+            assert!(b3_resolved(&d, seq0).is_empty(), "캐시의 신원이 A 인데 해소 알림이 나갔다: {:?}", b3_resolved(&d, seq0));
+            assert_eq!(d.seat_ident_cache.lock().unwrap().reads, 0, "경보 틱이 신원 실판독 계수를 올렸다");
+            // 읽기-통과 조회(RPC)가 한 번 지나가면(60초 하한이 지난 시각) 새 신원이 캐시에 실리고 다음 틱이 그것을 본다 → A 는 더는 쓰이지 않는다(관측 1800초 초과) → 소멸
+            let _ = seat_identity_view_in(&d, Some(&home), t0 + 1802.0);
+            assert_eq!(d.seat_ident_cache.lock().unwrap().reads, 1);
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1810.0);
+            assert_eq!(account_alerts(&d, seq0, KEY_A), 2, "소멸해야 할 A 가 다시 발행됐다");
+            assert_eq!(b3_resolved(&d, seq0), vec![(KEY_A.to_string(), "stale".to_string())], "RPC 조회가 새 신원을 실은 뒤의 틱에서 A 가 붙들림 소멸(stale)해야 한다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// ★M-1·②: 상태줄 보고가 좌석 신원 캐시를 채운다(추가 IO 0) — 보고 직후 읽기-통과 조회는 파일을 다시 읽지 않고(실판독 0) 캐시 전용 조회도 그 신원을 본다. 로그인이 바뀐 뒤의 새 보고는 캐시를 새 신원으로 갈고,
+        /// 더 새로 기록된 항목은 옛 시각의 보고로 덮지 않으며, 창 밖 보고(표시용)는 캐시를 채우지 않는다.
+        #[test]
+        fn r1f_a_report_fills_the_identity_cache_without_reading_again() {
+            let (d, dir, home, f) = b3_fixture("r1c");
+            let seat = b3_seat(&d, "worker-r1", "claude", Some(&f));
+            let t0 = crate::state::now_epoch();
+            assert_eq!(counters(&d), (0, 0, 0));
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 40.0, Some(t0 + 7200.0))], "statusline", t0));
+            assert_eq!(counters(&d), (0, 0, 1), "보고가 캐시를 채우지 않았다(또는 추가 판독을 했다)");
+            assert_eq!(seat_identity_view_cached(&d).current_for(seat.id), Some("u-b3-a"));
+            // 읽기-통과 조회(하한 안)는 적중 — 파일을 다시 읽지 않는다
+            assert_eq!(seat_identity_view_in(&d, Some(&home), t0 + 10.0).current_for(seat.id), Some("u-b3-a"));
+            assert_eq!(counters(&d), (0, 1, 1), "보고 직후 조회가 파일을 다시 읽었다");
+            // 로그인이 B 로 바뀐 뒤 새 보고(B)가 오면 캐시가 B 로 갈린다 — 창이 닫혀 있어도(조회 없이) 워치독 표가 B 를 본다
+            b3_login(&home, ".cys/claude-b3", "u-b3-b", "b-b3@example.test", 2);
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 10.0, Some(t0 + 9000.0))], "statusline", t0 + 20.0));
+            assert_eq!(seat_identity_view_cached(&d).current_for(seat.id), Some("u-b3-b"), "새 로그인으로 보고했는데 캐시가 옛 신원이다");
+            // 더 새로 기록된 항목은 옛 시각의 보고가 덮지 않는다(t0+20 에 B 를 기록한 뒤, 파일을 A 로 되돌려 t0+5 시각으로 보고해도 캐시는 B 그대로)
+            b3_login(&home, ".cys/claude-b3", "u-b3-a", "a-b3@example.test", 3);
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 11.0, Some(t0 + 9000.0))], "statusline", t0 + 5.0));
+            assert_eq!(seat_identity_view_cached(&d).current_for(seat.id), Some("u-b3-b"), "더 새로 기록된 항목을 옛 시각의 보고가 덮었다");
+            // 시계가 크게 뒤로 간 경우(60초보다 먼 미래의 항목)는 만료로 보고 덮는다 — 캐시가 영구히 붙지 않는다(`folder_identity` 와 같은 규율)
+            let key = f.to_string_lossy().into_owned();
+            assert_eq!(folder_identity(&d, Some(&home), &key, t0 + 100_000.0).as_deref(), Some("u-b3-a"), "전제: 먼 미래 시각의 항목(A)");
+            b3_login(&home, ".cys/claude-b3", "u-b3-b", "b-b3@example.test", 4);
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 12.0, Some(t0 + 9000.0))], "statusline", t0 + 40.0));
+            assert_eq!(seat_identity_view_cached(&d).current_for(seat.id), Some("u-b3-b"), "시계가 크게 뒤로 갔는데 먼 미래의 항목을 보고가 덮지 못했다(캐시가 영구히 붙는다)");
+            // 창 밖 보고(표시용)는 캐시를 채우지 않는다
+            let o = outside_profile(&home, ".claude-r1o", "u-r1-o", "o-r1@example.test");
+            let before = counters(&d).2;
+            assert_eq!(report_outside_at(&d, Some(&home), &o, &[rw("5h", 5.0, None)], t0 + 30.0), Ok(OutsideOutcome::Accepted));
+            assert_eq!(counters(&d).2, before, "창 밖 보고가 좌석 신원 캐시를 채웠다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// ★M-1·③ 선점: 읽기-통과는 캐시 미스일 때 IO **전에** `(now, 옛 값)` 으로 자리를 찍는다 — 판독이 멈춰도(여기서는 accounts 락을 쥔 채 판독 스레드를 세워 흉내 낸다 — `claude_identity_probe` 가 mtime 캐시 조회에서 그 락에
+        /// 막힌다) 같은 폴더를 다시 묻는 호출은 막히지 않고 옛 값을 받는다(폴더당 60초에 요청 하나만 묶인다). 선점이 없으면 두 번째 호출도 같은 락에서 막힌다(적색 — 검체 스레드가 남지 않게 마지막에 락을 놓는다).
+        #[test]
+        fn r1f_a_stalled_read_blocks_one_request_per_folder_per_minute_because_the_slot_is_taken_before_the_io() {
+            let (d, dir, home, f) = b3_fixture("r1d");
+            let key = f.to_string_lossy().into_owned();
+            let t0 = 1_800_000_000.0;
+            assert_eq!(folder_identity(&d, Some(&home), &key, t0).as_deref(), Some("u-b3-a"));
+            let guard = d.accounts.lock().unwrap(); // '멈춘 IO' — 판독이 이 락에서 멈춘다
+            let (tx1, rx1) = std::sync::mpsc::channel();
+            {
+                let (d1, home1, key1) = (d.clone(), home.clone(), key.clone());
+                std::thread::spawn(move || {
+                    let _ = tx1.send(folder_identity(&d1, Some(&home1), &key1, t0 + 61.0));
+                });
+            }
+            // 첫 호출이 IO 에 들어가기 전에 자리를 찍었다 — 캐시 항목의 확인 시각이 t0+61 이 된다
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let marked = loop {
+                let at = d.seat_ident_cache.lock().unwrap().entries.get(Path::new(&key)).map(|slot| slot.at);
+                if at == Some(t0 + 61.0) {
+                    break true;
+                }
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            // 두 번째 호출(하한 안) — 막히지 않고 옛 값을 받는다
+            let (tx2, rx2) = std::sync::mpsc::channel();
+            if marked {
+                let (d2, home2, key2) = (d.clone(), home.clone(), key.clone());
+                std::thread::spawn(move || {
+                    let _ = tx2.send(folder_identity(&d2, Some(&home2), &key2, t0 + 62.0));
+                });
+            }
+            let second = marked.then(|| rx2.recv_timeout(std::time::Duration::from_secs(3)));
+            drop(guard); // '멈춘 IO' 해제 — 첫 호출이 끝난다
+            let first = rx1.recv_timeout(std::time::Duration::from_secs(5));
+            assert!(marked, "읽기-통과가 IO 전에 자리를 찍지 않았다(멈춘 디스크에서 같은 폴더를 묻는 모든 호출이 같은 IO 에 묶인다)");
+            assert_eq!(
+                second.expect("marked").expect("두 번째 호출이 첫 호출의 멈춘 IO 에 묶였다").as_deref(),
+                Some("u-b3-a"),
+                "선점 중 다른 호출은 옛 값을 받는다"
+            );
+            assert_eq!(first.expect("첫 호출이 끝나지 않았다").as_deref(), Some("u-b3-a"));
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 소스 핀(M-1): 워치독 진입점(`check_alerts_with_stale`)에서 닿는 **신원 경로**의 함수 사슬에 신원 파일 접근이 없다 — 진입점은 캐시 전용 스냅샷만 부르고, 사슬의 함수(캐시 전용 스냅샷 · 본체 · 캐시 전용 신원 표 ·
+        /// 캐시 조회 · 좌석 표 복사 · 조립 · 계정 축 행)에 `folder_identity(`(읽기-통과)·`claude_identity_*`·`std::fs::`·`identity_file_meta(`·`read_identity_*`·`enumerate_profile_dirs(` 가 없다.
+        /// (상태 폴더 `read_dir`(게이트 배지)·팩 설정 판독은 0.14.42 에도 있던 별개 경로 — 신원이 아니다.)
+        #[test]
+        fn r1f_watchdog_identity_chain_has_no_file_access_source_pin() {
+            let (acc, alr, gov) = (include_str!("accounts.rs"), include_str!("alerts.rs"), include_str!("governance.rs"));
+            let func = |src: &str, head: &str| -> String {
+                let body = src.split(head).nth(1).unwrap_or_else(|| panic!("{head} 소실"));
+                body[..body.find("\n}\n").unwrap_or_else(|| panic!("{head} 끝"))].to_string()
+            };
+            let forbidden = [
+                "folder_identity(",
+                "folder_identity_state(",
+                "claude_identity_unlocked(",
+                "claude_identity_probe(",
+                "claude_identity_at(",
+                "std::fs::",
+                "identity_file_meta(",
+                "read_identity_file(",
+                "read_identity_outcome(",
+                "enumerate_profile_dirs(",
+                "enumerated_profile_dirs(",
+                "known_profile_identities(",
+            ];
+            let g = func(gov, "pub(crate) fn check_alerts_with_stale(");
+            assert!(g.contains("snapshot_cached_with_stale("), "워치독 진입점이 캐시 전용 스냅샷을 부르지 않는다");
+            for bad in ["snapshot_with_stale(", "alerts::snapshot(", "seat_identity_view_at(", "seat_identity_view_in(", "seat_identity_view("] {
+                assert!(!g.contains(bad), "워치독 진입점이 읽기-통과 경로({bad})를 부른다");
+            }
+            for (src, head) in [
+                (alr, "pub fn snapshot_cached_with_stale("),
+                (alr, "fn snapshot_from_view("),
+                (acc, "pub fn seat_identity_view_cached("),
+                (acc, "fn peek_folder_ident("),
+                (acc, "fn peek_folder_state("),
+                (acc, "fn collect_seat_rows("),
+                (acc, "fn assemble_seat_view("),
+                (acc, "pub fn alert_rates_with("),
+            ] {
+                let f = func(src, head);
+                for bad in forbidden {
+                    assert!(!f.contains(bad), "워치독 사슬 {head} 가 {bad} 를 쓴다(신원 파일 접근)");
+                }
+            }
+            assert!(func(alr, "fn snapshot_from_view(").contains("alert_rates_with(") && !func(alr, "fn snapshot_from_view(").contains("seat_identity_view"), "본체가 신원 표를 직접 만든다");
+            // 캐시 전용 조회는 캐시에 쓰지 않는다(항목·계측 무변)
+            let v = func(acc, "pub fn seat_identity_view_cached(");
+            assert!(v.contains("peek_folder_ident(") && !v.contains("seat_ident_cache") && !v.contains("entries"), "캐시 전용 신원 표가 캐시를 직접 만진다");
+            for head in ["fn peek_folder_ident(", "fn peek_folder_state("] {
+                let p = func(acc, head);
+                for bad in ["insert(", ".reads", ".hits", "retain(", "clear("] {
+                    assert!(!p.contains(bad), "캐시 전용 조회 {head} 가 캐시를 바꾼다({bad})");
+                }
+            }
+            // 읽기-통과(folder_identity)에는 선점이 IO(판독) 앞에 있다 — 선점 → 판독 → 기록
+            let fi = func(acc, "pub(crate) fn folder_identity_state(");
+            let (preempt, io, record) = (fi.find("c.entries.insert(").expect("선점"), fi.find("claude_identity_probe(").expect("판독"), fi.rfind("c.entries.insert(").expect("기록"));
+            assert!(preempt < io && io < record, "folder_identity_state 가 IO 전에 자리를 찍지 않는다(선점 → 판독 → 기록 순서)");
+        }
+
+        /// 캐시가 데워진 뒤에는 읽기-통과 스냅샷과 캐시 전용 스냅샷이 **같은 입력**을 낸다(좌석 축·계정 축 값·메타 · 붙들 키) — 두 진입점이 갈라지지 않는다.
+        /// 계정 B(좌석이 쓰지 않는 로그인 · 관측 3000초 전 97%)는 신선도 규칙으로 빠져 붙들 키가 된다 — 캐시가 비었다면(= 신원을 몰랐다면) B 는 '판정 불가 = 사용 중'으로 적격이 되어 두 스냅샷이 갈라진다.
+        #[test]
+        fn r1f_cached_and_read_through_snapshots_agree_once_the_cache_is_warm() {
+            let (d, dir, home, f) = b3_fixture("r1p");
+            let fb = b3_login(&home, ".cys/claude-b3-b", "u-b3-b", "b-b3@example.test", 2); // 좌석이 쓰지 않는 로그인 B
+            let seat = b3_seat(&d, "worker-r1", "claude", Some(&f));
+            let t0 = crate::state::now_epoch();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &f, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0));
+            assert!(note_rate_for_profile_at(&d, Some(&home), &fb, &[rw("5h", 97.0, Some(t0 + 7200.0))], "statusline", t0 - 3000.0));
+            put_usage(&seat, 97.0, t0 + 7200.0, t0, Some("u-b3-a"));
+            let _ = seat_identity_view_in(&d, Some(&home), t0);
+            let cfg = crate::alerts::AlertConfig::default();
+            let a = crate::alerts::snapshot_with_stale(&d, t0 + 30.0, 1800.0);
+            let b = crate::alerts::snapshot_cached_with_stale(&d, t0 + 30.0, 1800.0, &cfg);
+            assert_eq!((&a.rates, &a.account_rates), (&b.rates, &b.account_rates));
+            assert_eq!((&a.rate_meta, &a.account_meta), (&b.rate_meta, &b.account_meta));
+            assert_eq!(a.stale_suppressed, b.stale_suppressed);
+            assert_eq!(a.stale_suppressed, vec!["account_rate:b-b3@example.test:5h".to_string()], "B(사용 중 아님 · 관측 3000초)는 붙들 키여야 한다 — 두 진입점 모두");
+            assert_eq!(a.account_rates, vec![("a-b3@example.test".to_string(), "5h".to_string(), 99.0)], "A 만 계정 축 입력이다");
+            assert!(!a.rates.is_empty() && !a.account_rates.is_empty(), "전제: 두 축 모두 입력이 있어야 한다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        // ───────────────────────── [m-5] 프로필 폴더 열거도 60초 하한 캐시 ─────────────────────────
+
+        /// ★m-5: 알려진 프로필 폴더 열거(홈·`~/.cys` 의 `read_dir`)는 60초 하한이다 — 하한 안에 만든 새 폴더는 보이지 않고(다시 열거하지 않는다) 하한이 지나면 보인다 · 시계 역행은 만료 · 5초 폴링(`local_json`) 12회에 열거 1회.
+        #[test]
+        fn r1f_profile_folder_listing_is_cached_for_sixty_seconds() {
+            let dir = tmp("r1g-daemon");
+            let home = tmp("r1g-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            b3_login(&home, ".claude-r1a", "u-r1-a", "a-r1@example.test", 1);
+            let t0 = 1_800_000_000.0;
+            let names = |d: &Arc<Daemon>, t: f64| -> Vec<String> {
+                let mut v: Vec<String> = known_profile_identities(d, Some(&home), t).expect("열거 성공").into_iter().map(|(p, _)| p.replace('\\', "/")).collect();
+                v.sort();
+                v
+            };
+            let enum_reads = |d: &Arc<Daemon>| d.seat_ident_cache.lock().unwrap().enum_reads;
+            assert_eq!(names(&d, t0), s(&[".claude-r1a"]));
+            assert_eq!(enum_reads(&d), 1);
+            b3_login(&home, ".claude-r1b", "u-r1-b", "b-r1@example.test", 2);
+            assert_eq!(names(&d, t0 + 30.0), s(&[".claude-r1a"]), "60초 안인데 홈을 다시 열거했다(5초 폴링이 read_dir 을 늘린다)");
+            assert_eq!(enum_reads(&d), 1);
+            assert_eq!(names(&d, t0 + 60.0), s(&[".claude-r1a", ".claude-r1b"]), "하한이 지났는데 새 폴더가 보이지 않는다");
+            assert_eq!(enum_reads(&d), 2);
+            // 시계가 뒤로 가면(now < 확인 시각) 만료로 본다 — 캐시가 영구히 붙지 않는다
+            let _ = names(&d, t0 - 5.0);
+            assert_eq!(enum_reads(&d), 3);
+            // 5초 폴링 12회(Control Center Live 의 usage.accounts·control.dashboard)에 열거 1회
+            let _h = test_home::set(&home);
+            let base = enum_reads(&d);
+            for i in 0..12 {
+                let _ = local_json(&d, t0 + 200.0 + 5.0 * f64::from(i));
+            }
+            assert_eq!(enum_reads(&d), base + 1, "5초 폴링 12회에 홈 열거가 1회가 아니다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 열거 실패와 '프로필 폴더가 정말 없음'을 가른다 — 정본(`enumerate_profile_dirs`)은 읽기 오류를 조용히 빈 목록으로 접으므로 홈 `read_dir` 가 되는지로 가른다: 홈이 있으면 `Some([])`, 홈이 없으면 `None`.
+        #[test]
+        fn r1f_a_failed_listing_is_not_the_same_as_no_profile_folders() {
+            let dir = tmp("r1j-daemon");
+            let empty_home = tmp("r1j-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            assert_eq!(enumerated_profile_dirs(&d, &empty_home, 1_800_000_000.0), Some(Vec::new()), "프로필 폴더가 하나도 없는 홈은 열거 성공(빈 목록)이다");
+            let missing = empty_home.join("not-there");
+            assert_eq!(enumerated_profile_dirs(&d, &missing, 1_800_000_000.0), None, "읽을 수 없는 홈은 열거 실패(None)다");
+            assert_eq!(known_profile_identities(&d, Some(&missing), 1_800_000_100.0), None);
+            assert_eq!(known_profile_identities(&d, None, 1_800_000_100.0), None, "홈 불명도 목록을 못 얻은 것이다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&empty_home);
+        }
+
+        // ───────────────────────── [m-2] 신원 판독이 한 번 실패해도 '이전 로그인'을 단정하지 않는다 ─────────────────────────
+
+        /// ★m-2 ⓐ: 신원 파일은 있는데(메타 성공) 이번 판독·파싱만 실패하면 직전 신원을 **한 주기(60초)만** 더 쓴다 — 연속 실패면 다음 주기에는 None. 정상으로 읽히면 카운트가 돌아온다.
+        /// 파일이 없어진 것 · `oauthAccount` 가 없는 것(로그아웃)은 종전처럼 즉시 None.
+        #[test]
+        fn r1f_a_failed_read_keeps_the_previous_identity_for_one_cycle_only() {
+            let dir = tmp("r1e-daemon");
+            let home = tmp("r1e-home");
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let f = b3_login(&home, ".cys/claude-b3", "u-b3-a", "a-b3@example.test", 1);
+            let key = f.to_string_lossy().into_owned();
+            let id = |t: f64| folder_identity(&d, Some(&home), &key, t);
+            let t0 = 1_800_000_000.0;
+            assert_eq!(id(t0).as_deref(), Some("u-b3-a"));
+            // 쓰는 도중의 잘린 파일(새 mtime — 판독은 실패한다)
+            put_body(&f, "{\"oauthAccount\":", 2);
+            assert_eq!(id(t0 + 60.0).as_deref(), Some("u-b3-a"), "일시 실패 첫 주기에 직전 신원을 쓰지 않았다('이전 로그인' 단정)");
+            // 하한(60초) 안에서는 다시 판독하지 않는다(실패 중에도 stat 폭주 없음)
+            let reads = d.seat_ident_cache.lock().unwrap().reads;
+            assert_eq!(id(t0 + 100.0).as_deref(), Some("u-b3-a"));
+            assert_eq!(d.seat_ident_cache.lock().unwrap().reads, reads, "실패한 항목이 60초 하한 안에서 다시 판독됐다");
+            assert_eq!(id(t0 + 120.0), None, "연속 실패인데 직전 신원이 한 주기 더 연장됐다(무한 연장)");
+            // 정상 복구 → 카운트 리셋 → 새 실패(빈 파일 — 쓰기 직전)에서 한 주기 연장이 되살아난다
+            put_body(&f, ID_A, 3);
+            assert_eq!(id(t0 + 180.0).as_deref(), Some("u-b3-a"));
+            put_body(&f, "", 4);
+            assert_eq!(id(t0 + 240.0).as_deref(), Some("u-b3-a"), "복구 뒤 새 실패에서 한 주기 연장이 없다");
+            assert_eq!(id(t0 + 300.0), None);
+            // 확정 '신원 없음'은 연장하지 않는다 — 파일이 사라짐 · 로그인 정보(oauthAccount)가 없는 정상 JSON(로그아웃)
+            let f2 = b3_login(&home, ".cys/claude-b3-2", "u-b3-b", "b-b3@example.test", 5);
+            let k2 = f2.to_string_lossy().into_owned();
+            assert_eq!(folder_identity(&d, Some(&home), &k2, t0).as_deref(), Some("u-b3-b"));
+            std::fs::remove_file(f2.join(".claude.json")).unwrap();
+            assert_eq!(folder_identity(&d, Some(&home), &k2, t0 + 60.0), None, "파일이 사라졌는데 직전 신원을 연장했다");
+            let f3 = b3_login(&home, ".cys/claude-b3-3", "u-b3-c", "c-b3@example.test", 6);
+            let k3 = f3.to_string_lossy().into_owned();
+            assert_eq!(folder_identity(&d, Some(&home), &k3, t0).as_deref(), Some("u-b3-c"));
+            put_body(&f3, "{\"projects\":{}}", 7);
+            assert_eq!(folder_identity(&d, Some(&home), &k3, t0 + 60.0), None, "로그아웃(oauthAccount 없음)인데 직전 신원을 연장했다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 판독 3값 표(순수) — JSON 이 아니면(빈 문자열·잘린 본문) `Unreadable`, JSON 인데 `oauthAccount`·`accountUuid` 가 없거나 문자열이 아니면 `NoIdentity`, 있으면 `Found`.
+        #[test]
+        fn r1f_parse_identity_outcome_table() {
+            let kind = |body: &str| match parse_identity_outcome(body) {
+                IdentRead::Found((u, e, _)) => format!("found:{u}:{e}"),
+                IdentRead::NoIdentity => "none".to_string(),
+                IdentRead::Unreadable => "unreadable".to_string(),
+            };
+            assert_eq!(kind(ID_A), "found:u-b3-a:a-b3@example.test");
+            assert_eq!(kind(r#"{"oauthAccount":{"accountUuid":"u-x"}}"#), "found:u-x:u-x", "이메일이 없으면 uuid 가 라벨");
+            for none in ["{}", "[]", "null", "5", r#""x""#, r#"{"oauthAccount":null}"#, r#"{"oauthAccount":{}}"#, r#"{"oauthAccount":{"accountUuid":7}}"#, r#"{"oauthAccount":{"accountUuid":null}}"#] {
+                assert_eq!(kind(none), "none", "{none:?}");
+            }
+            for bad in ["", "   ", "{", "{\"oauthAccount\":", "{not json", "\u{feff}{}"] {
+                assert_eq!(kind(bad), "unreadable", "{bad:?}");
+            }
+        }
+
+        /// ★m-2 ⓑ(순수 · 보정): `current_profiles_for` 가 **None = 키를 내지 않는다** — claude 행에서 ① 폴더 표를 못 얻었거나(홈 불명·열거 실패) ② 그 행의 `profiles` 에 든 폴더 가운데 이번에 신원을 **읽지 못한** 것(표에서 `Unread`)이 있으면.
+        /// **신원 없음 확정(`NoLogin` — 로그아웃·신원 파일 없음)은 읽지 못한 것이 아니다** — '이 계정의 폴더가 아니다'로 세어 그 계정의 다른 폴더가 없으면 `[]`(9650334f 와 같다). 표에 없는 폴더(열거 밖 · 삭제됨)도 '읽지 못함'이 아니다 ·
+        /// 구분자(`\` 와 `/`)는 같은 것 · codex·agy·선언 계정은 언제나 profiles 그대로.
+        #[test]
+        fn r1f_current_profiles_key_is_absent_only_for_an_unread_folder_or_a_failed_listing() {
+            let ps = |items: &[&str]| -> BTreeSet<String> { items.iter().map(|x| x.to_string()).collect() };
+            let k = known_pairs(&[(".cys/claude-r1", "A"), (".claude-r1x", "B"), (".claude-r1bad", "?"), (".claude-r1out", "-")]);
+            // 읽은 폴더만 가진 행 → 키를 낸다
+            assert_eq!(current_profiles_for("claude", "A", &ps(&[".cys/claude-r1"]), Some(&k)), Some(s(&[".cys/claude-r1"])));
+            assert_eq!(current_profiles_for("claude", "C", &ps(&[".claude-r1gone"]), Some(&k)), Some(Vec::new()), "표에 없는 폴더(삭제·열거 밖)는 '읽지 못함'이 아니다 — 이전 로그인이 맞다");
+            // ★보정 (가): 신원 없음 확정(NoLogin — 로그아웃·신원 파일 없음) 폴더만 가진 계정 → 키 부재가 아니라 `[]`('이전 로그인')
+            assert_eq!(current_profiles_for("claude", "Z", &ps(&[".claude-r1out"]), Some(&k)), Some(Vec::new()), "신원 없음 확정 폴더만 가진 계정이 키를 내지 않았다 — 읽지 못함으로 섞었다");
+            // NoLogin 폴더와 자기 폴더가 섞인 행 → 자기 폴더만(NoLogin 은 이 계정의 폴더가 아니다)
+            assert_eq!(current_profiles_for("claude", "A", &ps(&[".cys/claude-r1", ".claude-r1out"]), Some(&k)), Some(s(&[".cys/claude-r1"])));
+            // ★보정 (나): 읽지 못한(Unread) 폴더가 profiles 에 든 행 → 키 부재(빈 배열이 아니다) — NoLogin 이 섞여 있어도 마찬가지
+            assert_eq!(current_profiles_for("claude", "A", &ps(&[".cys/claude-r1", ".claude-r1bad"]), Some(&k)), None, "읽지 못한 폴더가 낀 행이 키를 냈다");
+            assert_eq!(current_profiles_for("claude", "Z", &ps(&[".claude-r1bad"]), Some(&k)), None);
+            assert_eq!(current_profiles_for("claude", "A", &ps(&[".claude-r1out", ".claude-r1bad"]), Some(&k)), None, "NoLogin 이 섞였다고 읽지 못한 폴더를 가렸다");
+            // 윈도우: 표는 `\`, profiles 는 `/` 로 섞여 와도 같은 폴더다 — 읽지 못함이면 키 부재 · 신원 없음 확정이면 `[]`
+            let kw = known_pairs(&[(".cys\\claude-r1", "?")]);
+            assert_eq!(current_profiles_for("claude", "A", &ps(&[".cys/claude-r1"]), Some(&kw)), None, "구분자가 다른 같은 폴더(읽지 못함)를 놓쳤다");
+            let kn = known_pairs(&[(".cys\\claude-r1", "-")]);
+            assert_eq!(current_profiles_for("claude", "A", &ps(&[".cys/claude-r1"]), Some(&kn)), Some(Vec::new()), "구분자가 다른 같은 폴더(신원 없음 확정)가 읽지 못함으로 읽혔다");
+            // 폴더 표를 못 얻었다(홈 불명 · 열거 실패) → 모든 claude 행 키 부재 · 열거 성공·폴더 0개는 빈 배열
+            assert_eq!(current_profiles_for("claude", "A", &ps(&[".cys/claude-r1"]), None), None);
+            assert_eq!(current_profiles_for("claude", "A", &ps(&[".cys/claude-r1"]), Some(&[])), Some(Vec::new()));
+            // 그 밖 provider 는 폴더 표와 무관하게 profiles 그대로
+            assert_eq!(current_profiles_for("codex", "default", &ps(&[".codex"]), None), Some(s(&[".codex"])));
+            assert_eq!(current_profiles_for("antigravity", "default", &ps(&[".antigravity"]), Some(&k)), Some(s(&[".antigravity"])));
+            assert_eq!(current_profiles_for("grok", "default", &ps(&[]), None), Some(Vec::new()));
+        }
+
+        /// ★m-2 ⓑ(끝에서 끝까지 · `usage.accounts` 행): 신원 판독이 **연속** 실패한 폴더가 낀 행은 `current_profiles` 키를 내지 않는다(첫 실패 주기는 직전 신원을 한 주기 더 써 키가 그대로다) — 읽은 폴더만 가진 행은 키를
+        /// 낸다. 홈 열거 자체가 실패하면 모든 claude 행이 키를 내지 않고 codex 행은 profiles 그대로다. 종전은 둘 다 `[]`(= 화면의 '이전 로그인')을 단정했다.
+        #[test]
+        fn r1f_local_json_omits_current_profiles_for_an_unreadable_folder_and_for_every_claude_row_when_the_listing_fails() {
+            let dir = tmp("r1k-daemon");
+            let home = tmp("r1k-home");
+            let _h = test_home::set(&home);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let fa = b3_login(&home, ".cys/claude-r1", "u-r1-a", "a-r1@example.test", 1);
+            b3_login(&home, ".claude-r1x", "u-r1-b", "b-r1@example.test", 1);
+            std::fs::create_dir_all(home.join(".codex")).unwrap();
+            {
+                let mut st = d.accounts.lock().unwrap();
+                seed_discovered(&mut st, &home); // 부트 발견 — 행 A·B·codex 가 생기고 profiles 에 폴더가 실린다
+            }
+            let t0 = crate::state::now_epoch();
+            let rows = local_json(&d, t0);
+            assert_eq!(strs(&row(&rows, "u-r1-a")["current_profiles"]), s(&[".cys/claude-r1"]), "전제: 정상일 때 A 는 자기 폴더를 현재로 갖는다");
+            // 폴더 A 의 신원 파일이 읽히지 않는다(잘린 JSON) — 첫 실패 주기: 직전 신원을 한 주기 더 쓴다 → '이전 로그인'을 단정하지 않는다
+            put_body(&fa, "{\"oauthAccount\"", 2);
+            let rows = local_json(&d, t0 + 61.0);
+            assert_eq!(strs(&row(&rows, "u-r1-a")["current_profiles"]), s(&[".cys/claude-r1"]), "일시 실패 한 번에 '이전 로그인'(빈 배열)을 단정했다");
+            // 연속 실패 → 키 부재(빈 배열이 아니다) · 읽은 폴더만 가진 행 B 는 키를 낸다 · codex 는 profiles 그대로
+            let rows = local_json(&d, t0 + 122.0);
+            let a = row(&rows, "u-r1-a");
+            assert!(a.get("current_profiles").is_none(), "신원을 읽지 못한 폴더가 낀 행이 current_profiles 를 냈다: {a}");
+            assert_eq!(strs(&a["profiles"]), s(&[".cys/claude-r1"]), "profiles(추가 전용 폴백)는 그대로여야 한다");
+            assert_eq!(strs(&row(&rows, "u-r1-b")["current_profiles"]), s(&[".claude-r1x"]), "읽은 폴더만 가진 행은 키를 낸다");
+            assert_eq!(strs(&row(&rows, "default")["current_profiles"]), s(&[".codex"]));
+            // 홈 열거 자체가 실패(읽을 수 없는 홈) → 모든 claude 행 키 부재 · codex 는 그대로
+            let gone = home.join("not-there");
+            let _h2 = test_home::set(&gone);
+            let rows = local_json(&d, t0 + 500.0);
+            for r in rows.as_array().unwrap().iter().filter(|r| r["provider"] == "claude") {
+                assert!(r.get("current_profiles").is_none(), "열거 실패인데 claude 행이 current_profiles 를 냈다: {r}");
+            }
+            assert_eq!(strs(&row(&rows, "default")["current_profiles"]), s(&[".codex"]), "codex 행은 열거와 무관하다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        // ───────────────────────── [보정 · m-2 ⓑ] 신원 없음 확정(가)과 이번에 읽지 못함(나)을 가른다 ─────────────────────────
+
+        /// ★보정 (가): **신원 없음이 확정**인 폴더 — 로그아웃(파일은 읽히고 JSON 인데 `oauthAccount` 없음)·신원 파일이 아예 없음 — 는 '읽지 못함'이 아니라 '이 계정의 폴더가 아니다'다 → 그 계정에 다른 폴더가 없으면
+        /// `current_profiles` 는 키 부재가 아니라 `[]`(= 화면의 '이전 로그인' · 9650334f 와 같다). 다른 계정은 영향이 없다 · 로그아웃이 계속돼도 `[]` 그대로(연장·키 부재로 바뀌지 않는다).
+        #[test]
+        fn r1f_a_logged_out_folder_or_one_without_an_identity_file_gives_an_empty_current_profiles_not_an_absent_key() {
+            let dir = tmp("r1m-daemon");
+            let home = tmp("r1m-home");
+            let _h = test_home::set(&home);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let fa = b3_login(&home, ".cys/claude-r1", "u-r1-a", "a-r1@example.test", 1); // 곧 로그아웃
+            let fb = b3_login(&home, ".claude-r1x", "u-r1-b", "b-r1@example.test", 1); // 곧 신원 파일이 사라진다(폴더는 남는다 — 이름 규칙에 맞아 열거된다)
+            b3_login(&home, ".claude-r1y", "u-r1-c", "c-r1@example.test", 1); // 그대로
+            {
+                let mut st = d.accounts.lock().unwrap();
+                seed_discovered(&mut st, &home); // 부트 발견 — 행 A·B·C 가 생기고 profiles 에 폴더가 실린다
+            }
+            let t0 = crate::state::now_epoch();
+            let cp = |rows: &Value, id: &str| row(rows, id).get("current_profiles").cloned();
+            let rows = local_json(&d, t0);
+            assert_eq!(cp(&rows, "u-r1-a"), Some(json!([".cys/claude-r1"])), "전제: 정상일 때 A 는 자기 폴더를 현재로 갖는다");
+            put_body(&fa, r#"{"projects":{}}"#, 2); // 로그아웃: 파일은 있고 JSON 인데 oauthAccount 가 없다
+            std::fs::remove_file(fb.join(".claude.json")).unwrap(); // 신원 파일이 아예 없다
+            for dt in [61.0, 122.0] {
+                let rows = local_json(&d, t0 + dt);
+                assert_eq!(cp(&rows, "u-r1-a"), Some(json!([])), "+{dt}초: 로그아웃(신원 없음 확정)한 폴더만 가진 계정이 `[]` 가 아니다 — 읽지 못함으로 섞어 키를 뺐다(또는 직전 신원을 연장했다): {}", row(&rows, "u-r1-a"));
+                assert_eq!(cp(&rows, "u-r1-b"), Some(json!([])), "+{dt}초: 신원 파일이 없는 폴더만 가진 계정이 `[]` 가 아니다: {}", row(&rows, "u-r1-b"));
+                assert_eq!(cp(&rows, "u-r1-c"), Some(json!([".claude-r1y"])), "+{dt}초: 다른 계정은 영향이 없다");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// ★보정 (나)-선점: **처음 보는 폴더를 다른 요청이 아직 읽는 중**이면(선점 자리) 그 폴더는 '신원 없음 확정'이 아니라 '아직 모름'(`Unread`)이다 — 그 폴더가 `profiles` 에 든 행은 키가 나오지 않는다.
+        /// 읽기-통과를 accounts 락 위에서 세워 놓고(첫 요청 = 선점 후 멈춤) 다른 요청이 같은 폴더를 물으면 `Unread` 를 받는다(`NoLogin` 이 아니다 · 막히지 않는다). 알려진 폴더 표·`current_profiles_for` 도 같다 — 판독이 끝나면 실제
+        /// 상태(`Known`)가 된다. 끝에서 끝(`local_json`)은 같은 모양의 선점 자리를 직접 실어 본다(accounts 락을 쥔 채는 `local_json` 이 행을 만들 수 없다). 대조: 자리가 사라진 뒤(읽은 뒤)에는 같은 행이 키를 낸다.
+        #[test]
+        fn r1f_a_folder_another_request_is_still_reading_for_the_first_time_is_unread_not_no_login() {
+            let dir = tmp("r1o-daemon");
+            let dir2 = tmp("r1o-daemon2");
+            let home = tmp("r1o-home");
+            let _h = test_home::set(&home);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let f = b3_login(&home, ".cys/claude-r1", "u-r1-a", "a-r1@example.test", 1);
+            let key = f.to_string_lossy().into_owned();
+            let t0 = 1_800_000_000.0;
+            let guard = d.accounts.lock().unwrap(); // '멈춘 IO' — 처음 보는 폴더의 첫 읽기가 이 락에서 멈춘다
+            let (tx1, rx1) = std::sync::mpsc::channel();
+            {
+                let (d1, home1, key1) = (d.clone(), home.clone(), key.clone());
+                std::thread::spawn(move || {
+                    let _ = tx1.send(folder_identity_state(&d1, Some(&home1), &key1, t0));
+                });
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let marked = loop {
+                if d.seat_ident_cache.lock().unwrap().entries.contains_key(Path::new(&key)) {
+                    break true;
+                }
+                if std::time::Instant::now() > deadline {
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            // 선점 자리 — 다른 요청의 눈에는 '아직 모름'. 막히지 않는다(accounts 락이 필요 없다).
+            let peeked = marked.then(|| peek_folder_state(&d, &key));
+            let second = marked.then(|| {
+                let (tx2, rx2) = std::sync::mpsc::channel();
+                let (d2, home2, key2) = (d.clone(), home.clone(), key.clone());
+                std::thread::spawn(move || {
+                    let _ = tx2.send(folder_identity_state(&d2, Some(&home2), &key2, t0 + 1.0));
+                });
+                rx2.recv_timeout(std::time::Duration::from_secs(3))
+            });
+            let table = marked.then(|| known_profile_identities(&d, Some(&home), t0 + 2.0));
+            drop(guard); // '멈춘 IO' 해제 — 첫 요청이 끝난다
+            let first = rx1.recv_timeout(std::time::Duration::from_secs(5));
+            assert!(marked, "읽기-통과가 IO 전에 선점 자리를 찍지 않았다");
+            assert_eq!(peeked, Some(FolderWho::Unread), "처음 보는 폴더의 선점 자리가 '아직 모름'(Unread)이 아니다(신원 없음 확정으로 읽혔다)");
+            assert_eq!(second.expect("marked").expect("두 번째 요청이 첫 요청의 멈춘 IO 에 묶였다"), FolderWho::Unread, "선점 중 다른 요청이 신원 없음 확정(NoLogin)을 받았다");
+            let table = table.expect("marked").expect("열거 성공");
+            let table_norm: Vec<(String, FolderWho)> = table.iter().map(|(p, w)| (p.replace('\\', "/"), w.clone())).collect(); // 윈도우 열거 경로의 `\` 를 접는다
+            assert_eq!(table_norm, known_pairs(&[(".cys/claude-r1", "?")]), "알려진 폴더 표가 선점 자리를 '아직 모름'으로 싣지 않았다");
+            let profiles: BTreeSet<String> = [".cys/claude-r1".to_string()].into_iter().collect();
+            assert_eq!(current_profiles_for("claude", "u-r1-a", &profiles, Some(&table)), None, "읽는 중인 폴더가 낀 행이 키를 냈다");
+            assert_eq!(first.expect("첫 요청이 끝나지 않았다"), FolderWho::Known("u-r1-a".to_string()), "판독이 끝나면 실제 상태가 된다");
+            assert_eq!(peek_folder_state(&d, &key), FolderWho::Known("u-r1-a".to_string()));
+            // 끝에서 끝: 같은 모양의 선점 자리(처음 보는 폴더 · Unread · 읽는 중)를 직접 실은 데몬 — 행 A 가 키를 내지 않는다
+            let d2 = crate::state::Daemon::new(dir2.join("cysd.sock"));
+            {
+                let mut st = d2.accounts.lock().unwrap();
+                seed_discovered(&mut st, &home);
+            }
+            let now = t0 + 100.0;
+            d2.seat_ident_cache.lock().unwrap().entries.insert(PathBuf::from(&key), IdentSlot { at: now, state: FolderWho::Unread, misses: 0 });
+            let rows = local_json(&d2, now + 1.0);
+            assert!(row(&rows, "u-r1-a").get("current_profiles").is_none(), "선점 자리(읽는 중) 위에서 행이 current_profiles 를 냈다: {}", row(&rows, "u-r1-a"));
+            let rows = local_json(&d2, now + 62.0); // 60초 하한이 지나 읽기-통과가 실제 신원을 읽는다
+            assert_eq!(row(&rows, "u-r1-a").get("current_profiles").cloned(), Some(json!([".cys/claude-r1"])), "자리가 사라진(읽은) 뒤에도 키가 안 나온다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&dir2);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// ★보정: 좌석 폴더(열거 밖 포함)의 신원 표 None 도 같은 두 뜻이다 — `seat_folder_states` 가 캐시 항목으로 가른다(추가 IO 0): 신원 없음 확정 = `NoLogin` · 읽지 못함·항목 없음(아직 모름) = `Unread` · 신원을 읽은 폴더 = `Known`.
+        #[test]
+        fn r1f_seat_folder_states_split_a_none_identity_into_no_login_and_unread_from_the_cache() {
+            let (d, dir, home, f1) = b3_fixture("r1n");
+            let f2 = b3_login(&home, ".cys/claude-b3-2", "u-b3-b", "b-b3@example.test", 2); // 곧 로그아웃
+            let f3 = b3_login(&home, ".cys/claude-b3-3", "u-b3-c", "c-b3@example.test", 3); // 곧 깨진다
+            let _s1 = b3_seat(&d, "worker-r1a", "claude", Some(&f1));
+            let _s2 = b3_seat(&d, "worker-r1b", "claude", Some(&f2));
+            let _s3 = b3_seat(&d, "worker-r1c", "claude", Some(&f3));
+            put_body(&f2, r#"{"projects":{}}"#, 4); // 로그아웃 — 신원 없음 확정
+            put_body(&f3, "{\"oauthAccount\"", 5); // 잘린 JSON — 처음 읽기라 직전 신원이 없다 → 읽지 못함
+            let t0 = crate::state::now_epoch();
+            let view = seat_identity_view_in(&d, Some(&home), t0);
+            let st = seat_folder_states(&d, &view);
+            let fs = |p: &Path| p.to_string_lossy().into_owned();
+            assert_eq!(
+                st,
+                vec![(fs(&f1), FolderWho::Known("u-b3-a".to_string())), (fs(&f2), FolderWho::NoLogin), (fs(&f3), FolderWho::Unread)],
+                "신원 표의 None 이 신원 없음 확정(NoLogin)과 읽지 못함(Unread)으로 갈리지 않았다"
+            );
+            // 캐시 항목이 사라지면(아직 모름) None 인 폴더는 Unread — 신원 없음 확정으로 읽지 않는다
+            d.seat_ident_cache.lock().unwrap().clear();
+            let st = seat_folder_states(&d, &view);
+            assert_eq!(st[1].1, FolderWho::Unread, "캐시 항목이 없는 폴더를 신원 없음 확정으로 읽었다");
+            assert_eq!(st[0].1, FolderWho::Known("u-b3-a".to_string()), "신원을 읽은 폴더는 캐시와 무관하다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// ★보정(좌석 폴더): 열거 규칙 밖 좌석 폴더(`CYS_ACCOUNT_DIR=<임의>`)의 계정이 ① 로그아웃(신원 없음 확정) → `current_profiles: []` ② 다시 로그인 → 그 폴더 ③ 판독 첫 실패 → 직전 신원 유예 → 그 폴더 ④ 연속 실패(읽지 못함)
+        /// → 키 부재. 좌석 폴더의 합류(m-1)도 같은 구분을 쓴다.
+        #[test]
+        fn r1f_an_out_of_rules_seat_folder_follows_the_same_split_logged_out_is_empty_and_unreadable_is_absent() {
+            let dir = tmp("r1q-daemon");
+            let home = tmp("r1q-home");
+            let _h = test_home::set(&home);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            b3_login(&home, ".claude-r1x", "u-r1-x", "x-r1@example.test", 1); // 이름 규칙 안의 다른 계정(열거는 비어 있지 않다)
+            let work = b3_login(&home, "work/acct", "u-r1-w", "w-r1@example.test", 2); // 이름 규칙 밖
+            let _seat = b3_seat(&d, "worker-r1", "claude", Some(&work));
+            let t0 = crate::state::now_epoch();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &work, &[rw("5h", 40.0, Some(t0 + 7200.0))], "statusline", t0));
+            let cp = |t: f64| row(&local_json(&d, t), "u-r1-w").get("current_profiles").cloned();
+            assert_eq!(cp(t0 + 1.0), Some(json!(["work/acct"])), "전제: 좌석이 쓰는 계정은 자기 폴더를 현재로 갖는다");
+            put_body(&work, r#"{"projects":{}}"#, 3); // ① 로그아웃
+            assert_eq!(cp(t0 + 61.0), Some(json!([])), "좌석 폴더가 로그아웃(신원 없음 확정)인데 키가 빠졌거나 폴더가 남았다");
+            put_body(&work, ID_W, 4); // ② 다시 로그인
+            assert_eq!(cp(t0 + 122.0), Some(json!(["work/acct"])));
+            put_body(&work, "{\"oauthAccount\"", 5); // ③ 읽기 실패 첫 주기 — 직전 신원을 한 주기 더
+            assert_eq!(cp(t0 + 183.0), Some(json!(["work/acct"])), "일시 실패 한 번에 이전 로그인(빈 배열)·키 부재를 단정했다");
+            assert_eq!(cp(t0 + 244.0), None, "④ 유예 뒤에도 못 읽는 좌석 폴더가 낀 행이 키를 냈다(읽지 못함)");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        // ───────────────────────── [m-1] 이름 규칙 밖 좌석 폴더 ─────────────────────────
+
+        /// ★m-1 ⓐ: 열거 규칙 밖 좌석 폴더(`CYS_ACCOUNT_DIR=<임의>` · 부서 카탈로그의 임의 계정 폴더)를 쓰는 계정은 `in_use:true` + `current_profiles` 에 그 폴더가 든다(종전: `[]` → 화면 `● 사용 중` + `이전 로그인`).
+        /// 좌석이 떠나면 그 폴더는 알려진 폴더가 아니므로 `[]`(in_use:false 와 일관 — 이전 로그인이 맞다).
+        #[test]
+        fn r1f_a_seat_folder_outside_the_naming_rules_still_shows_its_account_as_current() {
+            let dir = tmp("r1l-daemon");
+            let home = tmp("r1l-home");
+            let _h = test_home::set(&home);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            b3_login(&home, ".claude-r1x", "u-r1-x", "x-r1@example.test", 1); // 이름 규칙 안의 다른 계정(열거는 비어 있지 않다)
+            let work = b3_login(&home, "work/acct", "u-r1-w", "w-r1@example.test", 2); // 이름 규칙 밖(CYS_ACCOUNT_DIR=<임의>)
+            let seat = b3_seat(&d, "worker-r1", "claude", Some(&work));
+            let t0 = crate::state::now_epoch();
+            assert!(note_rate_for_profile_at(&d, Some(&home), &work, &[rw("5h", 40.0, Some(t0 + 7200.0))], "statusline", t0));
+            let rows = local_json(&d, t0 + 1.0);
+            let w = row(&rows, "u-r1-w");
+            assert_eq!(w["in_use"], json!(true), "전제: 좌석이 쓰는 계정은 in_use:true");
+            assert_eq!(strs(&w["profiles"]), s(&["work/acct"]));
+            assert_eq!(strs(&w["current_profiles"]), s(&["work/acct"]), "열거 밖 좌석 폴더의 계정이 in_use:true 인데 current_profiles 가 비었다('● 사용 중' + '이전 로그인')");
+            // 좌석이 떠나면 — 열거 밖 폴더는 알려진 폴더가 아니다(in_use:false 와 일관 · 이전 로그인)
+            seat.exited.store(true, Ordering::Relaxed);
+            let rows = local_json(&d, t0 + 2.0);
+            let w = row(&rows, "u-r1-w");
+            assert_eq!(w["in_use"], json!(false));
+            assert_eq!(strs(&w["current_profiles"]), Vec::<String>::new(), "좌석이 떠났는데 열거 밖 폴더가 현재로 남았다");
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 순수: 좌석 폴더(3값 상태)를 알려진 폴더 표에 한 번만 합친다 — `profiles` 와 같은 표기(`profile_short`)로 · 같은 표기(구분자 `\` 와 `/` 는 같은 것)가 이미 있으면 그대로(열거된 폴더 우선) · 상태(`Known`·`NoLogin`·`Unread`)는 그대로 싣는다.
+        #[test]
+        fn r1f_merge_seat_folders_adds_a_seat_folder_once_in_the_profiles_notation() {
+            let home = Path::new("/h");
+            let seat: Vec<(String, FolderWho)> = vec![
+                ("/h/work/acct".to_string(), FolderWho::Known("W".to_string())),
+                ("/h/.cys/claude-a".to_string(), FolderWho::Known("A".to_string())),
+                ("/elsewhere/acct".to_string(), FolderWho::Unread),
+                ("/h/work/out".to_string(), FolderWho::NoLogin),
+            ];
+            let k = known_pairs(&[(".cys/claude-a", "A"), (".claude-b", "B")]);
+            let merged = merge_seat_folders(k, Some(home), &seat);
+            assert_eq!(
+                merged,
+                known_pairs(&[(".cys/claude-a", "A"), (".claude-b", "B"), ("work/acct", "W"), ("/elsewhere/acct", "?"), ("work/out", "-")]),
+                "좌석 폴더는 profile_short 표기로 한 번만 합쳐지고 상태가 그대로다(열거된 폴더는 그대로)"
+            );
+            // 구분자만 다른 같은 표기는 합치지 않는다
+            let kw = known_pairs(&[("work\\acct", "W")]);
+            assert_eq!(merge_seat_folders(kw.clone(), Some(home), &seat).iter().filter(|(p, _)| p.replace('\\', "/") == "work/acct").count(), 1);
+            // 좌석 폴더가 없으면(수집 실패 · 좌석 0) 아무것도 더하지 않는다
+            assert_eq!(merge_seat_folders(kw.clone(), Some(home), &[]), kw);
+        }
+
+        // ───────────────────────── [m-6] 같은 경보 키를 여러 좌석·계정이 나눠 쓸 때 ─────────────────────────
+
+        /// ★m-6(a): 같은 경보 키를 쓰는 입력이 둘 이상이면 스냅샷이 **값이 가장 큰 입력 하나**를 쥐고 그 입력의 메타(`age=`·`in_use=`·`reset=`)를 싣는다 — 3시간 전 99% 가 5초 전 91% 의 나이(`age=5`)로
+        /// 나가지 않는다. 좌석 축(같은 역할명 좌석 둘 — 생성 순서를 바꿔 두 번)·계정 축(같은 이메일의 두 계정) 모두. 발행되는 경보(틱)의 detail 도 같은 입력의 것이다.
+        #[test]
+        fn r1f_a_shared_alert_key_publishes_the_value_and_the_meta_of_the_same_input() {
+            for swap in [false, true] {
+                let (d, dir, home, f1) = b3_fixture(&format!("r1h{}", u8::from(swap)));
+                let f2 = b3_login(&home, ".cys/claude-b3-2", "u-b3-b", "b-b3@example.test", 2);
+                let seat_a = b3_seat(&d, "worker-r1", "claude", Some(&f1));
+                let seat_b = b3_seat(&d, "worker-r1", "claude", Some(&f2));
+                let t0 = crate::state::now_epoch();
+                let _ = seat_identity_view_in(&d, Some(&home), t0); // 두 폴더의 현재 신원(A·B)을 캐시에 싣는다
+                let ((hi, hi_acct), (lo, lo_acct)) = if swap { ((&seat_b, "u-b3-b"), (&seat_a, "u-b3-a")) } else { ((&seat_a, "u-b3-a"), (&seat_b, "u-b3-b")) };
+                put_usage(hi, 99.0, t0 + 7200.0, t0 - 10_800.0, Some(hi_acct)); // 3시간 전 99% — 사용 중(귀속 == 현재 신원)이라 적격
+                put_usage(lo, 91.0, t0 + 7200.0, t0 - 5.0, Some(lo_acct)); // 5초 전 91%
+                let key = ("worker-r1".to_string(), "5h".to_string());
+                let snap = crate::alerts::snapshot_with_stale(&d, t0, 1800.0);
+                assert_eq!(snap.rates, vec![("worker-r1".to_string(), "5h".to_string(), 99.0)], "swap={swap}: 같은 키의 입력이 하나로 접히지 않았거나 값이 가장 큰 입력이 아니다: {:?}", snap.rates);
+                let m = &snap.rate_meta[&key];
+                assert_eq!((m.age_secs as u64, m.in_use, m.observed_at), (10_800, Some(true), t0 - 10_800.0), "swap={swap}: 메타가 값을 낸 입력(99%)의 것이 아니다: {m:?}");
+                // 틱이 실제로 내는 경보 — 값과 detail 이 같은 입력의 것
+                let seq0 = d.bus.latest_seq();
+                let mut fired: HashMap<String, f64> = HashMap::new();
+                crate::governance::check_alerts_with(&d, &mut fired, &crate::alerts::AlertConfig::default(), t0);
+                let ev: Vec<Value> = b3_events(&d, seq0, "alert.rate_limit").into_iter().filter(|p| p["key"] == "rate_limit:worker-r1:5h").collect();
+                assert_eq!(ev.len(), 1, "swap={swap}");
+                assert_eq!((ev[0]["detail"]["used_pct"].clone(), ev[0]["detail"]["age_secs"].clone()), (json!(99.0), json!(10_800)), "swap={swap}: 발행된 경보의 값과 age 가 다른 입력의 것이다: {}", ev[0]);
+                let _ = std::fs::remove_dir_all(&dir);
+                let _ = std::fs::remove_dir_all(&home);
+            }
+            // ── 계정 축: 같은 이메일(=같은 경보 키)의 두 계정 ──
+            let (d, dir, home, _f) = b3_fixture("r1h2");
+            let d1 = b3_login(&home, ".cys/claude-dup1", "u-r1-d1", "dup-r1@example.test", 5);
+            let d2 = b3_login(&home, ".cys/claude-dup2", "u-r1-d2", "dup-r1@example.test", 6);
+            let _s1 = b3_seat(&d, "worker-r1d1", "claude", Some(&d1));
+            let _s2 = b3_seat(&d, "worker-r1d2", "claude", Some(&d2));
+            let t0 = crate::state::now_epoch();
+            let _ = seat_identity_view_in(&d, Some(&home), t0);
+            assert!(note_rate_for_profile_at(&d, Some(&home), &d1, &[rw("5h", 99.0, Some(t0 + 7200.0))], "statusline", t0 - 10_800.0));
+            assert!(note_rate_for_profile_at(&d, Some(&home), &d2, &[rw("5h", 91.0, Some(t0 + 7200.0))], "statusline", t0 - 5.0));
+            let snap = crate::alerts::snapshot_with_stale(&d, t0, 1800.0);
+            assert_eq!(snap.account_rates, vec![("dup-r1@example.test".to_string(), "5h".to_string(), 99.0)], "같은 이메일 두 계정의 입력이 값이 가장 큰 하나로 접히지 않았다: {:?}", snap.account_rates);
+            let m = &snap.account_meta[&("dup-r1@example.test".to_string(), "5h".to_string())];
+            assert_eq!((m.age_secs as u64, m.in_use, m.observed_at), (10_800, Some(true), t0 - 10_800.0), "계정 축 메타가 값을 낸 입력(99%)의 것이 아니다: {m:?}");
+            let seq0 = d.bus.latest_seq();
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            crate::governance::check_alerts_with(&d, &mut fired, &crate::alerts::AlertConfig::default(), t0);
+            let ev: Vec<Value> = b3_events(&d, seq0, "alert.account_rate").into_iter().filter(|p| p["key"] == "account_rate:dup-r1@example.test:5h").collect();
+            assert_eq!(ev.len(), 1);
+            assert_eq!((ev[0]["detail"]["used_pct"].clone(), ev[0]["detail"]["age_secs"].clone()), (json!(99.0), json!(10_800)), "발행된 계정 경보의 값과 age 가 다른 입력의 것이다: {}", ev[0]);
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// 틱 한 번의 시나리오 도우미(m-6 b): 같은 키(`rate_limit:worker-r1:5h`)를 쓰는 좌석 셋 — s1 은 사용 중·신선한 99%(발화), s2 는 로그인이 바뀐 좌석의 **낡은** 창(`stale_pct`), s3 은 나중에 같은 키로 새로 교차하는 좌석.
+        /// s1 이 떠난 뒤(+31초 틱) 키가 붙들렸는지(`fired`)·해소 알림 사유·s3 의 새 교차(+61초 틱)가 발행됐는지를 돌려준다.
+        /// (`tag` 는 검체마다 달라야 한다 — 임시 폴더 이름이 같으면 병렬 검체끼리 서로의 폴더를 지운다.)
+        fn hold_scenario(tag: &str, stale_pct: f64) -> (bool, Vec<(String, String)>, usize) {
+            let (d, dir, home, f1) = b3_fixture(tag);
+            let f2 = b3_login(&home, ".cys/claude-b3-2", "u-b3-b", "b-b3@example.test", 2);
+            let f3 = b3_login(&home, ".cys/claude-b3-3", "u-b3-c", "c-b3@example.test", 3);
+            let s1 = b3_seat(&d, "worker-r1", "claude", Some(&f1));
+            let s2 = b3_seat(&d, "worker-r1", "claude", Some(&f2));
+            let s3 = b3_seat(&d, "worker-r1", "claude", Some(&f3)); // 관측이 생기기 전에는 입력이 없다
+            let t0 = crate::state::now_epoch();
+            let _ = seat_identity_view_in(&d, Some(&home), t0); // 세 폴더의 현재 신원을 캐시에 싣는다(워치독은 읽지 않는다)
+            let key = "rate_limit:worker-r1:5h";
+            let cfg = crate::alerts::AlertConfig::default();
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            let seq0 = d.bus.latest_seq();
+            put_usage(&s1, 99.0, t0 + 20_000.0, t0, Some("u-b3-a")); // 사용 중 · 신선 → 적격 → 발화
+            put_usage(&s2, stale_pct, t0 + 20_000.0, t0 - 5_000.0, Some("u-r1-old")); // 귀속 계정 ≠ 현재 신원(로그인이 바뀐 좌석) · 관측 5000초 → 부적격(붙들림 후보)
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1.0);
+            assert_eq!(b3_events(&d, seq0, "alert.rate_limit").iter().filter(|p| p["key"] == key).count(), 1, "전제: s1 99% 가 발화했다");
+            s1.exited.store(true, Ordering::Relaxed); // 진짜 경보의 주인이 사라진다
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 31.0);
+            let held = fired.contains_key(key);
+            let resolved = b3_resolved(&d, seq0);
+            put_usage(&s3, 95.0, t0 + 20_000.0, t0 + 50.0, Some("u-b3-c")); // 다른 좌석의 새 교차(같은 키)
+            crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 61.0);
+            let published = b3_events(&d, seq0, "alert.rate_limit").iter().filter(|p| p["key"] == key).count();
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
+            (held, resolved, published)
+        }
+
+        /// ★m-6(b): 임계 **미만**의 낡은 창은 같은 키를 쓰는 다른 좌석의 발화 키를 붙들지 않는다 — 주인(s1)이 떠나면 키가 풀리고(해소 사유 `cleared`) 다른 좌석(s3)의 새 교차가 **즉시** 발행된다(0.14.42 와 같다).
+        /// 종전: 낡은 10% 창이 키를 붙들어(`stale`) s3 의 새 교차가 마지막 발행에서 30분이 될 때까지 늦게 나갔다.
+        #[test]
+        fn r1f_a_below_threshold_stale_window_does_not_hold_another_seats_fired_key() {
+            let (held, resolved, published) = hold_scenario("r1i-lo", 10.0);
+            assert!(!held, "임계 미만의 낡은 창이 남의 발화 키를 붙들었다(키가 fired 에 남았다)");
+            assert_eq!(resolved, vec![("rate_limit:worker-r1:5h".to_string(), "cleared".to_string())], "붙들림이 아니라 해소(cleared)여야 한다");
+            assert_eq!(published, 2, "다른 좌석의 새 교차가 즉시 발행되지 않았다(30분 늦게 나간다)");
+        }
+
+        /// 음성 대조(m-6 b): 임계 **이상**의 낡은 창(경보였을 값이 신선도 규칙으로 빠진 것)은 여전히 키를 붙든다 — 주인이 떠나도 키가 `fired` 에 남고(해소 사유 `stale`) REMIND 안에는 다른 좌석의 교차가 다시 발행되지 않는다
+        /// (B3 의 깜빡임 금지는 그대로 — 붙들림이 죽지 않았다).
+        #[test]
+        fn r1f_an_above_threshold_stale_window_still_holds_the_key() {
+            let (held, resolved, published) = hold_scenario("r1i-hi", 95.0);
+            assert!(held, "임계 이상의 낡은 창이 키를 붙들지 못했다(깜빡임 금지가 죽었다)");
+            assert_eq!(resolved, vec![("rate_limit:worker-r1:5h".to_string(), "stale".to_string())]);
+            assert_eq!(published, 1, "붙들린 키가 REMIND 안에 다시 발행됐다");
+        }
+
+        // ───────────────────────── [n-1 · n-2] 별명 ─────────────────────────
+
+        /// ★n-1: `account_id == "default"` 인 행(Codex·Antigravity·선언 계정)은 `label` 키를 **먼저** 본다 — `{"default":"X","OpenAI Codex":"코덱스"}` 에서 코덱스가 `X` 가 되지 않는다(라벨 키가 없는 행만 `default` 키로 내려간다).
+        /// 그 밖 행(claude)은 종전 순서(account_id → label)다.
+        #[test]
+        fn r1f_alias_for_default_rows_looks_at_the_label_key_first() {
+            let t: HashMap<String, String> = [("default", "X"), ("OpenAI Codex", "코덱스"), ("u-r1-a", "ID별명"), ("a-r1@example.test", "메일별명")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            assert_eq!(alias_for(&t, "default", "OpenAI Codex"), Some("코덱스"), "default 행인데 default 키가 라벨 키를 가렸다");
+            assert_eq!(alias_for(&t, "default", "Antigravity (agy)"), Some("X"), "라벨 키가 없는 default 행은 default 키로 내려간다");
+            assert_eq!(alias_for(&t, "u-r1-a", "a-r1@example.test"), Some("ID별명"), "claude 행은 종전 순서(account_id 먼저)");
+            assert_eq!(alias_for(&t, "u-r1-zzz", "a-r1@example.test"), Some("메일별명"));
+            let only_default: HashMap<String, String> = [("default".to_string(), "X".to_string())].into_iter().collect();
+            assert_eq!(alias_for(&only_default, "u-r1-a", "a-r1@example.test"), None, "default 키는 claude 행에 붙지 않는다");
+            assert_eq!(alias_for(&HashMap::new(), "default", "OpenAI Codex"), None);
+        }
+
+        /// ★n-2: 별명 정제가 제어 문자에 더해 양방향 제어(U+202A~202E · U+2066~2069)·제로폭(U+200B~200F · U+FEFF)·줄/문단 구분자(U+2028·2029)도 걷는다 — 화면 `starvednotice.ts` 의 `INVISIBLE` 과 같은 집합.
+        /// 경계 바로 밖의 글자(U+200A · U+2010 · U+202F · U+2065 · U+206A)와 일반 한글·이모지는 남는다.
+        #[test]
+        fn r1f_sanitize_alias_also_strips_bidi_controls_and_zero_width_characters() {
+            let stripped = [
+                '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{2028}', '\u{2029}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{FEFF}',
+            ];
+            for c in stripped {
+                assert_eq!(sanitize_alias(&format!("업무{c}용")).as_deref(), Some("업무용"), "U+{:04X} 가 걷히지 않았다", c as u32);
+                assert_eq!(sanitize_alias(&format!("{c}{c}")), None, "U+{:04X} 만으로 된 별명은 비어야 한다", c as u32);
+            }
+            assert_eq!(sanitize_alias("\u{202E}evil\u{202C}").as_deref(), Some("evil"), "RLO 로 표시를 뒤집는 별명");
+            for c in ['\u{200A}', '\u{2010}', '\u{202F}', '\u{2065}', '\u{206A}', '\u{00A0}'] {
+                let t = format!("a{c}b");
+                assert_eq!(sanitize_alias(&t).as_deref(), Some(t.as_str()), "경계 밖 글자 U+{:04X} 까지 걷었다", c as u32);
+            }
+            assert_eq!(sanitize_alias("개인 😀").as_deref(), Some("개인 😀"));
+            // 표 파서를 거쳐도 같다(별명 파일 → 표)
+            let t = parse_alias_table("{\"aliases\":{\"k\":\"\\u202e업무\\u200b용\"}}".as_bytes());
+            assert_eq!(t.get("k").map(String::as_str), Some("업무용"));
         }
     }
 }

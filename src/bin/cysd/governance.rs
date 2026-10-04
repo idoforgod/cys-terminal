@@ -1431,6 +1431,9 @@ pub(crate) fn check_alerts_with(
 }
 
 /// [`check_alerts_with`] 의 시험 이음매 — 신선도 규칙의 나이 상한(초)을 인자로 받는다(`0` = 규칙 끔). 노브 환경변수를 만지지 않고 같은 시나리오를 노브 값별로 돌린다.
+/// ★R1F-US(M-1): 이 함수는 **워치독 스레드**에서 돈다 — 스냅샷은 **캐시 전용**(`alerts::snapshot_cached_with_stale` · 신원 파일을 열지도 stat 하지도 않는다 · 항목이 있으면 만료됐어도 마지막 값 · 없으면 판정 불가 = 사용 중이라
+/// 실패 방향은 경보 유지)이다. 신원 캐시는 상태줄 보고(`usage.report` 귀속 경로)와 RPC 의 읽기-통과 조회가 채운다. 이 틱(큐 배달·사망 감지·데드맨과 같은 틱)은 신원 파일을 열지도 stat 하지도 않는다(팩 설정·상태 폴더·분석 DB 판독은 0.14.42 와 같다).
+/// 붙들 키(`stale_suppressed`)는 임계 이상인 창의 것만이다(임계 미만의 낡은 창이 남의 발화 키를 붙들지 않는다 — 그래서 스냅샷이 `cfg` 를 받는다).
 pub(crate) fn check_alerts_with_stale(
     daemon: &Arc<Daemon>,
     fired: &mut HashMap<String, f64>,
@@ -1439,7 +1442,7 @@ pub(crate) fn check_alerts_with_stale(
     stale_secs: f64,
 ) {
     const REMIND_SECS: f64 = ALERT_REMIND_SECS;
-    let snap = crate::alerts::snapshot_with_stale(daemon, now, stale_secs);
+    let snap = crate::alerts::snapshot_cached_with_stale(daemon, now, stale_secs, cfg);
     let active = crate::alerts::evaluate(&snap, cfg);
     let active_keys: std::collections::HashSet<String> =
         active.iter().map(|a| a.key.clone()).collect();

@@ -9642,7 +9642,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 .filter(|e| now - e["ts"].as_f64().unwrap_or(0.0) < 30.0)
                 .filter_map(|e| e["surface_id"].as_u64())
                 .collect();
-            // ★0.14.43(B3) 좌석 `usage` 계산 키용 좌석 신원 표 — surfaces 락 **밖**에서(파일 IO · 폴더별 60초 캐시 — 5초 폴링이 stat 을 늘리지 않는다).
+            // ★0.14.43(B3) 좌석 `usage` 계산 키용 좌석 신원 표 — surfaces 락 **밖**에서(파일 IO · 폴더별 60초 캐시). 5초 폴링이 stat 을 늘리지 않는다 — 이 아크의 신원 표뿐 아니라 아래 `accounts`(`local_json`)의
+            // 알려진 프로필 폴더 **열거**(홈·`~/.cys` 의 `read_dir`)와 그 폴더들의 신원도 같은 60초 하한 캐시를 탄다(R1F-US m-5 — 열거 결과도 `SeatIdentCache` 에 60초 하한·선점 꼴로 둔다).
             let usage_view = crate::accounts::seat_identity_view_at(daemon, now);
             let usage_stale_secs = crate::accounts::account_alert_stale_secs();
             let surfaces = daemon.surfaces.lock().unwrap();
@@ -30223,6 +30224,8 @@ mod tests {
             crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + 1.0);
             assert_eq!((b3_alert_count(&daemon, seq0, SEAT_ALERT, seat_key), b3_alert_count(&daemon, seq0, ACCT_ALERT, acct_key)), (1, 1), "전제: 좌석·계정 두 축이 발화해야 한다");
             b3_switch_login(&home, ".cys/claude-b3", "u-b3-b", "b-b3@example.test", 9);
+            // ★R1F-US: 워치독은 신원 파일을 읽지 않고 캐시만 본다 — 전환을 캐시에 싣는 것은 RPC 의 읽기-통과 조회다(60초 하한이 지난 시각의 조회 · 이 검체의 전제를 채운다 · 단언은 그대로).
+            let _ = crate::accounts::seat_identity_view_at(&daemon, t + 70.0);
             for dt in [70.0, 1799.0] {
                 crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + dt);
             }
@@ -30265,6 +30268,8 @@ mod tests {
             let seq0 = daemon.bus.latest_seq();
             crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + 1.0);
             b3_switch_login(&home, ".cys/claude-b3", "u-b3-b", "b-b3@example.test", 9);
+            // ★R1F-US: 전환을 캐시에 싣는 읽기-통과 조회(워치독은 파일을 읽지 않는다 — 이 검체의 전제를 채운다 · 단언은 그대로).
+            let _ = crate::accounts::seat_identity_view_at(&daemon, t + 65.0);
             // transcript tail 의 이월 갱신: updated_at 만 현재로 — rate_observed_at 은 그대로
             daemon.surfaces.lock().unwrap()[&seat].observed_usage.lock().unwrap().as_mut().unwrap().updated_at = t + 1800.0;
             crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + 70.0);
@@ -30278,6 +30283,8 @@ mod tests {
             let seq0 = daemon.bus.latest_seq();
             crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + 1.0);
             std::fs::remove_file(folder.join(".claude.json")).unwrap();
+            // ★R1F-US: '판독 불가'를 캐시에 싣는 읽기-통과 조회(워치독은 파일을 읽지 않는다 — 이 검체의 전제를 채운다 · 단언은 그대로).
+            let _ = crate::accounts::seat_identity_view_at(&daemon, t + 61.0);
             for dt in [70.0, 1799.0, 1801.0] {
                 crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + dt);
             }
@@ -30394,8 +30401,10 @@ mod tests {
                 let _ = b3_usage_objs(&daemon, seat);
             }
             {
+                // ★R1F-US(M-1·②): 상태줄 보고(`b3_reported_seat` 의 `usage.report`)가 좌석 폴더의 신원을 캐시에 이미 실었다 — 폴링 16회는 실판독 **0**회다(종전 단언은 실판독 1회 — 보고가 캐시를 채우지 않아
+                // 첫 폴링이 읽었다). 폴링이 파일 stat 을 늘리지 않는다는 요지는 같고(적중만 늘어난다) 더 강하다.
                 let c = daemon.seat_ident_cache.lock().unwrap();
-                assert_eq!(c.reads, 1, "status 폴링 16회에 신원 실판독이 1회가 아니다(폴링이 파일 stat 을 늘린다)");
+                assert_eq!(c.reads, 0, "status 폴링 16회에 신원 실판독이 있다(보고가 캐시를 채우지 않았거나 폴링이 파일 stat 을 늘린다)");
                 assert!(c.hits >= 15, "캐시 적중이 모자란다: {}", c.hits);
             }
             std::fs::remove_file(folder.join(".claude.json")).unwrap();
@@ -30468,6 +30477,61 @@ mod tests {
             crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + 1.0);
             crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + 1801.0);
             assert_eq!(b3_alert_count(&daemon, seq0, SEAT_ALERT, "rate_limit:reviewer-b3:7d"), 2, "비 claude 좌석의 경보가 나이 때문에 사라졌다");
+        }
+    }
+
+    // ═════════ ★0.14.43(R1F-US · 성찰 1회차 수정) — 실제 핸들러(dispatch)로 본 M-1·m-5: 보고가 신원 캐시를 채우고 워치독 틱은 파일을 읽지 않는다 · 5초 폴링은 프로필 폴더 열거를 늘리지 않는다 ═════════
+    // 픽스처는 전부 합성값이다(u-b3-a · a-b3@example.test 등) — 실계정 식별자 금지. 시각은 주입한다(실시간 대기 없음).
+    mod r1f_us_status {
+        use super::b3_status_tests::{b3_alert_count, b3_observed, b3_reported_seat, b3_resolved, b3_rpc, b3_switch_login, ACCT_ALERT, SEAT_ALERT};
+        use super::*;
+        use std::collections::HashMap;
+
+        /// ★M-1·② + 핵심: 실제 `usage.report` 가 좌석 폴더의 신원을 신원 캐시에 싣는다(추가 IO 0 — 실판독 0 · 캐시 전용 신원 표가 그 신원을 본다). 로그인이 B 로 바뀐 뒤 보고도 조회도 없으면 경보 틱은 신원 파일을
+        /// 읽지 않으므로 옛 신원(A=사용 중)을 쓴다 — +1801초에도 좌석 축·계정 축 모두 REMIND 재발행(2건)·해소 알림 0·실판독 0. 새 `usage.report`(B)가 오면 창이 닫혀 있어도(status·조회 없이) 캐시가 B 로 갈린다.
+        /// 종전 코드는 틱이 만료된 캐시를 스스로 다시 읽어 +1801초에 두 키를 소멸시켰다(적색).
+        #[test]
+        fn r1f_usage_report_fills_the_identity_cache_and_the_alert_tick_does_not_read_the_file() {
+            let seat_key = "rate_limit:worker-b3-r1:5h";
+            let acct_key = "account_rate:a-b3@example.test:5h";
+            let cfg = crate::alerts::AlertConfig::default();
+            let (daemon, seat, home, _folder, t) = b3_reported_seat("r1", 996_101);
+            // ① 보고가 폴더 신원(A)을 캐시에 실었다 — 실판독 0
+            assert_eq!(daemon.seat_ident_cache.lock().unwrap().reads, 0, "보고가 추가 판독을 했다");
+            assert_eq!(crate::accounts::seat_identity_view_cached(&daemon).current_for(seat), Some("u-b3-a"), "usage.report 가 신원 캐시를 채우지 않았다");
+            let mut fired: HashMap<String, f64> = HashMap::new();
+            let seq0 = daemon.bus.latest_seq();
+            crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + 1.0);
+            let counts = |daemon: &Arc<Daemon>| (b3_alert_count(daemon, seq0, SEAT_ALERT, seat_key), b3_alert_count(daemon, seq0, ACCT_ALERT, acct_key));
+            assert_eq!(counts(&daemon), (1, 1), "전제: 좌석·계정 두 축이 발화해야 한다");
+            // ② 로그인을 B 로 바꾸되 보고도 조회도 없다 — 워치독은 파일을 읽지 않는다
+            b3_switch_login(&home, ".cys/claude-b3", "u-b3-b", "b-b3@example.test", 9);
+            for dt in [70.0, 1799.0, 1801.0] {
+                crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + dt);
+            }
+            assert_eq!(counts(&daemon), (2, 2), "워치독 틱이 신원 파일을 다시 읽어 전환을 봤다(캐시는 보고·조회로만 갱신돼야 한다) — 캐시의 A(사용 중)면 두 축 REMIND 재발행이 맞다");
+            assert!(b3_resolved(&daemon, seq0).is_empty(), "캐시의 신원이 A 인데 해소 알림이 나갔다: {:?}", b3_resolved(&daemon, seq0));
+            assert_eq!(daemon.seat_ident_cache.lock().unwrap().reads, 0, "경보 틱이 신원 실판독 계수를 올렸다");
+            // ③ 새 usage.report(B)가 오면 창이 닫혀 있어도(status·조회 없이) 캐시가 B 로 갈려 다음 틱이 전환을 본다
+            let own = home.join(".cys/claude-b3/projects/-w/s.jsonl").to_string_lossy().into_owned();
+            let now = crate::state::now_epoch();
+            let r = usage_report(&daemon, seat, json!({"session_file": own, "rate": [{"label": "5h", "used_pct": 10.0, "resets_at": now + 9000.0}]}), Some(996_101));
+            assert_eq!(r["ok"], json!(true), "{r}");
+            assert_eq!(b3_observed(&daemon, seat).rate_account.as_deref(), Some("u-b3-b"), "새 보고가 새 로그인에 귀속되지 않았다");
+            assert_eq!(crate::accounts::seat_identity_view_cached(&daemon).current_for(seat), Some("u-b3-b"), "새 로그인으로 보고했는데 신원 캐시가 옛 신원이다(창을 닫아 둔 채로는 전환이 안 보인다)");
+            assert_eq!(daemon.seat_ident_cache.lock().unwrap().reads, 0, "보고가 추가 판독을 했다(캐시를 채우는 길이 IO 를 늘렸다)");
+            let _ = std::fs::remove_dir_all(&home);
+        }
+
+        /// ★m-5: Control Center Live 의 5초 폴링(`control.dashboard` — 안에서 `local_json` 이 알려진 프로필 폴더를 열거한다)과 `usage.accounts` 가 홈·`~/.cys` 를 매번 열거하지 않는다 — 60초 하한: 호출 13회에 열거 1회.
+        #[test]
+        fn r1f_dashboard_and_usage_accounts_polling_enumerate_the_profile_folders_once_per_minute() {
+            let daemon = claim_daemon();
+            for _ in 0..12 {
+                let _ = b3_rpc(&daemon, "control.dashboard");
+            }
+            let _ = b3_rpc(&daemon, "usage.accounts");
+            assert_eq!(daemon.seat_ident_cache.lock().unwrap().enum_reads, 1, "5초 폴링 13회에 홈 열거가 1회가 아니다(폴링이 read_dir 을 늘린다)");
         }
     }
 }

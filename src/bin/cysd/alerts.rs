@@ -124,8 +124,9 @@ impl RateMeta {
 /// 평가 입력 스냅샷 — 호출부(watchdog/RPC)가 락 잡고 수집(평가기는 락 무관·순수).
 #[derive(Default)]
 pub struct Snapshot {
-    pub rates: Vec<(String, String, f64)>,        // (role, label, used_pct)
-    /// CC v2 WS-A: 계정 단위 rate — (계정 라벨, 창, used_pct). 관측된 계정만.
+    /// (role, label, used_pct) — ★R1F-US(m-6): 스냅샷(`snapshot_*`)이 만든 것은 같은 키 (역할, 창)당 **하나**다 — 값이 가장 큰 입력(같은 값이면 관측 나이가 작은 쪽). 값과 `rate_meta` 가 같은 입력의 것이어야 한다.
+    pub rates: Vec<(String, String, f64)>,
+    /// CC v2 WS-A: 계정 단위 rate — (계정 라벨, 창, used_pct). 관측된 계정만. ★R1F-US(m-6): 스냅샷이 만든 것은 같은 키 (라벨, 창)당 하나(값이 가장 큰 입력).
     pub account_rates: Vec<(String, String, f64)>,
     pub weekly_cost_usd: f64,
     pub weekly_tokens: u64,
@@ -140,6 +141,8 @@ pub struct Snapshot {
     /// ★0.14.43(B3) **신선도 규칙이 입력에서 뺀** 창의 경보 키(`account_rate:{라벨}:{창}` · `rate_limit:{역할}:{창}`) — 리셋 전인데도 '지금 쓰이지 않고 관측이
     /// 30분(노브)을 넘은' 값이다. 임계 판정은 `evaluate` 의 몫이라 임계 미만 창도 섞일 수 있다(발화한 적 없는 키는 틱의 `fired.retain` 이 어차피 버린다).
     /// 틱(`governance::check_alerts_with`)이 이 키를 `fired` 에 붙들어 둔다 — 다시 적격이 돼도 REMIND 안에는 재발행하지 않게(깜빡임 금지).
+    /// ★R1F-US(m-6·b): 워치독 틱 판([`snapshot_cached_with_stale`])은 **임계 이상**인 창(경보 입력이었다면 `evaluate` 가 경보로 냈을 값)의 키만 싣는다 — 임계 미만의 낡은 창이 같은 키를 쓰는 다른 좌석·계정의
+    /// 발화 키를 붙들어 새 교차가 30분 늦게 나가는 일이 없다. RPC 판([`snapshot`]·[`snapshot_with_stale`])은 이 필드를 쓰지 않으므로 임계로 좁히지 않는다(전부 싣는다).
     pub stale_suppressed: Vec<String>,
 }
 
@@ -427,22 +430,42 @@ pub fn gate_signal_badges(now: f64) -> Vec<GateBadge> {
 
 /// 데몬에서 평가 스냅샷 수집 — 노드 rate(in-memory) + 7d usage_records/events(analytics).
 /// 락 순서: surfaces → (해제) → analytics. consumption 미사용(교착 회피).
-/// ★0.14.43(B3) 신선도 규칙: 좌석 신원 표를 **한 번** 만들어 좌석 축·계정 축이 함께 쓴다 — 락 순서 surfaces(복사만) → 해제 → 신원 판독(무락 · 60초 캐시) →
+/// ★0.14.43(B3) 신선도 규칙: 좌석 신원 표를 **한 번** 만들어 좌석 축·계정 축이 함께 쓴다 — 락 순서 surfaces(복사만) → 해제 → 신원 표(캐시) →
 /// surfaces(좌석 rate 수집 — 파일 IO 없음) → 해제 → accounts(메모리 연산뿐) → 해제 → analytics. 겹쳐 쥐는 락 쌍이 새로 생기지 않는다.
+/// ★R1F-US(M-1): **이 판은 RPC 경로(`control.alerts`)용 읽기-통과**다 — 신원 표가 캐시 미스일 때 신원 파일을 확인한다(폴더별 60초 하한 · 미스 때 IO 전에 선점). **워치독(경보 틱)은 이 함수를 부르지 않는다** —
+/// 스냅샷이 신원 파일을 열면 그 디스크가 응답하지 않을 때 같은 틱의 큐 배달·사망 감지·데드맨 점검이 함께 설 수 있다(오너 절대 기준 ③ — 코드 경로로 본 것이고 멈춘 디스크로 실측하지는 않았다).
+/// 워치독은 [`snapshot_cached_with_stale`](캐시 전용 · IO 0)을 쓴다.
 pub fn snapshot(daemon: &Arc<Daemon>, now: f64) -> Snapshot {
     snapshot_with_stale(daemon, now, crate::accounts::account_alert_stale_secs())
 }
 
 /// [`snapshot`] 의 시험 이음매 — 신선도 규칙의 나이 상한(초)을 인자로 받는다(`0` = 규칙 끔 = 0.14.42 동작). 환경변수를 건드리지 않고(병렬 검체가 서로 오염되지 않게)
-/// 노브 값별 시나리오를 돌린다. 운영은 [`snapshot`] 이 노브 값(`CYS_ACCOUNT_ALERT_STALE_SECS`)을 넘긴다. 락 순서 등 본체 계약은 [`snapshot`] 의 문서와 같다.
+/// 노브 값별 시나리오를 돌린다. 운영은 [`snapshot`] 이 노브 값(`CYS_ACCOUNT_ALERT_STALE_SECS`)을 넘긴다. 락 순서 등 본체 계약은 [`snapshot`] 의 문서와 같다(읽기-통과 신원 표).
 pub fn snapshot_with_stale(daemon: &Arc<Daemon>, now: f64, stale_secs: f64) -> Snapshot {
     let view = crate::accounts::seat_identity_view_at(daemon, now);
-    let mut rates = Vec::new();
-    let mut rate_meta: HashMap<(String, String), RateMeta> = HashMap::new();
+    snapshot_from_view(daemon, now, stale_secs, &view, None)
+}
+
+/// ★R1F-US(M-1) **워치독 틱 전용** 스냅샷 — 신원 표를 **캐시 전용**으로 만든다([`crate::accounts::seat_identity_view_cached`] · IO 0 · stat 0: 항목이 있으면 만료됐어도 마지막 값 · 없으면 None = 판정 불가 = 사용 중 —
+/// 실패 방향은 경보 유지 = 0.14.42 동작). 캐시는 상태줄 보고와 RPC 의 읽기-통과 조회가 채운다. 락 순서·본체 계약은 [`snapshot`] 과 같다(본체 [`snapshot_from_view`]).
+/// ★R1F-US(m-6·b): `cfg` 는 붙들 키를 **임계로 좁히는** 데만 쓴다 — 신선도 규칙으로 빠진 창 가운데 **임계 이상**(`evaluate` 가 경보로 냈을 값)인 것의 키만 `stale_suppressed` 에 싣는다. 임계 미만의 낡은 창이 같은 키를
+/// 쓰는 다른 좌석·계정의 발화 키를 붙들어 새 교차가 30분 늦게 나가는 일을 없앤다(0.14.42 는 즉시).
+pub fn snapshot_cached_with_stale(daemon: &Arc<Daemon>, now: f64, stale_secs: f64, cfg: &AlertConfig) -> Snapshot {
+    let view = crate::accounts::seat_identity_view_cached(daemon);
+    snapshot_from_view(daemon, now, stale_secs, &view, Some(cfg))
+}
+
+/// 스냅샷 본체 — 신원 표(`view`)는 **부른 쪽이** 만들어 넘긴다(읽기-통과판은 파일 IO 가 있으므로 surfaces 락을 잡기 전에). 이 본체는 신원 표를 만들지 않는다(락 순서·IO 위치의 계약).
+/// `hold` = 붙들 키를 임계로 좁힐 설정(None = 좁히지 않는다). ★R1F-US(m-6·a): 같은 키의 입력이 둘 이상이면 **값이 가장 큰 입력 하나**를 쥐고 그 입력의 메타를 싣는다(발행되는 경보의 값과 `age=`·`in_use=`·`reset=` 이 같은 입력의 것).
+fn snapshot_from_view(daemon: &Arc<Daemon>, now: f64, stale_secs: f64, view: &crate::accounts::SeatIdentityView, hold: Option<&AlertConfig>) -> Snapshot {
+    let mut seat_best: HashMap<(String, String), (f64, RateMeta)> = HashMap::new();
     let mut stale_suppressed: Vec<String> = Vec::new();
     {
         let surfaces = daemon.surfaces.lock().unwrap();
-        for s in surfaces.values() {
+        // 좌석 id 순으로 훑는다 — 같은 값·같은 나이의 입력이 겹칠 때 어느 입력이 남는지가 `HashMap` 순서에 달리지 않는다.
+        let mut seats: Vec<&Arc<crate::state::Surface>> = surfaces.values().collect();
+        seats.sort_by_key(|s| s.id);
+        for s in seats {
             if s.exited.load(Ordering::Relaxed) {
                 continue;
             }
@@ -471,14 +494,16 @@ pub fn snapshot_with_stale(daemon: &Arc<Daemon>, now: f64, stale_secs: f64) -> S
                         continue;
                     }
                     if !crate::accounts::alert_eligible(true, in_use, age, stale_secs) {
-                        // 신선도 규칙으로만 빠진 창 — 틱이 이 키를 `fired` 에 붙들어 깜빡임(재발행)을 막는다.
-                        stale_suppressed.push(format!("rate_limit:{role}:{}", w.label));
+                        // 신선도 규칙으로만 빠진 창 — 틱이 이 키를 `fired` 에 붙들어 깜빡임(재발행)을 막는다. ★R1F-US(m-6·b): 틱 판은 임계 이상인 창만 붙든다.
+                        if hold.is_none_or(|c| w.used_pct >= c.rate_limit_pct) {
+                            stale_suppressed.push(format!("rate_limit:{role}:{}", w.label));
+                        }
                         continue;
                     }
-                    rates.push((role.clone(), w.label.clone(), w.used_pct));
-                    keep_meta(
-                        &mut rate_meta,
+                    keep_best(
+                        &mut seat_best,
                         (role.clone(), w.label.clone()),
+                        w.used_pct,
                         RateMeta {
                             observed_at: if known_at { u.rate_observed_at } else { 0.0 },
                             age_secs: age,
@@ -522,17 +547,19 @@ pub fn snapshot_with_stale(daemon: &Arc<Daemon>, now: f64, stale_secs: f64) -> S
         }
     };
     // ★0.14.43(B3): 계정 축 — 적격 행만 입력이 되고, 신선도 규칙으로 빠진 창은 `stale_suppressed` 로 따로 안다.
-    let mut account_rates: Vec<(String, String, f64)> = Vec::new();
-    let mut account_meta: HashMap<(String, String), RateMeta> = HashMap::new();
-    for r in crate::accounts::alert_rates_with(daemon, &view, now, stale_secs) {
+    let mut account_best: HashMap<(String, String), (f64, RateMeta)> = HashMap::new();
+    for r in crate::accounts::alert_rates_with(daemon, view, now, stale_secs) {
         if !r.eligible {
-            stale_suppressed.push(format!("account_rate:{}:{}", r.label, r.win));
+            // ★R1F-US(m-6·b): 틱 판은 임계 이상인 창만 붙든다.
+            if hold.is_none_or(|c| r.used_pct >= c.account_warn_pct) {
+                stale_suppressed.push(format!("account_rate:{}:{}", r.label, r.win));
+            }
             continue;
         }
-        account_rates.push((r.label.clone(), r.win.clone(), r.used_pct));
-        keep_meta(
-            &mut account_meta,
+        keep_best(
+            &mut account_best,
             (r.label.clone(), r.win.clone()),
+            r.used_pct,
             RateMeta {
                 observed_at: r.observed_at,
                 age_secs: r.age_secs,
@@ -545,6 +572,13 @@ pub fn snapshot_with_stale(daemon: &Arc<Daemon>, now: f64, stale_secs: f64) -> S
     }
     stale_suppressed.sort();
     stale_suppressed.dedup();
+    // 같은 키의 입력은 하나로 접혔다(값이 가장 큰 입력) — 키 오름차순으로 낸다(결정론).
+    let mut rates: Vec<(String, String, f64)> = seat_best.iter().map(|((r, l), (p, _))| (r.clone(), l.clone(), *p)).collect();
+    rates.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let rate_meta: HashMap<(String, String), RateMeta> = seat_best.into_iter().map(|(k, (_, m))| (k, m)).collect();
+    let mut account_rates: Vec<(String, String, f64)> = account_best.iter().map(|((l, w), (p, _))| (l.clone(), w.clone(), *p)).collect();
+    account_rates.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    let account_meta: HashMap<(String, String), RateMeta> = account_best.into_iter().map(|(k, (_, m))| (k, m)).collect();
     // ★T-0147-2 A8 + N6b: 두 oracle 을 합친다 —
     //   파일 oracle(레인별 badges.json) = 게이트가 state 를 쓸 수 있을 때의 정상 경로,
     //   state 외부 oracle(gate_signal_badges) = 바로 그 state 를 못 쓸 때의 유일한 경로.
@@ -570,17 +604,21 @@ fn reset_in_secs(resets_at: Option<f64>, now: f64) -> Option<f64> {
     resets_at.filter(|r| r.is_finite() && *r >= 1.0e9).map(|r| r - now)
 }
 
-/// 같은 키의 메타가 둘 이상이면(같은 역할명 좌석 여럿 · 같은 이메일의 두 계정) **가장 최근에 관측된(나이가 작은) 쪽**을 쥔다 — 경보가 읽는 값이 가장 신선한 쪽이다.
-/// (`evaluate` 는 같은 키의 중복 입력마다 경보를 만들지만 발행은 키당 하나라 메타도 하나면 된다.)
-fn keep_meta(map: &mut HashMap<(String, String), RateMeta>, key: (String, String), meta: RateMeta) {
+/// ★R1F-US(m-6·a) 같은 키의 입력이 둘 이상이면(같은 역할명·역할 없음(`?`) 좌석 여럿 · 같은 이메일의 두 계정) **값(사용률)이 가장 큰 입력**을 쥐고 그 입력의 메타를 함께 쥔다 — 발행되는 경보의 값과 메타(`age=`·`in_use=`·`reset=`)가
+/// 같은 입력의 것이어야 한다(종전엔 나이가 가장 작은 입력의 메타를 쥐어 "3시간 전 99%" 가 `age=5` 로 나갈 수 있었다). 같은 값이면 관측 나이가 작은 쪽. (`evaluate` 는 키당 경보 하나로 나가므로 입력도 키당 하나면 된다.)
+fn keep_best(map: &mut HashMap<(String, String), (f64, RateMeta)>, key: (String, String), pct: f64, meta: RateMeta) {
     use std::collections::hash_map::Entry;
     match map.entry(key) {
         Entry::Vacant(v) => {
-            v.insert(meta);
+            v.insert((pct, meta));
         }
         Entry::Occupied(mut o) => {
-            if meta.age_secs < o.get().age_secs {
-                o.insert(meta);
+            let better = {
+                let (cur_pct, cur_meta) = o.get();
+                pct > *cur_pct || (pct == *cur_pct && meta.age_secs < cur_meta.age_secs)
+            };
+            if better {
+                o.insert((pct, meta));
             }
         }
     }
@@ -648,16 +686,27 @@ mod tests {
         assert_eq!(keys, sorted);
     }
 
-    /// 락 순서 배선 핀(소스): `snapshot` 은 신원 표(파일 IO · 락 없이)를 surfaces 락을 잡기 **전에** 만들고, 계정 축 입력(accounts 락)은 surfaces 락을 놓은 뒤에 읽는다.
+    /// 락 순서 배선 핀(소스): 스냅샷은 신원 표(읽기-통과는 파일 IO 가 있다 · 락 없이)를 surfaces 락을 잡기 **전에** 만들고, 계정 축 입력(accounts 락)은 surfaces 락을 놓은 뒤에 읽는다.
+    /// ★R1F-US: 스냅샷이 두 진입점(`snapshot_with_stale` 읽기-통과 · `snapshot_cached_with_stale` 캐시 전용)과 본체(`snapshot_from_view`)로 갈렸다 — 두 진입점이 각자 신원 표를 만든 **뒤에** 본체를 부르고,
+    /// 본체는 신원 표를 인자로만 받는다(안에서 만들지 않는다). 계약(신원 표 → surfaces → accounts 순서)은 같다.
     #[test]
     fn b3_snapshot_builds_the_identity_view_before_taking_the_surfaces_lock() {
         let src = include_str!("alerts.rs");
-        let body = src.split("pub fn snapshot_with_stale(").nth(1).expect("snapshot_with_stale 소실");
-        let body = &body[..body.find("\n}\n").expect("끝")];
-        let view = body.find("seat_identity_view_at(").expect("신원 표 호출");
+        let func = |head: &str| -> String {
+            let body = src.split(head).nth(1).unwrap_or_else(|| panic!("{head} 소실"));
+            body[..body.find("\n}\n").unwrap_or_else(|| panic!("{head} 끝"))].to_string()
+        };
+        for head in ["pub fn snapshot_with_stale(", "pub fn snapshot_cached_with_stale("] {
+            let entry = func(head);
+            let view = entry.find("seat_identity_view").unwrap_or_else(|| panic!("{head}: 신원 표 호출"));
+            let call = entry.find("snapshot_from_view(").unwrap_or_else(|| panic!("{head}: 본체 호출"));
+            assert!(view < call, "{head}: 신원 표가 본체(surfaces 락을 잡는다) 호출 뒤에 만들어진다(파일 IO 가 락 안)");
+            assert!(!entry.contains("daemon.surfaces.lock()"), "{head}: 진입점이 surfaces 락을 직접 쥔다");
+        }
+        let body = func("fn snapshot_from_view(");
+        assert!(!body.contains("seat_identity_view"), "본체가 신원 표를 직접 만든다(surfaces 락 안의 파일 IO 위험)");
         let surfaces = body.find("daemon.surfaces.lock()").expect("surfaces 락");
         let accounts = body.find("alert_rates_with(").expect("계정 축 입력");
-        assert!(view < surfaces, "신원 표가 surfaces 락 안에서 만들어진다(파일 IO 가 락 안)");
         let block_end = body[surfaces..].find("\n    }\n").map(|i| surfaces + i).expect("surfaces 블록 끝");
         assert!(block_end < accounts, "계정 축 입력(accounts 락)이 surfaces 락을 쥔 채 읽힌다");
     }
