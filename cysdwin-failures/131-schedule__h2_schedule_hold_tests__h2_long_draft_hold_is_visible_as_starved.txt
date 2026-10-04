@@ -1,0 +1,19 @@
+test        : schedule::h2_schedule_hold_tests::h2_long_draft_hold_is_visible_as_starved
+sequence    : 131 of 196
+module      : schedule   (full path: schedule::h2_schedule_hold_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/schedule.rs:5385   thread 'schedule::h2_schedule_hold_tests::h2_long_draft_hold_is_visible_as_starved'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("queued(gate:draft)")
+FAILED
+----------------------------------------------------------------------
+test schedule::h2_schedule_hold_tests::h2_long_draft_hold_is_visible_as_starved ... 
+thread 'schedule::h2_schedule_hold_tests::h2_long_draft_hold_is_visible_as_starved' (41328) panicked at src\bin\cysd\schedule.rs:5385:9:
+assertion `left == right` failed
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("queued(gate:draft)")
+FAILED

@@ -1,0 +1,19 @@
+test        : schedule::h2_schedule_hold_tests::h2_unproven_machine_draft_falls_back_after_bounded_diverts
+sequence    : 140 of 196
+module      : schedule   (full path: schedule::h2_schedule_hold_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/schedule.rs:5333   thread 'schedule::h2_schedule_hold_tests::h2_unproven_machine_draft_falls_back_after_bounded_diverts'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("queued(gate:draft)")
+FAILED
+----------------------------------------------------------------------
+test schedule::h2_schedule_hold_tests::h2_unproven_machine_draft_falls_back_after_bounded_diverts ... 
+thread 'schedule::h2_schedule_hold_tests::h2_unproven_machine_draft_falls_back_after_bounded_diverts' (42988) panicked at src\bin\cysd\schedule.rs:5333:9:
+assertion `left == right` failed
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("queued(gate:draft)")
+FAILED

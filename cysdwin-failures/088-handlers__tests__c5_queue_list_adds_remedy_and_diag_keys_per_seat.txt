@@ -1,0 +1,19 @@
+test        : handlers::tests::c5_queue_list_adds_remedy_and_diag_keys_per_seat
+sequence    : 88 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:17342   thread 'handlers::tests::c5_queue_list_adds_remedy_and_diag_keys_per_seat'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 막힌 좌석 행 2건
+  left: 3
+ right: 2
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::c5_queue_list_adds_remedy_and_diag_keys_per_seat ... 
+thread 'handlers::tests::c5_queue_list_adds_remedy_and_diag_keys_per_seat' (22216) panicked at src\bin\cysd\handlers.rs:17342:9:
+assertion `left == right` failed: 막힌 좌석 행 2건
+  left: 3
+ right: 2
+FAILED

@@ -1,0 +1,19 @@
+test        : approval::tests::saving_migrates_ttl_records_out_of_the_shared_store
+sequence    : 15 of 196
+module      : approval   (full path: approval::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/approval.rs:1533   thread 'approval::tests::saving_migrates_ttl_records_out_of_the_shared_store'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 분리 전 공용 파일을 읽을 때 승인 id 또는 L, T 순서가 바뀌었습니다
+  left: []
+ right: ["L", "T"]
+FAILED
+----------------------------------------------------------------------
+test approval::tests::saving_migrates_ttl_records_out_of_the_shared_store ... 
+thread 'approval::tests::saving_migrates_ttl_records_out_of_the_shared_store' (12036) panicked at src\bin\cysd\approval.rs:1533:9:
+assertion `left == right` failed: 분리 전 공용 파일을 읽을 때 승인 id 또는 L, T 순서가 바뀌었습니다
+  left: []
+ right: ["L", "T"]
+FAILED

@@ -1,0 +1,15 @@
+test        : handlers::tests::feed_push_rejects_reserved_daemon_prefix
+sequence    : 92 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:25684   thread 'handlers::tests::feed_push_rejects_reserved_daemon_prefix'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+거부된 push 는 항목을 만들지 않아야 한다(부작용 0)
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::feed_push_rejects_reserved_daemon_prefix ... 
+thread 'handlers::tests::feed_push_rejects_reserved_daemon_prefix' (31148) panicked at src\bin\cysd\handlers.rs:25684:9:
+거부된 push 는 항목을 만들지 않아야 한다(부작용 0)
+FAILED

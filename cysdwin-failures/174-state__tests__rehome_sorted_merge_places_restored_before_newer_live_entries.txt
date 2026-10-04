@@ -1,0 +1,19 @@
+test        : state::tests::rehome_sorted_merge_places_restored_before_newer_live_entries
+sequence    : 174 of 196
+module      : state   (full path: state::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/state.rs:10479   thread 'state::tests::rehome_sorted_merge_places_restored_before_newer_live_entries'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed
+  left: 0
+ right: 2
+FAILED
+----------------------------------------------------------------------
+test state::tests::rehome_sorted_merge_places_restored_before_newer_live_entries ... 
+thread 'state::tests::rehome_sorted_merge_places_restored_before_newer_live_entries' (52360) panicked at src\bin\cysd\state.rs:10479:9:
+assertion `left == right` failed
+  left: 0
+ right: 2
+FAILED

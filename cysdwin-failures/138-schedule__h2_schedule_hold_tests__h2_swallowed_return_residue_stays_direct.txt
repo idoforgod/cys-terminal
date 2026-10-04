@@ -1,0 +1,19 @@
+test        : schedule::h2_schedule_hold_tests::h2_swallowed_return_residue_stays_direct
+sequence    : 138 of 196
+module      : schedule   (full path: schedule::h2_schedule_hold_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/schedule.rs:5267   thread 'schedule::h2_schedule_hold_tests::h2_swallowed_return_residue_stays_direct'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: CR 이 삼켜진 기계 잔여 위에서 큐로 우회했다 — 푸는 주체 없는 무기한 보류(③)
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("pushed")
+FAILED
+----------------------------------------------------------------------
+test schedule::h2_schedule_hold_tests::h2_swallowed_return_residue_stays_direct ... 
+thread 'schedule::h2_schedule_hold_tests::h2_swallowed_return_residue_stays_direct' (44212) panicked at src\bin\cysd\schedule.rs:5267:9:
+assertion `left == right` failed: CR 이 삼켜진 기계 잔여 위에서 큐로 우회했다 — 푸는 주체 없는 무기한 보류(③)
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("pushed")
+FAILED

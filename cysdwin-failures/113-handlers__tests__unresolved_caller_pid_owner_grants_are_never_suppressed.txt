@@ -1,0 +1,36 @@
+test        : handlers::tests::unresolved_caller_pid_owner_grants_are_never_suppressed
+sequence    : 113 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:13039   thread 'handlers::tests::unresolved_caller_pid_owner_grants_are_never_suppressed'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 원장에도 3건이 남아야 한다 — {"event":"acl.owner_granted","ts":2.0}
+{"event":"acl.owner_granted","payload":{"caller_pid":999102,"caller_pid_resolved":true,"denied_as_role":"external","explicit_owner_rule":false,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. 이 등급은 보안 경계가 아니라 거버넌스 구분이다 — 같은 UID 로 operator.token 을 읽을 수 있는 프로세스(타 데몬 노드 포함)는 raw RPC 로 참칭할 수 있다. 공용 cys CLI 는 토큰을 붙이지 않으므로 정상 노드는 여기 오지 않는다. 예상 밖 caller_pid 면 그 프로세스를 확인하라.","to_role":"worker-1"},"to_surface":5,"ts":1791102733.8405547}
+{"event":"acl.owner_granted","payload":{"caller_pid":999131,"caller_pid_resolved":true,"denied_as_role":"external","explicit_owner_rule":false,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. 이 등급은 보안 경계가 아니라 거버넌스 구분이다 — 같은 UID 로 operator.token 을 읽을 수 있는 프로세스(타 데몬 노드 포함)는 raw RPC 로 참칭할 수 있다. 공용 cys CLI 는 토큰을 붙이지 않으므로 정상 노드는 여기 오지 않는다. 예상 밖 caller_pid 면 그 프로세스를 확인하라.","to_role":"worker-1"},"to_surface":5,"ts":1791102733.9183939}
+{"event":"acl.owner_granted","payload":{"caller_pid":999121,"caller_pid_resolved":true,"denied_as_role":"external","explicit_owner_rule":true,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. 이 등급은 보안 경계가 아니라 거버넌스 구분이다 — 같은 UID 로 operator.token 을 읽을 수 있는 프로세스(타 데몬 노드 포함)는 raw RPC 로 참칭할 수 있다. 공용 cys CLI 는 토큰을 붙이지 않으므로 정상 노드는 여기 오지 않는다. 예상 밖 caller_pid 면 그 프로세스를 확인하라.","to_role":"worker-1"},"to_surface":5,"ts":1791102734.2
+[... 394 bytes cut here (a file is capped; head and tail are kept) ...]
+ 수 있다. 공용 cys CLI 는 토큰을 붙이지 않으므로 정상 노드는 여기 오지 않는다. 예상 밖 caller_pid 면 그 프로세스를 확인하라.","to_role":"worker-1"},"to_surface":5,"ts":1791102734.570164}
+{"event":"acl.owner_granted","payload":{"caller_pid":null,"caller_pid_resolved":false,"denied_as_role":"external","explicit_owner_rule":false,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. ★발신자 pid 를 커널에서 해석하지 못했다(peer 조회 실패) — 프로세스를 특정할 수 없으므로 억제 없이 매 건 기록한다. 이 부류는 신원 미상 승격이라 감사가치가 가장 높다: 같은 시각의 배달 원장·부서 소켓 접속을 함께 보라.","to_role":"worker-1"},"to_surface":29,"ts":1791102861.2585237}
+{"event":"acl.owner_granted","payload":{"caller_pid":null,"caller_pid_resolved":false,"denied_as_role":"external","explicit_owner_rule":false,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. ★발신자 pid 를 커널에서 해석하지 못했다(peer 조회 실패) — 프로세스를 특정할 수 없으므로 억제 없이 매 건 기록한다. 이 부류는 신원 미상 승격이라 감사가치가 가장 높다: 같은 시각의 배달 원장·부서 소켓 접속을 함께 보라.","to_role":"worker-1"},"to_surface":29,"ts":1791102861.261719}
+{"event":"acl.owner_granted","payload":{"caller_pid":null,"caller_pid_resolved":false,"denied_as_role":"external","explicit_owner_rule":false,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. ★발신자 pid 를 커널에서 해석하지 못했다(peer 조회 실패) — 프로세스를 특정할 수 없으므로 억제 없이 매 건 기록한다. 이 부류는 신원 미상 승격이라 감사가치가 가장 높다: 같은 시각의 배달 원장·부서 소켓 접속을 함께 보라.","to_role":"worker-1"},"to_surface":29,"ts":1791102861.2790596}
+
+  left: 8
+ right: 3
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::unresolved_caller_pid_owner_grants_are_never_suppressed ... 
+thread 'handlers::tests::unresolved_caller_pid_owner_grants_are_never_suppressed' (41724) panicked at src\bin\cysd\handlers.rs:13039:9:
+assertion `left == right` failed: 원장에도 3건이 남아야 한다 — {"event":"acl.owner_granted","ts":2.0}
+{"event":"acl.owner_granted","payload":{"caller_pid":999102,"caller_pid_resolved":true,"denied_as_role":"external","explicit_owner_rule":false,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. 이 등급은 보안 경계가 아니라 거버넌스 구분이다 — 같은 UID 로 operator.token 을 읽을 수 있는 프로세스(타 데몬 노드 포함)는 raw RPC 로 참칭할 수 있다. 공용 cys CLI 는 토큰을 붙이지 않으므로 정상 노드는 여기 오지 않는다. 예상 밖 caller_pid 면 그 프로세스를 확인하라.","to_role":"worker-1"},"to_surface":5,"ts":1791102733.8405547}
+{"event":"acl.owner_granted","payload":{"caller_pid":999131,"caller_pid_resolved":true,"denied_as_role":"external","explicit_owner_rule":false,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. 이 등급은 보안 경계가 아니라 거버넌스 구분이다 — 같은 UID 로 operator.token 을 읽을 수 있는 프로세스(타 데몬 노드 포함)는 raw RPC 로 참칭할 수 있다. 공용 cys CLI 는 토큰을 붙이지 않으므로 정상 노드는 여기 오지 않는다. 예상 밖 caller_pid 면 그 프로세스를 확인하라.","to_role":"worker-1"},"to_surface":5,"ts":1791102733.9183939}
+{"event":"acl.owner_granted","payload":{"caller_pid":999121,"caller_pid_resolved":true,"denied_as_role":"external","explicit_owner_rule":true,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. 이 등급은 보안 경계가 아니라 거버넌스 구분이다 — 같은 UID 로 operator.token 을 읽을 수 있는 프로세스(타 데몬 노드 포함)는 raw RPC 로 참칭할 수 있다. 공용 cys CLI 는 토큰을 붙이지 않으므로 정상 노드는 여기 오지 않는다. 예상 밖 caller_pid 면 그 프로세스를 확인하라.","to_role":"worker-1"},"to_surface":5,"ts":1791102734.2008245}
+{"event":"acl.owner_granted","payload":{"caller_pid":999101,"caller_pid_resolved":true,"denied_as_role":"external","explicit_owner_rule":true,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. 이 등급은 보안 경계가 아니라 거버넌스 구분이다 — 같은 UID 로 operator.token 을 읽을 수 있는 프로세스(타 데몬 노드 포함)는 raw RPC 로 참칭할 수 있다. 공용 cys CLI 는 토큰을 붙이지 않으므로 정상 노드는 여기 오지 않는다. 예상 밖 caller_pid 면 그 프로세스를 확인하라.","to_role":"worker-1"},"to_surface":5,"ts":1791102734.570164}
+{"event":"acl.owner_granted","payload":{"caller_pid":null,"caller_pid_resolved":false,"denied_as_role":"external","explicit_owner_rule":false,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. ★발신자 pid 를 커널에서 해석하지 못했다(peer 조회 실패) — 프로세스를 특정할 수 없으므로 억제 없이 매 건 기록한다. 이 부류는 신원 미상 승격이라 감사가치가 가장 높다: 같은 시각의 배달 원장·부서 소켓 접속을 함께 보라.","to_role":"worker-1"},"to_surface":29,"ts":1791102861.2585237}
+{"event":"acl.owner_granted","payload":{"caller_pid":null,"caller_pid_resolved":false,"denied_as_role":"external","explicit_owner_rule":false,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. ★발신자 pid 를 커널에서 해석하지 못했다(peer 조회 실패) — 프로세스를 특정할 수 없으므로 억제 없이 매 건 기록한다. 이 부류는 신원 미상 승격이라 감사가치가 가장 높다: 같은 시각의 배달 원장·부서 소켓 접속을 함께 보라.","to_role":"worker-1"},"to_surface":29,"ts":1791102861.261719}
+{"event":"acl.owner_granted","payload":{"caller_pid":null,"caller_pid_resolved":false,"denied_as_role":"external","explicit_owner_rule":false,"note":"owner 등급 승격이 ACL 판정을 뒤집었다. ★발신자 pid 를 커널에서 해석하지 못했다(peer 조회 실패) — 프로세스를 특정할 수 없으므로 억제 없이 매 건 기록한다. 이 부류는 신원 미상 승격이라 감사가치가 가장 높다: 같은 시각의 배달 원장·부서 소켓 접속을 함께 보라.","to_role":"worker-1"},"to_surface":29,"ts":1791102861.2790596}
+
+  left: 8
+ right: 3
+FAILED

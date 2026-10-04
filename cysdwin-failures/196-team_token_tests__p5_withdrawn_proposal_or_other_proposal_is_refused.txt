@@ -1,0 +1,19 @@
+test        : team_token_tests::p5_withdrawn_proposal_or_other_proposal_is_refused
+sequence    : 196 of 196
+module      : team_token_tests   (full path: team_token_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/team_token_tests.rs:175   thread 'team_token_tests::p5_withdrawn_proposal_or_other_proposal_is_refused'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 제안 발행 실패: {"error":{"code":"team_proposal_limit","message":"대기 중인 팀 만들기 제안이 이미 1건 있다 — 오너가 확인 창에서 처리할 때까지 기다리거나, 고쳐 올리려면 먼저 `cys feed reply <id> superseded` 로 자기 제안을 거둔다"},"id":1,"ok":false}
+  left: Bool(false)
+ right: Bool(true)
+FAILED
+----------------------------------------------------------------------
+test team_token_tests::p5_withdrawn_proposal_or_other_proposal_is_refused ... 
+thread 'team_token_tests::p5_withdrawn_proposal_or_other_proposal_is_refused' (56004) panicked at src\bin\cysd\team_token_tests.rs:175:5:
+assertion `left == right` failed: 제안 발행 실패: {"error":{"code":"team_proposal_limit","message":"대기 중인 팀 만들기 제안이 이미 1건 있다 — 오너가 확인 창에서 처리할 때까지 기다리거나, 고쳐 올리려면 먼저 `cys feed reply <id> superseded` 로 자기 제안을 거둔다"},"id":1,"ok":false}
+  left: Bool(false)
+ right: Bool(true)
+FAILED

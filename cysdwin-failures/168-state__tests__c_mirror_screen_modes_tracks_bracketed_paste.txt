@@ -1,0 +1,15 @@
+test        : state::tests::c_mirror_screen_modes_tracks_bracketed_paste
+sequence    : 168 of 196
+module      : state   (full path: state::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/state.rs:8048   thread 'state::tests::c_mirror_screen_modes_tracks_bracketed_paste'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+reader 가 2004h 를 미러해야 한다
+FAILED
+----------------------------------------------------------------------
+test state::tests::c_mirror_screen_modes_tracks_bracketed_paste ... 
+thread 'state::tests::c_mirror_screen_modes_tracks_bracketed_paste' (16788) panicked at src\bin\cysd\state.rs:8048:9:
+reader 가 2004h 를 미러해야 한다
+FAILED

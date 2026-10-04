@@ -1,0 +1,19 @@
+test        : boot_supervisor::tests::exhaustion_notice_reaches_the_declaring_surface_with_ledger_first
+sequence    : 19 of 196
+module      : boot_supervisor   (full path: boot_supervisor::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/boot_supervisor.rs:5705   thread 'boot_supervisor::tests::exhaustion_notice_reaches_the_declaring_surface_with_ledger_first'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 통보의 선언 surface 귀속 소실
+  left: None
+ right: Some(1)
+FAILED
+----------------------------------------------------------------------
+test boot_supervisor::tests::exhaustion_notice_reaches_the_declaring_surface_with_ledger_first ... 
+thread 'boot_supervisor::tests::exhaustion_notice_reaches_the_declaring_surface_with_ledger_first' (6028) panicked at src\bin\cysd\boot_supervisor.rs:5705:9:
+assertion `left == right` failed: 통보의 선언 surface 귀속 소실
+  left: None
+ right: Some(1)
+FAILED

@@ -1,0 +1,15 @@
+test        : analytics::tests::change_log_append_accepts_and_chains
+sequence    : 11 of 196
+module      : analytics   (full path: analytics::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/analytics.rs:1882   thread 'analytics::tests::change_log_append_accepts_and_chains'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+open analytics.db
+FAILED
+----------------------------------------------------------------------
+test analytics::tests::change_log_append_accepts_and_chains ... 
+thread 'analytics::tests::change_log_append_accepts_and_chains' (11876) panicked at src\bin\cysd\analytics.rs:1882:34:
+open analytics.db
+FAILED

@@ -1,0 +1,172 @@
+cysd-win digest (diag/cysdwin-digest.py v1) - generated 2026-10-04T08:36:33Z
+
+== what was run ==
+product ref   : bd0a0ca3e1d7634057b6ca4c6160953b36f1a3d3
+filter        : (none)
+skip          : hwmon::tests::snapshot_has_all_sections attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery
+cargo command : cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections --skip attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery
+cargo rc      : 101
+elapsed       : 660 s (11 min 0 s)
+step outcomes : read-input=success, checkout-product=success, cargo=failure
+
+== test result lines (1) ==
+test result: FAILED. 1680 passed; 196 failed; 3 ignored; 0 measured; 2 filtered out; finished in 486.91s
+
+== counts ==
+"test <name> ... " lines in the log      : 1879
+result marks of those lines              : FAILED=196, ignored=3, ok=1680
+failing tests                            : 196   (taken from: failures list)
+  with a log part                        : 196
+  with a panic location                  : 196
+  with more than one panic in their part : 0
+failed according to the result line(s)   : 196 -> agrees with the list
+last started test                        : write_stall_tests::write_stall_default_leaves_release_margin
+
+== failures per module (name before "::tests::"; else the first path segment) ==
+   38  channels
+   38  handlers
+   25  schedule
+   22  send_settle_tests
+   17  governance
+   14  state
+   10  accounts
+   10  team_token_tests
+    7  boot_supervisor
+    6  team_gate_tests
+    4  analytics
+    2  approval
+    1  auto_restore_tests
+    1  recall
+    1  return_absorb_tests
+
+== failures per full module path (top 40) ==
+   38  channels::tests
+   38  handlers::tests
+   22  send_settle_tests
+   15  schedule::h2_schedule_hold_tests
+   13  state::tests
+   10  team_token_tests
+    9  governance::tests
+    7  boot_supervisor::tests
+    6  schedule::c8_push_counts_submit_tests
+    6  team_gate_tests
+    4  accounts::tests::b1_units
+    4  analytics::tests
+    4  governance::h_machine_hold_tests
+    3  schedule::tests
+    2  accounts::tests::r1f_us
+    2  accounts::tests
+    2  approval::tests
+    2  governance::reflect_queue_tests
+    2  governance::todo_decl_tests
+    1  accounts::tests::b3_scenarios
+    1  accounts::tests::b3_units
+    1  auto_restore_tests
+    1  recall::tests
+    1  return_absorb_tests
+    1  schedule::triage_schedule
+    1  state::reflect_queue_tests
+
+== failures per panic location (file:line of the FIRST panic of the test; top 30; backslashes shown as /) ==
+   35  src/bin/cysd/channels.rs:2607
+   10  src/bin/cysd/team_token_tests.rs:175
+    9  src/bin/cysd/send_settle_tests.rs:592
+    4  src/bin/cysd/send_settle_tests.rs:1003
+    2  src/bin/cysd/analytics.rs:1882
+    1  src/bin/cysd/accounts.rs:4884
+    1  src/bin/cysd/accounts.rs:4862
+    1  src/bin/cysd/accounts.rs:4784
+    1  src/bin/cysd/accounts.rs:4921
+    1  src/bin/cysd/accounts.rs:3550
+    1  src/bin/cysd/accounts.rs:3945
+    1  src/bin/cysd/accounts.rs:5579
+    1  src/bin/cysd/accounts.rs:5501
+    1  src/bin/cysd/accounts.rs:2993
+    1  src/bin/cysd/accounts.rs:3074
+    1  src/bin/cysd/analytics.rs:1981
+    1  src/bin/cysd/analytics.rs:1921
+    1  src/bin/cysd/approval.rs:1533
+    1  src/bin/cysd/approval.rs:1356
+    1  src/bin/cysd/main.rs:5000
+    1  src/bin/cysd/boot_supervisor.rs:5737
+    1  src/bin/cysd/boot_supervisor.rs:5705
+    1  src/bin/cysd/boot_supervisor.rs:5679
+    1  src/bin/cysd/boot_supervisor.rs:5775
+    1  src/bin/cysd/boot_supervisor.rs:6086
+    1  src/bin/cysd/boot_supervisor.rs:6108
+    1  src/bin/cysd/boot_supervisor.rs:5813
+    1  src/bin/cysd/channels.rs:2745
+    1  src/bin/cysd/channels.rs:2692
+    1  src/bin/cysd/channels.rs:2760
+
+== failures per message type (PRIMARY label = first matching rule below; the counts add up to the number of failures) ==
+  111  assert_left_right
+   39  unwrap_err
+   26  other
+   13  no_such_file
+    5  assert_failed
+    2  path_backslash
+
+== failures per message type (ANY match: a failure counts for every rule that matches it) ==
+  112  assert_left_right
+   47  unwrap_err
+   13  no_such_file
+    5  assert_failed
+    2  path_backslash
+
+== first message lines, normalized (paths -> <WINPATH>/<POSIXPATH>, hex ids, digits -> N; top 30) ==
+   37  called `Result::unwrap()` on an `Err` value: SqliteFailure(Error { code: ConstraintViolation, extended_code: N }, Some("UNIQUE constraint failed: channels.chann
+   21  assertion `left == right` failed
+   13  assertion `left == right` failed: 전제: 창 위 제출 CR 은 보류된다: SubmitSettleObs { inflight: false, pending: N, handed_age_ms: Some(N), since_written_ms: Some(N) }
+   10  assertion `left == right` failed: 제안 발행 실패: {"error":{"code":"team_proposal_limit","message":"대기 중인 팀 만들기 제안이 이미 N건 있다 — 오너가 확인 창에서 처리할 때까지 기다리거나, 고쳐 올리려면 먼저 `c
+    8  called `Result::unwrap()` on an `Err` value: Os { code: N, kind: NotFound, message: "The system cannot find the file specified." }
+    3  assertion failed: spool_intents(&daemon).is_empty()
+    3  assertion `left == right` failed: {"error":{"code":"team_proposal_limit","message":"대기 중인 팀 만들기 제안이 이미 N건 있다 — 오너가 확인 창에서 처리할 때까지 기다리거나, 고쳐 올리려면 먼저 `cys feed re
+    2  open analytics.db
+    2  assertion `left == right` failed: feed 통보는 무조건 N건
+    1  assertion `left == right` failed: NKiB 를 넘는 파일의 선언 계정이 적재되지 않았다(상한이 별명과 같아졌다)
+    1  assertion `left == right` failed: 정확히 NMiB 파일을 거절했다
+    1  assertion `left == right` failed: 새 안전 판독이 종전과 다른 선언 계정 뷰를 만들었다
+    1  디렉터리: 선언 계정이 적재됐다: {("antigravity", "default"): ("Antigravity (agy)", true, N, None), ("claude", "u-alt"): ("alt@example.test", true, N, None), ("claude", "u-bN
+    1  assertion `left == right` failed: 그 계정을 쓰는 좌석이 있는데 복원값이 발화하지 않았다
+    1  assertion `left == right` failed: 복원분에 held 가 있다
+    1  assertion `left == right` failed: 자리가 사라진(읽은) 뒤에도 키가 안 나온다
+    1  assertion `left == right` failed: 전제: 정상일 때 A 는 자기 폴더를 현재로 갖는다
+    1  assertion `left == right` failed: 재시작 뒤 경보 입력에 창 밖 값이 들어왔거나 좌석 값이 사라졌다
+    1  assertion `left == right` failed: 분리 전 공용 파일을 읽을 때 승인 id 또는 L, T 순서가 바뀌었습니다
+    1  TTL 승인은 전용 파일에 저장되어야 합니다: Os { code: N, kind: NotFound, message: "The system cannot find the path specified." }
+    1  폴백 후보 경로: <WINPATH>
+    1  assertion `left == right` failed: claim_stale 폐기의 통보가 N건이다(N=조용한 포기 / N+=래치 파손)
+    1  assertion `left == right` failed: 통보의 선언 surface 귀속 소실
+    1  assertion `left == right` failed: 소진 통보가 N회로 접히지 않았다: N건 (매 틱 반복 = 폭주)
+    1  assertion `left == right` failed: 만료 폐기의 통보가 N건이 아니다 — 조용히 사라지는 갈래가 남았다
+    1  assertion `left == right` failed: 재시작 픽업 소진이 조용히 폐기됐다(통보 N건)
+    1  assertion `left == right` failed: 메인은 dept 거부 아닌 정상 경로: {"id":N,"ok":true,"result":{"channel":"slack","pending":[],"registered":true}}
+    1  assertion `left == right` failed: machine_residue N건: []
+    1  assertion `left == right` failed: machine_residue 이벤트는 세대당 N건
+    1  assertion `left == right` failed: 전제: 초안 화면
+
+== message type rules (text = the panic message; when a test has no panic line: its message + the first 15 lines of its log part) ==
+matched case-insensitively, in this order; the first match is the primary label, "other" when nothing matches:
+  no_such_file       no such file or directory|cannot find the (?:path|file) specified|the system cannot find|\bos error (?:2|3)\b|\bNotFound\b
+  permission         permission denied|access is denied|\bos error (?:5|13)\b|\bPermissionDenied\b
+  symlink_privilege  symlink|a required privilege is not held|\bos error 1314\b
+  pipe_socket        named pipe|\bpipe\b|socket|connection (?:refused|reset|aborted)|\bos error (?:109|231|232|10048|10054|10061)\b|\bConnectionRefused\b|\bBrokenPipe\b
+  timeout            timed out|timeout|deadline
+  encoding           utf-?8|invalid utf|code ?page|cp949|cp1252|encoding
+  home_userprofile   (?-i:\bHOME\b|USERPROFILE|APPDATA|LOCALAPPDATA)|home_dir|home dir
+  not_supported      not supported|unsupported|not implemented|only on (?:unix|macos|windows)
+  path_backslash     [A-Za-z]:\\|\\\\\?\\|\\[A-Za-z0-9_.-]+\\|[A-Za-z0-9_.-]+\\[A-Za-z0-9_.-]+\.[A-Za-z0-9]+
+  os_error_other     \bos error \d+\b|\bio::Error\b|Error \{ kind
+  assert_left_right  assertion `?left (?:==|!=) right`? failed|^\s*left:\s|^\s*right:\s
+  assert_failed      assertion failed
+  unwrap_none        called `Option::unwrap\(\)` on a `None` value|Option::expect
+  unwrap_err         called `Result::unwrap\(\)` on an `Err` value|Result::expect
+
+== files ==
+cysdwin-failures/        196 file(s), one per failing test, each capped at 10240 bytes (head + tail kept when longer)
+cysdwin-digest.tsv       seq, test, panic_at (as printed), location (file:line), message (first 300 characters), thread, panics, file
+cysdwin-digest.json      the same numbers for programs
+cysdwin-cargo.log        275976 bytes, kept whole
+cysdwin-meta.json / cysdwin-env.txt   what was run and the runner facts
+

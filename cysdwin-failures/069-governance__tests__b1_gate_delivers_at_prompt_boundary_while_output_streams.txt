@@ -1,0 +1,15 @@
+test        : governance::tests::b1_gate_delivers_at_prompt_boundary_while_output_streams
+sequence    : 69 of 196
+module      : governance   (full path: governance::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:17285   thread 'governance::tests::b1_gate_delivers_at_prompt_boundary_while_output_streams'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+프롬프트 박스가 열려 있으면 출력 중이라도 배달한다(기아 봉인의 본체)
+FAILED
+----------------------------------------------------------------------
+test governance::tests::b1_gate_delivers_at_prompt_boundary_while_output_streams ... 
+thread 'governance::tests::b1_gate_delivers_at_prompt_boundary_while_output_streams' (13292) panicked at src\bin\cysd\governance.rs:17285:9:
+프롬프트 박스가 열려 있으면 출력 중이라도 배달한다(기아 봉인의 본체)
+FAILED

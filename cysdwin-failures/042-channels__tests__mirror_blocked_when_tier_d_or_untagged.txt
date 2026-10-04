@@ -1,0 +1,15 @@
+test        : channels::tests::mirror_blocked_when_tier_d_or_untagged
+sequence    : 42 of 196
+module      : channels   (full path: channels::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/channels.rs:2607   thread 'channels::tests::mirror_blocked_when_tier_d_or_untagged'
+panics      : 1 in this part of the log
+type        : unwrap_err   (any match: unwrap_err)
+message     :
+called `Result::unwrap()` on an `Err` value: SqliteFailure(Error { code: ConstraintViolation, extended_code: 1555 }, Some("UNIQUE constraint failed: channels.channel"))
+FAILED
+----------------------------------------------------------------------
+test channels::tests::mirror_blocked_when_tier_d_or_untagged ... 
+thread 'channels::tests::mirror_blocked_when_tier_d_or_untagged' (12788) panicked at src\bin\cysd\channels.rs:2607:10:
+called `Result::unwrap()` on an `Err` value: SqliteFailure(Error { code: ConstraintViolation, extended_code: 1555 }, Some("UNIQUE constraint failed: channels.channel"))
+FAILED

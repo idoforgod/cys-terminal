@@ -1,0 +1,15 @@
+test        : governance::tests::c5_queue_blocked_file_lifecycle_change_release_and_atomic
+sequence    : 71 of 196
+module      : governance   (full path: governance::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:24252   thread 'governance::tests::c5_queue_blocked_file_lifecycle_change_release_and_atomic'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+전제: 데몬 부트는 사유 파일을 만들지 않는다
+FAILED
+----------------------------------------------------------------------
+test governance::tests::c5_queue_blocked_file_lifecycle_change_release_and_atomic ... 
+thread 'governance::tests::c5_queue_blocked_file_lifecycle_change_release_and_atomic' (10252) panicked at src\bin\cysd\governance.rs:24252:9:
+전제: 데몬 부트는 사유 파일을 만들지 않는다
+FAILED

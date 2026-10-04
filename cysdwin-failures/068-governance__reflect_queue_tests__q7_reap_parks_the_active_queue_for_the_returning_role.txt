@@ -1,0 +1,19 @@
+test        : governance::reflect_queue_tests::q7_reap_parks_the_active_queue_for_the_returning_role
+sequence    : 68 of 196
+module      : governance   (full path: governance::reflect_queue_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:26241   thread 'governance::reflect_queue_tests::q7_reap_parks_the_active_queue_for_the_returning_role'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 보존소에 3행이 아니다
+  left: 6
+ right: 3
+FAILED
+----------------------------------------------------------------------
+test governance::reflect_queue_tests::q7_reap_parks_the_active_queue_for_the_returning_role ... 
+thread 'governance::reflect_queue_tests::q7_reap_parks_the_active_queue_for_the_returning_role' (4888) panicked at src\bin\cysd\governance.rs:26241:13:
+assertion `left == right` failed: 보존소에 3행이 아니다
+  left: 6
+ right: 3
+FAILED

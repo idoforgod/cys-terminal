@@ -1,0 +1,19 @@
+test        : handlers::tests::approval_ttl_roundtrip_through_rpc
+sequence    : 80 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:29478   thread 'handlers::tests::approval_ttl_roundtrip_through_rpc'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 신선한 TTL 승인이 거부됐다: {"id":1,"ok":true,"result":{"approved":false,"reason":null,"ttl_enforced":true}}
+  left: Bool(false)
+ right: Bool(true)
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::approval_ttl_roundtrip_through_rpc ... 
+thread 'handlers::tests::approval_ttl_roundtrip_through_rpc' (18500) panicked at src\bin\cysd\handlers.rs:29478:9:
+assertion `left == right` failed: 신선한 TTL 승인이 거부됐다: {"id":1,"ok":true,"result":{"approved":false,"reason":null,"ttl_enforced":true}}
+  left: Bool(false)
+ right: Bool(true)
+FAILED

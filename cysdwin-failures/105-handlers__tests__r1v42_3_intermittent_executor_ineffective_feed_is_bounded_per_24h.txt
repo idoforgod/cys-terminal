@@ -1,0 +1,15 @@
+test        : handlers::tests::r1v42_3_intermittent_executor_ineffective_feed_is_bounded_per_24h
+sequence    : 105 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:22565   thread 'handlers::tests::r1v42_3_intermittent_executor_ineffective_feed_is_bounded_per_24h'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+전제: 효과 없음이 되풀이된다: 0
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::r1v42_3_intermittent_executor_ineffective_feed_is_bounded_per_24h ... 
+thread 'handlers::tests::r1v42_3_intermittent_executor_ineffective_feed_is_bounded_per_24h' (24592) panicked at src\bin\cysd\handlers.rs:22565:9:
+전제: 효과 없음이 되풀이된다: 0
+FAILED

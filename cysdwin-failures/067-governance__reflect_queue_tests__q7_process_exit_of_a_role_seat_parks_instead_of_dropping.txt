@@ -1,0 +1,15 @@
+test        : governance::reflect_queue_tests::q7_process_exit_of_a_role_seat_parks_instead_of_dropping
+sequence    : 67 of 196
+module      : governance   (full path: governance::reflect_queue_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:26285   thread 'governance::reflect_queue_tests::q7_process_exit_of_a_role_seat_parks_instead_of_dropping'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+전제: 좌석이 15초 안에 종료하지 않았다
+FAILED
+----------------------------------------------------------------------
+test governance::reflect_queue_tests::q7_process_exit_of_a_role_seat_parks_instead_of_dropping ... 
+thread 'governance::reflect_queue_tests::q7_process_exit_of_a_role_seat_parks_instead_of_dropping' (10664) panicked at src\bin\cysd\governance.rs:26285:9:
+전제: 좌석이 15초 안에 종료하지 않았다
+FAILED

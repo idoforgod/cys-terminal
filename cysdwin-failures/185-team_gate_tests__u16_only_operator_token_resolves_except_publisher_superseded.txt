@@ -1,0 +1,19 @@
+test        : team_gate_tests::u16_only_operator_token_resolves_except_publisher_superseded
+sequence    : 185 of 196
+module      : team_gate_tests   (full path: team_gate_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/team_gate_tests.rs:270   thread 'team_gate_tests::u16_only_operator_token_resolves_except_publisher_superseded'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: {"error":{"code":"team_proposal_limit","message":"대기 중인 팀 만들기 제안이 이미 1건 있다 — 오너가 확인 창에서 처리할 때까지 기다리거나, 고쳐 올리려면 먼저 `cys feed reply <id> superseded` 로 자기 제안을 거둔다"},"id":1,"ok":false}
+  left: Bool(false)
+ right: Bool(true)
+FAILED
+----------------------------------------------------------------------
+test team_gate_tests::u16_only_operator_token_resolves_except_publisher_superseded ... 
+thread 'team_gate_tests::u16_only_operator_token_resolves_except_publisher_superseded' (35348) panicked at src\bin\cysd\team_gate_tests.rs:270:5:
+assertion `left == right` failed: {"error":{"code":"team_proposal_limit","message":"대기 중인 팀 만들기 제안이 이미 1건 있다 — 오너가 확인 창에서 처리할 때까지 기다리거나, 고쳐 올리려면 먼저 `cys feed reply <id> superseded` 로 자기 제안을 거둔다"},"id":1,"ok":false}
+  left: Bool(false)
+ right: Bool(true)
+FAILED

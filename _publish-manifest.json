@@ -1,0 +1,824 @@
+{
+  "generated": "2026-10-04T08:36:34.272Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37188821194",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37188821194",
+  "job": "cysd-win",
+  "os": "windows-latest",
+  "branch": "diag-results/37188821194-1-cysd-win-windows-latest",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "cysdwin-cargo.log",
+      "bytes": 275976
+    },
+    {
+      "path": "cysdwin-digest.json",
+      "bytes": 21112
+    },
+    {
+      "path": "cysdwin-digest.tsv",
+      "bytes": 97379
+    },
+    {
+      "path": "cysdwin-env.txt",
+      "bytes": 2309
+    },
+    {
+      "path": "cysdwin-failures/001-accounts__tests__b1_units__b1b_declared_accounts_between_the_two_caps_load_while_aliases_do_not.txt",
+      "bytes": 1592
+    },
+    {
+      "path": "cysdwin-failures/002-accounts__tests__b1_units__b1b_declared_accounts_file_over_one_mebibyte_is_no_declared_accounts.txt",
+      "bytes": 1395
+    },
+    {
+      "path": "cysdwin-failures/003-accounts__tests__b1_units__b1b_declared_accounts_views_match_the_old_loader_on_a_regular_file.txt",
+      "bytes": 2808
+    },
+    {
+      "path": "cysdwin-failures/004-accounts__tests__b1_units__b1b_unreadable_declared_files_mean_no_declared_accounts.txt",
+      "bytes": 1509
+    },
+    {
+      "path": "cysdwin-failures/005-accounts__tests__b3_scenarios__b3_restored_snapshot_without_a_user_stays_silent_and_with_a_user_fire.txt",
+      "bytes": 1179
+    },
+    {
+      "path": "cysdwin-failures/006-accounts__tests__b3_units__b3_alert_rows_carry_age_in_use_reset_and_held.txt",
+      "bytes": 994
+    },
+    {
+      "path": "cysdwin-failures/007-accounts__tests__r1f_us__r1f_a_folder_another_request_is_still_reading_for_the_first_time_is_unread_.txt",
+      "bytes": 1331
+    },
+    {
+      "path": "cysdwin-failures/008-accounts__tests__r1f_us__r1f_a_logged_out_folder_or_one_without_an_identity_file_gives_an_empty_curr.txt",
+      "bytes": 1415
+    },
+    {
+      "path": "cysdwin-failures/009-accounts__tests__snapshot_restore_keeps_outside_values_out_of_alert_inputs.txt",
+      "bytes": 2313
+    },
+    {
+      "path": "cysdwin-failures/010-accounts__tests__snapshot_restore_takes_the_alert_label_from_seat_rows.txt",
+      "bytes": 2196
+    },
+    {
+      "path": "cysdwin-failures/011-analytics__tests__change_log_append_accepts_and_chains.txt",
+      "bytes": 729
+    },
+    {
+      "path": "cysdwin-failures/012-analytics__tests__concurrent_same_base_exactly_one_accepted.txt",
+      "bytes": 749
+    },
+    {
+      "path": "cysdwin-failures/013-analytics__tests__rate_snapshots_record_last_and_prune.txt",
+      "bytes": 826
+    },
+    {
+      "path": "cysdwin-failures/014-analytics__tests__revn_monotonic_rejects_stale_base.txt",
+      "bytes": 934
+    },
+    {
+      "path": "cysdwin-failures/015-approval__tests__saving_migrates_ttl_records_out_of_the_shared_store.txt",
+      "bytes": 1080
+    },
+    {
+      "path": "cysdwin-failures/016-approval__tests__ttl_record_survives_an_old_daemon_rewriting_the_shared_store.txt",
+      "bytes": 1087
+    },
+    {
+      "path": "cysdwin-failures/017-auto_restore_tests__missing_disk_phoenix_still_ready_embed_authoritative.txt",
+      "bytes": 988
+    },
+    {
+      "path": "cysdwin-failures/018-boot_supervisor__tests__claim_stale_retire_is_loud_not_silent.txt",
+      "bytes": 1044
+    },
+    {
+      "path": "cysdwin-failures/019-boot_supervisor__tests__exhaustion_notice_reaches_the_declaring_surface_with_ledger_first.txt",
+      "bytes": 1087
+    },
+    {
+      "path": "cysdwin-failures/020-boot_supervisor__tests__exhaustion_notification_fires_once_across_both_paths.txt",
+      "bytes": 1094
+    },
+    {
+      "path": "cysdwin-failures/021-boot_supervisor__tests__expired_retire_is_loud_on_every_intent_and_gc_is_not_gated_by_notice.txt",
+      "bytes": 1190
+    },
+    {
+      "path": "cysdwin-failures/022-boot_supervisor__tests__h5_notice_skipped_on_modal_pane.txt",
+      "bytes": 918
+    },
+    {
+      "path": "cysdwin-failures/023-boot_supervisor__tests__h5_transient_hold_defers_then_delivers_pane_notice.txt",
+      "bytes": 994
+    },
+    {
+      "path": "cysdwin-failures/024-boot_supervisor__tests__restart_pickup_of_exhausted_intent_is_loud.txt",
+      "bytes": 1030
+    },
+    {
+      "path": "cysdwin-failures/025-channels__tests__dept_daemon_forbids_channel_spawn_main_allows.txt",
+      "bytes": 1148
+    },
+    {
+      "path": "cysdwin-failures/026-channels__tests__inbound_bot_loop_suppressed.txt",
+      "bytes": 1001
+    },
+    {
+      "path": "cysdwin-failures/027-channels__tests__inbound_dedup_conflict_same_key_diff_hash.txt",
+      "bytes": 1057
+    },
+    {
+      "path": "cysdwin-failures/028-channels__tests__inbound_idempotent_same_key_same_hash.txt",
+      "bytes": 1041
+    },
+    {
+      "path": "cysdwin-failures/029-channels__tests__inbound_owner_allowed_lands_in_inbox.txt",
+      "bytes": 1037
+    },
+    {
+      "path": "cysdwin-failures/030-channels__tests__inbound_owner_only_fail_closed.txt",
+      "bytes": 1013
+    },
+    {
+      "path": "cysdwin-failures/031-channels__tests__interaction_expired_rejected.txt",
+      "bytes": 1005
+    },
+    {
+      "path": "cysdwin-failures/032-channels__tests__interaction_forged_nonce_rejected.txt",
+      "bytes": 1025
+    },
+    {
+      "path": "cysdwin-failures/033-channels__tests__interaction_gate_off_rejected.txt",
+      "bytes": 1009
+    },
+    {
+      "path": "cysdwin-failures/034-channels__tests__interaction_non_owner_rejected.txt",
+      "bytes": 1013
+    },
+    {
+      "path": "cysdwin-failures/035-channels__tests__interaction_owner_mismatch_rejected.txt",
+      "bytes": 1033
+    },
+    {
+      "path": "cysdwin-failures/036-channels__tests__interaction_replay_rejected_nonce_burned.txt",
+      "bytes": 1053
+    },
+    {
+      "path": "cysdwin-failures/037-channels__tests__interaction_unknown_feed_rejected.txt",
+      "bytes": 1025
+    },
+    {
+      "path": "cysdwin-failures/038-channels__tests__interaction_valid_button_resolves_feed.txt",
+      "bytes": 1045
+    },
+    {
+      "path": "cysdwin-failures/039-channels__tests__lockdown_then_unlock_restores_inbound.txt",
+      "bytes": 1041
+    },
+    {
+      "path": "cysdwin-failures/040-channels__tests__mirror_blocked_after_expiry.txt",
+      "bytes": 1001
+    },
+    {
+      "path": "cysdwin-failures/041-channels__tests__mirror_blocked_when_gate_off.txt",
+      "bytes": 1005
+    },
+    {
+      "path": "cysdwin-failures/042-channels__tests__mirror_blocked_when_tier_d_or_untagged.txt",
+      "bytes": 1045
+    },
+    {
+      "path": "cysdwin-failures/043-channels__tests__mirror_idempotent_no_duplicate_button.txt",
+      "bytes": 1041
+    },
+    {
+      "path": "cysdwin-failures/044-channels__tests__non_owner_denied_before_botloop_no_loopwin.txt",
+      "bytes": 1061
+    },
+    {
+      "path": "cysdwin-failures/045-channels__tests__outbound_blocked_during_lockdown.txt",
+      "bytes": 1021
+    },
+    {
+      "path": "cysdwin-failures/046-channels__tests__outbound_monotonic_and_idempotent.txt",
+      "bytes": 1025
+    },
+    {
+      "path": "cysdwin-failures/047-channels__tests__outbound_target_fail_closed.txt",
+      "bytes": 1001
+    },
+    {
+      "path": "cysdwin-failures/048-channels__tests__outbound_timeout_to_unknown.txt",
+      "bytes": 1001
+    },
+    {
+      "path": "cysdwin-failures/049-channels__tests__pause_freezes_outbound_timeout_clock.txt",
+      "bytes": 1037
+    },
+    {
+      "path": "cysdwin-failures/050-channels__tests__prune_retention_removes_old_terminal_keeps_live.txt",
+      "bytes": 1081
+    },
+    {
+      "path": "cysdwin-failures/051-channels__tests__register_rejects_token_mismatch.txt",
+      "bytes": 1017
+    },
+    {
+      "path": "cysdwin-failures/052-channels__tests__register_reprompts_sent_approval_with_pending_feed.txt",
+      "bytes": 1093
+    },
+    {
+      "path": "cysdwin-failures/053-channels__tests__register_returns_pending_outbound.txt",
+      "bytes": 1025
+    },
+    {
+      "path": "cysdwin-failures/054-channels__tests__revoke_removes_from_allowlist.txt",
+      "bytes": 1009
+    },
+    {
+      "path": "cysdwin-failures/055-channels__tests__status_reports_channel_shape.txt",
+      "bytes": 1005
+    },
+    {
+      "path": "cysdwin-failures/056-channels__tests__status_reports_remote_approve.txt",
+      "bytes": 1009
+    },
+    {
+      "path": "cysdwin-failures/057-channels__tests__v2_nonce_feed_mismatch_rejected.txt",
+      "bytes": 1017
+    },
+    {
+      "path": "cysdwin-failures/058-channels__tests__v4_sender_cooldown_after_consecutive_fails.txt",
+      "bytes": 1061
+    },
+    {
+      "path": "cysdwin-failures/059-channels__tests__v4_success_resets_consecutive_fails.txt",
+      "bytes": 1033
+    },
+    {
+      "path": "cysdwin-failures/060-channels__tests__v7_cap_counts_allow_not_deny.txt",
+      "bytes": 1005
+    },
+    {
+      "path": "cysdwin-failures/061-channels__tests__v7_daily_cap_21st_allow_rejected_pending_preserved.txt",
+      "bytes": 1093
+    },
+    {
+      "path": "cysdwin-failures/062-channels__tests__v7_under_cap_allow_succeeds_and_increments.txt",
+      "bytes": 1061
+    },
+    {
+      "path": "cysdwin-failures/063-governance__h_machine_hold_tests__h0_cross_socket_residue_is_not_a_draft.txt",
+      "bytes": 970
+    },
+    {
+      "path": "cysdwin-failures/064-governance__h_machine_hold_tests__h0_machine_residue_is_not_a_draft.txt",
+      "bytes": 988
+    },
+    {
+      "path": "cysdwin-failures/065-governance__h_machine_hold_tests__h0_own_inject_in_flight_is_not_a_draft.txt",
+      "bytes": 990
+    },
+    {
+      "path": "cysdwin-failures/066-governance__h_machine_hold_tests__h0_stale_pending_alone_never_holds.txt",
+      "bytes": 928
+    },
+    {
+      "path": "cysdwin-failures/067-governance__reflect_queue_tests__q7_process_exit_of_a_role_seat_parks_instead_of_dropping.txt",
+      "bytes": 960
+    },
+    {
+      "path": "cysdwin-failures/068-governance__reflect_queue_tests__q7_reap_parks_the_active_queue_for_the_returning_role.txt",
+      "bytes": 1038
+    },
+    {
+      "path": "cysdwin-failures/069-governance__tests__b1_gate_delivers_at_prompt_boundary_while_output_streams.txt",
+      "bytes": 978
+    },
+    {
+      "path": "cysdwin-failures/070-governance__tests__c5_queue_blocked_file_boot_leaves_stale_file_then_first_tick_overwrites.txt",
+      "bytes": 1134
+    },
+    {
+      "path": "cysdwin-failures/071-governance__tests__c5_queue_blocked_file_lifecycle_change_release_and_atomic.txt",
+      "bytes": 910
+    },
+    {
+      "path": "cysdwin-failures/072-governance__tests__c5_queue_blocked_file_write_failure_retries_after_the_suppression_window.txt",
+      "bytes": 1154
+    },
+    {
+      "path": "cysdwin-failures/073-governance__tests__missing_topology_is_empty_not_corrupt.txt",
+      "bytes": 837
+    },
+    {
+      "path": "cysdwin-failures/074-governance__tests__rqfix2_m6_empty_file_does_not_overwrite_the_previous_generation_on_the_next_boot.txt",
+      "bytes": 1171
+    },
+    {
+      "path": "cysdwin-failures/075-governance__tests__rqfix2_n3_panic_path_enters_the_sixty_second_suppression.txt",
+      "bytes": 890
+    },
+    {
+      "path": "cysdwin-failures/076-governance__tests__rqfix_f3_blocked_file_lists_paused_seats_and_parked_entries.txt",
+      "bytes": 1896
+    },
+    {
+      "path": "cysdwin-failures/077-governance__tests__rqfix_i9_first_write_of_a_boot_rotates_the_previous_file_exactly_once.txt",
+      "bytes": 1127
+    },
+    {
+      "path": "cysdwin-failures/078-governance__todo_decl_tests__excluded_todos_publish_no_events_on_change.txt",
+      "bytes": 1086
+    },
+    {
+      "path": "cysdwin-failures/079-governance__todo_decl_tests__retiring_a_counted_todo_removes_it_from_progress.txt",
+      "bytes": 914
+    },
+    {
+      "path": "cysdwin-failures/080-handlers__tests__approval_ttl_roundtrip_through_rpc.txt",
+      "bytes": 1090
+    },
+    {
+      "path": "cysdwin-failures/081-handlers__tests__b3_queue_list_full_exposes_text_only_when_requested.txt",
+      "bytes": 972
+    },
+    {
+      "path": "cysdwin-failures/082-handlers__tests__boot_enqueue_cross_verifies_claim_against_the_registry.txt",
+      "bytes": 836
+    },
+    {
+      "path": "cysdwin-failures/083-handlers__tests__boot_enqueue_refuses_an_unresolved_caller.txt",
+      "bytes": 830
+    },
+    {
+      "path": "cysdwin-failures/084-handlers__tests__boot_enqueue_refuses_when_supervisor_is_off.txt",
+      "bytes": 804
+    },
+    {
+      "path": "cysdwin-failures/085-handlers__tests__boot_enqueue_rejects_self_reported_surface_and_lane.txt",
+      "bytes": 870
+    },
+    {
+      "path": "cysdwin-failures/086-handlers__tests__boot_enqueue_rejects_unknown_decl_origin.txt",
+      "bytes": 826
+    },
+    {
+      "path": "cysdwin-failures/087-handlers__tests__boot_enqueue_writes_a_v3_intent_with_own_lane_and_content_derived_id.txt",
+      "bytes": 1665
+    },
+    {
+      "path": "cysdwin-failures/088-handlers__tests__c5_queue_list_adds_remedy_and_diag_keys_per_seat.txt",
+      "bytes": 916
+    },
+    {
+      "path": "cysdwin-failures/089-handlers__tests__c_direct_fence_dispatch_behavior.txt",
+      "bytes": 712
+    },
+    {
+      "path": "cysdwin-failures/090-handlers__tests__creator_promotion_that_flips_verdict_is_audited.txt",
+      "bytes": 3662
+    },
+    {
+      "path": "cysdwin-failures/091-handlers__tests__edge_feed_sentence_follows_the_verdict.txt",
+      "bytes": 6850
+    },
+    {
+      "path": "cysdwin-failures/092-handlers__tests__feed_push_rejects_reserved_daemon_prefix.txt",
+      "bytes": 840
+    },
+    {
+      "path": "cysdwin-failures/093-handlers__tests__feed_reply_operator_token_bypasses_self_approval.txt",
+      "bytes": 997
+    },
+    {
+      "path": "cysdwin-failures/094-handlers__tests__h4_burst_second_approval_not_held_by_own_paste.txt",
+      "bytes": 938
+    },
+    {
+      "path": "cysdwin-failures/095-handlers__tests__h4_ceo_hard_axes_escalate.txt",
+      "bytes": 865
+    },
+    {
+      "path": "cysdwin-failures/096-handlers__tests__h4_cross_socket_residue_routes_to_ceo.txt",
+      "bytes": 930
+    },
+    {
+      "path": "cysdwin-failures/097-handlers__tests__owner_promotion_that_flips_verdict_is_audited.txt",
+      "bytes": 3632
+    },
+    {
+      "path": "cysdwin-failures/098-handlers__tests__pause_freezes_before_actor_resolution_and_backfills_actor.txt",
+      "bytes": 1063
+    },
+    {
+      "path": "cysdwin-failures/099-handlers__tests__pause_with_blank_reason_is_also_absence.txt",
+      "bytes": 991
+    },
+    {
+      "path": "cysdwin-failures/100-handlers__tests__pause_without_reason_records_absence_not_an_empty_string.txt",
+      "bytes": 1060
+    },
+    {
+      "path": "cysdwin-failures/101-handlers__tests__persisted_pause_omits_reason_when_absent_and_survives_restart.txt",
+      "bytes": 1080
+    },
+    {
+      "path": "cysdwin-failures/102-handlers__tests__queue_deliver_denied_by_send_acl.txt",
+      "bytes": 873
+    },
+    {
+      "path": "cysdwin-failures/103-handlers__tests__queue_deliver_rpc_delivers_single_and_plumbs_params.txt",
+      "bytes": 1251
+    },
+    {
+      "path": "cysdwin-failures/104-handlers__tests__queue_list_exposes_new_columns_on_restored_rows.txt",
+      "bytes": 899
+    },
+    {
+      "path": "cysdwin-failures/105-handlers__tests__r1v42_3_intermittent_executor_ineffective_feed_is_bounded_per_24h.txt",
+      "bytes": 891
+    },
+    {
+      "path": "cysdwin-failures/106-handlers__tests__read_text_reports_quiet_secs_on_both_branches.txt",
+      "bytes": 894
+    },
+    {
+      "path": "cysdwin-failures/107-handlers__tests__reap_allows_privileged_after_grace.txt",
+      "bytes": 1146
+    },
+    {
+      "path": "cysdwin-failures/108-handlers__tests__reap_denies_queue_nonempty_then_queue_clear_exited_reclaim.txt",
+      "bytes": 918
+    },
+    {
+      "path": "cysdwin-failures/109-handlers__tests__repeated_checks_never_extend_expiry_through_rpc.txt",
+      "bytes": 926
+    },
+    {
+      "path": "cysdwin-failures/110-handlers__tests__rqfix_f3_paused_seat_without_recorded_reason_reports_paused_in_queue_list_and_org_s.txt",
+      "bytes": 2473
+    },
+    {
+      "path": "cysdwin-failures/111-handlers__tests__rqfix_i6_settle_proof_seen_before_the_pause_filter_blocks_the_ghost_prescription.txt",
+      "bytes": 1032
+    },
+    {
+      "path": "cysdwin-failures/112-handlers__tests__unmarked_clear_retry_judges_the_new_session_not_the_dead_one.txt",
+      "bytes": 3113
+    },
+    {
+      "path": "cysdwin-failures/113-handlers__tests__unresolved_caller_pid_owner_grants_are_never_suppressed.txt",
+      "bytes": 9085
+    },
+    {
+      "path": "cysdwin-failures/114-handlers__tests__v42r_2_stuck_self_report_feed_asserts_the_blocking_point_only_for_claude_seats_with.txt",
+      "bytes": 6564
+    },
+    {
+      "path": "cysdwin-failures/115-handlers__tests__w3_ceo_delivered_when_seat_occupied.txt",
+      "bytes": 897
+    },
+    {
+      "path": "cysdwin-failures/116-handlers__tests__w3_off_no_auto_route.txt",
+      "bytes": 729
+    },
+    {
+      "path": "cysdwin-failures/117-handlers__tests__wp5_queue_list_hides_expired_unless_requested.txt",
+      "bytes": 952
+    },
+    {
+      "path": "cysdwin-failures/118-recall__tests__max_surface_id_survives_full_surface_prune_via_chains.txt",
+      "bytes": 1069
+    },
+    {
+      "path": "cysdwin-failures/119-return_absorb_tests__a2_stuck_dead_sender_body_rescued_immediately.txt",
+      "bytes": 864
+    },
+    {
+      "path": "cysdwin-failures/120-schedule__c8_push_counts_submit_tests__c8_diverted_or_refused_pushes_keep_the_count_gates_unchanged.txt",
+      "bytes": 1197
+    },
+    {
+      "path": "cysdwin-failures/121-schedule__c8_push_counts_submit_tests__c8_handoff_failure_leaves_the_count_untouched.txt",
+      "bytes": 947
+    },
+    {
+      "path": "cysdwin-failures/122-schedule__c8_push_counts_submit_tests__c8_knob_zero_keeps_the_count_and_emits_nothing.txt",
+      "bytes": 1118
+    },
+    {
+      "path": "cysdwin-failures/123-schedule__c8_push_counts_submit_tests__c8_machine_residue_push_clears_count_and_invalidates_owner.txt",
+      "bytes": 1165
+    },
+    {
+      "path": "cysdwin-failures/124-schedule__c8_push_counts_submit_tests__c8_push_clears_ghost_count_then_queue_tick_delivers_without_i.txt",
+      "bytes": 1213
+    },
+    {
+      "path": "cysdwin-failures/125-schedule__c8_push_counts_submit_tests__c8_push_on_zero_count_seat_emits_no_event.txt",
+      "bytes": 1097
+    },
+    {
+      "path": "cysdwin-failures/126-schedule__h2_schedule_hold_tests__h2_busy_seat_stays_direct.txt",
+      "bytes": 1008
+    },
+    {
+      "path": "cysdwin-failures/127-schedule__h2_schedule_hold_tests__h2_cross_socket_residue_stays_direct.txt",
+      "bytes": 1301
+    },
+    {
+      "path": "cysdwin-failures/128-schedule__h2_schedule_hold_tests__h2_diverted_item_survives_daemon_restart.txt",
+      "bytes": 1091
+    },
+    {
+      "path": "cysdwin-failures/129-schedule__h2_schedule_hold_tests__h2_fallback_headroom_keeps_cli_room.txt",
+      "bytes": 1071
+    },
+    {
+      "path": "cysdwin-failures/130-schedule__h2_schedule_hold_tests__h2_knob_off_is_head_identical.txt",
+      "bytes": 1013
+    },
+    {
+      "path": "cysdwin-failures/131-schedule__h2_schedule_hold_tests__h2_long_draft_hold_is_visible_as_starved.txt",
+      "bytes": 1092
+    },
+    {
+      "path": "cysdwin-failures/132-schedule__h2_schedule_hold_tests__h2_machine_residue_stays_direct.txt",
+      "bytes": 1236
+    },
+    {
+      "path": "cysdwin-failures/133-schedule__h2_schedule_hold_tests__h2_periodic_ttl_le_period_oneshot_default.txt",
+      "bytes": 1096
+    },
+    {
+      "path": "cysdwin-failures/134-schedule__h2_schedule_hold_tests__h2_role_push_diverts_on_human_30s_and_quiescing.txt",
+      "bytes": 1120
+    },
+    {
+      "path": "cysdwin-failures/135-schedule__h2_schedule_hold_tests__h2_role_push_diverts_on_observed_draft.txt",
+      "bytes": 1184
+    },
+    {
+      "path": "cysdwin-failures/136-schedule__h2_schedule_hold_tests__h2_same_job_divert_is_one_pending_entry.txt",
+      "bytes": 945
+    },
+    {
+      "path": "cysdwin-failures/137-schedule__h2_schedule_hold_tests__h2_swallowed_inject_residue_stays_direct.txt",
+      "bytes": 1182
+    },
+    {
+      "path": "cysdwin-failures/138-schedule__h2_schedule_hold_tests__h2_swallowed_return_residue_stays_direct.txt",
+      "bytes": 1286
+    },
+    {
+      "path": "cysdwin-failures/139-schedule__h2_schedule_hold_tests__h2_unobservable_seat_stays_direct.txt",
+      "bytes": 1071
+    },
+    {
+      "path": "cysdwin-failures/140-schedule__h2_schedule_hold_tests__h2_unproven_machine_draft_falls_back_after_bounded_diverts.txt",
+      "bytes": 1164
+    },
+    {
+      "path": "cysdwin-failures/141-schedule__tests__deliver_push_branches_are_observable.txt",
+      "bytes": 967
+    },
+    {
+      "path": "cysdwin-failures/142-schedule__tests__run_now_passes_gate_when_not_paused.txt",
+      "bytes": 815
+    },
+    {
+      "path": "cysdwin-failures/143-schedule__tests__u8_p1_direct_push_diverts_to_the_seat_queue_on_a_foreground_modal.txt",
+      "bytes": 1271
+    },
+    {
+      "path": "cysdwin-failures/144-schedule__triage_schedule__triage_a4_a_pending_queue_item_defers_the_fresh_seat_reap.txt",
+      "bytes": 1069
+    },
+    {
+      "path": "cysdwin-failures/145-send_settle_tests__c5_settle_proof_denial_never_carries_the_ghost_prescription.txt",
+      "bytes": 891
+    },
+    {
+      "path": "cysdwin-failures/146-send_settle_tests__f1_submit_cr_withheld_on_stale_empty_seat_before_first_agent_sighting.txt",
+      "bytes": 1364
+    },
+    {
+      "path": "cysdwin-failures/147-send_settle_tests__f1_submit_cr_withheld_when_dialog_rose_after_own_body.txt",
+      "bytes": 1273
+    },
+    {
+      "path": "cysdwin-failures/148-send_settle_tests__f1_withheld_submit_dropped_after_newer_machine_body.txt",
+      "bytes": 1222
+    },
+    {
+      "path": "cysdwin-failures/149-send_settle_tests__f1_withheld_submit_is_resubmitted_once_after_dialog_closes.txt",
+      "bytes": 1250
+    },
+    {
+      "path": "cysdwin-failures/150-send_settle_tests__f1_withheld_submit_waits_for_resume_and_yields_to_human.txt",
+      "bytes": 1238
+    },
+    {
+      "path": "cysdwin-failures/151-send_settle_tests__fv1_paused_daemon_gives_no_settle_proof_but_keeps_hold.txt",
+      "bytes": 1256
+    },
+    {
+      "path": "cysdwin-failures/152-send_settle_tests__fv2_dialog_drawn_below_own_composer_is_still_withheld.txt",
+      "bytes": 1274
+    },
+    {
+      "path": "cysdwin-failures/153-send_settle_tests__fv2_dialog_replacing_wrapped_body_is_still_withheld.txt",
+      "bytes": 1290
+    },
+    {
+      "path": "cysdwin-failures/154-send_settle_tests__fv2_resubmit_ignores_signatures_above_own_composer_without_trailer.txt",
+      "bytes": 1284
+    },
+    {
+      "path": "cysdwin-failures/155-send_settle_tests__fv2_withheld_record_dropped_at_wait_cap.txt",
+      "bytes": 1176
+    },
+    {
+      "path": "cysdwin-failures/156-send_settle_tests__fv2_withheld_wrapped_body_is_resubmitted_after_dialog_closes.txt",
+      "bytes": 1260
+    },
+    {
+      "path": "cysdwin-failures/157-send_settle_tests__fv2_withheld_wrapped_body_is_resubmitted_on_alt_screen.txt",
+      "bytes": 1236
+    },
+    {
+      "path": "cysdwin-failures/158-send_settle_tests__r3c_dialog_clock_restarts_when_window_closes.txt",
+      "bytes": 1194
+    },
+    {
+      "path": "cysdwin-failures/159-send_settle_tests__r3c_long_agent_turn_after_quick_approval_resubmits_once.txt",
+      "bytes": 1238
+    },
+    {
+      "path": "cysdwin-failures/160-send_settle_tests__r3c_long_pause_then_resume_resubmits_once.txt",
+      "bytes": 1182
+    },
+    {
+      "path": "cysdwin-failures/161-send_settle_tests__r3c_long_wait_still_yields_to_human_newer_body_and_empty_line.txt",
+      "bytes": 1262
+    },
+    {
+      "path": "cysdwin-failures/162-send_settle_tests__r3c_pause_freezes_dialog_clock_and_cap_still_fires_on_open_window.txt",
+      "bytes": 1282
+    },
+    {
+      "path": "cysdwin-failures/163-send_settle_tests__r3c_queue_ttl_bounds_post_close_wait_with_pause_credit.txt",
+      "bytes": 1234
+    },
+    {
+      "path": "cysdwin-failures/164-send_settle_tests__settle_hold_denies_text_while_submit_cr_inflight_then_admits.txt",
+      "bytes": 1262
+    },
+    {
+      "path": "cysdwin-failures/165-send_settle_tests__settle_proof_on_pending_machine_body_awaiting_its_return.txt",
+      "bytes": 1218
+    },
+    {
+      "path": "cysdwin-failures/166-send_settle_tests__settle_proven_denial_events_are_rate_limited_per_sender.txt",
+      "bytes": 1172
+    },
+    {
+      "path": "cysdwin-failures/167-state__reflect_queue_tests__q3_wal_duplicate_resolves_by_persisted_transition_time_not_by_file.txt",
+      "bytes": 1059
+    },
+    {
+      "path": "cysdwin-failures/168-state__tests__c_mirror_screen_modes_tracks_bracketed_paste.txt",
+      "bytes": 775
+    },
+    {
+      "path": "cysdwin-failures/169-state__tests__queue_seq_seeds_from_wal_max_and_persist_load_roundtrip.txt",
+      "bytes": 919
+    },
+    {
+      "path": "cysdwin-failures/170-state__tests__r6_failed_destination_write_never_deletes_the_source_copy.txt",
+      "bytes": 941
+    },
+    {
+      "path": "cysdwin-failures/171-state__tests__r6_revive_between_the_two_restored_snapshots_never_disappears.txt",
+      "bytes": 953
+    },
+    {
+      "path": "cysdwin-failures/172-state__tests__rehome_into_empty_queue_reports_reordered_false.txt",
+      "bytes": 841
+    },
+    {
+      "path": "cysdwin-failures/173-state__tests__rehome_restores_queue_entry_with_original_metadata.txt",
+      "bytes": 853
+    },
+    {
+      "path": "cysdwin-failures/174-state__tests__rehome_sorted_merge_places_restored_before_newer_live_entries.txt",
+      "bytes": 897
+    },
+    {
+      "path": "cysdwin-failures/175-state__tests__wp5_expired_rows_persist_in_separate_file_invisible_to_old_daemon.txt",
+      "bytes": 1008
+    },
+    {
+      "path": "cysdwin-failures/176-state__tests__wp5_r1_old_daemon_roundtrip_leaves_the_expired_sidecar_intact.txt",
+      "bytes": 996
+    },
+    {
+      "path": "cysdwin-failures/177-state__tests__wp5_r5_crash_between_queue_file_replacements_never_drops_an_entry.txt",
+      "bytes": 1119
+    },
+    {
+      "path": "cysdwin-failures/178-state__tests__wp5_r5_revive_keeps_a_copy_until_the_active_file_has_it.txt",
+      "bytes": 1032
+    },
+    {
+      "path": "cysdwin-failures/179-state__tests__wp5_rehome_orders_revived_entry_by_revived_at.txt",
+      "bytes": 1019
+    },
+    {
+      "path": "cysdwin-failures/180-state__tests__wp5_wal_roundtrip_new_old_new_recomputes_expiry.txt",
+      "bytes": 930
+    },
+    {
+      "path": "cysdwin-failures/181-team_gate_tests__u16_daemon_response_shape_satisfies_cli_team_gate_ok.txt",
+      "bytes": 1516
+    },
+    {
+      "path": "cysdwin-failures/182-team_gate_tests__u16_malformed_or_wait_is_rejected_without_side_effects.txt",
+      "bytes": 992
+    },
+    {
+      "path": "cysdwin-failures/183-team_gate_tests__u16_non_master_or_unattributed_or_dept_lane_cannot_propose.txt",
+      "bytes": 1048
+    },
+    {
+      "path": "cysdwin-failures/184-team_gate_tests__u16_one_pending_and_three_per_24h.txt",
+      "bytes": 1440
+    },
+    {
+      "path": "cysdwin-failures/185-team_gate_tests__u16_only_operator_token_resolves_except_publisher_superseded.txt",
+      "bytes": 1548
+    },
+    {
+      "path": "cysdwin-failures/186-team_gate_tests__u16_team_proposal_excluded_from_ceo_auto_route_even_when_flag_on.txt",
+      "bytes": 1662
+    },
+    {
+      "path": "cysdwin-failures/187-team_token_tests__p5_body_changed_after_approval_is_token_body_mismatch.txt",
+      "bytes": 1572
+    },
+    {
+      "path": "cysdwin-failures/188-team_token_tests__p5_expired_token_is_token_expired.txt",
+      "bytes": 1492
+    },
+    {
+      "path": "cysdwin-failures/189-team_token_tests__p5_failed_creation_revokes_allow.txt",
+      "bytes": 1488
+    },
+    {
+      "path": "cysdwin-failures/190-team_token_tests__p5_forged_or_missing_token_refused_with_specific_codes.txt",
+      "bytes": 1576
+    },
+    {
+      "path": "cysdwin-failures/191-team_token_tests__p5_full_protocol_consume_settle_then_allow_from_publisher_seat.txt",
+      "bytes": 1608
+    },
+    {
+      "path": "cysdwin-failures/192-team_token_tests__p5_ledger_corrupt_is_refused_not_authorized.txt",
+      "bytes": 1532
+    },
+    {
+      "path": "cysdwin-failures/193-team_token_tests__p5_seat_binding_uses_kernel_identity_not_self_report.txt",
+      "bytes": 1568
+    },
+    {
+      "path": "cysdwin-failures/194-team_token_tests__p5_token_never_authorizes_deny_and_absent_token_keeps_owner_gui_required.txt",
+      "bytes": 1648
+    },
+    {
+      "path": "cysdwin-failures/195-team_token_tests__p5_token_without_hook_witness_is_refused.txt",
+      "bytes": 1520
+    },
+    {
+      "path": "cysdwin-failures/196-team_token_tests__p5_withdrawn_proposal_or_other_proposal_is_refused.txt",
+      "bytes": 1560
+    },
+    {
+      "path": "cysdwin-meta.json",
+      "bytes": 559
+    },
+    {
+      "path": "cysdwin-summary.txt",
+      "bytes": 9788
+    }
+  ],
+  "skipped": [],
+  "inline_files": 201,
+  "blob_files": 1
+}

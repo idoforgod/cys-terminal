@@ -1,0 +1,19 @@
+test        : handlers::tests::h4_burst_second_approval_not_held_by_own_paste
+sequence    : 94 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:26179   thread 'handlers::tests::h4_burst_second_approval_not_held_by_own_paste'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: settle 뒤 화면 초안을 놓쳤다
+  left: 0
+ right: 1
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::h4_burst_second_approval_not_held_by_own_paste ... 
+thread 'handlers::tests::h4_burst_second_approval_not_held_by_own_paste' (18188) panicked at src\bin\cysd\handlers.rs:26179:9:
+assertion `left == right` failed: settle 뒤 화면 초안을 놓쳤다
+  left: 0
+ right: 1
+FAILED

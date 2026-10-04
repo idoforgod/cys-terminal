@@ -1,0 +1,19 @@
+test        : schedule::h2_schedule_hold_tests::h2_fallback_headroom_keeps_cli_room
+sequence    : 129 of 196
+module      : schedule   (full path: schedule::h2_schedule_hold_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/schedule.rs:5448   thread 'schedule::h2_schedule_hold_tests::h2_fallback_headroom_keeps_cli_room'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: #0
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("queued(modal)")
+FAILED
+----------------------------------------------------------------------
+test schedule::h2_schedule_hold_tests::h2_fallback_headroom_keeps_cli_room ... 
+thread 'schedule::h2_schedule_hold_tests::h2_fallback_headroom_keeps_cli_room' (50604) panicked at src\bin\cysd\schedule.rs:5448:13:
+assertion `left == right` failed: #0
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("queued(modal)")
+FAILED

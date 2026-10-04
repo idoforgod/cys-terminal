@@ -1,0 +1,15 @@
+test        : auto_restore_tests::missing_disk_phoenix_still_ready_embed_authoritative
+sequence    : 17 of 196
+module      : auto_restore_tests   (full path: auto_restore_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/main.rs:5000   thread 'auto_restore_tests::missing_disk_phoenix_still_ready_embed_authoritative'
+panics      : 1 in this part of the log
+type        : path_backslash   (any match: path_backslash)
+message     :
+폴백 후보 경로: C:\Users\RUNNER~1\AppData\Local\Temp\cys-ar-missing-9616\bin\javis_phoenix.py
+FAILED
+----------------------------------------------------------------------
+test auto_restore_tests::missing_disk_phoenix_still_ready_embed_authoritative ... 
+thread 'auto_restore_tests::missing_disk_phoenix_still_ready_embed_authoritative' (11272) panicked at src\bin\cysd\main.rs:5000:17:
+폴백 후보 경로: C:\Users\RUNNER~1\AppData\Local\Temp\cys-ar-missing-9616\bin\javis_phoenix.py
+FAILED

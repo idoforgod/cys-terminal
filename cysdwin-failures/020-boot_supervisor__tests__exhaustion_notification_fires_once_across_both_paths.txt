@@ -1,0 +1,19 @@
+test        : boot_supervisor::tests::exhaustion_notification_fires_once_across_both_paths
+sequence    : 20 of 196
+module      : boot_supervisor   (full path: boot_supervisor::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/boot_supervisor.rs:5679   thread 'boot_supervisor::tests::exhaustion_notification_fires_once_across_both_paths'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 소진 통보가 1회로 접히지 않았다: 9건 (매 틱 반복 = 폭주)
+  left: 9
+ right: 1
+FAILED
+----------------------------------------------------------------------
+test boot_supervisor::tests::exhaustion_notification_fires_once_across_both_paths ... 
+thread 'boot_supervisor::tests::exhaustion_notification_fires_once_across_both_paths' (12276) panicked at src\bin\cysd\boot_supervisor.rs:5679:9:
+assertion `left == right` failed: 소진 통보가 1회로 접히지 않았다: 9건 (매 틱 반복 = 폭주)
+  left: 9
+ right: 1
+FAILED

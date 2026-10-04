@@ -1,0 +1,19 @@
+test        : boot_supervisor::tests::h5_notice_skipped_on_modal_pane
+sequence    : 22 of 196
+module      : boot_supervisor   (full path: boot_supervisor::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/boot_supervisor.rs:6086   thread 'boot_supervisor::tests::h5_notice_skipped_on_modal_pane'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: feed 통보는 무조건 1건
+  left: 16
+ right: 1
+FAILED
+----------------------------------------------------------------------
+test boot_supervisor::tests::h5_notice_skipped_on_modal_pane ... 
+thread 'boot_supervisor::tests::h5_notice_skipped_on_modal_pane' (11996) panicked at src\bin\cysd\boot_supervisor.rs:6086:9:
+assertion `left == right` failed: feed 통보는 무조건 1건
+  left: 16
+ right: 1
+FAILED

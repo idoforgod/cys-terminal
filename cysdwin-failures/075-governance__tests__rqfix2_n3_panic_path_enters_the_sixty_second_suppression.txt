@@ -1,0 +1,15 @@
+test        : governance::tests::rqfix2_n3_panic_path_enters_the_sixty_second_suppression
+sequence    : 75 of 196
+module      : governance   (full path: governance::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:17006   thread 'governance::tests::rqfix2_n3_panic_path_enters_the_sixty_second_suppression'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+패닉 뒤 60초 안의 틱은 기록하지 않는다
+FAILED
+----------------------------------------------------------------------
+test governance::tests::rqfix2_n3_panic_path_enters_the_sixty_second_suppression ... 
+thread 'governance::tests::rqfix2_n3_panic_path_enters_the_sixty_second_suppression' (17112) panicked at src\bin\cysd\governance.rs:17006:9:
+패닉 뒤 60초 안의 틱은 기록하지 않는다
+FAILED

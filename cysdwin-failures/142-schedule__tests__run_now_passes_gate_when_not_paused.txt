@@ -1,0 +1,15 @@
+test        : schedule::tests::run_now_passes_gate_when_not_paused
+sequence    : 142 of 196
+module      : schedule   (full path: schedule::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/schedule.rs:3085   thread 'schedule::tests::run_now_passes_gate_when_not_paused'
+panics      : 1 in this part of the log
+type        : assert_failed   (any match: assert_failed)
+message     :
+assertion failed: !daemon.paused.load(Ordering::Relaxed)
+FAILED
+----------------------------------------------------------------------
+test schedule::tests::run_now_passes_gate_when_not_paused ... 
+thread 'schedule::tests::run_now_passes_gate_when_not_paused' (44284) panicked at src\bin\cysd\schedule.rs:3085:9:
+assertion failed: !daemon.paused.load(Ordering::Relaxed)
+FAILED

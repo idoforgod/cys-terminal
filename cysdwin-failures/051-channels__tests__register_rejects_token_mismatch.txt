@@ -1,0 +1,15 @@
+test        : channels::tests::register_rejects_token_mismatch
+sequence    : 51 of 196
+module      : channels   (full path: channels::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/channels.rs:2760   thread 'channels::tests::register_rejects_token_mismatch'
+panics      : 1 in this part of the log
+type        : unwrap_err   (any match: unwrap_err)
+message     :
+called `Result::unwrap()` on an `Err` value: SqliteFailure(Error { code: ConstraintViolation, extended_code: 1555 }, Some("UNIQUE constraint failed: channels.channel"))
+FAILED
+----------------------------------------------------------------------
+test channels::tests::register_rejects_token_mismatch ... 
+thread 'channels::tests::register_rejects_token_mismatch' (12880) panicked at src\bin\cysd\channels.rs:2760:14:
+called `Result::unwrap()` on an `Err` value: SqliteFailure(Error { code: ConstraintViolation, extended_code: 1555 }, Some("UNIQUE constraint failed: channels.channel"))
+FAILED

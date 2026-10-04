@@ -1,0 +1,15 @@
+test        : governance::tests::c5_queue_blocked_file_boot_leaves_stale_file_then_first_tick_overwrites
+sequence    : 70 of 196
+module      : governance   (full path: governance::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:24352   thread 'governance::tests::c5_queue_blocked_file_boot_leaves_stale_file_then_first_tick_overwrites'
+panics      : 1 in this part of the log
+type        : no_such_file   (any match: no_such_file, unwrap_err)
+message     :
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "The system cannot find the file specified." }
+FAILED
+----------------------------------------------------------------------
+test governance::tests::c5_queue_blocked_file_boot_leaves_stale_file_then_first_tick_overwrites ... 
+thread 'governance::tests::c5_queue_blocked_file_boot_leaves_stale_file_then_first_tick_overwrites' (6544) panicked at src\bin\cysd\governance.rs:24352:51:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "The system cannot find the file specified." }
+FAILED

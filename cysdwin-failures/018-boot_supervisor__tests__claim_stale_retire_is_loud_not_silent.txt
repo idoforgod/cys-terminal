@@ -1,0 +1,19 @@
+test        : boot_supervisor::tests::claim_stale_retire_is_loud_not_silent
+sequence    : 18 of 196
+module      : boot_supervisor   (full path: boot_supervisor::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/boot_supervisor.rs:5737   thread 'boot_supervisor::tests::claim_stale_retire_is_loud_not_silent'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: claim_stale 폐기의 통보가 6건이다(0=조용한 포기 / 2+=래치 파손)
+  left: 6
+ right: 1
+FAILED
+----------------------------------------------------------------------
+test boot_supervisor::tests::claim_stale_retire_is_loud_not_silent ... 
+thread 'boot_supervisor::tests::claim_stale_retire_is_loud_not_silent' (11988) panicked at src\bin\cysd\boot_supervisor.rs:5737:9:
+assertion `left == right` failed: claim_stale 폐기의 통보가 6건이다(0=조용한 포기 / 2+=래치 파손)
+  left: 6
+ right: 1
+FAILED

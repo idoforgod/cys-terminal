@@ -1,0 +1,19 @@
+test        : send_settle_tests::fv2_resubmit_ignores_signatures_above_own_composer_without_trailer
+sequence    : 154 of 196
+module      : send_settle_tests   (full path: send_settle_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/send_settle_tests.rs:1003   thread 'send_settle_tests::fv2_resubmit_ignores_signatures_above_own_composer_without_trailer'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 전제: 창 위 제출 CR 은 보류된다: SubmitSettleObs { inflight: false, pending: 0, handed_age_ms: Some(90), since_written_ms: Some(7) }
+  left: Some(7)
+ right: None
+FAILED
+----------------------------------------------------------------------
+test send_settle_tests::fv2_resubmit_ignores_signatures_above_own_composer_without_trailer ... 
+thread 'send_settle_tests::fv2_resubmit_ignores_signatures_above_own_composer_without_trailer' (32848) panicked at src\bin\cysd\send_settle_tests.rs:1003:5:
+assertion `left == right` failed: 전제: 창 위 제출 CR 은 보류된다: SubmitSettleObs { inflight: false, pending: 0, handed_age_ms: Some(90), since_written_ms: Some(7) }
+  left: Some(7)
+ right: None
+FAILED

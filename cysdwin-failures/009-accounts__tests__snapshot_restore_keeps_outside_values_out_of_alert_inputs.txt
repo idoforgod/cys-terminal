@@ -1,0 +1,19 @@
+test        : accounts::tests::snapshot_restore_keeps_outside_values_out_of_alert_inputs
+sequence    : 9 of 196
+module      : accounts   (full path: accounts::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/accounts.rs:2993   thread 'accounts::tests::snapshot_restore_keeps_outside_values_out_of_alert_inputs'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 재시작 뒤 경보 입력에 창 밖 값이 들어왔거나 좌석 값이 사라졌다
+  left: [("Antigravity (agy)", "5h", 79.0), ("OpenAI Codex", "7d", 50.0), ("a-b1@example.test", "5h", 40.0), ("a-b3@example.test", "5h", 10.0), ("al@example.test", "5h", 97.0), ("alt2@example.test", "5h", 99.0), ("alt2@example.test", "7d", 40.0), ("alt@example.test", "5h", 97.0), ("b-b1@example.test", "5h", 10.0), ("b-b3@example.test", "5h", 12.0), ("dup-r1@example.test", "5h", 91.0), ("keep@example.test", "5h", 40.0), ("rs@example.test", "5h", 97.3), ("rst@example.test", "7d", 91.0), ("seat@example.test", "5h", 97.0), ("sup@example.test", "5h", 97.0), ("w-r1@example.test", "5h", 40.0)]
+ right: [("rs@example.test", "5h", 97.3)]
+FAILED
+----------------------------------------------------------------------
+test accounts::tests::snapshot_restore_keeps_outside_values_out_of_alert_inputs ... 
+thread 'accounts::tests::snapshot_restore_keeps_outside_values_out_of_alert_inputs' (11844) panicked at src\bin\cysd\accounts.rs:2993:9:
+assertion `left == right` failed: 재시작 뒤 경보 입력에 창 밖 값이 들어왔거나 좌석 값이 사라졌다
+  left: [("Antigravity (agy)", "5h", 79.0), ("OpenAI Codex", "7d", 50.0), ("a-b1@example.test", "5h", 40.0), ("a-b3@example.test", "5h", 10.0), ("al@example.test", "5h", 97.0), ("alt2@example.test", "5h", 99.0), ("alt2@example.test", "7d", 40.0), ("alt@example.test", "5h", 97.0), ("b-b1@example.test", "5h", 10.0), ("b-b3@example.test", "5h", 12.0), ("dup-r1@example.test", "5h", 91.0), ("keep@example.test", "5h", 40.0), ("rs@example.test", "5h", 97.3), ("rst@example.test", "7d", 91.0), ("seat@example.test", "5h", 97.0), ("sup@example.test", "5h", 97.0), ("w-r1@example.test", "5h", 40.0)]
+ right: [("rs@example.test", "5h", 97.3)]
+FAILED

@@ -1,0 +1,19 @@
+test        : handlers::tests::h4_cross_socket_residue_routes_to_ceo
+sequence    : 96 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:26226   thread 'handlers::tests::h4_cross_socket_residue_routes_to_ceo'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: GUI 삽입을 기계 잔여로 봤다(주입했다)
+  left: 0
+ right: 1
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::h4_cross_socket_residue_routes_to_ceo ... 
+thread 'handlers::tests::h4_cross_socket_residue_routes_to_ceo' (18988) panicked at src\bin\cysd\handlers.rs:26226:9:
+assertion `left == right` failed: GUI 삽입을 기계 잔여로 봤다(주입했다)
+  left: 0
+ right: 1
+FAILED

@@ -1,0 +1,19 @@
+test        : accounts::tests::r1f_us::r1f_a_folder_another_request_is_still_reading_for_the_first_time_is_unread_not_no_login
+sequence    : 7 of 196
+module      : accounts   (full path: accounts::tests::r1f_us)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/accounts.rs:5579   thread 'accounts::tests::r1f_us::r1f_a_folder_another_request_is_still_reading_for_the_first_time_is_unread_not_no_login'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 자리가 사라진(읽은) 뒤에도 키가 안 나온다
+  left: Some(Array [String(".cys\\claude-r1")])
+ right: Some(Array [String(".cys/claude-r1")])
+FAILED
+----------------------------------------------------------------------
+test accounts::tests::r1f_us::r1f_a_folder_another_request_is_still_reading_for_the_first_time_is_unread_not_no_login ... 
+thread 'accounts::tests::r1f_us::r1f_a_folder_another_request_is_still_reading_for_the_first_time_is_unread_not_no_login' (8872) panicked at src\bin\cysd\accounts.rs:5579:13:
+assertion `left == right` failed: 자리가 사라진(읽은) 뒤에도 키가 안 나온다
+  left: Some(Array [String(".cys\\claude-r1")])
+ right: Some(Array [String(".cys/claude-r1")])
+FAILED

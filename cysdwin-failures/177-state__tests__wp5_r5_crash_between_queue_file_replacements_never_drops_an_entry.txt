@@ -1,0 +1,19 @@
+test        : state::tests::wp5_r5_crash_between_queue_file_replacements_never_drops_an_entry
+sequence    : 177 of 196
+module      : state   (full path: state::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/state.rs:11736   thread 'state::tests::wp5_r5_crash_between_queue_file_replacements_never_drops_an_entry'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 크래시 잔상이 한 벌로 정리되지 않았다(유실 또는 이중 배달) — dedup 결손
+  left: 172
+ right: 1
+FAILED
+----------------------------------------------------------------------
+test state::tests::wp5_r5_crash_between_queue_file_replacements_never_drops_an_entry ... 
+thread 'state::tests::wp5_r5_crash_between_queue_file_replacements_never_drops_an_entry' (53520) panicked at src\bin\cysd\state.rs:11736:9:
+assertion `left == right` failed: 크래시 잔상이 한 벌로 정리되지 않았다(유실 또는 이중 배달) — dedup 결손
+  left: 172
+ right: 1
+FAILED

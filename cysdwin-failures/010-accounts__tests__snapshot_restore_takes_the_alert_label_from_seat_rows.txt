@@ -1,0 +1,19 @@
+test        : accounts::tests::snapshot_restore_takes_the_alert_label_from_seat_rows
+sequence    : 10 of 196
+module      : accounts   (full path: accounts::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/accounts.rs:3074   thread 'accounts::tests::snapshot_restore_takes_the_alert_label_from_seat_rows'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed
+  left: [("Antigravity (agy)", "5h", 79.0), ("OpenAI Codex", "7d", 50.0), ("a-b1@example.test", "5h", 40.0), ("a-b3@example.test", "5h", 10.0), ("al@example.test", "5h", 97.0), ("alt2@example.test", "5h", 99.0), ("alt2@example.test", "7d", 40.0), ("alt@example.test", "5h", 97.0), ("b-b1@example.test", "5h", 10.0), ("b-b3@example.test", "5h", 12.0), ("dup-r1@example.test", "5h", 91.0), ("keep@example.test", "5h", 40.0), ("rs@example.test", "5h", 97.3), ("rst@example.test", "7d", 91.0), ("seat2@example.test", "5h", 97.0), ("seat@example.test", "5h", 97.0), ("sup@example.test", "5h", 97.0), ("w-r1@example.test", "5h", 40.0)]
+ right: [("seat2@example.test", "5h", 97.0)]
+FAILED
+----------------------------------------------------------------------
+test accounts::tests::snapshot_restore_takes_the_alert_label_from_seat_rows ... 
+thread 'accounts::tests::snapshot_restore_takes_the_alert_label_from_seat_rows' (11908) panicked at src\bin\cysd\accounts.rs:3074:9:
+assertion `left == right` failed
+  left: [("Antigravity (agy)", "5h", 79.0), ("OpenAI Codex", "7d", 50.0), ("a-b1@example.test", "5h", 40.0), ("a-b3@example.test", "5h", 10.0), ("al@example.test", "5h", 97.0), ("alt2@example.test", "5h", 99.0), ("alt2@example.test", "7d", 40.0), ("alt@example.test", "5h", 97.0), ("b-b1@example.test", "5h", 10.0), ("b-b3@example.test", "5h", 12.0), ("dup-r1@example.test", "5h", 91.0), ("keep@example.test", "5h", 40.0), ("rs@example.test", "5h", 97.3), ("rst@example.test", "7d", 91.0), ("seat2@example.test", "5h", 97.0), ("seat@example.test", "5h", 97.0), ("sup@example.test", "5h", 97.0), ("w-r1@example.test", "5h", 40.0)]
+ right: [("seat2@example.test", "5h", 97.0)]
+FAILED

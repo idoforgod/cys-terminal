@@ -1,0 +1,19 @@
+test        : schedule::tests::u8_p1_direct_push_diverts_to_the_seat_queue_on_a_foreground_modal
+sequence    : 143 of 196
+module      : schedule   (full path: schedule::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/schedule.rs:4114   thread 'schedule::tests::u8_p1_direct_push_diverts_to_the_seat_queue_on_a_foreground_modal'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 권한 창이 전경인데 직접 주입했다(본문·CR 이 선택지를 누른다)
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("queued(modal)")
+FAILED
+----------------------------------------------------------------------
+test schedule::tests::u8_p1_direct_push_diverts_to_the_seat_queue_on_a_foreground_modal ... 
+thread 'schedule::tests::u8_p1_direct_push_diverts_to_the_seat_queue_on_a_foreground_modal' (28560) panicked at src\bin\cysd\schedule.rs:4114:9:
+assertion `left == right` failed: 권한 창이 전경인데 직접 주입했다(본문·CR 이 선택지를 누른다)
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("queued(modal)")
+FAILED

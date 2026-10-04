@@ -1,0 +1,15 @@
+test        : schedule::h2_schedule_hold_tests::h2_same_job_divert_is_one_pending_entry
+sequence    : 136 of 196
+module      : schedule   (full path: schedule::h2_schedule_hold_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/schedule.rs:5364   thread 'schedule::h2_schedule_hold_tests::h2_same_job_divert_is_one_pending_entry'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+회차 0 잡 0: Err("delivery_frozen: kill-switch paused between tick and push")
+FAILED
+----------------------------------------------------------------------
+test schedule::h2_schedule_hold_tests::h2_same_job_divert_is_one_pending_entry ... 
+thread 'schedule::h2_schedule_hold_tests::h2_same_job_divert_is_one_pending_entry' (43696) panicked at src\bin\cysd\schedule.rs:5364:17:
+회차 0 잡 0: Err("delivery_frozen: kill-switch paused between tick and push")
+FAILED

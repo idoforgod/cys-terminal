@@ -1,0 +1,15 @@
+test        : handlers::tests::boot_enqueue_cross_verifies_claim_against_the_registry
+sequence    : 82 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:18632   thread 'handlers::tests::boot_enqueue_cross_verifies_claim_against_the_registry'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+모순 claim 인텐트가 기록됐다
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::boot_enqueue_cross_verifies_claim_against_the_registry ... 
+thread 'handlers::tests::boot_enqueue_cross_verifies_claim_against_the_registry' (13516) panicked at src\bin\cysd\handlers.rs:18632:9:
+모순 claim 인텐트가 기록됐다
+FAILED

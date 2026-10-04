@@ -1,0 +1,15 @@
+test        : handlers::tests::rqfix_f3_paused_seat_without_recorded_reason_reports_paused_in_queue_list_and_org_status
+sequence    : 110 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:17447   thread 'handlers::tests::rqfix_f3_paused_seat_without_recorded_reason_reports_paused_in_queue_list_and_org_status'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+{"age_secs":0,"blocked_by":null,"blocked_since":null,"bytes":17,"draft_visible":null,"enqueued_at":1791102798.3493233,"from":"surface:1","ghost_after_cursor":null,"id":"q6ac20f4e.269","index":0,"input_paste_open":false,"origin":"send","pending_input_bytes":0,"pending_input_human_bytes":0,"preview":"[보고] 동결 0","remedy":"kill-switch 동결 중 — 정체가 아니라 동결이다. 해제는 오너(사람)가 한다. 동결 시간은 TTL 에서 빠지므로 해제하면 묵은 항목이 차례로 배달된다 — 오너가 해제 전에 `cys queue list` 로 묵은 항목을 확인한다 · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지","remedy_code":"paused","seq":269,"surface_id":26,"surface_ref":"surface:26"}
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::rqfix_f3_paused_seat_without_recorded_reason_reports_paused_in_queue_list_and_org_status ... 
+thread 'handlers::tests::rqfix_f3_paused_seat_without_recorded_reason_reports_paused_in_queue_list_and_org_status' (5612) panicked at src\bin\cysd\handlers.rs:17447:13:
+{"age_secs":0,"blocked_by":null,"blocked_since":null,"bytes":17,"draft_visible":null,"enqueued_at":1791102798.3493233,"from":"surface:1","ghost_after_cursor":null,"id":"q6ac20f4e.269","index":0,"input_paste_open":false,"origin":"send","pending_input_bytes":0,"pending_input_human_bytes":0,"preview":"[보고] 동결 0","remedy":"kill-switch 동결 중 — 정체가 아니라 동결이다. 해제는 오너(사람)가 한다. 동결 시간은 TTL 에서 빠지므로 해제하면 묵은 항목이 차례로 배달된다 — 오너가 해제 전에 `cys queue list` 로 묵은 항목을 확인한다 · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지","remedy_code":"paused","seq":269,"surface_id":26,"surface_ref":"surface:26"}
+FAILED

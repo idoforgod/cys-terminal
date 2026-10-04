@@ -1,0 +1,19 @@
+test        : handlers::tests::unmarked_clear_retry_judges_the_new_session_not_the_dead_one
+sequence    : 112 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:22652   thread 'handlers::tests::unmarked_clear_retry_judges_the_new_session_not_the_dead_one'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: [Object {"category": String("watchdog"), "name": String("context.threshold"), "payload": Object {"action": String("cys cycle-agent --fire 1791102860:30:1 (저장→검증→clear→복원) 집행 대상 — MASTER_DIRECTIVE §컨텍스트 사이클 · rc 87 = 그 통보 뒤 사이클이 이미 끝남(재집행 금지) · rc 88 = 다른 집행자의 사이클이 진행 중(송신 0건 · 기다리거나 다시 집행하지 말고 턴을 끝낸다 — 그 시도가 clear 전에 끝나면 데몬이 이 통보를 한 번 재배달한다 · redelivery)"), "after_compaction": Bool(false), "agent": String("claude"), "axis": String("measured"), "base_threshold": Number(60), "context_pct": Number(72), "ctx_window": Null, "fire_id": String("1791102860:30:1"), "level_pct": Null, "observed_age_secs": Number(0), "redelivery": Bool(false), "role": String("master"), "source": String("statusline"), "strikes": Number(0), "surface_ref": String("surface:30"), "threshold": Number(60)}, "seq": Number(126212), "surface_id": Number(30), "timestamp": Number(1791102860.9031212), "type": String("event")}]
+  left: 1
+ right: 2
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::unmarked_clear_retry_judges_the_new_session_not_the_dead_one ... 
+thread 'handlers::tests::unmarked_clear_retry_judges_the_new_session_not_the_dead_one' (41832) panicked at src\bin\cysd\handlers.rs:22652:9:
+assertion `left == right` failed: [Object {"category": String("watchdog"), "name": String("context.threshold"), "payload": Object {"action": String("cys cycle-agent --fire 1791102860:30:1 (저장→검증→clear→복원) 집행 대상 — MASTER_DIRECTIVE §컨텍스트 사이클 · rc 87 = 그 통보 뒤 사이클이 이미 끝남(재집행 금지) · rc 88 = 다른 집행자의 사이클이 진행 중(송신 0건 · 기다리거나 다시 집행하지 말고 턴을 끝낸다 — 그 시도가 clear 전에 끝나면 데몬이 이 통보를 한 번 재배달한다 · redelivery)"), "after_compaction": Bool(false), "agent": String("claude"), "axis": String("measured"), "base_threshold": Number(60), "context_pct": Number(72), "ctx_window": Null, "fire_id": String("1791102860:30:1"), "level_pct": Null, "observed_age_secs": Number(0), "redelivery": Bool(false), "role": String("master"), "source": String("statusline"), "strikes": Number(0), "surface_ref": String("surface:30"), "threshold": Number(60)}, "seq": Number(126212), "surface_id": Number(30), "timestamp": Number(1791102860.9031212), "type": String("event")}]
+  left: 1
+ right: 2
+FAILED

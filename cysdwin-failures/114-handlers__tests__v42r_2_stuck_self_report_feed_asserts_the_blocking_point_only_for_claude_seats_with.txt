@@ -1,0 +1,19 @@
+test        : handlers::tests::v42r_2_stuck_self_report_feed_asserts_the_blocking_point_only_for_claude_seats_with_a_known_window
+sequence    : 114 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:22502   thread 'handlers::tests::v42r_2_stuck_self_report_feed_asserts_the_blocking_point_only_for_claude_seats_with_a_known_window'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: reviewer-codex: [("worker-sr 좌석 cys 사이클 뒤 첫 자기보고가 통보 때와 같은 90% — 자기보고로 clear 효과를 볼 수 없어 자기보고 통보를 15분 보류(1번 연속) (surface:29)", "자기보고(status.set) 축 통보 90% 뒤 cys 사이클이 끝났는데 사이클 뒤 첫 자기보고가 같은 90% 다(가드는 이 규칙을 200K Claude 기준 차단점 이상으로만 보이는 값(90% · B 이상)에 쓴다 — 이 좌석(에이전트 미상)에는 Claude Code 차단점이 없을 수 있다 — 가드는 창 미상 좌석을 200K Claude 로 보는 보수 규칙으로 판정했다 · 차단점 단정은 하지 않는다). 가드는 원인을 알지 못한다(가능: 자기보고가 갱신되지 않음 · clear 로 낮출 수 없는 수준). 자기보고 통보를 15분 보류한다(연속될수록 두 배 · 최대 120분 · 보류 중 값이 바뀌어도 보류는 그대로다). 보류가 끝나면 **다음 자기보고가 올 때** 판정한다 — 자기보고 축은 보류 만료에 스스로 다시 판정하지 않으므로 좌석이 자기보고를 멈추면(차단점에서 제출이 막힌 좌석 포함) 이 축으로는 통보가 오지 않는다(그때는 오너 확인이 필요하다). 후보(오너 결정): 자기보고 값 정정(`cys set-status --context` 가 실제 값인지) · 실측 축(상태줄) 확보."), ("reviewer-codex 좌석 cys 사이클 뒤 첫 자기보고가 통보 때와 같은 90% — 자기보고로 clear 효과를 볼 수 없어 자기보고 통보를 15분 보류(1번 연속) (surface:29)", "자기보고(status.set) 축 통보 90% 뒤 cys 사이클이 끝났는데 사이클 뒤 첫 자기보고가 같은 90% 다(가드는 이 규칙을 200K Claude 기준 차단점 이상으로만 보이는 값(90% · B 이상)에 쓴다 — 이 좌석(agent=codex)에는 Claude Code 차단점이 없을 수 있다 — 가드는 창 미상 좌석을 200K Claude 로 보는 보수 규칙으로 판정했다 · 차단점 단정은 하지 않는다). 가드는 원인을 알지 못한다(가능: 자기보고가 갱신되지 않음 · clear 로 낮출 수 없는 수준). 자기보고 통보를 15분 보류한다(연속될수록 두 배 · 최대 120분 · 보류 중 값이 바뀌어도 보류는 그대로다). 보류가 끝나면 **다음 자기보고가 올 때** 판정한다 — 자기보고 축은 보류 만료에 스스로 다시 판정하지 않으므로 좌석이 자기보고를 멈추면(차단점에서 제출이 막힌 좌석 포함) 이 축으로는 통보가 오지 않는다(그때는 오너 확인이 필요하다). 후보(오너 결정): 자기보고 값 정정(`cys set-status --context` 가 실제 값인지) · 실측 축(상태줄) 확보.")]
+  left: 2
+ right: 1
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::v42r_2_stuck_self_report_feed_asserts_the_blocking_point_only_for_claude_seats_with_a_known_window ... 
+thread 'handlers::tests::v42r_2_stuck_self_report_feed_asserts_the_blocking_point_only_for_claude_seats_with_a_known_window' (43556) panicked at src\bin\cysd\handlers.rs:22502:13:
+assertion `left == right` failed: reviewer-codex: [("worker-sr 좌석 cys 사이클 뒤 첫 자기보고가 통보 때와 같은 90% — 자기보고로 clear 효과를 볼 수 없어 자기보고 통보를 15분 보류(1번 연속) (surface:29)", "자기보고(status.set) 축 통보 90% 뒤 cys 사이클이 끝났는데 사이클 뒤 첫 자기보고가 같은 90% 다(가드는 이 규칙을 200K Claude 기준 차단점 이상으로만 보이는 값(90% · B 이상)에 쓴다 — 이 좌석(에이전트 미상)에는 Claude Code 차단점이 없을 수 있다 — 가드는 창 미상 좌석을 200K Claude 로 보는 보수 규칙으로 판정했다 · 차단점 단정은 하지 않는다). 가드는 원인을 알지 못한다(가능: 자기보고가 갱신되지 않음 · clear 로 낮출 수 없는 수준). 자기보고 통보를 15분 보류한다(연속될수록 두 배 · 최대 120분 · 보류 중 값이 바뀌어도 보류는 그대로다). 보류가 끝나면 **다음 자기보고가 올 때** 판정한다 — 자기보고 축은 보류 만료에 스스로 다시 판정하지 않으므로 좌석이 자기보고를 멈추면(차단점에서 제출이 막힌 좌석 포함) 이 축으로는 통보가 오지 않는다(그때는 오너 확인이 필요하다). 후보(오너 결정): 자기보고 값 정정(`cys set-status --context` 가 실제 값인지) · 실측 축(상태줄) 확보."), ("reviewer-codex 좌석 cys 사이클 뒤 첫 자기보고가 통보 때와 같은 90% — 자기보고로 clear 효과를 볼 수 없어 자기보고 통보를 15분 보류(1번 연속) (surface:29)", "자기보고(status.set) 축 통보 90% 뒤 cys 사이클이 끝났는데 사이클 뒤 첫 자기보고가 같은 90% 다(가드는 이 규칙을 200K Claude 기준 차단점 이상으로만 보이는 값(90% · B 이상)에 쓴다 — 이 좌석(agent=codex)에는 Claude Code 차단점이 없을 수 있다 — 가드는 창 미상 좌석을 200K Claude 로 보는 보수 규칙으로 판정했다 · 차단점 단정은 하지 않는다). 가드는 원인을 알지 못한다(가능: 자기보고가 갱신되지 않음 · clear 로 낮출 수 없는 수준). 자기보고 통보를 15분 보류한다(연속될수록 두 배 · 최대 120분 · 보류 중 값이 바뀌어도 보류는 그대로다). 보류가 끝나면 **다음 자기보고가 올 때** 판정한다 — 자기보고 축은 보류 만료에 스스로 다시 판정하지 않으므로 좌석이 자기보고를 멈추면(차단점에서 제출이 막힌 좌석 포함) 이 축으로는 통보가 오지 않는다(그때는 오너 확인이 필요하다). 후보(오너 결정): 자기보고 값 정정(`cys set-status --context` 가 실제 값인지) · 실측 축(상태줄) 확보.")]
+  left: 2
+ right: 1
+FAILED

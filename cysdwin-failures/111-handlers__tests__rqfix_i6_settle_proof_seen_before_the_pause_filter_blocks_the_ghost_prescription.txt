@@ -1,0 +1,15 @@
+test        : handlers::tests::rqfix_i6_settle_proof_seen_before_the_pause_filter_blocks_the_ghost_prescription
+sequence    : 111 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:17393   thread 'handlers::tests::rqfix_i6_settle_proof_seen_before_the_pause_filter_blocks_the_ghost_prescription'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+human is typing in this pane; retry later or use --queued [draft_gate:pending_input]
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::rqfix_i6_settle_proof_seen_before_the_pause_filter_blocks_the_ghost_prescription ... 
+thread 'handlers::tests::rqfix_i6_settle_proof_seen_before_the_pause_filter_blocks_the_ghost_prescription' (5584) panicked at src\bin\cysd\handlers.rs:17393:9:
+human is typing in this pane; retry later or use --queued [draft_gate:pending_input]
+FAILED

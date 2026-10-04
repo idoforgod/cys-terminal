@@ -1,0 +1,15 @@
+test        : state::tests::wp5_expired_rows_persist_in_separate_file_invisible_to_old_daemon
+sequence    : 175 of 196
+module      : state   (full path: state::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/state.rs:12123   thread 'state::tests::wp5_expired_rows_persist_in_separate_file_invisible_to_old_daemon'
+panics      : 1 in this part of the log
+type        : no_such_file   (any match: no_such_file)
+message     :
+활성 WAL 읽기: Os { code: 2, kind: NotFound, message: "The system cannot find the file specified." }
+FAILED
+----------------------------------------------------------------------
+test state::tests::wp5_expired_rows_persist_in_separate_file_invisible_to_old_daemon ... 
+thread 'state::tests::wp5_expired_rows_persist_in_separate_file_invisible_to_old_daemon' (52964) panicked at src\bin\cysd\state.rs:12123:58:
+활성 WAL 읽기: Os { code: 2, kind: NotFound, message: "The system cannot find the file specified." }
+FAILED

@@ -1,0 +1,15 @@
+test        : approval::tests::ttl_record_survives_an_old_daemon_rewriting_the_shared_store
+sequence    : 16 of 196
+module      : approval   (full path: approval::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/approval.rs:1356   thread 'approval::tests::ttl_record_survives_an_old_daemon_rewriting_the_shared_store'
+panics      : 1 in this part of the log
+type        : no_such_file   (any match: no_such_file)
+message     :
+TTL 승인은 전용 파일에 저장되어야 합니다: Os { code: 3, kind: NotFound, message: "The system cannot find the path specified." }
+FAILED
+----------------------------------------------------------------------
+test approval::tests::ttl_record_survives_an_old_daemon_rewriting_the_shared_store ... 
+thread 'approval::tests::ttl_record_survives_an_old_daemon_rewriting_the_shared_store' (12072) panicked at src\bin\cysd\approval.rs:1356:51:
+TTL 승인은 전용 파일에 저장되어야 합니다: Os { code: 3, kind: NotFound, message: "The system cannot find the path specified." }
+FAILED

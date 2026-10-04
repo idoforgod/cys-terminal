@@ -1,0 +1,19 @@
+test        : state::tests::wp5_rehome_orders_revived_entry_by_revived_at
+sequence    : 179 of 196
+module      : state   (full path: state::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/state.rs:12229   thread 'state::tests::wp5_rehome_orders_revived_entry_by_revived_at'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: order_at: B(200) < C(now-5) < A(now-1)
+  left: ["wp5-r1-active", "C", "wp5-r5-revived"]
+ right: ["B", "C", "A"]
+FAILED
+----------------------------------------------------------------------
+test state::tests::wp5_rehome_orders_revived_entry_by_revived_at ... 
+thread 'state::tests::wp5_rehome_orders_revived_entry_by_revived_at' (53724) panicked at src\bin\cysd\state.rs:12229:9:
+assertion `left == right` failed: order_at: B(200) < C(now-5) < A(now-1)
+  left: ["wp5-r1-active", "C", "wp5-r5-revived"]
+ right: ["B", "C", "A"]
+FAILED

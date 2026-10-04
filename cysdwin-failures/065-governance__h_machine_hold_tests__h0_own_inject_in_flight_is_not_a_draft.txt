@@ -1,0 +1,19 @@
+test        : governance::h_machine_hold_tests::h0_own_inject_in_flight_is_not_a_draft
+sequence    : 65 of 196
+module      : governance   (full path: governance::h_machine_hold_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:27502   thread 'governance::h_machine_hold_tests::h0_own_inject_in_flight_is_not_a_draft'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 전제: 초안 화면
+  left: None
+ right: Some(Draft)
+FAILED
+----------------------------------------------------------------------
+test governance::h_machine_hold_tests::h0_own_inject_in_flight_is_not_a_draft ... 
+thread 'governance::h_machine_hold_tests::h0_own_inject_in_flight_is_not_a_draft' (5264) panicked at src\bin\cysd\governance.rs:27502:9:
+assertion `left == right` failed: 전제: 초안 화면
+  left: None
+ right: Some(Draft)
+FAILED

@@ -1,0 +1,19 @@
+test        : team_gate_tests::u16_malformed_or_wait_is_rejected_without_side_effects
+sequence    : 182 of 196
+module      : team_gate_tests   (full path: team_gate_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/team_gate_tests.rs:221   thread 'team_gate_tests::u16_malformed_or_wait_is_rejected_without_side_effects'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 거부된 제안이 항목을 남겼다
+  left: 1
+ right: 0
+FAILED
+----------------------------------------------------------------------
+test team_gate_tests::u16_malformed_or_wait_is_rejected_without_side_effects ... 
+thread 'team_gate_tests::u16_malformed_or_wait_is_rejected_without_side_effects' (53904) panicked at src\bin\cysd\team_gate_tests.rs:221:5:
+assertion `left == right` failed: 거부된 제안이 항목을 남겼다
+  left: 1
+ right: 0
+FAILED

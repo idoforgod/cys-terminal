@@ -1,0 +1,15 @@
+test        : governance::tests::rqfix2_m6_empty_file_does_not_overwrite_the_previous_generation_on_the_next_boot
+sequence    : 74 of 196
+module      : governance   (full path: governance::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:16962   thread 'governance::tests::rqfix2_m6_empty_file_does_not_overwrite_the_previous_generation_on_the_next_boot'
+panics      : 1 in this part of the log
+type        : no_such_file   (any match: no_such_file, unwrap_err)
+message     :
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "The system cannot find the file specified." }
+FAILED
+----------------------------------------------------------------------
+test governance::tests::rqfix2_m6_empty_file_does_not_overwrite_the_previous_generation_on_the_next_boot ... 
+thread 'governance::tests::rqfix2_m6_empty_file_does_not_overwrite_the_previous_generation_on_the_next_boot' (17100) panicked at src\bin\cysd\governance.rs:16962:51:
+called `Result::unwrap()` on an `Err` value: Os { code: 2, kind: NotFound, message: "The system cannot find the file specified." }
+FAILED

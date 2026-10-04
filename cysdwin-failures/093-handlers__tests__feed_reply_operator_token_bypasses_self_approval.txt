@@ -1,0 +1,15 @@
+test        : handlers::tests::feed_reply_operator_token_bypasses_self_approval
+sequence    : 93 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:26721   thread 'handlers::tests::feed_reply_operator_token_bypasses_self_approval'
+panics      : 1 in this part of the log
+type        : no_such_file   (any match: no_such_file)
+message     :
+operator.token 파일 기록돼야: Os { code: 2, kind: NotFound, message: "The system cannot find the file specified." }
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::feed_reply_operator_token_bypasses_self_approval ... 
+thread 'handlers::tests::feed_reply_operator_token_bypasses_self_approval' (31200) panicked at src\bin\cysd\handlers.rs:26721:14:
+operator.token 파일 기록돼야: Os { code: 2, kind: NotFound, message: "The system cannot find the file specified." }
+FAILED

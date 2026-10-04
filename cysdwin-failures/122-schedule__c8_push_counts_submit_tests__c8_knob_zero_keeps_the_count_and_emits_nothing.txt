@@ -1,0 +1,19 @@
+test        : schedule::c8_push_counts_submit_tests::c8_knob_zero_keeps_the_count_and_emits_nothing
+sequence    : 122 of 196
+module      : schedule   (full path: schedule::c8_push_counts_submit_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/schedule.rs:5707   thread 'schedule::c8_push_counts_submit_tests::c8_knob_zero_keeps_the_count_and_emits_nothing'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("pushed")
+FAILED
+----------------------------------------------------------------------
+test schedule::c8_push_counts_submit_tests::c8_knob_zero_keeps_the_count_and_emits_nothing ... 
+thread 'schedule::c8_push_counts_submit_tests::c8_knob_zero_keeps_the_count_and_emits_nothing' (50464) panicked at src\bin\cysd\schedule.rs:5707:13:
+assertion `left == right` failed
+  left: Err("delivery_frozen: kill-switch paused between tick and push")
+ right: Ok("pushed")
+FAILED

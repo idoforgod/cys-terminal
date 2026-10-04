@@ -1,0 +1,19 @@
+test        : handlers::tests::queue_deliver_rpc_delivers_single_and_plumbs_params
+sequence    : 103 of 196
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:24289   thread 'handlers::tests::queue_deliver_rpc_delivers_single_and_plumbs_params'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 강제 배달 실패 (응답: {"error":{"code":"paused","message":"daemon paused (kill-switch) — queue.deliver refused; resume 후 재시도"},"id":1,"ok":false})
+  left: Bool(false)
+ right: Bool(true)
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::queue_deliver_rpc_delivers_single_and_plumbs_params ... 
+thread 'handlers::tests::queue_deliver_rpc_delivers_single_and_plumbs_params' (25320) panicked at src\bin\cysd\handlers.rs:24289:9:
+assertion `left == right` failed: 강제 배달 실패 (응답: {"error":{"code":"paused","message":"daemon paused (kill-switch) — queue.deliver refused; resume 후 재시도"},"id":1,"ok":false})
+  left: Bool(false)
+ right: Bool(true)
+FAILED

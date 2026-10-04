@@ -1,0 +1,15 @@
+test        : schedule::c8_push_counts_submit_tests::c8_handoff_failure_leaves_the_count_untouched
+sequence    : 121 of 196
+module      : schedule   (full path: schedule::c8_push_counts_submit_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/schedule.rs:5794   thread 'schedule::c8_push_counts_submit_tests::c8_handoff_failure_leaves_the_count_untouched'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+delivery_frozen: kill-switch paused between tick and push
+FAILED
+----------------------------------------------------------------------
+test schedule::c8_push_counts_submit_tests::c8_handoff_failure_leaves_the_count_untouched ... 
+thread 'schedule::c8_push_counts_submit_tests::c8_handoff_failure_leaves_the_count_untouched' (50880) panicked at src\bin\cysd\schedule.rs:5794:9:
+delivery_frozen: kill-switch paused between tick and push
+FAILED

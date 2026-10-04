@@ -1,0 +1,19 @@
+test        : boot_supervisor::tests::restart_pickup_of_exhausted_intent_is_loud
+sequence    : 24 of 196
+module      : boot_supervisor   (full path: boot_supervisor::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/boot_supervisor.rs:5813   thread 'boot_supervisor::tests::restart_pickup_of_exhausted_intent_is_loud'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 재시작 픽업 소진이 조용히 폐기됐다(통보 24건)
+  left: 24
+ right: 1
+FAILED
+----------------------------------------------------------------------
+test boot_supervisor::tests::restart_pickup_of_exhausted_intent_is_loud ... 
+thread 'boot_supervisor::tests::restart_pickup_of_exhausted_intent_is_loud' (12396) panicked at src\bin\cysd\boot_supervisor.rs:5813:9:
+assertion `left == right` failed: 재시작 픽업 소진이 조용히 폐기됐다(통보 24건)
+  left: 24
+ right: 1
+FAILED

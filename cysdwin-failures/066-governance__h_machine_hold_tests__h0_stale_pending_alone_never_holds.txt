@@ -1,0 +1,19 @@
+test        : governance::h_machine_hold_tests::h0_stale_pending_alone_never_holds
+sequence    : 66 of 196
+module      : governance   (full path: governance::h_machine_hold_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:27181   thread 'governance::h_machine_hold_tests::h0_stale_pending_alone_never_holds'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed
+  left: None
+ right: Some(Draft)
+FAILED
+----------------------------------------------------------------------
+test governance::h_machine_hold_tests::h0_stale_pending_alone_never_holds ... 
+thread 'governance::h_machine_hold_tests::h0_stale_pending_alone_never_holds' (8516) panicked at src\bin\cysd\governance.rs:27181:9:
+assertion `left == right` failed
+  left: None
+ right: Some(Draft)
+FAILED

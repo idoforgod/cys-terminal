@@ -1,0 +1,76 @@
+== runner ==
+ImageOS=win25-vs2026 ImageVersion=20260925.250.1 RUNNER_OS=Windows RUNNER_ARCH=X64 RUNNER_NAME=GitHub Actions 1000006397
+== versions ==
+rustc 1.99.0 (b940084d7 2026-09-28)
+binary: rustc
+commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4
+commit-date: 2026-09-28
+host: x86_64-pc-windows-msvc
+release: 1.99.0
+LLVM version: 23.1.1
+cargo 1.99.0 (5f94df478 2026-08-27)
+Default host: x86_64-pc-windows-msvc
+rustup home:  C:\Users\runneradmin\.rustup
+
+installed toolchains
+--------------------
+stable-x86_64-pc-windows-msvc (active, default)
+
+active toolchain
+----------------
+name: stable-x86_64-pc-windows-msvc
+active because: it's the default toolchain
+installed targets:
+  i686-pc-windows-msvc
+  x86_64-pc-windows-gnu
+  x86_64-pc-windows-msvc
+Python 3.12.10
+GNU bash, version 5.3.15(2)-release (x86_64-pc-cygwin)
+git version 2.55.0.windows.5
+v22.23.3
+== product checkout ==
+bd0a0ca3e1d7634057b6ca4c6160953b36f1a3d3 chore(0.14.43): seat_ident_cache 필드 주석을 바뀐 사실대로(워치독은 읽기만)
+== variables (selected) ==
+HOME=/c/Users/runneradmin
+USERPROFILE=C:\Users\runneradmin
+APPDATA=C:\Users\runneradmin\AppData\Roaming
+LOCALAPPDATA=C:\Users\runneradmin\AppData\Local
+TEMP=/tmp
+TMP=/tmp
+RUNNER_TEMP=D:\a\_temp
+GITHUB_WORKSPACE=D:\a\cys-terminal\cys-terminal
+PYTHONUTF8=1
+OSTYPE=cygwin
+MSYSTEM=MINGW64
+CARGO_HOME=C:\Users\runneradmin\.cargo
+RUSTUP_HOME=<unset>
+== PATH (bash view, first 25) ==
+/mingw64/bin
+/usr/bin
+/c/Users/runneradmin/bin
+/c/Users/runneradmin/AppData/Roaming/Python/Python312/Scripts
+/c/hostedtoolcache/windows/Python/3.12.10/x64/Scripts
+/c/hostedtoolcache/windows/Python/3.12.10/x64
+/c/Program Files/MongoDB/Server/7.0/bin
+/c/vcpkg
+/c/tools/zstd
+/c/hostedtoolcache/windows/stack/3.11.1/x64
+/c/cabal/bin
+/c/ghcup/bin
+/c/mingw64/bin
+/c/Program Files/dotnet
+/c/Program Files/MySQL/MySQL Server 8.0/bin
+/c/Program Files/R/R-4.6.1/bin/x64
+/c/SeleniumWebDrivers/GeckoDriver
+/c/SeleniumWebDrivers/EdgeDriver
+/c/SeleniumWebDrivers/ChromeDriver
+/c/Program Files (x86)/sbt/bin
+/c/Program Files (x86)/GitHub CLI
+/bin
+/c/Program Files (x86)/pipx_bin
+/c/npm/prefix
+/c/hostedtoolcache/windows/go/1.24.13/x64/bin
+== uname / ver ==
+MINGW64_NT-10.0-26100 runnervmfi6oq 3.6.10-710e5275.x86_64 2026-07-28 09:32 UTC x86_64 Msys
+
+Microsoft Windows [Version 10.0.26100.33438]

@@ -1,0 +1,19 @@
+test        : governance::todo_decl_tests::excluded_todos_publish_no_events_on_change
+sequence    : 78 of 196
+module      : governance   (full path: governance::todo_decl_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:25336   thread 'governance::todo_decl_tests::excluded_todos_publish_no_events_on_change'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 은퇴 파일의 갱신이 이벤트로 새어나갔다
+  left: []
+ right: [("WORKER_TODO.md", "counted")]
+FAILED
+----------------------------------------------------------------------
+test governance::todo_decl_tests::excluded_todos_publish_no_events_on_change ... 
+thread 'governance::todo_decl_tests::excluded_todos_publish_no_events_on_change' (18168) panicked at src\bin\cysd\governance.rs:25336:9:
+assertion `left == right` failed: 은퇴 파일의 갱신이 이벤트로 새어나갔다
+  left: []
+ right: [("WORKER_TODO.md", "counted")]
+FAILED
