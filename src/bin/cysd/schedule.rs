@@ -2294,7 +2294,8 @@ fn resolve_push_target(
 /// 확정된 좌석에 주입한다(조회를 다시 하지 않는다 — 확정과 주입 사이에 좌석이 바뀌지 않게).
 ///
 /// ★(0.14.43 · C8) **인계에 성공하면 그 좌석의 미제출 입력 계수를 0 으로 계상한다** — 큐 배달 인계(`governance::deliver_head_locked`)와 같은 규약이다.
-/// Inject 는 본문+CR 을 원자로 보내 **줄을 제출**하므로 인계 뒤의 입력줄은 비어 있다. 종전에는 이 경로만 계수를 건드리지 않아, 유령 계수(윈도우·
+/// Inject 는 본문+CR 을 원자로 보내 **줄을 제출**한다 — 인계된 Inject 가 쓰이면 줄이 제출된다고 계상한다(인계 시점에는 아직 쓰기 전이고 CR 이 삼켜져 본문이 남을 수도 있다 — 아래 계상 주석).
+/// 종전에는 이 경로만 계수를 건드리지 않아, 유령 계수(윈도우·
 /// `CYS_PENDING_INPUT_MODEL=v2` 좌석의 단독 Esc · 글자를 치고 전부 지운 줄)가 있는 좌석에 하트비트가 들어가도 계수가 남아 그 좌석의 큐 배달이
 /// 계속 `input_pending` 으로 막혔다(실측: push 뒤 `pending=1·human=1` 잔존). **게이트(보류·전환 판정)는 이 함수 앞 `deliver_push` 의 H0 이고 무변경이다** —
 /// 여기서는 이미 통과한 주입의 사실만 계상한다. 노브 `CYS_SCHEDULE_PUSH_COUNTS_SUBMIT=0` 이면 종전(계수·게이트 무접촉)이다.
@@ -2355,6 +2356,11 @@ fn inject_on(
         let mut st = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner());
         let human = st.human.min(prev_bytes);
         st.human = 0;
+        // ★(0.14.43 · R1F-IN ⓐ) 줄을 제출했다고 계상하면 잠정 Esc 면제 표식(`esc_exempt_pgid`)도 내린다 — 같은 leaf 임계영역에서 미러까지(큐 인계 `take_esc_exempt` 와 같은 규약).
+        //   남기면 이미 제출된 줄 뒤에 에이전트가 전경에서 사라졌을 때 틱의 되돌리기가 헛 계수 1 을 세운다.
+        st.esc_exempt_pgid = 0;
+        #[cfg(unix)]
+        surface.esc_exempt_pgid.store(0, std::sync::atomic::Ordering::Relaxed);
         human
     };
     surface.set_pending_input(0);
@@ -2371,10 +2377,10 @@ struct PushClearedPending {
     prev_human_bytes: u64,
 }
 
-/// ★(0.14.43 · C8) 순수 파서 — 노브 `CYS_SCHEDULE_PUSH_COUNTS_SUBMIT`(직접 push 인계 뒤 입력줄 계수를 0 으로 계상할지 · 기본 켬). **정확히 `"0"` 일 때만 끈다**(= 종전 =
+/// ★(0.14.43 · C8 · R1F-IN n-2) 순수 파서 — 노브 `CYS_SCHEDULE_PUSH_COUNTS_SUBMIT`(직접 push 인계 뒤 입력줄 계수를 0 으로 계상할지 · 기본 켬). **앞뒤 공백을 걷은 값이 `"0"` 일 때만 끈다**(= 종전 =
 /// 계수·게이트 무접촉). 미설정·빈 값·그 밖의 값은 켬 — 이 노브는 안전 게이트가 아니라 계상의 롤백 손잡이다.
 fn schedule_push_counts_submit_from_env(v: Option<&str>) -> bool {
-    v != Some("0")
+    v.map(str::trim) != Some("0")
 }
 
 /// env 래퍼 — 호출마다 읽는다(프로세스 수명 1회 캐시가 아니다 · 같은 push 경로의 `CYS_MACHINE_INJECT_HOLD` 와 같은 `h_knob` 관례. 검체는 스레드 로컬 덮개로 값을 준다).
@@ -5713,12 +5719,17 @@ mod c8_push_counts_submit_tests {
         done(&s);
     }
 
-    /// [C8 노브 파서] 순수 파서는 **정확히 `"0"`** 일 때만 끈다 — 미설정·빈 값·그 밖의 값은 켬. env 래퍼는 덮개(검체)·프로세스 env 를 호출마다 읽는다.
+    /// [C8 노브 파서] 순수 파서는 **앞뒤 공백을 걷은 값이 `"0"`** 일 때만 끈다(★R1F-IN n-2: 같은 판의 다른 두 노브처럼 trim — 종전 검체는 정확히 `"0"` 만 끔으로 고정해 `"0 "` 가 조용히 켜진 채 남았다) —
+    /// 미설정·빈 값·그 밖의 값은 켬. env 래퍼는 덮개(검체)·프로세스 env 를 호출마다 읽는다.
     #[test]
     fn c8_knob_parser_turns_off_only_on_exactly_zero() {
         assert!(schedule_push_counts_submit_from_env(None), "미설정 = 켬(기본)");
         assert!(!schedule_push_counts_submit_from_env(Some("0")));
-        for v in ["", "1", "on", "off", "false", "no", "00", " 0", "0 ", "2", "true", "OFF"] {
+        // ★R1F-IN n-2 — 앞뒤 공백(탭·개행 포함)을 걷은 값이 `0` 이면 끈다.
+        for v in [" 0", "0 ", " 0 ", "\t0\n", "  0\t"] {
+            assert!(!schedule_push_counts_submit_from_env(Some(v)), "{v:?} 는 공백을 걷으면 0 — 끄는 값이다");
+        }
+        for v in ["", "1", "on", "off", "false", "no", "00", "2", "true", "OFF", " ", "0 0", "-0", "+0"] {
             assert!(schedule_push_counts_submit_from_env(Some(v)), "{v:?} 는 끄는 값이 아니다");
         }
         // 래퍼 — 호출마다 읽는다(덮개 변경이 곧바로 반영 = 1회 캐시 아님).
@@ -5729,6 +5740,33 @@ mod c8_push_counts_submit_tests {
         if std::env::var_os("CYS_SCHEDULE_PUSH_COUNTS_SUBMIT").is_none() {
             assert!(schedule_push_counts_submit(), "env 미설정 = 켬");
         }
+    }
+
+    /// [R1F-IN ⓐ] 직접 push 인계 계상은 **잠정 Esc 면제 표식**(leaf `esc_exempt_pgid` + 원자 미러)도 같은 임계영역에서 내린다 — 계수가 0→0 이어도(이미 제출된 줄 뒤에 에이전트가 전경에서 사라졌을 때
+    /// 틱의 되돌리기가 헛 계수를 세우지 않게). 노브가 꺼졌으면(공백 낀 `" 0 "` 도 끔 — n-2) 계수·표식 모두 무접촉(종전). 표식은 사람의 단독 Esc 를 에이전트 전경 그룹 밑에서 면제한 상태를 직접 세워 재현한다.
+    #[cfg(unix)]
+    #[test]
+    fn r1f_in_push_handoff_lowers_the_esc_exempt_marker_and_knob_off_leaves_it() {
+        let (d, s) = rig("r1f-in-push");
+        h_paint(&s, H_IDLE_SCREEN);
+        let marker = || (s.pending_input.lock().unwrap().esc_exempt_pgid, s.esc_exempt_pgid.load(Ordering::Relaxed));
+        s.pending_input.lock().unwrap().esc_exempt_pgid = 4242;
+        s.esc_exempt_pgid.store(4242, Ordering::Relaxed);
+        {
+            let _k = HKnobGuard::set(&[("CYS_SCHEDULE_PUSH_COUNTS_SUBMIT", " 0 ")]);
+            assert!(!schedule_push_counts_submit(), "공백 낀 0 도 끔(n-2)");
+            assert_eq!(deliver_push(&d, &periodic("hb", 5), s.id, "[heartbeat] 노브 끔", None), Ok("pushed"));
+        }
+        assert_eq!(marker(), (4242, 4242), "노브 끔 = 계수·표식 무접촉(종전)");
+        settle();
+        h_paint(&s, H_IDLE_SCREEN);
+        assert_eq!(counts(&s), (0, 0), "전제: 계수 0 인 좌석(표식만 서 있다)");
+        let gen0 = s.input_gen.load(Ordering::Acquire);
+        assert_eq!(deliver_push(&d, &periodic("hb", 5), s.id, "[heartbeat] 노브 기본", None), Ok("pushed"));
+        assert_eq!(marker(), (0, 0), "인계 계상이 잠정 Esc 면제 표식을 내려야 한다(leaf·미러)");
+        assert!(s.input_gen.load(Ordering::Acquire) > gen0, "세대는 종전대로 오른다");
+        assert!(events(&d, "schedule.push_cleared_pending").is_empty(), "계수 0→0 이라 종전대로 이벤트 없음");
+        done(&s);
     }
 
     /// [C8 인계 실패] `try_send` 실패(채널 가득 · writer 종료) → 계수·사람 몫·세대 유지 · 이벤트 0건 · Err 는 종전 문구 그대로.

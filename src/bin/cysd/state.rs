@@ -1715,38 +1715,54 @@ pub struct Surface {
     /// `governance::pending_input_step` 가 전이 규칙, `governance::input_line_state` 가 소비자).
     /// 휘발이므로 재기동 직후엔 0 이고, 그때는 화면 축(커서 앞 텍스트)이 2차로 판정한다.
     /// v2(0.14.39): 봉투 제외 · 봉투 안 개행 가산 · 봉투 밖 순수 자동응답 면제 · 표식 절단 이월 — 규칙은 governance::pending_input_step 하나.
-    /// v3(0.14.43 · RQFIX): 봉투 밖 단독 Esc·BS/DEL 비계수는 **좌석 표식 [`Surface::lone_key_exempt`] 가 참인 좌석**(살아 있는 에이전트 TUI)에서만 —
-    /// 표식이 거짓(맨 셸·죽은 에이전트·마커 없는 어댑터·표식 쓰기 전)이면 v2 규칙으로 센다([`Surface::pending_input_model`]).
+    /// v3(0.14.43 · RQFIX · R1F-IN): 봉투 밖 단독 Esc·BS/DEL 비계수는 **좌석 표식 [`Surface::lone_key_exempt`] 가 참이고 전경이 에이전트 그룹인 좌석**(살아 있는 에이전트 TUI)에서만 —
+    /// 표식이 거짓(맨 셸·죽은 에이전트·마커 없는 어댑터·표식 쓰기 전)이거나 전경이 에이전트 그룹이 아니면 v2 규칙으로 센다([`Surface::pending_input_model`]).
     pub pending_input_bytes: AtomicU64,
     /// 미제출 입력 상태기계의 surface 별 상태. count 의 SOT 는 미러 atomic `pending_input_bytes`
     /// (락 없는 읽기 소비자·테스트 픽스처 직접 store 호환) · 나머지 필드의 SOT 는 이 Mutex.
     pub pending_input: Mutex<crate::governance::PendingInputState>,
-    /// ★(0.14.43 · RQFIX B-1 · RQFIX2 m-1·m-2) **좌석 틱 표식** — "마지막 watchdog 틱이 이 좌석에 **엄격 증거로 살아 있는 마커 에이전트**가 있다고 판정했다"
+    /// ★(0.14.43 · RQFIX B-1 · RQFIX2 m-1·m-2 · R1F-IN ⓑ) **좌석 틱 표식** — "마지막 watchdog 틱이 이 좌석에 **엄격 증거로 살아 있는 마커 에이전트**가 있다고 판정했다"
     /// (`liveness == AliveStrict` ∧ 어댑터가 프롬프트 마커 선언 ∧ 전역 모델 V3). **이 표식만으로 V3 가 적용되지는 않는다** — 실제 적용은
-    /// 이 표식 ∧ **계수 시점의 전경이 작업(job)**(`tcgetpgrp(master)` ≠ `getpgid(뿌리)` · unix)이다([`Surface::pending_input_model`]).
+    /// 이 표식 ∧ **계수 시점의 PTY 전경 프로세스 그룹이 틱이 적어 둔 에이전트 그룹**(`tcgetpgrp(master)` == [`Surface::agent_fg_pgid`] > 0 · unix)이다([`Surface::pending_input_model`]).
     /// [`Surface::apply_pending_input`] 이 그 판정으로 계수 모델을 고른다 — V3(봉투 밖 단독 Esc·BS/DEL 비계수) · 그 밖은 V2(종전 · 길이만큼 계수).
     ///
     /// **단일 writer = `governance::check_agent_death`**(watchdog 틱 · 좌석마다 에이전트 생존을 이미 판정하는 상태머신 — 사망 상태머신은 광의 일치도 생존으로 보는 `alive` 로 돌고,
-    /// 표식은 **엄격 증거**만 받는다). 맨 셸(`agent_meta` 없음)·종료 좌석·죽은 에이전트·광의 일치(미증명 포함)뿐인 좌석·마커 없는 어댑터는 거짓.
+    /// 표식은 **엄격 증거**만 받는다 · 쓰는 자리는 `governance::sync_lone_key_exempt` 하나이고 `agent_fg_pgid` 도 거기서 함께 쓴다). 맨 셸(`agent_meta` 없음)·종료 좌석·죽은 에이전트·광의 일치(미증명 포함)뿐인 좌석·마커 없는 어댑터는 거짓.
     /// 맨 셸 줄 편집기(zsh·readline 계열)는 단독 ESC 를 Meta 조합의 첫 바이트로 받아 **다음 키를 무기한 기다린다**(화면에는 아무것도 없다) —
     /// 그 좌석에서 v3 로 0 을 세면 큐 본문(`ESC[200~…`)이 그 접두와 합쳐져 붙여넣기 봉투가 깨진다(B-1 실측). 정규 모드 tty(`cat`·`read`·`sudo`)에서는
     /// `^[`·`^H` 가 글자로도 남는다.
     ///
-    /// **왜 전경을 직접 보나**: 프로세스 표는 '에이전트 프로세스가 있다' 까지만 안다. 중지된 에이전트(Ctrl-Z · 중지 상태로 표에 남는다)·사망 직후 다음 틱까지의 창에서는
-    /// 표식이 참인데 전경은 셸(줄 편집기)이다 — 셸 프롬프트가 전경이면 줄 편집기가 키를 받는다. 이것은 커널에 물으면 계수 시점에 즉시 안다.
+    /// **왜 전경을 직접 보나**: 프로세스 표는 '에이전트 프로세스가 있다' 까지만 안다. 중지된 에이전트(Ctrl-Z · 중지 상태로 표에 남는다)·사망 직후 다음 틱까지의 창·에이전트는 배경이고 셸 프롬프트나
+    /// 중첩 셸(`poetry shell`·손으로 친 `zsh`)이 전경인 좌석에서는 표식이 참인데 키를 받는 것은 줄 편집기다. 그 구분은 커널에 물으면 계수 시점에 즉시 안다 — ★R1F-IN: 판정은
+    /// "전경 ≠ 뿌리 셸 그룹"(중첩 셸의 프롬프트도 '작업'으로 읽혔다)이 아니라 **"전경 == 틱이 적어 둔 엄격 일치 에이전트 프로세스의 그룹"** 이다.
     ///
-    /// **실패 방향**: 표식이 거짓인 동안(좌석 등록 직후 첫 틱 전 · 어댑터 프로브 미도달)·전경을 모를 때(시스템 콜 실패 · 자식 종료)는 V2 = 0.14.42 동작(보수 · fail-closed).
-    /// 휘발(재기동 직후 false)이며 영속하지 않는다. 읽기는 원자 한 번(락 없음) — `input_gate` 안에서는 `pending_input` leaf 만 잡는다는 계약을 건드리지 않는다.
+    /// **실패 방향**: 표식이 거짓인 동안(좌석 등록 직후 첫 틱 전 · 어댑터 프로브 미도달)·에이전트 그룹을 모를 때(틱 전 · 0)·전경을 모를 때(시스템 콜 실패 · 자식 종료)는 V2 = 0.14.42 동작(보수 · fail-closed).
+    /// 휘발(재기동 직후 false)이며 영속하지 않는다. 읽기는 원자 두 번과 시스템 콜 한 번(락 없음) — `input_gate` 안에서는 `pending_input` leaf 만 잡는다는 계약을 건드리지 않는다.
     ///
-    /// **남는 한계(정직)**: ① 전경 작업이 에이전트가 아닌 다른 프로그램이고 에이전트는 배경·중지인 좌석(전경 = 작업 → V3) ② 엄격 매처가 에이전트로 오인하는 프로그램
-    /// (`man claude` 등 — 토큰 basename 일치)이 전경인 좌석 ③ 좌석의 뿌리 프로세스가 셸이 아니라 에이전트 자신인 좌석(전경 = 뿌리 그룹 → V2 · 보수) ④ 윈도우: 전경 판정이 없다 —
-    /// 틱 표식만(기본 V2 라 표식이 늘 거짓이고, 명시 `v3` 옵트인은 종전 뜻 그대로).
+    /// **남는 한계(정직)**: ① 닫힘 — 전경이 '에이전트가 아닌 다른 프로그램'(중첩 셸 프롬프트·다른 작업)인 좌석은 V2 다(전경이 엄격 일치한 에이전트 프로세스의 그룹일 때만 V3).
+    /// ② 엄격 매처가 에이전트로 오인하는 프로그램(`man claude` 등 — 토큰 basename 일치)이 전경 그룹에 있으면 에이전트로 읽는다(그대로).
+    /// ③ 새 한계 — 에이전트가 키 읽기를 멈춘 때(종료 중·멈춤)부터 다음 틱(주기 5초 + 틱 소요)까지의 창: 그 사이 누른 사람 단독 Esc 는 0 으로 세어진다. 에이전트가 그 Esc 를 읽지 못한 채 전경에서
+    /// 사라지면 틱이 `tcgetpgrp`(커널 사실)로 알아채 계수 1(사람 몫 1)로 되돌린다(`input.esc_recounted` · [`Surface::esc_exempt_pgid`]). 되돌리기 전에 셸이 그 Esc 를 읽고 비권위 주입이 끼어드는 것이 이 창의 위험이다.
+    /// ④ 뿌리 프로세스가 셸이 아니라 에이전트 자신인 좌석·작업 제어가 없는 셸(에이전트가 뿌리 셸과 같은 그룹)은 전경 = 뿌리 그룹이라 V2(보수).
+    /// ⑤ 윈도우: 전경 판정이 없다 — 틱 표식만(기본 V2 라 표식이 늘 거짓이고, 명시 `v3` 옵트인은 종전 뜻 그대로). 되돌리기도 없다(전경을 물을 수 없다 — 면제 표식이 서지 않는다).
     pub lone_key_exempt: AtomicBool,
     /// ★(0.14.43 · RQFIX2 m-2) PTY master 의 raw fd — **좌석 생성 때 원자로 캐시**한다(unix · 모르면 −1). 입력 경로(`apply_pending_input` → `pending_input_model`)가 전경 프로세스 그룹을
     /// `tcgetpgrp` 로 묻기 위한 것이다 — `master` Mutex 를 입력 경로에서 잡지 않는다(`input_gate` 안에서는 `pending_input` leaf 만 잡는다는 계약 유지).
     /// 좌석이 살아 있는 동안 `master` 도 이 구조체 안에서 살아 있으므로 fd 는 유효하다(자식이 죽어도 master 는 남는다 — 그때 `tcgetpgrp` 는 실패 → V2).
     #[cfg(unix)]
     pub pty_master_fd: AtomicI32,
+    /// ★(0.14.43 · R1F-IN ⓑ) 이 좌석 PTY 의 전경 프로세스 그룹이 **"엄격 일치한 에이전트 프로세스(`cmdline_matches_agent_exec`)의 그룹"** 이면 그 그룹 id, 아니면 0(unix).
+    /// 단일 writer = `governance::sync_lone_key_exempt`(watchdog 틱 · 좌석마다 매 틱 — 종료 좌석·맨 셸·엄격 증거 없음·시스템 콜 실패·전경이 뿌리 셸 그룹이면 0). 틱이 엄격 일치한 자손 pid 들의 `getpgid` 집합 P 와
+    /// `tcgetpgrp(pty_master_fd)` 를 비교해 `fg ∈ P` 일 때만 `fg` 를 적는다. 읽는 곳: 계수 시점의 V3 판정([`Surface::pending_input_model`] — 지금의 `tcgetpgrp` 와 같을 때만 · "면제해도 되는가"의 판정).
+    /// ★되돌리기(`esc_exempt_pgid`)는 이 값을 쓰지 않는다 — 프로세스 표 판독이 한 틱 비는 것만으로 살아 있는 에이전트 좌석에 헛 계수를 세우지 않으려고 커널 사실(전경 그룹)만 본다. 락 없음 · 휘발(0 = 틱 전).
+    #[cfg(unix)]
+    pub agent_fg_pgid: AtomicI32,
+    /// ★(0.14.43 · R1F-IN ⓐ) **잠정 Esc 면제 표식의 원자 미러**(unix) — V3 로 면제한 **사람의 단독 Esc** 가 마지막 리셋 뒤에 있었다면 **면제 당시의 PTY 전경(에이전트) 그룹 번호**, 없으면 0.
+    /// 진실은 leaf 상태 `PendingInputState::esc_exempt_pgid` 이고 이것은 틱이 락 없이 미리 보는 용도다 — 쓰는 곳은 모두 `pending_input` leaf 를 쥔 채다(`apply_pending_input` · `clear_pending_input` ·
+    /// `take_esc_exempt` · `restore_esc_exempt` · `recount_exempted_esc` · 스케줄 인계 계상 `schedule::inject_on`). 틱은 이 값이 0 이 아닌 좌석에서만 지금의 전경 그룹을 커널에 물어(`tcgetpgrp`) 면제 당시의
+    /// 그룹이 아니면 되돌린다(`governance::esc_recount_due`). 휘발.
+    #[cfg(unix)]
+    pub esc_exempt_pgid: AtomicI32,
     /// ★(0.14.31 · WP-5 B-2②) `pending_input_bytes` 의 **변이 세대** — 모든 쓰기(`set_pending_input`)
     /// 마다 +1. stale 리셋 판정이 "같은 바이트 수" 가 아니라 "같은 세대" 를 본다: 옛 초안을 제출하고
     /// 같은 길이의 새 초안을 친 ABA 를 바이트 수는 구분하지 못한다(codex 설계 검토 Q4).
@@ -2003,6 +2019,20 @@ pub struct GatePending {
     pub followup: Option<String>,
 }
 
+/// ★(0.14.43 · R1F-IN ⓐ) [`Surface::recount_exempted_esc`](틱의 잠정 Esc 면제 되돌리기 · unix)의 결과.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscRecount {
+    /// `input_gate` 가 바빠 이번 틱은 건너뛴다 — 아무것도 바꾸지 않았다(표식이 남으므로 다음 틱이 같은 판정으로 다시 한다).
+    Busy,
+    /// 되돌릴 이유가 없다 — 표식이 없거나(그 사이 리셋·인계가 내렸다) 지금 전경 그룹이 면제 당시 그룹 그대로다. 아무것도 바꾸지 않았다.
+    NotDue,
+    /// 표식만 내렸다 — 계수가 이미 0 이 아니라 그대로 둔다(이벤트 없음). `from` = 면제 당시의 그룹.
+    Lowered { from: i32 },
+    /// 계수 0 → 1(사람 몫 1)로 올리고 표식을 내렸다(이벤트 1건). `from` = 면제 당시의 그룹.
+    Raised { from: i32 },
+}
+
 impl Surface {
     /// ★(0.14.31 · 리뷰 R2 · codex blocking) 결판 대기 중인 인계를 **취소**한다(처분자 전용).
     ///
@@ -2062,34 +2092,46 @@ impl Surface {
         self.input_gen.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// ★(0.14.43 · RQFIX B-1 · RQFIX2 m-2) 이 좌석에 **지금 이 순간 적용되는** 미제출 입력 계수 모델 — V3 는 **[`Surface::lone_key_exempt`](엄격 증거로 살아 있는 마커 에이전트) ∧
-    /// 지금 PTY 의 전경이 작업(job)** 일 때만, 그 밖은 V2. `apply_pending_input` 과 진단(`queue_block_diag` 의 `input_model`)이 이 한 곳을 읽는다.
-    /// 틱 표식이 거짓이면 시스템 콜 없이 곧바로 V2 다(원자 읽기 한 번). 참일 때만 [`Surface::foreground_is_job_now`] 가 `tcgetpgrp`·`getpgid` 두 시스템 콜로 묻는다(락 없음).
+    /// ★(0.14.43 · RQFIX B-1 · RQFIX2 m-2 · R1F-IN ⓑ) 이 좌석에 **지금 이 순간 적용되는** 미제출 입력 계수 모델 — V3 는 **[`Surface::lone_key_exempt`](엄격 증거로 살아 있는 마커 에이전트) ∧
+    /// 지금 PTY 의 전경 프로세스 그룹 == 틱이 적어 둔 에이전트 그룹([`Surface::agent_fg_pgid`])** 일 때만, 그 밖은 V2. `apply_pending_input` 과 진단(`queue_block_diag` 의 `input_model`)이 이 한 곳을 읽는다.
+    /// 틱 표식이 거짓이거나 에이전트 그룹이 0 이면 시스템 콜 없이 곧바로 V2 다(원자 읽기뿐). 둘 다 참일 때만 `tcgetpgrp` 한 번으로 묻는다(락 없음).
     pub fn pending_input_model(&self) -> crate::governance::PendingInputModel {
-        if self.lone_key_exempt.load(Ordering::Relaxed) && self.foreground_is_job_now() {
-            crate::governance::PendingInputModel::V3
-        } else {
-            crate::governance::PendingInputModel::V2
+        self.pending_input_model_with_fg().0
+    }
+
+    /// [`Surface::pending_input_model`] 의 본체 — `(모델, 그 판정에 실제로 쓴 에이전트 전경 그룹)`. V3 면 그룹 번호(unix · `tcgetpgrp` 값 == `agent_fg_pgid` > 0 · 비-unix 는 모르므로 0), V2 면 0.
+    /// ★전경은 **한 번만** 읽는다 — `apply_pending_input` 이 사람의 단독 Esc 를 면제할 때 적는 표식 값과 모델 판정에 쓴 값이 같아야 한다.
+    fn pending_input_model_with_fg(&self) -> (crate::governance::PendingInputModel, i32) {
+        use crate::governance::PendingInputModel::{V2, V3};
+        if !self.lone_key_exempt.load(Ordering::Relaxed) {
+            return (V2, 0);
         }
+        self.v3_foreground_group_now().map_or((V2, 0), |fg| (V3, fg))
     }
 
-    /// 지금 이 좌석 PTY 의 전경 프로세스 그룹이 **작업**인가(unix) — `tcgetpgrp(캐시한 master fd)` 와 `getpgid(뿌리 프로세스)` 를 순수 판정
-    /// [`crate::governance::foreground_is_job`] 에 넘긴다. fd 가 없거나(< 0)·시스템 콜이 실패하거나(반환 ≤ 0)·뿌리 pid 를 모르면 `None` → 거짓(V2).
-    /// 락 없음 · `master` Mutex 를 잡지 않는다.
+    /// 지금 이 좌석 PTY 의 전경 프로세스 그룹(unix) — `tcgetpgrp(캐시한 master fd)`. fd 가 없거나(< 0)·시스템 콜이 실패하면(반환 ≤ 0) `None`. 락 없음 · `master` Mutex 를 잡지 않는다.
+    /// raw fd 를 읽는 곳은 이 함수 하나다(계수 시점 판정과 틱의 에이전트 그룹 판정·되돌리기가 같은 읽기를 쓴다).
     #[cfg(unix)]
-    fn foreground_is_job_now(&self) -> bool {
+    pub fn foreground_pgid_now(&self) -> Option<i32> {
         let fd = self.pty_master_fd.load(Ordering::Relaxed);
-        let fg = (fd >= 0).then(|| unsafe { libc::tcgetpgrp(fd) }).filter(|p| *p > 0);
-        let shell = (self.pid > 0)
-            .then(|| unsafe { libc::getpgid(self.pid as libc::pid_t) })
-            .filter(|p| *p > 0);
-        crate::governance::foreground_is_job(fg, shell)
+        (fd >= 0).then(|| unsafe { libc::tcgetpgrp(fd) }).filter(|p| *p > 0)
     }
 
-    /// 윈도우 등 비-unix: 전경 판정을 건너뛴다(틱 표식만 — 기본 V2 라 표식이 늘 거짓이고, 명시 `v3` 옵트인은 종전 뜻 그대로). 컴파일 분기는 `cfg` 다(런타임 `cfg!` 안에 unix API 금지).
+    /// 지금 이 좌석 PTY 의 전경 프로세스 그룹이 **틱이 적어 둔 에이전트 그룹**이면 그 그룹 번호(unix) — [`Surface::agent_fg_pgid`] 가 0 이면 시스템 콜 없이 `None`(V2).
+    /// 아니면 `tcgetpgrp` 결과를 순수 판정 [`crate::governance::foreground_is_agent`] 에 넘긴다 — 시스템 콜이 실패하면(반환 ≤ 0) `None`(V2). 락 없음.
+    #[cfg(unix)]
+    fn v3_foreground_group_now(&self) -> Option<i32> {
+        let agent = self.agent_fg_pgid.load(Ordering::Relaxed);
+        if agent <= 0 {
+            return None;
+        }
+        crate::governance::foreground_is_agent(self.foreground_pgid_now(), agent).then_some(agent)
+    }
+
+    /// 윈도우 등 비-unix: 전경 판정을 건너뛴다(틱 표식만 — 기본 V2 라 표식이 늘 거짓이고, 명시 `v3` 옵트인은 종전 뜻 그대로 · 그룹 번호는 모른다 = 0). 컴파일 분기는 `cfg` 다(런타임 `cfg!` 안에 unix API 금지).
     #[cfg(not(unix))]
-    fn foreground_is_job_now(&self) -> bool {
-        true
+    fn v3_foreground_group_now(&self) -> Option<i32> {
+        Some(0)
     }
 
     /// 청크 1개를 상태기계에 적용하고 미러·세대를 갱신한다. 새 상태를 돌려준다.
@@ -2101,19 +2143,28 @@ impl Surface {
         chunk: &[u8],
         origin: crate::governance::InputOrigin,
     ) -> crate::governance::PendingInputState {
-        let model = self.pending_input_model();
+        // ★(R1F-IN ⓐ) 전경은 한 번만 읽는다 — 모델 판정에 쓴 값(`fg_used`)이 곧 아래 면제 표식에 적는 값이다. 시스템 콜은 `pending_input` leaf 를 잡기 **전**에 끝낸다.
+        let (model, fg_used) = self.pending_input_model_with_fg();
         let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
         st.count = self.pending_input_bytes.load(Ordering::Relaxed); // 미러가 count 의 SOT
         // count 만 바꾸는 경로(큐 Inject·롤백 `set_pending_input`)가 지나간 뒤 불변식 human ≤ count 를 복원 — human 은 D-12 Return 게이트 축이라 stale 하면 자기 본문 제출이 거부된다.
         st.human = st.human.min(st.count);
-        let next = crate::governance::pending_input_step_model(
+        let mut next = crate::governance::pending_input_step_model(
             &st,
             chunk,
             origin,
             std::time::Instant::now(),
             model,
         );
+        // ★(R1F-IN ⓐ) 스텝이 "이번 청크에서 사람의 단독 Esc 를 V3 로 면제했다"고 표지했다(순수 — 전경을 모른다) → 그 판정에 쓴 전경(에이전트 그룹)을 표식으로 적는다.
+        //   비-unix 는 전경을 몰라 0(= 표식 없음 · 되돌리기 없음). 임시 표지 값은 저장 상태에 남지 않는다.
+        if next.esc_exempt_pgid == crate::governance::ESC_EXEMPT_PGID_PENDING {
+            next.esc_exempt_pgid = fg_used;
+        }
         *st = next.clone();
+        // 원자 미러 — leaf 를 쥔 채 쓴다(진실 = leaf 상태).
+        #[cfg(unix)]
+        self.esc_exempt_pgid.store(next.esc_exempt_pgid, Ordering::Relaxed);
         drop(st);
         self.set_pending_input(next.count);
         next
@@ -2123,8 +2174,76 @@ impl Surface {
     /// 호출자는 `input_gate` 안에서 부르는 것이 규약이다(handlers send_text/send_key ·
     /// governance 배달 임계영역 · stale 리셋).
     pub fn clear_pending_input(&self) {
-        *self.pending_input.lock().unwrap_or_else(|e| e.into_inner()) = Default::default();
+        {
+            let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+            *st = Default::default(); // 잠정 Esc 면제 표식(esc_exempt_pgid)도 Default(0)로 내려간다 — 미러는 leaf 를 쥔 채 맞춘다.
+            #[cfg(unix)]
+            self.esc_exempt_pgid.store(0, Ordering::Relaxed);
+        }
         self.set_pending_input(0);
+    }
+
+    /// ★(0.14.43 · R1F-IN ⓐ) 줄이 **제출됐다고 계상**하는 큐 인계(`governance::deliver_head_locked`)가 잠정 Esc 면제 표식을 내리고 **직전 값**(면제 당시의 그룹 번호 · 없으면 0)을 돌려준다 —
+    /// 롤백이 그 값을 복원한다. `clear_pending_input` 과 달리 나머지 leaf 상태(사람 몫·봉투·소유자)는 건드리지 않는다(큐 인계가 `set_pending_input(0)` 만 하던 종전 계상 그대로).
+    /// 호출자는 `input_gate` 안에서 부른다(규약) — `pending_input` leaf 만 잡는다.
+    pub fn take_esc_exempt(&self) -> i32 {
+        let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+        let was = std::mem::replace(&mut st.esc_exempt_pgid, 0);
+        #[cfg(unix)]
+        self.esc_exempt_pgid.store(0, Ordering::Relaxed);
+        was
+    }
+
+    /// ★(0.14.43 · R1F-IN ⓐ) [`Surface::take_esc_exempt`] 의 역 — 인계 롤백(쓰이지 않은 배달)이 직전에 서 있던 표식(`pgid` > 0)을 되살린다. 0 이면 아무것도 하지 않는다. 호출자는 `input_gate` 안에서 부른다.
+    pub fn restore_esc_exempt(&self, pgid: i32) {
+        if pgid <= 0 {
+            return;
+        }
+        let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+        st.esc_exempt_pgid = pgid;
+        #[cfg(unix)]
+        self.esc_exempt_pgid.store(pgid, Ordering::Relaxed);
+    }
+
+    /// ★(0.14.43 · R1F-IN ⓐ) **틱의 되돌리기**(unix) — V3 로 면제한 사람의 단독 Esc(표식 `esc_exempt_pgid`)가 서 있는데 지금의 전경 그룹(`fg_now`)이 면제 당시의 그룹이 아니면 그 면제를 거둔다:
+    /// 계수가 0 이면 `count = 1 · human = 1`(0.14.42 의 유령 계수 1 — 사람이 그 창에서 Ctrl-U 로 비운다), 이미 0 이 아니면 계수는 그대로 두고 표식만 내린다. 가산 정정뿐이다(감산 없음).
+    /// 락: `input_gate` 는 **`try_lock` 으로만** 잡는다(바쁘면 [`EscRecount::Busy`] — 워치독이 직접 send·큐 배달의 게이트 보유를 기다리지 않는다 · 표식이 남으므로 다음 틱에 다시 한다) →
+    /// `pending_input` leaf(기존 stale 리셋·배달 임계영역과 같은 순서). 되돌릴 이유는 **leaf 의 진실로 다시 판정**한다(틱이 미러를 본 뒤 리셋·인계가 내렸거나 새 Esc 가 지금 전경 그룹 밑에서 다시 면제됐을 수 있다).
+    /// 미러·세대는 `set_pending_input` 으로 갱신한다(세대가 올라 소유자 각인은 자동 무효). 이벤트는 호출자가 락 밖에서 낸다.
+    #[cfg(unix)]
+    pub fn recount_exempted_esc(&self, fg_now: i32) -> EscRecount {
+        let gate = match self.input_gate.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => return EscRecount::Busy,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
+        let (from, raised) = {
+            let mut st = self.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+            let from = st.esc_exempt_pgid;
+            if !crate::governance::esc_recount_due(from, Some(fg_now)) {
+                // 되돌릴 이유가 없다(표식 없음 · 지금 전경 그룹 그대로) — 아무것도 바꾸지 않는다(낡은 미러만 맞춘다).
+                self.esc_exempt_pgid.store(from, Ordering::Relaxed);
+                return EscRecount::NotDue;
+            }
+            st.esc_exempt_pgid = 0;
+            self.esc_exempt_pgid.store(0, Ordering::Relaxed);
+            if self.pending_input_bytes.load(Ordering::Relaxed) > 0 {
+                (from, false) // 이미 계수가 있다 — 그대로 둔다(표식만 내렸다).
+            } else {
+                st.count = 1;
+                st.human = 1;
+                (from, true)
+            }
+        };
+        if raised {
+            self.set_pending_input(1);
+        }
+        drop(gate);
+        if raised {
+            EscRecount::Raised { from }
+        } else {
+            EscRecount::Lowered { from }
+        }
     }
 
     /// ★(0.14.42 · A2 D0) 방금 적용한 기계 본문의 **검증** 소유자를 지금 세대로 각인한다
@@ -6077,6 +6196,11 @@ impl Daemon {
             lone_key_exempt: AtomicBool::new(false),
             #[cfg(unix)]
             pty_master_fd: AtomicI32::new(pty_master_fd),
+            // ★(R1F-IN) ⓑ 에이전트 전경 그룹은 틱 전이라 0(= V2) · ⓐ 신생 좌석은 면제한 Esc 가 없다(0).
+            #[cfg(unix)]
+            agent_fg_pgid: AtomicI32::new(0),
+            #[cfg(unix)]
+            esc_exempt_pgid: AtomicI32::new(0),
             input_gen: AtomicU64::new(0),
             input_gate: std::sync::Mutex::new(()),
             // ★(0.14.42 · A2) 흡수 표는 휘발 — 재기동·재생성 좌석은 빈 채로 출발(= 종전 동작).

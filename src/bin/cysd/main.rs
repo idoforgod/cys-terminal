@@ -6,6 +6,23 @@
 // GUI 앱과 동일하게 릴리스에서 windows subsystem 으로 빌드해 콘솔을 원천 제거한다(디버그는 콘솔 유지).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+// ★(0.14.43 · R1F-IN m-1) 데몬 전역 로그 매크로 — 표준 `eprintln!`·`eprint!` 는 stderr 쓰기가 실패하면(디스크 가득·닫힌 파이프) **패닉**한다. 이 데몬의 stderr 는 로그 파일이고,
+//   워치독 틱 안의 로그 한 줄이 패닉하면 그 틱의 나머지 검사(사망 감지·데드맨·승인 스캔)를 버린다(적대 검증 S1 m-1 실측 P5 · 표준 매크로는 종료 코드 101, 아래 매크로는 정상 종료).
+//   같은 이름을 크레이트 전역으로 가려 쓰기 실패를 무시한다 — 호출처(약 170곳)는 고치지 않는다(그대로 이 매크로로 풀린다). 로그는 부가 정보라 실패해도 계속 돈다.
+//   ★반드시 **첫 모듈 선언보다 앞**에 둔다(macro_rules 의 텍스트 범위 — 뒤에 선언한 모듈 전부에 적용된다). 핀: `eprintln_guard_tests`.
+macro_rules! eprintln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), $($arg)*);
+    }};
+}
+macro_rules! eprint {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = write!(std::io::stderr(), $($arg)*);
+    }};
+}
+
 mod accounts;
 mod alert_route;
 mod alerts;
@@ -4029,6 +4046,98 @@ mod abi_frame_tests {
         }
         assert_eq!(body.matches("emit(").count(), 1, "로그 출력구는 한 곳");
         assert_eq!(body.matches("abi_note(").count(), 1, "계수·로그 판정은 abi_note 한 곳");
+    }
+}
+
+#[cfg(test)]
+mod eprintln_guard_tests {
+    //! ★(0.14.43 · R1F-IN m-1) 데몬 전역 로그 매크로 핀 — 파일 맨 위의 `eprintln!`·`eprint!` 가림 매크로는 stderr 쓰기가 실패해도(디스크 가득·닫힌 파이프) 패닉하지 않는다.
+    //! 표준 매크로는 그때 패닉하고, 워치독 틱 안의 로그 한 줄이 그 틱의 나머지 검사(사망 감지·데드맨·승인 스캔)를 버린다(적대 검증 S1 m-1 실측 P5).
+
+    /// 소스 핀 — ① 매크로 정의가 **첫 `mod` 선언보다 앞**이다(macro_rules 의 텍스트 범위 — 뒤에 선언한 모듈 전부에 적용된다) ② 쓰기 실패를 버린다(`let _ = writeln!`/`write!`) ③ cysd 소스 어디에도
+    /// 표준 경로(`std::` 접두) 호출이 없다 — 경로 호출은 이 매크로를 우회해 그대로 패닉한다(바늘은 조각으로 만들어 이 파일에 그 문자열이 남지 않게 한다).
+    #[test]
+    fn global_eprintln_macro_is_defined_before_the_first_mod_and_nothing_bypasses_it() {
+        let src = include_str!("main.rs");
+        let mac = src.find("macro_rules! eprintln {").expect("eprintln 가림 매크로 소실");
+        let macp = src.find("macro_rules! eprint {").expect("eprint 가림 매크로 소실");
+        let first_mod = src.find("\nmod ").expect("첫 mod 선언");
+        assert!(mac < first_mod && macp < first_mod, "매크로 정의가 첫 `mod` 선언보다 앞이어야 모든 모듈에 적용된다");
+        let def = &src[mac..first_mod];
+        assert!(def.contains("let _ = writeln!(std::io::stderr(), $($arg)*);"), "eprintln 은 쓰기 실패를 버린다");
+        assert!(def.contains("let _ = write!(std::io::stderr(), $($arg)*);"), "eprint 도 같은 꼴이다");
+        let needles = [format!("{}{}", "std::", "eprintln!"), format!("{}{}", "std::", "eprint!")];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
+        let mut scanned = 0;
+        for entry in std::fs::read_dir(&dir).expect("cysd 소스 디렉터리") {
+            let path = entry.expect("디렉터리 항목").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("소스 읽기");
+            scanned += 1;
+            for n in &needles {
+                // `::std::…` 접두 호출도 부분 문자열로 걸린다.
+                assert!(
+                    !text.contains(n.as_str()),
+                    "{} 에 표준 경로 호출 `{n}` 이 있다 — 가림 매크로를 우회해 stderr 쓰기 실패에서 패닉한다",
+                    path.display()
+                );
+            }
+        }
+        assert!(scanned >= 20, "cysd 소스 스캔이 공허하다({scanned}개)");
+    }
+
+    /// 자식 전용 탐침의 표식 env — 부모 검체가 같은 하네스를 다시 띄울 때만 켠다.
+    const EPRINTLN_CHILD_ENV: &str = "CYS_EPRINTLN_CHILD_PROBE";
+
+    /// 자식 전용 탐침 — 표식이 없으면(일반 전량 실행) 즉시 통과한다. 부모 검체가 stderr 를 **닫힌 파이프**로 주고 같은 하네스를 `--exact` 로 다시 띄워 이 줄을 읽는다(`v3_current_child_probe` 와 같은 기법).
+    /// 측정 유효성: 맨 쓰기(`writeln!(stderr)`)가 실제로 실패해야(= EPIPE) 이 탐침이 의미가 있다 — 그 값도 함께 찍는다.
+    #[test]
+    fn eprintln_child_probe() {
+        if std::env::var_os(EPRINTLN_CHILD_ENV).is_none() {
+            return;
+        }
+        use std::io::Write as _;
+        let raw_write_failed = writeln!(std::io::stderr(), "raw").is_err();
+        let macros = std::panic::catch_unwind(|| {
+            eprintln!("probe {}", 1);
+            eprint!("probe {}", 2);
+            eprintln!();
+        });
+        println!("@@EPRINT raw_write_failed={raw_write_failed} macros_ok={}", macros.is_ok());
+    }
+
+    /// 행동 핀(unix) — stderr 가 닫힌 파이프인 프로세스에서 가림 매크로(`eprintln!`·`eprint!` · 인자 없는 꼴 포함)는 패닉하지 않는다. 같은 프로세스의 맨 쓰기는 실패한다(측정 유효성).
+    /// 매크로를 지우면(표준 매크로로 돌아가면) 자식이 패닉을 잡아 `macros_ok=false` 가 되어 이 검체가 적색이다.
+    #[cfg(unix)]
+    #[test]
+    fn eprintln_macros_survive_a_broken_stderr() {
+        use std::os::fd::FromRawFd as _;
+        if std::env::var_os(EPRINTLN_CHILD_ENV).is_some() {
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe 생성");
+        unsafe { libc::close(fds[0]) }; // 읽는 쪽을 닫는다 → 쓰기는 EPIPE(러스트 런타임은 SIGPIPE 를 무시한다)
+        let broken = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+        let out = std::process::Command::new(&exe)
+            .args(["--exact", "eprintln_guard_tests::eprintln_child_probe", "--nocapture", "--test-threads=1"])
+            .env(EPRINTLN_CHILD_ENV, "1")
+            .stderr(std::process::Stdio::from(broken))
+            .output()
+            .expect("자식 하네스 실행");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let line = stdout
+            .lines()
+            .find_map(|l| l.find("@@EPRINT ").map(|i| l[i + "@@EPRINT ".len()..].trim().to_string()))
+            .unwrap_or_else(|| panic!("자식 검체 줄 누락(결측은 값이 아니다) — rc={:?}\nstdout:\n{stdout}", out.status.code()));
+        assert_eq!(
+            line, "raw_write_failed=true macros_ok=true",
+            "닫힌 파이프에서 가림 매크로가 패닉했거나(macros_ok=false) 탐침이 stderr 를 닫지 못했다(raw_write_failed=false)"
+        );
+        assert!(out.status.success(), "자식 하네스가 비정상 종료했다: {:?}", out.status.code());
     }
 }
 
