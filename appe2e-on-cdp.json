@@ -1,0 +1,736 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "ui",
+  "port": 9333,
+  "started": "2026-10-04T08:03:58.419Z",
+  "finished": "2026-10-04T08:05:30.960Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "cys — CYSJavis Terminal",
+      "url": "http://tauri.localhost/",
+      "id": "4ABBE85F936A1063FDA4682C5CB97EB1"
+    }
+  ],
+  "chosen_target": {
+    "url": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "id": "4ABBE85F936A1063FDA4682C5CB97EB1"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.43",
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": {
+    "update-progress": "ok",
+    "update-error": "ok",
+    "update-available": "ok",
+    "update-downloaded": "ok",
+    "update-finished": "ok",
+    "update-installing": "ok"
+  },
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 8788,
+    "progress_count": 8788,
+    "progress_first": {
+      "polled_at": "2026-10-04T08:04:02.070Z",
+      "ev": {
+        "t": 1791101039981,
+        "n": "update-progress",
+        "p": {
+          "phase": "download"
+        }
+      }
+    },
+    "progress_last": {
+      "polled_at": "2026-10-04T08:04:04.097Z",
+      "ev": {
+        "t": 1791101042598,
+        "n": "update-progress",
+        "p": {
+          "chunk": 9341,
+          "phase": "download",
+          "total": 143202847
+        }
+      }
+    },
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-04T08:03:58.420Z",
+      "name": "start",
+      "argv": "--mode ui --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-on --max-wait-sec 300 --observe-sec 90 --ready-wait-sec 90 --panel-wait-sec 180 --modal-wait-sec 60",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-04T08:03:58.480Z",
+      "name": "targets",
+      "count": 1,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-04T08:03:58.497Z",
+      "name": "connected",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-04T08:03:58.502Z",
+      "name": "attached",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "id": "4ABBE85F936A1063FDA4682C5CB97EB1"
+    },
+    {
+      "t": "2026-10-04T08:03:58.509Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-04T08:03:58.518Z",
+      "name": "app_version",
+      "value": "0.14.43"
+    },
+    {
+      "t": "2026-10-04T08:03:58.522Z",
+      "name": "ui: wait for the Update button"
+    },
+    {
+      "t": "2026-10-04T08:03:58.581Z",
+      "name": "listeners",
+      "update-progress": "ok",
+      "update-error": "ok",
+      "update-available": "ok",
+      "update-downloaded": "ok",
+      "update-finished": "ok",
+      "update-installing": "ok"
+    },
+    {
+      "t": "2026-10-04T08:03:58.585Z",
+      "name": "ui: click the Update button",
+      "attempt": 1
+    },
+    {
+      "t": "2026-10-04T08:03:58.694Z",
+      "name": "ui: panel open, waiting for the bin patch button",
+      "attempt": 1
+    },
+    {
+      "t": "2026-10-04T08:03:59.240Z",
+      "name": "ui: click the bin patch button",
+      "panel_headline": "설치할 수 있는 업데이트 1건",
+      "attempt": 1
+    },
+    {
+      "t": "2026-10-04T08:03:59.817Z",
+      "name": "ui: confirm window",
+      "title": "새 본체 버전 0.14.99 — 패치 설치",
+      "sac_note": true
+    },
+    {
+      "t": "2026-10-04T08:03:59.927Z",
+      "name": "ui: observing",
+      "observe_ms": 90000,
+      "fallback_invoke": false
+    },
+    {
+      "t": "2026-10-04T08:04:09.144Z",
+      "name": "ui: the \"installer launch blocked\" notification is on the screen",
+      "has_4551": true
+    }
+  ],
+  "errors": [],
+  "ui": {
+    "mode": "ui",
+    "stage": "done",
+    "ready": {
+      "ok": true,
+      "waited_ms": 2,
+      "snapshot": {
+        "t": 1791101038530,
+        "ready": true,
+        "update_button": {
+          "text": "Update !",
+          "badge_text": "!",
+          "badge_hidden": false,
+          "badge_title": "새 본체 버전 0.14.99 (Update 버튼으로 패치 설치)"
+        },
+        "panel": null,
+        "confirm": null,
+        "overlays": [],
+        "toasts": [
+          {
+            "cls": "toast health",
+            "name": "Claude Code CLI가 없습니다",
+            "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+          }
+        ],
+        "title": "cys — CYSJavis Terminal"
+      }
+    },
+    "clicks": [
+      {
+        "label": "update button",
+        "t": "2026-10-04T08:03:58.589Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 752.296875,
+          "y": 18.5,
+          "w": 80.03125,
+          "h": 22,
+          "hit": true,
+          "top": "BUTTON#btn-update",
+          "el": "BUTTON#btn-update",
+          "text": "Update !",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      },
+      {
+        "label": "bin patch button",
+        "t": "2026-10-04T08:03:59.244Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 693.3828125,
+          "y": 449.6875,
+          "w": 119.234375,
+          "h": 33,
+          "hit": true,
+          "top": "BUTTON.modal-yes",
+          "el": "BUTTON.modal-yes",
+          "text": "본체 패치 설치",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      },
+      {
+        "label": "confirm install button",
+        "t": "2026-10-04T08:03:59.849Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 691,
+          "y": 544.578125,
+          "w": 60,
+          "h": 33,
+          "hit": true,
+          "top": "BUTTON.modal-yes",
+          "el": "BUTTON.modal-yes",
+          "text": "설치",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      }
+    ],
+    "states": [
+      {
+        "t": "2026-10-04T08:03:58.530Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [
+          "Claude Code CLI가 없습니다"
+        ],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-04T08:03:58.693Z",
+        "ready": true,
+        "panel_headline": "설치할 수 있는 업데이트 1건",
+        "panel_buttons": [
+          "닫기",
+          "확인 중… (disabled)",
+          "본체 패치 설치"
+        ],
+        "confirm_title": null,
+        "toasts": [],
+        "overlays": 1
+      },
+      {
+        "t": "2026-10-04T08:03:59.207Z",
+        "ready": true,
+        "panel_headline": "설치할 수 있는 업데이트 1건",
+        "panel_buttons": [
+          "닫기",
+          "다시 확인",
+          "본체 패치 설치"
+        ],
+        "confirm_title": null,
+        "toasts": [],
+        "overlays": 1
+      },
+      {
+        "t": "2026-10-04T08:03:59.315Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-04T08:03:59.817Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": "새 본체 버전 0.14.99 — 패치 설치",
+        "toasts": [],
+        "overlays": 1
+      },
+      {
+        "t": "2026-10-04T08:03:59.927Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-04T08:04:00.951Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [
+          "⬇ 업데이트 설치"
+        ],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-04T08:04:09.144Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [
+          "설치 파일 실행이 차단되었습니다"
+        ],
+        "overlays": 0
+      }
+    ],
+    "shots": [
+      {
+        "name": "ready",
+        "file": "appe2e-on-ui-ready.png",
+        "t": "2026-10-04T08:03:58.563Z",
+        "bytes": 46708
+      },
+      {
+        "name": "panel",
+        "file": "appe2e-on-ui-panel.png",
+        "t": "2026-10-04T08:03:59.240Z",
+        "bytes": 55556
+      },
+      {
+        "name": "confirm",
+        "file": "appe2e-on-ui-confirm.png",
+        "t": "2026-10-04T08:03:59.849Z",
+        "bytes": 84512
+      },
+      {
+        "name": "after-click-2s",
+        "file": "appe2e-on-ui-after-click-2s.png",
+        "t": "2026-10-04T08:04:02.065Z",
+        "bytes": 44260
+      },
+      {
+        "name": "blocked-toast",
+        "file": "appe2e-on-ui-blocked-toast.png",
+        "t": "2026-10-04T08:04:09.901Z",
+        "bytes": 74336
+      },
+      {
+        "name": "after-click-10s",
+        "file": "appe2e-on-ui-after-click-10s.png",
+        "t": "2026-10-04T08:04:10.939Z",
+        "bytes": 74336
+      },
+      {
+        "name": "observe-late",
+        "file": "appe2e-on-ui-observe-late.png",
+        "t": "2026-10-04T08:05:22.822Z",
+        "bytes": 74380
+      },
+      {
+        "name": "observe-end",
+        "file": "appe2e-on-ui-observe-end.png",
+        "t": "2026-10-04T08:05:30.958Z",
+        "bytes": 74380
+      }
+    ],
+    "button_flow_complete": true,
+    "fallback_invoke": false,
+    "observe": {
+      "polls": 89,
+      "ms": 91001,
+      "socket_closed": false,
+      "socket_closed_at": null
+    },
+    "recorder_installed": "already",
+    "panel": {
+      "headline": "설치할 수 있는 업데이트 1건",
+      "rows": [
+        {
+          "k": "본체(앱)",
+          "v": "v0.14.43 → v0.14.99 — [본체 패치 설치]로 설치(재시작 후 자동 복원)"
+        },
+        {
+          "k": "팩(지침·스킬)",
+          "v": "0.14.43 — 최신"
+        }
+      ],
+      "meta": "마지막 확인 오전 01:03",
+      "buttons": [
+        {
+          "text": "닫기",
+          "cls": "modal-no",
+          "disabled": false
+        },
+        {
+          "text": "다시 확인",
+          "cls": "modal-no",
+          "disabled": false
+        },
+        {
+          "text": "본체 패치 설치",
+          "cls": "modal-yes",
+          "disabled": false
+        }
+      ]
+    },
+    "update_button_state": {
+      "text": "Update !",
+      "badge_text": "!",
+      "badge_hidden": false,
+      "badge_title": "새 본체 버전 0.14.99 (Update 버튼으로 패치 설치)"
+    },
+    "confirm": {
+      "title": "새 본체 버전 0.14.99 — 패치 설치",
+      "body": "새 본체(앱) 0.14.99을 패치 방식으로 설치합니다: 다운로드·서명 검증 뒤 설치 프로그램을 실행합니다(이 앱은 닫히고, 설치가 끝나면 다시 시작됩니다). 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)\n\n이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 새 설치 파일에 Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다(0.14.43 까지의 cys 설치 파일에는 코드 서명이 없습니다). 막히면 업데이트는 설치되지 않고, 이 앱은 닫히지 않은 채 그 사실을 알려 드립니다. 그 경우 홈페이지에서 받은 설치 파일도 같은 이유로 막힙니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.",
+      "buttons": [
+        {
+          "text": "아니오",
+          "cls": "modal-no",
+          "disabled": false
+        },
+        {
+          "text": "설치",
+          "cls": "modal-yes",
+          "disabled": false
+        }
+      ],
+      "sac_note_in_body": true,
+      "seen_at": "2026-10-04T08:03:59.817Z"
+    },
+    "clicked_install_at": "2026-10-04T08:03:59.925Z",
+    "clicked_install_ms": 1791101039925,
+    "install_click": {
+      "label": "confirm install button",
+      "t": "2026-10-04T08:03:59.849Z",
+      "method": "mouse",
+      "ok": true,
+      "find": {
+        "found": true,
+        "x": 691,
+        "y": 544.578125,
+        "w": 60,
+        "h": 33,
+        "hit": true,
+        "top": "BUTTON.modal-yes",
+        "el": "BUTTON.modal-yes",
+        "text": "설치",
+        "disabled": false,
+        "vw": 1028,
+        "vh": 749
+      }
+    },
+    "recorder": {
+      "events": [
+        {
+          "ev": "toast_appear",
+          "name": "🔄 새 본체 버전",
+          "detail": "새 본체 0.14.99 — 상단 Update 버튼으로 패치 설치(재시작·자동 복원)",
+          "cls": "toast feed",
+          "t": 1791101015753
+        },
+        {
+          "ev": "toast_appear",
+          "name": "👥 직원 복귀 중",
+          "detail": "노드 세션 복원 중… (본부·부서)",
+          "cls": "toast feed",
+          "t": 1791101015860
+        },
+        {
+          "ev": "toast_appear",
+          "name": "✅ 직원 복귀 완료",
+          "detail": "노드 세션 복원 완료 (부서 0).",
+          "cls": "toast watchdog",
+          "t": 1791101015960
+        },
+        {
+          "ev": "toast_gone",
+          "name": "👥 직원 복귀 중",
+          "t": 1791101015960
+        },
+        {
+          "ev": "toast_appear",
+          "name": "Claude Code CLI가 없습니다",
+          "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+          "cls": "toast health",
+          "t": 1791101016746
+        },
+        {
+          "ev": "toast_gone",
+          "name": "🔄 새 본체 버전",
+          "t": 1791101023768
+        },
+        {
+          "ev": "toast_gone",
+          "name": "✅ 직원 복귀 완료",
+          "t": 1791101023973
+        },
+        {
+          "ev": "toast_gone",
+          "name": "Claude Code CLI가 없습니다",
+          "t": 1791101038548
+        },
+        {
+          "ev": "modal_open",
+          "cls": "modal-overlay",
+          "title": "업데이트",
+          "body": "설치할 수 있는 업데이트 1건",
+          "buttons": [
+            "닫기",
+            "확인 중…",
+            "본체 패치 설치"
+          ],
+          "t": 1791101038688
+        },
+        {
+          "ev": "modal_close",
+          "cls": "modal-overlay",
+          "title": "업데이트",
+          "t": 1791101039313
+        },
+        {
+          "ev": "modal_open",
+          "cls": "modal-overlay confirm-overlay",
+          "title": "새 본체 버전 0.14.99 — 패치 설치",
+          "body": "새 본체(앱) 0.14.99을 패치 방식으로 설치합니다: 다운로드·서명 검증 뒤 설치 프로그램을 실행합니다(이 앱은 닫히고, 설치가 끝나면 다시 시작됩니다). 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)\n\n이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 새 설치 파일에 Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다(0.14.43 까지의 cys 설치 파일에는 코드 서명이 없습니다). 막히면 업데이트는 설치되지 않고, 이 앱은 닫히지 않은 채 그 사실을 알려 드립니다. 그 경우 홈페이지에서 받은 설치 파일도 같은 이유로 막힙니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.",
+          "buttons": [
+            "아니오",
+            "설치"
+          ],
+          "t": 1791101039360
+        },
+        {
+          "ev": "modal_close",
+          "cls": "modal-overlay confirm-overlay",
+          "title": "새 본체 버전 0.14.99 — 패치 설치",
+          "t": 1791101039923
+        },
+        {
+          "ev": "toast_appear",
+          "name": "⬇ 업데이트 설치",
+          "detail": "다운로드 시작…",
+          "cls": "toast feed",
+          "t": 1791101039981
+        },
+        {
+          "ev": "toast_detail",
+          "name": "⬇ 업데이트 설치",
+          "detail": "다운로드 중 0.0 / 136.6 MB (0%)",
+          "t": 1791101040109
+        },
+        {
+          "ev": "toast_appear",
+          "name": "설치 파일 실행이 차단되었습니다",
+          "detail": "Windows 의 앱 제어 정책(스마트 앱 컨트롤 등)이 새 버전(0.14.99) 설치 파일의 실행을 막았습니다(오류 4551). 업데이트는 설치되지 않았고 지금 버전(0.14.43)이 그대로 실행 중입니다. 앱은 닫히지 않았습니다. 스마트 앱 컨트롤이 켜진 PC 에서는 Windows 가 신뢰하는 코드 서명이나 평판이 없는 프로그램이 실행되지 않습니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요. 확인하는 곳: Windows 보안 → 앱 및 브라우저 컨트롤 → 스마트 앱 컨트롤. 스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택이며, Windows 업데이트 상태에 따라 다시 켜지 못할 수 있습니다.",
+          "cls": "toast health",
+          "t": 1791101048758
+        },
+        {
+          "ev": "toast_gone",
+          "name": "⬇ 업데이트 설치",
+          "t": 1791101048758
+        }
+      ],
+      "names": {
+        "🔄 새 본체 버전": {
+          "first": 1791101015753,
+          "last": 1791101016746,
+          "n": 4,
+          "detail": "새 본체 0.14.99 — 상단 Update 버튼으로 패치 설치(재시작·자동 복원)",
+          "cls": "toast feed",
+          "shown": false,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "👥 직원 복귀 중": {
+          "first": 1791101015860,
+          "last": 1791101015860,
+          "n": 1,
+          "detail": "노드 세션 복원 중… (본부·부서)",
+          "cls": "toast feed",
+          "shown": false,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "✅ 직원 복귀 완료": {
+          "first": 1791101015960,
+          "last": 1791101023768,
+          "n": 3,
+          "detail": "노드 세션 복원 완료 (부서 0).",
+          "cls": "toast watchdog",
+          "shown": false,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "Claude Code CLI가 없습니다": {
+          "first": 1791101016746,
+          "last": 1791101023973,
+          "n": 3,
+          "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+          "cls": "toast health",
+          "shown": false,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "⬇ 업데이트 설치": {
+          "first": 1791101039981,
+          "last": 1791101042598,
+          "n": 8788,
+          "detail": "다운로드 중 136.6 / 136.6 MB (100%)",
+          "cls": "toast feed",
+          "shown": false,
+          "detail_events": 1,
+          "last_detail_event": 1791101040109,
+          "reappears": 0
+        },
+        "설치 파일 실행이 차단되었습니다": {
+          "first": 1791101048758,
+          "last": 1791101048758,
+          "n": 1,
+          "detail": "Windows 의 앱 제어 정책(스마트 앱 컨트롤 등)이 새 버전(0.14.99) 설치 파일의 실행을 막았습니다(오류 4551). 업데이트는 설치되지 않았고 지금 버전(0.14.43)이 그대로 실행 중입니다. 앱은 닫히지 않았습니다. 스마트 앱 컨트롤이 켜진 PC 에서는 Windows 가 신뢰하는 코드 서명이나 평판이 없는 프로그램이 실행되지 않습니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요. 확인하는 곳: Windows 보안 → 앱 및 브라우저 컨트롤 → 스마트 앱 컨트롤. 스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택이며, Windows 업데이트 상태에 따라 다시 켜지 못할 수 있습니다.",
+          "cls": "toast health",
+          "shown": true,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        }
+      }
+    },
+    "blocked_toast_seen_at": "2026-10-04T08:04:09.144Z",
+    "blocked_toast": {
+      "found": true,
+      "from": "snapshot",
+      "name": "설치 파일 실행이 차단되었습니다",
+      "detail": "Windows 의 앱 제어 정책(스마트 앱 컨트롤 등)이 새 버전(0.14.99) 설치 파일의 실행을 막았습니다(오류 4551). 업데이트는 설치되지 않았고 지금 버전(0.14.43)이 그대로 실행 중입니다. 앱은 닫히지 않았습니다. 스마트 앱 컨트롤이 켜진 PC 에서는 Windows 가 신뢰하는 코드 서명이나 평판이 없는 프로그램이 실행되지 않습니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요. 확인하는 곳: Windows 보안 → 앱 및 브라우저 컨트롤 → 스마트 앱 컨트롤. 스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택이며, Windows 업데이트 상태에 따라 다시 켜지 못할 수 있습니다.",
+      "has_4551": true,
+      "has_kept_phrase": true
+    },
+    "final_snapshot": {
+      "t": 1791101130927,
+      "ready": true,
+      "update_button": {
+        "text": "Update !",
+        "badge_text": "!",
+        "badge_hidden": false,
+        "badge_title": "새 본체 버전 0.14.99 (Update 버튼으로 패치 설치)"
+      },
+      "panel": null,
+      "confirm": null,
+      "overlays": [],
+      "toasts": [
+        {
+          "cls": "toast health",
+          "name": "설치 파일 실행이 차단되었습니다",
+          "detail": "Windows 의 앱 제어 정책(스마트 앱 컨트롤 등)이 새 버전(0.14.99) 설치 파일의 실행을 막았습니다(오류 4551). 업데이트는 설치되지 않았고 지금 버전(0.14.43)이 그대로 실행 중입니다. 앱은 닫히지 않았습니다. 스마트 앱 컨트롤이 켜진 PC 에서는 Windows 가 신뢰하는 코드 서명이나 평판이 없는 프로그램이 실행되지 않습니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요. 확인하는 곳: Windows 보안 → 앱 및 브라우저 컨트롤 → 스마트 앱 컨트롤. 스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택이며, Windows 업데이트 상태에 따라 다시 켜지 못할 수 있습니다."
+        }
+      ],
+      "title": "cys — CYSJavis Terminal"
+    },
+    "blocked_toast_final": true,
+    "body_text_head": "cys\ndaemon pid=10720 sock=\\\\.\\pipe\\cys\n정렬\nControl Center\nUpdate !\n↻ 재시작\n완전 초기화\n테마\n워크스페이스\nA−\nA＋\n＋\nnon title\n×\n1 pane · C:\\Users\\runneradmin\\ · 💤1\n▾\n사용량\n관측 없음\n아직 관측된 사용량 없음 — 에이전트 첫 응답 후 표시\n피드백 보내기\n▸\n전문가용\nC:\\Users\\runneradmin\\\n×\nWindows PowerShell\nCopyright (C) Microsoft Corporation. All rights reserved.\nPS C:\\Users\\runneradmin>  \n설치 파일 실행이 차단되었습니다Windows 의 앱 제어 정책(스마트 앱 컨트롤 등)이 새 버전(0.14.99) 설치 파일의 실행을 막았습니다(오류 4551). 업데이트는 설치되지 않았고 지금 버전(0.14.43)이 그대로 실행 중입니다. 앱은 닫히지 않았습니다. 스마트 앱 컨트롤이 켜진 PC 에서는 Windows 가 신뢰하는 코드 서명이나 평판이 없는 프로그램이 실행되지 않습니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요. 확인하는 곳: Windows 보안 → 앱 및 브라우저 컨트롤 → 스마트 앱 컨트롤. 스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택이며, Windows 업데이트 상태에 따라 다시 켜지 못할 수 있습니다.\n×"
+  }
+}
