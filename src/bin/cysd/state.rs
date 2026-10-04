@@ -3551,8 +3551,9 @@ pub struct Daemon {
     pub parser_panics_total: AtomicU64,
     /// CC v2 WS-A: 계정 단위 rate limit 집계 상태(뷰·신원 캐시·영속 스로틀) — accounts.rs 전담.
     pub accounts: Mutex<crate::accounts::AccountsState>,
-    /// ★0.14.43(B3): 좌석 설정 폴더 **현재 신원**의 60초 하한 캐시(폴더 → (확인 시각, account_id)) — 좌석 신원 표(`accounts::seat_identity_view`)가 쓴다.
-    /// 경보 틱·status 폴링·계정 조회가 같은 폴더를 초 단위로 다시 stat 하지 않게 한다. **말단 락** — 조회·기록 때만 순간 잡고 그 안에서 다른 락을
+    /// ★0.14.43(B3 · R1F-US): 좌석 설정 폴더 **현재 신원**의 60초 하한 캐시(폴더 → (확인 시각, 신원 상태)) — 좌석 신원 표(`accounts::seat_identity_view`)가 쓴다.
+    /// status 폴링·계정 조회(RPC 의 읽기-통과)가 같은 폴더를 초 단위로 다시 stat 하지 않게 한다. **경보 틱(워치독)은 이 캐시를 읽기만 한다** — 신원 파일을 열지도 stat 하지도
+    /// 않는다(`accounts::seat_identity_view_cached`). 채우는 것은 상태줄 보고(`usage.report` 귀속 경로)와 RPC 의 읽기-통과 조회다. **말단 락** — 조회·기록 때만 순간 잡고 그 안에서 다른 락을
     /// 잡지 않는다(파일 IO 는 이 락을 쥐지 않은 채). `accounts` 와 겹쳐 쥐지 않는다.
     pub seat_ident_cache: Mutex<crate::accounts::SeatIdentCache>,
     /// ★0.14.43(B3): 경보 틱이 **직전 틱에 신선도 규칙으로 빠뜨려 `fired` 에 붙들어 둔** 경보 키 — `usage.alert_resolved{reason:"stale"}` 를 처음 빠질 때
