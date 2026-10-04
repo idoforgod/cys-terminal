@@ -413,9 +413,15 @@ SAFETY_CLAUSES = {
         #   본문의 `in_use=0 ∧ age>1800` 또는 `reset<0` 이면 신규 작업 제한 판단의 근거로 쓰지 않고 `alert_eligible` 로 재확인 — 아래
         #   `QueueStarvedDocContract` 가 그 문장의 낱말(나이 상한 1800 · 재확인 키 · 규칙 모양)을 데몬 코드와 대조한다.
         ("queue.starved 기본값", "`CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초(0=끔)"),
-        ("queue.starved 처방 전달·자동 조치 금지", "요약의 `remedy=<코드>`(처방 코드)는 읽어 master·오너(사람)에게 그대로 전달. "
+        # ★(0.14.43 · 성찰 1회차 R1F-DOC · S5 M1·m1·m2 · 의식적 재핀) 위 문면이 바뀌었다: ①`remedy=<코드>` 는 0.14.43 데몬만 싣는다(0.14.42 본체에도
+        #   이 팩이 간다 · 요약이 200바이트에서 잘리면 끝의 코드가 빠진다) — 코드가 없으면 같은 요약의 `blocked_by` 를 전달하라고 적었다
+        #   ②0.14.42 의 "사람 운영자 전용" 단정을 되살렸고(`강제 배달`이 '자동'이 아니어도 막는다) depth_high 행과 겹쳐도 이 행이 이긴다고 적었다.
+        #   아래 첫 항은 문장 전체를 잡고, 뒤 두 항(가산)은 되살린 낱말·새 조건을 따로 잡아 그 구절만 지워도 붉어지게 한다.
+        ("queue.starved 처방 전달·자동 조치 금지", "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 master·오너(사람)에게 그대로 전달. "
                                  "**★LLM 에이전트(CSO·master 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·동결 해제·항목 삭제) 금지 — "
-                                 "사람 판단에 맡긴다**"),
+                                 "사람 운영자 전용(depth_high 와 겹쳐도)**"),
+        ("queue.starved 사람 운영자 전용 복원", "금지 — 사람 운영자 전용(depth_high 와 겹쳐도)"),
+        ("queue.starved 처방 코드가 없으면 blocked_by 전달", "(처방 코드 · 없으면 `blocked_by`)는 master·오너(사람)에게 그대로 전달"),
         ("한도 경보 낡은 값 읽기(오너 결재 문면)", "`alert.account_rate`·`alert.rate_limit` 는 본문의 `in_use=0 ∧ age>1800` 또는 `reset<0` 이면 "
                                     "신규 작업 제한 판단의 근거로 쓰지 않는다 — `cys status --json` 의 `alert_eligible` 로 재확인"),
     ),
@@ -461,10 +467,15 @@ SAFETY_CLAUSES = {
         ("사이클 진행 중 회신", "그 백그라운드 1콜 중 clear 통보에는 '사이클 진행 중(대상·시작 시각)'으로 회신하고 끝난 뒤 준비한다"),
         ("백그라운드 없는 CLI 예외", "백그라운드 실행이 없는 CLI 만 예외로 도구 timeout 600000 전경 실행"),
         # ★(0.14.43 · DOCS) `queue.starved` 대응 — 가산 핀(CSO 쪽 주석 참조 · MASTER 와 같은 2항을 CEO 에도 건다).
+        # ★(0.14.43 · 성찰 1회차 R1F-DOC · S5 M1·m1·m7 · 의식적 재핀 — CSO 쪽 주석 참조) ①처방 코드가 없을 때의 폴백(`blocked_by`) ②"사람 운영자 전용"
+        #   단정 복원(depth_high 와 겹쳐도) ③0.14.42 에 있던 `send-key --queued ... Return` 의 제약 고지 `(Return 한정 큐잉)` 복원 — 낱말 핀은 가산이다.
+        #   ★종전 핀은 "에이전트 (master" 로 공백을 넣어 잡았다(줄바꿈이 낀 문면을 접은 값) — 이제 문면이 한 줄 안에서 "에이전트(master" 로 이어진다(티켓 문안 그대로).
         ("queue.starved 기본값·처방 전달", "(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 — "
-                                  "요약의 `remedy=<코드>`(처방 코드)는 사람에게 그대로 전달한다."),
-        ("queue.starved 자동 조치 금지", "**★LLM 에이전트 (master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·"
-                                 "동결 해제·항목 삭제) 금지 — 사람 판단에 맡긴다.**"),
+                                  "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 사람에게 그대로 전달한다."),
+        ("queue.starved 자동 조치 금지", "**★LLM 에이전트(master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·"
+                                 "동결 해제·항목 삭제) 금지 — 사람 운영자 전용(depth_high 와 겹쳐도).**"),
+        ("queue.starved 사람 운영자 전용 복원", "금지 — 사람 운영자 전용(depth_high 와 겹쳐도)."),
+        ("send-key --queued Return 한정 큐잉 고지", "`cys send-key --queued ... Return`(Return 한정 큐잉)을 쓴다."),
     ),
     # CEO_TEMPLATE 은 MASTER 전문을 바이트 연접한 생성물이다(gen_ceo_template.py) — 배포본에도 같은 문면이 있어야 한다.
     "CEO_TEMPLATE.md": (
@@ -482,10 +493,15 @@ SAFETY_CLAUSES = {
         ("사이클 진행 중 회신", "그 백그라운드 1콜 중 clear 통보에는 '사이클 진행 중(대상·시작 시각)'으로 회신하고 끝난 뒤 준비한다"),
         ("백그라운드 없는 CLI 예외", "백그라운드 실행이 없는 CLI 만 예외로 도구 timeout 600000 전경 실행"),
         # ★(0.14.43 · DOCS) `queue.starved` 대응 — 가산 핀(CSO 쪽 주석 참조 · MASTER 와 같은 2항을 CEO 에도 건다).
+        # ★(0.14.43 · 성찰 1회차 R1F-DOC · S5 M1·m1·m7 · 의식적 재핀 — CSO 쪽 주석 참조) ①처방 코드가 없을 때의 폴백(`blocked_by`) ②"사람 운영자 전용"
+        #   단정 복원(depth_high 와 겹쳐도) ③0.14.42 에 있던 `send-key --queued ... Return` 의 제약 고지 `(Return 한정 큐잉)` 복원 — 낱말 핀은 가산이다.
+        #   ★종전 핀은 "에이전트 (master" 로 공백을 넣어 잡았다(줄바꿈이 낀 문면을 접은 값) — 이제 문면이 한 줄 안에서 "에이전트(master" 로 이어진다(티켓 문안 그대로).
         ("queue.starved 기본값·처방 전달", "(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 — "
-                                  "요약의 `remedy=<코드>`(처방 코드)는 사람에게 그대로 전달한다."),
-        ("queue.starved 자동 조치 금지", "**★LLM 에이전트 (master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·"
-                                 "동결 해제·항목 삭제) 금지 — 사람 판단에 맡긴다.**"),
+                                  "요약의 `remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는 사람에게 그대로 전달한다."),
+        ("queue.starved 자동 조치 금지", "**★LLM 에이전트(master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·"
+                                 "동결 해제·항목 삭제) 금지 — 사람 운영자 전용(depth_high 와 겹쳐도).**"),
+        ("queue.starved 사람 운영자 전용 복원", "금지 — 사람 운영자 전용(depth_high 와 겹쳐도)."),
+        ("send-key --queued Return 한정 큐잉 고지", "`cys send-key --queued ... Return`(Return 한정 큐잉)을 쓴다."),
     ),
     "REVIEWER_DIRECTIVE.md": (
         ("정체 종결 휴면", "그 축을 내는 도구가 없는 버전이면 이 조항은 **휴면**이다 —\n"
@@ -3184,6 +3200,8 @@ class QueueStarvedDocContract(unittest.TestCase):
     ④한도 경보 읽기(오너 결재 문면): 본문 토큰(`age=`·`in_use=`·`reset=`)은 요약 렌더러가 실제로 싣는 것이고, 지침의 `age>1800` 은 코드 노브
       기본값(`ACCOUNT_ALERT_STALE_SECS_DEFAULT` 1800초)과 같고, 재확인 키 `alert_eligible` 은 데몬이 싣는 키이며 그 판정 규칙의 모양(사용 중 아님 ∧ 나이 > 상한)이
       지침 문장과 같다. 두 경보 이름(`alert.account_rate`·`alert.rate_limit`)은 경보 엔진이 실제로 내는 이름이다.
+    ⑤(성찰 1회차 R1F-DOC) 되살린 구절: "사람 운영자 전용(depth_high 와 겹쳐도)"(0.14.42 의 단정) · 처방 코드가 없을 때의 폴백 `blocked_by`(요약에는 늘 실린다 —
+      `remedy=` 는 0.14.43 데몬만 싣고 200바이트 절단에서 빠질 수 있다) · MASTER·CEO 의 `(Return 한정 큐잉)`(0.14.42 의 제약 고지). 하나씩 지워 보면 붉어진다.
     실패 방향: 붉어지면 운영 지침이 데몬 동작과 어긋난다 — 0.14.42 까지 ①이 조용히 그랬다(주석이 코드보다 오래 산다).
     소스를 읽지 못하면(측정 불능) 통과가 아니라 실패다."""
 
@@ -3223,6 +3241,9 @@ class QueueStarvedDocContract(unittest.TestCase):
 
     def test_remedy_token_and_llm_prohibition_match_the_code(self):
         self.assertIn('format!(" remedy={c}")', self.route, "경보 요약의 처방 토큰 이름(remedy=)이 코드에서 바뀌었다")
+        # ★(성찰 1회차 R1F-DOC) 지침의 폴백 "없으면 `blocked_by`" 의 근거 — 요약은 `blocked_by=` 를 늘 싣고(없으면 `-`) 그 뒤에 `remedy=` 가 붙는다.
+        self.assertIn('format!("depth={depth} head_wait={wait}s blocked_by={blocked}{remedy}")', self.route,
+                      "경보 요약의 꼴(blocked_by 가 remedy 앞에 늘 실림)이 바뀌었다 — 지침의 폴백('없으면 blocked_by')이 달라진다")
         found = re.search(r'pub\(crate\) const REMEDY_LLM_SUFFIX: &str = "[^"]*?자동 조치\(([^)]*)\)', self.governance)
         self.assertIsNotNone(found, "governance.rs REMEDY_LLM_SUFFIX 의 금지 목록을 읽지 못했다(측정 불능)")
         items = [item.strip() for item in found.group(1).split("·") if item.strip()]
@@ -3234,7 +3255,33 @@ class QueueStarvedDocContract(unittest.TestCase):
                 self.assertEqual(len(lists), 1, "%s: queue.starved 자동 조치 금지 조항이 정확히 1개여야 한다: %r" % (name, lists))
                 for item in items:
                     self.assertIn(item, lists[0], "%s: 코드의 금지 항목 %r 이 지침 목록에 없다" % (name, item))
-                self.assertIn("`remedy=<코드>`(처방 코드)는", body)
+                self.assertIn("`remedy=<코드>`(처방 코드 · 없으면 `blocked_by`)는", body)
+                # ★(성찰 1회차 R1F-DOC) 0.14.42 의 "사람 운영자 전용" 단정이 되살아나 있다 — 금지 조항의 끝에 붙어 정확히 1번이다.
+                tail = re.findall(r"자동 조치\([^)]*cys queue deliver[^)]*\) 금지 — (사람 운영자 전용\(depth_high 와 겹쳐도\))", body)
+                self.assertEqual(len(tail), 1, "%s: '금지 — 사람 운영자 전용(depth_high 와 겹쳐도)' 이 정확히 1번이어야 한다: %r" % (name, tail))
+
+    def test_negative_control_catches_each_restored_clause(self):
+        """음성 대조(돌연변이) — 되살린 구절을 하나씩 지우면 그 핀이 붉어진다(핀이 공허하지 않다 · 메모리 사본만 바꾼다).
+
+        ★(성찰 1회차 R1F-DOC) 이 검체가 없으면 "사람 운영자 전용" 을 도로 "사람 판단에 맡긴다" 로 되돌려도 문장 전체 핀 한 개만 붉고, 그 핀을 약화해
+        지우면 아무도 모른다 — 낱말 핀을 따로 걸고(가산) 지움 → 붉음을 여기서 증명한다."""
+        both = ("MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md")
+        cases = [
+            ("CSO_DIRECTIVE.md", "사람 운영자 전용(depth_high 와 겹쳐도)", "사람 판단에 맡긴다", "queue.starved 사람 운영자 전용 복원"),
+            ("CSO_DIRECTIVE.md", "(처방 코드 · 없으면 `blocked_by`)", "(처방 코드)", "queue.starved 처방 코드가 없으면 blocked_by 전달"),
+        ]
+        for name in both:
+            cases += [
+                (name, "사람 운영자 전용(depth_high 와 겹쳐도)", "사람 판단에 맡긴다", "queue.starved 사람 운영자 전용 복원"),
+                (name, "(처방 코드 · 없으면 `blocked_by`)", "(처방 코드)", "queue.starved 기본값·처방 전달"),
+                (name, "(Return 한정 큐잉)", "", "send-key --queued Return 한정 큐잉 고지"),
+            ]
+        for name, present, absent, label in cases:
+            with self.subTest(directive=name, label=label):
+                self.assertNotIn(label, missing_safety_clauses(name, self.raw[name]), "복원한 문면이 지금 지침에 없다")
+                mutated = self.raw[name].replace(present, absent, 1)
+                self.assertNotEqual(mutated, self.raw[name], "음성 대조 치환이 적중하지 않았다: %r" % present)
+                self.assertIn(label, missing_safety_clauses(name, mutated), "구절을 지웠는데 핀이 붉어지지 않았다 — 핀이 공허하다")
 
     def test_rate_alert_summary_tokens_match_the_code(self):
         # ① 본문 토큰 — 요약 렌더러가 실제로 싣는 것(코드가 바뀌면 지침이 읽는 재료가 달라진다)
