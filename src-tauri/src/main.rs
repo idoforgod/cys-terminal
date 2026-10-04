@@ -3341,6 +3341,18 @@ fn write_update_attempt_at(path: &std::path::Path, from: &str, to: &str, at: u64
     std::fs::write(path, json)
 }
 
+/// ★(0.14.43 · R1F-UA · S3 minor 2) 설치기가 **뜬 직후** 시도 기록의 기준 시각(`at`)을 `now` 로 다시 쓴다 — 최선 노력(실패는 무시한다: 이 기록이 설치를 막아서는 안 된다).
+/// 처음 기록은 **받기 전**에 찍힌다(`install_update`) — 느린 회선에서는 설치기가 뜰 때 판정 보류 창(`UPDATE_ATTEMPT_MIN_AGE_SECS` · 90초)이 이미 지나 있어, 설치기가 도는 동안
+/// 사용자가 구 앱을 다시 열면(설치기가 첫 단계에서 GUI 를 끝내므로 "꺼졌네" 하고 다시 여는 경우) 설치가 진행 중인데도 "설치되지 않았습니다"가 뜬다.
+/// 창의 기준을 '설치기가 뜬 시각'으로 옮긴다(`from`·`to` 는 처음 기록과 같은 값을 받는다). `verify_on` 이 꺼져 있으면(`CYS_UPDATE_VERIFY=0`) 아무것도 쓰지 않는다 —
+/// 처음에도 쓰지 않았으니 이 노브가 기록을 되살려서는 안 된다.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn restamp_update_attempt_at(verify_on: bool, path: &std::path::Path, from: &str, to: &str, now: u64) {
+    if verify_on {
+        let _ = write_update_attempt_at(path, from, to, now);
+    }
+}
+
 /// 시도 기록 삭제(최선 노력 · 없어도 무해).
 fn clear_update_attempt_at(path: &std::path::Path) {
     let _ = std::fs::remove_file(path);
@@ -3479,6 +3491,20 @@ async fn smart_app_control() -> Option<String> {
         .ok()
         .flatten()
         .map(str::to_string)
+}
+
+/// ★(0.14.43 · R1F-UA) 윈도우 `install_update` 가 '확인 실행'(설치기를 띄운 결과를 보고, 막혔으면 앱을 닫지 않고 알린다 — `CYS_UPDATE_CHECKED_LAUNCH`)을 쓰는지의 순수 판정.
+/// 그 노브는 윈도우만 본다(맥·리눅스는 분기 자체가 컴파일되지 않는다) — 그 밖 OS 는 늘 `true`(기본값). 노브 값의 해석은 `update_checked_launch_from_env` 하나다.
+fn update_checked_launch_enabled_for(is_windows: bool, v: Option<&str>) -> bool {
+    !is_windows || update_checked_launch_from_env(v)
+}
+
+/// ★(0.14.43 · R1F-UA) 확인 실행이 켜져 있는지 pull — 패치 설치 확인 창이 스마트 앱 컨트롤 안내 문단의 판을 고르려고 UI 가 부른다(스마트 앱 컨트롤이 **켜짐**일 때만 부른다 — 윈도우뿐).
+/// 꺼져 있으면(`CYS_UPDATE_CHECKED_LAUNCH=0`) 막혀도 앱이 알림 없이 닫히므로 문단이 그 사실을 말한다. 읽기 전용 · 노브를 읽는 식은 `install_update` 의 윈도우 분기와 같다.
+/// 등록은 `smart_app_control` 과 같다 — `generate_handler!` 한 곳(별도 권한·capability 항목 없음: 앱 자체 명령은 `capabilities/default.json` 에 적지 않고 `tauri_build::build()` 기본값으로 열린다).
+#[tauri::command]
+async fn update_checked_launch_enabled() -> bool {
+    update_checked_launch_enabled_for(cfg!(windows), cys::env_compat("CYS_UPDATE_CHECKED_LAUNCH").as_deref())
 }
 
 /// GUI 온보딩 완료 마커 — "이 GUI가 이 바이너리 버전에서 온보딩(팩+hook(+win: schtasks))을
@@ -7112,7 +7138,7 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
     // ★(0.14.43 · WU) 윈도우: 설치기를 띄운 **결과를 본다**. 플러그인의 설치는 `ShellExecuteW` 반환값을 보지 않고 곧바로 프로세스를 끝내므로 앱 제어 정책
     //   (스마트 앱 컨트롤 등)이 서명 없는 설치 파일을 막으면 앱이 말없이 꺼지고 구버전이 남았다. 아래 분기는 같은 임시 경로·같은 인자·같은 호출로 설치기를
     //   띄우되, 막혔으면(반환값 32 이하) 앱을 닫지 않고 오류(`installer_launch_failed:<코드>:<반환값>`)를 돌려주고 시도 기록을 지운다(설치기가 뜨지 않았으니
-    //   재시작 뒤 알림이 필요 없다). 성공하면 종전과 같이 곧바로 종료한다 — 그때 시도 기록은 그대로다(설치기가 뜬 뒤의 실패는 재시작 뒤 판정이 맡는다).
+    //   재시작 뒤 알림이 필요 없다). 성공하면 종전과 같이 곧바로 종료한다 — 그때 시도 기록은 남는다(기준 시각만 설치기가 뜬 직후로 다시 쓴다 · 설치기가 뜬 뒤의 실패는 재시작 뒤 판정이 맡는다).
     //   `CYS_UPDATE_CHECKED_LAUNCH=0` 이면 이 분기를 건너뛰고 종전 경로(바로 아래)를 그대로 쓴다. 맥·리눅스는 이 분기가 컴파일되지 않는다.
     #[cfg(windows)]
     if update_checked_launch_from_env(cys::env_compat("CYS_UPDATE_CHECKED_LAUNCH").as_deref()) {
@@ -7188,7 +7214,7 @@ async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
 ///  · 받은 바이트가 exe 가 아니면(zip·MSI 등 예상 밖 형식) 플러그인의 `install` 에 맡긴다(동작 불변).
 ///  · 성공한 **뒤에만** `cleanup_before_exit()` 를 부르고 종료한다. 플러그인 기본 훅은 설치기를 띄우기 **앞에** 불렀다 — 이 훅은 트레이 아이콘·리소스 표를 비우고
 ///    윈도우에서는 모든 창을 숨기므로, 실패했을 때 앱이 창만 숨은 채 남지 않게 순서만 옮겼다.
-///  · 설치기가 뜨기 전에 실패하는 모든 갈래는 같은 일을 한다: 시도 기록을 지우고(`verify_on` 일 때) 오류를 돌려준다. 설치기가 **뜬 뒤**에는 기록을 그대로 둔다.
+///  · 설치기가 뜨기 전에 실패하는 모든 갈래는 같은 일을 한다: 시도 기록을 지우고(`verify_on` 일 때) 오류를 돌려준다. 설치기가 **뜬 뒤**에는 기록을 지우지 않는다(기준 시각만 그 직후로 다시 쓴다).
 #[cfg_attr(not(windows), allow(dead_code))]
 async fn install_update_checked_windows(
     app: &AppHandle,
@@ -7247,6 +7273,8 @@ async fn install_update_checked_windows(
             cys::update_launch::remove_installer(&file);
             forget();
         })?;
+        // ★(R1F-UA · S3 minor 2) 설치기가 떴다 — J2 판정 보류 창(90초)의 기준 시각을 지금(설치기가 뜬 시각)으로 다시 쓴다. 최선 노력이고(실패 무시) 이 한 줄 말고 성공 경로는 종전과 같다.
+        restamp_update_attempt_at(verify_on, attempt_path, env!("CARGO_PKG_VERSION"), &update.version, unix_now_secs());
         // 여기부터는 설치기가 **떴을 때만** 도달한다 — 종전과 같은 시점에 종료한다.
         app.cleanup_before_exit();
         std::process::exit(0)
@@ -7737,9 +7765,10 @@ fn main() {
             check_pack_update,
             live_session_count,
             install_update,
-            // ★(0.14.43 · J2) 업데이트 미설치 알림 — 재시작 뒤 1회 판정 pull · 스마트 앱 컨트롤 상태 pull(둘 다 읽기 전용).
+            // ★(0.14.43 · J2) 업데이트 미설치 알림 — 재시작 뒤 1회 판정 pull · 스마트 앱 컨트롤 상태 pull · 확인 실행 노브 pull(R1F-UA — 전부 읽기 전용).
             update_attempt_report,
             smart_app_control,
+            update_checked_launch_enabled,
             autotest_patch_install,
             rotate_daemon,
             drain_verify,
@@ -10468,8 +10497,10 @@ exit 0
         for banned in ["launch_installer", "process::exit", "cleanup_before_exit", "write_installer", "settle_launch"] {
             assert!(!code.contains(banned), "install_update 본문에 `{banned}` — 윈도우 분기 함수 밖으로 새면 맥·리눅스 경로가 바뀐다");
         }
-        // 노브는 한 곳에서만 읽는다(제품 코드 전체에서)
-        assert_eq!(wu_code(wu_prod()).matches("cys::env_compat(\"CYS_UPDATE_CHECKED_LAUNCH\")").count(), 1, "노브를 읽는 곳이 한 곳이 아니다");
+        // 노브는 정확히 두 곳에서만 읽는다(제품 코드 전체에서) — 실제 선택(이 함수의 윈도우 분기)과 화면에 알리는 보고(R1F-UA `update_checked_launch_enabled`).
+        // 두 식이 글자 그대로 같다는 핀은 `r1fua_checked_launch_command_reads_the_same_knob_as_the_windows_branch` 가 맡는다(종전 단언은 "한 곳" 이었다).
+        assert_eq!(wu_code(wu_prod()).matches("cys::env_compat(\"CYS_UPDATE_CHECKED_LAUNCH\")").count(), 2, "노브를 읽는 곳이 둘(실제 선택 · 화면 보고)이 아니다");
+        assert_eq!(code.matches("cys::env_compat(\"CYS_UPDATE_CHECKED_LAUNCH\")").count(), 1, "실제 선택은 이 함수의 윈도우 분기 한 곳이다");
         // 종전 꼬리(맥·리눅스 경로 — 이 티켓은 한 글자도 바꾸지 않는다): 종전 경로 머리부터 순서와 핵심 호출이 그대로다
         let start = code.find("    if let Err(e) = update\n        .download_and_install(").expect("종전 경로 머리 소실");
         let tail = &code[start..];
@@ -10607,14 +10638,202 @@ exit 0
         assert!(conf.contains("\"productName\": \"cys\""), "productName 이 cys 가 아니다 — 임시 설치 폴더·파일 이름이 달라진다(플러그인도 같은 이름을 쓴다)");
     }
 
-    /// ★J2 배선 핀: 두 명령이 invoke_handler 에 등재돼 있다(누락 = 런타임 'command not found' — UI 의 pull 은 조용히 실패한다).
+    // ───────── ★(0.14.43 · R1F-UA) 성찰 1회차 수정 — 확인 실행 노브를 화면이 알게 한다 · J2 보류 창의 기준 시각 · 플러그인 설정 가정 ─────────
+
+    /// ★R1F-UA(S3 minor 4): 화면이 묻는 값. 윈도우만 노브(`CYS_UPDATE_CHECKED_LAUNCH`)를 본다 — 정확히 `"0"` 만 끈다(`update_checked_launch_from_env` 와 같은 규칙).
+    /// 맥·리눅스는 그 노브를 보지 않으므로(분기가 컴파일되지 않는다) 늘 `true`(기본값)다.
+    #[test]
+    fn r1fua_checked_launch_enabled_reports_the_knob_on_windows_and_true_elsewhere() {
+        assert!(update_checked_launch_enabled_for(true, Option::None), "윈도우 미설정 = 켬");
+        assert!(update_checked_launch_enabled_for(true, Some("1")), "\"1\" = 켬");
+        assert!(update_checked_launch_enabled_for(true, Some("")), "빈 값 = 켬");
+        assert!(!update_checked_launch_enabled_for(true, Some("0")), "윈도우 \"0\" = 끔(종전 경로)");
+        for other in ["false", "off", "00", " 0", "0 ", "no", "2", "true"] {
+            assert!(update_checked_launch_enabled_for(true, Some(other)), "{other:?} 는 \"0\" 이 아니므로 켬(정확히 \"0\" 만 끈다)");
+        }
+        for v in [Option::None, Some("0"), Some("1"), Some(""), Some("x")] {
+            assert!(update_checked_launch_enabled_for(false, v), "윈도우가 아니면 노브를 보지 않는다 — 늘 true: {v:?}");
+            assert_eq!(
+                update_checked_launch_enabled_for(true, v),
+                update_checked_launch_from_env(v),
+                "윈도우 판정은 노브 해석 함수와 모든 값에서 같다: {v:?}"
+            );
+        }
+    }
+
+    /// ★R1F-UA 배선 핀: 명령은 `#[tauri::command] async fn`(`smart_app_control` 과 같은 꼴)이고, 노브를 읽는 식이 `install_update` 윈도우 분기의 것과 **글자 그대로 같다** —
+    /// 화면에 알리는 값과 실제 선택이 갈라지지 않게. 노브를 읽는 곳은 정확히 둘(실제 선택 · 화면 보고)이다. 읽기 전용(쓰기·프로세스 생성·종료 없음).
+    /// (등재는 `j2_commands_are_registered_in_invoke_handler` 가 본다. 권한 파일에는 적지 않는다 — `capabilities/default.json` 에는 플러그인 권한 세트뿐이고 `smart_app_control` 도 거기 없다.)
+    #[test]
+    fn r1fua_checked_launch_command_reads_the_same_knob_as_the_windows_branch() {
+        let knob = "cys::env_compat(\"CYS_UPDATE_CHECKED_LAUNCH\").as_deref()";
+        assert_eq!(wu_code(wu_prod()).matches(knob).count(), 2, "노브를 읽는 곳이 둘(install_update 의 윈도우 분기 · update_checked_launch_enabled)이 아니다");
+        let install = wu_code(wu_seg("async fn install_update("));
+        assert_eq!(install.matches(knob).count(), 1, "실제 선택(install_update)이 노브를 읽지 않는다");
+        assert!(
+            install.contains(&format!("if update_checked_launch_from_env({knob}) {{")),
+            "실제 선택의 식이 바뀌었다 — 화면 보고와 같은 식이어야 한다"
+        );
+        assert!(
+            wu_prod().contains("#[tauri::command]\nasync fn update_checked_launch_enabled() -> bool {"),
+            "명령 정의가 `#[tauri::command]` + `async fn` 꼴이 아니다(smart_app_control 과 같은 꼴)"
+        );
+        let cmd = wu_code(wu_seg("async fn update_checked_launch_enabled("));
+        assert_eq!(cmd.matches(knob).count(), 1, "명령이 노브를 읽지 않는다");
+        assert!(
+            cmd.contains(&format!("update_checked_launch_enabled_for(cfg!(windows), {knob})")),
+            "명령이 (윈도우 여부, 노브 값)을 순수 판정에 넘기지 않는다: {cmd}"
+        );
+        for banned in ["set_var", "remove_var", "Command::new", "process::exit", "spawn", "write(", "cleanup_before_exit"] {
+            assert!(!cmd.contains(banned), "노브 보고 명령에 `{banned}` — 읽기 전용이어야 한다");
+        }
+        let pure = wu_code(wu_seg("fn update_checked_launch_enabled_for("));
+        assert!(
+            pure.contains("!is_windows || update_checked_launch_from_env(v)"),
+            "순수 판정이 (윈도우가 아니면 true · 윈도우면 노브 해석)이 아니다: {pure}"
+        );
+    }
+
+    /// ★R1F-UA(S3 minor 2): 설치기가 뜬 직후 기록을 다시 쓰면 판정 보류 창의 기준이 '받기 전'에서 '설치기가 뜬 시각'으로 옮겨진다 — 느린 회선(받는 데 200초)에서
+    /// 설치기가 도는 동안 구 앱을 다시 열어도 헛 알림이 뜨지 않는다. 같은 입력에서 다시 쓰지 않은 기록(수정 전 거동)은 이미 Failed 로 보고된다는 대조를 함께 건다.
+    #[test]
+    fn r1fua_restamp_moves_the_pending_window_to_the_installer_launch_time() {
+        let dir = J2Tmp::new("restamp");
+        let calls = std::cell::Cell::new(0u32);
+        let t0 = 1_000_000u64; // 처음 기록(받기 전)
+        let launched = t0 + 200; // 받는 데 200초가 걸린 뒤 설치기가 떴다
+        let reopened = launched + 50; // 설치기가 도는 중에 구 앱을 다시 열었다
+        // 대조(수정 전): 다시 쓰지 않으면 기록 나이가 250초라 이미 Failed — 설치가 진행 중인데도 헛 알림
+        let old = dir.join("old.json");
+        write_update_attempt_at(&old, "0.14.42", "0.14.43", t0).unwrap();
+        let r = update_attempt_report_at(&old, "0.14.42", reopened, "windows", j2_sac(&calls, Some("on"))).expect("보고");
+        assert_eq!(r["failed"], true, "대조 실패 — 다시 쓰기 전 기록은 헛 알림을 내는 결함 그대로여야 이 검체가 의미가 있다");
+        // 수정 후: 설치기가 뜬 직후 다시 쓴다 → 같은 시각에 열어도 아직 보류(남은 40초) · 기록 유지
+        let p = dir.join(".update-attempt.json");
+        write_update_attempt_at(&p, "0.14.42", "0.14.43", t0).unwrap();
+        restamp_update_attempt_at(true, &p, "0.14.42", "0.14.43", launched);
+        assert_eq!(
+            read_update_attempt_at(&p),
+            Some(j2_attempt("0.14.42", "0.14.43", launched)),
+            "from·to 는 그대로, at 만 설치기가 뜬 시각이어야 한다"
+        );
+        let calls_before = calls.get();
+        let r = update_attempt_report_at(&p, "0.14.42", reopened, "windows", j2_sac(&calls, Some("on"))).expect("pending 보고");
+        assert_eq!(r, json!({"pending": true, "wait_secs": 40u64}), "설치기가 뜬 지 50초 — 창(90초)의 남은 40초");
+        assert_eq!(calls.get(), calls_before, "보류 중에는 레지스트리를 읽지 않는다");
+        assert!(p.exists(), "보류 중에 기록을 지웠다 — 곧 알려야 할 실패를 잃는다");
+        // 경계: 89초는 아직 보류 · 90초부터 종전처럼 Failed(실패를 영영 숨기지 않는다) · 1회 보고 뒤 기록 삭제
+        assert_eq!(
+            update_attempt_report_at(&p, "0.14.42", launched + 89, "windows", j2_sac(&calls, Some("on"))),
+            Some(json!({"pending": true, "wait_secs": 1u64})),
+            "설치기가 뜬 지 89초"
+        );
+        let r = update_attempt_report_at(&p, "0.14.42", launched + 90, "windows", j2_sac(&calls, Some("on"))).expect("Failed 보고");
+        assert_eq!(r["failed"], true, "설치기가 뜬 지 90초가 지나면 종전처럼 Failed 로 보고된다");
+        assert_eq!(r["at"], launched, "보고의 at 은 다시 쓴 시각이다");
+        assert!(!p.exists(), "Failed 보고 뒤 기록이 남아 있다 — 반복 알림");
+    }
+
+    /// ★R1F-UA: 다시 쓰기는 노브(`CYS_UPDATE_VERIFY=0`)를 지키고(꺼지면 아무것도 쓰지 않는다) · 실패해도 설치를 막지 않는다(반환값이 없고 패닉하지 않는다).
+    #[test]
+    fn r1fua_restamp_respects_the_verify_knob_and_never_fails_the_install() {
+        let dir = J2Tmp::new("restamp-knob");
+        let p = dir.join(".update-attempt.json");
+        // 노브 꺼짐: 기록이 없으면 만들지 않고 · 있으면 건드리지 않는다
+        restamp_update_attempt_at(false, &p, "0.14.42", "0.14.43", 1_000_200);
+        assert!(!p.exists(), "노브가 꺼졌는데 기록을 만들었다 — CYS_UPDATE_VERIFY=0 이 기록을 되살린다");
+        write_update_attempt_at(&p, "0.14.42", "0.14.43", 1_000_000).unwrap();
+        let before = std::fs::read_to_string(&p).unwrap();
+        restamp_update_attempt_at(false, &p, "0.14.42", "0.14.43", 1_000_200);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "노브가 꺼졌는데 기록을 고쳐 썼다");
+        // 노브 켜짐: 기록이 없어도(처음 쓰기가 실패했던 경우) 지금 시각으로 쓴다 — 설치기가 뜬 뒤의 실패를 알릴 단서가 남는다
+        clear_update_attempt_at(&p);
+        restamp_update_attempt_at(true, &p, "0.14.42", "0.14.43", 1_000_200);
+        assert_eq!(read_update_attempt_at(&p), Some(j2_attempt("0.14.42", "0.14.43", 1_000_200)));
+        // 파일 모양은 처음 기록과 같다 — {from,to,at} 세 키
+        let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert_eq!(on_disk, json!({"from": "0.14.42", "to": "0.14.43", "at": 1_000_200u64}));
+        // 쓰기 실패(상위 폴더 없음)는 패닉도 오류 전파도 없다 — 반환값이 없는 함수라 설치(종료)를 막을 방법이 없다
+        restamp_update_attempt_at(true, &dir.join("no-such-dir").join("x.json"), "a", "b", 1);
+        assert_eq!(read_update_attempt_at(&p), Some(j2_attempt("0.14.42", "0.14.43", 1_000_200)), "실패한 다시 쓰기가 다른 기록을 건드렸다");
+    }
+
+    /// ★R1F-UA 배선 핀(윈도우 분기 함수): 다시 쓰기는 `settle_launch(...)?;` **뒤** · `cleanup_before_exit` **앞**에 정확히 한 번이고, 둘 사이에는 이 한 줄뿐이다 —
+    /// 성공 경로의 순서·부작용은 이 한 줄 말고 바뀌지 않는다. 실패 처리 클로저·맥/리눅스 경로(`install_update`)에는 없다(막혔을 때 기록을 되살리면 안 된다).
+    #[test]
+    fn r1fua_windows_branch_restamps_exactly_once_after_a_successful_launch() {
+        let code = wu_code(wu_seg("async fn install_update_checked_windows("));
+        let call = "restamp_update_attempt_at(verify_on, attempt_path, env!(\"CARGO_PKG_VERSION\"), &update.version, unix_now_secs());";
+        assert_eq!(code.matches("restamp_update_attempt_at(").count(), 1, "윈도우 분기에서 기록을 다시 쓰는 곳이 정확히 한 곳이 아니다");
+        assert!(code.contains(call), "다시 쓰기 호출의 모양이 바뀌었다(노브 · 경로 · 현재 버전 · 받은 버전 · 지금 시각): 기대 `{call}`");
+        let settle = code.find("settle_launch(").expect("settle_launch 소실");
+        let end = settle + code[settle..].find("})?;").expect("settle_launch 문장 끝") + "})?;".len();
+        let cleanup = code.find("app.cleanup_before_exit();").expect("종료 준비 소실");
+        let at = code.find(call).unwrap();
+        assert!(end <= at && at < cleanup, "다시 쓰기가 `settle_launch(...)?;` 뒤 · 종료 준비 앞에 있지 않다");
+        assert_eq!(
+            code[end..cleanup].trim(),
+            call,
+            "settle_launch 와 종료 준비 사이에 이 한 줄 말고 다른 것이 끼었다 — 성공 경로의 순서·부작용이 바뀐다"
+        );
+        assert!(!code[settle..end].contains("restamp_update_attempt_at"), "막혔을 때의 정리 클로저에 다시 쓰기가 있다 — 막힌 실행의 기록을 되살린다");
+        // 처음 기록과 같은 from·to 식을 쓴다(현재 버전 = CARGO_PKG_VERSION · 받은 버전 = update.version) · 맥/리눅스 경로는 이 기능을 모른다
+        let base = wu_code(wu_seg("async fn install_update("));
+        assert!(base.contains("env!(\"CARGO_PKG_VERSION\"),") && base.contains("&update.version,"), "처음 기록의 from·to 식이 바뀌었다");
+        assert!(!base.contains("restamp_update_attempt_at"), "install_update(맥·리눅스 · 노브 0 의 종전 경로)에 다시 쓰기가 섞였다");
+        // 제품 코드 전체에서 정의 1 + 호출 1
+        assert_eq!(wu_code(wu_prod()).matches("restamp_update_attempt_at(").count(), 2, "다시 쓰기 함수의 정의·호출이 각각 하나가 아니다");
+    }
+
+    /// ★R1F-UA(S3 minor 6): 윈도우 확인 실행 경로(`update_launch.rs`)는 플러그인 설정이 **기본**이라고 가정한다 — 설치 방식 `/P /R`(Passive) · '추가 인자 없음'. 누가
+    /// `plugins.updater.windows`(`installMode`·`installerArgs`)를 설정에 넣거나 플러그인 `Builder::installer_arg(s)` 를 쓰면 플러그인 경로는 그 설정을 따르지만 새 경로는 조용히 무시한다 —
+    /// 이 검체가 붉어져 새 경로(`nsis_update_params`)도 함께 고치게 한다. 바로 위 검체(플러그인 버전·productName)와 같은 장르다.
+    #[test]
+    fn r1fua_updater_plugin_settings_assumed_by_the_checked_launch_path_are_pinned() {
+        // (1) 설정 파일 — `plugins.updater` 에 `windows` 키가 없다. 기본 설정에 updater 항목이 실제로 있어야(구조가 옮겨져 핀이 공허해지지 않게) 한다.
+        let base: Value = serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri.conf.json 판독");
+        let win: Value = serde_json::from_str(include_str!("../tauri.windows.conf.json")).expect("tauri.windows.conf.json 판독");
+        assert!(
+            base.pointer("/plugins/updater/pubkey").is_some() && base.pointer("/plugins/updater/endpoints").is_some(),
+            "tauri.conf.json 의 plugins.updater(pubkey·endpoints)가 보이지 않는다 — 구조가 옮겨졌으면 이 핀도 따라가야 한다"
+        );
+        // 양성 대조 — 같은 판정이 `windows` 키가 있는 설정을 실제로 잡아낸다(핀이 공허하지 않다는 증거)
+        let has_windows_key = |c: &Value| c.pointer("/plugins/updater/windows").is_some();
+        assert!(has_windows_key(&json!({"plugins": {"updater": {"windows": {"installMode": "quiet"}}}})), "양성 대조 실패 — 판정이 `windows` 키를 못 본다");
+        assert!(has_windows_key(&json!({"plugins": {"updater": {"windows": {"installerArgs": ["/S"]}}}})), "양성 대조 실패 — installerArgs 도 `windows` 아래에 있다");
+        assert!(!has_windows_key(&json!({"plugins": {"updater": {"pubkey": "x", "endpoints": []}}})), "음성 대조 실패 — `windows` 키가 없는 설정을 있다고 한다");
+        for (name, conf) in [("tauri.conf.json", &base), ("tauri.windows.conf.json", &win)] {
+            assert!(
+                !has_windows_key(conf),
+                "{name} 의 plugins.updater 에 `windows`(installMode·installerArgs) 키가 생겼다 — 플러그인 경로는 따르지만 새 경로(update_launch.rs 의 `/P /R` · 추가 인자 없음)는 무시한다. nsis_update_params 를 함께 고쳐라"
+            );
+        }
+        // (2) 코드 — 플러그인 등록은 `Builder::new().build()` 꼴이고 설치 인자를 더하는 호출(`installer_arg`·`installer_args`·`clear_installer_args`)이 없다.
+        let prod = wu_code(wu_prod());
+        assert_eq!(
+            prod.matches("tauri_plugin_updater::Builder::new().build()").count(),
+            1,
+            "업데이터 플러그인 등록이 `Builder::new().build()` 꼴이 아니다 — 플러그인 설정이 바뀌면 새 경로(update_launch.rs)도 함께 고쳐라"
+        );
+        let feedback = wu_code(include_str!("feedback.rs"));
+        for (name, code) in [("main.rs", &prod), ("feedback.rs", &feedback)] {
+            assert!(
+                !code.contains("installer_arg"),
+                "{name} 에 `installer_arg*` 호출이 생겼다 — 플러그인 경로는 따르지만 새 경로는 무시한다. nsis_update_params 를 함께 고쳐라"
+            );
+        }
+        // (3) 새 경로가 가정하는 값 그대로 — 설정이 없을 때의 인자 문자열(현재 실행 인자 없음)
+        assert_eq!(cys::update_launch::nsis_update_params(&[]), "/P /R /UPDATE /ARGS");
+    }
+
+    /// ★J2 배선 핀: 세 명령(J2 의 둘 + R1F-UA 가 더한 확인 실행 노브 pull)이 invoke_handler 에 등재돼 있다(누락 = 런타임 'command not found' — UI 의 pull 은 조용히 실패한다).
     #[test]
     fn j2_commands_are_registered_in_invoke_handler() {
         let src = include_str!("main.rs");
         let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
         let i = prod.find("tauri::generate_handler![").expect("invoke_handler 소실");
         let reg = &prod[i..i + prod[i..].find("\n        ])").expect("핸들러 목록 끝")];
-        for name in ["update_attempt_report", "smart_app_control"] {
+        for name in ["update_attempt_report", "smart_app_control", "update_checked_launch_enabled"] {
             assert!(
                 reg.lines().any(|l| l.trim() == format!("{name},")),
                 "{name} 이 invoke_handler 에 등재되지 않았다"

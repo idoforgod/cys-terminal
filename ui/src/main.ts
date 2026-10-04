@@ -6627,47 +6627,65 @@ function renderUpdatePanel() {
 /// 전용 정책의 실험적 개정). install_update = drain 저장 신호 → 다운로드·서명검증 → .app 교체 →
 /// 데몬 핸드오프 → 앱 재시작(부서·노드는 피닉스·resume으로 자동 복원). 진행 표시는
 /// update-progress 리스너("upd-bin" sticky)가 전담한다.
+/// (윈도우는 drain·핸드오프가 없다 — 받고 서명을 검증한 뒤 설치 프로그램을 실행하고 이 앱은 닫힌다: src-tauri install_update_checked_windows)
+// ★(R1F-UA · S3 note 8) 진행 중 표식 — 이 함수가 도는 동안(스마트 앱 컨트롤 조회·확인 창·설치 호출) 다시 불리면 확인 창이 두 번 뜨고 설치 호출이 겹친다.
+//   진입하면 올리고 어떤 갈래로 끝나든(조기 return·예외 포함) `finally` 로 내린다. 그 사이 다시 눌린 호출은 아무것도 하지 않는다.
+let promptBinaryPatchBusy = false;
 async function promptBinaryPatch() {
-  // ★A7(성찰 확정): install_update 는 앱을 교체·재시작한다 — 리셋 실행 중이면 격리 스레드가
-  // 중도 사멸해 manifest(복구 지도) 없는 반쪽 격리가 남는다. 완료 래치 상태에서도 무의미하다.
-  if (daemonActionBlocked()) return;
-  const ba = binActionable(updState);
-  if (!ba) {
-    // 창 밖에서 불렸는데 설치할 본체가 없다 — 다시 확인하고 창으로 보여 준다(설치 창을 헛열지 않음).
-    openUpdatePanel();
-    await refreshUpdateState(false);
-    return;
-  }
-  const v = ba.version;
-  // ★(0.14.43 · J2) 설치 전 사실 고지 — Windows 스마트 앱 컨트롤이 켜져 있으면 서명 없는 설치 파일의 실행이 막히고, 막히면 업데이트는 설치되지 않은 채
-  //   이 앱이 닫히지 않고 그 사실을 알린다(WU — 아래 catch · 앱을 닫으면 다시 열 때도 막힐 수 있다). **켜짐일 때만** 확인 창 본문 끝에 한 문단을 붙인다 — 설치를 막지는 않는다(계속할지는 사용자가 정한다).
-  //   조회는 정보일 뿐이라 실패·시간 초과는 '문단 없음'으로 접는다(T_SAC 상한 + catch). 문단이 없으면 본문은 종전과 바이트 동일하다.
-  let sacNote: string | null = null;
+  if (promptBinaryPatchBusy) return;
+  promptBinaryPatchBusy = true;
   try {
-    const sac = await rpcT(invoke("smart_app_control"), T_SAC);
-    sacNote = sacPreflightText(typeof sac === "string" ? sac : null);
-  } catch {
-    sacNote = null;
-  }
-  const ok = await confirmModal(
-    `새 본체 버전 ${v} — 패치 설치`,
-    `새 본체(앱) ${v}을 패치 방식으로 설치합니다: 저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 ` +
-      `재시작합니다. 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +
-      `있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)` +
-      (sacNote ? `\n\n${sacNote}` : ""),
-    "설치",
-  );
-  if (!ok) return;
-  try {
-    await invoke("install_update", { force: true });
-    // 성공 시 백엔드가 app.restart()까지 수행 — 후속 UI 처리 없음(진행은 update-progress 리스너).
-  } catch (e) {
-    dismissToast("upd-bin");
-    // ★(0.14.43 · WU) 윈도우: 설치 파일 실행이 막혔으면(`installer_launch_failed:<코드>:<반환값>`) 앱은 닫히지 않은 채 여기로 온다 — J2 알림과 같은 자리·같은
-    //   지속 알림(수명 10분·만료 배너)으로 사람 말 문구를 보인다. 그 꼴이 아니면 종전 토스트 그대로다.
-    const lf = installerLaunchFailure(String(e), updAppVersion, v);
-    if (lf) stickyToast(INSTALLER_LAUNCH_FAILED_TOAST_ID, "health", lf.title, lf.body);
-    else toast("health", "패치 설치 실패", String(e));
+    // ★A7(성찰 확정): install_update 는 앱을 교체·재시작한다 — 리셋 실행 중이면 격리 스레드가
+    // 중도 사멸해 manifest(복구 지도) 없는 반쪽 격리가 남는다. 완료 래치 상태에서도 무의미하다.
+    if (daemonActionBlocked()) return;
+    const ba = binActionable(updState);
+    if (!ba) {
+      // 창 밖에서 불렸는데 설치할 본체가 없다 — 다시 확인하고 창으로 보여 준다(설치 창을 헛열지 않음).
+      openUpdatePanel();
+      await refreshUpdateState(false);
+      return;
+    }
+    const v = ba.version;
+    // ★(0.14.43 · J2) 설치 전 사실 고지 — Windows 스마트 앱 컨트롤이 켜져 있으면 코드 서명도 평판도 없는 설치 파일의 실행이 막히고, 막히면 업데이트는 설치되지 않은 채
+    //   이 앱이 닫히지 않고 그 사실을 알린다(WU — 아래 catch · 앱을 닫으면 다시 열 때도 막힐 수 있다). **켜짐일 때만** 확인 창 본문 끝에 한 문단을 붙인다 — 설치를 막지는 않는다(계속할지는 사용자가 정한다).
+    //   조회는 정보일 뿐이라 실패·시간 초과는 '문단 없음'으로 접는다(T_SAC 상한 + catch). 문단이 없으면 본문은 종전과 바이트 동일하다.
+    // ★(R1F-UA · S3 minor 4) 켜짐일 때만 '확인 실행'(`CYS_UPDATE_CHECKED_LAUNCH`)이 켜져 있는지 한 번 더 묻는다(같은 상한 T_SAC) — 꺼져 있으면(=0) 막혀도 앱이 알림 없이 닫히므로
+    //   "닫히지 않은 채 알려 드립니다" 문장 대신 사실대로 적은 판을 쓴다. 이 조회의 실패·시간 초과는 기본값(켜짐)으로 본다 — 문단 자체를 없애지 않는다.
+    let sacNote: string | null = null;
+    try {
+      const sac = await rpcT(invoke("smart_app_control"), T_SAC);
+      const checked = sac === "on" ? await rpcT(invoke("update_checked_launch_enabled"), T_SAC).catch(() => true) : true;
+      sacNote = sacPreflightText(typeof sac === "string" ? sac : null, checked !== false);
+    } catch {
+      sacNote = null;
+    }
+    // ★(R1F-UA · S3 note 14) 윈도우 분기에는 drain·핸드오프가 없다(src-tauri/src/main.rs 의 핀이 그 사실을 고정한다) — 윈도우에서만 실제 순서를 적는다.
+    //   OS 판정은 이 파일의 IS_WINDOWS 다. 맥·리눅스 문안은 종전과 바이트 동일하다(updatenotice.test.ts 가 두 문안을 전문으로 핀한다).
+    const how = IS_WINDOWS
+      ? "다운로드·서명 검증 뒤 설치 프로그램을 실행합니다(이 앱은 닫히고, 설치가 끝나면 다시 시작됩니다)"
+      : "저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 재시작합니다";
+    const ok = await confirmModal(
+      `새 본체 버전 ${v} — 패치 설치`,
+      `새 본체(앱) ${v}을 패치 방식으로 설치합니다: ${how}. ` +
+        `부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +
+        `있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)` +
+        (sacNote ? `\n\n${sacNote}` : ""),
+      "설치",
+    );
+    if (!ok) return;
+    try {
+      await invoke("install_update", { force: true });
+      // 성공 시 백엔드가 app.restart()까지 수행 — 후속 UI 처리 없음(진행은 update-progress 리스너).
+    } catch (e) {
+      dismissToast("upd-bin");
+      // ★(0.14.43 · WU) 윈도우: 설치 파일 실행이 막혔으면(`installer_launch_failed:<코드>:<반환값>`) 앱은 닫히지 않은 채 여기로 온다 — J2 알림과 같은 자리·같은
+      //   지속 알림(수명 10분·만료 배너)으로 사람 말 문구를 보인다. 그 꼴이 아니면 종전 토스트 그대로다.
+      const lf = installerLaunchFailure(String(e), updAppVersion, v);
+      if (lf) stickyToast(INSTALLER_LAUNCH_FAILED_TOAST_ID, "health", lf.title, lf.body);
+      else toast("health", "패치 설치 실패", String(e));
+    }
+  } finally {
+    promptBinaryPatchBusy = false;
   }
 }
 

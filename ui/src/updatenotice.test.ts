@@ -9,6 +9,8 @@
 //   · main.ts 배선: pull 은 bundle_integrity pull 바로 뒤에서 fire-and-forget · 재-pull 은 한 번뿐(타이머 1개·재귀 없음) ·
 //     설치 확인 창은 조회 실패·초과에도 열린다(문단 없으면 본문 바이트 동일).
 //   · 백엔드(src-tauri) 쪽 계약(명령 등재·응답 키)이 UI 가 읽는 것과 같다.
+// ★R1F-UA(성찰 1회차 · 2026-10-04) 가산: 문구의 정직성(재지 않은 단정은 조건문 · 옛 단정 부재) · 설치 전 안내 두 판((가) 확인 실행 켜짐 / (나) 꺼짐) · 윈도우/맥 확인 창 본문 ·
+//   재시작 뒤 알림의 설치기 실패 기록 파일 · 다시 누름 방지(진행 중 표식) · 확인 실행 노브 명령의 등재.
 import { describe, it, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
@@ -47,18 +49,25 @@ const count = (hay: string, needle: string): number => hay.split(needle).length 
 
 /**
  * 설치 전 고지 문안 전문 — 모듈의 문구가 바뀌면 이 핀이 빨개진다(손으로 옮긴 사본이 아니라 지시 원문이다).
- * ★WU 보충 지시(2026-10-04 · 2차 실측)로 바뀐 문구다: 종전 문구("막히면 경고 없이 지금 버전이 그대로 남고, 앱을 다시 열면 '설치되지 않았습니다' 알림이 뜹니다")는
- * 설치 파일 실행 결과를 보게 된 뒤에는 틀린 말이 된다 — 이제 막히면 앱이 닫히지 않은 채 바로 알리고, 앱을 닫으면 다시 열 때도 막힐 수 있다(cys-app.exe 도 차단).
+ * ★R1F-UA(성찰 1회차 · 2026-10-04)로 바뀐 문구다 — 실측(W11/FINDINGS): 스마트 앱 컨트롤이 켜진 PC 에서 막히는 것은 서명도 평판도 없는 파일이고(서명 없는 7-Zip 은 허용됐다),
+ * 0.14.43 앱 안의 문구는 **다음 버전으로 올릴 때** 나오는데 그 설치 파일이 서명될지는 지금 모른다 → "지금 cys 설치 파일에는 코드 서명이 없어 막습니다" 같은 단정을 조건문("…없으면")으로 바꿨다.
+ * WU 보충 지시(2026-10-04 · 2차 실측)의 사실은 그대로다: 막히면 앱이 닫히지 않은 채 바로 알리고, 앱을 닫으면 다시 열 때도 막힐 수 있다.
+ * (나)는 확인 실행 꺼짐(`CYS_UPDATE_CHECKED_LAUNCH=0`)판 — "막히면 …" 문장 하나만 다르다.
  */
 const SAC_PREFLIGHT =
-  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 지금 cys 설치 파일에는 코드 서명이 없어 Windows 가 실행을 막습니다. " +
+  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 새 설치 파일에 Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다(0.14.43 까지의 cys 설치 파일에는 코드 서명이 없습니다). " +
   "막히면 업데이트는 설치되지 않고, 이 앱은 닫히지 않은 채 그 사실을 알려 드립니다. " +
-  "스마트 앱 컨트롤이 켜진 PC 에서는 홈페이지에서 받은 설치 파일도 같은 이유로 막히며, 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.";
+  "그 경우 홈페이지에서 받은 설치 파일도 같은 이유로 막힙니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.";
+const SAC_PREFLIGHT_UNCHECKED =
+  "이 PC 는 Windows '스마트 앱 컨트롤'이 켜져 있습니다. 새 설치 파일에 Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다(0.14.43 까지의 cys 설치 파일에는 코드 서명이 없습니다). " +
+  "막히면 업데이트는 설치되지 않고, 지금 설정(CYS_UPDATE_CHECKED_LAUNCH=0)에서는 이 앱이 알림 없이 닫힙니다. " +
+  "그 경우 홈페이지에서 받은 설치 파일도 같은 이유로 막힙니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.";
 const WIN_PARAGRAPH =
-  "Windows 가 서명 없는 설치 파일을 막았을 수 있습니다(스마트 앱 컨트롤 · Defender). " +
-  "확인: 이벤트 뷰어 → 응용 프로그램 및 서비스 로그 → Microsoft → Windows → CodeIntegrity → Operational 의 이벤트 3033·3077. " +
-  "설치기는 임시 폴더의 cys-<to>-updater-… 아래에 풀립니다.";
-const SAC_ON_LINE = "이 PC 의 스마트 앱 컨트롤: 켜짐 — 켜져 있는 동안은 서명 없는 설치 파일이 수동 설치에서도 막힙니다.";
+  "설치가 끝나지 않았거나 받는 중에 앱이 닫혔을 수 있습니다. Windows 가 설치 파일의 실행을 막았을 수도 있습니다(스마트 앱 컨트롤 · Defender). " +
+  "확인: 이벤트 뷰어 → 응용 프로그램 및 서비스 로그 → Microsoft → Windows → CodeIntegrity → Operational 의 이벤트 3033·3077, " +
+  "설치 폴더(보통 %LOCALAPPDATA%\\cys)의 cys-install-failure.txt(설치기의 실행 파일 교체·검증이 실패하면 이 파일이 남습니다). " +
+  "받은 설치 파일은 임시 폴더의 cys-<to>-updater-… 아래에 저장됩니다.";
+const SAC_ON_LINE = "이 PC 의 스마트 앱 컨트롤: 켜짐 — 켜져 있는 동안은 Windows 가 신뢰하는 코드 서명이나 평판이 없는 설치 파일이 수동 설치에서도 막힙니다.";
 const SAC_EVAL_LINE = "이 PC 의 스마트 앱 컨트롤: 평가 모드(차단하지 않음) — 다른 원인(Defender 등)을 확인해 주세요.";
 const OTHER_OS_LINE = "홈페이지(www.cysinsight.com)에서 설치 파일을 받아 직접 설치해 주세요.";
 const first = (from: string, to: string) => `${to} 업데이트가 설치되지 않았습니다 — 지금 버전은 ${from} 그대로입니다.`;
@@ -69,38 +78,70 @@ const DISABLE_WORDS = ["끄", "끌", "꺼", "비활성", "해제", "disable", "t
 const hasDisableWord = (s: string): string[] => DISABLE_WORDS.filter((w) => s.toLowerCase().includes(w));
 
 describe("sacPreflightText — 켜짐(on)일 때만 문단", () => {
-  it("\"on\" → 티켓 문안 전문(「스마트 앱 컨트롤」·「코드 서명」 포함)", () => {
+  it("\"on\" → 티켓 문안 (가) 전문(둘째 인자 생략 · 「스마트 앱 컨트롤」·「코드 서명」·조건문 「없으면」 포함)", () => {
     const t = sacPreflightText("on");
     expect(t).toBe(SAC_PREFLIGHT);
     expect((t ?? "").includes("스마트 앱 컨트롤")).toBe(true);
     expect((t ?? "").includes("코드 서명")).toBe(true);
+    expect((t ?? "").includes("없으면")).toBe(true);
   });
 
-  it("\"eval\"·\"off\"·null·undefined·\"\" → null", () => {
+  it("★R1F-UA: 확인 실행이 켜져 있으면(둘째 인자 true·생략·null·모르는 값) (가) · 정확히 false 일 때만 (나) — 조회 실패·시간 초과(= 켜짐으로 본다)가 (가)로 가는 근거", () => {
+    const notFalse: unknown[] = [true, undefined, null, "false", 0, "", NaN, {}, []];
+    for (const c of notFalse) expect({ 둘째: c, 결과: sacPreflightText("on", c as boolean | null | undefined) }).toEqual({ 둘째: c, 결과: SAC_PREFLIGHT });
+    expect(sacPreflightText("on", true)).toBe(SAC_PREFLIGHT);
+    expect(sacPreflightText("on", false)).toBe(SAC_PREFLIGHT_UNCHECKED);
+  });
+
+  it("★R1F-UA: (가)와 (나)는 \"막히면 …\" 문장 하나만 다르다 — (나)는 노브 이름과 \"알림 없이 닫힙니다\" 를 말하고 (가)의 \"닫히지 않은 채\" 는 없다", () => {
+    const IF_ON = "막히면 업데이트는 설치되지 않고, 이 앱은 닫히지 않은 채 그 사실을 알려 드립니다.";
+    const IF_OFF = "막히면 업데이트는 설치되지 않고, 지금 설정(CYS_UPDATE_CHECKED_LAUNCH=0)에서는 이 앱이 알림 없이 닫힙니다.";
+    expect(count(SAC_PREFLIGHT, IF_ON)).toBe(1);
+    expect(SAC_PREFLIGHT.replace(IF_ON, IF_OFF)).toBe(SAC_PREFLIGHT_UNCHECKED);
+    const off = sacPreflightText("on", false) ?? "";
+    expect(off.includes("CYS_UPDATE_CHECKED_LAUNCH=0")).toBe(true);
+    expect(off.includes("알림 없이 닫힙니다")).toBe(true);
+    expect(off.includes("닫히지 않은 채")).toBe(false);
+    const on = sacPreflightText("on") ?? "";
+    expect(on.includes("CYS_UPDATE_CHECKED_LAUNCH")).toBe(false);
+    expect(on.includes("알림 없이")).toBe(false);
+    // 둘 다 같은 조건문·같은 단정 한정(0.14.43 까지)·같은 꼬리를 가진다
+    for (const t of [on, off]) {
+      expect(t.includes("코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다")).toBe(true);
+      expect(t.includes("(0.14.43 까지의 cys 설치 파일에는 코드 서명이 없습니다)")).toBe(true);
+      expect(t.endsWith("스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있습니다.")).toBe(true);
+    }
+  });
+
+  it("\"eval\"·\"off\"·null·undefined·\"\" → null (둘째 인자와 무관)", () => {
     for (const v of ["eval", "off", null, undefined, ""] as const) {
       expect({ 입력: v, 결과: sacPreflightText(v) }).toEqual({ 입력: v, 결과: null });
+      expect({ 입력: v, 결과: sacPreflightText(v, false) }).toEqual({ 입력: v, 결과: null });
+      expect({ 입력: v, 결과: sacPreflightText(v, true) }).toEqual({ 입력: v, 결과: null });
     }
   });
 
-  it("모르는 값(대소문자 다른 \"ON\"·공백 낀 \"on \"·숫자 모양)도 null — 정확히 \"on\" 만 켜짐으로 읽는다", () => {
+  it("모르는 값(대소문자 다른 \"ON\"·공백 낀 \"on \"·숫자 모양)도 null — 정확히 \"on\" 만 켜짐으로 읽는다(둘째 인자와 무관)", () => {
     for (const v of ["ON", "On", " on", "on ", "1", "0x1", "true", "yes", "enabled"]) {
       expect({ 입력: v, 결과: sacPreflightText(v) }).toEqual({ 입력: v, 결과: null });
+      expect({ 입력: v, 결과: sacPreflightText(v, false) }).toEqual({ 입력: v, 결과: null });
     }
   });
 
-  it("사실만 말한다 — 끄라는 말·끄는 방법이 없다 · 설치를 막는 말(금지·불가·중단)도 없다", () => {
-    const t = sacPreflightText("on") ?? "";
-    expect(hasDisableWord(t)).toEqual([]);
-    for (const w of ["금지", "불가", "중단", "하지 마"]) expect({ 낱말: w, 있음: t.includes(w) }).toEqual({ 낱말: w, 있음: false });
+  it("사실만 말한다 — 끄라는 말·끄는 방법이 없다 · 설치를 막는 말(금지·불가·중단)도 없다(두 판 모두)", () => {
+    for (const t of [sacPreflightText("on") ?? "", sacPreflightText("on", false) ?? ""]) {
+      expect(hasDisableWord(t)).toEqual([]);
+      for (const w of ["금지", "불가", "중단", "하지 마"]) expect({ 낱말: w, 있음: t.includes(w) }).toEqual({ 낱말: w, 있음: false });
+    }
   });
 
-  it("★WU 보충(2차 실측): 막히면 업데이트는 설치되지 않고 이 앱은 닫히지 않은 채 알려 준다 · 앱을 닫으면 다시 열 때도 막힐 수 있다 — 낡은 주장(경고 없이 그대로 남는다 · 다시 열면 알림이 뜬다)은 없다", () => {
+  it("★WU 보충(2차 실측)은 그대로 — 막히면 업데이트는 설치되지 않고 이 앱은 닫히지 않은 채 알려 준다((가)) · 앱을 닫으면 다시 열 때도 막힐 수 있다 — 낡은 주장(경고 없이 그대로 남는다 · 다시 열면 알림이 뜬다)은 없다", () => {
     const t = sacPreflightText("on") ?? "";
     for (const w of [
-      "코드 서명이 없어 Windows 가 실행을 막습니다",
+      "새 설치 파일에 Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다",
       "업데이트는 설치되지 않고",
       "이 앱은 닫히지 않은 채 그 사실을 알려 드립니다",
-      "홈페이지에서 받은 설치 파일도 같은 이유로 막히며",
+      "그 경우 홈페이지에서 받은 설치 파일도 같은 이유로 막힙니다",
       "이 앱을 닫으면 다시 열 때도 막힐 수 있습니다",
     ])
       expect({ 낱말: w, 있음: t.includes(w) }).toEqual({ 낱말: w, 있음: true });
@@ -117,10 +158,22 @@ describe("updateFailedNotice — 제목 · 공통 첫 문장 · OS 별 분기", 
     expect(updateFailedNotice({ from: "0.14.42", to: "0.14.43", os: "macos" }).title).toBe("업데이트가 설치되지 않았습니다");
   });
 
-  it("windows + on: 첫 문장 · 서명 없는 설치 파일 사실 · 이벤트 3033·3077 · 임시 폴더 이름 · 켜짐 한 줄", () => {
+  it("windows + on: 첫 문장 · 원인 후보(앱이 닫힘 · 실행을 막았을 수도) · 이벤트 3033·3077 · 설치기 실패 기록 파일 · 받은 설치 파일 임시 폴더 · 켜짐 한 줄(R1F-UA 문안)", () => {
     const n = updateFailedNotice({ from: "0.14.42", to: "0.14.43", os: "windows", sac: "on" });
     expect(n.body).toBe([first("0.14.42", "0.14.43"), win("0.14.43"), SAC_ON_LINE].join("\n"));
-    for (const must of ["CodeIntegrity", "3033", "3077", "cys-0.14.43-updater-", "스마트 앱 컨트롤", "Defender", "이벤트 뷰어"]) {
+    for (const must of [
+      "CodeIntegrity",
+      "3033",
+      "3077",
+      "cys-0.14.43-updater-",
+      "스마트 앱 컨트롤",
+      "Defender",
+      "이벤트 뷰어",
+      "설치가 끝나지 않았거나 받는 중에 앱이 닫혔을 수 있습니다",
+      "설치 파일의 실행을 막았을 수도 있습니다",
+      "cys-install-failure.txt",
+      "받은 설치 파일은 임시 폴더의 cys-0.14.43-updater-… 아래에 저장됩니다.",
+    ]) {
       expect({ 낱말: must, 있음: n.body.includes(must) }).toEqual({ 낱말: must, 있음: true });
     }
     expect(n.body.includes(OTHER_OS_LINE)).toBe(false);
@@ -149,7 +202,7 @@ describe("updateFailedNotice — 제목 · 공통 첫 문장 · OS 별 분기", 
   it("macos: 홈페이지에서 직접 설치 안내 · 윈도우 문구(스마트 앱 컨트롤·CodeIntegrity·Defender)는 없다 · sac 값이 와도 무시", () => {
     const n = updateFailedNotice({ from: "0.14.42", to: "0.14.43", os: "macos" });
     expect(n.body).toBe([first("0.14.42", "0.14.43"), OTHER_OS_LINE].join("\n"));
-    for (const w of ["스마트 앱 컨트롤", "CodeIntegrity", "Defender", "이벤트 뷰어", "3033", "updater-"]) {
+    for (const w of ["스마트 앱 컨트롤", "CodeIntegrity", "Defender", "이벤트 뷰어", "3033", "updater-", "cys-install-failure.txt"]) {
       expect({ 낱말: w, 있음: n.body.includes(w) }).toEqual({ 낱말: w, 있음: false });
     }
     expect(updateFailedNotice({ from: "0.14.42", to: "0.14.43", os: "macos", sac: "on" }).body).toBe(n.body);
@@ -418,14 +471,19 @@ describe("main.ts 배선 — 기동 pull(bundle_integrity 바로 뒤 · fire-and
 
   it("★확인 창 본문: 문단이 없으면 종전과 바이트 동일 · 있으면 맨 끝에 한 줄 띄우고 붙는다 · 설치를 막지 않는다(`if (!ok) return;` 그대로)", () => {
     const b = fnBody("promptBinaryPatch");
-    // 종전 본문 조각 3개가 그대로 있다(앞부분을 건드리지 않았다)
+    // 본문 조각이 그대로 있다 — 제목 · 맥 방법 절(종전 문장 그대로) · 윈도우 방법 절(R1F-UA) · 뒤 문장(종전 그대로)
     for (const piece of [
       "`새 본체 버전 ${v} — 패치 설치`",
-      "`새 본체(앱) ${v}을 패치 방식으로 설치합니다: 저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 ` +",
-      "`재시작합니다. 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +",
+      '"저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 재시작합니다"',
+      '"다운로드·서명 검증 뒤 설치 프로그램을 실행합니다(이 앱은 닫히고, 설치가 끝나면 다시 시작됩니다)"',
+      "`새 본체(앱) ${v}을 패치 방식으로 설치합니다: ${how}. ` +",
+      "`부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +",
       "`있습니다.\\n\\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)` +",
     ])
       expect({ 조각: piece, 있음: b.includes(piece) }).toEqual({ 조각: piece, 있음: true });
+    // OS 판정은 이 파일이 이미 쓰는 IS_WINDOWS 다 — 새 판정 방법을 만들지 않았다
+    expect(b.includes("const how = IS_WINDOWS")).toBe(true);
+    expect(/const IS_WINDOWS = \/Windows\/i\.test\(navigator\.userAgent\);/.test(code)).toBe(true);
     // 덧붙임 식: 실제 소스 조각을 꺼내 실행해 두 경우를 잰다(문자열 핀을 우회하는 변형 차단)
     const a = b.indexOf("(sacNote ? ");
     expect(a).toBeGreaterThan(0);
@@ -437,11 +495,40 @@ describe("main.ts 배선 — 기동 pull(bundle_integrity 바로 뒤 · fire-and
     expect(run("")).toBe("");
     expect(run("고지 문단")).toBe("\n\n고지 문단"); // 한 줄 띄우고
     expect(run(SAC_PREFLIGHT)).toBe("\n\n" + SAC_PREFLIGHT);
-    // 덧붙임이 본문 인자의 맨 끝이고 다음 인자는 확인 버튼 라벨이다
-    expect(b.slice(e).trimStart().startsWith(',\n    "설치",')).toBe(true);
+    expect(run(SAC_PREFLIGHT_UNCHECKED)).toBe("\n\n" + SAC_PREFLIGHT_UNCHECKED);
+    // 덧붙임이 본문 인자의 맨 끝이고 다음 인자는 확인 버튼 라벨이다(들여쓰기와 무관)
+    expect(/^,\s*"설치",/.test(b.slice(e).trimStart())).toBe(true);
     // 설치를 막지 않는다 — 확인(사용자 선택)이 유일한 관문이다
     expect(b.includes("if (!ok) return;")).toBe(true);
     expect(b.includes('await invoke("install_update", { force: true });')).toBe(true);
+  });
+
+  it("★R1F-UA: 확인 실행 노브 조회 — 스마트 앱 컨트롤이 켜짐일 때만 · 같은 상한(T_SAC) · 실패·시간 초과는 켜짐(true)으로 접힌다 · 결과는 sacPreflightText 의 둘째 인자로 간다 · 확인 창보다 앞이다", () => {
+    const b = fnBody("promptBinaryPatch");
+    expect(count(b, 'invoke("update_checked_launch_enabled")')).toBe(1);
+    const sac = b.indexOf('invoke("smart_app_control")');
+    const chk = b.indexOf('invoke("update_checked_launch_enabled")');
+    const modal = b.indexOf("confirmModal(");
+    expect(sac).toBeGreaterThanOrEqual(0);
+    expect(chk).toBeGreaterThan(sac);
+    expect(modal).toBeGreaterThan(chk);
+    expect(b.includes('const checked = sac === "on" ? await rpcT(invoke("update_checked_launch_enabled"), T_SAC).catch(() => true) : true;')).toBe(true);
+    expect(b.includes('sacNote = sacPreflightText(typeof sac === "string" ? sac : null, checked !== false);')).toBe(true);
+  });
+
+  it("★R1F-UA(S3 note 8): 진행 중 표식 — 모듈 수준 `let` 하나 · 진입하자마자 이미 올라 있으면 return · 올린 뒤 본문 전체가 try 안 · finally 에서 내린다(조기 return·예외 포함)", () => {
+    expect(count(code, "let promptBinaryPatchBusy = false;")).toBe(1);
+    const b = fnBody("promptBinaryPatch");
+    // 함수 머리: 표식 확인 → 올림 → try — 첫 await·첫 return 보다 앞이다
+    expect(b.replace(/\s+/g, " ").startsWith("async function promptBinaryPatch() { if (promptBinaryPatchBusy) return; promptBinaryPatchBusy = true; try {")).toBe(true);
+    // 함수 끝: finally 에서 내린다
+    expect(/\} finally \{\s*promptBinaryPatchBusy = false;\s*\}\s*$/.test(b)).toBe(true);
+    // 표식을 쓰는 곳은 확인 1 · 올림 1 · 내림 1 — 다른 곳에서 만지지 않는다
+    expect(count(b, "promptBinaryPatchBusy")).toBe(3);
+    expect(count(b, "promptBinaryPatchBusy = true;")).toBe(1);
+    expect(count(b, "promptBinaryPatchBusy = false;")).toBe(1);
+    // 올림 뒤의 모든 await·return 이 try 안이다 — try 앞(머리)에는 await 가 없다
+    expect(b.slice(0, b.indexOf("try {")).includes("await")).toBe(false);
   });
 
   it("스마트 앱 컨트롤 조회·시도 판정 외에 업데이트 경로를 바꾸지 않는다 — install_update 호출 위치는 종전 둘(패치 설치·자동 테스트)뿐", () => {
@@ -454,9 +541,9 @@ describe("백엔드(src-tauri) 계약 — UI 가 부르는 명령이 등재돼 �
   const prod = rust.slice(0, rust.indexOf("#[cfg(test)]\nmod tests {"));
   const regStart = prod.indexOf("tauri::generate_handler![");
   const reg = prod.slice(regStart, prod.indexOf("\n        ])", regStart));
-  it("update_attempt_report·smart_app_control 이 #[tauri::command] 로 정의되고 invoke_handler 에 등재된다", () => {
+  it("update_attempt_report·smart_app_control·update_checked_launch_enabled(R1F-UA) 가 #[tauri::command] 로 정의되고 invoke_handler 에 등재된다", () => {
     expect(regStart).toBeGreaterThan(0);
-    for (const name of ["update_attempt_report", "smart_app_control"]) {
+    for (const name of ["update_attempt_report", "smart_app_control", "update_checked_launch_enabled"]) {
       expect({ 명령: name, 정의: prod.includes(`#[tauri::command]\nasync fn ${name}(`) }).toEqual({ 명령: name, 정의: true });
       expect({ 명령: name, 등재: reg.split("\n").some((l) => l.trim() === `${name},`) }).toEqual({ 명령: name, 등재: true });
     }
@@ -469,6 +556,10 @@ describe("백엔드(src-tauri) 계약 — UI 가 부르는 명령이 등재돼 �
       expect({ 키: key, 백엔드: body.includes(`"${key}"`) }).toEqual({ 키: key, 백엔드: true });
       expect({ 키: key, UI: ui.includes(key) }).toEqual({ 키: key, UI: true });
     }
+  });
+  it("★R1F-UA: 확인 실행 노브 명령은 불리언을 돌려준다(UI 는 정확히 false 만 '꺼짐'으로 읽는다) · 화면이 부르는 이름과 같다", () => {
+    expect(prod.includes("async fn update_checked_launch_enabled() -> bool {")).toBe(true);
+    expect(count(mainCode, 'invoke("update_checked_launch_enabled")')).toBe(1);
   });
   it("백엔드 판정 보류 창(90초)과 UI 의 기본 대기(90초)가 같은 값이다", () => {
     const m = prod.match(/const UPDATE_ATTEMPT_MIN_AGE_SECS: u64 = (\d+);/);
@@ -622,24 +713,41 @@ describe("main.ts 실행 — pullUpdateAttemptReport 를 대역 위에서 돌린
 });
 
 describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 위에서 돌린다(본문 바이트 동일 · 조회 실패·초과에도 창은 열린다)", () => {
-  /** 이 변경 전의 확인 창 본문(리터럴) — '문단이 없으면 종전과 바이트 동일'의 기준. */
+  /** 이 변경 전의 확인 창 본문(리터럴) — '문단이 없으면 종전과 바이트 동일'의 기준(맥·리눅스). */
   const BASE_BODY = (v: string): string =>
     `새 본체(앱) ${v}을 패치 방식으로 설치합니다: 저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 ` +
     `재시작합니다. 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +
     `있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)`;
+  /** ★R1F-UA(S3 note 14): 윈도우 확인 창 본문 — 윈도우 분기에는 drain·핸드오프가 없다. 첫 문장의 방법 절만 다르고 뒤 문장은 맥과 같다. */
+  const WIN_BODY = (v: string): string =>
+    `새 본체(앱) ${v}을 패치 방식으로 설치합니다: 다운로드·서명 검증 뒤 설치 프로그램을 실행합니다(이 앱은 닫히고, 설치가 끝나면 다시 시작됩니다). ` +
+    `부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 ` +
+    `있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)`;
+  const tick = (): Promise<void> => new Promise<void>((res) => globalThis.setTimeout(res, 0));
 
   type Opts = {
     sac?: unknown;
     sacRejects?: boolean;
     sacHangs?: boolean;
+    /** ★R1F-UA: update_checked_launch_enabled 의 응답(생략하면 null — 알 수 없는 응답). */
+    checked?: unknown;
+    checkedRejects?: boolean;
+    checkedHangs?: boolean;
+    /** ★R1F-UA: IS_WINDOWS(생략하면 false = 맥·리눅스). */
+    isWindows?: boolean;
     ok?: boolean;
     installRejects?: boolean;
     /** 설치 호출이 이 값으로 거부된다(WU — 백엔드가 돌려주는 오류 문자열을 흉내). */
     installError?: unknown;
     blocked?: boolean;
     noBin?: boolean;
+    /** ★R1F-UA(재진입): 해당 응답을 테스트가 손으로 풀어 준다(h.gates). */
+    sacDeferred?: boolean;
+    modalDeferred?: boolean;
+    installDeferred?: boolean;
+    modalThrows?: boolean;
   };
-  async function runPrompt(o: Opts) {
+  function makePrompt(o: Opts) {
     const calls: string[] = [];
     const modal: unknown[][] = [];
     const invokes: unknown[][] = [];
@@ -647,6 +755,14 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     const dismissed: string[] = [];
     const caps: number[] = [];
     const stickies: unknown[][] = [];
+    const gates: { sac?: (v: unknown) => void; modal?: (v: boolean) => void; install?: (err?: unknown) => void } = {};
+    // 영영 안 끝나는 조회 — 진짜 rpcT 는 상한이 지나면 거부한다(대역은 이 표식이 붙은 promise 를 즉시 거부해 그 계약을 흉내 낸다).
+    const hung = new WeakSet<object>();
+    const never = (): Promise<unknown> => {
+      const p = new Promise<unknown>(() => {});
+      hung.add(p);
+      return p;
+    };
     const deps = {
       daemonActionBlocked: (): boolean => !!o.blocked,
       binActionable: (): { version: string } | null => (o.noBin ? null : { version: "0.14.43" }),
@@ -657,13 +773,22 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
       refreshUpdateState: async (): Promise<void> => {
         calls.push("refreshUpdateState");
       },
+      // ★R1F-UA: 새 자유 변수 — OS 판정(IS_WINDOWS)과 진행 중 표식(모듈 수준 let 의 대역 · 함수가 이 속성을 올리고 내린다)
+      IS_WINDOWS: !!o.isWindows,
+      promptBinaryPatchBusy: false,
       invoke: (cmd: string, args?: unknown): Promise<unknown> => {
         invokes.push([cmd, args]);
         if (cmd === "smart_app_control") {
-          if (o.sacHangs) return new Promise<unknown>(() => {}); // 영영 안 끝나는 조회
+          if (o.sacHangs) return never(); // 영영 안 끝나는 조회
+          if (o.sacDeferred) return new Promise<unknown>((res) => (gates.sac = res));
           return o.sacRejects ? Promise.reject(new Error("boom")) : Promise.resolve(o.sac ?? null);
         }
+        if (cmd === "update_checked_launch_enabled") {
+          if (o.checkedHangs) return never();
+          return o.checkedRejects ? Promise.reject(new Error("boom")) : Promise.resolve(o.checked ?? null);
+        }
         if (cmd === "install_update") {
+          if (o.installDeferred) return new Promise<unknown>((res, rej) => (gates.install = (e?: unknown) => (e === undefined ? res(undefined) : rej(e))));
           if (o.installError !== undefined) return Promise.reject(o.installError);
           return o.installRejects ? Promise.reject("install boom") : Promise.resolve(undefined);
         }
@@ -672,12 +797,14 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
       // rpcT 대역: 상한 값을 기록하고, 영영 안 끝나는 조회는 상한이 지난 것으로 보고 즉시 거부한다(진짜 rpcT 와 같은 계약).
       rpcT: (p: Promise<unknown>, ms: number): Promise<unknown> => {
         caps.push(ms);
-        return o.sacHangs ? Promise.reject(new Error("rpc timeout")) : p;
+        return hung.has(p) ? Promise.reject(new Error("rpc timeout")) : p;
       },
       T_SAC: 4242,
       sacPreflightText,
       confirmModal: (...a: unknown[]): Promise<boolean> => {
         modal.push(a);
+        if (o.modalThrows) return Promise.reject(new Error("modal boom"));
+        if (o.modalDeferred) return new Promise<boolean>((res) => (gates.modal = res));
         return Promise.resolve(o.ok !== false);
       },
       dismissToast: (id: string): void => {
@@ -699,27 +826,36 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     expect({ 걷을_표기: strip[0], 존재: js.includes(strip[0]) }).toEqual({ 걷을_표기: strip[0], 존재: true });
     js = js.replace(strip[0], strip[1]);
     const fn = new Function("deps", `with (deps) {\n${js}\nreturn promptBinaryPatch;\n}`)(deps) as () => Promise<void>;
-    await fn();
-    return { calls, modal, invokes, toasts, dismissed, caps, stickies };
+    return { fn, deps, calls, modal, invokes, toasts, dismissed, caps, stickies, gates };
   }
+  async function runPrompt(o: Opts) {
+    const h = makePrompt(o);
+    await h.fn();
+    return h;
+  }
+  const cmds = (h: { invokes: unknown[][] }): unknown[] => h.invokes.map((i) => i[0]);
 
-  it("★켜짐(on): 확인 창 본문 맨 끝에 한 줄 띄우고 문단이 붙는다 — 제목·확인 라벨은 그대로 · 조회 상한은 T_SAC", async () => {
+  it("★켜짐(on): 확인 창 본문 맨 끝에 한 줄 띄우고 문단이 붙는다 — 제목·확인 라벨은 그대로 · 두 조회(스마트 앱 컨트롤 → 확인 실행 노브) 모두 상한은 T_SAC", async () => {
     const r = await runPrompt({ sac: "on" });
     expect(r.modal.length).toBe(1);
-    expect(r.modal[0]).toEqual(["새 본체 버전 0.14.43 — 패치 설치", BASE_BODY("0.14.43") + "\n\n" + sacPreflightText("on"), "설치"]);
-    expect(r.caps).toEqual([4242]);
+    expect(r.modal[0]).toEqual(["새 본체 버전 0.14.43 — 패치 설치", BASE_BODY("0.14.43") + "\n\n" + SAC_PREFLIGHT, "설치"]);
+    expect(r.modal[0]?.[1]).toBe(BASE_BODY("0.14.43") + "\n\n" + sacPreflightText("on"));
+    expect(r.caps).toEqual([4242, 4242]);
     expect(r.invokes[0]).toEqual(["smart_app_control", undefined]);
+    expect(r.invokes[1]).toEqual(["update_checked_launch_enabled", undefined]);
     // 이어서 설치는 사용자가 확인했으므로 그대로 진행된다(문단이 설치를 막지 않는다)
-    expect(r.invokes[1]).toEqual(["install_update", { force: true }]);
-    expect(r.invokes.length).toBe(2);
+    expect(r.invokes[2]).toEqual(["install_update", { force: true }]);
+    expect(r.invokes.length).toBe(3);
   });
 
-  it("★켜짐이 아니면(off·eval·null·모르는 값·문자열 아님) 본문은 종전과 바이트 동일", async () => {
+  it("★켜짐이 아니면(off·eval·null·모르는 값·문자열 아님) 본문은 종전과 바이트 동일 · 확인 실행 노브는 묻지도 않는다", async () => {
     for (const sac of ["off", "eval", null, undefined, "", "weird", "ON", 1, true, { on: true }]) {
       const r = await runPrompt({ sac });
       expect({ sac, 본문: r.modal[0]?.[1] }).toEqual({ sac, 본문: BASE_BODY("0.14.43") });
       expect(r.modal[0]?.[0]).toBe("새 본체 버전 0.14.43 — 패치 설치");
       expect(r.modal[0]?.[2]).toBe("설치");
+      expect({ sac, 호출: cmds(r) }).toEqual({ sac, 호출: ["smart_app_control", "install_update"] });
+      expect(r.caps).toEqual([4242]);
     }
   });
 
@@ -728,15 +864,56 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
       const r = await runPrompt(o);
       expect(r.modal.length).toBe(1);
       expect(r.modal[0]?.[1]).toBe(BASE_BODY("0.14.43"));
-      expect(r.caps).toEqual([4242]); // 상한(rpcT) 아래에서 불렀다
+      expect(r.caps).toEqual([4242]); // 상한(rpcT) 아래에서 불렀다 — 실패한 조회 뒤에는 노브를 묻지 않는다
+      expect(cmds(r)).toEqual(["smart_app_control", "install_update"]);
       expect(r.invokes[r.invokes.length - 1]).toEqual(["install_update", { force: true }]); // 사용자가 확인하면 설치는 진행
     }
   });
 
-  it("사용자가 거절하면(아니오) 설치하지 않는다 — 스마트 앱 컨트롤 조회는 설치를 막지도 부르지도 않는다", async () => {
+  it("★R1F-UA(가)/(나) 선택: 확인 실행이 꺼져 있다고 답하면(정확히 false) (나) · 켜져 있다·모르는 응답·거부·상한 초과는 전부 (가)(= 켜짐으로 본다)", async () => {
+    const off = await runPrompt({ sac: "on", checked: false });
+    expect(off.modal[0]?.[1]).toBe(BASE_BODY("0.14.43") + "\n\n" + SAC_PREFLIGHT_UNCHECKED);
+    expect(off.modal.length).toBe(1);
+    expect(off.caps).toEqual([4242, 4242]);
+    for (const checked of [true, null, undefined, "false", 0, "", { enabled: false }, []]) {
+      const r = await runPrompt({ sac: "on", checked });
+      expect({ checked, 본문: r.modal[0]?.[1] }).toEqual({ checked, 본문: BASE_BODY("0.14.43") + "\n\n" + SAC_PREFLIGHT });
+    }
+    // 조회 실패·시간 초과: 문단 자체를 없애지 않고 기본값(켜짐) 판 — 창은 열리고 설치는 진행된다
+    for (const o of [{ checkedRejects: true }, { checkedHangs: true }] as Opts[]) {
+      const r = await runPrompt({ sac: "on", ...o });
+      expect(r.modal.length).toBe(1);
+      expect(r.modal[0]?.[1]).toBe(BASE_BODY("0.14.43") + "\n\n" + SAC_PREFLIGHT);
+      expect(r.caps).toEqual([4242, 4242]); // 둘 다 같은 상한 아래에서 불렀다
+      expect(r.invokes[r.invokes.length - 1]).toEqual(["install_update", { force: true }]);
+    }
+    // 스마트 앱 컨트롤 조회가 먼저다 — 켜짐이어야 노브를 묻는다(순서)
+    expect(cmds(off)).toEqual(["smart_app_control", "update_checked_launch_enabled", "install_update"]);
+  });
+
+  it("★R1F-UA(S3 note 14) 확인 창 본문: 윈도우에서만 실제 순서(다운로드·서명 검증 뒤 설치 프로그램 실행 · 이 앱은 닫힘)를 적는다 · 맥·리눅스 문안은 종전과 바이트 동일", async () => {
+    const win = await runPrompt({ sac: "off", isWindows: true });
+    expect(win.modal[0]).toEqual(["새 본체 버전 0.14.43 — 패치 설치", WIN_BODY("0.14.43"), "설치"]);
+    const mac = await runPrompt({ sac: "off" }); // IS_WINDOWS = false
+    expect(mac.modal[0]).toEqual(["새 본체 버전 0.14.43 — 패치 설치", BASE_BODY("0.14.43"), "설치"]);
+    // 윈도우 본문에는 drain·핸드오프 서술이 없다 · 맥 본문에는 종전 서술이 그대로 있다
+    const w = String(win.modal[0]?.[1]);
+    for (const x of ["저장(drain)", "교체하고 앱을 재시작합니다"]) expect({ 낱말: x, 윈도우: w.includes(x) }).toEqual({ 낱말: x, 윈도우: false });
+    expect(w.includes("다운로드·서명 검증 뒤 설치 프로그램을 실행합니다(이 앱은 닫히고, 설치가 끝나면 다시 시작됩니다)")).toBe(true);
+    const m = String(mac.modal[0]?.[1]);
+    expect(m.includes("저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 재시작합니다")).toBe(true);
+    expect(m.includes("설치 프로그램")).toBe(false);
+    // 두 본문은 방법 절 하나만 다르다 — 뒤 문장("부서·노드는 … 손실될 수 있습니다 … 지금 설치하시겠습니까 …")은 같다
+    expect(BASE_BODY("0.14.43").replace("저장(drain) 신호 후 다운로드·서명 검증·교체하고 앱을 재시작합니다", "다운로드·서명 검증 뒤 설치 프로그램을 실행합니다(이 앱은 닫히고, 설치가 끝나면 다시 시작됩니다)")).toBe(WIN_BODY("0.14.43"));
+    // 윈도우 + 스마트 앱 컨트롤 켜짐 + 확인 실행 꺼짐: 본문 끝에 (나) 문단이 붙는다(두 변경이 함께 간다)
+    const both = await runPrompt({ sac: "on", checked: false, isWindows: true });
+    expect(both.modal[0]?.[1]).toBe(WIN_BODY("0.14.43") + "\n\n" + SAC_PREFLIGHT_UNCHECKED);
+  });
+
+  it("사용자가 거절하면(아니오) 설치하지 않는다 — 스마트 앱 컨트롤·노브 조회는 설치를 막지도 부르지도 않는다", async () => {
     const r = await runPrompt({ sac: "on", ok: false });
     expect(r.modal.length).toBe(1);
-    expect(r.invokes.map((i) => i[0])).toEqual(["smart_app_control"]);
+    expect(cmds(r)).toEqual(["smart_app_control", "update_checked_launch_enabled"]);
   });
 
   it("데몬 작업 차단 중이면 아무것도 하지 않고 · 설치할 본체가 없으면 패널을 열 뿐 조회도 창도 없다(종전 거동)", async () => {
@@ -757,6 +934,75 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     expect(r.stickies).toEqual([]); // 종전 오류에는 지속 알림이 없다(WU 는 그 꼴일 때만)
   });
 
+  // ── ★R1F-UA(S3 note 8): 다시 누름 방지 — 조회를 기다리는 동안 다시 눌려도 확인 창이 두 번 뜨지 않는다 ──
+
+  it("★재진입: 스마트 앱 컨트롤 조회를 기다리는 동안 다시 불려도 확인 창은 한 번만 뜬다 · 조회도 한 번 · 끝나면 표식이 내려가 다음 호출은 다시 열린다", async () => {
+    const h = makePrompt({ sac: "off", sacDeferred: true });
+    const p1 = h.fn();
+    const p2 = h.fn(); // 조회를 기다리는 중에 다시 눌림
+    const p3 = h.fn();
+    await tick();
+    const sacCalls = () => h.invokes.filter((i) => i[0] === "smart_app_control").length;
+    expect({ 창: h.modal.length, 조회: sacCalls(), 표식: h.deps.promptBinaryPatchBusy }).toEqual({ 창: 0, 조회: 1, 표식: true });
+    h.gates.sac?.("off");
+    await Promise.all([p1, p2, p3]);
+    expect({ 창: h.modal.length, 조회: sacCalls(), 표식: h.deps.promptBinaryPatchBusy }).toEqual({ 창: 1, 조회: 1, 표식: false });
+    const p4 = h.fn(); // 끝난 뒤의 새 호출은 막히지 않는다(조회부터 다시 시작한다)
+    await tick();
+    expect({ 조회: sacCalls(), 표식: h.deps.promptBinaryPatchBusy }).toEqual({ 조회: 2, 표식: true });
+    h.gates.sac?.("off");
+    await p4;
+    expect({ 창: h.modal.length, 조회: sacCalls(), 표식: h.deps.promptBinaryPatchBusy }).toEqual({ 창: 2, 조회: 2, 표식: false });
+  });
+
+  it("★재진입: 확인 창이 열려 있는 동안 · 설치 호출이 진행되는 동안에도 다시 불려도 아무것도 하지 않는다(창 1 · 설치 호출 1) — 설치가 겹치지 않는다", async () => {
+    const h = makePrompt({ sac: "off", modalDeferred: true, installDeferred: true });
+    const installs = () => h.invokes.filter((i) => i[0] === "install_update").length;
+    const p1 = h.fn();
+    await tick();
+    expect({ 창: h.modal.length, 설치: installs() }).toEqual({ 창: 1, 설치: 0 });
+    await h.fn(); // 확인 창이 열려 있는 중
+    expect({ 창: h.modal.length, 설치: installs() }).toEqual({ 창: 1, 설치: 0 });
+    h.gates.modal?.(true);
+    await tick();
+    expect({ 창: h.modal.length, 설치: installs() }).toEqual({ 창: 1, 설치: 1 });
+    await h.fn(); // 설치 호출이 진행 중
+    expect({ 창: h.modal.length, 설치: installs(), 표식: h.deps.promptBinaryPatchBusy }).toEqual({ 창: 1, 설치: 1, 표식: true });
+    h.gates.install?.(); // 설치 호출이 끝난다
+    await p1;
+    expect(h.deps.promptBinaryPatchBusy).toBe(false);
+  });
+
+  it("★표식은 어떤 갈래로 끝나도 내려간다 — 거절 · 데몬 차단 · 본체 없음 · 설치 거부 · 4551 차단 · 설치 성공 · 확인 창 예외 — 이어서 다시 부르면 열린다", async () => {
+    const cases: [string, Opts][] = [
+      ["거절", { sac: "off", ok: false }],
+      ["데몬 작업 차단", { blocked: true }],
+      ["설치할 본체 없음", { noBin: true }],
+      ["설치 거부", { sac: "off", installRejects: true }],
+      ["4551 차단", { sac: "on", installError: "installer_launch_failed:4551:5" }],
+      ["설치 성공", { sac: "off" }],
+    ];
+    for (const [label, o] of cases) {
+      const h = makePrompt(o);
+      await h.fn();
+      expect({ label, 표식: h.deps.promptBinaryPatchBusy }).toEqual({ label, 표식: false });
+    }
+    // 확인 창이 던져도(예외) 표식은 내려가고 예외는 삼키지 않는다 — 다시 불러도 열린다(표식이 남아 있지 않다)
+    const t = makePrompt({ sac: "off", modalThrows: true });
+    const thrown = async (): Promise<string> => {
+      try {
+        await t.fn();
+        return "(던지지 않았다)";
+      } catch (e) {
+        return String((e as Error).message);
+      }
+    };
+    expect(await thrown()).toBe("modal boom");
+    expect(t.deps.promptBinaryPatchBusy).toBe(false);
+    expect(await thrown()).toBe("modal boom");
+    expect(t.modal.length).toBe(2);
+  });
+
   // ── ★WU: 설치 파일 실행이 막혔을 때(백엔드 오류 `installer_launch_failed:<코드>:<반환값>`) ──
 
   it("★4551 차단: 진행 토스트를 내리고 · 종전 토스트 대신 J2 와 같은 자리의 지속 알림(사람 말 문구 · 현재·새 버전 치환)을 낸다", async () => {
@@ -773,7 +1019,7 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     expect(body.includes("지금 버전(0.14.42)")).toBe(true); // 현재 버전 = updAppVersion
     expect(body.includes("닫히지 않았습니다")).toBe(true);
     // 설치 요청은 한 번만 갔고(재시도 없음) 앱 종료를 흉내 내는 호출도 없다
-    expect(r.invokes.map((i) => i[0])).toEqual(["smart_app_control", "install_update"]);
+    expect(cmds(r)).toEqual(["smart_app_control", "update_checked_launch_enabled", "install_update"]);
   });
 
   it("★다른 코드도 사람 말 지속 알림(5 · 2 · 225 · 1223 · 그 밖) — 종전 토스트는 없다", async () => {
@@ -807,16 +1053,16 @@ const LF = (code: number | string, ret: number | string = 5): string => `install
 /** 모든 실패 문구가 나눠 갖는 문장(티켓: 업데이트는 설치되지 않았고 지금 버전이 그대로 실행 중). */
 const KEPT = (cur: string): string => `업데이트는 설치되지 않았고 지금 버전(${cur})이 그대로 실행 중입니다. 앱은 닫히지 않았습니다.`;
 /**
- * 4551 문구 — 티켓 문안 + WU 보충 지시의 한 문장(앱을 닫으면 다시 열 때도 막힐 수 있다 — 넷째 줄). 마지막 줄의 '끄면'은 기존 J2 낱말 핀(문자열 리터럴에
+ * 4551 문구 — 티켓 문안 + WU 보충 지시의 한 문장(앱을 닫으면 다시 열 때도 막힐 수 있다 — 넷째 줄). ★R1F-UA 가 셋째 줄(조건문)과 마지막 줄(다시 켜지 못할 수 있다)을 바꿨다 — 첫 줄·공통 문장·넷째 줄은 그대로. 마지막 줄의 '끄면'은 기존 J2 낱말 핀(문자열 리터럴에
  * 끄다 계열 낱말 0)과 충돌해 같은 뜻의 다른 낱말로 적었다(WORKLOG 기록).
  */
 const L4551 = (cur: string, tgt: string): string[] => [
   `Windows 의 앱 제어 정책(스마트 앱 컨트롤 등)이 새 버전(${tgt}) 설치 파일의 실행을 막았습니다(오류 4551).`,
   KEPT(cur),
-  "이 설치 파일에는 코드 서명이 없습니다. 스마트 앱 컨트롤이 켜진 PC 에서는 서명 없는 프로그램이 실행되지 않습니다.",
+  "스마트 앱 컨트롤이 켜진 PC 에서는 Windows 가 신뢰하는 코드 서명이나 평판이 없는 프로그램이 실행되지 않습니다.",
   "스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요.",
   "확인하는 곳: Windows 보안 → 앱 및 브라우저 컨트롤 → 스마트 앱 컨트롤. " +
-    "스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택입니다(최근 Windows 는 다시 켤 수 있습니다).",
+    "스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택이며, Windows 업데이트 상태에 따라 다시 켜지 못할 수 있습니다.",
 ];
 
 describe("installerLaunchFailure — 4551(앱 제어 정책 차단)", () => {
@@ -849,9 +1095,35 @@ describe("installerLaunchFailure — 4551(앱 제어 정책 차단)", () => {
 
   it("★보충 문장은 앱을 닫는 것에 대한 사실+당부이고 위치는 '코드 서명' 설명 줄 바로 뒤 · '확인하는 곳' 앞이다", () => {
     const lines = (installerLaunchFailure(LF(4551), "0.14.42", "0.14.43")?.body ?? "").split("\n");
-    expect(lines[2].startsWith("이 설치 파일에는 코드 서명이 없습니다.")).toBe(true);
+    expect(lines[2].startsWith("스마트 앱 컨트롤이 켜진 PC 에서는 Windows 가 신뢰하는 코드 서명이나 평판이 없는")).toBe(true);
     expect(lines[3]).toBe("스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요.");
     expect(lines[4].startsWith("확인하는 곳:")).toBe(true);
+  });
+});
+
+describe("★R1F-UA installerLaunchFailure 4551 — 셋째 줄(조건문 · 단정 없음)과 마지막 줄(다시 켜지 못할 수 있다) · 나머지 줄은 그대로", () => {
+  const lines = (installerLaunchFailure(LF(4551), "0.14.42", "0.14.43")?.body ?? "").split("\n");
+
+  it("셋째 줄 = 티켓 문안 그대로 — 서명이 없다는 단정이 아니라 '신뢰하는 서명이나 평판이 없는' 프로그램에 대한 일반 사실", () => {
+    expect(lines.length).toBe(5);
+    expect(lines[2]).toBe("스마트 앱 컨트롤이 켜진 PC 에서는 Windows 가 신뢰하는 코드 서명이나 평판이 없는 프로그램이 실행되지 않습니다.");
+    expect(lines[2].includes("이 설치 파일에는 코드 서명이 없습니다")).toBe(false);
+  });
+
+  it("마지막 줄 = 티켓 문안 그대로 — 확인하는 곳 · 선택의 결과(보호 수준을 낮춘다) · Windows 업데이트 상태에 따라 다시 켜지 못할 수 있다 · 근거 없는 '최근 Windows 는 다시 켤 수 있습니다' 는 없다", () => {
+    expect(lines[4]).toBe(
+      "확인하는 곳: Windows 보안 → 앱 및 브라우저 컨트롤 → 스마트 앱 컨트롤. " +
+        "스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택이며, Windows 업데이트 상태에 따라 다시 켜지 못할 수 있습니다.",
+    );
+    expect(lines[4].includes("최근 Windows")).toBe(false);
+    expect(lines[4].includes("다시 켤 수 있습니다")).toBe(false);
+    expect(hasDisableWord(lines.join("\n"))).toEqual([]);
+  });
+
+  it("나머지 줄(첫 줄 · kept · 앱을 닫지 말라는 줄)은 종전 그대로", () => {
+    expect(lines[0]).toBe("Windows 의 앱 제어 정책(스마트 앱 컨트롤 등)이 새 버전(0.14.43) 설치 파일의 실행을 막았습니다(오류 4551).");
+    expect(lines[1]).toBe(KEPT("0.14.42"));
+    expect(lines[3]).toBe("스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요.");
   });
 });
 
@@ -1050,5 +1322,83 @@ describe("main.ts 배선(WU) — promptBinaryPatch 의 catch 한 곳", () => {
   it("자동 테스트 경로(install_update 호출 둘째 곳)는 건드리지 않았다 — 종전 catch 그대로", () => {
     expect(count(code, 'invoke("install_update"')).toBe(2);
     expect(code.includes('toast("health", "자동 테스트 패치 실패", String(e));')).toBe(true);
+  });
+});
+
+// ── ★R1F-UA(성찰 1회차) — 문구의 정직성: 재지 않은 단정은 조건문으로, 옛 단정은 어느 화면에도 없다 ─────────────────────────────────
+
+describe("★R1F-UA 문구의 정직성 — 옛 단정의 부재 · 조건문 · 설치기 실패 기록 파일의 근거(S3 major 1·2 · minor 3·5 · S5 M2)", () => {
+  /** 실측(W11/FINDINGS)과 어긋나거나 다음 버전의 서명 상태를 단정하던 옛 문구 조각 — 어느 화면 문구에도 있으면 안 된다. */
+  const OLD_CLAIMS = [
+    "서명 없는 프로그램이 실행되지 않습니다", // 4551 셋째 줄(서명 없는 7-Zip 은 평판으로 허용됐다)
+    "이 설치 파일에는 코드 서명이 없습니다", // 4551 — 다음 버전의 서명 상태를 빌드 시점에 단정
+    "최근 Windows 는 다시 켤 수 있습니다", // 4551 — 근거가 증거 폴더에 없다(2026-04 이전 빌드는 초기화·재설치가 필요)
+    "지금 cys 설치 파일에는 코드 서명이 없어", // 설치 전 안내 — 다음 버전의 서명 상태를 단정
+    "서명 없는 설치 파일", // 재시작 뒤 알림의 두 줄·설치 전 안내의 일반화
+    "아래에 풀립니다", // 받은 설치 파일은 저장될 뿐 풀리지 않는다
+  ];
+  /** 이 모듈이 화면에 올릴 수 있는 모든 문구(설치 전 안내 2판 · 재시작 뒤 알림 전 조합 · 설치 파일 실행 실패 전 코드). */
+  const surfaces = (): string[] => {
+    const out: string[] = [sacPreflightText("on") ?? "", sacPreflightText("on", false) ?? ""];
+    for (const sac of ["on", "off", "eval", null, undefined]) {
+      for (const os of ["windows", "macos", "linux", undefined]) {
+        const n = updateFailedNotice({ from: "0.14.42", to: "0.14.43", os, sac });
+        out.push(n.title, n.body);
+      }
+    }
+    for (const code of [4551, 5, 2, 3, 225, 1223, 1155, 0]) {
+      const r = installerLaunchFailure(LF(code), "0.14.42", "0.14.43");
+      out.push(r?.title ?? "", r?.body ?? "");
+    }
+    return out;
+  };
+
+  it("옛 단정이 어느 화면 문구에도 없다(설치 전 안내 2판 · 재시작 뒤 알림 · 설치 파일 실행 실패 전 코드)", () => {
+    const all = surfaces();
+    expect(all.length).toBeGreaterThan(40); // 공허 방지 — 문구를 실제로 모았다
+    for (const w of OLD_CLAIMS) {
+      expect({ 옛단정: w, 있는_문구: all.filter((t) => t.includes(w)).length }).toEqual({ 옛단정: w, 있는_문구: 0 });
+    }
+  });
+
+  it("옛 단정은 모듈 소스의 문자열 리터럴에도 없다(문구 사본이 따로 생기지 않게) · promptBinaryPatch 본문 리터럴에도 없다", () => {
+    const raw = read("./updatenotice.ts").replace(/\/\*[\s\S]*?\*\//g, "");
+    const literals = (raw.match(/"(?:[^"\\\n]|\\.)*"|`(?:[^`\\]|\\.)*`/g) ?? []).join("\n");
+    const prompt = fnBodyOf("promptBinaryPatch");
+    for (const w of OLD_CLAIMS) {
+      expect({ 옛단정: w, 모듈: literals.includes(w) }).toEqual({ 옛단정: w, 모듈: false });
+      expect({ 옛단정: w, 본문: prompt.includes(w) }).toEqual({ 옛단정: w, 본문: false });
+    }
+  });
+
+  it("조건문: 설치 전 안내는 두 판 모두 \"…없으면\" 으로 말하고, 서명이 없다는 단정은 \"0.14.43 까지의\" 설치 파일에 한정한다(새 설치 파일의 서명 여부는 받기 전에 알 수 없다)", () => {
+    for (const t of [sacPreflightText("on") ?? "", sacPreflightText("on", false) ?? ""]) {
+      expect(t.includes("Windows 가 신뢰하는 코드 서명이나 평판이 없으면 Windows 가 실행을 막습니다")).toBe(true);
+      expect(count(t, "코드 서명이 없습니다")).toBe(1); // 서명이 없다는 문장은 한 곳뿐 — 그리고
+      expect(t.includes("(0.14.43 까지의 cys 설치 파일에는 코드 서명이 없습니다)")).toBe(true); // 그것은 지난 설치 파일에 한정한다
+    }
+    // 4551·재시작 뒤 알림의 켜짐 줄도 '신뢰하는 서명이나 평판이 없는' 파일에 대한 일반 사실이다
+    expect((installerLaunchFailure(LF(4551), "a", "b")?.body ?? "").includes("Windows 가 신뢰하는 코드 서명이나 평판이 없는 프로그램")).toBe(true);
+    expect(updateFailedNotice({ from: "a", to: "b", os: "windows", sac: "on" }).body.includes("Windows 가 신뢰하는 코드 서명이나 평판이 없는 설치 파일")).toBe(true);
+  });
+
+  it("재시작 뒤 알림(윈도우): 첫 원인은 '설치가 끝나지 않았거나 받는 중에 앱이 닫힘'이고 실행 차단은 '수도 있다' · 설치 파일은 '저장된다'(풀리지 않는다)", () => {
+    const body = updateFailedNotice({ from: "0.14.42", to: "0.14.43", os: "windows", sac: null }).body;
+    const para = body.split("\n")[1];
+    expect(para.startsWith("설치가 끝나지 않았거나 받는 중에 앱이 닫혔을 수 있습니다. Windows 가 설치 파일의 실행을 막았을 수도 있습니다(스마트 앱 컨트롤 · Defender). ")).toBe(true);
+    expect(para.endsWith("받은 설치 파일은 임시 폴더의 cys-0.14.43-updater-… 아래에 저장됩니다.")).toBe(true);
+    // 켜짐 줄만 바뀌었고 평가 모드(eval) 줄은 그대로다
+    expect(updateFailedNotice({ from: "a", to: "b", os: "windows", sac: "eval" }).body.endsWith("이 PC 의 스마트 앱 컨트롤: 평가 모드(차단하지 않음) — 다른 원인(Defender 등)을 확인해 주세요.")).toBe(true);
+  });
+
+  it("★설치기 실패 기록 파일: 알림이 가리키는 이름·위치(설치 폴더)가 설치기 훅이 실제로 쓰는 경로와 같다(src-tauri/nsis-hooks.nsh)", () => {
+    const nsh = read("../../src-tauri/nsis-hooks.nsh");
+    // 훅이 쓰는 경로: `$INSTDIR\cys-install-failure.txt`(cys_post_fail — 실행 파일 교체·검증이 실패했을 때) · 성공하면 지운다
+    expect(nsh.includes('FileOpen $4 "$INSTDIR\\cys-install-failure.txt" w')).toBe(true);
+    expect(nsh.includes('Delete "$INSTDIR\\cys-install-failure.txt"')).toBe(true);
+    const para = updateFailedNotice({ from: "0.14.42", to: "0.14.43", os: "windows" }).body.split("\n")[1];
+    expect(para.includes("설치 폴더(보통 %LOCALAPPDATA%\\cys)의 cys-install-failure.txt(설치기의 실행 파일 교체·검증이 실패하면 이 파일이 남습니다)")).toBe(true);
+    // 이름이 한 곳에서만 바뀌면(훅 또는 알림) 이 검체가 붉어진다 — 알림의 파일 이름은 훅의 이름과 같은 한 토큰이다
+    expect(para.match(/cys-install-failure\.txt/g)?.length).toBe(1);
   });
 });
