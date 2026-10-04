@@ -2,8 +2,9 @@
 # See diag/README.md. Measurement steps never turn the job red (their result IS the data);
 # only a failing publish step stays red. Results go to branch diag-results/<run>-<attempt>-<job>-<os>.
 # Commit message tags choose the jobs: [product-only] -> only product-launch, [sacreal-only] -> only sacreal-e2e,
-# [appe2e-only] -> only app-e2e (+ its tiny gate job), no tag -> all jobs (app-e2e only when diag/appe2e-input.json has a run id above 0).
-# e2e and sacrules run only when none of the three tags is present.
+# [appe2e-only] -> only app-e2e (+ its tiny gate job), [cysdwin-only] -> only cysd-win (the cysd unit specimens on windows-latest), no tag -> all jobs
+# except cysd-win (it runs only with its tag; app-e2e only when diag/appe2e-input.json has a run id above 0). Two tags -> those two.
+# e2e and sacrules run only when none of the four tags is present.
 name: diag-win11-update
 
 on:
@@ -20,7 +21,7 @@ concurrency:
 jobs:
   e2e:
     name: 'e2e (${{ matrix.os }})'
-    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 55
     strategy:
@@ -157,7 +158,7 @@ jobs:
 
   sacrules:
     name: 'sacrules (${{ matrix.os }})'
-    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]') }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -329,7 +330,7 @@ jobs:
   # message runs ONLY this job; it is skipped by [product-only] or [appe2e-only] alone (and runs when [sacreal-only] is present).
   sacreal-e2e:
     name: 'sacreal-e2e (windows-11-arm)'
-    if: ${{ contains(github.event.head_commit.message, '[sacreal-only]') || (!contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]')) }}
+    if: ${{ contains(github.event.head_commit.message, '[sacreal-only]') || (!contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
     runs-on: windows-11-arm
     timeout-minutes: 50
     env:
@@ -464,7 +465,7 @@ jobs:
   # [sacreal-only] or [appe2e-only] alone (and runs when [product-only] is present).
   product-launch:
     name: 'product-launch (windows-11-arm)'
-    if: ${{ contains(github.event.head_commit.message, '[product-only]') || (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[appe2e-only]')) }}
+    if: ${{ contains(github.event.head_commit.message, '[product-only]') || (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
     runs-on: windows-11-arm
     timeout-minutes: 30
     env:
@@ -598,7 +599,7 @@ jobs:
   # right before pushing; 0 = no input). A tiny ubuntu job so that no Windows runner is allocated for app-e2e without an input.
   appe2e-gate:
     name: 'appe2e-gate'
-    if: ${{ contains(github.event.head_commit.message, '[appe2e-only]') || (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]')) }}
+    if: ${{ contains(github.event.head_commit.message, '[appe2e-only]') || (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -638,7 +639,7 @@ jobs:
   app-e2e:
     name: 'app-e2e (windows-11-arm)'
     needs: appe2e-gate
-    if: ${{ contains(github.event.head_commit.message, '[appe2e-only]') || (needs.appe2e-gate.outputs.go == 'true' && !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]')) }}
+    if: ${{ contains(github.event.head_commit.message, '[appe2e-only]') || (needs.appe2e-gate.outputs.go == 'true' && !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
     runs-on: windows-11-arm
     timeout-minutes: 65
     # download-artifact reads the artifacts of ANOTHER workflow run: needs actions: read (a job level block replaces the workflow one)
@@ -784,6 +785,263 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: diag-app-e2e-windows-11-arm
+          path: ${{ runner.temp }}\diag-out
+          if-no-files-found: warn
+          retention-days: 14
+
+  # The cysd unit specimens of the PRODUCT on a REAL Windows, with their FULL failure text (diag/cysdwin-digest.py). windows-health.yml of
+  # the product runs `cargo test --bin cysd` as a non-blocking step, but its log cannot be read anonymously (annotations show a cut list
+  # only). This job runs the SAME command in the SAME environment - runner windows-latest (x64, the label of windows-health.yml), bash,
+  # PYTHONUTF8=1, Python 3.12 (setup-python), dtolnay/rust-toolchain@stable, CYS_PACK_DIR=$(mktemp -d), --test-threads=1 --nocapture and
+  # the skip list of the input file - keeps the whole log, cuts it into one file per failure + a digest + a summary, and publishes
+  # them to a results branch. Input: diag/cysdwin-input.json {"ref": <product commit SHA of THIS repository>, "filter": "", "skip": [...]};
+  # the product is checked out into the separate folder p/ (a short name on purpose: the Windows path stays close to the one
+  # windows-health builds in). [cysdwin-only] in the commit message runs ONLY this job; the other tags alone never run it, and without
+  # a tag it does not run at all (unlike the other jobs it has no default run). The cargo step may take 45 minutes (build included).
+  cysd-win:
+    name: 'cysd-win (windows-latest)'
+    if: ${{ contains(github.event.head_commit.message, '[cysdwin-only]') }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      # the job env of windows-health: UTF-8 mode for every python step
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Reads and checks diag/cysdwin-input.json. Never fails: a problem becomes go=false plus a reason that the digest step writes into
+      # the summary. The values travel as step outputs and reach later scripts only through env: (never pasted into a script text).
+      - name: read-input
+        id: input
+        shell: powershell
+        timeout-minutes: 3
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $go = 'false'
+          $why = ''
+          $ref = ''
+          $filter = ''
+          $skips = ''
+          try {
+            $path = Join-Path $env:GITHUB_WORKSPACE 'diag\cysdwin-input.json'
+            $j = ConvertFrom-Json ([System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8))
+            $ref = ([string]$j.ref).Trim()
+            $filter = ([string]$j.filter).Trim()
+            $sk = New-Object System.Collections.Generic.List[string]
+            foreach ($s in @($j.skip)) {
+              $t = ([string]$s).Trim()
+              if ($t) { $sk.Add($t) }
+            }
+            if (-not $ref) {
+              $why = 'diag/cysdwin-input.json: ref is empty (put the product commit SHA there)'
+            } elseif ($ref -notmatch '^[0-9A-Za-z][0-9A-Za-z._/-]{0,199}$') {
+              $why = 'diag/cysdwin-input.json: ref has characters that are not allowed'
+            } elseif ($filter -notmatch '^[A-Za-z0-9_:]*$') {
+              $why = 'diag/cysdwin-input.json: filter has characters that are not allowed (letters, digits, _ and : only)'
+            } else {
+              $bad = @($sk.ToArray() | Where-Object { $_ -notmatch '^[A-Za-z0-9_:]+$' })
+              if ($bad.Count -gt 0) {
+                $why = 'diag/cysdwin-input.json: skip names with characters that are not allowed: ' + ($bad -join ', ')
+              } else {
+                $go = 'true'
+                $skips = ($sk.ToArray() -join ' ')
+              }
+            }
+          } catch {
+            $why = 'diag/cysdwin-input.json could not be read: ' + $_.Exception.Message
+          }
+          $why = ($why -replace '[\r\n]+', ' ')
+          $enc = New-Object System.Text.UTF8Encoding($false)
+          $text = 'go=' + $go + "`n" + 'ref=' + $ref + "`n" + 'filter=' + $filter + "`n" + 'skips=' + $skips + "`n" + 'why=' + $why + "`n"
+          [System.IO.File]::AppendAllText($env:GITHUB_OUTPUT, $text, $enc)
+          Write-Host ('cysd-win input: go={0} ref={1} filter=[{2}] skips=[{3}] why=[{4}]' -f $go, $ref, $filter, $skips, $why)
+          exit 0
+
+      # the product commit, in its own folder (fetch-depth 0 as in windows-health; no credentials are left in the checkout)
+      - name: checkout-product
+        id: pco
+        if: ${{ steps.input.outputs.go == 'true' }}
+        uses: actions/checkout@v4
+        timeout-minutes: 15
+        with:
+          ref: ${{ steps.input.outputs.ref }}
+          path: p
+          fetch-depth: 0
+          persist-credentials: false
+
+      # no go-condition on purpose: the digest step needs this python even when the product checkout failed or the input was bad
+      - name: Setup Python 3.12
+        if: ${{ always() }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Rust toolchain (as windows-health)
+        if: ${{ steps.input.outputs.go == 'true' }}
+        uses: dtolnay/rust-toolchain@stable
+
+      # facts that explain a different result later (image version, toolchain, paths); written to the results folder
+      - name: environment facts
+        if: ${{ steps.input.outputs.go == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set +e
+          OUT="${RUNNER_TEMP}/diag-out"
+          mkdir -p "$OUT"
+          {
+            echo "== runner =="
+            echo "ImageOS=${ImageOS:-?} ImageVersion=${ImageVersion:-?} RUNNER_OS=${RUNNER_OS:-?} RUNNER_ARCH=${RUNNER_ARCH:-?} RUNNER_NAME=${RUNNER_NAME:-?}"
+            echo "== versions =="
+            rustc -Vv 2>&1
+            cargo -V 2>&1
+            rustup show 2>&1 | head -20
+            python --version 2>&1
+            bash --version 2>&1 | head -1
+            git --version 2>&1
+            node --version 2>&1
+            echo "== product checkout =="
+            git -C p log -1 --format='%H %s' 2>&1
+            echo "== variables (selected) =="
+            for v in HOME USERPROFILE APPDATA LOCALAPPDATA TEMP TMP RUNNER_TEMP GITHUB_WORKSPACE PYTHONUTF8 OSTYPE MSYSTEM CARGO_HOME RUSTUP_HOME; do echo "$v=${!v:-<unset>}"; done
+            echo "== PATH (bash view, first 25) =="
+            echo "$PATH" | tr ':' '\n' | head -25
+            echo "== uname / ver =="
+            uname -a
+            cmd //c ver
+          } > "$OUT/cysdwin-env.txt" 2>&1
+          exit 0
+
+      # the cysd step of windows-health.yml, with the log kept whole: -e off, rc caught from PIPESTATUS, the log streamed through tee,
+      # CYS_PACK_DIR=$(mktemp -d), --test-threads=1 --nocapture, the skip list from the input file. continue-on-error: a failing or cut
+      # run still goes on to the digest. The 45 minutes cover build and run.
+      - name: cargo test --bin cysd (as windows-health, full log kept)
+        id: cysd
+        if: ${{ steps.input.outputs.go == 'true' }}
+        continue-on-error: true
+        timeout-minutes: 45
+        shell: bash
+        working-directory: p
+        env:
+          CYSD_FILTER: ${{ steps.input.outputs.filter }}
+          CYSD_SKIPS: ${{ steps.input.outputs.skips }}
+        run: |
+          set +e
+          set -uo pipefail
+          CYSD_DIR="${RUNNER_TEMP:-/tmp}/cysd-win"
+          rm -rf "$CYSD_DIR"
+          mkdir -p "$CYSD_DIR"
+          date +%s > "$CYSD_DIR/start"
+          LOG="$CYSD_DIR/cargo.log"
+          args=(--test-threads=1 --nocapture)
+          for s in $CYSD_SKIPS; do args+=(--skip "$s"); done
+          flt=()
+          if [ -n "${CYSD_FILTER:-}" ]; then flt=("$CYSD_FILTER"); fi
+          cmdline="cargo test --bin cysd --"
+          if [ -n "${CYSD_FILTER:-}" ]; then cmdline="$cmdline $CYSD_FILTER"; fi
+          echo "$cmdline ${args[*]}" > "$CYSD_DIR/cmd.txt"
+          cat "$CYSD_DIR/cmd.txt"
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- ${flt[@]+"${flt[@]}"} "${args[@]}" 2>&1 | tee "$LOG"
+          rc="${PIPESTATUS[0]}"
+          date +%s > "$CYSD_DIR/end"
+          echo "$rc" > "$CYSD_DIR/rc"
+          exit "$rc"
+
+      # publish-results.mjs needs a current Node (global fetch, AbortSignal.timeout): set up AFTER the cargo step so that the test
+      # environment is the one of windows-health
+      - uses: actions/setup-node@v4
+        if: ${{ always() }}
+        continue-on-error: true
+        with:
+          node-version: '22'
+
+      # failure files + digest + summary + the whole log (cut when it is too big for the publisher): diag/cysdwin-digest.py never fails
+      - name: digest
+        if: ${{ always() }}
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        env:
+          CYSD_REF: ${{ steps.input.outputs.ref }}
+          CYSD_FILTER: ${{ steps.input.outputs.filter }}
+          CYSD_SKIPS: ${{ steps.input.outputs.skips }}
+          CYSD_WHY: ${{ steps.input.outputs.why }}
+          CYSD_O_INPUT: ${{ steps.input.outcome }}
+          CYSD_O_CHECKOUT: ${{ steps.pco.outcome }}
+          CYSD_O_CARGO: ${{ steps.cysd.outcome }}
+          # Git Bash must not rewrite slashes/colons in the arguments (the why text has both)
+          MSYS_NO_PATHCONV: '1'
+        run: |
+          set +e
+          D="${RUNNER_TEMP}/cysd-win"
+          OUT="${RUNNER_TEMP}/diag-out"
+          mkdir -p "$OUT"
+          python "$GITHUB_WORKSPACE/diag/cysdwin-digest.py" --dir "$D" --out "$OUT" --ref "$CYSD_REF" --filter "$CYSD_FILTER" --skip "$CYSD_SKIPS" --why "$CYSD_WHY" --outcome "read-input=$CYSD_O_INPUT" --outcome "checkout-product=$CYSD_O_CHECKOUT" --outcome "cargo=$CYSD_O_CARGO" --annotate
+          echo "digest exit code: $?"
+          # python missing or dead: at least the raw log goes to the results folder (cut by hand when it is bigger than the publisher takes)
+          if [ ! -f "$OUT/cysdwin-cargo.log" ] && [ -f "$D/cargo.log" ]; then
+            sz="$(wc -c < "$D/cargo.log")"
+            if [ "$sz" -le 40000000 ]; then
+              cp "$D/cargo.log" "$OUT/cysdwin-cargo.log"
+            else
+              { head -c 15000000 "$D/cargo.log"; printf '\n[... CUT by the workflow fallback: log has %s bytes ...]\n' "$sz"; tail -c 15000000 "$D/cargo.log"; } > "$OUT/cysdwin-cargo.log"
+            fi
+          fi
+          exit 0
+
+      - name: list-out
+        if: ${{ always() }}
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $d = Join-Path $env:RUNNER_TEMP 'diag-out'
+          if (Test-Path -LiteralPath $d) {
+            Get-ChildItem -LiteralPath $d -Recurse -File | ForEach-Object { '{0,12}  {1}' -f $_.Length, $_.FullName.Substring($d.Length + 1) }
+          } else {
+            Write-Host "no diag-out folder"
+          }
+          exit 0
+
+      # same call form as the other jobs. continue-on-error: the one thing that can fail here is the raw log (up to 40 MB, sent as one
+      # base64 blob; the publisher gives each request 60 s and throws away the whole publish when one blob does not go through) -
+      # the next step then publishes everything else
+      - name: publish-results
+        id: pub
+        if: ${{ always() }}
+        continue-on-error: true
+        shell: cmd
+        timeout-minutes: 8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node diag\publish-results.mjs --job cysd-win --os windows-latest --out "%RUNNER_TEMP%\diag-out"
+
+      # only when the publish above failed: a copy of the results folder WITHOUT the raw log goes to the same branch (the raw log stays in
+      # the artifact of this run). This step has no continue-on-error: if it fails too, the job is red.
+      - name: publish-results (again, without the raw log)
+        if: ${{ always() && steps.pub.outcome == 'failure' }}
+        shell: bash
+        timeout-minutes: 8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          LITE="${RUNNER_TEMP}/diag-out-lite"
+          rm -rf "$LITE"
+          mkdir -p "$LITE"
+          cp -R "${RUNNER_TEMP}/diag-out/." "$LITE/"
+          rm -f "$LITE/cysdwin-cargo.log"
+          printf '%s\n' 'The first publish of this job failed (most likely because of the raw log cysdwin-cargo.log, which can be 40 MB).' 'The raw log is NOT in this branch; it is in the artifact diag-cysd-win-windows-latest of the same run. The cysdwin-summary.txt text about the raw log describes the file as it was written, not this branch.' > "$LITE/cysdwin-RAWLOG-NOT-PUBLISHED.txt"
+          node diag/publish-results.mjs --job cysd-win --os windows-latest --out "$LITE"
+
+      - name: upload-artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-cysd-win-windows-latest
           path: ${{ runner.temp }}\diag-out
           if-no-files-found: warn
           retention-days: 14

@@ -1,0 +1,8 @@
+{
+  "ref": "bd0a0ca3e1d7634057b6ca4c6160953b36f1a3d3",
+  "filter": "",
+  "skip": [
+    "hwmon::tests::snapshot_has_all_sections",
+    "attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery"
+  ]
+}
