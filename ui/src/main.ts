@@ -10105,7 +10105,7 @@ async function launchDept(catalogKey: string | undefined, ctx: TeamCreateCtx, di
 // 팀이 2개 생긴다 — clipath.test.ts '재진입 차단이 첫 await 앞' 과 같은 계열이다.
 let teamFlowBusy = false;
 
-/** 팀 만들기가 이미 진행 중일 때의 안내 1줄(리뷰1 M4) — 생성이 도는 약 12초 동안 팔레트로 다시 누르면 버튼 라벨
+/** 팀 만들기가 이미 진행 중일 때의 안내 1줄(리뷰1 M4) — 생성이 도는 동안(대기 문구로는 보통 30초 안팎 · 윈도우 11 러너 실측 약 44초) 팔레트로 다시 누르면 버튼 라벨
  *  ('만드는 중…')이 안 보이는 곳이라 아무 반응이 없었다. 결과 "busy" 를 받는 호출측(U16 카드 등)은 따로 알릴 필요 없다. */
 function notifyTeamFlowBusy(): void {
   toast(
