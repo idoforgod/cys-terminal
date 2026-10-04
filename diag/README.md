@@ -13,12 +13,13 @@
 | QE | 진짜 SAC 를 레지스트리 + `CiTool -r` 로 켤 수 있는가 (값 1·2 를 모두 시험 — 값의 뜻이 자료마다 달라 `citool` 정책명·`SmartAppControlState` 로 판정) | `sac-real.json` |
 | QF | `ShellExecuteW` 직후 `exit(0)` 가 설치기 기동을 놓치는가 (40회 반복) | `replica.json` · `replica-summary.txt` |
 | QG (2차) | **진짜 SAC 를 켠 채로** 전체 재현: 켠 뒤 설치기·앱 exe·설치된 exe 가 무엇이 막히는가, 이미 떠 있던 앱의 `install_update` 는 어떻게 되는가(A), 설치된 앱을 새로 띄우면(B) | `sacreal-summary.txt`(10줄) · `sacreal-matrix.txt`(+`.json`) · `sacreal-e2e-A-verdict.json` · `sacreal-e2e-B.json` |
+| QI (4차) | **0.14.43 앱 전체**를 윈도우에서 **진짜 Update 버튼 클릭**으로 갱신: 꺼짐(성공 경로: 내려받기 → 설치 파일 기동 → 앱 종료 → 설치 → 재실행) · 진짜 SAC 켬(차단 경로: 앱이 살아 있고 화면에 「설치 파일 실행이 차단되었습니다」 알림 · 임시 폴더·시도 기록 정리) | `appe2e-summary.txt`(10줄) · `appe2e-off-verdict.json` · `appe2e-on-verdict.json` · `appe2e-*-ui-*.png`(앱 화면) · `appe2e-*-cdp.json` |
 | QH (3차) | **제품 코드의 설치 파일 실행 모듈(`src/update_launch.rs`)을 진짜 SAC 에서 그대로** 시험: 켜기 전 성공 경로(서명된 cmd.exe 사본) · 켠 뒤 진짜 0.14.42 설치기는 `Err 4551 / shell_ret 5 / AppControl` · `remove_installer` 정리 · 서명된 대조는 통과 | `product-launch-summary.txt`(10줄) · `product-launch-x64.jsonl`(본 판정) · `product-launch-aarch64.jsonl`(보조) · `product-launch-verdict.json` · `product-3077.json` |
 
 ## 구성
 
 - `.github/workflows/diag-win11-update.yml` — 잡 `e2e`(win11-arm · 2025 · 2022), 잡 `sacrules`(win11-arm · 2025), 잡 `sacreal-e2e`(win11-arm, 2차), 잡 `product-launch`(win11-arm, 3차). `diag/**` 브랜치 푸시로 돈다.
-  **커밋 메시지 태그로 잡을 고른다**: `[product-only]` → `product-launch` 만 · `[sacreal-only]` → `sacreal-e2e` 만 · 태그 없음 → 전부 · 두 태그 → 그 둘. `e2e`·`sacrules` 는 두 태그가 모두 없을 때만 돈다(`if:` 조건).
+  **커밋 메시지 태그로 잡을 고른다**: `[product-only]` → `product-launch` 만 · `[sacreal-only]` → `sacreal-e2e` 만 · `[appe2e-only]` → `app-e2e`(와 그 문지기 잡)만 · 태그 없음 → 전부(단 `app-e2e` 는 `diag/appe2e-input.json` 의 런 번호가 0 이면 건너뜀) · 태그 둘 → 그 둘. `e2e`·`sacrules` 는 세 태그가 모두 없을 때만 돈다(`if:` 조건). 4차에서 잡 `appe2e-gate`(ubuntu · 입력 파일만 읽음)와 `app-e2e`(win11-arm)가 늘었다.
 - `diag/lib.ps1` 공통(+ 2차에서 `sacrules.ps1` 에서 글자 그대로 옮긴 매트릭스·이벤트 도우미 10개) · `p0-facts.ps1` 환경 사실 · `p1-assets.ps1` 내려받기·추출·대조군 ·
   `e2e-update.ps1` + `cdp-update.mjs` QA · `replica.ps1` + `replica/*.rs` QF · `sacrules.ps1` QB·QC·QD · `sac-real.ps1` QE ·
   `sacreal-e2e.ps1` QG · `sac-lib.ps1`(sacreal-e2e 에서 글자 그대로 옮긴 진짜 SAC 켜기·복구·체크포인트·이벤트 도우미 — 3차가 같이 쓴다) ·
@@ -74,3 +75,21 @@ SAC 를 켠 뒤에는 서명된 `node.exe` 와 시스템 도구만 새로 실행
 - **판정(PASS)** = x64 드라이버(없으면 aarch64 만 · 근거 표시)의 ① OFF 성공 경로 Ok ② ON 차단이 정확히 `Err 4551 / 5 / AppControl` ③ 정리 완료 ④ 서명 대조 Ok ⑤ ON 단계 끝까지 도달, 그리고 SAC 켜짐 확인. 하나라도 어긋나면 FAIL + 이유. 5초 넘은 호출 · 경로가 플러그인 꼴이 아님 · 즉시는 안 지워졌지만 3초 안에 사라짐 · 복구 미확인은 판정을 바꾸지 않는 NOTE.
 - 결과 읽는 순서: `product-launch-summary.txt` → `product-launch-x64.jsonl`(호출마다 한 줄 · SAC 켜기 전 체크포인트 때의 OFF 단계 기록은 `product-launch-<arch>-off.jsonl`) → `product-launch-verdict.json` → `product-state-*.json`(3상태) → `product-3077.json`(이벤트 원본) → `ensure-sac-restored.txt`.
 - 로컬 확인(맥): `rustc --edition 2021 --test diag/product/main.rs` — 드라이버 시험 14개 + 제품 모듈 자체 시험 17개 = 31개 통과(비윈도우 갈래의 시험용 대역 사용), `--target x86_64-pc-windows-msvc --emit=metadata` 로 윈도우 갈래 타입 체크. 윈도우 실기는 러너에서 처음 돈다.
+
+## 4차: `app-e2e` (0.14.43 앱 전체를 진짜 Update 버튼으로 — 실행은 master 가 윈도우 빌드가 나온 뒤에)
+
+만들어 두기만 한 하네스다(이 커밋은 `[skip ci]` · push 안 함). 0.14.43 앱 전체를 윈도우에서 돌려 본 적이 없다 — 성공 경로(설치 파일이 뜨고 → 앱 종료 → 설치 완료)와, 막혔을 때 **앱 화면에 알림이 뜨는 것**을 잰다.
+
+- **재료**
+  - 0.14.43 설치 파일 = 제품 브랜치 `fix/0.14.43-bugreport` 를 푸시하면 제품 저장소의 `windows-build.yml` 이 만드는 아티팩트 **`cys-windows-x64-nsis`**(`target/release/bundle/nsis/*.exe`). 잡 `app-e2e` 가 `actions/download-artifact@v4`(`run-id`+`github-token` · 잡에 `actions: read`)로 그 런의 아티팩트를 받는다. 런 번호·아티팩트 이름은 **`diag/appe2e-input.json`**(`{"windows_build_run_id": <숫자>, "artifact": "<이름>"}`)에서 읽는다 — **지금은 0** 이라 태그 없는 푸시에서는 `app-e2e` 가 건너뛰어진다(`[appe2e-only]` 로 돌리면 '입력 없음'을 결과에 적고 끝).
+  - 업데이트 대상 = 앱의 시험용 환경변수 `CYS_UPDATE_MANIFEST_URL`(제품 `build_updater`)로 가리키는 매니페스트 **`diag/appe2e-manifest.json`**: `version` 0.14.99 · `platforms["windows-x86_64"]`(와 `-nsis`)의 `url` = 공개 0.14.42 설치 파일 · `signature` = 공개 `cys_0.14.42_x64-setup.exe.sig` 의 내용 그대로(공개 `latest.json` 과 글자 그대로 같음을 확인했다). 서명은 파일 바이트에 대한 것이라 버전 표기와 무관하게 통과한다 → "0.14.43 앱이 0.14.99 업데이트를 받아 실제로는 0.14.42 설치 파일을 띄운다". 재는 것은 0.14.43 의 **새 실행 경로**이지 설치 내용물이 아니다. 주소는 잡이 `https://raw.githubusercontent.com/<저장소>/<이 커밋 sha>/diag/appe2e-manifest.json` 으로 조립한다(저장소가 공개여야 한다).
+- **`diag/app-e2e.ps1`**(한 PowerShell 프로세스) 흐름
+  1. 입력 확인(설치 파일·매니페스트 주소가 열리는지·글자 그대로 이 커밋의 파일인지) → SAC 꺼짐 기준선
+  2. **OFF(성공 경로)**: 0.14.43 `/S` 설치 → 버전 표식 확인 → 앱 기동(WebView2 CDP + 매니페스트 환경변수) → `node diag/cdp-update.mjs --mode ui` 가 **Update 버튼 클릭 → 업데이트 창의 「본체 패치 설치」 클릭 → 확인 창의 「설치」 클릭**(진짜 마우스 이벤트 · 가려지면 DOM 클릭 · 어느 쪽인지 기록) → 관측: 내려받기 · 임시 설치 파일(`cys-0.14.99-updater-*\cys-0.14.99-installer.exe`) · 설치 파일 프로세스 · 앱 종료 · 버전 표식(0.14.42 가 될 것) · 앱 재실행 → `appe2e-off-verdict.json`. (0.14.42 로 내려 설치라 NSIS 가 창을 띄워 멈추면 '설치 파일 기동·앱 종료까지 확인, 설치 완료는 미완'으로 사실대로 적고 스크린샷을 남긴다.)
+  3. 0.14.43 다시 `/S` 설치 → 앱 기동 → `--mode uipre`(UI 준비 확인) → 체크포인트 → **진짜 SAC 켬**(값 1 + `CiTool -r` · 3상태 확인 · 안 켜지면 `measurable:false`) → 같은 클릭 흐름 → 기대: 설치 파일은 뜨지 않고 **앱이 살아 있고**(프로세스 + CDP 연결 60초 이상) 화면에 지속 알림 「설치 파일 실행이 차단되었습니다」(본문에 4551) · 임시 설치 폴더와 시도 기록(`~/.cys/.update-attempt.json`) 정리 → `appe2e-on-verdict.json`
+  4. `finally`: **복구 먼저**(값 0 + `CiTool -r` + 확인) → 정리 → 3077 이벤트(경로에 `-updater-` 가 든 것 · 프로세스 `cys-app.exe`) → 판정 → `appe2e-summary.txt`
+  - UI 흐름이 중간에 막히면(선택자가 달라졌거나 창이 안 뜸) 화면 요약(`appe2e-*-ui-dom-*.json`)을 저장하고 `invoke('install_update',{force:true})` 로 대체한다 — 결과에 **'버튼 클릭 아님'**(`fallback_invoke`)으로 표시되고 판정은 최대 PARTIAL 이다.
+- **판정**: PASS / PARTIAL / FAIL(이유 포함). OFF PASS = 버튼 클릭 + 설치 파일 기동 + 앱 종료 + 버전 표식 변화 + 앱 재실행. ON PASS = SAC 켜짐 확인 + 버튼 클릭 + 알림(4551) + 앱·CDP 60초 생존 + 설치 파일 미기동 + 임시 폴더·시도 기록 정리 + 버전 표식 불변.
+- **master 가 실행할 때 할 일**: ① 제품 브랜치를 푸시해 `windows-build.yml` 런이 끝나기를 기다린다 ② 그 런 번호를 `diag/appe2e-input.json` 에 적고 커밋한다(제목 끝 `[appe2e-only]`) ③ **푸시는 한 번만**(연속 푸시는 앞 런을 취소한다 — SAC 를 켠 구간이면 `ensure-sac-restored` 가 복구) ④ 결과: `diag-results/<런>-1-app-e2e-windows-11-arm` 브랜치 → `appe2e-summary.txt` 부터.
+- 결과 읽는 순서: `appe2e-summary.txt` → `appe2e-off-verdict.json` · `appe2e-on-verdict.json`(근거 필드 `facts`) → `appe2e-off-cdp.json` · `appe2e-on-cdp.json`(`ui.clicks`·`ui.states`·`ui.recorder.events` = 화면에 뜬 알림·창의 전체 문구) → `appe2e-*-ui-*.png`(앱 화면) · `appe2e-*-screen-*.png`(바탕화면) → `appe2e-*-timeline.txt`(2초 간격 프로세스·임시 폴더·표식) → `appe2e-3077.json` · `appe2e-state-*.json` · `ensure-sac-restored.txt`.
+- 로컬 확인(맥): 가짜 DevTools 서버 + 가짜 앱 페이지(작은 DOM)로 `cdp-update.mjs --mode ui|uipre` 의 흐름 전체(마우스 클릭·DOM 클릭 대체·버튼 없음 대체·앱 종료·차단 알림)를 시험했다 — 시험 도구는 저장소 밖.
