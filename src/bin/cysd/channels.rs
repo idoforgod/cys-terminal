@@ -4302,6 +4302,11 @@ mod tests {
         const HOLD_MS: u64 = 700;
         let (d, m) = h3_rig("h3-handoff");
         let ids = [h3_seed(&d, "q0", now()), h3_seed(&d, "q1", now())];
+        // ★(0.14.43 · 통합 2) 하한의 기준 시각 — 선행 쓰기를 넘기기 **직전**. writer 가 그 쓰기를 집어 자는 시각은 이보다 빠를 수
+        //   없고, 그 뒤 첫 행의 붙여넣기 + 500ms(cr_delay) + CR + [`CHANNEL_ROW_GAP_MS`] 전에는 다음 행이 나갈 수 없다.
+        //   종전엔 첫 행 인계 **뒤**(`t_hand`)를 재고 "선행 쓰기를 넘긴 뒤 정확히 50ms 뒤" 를 가정했다 — 스케줄 지연으로 그 50ms
+        //   수면이 길어지면 `t_hand` 가 늦어져 하한에 못 미쳤다(전량 실행 간헐 적색). 지금 하한은 수면 오차와 무관하다.
+        let t_send = std::time::Instant::now();
         m.write_tx
             .send(crate::state::WriteReq::DataAfter { bytes: Vec::new(), delay_ms: HOLD_MS })
             .unwrap();
@@ -4312,7 +4317,6 @@ mod tests {
         };
         let r1 = pass(&d);
         assert_eq!(r1.delivered, vec![ids[0]], "전제: 첫 행 인계");
-        let t_hand = std::time::Instant::now();
         assert!(
             !m.inject_track.busy_within(std::time::Duration::from_millis(CHANNEL_ROW_GAP_MS)),
             "전제: writer 가 앞 행을 아직 집지 않았다(begin 전)"
@@ -4322,8 +4326,8 @@ mod tests {
         assert_eq!(r2.hold, Some(InboxHold::Paced), "인계 대기는 간격(Paced)이다 — 막힌 writer 가 아니다");
         assert_eq!(h3_state(&d, ids[1]), "new");
         assert_eq!(h3_drain(&d, 1), vec![ids[1]], "간격 뒤 다음 행(유실 0 · FIFO)");
-        let floor = std::time::Duration::from_millis(HOLD_MS - 50 + 500 + CHANNEL_ROW_GAP_MS);
-        assert!(t_hand.elapsed() >= floor, "다음 행이 앞 행 끝 CR + 간격 전에 나갔다: {:?} < {floor:?}", t_hand.elapsed());
+        let floor = std::time::Duration::from_millis(HOLD_MS + 500 + CHANNEL_ROW_GAP_MS);
+        assert!(t_send.elapsed() >= floor, "다음 행이 앞 행 끝 CR + 간격 전에 나갔다: {:?} < {floor:?}", t_send.elapsed());
         assert_eq!(crate::governance::h_ledger_count(&d, "channel"), 2, "각 1회");
         h3_done(&m);
     }

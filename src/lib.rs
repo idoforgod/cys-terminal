@@ -3197,6 +3197,35 @@ mod tests {
         assert_ne!(super::EXIT_GATE_PENDING, super::EXIT_BOOT_BUSY, "형제 sysexits 값과 충돌");
         assert_eq!(super::ENV_GATE_PENDING_CLOSE, "CYS_GATE_PENDING_CLOSE");
     }
+
+    /// ★(0.14.43 · E2 · 통합 9) 데몬 `hwmon.rs` 에 IOReport **강링크**(link 속성으로 묶기)가 다시 들어오지 않는다 — CI 가시판 핀.
+    /// 비공개 dylib(IOReport)을 링크 속성으로 묶으면 그 라이브러리가 사라진 macOS 에서 데몬이 **뜨지 않는다**(dyld 가 기동 전에 실패).
+    /// E2 는 이를 지연 로딩(dlopen)으로 바꿨고, 같은 핀이 `hwmon.rs` 안(`e2_source_has_no_ioreport_strong_link`)에도 있다. 그러나
+    /// 그 모듈의 검체는 CI 세 레인이 모두 `--skip hwmon::`(실 GPU 전제 검체 때문)으로 건너뛰어 **CI 에서는 돌지 않는다** —
+    /// 안 도는 핀은 게이트가 아니다. 그래서 같은 로직을 skip 에 걸리지 않는 이 자리(`state.rs` 소스 핀과 같은 `include_str!` 방식)에 둔다.
+    /// 금지 문자열은 조각으로 이어 붙인다 — `git grep` 으로 강링크를 찾는 사람에게 이 핀이 가짜 양성으로 잡히지 않게 한다
+    /// (스캔 대상은 `hwmon.rs` 뿐이라 자기참조는 없다).
+    #[test]
+    fn e2_cysd_hwmon_source_has_no_ioreport_strong_link() {
+        let src = include_str!("bin/cysd/hwmon.rs"); // src/lib.rs 기준 경로
+        // 종전의 정확한 문구(공백 포함)
+        let literal = ["#[li", "nk(name = \"IO", "Report\""].concat();
+        assert!(!src.contains(&literal), "IOReport 강링크가 다시 들어왔다: {literal}");
+        // 공백·줄바꿈·인자 순서가 달라진 변형도 같은 강링크다 — 모든 link 속성에서 IOReport 를 찾는다.
+        let squashed: String = src.split_whitespace().collect();
+        let open = ["#[li", "nk("].concat();
+        let target = ["IO", "Report"].concat();
+        let (mut rest, mut seen) = (squashed.as_str(), 0);
+        while let Some(i) = rest.find(&open) {
+            let tail = &rest[i..];
+            let end = tail.find(")]").expect("link 속성이 닫히지 않았다");
+            assert!(!tail[..end].contains(&target), "link 속성이 IOReport 를 묶는다: {}", &tail[..end]);
+            seen += 1;
+            rest = &tail[end..];
+        }
+        // 계측 유효성 — CoreFoundation 의 link 속성은 남아 있어야 한다(스캐너가 속성을 실제로 읽고 있다는 증거).
+        assert!(seen >= 1, "link 속성 스캐너가 아무것도 읽지 못했다");
+    }
     use super::*;
 
     #[test]

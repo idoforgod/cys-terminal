@@ -23248,10 +23248,10 @@ mod tests {
         let (daemon, s) = wp5_seat("c5-file", "claude");
         let dir = crate::state::state_dir(&daemon.socket_path);
         let path = dir.join(QUEUE_BLOCKED_FILE);
-        let secret = "SECRET-BODY-7f3a";
+        let body_marker = "SECRET-BODY-7f3a";
         let no_body = |tag: &str| {
             let raw = std::fs::read_to_string(&path).expect("사유 파일");
-            assert!(!raw.contains(secret) && !raw.contains("[보고]"), "{tag}: 본문·미리보기가 실렸다: {raw}");
+            assert!(!raw.contains(body_marker) && !raw.contains("[보고]"), "{tag}: 본문·미리보기가 실렸다: {raw}");
             assert!(!raw.contains("\"text\"") && !raw.contains("\"preview\""), "{tag}: 본문 키가 실렸다: {raw}");
             let leftovers: Vec<String> = std::fs::read_dir(&dir)
                 .unwrap()
@@ -23276,7 +23276,7 @@ mod tests {
         no_body("①");
 
         // ② 막힘 발생 — 사람 계수 3 + 빈 줄(커서 뒤 고스트): 커서 앞은 비었고 커서 뒤에 글자 → 처방은 `after_cursor_text`(★RQFIX 7행). 좌석 1건.
-        let e = daemon.next_queue_entry(format!("[보고] {secret}"), Some("surface:9".into()), "send");
+        let e = daemon.next_queue_entry(format!("[보고] {body_marker}"), Some("surface:9".into()), "send");
         let (head_id, head_at) = (e.id.clone(), e.enqueued_at);
         s.pending_queue.lock().unwrap().push_back(e);
         s.apply_pending_input(b"abc", InputOrigin::Human);

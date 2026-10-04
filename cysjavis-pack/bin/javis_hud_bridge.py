@@ -280,6 +280,40 @@ def node_key(s):
     return s.get("_full_key") or s.get("surface_ref")
 
 
+_SEAT_NUM = re.compile(r"\+?[0-9]+")      # 좌석 번호 문자열 — ASCII 숫자만(파이썬 isdigit/int 의 유니코드 숫자 배제)
+_U64_MAX = (1 << 64) - 1
+
+
+def injected_from_key(slug, raw):
+    """`surface.input_injected` 의 `from` → 소스 좌석의 정식 노드 키. **좌석이 아니면 None**(= HUD 의 '외부').
+
+    ★(0.14.43 · J3) 데몬은 pane 밖 CLI 의 발신 표기로 `from` 에 좌석 번호가 아닌 **표시용 라벨 문자열**
+    (`cli:send`·`cli:inject`·`cli:drain`·`cli:<사용자값>`)을 싣는다. 종전 `f"{slug}@surface:{from}"` 은 `from`
+    이 좌석 번호임을 전제해 `main@surface:cli:send` 라는 **없는 노드 키**를 만들었고, HUD 틱 문구가 '외부' 대신
+    그 문자열이 됐다. 좌석 판별은 데몬(`cys::parse_surface_ref` — 앞뒤 공백 제거 · 선택적 `surface:` 접두 · u64)과
+    같다: JSON 정수 · `"surface:N"` · `"N"` 만 좌석이다. 불리언(파이썬에서 int 의 하위형)·실수·음수·None·빈 문자열·
+    그 밖의 문자열(라벨)은 전부 None 이다.
+
+    ⚠스큐 안전(ADR-2): 구버전 데몬의 `from`(좌석 정수)은 종전과 **같은 키**를 낸다 — 라벨을 모르는 데몬도 무해하다.
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        n = raw
+    elif isinstance(raw, str):
+        t = raw.strip()
+        if t.startswith("surface:"):
+            t = t[len("surface:"):]
+        if not _SEAT_NUM.fullmatch(t):
+            return None
+        n = int(t)
+    else:
+        return None
+    if not 0 <= n <= _U64_MAX:
+        return None
+    return "%s@surface:%d" % (slug, n)
+
+
 # ------------------------------------------------------------------ 월드
 # ★W14 S16 — 파일명 정규식이 **숫자·하이픈을 통째로 탈락**시켰다. 종전 `[A-Z_]+`는
 # `WORKER_2_TODO.md`·`REVIEWER-GEMINI_TODO.md`를 아예 매치하지 못해 HUD에서 **표시 자체가
@@ -907,10 +941,10 @@ def route_event(ev, world, coal, slug="main", now=None):
             fx["flag"] = flag   # 달 라벨이 없으면 키 자체를 만들지 않는다(구버전 프레임과 동형)
         frames.append(fx)
     elif name == "surface.input_injected":
-        # from 은 동일 데몬 내 소스 surface → 같은 slug 로 정식화.
+        # from 은 동일 데몬 내 소스 surface → 같은 slug 로 정식화. ★(0.14.43 · J3) 좌석이 아닌 발신 라벨
+        # (`cli:send` …)은 노드 키가 아니다 — None(= '외부') 으로 둔다(injected_from_key).
         frames.append({"t": "fx", "kind": "doc", "to": key,
-                       "from": f"{slug}@surface:{p.get('from')}" if p.get("from") is not None
-                               else None,
+                       "from": injected_from_key(slug, p.get("from")),
                        "bytes": p.get("bytes")})
     elif name == "queue.enqueued":
         frames.append({"t": "fx", "kind": "queue", "to": key, "depth": p.get("depth")})

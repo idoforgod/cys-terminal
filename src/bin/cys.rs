@@ -30278,10 +30278,16 @@ mod tests {
             ("fn gate_guard_check_on(", "\n/// `inject_text`"),
         ] {
             let i = prod.find(name).unwrap_or_else(|| panic!("{name} 이 사라졌다"));
-            let end = prod[i..]
+            let mut end = prod[i..]
                 .find(end_marker)
                 .map(|e| i + e)
                 .unwrap_or_else(|| (i + 3000).min(prod.len()));
+            // ★(0.14.43 · 통합 2) 대체 창(3000 바이트)의 끝은 **문자 경계**로 물린다 — 끝이 한국어 주석 한가운데에 걸리면
+            //   `&prod[i..end]` 가 "not a char boundary" 로 패닉해, 이 창 안에 비ASCII 를 넣는 모든 변경이 이 핀을 깨뜨렸다.
+            //   보는 내용·단언은 그대로다(끝을 최대 3 바이트 앞당길 뿐).
+            while !prod.is_char_boundary(end) {
+                end -= 1;
+            }
             let body = &prod[i..end];
             assert!(
                 body.contains("gate_corpus_for_seat("),
@@ -30302,8 +30308,13 @@ mod tests {
         let wi = prod
             .find("fn gate_guard_screen_or_warn(")
             .expect("loud fail-open 단일 지점이 사라졌다");
+        // (같은 결함 계급 — 이 창도 바이트 단위라 끝이 비ASCII 한가운데에 걸리면 패닉한다. 끝을 문자 경계로 물린다.)
+        let mut we = (wi + 900).min(prod.len());
+        while !prod.is_char_boundary(we) {
+            we -= 1;
+        }
         assert!(
-            prod[wi..wi + 900].contains("eprintln!"),
+            prod[wi..we].contains("eprintln!"),
             "관측 실패를 조용히 접는다(fail-silent 복귀) — 스키마 스큐 한 번으로 그물 전체가 \
              무증상 통과한다"
         );

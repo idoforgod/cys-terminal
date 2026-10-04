@@ -686,6 +686,7 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             성공(rc 0 · `registered:` 출력)해야 한다. CI 는 토큰 **배달**까지만 관측하고
             (위 ② 분절), 체인 단절 실조건은 실기 claude 세션에서만 재현된다.
             판정: 종전 rc 6 재현 조건에서 rc 0. PASS 전까지 '실기 미검증' 유지.
+- [ ] **★공증된 DMG 실기 — 상태: 실기 미검증 (0.14.43 E2 · 바이너리 릴리스 발행 뒤)** 공증된 DMG 의 cysd 에서 `control.hw` 의 `npu.status` 가 `ok` 인가(강화 런타임에서 시스템 dylib dlopen — 실패해도 데몬은 뜬다: `unavailable` + `reason`).
 - [ ] **★codex ready_marker 라이브 재주입 왕복 실증 — 상태: 실기 미검증 (P0-6 측정 선행
       게이트 잔여 분절 · 2026-08-26 등재)**
 

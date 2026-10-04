@@ -8170,7 +8170,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gu_failure_reason_survives_the_first_300_chars_after_marker_strip() {
-        let reason = "[cys-dept] ERROR: dept-3 데몬 기동 실패 (소켓 대기 12초 · 로그: /Users/very-long-user-name-example/Library/Caches/cys/state/cys-dept-dept-3/cysd.log · \
+        let reason = "[cys-dept] ERROR: dept-3 데몬 기동 실패 (소켓 대기 12초 · 로그: /Users/user/very-long-dirs-example/Library/Caches/cys/state/cys-dept-dept-3/cysd.log · \
                       느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)";
         let units = |s: &str| s.encode_utf16().count();
         assert!(units(reason) <= 300, "전제: 사유 줄 자체는 300자 안이다({})", units(reason));
