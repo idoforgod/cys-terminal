@@ -14,6 +14,14 @@
 #            verdict, appe2e-summary.txt (10 lines at most)
 # ONE PowerShell process. Every Add-Type / module warm-up happens BEFORE SAC is turned on. While SAC is on only the signed node.exe
 # and Windows system tools are started. OBSERVATION ONLY: no SAC / Defender bypass. The shared SAC switch helpers live in sac-lib.ps1.
+# TEAM     (5th run, the LAST scene: after the restore and the cleanup, with SAC verified OFF again inside): the "create a team directly"
+#          flow of the real UI. node cdp-update.mjs --mode uiteam clicks (toggle of the expert section -> team button -> confirm window ->
+#          its execute button) and watches the page for up to 6 minutes; this script samples the processes (cysd.exe cys.exe bash.exe
+#          python*.exe), the named pipes, the team daemon folder and its logs -> appe2e-team-verdict.json (PASS = the click flow started +
+#          a new team tab stood + a new cysd.exe was created after the click + no failure notification). It runs AFTER the verdict and the
+#          summary of the earlier scenes were written (a hang cannot take them away) and only ADDS: a "team" key and a TEAM line in
+#          appe2e-verdict.json and two TEAM lines (11 and 12) appended to appe2e-summary.txt. The OFF / ON verdicts, the restore and
+#          their order are unchanged. Time: DIAG_TEAM_EXTRA_MIN (workflow env, default 15) extra minutes on top of DIAG_JOB_LIMIT_MIN.
 $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'lib.ps1')
 . (Join-Path $PSScriptRoot 'e2e-update.ps1')
@@ -32,6 +40,11 @@ $K_OFF_OBSERVE_SEC = 300
 $K_ON_OBSERVE_SEC = 90
 $K_ON_ALIVE_SEC = 60
 $K_OFF_MAX_SEC = 900
+# TEAM scene (the last scene; Invoke-TeamScene): observation window of the page, wait for the UI, watch cap, job minutes it needs
+$K_TEAM_OBSERVE_SEC = 360
+$K_TEAM_READY_SEC = 150
+$K_TEAM_MAX_SEC = 780
+$K_TEAM_NEED_MIN = 14
 
 $RUN = [ordered]@{
     started = (Get-IsoNow)
@@ -69,6 +82,8 @@ $CTX['on_cdp'] = $null
 $CTX['on_obs'] = $null
 $CTX['on_verdict'] = $null
 $CTX['app_proc'] = $null
+$CTX['team_verdict'] = $null
+$CTX['team_scene_utc'] = $null
 # the registry value is 'touched' from the moment we try to write 1 until a restore was verified
 $script:SacTouched = $false
 # GITHUB_TOKEN is only for the checkpoint upload: keep it in a variable and take it out of the process environment so that no child
@@ -1008,6 +1023,634 @@ function Get-ObsBrief {
 }
 
 # =========================================================================
+# TEAM scene (5th run, LAST scene): "create a team directly" on the real UI of the app, SAC OFF.
+#   gates      the SAC restore is verified (fresh state check: not enforced), the inputs are usable, enough job time is left
+#   app        a live 0.14.43 app with the CDP port is used as it is; otherwise (the normal case: the cleanup step killed it) the app is
+#              started again (Reset-AppState, marker check / reinstall, the WebView2 debug policy again, Start-CysApp)
+#   observe    node cdp-update.mjs --mode uiteam presses the buttons (real mouse clicks) and watches the page for up to 6 minutes; this
+#              side samples processes (cysd.exe cys.exe bash.exe sh.exe python*.exe: pid / parent / command line / creation time), the
+#              named pipes and the team daemon folders every 2 s, before and after tables, log tails, app files
+#   verdict    appe2e-team-verdict.json: PASS = the click flow started AND a new team tab stood AND a new cysd.exe process started after
+#              the click AND no failure notification; the stage order / seconds / notices / seats / bash are reference facts only
+# Nothing here changes the OFF / ON scenes, the restore or their verdicts: the scene runs after them and only ADDS a verdict key and lines.
+# =========================================================================
+function Get-TeamMinutesLeft {
+    $x = 15
+    $n = 0
+    if ([int]::TryParse([string]$env:DIAG_TEAM_EXTRA_MIN, [ref]$n)) {
+        if ($n -ge 0) { $x = $n }
+    }
+    return ((Get-MinutesLeft) + $x)
+}
+
+function Format-TeamCmd {
+    param([string]$Cmd, [int]$Max = 400)
+    $c = [regex]::Replace([string]$Cmd, '(?i)(token|password|passwd|secret|apikey|api-key|authorization)([=:\s]+)\S+', '$1$2<redacted>')
+    return (Limit-Text $c $Max)
+}
+
+# the processes the team flow is about: the app, the daemons (base + team), the CLI, MSYS bash / sh and the pythons
+function Get-TeamProcs {
+    $res = New-Object System.Collections.Generic.List[object]
+    try {
+        $all = Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 30 -ErrorAction Stop
+        foreach ($p in $all) {
+            $n = [string]$p.Name
+            if ($n -match '^(cysd|cys|cys-app|bash|sh|python[0-9.]*|pythonw[0-9.]*)\.exe$') {
+                $created = $null
+                try {
+                    if ($null -ne $p.CreationDate) { $created = ConvertTo-IsoUtc $p.CreationDate }
+                } catch { }
+                $res.Add([pscustomobject]@{ name = $n; id = [int]$p.ProcessId; ppid = [int]$p.ParentProcessId; path = [string]$p.ExecutablePath; cmd = (Format-TeamCmd ([string]$p.CommandLine) 400); created = $created })
+            }
+        }
+    } catch { }
+    return $res.ToArray()
+}
+
+# named pipes whose name contains cys (the base daemon: cys, a team daemon: cys-dept-<name>)
+function Get-TeamPipes {
+    $o = [ordered]@{ ok = $false; total = 0; cys = @(); error = $null }
+    try {
+        $names = New-Object System.Collections.Generic.List[string]
+        $files = [System.IO.Directory]::GetFiles('\\.\pipe\')
+        foreach ($f in $files) {
+            $nm = [string]$f
+            $i = $nm.LastIndexOf('\')
+            if ($i -ge 0) { $nm = $nm.Substring($i + 1) }
+            if ($nm -match 'cys') { $names.Add($nm) }
+        }
+        $o['total'] = @($files).Count
+        $o['cys'] = $names.ToArray()
+        $o['ok'] = $true
+    } catch {
+        $o['error'] = $_.Exception.Message
+        # fallback: the same list through cmd.exe (a pipe name with a character .NET refuses as a path makes GetFiles throw)
+        try {
+            $dr = Invoke-Proc -File $env:ComSpec -Arguments '/d /c dir /b \\.\pipe\' -TimeoutSec 20
+            $names2 = New-Object System.Collections.Generic.List[string]
+            foreach ($ln in ([string]$dr['out'] -split "`r?`n")) {
+                $tn = $ln.Trim()
+                if (($tn -ne '') -and ($tn -match 'cys')) { $names2.Add($tn) }
+            }
+            $o['cys'] = $names2.ToArray()
+            $o['ok'] = $true
+            $o['via'] = 'cmd dir /b'
+        } catch { }
+    }
+    return $o
+}
+
+# team daemon folders: %LOCALAPPDATA%\cys\cys-dept-<name> (cys-dept dept_logdir on Windows: cysd.log, formation.log, ...)
+function Get-TeamDeptDirs {
+    $res = New-Object System.Collections.Generic.List[object]
+    try {
+        foreach ($d in @(Get-ChildItem -LiteralPath (Get-InstallDir) -Directory -Filter 'cys-dept-*' -ErrorAction SilentlyContinue)) {
+            $files = New-Object System.Collections.Generic.List[string]
+            foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -File -ErrorAction SilentlyContinue)) {
+                $files.Add(('{0}:{1}B' -f $f.Name, $f.Length))
+            }
+            $res.Add([pscustomobject]@{ name = [string]$d.Name; files = ($files.ToArray() -join ',') })
+        }
+    } catch { }
+    return $res.ToArray()
+}
+
+function Read-FileTailShared {
+    param([string]$Path, [int]$MaxBytes = 49152)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return '' }
+        $fs = New-Object System.IO.FileStream($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $len = [int64]$fs.Length
+            $start = [int64]0
+            if ($len -gt $MaxBytes) { $start = $len - $MaxBytes }
+            [void]$fs.Seek($start, [System.IO.SeekOrigin]::Begin)
+            $cnt = [int]($len - $start)
+            $buf = New-Object byte[] $cnt
+            $read = 0
+            while ($read -lt $cnt) {
+                $got = $fs.Read($buf, $read, $cnt - $read)
+                if ($got -le 0) { break }
+                $read = $read + $got
+            }
+            $txt = [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
+            if ($start -gt 0) { $txt = '...[head cut]' + $txt }
+            return $txt
+        } finally { $fs.Dispose() }
+    } catch { return ('[read failed: ' + $_.Exception.Message + ']') }
+}
+
+# which bash can cys-dept use: the bundled MSYS bash of the app (runtime\git) and what the runner has on its PATH (static facts)
+function Get-TeamBashStatic {
+    $o = [ordered]@{ install_dir = (Get-InstallDir); bundled = @(); runner_path_hits = @(); where_bash = $null; path_entries = @() }
+    try {
+        $inst = Get-InstallDir
+        $b = New-Object System.Collections.Generic.List[object]
+        foreach ($rel in @('runtime\git\bin\bash.exe', 'runtime\git\usr\bin\bash.exe', 'runtime\git\cmd\git.exe', 'runtime\python\python.exe', 'runtime\python\python3.exe', 'runtime\node\node.exe')) {
+            $pth = Join-Path $inst $rel
+            $ex = [bool](Test-Path -LiteralPath $pth)
+            $sz = $null
+            if ($ex) {
+                try { $sz = (Get-Item -LiteralPath $pth).Length } catch { }
+            }
+            $b.Add([ordered]@{ rel = $rel; exists = $ex; size = $sz })
+        }
+        $o['bundled'] = $b.ToArray()
+    } catch {
+        $o['bundled_error'] = $_.Exception.Message
+    }
+    try {
+        $hits = New-Object System.Collections.Generic.List[string]
+        foreach ($c in @(Get-Command 'bash.exe' -All -ErrorAction SilentlyContinue)) { $hits.Add([string]$c.Source) }
+        $o['runner_path_hits'] = $hits.ToArray()
+    } catch { }
+    try {
+        $w = Invoke-Proc -File (Join-Path $env:windir 'System32\where.exe') -Arguments 'bash' -TimeoutSec 20
+        $o['where_bash'] = [ordered]@{ rc = $w['rc']; out = (Limit-Text ([string]$w['out']) 600) }
+    } catch { }
+    try {
+        $pe = New-Object System.Collections.Generic.List[string]
+        foreach ($e in @(([string]$env:PATH).Split(';'))) {
+            if (($e -match 'git|bash|msys|system32$') -and ($pe.Count -lt 12)) { $pe.Add($e) }
+        }
+        $o['path_entries'] = $pe.ToArray()
+    } catch { }
+    return $o
+}
+
+# where a bash.exe that was seen running comes from
+function Get-TeamBashKind {
+    param([string]$Path)
+    $p = [string]$Path
+    if (-not $p) { return 'unknown (no path)' }
+    $rt = Join-Path (Get-InstallDir) 'runtime'
+    if ($p.StartsWith($rt, [System.StringComparison]::OrdinalIgnoreCase) -or ($p -like '*\Local\cys\runtime\*')) { return 'bundled (install dir runtime)' }
+    if ($p -like '*\Git\*') { return 'runner Git for Windows' }
+    if ($p -like '*\System32\bash.exe') { return 'System32 bash.exe (WSL launcher)' }
+    return 'other'
+}
+
+# a live 0.14.43 app: a cys-app.exe process of the install folder AND an answering CDP port
+function Test-TeamAppAlive {
+    $r = [ordered]@{ process = $false; cdp = $false; marker = (Get-InstalledMarker) }
+    try {
+        foreach ($g in @(Get-Process -Name 'cys-app' -ErrorAction SilentlyContinue)) {
+            $gp = ''
+            try { $gp = [string]$g.Path } catch { }
+            if ((-not $gp) -or ($gp -like '*\Local\cys\*')) { $r['process'] = $true }
+        }
+    } catch { }
+    if ($r['process']) {
+        try {
+            $resp = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/json/version' -f $K_PORT) -UseBasicParsing -TimeoutSec 3 -ErrorAction Stop
+            if ($resp.StatusCode -eq 200) { $r['cdp'] = $true }
+        } catch { }
+    }
+    return $r
+}
+
+# background: the click flow + the observation of the page (node); this process samples the machine meanwhile
+function Start-NodeTeam {
+    param([string]$Prefix, [string]$NodeExe, [int]$ObserveSec, [int]$ReadySec)
+    $a = '"{0}" --mode uiteam --port {1} --out "{2}" --prefix {3} --max-wait-sec 300 --team-observe-sec {4} --team-ready-wait-sec {5}' -f (Get-NodeScript), $K_PORT, $global:DiagOut, $Prefix, $ObserveSec, $ReadySec
+    $o = Join-Path $global:DiagOut ($Prefix + '-cdp-stdout.txt')
+    $e = Join-Path $global:DiagOut ($Prefix + '-cdp-stderr.txt')
+    $p = Start-Process -FilePath $NodeExe -ArgumentList $a -NoNewWindow -PassThru -RedirectStandardOutput $o -RedirectStandardError $e -ErrorAction Stop
+    try { $null = $p.Handle } catch { }
+    return $p
+}
+
+function Read-TeamFacts {
+    param([string]$Prefix)
+    $txt = Read-TextUtf8 (Join-Path $global:DiagOut ($Prefix + '-facts.json'))
+    if (-not $txt) { return $null }
+    try { return (ConvertFrom-Json $txt) } catch { return $null }
+}
+
+# the machine side of the observation: processes, pipes, team daemon folders every 2 s until the node driver ends
+function Watch-TeamRun {
+    param([string]$Prefix, $NodeProc, [int]$MaxSec)
+    $obs = [ordered]@{
+        started = (Get-IsoNow); ended = $null; end_reason = $null; ticks = 0
+        click_at = $null; node_exited_at = $null; node_exit_code = $null
+        procs_seen = (New-Object System.Collections.Generic.List[object])
+        pipes_first_seen = [ordered]@{}
+        pipes_last = $null
+        dept_dirs_last = @()
+        new_cysd = @()
+        windows_at_end = $null
+    }
+    $tl = Join-Path $global:DiagOut ($Prefix + '-timeline.txt')
+    try { Add-Utf8NoBom $tl (('# TEAM scene watch start {0} (sampled every 2 s; a line is written when the process set or the cys pipes change, and every 30 s)' -f (Get-IsoNow)) + "`r`n") } catch { }
+    $t0 = Get-Date
+    $seen = @{}
+    $clickIso = $null
+    $lastSig = ''
+    $lastLine = $t0.AddSeconds(-60)
+    $lastDirs = $t0.AddSeconds(-60)
+    $nodeExitAt = $null
+    $reason = $null
+    try {
+        while ($true) {
+            $now = Get-Date
+            $elapsed = [int]($now - $t0).TotalSeconds
+            if (($null -ne $NodeProc) -and ($null -eq $nodeExitAt)) {
+                $exited = $false
+                try { $exited = $NodeProc.HasExited } catch { $exited = $true }
+                if ($exited) {
+                    $nodeExitAt = $now
+                    $obs['node_exited_at'] = ConvertTo-IsoUtc $now
+                    try { $obs['node_exit_code'] = $NodeProc.ExitCode } catch { }
+                }
+            }
+            if ($null -eq $clickIso) {
+                $ltxt = [string](Read-FileShared (Join-Path $global:DiagOut ($Prefix + '-live.json')))
+                $lm = [regex]::Match($ltxt, '"team_clicked_at"\s*:\s*"([^"]+)"')
+                if ($lm.Success) {
+                    $clickIso = $lm.Groups[1].Value
+                    $obs['click_at'] = $clickIso
+                }
+            }
+            $rows = @(Get-TeamProcs)
+            $parts = New-Object System.Collections.Generic.List[string]
+            foreach ($p in $rows) {
+                $parts.Add(('{0}#{1}' -f $p.name, $p.id))
+                $k = [string]$p.id
+                if ($seen.ContainsKey($k)) {
+                    $seen[$k]['last_seen'] = (Get-IsoNow)
+                } elseif (($p.name -ieq 'cysd.exe') -or ($p.name -ieq 'bash.exe') -or ($obs['procs_seen'].Count -lt 800)) {
+                    # cys.exe / sh.exe / python rows are capped (cys ping loops make hundreds of short-lived processes); daemons and bash never are
+                    $rec = [ordered]@{ name = $p.name; id = $p.id; ppid = $p.ppid; path = $p.path; cmd = $p.cmd; created = $p.created; first_seen = (Get-IsoNow); last_seen = (Get-IsoNow); after_click = $null }
+                    $seen[$k] = $rec
+                    $obs['procs_seen'].Add($rec)
+                }
+            }
+            $pipes = Get-TeamPipes
+            $obs['pipes_last'] = $pipes
+            foreach ($pn in @($pipes['cys'])) {
+                $pkey = [string]$pn
+                if (-not $obs['pipes_first_seen'].Contains($pkey)) { $obs['pipes_first_seen'][$pkey] = (Get-IsoNow) }
+            }
+            if ((($now - $lastDirs).TotalSeconds) -ge 10) {
+                $lastDirs = $now
+                $obs['dept_dirs_last'] = @(Get-TeamDeptDirs)
+            }
+            $sig = (($parts.ToArray() -join ' ') + ' | ' + (@($pipes['cys']) -join ' '))
+            if (($sig -ne $lastSig) -or ((($now - $lastLine).TotalSeconds) -ge 30)) {
+                $lastSig = $sig
+                $lastLine = $now
+                $since = -1
+                if ($clickIso) {
+                    try { $since = [int](($now.ToUniversalTime() - [datetime]::Parse($clickIso, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()).TotalSeconds) } catch { }
+                }
+                $line = '[{0,5}s {1}] click+{2} procs=[{3}] pipes=[{4}]' -f $elapsed, (Get-IsoNow), $since, ($parts.ToArray() -join ' '), (@($pipes['cys']) -join ' ')
+                try { Add-Utf8NoBom $tl ($line + "`r`n") } catch { }
+            }
+            $obs['ticks'] = [int]$obs['ticks'] + 1
+            if (($null -ne $nodeExitAt) -and ((($now - $nodeExitAt).TotalSeconds) -ge 3)) { $reason = 'the node driver ended'; break }
+            if ($elapsed -ge $MaxSec) { $reason = ('max watch seconds reached ({0})' -f $MaxSec); break }
+            if ((Get-TeamMinutesLeft) -lt 3) { $reason = 'job time budget exhausted'; break }
+            Start-Sleep -Seconds 2
+        }
+    } catch {
+        $reason = 'watch loop exception: ' + $_.Exception.Message
+        Add-DiagError ('Watch-TeamRun ' + $Prefix) $_
+    }
+    $obs['end_reason'] = $reason
+    $obs['ended'] = (Get-IsoNow)
+    # a team daemon = a cysd.exe of the install folder that was CREATED after the execute click
+    $inst = Get-InstallDir
+    $newOnes = New-Object System.Collections.Generic.List[object]
+    foreach ($rec in $obs['procs_seen']) {
+        if ($clickIso -and $rec['created']) {
+            $rec['after_click'] = [bool]([string]::CompareOrdinal([string]$rec['created'], [string]$clickIso) -ge 0)
+        }
+        $recPath = [string]$rec['path']
+        $inInstall = ($recPath.StartsWith($inst, [System.StringComparison]::OrdinalIgnoreCase) -or ($recPath -like '*\Local\cys\*'))
+        if (([string]$rec['name'] -ieq 'cysd.exe') -and $inInstall -and ($rec['after_click'] -eq $true)) {
+            $newOnes.Add($rec)
+        }
+    }
+    $obs['new_cysd'] = $newOnes.ToArray()
+    try { $obs['windows_at_end'] = Get-VisibleWindowsText } catch { }
+    try { Add-Utf8NoBom $tl (('# end: {0}' -f $reason) + "`r`n") } catch { }
+    Save-Json ($Prefix + '-observe.json') $obs 7
+    return $obs
+}
+
+# the logs of the team daemon(s) (cysd.log, formation.log ...: tails), the registry of the app, the team pack folders
+function Save-TeamLogs {
+    param([string]$Prefix)
+    $o = [ordered]@{ dirs = @(); copied = @(); tails = [ordered]@{}; registry = $null; catalog_present = $null; packs = @(); error = $null }
+    try {
+        $copied = New-Object System.Collections.Generic.List[string]
+        $dirs = @(Get-ChildItem -LiteralPath (Get-InstallDir) -Directory -Filter 'cys-dept-*' -ErrorAction SilentlyContinue)
+        $dn = New-Object System.Collections.Generic.List[string]
+        foreach ($d in $dirs) {
+            $dn.Add([string]$d.Name)
+            foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -File -Filter '*.log' -ErrorAction SilentlyContinue)) {
+                $tail = Read-FileTailShared $f.FullName 49152
+                Save-Text ('{0}-{1}-{2}-tail.txt' -f $Prefix, $d.Name, $f.Name) $tail
+                $copied.Add(('{0}\{1} ({2} bytes)' -f $d.Name, $f.Name, $f.Length))
+                $o['tails'][('{0}\{1}' -f $d.Name, $f.Name)] = $tail.Substring([math]::Max(0, $tail.Length - 1500))
+            }
+        }
+        $o['dirs'] = $dn.ToArray()
+        $o['copied'] = $copied.ToArray()
+        $cysHome = Join-Path $env:USERPROFILE '.cys'
+        $reg = Join-Path $cysHome 'depts.json'
+        if (Test-Path -LiteralPath $reg) {
+            Save-Text ($Prefix + '-depts.json') (Limit-Text (Read-FileShared $reg) 60000)
+            $o['registry'] = 'saved'
+        } else {
+            $o['registry'] = 'absent'
+        }
+        $o['catalog_present'] = [bool](Test-Path -LiteralPath (Join-Path $cysHome 'dept-catalog.json'))
+        $packs = New-Object System.Collections.Generic.List[string]
+        foreach ($pd in @(Get-ChildItem -LiteralPath $cysHome -Directory -Filter 'pack-dept-*' -ErrorAction SilentlyContinue)) { $packs.Add([string]$pd.Name) }
+        $o['packs'] = $packs.ToArray()
+    } catch {
+        $o['error'] = $_.Exception.Message
+    }
+    return $o
+}
+
+function Save-TeamNotRun {
+    param([string]$Why)
+    $tv = [ordered]@{ result = 'NOT_RUN'; reasons = @($Why); facts = [ordered]@{}; reference = $null; ps_reference = $null }
+    $CTX['team_verdict'] = $tv
+    try { $RUN['team']['skipped'] = $Why } catch { }
+    Save-Json 'appe2e-team-verdict.json' $tv 6
+    Write-Log ('TEAM scene not run: ' + $Why) 'WARN'
+}
+
+# PASS = the click flow started AND a new team tab stood AND a new cysd.exe started after the click AND no failure notification.
+# Facts of the node driver (appe2e-team-facts.json) + facts of this side (processes). Everything else is reference.
+function Get-TeamVerdict {
+    param($Facts, $Obs, $PsRef, $Cj)
+    $reasons = New-Object System.Collections.Generic.List[string]
+    $f = [ordered]@{}
+    $nodeOk = $false
+    $ref = $null
+    if ($null -eq $Facts) {
+        $reasons.Add('the CDP driver left no facts file (appe2e-team-facts.json): the flow could not be observed')
+        if ($null -ne $Cj) {
+            $reasons.Add(('CDP driver result: attached={0} app_version={1} error_summary={2}' -f [string]$Cj.attached, [string]$Cj.app_version, [string]$Cj.error_summary))
+        } else {
+            $reasons.Add('the CDP driver left no result file either (appe2e-team-cdp.json): node did not start or died at once (see appe2e-team-cdp-stderr.txt)')
+        }
+    } else {
+        $nodeOk = [bool]($Facts.node_ok -eq $true)
+        $ref = $Facts.reference
+        $fa = $Facts.facts
+        foreach ($m in @($Facts.node_missing)) {
+            if ($m) { $reasons.Add([string]$m) }
+        }
+        $f['team_clicked_at'] = [string]$Facts.team_clicked_at
+        $f['app_version_seen_by_cdp'] = [string]$Facts.app_version
+        $f['ready_ok'] = [bool]($fa.ready_ok -eq $true)
+        $f['toggle_click_method'] = [string]$fa.toggle_click_method
+        $f['entry_click_ok'] = [bool]($fa.entry_click_ok -eq $true)
+        $f['entry_click_method'] = [string]$fa.entry_click_method
+        $f['menu_seen'] = [bool]($fa.menu_seen -eq $true)
+        $f['confirm_seen'] = [bool]($fa.confirm_seen -eq $true)
+        $f['confirm_title'] = [string]$fa.confirm_title
+        $f['confirm_click_ok'] = [bool]($fa.confirm_click_ok -eq $true)
+        $f['confirm_click_method'] = [string]$fa.confirm_click_method
+        $f['any_dom_click'] = [bool]($fa.any_dom_click -eq $true)
+        $f['flow_started'] = [bool]($fa.flow_started -eq $true)
+        $f['pending_seen'] = [bool]($fa.pending_seen -eq $true)
+        $f['tab_created'] = [bool]($fa.tab_created -eq $true)
+        $f['tab_ms'] = $fa.tab_ms
+        $f['tab_name'] = [string]$fa.tab_name
+        $f['tab_count_before'] = $fa.tab_count_before
+        $f['tab_count_after'] = $fa.tab_count_after
+        $f['failure_alert_count'] = $fa.failure_alert_count
+        $f['failure_alerts'] = $fa.failure_alerts
+        $f['post_creation_alert_count'] = $fa.post_creation_alert_count
+        $f['stage_source'] = [string]$fa.stage_source
+        $f['observe_end_reason'] = [string]$fa.observe_end_reason
+        $f['flow_error'] = [string]$fa.flow_error
+    }
+    $newCysd = @($Obs['new_cysd'])
+    $daemonNew = [bool]($newCysd.Count -gt 0)
+    $f['new_cysd_count'] = $newCysd.Count
+    $nc = New-Object System.Collections.Generic.List[object]
+    foreach ($r in $newCysd) { $nc.Add([ordered]@{ id = $r['id']; ppid = $r['ppid']; created = $r['created']; first_seen = $r['first_seen']; path = $r['path'] }) }
+    $f['new_cysd'] = $nc.ToArray()
+    $f['click_at_seen_by_powershell'] = [string]$Obs['click_at']
+    $f['node_exit_code'] = $Obs['node_exit_code']
+    $f['watch_end'] = [string]$Obs['end_reason']
+    if (-not $daemonNew) {
+        $cs = New-Object System.Collections.Generic.List[string]
+        foreach ($r in @($Obs['procs_seen'])) {
+            if ([string]$r['name'] -ieq 'cysd.exe') { $cs.Add(('pid {0} created {1} after_click={2}' -f $r['id'], $r['created'], $r['after_click'])) }
+        }
+        $reasons.Add(('no new cysd.exe process of the install folder was created after the execute click (click seen at {0}; cysd.exe rows seen: {1})' -f [string]$Obs['click_at'], ($cs.ToArray() -join '; ')))
+    }
+    $result = 'FAIL'
+    if ($nodeOk -and $daemonNew) {
+        $result = 'PASS'
+        $reasons.Add('the button flow started by clicks, a new team tab stood (waiting screen -> real tab), a new cysd.exe was created after the click and no failure notification was shown')
+        if ($f['pending_seen'] -ne $true) { $reasons.Add('NOTE the waiting screen was not seen before the tab stood (selector or timing: read appe2e-team-ui-timeline.txt)') }
+        if ($f['any_dom_click'] -eq $true) { $reasons.Add('NOTE at least one click was a DOM click (the element was not hit-testable), not a mouse event: see ui.clicks in appe2e-team-cdp.json') }
+        if ([int]$f['post_creation_alert_count'] -gt 0) { $reasons.Add(('NOTE {0} failure-like notification(s) (watchdog / health) appeared AFTER the tab stood (reference only, not counted): see reference.post_creation_notices' -f [int]$f['post_creation_alert_count'])) }
+        $deptPipe = $false
+        if ($PsRef -is [System.Collections.IDictionary]) {
+            foreach ($np in @($PsRef['new_pipes'])) {
+                if ([string]$np -match '^cys-dept-') { $deptPipe = $true }
+            }
+        }
+        if (-not $deptPipe) { $reasons.Add('NOTE no new cys-dept-* named pipe was listed after the scene (check that the new cysd.exe is the team daemon: ps_reference.pipes_first_seen, appe2e-team-timeline.txt)') }
+    }
+    return [ordered]@{ result = $result; reasons = $reasons.ToArray(); facts = $f; reference = $ref; ps_reference = $PsRef }
+}
+
+# the TEAM lines of the summary (after the 10 lines of the earlier scenes, which are unchanged)
+function Get-TeamSummaryLines {
+    $out = New-Object System.Collections.Generic.List[string]
+    $tv = $CTX['team_verdict']
+    if (-not ($tv -is [System.Collections.IDictionary])) {
+        $out.Add('TEAM NOT_RUN: the scene did not complete (see steps.team in app-e2e.json)')
+        return $out.ToArray()
+    }
+    if ([string]$tv['result'] -eq 'NOT_RUN') {
+        $out.Add('TEAM NOT_RUN: ' + (@($tv['reasons']) -join '; '))
+        return $out.ToArray()
+    }
+    $f = $tv['facts']
+    $r = $tv['reference']
+    $pr = $tv['ps_reference']
+    $l1 = 'TEAM ' + [string]$tv['result'] + ': ' + (@($tv['reasons']) -join '; ')
+    $l1 = $l1 + ' | clicks: toggle=' + [string]$f['toggle_click_method'] + ' entry=' + [string]$f['entry_click_method'] + ' confirm=' + [string]$f['confirm_click_method'] + ' (a DOM click was used: ' + [string]$f['any_dom_click'] + ')'
+    $l1 = $l1 + ' | confirm window "' + [string]$f['confirm_title'] + '" | waiting screen seen=' + [string]$f['pending_seen']
+    $l1 = $l1 + ' | new tab=' + [string]$f['tab_created'] + ' (' + [string]$f['tab_ms'] + ' ms; tabs ' + [string]$f['tab_count_before'] + ' -> ' + [string]$f['tab_count_after'] + ')'
+    $l1 = $l1 + ' | failure notifications=' + [string]$f['failure_alert_count'] + ' | new cysd.exe=' + [string]$f['new_cysd_count']
+    $out.Add($l1)
+    $l2 = 'TEAM observed:'
+    if ($null -ne $r) {
+        $l2 = $l2 + ' stages (' + [string]$r.stage_source + '): ' + [string]$r.stage_line + ' | ' + [string]$r.tab_line + ' | notices after the tab: ' + [string]$r.formation_line + ' | seats at the end: ' + [string]$r.seats_line + ' | alarm ids seen: ' + [string]$r.alarm_id_count
+    } else {
+        $l2 = $l2 + ' no reference facts from the CDP driver'
+    }
+    if ($pr -is [System.Collections.IDictionary]) {
+        $l2 = $l2 + ' | bash: ' + [string]$pr['bash_summary'] + ' | new pipes: ' + ((@($pr['new_pipes'])) -join ',') + ' | python/bash/cys processes seen: ' + [string]$pr['proc_rows_seen']
+        if (([string]$tv['result'] -ne 'PASS') -and ($pr['daemon_log_tails'] -is [System.Collections.IDictionary])) {
+            foreach ($tk in @($pr['daemon_log_tails'].Keys)) {
+                $tt = [string]$pr['daemon_log_tails'][$tk]
+                $l2 = $l2 + ' | log tail ' + [string]$tk + ': ' + $tt.Substring([math]::Max(0, $tt.Length - 300))
+            }
+        }
+    }
+    $out.Add($l2)
+    return $out.ToArray()
+}
+
+# the TEAM result as one more key and one more line of appe2e-verdict.json (result / off / on and their reasons are NOT touched)
+function Add-TeamToVerdict {
+    $tv = $CTX['team_verdict']
+    $res = 'NOT_RUN'
+    $line = 'TEAM NOT_RUN: the scene did not complete (see steps.team in app-e2e.json)'
+    if ($tv -is [System.Collections.IDictionary]) {
+        $res = [string]$tv['result']
+        $line = 'TEAM ' + $res + ': ' + (@($tv['reasons']) -join '; ')
+    }
+    if (-not ($RUN['verdict'] -is [System.Collections.IDictionary])) { return }
+    $RUN['verdict']['team'] = $res
+    $RUN['verdict']['reasons'] = @($RUN['verdict']['reasons']) + @($line)
+    Save-Json 'appe2e-verdict.json' $RUN['verdict'] 5
+}
+
+# the TEAM lines appended to appe2e-summary.txt (the 10 lines of the earlier scenes were written before and are not rewritten)
+function Add-TeamSummary {
+    $sum = Join-Path $global:DiagOut 'appe2e-summary.txt'
+    $add = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($tl in @(Get-TeamSummaryLines)) {
+            $one = [regex]::Replace([string]$tl, '[\r\n]+', ' ')
+            $add.Add((Limit-Text $one 1200))
+        }
+    } catch {
+        $add.Add('TEAM lines could not be built: ' + $_.Exception.Message)
+    }
+    foreach ($l in $add.ToArray()) { Write-Log ('SUMMARY ' + $l) }
+    try { Add-Utf8NoBom $sum (("`r`n" + ($add.ToArray() -join "`r`n"))) } catch { }
+}
+
+function Invoke-TeamScene {
+    $pfx = 'appe2e-team'
+    $T = [ordered]@{ started = (Get-IsoNow); skipped = $null; gates = $null; app = $null; node = $null; before = $null; observe = $null; after = $null; logs = $null; evidence = $null; cleanup = $null; error = $null; finished = $null }
+    $RUN['team'] = $T
+    $CTX['team_scene_utc'] = (Get-Date).ToUniversalTime()
+    $prepared = $false
+    try {
+        # ---- gates: what the harness needs before it can measure at all (a miss is NOT_RUN, not a product failure) ----
+        if (-not $CTX['inputs_ok']) { Save-TeamNotRun 'the inputs are not usable (no installer of the product build): nothing to run'; return }
+        if ((Get-TeamMinutesLeft) -lt $K_TEAM_NEED_MIN) { Save-TeamNotRun ('not enough job time left ({0} min, needs {1})' -f (Get-TeamMinutesLeft), $K_TEAM_NEED_MIN); return }
+        $chk = Get-SacRealState 'before-team'
+        $T['gates'] = [ordered]@{ sac_enforced = $chk['enforced']; sac_registry_value = $chk['registry']['value']; minutes_left = (Get-TeamMinutesLeft) }
+        if ($chk['enforced']) { Save-TeamNotRun 'Smart App Control is still enforced after the restore: the scene needs it OFF'; return }
+        $node = Find-Exe 'node.exe'
+        if (-not $node) { Save-TeamNotRun 'node.exe was not found'; return }
+        $prepared = $true
+
+        # ---- the app: a live 0.14.43 app as it is, else (normal case: the cleanup step killed it) started again ----
+        $alive = Test-TeamAppAlive
+        $reuse = [bool]($alive['process'] -and $alive['cdp'] -and ([string]$alive['marker'] -eq [string]$CTX['from_version']))
+        $T['app'] = [ordered]@{ alive_check = $alive; reused = $reuse; reset = $null; reinstall = $null; start = $null }
+        if (-not $reuse) {
+            $T['app']['reset'] = Reset-AppState 'before-team'
+            if ((Get-InstalledMarker) -ne [string]$CTX['from_version']) {
+                if ((Get-TeamMinutesLeft) -lt ($K_TEAM_NEED_MIN + 3)) { Save-TeamNotRun 'the installed app is not the product build and there is no time to reinstall it'; return }
+                $T['app']['reinstall'] = Install-CysFile -Installer ([string]$CTX['installer']) -ExpectVersion ([string]$CTX['from_version'])
+                if (-not $T['app']['reinstall']['ok']) { Save-TeamNotRun ('the reinstall of the product build did not leave the version marker at {0}' -f $CTX['from_version']); return }
+            }
+            # the cleanup step removed the WebView2 debug policy: set it again (Start-CysApp sets it when the state is empty)
+            $prevPolicyRec = $RUN['webview2_policy']
+            $CTX['wv2_policy'] = $null
+            $st = Start-CysApp $pfx
+            # Start-CysApp files its policy record under the field of the OFF scene: keep that one and file this one under its own key
+            $RUN['webview2_policy_team'] = $RUN['webview2_policy']
+            $RUN['webview2_policy'] = $prevPolicyRec
+            $T['app']['start'] = $st
+            if (-not $st['cdp_ready']) { Save-TeamNotRun ('the app did not answer on the CDP port: {0}' -f [string]$st['error']); return }
+        }
+
+        # ---- before: processes, pipes, daemon folders, bash facts ----
+        $T['before'] = [ordered]@{ time = (Get-IsoNow); procs = @(Get-TeamProcs); pipes = (Get-TeamPipes); dept_dirs = @(Get-TeamDeptDirs); bash_static = (Get-TeamBashStatic) }
+        Save-Text ($pfx + '-procs-before.txt') (Get-ProcessListText)
+        Save-Text ($pfx + '-pipes-before.txt') ((@($T['before']['pipes']['cys']) -join "`r`n"))
+
+        # ---- the scene: node presses the buttons and watches the page; this side watches the machine ----
+        $T['node'] = [ordered]@{ node_exe = $node; started = (Get-IsoNow) }
+        $nodeProc = Start-NodeTeam -Prefix $pfx -NodeExe $node -ObserveSec $K_TEAM_OBSERVE_SEC -ReadySec $K_TEAM_READY_SEC
+        $obs = Watch-TeamRun -Prefix $pfx -NodeProc $nodeProc -MaxSec $K_TEAM_MAX_SEC
+        try { if (-not $nodeProc.HasExited) { Stop-ProcessTree -ProcessId $nodeProc.Id } } catch { }
+
+        # ---- after: tables, tails, files ----
+        $T['after'] = [ordered]@{ time = (Get-IsoNow); procs = @(Get-TeamProcs); pipes = (Get-TeamPipes); dept_dirs = @(Get-TeamDeptDirs) }
+        Save-Text ($pfx + '-procs-after.txt') (Get-ProcessListText)
+        Save-Text ($pfx + '-pipes-after.txt') ((@($T['after']['pipes']['cys']) -join "`r`n"))
+        $null = Save-Screenshot ($pfx + '-screen-end.png')
+        $T['logs'] = Save-TeamLogs $pfx
+        $T['evidence'] = Save-AppEvidence $pfx
+        try { Save-AppEventLog $pfx $CTX['team_scene_utc'] } catch { }
+        $T['observe'] = [ordered]@{ end_reason = $obs['end_reason']; click_at = $obs['click_at']; ticks = $obs['ticks']; node_exited_at = $obs['node_exited_at']; node_exit_code = $obs['node_exit_code']; new_cysd = @($obs['new_cysd']).Count; windows_at_end = $obs['windows_at_end'] }
+
+        # ---- reference facts of this side (bash that ran, new pipes) and the verdict ----
+        $bashRows = New-Object System.Collections.Generic.List[object]
+        $kinds = @{}
+        $procRows = 0
+        foreach ($rec in $obs['procs_seen']) {
+            if (@('bash.exe', 'sh.exe', 'python.exe', 'python3.exe', 'pythonw.exe', 'cys.exe') -contains ([string]$rec['name']).ToLowerInvariant()) { $procRows++ }
+            if ([string]$rec['name'] -ieq 'bash.exe') {
+                $kd = Get-TeamBashKind ([string]$rec['path'])
+                $bashRows.Add([ordered]@{ id = $rec['id']; ppid = $rec['ppid']; kind = $kd; path = $rec['path']; cmd = $rec['cmd']; created = $rec['created']; first_seen = $rec['first_seen']; last_seen = $rec['last_seen'] })
+                if ($kinds.ContainsKey($kd)) { $kinds[$kd] = [int]$kinds[$kd] + 1 } else { $kinds[$kd] = 1 }
+            }
+        }
+        $kt = New-Object System.Collections.Generic.List[string]
+        foreach ($kk in @($kinds.Keys)) { $kt.Add(('{0} x{1}' -f $kk, $kinds[$kk])) }
+        $bashSummary = 'no bash.exe was seen running'
+        if ($kt.Count -gt 0) { $bashSummary = ($kt.ToArray() -join ', ') }
+        $newPipes = New-Object System.Collections.Generic.List[string]
+        foreach ($pn in @($T['after']['pipes']['cys'])) {
+            if (@($T['before']['pipes']['cys']) -notcontains [string]$pn) { $newPipes.Add([string]$pn) }
+        }
+        $psRef = [ordered]@{ bash_summary = $bashSummary; bash_rows = $bashRows.ToArray(); bash_static = $T['before']['bash_static']; new_pipes = $newPipes.ToArray(); pipes_first_seen = $obs['pipes_first_seen']; proc_rows_seen = $procRows; dept_dirs_after = $T['after']['dept_dirs']; daemon_log_tails = $T['logs']['tails'] }
+        $facts = Read-TeamFacts $pfx
+        $cjTeam = $null
+        if ($null -eq $facts) { $cjTeam = Read-CdpJson $pfx }
+        $tv = Get-TeamVerdict -Facts $facts -Obs $obs -PsRef $psRef -Cj $cjTeam
+        $CTX['team_verdict'] = $tv
+        Save-Json 'appe2e-team-verdict.json' $tv 8
+    } catch {
+        $T['error'] = Format-ErrorText $_
+        Add-DiagError 'team scene' $_
+        if ($null -eq $CTX['team_verdict']) { Save-TeamNotRun ('the scene stopped on an exception: ' + $_.Exception.Message) }
+    } finally {
+        if ($prepared) {
+            $cl = [ordered]@{ node_killed = @(); reset = $null; webview2_policy_removed = $null }
+            $T['cleanup'] = $cl
+            try {
+                $nk = New-Object System.Collections.Generic.List[string]
+                foreach ($np in @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 30 -Filter "Name = 'node.exe'" -ErrorAction Stop)) {
+                    if ([string]$np.CommandLine -like '*cdp-update.mjs*') {
+                        Stop-ProcessTree -ProcessId ([int]$np.ProcessId)
+                        $nk.Add(('node#{0}' -f $np.ProcessId))
+                    }
+                }
+                $cl['node_killed'] = $nk.ToArray()
+            } catch { }
+            try { $cl['reset'] = Reset-AppState 'after-team' } catch { }
+            try { $cl['webview2_policy_removed'] = Remove-WebView2DebugPolicy $CTX['wv2_policy'] } catch { }
+        }
+        $T['finished'] = (Get-IsoNow)
+    }
+}
+
+# =========================================================================
 # main
 # =========================================================================
 $CTX['script_start_utc'] = (Get-Date).ToUniversalTime()
@@ -1254,6 +1897,11 @@ try {
         Save-Json 'appe2e-verdict.json' $RUN['verdict'] 5
     }
     Invoke-Step 'summary' { Write-AppSummary }
+    # the TEAM scene: LAST - after the verdict and the summary of the earlier scenes are already on disk (a hang or a crash of this scene
+    # cannot take them away), after the restore and the cleanup; it checks SAC again. The report step then ADDS a team key + line to
+    # appe2e-verdict.json and two TEAM lines to appe2e-summary.txt (the 10 lines written above stay byte for byte as they are).
+    Invoke-Step 'team' { Invoke-TeamScene }
+    Invoke-Step 'team-report' { Add-TeamSummary; Add-TeamToVerdict }
     $RUN['finished'] = (Get-IsoNow)
     Save-Run
     Complete-DiagScript 'app-e2e'

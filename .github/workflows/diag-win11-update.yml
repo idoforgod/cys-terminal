@@ -632,12 +632,15 @@ jobs:
   # product branch (artifact of the run in diag/appe2e-input.json), updated through the REAL Update button (click flow), once with
   # SAC off (success path) and once with REAL Smart App Control on (blocked path). [appe2e-only] in the commit message runs ONLY this
   # job (and its gate); it is skipped by [sacreal-only] or [product-only] alone; without a tag it runs only when the input has a run id.
+  # 5th run: after the restore a LAST scene TEAM runs in the same script (the "create a team directly" flow of the real UI, SAC off:
+  # app start + up to 6 min of observation + evidence, about 10-14 min) - the job and the script step got +15 min for it, and
+  # DIAG_TEAM_EXTRA_MIN (+15, on top of DIAG_JOB_LIMIT_MIN 40 which the OFF / ON scenes keep using unchanged) is the time the scene may use.
   app-e2e:
     name: 'app-e2e (windows-11-arm)'
     needs: appe2e-gate
     if: ${{ contains(github.event.head_commit.message, '[appe2e-only]') || (needs.appe2e-gate.outputs.go == 'true' && !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]')) }}
     runs-on: windows-11-arm
-    timeout-minutes: 50
+    timeout-minutes: 65
     # download-artifact reads the artifacts of ANOTHER workflow run: needs actions: read (a job level block replaces the workflow one)
     permissions:
       contents: write
@@ -645,6 +648,7 @@ jobs:
     env:
       DIAG_MATRIX_OS: windows-11-arm
       DIAG_JOB_LIMIT_MIN: '40'
+      DIAG_TEAM_EXTRA_MIN: '15'
       APPE2E_RUN_ID: ${{ needs.appe2e-gate.outputs.run_id }}
       APPE2E_ARTIFACT: ${{ needs.appe2e-gate.outputs.artifact }}
       APPE2E_MANIFEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/diag/appe2e-manifest.json
@@ -712,12 +716,13 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: ${{ runner.temp }}\appe2e-installer
 
-      # one step = one PowerShell process: inputs -> OFF run (success path) -> reinstall -> ON run under REAL SAC -> RESTORE (see
-      # diag/app-e2e.ps1). GITHUB_TOKEN is only for the checkpoint upload the script makes before SAC is turned on.
+      # one step = one PowerShell process: inputs -> OFF run (success path) -> reinstall -> ON run under REAL SAC -> RESTORE -> cleanup ->
+      # events -> verdict -> summary -> TEAM scene (last, SAC off; +15 min of step time for it) -> TEAM report (see diag/app-e2e.ps1).
+      # GITHUB_TOKEN is only for the checkpoint upload the script makes before SAC is turned on.
       - name: app-e2e
         shell: powershell
         continue-on-error: true
-        timeout-minutes: 36
+        timeout-minutes: 51
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPE2E_INSTALLER_DIR: ${{ runner.temp }}\appe2e-installer

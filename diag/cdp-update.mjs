@@ -12,6 +12,8 @@
 //                          used by sacreal-e2e.ps1 before Smart App Control is turned on
 //   mode ui / uipre:       the REAL UI flow (Update button -> panel -> bin patch button -> confirm), see the block "4th task" below;
 //                          used by app-e2e.ps1 (uipre = attach + wait for the UI, no click)
+//   mode uiteam:           the "create a team directly" flow of the real UI (scene TEAM of app-e2e.ps1), see the block "5th task" below;
+//                          nothing is invoked instead of a click (no fallback call)
 //
 // Success path of install_update = the app exits by itself, so the socket closing is an expected result.
 // The result file <out>/<prefix>-cdp.json is rewritten after every step so partial results survive any kill.
@@ -1167,6 +1169,1133 @@ async function runUiMode() {
 }
 
 // ---------------------------------------------------------------------------
+// 5th task (diag/app-e2e.ps1, scene TEAM): the "create a team directly" flow of the REAL UI of the 0.14.43 app. Mode:
+//   uiteam  attach, wait for the UI (a workspace tab AND a pane are drawn = the product's start() has finished), install the page
+//           recorder and the event listeners, open the "expert" section of the sidebar (real mouse click on #btn-expert-toggle), press
+//           the team button (#btn-ws-dept -> openTeamCreateFlow), answer the confirm window with its execute button (.modal-yes; when the
+//           product shows a menu first, its LAST item = "new numbered team"), then observe for --team-observe-sec (default 360) while the
+//           page is polled once a second: workspace tabs, the waiting screen (text + stage line), every toast (class, title, body), menus,
+//           confirm windows, and the Tauri events 'dept-create-progress' (the pack's @stage markers) and 'daemon-event' (raw, capped).
+//           At the end: the seat list of the new team (the product's own list_surfaces call), the alarm history of the Control Center
+//           (the only place where the sticky toast ids are visible) and facts for the verdict.
+// NOTHING IS INVOKED INSTEAD OF A BUTTON: if a click cannot be made the page state (DOM summary + screenshot) is saved and the mode ends
+// (no fallback call of allocate_dept_daemon). The only invoke() calls are read-only observations the product itself makes
+// (list_depts, read_dept_catalog, list_surfaces). The mode does not judge by screen texts: it records the texts verbatim and judges by
+// structure (selectors / counts / classes). Files: <prefix>-cdp.json (everything), <prefix>-facts.json (small: facts + reference for the
+// PowerShell verdict), <prefix>-live.json (tiny, rewritten every poll: the click time for the PowerShell side), <prefix>-ui-*.png.
+// Options: --team-observe-sec 360 --team-ready-wait-sec 150 --team-settle-sec 6 --team-react-sec 60.
+// Selectors follow the product UI (ui/src/main.ts, 0.14.43 snapshot 9650334f): #btn-expert-toggle / #wsbar-expert-body / #btn-ws-dept
+// (mountExpertSection), #ws-tabs > .ws-tab[data-ws-id] > .ws-title-row > .ws-name + .ws-sub (buildTab; pending placeholders are NOT drawn as
+// tabs), #root > .pane.dept-pending[aria-busy=true] > .dept-pending-box > .dept-pending-msg + .dept-pending-stage (renderDeptPending),
+// .confirm-overlay > .modal > h3 + p + .modal-btns > .modal-no + .modal-yes (confirmModal), #ctx-menu > .ctx-item (showCtxMenu),
+// #toasts > div.toast.<category> > .toast-name + .toast-detail (toast / stickyToast), #btn-cc + #cc-tabs .cc-tab[data-view=alarms] +
+// #cc-alarm-list .alarm-item (> .al-meta .al-title .al-body) (renderAlarmHistory).
+// ---------------------------------------------------------------------------
+const teamNum = (v, d) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+};
+const TEAM_OBSERVE_MS = Math.max(3, teamNum(args['team-observe-sec'], 360)) * 1000;
+const TEAM_READY_MS = Math.max(5, teamNum(args['team-ready-wait-sec'], 150)) * 1000;
+const TEAM_SETTLE_MS = Math.max(0, teamNum(args['team-settle-sec'], 6)) * 1000;
+const TEAM_REACT_MS = Math.max(3, teamNum(args['team-react-sec'], 60)) * 1000;
+const TEAM_FAIL_GRACE_MS = Math.max(2, teamNum(args['team-fail-grace-sec'], 20)) * 1000;
+const K_TEAM = {
+  toggle: "document.getElementById('btn-expert-toggle')",
+  entry: "document.getElementById('btn-ws-dept')",
+  menu_last: "(function () { var n = document.querySelectorAll('#ctx-menu .ctx-item'); return n.length ? n[n.length - 1] : null; })()",
+  confirm_yes: "document.querySelector('.confirm-overlay .modal .modal-yes')",
+  cc_btn: "document.getElementById('btn-cc')",
+  cc_alarm_tab: "document.querySelector('#cc-tabs .cc-tab[data-view=\"alarms\"]')",
+  cc_close: "document.getElementById('btn-cc-close')",
+};
+
+// ==== TEAM-PURE-BEGIN (self-contained: nothing in this block may use anything defined outside it; the local self-check evaluates exactly this text) ====
+const TEAM_TIMELINE_MAX = 600;
+const TEAM_DAEMON_EVENTS_MAX = 400;
+const TEAM_SUB_EVENTS_MAX = 80;
+
+function teamNorm(s) {
+  return String(s === undefined || s === null ? '' : s).replace(/[0-9]+/g, 'N');
+}
+function teamR1(x) {
+  return Math.round(Number(x) * 10) / 10;
+}
+function teamCut(s, n) {
+  const t = String(s === undefined || s === null ? '' : s);
+  return t.length > n ? t.slice(0, n) : t;
+}
+function teamHasToken(cls, token) {
+  return (' ' + String(cls || '') + ' ').indexOf(' ' + token + ' ') >= 0;
+}
+// toast elements are "toast <category>": a failure is announced with watchdog (create failures) or health (blocked installer, ...)
+function teamIsFailureCls(cls) {
+  return teamHasToken(cls, 'watchdog') || teamHasToken(cls, 'health');
+}
+function teamToastKey(t) {
+  return t && t.name ? String(t.name) : '(no name)';
+}
+
+function teamNewState() {
+  return {
+    stage: 'start',
+    params: null,
+    prev: null,
+    last: null,
+    polls: 0,
+    timeline: [],
+    timeline_dropped: 0,
+    sub_events: 0,
+    seen_before: {}, // toast keys seen in the page before the entry click = baseline (not caused by the team flow)
+    entry_ms: null,
+    entry_at: null,
+    create_ms: null,
+    create_at: null,
+    create_click_ok: false,
+    observe_end_ms: null,
+    observe_end_reason: null,
+    tab_ids_before: null,
+    tab_names_before: null,
+    tab_count_before: null,
+    tab_ms: null,
+    tab_id: null,
+    tab_name: null,
+    pending_seen: false,
+    pending_first_ms: null,
+    busy_seen: false,
+    stage_texts: [],
+    pending_samples: [],
+    pending_norms: {},
+    last_pending_sample_t: 0,
+    stage_events: [],
+    daemon_events: [],
+    event_counts: {},
+    ev_cursor: 0,
+    confirm: null,
+    menu: null,
+    confirm_closed: false,
+    ready: null,
+    seats: null,
+    alarms: null,
+    flow_error: null,
+  };
+}
+
+// what changed between two page snapshots (pageTeamSnapshot): [{ kind, ... }]; prev = null on the first snapshot
+function teamDiffSnapshot(prev, cur) {
+  const out = [];
+  if (!cur) return out;
+  const p = prev || null;
+  const name = (t) => t.name;
+  const pt = p && Array.isArray(p.tabs) ? p.tabs : [];
+  const ct = Array.isArray(cur.tabs) ? cur.tabs : [];
+  const pById = {};
+  pt.forEach((t) => {
+    pById[t.id] = t;
+  });
+  const cById = {};
+  ct.forEach((t) => {
+    cById[t.id] = t;
+  });
+  const added = ct.filter((t) => !pById[t.id]);
+  const removed = pt.filter((t) => !cById[t.id]);
+  const renamed = ct.filter((t) => pById[t.id] && pById[t.id].name !== t.name);
+  const activeNow = ct.filter((t) => t.active).map(name).join('|');
+  const activeBefore = pt.filter((t) => t.active).map(name).join('|');
+  if (!p || added.length || removed.length || renamed.length || activeNow !== activeBefore) {
+    out.push({ kind: 'tabs', count: ct.length, names: ct.map(name), added: added.map(name), removed: removed.map(name), active: activeNow });
+  }
+  ct.forEach((t) => {
+    const o = pById[t.id];
+    if (o && teamNorm(o.sub) !== teamNorm(t.sub)) out.push({ kind: 'tab_sub', id: t.id, name: t.name, sub: t.sub });
+  });
+  const rootKey = (r) => JSON.stringify(r ? [r.kind, teamNorm(r.msg), r.stage, r.idle_btn, r.pane_count, r.role_slots, r.pane_titles] : null);
+  if (!p || rootKey(p.root) !== rootKey(cur.root)) {
+    const r = cur.root || {};
+    out.push({ kind: 'root', root: { kind: r.kind, msg: r.msg, stage: r.stage, idle_btn: r.idle_btn, pane_count: r.pane_count, role_slots: r.role_slots, pane_titles: r.pane_titles } });
+  }
+  const pe = p ? p.entry : null;
+  const ce = cur.entry || {};
+  if (!pe || pe.exists !== ce.exists || pe.visible !== ce.visible || pe.disabled !== ce.disabled || pe.text !== ce.text) out.push({ kind: 'entry', entry: ce });
+  const pg = p ? p.toggle : null;
+  const cg = cur.toggle || {};
+  if (!pg || pg.exists !== cg.exists || pg.visible !== cg.visible || pg.expanded !== cg.expanded) out.push({ kind: 'toggle', toggle: cg });
+  const pcf = p ? p.confirm : null;
+  const ccf = cur.confirm || null;
+  if (ccf && (!pcf || pcf.title !== ccf.title)) out.push({ kind: 'confirm_open', title: ccf.title, body: ccf.body, buttons: ccf.buttons });
+  if (!ccf && pcf) out.push({ kind: 'confirm_close', title: pcf.title });
+  const pm = p ? p.menu : null;
+  const cm = cur.menu || null;
+  if (cm && (!pm || JSON.stringify(pm) !== JSON.stringify(cm))) out.push({ kind: 'menu_open', items: cm.map((i) => i.text) });
+  if (!cm && pm) out.push({ kind: 'menu_close' });
+  const ptm = {};
+  (p && Array.isArray(p.toasts) ? p.toasts : []).forEach((t) => {
+    ptm[teamToastKey(t)] = t;
+  });
+  const ctm = {};
+  (Array.isArray(cur.toasts) ? cur.toasts : []).forEach((t) => {
+    ctm[teamToastKey(t)] = t;
+  });
+  (Array.isArray(cur.toasts) ? cur.toasts : []).forEach((t) => {
+    const o = ptm[teamToastKey(t)];
+    if (!o) out.push({ kind: 'toast_new', cls: t.cls, name: t.name, detail: t.detail });
+    else if (o.detail !== t.detail || o.cls !== t.cls) out.push({ kind: 'toast_text', cls: t.cls, name: t.name, detail: t.detail, prev_detail: o.detail });
+  });
+  (p && Array.isArray(p.toasts) ? p.toasts : []).forEach((t) => {
+    if (!ctm[teamToastKey(t)]) out.push({ kind: 'toast_gone', cls: t.cls, name: t.name });
+  });
+  if (!p || p.daemon_info !== cur.daemon_info) out.push({ kind: 'daemon_info', text: cur.daemon_info });
+  if (p && p.cc_open !== cur.cc_open) out.push({ kind: 'cc', open: !!cur.cc_open });
+  return out;
+}
+
+// feed one page snapshot into the state: time table (only changes), baseline toasts, waiting-screen facts, new-tab detection.
+// Returns { new_tab, first_stage_text, changes } so that the caller knows when to take a screenshot.
+function teamNote(S, snap) {
+  const res = { new_tab: false, first_stage_text: false, changes: 0 };
+  if (!snap) return res;
+  S.polls++;
+  const t = typeof snap.t === 'number' ? snap.t : Date.now();
+  const changes = teamDiffSnapshot(S.prev, snap);
+  for (const ch of changes) {
+    if (ch.kind === 'tab_sub') {
+      if (S.sub_events >= TEAM_SUB_EVENTS_MAX) continue;
+      S.sub_events++;
+    }
+    if (S.timeline.length >= TEAM_TIMELINE_MAX) {
+      S.timeline_dropped++;
+      continue;
+    }
+    const rec = { t, ms_entry: S.entry_ms === null ? null : t - S.entry_ms, ms_create: S.create_ms === null ? null : t - S.create_ms };
+    for (const k of Object.keys(ch)) rec[k] = ch[k];
+    S.timeline.push(rec);
+    res.changes++;
+  }
+  if (S.entry_ms === null) {
+    for (const x of Array.isArray(snap.toasts) ? snap.toasts : []) S.seen_before[teamToastKey(x)] = true;
+  }
+  const root = snap.root || {};
+  if (S.create_ms !== null) {
+    if (root.kind === 'pending' && !S.pending_seen) {
+      S.pending_seen = true;
+      S.pending_first_ms = t - S.create_ms;
+    }
+    if (snap.entry && snap.entry.disabled && !S.busy_seen) S.busy_seen = true;
+    if (root.stage && (S.stage_texts.length === 0 || S.stage_texts[S.stage_texts.length - 1].text !== root.stage)) {
+      S.stage_texts.push({ ms: t - S.create_ms, text: String(root.stage) });
+      if (S.stage_texts.length === 1) res.first_stage_text = true;
+    }
+    if (S.tab_ids_before !== null && S.tab_ms === null) {
+      const fresh = (Array.isArray(snap.tabs) ? snap.tabs : []).filter((x) => S.tab_ids_before.indexOf(x.id) < 0)[0];
+      if (fresh) {
+        S.tab_ms = t;
+        S.tab_id = fresh.id;
+        S.tab_name = fresh.name;
+        res.new_tab = true;
+      }
+    }
+    if (root.kind === 'pending') {
+      S.pending_norms[teamNorm(root.msg)] = true;
+      if (t - S.last_pending_sample_t >= 15000 && S.pending_samples.length < 40) {
+        S.last_pending_sample_t = t;
+        S.pending_samples.push({ ms_create: t - S.create_ms, msg: root.msg, stage: root.stage });
+      }
+    }
+  }
+  S.prev = snap;
+  S.last = snap;
+  return res;
+}
+
+// events pulled from the page (pagePollTeamEvents): 'dept-create-progress' (the pack's stage markers) and 'daemon-event' (raw, capped)
+function teamNoteEvents(S, evs) {
+  for (const e of Array.isArray(evs) ? evs : []) {
+    if (!e || typeof e !== 'object') continue;
+    const ms = S.create_ms === null ? null : e.t - S.create_ms;
+    if (e.n === 'dept-create-progress') {
+      const p = e.p && typeof e.p === 'object' ? e.p : {};
+      const rec = {
+        t: e.t,
+        ms_create: ms,
+        id: p.id === undefined || p.id === null ? null : String(p.id),
+        stage: p.stage === undefined || p.stage === null ? null : String(p.stage),
+        raw: teamCut(JSON.stringify(e.p === undefined ? null : e.p), 300),
+      };
+      S.stage_events.push(rec);
+      if (S.timeline.length < TEAM_TIMELINE_MAX) S.timeline.push({ t: e.t, ms_entry: S.entry_ms === null ? null : e.t - S.entry_ms, ms_create: ms, kind: 'stage_event', stage: rec.stage, id: rec.id, raw: rec.raw });
+    } else if (e.n === 'daemon-event') {
+      if (S.daemon_events.length < TEAM_DAEMON_EVENTS_MAX) {
+        S.daemon_events.push({ t: e.t, ms_create: ms, name: e.name, category: e.category, slug: e.slug, sid: e.sid, kind: e.kind, title: e.title, body: e.body });
+      }
+      if (e.kind && S.timeline.length < TEAM_TIMELINE_MAX) {
+        S.timeline.push({ t: e.t, ms_entry: S.entry_ms === null ? null : e.t - S.entry_ms, ms_create: ms, kind: 'daemon_event', name: e.name, category: e.category, event_kind: e.kind, title: e.title, body: e.body });
+      }
+    }
+  }
+}
+
+// ordered stage list with the seconds each stage lasted (until the next marker; the last one until the real tab stood)
+function teamStageSummary(S) {
+  const evs = S.stage_events.filter((e) => e.ms_create !== null).slice().sort((a, b) => a.t - b.t);
+  const endMs = S.tab_ms !== null && S.create_ms !== null ? S.tab_ms - S.create_ms : null;
+  const out = [];
+  for (let i = 0; i < evs.length; i++) {
+    const cur = evs[i];
+    let next = null;
+    if (i + 1 < evs.length) next = evs[i + 1].ms_create;
+    else if (endMs !== null && endMs >= cur.ms_create) next = endMs;
+    out.push({ stage: cur.stage, at_s: teamR1(cur.ms_create / 1000), dur_s: next === null ? null : teamR1((next - cur.ms_create) / 1000) });
+  }
+  return out;
+}
+
+function teamStageLine(stages) {
+  if (!stages.length) return 'no stage events';
+  return stages.map((s) => s.stage + ' at ' + s.at_s + 's' + (s.dur_s === null ? '' : ' (' + s.dur_s + 's)')).join(' > ');
+}
+
+// new notifications since the entry click, sorted: failure-like (watchdog / health) before the real tab stood = failure alerts (they count
+// against PASS); failure-like after the tab stood = post-creation notices (reference: e.g. "members could not be started");
+// everything else = other. Toasts that were already on the screen before the click (baseline, by title) never count.
+function teamClassifyAlerts(S) {
+  const failure = [];
+  const post = [];
+  const other = [];
+  const end = S.observe_end_ms;
+  for (const r of S.timeline) {
+    if (r.kind !== 'toast_new') continue;
+    if (S.entry_ms === null || r.t < S.entry_ms) continue;
+    if (end !== null && r.t > end) continue;
+    if (S.seen_before[r.name ? String(r.name) : '(no name)']) continue;
+    const item = { t: r.t, ms_create: r.ms_create, cls: r.cls, name: r.name, detail: r.detail };
+    if (!teamIsFailureCls(r.cls)) other.push(item);
+    else if (S.tab_ms !== null && r.t >= S.tab_ms) post.push(item);
+    else failure.push(item);
+  }
+  return { failure, post_creation: post, other };
+}
+
+// the time table as text: one line per entry, sorted by time (seconds after the execute click, seconds after the entry click, kind, details).
+// Texts are verbatim; a line cuts them at 400 characters (the JSON records have them whole).
+function teamTimelineText(S) {
+  const rows = S.timeline.slice().sort((a, b) => a.t - b.t);
+  const sec = (ms) => (ms === null || ms === undefined ? '      ---' : (ms < 0 ? '-' : '+') + String(teamR1(Math.abs(ms) / 1000)).padStart(7) + 's');
+  const one = (v) => teamCut(String(v === undefined || v === null ? '' : v).replace(/\s+/g, ' '), 400);
+  const lines = ['# TEAM scene time table (changes only). columns: seconds after the execute click | seconds after the entry click | kind | details (texts verbatim, cut at 400 characters here)'];
+  for (const r of rows) {
+    let d = '';
+    if (r.kind === 'tabs') d = 'count=' + r.count + ' names=[' + r.names.join('|') + '] added=[' + r.added.join('|') + '] removed=[' + r.removed.join('|') + '] active=' + r.active;
+    else if (r.kind === 'tab_sub') d = r.name + ' :: ' + one(r.sub);
+    else if (r.kind === 'root') d = 'kind=' + r.root.kind + ' msg="' + one(r.root.msg) + '" stage="' + one(r.root.stage) + '" idle_btn="' + one(r.root.idle_btn) + '" panes=' + r.root.pane_count + ' role_slots=' + r.root.role_slots + ' titles=[' + (r.root.pane_titles || []).join('|') + ']';
+    else if (r.kind === 'entry') d = 'exists=' + r.entry.exists + ' visible=' + r.entry.visible + ' disabled=' + r.entry.disabled + ' text="' + one(r.entry.text) + '"';
+    else if (r.kind === 'toggle') d = 'exists=' + r.toggle.exists + ' visible=' + r.toggle.visible + ' expanded=' + r.toggle.expanded;
+    else if (r.kind === 'confirm_open') d = 'title="' + one(r.title) + '" buttons=[' + (r.buttons || []).map((b) => b.text).join('|') + '] body="' + one(r.body) + '"';
+    else if (r.kind === 'confirm_close') d = 'title="' + one(r.title) + '"';
+    else if (r.kind === 'menu_open') d = 'items=[' + (r.items || []).join(' | ') + ']';
+    else if (r.kind === 'toast_new' || r.kind === 'toast_text') d = '[' + r.cls + '] ' + one(r.name) + ' :: ' + one(r.detail);
+    else if (r.kind === 'toast_gone') d = '[' + r.cls + '] ' + one(r.name);
+    else if (r.kind === 'stage_event') d = 'stage=' + r.stage + ' id=' + r.id + ' raw=' + r.raw;
+    else if (r.kind === 'daemon_event') d = r.name + ' [' + r.category + '] kind=' + r.event_kind + ' title="' + one(r.title) + '" body="' + one(r.body) + '"';
+    else if (r.kind === 'daemon_info') d = one(r.text);
+    else if (r.kind === 'cc') d = 'open=' + r.open;
+    lines.push(sec(r.ms_create) + ' ' + sec(r.ms_entry) + ' ' + r.kind.padEnd(13) + ' ' + d);
+  }
+  if (S.timeline_dropped > 0) lines.push('# ' + S.timeline_dropped + ' more entries were dropped (cap ' + TEAM_TIMELINE_MAX + ')');
+  return lines.join('\r\n') + '\r\n';
+}
+
+function teamSeatsFrom(ls) {
+  if (!ls || ls.ok !== true) return { ok: false, error: ls && ls.error ? teamCut(ls.error, 300) : 'no result', count: null, roles: [], surfaces: [] };
+  const v = ls.value;
+  const arr = Array.isArray(v) ? v : v && Array.isArray(v.surfaces) ? v.surfaces : null;
+  if (!arr) return { ok: false, error: 'unexpected shape: ' + teamCut(JSON.stringify(v), 300), count: null, roles: [], surfaces: [] };
+  const surfaces = arr.slice(0, 30).map((s) => {
+    const o = {};
+    if (s && typeof s === 'object') {
+      for (const k of Object.keys(s)) {
+        const x = s[k];
+        if (typeof x === 'string') o[k] = teamCut(x, 120);
+        else if (typeof x === 'number' || typeof x === 'boolean' || x === null) o[k] = x;
+      }
+    }
+    return o;
+  });
+  const roles = arr.map((s) => (s && typeof s === 'object' && s.role !== undefined && s.role !== null ? String(s.role) : '(none)'));
+  return { ok: true, count: arr.length, roles, surfaces };
+}
+
+function teamCompactValue(v, max) {
+  let s;
+  try {
+    s = JSON.stringify(v);
+  } catch (e) {
+    s = String(v);
+  }
+  if (s === undefined) return null;
+  return s.length > max ? { truncated: true, length: s.length, head: s.slice(0, max) } : v;
+}
+
+// the registry key of the team that was just created: a key that was not there before (the tab name when it is one of them)
+function teamPickNewDept(beforeKeys, depts, tabName) {
+  const d = depts && typeof depts === 'object' ? depts : {};
+  const before = Array.isArray(beforeKeys) ? beforeKeys : [];
+  const fresh = Object.keys(d).filter((k) => before.indexOf(k) < 0);
+  if (tabName && fresh.indexOf(tabName) >= 0) return tabName;
+  return fresh.length ? fresh[0] : null;
+}
+
+function teamParseAlarms(items) {
+  return (Array.isArray(items) ? items : []).map((it) => {
+    const parts = String((it && it.meta) || '').split(' \u00b7 ');
+    return { time: parts[0] || null, category: parts[1] || null, id: parts.length > 2 ? parts.slice(2).join(' \u00b7 ') : null, title: it ? it.title : null, body: it ? it.body : null, cls: it ? it.cls : null };
+  });
+}
+
+// facts for the verdict (node part) + reference facts (never used for the verdict) from the recorded state and the click records
+function teamBuildFacts(S, clicks) {
+  const find = (label) => {
+    const l = (clicks || []).filter((c) => c && c.label === label);
+    return l.length ? l[l.length - 1] : null;
+  };
+  const entry = find('team entry button');
+  const toggle = find('expert toggle');
+  const menu = find('team menu item');
+  const yes = find('team confirm yes');
+  const al = teamClassifyAlerts(S);
+  const stages = teamStageSummary(S);
+  const last = S.last || {};
+  const entryOk = !!(entry && entry.ok);
+  const confirmSeen = !!S.confirm;
+  const yesOk = !!(yes && yes.ok);
+  const tabCreated = S.tab_ms !== null;
+  const flowStarted = yesOk && (S.pending_seen || tabCreated || S.busy_seen);
+  const rolledBack = S.pending_seen && !tabCreated && !!last.root && last.root.kind !== 'pending';
+  const why = S.flow_error ? ' (' + S.flow_error + ')' : '';
+  const missing = [];
+  if (!entryOk) missing.push('the team button could not be clicked' + (entry && entry.error ? ' (' + entry.error + ')' : why));
+  if (entryOk && !confirmSeen) missing.push('no confirm window appeared after the click' + why);
+  if (confirmSeen && !yesOk) missing.push('the execute button of the confirm window could not be clicked' + (yes && yes.error ? ' (' + yes.error + ')' : why));
+  if (yesOk && !flowStarted) missing.push('the flow did not start: no waiting screen, no busy button and no new tab after the execute click');
+  if (flowStarted && !tabCreated) missing.push('no new team tab stood' + (rolledBack ? ' (the waiting screen went away without one: the creation failed)' : ' within the observation window'));
+  for (const a of al.failure) missing.push('failure notification [' + a.cls + '] ' + a.name + ' :: ' + teamCut(a.detail, 300));
+  const tabsAfter = Array.isArray(last.tabs) ? last.tabs : [];
+  const facts = {
+    ready_ok: !!(S.ready && S.ready.ok),
+    entry_found: !!(entry && entry.find && entry.find.found),
+    entry_click_ok: entryOk,
+    entry_click_method: entry ? entry.method : null,
+    toggle_click_method: toggle ? toggle.method : null,
+    menu_seen: !!S.menu,
+    menu_picked: S.menu ? S.menu.picked_text : null,
+    menu_click_ok: !!(menu && menu.ok),
+    confirm_seen: confirmSeen,
+    confirm_title: S.confirm ? S.confirm.title : null,
+    confirm_click_ok: yesOk,
+    confirm_click_method: yes ? yes.method : null,
+    confirm_closed: !!S.confirm_closed,
+    any_dom_click: [toggle, entry, menu, yes].some((c) => !!c && c.method === 'dom_click'),
+    flow_started: flowStarted,
+    pending_seen: S.pending_seen,
+    pending_first_ms: S.pending_first_ms,
+    busy_button_seen: S.busy_seen,
+    tab_created: tabCreated,
+    tab_ms: S.tab_ms !== null && S.create_ms !== null ? S.tab_ms - S.create_ms : null,
+    tab_name: S.tab_name,
+    tab_id: S.tab_id,
+    tab_count_before: S.tab_count_before,
+    tab_names_before: S.tab_names_before,
+    tab_count_after: tabsAfter.length,
+    tab_names_after: tabsAfter.map((t) => t.name),
+    rolled_back: rolledBack,
+    failure_alert_count: al.failure.length,
+    failure_alerts: al.failure,
+    post_creation_alert_count: al.post_creation.length,
+    post_creation_alerts: al.post_creation,
+    other_new_toast_count: al.other.length,
+    stage_event_count: S.stage_events.length,
+    stage_source: S.stage_events.length ? 'event' : S.stage_texts.length ? 'text' : 'none',
+    observe_end_reason: S.observe_end_reason,
+    flow_error: S.flow_error,
+  };
+  // reference: what the screen / the pack said
+  const post = S.timeline.filter((r) => (r.kind === 'toast_new' || r.kind === 'toast_text') && S.tab_ms !== null && r.t >= S.tab_ms && (S.observe_end_ms === null || r.t <= S.observe_end_ms) && !S.seen_before[r.name ? String(r.name) : '(no name)']);
+  const formationLine = post.length
+    ? post.slice(0, 8).map((r) => (r.ms_create === null ? '?' : teamR1(r.ms_create / 1000)) + 's [' + r.cls + '] ' + teamCut(r.name, 80) + ' :: ' + teamCut(r.detail, 200)).join(' | ')
+    : 'no notification after the tab stood';
+  const seats = S.seats || null;
+  const seatsLine = seats ? (seats.ok ? 'count=' + seats.count + ' roles=[' + seats.roles.join(',') + ']' : 'not available: ' + seats.error) : 'not read';
+  const ps = S.pending_samples;
+  const tabLine = tabCreated
+    ? 'tab ' + JSON.stringify(S.tab_name) + ' stood ' + teamR1(facts.tab_ms / 1000) + ' s after the execute click (tabs ' + facts.tab_count_before + ' -> ' + facts.tab_count_after + ')'
+    : 'no new tab (tabs ' + facts.tab_count_before + ' -> ' + facts.tab_count_after + ')';
+  const reference = {
+    stages,
+    stage_line: teamStageLine(stages),
+    stage_source: facts.stage_source,
+    stage_texts: S.stage_texts.slice(0, 20),
+    tab_line: tabLine,
+    confirm: S.confirm ? { title: S.confirm.title, body_head: teamCut(S.confirm.body, 600), buttons: (S.confirm.buttons || []).map((b) => b.text) } : null,
+    menu: S.menu,
+    pending_first_text: ps.length ? ps[0].msg : null,
+    pending_last_text: ps.length ? ps[ps.length - 1].msg : null,
+    pending_text_variants: Object.keys(S.pending_norms).length,
+    post_creation_notices: post.slice(0, 20).map((r) => ({ ms_create: r.ms_create, kind: r.kind, cls: r.cls, name: r.name, detail: r.detail })),
+    formation_line: formationLine,
+    seats,
+    seats_line: seatsLine,
+    event_counts: S.event_counts,
+    alarm_count: S.alarms && S.alarms.items ? S.alarms.items.length : null,
+    alarm_id_count: S.alarms && S.alarms.items ? S.alarms.items.filter((a) => a.id).length : null,
+    alarm_ids: S.alarms && S.alarms.items ? S.alarms.items.filter((a) => a.id).slice(0, 40).map((a) => ({ id: a.id, category: a.category, title: a.title })) : [],
+    final_daemon_info: last.daemon_info === undefined ? null : last.daemon_info,
+    final_root: last.root || null,
+  };
+  return { facts, reference, node_ok: missing.length === 0, node_missing: missing };
+}
+// ==== TEAM-PURE-END ====
+
+// ==== TEAM-PAGE-BEGIN (functions that run INSIDE the page: they are stringified into Runtime.evaluate expressions, so each must be self-contained) ====
+// one JSON snapshot of everything the team scene looks at (selectors: see the block comment above)
+function pageTeamSnapshot() {
+  var txt = function (el) {
+    return el && el.textContent ? String(el.textContent).replace(/\s+/g, ' ').trim() : '';
+  };
+  var q = function (s, root) {
+    return (root || document).querySelector(s);
+  };
+  var qa = function (s, root) {
+    return Array.prototype.slice.call((root || document).querySelectorAll(s));
+  };
+  var clsOf = function (el) {
+    return String(el && el.className ? el.className : '');
+  };
+  var hasCls = function (el, c) {
+    return (' ' + clsOf(el) + ' ').indexOf(' ' + c + ' ') >= 0;
+  };
+  var vis = function (el) {
+    if (!el) return false;
+    var r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  var cut = function (s, n) {
+    var t = String(s === undefined || s === null ? '' : s);
+    return t.length > n ? t.slice(0, n) : t;
+  };
+  var btn = function (b) {
+    return { text: txt(b), cls: clsOf(b), disabled: !!b.disabled };
+  };
+  var o = { t: Date.now() };
+  o.title = document.title;
+  o.daemon_info = cut(txt(document.getElementById('daemon-info')), 200);
+  var tg = document.getElementById('btn-expert-toggle');
+  o.toggle = tg ? { exists: true, visible: vis(tg), expanded: tg.getAttribute('aria-expanded') } : { exists: false, visible: false, expanded: null };
+  var en = document.getElementById('btn-ws-dept');
+  o.entry = en ? { exists: true, visible: vis(en), disabled: !!en.disabled, text: cut(txt(en), 80) } : { exists: false, visible: false, disabled: false, text: '' };
+  o.tabs = qa('#ws-tabs .ws-tab').map(function (tb) {
+    return {
+      id: tb.getAttribute('data-ws-id'),
+      name: cut(txt(q('.ws-name', tb)), 120),
+      sub: cut(txt(q('.ws-sub', tb)), 160),
+      active: hasCls(tb, 'active'),
+      busy: tb.getAttribute('aria-busy') === 'true',
+    };
+  });
+  o.tab_count = o.tabs.length;
+  var rootEl = document.getElementById('root');
+  var panes = rootEl ? qa('.pane', rootEl) : [];
+  var big = panes.filter(function (p) {
+    return hasCls(p, 'dept-pending') && !hasCls(p, 'role-slot');
+  })[0] || null;
+  var seatPanes = panes.filter(function (p) {
+    return p.getAttribute('data-sid') !== null && !hasCls(p, 'dept-pending');
+  });
+  var kind = 'empty';
+  if (big) kind = big.getAttribute('aria-busy') === 'true' ? 'pending' : 'idle';
+  else if (panes.length) kind = 'panes';
+  o.root = {
+    kind: kind,
+    msg: big ? cut(txt(q('.dept-pending-msg', big)), 600) : '',
+    stage: big ? cut(txt(q('.dept-pending-stage', big)), 300) : '',
+    idle_btn: big ? cut(txt(q('.dept-idle-btn', big)), 80) : '',
+    pane_count: seatPanes.length,
+    role_slots: panes.filter(function (p) {
+      return hasCls(p, 'role-slot');
+    }).length,
+    pane_titles: seatPanes.slice(0, 8).map(function (p) {
+      return cut(txt(q('.pane-title-text', p)), 80);
+    }),
+  };
+  var cm = q('.confirm-overlay .modal');
+  o.confirm = cm
+    ? { title: cut(txt(q('h3', cm)), 200), body: cut(q('p', cm) ? q('p', cm).textContent : '', 6000), buttons: qa('.modal-btns button', cm).map(btn) }
+    : null;
+  var mn = document.getElementById('ctx-menu');
+  o.menu = mn
+    ? qa('.ctx-item', mn).map(function (it) {
+        return { text: cut(txt(it), 160), disabled: hasCls(it, 'disabled') };
+      })
+    : null;
+  o.overlays = qa('.modal-overlay').length;
+  o.toasts = qa('#toasts > *').map(function (e) {
+    return { cls: clsOf(e), name: cut(txt(q('.toast-name', e)), 400), detail: cut(txt(q('.toast-detail', e)), 4000) };
+  });
+  var cc = document.getElementById('cc-panel');
+  o.cc_open = !!cc && !cc.hidden;
+  return JSON.stringify(o);
+}
+
+// what the page looks like when a step failed (selectors may have changed): the sidebar and the waiting area as HTML heads
+function pageTeamDomSummary() {
+  var txt = function (el) {
+    return el && el.textContent ? String(el.textContent).replace(/\s+/g, ' ').trim() : '';
+  };
+  var qa = function (s) {
+    return Array.prototype.slice.call(document.querySelectorAll(s));
+  };
+  var cut = function (s, n) {
+    var t = String(s === undefined || s === null ? '' : s);
+    return t.length > n ? t.slice(0, n) : t;
+  };
+  var one = function (sel, n) {
+    var e = document.querySelector(sel);
+    return e ? cut(e.outerHTML, n) : null;
+  };
+  var rootEl = document.getElementById('root');
+  var menu = document.getElementById('ctx-menu');
+  return JSON.stringify({
+    href: location.href,
+    title: document.title,
+    daemon_info: cut(txt(document.getElementById('daemon-info')), 200),
+    wsbar_head: one('#wsbar-head', 1500),
+    ws_tabs: one('#ws-tabs', 4000),
+    wsbar_expert: one('#wsbar-expert', 3000),
+    root_head: rootEl ? cut(rootEl.innerHTML, 3000) : null,
+    top_buttons: qa('#topbar button').map(function (b) {
+      return { id: b.id, text: cut(txt(b), 60), disabled: !!b.disabled };
+    }),
+    all_button_ids: qa('button[id]').map(function (b) {
+      return b.id;
+    }).slice(0, 80),
+    overlays: qa('.modal-overlay').map(function (e) {
+      return { cls: String(e.className || ''), text: cut(txt(e), 600) };
+    }),
+    menu: menu ? cut(txt(menu), 600) : null,
+    toasts: qa('#toasts > *').map(function (e) {
+      return cut(txt(e), 600);
+    }),
+    body_text_head: cut(document.body ? document.body.innerText : '', 3000),
+  });
+}
+
+// listeners for the Tauri events of the team flow: 'dept-create-progress' (payload {id, stage}) and 'daemon-event' (raw, compact)
+async function pageTeamListeners() {
+  window.__diagTeam = window.__diagTeam || { events: [], counts: {}, listen: {} };
+  var D = window.__diagTeam;
+  var reg = async function (n) {
+    if (D.listen[n]) return;
+    try {
+      await window.__TAURI__.event.listen(n, function (e) {
+        try {
+          var p = e && e.payload !== undefined ? e.payload : null;
+          var r = { t: Date.now(), n: n };
+          if (n === 'dept-create-progress') {
+            r.p = p;
+          } else {
+            var o = p && typeof p === 'object' ? p : {};
+            var pl = o.payload && typeof o.payload === 'object' ? o.payload : {};
+            r.name = String(o.name === undefined || o.name === null ? '' : o.name).slice(0, 120);
+            r.category = String(o.category === undefined || o.category === null ? '' : o.category).slice(0, 60);
+            r.slug = o.socket_slug === undefined || o.socket_slug === null ? null : String(o.socket_slug).slice(0, 120);
+            r.sid = o.surface_id === undefined ? null : o.surface_id;
+            r.kind = pl.kind === undefined || pl.kind === null ? null : String(pl.kind).slice(0, 80);
+            r.title = pl.title === undefined || pl.title === null ? null : String(pl.title).slice(0, 300);
+            r.body = pl.body === undefined || pl.body === null ? null : String(pl.body).slice(0, 1200);
+          }
+          var ck = n === 'daemon-event' ? 'daemon-event:' + r.name : n;
+          D.counts[ck] = (D.counts[ck] || 0) + 1;
+          if (n === 'dept-create-progress' || D.events.length < 700) D.events.push(r);
+        } catch (x) {}
+      });
+      D.listen[n] = 'ok';
+    } catch (x) {
+      D.listen[n] = 'fail: ' + String(x);
+    }
+  };
+  await reg('dept-create-progress');
+  await reg('daemon-event');
+  return JSON.stringify(D.listen);
+}
+
+function pagePollTeamEvents(from) {
+  var D = window.__diagTeam;
+  if (!D) return JSON.stringify({ n: 0, ev: [], counts: {} });
+  return JSON.stringify({ n: D.events.length, ev: D.events.slice(from || 0), counts: D.counts });
+}
+
+// one read-only call of the product's own commands (list_depts, read_dept_catalog, list_surfaces)
+async function pageInvoke(cmd, args) {
+  try {
+    var v = await window.__TAURI__.core.invoke(cmd, args);
+    return JSON.stringify({ ok: true, value: v === undefined ? null : v });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: e && e.message ? e.message : typeof e === 'string' ? e : JSON.stringify(e) });
+  }
+}
+
+// the alarm history list of the Control Center ("category + id" per entry is the only place where the sticky toast ids are visible)
+function pageTeamAlarms() {
+  var txt = function (el) {
+    return el && el.textContent ? String(el.textContent).replace(/\s+/g, ' ').trim() : '';
+  };
+  var q = function (s, root) {
+    return (root || document).querySelector(s);
+  };
+  var items = Array.prototype.slice.call(document.querySelectorAll('#cc-alarm-list .alarm-item')).slice(0, 200);
+  return JSON.stringify(
+    items.map(function (it) {
+      var b = txt(q('.al-body', it));
+      return { cls: String(it.className || ''), meta: txt(q('.al-meta', it)), title: txt(q('.al-title', it)), body: b.length > 2000 ? b.slice(0, 2000) : b };
+    }),
+  );
+}
+// ==== TEAM-PAGE-END ====
+const EXPR_TEAM_SNAPSHOT = '(' + pageTeamSnapshot.toString() + ')()';
+const EXPR_TEAM_DOM_SUMMARY = '(' + pageTeamDomSummary.toString() + ')()';
+const EXPR_TEAM_LISTENERS = '(' + pageTeamListeners.toString() + ')()';
+const EXPR_TEAM_ALARMS = '(' + pageTeamAlarms.toString() + ')()';
+const exprTeamEvents = (from) => '(' + pagePollTeamEvents.toString() + ')(' + (Number(from) || 0) + ')';
+const exprTeamInvoke = (cmd, a) => '(' + pageInvoke.toString() + ')(' + JSON.stringify(String(cmd)) + ', ' + JSON.stringify(a || {}) + ')';
+
+// ---- team scene: the runner (uses uiClick / uiShot / evalJs / save / step / fail of the blocks above) ----
+function teamWriteLive(S) {
+  try {
+    const o = {
+      t: iso(),
+      stage: S.stage,
+      entry_at: S.entry_at,
+      team_clicked_at: S.create_click_ok ? S.create_at : null,
+      tab_created: S.tab_ms !== null,
+      tab_count: S.last && typeof S.last.tab_count === 'number' ? S.last.tab_count : null,
+      pending_seen: S.pending_seen,
+      polls: S.polls,
+    };
+    fs.writeFileSync(path.join(OUT, `${PREFIX}-live.json`), JSON.stringify(o));
+  } catch (e) {
+    // ignore: only a convenience for the PowerShell watch loop
+  }
+}
+
+function teamWriteFacts(S, partial) {
+  try {
+    const fa = teamBuildFacts(S, R.ui ? R.ui.clicks : []);
+    S.facts = fa.facts;
+    S.reference = fa.reference;
+    S.node_ok = fa.node_ok;
+    S.node_missing = fa.node_missing;
+    const o = {
+      script: 'cdp-update.mjs',
+      mode: MODE,
+      written: iso(),
+      partial: !!partial,
+      attached: R.attached,
+      app_version: R.app_version,
+      team_clicked_at: S.create_click_ok ? S.create_at : null,
+      node_ok: fa.node_ok,
+      node_missing: fa.node_missing,
+      facts: fa.facts,
+      reference: fa.reference,
+    };
+    fs.writeFileSync(path.join(OUT, `${PREFIX}-facts.json`), JSON.stringify(o, null, 1));
+    fs.writeFileSync(path.join(OUT, `${PREFIX}-ui-timeline.txt`), teamTimelineText(S));
+  } catch (e) {
+    fail('team facts', e);
+  }
+}
+
+// one poll: page snapshot -> state (time table, baseline, new tab ...), then the events that arrived in the page
+async function teamPoll(S) {
+  const snap = parseJsonValue(await evalJs(EXPR_TEAM_SNAPSHOT, { awaitPromise: false, timeoutMs: 12000 }));
+  if (!snap || snap.ok === false) return null;
+  const r = teamNote(S, snap);
+  try {
+    const o = parseJsonValue(await evalJs(exprTeamEvents(S.ev_cursor), { awaitPromise: false, timeoutMs: 8000 }));
+    if (o && Array.isArray(o.ev)) {
+      S.ev_cursor = typeof o.n === 'number' ? o.n : S.ev_cursor;
+      teamNoteEvents(S, o.ev);
+      if (o.counts && typeof o.counts === 'object') S.event_counts = o.counts;
+    }
+  } catch (e) {
+    // the events are an extra: a failed pull never stops the scene
+  }
+  teamWriteLive(S);
+  return { snap, r };
+}
+
+async function teamWait(S, pred, timeoutMs) {
+  const t0 = Date.now();
+  let snap = S.last;
+  while (Date.now() - t0 < timeoutMs && !closed) {
+    try {
+      const r = await teamPoll(S);
+      if (r) {
+        snap = r.snap;
+        if (pred(snap)) return { ok: true, snap, waited_ms: Date.now() - t0 };
+      }
+    } catch (e) {
+      if (closed) break;
+    }
+    await sleep(500);
+  }
+  return { ok: false, snap, waited_ms: Date.now() - t0, closed };
+}
+
+// after the entry click: a confirm window (or the menu that comes first); a failure-like notification that stays 6 s without either = blocked
+async function teamWaitReaction(S, timeoutMs) {
+  const t0 = Date.now();
+  let toastSince = null;
+  while (Date.now() - t0 < timeoutMs && !closed) {
+    let r = null;
+    try {
+      r = await teamPoll(S);
+    } catch (e) {
+      if (closed) break;
+    }
+    if (r) {
+      const s = r.snap;
+      if (s.confirm) return { ok: true, kind: 'confirm', snap: s, waited_ms: Date.now() - t0 };
+      if (s.menu) return { ok: true, kind: 'menu', snap: s, waited_ms: Date.now() - t0 };
+      const fresh = (Array.isArray(s.toasts) ? s.toasts : []).filter((x) => !S.seen_before[teamToastKey(x)] && teamIsFailureCls(x.cls));
+      if (fresh.length && toastSince === null) toastSince = Date.now();
+      if (toastSince !== null && Date.now() - toastSince >= 6000) return { ok: false, kind: 'notification', snap: s, waited_ms: Date.now() - t0 };
+    }
+    await sleep(500);
+  }
+  return { ok: false, kind: 'none', snap: S.last, waited_ms: Date.now() - t0, closed };
+}
+
+async function teamInvoke(cmd, a) {
+  try {
+    return parseJsonValue(await evalJs(exprTeamInvoke(cmd, a), { timeoutMs: 30000 }));
+  } catch (e) {
+    return { ok: false, error: String(e && e.message ? e.message : e) };
+  }
+}
+
+async function teamDomSummary(S, tag) {
+  try {
+    const s = parseJsonValue(await evalJs(EXPR_TEAM_DOM_SUMMARY, { awaitPromise: false, timeoutMs: 15000 }));
+    const file = `${PREFIX}-team-dom-${tag}.json`;
+    fs.writeFileSync(path.join(OUT, file), JSON.stringify(s, null, 2));
+    S.dom_summaries = S.dom_summaries || [];
+    S.dom_summaries.push({ tag, file, t: iso() });
+    save();
+  } catch (e) {
+    fail('team dom summary ' + tag, e);
+  }
+}
+
+async function teamSeats(S) {
+  S.stage = 'seats';
+  try {
+    const reg = await teamInvoke('list_depts', {});
+    const depts = reg.ok && reg.value && typeof reg.value.depts === 'object' && reg.value.depts ? reg.value.depts : null;
+    const key = depts ? teamPickNewDept(S.before_dept_keys, depts, S.tab_name) : null;
+    const entry = key && depts[key] ? depts[key] : null;
+    const sock = entry && typeof entry.socket === 'string' ? entry.socket : null;
+    S.seats_dept = { registry_ok: !!reg.ok, registry_error: reg.ok ? null : reg.error, key, socket: sock, entry: entry ? teamCompactValue(entry, 1500) : null, dept_keys_after: depts ? Object.keys(depts) : null };
+    if (sock) {
+      const ls = await teamInvoke('list_surfaces', { socket: sock });
+      S.seats = teamSeatsFrom(ls);
+      S.seats.raw = ls.ok ? teamCompactValue(ls.value, 6000) : null;
+    } else {
+      S.seats = { ok: false, error: key ? 'the registry entry of ' + key + ' has no socket' : 'no new team in the registry', count: null, roles: [], surfaces: [] };
+    }
+  } catch (e) {
+    S.seats = { ok: false, error: 'exception: ' + String(e && e.message ? e.message : e), count: null, roles: [], surfaces: [] };
+  }
+  step('team: seats', { ok: S.seats.ok, count: S.seats.count, roles: S.seats.roles });
+}
+
+// the alarm history of the Control Center: the only place where the ids of the sticky notifications are visible (best effort)
+async function teamAlarms(S) {
+  S.stage = 'alarms';
+  S.alarms = { ok: false, note: null, items: [] };
+  try {
+    const o1 = await uiClick(K_TEAM.cc_btn, 'cc button', false);
+    if (!o1.ok) {
+      S.alarms.note = 'the Control Center button could not be clicked: ' + (o1.error || 'unknown');
+      return;
+    }
+    const w = await teamWait(S, (s) => !!s.cc_open, 8000);
+    if (!w.ok) {
+      S.alarms.note = 'the Control Center did not open';
+      return;
+    }
+    const o2 = await uiClick(K_TEAM.cc_alarm_tab, 'cc alarms tab', false);
+    if (!o2.ok) {
+      S.alarms.note = 'the alarms tab could not be clicked: ' + (o2.error || 'unknown');
+    } else {
+      await sleep(800);
+      const raw = parseJsonValue(await evalJs(EXPR_TEAM_ALARMS, { awaitPromise: false, timeoutMs: 12000 }));
+      S.alarms.items = teamParseAlarms(Array.isArray(raw) ? raw : []);
+      S.alarms.ok = Array.isArray(raw);
+      if (!S.alarms.ok) S.alarms.note = 'the alarm list could not be read: ' + teamCut(JSON.stringify(raw), 200);
+      await uiShot('alarms');
+    }
+    await uiClick(K_TEAM.cc_close, 'cc close', false);
+  } catch (e) {
+    S.alarms.note = 'exception: ' + String(e && e.message ? e.message : e);
+  }
+  step('team: alarms', { ok: S.alarms.ok, count: S.alarms.items.length, note: S.alarms.note });
+}
+
+async function teamObserve(S) {
+  S.stage = 'observe';
+  const t0 = S.create_ms;
+  step('team: observing', { observe_ms: TEAM_OBSERVE_MS });
+  let shotAfter = false;
+  let shotStage = false;
+  let shotTab = false;
+  let failSince = null;
+  let lastFacts = Date.now();
+  while (Date.now() - t0 < TEAM_OBSERVE_MS && !closed) {
+    try {
+      await teamPoll(S);
+    } catch (e) {
+      if (closed) break;
+    }
+    const el = Date.now() - t0;
+    if (!shotAfter && el >= 1500) {
+      shotAfter = true;
+      await uiShot('after-click');
+    }
+    if (!shotStage && (S.stage_texts.length > 0 || S.stage_events.length > 0)) {
+      shotStage = true;
+      await uiShot('first-stage');
+    }
+    if (!shotTab && S.tab_ms !== null) {
+      shotTab = true;
+      await sleep(700);
+      await uiShot('new-tab');
+    }
+    const root = S.last && S.last.root ? S.last.root : {};
+    const started = S.pending_seen || S.busy_seen || S.tab_ms !== null;
+    if (!started && el >= 30000) {
+      S.observe_end_reason = 'the flow did not start within 30 s of the execute click';
+      break;
+    }
+    if (S.pending_seen && S.tab_ms === null && root.kind !== 'pending') {
+      if (failSince === null) failSince = Date.now();
+      if (Date.now() - failSince >= TEAM_FAIL_GRACE_MS) {
+        S.observe_end_reason = 'creation failed: the waiting screen went away and no tab stood';
+        break;
+      }
+    } else {
+      failSince = null;
+    }
+    if (Date.now() - lastFacts >= 30000) {
+      lastFacts = Date.now();
+      teamWriteFacts(S, true);
+    }
+    save();
+    await sleep(1000);
+  }
+  if (!S.observe_end_reason) S.observe_end_reason = closed ? 'the CDP socket closed (the app exited)' : 'observation window elapsed (' + Math.round(TEAM_OBSERVE_MS / 1000) + ' s)';
+  S.observe_end_ms = Date.now();
+  S.observe = { polls: S.polls, ms: S.observe_end_ms - t0, socket_closed: closed, socket_closed_at: closed ? closedAt : null };
+  step('team: observation ended', { reason: S.observe_end_reason, tab_created: S.tab_ms !== null });
+}
+
+async function teamRun(S, U) {
+  S.stage = 'wait_ready';
+  step('team: wait for the UI (a workspace tab and a pane drawn)', { ready_ms: TEAM_READY_MS });
+  const t0 = Date.now();
+  let ready = false;
+  let okSince = null;
+  while (Date.now() - t0 < TEAM_READY_MS && !closed) {
+    let r = null;
+    try {
+      r = await teamPoll(S);
+    } catch (e) {
+      if (closed) break;
+    }
+    const s = r ? r.snap : null;
+    const good = !!(s && s.toggle && s.toggle.exists && s.tab_count >= 1 && s.root && s.root.pane_count >= 1);
+    if (good) {
+      if (okSince === null) okSince = Date.now();
+      if (Date.now() - okSince >= TEAM_SETTLE_MS) {
+        ready = true;
+        break;
+      }
+    } else {
+      okSince = null;
+    }
+    await sleep(1000);
+  }
+  S.ready = { ok: ready, waited_ms: Date.now() - t0, snapshot: S.last };
+  U.ready = { ok: ready, waited_ms: S.ready.waited_ms };
+  if (!ready) {
+    S.ready_note = 'the UI was not complete within ' + Math.round(TEAM_READY_MS / 1000) + ' s (a workspace tab and a pane were not both drawn): the click is tried anyway';
+    await teamDomSummary(S, 'not-ready');
+    if (!S.last || !S.last.toggle || !S.last.toggle.exists) {
+      S.flow_error = 'the team controls (#btn-expert-toggle / #btn-ws-dept) are not in the page';
+      await uiShot('no-controls');
+      return;
+    }
+  }
+  try {
+    S.recorder_installed = await evalJs(EXPR_UI_RECORDER, { awaitPromise: false, timeoutMs: 15000 });
+  } catch (e) {
+    fail('team recorder', e);
+  }
+  try {
+    S.listeners = parseJsonValue(await evalJs(EXPR_TEAM_LISTENERS, { timeoutMs: 30000 }));
+    step('team: listeners', S.listeners);
+  } catch (e) {
+    fail('team listeners', e);
+  }
+  // the registry and the catalog as the product reads them at the entry (read-only calls the product itself makes)
+  const regBefore = await teamInvoke('list_depts', {});
+  const catBefore = await teamInvoke('read_dept_catalog', {});
+  S.before_registry = regBefore.ok ? teamCompactValue(regBefore.value, 6000) : { error: regBefore.error };
+  S.before_catalog = catBefore.ok ? teamCompactValue(catBefore.value, 6000) : { error: catBefore.error };
+  S.before_dept_keys = regBefore.ok && regBefore.value && typeof regBefore.value.depts === 'object' && regBefore.value.depts ? Object.keys(regBefore.value.depts) : null;
+  await uiShot('ready');
+
+  // the entry button sits in the collapsed "expert" section of the sidebar: open it with a real click first
+  let snap = S.last || {};
+  if (!(snap.entry && snap.entry.visible) && snap.toggle && snap.toggle.exists) {
+    S.stage = 'open_expert';
+    step('team: open the expert section (click on its toggle)');
+    const tr = await uiClick(K_TEAM.toggle, 'expert toggle', false);
+    S.toggle_click = { ok: tr.ok, method: tr.method, error: tr.error || null };
+    const w = await teamWait(S, (s) => !!(s.entry && s.entry.visible), 15000);
+    snap = w.snap || S.last || {};
+  }
+  if (!(snap.entry && snap.entry.exists)) {
+    S.flow_error = 'the team button (#btn-ws-dept) is not in the page';
+    await teamDomSummary(S, 'no-entry');
+    await uiShot('no-entry');
+    return;
+  }
+
+  S.stage = 'click_entry';
+  step('team: click the team button');
+  S.entry_ms = Date.now();
+  S.entry_at = iso();
+  const er = await uiClick(K_TEAM.entry, 'team entry button', false);
+  S.entry_click = { ok: er.ok, method: er.method, error: er.error || null };
+  if (!er.ok) {
+    S.flow_error = 'the team button could not be clicked: ' + (er.error || 'unknown');
+    await teamDomSummary(S, 'entry-click-failed');
+    await uiShot('entry-click-failed');
+    return;
+  }
+  const rw = await teamWaitReaction(S, TEAM_REACT_MS);
+  S.reaction = { ok: rw.ok, kind: rw.kind, waited_ms: rw.waited_ms };
+  if (!rw.ok) {
+    S.flow_error = rw.kind === 'notification' ? 'a failure-like notification appeared and no confirm window or menu followed' : 'no confirm window or menu within ' + Math.round(TEAM_REACT_MS / 1000) + ' s of the click';
+    await teamDomSummary(S, 'no-reaction');
+    await uiShot('no-reaction');
+    return;
+  }
+  let confirmSnap = rw.snap;
+  if (rw.kind === 'menu') {
+    const items = (Array.isArray(rw.snap.menu) ? rw.snap.menu : []).map((i) => i.text);
+    S.menu = { items, seen_at: iso(), picked_index: items.length - 1, picked_text: items.length ? items[items.length - 1] : null };
+    step('team: a menu comes first - choosing its last item', { items });
+    await uiShot('menu');
+    const mr = await uiClick(K_TEAM.menu_last, 'team menu item', false);
+    if (!mr.ok) {
+      S.flow_error = 'the menu item could not be clicked: ' + (mr.error || 'unknown');
+      await teamDomSummary(S, 'menu-click-failed');
+      return;
+    }
+    const mw = await teamWait(S, (s) => !!s.confirm, 30000);
+    if (!mw.ok) {
+      S.flow_error = 'no confirm window within 30 s of choosing the menu item';
+      await teamDomSummary(S, 'no-confirm-after-menu');
+      await uiShot('no-confirm-after-menu');
+      return;
+    }
+    confirmSnap = mw.snap;
+  }
+  const cs = confirmSnap && confirmSnap.confirm ? confirmSnap.confirm : null;
+  if (!cs) {
+    S.flow_error = 'the confirm window was gone before it could be read';
+    await teamDomSummary(S, 'confirm-gone');
+    return;
+  }
+  S.confirm = { title: cs.title, body: cs.body, buttons: cs.buttons, seen_at: iso() };
+  step('team: confirm window', { title: cs.title, buttons: (cs.buttons || []).map((b) => b.text) });
+  await uiShot('confirm');
+
+  // the tabs as they are right before the execute click: the baseline of the "a new tab stood" test
+  const base = S.last || confirmSnap;
+  S.tab_ids_before = (Array.isArray(base.tabs) ? base.tabs : []).map((t) => t.id);
+  S.tab_names_before = (Array.isArray(base.tabs) ? base.tabs : []).map((t) => t.name);
+  S.tab_count_before = S.tab_ids_before.length;
+  S.stage = 'click_create';
+  S.create_ms = Date.now();
+  S.create_at = iso();
+  const yr = await uiClick(K_TEAM.confirm_yes, 'team confirm yes', false);
+  S.create_click = { ok: yr.ok, method: yr.method, error: yr.error || null };
+  if (!yr.ok) {
+    S.create_ms = null;
+    S.flow_error = 'the execute button of the confirm window could not be clicked: ' + (yr.error || 'unknown');
+    await teamDomSummary(S, 'confirm-click-failed');
+    await uiShot('confirm-click-failed');
+    return;
+  }
+  S.create_click_ok = true;
+  teamWriteLive(S);
+  step('team: execute button clicked', { method: yr.method, at: S.create_at });
+  const cw = await teamWait(S, (s) => !s.confirm, 10000);
+  S.confirm_closed = cw.ok;
+
+  await teamObserve(S);
+
+  S.stage = 'tail';
+  if (!closed) {
+    try {
+      await teamPoll(S);
+    } catch (e) {
+      // ignore
+    }
+    await uiShot('end');
+    try {
+      const rp = parseJsonValue(await evalJs(EXPR_UI_RECORDER_POLL, { awaitPromise: false, timeoutMs: 10000 }));
+      if (rp && rp.events) S.recorder = rp;
+    } catch (e) {
+      // the recorder is an extra source (it also sees toasts that lived less than one poll)
+    }
+    teamWriteFacts(S, true);
+    await teamSeats(S);
+    await teamAlarms(S);
+  }
+}
+
+async function runTeamMode() {
+  armWatchdog(TEAM_READY_MS + TEAM_OBSERVE_MS + 8 * 60 * 1000);
+  const U = (R.ui = { mode: MODE, stage: 'start', ready: null, clicks: [], states: [], shots: [], button_flow_complete: false, fallback_invoke: false, observe: null });
+  const S = (R.team = teamNewState());
+  S.params = { observe_ms: TEAM_OBSERVE_MS, ready_ms: TEAM_READY_MS, settle_ms: TEAM_SETTLE_MS, react_ms: TEAM_REACT_MS, fail_grace_ms: TEAM_FAIL_GRACE_MS };
+  try {
+    await teamRun(S, U);
+  } catch (e) {
+    fail('team flow', e);
+    S.flow_error = S.flow_error || 'exception in the team flow: ' + String(e && e.message ? e.message : e);
+  }
+  if (S.observe_end_ms === null) S.observe_end_ms = Date.now();
+  S.prev = undefined;
+  S.timeline.sort((a, b) => a.t - b.t);
+  teamWriteFacts(S, false);
+  U.stage = 'done';
+  S.stage = 'done';
+  save();
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 async function main() {
@@ -1256,6 +2385,10 @@ async function main() {
   }
   if (MODE === 'ui' || MODE === 'uipre') {
     await runUiMode();
+    return;
+  }
+  if (MODE === 'uiteam') {
+    await runTeamMode();
     return;
   }
 
