@@ -1027,7 +1027,7 @@ describe("팀원 부팅 안내 — 실제 본문 실행(showDeptFormation · che
   };
   /** 데몬 surface.list 한 줄의 **실제 꼴**(handlers.rs surface.list 의 키 전부) — 값은 지어낸 값. 판정의 입력은 이 꼴이다(손으로 만든 이벤트가 아니다 — S4 B1 의 교훈). */
   const row = (sid: number, role: string | null, over: Record<string, unknown> = {}): Record<string, unknown> => ({
-    surface_id: sid, surface_ref: `surface:${sid}`, title: "zsh", role, cmd: "zsh", cwd: "/Users/tester/work", live_cwd: "/Users/tester/work", pid: 41000 + sid, exited: false,
+    surface_id: sid, surface_ref: `surface:${sid}`, title: "zsh", role, cmd: "zsh", cwd: "/Users/runner/work", live_cwd: "/Users/runner/work", pid: 41000 + sid, exited: false,
     created_at: 1_800_000_000, pending_input_bytes: 0, pending_input_human_bytes: 0, input_paste_open: false, seat: "occupied", env_injected: true, created_by: null,
     claude_config_dir: null, agent: null, agent_alive: null, awakened_at: null, directive_verified: null, ack_nonce_ok: null, ack_source: null, boot_nonce_generation: null,
     alt_screen: false, line_count: 12, cwd_blocked: null, usage: null, ...over,
@@ -1456,7 +1456,7 @@ describe("★S4 B1 — 실제 3초 틱(refreshPaneTitles 실제 본문)으로: �
   const FIVE = ["master", "cso", "worker", "reviewer-gemini", "reviewer-codex"];
   /** 데몬 surface.list 한 줄의 실제 꼴(handlers.rs surface.list 의 키 전부) — 값은 지어낸 값. */
   const row = (sid: number, role: string | null, over: Record<string, unknown> = {}): Record<string, unknown> => ({
-    surface_id: sid, surface_ref: `surface:${sid}`, title: "zsh", role, cmd: "zsh", cwd: "/Users/tester/work", live_cwd: "/Users/tester/work", pid: 41000 + sid, exited: false,
+    surface_id: sid, surface_ref: `surface:${sid}`, title: "zsh", role, cmd: "zsh", cwd: "/Users/runner/work", live_cwd: "/Users/runner/work", pid: 41000 + sid, exited: false,
     created_at: 1_800_000_000, pending_input_bytes: 0, pending_input_human_bytes: 0, input_paste_open: false, seat: "occupied", env_injected: true, created_by: null,
     claude_config_dir: null, agent: null, agent_alive: null, awakened_at: null, directive_verified: null, ack_nonce_ok: null, ack_source: null, boot_nonce_generation: null,
     alt_screen: false, line_count: 12, cwd_blocked: null, usage: null, ...over,
@@ -1742,7 +1742,7 @@ describe("★S4 m3 — 실제 토스트 기계(stickyToast · addToastCloseButto
 
 describe("★S4 n1 — 「팀 직접 만들기」 실패 알림은 지속 알림(sticky · 닫기 버튼 있음)으로 — 문구는 그대로", () => {
   /** cys-dept 가 실제로 내는 데몬 기동 실패 문구(ready_fail_note 꼴 · 로그 경로와 환경변수 이름 포함) — Tauri 가 `dept-create:<코드>:<stderr>` 로 전달한다. 150자 이상이다. */
-  const LONG = "dept-create:1:[cys-dept] ERROR: dept-2 데몬 기동 실패 (소켓 대기 12초 · 로그: /Users/tester/.local/state/cys-dept-dept-2/cysd.log · 느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)";
+  const LONG = "dept-create:1:[cys-dept] ERROR: dept-2 데몬 기동 실패 (소켓 대기 12초 · 로그: /Users/runner/.local/state/cys-dept-dept-2/cysd.log · 느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)";
   function setup(failWith: unknown) {
     const toasts: { fn: string; args: unknown[] }[] = [];
     const dismissed: string[] = [];
