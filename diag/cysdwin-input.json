@@ -1,5 +1,5 @@
 {
-  "ref": "bd0a0ca3e1d7634057b6ca4c6160953b36f1a3d3",
+  "ref": "5c4b2ac25bba82103d610237f92d6798abba4596",
   "filter": "",
   "skip": [
     "hwmon::tests::snapshot_has_all_sections",
