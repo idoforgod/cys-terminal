@@ -405,6 +405,19 @@ SAFETY_CLAUSES = {
         # ★(게이트 수정 1회차 ROLE-G1) 동시 경보 순서가 master·CEO 핸드셰이크(②통보 → ③ack → ④)와 맞물리는 방식.
         ("동시 경보 핸드셰이크 순서", "**master·CEO\n  먼저**(master·CEO 는 그 턴에 ②안전지점 확인·②통보를 **먼저** 내고, ④ `--detach` 1콜은 ③ ack·재독 "
                                "검증 뒤의 턴에 낸다 — 무응답이면 §2 무응답 정책"),
+        # ★(0.14.43 · DOCS) `queue.starved` 대응 · 한도 경보 읽기 — 가산 핀(종전 핀을 지우거나 약화하지 않았다).
+        #   종전 표 문면은 `CYS_QUEUE_STARVE_ALERT_SECS` 를 "기본 0=비활성" 이라 적었다 — 코드 기본은 600초이고 0 이 끔이다
+        #   (governance.rs `queue_starve_alert_secs`). 운영자가 "우리 함대는 기아 경보가 꺼져 있다" 고 읽는 문면이었다.
+        #   대응은 두 가지뿐이다: 경보 요약의 처방 코드(`remedy=<코드>`)를 사람에게 그대로 전달 · LLM 자동 조치 금지(코드 상수
+        #   `REMEDY_LLM_SUFFIX` 와 같은 뜻 — 종전의 '자동 강제배달 금지' 문장과 합쳤다). 한도 경보 항은 **오너 결재 문면 그대로**다(보충 2차):
+        #   본문의 `in_use=0 ∧ age>1800` 또는 `reset<0` 이면 신규 작업 제한 판단의 근거로 쓰지 않고 `alert_eligible` 로 재확인 — 아래
+        #   `QueueStarvedDocContract` 가 그 문장의 낱말(나이 상한 1800 · 재확인 키 · 규칙 모양)을 데몬 코드와 대조한다.
+        ("queue.starved 기본값", "`CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초(0=끔)"),
+        ("queue.starved 처방 전달·자동 조치 금지", "요약의 `remedy=<코드>`(처방 코드)는 읽어 master·오너(사람)에게 그대로 전달. "
+                                 "**★LLM 에이전트(CSO·master 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·동결 해제·항목 삭제) 금지 — "
+                                 "사람 판단에 맡긴다**"),
+        ("한도 경보 낡은 값 읽기(오너 결재 문면)", "`alert.account_rate`·`alert.rate_limit` 는 본문의 `in_use=0 ∧ age>1800` 또는 `reset<0` 이면 "
+                                    "신규 작업 제한 판단의 근거로 쓰지 않는다 — `cys status --json` 의 `alert_eligible` 로 재확인"),
     ),
     "MASTER_DIRECTIVE.md": (
         ("정체 종결 휴면", "`javis_orchestra.py round-status --help` 에 `stop_reason`(그리고 `round-log`\n"
@@ -447,6 +460,11 @@ SAFETY_CLAUSES = {
                         "전경 대기 금지(단일 전체 시한 570초 동안 네 턴이 멈춘다)"),
         ("사이클 진행 중 회신", "그 백그라운드 1콜 중 clear 통보에는 '사이클 진행 중(대상·시작 시각)'으로 회신하고 끝난 뒤 준비한다"),
         ("백그라운드 없는 CLI 예외", "백그라운드 실행이 없는 CLI 만 예외로 도구 timeout 600000 전경 실행"),
+        # ★(0.14.43 · DOCS) `queue.starved` 대응 — 가산 핀(CSO 쪽 주석 참조 · MASTER 와 같은 2항을 CEO 에도 건다).
+        ("queue.starved 기본값·처방 전달", "(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 — "
+                                  "요약의 `remedy=<코드>`(처방 코드)는 사람에게 그대로 전달한다."),
+        ("queue.starved 자동 조치 금지", "**★LLM 에이전트 (master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·"
+                                 "동결 해제·항목 삭제) 금지 — 사람 판단에 맡긴다.**"),
     ),
     # CEO_TEMPLATE 은 MASTER 전문을 바이트 연접한 생성물이다(gen_ceo_template.py) — 배포본에도 같은 문면이 있어야 한다.
     "CEO_TEMPLATE.md": (
@@ -463,6 +481,11 @@ SAFETY_CLAUSES = {
                         "전경 대기 금지(단일 전체 시한 570초 동안 네 턴이 멈춘다)"),
         ("사이클 진행 중 회신", "그 백그라운드 1콜 중 clear 통보에는 '사이클 진행 중(대상·시작 시각)'으로 회신하고 끝난 뒤 준비한다"),
         ("백그라운드 없는 CLI 예외", "백그라운드 실행이 없는 CLI 만 예외로 도구 timeout 600000 전경 실행"),
+        # ★(0.14.43 · DOCS) `queue.starved` 대응 — 가산 핀(CSO 쪽 주석 참조 · MASTER 와 같은 2항을 CEO 에도 건다).
+        ("queue.starved 기본값·처방 전달", "(기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 — "
+                                  "요약의 `remedy=<코드>`(처방 코드)는 사람에게 그대로 전달한다."),
+        ("queue.starved 자동 조치 금지", "**★LLM 에이전트 (master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·"
+                                 "동결 해제·항목 삭제) 금지 — 사람 판단에 맡긴다.**"),
     ),
     "REVIEWER_DIRECTIVE.md": (
         ("정체 종결 휴면", "그 축을 내는 도구가 없는 버전이면 이 조항은 **휴면**이다 —\n"
@@ -3150,6 +3173,102 @@ class ClearGuardFireWiring(unittest.TestCase):
         self.assertNotEqual(mutated, self.raw["CSO_DIRECTIVE.md"], "음성 대조 치환이 적중하지 않았다")
         calls = [c for c in self.CALL_RE.findall(mutated) if "--role" in c or "--verifier" in c]
         self.assertTrue(any("--fire" not in c for c in calls))
+
+
+class QueueStarvedDocContract(unittest.TestCase):
+    """★(0.14.43 · DOCS) 지침의 `queue.starved` 대응·한도 경보 읽기 문면이 데몬 코드와 같은 말을 한다 — 코드 소스에서 읽어 대조한다.
+
+    ①기본 임계: 종전 문면 "기본 0=비활성" 은 코드 기본 600초와 정반대였다(governance.rs `queue_starve_alert_secs` — 0 이 끔).
+    ②`remedy=<코드>`: 경보 요약이 싣는 토큰은 허용 목록 코드뿐이다(alert_route.rs) — 사람에게 그대로 전달한다.
+    ③LLM 자동 조치 금지 목록은 상수 `REMEDY_LLM_SUFFIX` 의 괄호 목록과 같은 항목이다(코드가 항목을 늘리면 지침도 같이 고친다).
+    ④한도 경보 읽기(오너 결재 문면): 본문 토큰(`age=`·`in_use=`·`reset=`)은 요약 렌더러가 실제로 싣는 것이고, 지침의 `age>1800` 은 코드 노브
+      기본값(`ACCOUNT_ALERT_STALE_SECS_DEFAULT` 1800초)과 같고, 재확인 키 `alert_eligible` 은 데몬이 싣는 키이며 그 판정 규칙의 모양(사용 중 아님 ∧ 나이 > 상한)이
+      지침 문장과 같다. 두 경보 이름(`alert.account_rate`·`alert.rate_limit`)은 경보 엔진이 실제로 내는 이름이다.
+    실패 방향: 붉어지면 운영 지침이 데몬 동작과 어긋난다 — 0.14.42 까지 ①이 조용히 그랬다(주석이 코드보다 오래 산다).
+    소스를 읽지 못하면(측정 불능) 통과가 아니라 실패다."""
+
+    FILES = ("CSO_DIRECTIVE.md", "MASTER_DIRECTIVE.md", "CEO_TEMPLATE.md")
+
+    @classmethod
+    def setUpClass(cls):
+        CsoDirectiveRevision.setUpClass()
+        cls.raw = CsoDirectiveRevision.raw
+
+        def source(*parts):
+            with open(os.path.join(REPO_DIR, *parts), encoding="utf-8") as handle:
+                return handle.read()
+
+        cls.governance = source("src", "bin", "cysd", "governance.rs")
+        cls.route = source("src", "bin", "cysd", "alert_route.rs")
+        cls.accounts = source("src", "bin", "cysd", "accounts.rs")
+        cls.alerts = source("src", "bin", "cysd", "alerts.rs")
+
+    def body(self, name):
+        return normalize(strip_html_comments(self.raw[name]))
+
+    def test_default_secs_matches_the_daemon(self):
+        found = re.search(r"pub\(crate\) fn queue_starve_alert_secs\(\) -> u64 \{.*?\.unwrap_or\((\d+)\)", self.governance, re.S)
+        self.assertIsNotNone(found, "governance.rs queue_starve_alert_secs 의 기본값을 읽지 못했다(측정 불능)")
+        secs = int(found.group(1))
+        self.assertGreater(secs, 0, "코드 기본이 0(끔)이면 이 검체의 전제('켜짐이 기본')가 바뀐 것이다 — 문면과 함께 다시 정한다")
+        for name in self.FILES:
+            body = self.body(name)
+            with self.subTest(directive=name):
+                self.assertIn("`CYS_QUEUE_STARVE_ALERT_SECS` 기본 %d초" % secs, body)
+                self.assertNotIn("CYS_QUEUE_STARVE_ALERT_SECS` 기본 0=비활성", body, "종전의 틀린 기본값 문면이 되살아났다")
+        # 음성 대조 — 종전 문면을 되돌려 넣으면 조항 핀이 잡는다(검사기가 공허하지 않다)
+        old = self.raw["CSO_DIRECTIVE.md"].replace("기본 600초(0=끔)", "기본 0=비활성", 1)
+        self.assertNotEqual(old, self.raw["CSO_DIRECTIVE.md"], "음성 대조 치환이 적중하지 않았다")
+        self.assertIn("queue.starved 기본값", missing_safety_clauses("CSO_DIRECTIVE.md", old))
+
+    def test_remedy_token_and_llm_prohibition_match_the_code(self):
+        self.assertIn('format!(" remedy={c}")', self.route, "경보 요약의 처방 토큰 이름(remedy=)이 코드에서 바뀌었다")
+        found = re.search(r'pub\(crate\) const REMEDY_LLM_SUFFIX: &str = "[^"]*?자동 조치\(([^)]*)\)', self.governance)
+        self.assertIsNotNone(found, "governance.rs REMEDY_LLM_SUFFIX 의 금지 목록을 읽지 못했다(측정 불능)")
+        items = [item.strip() for item in found.group(1).split("·") if item.strip()]
+        self.assertGreaterEqual(len(items), 5, "금지 목록 판독이 비었다: %r" % items)
+        for name in self.FILES:
+            body = self.body(name)
+            with self.subTest(directive=name):
+                lists = [g for g in re.findall(r"자동 조치\(([^)]*)\) 금지", body) if "cys queue deliver" in g]
+                self.assertEqual(len(lists), 1, "%s: queue.starved 자동 조치 금지 조항이 정확히 1개여야 한다: %r" % (name, lists))
+                for item in items:
+                    self.assertIn(item, lists[0], "%s: 코드의 금지 항목 %r 이 지침 목록에 없다" % (name, item))
+                self.assertIn("`remedy=<코드>`(처방 코드)는", body)
+
+    def test_rate_alert_summary_tokens_match_the_code(self):
+        # ① 본문 토큰 — 요약 렌더러가 실제로 싣는 것(코드가 바뀌면 지침이 읽는 재료가 달라진다)
+        for token in ('push(format!("age={a}"))', 'push("in_use=1".into())', 'push("in_use=0".into())',
+                      'push("in_use=na".into())', 'push(format!("reset={r}"))'):
+            self.assertIn(token, self.route, "한도 경보 요약 토큰 렌더가 코드에서 바뀌었다: %s" % token)
+        # ② 음수 리셋은 요약에서 빠진다(`summary_secs` 는 0 이상만 싣는다) — 지침의 `reset<0` 은 숫자로 보이는 값이 아니라 '이미 리셋됨' 이다
+        self.assertRegex(self.route, r"fn summary_secs\(v: Option<&Value>\) -> Option<u64> \{[^}]*\*x >= 0\.0",
+                         "요약 토큰이 음수를 거르지 않는다 — 지침의 `reset<0` 해석이 달라진다")
+        # ③ `age>N` — 코드 노브 기본 상한(초)과 같다
+        found = re.search(r"pub const ACCOUNT_ALERT_STALE_SECS_DEFAULT: f64 = (\d+)\.0;", self.accounts)
+        self.assertIsNotNone(found, "accounts.rs 의 경보 입력 관측 나이 상한 기본값을 읽지 못했다(측정 불능)")
+        secs = int(found.group(1))
+        cso = self.body("CSO_DIRECTIVE.md")
+        self.assertIn("`in_use=0 ∧ age>%d`" % secs, cso, "지침의 나이 상한이 코드 기본값(%d초)과 다르다" % secs)
+        # ④ 재확인 키와 판정 규칙의 모양 — `alert_eligible` 을 데몬이 싣고, 규칙이 '사용 중 아님 ∧ 나이 > 상한' 을 거르는 모양이다
+        self.assertIn('m.insert("alert_eligible".into()', self.accounts, "데몬이 `alert_eligible` 키를 싣지 않는다 — 지침의 재확인 경로가 사라진다")
+        # 지침이 가리키는 `cys status --json` 의 좌석 `usage` 쪽 키(좌석 와이어)도 따로 건다 — 위는 `usage.accounts` 행의 삽입 지점이다
+        self.assertIn('o.insert("alert_eligible".into(), json!(alert_eligible(live, tri, age, stale_secs)))', self.accounts,
+                      "`cys status --json` 좌석 `usage` 의 `alert_eligible` 키가 사라졌다 — 지침이 가리키는 재확인 경로가 끊긴다")
+        self.assertIn("in_use != Some(false) || !(age > stale_secs)", self.accounts, "경보 적격 판정 규칙의 모양이 지침 문장과 달라졌다")
+        # ⑤ 두 경보 이름 — 경보 엔진이 `alert.<kind>` 로 내는 종류
+        self.assertIn('format!("alert.{}", a.kind)', self.governance, "경보 이름 조립(`alert.<kind>`)이 바뀌었다")
+        for kind in ("account_rate", "rate_limit"):
+            self.assertIn('kind: "%s".into()' % kind, self.alerts, "경보 엔진이 `%s` 종류를 내지 않는다" % kind)
+        # ⑥ 지침 문장 — 결재 문면 전체가 정확히 1번(SAFETY_CLAUSES 와 별개로 여기서도 건다) · 종전의 넓은 문면이 되살아나지 않았다
+        sentence = ("`alert.account_rate`·`alert.rate_limit` 는 본문의 `in_use=0 ∧ age>%d` 또는 `reset<0` 이면 신규 작업 제한 판단의 근거로 쓰지 않는다 — "
+                    "`cys status --json` 의 `alert_eligible` 로 재확인" % secs)
+        self.assertEqual(cso.count(sentence), 1, "오너 결재 문면이 정확히 1번이어야 한다")
+        self.assertNotIn("은 상신 말고 관찰", cso, "결재 문면보다 넓은 종전 문면(`in_use=0` 전반 관찰)이 되살아났다")
+        # 음성 대조 — 나이 상한을 바꾼 문면은 조항 핀이 잡는다(검사기가 공허하지 않다)
+        wrong = self.raw["CSO_DIRECTIVE.md"].replace("`in_use=0 ∧ age>%d`" % secs, "`in_use=0 ∧ age>600`", 1)
+        self.assertNotEqual(wrong, self.raw["CSO_DIRECTIVE.md"], "음성 대조 치환이 적중하지 않았다")
+        self.assertIn("한도 경보 낡은 값 읽기(오너 결재 문면)", missing_safety_clauses("CSO_DIRECTIVE.md", wrong))
 
 
 if __name__ == "__main__":

@@ -292,13 +292,13 @@
   단 `cys send --queued`는 대상이 조용해질 때 데몬이 **자동 Return**으로 배달한다(send-key
   불필요). 사람이 그 pane에 타이핑 중이면 직접 send가 **기본 3초간** 차단된다(타이핑 가드,
   `CYS_TYPING_GUARD_SECS`로 조정) — 그때도 `--queued`가 안전하다. 이미 직접 send한 텍스트의
-  Return만 가드에 막혔으면 `cys send-key --queued ... Return`(Return 한정 큐잉)을 쓴다.
-  대상행 큐가 적체되면 데몬이 `queue.depth_high`(기본 depth 5+)를 발행한다 — 수신 시 해당
+  Return만 가드에 막혔으면 `cys send-key --queued ... Return`을 쓴다.
+  대상행 큐가 적체되면 데몬이 `queue.depth_high`(기본 depth 5+)를 발행한다 — 수신 시
   노드를 read-screen으로 점검하라. 큐 **머리**가 임계 이상 막혀 있으면 `queue.starved`
-  (기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 0=비활성 · depth_high와 별도 축)가 발행된다 —
-  대응은 원인 해소(연속 출력·사람 입력·queue pause)다. **★강제 배달 `cys queue deliver`는
-  사람 운영자 전용 — LLM 에이전트(master·CEO·CSO 포함)는 자동 강제배달 금지·사람 판단에
-  맡긴다.**
+  (기아 · `CYS_QUEUE_STARVE_ALERT_SECS` 기본 600초 · depth_high와 별도 축)가 발행된다 —
+  요약의 `remedy=<코드>`(처방 코드)는 사람에게 그대로 전달한다. **★LLM 에이전트
+  (master·CEO·CSO 포함)는 자동 조치(강제 배달 `cys queue deliver`·드레인·키 주입·동결 해제·항목
+  삭제) 금지 — 사람 판단에 맡긴다.**
 - **위임 티켓 — task-prompt 의무 (work management 앵커 1·강조 의무 / 눈대중 금지)**:
   워커에게 task를 위임하는 프롬프트는 반드시
   `python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" task-prompt --task "<T>"
