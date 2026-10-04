@@ -1,0 +1,100 @@
+{
+  "generated": "2026-10-04T12:28:39.139Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37201047193",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37201047193",
+  "job": "cysd-win",
+  "os": "windows-latest",
+  "branch": "diag-results/37201047193-1-cysd-win-windows-latest",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "cysdwin-cargo.log",
+      "bytes": 200487
+    },
+    {
+      "path": "cysdwin-digest.json",
+      "bytes": 2359
+    },
+    {
+      "path": "cysdwin-digest.tsv",
+      "bytes": 7607
+    },
+    {
+      "path": "cysdwin-env.txt",
+      "bytes": 2313
+    },
+    {
+      "path": "cysdwin-failures/001-governance__reflect_queue_tests__q7_process_exit_of_a_role_seat_parks_instead_of_dropping.txt",
+      "bytes": 957
+    },
+    {
+      "path": "cysdwin-failures/002-governance__tests__b1_gate_input_pending_blocks_delivery_with_reason.txt",
+      "bytes": 1647
+    },
+    {
+      "path": "cysdwin-failures/003-governance__tests__b1_obs_blocked_reason_is_recorded_until_delivery.txt",
+      "bytes": 1009
+    },
+    {
+      "path": "cysdwin-failures/004-governance__tests__wp5_r2_expired_notice_is_not_lost_when_the_flag_persisted_without_the_notice.txt",
+      "bytes": 3077
+    },
+    {
+      "path": "cysdwin-failures/005-governance__todo_decl_tests__unchanged_mtime_skips_reparse_even_for_excluded_files.txt",
+      "bytes": 1008
+    },
+    {
+      "path": "cysdwin-failures/006-handlers__tests__c5_ghost_suffix_keeps_cli_fallback_and_settle_parsers_working.txt",
+      "bytes": 1566
+    },
+    {
+      "path": "cysdwin-failures/007-handlers__tests__pause_freezes_before_actor_resolution_and_backfills_actor.txt",
+      "bytes": 1131
+    },
+    {
+      "path": "cysdwin-failures/008-handlers__tests__pause_with_blank_reason_is_also_absence.txt",
+      "bytes": 1059
+    },
+    {
+      "path": "cysdwin-failures/009-handlers__tests__pause_without_reason_records_absence_not_an_empty_string.txt",
+      "bytes": 1127
+    },
+    {
+      "path": "cysdwin-failures/010-handlers__tests__read_text_reports_quiet_secs_on_both_branches.txt",
+      "bytes": 922
+    },
+    {
+      "path": "cysdwin-failures/011-handlers__tests__reap_denies_queue_nonempty_then_queue_clear_exited_reclaim.txt",
+      "bytes": 922
+    },
+    {
+      "path": "cysdwin-failures/012-schedule__c8_push_counts_submit_tests__c8_handoff_failure_leaves_the_count_untouched.txt",
+      "bytes": 960
+    },
+    {
+      "path": "cysdwin-failures/013-state__tests__inject_track_handoff_pending_until_an_arm_ends.txt",
+      "bytes": 821
+    },
+    {
+      "path": "cysdwin-failures/014-state__tests__queue_seq_seeds_from_wal_max_and_persist_load_roundtrip.txt",
+      "bytes": 999
+    },
+    {
+      "path": "cysdwin-failures/015-state__tests__wp5_stale_pending_input_human_is_clamped_after_count_only_reset.txt",
+      "bytes": 1101
+    },
+    {
+      "path": "cysdwin-meta.json",
+      "bytes": 558
+    },
+    {
+      "path": "cysdwin-summary.txt",
+      "bytes": 6100
+    }
+  ],
+  "skipped": [],
+  "inline_files": 21,
+  "blob_files": 0
+}

@@ -1,0 +1,19 @@
+test        : governance::todo_decl_tests::unchanged_mtime_skips_reparse_even_for_excluded_files
+sequence    : 5 of 15
+module      : governance   (full path: governance::todo_decl_tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:25572   thread 'governance::todo_decl_tests::unchanged_mtime_skips_reparse_even_for_excluded_files'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed
+  left: Some("retired")
+ right: Some("counted")
+FAILED
+----------------------------------------------------------------------
+test governance::todo_decl_tests::unchanged_mtime_skips_reparse_even_for_excluded_files ... 
+thread 'governance::todo_decl_tests::unchanged_mtime_skips_reparse_even_for_excluded_files' (12776) panicked at src\bin\cysd\governance.rs:25572:9:
+assertion `left == right` failed
+  left: Some("retired")
+ right: Some("counted")
+FAILED

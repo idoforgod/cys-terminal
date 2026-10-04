@@ -1,0 +1,57 @@
+{
+ "by_location": {
+  "src/bin/cysd/governance.rs:17409": 1,
+  "src/bin/cysd/governance.rs:20139": 1,
+  "src/bin/cysd/governance.rs:21516": 1,
+  "src/bin/cysd/governance.rs:25572": 1,
+  "src/bin/cysd/governance.rs:26421": 1,
+  "src/bin/cysd/handlers.rs:12012": 1,
+  "src/bin/cysd/handlers.rs:17289": 1,
+  "src/bin/cysd/handlers.rs:23539": 1,
+  "src/bin/cysd/handlers.rs:23983": 1,
+  "src/bin/cysd/handlers.rs:24035": 1,
+  "src/bin/cysd/handlers.rs:24151": 1,
+  "src/bin/cysd/schedule.rs:5815": 1,
+  "src/bin/cysd/state.rs:10394": 1,
+  "src/bin/cysd/state.rs:8761": 1,
+  "src/bin/cysd/state.rs:9902": 1
+ },
+ "by_module": {
+  "governance": 5,
+  "handlers": 6,
+  "schedule": 1,
+  "state": 3
+ },
+ "by_type": {
+  "assert_left_right": 4,
+  "other": 8,
+  "unwrap_err": 3
+ },
+ "failed": [
+  "governance::reflect_queue_tests::q7_process_exit_of_a_role_seat_parks_instead_of_dropping",
+  "governance::tests::b1_gate_input_pending_blocks_delivery_with_reason",
+  "governance::tests::b1_obs_blocked_reason_is_recorded_until_delivery",
+  "governance::tests::wp5_r2_expired_notice_is_not_lost_when_the_flag_persisted_without_the_notice",
+  "governance::todo_decl_tests::unchanged_mtime_skips_reparse_even_for_excluded_files",
+  "handlers::tests::c5_ghost_suffix_keeps_cli_fallback_and_settle_parsers_working",
+  "handlers::tests::pause_freezes_before_actor_resolution_and_backfills_actor",
+  "handlers::tests::pause_with_blank_reason_is_also_absence",
+  "handlers::tests::pause_without_reason_records_absence_not_an_empty_string",
+  "handlers::tests::read_text_reports_quiet_secs_on_both_branches",
+  "handlers::tests::reap_denies_queue_nonempty_then_queue_clear_exited_reclaim",
+  "schedule::c8_push_counts_submit_tests::c8_handoff_failure_leaves_the_count_untouched",
+  "state::tests::inject_track_handoff_pending_until_an_arm_ends",
+  "state::tests::queue_seq_seeds_from_wal_max_and_persist_load_roundtrip",
+  "state::tests::wp5_stale_pending_input_human_is_clamped_after_count_only_reset"
+ ],
+ "failed_count": 15,
+ "last_started": "write_stall_tests::write_stall_default_leaves_release_margin",
+ "last_started_ended": true,
+ "rc": "101",
+ "ref": "5c4b2ac25bba82103d610237f92d6798abba4596",
+ "result_lines": [
+  "test result: FAILED. 1835 passed; 15 failed; 44 ignored; 0 measured; 2 filtered out; finished in 1001.71s"
+ ],
+ "tool": "cysdwin-digest.py",
+ "version": 1
+}

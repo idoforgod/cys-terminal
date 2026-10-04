@@ -1,0 +1,15 @@
+test        : state::tests::wp5_stale_pending_input_human_is_clamped_after_count_only_reset
+sequence    : 15 of 15
+module      : state   (full path: state::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/state.rs:9902   thread 'state::tests::wp5_stale_pending_input_human_is_clamped_after_count_only_reset'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+테스트 상태 디렉터리 정리: Os { code: 32, kind: Uncategorized, message: "The process cannot access the file because it is being used by another process." }
+FAILED
+----------------------------------------------------------------------
+test state::tests::wp5_stale_pending_input_human_is_clamped_after_count_only_reset ... 
+thread 'state::tests::wp5_stale_pending_input_human_is_clamped_after_count_only_reset' (2260) panicked at src\bin\cysd\state.rs:9902:57:
+테스트 상태 디렉터리 정리: Os { code: 32, kind: Uncategorized, message: "The process cannot access the file because it is being used by another process." }
+FAILED

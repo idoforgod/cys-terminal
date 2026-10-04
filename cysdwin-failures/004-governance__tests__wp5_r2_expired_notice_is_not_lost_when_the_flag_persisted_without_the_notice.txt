@@ -1,0 +1,19 @@
+test        : governance::tests::wp5_r2_expired_notice_is_not_lost_when_the_flag_persisted_without_the_notice
+sequence    : 4 of 15
+module      : governance   (full path: governance::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/governance.rs:20139   thread 'governance::tests::wp5_r2_expired_notice_is_not_lost_when_the_flag_persisted_without_the_notice'
+panics      : 1 in this part of the log
+type        : assert_left_right   (any match: assert_left_right)
+message     :
+assertion `left == right` failed: 파일 전제 확인: queue-expired.json
+  left: [Object {"enqueued_at": Number(1791116289.2647004), "expired_at": Number(1791116349.264701), "expired_event_sent": Bool(true), "expired_notified": Bool(true), "from": String("surface:2"), "id": String("q6ac2443c.1"), "mid": String("qc4528d0969b4a7b8"), "origin": String("send"), "paused_total_secs": Number(0.0), "revived_at": Null, "role": String("r2-flag-only-window-target"), "seq": Number(1), "surface_id": Number(1), "text": String("[보고] R2 재기동 만료 검체"), "ttl_secs": Number(1)}]
+ right: [Object {"enqueued_at": Number(1791116289.2647004), "expired_at": Number(1791116349.2647007), "expired_event_sent": Bool(true), "expired_notified": Bool(true), "from": String("surface:2"), "id": String("q6ac2443c.1"), "mid": String("qc4528d0969b4a7b8"), "origin": String("send"), "paused_total_secs": Number(0.0), "revived_at": Null, "role": String("r2-flag-only-window-target"), "seq": Number(1), "surface_id": Number(1), "text": String("[보고] R2 재기동 만료 검체"), "ttl_secs": Number(1)}]
+FAILED
+----------------------------------------------------------------------
+test governance::tests::wp5_r2_expired_notice_is_not_lost_when_the_flag_persisted_without_the_notice ... 
+thread 'governance::tests::wp5_r2_expired_notice_is_not_lost_when_the_flag_persisted_without_the_notice' (16744) panicked at src\bin\cysd\governance.rs:20139:13:
+assertion `left == right` failed: 파일 전제 확인: queue-expired.json
+  left: [Object {"enqueued_at": Number(1791116289.2647004), "expired_at": Number(1791116349.264701), "expired_event_sent": Bool(true), "expired_notified": Bool(true), "from": String("surface:2"), "id": String("q6ac2443c.1"), "mid": String("qc4528d0969b4a7b8"), "origin": String("send"), "paused_total_secs": Number(0.0), "revived_at": Null, "role": String("r2-flag-only-window-target"), "seq": Number(1), "surface_id": Number(1), "text": String("[보고] R2 재기동 만료 검체"), "ttl_secs": Number(1)}]
+ right: [Object {"enqueued_at": Number(1791116289.2647004), "expired_at": Number(1791116349.2647007), "expired_event_sent": Bool(true), "expired_notified": Bool(true), "from": String("surface:2"), "id": String("q6ac2443c.1"), "mid": String("qc4528d0969b4a7b8"), "origin": String("send"), "paused_total_secs": Number(0.0), "revived_at": Null, "role": String("r2-flag-only-window-target"), "seq": Number(1), "surface_id": Number(1), "text": String("[보고] R2 재기동 만료 검체"), "ttl_secs": Number(1)}]
+FAILED

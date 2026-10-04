@@ -1,0 +1,15 @@
+test        : handlers::tests::pause_without_reason_records_absence_not_an_empty_string
+sequence    : 9 of 15
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:23983   thread 'handlers::tests::pause_without_reason_records_absence_not_an_empty_string'
+panics      : 1 in this part of the log
+type        : unwrap_err   (any match: unwrap_err)
+message     :
+called `Result::unwrap()` on an `Err` value: Os { code: 32, kind: Uncategorized, message: "The process cannot access the file because it is being used by another process." }
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::pause_without_reason_records_absence_not_an_empty_string ... 
+thread 'handlers::tests::pause_without_reason_records_absence_not_an_empty_string' (26312) panicked at src\bin\cysd\handlers.rs:23983:38:
+called `Result::unwrap()` on an `Err` value: Os { code: 32, kind: Uncategorized, message: "The process cannot access the file because it is being used by another process." }
+FAILED

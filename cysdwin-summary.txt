@@ -1,0 +1,103 @@
+cysd-win digest (diag/cysdwin-digest.py v1) - generated 2026-10-04T12:28:38Z
+
+== what was run ==
+product ref   : 5c4b2ac25bba82103d610237f92d6798abba4596
+filter        : (none)
+skip          : hwmon::tests::snapshot_has_all_sections attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery
+cargo command : cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections --skip attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery
+cargo rc      : 101
+elapsed       : 1150 s (19 min 10 s)
+step outcomes : read-input=success, checkout-product=success, cargo=failure
+
+== test result lines (1) ==
+test result: FAILED. 1835 passed; 15 failed; 44 ignored; 0 measured; 2 filtered out; finished in 1001.71s
+
+== counts ==
+"test <name> ... " lines in the log      : 1894
+result marks of those lines              : FAILED=15, ignored=44, ok=1835
+failing tests                            : 15   (taken from: failures list)
+  with a log part                        : 15
+  with a panic location                  : 15
+  with more than one panic in their part : 0
+failed according to the result line(s)   : 15 -> agrees with the list
+last started test                        : write_stall_tests::write_stall_default_leaves_release_margin
+
+== failures per module (name before "::tests::"; else the first path segment) ==
+    6  handlers
+    5  governance
+    3  state
+    1  schedule
+
+== failures per full module path (top 40) ==
+    6  handlers::tests
+    3  governance::tests
+    3  state::tests
+    1  governance::reflect_queue_tests
+    1  governance::todo_decl_tests
+    1  schedule::c8_push_counts_submit_tests
+
+== failures per panic location (file:line of the FIRST panic of the test; top 30; backslashes shown as /) ==
+    1  src/bin/cysd/governance.rs:26421
+    1  src/bin/cysd/governance.rs:17409
+    1  src/bin/cysd/governance.rs:21516
+    1  src/bin/cysd/governance.rs:20139
+    1  src/bin/cysd/governance.rs:25572
+    1  src/bin/cysd/handlers.rs:17289
+    1  src/bin/cysd/handlers.rs:24151
+    1  src/bin/cysd/handlers.rs:24035
+    1  src/bin/cysd/handlers.rs:23983
+    1  src/bin/cysd/handlers.rs:12012
+    1  src/bin/cysd/handlers.rs:23539
+    1  src/bin/cysd/schedule.rs:5815
+    1  src/bin/cysd/state.rs:8761
+    1  src/bin/cysd/state.rs:10394
+    1  src/bin/cysd/state.rs:9902
+
+== failures per message type (PRIMARY label = first matching rule below; the counts add up to the number of failures) ==
+    8  other
+    4  assert_left_right
+    3  unwrap_err
+
+== failures per message type (ANY match: a failure counts for every rule that matches it) ==
+    4  assert_left_right
+    3  unwrap_err
+
+== first message lines, normalized (paths -> <WINPATH>/<POSIXPATH>, hex ids, digits -> N; top 30) ==
+    3  called `Result::unwrap()` on an `Err` value: Os { code: N, kind: Uncategorized, message: "The process cannot access the file because it is being used by another
+    1  전제: 좌석이 N초 안에 종료하지 않았다
+    1  사유가 입력줄 점유로 기록돼야 손잡이가 맞는다: {"category":"queue","name":"queue.depth_high","payload":{"blocked_by":"busy(출력 중)","depth":N,"hint":"queued 배달이 막힌 채 적체 중 — read-scre
+    1  보류 사유가 기록되지 않으면 queue.list 가 이유를 말할 수 없다: Some(("busy(출력 중)", <ID>.N))
+    1  assertion `left == right` failed: 파일 전제 확인: queue-expired.json
+    1  assertion `left == right` failed
+    1  assertion `left == right` failed: 전제: 실제 거부 문구 = 종전 문구 + 맨 끝 처방
+    1  quiet_secs 가 되감은 last_output 을 반영하지 않는다({"since_line":N,"surface_id":N}): N
+    1  surface.exited(sid=N) N초 내 미도착 — reader EOF 경로 미완주
+    1  전제 실패: reader 가 자식 종료(EOF)를 보지 못했다
+    1  뒤 인계의 표식을 앞 인계의 되돌림이 지웠다
+    1  assertion `left == right` failed: fN 왕복 보존
+    1  테스트 상태 디렉터리 정리: Os { code: N, kind: Uncategorized, message: "The process cannot access the file because it is being used by another process." }
+
+== message type rules (text = the panic message; when a test has no panic line: its message + the first 15 lines of its log part) ==
+matched case-insensitively, in this order; the first match is the primary label, "other" when nothing matches:
+  no_such_file       no such file or directory|cannot find the (?:path|file) specified|the system cannot find|\bos error (?:2|3)\b|\bNotFound\b
+  permission         permission denied|access is denied|\bos error (?:5|13)\b|\bPermissionDenied\b
+  symlink_privilege  symlink|a required privilege is not held|\bos error 1314\b
+  pipe_socket        named pipe|\bpipe\b|socket|connection (?:refused|reset|aborted)|\bos error (?:109|231|232|10048|10054|10061)\b|\bConnectionRefused\b|\bBrokenPipe\b
+  timeout            timed out|timeout|deadline
+  encoding           utf-?8|invalid utf|code ?page|cp949|cp1252|encoding
+  home_userprofile   (?-i:\bHOME\b|USERPROFILE|APPDATA|LOCALAPPDATA)|home_dir|home dir
+  not_supported      not supported|unsupported|not implemented|only on (?:unix|macos|windows)
+  path_backslash     [A-Za-z]:\\|\\\\\?\\|\\[A-Za-z0-9_.-]+\\|[A-Za-z0-9_.-]+\\[A-Za-z0-9_.-]+\.[A-Za-z0-9]+
+  os_error_other     \bos error \d+\b|\bio::Error\b|Error \{ kind
+  assert_left_right  assertion `?left (?:==|!=) right`? failed|^\s*left:\s|^\s*right:\s
+  assert_failed      assertion failed
+  unwrap_none        called `Option::unwrap\(\)` on a `None` value|Option::expect
+  unwrap_err         called `Result::unwrap\(\)` on an `Err` value|Result::expect
+
+== files ==
+cysdwin-failures/        15 file(s), one per failing test, each capped at 10240 bytes (head + tail kept when longer)
+cysdwin-digest.tsv       seq, test, panic_at (as printed), location (file:line), message (first 300 characters), thread, panics, file
+cysdwin-digest.json      the same numbers for programs
+cysdwin-cargo.log        200487 bytes, kept whole
+cysdwin-meta.json / cysdwin-env.txt   what was run and the runner facts
+

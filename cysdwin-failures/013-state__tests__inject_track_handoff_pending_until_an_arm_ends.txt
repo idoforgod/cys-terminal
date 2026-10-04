@@ -1,0 +1,15 @@
+test        : state::tests::inject_track_handoff_pending_until_an_arm_ends
+sequence    : 13 of 15
+module      : state   (full path: state::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/state.rs:8761   thread 'state::tests::inject_track_handoff_pending_until_an_arm_ends'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+뒤 인계의 표식을 앞 인계의 되돌림이 지웠다
+FAILED
+----------------------------------------------------------------------
+test state::tests::inject_track_handoff_pending_until_an_arm_ends ... 
+thread 'state::tests::inject_track_handoff_pending_until_an_arm_ends' (49952) panicked at src\bin\cysd\state.rs:8761:9:
+뒤 인계의 표식을 앞 인계의 되돌림이 지웠다
+FAILED
