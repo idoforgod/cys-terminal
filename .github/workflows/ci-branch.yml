@@ -285,6 +285,14 @@ jobs:
                   "가짜 otool 로 재는 것이라 브랜치 조기 경보(ci-branch)에 먼저 싣는다. release 레인 편입은 발행 레인 변경이라 이번 티켓 범위 밖이다(편입하려면 release.yml 의 같은 게이트 "
                   "스텝 옆에 한 스텝을 더하고 이 항목의 레인 집합을 {ci-branch, release} 로 고친다). pack-release 는 이 도구를 실행하지도 싣지도 않아 편입하면 근거 없는 목록이 된다.",
               ),
+              # ★R2F-PK 2차(성찰 2회차): 맥 데몬 검체 스텝(`--bin cysd`)의 **음성 대조** — 그 스텝의 run 본문을 떼어 가짜 cargo 로 종료 코드 전달과 실패 annotation 을 잰다. 브랜치 CI 한 레인만 등재한다.
+              "test_ci_branch_cysd_step": (
+                  {"ci-branch"},
+                  "scripts/tests/ 스위트(팩 스위트 아님 · R2F-PK 2차 편입). 대상은 배송물이 아니라 **이 파일(ci-branch.yml)의 맥 데몬 검체 스텝 본문**이다 — 그 스텝이 실패 때 검체 이름을 annotation 으로 "
+                  "내고 cargo 와 같은 종료 코드로 끝나는지(파이프가 실패를 삼키지 않는지)를 가짜 cargo 로 잰다. release·pack-release 에는 그 본문이 없다(release 의 데몬 검체는 phoenix 로직 게이트 스텝의 "
+                  "한 줄이고 이번 티켓에서 고치지 않았다 · pack-release 는 데몬 검체를 돌리지 않는다) — 편입하면 잴 대상이 없는 근거 없는 목록이 된다. release 의 그 줄에 같은 판독을 얹는다면 그때 "
+                  "이 검체의 대상과 이 항목의 레인 집합을 함께 넓힌다.",
+              ),
                             "test_verify_win_crt": (
                   {"ci-branch", "release"},
                   "scripts/tests/ 스위트(팩 스위트 아님 · R1-repair 2026-08-29 편입 — 그 전에는 "
@@ -1239,11 +1247,71 @@ jobs:
       #   소스 핀·실패 사유 판정)하거나 `CYS_HW_STRICT` 일 때만 켜진다 — 코드 읽기 근거이고 가상 러너 실측은 아직 없다
       #   (로컬 맥 실기 16/16 통과). **이 좁힘 탓에 이 스텝이 붉어지면 이 한 줄을 되돌려라**(테스트 삭제 금지).
       #   release.yml 의 skip 은 그대로다(발행 레인은 건드리지 않는다).
+      #   ★(0.14.43 성찰 2회차 R2F-PK 2차 · 2026-10-05) **실패하면 검체 이름을 annotation 으로 낸다.** 종전의 이 스텝은 붉어도 annotation 이 러너의 "Process completed with exit code 101" 한 줄뿐이었다.
+      #   잡 로그는 인증 없이 읽히지 않는다(익명으로 읽히는 실패 사유 채널은 annotation 뿐이다 — scripts/pre-tag-ci-check.py 머리말) → 러너에서만 흔들리는 검체는 **이름조차 알 수 없었다**
+      #   (실발생 2026-10-04: 커밋 2d9aea4e 의 런 37198280229 · 잡 111424543389 가 이 스텝에서 exit 101 — `src/` 가 한 글자도 다르지 않은 앞 커밋 bd0a0ca3 의 같은 스텝은 통과했다).
+      #   그래서 cargo 출력을 `tee` 로 로그 파일에도 받고, 실패(rc≠0)일 때만 ①판정 한 줄(실패 검체 이름 · 하네스 이상은 따로 구분) ②로그 꼬리 20줄을 `::error` 로 낸 뒤 **같은 rc 로** 끝낸다.
+      #   · **차단 의미·실행 명령은 그대로다.** 판정은 cargo 의 종료 코드 하나다 — rc 0 이면 로그에 FAILED 가 보여도 통과이고 덧붙는 줄도 없다(종전과 같은 출력). `continue-on-error`·`if:` 를 달지 않는다.
+      #   · rc 는 파이프에 삼켜지지 않게 `PIPESTATUS[0]` 으로 직독하고 `-e` 는 파이프 **앞에서** 끈다 — 켜 둔 채면 cargo 가 비0 일 때 파이프 직후 그 자리에서 스텝이 끝나 판독 코드가 도달 불가다
+      #     (windows-health 의 cysd 스텝이 U4 C4-① 에서 겪은 형태). 그 뒤로 `-e` 를 다시 켜지 않는다 — 판독 명령 하나가 실패해도 스크립트는 끝까지 가고 맨 끝의 `exit "$rc"` 가 종료 코드를 정한다.
+      #   · annotation 은 **많아야 두 줄이고 판정(이름) 줄이 먼저다.** 실측(R2F-PK 1차 · 커밋 bd0a0ca3 의 windows-health 런 37185687205 익명 조회): 그 런의 cysd 스텝 본문은 실패 때 error 를 22줄
+      #     (머리 1 · 꼬리 20 · 판정 1) 내는데 조회에 남은 것은 앞 10줄(머리 1 · 꼬리 9)이었고 맨 뒤 판정 줄은 없었다 — 스텝당 error annotation 은 앞 10개만 남는 것으로 보인다. 그래서 꼬리는
+      #     줄마다가 아니라 `%0A` 로 이은 **한 줄**로 낸다(windows-health 판독 스텝의 esc 와 같은 방식).
+      #   · 판독 도구는 `LC_ALL=C`·`grep -a` 로 돈다 — 맥의 sed·tr·sort·awk 는 UTF-8 로케일에서 깨진 바이트 하나에 멈추고 grep 은 NUL 하나에 "Binary file … matches" 만 낸다(로컬 맥 실측).
+      #     실패한 검체가 터미널 바이트를 찍었다는 이유로 이름·꼬리가 사라지면 안 된다. 맥의 bash 3.2 도 UTF-8 로케일에서는 `$이름` 바로 뒤 한글의 첫 바이트를 변수 이름에 붙여 읽는데
+      #     (unbound variable · 로컬 맥 실측) `LC_ALL=C` 뒤로는 그 함정도 없다 — 이 줄을 지우지 마라.
+      #   · 한계: 러너가 스텝을 잘라 내면(취소·잡 타임아웃) 판독 코드는 돌지 않는다 — 그때 남는 것은 `tee` 가 흘린 러너 로그뿐이다(익명으로는 읽히지 않는다).
       - name: cargo test --bin cysd (데몬 단위 검체 · 브랜치 레인 편입 · macOS)
         shell: bash
         run: |
           set -euo pipefail
-          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::tests::snapshot_has_all_sections
+          # 로그는 판독 전용이다(판정은 아래 rc 하나). 낡은 로그를 읽지 않게 먼저 지운다.
+          LOG="${RUNNER_TEMP:-/tmp}/cysd-mac.log"
+          rm -f "$LOG"
+          # ★여기서 -e 를 끈다(위 머리 주석) — 아래 파이프가 비0 이어도 rc 를 받아 판독까지 간다.
+          set +e
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::tests::snapshot_has_all_sections 2>&1 | tee "$LOG"
+          rc="${PIPESTATUS[0]}"
+          if [ "$rc" -eq 0 ]; then exit 0; fi
+          # ── 여기부터는 실패(rc≠0)일 때만 돈다 — 판독은 종료 코드를 바꾸지 않는다 ──
+          export LC_ALL=C
+          esc() { sed -e 's/%/%25/g' | tr -d '\r' | awk 'BEGIN{ORS="%0A"}{print}' | sed -e 's/%0A$//'; }
+          # cargo 출력이 줄 중간에서 끊겼어도 아래 `::error` 가 줄 머리에 오게 한다(줄 머리가 아니면 러너가 명령으로 읽지 않는다).
+          echo
+          if [ ! -s "$LOG" ]; then
+            echo "::error title=cysd-mac 측정 실패::rc=$rc 인데 로그가 없거나 비어 있다 — cargo 가 한 줄도 내지 못했거나 로그 파일을 쓰지 못했다. '실패한 테스트 없음' 이 아니다"
+            exit "$rc"
+          fi
+          summary="$(grep -a -E '^test result:' "$LOG" | tail -1)"
+          failed="$(printf '%s' "$summary" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+')"
+          names="$(awk '/^failures:$/{f=1;next} f&&/^    [a-zA-Z_]/{print $1} f&&/^$/{f=0}' "$LOG" | sort -u | head -20 | tr '\n' ' ')"
+          if [ -z "$summary" ]; then
+            echo "::error title=cysd-mac 측정 실패::rc=$rc 인데 'test result' 요약이 없다 — 컴파일 실패이거나 하네스가 요약 전에 죽었다. '실패한 테스트 없음' 이 아니다"
+          elif [ "${failed:-0}" -eq 0 ]; then
+            echo "::error title=cysd-mac 측정 실패::rc=$rc 인데 failed=0 이다 — 개별 테스트 실패가 아니라 하네스 이상이다(101=러스트 패닉)"
+          else
+            more=""
+            if [ "$failed" -gt 20 ]; then more="… (이름순 앞 20개만 — 전체는 잡 로그에 있다)"; fi
+            printf '%s\n' "::error title=cysd-mac 테스트 실패::failed=$failed — ${names:-(이름을 읽지 못했다 — 아래 로그 꼬리를 보라) }$more"
+          fi
+          printf '%s\n' "::error title=cysd-mac 로그::$(tail -20 "$LOG" | esc)"
+          exit "$rc"
+
+      # ★R2F-PK 2차(성찰 2회차 · 2026-10-05): 위 데몬 검체 스텝의 **음성 대조**. 그 스텝의 `run:` 본문을 이 파일에서 그대로 떼어 가짜 `cargo`(PATH 맨 앞)로 돌려 잰다 — 성공(rc 0 · 덧붙는 줄 0 · 출력 그대로) ·
+      #   테스트 실패(같은 rc · 이름이 든 판정 줄이 먼저 · 꼬리 한 줄) · 하네스 이상(요약 없음 / failed=0 / 로그 없음) · rc 0 인데 로그에 FAILED(통과) · 종료 코드가 그대로 나가는가(1·3·101·137·255) ·
+      #   깨진 바이트·NUL·줄바꿈 없이 끝난 출력 · 낡은 로그 · 이름 목록을 못 읽은 경우 · 실행 인자 · `continue-on-error`·`if:` 부재.
+      #   왜 필요한가: 위 스텝은 파이프(`| tee`)와 rc 직독을 얻었다 — 그 배선이 한 줄만 틀어져도 **데몬 검체가 붉은데 스텝은 초록**이 된다(통과만 보이는 게이트는 늘 초록인 검사와 구별되지 않는다).
+      #   레인 대조 게이트는 실행 줄의 존재와 `if:` 만 핀한다 — 종료 코드 전달과 `continue-on-error` 는 그 사정거리 밖이고 이 검체가 그 몫을 진다.
+      #   밀폐: 임시 폴더의 가짜 cargo 와 시스템 도구(/usr/bin·/bin)만 쓴다(진짜 cargo·네트워크 무접촉 · 로컬 맥 실측 약 2초). pack-release·release 미편입 사유는 위 레인 대조 게이트의
+      #   ALLOWED("test_ci_branch_cysd_step") 등재 참조. ★`if:` 를 달지 않는다(돌지 않는 초록 금지). 데몬 검체 스텝 **뒤**에 둔다 — 앞에 두면 이 검체가 붉을 때 데몬 검체가 건너뛰어진다.
+      - name: 맥 데몬 검체 스텝의 실패 판독 음성 대조 (가짜 cargo · 종료 코드·annotation · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_ci_branch_cysd_step.py"
+          [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+          echo "== test_ci_branch_cysd_step (mac) =="
+          python3 "$f"
 
       # ★(0.14.43 성찰 R1F-PK · S3 minor 8) IOReport 강링크 **산출물** 게이트. E2 가 `hwmon.rs` 의 IOReport 강링크를 dlopen 지연
       #   로딩으로 바꿨다(그 dylib 이 없는 맥에서 데몬이 뜨지 못하던 문제). 소스 핀(lib `e2_cysd_hwmon_source_has_no_ioreport_strong_link`)은
