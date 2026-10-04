@@ -2444,7 +2444,7 @@ describe("★S4 m3 — 실제 토스트 기계(stickyToast · addToastCloseButto
 
 describe("★S4 n1 — 「팀 직접 만들기」 실패 알림은 지속 알림(sticky · 닫기 버튼 있음)으로 — 문구는 그대로", () => {
   /** cys-dept 가 실제로 내는 데몬 기동 실패 문구(ready_fail_note 꼴 · 로그 경로와 환경변수 이름 포함) — Tauri 가 `dept-create:<코드>:<stderr>` 로 전달한다. 150자 이상이다. */
-  const LONG = "dept-create:1:[cys-dept] ERROR: dept-2 데몬 기동 실패 (소켓 대기 12초 · 로그: /Users/runner/.local/state/cys-dept-dept-2/cysd.log · 느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)";
+  const LONG = "dept-create:1:[cys-dept] ERROR: dept-2 데몬 기동 실패 (대기 예산 12초 · 실제 약 13초 · 로그: /Users/runner/.local/state/cys-dept-dept-2/cysd.log · 느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)";
   function setup(failWith: unknown) {
     const toasts: { fn: string; args: unknown[] }[] = [];
     const dismissed: string[] = [];

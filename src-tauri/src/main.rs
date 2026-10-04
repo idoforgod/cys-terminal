@@ -5536,7 +5536,7 @@ fn parse_dept_stage_line(line: &str) -> Option<&str> {
 }
 
 /// stderr 에서 단계 표지 줄만 뺀다 — 나머지 바이트·순서·줄바꿈(CRLF 포함)은 그대로. 실패 메시지(`dept-create:<code>:<stderr>`)에 넣는 stderr 에 쓴다:
-/// 화면(ui/src/teamproposal.ts `teamCreateErrorText`)은 stderr 의 **앞 300자만** 보이므로 표지 5~6줄이 앞자리를 차지하면 정작 실패 사유(소켓 대기 N초·로그 경로·노브 안내)가 잘려 나간다.
+/// 화면(ui/src/teamproposal.ts `teamCreateErrorText`)은 stderr 의 **앞 300자만** 보이므로 표지 5~6줄이 앞자리를 차지하면 정작 실패 사유(대기 예산·실제 경과 초·로그 경로·노브 안내)가 잘려 나간다.
 fn strip_stage_lines(stderr: &str) -> String {
     let mut out = String::with_capacity(stderr.len());
     for seg in stderr.split_inclusive('\n') {
@@ -8214,7 +8214,7 @@ mod tests {
             "plain",
             "[cys-dept] @stage Done",
             "",
-            "[cys-dept] ERROR: x 데몬 기동 실패 (소켓 대기 12초)",
+            "[cys-dept] ERROR: x 데몬 기동 실패 (대기 예산 12초 · 실제 약 13초)",
             "[cys-dept] @stage up",
         ];
         let mut seed: u32 = 0x1234_5678;
@@ -8243,7 +8243,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn gu_failure_reason_survives_the_first_300_chars_after_marker_strip() {
-        let reason = "[cys-dept] ERROR: dept-3 데몬 기동 실패 (소켓 대기 12초 · 로그: /Users/user/very-long-dirs-example/Library/Caches/cys/state/cys-dept-dept-3/cysd.log · \
+        let reason = "[cys-dept] ERROR: dept-3 데몬 기동 실패 (대기 예산 12초 · 실제 약 28초 · 로그: /Users/user/very-long-dirs-example/Library/Caches/cys/state/cys-dept-dept-3/cysd.log · \
                       느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)";
         let units = |s: &str| s.encode_utf16().count();
         assert!(units(reason) <= 300, "전제: 사유 줄 자체는 300자 안이다({})", units(reason));
