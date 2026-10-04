@@ -162,6 +162,9 @@ import {
   deptFormationCapped,
   deptFormationToastId,
   deptFormationVerdict,
+  deptFormationNoticeKind,
+  deptFormationListSilent,
+  deptFormationStalled,
   deptLiveRoles,
   deptFirstSeatPending,
   deptFirstSeatRemainingMs,
@@ -346,9 +349,9 @@ interface Workspace {
   pendingStage?: string; // 팩이 마지막으로 알린 단계 키(dept-create-progress) — 대기 문구의 '지금: …' 줄. undefined = 표지를 한 번도 못 받았다(구 팩·스트리밍 끔)
   pendingSpawned?: boolean; // ★R1F-UB(S4 m4): 이 호출이 데몬을 띄웠다는 `spawn` 단계 표지를 받았다 — 새 팀 표지(createdAt)를 세울지 가르는 근거(기존 팀을 돌려받은 호출엔 없다)
   createdAt?: number; // 이 세션에서 **새로 만든**(이 호출이 데몬을 띄운) 팀의 생성 성공 시각(ms) — 멱등 합류·취소·실패 분기와 기존 팀을 돌려받은 호출에는 세우지 않는다
-  formationDone?: boolean; // 팀원 부팅 안내를 더 갱신하지 않는다(자리 판정이 끝났다 — 다섯 다 붙음 · 15분 상한 · 닫힌 탭)
+  formationDone?: boolean; // 팀원 부팅 안내를 더 갱신하지 않는다 — 자리 판정이 끝났다(다섯 다 붙음 「모두 붙었습니다」 또는 15분 상한 「15분 경과」). 이 값은 checkDeptFormationNotices 의 자리 판정 분기 한 곳에서만 선다 — 닫힌 탭은 이 표식이 아니라 탭이 목록에서 사라져 점검 대상에서 빠진다
   // 마지막으로 낸 팀원 부팅 안내 — 열쇠(key)가 바뀔 때만 다시 낸다. muted = 사용자가 안내를 **× 버튼으로** 닫았다(noteToastClosedByUser 만 세운다 — 수명 만료·탭 닫힘은 닫음이 아니다).
-  //   주기 갱신만 멈춘다 · 자리 판정의 최종 안내(모두 붙음·확인 필요)는 그래도 한 번 낸다.
+  //   주기 갱신만 멈춘다 · 자리 판정의 최종 안내(모두 붙음·15분 경과·팀 데몬 무응답)는 그래도 한 번 낸다.
   formationView?: { state: DeptFormationState; key: string; muted?: boolean };
 }
 
@@ -5159,7 +5162,7 @@ async function addWorkspace(): Promise<Workspace> {
 
 // 멀티마스터 F4: 새 '부서 workspace' 런칭 = 새 부서 데몬 spawn(cys-dept launch 단일 진입점).
 // 첫 부서가 생기면 백엔드(cys-dept)가 기본 데몬을 CEO로 자동 승격한다.
-// ① 표시 지연(안 C): 무거운 launch await(최대 ~12s) '전에' placeholder 탭을 즉시 render — 체감 지연 0.
+// ① 표시 지연(안 C): 무거운 launch await(실측 이 맥 25~30초 · 느린 PC 는 1분 넘게 · 윈도우 11 러너 약 43~44초 — 대기 문구가 말하는 값) '전에' placeholder 탭을 즉시 render — 체감 지연 0.
 // ② 고아 방지(안 A): 빈 newSurface를 만들지 않는다. cys-dept가 띄우는 role=master surface가
 //    refreshPaneTitles 자동입양으로 '첫 pane'이 되게 한다(빈 셸 미생성 → 고아 0).
 // ★U16(0.14.41): teamSpec = 오너가 팀 제안 확인 창에서 [만들기]를 누른 팀(이름·하는 일). 새 생성 경로가
@@ -5190,6 +5193,7 @@ async function addDeptWorkspace(catalogKey?: string, teamSpec?: TeamSpec): Promi
       socket_slug?: string;
       name: string;
       display_name?: string;
+      spawned?: boolean; // ★R2F-UI(A3 n1): 백엔드가 `spawn` 단계 표지를 읽었는지(가산 키 — 표지를 한 번도 못 읽었거나 구 백엔드면 없다)
     };
     ws.name = info.display_name ?? info.name; // ★표시명(create 카탈로그·U16 팀 제안) 또는 부서 번호(레거시)
     if (info.socket_slug && info.socket) socketForSlug.set(info.socket_slug, info.socket);
@@ -5225,10 +5229,12 @@ async function addDeptWorkspace(catalogKey?: string, teamSpec?: TeamSpec): Promi
     ws.pending = false;
     // ★0.14.43(GU): 이 세션에서 **새로 만든** 팀 표지(표시 전용) — 성공 분기에서만 세운다(멱등 합류·취소·실패 분기에는 세우지 않는다). render() 보다 먼저 서야
     //   빈 탭이 '아직 켜지 않았습니다'(방금 만든 팀에는 거짓)를 잠깐 비추지 않는다. 첫 안내는 성공 직후 한 번 — 표시 실패가 생성 성공을 뒤집지 않게 가둔다.
-    // ★R1F-UB(S4 m4): 그리고 **이 호출이 데몬을 띄웠을 때만** 세운다 — 팩이 `spawn` 단계 표지를 냈다(pendingSpawned). 기존 팀을 돌려받은 호출(create 의 REUSE_UP·REUSE_BOOTING ·
-    //   allocate 의 멱등 반환 · 이미 가동 중인 데몬 재사용)은 spawn 표지가 없다(다른 표지는 온다) → 표지·첫 안내 없음(문서: '새로 만든 팀에만'). 표지를 한 번도 못 받았으면(pendingStage
-    //   없음 = 진행 표지를 내지 않는 구 팩 · 스트리밍 끔 · 이벤트 유실) 구분할 수 없으므로 **현행 유지** — 새 팀으로 보고 안내를 낸다.
-    const spawned = ws.pendingSpawned === true || ws.pendingStage === undefined;
+    // ★R1F-UB(S4 m4): 그리고 **이 호출이 데몬을 띄웠을 때만** 세운다 — 팩이 `spawn` 단계 표지를 냈다. 기존 팀을 돌려받은 호출(create 의 REUSE_UP·REUSE_BOOTING ·
+    //   allocate 의 멱등 반환 · 이미 가동 중인 데몬 재사용)은 spawn 표지가 없다(다른 표지는 온다) → 표지·첫 안내 없음(문서: '새로 만든 팀에만').
+    // ★R2F-UI(A3 n1): 그 판정은 **명령 응답의 `spawned`** 가 1순위다 — 백엔드가 표지를 읽는 즉시 기억해 응답 객체에 싣는다(이벤트와 응답이 다른 통로로 와서 도착 순서가 보장되지 않는다 —
+    //   종전 식은 응답이 도착한 순간의 pendingSpawned·pendingStage 를 봐, `done` 표지만 늦게 도착하면 기존 팀이 새 팀으로 읽힐 수 있었다). 응답에 그 키가 없으면(구 백엔드 · 표지를 한 번도 못 읽음)
+    //   종전 식 그대로다: 이벤트로 `spawn` 을 받았거나(pendingSpawned) 표지를 한 번도 못 받았으면(pendingStage 없음 = 진행 표지를 내지 않는 구 팩 · 스트리밍 끔 · 이벤트 유실) **현행 유지** — 새 팀으로 보고 안내를 낸다.
+    const spawned = typeof info.spawned === "boolean" ? info.spawned : ws.pendingSpawned === true || ws.pendingStage === undefined;
     if (spawned) ws.createdAt = Date.now();
     render();
     if (spawned) {
@@ -5265,32 +5271,49 @@ function onDeptCreateProgress(payload: unknown): void {
   for (const ws of workspaces) {
     if (!ws.pending || deptProgressId(ws.id) !== p.id) continue;
     ws.pendingStage = p.stage;
-    if (p.stage === "spawn") ws.pendingSpawned = true; // ★R1F-UB(S4 m4): 이 호출이 데몬을 띄웠다 — 성공 분기가 '새로 만든 팀' 표지를 세울지 이것으로 가른다
+    if (p.stage === "spawn") ws.pendingSpawned = true; // ★R1F-UB(S4 m4): 이 호출이 데몬을 띄웠다 — 응답에 `spawned` 가 없을 때(구 백엔드)만 성공 분기가 '새로 만든 팀' 표지를 세울지 이것으로 가른다(R2F-UI)
     const paint = deptPendingPainters.get(ws.id);
     if (paint) paint();
   }
 }
 
+/// ★R2F-UI(A3 M1 (b)·n13) 팀원 부팅 안내의 '그 팀 좌석 목록을 마지막으로 받은 때' 기록 — Workspace 필드가 아니라 WeakMap 이다: 런타임 전용 표시 상태라 saveLayout 직렬화에 새지 않고(저장되면 다음 기동이
+/// 옛 안내를 되살린다) 탭 객체가 사라지면 함께 사라진다. listAt = 마지막으로 목록(배열)을 받은 시각(ms · 아직 못 받았으면 팀을 만든 시각) · seated = 그때 붙은 의무 역할 수(안내 문구의 자리 수) ·
+/// silentShown = 「팀 데몬이 응답하지 않습니다」 를 이미 알렸다(상한에서 한 번뿐).
+/// ★후속(정체 판정): grewAt = 붙은 의무 역할 수가 **마지막으로 늘어난** 때(ms · 처음 목록을 받은 틱이 기준 · 늘 때마다 갱신 · 줄어드는 것은 갱신하지 않는다 · 목록을 한 번도 못 받았으면 없음) ·
+/// stallShown = 「자리가 더 붙지 않습니다」 를 이미 알렸다(한 번뿐 — 알린 뒤에는 켜는 중 갱신을 멈추고 15분 상한의 「15분 경과」 도 내지 않는다). 표시 전용 — 어떤 명령도 보내지 않는다.
+const formationTrack = new WeakMap<Workspace, { listAt: number; seated: number; grewAt?: number; silentShown?: boolean; stallShown?: boolean }>();
+
 /// 팀원 부팅 안내(sticky 토스트 · id `dept-formation:<소켓>`)를 한 번 낸다 — 같은 id 는 갱신이다. 낸 상태·열쇠를 탭에 적어 두어
 /// 다음 틱(checkDeptFormationNotices)이 '값이 바뀔 때만' 다시 내게 한다. 매 호출이 알람 이력을 돌리므로 초 단위로 부르지 않는다.
-/// state = booting(켜는 중 · 주기 갱신) · seated(의무 역할 다섯이 모두 붙음 — 한 번) · check(15분 상한까지 다 안 붙음 — 한 번). seated 인자 = 붙은 의무 역할 수(check 문구의 N · 판정이 센 값).
-/// booting 의 '지금 N자리' 는 탭의 칸 수(collectSids)다.
+/// state = booting(켜는 중 · 주기 갱신) · seated(의무 역할 다섯이 모두 붙음 — 한 번) · check(15분 상한까지 다 안 붙음 — 일반 알림 · 한 번) · silent(15분 상한인데 좌석 목록을 못 받음 — 경고 · 한 번) ·
+/// stall(자리가 3분 동안 더 붙지 않음 — 일반 알림 · 한 번).
+/// ★R2F-UI(A3 n13): 모든 문구의 자리 수는 **붙은 의무 역할 수**다 — 인자 seated(판정이 센 값)가 있으면 그것, 없으면 그 팀 소켓의 목록을 마지막으로 받았을 때의 값(formationTrack · 아직 못 받았으면 0).
+///   종전 booting 의 '지금 N자리' 는 탭의 칸 수(collectSids — 사용자가 연 셸 포함)라 같은 팀의 다른 문구('아직 N자리')와 N 이 달랐다. 알림 등급은 deptFormationNoticeKind 가 정한다.
 function showDeptFormation(ws: Workspace, state: DeptFormationState, seated?: number): void {
   if (!ws.socket || ws.createdAt === undefined) return;
   const elapsedSec = Math.floor((Date.now() - ws.createdAt) / 1000);
-  const seats = state === "check" && seated !== undefined ? seated : collectSids(ws.tree).length;
+  const seats = seated !== undefined ? seated : (formationTrack.get(ws)?.seated ?? 0);
   const t = deptFormationText({ seats, elapsedSec, state });
-  stickyToast(deptFormationToastId(ws.socket), state === "check" ? "watchdog" : "feed", t.title, t.body);
+  stickyToast(deptFormationToastId(ws.socket), deptFormationNoticeKind(state), t.title, t.body);
   ws.formationView = { state, key: deptFormationNoticeKey({ seats, elapsedSec, state }) };
 }
 
 /// 기존 3초 주기 refreshPaneTitles 끝에서 부르는 가벼운 점검(새 타이머 0): ① 닫힌 탭의 안내를 거둔다(탭이 어떤 경로로 사라졌든 — 탭 ×·그룹 삭제·롤백)
 /// ② ★완료 판정(R1F-UB · S4 B1) — 이 세션에서 새로 만든 탭의 **소켓의 좌석 목록**(이번 틱이 받은 list_surfaces 의 역할 · seatRoles)에서 의무 역할 다섯이 모두 붙었으면
 ///    「팀 자리가 모두 붙었습니다」로 **한 번** 바꾸고 더 갱신하지 않는다(formationDone — 토스트는 수명대로 사라진다 · '준비 완료'라고 단정하지 않는다: 에이전트가 떴는지는 화면이 모른다).
-///    15분(DEPT_FORMATION_CAP_SECS)에 닿았는데 다 안 붙었으면 「팀원 켜기 — 확인 필요」를 **한 번** 알리고 접는다. 그 소켓의 목록을 못 받은 틱(시간 초과 등)은 판정을 건너뛴다.
+///    15분(DEPT_FORMATION_CAP_SECS)에 닿았는데 다 안 붙었으면 「팀원 켜기 — 15분 경과」(**일반 알림** — 설치하지 않은 프로그램의 자리는 생기지 않는 것이 정상일 수 있다)를 **한 번** 알리고 접는다.
+///    그 소켓의 목록을 못 받은 틱(시간 초과 등)은 판정을 건너뛴다.
 ///    편성 결과 feed 는 보지 않는다 — 편성 도구는 본부 데몬으로 feed 를 내고 화면의 socketForSlug 에는 부서 소켓만 있어 부서 탭과 대응시킬 수 없었다(종전 배선은 닿지 않았다).
-/// ③ 그 밖에는 안내를 **열쇠가 바뀔 때만** 다시 낸다(자리 수 · 경과 '분' · 45초 수명 칸) — 토스트가 수명(60초)으로 사라졌으면(점검이 밀려 갱신 칸을 놓쳤다) 다시 낸다(S4 m3)
-/// ④ 사용자가 안내를 **× 버튼으로** 닫았으면(formationView.muted · noteToastClosedByUser 만 세운다) 주기 갱신을 멈춘다(닫힌 안내를 되살리는 재점등 스팸 금지 — ②의 최종 안내는 그래도 한 번 낸다).
+/// ③ ★R2F-UI(A3 M1 (b)) 목록을 **연속으로 60초 넘게** 못 받은 팀은 「켜는 중」 갱신을 멈춘다(토스트는 수명으로 사라지고, 목록이 다시 오면 이어 간다). 15분 상한에 닿았는데 최근 60초 안에 받은 목록이 없으면
+///    「팀 데몬이 응답하지 않습니다 — 확인 필요」(경고)를 **한 번** 알린다(그 팀이 켜졌는지 화면이 모르는 채로 입을 다물지 않는다 — 가장 '확인 필요'가 필요한 경우). 목록이 나중에 다시 오면 그때 위 ②의 판정이 난다.
+///    삭제 중(deleting)·종료 실패(stopFailed) 탭은 켜지는 중인 팀이 아니라 점검하지 않는다(종료 실패로 남은 탭에 '켜는 중' 이 계속 뜨던 것).
+/// ④ 그 밖에는 안내를 **열쇠가 바뀔 때만** 다시 낸다(붙은 자리 수 · 경과 '분' · 45초 수명 칸) — 토스트가 수명(60초)으로 사라졌으면(점검이 밀려 갱신 칸을 놓쳤다) 다시 낸다(S4 m3)
+/// ⑤ 사용자가 안내를 **× 버튼으로** 닫았으면(formationView.muted · noteToastClosedByUser 만 세운다) 주기 갱신을 멈춘다(닫힌 안내를 되살리는 재점등 스팸 금지 — ②의 최종 안내는 그래도 한 번 낸다).
+/// ⑥ ★후속(정체 판정 · A2 B-1 최소 수정안 2) 부서장 자리는 붙어 있는데(붙은 의무 역할 수 ≥ 1) 다섯이 안 됐고 15분 상한 전이며 **이번 틱에 그 팀의 목록을 받았고** 붙은 수가 마지막으로 늘어난 때부터 180초 이상이면
+///    「팀원 켜기 — 자리가 더 붙지 않습니다」(일반 알림)를 **한 번** 알린다(claude 만 깐 PC 는 3자리에서 더 늘지 않는다). 기준 시각(grewAt)은 처음 목록을 받은 틱에서 서고 수가 늘 때마다 밀린다(줄어드는 것은 밀지 않는다).
+///    알린 뒤: 「켜는 중」 주기 갱신을 멈춘다 · 판정은 계속 본다 — 상한 전에 다섯이 모두 붙으면 「팀 자리가 모두 붙었습니다」 를 한 번 내고 끝 · 15분 상한에 닿으면 **추가 알림 없이** 끝낸다(이미 사실을 알렸다 — 「15분 경과」 를 또 내지 않는다) ·
+///    목록 무응답(③)은 종전대로 독립이다. 이 알림은 ②의 최종 안내와 같은 계열이라 **× 로 닫았어도 한 번 난다**(muted 를 보지 않는다).
 function checkDeptFormationNotices(seatRoles?: ReadonlyMap<string, string[] | null>): void {
   const live = new Set<string>();
   for (const w of workspaces) if (w.socket) live.add(deptFormationToastId(w.socket));
@@ -5299,16 +5322,45 @@ function checkDeptFormationNotices(seatRoles?: ReadonlyMap<string, string[] | nu
   }
   const now = Date.now();
   for (const ws of workspaces) {
-    if (ws.pending || !ws.socket || ws.createdAt === undefined || ws.formationDone) continue;
+    if (ws.pending || !ws.socket || ws.createdAt === undefined || ws.formationDone || ws.deleting || ws.stopFailed) continue;
     const elapsedSec = Math.floor((now - ws.createdAt) / 1000);
     const v = deptFormationVerdict(seatRoles === undefined ? undefined : seatRoles.get(ws.socket), elapsedSec);
+    let track = formationTrack.get(ws);
+    if (track === undefined) {
+      track = { listAt: ws.createdAt, seated: 0 };
+      formationTrack.set(ws, track);
+    }
+    if (v.verdict !== "skip") {
+      // 이번 틱에 그 소켓의 좌석 목록(배열)을 받았다 — 수신 시각과 그때 붙은 의무 역할 수를 적는다(skip = 못 받음 · 배열이 아님 → 적지 않는다).
+      // ★후속(정체 판정): 붙은 수가 **늘어난** 틱(또는 처음 목록을 받은 틱 = 기준)에서만 grewAt 을 민다 — 같거나 줄어든 틱은 밀지 않는다(직전 관측과 비교 — 되돌아온 자리의 증가도 늘어난 때로 센다).
+      if (track.grewAt === undefined || v.seated > track.seated) track.grewAt = now;
+      track.listAt = now;
+      track.seated = v.seated;
+    }
     if (v.verdict === "seated" || v.verdict === "check") {
-      showDeptFormation(ws, v.verdict, v.seated);
+      // 다섯이 모두 붙은 것(seated)은 정체 알림 뒤에도 한 번 내고 끝낸다. 15분 상한(check)에 닿았을 때 이미 정체를 알렸으면 **추가 알림 없이** 끝낸다(「15분 경과」 를 또 내지 않는다).
+      if (v.verdict === "seated" || !track.stallShown) showDeptFormation(ws, v.verdict, v.seated);
       ws.formationDone = true;
       continue;
     }
-    // 상한에 닿았는데 그 소켓의 목록을 아직 못 받았다 — 갱신 없이 다음 틱에 다시 판정한다(완료로도 '확인 필요'로도 치지 않는다 · 무한 갱신 금지).
-    if (deptFormationCapped(elapsedSec)) continue;
+    // ★후속(정체 판정): 이번 틱에 목록을 받았고(wait = 목록 있음 ∧ 다섯 미만 ∧ 상한 전) 부서장 자리가 붙어 있으며 붙은 수가 180초 이상 늘지 않았으면 — 한 번 알린다(× 로 닫았어도 난다 · muted 를 보지 않는다).
+    if (v.verdict === "wait" && !track.stallShown && deptFormationStalled(v.seated, track.grewAt, now)) {
+      track.stallShown = true;
+      showDeptFormation(ws, "stall", v.seated);
+      continue;
+    }
+    const silent = deptFormationListSilent(track.listAt, now);
+    // 상한에 닿았는데 이번 틱에 그 소켓의 목록을 못 받았다 — 최근 60초 안에 받은 목록도 없으면 「팀 데몬이 응답하지 않습니다」 를 한 번 알린다(접지는 않는다: 목록이 다시 오면 다음 틱에 판정한다 ·
+    // 이미 알렸으면 갱신 없이 넘어간다 — 무한 갱신 금지). 최근 60초 안에 받은 목록이 있으면(방금 한 틱 못 받았을 뿐) 말하지 않고 다음 틱에 다시 본다.
+    if (deptFormationCapped(elapsedSec)) {
+      if (silent && !track.silentShown) {
+        track.silentShown = true;
+        showDeptFormation(ws, "silent");
+      }
+      continue;
+    }
+    if (silent) continue; // 목록을 60초 넘게 못 받았다 — 「켜는 중」 갱신을 멈춘다(마지막 안내는 수명으로 사라지고, 목록이 다시 오면 아래에서 이어 간다)
+    if (track.stallShown) continue; // 정체를 알렸다 — 「켜는 중」 주기 갱신을 멈춘다(수명으로 사라져도 다시 내지 않는다 · 판정은 위에서 계속 본다)
     const view = ws.formationView;
     if (!view) {
       showDeptFormation(ws, "booting"); // 첫 안내가 아직 안 나갔다(성공 직후 한 번이 빠졌을 때의 안전망)
@@ -5319,8 +5371,7 @@ function checkDeptFormationNotices(seatRoles?: ReadonlyMap<string, string[] | nu
       showDeptFormation(ws, "booting"); // 수명 만료로 사라졌다(닫은 것이 아니다) — 다시 낸다
       continue;
     }
-    const seats = collectSids(ws.tree).length;
-    if (deptFormationNoticeKey({ seats, elapsedSec, state: view.state }) === view.key) continue;
+    if (deptFormationNoticeKey({ seats: track.seated, elapsedSec, state: view.state }) === view.key) continue;
     showDeptFormation(ws, "booting");
   }
 }
@@ -6452,6 +6503,8 @@ const T_UPD_CHECK = winScaled(60_000);
 // ★(0.14.43 · J2) 패치 설치 확인 창을 열기 전 '스마트 앱 컨트롤 상태' 조회의 상한. 넘기면: 안내 문단 없이 확인 창을 연다(조회는 정보일 뿐
 // 설치를 막지 않는다 — 이 조회 때문에 창이 멈추면 안 된다). 맥·리눅스는 프로세스를 띄우지 않고 곧바로 null 이라 이 상한에 닿지 않는다.
 // 윈도우는 reg.exe 1회(Defender 콜드스타트가 겹쳐도 수 초 안)라 winScaled 로 2배(= 5초)다. 부작용 없는 읽기라 rpcT 의 전제를 지킨다.
+// ★(R1F-UA · R2F-UI A3 n9) 이 상한은 **조회 둘**이 쓴다 — 스마트 앱 컨트롤 상태(smart_app_control)와, 켜짐일 때 이어서 묻는 확인 실행 노브(update_checked_launch_enabled). 둘은 차례로 돌아 최악의 대기는
+// 상한의 2배(윈도우 5초 × 2 = 10초)다(노브 조회의 실패·시간 초과는 기본값 '켜짐' 으로 접힌다).
 const T_SAC = winScaled(2_500);
 let updAppVersion = "";
 // 클릭 창(열려 있을 때만 존재) — 확인이 끝나면 같은 창을 다시 그린다(창 1개 상한).
@@ -6646,10 +6699,19 @@ function renderUpdatePanel() {
 /// update-progress 리스너("upd-bin" sticky)가 전담한다.
 /// (윈도우는 drain·핸드오프가 없다 — 받고 서명을 검증한 뒤 설치 프로그램을 실행하고 이 앱은 닫힌다: src-tauri install_update_checked_windows)
 // ★(R1F-UA · S3 note 8) 진행 중 표식 — 이 함수가 도는 동안(스마트 앱 컨트롤 조회·확인 창·설치 호출) 다시 불리면 확인 창이 두 번 뜨고 설치 호출이 겹친다.
-//   진입하면 올리고 어떤 갈래로 끝나든(조기 return·예외 포함) `finally` 로 내린다. 그 사이 다시 눌린 호출은 아무것도 하지 않는다.
+//   진입하면 올리고 어떤 갈래로 끝나든(조기 return·예외 포함) `finally` 로 내린다. 그 사이 다시 눌린 호출은 설치를 시작하지 않는다(아래 R2F-UI: 안내만 낸다).
+//   ★R2F-UI(A3 m4): 그 사이 다시 눌린 호출은 **말없이 무시하지 않고** 안내 1줄을 낸다(notifyBinaryPatchBusy — 팀 만들기 재진입 안내 notifyTeamFlowBusy 와 같은 방식). 받기가 멈추면(플러그인 기본은 상한 없음 ·
+//   진행 토스트는 갱신이 없으면 180초 뒤 사라진다) 그 뒤 단추를 눌러도 아무 일도 없던 것이 결함이었다 — 받기에 상한을 거는 것은 느린 회선의 정상 설치를 끊을 수 있어 하지 않는다.
 let promptBinaryPatchBusy = false;
+/** 본체 패치 설치가 이미 진행 중일 때 다시 눌렀다는 안내 1줄 — 말없이 무시하지 않는다(notifyTeamFlowBusy 와 같은 등급·같은 방식). */
+function notifyBinaryPatchBusy(): void {
+  toast("watchdog", "패치 설치 진행 중", "받는 중입니다 — 끝난 뒤 다시 시도하세요");
+}
 async function promptBinaryPatch() {
-  if (promptBinaryPatchBusy) return;
+  if (promptBinaryPatchBusy) {
+    notifyBinaryPatchBusy();
+    return;
+  }
   promptBinaryPatchBusy = true;
   try {
     // ★A7(성찰 확정): install_update 는 앱을 교체·재시작한다 — 리셋 실행 중이면 격리 스레드가

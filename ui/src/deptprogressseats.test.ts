@@ -155,7 +155,10 @@ describe("deptFormationVerdict — 한 틱의 판정(skip · wait · seated · c
   });
 });
 
-describe("최종 화면 문구 — 자리 판정의 두 결과(WORKLOG 에 전문을 붙이는 문구와 같은 줄)", () => {
+// ★R2F-UI(A2 B-1 · A3 M1): 이 describe 는 종전 「두 결과(seated · check)」 였다 — check 문구가 경고색 「팀원 켜기 — 확인 필요 · 아직 N자리입니다」 에서 일반 알림 「팀원 켜기 — 15분 경과」 로 바뀌었다
+//   (설치하지 않은 프로그램의 자리가 안 생기는 것은 정상 종결이다 · 사실 확인: javis_formation.py ROLE_CLI) · 좌석 목록을 못 받는 팀의 silent 가 더해졌다.
+// ★후속(정체 판정): 자리 정체(stall)를 더했다 — 부서장 자리는 붙어 있는데 붙은 수가 3분 동안 늘지 않을 때(상한 전) 한 번 나가는 일반 알림.
+describe("최종 화면 문구 — 자리 판정의 결과(seated · check · silent · stall — WORKLOG 에 전문을 붙이는 문구와 같은 줄)", () => {
   it("seated — 제목 「팀 자리가 모두 붙었습니다」 · 본문 「자리 5개가 모두 붙었습니다 · 걸린 시간 <분>」(formatDeptMinutes)", () => {
     expect(deptFormationText({ seats: 5, elapsedSec: 252, state: "seated" })).toEqual({ title: "팀 자리가 모두 붙었습니다", body: "자리 5개가 모두 붙었습니다 · 걸린 시간 4분" });
     expect(deptFormationText({ seats: 5, elapsedSec: 30, state: "seated" }).body).toBe("자리 5개가 모두 붙었습니다 · 걸린 시간 1분 미만");
@@ -163,15 +166,27 @@ describe("최종 화면 문구 — 자리 판정의 두 결과(WORKLOG 에 전�
     // 자리 수 인자와 무관하게 '5개'(의무 역할 수) — 판정이 이미 다섯을 확인했다
     expect(deptFormationText({ seats: 0, elapsedSec: 252, state: "seated" }).body).toBe(`자리 ${DEPT_SEAT_ROLES.length}개가 모두 붙었습니다 · 걸린 시간 ${formatDeptMinutes(252)}`);
   });
-  it("check — 제목 「팀원 켜기 — 확인 필요」 · 본문 「아직 <N>자리입니다 — Control Center 에서 자리 상태를 확인하세요 · 경과 <분>」", () => {
+  it("check(설치 여부를 모르는 15분 상한 · 의무 역할 M개만 붙음) — 제목 「팀원 켜기 — 15분 경과」 · 본문 「붙은 자리 M개 — 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 그 밖이면 Control Center 에서 자리 상태를 확인하세요」", () => {
     expect(deptFormationText({ seats: 3, elapsedSec: DEPT_FORMATION_CAP_SECS, state: "check" })).toEqual({
-      title: "팀원 켜기 — 확인 필요",
-      body: "아직 3자리입니다 — Control Center 에서 자리 상태를 확인하세요 · 경과 15분",
+      title: "팀원 켜기 — 15분 경과",
+      body: "붙은 자리 3개 — 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 그 밖이면 Control Center 에서 자리 상태를 확인하세요",
     });
-    expect(deptFormationText({ seats: 0, elapsedSec: 905, state: "check" }).body).toBe("아직 0자리입니다 — Control Center 에서 자리 상태를 확인하세요 · 경과 15분");
+    expect(deptFormationText({ seats: 0, elapsedSec: 905, state: "check" }).body).toBe("붙은 자리 0개 — 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 그 밖이면 Control Center 에서 자리 상태를 확인하세요");
   });
-  it("★'준비 완료'·'정상'을 단정하지 않는다 — 에이전트가 실제로 떴는지는 화면이 모른다(두 문구 어디에도 완료·준비됐·정상·성공·켜졌습니다가 없다)", () => {
-    for (const state of ["seated", "check"] as const) {
+  it("silent(좌석 목록을 못 받는 채 15분 상한) — 제목 「팀 데몬이 응답하지 않습니다 — 확인 필요」 · 본문 「좌석 목록을 받지 못했습니다 — Control Center 에서 팀 상태를 확인하세요 · 경과 <분>」", () => {
+    expect(deptFormationText({ seats: 0, elapsedSec: DEPT_FORMATION_CAP_SECS, state: "silent" })).toEqual({
+      title: "팀 데몬이 응답하지 않습니다 — 확인 필요",
+      body: "좌석 목록을 받지 못했습니다 — Control Center 에서 팀 상태를 확인하세요 · 경과 15분",
+    });
+  });
+  it("stall(자리가 3분 동안 더 붙지 않음 · 상한 전) — 제목 「팀원 켜기 — 자리가 더 붙지 않습니다」 · 본문 「3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 M개 · 경과 <분>. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요」", () => {
+    expect(deptFormationText({ seats: 3, elapsedSec: 280, state: "stall" })).toEqual({
+      title: "팀원 켜기 — 자리가 더 붙지 않습니다",
+      body: "3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 3개 · 경과 4분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요",
+    });
+  });
+  it("★'준비 완료'·'정상'을 단정하지 않는다 — 에이전트가 실제로 떴는지는 화면이 모른다(네 문구 어디에도 완료·준비됐·정상·성공·켜졌습니다가 없다)", () => {
+    for (const state of ["seated", "check", "silent", "stall"] as const) {
       const t = deptFormationText({ seats: 4, elapsedSec: 300, state });
       for (const lie of ["완료", "준비됐", "준비 완료", "정상", "성공", "켜졌습니다", "작동"]) expect({ 상태: state, 낱말: lie, 있음: (t.title + t.body).includes(lie) }).toEqual({ 상태: state, 낱말: lie, 있음: false });
     }

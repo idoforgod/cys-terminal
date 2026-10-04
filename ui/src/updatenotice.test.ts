@@ -516,11 +516,13 @@ describe("main.ts 배선 — 기동 pull(bundle_integrity 바로 뒤 · fire-and
     expect(b.includes('sacNote = sacPreflightText(typeof sac === "string" ? sac : null, checked !== false);')).toBe(true);
   });
 
-  it("★R1F-UA(S3 note 8): 진행 중 표식 — 모듈 수준 `let` 하나 · 진입하자마자 이미 올라 있으면 return · 올린 뒤 본문 전체가 try 안 · finally 에서 내린다(조기 return·예외 포함)", () => {
+  // ★R2F-UI(A3 m4): 이름·머리 핀을 고쳤다 — 종전 머리는 `if (promptBinaryPatchBusy) return;`(말없이 무시)였다. 받기가 멈추면 진행 토스트는 180초 뒤 사라지고 그 뒤 단추를 눌러도 화면에 아무 일도 없었다.
+  //   이제 이미 진행 중이면 안내 1줄(notifyBinaryPatchBusy)을 내고 return 한다(팀 만들기 재진입 안내 notifyTeamFlowBusy 와 같은 방식). 표식을 쓰는 곳(확인 1·올림 1·내림 1)·try/finally 구조는 그대로다.
+  it("★R1F-UA(S3 note 8) · R2F-UI(A3 m4): 진행 중 표식 — 모듈 수준 `let` 하나 · 진입하자마자 이미 올라 있으면 **안내 1줄을 내고** return · 올린 뒤 본문 전체가 try 안 · finally 에서 내린다(조기 return·예외 포함)", () => {
     expect(count(code, "let promptBinaryPatchBusy = false;")).toBe(1);
     const b = fnBody("promptBinaryPatch");
-    // 함수 머리: 표식 확인 → 올림 → try — 첫 await·첫 return 보다 앞이다
-    expect(b.replace(/\s+/g, " ").startsWith("async function promptBinaryPatch() { if (promptBinaryPatchBusy) return; promptBinaryPatchBusy = true; try {")).toBe(true);
+    // 함수 머리: 표식 확인(→ 안내 · return) → 올림 → try — 첫 await·첫 return 보다 앞이다
+    expect(b.replace(/\s+/g, " ").startsWith("async function promptBinaryPatch() { if (promptBinaryPatchBusy) { notifyBinaryPatchBusy(); return; } promptBinaryPatchBusy = true; try {")).toBe(true);
     // 함수 끝: finally 에서 내린다
     expect(/\} finally \{\s*promptBinaryPatchBusy = false;\s*\}\s*$/.test(b)).toBe(true);
     // 표식을 쓰는 곳은 확인 1 · 올림 1 · 내림 1 — 다른 곳에서 만지지 않는다
@@ -554,12 +556,26 @@ describe("백엔드(src-tauri) 계약 — UI 가 부르는 명령이 등재돼 �
     const ui = read("./updatenotice.ts");
     for (const key of ["failed", "pending", "wait_secs", "from", "to", "os", "sac"]) {
       expect({ 키: key, 백엔드: body.includes(`"${key}"`) }).toEqual({ 키: key, 백엔드: true });
-      expect({ 키: key, UI: ui.includes(key) }).toEqual({ 키: key, UI: true });
+      // ★R2F-UI(A3 n5): 종전 `ui.includes(key)` 는 `"to"`·`"os"`·`"from"` 이 어떤 TS 파일에서도 참이라 화면이 그 키를 읽지 않게 돼도 초록이었다(자명하게 참인 핀).
+      //   화면이 응답 객체(`const o = r as Record<string, unknown>`)에서 그 키를 **접근식**(`o.<키>`)으로 읽는지 본다.
+      expect({ 키: key, UI: new RegExp(`\\bo\\.${key}\\b`).test(ui) }).toEqual({ 키: key, UI: true });
     }
+    expect(ui.includes("const o = r as Record<string, unknown>;")).toBe(true); // 접근식의 대상 `o` 가 응답 객체다
   });
   it("★R1F-UA: 확인 실행 노브 명령은 불리언을 돌려준다(UI 는 정확히 false 만 '꺼짐'으로 읽는다) · 화면이 부르는 이름과 같다", () => {
     expect(prod.includes("async fn update_checked_launch_enabled() -> bool {")).toBe(true);
     expect(count(mainCode, 'invoke("update_checked_launch_enabled")')).toBe(1);
+  });
+  it("★R2F-UI(A3 n16 ⓐ): 화면 문구(확인 실행 꺼짐 판) 속 노브 이름 리터럴이 Rust 가 읽는 노브 이름과 같다 — 문구를 읽고 되돌리기 손잡이를 쓰는 사용자가 그 이름을 그대로 쓴다(Rust 쪽 핀은 판독식만 보았다)", () => {
+    const text = sacPreflightText("on", false) as string;
+    const m = /\((CYS_[A-Z0-9_]+)=0\)/.exec(text);
+    expect(m).not.toBeNull(); // 문구에 `(노브=0)` 꼴의 이름이 있다
+    const shown = (m as RegExpExecArray)[1];
+    const rustNames = new Set(Array.from(prod.matchAll(/cys::env_compat\("(CYS_[A-Z0-9_]*CHECKED_LAUNCH[A-Z0-9_]*)"\)/g), (x) => x[1]));
+    expect({ 문구의_이름: shown, Rust_이름들: [...rustNames] }).toEqual({ 문구의_이름: shown, Rust_이름들: [shown] }); // Rust 가 읽는 이름이 정확히 그 하나다
+    expect(shown).toBe("CYS_UPDATE_CHECKED_LAUNCH");
+    // 켜짐(기본) 판 문구에는 노브 이름이 없다 — 이름이 적힌 곳은 꺼짐 판 한 곳뿐이다
+    expect((sacPreflightText("on", true) as string).includes("CYS_")).toBe(false);
   });
   it("백엔드 판정 보류 창(90초)과 UI 의 기본 대기(90초)가 같은 값이다", () => {
     const m = prod.match(/const UPDATE_ATTEMPT_MIN_AGE_SECS: u64 = (\d+);/);
@@ -747,6 +763,8 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     installDeferred?: boolean;
     modalThrows?: boolean;
   };
+  /** ★R2F-UI(A3 m4): 이미 진행 중일 때 다시 눌렀을 때의 안내 — toast(등급, 제목, 본문) 호출 인자(티켓 문안 그대로). */
+  const BUSY_TOAST = ["watchdog", "패치 설치 진행 중", "받는 중입니다 — 끝난 뒤 다시 시도하세요"];
   function makePrompt(o: Opts) {
     const calls: string[] = [];
     const modal: unknown[][] = [];
@@ -825,6 +843,12 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     const strip: [string, string] = ["let sacNote: string | null = null;", "let sacNote = null;"];
     expect({ 걷을_표기: strip[0], 존재: js.includes(strip[0]) }).toEqual({ 걷을_표기: strip[0], 존재: true });
     js = js.replace(strip[0], strip[1]);
+    // ★R2F-UI(A3 m4): 이미 진행 중일 때 부르는 안내 함수도 **실제 본문**을 같은 범위에 연다(대역이 아니다 — toast 는 아래 deps 의 기록기다)
+    let busyFn = fnBodyOf("notifyBinaryPatchBusy") + "\n}";
+    const busyType = "function notifyBinaryPatchBusy(): void {";
+    expect({ 걷을_표기: busyType, 존재: busyFn.includes(busyType) }).toEqual({ 걷을_표기: busyType, 존재: true });
+    busyFn = busyFn.replace(busyType, "function notifyBinaryPatchBusy() {");
+    js = `${busyFn}\n${js}`;
     const fn = new Function("deps", `with (deps) {\n${js}\nreturn promptBinaryPatch;\n}`)(deps) as () => Promise<void>;
     return { fn, deps, calls, modal, invokes, toasts, dismissed, caps, stickies, gates };
   }
@@ -936,7 +960,7 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
 
   // ── ★R1F-UA(S3 note 8): 다시 누름 방지 — 조회를 기다리는 동안 다시 눌려도 확인 창이 두 번 뜨지 않는다 ──
 
-  it("★재진입: 스마트 앱 컨트롤 조회를 기다리는 동안 다시 불려도 확인 창은 한 번만 뜬다 · 조회도 한 번 · 끝나면 표식이 내려가 다음 호출은 다시 열린다", async () => {
+  it("★재진입: 스마트 앱 컨트롤 조회를 기다리는 동안 다시 불려도 확인 창은 한 번만 뜬다 · 조회도 한 번 · 다시 눌린 호출마다 안내 1줄(R2F-UI) · 끝나면 표식이 내려가 다음 호출은 다시 열린다", async () => {
     const h = makePrompt({ sac: "off", sacDeferred: true });
     const p1 = h.fn();
     const p2 = h.fn(); // 조회를 기다리는 중에 다시 눌림
@@ -944,9 +968,11 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     await tick();
     const sacCalls = () => h.invokes.filter((i) => i[0] === "smart_app_control").length;
     expect({ 창: h.modal.length, 조회: sacCalls(), 표식: h.deps.promptBinaryPatchBusy }).toEqual({ 창: 0, 조회: 1, 표식: true });
+    expect(h.toasts).toEqual([BUSY_TOAST, BUSY_TOAST]); // ★R2F-UI(A3 m4): 다시 눌린 둘(p2·p3)이 각각 안내를 받는다 — 말없이 무시되지 않는다
     h.gates.sac?.("off");
     await Promise.all([p1, p2, p3]);
     expect({ 창: h.modal.length, 조회: sacCalls(), 표식: h.deps.promptBinaryPatchBusy }).toEqual({ 창: 1, 조회: 1, 표식: false });
+    expect(h.toasts.length).toBe(2); // 첫 호출(p1)과 끝난 뒤에는 안내가 없다
     const p4 = h.fn(); // 끝난 뒤의 새 호출은 막히지 않는다(조회부터 다시 시작한다)
     await tick();
     expect({ 조회: sacCalls(), 표식: h.deps.promptBinaryPatchBusy }).toEqual({ 조회: 2, 표식: true });
@@ -955,22 +981,44 @@ describe("main.ts 실행 — promptBinaryPatch 의 설치 전 고지를 대역 �
     expect({ 창: h.modal.length, 조회: sacCalls(), 표식: h.deps.promptBinaryPatchBusy }).toEqual({ 창: 2, 조회: 2, 표식: false });
   });
 
-  it("★재진입: 확인 창이 열려 있는 동안 · 설치 호출이 진행되는 동안에도 다시 불려도 아무것도 하지 않는다(창 1 · 설치 호출 1) — 설치가 겹치지 않는다", async () => {
+  it("★재진입: 확인 창이 열려 있는 동안 · 설치 호출이 진행되는 동안에도 다시 불려도 설치를 시작하지 않는다(창 1 · 설치 호출 1) — 설치가 겹치지 않는다 · 안내 1줄만 낸다(R2F-UI)", async () => {
     const h = makePrompt({ sac: "off", modalDeferred: true, installDeferred: true });
     const installs = () => h.invokes.filter((i) => i[0] === "install_update").length;
     const p1 = h.fn();
     await tick();
     expect({ 창: h.modal.length, 설치: installs() }).toEqual({ 창: 1, 설치: 0 });
+    expect(h.toasts).toEqual([]); // 첫 호출에는 안내가 없다
     await h.fn(); // 확인 창이 열려 있는 중
     expect({ 창: h.modal.length, 설치: installs() }).toEqual({ 창: 1, 설치: 0 });
+    expect(h.toasts).toEqual([BUSY_TOAST]);
     h.gates.modal?.(true);
     await tick();
     expect({ 창: h.modal.length, 설치: installs() }).toEqual({ 창: 1, 설치: 1 });
     await h.fn(); // 설치 호출이 진행 중
     expect({ 창: h.modal.length, 설치: installs(), 표식: h.deps.promptBinaryPatchBusy }).toEqual({ 창: 1, 설치: 1, 표식: true });
+    expect(h.toasts).toEqual([BUSY_TOAST, BUSY_TOAST]);
     h.gates.install?.(); // 설치 호출이 끝난다
     await p1;
     expect(h.deps.promptBinaryPatchBusy).toBe(false);
+    expect(h.toasts.length).toBe(2);
+  });
+
+  // ── ★R2F-UI(A3 m4): 진행 중에 다시 누르면 말없이 무시하지 않고 안내 1줄 — 팀 만들기 재진입 안내(notifyTeamFlowBusy)와 같은 방식 ──
+  it("★안내 문안 전문(티켓 그대로) — 등급 watchdog · 제목 「패치 설치 진행 중」 · 본문 「받는 중입니다 — 끝난 뒤 다시 시도하세요」 · 정상 호출(진행 중이 아님)에는 안내가 없다", async () => {
+    expect(BUSY_TOAST).toEqual(["watchdog", "패치 설치 진행 중", "받는 중입니다 — 끝난 뒤 다시 시도하세요"]);
+    const r = await runPrompt({ sac: "off" });
+    expect(r.toasts).toEqual([]); // 평범한 한 번의 설치 흐름에는 안내가 없다
+    // 안내 함수 본문은 toast 한 번뿐 — 설치·표식·창을 건드리지 않는다
+    const b = fnBodyOf("notifyBinaryPatchBusy").replace(/\s+/g, " ");
+    expect(b).toBe('function notifyBinaryPatchBusy(): void { toast("watchdog", "패치 설치 진행 중", "받는 중입니다 — 끝난 뒤 다시 시도하세요");');
+  });
+  it("★같은 방식 — 안내 등급이 팀 만들기 재진입 안내(notifyTeamFlowBusy)의 등급과 같다 · 안내는 toast(volatile) 한 번이고 지속 알림·OS 배너가 아니다", () => {
+    const grade = (name: string): string | null => /toast\(\s*"(\w+)"/.exec(fnBodyOf(name))?.[1] ?? null;
+    expect(grade("notifyTeamFlowBusy")).toBe("watchdog");
+    expect(grade("notifyBinaryPatchBusy")).toBe(grade("notifyTeamFlowBusy"));
+    const b = fnBodyOf("notifyBinaryPatchBusy");
+    for (const bad of ["stickyToast", "osBanner", "invoke(", "confirmModal", "promptBinaryPatchBusy"]) expect({ 낱말: bad, 있음: b.includes(bad) }).toEqual({ 낱말: bad, 있음: false });
+    expect(count(mainCode, "notifyBinaryPatchBusy()")).toBe(2); // 호출 1(promptBinaryPatch 머리) + 정의 1
   });
 
   it("★표식은 어떤 갈래로 끝나도 내려간다 — 거절 · 데몬 차단 · 본체 없음 · 설치 거부 · 4551 차단 · 설치 성공 · 확인 창 예외 — 이어서 다시 부르면 열린다", async () => {

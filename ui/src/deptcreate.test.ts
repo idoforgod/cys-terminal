@@ -18,6 +18,7 @@ const catalog = {
 };
 
 describe("자리 역할 드리프트 핀 — 편성 도구와 같은 5석", () => {
+  // 상수 동일성만 본다 — 실제 로스터는 설치된 CLI 에 달렸다(편성 도구는 설치된 프로그램의 역할만 띄운다 — javis_formation.py ROLE_CLI · 미설치 역할은 건너뛰어 정상 종결 partial·pending-cli).
   it("DEPT_SEAT_ROLES == javis_formation.py REQUIRED_ROLES", () => {
     const py = readFileSync(new URL("../../cysjavis-pack/bin/javis_formation.py", import.meta.url), "utf-8");
     const m = /^REQUIRED_ROLES\s*=\s*\(([^)]*)\)/m.exec(py);

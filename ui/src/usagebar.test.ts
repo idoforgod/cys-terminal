@@ -7,6 +7,7 @@
 //   · 100% 초과·창 누락('—')·리셋 지남(값 숨김)·오래됨(흐림)·응답 없음을 정직하게 표기한다.
 //   · 조회 스로틀(부팅 유예·최소 간격·force)은 순수 함수가 정한다 — 새 타이머 없이 기존 10초 틱에 얹기 위해.
 import { describe, it, expect } from "bun:test";
+import { readFileSync } from "node:fs";
 import {
   normalizeProfiles,
   accountShortLabel,
@@ -25,6 +26,7 @@ import {
   kpiCandidates,
   aggSeatRates,
   sanitizeHiddenKeys,
+  USAGE_STALE_SECS,
   USAGE_OTHERS_MAX,
   USAGE_ALIAS_MAX,
   USAGE_HIDDEN_MAX,
@@ -1077,9 +1079,12 @@ describe("0.14.43 A3 — 제공자별 접힘 요약", () => {
     expect(m.headline).toBe("5h 12% · 7d 30%");
     expect(m.headlineTitle).toBe("");
   });
-  it("주 계정이 오래된 값이면 약식 요약의 끝에도 ' (오래됨)'", () => {
+  // ★R2F-UI(A3 m3): 이름·기대를 고쳤다 — 종전 「주 계정이 오래된 값이면 약식 요약의 끝에도 ' (오래됨)'」 은 약식에서도 **주 계정 한 곳의** 신선도를 꼬리로 붙였다. 약식에서는 오래된 값마다 이미 `?` 가 붙으므로
+  //   꼬리는 중복이거나 틀린 귀속(다른 계정의 방금 값에 '오래됨')이다 — 약식에는 꼬리를 붙이지 않는다. 한 제공자뿐인 종전 형식의 꼬리는 그대로다(위 「접힘 요약 — 주 계정이 오래됐으면 끝에 ' (오래됨)'」).
+  it("★주 계정이 오래된 값이어도 약식 요약에는 ' (오래됨)' 꼬리가 없다 — 오래된 값마다 `?` 가 이미 붙는다", () => {
     const m = buildUsageBarModel([C("c1", { p5: 50, age: 7200 }), X("x1", { p7: 20, age: 7200 })], NOW, okFetch, noRedact);
-    expect(m.headline).toBe("C 5h50%? │ X 7d20%? (오래됨)");
+    expect(m.headline).toBe("C 5h50%? │ X 7d20%?");
+    expect(m.headline.includes("(오래됨)")).toBe(false);
   });
   // ★R1F-UB(S2 m-3): 이름을 고쳤다 — 종전 이름 「주 계정 창들의 최고 심각도」 는 약식 요약에서 사실이 아니게 됐다(색이 요약에 실린 값들로 계산된다). 단언은 그대로다.
   it("headlineSev 는 약식 요약에서 요약에 실린 값들의 최고 심각도", () => {
@@ -1154,9 +1159,10 @@ describe("0.14.43 A3 — 제공자별 접힘 요약", () => {
     expect(m.headline).toBe("C 5h10% │ X 7d20%");
     expect(m.headlineSev).toBe("");
   });
-  it("접미 ' (오래됨)'(주 계정이 오래됨)은 색과 무관하게 종전 그대로", () => {
+  // ★R2F-UI(A3 m3): 이름·기대를 고쳤다 — 종전 「접미 ' (오래됨)'(주 계정이 오래됨)은 색과 무관하게 종전 그대로」 는 약식 꼬리를 박았다. 이제 약식에는 꼬리가 없고, 색(오래된 값은 경고색 없음 — 요약에 실린 값 기준)은 그대로다.
+  it("약식 요약의 색은 꼬리와 무관하다 — 모든 값이 오래돼 `?` 로만 실리면 꼬리도 색도 없다", () => {
     const m = buildUsageBarModel([C("c1", { p5: 50, age: 7200 }), X("x1", { p7: 20, age: 7200 })], NOW, okFetch, noRedact);
-    expect(m.headline).toBe("C 5h50%? │ X 7d20%? (오래됨)");
+    expect(m.headline).toBe("C 5h50%? │ X 7d20%?");
     expect(m.headlineSev).toBe("");
   });
 });
@@ -1534,5 +1540,62 @@ describe("R1F-UB(S2 m-4) — 숨기기 단추 툴팁이 말하는 사실: 후보
     expect(kpiCandidates([low], "5h", NOW).length).toBe(1); // 숨기지 않으면 후보
     const fallback = aggSeatRates([{ usage: { rate: [{ label: "5h", used_pct: 10, resets_at: NOW + 7200, alert_eligible: true }] } }], NOW);
     expect(fallback["5h"]).toEqual({ used: 10, reset: NOW + 7200 });
+  });
+});
+
+// ── ★R2F-UI(A3 m3) 접힌 요약의 '(오래됨)' 꼬리가 숫자·색과 다른 계정을 봤다(1회차 m-3 수정의 잔여) ───────────────────────────────────────────────────────────────────
+// 1회차 수정은 약식 요약의 **색**을 요약에 실린 값으로 맞췄지만 꼬리는 여전히 **주 계정**(사용 중 우선)의 신선도였다. 주 계정이 40분 묵었는데 같은 제공자의 다른 계정이 방금 96% 로 관측되면
+// 요약은 그 96% 를 싣고 색도 crit 인데 꼬리는 '(오래됨)' — 방금 잰 값에 '오래됨'이 붙었다. 약식에서는 오래된 값마다 이미 `?` 가 붙으므로 꼬리는 중복이거나 틀린 귀속이라 약식에는 붙이지 않는다.
+describe("★R2F-UI(A3 m3) 약식 요약의 '(오래됨)' 꼬리 — 약식에는 없고 종전 형식(한 제공자)에는 그대로", () => {
+  const C = (id: string, o: RowOpt = {}) => R(id, o);
+  const X = (id: string, o: RowOpt = {}) => R(id, { prov: "codex", src: "rollout", ...o });
+  it("★탐침 E: 주 계정(사용 중 · 40분 묵음 · 10%) + 같은 제공자의 방금 관측한 96% 계정 + codex → 요약은 96% 를 싣고 색은 crit 이며 꼬리는 없다(방금 잰 96% 에 '오래됨' 이 붙지 않는다)", () => {
+    const primary = C("p", { p5: 10, p7: 12, in_use: true, age: 40 * 60, profiles: [".cys/claude"], current: [".cys/claude"] });
+    const fresh = C("f", { p5: 96, p7: 40, in_use: false, age: 10, src: "statusline-outside", profiles: [".claude-2"], current: [".claude-2"] });
+    const codex = X("x", { p7: 50, age: 60 }); // 사용 중 표식이 없다 — 주 계정 순위는 사용 중이 먼저라 묵은 Claude 가 그대로 주 계정이다(탐침 E 의 구성)
+    const m = buildUsageBarModel([primary, fresh, codex], NOW, okFetch, noRedact);
+    expect(m.primary!.label).toBe("좌석"); // 주 계정은 종전대로 사용 중(결재 사항 — 바꾸지 않는다)
+    expect(m.primary!.fresh.level).toBe("stale"); // 주 계정은 실제로 묵었다 — 종전 꼬리의 조건이 성립하는 입력이다
+    expect(m.headline).toBe("C 5h96%·7d40% │ X 7d50%");
+    expect(m.headline.includes("(오래됨)")).toBe(false);
+    expect(m.headlineSev).toBe("crit");
+  });
+  it("약식 요약의 어떤 구성에서도 꼬리가 없다 — 주 계정이 묵었든·신선하든·일부 제공자만 묵었든 · 오래된 값의 표시는 `?` 하나뿐", () => {
+    const stalePrimary = C("p", { p5: 10, in_use: true, age: 7200 });
+    const cases: [string, AcctRow[], string][] = [
+      ["주 계정만 묵음", [stalePrimary, X("x", { p7: 50, age: 30 })], "C 5h10%? │ X 7d50%"],
+      ["둘 다 묵음", [stalePrimary, X("x", { p7: 50, age: 7200 })], "C 5h10%? │ X 7d50%?"],
+      ["둘 다 신선", [C("p", { p5: 10, in_use: true, age: 10 }), X("x", { p7: 50, age: 30 })], "C 5h10% │ X 7d50%"],
+      ["주 계정 신선 · 다른 제공자만 묵음", [C("p", { p5: 10, in_use: true, age: 10 }), X("x", { p7: 50, age: 7200 })], "C 5h10% │ X 7d50%?"],
+    ];
+    for (const [이름, rows, want] of cases) {
+      const h = buildUsageBarModel(rows, NOW, okFetch, noRedact).headline;
+      expect({ 사례: 이름, 줄: h, 꼬리: h.includes("(오래됨)") }).toEqual({ 사례: 이름, 줄: want, 꼬리: false });
+    }
+  });
+  it("대조(그대로): 제공자가 하나뿐이면 종전 형식이고 주 계정이 묵었으면 꼬리 ' (오래됨)' 이 붙는다 — 이쪽은 약식이 아니라 `?` 가 없다", () => {
+    const m = buildUsageBarModel([C("c1", { p5: 12, p7: 30, age: 3 * 3600 })], NOW, okFetch, noRedact);
+    expect(m.headline).toBe("5h 12% · 7d 30% (오래됨)");
+    expect(m.headlineTitle).toBe("");
+    // 신선하면 꼬리 없음
+    expect(buildUsageBarModel([C("c1", { p5: 12, p7: 30, age: 30 })], NOW, okFetch, noRedact).headline).toBe("5h 12% · 7d 30%");
+  });
+  it("풀이(headlineTitle)의 `(오래됨)` 은 창 단위로 그대로 있다 — 이번 수정은 줄 끝의 꼬리 하나만 바꾼다", () => {
+    const m = buildUsageBarModel([C("c1", { p5: 50, age: 7200 }), X("x1", { p7: 20, age: 7200 })], NOW, okFetch, noRedact);
+    expect(m.headlineTitle).toBe("Claude 5h 50% (오래됨) / Codex 7d 20% (오래됨)");
+  });
+});
+
+// ── ★R2F-UI(A5 m9) 30분(1800초) 임계의 사본 — 화면 상수가 데몬 `ACCOUNT_ALERT_STALE_SECS_DEFAULT` 와 같다는 소스 대조 ─────────────────────────────────────────────────
+// 같은 값이 데몬 기본값·CLI·화면·지침 문면에 따로 적혀 있고 노브는 데몬 것만 움직인다. CLI 쪽은 데몬 상수를 읽어 대조하는 선례가 있다(cys.rs refl_daemon_u64) — 화면에는 값 사이의 핀이 없었다.
+describe("★R2F-UI(A5 m9) 화면의 30분 상수(USAGE_STALE_SECS)는 데몬 ACCOUNT_ALERT_STALE_SECS_DEFAULT 와 같다 — 소스 대조", () => {
+  const read = (rel: string): string => readFileSync(new URL(rel, import.meta.url), "utf-8");
+  it("데몬 accounts.rs 의 상수 선언(`pub const ACCOUNT_ALERT_STALE_SECS_DEFAULT: f64 = <값>;`)을 읽어 화면 상수와 대조한다 — 한쪽만 바뀌면 적색", () => {
+    const m = read("../../src/bin/cysd/accounts.rs").match(/pub const ACCOUNT_ALERT_STALE_SECS_DEFAULT: f64 = ([0-9_.]+);/);
+    expect(m).not.toBeNull(); // 선언 꼴(상수 이름·f64·숫자 리터럴)이 바뀌면 파싱 불능 = 측정 불능이다(통과가 아니다)
+    const daemon = Number((m as RegExpMatchArray)[1].replace(/_/g, ""));
+    expect(Number.isFinite(daemon)).toBe(true);
+    expect(USAGE_STALE_SECS).toBe(daemon);
+    expect(USAGE_STALE_SECS).toBe(1800); // 문서·지침이 말하는 30분
   });
 });

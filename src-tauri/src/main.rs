@@ -3273,18 +3273,24 @@ enum AttemptVerdict {
     Failed { from: String, to: String, at: u64 },
 }
 
-/// `CYS_UPDATE_VERIFY` 해석(되돌리기 노브) — `"0"` 만 끈다(그 밖의 값·빈 값·미설정은 켬). 끄면 `install_update` 는
-/// 시도 기록을 쓰지 않고 `update_attempt_report` 는 늘 null 을 돌려준다(이 기능이 없던 때와 같은 거동).
-fn update_verify_from_env(v: Option<&str>) -> bool {
-    v != Some("0")
+/// ★(성찰 2회차 R2F-UI · A4 n1) 앱의 되돌리기 노브(`CYS_UPDATE_VERIFY` · `CYS_UPDATE_CHECKED_LAUNCH` · `CYS_DEPT_CREATE_STREAM`) 값 해석 **하나** — **앞뒤 공백을 걷은 값이 `0`** 이면 끈다(데몬의 다른 노브와 같은 규칙).
+/// 종전은 정확히 `"0"` 만 꺼서, 윈도우 cmd 의 `set X=0 && …` 가 값 끝에 붙이는 공백(`"0 "`)이면 되돌리기 손잡이가 듣지 않았다. 셋은 모두 이 함수의 부정이다(검체가 셋의 본문을 같은 식으로 묶는다).
+fn knob_turned_off(v: Option<&str>) -> bool {
+    v.map(str::trim) == Some("0")
 }
 
-/// ★(0.14.43 · WU) `CYS_UPDATE_CHECKED_LAUNCH` 해석(되돌리기 노브) — `"0"` 만 끈다(그 밖의 값·빈 값·미설정은 켬). 끄면 윈도우 `install_update` 는
+/// `CYS_UPDATE_VERIFY` 해석(되돌리기 노브) — 앞뒤 공백을 걷은 값이 `"0"` 이면 끈다(그 밖의 값·빈 값·미설정은 켬 — `knob_turned_off`). 끄면 `install_update` 는
+/// 시도 기록을 쓰지 않고 `update_attempt_report` 는 늘 null 을 돌려준다(이 기능이 없던 때와 같은 거동).
+fn update_verify_from_env(v: Option<&str>) -> bool {
+    !knob_turned_off(v)
+}
+
+/// ★(0.14.43 · WU) `CYS_UPDATE_CHECKED_LAUNCH` 해석(되돌리기 노브) — 앞뒤 공백을 걷은 값이 `"0"` 이면 끈다(그 밖의 값·빈 값·미설정은 켬 — `knob_turned_off`). 끄면 윈도우 `install_update` 는
 /// 종전 경로(업데이터 플러그인의 `download_and_install` 그대로 — 설치기를 띄운 뒤 반환값을 보지 않고 곧바로 종료)를 쓴다. 읽는 곳은
 /// `install_update` 한 곳이다. 맥·리눅스는 이 노브를 보지 않는다(분기 자체가 컴파일되지 않는다).
 #[cfg_attr(not(windows), allow(dead_code))]
 fn update_checked_launch_from_env(v: Option<&str>) -> bool {
-    v != Some("0")
+    !knob_turned_off(v)
 }
 
 /// ★(0.14.43 · WU) 설치기 실행 결과의 처리 정책(윈도우 `install_update` 분기가 쓴다 · 부작용 없는 순수 함수 — 시험은 맥에서도 돈다):
@@ -4611,10 +4617,11 @@ async fn fanout_usage_accounts(
 /// ★source_error(관측 경로 고장 코드): 승자가 **관측 전**(updated_at 없음)이고 자기 오류가 없으면 다른 데몬의
 /// 오류를 이어받는다 — 본부(좌석 없음 · 오류 없음)가 먼저 오면 부서 agy 의 거부 코드가 묻혔다. 관측된 승자에는
 /// 남의 오류를 덧씌우지 않는다.
-/// ★0.14.43 가산 키 셋(구버전 데몬은 키가 없다 — UI 가 키 부재·null·빈 배열을 다르게 읽으므로 병합은 셋을 뭉개지 않는다):
+/// ★0.14.43 가산 키 셋(구버전 데몬은 키가 없다 — `current_profiles` 는 신 데몬이 이번에 읽지 못한 폴더가 낀 행에서도 없다 · UI 가 키 부재·null·빈 배열을 다르게 읽으므로 병합은 셋을 뭉개지 않는다):
 ///  · current_profiles(지금 이 계정으로 로그인된 설정 폴더): 승자와 무관하게 합집합(정렬·중복 제거 — profiles 와 같은 방식).
-///    어느 응답에도 이 키(배열)가 없으면(전부 구버전) 결과에도 만들지 않는다 — UI 는 '키 없음 → profiles 폴백',
-///    '빈 배열 → 이전 로그인'으로 읽는다. 일부 응답에만 있으면 있는 것들의 합집합. 배열이 아닌 값은 키 없음으로 본다.
+///    어느 응답에도 이 키(배열)가 없으면(전부 구버전 **또는 신 데몬이 이번에 읽지 못한 폴더가 낀 행** — 신 데몬도 그런 행에서는 키를 뺀다: accounts.rs `current_profiles_for`) 결과에도 만들지 않는다 —
+///    UI 는 '키 없음 → profiles 폴백', '빈 배열 → 이전 로그인'으로 읽는다. 일부 응답에만 있으면 있는 것들의 합집합(★키 없는 신 데몬 행 + 빈 배열 신 데몬 행 → 빈 배열 — 지금의 사양이고 문서가 그렇게 적었다 · 검체
+///    `r2fui_merge_new_daemon_missing_key_plus_new_daemon_empty_array_is_empty_array`). 배열이 아닌 값은 키 없음으로 본다.
 ///  · in_use: 승자 값이 아니라 같은 계정 행 전체로 정한다 — 하나라도 true → true · 아니면 하나라도 null/키 부재 → null ·
 ///    전부 false → false. 병합이 일어난 행은 전부 키 부재여도 null 이다(UI 는 null·키 없음을 같게 읽는다 · 데몬이 하나뿐이라
 ///    병합할 것이 없는 행은 그대로).
@@ -5342,6 +5349,8 @@ async fn launch_dept_daemon(app: AppHandle, name: String) -> Result<Value, Strin
 ///   바뀐 것은 자식 실행 방식(`run_dept_child` — 종전 `cmd.output()` 과 같은 `Output`)뿐이다. 실패 메시지의 stderr 에서는 표지 줄을 뺀다
 ///   (화면은 stderr 의 앞 300자만 보이므로 표지 5~6줄이 실패 사유를 밀어내지 않게 — `strip_stage_lines` · 스트리밍 판·종전 판 양쪽).
 ///   되돌리기 노브 `CYS_DEPT_CREATE_STREAM=0` = 종전 `cmd.output()` 경로(`dept_create_stream_from_env`).
+/// ★R2F-UI(A3 n1) 응답 객체의 가산 키 `spawned`(불리언) — 이 호출이 데몬을 띄웠는가(`spawn` 표지를 읽었는가). 표지를 하나도 읽지 못했으면(구 팩·스트리밍 끔·진행 id 없음) 키가 **없다**(`DeptStageSeen`).
+///   화면은 그 값이 있으면 그것으로 '새로 만든 팀' 표지를 세우고, 없으면 종전 식(이벤트가 채운 pendingSpawned·pendingStage)을 쓴다 — 이벤트와 응답의 도착 순서에 기대지 않는다.
 #[tauri::command]
 async fn allocate_dept_daemon(
     app: AppHandle,
@@ -5379,6 +5388,9 @@ async fn allocate_dept_daemon(
     let streaming = progress_id.is_some() && dept_create_stream_from_env(std::env::var("CYS_DEPT_CREATE_STREAM").ok().as_deref());
     let emit_app = app.clone();
     let emit_id = progress_id.clone();
+    // ★R2F-UI(A3 n1): 읽은 단계 표지를 기억해 응답 객체에 `spawned` 를 싣는다(아래 응답 조립 끝). 콜백(판독 스레드)에 복제본을 주고, 자식이 끝난 뒤 이쪽에서 읽는다.
+    let stage_seen = std::sync::Arc::new(DeptStageSeen::default());
+    let stage_seen_cb = stage_seen.clone();
     let out = tokio::task::spawn_blocking(move || {
         let mut cmd = std::process::Command::new("bash");
         inject_runtime_path(&mut cmd); // RC-5: 동봉 runtime(bash.exe) PATH 주입
@@ -5398,6 +5410,7 @@ async fn allocate_dept_daemon(
         no_console(&mut cmd);
         // ★0.14.43(GU): 실행 방식만 바뀐다 — 종전 `cmd.output()` 과 같은 `Output`(status·stdout·stderr · stderr 는 표지 줄만 뺀다)을 돌려준다.
         run_dept_child(cmd, streaming, move |key: &str| {
+            stage_seen_cb.note(key);
             let _ = emit_app.emit("dept-create-progress", json!({"id": emit_id, "stage": key}));
         })
     })
@@ -5459,7 +5472,38 @@ async fn allocate_dept_daemon(
             }
         }
     }
+    // ★R2F-UI(A3 n1 · 가산 키): 이 호출이 데몬을 띄웠는가(`spawn` 표지를 읽었는가) — 화면이 '새로 만든 팀' 표지를 세울지 정하는 근거다. 표지를 한 번도 못 읽었으면(None) 키를 싣지 않는다(화면은 종전 식으로 판정).
+    if let (Some(obj), Some(spawned)) = (info.as_object_mut(), stage_seen.spawned()) {
+        obj.insert("spawned".into(), json!(spawned));
+    }
     Ok(info)
+}
+
+/// ★(성찰 2회차 R2F-UI · A3 n1) `allocate_dept_daemon` 이 읽은 **단계 표지의 기억** — 응답 객체의 `spawned` 의 근거.
+/// 화면은 종전에 응답이 도착한 순간의 `pendingSpawned`·`pendingStage`(이벤트가 채운 값)를 봤다. 이벤트는 `eval` 로, 명령 응답은 다른 통로(사용자 정의 프로토콜·채널)로 가서 두 통로 사이의 순서가
+/// 보장되지 않는다 — 표지가 `done` 하나뿐인 갈래(멱등 반환)에서 응답이 이벤트를 앞지르면 '표지 없음 = 구 팩' 으로 읽혀 기존 팀에 새 팀 안내가 떴다. 백엔드는 표지를 읽는 쪽이라 **그 자리에서 기억**하면 순서 의존이 사라진다.
+/// 기록은 두 비트 — `any`(표지를 하나라도 읽었다) · `spawn`(`spawn` 표지를 읽었다). 콜백은 stderr 판독 스레드에서, 읽기는 자식이 끝나 그 스레드가 join 된 뒤 호출 스레드에서 한다.
+#[derive(Default)]
+struct DeptStageSeen {
+    any: std::sync::atomic::AtomicBool,
+    spawn: std::sync::atomic::AtomicBool,
+}
+
+impl DeptStageSeen {
+    /// 단계 표지 하나를 읽었다(콜백이 부른다).
+    fn note(&self, key: &str) {
+        self.any.store(true, std::sync::atomic::Ordering::SeqCst);
+        if key == "spawn" {
+            self.spawn.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 응답에 싣는 값 — `Some(true)` = `spawn` 표지를 읽었다(이 호출이 데몬을 띄웠다) · `Some(false)` = 다른 표지만 읽었다(기존 팀을 돌려받았다: create 의 REUSE_UP·REUSE_BOOTING · allocate 의 멱등 반환 · 이미 가동 중인 데몬 재사용) ·
+    /// `None` = 표지를 하나도 읽지 못했다(진행 표지를 내지 않는 구 팩 · 스트리밍 끔(`CYS_DEPT_CREATE_STREAM=0`) · 진행 id 없음 — 콜백이 불리지 않는다) → 키를 싣지 않는다. 이 경우 화면의 종전 식은
+    /// '표지를 한 번도 못 받았으면 새 팀으로 본다(현행 유지)' 이고, `false` 를 싣는 것은 그 규칙을 뒤집는 것이다.
+    fn spawned(&self) -> Option<bool> {
+        self.any.load(std::sync::atomic::Ordering::SeqCst).then(|| self.spawn.load(std::sync::atomic::Ordering::SeqCst))
+    }
 }
 
 // ───────── ★0.14.43(GU) 「팀 직접 만들기」 진행 표시 — cys-dept 단계 표지(`@stage`)의 스트리밍 판독 ─────────
@@ -5503,9 +5547,9 @@ fn strip_stage_lines(stderr: &str) -> String {
     out
 }
 
-/// 되돌리기 노브 `CYS_DEPT_CREATE_STREAM` — 정확히 `0` 이면 종전 `cmd.output()` 경로(false), 그 밖(미설정·빈 값·다른 값)은 스트리밍(true).
+/// 되돌리기 노브 `CYS_DEPT_CREATE_STREAM` — 앞뒤 공백을 걷은 값이 `0` 이면 종전 `cmd.output()` 경로(false), 그 밖(미설정·빈 값·다른 값)은 스트리밍(true — `knob_turned_off`).
 fn dept_create_stream_from_env(v: Option<&str>) -> bool {
-    v != Some("0")
+    !knob_turned_off(v)
 }
 
 /// (b) stderr 를 EOF 까지 줄 단위로 읽는다 — 전량을 모아 돌려주고, 표지 줄이면 콜백을 부른다. **어떤 줄도 읽기를 멈추게 하지 않는다**: `lines()` 가 아니라
@@ -8226,13 +8270,17 @@ mod tests {
         assert_eq!(out.status.code(), Some(3), "종료 코드는 그대로여야 한다(판정 코드의 입력)");
     }
 
-    /// 노브 파서 — 정확히 `0` 만 종전 경로(false)이고 그 밖(미설정·빈 값·다른 값)은 스트리밍(true)이다.
+    /// 노브 파서 — 앞뒤 공백을 걷은 값이 `0` 이면 종전 경로(false)이고 그 밖(미설정·빈 값·다른 값)은 스트리밍(true)이다.
+    /// ★R2F-UI(A4 n1): 이 검체는 종전에 '정확히 `0` 만 끈다'(`" 0"`·`"0 "` 는 켬)를 핀했다 — 윈도우 cmd 의 `set X=0 && …` 는 값 끝에 공백을 붙여(`"0 "`) 되돌리기 손잡이가 듣지 않았다.
+    /// 새 규칙(앞뒤 공백을 걷은 값이 `0`)으로 고쳤다(이름 그대로 · 공백 낀 0 은 끔 쪽으로 옮기고 `00`·`0.0`·`-0` 은 여전히 켬).
     #[test]
     fn gu_dept_create_stream_knob_parser() {
         assert!(dept_create_stream_from_env(None), "미설정 = 스트리밍(기본)");
-        assert!(!dept_create_stream_from_env(Some("0")), "0 = 종전 cmd.output() 경로");
-        for v in ["1", "", "00", " 0", "0 ", "false", "off", "no", "true", "x"] {
-            assert!(dept_create_stream_from_env(Some(v)), "{v:?} 는 노브를 끄지 않는다(정확히 `0` 만 끈다)");
+        for v in ["0", " 0", "0 ", " 0 ", "\t0\r\n"] {
+            assert!(!dept_create_stream_from_env(Some(v)), "{v:?} 는 종전 cmd.output() 경로(앞뒤 공백을 걷은 값이 `0`)");
+        }
+        for v in ["1", "", " ", "00", "0.0", "-0", "false", "off", "no", "true", "x"] {
+            assert!(dept_create_stream_from_env(Some(v)), "{v:?} 는 노브를 끄지 않는다(공백을 걷은 값이 `0` 일 때만 끈다)");
         }
     }
 
@@ -8603,7 +8651,12 @@ exit 0
         let f = gu_prod_fn("async fn allocate_dept_daemon(");
         let marker = "    if !out.status.success() {\n        let stderr = String::from_utf8_lossy(&out.stderr).to_string();";
         let at = f.find(marker).expect("판정 구간 시작 소실");
-        let judged = gu_code_only(&f[at..]);
+        let judged_all = gu_code_only(&f[at..]);
+        // ★R2F-UI(A3 n1): 응답 객체에 가산 키 `spawned` 를 싣는 블록(함수 맨 끝 · 3줄)은 판정 코드가 아니다 — 그 블록을 **걷고** 종전 44줄·종전 지문을 그대로 잰다(지문을 새로 재서 값을 갈아 끼우지 않는다 —
+        // 그러면 이 핀은 아무것도 지키지 않게 된다). 블록 자체는 r2fui_allocate_dept_daemon_wires_the_stage_memory_into_the_response_additively 가 따로 핀한다.
+        let additive = "    if let (Some(obj), Some(spawned)) = (info.as_object_mut(), stage_seen.spawned()) {\n        obj.insert(\"spawned\".into(), json!(spawned));\n    }\n";
+        assert_eq!(judged_all.matches(additive).count(), 1, "가산 블록(spawned)이 하나가 아니다 — 판정 구간 밖에서 가산이어야 한다:\n{judged_all}");
+        let judged = judged_all.replacen(additive, "", 1);
         assert_eq!(judged.lines().count(), 44, "판정 구간의 코드 줄 수가 달라졌다 — 판정 코드를 건드렸다:\n{judged}");
         assert_eq!(
             gu_fnv1a64(&judged),
@@ -10359,14 +10412,19 @@ exit 0
         );
     }
 
+    /// ★R2F-UI(A4 n1): 종전에는 '정확히 `"0"` 만 끈다'(`" 0"`·`"0 "` 는 켬)를 핀했다 — 윈도우 cmd 의 `set X=0 && …` 가 붙이는 값 끝 공백(`"0 "`)에 되돌리기 손잡이가 듣지 않았다.
+    /// 이제 앞뒤 공백을 걷은 값이 `"0"` 이면 끈다(이름 그대로 — 0 만 끈다는 뜻은 같다 · 공백 낀 0 은 끔 쪽으로 옮겼다).
     #[test]
     fn j2_update_verify_knob_only_zero_turns_it_off() {
         assert!(update_verify_from_env(Option::None), "미설정 = 켬");
         assert!(update_verify_from_env(Some("1")), "\"1\" = 켬");
         assert!(!update_verify_from_env(Some("0")), "\"0\" = 끔");
         assert!(update_verify_from_env(Some("")), "빈 값 = 켬");
-        for other in ["false", "off", "00", " 0", "0 ", "no"] {
-            assert!(update_verify_from_env(Some(other)), "{other:?} 는 \"0\" 이 아니므로 켬(정확히 \"0\" 만 끈다)");
+        for off in [" 0", "0 ", " 0 ", "\t0\r\n"] {
+            assert!(!update_verify_from_env(Some(off)), "{off:?} 는 앞뒤 공백을 걷으면 \"0\" 이므로 끔(윈도우 cmd `set X=0 && …`)");
+        }
+        for other in ["false", "off", "00", "no", " ", "0.0", "-0"] {
+            assert!(update_verify_from_env(Some(other)), "{other:?} 는 공백을 걷어도 \"0\" 이 아니므로 켬");
         }
     }
 
@@ -10445,14 +10503,19 @@ exit 0
         s.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
     }
 
+    /// ★R2F-UI(A4 n1): 종전에는 '정확히 `"0"` 만 끈다'(`" 0"`·`"0 "` 는 켬)를 핀했다 — 윈도우 전용 되돌리기 손잡이인데 윈도우 cmd 의 `set X=0 && …` 가 붙이는 값 끝 공백(`"0 "`)에 듣지 않았다.
+    /// 이제 앞뒤 공백을 걷은 값이 `"0"` 이면 끈다(이름 그대로 · 공백 낀 0 은 끔 쪽으로 옮겼다).
     #[test]
     fn wu_checked_launch_knob_only_zero_turns_it_off() {
         assert!(update_checked_launch_from_env(Option::None), "미설정 = 켬");
         assert!(update_checked_launch_from_env(Some("1")), "\"1\" = 켬");
         assert!(!update_checked_launch_from_env(Some("0")), "\"0\" = 끔(종전 경로)");
         assert!(update_checked_launch_from_env(Some("")), "빈 값 = 켬");
-        for other in ["false", "off", "00", " 0", "0 ", "no", "2", "true"] {
-            assert!(update_checked_launch_from_env(Some(other)), "{other:?} 는 \"0\" 이 아니므로 켬(정확히 \"0\" 만 끈다)");
+        for off in [" 0", "0 ", " 0 ", "\t0\r\n"] {
+            assert!(!update_checked_launch_from_env(Some(off)), "{off:?} 는 앞뒤 공백을 걷으면 \"0\" 이므로 끔(윈도우 cmd `set X=0 && …`)");
+        }
+        for other in ["false", "off", "00", "no", "2", "true", " ", "0.0", "-0"] {
+            assert!(update_checked_launch_from_env(Some(other)), "{other:?} 는 공백을 걷어도 \"0\" 이 아니므로 켬");
         }
     }
 
@@ -10640,18 +10703,22 @@ exit 0
 
     // ───────── ★(0.14.43 · R1F-UA) 성찰 1회차 수정 — 확인 실행 노브를 화면이 알게 한다 · J2 보류 창의 기준 시각 · 플러그인 설정 가정 ─────────
 
-    /// ★R1F-UA(S3 minor 4): 화면이 묻는 값. 윈도우만 노브(`CYS_UPDATE_CHECKED_LAUNCH`)를 본다 — 정확히 `"0"` 만 끈다(`update_checked_launch_from_env` 와 같은 규칙).
+    /// ★R1F-UA(S3 minor 4): 화면이 묻는 값. 윈도우만 노브(`CYS_UPDATE_CHECKED_LAUNCH`)를 본다 — 앞뒤 공백을 걷은 값이 `"0"` 이면 끈다(`update_checked_launch_from_env` 와 같은 규칙).
     /// 맥·리눅스는 그 노브를 보지 않으므로(분기가 컴파일되지 않는다) 늘 `true`(기본값)다.
+    /// ★R2F-UI(A4 n1): 종전 단언은 '정확히 `"0"` 만 끈다'(`" 0"`·`"0 "` 는 켬)였다 — 실제 선택(`update_checked_launch_from_env`)이 공백 낀 0 을 끄게 바뀌었으니 화면에 알리는 값도 같은 해석이어야 한다(식 공유 — 아래 모든 값 대조).
     #[test]
     fn r1fua_checked_launch_enabled_reports_the_knob_on_windows_and_true_elsewhere() {
         assert!(update_checked_launch_enabled_for(true, Option::None), "윈도우 미설정 = 켬");
         assert!(update_checked_launch_enabled_for(true, Some("1")), "\"1\" = 켬");
         assert!(update_checked_launch_enabled_for(true, Some("")), "빈 값 = 켬");
         assert!(!update_checked_launch_enabled_for(true, Some("0")), "윈도우 \"0\" = 끔(종전 경로)");
-        for other in ["false", "off", "00", " 0", "0 ", "no", "2", "true"] {
-            assert!(update_checked_launch_enabled_for(true, Some(other)), "{other:?} 는 \"0\" 이 아니므로 켬(정확히 \"0\" 만 끈다)");
+        for off in [" 0", "0 ", " 0 ", "\t0\r\n"] {
+            assert!(!update_checked_launch_enabled_for(true, Some(off)), "{off:?} 는 앞뒤 공백을 걷으면 \"0\" 이므로 끔(실제 선택과 같은 해석)");
         }
-        for v in [Option::None, Some("0"), Some("1"), Some(""), Some("x")] {
+        for other in ["false", "off", "00", "no", "2", "true", " ", "0.0", "-0"] {
+            assert!(update_checked_launch_enabled_for(true, Some(other)), "{other:?} 는 공백을 걷어도 \"0\" 이 아니므로 켬");
+        }
+        for v in [Option::None, Some("0"), Some("1"), Some(""), Some("x"), Some(" 0"), Some("0 "), Some("\t0\r\n"), Some(" ")] {
             assert!(update_checked_launch_enabled_for(false, v), "윈도우가 아니면 노브를 보지 않는다 — 늘 true: {v:?}");
             assert_eq!(
                 update_checked_launch_enabled_for(true, v),
@@ -15310,5 +15377,159 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
             vec![json!({"folder": "Desktop"}), json!({"folder": "Documents"})]
         );
         assert_eq!(perm_warnings_from(&[]), Vec::<Value>::new());
+    }
+
+    // ───────── ★(성찰 2회차 · R2F-UI) 앱 노브 셋의 공백(A4 n1) · 새 팀 표지의 응답 값 `spawned`(A3 n1) · 계정 병합의 키 부재(A2 m-1) ─────────
+
+    /// ★R2F-UI(A4 n1): 앱의 되돌리기 노브 셋(`CYS_UPDATE_VERIFY` · `CYS_UPDATE_CHECKED_LAUNCH` · `CYS_DEPT_CREATE_STREAM`)은 **같은 해석 하나**(`knob_turned_off` — 앞뒤 공백을 걷은 값이 `0`)를 쓴다.
+    /// 셋이 같은 값에서 같은 답을 내고, 셋의 본문은 그 함수의 부정이며, 제품 코드에 옛 식(`v != Some("0")`)이 남아 있지 않다 — 윈도우 cmd 의 `set X=0 && …` 가 값 끝에 공백을 붙여(`"0 "`)
+    /// 되돌리기 손잡이가 듣지 않던 것이 이 핀의 대상이다. 데몬의 다른 노브와 같은 규칙이다.
+    #[test]
+    fn r2fui_app_knob_parsers_share_one_trim_rule() {
+        let table: [Option<&str>; 16] = [
+            None,
+            Some(""),
+            Some(" "),
+            Some("0"),
+            Some(" 0"),
+            Some("0 "),
+            Some(" 0 "),
+            Some("\t0\r\n"),
+            Some("00"),
+            Some("0.0"),
+            Some("-0"),
+            Some("1"),
+            Some("false"),
+            Some("off"),
+            Some("x"),
+            Some("\u{ff10}"), // 전각 0 — 닮았지만 0 이 아니다
+        ];
+        for v in table {
+            let off = knob_turned_off(v);
+            assert_eq!(update_verify_from_env(v), !off, "CYS_UPDATE_VERIFY 해석이 공용 규칙과 다르다: {v:?}");
+            assert_eq!(update_checked_launch_from_env(v), !off, "CYS_UPDATE_CHECKED_LAUNCH 해석이 공용 규칙과 다르다: {v:?}");
+            assert_eq!(dept_create_stream_from_env(v), !off, "CYS_DEPT_CREATE_STREAM 해석이 공용 규칙과 다르다: {v:?}");
+        }
+        // 끄는 값은 앞뒤 공백을 걷은 `0` 뿐이다 — 옛 규칙과 갈라지는 것은 공백 낀 0 하나(윈도우 cmd `set X=0 && …`)
+        for v in [Some("0"), Some(" 0"), Some("0 "), Some(" 0 "), Some("\t0\r\n")] {
+            assert!(knob_turned_off(v), "{v:?} 는 끄는 값이어야 한다");
+        }
+        for v in [None, Some(""), Some(" "), Some("00"), Some("0.0"), Some("-0"), Some("1"), Some("false"), Some("off"), Some("x"), Some("\u{ff10}")] {
+            assert!(!knob_turned_off(v), "{v:?} 는 끄는 값이 아니다");
+        }
+        // 소스 핀 — 셋의 본문은 공용 함수의 부정 하나 · 옛 식이 제품 코드 어디에도 없다 · 공용 함수는 trim 으로 비교한다
+        for head in ["fn update_verify_from_env(", "fn update_checked_launch_from_env(", "fn dept_create_stream_from_env("] {
+            let body = wu_code(wu_seg(head));
+            assert!(body.contains("!knob_turned_off(v)"), "{head} 의 본문이 공용 규칙의 부정이 아니다:\n{body}");
+        }
+        assert_eq!(wu_code(wu_prod()).matches("v != Some(\"0\")").count(), 0, "옛 '정확히 0' 식이 제품 코드에 남았다");
+        let shared = wu_code(wu_seg("fn knob_turned_off("));
+        assert!(shared.contains("v.map(str::trim) == Some(\"0\")"), "공용 규칙이 앞뒤 공백을 걷어 `0` 과 비교하지 않는다:\n{shared}");
+    }
+
+    /// ★R2F-UI(A3 n1): `DeptStageSeen` — 응답의 `spawned` 가 되는 값. `spawn` 표지를 읽었으면 `Some(true)` · 다른 표지만 읽었으면 `Some(false)`(기존 팀을 돌려받은 호출) ·
+    /// **하나도 못 읽었으면 `None`**(구 팩·스트리밍 끔 — 키를 싣지 않아 화면이 종전 식으로 판정한다 · `false` 를 싣는 것은 '표지 없음 = 새 팀으로 본다'는 종전 규칙을 뒤집는다).
+    #[test]
+    fn r2fui_stage_seen_reports_spawned_only_when_a_marker_was_read() {
+        let run = |keys: &[&str]| {
+            let seen = DeptStageSeen::default();
+            for k in keys {
+                seen.note(k);
+            }
+            seen.spawned()
+        };
+        assert_eq!(run(&[]), None, "표지를 하나도 못 읽었는데 값이 생겼다");
+        // 새로 띄운 팀(create/allocate 신규): reserve → probe → spawn → wait → up → seat → done
+        assert_eq!(run(&["reserve", "probe", "spawn", "wait", "up", "seat", "done"]), Some(true));
+        // 기존 팀을 돌려받은 호출 — 재사용(reserve → probe → up → seat → done) · create 조기 반환(reserve → done) · allocate 멱등 반환(done 하나뿐)
+        assert_eq!(run(&["reserve", "probe", "up", "seat", "done"]), Some(false));
+        assert_eq!(run(&["reserve", "done"]), Some(false));
+        assert_eq!(run(&["done"]), Some(false), "done 하나뿐인 갈래(allocate 멱등 반환)가 '표지 없음' 으로 읽히면 안 된다 — 이것이 순서 의존의 원인이었다");
+        // 순서·반복에 무관하다 · 실패로 spawn 까지만 갔어도 spawn 은 읽은 것이다
+        assert_eq!(run(&["spawn"]), Some(true));
+        assert_eq!(run(&["done", "spawn"]), Some(true));
+        assert_eq!(run(&["spawn", "spawn", "done"]), Some(true));
+        // 이름이 닮은 키는 spawn 이 아니다(정확 일치만)
+        for near in ["Spawn", "SPAWN", "spawn ", " spawn", "spawned", "spawn-2", "respawn", ""] {
+            assert_eq!(run(&[near]), Some(false), "{near:?} 는 spawn 표지가 아니다(다른 표지로만 센다)");
+        }
+    }
+
+    /// ★R2F-UI(A3 n1): 실제 스트리밍 실행기를 지나는 `spawned` — 스크립트가 낸 표지가 콜백을 거쳐 `DeptStageSeen` 에 기억된다. 새 팀 · 기존 팀 · 표지 없음(구 팩) · 노브 끔(콜백이 안 불린다) 네 갈래.
+    #[cfg(unix)]
+    #[test]
+    fn r2fui_stage_seen_through_the_real_streaming_runner() {
+        let run = |script: &str, stream: bool| -> Option<bool> {
+            let sc = GuScript::new(script);
+            let seen = std::sync::Arc::new(DeptStageSeen::default());
+            let cb_seen = seen.clone();
+            let cmd = sc.cmd();
+            let out = gu_within(30, move || run_dept_child(cmd, stream, move |key: &str| cb_seen.note(key))).expect("실행");
+            assert!(out.status.success(), "스크립트가 실패했다");
+            seen.spawned()
+        };
+        let new_team = "printf '%s\\n' '[cys-dept] @stage reserve' '[cys-dept] @stage probe' '[cys-dept] @stage spawn' '[cys-dept] @stage wait' '[cys-dept] @stage up' '[cys-dept] @stage seat' '[cys-dept] @stage done' >&2\necho dept-1\n";
+        let reuse = "printf '%s\\n' '[cys-dept] @stage reserve' '[cys-dept] @stage probe' '[cys-dept] @stage up' '[cys-dept] @stage done' >&2\necho dept-1\n";
+        let done_only = "printf '%s\\n' '[cys-dept] @stage done' >&2\necho dept-1\n";
+        let old_pack = "echo '[cys-dept] 예약 완료(dept-1)' >&2\necho dept-1\n";
+        assert_eq!(run(new_team, true), Some(true), "새로 띄운 팀");
+        assert_eq!(run(reuse, true), Some(false), "기존 팀을 돌려받은 호출");
+        assert_eq!(run(done_only, true), Some(false), "done 하나뿐인 갈래");
+        assert_eq!(run(old_pack, true), None, "표지를 내지 않는 구 팩 — 키를 싣지 않는다");
+        assert_eq!(run(new_team, false), None, "노브 끔(CYS_DEPT_CREATE_STREAM=0 — 콜백이 불리지 않는다) — 키를 싣지 않는다(false 가 아니다)");
+    }
+
+    /// ★R2F-UI(A3 n1) 배선 핀: `allocate_dept_daemon` 은 표지 콜백 안에서 기억하고(`stage_seen_cb.note(key)`) 응답 객체에 **가산**으로 싣는다 — 기억은 객체 맨 끝(`Ok(info)` 바로 앞)의 한 블록이고
+    /// `None` 이면 싣지 않는다. 기존 키(socket·socket_slug·name·display_name)는 그대로다. 화면이 읽는 이름 `spawned` 가 양쪽에서 같다.
+    #[test]
+    fn r2fui_allocate_dept_daemon_wires_the_stage_memory_into_the_response_additively() {
+        let f = gu_code_only(&gu_prod_fn("async fn allocate_dept_daemon("));
+        assert!(f.contains("let stage_seen = std::sync::Arc::new(DeptStageSeen::default());"), "표지 기억 객체를 만들지 않는다");
+        assert!(f.contains("stage_seen_cb.note(key);"), "표지 콜백이 기억하지 않는다");
+        let cb = f.find("run_dept_child(cmd, streaming, move |key: &str| {").expect("콜백 소실");
+        let note = f.find("stage_seen_cb.note(key);").expect("note 소실");
+        let emit = f.find("emit_app.emit(\"dept-create-progress\"").expect("이벤트 소실");
+        assert!(cb < note && note < emit, "기억은 콜백 안(이벤트 전)이어야 한다");
+        let tail = "    if let (Some(obj), Some(spawned)) = (info.as_object_mut(), stage_seen.spawned()) {\n        obj.insert(\"spawned\".into(), json!(spawned));\n    }\n    Ok(info)";
+        assert!(f.ends_with(tail), "응답의 `spawned` 가산 블록이 함수 맨 끝(Ok(info) 바로 앞)에 있지 않다:\n{}", &f[f.len().saturating_sub(300)..]);
+        assert_eq!(f.matches("\"spawned\"").count(), 1, "spawned 키를 싣는 곳은 한 곳이다");
+        // 기존 응답 키는 그대로 — 가산이다
+        for key in ["\"socket\"", "\"socket_slug\"", "\"name\"", "\"display_name\""] {
+            assert!(f.contains(&format!("obj.insert({key}.into(),")), "기존 응답 키 {key} 가 사라졌다");
+        }
+        // 화면과 같은 이름
+        let ui = std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../ui/src/main.ts"))
+            .expect("ui/src/main.ts 를 읽지 못했다 — 측정 불능은 통과가 아니다");
+        assert!(ui.contains("spawned?: boolean;"), "화면의 응답 타입에 spawned 가 없다");
+        assert!(ui.contains("typeof info.spawned === \"boolean\" ? info.spawned :"), "화면이 응답의 spawned 를 1순위로 읽지 않는다");
+    }
+
+    /// ★R2F-UI(A2 m-1): '신 데몬 키 부재 + 신 데몬 빈 배열 → 빈 배열' — 지금의 사양을 박는다(문서가 그렇게 적었다). 신 데몬도 이번에 읽지 못한 폴더가 낀 행에서는 `current_profiles` 키를 뺀다
+    /// (accounts.rs `current_profiles_for`) — 키 부재가 곧 구버전 데몬은 아니다. 그 행이 다른 신 데몬의 빈 배열('어느 폴더에도 로그인돼 있지 않다')과 병합되면 결과는 **빈 배열**이다 —
+    /// 키 있는 쪽이 이기고, 키 없는 쪽을 '구버전이니 profiles 로 폴백하라'는 신호로 되살리지 않는다. 입력 순서 둘 × 승자(관측 시각) 둘 = 4가지 모두 같다.
+    #[test]
+    fn r2fui_merge_new_daemon_missing_key_plus_new_daemon_empty_array_is_empty_array() {
+        // 신 데몬 A — 읽지 못한 폴더가 낀 행: current_profiles 키가 없다(in_use 는 신 데몬이라 있다 · 판정 불가 null)
+        let missing = |ts: f64| acct_merge_resp(vec![acct_merge_row(ts, json!({"profiles": [".cys/claude"], "in_use": null}))]);
+        // 신 데몬 B — 이 계정이 지금 어느 폴더에도 로그인돼 있지 않다: 빈 배열(키는 있다)
+        let empty = |ts: f64| acct_merge_resp(vec![acct_merge_row(ts, json!({"profiles": [".claude-2"], "current_profiles": [], "in_use": false}))]);
+        for (a_ts, b_ts) in [(100.0, 200.0), (200.0, 100.0)] {
+            for resps in [[missing(a_ts), empty(b_ts)], [empty(b_ts), missing(a_ts)]] {
+                let m = merge_account_rows(&resps);
+                assert_eq!(m.len(), 1);
+                assert_eq!(
+                    m[0].get("current_profiles"),
+                    Some(&json!([])),
+                    "a_ts={a_ts} b_ts={b_ts}: 키 없는 신 데몬 행 + 빈 배열 신 데몬 행은 빈 배열이어야 한다(키를 지우면 UI 가 profiles 로 폴백해 옛 로그인 폴더를 '현재' 로 되살린다): {}",
+                    m[0]
+                );
+                // profiles 합집합·in_use(null 이 false 보다 우선 = 판정 불가)는 종전 규칙 그대로
+                assert_eq!(m[0]["profiles"], json!([".claude-2", ".cys/claude"]));
+                assert_eq!(m[0]["in_use"], Value::Null);
+            }
+        }
+        // 대조: 키 없는 행끼리(둘 다 읽지 못함·구버전)는 키를 만들지 않는다 — 위의 결과가 '키 부재 = 빈 배열' 로 뭉개진 것이 아니다
+        let m = merge_account_rows(&[missing(100.0), missing(200.0)]);
+        assert!(m[0].get("current_profiles").is_none(), "키 없는 행끼리의 병합이 키를 만들었다: {}", m[0]);
     }
 }

@@ -4,7 +4,9 @@
 //   · 이 GUI 는 queue.starved 를 소비하지 않았다 — category "queue" 는 폴백 3종(health·watchdog·feed)에 안 걸려 화면이 0 이었고, 사람이 해야 하는
 //     조치(그 창을 클릭해 Ctrl-U · 질문 창에 답하기 …)를 알릴 표면이 없어 좌석 큐가 몇 시간씩 막혀도 아무도 몰랐다.
 //   · starvedNotice 는 payload 를 의심한다(타입·꼴) — 올릴 수 없으면 null, 올리면 제목·상세(LLM 꼬리 제거 · 200자 상한)·id·humanNeeded.
-//   · remedy_code 표: approval·paused·wait 만 '사람 조치 불필요'(토스트만) — 코드가 없거나(구버전 데몬) 모르는 값이면 알린다(모르면 알린다).
+//   · remedy_code 표: approval·paused·wait 만 '사람 조치 불필요'(토스트만) — 모르는 값이면 알린다(모르면 알린다).
+//   · ★R2F-UI(A3 m1): 코드가 **아예 없는** payload(0.14.42 데몬)는 `blocked_by` 의 접두로 가린다 — 스스로 풀리거나 사람 조치가 아닌 사유(데몬 REMEDY_WAIT_PREFIXES 의 것들 + approval_pending + 일시정지)면 토스트만 ·
+//     그 밖은 알린다. 접두 목록은 데몬 소스를 읽는 어휘 핀으로 묶는다.
 //   · 토스트를 **눌렀을 때만** 좌석으로 간다 — 다른 데몬의 같은 번호 좌석을 열지 않는다(locateStarvedSeat). 못 찾으면 무동작.
 //   · main.ts 배선: name-우선 분기 · 끝의 return(폴백 이중 표시 금지) · 풀림(queue.delivered)·좌석 종료가 토스트를 거둔다.
 //   · 순수 모듈 불변식: 최상위 부수효과 0 · 문서/창/저장소 낱말 0 · 구형 WKWebView 비호환 문법 0.
@@ -23,6 +25,7 @@ import {
   STARVED_HUMAN_CODES,
   STARVED_LEGACY_HUMAN_CODES,
   STARVED_CALM_CODES,
+  STARVED_LEGACY_CALM_PREFIXES,
   type StarvedSeatLookup,
 } from "./starvednotice";
 
@@ -118,12 +121,117 @@ describe("remedy_code 별 humanNeeded 표 — approval·paused·wait 만 false, 
   });
 });
 
+// ── ★R2F-UI(A3 m1) 구 데몬 + 새 앱: 큐 막힘 OS 배너가 스스로 풀리는 사유에도 나갔다 ─────────────────────────────────────────────
+// 0.14.42 데몬의 payload 에는 `remedy_code` 가 없다(7키). 그때 humanNeeded 는 늘 true 라 — 승인 대기·일시정지·`busy`(출력 중) 같은 사유도 OS 배너(고우선 통로)를 냈다. 새 데몬은 같은 사유를 calm 코드로 내 배너가 없다.
+// 업데이트 직후 세션을 살려 둔 사용자(= 가장 많이 쓰는 사용자)가 워커가 10분 넘게 일할 때마다 좌석당 5분 간격으로 배너를 받았다. 코드가 **아예 없는** payload 는 `blocked_by` 의 접두로 가려 그런 사유면 토스트만 낸다.
+describe("★R2F-UI(A3 m1) 코드가 아예 없는 payload(0.14.42 데몬) — 막힘 사유의 접두로 사람 조치 여부를 가른다", () => {
+  const legacy = (blocked_by: unknown): Record<string, unknown> => legacyPayload({ blocked_by });
+  const needed = (blocked_by: unknown): boolean => starvedNotice(legacy(blocked_by))!.humanNeeded;
+  const CALM_REASONS = [
+    "busy(출력 중)",
+    "delivery_interval(배달 최소 간격)",
+    "settle_budget(이 틱의 인계 결판 예산 소진 — 다음 틱이 이 좌석부터 시작한다)",
+    "quiescing(사이클 진행 중 · /clear~RESUME 창)",
+    "prompt_not_ready(프롬프트 경계 미도달)",
+    "human_typing(사람이 입력 중)",
+    "queue_paused(헬스 조치)",
+    "approval_pending(승인·관문 대기)",
+    "paused(kill-switch 동결)",
+  ];
+  const HUMAN_REASONS = [
+    "input_pending(입력줄에 미제출 입력)",
+    "modal_pending(모달·선택기 전경)",
+    "prompt_unknown(프롬프트 경계 관측 불능)",
+    "alt_screen(전체화면 · 프롬프트 레이아웃 미확인)",
+    "empty_seat(좌석에 에이전트가 없다)",
+    "schedule_divert(gate:draft · job 7)",
+    "future_reason(새 사유)",
+  ];
+  it("★스스로 풀리거나 사람 조치가 아닌 사유 — 데몬 wait 7종(busy·delivery_interval·settle·quiescing·prompt_not_ready·human_typing·queue_paused) + approval_pending + 일시정지(paused) — 는 토스트만(humanNeeded false)", () => {
+    for (const r of CALM_REASONS) expect({ 사유: r, 알림: needed(r) }).toEqual({ 사유: r, 알림: false });
+    // 접두만 같으면 된다 — 괄호 설명이 달라도(데몬 판마다 문면이 다르다) · 앞뒤 공백·줄바꿈이 끼어도
+    for (const r of ["busy", "busy(다른 설명)", "  busy(출력 중)  ", "busy\n", "queue_paused", "settle", "paused"]) expect({ 사유: r, 알림: needed(r) }).toEqual({ 사유: r, 알림: false });
+  });
+  it("★사람이 조치해야 하는 사유·모르는 사유는 그대로 알린다(토스트 + OS 배너) — 입력줄·모달·프롬프트 불명·전체화면·빈 좌석·스케줄 우회·새 사유", () => {
+    for (const r of HUMAN_REASONS) expect({ 사유: r, 알림: needed(r) }).toEqual({ 사유: r, 알림: true });
+  });
+  it("사유가 없거나(null·빈 값·공백·키 없음)·문자열이 아니면(숫자·객체·배열·불리언) 알린다 — 모르면 알린다", () => {
+    for (const r of [null, undefined, "", "   ", "\n\t", 5, {}, [], ["busy"], true]) expect({ 사유: String(r), 알림: needed(r) }).toEqual({ 사유: String(r), 알림: true });
+    const noKey = legacyPayload();
+    delete noKey.blocked_by;
+    expect(starvedNotice(noKey)!.humanNeeded).toBe(true);
+    expect(starvedHumanNeeded(undefined)).toBe(true); // 코드도 사유도 없다
+    expect(starvedHumanNeeded(undefined, undefined)).toBe(true);
+  });
+  it("접두는 **앞**에서만 본다 — 사유 중간에 calm 낱말이 들어 있어도(예: input_pending 의 설명에 'busy') calm 으로 읽지 않는다 · 대소문자 다른 값·접두를 늘린 값도 아니다", () => {
+    for (const r of ["input_pending(busy 때문에 막힘)", "x_busy", "Busy", "BUSY(출력 중)", "unbusy", "queue_paused_x_but_not", "not_paused"]) {
+      const calm = r === "queue_paused_x_but_not"; // 접두 queue_paused 와 일치 — 데몬도 접두 일치(starts_with)로 읽는다
+      expect({ 사유: r, 알림: needed(r) }).toEqual({ 사유: r, 알림: !calm });
+    }
+  });
+  it("★코드가 **있으면** 코드로만 가른다 — calm 사유(busy)라도 사람 조치 코드면 알리고, 코드가 calm 이면 사유와 무관하게 토스트만 · `null` 같은 '있는데 이상한' 값은 코드가 없는 것이 아니다(알린다)", () => {
+    expect(starvedNotice(legacyPayload({ remedy_code: "phantom_count" }))!.humanNeeded).toBe(true); // 사유 busy 인데 사람 조치 코드
+    expect(starvedNotice(legacyPayload({ blocked_by: "input_pending(…)", remedy_code: "wait" }))!.humanNeeded).toBe(false); // 사유는 입력줄인데 calm 코드
+    for (const v of [null, "", "bogus", 7, {}, []]) expect({ 코드: JSON.stringify(v), 알림: starvedNotice(legacyPayload({ remedy_code: v }))!.humanNeeded }).toEqual({ 코드: JSON.stringify(v), 알림: true });
+    expect(starvedHumanNeeded("wait", "input_pending")).toBe(false);
+    expect(starvedHumanNeeded("phantom_count", "busy")).toBe(true);
+  });
+  it("접두 목록(STARVED_LEGACY_CALM_PREFIXES)은 정확히 9개 — 데몬 wait 7 + approval_pending + paused · 서로 겹치지 않는다(어느 접두도 다른 접두의 접두가 아니다)", () => {
+    expect([...STARVED_LEGACY_CALM_PREFIXES].sort()).toEqual(["approval_pending", "busy", "delivery_interval", "human_typing", "paused", "prompt_not_ready", "queue_paused", "quiescing", "settle"]);
+    for (const a of STARVED_LEGACY_CALM_PREFIXES) for (const b of STARVED_LEGACY_CALM_PREFIXES) if (a !== b) expect({ a, b, 겹침: b.startsWith(a) }).toEqual({ a, b, 겹침: false });
+  });
+  it("조치 문구·제목·id 는 종전 그대로다 — 사유가 calm 이어도 상세는 `막힘 사유: …` 이고 토스트는 뜬다(OS 배너만 없다)", () => {
+    const n = starvedNotice(legacy("busy(출력 중)"), "abc")!;
+    expect(n).toEqual({ id: "starved:abc:surface:3", title: "⏳ 큐 막힘 — worker surface:3", detail: "10분째 · 막힘 사유: busy(출력 중)", humanNeeded: false });
+  });
+});
+
+describe("★R2F-UI(A3 m1) 데몬 어휘 핀 — 접두 목록은 데몬 소스를 읽어 묶는다(데몬이 wait 접두를 더하거나 사유 상수를 바꾸면 이 표도 따라가야 한다)", () => {
+  const rs = read("../../src/bin/cysd/governance.rs");
+  it("STARVED_LEGACY_CALM_PREFIXES = 데몬 REMEDY_WAIT_PREFIXES(소스에서 읽는다) ∪ {approval_pending, paused} — 한쪽만 바뀌면 적색", () => {
+    const m = rs.match(/const REMEDY_WAIT_PREFIXES: \[&str; \d+\] = \[([^\]]*)\];/);
+    expect(m).not.toBeNull();
+    const daemon = Array.from((m as RegExpMatchArray)[1].matchAll(/"([^"]*)"/g), (x) => x[1]);
+    expect(daemon.length).toBeGreaterThan(0);
+    expect(daemon.length).toBe(Number(((rs.match(/const REMEDY_WAIT_PREFIXES: \[&str; (\d+)\]/) as RegExpMatchArray)[1])));
+    expect([...STARVED_LEGACY_CALM_PREFIXES].sort()).toEqual([...daemon, "approval_pending", "paused"].sort());
+  });
+  it("데몬의 사유 상수(`pub(crate) const BLOCKED_* : &str`)는 전부 이 표의 분류에 있고 — 각 상수의 문면이 구 데몬 payload 로 오면 표대로 읽힌다(calm 이면 토스트만 · 아니면 알린다)", () => {
+    // 상수 이름 → 코드 없는 payload 의 humanNeeded. 새 사유 상수가 데몬에 생기면 여기에도 한 줄을 더해야 한다(판단을 강제한다).
+    const TABLE: Record<string, boolean> = {
+      BLOCKED_APPROVAL: false, // approval(승인 알림 경로가 맡는다)
+      BLOCKED_MODAL: true, // answer_modal
+      BLOCKED_BUSY: false, // wait
+      BLOCKED_INPUT_PENDING: true, // 입력줄 계열
+      BLOCKED_PROMPT_UNKNOWN: true, // prompt_unknown
+      BLOCKED_PROMPT_NOT_READY: false, // wait
+      BLOCKED_ALT_SCREEN: true, // alt_screen
+      BLOCKED_INTERVAL: false, // wait
+      BLOCKED_QUIESCING: false, // wait
+      BLOCKED_SETTLE_BUDGET: false, // wait(settle — 다음 틱에 스스로 풀린다)
+      BLOCKED_PAUSED_KILL_SWITCH: false, // paused
+      BLOCKED_QUEUE_PAUSED: false, // wait(queue_paused)
+    };
+    const found = Array.from(rs.matchAll(/pub\(crate\) const (BLOCKED_[A-Z_]+): &str =\s*"([^"]*)";/g), (x) => [x[1], x[2]] as [string, string]);
+    expect(found.length).toBeGreaterThanOrEqual(12);
+    expect({ 표에_없는_상수: found.map(([n]) => n).filter((n) => !(n in TABLE)) }).toEqual({ 표에_없는_상수: [] });
+    expect({ 데몬에_없는_표항목: Object.keys(TABLE).filter((n) => !found.some(([f]) => f === n)) }).toEqual({ 데몬에_없는_표항목: [] });
+    for (const [name, text] of found) {
+      const n = starvedNotice(legacyPayload({ blocked_by: text }))!;
+      expect({ 상수: name, 문면: text, 알림: n.humanNeeded }).toEqual({ 상수: name, 문면: text, 알림: TABLE[name] });
+    }
+  });
+});
+
 describe("데몬 어휘와 대조 — 데몬이 내는 remedy_code 는 전부 이 표가 분류한다(어휘 이탈 방지)", () => {
   const rs = read("../../src/bin/cysd/governance.rs");
-  // 이 대조는 데몬 쪽 처방 표(queue_remedy)가 트리에 있을 때만 의미가 있다 — 없으면(그 티켓이 아직 안 들어온 중간 커밋) 대상이 없다.
+  // ★R2F-UI(A3 n17): 종전에는 이 대조가 데몬 소스에 `fn queue_remedy(` 가 있을 때만 돌았다('그 티켓이 아직 안 들어온 중간 커밋'을 위한 탈출구). 처방 표는 이제 트리에 있으니 탈출구는 쓸모가 없고,
+  //   남아 있으면 `queue_remedy` 의 이름을 바꾸거나 다른 파일로 옮기는 순간 데몬↔화면 어휘를 묶는 **유일한** 대조가 초록인 채 꺼진다. 무조건 돌리고, 생산자가 없으면 적색이다.
   const hasProducer = rs.includes("fn queue_remedy(");
+  it("★R2F-UI(A3 n17): 처방 표 생산자(`fn queue_remedy(`)가 데몬 소스에 있다 — 없으면 아래 어휘 대조가 말없이 꺼지던 탈출구가 닫혔다", () => {
+    expect(hasProducer).toBe(true);
+  });
   it("QUEUE_REMEDY_CODES ⊆ (사람 조치 필요 ∪ 옛 이름 ∪ calm) · 꼬리 상수 REMEDY_LLM_SUFFIX 가 STARVED_LLM_TAIL 로 시작한다", () => {
-    if (!hasProducer) return;
     const m = rs.match(/const QUEUE_REMEDY_CODES: \[&str; \d+\] = \[([^\]]*)\];/);
     expect(m).not.toBeNull();
     const daemon = Array.from((m as RegExpMatchArray)[1].matchAll(/"([^"]*)"/g), (x) => x[1]);
@@ -273,19 +381,27 @@ describe("200자 절단 — 넘으면 앞 199자 + … (총 200자, 코드 포�
 });
 
 describe("구버전 데몬 payload(remedy_code·remedy 없음) · 조치 문장을 믿을 수 없는 경우", () => {
-  it("remedy 없음 → humanNeeded true · 상세는 `막힘 사유: <blocked_by>` 만(분 표기는 유지)", () => {
+  // ★R2F-UI(A3 m1): 이름·기대를 고쳤다 — 종전 「remedy 없음 → humanNeeded true」 는 코드가 없으면 **모든** 사유를 '모르면 알린다'로 읽었다. 이제 코드가 아예 없는 payload 는 막힘 사유의 접두로 가린다:
+  //   기본 legacyPayload(blocked_by=`busy`)는 스스로 풀리는 사유라 토스트만(humanNeeded false), 사람 조치 사유(`input_pending…`)는 그대로 true. 상세 문구(`막힘 사유: <blocked_by>`)·분 표기·id·제목은 그대로다.
+  it("remedy 없음 → 상세는 `막힘 사유: <blocked_by>` 만(분 표기는 유지) · humanNeeded 는 사유로 가른다 — 사람 조치 사유(입력줄)면 true, 스스로 풀리는 사유(busy)면 false", () => {
+    expect(starvedNotice(legacyPayload({ blocked_by: "input_pending(입력줄에 미제출 입력)" }), "base")).toEqual({
+      id: "starved:base:surface:3",
+      title: "⏳ 큐 막힘 — worker surface:3",
+      detail: "10분째 · 막힘 사유: input_pending(입력줄에 미제출 입력)",
+      humanNeeded: true,
+    });
     expect(starvedNotice(legacyPayload(), "base")).toEqual({
       id: "starved:base:surface:3",
       title: "⏳ 큐 막힘 — worker surface:3",
       detail: "10분째 · 막힘 사유: busy",
-      humanNeeded: true,
+      humanNeeded: false,
     });
   });
   it("remedy_code 가 없거나 모르는 값이면 remedy 문장이 있어도 쓰지 않는다 — blocked_by 만(티켓 문면)", () => {
     expect(starvedNotice(legacyPayload({ remedy: `조치 문장${TAIL}` }))!.detail).toBe("10분째 · 막힘 사유: busy");
     const futureCode = starvedNotice(legacyPayload({ remedy_code: "future_code", remedy: `새 조치${TAIL}` }))!;
     expect(futureCode.detail).toBe("10분째 · 막힘 사유: busy");
-    expect(futureCode.humanNeeded).toBe(true);
+    expect(futureCode.humanNeeded).toBe(true); // ★코드가 **있는데** 모르는 값이면 사유가 busy 여도 알린다 — 사유 접두 규칙은 코드가 아예 없는 payload 에만 쓴다(A3 m1)
   });
   it("아는 코드인데 remedy 가 없거나(빈 값·공백·문자열 아님) 비면 `막힘 사유: …` 로 대체된다", () => {
     for (const r of [undefined, null, "", "   ", 12, {}, [], TAIL])
@@ -729,11 +845,20 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
       expect({ 코드: code, 호출: calls.map((c) => c.fn), ret }).toEqual({ 코드: code, 호출: ["stickyToast"], ret: undefined });
     }
   });
-  it("구버전 payload(remedy_code 없음): 토스트 + OS 배너(모르면 알린다)", () => {
-    const { calls } = run("queue.starved", { name: "queue.starved", surface_id: 3 }, legacyPayload());
+  // ★R2F-UI(A3 m1): 이름·기대를 고쳤다 — 종전 「구버전 payload(remedy_code 없음): 토스트 + OS 배너(모르면 알린다)」 는 기본 legacyPayload(blocked_by=`busy`)로 배너를 기대했다. 코드가 없는 payload 는 이제
+  //   막힘 사유로 가른다 — 스스로 풀리는 사유(busy)는 토스트만 · 사람 조치 사유(입력줄)는 종전처럼 토스트 + OS 배너.
+  it("구버전 payload(remedy_code 없음) · 사람 조치 사유(입력줄): 토스트 + OS 배너(모르면 알린다)", () => {
+    const { calls } = run("queue.starved", { name: "queue.starved", surface_id: 3 }, legacyPayload({ blocked_by: "input_pending(입력줄에 미제출 입력)" }));
     expect(calls.map((c) => c.fn)).toEqual(["stickyToast", "osBanner"]);
     expect(calls[0].args[0]).toBe("starved:base:surface:3"); // socket_slug 없음 → base
-    expect(calls[0].args[3]).toBe("10분째 · 막힘 사유: busy");
+    expect(calls[0].args[3]).toBe("10분째 · 막힘 사유: input_pending(입력줄에 미제출 입력)");
+  });
+  it("★R2F-UI(A3 m1) 구버전 payload(remedy_code 없음) · 스스로 풀리는 사유(busy)·승인 대기·일시정지: 토스트만 — OS 배너 0(좌석당 5분 간격 배너가 고우선 통로를 묽히던 것)", () => {
+    for (const reason of ["busy", "busy(출력 중)", "approval_pending(승인·관문 대기)", "queue_paused(헬스 조치)", "paused(kill-switch 동결)", "human_typing(사람이 입력 중)"]) {
+      const { ret, calls } = run("queue.starved", { name: "queue.starved", surface_id: 3 }, legacyPayload({ blocked_by: reason }));
+      expect({ 사유: reason, 호출: calls.map((c) => c.fn), ret }).toEqual({ 사유: reason, 호출: ["stickyToast"], ret: undefined });
+      expect(calls[0].args[3]).toBe(`10분째 · 막힘 사유: ${reason}`); // 토스트는 그대로 뜬다
+    }
   });
   it("socket_slug 가 문자열이 아니면 클릭 처리기는 빈 slug(= 본부)로 부른다", () => {
     const { calls } = run("queue.starved", { name: "queue.starved", socket_slug: 77, surface_id: 3 }, legacyPayload());

@@ -209,7 +209,7 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 #wsbar-usage .usage-sum.warn { color: var(--warn); }
-#wsbar-usage .usage-sum.crit { color: var(--error); } /* 0.14.43 headlineSev — 주 계정 창 최고 심각도(오래된 값이면 클래스 없음) */
+#wsbar-usage .usage-sum.crit { color: var(--error); } /* 0.14.43 headlineSev — 줄에 실린 값의 최고 심각도: 제공자별 약식이면 요약에 실린 값들(오래돼 `?` 가 붙은 값·리셋됨 제외), 제공자가 하나뿐이면 주 계정의 두 창(오래된 값이면 클래스 없음) */
 #wsbar-usage .usage-acct { display: flex; align-items: baseline; gap: 6px; min-width: 0; font-weight: 600; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #wsbar-usage .usage-acct-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #wsbar-usage .usage-win { display: flex; align-items: baseline; gap: 6px; margin-top: 3px; min-width: 0; }

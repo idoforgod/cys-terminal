@@ -52,6 +52,24 @@ export const STARVED_HUMAN_CODES: readonly string[] = [
 export const STARVED_LEGACY_HUMAN_CODES: readonly string[] = ["phantom_count_ctrl_u"];
 /** 사람 조치가 필요 없는 remedy_code — 승인(approval)은 기존 승인 알림 경로가 맡고, 동결(paused)·일시 보류(wait)는 스스로 풀린다. */
 export const STARVED_CALM_CODES: readonly string[] = ["approval", "paused", "wait"];
+/**
+ * ★(성찰 2회차 R2F-UI · A3 m1) 구버전 데몬(0.14.42 — payload 에 `remedy_code` 가 **아예 없다**)의 막힘 사유(`blocked_by`) 가운데 **스스로 풀리거나 사람 조치가 아닌** 것의 접두.
+ * 코드가 없던 시절에는 모든 막힘이 '모르면 알린다'로 OS 배너까지 나가, 업데이트 직후 세션을 살려 둔 사용자가 워커가 10분 넘게 일할 때마다(좌석당 5분 간격) 배너를 받았다 —
+ * 새 데몬은 같은 사유를 calm 코드(wait·approval·paused)로 내 배너를 내지 않는다. 이 접두에 걸리면 토스트만 낸다(새 데몬의 calm 3종과 같은 뜻).
+ * 구성 = 데몬 `REMEDY_WAIT_PREFIXES`(wait 7종 — busy·delivery_interval·settle·quiescing·prompt_not_ready·human_typing·queue_paused) + `approval_pending`(approval) + `paused`(일시정지 — kill-switch 동결).
+ * 데몬 소스를 읽는 어휘 핀(starvednotice.test.ts)이 이 목록을 묶는다 — 데몬이 wait 접두를 더하면 이 목록도 따라가야 한다. 코드가 **있는** payload 에는 쓰지 않는다(코드가 있으면 코드로만 가른다).
+ */
+export const STARVED_LEGACY_CALM_PREFIXES: readonly string[] = [
+  "busy",
+  "delivery_interval",
+  "settle",
+  "quiescing",
+  "prompt_not_ready",
+  "human_typing",
+  "queue_paused",
+  "approval_pending",
+  "paused",
+];
 
 const ROLE_MAX = 40;
 const BLOCKED_BY_MAX = 80;
@@ -77,8 +95,16 @@ function clip(s: string, max: number): string {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 
-/** remedy_code → 사람이 조치해야 하는가. calm 3종(approval·paused·wait)만 false — 코드가 없거나(구버전 데몬)·모르는 값이면 **true**(모르면 알린다). */
-export function starvedHumanNeeded(code: unknown): boolean {
+/**
+ * remedy_code → 사람이 조치해야 하는가. 코드가 **있으면** 코드로만 가른다 — calm 3종(approval·paused·wait)만 false, 모르는 값·문자열이 아닌 값은 **true**(모르면 알린다).
+ * ★R2F-UI(A3 m1): 코드가 **아예 없으면**(`undefined` — 0.14.42 데몬의 payload) 막힘 사유(`blockedBy`)의 접두(STARVED_LEGACY_CALM_PREFIXES)로 가른다 — 스스로 풀리거나 사람 조치가 아닌 사유면 false(토스트만),
+ * 그 밖·사유가 없거나 문자열이 아니면 true(모르면 알린다). `null` 같은 '있는데 이상한' 값은 코드가 없는 것이 아니다 — 알린다.
+ */
+export function starvedHumanNeeded(code: unknown, blockedBy?: unknown): boolean {
+  if (code === undefined) {
+    const b = clean(blockedBy);
+    return !(b !== "" && STARVED_LEGACY_CALM_PREFIXES.some((p) => b.startsWith(p)));
+  }
   return !(typeof code === "string" && STARVED_CALM_CODES.indexOf(code) >= 0);
 }
 
@@ -132,8 +158,8 @@ function stripLlmTail(remedy: string): string {
  * `queue.starved` payload → 알림 한 건. 화면에 올릴 수 없는 payload(객체가 아님·`surface_ref` 가 `surface:<숫자>` 꼴이 아님)는 null.
  * `socketSlug` = 이벤트를 낸 데몬의 구분자(Tauri 가 이벤트에 싣는 socket_slug) — 본부·부서 데몬의 같은 surface 번호가 id 에서 겹치지 않게 한다. 없으면 "base".
  *
- *  · humanNeeded — remedy_code 가 approval·paused·wait 가 아니면 true(코드가 없거나 모르는 값이면 true). 승인은 기존 승인 알림 경로가, 동결·일시 보류는
- *    스스로 풀리는 것이라 사람이 할 일이 없다.
+ *  · humanNeeded — remedy_code 가 approval·paused·wait 가 아니면 true(모르는 값이면 true). 승인은 기존 승인 알림 경로가, 동결·일시 보류는
+ *    스스로 풀리는 것이라 사람이 할 일이 없다. 코드가 **아예 없는** payload(구버전 데몬)는 `blocked_by` 의 접두로 가린다(starvedHumanNeeded · R2F-UI A3 m1) — 스스로 풀리는 사유면 토스트만.
  *  · detail — `<N분째> · <조치 문장>`. 조치 문장 = remedy 에서 LLM 꼬리를 뗀 것. remedy 가 없거나 비었거나 remedy_code 를 모르면(구버전 데몬·새 코드)
  *    `막힘 사유: <blocked_by>`(없으면 "알 수 없음"). 대기 시간이 유한한 양수가 아니면 분 표기만 생략한다. 총 길이는 200자 이내.
  */
@@ -152,7 +178,7 @@ export function starvedNotice(payload: unknown, socketSlug?: unknown): StarvedNo
     id: toastId(socketSlug, ref),
     title: ["⏳ 큐 막힘 —", clip(clean(payload.role), ROLE_MAX), ref].filter((x) => x !== "").join(" "),
     detail: clip(wait ? `${wait} · ${sentence}` : sentence, STARVED_DETAIL_MAX),
-    humanNeeded: starvedHumanNeeded(code),
+    humanNeeded: starvedHumanNeeded(code, payload.blocked_by),
   };
 }
 

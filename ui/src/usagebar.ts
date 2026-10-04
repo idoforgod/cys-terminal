@@ -22,7 +22,7 @@
 //     '지금'을 읽는다 — 별명(alias)·현재 로그인 폴더(current_profiles)로 라벨을 만들고, 지금 쓰이는 계정(in_use)에
 //     '● 사용 중' 표식을 단다. 주 계정은 사용 중 → 관측 신선도 순이다. 30분 넘은 관측·스냅샷은 경고색 없이 '오래됨'으로
 //     적는다(값·게이지 폭은 그대로 — 지난 값을 빨갛게 외치지 않는다). 숨긴 계정(뷰어별 목록은 main.ts 가 읽어 인자로
-//     넘긴다)은 후보·줄·요약에서 뺀다. 가산 키가 없으면(구버전 데몬) 종전 규칙으로 폴백한다 — IPC 데이터라 전부 의심한다.
+//     넘긴다)은 후보·줄·요약에서 뺀다. 가산 키가 없으면(구버전 데몬 — 단 `current_profiles` 는 신 데몬이 이번에 읽지 못한 폴더가 낀 행도 키를 뺀다) 종전 규칙으로 폴백한다 — IPC 데이터라 전부 의심한다.
 //   · ★(0.14.43 · UI2) Control Center Live KPI 의 '전 좌석 폴백'(계정 병합 값이 없을 때)도 옛 좌석 값을 되살리지 않는다 — aggSeatRates 가 경보 부적격(alert_eligible=false)
 //     창과 리셋 지난 창을 집계에서 뺀다. 구버전 데몬(키 없음)은 리셋 지난 창만 뺀다.
 //
@@ -55,7 +55,7 @@ export interface AcctRow {
   exhaust_at?: number | null; // 신선한 5h 창의 선형 소진 예측(epoch 초)
   source_error?: string | null; // 관측 경로 고장 코드(예: "agy_http_403") · null = 고장 없음(0.14.42)
   /** 0.14.43(B1 가산) 지금 이 계정으로 로그인돼 있는 설정 폴더(profiles 와 같은 표기). **배열로 있으면 그것만**이 '현재'다
-   *  (빈 배열 = 어느 폴더에도 로그인돼 있지 않은 이전 계정). 키가 없으면 구버전 데몬 — profiles 로 폴백한다. */
+   *  (빈 배열 = 어느 폴더에도 로그인돼 있지 않은 이전 계정). 키가 없으면 구버전 데몬 **또는 신 데몬이 이번에 읽지 못한 폴더가 낀 행** — profiles 로 폴백한다. */
   current_profiles?: string[];
   /** 0.14.43(B1) 오너가 적어 둔 별명(데몬이 24자로 자른다) — 표시 전용. null·키 없음 = 별명 없음. */
   alias?: string | null;
@@ -154,7 +154,7 @@ export function acctAlias(a: AcctRow): string {
 }
 
 /** claude 계정이 지금 어느 폴더에도 로그인돼 있지 않은가 — current_profiles 가 (쓸 수 있는 원소가 없는) **배열로 있을 때만**.
- *  키가 없는 구버전 데몬은 판정하지 않는다(false). Control Center 의 '이전 로그인' 배지가 쓴다.
+ *  키가 없는 행(구버전 데몬 또는 신 데몬이 이번에 읽지 못한 폴더가 낀 행)은 판정하지 않는다(false). Control Center 의 '이전 로그인' 배지가 쓴다.
  *  ★(성찰 1회차 R1F-UB · S2 m-1 ⓑ) **in_use === true 인 계정은 '이전 로그인'이 아니다** — 좌석 폴더가 열거 밖(`CYS_ACCOUNT_DIR` 임의 경로 · 부서 카탈로그의 임의 계정 폴더)이면
  *  데몬이 `in_use:true` 와 `current_profiles:[]` 를 함께 보낸다(`in_use` 는 좌석 폴더의 신원으로, `current_profiles` 는 열거된 폴더의 신원으로만 만든다 — 출처가 다르다).
  *  지금 쓰이는 계정을 '이전'이라 부르면 모순이다 — 데몬 쪽 원인 수정과 별개로 화면이 구 데몬·혼재 구성에서도 모순을 내지 않게 막는다. */
@@ -177,7 +177,7 @@ function folderLabel(profiles: unknown): string | null {
  *  · current_profiles 가 배열로 있으면 **그것만**으로 폴더 라벨을 만든다(profiles 는 추가 전용이라 옛 로그인 폴더가 남아 있다).
  *    폴더 라벨을 하나도 못 만들면(보통 빈 배열 = 지금은 어느 폴더에도 로그인돼 있지 않다) claude 는 'Claude (이전 로그인)',
  *    그 밖은 제공자 라벨. ★단 **in_use === true 면 '이전 로그인'이 아니다**(R1F-UB · S2 m-1 ⓑ — isPreviousLogin 과 같은 규칙) — 아래 profiles 폴백을 쓴다.
- *  · 키가 없으면(구버전 데몬) 종전처럼 profiles 로 만든다. */
+ *  · 키가 없으면(구버전 데몬 또는 신 데몬이 이번에 읽지 못한 폴더가 낀 행) 종전처럼 profiles 로 만든다. */
 export function accountShortLabel(a: AcctRow): string {
   const alias = acctAlias(a);
   if (alias) return alias;
@@ -191,7 +191,7 @@ export function accountShortLabel(a: AcctRow): string {
 }
 
 /** 이 계정의 '설정 폴더' 표시 목록(툴팁용) — current_profiles 가 배열이면 그것(추가 전용 profiles 에 남은 옛 로그인 폴더는 쓰지 않는다 · 라벨과 같은 규칙),
- *  키가 없으면(구버전 데몬) 종전 profiles. 단 in_use === true 인데 current_profiles 에서 쓸 폴더가 하나도 안 나오면(좌석 폴더가 열거 밖) 라벨처럼 profiles 로 폴백한다
+ *  키가 없으면(구버전 데몬 또는 신 데몬이 이번에 읽지 못한 폴더가 낀 행) 종전 profiles. 단 in_use === true 인데 current_profiles 에서 쓸 폴더가 하나도 안 나오면(좌석 폴더가 열거 밖) 라벨처럼 profiles 로 폴백한다
  *  (R1F-UB · S2 n-9 ⓐ · m-1 ⓑ). */
 function shownProfiles(a: AcctRow): unknown {
   if (Array.isArray(a.current_profiles) && !(a.in_use === true && normalizeProfiles(a.current_profiles).length === 0)) return a.current_profiles;
@@ -760,9 +760,11 @@ export function buildUsageBarModel(
   const cut = all.slice(USAGE_OTHERS_MAX);
   const cutObserved = cut.filter((l) => !l.unobserved);
 
-  // 접힘 요약 — 관측 계정이 두 제공자 이상이면 제공자별 약식, 아니면 종전 형식(주 계정의 두 창). 주 계정이 오래된 값이면 끝에 '(오래됨)'.
+  // 접힘 요약 — 관측 계정이 두 제공자 이상이면 제공자별 약식, 아니면 종전 형식(주 계정의 두 창). 종전 형식에서 주 계정이 오래된 값이면 끝에 '(오래됨)'.
+  // ★R2F-UI(A3 m3): 제공자별 약식에는 그 꼬리를 붙이지 않는다 — 약식에서는 오래된 값마다 이미 `?` 가 붙고(providerSummary), 꼬리는 **주 계정** 한 곳의 신선도라 숫자·색이 보는
+  //   다른 계정과 어긋난 귀속이었다(주 계정이 40분 묵었고 같은 제공자의 다른 계정이 방금 96% 로 관측되면 '96%' 에 '(오래됨)' 이 붙었다).
   const sum = providerSummary(list.filter(isObserved), nowSec);
-  const headline = (sum ? sum.short : pv.map((w) => `${w.label} ${w.text}`).join(" · ")) + (primaryStale ? " (오래됨)" : "");
+  const headline = sum ? sum.short : pv.map((w) => `${w.label} ${w.text}`).join(" · ") + (primaryStale ? " (오래됨)" : "");
   // ★R1F-UB(S2 m-3): 색은 **줄에 실린 값**으로 계산한다 — 제공자별 약식이면 요약에 실린 값들(sum.sev · 오래됨 `?` 제외), 한 제공자뿐이면 종전대로 주 계정의 두 창
   //   (오너 결재 "주 계정 = 사용 중 우선" — 그 경우의 동작은 바꾸지 않는다). 종전엔 약식에서도 주 계정 창만 봐서 96% 계정이 숫자로는 실리고 색은 무색이었다.
   const headlineSev: UsageBarModel["headlineSev"] = sum
