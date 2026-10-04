@@ -564,6 +564,9 @@ import javis_preflight as pf  # noqa: E402 — 핀의 SOT 는 preflight
 PACK_DIR = os.path.dirname(BIN)
 REPO_DIR = os.path.dirname(PACK_DIR)
 DIRECTIVES_DIR = os.path.join(PACK_DIR, "directives")
+# ★R2F-PK(A5 m7): 바이트 예산 핀(test_directive_byte_budget_ratchet)은 **저장소의 실제 지침 파일**을 잰다 — 위 DIRECTIVES_DIR 은 '정당한 편집이 전체 검체를 통과하는가'를 재는 검체
+#   (test_triage_positive_controls_pass_through_full_suite)가 임시 사본으로 바꿔 끼우는데, 그 사본은 일부러 조항에 주석을 끼워 크기가 늘어난다 — 예산은 그 가정의 사본이 아니라 출하되는 파일에 건다.
+REAL_DIRECTIVES_DIR = DIRECTIVES_DIR
 TEMPLATE_PATHS = {
     "CLAUDE.md.template": os.path.join(PACK_DIR, "CLAUDE.md.template"),
     # 저장소 사본은 배포 팩에는 없다(그때는 그 사본만 건너뛴다 — 템플릿은 언제나 있어야 한다).
@@ -2417,6 +2420,16 @@ class CsoDirectiveRevision(unittest.TestCase):
         # 이 백로그 가드를 '고치기' 위해 구독을 삭제하지 않는다.
         self.assertIn("cys events --category feed --category watchdog --category queue",
                       self.raw["MASTER_DIRECTIVE.md"])
+
+    def test_directive_byte_budget_ratchet(self):
+        """지침 바이트 예산 핀(0.14.43 성찰 2회차 R2F-PK · A5 m7): 릴리스 노트가 이번 판의 규칙으로 적은 "지침의 바이트·줄 수를 늘리지 않는다"는 수기 측정으로만 지켜졌다 — 57,368·99,272·107,886 이라는
+        숫자를 강제하는 검체가 저장소에 없었다(CSO 는 여유가 3 B). 줄 수는 CEO 합성 제출단위 핀이 간접으로 막지만 바이트는 아무것도 막지 않는다.
+        ★래칫: 지침을 **줄이면 아래 상한도 함께 낮춘다** — 줄인 커밋이 이 숫자를 새 크기로 내리지 않으면 그 여유가 다음 증가를 조용히 받아 준다. 늘려야 할 때는 이 숫자를 올리는 것이 아니라 먼저 다른 곳을 줄인다
+        (예산을 올리는 변경은 그 사유를 커밋 메시지에 적는다 — 이 핀이 붉어지는 순간이 그 결정을 사람 눈에 올리는 자리다). 단위 = 파일의 UTF-8 바이트(줄바꿈 포함)."""
+        size = lambda name: os.path.getsize(os.path.join(REAL_DIRECTIVES_DIR, name))   # 실제 파일(전체 검체 재실행이 DIRECTIVES_DIR 을 임시 사본으로 바꿔도 영향 없다)
+        self.assertLessEqual(size("CSO_DIRECTIVE.md"), 57368, "CSO_DIRECTIVE.md 바이트 예산(57,368) 초과 — 늘리지 말고 줄여라(줄이면 이 상한도 낮춘다)")
+        self.assertLessEqual(size("MASTER_DIRECTIVE.md"), 99272, "MASTER_DIRECTIVE.md 바이트 예산(99,272) 초과 — 늘리지 말고 줄여라(줄이면 이 상한도 낮춘다)")
+        self.assertLessEqual(size("CEO_TEMPLATE.md"), 107886, "CEO_TEMPLATE.md 바이트 예산(107,886) 초과 — 늘리지 말고 줄여라(줄이면 이 상한도 낮춘다 · 생성물이라 MASTER 와 머리글 바이트가 함께 든다)")
 
     def test_utf8_and_lf(self):
         """세 지시문 모두 엄격 UTF-8 로 읽히고 CRLF 가 없어야 한다(Windows 체크아웃 회귀)."""

@@ -11,9 +11,11 @@
 # 사용:   scripts/check-no-ioreport-link.sh <cysd 바이너리 경로>
 # 판정:   `otool -L <바이너리>` 의 **의존 라이브러리 줄**(탭 들여쓰기 — 첫 줄 `<경로>:` 와 fat 바이너리의 `(architecture …):` 머리는 제외)에
 #         `IOReport`(대소문자 무시)가 있으면 실패.
-# 종료:   0 = 통과(IOReport 링크 없음) 또는 건너뜀(macOS 가 아니거나 otool 이 없다 — 리눅스·윈도우 러너에서 깨지지 않게)
+# 종료:   0 = 통과(IOReport 링크 없음) 또는 건너뜀(macOS 가 아니다 — 리눅스·윈도우 러너에서 깨지지 않게)
 #         1 = 실패(IOReport 링크 발견 — 그 줄을 출력한다)
-#         2 = 판정 불가(인자 누락 · 파일 없음 · otool 실패 · 의존 라이브러리 줄 0건). 측정 불능은 통과가 아니다.
+#         2 = 판정 불가(인자 누락 · 파일 없음 · **macOS 인데 otool 이 없다** · otool 실패 · 의존 라이브러리 줄 0건). 측정 불능은 통과가 아니다.
+#         (★0.14.43 성찰 R2F-PK · A4 m2: 종전에는 '맥인데 otool 이 없다'도 건너뜀(통과)이었다 — 이 게이트는 맥 러너에서만 의미가 있는데 거기서 도구가 없다는 것은 '재지 못했다'이지 '링크가 없다'가 아니다.
+#          같은 스크립트의 다른 갈래(아래 파일 없음·otool 실패·의존 줄 0건 = 2)와 맞췄다. 세 갈래(0/1/2)를 재는 검체: scripts/tests/test_check_no_ioreport_link.py — 브랜치 CI 가 매 push 돈다.)
 #
 # 한계(정직): 로드 명령(LC_LOAD_DYLIB·약한/재수출/지연 로드)만 본다. `dlopen` 으로 런타임에 여는 것은 의도된 방식이라 여기 나오지 않는다.
 #   정적 라이브러리로 IOReport 를 섞어 넣는 경우(공개 .a 가 없다)도 이 검사가 잡는 대상이 아니다. 이 스크립트는 macOS 에서만 판정한다.
@@ -27,16 +29,18 @@ if [ "$#" -lt 1 ] || [ -z "${1:-}" ]; then
 fi
 bin="$1"
 
-# 맥이 아니거나 otool 이 없으면 건너뜀 — 리눅스·윈도우 러너에서 깨지지 않게 통과로 센다(건너뛴 사실은 한 줄로 남긴다).
+# 맥이 아니면 건너뜀 — 리눅스·윈도우 러너에서 깨지지 않게 통과로 센다(건너뛴 사실은 한 줄로 남긴다). Mach-O 가 없는 곳에는 otool -L 이 판정할 대상이 없다.
 os="$(uname -s 2>/dev/null || echo unknown)"
 if [ "$os" != "Darwin" ]; then
   echo "$me 건너뜀: macOS 가 아니다($os) — otool -L 은 Mach-O 전용이다"
   exit 0
 fi
+# ★R2F-PK(A4 m2): **맥인데 otool 이 없으면 판정 불가(exit 2)다 — 건너뜀(통과)이 아니다.** 이 게이트가 의미 있는 곳이 바로 맥(브랜치 CI 맥 레인 · 릴리스 맥 레그)이고, 거기서 otool 이 없다는 것은
+#   Xcode Command Line Tools 가 없거나 PATH 가 깨졌다는 뜻이다 — 그 상태의 '건너뜀 0'은 링크가 없다는 증거가 아니라 **재지 못했다**는 사실이다(측정 불능은 통과가 아니다 · 이 파일 아래 갈래들과 같은 계급).
 if ! command -v otool >/dev/null 2>&1; then
-  echo "::warning::$me 건너뜀: otool 이 없다(Xcode Command Line Tools 부재) — 이 러너에서는 IOReport 링크를 재지 못했다"
-  echo "$me 건너뜀: otool 이 없다"
-  exit 0
+  echo "::error::$me 판정 불가: macOS 인데 otool 이 없다(Xcode Command Line Tools 부재 또는 PATH 문제) — 이 러너에서는 IOReport 링크를 재지 못했다. 측정 불능은 통과가 아니다(exit 2)" >&2
+  echo "$me 판정 불가: otool 이 없다(macOS 에서는 건너뛰지 않는다 · exit 2)" >&2
+  exit 2
 fi
 
 if [ ! -f "$bin" ]; then

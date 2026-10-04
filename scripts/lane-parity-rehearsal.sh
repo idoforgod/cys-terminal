@@ -553,6 +553,7 @@ DOC_OK_EOF
   #   ②`if: false`(완전 레인의 등재되지 않은 조건 · D9)
   #   ③필수 명령 소거(`cargo test --bin cysd` 스텝 이름·실행 줄 변조 · D4)
   #   ④필터 가드 삭제(`cargo_filter_count --lib readiness::` 선행 호출 제거 · D10)
+  #   ⑤~⑦ UI 회귀·타입체크(U4 C4-⑧) · ⑧~⑫ IOReport 링크 게이트·hwmon 스텝(R2F-PK · A4 n6) — 아래 각 변이 앞의 주석 참조.
   MUT_ROOT="$SELF_TMP/mut"
   mut_reset() {
     rm -rf "$MUT_ROOT"; mkdir -p "$MUT_ROOT/.github/workflows"
@@ -648,6 +649,55 @@ t = t.replace(a, "          echo skipped-typecheck\n", 1)
 open(p, "w", encoding="utf-8", newline="").write(t)
 PYM
   mut_expect 1 "UI 타입체크 실행 줄만 소거(ci-branch tsc -p tsconfig.check.json · 스텝 이름은 유지)" "typescript@7.0.2 tsc -p tsconfig.check.json"
+  # ★R2F-PK(성찰 2회차 · A4 n6): 1회차가 더한 **IOReport 링크 게이트**와 **hwmon 스텝**이 레인 게이트의 필수 목록에 올라 있는가(누가 스텝을 지우거나 `if: false` 를 달아도 붉어지게).
+  #   ⑧ ci-branch IOReport 게이트 실행 줄 소거(스텝 이름은 유지 — MAJOR-1 교훈) ⑨ release 맥 레그 IOReport 게이트 실행 줄 소거 ⑩ ci-branch IOReport 게이트 스텝에 `if: false`
+  #   ⑪ ci-branch hwmon 좁힘을 모듈 전체 skip 으로 되돌림 ⑫ windows-health hwmon 전용 스텝의 실행 줄·가드 소거(필수 필터형 실행 — 남은 필터형 실행이 있어도 붉어야 한다)
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "          bash scripts/check-no-ioreport-link.sh target/debug/cysd\n"
+assert t.count(a) == 1, "변이 앵커 부재(ci-branch IOReport 게이트 실행 줄)"
+t = t.replace(a, "          echo skipped-ioreport-gate\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "IOReport 게이트 실행 줄만 소거(ci-branch · 스텝 이름은 유지)" "check-no-ioreport-link.sh target/debug/cysd"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/release.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = '          bash scripts/check-no-ioreport-link.sh "$SRC/macos/cys.app/Contents/MacOS/cysd"\n'
+assert t.count(a) == 1, "변이 앵커 부재(release IOReport 게이트 실행 줄)"
+t = t.replace(a, "          echo skipped-ioreport-gate\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "IOReport 게이트 실행 줄 소거(release 맥 레그)" 'check-no-ioreport-link.sh "$SRC/macos/cys.app/Contents/MacOS/cysd"'
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "      - name: cysd 산출물 IOReport 링크 게이트 (otool -L · macOS)\n"
+assert t.count(a) == 1, "변이 앵커 부재(ci-branch IOReport 게이트 스텝 이름)"
+t = t.replace(a, a + "        if: false\n", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "IOReport 게이트 스텝 소등(ci-branch 스텝 수준 if: false)" "if: false"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/ci-branch.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+a = "cargo test --bin cysd -- --test-threads=1 --skip hwmon::tests::snapshot_has_all_sections"
+assert t.count(a) == 1, "변이 앵커 부재(ci-branch cysd 스텝의 hwmon 좁힘 실행 줄)"
+t = t.replace(a, "cargo test --bin cysd -- --test-threads=1 --skip hwmon::", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "hwmon 좁힘을 모듈 전체 skip 으로 되돌림(ci-branch)" "--skip hwmon::tests::snapshot_has_all_sections"
+  mut_reset; python3 - "$MUT_ROOT/.github/workflows/windows-health.yml" <<'PYM'
+import sys
+p = sys.argv[1]; t = open(p, encoding="utf-8").read()
+g = "          cargo_filter_count --bin cysd hwmon::\n"
+r = '          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd hwmon:: -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections 2>&1 | tee "$LOG"\n'
+assert t.count(g) == 1 and t.count(r) == 1, "변이 앵커 부재(windows-health hwmon 전용 스텝의 가드·실행 줄)"
+t = t.replace(g, "", 1).replace(r, "", 1)
+open(p, "w", encoding="utf-8", newline="").write(t)
+PYM
+  mut_expect 1 "hwmon 전용 스텝 소거(windows-health · 가드와 실행 줄 모두)" "필수 필터형 실행"
 
   echo
   echo "── 자기 검체 3: 5단계(우분투 사전 레인 동일성)의 변이 대조 ──────────────────"

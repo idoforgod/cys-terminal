@@ -480,7 +480,7 @@ usage: cys-dept <verb> ...
   cys-dept down <name> [--purge-state]          teardown(+state 격리)
   cys-dept down-sock <socket>                   socket 기준 teardown
   cys-dept rotate <name>                        버전 스큐 세대교체(재기동·폐기 아님)
-  cys-dept reap [--dry]                         죽은 등록·유휴 부서 회수
+  cys-dept reap [--dry]                         죽은 등록·유휴 부서 회수(방금 예약돼 부팅 중인 등재는 유예 동안 건너뜀 — 유예 = max(CYS_DEPT_REAP_GRACE 60, 예약 유예) · 사유는 출력에 나온다)
   cys-dept promote-ceo                          CEO 승격(오너 지명)
   cys-dept promote-if-pending [--request-only]  보류 승격 해소(알림만=--request-only)
   cys-dept list                                 부서명 목록
@@ -867,6 +867,67 @@ finally: _ulk(lf)
 PY
 }
 
+# ★0.14.43 R2F-PK(S4 §4-2 · 윈도우 11 실측 W11/FINDINGS §9) 예약 재기록 — 생성자가 **데몬을 띄우기 직전에** 자기 예약의 `reserved_at` 을 지금 시각으로 한 번 다시 찍는다(create·allocate 공통 · 호출 지점은 각 동사의 스폰 분기 첫머리).
+#   왜: 예약은 사전 검사(`ready` — 맥 약 13초 · 윈도우 약 28초) **전에** 찍히므로, 예약 → 소켓이 열리기까지가 윈도우에서 약 39초(실측)라 기본 유예 25초보다 길었다. 그 사이에 같은 카탈로그 키로 다시 부르면 뒤 호출이 앞 호출을
+#   '죽은 예약'으로 읽어 데몬을 중복 기동한다(0.14.42 부터의 틈). 스폰 직전에 시각을 다시 찍으면 유예가 덮을 것은 '스폰 뒤 대기'뿐이다.
+#   인자: $1=이름 · $2=종류(`create`|`alloc`) · $3=확인 값(create = 카탈로그 mission_key · alloc = 팀 제안 b64 — 번호 팀이면 빈 값). 쓰는 조건(전부 **같은 flock 안** — REUSE_DEAD 갈래가 `reserved_at=now` 를 쓰는 것과 같은 잠금 쓰기):
+#     ① 그 이름의 등재가 **아직 있다**(없으면 새로 만들지 않는다 — 등재가 없으면 만들어 쓰는 `reg_set_field` 를 일부러 쓰지 않는다) ② 이미 `reserved_at` 이 있는 **예약**이다 ③ **내 예약**이다 — create 는 mission_key 가 같을 때 · 팀 제안 allocate 는
+#     team_proposal_id 가 같을 때 · 번호 팀 allocate 는 mission_key·team_proposal_id 가 둘 다 없을 때(다른 부서가 같은 이름을 받아 갔으면 그 부팅 창을 늘려 주지 않는다). 다른 키·모르는 키는 그대로 둔다(load → 그 필드만 → dump).
+#   ★최선 노력: 어떤 이유로든(잠금·판독·쓰기 실패 · 등재 없음 · 내 예약 아님 · python 부재) 실패해도 생성은 계속한다 — 이 함수는 늘 0 을 돌려주고(`set -e` 안전) 못 찍었으면 stderr 에 1줄만 남긴다(유예가 원래 예약 시각 기준으로 남는다는 사실).
+#   판독 실패(rc 10 계열)로 쓰기 동사 전체를 끊는 다른 도우미와 달리 여기서는 끊지 않는다: 이 쓰기는 없어도 생성이 성립하고(종전 동작), 손상 원본은 읽기만 했으므로 그대로 보존된다 — 이어지는 필수 쓰기(`reg_set_meta` 등)가 같은 사유로 알맞게 멈춘다.
+#   argv 의 `restamp:<종류>` 는 검체가 이 호출을 가려내는 표지다(인터프리터 이름 뒤 첫 인자들 — 다른 도우미의 인자와 겹치지 않는다).
+reg_restamp(){
+  local _rs_out
+  _rs_out="$(reg_init; python3 - "$REG" "$1" "restamp:$2" "${3:-}" <<'PY' | tr -d '\r'
+import json,sys,os,time
+try:
+    import fcntl
+    def _lk(f): fcntl.flock(f, fcntl.LOCK_EX)
+    def _ulk(f): fcntl.flock(f, fcntl.LOCK_UN)
+except ImportError:  # RC-6 Windows: fcntl 부재 → msvcrt 바이트락(파일 닫힘 시 해제·_ulk no-op 안전)
+    import msvcrt
+    def _lk(f):
+        try: msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+        except OSError: pass
+    def _ulk(f): pass
+def main():
+    p,n,kind,val=sys.argv[1:5]
+    kind=kind[len("restamp:"):]
+    lf=open(p+'.lock','w'); _lk(lf)
+    try:
+        try: d=json.load(open(p, encoding="utf-8-sig"))
+        except Exception: return "READFAIL"
+        e=((d.get('depts') or {}) if isinstance(d,dict) else {}).get(n)
+        if not isinstance(e,dict): return "ABSENT"
+        mine='reserved_at' in e
+        if kind=='create': mine=mine and e.get('mission_key')==val
+        elif val:
+            import base64
+            try: tid=json.loads(base64.urlsafe_b64decode(val.encode('ascii')).decode('utf-8'))['id']
+            except Exception: tid=None
+            mine=mine and tid is not None and e.get('team_proposal_id')==tid
+        else: mine=mine and not e.get('mission_key') and not e.get('team_proposal_id')
+        if not mine: return "NOTMINE"
+        e['reserved_at']=time.time()
+        tmp=p+'.tmp.%d'%os.getpid()
+        with open(tmp,'w',encoding='utf-8') as f: json.dump(d,f,ensure_ascii=False,indent=2); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp,p)
+        return "OK"
+    finally: _ulk(lf)
+try: print(main())
+except Exception as ex: print("ERR:"+type(ex).__name__)
+PY
+)" || _rs_out="ERR"
+  case "$_rs_out" in
+    OK) ;;
+    ABSENT) echo "[cys-dept] WARN: $1 예약 시각(reserved_at) 재기록 생략 — 그 이름의 등재가 이미 없다(새로 만들지 않는다). 생성은 계속한다" >&2 ;;
+    NOTMINE) echo "[cys-dept] WARN: $1 예약 시각(reserved_at) 재기록 생략 — 그 등재는 내 예약이 아니다(다른 키·다른 제안). 생성은 계속한다" >&2 ;;
+    READFAIL) echo "[cys-dept] WARN: $1 예약 시각(reserved_at) 재기록 생략 — 등재(depts.json)를 읽지 못했다(원본은 그대로). 유예가 원래 예약 시각 기준으로 남는다. 생성은 계속한다" >&2 ;;
+    *) echo "[cys-dept] WARN: $1 예약 시각(reserved_at) 재기록 실패(${_rs_out:-ERR} — 잠금·쓰기 오류). 유예가 원래 예약 시각 기준으로 남는다. 생성은 계속한다" >&2 ;;
+  esac
+  return 0
+}
+
 # 부서 팩 agents.json 이 실제로 가리키는 계정 dir(=시드된 값) 출력. 없으면 빈 출력.
 # ★J5 M3(codex 9차 major · cys-dept:1557): 이 폴백 출력에는 **CR 정규화가 없었다**. Windows
 #   PortableGit 의 네이티브 python 은 텍스트 모드라 `print()` 가 `\r\n` 을 낸다 — `reg_names`·
@@ -945,25 +1006,33 @@ ready(){ local s="$1" i; for i in $(seq 1 120); do CYS_SOCKET="$s" "$CYS" ping >
 #          seat(부서장 자리 단계 직전 · 그 단계가 있는 경로만) · done(성공 종료 직전 = 이름을 stdout 에 내기 직전).
 #      넣은 동사: allocate·create 뿐(launch·rotate·down 등은 무변경). 순서: 신규 reserve→probe→spawn→wait→up→(seat)→done ·
 #      재사용 reserve→probe→up→(seat)→done · create 조기 반환(REUSE_UP·REUSE_BOOTING)은 reserve→done · 실패는 낸 데까지(done 없음).
+#      ★계약(0.14.43 성찰 R2F-PK · A3 n2): **화면은 `spawn` 표지의 유무로 '이 호출이 새 데몬을 띄웠다(새 팀)'를 판정한다**(새 팀 안내·표지가 그것으로 갈린다 — `ui/src/main.ts` 의 `pendingSpawned`) —
+#      재사용 갈래(사전 검사가 이미 켜진 데몬을 찾은 경우 · create 의 REUSE_UP·REUSE_BOOTING 조기 반환)에서 `spawn` 을 내면 안 된다(기존 팀에 '새 팀을 만들었다' 안내가 뜬다). 키 철자와 함께 **언제 내는가**도 계약이다.
 dept_stage(){ echo "[cys-dept] @stage $1" >&2; }
 
-#   ② 스폰 **뒤** 소켓 대기 예산 노브 `CYS_DEPT_READY_SECS`(정수 12~180 · 그 밖은 전부 12 = 종전). 스폰 뒤 대기 3곳(launch·allocate·create)
-#      만 `ready_wait` 로 읽는다. **사전 검사 3곳은 `ready` 그대로(12초 고정)** — 거기를 늘리면 새 팀마다 그만큼 더 기다린다.
-#      기본(미설정)에서 `ready_wait` 는 `ready` 와 같은 횟수(120)라 동작이 종전과 같다.
-#   ★상한이 180 인 까닭(0.14.43 성찰 R1F-PK · S4 m2): 부트 폴백(`javis_bootstrap.py` — `cys-dept allocate` 를 기본 240초 `subprocess.run(timeout)` 으로 부른다)이 그 시간을
-#      넘기면 자식을 SIGKILL 한다 — bash 의 EXIT 트랩이 돌지 않아 예약(레지스트리 등재)과 띄운 데몬이 남는다. 실패 경로의 실소요는 사전 검사(약 14초) + 스폰 뒤 대기
-#      (노브 × 약 1.18초 — 반복 1회 = `sleep 0.1` + 핑 프로세스 ≈ 0.118초 · 성찰 실측)라 노브 180 이면 약 226초 < 240초다. 상한을 넘는 값은 12(종전 동작)로 읽는다 —
-#      이 노브는 0.14.43 에서 새로 생겼으므로 그 전 판과의 호환 문제는 없다.
-#   ★왜 기본값을 올리지 않았나(유예와의 결합): create 의 예약 유예 `CYS_DEPT_RESERVE_GRACE`(기본 25초)는 "생성자가 부팅 중"으로 믿어 주는 창이다
-#      (REUSE_BOOTING). 유예가 지나고 소켓이 죽어 있으면 뒤따라온 호출이 REUSE_DEAD 로 **데몬을 다시 띄운다**. 25 는 사전 검사 + 스폰 뒤 대기의 합(약 25.6~28초)보다
-#      이미 조금 짧다 — 이 작은 틈은 0.14.42 에도 있었고 이번 판은 기본 동작을 바꾸지 않는다. 스폰 뒤 대기만 늘리면 그 틈이 노브만큼 벌어져 **중복 기동 경합**이 더 열린다.
-#      그래서 (a) 기본은 올리지 않았다(기본 상향은 윈도우 실기 측정 뒤) (b) 노브를 12 보다 크게 올리면 아래 dept_reserve_grace 가 유예를 `노브 + 노브/5 + 17`(정수 나눗셈 —
-#      반복당 0.118초 + 예약→사전 검사 구간의 여유)까지 따라 올려 **틈을 줄인다**. 다만 그 식은 공칭 기준이라 실제 대기보다 수 초~수십 초 짧을 수 있다 — 틈을 닫는 것이 아니라
-#      줄이는 것이다. 노브가 12 이하(기본·무효 값 포함)면 유예는 종전 인라인 식 그대로다(명시한 낮은 값·비정수도 종전과 같다).
+#   ② 스폰 **뒤** 소켓 대기 예산 노브 `CYS_DEPT_READY_SECS`(정수 12~180 · 그 밖은 전부 12 = 종전 — 비어 있지 않은데 무효이면 stderr 경고 1줄 · 미설정·빈 값·유효 값은 경고 없음). 스폰 뒤 대기 3곳(launch·allocate·create)
+#      만 `ready_wait` 로 읽는다. **사전 검사 3곳은 `ready` 그대로(120회 고정)** — 거기를 늘리면 새 팀마다 그만큼 더 기다린다.
+#      기본(노브 ≤ 12)에서 `ready_wait` 는 `ready` 와 같은 횟수(120)이고 시계를 한 번도 읽지 않아 동작이 종전과 같다.
+#   ★'초'의 정의(0.14.43 성찰 R2F-PK · 윈도우 11 러너 실측 W11/FINDINGS §9·§10): 반복 1회 = `sleep 0.1` + 핑 프로세스 1개라 맥 약 0.118초 · 윈도우 11(ARM64 러너 · x64 에뮬레이션) 약 0.237초다(사전 검사 120회 = 27.4~28.4초).
+#      종전의 횟수만 세는 대기는 노브의 '초'가 벽시계가 아니라 횟수(초 × 10)여서 윈도우에서 노브 1초가 실제 약 2.4초였다 → 노브 89 이상이면 실패 경로가 부트 폴백의 240초를 넘었다. 그래서 횟수 상한(초 × 10)은 **그대로** 두고
+#      벽시계 상한을 **더한다**: 첫 120회는 시계를 보지 않고(= 기본 경로와 같은 횟수 — 어느 플랫폼에서도 기본보다 짧아지지 않는다 · 노브 13~28 이 윈도우에서 기본보다 일찍 포기하는 비단조를 막는다), 121번째 반복부터
+#      `$SECONDS` 경과가 노브 초에 닿으면 끝낸다. bash 3.2·Git Bash 호환(정수 `$SECONDS` 만 쓴다 — 1초 단위라 기한은 최대 약 1초 + 반복 1회만큼 넘을 수 있다).
+#   ★상한이 180 인 까닭(0.14.43 성찰 R1F-PK · S4 m2 → R2F-PK 에서 수치 정정): 부트 폴백(`javis_bootstrap.py` — `cys-dept allocate` 를 **240초 고정** `subprocess.run(timeout)` 으로 부른다. `_budget_leaf("CYS_DEPT_FB_ALLOC_S", 240)` 의 그 키는
+#      `javis_budget.LEAF_FLOORS` 에 없어 KeyError → 폴백 240 이 늘 쓰인다 = 호출자가 낮추거나 조정할 길이 없다)이 그 시간을 넘기면 자식을 SIGKILL 한다 — bash 의 EXIT 트랩이 돌지 않아 예약(레지스트리 등재)과 띄운 데몬이 남는다.
+#      실패 경로(스폰 뒤 응답이 끝내 없을 때)의 실소요 상한 = 사전 검사 + max(노브, 첫 120회의 실제 시간). 사전 검사는 120회 고정이라 맥 약 13~14초 · 윈도우 11 러너 약 28.4초(예약→검사 약 2.1초가 따로 든다)이고, 첫 120회의 실제 시간도
+#      같은 모양의 루프라 같은 값이다 → 노브 180 에서 윈도우 약 211초(2.1 + 28.4 + 180) · 맥 약 194초(14 + 180) — 둘 다 240초 안이다. (이 주석의 종전 '226초 < 240초'는 맥에서 횟수만 센 옛 수치였다 — 같은 횟수 기준을 윈도우에 대면 노브 89 이상부터 240초를 넘는다.)
+#      상한을 넘는 값은 12(종전 동작)로 읽는다 — 이 노브는 0.14.43 에서 새로 생겼으므로 그 전 판과의 호환 문제는 없다.
+#   ★왜 기본값을 올리지 않았나(유예와의 결합): create 의 예약 유예 `CYS_DEPT_RESERVE_GRACE`(기본 25초)는 "생성자가 부팅 중"으로 믿어 주는 창이다(REUSE_BOOTING). 유예가 지나고 소켓이 죽어 있으면 뒤따라온 호출이
+#      REUSE_DEAD 로 **데몬을 다시 띄운다**(중복 기동 경합). 예약은 사전 검사 **전**에 찍히는데 사전 검사가 맥 약 13초 · 윈도우 약 28초라, 종전에는 예약 → 소켓이 열리기까지가 윈도우에서 약 39초(실측)로 기본 유예 25초보다 길었다
+#      (같은 카탈로그 키를 25~39초 사이에 다시 만들면 데몬이 중복 기동 — 0.14.42 부터의 틈). 그래서(R2F-PK) 생성자가 **데몬을 띄우기 직전에 `reserved_at` 을 한 번 다시 찍는다**(`reg_restamp` — REUSE_DEAD 갈래와 같은 잠금 쓰기 · 그 등재가 아직 있고
+#      내 예약일 때만 · 최선 노력 — 실패해도 생성은 계속하고 등재를 새로 만들지 않는다 · allocate 의 예약에도 `reserved_at` 을 적는다). 그러면 유예는 사전 검사를 덮을 필요가 없고 **스폰 뒤 대기만** 덮으면 된다 → 기본값에서도 윈도우의 25~39초 틈이 닫힌다
+#      (성공 경로 기준 — 스폰 뒤 소켓까지 실측 8.3~8.5초 < 25초. 데몬이 끝내 안 뜨는 실패 경로의 스폰 뒤 대기는 같은 모양 120회의 실측 28.4초로 계산하면 윈도우 기본값에서 유예보다 약 3초 길다 — 그 약 3초는 남는다). 노브를 12 보다 크게 올리면 아래
+#      dept_reserve_grace 가 유예를 `노브 + 17`(재기록 → 스폰 사이와 첫 120회의 여유)까지 올린다 — 벽시계 상한이 생겨 종전의 `노브/5` 항(반복당 0.118초 초과분을 덮으려던 것)은 근거가 없어졌다. 노브가 12 이하(기본·무효 값 포함)면 유예는 종전 인라인 식
+#      그대로다(명시한 낮은 값·비정수도 종전과 같다).
 #   ★한계: 유예는 **뒤따르는 호출**이 자기 프로세스의 env 로 계산한다. 뒤따르는 호출이 같은 `CYS_DEPT_READY_SECS`(와 같은 유예 설정)를 보지 못하면
 #      (첫 호출에만 환경변수를 준 경우) 결합은 성립하지 않는다 — 노브는 모든 호출이 같은 값을 보는 자리(로그인 환경 등)에 둔다.
 #
-# 순수 해석 함수(인자 없음 · 부작용 없음): stdout = 유효 초. 정수 12~180 만 유효 — 빈 값·문자·음수('-')·소수('.')·12 미만·180 초과는 전부 12.
+# 순수 해석 함수(인자 없음 · 부작용 없음 · 경고도 내지 않는다 — 경고는 아래 dept_ready_knob_warn): stdout = 유효 초. 정수 12~180 만 유효 — 빈 값·문자·음수('-')·소수('.')·12 미만·180 초과는 전부 12.
 #   선행 0 은 10진으로 읽는다(`$(( ))` 에 날것으로 넣으면 08·09 가 8진 오류) — 선행 0 을 벗긴 뒤 3자리 이하만 비교에 넣는다(긴 숫자 넘침 방지).
 dept_ready_secs(){
   local v="${CYS_DEPT_READY_SECS:-}"
@@ -971,13 +1040,45 @@ dept_ready_secs(){
   while [ "${#v}" -gt 1 ] && [ "${v#0}" != "$v" ]; do v="${v#0}"; done
   if [ "${#v}" -le 3 ] && [ "$v" -ge 12 ] && [ "$v" -le 180 ]; then echo "$v"; else echo 12; fi
 }
-# `ready` 와 같은 모양(핑 + sleep 0.1)이되 반복 횟수 = dept_ready_secs × 10(기본 120 = `ready` 와 같다). 스폰 **뒤** 대기 전용.
-ready_wait(){ local s="$1" i n; n=$(( $(dept_ready_secs) * 10 )); for i in $(seq 1 "$n"); do CYS_SOCKET="$s" "$CYS" ping >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
+# ★0.14.43 R2F-PK(S4 m4) 노브 경고 — `CYS_DEPT_READY_SECS` 가 **비어 있지 않은데** 위 해석이 받아들이지 않은 값(범위 밖·비정수 → 12)이면 stderr 에 1줄. 미설정·빈 값·유효 값(선행 0 포함 — `060` = 60)에서는 아무것도 내지 않는다
+#   (기본 경로 무변경). 순수 함수 `dept_ready_secs` 는 한 실행에서 여러 번 불리므로(스폰 뒤 대기 · 유예 · 실패 문구) 경고를 거기 넣지 않고, `ready_wait` 도 소음 없는 자기완결로 두고 — 스폰 뒤 대기의 세 호출 지점
+#   (launch·allocate·create)이 `ready_wait` **직전에** 이 함수를 부른다(프로세스당 한 번만 낸다 — 아래 플래그).
+#   종전에는 범위 밖 값(예 300)이 말없이 12 가 되어 사용자가 아는 것은 실패 문구의 '12초' 뿐이었다(유예 쪽은 같은 상황에 경고 1줄이 있었다 — 비대칭). 값은 40자까지 한 줄로 접어 싣는다.
+dept_ready_knob_warn(){
+  local raw="${CYS_DEPT_READY_SECS:-}" v eff
+  [ -n "$raw" ] || return 0
+  [ -z "${_CYS_READY_KNOB_WARNED:-}" ] || return 0
+  v="$raw"
+  case "$v" in *[!0-9]*) ;; *) while [ "${#v}" -gt 1 ] && [ "${v#0}" != "$v" ]; do v="${v#0}"; done ;; esac
+  eff="$(dept_ready_secs)"
+  [ "$v" != "$eff" ] || return 0
+  _CYS_READY_KNOB_WARNED=1
+  v="$(printf '%s' "$raw" | tr '\r\n\t' '   ' | cut -c1-40)"
+  echo "[cys-dept] WARN: CYS_DEPT_READY_SECS='$v' 는 정수 12~180 이 아니라 12 로 읽는다(스폰 뒤 소켓 대기 예산 — 올리려면 12~180 사이 정수로 지정)" >&2
+  return 0
+}
+# `ready` 와 같은 모양(핑 + sleep 0.1)이되 반복 횟수 상한 = dept_ready_secs × 10(기본 120 = `ready` 와 같다) **그리고** 121번째 반복부터는 `$SECONDS` 경과가 노브 초에 닿으면 끝낸다(위 ② ★'초'의 정의). 스폰 **뒤** 대기 전용.
+#   첫 120회는 시계를 보지 않는다 — 기본 경로(노브 ≤ 12 → 최대 120회)는 시계를 한 번도 읽지 않아 종전과 같은 동작이다.
+#   `_READY_WAIT_SECS` = 이번 대기의 실제 경과(`$SECONDS` 차이 · 성공·실패 모두) — 실패 문구(ready_fail_note)가 '대기 예산'과 나란히 적는다.
+#   ★자기완결·무소음: 이 함수는 `dept_ready_secs`(순수 해석)만 부르고 stderr 에 아무것도 내지 않는다 — 무효 노브의 경고(dept_ready_knob_warn)는 **호출 지점**이 이 함수 앞에서 부른다
+#   (기존 횟수 핀 검체는 ready·ready_wait·dept_ready_secs 세 함수만 떼어 돌리고 무효 노브에서도 stderr 가 비어 있음을 못박는다 — 그 핀이 무수정으로 통과해야 한다).
+#   ★`SECONDS` 에 **대입하지 않는다**(셸 전체의 경과 기준이 흔들린다 — 검체의 가짜 시계만 민다). 대기 동작(횟수·간격·상한)은 위 정의 말고 바뀐 것이 없다.
+ready_wait(){
+  local s="$1" i n secs t0
+  secs="$(dept_ready_secs)"; n=$(( secs * 10 )); t0=$SECONDS
+  for i in $(seq 1 "$n"); do
+    if CYS_SOCKET="$s" "$CYS" ping >/dev/null 2>&1; then _READY_WAIT_SECS=$(( SECONDS - t0 )); return 0; fi
+    if [ "$i" -gt 120 ] && [ $(( SECONDS - t0 )) -ge "$secs" ]; then break; fi
+    sleep 0.1
+  done
+  _READY_WAIT_SECS=$(( SECONDS - t0 )); return 1
+}
 # create 의 예약 유예(초) — stdout = 파이썬 `CYS_GRACE` 로 넘길 값.
 #   노브(dept_ready_secs)가 12 이하(기본·무효 값 포함)면 종전 인라인 식 `${CYS_DEPT_RESERVE_GRACE:-25}` 를 **그대로** 낸다(같은 값 — 명시한 낮은 값·비정수도 종전과 같다 · 경고도 없다).
-#   노브를 12 보다 크게 올렸을 때만 `max(설정값 또는 25, need)` 를 낸다. need = `노브 + 노브/5 + 17`(정수 나눗셈) — 스폰 뒤 대기 반복 1회가 0.1초가 아니라 약 0.118초라 대기가 노브 × 1.18 로
-#   늘고, 17 은 사전 검사(약 14초)와 예약→검사 구간의 여유다. 셸 정수 비교로 계산하고 파이썬 쪽 GRACE 판독부는 무변경이다.
-#   ★공칭 기준이라 실제 대기(사전 검사 + 스폰 뒤 대기)보다 수 초~수십 초 짧을 수 있다 — 유예가 따라 올라 틈을 **줄일 뿐** 닫지는 못한다.
+#   노브를 12 보다 크게 올렸을 때만 `max(설정값 또는 25, need)` 를 낸다. need = `노브 + 17`(정수) — 생성자가 데몬을 띄우기 직전에 `reserved_at` 을 다시 찍으므로(reg_restamp) 유예는 '스폰 뒤 대기'만 덮으면 되고,
+#   그 대기의 상한이 벽시계로 묶여 있어(ready_wait — 노브 초, 첫 120회가 노브보다 길면 그 시간) 17 은 재기록 → 스폰 사이와 첫 120회의 여유다. (R2F-PK 이전의 `노브 + 노브/5 + 17` 은 횟수 기준의 초과분 — 반복당 0.118초 — 을 덮으려던 식이라 근거가 없어졌다.)
+#   셸 정수 비교로 계산하고 파이썬 쪽 GRACE 판독부는 무변경이다.
+#   ★공칭 기준이다: 윈도우 기본 경로의 실패 경로처럼 실제 대기가 유예보다 몇 초 길 수 있다 — 유예는 틈을 **줄일 뿐** 닫는다고 단정하지 않는다(성공 경로는 스폰 뒤 소켓까지 실측 8.3~8.5초라 닫힌다).
 #   `CYS_DEPT_RESERVE_GRACE` 가 정수가 아니면(소수 등) 노브와 무관하게 종전처럼 그대로 넘긴다(파이썬이 판독 — 종전 동작 보존) — max 는 **정수일 때만** 취한다. 단 노브를 올렸는데 정수가
 #   아니면 결합이 말없이 풀리므로 **stderr 경고 1줄**을 낸다(노브가 12 이하인 기본 경로에서는 경고 없음 · stdout 값은 그대로).
 #   ※ 노브를 올린 경우에만, 설정값이 정수이면서 `need` 보다 작으면 그 아래로는 내려가지 못한다 — 틈을 줄이려는 의도다(master 결정: 올림은 노브를 올렸을 때만).
@@ -989,14 +1090,26 @@ dept_reserve_grace(){
   case "$g" in *[!0-9]*)
     echo "[cys-dept] WARN: CYS_DEPT_READY_SECS=$secs 로 올렸지만 CYS_DEPT_RESERVE_GRACE='$g' 가 정수(초)가 아니라 유예를 노브에 맞춰 올리지 못한다 — 중복 기동 경합의 틈이 남을 수 있다. 정수로 지정하거나 비워라" >&2
     printf '%s\n' "$g"; return 0 ;; esac
-  need=$(( secs + secs / 5 + 17 ))
+  need=$(( secs + 17 ))
   d="$g"; while [ "${#d}" -gt 1 ] && [ "${d#0}" != "$d" ]; do d="${d#0}"; done
   if [ "${#d}" -le 9 ] && [ "$d" -lt "$need" ]; then printf '%s\n' "$need"; else printf '%s\n' "$g"; fi
 }
 #   ③ 스폰 뒤 대기 실패 문구의 꼬리(3곳 공통) — 기존 `[cys-dept] ERROR: <이름> 데몬 기동 실패` 를 접두로 **그대로** 두고 뒤에 붙인다(스트림·뒤따르는
 #      `sock_len_diag`·`reg_remove` 순서는 각 줄 종전 그대로). 로그 경로 = launch·allocate·create 의 cysd 스폰이 실제로 쓰는 리다이렉트 대상
 #      (`$(dept_logdir "$name")/cysd.log`)과 같다 — 세 곳 모두 그 표현이라 한 곳에서 만든다.
-ready_fail_note(){ printf ' (소켓 대기 %s초 · 로그: %s/cysd.log · 느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다)' "$(dept_ready_secs)" "$(dept_logdir "$1")"; }
+#      ★(R2F-PK · S4 m4) 숫자 둘: `대기 예산 N초` = 노브(스폰 뒤 대기의 공칭 상한) · `실제 약 M초` = 이번 `ready_wait` 의 `$SECONDS` 차이(`_READY_WAIT_SECS`) — 종전 '소켓 대기 N초'의 N 은 노브 값이지 경과가
+#      아니었다(기본값에서도 맥 약 13~14초 · 윈도우 약 28초를 기다린 뒤 '12초'로 보였다). 끝의 안내 예시는 **현재 값 기준**이다: 60 미만이면 종전 그대로 `=60`, 60 이상이면 그 두 배(상한 180)를, 이미 상한이면 늘릴 수 없다고 적는다
+#      (이미 60 이상으로 올린 사용자에게 '=60 처럼 늘릴 수 있다'고 안내하지 않는다).
+#      이 문구를 읽는 곳: 사람(화면 토스트 앞 300자) · 문서 인용(USER-MANUAL.md · docs/INSTALL.md · docs/RELEASE_NOTES_0.14.43.md) · 팩 검체(test_dept_create_progress.py) · 앱 쪽 검체 문자열(src-tauri `strip_stage_lines` 검체 ·
+#      ui/src/deptprogresswiring.test.ts)뿐이다 — 앱은 이 줄의 꼴을 해석하지 않는다(Tauri `strip_stage_lines` 는 `@stage` 줄만 뺀다).
+ready_fail_note(){
+  local secs adv
+  secs="$(dept_ready_secs)"
+  if [ "$secs" -ge 180 ]; then adv="대기 예산이 이미 상한(180초)이다 — 더 늘릴 수 없으니 로그를 확인하라"
+  elif [ "$secs" -ge 60 ]; then adv="CYS_DEPT_READY_SECS=$(( secs * 2 > 180 ? 180 : secs * 2 )) 처럼 더 늘릴 수 있다 · 상한 180초"
+  else adv="느린 디스크라면 CYS_DEPT_READY_SECS=60 처럼 대기 예산을 늘릴 수 있다"; fi
+  printf ' (대기 예산 %s초 · 실제 약 %s초 · 로그: %s/cysd.log · %s)' "$secs" "${_READY_WAIT_SECS:-?}" "$(dept_logdir "$1")" "$adv"
+}
 
 # allocate 계정격리(Fix1'): 기본계정 base config dir 해석. 카탈로그 accounts 맵 우선(있으면), 없으면
 # ~/.cys/claude-<account> 규약 fallback. 항상 경로를 산출(빈 문자열이면 호출부가 fail-closed).
@@ -1226,6 +1339,28 @@ for s in surfaces:
     if s.get("agent") is not None and role!="cso" and not role.startswith("reviewer"):
         print("ACTIVE:agent(%s/%s)"%(role or '-', s.get('agent'))); sys.exit(0)
 print("IDLE")
+PY
+}
+
+# ★0.14.43 R2F-PK(S4 m3) reap 의 '죽은 등록' 부팅 유예 판정(read-only) — 소켓이 아직 열리지 않은 등재는 **죽은 등록과 겉모습이 같다**: 부팅 중인 팀(create·allocate 가 예약 → 사전 검사 → 스폰 → 소켓 대기 중)도 `cys ping` 이 실패한다.
+#   종전 reap 은 그 갈래를 유예 없이 즉시 `reg_remove` 해, CSO 가 손으로 돌린 reap 이 부팅 중인 팀의 등재를 지웠다(데몬은 뜨는데 등재가 없는 팀 — 팀 제안이면 앱의 사후 대조가 '이 제안으로 만들어지지 않았다'로 실패를 보고한다).
+#   인자: $1=등재의 `reserved_at`(스냅샷 값 · 없으면 0) · $2=예약 유예(dept_reserve_grace 의 값). 유예 = max(`CYS_DEPT_REAP_GRACE`(기본 60 — 살아 있는 소켓에 쓰는 것과 같은 값), 예약 유예) — 노브를 올려 부팅이 길어진 컴퓨터에서는 그만큼 더 기다린다.
+#   rc 0 = 유예 안(건너뛴다 · stdout = `예약 N초 전 ≤ 유예 G초` 한 줄 — reap/`--dry` 출력이 그 사유를 보인다) · rc 1 = 유예 밖이거나 `reserved_at` 이 없다·읽을 수 없다(옛 등재 — 종전 그대로 죽은 등록). 숫자가 아닌 설정값은 기본값으로 접는다(이 판정이 reap 을 죽이지 않는다).
+dept_reap_boot_grace(){ CYS_REAP_GRACE="${CYS_DEPT_REAP_GRACE:-60}" CYS_RES_GRACE="${2:-25}" python3 - "${1:-0}" <<'PY'
+import sys,os,time
+def num(s, default):
+    try:
+        v=float(s)
+    except (TypeError, ValueError):
+        return default
+    return v if v==v and abs(v)!=float("inf") else default
+rat=num(sys.argv[1], 0.0)
+g=max(num(os.environ.get("CYS_REAP_GRACE"), 60.0), num(os.environ.get("CYS_RES_GRACE"), 25.0))
+if rat<=0: sys.exit(1)
+age=time.time()-rat
+if age<g:
+    print("예약 %.0f초 전 ≤ 유예 %g초"%(age,g)); sys.exit(0)
+sys.exit(1)
 PY
 }
 
@@ -1999,8 +2134,9 @@ launch_dept(){   # $1=name
         CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       fi
       disown
+      dept_ready_knob_warn   # ★0.14.43 R2F-PK(S4 m4): 비어 있지 않은 무효 노브 경고 1줄(미설정·유효 값은 무음) — 스폰 뒤 대기 직전
       # 기동 실패 시 reg_upsert 롤백 — 유령 부서(데몬 없는 레지스트리 항목) 잔류 방지
-      ready_wait "$sock" || { reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")"; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만) · ★0.14.43 GP: 스폰 뒤 대기 예산 노브 + 실패 문구 꼬리
+      ready_wait "$sock" || { _lf="$(ready_fail_note "$name")"; echo "[cys-dept] ERROR: $name 데몬 기동 실패${_lf}" >&2; reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")"; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만) · ★0.14.43 GP: 스폰 뒤 대기 예산 노브 + 실패 문구 꼬리 · ★R2F-PK(S4 m7): launch·rotate 실패는 stdout 줄만 있어 앱(stderr 만 올린다)에 꼬리가 닿지 않았다 → 같은 꼬리를 stderr 에도 한 줄(가산 — stdout 줄·순서·핀은 그대로)
     fi
     seed_schedule "$pack"   # owner-progress-report 제거(부서는 최상위 보고 안 함) — 데몬 30초 핫리로드로 반영
     # ★G3: 시드 검증(+자기치유) — 데몬 env 전파에 의존하지 않는 belt(구 cysd·재기동 경로 대비).
@@ -2124,7 +2260,7 @@ allocate_dept(){
     # 번호계산+예약을 단일 flock 블록에 묶어 TOCTOU 제거 — lowest-unused dept-N을 발급·예약(원자).
     # 시나리오2: 레지스트리엔 빠졌어도 소켓을 점유 중인(죽어가는) 데몬 번호는 alive() probe로 skip.
     name=$(reg_init; python3 - "$REG" "$TEAM_B64" "$_tp_pack" "$_tp_state" "$_tp_acct" <<'PY'
-import json,sys,os,re,socket as S
+import json,sys,os,re,time,socket as S
 try:
     import fcntl
     def _lk(f): fcntl.flock(f, fcntl.LOCK_EX)
@@ -2181,7 +2317,8 @@ try:
     while N in used or alive(N) or _leftover(N): N+=1
     name=f"dept-{N}"
     depts[name]={'socket':_dept_sk(N),  # RC-6: OS별 소켓 규약(Windows named pipe·unix .sock)
-                 'pack_dir':f"{home}/.cys/pack-dept-{name}",'role':'dept-master'}
+                 'pack_dir':f"{home}/.cys/pack-dept-{name}",'role':'dept-master',
+                 'reserved_at':time.time()}  # ★0.14.43 R2F-PK(S4 m3): create 의 예약과 같은 **가산 키** — reap 의 부팅 유예와 스폰 직전 재기록(reg_restamp)이 읽는다. 구 팩의 등재 쓰기는 load→dump 라 모르는 키를 보존한다
     if spec:  # ★U16: 표시명·하는 일 첫 줄(CEO 라우팅 근거)·제안 id(멱등 키)를 예약과 같은 원자 기록으로
         depts[name]['display_name']=spec['display']
         depts[name]['purpose']=next((l.strip() for l in spec['purpose'].splitlines() if l.strip()),'')[:200]
@@ -2256,6 +2393,7 @@ PY
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 중 — 재사용" >&2; _spawned=0
     else
       dept_stage spawn   # ★0.14.43 GP: 새 cysd 를 띄우기 직전(재사용 분기엔 없다)
+      reg_restamp "$name" alloc "$TEAM_B64"   # ★0.14.43 R2F-PK(S4 m3): 스폰 직전에 예약 시각을 한 번 다시 찍는다(최선 노력 · 등재가 아직 있고 내 예약일 때만 · 유예는 스폰 뒤 대기만 덮으면 된다)
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR(fork dir)와 함께 spawn (create와 동형).
       if _cys_detach_ok; then
         # ★fatal-fix X-R4-1: 대화 승인 토큰 경로 — 호출자(대표의 Bash 도구) 프로세스 그룹 밖 새 세션에서 띄운다(pid 불변 exec).
@@ -2265,6 +2403,7 @@ PY
       fi
       _dept_spawn_pid=$!
       dept_stage wait   # ★0.14.43 GP: 스폰 뒤 소켓 대기 시작 직전(재사용 분기엔 없다)
+      dept_ready_knob_warn   # ★0.14.43 R2F-PK(S4 m4): 비어 있지 않은 무효 노브 경고 1줄(미설정·유효 값은 무음)
       ready_wait "$sock" || { reg_remove "$name" || exit $?; echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만) · ★0.14.43 GP: 스폰 뒤 대기 예산 노브 + 실패 문구 꼬리
     fi
     dept_stage up   # ★0.14.43 GP: 데몬 소켓 응답 확인 직후(재사용이든 신규든)
@@ -2471,9 +2610,9 @@ PY
     # F3(codex): 멱등검사+예약을 단일 flock 원자. ★같은 mission_key 엔트리=청구됨 → REUSE(데몬 생사 무관·
     #   호출부가 ensure-ready). 신규는 lowest-unused 예약 + ★엔트리에 mission_key 기록(동시/부팅중 다른
     #   create가 즉시 발견 — codex: NEW 엔트리에 mission_key 누락 TOCTOU 해소).
-    #   ★0.14.43 GP: 노브(CYS_DEPT_READY_SECS)를 12 보다 크게 올렸을 때만 유예 = max(CYS_DEPT_RESERVE_GRACE 또는 25, 노브 + 노브/5 + 17) — 스폰 뒤 대기를 늘리면 유예가 따라 올라가
-    #   유예 밖 구간(중복 기동 경합)의 틈을 줄인다(공칭 기준이라 실제 대기보다 수 초~수십 초 짧을 수 있다 — 틈을 닫지는 못한다). 노브가 기본이면 종전 값 그대로다(25 · 명시한 낮은 값도 그대로 — 근거·한계는
-    #   dept_ready_secs 주석). 파이썬 GRACE 판독부는 무변경.
+    #   ★0.14.43 GP: 노브(CYS_DEPT_READY_SECS)를 12 보다 크게 올렸을 때만 유예 = max(CYS_DEPT_RESERVE_GRACE 또는 25, 노브 + 17) — 스폰 뒤 대기를 늘리면 유예가 따라 올라가
+    #   유예 밖 구간(중복 기동 경합)의 틈을 줄인다(★R2F-PK: 종전 `노브 + 노브/5 + 17` 에서 바뀜 — 스폰 뒤 대기가 벽시계로 묶이고 생성자가 스폰 직전에 `reserved_at` 을 다시 찍으므로 유예는 '스폰 뒤 대기'만 덮으면 된다 ·
+    #   근거와 남는 한계(윈도우 기본 실패 경로의 약 3초)는 dept_ready_secs·dept_reserve_grace 주석). 노브가 기본이면 종전 값 그대로다(25 · 명시한 낮은 값도 그대로). 파이썬 GRACE 판독부는 무변경.
     res=$(reg_init; CYS_GRACE="$(dept_reserve_grace)" python3 - "$REG" "$mkey" "$cwd" "$acctdir" <<'PY'
 import json,sys,os,re,time,socket as S
 try:
@@ -2570,10 +2709,12 @@ PY
     if ready "$sock"; then echo "[cys-dept] $name 이미 가동 — 재사용" >&2; _spawned=0
     else
       dept_stage spawn   # ★0.14.43 GP: 새 cysd 를 띄우기 직전(재사용 분기엔 없다)
+      reg_restamp "$name" create "$mkey"   # ★0.14.43 R2F-PK(S4 m3): NEW·REUSE_DEAD 공통 — 스폰 직전에 예약 시각을 한 번 다시 찍는다(최선 노력 · 등재가 아직 있고 내 mission_key 일 때만)
       # ★계정 격리: 데몬을 CYS_ACCOUNT_DIR 와 함께 spawn(patch2 있으면 자식 전파·없으면 F1 시드가 보장)
       CYS_SOCKET="$sock" CYS_PACK_DIR="$pack" CYS_ACCOUNT_DIR="$acctdir" env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN -u CYS_DEPT_ROTATE nohup "$CYSD" >"$(dept_logdir "$name")/cysd.log" 2>&1 &
       _dept_spawn_pid=$!
       dept_stage wait   # ★0.14.43 GP: 스폰 뒤 소켓 대기 시작 직전(재사용 분기엔 없다)
+      dept_ready_knob_warn   # ★0.14.43 R2F-PK(S4 m4): 비어 있지 않은 무효 노브 경고 1줄(미설정·유효 값은 무음)
       ready_wait "$sock" || { if [ "$verb" = "NEW" ]; then reg_remove "$name" || exit $?; fi; echo "[cys-dept] ERROR: $name 데몬 기동 실패$(ready_fail_note "$name")" >&2; sock_len_diag "$sock"; exit 1; }   # ★K2-07: 소켓 길이 사유(진단만) · ★0.14.43 GP: 스폰 뒤 대기 예산 노브 + 실패 문구 꼬리
     fi
     dept_stage up   # ★0.14.43 GP: 데몬 소켓 응답 확인 직후(재사용이든 신규든)
@@ -2772,9 +2913,18 @@ PY
 ) || { _rc=$?; [ "$_rc" = 10 ] && exit 10; echo "[cys-dept] reap: 스냅샷 실패" >&2; exit 1; }
     # 분류+집행(flock 밖·probe). reg_remove/down-sock는 각자 자체 flock·원자. 현재 셸 루프(카운터 보존).
     nd=0; ni=0; ns=0
+    # ★0.14.43 R2F-PK(S4 m3): '죽은 등록'(소켓 무응답) 갈래의 부팅 유예 — `reserved_at` 이 max(CYS_DEPT_REAP_GRACE, 예약 유예) 안인 등재는 부팅 중인 팀일 수 있어 지우지 않는다(`reserved_at` 이 없는 옛 등재는 종전 그대로).
+    #   예약 유예는 한 번만 계산한다(경고는 reap 과 무관해 버린다). 건너뛴 사실은 reap·`--dry` 모두 출력에 사유와 함께 남는다(SKIP 수에 든다).
+    _reap_resg="$(dept_reserve_grace 2>/dev/null)" || _reap_resg=25
     while IFS=$'\t' read -r nm sk rat; do
       [ -n "$nm" ] || continue
       if ! sock_alive "$sk"; then
+        if _bg="$(dept_reap_boot_grace "$rat" "$_reap_resg")"; then
+          ns=$((ns+1))
+          if [ "$dry" = 1 ]; then echo "[cys-dept] reap(dry): SKIP $nm (부팅 중 — 소켓은 아직 무응답이지만 $_bg · 죽은 등록으로 지우지 않는다)"
+          else echo "[cys-dept] reap: SKIP $nm (부팅 중 — 소켓은 아직 무응답이지만 $_bg · 죽은 등록으로 지우지 않는다)" >&2; fi
+          continue
+        fi
         nd=$((nd+1))
         if [ "$dry" = 1 ]; then echo "[cys-dept] reap(dry): DEAD $nm (sock 死) → reg_remove"
         else echo "[cys-dept] reap: DEAD $nm → reg_remove"; reg_remove "$nm"; fi

@@ -186,11 +186,25 @@ jobs:
                       "`typescript@7.0.2 tsc -p tsconfig.check.json` 인 것은 실행 줄에만 있고 스텝 이름에는 "
                       "없게 하기 위해서다(위 리뷰1 MAJOR-1 주석 참조) — 단순 `tsc -p tsconfig.check.json` "
                       "이면 스텝 이름 문면만으로도 '있음' 판정이 나 실행 줄 소거를 놓친다.",
+                  # ★R2F-PK(성찰 2회차 · A4 n6): 1회차가 더한 두 스텝(IOReport 링크 게이트 · hwmon 검체 좁힘)은 이 목록에 없어, 누가 스텝을 지우거나 `if: false` 를 달아도 붉어지지 않았다.
+                  #   두 토큰 모두 **실행 줄에만** 있고 스텝 이름에는 없다(위 MAJOR-1 교훈 — 이름에도 있으면 실행 줄 소거를 놓친다). 첫째 토큰은 `cargo test --bin cysd -- … --skip hwmon::` 접두를
+                  #   통째로 적지 않는다(예행 도구 자기 검체 2 의 변이 앵커가 그 접두의 파일 내 등장 횟수를 1 로 요구한다).
+                  "--skip hwmon::tests::snapshot_has_all_sections":
+                      "hwmon 검체의 브랜치 조기 경보 — E2 가 더한 hwmon 검체 15건(맥 기준)은 `hwmon::` 모듈 전체 skip 때문에 CI 어느 레인에서도 한 번도 안 돌았다. 1회차(R1F-PK)가 깨질 검체 "
+                      "하나(`snapshot_has_all_sections` — 가상 러너 GPU 부재)로 좁혀 돌린다. 이 skip 이 사라지거나(모듈 전체로 되돌림 · 지움) 그 스텝이 꺼지면 15건이 다시 조용히 CI 밖이거나 "
+                      "가상 러너에서 레인이 붉다.",
+                  "bash scripts/check-no-ioreport-link.sh target/debug/cysd":
+                      "IOReport 강링크 **산출물** 게이트(otool -L) — 소스 핀(lib `e2_cysd_hwmon_source_has_no_ioreport_strong_link`)은 소스의 모양만 본다. 이 스텝이 지워지거나 `if: false` 가 "
+                      "달리면 dlopen 지연 로딩으로 바꾼 E2 의 회귀(그 dylib 이 없는 맥에서 데몬이 main 에 닿기 전에 죽음 = 전 pane 사망)를 **산출물로** 잡는 자리가 브랜치에서 사라진다.",
               },
               "release": {
                   "cd ui && bun test":
                       "UI 회귀 게이트(발행 직전 최종선) — 브랜치 ui-check 와 쌍이다. 빠지면 브랜치 초록만 "
                       "믿고 태그한 빌드가 UI 회귀를 싣고 나간다.",
+                  # ★R2F-PK(A4 n6): 릴리스 맥 레그의 같은 게이트(업로드 전 · `.app` 안 cysd) — 태그 레인에서 처음 도는 스텝이라 지워져도 브랜치 초록이 알려 주지 못한다. 이 스텝의 `if` 는
+                  #   `matrix.platform == 'macos-latest'` 한 가지뿐이고 아래 ALLOWED_STEP_CONDITIONS 에 이미 등재돼 있다(그 밖의 조건·`if: false` 는 붉다).
+                  'bash scripts/check-no-ioreport-link.sh "$SRC/macos/cys.app/Contents/MacOS/cysd"':
+                      "IOReport 강링크 산출물 게이트(릴리스 맥 레그 · 업로드 전) — 브랜치 ci-branch 의 같은 게이트와 쌍이다. 빠지면 출하되는 `.app` 안 cysd 가 IOReport 를 강링크해도 업로드가 일어난다.",
               },
           }
 
@@ -200,6 +214,15 @@ jobs:
           #   되돌아간다. 실행 줄마다 같은 스텝 **앞**에 `cargo_filter_count <같은 인자>` 호출이 있어야
           #   한다(그 함수가 `-- --list` 로 세어 0 이면 붉힌다 · 함수 이름이 두 파일 사이의 계약이다).
           FILTERED_CARGO_GUARD = {"windows-health": ".github/workflows/windows-health.yml"}
+          # ★R2F-PK(A4 n6): 위 폐쇄는 '**있는** 필터형 실행 줄마다 가드가 선행하는가'만 봤다 — 실행 줄 **자체**를 지워도(예 hwmon 전용 스텝 삭제) 남은 줄이 있으면 초록이었다.
+          #   반드시 있어야 할 필터형 실행(인자 = FILTER_RUN_RE 가 뽑는 `--lib|--bin <크레이트> <필터>`)을 등재한다. 없으면 붉다.
+          FILTERED_CARGO_REQUIRED = {
+              "windows-health": {
+                  "--bin cysd hwmon::":
+                      "윈도우 실기에서 hwmon 검체(특히 맥에서는 컴파일되지 않는 비 macOS 스텁 `e2_non_macos_stub_reports_platform`)가 도는 **유일하게 보증된** 자리 — cysd 전량 스텝은 비차단이고 "
+                      "이름순 실행이 그 앞 검체에서 멈추거나(1회차 두 런) 실패가 쌓여(bd0a0ca3 런 195건) hwmon 에 닿는다고 말할 수 없다.",
+              },
+          }
 
           # 레인별 "빠지면 무엇이 거짓말이 되는가" — 에러 메시지에 붙여 편입 방향을 지시한다.
           HINT = {
@@ -252,6 +275,15 @@ jobs:
                   "근거 없는 목록이 된다(test_verify_win_crt 와 같은 계급의 정당한 비대칭). "
                   "ci-branch = 브랜치 조기 경보 · release = 그 게이트를 발행 차단 근거로 신뢰하기 "
                   "직전 증명의 2레인 편입.",
+              ),
+              # ★R2F-PK(성찰 2회차 · A4 m2): IOReport 게이트 스크립트의 **음성 대조** — 가짜 otool 로 exit 0/1/2 세 갈래를 잰다. 브랜치 CI 한 레인만 등재한다(release.yml 은 이번 티켓에서
+              #   고치지 않았다).
+              "test_check_no_ioreport_link": (
+                  {"ci-branch"},
+                  "scripts/tests/ 스위트(팩 스위트 아님 · R2F-PK 2회차 편입). 대상 scripts/check-no-ioreport-link.sh 는 배송 팩 tar 에 실리지 않고, 소비 지점은 ci-branch 맥 레인의 "
+                  "`cargo build --bin cysd` 뒤 게이트와 release 맥 레그의 업로드 전 게이트다. 이 검체는 그 스크립트의 세 갈래(통과 0 · 링크 발견 1 · 판정 불가 2 — 맥인데 otool 없음 포함)를 "
+                  "가짜 otool 로 재는 것이라 브랜치 조기 경보(ci-branch)에 먼저 싣는다. release 레인 편입은 발행 레인 변경이라 이번 티켓 범위 밖이다(편입하려면 release.yml 의 같은 게이트 "
+                  "스텝 옆에 한 스텝을 더하고 이 항목의 레인 집합을 {ci-branch, release} 로 고친다). pack-release 는 이 도구를 실행하지도 싣지도 않아 편입하면 근거 없는 목록이 된다.",
               ),
                             "test_verify_win_crt": (
                   {"ci-branch", "release"},
@@ -553,6 +585,7 @@ jobs:
           for lane, path in FILTERED_CARGO_GUARD.items():
               lines = _read(path).splitlines()
               runs = 0
+              seen_args = set()
               for start, end, *_rest in _step_ranges(lines, path):
                   for i in range(start, end):
                       code = re.sub(r"#.*$", "", lines[i])
@@ -561,6 +594,7 @@ jobs:
                           continue
                       runs += 1
                       args = re.sub(r"\s+", " ", m.group(1)).strip()
+                      seen_args.add(args)
                       guard = re.compile(r"^\s*cargo_filter_count\s+" + r"\s+".join(map(re.escape, args.split(" "))) + r"\s*$")
                       if not any(guard.match(re.sub(r"#.*$", "", lines[j])) for j in range(start, i)):
                           cond_err.append(f"{lane}: {path}:{i + 1} `cargo test {args} -- …` 앞에 같은 스텝의 "
@@ -570,7 +604,12 @@ jobs:
                   cond_err.append(f"{lane}: {path} 에 필터형 `cargo test` 실행 줄이 0건 — 핀이 잴 대상이 없다"
                                   f"(정규식·파일 구조가 바뀐 신호 · fail-closed)")
               else:
-                  print(f"[필터 폐쇄] {lane}: 필터형 실행 {runs}건 · 전건 cargo_filter_count 선행")
+                  req = FILTERED_CARGO_REQUIRED.get(lane, {})
+                  for need, why in req.items():
+                      if need not in seen_args:
+                          cond_err.append(f"{lane}: 필수 필터형 실행 `cargo test {need} -- …` 이 {path} 에 없다 — {why}")
+                  print(f"[필터 폐쇄] {lane}: 필터형 실행 {runs}건 · 전건 cargo_filter_count 선행 · 필수 필터 "
+                        f"{len([n for n in req if n in seen_args])}/{len(req)} 보유")
 
           if cond_err:
               print("::error::무조건 실행·필수 명령·필터 폐쇄 계약 위반.", file=sys.stderr)
@@ -1213,13 +1252,27 @@ jobs:
       #   앞 스텝이 의존 크레이트와 lib 를 같은 개발 프로파일로 이미 컴파일했으므로 늘어나는 것은 cysd 비테스트 빌드뿐이다.
       #   검사 경로: 이 잡은 호스트 네이티브(macos-latest · 타깃 트리플 지정 없음 · 유니버설 아님)라 `target/debug/cysd` 하나다.
       #   (릴리스 레인은 레그별 — aarch64·x86_64 크로스 — `.app` 안 cysd 를 본다.) 개발 프로파일도 같은 링크 속성을 적용받는다.
-      #   ★`if:` 를 달지 않는다(돌지 않는 초록 금지). 스크립트는 맥이 아니거나 otool 이 없으면 '건너뜀'으로 통과하지만 이 잡은 macOS 전용이다.
+      #   ★`if:` 를 달지 않는다(돌지 않는 초록 금지) — 레인 대조 게이트의 MUST_RUN_TOKENS 가 이 실행 줄의 존재와 무조건 실행을 핀한다(R2F-PK · A4 n6). 스크립트는 맥이 아니면 '건너뜀'(통과)이지만
+      #   **맥인데 otool 이 없으면 판정 불가(exit 2)** 다(R2F-PK · A4 m2 — 종전에는 이것도 건너뜀이었다). 이 잡은 macOS 전용이라 건너뜀은 일어나지 않는다.
       - name: cysd 산출물 IOReport 링크 게이트 (otool -L · macOS)
         shell: bash
         run: |
           set -euo pipefail
           cargo build --bin cysd
           bash scripts/check-no-ioreport-link.sh target/debug/cysd
+
+      # ★R2F-PK(성찰 2회차 · A4 m2): 위 게이트 스크립트의 **음성 대조** — 가짜 `otool`(PATH 맨 앞)로 종료 코드 0(통과)·1(IOReport 링크 발견)·2(판정 불가 — 맥인데 otool 없음 포함) 세 갈래를 잰다.
+      #   종전에는 CI 가 통과 갈래만 돌았다(실패 갈래를 재는 검체는 증거 폴더의 일회성 도구뿐이었다) — awk 패턴 한 글자가 바뀌어 늘 통과하게 돼도 붉어지는 곳이 없었다(이 저장소의 교리 "통과만 보이는 게이트는
+      #   늘 초록인 검사와 구별되지 않는다"). 밀폐: 임시 폴더의 가짜 uname·otool 과 도구 링크만 쓰고 PATH 를 그 폴더 하나로 한정한다(실측 약 2초 · 라이브 무접촉). pack-release·release 미편입 사유는 위
+      #   레인 대조 게이트의 ALLOWED("test_check_no_ioreport_link") 등재 참조. ★`if:` 를 달지 않는다(돌지 않는 초록 금지).
+      - name: IOReport 링크 게이트 스크립트 음성 대조 (가짜 otool · 0/1/2 · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_check_no_ioreport_link.py"
+          [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
+          echo "== test_check_no_ioreport_link (mac) =="
+          python3 "$f"
 
       # ★T6(v2 §12 이월 · merge3 CI 편입): cargo test --lib 완전 레인(macOS). 병합 엔진
       #   (merge3 golden 15종)과 pack 판정·실행부 스위트가 **브랜치 push 마다** 도는 유일한
