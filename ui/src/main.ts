@@ -161,14 +161,14 @@ import {
   deptFormationNoticeKey,
   deptFormationCapped,
   deptFormationToastId,
-  deptFormationStateOfKind,
-  deptFormationDetail,
+  deptFormationVerdict,
+  deptLiveRoles,
   deptFirstSeatPending,
   deptFirstSeatRemainingMs,
   DEPT_FORMATION_TOAST_PREFIX,
   DEPT_FIRST_SEAT_TEXT,
   type DeptFormationState,
-} from "./deptprogress"; // 0.14.43 GU 「팀 직접 만들기」 대기 문구(경과·단계)·팀원 부팅 안내(순수 문구·판정 · 표시 전용)
+} from "./deptprogress"; // 0.14.43 GU 「팀 직접 만들기」 대기 문구(경과·단계)·팀원 부팅 안내(순수 문구·판정 · 표시 전용) — R1F-UB: 완료 판정은 좌석 목록의 역할(deptLiveRoles·deptFormationVerdict)
 import { composeFontFamily, FONT_CHOICES, ROLE_COLOR, roleDotColor } from "./appearance";
 import { routeOnData } from "./mousefilter";
 import { MouseTrackingFilter, MOUSE_ALL_OFF } from "./trackfilter";
@@ -343,11 +343,13 @@ interface Workspace {
   // ★0.14.43(GU) 「팀 직접 만들기」 대기 문구·팀원 부팅 안내용 **표시 전용** 필드 — 어떤 명령도 보내지 않고 판정에도 쓰지 않는다.
   //   런타임 전용: saveLayout 이 직렬화에서만 턴다(저장되면 다음 기동이 옛 안내를 되살린다).
   pendingSince?: number; // 대기 탭(pending)을 만든 시각(ms) — 대기 문구의 경과 시간
-  pendingStage?: string; // 팩이 마지막으로 알린 단계 키(dept-create-progress) — 대기 문구의 '지금: …' 줄
-  createdAt?: number; // 이 세션에서 **새로 만든** 팀의 생성 성공 시각(ms) — 멱등 합류·취소·실패 분기에는 세우지 않는다
-  formationDone?: boolean; // 팀원 부팅 안내를 더 갱신하지 않는다(완료·15분 상한·닫힌 탭)
-  // 마지막으로 낸 팀원 부팅 안내 — 열쇠(key)가 바뀔 때만 다시 낸다. muted = 사용자가 안내를 ×로 닫았다(주기 갱신만 멈춘다 · 편성 결과 이벤트는 그래도 낸다).
-  formationView?: { state: DeptFormationState; detail: string | null; key: string; muted?: boolean };
+  pendingStage?: string; // 팩이 마지막으로 알린 단계 키(dept-create-progress) — 대기 문구의 '지금: …' 줄. undefined = 표지를 한 번도 못 받았다(구 팩·스트리밍 끔)
+  pendingSpawned?: boolean; // ★R1F-UB(S4 m4): 이 호출이 데몬을 띄웠다는 `spawn` 단계 표지를 받았다 — 새 팀 표지(createdAt)를 세울지 가르는 근거(기존 팀을 돌려받은 호출엔 없다)
+  createdAt?: number; // 이 세션에서 **새로 만든**(이 호출이 데몬을 띄운) 팀의 생성 성공 시각(ms) — 멱등 합류·취소·실패 분기와 기존 팀을 돌려받은 호출에는 세우지 않는다
+  formationDone?: boolean; // 팀원 부팅 안내를 더 갱신하지 않는다(자리 판정이 끝났다 — 다섯 다 붙음 · 15분 상한 · 닫힌 탭)
+  // 마지막으로 낸 팀원 부팅 안내 — 열쇠(key)가 바뀔 때만 다시 낸다. muted = 사용자가 안내를 **× 버튼으로** 닫았다(noteToastClosedByUser 만 세운다 — 수명 만료·탭 닫힘은 닫음이 아니다).
+  //   주기 갱신만 멈춘다 · 자리 판정의 최종 안내(모두 붙음·확인 필요)는 그래도 한 번 낸다.
+  formationView?: { state: DeptFormationState; key: string; muted?: boolean };
 }
 
 // 06: 워크스페이스 그룹 메타데이터. 진실원=localStorage(cys-layout-v2). 데몬은 모름(그룹=UI/solution 층).
@@ -646,7 +648,7 @@ function renderAccounts() {
         .join("");
       const badges: string[] = [];
       if (a.in_use === true) badges.push(`<span class="cc-acct-badge on">● 사용 중</span>`);
-      if (isPreviousLogin(a)) badges.push(`<span class="cc-acct-badge">이전 로그인</span>`); // claude · current_profiles 가 빈 배열
+      if (isPreviousLogin(a)) badges.push(`<span class="cc-acct-badge">이전 로그인</span>`); // claude · 지금 로그인된 폴더가 없고(빈 배열) 사용 중이 아닐 때만 — 판정은 순수 isPreviousLogin 하나(R1F-UB S2 m-1 ⓑ)
       if (a.updated_at == null) badges.push(`<span class="cc-acct-badge">관측 전</span>`);
       // 0.14.42: 관측 경로 고장(예: agy_http_401)은 '관측 전'과 구별해 코드째 보인다(사이드바와 같은 source_error).
       if (typeof a.source_error === "string" && a.source_error)
@@ -656,9 +658,10 @@ function renderAccounts() {
       const stale = Number(a.stale_secs);
       if (Number.isFinite(stale) && stale > 120) badges.push(`<span class="cc-acct-badge">${Math.round(stale / 60)}분 전 관측</span>`);
       if (a.exhaust_at != null) badges.push(`<span class="cc-acct-badge warn">이 속도면 ${ccHHMM(Number(a.exhaust_at))} 소진</span>`);
+      // ★R1F-UB(S2 m-4): 문구를 사실대로 — 숨기면 KPI 의 **계정 후보**에서 빠지고, 후보가 하나도 남지 않으면 KPI 는 전 좌석 값으로 표시된다(숨김을 모르는 좌석 집계 · 동작은 종전 그대로).
       const hideTip = hiddenNow
         ? "사이드바 사용량 패널과 위 KPI 에 이 계정을 다시 넣습니다"
-        : "사이드바 사용량 패널과 위 KPI 에서 이 계정을 뺍니다(이 표에는 흐리게 남습니다)";
+        : "사이드바 사용량 패널과 위 KPI 의 계정 후보에서 이 계정을 뺍니다(계정 후보가 하나도 남지 않으면 KPI 는 좌석 값으로 표시됩니다)";
       const hideBtn = `<button type="button" class="cc-acct-hide" data-acct-key="${ccEsc(key)}" title="${hideTip}">${hiddenNow ? "보이기" : "숨기기"}</button>`;
       return `<div class="cc-acct-row${old || hiddenNow ? " dim" : ""}"><span class="cc-acct-prov">[${prov}]</span><span class="cc-acct-label">${label}</span>${plan}<div class="cc-acct-gauges">${gauges}</div><span class="cc-acct-badges">${badges.join("")}</span>${hideBtn}</div>`;
     })
@@ -2206,10 +2209,10 @@ function saveLayout() {
   //   탭째 배제하지만 `deleting`·`stopFailed` 는 **살아 있는 탭**의 일시 상태라 탭을 버릴 수 없다 — 대신
   //   직렬화에서만 턴다. 저장되면 다음 기동이 '삭제 중' 탭을 영영 입양 금지로 보거나(deleting) 이미 정리된
   //   부서에 종료 실패 안내를 계속 그린다(stopFailed). norm 의 원본 객체는 건드리지 않는다(복사본만).
-  //   ★0.14.43(GU): 「팀 직접 만들기」 표시 전용 필드(pendingSince·pendingStage·createdAt·formationDone·formationView)도 같은 이유로 턴다 —
+  //   ★0.14.43(GU): 「팀 직접 만들기」 표시 전용 필드(pendingSince·pendingStage·pendingSpawned·createdAt·formationDone·formationView)도 같은 이유로 턴다 —
   //   저장되면 다음 기동이 '이 세션에서 새로 만든 팀' 안내를 되살린다. 첫 map 은 위 핀(wswiring.test.ts)이 한 줄 그대로 못박는다.
   const persisted = norm.map(({ deleting: _d, stopFailed: _s, ...w }) => w).map(
-    ({ pendingSince: _ps, pendingStage: _pg, createdAt: _ca, formationDone: _fd, formationView: _fv, ...w }) => w,
+    ({ pendingSince: _ps, pendingStage: _pg, pendingSpawned: _sp, createdAt: _ca, formationDone: _fd, formationView: _fv, ...w }) => w,
   );
   localStorage.setItem(
     LAYOUT_KEY,
@@ -2324,6 +2327,9 @@ async function refreshPaneTitles() {
   refreshing = true;
   let adoptedWs = false; // 이번 틱에서 워크스페이스/트리를 고쳤는가(render 필요 판정)
   const blockedTick: CwdBlockedEntry[] = []; // 이번 틱에 모든 소켓에서 모은 cwd_blocked
+  // ★0.14.43(R1F-UB · S4 B1): 이번 틱에 **받은** 소켓별 좌석 목록의 (종료 안 한) 역할 — 팀원 부팅 안내의 완료 판정이 쓴다. 새 RPC·새 타이머 0: 이 틱이 어차피 부르는 list_surfaces 의 결과다.
+  //   목록을 못 받은 소켓(진행 중 요청·시간 초과·오류)은 키가 없다 → 그 소켓의 판정은 이번 틱에 건너뛴다(완료로도 상한 실패로도 치지 않는다).
+  const seatRolesTick = new Map<string, string[] | null>();
   let roleMemoChanged = false; // ★U2: 칸의 역할 기억만 바뀌었는가(render 없이 저장만)
   try {
     // 멀티마스터 F4: workspace별 소켓을 순회 — 각 데몬의 surface를 그 소켓 ws에만 귀속시킨다.
@@ -2356,6 +2362,7 @@ async function refreshPaneTitles() {
             cwd_blocked?: unknown;
           }[];
         };
+        seatRolesTick.set(sk ?? "", deptLiveRoles(r.surfaces)); // ★R1F-UB(S4 B1): 목록을 **받은 뒤에만** 적는다 — 받지 못하면(시간 초과·오류) 이 줄에 닿지 않아 그 소켓의 판정을 건너뛴다
         blockedTick.push(...collectCwdBlocked(r.surfaces, sk ?? ""));
         // ★유령 pane 수렴 — 판정은 wsreconcile.advanceGhostStrikes(순수·유닛 테스트가 고정),
         // 여기는 배선이다. 데몬이 **기록 자체를 모르는** sid 만, **2연속 관측**일 때만 친다.
@@ -2498,8 +2505,9 @@ async function refreshPaneTitles() {
     /* 안내 실패는 무음 — 다음 새 좌석에서 다시 시도한다 */
   }
   // ★0.14.43(GU): 방금 만든 팀의 팀원 부팅 안내 — 값(열쇠)이 바뀐 틱에만 갱신한다(새 타이머 0 · 이 3초 틱을 그대로 쓴다). 표시 전용이라 실패해도 루프는 멈추지 않는다.
+  //   ★R1F-UB(S4 B1): 완료 판정은 이 틱이 받은 그 팀 소켓의 좌석 목록(seatRolesTick)의 역할이다 — 편성 결과 feed 는 본부 데몬으로 가서 부서 탭과 대응시킬 수 없다.
   try {
-    checkDeptFormationNotices();
+    checkDeptFormationNotices(seatRolesTick);
   } catch {
     /* 안내 실패는 무음 — 다음 틱에서 다시 점검한다 */
   }
@@ -4381,7 +4389,7 @@ function renderUsageBar(): void {
     const sumEl = head.querySelector(".usage-sum") as HTMLElement;
     // 조회 연속 실패면 요약 줄에도 표시한다(접힌 채로도 보이게) — 첫 조회 전 실패는 headline 자체가 "응답 없음"이다.
     setText(sumEl, model.footer && model.headline !== "응답 없음" ? `${model.headline} · 응답 없음` : model.headline);
-    // ★0.14.43: 요약 줄 색 = 주 계정 창들의 최고 심각도(headlineSev — 오래된 값이면 ""). 응답 없음 경고(warn)와 같은 칸을 쓰되 crit 가 이긴다.
+    // ★0.14.43: 요약 줄 색 = 줄에 실린 값들의 최고 심각도(headlineSev) — 제공자별 약식이면 요약에 실린 값들(오래됨 `?` 제외 · R1F-UB S2 m-3), 아니면 주 계정 창들(오래된 값이면 ""). 응답 없음 경고(warn)와 같은 칸을 쓰되 crit 가 이긴다.
     sumEl.classList.toggle("warn", !!model.footer || model.headlineSev === "warn");
     sumEl.classList.toggle("crit", model.headlineSev === "crit");
     // 제공자별 약식(`C 5h12%·7d30% │ X 7d50%`)이면 풀이를 툴팁으로 — 없으면 title 제거(머리 단추 자체의 title 이 보이게).
@@ -5217,12 +5225,18 @@ async function addDeptWorkspace(catalogKey?: string, teamSpec?: TeamSpec): Promi
     ws.pending = false;
     // ★0.14.43(GU): 이 세션에서 **새로 만든** 팀 표지(표시 전용) — 성공 분기에서만 세운다(멱등 합류·취소·실패 분기에는 세우지 않는다). render() 보다 먼저 서야
     //   빈 탭이 '아직 켜지 않았습니다'(방금 만든 팀에는 거짓)를 잠깐 비추지 않는다. 첫 안내는 성공 직후 한 번 — 표시 실패가 생성 성공을 뒤집지 않게 가둔다.
-    ws.createdAt = Date.now();
+    // ★R1F-UB(S4 m4): 그리고 **이 호출이 데몬을 띄웠을 때만** 세운다 — 팩이 `spawn` 단계 표지를 냈다(pendingSpawned). 기존 팀을 돌려받은 호출(create 의 REUSE_UP·REUSE_BOOTING ·
+    //   allocate 의 멱등 반환 · 이미 가동 중인 데몬 재사용)은 spawn 표지가 없다(다른 표지는 온다) → 표지·첫 안내 없음(문서: '새로 만든 팀에만'). 표지를 한 번도 못 받았으면(pendingStage
+    //   없음 = 진행 표지를 내지 않는 구 팩 · 스트리밍 끔 · 이벤트 유실) 구분할 수 없으므로 **현행 유지** — 새 팀으로 보고 안내를 낸다.
+    const spawned = ws.pendingSpawned === true || ws.pendingStage === undefined;
+    if (spawned) ws.createdAt = Date.now();
     render();
-    try {
-      showDeptFormation(ws, "booting", null);
-    } catch {
-      /* 안내 실패는 무음 — 생성은 이미 끝났다(아래 catch 의 롤백으로 새면 성공한 팀을 지운다) */
+    if (spawned) {
+      try {
+        showDeptFormation(ws, "booting");
+      } catch {
+        /* 안내 실패는 무음 — 생성은 이미 끝났다(아래 catch 의 롤백으로 새면 성공한 팀을 지운다) */
+      }
     }
     await refreshPaneTitles(); // 방금 띄운 master surface를 즉시 입양(3초 인터벌 대기 없이). 부팅 실패 시
     //                            tree:null로 남고 master 등장 시 인터벌이 재입양(start()의 비활성 부서 처리와 정합).
@@ -5251,26 +5265,33 @@ function onDeptCreateProgress(payload: unknown): void {
   for (const ws of workspaces) {
     if (!ws.pending || deptProgressId(ws.id) !== p.id) continue;
     ws.pendingStage = p.stage;
+    if (p.stage === "spawn") ws.pendingSpawned = true; // ★R1F-UB(S4 m4): 이 호출이 데몬을 띄웠다 — 성공 분기가 '새로 만든 팀' 표지를 세울지 이것으로 가른다
     const paint = deptPendingPainters.get(ws.id);
     if (paint) paint();
   }
 }
 
-/// 팀원 부팅 안내(sticky 토스트 · id `dept-formation:<소켓>`)를 한 번 낸다 — 같은 id 는 갱신이다. 낸 상태·사유·열쇠를 탭에 적어 두어
+/// 팀원 부팅 안내(sticky 토스트 · id `dept-formation:<소켓>`)를 한 번 낸다 — 같은 id 는 갱신이다. 낸 상태·열쇠를 탭에 적어 두어
 /// 다음 틱(checkDeptFormationNotices)이 '값이 바뀔 때만' 다시 내게 한다. 매 호출이 알람 이력을 돌리므로 초 단위로 부르지 않는다.
-function showDeptFormation(ws: Workspace, state: DeptFormationState, detail: string | null): void {
+/// state = booting(켜는 중 · 주기 갱신) · seated(의무 역할 다섯이 모두 붙음 — 한 번) · check(15분 상한까지 다 안 붙음 — 한 번). seated 인자 = 붙은 의무 역할 수(check 문구의 N · 판정이 센 값).
+/// booting 의 '지금 N자리' 는 탭의 칸 수(collectSids)다.
+function showDeptFormation(ws: Workspace, state: DeptFormationState, seated?: number): void {
   if (!ws.socket || ws.createdAt === undefined) return;
   const elapsedSec = Math.floor((Date.now() - ws.createdAt) / 1000);
-  const seats = collectSids(ws.tree).length;
-  const t = deptFormationText({ seats, elapsedSec, state, detail });
-  stickyToast(deptFormationToastId(ws.socket), state === "booting" || state === "complete" ? "feed" : "watchdog", t.title, t.body);
-  ws.formationView = { state, detail, key: deptFormationNoticeKey({ seats, elapsedSec, state }) };
+  const seats = state === "check" && seated !== undefined ? seated : collectSids(ws.tree).length;
+  const t = deptFormationText({ seats, elapsedSec, state });
+  stickyToast(deptFormationToastId(ws.socket), state === "check" ? "watchdog" : "feed", t.title, t.body);
+  ws.formationView = { state, key: deptFormationNoticeKey({ seats, elapsedSec, state }) };
 }
 
 /// 기존 3초 주기 refreshPaneTitles 끝에서 부르는 가벼운 점검(새 타이머 0): ① 닫힌 탭의 안내를 거둔다(탭이 어떤 경로로 사라졌든 — 탭 ×·그룹 삭제·롤백)
-/// ② 이 세션에서 새로 만든 탭의 안내를 **열쇠가 바뀔 때만** 다시 낸다(자리 수 · 경과 '분' · 45초 수명 칸) ③ 15분(DEPT_FORMATION_CAP_SECS)이 지나면 접는다
-/// ④ 사용자가 안내를 ×로 닫았으면 주기 갱신을 멈춘다(닫힌 안내를 되살리는 재점등 스팸 금지 — 편성 결과 이벤트는 onDeptFormationFeed 가 그래도 낸다).
-function checkDeptFormationNotices(): void {
+/// ② ★완료 판정(R1F-UB · S4 B1) — 이 세션에서 새로 만든 탭의 **소켓의 좌석 목록**(이번 틱이 받은 list_surfaces 의 역할 · seatRoles)에서 의무 역할 다섯이 모두 붙었으면
+///    「팀 자리가 모두 붙었습니다」로 **한 번** 바꾸고 더 갱신하지 않는다(formationDone — 토스트는 수명대로 사라진다 · '준비 완료'라고 단정하지 않는다: 에이전트가 떴는지는 화면이 모른다).
+///    15분(DEPT_FORMATION_CAP_SECS)에 닿았는데 다 안 붙었으면 「팀원 켜기 — 확인 필요」를 **한 번** 알리고 접는다. 그 소켓의 목록을 못 받은 틱(시간 초과 등)은 판정을 건너뛴다.
+///    편성 결과 feed 는 보지 않는다 — 편성 도구는 본부 데몬으로 feed 를 내고 화면의 socketForSlug 에는 부서 소켓만 있어 부서 탭과 대응시킬 수 없었다(종전 배선은 닿지 않았다).
+/// ③ 그 밖에는 안내를 **열쇠가 바뀔 때만** 다시 낸다(자리 수 · 경과 '분' · 45초 수명 칸) — 토스트가 수명(60초)으로 사라졌으면(점검이 밀려 갱신 칸을 놓쳤다) 다시 낸다(S4 m3)
+/// ④ 사용자가 안내를 **× 버튼으로** 닫았으면(formationView.muted · noteToastClosedByUser 만 세운다) 주기 갱신을 멈춘다(닫힌 안내를 되살리는 재점등 스팸 금지 — ②의 최종 안내는 그래도 한 번 낸다).
+function checkDeptFormationNotices(seatRoles?: ReadonlyMap<string, string[] | null>): void {
   const live = new Set<string>();
   for (const w of workspaces) if (w.socket) live.add(deptFormationToastId(w.socket));
   for (const id of [...stickyToasts.keys()]) {
@@ -5280,40 +5301,36 @@ function checkDeptFormationNotices(): void {
   for (const ws of workspaces) {
     if (ws.pending || !ws.socket || ws.createdAt === undefined || ws.formationDone) continue;
     const elapsedSec = Math.floor((now - ws.createdAt) / 1000);
-    if (deptFormationCapped(elapsedSec)) {
+    const v = deptFormationVerdict(seatRoles === undefined ? undefined : seatRoles.get(ws.socket), elapsedSec);
+    if (v.verdict === "seated" || v.verdict === "check") {
+      showDeptFormation(ws, v.verdict, v.seated);
       ws.formationDone = true;
       continue;
     }
+    // 상한에 닿았는데 그 소켓의 목록을 아직 못 받았다 — 갱신 없이 다음 틱에 다시 판정한다(완료로도 '확인 필요'로도 치지 않는다 · 무한 갱신 금지).
+    if (deptFormationCapped(elapsedSec)) continue;
     const view = ws.formationView;
     if (!view) {
-      showDeptFormation(ws, "booting", null); // 첫 안내가 아직 안 나갔다(성공 직후 한 번이 빠졌을 때의 안전망)
+      showDeptFormation(ws, "booting"); // 첫 안내가 아직 안 나갔다(성공 직후 한 번이 빠졌을 때의 안전망)
       continue;
     }
     if (!stickyToasts.has(deptFormationToastId(ws.socket))) {
-      view.muted = true; // 사용자가 ×로 닫았다 — 되살리지 않는다(편성 결과 이벤트가 오면 새 안내가 다시 선다)
+      if (view.muted) continue; // 사용자가 × 로 닫았다 — 되살리지 않는다
+      showDeptFormation(ws, "booting"); // 수명 만료로 사라졌다(닫은 것이 아니다) — 다시 낸다
       continue;
     }
     const seats = collectSids(ws.tree).length;
     if (deptFormationNoticeKey({ seats, elapsedSec, state: view.state }) === view.key) continue;
-    showDeptFormation(ws, view.state, view.detail);
+    showDeptFormation(ws, "booting");
   }
 }
 
-/// 편성 feed(`formation-*`)가 오면 그 팀의 팀원 안내를 갱신한다 — 데몬 이벤트의 socket_slug 가 **이 세션에서 새로 만든 탭**의 소켓으로 해석될 때만.
-/// slug 가 없거나 해석되지 않으면 아무것도 하지 않는다(다른 부서로 오인 금지). complete 는 완료 문구로 한 번 갱신하고 더 갱신하지 않는다(formationDone —
-/// 토스트는 수명대로 사라진다). partial·pending·failed 는 feed 의 본문(없으면 제목)을 사유로 실어 '확인 필요' 문구로 갱신하되 계속 추적한다. payload 는 신뢰하지 않는다.
-function onDeptFormationFeed(slug: unknown, kind: unknown, body: unknown, title: unknown): void {
-  const state = deptFormationStateOfKind(kind);
-  if (state === null || typeof slug !== "string" || slug === "") return;
-  const sock = socketForSlug.get(slug);
-  if (!sock) return;
-  const ws = workspaces.find((w) => !w.pending && w.socket === sock && w.createdAt !== undefined && !w.formationDone);
-  if (!ws) return;
-  if (state === "complete") {
-    showDeptFormation(ws, "complete", null);
-    ws.formationDone = true;
-  } else {
-    showDeptFormation(ws, state, deptFormationDetail(body, title));
+/// 사용자가 토스트의 × 버튼을 눌렀다(addToastCloseButton 의 click 처리기 — **이 경로에서만** 부른다) — 팀원 부팅 안내(`dept-formation:<소켓>`)면 그 팀의 닫음 표식(formationView.muted)을 세운다.
+/// 수명 만료(stickyToast 의 타이머)·탭 닫힘 정리(checkDeptFormationNotices)·같은 id 의 갱신은 이 경로가 아니라 표식이 서지 않는다 — 점검이 '토스트 없음 ∧ 표식 없음'이면 다시 낸다(S4 m3).
+/// 안내가 없는 탭·다른 id(접두가 같아도 소켓이 다른 것 포함)·이상한 입력은 무동작이다 — 대조는 안내 id 의 정본(deptFormationToastId) 일치 하나다.
+function noteToastClosedByUser(id: string): void {
+  for (const ws of workspaces) {
+    if (ws.socket && deptFormationToastId(ws.socket) === id && ws.formationView) ws.formationView.muted = true;
   }
 }
 
@@ -8263,8 +8280,10 @@ function addToastCloseButton(el: HTMLElement, id?: string) {
   x.textContent = "×";
   x.addEventListener("click", (e) => {
     e.stopPropagation();
-    if (id) dismissToast(id);
-    else el.remove();
+    if (id) {
+      noteToastClosedByUser(id); // ★R1F-UB(S4 m3): '사용자가 닫음' 표식은 이 × 경로에서만 선다(수명 만료·갱신·탭 정리는 dismissToast 만 부른다) — 팀원 부팅 안내가 쓴다
+      dismissToast(id);
+    } else el.remove();
   });
   el.appendChild(x);
 }
@@ -8569,13 +8588,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
       if (payload.kind === TEAM_CREATE_KIND)
         toast("feed", "팀 만들기 제안 1건", `${String(payload.title ?? "")} — Control Center 의 '승인 Feed' 탭 카드에서 [확인 창 열기]를 누르세요.`);
       else toast("feed", feedCreatedToastTitle(payload.kind), String(payload.title ?? ""));
-      // ★0.14.43(GU): 방금 만든 팀의 편성 결과(formation-*)를 그 팀의 팀원 부팅 안내에도 반영한다 — socket_slug 가 이 세션에서 새로 만든 탭의 소켓으로
-      //   해석될 때만(표시 전용 · 어떤 명령도 보내지 않는다). 표시 실패가 이 분기의 나머지를 막지 않게 가둔다.
-      try {
-        onDeptFormationFeed(event.socket_slug, payload.kind, payload.body, payload.title);
-      } catch {
-        /* 안내 실패는 무음 */
-      }
+      // ★R1F-UB(S4 B1): 편성 결과(formation-*) feed 는 팀원 부팅 안내를 건드리지 않는다 — 편성 도구(javis_formation.py _feed)는 소켓 지정 없이 `cys feed push` 를 불러 **본부 데몬**으로 가고,
+      //   화면의 socketForSlug 에는 부서 소켓만 있어 그 이벤트의 socket_slug 를 새로 만든 부서 탭에 대응시킬 수 없다(종전 배선은 닿지 않았다). 팀원 안내의 완료 판정은
+      //   3초 틱이 받는 그 팀 소켓의 좌석 목록(checkDeptFormationNotices)이다. 위의 일반 알림(ℹ 알림 · 부서 팀 편성 완결)은 종전 그대로다.
       // 즉시 전환하지 않는다 — master/CEO 자동 승인 유예 후에도 pending인 항목만
       // 사람 개입 필요로 보고 전환한다(자동 승인분은 무전환).
       // W3.4: auto_route 항목은 90초 기본 + CEO 활성 동적 연장, 비대상 wait 항목은 30초.
@@ -10047,6 +10062,8 @@ async function launchDept(catalogKey: string | undefined, ctx: TeamCreateCtx, di
   }
   let fallbackLegacy = false;
   let outcome: TeamCreateOutcome = "failed";
+  // ★R1F-UB(S4 n1 의 동반): 새 시도가 시작되면 지난 실패 알림(지속 알림 — 수명 60초)을 걷는다 — 재시도가 성공했는데 '팀 만들기 실패' 가 남아 있지 않게(종전 8초 토스트는 저절로 사라졌다). 실패하면 같은 id 로 다시 난다.
+  dismissToast("dept-create-failed");
   try {
     await addDeptWorkspace(catalogKey);
     outcome = "created";
@@ -10064,7 +10081,9 @@ async function launchDept(catalogKey: string | undefined, ctx: TeamCreateCtx, di
     } else if (code === 3 && catalogKey !== undefined) {
       fallbackLegacy = true; // 카탈로그 파일 부재(비격리 위험 없음·번호만) — 아래에서 새 대상 재확인
     } else {
-      toast("watchdog", "팀 만들기 실패", msg);
+      // ★R1F-UB(S4 n1): 이 실패 문구는 로그 경로와 환경변수 이름이 든 150자 넘는 글이다 — 8초 토스트로는 읽고 옮기기 어렵다. **지속 알림**(이 파일이 이미 쓰는 sticky · 닫기 버튼 있음 · 수명 60초 ·
+      //   같은 id 는 갱신)으로 낸다. 문구(msg)는 받은 그대로다. 알람 이력에는 종전처럼 남는다.
+      stickyToast("dept-create-failed", "watchdog", "팀 만들기 실패", msg);
     }
   } finally {
     deptLaunchInFlight = false; // 성공/실패 무관 항상 해제(버튼 freeze·영구 busy 방지)

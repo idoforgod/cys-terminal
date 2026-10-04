@@ -449,3 +449,38 @@ describe("0.14.43 UI2 — Control Center KPI 전 좌석 폴백 배선(ccAggRate 
     expect(enclosingFns("ccAggRate(").filter((f) => f !== "ccAggRate")).toEqual(["renderLiveBody"]);
   });
 });
+
+// ═════════ 성찰 1회차 R1F-UB (S2 m-4 · m-1 ⓑ) — Control Center 계정 행의 문구·배지 배선 ═════════
+describe("R1F-UB(S2 m-4) — 숨기기 단추 툴팁은 사실대로 말한다(동작은 그대로 · 문구만)", () => {
+  const HIDE_TIP = "사이드바 사용량 패널과 위 KPI 의 계정 후보에서 이 계정을 뺍니다(계정 후보가 하나도 남지 않으면 KPI 는 좌석 값으로 표시됩니다)";
+  const SHOW_TIP = "사이드바 사용량 패널과 위 KPI 에 이 계정을 다시 넣습니다";
+  it("★숨기기 툴팁 전문 — 후보에서 뺀다는 것과 후보가 비면 좌석 값으로 간다는 것을 함께 적는다 · 옛 문구('위 KPI 에서 이 계정을 뺍니다')는 없다", () => {
+    const b = fnBody("renderAccounts");
+    expect(b.includes(`"${HIDE_TIP}"`)).toBe(true);
+    expect(b.includes("위 KPI 에서 이 계정을 뺍니다")).toBe(false);
+    expect(b.includes("이 표에는 흐리게 남습니다")).toBe(false);
+  });
+  it("보이기 툴팁은 종전 그대로 · 두 문구는 숨김 상태(hiddenNow)로 갈린다", () => {
+    const b = fnBody("renderAccounts");
+    expect(b.includes(`"${SHOW_TIP}"`)).toBe(true);
+    const i = b.indexOf("const hideTip = hiddenNow");
+    expect(i).toBeGreaterThan(0);
+    const seg = b.slice(i, b.indexOf(";", b.indexOf(HIDE_TIP, i)) + 1);
+    expect(seg.indexOf(SHOW_TIP)).toBeGreaterThan(0);
+    expect(seg.indexOf(SHOW_TIP)).toBeLessThan(seg.indexOf(HIDE_TIP)); // hiddenNow ? 보이기 : 숨기기
+    expect(b.includes('title="${hideTip}"')).toBe(true);
+  });
+});
+
+describe("R1F-UB(S2 m-1 ⓑ) — Control Center '이전 로그인' 배지는 순수 판정(isPreviousLogin)만 따른다 · 요약 줄 색 주석은 사실대로", () => {
+  it("배지는 isPreviousLogin(a) 로만 — 화면이 current_profiles 를 직접 보고 따로 판정하지 않는다(in_use 모순 방어가 한 곳에 있다)", () => {
+    const b = fnBody("renderAccounts");
+    expect(b.includes("if (isPreviousLogin(a)) badges.push(")).toBe(true);
+    expect(b.includes("current_profiles")).toBe(false);
+    expect(code.includes("current_profiles")).toBe(false);
+  });
+  it("요약 줄 색 주석은 약식 요약의 실제(요약에 실린 값들)를 말한다 — 주 계정 창들뿐이라고 적지 않는다", () => {
+    expect(src.includes("제공자별 약식이면 요약에 실린 값들")).toBe(true);
+    expect(src.includes("요약 줄 색 = 주 계정 창들의 최고 심각도(headlineSev")).toBe(false);
+  });
+});

@@ -1,7 +1,7 @@
-// ui/src/deptprogress.ts — 「팀 직접 만들기」 대기 문구(경과·단계)와 팀원 부팅 안내 문구, 팩의 단계 표지 해석(0.14.43 · GU).
+// ui/src/deptprogress.ts — 「팀 직접 만들기」 대기 문구(경과·단계)와 팀원 부팅 안내 문구·판정, 팩의 단계 표지 해석(0.14.43 · GU · 성찰 1회차 R1F-UB 수정).
 //
 // 왜 필요한가: 팀을 만드는 동안 화면은 "곧 끝난다"는 짧은 약속을 했지만 실측은 보통 25~30초(이 맥)이고 느린 PC 는 1분을 넘는다 —
-// 거짓 약속이다. 그 뒤 팀원(부서장·CSO·워커·리뷰어 둘)이 켜지는 3~5분에는 화면에 아무 안내가 없었고, 첫 자리가 붙기 전에는
+// 거짓 약속이다. 그 뒤 팀원(부서장·CSO·워커·리뷰어 둘)이 켜지는 동안(이 맥 실측 1회 약 5분)에는 화면에 아무 안내가 없었고, 첫 자리가 붙기 전에는
 // "이 부서는 아직 켜지 않았습니다" 가 잠깐 보였다(방금 만든 팀에는 거짓). 이 모듈은 그 두 구간의 **문구와 해석**만 만든다.
 //
 // 팩(cysjavis-pack/bin/cys-dept)은 팀을 만드는 동안 stderr 에 `[cys-dept] @stage <키>` 한 줄씩을 낸다(키 7종: reserve probe spawn wait up seat done).
@@ -9,21 +9,28 @@
 // 구 팩에는 표지가 없다 — 그때는 단계 줄 없이 경과만 보인다(deptPendingText 의 sub = null).
 //
 // 이 모듈은 문구·해석만 한다. 화면·IPC·저장소·타이머를 모른다(main.ts 가 배선·렌더를 한다 — 반복 타이머는 대기 화면 엘리먼트 수명에 묶인 1개뿐이다).
-// ★문구는 **사실만** 말한다: 대기 문구는 실측 범위만 약속하고, 팀원 안내의 '확인 필요' 문구는 받은 사유를 그대로 전할 뿐 살아 있음을 지어내지 않는다.
-// ★이벤트 payload·feed 본문은 **신뢰할 수 없는 데이터**다 — 단계 키는 정규식으로 거르고, 사유는 제어문자를 걷고 길이를 자른다.
+// ★문구는 **사실만**, 잰 만큼만 말한다(S4 M1): 대기 문구는 실측 범위만 약속하고(사전 검사 「약 12초」 · 팀원 「보통 5분 안팎」), 팀원 안내는 '자리가 붙었다'까지만 말한다 —
+//   에이전트가 실제로 떴는지는 화면이 모르므로 '준비 완료'라고 단정하지 않는다.
+// ★팀원 안내의 완료 판정은 **그 팀 소켓의 좌석 목록**(3초 틱이 이미 받는 list_surfaces)의 역할이다(성찰 1회차 S4 B1). 편성 결과 feed 는 본부 데몬으로 가서
+//   (javis_formation.py `_feed` — 소켓 지정 없음) 화면이 부서 탭과 대응시킬 수 없다(socketForSlug 에는 부서 소켓만 있다) — 그 배선은 걷었다.
+//   이 모듈은 좌석 목록 → 역할 → 판정(deptLiveRoles · deptSeatedCount · deptFormationVerdict)만 맡는다.
+// ★이벤트 payload·좌석 목록은 **신뢰할 수 없는 데이터**다 — 단계 키는 정규식으로 거르고, 역할은 문자열만 본다.
 //   렌더는 main.ts 가 텍스트 노드·stickyToast 로만 한다(HTML 삽입 없음).
 // ★이 안내는 **표시 전용**이다 — 어떤 명령도 보내지 않는다.
 //
 // ★이 모듈의 불변식(deptprogress.test.ts 가 핀으로 고정 — starvednotice.ts·updatenotice.ts 와 같다):
-//   · 최상위 부수효과 0 — 선언(export/const/function/interface/type)만. 브라우저 저장소·문서 객체·창 객체·타이머·IPC 접근 0
+//   · 최상위 부수효과 0 — 선언(import/export/const/function/interface/type)만. 브라우저 저장소·문서 객체·창 객체·타이머·IPC 접근 0
 //     (main.js 는 번들 하나라 여기서 평가 중 예외가 나면 앱 전체가 백지가 된다).
 //   · 구형 WKWebView 가 파싱하지 못하는 문법 0 — 정규식 뒤돌아보기·배열 끝 인덱스 접근·뒤에서 찾기·구조 복제·소유 판정 정적 메서드·전체 치환 계열.
+
+// 의무 역할 목록의 출처 — 편성 로스터(javis_formation.py REQUIRED_ROLES)와 같은 상수 하나(드리프트 핀: deptcreate.test.ts). 여기에 두 번째 목록을 적지 않는다.
+import { DEPT_SEAT_ROLES } from "./deptcreate";
 
 /** 팀을 만드는 데 보통 걸리는 시간(초) — 이 맥 실측 25~30초. */
 export const DEPT_TYPICAL_SECS = 30;
 /** '평소보다 오래' 로 바꾸는 배수 — `DEPT_TYPICAL_SECS × DEPT_SLOW_FACTOR` = 90초부터. */
 export const DEPT_SLOW_FACTOR = 3;
-/** 팀원 부팅 안내를 더 갱신하지 않는 상한(초) — 15분. 넘으면 main.ts 가 안내를 접는다(무한 갱신 금지). */
+/** 팀원 부팅 안내의 상한(초) — 15분. 닿으면 주기 갱신을 멈추고, 그때까지 의무 역할 다섯이 다 안 붙었으면 '확인 필요'를 한 번 알린다(무한 갱신 금지). */
 export const DEPT_FORMATION_CAP_SECS = 900;
 /** 팀원 부팅 안내 토스트 id 의 접두 — id 는 `dept-formation:<소켓>` 이다(탭마다 하나 · 같은 id 는 갱신된다). */
 export const DEPT_FORMATION_TOAST_PREFIX = "dept-formation:";
@@ -37,8 +44,6 @@ export const DEPT_FORMATION_REFRESH_SECS = 45;
 export const DEPT_FIRST_SEAT_WINDOW_SECS = 60;
 /** 방금 만든 팀의 빈 탭 문구 — 창(위) 안에서만. */
 export const DEPT_FIRST_SEAT_TEXT = "첫 자리를 붙이는 중입니다 — 잠시만 기다려 주세요";
-/** 팀원 안내에 싣는 사유(feed 본문)의 글자 수 상한(코드 포인트) — 넘으면 앞 299자 + `…` = 300자. */
-export const DEPT_FORMATION_DETAIL_MAX = 300;
 
 /** 경과 표기의 상한(초) — 이상한 값이 지수 표기로 화면을 어지럽히지 않게(99시간 59분 59초). */
 const ELAPSED_MAX_SECS = 359_999;
@@ -52,11 +57,9 @@ const PROGRESS_ID_MAX = 64;
 const STAGE_PREFIX = "[cys-dept] @stage ";
 /** 단계 키 — 영소문자·숫자·`_`·`-` 만, 1~32자. */
 const STAGE_KEY = /^[a-z0-9_-]{1,32}$/;
-/** 제어문자·줄바꿈·양방향 제어·제로폭 문자 — 알림 한 줄을 속이거나 깨뜨릴 수 있는 것들. */
-const INVISIBLE = /[\u{0}-\u{1f}\u{7f}-\u{9f}\u{200b}-\u{200f}\u{2028}\u{2029}\u{202a}-\u{202e}\u{2066}-\u{2069}\u{feff}]/gu;
 
-/** 팀원 부팅 안내의 상태 — 편성 스크립트(javis_formation)가 feed 로 내는 `formation-*` 종류와 짝이다(deptFormationStateOfKind). */
-export type DeptFormationState = "booting" | "complete" | "partial" | "pending" | "failed";
+/** 팀원 부팅 안내의 상태 — booting(켜는 중 · 주기 갱신) · seated(의무 역할 자리가 모두 붙음 · 한 번) · check(15분 상한까지 다 안 붙음 · 한 번). */
+export type DeptFormationState = "booting" | "seated" | "check";
 
 /** 초 → 0 이상 정수. 숫자가 아니거나 음수·NaN·무한대면 0, 소수는 내림, 상한 ELAPSED_MAX_SECS. */
 function normSecs(sec: unknown): number {
@@ -68,18 +71,6 @@ function normSecs(sec: unknown): number {
 function normSeats(n: unknown): number {
   if (typeof n !== "number" || !isFinite(n) || n < 0) return 0;
   return Math.min(Math.floor(n), SEATS_MAX);
-}
-
-/** 문자열만 받아 제어문자를 공백으로 바꾸고 공백을 접어 앞뒤를 다듬는다. 문자열이 아니면 빈 문자열. */
-function clean(v: unknown): string {
-  if (typeof v !== "string") return "";
-  return v.replace(INVISIBLE, " ").replace(/\s+/g, " ").trim();
-}
-
-/** 코드 포인트 단위 절단 — 넘으면 앞 `max-1` 자 + `…`(총 `max` 자). 이모지 같은 서로게이트 쌍을 반으로 자르지 않는다. */
-function clip(s: string, max: number): string {
-  const cs = Array.from(s);
-  return cs.length > max ? cs.slice(0, max - 1).join("") + "…" : s;
 }
 
 /**
@@ -109,7 +100,7 @@ export function deptStageLabel(stage: string | null | undefined): string | null 
     case "reserve":
       return "팀 번호를 잡는 중";
     case "probe":
-      return "이미 켜진 데몬이 있는지 확인하는 중(최대 12초)";
+      return "이미 켜진 데몬이 있는지 확인하는 중(약 12초)"; // 실측 12.8초 — '최대'가 아니다(같은 화면의 경과 초가 12를 넘는 것이 보인다)
     case "spawn":
       return "데몬을 켜는 중";
     case "wait":
@@ -188,67 +179,73 @@ export function deptFormationToastId(socket: string): string {
 }
 
 /**
- * 편성 feed 의 종류(`payload.kind`) → 안내 상태. `formation-complete`·`formation-partial`·`formation-pending`·`formation-failed` 만 알고,
- * 그 밖(다른 종류·접두만 같은 문자열·문자열이 아닌 값)은 null.
+ * 좌석 목록(`list_surfaces` 응답의 `surfaces`)에서 **종료하지 않은** 좌석의 역할만 뽑는다 — 팀원 부팅 안내의 완료 판정 입력(성찰 1회차 S4 B1).
+ * 3초 틱(refreshPaneTitles)이 소켓마다 이미 받는 목록을 그대로 쓴다(새 RPC·새 타이머 없음). 데몬 IPC 데이터라 의심한다:
+ *  · 배열이 아니면 null — '목록을 받지 못함'과 같다(호출측은 그 틱의 판정을 건너뛴다 · 빈 배열 = 데몬이 성공적으로 0개를 돌려준 것과 다르다).
+ *  · 원소가 객체가 아니거나 `exited` 가 참이면 건너뛴다(종료한 좌석은 붙은 자리가 아니다 — 같은 데이터를 읽는 입양 루프의 규칙 `s.exited ? 종료 : 살아 있음` 그대로).
+ *  · 역할이 문자열이 아니거나 비면 건너뛴다(역할 없는 셸).
  */
-export function deptFormationStateOfKind(kind: unknown): DeptFormationState | null {
-  switch (kind) {
-    case "formation-complete":
-      return "complete";
-    case "formation-partial":
-      return "partial";
-    case "formation-pending":
-      return "pending";
-    case "formation-failed":
-      return "failed";
-    default:
-      return null;
+export function deptLiveRoles(surfaces: unknown): string[] | null {
+  if (!Array.isArray(surfaces)) return null;
+  const out: string[] = [];
+  for (const s of surfaces) {
+    if (typeof s !== "object" || s === null) continue;
+    const o = s as Record<string, unknown>;
+    if (o.exited) continue;
+    if (typeof o.role === "string" && o.role !== "") out.push(o.role);
   }
+  return out;
 }
 
 /**
- * feed 항목(신뢰할 수 없는 데이터)에서 안내에 실을 사유를 뽑는다 — 본문이 있으면 본문, 없으면 제목. 둘 다 문자열이 아니거나 비면 null.
- * 제어문자·양방향 제어는 공백으로 바꾸고 공백을 접어 한 줄로 만들며 DEPT_FORMATION_DETAIL_MAX 자에서 자른다. 내용은 지어내지도 바꾸지도 않는다.
+ * 의무 역할(DEPT_SEAT_ROLES — master·cso·worker·reviewer-gemini·reviewer-codex) 가운데 붙어 있는 **서로 다른** 역할의 수(0~5).
+ * 이름이 정확히 같은 것만 센다 — 변형(`worker-2`·`cso-1`)·일회용(`cso-fresh-<epoch>`)·대소문자·공백·접두만 같은 이름은 의무 자리가 아니다. 배열이 아니면 0.
  */
-export function deptFormationDetail(body: unknown, title: unknown): string | null {
-  const b = clean(body);
-  if (b !== "") return clip(b, DEPT_FORMATION_DETAIL_MAX);
-  const t = clean(title);
-  return t !== "" ? clip(t, DEPT_FORMATION_DETAIL_MAX) : null;
+export function deptSeatedCount(roles: unknown): number {
+  if (!Array.isArray(roles)) return 0;
+  let n = 0;
+  for (const r of DEPT_SEAT_ROLES) if (roles.indexOf(r) >= 0) n++;
+  return n;
+}
+
+/** 한 틱의 판정 — skip(목록을 못 받음 · 판정 건너뜀) · wait(아직 — 상한 전) · seated(의무 역할 다섯이 모두 붙음) · check(상한에 닿았는데 다 안 붙음). */
+export type DeptFormationVerdict = "skip" | "wait" | "seated" | "check";
+
+/**
+ * 한 틱의 판정 = 그 팀 소켓의 좌석 목록에서 읽은 역할(deptLiveRoles 의 값)과 경과(초).
+ *  · roles 가 배열이 아니면(null·undefined — 이번 틱에 그 소켓의 목록을 못 받았다) **skip** — 완료로도 '확인 필요'로도 치지 않는다.
+ *  · 의무 역할 다섯이 모두 붙었으면 **seated**(경과와 무관 — 상한 틱에도 이쪽이 먼저다).
+ *  · 아니면 상한(DEPT_FORMATION_CAP_SECS = 15분)에 닿았는지로 check 또는 wait. seated 필드는 붙은 의무 역할 수(check 문구의 N).
+ */
+export function deptFormationVerdict(roles: unknown, elapsedSec: number): { verdict: DeptFormationVerdict; seated: number } {
+  if (!Array.isArray(roles)) return { verdict: "skip", seated: 0 };
+  const seated = deptSeatedCount(roles);
+  if (seated >= DEPT_SEAT_ROLES.length) return { verdict: "seated", seated };
+  return { verdict: deptFormationCapped(elapsedSec) ? "check" : "wait", seated };
 }
 
 /**
- * 팀원 부팅 안내의 제목·본문.
- *  · booting(기본): 「팀원을 켜는 중」 — 켜지는 순서·보통 시간(3~5분)·지금 자리 수·경과(분).
- *  · complete: 「팀 준비 완료」 — 자리 수와 걸린 시간(초까지).
- *  · partial·pending·failed: 「팀원 켜기 — 확인 필요」 — 본문은 받은 사유(detail)를 **그대로**(없거나 공백뿐이면 일반 안내) + 지금 자리 수·경과(분).
- *    살아 있음을 지어내지 않는다(받은 사유만 전한다).
- * seats·elapsedSec 는 음수·NaN 이면 0, 소수는 내림.
+ * 팀원 부팅 안내의 제목·본문(경과는 분 단위 — formatDeptMinutes).
+ *  · booting(기본): 「팀원을 켜는 중」 — 켜지는 순서·보통 시간(5분 안팎 — 이 맥 실측 1회 약 5분)·지금 자리 수(탭의 칸 수)·경과.
+ *  · seated: 「팀 자리가 모두 붙었습니다」 — 의무 역할 다섯이 모두 붙은 것까지만 말한다('준비 완료'라고 단정하지 않는다 — 에이전트가 실제로 떴는지는 화면이 모른다) + 걸린 시간.
+ *  · check: 「팀원 켜기 — 확인 필요」 — 15분 상한까지 다섯이 다 안 붙었다. 지금 붙은 의무 역할 수(seats) + 확인할 곳(Control Center) + 경과.
+ * seats·elapsedSec 는 음수·NaN 이면 0, 소수는 내림. 모르는 상태 값은 booting 으로 접는다(던지지 않는다).
  */
-export function deptFormationText(o: {
-  seats: number;
-  elapsedSec: number;
-  state?: DeptFormationState;
-  detail?: string | null;
-}): { title: string; body: string } {
+export function deptFormationText(o: { seats: number; elapsedSec: number; state?: DeptFormationState }): { title: string; body: string } {
   const seats = normSeats(o.seats);
   const sec = normSecs(o.elapsedSec);
   switch (o.state) {
-    case "complete":
-      return { title: "팀 준비 완료", body: `${seats}자리 · ${formatDeptElapsed(sec)} 걸렸습니다` };
-    case "partial":
-    case "pending":
-    case "failed": {
-      const detail =
-        typeof o.detail === "string" && o.detail.trim() !== ""
-          ? o.detail
-          : "일부 자리가 아직 켜지지 않았습니다 — Control Center 에서 자리 상태를 확인하세요";
-      return { title: "팀원 켜기 — 확인 필요", body: `${detail} · 지금 ${seats}자리 · 경과 ${formatDeptMinutes(sec)}` };
-    }
+    case "seated":
+      return { title: "팀 자리가 모두 붙었습니다", body: `자리 ${DEPT_SEAT_ROLES.length}개가 모두 붙었습니다 · 걸린 시간 ${formatDeptMinutes(sec)}` };
+    case "check":
+      return {
+        title: "팀원 켜기 — 확인 필요",
+        body: `아직 ${seats}자리입니다 — Control Center 에서 자리 상태를 확인하세요 · 경과 ${formatDeptMinutes(sec)}`,
+      };
     default:
       return {
         title: "팀원을 켜는 중",
-        body: `부서장·CSO·워커·리뷰어가 차례로 켜집니다(보통 3~5분) · 지금 ${seats}자리 · 경과 ${formatDeptMinutes(sec)}`,
+        body: `부서장·CSO·워커·리뷰어가 차례로 켜집니다(보통 5분 안팎) · 지금 ${seats}자리 · 경과 ${formatDeptMinutes(sec)}`,
       };
   }
 }
@@ -256,13 +253,14 @@ export function deptFormationText(o: {
 /**
  * 팀원 부팅 안내를 **다시 내야 하는지** 가르는 열쇠 — 열쇠가 바뀔 때만 안내를 갱신한다(토스트를 낼 때마다 알람 이력이 돌므로 초 단위로 부르지 않는다).
  * 열쇠 = 상태 · 자리 수 · 경과 '분' · 수명 갱신 칸(DEPT_FORMATION_REFRESH_SECS). 자리 수가 바뀌거나 분이 바뀌거나 45초 칸이 바뀌면 달라진다.
+ * (성찰 1회차 S4 m3: 토스트가 수명으로 사라졌으면 열쇠가 같아도 main.ts 가 다시 낸다 — 이 열쇠는 '살아 있는 안내를 언제 새로 고칠까'만 정한다.)
  */
 export function deptFormationNoticeKey(o: { seats: number; elapsedSec: number; state?: DeptFormationState }): string {
   const s = normSecs(o.elapsedSec);
   return `${o.state ?? "booting"}|${normSeats(o.seats)}|${Math.floor(s / 60)}|${Math.floor(s / DEPT_FORMATION_REFRESH_SECS)}`;
 }
 
-/** 팀원 부팅 안내를 접을 때인가 — 경과가 상한(DEPT_FORMATION_CAP_SECS = 15분) 이상이다. */
+/** 팀원 부팅 안내가 상한에 닿았는가 — 경과가 상한(DEPT_FORMATION_CAP_SECS = 15분) 이상이다(닿으면 주기 갱신을 멈추고, 자리 판정이 '확인 필요'를 한 번 알린다). */
 export function deptFormationCapped(elapsedSec: number): boolean {
   return normSecs(elapsedSec) >= DEPT_FORMATION_CAP_SECS;
 }

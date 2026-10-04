@@ -4,8 +4,10 @@
 //   · 대기 문구는 거짓 약속을 하지 않는다 — 옛 "최대 십여 초" 는 실측(25~30초 · 느린 PC 1분+)과 달랐다. 90초 미만은 실측 범위, 90초부터 '평소보다 오래'.
 //   · 단계 표지(`[cys-dept] @stage <키>`)는 키 7종만 한글 줄이 되고 모르는 키·빈 값은 단계 줄 없이 경과만 보인다(구 팩에도 견딘다).
 //   · 표지 파서는 Rust 쪽 같은 이름의 파서와 **같은 벡터표**를 잰다(이 파일이 src-tauri/src/main.rs 의 표를 소스에서 읽어 자기 표와 대조한다).
-//   · 팀원 부팅 안내: 5상태 문구 · '확인 필요' 는 받은 사유를 그대로(없으면 일반 안내) · 갱신 열쇠(자리 수·경과 분·45초 칸) · 15분 상한 · 첫 자리 창(60초).
-//   · 신뢰할 수 없는 입력(이벤트 payload·feed 본문)은 걸러 낸다 — 단계 키 정규식 · 사유의 제어문자·길이.
+//   · 팀원 부팅 안내(R1F-UB 개정): 3상태 문구(켜는 중 · 자리가 모두 붙음 · 확인 필요) · 갱신 열쇠(자리 수·경과 분·45초 칸) · 15분 상한 · 첫 자리 창(60초).
+//     완료 판정(좌석 목록의 역할 다섯)은 deptprogressseats.test.ts 가 지킨다 — 편성 결과 feed 를 읽던 판정·사유 정제(deptFormationStateOfKind·deptFormationDetail)는 걷었다(S4 B1).
+//   · 화면 문구의 수치는 **잰 만큼만**(S4 M1): 사전 검사는 「약 12초」(실측 12.8초 — '최대'가 아니다) · 팀원이 켜지는 데는 「보통 5분 안팎」(실측 1회 약 5분 — 3분 쪽은 잰 적이 없다).
+//   · 신뢰할 수 없는 입력(이벤트 payload)은 걸러 낸다 — 단계 키 정규식.
 //   · 순수 모듈 불변식: 최상위 부수효과 0 · 문서/창/저장소 낱말 0 · 구형 WKWebView 비호환 문법 0.
 import { describe, it, expect } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -17,7 +19,6 @@ import {
   DEPT_FORMATION_REFRESH_SECS,
   DEPT_FIRST_SEAT_WINDOW_SECS,
   DEPT_FIRST_SEAT_TEXT,
-  DEPT_FORMATION_DETAIL_MAX,
   deptStageLabel,
   deptPendingText,
   formatDeptElapsed,
@@ -27,8 +28,6 @@ import {
   deptProgressId,
   parseDeptProgressPayload,
   deptFormationToastId,
-  deptFormationStateOfKind,
-  deptFormationDetail,
   deptFormationText,
   deptFormationNoticeKey,
   deptFormationCapped,
@@ -38,19 +37,13 @@ import {
 } from "./deptprogress";
 
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf-8");
-const cpLen = (s: string): number => Array.from(s).length;
-
-/** 보이지 않는 문자 — 원문에 raw 로 두지 않고 코드로 만든다. */
-const BIDI = String.fromCharCode(0x202e);
-const ZWSP = String.fromCharCode(0x200b);
-const NUL = String.fromCharCode(0);
 
 // ── 문안 전문(티켓 문구 그대로 — 모듈 상수로 다시 짓지 않고 리터럴로 적는다: 문구가 바뀌면 여기서 적색) ──
 const NORMAL = (elapsed: string): string => `팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 ${elapsed}`;
 const SLOW = (elapsed: string): string => `평소보다 오래 걸리고 있습니다 — 그대로 기다려 주세요(중간에 닫으면 만들던 팀이 정리됩니다) · 경과 ${elapsed}`;
 const STAGES: [string, string][] = [
   ["reserve", "팀 번호를 잡는 중"],
-  ["probe", "이미 켜진 데몬이 있는지 확인하는 중(최대 12초)"],
+  ["probe", "이미 켜진 데몬이 있는지 확인하는 중(약 12초)"],
   ["spawn", "데몬을 켜는 중"],
   ["wait", "데몬이 팩을 설치하는 중(파일 수백 개)"],
   ["up", "데몬이 켜졌습니다 — 설정을 심는 중"],
@@ -87,6 +80,11 @@ describe("deptStageLabel — 키 7종 + 모르는 키", () => {
     }
     expect(deptStageLabel(null)).toBeNull();
     expect(deptStageLabel(undefined)).toBeNull();
+  });
+  it("★S4 M1: 사전 검사 문구는 「약 12초」 — 실측 12.8초라 '최대'가 아니다(경과 초가 12를 넘는 것이 같은 화면에 보인다) · 어느 단계 문구에도 '최대'가 없다", () => {
+    expect(deptStageLabel("probe")).toBe("이미 켜진 데몬이 있는지 확인하는 중(약 12초)");
+    for (const [key] of STAGES) expect({ 키: key, 최대: (deptStageLabel(key) ?? "").includes("최대") }).toEqual({ 키: key, 최대: false });
+    for (const rel of ["./deptprogress.ts", "./main.ts"]) expect({ 파일: rel, 최대12초: read(rel).includes("최대 12초") }).toEqual({ 파일: rel, 최대12초: false });
   });
   it("프로토타입 이름·문자열이 아닌 값에도 속지 않는다", () => {
     for (const bad of ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf", "prototype"]) {
@@ -301,102 +299,64 @@ describe("진행 id·이벤트 payload", () => {
   });
 });
 
-describe("deptFormationText — 5상태 × detail 유/무", () => {
-  const BOOT = (seats: number, elapsed: string): string => `부서장·CSO·워커·리뷰어가 차례로 켜집니다(보통 3~5분) · 지금 ${seats}자리 · 경과 ${elapsed}`;
-  const DEFAULT_DETAIL = "일부 자리가 아직 켜지지 않았습니다 — Control Center 에서 자리 상태를 확인하세요";
-  const CHECK_TITLE = "팀원 켜기 — 확인 필요";
+describe("deptFormationText — 3상태(booting · seated · check)", () => {
+  const BOOT = (seats: number, elapsed: string): string => `부서장·CSO·워커·리뷰어가 차례로 켜집니다(보통 5분 안팎) · 지금 ${seats}자리 · 경과 ${elapsed}`;
 
-  it("booting(기본) — 제목 「팀원을 켜는 중」 · 본문에 순서·보통 시간·자리 수·경과(분)", () => {
+  it("booting(기본) — 제목 「팀원을 켜는 중」 · 본문에 순서·보통 시간(5분 안팎)·자리 수·경과(분)", () => {
     expect(deptFormationText({ seats: 0, elapsedSec: 0 })).toEqual({ title: "팀원을 켜는 중", body: BOOT(0, "1분 미만") });
     expect(deptFormationText({ seats: 3, elapsedSec: 125, state: "booting" })).toEqual({ title: "팀원을 켜는 중", body: BOOT(3, "2분") });
     expect(deptFormationText({ seats: 5, elapsedSec: 60 }).body).toBe(BOOT(5, "1분"));
-    // state 를 생략한 것과 booting 은 같다 · detail 은 booting 에서 쓰지 않는다
+    // state 를 생략한 것과 booting 은 같다
     expect(deptFormationText({ seats: 2, elapsedSec: 10 })).toEqual(deptFormationText({ seats: 2, elapsedSec: 10, state: "booting" }));
-    expect(deptFormationText({ seats: 2, elapsedSec: 10, state: "booting", detail: "사유" }).body).toBe(BOOT(2, "1분 미만"));
   });
-  it("complete — 제목 「팀 준비 완료」 · 본문 「<자리>자리 · <시간> 걸렸습니다」(초까지)", () => {
-    expect(deptFormationText({ seats: 5, elapsedSec: 252, state: "complete" })).toEqual({ title: "팀 준비 완료", body: "5자리 · 4분 12초 걸렸습니다" });
-    expect(deptFormationText({ seats: 5, elapsedSec: 30, state: "complete" }).body).toBe("5자리 · 30초 걸렸습니다");
-    expect(deptFormationText({ seats: 4, elapsedSec: 60, state: "complete" }).body).toBe("4자리 · 1분 0초 걸렸습니다");
-    // detail 은 complete 에서 쓰지 않는다(완료를 사유로 덮지 않는다)
-    expect(deptFormationText({ seats: 5, elapsedSec: 30, state: "complete", detail: "무시됨" }).body).toBe("5자리 · 30초 걸렸습니다");
-  });
-  for (const state of ["partial", "pending", "failed"] as DeptFormationState[]) {
-    it(`${state} — 제목 「팀원 켜기 — 확인 필요」 · 본문 = 받은 사유 **그대로** + 지금 자리·경과(분)`, () => {
-      const detail = "worker·reviewer-codex 자리가 아직 안 떴습니다(CLI 미설치?)  — 공백 두 칸 · 그대로";
-      expect(deptFormationText({ seats: 2, elapsedSec: 200, state, detail })).toEqual({
-        title: CHECK_TITLE,
-        body: `${detail} · 지금 2자리 · 경과 3분`,
-      });
-      // 사유는 다듬지 않는다 — 앞뒤 공백·줄바꿈까지 받은 그대로(정제는 deptFormationDetail 의 일이고 이 함수는 전하기만 한다)
-      expect(deptFormationText({ seats: 2, elapsedSec: 200, state, detail: "  앞뒤 공백 유지  " }).body).toBe("  앞뒤 공백 유지   · 지금 2자리 · 경과 3분");
-      expect(deptFormationText({ seats: 2, elapsedSec: 200, state, detail: "첫 줄\n둘째 줄" }).body).toBe("첫 줄\n둘째 줄 · 지금 2자리 · 경과 3분");
-      // 사유가 없으면(없음·null·빈 문자열·공백뿐) 일반 안내
-      for (const none of [undefined, null, "", "   ", "\n\t"]) {
-        expect({ 사유: none, 값: deptFormationText({ seats: 1, elapsedSec: 5, state, detail: none }) }).toEqual({
-          사유: none,
-          값: { title: CHECK_TITLE, body: `${DEFAULT_DETAIL} · 지금 1자리 · 경과 1분 미만` },
-        });
+  it("★S4 M1: 보통 시간은 잰 만큼만 — 「보통 5분 안팎」(실측 1회 약 5분) · 재 본 적 없는 하한 「3~5분」 은 어떤 상태·입력에서도 나오지 않는다", () => {
+    expect(deptFormationText({ seats: 1, elapsedSec: 10 }).body).toContain("(보통 5분 안팎)");
+    for (const state of ["booting", "seated", "check"] as DeptFormationState[])
+      for (const sec of [0, 59, 60, 300, 900, 5000]) {
+        const t = deptFormationText({ seats: 3, elapsedSec: sec, state });
+        expect({ state, sec, 하한: (t.title + t.body).includes("3~5분") }).toEqual({ state, sec, 하한: false });
       }
-      expect(deptFormationText({ seats: 1, elapsedSec: 5, state, detail: 7 as unknown as string }).body).toContain(DEFAULT_DETAIL);
-    });
-  }
-  it("★살아 있음을 지어내지 않는다 — '확인 필요' 문구에는 받은 사유 말고 성공·정상을 암시하는 낱말이 없다", () => {
-    for (const state of ["partial", "pending", "failed"] as DeptFormationState[]) {
-      const t = deptFormationText({ seats: 1, elapsedSec: 30, state, detail: "사유X" });
-      expect(t.body).toBe("사유X · 지금 1자리 · 경과 1분 미만");
-      for (const lie of ["완료", "정상", "준비됐", "켜졌습니다", "성공"]) expect({ 낱말: lie, 있음: t.title.includes(lie) || t.body.includes(lie) }).toEqual({ 낱말: lie, 있음: false });
-    }
-    // 일반 안내도 '아직 켜지지 않았다'만 말한다.
-    expect(deptFormationText({ seats: 1, elapsedSec: 30, state: "partial" }).body).toContain("아직 켜지지 않았습니다");
+    for (const rel of ["./deptprogress.ts", "./main.ts"]) expect({ 파일: rel, 하한: read(rel).includes("보통 3~5분") }).toEqual({ 파일: rel, 하한: false });
   });
-  it("자리 수·경과가 이상해도 던지지 않고 0 으로 접는다", () => {
+  it("seated — 제목 「팀 자리가 모두 붙었습니다」 · 본문 「자리 5개가 모두 붙었습니다 · 걸린 시간 <분>」(formatDeptMinutes) — '준비 완료'라고 단정하지 않는다", () => {
+    expect(deptFormationText({ seats: 5, elapsedSec: 252, state: "seated" })).toEqual({ title: "팀 자리가 모두 붙었습니다", body: "자리 5개가 모두 붙었습니다 · 걸린 시간 4분" });
+    expect(deptFormationText({ seats: 5, elapsedSec: 30, state: "seated" }).body).toBe("자리 5개가 모두 붙었습니다 · 걸린 시간 1분 미만");
+    expect(deptFormationText({ seats: 5, elapsedSec: 60, state: "seated" }).body).toBe("자리 5개가 모두 붙었습니다 · 걸린 시간 1분");
+  });
+  it("check — 제목 「팀원 켜기 — 확인 필요」 · 본문 「아직 <N>자리입니다 — Control Center 에서 자리 상태를 확인하세요 · 경과 <분>」", () => {
+    expect(deptFormationText({ seats: 3, elapsedSec: 900, state: "check" })).toEqual({
+      title: "팀원 켜기 — 확인 필요",
+      body: "아직 3자리입니다 — Control Center 에서 자리 상태를 확인하세요 · 경과 15분",
+    });
+    expect(deptFormationText({ seats: 0, elapsedSec: 905, state: "check" }).body).toBe("아직 0자리입니다 — Control Center 에서 자리 상태를 확인하세요 · 경과 15분");
+  });
+  it("★살아 있음을 지어내지 않는다 — 자리 판정 문구(seated·check)에 완료·준비됐·정상·성공·켜졌습니다 낱말이 없다(에이전트가 실제로 떴는지는 화면이 모른다)", () => {
+    for (const state of ["seated", "check"] as DeptFormationState[]) {
+      const t = deptFormationText({ seats: 1, elapsedSec: 30, state });
+      for (const lie of ["완료", "준비됐", "정상", "켜졌습니다", "성공"]) expect({ state, 낱말: lie, 있음: (t.title + t.body).includes(lie) }).toEqual({ state, 낱말: lie, 있음: false });
+    }
+    // 켜는 중 문구도 '곧 켜진다'가 아니라 순서·보통 시간·지금 자리 수만 말한다
+    expect(deptFormationText({ seats: 1, elapsedSec: 30 }).body.includes("완료")).toBe(false);
+  });
+  it("모르는 상태(옛 partial·pending·failed·complete 같은 값)는 던지지 않고 켜는 중 문구 — 사유(detail)를 싣던 경로는 없다", () => {
+    for (const old of ["partial", "pending", "failed", "complete", "", "x"]) {
+      const t = deptFormationText({ seats: 2, elapsedSec: 10, state: old as unknown as DeptFormationState, detail: "사유" } as never);
+      expect({ 상태: old, 값: t }).toEqual({ 상태: old, 값: { title: "팀원을 켜는 중", body: BOOT(2, "1분 미만") } });
+      expect(t.body.includes("사유")).toBe(false);
+    }
+  });
+  it("자리 수·경과가 이상해도 던지지 않고 0 으로 접는다 — 세 상태 모두", () => {
     expect(deptFormationText({ seats: -2, elapsedSec: -5 }).body).toBe(BOOT(0, "1분 미만"));
-    expect(deptFormationText({ seats: Number.NaN, elapsedSec: Number.NaN, state: "complete" }).body).toBe("0자리 · 0초 걸렸습니다");
+    expect(deptFormationText({ seats: Number.NaN, elapsedSec: Number.NaN, state: "seated" }).body).toBe("자리 5개가 모두 붙었습니다 · 걸린 시간 1분 미만");
+    expect(deptFormationText({ seats: Number.NaN, elapsedSec: Number.NaN, state: "check" }).body).toBe("아직 0자리입니다 — Control Center 에서 자리 상태를 확인하세요 · 경과 1분 미만");
     expect(deptFormationText({ seats: 2.9, elapsedSec: 125.9 }).body).toBe(BOOT(2, "2분"));
     expect(deptFormationText({ seats: 1e9, elapsedSec: 0 }).body).toBe(BOOT(999, "1분 미만"));
   });
   it("★옛 거짓 약속 「십여 초」 는 팀원 안내에도 없다", () => {
-    for (const state of ["booting", "complete", "partial", "pending", "failed"] as DeptFormationState[]) {
+    for (const state of ["booting", "seated", "check"] as DeptFormationState[]) {
       const t = deptFormationText({ seats: 3, elapsedSec: 100, state });
       expect((t.title + t.body).includes("십여")).toBe(false);
     }
-  });
-});
-
-describe("편성 feed → 안내 상태 · 사유 정제", () => {
-  it("deptFormationStateOfKind — formation-* 4종만", () => {
-    expect(deptFormationStateOfKind("formation-complete")).toBe("complete");
-    expect(deptFormationStateOfKind("formation-partial")).toBe("partial");
-    expect(deptFormationStateOfKind("formation-pending")).toBe("pending");
-    expect(deptFormationStateOfKind("formation-failed")).toBe("failed");
-    for (const bad of ["formation", "formation-", "formation-complete ", "Formation-complete", "approval", "formation-other", "", null, undefined, 7, {}, []]) {
-      expect({ kind: bad, 상태: deptFormationStateOfKind(bad) }).toEqual({ kind: bad, 상태: null });
-    }
-  });
-  it("deptFormationDetail — 본문 우선 · 없으면 제목 · 둘 다 없으면 null", () => {
-    expect(deptFormationDetail("본문입니다", "제목")).toBe("본문입니다");
-    expect(deptFormationDetail("", "제목")).toBe("제목");
-    expect(deptFormationDetail("   ", "제목")).toBe("제목");
-    expect(deptFormationDetail(undefined, "제목")).toBe("제목");
-    expect(deptFormationDetail(null, null)).toBeNull();
-    expect(deptFormationDetail("", "")).toBeNull();
-    expect(deptFormationDetail(5, {})).toBeNull();
-  });
-  it("제어문자·줄바꿈·양방향 제어는 공백으로 접고 앞뒤를 다듬는다 · HTML 은 해석하지 않고 글자 그대로", () => {
-    expect(deptFormationDetail(`a${NUL}b\n c\t d  ${BIDI}e${ZWSP}f`, "")).toBe("a b c d e f");
-    expect(deptFormationDetail("<b>굵게</b> & <img src=x onerror=alert(1)>", "")).toBe("<b>굵게</b> & <img src=x onerror=alert(1)>");
-  });
-  it("300자(코드 포인트)에서 자른다 — 넘으면 앞 299자 + …", () => {
-    expect(DEPT_FORMATION_DETAIL_MAX).toBe(300);
-    const exact = "가".repeat(300);
-    expect(deptFormationDetail(exact, "")).toBe(exact);
-    const over = deptFormationDetail("가".repeat(301), "") as string;
-    expect(cpLen(over)).toBe(300);
-    expect(over.endsWith("…")).toBe(true);
-    const emoji = deptFormationDetail("😀".repeat(400), "") as string;
-    expect(cpLen(emoji)).toBe(300); // 서로게이트 쌍을 반으로 자르지 않는다
-    expect(emoji.includes("\ud83d ")).toBe(false);
   });
 });
 
@@ -414,7 +374,7 @@ describe("갱신 열쇠 · 상한 · 첫 자리 창", () => {
     expect(deptFormationNoticeKey({ seats: 1, elapsedSec: 89 })).not.toBe(deptFormationNoticeKey({ seats: 1, elapsedSec: 90 }));
   });
   it("상태가 바뀌면 달라진다 · 상태를 생략하면 booting", () => {
-    expect(deptFormationNoticeKey({ seats: 1, elapsedSec: 10, state: "partial" })).not.toBe(deptFormationNoticeKey({ seats: 1, elapsedSec: 10, state: "booting" }));
+    expect(deptFormationNoticeKey({ seats: 1, elapsedSec: 10, state: "check" })).not.toBe(deptFormationNoticeKey({ seats: 1, elapsedSec: 10, state: "booting" }));
     expect(deptFormationNoticeKey({ seats: 1, elapsedSec: 10 })).toBe(deptFormationNoticeKey({ seats: 1, elapsedSec: 10, state: "booting" }));
   });
   it("★3초 틱으로 5분을 돌려도 열쇠가 바뀌는 횟수는 한 자릿수·두 갱신 사이는 47초 이하(초 단위 호출 없음 · 토스트가 사라지지 않음)", () => {

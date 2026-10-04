@@ -1081,10 +1081,83 @@ describe("0.14.43 A3 — 제공자별 접힘 요약", () => {
     const m = buildUsageBarModel([C("c1", { p5: 50, age: 7200 }), X("x1", { p7: 20, age: 7200 })], NOW, okFetch, noRedact);
     expect(m.headline).toBe("C 5h50%? │ X 7d20%? (오래됨)");
   });
-  it("headlineSev 는 약식 요약에서도 주 계정 창들의 최고 심각도", () => {
+  // ★R1F-UB(S2 m-3): 이름을 고쳤다 — 종전 이름 「주 계정 창들의 최고 심각도」 는 약식 요약에서 사실이 아니게 됐다(색이 요약에 실린 값들로 계산된다). 단언은 그대로다.
+  it("headlineSev 는 약식 요약에서 요약에 실린 값들의 최고 심각도", () => {
     const m = buildUsageBarModel([C("c1", { p5: 95, p7: 10 }), X("x1", { p7: 50 })], NOW, okFetch, noRedact);
     expect(m.headline).toBe("C 5h95%·7d10% │ X 7d50%");
     expect(m.headlineSev).toBe("crit");
+  });
+  // ── ★R1F-UB(S2 m-3) 접힌 요약의 숫자와 색이 서로 다른 계정을 봤다 — 숫자는 제공자 안 신선한 계정들의 최댓값(providerWindow)이고 색은 **주 계정**(사용 중 우선)의 창뿐이었다.
+  //    주 계정이 사용 중·저사용이고 같은 제공자의 다른 계정이 높으면 96% 가 무색으로 찍혔다(탐침 ② F5). 약식 요약이면 색도 요약에 실린 값들로 계산한다(오래됨 `?` 값은 제외).
+  it("★F5(탐침 ②): 주 계정(사용 중 · 10%/12%)이 낮고 같은 제공자의 다른 계정이 96% 면 — 요약은 96% 를 싣고 색도 crit", () => {
+    const inUseLow = C("u-low", { p5: 10, p7: 12, in_use: true, age: 10, profiles: [".cys/claude"], current: [".cys/claude"] });
+    const outsideHigh = C("u-high", { p5: 96, p7: 40, in_use: false, age: 15, src: "statusline-outside", profiles: [".claude"], current: [".claude"] });
+    const codex = X("cx", { p7: 50, age: 60, in_use: true });
+    const m = buildUsageBarModel([inUseLow, outsideHigh, codex], NOW, okFetch, noRedact);
+    expect(m.primary!.label).toBe("좌석"); // 주 계정은 종전대로 사용 중(결재 사항 — 바꾸지 않는다)
+    expect(m.headline).toBe("C 5h96%·7d40% │ X 7d50%");
+    expect(m.headlineSev).toBe("crit");
+    // 주 계정 자신의 창은 여전히 무색이다(그 줄의 색은 그 계정의 값)
+    expect(m.primary!.windows.map((w) => w.sev)).toEqual(["", ""]);
+  });
+  it("대조(오너 결재 — 바꾸지 않는다): 제공자가 하나뿐이면 접힌 줄은 주 계정의 두 창이고 색도 주 계정 것 — 96% 계정이 줄에 안 보이면 색도 없다(탐침 ② F5b)", () => {
+    const inUseLow = C("u-low", { p5: 10, p7: 12, in_use: true, age: 10, profiles: [".cys/claude"], current: [".cys/claude"] });
+    const outsideHigh = C("u-high", { p5: 96, p7: 40, in_use: false, age: 15, profiles: [".claude"], current: [".claude"] });
+    const m = buildUsageBarModel([inUseLow, outsideHigh], NOW, okFetch, noRedact);
+    expect(m.headline).toBe("5h 10% · 7d 12%");
+    expect(m.headlineTitle).toBe("");
+    expect(m.headlineSev).toBe("");
+  });
+  it("색은 요약에 실린 값들의 최고 심각도 — crit > warn > 없음 · 제공자·창을 가리지 않는다", () => {
+    const sev = (rows: AcctRow[]) => buildUsageBarModel(rows, NOW, okFetch, noRedact).headlineSev;
+    // Claude 낮음 · Codex 7d 가 warn/crit
+    expect(sev([C("c", { p5: 10, p7: 10, in_use: true }), X("x", { p7: 75 })])).toBe("warn");
+    expect(sev([C("c", { p5: 10, p7: 10, in_use: true }), X("x", { p7: 95 })])).toBe("crit");
+    // 주 계정이 아닌 Antigravity 의 5h 가 warn
+    expect(sev([C("c", { p5: 10, p7: 10, in_use: true }), A("a", { p5: 71 })])).toBe("warn");
+    // 둘 다 낮으면 없음(경계 69)
+    expect(sev([C("c", { p5: 69, p7: 10, in_use: true }), X("x", { p7: 69 })])).toBe("");
+    // warn 과 crit 이 섞이면 crit — 요약에 실린 순서(제공자 순서 claude → codex → antigravity)와 무관하다
+    expect(sev([C("c", { p5: 75, p7: 10, in_use: true }), X("x", { p7: 95 })])).toBe("crit"); // warn 이 먼저, crit 가 나중
+    expect(sev([C("c", { p5: 95, p7: 10, in_use: true }), X("x", { p7: 75 })])).toBe("crit"); // crit 가 먼저, warn 이 나중(뒤의 warn 이 앞의 crit 를 덮지 않는다)
+    expect(sev([C("c", { p5: 95, p7: 75, in_use: true }), X("x", { p7: 10 })])).toBe("crit"); // 같은 제공자 안에서도(5h crit · 7d warn)
+    // 임계 경계 — 70 은 warn · 90 은 crit(windowView 의 선과 같다)
+    expect(sev([C("c", { p5: 10, in_use: true }), X("x", { p7: 70 })])).toBe("warn");
+    expect(sev([C("c", { p5: 10, in_use: true }), X("x", { p7: 90 })])).toBe("crit");
+  });
+  it("★오래됨 `?` 값은 색에서 제외 — 그 제공자에 오래되지 않은 계정이 없어 오래된 값이 `?` 로 실린 창은 무색(경고색을 걷는 규칙과 같다)", () => {
+    // Codex 의 유일한 관측이 3시간 전 95% → 요약에는 `X 7d95%?` 로 실리지만 색은 없다
+    const m = buildUsageBarModel([C("c", { p5: 10, p7: 10, in_use: true }), X("x", { p7: 95, age: 3 * 3600 })], NOW, okFetch, noRedact);
+    expect(m.headline).toBe("C 5h10%·7d10% │ X 7d95%?");
+    expect(m.headlineSev).toBe("");
+    // 스냅샷도 오래된 값
+    const s = buildUsageBarModel([C("c", { p5: 10, in_use: true }), A("a", { p5: 99, src: "snapshot", age: 600 })], NOW, okFetch, noRedact);
+    expect(s.headline).toBe("C 5h10% │ A 5h99%?");
+    expect(s.headlineSev).toBe("");
+    // 대조: 같은 제공자에 신선한 계정이 있으면 오래된 계정의 99% 는 요약에도 색에도 끼지 않는다
+    const mix = buildUsageBarModel([C("fresh", { p5: 10, in_use: true, age: 10 }), C("old", { p5: 99, age: 7200, profiles: [".claude-2"] }), X("x", { p7: 20 })], NOW, okFetch, noRedact);
+    expect(mix.headline).toBe("C 5h10% │ X 7d20%");
+    expect(mix.headlineSev).toBe("");
+  });
+  it("리셋 지난 창('리셋됨')은 색이 없다 — 지난 99% 를 외치지 않는다", () => {
+    const c = C("c", { p7: 10, in_use: true });
+    c.rate = [win("5h", 99, NOW - 1), win("7d", 10)];
+    const m = buildUsageBarModel([c, X("x", { p7: 20 })], NOW, okFetch, noRedact);
+    expect(m.headline).toBe("C 5h리셋됨·7d10% │ X 7d20%");
+    expect(m.headlineSev).toBe("");
+  });
+  it("숨긴 계정의 값은 요약에도 색에도 끼지 않는다(후보·줄·요약에서 빠진다는 종전 규칙 그대로)", () => {
+    const hot = C("hot", { p5: 96, age: 10, profiles: [".claude-2"] });
+    const rows = [C("c", { p5: 10, in_use: true }), hot, X("x", { p7: 20 })];
+    expect(buildUsageBarModel(rows, NOW, okFetch, noRedact).headlineSev).toBe("crit");
+    const m = buildUsageBarModel(rows, NOW, okFetch, noRedact, false, new Set([acctKey(hot)]));
+    expect(m.headline).toBe("C 5h10% │ X 7d20%");
+    expect(m.headlineSev).toBe("");
+  });
+  it("접미 ' (오래됨)'(주 계정이 오래됨)은 색과 무관하게 종전 그대로", () => {
+    const m = buildUsageBarModel([C("c1", { p5: 50, age: 7200 }), X("x1", { p7: 20, age: 7200 })], NOW, okFetch, noRedact);
+    expect(m.headline).toBe("C 5h50%? │ X 7d20%? (오래됨)");
+    expect(m.headlineSev).toBe("");
   });
 });
 
@@ -1352,5 +1425,114 @@ describe("aggSeatRates — 전 좌석 폴백 집계(옛 좌석 값을 되살리�
       expect({ 사례: name, 새: aggSeatRates(fleet, NOW)["5h"].used }).toEqual({ 사례: name, 새: 30 });
       expect({ 사례: name, 종전이_다르다: legacyAggRate(fleet)["5h"].used !== 30 }).toEqual({ 사례: name, 종전이_다르다: true });
     }
+  });
+});
+
+// ═════════ 성찰 1회차 R1F-UB (S2 m-1 ⓑ · n-9 ⓐ · m-4) — 표시의 모순·문구를 사실대로 ═════════
+// 데몬 쪽 원인 수정(R1F-US 레인: 좌석 폴더의 신원을 current_profiles 에 합친다)과 별개로, 화면은 구 데몬·혼재 구성에서도 모순을 내지 않게 방어한다.
+// 아래 행은 탐침 ②(S2-REPORT 부록 B)의 F1 과 같은 모양이다 — 데몬 계약대로 만든 합성 행(이메일·id 는 지어낸 값).
+describe("R1F-UB(S2 m-1 ⓑ) — in_use === true 인 계정은 '이전 로그인'이 아니다(사이드바 라벨 · Control Center 배지 판정)", () => {
+  /** F1 — 이름 규칙 밖 설정 폴더(CYS_ACCOUNT_DIR=<임의 경로>)를 쓰는 좌석의 계정: in_use=true(좌석 폴더 신원 일치) · current_profiles=[](열거 정본에 없는 폴더) · profiles=["work/acct"]. */
+  const f1 = (over: Partial<AcctRow> = {}): AcctRow =>
+    acct({ account_id: "u-custom", label: "a-s2@example.test", profiles: ["work/acct"], current_profiles: [], in_use: true, updated_at: NOW - 20, stale_secs: 20, rate: [win("5h", 42), win("7d", 30)], ...over });
+  it("★F1: 라벨에 '(이전 로그인)' 이 붙지 않는다 · isPreviousLogin 은 거짓 — 같은 행의 0.14.42 라벨 'Claude' 로 돌아온다(profiles 폴백)", () => {
+    expect(accountShortLabel(f1())).toBe("Claude");
+    expect(isPreviousLogin(f1())).toBe(false);
+    const legacy = f1() as Record<string, unknown>;
+    delete legacy.current_profiles;
+    delete legacy.in_use;
+    expect(accountShortLabel(legacy as AcctRow)).toBe("Claude"); // 0.14.42 데몬(키 없음)이 보낸 같은 계정
+  });
+  it("profiles 에서 폴더 라벨을 만들 수 있으면 그것으로 — 폴백 규칙은 profiles 의 기존 규칙 그대로(claude-N > 좌석 > 부서 x)", () => {
+    expect(accountShortLabel(f1({ profiles: [".claude-2"] }))).toBe("claude-2");
+    expect(accountShortLabel(f1({ profiles: [".cys/claude"] }))).toBe("좌석");
+    expect(accountShortLabel(f1({ profiles: [".cys/claude-default-dept-1"] }))).toBe("부서 dept-1");
+    expect(accountShortLabel(f1({ profiles: [] }))).toBe("Claude");
+  });
+  it("대조(종전 그대로): in_use 가 true 가 아니면(false · null · 키 없음 · 문자열 'true') current_profiles 가 빈 배열인 claude 는 '이전 로그인'", () => {
+    for (const inUse of [false, null, undefined, "true" as unknown as boolean]) {
+      const a = f1({ in_use: inUse });
+      expect({ in_use: inUse, 라벨: accountShortLabel(a), 이전: isPreviousLogin(a) }).toEqual({ in_use: inUse, 라벨: "Claude (이전 로그인)", 이전: true });
+    }
+  });
+  it("사용 중이어도 current_profiles 에 폴더가 있으면 그것이 먼저(폴백은 라벨을 못 만들 때만) · 별명은 늘 먼저", () => {
+    expect(accountShortLabel(f1({ current_profiles: [".claude-3"], profiles: [".claude-2"] }))).toBe("claude-3");
+    expect(isPreviousLogin(f1({ current_profiles: [".claude-3"] }))).toBe(false);
+    expect(accountShortLabel(f1({ alias: "업무" }))).toBe("업무");
+  });
+  it("current 에 폴더 라벨을 못 만드는 경로뿐이어도 사용 중이면 '이전 로그인' 이 아니다(profiles 폴백)", () => {
+    expect(accountShortLabel(f1({ current_profiles: ["/weird/place"], profiles: [".claude-2"] }))).toBe("claude-2");
+    expect(accountShortLabel(f1({ current_profiles: ["/weird/place"], profiles: [] }))).toBe("Claude");
+    // 사용 중이 아니면 종전대로(위 표의 '폴더 라벨을 하나도 못 만들면 이전 로그인' 규칙)
+    expect(accountShortLabel(f1({ in_use: false, current_profiles: ["/weird/place"] }))).toBe("Claude (이전 로그인)");
+  });
+  it("claude 가 아닌 제공자: 사용 중 + current 빈 배열 → 제공자 라벨(종전과 같다 — '이전 로그인' 은 claude 에만 붙는다)", () => {
+    expect(accountShortLabel(f1({ provider: "codex", profiles: [".codex"] }))).toBe("Codex");
+    expect(isPreviousLogin(f1({ provider: "codex" }))).toBe(false);
+    expect(accountShortLabel(f1({ provider: "antigravity", profiles: [] }))).toBe("Antigravity");
+  });
+  it("★모델: 사용 중인 계정이 있는 사이드바 어디에도 '이전 로그인' 문구가 없다 · 사용 중이 아닌 계정의 줄에만 있다(주 계정 라벨·표식 · 다른 줄 · 요약)", () => {
+    const inUse = f1();
+    const m = buildUsageBarModel([inUse], NOW, okFetch, noRedact);
+    expect(m.primary!.label).toBe("Claude");
+    expect(m.primary!.inUse).toBe(true);
+    expect(JSON.stringify(m).includes("이전 로그인")).toBe(false);
+    // 사용 중이 아닌 옛 계정은 종전대로 — 라벨에만 있고 사용 중 표식은 없다
+    const prev = f1({ account_id: "u-prev", in_use: false, updated_at: NOW - 3 * 3600, stale_secs: 3 * 3600, profiles: [".claude-9"] });
+    const both = buildUsageBarModel([inUse, prev], NOW, okFetch, noRedact);
+    expect(both.primary!.label).toBe("Claude");
+    expect(both.others.map((o) => [o.label, o.inUse])).toEqual([["Claude (이전 로그인)", false]]);
+  });
+  it("라벨이 겹치는 계정의 구분 꼬리표 규칙은 그대로(사용 중 계정끼리 같은 'Claude' 면 이메일 꼬리표)", () => {
+    const m = buildUsageBarModel([f1(), f1({ account_id: "u-two", label: "b-s2@example.test", rate: [win("5h", 10)] })], NOW, okFetch, noRedact);
+    expect([m.primary!.label, m.others[0].label]).toEqual(["Claude ·a-s2@example.test", "Claude ·b-s2@example.test"]);
+  });
+});
+
+describe("R1F-UB(S2 n-9 ⓐ) — 계정 툴팁의 '설정 폴더:' 는 current_profiles 가 있으면 그것을, 없으면 종전 profiles 를", () => {
+  const FOLDERS = "설정 폴더:";
+  const primaryFolders = (a: AcctRow, hidePaths = false): string | undefined =>
+    buildUsageBarModel([a], NOW, okFetch, noRedact, hidePaths).primary!.tooltip.split("\n").find((l) => l.startsWith(FOLDERS));
+  const row = (over: Partial<AcctRow>): AcctRow => acct({ account_id: "tip", profiles: [".claude-4", ".cys/claude"], rate: [win("5h", 5)], ...over });
+  it("★current_profiles 가 배열이면 그것만 — 추가 전용 profiles 에 남은 옛 로그인 폴더는 툴팁에 나오지 않는다(라벨과 같은 규칙)", () => {
+    expect(primaryFolders(row({ current_profiles: [".cys/claude"] }))).toBe("설정 폴더: .cys/claude");
+    expect(primaryFolders(row({ current_profiles: [".claude-4", ".cys/claude"] }))).toBe("설정 폴더: .claude-4, .cys/claude");
+  });
+  it("current_profiles 가 빈 배열이고 사용 중이 아니면(이전 로그인) 설정 폴더 줄이 없다 — 지금 로그인된 폴더가 없다", () => {
+    expect(primaryFolders(row({ current_profiles: [] }))).toBeUndefined();
+    expect(primaryFolders(row({ current_profiles: [], in_use: false }))).toBeUndefined();
+  });
+  it("★키가 없으면(구버전 데몬) 종전 profiles · 배열이 아니어도(null) 같다", () => {
+    expect(primaryFolders(row({}))).toBe("설정 폴더: .claude-4, .cys/claude");
+    expect(primaryFolders(row({ current_profiles: null as unknown as string[] }))).toBe("설정 폴더: .claude-4, .cys/claude");
+    expect(primaryFolders(row({ current_profiles: "x" as unknown as string[] }))).toBe("설정 폴더: .claude-4, .cys/claude");
+  });
+  it("사용 중인데 current_profiles 가 비면(좌석 폴더가 열거 밖) 라벨과 같은 폴백 — profiles 를 보인다", () => {
+    expect(primaryFolders(row({ current_profiles: [], in_use: true, profiles: ["work/acct"] }))).toBe("설정 폴더: work/acct");
+  });
+  it("🔒 가림이면 current_profiles 의 경로도 끝 이름만(윈도우 절대경로의 OS 사용자명 비노출 — 리뷰1 M9 규칙 그대로)", () => {
+    const a = row({ current_profiles: ["C:\\Users\\runner\\.cys\\claude", "C:/Users/runner/.cys/claude"], profiles: ["C:\\Users\\runner\\.claude-4"] });
+    const red = buildUsageBarModel([a], NOW, okFetch, (s) => `#${s.length}`, true).primary!.tooltip;
+    expect(red.includes("runner")).toBe(false);
+    expect(primaryFolders(a, true)).toBe("설정 폴더: .cys/claude");
+    expect(primaryFolders(a, false)).toBe("설정 폴더: C:/Users/runner/.cys/claude");
+  });
+  it("다른 줄(주 계정이 아닌 계정)의 툴팁도 같은 규칙", () => {
+    const main = row({ account_id: "main", in_use: true, current_profiles: [".claude-1"], profiles: [".claude-1"], rate: [win("5h", 50)] });
+    const other = row({ account_id: "other", current_profiles: [".claude-2"], profiles: [".claude-2", ".claude-7"], rate: [win("5h", 5)], updated_at: NOW - 600 });
+    const m = buildUsageBarModel([main, other], NOW, okFetch, noRedact);
+    const line = m.others[0].tooltip.split("\n").find((l) => l.startsWith(FOLDERS));
+    expect(line).toBe("설정 폴더: .claude-2");
+  });
+});
+
+describe("R1F-UB(S2 m-4) — 숨기기 단추 툴팁이 말하는 사실: 후보가 하나도 남지 않으면 KPI 는 좌석 값으로 간다(동작은 종전 그대로)", () => {
+  it("★숨긴 계정이 유일한 후보면 kpiCandidates 는 0 이고, 폴백 aggSeatRates 는 숨김을 모른 채 좌석 값을 그대로 낸다(탐침 ② KPI 줄)", () => {
+    const low = R("u-low", { p5: 10, in_use: true, age: 10 });
+    const hidden = new Set([acctKey(low)]);
+    expect(kpiCandidates([low], "5h", NOW, hidden).length).toBe(0);
+    expect(kpiCandidates([low], "5h", NOW).length).toBe(1); // 숨기지 않으면 후보
+    const fallback = aggSeatRates([{ usage: { rate: [{ label: "5h", used_pct: 10, resets_at: NOW + 7200, alert_eligible: true }] } }], NOW);
+    expect(fallback["5h"]).toEqual({ used: 10, reset: NOW + 7200 });
   });
 });

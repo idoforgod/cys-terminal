@@ -154,9 +154,12 @@ export function acctAlias(a: AcctRow): string {
 }
 
 /** claude 계정이 지금 어느 폴더에도 로그인돼 있지 않은가 — current_profiles 가 (쓸 수 있는 원소가 없는) **배열로 있을 때만**.
- *  키가 없는 구버전 데몬은 판정하지 않는다(false). Control Center 의 '이전 로그인' 배지가 쓴다. */
+ *  키가 없는 구버전 데몬은 판정하지 않는다(false). Control Center 의 '이전 로그인' 배지가 쓴다.
+ *  ★(성찰 1회차 R1F-UB · S2 m-1 ⓑ) **in_use === true 인 계정은 '이전 로그인'이 아니다** — 좌석 폴더가 열거 밖(`CYS_ACCOUNT_DIR` 임의 경로 · 부서 카탈로그의 임의 계정 폴더)이면
+ *  데몬이 `in_use:true` 와 `current_profiles:[]` 를 함께 보낸다(`in_use` 는 좌석 폴더의 신원으로, `current_profiles` 는 열거된 폴더의 신원으로만 만든다 — 출처가 다르다).
+ *  지금 쓰이는 계정을 '이전'이라 부르면 모순이다 — 데몬 쪽 원인 수정과 별개로 화면이 구 데몬·혼재 구성에서도 모순을 내지 않게 막는다. */
 export function isPreviousLogin(a: AcctRow): boolean {
-  return a.provider === "claude" && Array.isArray(a.current_profiles) && normalizeProfiles(a.current_profiles).length === 0;
+  return a.in_use !== true && a.provider === "claude" && Array.isArray(a.current_profiles) && normalizeProfiles(a.current_profiles).length === 0;
 }
 
 /** 프로필 집합에서 만든 폴더 라벨(claude-N > 좌석 > 부서 x). 만들 수 없으면 null. */
@@ -173,7 +176,7 @@ function folderLabel(profiles: unknown): string | null {
 /** 계정의 화면 라벨 — 별명 > 현재 로그인 폴더(claude-N > 좌석 > 부서 x) > 제공자. **이메일(label 필드)은 절대 쓰지 않는다.**
  *  · current_profiles 가 배열로 있으면 **그것만**으로 폴더 라벨을 만든다(profiles 는 추가 전용이라 옛 로그인 폴더가 남아 있다).
  *    폴더 라벨을 하나도 못 만들면(보통 빈 배열 = 지금은 어느 폴더에도 로그인돼 있지 않다) claude 는 'Claude (이전 로그인)',
- *    그 밖은 제공자 라벨.
+ *    그 밖은 제공자 라벨. ★단 **in_use === true 면 '이전 로그인'이 아니다**(R1F-UB · S2 m-1 ⓑ — isPreviousLogin 과 같은 규칙) — 아래 profiles 폴백을 쓴다.
  *  · 키가 없으면(구버전 데몬) 종전처럼 profiles 로 만든다. */
 export function accountShortLabel(a: AcctRow): string {
   const alias = acctAlias(a);
@@ -181,9 +184,18 @@ export function accountShortLabel(a: AcctRow): string {
   if (Array.isArray(a.current_profiles)) {
     const cur = folderLabel(a.current_profiles);
     if (cur) return cur;
-    return a.provider === "claude" ? `${providerLabel(a.provider)} (이전 로그인)` : providerLabel(a.provider);
+    if (a.in_use !== true) return a.provider === "claude" ? `${providerLabel(a.provider)} (이전 로그인)` : providerLabel(a.provider);
+    // in_use === true — 지금 쓰이는 계정이다(좌석 폴더가 열거 밖이라 current_profiles 가 비었을 뿐). 0.14.42 와 같은 profiles 폴백.
   }
   return folderLabel(a.profiles) ?? providerLabel(a.provider);
+}
+
+/** 이 계정의 '설정 폴더' 표시 목록(툴팁용) — current_profiles 가 배열이면 그것(추가 전용 profiles 에 남은 옛 로그인 폴더는 쓰지 않는다 · 라벨과 같은 규칙),
+ *  키가 없으면(구버전 데몬) 종전 profiles. 단 in_use === true 인데 current_profiles 에서 쓸 폴더가 하나도 안 나오면(좌석 폴더가 열거 밖) 라벨처럼 profiles 로 폴백한다
+ *  (R1F-UB · S2 n-9 ⓐ · m-1 ⓑ). */
+function shownProfiles(a: AcctRow): unknown {
+  if (Array.isArray(a.current_profiles) && !(a.in_use === true && normalizeProfiles(a.current_profiles).length === 0)) return a.current_profiles;
+  return a.profiles;
 }
 
 /** 좌석(또는 부서 포크) 폴더를 쓰는 계정인가 — 동률 해소용. 비앵커·두 구분자. */
@@ -387,7 +399,7 @@ export interface UsagePrimary {
 export interface UsageBarModel {
   /** 접힘 상태·헤더 요약 한 줄. */
   headline: string;
-  /** 요약 줄 색 — 주 계정 창들의 최고 심각도(오래된 값이면 ""). */
+  /** 요약 줄 색 — 줄에 실린 값들의 최고 심각도. 제공자별 약식이면 요약에 실린 값들(오래됨 `?`·'리셋됨' 제외), 아니면 주 계정 창들(오래된 값이면 ""). */
   headlineSev: "" | "warn" | "crit";
   /** 요약 줄 툴팁 — 제공자별 약식(`C 5h12%·7d30% │ X 7d50%`)일 때 풀이. 아니면 빈 문자열. */
   headlineTitle: string;
@@ -503,7 +515,9 @@ function tooltipFor(
   lines.push(`${providerLabel(a.provider)} 계정 — ${whoRaw ? redactEmail(whoRaw) : "?"}`);
   if (typeof a.plan === "string" && a.plan) lines.push(`요금제: ${a.plan}`);
   // 🔒 가림이면 경로는 끝 이름만(가린 뒤 같아진 줄은 다시 접는다) — 사이드바는 늘 화면에 떠 있어 공유 화면에 찍힌다.
-  const profs = hidePaths ? normalizeProfiles(normalizeProfiles(a.profiles).map(profileTail)) : normalizeProfiles(a.profiles);
+  //   ★R1F-UB(S2 n-9 ⓐ): 목록은 current_profiles 가 있으면 그것(shownProfiles) — 옛 계정 툴팁에 지금 폴더가 남지 않는다.
+  const shown = shownProfiles(a);
+  const profs = hidePaths ? normalizeProfiles(normalizeProfiles(shown).map(profileTail)) : normalizeProfiles(shown);
   if (profs.length) lines.push(`설정 폴더: ${profs.join(", ")}`);
   const u = finiteNum(a.updated_at);
   if (u !== null && u > 0) lines.push(`관측: ${sourceLabel(a.source)} · ${hhmm(u)}${fr.note ? ` (${fr.note})` : ""}`);
@@ -559,8 +573,10 @@ function providerInitial(key: string): string {
 const viewRank = (v: WindowView): number => (v.text === "100%+" ? 101 : v.pct ?? 0);
 
 /** 한 제공자의 한 창 — 오래되지 않은(fresh·recent) 계정들의 최댓값. 그런 계정에 값이 없으면 오래된 계정들의 최댓값(stale=true →
- *  호출측이 `?`). 리셋 지난 창은 '리셋됨'. 값 없는 창은 null(생략). */
-function providerWindow(accts: AcctRow[], label: string, nowSec: number): { text: string; stale: boolean } | null {
+ *  호출측이 `?`). 리셋 지난 창은 '리셋됨'. 값 없는 창은 null(생략).
+ *  sev = 그 값의 심각도(windowView 의 임계 70/90) — 요약 줄 색(headlineSev)이 **요약에 실린 값**으로 계산되도록 값과 함께 돌려준다(R1F-UB · S2 m-3).
+ *  오래된 값(stale · `?`)과 '리셋됨'은 경고색이 없다(오래된 값의 경고색을 걷는 규칙과 같다). */
+function providerWindow(accts: AcctRow[], label: string, nowSec: number): { text: string; stale: boolean; sev: WindowView["sev"] } | null {
   const pick = (list: AcctRow[]): WindowView | null => {
     let top: WindowView | null = null;
     let rolled: WindowView | null = null;
@@ -573,14 +589,15 @@ function providerWindow(accts: AcctRow[], label: string, nowSec: number): { text
     return top ?? rolled;
   };
   const live = pick(accts.filter((a) => !isStaleGrade(freshGrade(a, nowSec))));
-  if (live) return { text: live.text, stale: false };
+  if (live) return { text: live.text, stale: false, sev: live.sev };
   const old = pick(accts.filter((a) => isStaleGrade(freshGrade(a, nowSec))));
-  return old ? { text: old.text, stale: old.state === "ok" } : null;
+  return old ? { text: old.text, stale: old.state === "ok", sev: "" } : null;
 }
 
 /** 제공자별 접힘 요약 — 관측 계정이 두 제공자 이상에 걸칠 때만(아니면 null → 종전 형식). 예 `C 5h12%·7d30% │ X 7d50%`.
- *  풀이(title)는 `Claude 5h 12% · 7d 30% / Codex 7d 50%`. 제공자 순서는 PROVIDER_ORDER. */
-function providerSummary(observed: AcctRow[], nowSec: number): { short: string; title: string } | null {
+ *  풀이(title)는 `Claude 5h 12% · 7d 30% / Codex 7d 50%`. 제공자 순서는 PROVIDER_ORDER.
+ *  sev = **요약에 실린 값들**의 최고 심각도(crit > warn > "") — 오래됨 `?` 값·'리셋됨'은 뺀다(R1F-UB · S2 m-3: 색이 주 계정 창만 보면 숫자와 색이 서로 다른 계정을 봤다). */
+function providerSummary(observed: AcctRow[], nowSec: number): { short: string; title: string; sev: UsageBarModel["headlineSev"] } | null {
   const groups = new Map<string, AcctRow[]>();
   for (const a of observed) {
     const k = provGroup(a);
@@ -592,6 +609,7 @@ function providerSummary(observed: AcctRow[], nowSec: number): { short: string; 
   const keys = [...groups.keys()].sort((x, y) => groupRank(x) - groupRank(y) || (x < y ? -1 : x > y ? 1 : 0));
   const shorts: string[] = [];
   const titles: string[] = [];
+  let sev: UsageBarModel["headlineSev"] = "";
   for (const k of keys) {
     const segs: string[] = [];
     const full: string[] = [];
@@ -600,11 +618,13 @@ function providerSummary(observed: AcctRow[], nowSec: number): { short: string; 
       if (!w) continue;
       segs.push(`${l}${w.text}${w.stale ? "?" : ""}`);
       full.push(`${l} ${w.text}${w.stale ? " (오래됨)" : ""}`);
+      if (!w.stale && w.sev === "crit") sev = "crit";
+      else if (!w.stale && w.sev === "warn" && sev === "") sev = "warn";
     }
     shorts.push(`${providerInitial(k)} ${segs.length ? segs.join("·") : "—"}`);
     titles.push(`${providerLabel(k)} ${full.length ? full.join(" · ") : "—"}`);
   }
-  return { short: shorts.join(" │ "), title: titles.join(" / ") };
+  return { short: shorts.join(" │ "), title: titles.join(" / "), sev };
 }
 
 /** 렌더용 모델. main.ts 는 이 모델을 textContent 로만 옮긴다.
@@ -743,7 +763,15 @@ export function buildUsageBarModel(
   // 접힘 요약 — 관측 계정이 두 제공자 이상이면 제공자별 약식, 아니면 종전 형식(주 계정의 두 창). 주 계정이 오래된 값이면 끝에 '(오래됨)'.
   const sum = providerSummary(list.filter(isObserved), nowSec);
   const headline = (sum ? sum.short : pv.map((w) => `${w.label} ${w.text}`).join(" · ")) + (primaryStale ? " (오래됨)" : "");
-  const headlineSev: UsageBarModel["headlineSev"] = pv.some((w) => w.sev === "crit") ? "crit" : pv.some((w) => w.sev === "warn") ? "warn" : "";
+  // ★R1F-UB(S2 m-3): 색은 **줄에 실린 값**으로 계산한다 — 제공자별 약식이면 요약에 실린 값들(sum.sev · 오래됨 `?` 제외), 한 제공자뿐이면 종전대로 주 계정의 두 창
+  //   (오너 결재 "주 계정 = 사용 중 우선" — 그 경우의 동작은 바꾸지 않는다). 종전엔 약식에서도 주 계정 창만 봐서 96% 계정이 숫자로는 실리고 색은 무색이었다.
+  const headlineSev: UsageBarModel["headlineSev"] = sum
+    ? sum.sev
+    : pv.some((w) => w.sev === "crit")
+      ? "crit"
+      : pv.some((w) => w.sev === "warn")
+        ? "warn"
+        : "";
 
   return {
     headline,
