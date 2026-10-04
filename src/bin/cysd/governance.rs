@@ -6880,22 +6880,39 @@ pub(crate) enum PendingInputModel {
 }
 
 impl PendingInputModel {
-    /// OS 별 기본 모델 — 윈도우는 `V2`(실기 확인 전 종전 유지), 그 밖은 `V3`. 런타임 분기(`cfg!`)다.
-    pub(crate) fn os_default() -> Self {
-        if cfg!(windows) {
+    /// ★(R2F-DM · A5 M2) OS 별 기본 모델의 **순수 표** — 윈도우(`true`)는 `V2`(실기 확인 전 종전 유지), 그 밖(`false`)은 `V3`. OS 를 인자로 받아 어느 호스트의 검체든 두 갈래를 모두 잰다
+    /// (종전에는 식과 검체의 기대값이 둘 다 `cfg!(windows)` 라 맥 레인이 "윈도우 기본은 v2" 라는 안전 게이트의 변이를 잡지 못했다).
+    pub(crate) fn default_for(is_windows: bool) -> Self {
+        if is_windows {
             PendingInputModel::V2
         } else {
             PendingInputModel::V3
         }
     }
 
-    /// env 값 해석(순수) — `v2`/`v3`(대소문자·앞뒤 공백 무시). 그 밖·부재는 [`Self::os_default`].
-    pub(crate) fn from_env_value(v: Option<&str>) -> Self {
+    /// OS 별 기본 모델 — [`Self::default_for`] 에 이 빌드의 OS 를 넣은 한 식이다(런타임 분기 `cfg!`). 본문이 그 한 식이라는 것은 소스 핀(`a5_m2_os_default_is_one_expression…`)이 고정한다.
+    pub(crate) fn os_default() -> Self {
+        Self::default_for(cfg!(windows))
+    }
+
+    /// env 값의 **명시 해석**(순수) — `v2`/`v3`(대소문자·앞뒤 공백 무시). 그 밖·부재는 `None`(= OS 기본으로 내려간다). 아래 두 판이 같은 표를 쓴다.
+    fn explicit_from_env_value(v: Option<&str>) -> Option<Self> {
         match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-            Some("v2") => PendingInputModel::V2,
-            Some("v3") => PendingInputModel::V3,
-            _ => Self::os_default(),
+            Some("v2") => Some(PendingInputModel::V2),
+            Some("v3") => Some(PendingInputModel::V3),
+            _ => None,
         }
+    }
+
+    /// env 값 해석의 **OS 인자판**(순수) — 명시한 `v2`/`v3` 는 OS 와 무관하고, 그 밖·부재는 [`Self::default_for`]`(is_windows)`. 검체가 두 OS 를 함께 돌린다(운영은 아래 [`Self::from_env_value`] — 이 빌드의 OS).
+    #[cfg_attr(not(test), allow(dead_code))] // 두 OS 를 함께 재는 검체용 판 — 운영 경로는 `from_env_value`(이 빌드의 OS 기본)
+    pub(crate) fn from_env_value_for(v: Option<&str>, is_windows: bool) -> Self {
+        Self::explicit_from_env_value(v).unwrap_or_else(|| Self::default_for(is_windows))
+    }
+
+    /// env 값 해석(순수) — 명시한 `v2`/`v3` 가 아니면 [`Self::os_default`]. [`Self::from_env_value_for`] 에 이 빌드의 OS 를 넣은 값과 같다(검체가 대조한다).
+    pub(crate) fn from_env_value(v: Option<&str>) -> Self {
+        Self::explicit_from_env_value(v).unwrap_or_else(Self::os_default)
     }
 
     /// 이 프로세스의 모델 — env `CYS_PENDING_INPUT_MODEL` 을 **프로세스 수명 1회** 판독한다(이후 env 변경은 무시).
@@ -7961,6 +7978,11 @@ pub(crate) const REMEDY_CODE_AFTER_CURSOR: &str = "after_cursor_text";
 /// ★(RQFIX I-4) 금지 목록에 `동결 해제`·`항목 삭제` 를 더했다. **앞부분 ` · LLM 에이전트는 자동 조치(` 는 바이트 그대로**다 — GUI 가 이 접두로 꼬리를 뗀다.
 pub(crate) const REMEDY_LLM_SUFFIX: &str = " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지";
 
+/// ★(R2F-DM · 성찰 2회차 A1 m-2 ⓐ) `empty_seat` 처방(표 13행)에 **입력줄 계수가 0 보다 클 때만** 덧붙는 한 구절 — 죽은 좌석의 계수 1(되돌린 Esc)은 제품의 정상 상태 하나인데(`state.rs` 틱의 되돌리기),
+/// 권위 없는 재기동은 바로 그 계수로 막힌다(node-recover 거부 문구 · 화면 재기동 보류와 같은 안내가 처방에도 있어야 한다). 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다).
+/// code·분기·게이트는 불변이고 문장의 이 한 갈래만 길어진다 — [`REMEDY_LLM_SUFFIX`] 의 위치(문장 맨 끝)와 앞부분은 바이트 그대로다(GUI 가 접두로 꼬리를 뗀다).
+pub(crate) const REMEDY_EMPTY_SEAT_COUNT_CLAUSE: &str = " — 다시 띄우기 전에 사람이 그 창에서 Ctrl-U 한 번(입력줄 계수가 남아 있다)";
+
 /// 유령 계수 처방 — 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙는다(앞 문구·접두·태그의 위치·바이트는 불변).
 /// 사람이 하는 일이다(기계가 Ctrl-U 를 보내는 경로는 없다). ★(RQFIX I-8) 정의처는 `src/lib.rs` 다 — `cys` CLI 가 같은 문자열로 stderr 처방 줄을 찍는다(한 정의처 공유).
 pub(crate) use cys::GHOST_CTRL_U_SUFFIX;
@@ -8037,7 +8059,7 @@ pub(crate) fn paused_queue_remedy(
 /// | 10 | `modal_pending` | `answer_modal` |
 /// | 11 | `approval_pending` | `approval` |
 /// | 12 | `alt_screen` | `alt_screen` |
-/// | 13 | `empty_seat` | `empty_seat` |
+/// | 13 | `empty_seat` (입력줄 계수 > 0 이면 문장에 [`REMEDY_EMPTY_SEAT_COUNT_CLAUSE`] 한 구절이 더 붙는다 — code 는 같다) | `empty_seat` |
 /// | 14 | `prompt_unknown` | `prompt_unknown` |
 /// | 15 | `busy`·`delivery_interval`·`settle`·`quiescing`·`prompt_not_ready`·`human_typing`·`queue_paused` | `wait` |
 /// | 16 | 그 밖(`schedule_divert` 의 그 밖 꼴·미등재) | `unknown` |
@@ -8048,6 +8070,8 @@ pub(crate) fn paused_queue_remedy(
 /// 입력줄이 비어 보이는데 사람 몫만 0 이라고 "기계가 넣은 본문" 이라 하지 않는다). 4행은 계수가 이미 0 이면 처방할 것이 없다는 뜻이다(I-7).
 pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static str, String) {
     let input_line = blocked_is_input_line(blocked_by);
+    // 본문 뒤·패닉 주석 앞에 붙는 한 구절 — 지금은 `empty_seat` 의 계수 구절 하나뿐이다(그 밖 행은 빈 문자열이라 바이트 불변).
+    let mut clause: &str = "";
     let (code, body): (&'static str, &str) = if let Some(body) = pause_remedy_body(d.kill_switch, d.paused) {
         ("paused", body)
     } else if input_line && d.pending_input_bytes == 0 && d.draft_visible == Some(true) {
@@ -8091,6 +8115,9 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
              Windows 는 `~/.cys/win-no-alt-screen` 파일을 만들고 새 pane 으로 띄운다",
         )
     } else if blocked_by.starts_with("empty_seat") {
+        if d.pending_input_bytes > 0 {
+            clause = REMEDY_EMPTY_SEAT_COUNT_CLAUSE;
+        }
         (
             "empty_seat",
             "그 자리에 에이전트가 붙어 있지 않다(빈 셸) — 에이전트를 다시 띄우면 순서대로 배달된다",
@@ -8110,7 +8137,7 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
     } else {
         String::new()
     };
-    (code, format!("{body}{panics}{REMEDY_LLM_SUFFIX}"))
+    (code, format!("{body}{clause}{panics}{REMEDY_LLM_SUFFIX}"))
 }
 
 /// 사유 영속 파일 이름 — 상태 디렉터리(`queue-state.json` 과 같은 폴더).
@@ -15299,28 +15326,63 @@ mod tests {
     /// 핀 12 — 모델 선택: env 값 해석(순수)과 OS 기본값. `current()` 의 프로세스 수명 1회 판독은 자식 프로세스 핀이 잰다.
     #[test]
     fn v3_model_selection_from_env_value_and_os_default() {
-        let want_default = if cfg!(windows) { PendingInputModel::V2 } else { PendingInputModel::V3 };
+        // ★(R2F-DM · A5 M2) 기대값을 제품과 같은 `cfg!(windows)` 식으로 다시 쓰지 않는다 — 그러면 맥에서는 제품의 윈도우 갈래를 V3 로 바꿔도 통과한다(변이를 못 잡는다).
+        //   OS 를 인자로 받는 순수 표(`default_for` · `from_env_value_for`)로 **두 OS 의 값을 어느 호스트에서든** 박고, 이 빌드의 판은 그 표에 `cfg!(windows)` 를 넣은 값과 같은지만 본다.
+        assert_eq!(PendingInputModel::default_for(true), PendingInputModel::V2, "윈도우 기본은 실기 확인 전이라 종전 V2 유지");
+        assert_eq!(PendingInputModel::default_for(false), PendingInputModel::V3, "그 밖(맥·리눅스) 기본은 V3");
         assert_eq!(
             PendingInputModel::os_default(),
-            want_default,
-            "OS 기본: 윈도우는 실기 확인 전이라 종전 V2 유지 · 그 밖은 V3"
+            PendingInputModel::default_for(cfg!(windows)),
+            "OS 기본: 이 빌드의 판은 순수 표에 이 빌드의 OS 를 넣은 값이다"
         );
-        for (v, want) in [
-            ("v2", PendingInputModel::V2),
-            ("V2", PendingInputModel::V2),
-            ("\tv2\n", PendingInputModel::V2),
-            ("v3", PendingInputModel::V3),
-            (" V3 ", PendingInputModel::V3),
-        ] {
-            assert_eq!(PendingInputModel::from_env_value(Some(v)), want, "{v:?}");
+        for (is_windows, want_default) in [(true, PendingInputModel::V2), (false, PendingInputModel::V3)] {
+            for (v, want) in [
+                ("v2", PendingInputModel::V2),
+                ("V2", PendingInputModel::V2),
+                ("\tv2\n", PendingInputModel::V2),
+                ("v3", PendingInputModel::V3),
+                (" V3 ", PendingInputModel::V3),
+            ] {
+                assert_eq!(PendingInputModel::from_env_value_for(Some(v), is_windows), want, "windows={is_windows} {v:?}: 명시한 v2/v3 는 OS 와 무관하다");
+            }
+            for junk in [Some("junk"), Some(""), Some("   "), Some("v4"), Some("v 3"), Some("3"), Some("v2v3"), None] {
+                assert_eq!(
+                    PendingInputModel::from_env_value_for(junk, is_windows),
+                    want_default,
+                    "windows={is_windows} {junk:?}: 그 밖·부재는 그 OS 의 기본"
+                );
+            }
         }
-        for junk in [Some("junk"), Some(""), Some("   "), Some("v4"), Some("v 3"), Some("3"), Some("v2v3"), None] {
-            assert_eq!(
-                PendingInputModel::from_env_value(junk),
-                want_default,
-                "{junk:?}: 그 밖·부재는 OS 기본"
-            );
+        // 이 빌드의 env 판은 OS 인자판에 이 빌드의 OS 를 넣은 값과 같다(같은 입력 · 두 경로).
+        for v in [Some("v2"), Some(" V3 "), Some("junk"), Some(""), None] {
+            assert_eq!(PendingInputModel::from_env_value(v), PendingInputModel::from_env_value_for(v, cfg!(windows)), "{v:?}");
         }
+    }
+
+    /// ★(R2F-DM · A5 M2) 소스 핀 — `os_default` 의 본문은 **순수 표에 `cfg!(windows)` 를 넣는 한 식**이고 `from_env_value` 의 폴백은 `os_default` · `from_env_value_for` 의 폴백은 `default_for(is_windows)` 다(OS 판정이 두 곳으로
+    /// 갈라져 검체가 못 재는 갈래가 다시 생기지 않는다).
+    /// `default_for` 의 두 갈래도 박는다 — 윈도우 갈래를 V3 로 바꾸면 위 진리표와 이 핀이 함께 적색이다.
+    #[test]
+    fn a5_m2_os_default_is_one_expression_over_default_for() {
+        let src = include_str!("governance.rs");
+        let body = |head: &str| -> String {
+            let i = src.find(head).unwrap_or_else(|| panic!("{head} 소실"));
+            let rest = &src[i..];
+            let open = rest.find('{').expect("본문 시작");
+            let close = rest.find("\n    }\n").expect("본문 끝(메서드 들여쓰기 4칸)");
+            rest[open + 1..close].split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        assert_eq!(body(concat!("pub(crate) fn os_default", "() -> Self {")), "Self::default_for(cfg!(windows))");
+        assert_eq!(body(concat!("pub(crate) fn from_env_value", "(v: Option<&str>) -> Self {")), "Self::explicit_from_env_value(v).unwrap_or_else(Self::os_default)");
+        assert_eq!(
+            body(concat!("pub(crate) fn default_for", "(is_windows: bool) -> Self {")),
+            "if is_windows { PendingInputModel::V2 } else { PendingInputModel::V3 }"
+        );
+        assert_eq!(
+            body(concat!("pub(crate) fn from_env_value_for", "(v: Option<&str>, is_windows: bool) -> Self {")),
+            "Self::explicit_from_env_value(v).unwrap_or_else(|| Self::default_for(is_windows))",
+            "env 해석의 폴백은 OS 인자의 기본이다"
+        );
     }
 
     /// 핀 13 — V2·V3 동치 성질: 단독 ESC 청크도 BS/DEL 전용 청크도 들어 있지 않은 청크열은 두 모델이 **단계마다 같은 상태**다
@@ -16786,7 +16848,7 @@ mod tests {
     #[test]
     fn r1f_in_reset_path_census_source_pin() {
         // 생산 구간 — governance 는 이 파일의 관례(첫 cfg 속성 앞)이고, 나머지는 `mod tests` 바로 앞이다(앞쪽에 작은 cfg 항목이 있어도 생산 코드를 자르지 않는다).
-        fn prod(src: &'static str) -> &'static str {
+        fn prod(src: &str) -> &str {
             let end = src.find("\n#[cfg(test)]\nmod tests {").or_else(|| src.find("#[cfg(test)]")).expect("테스트 모듈 앵커");
             &src[..end]
         }
@@ -16814,6 +16876,34 @@ mod tests {
             assert_eq!(code_matches(p, "set_pending_input("), w_set, "{name}: set_pending_input 호출처가 늘었다/줄었다 — 면제 표식을 내릴지 정한다");
             assert_eq!(code_matches(p, "clear_pending_input("), w_clear, "{name}: clear_pending_input 호출처가 바뀌었다");
             assert_eq!(code_matches(p, "apply_pending_input("), w_apply, "{name}: apply_pending_input 호출처가 바뀌었다");
+        }
+        // ★(R2F-DM · 성찰 2회차 A1 m-1 ⓐ) 위 다섯 파일 **밖의 데몬 소스 전부**는 세 호출이 0 이다 — 종전 핀은 다섯 파일만 봐서(`boot_supervisor`·`alert_route`·`main`·`usage`·`accounts` 등)
+        // 거기에 `set_pending_input(`·`clear_pending_input(`·`apply_pending_input(` 호출이 생겨도 초록이었다(줄을 비었다/제출됐다고 계상하는 새 경로가 면제 표식을 내리지 않는 채 선다).
+        // `h7` 핀(`daemon_sources`)과 같은 방식으로 **디렉터리를 훑어** 목록 밖 파일(새로 생기는 파일 포함)을 잡는다 · `_tests.rs`(파일 전체가 cfg(test))는 생산 코드가 아니라 건너뛴다(h7 과 같다).
+        {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
+            let listed: Vec<&str> = files.iter().map(|(n, _)| *n).collect();
+            let mut scanned = 0usize;
+            for e in std::fs::read_dir(&dir).expect("cysd 소스 디렉터리") {
+                let file = e.expect("항목").file_name().to_string_lossy().to_string();
+                let Some(stem) = file.strip_suffix(".rs") else { continue };
+                if stem.ends_with("_tests") || listed.contains(&stem) {
+                    continue;
+                }
+                let text = std::fs::read_to_string(dir.join(&file)).expect("소스 읽기");
+                // 테스트 모듈이 없는 작은 파일은 전체가 생산 코드다.
+                let end = text.find("\n#[cfg(test)]\nmod tests {").or_else(|| text.find("#[cfg(test)]")).unwrap_or(text.len());
+                let p = &text[..end];
+                scanned += 1;
+                for needle in ["set_pending_input(", "clear_pending_input(", "apply_pending_input("] {
+                    assert_eq!(
+                        code_matches(p, needle),
+                        0,
+                        "{stem}: 목록 밖 파일에 {needle} 호출이 생겼다 — 줄을 비었다/제출됐다고 계상하는 새 경로다: 면제 표식(`esc_exempt_pgid`)을 내릴지 정하고 이 핀의 목록에 넣어라"
+                    );
+                }
+            }
+            assert!(scanned >= 20, "목록 밖 소스 스캔이 공허하다({scanned}개) — 디렉터리 판독이 비었거나 파일 이름 규칙이 바뀌었다");
         }
         // 인계 두 곳이 표식을 내린다: 큐 인계는 `take_esc_exempt`, 스케줄 인계는 leaf 에서 직접 0 + 미러.
         let gov = prod(include_str!("governance.rs"));
@@ -24050,6 +24140,52 @@ mod tests {
         assert!(text.ends_with(&format!(" (이 좌석 화면 파서 패닉 1회 — 화면 판독이 순간 비었을 수 있다){REMEDY_LLM_SUFFIX}")), "{text}");
     }
 
+    /// ★(R2F-DM · 성찰 2회차 A1 m-2 ⓐ) `empty_seat` 처방 — **입력줄 계수가 0 보다 크면**(죽은 좌석의 되돌린 Esc = 계수 1 · 제품의 정상 상태 하나) 사람이 그 창에서 Ctrl-U 한 번 하라는 한 구절이 문장에 더해진다.
+    /// 권위 없는 재기동은 바로 그 계수로 막히는데(node-recover 거부 문구 · 화면 재기동 보류는 이미 안내한다) 처방만 "다시 띄우면 순서대로 배달된다" 고만 말했다.
+    /// 계수 0 은 종전 문장 그대로(바이트 불변) · code(`empty_seat`)·분기·게이트는 불변 · 접미 `REMEDY_LLM_SUFFIX` 는 맨 끝 · 일시정지 행(1·2행)이 여전히 맨 앞 · 다른 사유에는 구절이 새지 않는다.
+    #[test]
+    fn r2f_dm_empty_seat_remedy_adds_the_ctrl_u_clause_only_when_the_input_count_is_positive() {
+        const BASE: &str = "그 자리에 에이전트가 붙어 있지 않다(빈 셸) — 에이전트를 다시 띄우면 순서대로 배달된다";
+        const CLAUSE: &str = " — 다시 띄우기 전에 사람이 그 창에서 Ctrl-U 한 번(입력줄 계수가 남아 있다)";
+        assert_eq!(super::REMEDY_EMPTY_SEAT_COUNT_CLAUSE, CLAUSE, "구절의 바이트 고정(문서·화면이 이 문장을 인용한다)");
+        let blocked = "empty_seat(좌석에 에이전트 미연결)";
+        // 계수 0 → 종전 문장 그대로.
+        let (code0, t0) = queue_remedy(blocked, &c5_diag(0, 0, None));
+        assert_eq!(code0, "empty_seat");
+        assert_eq!(t0, format!("{BASE}{REMEDY_LLM_SUFFIX}"), "계수 0 의 문장은 종전과 바이트가 같아야 한다");
+        // 계수 > 0 → 사람 몫(0·양수)·화면 관측(없음·비어 보임·초안 보임)과 무관하게 구절이 본문 바로 뒤에 붙는다.
+        for (c, h, dv) in [(1, 1, None), (1, 0, None), (7, 3, Some(false)), (3, 3, Some(true)), (u64::MAX, 0, None)] {
+            let (code, t) = queue_remedy(blocked, &c5_diag(c, h, dv));
+            assert_eq!(code, "empty_seat", "c={c} h={h} dv={dv:?}: code 는 그대로");
+            assert_eq!(t, format!("{BASE}{CLAUSE}{REMEDY_LLM_SUFFIX}"), "c={c} h={h} dv={dv:?}");
+        }
+        // 파서 패닉 주석은 구절 뒤 · 접미 앞(순서: 본문 · 구절 · 주석 · 접미).
+        let mut d = c5_diag(1, 1, None);
+        d.parser_panics = 2;
+        let (_, t) = queue_remedy(blocked, &d);
+        assert_eq!(t, format!("{BASE}{CLAUSE} (이 좌석 화면 파서 패닉 2회 — 화면 판독이 순간 비었을 수 있다){REMEDY_LLM_SUFFIX}"));
+        // 다른 사유에는 구절이 새지 않는다(계수 > 0 이어도).
+        for other in [BLOCKED_MODAL, BLOCKED_APPROVAL, BLOCKED_BUSY, BLOCKED_PROMPT_UNKNOWN, BLOCKED_ALT_SCREEN, "zzz"] {
+            let (_, t) = queue_remedy(other, &c5_diag(5, 5, None));
+            assert!(!t.contains("Ctrl-U 한 번(입력줄 계수가 남아 있다)"), "{other}: 구절이 다른 사유로 샜다: {t}");
+        }
+        // 일시정지(1·2행)가 여전히 맨 앞 — empty_seat 사유라도 동결 중이면 동결 처방(구절 없음).
+        let mut k = c5_diag(1, 1, None);
+        k.kill_switch = true;
+        k.paused = true;
+        let (code, t) = queue_remedy(blocked, &k);
+        assert_eq!(code, "paused");
+        assert!(!t.contains("Ctrl-U"), "동결 처방에 구절이 섞였다: {t}");
+        // 화면이 이 문장을 읽는 방식(`ui/src/starvednotice.ts`): 접두 ` · LLM 에이전트는 자동 조치` 로 꼬리를 떼고 `<N분째> · <조치 문장>` 을 200자(코드 포인트)로 자른다 — 구절은 꼬리 **앞**이라 정규식·접두가 그대로
+        // 맞고, 가장 긴 분 표기(`99999분째`)를 붙여도 200자 안이다.
+        let (_, t) = queue_remedy(blocked, &c5_diag(1, 1, None));
+        let human = t.split(" · LLM 에이전트는 자동 조치").next().expect("꼬리 앞");
+        assert!(human.ends_with("(입력줄 계수가 남아 있다)"), "{human}");
+        assert!(t.ends_with(REMEDY_LLM_SUFFIX), "접미는 문장 맨 끝");
+        let toast = format!("99999분째 · {human}");
+        assert!(toast.chars().count() <= 200, "토스트 본문이 200자를 넘는다({}자): {toast}", toast.chars().count());
+    }
+
     /// blocked_by 전수 매핑(WORKLOG 표와 같다) — 상수 문면을 바꾸지 않고 **접두 일치**로 판정한다. 틱이 쓰는 리터럴·상수·직접 `mark_queue_blocked` 호출·
     /// 소스의 `BLOCKED_*` 상수 선언 **전부**가 같은 표에 든다(★RQFIX I-11: 종전 전수 가드는 `block("…")` 리터럴만 셌다 — 상수로 들어오는 사유와
     /// `mark_queue_blocked(&s, …)` 직접 호출은 세지 못해, 새 사유가 표 밖에서 조용히 `unknown` 이 될 수 있었다).
@@ -27166,6 +27302,7 @@ mod h_machine_hold_tests {
     /// [H0 음성 · 검토 5] `pending_input_bytes` 단독은 보류 근거가 아니다 — 화면 파손(커서행 미관측)에서도,
     /// 빈 composer 에서도 None. draft 는 **화면 양성 관측**만 본다.
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h0_stale_pending_alone_never_holds() {
         let d = h_daemon("h0-stale");
         let s = claude_seat(&d);
@@ -27384,6 +27521,7 @@ mod h_machine_hold_tests {
     /// 초안(계수 0 · 화면만 = S41 가짜 에이전트 초안)·잔여 뒤 사람 키·owner 없는 기계 바이트는 종전대로 Draft.
     /// RED(HEAD): ① 이 Draft.
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h0_machine_residue_is_not_a_draft() {
         let d = h_daemon("h0-residue");
         let s = claude_seat(&d);
@@ -27438,6 +27576,7 @@ mod h_machine_hold_tests {
     /// 보상 표의 주인(`pending_owner` · 검증 전용)은 Claimed·익명 각인에서 결측 그대로다(설계 B 무변경).
     /// RED(HEAD f1b1a7e8): Claimed·익명 잔여가 Draft · machine_residue 이벤트 0.
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h0_cross_socket_residue_is_not_a_draft() {
         let pack = HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
         let d = h_daemon("h0-xsock");
@@ -27495,6 +27634,7 @@ mod h_machine_hold_tests {
     /// 붙여넣기다 — 초안 축의 보류 근거가 아니다(뒤 Inject 는 writer 직렬이라 앞 CR 뒤에 쓰인다). arm 이 끝나고 settle 이
     /// 지나면 같은 화면 초안은 다시 Draft 다. 모달 축은 in-flight 여도 본다. RED(HEAD): in-flight 중 Draft.
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h0_own_inject_in_flight_is_not_a_draft() {
         let d = h_daemon("h0-own-inject");
         let s = claude_seat(&d);
@@ -27726,6 +27866,89 @@ mod h_machine_hold_tests {
         let fake = "fn legit() {}\nfn sneaky_producer(x: u8) {\n    let _ = WriteReq::Inject { text, cr_delay_ms: 0, clear_first: false, guard: None };\n}\n// fn commented() { guard: None }\n#[cfg(test)]\nmod tests {\n    fn t() { let _ = X { guard: None }; }\n}\nfn after_tests() {}\n";
         let got = guard_none_producers("fake", fake);
         assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["fake::sneaky_producer".to_string()]);
+    }
+
+    /// ★(R2F-DM · 성찰 2회차 마스터 결정 D2) **윈도우에서 `ignored`(+사유)로 남기는 검체는 정확히 이 41건이다** — 컴파일에서 빼지 않고(`#[cfg(unix)]`·조기 return 금지) `cfg_attr(not(unix), ignore = "<사유>")` 속성으로 윈도우 보고서에
+    /// 사유가 남게 한다(맥·리눅스에는 `ignore` 가 붙지 않는다). 세 부류: A) `send_settle_tests.rs` 의 윈도우에서 붉던 22건 — S21 제출 정착·창 위 CR 보류는 `cfg!(unix)` 한정(`send_settle_applies`) B) 윈도우 기본 H 마스크가 `draft` 축을 끄는데
+    /// (`hold_axes_default(true)` — 순수 검체 `h0_axes_default_by_platform`·`h0_conpty_fixtures` 가 이미 그 값을 고정한다) 유닉스 기본(draft 축) 동작을 보는 17건(h0 4 · h4 3 · h2 9 · c8 1) C) 좌석 명령이 POSIX 셸 문법인 2건.
+    /// 이 핀은 **집합이 늘지도 줄지도 않게** 한다 — 나머지 20건(`send_settle_tests.rs` 의 '셸 좌석·윈도우·끔 = 종전 바이트' 음성 대조)은 윈도우에서도 돌아야 하고, [추측]으로 남긴 검체(ConPTY 2 · mtime 2 · ⓐ 추정·연쇄)는 윈도우 재측정 전에
+    /// 손대지 않는다. 새 `ignore` 를 더하는 사람은 사유와 함께 이 목록을 고쳐야 한다(윈도우 검증력을 줄이는 결정이 코드 리뷰에 보이게).
+    #[test]
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_41() {
+        const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
+        const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
+        const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
+        let want: Vec<(&str, &str, char)> = vec![
+            ("send_settle_tests", "c5_settle_proof_denial_never_carries_the_ghost_prescription", 'A'),
+            ("send_settle_tests", "f1_submit_cr_withheld_on_stale_empty_seat_before_first_agent_sighting", 'A'),
+            ("send_settle_tests", "f1_submit_cr_withheld_when_dialog_rose_after_own_body", 'A'),
+            ("send_settle_tests", "f1_withheld_submit_dropped_after_newer_machine_body", 'A'),
+            ("send_settle_tests", "f1_withheld_submit_is_resubmitted_once_after_dialog_closes", 'A'),
+            ("send_settle_tests", "f1_withheld_submit_waits_for_resume_and_yields_to_human", 'A'),
+            ("send_settle_tests", "fv1_paused_daemon_gives_no_settle_proof_but_keeps_hold", 'A'),
+            ("send_settle_tests", "fv2_dialog_drawn_below_own_composer_is_still_withheld", 'A'),
+            ("send_settle_tests", "fv2_dialog_replacing_wrapped_body_is_still_withheld", 'A'),
+            ("send_settle_tests", "fv2_resubmit_ignores_signatures_above_own_composer_without_trailer", 'A'),
+            ("send_settle_tests", "fv2_withheld_record_dropped_at_wait_cap", 'A'),
+            ("send_settle_tests", "fv2_withheld_wrapped_body_is_resubmitted_after_dialog_closes", 'A'),
+            ("send_settle_tests", "fv2_withheld_wrapped_body_is_resubmitted_on_alt_screen", 'A'),
+            ("send_settle_tests", "r3c_dialog_clock_restarts_when_window_closes", 'A'),
+            ("send_settle_tests", "r3c_long_agent_turn_after_quick_approval_resubmits_once", 'A'),
+            ("send_settle_tests", "r3c_long_pause_then_resume_resubmits_once", 'A'),
+            ("send_settle_tests", "r3c_long_wait_still_yields_to_human_newer_body_and_empty_line", 'A'),
+            ("send_settle_tests", "r3c_pause_freezes_dialog_clock_and_cap_still_fires_on_open_window", 'A'),
+            ("send_settle_tests", "r3c_queue_ttl_bounds_post_close_wait_with_pause_credit", 'A'),
+            ("send_settle_tests", "settle_hold_denies_text_while_submit_cr_inflight_then_admits", 'A'),
+            ("send_settle_tests", "settle_proof_on_pending_machine_body_awaiting_its_return", 'A'),
+            ("send_settle_tests", "settle_proven_denial_events_are_rate_limited_per_sender", 'A'),
+            ("governance", "h0_cross_socket_residue_is_not_a_draft", 'B'),
+            ("governance", "h0_machine_residue_is_not_a_draft", 'B'),
+            ("governance", "h0_own_inject_in_flight_is_not_a_draft", 'B'),
+            ("governance", "h0_stale_pending_alone_never_holds", 'B'),
+            ("handlers", "h4_burst_second_approval_not_held_by_own_paste", 'B'),
+            ("handlers", "h4_ceo_hard_axes_escalate", 'B'),
+            ("handlers", "h4_cross_socket_residue_routes_to_ceo", 'B'),
+            ("schedule", "h2_cross_socket_residue_stays_direct", 'B'),
+            ("schedule", "h2_diverted_item_survives_daemon_restart", 'B'),
+            ("schedule", "h2_long_draft_hold_is_visible_as_starved", 'B'),
+            ("schedule", "h2_machine_residue_stays_direct", 'B'),
+            ("schedule", "h2_periodic_ttl_le_period_oneshot_default", 'B'),
+            ("schedule", "h2_role_push_diverts_on_observed_draft", 'B'),
+            ("schedule", "h2_swallowed_inject_residue_stays_direct", 'B'),
+            ("schedule", "h2_swallowed_return_residue_stays_direct", 'B'),
+            ("schedule", "h2_unproven_machine_draft_falls_back_after_bounded_diverts", 'B'),
+            ("schedule", "c8_diverted_or_refused_pushes_keep_the_count_gates_unchanged", 'B'),
+            ("handlers", "c_direct_fence_dispatch_behavior", 'C'),
+            ("state", "c_mirror_screen_modes_tracks_bracketed_paste", 'C'),
+        ];
+        assert_eq!(want.len(), 41, "결정한 집합은 41건(22 + 17 + 2)");
+        let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
+        let mut got: Vec<(String, String, char)> = Vec::new();
+        for e in std::fs::read_dir(&dir).expect("cysd 소스 디렉터리") {
+            let file = e.expect("항목").file_name().to_string_lossy().to_string();
+            let Some(stem) = file.strip_suffix(".rs") else { continue };
+            let text = std::fs::read_to_string(dir.join(&file)).expect("소스 읽기");
+            for (at, _) in text.match_indices(needle) {
+                let rest = &text[at + needle.len()..];
+                let reason = &rest[..rest.find("\")]").expect("사유 끝")];
+                let kind = match reason {
+                    REASON_A => 'A',
+                    REASON_B => 'B',
+                    REASON_C => 'C',
+                    other => panic!("{stem}: 결정에 없는 `ignore` 사유 — {other}"),
+                };
+                let after = &rest[rest.find('\n').expect("속성 줄 끝")..];
+                let fn_at = after.find("fn ").expect("뒤따르는 fn");
+                let name: String = after[fn_at + 3..].chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                got.push((stem.to_string(), name, kind));
+            }
+        }
+        got.sort();
+        let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
+        want_sorted.sort();
+        assert_eq!(got.len(), 41, "윈도우 `ignore` 가 {}건이다(결정 41건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 41건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 

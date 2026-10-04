@@ -148,6 +148,7 @@ const P: u32 = 996_600;
 /// 큐 적재 0 · 사유 submit_settling · 정착 증명 힌트. CR 이 쓰이고 분리 창이 지나면 같은 본문이 직접 통과한다.
 /// 종전(0.14.42 A2 트리): 셸 화면 축이 Unknown 이라 Y 가 곧바로 통과해 writer FIFO 에서 X 의 대기 CR 바로 뒤에 붙었다.
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn settle_hold_denies_text_while_submit_cr_inflight_then_admits() {
     let fx = fx("hold");
     let t = agent_pane(&fx, "worker-1", P);
@@ -193,6 +194,7 @@ fn settle_hold_denies_text_while_submit_cr_inflight_then_admits() {
 /// pending_input 거부에 증명을 붙인다 — CLI 가 곧바로 큐(10초 간격)로 밀려나지 않고 짝 Return 뒤를 기다린다.
 /// 종전: 증명 없음 → 곧바로 `--queued`.
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn settle_proof_on_pending_machine_body_awaiting_its_return() {
     let fx = fx("pair-proof");
     let t = agent_pane(&fx, "worker-1", P + 10);
@@ -212,6 +214,7 @@ fn settle_proof_on_pending_machine_body_awaiting_its_return() {
 /// ★(0.14.43 · C5) 정착 증명이 붙은 거부에는 유령 계수 처방(Ctrl-U)을 붙이지 않는다 — 증명 = 기계 제출이 진행 중이라 줄이 곧 빈다. 그 순간의
 /// 빈 입력줄은 유령이 아니다(처방하면 곧 풀릴 줄에 사람이 Ctrl-U 를 누르게 된다). 증명 접미(`[settle:<ms>]`)는 여전히 문구 맨 끝이다.
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn c5_settle_proof_denial_never_carries_the_ghost_prescription() {
     let fx = fx("c5-settle");
     let t = agent_pane(&fx, "worker-1", P + 50);
@@ -383,6 +386,7 @@ fn stale_inflight_marker_expires() {
 /// 정착 증명 거부 이벤트는 (좌석, 발신자)당 1초에 1건 — CLI 재시도가 이벤트 링을 채우지 않는다. 응답(증명 힌트)은
 /// 매번 그대로다. 발신자가 다르면 따로 센다. 증명 없는 거부는 종전처럼 요청마다 1건(위 사람 초안 검체·d12 핀).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn settle_proven_denial_events_are_rate_limited_per_sender() {
     let fx = fx("evrate");
     let t = agent_pane(&fx, "worker-1", P + 80);
@@ -413,6 +417,7 @@ fn settle_proven_denial_events_are_rate_limited_per_sender() {
 /// ① pause 중에는 어떤 거부에도 정착 증명이 없다 — 계수 축(짝 Return 을 기다리는 기계 본문)·분리 보류 둘 다.
 /// 분리 보류 거부 자체(쓰기 0)는 유지한다. resume 뒤에는 증명이 돌아온다(영구화 0).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn fv1_paused_daemon_gives_no_settle_proof_but_keeps_hold() {
     let fx = fx("fv1-pause-proof");
     let t = agent_pane(&fx, "worker-1", P + 90);
@@ -537,6 +542,7 @@ fn agent_pane_settled(fx: &Fx, role: &str, pid: u32) -> Arc<Surface> {
 /// 적색→녹색: X 의 본문이 쓰인 뒤·짝 Return 앞에 권한 창이 떴다(렌더 지연 창) — X 의 CR 은 쓰이지 않는다.
 /// 종전: writer 가 간격을 잔 뒤 화면을 보지 않고 CR 을 써 '1. Yes' 를 눌렀다(오승인).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn f1_submit_cr_withheld_when_dialog_rose_after_own_body() {
     let fx = fx("f1-withhold");
     let t = agent_pane_settled(&fx, "worker-1", P + 110);
@@ -559,6 +565,7 @@ fn f1_submit_cr_withheld_when_dialog_rose_after_own_body() {
 /// 에이전트 미확인(set_meta 가 내린 `agent_seen=false`). 종전에는 탐침을 걸지 않아(생존 술어 거짓) 같은 창 경합에서
 /// CR 이 '1. Yes' 를 눌렀다(S94 좌석 empty 시행만 오승인). 커서가 선택지 행이면 쓰지 않는다.
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn f1_submit_cr_withheld_on_stale_empty_seat_before_first_agent_sighting() {
     let fx = fx("f1-stale");
     let t = agent_pane_settled(&fx, "worker-1", P + 115);
@@ -603,6 +610,7 @@ fn paint_own_composer(t: &Arc<Surface>) {
 /// 그대로면 watchdog 틱이 그 CR 을 **한 번** 다시 쓴다. 종전(88a63e22)에는 본문이 입력줄에 남아 큐 틱이 입력줄 점유로
 /// 그 좌석을 통째로 세웠다(S91 dialog 폭풍: 150초 동안 큐 배달 0 · 수정 전 판 10건).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn f1_withheld_submit_is_resubmitted_once_after_dialog_closes() {
     let fx = fx("f1-resubmit");
     let t = withheld_seat(&fx, P + 180);
@@ -629,6 +637,7 @@ fn f1_withheld_submit_is_resubmitted_once_after_dialog_closes() {
 
 /// 음성 대조: kill-switch pause 중에는 다시 쓰지 않고(기록 유지 — resume 뒤 재개), 사람 손이 닿은 줄은 버린다(사람 몫).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn f1_withheld_submit_waits_for_resume_and_yields_to_human() {
     let fx = fx("f1-resubmit-guard");
     let t = withheld_seat(&fx, P + 190);
@@ -654,6 +663,7 @@ fn f1_withheld_submit_waits_for_resume_and_yields_to_human() {
 
 /// 음성 대조: 보류 뒤 새 기계 본문이 들어왔으면(데몬 주입의 병합 제출 · 다른 send) 그 기록은 낡았다 — 버린다.
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn f1_withheld_submit_dropped_after_newer_machine_body() {
     let fx = fx("f1-resubmit-newer");
     let t = withheld_seat(&fx, P + 200);
@@ -972,6 +982,7 @@ fn claude_dialog(cursor_on_last_option: bool) -> (Vec<String>, u16, u16) {
 /// 음성 대조(치명 방향 — 오승인): 접힌 우리 본문 뒤·Return 앞에 권한 창이 입력 상자를 대체했다 — 커서가 선택지 행이든
 /// 그 아래 선택지(들여쓴 연속행 모양)든 보류한다(블록 이음이 창 행을 우리 본문으로 설명하지 않는다).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn fv2_dialog_replacing_wrapped_body_is_still_withheld() {
     for (i, last) in [false, true].into_iter().enumerate() {
         let fx = fx("fv2-dlg");
@@ -985,6 +996,7 @@ fn fv2_dialog_replacing_wrapped_body_is_still_withheld() {
 
 /// 음성 대조(② 의 경계): 입력 블록의 주인이 우리 본문이어도 블록 **아래**에 창 서명이 그려져 있으면 창이다(보류).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn fv2_dialog_drawn_below_own_composer_is_still_withheld() {
     let fx = fx("fv2-below");
     let t = agent_pane_settled(&fx, "worker-1", P + 320);
@@ -1008,6 +1020,7 @@ fn withheld_wrapped_seat(fx: &Fx, pid: u32) -> Arc<Surface> {
 /// 적색→녹색(FV2-1 재제출 wait_dialog 영구): 창이 닫히고 접힌 우리 번호 본문이 입력 상자에 돌아왔다 — 한 번 다시 쓴다.
 /// 종전: 본문 첫 줄의 `❯ 1.` 서명을 창으로 보아 `wait_dialog` 에 영구히 머물렀다(상한 = 큐 TTL).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn fv2_withheld_wrapped_body_is_resubmitted_after_dialog_closes() {
     let fx = fx("fv2-resub");
     let t = withheld_wrapped_seat(&fx, P + 330);
@@ -1021,6 +1034,7 @@ fn fv2_withheld_wrapped_body_is_resubmitted_after_dialog_closes() {
 /// 적색→녹색: 같은 재제출이 대체화면(실 claude 2.1.282 는 alt-screen 상주 · fatal-v2 surface.list alt_screen=true)에서도
 /// 된다 — 레이아웃 양성 증거를 '빈 대기 프롬프트로 본 화면'에서 잰다(접힌 본문 연속행은 입력 상자 아래 꼬리가 아니다).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn fv2_withheld_wrapped_body_is_resubmitted_on_alt_screen() {
     let fx = fx("fv2-resub-alt");
     let t = withheld_wrapped_seat(&fx, P + 340);
@@ -1038,6 +1052,7 @@ fn fv2_withheld_wrapped_body_is_resubmitted_on_alt_screen() {
 /// 종전 상한은 큐 TTL(6h)뿐이었다. 쓰기는 0 이다(상한은 쓰지 않는 방향으로만 끝낸다).
 /// (R3C-1: 상한은 창이 연달아 열린 시간만 잰다 — 창이 11분 떠 있는 것을 가상 시계로 모사한다.)
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn fv2_withheld_record_dropped_at_wait_cap() {
     let fx = fx("fv2-cap");
     let t = withheld_wrapped_seat(&fx, P + 350);
@@ -1061,6 +1076,7 @@ fn fv2_withheld_record_dropped_at_wait_cap() {
 /// 괘선·상태줄 대신 레이아웃 증거가 아닌 안내 행(실 claude 2.1.282 실측 `paste again to expand`)만 보이는 프레임에서도
 /// 재제출은 보류 탐침과 같은 판정을 쓴다(공유 전경 술어로 재면 이력 에코 `❯ 1. …` 가 '과거'로 면제되지 않아 wait_prompt).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn fv2_resubmit_ignores_signatures_above_own_composer_without_trailer() {
     let fx = fx("fv2-resub-notrail");
     let t = withheld_wrapped_seat(&fx, P + 360);
@@ -1137,6 +1153,7 @@ fn long_turn_after_quick_approval(fx: &Fx, pid: u32) -> Arc<Surface> {
 
 /// 적색→녹색(R3C-1 결과 1): 창 2초 승인 뒤 에이전트 11분 작업 → 유휴가 되면 한 번 재제출(두 번째는 없다).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn r3c_long_agent_turn_after_quick_approval_resubmits_once() {
     let fx = fx("r3c-longturn");
     let t = long_turn_after_quick_approval(&fx, P + 400);
@@ -1157,6 +1174,7 @@ fn r3c_long_agent_turn_after_quick_approval_resubmits_once() {
 /// 적색→녹색(R3C-1 결과 3 · FV1-1 'pause 동안 동결 · resume 뒤 재개'): pause 11분 동안 창이 닫혔고 입력줄은 우리 본문
 /// 그대로 — pause 중에는 쓰지 않고, resume 뒤 한 번 재제출한다(pause 시간은 창 대기 상한에 들지 않는다).
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn r3c_long_pause_then_resume_resubmits_once() {
     let fx = fx("r3c-longpause");
     let t = withheld_seat(&fx, P + 410);
@@ -1183,6 +1201,7 @@ fn r3c_long_pause_then_resume_resubmits_once() {
 /// 적색→녹색 + 상한 보존: 창이 6분 열린 채 pause 30분(창 그대로) → resume 뒤에도 기록 유지(pause 는 창 시계를 멈춘다) →
 /// 창이 5분 더 열려 누적 11분이면 `wait_cap` 으로 버린다(쓰기 0). 상한 자체(창이 10분 안에 닫히지 않으면)는 그대로다.
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn r3c_pause_freezes_dialog_clock_and_cap_still_fires_on_open_window() {
     let fx = fx("r3c-freeze");
     let t = withheld_seat(&fx, P + 420);
@@ -1214,6 +1233,7 @@ fn r3c_pause_freezes_dialog_clock_and_cap_still_fires_on_open_window() {
 /// 적색→녹색: 상한은 **한 창**이 10분 안에 닫히지 않을 때다 — 8분 창이 닫히고(작업) 다음 창이 8분 열려 있어도 버리지
 /// 않는다. 두 번째 창이 닫히고 유휴가 되면 한 번 재제출한다.
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn r3c_dialog_clock_restarts_when_window_closes() {
     let fx = fx("r3c-rewin");
     let t = withheld_seat(&fx, P + 430);
@@ -1240,6 +1260,7 @@ fn r3c_dialog_clock_restarts_when_window_closes() {
 
 /// 음성 대조(종전대로 버림): 긴 작업 대기 중에도 사람 손 · 새 기계 본문 · 빈 줄이면 쓰지 않고 그 사유로 버린다.
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn r3c_long_wait_still_yields_to_human_newer_body_and_empty_line() {
     for (i, case) in ["human", "newer_body", "line_empty"].into_iter().enumerate() {
         let fx = fx("r3c-yield");
@@ -1268,6 +1289,7 @@ fn r3c_long_wait_still_yields_to_human_newer_body_and_empty_line() {
 /// 외곽 상한(큐 TTL)은 창이 닫힌 뒤 대기에도 그대로다 — pause 가 아닌 대기가 TTL 을 넘으면 `expired` 로 버린다(쓰기 0).
 /// 큐 항목과 같은 pause 크레딧: 긴 pause(TTL 초과) 뒤 resume 한 유휴 입력줄은 재제출한다.
 #[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
 fn r3c_queue_ttl_bounds_post_close_wait_with_pause_credit() {
     let ttl = crate::state::queue_ttl_default_secs();
     assert!(ttl > 0, "전제: 큐 TTL 켜짐");

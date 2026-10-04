@@ -1518,7 +1518,29 @@ pub fn summarize_payload(name: &str, payload: &Value) -> String {
         _ => None,
     };
     let s = s.unwrap_or_else(|| generic_summary(payload));
-    sanitize_line(&s, SUMMARY_MAX_BYTES)
+    sanitize_summary(&s)
+}
+
+/// ★(R2F-DM · 성찰 2회차 A2 m-3) **요약 전용** 절단 — [`sanitize_line`] 과 같은 정제·`SUMMARY_MAX_BYTES` 상한이되, **절단이 일어났고 그 자리가 토큰 중간이면 마지막 공백까지 물려 꼬리 토큰을 통째로 버린다.**
+/// 종전에는 200바이트 위치에서 글자 경계만 지켜 잘라 부분 값이 남았다 — 숫자 토큰은 더 작은 유효 숫자가 되고(`held=1800` → `held=1`) 코드 토큰은 허용 목록 밖 문자열이 된다(`remedy=input_pendin`).
+/// 받는 LLM 에게 "있는데 깨진" 토큰은 "없는" 토큰보다 나쁘다(지침은 `remedy=` 가 없으면 `blocked_by` 를 전달하라고만 말한다). 절단이 토큰 경계(바로 다음 글자가 공백)에서 났거나 절단이 없으면 종전과 **같은 문자열**이다.
+/// 공백이 하나도 없는(한 토큰이 상한을 넘는) 입력은 물릴 곳이 없어 종전 절단을 그대로 쓴다. 호출부는 [`summarize_payload`] 한 곳이다 — 다른 `sanitize_line` 소비자(상세·복원·라벨)는 불변이다.
+fn sanitize_summary(s: &str) -> String {
+    let full = sanitize_line(s, usize::MAX); // 정제만(절단 없음 — 끝 공백도 걷힌다)
+    if full.len() <= SUMMARY_MAX_BYTES {
+        return full;
+    }
+    let mut cut = SUMMARY_MAX_BYTES;
+    while cut > 0 && !full.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    if full[cut..].starts_with(' ') {
+        return full[..cut].trim_end().to_string(); // 토큰 경계에서 잘렸다 — 앞 토큰은 온전하다
+    }
+    match full[..cut].rfind(' ') {
+        Some(i) => full[..i].trim_end().to_string(), // 토큰 중간 — 꼬리 토큰을 통째로 버린다
+        None => full[..cut].trim_end().to_string(),  // 물릴 공백이 없다 — 종전 절단
+    }
 }
 
 fn generic_summary(payload: &Value) -> String {
@@ -6179,10 +6201,18 @@ mod pure_tests {
             "queue.depth_high",
             &json!({"depth": 3, "threshold": 2, "blocked_by": "한".repeat(100)}),
         );
-        let head = "depth=3/2 blocked_by=";
-        assert_eq!(summary, format!("{head}{}", "한".repeat((200 - head.len()) / 3)),
-            "고정 요약의 200바이트 문자 경계 절단이 깨졌다");
+        // ★(R2F-DM · 성찰 2회차 A2 m-3 — **기존 검체의 기대값을 새 규칙으로 고쳤다**) 종전 기대값은 `depth=3/2 blocked_by=` 뒤에 한글을 글자 경계(66자)까지 채운 **부분 값**이었다.
+        //   새 규칙: 절단이 일어났고 그 자리가 토큰 중간이면 마지막 공백까지 물려 꼬리 토큰을 통째로 버린다 — 200바이트 위치가 `blocked_by=한…` 토큰 안이므로 그 토큰이 빠진다.
+        //   이 검체가 지키던 불변(상한 200 이하 · 글자를 반으로 가르지 않는다)은 그대로 박는다.
+        assert_eq!(summary, "depth=3/2", "고정 요약의 200바이트 절단이 꼬리 토큰(blocked_by=한…)을 통째로 버리지 않았다");
         assert!(summary.len() <= 200, "요약이 200바이트를 넘었다");
+        // 공백이 낀 긴 사유 — 단어 사이 공백마다 절단 후보가 있다: 결과는 **온전한 단어**로 끝나고(글자를 반으로 가르지 않는다) 정제 원문의 토큰 접두다.
+        let spaced = "한 ".repeat(80);
+        let summary = summarize_payload("queue.depth_high", &json!({"depth": 3, "threshold": 2, "blocked_by": spaced}));
+        let full = sanitize_line(&format!("depth=3/2 blocked_by={spaced}"), usize::MAX);
+        assert!(summary.len() <= 200 && full.starts_with(&summary), "{summary:?}");
+        assert!(summary.ends_with('한') && (summary.len() == full.len() || full[summary.len()..].starts_with(' ')), "토큰 중간(또는 글자 중간)에서 끝났다: {summary:?}");
+        assert!(summary.split(' ').all(|t| t == "한" || t == "depth=3/2" || t == "blocked_by=한"), "부분 토큰이 남았다: {summary:?}");
         // 일반 요약은 값 자체가 16진 16자리 해시로 접히므로 길이 상한을 구조가 진다.
         let long = summarize_payload("watchdog.load_high", &json!({"a": "a".repeat(100)}));
         assert_eq!(long, format!("a={}", opaque_label(&"a".repeat(100))), "긴 값이 원문으로 통과했다");
@@ -8851,17 +8881,167 @@ mod b3_summary_tests {
         assert_ne!(rate_alert_detail(&with_meta["detail"], false), legacy);
     }
 
-    /// 요약 상한(200바이트) 안에서 가산 토큰이 잘려 나가지 않는다 — 최악의 자릿수(나이 10자리 · 소수 사용률)에서도.
+    /// 요약 상한(200바이트) 안에서 가산 토큰이 잘려 나가지 않는다 — 최악의 자릿수(나이·리셋 10자리 · 17자 사용률)에서도.
+    /// ★(R2F-DM · 성찰 2회차 A2 m-3) 입력을 **서식의 최악**으로 바꿨다: 종전 입력(표준 창 라벨 `300m` · 사용률 14자 · 리셋 6자리 = 172바이트)은 서식의 최악(허용 목록 밖 창 라벨의 해시 17바이트 · 17자 사용률 ·
+    /// 리셋 10자리 · `in_use=na` = 193바이트)보다 21바이트 작아, 28바이트 토큰이 더 붙어도 초록이었다 — 이 핀의 이름이 말하는 '최악' 이 아니었다. 같은 입력의 정확한 문자열과 상한 초과 때의 절단 규칙은
+    /// `r2f_dm_rate_alert_summary_worst_case_format_is_whole_and_overflow_drops_whole_tail_tokens` 가 박는다.
     #[test]
     fn b3_rate_alert_summary_fits_the_byte_cap_with_worst_case_digits() {
-        let mut p = payload(true, "300m", true);
-        p["detail"]["used_pct"] = json!(1000.123456789);
+        let mut p = payload(true, "weekly", true); // 허용 목록 밖 창 라벨 → 해시(`#` + 16 hex)
+        p["detail"]["used_pct"] = json!(99.99999999999999); // 17자
         p["detail"]["age_secs"] = json!(9_999_999_999u64);
-        p["detail"]["reset_in_secs"] = json!(604_800);
+        p["detail"]["reset_in_secs"] = json!(9_999_999_999u64); // 10자리
         p["detail"]["held_secs"] = json!(1800);
+        p["detail"]["in_use"] = json!(null); // `in_use=na`
         let s = summarize_payload(ACCT, &p);
         assert!(s.len() <= SUMMARY_MAX_BYTES, "{} 바이트: {s}", s.len());
         assert!(s.ends_with(" held=1800"), "마지막 토큰이 잘렸다: {s}");
+        // 종전 입력(172바이트)도 여전히 상한 안이다(약화 금지 — 같은 불변을 더 낮은 입력에서도).
+        let mut q = payload(true, "300m", true);
+        q["detail"]["used_pct"] = json!(1000.123456789);
+        q["detail"]["age_secs"] = json!(9_999_999_999u64);
+        q["detail"]["reset_in_secs"] = json!(604_800);
+        q["detail"]["held_secs"] = json!(1800);
+        let t = summarize_payload(ACCT, &q);
+        assert!(t.len() <= SUMMARY_MAX_BYTES && t.ends_with(" held=1800"), "{} 바이트: {t}", t.len());
+    }
+
+    /// ★(R2F-DM · 성찰 2회차 A2 m-3) 길이 핀의 입력을 **서식의 최악**으로 — 위 검체의 입력(172바이트: 표준 창 라벨 `300m` · 사용률 14자 · 리셋 6자리)은 서식의 최악보다 21바이트 작아, 28바이트 토큰이 더 붙어도 초록이었다.
+    /// 서식의 최악 = 허용 목록 밖 창 라벨(해시 17바이트) · 17자 사용률 · 나이·리셋 10자리 · `in_use=na` — 보고서의 193바이트 조합(요약 상한 200 안). 이 조합이 **한 글자도 잘리지 않고** 마지막 토큰이 온전함을 박는다.
+    /// 그리고 현실 밖 자릿수(나이 u64 최대 20자리)로 상한을 넘기면 — 종전에는 `held=1800` 이 `held=1` 로 잘렸다 — **꼬리 토큰이 통째로 빠져** 부분 값이 남지 않는다(앞 토큰은 전부 온전).
+    #[test]
+    fn r2f_dm_rate_alert_summary_worst_case_format_is_whole_and_overflow_drops_whole_tail_tokens() {
+        let mut p = payload(true, "weekly", true); // 허용 목록 밖 → 해시 `#` + 16 hex
+        p["detail"]["used_pct"] = json!(99.99999999999999); // 17자
+        p["detail"]["age_secs"] = json!(9_999_999_999u64);
+        p["detail"]["reset_in_secs"] = json!(9_999_999_999u64);
+        p["detail"]["held_secs"] = json!(1800);
+        p["detail"]["in_use"] = json!(null); // `in_use=na`
+        let s = summarize_payload(ACCT, &p);
+        let (key_a, acct, win) = (
+            opaque_label("account_rate:a-b3@example.test:5h"),
+            opaque_label("a-b3@example.test"),
+            opaque_label("weekly"),
+        );
+        let want = format!(
+            "kind=account_rate severity=crit isolate=true key={key_a} account={acct} used_pct=99.99999999999999 win={win} age=9999999999 in_use=na reset=9999999999 held=1800"
+        );
+        assert_eq!(s, want, "서식의 최악 조합이 잘리거나 달라졌다");
+        assert_eq!(s.len(), 193, "보고서의 193바이트 조합({}바이트): {s}", s.len());
+        assert!(s.len() <= SUMMARY_MAX_BYTES, "{} 바이트: {s}", s.len());
+        // 현실 밖 자릿수로 상한을 넘긴다 — 꼬리 토큰이 통째로 빠지고 부분 값이 남지 않는다.
+        p["detail"]["age_secs"] = json!(u64::MAX);
+        let t = summarize_payload(ACCT, &p);
+        assert!(t.len() <= SUMMARY_MAX_BYTES, "{} 바이트: {t}", t.len());
+        assert!(!t.ends_with("held=1") && !t.contains("held=1 ") && t.matches("held=").count() <= 1, "부분 값이 남았다: {t}");
+        assert!(
+            t.ends_with(" reset=9999999999") || t.ends_with(" held=1800"),
+            "마지막 토큰이 온전하지 않다(종전 절단은 `held=1` 을 남겼다): {t}"
+        );
+        // 남은 토큰은 전부 완결된 `키=값` 이다(숫자 토큰은 입력 자릿수 그대로).
+        for tok in t.split(' ') {
+            let ok = match tok.split_once('=') {
+                Some(("age", v)) => v == "18446744073709551615",
+                Some(("reset", v)) => v == "9999999999",
+                Some(("held", v)) => v == "1800",
+                Some(("in_use", v)) => v == "na",
+                Some((_, v)) => !v.is_empty(),
+                None => false,
+            };
+            assert!(ok, "완결되지 않은 토큰 `{tok}`: {t}");
+        }
+    }
+
+    /// ★(R2F-DM · A2 m-3) 요약 절단의 규칙 — 정제만 한 문자열이 상한 이하이면 그대로 · 절단이 **토큰 경계**(바로 다음 글자가 공백)에서 나면 종전과 같은 문자열 · **토큰 중간**이면 마지막 공백까지 물려 꼬리 토큰을 버린다 ·
+    /// 공백이 하나도 없는 입력은 종전 절단 그대로(물릴 곳이 없다) · 글자 경계(3바이트 한글)를 지킨다. 결과는 언제나 정제 원문의 **토큰 접두**이고 상한 이하다.
+    #[test]
+    fn r2f_dm_sanitize_summary_drops_a_partial_tail_token_and_keeps_boundary_cuts() {
+        let filler = |n: usize| "a".repeat(n);
+        // ① 상한 이하 — 그대로.
+        assert_eq!(sanitize_summary("depth=3 head_wait=5s blocked_by=busy remedy=wait"), "depth=3 head_wait=5s blocked_by=busy remedy=wait");
+        assert_eq!(sanitize_summary("  a \n b  "), "a b", "정제는 종전과 같다(공백 압축 · 끝 공백)");
+        // ② 토큰 중간 절단 — 195바이트 앞 토큰들 + 28바이트 꼬리 토큰: 200 위치가 꼬리 토큰 안이다 → 꼬리 토큰이 통째로 빠진다.
+        let head = format!("{} {}", filler(100), filler(94)); // 100 + 1 + 94 = 195
+        let full = format!("{head} remedy=input_pending_unknown");
+        let legacy = sanitize_line(&full, SUMMARY_MAX_BYTES);
+        assert!(legacy.len() == SUMMARY_MAX_BYTES && legacy.ends_with(" reme"), "전제: 종전 절단은 200바이트에서 꼬리 토큰 중간(`reme`)이다({legacy})");
+        let got = sanitize_summary(&full);
+        assert_eq!(got, head, "꼬리 토큰 `remedy=…` 이 통째로 빠져야 한다");
+        // ③ 토큰 경계 절단 — 정확히 200바이트에서 토큰이 끝나고 다음이 공백 → 종전과 같다(앞 토큰은 온전).
+        let edge = format!("{} {} tail", filler(100), filler(99)); // 100 + 1 + 99 = 200, 다음이 공백
+        let got = sanitize_summary(&edge);
+        assert_eq!(got.len(), 200);
+        assert_eq!(got, sanitize_line(&edge, SUMMARY_MAX_BYTES), "경계 절단은 종전과 같은 문자열");
+        assert_eq!(got, format!("{} {}", filler(100), filler(99)));
+        // 경계 직전 한 바이트 더 길면(토큰이 201바이트째까지 이어진다) 그 토큰은 중간이라 빠진다.
+        let over = format!("{} {} tail", filler(100), filler(100));
+        assert_eq!(sanitize_summary(&over), filler(100), "토큰 중간(200 위치)이면 그 토큰을 버린다");
+        // ④ 공백 없는 한 토큰이 상한을 넘으면 종전 절단 그대로.
+        let one = filler(300);
+        assert_eq!(sanitize_summary(&one), sanitize_line(&one, SUMMARY_MAX_BYTES));
+        assert_eq!(sanitize_summary(&one).len(), 200);
+        // ⑤ 3바이트 글자 경계 — 꼬리 토큰이 한글이어도 글자를 반으로 가르지 않고 토큰째 버린다.
+        let ko = format!("{} {}", filler(150), "가나다라마바사아자차카타파하".repeat(5)); // 150 + 1 + 210 바이트
+        let got = sanitize_summary(&ko);
+        assert_eq!(got, filler(150), "한글 꼬리 토큰은 글자 경계가 아니라 토큰째 빠진다");
+        // ⑥ 성질 — 어떤 입력이든 결과는 상한 이하이고, 정제 원문의 접두이며, 접두가 끝난 자리가 토큰 경계(끝 또는 공백)다(공백 없는 한 토큰 입력만 예외 — 종전 절단).
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..400 {
+            let ntok = 3 + (next() % 30) as usize;
+            let toks: Vec<String> = (0..ntok)
+                .map(|_| {
+                    let len = 1 + (next() % 28) as usize;
+                    (0..len).map(|_| ["a", "b", "=", "가", "9", "_"][(next() % 6) as usize]).collect::<String>()
+                })
+                .collect();
+            let src = toks.join(" ");
+            let full = sanitize_line(&src, usize::MAX);
+            let got = sanitize_summary(&src);
+            assert!(got.len() <= SUMMARY_MAX_BYTES, "{} 바이트: {got}", got.len());
+            assert!(full.starts_with(&got), "정제 원문의 접두가 아니다: {got:?} / {full:?}");
+            assert!(
+                got.len() == full.len() || full[got.len()..].starts_with(' '),
+                "토큰 중간에서 끝났다: {got:?} / {full:?}"
+            );
+            if full.len() <= SUMMARY_MAX_BYTES {
+                assert_eq!(got, full, "상한 이하인데 바뀌었다");
+            }
+        }
+    }
+
+    /// ★(R2F-DM · A2 m-3) 끝에서 끝까지: 큐 기아 요약(`depth=… head_wait=…s blocked_by=<사유> remedy=<코드>`)의 `blocked_by` 가 길어 상한을 넘기면, 마지막 `remedy=` 토큰이 `remedy=phantom_c` 같은 **허용 목록 밖
+    /// 부분 값**으로 남지 않는다 — 통째로 빠지거나(지침의 폴백 "없으면 `blocked_by` 를 전달") 온전하다. 사유 길이를 훑어 200 위치가 `remedy=` 토큰의 모든 자리를 지나가게 한다.
+    #[test]
+    fn r2f_dm_queue_starved_summary_never_ends_in_a_partial_remedy_token() {
+        let mut saw_whole = false;
+        let mut saw_dropped = false;
+        for n in 100..=200usize {
+            let blocked = format!("input_pending({})", "가".repeat(n / 3));
+            let pay = json!({"surface_id": 3, "depth": 3, "waited_secs": 120, "blocked_by": blocked, "remedy_code": "phantom_count"});
+            let s = summarize_payload("queue.starved", &pay);
+            assert!(s.len() <= SUMMARY_MAX_BYTES, "n={n}: {} 바이트: {s}", s.len());
+            let full = sanitize_line(&format!("depth=3 head_wait=120s blocked_by={blocked} remedy=phantom_count"), usize::MAX);
+            assert!(full.starts_with(&s) && (s.len() == full.len() || full[s.len()..].starts_with(' ')), "n={n}: 토큰 중간에서 끝났다: {s:?}");
+            match s.rsplit_once(" remedy=") {
+                Some((_, code)) => {
+                    assert_eq!(code, "phantom_count", "n={n}: 코드가 잘려 허용 목록 밖 값이 남았다: {s:?}");
+                    saw_whole = true;
+                }
+                None => {
+                    assert!(!s.contains("remedy="), "n={n}: 부분 `remedy=` 가 남았다: {s:?}");
+                    if full.contains(" remedy=") {
+                        saw_dropped = true;
+                    }
+                }
+            }
+        }
+        assert!(saw_whole && saw_dropped, "훑는 범위가 두 갈래(온전 · 통째로 빠짐)를 모두 지나가야 검체가 공허하지 않다(온전={saw_whole} 빠짐={saw_dropped})");
     }
 
     /// 한도 경보가 아닌 경보의 요약은 불변이다(`generic_summary` 4개 상한 · 수치 원문 · 문자열 해시) — 가산 키 이름이 겹쳐도(`age_secs`) 그대로.

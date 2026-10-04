@@ -1,6 +1,8 @@
 //! T7 E6 경보 엔진 — 임계값·반복실패 경보의 순수 평가기 + 설정 로딩.
 //! governance.rs watchdog가 에지 디바운스로 발화(능동 경보)하고, control.alerts RPC가 같은
-//! 평가기로 현재 상태(UI 배지)를 노출한다 — 단일 진실원으로 둘이 갈라지지 않게.
+//! 평가기(`evaluate`)로 현재 상태(UI 배지)를 노출한다 — **평가기가 하나**라 판정 규칙이 갈라지지 않는다.
+//! ★(R2F-DM · 성찰 2회차 A1 n-12 ⓑ) 다만 **입력 스냅샷은 같지 않다**: 워치독은 캐시 전용 스냅샷(`snapshot_cached_with_stale` · IO 0 · 신원 캐시가 데워지기 전에는 '판정 불가 = 사용 중'),
+//! `control.alerts` 는 읽기-통과 스냅샷(`snapshot` · 신원 파일을 읽는다)을 쓴다 — 캐시가 데워질 때까지 두 입력이 다를 수 있다(R1F-US M-1). "단일 진실원" 은 평가기에 대한 말이지 입력에 대한 말이 아니다.
 //! ★자동응답 금지(governance 교리): 감지·격상(이벤트)만, cycle/clear/budget 판단은 master의 몫.
 //! 데이터 소스: 노드 rate(observed_usage) + 7d usage_records(비용·토큰) + 7d events(반복실패).
 
@@ -439,7 +441,8 @@ pub fn snapshot(daemon: &Arc<Daemon>, now: f64) -> Snapshot {
     snapshot_with_stale(daemon, now, crate::accounts::account_alert_stale_secs())
 }
 
-/// [`snapshot`] 의 시험 이음매 — 신선도 규칙의 나이 상한(초)을 인자로 받는다(`0` = 규칙 끔 = 0.14.42 동작). 환경변수를 건드리지 않고(병렬 검체가 서로 오염되지 않게)
+/// [`snapshot`] 의 시험 이음매 — 신선도 규칙의 나이 상한(초)을 인자로 받는다(`0` = 규칙 끔 = 0.14.42 동작에 **가깝지만 같지는 않다** — 좌석별 경보에서 리셋 시각이 없는 창의 생사를 갱신 시각이 아니라 값을 실제로 관측한 시각으로 따지고,
+/// `usage.alert_resolved` 의 `cleared` 가 난다 · `USER-MANUAL.md` 노브 표·릴리스 노트 §4 · R2F-DM 성찰 2회차 A5 m11). 환경변수를 건드리지 않고(병렬 검체가 서로 오염되지 않게)
 /// 노브 값별 시나리오를 돌린다. 운영은 [`snapshot`] 이 노브 값(`CYS_ACCOUNT_ALERT_STALE_SECS`)을 넘긴다. 락 순서 등 본체 계약은 [`snapshot`] 의 문서와 같다(읽기-통과 신원 표).
 pub fn snapshot_with_stale(daemon: &Arc<Daemon>, now: f64, stale_secs: f64) -> Snapshot {
     let view = crate::accounts::seat_identity_view_at(daemon, now);

@@ -4063,6 +4063,44 @@ mod eprintln_guard_tests {
         let macp = src.find("macro_rules! eprint {").expect("eprint 가림 매크로 소실");
         let first_mod = src.find("\nmod ").expect("첫 mod 선언");
         assert!(mac < first_mod && macp < first_mod, "매크로 정의가 첫 `mod` 선언보다 앞이어야 모든 모듈에 적용된다");
+        // ★(R2F-DM · 성찰 2회차 A1 m-1 ⓒ) `\nmod ` 만 찾으면 `pub mod x;` · `pub(crate) mod x;` · 속성 뒤 `mod x;` 꼴로 매크로 **앞**에 더한 모듈은 첫 `mod` 가 아니라서 위 단언을 지나간다 —
+        //   그 모듈 안의 `eprintln!` 는 가림 매크로가 아니라 표준 매크로로 풀려 stderr 쓰기 실패에서 패닉한다. 매크로 정의 **앞 구간**의 주석 아닌 줄에 `mod` 선언이 없음을 단언한다.
+        fn declares_mod(line: &str) -> bool {
+            let mut t = line.trim_start();
+            if t.starts_with("//") {
+                return false;
+            }
+            // 같은 줄의 속성 접두(`#[…]` · `#![…]`)를 걷는다.
+            while t.starts_with("#[") || t.starts_with("#![") {
+                match t.find(']') {
+                    Some(i) => t = t[i + 1..].trim_start(),
+                    None => return false,
+                }
+            }
+            // 가시성 접두 — `pub` · `pub(crate)` · `pub(super)` · `pub(in path)`.
+            if let Some(r) = t.strip_prefix("pub") {
+                let r = r.trim_start();
+                t = match r.strip_prefix('(') {
+                    Some(inner) => match inner.find(')') {
+                        Some(i) => inner[i + 1..].trim_start(),
+                        None => return false,
+                    },
+                    None => r,
+                };
+            }
+            t.starts_with("mod ")
+        }
+        // 탐지기 생존 증명(합성) — 선언 꼴은 적발하고, 주석·비슷한 낱말은 놓아준다.
+        for yes in ["mod x;", "pub mod x;", "pub(crate) mod x;", "pub(super) mod x {", "pub(in crate::a) mod x;", "#[cfg(test)] mod x;", "#[path = \"a.rs\"] pub mod x;", "    mod x;"] {
+            assert!(declares_mod(yes), "탐지기가 선언을 놓친다: {yes}");
+        }
+        for no in ["// mod x;", "//! pub mod x;", "/// pub mod x;", "let modes = 1;", "fn mod_x() {}", "mod_name!();", "use a::mod_b;", "pub fn model() {}", "pub model();", "", "#![cfg_attr(not(debug_assertions), windows_subsystem = \"windows\")]"] {
+            assert!(!declares_mod(no), "탐지기가 선언이 아닌 줄을 적발한다: {no:?}");
+        }
+        let before_macros = &src[..mac.min(macp)];
+        for (i, l) in before_macros.lines().enumerate() {
+            assert!(!declares_mod(l), "매크로 정의 앞 {}번째 줄에 `mod` 선언이 있다 — 그 모듈은 가림 매크로의 범위 밖이다: {l:?}", i + 1);
+        }
         let def = &src[mac..first_mod];
         assert!(def.contains("let _ = writeln!(std::io::stderr(), $($arg)*);"), "eprintln 은 쓰기 실패를 버린다");
         assert!(def.contains("let _ = write!(std::io::stderr(), $($arg)*);"), "eprint 도 같은 꼴이다");
@@ -4997,7 +5035,8 @@ mod auto_restore_tests {
         std::fs::create_dir_all(&dir).unwrap();
         match decide_auto_restore(&dir, false, &dir, "/usr/bin:/bin", "sock:test") {
             AutoRestore::Ready { args, .. } => {
-                assert!(args[0].ends_with("bin/javis_phoenix.py"), "폴백 후보 경로: {}", args[0]);
+                // ★(R2F-DM · ⓑ) 윈도우는 `Path::join` 이 `\` 를 넣어 `…\bin\javis_phoenix.py` 로 나온다 — 구분자에 무관하게 비교한다(제품 출력은 그대로).
+                assert!(args[0].replace('\\', "/").ends_with("bin/javis_phoenix.py"), "폴백 후보 경로: {}", args[0]);
                 // args = [phoenix, "--socket", <sock>, "restore", "--auto"] — W6/E1 소켓 명시 전달.
                 assert_eq!(args[1], "--socket");
                 assert_eq!(&args[3..], &["restore".to_string(), "--auto".to_string()]);

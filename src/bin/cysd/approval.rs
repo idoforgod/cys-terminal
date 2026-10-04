@@ -735,6 +735,44 @@ fn fingerprint(records: &[ApprovalRecord]) -> Option<Vec<u8>> {
     serde_json::to_vec(records).ok()
 }
 
+/// ★(R2F-DM · 성찰 2회차) 승인 레코드가 서명하는 시각의 **해상도 = 마이크로초**.
+///
+/// 서명 재료(`signing_payload`)의 `createdAt`·`updatedAt`·`expiresAt` 는 `f64` 의 `Display` 문자열이고 레코드는 `serde_json` 으로
+/// 저장·재독한다. 윈도우 `SystemTime` 은 100ns(리눅스는 1ns) 해상도라 시각이 유효숫자 17자리가 되는데, `serde_json` 의 기본 파서는
+/// `significand as f64 / 10^k` 로 두 번 반올림해 그런 값의 약 10 % 를 같은 값으로 돌려주지 못한다 → 저장→읽기 뒤 서명 재료가 달라져
+/// 서명이 어긋나고 승인이 거부됐다(윈도우 `cys approval check` · guard 훅의 LOOSE 우회가 먹지 않는다). 시각을 마이크로초로 맞추면
+/// 값이 `N / 10^6`(N < 2^53 · 서기 2255 년까지)에 가장 가까운 `f64` 가 되어 유효숫자가 16자리 이하이고, 기본 파서의 빠른 길(정수 유효수 ÷ 10^k 한 번 =
+/// 정확한 반올림)이 같은 값을 돌려준다 — 맥의 시계(1µs)가 이미 그렇게 동작하던 것과 같다(맥에서는 사실상 값이 바뀌지 않는다).
+///
+/// ★`serde_json` 의 `float_roundtrip` 기능으로 막지 **않는다**: 0.14.43 릴리스 노트가 그 설계안을 기각했다 — 켜면 데몬이 부동소수 프레임에도 길이 표지(`_flen`)를
+/// 붙이게 되어, 읽기가 best-effort 인 구 클라이언트(0.14.42 이하 `cys`)가 값에 따라 `abi: LenMismatch` 로 간헐 실패한다(`abi_frame_tests`·`wire::tests::k1_*` 가 그 전제를 지킨다).
+/// 서명·검증·매칭 함수(`signing_payload`·`has_valid_signature`·`matches`)는 건드리지 않았다 — 이 함수는 그 함수들에 들어가는 **값**만 정한다.
+/// 종전에 저장된(17자리) 승인은 되살아나지 않는다 — 읽는 쪽 파서가 그대로라서다(다시 서명해야 한다 · 거부 방향 불변).
+pub fn quantize_epoch_us(t: f64) -> f64 {
+    let us = (t * 1e6).round();
+    if us.is_finite() {
+        us / 1e6
+    } else {
+        t
+    }
+}
+
+/// `approval.sign`·`approval.check`(재서명) 가 레코드에 박는 "지금" — 마이크로초로 양자화한 벽시계([`quantize_epoch_us`]).
+/// 승인 레코드의 시각은 **반드시 이 함수로** 만든다(원문 핀 `r2f_dm_record_producers_use_the_quantized_clock` 이 지킨다).
+pub fn record_now() -> f64 {
+    quantize_epoch_us(raw_epoch_now())
+}
+
+/// 양자화 전 벽시계 — 릴리스에서는 언제나 `state::now_epoch()` 하나다. `cfg(test)` 한정 이음매(`tests::with_raw_clock_script`)로 윈도우 100ns·리눅스 1ns 시계를
+/// 맥에서 재현한다(맥의 실제 시계는 1µs 라 양자화가 없어도 어긋나지 않는다). 스레드 지역이라 병렬 검체끼리 간섭하지 않는다.
+fn raw_epoch_now() -> f64 {
+    #[cfg(test)]
+    if let Some(t) = tests::raw_clock_next() {
+        return t;
+    }
+    crate::state::now_epoch()
+}
+
 /// 신규 레코드 id 생성: epoch초 + 프로세스 카운터(동일 초 충돌 차단).
 pub fn new_record_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1244,6 +1282,309 @@ pub(crate) mod tests {
         assert_eq!(b64_decode("Zm9vYmFy").unwrap(), b"foobar");
     }
 
+    /// ★(R2F-DM · 성찰 2회차 A4 M1 ⓒ) **`HOME` 만 돌리는 검체 금지**(소스 전수 핀) — 윈도우의 `dirs::home_dir()` 은 `HOME` 을 보지 않아, `HOME` 만 임시 폴더로 돌린 검체는 임시 폴더가 아니라 러너의 **실제 프로필**을 읽고 쓰며
+    /// (`~\.cys\approvals*.json` 오염 + 찾는 파일이 없어 실패) 맥에서는 우연히 통한다. 그래서 데몬 소스 전체(디렉터리 스캔 · 목록 밖 파일 포함)에서 프로세스 `HOME` 을 바꾸는 검체는 **같은 함수 안에서**
+    /// 저장소 루트 이음매(`with_store_root(`) 나 스레드 지역 홈 이음매(`test_home::set(`)를 함께 쓴다. 이 검체가 붉으면 새 검체가 `HOME` 에만 기대는 것이다 — 이음매로 옮겨라.
+    #[test]
+    fn r2f_dm_no_daemon_test_turns_only_the_home_env_without_a_seam() {
+        let needle = concat!("set_var(\"HO", "ME\"");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
+        let (mut scanned, mut hits) = (0usize, 0usize);
+        for e in std::fs::read_dir(&dir).expect("cysd 소스 디렉터리") {
+            let file = e.expect("항목").file_name().to_string_lossy().to_string();
+            if !file.ends_with(".rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(dir.join(&file)).expect("소스 읽기");
+            scanned += 1;
+            // 함수 단위로 자른다 — 4칸 들여쓴 `fn`(검체 모듈 안의 함수·도우미) 머리에서 나눈다.
+            let mut cuts: Vec<usize> = text.match_indices("\n    fn ").chain(text.match_indices("\n    pub(crate) fn ")).map(|(i, _)| i).collect();
+            cuts.sort_unstable();
+            let mut chunks: Vec<&str> = Vec::new();
+            let mut start = 0usize;
+            for i in cuts {
+                chunks.push(&text[start..i]);
+                start = i;
+            }
+            chunks.push(&text[start..]);
+            for c in chunks {
+                if !c.contains(needle) {
+                    continue;
+                }
+                hits += 1;
+                assert!(
+                    c.contains("with_store_root(") || c.contains("test_home::set("),
+                    "{file}: `HOME` 만 돌리는 검체가 있다(이음매 없음) — 윈도우에서는 러너의 실제 프로필을 건드린다:\n{}",
+                    c.lines().take(6).collect::<Vec<_>>().join("\n")
+                );
+            }
+        }
+        assert!(scanned >= 20, "스캔이 공허하다({scanned}개)");
+        assert!(hits >= 6, "`HOME` 을 바꾸는 검체가 {hits}곳뿐이다 — 판정 대상이 사라졌다면 핀을 점검하라(기대 ≥ 6: handlers 승인 RPC 검체 등)");
+    }
+
+    // ── ★(R2F-DM · 성찰 2회차) 승인 레코드 시각의 **마이크로초 양자화** — 윈도우 서명 불일치(JSON f64 왕복)의 수리 검체 ────────────────────────────────────
+    // 서명 재료의 `createdAt={f64}`·`updatedAt={f64}`·`expiresAt={f64}` 는 `Display` 문자열이고 레코드는 `serde_json` 으로 저장·재독한다. 윈도우 시계는 100ns(리눅스는 1ns)라 시각이 유효숫자
+    // 17자리가 되는데 `serde_json` 기본 파서는 그런 값의 약 10 % 를 같은 값으로 돌려주지 못한다 → 서명 불일치 → 승인 거부(`cys approval check` · guard 훅의 LOOSE 우회가 먹지 않는다).
+    // 수리 = 시각을 만드는 두 곳(`approval.sign`·`approval.check` 의 재서명)이 `record_now()`(마이크로초 양자화)를 쓴다. `float_roundtrip` 기능은 0.14.43 K1 설계상 켜지 않는다(`quantize_epoch_us` 의 doc).
+    // 맥의 실제 시계는 1µs 라 양자화 없이도 어긋나지 않는다 → 윈도우·리눅스 시계는 시계 이음매(`with_raw_clock_script`)와 결정론 격자로 재현한다. 시계·난수 없이 결정론이다.
+
+    // ── 시계 이음매(§`raw_epoch_now`) — `cfg(test)` 한정 · 스레드 지역 ───────────────────────────────────────────────────────────────
+    thread_local! {
+        /// 검체가 주입한 "원시 벽시계 판독" 대기열(앞에서부터 하나씩 소비). 비어 있으면 실제 시계다.
+        static RAW_CLOCK_SCRIPT: std::cell::RefCell<std::collections::VecDeque<f64>> =
+            std::cell::RefCell::new(std::collections::VecDeque::new());
+    }
+
+    pub(crate) fn raw_clock_next() -> Option<f64> {
+        RAW_CLOCK_SCRIPT.with(|s| s.borrow_mut().pop_front())
+    }
+
+    /// 아직 소비되지 않은 판독 수 — 검체가 "두 생산자가 모두 이 시계를 썼다"를 단언하는 데 쓴다.
+    pub(crate) fn raw_clock_remaining() -> usize {
+        RAW_CLOCK_SCRIPT.with(|s| s.borrow().len())
+    }
+
+    /// 원시 시계를 판독 목록으로 갈아 끼운다 — 가드가 살아 있는 동안만(드롭하면 비운다 · 이 스레드 한정).
+    #[must_use]
+    pub(crate) fn with_raw_clock_script(readings: &[f64]) -> RawClockGuard {
+        RAW_CLOCK_SCRIPT.with(|s| *s.borrow_mut() = readings.iter().copied().collect());
+        RawClockGuard
+    }
+
+    pub(crate) struct RawClockGuard;
+
+    impl Drop for RawClockGuard {
+        fn drop(&mut self) {
+            RAW_CLOCK_SCRIPT.with(|s| s.borrow_mut().clear());
+        }
+    }
+
+    /// 결정론 시각 격자 — 고정 시작(2026-10-04T08:20:00Z 근방) · 고정 보폭(7,919,113 칸) · 칸 크기 `unit_ns`(100 = 윈도우 `SystemTime`, 1 = 리눅스 `clock_gettime`). 값은 `Duration::as_secs_f64` 라 제품의 `now_epoch()` 와 같은 산출식이다.
+    fn r2f_grid_epoch(unit_ns: u64, i: u64) -> f64 {
+        let total_ns: u128 = 1_791_102_000u128 * 1_000_000_000 + (i as u128) * 7_919_113u128 * (unit_ns as u128);
+        std::time::Duration::new((total_ns / 1_000_000_000) as u64, (total_ns % 1_000_000_000) as u32).as_secs_f64()
+    }
+
+    /// 위 격자에서 **기본 파서가 같은 값으로 돌려주지 못하는** 17자리 값(탐침 실측) — 100ns 격자 i=3·14·46 · 1ns 격자 i=2·3.
+    pub(crate) const R2F_BAD_100NS: [f64; 3] = [1791102002.3757339, 1791102011.0867581, 1791102036.4279199];
+    pub(crate) const R2F_BAD_1NS: [f64; 2] = [1791102000.0158381, 1791102000.0237575];
+
+    /// **지금 시각 근처**에서 기본 파서가 같은 값으로 돌려주지 못하는 17자리 "원시 판독" `n` 개 — 100ns 칸 · 약 0.8ms 보폭(시작 시각만 실제 시계 · 나머지는 결정론).
+    /// RPC 검체는 만료·신선도를 **실제 시계**로 판정하므로 합성 시계도 지금 근처여야 한다(고정한 과거 시각이면 TTL 이 이미 지나 승인이 거부된다).
+    pub(crate) fn r2f_lossy_readings_near_now(n: usize) -> Vec<f64> {
+        let now_ns = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("시스템 시계").as_nanos();
+        let base_ns = now_ns / 100 * 100;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..50_000u128 {
+            let total = base_ns + i * 7_919 * 100;
+            let x = std::time::Duration::new((total / 1_000_000_000) as u64, (total % 1_000_000_000) as u32).as_secs_f64();
+            if r2f_lossy(x) {
+                out.push(x);
+                if out.len() == n {
+                    break;
+                }
+            }
+        }
+        assert_eq!(out.len(), n, "지금 근처에서 기본 파서가 틀리는 값을 {n}개 찾지 못했다({}개) — 이 빌드의 파서가 정확해졌나(`float_roundtrip`?)", out.len());
+        out
+    }
+
+    /// `x` 를 JSON 으로 쓰고 읽는다 — `load_records_from` 이 실제로 타는 두 길(`from_str::<f64>` · `from_str::<Value> → as_f64`)과 쓴 문자열.
+    fn r2f_json_roundtrip(x: f64) -> (f64, f64, String) {
+        let text = serde_json::to_string(&x).expect("직렬화");
+        let via_f64: f64 = serde_json::from_str(&text).expect("f64 판독");
+        let via_value = serde_json::from_str::<serde_json::Value>(&text).expect("Value 판독").as_f64().expect("수치");
+        (via_f64, via_value, text)
+    }
+
+    /// 두 길 가운데 하나라도 `to_bits()` 까지 같지 않으면 참.
+    fn r2f_lossy(x: f64) -> bool {
+        let (a, b, _) = r2f_json_roundtrip(x);
+        a.to_bits() != x.to_bits() || b.to_bits() != x.to_bits()
+    }
+
+    /// ① 양자화한 시각은 100ns 격자·1ns 격자 각 20,000 값에서 **두 판독 길 모두 비트까지 정확히** 돌아온다(불일치 0) — 만료 시각(양자화한 지금 + 정수 TTL 을 다시 양자화 = 핸들러가 하는 식)도 같다.
+    /// 양자화는 멱등이고 · 값을 1µs 넘게 옮기지 않으며 · 유효숫자 16자리 이하다.
+    /// 공허 방지: 같은 격자의 **원시** 값은 기본 파서에서 1,000건 이상 어긋난다(탐침 실측 100ns 격자 2076건 · 1ns 격자 2456건) — 양자화가 항등이면 아래 단언이 붉다.
+    #[test]
+    fn r2f_dm_quantized_record_clock_survives_json_exactly_on_the_100ns_and_1ns_grids() {
+        for (label, unit) in [("100ns(윈도우 시계)", 100u64), ("1ns(리눅스 시계)", 1u64)] {
+            let (mut raw_lossy, mut q_lossy, mut sum_lossy, mut not_idem) = (0u32, 0u32, 0u32, 0u32);
+            let (mut max_digits, mut max_shift) = (0usize, 0f64);
+            let mut first_bad: Option<f64> = None;
+            for i in 0..20_000u64 {
+                let raw = r2f_grid_epoch(unit, i);
+                if r2f_lossy(raw) {
+                    raw_lossy += 1;
+                }
+                let q = quantize_epoch_us(raw);
+                max_shift = max_shift.max((q - raw).abs());
+                if quantize_epoch_us(q).to_bits() != q.to_bits() {
+                    not_idem += 1;
+                }
+                let (_, _, text) = r2f_json_roundtrip(q);
+                max_digits = max_digits.max(text.bytes().filter(u8::is_ascii_digit).count());
+                if r2f_lossy(q) {
+                    q_lossy += 1;
+                    first_bad.get_or_insert(raw);
+                }
+                for ttl in [1u64, 60, 3_600, 86_400, 2_592_000] {
+                    if r2f_lossy(quantize_epoch_us(q + ttl as f64)) {
+                        sum_lossy += 1;
+                        first_bad.get_or_insert(raw);
+                    }
+                }
+            }
+            assert!(
+                raw_lossy >= 1_000,
+                "{label}: 원시 값이 기본 파서에서 {raw_lossy}/20000 건만 어긋난다 — 이 검체의 전제가 사라졌다(`serde_json` 의 `float_roundtrip` 이 켜졌나? 0.14.43 K1 검체도 함께 점검하라)"
+            );
+            assert_eq!(
+                (q_lossy, sum_lossy, not_idem),
+                (0, 0, 0),
+                "{label}: 양자화한 시각이 JSON 왕복에서 바뀌었다(지금 {q_lossy}건 · 만료 {sum_lossy}건 · 멱등 위반 {not_idem}건 · 첫 불일치 원시값 {first_bad:?})"
+            );
+            assert!(max_digits <= 16, "{label}: 양자화한 값의 유효숫자가 {max_digits}자리다(기대 ≤ 16)");
+            // 정확 산술이면 ≤ 0.5µs 지만 `f64` 곱(`t * 1e6` — 1.8e15 부근 칸 0.25)과 가장 가까운 `f64` 선택(칸 2.4e-7 초)이 각각 반올림을 더해 실제 상한은 약 0.75µs 다 — 1µs 이내면 충분하다(마이크로초 아래는 의미가 없다).
+            assert!(max_shift <= 1e-6, "{label}: 양자화가 값을 {max_shift:e} 초 옮겼다(기대 ≤ 1µs)");
+        }
+        // 표: 마이크로초 아래는 반올림(작은 크기라 리터럴이 정확하다) · 영·무한·NaN 은 그대로 · 음수는 대칭.
+        assert_eq!(quantize_epoch_us(1.000_000_4).to_bits(), 1.0f64.to_bits());
+        assert_eq!(quantize_epoch_us(1.000_000_6).to_bits(), 1.000_001f64.to_bits());
+        assert_eq!(quantize_epoch_us(-1.000_000_6).to_bits(), (-1.000_001f64).to_bits());
+        assert_eq!(quantize_epoch_us(0.0).to_bits(), 0.0f64.to_bits());
+        assert!(quantize_epoch_us(f64::INFINITY).is_infinite() && quantize_epoch_us(f64::NAN).is_nan());
+    }
+
+    /// ② 실제 `save_records → load_records`(`with_store_root` 이음매) — **원시** 17자리 시각으로 서명한 레코드는 저장→읽기 뒤 서명이 죽는다(수리 전 윈도우 사고의 재현 · 음성 대조),
+    /// 같은 판독을 **양자화한 값**으로 서명하면 무TTL·TTL 모두 세 값 `to_bits()` 동일 + 서명 유효, 그리고 **사용 1회**(`approval.check` 가 하는 일 = `updated_at` 새 시각으로 재서명·저장) 뒤에도 같다.
+    #[test]
+    fn r2f_dm_approvals_signed_on_the_quantized_clock_survive_save_load_and_one_use() {
+        for (v, unit, i) in [(R2F_BAD_100NS[0], 100u64, 3u64), (R2F_BAD_100NS[1], 100, 14), (R2F_BAD_100NS[2], 100, 46), (R2F_BAD_1NS[0], 1, 2), (R2F_BAD_1NS[1], 1, 3)] {
+            assert_eq!(r2f_grid_epoch(unit, i).to_bits(), v.to_bits(), "고정한 값이 격자의 i={i} 값과 다르다({v:?})");
+            assert!(r2f_lossy(v), "{v:?}: 이 빌드의 기본 파서가 이 값을 정확히 돌려준다 — 전제가 사라졌다(`float_roundtrip` 이 켜졌나? 0.14.43 K1 검체도 함께 점검하라)");
+        }
+        let root = std::env::temp_dir().join(format!(
+            "cys-r2f-f64-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&root).expect("임시 루트");
+        let _guard = with_store_root(&root);
+        let secret: &[u8] = b"r2f-f64-roundtrip-secret-32-bytes-xx";
+        let rec = |id: &str, created: f64, updated: f64, expires: Option<f64>| {
+            let mut r = ApprovalRecord {
+                version: 1,
+                id: id.into(),
+                command_prefix: vec!["echo".into(), "hi".into()],
+                cwd: Some("/tmp".into()),
+                environment: vec![],
+                created_at: created,
+                updated_at: updated,
+                expires_at: expires,
+                signature: String::new(),
+            };
+            r.sign(secret);
+            r
+        };
+        let same_bits = |a: &ApprovalRecord, b: &ApprovalRecord, what: &str| {
+            assert_eq!(a.created_at.to_bits(), b.created_at.to_bits(), "{what}: created_at 이 왕복에서 바뀌었다({:?} → {:?})", b.created_at, a.created_at);
+            assert_eq!(a.updated_at.to_bits(), b.updated_at.to_bits(), "{what}: updated_at 이 왕복에서 바뀌었다({:?} → {:?})", b.updated_at, a.updated_at);
+            assert_eq!(a.expires_at.map(f64::to_bits), b.expires_at.map(f64::to_bits), "{what}: expires_at 이 왕복에서 바뀌었다({:?} → {:?})", b.expires_at, a.expires_at);
+            assert!(a.has_valid_signature(secret), "{what}: 저장→읽기 뒤 서명이 무효다 — 시각 값이 달라졌다");
+        };
+        let combos = [(R2F_BAD_100NS[0], R2F_BAD_100NS[1], R2F_BAD_100NS[2]), (R2F_BAD_1NS[0], R2F_BAD_1NS[1], R2F_BAD_100NS[2]), (R2F_BAD_100NS[2], R2F_BAD_1NS[1], R2F_BAD_1NS[0])];
+        // 음성 대조 — 원시 시각 그대로 서명하면 저장→읽기 뒤 서명이 죽는다(수리 전 윈도우).
+        let mut raw_dead = 0u32;
+        let mut raw_total = 0u32;
+        for ttl in [false, true] {
+            for (n, (c, u, e)) in combos.into_iter().enumerate() {
+                let written = rec(&format!("r2f-raw-{ttl}-{n}"), c, u, ttl.then_some(e));
+                save_records(std::slice::from_ref(&written)).expect("저장");
+                let back = load_records();
+                assert_eq!(back.len(), 1, "원시 ttl={ttl} 조합{n}: 읽은 레코드 수");
+                raw_total += 1;
+                if !back[0].has_valid_signature(secret) {
+                    raw_dead += 1;
+                }
+            }
+        }
+        assert_eq!(raw_dead, raw_total, "원시 17자리 시각으로 서명한 레코드 {raw_total}건 가운데 {raw_dead}건만 죽었다 — 음성 대조의 전제가 사라졌다(기본 파서가 정확해졌나?)");
+        // 수리 — 같은 판독을 양자화(`record_now` 가 하는 일)한 값으로 서명하면 모두 산다.
+        let q = quantize_epoch_us;
+        for ttl in [false, true] {
+            for (n, (c, u, _)) in combos.into_iter().enumerate() {
+                let what = format!("ttl={ttl} 조합{n}");
+                let written = rec(&format!("r2f-{ttl}-{n}"), q(c), q(u), ttl.then(|| q(q(c) + 3600.0)));
+                save_records(std::slice::from_ref(&written)).expect("저장");
+                let back = load_records();
+                assert_eq!(back.len(), 1, "{what}: 읽은 레코드 수");
+                same_bits(&back[0], &written, &what);
+                // 사용 1회 — `approval.check` 가 하는 일: 읽은 레코드의 `updated_at` 을 새 시각(양자화)으로 바꿔 재서명·저장.
+                let mut used = back[0].clone();
+                used.updated_at = q(if n % 2 == 0 { R2F_BAD_100NS[1] } else { R2F_BAD_1NS[0] });
+                used.sign(secret);
+                save_records(std::slice::from_ref(&used)).expect("재저장");
+                let again = load_records();
+                assert_eq!(again.len(), 1, "{what}: 사용 뒤 읽은 레코드 수");
+                same_bits(&again[0], &used, &format!("{what}(사용 1회 뒤)"));
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ③ 원문 핀 — 승인 레코드의 시각을 만드는 **두 곳**(`approval.sign` 의 `created_at`·`updated_at`·`expires_at` · `approval.check` 의 재서명 `updated_at`)이 양자화한 시계를 쓴다.
+    /// 둘 중 하나가 원시 `state::now_epoch()` 로 돌아가면 윈도우에서 승인이 다시 죽는다(맥은 1µs 시계라 어떤 검체도 못 잡는다 — 그래서 원문으로 지킨다).
+    /// 그리고 `ApprovalRecord` 리터럴을 만드는 곳이 데몬 전체에서 그 한 곳뿐이다(새 생산자가 생기면 이 핀이 붉어 시계 규칙을 상기시킨다).
+    #[test]
+    fn r2f_dm_record_producers_use_the_quantized_clock() {
+        let strip = |src: &str| -> String {
+            src.lines()
+                .map(|l| match l.find("//") {
+                    Some(i) if !l[..i].contains('"') => &l[..i],
+                    _ => l,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let handlers_full = include_str!("handlers.rs");
+        let prod = strip(handlers_full.split("\n#[cfg(test)]\nmod tests {").next().expect("handlers.rs 운영부"));
+        assert!(prod.len() < handlers_full.len(), "운영부 경계(`#[cfg(test)] mod tests`)를 못 찾았다");
+        // 있어야 하는 것
+        let sign_now = concat!("let now = crate::approval::", "record_now();");
+        let sign_exp = concat!("expires_at: ttl_secs.map(|t| crate::approval::", "quantize_epoch_us(now + t as f64)),");
+        let check_upd = concat!("r.updated_at = crate::approval::", "record_now();");
+        for (what, needle) in [("sign 의 now", sign_now), ("sign 의 expires_at", sign_exp), ("check 재서명의 updated_at", check_upd)] {
+            assert_eq!(prod.matches(needle).count(), 1, "handlers.rs 운영부에 `{needle}`({what})가 정확히 한 번 있어야 한다");
+        }
+        // 있으면 안 되는 것 — 원시 시계로 되돌린 꼴
+        let raw_sign_now = concat!("let now = crate::state::", "now_epoch();\n            let mut rec = crate::approval::ApprovalRecord");
+        let raw_sign_exp = concat!("expires_at: ttl_secs.map(|t| ", "now + t as f64),");
+        let raw_check_upd = concat!("r.updated_at = crate::state::", "now_epoch();");
+        for (what, needle) in [("sign 의 now", raw_sign_now), ("sign 의 expires_at", raw_sign_exp), ("check 재서명의 updated_at", raw_check_upd)] {
+            assert_eq!(prod.matches(needle).count(), 0, "handlers.rs 운영부에 원시 시계 꼴 `{needle}`({what})가 남았다 — 윈도우 승인 서명이 다시 죽는다(`approval::record_now`)");
+        }
+        // 생산자 센서스 — 데몬 전체(디렉터리 스캔)에서 `ApprovalRecord { … }` 리터럴을 만드는 운영 코드는 handlers.rs 의 그 한 곳뿐이다.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
+        let (mut scanned, mut literals) = (0usize, 0usize);
+        for entry in std::fs::read_dir(&dir).expect("cysd 소스 폴더") {
+            let path = entry.expect("항목").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("소스 읽기");
+            let body = strip(text.split("\n#[cfg(test)]").next().unwrap_or(""));
+            scanned += 1;
+            literals += body
+                .lines()
+                .filter(|l| l.contains("ApprovalRecord {") && !l.contains("struct ApprovalRecord") && !l.contains("impl ApprovalRecord") && !l.contains("-> ApprovalRecord"))
+                .count();
+        }
+        assert!(scanned >= 20, "스캔이 공허하다({scanned}개)");
+        assert_eq!(literals, 1, "`ApprovalRecord {{ … }}` 리터럴을 만드는 운영 코드가 {literals}곳이다(기대 1 = approval.sign) — 새 생산자는 `approval::record_now()` 로 시각을 만들어야 한다");
+    }
+
     // ── ★(0.14.31 · WP-4 R2 · codex major) TTL 저장소 분리의 **호환성 검체** ──────────────
     // 위임 작성: codex(gpt-6-astra) · 전 줄 검토 후 채택(R4-WP4-r2-tests-prompt.md).
     // 이 두 검체가 재는 사실은 하나다: **구 데몬은 TTL 레코드를 파괴할 수 없다.** 공용 파일에
@@ -1305,7 +1646,10 @@ pub(crate) mod tests {
             temporary,
         };
         let secret: &[u8] = b"ttl-store-compatibility-secret-32-bytes";
-        std::env::set_var("HOME", &restore.temporary);
+        // ★(R2F-DM · ⓒ) 저장소 루트는 `HOME` 이 아니라 **이음매**로 옮긴다 — 윈도우의 `dirs::home_dir()` 은 `HOME` 을 보지 않아(`store_root` 의 doc) `HOME` 만 바꾼 이 검체는
+        //   임시 폴더가 아니라 러너의 **실제 프로필** `~\.cys\approvals*.json` 을 읽고 썼다(실측: 윈도우 진단 잡 `37188821194` — 두 검체가 임시 폴더의 파일을 찾지 못해 실패). 가드는 `restore` 보다
+        //   뒤에 선언되어 임시 폴더를 지우기 전에 풀린다. `HOME` 은 더 이상 바꾸지 않는다(복원 목록의 항목은 그대로 무해하다).
+        let _root = with_store_root(&restore.temporary);
         std::env::set_var("CYS_APPROVAL_SECRET_B64", b64_encode(secret));
         let shared_path = restore.temporary.join(".cys/approvals.json");
         let ttl_path = restore.temporary.join(".cys/approvals-ttl.json");
@@ -1486,7 +1830,10 @@ pub(crate) mod tests {
             temporary,
         };
         let secret: &[u8] = b"ttl-store-compatibility-secret-32-bytes";
-        std::env::set_var("HOME", &restore.temporary);
+        // ★(R2F-DM · ⓒ) 저장소 루트는 `HOME` 이 아니라 **이음매**로 옮긴다 — 윈도우의 `dirs::home_dir()` 은 `HOME` 을 보지 않아(`store_root` 의 doc) `HOME` 만 바꾼 이 검체는
+        //   임시 폴더가 아니라 러너의 **실제 프로필** `~\.cys\approvals*.json` 을 읽고 썼다(실측: 윈도우 진단 잡 `37188821194` — 두 검체가 임시 폴더의 파일을 찾지 못해 실패). 가드는 `restore` 보다
+        //   뒤에 선언되어 임시 폴더를 지우기 전에 풀린다. `HOME` 은 더 이상 바꾸지 않는다(복원 목록의 항목은 그대로 무해하다).
+        let _root = with_store_root(&restore.temporary);
         std::env::set_var("CYS_APPROVAL_SECRET_B64", b64_encode(secret));
         let shared_path = restore.temporary.join(".cys/approvals.json");
         let ttl_path = restore.temporary.join(".cys/approvals-ttl.json");

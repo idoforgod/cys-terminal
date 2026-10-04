@@ -923,8 +923,9 @@ enum DaemonAction {
 enum QueueAction {
     /// List undelivered queued messages (all surfaces or one)
     ///
-    /// ★(0.14.43) 막힌 좌석은 **stderr** 에 좌석당 한 줄 안내 `# surface:N blocked_by=… (Ns) → <조치 문장>` 을 낸다(무엇을 하면 풀리는가 — stdout 의 6열 행 계약은
-    /// 불변이라 행 파서는 영향이 없다). `--json` 은 각 항목에 `blocked_by`·`remedy_code`·`remedy`·`draft_visible`·`ghost_after_cursor` 키를 싣는다.
+    /// ★(0.14.43) 막힌 좌석은 **stderr** 에 좌석당 한 줄 안내 `# surface:N blocked_by=… (이 사유로 Ns) → <조치 문장>` 을 낸다(무엇을 하면 풀리는가 — stdout 의 6열 행 계약은
+    /// 불변이라 행 파서는 영향이 없다). `(이 사유로 Ns)` 는 **지금 사유가 시작된 뒤** 경과 초다 — 사유가 바뀌면(busy ↔ input_pending) 다시 센다. 큐 머리가 얼마나 기다렸는지는
+    /// `--json` 의 `age_secs`(항목별)로 읽는다. `--json` 은 각 항목에 `blocked_by`·`remedy_code`·`remedy`·`draft_visible`·`ghost_after_cursor` 키를 싣는다.
     List {
         #[arg(long)]
         surface: Option<String>,
@@ -1862,12 +1863,14 @@ fn ghost_fallback_stderr_line(tag: &str, err: &str, sid: u64) -> Option<String> 
         .then(|| format!("[{tag}] surface={}{}", surface_ref(sid), cys::GHOST_CTRL_U_SUFFIX))
 }
 
-/// ★(0.14.43 · C5) `cys queue list` 텍스트 모드의 **막힘 안내**(순수) — 막힌 좌석당 1줄 `# surface:N blocked_by=… (Ns) → <remedy>`.
+/// ★(0.14.43 · C5) `cys queue list` 텍스트 모드의 **막힘 안내**(순수) — 막힌 좌석당 1줄 `# surface:N blocked_by=… (이 사유로 Ns) → <remedy>`.
 ///
 /// 어디로 나가나: **stderr** 다. stdout 의 6열 행 계약(`queue_list_row` · cols[3]=preview 를 javis_boot_node 가 파싱)은 한 글자도 바뀌지 않는다
 /// — 안내는 사람이 읽는 표면이고 행 파서는 stderr 를 보지 않는다. 좌석당 1줄(같은 좌석의 여러 행은 첫 행의 값 = 좌석 단위 값),
-/// 첫 등장 순서 보존. `blocked_by` 가 null 이고 `remedy_code`·`remedy` 도 없는 행(막히지 않은 좌석·만료·복원 행)은 건너뛴다. `(Ns)` = 막힌 지 N 초(`blocked_since` 벽시계 ·
-/// 표시용 — 시계 역행은 0 으로 접는다). `remedy` 키가 없으면(구 데몬) 화살표 뒷부분만 생략한다 — 줄바꿈·탭은 공백으로 접는다.
+/// 첫 등장 순서 보존. `blocked_by` 가 null 이고 `remedy_code`·`remedy` 도 없는 행(막히지 않은 좌석·만료·복원 행)은 건너뛴다. `(이 사유로 Ns)` = **지금 사유가 시작된 뒤** 경과 N 초(`blocked_since`
+/// 벽시계 · 표시용 — 시계 역행은 0 으로 접는다). ★(R2F-DM · 성찰 2회차 A2 n-14) `blocked_since` 는 사유가 **바뀔 때마다 새로 찍힌다**(데몬 `governance.rs` — 같은 좌석이 `busy` ↔ `input_pending` 을 오가면 시계가 다시 시작한다)
+/// 그래서 이 숫자는 '막힌 지 N 초' 가 아니다 — 머리가 몇 시간을 기다려도 `(이 사유로 3s)` 일 수 있다(큐 머리의 나이는 항목의 `age_secs`). 종전 `(Ns)` 는 출력만 읽으면 '막힌 지 N 초' 로 읽혔다(이 줄은 0.14.43 에
+/// 새로 생긴 것이라 호환 문제가 없다). `remedy` 키가 없으면(구 데몬) 화살표 뒷부분만 생략한다 — 줄바꿈·탭은 공백으로 접는다.
 /// ★(RQFIX2 m-5) **사유가 기록되지 않은 일시정지 좌석**(`blocked_by` null 이어도 `remedy_code`/`remedy` 가 있다 — 일시정지 중에는 틱이 사유를 갱신하지 않는다)도 한 줄을 낸다:
 /// `# surface:N <remedy_code> → <조치 문장>`(기존 줄과 같은 꼴 · `blocked_by=…` 자리에 코드). 기존 줄(`blocked_by` 가 있는 행)은 바이트 불변이다 — kill-switch 문장이 권하는
 /// "해제 전에 `cys queue list` 로 묵은 항목을 확인한다" 가 이 명령의 안내에서 보이게 한다.
@@ -1898,7 +1901,7 @@ fn queue_blocked_notice_lines(entries: &[Value], now: f64) -> Vec<String> {
         seen.push(sref);
         let age = e["blocked_since"]
             .as_f64()
-            .map(|t| format!(" ({}s)", (now - t).max(0.0) as u64))
+            .map(|t| format!(" (이 사유로 {}s)", (now - t).max(0.0) as u64))
             .unwrap_or_default();
         let remedy = e["remedy"].as_str().map(|r| format!(" → {}", fold(r))).unwrap_or_default();
         out.push(format!("# {sref} blocked_by={}{age}{remedy}", fold(blocked_by)));
@@ -1910,7 +1913,7 @@ fn queue_blocked_notice_lines(entries: &[Value], now: f64) -> Vec<String> {
 mod queue_list_row_tests {
     use super::*;
 
-    /// ★(0.14.43 · C5) 막힘 안내(stderr) — 막힌 좌석당 1줄 `# surface:N blocked_by=… (Ns) → <remedy>`. 막히지 않은 좌석·만료·복원 행은 건너뛰고,
+    /// ★(0.14.43 · C5) 막힘 안내(stderr) — 막힌 좌석당 1줄 `# surface:N blocked_by=… (이 사유로 Ns) → <remedy>`. 막히지 않은 좌석·만료·복원 행은 건너뛰고,
     /// 같은 좌석의 여러 행은 한 줄이며, **stdout 의 6열 행 계약은 가산 키(remedy_code·remedy·draft_visible·ghost_after_cursor)에 영향받지 않는다.**
     #[test]
     fn c5_queue_blocked_notice_lines_one_per_blocked_seat_and_row_contract_unchanged() {
@@ -1935,7 +1938,7 @@ mod queue_list_row_tests {
         assert_eq!(
             lines,
             vec![
-                "# surface:3 blocked_by=input_pending(입력줄에 미제출 입력) (30s) → 입력줄은 비어 보이는데 미제출 계수가 남았다 · LLM 에이전트는 자동 조치 금지"
+                "# surface:3 blocked_by=input_pending(입력줄에 미제출 입력) (이 사유로 30s) → 입력줄은 비어 보이는데 미제출 계수가 남았다 · LLM 에이전트는 자동 조치 금지"
                     .to_string()
             ],
             "막힌 좌석당 정확히 1줄(같은 좌석의 두 행은 한 줄)"
@@ -1987,7 +1990,7 @@ mod queue_list_row_tests {
             vec![
                 "# surface:6 paused → kill-switch 동결 중 — 정체가 아니라 동결이다. 해제는 오너(사람)가 한다 · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지"
                     .to_string(),
-                "# surface:3 blocked_by=input_pending(입력줄에 미제출 입력) (30s) → 입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) · LLM 에이전트는 자동 조치 금지"
+                "# surface:3 blocked_by=input_pending(입력줄에 미제출 입력) (이 사유로 30s) → 입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) · LLM 에이전트는 자동 조치 금지"
                     .to_string(),
             ],
             "무기록 동결 좌석 한 줄(좌석당 1줄 · 첫 등장 순서) + 기존 줄 바이트 불변 + 막히지 않은 좌석 없음"
@@ -1996,7 +1999,7 @@ mod queue_list_row_tests {
         assert_eq!(
             queue_blocked_notice_lines(&[blocked], 1030.4),
             vec![lines[1].clone()],
-            "기존 줄 서식(blocked_by=… (Ns) → …)은 불변"
+            "기존 줄 서식(blocked_by=… (이 사유로 Ns) → …)은 불변"
         );
         // 코드만 있고 문장이 없는 행(구 데몬 스큐) → 화살표 없이 코드만 · 둘 다 없으면 건너뛴다.
         let code_only = serde_json::json!({"surface_ref": "surface:8", "blocked_by": null, "remedy_code": "paused"});
@@ -2080,7 +2083,7 @@ mod queue_list_row_tests {
         }
     }
 
-    /// F10 — `cys queue list` **긴 도움말**에 stderr 안내 줄(`# surface:N blocked_by=… (Ns) → <조치 문장>`)이 한 줄 있다. 짧은 도움말(첫 문단)은 종전 그대로다
+    /// F10 — `cys queue list` **긴 도움말**에 stderr 안내 줄(`# surface:N blocked_by=… (이 사유로 Ns) → <조치 문장>`)이 한 줄 있다. 짧은 도움말(첫 문단)은 종전 그대로다
     /// (`cysjavis-pack/hooks/guard.sh` 가 이 문구로 조회 명령을 분류한 관측 기록이 있다).
     #[test]
     fn rqfix_f10_queue_list_long_help_documents_the_stderr_notice_line() {
@@ -2089,39 +2092,64 @@ mod queue_list_row_tests {
         let queue = cmd.find_subcommand_mut("queue").expect("queue 서브커맨드");
         let list = queue.find_subcommand_mut("list").expect("queue list");
         let long = list.render_long_help().to_string();
-        assert!(long.contains("# surface:N blocked_by=… (Ns) → <조치 문장>"), "긴 도움말에 stderr 안내 줄 서식이 없다:\n{long}");
+        assert!(long.contains("# surface:N blocked_by=… (이 사유로 Ns) → <조치 문장>"), "긴 도움말에 stderr 안내 줄 서식이 없다:\n{long}");
+        // ★(R2F-DM · A2 n-14) `(Ns)` 가 '막힌 지 N 초' 가 아니라 '지금 사유가 시작된 뒤' 라는 풀이와 머리 나이의 출처(`age_secs`)가 도움말에 있다.
+        assert!(long.contains("지금 사유가 시작된 뒤") && long.contains("age_secs"), "긴 도움말에 (이 사유로 Ns) 의 뜻 풀이가 없다:\n{long}");
+        assert!(!long.contains("(Ns)"), "옛 서식 `(Ns)` 가 도움말에 남았다:\n{long}");
         assert!(long.contains("stderr") && long.contains("6열 행 계약"), "{long}");
         assert!(long.contains("List undelivered queued messages (all surfaces or one)"), "첫 문단(짧은 도움말)은 종전 그대로:\n{long}");
         let short = list.render_help().to_string();
         assert!(short.contains("List undelivered queued messages (all surfaces or one)"), "{short}");
     }
 
-    /// 막힘 안내의 결측·구 데몬·경계 — remedy 키가 없으면 화살표만 생략, blocked_since 가 없으면 (Ns) 만 생략, 시계 역행은 0 으로 접고,
+    /// ★(R2F-DM · 성찰 2회차 A2 n-14) 안내 줄의 경과 표기는 **`(이 사유로 Ns)`** 다 — `(Ns)` 는 지금 − `blocked_since`(사유가 **바뀔 때마다** 새로 찍힌다)라 '막힌 지 N 초' 가 아니다.
+    /// 사유가 번갈아 드는 좌석(`busy` ↔ `input_pending`)은 큐 머리가 몇 시간을 기다려도 `(이 사유로 3s)` 다 — 출력만 읽는 사람·CSO(지침이 이 명령을 근거 확인 도구로 가리킨다)가 '3초 막힘' 으로 읽지 않게 한 낱말을 붙였다.
+    /// 줄의 서식과 함수 주석·도움말이 같은 말을 한다(주석이 다시 '막힌 지 N 초' 로 돌아가면 적색 — 바늘은 조각으로 이어 이 줄에 그 문자열이 남지 않게 한다).
+    #[test]
+    fn r2f_dm_notice_age_label_says_since_this_reason_not_blocked_for() {
+        let e = serde_json::json!({"surface_ref": "surface:2", "blocked_by": "busy(출력 중)", "blocked_since": 1000.0, "remedy": "스스로 풀린다"});
+        // 출력: 같은 입력에 새 서식 · 옛 서식은 없다.
+        assert_eq!(queue_blocked_notice_lines(std::slice::from_ref(&e), 1030.0), vec!["# surface:2 blocked_by=busy(출력 중) (이 사유로 30s) → 스스로 풀린다".to_string()]);
+        assert!(!queue_blocked_notice_lines(std::slice::from_ref(&e), 1030.0)[0].contains(" (30s)"), "옛 서식 ` (30s)` 가 남았다");
+        // 같은 좌석이 사유를 바꾸면 경과가 다시 시작한다는 사실이 출력의 숫자로 보인다(머리 나이가 아니다): blocked_since 만 새로 찍힌 같은 좌석.
+        let swapped = serde_json::json!({"surface_ref": "surface:2", "blocked_by": "input_pending(입력줄에 미제출 입력)", "blocked_since": 1028.0, "age_secs": 7200, "remedy": "x"});
+        let line = &queue_blocked_notice_lines(&[swapped], 1030.0)[0];
+        assert!(line.contains("(이 사유로 2s)"), "머리가 두 시간 기다려도 이 사유로는 2초다: {line}");
+        // 함수 주석·도움말·검체 설명이 같은 말을 한다.
+        let src = include_str!("cys.rs");
+        let fn_head = concat!("fn queue_blocked_notice", "_lines(");
+        let doc_end = src.find(fn_head).expect("안내 함수");
+        let doc = &src[src[..doc_end].rfind("\n\n").expect("문서 주석 앞") ..doc_end];
+        assert!(doc.contains("지금 사유가 시작된 뒤") && doc.contains("age_secs"), "함수 주석이 `(이 사유로 Ns)` 의 뜻을 말하지 않는다:\n{doc}");
+        assert!(!doc.contains(concat!("`(Ns)` = 막힌 지 N", " 초")), "함수 주석이 `(Ns)` 를 '막힌 지 N 초' 라고 정의한다(옛 문장 — 사유가 바뀌면 다시 센다는 사실과 어긋난다)");
+    }
+
+    /// 막힘 안내의 결측·구 데몬·경계 — remedy 키가 없으면 화살표만 생략, blocked_since 가 없으면 (이 사유로 Ns) 만 생략, 시계 역행은 0 으로 접고,
     /// 개행·탭은 공백으로 접어 한 줄을 지킨다. 좌석 첫 등장 순서를 보존한다.
     #[test]
     fn c5_queue_blocked_notice_lines_tolerate_old_daemons_and_fold_whitespace() {
         let old = serde_json::json!({"surface_ref": "surface:2", "index": 0, "blocked_by": "busy(출력 중)", "blocked_since": 500.0});
         assert_eq!(
             queue_blocked_notice_lines(std::slice::from_ref(&old), 560.9),
-            vec!["# surface:2 blocked_by=busy(출력 중) (60s)".to_string()],
+            vec!["# surface:2 blocked_by=busy(출력 중) (이 사유로 60s)".to_string()],
             "구 데몬(remedy 키 없음): 화살표만 생략"
         );
         let no_since = serde_json::json!({"surface_ref": "surface:2", "blocked_by": "busy(출력 중)", "remedy": "스스로 풀린다"});
         assert_eq!(
             queue_blocked_notice_lines(&[no_since], 10.0),
             vec!["# surface:2 blocked_by=busy(출력 중) → 스스로 풀린다".to_string()],
-            "blocked_since 결측: (Ns) 만 생략"
+            "blocked_since 결측: (이 사유로 Ns) 만 생략"
         );
         assert_eq!(
             queue_blocked_notice_lines(std::slice::from_ref(&old), 100.0),
-            vec!["# surface:2 blocked_by=busy(출력 중) (0s)".to_string()],
+            vec!["# surface:2 blocked_by=busy(출력 중) (이 사유로 0s)".to_string()],
             "시계 역행(now < since)은 0 으로 접는다"
         );
         let messy = serde_json::json!({"surface_ref": "surface:9", "blocked_by": "a\tb", "blocked_since": 1.0, "remedy": "줄1\n줄2\r\n줄3"});
         let lines = queue_blocked_notice_lines(&[messy], 2.0);
         assert_eq!(lines.len(), 1);
         assert!(!lines[0].contains('\n') && !lines[0].contains('\r') && !lines[0].contains('\t'), "한 줄 불변식: {:?}", lines[0]);
-        assert_eq!(lines[0], "# surface:9 blocked_by=a b (1s) → 줄1 줄2  줄3");
+        assert_eq!(lines[0], "# surface:9 blocked_by=a b (이 사유로 1s) → 줄1 줄2  줄3");
         // 첫 등장 순서 보존(좌석 id 정렬이 아니다).
         let mk = |sref: &str| serde_json::json!({"surface_ref": sref, "blocked_by": "busy(출력 중)", "blocked_since": 0.0});
         let order: Vec<String> = queue_blocked_notice_lines(&[mk("surface:9"), mk("surface:2"), mk("surface:9")], 1.0)
@@ -18400,7 +18428,7 @@ fn usage_accounts_age_text(secs: f64) -> String {
 }
 
 /// ★0.14.43(B6) `cys usage-accounts` 텍스트 모드의 한 줄(순수 — 검체가 핀한다). 기존 3열(`{provider:<12} {label:<32} {관측}`)은 **그대로 두고** 같은 줄 뒤에 ` | ` 구분으로 덧붙인다 —
-/// `● 사용 중`/`○`(`in_use` · null·부재는 생략) · `현재: <current_profiles>`(빈 배열이면 `현재: —` · 키 부재(구 데몬)는 생략) · 관측 나이(`stale_secs` — [`usage_accounts_age_text`]) · `별명: <alias>`.
+/// `● 사용 중`/`○`(`in_use` · null·부재는 생략) · `현재: <current_profiles>`(빈 배열이면 `현재: —` · 키 부재(구 데몬 **또는 신 데몬이 이번에 읽지 못한 폴더가 낀 행** — R2F-DM · 성찰 2회차 A2 m-1: 신 데몬도 판독 실패 시 키를 뺀다)는 생략) · 관측 나이(`stale_secs` — [`usage_accounts_age_text`]) · `별명: <alias>`.
 /// 창 표기는 `resets_at` 이 지났으면 `(리셋됨)` 을 붙인다(UI windowView 와 같은 규칙: 유효한 양수이고 `now` 가 그 이후 — 종전엔 리셋이 지나도 값만 찍었다).
 /// 별명·폴더 이름의 제어 문자는 터미널로 흘리지 않는다(기존 3열의 값은 종전 그대로).
 fn usage_accounts_line(a: &Value, now: f64) -> String {
@@ -41310,6 +41338,28 @@ mod usage_accounts_line_tests {
         assert!(usage_accounts_line(&a, NOW).ends_with(" | 30분 전 · 오래됨"));
         let a = json!({"provider": "claude", "label": "x", "updated_at": 1.0, "rate": []});
         assert_eq!(usage_accounts_line(&a, NOW), old_three_columns(&a), "stale_secs 키가 없으면 생략");
+    }
+
+    /// ★(R2F-DM · 성찰 2회차 A5 m9) `cys usage-accounts` 의 `오래됨` 문턱(`USAGE_ACCOUNTS_OLD_SECS`)은 데몬 경보 신선도 규칙의 기본(`accounts::ACCOUNT_ALERT_STALE_SECS_DEFAULT`)과 **같은 값**이다(주석만이 그렇게 말했다).
+    /// 같은 30분이 데몬 기본값 · 경보 리마인드 간격 · CLI · 화면 · 지침 문면에 따로 적혀 있고 노브는 데몬 것만 움직인다 — 데몬 상수를 소스에서 읽어 대조해, 한쪽만 고치면 이 핀이 붉다
+    /// (같은 파일의 `refl_daemon_u64` 선례와 같은 방식 · 부동소수판). 화면 쪽 사본(`ui/src/usagebar.ts`)의 대조는 화면 레인의 몫이다.
+    #[test]
+    fn r2f_dm_usage_accounts_old_secs_equals_the_daemon_account_alert_stale_default() {
+        fn refl_daemon_f64(src: &str, name: &str) -> f64 {
+            let head = format!("pub const {name}: f64 = ");
+            let i = src.find(&head).unwrap_or_else(|| panic!("데몬에 {name} 이 없다(f64 상수여야 한다)"));
+            let rest = &src[i + head.len()..];
+            let lit: String = rest.chars().take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '_').filter(|c| *c != '_').collect();
+            lit.parse().unwrap_or_else(|_| panic!("{name} 값을 읽지 못했다: {lit:?}"))
+        }
+        let daemon = refl_daemon_f64(include_str!("cysd/accounts.rs"), "ACCOUNT_ALERT_STALE_SECS_DEFAULT");
+        assert_eq!(
+            daemon, USAGE_ACCOUNTS_OLD_SECS,
+            "CLI 의 `오래됨` 문턱이 데몬 경보 신선도 기본값과 갈렸다 — 같은 30분을 두 곳이 다르게 말한다(화면 `usagebar.ts` 의 사본도 함께 맞춘다)"
+        );
+        // 문턱이 실제 판정에 쓰이는지(공허 방지) — 경계에서 한 번.
+        assert!(!usage_accounts_age_text(daemon).contains("오래됨"), "문턱 그 순간은 아직 '오래됨'이 아니다(초과일 때만)");
+        assert!(usage_accounts_age_text(daemon + 0.5).contains("오래됨"), "문턱을 넘으면 '오래됨'");
     }
 
     #[test]

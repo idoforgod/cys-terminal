@@ -5060,6 +5060,7 @@ mod h2_schedule_hold_tests {
     /// [H2] 마커 좌석 화면에 초안이 **양성 관측**되면 직접 주입하지 않고 좌석 큐로 우회한다.
     /// RED(HEAD): "pushed" + 주입(원장 schedule 1).
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_role_push_diverts_on_observed_draft() {
         let (d, s) = rig("h2-draft");
         h_paint(&s, H_DRAFT_SCREEN);
@@ -5165,6 +5166,7 @@ mod h2_schedule_hold_tests {
     /// 않아 우회 항목이 TTL 까지 서고 다음 회차도 같은 길을 간다(heartbeat·wakeup 무기한 침묵). 병합 제출이 유일한
     /// 자가치유 경로다(pre-H 동작). 음성 대조: 같은 화면이 사람 초안이면 종전대로 우회. RED(HEAD): queued(gate:draft).
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_machine_residue_stays_direct() {
         let (d, s) = rig("h2-residue");
         s.apply_pending_input(b"WORKER-REPORT residue text", crate::governance::InputOrigin::Machine);
@@ -5193,6 +5195,7 @@ mod h2_schedule_hold_tests {
     /// 제출이 유일한 자가치유). 잔여는 실제 핸들러(`dispatch` · peer pid 결측)로 만든다. 음성 대조: GUI 모양 삽입(human +
     /// machine_origin + 오너 토큰) 잔여는 종전대로 우회. RED(HEAD f1b1a7e8): Claimed·익명 모두 queued(gate:draft).
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_cross_socket_residue_stays_direct() {
         let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
         let (d, s) = rig("h2-xsock");
@@ -5240,6 +5243,7 @@ mod h2_schedule_hold_tests {
     /// 음성 대조: 같은 잔여 뒤에 사람이 한 글자라도 치면(입력 시각이 기록보다 뒤) 종전대로 우회.
     /// RED(HEAD 1b614e47): queued(gate:draft) — heartbeat·wakeup 무기한 정체(③).
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_swallowed_return_residue_stays_direct() {
         let pack = crate::governance::HOutsidePack::new();
         let (d, s) = rig("h2-swallowed");
@@ -5289,6 +5293,7 @@ mod h2_schedule_hold_tests {
     /// ★(R3SH-1 · S2 모양) 큐가 배달한 데몬 Inject 의 CR 이 삼켜졌다(데몬 자신의 붙여넣기 잔여 · owner 없음) — 붙여넣기 창
     /// (500ms)이 지난 뒤에도 H2 는 직접 주입한다. 음성 대조: 입력줄에 기계 본문 **앞에** 다른 글자가 섞였으면(꼬리 일치 아님) 우회.
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_swallowed_inject_residue_stays_direct() {
         let (d, s) = rig("h2-inject-residue");
         let body = "[RESUME] 이전 세션 복원 — TODO 를 읽고 이어서 진행";
@@ -5325,6 +5330,7 @@ mod h2_schedule_hold_tests {
     /// 종전(pre-H)처럼 직접 주입한다(`schedule.draft_fallback` 1회). 음성 대조: 사람 바이트가 있는 초안(오너가 친 글자)은
     /// 몇 회차가 지나도 폴백하지 않는다(R3SH-2 — 오너 결재 대기 · 가시화만).
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_unproven_machine_draft_falls_back_after_bounded_diverts() {
         let (d, s) = rig("h2-fallback");
         h_paint(&s, &crate::governance::h_residue_screen("[Pasted text #1 +12 lines]"));
@@ -5376,6 +5382,7 @@ mod h2_schedule_hold_tests {
     /// ★(R3SH-2 (c)) 초안 우회가 기아 임계(기본 600s) 이상 이어지면 `queue.starved` 를 보류 에피소드마다 1회 낸다 —
     /// 우회 항목은 TTL ≤ 주기로 만료·재적재되므로 틱의 머리 나이 경보가 영영 나지 않았다(오너 부재 중 무음 정지).
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_long_draft_hold_is_visible_as_starved() {
         let (d, s) = rig("h2-starved");
         s.apply_pending_input("오너가 쓰다 둔 초안".as_bytes(), crate::governance::InputOrigin::Human);
@@ -5474,6 +5481,7 @@ mod h2_schedule_hold_tests {
     /// [H2] 주기 잡 우회 항목 TTL = min(주기, 데몬 기본) · 원샷(at)은 Some(0)(만료 없음 · R3SH-5) · 일일(time)은 None(데몬 기본 6h). 만료분은 만료 큐로 가고
     /// 다음 회차는 새 항목으로 다시 적재된다(대기가 1회분으로 묶인다).
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_periodic_ttl_le_period_oneshot_default() {
         let (d, s) = rig("h2-ttl");
         h_paint(&s, H_DRAFT_SCREEN);
@@ -5502,6 +5510,7 @@ mod h2_schedule_hold_tests {
     /// [H2 ③ 재기동 뒤 처리] 우회 항목은 WAL 에 영속된다 — 데몬이 재기동하면 같은 역할 좌석으로 재홈되고
     /// TTL·발신 라벨·경로 태그가 그대로 살아 있다(유실 0 · 스키마 변경 0 · ttl_secs 는 WP-5 필드).
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h2_diverted_item_survives_daemon_restart() {
         let (d, s) = rig("h2-restart");
         h_paint(&s, H_DRAFT_SCREEN);
@@ -5722,7 +5731,7 @@ mod c8_push_counts_submit_tests {
     /// [C8 노브 파서] 순수 파서는 **앞뒤 공백을 걷은 값이 `"0"`** 일 때만 끈다(★R1F-IN n-2: 같은 판의 다른 두 노브처럼 trim — 종전 검체는 정확히 `"0"` 만 끔으로 고정해 `"0 "` 가 조용히 켜진 채 남았다) —
     /// 미설정·빈 값·그 밖의 값은 켬. env 래퍼는 덮개(검체)·프로세스 env 를 호출마다 읽는다.
     #[test]
-    fn c8_knob_parser_turns_off_only_on_exactly_zero() {
+    fn c8_knob_parser_turns_off_only_on_zero_after_trimming_whitespace() {
         assert!(schedule_push_counts_submit_from_env(None), "미설정 = 켬(기본)");
         assert!(!schedule_push_counts_submit_from_env(Some("0")));
         // ★R1F-IN n-2 — 앞뒤 공백(탭·개행 포함)을 걷은 값이 `0` 이면 끈다.
@@ -5827,6 +5836,7 @@ mod c8_push_counts_submit_tests {
     /// [C8 게이트 불변] 사람 키 직후(30s 창) · 화면 초안 · 모달 전경 · kill-switch — 종전처럼 직접 주입하지 않고(큐로 전환 · Err) **계수는 그대로**다. 이벤트·원장 0.
     /// (기존 H0/H2 검체가 판정 자체를 이미 핀한다 — 여기서는 전환·거부가 계수를 건드리지 않음을 잰다.)
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn c8_diverted_or_refused_pushes_keep_the_count_gates_unchanged() {
         let (d, s) = rig("c8-gates");
         make_ghost(&s);

@@ -196,6 +196,14 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// ★(R2F-DM · 성찰 2회차 A5 m5) 전역 `INFLIGHT`(동시 관측 상한 [`MAX_INFLIGHT`])를 건드리는 이 모듈의 검체는 **서로 겹치지 않게 직렬화**한다 — `inflight_cap_bounds_hung_threads` 가 상한(8)까지 채운 700ms 동안
+    /// 다른 검체(`real_reader_on_readable_and_missing_dirs` 등)의 `probe_bounded` 는 상한에 걸려 `Unknown` 을 받아 실패했다(전량 8회 중 2회 · 병렬에서만 — CI 는 `--test-threads=1` 이라 닿지 않았다).
+    /// 제품 코드는 그대로다(상한은 의도된 동작 — 검체끼리의 간섭만 막는다). 같은 락을 `INFLIGHT` 를 건드리는 검체 셋이 쥔다(상한을 직접 채우는 검체 하나와 상한에 걸리면 실패하는 두 검체).
+    static INFLIGHT_SERIAL: Mutex<()> = Mutex::new(());
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        INFLIGHT_SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn classify_only_eperm_is_blocked() {
         assert_eq!(classify(&Ok(())), CwdProbe::Readable);
@@ -255,6 +263,7 @@ mod tests {
 
     #[test]
     fn bounded_probe_folds_every_failure_into_unknown() {
+        let _serial = serial();
         assert_eq!(probe_bounded("/u18/eperm", Duration::from_secs(2), eperm), CwdProbe::Blocked);
         // 시한 초과 = Unknown(막힘 아님 · 반박 D-4) — 그리고 시한만큼만 기다린다.
         let t0 = Instant::now();
@@ -271,6 +280,7 @@ mod tests {
 
     #[test]
     fn inflight_cap_bounds_hung_threads() {
+        let _serial = serial();
         fn hang(_: &str) -> io::Result<()> {
             std::thread::sleep(Duration::from_millis(700));
             Ok(())
@@ -293,6 +303,7 @@ mod tests {
 
     #[test]
     fn real_reader_on_readable_and_missing_dirs() {
+        let _serial = serial();
         let d = std::env::temp_dir().join(format!("cys-u18-probe-{}", std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         let ds = d.to_string_lossy().into_owned();

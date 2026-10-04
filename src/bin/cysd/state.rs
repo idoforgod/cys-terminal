@@ -1774,8 +1774,9 @@ pub struct Surface {
     /// 판정해 Inject 를 넣으면 **두 본문이 한 제출로 합쳐진다**(오너 임무 게이트가
     /// `delivery_concatenated`·`delivery_substring` 이상징후를 실제로 발행한 축).
     ///
-    /// 락 순서 계약: `pending_queue` → `input_gate`. 직접 write 경로는 이 락 **하나만** 잡고
-    /// 그 안에서 다른 락을 잡지 않는다(사이클 없음).
+    /// 락 순서 계약: `pending_queue` → `input_gate`. 직접 write 경로(`send_text`·`send_key`)는 이 락을 잡은 채 **`pending_input`(leaf)과 원자·`try_send` 만** 쓰고
+    /// 그 밖의 락(`pending_queue` 포함)을 이 락 안에서 새로 잡지 않는다 — 순서는 `input_gate` → `pending_input` 하나뿐이다(역순 금지 · 사이클 없음).
+    /// ★(R2F-DM · 성찰 2회차 A1 n-12 ⓐ) 종전 문장 "이 락 **하나만** 잡고 그 안에서 다른 락을 잡지 않는다" 는 leaf 접점(`apply_pending_input`·`set_pending_input` — 이번 판이 더 늘렸다)이 생긴 뒤로 사실이 아니었다.
     pub input_gate: std::sync::Mutex<()>,
     /// ★(0.14.42 · A2) 짝 Return 흡수 표 — 발신자 키([`PairKey`] · B) → 표(대상·발신자당 1장 · 덮어쓰기 ·
     /// 상한 [`RETURN_TICKETS_CAP`]).
@@ -4654,6 +4655,33 @@ pub fn pipe_slug(socket_path: &std::path::Path) -> String {
         .collect()
 }
 
+/// ★(R2F-DM · 윈도우 시험 격리) 이 소켓 경로가 **이름 있는 파이프**(`\\.\pipe\<이름>`)를 가리키는가 — 순수 문자열 판정(전 OS 컴파일 · 맥에서 검체로 잰다).
+/// 구분자는 `/`·`\` 를 같게 보고 대소문자를 가리지 않는다. `\\` 로 시작하고 장치·서버 이름(`.`·`?`·호스트) **바로 다음 성분이 `pipe`** 일 때만 파이프다 —
+/// `C:\…\cysd.sock` · `\\?\C:\…\cysd.sock`(길이 확장 파일 경로) · `\\서버\공유\…` · `/tmp/x/cysd.sock` 는 파일 시스템 경로다.
+/// 소비처는 [`state_dir`] 의 **윈도우 시험 빌드 분기**(`cfg(windows)` ∧ `cfg(test)`) 하나다 — 제품 빌드에는 이 함수가 없다.
+#[cfg(test)]
+pub(crate) fn is_pipe_name_path(socket_path: &std::path::Path) -> bool {
+    let s = socket_path.to_string_lossy().replace('/', "\\");
+    let Some(rest) = s.strip_prefix("\\\\") else {
+        return false;
+    };
+    let mut parts = rest.split('\\');
+    let _device_or_server = parts.next();
+    parts.next().is_some_and(|c| c.eq_ignore_ascii_case("pipe"))
+}
+
+/// ★(R2F-DM · 윈도우 시험 격리) 윈도우 **시험 빌드**의 상태 폴더 판정(순수 — 맥에서 검체로 잰다): 소켓이 파이프 이름이 아니라 파일 시스템 경로이면 유닉스와 같은 식(그 부모 폴더 · 부모가 없으면 `.`)으로
+/// `Some`, 파이프 이름이면 `None`(= 제품 식으로 내려간다). [`state_dir`] 의 `cfg(windows)` ∧ `cfg(test)` 분기가 이 함수 하나를 부른다 — 제품 빌드에는 없다.
+#[cfg(test)]
+pub(crate) fn fs_socket_state_dir(socket_path: &std::path::Path) -> Option<PathBuf> {
+    (!is_pipe_name_path(socket_path)).then(|| {
+        socket_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
+    })
+}
+
 /// 영속 상태 디렉터리 — 소켓과 같은 곳 (unix). Windows는 LOCALAPPDATA 하위.
 /// RC-13: Windows에서 부서 데몬마다 pipe명 슬러그로 **고유 디렉토리**를 파생해 transcripts.db·feed.jsonl
 /// 격리를 보장한다(구: 모든 부서가 단일 %LOCALAPPDATA%\cys 공유 → SQLite 락 경합·부서간 오염).
@@ -4661,6 +4689,13 @@ pub fn pipe_slug(socket_path: &std::path::Path) -> String {
 pub fn state_dir(socket_path: &std::path::Path) -> PathBuf {
     #[cfg(windows)]
     {
+        // ★(R2F-DM · 시험 빌드 전용) 소켓이 이름 있는 파이프가 아니라 **파일 시스템 경로**이면 유닉스처럼 그 부모 폴더가 상태 폴더다 — 검체는 임시 폴더마다
+        //   같은 파일 이름(`cysd.sock`)을 쓰는데, 아래 슬러그 식은 마지막 성분만 보므로 이 문장이 없으면 모든 검체가 `%LOCALAPPDATA%\cys\cysdsock` 한 곳을 나눠 쓴다
+        //   (윈도우 데몬 검체 196 실패의 다수 · 실측). 제품 빌드(`not(test)`)에는 이 문장이 컴파일되지 않는다 — 아래 식은 한 글자도 바꾸지 않았다.
+        #[cfg(test)]
+        if let Some(dir) = fs_socket_state_dir(socket_path) {
+            return dir;
+        }
         let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".into());
         let root = PathBuf::from(base).join("cys");
         let slug = pipe_slug(socket_path);
@@ -8033,6 +8068,7 @@ mod tests {
     /// 유지 · alt_screen 동시 미러 ② 파서 패닉 재초기화 뒤 false ③ 실제 reader: 좌석이 `ESC[?2004h` 를 찍으면
     /// 2 초 안에 `surface.bracketed_paste` 가 true.
     #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
     fn c_mirror_screen_modes_tracks_bracketed_paste() {
         let dir = std::env::temp_dir().join(format!("cys-c-mirror-{}-{}", std::process::id(), now_epoch() as u64));
         let _ = std::fs::create_dir_all(&dir);
@@ -12795,6 +12831,131 @@ mod u10_feed_restart_tests {
             let snap = format!("{v:?}");
             assert_eq!(reconcile_restored_feed(&mut v, now, ttl), RestoredFeedReconcile::default(), "멱등 위반");
             assert_eq!(format!("{v:?}"), snap, "멱등 위반(내용)");
+        }
+    }
+}
+
+/// ★(R2F-DM · 성찰 2회차 A4 M1 · A5 M1) 윈도우 데몬 검체 격리 — `state_dir` 의 **시험 빌드 전용** 윈도우 분기.
+///
+/// 배경: 윈도우의 `state_dir` 는 소켓 경로의 **마지막 성분**만 슬러그로 삼아 `%LOCALAPPDATA%\cys\<슬러그>` 를 만든다. 검체는 임시 폴더마다 같은 파일 이름(`cysd.sock` · `cys.sock`)을 쓰므로
+/// 윈도우에서는 모든 검체가 `…\cys\cysdsock` 한 곳을 나눠 써서 서로를 오염시켰다(진단 잡 `37188821194` — 1680 통과 · 196 실패 가운데 다수). 제품 동작은 바꾸지 않는다: 시험 빌드에서
+/// 소켓이 **파일 시스템 경로**일 때만 유닉스처럼 그 부모 폴더를 쓴다. 맥에서는 `cfg(windows)` 분기가 컴파일되지 않으므로 판정을 순수 함수 둘([`is_pipe_name_path`] · [`fs_socket_state_dir`])로 빼
+/// 맥에서도 재고, 제품 갈래는 **원문 핀**으로 한 글자도 안 바뀌었음을 고정한다.
+#[cfg(test)]
+mod r2f_dm_state_dir_tests {
+    use super::*;
+    use std::path::Path;
+
+    /// 윈도우 갈래의 **제품 식**(시험 분기를 뺀 나머지) — v0.14.43 성찰 1회차 수정판(`bd0a0ca3`)의 원문 그대로다.
+    const WINDOWS_PRODUCT_BODY: &str = "        let base = std::env::var(\"LOCALAPPDATA\").unwrap_or_else(|_| \".\".into());\n        let root = PathBuf::from(base).join(\"cys\");\n        let slug = pipe_slug(socket_path);\n        if slug.is_empty() || slug == \"cys\" {\n            root // 기본 데몬 — 기존 경로 유지(호환)\n        } else {\n            root.join(slug) // 부서 데몬 — 슬러그별 격리 디렉토리\n        }\n    }\n";
+    /// 윈도우 아닌 갈래의 식 — 원문 그대로.
+    const UNIX_PRODUCT_BODY: &str = "        socket_path\n            .parent()\n            .map(|p| p.to_path_buf())\n            .unwrap_or_else(|| PathBuf::from(\".\"))\n    }";
+    /// 시험 분기 한 덩이의 머리 주석 첫 줄과 끝 줄(원문에서 이 구간만 걷어 내면 제품 식이 남는다).
+    const TEST_BRANCH_HEAD: &str = "        // ★(R2F-DM · 시험 빌드 전용)";
+    const TEST_BRANCH_STMT: &str = "        #[cfg(test)]\n        if let Some(dir) = fs_socket_state_dir(socket_path) {\n            return dir;\n        }\n";
+
+    /// `state_dir` 함수 원문(문서 주석 제외 · `pub fn state_dir(` 부터 첫 `\n}\n` 앞까지). 바늘은 조각으로 이어 이 파일의 이 줄이 자기 자신에 걸리지 않게 한다.
+    fn state_dir_src() -> &'static str {
+        let src = include_str!("state.rs");
+        let head = concat!("pub fn state_", "dir(socket_path: &std::path::Path) -> PathBuf {");
+        let i = src.find(head).expect("state_dir 본문 소실");
+        let rest = &src[i..];
+        &rest[..rest.find("\n}\n").expect("state_dir 끝")]
+    }
+
+    /// 두 갈래로 가른다 — (함수 머리 ~ `#[cfg(windows)]` 블록 안, `#[cfg(not(windows))]` 블록 안).
+    fn split_branches(f: &str) -> (&str, &str) {
+        let (win, unix) = f.split_once("    #[cfg(not(windows))]\n    {\n").expect("cfg(not(windows)) 갈래 소실");
+        let win_body = win.split_once("    #[cfg(windows)]\n    {\n").expect("cfg(windows) 갈래 소실").1;
+        (win_body, unix)
+    }
+
+    /// [순수] 파이프 이름 판정 진리표 — 파이프(구분자 `/`·`\` 무관 · 대소문자 무관 · 장치/서버 이름 무관)와 파일 시스템 경로를 가른다.
+    /// 이 표는 어느 OS 에서든 같은 값이어야 한다(문자열만 본다) — 맥 레인이 윈도우 경로 모양의 판정을 잡는다.
+    #[test]
+    fn r2f_dm_is_pipe_name_path_truth_table() {
+        for p in [
+            r"\\.\pipe\cys",
+            r"\\.\pipe\cys-dept-3",
+            r"\\.\pipe\cys-dept-dept-3",
+            r"\\.\PIPE\cys",
+            r"//./pipe/cys",
+            r"\\?\pipe\cys",
+            r"\\server\pipe\cys",
+            r"\\.\pipe\a\b",
+            r"\\.\pipe",
+        ] {
+            assert!(is_pipe_name_path(Path::new(p)), "파이프 이름이어야 한다: {p}");
+        }
+        for p in [
+            r"C:\Users\runner\AppData\Local\Temp\cys-x\cysd.sock",
+            r"C:/Users/x/cysd.sock",
+            r"\\?\C:\Users\x\cysd.sock",
+            r"\\server\share\pipe\cysd.sock",
+            r"\\.\pip\cys",
+            r"\pipe\cys",
+            "/tmp/x/cysd.sock",
+            "/tmp/pipe/cysd.sock",
+            "cysd.sock",
+            r"\\",
+            r"\\.",
+            "",
+        ] {
+            assert!(!is_pipe_name_path(Path::new(p)), "파일 시스템 경로여야 한다: {p}");
+        }
+        // 제품이 실제로 만드는 이름(lib.rs `default_socket_path`·`dept_socket_path` 의 윈도우 갈래)은 모두 파이프다.
+        for name in ["", "dept-3", "future"] {
+            let p = if name.is_empty() { r"\\.\pipe\cys".to_string() } else { format!(r"\\.\pipe\cys-dept-{name}") };
+            assert!(is_pipe_name_path(Path::new(&p)), "{p}");
+        }
+    }
+
+    /// [순수] 윈도우 시험 분기가 내는 폴더 — 파일 시스템 경로는 **유닉스 `state_dir` 와 같은 폴더**(그 부모)이고, 같은 파일 이름이라도 부모가 다르면 서로 다른 폴더다(슬러그 식의 결함이 없다).
+    /// 파이프 이름은 `None` — 제품 식으로 내려가 슬러그 폴더가 된다. 맥에서 `state_dir` 는 이 분기를 타지 않으므로 두 값이 같다는 것이 곧 "윈도우 시험 빌드도 유닉스와 같다"는 증거다.
+    #[test]
+    fn r2f_dm_fs_socket_state_dir_is_the_parent_and_pipes_fall_through() {
+        let a = Path::new("/tmp/cys-r2f-a/cysd.sock");
+        let b = Path::new("/tmp/cys-r2f-b/cysd.sock");
+        assert_eq!(fs_socket_state_dir(a), Some(PathBuf::from("/tmp/cys-r2f-a")));
+        assert_eq!(fs_socket_state_dir(b), Some(PathBuf::from("/tmp/cys-r2f-b")));
+        assert_ne!(fs_socket_state_dir(a), fs_socket_state_dir(b), "같은 파일 이름 `cysd.sock` 이어도 부모가 다르면 상태 폴더가 달라야 한다(윈도우 슬러그 식은 둘을 같은 폴더로 접었다)");
+        // 윈도우 시험 빌드의 판정 == 유닉스 제품 식(이 호스트의 `state_dir`) — 같은 입력에 같은 폴더.
+        #[cfg(not(windows))]
+        for p in [a, b, Path::new("cysd.sock"), Path::new("/cysd.sock"), Path::new("rel/dir/cys.sock")] {
+            assert_eq!(fs_socket_state_dir(p), Some(state_dir(p)), "{}", p.display());
+        }
+        // 부모가 없는 경로(빈 경로)는 `.` — 유닉스 식의 `unwrap_or_else(|| ".")` 와 같다.
+        assert!(Path::new("").parent().is_none(), "전제: 빈 경로는 부모가 없다");
+        assert_eq!(fs_socket_state_dir(Path::new("")), Some(PathBuf::from(".")));
+        // 파이프 이름은 내려간다 — 시험 빌드도 파이프에는 제품 식(`%LOCALAPPDATA%\cys[\<슬러그>]`)을 쓴다.
+        for p in [r"\\.\pipe\cys", r"\\.\pipe\cys-dept-1", r"//./pipe/cys-dept-2"] {
+            assert_eq!(fs_socket_state_dir(Path::new(p)), None, "{p}");
+        }
+        // 슬러그 결함의 재현: 마지막 성분만 보는 `pipe_slug` 는 두 FS 소켓에 같은 값을 낸다 — 그래서 시험 분기가 필요했다.
+        assert_eq!(pipe_slug(a), pipe_slug(b));
+        assert_eq!(pipe_slug(a), "cysdsock");
+    }
+
+    /// [소스 핀] **제품 동작 불변** — ① `cfg(windows)` 갈래의 제품 식(시험 분기를 걷은 나머지)이 성찰 1회차 수정판의 원문과 바이트 같다 ② `cfg(not(windows))` 갈래는 원문 그대로이고 시험 분기가 없다
+    /// ③ `#[cfg(test)]` 는 이 함수 안에 **정확히 한 곳**이고 `cfg(windows)` 갈래 안에만 있다 ④ 그 분기는 순수 함수 하나를 부른다. 제품 식을 건드리거나 시험 분기를 유닉스 갈래·함수 밖으로 옮기면 적색이다.
+    #[test]
+    fn r2f_dm_state_dir_product_branches_are_byte_identical_and_test_branch_lives_only_in_windows() {
+        let f = state_dir_src();
+        let (win, unix) = split_branches(f);
+        assert_eq!(f.matches("#[cfg(test)]").count(), 1, "state_dir 안의 `#[cfg(test)]` 는 정확히 한 곳(윈도우 갈래의 시험 분기)이어야 한다");
+        assert!(win.contains(TEST_BRANCH_STMT), "윈도우 갈래에 시험 분기(순수 함수 호출)가 없다 — 있어야 윈도우 시험 검체가 한 상태 폴더를 나눠 쓰지 않는다");
+        assert!(!unix.contains("cfg(test)") && !unix.contains("fs_socket_state_dir") && !unix.contains("is_pipe_name_path"), "시험 분기가 윈도우 아닌 갈래에 있다");
+        let t0 = win.find(TEST_BRANCH_HEAD).expect("시험 분기 머리 주석");
+        let t1 = win.find(TEST_BRANCH_STMT).expect("시험 분기 문장") + TEST_BRANCH_STMT.len();
+        assert!(t0 < t1, "시험 분기: 머리 주석이 문장보다 앞이어야 한다");
+        let product_windows = format!("{}{}", &win[..t0], &win[t1..]);
+        assert_eq!(product_windows, WINDOWS_PRODUCT_BODY, "윈도우 갈래의 제품 식이 바뀌었다(시험 분기를 걷어도 원문과 달라야 안 된다)");
+        assert_eq!(unix, UNIX_PRODUCT_BODY, "윈도우 아닌 갈래의 식이 바뀌었다");
+        // 시험 분기가 소비하는 두 함수는 시험 빌드에서만 존재한다(제품 빌드에 새 코드가 없다).
+        let src = include_str!("state.rs");
+        for head in [concat!("pub(crate) fn is_pipe_name", "_path("), concat!("pub(crate) fn fs_socket_state", "_dir(")] {
+            let i = src.find(head).unwrap_or_else(|| panic!("{head} 소실"));
+            assert!(src[..i].trim_end().ends_with("#[cfg(test)]"), "{head} 는 `#[cfg(test)]` 여야 한다 — 제품 빌드에 새 함수가 생기면 안 된다");
         }
     }
 }

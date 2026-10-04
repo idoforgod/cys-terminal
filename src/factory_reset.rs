@@ -48,7 +48,7 @@ const CYS_BASE_EXACT: [&str; 27] = [
 
 /// ~/.cys 직하에서 격리하는 정확 이름(2차) — 배열 상수 길이 고정을 피하려 분리하지 않고
 /// 접두로 못 잡는 단건들을 이어 담는다.
-const CYS_BASE_EXACT2: [&str; 10] = [
+const CYS_BASE_EXACT2: [&str; 11] = [
     // ★(0.14.31 · 독립 재유도) TTL 승인 전용 저장소와 두 저장소의 **원자적 쓰기 잔재**.
     //   0.14.31 이 `expires_at` 레코드를 `approvals-ttl.json` 으로 분리했는데 인벤토리는
     //   `approvals.json` 하나였다 → 초기화 뒤에도 미만료 승인이 남는다(시크릿을 env 로 고정한
@@ -70,6 +70,10 @@ const CYS_BASE_EXACT2: [&str; 10] = [
     // 진단의 **사용 흔적**이다(src-tauri/src/feedback.rs). 비밀이 찍힌 화면일 수 있어, 남기면
     // "완전 초기화"를 한 사용자에게 스크린샷이 그대로 남는다. transfers 와 같은 등급.
     "feedback",
+    // ★(R2F-DM · 성찰 2회차 A3 m2 · 0.14.43 J2) 인앱 업데이트 **시도 기록** — 업데이트가 설치기를 띄우기 직전에 쓰고 다시 뜬 앱의 `update_attempt_report` 가 한 번 읽어 판정한다
+    //   (`src-tauri/src/main.rs update_attempt_path`). 이 이름이 빠지면 완전 초기화 뒤에도 기록이 남아, 설치기가 뜬 뒤 실패했고 아직 판정 전인 구간에 초기화한 사람의 다음 기동이
+    //   '업데이트가 설치되지 않았습니다' 를 낼 수 있다. `.pending-restore`·`.last-app-version`·`.gui-onboarded` 와 같은 등급(앱 마커) — 업데이트 이력을 지우는 것은 초기화의 뜻이다.
+    ".update-attempt.json",
 ];
 
 /// ~/.cys 직하에서 격리하는 접두. `pack-dept-<name>`(유령 `pack-dept---help` 포함),
@@ -126,7 +130,7 @@ const TEMP_SWEEP_PREFIX: [&str; 7] = [
 /// 격리하면 **앱 자신(cys.exe·cysd.exe·runtime/·resources/)을 언인스톨**해 버린다.
 /// → `~/.cys` 와 같은 교리를 적용한다: **알려진 상태 항목만** 격리하고 나머지(=설치본)는 보존.
 /// 놓친 상태 파일이 남는 것은 불편이지만, 앱을 옮기는 것은 복구 불능급 사고다(fail-safe 방향).
-const WIN_STATE_EXACT: [&str; 21] = [
+const WIN_STATE_EXACT: [&str; 23] = [
     "transcripts.db",
     "analytics.db",
     "channels.db",
@@ -148,6 +152,10 @@ const WIN_STATE_EXACT: [&str; 21] = [
     "phoenix-restore.log",
     "dead-letters.jsonl",
     "oob-cooldowns.json",
+    // ★(R2F-DM · 성찰 2회차 A3 m2 · 0.14.43 C5) 큐 막힘 사유 영속 파일 — 사후 분석용 진단이지만 **상태 폴더에 남는 사용 흔적**이다(막힌 좌석 역할·사유·머리 나이).
+    //   `queue-blocked.json` 은 `write_json_atomic` 이 쓰고(임시 잔재 `.queue-blocked.json.tmp` 는 아래 [`WIN_STATE_ATOMIC`] 이 잡는다), `queue-blocked.prev.json` 은 한 부트에 한 번 직전 파일을 옮겨 둔 1세대 보존본이다.
+    "queue-blocked.json",
+    "queue-blocked.prev.json",
 ];
 
 /// 접두로 잡는 Windows 상태 항목(부서 슬러그 디렉토리·저널/스풀 디렉토리·손상 격리본).
@@ -165,7 +173,7 @@ const WIN_STATE_PREFIX: [&str; 8] = [
 /// `write_json_atomic`(governance.rs)이 **실제로 쓰는** 상태 파일 이름 전량.
 /// 임시 잔재(`.{name}.tmp`)의 판정은 이 목록·[`WIN_STATE_EXACT`] 와의 **정확 일치**로만 한다 —
 /// 접두 가족으로 넓히면 임의의 점 파일이 상태로 잡힌다(아래 X14 주석).
-const WIN_STATE_ATOMIC: [&str; 7] = [
+const WIN_STATE_ATOMIC: [&str; 8] = [
     "topology.json",
     "dept_tombstones.json",
     "queue-state.json",
@@ -173,6 +181,8 @@ const WIN_STATE_ATOMIC: [&str; 7] = [
     "learn_stuck_debounce.json",
     "alert-route-pending.json",
     "alert-route-folded.jsonl",
+    // ★(R2F-DM · 성찰 2회차 A3 m2) 0.14.43 C5 가 더한 `write_json_atomic` 대상 — 위 주석의 "전량" 을 다시 사실로 만든다(소스 핀: `r2f_dm_factory_reset_inventory_covers_the_new_persistent_files`).
+    "queue-blocked.json",
 ];
 
 /// Windows 상태 항목인가 — 정확 이름 · 접두 · **원자쓰기 임시 잔재**의 세 축.
@@ -3660,5 +3670,130 @@ mod converge_factory_reset {
         assert!(is_win_state_name("alert-route-pending.json"));
         assert!(is_win_state_name("cys-dept-dept-1"));
         assert!(is_win_state_name("CYS-DEPT-DEPT-1"), "접두 축의 대소문자 변형을 놓쳤다");
+    }
+}
+
+// ═════════════════ R2F-DM(성찰 2회차 A3 m2) — 이번 판이 더한 영속 파일의 인벤토리 핀 ═════════════════
+#[cfg(test)]
+mod r2f_dm_factory_reset {
+    use super::*;
+    use std::path::Path;
+
+    fn touch(p: &Path, body: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn roots_in(td: &Path, win_state: Option<PathBuf>) -> ResetRoots {
+        ResetRoots {
+            home: td.to_path_buf(),
+            cys_base: td.join(".cys"),
+            state_root: td.join(".local/state"),
+            trash_root: td.join(".local/state/cys-trash"),
+            library: None,
+            darwin_cache: None,
+            temp: td.join("tmpzone"),
+            workspace_root: td.join("Desktop/CYSjavis"),
+            win_local_state: win_state,
+            win_webview_data: None,
+        }
+    }
+
+    /// 계획에서 이름만 뽑는다(격리 · 보존).
+    fn names(plan: &ResetPlan) -> (Vec<String>, Vec<String>) {
+        let n = |items: &Vec<PlanItem>| -> Vec<String> {
+            items.iter().filter_map(|i| i.path.file_name().map(|f| f.to_string_lossy().into_owned())).collect()
+        };
+        (n(&plan.quarantine), n(&plan.keep))
+    }
+
+    /// [목록 핀] 목록의 **길이·내용**을 박는다 — 이번 판이 더한 세 이름이 들어 있고(없으면 완전 초기화 뒤에도 남는다) 목록 안에 중복이 없다. 길이는 컴파일 시점에 고정된 배열 형(`[&str; N]`)이라
+    /// 이름을 더하고도 형을 안 고치면 컴파일이 깨지지만, 형을 고쳐 맞추면서 **내용 단언**을 잊는 일을 이 검체가 막는다(길이 11·23·8).
+    #[test]
+    fn r2f_dm_factory_reset_inventory_lists_carry_the_new_persistent_files() {
+        assert_eq!(CYS_BASE_EXACT2.len(), 11, "~/.cys 직하 정확 이름 목록(2차)의 길이");
+        assert!(CYS_BASE_EXACT2.contains(&".update-attempt.json"), "~/.cys/.update-attempt.json(인앱 업데이트 시도 기록)이 기본 격리 목록에 없다");
+        assert_eq!(WIN_STATE_EXACT.len(), 23, "윈도우 상태 폴더 정확 이름 목록의 길이");
+        for n in ["queue-blocked.json", "queue-blocked.prev.json"] {
+            assert!(WIN_STATE_EXACT.contains(&n), "윈도우 상태 폴더의 {n} 이 정확 일치 목록에 없다");
+        }
+        assert_eq!(WIN_STATE_ATOMIC.len(), 8, "원자 쓰기 목록의 길이");
+        assert!(WIN_STATE_ATOMIC.contains(&"queue-blocked.json"), "queue-blocked.json 이 원자 쓰기 목록에 없다 — `.queue-blocked.json.tmp` 잔재가 설치 파일로 분류된다");
+        // 목록 안 중복 0 · `~/.cys` 두 목록 사이 중복 0.
+        for (label, list) in [
+            ("CYS_BASE_EXACT", CYS_BASE_EXACT.to_vec()),
+            ("CYS_BASE_EXACT2", CYS_BASE_EXACT2.to_vec()),
+            ("WIN_STATE_EXACT", WIN_STATE_EXACT.to_vec()),
+            ("WIN_STATE_ATOMIC", WIN_STATE_ATOMIC.to_vec()),
+        ] {
+            let set: std::collections::BTreeSet<&str> = list.iter().copied().collect();
+            assert_eq!(set.len(), list.len(), "{label} 에 중복 이름이 있다");
+        }
+        assert!(CYS_BASE_EXACT.iter().all(|n| !CYS_BASE_EXACT2.contains(n)), "두 ~/.cys 정확 이름 목록이 겹친다");
+    }
+
+    /// [행동 핀] `~/.cys/.update-attempt.json` 은 완전 초기화 계획에서 **격리**되고, 이름이 비슷한 미등록 파일(`.update-attempt.json.bak` · `.update-attempt-notes.md`)은 **보존**된다(미등록 보존 계약).
+    #[test]
+    fn r2f_dm_factory_reset_plan_quarantines_the_update_attempt_record_and_keeps_lookalikes() {
+        let td = std::env::temp_dir().join(format!("cys-r2f-freset-attempt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let cys = td.join(".cys");
+        touch(&cys.join(".update-attempt.json"), r#"{"from":"0.14.42","to":"0.14.43","at":1}"#);
+        touch(&cys.join(".update-attempt.json.bak"), "owner");
+        touch(&cys.join(".update-attempt-notes.md"), "owner");
+        touch(&cys.join(".pending-restore"), "{}"); // 같은 등급 마커(전제 — 이미 목록에 있다)
+        let plan = build_plan(&roots_in(&td, None), &ResetOptions { purge_license: false, purge_local: false, purge_round: false });
+        let (q, k) = names(&plan);
+        assert!(q.contains(&".update-attempt.json".to_string()), "시도 기록이 격리 계획에 없다 — 격리: {q:?} · 보존: {k:?}");
+        assert!(q.contains(&".pending-restore".to_string()), "전제: 같은 등급 마커는 격리된다: {q:?}");
+        for keep in [".update-attempt.json.bak", ".update-attempt-notes.md"] {
+            assert!(!q.contains(&keep.to_string()), "{keep}: 미등록 파일을 격리했다 — 보존 계약 위반: {q:?}");
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// [행동 핀] 윈도우 상태 폴더(`%LOCALAPPDATA%\cys` — 설치 폴더와 같다)에서 `queue-blocked.json`·`queue-blocked.prev.json` 과 그 원자 쓰기 잔재 `.queue-blocked.json.tmp` 는 **격리**되고,
+    /// 설치본(`cys.exe`)과 비슷한 이름의 미등록 점 파일(`.queue-blocked-theme.tmp`)은 **보존**된다(임의 점 파일 보존 원칙 — 정확 일치로만).
+    #[test]
+    fn r2f_dm_factory_reset_plan_claims_the_queue_blocked_files_in_the_windows_state_dir() {
+        let td = std::env::temp_dir().join(format!("cys-r2f-freset-qblocked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&td);
+        let inst = td.join("AppData/Local/cys");
+        touch(&inst.join("cys.exe"), "MZ"); // 설치본(보존 대상)
+        touch(&inst.join("queue-blocked.json"), "{}");
+        touch(&inst.join("queue-blocked.prev.json"), "{}");
+        touch(&inst.join(".queue-blocked.json.tmp"), "{}"); // 크래시 잔재
+        touch(&inst.join(".queue-blocked-theme.tmp"), "x"); // 무관한 점 파일
+        let plan = build_plan(&roots_in(&td, Some(inst.clone())), &ResetOptions { purge_license: false, purge_local: false, purge_round: false });
+        let (q, k) = names(&plan);
+        for n in ["queue-blocked.json", "queue-blocked.prev.json", ".queue-blocked.json.tmp"] {
+            assert!(q.contains(&n.to_string()), "{n} 가 격리 계획에 없다 — 격리: {q:?} · 보존: {k:?}");
+        }
+        assert!(k.contains(&"cys.exe".to_string()), "전제: 설치본은 보존한다: {k:?}");
+        assert!(!q.contains(&".queue-blocked-theme.tmp".to_string()), "무관한 점 파일을 격리했다(임의 점 파일 보존 원칙 위반): {q:?}");
+        // 이름 판정 자체(대소문자 변형 포함).
+        for n in ["queue-blocked.json", "queue-blocked.prev.json", ".queue-blocked.json.tmp", ".QUEUE-BLOCKED.JSON.TMP", "Queue-Blocked.Prev.Json"] {
+            assert!(is_win_state_name(n), "{n}");
+        }
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// [소스 핀] 인벤토리의 이름은 **생산자 상수와 같다** — 데몬의 사유 파일 상수(`QUEUE_BLOCKED_FILE`·`QUEUE_BLOCKED_PREV_FILE`)가 바뀌거나 이름이 갈리면 적색이다(인벤토리가 옛 이름을 들고 있는 채로 초록이 되지 않게).
+    #[test]
+    fn r2f_dm_factory_reset_inventory_names_match_the_daemon_producer_constants() {
+        let gov = include_str!("bin/cysd/governance.rs");
+        let lit = |name: &str| -> String {
+            let head = format!("pub(crate) const {name}: &str = \"");
+            let i = gov.find(&head).unwrap_or_else(|| panic!("데몬에 {name} 상수가 없다"));
+            let rest = &gov[i + head.len()..];
+            rest[..rest.find('"').expect("리터럴 끝")].to_string()
+        };
+        let (cur, prev) = (lit("QUEUE_BLOCKED_FILE"), lit("QUEUE_BLOCKED_PREV_FILE"));
+        assert_eq!(cur, "queue-blocked.json");
+        assert_eq!(prev, "queue-blocked.prev.json");
+        assert!(WIN_STATE_EXACT.contains(&cur.as_str()) && WIN_STATE_EXACT.contains(&prev.as_str()), "데몬이 쓰는 사유 파일 이름이 인벤토리에 없다");
+        assert!(WIN_STATE_ATOMIC.contains(&cur.as_str()), "`write_json_atomic` 으로 쓰는 사유 파일이 원자 쓰기 목록에 없다");
+        // 그 파일이 정말 `write_json_atomic` 으로 쓰이는가(목록의 근거) — 생산 구간에서 호출이 상수와 함께 있다.
+        assert!(gov.contains("write_json_atomic(&dir, QUEUE_BLOCKED_FILE,"), "사유 파일 쓰기가 `write_json_atomic` 이 아니게 됐다 — 원자 쓰기 목록의 근거가 바뀌었다");
     }
 }

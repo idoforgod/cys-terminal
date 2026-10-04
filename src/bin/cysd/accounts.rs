@@ -1535,7 +1535,8 @@ pub const SEAT_IDENT_CACHE_SECS: f64 = 60.0;
 const SEAT_IDENT_PRUNE_SECS: f64 = 600.0;
 const SEAT_IDENT_CACHE_MAX: usize = 512;
 
-/// 노브 값 파서(순수 · 검체 대상). 미설정·빈 값·파싱 실패·음수·비유한 = 기본값(규칙은 켜진 채). `0` = 이 규칙 끔(0.14.42 동작 그대로).
+/// 노브 값 파서(순수 · 검체 대상). 미설정·빈 값·파싱 실패·음수·비유한 = 기본값(규칙은 켜진 채). `0` = 이 규칙 끔(0.14.42 동작에 **가깝지만 같지는 않다** — 좌석별 경보에서 리셋 시각이 없는 창의 생사를 갱신 시각이 아니라
+/// 값을 실제로 관측한 시각으로 따지고, `usage.alert_resolved` 의 `cleared` 가 난다 · `USER-MANUAL.md` 노브 표·릴리스 노트 §4 · R2F-DM 성찰 2회차 A5 m11).
 pub fn parse_stale_secs(raw: Option<&str>) -> f64 {
     match raw.map(str::trim) {
         None | Some("") => ACCOUNT_ALERT_STALE_SECS_DEFAULT,
@@ -5021,6 +5022,24 @@ mod tests {
                 .collect()
         }
 
+        /// ★(R2F-DM · ⓑ) 윈도우의 열거 경로(`\\`)와 보고 경로(`/`)가 섞여 오는 `current_profiles` 를 이 모듈의 검체는 `strs` 로 접어 비교한다 — 그 도우미가 실제로 `\\` 를 `/` 로 접고 정렬·중복을 지우는지(맥에서도 잰다),
+        /// 그리고 윈도우에서 붉던 두 검체(`r1f_a_logged_out_folder…` · `r1f_a_folder_another_request…`)가 날 `Value` 를 `==` 로 대조하지 않고 그 도우미를 거치는지(소스) 박는다.
+        #[test]
+        fn r2f_dm_strs_folds_windows_separators_and_the_two_windows_red_tests_use_it() {
+            assert_eq!(strs(&json!([".cys\\claude-r1", ".cys/claude-r1", ".claude-r1x"])), s(&[".claude-r1x", ".cys/claude-r1"]), "구분자 접기 · 정렬 · 중복 제거");
+            assert_eq!(strs(&json!([])), Vec::<String>::new());
+            let src = include_str!("accounts.rs");
+            for name in [
+                concat!("fn r1f_a_logged_out_folder_or_one_without_an_identity_file", "_gives_an_empty_current_profiles_not_an_absent_key()"),
+                concat!("fn r1f_a_folder_another_request_is_still_reading_for_the_first_time", "_is_unread_not_no_login()"),
+            ] {
+                let i = src.find(name).unwrap_or_else(|| panic!("{name} 소실"));
+                let body = &src[i..i + src[i..].find("\n        }\n").expect("검체 끝")];
+                assert!(body.contains("strs("), "{name}: 윈도우 구분자를 접는 `strs` 를 거치지 않는다 — 날 `Value` 를 `/` 리터럴과 비교하면 윈도우에서 붉다");
+                assert!(!body.contains(".cloned(), Some(json!([\".cys/"), "{name}: `current_profiles` 날 값을 `/` 리터럴과 직접 비교한다(윈도우에서 `\\`)");
+            }
+        }
+
         const ID_W: &str = r#"{"oauthAccount":{"accountUuid":"u-r1-w","emailAddress":"w-r1@example.test"}}"#;
 
         /// 신원 파일을 임의 본문으로 쓴다(mtime 은 `bump` 로 맞춘다 — 같은 초 안에 다시 써도 mtime 이 달라지게).
@@ -5212,7 +5231,7 @@ mod tests {
         /// (상태 폴더 `read_dir`(게이트 배지)·팩 설정 판독은 0.14.42 에도 있던 별개 경로 — 신원이 아니다.)
         #[test]
         fn r1f_watchdog_identity_chain_has_no_file_access_source_pin() {
-            let (acc, alr, gov) = (include_str!("accounts.rs"), include_str!("alerts.rs"), include_str!("governance.rs"));
+            let (acc, alr, gov, usg) = (include_str!("accounts.rs"), include_str!("alerts.rs"), include_str!("governance.rs"), include_str!("usage.rs"));
             let func = |src: &str, head: &str| -> String {
                 let body = src.split(head).nth(1).unwrap_or_else(|| panic!("{head} 소실"));
                 body[..body.find("\n}\n").unwrap_or_else(|| panic!("{head} 끝"))].to_string()
@@ -5230,6 +5249,11 @@ mod tests {
                 "enumerate_profile_dirs(",
                 "enumerated_profile_dirs(",
                 "known_profile_identities(",
+                // ★(R2F-DM · 성찰 2회차 A1 m-1 ⓑ) `use` 로 접두를 줄인 판독 — `std::fs::` 접두 꼴만 막으면 `File::open(`·`OpenOptions`·`metadata(`·`read_dir(` 단독 꼴은 지나갔다.
+                "File::open",
+                "OpenOptions",
+                "metadata(",
+                "read_dir(",
             ];
             let g = func(gov, "pub(crate) fn check_alerts_with_stale(");
             assert!(g.contains("snapshot_cached_with_stale("), "워치독 진입점이 캐시 전용 스냅샷을 부르지 않는다");
@@ -5245,6 +5269,15 @@ mod tests {
                 (acc, "fn collect_seat_rows("),
                 (acc, "fn assemble_seat_view("),
                 (acc, "pub fn alert_rates_with("),
+                // ★(R2F-DM · 성찰 2회차 A1 m-1 ⓑ) 사슬에 실제로 있는데 목록에 없던 여섯 + 진입점 둘 — 지금은 전부 순수·위임이지만 여기에 판독이 들어가도 초록이었다.
+                (acc, "pub fn account_in_use("),
+                (acc, "pub fn seat_in_use_tri("),
+                (acc, "pub fn alert_eligible("),
+                (alr, "fn keep_best("),
+                (alr, "fn reset_in_secs("),
+                (usg, "pub fn rate_window_live("),
+                (gov, "fn check_alerts("),
+                (gov, "pub(crate) fn check_alerts_with("),
             ] {
                 let f = func(src, head);
                 for bad in forbidden {
@@ -5496,7 +5529,9 @@ mod tests {
                 seed_discovered(&mut st, &home); // 부트 발견 — 행 A·B·C 가 생기고 profiles 에 폴더가 실린다
             }
             let t0 = crate::state::now_epoch();
-            let cp = |rows: &Value, id: &str| row(rows, id).get("current_profiles").cloned();
+            // ★(R2F-DM · ⓑ) 윈도우의 열거 경로는 `\` 라 `current_profiles` 도 `.cys\claude-r1` 로 나온다 — `strs` 가 구분자를 `/` 로 접는다(화면의 `normalizeProfile` 과 같은 규칙 · 이 파일의 다른 검체가 이미 쓰는 도우미).
+            //   제품 출력은 바꾸지 않는다 · 맥·리눅스는 `/` 뿐이라 값이 그대로다.
+            let cp = |rows: &Value, id: &str| row(rows, id).get("current_profiles").map(|v| json!(strs(v)));
             let rows = local_json(&d, t0);
             assert_eq!(cp(&rows, "u-r1-a"), Some(json!([".cys/claude-r1"])), "전제: 정상일 때 A 는 자기 폴더를 현재로 갖는다");
             put_body(&fa, r#"{"projects":{}}"#, 2); // 로그아웃: 파일은 있고 JSON 인데 oauthAccount 가 없다
@@ -5576,7 +5611,8 @@ mod tests {
             let rows = local_json(&d2, now + 1.0);
             assert!(row(&rows, "u-r1-a").get("current_profiles").is_none(), "선점 자리(읽는 중) 위에서 행이 current_profiles 를 냈다: {}", row(&rows, "u-r1-a"));
             let rows = local_json(&d2, now + 62.0); // 60초 하한이 지나 읽기-통과가 실제 신원을 읽는다
-            assert_eq!(row(&rows, "u-r1-a").get("current_profiles").cloned(), Some(json!([".cys/claude-r1"])), "자리가 사라진(읽은) 뒤에도 키가 안 나온다");
+            // ★(R2F-DM · ⓑ) 윈도우의 열거 경로(`\`)를 `/` 로 접어 비교한다(`strs`) — 위 `table_norm` 과 같은 이유다.
+            assert_eq!(row(&rows, "u-r1-a").get("current_profiles").map(|v| json!(strs(v))), Some(json!([".cys/claude-r1"])), "자리가 사라진(읽은) 뒤에도 키가 안 나온다");
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&dir2);
             let _ = std::fs::remove_dir_all(&home);

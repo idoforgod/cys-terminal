@@ -9827,7 +9827,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             Reply::Single(ok_response(&id, json!({ "now": now, "summary": summary })))
         }
 
-        // ─── T7 E6: 현재 활성 경보 (Control Center 경보 배지 — watchdog 발화와 동일 평가기) ───
+        // ─── T7 E6: 현재 활성 경보 (Control Center 경보 배지 — watchdog 발화와 **같은 평가기**(`evaluate`) · **다른 스냅샷**: 이쪽은 읽기-통과 `snapshot`, 워치독은 캐시 전용 — R2F-DM · 성찰 2회차 A1 n-12 ⓒ) ───
         "control.alerts" => {
             let now = crate::state::now_epoch();
             let cfg = crate::alerts::AlertConfig::load();
@@ -11089,7 +11089,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // ★`expires_at` 은 손대지 않는다: 사용할 때마다 만료가 밀리면 TTL 이 아니다.
                 if let Some((matched_idx, _, _, _)) = &hit {
                     if let Some(r) = records.get_mut(*matched_idx) {
-                        r.updated_at = crate::state::now_epoch();
+                        // ★(R2F-DM · 성찰 2회차) 승인 시각은 마이크로초로 양자화한 시계로만 만든다(`approval::record_now`) — 윈도우 100ns 시계의
+                        //   17자리 값이 JSON 저장→읽기에서 바뀌어 서명이 죽던 것을 막는다. 서명·검증 함수는 그대로다(들어가는 값만 정한다).
+                        r.updated_at = crate::approval::record_now();
                         r.sign(&secret);
                     }
                 }
@@ -11254,7 +11256,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 },
             };
-            let now = crate::state::now_epoch();
+            // ★(R2F-DM · 성찰 2회차) 서명 시각 셋(`created_at`·`updated_at`·`expires_at`)은 마이크로초로 양자화한 시계에서 나온다(`approval::record_now`·
+            //   `quantize_epoch_us`) — 윈도우 100ns 시계의 17자리 값이 JSON 저장→읽기에서 바뀌어 서명이 죽던 것을 막는다(위 check 재서명과 같은 규칙).
+            let now = crate::approval::record_now();
             let mut rec = crate::approval::ApprovalRecord {
                 version: 1,
                 id: crate::approval::new_record_id(),
@@ -11263,7 +11267,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 environment: env, // env_from_json이 이미 sort_norm_env(민감키 drop·정렬)
                 created_at: now,
                 updated_at: now,
-                expires_at: ttl_secs.map(|t| now + t as f64),
+                expires_at: ttl_secs.map(|t| crate::approval::quantize_epoch_us(now + t as f64)),
                 signature: String::new(),
             };
             rec.sign(&secret);
@@ -15605,6 +15609,7 @@ mod tests {
     ///   ⓕ 1200B + 끝 CR → 원문 · ⓖ human → 원문 · ⓗ `!` 접두 → 원문 · ⓘ codex 어댑터 → 원문
     ///   ⓙ 킬 스위치 파일 → 원문 · ⓚ 뒤따르는 send_key Return → 봉투 뒤 CR 1개
     #[test]
+    #[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
     fn c_direct_fence_dispatch_behavior() {
         let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (daemon, dir) = daemon_with_acl("c-direct-fence", r#"{"default":"allow","rules":[]}"#);
@@ -26095,6 +26100,7 @@ mod tests {
     /// [H4] CEO 좌석에 모달·화면 초안·kill-switch(ⓓ)·사이클(quiescing)이 양성 관측되면 주입하지 않고 즉시 사람에게
     /// 넘긴다(approval.stalled{reason}) — 요청자 대기가 120s 라 큐 보류는 곧 조용한 만료다. RED(HEAD): 주입.
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h4_ceo_hard_axes_escalate() {
         let (d, ceo) = h4_rig("h4-axes", "sleep 30");
         let cases: [(&str, &str); 4] = [
@@ -26152,6 +26158,7 @@ mod tests {
     /// 보이는 상태를 그린다. 음성 대조: 붙여넣기 창·settle 이 지난 뒤 같은 화면 초안은 종전대로 escalation.
     /// RED(HEAD): 둘째 건 approval.stalled{ceo_seat_draft}.
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h4_burst_second_approval_not_held_by_own_paste() {
         let (d, ceo) = h4_rig("h4-burst", "sleep 30");
         let own_paste = "● 작업 로그 한 줄\n────────────────────\n❯ [cys 결재 요청] RSI 학습 추천 burstA";
@@ -26186,6 +26193,7 @@ mod tests {
     /// (pre-H 처럼 잔여 뒤에 병합 제출). 종전에는 매 결재가 ceo_seat_draft 로 사람에게 갔다. 음성 대조: GUI 모양 삽입(오너
     /// 클릭 · human + machine_origin + 오너 토큰)은 종전대로 escalation. RED(HEAD f1b1a7e8): approval.stalled{ceo_seat_draft}.
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다")]
     fn h4_cross_socket_residue_routes_to_ceo() {
         let pack = crate::governance::HOutsidePack::new(); // 좌석보다 먼저(락 대기 중 좌석 만료 방지)
         let (d, ceo) = h4_rig("h4-xsock", "sleep 30");
@@ -29531,6 +29539,77 @@ mod tests {
             );
         }
 
+        match prev_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        std::env::remove_var(cys::pack::ENV_PACK_DIR);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(R2F-DM · 성찰 2회차) **윈도우 시계(100ns · 유효숫자 17자리)로도 승인이 저장→읽기 뒤 살아 있다** — `approval.sign`(TTL·무기한)·`approval.check`(재서명)를 실제 RPC 경로로.
+    /// 맥의 실제 시계는 1µs 라 양자화 없이도 어긋나지 않는다 — 그래서 원시 시계를 이음매(`approval::tests::with_raw_clock_script`)로 갈아 끼워, 기본 파서가 틀리는 17자리 판독(탐침 실측)을 먹인다.
+    /// 수리 전(`record_now` 가 양자화하지 않던 시절)에는 서명한 승인의 약 12 % 가 처음부터 `approved:false` 였고 쓸 때마다 약 9.5 % 가 죽었다 — 시각 생산자가 원시 시계로 돌아가면 이 검체가 붉다.
+    /// 응답의 `expires_at`(CLI 가 보는 값)도 저장된 값과 비트까지 같다.
+    #[test]
+    fn r2f_dm_windows_like_100ns_clock_approvals_survive_reload_through_the_rpc_handlers() {
+        use crate::approval::tests::{r2f_lossy_readings_near_now, raw_clock_remaining, with_raw_clock_script};
+        let _g = ACL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (daemon, dir) = daemon_with_acl("r2f-clk", r#"{"default":"allow","rules":[]}"#);
+        let prev_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", &dir); // 서명 시크릿·approvals.json 격리(실 ~/.cys 오염 방지)
+        let _store = crate::approval::tests::with_store_root(&dir); // `HOME` 하나로는 Windows 에서 격리되지 않는다(§`approval::store_root`)
+        let caller = 993_171_u32;
+        let _sid = setup_master(&daemon, caller);
+        *daemon.master_claimed_at.lock().unwrap() = Some(crate::state::now_epoch() - 120.0);
+        // 판독 순서 = 소비 순서: sign(TTL) · check(재서명) · check(재서명) · sign(무기한) · check(재서명). 전부 기본 파서가 틀리는 17자리 값이고 **지금 근처**다(만료는 실제 시계로 판정한다).
+        let bad = r2f_lossy_readings_near_now(5);
+        let _clock = with_raw_clock_script(&bad);
+        let secret = crate::approval::signing_secret().expect("secret");
+        let all_valid = |what: &str| {
+            let recs = crate::approval::load_records();
+            assert!(!recs.is_empty(), "{what}: 저장된 승인이 없다");
+            for r in &recs {
+                assert!(r.has_valid_signature(&secret), "{what}: 저장→읽기 뒤 승인 {} 의 서명이 무효다 — 시각 값이 JSON 왕복에서 바뀌었다(created_at={:?} updated_at={:?} expires_at={:?})", r.id, r.created_at, r.updated_at, r.expires_at);
+            }
+            recs
+        };
+
+        // ① TTL 서명(판독 1) — 응답의 만료와 저장된 만료가 비트까지 같고, 읽은 뒤에도 서명이 선다.
+        let sign = Request {
+            id: json!(1),
+            method: "approval.sign".into(),
+            params: json!({"command_prefix": ["echo", "hi"], "cwd": "/tmp", "ttl_secs": 3600}),
+        };
+        let Reply::Single(r1) = dispatch(&daemon, sign, Some(caller)) else { panic!() };
+        assert_eq!(r1["ok"], json!(true), "TTL 서명이 거부됐다: {r1}");
+        let exp = r1["result"]["expires_at"].as_f64().expect("expires_at 미노출");
+        let recs = all_valid("TTL 서명 직후");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].expires_at.map(f64::to_bits), Some(exp.to_bits()), "응답의 expires_at 이 저장된 값과 다르다({exp:?} vs {:?})", recs[0].expires_at);
+
+        // ② 사용 두 번(판독 2·3) — 매번 `updated_at` 을 새 시각으로 재서명·저장하고, 읽은 뒤에도 승인이 선다.
+        for n in 1..=2 {
+            let Reply::Single(rc) = dispatch(&daemon, approval_check_req("echo hi there", "/tmp", true), Some(caller)) else { panic!() };
+            assert_eq!(rc["result"]["approved"], json!(true), "{n}번째 사용이 거부됐다: {rc}");
+            let recs = all_valid(&format!("TTL 승인 {n}번째 사용 직후"));
+            assert_eq!(recs[0].expires_at.map(f64::to_bits), Some(exp.to_bits()), "사용이 만료를 건드렸다");
+        }
+
+        // ③ 무기한 서명(판독 4) → 사용(판독 5).
+        let sign2 = Request {
+            id: json!(1),
+            method: "approval.sign".into(),
+            params: json!({"command_prefix": ["ls", "-la"], "cwd": "/tmp"}),
+        };
+        let Reply::Single(r4) = dispatch(&daemon, sign2, Some(caller)) else { panic!() };
+        assert_eq!(r4["ok"], json!(true), "무기한 서명이 거부됐다: {r4}");
+        all_valid("무기한 서명 직후");
+        let Reply::Single(r5) = dispatch(&daemon, approval_check_req("ls -la /x", "/tmp", false), Some(caller)) else { panic!() };
+        assert_eq!(r5["result"]["approved"], json!(true), "무기한 승인의 사용이 거부됐다: {r5}");
+        all_valid("무기한 승인 사용 직후");
+
+        assert_eq!(raw_clock_remaining(), 0, "시계 이음매의 판독이 다 쓰이지 않았다 — 승인 시각 생산자가 `approval::record_now` 를 거치지 않는다");
         match prev_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
