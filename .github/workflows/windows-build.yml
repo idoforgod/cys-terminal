@@ -842,10 +842,23 @@ jobs:
           $expVer = $verHit.Matches[0].Groups[1].Value
           # ① 구버전 스탠드인: 다른 VERSIONINFO 를 가진 자기완결 PE(cmd.exe 사본)를 정식 자리에 —
           #    오라클(CYS_ORACLE)이 notfresh 로 판정해 스왑 기계가 실제로 돈다(단락 아님).
-          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Start-Sleep 1
-          Get-ChildItem $dir -File -Filter 'cys.prev*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-          Copy-Item "$env:SystemRoot\System32\cmd.exe" $cys -Force
+          # ★(0.14.43 · 2026-10-05 실발생: 커밋 dda584f5 의 런 37258670910) 스탠드인 배치는 **시험의 준비**이지 단언이 아닌데, 종전에는 `Stop-Process` 뒤 1초만 쉬고
+          #   `Copy-Item` 을 한 번 시도해 그 사이에 `cys.exe` 를 쥔 프로세스가 남아 있으면(끝나는 중이거나 남은 자식이 다시 띄운 것) "being used by another process" 로
+          #   스텝이 붉었다(코드가 같은 앞 커밋 f83c9bf6 의 런은 통과 — 타이밍). 준비 단계만 유한 재시도한다(최대 10회 · 매번 다시 끝내고 1초 쉼) —
+          #   아래 ②~의 잠금·업그레이드·단언은 그대로다. 10회 안에 못 놓으면 사유를 밝혀 실패한다(준비 실패를 통과로 접지 않는다).
+          $placed = $false
+          for ($attempt = 1; $attempt -le 10 -and -not $placed; $attempt++) {
+            Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 1
+            Get-ChildItem $dir -File -Filter 'cys.prev*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            try {
+              Copy-Item "$env:SystemRoot\System32\cmd.exe" $cys -Force -ErrorAction Stop
+              $placed = $true
+            } catch {
+              Write-Host ("스탠드인 배치 재시도 {0}/10: {1}" -f $attempt, $_.Exception.Message)
+            }
+          }
+          if (-not $placed) { Die "T4-14: 스탠드인 배치 실패 — cys.exe 를 쥔 프로세스가 10회 재시도 동안 남아 있었다(준비 단계)" }
           Write-Host ("스탠드인 배치: cys.exe VERSIONINFO = {0} (이번 빌드 {1} 와 달라야 한다)" -f (Get-Item $cys).VersionInfo.FileVersion, $expVer)
           # ② 실행 = 진짜 이미지 잠금(덮어쓰기·삭제 거부 / rename 허용) — 실사고의 잠금 계급
           $lock = Start-Process -FilePath $cys -ArgumentList '/c ping -n 900 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
