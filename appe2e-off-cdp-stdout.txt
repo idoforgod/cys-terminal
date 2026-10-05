@@ -1,0 +1,13 @@
+{"t":"2026-10-05T01:36:17.329Z","name":"start","argv":"--mode ui --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-off --max-wait-sec 300 --observe-sec 300 --ready-wait-sec 90 --panel-wait-sec 180 --modal-wait-sec 60","native_websocket":true}
+{"t":"2026-10-05T01:36:17.566Z","name":"targets","count":1,"pages":1}
+{"t":"2026-10-05T01:36:17.703Z","name":"connected","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","ws_impl":"mini"}
+{"t":"2026-10-05T01:36:18.245Z","name":"attached","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","id":"82E3C799C24D5A19FF7DFB6AA36ED536"}
+{"t":"2026-10-05T01:36:18.365Z","name":"page_info","href":"http://tauri.localhost/"}
+{"t":"2026-10-05T01:36:18.395Z","name":"app_version","value":"0.14.43"}
+{"t":"2026-10-05T01:36:18.424Z","name":"ui: wait for the Update button"}
+{"t":"2026-10-05T01:36:18.473Z","name":"listeners","update-progress":"ok","update-error":"ok","update-available":"ok","update-downloaded":"ok","update-finished":"ok","update-installing":"ok"}
+{"t":"2026-10-05T01:36:18.484Z","name":"ui: click the Update button","attempt":1}
+{"t":"2026-10-05T01:36:18.752Z","name":"ui: panel open, waiting for the bin patch button","attempt":1}
+{"t":"2026-10-05T01:36:19.396Z","name":"ui: click the bin patch button","panel_headline":"설치할 수 있는 업데이트 1건","attempt":1}
+{"t":"2026-10-05T01:36:20.009Z","name":"ui: confirm window","title":"새 본체 버전 0.14.99 — 패치 설치","sac_note":false}
+{"t":"2026-10-05T01:36:20.150Z","name":"ui: observing","observe_ms":300000,"fallback_invoke":false}
