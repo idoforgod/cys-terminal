@@ -1,0 +1,155 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "attach",
+  "port": 9333,
+  "started": "2026-10-05T09:37:19.253Z",
+  "finished": "2026-10-05T09:37:19.654Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "cys — CYSJavis Terminal",
+      "url": "http://tauri.localhost/",
+      "id": "300F3F3E16321F4B04F95C3EBCBD6435"
+    }
+  ],
+  "chosen_target": {
+    "url": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "id": "300F3F3E16321F4B04F95C3EBCBD6435"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.42",
+  "check_update": {
+    "current": "0.14.42",
+    "notes": "cys 터미널 v0.14.43. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.",
+    "version": "0.14.43"
+  },
+  "check_update_error": null,
+  "listeners": null,
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 0,
+    "progress_count": 0,
+    "progress_first": null,
+    "progress_last": null,
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-05T09:37:19.254Z",
+      "name": "start",
+      "argv": "--mode attach --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-upg-check --max-wait-sec 120 --ready-wait-sec 30",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-05T09:37:19.275Z",
+      "name": "targets",
+      "count": 1,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-05T09:37:19.283Z",
+      "name": "connected",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-05T09:37:19.286Z",
+      "name": "attached",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "id": "300F3F3E16321F4B04F95C3EBCBD6435"
+    },
+    {
+      "t": "2026-10-05T09:37:19.287Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-05T09:37:19.292Z",
+      "name": "app_version",
+      "value": "0.14.42"
+    },
+    {
+      "t": "2026-10-05T09:37:19.324Z",
+      "name": "screenshot",
+      "file": "appe2e-upg-check-before.png",
+      "bytes": 39952
+    },
+    {
+      "t": "2026-10-05T09:37:19.653Z",
+      "name": "check_update",
+      "ok": true,
+      "value": "{\"current\":\"0.14.42\",\"notes\":\"cys 터미널 v0.14.43. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.\",\"version\":\"0.14.43\"}"
+    },
+    {
+      "t": "2026-10-05T09:37:19.653Z",
+      "name": "attach mode: stopping before listeners / install_update"
+    }
+  ],
+  "errors": []
+}

@@ -1,0 +1,56 @@
+# base state: waiting (every 3 s, at most 120 s) for a cysd.exe of the install folder AND a committed pack (.pack-version); start 2026-10-05T09:35:24.191Z
+[   0s 2026-10-05T09:35:24.350Z] cysd=[pid 3776 (parent 8320, created 2026-10-05T09:35:19.802Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=77 version=
+[   3s 2026-10-05T09:35:27.431Z] cysd=[pid 3776 (parent 8320, created 2026-10-05T09:35:19.802Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=174 version=
+[   6s 2026-10-05T09:35:30.524Z] cysd=[pid 3776 (parent 8320, created 2026-10-05T09:35:19.802Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=311 version=
+[   9s 2026-10-05T09:35:33.656Z] cysd=[pid 3776 (parent 8320, created 2026-10-05T09:35:19.802Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=471 version=
+[  12s 2026-10-05T09:35:36.776Z] cysd=[pid 3776 (parent 8320, created 2026-10-05T09:35:19.802Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=631 version=
+[  16s 2026-10-05T09:35:39.900Z] cysd=[pid 3776 (parent 8320, created 2026-10-05T09:35:19.802Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=783 version=
+[  19s 2026-10-05T09:35:43.039Z] cysd=[pid 3776 (parent 8320, created 2026-10-05T09:35:19.802Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=939 version=
+[  22s 2026-10-05T09:35:46.427Z] cysd=[pid 3776 (parent 8320, created 2026-10-05T09:35:19.802Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=942 version=0.14.42
+# end: a daemon runs and the pack is committed
+[settle +  0s 2026-10-05T09:35:46.558Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-1928] gui-onboarded=none onboard-attempts=none busy=[cys.exe#1928 init-pack] missing=4
+[settle +  2s 2026-10-05T09:35:48.595Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=2
+[settle +  4s 2026-10-05T09:35:50.660Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-1892] gui-onboarded=none onboard-attempts=none busy=[cys.exe#1892 init-pack --no-install-hook] missing=4
+[settle +  6s 2026-10-05T09:35:52.711Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-1892] gui-onboarded=none onboard-attempts=none busy=[cys.exe#1892 init-pack --no-install-hook] missing=4
+[settle +  8s 2026-10-05T09:35:54.759Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-1892] gui-onboarded=none onboard-attempts=none busy=[cys.exe#1892 init-pack --no-install-hook] missing=4
+[settle + 10s 2026-10-05T09:35:56.818Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 12s 2026-10-05T09:35:58.863Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 14s 2026-10-05T09:36:00.911Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 16s 2026-10-05T09:36:02.956Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 19s 2026-10-05T09:36:05.000Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 21s 2026-10-05T09:36:07.043Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 23s 2026-10-05T09:36:09.087Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 25s 2026-10-05T09:36:11.131Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 27s 2026-10-05T09:36:13.178Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 29s 2026-10-05T09:36:15.229Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 31s 2026-10-05T09:36:17.274Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 33s 2026-10-05T09:36:19.318Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 35s 2026-10-05T09:36:21.364Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 37s 2026-10-05T09:36:23.408Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 39s 2026-10-05T09:36:25.456Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 41s 2026-10-05T09:36:27.506Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 43s 2026-10-05T09:36:29.550Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 45s 2026-10-05T09:36:31.595Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 47s 2026-10-05T09:36:33.635Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 49s 2026-10-05T09:36:35.672Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 51s 2026-10-05T09:36:37.713Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 53s 2026-10-05T09:36:39.756Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 55s 2026-10-05T09:36:41.801Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 57s 2026-10-05T09:36:43.846Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 59s 2026-10-05T09:36:45.892Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 61s 2026-10-05T09:36:47.938Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 64s 2026-10-05T09:36:49.984Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 66s 2026-10-05T09:36:52.029Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 68s 2026-10-05T09:36:54.079Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 70s 2026-10-05T09:36:56.122Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 72s 2026-10-05T09:36:58.169Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 74s 2026-10-05T09:37:00.207Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 76s 2026-10-05T09:37:02.239Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 78s 2026-10-05T09:37:04.280Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 80s 2026-10-05T09:37:06.310Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 82s 2026-10-05T09:37:08.358Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 84s 2026-10-05T09:37:10.398Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 86s 2026-10-05T09:37:12.432Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 88s 2026-10-05T09:37:14.471Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+[settle + 90s 2026-10-05T09:37:16.517Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=1
+# settled=False after +- s; missing: .gui-onboarded is "absent"

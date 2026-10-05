@@ -1,0 +1,3882 @@
+[
+    {
+        "label":  "installer 0.14.37",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\inst-0.14.37.exe",
+        "sha256":  "e46b9f8d65ca65e2e90fafb516c255eae15ba4b5e2437ec79ca7e899627e22f7",
+        "size":  141952812,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "installer",
+        "needle":  "\\subj\\inst-0.14.37.exe"
+    },
+    {
+        "label":  "installer 0.14.41",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\inst-0.14.41.exe",
+        "sha256":  "e066e689d2806f085ac1f5a9c3321371489b6f843c55b411fb6793387782b10b",
+        "size":  142531747,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "installer",
+        "needle":  "\\subj\\inst-0.14.41.exe"
+    },
+    {
+        "label":  "installer 0.14.42",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\inst-0.14.42.exe",
+        "sha256":  "e0810a429c757d81e33c7b3655fd55aaa746be94ecfd68961e6c2d6da0eec37e",
+        "size":  143202847,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "installer",
+        "needle":  "\\subj\\inst-0.14.42.exe"
+    },
+    {
+        "label":  "app 0.14.37 cys-app.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.37-cys-app.exe",
+        "sha256":  "78e06dd599a054939ddf6d64d467eeeefd787be1a01a027cc92a14a160b5407e",
+        "size":  15798272,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "app-main",
+        "needle":  "\\subj\\app-0.14.37-cys-app.exe"
+    },
+    {
+        "label":  "app 0.14.37 cys.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.37-cys.exe",
+        "sha256":  "98afc2e2a8a1fa174dc9fbbb93178b92dc1aae8f0c6a11db6127b820a0b7babf",
+        "size":  29387776,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "app-main",
+        "needle":  "\\subj\\app-0.14.37-cys.exe"
+    },
+    {
+        "label":  "app 0.14.37 cysd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.37-cysd.exe",
+        "sha256":  "16c0c6432975496f732eb8ed70d57748194d16431984d895062aa0fa4685d31b",
+        "size":  42604032,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "app-main",
+        "needle":  "\\subj\\app-0.14.37-cysd.exe"
+    },
+    {
+        "label":  "app 0.14.41 cys-app.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.41-cys-app.exe",
+        "sha256":  "42a255f0c5ac5dbb7268b4cf91d1ba95d8b8dfe5246ce1c8afdec2356e767340",
+        "size":  16568320,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "app-main",
+        "needle":  "\\subj\\app-0.14.41-cys-app.exe"
+    },
+    {
+        "label":  "app 0.14.41 cys.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.41-cys.exe",
+        "sha256":  "90ddd46b2622cfaa6b1578ef7f1f7a6fe5319eece1bdbee88eca8dcea9a60c12",
+        "size":  30062080,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "app-main",
+        "needle":  "\\subj\\app-0.14.41-cys.exe"
+    },
+    {
+        "label":  "app 0.14.41 cysd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.41-cysd.exe",
+        "sha256":  "e41745e7b07792b911cf91183987795b5a761ab1187a30c888d875c4f112fd70",
+        "size":  43452928,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "app-main",
+        "needle":  "\\subj\\app-0.14.41-cysd.exe"
+    },
+    {
+        "label":  "app 0.14.42 cys-app.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.42-cys-app.exe",
+        "sha256":  "bc1c6e19bcf3e0dcd4abba8c363423525ee1e050b4929a31c49f7e56e2f142ab",
+        "size":  16544768,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "app-main",
+        "needle":  "\\subj\\app-0.14.42-cys-app.exe"
+    },
+    {
+        "label":  "app 0.14.42 cys.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.42-cys.exe",
+        "sha256":  "c3d91129278246cf396a119e9f8addf9eb06af4d30053c3f5bc4f06c1857d2f2",
+        "size":  30860288,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "app-main",
+        "needle":  "\\subj\\app-0.14.42-cys.exe"
+    },
+    {
+        "label":  "app 0.14.42 cysd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\app-0.14.42-cysd.exe",
+        "sha256":  "5286f08c891e7cbe5992509688bd4f69028f635f825391a1f899215680b3d8f9",
+        "size":  45291008,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "app-main",
+        "needle":  "\\subj\\app-0.14.42-cysd.exe"
+    },
+    {
+        "label":  "control NEG (fresh unsigned exe)",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-neg-fresh.exe",
+        "sha256":  "c643bf54b26a41a40ccbd2c9abc7cd769b84f3c789ec28347b8981244c367456",
+        "size":  228864,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "control-neg",
+        "needle":  "\\subj\\ctl-neg-fresh.exe"
+    },
+    {
+        "label":  "control POS-UNSIGNED 7-Zip setup",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-pos-7zip-setup.exe",
+        "sha256":  "78afa2a1c773caf3cf7edf62f857d2a8a5da55fb0fff5da416074c0d28b2b55f",
+        "size":  1643509,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "control-pos-unsigned",
+        "needle":  "\\subj\\ctl-pos-7zip-setup.exe"
+    },
+    {
+        "label":  "control POS-UNSIGNED 7z.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-pos-7z.exe",
+        "sha256":  "4cd7d776c686427226a151789d2d61f0b2ed2c392148cc4e69c0238362fafecf",
+        "size":  575488,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "control-pos-unsigned",
+        "needle":  "\\subj\\ctl-pos-7z.exe"
+    },
+    {
+        "label":  "control POS-UNSIGNED 7zFM.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-pos-7zFM.exe",
+        "sha256":  "5cbdf46a4ef4b462e63e53dc385c44c85af079f1aa23572d4420a653492b59f3",
+        "size":  998912,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "control-pos-unsigned",
+        "needle":  "\\subj\\ctl-pos-7zFM.exe"
+    },
+    {
+        "label":  "control POS-SIGNED node.exe (0.14.42 runtime)",
+        "path":  "C:\\a\\_temp\\diag-work\\subj\\ctl-signed-node.exe",
+        "sha256":  "0f1098a455c7058daaaccd660d3a71dfed1cc0ffe8bea826170a7807d36fcef2",
+        "size":  85193344,
+        "sig":  "Valid",
+        "sig_subject":  "CN=OpenJS Foundation, O=OpenJS Foundation, L=San Francisco, S=California, C=US",
+        "kind":  "control-signed",
+        "needle":  "\\subj\\ctl-signed-node.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/cys.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\cys.exe",
+        "sha256":  "c3d91129278246cf396a119e9f8addf9eb06af4d30053c3f5bc4f06c1857d2f2",
+        "size":  30860288,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\cys.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/cys.new.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\cys.new.exe",
+        "sha256":  "c3d91129278246cf396a119e9f8addf9eb06af4d30053c3f5bc4f06c1857d2f2",
+        "size":  30860288,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\cys.new.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/cys-app.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\cys-app.exe",
+        "sha256":  "bc1c6e19bcf3e0dcd4abba8c363423525ee1e050b4929a31c49f7e56e2f142ab",
+        "size":  16544768,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\cys-app.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/cys-app.new.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\cys-app.new.exe",
+        "sha256":  "bc1c6e19bcf3e0dcd4abba8c363423525ee1e050b4929a31c49f7e56e2f142ab",
+        "size":  16544768,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\cys-app.new.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/cysd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\cysd.exe",
+        "sha256":  "5286f08c891e7cbe5992509688bd4f69028f635f825391a1f899215680b3d8f9",
+        "size":  45291008,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\cysd.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/cysd.new.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\cysd.new.exe",
+        "sha256":  "5286f08c891e7cbe5992509688bd4f69028f635f825391a1f899215680b3d8f9",
+        "size":  45291008,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\cysd.new.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/bin/bash.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\bin\\bash.exe",
+        "sha256":  "be764e3fbab7c83fdc2d85e01982a0054df9a19da513be1d87b3252abd3a7a4f",
+        "size":  47464,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\bin\\bash.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/bin/git.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\bin\\git.exe",
+        "sha256":  "399eaf1c3f33a29e69785b7ec432ae778f13884abd6a513d87892d49e1062cd3",
+        "size":  46936,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\bin\\git.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/bin/sh.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\bin\\sh.exe",
+        "sha256":  "be764e3fbab7c83fdc2d85e01982a0054df9a19da513be1d87b3252abd3a7a4f",
+        "size":  47464,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\bin\\sh.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/cmd/git.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\cmd\\git.exe",
+        "sha256":  "399eaf1c3f33a29e69785b7ec432ae778f13884abd6a513d87892d49e1062cd3",
+        "size":  46936,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\cmd\\git.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/cmd/git-gui.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\cmd\\git-gui.exe",
+        "sha256":  "1c38aba7cf67b3a4807c08cf034561a9d73622e3833f54031365037f57ff1d40",
+        "size":  138088,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\cmd\\git-gui.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/cmd/gitk.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\cmd\\gitk.exe",
+        "sha256":  "8335383f9258532e36f1182adf6eb157e703e8aa35e9b5eafe2217b74a694405",
+        "size":  138088,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\cmd\\gitk.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/cmd/git-receive-pack.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\cmd\\git-receive-pack.exe",
+        "sha256":  "6ba518bfe16bc21d7eb66d2d07305cf9cea5dcc6ac1346d840abcf196e9c4d43",
+        "size":  32924,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\cmd\\git-receive-pack.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/cmd/git-upload-pack.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\cmd\\git-upload-pack.exe",
+        "sha256":  "f29a0de5682fd8c169a49501dfdbe3f78ad709f4085e1bd94d8f4e44c317c073",
+        "size":  32924,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\cmd\\git-upload-pack.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/cmd/scalar.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\cmd\\scalar.exe",
+        "sha256":  "399eaf1c3f33a29e69785b7ec432ae778f13884abd6a513d87892d49e1062cd3",
+        "size":  46936,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\cmd\\scalar.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/cmd/tig.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\cmd\\tig.exe",
+        "sha256":  "6d3915d45fbc2165b0725c54b6196f29f087fc52dedb60eed8323c4083c74039",
+        "size":  47448,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\cmd\\tig.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/git-bash.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\git-bash.exe",
+        "sha256":  "fbeb1e7142b422970b208168929f95b790c0ce1f0794e858086104274da5bb24",
+        "size":  139112,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\git-bash.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/git-cmd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\git-cmd.exe",
+        "sha256":  "11e6ed0e709ee33e7e1794a5e014f5111f643ea276b776251454e99ff6bc7cfb",
+        "size":  138584,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\git-cmd.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/adig.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\adig.exe",
+        "sha256":  "da169efdf43f4f2e87937efaaaf328dd659e28740411d1904a5bd0908ea5e061",
+        "size":  74364,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\adig.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/ahost.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\ahost.exe",
+        "sha256":  "b89936894123b94375375d88b294416552c5b16c3beace7f9e51675498ed95c1",
+        "size":  53857,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\ahost.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/antiword.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\antiword.exe",
+        "sha256":  "d30a37489c64ada474d8d5aa5abb0778a6955d3ce6cdbb7c8c659e37b89d3da9",
+        "size":  284448,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\antiword.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/blocked-file-util.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\blocked-file-util.exe",
+        "sha256":  "8e2197e888083f0fc1c25dee0c80efeafeaa7b2e974756e9619c1a5f7292f083",
+        "size":  51506,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\blocked-file-util.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/brotli.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\brotli.exe",
+        "sha256":  "ba1fb21bdacc911fb2becb98739eeabd87295c646a21b7f2e500db566eb30dee",
+        "size":  72001,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\brotli.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/bunzip2.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\bunzip2.exe",
+        "sha256":  "4dd06837ccca65bb3be00d9f10bf4350143551d22a068e29345acff290a4a6b6",
+        "size":  70978,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\bunzip2.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/bzcat.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\bzcat.exe",
+        "sha256":  "4dd06837ccca65bb3be00d9f10bf4350143551d22a068e29345acff290a4a6b6",
+        "size":  70978,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\bzcat.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/bzip2.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\bzip2.exe",
+        "sha256":  "4dd06837ccca65bb3be00d9f10bf4350143551d22a068e29345acff290a4a6b6",
+        "size":  70978,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\bzip2.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/bzip2recover.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\bzip2recover.exe",
+        "sha256":  "288e19b3b6aa826fd650c308f4c0756954e5ead10b4f4aa9dc0e8adc34b446bb",
+        "size":  50679,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\bzip2recover.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/connect.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\connect.exe",
+        "sha256":  "a76c8ca6f31978bda3f7cff0efc4c4b38050b2a9f2264016ed44ffa956d307d3",
+        "size":  85278,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\connect.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/create-shortcut.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\create-shortcut.exe",
+        "sha256":  "e6fa7ff81e8a103b9ebdff344c16a5be0dbf26df24c7d8fdc9f76f1483dcc3b2",
+        "size":  145626,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\create-shortcut.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/curl.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\curl.exe",
+        "sha256":  "5505b671e7abb43af2513a273e8ff25cf25856e9d56a1faa6c0b1538aed3f7f0",
+        "size":  328876,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\curl.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/edit_test.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\edit_test.exe",
+        "sha256":  "041d2342207a248b50ac8ec5ad05fb658fe64fd2df171480d7d909646dc48b76",
+        "size":  46135,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\edit_test.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/edit_test_dll.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\edit_test_dll.exe",
+        "sha256":  "d4016cc79b26d37ded3f6b32891501c7f2a0ab5de6b3831bc7b3616526f9955a",
+        "size":  48494,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\edit_test_dll.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/envsubst.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\envsubst.exe",
+        "sha256":  "5ecde5c059557253f5ab87bfe27e5fc469a6180b2fff73639204dd6b0395d44e",
+        "size":  150546,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\envsubst.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/gettext.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\gettext.exe",
+        "sha256":  "6342b8d11a5beb9d21858ffd30cb2ae784f9ea19352f93948462d93257b83300",
+        "size":  144804,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\gettext.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/git.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git.exe",
+        "sha256":  "3277a596afd56b088610d662d4bd7927619e5c55ca97d0d03c0ced1e82c11780",
+        "size":  4383064,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/git-askpass.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-askpass.exe",
+        "sha256":  "bc324e6307b4d93d1dd53db5c86ccd55168ffc09e5fbf3c0ac481efa4ebee7ce",
+        "size":  49008,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-askpass.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/git-askyesno.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-askyesno.exe",
+        "sha256":  "6c87091fa63f3ea4219944fb3fc6d0bcf6e03643af3bc8c478935e8539bc793f",
+        "size":  18605,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-askyesno.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/git-credential-helper-selector.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-credential-helper-selector.exe",
+        "sha256":  "c7599b4b7642839f64a1eff5b43ff805f47eb5122a29dad4cc0efc062e4531f0",
+        "size":  67524,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-credential-helper-selector.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/git-credential-manager.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-credential-manager.exe",
+        "sha256":  "932dc44d83717913bd5feb246f0cd24fe4bf04374f5a195e735f9ae9e06159d2",
+        "size":  132928,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-credential-manager.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/git-lfs.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-lfs.exe",
+        "sha256":  "690f49b6aaa4d9dd707e08419d18f11ac2cb18051aa6779a6badff7d7c4ee95a",
+        "size":  12738008,
+        "sig":  "Valid",
+        "sig_subject":  "CN=\"GitHub, Inc.\", O=\"GitHub, Inc.\", L=San Francisco, S=California, C=US",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-lfs.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/git-receive-pack.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-receive-pack.exe",
+        "sha256":  "febe1b41ea31ae34a2437121866f2ed32954a8e1fc41a33c7627c497d4f1bed4",
+        "size":  46952,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-receive-pack.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/git-upload-archive.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-upload-archive.exe",
+        "sha256":  "febe1b41ea31ae34a2437121866f2ed32954a8e1fc41a33c7627c497d4f1bed4",
+        "size":  46952,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-upload-archive.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/git-upload-pack.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-upload-pack.exe",
+        "sha256":  "febe1b41ea31ae34a2437121866f2ed32954a8e1fc41a33c7627c497d4f1bed4",
+        "size":  46952,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\git-upload-pack.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/lzmadec.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\lzmadec.exe",
+        "sha256":  "636e0cf0eb80a26a59efffd02cd9cffef6208dd54805f61cae9800111f2a91fb",
+        "size":  61705,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\lzmadec.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/lzmainfo.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\lzmainfo.exe",
+        "sha256":  "be3707dbd6e9e7832bb0a46006e64e40a6a4d5263ea7a9b9e6eb4aeb0a50241d",
+        "size":  62205,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\lzmainfo.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/odt2txt.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\odt2txt.exe",
+        "sha256":  "9f48f3e03c4a0132d643b959913769c9bb4af9eb0d5b491c4b7303308928954b",
+        "size":  63727,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\odt2txt.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/openssl.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\openssl.exe",
+        "sha256":  "822034da8a01558c17cbe53f42f33985a6eaf7c89e21273779f9c6560d8c4d78",
+        "size":  1050780,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\openssl.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/p11-kit.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\p11-kit.exe",
+        "sha256":  "7f0fec9949be2ebea3027ab4b2dc6a5c8a4d3ceabdec7e85d7f1b0fe3461f8f3",
+        "size":  260568,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\p11-kit.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/pdftotext.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\pdftotext.exe",
+        "sha256":  "9699be3ec5726d33010295d96fd9eff43c5a6f4201aefe5c1678e70ec9fe3948",
+        "size":  1853512,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\pdftotext.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/pkcs1-conv.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\pkcs1-conv.exe",
+        "sha256":  "138452ac38683b855dd9f17afbc67a7f4a6f4fb37a7910528cfb0c56631ac4fd",
+        "size":  61460,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\pkcs1-conv.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/printf_gettext.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\printf_gettext.exe",
+        "sha256":  "8c641d2265ccc2a1ba564a7baba279d9b3019aa34f5421e1320a3e678120af89",
+        "size":  228391,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\printf_gettext.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/printf_ngettext.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\printf_ngettext.exe",
+        "sha256":  "5afcedcc8d791ccce1a5a1b2b53520007cd8c58a6b0c814b46d3a0aab2b87d23",
+        "size":  229458,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\printf_ngettext.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/proxy-lookup.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\proxy-lookup.exe",
+        "sha256":  "4ddaee21bc06755be28a34aa2cb49bdfe8a548c9b7c78d1ae3049b7605d6c9c1",
+        "size":  48386,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\proxy-lookup.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/psl.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\psl.exe",
+        "sha256":  "0bb58f7d75c4d2f52483c9eda2b910d8acd1d817f5a716646e231d15940b0df9",
+        "size":  55854,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\psl.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/scalar.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\scalar.exe",
+        "sha256":  "66b1a3f9918a385f4fa4a88f911030588eccdafac350bbdec51305b1327d2b61",
+        "size":  2482828,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\scalar.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/sexp-conv.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\sexp-conv.exe",
+        "sha256":  "5e1dbb245fad6f9f8300268eaf1d18d6a410912f02bf4c07f9abf422ab729747",
+        "size":  67202,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\sexp-conv.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/tclsh.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\tclsh.exe",
+        "sha256":  "633ca676693e0ba6db7776057a04e3c3b9b61295743de8932db225cc778e36b3",
+        "size":  80163,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\tclsh.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/tclsh86.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\tclsh86.exe",
+        "sha256":  "633ca676693e0ba6db7776057a04e3c3b9b61295743de8932db225cc778e36b3",
+        "size":  80163,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\tclsh86.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/trust.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\trust.exe",
+        "sha256":  "3f090f33f76f08f9b254fd660323ecd503fc0fdad027580b996388ffe31cd8ea",
+        "size":  285029,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\trust.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/unxz.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\unxz.exe",
+        "sha256":  "c3d660fb270ebbcb9d1e2b0658453384793a7e48cbebd4bad0d8a37ecf6526cd",
+        "size":  127124,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\unxz.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/WhoUses.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\WhoUses.exe",
+        "sha256":  "5fde49f10ed3206061daf403eb59a903e7d51f5f0eda6668b2f70396a73e1efd",
+        "size":  84362,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\WhoUses.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/wish.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\wish.exe",
+        "sha256":  "4350dedc08e7c353dd0fe1ea05cc3bd55d14a47517173fc3ef398bd0c2d5d9d9",
+        "size":  67763,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\wish.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/wish86.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\wish86.exe",
+        "sha256":  "4350dedc08e7c353dd0fe1ea05cc3bd55d14a47517173fc3ef398bd0c2d5d9d9",
+        "size":  67763,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\wish86.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/xmlwf.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\xmlwf.exe",
+        "sha256":  "30fae2d113597649f909ae780a4539512315d4593a0372a97690163a1ab608ba",
+        "size":  90958,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\xmlwf.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/xz.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\xz.exe",
+        "sha256":  "c3d660fb270ebbcb9d1e2b0658453384793a7e48cbebd4bad0d8a37ecf6526cd",
+        "size":  127124,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\xz.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/xzcat.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\xzcat.exe",
+        "sha256":  "c3d660fb270ebbcb9d1e2b0658453384793a7e48cbebd4bad0d8a37ecf6526cd",
+        "size":  127124,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\xzcat.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/bin/xzdec.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\xzdec.exe",
+        "sha256":  "456468fc667d133b8bf65ffd1066b5864ca9409da1f41712b094adc1b98c6df7",
+        "size":  61706,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\bin\\xzdec.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git.exe",
+        "sha256":  "3277a596afd56b088610d662d4bd7927619e5c55ca97d0d03c0ced1e82c11780",
+        "size":  4383064,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-credential-wincred.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-credential-wincred.exe",
+        "sha256":  "7bee5c01b3c1c0ec6a4d1ff09e12f405e5493f3f09fba36a901c72b3d60e7de9",
+        "size":  67464,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-credential-wincred.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-daemon.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-daemon.exe",
+        "sha256":  "f9e47a10d479d5095c3c57fb15d8329bc00461b5316a86128aebf6dbdc4eedf9",
+        "size":  2462056,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-daemon.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-http-backend.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-http-backend.exe",
+        "sha256":  "df1e6ad43340716b54ad5d0dfa7a77c9834a0ce013583641fbe77c80b28fa43d",
+        "size":  2457960,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-http-backend.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-http-fetch.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-http-fetch.exe",
+        "sha256":  "5cfc782f6f1e18eda810f37194c8b542943f2df001fcdf56e4961f2420306fbf",
+        "size":  2512232,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-http-fetch.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-http-push.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-http-push.exe",
+        "sha256":  "373a31ebebbeb239579e593d8a4e53ccd52712d2b722ad5620ba10bf505e34ef",
+        "size":  2522472,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-http-push.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-imap-send.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-imap-send.exe",
+        "sha256":  "ad53e55c855700925aaf5146dd8bed3711661bb40cff967a255064709df773f6",
+        "size":  2524520,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-imap-send.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-remote-ftp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-remote-ftp.exe",
+        "sha256":  "6a1e0a86e3bd8a17a3c41a81687984082cb0dae224c9d7af5035041cf7d0431e",
+        "size":  2529128,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-remote-ftp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-remote-ftps.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-remote-ftps.exe",
+        "sha256":  "6a1e0a86e3bd8a17a3c41a81687984082cb0dae224c9d7af5035041cf7d0431e",
+        "size":  2529128,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-remote-ftps.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-remote-http.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-remote-http.exe",
+        "sha256":  "6a1e0a86e3bd8a17a3c41a81687984082cb0dae224c9d7af5035041cf7d0431e",
+        "size":  2529128,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-remote-http.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-remote-https.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-remote-https.exe",
+        "sha256":  "6a1e0a86e3bd8a17a3c41a81687984082cb0dae224c9d7af5035041cf7d0431e",
+        "size":  2529128,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-remote-https.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/git-sh-i18n--envsubst.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-sh-i18n--envsubst.exe",
+        "sha256":  "d609ab016f99c0030a5fd1c6e82e82a943767ed697d18e120e67e119498ce05a",
+        "size":  2447720,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\git-sh-i18n--envsubst.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/headless-git.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\headless-git.exe",
+        "sha256":  "b7cc1056ac79d2c762af4b4ed803596d8de1928be4370b2eec4caf3165be8d81",
+        "size":  35176,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\headless-git.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/git-core/scalar.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\scalar.exe",
+        "sha256":  "66b1a3f9918a385f4fa4a88f911030588eccdafac350bbdec51305b1327d2b61",
+        "size":  2482828,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\git-core\\scalar.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/p11-kit/p11-kit-remote.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\p11-kit\\p11-kit-remote.exe",
+        "sha256":  "32f3fc3c4910f3ce73ab4d287d147417d38d7784f63c4bf543b03bac4a8940f6",
+        "size":  73143,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\p11-kit\\p11-kit-remote.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/libexec/p11-kit/p11-kit-server.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\p11-kit\\p11-kit-server.exe",
+        "sha256":  "6f25f071d6977e5260c4ec79c8dba6a17c0354f9e527a59830619c882a1980e5",
+        "size":  88148,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\libexec\\p11-kit\\p11-kit-server.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/share/git/compat-bash.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\share\\git\\compat-bash.exe",
+        "sha256":  "be764e3fbab7c83fdc2d85e01982a0054df9a19da513be1d87b3252abd3a7a4f",
+        "size":  47464,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\share\\git\\compat-bash.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/share/git/edit-git-bash.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\share\\git\\edit-git-bash.exe",
+        "sha256":  "61f697ae9f0eb8d28b556e681b800a91be4cb3f0446452fdf97ef0fbd3090df2",
+        "size":  142512,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\share\\git\\edit-git-bash.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/mingw64/share/git/git-wrapper.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\mingw64\\share\\git\\git-wrapper.exe",
+        "sha256":  "febe1b41ea31ae34a2437121866f2ed32954a8e1fc41a33c7627c497d4f1bed4",
+        "size":  46952,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, L=Bruehl, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\mingw64\\share\\git\\git-wrapper.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/[.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\[.exe",
+        "sha256":  "0093104c9e58d42099b8d796f65efa18eab6e941d54de62a5ca224b0d2621413",
+        "size":  72418,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\[.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/arch.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\arch.exe",
+        "sha256":  "c63dc7b8d578a9a418c3f57ce4172af9a527901a335a73b542f839d1b1ce4488",
+        "size":  35876,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\arch.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/awk.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\awk.exe",
+        "sha256":  "c57f626dd07175e23aaef766d9c699fce950483b1ceb665c4771a45d87c14099",
+        "size":  1219175,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\awk.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/b2sum.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\b2sum.exe",
+        "sha256":  "604deb03fc039e3588a782010774a9d7b4f785f015323a4f4739ac26070569a4",
+        "size":  55390,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\b2sum.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/base32.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\base32.exe",
+        "sha256":  "a54e521efb9c1564607e46ba09cd1c9e33572aacedb7d249f780fdd2bca27641",
+        "size":  41819,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\base32.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/base64.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\base64.exe",
+        "sha256":  "ef4877b2e3f929fa3e9671ff421fe64a8e50c89b3e11c2263d9b802604586e7c",
+        "size":  41819,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\base64.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/basename.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\basename.exe",
+        "sha256":  "6fe2e201a956304503f808d0909a26d9b49e1a7e99f6ee6d93721ac4a76a7c6e",
+        "size":  34883,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\basename.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/basenc.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\basenc.exe",
+        "sha256":  "39a435a6a46a997417630bbc5374e89f3d34673eb10e65cee6122a6bb547d47e",
+        "size":  49499,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\basenc.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/bash.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\bash.exe",
+        "sha256":  "acf4ecb52e601f7b4a37db51b07650b5d0315eafd010590e98079fa026da4b7b",
+        "size":  2456832,
+        "sig":  "UnknownError",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, S=Nordrhein-Westfalen, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\bash.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/bunzip2.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\bunzip2.exe",
+        "sha256":  "ac027e648f7d4bb8172d13a1bc27ac71784d193109aa48e76eff703aeb0f520d",
+        "size":  92176,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\bunzip2.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/bzcat.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\bzcat.exe",
+        "sha256":  "ac027e648f7d4bb8172d13a1bc27ac71784d193109aa48e76eff703aeb0f520d",
+        "size":  92176,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\bzcat.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/bzip2.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\bzip2.exe",
+        "sha256":  "ac027e648f7d4bb8172d13a1bc27ac71784d193109aa48e76eff703aeb0f520d",
+        "size":  92176,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\bzip2.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/bzip2recover.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\bzip2recover.exe",
+        "sha256":  "65dbae306befe1505e3ed9079e42e6ec8c08d72fd7a8a95d2baa25d09baa75ec",
+        "size":  14653,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\bzip2recover.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/captoinfo.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\captoinfo.exe",
+        "sha256":  "539b180bc2812fbf2bf0dde23f1f09143fb311616362cf77c552e38d9d467ac9",
+        "size":  81920,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\captoinfo.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/cat.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\cat.exe",
+        "sha256":  "f1b37048ee5c70fdc31dde509e562261c9b2d102d94c903393f55b45e883ef90",
+        "size":  38719,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\cat.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/chattr.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\chattr.exe",
+        "sha256":  "16d6c5a87c988652f64ebceda809e8c296ea5d7a628ecc76d68be8c9ccd70f82",
+        "size":  30466,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\chattr.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/chcon.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\chcon.exe",
+        "sha256":  "97ac075c9b7fbba4c18eefe29b5ba2870a047b676e263425c8f4cd83a9607bb0",
+        "size":  60112,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\chcon.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/chgrp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\chgrp.exe",
+        "sha256":  "a73833f67a4493939325b27d8d1b31f53b5b18310ee18139edcd6d22ac57ef31",
+        "size":  66575,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\chgrp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/chmod.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\chmod.exe",
+        "sha256":  "fd765e24d91b94dcedf9b4c070047a964f866c0f079ad47d7462559302736f1c",
+        "size":  58933,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\chmod.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/chown.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\chown.exe",
+        "sha256":  "601acf672040aa81cc8fa07f43d06f44b33c7f6e3396276c94410bf9ba72de41",
+        "size":  69199,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\chown.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/chroot.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\chroot.exe",
+        "sha256":  "67d990ca052d293fbdb3aabdc417ec3a6e5e04155b9e5497f101aa5e094938d8",
+        "size":  43648,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\chroot.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/cksum.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\cksum.exe",
+        "sha256":  "dc8779dd90181c9a74d3fb26b671da4d5d5b93c9be59287b9244ab66653b8073",
+        "size":  37068,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\cksum.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/clear.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\clear.exe",
+        "sha256":  "8af8a6991f6731c07b4ac4d3249dafe6ac8e2bbc18e54a81f17d343e8ae7902f",
+        "size":  10752,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\clear.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/cmp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\cmp.exe",
+        "sha256":  "9436e2a0a92e8f31e02077785f075fb62d05074d4ce257c53434b93497b0eb2d",
+        "size":  55905,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\cmp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/column.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\column.exe",
+        "sha256":  "30712da3849a25b0ead46212b7f2e6279519d62cfc796cbd7e465d2eff1f0dfd",
+        "size":  49958,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\column.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/comm.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\comm.exe",
+        "sha256":  "7b1a630adb1d85b4f3dd8247a45a914ead7bc34e8b72b8c4a1f12baa82aa80f4",
+        "size":  40237,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\comm.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/cp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\cp.exe",
+        "sha256":  "5f91e0b445edb4e4c17e9a660ac29239f6cac5a821a173a86d4332b9eaa8cea3",
+        "size":  114653,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\cp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/csplit.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\csplit.exe",
+        "sha256":  "730846a83bc6c4f4eb4675b373d9204e8e5961876e17ac6b0bd9f9755559fbd6",
+        "size":  112205,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\csplit.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/cut.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\cut.exe",
+        "sha256":  "63fcfb76c80d57538312a9637429d5a4b99ac83e8b00d95684609b4c045471e9",
+        "size":  45102,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\cut.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/cygcheck.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\cygcheck.exe",
+        "sha256":  "3fcfd1b25c7cb2c71abebafb7aec63dea1224bcf43b9fdf8f6c24610c2e5c369",
+        "size":  720646,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\cygcheck.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/cygpath.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\cygpath.exe",
+        "sha256":  "8b6f1f10f36ca370f20d8f155c5ce6f333a2fb65887d14a980909d1d843da537",
+        "size":  53959,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\cygpath.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/cygwin-console-helper.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\cygwin-console-helper.exe",
+        "sha256":  "8fa85d550f0935179ee0a89be85fd0d915d302efa7eefb9875369dcdcc3e9ba6",
+        "size":  273947,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\cygwin-console-helper.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/d2u.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\d2u.exe",
+        "sha256":  "fbc7af1061f5776e941477cf04e0a31ca33695e106ecaaf091a80ebca69ec6e4",
+        "size":  54337,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\d2u.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/dash.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\dash.exe",
+        "sha256":  "61dc29be7b19d8f5facffbf0c1b6df7d40f064743f9902d2e51d51f4409f762d",
+        "size":  117939,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\dash.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/date.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\date.exe",
+        "sha256":  "743228ae082e1128a2aff02414e114dc45a51f7461775bc5750d89307f3ccdac",
+        "size":  120177,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\date.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/dd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\dd.exe",
+        "sha256":  "fc825633d2b831517253092a1e4a10b5b68452ba3a2af0b5f2a5a0d2c180a752",
+        "size":  90732,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\dd.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/df.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\df.exe",
+        "sha256":  "66d5c328f71c47f8311bd579f84114932d708788e831f320a50c5831777de047",
+        "size":  104899,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\df.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/diff.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\diff.exe",
+        "sha256":  "d64621f766d8910a92cb3d99bd7f23c0b1c736eece0e19dccbccead93aa81854",
+        "size":  279886,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\diff.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/diff3.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\diff3.exe",
+        "sha256":  "913e23ff6b2f9dc204b92a181ac993e3ce7c8c5bcd68db3f7662224a1896a975",
+        "size":  60138,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\diff3.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/dir.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\dir.exe",
+        "sha256":  "0ed6ccc9669fcb28e6c29086623ef7ddb5bddf8e73d427f7e890cee6436cfb51",
+        "size":  149479,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\dir.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/dircolors.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\dircolors.exe",
+        "sha256":  "368a44254cfeddb273c75cd181f0f6bf99ec1eeb3f223120b111112ce0fe9efc",
+        "size":  57476,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\dircolors.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/dirmngr.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\dirmngr.exe",
+        "sha256":  "b6fb58662f7020c3df0b8e084cca4260302f4200d1a309582f4655dd7c2dfbba",
+        "size":  393591,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\dirmngr.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/dirmngr-client.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\dirmngr-client.exe",
+        "sha256":  "f1d547dbc843ab61b6c7cf6b30edb5537a08e83ebdffce071639698489fc2cf2",
+        "size":  96175,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\dirmngr-client.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/dirname.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\dirname.exe",
+        "sha256":  "53896fda354605a1a1d1f5e6802daba5ba6c05961f3074b892194e068aa82772",
+        "size":  34830,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\dirname.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/dos2unix.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\dos2unix.exe",
+        "sha256":  "fbc7af1061f5776e941477cf04e0a31ca33695e106ecaaf091a80ebca69ec6e4",
+        "size":  54337,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\dos2unix.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/du.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\du.exe",
+        "sha256":  "dc22867da6d50648fd627c549edc906d97fdecf2f7956b2f3e05fe619976b07e",
+        "size":  168410,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\du.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/dumpsexp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\dumpsexp.exe",
+        "sha256":  "ffd7b283e5323b4f223bc856405cd7b3fe57e010816ff38e2847a325c8350016",
+        "size":  16511,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\dumpsexp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/echo.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\echo.exe",
+        "sha256":  "629697ea64fad72bceda3b2a6fe3c60c79e1a55e0a79de54f04ddf840907cf41",
+        "size":  35755,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\echo.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/env.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\env.exe",
+        "sha256":  "b5d80f13e6b4b422a8c22d32be9cc1f5fd9b482fc60008ed80e513a2fa938cdc",
+        "size":  44180,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\env.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ex.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ex.exe",
+        "sha256":  "104f3ffb0014b7eda6d6609cfef76d753cd6119816ea9d56f1332020dc3705c9",
+        "size":  3933752,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ex.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/expand.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\expand.exe",
+        "sha256":  "d4dd802d17f6f0801d8df622235c41ca30dadbb8eeb0ea35837d2312e2ce9d2b",
+        "size":  38673,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\expand.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/expr.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\expr.exe",
+        "sha256":  "e1608f26781374b67f180370dc50c833bfc61946aadfb433e48536590bb79219",
+        "size":  111126,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\expr.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/factor.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\factor.exe",
+        "sha256":  "8a9deaea51cb45aa7afc6bd8914f5937f9dbf64ab98aabef1b1a02677d5ea4fe",
+        "size":  77490,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\factor.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/false.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\false.exe",
+        "sha256":  "71314347cf1355d1fd818d62fe11cf6b58373e70170a273335d38a8bacb987d6",
+        "size":  33123,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\false.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/file.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\file.exe",
+        "sha256":  "9c70cd7f49560a672ebbe707a8f21fe5312a2d3f6277fd718c23f2a477879fd9",
+        "size":  24742,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\file.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/find.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\find.exe",
+        "sha256":  "eaae72deb0347b35a5a296d709cbd24af26118106043a9f85761f8210399b773",
+        "size":  351677,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\find.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/fmt.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\fmt.exe",
+        "sha256":  "578c22331e778a2827d67a5563afca8c4b9de3af9031b78ecf31cbffce120e5b",
+        "size":  43330,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\fmt.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/fold.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\fold.exe",
+        "sha256":  "391d6f86fb796d5be5e87ab4d47d2376405795119de9968cfc2788cf3cb9a2f0",
+        "size":  38204,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\fold.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/funzip.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\funzip.exe",
+        "sha256":  "45e648bd3be4fee5c7c05b7a758b85fc6d284a027ec504a80f687483a7335fb6",
+        "size":  28476,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\funzip.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gawk.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gawk.exe",
+        "sha256":  "c57f626dd07175e23aaef766d9c699fce950483b1ceb665c4771a45d87c14099",
+        "size":  1219175,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gawk.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gawk-5.4.0.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gawk-5.4.0.exe",
+        "sha256":  "c57f626dd07175e23aaef766d9c699fce950483b1ceb665c4771a45d87c14099",
+        "size":  1219175,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gawk-5.4.0.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gdbm_dump.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gdbm_dump.exe",
+        "sha256":  "74079ae2990d948345ea5d8c1084b9577fdba3eb8c86a996a93709d1bf6ef38c",
+        "size":  27213,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gdbm_dump.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gdbm_load.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gdbm_load.exe",
+        "sha256":  "128a6653510a13d53cc38ea9f129c3f4d4b41595c90ab4141791010e7c21128b",
+        "size":  29600,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gdbm_load.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gdbmtool.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gdbmtool.exe",
+        "sha256":  "34e96ea18cb37d6ce97f9b2157edcb4bf9e9dc568f143f33b52f85c7312c5916",
+        "size":  134024,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gdbmtool.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gencat.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gencat.exe",
+        "sha256":  "75233527ca720e96534f19af3ba66b54616ac8feb4b88d17b11e2f27229d00d4",
+        "size":  31758,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gencat.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/getconf.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\getconf.exe",
+        "sha256":  "1d0d00e68f989b7df8ca36073b13667cdfccf21ea4b043181975bb6fe3f7fc07",
+        "size":  40828,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\getconf.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/getfacl.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\getfacl.exe",
+        "sha256":  "65cdbd2b9f35d06be1dbf4263487da6106e51af012c2f60578e2eed7c8ad76ae",
+        "size":  28764,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\getfacl.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/getopt.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\getopt.exe",
+        "sha256":  "9ab321a755847a5cb427246ef063b2b6cd74673ff866a0836f6d56b90f8fe41f",
+        "size":  29407,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\getopt.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gkill.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gkill.exe",
+        "sha256":  "17630ebb06517f269bcea82c3584c3ec10f2f09aa44c7046e89d732c9fb4405f",
+        "size":  36574,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gkill.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gmondump.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gmondump.exe",
+        "sha256":  "d51b8a20ef672b7c865c8255b5e144308f6b93b8b43d87db5e587156886722cd",
+        "size":  28078,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gmondump.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpg.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg.exe",
+        "sha256":  "a5140c85353e8399da8d6bd7e3741524cd76a4e69be88af12042b1c9ef022984",
+        "size":  1130330,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpg-agent.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-agent.exe",
+        "sha256":  "16cf65edcbb73e0f0fc756aee23b0d9149c932bbf4d49947a8e71eac8b940f96",
+        "size":  407954,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-agent.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpg-card.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-card.exe",
+        "sha256":  "d21113d6a844e4784ea288794c636c6b43b3818bfefd62df0fbe1fa7f3aef6b6",
+        "size":  236395,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-card.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpgconf.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgconf.exe",
+        "sha256":  "3ac8f1a7cd4dcaa772f6d0837a2cda31204b8a29f4aa35fddf9065d0ac8ceaa0",
+        "size":  145721,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgconf.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpg-connect-agent.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-connect-agent.exe",
+        "sha256":  "b89c59da9cd3938ccff759fac1ae4baf560f1f3e0a30909fa087fcc161db1dc8",
+        "size":  126078,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-connect-agent.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpg-error.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-error.exe",
+        "sha256":  "9d846f91023296072ee623aacb80d6907eb10cd4ab96ee029a879ae6e8806d3f",
+        "size":  36779,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-error.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpg-mail-tube.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-mail-tube.exe",
+        "sha256":  "4846552779f15f373bce9714e8104ee7f64521c73ebc4da39731e476210bf5ef",
+        "size":  105664,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-mail-tube.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpgparsemail.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgparsemail.exe",
+        "sha256":  "7c43d6bfa185b602de7843b5b288cba16c68a74e04751e3da20f3e64c77da84f",
+        "size":  28007,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgparsemail.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpgscm.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgscm.exe",
+        "sha256":  "e3ea4445c20ed6b190c2bba6bcf9d5ef13bd669c03cb6947690e70795160d008",
+        "size":  221446,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgscm.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpgsm.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgsm.exe",
+        "sha256":  "efcab702d47b7a868427aa77de51f191c9187642c22078bf0e66384746ca6407",
+        "size":  570204,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgsm.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpgsplit.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgsplit.exe",
+        "sha256":  "6829011d68589f5e0c5e5d1dacd488b05c71be571e5ee627ffb348b7117196a1",
+        "size":  65545,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgsplit.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpgtar.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgtar.exe",
+        "sha256":  "5a49463b91ee08eeb562b571cb788b5be94d63010c25c28c8db379e76042bf0f",
+        "size":  115182,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgtar.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpgv.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgv.exe",
+        "sha256":  "f4d13204d77fdf63c02b0e6742230f83a833128c28f7b715709c2c63a96c427b",
+        "size":  514306,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpgv.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpg-wks-client.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-wks-client.exe",
+        "sha256":  "b75b7844e25461065c5c23a45d97e82f4efd1de5dc472aa5e00842627220f591",
+        "size":  195792,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-wks-client.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gpg-wks-server.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-wks-server.exe",
+        "sha256":  "3127d321c11d1d2d6eeface4c1c684eb734f215afc0fd726285c678cf2eb9dd6",
+        "size":  170482,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gpg-wks-server.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/grep.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\grep.exe",
+        "sha256":  "497202418334f8a48d9f34cd2e1b2c03c4f957e02304b613e10931c0457e8d4a",
+        "size":  213710,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\grep.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/groups.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\groups.exe",
+        "sha256":  "18bb936d12baa55cb9cc240fb4afb088af2784fbde8a6dd5d3537448a5263046",
+        "size":  36590,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\groups.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/gzip.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\gzip.exe",
+        "sha256":  "66b484c89583bd78f94ffcae69d57d0be05c9d682fbe265e55e5e95e9c0b89d5",
+        "size":  126581,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\gzip.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/head.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\head.exe",
+        "sha256":  "c82ae2ef72235a34db7007580628cd5183cb350878a10fcc98b6ef26b92a3537",
+        "size":  45413,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\head.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/hmac256.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\hmac256.exe",
+        "sha256":  "81cbc7541f1035d56e58b3ade609f74c886cb4b636cce506f4f59724a650a96c",
+        "size":  17059,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\hmac256.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/hostid.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\hostid.exe",
+        "sha256":  "9c93d1b5c9dffcae583e524d3023a8fa6382048d217de697b96f5c805e4da474",
+        "size":  33315,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\hostid.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/hostname.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\hostname.exe",
+        "sha256":  "99d3b0b660717c412334adbf2ac5c52ae491eb504df12197c35ec91918ae00b2",
+        "size":  33894,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\hostname.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/iconv.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\iconv.exe",
+        "sha256":  "d34c197226bed76320d7d0579e19560dee5c2c36a69378f5ed41874d26c4e748",
+        "size":  33549,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\iconv.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/id.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\id.exe",
+        "sha256":  "7e5a847d3d4745879db5cb8997045355334ed888f22965b59423ee05150ed371",
+        "size":  43959,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\id.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/infocmp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\infocmp.exe",
+        "sha256":  "ddd200f3128f17c9ec4634ab60368d9a5c5e2d52999e3260884d34752b051c41",
+        "size":  58880,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\infocmp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/infotocap.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\infotocap.exe",
+        "sha256":  "539b180bc2812fbf2bf0dde23f1f09143fb311616362cf77c552e38d9d467ac9",
+        "size":  81920,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\infotocap.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/install.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\install.exe",
+        "sha256":  "23b01a97c735f224f76804b306e19b5ba15649d0a9db620a172e480ba80533ab",
+        "size":  148448,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\install.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/join.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\join.exe",
+        "sha256":  "6e30a08d2bc2cb1fea56e41cee45c44f1c16272ed670d7c6138cbff5a00608c1",
+        "size":  51222,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\join.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/kbxutil.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\kbxutil.exe",
+        "sha256":  "7a4b780ce82983e22aa34f4f906423481022cc180d4d5870b3607c6d13738aba",
+        "size":  165020,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\kbxutil.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/kill.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\kill.exe",
+        "sha256":  "ffc957662914a9da3ee511a3d8b1ad5f0485fd5334decd58f27661db3c1f4d76",
+        "size":  39432,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\kill.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ldd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ldd.exe",
+        "sha256":  "beb121558bdfa341d86341504bb8d2ad39975068a199ce8d28038c1c73d828df",
+        "size":  37790,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ldd.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ldh.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ldh.exe",
+        "sha256":  "673a96502a1e6ac2c7778c4a54013a3e8a9d2d319357cf907d479360c0001482",
+        "size":  140268,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ldh.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/less.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\less.exe",
+        "sha256":  "72cd97cb8b8dd88c9070172febdadcae9a756831e10b53e3127d997d7b93f87a",
+        "size":  239056,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\less.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/lesskey.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\lesskey.exe",
+        "sha256":  "234d752b5318a392ed0f7bc004b6b21016f99593a026740db386a112bf5e5f55",
+        "size":  21727,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\lesskey.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/link.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\link.exe",
+        "sha256":  "070b43c6e5dfb7a92fafa30206fa4dd6361c3bad52e7d533a2827c3918c73d93",
+        "size":  33822,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\link.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ln.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ln.exe",
+        "sha256":  "28f25f435e02867e685e115e78554f585cd81db4ef9b66f4364fd342857bdaf6",
+        "size":  77077,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ln.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/locale.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\locale.exe",
+        "sha256":  "e8f6a51ccb70c9d81eaff82f38c0dbfaa362a8ad8b473a2663790e89bcfb3da7",
+        "size":  45162,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\locale.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/locate.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\locate.exe",
+        "sha256":  "6554191954bb58955f89315d01a94b8ab962fcd9d47816b57a71b6a3bb510726",
+        "size":  221171,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\locate.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/logname.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\logname.exe",
+        "sha256":  "b9938523b459bfa37f0547a3d321570eb63d9fc6becd7a94badfc4021f06f4b5",
+        "size":  33855,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\logname.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ls.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ls.exe",
+        "sha256":  "b45981580702029cfeeffc8ca69e2a4d1e9c68914009e94c31ffec9cbc544aa5",
+        "size":  149479,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ls.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/lsattr.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\lsattr.exe",
+        "sha256":  "3eabe08f8c554eeb47ab41b9ea44a76002c475ddced7ca0138b540b9f4ddfe56",
+        "size":  29805,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\lsattr.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mac2unix.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mac2unix.exe",
+        "sha256":  "fbc7af1061f5776e941477cf04e0a31ca33695e106ecaaf091a80ebca69ec6e4",
+        "size":  54337,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mac2unix.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/md5sum.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\md5sum.exe",
+        "sha256":  "9327e6f33e2d58cfe675a33453e17297c44dc0839584f33670bdf375f339a5ee",
+        "size":  47036,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\md5sum.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/minidumper.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\minidumper.exe",
+        "sha256":  "cf21cbbe5e7995cc6debbde6ac9236f494c031e11b50e2ed15ad7b970b2c20c5",
+        "size":  28235,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\minidumper.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mintty.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mintty.exe",
+        "sha256":  "c42538dcb59ddc4b46001d50480fb2c5962e957c3022aadc70a8ca0266221ff7",
+        "size":  1266680,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mintty.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mkdir.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mkdir.exe",
+        "sha256":  "fc9b9e49fd6496cdddfc5681208d74bd649ac934818eafdfd50a9571bdcb4861",
+        "size":  71435,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mkdir.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mkfifo.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mkfifo.exe",
+        "sha256":  "efd816dd4d0764b2df695b9ad8cc4cd2da68c7564cabef993dc9bc39ae0a97f0",
+        "size":  36564,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mkfifo.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mkgroup.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mkgroup.exe",
+        "sha256":  "d749375d5544f9a68778921421420d622b0d0c992b824e1aef7c49576caa77a5",
+        "size":  43041,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mkgroup.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mknod.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mknod.exe",
+        "sha256":  "ac12a4c60b0c1ba56de562249729e5e1ef747c322eec7a5b7ca8c1e4ed3e2fd7",
+        "size":  39738,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mknod.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mkpasswd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mkpasswd.exe",
+        "sha256":  "ab02ff19544465ed23d585d5a95e4c833e1dc5721a1e9af201fa597be25eb4af",
+        "size":  42890,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mkpasswd.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mktemp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mktemp.exe",
+        "sha256":  "bd6474b0404e52b195296438342f38e510fe1a4c1c0d91ceb83cf8411959fecb",
+        "size":  44192,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mktemp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mount.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mount.exe",
+        "sha256":  "ae4dacae50c40b2389f578219564e1ef2eb5c2579632c42771b47fc6a8eb4181",
+        "size":  35855,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mount.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mpicalc.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mpicalc.exe",
+        "sha256":  "25eed570d9183fc6859e249a9214965a93370277242613ea229e0f84b0649054",
+        "size":  18110,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mpicalc.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/mv.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\mv.exe",
+        "sha256":  "0e990f9314e17eaf2eed168561313e0b6e1d21daf8fb6400387026c6da7277a1",
+        "size":  122430,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\mv.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/nano.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\nano.exe",
+        "sha256":  "01b7fb5bbcbfcd9b5db2444a35ce92dcfc8196a216de4273f87d38cca098a458",
+        "size":  484236,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\nano.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/nettle-hash.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\nettle-hash.exe",
+        "sha256":  "904c2b260381da7c37aa317e35632d39a81e1879e58fb8db45743986efaeb0f9",
+        "size":  18493,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\nettle-hash.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/nettle-lfib-stream.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\nettle-lfib-stream.exe",
+        "sha256":  "7eabcec4691225130cd89e4530c136a311654bed6a2ddcf88c0b575d6b51858e",
+        "size":  10236,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\nettle-lfib-stream.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/nettle-pbkdf2.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\nettle-pbkdf2.exe",
+        "sha256":  "64849cb3826d8d5e15550e59bea6fe8c77ef8bbd5f3320ff58faa95788231b15",
+        "size":  18069,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\nettle-pbkdf2.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/newgrp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\newgrp.exe",
+        "sha256":  "ab286d434776f97b93b3ef389f410d6266322185b751b0ee0f8a1ec5b7a957c5",
+        "size":  31721,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\newgrp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/nice.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\nice.exe",
+        "sha256":  "9801b3b6def5c0f5c1fc19081c6629f0e2a54e4c5a32574bf2220bc9d7dc602c",
+        "size":  36525,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\nice.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/nl.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\nl.exe",
+        "sha256":  "925d98a835ad3d5484ad8a628e259e763573381e695d76a278a6c048c715baa5",
+        "size":  104060,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\nl.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/nohup.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\nohup.exe",
+        "sha256":  "215a3fa276e08704da190f3f3e9184746b35273835031939f9830978609bde7e",
+        "size":  36594,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\nohup.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/nproc.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\nproc.exe",
+        "sha256":  "0b1029ad4b71140a7ec31cc0a1f6495264cdb380cef4fbc91701e431c703d525",
+        "size":  36659,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\nproc.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/numfmt.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\numfmt.exe",
+        "sha256":  "a56e3fdeb73da651be49ce132342b645ba8f5d0b4fb7e348744367272930277b",
+        "size":  61464,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\numfmt.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/od.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\od.exe",
+        "sha256":  "5533b3edb4b47590a3279653475f12cb6dec11a3b8a289e93c613a06c30b99d2",
+        "size":  86740,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\od.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/openssl.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\openssl.exe",
+        "sha256":  "78340fb01dea2df5caab73dcf28833b31329226a4c9e02f717f1d399592265b9",
+        "size":  1005028,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\openssl.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/p11-kit.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\p11-kit.exe",
+        "sha256":  "2f77460de5f1ad7affd0a6c7bee0459c70bc8b72bd0f985a4d5d7567380b1a1a",
+        "size":  206208,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\p11-kit.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/passwd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\passwd.exe",
+        "sha256":  "69afff77cd1f1e2387e11f0a05901bad5b7285c5b660ebac22b84d79d6c9122a",
+        "size":  42961,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\passwd.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/paste.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\paste.exe",
+        "sha256":  "dbe30811afd9a26db96291c86da04a655011cb600ef075f961230b5a111a336c",
+        "size":  37588,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\paste.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/patch.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\patch.exe",
+        "sha256":  "d77a8f8499909a711d343fea72235b8de473c4928243b976589073efafa941d7",
+        "size":  178952,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\patch.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/pathchk.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\pathchk.exe",
+        "sha256":  "36afccc7251e0b1a5b2a7c54fe022d13a122c2479028b0f01e653084e79281e9",
+        "size":  35362,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\pathchk.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/perl.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\perl.exe",
+        "sha256":  "8679db320f05c37d004c70ee5196d0bf8e9029aea49b9abc2f5cab8e9da810c5",
+        "size":  14278,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\perl.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/perl5.42.2.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\perl5.42.2.exe",
+        "sha256":  "8679db320f05c37d004c70ee5196d0bf8e9029aea49b9abc2f5cab8e9da810c5",
+        "size":  14278,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\perl5.42.2.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/pinentry.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\pinentry.exe",
+        "sha256":  "95a49c7b02cfa93dfdec7f7e122d703e6a6003b2ae064b0eb61c22ab7c79410d",
+        "size":  79488,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\pinentry.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/pinentry-w32.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\pinentry-w32.exe",
+        "sha256":  "95a49c7b02cfa93dfdec7f7e122d703e6a6003b2ae064b0eb61c22ab7c79410d",
+        "size":  79488,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\pinentry-w32.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/pinky.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\pinky.exe",
+        "sha256":  "7bf3d57f6874c4c50aee67f7c2e6c4a22545a098b5cbe9e8a276ec41a8a0e666",
+        "size":  41090,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\pinky.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/pkcs1-conv.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\pkcs1-conv.exe",
+        "sha256":  "99aa2de5a002379258349c0d7366db12b2b54213f87099572250c2db8cd59983",
+        "size":  23492,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\pkcs1-conv.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/pldd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\pldd.exe",
+        "sha256":  "66ed4feb887b52d8e0b0c564de1a6311bf41a468a79a0bc145e8ae43a9d8534e",
+        "size":  26410,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\pldd.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/pluginviewer.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\pluginviewer.exe",
+        "sha256":  "49ace33d3fee1a901c9014f320b5ff75702536d8d785c4467c8a85ad1a20eed0",
+        "size":  17725,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\pluginviewer.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/pr.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\pr.exe",
+        "sha256":  "6e88ea48531904f8d85a122426989f616bdd465d96f5b2fd8c269b4d86c47a21",
+        "size":  73622,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\pr.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/printenv.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\printenv.exe",
+        "sha256":  "0c2c6c2141e1a54b526bcc3e426719651ccdc16790a7734bd7f6ab6a8d635c1f",
+        "size":  33795,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\printenv.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/printf.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\printf.exe",
+        "sha256":  "dbc52ee41a9d2fc4cdad6d690e430c6b630ce5fb5837d66d6b47cf59ea63b198",
+        "size":  72003,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\printf.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/profiler.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\profiler.exe",
+        "sha256":  "abab0321615356dadad1ecb65683aa50644cf3f9e8c963a6a3bebc9780f82b74",
+        "size":  64615,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\profiler.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ps.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ps.exe",
+        "sha256":  "b2cd85b901d9ab2475949a3f2fdda23f37d61294c892d1149b24b86d964c2742",
+        "size":  34095,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ps.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/psl.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\psl.exe",
+        "sha256":  "35e0a8972c19da68d1d43c7765c98382c7fdc86a23c9d211da1a90dd95d6bda2",
+        "size":  17570,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\psl.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ptx.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ptx.exe",
+        "sha256":  "adac7303d0a6e283eb76f30cb4833ff084e20b17315eb17606fbb558c6c989ff",
+        "size":  130279,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ptx.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/pwd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\pwd.exe",
+        "sha256":  "d1281cecce65fc76750381698faca130216ffacc6396886d63a85ad28a3071aa",
+        "size":  36148,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\pwd.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/readlink.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\readlink.exe",
+        "sha256":  "3617334c256348026305e7a978bb803c45c31e2f4d24c763e1f11361ceb1d58c",
+        "size":  48491,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\readlink.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/realpath.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\realpath.exe",
+        "sha256":  "e780c23d5d6bf60d7e80e073586be5f4d7f91faa0a0d1f07b3088b5d710f8395",
+        "size":  49576,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\realpath.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/rebase.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\rebase.exe",
+        "sha256":  "eccc5d1189f6ae079b461bee498e784c7f1516a7aaae08acc8306c669675dee6",
+        "size":  917446,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\rebase.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/regtool.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\regtool.exe",
+        "sha256":  "e4978cbf251642480df555181b01e58385a755dd3d36e1e2ac3595b6f03f0c1a",
+        "size":  45827,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\regtool.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/reset.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\reset.exe",
+        "sha256":  "e110d4ab4c863542124bff0ed1247990a2a7a09fdf884cd8fd822e1c124bfd2b",
+        "size":  20480,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\reset.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/rm.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\rm.exe",
+        "sha256":  "a845f7517a49b49726e056da8a8f65a6d9ce96fbe79c3664c082521eea0f80e7",
+        "size":  63813,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\rm.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/rmdir.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\rmdir.exe",
+        "sha256":  "7d91cc7b4e7a297a74dcdb621ff19b495db14a8a96612a737fc870403fc6775c",
+        "size":  62247,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\rmdir.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/rnano.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\rnano.exe",
+        "sha256":  "01b7fb5bbcbfcd9b5db2444a35ce92dcfc8196a216de4273f87d38cca098a458",
+        "size":  484236,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\rnano.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/runcon.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\runcon.exe",
+        "sha256":  "8f3881baac0ca03f32a974cfabee077ae87f9ed8a566249a110775c015d219a8",
+        "size":  34817,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\runcon.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/rview.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\rview.exe",
+        "sha256":  "104f3ffb0014b7eda6d6609cfef76d753cd6119816ea9d56f1332020dc3705c9",
+        "size":  3933752,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\rview.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/rvim.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\rvim.exe",
+        "sha256":  "104f3ffb0014b7eda6d6609cfef76d753cd6119816ea9d56f1332020dc3705c9",
+        "size":  3933752,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\rvim.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/scp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\scp.exe",
+        "sha256":  "3f66d559fefc6ea1c844d4dba765574f5d2e4d3e63694d4126968b2a8859e5f6",
+        "size":  209000,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\scp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sdiff.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sdiff.exe",
+        "sha256":  "1ebf31bdfe552d728c940866ffb0753a745e9699b69c79013d8766242d6714a6",
+        "size":  62159,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sdiff.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sed.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sed.exe",
+        "sha256":  "8d54e322dfc3faa60f0464691aba8634197406e53367aa8942409181c0808be8",
+        "size":  178140,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sed.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/seq.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\seq.exe",
+        "sha256":  "6e5c79fce1d50d888b38f5a0a02a314265e733f151e8b9d2c953b363a60d27d0",
+        "size":  68488,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\seq.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/setfacl.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\setfacl.exe",
+        "sha256":  "1c3517b5715628952ef6af0fec6ca5e355ebab464be830c637d6bda7b06d7dd1",
+        "size":  37904,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\setfacl.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/setmetamode.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\setmetamode.exe",
+        "sha256":  "89e311c8f2da65d7325d8e8abec2f6bda8892860bc49560890167bc43dffb85e",
+        "size":  23109,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\setmetamode.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sexp-conv.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sexp-conv.exe",
+        "sha256":  "336f25ce0c2765791d39a74f7bad0533fa8d1dfde9a832394a97d5cf77ae0eb8",
+        "size":  30039,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sexp-conv.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sftp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sftp.exe",
+        "sha256":  "5835ab9262742d5a05ad171d98b876d4d998e3d815d7ad8c2140833a1bcae655",
+        "size":  222242,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sftp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sh.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sh.exe",
+        "sha256":  "acf4ecb52e601f7b4a37db51b07650b5d0315eafd010590e98079fa026da4b7b",
+        "size":  2456832,
+        "sig":  "UnknownError",
+        "sig_subject":  "CN=Johannes Schindelin, O=Johannes Schindelin, S=Nordrhein-Westfalen, C=DE",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sh.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sha1sum.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sha1sum.exe",
+        "sha256":  "2fdbabc61355f77bedbc426c3d23e4d6a0d7a0e8a9f69ca0bd70e1aa4347b13d",
+        "size":  50108,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sha1sum.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sha224sum.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sha224sum.exe",
+        "sha256":  "42026c118285367e9612235fafd2ab971ecb32c4c3b130782ba95d1002c6d21e",
+        "size":  56252,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sha224sum.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sha256sum.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sha256sum.exe",
+        "sha256":  "ad199fb8a1104b5ac86eb49d775e2aeaea8396c4c8818beda074ddb0d359acc4",
+        "size":  56252,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sha256sum.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sha384sum.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sha384sum.exe",
+        "sha256":  "1a14f45fcf0f3212071fc14fe2e0c340f403a52bc00f302f8b1d81d62011fe93",
+        "size":  61372,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sha384sum.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sha512sum.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sha512sum.exe",
+        "sha256":  "19b1bd5ce7f1124f0bc5c73e0dee25130119fe24d4d7577ab6c3e41edab67aa7",
+        "size":  61372,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sha512sum.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/shred.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\shred.exe",
+        "sha256":  "0b5368364b3ec25a0aebffdc5a87ec4aa3e49e9fee6ff982434329aa4c388e8f",
+        "size":  58509,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\shred.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/shuf.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\shuf.exe",
+        "sha256":  "d36625fd75bccb007442995ce0d2b51257fa6b08b472c0f2709e736f3505b967",
+        "size":  54163,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\shuf.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sleep.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sleep.exe",
+        "sha256":  "3dfa2435317339e861121c1bd22e57b7b67c204705f00a88b5ac10a0cba87514",
+        "size":  36003,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sleep.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sort.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sort.exe",
+        "sha256":  "7c5df851d821e23988641f35442a06652ce834ed724456511798ce60314cab9a",
+        "size":  109591,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sort.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/split.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\split.exe",
+        "sha256":  "2c37e1474ccc2c73c6e2a82f04ac2f1943753ee9ae1dac17d605ccc82b0222af",
+        "size":  54181,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\split.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ssh.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh.exe",
+        "sha256":  "ff3de79218b536e7460e14f470cefca2c2516f2320ee8a54114c015254f37cef",
+        "size":  895029,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ssh-add.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh-add.exe",
+        "sha256":  "e06dc966945616cfa8fe27af1e41a4596592dabe5928886b10f810f0edca68ff",
+        "size":  294706,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh-add.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ssh-agent.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh-agent.exe",
+        "sha256":  "46852941c020386f2e73fe511ee183c0603c71d9f6d2ffc01fb87ec6ff086815",
+        "size":  271126,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh-agent.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ssh-keygen.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh-keygen.exe",
+        "sha256":  "2b4699de0e650e8a7514f2fa64cf84d144bc193d57d6e92ff1f69ef68e3079a0",
+        "size":  410003,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh-keygen.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ssh-keyscan.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh-keyscan.exe",
+        "sha256":  "fdeef6faeba3357ce2aba26f6f8dde07cf4b7fc79c4e091a17186082b13d3485",
+        "size":  465118,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh-keyscan.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ssh-pageant.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh-pageant.exe",
+        "sha256":  "83d06cd7922bdda6b49df5c1e1b2325d5fff930c8d4a2ff2baf654061f2b14d5",
+        "size":  22634,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssh-pageant.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/ssp.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssp.exe",
+        "sha256":  "21ab92b9fd7369a372e387c9b262625a1da818115b99222c9a9e471eb141e0c5",
+        "size":  41562,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\ssp.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/stat.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\stat.exe",
+        "sha256":  "84468965a541829728d1fa02d32e987ab1a844ec4a23644058ef477ff8b3264a",
+        "size":  97209,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\stat.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/stdbuf.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\stdbuf.exe",
+        "sha256":  "8926989b60ca00f78ff9e841f580d59647aa6bdb58ba86ea8169a6bdd559483f",
+        "size":  69024,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\stdbuf.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/strace.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\strace.exe",
+        "sha256":  "cd15a189a8272cda91ebc3c67bd84bd756fb3b18c9383121dbdeaaf13774ee83",
+        "size":  357968,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\strace.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/stty.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\stty.exe",
+        "sha256":  "9fb3079c682d78511383767763973c307659b2afe68f806e8c3dd50a01fab533",
+        "size":  90756,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\stty.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sum.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sum.exe",
+        "sha256":  "994a8c3a1d3a5a8008b2e283adfeed3fae01e5c5e6db34cd8c9978f065e96d89",
+        "size":  42969,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sum.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/sync.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\sync.exe",
+        "sha256":  "24312a69a33d40956c52317d415f4170395f7facb6379fe20b045ec386cd985f",
+        "size":  34426,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\sync.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tabs.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tabs.exe",
+        "sha256":  "69a684c3bb586b123f96e0e03f4ba4ff765f9ea280c68afd43de0de0b995ff4e",
+        "size":  15872,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tabs.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tac.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tac.exe",
+        "sha256":  "894fb8d6685818676116552ccd01b5ff7dfd72e961dfc9196e73bdbfc9d1addc",
+        "size":  107732,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tac.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tail.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tail.exe",
+        "sha256":  "8608c4138642de6dca0806b266b3009c137dc373171978cf47418056a5e05c55",
+        "size":  56617,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tail.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tar.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tar.exe",
+        "sha256":  "df0582941d1f451a76337863ba1dc8d8986ad0faf44f0e5f5c34afeb43c36453",
+        "size":  511486,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tar.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tee.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tee.exe",
+        "sha256":  "5b956ac9d6bb6d457665709bbcf71326ecd66bb5111b280c124a68405ce5da46",
+        "size":  38794,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tee.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/test.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\test.exe",
+        "sha256":  "bc151f331dbbe8d8558014bc55b983d20effd4ebbea04d2a29b6badf879ce423",
+        "size":  70331,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\test.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tic.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tic.exe",
+        "sha256":  "539b180bc2812fbf2bf0dde23f1f09143fb311616362cf77c552e38d9d467ac9",
+        "size":  81920,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tic.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tig.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tig.exe",
+        "sha256":  "b3e513f9bdddf4d41882a9e0289344b94945f4d2fa1c0a443430503036c2b8eb",
+        "size":  687058,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tig.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/timeout.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\timeout.exe",
+        "sha256":  "01da440d63161065d9522e6d5df96804beb1c1ea1b52e6b925be9510653f41d1",
+        "size":  41752,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\timeout.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/toe.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\toe.exe",
+        "sha256":  "971b25a1ca2f4f6fcc213b573a43bfa317b1de1e97c1a5fe5c50d5e942b60228",
+        "size":  15872,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\toe.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/touch.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\touch.exe",
+        "sha256":  "1d895e0f77cbc8b77c3a38da009e8ad8d23a371afd398da5408bdeffcddf5fc0",
+        "size":  107463,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\touch.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tput.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tput.exe",
+        "sha256":  "ce152c5c1f430bad1112e0e451303a3fdab3c15c1405ff6c02fc0d9348eba5d1",
+        "size":  21504,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tput.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tr.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tr.exe",
+        "sha256":  "7cf90be63820ba9ec66a10c0c4af84f0a2e3ec90a722ea6904219ec0b93bf1c1",
+        "size":  49460,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tr.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/true.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\true.exe",
+        "sha256":  "e3ce235425032cc3e1262f46b414b1b88f971724104916690f24e25c4663d474",
+        "size":  33123,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\true.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/truncate.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\truncate.exe",
+        "sha256":  "d91dfea756b366da4c3000a2d9da2408e0eaf25d7573edfc7efd61c60c87da2a",
+        "size":  39679,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\truncate.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/trust.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\trust.exe",
+        "sha256":  "c036d09e6063deddd8bc56932c486830eefa416492293373d21fefb9328ca074",
+        "size":  227833,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\trust.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tset.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tset.exe",
+        "sha256":  "e110d4ab4c863542124bff0ed1247990a2a7a09fdf884cd8fd822e1c124bfd2b",
+        "size":  20480,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tset.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tsort.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tsort.exe",
+        "sha256":  "d9513d0d97ec9b5eba4356502642ebaaa6d95444a530f1fc82ea3ff150823f65",
+        "size":  48935,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tsort.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tty.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tty.exe",
+        "sha256":  "b76e6139c92d5004b2b07b75687afc25da2838e843012cfca05927e974328e21",
+        "size":  33312,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tty.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/tzset.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\tzset.exe",
+        "sha256":  "c7494f30268d04c3a3727b595391d0cc9942a145931d0855099e43dda8e8de0a",
+        "size":  63971,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\tzset.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/u2d.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\u2d.exe",
+        "sha256":  "eaa9fbc1bba6a4844e6210862262d14594fb48eed9dc1ec428fd1704a88d923d",
+        "size":  54849,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\u2d.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/umount.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\umount.exe",
+        "sha256":  "f6e743f36b8ebe9a8163f3e8682895ba2ab7f8287cee64b6546bb0c01b582351",
+        "size":  24819,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\umount.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/uname.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\uname.exe",
+        "sha256":  "1cba275ff8e0c81f48898f017758c558ee5951cb0448c36628580beffdf4ef89",
+        "size":  35876,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\uname.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/unexpand.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\unexpand.exe",
+        "sha256":  "1952df1ca35316c5fc0721b798325cfc065acad9bb790276a8d0be4a4e5a8dd5",
+        "size":  39225,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\unexpand.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/uniq.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\uniq.exe",
+        "sha256":  "07e78095a79870b52ac988989faa5ff8446e1a8cdc861165d7eb93904fff5211",
+        "size":  45019,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\uniq.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/unix2dos.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\unix2dos.exe",
+        "sha256":  "eaa9fbc1bba6a4844e6210862262d14594fb48eed9dc1ec428fd1704a88d923d",
+        "size":  54849,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\unix2dos.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/unix2mac.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\unix2mac.exe",
+        "sha256":  "eaa9fbc1bba6a4844e6210862262d14594fb48eed9dc1ec428fd1704a88d923d",
+        "size":  54849,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\unix2mac.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/unlink.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\unlink.exe",
+        "sha256":  "b520d67aa204ee5e88548554dc51c1b1dbcdf4c2bfa9f94d682879084167a7a3",
+        "size":  33824,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\unlink.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/unzip.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\unzip.exe",
+        "sha256":  "57aa56a798aacc0638f83e60ecc2ef8598f3c99970303928dbbf0809c424c808",
+        "size":  163884,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\unzip.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/unzipsfx.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\unzipsfx.exe",
+        "sha256":  "07570a95fccfaa5ed2a3bffe9b9d4788fe0eae07a845d9f84c09c9bd74d12e23",
+        "size":  77942,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\unzipsfx.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/users.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\users.exe",
+        "sha256":  "2d0d68763854d37568c9dacd3fbdd0a1b02bb50c83192e39542224bb777e083d",
+        "size":  35078,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\users.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/vdir.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\vdir.exe",
+        "sha256":  "eb95ca4eb646c1684e849b0a77776087fa880197905e5e59192dc439d95f4673",
+        "size":  149479,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\vdir.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/view.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\view.exe",
+        "sha256":  "104f3ffb0014b7eda6d6609cfef76d753cd6119816ea9d56f1332020dc3705c9",
+        "size":  3933752,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\view.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/vim.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\vim.exe",
+        "sha256":  "104f3ffb0014b7eda6d6609cfef76d753cd6119816ea9d56f1332020dc3705c9",
+        "size":  3933752,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\vim.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/vimdiff.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\vimdiff.exe",
+        "sha256":  "104f3ffb0014b7eda6d6609cfef76d753cd6119816ea9d56f1332020dc3705c9",
+        "size":  3933752,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\vimdiff.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/watchgnupg.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\watchgnupg.exe",
+        "sha256":  "d5191eed3ab166ec17c854737ecc19230a42888e66588030e22cccd22b5c921f",
+        "size":  19296,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\watchgnupg.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/wc.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\wc.exe",
+        "sha256":  "3ab05efc4703295f0d36fd48da17f2021219494fb932a062a535ae17ea9f45b3",
+        "size":  47366,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\wc.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/which.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\which.exe",
+        "sha256":  "9065bc8362cecaa1e36648775717ba0c0f3acc22a1eb7363d7a88117a6f95c99",
+        "size":  30999,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\which.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/who.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\who.exe",
+        "sha256":  "b5660ee09997d4e1bbfa48fc2f61761b6a670b4b035246ee21dc5259140a12e6",
+        "size":  70291,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\who.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/whoami.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\whoami.exe",
+        "sha256":  "1a93f1d417aa80d12bae7c0cc37779ee864c148befd8518ab4fadb0b960d23e6",
+        "size":  33887,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\whoami.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/winpty.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\winpty.exe",
+        "sha256":  "1a8e92e0b03f7f83aa344b0dcfd141354b5bdaf6c824edbe872a95ab996d87b6",
+        "size":  185344,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\winpty.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/winpty-agent.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\winpty-agent.exe",
+        "sha256":  "84f6ce4535f7f3e09b2aef7d833b9a99ba675b304576d188a1db349246e41378",
+        "size":  361472,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\winpty-agent.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/winpty-debugserver.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\winpty-debugserver.exe",
+        "sha256":  "dc52844ab79097e30cc30f02760c9f4ced35c309a0580df6f15372da039b3419",
+        "size":  242688,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\winpty-debugserver.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/xargs.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\xargs.exe",
+        "sha256":  "c2fe1b7550b51afbc7527deaa5d72a18e83a56511c56e3fa59d8ed4023f5a716",
+        "size":  81423,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\xargs.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/xxd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\xxd.exe",
+        "sha256":  "18fda0d74a3b8231d0a4f17a8ca25768900a7d3d45e9347154e1b40cb78e1110",
+        "size":  23660,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\xxd.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/yat2m.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\yat2m.exe",
+        "sha256":  "7a7c41c56256d77c03427223ba76f68bf4c86bf081da7af20268e8206af6707b",
+        "size":  38625,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\yat2m.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/yes.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\yes.exe",
+        "sha256":  "d7fafc94aeb84be6a6d7dfb6037677638fa49848b1f750cbb735070428209cbd",
+        "size":  33823,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\yes.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/bin/zipinfo.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\bin\\zipinfo.exe",
+        "sha256":  "1559876bf7e0e828070b66dbdd318383389ce60f37117827e417c567d845fc82",
+        "size":  163884,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\bin\\zipinfo.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/awk/grcat.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\awk\\grcat.exe",
+        "sha256":  "3f0108e3b31e5fa4aae0ecd4e2630a051713a2b9bc7a9cc956ad1346925c133f",
+        "size":  10030,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\awk\\grcat.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/awk/pwcat.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\awk\\pwcat.exe",
+        "sha256":  "35a753eac58a6cd4c038f3921c23624eb934b57133cd265a49c4ab9fbaed4b13",
+        "size":  9998,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\awk\\pwcat.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/gnupg/gpg-auth.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\gpg-auth.exe",
+        "sha256":  "ecf034dfaf89a4af06d2f66bb57ae3b54751a4f2622694b99c74540b97b4a6a8",
+        "size":  101750,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\gpg-auth.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/gnupg/gpg-check-pattern.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\gpg-check-pattern.exe",
+        "sha256":  "b81fb898f3f800def2207d22cfcc760348490bef55460e637151f51ddd6948ae",
+        "size":  88598,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\gpg-check-pattern.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/gnupg/gpg-pair-tool.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\gpg-pair-tool.exe",
+        "sha256":  "577dae2f06e2e6bc99997d74de54e9b70983e2b7d1c998295d1ba0ac65a54b0c",
+        "size":  107840,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\gpg-pair-tool.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/gnupg/gpg-preset-passphrase.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\gpg-preset-passphrase.exe",
+        "sha256":  "ad2a9a614e7c72848ffe3df86644f5ad7273ee9591ee5dbe3f31df8e50b981e3",
+        "size":  66720,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\gpg-preset-passphrase.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/gnupg/gpg-protect-tool.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\gpg-protect-tool.exe",
+        "sha256":  "e5c5b3ba9e6b75c219a87db57cb52e979c9facc3fe364420f8d16725b75a887f",
+        "size":  174255,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\gpg-protect-tool.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/gnupg/keyboxd.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\keyboxd.exe",
+        "sha256":  "4ab55e12355f23639ca6cf81627408566b9249bc603b1025c0d3e6a1cb9f440f",
+        "size":  260180,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\keyboxd.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/gnupg/scdaemon.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\scdaemon.exe",
+        "sha256":  "83ffd54f23bc4301508e63afadfade75fde966b3ec0a6000cfc51be1ecbacbee",
+        "size":  503960,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\gnupg\\scdaemon.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/ssh/sftp-server.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\ssh\\sftp-server.exe",
+        "sha256":  "99d71f743dc4aca48df2fcb3af3f6845e3214b028e8b551638977cf4b0386abb",
+        "size":  147568,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\ssh\\sftp-server.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/ssh/ssh-keysign.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\ssh\\ssh-keysign.exe",
+        "sha256":  "f04151ad455d5592eab9551ec4f101c8b09f4ea197699a75f8a3bf1b59bb82bc",
+        "size":  354959,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\ssh\\ssh-keysign.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/ssh/ssh-pkcs11-helper.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\ssh\\ssh-pkcs11-helper.exe",
+        "sha256":  "3f5822cb7ddd49fb0906d66260a18b587def0a8bf35a88d8407ff3335a2ce635",
+        "size":  247534,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\ssh\\ssh-pkcs11-helper.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/ssh/ssh-sk-helper.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\ssh\\ssh-sk-helper.exe",
+        "sha256":  "b43e66b17bdb672576d40146402774728bbc4f35212364c5e14cee927acb0360",
+        "size":  239254,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\ssh\\ssh-sk-helper.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/lib/tar/rmt.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\lib\\tar\\rmt.exe",
+        "sha256":  "12529ab31728feb60358136cbbe11e67c9a1c8f8c691be16a5587fcaee38f1de",
+        "size":  56237,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\lib\\tar\\rmt.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/libexec/frcode.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\libexec\\frcode.exe",
+        "sha256":  "faffdf692528d5737f6fae5057ed52a006fa181a3e2a7d84a37bff30770febbb",
+        "size":  43335,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\libexec\\frcode.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/libexec/getprocaddr32.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\libexec\\getprocaddr32.exe",
+        "sha256":  "e9668b63e4c02554acb5483723596b2b0f8a30dbc458d6e0473ff3a2b52a27c3",
+        "size":  274459,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\libexec\\getprocaddr32.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/libexec/getprocaddr64.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\libexec\\getprocaddr64.exe",
+        "sha256":  "78ee906d07cb6ad77097d4d2000e7f1ebdcf9bf38f9613bf2f0656d7bedd9fd9",
+        "size":  290931,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\libexec\\getprocaddr64.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/libexec/lessecho.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\libexec\\lessecho.exe",
+        "sha256":  "1e3516b2e29268d9537247cd4de72e7f8c322eeccb65b1661d165d752d8af48b",
+        "size":  12261,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\libexec\\lessecho.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/libexec/p11-kit/p11-kit-remote.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\libexec\\p11-kit\\p11-kit-remote.exe",
+        "sha256":  "8f54bcd3e28059f84c2042d0900c226e0a8c7ba9ff8b0d7c55464770bc15290e",
+        "size":  24131,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\libexec\\p11-kit\\p11-kit-remote.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/git/usr/libexec/p11-kit/p11-kit-server.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\git\\usr\\libexec\\p11-kit\\p11-kit-server.exe",
+        "sha256":  "ed5f15d79e41296fb796ff1e34d933230a966ed4728ea844aeeb6a7b40aadffa",
+        "size":  36783,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\git\\usr\\libexec\\p11-kit\\p11-kit-server.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/node/node.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\node\\node.exe",
+        "sha256":  "0f1098a455c7058daaaccd660d3a71dfed1cc0ffe8bea826170a7807d36fcef2",
+        "size":  85193344,
+        "sig":  "Valid",
+        "sig_subject":  "CN=OpenJS Foundation, O=OpenJS Foundation, L=San Francisco, S=California, C=US",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\node\\node.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/Lib/site-packages/pip/_vendor/distlib/t32.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\t32.exe",
+        "sha256":  "6b4195e640a85ac32eb6f9628822a622057df1e459df7c17a12f97aeabc9415b",
+        "size":  97792,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\t32.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/Lib/site-packages/pip/_vendor/distlib/t64.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\t64.exe",
+        "sha256":  "81a618f21cb87db9076134e70388b6e9cb7c2106739011b6a51772d22cae06b7",
+        "size":  108032,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\t64.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/Lib/site-packages/pip/_vendor/distlib/t64-arm.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\t64-arm.exe",
+        "sha256":  "ebc4c06b7d95e74e315419ee7e88e1d0f71e9e9477538c00a93a9ff8c66a6cfc",
+        "size":  182784,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\t64-arm.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/Lib/site-packages/pip/_vendor/distlib/w32.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\w32.exe",
+        "sha256":  "47872cc77f8e18cf642f868f23340a468e537e64521d9a3a416c8b84384d064b",
+        "size":  91648,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\w32.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/Lib/site-packages/pip/_vendor/distlib/w64.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\w64.exe",
+        "sha256":  "7a319ffaba23a017d7b1e18ba726ba6c54c53d6446db55f92af53c279894f8ad",
+        "size":  101888,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\w64.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/Lib/site-packages/pip/_vendor/distlib/w64-arm.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\w64-arm.exe",
+        "sha256":  "c5dc9884a8f458371550e09bd396e5418bf375820a31b9899f6499bf391c7b2e",
+        "size":  168448,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\Lib\\site-packages\\pip\\_vendor\\distlib\\w64-arm.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/python.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\python.exe",
+        "sha256":  "4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a",
+        "size":  104952,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Python Software Foundation, O=Python Software Foundation, L=Beaverton, S=Oregon, C=US",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\python.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/python3.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\python3.exe",
+        "sha256":  "4d6f5f81a4bca11191c4c7c6b43632694d0a4ce74e068619d8fdc161d469859a",
+        "size":  104952,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Python Software Foundation, O=Python Software Foundation, L=Beaverton, S=Oregon, C=US",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\python3.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/pythonw.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\pythonw.exe",
+        "sha256":  "d72294fb338bc2fc8896d25a7395a4db466425427e1559e77185d5135a830681",
+        "size":  104304,
+        "sig":  "Valid",
+        "sig_subject":  "CN=Python Software Foundation, O=Python Software Foundation, L=Beaverton, S=Oregon, C=US",
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\pythonw.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/Scripts/pip.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\Scripts\\pip.exe",
+        "sha256":  "7fc3736261ace423f5f5fecf1bacfb767366f6e351e3ed42fe74b5376a707305",
+        "size":  108371,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\Scripts\\pip.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/Scripts/pip3.12.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\Scripts\\pip3.12.exe",
+        "sha256":  "7fc3736261ace423f5f5fecf1bacfb767366f6e351e3ed42fe74b5376a707305",
+        "size":  108371,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\Scripts\\pip3.12.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/Scripts/pip3.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\Scripts\\pip3.exe",
+        "sha256":  "7fc3736261ace423f5f5fecf1bacfb767366f6e351e3ed42fe74b5376a707305",
+        "size":  108371,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\Scripts\\pip3.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/uv.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\uv.exe",
+        "sha256":  "deeaa21aac3e3e40b3fa00788208aa9a319cefbb3c2aa598cf580565a82ebc34",
+        "size":  73969152,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\uv.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/uvw.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\uvw.exe",
+        "sha256":  "9ae74c637e65aad4c82f7124d283daff69ecda659ca7d12c1befdb8a4a9aa0a0",
+        "size":  338432,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\uvw.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/runtime/python/uvx.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\python\\uvx.exe",
+        "sha256":  "70e7349e220bf122d8a28b56b102b9a576dc21c9a9998a2e90ae91018efbce1c",
+        "size":  337920,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\runtime\\python\\uvx.exe"
+    },
+    {
+        "label":  "bundled 0.14.42/uninstall.exe",
+        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\uninstall.exe",
+        "sha256":  "eb456a1bb34f35f8380998256c257a59750ab284f8c7cb6dba559bb59b21b8c4",
+        "size":  168920,
+        "sig":  "NotSigned",
+        "sig_subject":  null,
+        "kind":  "bundled-0.14.42",
+        "needle":  "\\x\\0.14.42\\uninstall.exe"
+    }
+]
