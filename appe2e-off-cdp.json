@@ -1,0 +1,715 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "ui",
+  "port": 9333,
+  "started": "2026-10-05T08:37:17.236Z",
+  "finished": "2026-10-05T08:37:44.342Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "about:blank",
+      "url": "about:blank",
+      "id": "E614FD5F545DE8023008628FF98DDACF"
+    }
+  ],
+  "chosen_target": {
+    "url": "about:blank",
+    "title": "about:blank",
+    "id": "E614FD5F545DE8023008628FF98DDACF"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.43",
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": {
+    "update-progress": "ok",
+    "update-error": "ok",
+    "update-available": "ok",
+    "update-downloaded": "ok",
+    "update-finished": "ok",
+    "update-installing": "ok"
+  },
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": "2026-10-05T08:37:43.996Z",
+  "events": {
+    "total": 8797,
+    "progress_count": 8797,
+    "progress_first": {
+      "polled_at": "2026-10-05T08:37:36.227Z",
+      "ev": {
+        "t": 1791189454494,
+        "n": "update-progress",
+        "p": {
+          "phase": "download"
+        }
+      }
+    },
+    "progress_last": {
+      "polled_at": "2026-10-05T08:37:38.272Z",
+      "ev": {
+        "t": 1791189458086,
+        "n": "update-progress",
+        "p": {
+          "chunk": 8790,
+          "phase": "download",
+          "total": 143202847
+        }
+      }
+    },
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-05T08:37:17.238Z",
+      "name": "start",
+      "argv": "--mode ui --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-off --max-wait-sec 300 --observe-sec 300 --ready-wait-sec 90 --panel-wait-sec 180 --modal-wait-sec 60",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-05T08:37:17.311Z",
+      "name": "targets",
+      "count": 1,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-05T08:37:17.381Z",
+      "name": "connected",
+      "url": "about:blank",
+      "title": "about:blank",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-05T08:37:19.407Z",
+      "name": "attached",
+      "url": "about:blank",
+      "title": "about:blank",
+      "id": "E614FD5F545DE8023008628FF98DDACF"
+    },
+    {
+      "t": "2026-10-05T08:37:19.425Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-05T08:37:19.509Z",
+      "name": "app_version",
+      "value": "0.14.43"
+    },
+    {
+      "t": "2026-10-05T08:37:19.554Z",
+      "name": "ui: wait for the Update button"
+    },
+    {
+      "t": "2026-10-05T08:37:19.647Z",
+      "name": "listeners",
+      "update-progress": "ok",
+      "update-error": "ok",
+      "update-available": "ok",
+      "update-downloaded": "ok",
+      "update-finished": "ok",
+      "update-installing": "ok"
+    },
+    {
+      "t": "2026-10-05T08:37:19.708Z",
+      "name": "ui: click the Update button",
+      "attempt": 1
+    },
+    {
+      "t": "2026-10-05T08:37:19.934Z",
+      "name": "ui: panel open, waiting for the bin patch button",
+      "attempt": 1
+    },
+    {
+      "t": "2026-10-05T08:37:21.005Z",
+      "name": "ui: click the bin patch button",
+      "panel_headline": "설치할 수 있는 업데이트 1건",
+      "attempt": 1
+    },
+    {
+      "t": "2026-10-05T08:37:21.634Z",
+      "name": "ui: confirm window",
+      "title": "새 본체 버전 0.14.99 — 패치 설치",
+      "sac_note": false
+    },
+    {
+      "t": "2026-10-05T08:37:21.776Z",
+      "name": "ui: observing",
+      "observe_ms": 300000,
+      "fallback_invoke": false
+    }
+  ],
+  "errors": [],
+  "ui": {
+    "mode": "ui",
+    "stage": "done",
+    "ready": {
+      "ok": true,
+      "waited_ms": 2,
+      "snapshot": {
+        "t": 1791189439601,
+        "ready": true,
+        "update_button": {
+          "text": "Update …",
+          "badge_text": "…",
+          "badge_hidden": true,
+          "badge_title": ""
+        },
+        "panel": null,
+        "confirm": null,
+        "overlays": [],
+        "toasts": [],
+        "title": "cys — CYSJavis Terminal"
+      }
+    },
+    "clicks": [
+      {
+        "label": "update button",
+        "t": "2026-10-05T08:37:19.726Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 761.9609375,
+          "y": 18.5,
+          "w": 60.703125,
+          "h": 22,
+          "hit": true,
+          "top": "BUTTON#btn-update",
+          "el": "BUTTON#btn-update",
+          "text": "Update …",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      },
+      {
+        "label": "bin patch button",
+        "t": "2026-10-05T08:37:21.038Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 707.4140625,
+          "y": 449.6875,
+          "w": 119.234375,
+          "h": 33,
+          "hit": true,
+          "top": "BUTTON.modal-yes",
+          "el": "BUTTON.modal-yes",
+          "text": "본체 패치 설치",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      },
+      {
+        "label": "confirm install button",
+        "t": "2026-10-05T08:37:21.693Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 691,
+          "y": 461.390625,
+          "w": 60,
+          "h": 33,
+          "hit": true,
+          "top": "BUTTON.modal-yes",
+          "el": "BUTTON.modal-yes",
+          "text": "설치",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      }
+    ],
+    "states": [
+      {
+        "t": "2026-10-05T08:37:19.600Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-05T08:37:19.934Z",
+        "ready": true,
+        "panel_headline": "확인 중…",
+        "panel_buttons": [
+          "닫기",
+          "확인 중… (disabled)"
+        ],
+        "confirm_title": null,
+        "toasts": [],
+        "overlays": 1
+      },
+      {
+        "t": "2026-10-05T08:37:20.953Z",
+        "ready": true,
+        "panel_headline": "설치할 수 있는 업데이트 1건",
+        "panel_buttons": [
+          "닫기",
+          "다시 확인",
+          "본체 패치 설치"
+        ],
+        "confirm_title": null,
+        "toasts": [],
+        "overlays": 1
+      },
+      {
+        "t": "2026-10-05T08:37:21.118Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-05T08:37:21.634Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": "새 본체 버전 0.14.99 — 패치 설치",
+        "toasts": [],
+        "overlays": 1
+      },
+      {
+        "t": "2026-10-05T08:37:21.775Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-05T08:37:26.986Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [
+          "Claude Code CLI가 없습니다"
+        ],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-05T08:37:35.169Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [
+          "Claude Code CLI가 없습니다",
+          "⬇ 업데이트 설치"
+        ],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-05T08:37:36.203Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [
+          "Claude Code CLI가 없습니다",
+          "⬇ 업데이트 설치",
+          "🔄 새 본체 버전"
+        ],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-05T08:37:41.322Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [
+          "Claude Code CLI가 없습니다",
+          "⬇ 업데이트 설치",
+          "🔄 새 본체 버전",
+          "✅ 직원 복귀 완료"
+        ],
+        "overlays": 0
+      },
+      {
+        "t": "2026-10-05T08:37:43.339Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [
+          "Claude Code CLI가 없습니다",
+          "⬇ 업데이트 설치",
+          "✅ 직원 복귀 완료"
+        ],
+        "overlays": 0
+      }
+    ],
+    "shots": [
+      {
+        "name": "ready",
+        "file": "appe2e-off-ui-ready.png",
+        "t": "2026-10-05T08:37:19.628Z",
+        "bytes": 20960
+      },
+      {
+        "name": "panel",
+        "file": "appe2e-off-ui-panel.png",
+        "t": "2026-10-05T08:37:21.005Z",
+        "bytes": 41104
+      },
+      {
+        "name": "confirm",
+        "file": "appe2e-off-ui-confirm.png",
+        "t": "2026-10-05T08:37:21.692Z",
+        "bytes": 44528
+      },
+      {
+        "name": "after-click-2s",
+        "file": "appe2e-off-ui-after-click-2s.png",
+        "t": "2026-10-05T08:37:23.939Z",
+        "bytes": 21360
+      },
+      {
+        "name": "after-click-10s",
+        "file": "appe2e-off-ui-after-click-10s.png",
+        "t": "2026-10-05T08:37:32.114Z",
+        "bytes": 28456
+      }
+    ],
+    "button_flow_complete": true,
+    "fallback_invoke": false,
+    "observe": {
+      "polls": 22,
+      "ms": 22567,
+      "socket_closed": true,
+      "socket_closed_at": "2026-10-05T08:37:43.996Z"
+    },
+    "recorder_installed": "installed",
+    "panel": {
+      "headline": "설치할 수 있는 업데이트 1건",
+      "rows": [
+        {
+          "k": "본체(앱)",
+          "v": "v0.14.43 → v0.14.99 — [본체 패치 설치]로 설치(재시작 후 자동 복원)"
+        },
+        {
+          "k": "팩(지침·스킬)",
+          "v": "설치된 팩 버전 기록(.pack-version)이 없습니다 — 최신 여부를 알 수 없음"
+        }
+      ],
+      "meta": "마지막 확인 오전 01:37",
+      "buttons": [
+        {
+          "text": "닫기",
+          "cls": "modal-no",
+          "disabled": false
+        },
+        {
+          "text": "다시 확인",
+          "cls": "modal-no",
+          "disabled": false
+        },
+        {
+          "text": "본체 패치 설치",
+          "cls": "modal-yes",
+          "disabled": false
+        }
+      ]
+    },
+    "update_button_state": {
+      "text": "Update !",
+      "badge_text": "!",
+      "badge_hidden": false,
+      "badge_title": "새 본체 버전 0.14.99 (Update 버튼으로 패치 설치)"
+    },
+    "confirm": {
+      "title": "새 본체 버전 0.14.99 — 패치 설치",
+      "body": "새 본체(앱) 0.14.99을 패치 방식으로 설치합니다: 다운로드·서명 검증 뒤 설치 프로그램을 실행합니다(이 앱은 닫히고, 설치가 끝나면 다시 시작됩니다). 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)",
+      "buttons": [
+        {
+          "text": "아니오",
+          "cls": "modal-no",
+          "disabled": false
+        },
+        {
+          "text": "설치",
+          "cls": "modal-yes",
+          "disabled": false
+        }
+      ],
+      "sac_note_in_body": false,
+      "seen_at": "2026-10-05T08:37:21.634Z"
+    },
+    "clicked_install_at": "2026-10-05T08:37:21.773Z",
+    "clicked_install_ms": 1791189441774,
+    "install_click": {
+      "label": "confirm install button",
+      "t": "2026-10-05T08:37:21.693Z",
+      "method": "mouse",
+      "ok": true,
+      "find": {
+        "found": true,
+        "x": 691,
+        "y": 461.390625,
+        "w": 60,
+        "h": 33,
+        "hit": true,
+        "top": "BUTTON.modal-yes",
+        "el": "BUTTON.modal-yes",
+        "text": "설치",
+        "disabled": false,
+        "vw": 1028,
+        "vh": 749
+      }
+    },
+    "recorder": {
+      "events": [
+        {
+          "ev": "modal_open",
+          "cls": "modal-overlay",
+          "title": "업데이트",
+          "body": "확인 중…",
+          "buttons": [
+            "닫기",
+            "확인 중…"
+          ],
+          "t": 1791189439928
+        },
+        {
+          "ev": "modal_close",
+          "cls": "modal-overlay",
+          "title": "업데이트",
+          "t": 1791189441116
+        },
+        {
+          "ev": "modal_open",
+          "cls": "modal-overlay confirm-overlay",
+          "title": "새 본체 버전 0.14.99 — 패치 설치",
+          "body": "새 본체(앱) 0.14.99을 패치 방식으로 설치합니다: 다운로드·서명 검증 뒤 설치 프로그램을 실행합니다(이 앱은 닫히고, 설치가 끝나면 다시 시작됩니다). 부서·노드는 재시작 후 자동 복원됩니다(대화 기억 포함). 마지막 미저장분은 손실될 수 있습니다.\n\n지금 설치하시겠습니까? (수동 설치는 홈페이지 www.cysinsight.com)",
+          "buttons": [
+            "아니오",
+            "설치"
+          ],
+          "t": 1791189441252
+        },
+        {
+          "ev": "modal_close",
+          "cls": "modal-overlay confirm-overlay",
+          "title": "새 본체 버전 0.14.99 — 패치 설치",
+          "t": 1791189441771
+        },
+        {
+          "ev": "toast_appear",
+          "name": "Claude Code CLI가 없습니다",
+          "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+          "cls": "toast health",
+          "t": 1791189446041
+        },
+        {
+          "ev": "toast_appear",
+          "name": "⬇ 업데이트 설치",
+          "detail": "다운로드 시작…",
+          "cls": "toast feed",
+          "t": 1791189454495
+        },
+        {
+          "ev": "toast_detail",
+          "name": "⬇ 업데이트 설치",
+          "detail": "다운로드 중 0.0 / 136.6 MB (0%)",
+          "t": 1791189454822
+        },
+        {
+          "ev": "toast_appear",
+          "name": "🔄 새 본체 버전",
+          "detail": "새 본체 0.14.99 — 상단 Update 버튼으로 패치 설치(재시작·자동 복원)",
+          "cls": "toast feed",
+          "t": 1791189455292
+        },
+        {
+          "ev": "toast_detail",
+          "name": "⬇ 업데이트 설치",
+          "detail": "다운로드 중 114.1 / 136.6 MB (83%)",
+          "t": 1791189457324
+        },
+        {
+          "ev": "toast_appear",
+          "name": "👥 직원 복귀 중",
+          "detail": "노드 세션 복원 중… (본부·부서)",
+          "cls": "toast feed",
+          "t": 1791189460573
+        },
+        {
+          "ev": "toast_appear",
+          "name": "✅ 직원 복귀 완료",
+          "detail": "노드 세션 복원 완료 (부서 0).",
+          "cls": "toast watchdog",
+          "t": 1791189460640
+        },
+        {
+          "ev": "toast_gone",
+          "name": "👥 직원 복귀 중",
+          "t": 1791189460640
+        }
+      ],
+      "names": {
+        "Claude Code CLI가 없습니다": {
+          "first": 1791189446041,
+          "last": 1791189460640,
+          "n": 8801,
+          "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+          "cls": "toast health",
+          "shown": true,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "⬇ 업데이트 설치": {
+          "first": 1791189454494,
+          "last": 1791189460640,
+          "n": 8800,
+          "detail": "다운로드 중 136.6 / 136.6 MB (100%)",
+          "cls": "toast feed",
+          "shown": true,
+          "detail_events": 2,
+          "last_detail_event": 1791189457324,
+          "reappears": 0
+        },
+        "🔄 새 본체 버전": {
+          "first": 1791189455292,
+          "last": 1791189460640,
+          "n": 7640,
+          "detail": "새 본체 0.14.99 — 상단 Update 버튼으로 패치 설치(재시작·자동 복원)",
+          "cls": "toast feed",
+          "shown": true,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "👥 직원 복귀 중": {
+          "first": 1791189460573,
+          "last": 1791189460573,
+          "n": 1,
+          "detail": "노드 세션 복원 중… (본부·부서)",
+          "cls": "toast feed",
+          "shown": false,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "✅ 직원 복귀 완료": {
+          "first": 1791189460640,
+          "last": 1791189460640,
+          "n": 1,
+          "detail": "노드 세션 복원 완료 (부서 0).",
+          "cls": "toast watchdog",
+          "shown": true,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        }
+      }
+    },
+    "final_snapshot": {
+      "t": 1791189463340,
+      "ready": true,
+      "update_button": {
+        "text": "Update !",
+        "badge_text": "!",
+        "badge_hidden": false,
+        "badge_title": "새 본체 버전 0.14.99 (Update 버튼으로 패치 설치)"
+      },
+      "panel": null,
+      "confirm": null,
+      "overlays": [],
+      "toasts": [
+        {
+          "cls": "toast health",
+          "name": "Claude Code CLI가 없습니다",
+          "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+        },
+        {
+          "cls": "toast feed",
+          "name": "⬇ 업데이트 설치",
+          "detail": "다운로드 중 136.6 / 136.6 MB (100%)"
+        },
+        {
+          "cls": "toast watchdog",
+          "name": "✅ 직원 복귀 완료",
+          "detail": "노드 세션 복원 완료 (부서 0)."
+        }
+      ],
+      "title": "cys — CYSJavis Terminal"
+    },
+    "blocked_toast_final": false,
+    "blocked_toast": {
+      "found": false
+    }
+  }
+}

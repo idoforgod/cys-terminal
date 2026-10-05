@@ -1,0 +1,13 @@
+ensure-sac-restored Mon 10/05/2026  1:48:08.41 
+
+HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\CI\Policy
+    VerifiedAndReputablePolicyState    REG_DWORD    0x0
+
+value before = [0x0] 
+Operation Successful
+Press Enter to Continue
+CiTool refresh rc = 0 
+
+HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\CI\Policy
+    VerifiedAndReputablePolicyState    REG_DWORD    0x0
+
