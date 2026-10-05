@@ -1,0 +1,56 @@
+# TEAM scene time table (changes only). columns: seconds after the execute click | seconds after the entry click | kind | details (texts verbatim, cut at 400 characters here)
+      ---       --- tabs          count=0 names=[] added=[] removed=[] active=
+      ---       --- root          kind=empty msg="" stage="" idle_btn="" panes=0 role_slots=0 titles=[]
+      ---       --- entry         exists=true visible=false disabled=false text="팀 직접 만들기"
+      ---       --- toggle        exists=true visible=true expanded=false
+      ---       --- daemon_info   daemon: connecting…
+      ---       --- tabs          count=1 names=[non title] added=[non title] removed=[] active=non title
+      ---       --- root          kind=panes msg="" stage="" idle_btn="" panes=1 role_slots=0 titles=[C:\Users\runneradmin\]
+      ---       --- toast_new     [toast feed] 🔄 새 본체 버전 :: 새 본체 0.14.99 — 상단 Update 버튼으로 패치 설치(재시작·자동 복원)
+      ---       --- daemon_info   daemon pid=2612 sock=\\.\pipe\cys
+      ---       --- toast_new     [toast health] Claude Code CLI가 없습니다 :: PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작
+      ---       --- entry         exists=true visible=true disabled=false text="팀 직접 만들기"
+      ---       --- toggle        exists=true visible=true expanded=true
+      --- +    0.6s confirm_open  title="팀 만들기 확인" buttons=[취소|만들기] body="만들 팀: 새 번호 팀 — 예상 이름 dept-1 (만들 때 확정) 자리: 최대 5개 — 부서장 1 + 팀원 최대 4(CSO·워커·검토 2). 부서장 자리가 먼저 뜨고, 팀원 자리는 필요한 프로그램(claude·agy·codex)이 설치돼 있으면 자동으로 채워집니다. 작업 폴더: 홈 폴더(따로 지정하지 않은 경우) 계정: 기본 계정의 팀 전용 설정 폴더를 새로 씁니다 — 처음 한 번 로그인이 필요할 수 있습니다. 본부 대표: CEO 역할로 바뀝니다 (본부 대표가 아직 시작 전이면 나중에 명령 팔레트에서 승인합니다. 팀이 0개가 되면 되돌아갑니다.) [취소]를 누르면 아무것도 만들지 않습니다."
++    0.1s +    0.7s tabs          count=1 names=[non title] added=[] removed=[] active=
++    0.1s +    0.7s tab_sub       non title :: 1 pane · C:\Users\runneradmin\
++    0.1s +    0.7s root          kind=pending msg="팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 0초" stage="" idle_btn="" panes=0 role_slots=0 titles=[]
++    0.1s +    0.7s entry         exists=true visible=true disabled=true text="만드는 중…"
++    0.1s +    0.7s confirm_close title="팀 만들기 확인"
++    1.1s +    1.8s toast_gone    [toast feed] 🔄 새 본체 버전
++    2.1s +    2.8s stage_event   stage=reserve id=dp-6 raw={"id":"dp-6","stage":"reserve"}
++    2.1s +    2.8s root          kind=pending msg="팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 2초" stage="지금: 팀 번호를 잡는 중" idle_btn="" panes=0 role_slots=0 titles=[]
++      5s +    5.7s stage_event   stage=probe id=dp-6 raw={"id":"dp-6","stage":"probe"}
++    5.3s +    5.9s root          kind=pending msg="팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 5초" stage="지금: 이미 켜진 데몬이 있는지 확인하는 중(보통 10~30초 · 느린 컴퓨터는 더 걸립니다)" idle_btn="" panes=0 role_slots=0 titles=[]
++   39.9s +   40.6s stage_event   stage=spawn id=dp-6 raw={"id":"dp-6","stage":"spawn"}
++   40.4s +   41.1s stage_event   stage=wait id=dp-6 raw={"id":"dp-6","stage":"wait"}
++   40.8s +   41.4s root          kind=pending msg="팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 40초" stage="지금: 데몬이 팩을 설치하는 중(파일 수백 개)" idle_btn="" panes=0 role_slots=0 titles=[]
++   52.5s +   53.1s stage_event   stage=up id=dp-6 raw={"id":"dp-6","stage":"up"}
++     53s +   53.6s root          kind=pending msg="팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 52초" stage="지금: 데몬이 켜졌습니다 — 설정을 심는 중" idle_btn="" panes=0 role_slots=0 titles=[]
++   53.8s +   54.5s daemon_event  feed.item.created [feed] kind=ceo-notice title="CEO 승격 보류(부트 필요)" body="부서가 생성되었으나 base master가 아직 부트되지 않았습니다. base에서 '너는 마스터다' 또는 '마스터 시작' 버튼으로 부트를 완료하면 명령 팔레트의 'CEO 승격 진행'으로 승인할 수 있습니다."
++     54s +   54.6s toast_new     [toast feed] ℹ 알림 :: CEO 승격 보류(부트 필요)
++     54s +   54.6s toast_gone    [toast health] Claude Code CLI가 없습니다
++   54.4s +     55s stage_event   stage=seat id=dp-6 raw={"id":"dp-6","stage":"seat"}
++     55s +   55.6s root          kind=pending msg="팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 54초" stage="지금: 부서장 자리를 여는 중" idle_btn="" panes=0 role_slots=0 titles=[]
++   56.2s +   56.8s stage_event   stage=done id=dp-6 raw={"id":"dp-6","stage":"done"}
++     57s +   57.7s tabs          count=2 names=[non title|dept-1] added=[dept-1] removed=[] active=dept-1
++     57s +   57.7s tab_sub       non title :: 1 pane · C:\Users\runneradmin\ · 💤1
++     57s +   57.7s root          kind=panes msg="" stage="" idle_btn="" panes=1 role_slots=0 titles=[…]
++     57s +   57.7s entry         exists=true visible=true disabled=false text="팀 직접 만들기"
++     57s +   57.7s toast_new     [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 미만
++   58.8s +   59.5s root          kind=panes msg="" stage="" idle_btn="" panes=1 role_slots=0 titles=[C:\Users\runneradmin\]
++   61.9s +   62.5s toast_gone    [toast feed] ℹ 알림
++   62.9s +   63.5s tab_sub       dept-1 :: 1 pane · C:\Users\runneradmin\ · 미등록 1
++   66.9s +   67.5s daemon_event  feed.item.created [feed] kind=formation-pending title="부서 팀 편성 대기(CLI 미설치)" body="claude CLI 미설치 — 빈 셸 master 자리는 유지됩니다(팀 없이도 마스터 단독 사용 가능). PowerShell: `irm https://claude.ai/install.ps1 | iex` 로 설치한 뒤 앱 재시작 또는 부서 재기동 시 편성이 이어집니다."
++     67s +   67.6s toast_new     [toast feed] ℹ 알림 :: 부서 팀 편성 대기(CLI 미설치)
++   75.1s +   75.7s toast_gone    [toast feed] ℹ 알림
++  117.5s +  118.2s toast_text    [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분
++  122.6s +  123.2s tab_sub       dept-1 :: 1 pane · C:\Users\runneradmin\ · 💤1 · 미등록 1
++  178.2s +  178.9s toast_text    [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 2분
++    238s +  238.6s toast_new     [toast feed] 팀원 켜기 — 자리가 더 붙지 않습니다 :: 3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 1개 · 경과 3분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요
++    238s +  238.6s toast_gone    [toast feed] 팀원을 켜는 중
++  297.7s +  298.4s toast_gone    [toast feed] 팀원 켜기 — 자리가 더 붙지 않습니다
++  298.7s +  299.4s toast_new     [toast idle] 💤 노드 유휴 :: surface:3 — 304s 무출력
++  305.8s +  306.5s toast_gone    [toast idle] 💤 노드 유휴
++  358.4s +  359.1s toast_new     [toast idle] 💤 노드 유휴 :: surface:1 — 301s 무출력
++  360.7s +  361.3s cc            open=true

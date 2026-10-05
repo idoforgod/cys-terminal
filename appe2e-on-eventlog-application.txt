@@ -1,0 +1,4 @@
+2026-10-05T04:57:18.890Z lvl=4 id=15 prov=SecurityCenter :: Updated Windows Defender status successfully to SECURITY_PRODUCT_STATE_ON.
+2026-10-05T04:54:23.238Z lvl=4 id=15 prov=SecurityCenter :: Updated Windows Defender status successfully to SECURITY_PRODUCT_STATE_ON.
+2026-10-05T04:52:27.305Z lvl=4 id=16384 prov=Microsoft-Windows-Security-SPP :: Successfully scheduled Software Protection service for re-start at 2026-10-12T04:43:27Z. Reason: RulesEngine.
+2026-10-05T04:51:56.911Z lvl=4 id=16394 prov=Microsoft-Windows-Security-SPP :: Offline downlevel migration succeeded.

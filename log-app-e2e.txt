@@ -1,0 +1,31 @@
+2026-10-05T04:51:36.542Z [INFO] === app-e2e start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-05T04:51:36.621Z [INFO] --- step prepare (minutes left 33.6, language mode FullLanguage) ---
+2026-10-05T04:51:44.838Z [INFO] --- step install-off (minutes left 33.5, language mode FullLanguage) ---
+2026-10-05T04:52:49.119Z [INFO] --- step off-run (minutes left 32.4, language mode FullLanguage) ---
+2026-10-05T04:54:23.453Z [INFO] --- step reinstall (minutes left 30.9, language mode FullLanguage) ---
+2026-10-05T04:55:11.559Z [INFO] --- step on-pre (minutes left 30.1, language mode FullLanguage) ---
+2026-10-05T04:55:12.948Z [INFO] --- step checkpoint-pre-sac (minutes left 30, language mode FullLanguage) ---
+2026-10-05T04:55:19.357Z [INFO] checkpoint pre-sac: rc=0 publish-results: 47 files to upload, 1 skipped, out=C:\a\_temp\diag-out
+publish-results: ok -> refs/heads/diag-results/37265052045-1-app-e2e-pre-sac-windows-11-arm (commit 10950a4113f65c05b56114ce3f7802d2e2c24b11), 47 files + manifest
+2026-10-05T04:55:19.371Z [INFO] --- step sac-on (minutes left 29.9, language mode FullLanguage) ---
+2026-10-05T04:55:32.199Z [INFO] --- step on-run (minutes left 29.7, language mode FullLanguage) ---
+2026-10-05T04:57:16.763Z [INFO] --- step restore (minutes left 28, language mode FullLanguage) ---
+2026-10-05T04:57:24.640Z [INFO] --- step cleanup (minutes left 27.8, language mode FullLanguage) ---
+2026-10-05T04:57:28.961Z [INFO] --- step events (minutes left 27.8, language mode FullLanguage) ---
+2026-10-05T04:57:31.719Z [INFO] --- step verdict (minutes left 27.7, language mode FullLanguage) ---
+2026-10-05T04:57:31.759Z [INFO] --- step summary (minutes left 27.7, language mode FullLanguage) ---
+2026-10-05T04:57:31.878Z [INFO] SUMMARY app-e2e on windows-11-arm: run 37261026255, commit a23ee3ee; installer cys_0.14.43_x64-setup.exe (143384126 bytes, sha256 2ebc7e3421a1, signature NotSigned); manifest ok=True version 0.14.99 -> installs 0.14.42, same as the repo copy=True; measurable=True
+2026-10-05T04:57:31.878Z [INFO] SUMMARY OFF: install of 0.14.43 with /S: rc=0 marker=0.14.43 ok=True file version 0.14.43 / product 0.14.43; app started=True CDP ready=True (WebView2 runtime 154.0.4258.37)
+2026-10-05T04:57:31.878Z [INFO] SUMMARY OFF UI flow: button flow complete=True, fallback invoke=False; clicks: update button=mouse; bin patch button=mouse; confirm install button=mouse; confirm window "새 본체 버전 0.14.99 — 패치 설치"; error: 
+2026-10-05T04:57:31.878Z [INFO] SUMMARY OFF result PASS: download dir max 137 MB, installer process=True (C:\Users\RUNNER~1\AppData\Local\Temp\cys-0.14.99-updater-5jX2H2\cys-0.14.99-installer.exe), app exit=True, marker 0.14.43 -> 0.14.42 (target 0.14.42), relaunched=True; the real Update button flow downloaded the installer, started it, the app exited, the version marker changed and the app came back
+2026-10-05T04:57:31.885Z [INFO] SUMMARY SAC on confirmed=True: registry value=1; CiTool VerifiedAndReputableDesktop IsEnforced=True; Defender SmartAppControlState=On; UMCI flag=True
+2026-10-05T04:57:31.885Z [INFO] SUMMARY ON UI flow: button flow complete=True, fallback invoke=False; clicks: update button=mouse; bin patch button=mouse; confirm install button=mouse; confirm window "새 본체 버전 0.14.99 — 패치 설치" names Smart App Control=True; error: 
+2026-10-05T04:57:31.890Z [INFO] SUMMARY ON block result PASS: notification found=True "설치 파일 실행이 차단되었습니다" has 4551=True; app alive 97 s after the click (dead samples 0, CDP socket closed=False); installer process seen=False; temp dirs left=; attempt record present at end=False; marker 0.14.43
+2026-10-05T04:57:31.890Z [INFO] SUMMARY events: 1 CodeIntegrity 3076/3077 event(s) name an -updater- path (blocked processes: \Device\HarddiskVolume4\Users\runneradmin\AppData\Local\cys\cys-app.exe); 2 block event(s) by cys-app.exe
+2026-10-05T04:57:31.890Z [INFO] SUMMARY restore: ok=True; registry value=0; enforced=False; Defender SmartAppControlState=Off; NEG control runs again=True
+2026-10-05T04:57:31.890Z [INFO] SUMMARY VERDICT: PASS - OFF PASS: the real Update button flow downloaded the installer, started it, the app exited, the version marker changed and the app came back; ON PASS: under real SAC the blocked update left the app running, no installer started, the notification named 4551, the temp folder and the attempt record were cleaned up
+2026-10-05T04:57:31.907Z [INFO] --- step team (minutes left 27.7, language mode FullLanguage) ---
+2026-10-05T05:03:57.400Z [INFO] --- step team-report (minutes left 21.3, language mode FullLanguage) ---
+2026-10-05T05:03:57.416Z [INFO] SUMMARY TEAM PASS: the button flow started by clicks, a new team tab stood (waiting screen -> real tab), a new cysd.exe was created after the click and no failure notification was shown | clicks: toggle=mouse entry=mouse confirm=mouse (a DOM click was used: False) | confirm window "팀 만들기 확인" | waiting screen seen=True | new tab=True (57029 ms; tabs 1 -> 2) | failure notifications=0 | new cysd.exe=1
+2026-10-05T05:03:57.416Z [INFO] SUMMARY TEAM observed: stages (event): reserve at 2.1s (2.9s) > probe at 5s (34.9s) > spawn at 39.9s (0.5s) > wait at 40.4s (12.1s) > up at 52.5s (1.9s) > seat at 54.4s (1.8s) > done at 56.2s (0.8s) | tab "dept-1" stood 57 s after the execute click (tabs 1 -> 2) | notices after the tab: 57s [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 미만 | 67s [toast feed] ℹ 알림 :: 부서 팀 편성 대기(CLI 미설치) | 117.5s [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 | 178.2s [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 2분 | 238s [toast feed] 팀원 켜기 — 자리가 더 붙지 않습니다 :: 3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 1개 · 경과 3분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요 | 298.7s [toast idle] 💤 노드 유휴 :: surface:3 — 304s 무출력 | 358.4s [toast idle] 💤 노드 유휴 :: surface:1 — 301s 무출력 | seats at the end: count=1 roles=[master] | alarm ids seen: 2 | bash: bundled (install dir runtime) x28, unknown (no path) x4 | new pipes: cys-dept-dept-1 | python/bash/cys processes seen: 62
+2026-10-05T05:03:57.436Z [INFO] === app-e2e end ===

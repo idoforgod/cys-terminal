@@ -1,0 +1,6 @@
+cmd: C:\Windows\System32\CiTool.exe -r
+rc=0 timedOut=False ms=139 startError= pipes_not_drained=False
+--- stdout ---
+Operation Successful
+Press Enter to Continue
+
