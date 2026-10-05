@@ -1,0 +1,12 @@
+# daemon watch start 2026-10-05T08:38:50.606Z (every 5 s until the page observer ends, at most 240 s)
+[   0s 2026-10-05T08:38:50.770Z] cysd=[pid 10820 (parent 5092, created 2026-10-05T08:38:49.320Z, image cysd.exe v0.14.43)] app=[cys-app.exe#5092] pipes=[cys] stamp=0.14.42 pending-restore=True pack=0.14.43 pack.prev=True staging=[.pack-staging-init-5332,.pack-staging-init-8516]
+[   5s 2026-10-05T08:38:55.900Z] cysd=[pid 10820 (parent 5092, created 2026-10-05T08:38:49.320Z, image cysd.exe v0.14.43)] app=[cys-app.exe#5092] pipes=[cys] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[]
+[  10s 2026-10-05T08:39:01.074Z] cysd=[pid 10820 (parent 5092, created 2026-10-05T08:38:49.320Z, image cysd.exe v0.14.43)] app=[cys-app.exe#5092] pipes=[cys] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[]
+[  16s 2026-10-05T08:39:06.222Z] cysd=[pid 10820 (parent 5092, created 2026-10-05T08:38:49.320Z, image cysd.exe v0.14.43)] app=[cys-app.exe#5092] pipes=[cys] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[]
+[  21s 2026-10-05T08:39:11.382Z] cysd=[pid 10820 (parent 5092, created 2026-10-05T08:38:49.320Z, image cysd.exe v0.14.43)] app=[cys-app.exe#5092] pipes=[cys] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[]
+[  26s 2026-10-05T08:39:16.508Z] cysd=[pid 10820 (parent 5092, created 2026-10-05T08:38:49.320Z, image cysd.exe v0.14.43)] app=[cys-app.exe#5092] pipes=[cys] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[]
+[  31s 2026-10-05T08:39:21.645Z] cysd=[pid 10820 (parent 5092, created 2026-10-05T08:38:49.320Z, image cysd.exe v0.14.43)] app=[cys-app.exe#5092] pipes=[cys] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[]
+[  36s 2026-10-05T08:39:26.800Z] cysd=[pid 10820 (parent 5092, created 2026-10-05T08:38:49.320Z, image cysd.exe v0.14.43)] app=[cys-app.exe#5092] pipes=[cys] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[]
+[  41s 2026-10-05T08:39:31.946Z] cysd=[pid 10820 (parent 5092, created 2026-10-05T08:38:49.320Z, image cysd.exe v0.14.43)] app=[cys-app.exe#5092] pipes=[cys] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[]
+[  46s 2026-10-05T08:39:37.100Z] cysd=[pid 10820 (parent 5092, created 2026-10-05T08:38:49.320Z, image cysd.exe v0.14.43)] app=[cys-app.exe#5092] pipes=[cys] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[]
+# end: the page observer ended
