@@ -158,13 +158,29 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
    - 증명하지 않는 것: 링크·NSIS 번들·런타임 — 그건 `windows-build`·`release` 레인(윈도우 실기) 몫이다.
    - 사전: `rustup target add x86_64-pc-windows-msvc` (스크립트는 자동 설치하지 않고 rc=2 로 알린다).
    - 같은 스크립트가 `ci-branch.yml` 의 macOS 잡에서도 돈다(실패 = 잡 실패) — 아래 3번이 그 결과를 태그 조건으로 묶는다.
-3. **★같은 SHA 의 브랜치 CI 초록** — `python3 scripts/pre-tag-ci-check.py --wait 30`
-   - 태그할 SHA(기본 HEAD)에서 `ci-branch` 와 `windows-build (feasibility)` 가 **둘 다 success** 여야 한다.
+3. **★같은 SHA 의 브랜치 CI 초록** — `python3 scripts/pre-tag-ci-check.py --wait 60`
+   - 태그할 SHA(기본 HEAD)에서 필수 워크플로 **셋** — `ci-branch` · `windows-build (feasibility)` · `windows-health (H-WIN 실기)` —
+     이 **모두 success** 여야 한다(0.14.43 부터 `windows-health` 포함 — 태그 레인의 `windows-health-gate` 가 같은 SHA 의
+     windows-health 완주 런을 요구하므로, 이 워크플로를 안 보면 4종이 rc=0 이어도 태그 레인이 죽는다).
      진행 중·런 없음·실패·취소는 전부 rc=1(태그 금지), 네트워크·API 한도는 rc=2(판정 불가 — 통과 아님).
    - **gh 불필요**: 공개 저장소의 Actions 런·잡 목록은 인증 없이 조회된다(익명 한도 시간당 60회).
      `--wait N` 은 진행 중인 런을 60초 간격으로 최대 N분 기다리고, 실패한 런은 잡·스텝·annotation 을 보여 준다.
-   - 순서: 브랜치를 먼저 push → 두 워크플로가 끝날 때까지(약 15~20분) 기다림 → 이 점검 rc=0 → 그다음에 태그.
-     **58초 태그 금지** — 태그 레인은 브랜치 CI 결과를 기다려 주지 않는다.
+     `ci-branch` 의 macOS 데몬 시험 단계가 붉으면 annotation 첫 줄이 `failed=N — <실패한 시험 이름…>` 이다(이름순 최대 20개 ·
+     이 도구는 앞 200자를 보인다). `rc=<코드> 인데 'test result' 요약이 없다` 또는 `rc=<코드> 인데 failed=0 이다` 로 시작하면
+     개별 시험 실패가 아니라 컴파일 실패·하네스 이상이다.
+   - **성공한 런도 눈으로 확인한다**(0.14.43): 이 도구는 success 인 런의 failure·warning annotation 제목을 요약해 보여 준다
+     (`주의: 성공(success)한 런이지만 failure·warning annotation 이 있다 …` — 종료 코드는 바뀌지 않는다). `windows-health` 의
+     데몬 전량 시험과 hwmon 전용 단계는 비차단(`continue-on-error`)이라 실패·절단도 런 결론이 success 다 — 그 사실은 이 요약에만
+     보인다(아래 체크리스트 「Windows 데몬 단위 검체의 상태」).
+   - 알려진 차이: 태그 레인은 같은 SHA 의 완주 런 **전부**가 success 여야 하지만 이 점검은 워크플로마다 **가장 최근 런**만 본다 —
+     같은 SHA 에 `windows-health` 런이 둘 이상(별도 dispatch)이고 옛 런이 붉으면 여기서는 초록·태그 레인에서는 적색이다
+     (같은 런의 재실행은 해당 없음 · 스크립트 머리 주석).
+   - 순서: 브랜치를 먼저 push → 세 워크플로가 끝날 때까지(약 45분 — `ci-branch` 런이 실측 42~45분이다) 기다림 → 이 점검 rc=0 →
+     그다음에 태그. **58초 태그 금지** — 태그 레인은 브랜치 CI 결과를 기다려 주지 않는다.
+   - `windows-health` 잡에는 0.14.43 부터 화면 검체 `cd ui && bun test` 가 **차단** 단계로 들어 있다(Windows 에서의 첫 실행이
+     태그가 되지 않게 — 붉으면 `windows-health` 가 붉고 태그 레인이 막힌다). 잡 시간은 평상 약 14.5분이고, 데몬 전량 단계가
+     다시 30분 상한까지 멈추는 이론 최악이 44.3분으로 태그 레인 게이트의 45분 안이다(스텝·상한을 더하면 `windows-health.yml`
+     의 시간 표를 다시 계산한다).
 4. **★팩 콘텐츠 발행 hard-gate** — `bash scripts/scan-pack-secrets.sh` (rc=0 = `OK`).
    - 증명하는 것: git-추적 `cysjavis-pack` 전 트리에 개인 홈경로(`/Users/<실유저>`·`/home/<user>`)·이메일·
      키/토큰 형태의 문자열이 **없다**. 그 트리는 build.rs 가 `cys` 바이너리에 통째로 임베드하고
@@ -403,9 +419,10 @@ bash scripts/check-no-ioreport-link.sh <cysd 바이너리 경로>
   돌린다(`cargo build --bin cysd` 로 만든 `target/debug/cysd`) — 릴리스 레그는 최종 백스톱이다.
 - **판정**: `otool -L` 출력의 의존 라이브러리 줄(탭 들여쓰기 — 첫 줄과 fat 바이너리의 `(architecture …):` 머리는 제외)에
   `IOReport`(대소문자 무시)가 있으면 exit 1 이고, 그 줄을 출력하므로 어느 라이브러리가 들어왔는지 로그에서 바로 보인다.
-- **exit 2 는 통과가 아니다** — 인자 누락·파일 없음·`otool` 실패·의존 라이브러리 줄 0건(Mach-O 가 아니거나 출력 형식이 바뀜)
-  같은 측정 불능은 PASS 로 세지 않고 잡을 붉힌다. 어떤 상황이 exit 2 인지의 전체 목록(맥에서 `otool` 이 없을 때의 처리
-  포함)은 스크립트 머리 주석의 '종료' 항이 정본이다.
+- **exit 2 는 통과가 아니다** — 인자 누락 · 파일 없음 · **macOS 인데 `otool` 이 없음**(건너뜀이 아니다 — 재지 못한 것이다) ·
+  `otool` 실패 · 의존 라이브러리 줄 0건(Mach-O 가 아니거나 출력 형식이 바뀜)은 측정 불능이라 PASS 로 세지 않고 잡을 붉힌다.
+  건너뜀(exit 0)은 macOS 가 아닌 러너뿐이다. 세 갈래(0/1/2)는 음성 대조 검체 `scripts/tests/test_check_no_ioreport_link.py`
+  (12건 — 브랜치 CI 의 macOS 레인이 매 push 돌린다)가 잰다. 전체 목록의 정본은 스크립트 머리 주석의 '종료' 항이다.
 - **보지 못하는 것**: 로드 명령(`LC_LOAD_DYLIB`·약한/재수출/지연 로드)만 본다 — `dlopen` 으로 런타임에 여는 것은 의도된
   방식이라 나오지 않고, 정적 라이브러리로 섞어 넣는 경우는 대상이 아니다. 이 스크립트는 macOS 에서만 판정한다. 공증된 DMG 의
   데몬이 실제로 NPU 전력을 읽는지는 아래 체크리스트의 별도 행이다.
@@ -530,7 +547,7 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
 - [ ] DMG에서 설치 → 앱 실행 → `cys status` 동작
 - [ ] 버전 문자열 **8곳(수동 6 + `Cargo.lock` 2패키지)** 일치 — `sh scripts/version-check.sh vX.Y.Z` rc=0
 - [ ] **★태그 전 사전 게이트 4종 rc=0 — §0-C** (version-check · `sh scripts/win-typecheck.sh` ·
-      `python3 scripts/pre-tag-ci-check.py --wait 30` = 같은 SHA 의 ci-branch·windows-build success ·
+      `python3 scripts/pre-tag-ci-check.py --wait 60` = 같은 SHA 의 ci-branch·windows-build·windows-health success ·
       `bash scripts/scan-pack-secrets.sh` = 팩 콘텐츠 clean)
       (범프 후 `cargo` 가 lock 을 다시 쓰게 하고 그 결과를
       범프 커밋에 함께 담아라. 손편집 금지 · S23)
@@ -715,12 +732,26 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
             (위 ② 분절), 체인 단절 실조건은 실기 claude 세션에서만 재현된다.
             판정: 종전 rc 6 재현 조건에서 rc 0. PASS 전까지 '실기 미검증' 유지.
 - [ ] **★공증된 DMG 실기 — 상태: 실기 미검증 (0.14.43 E2 · 바이너리 릴리스 발행 뒤)** 공증된 DMG 의 cysd 에서 `control.hw` 의 `npu.status` 가 `ok` 인가(강화 런타임에서 시스템 dylib dlopen — 실패해도 데몬은 뜬다: `unavailable` + `reason`).
-- [ ] **★Windows 데몬 단위 검체의 상태 — 상태: 비차단 · 실패 목록 분류 미완 (0.14.43 · 바이너리 릴리스 발행 전)**
+- [ ] **★Windows 데몬 단위 검체의 상태 — 상태: 비차단 유지 · 처음 완주한 실패 196건 분류·수리 완료 · 시점 의존 검체의 흔들림 남음 · 가족 밖 실패 1건의 원문 미확보 (0.14.43 · 바이너리 릴리스 발행 전)**
       `windows-health.yml` 의 `cargo test --bin cysd` 단계(Windows 실기)는 `continue-on-error: true` 인 **비차단**이다 — 그 단계·잡·런이
       초록이어도 Windows 에서 전 검체가 통과했다는 뜻이 아니다(실패·절단도 conclusion 은 success 로 찍힌다). 발행 전에 바로 뒤의 판독
       스텝(annotation · STEP_SUMMARY)에서 실패 검체 이름 목록을 읽고 원인을 분류한다: 제품 결함 / 검체의 유닉스 가정 / 러너 환경.
-      제품 결함이 하나라도 있으면 릴리스 노트의 알려진 한계에 적고, 직전 런에 없던 새 실패가 생겼는지 대조한다. 이 행의 상태는 그
-      분류가 끝난 뒤에만 갱신한다.
+      제품 결함이 하나라도 있으면 릴리스 노트의 알려진 한계에 적고, 직전 런에 없던 새 실패가 생겼는지 대조한다.
+      **0.14.43 의 경과**(릴리스 노트 §14): 이 단계는 이번 판 이전부터 한 검체에서 멈춘 채 30분 상한에 끊겼고, 그 검체를 건너뛰자 처음
+      완주해 1680 통과 · 196 실패 · 3 무시였다(진단 실행 `37188821194` · 건강성 잡은 1681 · 195 · 3). 196건 분류: 상태 폴더 공유 154 ·
+      경로 구분자 3 · `HOME` 전제 2 · 유닉스 전제 35 · 제품 결함 2건(원인 1 — 승인 서명 · 고침). 수리 뒤(커밋 `2bf75a12`) 같은 명령의
+      세 실행: 진단 `37249118071` **1853 통과 · 0 실패 · 47 무시** / 건강성 잡 `37249110248` 1851 · 2 · 47 / 진단 반복 `37250481491`
+      1852 · 1 · 47. 코드 최종 커밋 `f83c9bf6` 의 건강성 잡 `37253140723` 은 1852 · 1 · 47. 네 실행의 실패 0 · 2 · 1 · 1건은 모두 다른
+      검체다. 앞의 세 실행의 셋은 좌석을 만든 직후 곧바로 배달·판정을 재는 시점 의존 검체다
+      (`b1_gate_delivers_at_prompt_boundary_while_output_streams` · `b1_merge_delivers_same_sender_burst_in_one_turn` ·
+      `j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger`). **넷째 실행의 하나는 그 가족 밖의 첫 사례다** —
+      `schedule::tests::schedule_writers_serialize_under_the_lock_and_no_add_is_lost`(스케줄 파일 잠금 아래 동시 쓰기 검체 ·
+      이번 판이 건드리지 않은 코드). 건강성 잡은 실패한 이름만 남겨 **패닉 메시지를 확보하지 못했다** — 아래 규칙(가족 밖 실패는
+      원문을 본다)의 대상이다. 무시 47 = Windows 전용 사유 44(제출 정착 22 ·
+      Windows 기본 H 마스크 17 · reader EOF 3 · POSIX 셸 2) + 종전부터의 3. **대조할 기대값은 1853 통과 · 0 실패 · 47 무시**이고,
+      위 세 검체 가족 밖에서 실패가 나오면 흔들림으로 넘기지 말고 원문을 본다. 3회 연속 초록에 닿지 못했으므로 차단 승격
+      (`continue-on-error` 제거)은 다음 판이다 — 그때 이 행의 상태를 갱신한다. reader EOF 3건은 Windows 에서 좌석 종료를
+      알지 못하는 한계다(릴리스 노트 §13-9 — 이번 판은 고치지 않았다).
 - [ ] **★Windows 업데이트 시도 기록의 '기준 시각 다시 쓰기' 실기 — 상태: 실기 미검증 (0.14.43 · 릴리스 노트 §13-4 의 '실측하지 못한 것'과 같은 항목)**
       설치 파일이 뜬 직후 `~/.cys/.update-attempt.json` 의 `at` 을 그 시각으로 다시 쓰는 동작(느린 회선에서 받는 시간 때문에 설치기가
       도는 중인데 알림이 일찍 뜨는 일을 줄이려는 것)은 실제 Windows 에서 확인하지 못했다. 실기 판정: Windows 실기에서 [본체 패치 설치] 로

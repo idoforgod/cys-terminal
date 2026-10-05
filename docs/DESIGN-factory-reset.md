@@ -56,7 +56,8 @@ hostinger-ftp.env·license.json)까지 파괴한다.
   depts.json(+.lock), dept-catalog.json(+.lock), dept-missions, dept-snapshots,
   accounts.json, policy.json, profile.json, approvals.json, .approval-secret,
   .master-bootstrapped*, .gui-onboarded, .gui-onboard-attempts, .last-app-version, .pending-restore,
-  ime-debug, allow-app-mouse, url-allow-hosts, harness-creator
+  ime-debug, allow-app-mouse, url-allow-hosts, harness-creator,
+  .update-attempt.json(0.14.43 — 인앱 업데이트 시도 기록 · 기본 격리: 남으면 초기화 뒤 첫 기동이 '업데이트가 설치되지 않았습니다' 를 낼 수 있다)
 - `~/.local/state/`: cys, cys-dept-* (등록·고아 불문. cys-trash 제외 — 격리 목적지)
 - 프로젝트 작업기억: `~/_round`, `${CYS_ROOT:-~/Desktop/CYSjavis}/_round`, 그리고 그
   둘의 `_round/ACTIVE_PROJECT` 가 가리키는 프로젝트의 `_round` — **_round 하위
@@ -67,6 +68,9 @@ hostinger-ftp.env·license.json)까지 파괴한다.
   com.cysjavis.terminal`, `defaults delete com.cysjavis.terminal`(+plist 격리)
 - Windows 층: `%LOCALAPPDATA%\cys`(메인+부서 데몬 상태 — cysd 슬러그 규약),
   `%LOCALAPPDATA%\com.cysjavis.terminal`(WebView2 데이터)
+  - (0.14.43) Windows 는 상태 폴더가 설치 폴더와 같아 상태 파일을 **이름 정확 일치**로만 고른다 — 큐 막힘 사유 파일
+    `queue-blocked.json`·`queue-blocked.prev.json` 을 그 목록에 더했다(macOS·Linux 는 `~/.local/state/cys` 를 폴더째 격리한다).
+  - (0.14.43) 원자 쓰기 임시 잔재 `.queue-blocked.json.tmp` 도 같은 정확 일치로 격리한다(이름이 비슷한 미등록 점 파일은 보존).
 - ★GUI 웹층은 **이연(best_effort) 등급**이다: 실행 중인 자기 앱이 점유하면 Windows 는 rename 이
   항상 실패한다(공유 위반). 이 실패는 `failed`(부분 실패)가 아니라 `deferred` 로 보고하고
   "앱 종료 후 재실행하면 정리됨"을 안내한다 — 맥 정상/윈도 매번 부분실패 비대칭 제거.
