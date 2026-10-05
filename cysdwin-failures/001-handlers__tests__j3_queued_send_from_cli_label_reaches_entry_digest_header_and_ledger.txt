@@ -1,0 +1,15 @@
+test        : handlers::tests::j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger
+sequence    : 1 of 1
+module      : handlers   (full path: handlers::tests)
+text source : log part between "test <name> ... " and the next test line
+panic       : src/bin/cysd/handlers.rs:16480   thread 'handlers::tests::j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger'
+panics      : 1 in this part of the log
+type        : other   (any match: -)
+message     :
+병합 배달
+FAILED
+----------------------------------------------------------------------
+test handlers::tests::j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger ... 
+thread 'handlers::tests::j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger' (20364) panicked at src\bin\cysd\handlers.rs:16480:14:
+병합 배달
+FAILED

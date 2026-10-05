@@ -1,0 +1,22 @@
+{
+ "end": "1791163620",
+ "failed_count": 1,
+ "filter": "",
+ "log_bytes": 195361,
+ "log_path": "D:\\a\\_temp/cysd-win\\cargo.log",
+ "outcomes": [
+  "read-input=success",
+  "checkout-product=success",
+  "cargo=failure"
+ ],
+ "raw": {
+  "cut": false,
+  "note": "195361 bytes, kept whole"
+ },
+ "rc": "101",
+ "ref": "2bf75a12405b438a9bcafb6f398240bc305c192b",
+ "skip": "hwmon::tests::snapshot_has_all_sections attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery",
+ "start": "1791162779",
+ "tool": "cysdwin-digest.py",
+ "version": 1
+}

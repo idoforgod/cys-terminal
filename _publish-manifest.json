@@ -1,0 +1,44 @@
+{
+  "generated": "2026-10-05T01:27:09.064Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37250481491",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37250481491",
+  "job": "cysd-win",
+  "os": "windows-latest",
+  "branch": "diag-results/37250481491-1-cysd-win-windows-latest",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "cysdwin-cargo.log",
+      "bytes": 195361
+    },
+    {
+      "path": "cysdwin-digest.json",
+      "bytes": 609
+    },
+    {
+      "path": "cysdwin-digest.tsv",
+      "bytes": 458
+    },
+    {
+      "path": "cysdwin-env.txt",
+      "bytes": 2372
+    },
+    {
+      "path": "cysdwin-failures/001-handlers__tests__j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger.txt",
+      "bytes": 840
+    },
+    {
+      "path": "cysdwin-meta.json",
+      "bytes": 557
+    },
+    {
+      "path": "cysdwin-summary.txt",
+      "bytes": 3920
+    }
+  ],
+  "skipped": [],
+  "inline_files": 7,
+  "blob_files": 0
+}

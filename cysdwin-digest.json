@@ -1,0 +1,24 @@
+{
+ "by_location": {
+  "src/bin/cysd/handlers.rs:16480": 1
+ },
+ "by_module": {
+  "handlers": 1
+ },
+ "by_type": {
+  "other": 1
+ },
+ "failed": [
+  "handlers::tests::j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger"
+ ],
+ "failed_count": 1,
+ "last_started": "write_stall_tests::write_stall_default_leaves_release_margin",
+ "last_started_ended": true,
+ "rc": "101",
+ "ref": "2bf75a12405b438a9bcafb6f398240bc305c192b",
+ "result_lines": [
+  "test result: FAILED. 1852 passed; 1 failed; 47 ignored; 0 measured; 2 filtered out; finished in 665.81s"
+ ],
+ "tool": "cysdwin-digest.py",
+ "version": 1
+}
