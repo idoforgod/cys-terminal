@@ -387,6 +387,19 @@ jobs:
           #   그 사실의 유일한 채널은 아래 판독 스텝의 annotation 이다(런 결론은 success) — `scripts/pre-tag-ci-check.py` 가 성공한 런의 failure·warning annotation 제목을 요약해 태그 전에 사람 눈에 올린다.
           #   `attach_race_tests::process_and_send_…` 의 skip 은 그대로 둔다 — 그 검체가 윈도우에서 멈추는 **원인은 여전히 미조사**다(skip 은 뒤 검체의 가시화이지 삭제가 아니다 · 맥 레인 ci-branch·release 에서는 그대로 돈다).
           #   멈춤이 다시 나오면(= 판독 스텝의 '절단') 같은 방식으로 한 건씩 드러낸다 — 시간 예산은 아래 hwmon 스텝 머리 주석의 표(전량 스텝이 다시 30분 상한에 닿는 최악 포함)가 정본이다. 30분 상한·비차단은 그대로다.
+          # ★(R2F-DM · 성찰 2회차 수리 뒤 재측정 · 2026-10-05) **위 문단의 '195건이 붉다'는 bd0a0ca3 시점의 사실이다 — 196건의 분류와 수리가 끝났다.**
+          #   분류(6차 진단 런의 196건): 상태 폴더 공유 154 · 경로 구분자 3 · `HOME` 전제 2 · 유닉스 전제 35 · 제품 결함 2(원인 1건 — 승인 서명이 JSON 저장 뒤 깨짐 · 윈도우 100ns 시계).
+          #   수리: 시험 빌드 전용 `state_dir` 분기(제품 식 불변) · 승인 시각 양자화와 데몬 시각 원천의 마이크로초 통일 · 인계 표식 순번 · 윈도우에서 뜻이 없는 검체 44건은 `ignore`+사유
+          #   (집합 핀 `r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_44` — 새 `ignore` 는 그 목록을 고쳐야 붉지 않다).
+          #   재측정(같은 명령): 커밋 5c4b2ac2 = 진단 37201047193 `1835 통과 · 15 실패 · 44 무시` / 이 스텝 37201027633 `1841 · 9 · 44`
+          #     → 커밋 2bf75a12 = 진단 37249118071 **`1853 통과 · 0 실패 · 47 무시`** / 이 스텝 37249110248 `1851 · 2 · 47` / 진단 반복 37250481491 `1852 · 1 · 47`.
+          #   **남은 것 = 시점 의존 검체 가족의 흔들림.** 2bf75a12 의 세 실행에서 실패가 0 · 2 · 1 건이고 매번 다른 검체다(`b1_gate_delivers_at_prompt_boundary_while_output_streams` ·
+          #   `b1_merge_delivers_same_sender_burst_in_one_turn` · `j3_queued_send_from_cli_label_reaches_entry_digest_header_and_ledger`). 셋 다 좌석을 만든 직후 화면을 그리거나 큐를 넣고 곧바로 배달·판정을 재는 꼴이다 —
+          #   그 사이에 좌석 출력(윈도우 ConPTY 의 기동 출력으로 본다)이 끼면 제품이 옳게도 '출력 중'으로 보류해 붉어진다. 같은 꼴로 붉었던 4건은 검체를 결정론으로 고쳤고(`state::test_until_no_pty_output` — 그 뒤 세 실행 모두 통과)
+          #   나머지는 손대지 않았다 → **'3회 연속 초록'에 닿지 못했으므로 차단 승격은 아직 하지 않는다**(비차단 유지 · 사실의 채널은 여전히 아래 판독 annotation 과 `scripts/pre-tag-ci-check.py` 의 요약이다).
+          #   승격의 남은 일 = 그 가족의 좌석 픽스처가 조용한 관측 창을 보장하게 하는 것(다음 판 · 검체 수십 건). 이 스텝의 실패가 **그 가족 밖**에서 나오면 흔들림으로 넘기지 말고 원문을 보라.
+          #   `attach_race_tests::process_and_send_…` 가 멈추는 원인의 후보도 생겼다: 그 검체의 관측자 루프는 좌석의 종료 래치(`exited`)를 상한 없이 기다리는데, 이 러너에서는 좌석 프로세스가 끝나거나 죽어도 reader 가
+          #   EOF 를 보지 못했다(같은 뿌리의 검체 3건 — 10~15초 대기 · 두 실행 모두 · 지금은 `ignore`+사유). 인과는 코드로 읽은 것이고 따로 실험하지 않았다 — skip 은 그대로 둔다.
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections --skip attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery 2>&1 | tee "$LOG"
           rc="${PIPESTATUS[0]}"
           echo "$rc" > "$CYSD_DIR/rc"
