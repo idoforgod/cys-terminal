@@ -5,7 +5,7 @@
 // RFC 6455 over node:http upgrade, NO extensions offered) because Node's global WebSocket (undici) offers
 // 'permessage-deflate' and Chromium's DevTools server would accept it. The global WebSocket stays as a fallback.
 //
-//   node cdp-update.mjs --port 9333 --out <dir> [--prefix e2e] [--mode update|version|attach|ui|uipre] [--max-wait-sec 720] [--ws mini|native]
+//   node cdp-update.mjs --port 9333 --out <dir> [--prefix e2e] [--mode update|version|attach|ui|uipre|uiteam|uiobs] [--max-wait-sec 720] [--ws mini|native]
 //   mode update (default): attach, app version, screenshot, check_update, listeners, install_update {force:true}
 //   mode version:          attach and read the app version only (<prefix>-cdp-after.json)
 //   mode attach:           attach, app version, screenshot, check_update - and STOP (install_update is NOT called);
@@ -14,6 +14,8 @@
 //                          used by app-e2e.ps1 (uipre = attach + wait for the UI, no click)
 //   mode uiteam:           the "create a team directly" flow of the real UI (scene TEAM of app-e2e.ps1), see the block "5th task" below;
 //                          nothing is invoked instead of a click (no fallback call)
+//   mode uiobs:            OBSERVE ONLY (scene UPGRADE of app-upgrade.ps1), see the block "7th task" below: the status bar, the version-skew
+//                          badge, the toasts and the product's read-only daemon_status call, polled for --obs-sec; nothing is clicked
 //
 // Success path of install_update = the app exits by itself, so the socket closing is an expected result.
 // The result file <out>/<prefix>-cdp.json is rewritten after every step so partial results survive any kill.
@@ -2296,6 +2298,404 @@ async function runTeamMode() {
 }
 
 // ---------------------------------------------------------------------------
+// 7th task (diag/app-upgrade.ps1, scene UPGRADE): mode uiobs = OBSERVE ONLY. Nothing is clicked, nothing that changes state is invoked.
+//   uiobs   attach, then every --obs-interval-sec (default 5) for --obs-sec (default 150; 0 = exactly one poll): the status bar text
+//           (#daemon-info), the version-skew badge inside it (.ver-skew-badge: presence, text, title), every toast (class, title, body),
+//           open windows - and the product's own READ-ONLY calls invoke('daemon_status') and invoke('app_version'). The mode ends early
+//           when the daemon reports --obs-expect-daemon in two polls in a row.
+// Why daemon_status and not the status bar: #daemon-info only shows "daemon pid=<pid> sock=<path>" - ui/src/main.ts start():
+//   info.textContent = `daemon pid=${status.daemon_pid} sock=${status.socket_path}` - written once in start() (the only other writes are
+//   error / "blocked" texts). It carries no version, and no code path rewrites it after a daemon rotation. The daemon version that the UI
+//   itself compares with the app version is daemon_status().version (detectSkew(); daemon_status = RPC system.identify -> socket_path,
+//   daemon_pid, version, started_at, surface_count: a pure read). checkVersionSkew() runs once at start and every 5 minutes: with no
+//   session to keep it rotates the daemon by itself, else it appends the badge (its text names both versions) to #daemon-info and
+//   shows one notice toast.
+// Files: <prefix>-cdp.json (everything, R.obs), <prefix>-obs-facts.json (small, rewritten after every poll: what the PowerShell side
+// reads), <prefix>-obs-timeline.txt (one line per poll), <prefix>-ui-obs-start.png / <prefix>-ui-obs-end.png.
+// Options: --obs-sec 150 --obs-interval-sec 5 --obs-expect-daemon <version> (the readiness wait is --ready-wait-sec capped at 30 s).
+// Selectors follow the product UI (ui/index.html + ui/src/main.ts, the same in 0.14.42 and 0.14.43): #daemon-info, .ver-skew-badge
+// (showSkewBadge), #toasts > .toast (.toast-name .toast-detail), .modal-overlay, #btn-update, #ws-tabs .ws-tab, #root .pane.
+// ---------------------------------------------------------------------------
+const OBS_MS = Math.max(0, teamNum(args['obs-sec'], 150)) * 1000;
+const OBS_INTERVAL_MS = Math.max(1, teamNum(args['obs-interval-sec'], 5)) * 1000;
+const OBS_EXPECT = args['obs-expect-daemon'] === undefined || args['obs-expect-daemon'] === true ? '' : String(args['obs-expect-daemon']);
+const OBS_READY_MS = Math.min(UI_READY_MS, 30000);
+const OBS_TICKS_MAX = 240;
+const K_OBS = {
+  notice_title: '\uC0C8 \uBC84\uC804 \uC900\uBE44', // title of the one-time notice toast of checkVersionSkew() ("new version ready")
+};
+
+// ==== OBS-PURE-BEGIN (self-contained: nothing in this block may use anything defined outside it; the local self-check evaluates exactly this text) ====
+function obsNewState(expect) {
+  return {
+    expect: expect || '',
+    polls: 0,
+    daemon_ok: 0,
+    daemon_fail: 0,
+    last_error: null,
+    version_first: null,
+    version_last: null,
+    versions: [],
+    pid_first: null,
+    pid_last: null,
+    pids: [],
+    started_first: null,
+    started_last: null,
+    surface_count_last: null,
+    reached_at: null,
+    reached_el_ms: null,
+    reached_streak: 0,
+    badge_seen: false,
+    badge_first_at: null,
+    badge_first_el_ms: null,
+    badge_polls: 0,
+    badge_last_present: false,
+    badge_text: '',
+    badge_title: '',
+    notice_seen: false,
+    notice_detail: '',
+    info_first: null,
+    info_last: null,
+    app_version_cmd: null,
+    toasts: [], // every distinct toast (class + title) that was on the screen in a poll
+  };
+}
+
+// one poll { at, el_ms, snap, daemon } -> the running state
+function obsNote(F, tick, noticeTitle) {
+  F.polls++;
+  const d = tick && tick.daemon ? tick.daemon : null;
+  if (d && d.ok === true) {
+    F.daemon_ok++;
+    const v = d.version === undefined || d.version === null ? null : String(d.version);
+    if (v !== null) {
+      if (F.version_first === null) F.version_first = v;
+      F.version_last = v;
+      if (F.versions.indexOf(v) < 0) F.versions.push(v);
+    }
+    if (d.daemon_pid !== undefined && d.daemon_pid !== null) {
+      if (F.pid_first === null) F.pid_first = d.daemon_pid;
+      F.pid_last = d.daemon_pid;
+      if (F.pids.indexOf(d.daemon_pid) < 0) F.pids.push(d.daemon_pid);
+    }
+    if (d.started_at !== undefined && d.started_at !== null) {
+      if (F.started_first === null) F.started_first = d.started_at;
+      F.started_last = d.started_at;
+    }
+    if (d.surface_count !== undefined && d.surface_count !== null) F.surface_count_last = d.surface_count;
+    if (d.app_version_cmd) F.app_version_cmd = String(d.app_version_cmd);
+    if (F.expect && v === F.expect) {
+      F.reached_streak++;
+      if (F.reached_at === null) {
+        F.reached_at = tick.at;
+        F.reached_el_ms = tick.el_ms;
+      }
+    } else {
+      F.reached_streak = 0;
+    }
+  } else {
+    F.daemon_fail++;
+    F.reached_streak = 0;
+    F.last_error = d && d.error ? String(d.error) : 'no daemon_status result';
+  }
+  const s = tick && tick.snap ? tick.snap : null;
+  if (s) {
+    if (s.daemon_info_present) {
+      const own = String(s.daemon_info_own || s.daemon_info || '');
+      if (F.info_first === null) F.info_first = own;
+      F.info_last = own;
+    }
+    const b = s.badge || {};
+    F.badge_last_present = b.present === true;
+    if (b.present === true) {
+      F.badge_polls++;
+      if (!F.badge_seen) {
+        F.badge_seen = true;
+        F.badge_first_at = tick.at;
+        F.badge_first_el_ms = tick.el_ms;
+      }
+      F.badge_text = String(b.text || '');
+      F.badge_title = String(b.title || '');
+    }
+    const ts = Array.isArray(s.toasts) ? s.toasts : [];
+    for (let i = 0; i < ts.length; i++) {
+      const t = ts[i] || {};
+      const name = String(t.name || '');
+      const detail = String(t.detail || '');
+      const cls = String(t.cls || '');
+      let rec = null;
+      for (let k = 0; k < F.toasts.length; k++) {
+        if (F.toasts[k].name === name && F.toasts[k].cls === cls) {
+          rec = F.toasts[k];
+          break;
+        }
+      }
+      if (!rec && F.toasts.length < 60) {
+        rec = { cls: cls, name: name, detail: detail, first_el_ms: tick.el_ms, last_el_ms: tick.el_ms, polls: 0 };
+        F.toasts.push(rec);
+      }
+      if (rec) {
+        rec.polls++;
+        rec.last_el_ms = tick.el_ms;
+        rec.detail = detail;
+      }
+      if (noticeTitle && name.indexOf(noticeTitle) >= 0) {
+        F.notice_seen = true;
+        F.notice_detail = detail;
+      }
+    }
+  }
+  return F;
+}
+
+// the small result the PowerShell side reads (fixed key names only: Windows PowerShell 5.1 cannot read arbitrary texts as JSON keys)
+function obsFacts(F) {
+  const hasToken = function (cls, token) {
+    return (' ' + String(cls || '') + ' ').indexOf(' ' + token + ' ') >= 0;
+  };
+  return {
+    polls: F.polls,
+    daemon_reads_ok: F.daemon_ok,
+    daemon_reads_failed: F.daemon_fail,
+    daemon_last_error: F.last_error,
+    expect_daemon: F.expect || null,
+    daemon_version_first: F.version_first,
+    daemon_version_last: F.version_last,
+    daemon_versions_seen: F.versions.slice(),
+    daemon_pid_first: F.pid_first,
+    daemon_pid_last: F.pid_last,
+    daemon_pids_seen: F.pids.slice(),
+    daemon_started_at_first: F.started_first,
+    daemon_started_at_last: F.started_last,
+    daemon_surface_count_last: F.surface_count_last,
+    daemon_changed: F.pids.length > 1 || F.versions.length > 1,
+    daemon_reached_expect: F.expect ? F.version_last === F.expect : null,
+    daemon_reached_expect_at: F.reached_at,
+    daemon_reached_expect_el_ms: F.reached_el_ms,
+    skew_badge_seen: F.badge_seen,
+    skew_badge_first_at: F.badge_first_at,
+    skew_badge_first_el_ms: F.badge_first_el_ms,
+    skew_badge_polls: F.badge_polls,
+    skew_badge_present_at_end: F.badge_last_present,
+    skew_badge_text: F.badge_text,
+    skew_badge_title: F.badge_title,
+    skew_notice_seen: F.notice_seen,
+    skew_notice_detail: F.notice_detail,
+    daemon_info_first: F.info_first,
+    daemon_info_last: F.info_last,
+    app_version_cmd: F.app_version_cmd,
+    toasts_seen: F.toasts.map(function (t) {
+      return { cls: t.cls, name: t.name, detail: t.detail, first_el_ms: t.first_el_ms, last_el_ms: t.last_el_ms, polls: t.polls, failure_like: hasToken(t.cls, 'watchdog') || hasToken(t.cls, 'health') };
+    }),
+  };
+}
+
+// one line of <prefix>-obs-timeline.txt
+function obsLine(tick) {
+  const d = tick && tick.daemon ? tick.daemon : {};
+  const s = tick && tick.snap ? tick.snap : {};
+  const b = s.badge || {};
+  const ts = Array.isArray(s.toasts) ? s.toasts : [];
+  const el = (Math.round((Number(tick && tick.el_ms) || 0) / 100) / 10).toFixed(1);
+  let dm;
+  if (d.ok === true) dm = 'daemon v' + d.version + ' pid=' + d.daemon_pid + ' surfaces=' + d.surface_count + ' started_at=' + d.started_at;
+  else dm = 'daemon_status FAILED: ' + String(d.error || (tick && tick.snap_error) || 'no result').slice(0, 160);
+  return (
+    '[+' + el + 's ' + String(tick && tick.at) + '] ' + dm +
+    ' | status bar: ' + JSON.stringify(s.daemon_info_own === undefined ? null : s.daemon_info_own) +
+    ' | badge: ' + (b.present === true ? JSON.stringify(String(b.text || '')) : 'none') +
+    ' | toasts(' + ts.length + '): ' +
+    ts
+      .map(function (t) {
+        return '[' + String(t.cls || '') + '] ' + String(t.name || '') + ' :: ' + String(t.detail || '').slice(0, 200);
+      })
+      .join(' || ') +
+    ' | windows: ' + (Array.isArray(s.overlays) ? s.overlays.length : 0)
+  );
+}
+// ==== OBS-PURE-END ====
+
+// ==== OBS-PAGE-BEGIN (functions that run INSIDE the page: they are stringified into Runtime.evaluate expressions, so each must be self-contained) ====
+function pageObsSnapshot() {
+  var txt = function (el) {
+    return el && el.textContent ? String(el.textContent).replace(/\s+/g, ' ').trim() : '';
+  };
+  var cut = function (s, n) {
+    var t = String(s === undefined || s === null ? '' : s);
+    return t.length > n ? t.slice(0, n) : t;
+  };
+  var qa = function (s) {
+    return Array.prototype.slice.call(document.querySelectorAll(s));
+  };
+  var info = document.getElementById('daemon-info');
+  var badge = document.querySelector('.ver-skew-badge');
+  // the status bar's own text, without the badge element that the product appends to it
+  var own = '';
+  if (info) {
+    var kids = info.childNodes || [];
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].nodeType === 3) own += String(kids[i].textContent || '');
+    }
+  }
+  var o = { t: Date.now(), title: document.title };
+  o.daemon_info_present = !!info;
+  o.daemon_info = cut(txt(info), 600);
+  o.daemon_info_own = cut(own.replace(/\s+/g, ' ').trim(), 400);
+  o.badge = badge
+    ? { present: true, text: cut(txt(badge), 400), title: cut(badge.title || badge.getAttribute('title') || '', 1000), in_daemon_info: !!(info && info.contains(badge)) }
+    : { present: false, text: '', title: '', in_daemon_info: false };
+  o.toasts = qa('#toasts > *').map(function (e) {
+    return { cls: String(e.className || ''), name: cut(txt(e.querySelector('.toast-name')), 400), detail: cut(txt(e.querySelector('.toast-detail')), 2000) };
+  });
+  o.overlays = qa('.modal-overlay').map(function (e) {
+    return { cls: String(e.className || ''), title: cut(txt(e.querySelector('h3')), 200) };
+  });
+  o.update_button = !!document.getElementById('btn-update');
+  o.tab_count = qa('#ws-tabs .ws-tab').length;
+  o.pane_count = qa('#root .pane').length;
+  return JSON.stringify(o);
+}
+
+// the two read-only calls the product's own detectSkew() / checkVersionSkew() make: daemon_status (RPC system.identify) and app_version
+async function pageObsDaemon() {
+  var o = { t: Date.now(), ok: false, version: null, daemon_pid: null, socket_path: null, started_at: null, surface_count: null, keys: [], error: null, app_version_cmd: null };
+  var es = function (e) {
+    return e && e.message ? e.message : typeof e === 'string' ? e : JSON.stringify(e);
+  };
+  try {
+    var st = await window.__TAURI__.core.invoke('daemon_status');
+    o.ok = true;
+    if (st && typeof st === 'object') {
+      o.keys = Object.keys(st).slice(0, 40);
+      o.version = st.version === undefined || st.version === null ? null : String(st.version);
+      o.daemon_pid = st.daemon_pid === undefined ? null : st.daemon_pid;
+      o.socket_path = st.socket_path === undefined || st.socket_path === null ? null : String(st.socket_path).slice(0, 300);
+      o.started_at = st.started_at === undefined ? null : st.started_at;
+      o.surface_count = st.surface_count === undefined ? null : st.surface_count;
+    }
+  } catch (e) {
+    o.error = String(es(e)).slice(0, 400);
+  }
+  try {
+    o.app_version_cmd = String(await window.__TAURI__.core.invoke('app_version'));
+  } catch (e2) {
+    o.app_version_cmd = null;
+  }
+  return JSON.stringify(o);
+}
+// ==== OBS-PAGE-END ====
+const EXPR_OBS_SNAPSHOT = '(' + pageObsSnapshot.toString() + ')()';
+const EXPR_OBS_DAEMON = '(' + pageObsDaemon.toString() + ')()';
+
+function obsWriteFacts(O, F, partial) {
+  try {
+    const o = {
+      script: 'cdp-update.mjs',
+      mode: MODE,
+      written: iso(),
+      partial: !!partial,
+      attached: R.attached,
+      app_version: R.app_version,
+      ready_ok: O.ready ? O.ready.ok : null,
+      end_reason: O.end_reason,
+      socket_closed: closed,
+      facts: obsFacts(F),
+    };
+    fs.writeFileSync(path.join(OUT, `${PREFIX}-obs-facts.json`), JSON.stringify(o, null, 1));
+  } catch (e) {
+    fail('obs facts', e);
+  }
+}
+
+async function runObsMode() {
+  armWatchdog(OBS_READY_MS + OBS_MS + 4 * 60 * 1000);
+  // R.ui exists so that uiShot() files its screenshots like the other UI modes do (R.ui.shots); this mode makes no click
+  R.ui = { mode: MODE, stage: 'start', ready: null, clicks: [], states: [], shots: [], button_flow_complete: false, fallback_invoke: false, observe: null };
+  const O = (R.obs = { params: { obs_ms: OBS_MS, interval_ms: OBS_INTERVAL_MS, expect_daemon: OBS_EXPECT || null }, started: iso(), ended: null, end_reason: null, ready: null, ticks: [], ticks_dropped: 0, facts: null });
+  const F = obsNewState(OBS_EXPECT);
+  const tl = path.join(OUT, `${PREFIX}-obs-timeline.txt`);
+  const line = (text) => {
+    try {
+      fs.appendFileSync(tl, text + '\n');
+    } catch (e) {
+      // ignore: the same facts are in the JSON files
+    }
+  };
+  line(`# uiobs start ${iso()} obs_sec=${Math.round(OBS_MS / 1000)} interval_sec=${Math.round(OBS_INTERVAL_MS / 1000)} expect_daemon=${OBS_EXPECT || '-'} app_version=${R.app_version}`);
+  step('obs: wait for the status bar (#daemon-info)');
+  const tr = Date.now();
+  let readyOk = false;
+  while (Date.now() - tr < OBS_READY_MS && !closed) {
+    try {
+      const s0 = parseJsonValue(await evalJs(EXPR_OBS_SNAPSHOT, { awaitPromise: false, timeoutMs: 12000 }));
+      if (s0 && s0.ok !== false && s0.daemon_info_present) {
+        readyOk = true;
+        break;
+      }
+    } catch (e) {
+      if (closed) break;
+    }
+    await sleep(500);
+  }
+  O.ready = { ok: readyOk, waited_ms: Date.now() - tr };
+  R.ui.ready = O.ready;
+  if (!closed) await uiShot('obs-start');
+  R.ui.stage = 'observe';
+  const t0 = Date.now();
+  step('obs: observing', { obs_ms: OBS_MS, interval_ms: OBS_INTERVAL_MS, expect_daemon: OBS_EXPECT || null, ready: readyOk });
+  for (;;) {
+    if (closed) {
+      O.end_reason = 'the CDP socket closed (the app exited)';
+      break;
+    }
+    const tick = { at: iso(), el_ms: Date.now() - t0, snap: null, daemon: null };
+    try {
+      const s = parseJsonValue(await evalJs(EXPR_OBS_SNAPSHOT, { awaitPromise: false, timeoutMs: 12000 }));
+      if (s && s.ok !== false) tick.snap = s;
+      else tick.snap_error = s && s.error ? String(s.error) : 'no snapshot';
+    } catch (e) {
+      tick.snap_error = String(e && e.message ? e.message : e);
+    }
+    if (!closed) {
+      try {
+        tick.daemon = parseJsonValue(await evalJs(EXPR_OBS_DAEMON, { timeoutMs: 15000 }));
+      } catch (e) {
+        tick.daemon = { ok: false, error: String(e && e.message ? e.message : e) };
+      }
+    }
+    obsNote(F, tick, K_OBS.notice_title);
+    if (O.ticks.length < OBS_TICKS_MAX) O.ticks.push(tick);
+    else O.ticks_dropped++;
+    line(obsLine(tick));
+    O.facts = obsFacts(F);
+    obsWriteFacts(O, F, true);
+    save();
+    if (closed) {
+      O.end_reason = 'the CDP socket closed (the app exited)';
+      break;
+    }
+    if (OBS_EXPECT && F.reached_streak >= 2) {
+      O.end_reason = 'the daemon reports the expected version ' + OBS_EXPECT + ' (two polls in a row)';
+      break;
+    }
+    const left = OBS_MS - (Date.now() - t0);
+    if (left <= 0) {
+      O.end_reason = 'observation window elapsed (' + Math.round(OBS_MS / 1000) + ' s)';
+      break;
+    }
+    await sleep(Math.max(200, Math.min(OBS_INTERVAL_MS, left)));
+  }
+  O.ended = iso();
+  if (!closed) await uiShot('obs-end');
+  O.facts = obsFacts(F);
+  line('# end: ' + O.end_reason);
+  obsWriteFacts(O, F, false);
+  R.ui.stage = 'done';
+  step('obs: ended', { reason: O.end_reason, polls: F.polls, daemon_version_last: F.version_last, badge_seen: F.badge_seen });
+  save();
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 async function main() {
@@ -2389,6 +2789,10 @@ async function main() {
   }
   if (MODE === 'uiteam') {
     await runTeamMode();
+    return;
+  }
+  if (MODE === 'uiobs') {
+    await runObsMode();
     return;
   }
 

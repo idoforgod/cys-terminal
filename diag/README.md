@@ -14,6 +14,7 @@
 | QF | `ShellExecuteW` 직후 `exit(0)` 가 설치기 기동을 놓치는가 (40회 반복) | `replica.json` · `replica-summary.txt` |
 | QG (2차) | **진짜 SAC 를 켠 채로** 전체 재현: 켠 뒤 설치기·앱 exe·설치된 exe 가 무엇이 막히는가, 이미 떠 있던 앱의 `install_update` 는 어떻게 되는가(A), 설치된 앱을 새로 띄우면(B) | `sacreal-summary.txt`(10줄) · `sacreal-matrix.txt`(+`.json`) · `sacreal-e2e-A-verdict.json` · `sacreal-e2e-B.json` |
 | QI (4차) | **0.14.43 앱 전체**를 윈도우에서 **진짜 Update 버튼 클릭**으로 갱신: 꺼짐(성공 경로: 내려받기 → 설치 파일 기동 → 앱 종료 → 설치 → 재실행) · 진짜 SAC 켬(차단 경로: 앱이 살아 있고 화면에 「설치 파일 실행이 차단되었습니다」 알림 · 임시 폴더·시도 기록 정리) | `appe2e-summary.txt`(10줄) · `appe2e-off-verdict.json` · `appe2e-on-verdict.json` · `appe2e-*-ui-*.png`(앱 화면) · `appe2e-*-cdp.json` |
+| QJ (7차) | **기존 사용자의 길(업그레이드)**: 공개 0.14.42 가 설치돼 떠 있는 PC 에 시험 대상 설치 파일(0.14.43)이 **0.14.42 의 업데이터가 띄우는 방식 그대로** 얹힐 때 — 설치 결과 · 다시 뜬 앱 · 새 앱과 옛 데몬의 만남 · 그 앱에서 팀 직접 만들기. 그리고 시험 대상 설치 파일을 **릴리스(draft 포함)** 에서 받는 입력 경로 | `appe2e-upgrade-summary.txt`(14줄) · `appe2e-upgrade-verdict.json` · `appe2e-upg-timeline.txt` · `appe2e-upg-after-obs-timeline.txt` · `appe2e-installer-source.json` |
 | QH (3차) | **제품 코드의 설치 파일 실행 모듈(`src/update_launch.rs`)을 진짜 SAC 에서 그대로** 시험: 켜기 전 성공 경로(서명된 cmd.exe 사본) · 켠 뒤 진짜 0.14.42 설치기는 `Err 4551 / shell_ret 5 / AppControl` · `remove_installer` 정리 · 서명된 대조는 통과 | `product-launch-summary.txt`(10줄) · `product-launch-x64.jsonl`(본 판정) · `product-launch-aarch64.jsonl`(보조) · `product-launch-verdict.json` · `product-3077.json` |
 
 ## 구성
@@ -108,3 +109,133 @@ SAC 를 켠 뒤에는 서명된 `node.exe` 와 시스템 도구만 새로 실행
 - **가공 `diag/cysdwin-digest.py`**(표준 라이브러리만 · 어떤 경우에도 종료 코드 0): `cysdwin-summary.txt`(`test result:` 줄 · 실패 수와 목록·결과줄의 일치 · 모듈별 수(이름의 `::tests::` 앞) · panic 위치(파일:줄)별 수 상위 30 · 메시지 유형별 수 — **분류 규칙(낱말·정규식)과 순서를 요약 안에 적는다** · 정규화한 첫 메시지 줄 상위 30) · `cysdwin-digest.tsv`(순번 · 검체 · `panicked at` 위치 원문 · 파일:줄 · 메시지 앞 300자 · 스레드 · panic 수 · 파일) · `cysdwin-failures/<순번>-<이름>.txt`(검체별 로그 조각 — `--nocapture` 이면 `test <이름> ... ` 줄부터 `FAILED` 까지, 캡처 모드면 `---- <이름> stdout ----` 블록 · 파일당 10KB 상한) · `cysdwin-cargo.log`(전체 로그 — 40MB 미만이면 그대로, 넘으면 앞뒤를 잘라 저장하고 그 사실을 요약과 로그 안에 적는다) · `cysdwin-digest.json` · `cysdwin-meta.json` · `cysdwin-env.txt`(러너 이미지·도구 버전·경로 규약).
 - 요약의 앞 3500자와 실패 첫 40건은 `::notice` annotation 으로도 올린다(익명 API 로 읽히는 유일한 면).
 - **master 가 실행할 때 할 일**: `diag/cysdwin-input.json` 의 `ref` 에 제품 커밋 SHA 를 적고 커밋 제목에 `[cysdwin-only]` 를 넣어 푸시한다(**푸시는 한 번만** — 같은 브랜치의 다음 푸시는 도는 런을 취소한다). 결과: 결과 브랜치의 `cysdwin-summary.txt` 부터. 로컬 확인(맥): 가짜 cargo 로그 시나리오 10개(`--nocapture` · CRLF · 캡처 모드 · 절단 · 컴파일 오류 · 전량 통과 · 큰 로그 절단 · 한글·이상한 이름 · 로그 없음 · annotation)와 195건 규모 시험으로 가공 스크립트를, 스텁 cargo 로 잡의 bash 스텝을 실제로 돌렸고, 워크플로 `if:` 를 16개 태그 조합 × 2(런 번호 있음·없음)로 이전·이후 비교했다. PowerShell 스텝은 맥에 PowerShell 이 없어 정적 린터로만 점검했다 — 러너에서 처음 돈다.
+
+## 7차 추가: 릴리스 설치 파일 입력 · UPGRADE 장면 (`app-e2e` 가 장면별 매트릭스로 돈다)
+
+(작업 지시서에는 「6차」로 적혀 있다. 이 문서에는 이미 「6차 추가: `cysd-win`」 절이 있어 번호만 7 로 적는다 — 내용은 같다.)
+
+### 무엇을 재나
+
+1. **기존 사용자의 길.** 지금까지 `app-e2e` 는 깨끗한 윈도우 11 에 0.14.43 을 **새로** 깔았다. 실제 사용자는 0.14.42 를 쓰다가 올린다. 설치 훅(`src-tauri/nsis-hooks.nsh`)은 0.14.42 와 같지만 실리는 바이너리·UI·팩이 다르고, 업데이터(NSIS) 경로에서는 앱이 `exit(0)` 로 먼저 나가서 **옛 데몬이 살아 남는다**(디스크는 새 버전 · 프로세스는 옛 버전). 새 앱·새 데몬이 그 옛 상태·옛 데몬과 만나는 지점을 잰다.
+2. **실제로 발행될 바이트.** `windows-build.yml` 산출물이 아니라 `release.yml` 이 만든 **draft 릴리스의 설치 파일**을 공개 발행 전에 같은 장면으로 잰다(`scripts/release-verify.py` 가 보지 않는 "이 설치본이 실제로 설치되는가").
+
+### 입력 키 (`diag/appe2e-input.json` — 전부 선택 · 없으면 아래 기본값)
+
+| 키 | 값 | 기본 | 뜻 |
+|---|---|---|---|
+| `windows_build_run_id` · `artifact` | 숫자 · 이름 | 0 · `cys-windows-x64-nsis` | 종전 그대로(제품 저장소 `windows-build.yml` 런의 아티팩트) |
+| `release_tag` | `"v0.14.43"` 꼴 · `""` = 안 씀 | `""` | 있으면 **이쪽이 이긴다**(런 번호는 기록만 되고 무시). 그 태그의 릴리스(**draft 포함**)에서 이름이 `_x64-setup.exe` 로 끝나는 자산 **정확히 1개**를 받는다 |
+| `scenes` | `["fresh"]` · `["upgrade"]` · `["fresh","upgrade"]` | **`["fresh","upgrade"]`** | 돌릴 장면. **키가 없으면 둘 다 돈다** — 종전처럼 fresh 만 돌리려면 `["fresh"]` 를 적는다 |
+| `upgrade_from` | `"0.14.42"` 꼴 | `"0.14.42"` | 먼저 깔아 둘 공개 버전(`p1-assets` 가 받아 둔 0.14.37·0.14.41·0.14.42 는 그 파일을 쓰고, 그 밖의 버전은 공개 릴리스에서 3회까지 받는다) |
+| `upgrade_mode` | `"emulate"` · `"updater"` | `"emulate"` | emulate = 하네스가 시험 대상 설치 파일을 0.14.42 업데이터와 같은 인자로 띄움(발행 전) · updater = 0.14.42 앱이 **자기 업데이터로 진짜 공개 엔드포인트에서** 받음(발행 뒤) |
+| `upgrade_expect` | `"0.14.43"` 꼴 | `""` | 올라가야 할 버전. emulate 에서 비면 시험 대상 설치 파일의 버전(적었는데 다르면 측정 불능) · **updater 에서는 필수** |
+
+문지기 잡 `appe2e-gate` 가 값의 꼴을 검사한다(태그 `v숫자.숫자.숫자` · 버전 `숫자.숫자.숫자` · 모드 둘 중 하나 · 장면은 fresh/upgrade 만 · 중복 금지). 어긋나면 사유를 찍고(로그 + notice annotation) `go=false` 로 끝낸다. `go` = 꼴 오류 없음 **그리고** (런 번호 > 0 **또는** `release_tag` 있음 **또는** 장면이 `["upgrade"]` 뿐이고 모드가 `updater` — 이때는 시험 대상 설치 파일이 필요 없다). `go=false` 인데 커밋에 `[appe2e-only]` 가 있으면 종전처럼 러너 **한 대**(장면 fresh)가 떠서 '입력 없음' 또는 문지기의 거절 사유(`inputs.gate_why`)를 결과에 적고 끝난다.
+
+### 설치 파일을 릴리스에서 받기 (`diag/fetch-release-asset.mjs` · 스텝 `download-release-installer`)
+
+`GET /repos/{repo}/releases?per_page=50`(최대 3쪽)에서 `tag_name` 이 같은 릴리스를 찾는다(draft 는 태그 조회 엔드포인트로 안 나온다 — 잡 토큰의 `contents: write` 로 목록에는 나온다). 같은 태그가 둘 이상이면 **draft 를 우선**하고 그 사실을 `duplicates_note` 에 적는다. 자산은 `…/releases/{id}/assets` 로 전부 읽어 접미사가 맞는 것이 0개·2개 이상이면 이름 목록을 찍고 실패한다. 내려받기는 `GET …/releases/assets/{id}` + `Accept: application/octet-stream` 이고 fetch 가 서명된 저장소 주소로 리다이렉트를 따른다 — **교차 출처 리다이렉트에는 `Authorization` 이 실리지 않는다**(Node 22.23.3·24.20.0 에서 두 포트짜리 가짜 서버로 실측: 저장소 쪽이 받은 Authorization 0건). `.part` 로 받아 크기(`size`)·`digest`(있으면)를 대조한 뒤에만 `.exe` 로 바꾼다(반쯤 받은 파일을 설치 파일로 집지 않게). 보고서 `appe2e-installer-source.json` 은 실패해도 쓰인다(`ok:false` · `error` · `http_status` · `body_head`). 토큰과 서명 주소의 쿼리는 어디에도 찍히지 않는다. `app-e2e.ps1` 은 이 보고서를 `inputs.installer_source` 로 싣고(없으면 `{"kind":"windows-build-artifact","run_id":…}`), 직접 계산한 sha256 과 보고서 값이 같은지(`file_sha256_same`)도 적는다.
+
+### 장면 UPGRADE (`diag/app-upgrade.ps1` — `app-e2e.ps1` 이 불러 쓰는 함수 묶음 · 잡은 같은 스크립트를 `APPE2E_SCENE=upgrade` 로 돌린다)
+
+스텝(각각 `Invoke-Step` · 실패해도 다음 스텝은 돈다 · 스텝마다 `app-e2e.json` 저장):
+
+1. `prepare` — 네이티브 도우미 · **SAC 꺼짐 확인**(켜져 있으면 측정 불능 · 이 장면은 SAC 를 켜지 않는다) · 입력.
+2. `upg-base-installer` — 공개 `<upgrade_from>` 설치 파일(크기·sha256·`SHA256SUMS.txt` 대조값).
+3. `upg-install-base` — `/S` 설치 → 표식 == from · 실패 파일 없음. 이어서 `upg-facts-base`(설치 사실 기록).
+4. `upg-start-base` — WebView2 정책 + 앱 기동(**`CYS_UPDATE_MANIFEST_URL` 없이** — 진짜 엔드포인트) → `uipre` 로 붙어 앱 버전 == from(안 붙으면 `--mode version` 으로 한 번 더). 여기까지 못 가면 **측정 불능**.
+5. `upg-base-state` — 최대 120초(3초 간격) 설치 폴더의 `cysd.exe` 와 팩(`%USERPROFILE%\.cys\pack\.pack-version`)을 기다리며 기록: 프로세스 표 · cys 파이프 · 팩 파일 수·버전 · `.cys` 최상위 이름 · 바탕화면 · 앱 화면(`#daemon-info` 글자 · `daemon_status`). 준비 미달은 NOTE.
+6. `upg-apply`
+   - **emulate**: 시험 대상 설치 파일을 `%TEMP%\cys-<to>-updater-diag<6자>\cys-<to>-installer.exe` 로 복사(sha256 대조) → `ShellExecuteW(open, 그 파일, "/P /R /UPDATE /ARGS")`(tauri-plugin-updater 2.10.1 의 호출 그대로 · 현재 폴더 = 설치 폴더) → 0.3초 뒤 **앱 프로세스 하나만**(pid · 트리 kill 아님) 끝낸다. 데몬은 건드리지 않는다.
+   - **updater**: `--mode attach` 로 `check_update` 를 읽어 버전이 `upgrade_expect` 가 아니면 **「공개 엔드포인트가 … 를 내놓지 않는다」로 FAIL**, 맞으면 `--mode update`(`install_update {force:true}`).
+   - 공통 관찰(최대 300초 · 2초 간격 · `appe2e-upg-timeline.txt`): 임시 설치 파일 · 설치 프로세스 · 옛 앱 종료 · 표식 · 새 앱. 성공 = 표식이 to 에 닿고 **새** `cys-app.exe` 가 떠 있음.
+7. `upg-after` — (a) 표식 == to · `cys-install-failure.txt` 없음 · `cys-app.exe`·`cys.exe`·`cysd.exe` 파일 버전 == to (b) 다시 뜬 앱에 `uipre`: 앱 버전 == to · UI 준비 (c) **옛 데몬과의 만남**(최대 150초 · 5초 간격 · 데몬이 to 를 두 번 연속 답하면 일찍 끝): `node cdp-update.mjs --mode uiobs`(클릭 없음)가 `#daemon-info` · `.ver-skew-badge` · 알림 · 제품의 읽기 전용 `daemon_status` 를 보고, PowerShell 은 `cysd` 프로세스(pid·부모·생성 시각·이미지·파일 버전)를 본다 (d) 잔해 `*.prev*`·`*.new.exe` 개수(직후·관찰 끝·장면 끝) (e) 팩 전후. 이어서 `upg-facts-after`.
+8. `team` — 기존 `Invoke-TeamScene` 을 **업그레이드된 채 떠 있는 그 앱 그대로** 쓴다(`team.app.reused`). 표식이 to 가 아니면 돌리지 않는다(`NOT_RUN`).
+9. `upg-verdict` · `upg-summary` · `upg-cleanup`(node 정리 · 설치 폴더 프로세스 종료 · WebView2 정책 제거).
+
+`#daemon-info` 는 `daemon pid=… sock=…` 만 보여 주고(제품 `ui/src/main.ts` `start()`) 버전이 없으며 데몬이 바뀌어도 다시 쓰이지 않는다. 그래서 데몬 버전은 제품 UI 가 스스로 쓰는 `invoke('daemon_status')`(= RPC `system.identify` · 읽기 전용)의 `version` 으로 읽는다. 제품 동작(`checkVersionSkew`): 지킬 세션(역할·에이전트가 붙은 좌석)이 0 이면 앱이 **스스로 데몬을 교대**하고, 있으면 `.ver-skew-badge` 배지와 「새 버전 준비」 알림을 띄운다 — 러너에는 claude·codex·agy 가 없으니 자동 교대가 예상이지만 **어느 쪽이든 판정을 바꾸지 않는 NOTE** 다.
+
+**판정**(`appe2e-upgrade-verdict.json` · 표준 파일 `appe2e-verdict.json`·`app-e2e.json` 의 `verdict` 에도 `{result, upgrade, team, reasons}`):
+- `PASS` = 전부 참일 때만: 3·4 성공 · 6 성공 · 7(a)(b) · TEAM PASS.
+- `FAIL` = 제품이 잘못했다(표식 미도달 · 앱 미복귀 · 실패 파일 · 파일 버전 불일치 · 앱 버전/UI · TEAM FAIL · updater 에서 엔드포인트가 기대 버전을 안 내놓음). 적용 관찰이 300초를 다 쓰고도 끝나지 않은 것도 여기다.
+- `NOT-MEASURABLE` = 하네스가 못 쟀다(SAC 가 켜져 있음 · 입력 없음 · 0.14.42 설치/기동 실패 · 시간 부족 · emulate 에서 하네스의 `ShellExecuteW` 가 설치 파일을 못 띄움(반환값·오류 번호·그때 화면을 남긴다) · 적용 관찰을 하네스가 중간에 그만둠(작업 시간 · 관찰 루프 오류 — `apply_observe.end_kind` = `harness` · 이때는 7(a)(b) 값도 판정에 쓰지 않는다) · 다시 뜬 앱의 디버그 포트가 안 열림 · 스텝이 오류로 멈춤 · TEAM NOT_RUN).
+- `NOTE`(판정 불변 · `reasons` 에 `NOTE …` 로): 옛 데몬이 150초 안에 교대되지 않음/배지가 뜸 · 5번 준비 미달 · 잔해 · TEAM 이 앱을 새로 띄움.
+
+`upgrade`(이 장면의 1~7번)와 `team` 을 따로 적고, `result` 는 둘 중 하나라도 FAIL 이면 `FAIL`, 아니고 둘 다 PASS 가 아니면 `NOT-MEASURABLE`, 둘 다 PASS 일 때만 `PASS` 다.
+
+### 설치 사실 기록 (`Get-InstallFacts` · 두 장면 공통 · 읽기 전용 · 판정에 안 넣음)
+
+HKCU `…\Uninstall\cys` 의 DisplayName·DisplayVersion·UninstallString · 시작 메뉴·바탕화면 바로가기(대상 경로) · 설치 폴더 파일 수·바이트 · 세 실행 파일(크기·버전·sha256) · `cys.exe --version`·`cysd.exe --version`(각 15초 · 둘 다 데몬을 띄우지 않는다 — 근거는 스크립트 주석 · `cysd.exe` 는 인자 판정이 생긴 0.14.41 이상에서만 부른다) · 동봉 `bash.exe`·`python3.exe` 의 존재와 `--version` rc. fresh 는 `install-off` 바로 뒤 스텝 `install-facts` 에서 한 번(`appe2e-install-facts.json`), upgrade 는 0.14.42 설치 뒤(`upg-facts-base` → `…-base.json`)와 업그레이드 뒤(`upg-facts-after` → `…-after.json` — 7번 전체가 끝난 다음이다. 새 앱과 옛 데몬이 만나는 순간의 관찰을 늦추지 않으려고 7(a) 바로 뒤가 아니라 7번 뒤에 둔다).
+
+### fresh 장면에서 달라진 것 (이 세 가지뿐 — 측정·판정·순서는 그대로)
+
+1. 스텝 `install-facts` 하나(위) — 기존 스텝 사이에 끼지만 설치된 것을 읽기만 한다. 다만 `--version` 을 물으려고 `cys.exe`·`cysd.exe`·동봉 `bash.exe`·`python3.exe` 를 **한 번씩 실행**한다(데몬은 뜨지 않는다). 그래서 앱이 처음 뜨기 전에 이 네 파일이 한 번 읽히고 검사된 상태가 된다 — 측정값에 닿는 차이는 그것뿐이다.
+2. `appe2e-summary.txt` **첫 줄**에 `installer source: …`(출처 · 이름 · 크기 · sha256 전체)가 더해졌다. 종전 10줄은 그 뒤에 글자 그대로 이어진다(2~11줄 · TEAM 줄은 12·13줄).
+3. `app-e2e.json` 의 `inputs` 에 `release_tag`·`gate_why`·`installer_source` 키가 더해졌다.
+
+잡 이름은 `app-e2e (windows-11-arm, fresh)` / `app-e2e (windows-11-arm, upgrade)` 로 바뀌었다. 결과 브랜치·아티팩트 이름은 fresh 가 종전 그대로(`…-app-e2e-windows-11-arm` · `diag-app-e2e-windows-11-arm` · 체크포인트 `…-app-e2e-pre-sac-…`), upgrade 가 `…-app-upgrade-windows-11-arm` · `diag-app-upgrade-windows-11-arm` 이다.
+
+### 결과 읽는 순서 (upgrade)
+
+`diag-results/<런>-1-app-upgrade-windows-11-arm` 브랜치 → `syntax-check.txt`(새 파일 `app-upgrade.ps1` 이 `ok` 인지 **먼저**) → `appe2e-upgrade-summary.txt`(14줄: 실행 · 시험 대상 설치 파일 · 0.14.42 설치 파일 · 0.14.42 설치/기동 · 업그레이드 전 상태 · 적용 방법 · 적용 관찰 · 적용 뒤 · 데몬 · 잔해/팩 · 설치 사실 · 시간 · TEAM · VERDICT) → `appe2e-upgrade-verdict.json`(`failures`·`not_measurable`·`notes`·`facts`) → `appe2e-upg-timeline.txt`(적용 2초 간격) · `appe2e-upg-screen-*.png` → `appe2e-upg-after-pre-cdp.json`·`…-ui-ready.png`(다시 뜬 앱) → `appe2e-upg-after-obs-timeline.txt`(화면: 데몬 버전·상태바·배지·알림) · `appe2e-upg-daemon-timeline.txt`(프로세스) · `appe2e-upg-after-ui-obs-*.png` → `appe2e-upg-base-state-timeline.txt` · `appe2e-upg-base-obs-*`(업그레이드 전) → `appe2e-install-facts-base.json` · `…-after.json` → `appe2e-team-*`(5차와 같음) → `app-e2e.json`(`upgrade` 아래 전부 · `steps`). 릴리스에서 받았으면 `appe2e-installer-source.json` 도.
+
+### master 가 실행할 때 할 일
+
+커밋 제목 끝에 **`[appe2e-only]`**(문지기 + `app-e2e` 매트릭스만 돈다). **푸시는 한 번만**(같은 브랜치의 다음 푸시는 도는 런을 취소한다). 장면마다 러너 한 대 · upgrade 는 15~25분쯤(추정 — 10차 fresh 실측: `/S` 설치 53초 · 업데이터식 설치 50초 · TEAM 6.5분).
+
+런 A — 태그 전 · 최종 커밋의 `windows-build` 산출물 · fresh + upgrade(emulate):
+
+```json
+{
+  "windows_build_run_id": 37261026255,
+  "artifact": "cys-windows-x64-nsis",
+  "release_tag": "",
+  "scenes": ["fresh", "upgrade"],
+  "upgrade_from": "0.14.42",
+  "upgrade_mode": "emulate",
+  "upgrade_expect": "0.14.43"
+}
+```
+
+런 B — 발행 전 · draft 릴리스 `v0.14.43` 의 설치 파일 · fresh + upgrade(emulate):
+
+```json
+{
+  "windows_build_run_id": 0,
+  "artifact": "cys-windows-x64-nsis",
+  "release_tag": "v0.14.43",
+  "scenes": ["fresh", "upgrade"],
+  "upgrade_from": "0.14.42",
+  "upgrade_mode": "emulate",
+  "upgrade_expect": "0.14.43"
+}
+```
+
+런 C — 발행 뒤 · 공개 0.14.42 앱이 자기 업데이터로 진짜 엔드포인트에서 0.14.43 이 되는가 · upgrade 만:
+
+```json
+{
+  "windows_build_run_id": 0,
+  "artifact": "cys-windows-x64-nsis",
+  "release_tag": "",
+  "scenes": ["upgrade"],
+  "upgrade_from": "0.14.42",
+  "upgrade_mode": "updater",
+  "upgrade_expect": "0.14.43"
+}
+```
+
+런 B 에서 fresh 의 OFF 장면은 종전처럼 가짜 0.14.99 매니페스트(공개 0.14.42 설치 파일)로 0.14.43 의 새 실행 경로를 잰다 — 릴리스 설치 파일이라고 달라지는 것은 없다. 런 C 는 `releases/latest/download/latest.json` 이 0.14.43 을 가리킨 **뒤에** 돌려야 한다(그 전에는 `check_update` 가 비어 FAIL 로 나온다 — 측정이 아니라 순서 문제).
+
+### 로컬 확인(맥) · 첫 실기 런에서 볼 것
+
+로컬에서 돌린 것(원문은 저장소 밖 `W11/UPG/WORKLOG.md` 와 `W11/UPG/tools/out/`):
+
+- `node --check` 전 `.mjs`(Node 22.23.3 · 24.20.0) · `.ps1`/`.mjs`/`.yml` 16개 파일 비ASCII·CR·TAB·제어문자 0.
+- `fetch-release-asset.mjs`: 가짜 GitHub 서버(출처 둘) 시나리오 21개가 두 Node 에서 전부 통과 — 저장소 쪽 출처가 받은 요청 12건 중 Authorization 0건(같은 출처 리다이렉트에서는 실리는 것도 대조로 쟀다).
+- `cdp-update.mjs`: `uiobs` 순수 함수 5개 + 가짜 DevTools 시나리오 6개 + 옛 모드 5개(version · uipre · attach · update 2갈래)의 결과 JSON 이 HEAD 판과 동일 — 두 Node 에서. `ui`·`uiteam` 모드는 로컬에서 돌리지 않았다(고친 줄 없음 — diff 는 추가뿐이다).
+- 문지기 파이썬 조각: 입력 26개 + 종전 꼴 입력 9개가 HEAD 조각과 같은 `run_id`/`artifact`/`go`.
+- 워크플로: YAML 파싱·이름 대조 0건(다른 잡 5개는 HEAD 와 동일) · `actionlint` 1.7.12 0건(이름 오타 돌연변이 7개는 전부 잡음).
+- PowerShell: 정적 검사 2종이 `diag/*.ps1` 12개에서 0건(돌연변이 24개 전부 검출 · `-f` 줄 86개 민감도 확인) · 키/필드 이름 대조 0건 · **PowerShell 7.6.6 파서**로 12개 파일 파싱 오류 0 · 구문 나무에서 7 전용 문법 0건 · **가짜 환경 모의 실행 53개 시나리오**(UPGRADE 45 + fresh 에 더한 조각 8 — 새 PowerShell 코드를 그대로 돌리고, 윈도우 전용·이미 검증된 부품만 가짜로 바꿨다)가 전부 기대한 판정·파일을 냈다.
+
+**Windows PowerShell 5.1 과 실제 윈도우에서는 `app-upgrade.ps1` 이 한 번도 돌지 않았다 — 러너가 첫 실기 실행이다**(맥에서 한 것은 PowerShell 7 파싱과 가짜 환경 모의 실행뿐이다). 레지스트리 읽기 · 바로가기 대상 읽기 · 진짜 `ShellExecuteW` · 진짜 프로세스 표는 모의 실행에서도 돌지 않았다. 첫 런에서는 `syntax-check.txt` 부터 본다. `app-upgrade.ps1` 이 파싱되지 않아도 fresh 장면은 영향이 없게 해 두었다(`install-facts` 스텝만 실패로 남고, upgrade 잡은 `NOT-MEASURABLE` + 사유를 표준 파일에 적는다 — 파싱 오류가 try/catch 에 잡히는 것은 PowerShell 7 에서만 확인했다).

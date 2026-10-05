@@ -5,6 +5,8 @@
 # [appe2e-only] -> only app-e2e (+ its tiny gate job), [cysdwin-only] -> only cysd-win (the cysd unit specimens on windows-latest), no tag -> all jobs
 # except cysd-win (it runs only with its tag; app-e2e only when diag/appe2e-input.json has a run id above 0). Two tags -> those two.
 # e2e and sacrules run only when none of the four tags is present.
+# app-e2e is a matrix over the scenes of diag/appe2e-input.json (fresh / upgrade; README 7th section): its installer comes from the
+# windows-build run id or, when release_tag is set there, from that release (a draft too) - the gate job says go for either.
 name: diag-win11-update
 
 on:
@@ -597,6 +599,12 @@ jobs:
 
   # Reads diag/appe2e-input.json (the master fills in windows_build_run_id = the run of windows-build.yml for the product branch,
   # right before pushing; 0 = no input). A tiny ubuntu job so that no Windows runner is allocated for app-e2e without an input.
+  # Optional keys (README 7th section; without them nothing changes but the scene list): release_tag "vX.Y.Z" (the installer of that
+  # release, a draft too - it wins over the run id), scenes ["fresh","upgrade"] (default: both; one is allowed), upgrade_from "0.14.42",
+  # upgrade_mode "emulate" | "updater", upgrade_expect "X.Y.Z" (needed for updater). Every value is checked for its form; a bad one is
+  # printed (also as a notice annotation), handed on as `why`, and go is false. go = no bad value AND (run id above 0 OR release_tag OR
+  # the only scene is upgrade in updater mode, which needs no installer). When go is false the scene list is ["fresh"]: a run that is
+  # forced by [appe2e-only] then allocates ONE runner, as before, and writes the reason into its result.
   appe2e-gate:
     name: 'appe2e-gate'
     if: ${{ contains(github.event.head_commit.message, '[appe2e-only]') || (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
@@ -606,6 +614,12 @@ jobs:
       go: ${{ steps.read.outputs.go }}
       run_id: ${{ steps.read.outputs.run_id }}
       artifact: ${{ steps.read.outputs.artifact }}
+      release_tag: ${{ steps.read.outputs.release_tag }}
+      scenes: ${{ steps.read.outputs.scenes }}
+      upgrade_from: ${{ steps.read.outputs.upgrade_from }}
+      upgrade_mode: ${{ steps.read.outputs.upgrade_mode }}
+      upgrade_expect: ${{ steps.read.outputs.upgrade_expect }}
+      why: ${{ steps.read.outputs.why }}
     steps:
       - uses: actions/checkout@v4
 
@@ -614,18 +628,79 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, sys
+          import json, re, sys
           rid = 0
           art = 'cys-windows-x64-nsis'
+          tag = ''
+          scenes = ['fresh', 'upgrade']
+          ufrom = '0.14.42'
+          umode = 'emulate'
+          uexp = ''
+          bad = []
+          d = {}
           try:
               d = json.load(open('diag/appe2e-input.json', encoding='utf-8'))
               rid = int(str(d.get('windows_build_run_id') or 0).strip() or 0)
               art = str(d.get('artifact') or art).strip() or art
           except Exception as e:
               print('appe2e-input.json unreadable: %s' % e, file=sys.stderr)
+              bad.append('diag/appe2e-input.json could not be read (%s)' % type(e).__name__)
+          if not isinstance(d, dict):
+              d = {}
+              bad.append('diag/appe2e-input.json is not a JSON object')
+          def one(name):
+              v = d.get(name)
+              return '' if v is None else str(v).strip()
+          VER = r'[0-9]+\.[0-9]+\.[0-9]+'
+          v = one('release_tag')
+          if v:
+              if re.fullmatch('v' + VER, v):
+                  tag = v
+              else:
+                  bad.append('release_tag must look like v0.14.43')
+          sc = d.get('scenes')
+          if sc is not None:
+              if isinstance(sc, list) and sc and all(isinstance(x, str) and x in ('fresh', 'upgrade') for x in sc) and len(set(sc)) == len(sc):
+                  scenes = [x for x in ('fresh', 'upgrade') if x in sc]
+              else:
+                  bad.append('scenes must be a non-empty array of "fresh" / "upgrade" without repeats')
+          v = one('upgrade_from')
+          if v:
+              if re.fullmatch(VER, v):
+                  ufrom = v
+              else:
+                  bad.append('upgrade_from must look like 0.14.42')
+          v = one('upgrade_mode')
+          if v:
+              if v in ('emulate', 'updater'):
+                  umode = v
+              else:
+                  bad.append('upgrade_mode must be emulate or updater')
+          v = one('upgrade_expect')
+          if v:
+              if re.fullmatch(VER, v):
+                  uexp = v
+              else:
+                  bad.append('upgrade_expect must look like 0.14.43')
+          if not bad and 'upgrade' in scenes and umode == 'updater' and not uexp:
+              bad.append('upgrade_mode updater needs upgrade_expect (the version the public endpoint must offer)')
+          # the installer under test is needed by every scene except "upgrade in updater mode" (that old app downloads by itself)
+          needs_installer = ('fresh' in scenes) or (umode == 'emulate')
+          go = (not bad) and (rid > 0 or tag != '' or not needs_installer)
+          why = re.sub(r'[\r\n]+', ' ', '; '.join(bad))[:400]
+          if not go:
+              scenes = ['fresh']
+          msg = 'go=%s run_id=%d release_tag=%s scenes=%s upgrade %s -> %s (%s)%s' % ('true' if go else 'false', rid, tag or '-', ','.join(scenes), ufrom, uexp or '(the installer under test)', umode, (' REFUSED: ' + why) if why else '')
+          print('::notice title=appe2e-gate::' + msg.replace('%', '%25'), file=sys.stderr)
           print('run_id=%d' % rid)
           print('artifact=%s' % art)
-          print('go=%s' % ('true' if rid > 0 else 'false'))
+          print('release_tag=%s' % tag)
+          print('scenes=%s' % json.dumps(scenes, separators=(',', ':')))
+          print('upgrade_from=%s' % ufrom)
+          print('upgrade_mode=%s' % umode)
+          print('upgrade_expect=%s' % uexp)
+          print('why=%s' % why)
+          print('go=%s' % ('true' if go else 'false'))
           PY
           cat "$GITHUB_OUTPUT"
 
@@ -636,12 +711,22 @@ jobs:
   # 5th run: after the restore a LAST scene TEAM runs in the same script (the "create a team directly" flow of the real UI, SAC off:
   # app start + up to 6 min of observation + evidence, about 10-14 min) - the job and the script step got +15 min for it, and
   # DIAG_TEAM_EXTRA_MIN (+15, on top of DIAG_JOB_LIMIT_MIN 40 which the OFF / ON scenes keep using unchanged) is the time the scene may use.
+  # 7th README section: the job is a MATRIX over the scenes of the gate (APPE2E_SCENE). scene fresh = everything above, unchanged (result
+  # branch / artifact names keep "app-e2e"). scene upgrade = diag/app-upgrade.ps1 through the same script: a public older version is
+  # installed and running, the installer under test goes on top of it the way that old app's updater does it, then the TEAM scene
+  # runs on the upgraded app (results: job name "app-upgrade"). The upgrade scene never turns Smart App Control on. The installer
+  # under test comes from the windows-build artifact (download-installer) or from a release (download-release-installer), never both.
   app-e2e:
-    name: 'app-e2e (windows-11-arm)'
+    name: 'app-e2e (windows-11-arm, ${{ matrix.scene }})'
     needs: appe2e-gate
     if: ${{ contains(github.event.head_commit.message, '[appe2e-only]') || (needs.appe2e-gate.outputs.go == 'true' && !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
     runs-on: windows-11-arm
     timeout-minutes: 65
+    strategy:
+      fail-fast: false
+      matrix:
+        # the scene list of the gate, always a JSON array; the fallback only matters when the gate left no output at all
+        scene: ${{ fromJSON(needs.appe2e-gate.outputs.scenes || '["fresh"]') }}
     # download-artifact reads the artifacts of ANOTHER workflow run: needs actions: read (a job level block replaces the workflow one)
     permissions:
       contents: write
@@ -653,6 +738,12 @@ jobs:
       APPE2E_RUN_ID: ${{ needs.appe2e-gate.outputs.run_id }}
       APPE2E_ARTIFACT: ${{ needs.appe2e-gate.outputs.artifact }}
       APPE2E_MANIFEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/diag/appe2e-manifest.json
+      APPE2E_SCENE: ${{ matrix.scene }}
+      APPE2E_RELEASE_TAG: ${{ needs.appe2e-gate.outputs.release_tag }}
+      APPE2E_UPGRADE_FROM: ${{ needs.appe2e-gate.outputs.upgrade_from }}
+      APPE2E_UPGRADE_MODE: ${{ needs.appe2e-gate.outputs.upgrade_mode }}
+      APPE2E_UPGRADE_EXPECT: ${{ needs.appe2e-gate.outputs.upgrade_expect }}
+      APPE2E_GATE_WHY: ${{ needs.appe2e-gate.outputs.why }}
     steps:
       - uses: actions/checkout@v4
 
@@ -706,9 +797,10 @@ jobs:
           Write-Host "p1-assets exit code: $LASTEXITCODE"
           exit 0
 
-      # the NSIS setup.exe of the product build (artifact name and path: windows-build.yml, "Upload NSIS installer artifact")
+      # the NSIS setup.exe of the product build (artifact name and path: windows-build.yml, "Upload NSIS installer artifact");
+      # not when a release tag is given (that wins) and not without a run id (upgrade in updater mode needs no installer)
       - name: download-installer
-        if: ${{ needs.appe2e-gate.outputs.go == 'true' }}
+        if: ${{ needs.appe2e-gate.outputs.go == 'true' && needs.appe2e-gate.outputs.release_tag == '' && needs.appe2e-gate.outputs.run_id != '0' }}
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -717,9 +809,23 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: ${{ runner.temp }}\appe2e-installer
 
+      # OR the installer of a RELEASE of this repository, into the same folder (README 7th section): diag/fetch-release-asset.mjs finds the
+      # release by tag_name in the release list (a DRAFT has no tag endpoint; this job's token has contents: write, so drafts are listed),
+      # takes the one asset that ends with _x64-setup.exe, and checks size and digest. Its report (also when it fails) goes to the
+      # results folder. The token is never printed and is not sent to the storage host the download is redirected to.
+      - name: download-release-installer
+        if: ${{ needs.appe2e-gate.outputs.go == 'true' && needs.appe2e-gate.outputs.release_tag != '' }}
+        shell: cmd
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node diag\fetch-release-asset.mjs --tag "%APPE2E_RELEASE_TAG%" --suffix _x64-setup.exe --out "%RUNNER_TEMP%\appe2e-installer" --report "%RUNNER_TEMP%\diag-out\appe2e-installer-source.json"
+
       # one step = one PowerShell process: inputs -> OFF run (success path) -> reinstall -> ON run under REAL SAC -> RESTORE -> cleanup ->
       # events -> verdict -> summary -> TEAM scene (last, SAC off; +15 min of step time for it) -> TEAM report (see diag/app-e2e.ps1).
       # GITHUB_TOKEN is only for the checkpoint upload the script makes before SAC is turned on.
+      # With APPE2E_SCENE=upgrade the same script runs the UPGRADE scene instead (diag/app-upgrade.ps1; no SAC switch, no checkpoint).
       - name: app-e2e
         shell: powershell
         continue-on-error: true
@@ -778,13 +884,13 @@ jobs:
         timeout-minutes: 8
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node diag\publish-results.mjs --job app-e2e --os windows-11-arm --out "%RUNNER_TEMP%\diag-out"
+        run: node diag\publish-results.mjs --job ${{ matrix.scene == 'upgrade' && 'app-upgrade' || 'app-e2e' }} --os windows-11-arm --out "%RUNNER_TEMP%\diag-out"
 
       - name: upload-artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diag-app-e2e-windows-11-arm
+          name: diag-${{ matrix.scene == 'upgrade' && 'app-upgrade' || 'app-e2e' }}-windows-11-arm
           path: ${{ runner.temp }}\diag-out
           if-no-files-found: warn
           retention-days: 14

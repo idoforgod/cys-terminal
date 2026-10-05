@@ -22,10 +22,24 @@
 #          summary of the earlier scenes were written (a hang cannot take them away) and only ADDS: a "team" key and a TEAM line in
 #          appe2e-verdict.json and two TEAM lines (11 and 12) appended to appe2e-summary.txt. The OFF / ON verdicts, the restore and
 #          their order are unchanged. Time: DIAG_TEAM_EXTRA_MIN (workflow env, default 15) extra minutes on top of DIAG_JOB_LIMIT_MIN.
+# SCENES   (README 7th section) the workflow runs this script once per scene (matrix) with APPE2E_SCENE:
+#          fresh (or empty)  everything described above, unchanged - plus ONE read-only step right after the first install:
+#                            install-facts (Get-InstallFacts of app-upgrade.ps1 -> appe2e-install-facts.json; never part of a verdict)
+#          upgrade           Invoke-UpgradeMain of diag/app-upgrade.ps1 INSTEAD of the main below: a public older version is installed
+#                            and running, the installer under test is applied on top of it the way that old app's updater does it,
+#                            then the TEAM scene runs on the upgraded app. That scene never turns Smart App Control on.
+#          The installer under test comes from the windows-build artifact (run id) or, when release_tag is set in
+#          diag/appe2e-input.json, from that release (diag/fetch-release-asset.mjs; its report -> inputs.installer_source).
+#          appe2e-summary.txt begins with ONE more line now ("installer source: ...": source, name, size, full sha256); the 10 lines
+#          described above follow it unchanged (they are lines 2-11 of the file, the TEAM lines 12 and 13).
 $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'lib.ps1')
 . (Join-Path $PSScriptRoot 'e2e-update.ps1')
 . (Join-Path $PSScriptRoot 'sac-lib.ps1')
+# functions only (Get-InstallFacts, Invoke-UpgradeMain ...). Loaded BEFORE the functions of this file, so a name defined in both would
+# be the one of this file; a load problem (parse error) is kept as text and never stops the fresh scene.
+$K_UPG_LOAD_ERROR = ''
+try { . (Join-Path $PSScriptRoot 'app-upgrade.ps1') } catch { $K_UPG_LOAD_ERROR = 'diag/app-upgrade.ps1 could not be loaded: ' + $_.Exception.Message }
 Start-DiagScript -Name 'app-e2e'
 
 $K_CITOOL = Join-Path $env:windir 'System32\CiTool.exe'
@@ -96,6 +110,66 @@ function Save-Run { Save-Json 'app-e2e.json' $RUN 9 }
 # =========================================================================
 # inputs: the installer of the product build, the manifest the app is pointed at
 # =========================================================================
+# (README 7th section, H1) where the installer under test came from: the report of diag/fetch-release-asset.mjs when the workflow
+# downloaded a release asset (release_tag in diag/appe2e-input.json), else the windows-build artifact of the run id
+function Get-InstallerSource {
+    $tag = ([string]$env:APPE2E_RELEASE_TAG).Trim()
+    $txt = Read-TextUtf8 (Join-Path $global:DiagOut 'appe2e-installer-source.json')
+    if ((-not $txt) -and (-not $tag)) {
+        return [ordered]@{ kind = 'windows-build-artifact'; run_id = [string]$env:APPE2E_RUN_ID; artifact = [string]$env:APPE2E_ARTIFACT }
+    }
+    $src = [ordered]@{ kind = 'release-asset'; tag = $tag; report_found = $false; ok = $null; error = $null }
+    if (-not $txt) {
+        $src['error'] = 'the download step left no report (appe2e-installer-source.json): it did not run or was stopped'
+        return $src
+    }
+    try {
+        $j = ConvertFrom-Json $txt
+        $src['report_found'] = $true
+        foreach ($k in @('ok', 'error', 'http_status', 'tag', 'release_id', 'draft', 'prerelease', 'release_name', 'asset_name', 'asset_id', 'size', 'sha256', 'digest', 'digest_match', 'asset_updated_at', 'saved_to', 'duplicates_note')) {
+            $src[$k] = $j.$k
+        }
+    } catch {
+        $src['error'] = 'the report of the release download could not be read: ' + $_.Exception.Message
+    }
+    return $src
+}
+
+# one line for the summaries: the source, then name, size and the full sha256 of the installer file that was found
+function Get-InstallerSourceLine {
+    $t = 'installer source: not known'
+    try {
+        $in = $RUN['inputs']
+        $src = $null
+        if ($in -is [System.Collections.IDictionary]) { $src = $in['installer_source'] }
+        $where = 'not recorded'
+        if ($src -is [System.Collections.IDictionary]) {
+            if ([string]$src['kind'] -eq 'release-asset') {
+                $v = @{}
+                foreach ($k in @('tag', 'release_id', 'draft', 'asset_id', 'digest_match', 'ok')) {
+                    $v[$k] = 'unknown'
+                    if ($null -ne $src[$k]) { $v[$k] = [string]$src[$k] }
+                }
+                $where = ('release {0} (release id {1}, draft={2}, asset id {3}, digest match={4}, download ok={5})' -f $v['tag'], $v['release_id'], $v['draft'], $v['asset_id'], $v['digest_match'], $v['ok'])
+                if ($src['duplicates_note']) { $where = $where + ' [' + [string]$src['duplicates_note'] + ']' }
+                if ($src['error']) { $where = $where + ' [error: ' + [string]$src['error'] + ']' }
+                if ($src.Contains('file_sha256_same') -and ($src['file_sha256_same'] -eq $false)) { $where = $where + ' [WARNING: the file on disk does not have the sha256 the download report recorded]' }
+            } else {
+                $where = ('windows-build artifact {0} of run {1}' -f $src['artifact'], $src['run_id'])
+            }
+        }
+        $file = 'no installer file'
+        if (($in -is [System.Collections.IDictionary]) -and ($in['installer'] -is [System.Collections.IDictionary])) {
+            $ii = $in['installer']
+            $file = ('{0}, {1} bytes, sha256 {2}' -f $ii['name'], $ii['size'], $ii['sha256'])
+        }
+        $t = ('installer source: {0}; {1}' -f $where, $file)
+    } catch {
+        $t = 'installer source: the line could not be built: ' + $_.Exception.Message
+    }
+    return $t
+}
+
 function Get-AppInputs {
     $in = [ordered]@{
         run_id = [string]$env:APPE2E_RUN_ID
@@ -109,17 +183,23 @@ function Get-AppInputs {
         from_version = $null
         manifest = $null
         problems = (New-Object System.Collections.Generic.List[string])
+        release_tag = ([string]$env:APPE2E_RELEASE_TAG).Trim()
+        gate_why = ([string]$env:APPE2E_GATE_WHY).Trim()
+        installer_source = $null
     }
     $RUN['inputs'] = $in
+    try { $in['installer_source'] = Get-InstallerSource } catch { }
+    if ($in['gate_why']) { $in['problems'].Add('appe2e-gate refused diag/appe2e-input.json: ' + [string]$in['gate_why']) }
     $rid = [int64]0
     [void][int64]::TryParse($in['run_id'], [ref]$rid)
-    if ($rid -le 0) {
+    if (($rid -le 0) -and (-not $in['release_tag'])) {
         $in['no_input'] = $true
         $in['problems'].Add('no input: diag/appe2e-input.json has windows_build_run_id 0 (the master fills in the run number of windows-build.yml before pushing)')
         return
     }
     $dir = [string]$in['installer_dir']
     if ((-not $dir) -or (-not (Test-Path -LiteralPath $dir))) {
+        if ($in['release_tag']) { $in['problems'].Add('release ' + [string]$in['release_tag'] + ': the installer was not downloaded (inputs.installer_source and appe2e-installer-source.json say why)') }
         $in['problems'].Add('the downloaded artifact folder is missing: ' + $dir + ' (download-artifact failed? wrong run id or artifact name?)')
         return
     }
@@ -141,6 +221,10 @@ function Get-AppInputs {
         $inst['product_version'] = [string]$vi.ProductVersion
     } catch { }
     $in['installer'] = $inst
+    try {
+        $rs = $in['installer_source']
+        if (($rs -is [System.Collections.IDictionary]) -and ([string]$rs['kind'] -eq 'release-asset') -and $rs['sha256']) { $rs['file_sha256_same'] = [bool]([string]$rs['sha256'] -eq [string]$inst['sha256']) }
+    } catch { }
     $fromVer = ''
     $m = [regex]::Match([string]$inst['name'], '(\d+\.\d+\.\d+)')
     if ($m.Success) { $fromVer = $m.Groups[1].Value }
@@ -877,6 +961,8 @@ function Get-ClickText {
 
 function Write-AppSummary {
     $lines = New-Object System.Collections.Generic.List[string]
+    # (README 7th section, H1) head line: where the installer under test came from, its name, size and full sha256
+    $lines.Add((Get-InstallerSourceLine))
     try {
         $in = $RUN['inputs']
         $instText = 'no installer'
@@ -1651,6 +1737,32 @@ function Invoke-TeamScene {
 }
 
 # =========================================================================
+# scene switch (README 7th section): APPE2E_SCENE=upgrade runs the UPGRADE scene of diag/app-upgrade.ps1 and ends here.
+# Every other value (fresh, empty) falls through to the main below.
+# =========================================================================
+if (([string]$env:APPE2E_SCENE).Trim().ToLowerInvariant() -eq 'upgrade') {
+    if (Get-Command -Name 'Invoke-UpgradeMain' -CommandType Function -ErrorAction SilentlyContinue) {
+        Invoke-UpgradeMain
+    } else {
+        # the library did not load (syntax-check.txt of this job names the parse error): say so in the standard result files
+        $why = 'the UPGRADE scene could not run: ' + $(if ($K_UPG_LOAD_ERROR) { $K_UPG_LOAD_ERROR } else { 'Invoke-UpgradeMain is not defined (diag/app-upgrade.ps1 missing?)' })
+        Write-Log $why 'ERROR'
+        $RUN['notes'].Add($why)
+        $RUN['measurable'] = $false
+        $RUN['verdict'] = [ordered]@{ result = 'NOT-MEASURABLE'; upgrade = 'NOT-MEASURABLE'; team = 'NOT_RUN'; reasons = @('NOT MEASURED: ' + $why) }
+        Save-Json 'appe2e-verdict.json' $RUN['verdict'] 5
+        # the same keys as the verdict file of the scene itself (Get-UpgVerdict), so that a reader finds one shape
+        $uv = [ordered]@{ result = 'NOT-MEASURABLE'; upgrade = 'NOT-MEASURABLE'; team = 'NOT_RUN'; mode = ([string]$env:APPE2E_UPGRADE_MODE).Trim(); from_version = ([string]$env:APPE2E_UPGRADE_FROM).Trim(); to_version = ([string]$env:APPE2E_UPGRADE_EXPECT).Trim(); failures = @(); not_measurable = @($why); notes = @(); reasons = @('NOT MEASURED: ' + $why); facts = [ordered]@{} }
+        Save-Json 'appe2e-upgrade-verdict.json' $uv 5
+        Save-Text 'appe2e-upgrade-summary.txt' ('VERDICT: NOT-MEASURABLE - ' + $why)
+        $RUN['finished'] = (Get-IsoNow)
+        Save-Run
+        Complete-DiagScript 'app-e2e'
+    }
+    exit 0
+}
+
+# =========================================================================
 # main
 # =========================================================================
 $CTX['script_start_utc'] = (Get-Date).ToUniversalTime()
@@ -1712,6 +1824,11 @@ try {
                 $CTX['off_install_ok'] = [bool]($RUN['off_install']['ok'])
                 if (-not $CTX['off_install_ok']) { $RUN['notes'].Add(('the installer of the product build did not leave the version marker at {0} (marker: {1})' -f $CTX['from_version'], $RUN['off_install']['marker'])) }
                 Save-Run
+            }
+            # (README 7th section, H2-b) read-only facts about what the installer left behind: a record, never part of a verdict
+            Invoke-Step 'install-facts' {
+                $RUN['install_facts'] = Get-InstallFacts 'fresh-after-first-install'
+                Save-Json 'appe2e-install-facts.json' $RUN['install_facts'] 7
             }
         } else {
             $RUN['notes'].Add('install-off skipped: not enough job time left')
