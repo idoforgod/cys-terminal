@@ -17389,23 +17389,25 @@ mod tests {
             ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
         ]);
         let (daemon, s) = marker_seat("b1-pending");
-        paint_prompt(&s, "버그 수정 착수한다", "");
-        *s.last_output.lock().unwrap() =
-            std::time::Instant::now() - std::time::Duration::from_secs(10);
-        *s.last_human_input.lock().unwrap() = None;
-        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
-        assert_eq!(
-            s.pending_queue.lock().unwrap().len(),
-            1,
-            "미제출 입력이 있는 줄에는 주입하지 않는다(§9 실사고)"
-        );
-        let alert = daemon
-            .bus
-            .tail(30)
-            .into_iter()
-            .find(|ev| ev["name"] == "queue.depth_high")
-            .expect("적체 사유가 침묵하면 안 된다");
+        // ★(R2F-DM 2차 · B3-e) 화면을 그리고 판정을 재는 사이에 "좌석이 아무것도 내지 않는다"는 전제를 출력 세대로 증명한 시도의 값으로만 단언한다 — 윈도우 ConPTY 의 기동 출력이
+        //   판정 창에 끼면 제품은 옳게도 `busy(출력 중)` 라 답한다(윈도우 러너 진단 잡 37201047193 에서 그 사유로 붉었다 · 맥에서 발행 중 프레임을 주어 같은 문구로 재현). 시도마다 화면·정적·경보 계수를 새로 세운다. 유닉스 좌석은 출력이 없어 첫 시도가 그대로다.
+        let (queued, alert) = crate::state::test_until_no_pty_output(&s, "b1_gate_input_pending", || {
+            paint_prompt(&s, "버그 수정 착수한다", "");
+            *s.last_output.lock().unwrap() =
+                std::time::Instant::now() - std::time::Duration::from_secs(10);
+            *s.last_human_input.lock().unwrap() = None;
+            let since = daemon.bus.latest_seq();
+            let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+            deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+            let alert = daemon
+                .bus
+                .replay_after(since)
+                .into_iter()
+                .find(|ev| ev["name"] == "queue.depth_high");
+            (s.pending_queue.lock().unwrap().len(), alert)
+        });
+        assert_eq!(queued, 1, "미제출 입력이 있는 줄에는 주입하지 않는다(§9 실사고)");
+        let alert = alert.expect("적체 사유가 침묵하면 안 된다");
         assert!(
             alert["payload"]["blocked_by"]
                 .as_str()
@@ -21506,13 +21508,17 @@ mod tests {
             ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
         ]);
         let (daemon, s) = marker_seat("b1-reason");
-        paint_prompt(&s, "미제출 초안", "");
-        *s.last_output.lock().unwrap() =
-            std::time::Instant::now() - std::time::Duration::from_secs(10);
-        *s.last_human_input.lock().unwrap() = None;
         let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
-        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
-        let blocked = s.queue_blocked.lock().unwrap().clone();
+        // ★(R2F-DM 2차 · B3-e) 전제("그 사이 좌석이 아무것도 내지 않는다")를 출력 세대로 증명한 시도의 값으로만 단언한다 — 윈도우 ConPTY 의 기동 출력이 판정 창에 끼면 제품은 옳게도
+        //   `busy(출력 중)` 라 답한다(윈도우 러너 진단 잡 37201047193 에서 그 사유로 붉었다 · 맥에서 발행 중 프레임을 주어 같은 문구로 재현). 유닉스 좌석은 출력이 없어 첫 시도가 그대로다.
+        let blocked = crate::state::test_until_no_pty_output(&s, "b1_obs_blocked_reason(보류)", || {
+            paint_prompt(&s, "미제출 초안", "");
+            *s.last_output.lock().unwrap() =
+                std::time::Instant::now() - std::time::Duration::from_secs(10);
+            *s.last_human_input.lock().unwrap() = None;
+            deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+            s.queue_blocked.lock().unwrap().clone()
+        });
         assert!(
             blocked
                 .as_ref()
@@ -21520,9 +21526,13 @@ mod tests {
             "보류 사유가 기록되지 않으면 queue.list 가 이유를 말할 수 없다: {blocked:?}"
         );
         // 입력줄을 비우면 같은 좌석이 배달되고 사유는 사라진다.
-        paint_prompt(&s, "", "");
-        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
-        assert!(s.pending_queue.lock().unwrap().is_empty(), "해소 후 배달 실패");
+        // (배달은 좌석에 본문을 쓴다 — 그 에코가 출력 세대를 움직이므로 이 단계는 '배달됐는가' 로 끝을 보고, 보류된 시도는 그 창에 좌석 출력이 끼었을 때만(윈도우) 다시 한다. 유닉스는 종전처럼 한 번이다.)
+        let delivered = crate::state::test_done_or_no_pty_output(&s, || {
+            paint_prompt(&s, "", "");
+            deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+            s.pending_queue.lock().unwrap().is_empty()
+        });
+        assert!(delivered, "해소 후 배달 실패");
         assert!(
             s.queue_blocked.lock().unwrap().is_none(),
             "배달 후에도 낡은 사유가 남으면 운영자가 오독한다"
@@ -25308,6 +25318,24 @@ mod todo_decl_tests {
             p
         }
 
+        /// ★(R2F-DM 2차 · B3-d) 이미 있는 파일을 **바뀐 파일로** 다시 쓴다 — 내용을 쓴 뒤 mtime 을 직전 값 + 2초로 **명시**한다.
+        /// 스캐너의 캐시는 mtime 이 달라야 파일을 다시 읽는다(제품 계약 · `unchanged_mtime_skips_reparse_…` 가 그 반대쪽을 잰다). 파일 시스템이 매기는 mtime 의 눈금에 기대면
+        /// "바뀐 파일을 본다"를 재는 검체가 눈금을 재게 된다 — 윈도우 러너에서 이 가족 검체가 실행마다 다르게 붉었다(진단 잡 37188821194 의 2건 · 37201047193 의 1건). 다시 쓴 파일이 직전과 같은 mtime 을 받으면 캐시는
+        /// 옳게도 건너뛴다(맥에서 같은 mtime 을 주어 같은 메시지로 재현했다 — 윈도우의 눈금 폭 자체는 재지 않았다).
+        /// 검체가 재는 뜻(바뀐 파일의 판정·이벤트·집계)은 그대로다. '같은 mtime' 을 재는 자리는 이 함수를 쓰지 않고 원래 값으로 되돌린다.
+        fn rewrite(&self, p: &std::path::Path, content: &str) {
+            let before = std::fs::metadata(p).and_then(|m| m.modified()).expect("직전 mtime");
+            std::fs::write(p, content).expect("픽스처 재기록");
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .expect("mtime 명시용 열기")
+                .set_modified(before + std::time::Duration::from_secs(2))
+                .expect("mtime 명시");
+            let after = std::fs::metadata(p).and_then(|m| m.modified()).expect("새 mtime");
+            assert_ne!(after, before, "전제: 다시 쓴 파일의 mtime 이 직전과 달라야 한다");
+        }
+
         fn tick(&self) {
             // ★S18 이후 `check_todo_with`는 팩 경로를 인자로 받는다. 이 스위트는 라이브 팩을
             // 만지지 않으므로 `None`을 넘긴다(정본 루트 추가 규칙 자체는
@@ -25465,8 +25493,8 @@ mod todo_decl_tests {
         f.tick(); // 최초 무음 등록
 
         let before = f.seq();
-        std::fs::write(&retired, format!("{}{}- [ ] 추가\n", decl(MY, "retired"), body())).unwrap();
-        std::fs::write(&alive, format!("{}{}- [ ] 추가\n", decl(MY, "active"), body())).unwrap();
+        f.rewrite(&retired, &format!("{}{}- [ ] 추가\n", decl(MY, "retired"), body()));
+        f.rewrite(&alive, &format!("{}{}- [ ] 추가\n", decl(MY, "active"), body()));
         f.tick();
 
         assert_eq!(
@@ -25491,12 +25519,11 @@ mod todo_decl_tests {
         f.tick();
 
         let before = f.seq();
-        std::fs::write(&plain, format!("{}- [ ] 추가\n", body())).unwrap();
-        std::fs::write(
+        f.rewrite(&plain, &format!("{}- [ ] 추가\n", body()));
+        f.rewrite(
             &orphan,
-            format!("{}{}- [ ] 추가\n", decl("pack-dept-dept-9", "active"), body()),
-        )
-        .unwrap();
+            &format!("{}{}- [ ] 추가\n", decl("pack-dept-dept-9", "active"), body()),
+        );
         f.tick();
 
         let mut got = f.todo_events(before);
@@ -25521,7 +25548,7 @@ mod todo_decl_tests {
         assert_eq!(f.progress("WORKER_TODO.md"), Some((1, 2)));
 
         let before = f.seq();
-        std::fs::write(&p, format!("{}{}", decl(MY, "retired"), body())).unwrap();
+        f.rewrite(&p, &format!("{}{}", decl(MY, "retired"), body()));
         f.tick();
 
         assert!(
@@ -25567,7 +25594,8 @@ mod todo_decl_tests {
         assert!(f.progress("MASTER_TODO.md").is_none());
 
         // 반대 방향: mtime이 실제로 바뀌면 즉시 반영된다(캐시가 갱신을 막지 않는다).
-        std::fs::write(&p, format!("{}{}", decl(MY, "active"), body())).unwrap();
+        // ★(R2F-DM 2차 · B3-d) 바뀐 mtime 을 명시한다(+2초) — 파일 시스템의 눈금에 맡기면 이 쓰기가 위에서 되돌린 값과 같은 mtime 을 받을 수 있다(윈도우 러너 진단 잡 37201047193: 여기서 `retired` 가 남았다).
+        f.rewrite(&p, &format!("{}{}", decl(MY, "active"), body()));
         f.tick();
         assert_eq!(f.verdict("MASTER_TODO.md"), Some("counted"));
         assert_eq!(f.progress("MASTER_TODO.md"), Some((1, 2)));
@@ -25657,8 +25685,8 @@ mod todo_decl_tests {
         f.tick();
 
         let before = f.seq();
-        std::fs::write(&named, format!("{}{}- [ ] 추가\n", decl(MY, "active"), body())).unwrap();
-        std::fs::write(&plain, format!("{}- [ ] 추가\n", body())).unwrap();
+        f.rewrite(&named, &format!("{}{}- [ ] 추가\n", decl(MY, "active"), body()));
+        f.rewrite(&plain, &format!("{}- [ ] 추가\n", body()));
         f.tick();
 
         let owners: std::collections::BTreeMap<String, Option<String>> = f
@@ -26402,6 +26430,7 @@ mod reflect_queue_tests {
     /// ★(0.14.31 · 성찰 Q7 · codex 설계 검토 #1) **자력 종료(EOF) 경로도 같은 park 정책이다** — reap
     /// 만 고치면 reader EOF 가 먼저 활성 큐를 비워 보존할 것이 없다.
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 ConPTY 는 자식이 끝나도 출력 파이프를 닫지 않는다 — reader EOF 로 좌석 종료를 아는 경로는 유닉스 전제")]
     fn q7_process_exit_of_a_role_seat_parks_instead_of_dropping() {
         let (daemon, _s0, _pack) = probe_seat("q7eof");
         let mut rx = daemon.bus.subscribe();
@@ -27868,16 +27897,20 @@ mod h_machine_hold_tests {
         assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["fake::sneaky_producer".to_string()]);
     }
 
-    /// ★(R2F-DM · 성찰 2회차 마스터 결정 D2) **윈도우에서 `ignored`(+사유)로 남기는 검체는 정확히 이 41건이다** — 컴파일에서 빼지 않고(`#[cfg(unix)]`·조기 return 금지) `cfg_attr(not(unix), ignore = "<사유>")` 속성으로 윈도우 보고서에
-    /// 사유가 남게 한다(맥·리눅스에는 `ignore` 가 붙지 않는다). 세 부류: A) `send_settle_tests.rs` 의 윈도우에서 붉던 22건 — S21 제출 정착·창 위 CR 보류는 `cfg!(unix)` 한정(`send_settle_applies`) B) 윈도우 기본 H 마스크가 `draft` 축을 끄는데
+    /// ★(R2F-DM · 성찰 2회차 마스터 결정 D2) **윈도우에서 `ignored`(+사유)로 남기는 검체는 정확히 이 44건이다**(1차 결정 41 + 2차 3 — 아래 ★) — 컴파일에서 빼지 않고(`#[cfg(unix)]`·조기 return 금지) `cfg_attr(not(unix), ignore = "<사유>")` 속성으로 윈도우 보고서에
+    /// 사유가 남게 한다(맥·리눅스에는 `ignore` 가 붙지 않는다). 1차의 세 부류: A) `send_settle_tests.rs` 의 윈도우에서 붉던 22건 — S21 제출 정착·창 위 CR 보류는 `cfg!(unix)` 한정(`send_settle_applies`) B) 윈도우 기본 H 마스크가 `draft` 축을 끄는데
     /// (`hold_axes_default(true)` — 순수 검체 `h0_axes_default_by_platform`·`h0_conpty_fixtures` 가 이미 그 값을 고정한다) 유닉스 기본(draft 축) 동작을 보는 17건(h0 4 · h4 3 · h2 9 · c8 1) C) 좌석 명령이 POSIX 셸 문법인 2건.
     /// 이 핀은 **집합이 늘지도 줄지도 않게** 한다 — 나머지 20건(`send_settle_tests.rs` 의 '셸 좌석·윈도우·끔 = 종전 바이트' 음성 대조)은 윈도우에서도 돌아야 하고, [추측]으로 남긴 검체(ConPTY 2 · mtime 2 · ⓐ 추정·연쇄)는 윈도우 재측정 전에
     /// 손대지 않는다. 새 `ignore` 를 더하는 사람은 사유와 함께 이 목록을 고쳐야 한다(윈도우 검증력을 줄이는 결정이 코드 리뷰에 보이게).
+    /// ★(R2F-DM 2차 · 윈도우 재측정 뒤 마스터 결정 B3-a) 41 → **44**: D) 좌석 종료를 **reader EOF** 로 아는 경로를 재는 3건 — 윈도우 러너에서 좌석 프로세스가 끝나거나 죽어도 reader 가 EOF 를 보지 못했다
+    /// (진단 잡 37201047193 원문 · 대기 10~15초 — 마스터 표로는 같은 커밋의 헬스 실행에서도 같았다). 위의 "[추측] ConPTY 2" 가운데 하나(`q7_process_exit_…`)가 여기로 왔고, 나머지 하나(`read_text_reports_quiet_secs_…`)와 "mtime 2" 는 `ignore` 가 아니라 검체를 결정론으로 고쳤다
+    /// (조용한 관측 창 `state::test_until_no_pty_output` · mtime 명시 `Fixture::rewrite`) — 그래서 이 집합에 없다.
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_41() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_44() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
+        const REASON_D: &str = "윈도우 ConPTY 는 자식이 끝나도 출력 파이프를 닫지 않는다 — reader EOF 로 좌석 종료를 아는 경로는 유닉스 전제";
         let want: Vec<(&str, &str, char)> = vec![
             ("send_settle_tests", "c5_settle_proof_denial_never_carries_the_ghost_prescription", 'A'),
             ("send_settle_tests", "f1_submit_cr_withheld_on_stale_empty_seat_before_first_agent_sighting", 'A'),
@@ -27920,8 +27953,11 @@ mod h_machine_hold_tests {
             ("schedule", "c8_diverted_or_refused_pushes_keep_the_count_gates_unchanged", 'B'),
             ("handlers", "c_direct_fence_dispatch_behavior", 'C'),
             ("state", "c_mirror_screen_modes_tracks_bracketed_paste", 'C'),
+            ("governance", "q7_process_exit_of_a_role_seat_parks_instead_of_dropping", 'D'),
+            ("handlers", "reap_denies_queue_nonempty_then_queue_clear_exited_reclaim", 'D'),
+            ("schedule", "c8_handoff_failure_leaves_the_count_untouched", 'D'),
         ];
-        assert_eq!(want.len(), 41, "결정한 집합은 41건(22 + 17 + 2)");
+        assert_eq!(want.len(), 44, "결정한 집합은 44건(22 + 17 + 2 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -27936,6 +27972,7 @@ mod h_machine_hold_tests {
                     REASON_A => 'A',
                     REASON_B => 'B',
                     REASON_C => 'C',
+                    REASON_D => 'D',
                     other => panic!("{stem}: 결정에 없는 `ignore` 사유 — {other}"),
                 };
                 let after = &rest[rest.find('\n').expect("속성 줄 끝")..];
@@ -27947,8 +27984,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 41, "윈도우 `ignore` 가 {}건이다(결정 41건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 41건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 44, "윈도우 `ignore` 가 {}건이다(결정 44건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 44건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 

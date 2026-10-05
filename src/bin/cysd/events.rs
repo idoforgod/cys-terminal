@@ -27,10 +27,11 @@ struct Inner {
     persist_hwm: u64,
 }
 
+/// 이벤트 `timestamp` 의 원천 — `state::now_epoch` 과 같은 마이크로초 해상도다([`crate::state::epoch_secs_us`] · R2F-DM 2차 B1).
 fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
+        .map(crate::state::epoch_secs_us)
         .unwrap_or(0.0)
 }
 

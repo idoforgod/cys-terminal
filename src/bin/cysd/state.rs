@@ -1100,7 +1100,8 @@ pub struct InjectTrack {
     done_at: Mutex<Option<Instant>>,
     /// ★(0.14.42 · H3 간격 경쟁) 채널 생산자가 Inject 를 writer 에 **넘긴**(try_send 직전) 단조 시각 —
     /// [`InjectTrack::handoff_pending`]. 채널 행 간격 전용이다(H0 자기 붙여넣기 귀속은 읽지 않는다 — 인계만 된 본문은 화면에 없다).
-    handed_at: Mutex<Option<Instant>>,
+    /// ★(R2F-DM 2차 · B2) 표식은 시각과 함께 **순번**을 든다([`HandoffSlot`]) — '같은 표식인가' 는 순번으로, 경과·선후는 시각으로 가린다.
+    handed_at: Mutex<HandoffSlot>,
     /// ★(R3SH-1) 마지막 **기계 본문**(데몬 Inject · CLI 기계 send) — 제출 CR 뒤에도 남는다. [`MachineBody`] doc.
     last_body: Mutex<Option<MachineBody>>,
     /// ★(R1-F4) 지금 Inject arm 이 시작된 단조 시각 — writer 가 쓰기에 막혀(stdin 을 읽지 않는 에이전트 · PTY 입력 버퍼 포화)
@@ -1400,17 +1401,26 @@ impl InjectTrack {
     /// 【왜 넘기기 전인가】 넘긴 뒤에 찍으면 부하 중 writer 가 그 arm 을 먼저 끝낼 수 있다 — 끝난 arm 뒤의 표식은 영영 풀리지
     /// 않는 '대기'가 된다. 인계에 실패하면 [`Self::undo_handoff`] 로 되돌린다.
     pub(crate) fn note_handoff(&self) -> HandoffMark {
-        let mine = Instant::now();
-        let prev = self.handed_at.lock().unwrap_or_else(|e| e.into_inner()).replace(mine);
+        self.note_handoff_at(Instant::now())
+    }
+
+    /// [`Self::note_handoff`] 의 본체 — 넘긴 시각을 인자로 받는다. 운영 경로는 언제나 `Instant::now()` 이고, 검체는 **같은 시각을 두 번** 넣어 윈도우의 100ns 눈금
+    /// 겹침을 결정론으로 재현한다(운영 경로가 지나는 바로 이 함수를 잰다 — 검체용 사본이 아니다). 순번은 표식 락 안에서 매긴다(같은 락 = 표식이 덮인 순서 그대로).
+    fn note_handoff_at(&self, at: Instant) -> HandoffMark {
+        let mut g = self.handed_at.lock().unwrap_or_else(|e| e.into_inner());
+        g.issued += 1;
+        let mine = HandoffStamp { at, seq: g.issued };
+        let prev = g.cur.replace(mine);
         HandoffMark { prev, mine }
     }
 
     /// 생산자 전용 — [`Self::note_handoff`] 뒤 인계(`try_send`)가 실패했다(채널 포화·writer 종료). 그 사이 다른 인계가 표식을
     /// 덮었으면 건드리지 않는다.
+    /// ★(R2F-DM 2차 · B2) '내 표식이 아직 서 있는가' 는 **순번**으로 가린다 — 시각 값이 같은 다른 인계의 표식(윈도우 `Instant` 100ns 눈금)을 지우지 않는다.
     pub(crate) fn undo_handoff(&self, m: HandoffMark) {
         let mut g = self.handed_at.lock().unwrap_or_else(|e| e.into_inner());
-        if *g == Some(m.mine) {
-            *g = m.prev;
+        if g.cur.is_some_and(|c| c.seq == m.mine.seq) {
+            g.cur = m.prev;
         }
     }
 
@@ -1422,7 +1432,7 @@ impl InjectTrack {
     /// 실패 방향 = 보류(지연): 표식이 풀리지 않는 경우는 writer 가 끝내 그 arm 을 쓰지 못한 때뿐이다(막힘 · 종료). 호출부는
     /// 경과가 막힘 문턱을 넘으면 막힌 writer 로 본다(채널 `CHANNEL_WRITER_STUCK_SECS` → `WriterBusy` · 15s sweep).
     pub(crate) fn handoff_pending(&self) -> Option<std::time::Duration> {
-        let handed = (*self.handed_at.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let handed = self.handed_at.lock().unwrap_or_else(|e| e.into_inner()).cur?.at;
         let done = *self.done_at.lock().unwrap_or_else(|e| e.into_inner());
         done.map_or(true, |d| d < handed).then(|| handed.elapsed())
     }
@@ -1430,17 +1440,36 @@ impl InjectTrack {
     /// 검체 전용 — 인계 시각을 과거로 옮긴다(writer 가 오래 집지 못한 인계 재현). 소비 검체(h3_handoff_stuck_…)가 cfg(unix) 라 같은 게이트.
     #[cfg(all(test, unix))]
     pub(crate) fn backdate_handoff(&self, by: std::time::Duration) {
-        if let Some(t) = self.handed_at.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            *t -= by;
+        if let Some(t) = self.handed_at.lock().unwrap_or_else(|e| e.into_inner()).cur.as_mut() {
+            t.at -= by;
         }
     }
 }
 
-/// [`InjectTrack::note_handoff`] 의 되돌림 증표(인계 실패 시 [`InjectTrack::undo_handoff`]).
+/// ★(R2F-DM 2차 · 성찰 2회차 B2) 인계 표식 한 건 — 넘긴 단조 시각(`at` · 경과·선후 판정 전용)과 **순번**(`seq` · '같은 표식인가' 판정 전용).
+///
+/// 【왜 순번인가】 종전에는 표식의 동일성을 `Instant` 값으로 가렸다([`InjectTrack::undo_handoff`] 의 "그 사이 다른 인계가 표식을 덮었으면 건드리지 않는다").
+/// 윈도우 `Instant` 는 100ns 눈금이라 연달아 찍은 두 표식이 **같은 값**을 받을 수 있고(윈도우 러너 실측 — 검체 `inject_track_handoff_pending_until_an_arm_ends` 의 ④),
+/// 그때 앞 인계의 되돌림이 뒤 인계의 표식을 지운다. 시각은 '언제' 이지 '무엇' 이 아니다 — 동일성은 표식 락 안에서 매기는 단조 증가 순번으로 가린다.
+/// 시간 판정([`InjectTrack::handoff_pending`] 의 경과 · `done_at` 과의 선후)은 종전대로 `at` 만 읽는다(동작 불변).
+#[derive(Debug, Clone, Copy)]
+struct HandoffStamp {
+    at: Instant,
+    seq: u64,
+}
+
+/// [`InjectTrack`] 의 `handed_at` 락이 지키는 것 — 지금 서 있는 표식과, 이 좌석에서 지금까지 매긴 순번의 수(단조 증가 — 되돌려도 줄지 않는다 = 한 번 쓴 순번은 다시 쓰지 않는다).
+#[derive(Debug, Default)]
+struct HandoffSlot {
+    cur: Option<HandoffStamp>,
+    issued: u64,
+}
+
+/// [`InjectTrack::note_handoff`] 의 되돌림 증표(인계 실패 시 [`InjectTrack::undo_handoff`]) — 덮기 전의 표식과 내 표식(각각 시각 + 순번).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HandoffMark {
-    prev: Option<Instant>,
-    mine: Instant,
+    prev: Option<HandoffStamp>,
+    mine: HandoffStamp,
 }
 
 /// PTY 쓰기 요청 — surface별 전용 writer 스레드가 순서대로 소비한다.
@@ -4510,10 +4539,27 @@ pub fn reconcile_restored_feed(
     rep
 }
 
+/// ★(R2F-DM 2차 · 성찰 2회차 B1) 데몬 벽시계의 **해상도 = 마이크로초**(내림) — 유닉스 기원 뒤 경과(`Duration`) → epoch 초(`f64`).
+///
+/// 【왜】 윈도우 `SystemTime` 은 100ns(리눅스는 1ns) 해상도라 `as_secs_f64()` 가 유효숫자 17자리 값을 낸다. `serde_json` 의 기본 파서는 `significand as f64 / 10^k`
+/// (두 번 반올림)라 그런 값의 약 10 % 를 같은 값으로 돌려주지 못한다 — 저장·와이어를 한 번 지난 시각이 원래 값과 1ulp 어긋난다(승인 서명 불일치
+/// [`crate::approval::quantize_epoch_us`] · 윈도우 러너의 큐 WAL 왕복 검체 둘이 이 뿌리다). 맥은 벽시계가 1µs 라 **시각**에서는 이 계급이 통째로 없다.
+/// 생산자마다 따로 막는 대신 **원천에서** 윈도우·리눅스를 맥과 같은 해상도로 맞춘다. (0.14.43 K1 의 ABI 거짓 양성도 같은 파서 한계지만 그쪽은 시각이 아닌 17자리 부동소수 —
+/// 경과·차 — 도 실리는 와이어 프레임의 일이라 맥에서도 났고, 프레임마다 스스로 재파싱해 가르는 K1 이 그대로 맡는다. 이 함수는 그 판정을 바꾸지 않는다.)
+/// 【값】 `N = d.as_micros()`(N < 2^53 — 서기 2255 년까지 `f64` 로 정확)를 10^6 으로 **한 번** 나눈다 = `N / 10^6` 에 가장 가까운 `f64` = 유효숫자 16자리 이하 →
+/// 기본 파서의 빠른 길(정수 유효수 ÷ 10^k 한 번)이 같은 값을 돌려준다. **내림**이라 입력보다 큰(미래) 시각을 만들지 않는다. 마이크로초 눈금의 입력(맥)은
+/// `as_secs_f64()` 와 비트까지 같다(검체가 2만 값으로 잰다).
+/// 【범위】 '지금'(벽시계)의 원천만 맞춘다 — 그 값에 분모가 2의 거듭제곱이 아닌 소수(0.1 등)를 더한 파생값·파일 mtime·바깥에서 들어온 시각은 여전히 17자리일 수 있다
+/// (맥에서도 같다 · 이 함수가 새로 만든 성질이 아니다). 승인 쪽의 [`crate::approval::quantize_epoch_us`] 는 그대로 둔다(안전 게이트의 이중 방어).
+pub(crate) fn epoch_secs_us(d: std::time::Duration) -> f64 {
+    d.as_micros() as f64 / 1e6
+}
+
+/// 지금(벽시계)의 epoch 초 — 해상도는 마이크로초다([`epoch_secs_us`] · 맥의 시계와 같은 눈금 · 윈도우·리눅스의 100ns·1ns 는 내린다).
 pub fn now_epoch() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f64())
+        .map(epoch_secs_us)
         .unwrap_or(0.0)
 }
 
@@ -4680,6 +4726,131 @@ pub(crate) fn fs_socket_state_dir(socket_path: &std::path::Path) -> Option<PathB
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."))
     })
+}
+
+/// ★(R2F-DM 2차 · 성찰 2회차 B3-b) **검체 끝정리 전용** — 검체가 만든 임시 폴더를 지운다.
+///
+/// 유닉스는 종전의 `std::fs::remove_dir_all(..).unwrap()` 과 같은 엄격함(실패하면 패닉)이다. 윈도우는 열린 핸들이 남은 파일을 지울 수 없어(`os error 32` · 공유 위반 —
+/// 윈도우 러너 진단 잡 37201047193 의 4건: 데몬을 놓은 직후·좌석을 닫은 직후의 상태 폴더 · 누가 쥐고 있었는지는 재지 않았다) 약 2초 다시 시도한 뒤 남은 실패를 **무시**한다 — 끝정리 실패는 그 검체가 재는 것이 아니고 임시 폴더는 러너가 치운다.
+/// ★**끝정리 자리에만** 쓴다. 삭제가 검체의 한 단계인 곳('실패 주입 해제' · 지운 뒤 없음을 단언하는 곳)에는 쓰지 않는다 — 거기서는 삭제 실패가 곧 검체의 실패여야 한다.
+#[cfg(test)]
+pub(crate) fn test_rm_rf(path: &std::path::Path) {
+    let res = test_rm_rf_policy(
+        cfg!(unix),
+        std::time::Duration::from_secs(2),
+        std::time::Duration::from_millis(100),
+        || std::fs::remove_dir_all(path),
+    );
+    if let Err(e) = res {
+        panic!("검체 끝정리 실패({}): {e}", path.display());
+    }
+}
+
+/// [`test_rm_rf`] 의 판정(순수 — 삭제 동작과 시한을 인자로 받는다 · 맥에서 윈도우 갈래를 잰다). 반환 `Ok(시도 횟수)`.
+/// `strict`(유닉스) = 한 번 시도하고 실패를 그대로 돌려준다(호출부가 패닉). 아니면(윈도우) 이미 없는 폴더는 성공으로 보고, 그 밖의 실패는 `budget` 동안 `pause` 간격으로
+/// 다시 시도한 뒤 무시한다(`Ok`).
+#[cfg(test)]
+pub(crate) fn test_rm_rf_policy(
+    strict: bool,
+    budget: std::time::Duration,
+    pause: std::time::Duration,
+    mut remove: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<u32> {
+    let t0 = Instant::now();
+    let mut tries = 0u32;
+    loop {
+        tries += 1;
+        match remove() {
+            Ok(()) => return Ok(tries),
+            Err(e) if strict => return Err(e),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(tries),
+            Err(_) if t0.elapsed() >= budget => return Ok(tries),
+            Err(_) => std::thread::sleep(pause),
+        }
+    }
+}
+
+/// ★(R2F-DM 2차 · 성찰 2회차 B3-e) **검체 전용** — 좌석의 PTY 출력이 끼어들지 않은 관측을 얻을 때까지 `attempt` 를 (유한 번) 되풀이한다.
+///
+/// 【왜】 화면을 파서에 직접 그린 뒤 곧바로 판정을 재는 검체는 "그 사이 좌석이 아무것도 내지 않는다"를 전제한다. 유닉스 좌석(`sleep 30`)은 그 전제가 언제나 참이지만
+/// 윈도우에서는 좌석이 뜬 직후에도 PTY 출력이 온다(ConPTY 의 초기화 출력으로 본다 — 그 내용·시각은 재지 않았다). reader 가 그 청크를 반영하는 **도중**(출력 세대 홀수)이나 직후에 판정이 돌면 제품은 옳게도 '출력 중'·'관측 불능'이라
+/// 답하고(`prompt_gate_verdict` 의 `frame_published` · `quiet_secs_consistent` 의 0.0 · `input_line_visibility` 의 `(None, None)`), 다른 사유를 기대한 검체가 붉어진다
+/// (윈도우 러너 진단 잡 37201047193 의 4건 · 맥에서 발행 중 프레임(세대 홀수)을 주어 네 건 모두 같은 메시지로 재현했다). 그 전제를 **잠(시각)으로 맞추지 않고 출력 세대로 증명**한다: 시도 앞뒤의 `output_gen` 이 **같고 짝수**면 그 창에서 reader 는 아무것도
+/// 반영하지 않았다(reader 는 [홀수 → `last_output` 스탬프 → 파서 반영 → 짝수] 순서다 — 소스 핀 `output_generation_bracket_source_pin`). 그런 시도의 결과만 돌려주고,
+/// 아니면 잠깐(시도마다 길어진다) 쉬었다가 다시 한다. 유닉스에서는 첫 시도가 그대로 통과한다(검체의 뜻과 단언은 그대로다).
+///
+/// `attempt` 에는 **전제 설정(화면 그리기·시각 되감기)부터 관측까지**를 담고 단언은 담지 않는다 — 단언은 돌려받은 값으로 호출부가 한다(끼어든 시도의 값으로 단언하지 않는다).
+/// 끝내 조용한 창을 얻지 못하면(좌석이 계속 출력한다) 패닉한다 — 전제가 서지 않은 것을 통과로 접지 않는다.
+#[cfg(test)]
+pub(crate) fn test_until_no_pty_output<T>(s: &Surface, what: &str, attempt: impl FnMut() -> T) -> T {
+    const MAX_TRIES: u32 = 60;
+    match test_until_quiet_window(|| s.output_gen.load(Ordering::Acquire), MAX_TRIES, 25, attempt) {
+        Ok(v) => v,
+        Err(tries) => panic!("{what}: 전제 불성립 — 좌석 PTY 출력이 {tries}회 시도 내내 관측 창에 끼어들었다(좌석이 계속 출력한다)"),
+    }
+}
+
+/// [`test_until_no_pty_output`] 의 코어(순수 — 세대 판독과 시한을 인자로 받는다). `Ok(값)` = 조용한 창에서 얻은 결과 · `Err(시도 횟수)` = 끝내 얻지 못했다.
+/// 시도 사이의 쉼은 `pause_step_ms × min(시도 번호, 12)` 밀리초다(0 이면 쉬지 않는다 — 검체용).
+#[cfg(test)]
+pub(crate) fn test_until_quiet_window<T>(
+    read_gen: impl Fn() -> u64,
+    max_tries: u32,
+    pause_step_ms: u64,
+    mut attempt: impl FnMut() -> T,
+) -> Result<T, u32> {
+    for i in 0..max_tries {
+        let before = read_gen();
+        let out = attempt();
+        let after = read_gen();
+        if test_pty_window_quiet(before, after) {
+            return Ok(out);
+        }
+        if pause_step_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(pause_step_ms * u64::from(i.min(11) + 1)));
+        }
+    }
+    Err(max_tries)
+}
+
+/// [`test_until_quiet_window`] 의 판정(순수) — 관측 창 앞뒤의 출력 세대가 **같고 짝수**일 때만 조용한 창이다(홀수 = 발행 중 · 다름 = 그 사이 청크가 반영됐다).
+#[cfg(test)]
+pub(crate) fn test_pty_window_quiet(gen_before: u64, gen_after: u64) -> bool {
+    gen_before % 2 == 0 && gen_before == gen_after
+}
+
+/// ★(R2F-DM 2차 · B3-e) [`test_until_no_pty_output`] 의 짝 — **성공이 좌석에 쓰는 일**인 단계(큐 배달: 그 에코가 출력 세대를 움직이므로 '조용한 창' 으로는 성공을 가릴 수 없다)에 쓴다.
+/// `attempt` 가 참(해냈다)을 돌려주면 그대로 참이다. 거짓이면 — 그 시도의 관측 창에 좌석 출력이 끼어들었을 때만(윈도우 ConPTY 의 기동 출력) 다시 하고, 조용한 창에서의 거짓은 그대로 거짓이다.
+/// ★유닉스에서는 다시 하지 않는다(한 번 = 종전 검체와 같다): 유닉스 좌석(`sleep 30`)은 스스로 출력하지 않으므로 끼어든 출력은 제품이 좌석에 쓴 것뿐이고, 그것을 재시도로 덮으면
+/// '좌석에 쓰고도 큐에서 빼지 않은' 결함을 가릴 수 있다.
+#[cfg(test)]
+pub(crate) fn test_done_or_no_pty_output(s: &Surface, attempt: impl FnMut() -> bool) -> bool {
+    test_done_or_quiet_window(|| s.output_gen.load(Ordering::Acquire), cfg!(unix), 60, 25, attempt)
+}
+
+/// [`test_done_or_no_pty_output`] 의 코어(순수 — 세대 판독·엄격 여부·시한을 인자로 받는다 · 맥에서 윈도우 갈래를 잰다).
+#[cfg(test)]
+pub(crate) fn test_done_or_quiet_window(
+    read_gen: impl Fn() -> u64,
+    single_try: bool,
+    max_tries: u32,
+    pause_step_ms: u64,
+    mut attempt: impl FnMut() -> bool,
+) -> bool {
+    for i in 0..max_tries {
+        let before = read_gen();
+        if attempt() {
+            return true;
+        }
+        let after = read_gen();
+        if single_try || test_pty_window_quiet(before, after) {
+            return false;
+        }
+        if pause_step_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(pause_step_ms * u64::from(i.min(11) + 1)));
+        }
+    }
+    false
 }
 
 /// 영속 상태 디렉터리 — 소켓과 같은 곳 (unix). Windows는 LOCALAPPDATA 하위.
@@ -9899,7 +10070,8 @@ mod tests {
         }
         crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::OwnerClose)
             .expect("surface 종료 및 자식 프로세스 회수");
-        std::fs::remove_dir_all(sock.parent().unwrap()).expect("테스트 상태 디렉터리 정리");
+        // ★(R2F-DM 2차 · B3-b) 끝정리 — 유닉스는 종전처럼 엄격(실패 = 패닉) · 윈도우는 공유 위반(os error 32)을 잠깐 다시 시도한 뒤 무시한다(이 검체는 데몬을 쥔 채 지운다).
+        test_rm_rf(sock.parent().unwrap());
     }
 
     fn sample_feed_item(id: &str, body: String) -> FeedItem {
@@ -12957,5 +13129,413 @@ mod r2f_dm_state_dir_tests {
             let i = src.find(head).unwrap_or_else(|| panic!("{head} 소실"));
             assert!(src[..i].trim_end().ends_with("#[cfg(test)]"), "{head} 는 `#[cfg(test)]` 여야 한다 — 제품 빌드에 새 함수가 생기면 안 된다");
         }
+    }
+}
+
+/// ★(R2F-DM 2차 · 성찰 2회차) 윈도우 재측정 잔여 15건 — 제품 수정 둘(B1 벽시계 해상도 [`epoch_secs_us`] · B2 인계 표식의 동일성 [`InjectTrack::note_handoff`])과
+/// 검체 도우미 둘(끝정리 [`test_rm_rf`] · 조용한 관측 창 [`test_until_no_pty_output`])의 검체. 윈도우 시계·눈금은 맥에서 결정론 격자·이음매로 모사한다.
+#[cfg(test)]
+mod r2f_dm2_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// 결정론 시각 격자 — 고정 시작(2026-10-04 근방) · 고정 보폭(7,919,113 칸) · 칸 크기 `unit_ns`(100 = 윈도우 `SystemTime` · 1 = 리눅스 `clock_gettime` · 1000 = 맥).
+    /// 승인 검체(`approval::tests::r2f_grid_epoch`)와 같은 격자를 `Duration` 으로 돌려준다(이쪽 함수의 입력이 `Duration` 이다).
+    fn grid(unit_ns: u64, i: u64) -> Duration {
+        let total_ns: u128 = 1_791_102_000u128 * 1_000_000_000 + (i as u128) * 7_919_113u128 * (unit_ns as u128);
+        Duration::new((total_ns / 1_000_000_000) as u64, (total_ns % 1_000_000_000) as u32)
+    }
+
+    /// `x` 를 JSON 으로 쓰고 읽는다 — 데몬이 실제로 타는 두 판독 길(`from_str::<f64>` · `from_str::<Value>` → `as_f64`)과 쓴 문자열.
+    fn json_roundtrip(x: f64) -> (f64, f64, String) {
+        let text = serde_json::to_string(&x).expect("직렬화");
+        let via_f64: f64 = serde_json::from_str(&text).expect("f64 판독");
+        let via_value = serde_json::from_str::<Value>(&text).expect("Value 판독").as_f64().expect("수치");
+        (via_f64, via_value, text)
+    }
+
+    /// 두 길 가운데 하나라도 `to_bits()` 까지 같지 않으면 참.
+    fn lossy(x: f64) -> bool {
+        let (a, b, _) = json_roundtrip(x);
+        a.to_bits() != x.to_bits() || b.to_bits() != x.to_bits()
+    }
+
+    /// ① [순수 · 진리표] 100ns(윈도우)·1ns(리눅스) 입력은 마이크로초로 **내려가고**(소수 6자리 이하 · 입력보다 크지 않다), 마이크로초 눈금의 입력(맥)은 `as_secs_f64()` 와 비트까지 같다.
+    /// 첫 두 값은 윈도우 러너 원문(진단 잡 37201047193)의 그 시각이다 — `queue_seq_seeds_…`(#14)의 `1791116826.7416139` · `wp5_r2_expired_notice_…`(#4)의 `1791116349.2647007`.
+    #[test]
+    fn r2f_dm2_epoch_secs_us_truth_table() {
+        let us = |secs: u64, nanos: u32| epoch_secs_us(Duration::new(secs, nanos));
+        assert_eq!(us(1_791_116_826, 741_613_900).to_bits(), 1791116826.741613_f64.to_bits(), "#14 의 원시 시각(100ns 눈금)");
+        assert_eq!(us(1_791_116_349, 264_700_700).to_bits(), 1791116349.2647_f64.to_bits(), "#4 의 원시 시각(100ns 눈금)");
+        // 1ns 입력 — **내림**이다(반올림이면 …614 가 되어 입력보다 큰 시각이 생긴다).
+        assert_eq!(us(1_791_116_826, 741_613_999).to_bits(), 1791116826.741613_f64.to_bits());
+        assert_eq!(us(1_791_116_826, 741_613_001).to_bits(), 1791116826.741613_f64.to_bits());
+        // 마이크로초 아래만 다른 입력은 같은 값이고, 다음 마이크로초는 더 큰 값이다.
+        assert_eq!(us(1_791_116_826, 741_613_000).to_bits(), us(1_791_116_826, 741_613_999).to_bits());
+        assert!(us(1_791_116_826, 741_614_000) > us(1_791_116_826, 741_613_999));
+        assert_eq!(us(0, 0).to_bits(), 0.0f64.to_bits());
+        assert_eq!(us(0, 999).to_bits(), 0.0f64.to_bits());
+        // 마이크로초 눈금의 입력(맥의 시계)은 그대로다 — 종전 식(`as_secs_f64()`)과 비트까지 같다.
+        for (s, n) in [(1_791_116_826u64, 741_613_000u32), (1_791_116_826, 0), (1_791_116_826, 999_999_000), (1_791_116_826, 1_000), (1, 500_000_000), (0, 0)] {
+            let d = Duration::new(s, n);
+            assert_eq!(epoch_secs_us(d).to_bits(), d.as_secs_f64().to_bits(), "{s}.{n:09}: 마이크로초 눈금의 입력이 바뀌었다");
+        }
+        // 소수 6자리 이하 · 입력보다 크지 않다 · 값은 정확히 '마이크로초 내림'이다.
+        for (s, n) in [
+            (1_791_116_826u64, 741_613_900u32),
+            (1_791_116_349, 264_700_700),
+            (1_791_116_826, 741_613_999),
+            (1_791_116_826, 999_999_999),
+            (1_791_116_826, 1),
+            (1_791_116_826, 99),
+        ] {
+            let d = Duration::new(s, n);
+            let v = epoch_secs_us(d);
+            let text = format!("{v}");
+            let frac = text.split_once('.').map_or(0, |(_, f)| f.len());
+            assert!(frac <= 6, "{s}.{n:09} → {text}: 소수 {frac}자리(기대 ≤ 6)");
+            assert!(v <= d.as_secs_f64(), "{s}.{n:09} → {text}: 입력보다 크다(미래 시각)");
+            assert_eq!((v * 1e6).round() as u128, d.as_micros(), "{s}.{n:09} → {text}: 마이크로초 내림값이 아니다");
+        }
+    }
+
+    /// ② 100ns 격자·1ns 격자 각 20,000 값 — [`epoch_secs_us`] 의 값은 **두 판독 길 모두 비트까지 정확히** 돌아온다(불일치 0) · 유효숫자 16자리 이하 · 입력보다 크지 않다 · 정확히 마이크로초 내림.
+    /// 그 값에 정수 초를 더하고 뺀 파생 시각(큐 항목의 `지금 − 60` · TTL 합)도 같다(#4 가 재는 값). 맥 격자(1µs) 20,000 값은 종전 식과 비트까지 같다(맥은 값 불변).
+    /// 공허 방지: 같은 격자의 **원시** 값(`as_secs_f64()`)은 기본 파서에서 1,000건 이상 어긋난다 — 함수가 항등(원시 값 그대로)이면 아래 단언이 붉다.
+    #[test]
+    fn r2f_dm2_epoch_secs_us_survives_the_default_json_parser_on_the_100ns_and_1ns_grids() {
+        for (label, unit) in [("100ns(윈도우 시계)", 100u64), ("1ns(리눅스 시계)", 1u64)] {
+            let (mut raw_lossy, mut us_lossy, mut derived_lossy, mut future, mut not_floor) = (0u32, 0u32, 0u32, 0u32, 0u32);
+            let (mut max_digits, mut max_shift) = (0usize, 0f64);
+            let mut first_bad: Option<Duration> = None;
+            for i in 0..20_000u64 {
+                let d = grid(unit, i);
+                let raw = d.as_secs_f64();
+                if lossy(raw) {
+                    raw_lossy += 1;
+                }
+                let v = epoch_secs_us(d);
+                if lossy(v) {
+                    us_lossy += 1;
+                    first_bad.get_or_insert(d);
+                }
+                if v > raw {
+                    future += 1;
+                }
+                if (v * 1e6).round() as u128 != d.as_micros() {
+                    not_floor += 1;
+                }
+                max_shift = max_shift.max(raw - v);
+                let (_, _, text) = json_roundtrip(v);
+                max_digits = max_digits.max(text.bytes().filter(u8::is_ascii_digit).count());
+                for off in [-60.0, 1.0, 60.0, 3_600.0] {
+                    if lossy(v + off) {
+                        derived_lossy += 1;
+                        first_bad.get_or_insert(d);
+                    }
+                }
+            }
+            assert!(
+                raw_lossy >= 1_000,
+                "{label}: 원시 값이 기본 파서에서 {raw_lossy}/20000 건만 어긋난다 — 이 검체의 전제가 사라졌다(`serde_json` 의 `float_roundtrip` 이 켜졌나? 0.14.43 K1 검체도 함께 점검하라)"
+            );
+            assert_eq!(
+                (us_lossy, derived_lossy, future, not_floor),
+                (0, 0, 0, 0),
+                "{label}: 마이크로초 시각이 JSON 왕복에서 바뀌었거나(지금 {us_lossy}건 · 정수 초 파생 {derived_lossy}건) 입력보다 크거나({future}건) 내림값이 아니다({not_floor}건) · 첫 불일치 입력 {first_bad:?}"
+            );
+            assert!(max_digits <= 16, "{label}: 값의 유효숫자가 {max_digits}자리다(기대 ≤ 16)");
+            // 정확 산술이면 < 1µs 지만 두 값이 각각 가장 가까운 `f64`(칸 약 2.4e-7 초)로 가므로 차는 1µs + 한 칸까지 간다.
+            assert!(max_shift < 1.25e-6, "{label}: 내림이 값을 {max_shift:e} 초 옮겼다(기대 < 1µs + f64 한 칸)");
+        }
+        for i in 0..20_000u64 {
+            let d = grid(1_000, i);
+            assert_eq!(epoch_secs_us(d).to_bits(), d.as_secs_f64().to_bits(), "1µs(맥 시계) 격자 i={i}: 값이 종전 식과 다르다 — 맥에서 시각이 바뀐다");
+        }
+    }
+
+    /// 함수 원문 — `head` 부터 첫 `\n}\n` 앞까지(문서 주석 제외).
+    fn fn_src<'a>(src: &'a str, head: &str) -> &'a str {
+        let i = src.find(head).unwrap_or_else(|| panic!("`{head}` 소실"));
+        let rest = &src[i..];
+        &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("`{head}` 의 끝을 찾지 못했다"))]
+    }
+
+    /// ③ [소스 핀] 데몬의 두 `now_epoch`(state · events) 본문이 벽시계를 [`epoch_secs_us`] 로 읽는다 — 원시 `as_secs_f64()` 로 되돌리면 붉다(맥의 시계는 1µs 라 동작 검체로는 그 회귀가 보이지 않는다).
+    /// 그 함수의 식(마이크로초 정수 ÷ 10^6 한 번)과, 데몬 소스 전체에서 `now_epoch` 정의가 이 둘뿐임(세 번째 사본이 원시 시계를 들고 생기지 않는다)도 함께 박는다. 바늘은 조각으로 이어 이 줄이 자기 자신에 걸리지 않게 한다.
+    #[test]
+    fn r2f_dm2_both_now_epoch_bodies_read_the_clock_through_epoch_secs_us_source_pin() {
+        let st = include_str!("state.rs");
+        let ev = include_str!("events.rs");
+        let bodies = [
+            ("state", fn_src(st, concat!("\npub fn now_", "epoch() -> f64 {")), concat!(".map(epoch_secs", "_us)")),
+            ("events", fn_src(ev, concat!("\nfn now_", "epoch() -> f64 {")), concat!(".map(crate::state::epoch_secs", "_us)")),
+        ];
+        for (name, body, call) in bodies {
+            assert!(
+                body.contains("std::time::SystemTime::now()") && body.contains(".duration_since(std::time::UNIX_EPOCH)"),
+                "{name}::now_epoch 가 벽시계(`SystemTime::now()` − `UNIX_EPOCH`)를 읽지 않는다:\n{body}"
+            );
+            assert!(body.contains(call), "{name}::now_epoch 가 `epoch_secs_us` 로 초를 만들지 않는다 — 윈도우·리눅스 시각이 다시 17자리가 된다:\n{body}");
+            assert!(!body.contains(concat!("as_secs", "_f64")), "{name}::now_epoch 가 원시 `as_secs_f64()` 를 쓴다 — 윈도우·리눅스 시각이 다시 17자리가 된다:\n{body}");
+        }
+        let f = fn_src(st, concat!("\npub(crate) fn epoch_secs", "_us(d: std::time::Duration) -> f64 {"));
+        assert!(f.contains(concat!("d.as_micros() as f64 ", "/ 1e6")), "`epoch_secs_us` 의 식이 바뀌었다(마이크로초 정수를 10^6 으로 한 번 나눈다):\n{f}");
+        // 데몬 소스 전체(디렉터리 스캔 · 주석 줄 제외)에서 `now_epoch` 정의는 state·events 한 곳씩뿐이다.
+        let needle = concat!("fn now_", "epoch(");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
+        let mut defs: Vec<(String, usize)> = Vec::new();
+        let mut scanned = 0usize;
+        for e in std::fs::read_dir(&dir).expect("cysd 소스 디렉터리") {
+            let file = e.expect("항목").file_name().to_string_lossy().to_string();
+            if !file.ends_with(".rs") {
+                continue;
+            }
+            scanned += 1;
+            let text = std::fs::read_to_string(dir.join(&file)).expect("소스 읽기");
+            let n: usize = text.lines().filter(|l| !l.trim_start().starts_with("//")).map(|l| l.matches(needle).count()).sum();
+            if n > 0 {
+                defs.push((file, n));
+            }
+        }
+        defs.sort();
+        assert!(scanned >= 20, "데몬 소스 스캔이 공허하다({scanned}개)");
+        assert_eq!(
+            defs,
+            vec![("events.rs".to_string(), 1), ("state.rs".to_string(), 1)],
+            "데몬의 `now_epoch` 정의처가 바뀌었다 — 새 사본은 `epoch_secs_us` 를 쓰고 이 핀의 목록에 넣어라"
+        );
+    }
+
+    /// ★(B2) 인계 표식의 동일성은 **순번**이다 — 같은 `Instant` 를 받은 두 표식을 가른다(윈도우 `Instant` 는 100ns 눈금이라 연달아 찍은 두 표식이 같은 값을 받을 수 있다 ·
+    /// 윈도우 러너 실측: 진단 잡 37201047193 의 `inject_track_handoff_pending_until_an_arm_ends` ④ "뒤 인계의 표식을 앞 인계의 되돌림이 지웠다"). 같은 시각을 두 번 넣어 결정론으로 재현한다.
+    /// 시간 판정(`handoff_pending` 의 경과 · 끝난 arm 과의 선후)은 종전대로 넘긴 시각만 본다.
+    #[test]
+    fn r2f_dm2_handoff_marks_with_the_same_instant_are_told_apart_by_sequence() {
+        let t = Instant::now();
+        // ① 같은 시각의 두 표식 — 앞 인계의 되돌림은 뒤 인계의 표식을 지우지 않는다.
+        let track = InjectTrack::default();
+        let stale = track.note_handoff_at(t);
+        let newer = track.note_handoff_at(t);
+        track.undo_handoff(stale);
+        assert!(track.handoff_pending().is_some(), "같은 시각을 받은 뒤 인계의 표식을 앞 인계의 되돌림이 지웠다(동일성을 시각 값으로 가렸다)");
+        // ② 뒤 인계를 되돌리면 그 앞의 표식(stale — 아직 어떤 arm 도 끝나지 않았다)으로 돌아간다 — 종전 계약 그대로.
+        track.undo_handoff(newer);
+        assert!(track.handoff_pending().is_some(), "뒤 인계를 되돌렸는데 앞 인계의 표식이 복원되지 않았다");
+        // ③ 그 표식도 되돌리면 빈 좌석이다.
+        track.undo_handoff(stale);
+        assert!(track.handoff_pending().is_none(), "남은 표식을 되돌렸는데 대기가 남았다");
+        // ④ 순번은 다시 쓰이지 않는다 — 되돌린 표식의 증표를 한 번 더 내밀어도(같은 시각의) 새 표식을 지우지 못한다.
+        let track = InjectTrack::default();
+        let first = track.note_handoff_at(t);
+        track.undo_handoff(first);
+        let _second = track.note_handoff_at(t);
+        track.undo_handoff(first);
+        assert!(track.handoff_pending().is_some(), "이미 되돌린 표식의 증표가 같은 시각의 새 표식을 지웠다(순번이 재사용됐다)");
+        // ⑤ 시간 판정은 종전대로 넘긴 시각만 본다: 끝난 arm 이 인계보다 뒤이거나 같으면 대기가 아니고, 그 뒤 시각의 인계는 다시 대기다.
+        let track = InjectTrack::default();
+        let _m = track.note_handoff_at(t);
+        track.end();
+        assert!(track.handoff_pending().is_none(), "arm 이 끝났는데(done_at ≥ handed_at) 인계 대기가 남았다");
+        let _later = track.note_handoff_at(Instant::now() + Duration::from_secs(1));
+        assert!(track.handoff_pending().is_some(), "끝난 arm 보다 뒤 시각의 인계가 대기로 보이지 않는다");
+        // ⑥ 경과는 넘긴 시각부터다(과거 시각으로 넘긴 표식 — 부팅 직후라 뺄 수 없으면 건너뛴다).
+        if let Some(past) = Instant::now().checked_sub(Duration::from_secs(5)) {
+            let track = InjectTrack::default();
+            let _m = track.note_handoff_at(past);
+            assert!(track.handoff_pending().is_some_and(|age| age >= Duration::from_secs(5)), "인계의 경과가 넘긴 시각부터가 아니다");
+        }
+    }
+
+    /// ★(B3-b) 끝정리 도우미의 판정 — 유닉스(엄격)는 한 번 시도하고 실패를 그대로 돌려주고(이미 없는 폴더도 실패다 — 종전 `.unwrap()` 과 같다), 윈도우(느슨)는 다시 시도한 뒤 무시한다.
+    /// 맥에서 두 갈래를 모두 잰다(삭제 동작을 인자로 받는다). 실제 폴더는 이 호스트의 갈래로 지워진다.
+    #[test]
+    fn r2f_dm2_test_rm_rf_policy_is_strict_on_unix_and_retries_then_ignores_elsewhere() {
+        use std::io::{Error, ErrorKind};
+        let busy = || Error::from_raw_os_error(32);
+        let (long, none) = (Duration::from_secs(5), Duration::ZERO);
+        // 엄격(유닉스): 한 번 · 실패는 실패.
+        let mut n = 0u32;
+        let r = test_rm_rf_policy(true, long, none, || {
+            n += 1;
+            Err(busy())
+        });
+        assert!(r.is_err() && n == 1, "유닉스: 삭제 실패를 삼켰거나 다시 시도했다({r:?} · {n}회)");
+        let mut n = 0u32;
+        let r = test_rm_rf_policy(true, long, none, || {
+            n += 1;
+            Err(Error::from(ErrorKind::NotFound))
+        });
+        assert!(r.is_err() && n == 1, "유닉스: 없는 폴더의 끝정리는 종전처럼 실패여야 한다({r:?})");
+        assert_eq!(test_rm_rf_policy(true, long, none, || Ok(())).ok(), Some(1));
+        // 느슨(윈도우): 성공할 때까지 다시 시도한다 · 이미 없으면 성공.
+        let mut n = 0u32;
+        let r = test_rm_rf_policy(false, long, none, || {
+            n += 1;
+            if n < 3 {
+                Err(busy())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(r.ok(), Some(3), "윈도우: 공유 위반이 풀린 뒤의 재시도가 성공으로 끝나지 않았다");
+        assert_eq!(test_rm_rf_policy(false, long, none, || Err(Error::from(ErrorKind::NotFound))).ok(), Some(1));
+        // 시한이 지나면 남은 실패를 무시한다(시한 0 = 첫 실패에서 그만둔다) · 시한 안에서는 여러 번 시도한다.
+        let mut n = 0u32;
+        let r = test_rm_rf_policy(false, none, none, || {
+            n += 1;
+            Err(busy())
+        });
+        assert_eq!((r.ok(), n), (Some(1), 1), "윈도우: 시한이 지났는데 실패를 돌려줬거나 계속 시도했다");
+        // (시한은 넉넉히 300ms — 부하로 이 스레드가 잠깐 밀려도 두 번째 시도가 시한 안에 든다.)
+        let mut n = 0u32;
+        let r = test_rm_rf_policy(false, Duration::from_millis(300), Duration::from_millis(10), || {
+            n += 1;
+            Err(busy())
+        });
+        assert!(r.is_ok() && n >= 2, "윈도우: 시한 안에서 다시 시도하지 않았다({n}회)");
+        // 실제 폴더(이 호스트의 갈래) — 유닉스에서는 하위 폴더·파일까지 지워진다.
+        let dir = std::env::temp_dir().join(format!("cys-r2f2-rmrf-{}-{}", std::process::id(), now_epoch().to_bits()));
+        std::fs::create_dir_all(dir.join("a/b")).expect("임시 폴더");
+        std::fs::write(dir.join("a/b/f.txt"), "x").expect("임시 파일");
+        test_rm_rf(&dir);
+        // 유닉스(엄격)에서는 반드시 지워졌다. 윈도우(느슨)에서는 지워지지 않아도 이 도우미의 실패가 아니다 — 여기서 '없음' 을 단언하면 도우미가 덮으려는 바로 그 흔들림을 이 검체가 되살린다.
+        if cfg!(unix) {
+            assert!(!dir.exists(), "끝정리 뒤에도 폴더가 남았다");
+        }
+        // 소스 핀: 운영 도우미는 '유닉스인가'를 엄격 인자로 넘기고 실패하면 패닉한다(유닉스의 엄격함을 조용히 풀지 못하게).
+        let f = fn_src(include_str!("state.rs"), concat!("\npub(crate) fn test_rm", "_rf(path: &std::path::Path) {"));
+        assert!(f.contains("cfg!(unix),") && f.contains("panic!("), "`test_rm_rf` 가 유닉스에서 엄격하지 않다:\n{f}");
+    }
+
+    /// ★(B3-e) 조용한 관측 창의 판정과 재시도 코어 — 관측 창 앞뒤의 출력 세대가 **같고 짝수**일 때만 그 시도의 값을 돌려준다(끼어든 시도의 값으로 단언하지 않는다).
+    /// 조용한 좌석(유닉스의 `sleep 30`)에서는 첫 시도가 그대로 통과하고, 끝내 조용해지지 않으면 통과로 접지 않는다(`Err`).
+    #[test]
+    fn r2f_dm2_quiet_window_rule_and_retry_core() {
+        for (before, after, want) in [(0u64, 0u64, true), (2, 2, true), (1, 1, false), (3, 3, false), (2, 3, false), (2, 4, false), (3, 4, false)] {
+            assert_eq!(test_pty_window_quiet(before, after), want, "({before}, {after})");
+        }
+        // 창 안에서 청크 하나가 통째로 반영된 시도(짝수 → 다른 짝수) 셋은 버리고, 네 번째(조용한 창)의 값만 돌려준다.
+        let gen = AtomicU64::new(0);
+        let mut calls = 0u32;
+        let got = test_until_quiet_window(
+            || gen.load(Ordering::Acquire),
+            10,
+            0,
+            || {
+                calls += 1;
+                if calls <= 3 {
+                    gen.fetch_add(2, Ordering::AcqRel);
+                }
+                calls
+            },
+        );
+        assert_eq!(got, Ok(4), "끼어든 시도의 값을 돌려줬다");
+        // 발행 중(홀수)으로 시작한 창은 세대가 그대로여도 버린다.
+        let gen = AtomicU64::new(1);
+        let mut calls = 0u32;
+        let got = test_until_quiet_window(
+            || gen.load(Ordering::Acquire),
+            10,
+            0,
+            || {
+                calls += 1;
+                if calls == 2 {
+                    gen.store(2, Ordering::Release);
+                }
+                calls
+            },
+        );
+        assert_eq!(got, Ok(3), "발행 중(홀수)이거나 창 안에서 세대가 바뀐 시도의 값을 돌려줬다");
+        // 끝내 조용해지지 않으면 `Err(시도 횟수)` — 전제가 서지 않은 것을 통과로 접지 않는다.
+        let gen = AtomicU64::new(0);
+        let mut calls = 0u32;
+        let got = test_until_quiet_window(
+            || gen.load(Ordering::Acquire),
+            5,
+            0,
+            || {
+                calls += 1;
+                gen.fetch_add(2, Ordering::AcqRel);
+                calls
+            },
+        );
+        assert_eq!((got, calls), (Err(5), 5));
+        // 조용한 좌석에서는 첫 시도가 그대로 통과한다(쉼 없음 · 한 번만 부른다).
+        let gen = AtomicU64::new(8);
+        let mut calls = 0u32;
+        let got = test_until_quiet_window(
+            || gen.load(Ordering::Acquire),
+            5,
+            25,
+            || {
+                calls += 1;
+                "값"
+            },
+        );
+        assert_eq!((got, calls), (Ok("값"), 1));
+
+        // 짝(성공이 좌석에 쓰는 단계 — 큐 배달): 참이면 곧바로 참 · 거짓이면 창에 출력이 끼어든 시도만 다시 한다 · 조용한 창의 거짓은 그대로 거짓 · 유닉스(엄격)는 한 번뿐이다.
+        let gen = AtomicU64::new(0);
+        let mut calls = 0u32;
+        let done = test_done_or_quiet_window(
+            || gen.load(Ordering::Acquire),
+            false,
+            10,
+            0,
+            || {
+                calls += 1;
+                if calls <= 2 {
+                    gen.fetch_add(2, Ordering::AcqRel);
+                    false
+                } else {
+                    true
+                }
+            },
+        );
+        assert_eq!((done, calls), (true, 3), "윈도우 갈래: 출력이 끼어 보류된 두 시도 뒤 세 번째의 성공을 돌려줘야 한다");
+        let gen = AtomicU64::new(0);
+        let mut calls = 0u32;
+        let done = test_done_or_quiet_window(
+            || gen.load(Ordering::Acquire),
+            false,
+            10,
+            0,
+            || {
+                calls += 1;
+                false
+            },
+        );
+        assert_eq!((done, calls), (false, 1), "조용한 창에서의 실패를 다시 시도했다(전제가 선 실패는 그대로 실패다)");
+        let gen = AtomicU64::new(0);
+        let mut calls = 0u32;
+        let done = test_done_or_quiet_window(
+            || gen.load(Ordering::Acquire),
+            true,
+            10,
+            0,
+            || {
+                calls += 1;
+                gen.fetch_add(2, Ordering::AcqRel);
+                false
+            },
+        );
+        assert_eq!((done, calls), (false, 1), "유닉스(엄격): 한 번뿐이어야 한다 — 재시도가 '쓰고도 빼지 않은' 결함을 가린다");
+        let gen = AtomicU64::new(0);
+        let mut calls = 0u32;
+        let done = test_done_or_quiet_window(
+            || gen.load(Ordering::Acquire),
+            false,
+            4,
+            0,
+            || {
+                calls += 1;
+                gen.fetch_add(2, Ordering::AcqRel);
+                false
+            },
+        );
+        assert_eq!((done, calls), (false, 4), "끝내 조용해지지 않으면 실패다(시도 상한)");
+        let f = fn_src(include_str!("state.rs"), concat!("\npub(crate) fn test_done_or_no_pty", "_output(s: &Surface, attempt: impl FnMut() -> bool) -> bool {"));
+        assert!(f.contains("cfg!(unix), 60, 25, attempt"), "`test_done_or_no_pty_output` 이 유닉스에서 한 번뿐이 아니다:\n{f}");
     }
 }

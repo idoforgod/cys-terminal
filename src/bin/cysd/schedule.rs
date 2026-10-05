@@ -5781,6 +5781,7 @@ mod c8_push_counts_submit_tests {
     /// [C8 인계 실패] `try_send` 실패(채널 가득 · writer 종료) → 계수·사람 몫·세대 유지 · 이벤트 0건 · Err 는 종전 문구 그대로.
     /// (RED 돌연변이 M1 = 실패에도 계수를 0 으로 → 이 검체가 적색.)
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 ConPTY 는 자식이 끝나도 출력 파이프를 닫지 않는다 — reader EOF 로 좌석 종료를 아는 경로는 유닉스 전제")]
     fn c8_handoff_failure_leaves_the_count_untouched() {
         use crate::state::WriteReq;
         use std::sync::mpsc::TrySendError;

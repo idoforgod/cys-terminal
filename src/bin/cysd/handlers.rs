@@ -11988,21 +11988,26 @@ mod tests {
             .expect("create surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         let rewound = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5));
-        if let Some(t) = rewound {
-            *s.last_output.lock().unwrap() = t;
-        }
         for params in [
             json!({"surface_id": s.id}),
             json!({"surface_id": s.id, "since_line": 0}),
         ] {
-            let req = Request {
-                id: json!(1),
-                method: "surface.read_text".into(),
-                params: params.clone(),
-            };
-            let Reply::Single(resp) = dispatch(&daemon, req, None) else {
-                panic!("expected single reply");
-            };
+            // ★(R2F-DM 2차 · B3-e) 되감기부터 판독까지를 한 시도로 묶고, 그 창에 좌석 출력이 끼지 않았음을 출력 세대로 증명한 시도의 응답으로만 단언한다 — 윈도우 ConPTY 의 기동 출력이
+            //   끼면 reader 가 스탬프를 다시 찍거나 발행 중이라 제품은 옳게도 0.0 을 답한다(윈도우 러너 진단 잡 37188821194 · 37201047193 에서 이 검체가 `0` 으로 붉었다). 유닉스 좌석은 출력이 없어 첫 시도가 그대로다.
+            let resp = crate::state::test_until_no_pty_output(&s, "read_text quiet_secs", || {
+                if let Some(t) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5)) {
+                    *s.last_output.lock().unwrap() = t;
+                }
+                let req = Request {
+                    id: json!(1),
+                    method: "surface.read_text".into(),
+                    params: params.clone(),
+                };
+                let Reply::Single(resp) = dispatch(&daemon, req, None) else {
+                    panic!("expected single reply");
+                };
+                resp
+            });
             assert_eq!(resp["ok"], json!(true), "read_text 실패: {resp}");
             let q = resp["result"]["quiet_secs"]
                 .as_f64()
@@ -17269,7 +17274,6 @@ mod tests {
         let (daemon, dir) = daemon_with_acl("c5-ghost-parsers", r#"{"default":"allow","rules":[]}"#);
         let suffix = crate::governance::GHOST_CTRL_U_SUFFIX;
         let seat = c5_agent_seat(&daemon, "worker-1", 999_860, 3);
-        c5_paint_prompt(&seat, "", ""); // 계수 3 + 빈 입력줄 = 유령 모양
         let denial = |settle: Option<u64>| -> String {
             let r = draft_gate_denied_response(
                 &daemon,
@@ -17284,7 +17288,12 @@ mod tests {
             r["error"]["message"].as_str().expect("거부 문구").to_string()
         };
         let base = format!("{} [{}:pending_input]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG);
-        let ghost = denial(None);
+        // ★(R2F-DM 2차 · B3-e) 화면을 그리고 거부 문구를 얻는 사이에 좌석 출력이 끼지 않았음을 출력 세대로 증명한 시도의 문구로만 단언한다 — 윈도우 ConPTY 의 기동 출력이 끼면 입력줄 가시성이
+        //   '관측 불능'(`input_line_visibility` 의 발행 중 프레임)이라 제품은 옳게도 처방을 붙이지 않는다(윈도우 러너 진단 잡 37201047193 에서 처방 없는 문구로 붉었다 · 맥에서 발행 중 프레임을 주어 같은 문구로 재현). 유닉스 좌석은 출력이 없어 첫 시도가 그대로다.
+        let ghost = crate::state::test_until_no_pty_output(&seat, "c5_ghost_suffix", || {
+            c5_paint_prompt(&seat, "", ""); // 계수 3 + 빈 입력줄 = 유령 모양
+            denial(None)
+        });
         d12_cleanup(&daemon, &dir);
         assert_eq!(ghost, format!("{base}{suffix}"), "전제: 실제 거부 문구 = 종전 문구 + 맨 끝 처방");
         assert!(ghost.contains(cys::MSG_TYPING_GUARD) && ghost.starts_with(cys::MSG_TYPING_GUARD), "구 CLI `--queued` 폴백 판정(contains)과 접두");
@@ -23857,6 +23866,7 @@ mod tests {
     /// (exited_reclaim)로 통과 — queue.dropped 에 cleared_by/via additive ③reap 재시도 통과.
     /// 대조 핀: cso 라도 **살아있는** 타 surface 의 queue.clear 는 여전히 clear_denied.
     #[test]
+    #[cfg_attr(not(unix), ignore = "윈도우 ConPTY 는 자식이 끝나도 출력 파이프를 닫지 않는다 — reader EOF 로 좌석 종료를 아는 경로는 유닉스 전제")]
     fn reap_denies_queue_nonempty_then_queue_clear_exited_reclaim() {
         let _g = crate::governance::REAP_ENV_LOCK.lock().unwrap();
         let _env = crate::governance::ReapEnvGuard::set(&[("CYS_REAP_EXITED_GRACE_SECS", "0")]);
@@ -23980,7 +23990,8 @@ mod tests {
             .expect("autopilot.paused 미발행");
         assert_eq!(event["payload"].get("reason"), Some(&Value::Null));
         drop(daemon);
-        std::fs::remove_dir_all(dir).unwrap();
+        // ★(R2F-DM 2차 · B3-b) 끝정리 — 유닉스는 종전처럼 엄격(실패 = 패닉) · 윈도우는 공유 위반(os error 32)을 잠깐 다시 시도한 뒤 무시한다.
+        crate::state::test_rm_rf(&dir);
     }
 
     /// 빈 문자열뿐 아니라 공백뿐인 사유도 결측이며, 실제 사유는 trim 후 보존한다.
@@ -24032,7 +24043,8 @@ mod tests {
         assert!(v.get("actor_surface").is_none());
         assert!(v.get("actor_role").is_none());
         drop(daemon);
-        std::fs::remove_dir_all(dir).unwrap();
+        // ★(R2F-DM 2차 · B3-b) 끝정리 — 유닉스는 종전처럼 엄격(실패 = 패닉) · 윈도우는 공유 위반(os error 32)을 잠깐 다시 시도한 뒤 무시한다.
+        crate::state::test_rm_rf(&dir);
     }
 
     /// 결측 사유는 디스크 키 생략으로 남고, 신·구 포맷 모두 같은 소켓 경로에서 복원된다.
@@ -24091,7 +24103,8 @@ mod tests {
         let roundtrip: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(roundtrip, populated, "복원·영속 과정에서 실제 메타데이터가 소실됐다");
         drop(restored);
-        std::fs::remove_dir_all(dir).unwrap();
+        // ★(R2F-DM 2차 · B3-b) 끝정리 — 유닉스는 종전처럼 엄격(실패 = 패닉) · 윈도우는 공유 위반(os error 32)을 잠깐 다시 시도한 뒤 무시한다.
+        crate::state::test_rm_rf(&dir);
     }
 
     /// ★(성찰 2회 · 3/3 · pause 순서 계약) **동결이 먼저, 설정자 해소는 뒤** — dispatch 직후
@@ -24148,7 +24161,8 @@ mod tests {
             assert_eq!(pi["actor_surface"].as_u64(), Some(sid), "{method}");
         }
         drop(daemon);
-        std::fs::remove_dir_all(dir).unwrap();
+        // ★(R2F-DM 2차 · B3-b) 끝정리 — 유닉스는 종전처럼 엄격(실패 = 패닉) · 윈도우는 공유 위반(os error 32)을 잠깐 다시 시도한 뒤 무시한다.
+        crate::state::test_rm_rf(&dir);
     }
 
     /// ★(성찰 2회 · 2/3 · fail-closed 복원) autopilot.json 이 **존재하는데** 손상(부분 쓰기·빈 파일·
@@ -24219,7 +24233,8 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v, json!({"paused": false}), "resume 이 손상을 해제본으로 되돌리지 못했다");
         drop(d);
-        std::fs::remove_dir_all(dir).unwrap();
+        // ★(R2F-DM 2차 · B3-b) 끝정리 — 유닉스는 종전처럼 엄격(실패 = 패닉) · 윈도우는 공유 위반(os error 32)을 잠깐 다시 시도한 뒤 무시한다.
+        crate::state::test_rm_rf(&dir);
     }
 
     /// [게이트 ② 독립 핀] 발신 ACL = send 와 동일 권한 모델(check_send_acl 재사용 · 신규
