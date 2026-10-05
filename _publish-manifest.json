@@ -1,0 +1,601 @@
+{
+  "generated": "2026-10-05T02:57:16.492Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37256386475",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37256386475",
+  "job": "app-e2e",
+  "os": "windows-11-arm",
+  "branch": "diag-results/37256386475-1-app-e2e-windows-11-arm",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "app-e2e.json",
+      "bytes": 132816
+    },
+    {
+      "path": "appe2e-3077.json",
+      "bytes": 313076
+    },
+    {
+      "path": "appe2e-ci.evtx",
+      "bytes": 1118208
+    },
+    {
+      "path": "appe2e-citool-lp-after-on-10s.json",
+      "bytes": 7236
+    },
+    {
+      "path": "appe2e-citool-lp-before-click.json",
+      "bytes": 7236
+    },
+    {
+      "path": "appe2e-citool-lp-before-team.json",
+      "bytes": 6761
+    },
+    {
+      "path": "appe2e-citool-lp-final.json",
+      "bytes": 6761
+    },
+    {
+      "path": "appe2e-citool-lp-initial.json",
+      "bytes": 6761
+    },
+    {
+      "path": "appe2e-citool-lp-restore-final-1.json",
+      "bytes": 6761
+    },
+    {
+      "path": "appe2e-citool-refresh-on.txt",
+      "bytes": 169
+    },
+    {
+      "path": "appe2e-citool-refresh-restore-final-1.txt",
+      "bytes": 168
+    },
+    {
+      "path": "appe2e-events.json",
+      "bytes": 565702
+    },
+    {
+      "path": "appe2e-off-appfile-01-000003.log",
+      "bytes": 30
+    },
+    {
+      "path": "appe2e-off-appfile-02-settings_diagnostic.log",
+      "bytes": 19930
+    },
+    {
+      "path": "appe2e-off-appfile-03-favorites_diagnostic.log",
+      "bytes": 888
+    },
+    {
+      "path": "appe2e-off-appfile-04-000003.log",
+      "bytes": 112
+    },
+    {
+      "path": "appe2e-off-appfile-05-000003.log",
+      "bytes": 347
+    },
+    {
+      "path": "appe2e-off-appfile-06-000003.log",
+      "bytes": 5491
+    },
+    {
+      "path": "appe2e-off-appfile-07-000003.log",
+      "bytes": 852
+    },
+    {
+      "path": "appe2e-off-appfile-08-000003.log",
+      "bytes": 114
+    },
+    {
+      "path": "appe2e-off-appfile-09-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "appe2e-off-appfile-10-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "appe2e-off-appfile-11-000003.log",
+      "bytes": 65
+    },
+    {
+      "path": "appe2e-off-appfile-12-cys-installed-version.txt",
+      "bytes": 7
+    },
+    {
+      "path": "appe2e-off-appfile-13-phoenix-restore.log",
+      "bytes": 3395
+    },
+    {
+      "path": "appe2e-off-appfile-14-office-bridge.log",
+      "bytes": 497
+    },
+    {
+      "path": "appe2e-off-appfiles.txt",
+      "bytes": 49195
+    },
+    {
+      "path": "appe2e-off-cdp-stdout.txt",
+      "bytes": 1598
+    },
+    {
+      "path": "appe2e-off-cdp.json",
+      "bytes": 19797
+    },
+    {
+      "path": "appe2e-off-eventlog-application.txt",
+      "bytes": 81
+    },
+    {
+      "path": "appe2e-off-observe.json",
+      "bytes": 4339
+    },
+    {
+      "path": "appe2e-off-screen-app-gone.png",
+      "bytes": 178627
+    },
+    {
+      "path": "appe2e-off-screen-end.png",
+      "bytes": 178627
+    },
+    {
+      "path": "appe2e-off-screen-installer-wait1.png",
+      "bytes": 178627
+    },
+    {
+      "path": "appe2e-off-screen-installer.png",
+      "bytes": 178627
+    },
+    {
+      "path": "appe2e-off-timeline.txt",
+      "bytes": 10023
+    },
+    {
+      "path": "appe2e-off-ui-after-click-10s.png",
+      "bytes": 21342
+    },
+    {
+      "path": "appe2e-off-ui-after-click-2s.png",
+      "bytes": 16020
+    },
+    {
+      "path": "appe2e-off-ui-confirm.png",
+      "bytes": 33394
+    },
+    {
+      "path": "appe2e-off-ui-panel.png",
+      "bytes": 30850
+    },
+    {
+      "path": "appe2e-off-ui-ready.png",
+      "bytes": 15720
+    },
+    {
+      "path": "appe2e-off-verdict.json",
+      "bytes": 2299
+    },
+    {
+      "path": "appe2e-on-appfile-01-settings_diagnostic.log",
+      "bytes": 32076
+    },
+    {
+      "path": "appe2e-on-appfile-02-favorites_diagnostic.log",
+      "bytes": 2858
+    },
+    {
+      "path": "appe2e-on-appfile-03-000003.log",
+      "bytes": 30
+    },
+    {
+      "path": "appe2e-on-appfile-04-000003.log",
+      "bytes": 1040
+    },
+    {
+      "path": "appe2e-on-appfile-05-000003.log",
+      "bytes": 184
+    },
+    {
+      "path": "appe2e-on-appfile-06-000003.log",
+      "bytes": 886
+    },
+    {
+      "path": "appe2e-on-appfile-07-000003.log",
+      "bytes": 5624
+    },
+    {
+      "path": "appe2e-on-appfile-08-000003.log",
+      "bytes": 114
+    },
+    {
+      "path": "appe2e-on-appfile-09-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "appe2e-on-appfile-10-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "appe2e-on-appfile-11-000003.log",
+      "bytes": 65
+    },
+    {
+      "path": "appe2e-on-appfile-12-phoenix-restore.log",
+      "bytes": 10433
+    },
+    {
+      "path": "appe2e-on-appfile-13-office-bridge.log",
+      "bytes": 1988
+    },
+    {
+      "path": "appe2e-on-appfile-14-cys-installed-version.txt",
+      "bytes": 7
+    },
+    {
+      "path": "appe2e-on-appfiles.txt",
+      "bytes": 54849
+    },
+    {
+      "path": "appe2e-on-cdp-stdout.txt",
+      "bytes": 1719
+    },
+    {
+      "path": "appe2e-on-cdp.json",
+      "bytes": 26348
+    },
+    {
+      "path": "appe2e-on-eventlog-application.txt",
+      "bytes": 134
+    },
+    {
+      "path": "appe2e-on-observe.json",
+      "bytes": 3915
+    },
+    {
+      "path": "appe2e-on-pre-cdp-stdout.txt",
+      "bytes": 795
+    },
+    {
+      "path": "appe2e-on-pre-cdp.json",
+      "bytes": 4330
+    },
+    {
+      "path": "appe2e-on-pre-ui-ready.png",
+      "bytes": 15720
+    },
+    {
+      "path": "appe2e-on-screen-click30s.png",
+      "bytes": 178627
+    },
+    {
+      "path": "appe2e-on-screen-click5s.png",
+      "bytes": 178627
+    },
+    {
+      "path": "appe2e-on-screen-click60s.png",
+      "bytes": 178627
+    },
+    {
+      "path": "appe2e-on-screen-end.png",
+      "bytes": 178627
+    },
+    {
+      "path": "appe2e-on-timeline.txt",
+      "bytes": 13060
+    },
+    {
+      "path": "appe2e-on-ui-after-click-10s.png",
+      "bytes": 55559
+    },
+    {
+      "path": "appe2e-on-ui-after-click-2s.png",
+      "bytes": 33120
+    },
+    {
+      "path": "appe2e-on-ui-blocked-toast.png",
+      "bytes": 55559
+    },
+    {
+      "path": "appe2e-on-ui-confirm.png",
+      "bytes": 63202
+    },
+    {
+      "path": "appe2e-on-ui-observe-end.png",
+      "bytes": 55588
+    },
+    {
+      "path": "appe2e-on-ui-observe-late.png",
+      "bytes": 55588
+    },
+    {
+      "path": "appe2e-on-ui-panel.png",
+      "bytes": 41453
+    },
+    {
+      "path": "appe2e-on-ui-ready.png",
+      "bytes": 29712
+    },
+    {
+      "path": "appe2e-on-verdict.json",
+      "bytes": 2709
+    },
+    {
+      "path": "appe2e-state-after-on-10s.json",
+      "bytes": 5817
+    },
+    {
+      "path": "appe2e-state-before-click.json",
+      "bytes": 5817
+    },
+    {
+      "path": "appe2e-state-before-team.json",
+      "bytes": 5525
+    },
+    {
+      "path": "appe2e-state-final.json",
+      "bytes": 5519
+    },
+    {
+      "path": "appe2e-state-initial.json",
+      "bytes": 5521
+    },
+    {
+      "path": "appe2e-state-restore-final-1.json",
+      "bytes": 5529
+    },
+    {
+      "path": "appe2e-summary.txt",
+      "bytes": 4300
+    },
+    {
+      "path": "appe2e-team-appfile-01-settings_diagnostic.log",
+      "bytes": 38580
+    },
+    {
+      "path": "appe2e-team-appfile-02-favorites_diagnostic.log",
+      "bytes": 3956
+    },
+    {
+      "path": "appe2e-team-appfile-03-000003.log",
+      "bytes": 30
+    },
+    {
+      "path": "appe2e-team-appfile-04-000003.log",
+      "bytes": 256
+    },
+    {
+      "path": "appe2e-team-appfile-05-000003.log",
+      "bytes": 5757
+    },
+    {
+      "path": "appe2e-team-appfile-06-000003.log",
+      "bytes": 2212
+    },
+    {
+      "path": "appe2e-team-appfile-07-000003.log",
+      "bytes": 920
+    },
+    {
+      "path": "appe2e-team-appfile-08-000003.log",
+      "bytes": 114
+    },
+    {
+      "path": "appe2e-team-appfile-09-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "appe2e-team-appfile-10-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "appe2e-team-appfile-11-000003.log",
+      "bytes": 65
+    },
+    {
+      "path": "appe2e-team-appfile-12-cysd.log",
+      "bytes": 1068
+    },
+    {
+      "path": "appe2e-team-appfile-13-formation.log",
+      "bytes": 240
+    },
+    {
+      "path": "appe2e-team-appfile-14-phoenix-restore.log",
+      "bytes": 17199
+    },
+    {
+      "path": "appe2e-team-appfile-15-office-bridge.log",
+      "bytes": 73
+    },
+    {
+      "path": "appe2e-team-appfiles.txt",
+      "bytes": 60486
+    },
+    {
+      "path": "appe2e-team-cdp-stdout.txt",
+      "bytes": 1771
+    },
+    {
+      "path": "appe2e-team-cdp.json",
+      "bytes": 68054
+    },
+    {
+      "path": "appe2e-team-cys-dept-dept-1-cysd.log-tail.txt",
+      "bytes": 1068
+    },
+    {
+      "path": "appe2e-team-cys-dept-dept-1-formation.log-tail.txt",
+      "bytes": 240
+    },
+    {
+      "path": "appe2e-team-cys-dept-dept-1-office-bridge.log-tail.txt",
+      "bytes": 73
+    },
+    {
+      "path": "appe2e-team-cys-dept-dept-1-phoenix-restore.log-tail.txt",
+      "bytes": 1705
+    },
+    {
+      "path": "appe2e-team-depts.json",
+      "bytes": 303
+    },
+    {
+      "path": "appe2e-team-eventlog-application.txt",
+      "bytes": 81
+    },
+    {
+      "path": "appe2e-team-facts.json",
+      "bytes": 9787
+    },
+    {
+      "path": "appe2e-team-live.json",
+      "bytes": 197
+    },
+    {
+      "path": "appe2e-team-observe.json",
+      "bytes": 45071
+    },
+    {
+      "path": "appe2e-team-pipes-after.txt",
+      "bytes": 20
+    },
+    {
+      "path": "appe2e-team-pipes-before.txt",
+      "bytes": 3
+    },
+    {
+      "path": "appe2e-team-procs-after.txt",
+      "bytes": 29313
+    },
+    {
+      "path": "appe2e-team-procs-before.txt",
+      "bytes": 28267
+    },
+    {
+      "path": "appe2e-team-screen-end.png",
+      "bytes": 178627
+    },
+    {
+      "path": "appe2e-team-timeline.txt",
+      "bytes": 9658
+    },
+    {
+      "path": "appe2e-team-ui-after-click.png",
+      "bytes": 30491
+    },
+    {
+      "path": "appe2e-team-ui-alarms.png",
+      "bytes": 61989
+    },
+    {
+      "path": "appe2e-team-ui-confirm.png",
+      "bytes": 62823
+    },
+    {
+      "path": "appe2e-team-ui-end.png",
+      "bytes": 40676
+    },
+    {
+      "path": "appe2e-team-ui-first-stage.png",
+      "bytes": 30474
+    },
+    {
+      "path": "appe2e-team-ui-new-tab.png",
+      "bytes": 39887
+    },
+    {
+      "path": "appe2e-team-ui-ready.png",
+      "bytes": 38982
+    },
+    {
+      "path": "appe2e-team-ui-timeline.txt",
+      "bytes": 8451
+    },
+    {
+      "path": "appe2e-team-verdict.json",
+      "bytes": 60308
+    },
+    {
+      "path": "appe2e-verdict.json",
+      "bytes": 695
+    },
+    {
+      "path": "done-app-e2e.json",
+      "bytes": 139
+    },
+    {
+      "path": "done-p0-facts.json",
+      "bytes": 140
+    },
+    {
+      "path": "done-p1-assets.json",
+      "bytes": 141
+    },
+    {
+      "path": "ensure-sac-restored-citool-lp.json",
+      "bytes": 6761
+    },
+    {
+      "path": "ensure-sac-restored.txt",
+      "bytes": 391
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-app-e2e.txt",
+      "bytes": 6782
+    },
+    {
+      "path": "log-p0-facts.txt",
+      "bytes": 165
+    },
+    {
+      "path": "log-p1-assets.txt",
+      "bytes": 167
+    },
+    {
+      "path": "p0-example-SmartAppControl.xml",
+      "bytes": 9489
+    },
+    {
+      "path": "p0-facts.json",
+      "bytes": 48851
+    },
+    {
+      "path": "p0-facts.txt",
+      "bytes": 42146
+    },
+    {
+      "path": "p1-assets.json",
+      "bytes": 20909
+    },
+    {
+      "path": "subjects.json",
+      "bytes": 182280
+    },
+    {
+      "path": "syntax-check.txt",
+      "bytes": 225
+    }
+  ],
+  "skipped": [
+    {
+      "path": "appe2e-off-cdp-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "appe2e-on-cdp-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "appe2e-team-cdp-stderr.txt",
+      "reason": "empty file"
+    }
+  ],
+  "inline_files": 78,
+  "blob_files": 65
+}
