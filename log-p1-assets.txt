@@ -1,0 +1,2 @@
+2026-10-05T08:56:31.139Z [INFO] === p1-assets start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-05T08:57:45.492Z [INFO] === p1-assets end ===

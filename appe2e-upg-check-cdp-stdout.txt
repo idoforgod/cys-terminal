@@ -1,0 +1,10 @@
+{"t":"2026-10-05T08:59:11.273Z","name":"start","argv":"--mode attach --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-upg-check --max-wait-sec 120 --ready-wait-sec 30","native_websocket":true}
+{"t":"2026-10-05T08:59:11.295Z","name":"targets","count":1,"pages":1}
+{"t":"2026-10-05T08:59:11.305Z","name":"connected","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","ws_impl":"mini"}
+{"t":"2026-10-05T08:59:11.308Z","name":"attached","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","id":"4CF2E1E4AE19BDF750C6C76460768E63"}
+{"t":"2026-10-05T08:59:11.310Z","name":"page_info","href":"http://tauri.localhost/"}
+{"t":"2026-10-05T08:59:11.314Z","name":"app_version","value":"0.14.42"}
+{"t":"2026-10-05T08:59:11.359Z","name":"screenshot","file":"appe2e-upg-check-before.png","bytes":42168}
+{"t":"2026-10-05T08:59:11.397Z","name":"check_update","ok":true,"value":"{\"current\":\"0.14.42\",\"notes\":\"cys 터미널 v0.14.43. macOS는 .dmg, Windows는 -setup.exe를 내려받아 설치하세요. 기존 사용자는 앱 내 Update 버튼으로 자동 갱신됩니다.\",\"version\":\"0.14.43\"}"}
+{"t":"2026-10-05T08:59:11.420Z","name":"attach mode: stopping before listeners / install_update"}
+
