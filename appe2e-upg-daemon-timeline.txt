@@ -1,0 +1,5 @@
+# daemon watch start 2026-10-05T07:14:54.735Z (every 5 s until the page observer ends, at most 240 s)
+[   0s 2026-10-05T07:14:54.877Z] cysd=[pid 8004 (parent 6864, created 2026-10-05T07:14:51.803Z, image cysd.exe v0.14.43)] app=[cys-app.exe#6864] pipes=[cys]
+[   5s 2026-10-05T07:15:00.043Z] cysd=[pid 8004 (parent 6864, created 2026-10-05T07:14:51.803Z, image cysd.exe v0.14.43)] app=[cys-app.exe#6864] pipes=[cys]
+[   6s 2026-10-05T07:15:01.133Z] cysd=[pid 8004 (parent 6864, created 2026-10-05T07:14:51.803Z, image cysd.exe v0.14.43)] app=[cys-app.exe#6864] pipes=[cys]
+# end: the page observer ended

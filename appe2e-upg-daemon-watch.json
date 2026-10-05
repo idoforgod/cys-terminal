@@ -1,0 +1,94 @@
+{
+    "started":  "2026-10-05T07:14:54.733Z",
+    "ended":  "2026-10-05T07:15:01.133Z",
+    "end_reason":  "the page observer ended",
+    "ticks":  3,
+    "node_exit_code":  0,
+    "first":  [
+                  {
+                      "id":  8004,
+                      "ppid":  6864,
+                      "created":  "2026-10-05T07:14:51.803Z",
+                      "name":  "cysd.exe",
+                      "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                      "image":  "cysd.exe",
+                      "image_version":  "0.14.43"
+                  }
+              ],
+    "last":  [
+                 {
+                     "id":  8004,
+                     "ppid":  6864,
+                     "created":  "2026-10-05T07:14:51.803Z",
+                     "name":  "cysd.exe",
+                     "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                     "image":  "cysd.exe",
+                     "image_version":  "0.14.43"
+                 }
+             ],
+    "samples":  [
+                    {
+                        "sec":  0,
+                        "time":  "2026-10-05T07:14:54.891Z",
+                        "daemons":  [
+                                        {
+                                            "id":  8004,
+                                            "ppid":  6864,
+                                            "created":  "2026-10-05T07:14:51.803Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#6864"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  5,
+                        "time":  "2026-10-05T07:15:00.048Z",
+                        "daemons":  [
+                                        {
+                                            "id":  8004,
+                                            "ppid":  6864,
+                                            "created":  "2026-10-05T07:14:51.803Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#6864"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  6,
+                        "time":  "2026-10-05T07:15:01.133Z",
+                        "daemons":  [
+                                        {
+                                            "id":  8004,
+                                            "ppid":  6864,
+                                            "created":  "2026-10-05T07:14:51.803Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#6864"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    }
+                ]
+}

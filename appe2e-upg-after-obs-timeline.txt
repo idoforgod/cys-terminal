@@ -1,0 +1,4 @@
+# uiobs start 2026-10-05T07:14:55.118Z obs_sec=150 interval_sec=5 expect_daemon=0.14.43 app_version=0.14.43
+[+0.0s 2026-10-05T07:14:55.165Z] daemon v0.14.43 pid=8004 surfaces=0 started_at=1791184493.567694 | status bar: "daemon pid=7416 sock=\\\\.\\pipe\\cys" | badge: none | toasts(1): [toast health] Claude Code CLI가 없습니다 :: PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작 | windows: 0
+[+5.0s 2026-10-05T07:15:00.191Z] daemon v0.14.43 pid=8004 surfaces=0 started_at=1791184493.567694 | status bar: "daemon pid=7416 sock=\\\\.\\pipe\\cys" | badge: none | toasts(3): [toast health] Claude Code CLI가 없습니다 :: PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작 || [toast watchdog] ✅ 직원 복귀 완료 :: 노드 세션 복원 완료 (부서 0). || [toast health] 업데이트 경고 :: 새 팩 반영(init-pack) 실패 — 노드 복원 보류, 다음 재시작에 재시도 | windows: 0
+# end: the daemon reports the expected version 0.14.43 (two polls in a row)

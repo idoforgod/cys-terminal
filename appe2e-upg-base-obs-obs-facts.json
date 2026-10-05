@@ -1,0 +1,58 @@
+{
+ "script": "cdp-update.mjs",
+ "mode": "uiobs",
+ "written": "2026-10-05T07:14:03.686Z",
+ "partial": false,
+ "attached": true,
+ "app_version": "0.14.42",
+ "ready_ok": true,
+ "end_reason": "observation window elapsed (0 s)",
+ "socket_closed": false,
+ "facts": {
+  "polls": 1,
+  "daemon_reads_ok": 1,
+  "daemon_reads_failed": 0,
+  "daemon_last_error": null,
+  "expect_daemon": null,
+  "daemon_version_first": "0.14.42",
+  "daemon_version_last": "0.14.42",
+  "daemon_versions_seen": [
+   "0.14.42"
+  ],
+  "daemon_pid_first": 7416,
+  "daemon_pid_last": 7416,
+  "daemon_pids_seen": [
+   7416
+  ],
+  "daemon_started_at_first": 1791184439.71847,
+  "daemon_started_at_last": 1791184439.71847,
+  "daemon_surface_count_last": 1,
+  "daemon_changed": false,
+  "daemon_reached_expect": null,
+  "daemon_reached_expect_at": null,
+  "daemon_reached_expect_el_ms": null,
+  "skew_badge_seen": false,
+  "skew_badge_first_at": null,
+  "skew_badge_first_el_ms": null,
+  "skew_badge_polls": 0,
+  "skew_badge_present_at_end": false,
+  "skew_badge_text": "",
+  "skew_badge_title": "",
+  "skew_notice_seen": false,
+  "skew_notice_detail": "",
+  "daemon_info_first": "daemon pid=7416 sock=\\\\.\\pipe\\cys",
+  "daemon_info_last": "daemon pid=7416 sock=\\\\.\\pipe\\cys",
+  "app_version_cmd": "0.14.42",
+  "toasts_seen": [
+   {
+    "cls": "toast health",
+    "name": "Claude Code CLI가 없습니다",
+    "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+    "first_el_ms": 0,
+    "last_el_ms": 0,
+    "polls": 1,
+    "failure_like": true
+   }
+  ]
+ }
+}

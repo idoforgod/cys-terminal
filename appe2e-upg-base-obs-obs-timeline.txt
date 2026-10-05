@@ -1,0 +1,3 @@
+# uiobs start 2026-10-05T07:14:03.607Z obs_sec=0 interval_sec=5 expect_daemon=- app_version=0.14.42
+[+0.0s 2026-10-05T07:14:03.653Z] daemon v0.14.42 pid=7416 surfaces=1 started_at=1791184439.71847 | status bar: "daemon pid=7416 sock=\\\\.\\pipe\\cys" | badge: none | toasts(1): [toast health] Claude Code CLI가 없습니다 :: PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작 | windows: 0
+# end: observation window elapsed (0 s)

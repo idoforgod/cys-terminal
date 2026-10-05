@@ -1,0 +1,51 @@
+{
+    "result":  "PASS",
+    "upgrade":  "PASS",
+    "team":  "PASS",
+    "mode":  "emulate",
+    "from_version":  "0.14.42",
+    "to_version":  "0.14.43",
+    "failures":  [
+
+                 ],
+    "not_measurable":  [
+
+                       ],
+    "notes":  [
+
+              ],
+    "reasons":  [
+                    "UPGRADE PASS: the installed 0.14.42 app was upgraded to 0.14.43 (emulate): the marker and the three executables are 0.14.43, no failure file, the app came back, reports 0.14.43 and its UI is up",
+                    "TEAM PASS: the button flow started by clicks, a new team tab stood (waiting screen -\u003e real tab), a new cysd.exe was created after the click and no failure notification was shown"
+                ],
+    "facts":  {
+                  "mode":  "emulate",
+                  "from_version":  "0.14.42",
+                  "to_version":  "0.14.43",
+                  "base_install_ok":  true,
+                  "base_start_ok":  true,
+                  "apply_started":  true,
+                  "apply_ok":  true,
+                  "marker_reached_sec":  45,
+                  "new_app_first_seen_sec":  45,
+                  "installer_seen":  true,
+                  "watch_end":  "success: the version marker reached the target and a new cys-app.exe is running",
+                  "watch_end_kind":  "success",
+                  "marker_after":  "0.14.43",
+                  "failure_file_absent":  true,
+                  "file_versions":  {
+                                        "cys-app.exe":  "0.14.43",
+                                        "cys.exe":  "0.14.43",
+                                        "cysd.exe":  "0.14.43"
+                                    },
+                  "app_version_after":  "0.14.43",
+                  "ui_ready_after":  true,
+                  "daemon_rotated_auto":  true,
+                  "daemon_version_last":  "0.14.43",
+                  "skew_badge_seen":  false,
+                  "leftovers_after_observation":  "prev=0 new.exe=0",
+                  "leftovers_at_end":  "prev=0 new.exe=0",
+                  "pack":  "files 942 -\u003e 945, version 0.14.42 -\u003e 0.14.43",
+                  "team_app_reused":  true
+              }
+}

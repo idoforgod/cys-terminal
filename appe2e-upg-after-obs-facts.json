@@ -1,0 +1,76 @@
+{
+ "script": "cdp-update.mjs",
+ "mode": "uiobs",
+ "written": "2026-10-05T07:15:00.238Z",
+ "partial": false,
+ "attached": true,
+ "app_version": "0.14.43",
+ "ready_ok": true,
+ "end_reason": "the daemon reports the expected version 0.14.43 (two polls in a row)",
+ "socket_closed": false,
+ "facts": {
+  "polls": 2,
+  "daemon_reads_ok": 2,
+  "daemon_reads_failed": 0,
+  "daemon_last_error": null,
+  "expect_daemon": "0.14.43",
+  "daemon_version_first": "0.14.43",
+  "daemon_version_last": "0.14.43",
+  "daemon_versions_seen": [
+   "0.14.43"
+  ],
+  "daemon_pid_first": 8004,
+  "daemon_pid_last": 8004,
+  "daemon_pids_seen": [
+   8004
+  ],
+  "daemon_started_at_first": 1791184493.567694,
+  "daemon_started_at_last": 1791184493.567694,
+  "daemon_surface_count_last": 0,
+  "daemon_changed": false,
+  "daemon_reached_expect": true,
+  "daemon_reached_expect_at": "2026-10-05T07:14:55.165Z",
+  "daemon_reached_expect_el_ms": 6,
+  "skew_badge_seen": false,
+  "skew_badge_first_at": null,
+  "skew_badge_first_el_ms": null,
+  "skew_badge_polls": 0,
+  "skew_badge_present_at_end": false,
+  "skew_badge_text": "",
+  "skew_badge_title": "",
+  "skew_notice_seen": false,
+  "skew_notice_detail": "",
+  "daemon_info_first": "daemon pid=7416 sock=\\\\.\\pipe\\cys",
+  "daemon_info_last": "daemon pid=7416 sock=\\\\.\\pipe\\cys",
+  "app_version_cmd": "0.14.43",
+  "toasts_seen": [
+   {
+    "cls": "toast health",
+    "name": "Claude Code CLI가 없습니다",
+    "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+    "first_el_ms": 6,
+    "last_el_ms": 5032,
+    "polls": 2,
+    "failure_like": true
+   },
+   {
+    "cls": "toast watchdog",
+    "name": "✅ 직원 복귀 완료",
+    "detail": "노드 세션 복원 완료 (부서 0).",
+    "first_el_ms": 5032,
+    "last_el_ms": 5032,
+    "polls": 1,
+    "failure_like": true
+   },
+   {
+    "cls": "toast health",
+    "name": "업데이트 경고",
+    "detail": "새 팩 반영(init-pack) 실패 — 노드 복원 보류, 다음 재시작에 재시도",
+    "first_el_ms": 5032,
+    "last_el_ms": 5032,
+    "polls": 1,
+    "failure_like": true
+   }
+  ]
+ }
+}
