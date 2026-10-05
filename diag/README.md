@@ -163,6 +163,18 @@ SAC 를 켠 뒤에는 서명된 `node.exe` 와 시스템 도구만 새로 실행
 
 `upgrade`(이 장면의 1~7번)와 `team` 을 따로 적고, `result` 는 둘 중 하나라도 FAIL 이면 `FAIL`, 아니고 둘 다 PASS 가 아니면 `NOT-MEASURABLE`, 둘 다 PASS 일 때만 `PASS` 다.
 
+### UPG-2 보강 (13차 뒤 · upgrade 장면만 · 전부 기록과 NOTE — PASS/FAIL 규칙은 그대로)
+
+13차에서 업그레이드된 앱 화면에 「업데이트 경고 :: 새 팩 반영(init-pack) 실패 …」 알림이 떴는데 판정에는 드러나지 않았다. 원인(업그레이드 직후 팩을 쓰는 주체가 겹친다는 가설)을 **재기** 위한 관측 세 가지를 더했다.
+
+1. **프로세스 감사** — 스텝 `upg-audit-on`(prepare 바로 뒤): `auditpol /set /subcategory:{0CCE922B-69AE-11D9-BED3-505054503030} /success:enable`(Process Creation) · `{0CCE922C-…}`(Process Termination) · 정책 값 `ProcessCreationIncludeCmdLine_Enabled=1`(4688 에 명령줄) · Security 로그가 128MB 보다 작으면 키움. 켜기 전 값은 기록하고 `upg-cleanup` 에서 되돌린다(로그 크기는 그대로 둔다). 켠 직후 **자가 시험**(낱말을 실은 `cmd.exe … exit 7` 이 4688+명령줄 · 4689 Status 0x7 로 보이는가)을 통과해야 감사를 쓴다. 스텝 `upg-proc-audit`(upg-facts-after 뒤)이 적용 30초 전부터의 4688/4689 를 읽어 제품 이미지(설치 폴더 · 업데이터 임시 폴더 · 설치 파일 · cys-app/cys/cysd)와 **그것이 띄운 것**만 남긴다 → `appe2e-upg-proc-audit.json`(원본 필드 + 10진 pid) · `.txt`(시간순 한 줄씩). 장면 끝에 한 번 더(`…-proc-audit-end.*`). 생성↔종료는 (pid · 이미지 · 시간 순서)로 짝짓는다.
+   - 거기서 뽑는 표(`app-e2e.json` 의 `upgrade.proc_audit.table`): 다시 뜬 뒤의 `cys.exe` 마다 인자 · 시작 · 끝 · 초 · 종료 상태, `init-pack` 의 수 · 겹침 · 0 아닌 종료 수, 새 `cysd.exe` 시작 시각, `restore`/`drain`. 요약 한 줄 `init-pack after the upgrade (…): N process(es) [pid … 시작..끝 exit=…] overlap=…; new daemon started at …`.
+   - **감사를 못 쓰면**(auditpol 실패 · 이벤트가 안 보임 · 명령줄이 안 실림) 새 앱이 보이는 순간 `diag/proc-poll.ps1` 을 두 번째 PowerShell 로 띄워 30초 동안 200ms 간격으로 `Win32_Process` 를 훑는다(`appe2e-upg-proc-poll.json` · **종료 코드 없음** · 한 간격보다 짧게 산 프로세스는 놓칠 수 있다). 그 사실은 NOTE 로 남는다.
+2. **알림을 사실로** — `uiobs` 가 데몬 목표 버전을 확인해도 **최소 45초**(`--obs-min-sec`)는 계속 보고, 화면은 1초마다 읽는다. 알림마다 처음 본 시각 · 사라진 시각 · 시작 때 이미 있었는지 · 끝까지 있었는지를 적는다. 판정 파일 `facts` 에 `toasts_after_upgrade` · `update_error_toast_seen`(종류 health + 본문에 `init-pack`) · `restore_done_toast_seen`(제목 「직원 복귀 완료」) · `status_bar_pid_differs_from_daemon_status`. 업데이트 경고 알림과 상태바 pid 불일치는 **NOTE**(FAIL 아님). 요약 한 줄 `notifications after the upgrade (…)`. updater 방식도 같은 경로다.
+3. **표식 파일** — `%USERPROFILE%\.cys\.pending-restore`(유무) · `.last-app-version` · `pack\.pack-version` · `pack.prev`(유무) · `.pack-staging*`(이름)을 적용 직전 · 재기동 감지 직후 · 관찰 끝 · 장면 끝에, 그리고 데몬 관찰 틱(5초)마다 바뀔 때 적는다(`upgrade.stamps`). 요약 한 줄 `stamp (.last-app-version) 0.14.42 -> 0.14.43 (first seen at …); .pending-restore …; staging leftovers …`.
+
+요약은 14줄에서 **17줄**이 됐다(데몬 줄 뒤에 위 세 줄). 0 아닌 종료 상태의 `init-pack` 이 있으면 그것도 NOTE 다. 맥에서는 감사 도구·Security 로그를 가짜로 바꿔 모의 실행했을 뿐이다 — `auditpol`·`Get-WinEvent` 는 러너가 첫 실행이다. 13차의 실제 화면 기록을 새 로직에 다시 넣어 보면 `update-error (init-pack) seen=True; restore done seen=True; status bar pid differs=True` 가 나온다.
+
 ### 설치 사실 기록 (`Get-InstallFacts` · 두 장면 공통 · 읽기 전용 · 판정에 안 넣음)
 
 HKCU `…\Uninstall\cys` 의 DisplayName·DisplayVersion·UninstallString · 시작 메뉴·바탕화면 바로가기(대상 경로) · 설치 폴더 파일 수·바이트 · 세 실행 파일(크기·버전·sha256) · `cys.exe --version`·`cysd.exe --version`(각 15초 · 둘 다 데몬을 띄우지 않는다 — 근거는 스크립트 주석 · `cysd.exe` 는 인자 판정이 생긴 0.14.41 이상에서만 부른다) · 동봉 `bash.exe`·`python3.exe` 의 존재와 `--version` rc. fresh 는 `install-off` 바로 뒤 스텝 `install-facts` 에서 한 번(`appe2e-install-facts.json`), upgrade 는 0.14.42 설치 뒤(`upg-facts-base` → `…-base.json`)와 업그레이드 뒤(`upg-facts-after` → `…-after.json` — 7번 전체가 끝난 다음이다. 새 앱과 옛 데몬이 만나는 순간의 관찰을 늦추지 않으려고 7(a) 바로 뒤가 아니라 7번 뒤에 둔다).

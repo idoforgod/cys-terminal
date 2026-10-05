@@ -15,9 +15,13 @@
 #     Then: marker / failure file / file versions, the app the installer started again (version, UI), the meeting of the NEW app with
 #     the OLD daemon (150 s: does the app rotate it by itself, or does it show its version-skew badge), leftovers (*.prev* / *.new.exe),
 #     the pack before and after, and - on that same upgraded app, as it is - the TEAM scene of app-e2e.ps1 (Invoke-TeamScene).
-#   steps   prepare, upg-base-installer, upg-install-base, upg-facts-base, upg-start-base, upg-base-state, upg-apply, upg-after,
-#           upg-facts-after, team, upg-verdict, upg-summary, upg-cleanup
-#   files   appe2e-upgrade-verdict.json, appe2e-upgrade-summary.txt (14 lines at most), appe2e-verdict.json + app-e2e.json
+#   steps   prepare, upg-audit-on, upg-base-installer, upg-install-base, upg-facts-base, upg-start-base, upg-base-state, upg-apply,
+#           upg-after, upg-facts-after, upg-proc-audit, team, upg-verdict, upg-summary, upg-cleanup
+#   UPG-2   (records and NOTES only, the PASS / FAIL rules are as before) the processes the upgrade and the relaunched app start
+#           (Security 4688 / 4689 with command lines and exit status -> appe2e-upg-proc-audit.{json,txt}, -end.{json,txt}; when the
+#           audit cannot be used: diag/proc-poll.ps1 -> appe2e-upg-proc-poll.json, no exit status), every notification of the upgraded
+#           app during a page watch of at least 45 s, and the marker / stamp files of the product at four moments. Three summary lines.
+#   files   appe2e-upgrade-verdict.json, appe2e-upgrade-summary.txt (17 lines at most), appe2e-verdict.json + app-e2e.json
 #           (verdict = { result, upgrade, team, reasons }), appe2e-upg-*.{json,txt,png}, appe2e-install-facts-{base,after}.json
 #   verdict PASS only when everything holds: base install + base app start (else NOT-MEASURABLE), the marker reached the target and
 #           the app came back, marker / no failure file / the three file versions, the new app's version and UI, TEAM PASS.
@@ -40,6 +44,18 @@ $K_UPG_APPLY_MAX_SEC = 300
 $K_UPG_OBS_SEC = 150
 $K_UPG_OBS_TICK_SEC = 5
 $K_UPG_INSTALLER_ARGS = '/P /R /UPDATE /ARGS'
+# UPG-2 (README 7th section, "UPG-2"): the page is polled every second and for at least 45 s after the upgrade (notifications come
+# and go in the first seconds); process creation / termination auditing (Security 4688 / 4689) is switched on for this scene only.
+# Subcategory GUIDs (the names are localised, the GUIDs are not; "auditpol /list /subcategory:* /v" prints them):
+# Detailed Tracking > Process Creation {0CCE922B-...}, Process Termination {0CCE922C-...}.
+$K_UPG_OBS_MIN_SEC = 45
+$K_UPG_OBS_PAGE_TICK_SEC = 1
+$K_UPG_AUDIT_CREATE = '{0CCE922B-69AE-11D9-BED3-505054503030}'
+$K_UPG_AUDIT_EXIT = '{0CCE922C-69AE-11D9-BED3-505054503030}'
+$K_UPG_AUDIT_REGKEY = 'HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\System\Audit'
+$K_UPG_AUDIT_REGVAL = 'ProcessCreationIncludeCmdLine_Enabled'
+$K_UPG_POLL_SEC = 30
+$K_UPG_POLL_MS = 200
 
 # =========================================================================
 # small readers
@@ -909,7 +925,8 @@ function Watch-UpgApply {
 # =========================================================================
 function Watch-UpgDaemons {
     param($NodeProc, [int]$MaxSec)
-    $w = [ordered]@{ started = (Get-IsoNow); ended = $null; end_reason = $null; ticks = 0; node_exit_code = $null; first = @(); last = @(); samples = (New-Object System.Collections.Generic.List[object]) }
+    $w = [ordered]@{ started = (Get-IsoNow); ended = $null; end_reason = $null; ticks = 0; node_exit_code = $null; first = @(); last = @(); samples = (New-Object System.Collections.Generic.List[object]); stamp_changes = (New-Object System.Collections.Generic.List[object]) }
+    $lastStampText = ''
     $tl = Join-Path $global:DiagOut ($K_UPG_PFX + '-daemon-timeline.txt')
     try { Add-Utf8NoBom $tl (('# daemon watch start {0} (every {1} s until the page observer ends, at most {2} s)' -f (Get-IsoNow), $K_UPG_OBS_TICK_SEC, $MaxSec) + "`r`n") } catch { }
     $t0 = Get-Date
@@ -937,7 +954,15 @@ function Watch-UpgDaemons {
                 if ([string]$p.name -ieq 'cys-app.exe') { $apps.Add(('cys-app.exe#{0}' -f $p.id)) }
             }
             $pipes = Get-TeamPipes
-            $line = '[{0,4}s {1}] cysd=[{2}] app=[{3}] pipes=[{4}]' -f $elapsed, (Get-IsoNow), (Format-UpgDaemons $dm), ($apps.ToArray() -join ' '), (@($pipes['cys']) -join ' ')
+            # UPG-2: the marker / stamp files at every tick; a change is filed with its time
+            $stp = Get-UpgStamps 'daemon-watch'
+            $stpText = Format-UpgStamps $stp
+            if ($stpText -ne $lastStampText) {
+                $lastStampText = $stpText
+                $stp['sec'] = $elapsed
+                if ($w['stamp_changes'].Count -lt 40) { $w['stamp_changes'].Add($stp) }
+            }
+            $line = '[{0,4}s {1}] cysd=[{2}] app=[{3}] pipes=[{4}] {5}' -f $elapsed, (Get-IsoNow), (Format-UpgDaemons $dm), ($apps.ToArray() -join ' '), (@($pipes['cys']) -join ' '), $stpText
             try { Add-Utf8NoBom $tl ($line + "`r`n") } catch { }
             if ($firstTick) {
                 $firstTick = $false
@@ -980,6 +1005,8 @@ function Get-UpgDaemonResult {
         skew_badge_seen = $null; skew_badge_first_sec = $null; skew_badge_present_at_end = $null; skew_badge_text = $null; skew_badge_title = $null
         skew_notice_seen = $null; skew_notice_detail = $null
         daemon_info_last = $null; app_version_cmd = $null; toasts_seen = @()
+        toasts = @(); update_error_toast_seen = $null; update_error_toast = $null; update_error_toast_sec = $null; restore_done_toast_seen = $null; restore_done_toast = $null
+        status_bar_pid = $null; status_bar_pid_differs = $null; obs_min_sec = $null
     }
     $before = New-Object System.Collections.Generic.List[int]
     foreach ($b in @($BeforePids)) {
@@ -1041,6 +1068,27 @@ function Get-UpgDaemonResult {
             $ts.Add(('[{0}] {1} :: {2}' -f [string]$t.cls, [string]$t.name, (Limit-Text ([string]$t.detail) 300)))
         }
         $d['toasts_seen'] = $ts.ToArray()
+        # UPG-2: every notification as a record (when first seen, when gone, there at the start / at the end) and the two that matter
+        $tl2 = New-Object System.Collections.Generic.List[object]
+        foreach ($t in @($f.toasts_seen)) {
+            if ($null -eq $t) { continue }
+            $gone = $null
+            if ($null -ne $t.gone_el_ms) { $gone = [math]::Round(([double]$t.gone_el_ms) / 1000, 1) }
+            $tl2.Add([ordered]@{ kind = [string]$t.cls; title = [string]$t.name; text = (Limit-Text ([string]$t.detail) 400); first_sec = [math]::Round(([double]$t.first_el_ms) / 1000, 1); gone_sec = $gone; at_start = [bool]$t.present_at_start; at_end = [bool]$t.present_at_end; polls = $t.polls })
+        }
+        $d['toasts'] = $tl2.ToArray()
+        if ($null -ne $f.update_error_toast_seen) {
+            $d['update_error_toast_seen'] = [bool]$f.update_error_toast_seen
+            $d['update_error_toast'] = [string]$f.update_error_toast_detail
+            if ($null -ne $f.update_error_toast_first_el_ms) { $d['update_error_toast_sec'] = [math]::Round(([double]$f.update_error_toast_first_el_ms) / 1000, 1) }
+        }
+        if ($null -ne $f.restore_done_toast_seen) {
+            $d['restore_done_toast_seen'] = [bool]$f.restore_done_toast_seen
+            $d['restore_done_toast'] = [string]$f.restore_done_toast_detail
+        }
+        $d['status_bar_pid'] = $f.status_bar_pid
+        if ($null -ne $f.status_bar_pid_differs) { $d['status_bar_pid_differs'] = [bool]$f.status_bar_pid_differs }
+        if ($null -ne $ObsFile.obs_min_ms) { $d['obs_min_sec'] = [math]::Round(([double]$ObsFile.obs_min_ms) / 1000, 0) }
     }
     # nothing is clicked by this harness in the window, so a daemon that changed did so by the app's own doing
     if (($d['daemon_reached_target'] -eq $true) -and ($oldAlive.Count -gt 0) -and ($newPids.Count -eq 0)) {
@@ -1062,6 +1110,410 @@ function Get-UpgDaemonResult {
         $d['rotated_evidence'] = 'unknown: the page could not be asked and the process table is not conclusive'
     }
     return $d
+}
+
+# =========================================================================
+# UPG-2: marker / stamp files of the product (records, never part of a verdict)
+#   %USERPROFILE%\.cys\.pending-restore   src-tauri/src/main.rs pending_restore_path(): written before a daemon hand-over, removed after
+#                                         a successful "cys init-pack" of maybe_apply_pending_update
+#   %USERPROFILE%\.cys\.last-app-version  last_app_version_path(): the app version whose pack was applied (written after init-pack)
+#   %USERPROFILE%\.cys\pack\.pack-version the commit marker of the pack
+#   %USERPROFILE%\.cys\pack.prev          src/pack.rs pack_prev_dir(): "<pack_dir>.prev", the one-generation rollback copy (atomic_swap)
+#   %USERPROFILE%\.cys\.pack-staging*     init_staging_dir(): ".pack-staging-init-<pid>" beside the pack (pack-update uses ".pack-staging")
+# =========================================================================
+function Get-UpgStamps {
+    param([string]$Tag)
+    $h = Join-Path $env:USERPROFILE '.cys'
+    $o = [ordered]@{ tag = $Tag; time = (Get-IsoNow); pending_restore = $null; last_app_version = $null; pack_version = $null; pack_prev = $null; staging = @(); error = $null }
+    try {
+        $o['pending_restore'] = [bool](Test-Path -LiteralPath (Join-Path $h '.pending-restore'))
+        $lv = Join-Path $h '.last-app-version'
+        if (Test-Path -LiteralPath $lv) { $o['last_app_version'] = (Limit-Text (([string](Read-FileShared $lv)).Trim()) 60) }
+        $pv = Join-Path $h 'pack\.pack-version'
+        if (Test-Path -LiteralPath $pv) { $o['pack_version'] = (Limit-Text (([string](Read-FileShared $pv)).Trim()) 60) }
+        $o['pack_prev'] = [bool](Test-Path -LiteralPath (Join-Path $h 'pack.prev'))
+        $st = New-Object System.Collections.Generic.List[string]
+        if (Test-Path -LiteralPath $h) {
+            foreach ($d in @(Get-ChildItem -LiteralPath $h -Force -Filter '.pack-staging*' -ErrorAction SilentlyContinue)) {
+                if ($null -ne $d) { $st.Add([string]$d.Name) }
+            }
+        }
+        $o['staging'] = $st.ToArray()
+    } catch { $o['error'] = $_.Exception.Message }
+    return $o
+}
+
+function Format-UpgStamps {
+    param($S)
+    if (-not ($S -is [System.Collections.IDictionary])) { return 'not read' }
+    return ('stamp={0} pending-restore={1} pack={2} pack.prev={3} staging=[{4}]' -f (Format-UpgVal $S['last_app_version'] 'none'), $S['pending_restore'], (Format-UpgVal $S['pack_version'] 'none'), $S['pack_prev'], (@($S['staging']) -join ','))
+}
+
+# =========================================================================
+# UPG-2: process creation / termination auditing for this scene (observation only; everything is put back in upg-cleanup)
+#   on      auditpol /set /subcategory:{GUID} /success:enable for Process Creation and Process Termination, and the policy value
+#           ProcessCreationIncludeCmdLine_Enabled = 1 (4688 then carries the command line). The values of before are recorded.
+#   test    a cmd.exe that exits with 7 and carries a random word in its command line must show up as 4688 (+ command line) and
+#           4689 (Status 0x7). Only then the audit counts as working; else the fallback (diag/proc-poll.ps1) is used.
+#   read    Get-WinEvent Security 4688 / 4689. 4688: NewProcessId, ProcessId (= the creator), NewProcessName, CommandLine,
+#           ParentProcessName. 4689: ProcessId, ProcessName, Status. The ids are hex strings ("0x1a2c").
+# =========================================================================
+function ConvertFrom-UpgHex {
+    param([string]$Text)
+    try {
+        $t = ([string]$Text).Trim()
+        if ($t -eq '') { return $null }
+        if ($t -match '^0[xX]([0-9a-fA-F]+)$') { return [Convert]::ToInt64($Matches[1], 16) }
+        if ($t -match '^\d+$') { return [int64]$t }
+    } catch { }
+    return $null
+}
+
+function Invoke-UpgSysTool {
+    param([string]$Exe, [string]$Arguments, [int]$TimeoutSec = 30)
+    $x = Invoke-Proc -File (Join-Path $env:windir ('System32\' + $Exe)) -Arguments $Arguments -TimeoutSec $TimeoutSec
+    return [ordered]@{ exe = $Exe; args = $Arguments; rc = $x['rc']; timed_out = $x['timedOut']; start_error = $x['startError']; out = (Limit-Text (([string]$x['out']).Trim()) 1500); err = (Limit-Text (([string]$x['err']).Trim()) 600) }
+}
+
+# "auditpol /get /subcategory:{GUID} /r" prints CSV: Machine Name,Policy Target,Subcategory,Subcategory GUID,Inclusion Setting,Exclusion Setting
+function Get-UpgAuditSetting {
+    param([string]$Guid)
+    $r = Invoke-UpgSysTool 'auditpol.exe' ('/get /subcategory:' + $Guid + ' /r')
+    $r['setting'] = $null
+    $r['success'] = $null
+    try {
+        foreach ($line in (([string]$r['out']) -split "`r?`n")) {
+            if ($line.ToUpperInvariant().Contains($Guid.ToUpperInvariant())) {
+                $f = $line.Split(',')
+                if ($f.Count -ge 5) {
+                    $r['setting'] = [string]$f[4]
+                    $r['success'] = [bool]([string]$f[4] -match 'Success')
+                }
+            }
+        }
+    } catch { }
+    return $r
+}
+
+# the Security events 4688 / 4689 since a moment, oldest first, as plain records
+function Read-UpgAuditEvents {
+    param([datetime]$Since, [int]$MaxEvents = 40000)
+    $res = [ordered]@{ ok = $false; error = $null; since = (ConvertTo-IsoUtc $Since); read = 0; events = @() }
+    $raw = @()
+    try {
+        $raw = @(Get-WinEvent -FilterHashtable @{ LogName = 'Security'; Id = 4688, 4689; StartTime = $Since } -MaxEvents $MaxEvents -ErrorAction Stop)
+        $res['ok'] = $true
+    } catch {
+        if ([string]$_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $res['ok'] = $true } else { $res['error'] = $_.Exception.Message }
+        $raw = @()
+    }
+    $list = New-Object System.Collections.Generic.List[object]
+    for ($i = $raw.Count - 1; $i -ge 0; $i--) {
+        $ev = $raw[$i]
+        if ($null -eq $ev) { continue }
+        try {
+            $d = [ordered]@{}
+            $x = [xml]$ev.ToXml()
+            foreach ($n in @($x.Event.EventData.Data)) {
+                if ($null -ne $n) { $d[[string]$n.Name] = [string]$n.InnerText }
+            }
+            $id = [int]$ev.Id
+            $e = [ordered]@{ time = (ConvertTo-IsoUtc $ev.TimeCreated); id = $id; kind = $null; pid = $null; ppid = $null; image = $null; cmd = $null; parent_image = $null; status = $null; status_dec = $null; raw = $d }
+            if ($id -eq 4688) {
+                $e['kind'] = 'create'
+                $e['pid'] = ConvertFrom-UpgHex ([string]$d['NewProcessId'])
+                $e['ppid'] = ConvertFrom-UpgHex ([string]$d['ProcessId'])
+                $e['image'] = [string]$d['NewProcessName']
+                $e['cmd'] = [string]$d['CommandLine']
+                $e['parent_image'] = [string]$d['ParentProcessName']
+            } else {
+                $e['kind'] = 'exit'
+                $e['pid'] = ConvertFrom-UpgHex ([string]$d['ProcessId'])
+                $e['image'] = [string]$d['ProcessName']
+                $e['status'] = [string]$d['Status']
+                $e['status_dec'] = ConvertFrom-UpgHex ([string]$d['Status'])
+            }
+            $list.Add($e)
+        } catch { }
+    }
+    $res['read'] = $list.Count
+    $res['events'] = $list.ToArray()
+    return $res
+}
+
+function Enable-UpgProcAudit {
+    $a = [ordered]@{ started = (Get-IsoNow); works = $false; cmdline_works = $false; exit_status_works = $false; before = [ordered]@{}; set = [ordered]@{}; after = [ordered]@{}; reg_before = $null; reg_before_value = $null; reg_set = $null; log_before = $null; log_max_before = $null; log_set = $null; selftest = $null; error = $null; restored = $null }
+    try {
+        foreach ($g in @($K_UPG_AUDIT_CREATE, $K_UPG_AUDIT_EXIT)) { $a['before'][$g] = Get-UpgAuditSetting $g }
+        $q = Invoke-UpgSysTool 'reg.exe' ('query "' + $K_UPG_AUDIT_REGKEY + '" /v ' + $K_UPG_AUDIT_REGVAL)
+        $a['reg_before'] = $q
+        $m = [regex]::Match([string]$q['out'], 'REG_DWORD\s+0x([0-9a-fA-F]+)')
+        if (($q['rc'] -eq 0) -and $m.Success) { $a['reg_before_value'] = [Convert]::ToInt64($m.Groups[1].Value, 16) }
+        $a['reg_set'] = Invoke-UpgSysTool 'reg.exe' ('add "' + $K_UPG_AUDIT_REGKEY + '" /v ' + $K_UPG_AUDIT_REGVAL + ' /t REG_DWORD /d 1 /f')
+        foreach ($g in @($K_UPG_AUDIT_CREATE, $K_UPG_AUDIT_EXIT)) { $a['set'][$g] = Invoke-UpgSysTool 'auditpol.exe' ('/set /subcategory:' + $g + ' /success:enable') }
+        foreach ($g in @($K_UPG_AUDIT_CREATE, $K_UPG_AUDIT_EXIT)) { $a['after'][$g] = Get-UpgAuditSetting $g }
+        # the Security log: 20 MB by default; every process of the machine is logged from now on, so give it room
+        $gl = Invoke-UpgSysTool 'wevtutil.exe' 'gl Security'
+        $a['log_before'] = $gl
+        $m2 = [regex]::Match([string]$gl['out'], 'maxSize:\s*(\d+)')
+        if ($m2.Success) {
+            $a['log_max_before'] = [int64]$m2.Groups[1].Value
+            if ([int64]$a['log_max_before'] -lt 134217728) { $a['log_set'] = Invoke-UpgSysTool 'wevtutil.exe' 'sl Security /ms:134217728' }
+        }
+        # the test: one process with a known command line and a known exit code
+        $word = 'diag-audit-' + [guid]::NewGuid().ToString('N').Substring(0, 10)
+        $t0 = (Get-Date).AddSeconds(-3)
+        $st = [ordered]@{ word = $word; rc = $null; tries = 0; create_seen = $false; cmdline_seen = $false; exit_seen = $false; exit_status = $null; events_read = $null; read_error = $null }
+        $a['selftest'] = $st
+        $x = Invoke-Proc -File (Join-Path $env:windir 'System32\cmd.exe') -Arguments ('/c "echo ' + $word + '>nul & exit 7"') -TimeoutSec 20
+        $st['rc'] = $x['rc']
+        for ($n = 1; $n -le 5; $n++) {
+            $st['tries'] = $n
+            Start-Sleep -Seconds 1
+            $r = Read-UpgAuditEvents -Since $t0 -MaxEvents 5000
+            $st['events_read'] = $r['read']
+            $st['read_error'] = $r['error']
+            $tp = $null
+            foreach ($e in @($r['events'])) {
+                if ($null -eq $e) { continue }
+                if (($e['kind'] -eq 'create') -and ([string]$e['image'] -like '*\cmd.exe')) {
+                    if ([string]$e['cmd'] -like ('*' + $word + '*')) { $st['create_seen'] = $true; $st['cmdline_seen'] = $true; $tp = $e['pid'] }
+                    elseif (($null -eq $tp) -and ([int64]$e['ppid'] -eq [int64]$PID)) { $st['create_seen'] = $true; $tp = $e['pid'] }
+                }
+                if (($e['kind'] -eq 'exit') -and ($null -ne $tp) -and ($e['pid'] -eq $tp) -and ([string]$e['image'] -like '*\cmd.exe')) { $st['exit_seen'] = $true; $st['exit_status'] = $e['status'] }
+            }
+            if ($st['create_seen'] -and $st['exit_seen']) { break }
+        }
+        $a['works'] = [bool]$st['create_seen']
+        $a['cmdline_works'] = [bool]$st['cmdline_seen']
+        $a['exit_status_works'] = [bool]($st['exit_seen'] -and ((ConvertFrom-UpgHex ([string]$st['exit_status'])) -eq 7))
+    } catch {
+        $a['error'] = 'exception: ' + $_.Exception.Message
+    }
+    $a['finished'] = (Get-IsoNow)
+    return $a
+}
+
+# put back what Enable-UpgProcAudit changed (the log size stays: a bigger log does no harm and shrinking a filled log can fail)
+function Restore-UpgProcAudit {
+    param($Setup)
+    $r = [ordered]@{ time = (Get-IsoNow); auditpol = [ordered]@{}; registry = $null; note = $null }
+    try {
+        if (-not ($Setup -is [System.Collections.IDictionary])) { $r['note'] = 'the audit was never set up: nothing to put back'; return $r }
+        foreach ($g in @($K_UPG_AUDIT_CREATE, $K_UPG_AUDIT_EXIT)) {
+            $b = $Setup['before'][$g]
+            if (($b -is [System.Collections.IDictionary]) -and ($b['success'] -eq $false)) {
+                $r['auditpol'][$g] = Invoke-UpgSysTool 'auditpol.exe' ('/set /subcategory:' + $g + ' /success:disable')
+            } else {
+                $r['auditpol'][$g] = 'left as it is (success auditing was already on before, or the value of before could not be read)'
+            }
+        }
+        if ($null -eq $Setup['reg_before_value']) {
+            $r['registry'] = Invoke-UpgSysTool 'reg.exe' ('delete "' + $K_UPG_AUDIT_REGKEY + '" /v ' + $K_UPG_AUDIT_REGVAL + ' /f')
+        } else {
+            $r['registry'] = Invoke-UpgSysTool 'reg.exe' ('add "' + $K_UPG_AUDIT_REGKEY + '" /v ' + $K_UPG_AUDIT_REGVAL + ' /t REG_DWORD /d ' + [string]$Setup['reg_before_value'] + ' /f')
+        }
+    } catch { $r['note'] = 'exception: ' + $_.Exception.Message }
+    return $r
+}
+
+# the file name of an image path as the event wrote it (a plain text split: the path is data, not a file of this machine)
+function Get-UpgLeaf {
+    param([string]$Image)
+    if (-not $Image) { return '' }
+    return [string](($Image -split '[\\/]')[-1])
+}
+
+function Test-UpgAuditImage {
+    param([string]$Image, [string]$InstallPrefix)
+    if (-not $Image) { return $false }
+    $leaf = Get-UpgLeaf $Image
+    if ($Image.StartsWith($InstallPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if (@('cys-app.exe', 'cys.exe', 'cysd.exe') -contains $leaf.ToLowerInvariant()) { return $true }
+    if (Test-AppInstallerProc $leaf $Image) { return $true }
+    return $false
+}
+
+# keep the processes of the product (install folder, updater temp folder, installer) and everything they started, in time order;
+# a creation and its termination are matched by (pid, image, order in time) because Windows hands a pid out again
+function Select-UpgAuditTree {
+    param($Events)
+    $kept = New-Object System.Collections.Generic.List[object]
+    $alive = @{}
+    $prefix = (Get-InstallDir).TrimEnd('\') + '\'
+    foreach ($e in @($Events)) {
+        if ($null -eq $e) { continue }
+        $img = [string]$e['image']
+        $mine = Test-UpgAuditImage $img $prefix
+        $k = [string]$e['pid']
+        if ($e['kind'] -eq 'create') {
+            $pk = [string]$e['ppid']
+            if ($mine -or $alive.ContainsKey($pk)) {
+                $e['why'] = $(if ($mine) { 'product image' } else { 'started by ' + [string]$alive[$pk] })
+                $alive[$k] = $img
+                $kept.Add($e)
+            }
+        } else {
+            if ($alive.ContainsKey($k) -and ([string]$alive[$k] -ieq $img)) {
+                $alive.Remove($k)
+                $kept.Add($e)
+            } elseif ($mine) {
+                $e['why'] = 'product image (its creation is older than the window)'
+                $kept.Add($e)
+            }
+        }
+        if ($kept.Count -ge 8000) { break }
+    }
+    return $kept.ToArray()
+}
+
+# creation + termination -> one record per process
+function ConvertTo-UpgProcList {
+    param($Kept)
+    $open = @{}
+    $done = New-Object System.Collections.Generic.List[object]
+    foreach ($e in @($Kept)) {
+        if ($null -eq $e) { continue }
+        $k = [string]$e['pid']
+        if ($e['kind'] -eq 'create') {
+            if ($open.ContainsKey($k)) { $done.Add($open[$k]); $open.Remove($k) }
+            $leaf = Get-UpgLeaf ([string]$e['image'])
+            $open[$k] = [ordered]@{ pid = $e['pid']; ppid = $e['ppid']; image = [string]$e['image']; leaf = $leaf; cmd = [string]$e['cmd']; parent_image = [string]$e['parent_image']; start = [string]$e['time']; end = $null; seconds = $null; exit_status = $null; exit_status_dec = $null; source = 'audit' }
+        } elseif ($open.ContainsKey($k) -and ([string]$open[$k]['image'] -ieq [string]$e['image'])) {
+            $p = $open[$k]
+            $p['end'] = [string]$e['time']
+            $p['seconds'] = Get-UpgSeconds ([string]$p['start']) ([string]$p['end'])
+            $p['exit_status'] = $e['status']
+            $p['exit_status_dec'] = $e['status_dec']
+            $done.Add($p)
+            $open.Remove($k)
+        }
+    }
+    foreach ($k in @($open.Keys)) { $done.Add($open[$k]) }
+    return @($done.ToArray() | Sort-Object { [string]$_['start'] })
+}
+
+# the arguments of a command line without the program ("C:\...\cys.exe" init-pack --no-install-hook -> init-pack --no-install-hook)
+function Get-UpgCmdArgs {
+    param([string]$Cmd)
+    $m = [regex]::Match(([string]$Cmd).Trim(), '^(?:"[^"]*"|\S+)\s*(.*)$')
+    if ($m.Success) { return [string]$m.Groups[1].Value }
+    return ''
+}
+
+# the table the summary line comes from: the cys.exe processes after the relaunch, init-pack among them, the new daemon, restore / drain
+function Get-UpgInitPackTable {
+    param($Procs, [string]$RelaunchIso, $BeforeDaemonPids, [string]$Source, [string]$NowIso)
+    $t = [ordered]@{ source = $Source; relaunch_at = $RelaunchIso; cys_processes = @(); init_pack_count = 0; init_pack = @(); init_pack_overlap = $null; init_pack_nonzero = 0; exit_status_known = $false; new_daemon_started_at = $null; new_daemon_pid = $null; restore = @(); drain = @(); line = $null }
+    $from = ''
+    try { if ($RelaunchIso) { $from = ConvertTo-IsoUtc (([datetime]::Parse($RelaunchIso, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)).AddSeconds(-10)) } } catch { $from = '' }
+    $before = New-Object System.Collections.Generic.List[string]
+    foreach ($b in @($BeforeDaemonPids)) { if ($null -ne $b) { $before.Add([string]$b) } }
+    $cys = New-Object System.Collections.Generic.List[object]
+    $ip = New-Object System.Collections.Generic.List[object]
+    $rs = New-Object System.Collections.Generic.List[object]
+    $dr = New-Object System.Collections.Generic.List[object]
+    foreach ($p in @($Procs)) {
+        if ($null -eq $p) { continue }
+        if ($from -and ([string]::CompareOrdinal([string]$p['start'], $from) -lt 0)) { continue }
+        $leaf = ([string]$p['leaf']).ToLowerInvariant()
+        if (($leaf -eq 'cysd.exe') -and ($null -eq $t['new_daemon_started_at']) -and (-not $before.Contains([string]$p['pid']))) {
+            $t['new_daemon_started_at'] = [string]$p['start']
+            $t['new_daemon_pid'] = $p['pid']
+        }
+        if ($leaf -ne 'cys.exe') { continue }
+        $args1 = Get-UpgCmdArgs ([string]$p['cmd'])
+        $row = [ordered]@{ pid = $p['pid']; ppid = $p['ppid']; parent_image = $p['parent_image']; args = (Limit-Text $args1 300); start = $p['start']; end = $p['end']; seconds = $p['seconds']; exit_status = $p['exit_status']; exit_status_dec = $p['exit_status_dec'] }
+        $cys.Add($row)
+        if ($args1 -match '(^|\s)init-pack(\s|$)') { $ip.Add($row) }
+        if ($args1 -match '(^|\s)restore(\s|$)') { $rs.Add($row) }
+        if ($args1 -match '(^|\s)drain(\s|$)') { $dr.Add($row) }
+    }
+    $t['cys_processes'] = $cys.ToArray()
+    $t['init_pack'] = $ip.ToArray()
+    $t['init_pack_count'] = $ip.Count
+    $t['restore'] = $rs.ToArray()
+    $t['drain'] = $dr.ToArray()
+    # overlap: two intervals [start, end] meet; a process without a seen end is taken as running until now
+    $ov = $false
+    for ($i = 0; $i -lt $ip.Count; $i++) {
+        for ($j = $i + 1; $j -lt $ip.Count; $j++) {
+            $a1 = [string]$ip[$i]['start']; $a2 = [string]$ip[$i]['end']; if (-not $a2) { $a2 = $NowIso }
+            $b1 = [string]$ip[$j]['start']; $b2 = [string]$ip[$j]['end']; if (-not $b2) { $b2 = $NowIso }
+            if (([string]::CompareOrdinal($a1, $b2) -lt 0) -and ([string]::CompareOrdinal($b1, $a2) -lt 0)) { $ov = $true }
+        }
+    }
+    if ($ip.Count -ge 2) { $t['init_pack_overlap'] = [bool]$ov } elseif ($ip.Count -eq 1) { $t['init_pack_overlap'] = $false }
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($r in $ip.ToArray()) {
+        if ($null -ne $r['exit_status_dec']) {
+            $t['exit_status_known'] = $true
+            if ([int64]$r['exit_status_dec'] -ne 0) { $t['init_pack_nonzero'] = [int]$t['init_pack_nonzero'] + 1 }
+        }
+        $s1 = [string]$r['start']; if ($s1.Length -ge 23) { $s1 = $s1.Substring(11, 12) }
+        $e1 = [string]$r['end']; if ($e1.Length -ge 23) { $e1 = $e1.Substring(11, 12) } elseif (-not $e1) { $e1 = '?' }
+        $parts.Add(('[pid {0} {1}..{2} exit={3}]' -f $r['pid'], $s1, $e1, (Format-UpgVal $r['exit_status'] 'unknown')))
+    }
+    $nd = [string]$t['new_daemon_started_at']; if ($nd.Length -ge 23) { $nd = $nd.Substring(11, 12) } elseif (-not $nd) { $nd = 'not seen' }
+    $t['line'] = ('init-pack after the upgrade ({0}): {1} process(es) {2} overlap={3}; new daemon started at {4}; restore={5} drain={6}; cys.exe processes after the relaunch={7}' -f $Source, $ip.Count, ($parts.ToArray() -join ' '), (Format-UpgVal $t['init_pack_overlap'] 'n/a'), $nd, $rs.Count, $dr.Count, $cys.Count)
+    return $t
+}
+
+# the audit of the window [since, now]: files <name>.json (the kept events, raw fields + decimal pids) and <name>.txt (one line each)
+function Save-UpgProcAudit {
+    param([datetime]$Since, [string]$Name)
+    $o = [ordered]@{ name = $Name; time = (Get-IsoNow); since = (ConvertTo-IsoUtc $Since); ok = $false; error = $null; events_read = 0; events_kept = 0; processes = @() }
+    try {
+        $r = Read-UpgAuditEvents -Since $Since
+        $o['ok'] = [bool]$r['ok']
+        $o['error'] = $r['error']
+        $o['events_read'] = $r['read']
+        $kept = @(Select-UpgAuditTree $r['events'])
+        $o['events_kept'] = $kept.Count
+        Save-Json ($Name + '.json') ([ordered]@{ since = $o['since']; read = $r['read']; kept = $kept.Count; error = $r['error']; events = $kept }) 6
+        $sb = New-Object System.Text.StringBuilder
+        [void]$sb.Append(('# Security 4688 (create) / 4689 (exit) since {0}: {1} read, {2} kept (product images and what they started)' -f $o['since'], $r['read'], $kept.Count) + "`r`n")
+        foreach ($e in $kept) {
+            if ($e['kind'] -eq 'create') { [void]$sb.Append(('{0} CREATE pid={1} parent={2} [{3}] image={4} cmd={5}' -f $e['time'], $e['pid'], $e['ppid'], $e['parent_image'], $e['image'], (Format-TeamCmd ([string]$e['cmd']) 600)) + "`r`n") }
+            else { [void]$sb.Append(('{0} EXIT   pid={1} status={2} image={3}' -f $e['time'], $e['pid'], $e['status'], $e['image']) + "`r`n") }
+        }
+        Save-Text ($Name + '.txt') $sb.ToString()
+        $o['processes'] = @(ConvertTo-UpgProcList $kept)
+    } catch {
+        $o['error'] = 'exception: ' + $_.Exception.Message
+    }
+    return $o
+}
+
+# the fallback when the audit does not work: diag/proc-poll.ps1 in a second PowerShell, started the moment the new app is seen
+function Start-UpgProcPoll {
+    $f = Join-Path $global:DiagOut ($K_UPG_PFX + '-proc-poll.json')
+    $ps = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $a = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Seconds {1} -IntervalMs {2} -OutFile "{3}"' -f (Join-Path $PSScriptRoot 'proc-poll.ps1'), $K_UPG_POLL_SEC, $K_UPG_POLL_MS, $f
+    $p = Start-Process -FilePath $ps -ArgumentList $a -WindowStyle Hidden -PassThru -ErrorAction Stop
+    try { $null = $p.Handle } catch { }
+    return [ordered]@{ started = (Get-IsoNow); pid = $p.Id; file = $f; process = $p }
+}
+
+function Read-UpgProcPoll {
+    $o = [ordered]@{ found = $false; samples = $null; rows = 0; processes = @(); error = $null }
+    try {
+        $j = Read-UpgJson ($K_UPG_PFX + '-proc-poll.json')
+        if ($null -eq $j) { $o['error'] = 'the result file of the poll is missing'; return $o }
+        $o['found'] = $true
+        $o['samples'] = $j.samples
+        $list = New-Object System.Collections.Generic.List[object]
+        foreach ($r in @($j.rows)) {
+            if ($null -eq $r) { continue }
+            # the times as the same ISO text the audit records carry (whatever type the JSON reader gave them)
+            $c1 = [string](ConvertTo-IsoUtc $r.created)
+            $l1 = [string](ConvertTo-IsoUtc $r.last_seen)
+            $list.Add([ordered]@{ pid = $r.pid; ppid = $r.ppid; image = [string]$r.path; leaf = [string]$r.name; cmd = [string]$r.cmd; parent_image = $null; start = $c1; end = $l1; seconds = (Get-UpgSeconds $c1 $l1); exit_status = $null; exit_status_dec = $null; source = 'poll' })
+        }
+        $o['rows'] = $list.Count
+        $o['processes'] = @($list.ToArray() | Sort-Object { [string]$_['start'] })
+    } catch { $o['error'] = 'exception: ' + $_.Exception.Message }
+    return $o
 }
 
 # =========================================================================
@@ -1177,9 +1629,33 @@ function Get-UpgVerdict {
         } else {
             $nt.Add('whether the old daemon was replaced could not be determined (' + [string]$dn['rotated_evidence'] + ')')
         }
+        # UPG-2: the notifications after the upgrade are facts; the two below are NOTES, never a FAIL
+        $facts['toasts_after_upgrade'] = $dn['toasts']
+        $facts['update_error_toast_seen'] = $dn['update_error_toast_seen']
+        $facts['restore_done_toast_seen'] = $dn['restore_done_toast_seen']
+        $facts['status_bar_pid_differs_from_daemon_status'] = $dn['status_bar_pid_differs']
+        if ($dn['update_error_toast_seen'] -eq $true) { $nt.Add(('the upgraded app showed the update-error notification at +{0} s of the page watch: "{1}"' -f (Format-UpgVal $dn['update_error_toast_sec']), [string]$dn['update_error_toast'])) }
+        if ($dn['status_bar_pid_differs'] -eq $true) { $nt.Add(('the status bar still shows daemon pid {0} at the end while daemon_status answers pid {1} (the text is not rewritten after the rotation)' -f (Format-UpgVal $dn['status_bar_pid']), (Format-UpgVal $dn['daemon_pid_last']))) }
     } elseif ($CTX['upg_apply_ok']) {
         $nt.Add('the meeting of the new app with the old daemon was not observed (see step upg-after)')
     }
+    # UPG-2: the process audit and the stamp files are records
+    $pa = $up['proc_audit']
+    if ($pa -is [System.Collections.IDictionary]) {
+        $facts['proc_audit_source'] = $pa['source']
+        $tb = $pa['table']
+        if ($tb -is [System.Collections.IDictionary]) {
+            $facts['init_pack_count'] = $tb['init_pack_count']
+            $facts['init_pack_overlap'] = $tb['init_pack_overlap']
+            $facts['init_pack_nonzero_exits'] = $(if ($tb['exit_status_known']) { $tb['init_pack_nonzero'] } else { $null })
+            $facts['init_pack'] = $tb['init_pack']
+            $facts['new_daemon_started_at'] = $tb['new_daemon_started_at']
+            if ($tb['exit_status_known'] -and ([int]$tb['init_pack_nonzero'] -gt 0)) { $nt.Add(('{0} of the {1} "cys.exe init-pack" process(es) after the upgrade ended with a non-zero exit status (overlap={2}; see appe2e-upg-proc-audit.txt)' -f $tb['init_pack_nonzero'], $tb['init_pack_count'], (Format-UpgVal $tb['init_pack_overlap'] 'n/a'))) }
+        }
+        if ($pa['note']) { $nt.Add('process audit: ' + [string]$pa['note']) }
+    }
+    $sx = $up['stamps']
+    if ($sx -is [System.Collections.IDictionary]) { $facts['stamps'] = $sx['summary'] }
     $lo = $up['leftovers']
     if ($lo -is [System.Collections.IDictionary]) {
         foreach ($lk in @('after_observation', 'at_end')) {
@@ -1224,7 +1700,7 @@ function Get-UpgVerdict {
 }
 
 # =========================================================================
-# scene UPGRADE: summary, 14 lines at most -> appe2e-upgrade-summary.txt
+# scene UPGRADE: summary, 17 lines at most (14 + the three of UPG-2) -> appe2e-upgrade-summary.txt
 # =========================================================================
 function Write-UpgSummary {
     $lines = New-Object System.Collections.Generic.List[string]
@@ -1326,6 +1802,36 @@ function Write-UpgSummary {
         }
         $lines.Add($t9)
     } catch { $lines.Add('line 9 (daemon) could not be built: ' + $_.Exception.Message) }
+    # UPG-2: three more lines (records): notifications, init-pack processes, stamp files
+    try {
+        $dn = $up['daemon']
+        $tA = 'notifications after the upgrade: not observed'
+        if ($dn -is [System.Collections.IDictionary]) {
+            $tp = New-Object System.Collections.Generic.List[string]
+            foreach ($x in @($dn['toasts'])) {
+                if (-not ($x -is [System.Collections.IDictionary])) { continue }
+                $tp.Add(('[{0}] {1} :: {2} (+{3} s{4}{5})' -f $x['kind'], $x['title'], (Limit-Text ([string]$x['text']) 120), $x['first_sec'], $(if ($x['at_start']) { ', there at the start' } else { '' }), $(if ($null -ne $x['gone_sec']) { ', gone at +' + [string]$x['gone_sec'] + ' s' } else { ', still there at the end' })))
+            }
+            $tA = ('notifications after the upgrade ({0} in a watch of at least {1} s): update-error (init-pack) seen={2}; restore done seen={3}; status bar pid differs from daemon_status={4} | {5}' -f $tp.Count, (Format-UpgVal $dn['obs_min_sec']), (Format-UpgVal $dn['update_error_toast_seen']), (Format-UpgVal $dn['restore_done_toast_seen']), (Format-UpgVal $dn['status_bar_pid_differs']), $(if ($tp.Count -gt 0) { ($tp.ToArray() -join ' || ') } else { 'none' }))
+        }
+        $lines.Add($tA)
+    } catch { $lines.Add('line (notifications) could not be built: ' + $_.Exception.Message) }
+    try {
+        $pa = $up['proc_audit']
+        $tB = 'init-pack after the upgrade: the process audit did not run'
+        if ($pa -is [System.Collections.IDictionary]) {
+            if (($pa['table'] -is [System.Collections.IDictionary]) -and $pa['table']['line']) { $tB = [string]$pa['table']['line'] }
+            else { $tB = 'init-pack after the upgrade: no table (' + (Format-UpgVal $pa['note'] 'see proc_audit in app-e2e.json') + ')' }
+            $tB = $tB + ('; audit works={0} command line={1} exit status={2}' -f (Get-UpgVal $pa 'setup' 'works'), (Get-UpgVal $pa 'setup' 'cmdline_works'), (Get-UpgVal $pa 'setup' 'exit_status_works'))
+        }
+        $lines.Add($tB)
+    } catch { $lines.Add('line (init-pack) could not be built: ' + $_.Exception.Message) }
+    try {
+        $sx = $up['stamps']
+        $tC = 'stamp: not read'
+        if (($sx -is [System.Collections.IDictionary]) -and $sx['summary']) { $tC = [string]$sx['summary'] }
+        $lines.Add($tC)
+    } catch { $lines.Add('line (stamp) could not be built: ' + $_.Exception.Message) }
     try {
         $parts = New-Object System.Collections.Generic.List[string]
         $lo = $up['leftovers']
@@ -1412,8 +1918,11 @@ function Invoke-UpgradeMain {
         base_installer = $null; base_reset = $null; base_install = $null; base_start = $null; base_pre = $null; base_state = $null
         apply = $null; apply_observe = $null; after = $null; daemon = $null; app_evidence = $null
         leftovers = [ordered]@{}; pack = [ordered]@{}; install_facts = [ordered]@{}; timings = [ordered]@{}
+        proc_audit = $null; stamps = [ordered]@{ points = [ordered]@{}; summary = $null }
         verdict = $null
     }
+    $CTX['upg_audit_ok'] = $false
+    $CTX['upg_poll'] = $null
     foreach ($k in @('upg_params_ok', 'upg_base_installer_ok', 'upg_base_install_ok', 'upg_base_start_ok', 'upg_apply_started', 'upg_apply_ok', 'upg_marker_reached')) { $CTX[$k] = $false }
     $CTX['upg_base_version'] = ''
     $CTX['upg_to_version'] = ''
@@ -1480,6 +1989,18 @@ function Invoke-UpgradeMain {
             $CTX['upg_params_ok'] = [bool]$CTX['inputs_ok']
             Write-Log ('upgrade parameters: mode={0} from={1} to={2} usable={3}' -f $mode, $from, $to, $CTX['upg_params_ok'])
             Save-Run
+        }
+
+        # ---------------------------------------------------------------- UPG-2: process auditing on (a record; a failure only means the fallback)
+        if ($CTX['upg_params_ok']) {
+            Invoke-Step 'upg-audit-on' {
+                $pa = [ordered]@{ setup = $null; source = $null; note = $null; first = $null; table = $null; poll = $null; end = $null; restore = $null }
+                $RUN['upgrade']['proc_audit'] = $pa
+                $pa['setup'] = Enable-UpgProcAudit
+                $CTX['upg_audit_ok'] = [bool]($pa['setup']['works'] -and $pa['setup']['cmdline_works'])
+                if (-not $CTX['upg_audit_ok']) { $pa['note'] = ('Security auditing of process creation is not usable here (events seen={0}, command line={1}{2}): the fallback poll is used, it has no exit status' -f $pa['setup']['works'], $pa['setup']['cmdline_works'], $(if ($pa['setup']['error']) { ', ' + [string]$pa['setup']['error'] } else { '' })) }
+                Save-Run
+            }
         }
 
         # ---------------------------------------------------------------- 2. the public installer of the older version
@@ -1605,6 +2126,7 @@ function Invoke-UpgradeMain {
                 }
                 $CTX['upg_daemon_pids_before'] = $ids.ToArray()
                 $null = Save-Screenshot ($K_UPG_PFX + '-screen-before-apply.png')
+                $up['stamps']['points']['before_apply'] = Get-UpgStamps 'before-apply'
                 $nodeProc = $null
                 $go = $false
                 $applyStart = Get-Date
@@ -1662,6 +2184,11 @@ function Invoke-UpgradeMain {
                         try {
                             if (-not $nodeProc.HasExited) { Stop-ProcessTree -ProcessId $nodeProc.Id }
                         } catch { }
+                    }
+                    # UPG-2: the stamp files the moment the relaunch is known; and, without a working audit, the fallback poll right now
+                    $up['stamps']['points']['after_relaunch'] = Get-UpgStamps 'after-relaunch'
+                    if ($obs['success'] -and (-not $CTX['upg_audit_ok'])) {
+                        try { $CTX['upg_poll'] = Start-UpgProcPoll } catch { $CTX['upg_poll'] = $null; Add-DiagError 'Start-UpgProcPoll' $_ }
                     }
                     $up['apply_observe'] = $obs
                     $ap['ok'] = [bool]$obs['success']
@@ -1737,7 +2264,7 @@ function Invoke-UpgradeMain {
                     if ((Get-TeamMinutesLeft) -gt ($K_TEAM_NEED_MIN + 2)) {
                         # an observation: a problem in it is a NOTE and never takes (a) / (b) or the TEAM scene with it
                         try {
-                            $np = Start-UpgNode -Prefix ($K_UPG_PFX + '-after') -NodeExe $node -Mode 'uiobs' -Extra ('--max-wait-sec 120 --ready-wait-sec 30 --obs-sec {0} --obs-interval-sec {1} --obs-expect-daemon {2}' -f $K_UPG_OBS_SEC, $K_UPG_OBS_TICK_SEC, $to)
+                            $np = Start-UpgNode -Prefix ($K_UPG_PFX + '-after') -NodeExe $node -Mode 'uiobs' -Extra ('--max-wait-sec 120 --ready-wait-sec 30 --obs-sec {0} --obs-interval-sec {1} --obs-min-sec {2} --obs-expect-daemon {3}' -f $K_UPG_OBS_SEC, $K_UPG_OBS_PAGE_TICK_SEC, $K_UPG_OBS_MIN_SEC, $to)
                             $w = Watch-UpgDaemons -NodeProc $np -MaxSec ($K_UPG_OBS_SEC + 90)
                             try {
                                 if (-not $np.HasExited) { Stop-ProcessTree -ProcessId $np.Id }
@@ -1745,6 +2272,7 @@ function Invoke-UpgradeMain {
                             $of = Read-UpgJson ($K_UPG_PFX + '-after-obs-facts.json')
                             $dn = Get-UpgDaemonResult -Watch $w -ObsFile $of -ToVersion $to -BeforePids $CTX['upg_daemon_pids_before']
                             $dn['watch'] = [ordered]@{ started = $w['started']; ended = $w['ended']; end_reason = $w['end_reason']; ticks = $w['ticks']; node_exit_code = $w['node_exit_code']; first = $w['first']; last = $w['last'] }
+                            $up['stamps']['watch_changes'] = $w['stamp_changes'].ToArray()
                             $up['daemon'] = $dn
                             $up['timings']['daemon_target_sec'] = $dn['daemon_reached_target_sec']
                             Save-Json ($K_UPG_PFX + '-daemon-watch.json') $w 7
@@ -1757,6 +2285,7 @@ function Invoke-UpgradeMain {
                     }
                 }
                 # (d) leftovers at the end of the observation, (e) the pack after the upgrade, the desktop, the app's files
+                $up['stamps']['points']['after_observation'] = Get-UpgStamps 'after-observation'
                 $up['leftovers']['after_observation'] = Get-UpgLeftovers 'after-observation'
                 $up['pack']['after'] = Get-UpgPackState
                 try { $null = Save-Screenshot ($K_UPG_PFX + '-screen-after.png') } catch { }
@@ -1769,6 +2298,47 @@ function Invoke-UpgradeMain {
                 $ff = Get-InstallFacts 'upgrade-after'
                 $RUN['upgrade']['install_facts']['after'] = $ff
                 Save-Json 'appe2e-install-facts-after.json' $ff 7
+                Save-Run
+            }
+            # UPG-2: which processes the upgrade and the relaunched app started (Security 4688 / 4689 from 30 s before the upgrade
+            # began), or the fallback poll. A record: the init-pack line of the summary comes from here.
+            Invoke-Step 'upg-proc-audit' {
+                $up = $RUN['upgrade']
+                $pa = $up['proc_audit']
+                if (-not ($pa -is [System.Collections.IDictionary])) { $pa = [ordered]@{ setup = $null; source = $null; note = 'the audit was not set up'; first = $null; table = $null; poll = $null; end = $null; restore = $null }; $up['proc_audit'] = $pa }
+                $relaunch = [string](Get-UpgVal $up 'apply_observe' 'new_app_first_seen_at')
+                $since = (Get-Date).AddMinutes(-10)
+                try { if ($up['timings']['apply_started_at']) { $since = ([datetime]::Parse([string]$up['timings']['apply_started_at'], [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime().AddSeconds(-30) } } catch { }
+                $CTX['upg_audit_since'] = $since
+                $procs = @()
+                if ($CTX['upg_audit_ok']) {
+                    $first = Save-UpgProcAudit -Since $since -Name ($K_UPG_PFX + '-proc-audit')
+                    $procs = @($first['processes'])
+                    $pa['first'] = [ordered]@{ time = $first['time']; since = $first['since']; ok = $first['ok']; error = $first['error']; events_read = $first['events_read']; events_kept = $first['events_kept']; processes = $procs.Count }
+                    $pa['source'] = 'audit'
+                    if (-not $first['ok']) { $pa['note'] = 'the Security log could not be read: ' + [string]$first['error'] }
+                } elseif ($null -ne $CTX['upg_poll']) {
+                    # the poll runs for a fixed time: wait for its end (it is short), then read its file
+                    $pp = $CTX['upg_poll']['process']
+                    $tw = Get-Date
+                    while (((Get-Date) - $tw).TotalSeconds -lt ($K_UPG_POLL_SEC + 20)) {
+                        $gone = $true
+                        try { $gone = [bool]$pp.HasExited } catch { $gone = $true }
+                        if ($gone) { break }
+                        Start-Sleep -Seconds 1
+                    }
+                    $rp = Read-UpgProcPoll
+                    $procs = @($rp['processes'])
+                    $pa['poll'] = [ordered]@{ started = $CTX['upg_poll']['started']; found = $rp['found']; samples = $rp['samples']; rows = $rp['rows']; error = $rp['error'] }
+                    $pa['source'] = 'poll'
+                } else {
+                    $pa['source'] = 'none'
+                    if (-not $pa['note']) { $pa['note'] = 'neither the audit nor the fallback poll ran' }
+                }
+                if ($pa['source'] -ne 'none') {
+                    $src = $(if ($pa['source'] -eq 'audit') { 'Security 4688/4689' } else { 'fallback poll every ' + [string]$K_UPG_POLL_MS + ' ms for ' + [string]$K_UPG_POLL_SEC + ' s, no exit status' })
+                    $pa['table'] = Get-UpgInitPackTable -Procs $procs -RelaunchIso $relaunch -BeforeDaemonPids $CTX['upg_daemon_pids_before'] -Source $src -NowIso (Get-IsoNow)
+                }
                 Save-Run
             }
         }
@@ -1788,6 +2358,34 @@ function Invoke-UpgradeMain {
             $up = $RUN['upgrade']
             # after the TEAM scene's own cleanup stopped every process of the install folder: what is left on disk now
             $up['leftovers']['at_end'] = Get-UpgLeftovers 'at-end'
+            # UPG-2: the stamp files at the end, their one line, and the audit once more over the whole scene (a second pair of files)
+            try {
+                $sx = $up['stamps']
+                $sx['points']['at_end'] = Get-UpgStamps 'at-end'
+                $b0 = $sx['points']['before_apply']
+                $e0 = $sx['points']['at_end']
+                $to0 = [string]$CTX['upg_to_version']
+                $relaunch0 = [string](Get-UpgVal $up 'apply_observe' 'new_app_first_seen_at')
+                $seen = 'the stamp never showed ' + $to0
+                $all0 = New-Object System.Collections.Generic.List[object]
+                foreach ($k0 in @('after_relaunch')) { if ($sx['points'][$k0] -is [System.Collections.IDictionary]) { $all0.Add($sx['points'][$k0]) } }
+                foreach ($c0 in @($sx['watch_changes'])) { if ($c0 -is [System.Collections.IDictionary]) { $all0.Add($c0) } }
+                foreach ($k0 in @('after_observation', 'at_end')) { if ($sx['points'][$k0] -is [System.Collections.IDictionary]) { $all0.Add($sx['points'][$k0]) } }
+                foreach ($s0 in $all0.ToArray()) {
+                    if ($to0 -and ([string]$s0['last_app_version'] -eq $to0)) {
+                        $seen = ('first seen at {0} in sample "{1}", {2} s after the new app was seen' -f $s0['time'], $s0['tag'], (Format-UpgVal (Get-UpgSeconds $relaunch0 ([string]$s0['time'])) '?'))
+                        break
+                    }
+                }
+                $sx['summary'] = ('stamp (.last-app-version) {0} -> {1} ({2}); .pending-restore before={3} right after the relaunch={4} at the end={5}; pack version {6} -> {7}; pack.prev at the end={8}; staging leftovers at the end=[{9}]' -f (Format-UpgVal (Get-UpgVal $b0 'last_app_version') 'none'), (Format-UpgVal (Get-UpgVal $e0 'last_app_version') 'none'), $seen, (Format-UpgVal (Get-UpgVal $b0 'pending_restore')), (Format-UpgVal (Get-UpgVal $sx['points'] 'after_relaunch' 'pending_restore')), (Format-UpgVal (Get-UpgVal $e0 'pending_restore')), (Format-UpgVal (Get-UpgVal $b0 'pack_version') 'none'), (Format-UpgVal (Get-UpgVal $e0 'pack_version') 'none'), (Format-UpgVal (Get-UpgVal $e0 'pack_prev')), (@(Get-UpgVal $e0 'staging') -join ','))
+            } catch { Add-DiagError 'upg stamps summary' $_ }
+            try {
+                $pa = $up['proc_audit']
+                if (($pa -is [System.Collections.IDictionary]) -and $CTX['upg_audit_ok'] -and ($null -ne $CTX['upg_audit_since'])) {
+                    $e1 = Save-UpgProcAudit -Since $CTX['upg_audit_since'] -Name ($K_UPG_PFX + '-proc-audit-end')
+                    $pa['end'] = [ordered]@{ time = $e1['time']; ok = $e1['ok']; error = $e1['error']; events_read = $e1['events_read']; events_kept = $e1['events_kept']; processes = @($e1['processes']).Count }
+                }
+            } catch { Add-DiagError 'upg proc audit at the end' $_ }
             $v = $null
             try {
                 $v = Get-UpgVerdict
@@ -1822,6 +2420,14 @@ function Invoke-UpgradeMain {
             $cl['node_killed'] = $nk.ToArray()
             $cl['reset'] = Reset-AppState 'upg-final'
             try { $cl['webview2_policy_removed'] = Remove-WebView2DebugPolicy $CTX['wv2_policy'] } catch { }
+            # UPG-2: the audit settings back to what they were
+            try {
+                $pa = $RUN['upgrade']['proc_audit']
+                if (($pa -is [System.Collections.IDictionary]) -and ($pa['setup'] -is [System.Collections.IDictionary])) {
+                    $pa['restore'] = Restore-UpgProcAudit $pa['setup']
+                    $cl['proc_audit_restored'] = $true
+                }
+            } catch { }
         }
         $RUN['finished'] = (Get-IsoNow)
         Save-Run

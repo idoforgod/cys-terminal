@@ -2312,7 +2312,8 @@ async function runTeamMode() {
 //   shows one notice toast.
 // Files: <prefix>-cdp.json (everything, R.obs), <prefix>-obs-facts.json (small, rewritten after every poll: what the PowerShell side
 // reads), <prefix>-obs-timeline.txt (one line per poll), <prefix>-ui-obs-start.png / <prefix>-ui-obs-end.png.
-// Options: --obs-sec 150 --obs-interval-sec 5 --obs-expect-daemon <version> (the readiness wait is --ready-wait-sec capped at 30 s).
+// Options: --obs-sec 150 --obs-interval-sec 5 --obs-expect-daemon <version> (the readiness wait is --ready-wait-sec capped at 30 s),
+// --obs-min-sec 45 (UPG-2: no early end before that; every toast is filed with first seen / gone / there at the start / at the end).
 // Selectors follow the product UI (ui/index.html + ui/src/main.ts, the same in 0.14.42 and 0.14.43): #daemon-info, .ver-skew-badge
 // (showSkewBadge), #toasts > .toast (.toast-name .toast-detail), .modal-overlay, #btn-update, #ws-tabs .ws-tab, #root .pane.
 // ---------------------------------------------------------------------------
@@ -2321,8 +2322,15 @@ const OBS_INTERVAL_MS = Math.max(1, teamNum(args['obs-interval-sec'], 5)) * 1000
 const OBS_EXPECT = args['obs-expect-daemon'] === undefined || args['obs-expect-daemon'] === true ? '' : String(args['obs-expect-daemon']);
 const OBS_READY_MS = Math.min(UI_READY_MS, 30000);
 const OBS_TICKS_MAX = 240;
+// UPG-2: the early end (the daemon reports the expected version twice) is only taken after this many seconds, so that notifications
+// which come and go right after the start are all seen (--obs-min-sec, default 45; never longer than --obs-sec)
+const OBS_MIN_MS = Math.min(Math.max(0, teamNum(args['obs-min-sec'], 45)) * 1000, OBS_MS);
 const K_OBS = {
   notice_title: '\uC0C8 \uBC84\uC804 \uC900\uBE44', // title of the one-time notice toast of checkVersionSkew() ("new version ready")
+  // UPG-2: two notifications of the first start after an update (ui/src/main.ts): toast("watchdog", "<restore done title>", ...) after
+  // the node restore, and toast("health", ..., <payload of the backend event update-error>) - that payload names init-pack
+  restore_title: '\uC9C1\uC6D0 \uBCF5\uADC0 \uC644\uB8CC',
+  update_error_text: 'init-pack',
 };
 
 // ==== OBS-PURE-BEGIN (self-contained: nothing in this block may use anything defined outside it; the local self-check evaluates exactly this text) ====
@@ -2357,12 +2365,18 @@ function obsNewState(expect) {
     info_first: null,
     info_last: null,
     app_version_cmd: null,
+    update_error_seen: false,
+    update_error_detail: '',
+    update_error_first_el_ms: null,
+    restore_done_seen: false,
+    restore_done_detail: '',
+    restore_done_first_el_ms: null,
     toasts: [], // every distinct toast (class + title) that was on the screen in a poll
   };
 }
 
 // one poll { at, el_ms, snap, daemon } -> the running state
-function obsNote(F, tick, noticeTitle) {
+function obsNote(F, tick, noticeTitle, marks) {
   F.polls++;
   const d = tick && tick.daemon ? tick.daemon : null;
   if (d && d.ok === true) {
@@ -2418,6 +2432,7 @@ function obsNote(F, tick, noticeTitle) {
       F.badge_title = String(b.title || '');
     }
     const ts = Array.isArray(s.toasts) ? s.toasts : [];
+    const seenNow = [];
     for (let i = 0; i < ts.length; i++) {
       const t = ts[i] || {};
       const name = String(t.name || '');
@@ -2431,18 +2446,35 @@ function obsNote(F, tick, noticeTitle) {
         }
       }
       if (!rec && F.toasts.length < 60) {
-        rec = { cls: cls, name: name, detail: detail, first_el_ms: tick.el_ms, last_el_ms: tick.el_ms, polls: 0 };
+        rec = { cls: cls, name: name, detail: detail, first_el_ms: tick.el_ms, last_el_ms: tick.el_ms, polls: 0, first_poll: F.polls, gone_el_ms: null };
         F.toasts.push(rec);
       }
       if (rec) {
         rec.polls++;
         rec.last_el_ms = tick.el_ms;
         rec.detail = detail;
+        rec.gone_el_ms = null;
+        seenNow.push(rec);
+      }
+      const m = marks || {};
+      if (m.update_error_text && (' ' + cls + ' ').indexOf(' health ') >= 0 && detail.indexOf(m.update_error_text) >= 0 && !F.update_error_seen) {
+        F.update_error_seen = true;
+        F.update_error_detail = name + ' :: ' + detail;
+        F.update_error_first_el_ms = tick.el_ms;
+      }
+      if (m.restore_title && name.indexOf(m.restore_title) >= 0 && !F.restore_done_seen) {
+        F.restore_done_seen = true;
+        F.restore_done_detail = name + ' :: ' + detail;
+        F.restore_done_first_el_ms = tick.el_ms;
       }
       if (noticeTitle && name.indexOf(noticeTitle) >= 0) {
         F.notice_seen = true;
         F.notice_detail = detail;
       }
+    }
+    // a toast that was seen before and is not in this poll went away between the two polls
+    for (let k = 0; k < F.toasts.length; k++) {
+      if (seenNow.indexOf(F.toasts[k]) < 0 && F.toasts[k].gone_el_ms === null) F.toasts[k].gone_el_ms = tick.el_ms;
     }
   }
   return F;
@@ -2453,6 +2485,10 @@ function obsFacts(F) {
   const hasToken = function (cls, token) {
     return (' ' + String(cls || '') + ' ').indexOf(' ' + token + ' ') >= 0;
   };
+  // the pid the status bar shows ("daemon pid=<pid> sock=..."), to compare with the pid daemon_status answers
+  const pm = /pid=(\d+)/.exec(String(F.info_last || ''));
+  const barPid = pm ? Number(pm[1]) : null;
+  const dsPid = F.pid_last === null || F.pid_last === undefined ? null : Number(F.pid_last);
   return {
     polls: F.polls,
     daemon_reads_ok: F.daemon_ok,
@@ -2484,8 +2520,16 @@ function obsFacts(F) {
     daemon_info_first: F.info_first,
     daemon_info_last: F.info_last,
     app_version_cmd: F.app_version_cmd,
+    status_bar_pid: barPid,
+    status_bar_pid_differs: barPid === null || dsPid === null || isNaN(dsPid) ? null : barPid !== dsPid,
+    update_error_toast_seen: F.update_error_seen,
+    update_error_toast_detail: F.update_error_detail,
+    update_error_toast_first_el_ms: F.update_error_first_el_ms,
+    restore_done_toast_seen: F.restore_done_seen,
+    restore_done_toast_detail: F.restore_done_detail,
+    restore_done_toast_first_el_ms: F.restore_done_first_el_ms,
     toasts_seen: F.toasts.map(function (t) {
-      return { cls: t.cls, name: t.name, detail: t.detail, first_el_ms: t.first_el_ms, last_el_ms: t.last_el_ms, polls: t.polls, failure_like: hasToken(t.cls, 'watchdog') || hasToken(t.cls, 'health') };
+      return { cls: t.cls, name: t.name, detail: t.detail, first_el_ms: t.first_el_ms, last_el_ms: t.last_el_ms, polls: t.polls, failure_like: hasToken(t.cls, 'watchdog') || hasToken(t.cls, 'health'), present_at_start: t.first_poll === 1, gone_el_ms: t.gone_el_ms === undefined ? null : t.gone_el_ms, present_at_end: t.gone_el_ms === null || t.gone_el_ms === undefined };
     }),
   };
 }
@@ -2599,6 +2643,9 @@ function obsWriteFacts(O, F, partial) {
       ready_ok: O.ready ? O.ready.ok : null,
       end_reason: O.end_reason,
       socket_closed: closed,
+      obs_ms: OBS_MS,
+      obs_min_ms: OBS_MIN_MS,
+      interval_ms: OBS_INTERVAL_MS,
       facts: obsFacts(F),
     };
     fs.writeFileSync(path.join(OUT, `${PREFIX}-obs-facts.json`), JSON.stringify(o, null, 1));
@@ -2663,7 +2710,7 @@ async function runObsMode() {
         tick.daemon = { ok: false, error: String(e && e.message ? e.message : e) };
       }
     }
-    obsNote(F, tick, K_OBS.notice_title);
+    obsNote(F, tick, K_OBS.notice_title, K_OBS);
     if (O.ticks.length < OBS_TICKS_MAX) O.ticks.push(tick);
     else O.ticks_dropped++;
     line(obsLine(tick));
@@ -2674,8 +2721,8 @@ async function runObsMode() {
       O.end_reason = 'the CDP socket closed (the app exited)';
       break;
     }
-    if (OBS_EXPECT && F.reached_streak >= 2) {
-      O.end_reason = 'the daemon reports the expected version ' + OBS_EXPECT + ' (two polls in a row)';
+    if (OBS_EXPECT && F.reached_streak >= 2 && Date.now() - t0 >= OBS_MIN_MS) {
+      O.end_reason = 'the daemon reports the expected version ' + OBS_EXPECT + ' (two polls in a row)' + (OBS_MIN_MS > 0 ? ' and the minimum observation of ' + Math.round(OBS_MIN_MS / 1000) + ' s is over' : '');
       break;
     }
     const left = OBS_MS - (Date.now() - t0);

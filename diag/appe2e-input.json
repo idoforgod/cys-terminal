@@ -3,7 +3,6 @@
   "artifact": "cys-windows-x64-nsis",
   "release_tag": "",
   "scenes": [
-    "fresh",
     "upgrade"
   ],
   "upgrade_from": "0.14.42",
