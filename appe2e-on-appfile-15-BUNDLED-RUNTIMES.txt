@@ -1,0 +1,8 @@
+Bundled runtimes and their licenses:
+- Git for Windows (git): GPLv2 (https://github.com/git-for-windows/git)
+- MSYS2 bash + GNU coreutils: GPLv3
+- CPython (embeddable): PSF License (https://www.python.org)
+- pip (get-pip bootstrap): MIT
+- uv (astral-sh): Apache-2.0 OR MIT (https://github.com/astral-sh/uv)
+- Node.js (+npm/npx): MIT (https://nodejs.org)
+Written offer for corresponding source: contact the distributor.

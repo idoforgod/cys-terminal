@@ -1,0 +1,12 @@
+{
+  "depts": {
+    "dept-1": {
+      "socket": "\\\\.\\pipe\\cys-dept-dept-1",
+      "pack_dir": "C:\\Users\\runneradmin/.cys/pack-dept-dept-1",
+      "role": "dept-master",
+      "reserved_at": 1791167611.8652332,
+      "account_dir": "C:/Users/runneradmin/.cys/claude-default-dept-1",
+      "cwd": "C:/Users/runneradmin"
+    }
+  }
+}
