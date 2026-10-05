@@ -1,0 +1,12 @@
+# base state: waiting (every 3 s, at most 120 s) for a cysd.exe of the install folder AND a committed pack (.pack-version); start 2026-10-05T08:20:36.225Z
+[   0s 2026-10-05T08:20:36.375Z] cysd=[pid 7476 (parent 6424, created 2026-10-05T08:20:34.051Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=45 version=
+[   3s 2026-10-05T08:20:39.461Z] cysd=[pid 7476 (parent 6424, created 2026-10-05T08:20:34.051Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=87 version=
+[   6s 2026-10-05T08:20:42.561Z] cysd=[pid 7476 (parent 6424, created 2026-10-05T08:20:34.051Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=182 version=
+[   9s 2026-10-05T08:20:45.795Z] cysd=[pid 7476 (parent 6424, created 2026-10-05T08:20:34.051Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=332 version=
+[  13s 2026-10-05T08:20:48.891Z] cysd=[pid 7476 (parent 6424, created 2026-10-05T08:20:34.051Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=431 version=
+[  16s 2026-10-05T08:20:51.999Z] cysd=[pid 7476 (parent 6424, created 2026-10-05T08:20:34.051Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=540 version=
+[  19s 2026-10-05T08:20:55.111Z] cysd=[pid 7476 (parent 6424, created 2026-10-05T08:20:34.051Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=638 version=
+[  22s 2026-10-05T08:20:58.223Z] cysd=[pid 7476 (parent 6424, created 2026-10-05T08:20:34.051Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=739 version=
+[  25s 2026-10-05T08:21:01.338Z] cysd=[pid 7476 (parent 6424, created 2026-10-05T08:20:34.051Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=921 version=
+[  28s 2026-10-05T08:21:04.571Z] cysd=[pid 7476 (parent 6424, created 2026-10-05T08:20:34.051Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=942 version=0.14.42
+# end: a daemon runs and the pack is committed

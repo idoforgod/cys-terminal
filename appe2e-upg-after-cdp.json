@@ -1,0 +1,2481 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "uiobs",
+  "port": 9333,
+  "started": "2026-10-05T08:22:02.943Z",
+  "finished": "2026-10-05T08:22:48.582Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "cys — CYSJavis Terminal",
+      "url": "http://tauri.localhost/",
+      "id": "4B558302582B1BFB4D035DB07875A383"
+    }
+  ],
+  "chosen_target": {
+    "url": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "id": "4B558302582B1BFB4D035DB07875A383"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.43",
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": null,
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 0,
+    "progress_count": 0,
+    "progress_first": null,
+    "progress_last": null,
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-05T08:22:02.945Z",
+      "name": "start",
+      "argv": "--mode uiobs --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-upg-after --max-wait-sec 120 --ready-wait-sec 30 --obs-sec 150 --obs-interval-sec 1 --obs-min-sec 45 --obs-expect-daemon 0.14.43",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-05T08:22:03.241Z",
+      "name": "targets",
+      "count": 1,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-05T08:22:03.318Z",
+      "name": "connected",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-05T08:22:03.352Z",
+      "name": "attached",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "id": "4B558302582B1BFB4D035DB07875A383"
+    },
+    {
+      "t": "2026-10-05T08:22:03.396Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-05T08:22:03.429Z",
+      "name": "app_version",
+      "value": "0.14.43"
+    },
+    {
+      "t": "2026-10-05T08:22:03.440Z",
+      "name": "obs: wait for the status bar (#daemon-info)"
+    },
+    {
+      "t": "2026-10-05T08:22:03.505Z",
+      "name": "obs: observing",
+      "obs_ms": 150000,
+      "interval_ms": 1000,
+      "expect_daemon": "0.14.43",
+      "ready": true
+    },
+    {
+      "t": "2026-10-05T08:22:48.567Z",
+      "name": "obs: ended",
+      "reason": "the daemon reports the expected version 0.14.43 (two polls in a row) and the minimum observation of 45 s is over",
+      "polls": 45,
+      "daemon_version_last": "0.14.43",
+      "badge_seen": false
+    }
+  ],
+  "errors": [],
+  "ui": {
+    "mode": "uiobs",
+    "stage": "done",
+    "ready": {
+      "ok": true,
+      "waited_ms": 2
+    },
+    "clicks": [],
+    "states": [],
+    "shots": [
+      {
+        "name": "obs-start",
+        "file": "appe2e-upg-after-ui-obs-start.png",
+        "t": "2026-10-05T08:22:03.504Z",
+        "bytes": 48760
+      },
+      {
+        "name": "obs-end",
+        "file": "appe2e-upg-after-ui-obs-end.png",
+        "t": "2026-10-05T08:22:48.565Z",
+        "bytes": 48888
+      }
+    ],
+    "button_flow_complete": false,
+    "fallback_invoke": false,
+    "observe": null
+  },
+  "obs": {
+    "params": {
+      "obs_ms": 150000,
+      "interval_ms": 1000,
+      "expect_daemon": "0.14.43"
+    },
+    "started": "2026-10-05T08:22:03.439Z",
+    "ended": "2026-10-05T08:22:48.535Z",
+    "end_reason": "the daemon reports the expected version 0.14.43 (two polls in a row) and the minimum observation of 45 s is over",
+    "ready": {
+      "ok": true,
+      "waited_ms": 2
+    },
+    "ticks": [
+      {
+        "at": "2026-10-05T08:22:03.585Z",
+        "el_ms": 80,
+        "snap": {
+          "t": 1791188523588,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188523591,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:04.612Z",
+        "el_ms": 1107,
+        "snap": {
+          "t": 1791188524617,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188524619,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:05.791Z",
+        "el_ms": 2286,
+        "snap": {
+          "t": 1791188525795,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            },
+            {
+              "cls": "toast feed",
+              "name": "👥 직원 복귀 중",
+              "detail": "노드 세션 복원 중… (본부·부서)"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188525797,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:06.814Z",
+        "el_ms": 3309,
+        "snap": {
+          "t": 1791188526818,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            },
+            {
+              "cls": "toast watchdog",
+              "name": "✅ 직원 복귀 완료",
+              "detail": "노드 세션 복원 완료 (부서 0)."
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188526819,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:07.829Z",
+        "el_ms": 4324,
+        "snap": {
+          "t": 1791188527832,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            },
+            {
+              "cls": "toast watchdog",
+              "name": "✅ 직원 복귀 완료",
+              "detail": "노드 세션 복원 완료 (부서 0)."
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188527833,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:08.845Z",
+        "el_ms": 5340,
+        "snap": {
+          "t": 1791188528848,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            },
+            {
+              "cls": "toast watchdog",
+              "name": "✅ 직원 복귀 완료",
+              "detail": "노드 세션 복원 완료 (부서 0)."
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188528849,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:09.876Z",
+        "el_ms": 6371,
+        "snap": {
+          "t": 1791188529879,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            },
+            {
+              "cls": "toast watchdog",
+              "name": "✅ 직원 복귀 완료",
+              "detail": "노드 세션 복원 완료 (부서 0)."
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188529880,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:10.900Z",
+        "el_ms": 7395,
+        "snap": {
+          "t": 1791188530903,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            },
+            {
+              "cls": "toast watchdog",
+              "name": "✅ 직원 복귀 완료",
+              "detail": "노드 세션 복원 완료 (부서 0)."
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188530904,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:11.916Z",
+        "el_ms": 8411,
+        "snap": {
+          "t": 1791188531918,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            },
+            {
+              "cls": "toast watchdog",
+              "name": "✅ 직원 복귀 완료",
+              "detail": "노드 세션 복원 완료 (부서 0)."
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188531919,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:12.931Z",
+        "el_ms": 9426,
+        "snap": {
+          "t": 1791188532934,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            },
+            {
+              "cls": "toast watchdog",
+              "name": "✅ 직원 복귀 완료",
+              "detail": "노드 세션 복원 완료 (부서 0)."
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188532935,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:13.943Z",
+        "el_ms": 10438,
+        "snap": {
+          "t": 1791188533945,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188533946,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:14.959Z",
+        "el_ms": 11454,
+        "snap": {
+          "t": 1791188534961,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188534962,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:15.974Z",
+        "el_ms": 12469,
+        "snap": {
+          "t": 1791188535976,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188535977,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:16.988Z",
+        "el_ms": 13483,
+        "snap": {
+          "t": 1791188536991,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188536992,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:18.005Z",
+        "el_ms": 14500,
+        "snap": {
+          "t": 1791188538007,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188538008,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:19.018Z",
+        "el_ms": 15513,
+        "snap": {
+          "t": 1791188539021,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188539022,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:20.033Z",
+        "el_ms": 16528,
+        "snap": {
+          "t": 1791188540036,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188540036,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:21.049Z",
+        "el_ms": 17544,
+        "snap": {
+          "t": 1791188541051,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188541052,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:22.064Z",
+        "el_ms": 18559,
+        "snap": {
+          "t": 1791188542066,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188542067,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:23.083Z",
+        "el_ms": 19578,
+        "snap": {
+          "t": 1791188543085,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188543086,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:24.102Z",
+        "el_ms": 20597,
+        "snap": {
+          "t": 1791188544105,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188544106,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:25.117Z",
+        "el_ms": 21612,
+        "snap": {
+          "t": 1791188545119,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188545120,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:26.133Z",
+        "el_ms": 22628,
+        "snap": {
+          "t": 1791188546135,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188546136,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:27.147Z",
+        "el_ms": 23642,
+        "snap": {
+          "t": 1791188547150,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188547151,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:28.161Z",
+        "el_ms": 24656,
+        "snap": {
+          "t": 1791188548163,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188548164,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:29.176Z",
+        "el_ms": 25671,
+        "snap": {
+          "t": 1791188549179,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188549179,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:30.190Z",
+        "el_ms": 26685,
+        "snap": {
+          "t": 1791188550193,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188550194,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:31.206Z",
+        "el_ms": 27701,
+        "snap": {
+          "t": 1791188551209,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188551210,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:32.221Z",
+        "el_ms": 28716,
+        "snap": {
+          "t": 1791188552223,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188552224,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:33.235Z",
+        "el_ms": 29730,
+        "snap": {
+          "t": 1791188553238,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188553239,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:34.266Z",
+        "el_ms": 30761,
+        "snap": {
+          "t": 1791188554269,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188554270,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:35.288Z",
+        "el_ms": 31783,
+        "snap": {
+          "t": 1791188555291,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188555292,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:36.304Z",
+        "el_ms": 32799,
+        "snap": {
+          "t": 1791188556307,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188556308,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:37.321Z",
+        "el_ms": 33816,
+        "snap": {
+          "t": 1791188557324,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188557325,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:38.335Z",
+        "el_ms": 34830,
+        "snap": {
+          "t": 1791188558337,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188558338,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:39.350Z",
+        "el_ms": 35845,
+        "snap": {
+          "t": 1791188559353,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188559354,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:40.375Z",
+        "el_ms": 36870,
+        "snap": {
+          "t": 1791188560378,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188560379,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:41.395Z",
+        "el_ms": 37890,
+        "snap": {
+          "t": 1791188561398,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188561399,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:42.411Z",
+        "el_ms": 38906,
+        "snap": {
+          "t": 1791188562413,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188562414,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:43.425Z",
+        "el_ms": 39920,
+        "snap": {
+          "t": 1791188563427,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188563428,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:44.440Z",
+        "el_ms": 40935,
+        "snap": {
+          "t": 1791188564443,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188564443,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:45.454Z",
+        "el_ms": 41949,
+        "snap": {
+          "t": 1791188565457,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188565458,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:46.470Z",
+        "el_ms": 42965,
+        "snap": {
+          "t": 1791188566472,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188566473,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:47.501Z",
+        "el_ms": 43996,
+        "snap": {
+          "t": 1791188567503,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188567504,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      },
+      {
+        "at": "2026-10-05T08:22:48.525Z",
+        "el_ms": 45020,
+        "snap": {
+          "t": 1791188568528,
+          "title": "cys — CYSJavis Terminal",
+          "daemon_info_present": true,
+          "daemon_info": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "daemon_info_own": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+          "badge": {
+            "present": false,
+            "text": "",
+            "title": "",
+            "in_daemon_info": false
+          },
+          "toasts": [
+            {
+              "cls": "toast health",
+              "name": "Claude Code CLI가 없습니다",
+              "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작"
+            }
+          ],
+          "overlays": [],
+          "update_button": true,
+          "tab_count": 1,
+          "pane_count": 1
+        },
+        "daemon": {
+          "t": 1791188568529,
+          "ok": true,
+          "version": "0.14.43",
+          "daemon_pid": 9676,
+          "socket_path": "\\\\.\\pipe\\cys",
+          "started_at": 1791188522.746563,
+          "surface_count": 0,
+          "keys": [
+            "caller",
+            "daemon_pid",
+            "latest_seq",
+            "socket_path",
+            "started_at",
+            "surface_count",
+            "version"
+          ],
+          "error": null,
+          "app_version_cmd": "0.14.43"
+        }
+      }
+    ],
+    "ticks_dropped": 0,
+    "facts": {
+      "polls": 45,
+      "daemon_reads_ok": 45,
+      "daemon_reads_failed": 0,
+      "daemon_last_error": null,
+      "expect_daemon": "0.14.43",
+      "daemon_version_first": "0.14.43",
+      "daemon_version_last": "0.14.43",
+      "daemon_versions_seen": [
+        "0.14.43"
+      ],
+      "daemon_pid_first": 9676,
+      "daemon_pid_last": 9676,
+      "daemon_pids_seen": [
+        9676
+      ],
+      "daemon_started_at_first": 1791188522.746563,
+      "daemon_started_at_last": 1791188522.746563,
+      "daemon_surface_count_last": 0,
+      "daemon_changed": false,
+      "daemon_reached_expect": true,
+      "daemon_reached_expect_at": "2026-10-05T08:22:03.585Z",
+      "daemon_reached_expect_el_ms": 80,
+      "skew_badge_seen": false,
+      "skew_badge_first_at": null,
+      "skew_badge_first_el_ms": null,
+      "skew_badge_polls": 0,
+      "skew_badge_present_at_end": false,
+      "skew_badge_text": "",
+      "skew_badge_title": "",
+      "skew_notice_seen": false,
+      "skew_notice_detail": "",
+      "daemon_info_first": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+      "daemon_info_last": "daemon pid=7476 sock=\\\\.\\pipe\\cys",
+      "app_version_cmd": "0.14.43",
+      "status_bar_pid": 7476,
+      "status_bar_pid_differs": true,
+      "update_error_toast_seen": false,
+      "update_error_toast_detail": "",
+      "update_error_toast_first_el_ms": null,
+      "restore_done_toast_seen": true,
+      "restore_done_toast_detail": "✅ 직원 복귀 완료 :: 노드 세션 복원 완료 (부서 0).",
+      "restore_done_toast_first_el_ms": 3309,
+      "toasts_seen": [
+        {
+          "cls": "toast health",
+          "name": "Claude Code CLI가 없습니다",
+          "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+          "first_el_ms": 80,
+          "last_el_ms": 45020,
+          "polls": 45,
+          "failure_like": true,
+          "present_at_start": true,
+          "gone_el_ms": null,
+          "present_at_end": true
+        },
+        {
+          "cls": "toast feed",
+          "name": "👥 직원 복귀 중",
+          "detail": "노드 세션 복원 중… (본부·부서)",
+          "first_el_ms": 2286,
+          "last_el_ms": 2286,
+          "polls": 1,
+          "failure_like": false,
+          "present_at_start": false,
+          "gone_el_ms": 3309,
+          "present_at_end": false
+        },
+        {
+          "cls": "toast watchdog",
+          "name": "✅ 직원 복귀 완료",
+          "detail": "노드 세션 복원 완료 (부서 0).",
+          "first_el_ms": 3309,
+          "last_el_ms": 9426,
+          "polls": 7,
+          "failure_like": true,
+          "present_at_start": false,
+          "gone_el_ms": 10438,
+          "present_at_end": false
+        }
+      ]
+    }
+  }
+}
