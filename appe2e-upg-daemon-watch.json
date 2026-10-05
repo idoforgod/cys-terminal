@@ -1,0 +1,313 @@
+{
+    "started":  "2026-10-05T09:15:24.904Z",
+    "ended":  "2026-10-05T09:16:12.584Z",
+    "end_reason":  "the page observer ended",
+    "ticks":  11,
+    "node_exit_code":  0,
+    "first":  [
+                  {
+                      "id":  11036,
+                      "ppid":  8972,
+                      "created":  "2026-10-05T09:15:24.503Z",
+                      "name":  "cysd.exe",
+                      "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                      "image":  "cysd.exe",
+                      "image_version":  "0.14.43"
+                  }
+              ],
+    "last":  [
+                 {
+                     "id":  11036,
+                     "ppid":  8972,
+                     "created":  "2026-10-05T09:15:24.503Z",
+                     "name":  "cysd.exe",
+                     "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                     "image":  "cysd.exe",
+                     "image_version":  "0.14.43"
+                 }
+             ],
+    "samples":  [
+                    {
+                        "sec":  0,
+                        "time":  "2026-10-05T09:15:25.157Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  5,
+                        "time":  "2026-10-05T09:15:30.338Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  10,
+                        "time":  "2026-10-05T09:15:35.466Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  16,
+                        "time":  "2026-10-05T09:15:40.614Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  21,
+                        "time":  "2026-10-05T09:15:45.769Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  26,
+                        "time":  "2026-10-05T09:15:50.902Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  31,
+                        "time":  "2026-10-05T09:15:56.043Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  36,
+                        "time":  "2026-10-05T09:16:01.205Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  41,
+                        "time":  "2026-10-05T09:16:06.337Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  46,
+                        "time":  "2026-10-05T09:16:11.479Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    },
+                    {
+                        "sec":  48,
+                        "time":  "2026-10-05T09:16:12.584Z",
+                        "daemons":  [
+                                        {
+                                            "id":  11036,
+                                            "ppid":  8972,
+                                            "created":  "2026-10-05T09:15:24.503Z",
+                                            "name":  "cysd.exe",
+                                            "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                            "image":  "cysd.exe",
+                                            "image_version":  "0.14.43"
+                                        }
+                                    ],
+                        "app":  [
+                                    "cys-app.exe#8972"
+                                ],
+                        "pipes":  [
+                                      "cys"
+                                  ]
+                    }
+                ],
+    "stamp_changes":  [
+                          {
+                              "tag":  "daemon-watch",
+                              "time":  "2026-10-05T09:15:25.113Z",
+                              "pending_restore":  true,
+                              "last_app_version":  "0.14.42",
+                              "pack_version":  "0.14.42",
+                              "pack_prev":  true,
+                              "staging":  [
+                                              ".pack-staging-init-2720",
+                                              ".pack-staging-init-8036"
+                                          ],
+                              "gui_onboarded":  "0.14.42",
+                              "gui_onboard_attempts_present":  false,
+                              "gui_onboard_attempts":  null,
+                              "error":  null,
+                              "sec":  0
+                          },
+                          {
+                              "tag":  "daemon-watch",
+                              "time":  "2026-10-05T09:15:30.326Z",
+                              "pending_restore":  true,
+                              "last_app_version":  "0.14.42",
+                              "pack_version":  "0.14.43",
+                              "pack_prev":  true,
+                              "staging":  [
+                                              ".pack-staging-init-2388"
+                                          ],
+                              "gui_onboarded":  "0.14.43",
+                              "gui_onboard_attempts_present":  false,
+                              "gui_onboard_attempts":  null,
+                              "error":  null,
+                              "sec":  5
+                          },
+                          {
+                              "tag":  "daemon-watch",
+                              "time":  "2026-10-05T09:15:35.455Z",
+                              "pending_restore":  false,
+                              "last_app_version":  "0.14.43",
+                              "pack_version":  "0.14.43",
+                              "pack_prev":  true,
+                              "staging":  [
+
+                                          ],
+                              "gui_onboarded":  "0.14.43",
+                              "gui_onboard_attempts_present":  false,
+                              "gui_onboard_attempts":  null,
+                              "error":  null,
+                              "sec":  10
+                          }
+                      ]
+}

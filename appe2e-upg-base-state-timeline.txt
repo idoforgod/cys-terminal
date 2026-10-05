@@ -1,0 +1,13 @@
+# base state: waiting (every 3 s, at most 120 s) for a cysd.exe of the install folder AND a committed pack (.pack-version); start 2026-10-05T09:14:06.237Z
+[   0s 2026-10-05T09:14:06.382Z] cysd=[pid 9316 (parent 8184, created 2026-10-05T09:14:04.739Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=42 version=
+[   3s 2026-10-05T09:14:09.471Z] cysd=[pid 9316 (parent 8184, created 2026-10-05T09:14:04.739Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=146 version=
+[   6s 2026-10-05T09:14:12.566Z] cysd=[pid 9316 (parent 8184, created 2026-10-05T09:14:04.739Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=342 version=
+[   9s 2026-10-05T09:14:15.696Z] cysd=[pid 9316 (parent 8184, created 2026-10-05T09:14:04.739Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=559 version=
+[  12s 2026-10-05T09:14:18.816Z] cysd=[pid 9316 (parent 8184, created 2026-10-05T09:14:04.739Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=795 version=
+[  16s 2026-10-05T09:14:22.322Z] cysd=[pid 9316 (parent 8184, created 2026-10-05T09:14:04.739Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=942 version=0.14.42
+# end: a daemon runs and the pack is committed
+[settle +  0s 2026-10-05T09:14:22.397Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-8180] gui-onboarded=none onboard-attempts=none busy=[cys.exe#8180 init-pack] missing=4
+[settle +  2s 2026-10-05T09:14:24.456Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-10156] gui-onboarded=0.14.42 onboard-attempts=none busy=[cys.exe#10156 init-pack --no-install-hook] missing=3
+[settle +  4s 2026-10-05T09:14:26.506Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-10156] gui-onboarded=0.14.42 onboard-attempts=none busy=[cys.exe#10156 init-pack --no-install-hook] missing=3
+[settle +  6s 2026-10-05T09:14:28.557Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=0.14.42 onboard-attempts=none busy=[] missing=0
+# settled=True after +6 s; missing: 

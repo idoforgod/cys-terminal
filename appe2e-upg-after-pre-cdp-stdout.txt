@@ -1,0 +1,8 @@
+{"t":"2026-10-05T09:15:24.423Z","name":"start","argv":"--mode uipre --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-upg-after-pre --max-wait-sec 200 --ready-wait-sec 90","native_websocket":true}
+{"t":"2026-10-05T09:15:24.451Z","name":"targets","count":1,"pages":1}
+{"t":"2026-10-05T09:15:24.459Z","name":"connected","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","ws_impl":"mini"}
+{"t":"2026-10-05T09:15:24.462Z","name":"attached","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","id":"BE3B6E262745BB85B7FEB49C2A0E0DDD"}
+{"t":"2026-10-05T09:15:24.464Z","name":"page_info","href":"http://tauri.localhost/"}
+{"t":"2026-10-05T09:15:24.470Z","name":"app_version","value":"0.14.43"}
+{"t":"2026-10-05T09:15:24.471Z","name":"ui: wait for the Update button"}
+
