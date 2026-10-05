@@ -16,12 +16,16 @@
 #     the OLD daemon (150 s: does the app rotate it by itself, or does it show its version-skew badge), leftovers (*.prev* / *.new.exe),
 #     the pack before and after, and - on that same upgraded app, as it is - the TEAM scene of app-e2e.ps1 (Invoke-TeamScene).
 #   steps   prepare, upg-audit-on, upg-base-installer, upg-install-base, upg-facts-base, upg-start-base, upg-base-state, upg-apply,
-#           upg-after, upg-facts-after, upg-proc-audit, team, upg-verdict, upg-summary, upg-cleanup
+#           upg-after, upg-facts-after, upg-proc-audit, team, upg-second-start, upg-verdict, upg-summary, upg-cleanup
 #   UPG-2   (records and NOTES only, the PASS / FAIL rules are as before) the processes the upgrade and the relaunched app start
 #           (Security 4688 / 4689 with command lines and exit status -> appe2e-upg-proc-audit.{json,txt}, -end.{json,txt}; when the
 #           audit cannot be used: diag/proc-poll.ps1 -> appe2e-upg-proc-poll.json, no exit status), every notification of the upgraded
 #           app during a page watch of at least 45 s, and the marker / stamp files of the product at four moments. Three summary lines.
-#   files   appe2e-upgrade-verdict.json, appe2e-upgrade-summary.txt (17 lines at most), appe2e-verdict.json + app-e2e.json
+#   UPG-3   (records and NOTES only) the older app has to be SETTLED before the upgrade (stamp and onboarding marker at its version,
+#           no pack staging, no init-pack / restore running: up to 90 s more); the stamp record carries .gui-onboarded and
+#           .gui-onboard-attempts; after the TEAM scene step upg-second-start starts the upgraded app once more and files what
+#           it runs (init-pack with / without --no-install-hook, daemon install), its notifications and the stamp files.
+#   files   appe2e-upgrade-verdict.json, appe2e-upgrade-summary.txt (18 lines at most), appe2e-verdict.json + app-e2e.json
 #           (verdict = { result, upgrade, team, reasons }), appe2e-upg-*.{json,txt,png}, appe2e-install-facts-{base,after}.json
 #   verdict PASS only when everything holds: base install + base app start (else NOT-MEASURABLE), the marker reached the target and
 #           the app came back, marker / no failure file / the three file versions, the new app's version and UI, TEAM PASS.
@@ -56,6 +60,13 @@ $K_UPG_AUDIT_REGKEY = 'HKLM\Software\Microsoft\Windows\CurrentVersion\Policies\S
 $K_UPG_AUDIT_REGVAL = 'ProcessCreationIncludeCmdLine_Enabled'
 $K_UPG_POLL_SEC = 30
 $K_UPG_POLL_MS = 200
+# UPG-3: the older app has to be past its own first-run work before the upgrade is applied (settled: up to 90 s more, every 2 s);
+# after the TEAM scene the upgraded app is started a second time (a record: does the product retry its onboarding, does it work)
+$K_UPG_SETTLE_SEC = 90
+$K_UPG_SETTLE_TICK_SEC = 2
+$K_UPG_SECOND_OBS_SEC = 45
+$K_UPG_SECOND_MIN_SEC = 30
+$K_UPG_SECOND_NEED_MIN = 4
 
 # =========================================================================
 # small readers
@@ -606,6 +617,60 @@ function Get-UpgBaseState {
         Add-DiagError 'Get-UpgBaseState' $_
     }
     try { Add-Utf8NoBom $tl (('# end: {0}' -f $s['end_reason']) + "`r`n") } catch { }
+    # UPG-3: "ready" is not yet "settled". A PC on which the older version has been in use is past that app's own first-run work:
+    # the stamp (.last-app-version) and the onboarding marker (.gui-onboarded) carry its version, no pack staging folder is left and
+    # no "cys.exe init-pack" / "cys.exe restore" is running. Wait for that - up to 90 s more, every 2 s. Not settled = a NOTE.
+    $s['settled'] = $false
+    $s['settled_after_sec'] = $null
+    $s['settle_ticks'] = 0
+    $s['settle_missing'] = @()
+    $s['settle_stamps'] = $null
+    $s['settle_proc_check_ok'] = $null
+    $baseVer = [string]$CTX['upg_base_version']
+    if ($s['ready']) {
+        $ts = Get-Date
+        try {
+            while ($true) {
+                $el2 = [int]((Get-Date) - $ts).TotalSeconds
+                $stp = Get-UpgStamps 'settle'
+                $busy = New-Object System.Collections.Generic.List[string]
+                $procOk = $true
+                try {
+                    foreach ($cp in @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 15 -Filter "Name = 'cys.exe'" -ErrorAction Stop)) {
+                        if ($null -eq $cp) { continue }
+                        $ca = Get-UpgCmdArgs ([string]$cp.CommandLine)
+                        if ($ca -match '(^|\s)(init-pack|restore)(\s|$)') { $busy.Add(('cys.exe#{0} {1}' -f $cp.ProcessId, (Limit-Text $ca 60))) }
+                    }
+                } catch { $procOk = $false }
+                $miss = New-Object System.Collections.Generic.List[string]
+                if ([string]$stp['last_app_version'] -ne $baseVer) { $miss.Add(('.last-app-version is "{0}"' -f (Format-UpgVal $stp['last_app_version'] 'absent'))) }
+                if ([string]$stp['gui_onboarded'] -ne $baseVer) { $miss.Add(('.gui-onboarded is "{0}"' -f (Format-UpgVal $stp['gui_onboarded'] 'absent'))) }
+                if (@($stp['staging']).Count -gt 0) { $miss.Add('pack staging left: ' + (@($stp['staging']) -join ',')) }
+                if ($busy.Count -gt 0) { $miss.Add('running: ' + ($busy.ToArray() -join ', ')) }
+                $s['settle_ticks'] = [int]$s['settle_ticks'] + 1
+                $s['settle_stamps'] = $stp
+                $s['settle_proc_check_ok'] = $procOk
+                try { Add-Utf8NoBom $tl (('[settle +{0,3}s {1}] {2} busy=[{3}] missing={4}' -f $el2, (Get-IsoNow), (Format-UpgStamps $stp), ($busy.ToArray() -join ', '), $miss.Count) + "`r`n") } catch { }
+                if ($miss.Count -eq 0) { $s['settled'] = $true; $s['settled_after_sec'] = $el2; $s['settle_missing'] = @(); break }
+                if ($el2 -ge $K_UPG_SETTLE_SEC) { $s['settle_missing'] = $miss.ToArray(); break }
+                if ((Get-MinutesLeft) -lt 12) { $miss.Add('the wait was cut short (job time)'); $s['settle_missing'] = $miss.ToArray(); break }
+                $s['settle_missing'] = $miss.ToArray()
+                Start-Sleep -Seconds $K_UPG_SETTLE_TICK_SEC
+            }
+        } catch {
+            $s['settle_missing'] = @('settle loop exception: ' + $_.Exception.Message)
+            Add-DiagError 'Get-UpgBaseState settle' $_
+        }
+        # the state the upgrade starts from is the one after this wait
+        try {
+            $tab2 = Get-UpgProcs
+            $s['daemons'] = @(Get-UpgDaemonRows $tab2.rows)
+            $s['pack'] = Get-UpgPackState
+        } catch { }
+    } else {
+        $s['settle_missing'] = @('the readiness wait itself did not complete')
+    }
+    try { Add-Utf8NoBom $tl (('# settled={0} after +{1} s; missing: {2}' -f $s['settled'], (Format-UpgVal $s['settled_after_sec'] '-'), (@($s['settle_missing']) -join '; ')) + "`r`n") } catch { }
     # the records: processes of the install folder, pipes, pack, the names in the .cys folder, the desktop, the page
     try {
         $pl = New-Object System.Collections.Generic.List[object]
@@ -1120,12 +1185,20 @@ function Get-UpgDaemonResult {
 #   %USERPROFILE%\.cys\pack\.pack-version the commit marker of the pack
 #   %USERPROFILE%\.cys\pack.prev          src/pack.rs pack_prev_dir(): "<pack_dir>.prev", the one-generation rollback copy (atomic_swap)
 #   %USERPROFILE%\.cys\.pack-staging*     init_staging_dir(): ".pack-staging-init-<pid>" beside the pack (pack-update uses ".pack-staging")
+#   %USERPROFILE%\.cys\.gui-onboarded     gui_onboarded_path(): the app version whose GUI onboarding (cys init-pack + cys daemon install,
+#                                         maybe_windows_onboard) succeeded; anything else makes the next app start run the onboarding again
+#   %USERPROFILE%\.cys\.gui-onboard-attempts  {"version","reason","attempts"}: onboarding tries that could not be judged
 # =========================================================================
 function Get-UpgStamps {
     param([string]$Tag)
     $h = Join-Path $env:USERPROFILE '.cys'
-    $o = [ordered]@{ tag = $Tag; time = (Get-IsoNow); pending_restore = $null; last_app_version = $null; pack_version = $null; pack_prev = $null; staging = @(); error = $null }
+    $o = [ordered]@{ tag = $Tag; time = (Get-IsoNow); pending_restore = $null; last_app_version = $null; pack_version = $null; pack_prev = $null; staging = @(); gui_onboarded = $null; gui_onboard_attempts_present = $null; gui_onboard_attempts = $null; error = $null }
     try {
+        $go = Join-Path $h '.gui-onboarded'
+        if (Test-Path -LiteralPath $go) { $o['gui_onboarded'] = (Limit-Text (([string](Read-FileShared $go)).Trim()) 60) }
+        $ga = Join-Path $h '.gui-onboard-attempts'
+        $o['gui_onboard_attempts_present'] = [bool](Test-Path -LiteralPath $ga)
+        if ($o['gui_onboard_attempts_present']) { $o['gui_onboard_attempts'] = (Limit-Text (([string](Read-FileShared $ga)).Trim()) 200) }
         $o['pending_restore'] = [bool](Test-Path -LiteralPath (Join-Path $h '.pending-restore'))
         $lv = Join-Path $h '.last-app-version'
         if (Test-Path -LiteralPath $lv) { $o['last_app_version'] = (Limit-Text (([string](Read-FileShared $lv)).Trim()) 60) }
@@ -1146,7 +1219,7 @@ function Get-UpgStamps {
 function Format-UpgStamps {
     param($S)
     if (-not ($S -is [System.Collections.IDictionary])) { return 'not read' }
-    return ('stamp={0} pending-restore={1} pack={2} pack.prev={3} staging=[{4}]' -f (Format-UpgVal $S['last_app_version'] 'none'), $S['pending_restore'], (Format-UpgVal $S['pack_version'] 'none'), $S['pack_prev'], (@($S['staging']) -join ','))
+    return ('stamp={0} pending-restore={1} pack={2} pack.prev={3} staging=[{4}] gui-onboarded={5} onboard-attempts={6}' -f (Format-UpgVal $S['last_app_version'] 'none'), $S['pending_restore'], (Format-UpgVal $S['pack_version'] 'none'), $S['pack_prev'], (@($S['staging']) -join ','), (Format-UpgVal $S['gui_onboarded'] 'none'), (Format-UpgVal $S['gui_onboard_attempts'] 'none'))
 }
 
 # =========================================================================
@@ -1404,7 +1477,7 @@ function Get-UpgCmdArgs {
 # the table the summary line comes from: the cys.exe processes after the relaunch, init-pack among them, the new daemon, restore / drain
 function Get-UpgInitPackTable {
     param($Procs, [string]$RelaunchIso, $BeforeDaemonPids, [string]$Source, [string]$NowIso)
-    $t = [ordered]@{ source = $Source; relaunch_at = $RelaunchIso; cys_processes = @(); init_pack_count = 0; init_pack = @(); init_pack_overlap = $null; init_pack_nonzero = 0; exit_status_known = $false; new_daemon_started_at = $null; new_daemon_pid = $null; restore = @(); drain = @(); line = $null }
+    $t = [ordered]@{ source = $Source; relaunch_at = $RelaunchIso; cys_processes = @(); init_pack_count = 0; init_pack_onboarding = 0; init_pack_no_install_hook = 0; init_pack = @(); init_pack_overlap = $null; init_pack_nonzero = 0; exit_status_known = $false; new_daemon_started_at = $null; new_daemon_pid = $null; restore = @(); drain = @(); daemon_install = @(); line = $null; parts = '' }
     $from = ''
     try { if ($RelaunchIso) { $from = ConvertTo-IsoUtc (([datetime]::Parse($RelaunchIso, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)).AddSeconds(-10)) } } catch { $from = '' }
     $before = New-Object System.Collections.Generic.List[string]
@@ -1413,6 +1486,7 @@ function Get-UpgInitPackTable {
     $ip = New-Object System.Collections.Generic.List[object]
     $rs = New-Object System.Collections.Generic.List[object]
     $dr = New-Object System.Collections.Generic.List[object]
+    $di = New-Object System.Collections.Generic.List[object]
     foreach ($p in @($Procs)) {
         if ($null -eq $p) { continue }
         if ($from -and ([string]::CompareOrdinal([string]$p['start'], $from) -lt 0)) { continue }
@@ -1425,7 +1499,14 @@ function Get-UpgInitPackTable {
         $args1 = Get-UpgCmdArgs ([string]$p['cmd'])
         $row = [ordered]@{ pid = $p['pid']; ppid = $p['ppid']; parent_image = $p['parent_image']; args = (Limit-Text $args1 300); start = $p['start']; end = $p['end']; seconds = $p['seconds']; exit_status = $p['exit_status']; exit_status_dec = $p['exit_status_dec'] }
         $cys.Add($row)
-        if ($args1 -match '(^|\s)init-pack(\s|$)') { $ip.Add($row) }
+        if ($args1 -match '(^|\s)init-pack(\s|$)') {
+            # UPG-3: the two callers differ by one flag: "init-pack" alone is the GUI onboarding (maybe_windows_onboard),
+            # "init-pack --no-install-hook" is maybe_apply_pending_update (app setup / after a daemon rotation)
+            if ($args1 -match '--no-install-hook') { $row['kind'] = 'no-install-hook'; $t['init_pack_no_install_hook'] = [int]$t['init_pack_no_install_hook'] + 1 }
+            else { $row['kind'] = 'onboarding'; $t['init_pack_onboarding'] = [int]$t['init_pack_onboarding'] + 1 }
+            $ip.Add($row)
+        }
+        if ($args1 -match '(^|\s)daemon\s+install(\s|$)') { $di.Add($row) }
         if ($args1 -match '(^|\s)restore(\s|$)') { $rs.Add($row) }
         if ($args1 -match '(^|\s)drain(\s|$)') { $dr.Add($row) }
     }
@@ -1434,6 +1515,7 @@ function Get-UpgInitPackTable {
     $t['init_pack_count'] = $ip.Count
     $t['restore'] = $rs.ToArray()
     $t['drain'] = $dr.ToArray()
+    $t['daemon_install'] = $di.ToArray()
     # overlap: two intervals [start, end] meet; a process without a seen end is taken as running until now
     $ov = $false
     for ($i = 0; $i -lt $ip.Count; $i++) {
@@ -1452,10 +1534,11 @@ function Get-UpgInitPackTable {
         }
         $s1 = [string]$r['start']; if ($s1.Length -ge 23) { $s1 = $s1.Substring(11, 12) }
         $e1 = [string]$r['end']; if ($e1.Length -ge 23) { $e1 = $e1.Substring(11, 12) } elseif (-not $e1) { $e1 = '?' }
-        $parts.Add(('[pid {0} {1}..{2} exit={3}]' -f $r['pid'], $s1, $e1, (Format-UpgVal $r['exit_status'] 'unknown')))
+        $parts.Add(('[pid {0} "{1}" {2}..{3} exit={4}]' -f $r['pid'], (Limit-Text ([string]$r['args']) 60), $s1, $e1, (Format-UpgVal $r['exit_status'] 'unknown')))
     }
+    $t['parts'] = ($parts.ToArray() -join ' ')
     $nd = [string]$t['new_daemon_started_at']; if ($nd.Length -ge 23) { $nd = $nd.Substring(11, 12) } elseif (-not $nd) { $nd = 'not seen' }
-    $t['line'] = ('init-pack after the upgrade ({0}): {1} process(es) {2} overlap={3}; new daemon started at {4}; restore={5} drain={6}; cys.exe processes after the relaunch={7}' -f $Source, $ip.Count, ($parts.ToArray() -join ' '), (Format-UpgVal $t['init_pack_overlap'] 'n/a'), $nd, $rs.Count, $dr.Count, $cys.Count)
+    $t['line'] = ('init-pack after the upgrade ({0}): {1} process(es) {2} overlap={3}; new daemon started at {4}; restore={5} drain={6} daemon install={7}; cys.exe processes after the relaunch={8}' -f $Source, $ip.Count, $t['parts'], (Format-UpgVal $t['init_pack_overlap'] 'n/a'), $nd, $rs.Count, $dr.Count, $di.Count, $cys.Count)
     return $t
 }
 
@@ -1487,7 +1570,8 @@ function Save-UpgProcAudit {
 
 # the fallback when the audit does not work: diag/proc-poll.ps1 in a second PowerShell, started the moment the new app is seen
 function Start-UpgProcPoll {
-    $f = Join-Path $global:DiagOut ($K_UPG_PFX + '-proc-poll.json')
+    param([string]$Name = 'proc-poll')
+    $f = Join-Path $global:DiagOut ($K_UPG_PFX + '-' + $Name + '.json')
     $ps = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $a = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Seconds {1} -IntervalMs {2} -OutFile "{3}"' -f (Join-Path $PSScriptRoot 'proc-poll.ps1'), $K_UPG_POLL_SEC, $K_UPG_POLL_MS, $f
     $p = Start-Process -FilePath $ps -ArgumentList $a -WindowStyle Hidden -PassThru -ErrorAction Stop
@@ -1496,9 +1580,10 @@ function Start-UpgProcPoll {
 }
 
 function Read-UpgProcPoll {
+    param([string]$Name = 'proc-poll')
     $o = [ordered]@{ found = $false; samples = $null; rows = 0; processes = @(); error = $null }
     try {
-        $j = Read-UpgJson ($K_UPG_PFX + '-proc-poll.json')
+        $j = Read-UpgJson ($K_UPG_PFX + '-' + $Name + '.json')
         if ($null -eq $j) { $o['error'] = 'the result file of the poll is missing'; return $o }
         $o['found'] = $true
         $o['samples'] = $j.samples
@@ -1514,6 +1599,210 @@ function Read-UpgProcPoll {
         $o['processes'] = @($list.ToArray() | Sort-Object { [string]$_['start'] })
     } catch { $o['error'] = 'exception: ' + $_.Exception.Message }
     return $o
+}
+
+# =========================================================================
+# UPG-3: the SECOND start of the upgraded app (a record; it never changes PASS / FAIL)
+#   Why: right after an upgrade the product runs "cys.exe init-pack" up to three times at once (the GUI onboarding of setup, the
+#   apply of maybe_apply_pending_update, and that one again after the daemon rotation). The loser varies with timing. When the
+#   onboarding call loses, %USERPROFILE%\.cys\.gui-onboarded is not written and the product runs its onboarding again on the NEXT start.
+#   What: after the TEAM scene - whose own cleanup has ended every process of the install folder and removed the WebView2 debug
+#   policy (Invoke-TeamScene: Reset-AppState 'after-team', Remove-WebView2DebugPolicy), so this is normally a COLD start; when an app
+#   is still there, only its cys-app.exe main process is ended (the daemons stay, as when a user closes the window) - the app is
+#   started the way the scene starts it (Start-CysApp, no manifest override, the policy set again), its version is read (uipre),
+#   the page is watched for at least 30 s (uiobs: toasts, daemon_status, status bar), the process audit of that window is read
+#   (or the fallback poll), and the stamp files are read before and after.
+# =========================================================================
+# the page facts of one uiobs run (<prefix>-obs-facts.json) as a small record
+function Get-UpgObsNotes {
+    param($ObsFile)
+    $o = [ordered]@{ found = $false; attached = $null; app_version = $null; polls = $null; end_reason = $null; obs_min_sec = $null; daemon_version_last = $null; daemon_pid_last = $null; daemon_info_last = $null; status_bar_pid = $null; status_bar_pid_differs = $null; update_error_toast_seen = $null; update_error_toast = $null; update_error_toast_sec = $null; restore_done_toast_seen = $null; toasts = @(); toast_text = 'not observed' }
+    try {
+        if ($null -eq $ObsFile) { return $o }
+        $o['found'] = $true
+        $o['attached'] = [bool]$ObsFile.attached
+        $o['app_version'] = $ObsFile.app_version
+        $o['end_reason'] = [string]$ObsFile.end_reason
+        if ($null -ne $ObsFile.obs_min_ms) { $o['obs_min_sec'] = [math]::Round(([double]$ObsFile.obs_min_ms) / 1000, 0) }
+        $f = $ObsFile.facts
+        if ($null -eq $f) { return $o }
+        $o['polls'] = $f.polls
+        $o['daemon_version_last'] = $f.daemon_version_last
+        $o['daemon_pid_last'] = $f.daemon_pid_last
+        $o['daemon_info_last'] = $f.daemon_info_last
+        $o['status_bar_pid'] = $f.status_bar_pid
+        if ($null -ne $f.status_bar_pid_differs) { $o['status_bar_pid_differs'] = [bool]$f.status_bar_pid_differs }
+        if ($null -ne $f.update_error_toast_seen) {
+            $o['update_error_toast_seen'] = [bool]$f.update_error_toast_seen
+            $o['update_error_toast'] = [string]$f.update_error_toast_detail
+            if ($null -ne $f.update_error_toast_first_el_ms) { $o['update_error_toast_sec'] = [math]::Round(([double]$f.update_error_toast_first_el_ms) / 1000, 1) }
+        }
+        if ($null -ne $f.restore_done_toast_seen) { $o['restore_done_toast_seen'] = [bool]$f.restore_done_toast_seen }
+        $tl = New-Object System.Collections.Generic.List[object]
+        $tx = New-Object System.Collections.Generic.List[string]
+        foreach ($t in @($f.toasts_seen)) {
+            if ($null -eq $t) { continue }
+            $gone = $null
+            if ($null -ne $t.gone_el_ms) { $gone = [math]::Round(([double]$t.gone_el_ms) / 1000, 1) }
+            $first = [math]::Round(([double]$t.first_el_ms) / 1000, 1)
+            $tl.Add([ordered]@{ kind = [string]$t.cls; title = [string]$t.name; text = (Limit-Text ([string]$t.detail) 400); first_sec = $first; gone_sec = $gone; at_start = [bool]$t.present_at_start; at_end = [bool]$t.present_at_end; polls = $t.polls })
+            $tx.Add(('[{0}] {1} :: {2} (+{3} s{4})' -f [string]$t.cls, [string]$t.name, (Limit-Text ([string]$t.detail) 100), $first, $(if ($null -ne $gone) { ', gone at +' + [string]$gone + ' s' } else { '' })))
+        }
+        $o['toasts'] = $tl.ToArray()
+        if ($tx.Count -gt 0) { $o['toast_text'] = ($tx.ToArray() -join ' || ') } else { $o['toast_text'] = 'none' }
+    } catch { $o['error'] = $_.Exception.Message }
+    return $o
+}
+
+function Invoke-UpgSecondStart {
+    $up = $RUN['upgrade']
+    $to = [string]$CTX['upg_to_version']
+    $pfx = $K_UPG_PFX + '-second'
+    $ss = [ordered]@{
+        ran = $false; skipped = $null; started = (Get-IsoNow); finished = $null; to_version = $to; cold_start = $null; t0 = $null
+        before = [ordered]@{ app_running = $null; app_pids = @(); cdp = $null; daemons = @(); note = $null }
+        stop = $null; start = $null; pre = $null; app_version = $null; ui_ready = $null; obs = $null; audit = $null; poll = $null; source = $null; table = $null
+        stamps_before = $null; stamps_after = $null; gui_onboarded_before = $null; gui_onboarded_after = $null
+        line = $null; notes = (New-Object System.Collections.Generic.List[string]); error = $null
+    }
+    $up['second_start'] = $ss
+    try {
+        if (-not $CTX['upg_marker_reached']) { $ss['skipped'] = 'the upgrade did not put the target version on disk'; return $ss }
+        $left = [math]::Round([double](Get-TeamMinutesLeft), 1)
+        if ($left -lt $K_UPG_SECOND_NEED_MIN) { $ss['skipped'] = ('fewer than {0} minutes of job time are left ({1})' -f $K_UPG_SECOND_NEED_MIN, $left); return $ss }
+        $node = Find-Exe 'node.exe'
+        if (-not $node) { $ss['skipped'] = 'node.exe was not found'; return $ss }
+
+        # ---- a) what runs now; the stamp files; only the app's main process is ended
+        $stB = Get-UpgStamps 'second-before'
+        $ss['stamps_before'] = $stB
+        $ss['gui_onboarded_before'] = $stB['gui_onboarded']
+        $tab = Get-UpgProcs
+        $dmB = @(Get-UpgDaemonRows $tab.rows)
+        $ss['before']['daemons'] = $dmB
+        $beforeIds = New-Object System.Collections.Generic.List[int]
+        foreach ($d0 in $dmB) { if ($null -ne $d0) { $beforeIds.Add([int]$d0['id']) } }
+        $appIds = New-Object System.Collections.Generic.List[int]
+        foreach ($g in @(Get-Process -Name 'cys-app' -ErrorAction SilentlyContinue)) {
+            if ($null -eq $g) { continue }
+            $gp = ''
+            try { $gp = [string]$g.Path } catch { }
+            if ((-not $gp) -or ($gp -like '*\Local\cys\*')) { $appIds.Add([int]$g.Id) }
+        }
+        $alive0 = Test-TeamAppAlive
+        $ss['before']['app_running'] = [bool]($appIds.Count -gt 0)
+        $ss['before']['app_pids'] = $appIds.ToArray()
+        $ss['before']['cdp'] = [bool]$alive0['cdp']
+        $ss['cold_start'] = [bool](($appIds.Count -eq 0) -and ($dmB.Count -eq 0))
+        if ($appIds.Count -eq 0) {
+            $ss['before']['note'] = ('no cys-app.exe was running and {0} daemon(s) were (the cleanup of the TEAM scene ends the app and the daemons): this second start is {1}' -f $dmB.Count, $(if ($dmB.Count -eq 0) { 'a cold start' } else { 'a start with a daemon already there' }))
+        } else {
+            $stop = [ordered]@{ pids = $appIds.ToArray(); stopped = (New-Object System.Collections.Generic.List[string]); gone = $false; gone_after_sec = $null; port_free = $false }
+            $ss['stop'] = $stop
+            foreach ($id in $appIds.ToArray()) {
+                try { Stop-Process -Id $id -Force -ErrorAction Stop; $stop['stopped'].Add(('cys-app.exe#{0}' -f $id)) } catch { $stop['stopped'].Add(('cys-app.exe#{0} NOT stopped: {1}' -f $id, $_.Exception.Message)) }
+            }
+            # the WebView2 processes of that app end by themselves; wait until the app is gone and the debugging port is silent
+            $tw = Get-Date
+            while (((Get-Date) - $tw).TotalSeconds -lt 20) {
+                $al = Test-TeamAppAlive
+                if ((-not $al['process']) -and (-not $stop['gone'])) { $stop['gone'] = $true; $stop['gone_after_sec'] = [int]((Get-Date) - $tw).TotalSeconds }
+                $portUp = $false
+                try {
+                    $resp = Invoke-WebRequest -Uri ('http://127.0.0.1:{0}/json/version' -f $K_PORT) -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+                    if ($resp.StatusCode -eq 200) { $portUp = $true }
+                } catch { $portUp = $false }
+                if ($stop['gone'] -and (-not $portUp)) { $stop['port_free'] = $true; break }
+                Start-Sleep -Seconds 1
+            }
+        }
+        Save-Run
+
+        # ---- b) the start: the same way the scene starts the app (no manifest override; the debug policy is set again)
+        $t0 = Get-Date
+        $ss['t0'] = ConvertTo-IsoUtc $t0
+        $poll = $null
+        if (-not $CTX['upg_audit_ok']) {
+            try { $poll = Start-UpgProcPoll -Name 'second-proc-poll' } catch { $poll = $null; Add-DiagError 'second start: Start-UpgProcPoll' $_ }
+        }
+        $prevPolicyRec = $RUN['webview2_policy']
+        try { $null = Remove-WebView2DebugPolicy $CTX['wv2_policy'] } catch { }
+        $CTX['wv2_policy'] = $null
+        $CTX['manifest_url'] = ''
+        $st = Start-CysApp $pfx
+        $RUN['webview2_policy_second'] = $RUN['webview2_policy']
+        $RUN['webview2_policy'] = $prevPolicyRec
+        $ss['start'] = $st
+        $ss['ran'] = $true
+        Save-Run
+        if ($st['cdp_ready']) {
+            $pre = Invoke-NodePre -Prefix ($pfx + '-pre') -NodeExe $node
+            $ss['pre'] = $pre
+            $ss['app_version'] = $pre['app_version']
+            $ss['ui_ready'] = [bool]$pre['ui_ready']
+            $x = Invoke-UpgNode -Prefix $pfx -NodeExe $node -Mode 'uiobs' -Extra ('--obs-sec {0} --obs-interval-sec {1} --obs-min-sec {2} --obs-expect-daemon {3}' -f $K_UPG_SECOND_OBS_SEC, $K_UPG_OBS_PAGE_TICK_SEC, $K_UPG_SECOND_MIN_SEC, $to) -TimeoutSec 240
+            $ob = Get-UpgObsNotes (Read-UpgJson ($pfx + '-obs-facts.json'))
+            $ob['rc'] = $x['rc']
+            $ss['obs'] = $ob
+            if ((-not $ss['app_version']) -and $ob['app_version']) { $ss['app_version'] = $ob['app_version'] }
+        } else {
+            $ss['notes'].Add(('the app did not come up at the second start (no answer on the debugging port): {0}' -f [string]$st['error']))
+            try { $null = Save-Screenshot ($pfx + '-screen-nocdp.png') } catch { }
+        }
+        try { $null = Save-Screenshot ($pfx + '-screen-end.png') } catch { }
+
+        # ---- c) the processes of this window: the audit, or the fallback poll
+        $procs = @()
+        if ($CTX['upg_audit_ok']) {
+            $a = Save-UpgProcAudit -Since $t0.AddSeconds(-5) -Name ($pfx + '-proc-audit')
+            $procs = @($a['processes'])
+            $ss['audit'] = [ordered]@{ time = $a['time']; since = $a['since']; ok = $a['ok']; error = $a['error']; events_read = $a['events_read']; events_kept = $a['events_kept']; processes = $procs.Count }
+            $ss['source'] = 'Security 4688/4689'
+        } elseif ($null -ne $poll) {
+            $tw2 = Get-Date
+            while (((Get-Date) - $tw2).TotalSeconds -lt ($K_UPG_POLL_SEC + 20)) {
+                $gone2 = $true
+                try { $gone2 = [bool]$poll['process'].HasExited } catch { $gone2 = $true }
+                if ($gone2) { break }
+                Start-Sleep -Seconds 1
+            }
+            $rp = Read-UpgProcPoll -Name 'second-proc-poll'
+            $procs = @($rp['processes'])
+            $ss['poll'] = [ordered]@{ started = $poll['started']; found = $rp['found']; samples = $rp['samples']; rows = $rp['rows']; error = $rp['error'] }
+            $ss['source'] = 'fallback poll, no exit status'
+        } else {
+            $ss['source'] = 'none'
+        }
+        if ($ss['source'] -ne 'none') { $ss['table'] = Get-UpgInitPackTable -Procs $procs -RelaunchIso ([string]$ss['t0']) -BeforeDaemonPids $beforeIds.ToArray() -Source ([string]$ss['source']) -NowIso (Get-IsoNow) }
+
+        # ---- d) the stamp files after it
+        $stA = Get-UpgStamps 'second-after'
+        $ss['stamps_after'] = $stA
+        $ss['gui_onboarded_after'] = $stA['gui_onboarded']
+
+        # ---- e) NOTES (never a FAIL)
+        $tb = $ss['table']
+        if (($tb -is [System.Collections.IDictionary]) -and $tb['exit_status_known'] -and ([int]$tb['init_pack_nonzero'] -gt 0)) { $ss['notes'].Add(('{0} of the {1} "cys.exe init-pack" process(es) of the second start ended with a non-zero exit status: {2}' -f $tb['init_pack_nonzero'], $tb['init_pack_count'], [string]$tb['parts'])) }
+        if (($ss['obs'] -is [System.Collections.IDictionary]) -and ($ss['obs']['update_error_toast_seen'] -eq $true)) { $ss['notes'].Add(('the update-error notification was shown at the second start: "{0}"' -f [string]$ss['obs']['update_error_toast'])) }
+        if ($to -and ([string]$stA['gui_onboarded'] -ne $to)) { $ss['notes'].Add(('.gui-onboarded is still "{0}" after the second start (the app is {1}): the product will run its onboarding again on the next start' -f (Format-UpgVal $stA['gui_onboarded'] 'absent'), $to)) }
+    } catch {
+        $ss['error'] = 'exception: ' + $_.Exception.Message
+        Add-DiagError 'Invoke-UpgSecondStart' $_
+    }
+    $ss['finished'] = (Get-IsoNow)
+    return $ss
+}
+
+# the one summary line of the second start
+function Format-UpgSecondStart {
+    param($S)
+    if (-not ($S -is [System.Collections.IDictionary])) { return 'second start: not run' }
+    if ($S['skipped']) { return 'second start: not run (' + [string]$S['skipped'] + ')' }
+    $tb = $S['table']
+    $ipText = 'processes not read'
+    if ($tb -is [System.Collections.IDictionary]) { $ipText = ('cys.exe init-pack {0} (onboarding {1}, --no-install-hook {2}){3}; daemon install={4}; cys.exe processes={5}' -f $tb['init_pack_count'], $tb['init_pack_onboarding'], $tb['init_pack_no_install_hook'], $(if ($tb['parts']) { ' ' + [string]$tb['parts'] } else { '' }), @($tb['daemon_install']).Count, @($tb['cys_processes']).Count) }
+    $ob = $S['obs']
+    return ('second start ({0}; {1}): app version {2}, CDP ready={3}, UI ready={4}; {5}; update-error toast seen={6}; .gui-onboarded {7} -> {8}; stamp {9} -> {10}; toasts: {11}{12}' -f $(if ($null -eq $S['cold_start']) { 'the state before it was not read' } elseif ($S['cold_start']) { 'cold start' } else { 'not a cold start: app running before=' + [string]$S['before']['app_running'] + ', daemons before=' + [string](@($S['before']['daemons']).Count) }), (Format-UpgVal $S['source'] 'no process source'), (Format-UpgVal $S['app_version'] 'not read'), (Get-UpgVal $S 'start' 'cdp_ready'), (Format-UpgVal $S['ui_ready']), $ipText, (Format-UpgVal (Get-UpgVal $ob 'update_error_toast_seen')), (Format-UpgVal $S['gui_onboarded_before'] 'none'), (Format-UpgVal $S['gui_onboarded_after'] 'none'), (Format-UpgVal (Get-UpgVal $S 'stamps_before' 'last_app_version') 'none'), (Format-UpgVal (Get-UpgVal $S 'stamps_after' 'last_app_version') 'none'), (Format-UpgVal (Get-UpgVal $ob 'toast_text') 'not observed'), $(if ($S['error']) { ' [' + [string]$S['error'] + ']' } else { '' }))
 }
 
 # =========================================================================
@@ -1656,6 +1945,14 @@ function Get-UpgVerdict {
     }
     $sx = $up['stamps']
     if ($sx -is [System.Collections.IDictionary]) { $facts['stamps'] = $sx['summary'] }
+    # UPG-3: the second start is a record too; its findings are NOTES
+    $s2 = $up['second_start']
+    if ($s2 -is [System.Collections.IDictionary]) {
+        $facts['second_start'] = [ordered]@{ ran = $s2['ran']; skipped = $s2['skipped']; cold_start = $s2['cold_start']; app_version = $s2['app_version']; gui_onboarded_before = $s2['gui_onboarded_before']; gui_onboarded_after = $s2['gui_onboarded_after']; init_pack_count = (Get-UpgVal $s2 'table' 'init_pack_count'); init_pack_onboarding = (Get-UpgVal $s2 'table' 'init_pack_onboarding'); init_pack_nonzero = (Get-UpgVal $s2 'table' 'init_pack_nonzero'); daemon_install = $(if ($s2['table'] -is [System.Collections.IDictionary]) { @($s2['table']['daemon_install']).Count } else { $null }); update_error_toast_seen = (Get-UpgVal $s2 'obs' 'update_error_toast_seen'); line = $s2['line'] }
+        if ($s2['skipped']) { $nt.Add('second start: not run (' + [string]$s2['skipped'] + ')') }
+        foreach ($x in @($s2['notes'].ToArray())) { if ($x) { $nt.Add('second start: ' + [string]$x) } }
+        if ($s2['error']) { $nt.Add('second start: the step stopped on an error: ' + [string]$s2['error']) }
+    }
     $lo = $up['leftovers']
     if ($lo -is [System.Collections.IDictionary]) {
         foreach ($lk in @('after_observation', 'at_end')) {
@@ -1700,7 +1997,7 @@ function Get-UpgVerdict {
 }
 
 # =========================================================================
-# scene UPGRADE: summary, 17 lines at most (14 + the three of UPG-2) -> appe2e-upgrade-summary.txt
+# scene UPGRADE: summary, 18 lines at most (14 + the three of UPG-2 + the second start of UPG-3) -> appe2e-upgrade-summary.txt
 # =========================================================================
 function Write-UpgSummary {
     $lines = New-Object System.Collections.Generic.List[string]
@@ -1742,7 +2039,12 @@ function Write-UpgSummary {
             $pg = $st['page']
             $pgText = ''
             if ($pg -is [System.Collections.IDictionary]) { $pgText = ('; page: status bar "{0}", daemon_status version {1} pid {2} surfaces {3}' -f $pg['daemon_info'], $pg['daemon_version'], $pg['daemon_pid'], $pg['daemon_surface_count']) }
-            $t5 = ('state before the upgrade: ready={0} after {1} s ({2}); daemons: {3}; pipes: {4}; pack: {5} files, version {6}{7}' -f $st['ready'], $st['waited_sec'], $st['end_reason'], (Format-UpgDaemons $st['daemons']), (@(Get-UpgVal $st 'pipes' 'cys') -join ','), (Get-UpgVal $st 'pack' 'files'), (Get-UpgVal $st 'pack' 'pack_version'), $pgText)
+            $setText = 'not checked'
+            if ($st.Contains('settled')) {
+                if ($st['settled']) { $setText = ('True after +{0} s' -f $st['settled_after_sec']) }
+                else { $setText = 'False (' + (Limit-Text ((@($st['settle_missing']) -join '; ')) 300) + ')' }
+            }
+            $t5 = ('state before the upgrade: ready={0} after {1} s ({2}); settled={8}; daemons: {3}; pipes: {4}; pack: {5} files, version {6}{7}' -f $st['ready'], $st['waited_sec'], $st['end_reason'], (Format-UpgDaemons $st['daemons']), (@(Get-UpgVal $st 'pipes' 'cys') -join ','), (Get-UpgVal $st 'pack' 'files'), (Get-UpgVal $st 'pack' 'pack_version'), $pgText, $setText)
         }
         $lines.Add($t5)
     } catch { $lines.Add('line 5 (state before the upgrade) could not be built: ' + $_.Exception.Message) }
@@ -1832,6 +2134,7 @@ function Write-UpgSummary {
         if (($sx -is [System.Collections.IDictionary]) -and $sx['summary']) { $tC = [string]$sx['summary'] }
         $lines.Add($tC)
     } catch { $lines.Add('line (stamp) could not be built: ' + $_.Exception.Message) }
+    try { $lines.Add((Format-UpgSecondStart $up['second_start'])) } catch { $lines.Add('line (second start) could not be built: ' + $_.Exception.Message) }
     try {
         $parts = New-Object System.Collections.Generic.List[string]
         $lo = $up['leftovers']
@@ -1918,7 +2221,7 @@ function Invoke-UpgradeMain {
         base_installer = $null; base_reset = $null; base_install = $null; base_start = $null; base_pre = $null; base_state = $null
         apply = $null; apply_observe = $null; after = $null; daemon = $null; app_evidence = $null
         leftovers = [ordered]@{}; pack = [ordered]@{}; install_facts = [ordered]@{}; timings = [ordered]@{}
-        proc_audit = $null; stamps = [ordered]@{ points = [ordered]@{}; summary = $null }
+        proc_audit = $null; stamps = [ordered]@{ points = [ordered]@{}; summary = $null }; second_start = $null
         verdict = $null
     }
     $CTX['upg_audit_ok'] = $false
@@ -2098,6 +2401,7 @@ function Invoke-UpgradeMain {
                 $up['base_state'] = $bs
                 $up['pack']['before'] = $bs['pack']
                 if (-not $bs['ready']) { $up['notes'].Add(('the older app was not fully up before the upgrade ({0}); the upgrade was applied anyway' -f [string]$bs['end_reason'])) }
+                elseif (-not $bs['settled']) { $up['notes'].Add(('the upgrade was applied while the older app was still in its first-run work: {0}' -f (Limit-Text ((@($bs['settle_missing']) -join '; ')) 400))) }
                 Save-Run
             }
 
@@ -2353,10 +2657,18 @@ function Invoke-UpgradeMain {
     } catch {
         Add-DiagError 'app-upgrade main' $_
     } finally {
+        # ---------------------------------------------------------------- UPG-3: the second start of the upgraded app (a record)
+        # after the TEAM scene, before the verdict; whatever happens in it stays inside it (Invoke-Step + its own try / catch)
+        Invoke-Step 'upg-second-start' {
+            $s2 = Invoke-UpgSecondStart
+            try { $s2['line'] = Format-UpgSecondStart $s2 } catch { }
+            Save-Run
+        }
         # ---------------------------------------------------------------- 9. verdict  10. summary  11. cleanup
         Invoke-Step 'upg-verdict' {
             $up = $RUN['upgrade']
-            # after the TEAM scene's own cleanup stopped every process of the install folder: what is left on disk now
+            # what is left on disk at the end (the TEAM scene's own cleanup stopped every process of the install folder; the second
+            # start of UPG-3 then started the app once more - no installer runs in it)
             $up['leftovers']['at_end'] = Get-UpgLeftovers 'at-end'
             # UPG-2: the stamp files at the end, their one line, and the audit once more over the whole scene (a second pair of files)
             try {
@@ -2377,7 +2689,7 @@ function Invoke-UpgradeMain {
                         break
                     }
                 }
-                $sx['summary'] = ('stamp (.last-app-version) {0} -> {1} ({2}); .pending-restore before={3} right after the relaunch={4} at the end={5}; pack version {6} -> {7}; pack.prev at the end={8}; staging leftovers at the end=[{9}]' -f (Format-UpgVal (Get-UpgVal $b0 'last_app_version') 'none'), (Format-UpgVal (Get-UpgVal $e0 'last_app_version') 'none'), $seen, (Format-UpgVal (Get-UpgVal $b0 'pending_restore')), (Format-UpgVal (Get-UpgVal $sx['points'] 'after_relaunch' 'pending_restore')), (Format-UpgVal (Get-UpgVal $e0 'pending_restore')), (Format-UpgVal (Get-UpgVal $b0 'pack_version') 'none'), (Format-UpgVal (Get-UpgVal $e0 'pack_version') 'none'), (Format-UpgVal (Get-UpgVal $e0 'pack_prev')), (@(Get-UpgVal $e0 'staging') -join ','))
+                $sx['summary'] = ('stamp (.last-app-version) {0} -> {1} ({2}); .pending-restore before={3} right after the relaunch={4} at the end={5}; pack version {6} -> {7}; pack.prev at the end={8}; staging leftovers at the end=[{9}]; .gui-onboarded before={10} right after the relaunch={11} after the page watch={12} at the end={13}; onboard-attempts at the end={14}' -f (Format-UpgVal (Get-UpgVal $b0 'last_app_version') 'none'), (Format-UpgVal (Get-UpgVal $e0 'last_app_version') 'none'), $seen, (Format-UpgVal (Get-UpgVal $b0 'pending_restore')), (Format-UpgVal (Get-UpgVal $sx['points'] 'after_relaunch' 'pending_restore')), (Format-UpgVal (Get-UpgVal $e0 'pending_restore')), (Format-UpgVal (Get-UpgVal $b0 'pack_version') 'none'), (Format-UpgVal (Get-UpgVal $e0 'pack_version') 'none'), (Format-UpgVal (Get-UpgVal $e0 'pack_prev')), (@(Get-UpgVal $e0 'staging') -join ','), (Format-UpgVal (Get-UpgVal $b0 'gui_onboarded') 'none'), (Format-UpgVal (Get-UpgVal $sx['points'] 'after_relaunch' 'gui_onboarded') 'none'), (Format-UpgVal (Get-UpgVal $sx['points'] 'after_observation' 'gui_onboarded') 'none'), (Format-UpgVal (Get-UpgVal $e0 'gui_onboarded') 'none'), (Format-UpgVal (Get-UpgVal $e0 'gui_onboard_attempts') 'none'))
             } catch { Add-DiagError 'upg stamps summary' $_ }
             try {
                 $pa = $up['proc_audit']

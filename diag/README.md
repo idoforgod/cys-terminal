@@ -175,6 +175,16 @@ SAC 를 켠 뒤에는 서명된 `node.exe` 와 시스템 도구만 새로 실행
 
 요약은 14줄에서 **17줄**이 됐다(데몬 줄 뒤에 위 세 줄). 0 아닌 종료 상태의 `init-pack` 이 있으면 그것도 NOTE 다. 맥에서는 감사 도구·Security 로그를 가짜로 바꿔 모의 실행했을 뿐이다 — `auditpol`·`Get-WinEvent` 는 러너가 첫 실행이다. 13차의 실제 화면 기록을 새 로직에 다시 넣어 보면 `update-error (init-pack) seen=True; restore done seen=True; status bar pid differs=True` 가 나온다.
 
+### UPG-3 보강 (14차 뒤 · upgrade 장면만 · 기록과 NOTE — PASS/FAIL 규칙은 그대로)
+
+14차의 감사 기록으로 드러난 것: 업그레이드 직후 `cys.exe init-pack` 이 겹쳐 돌고 **지는 쪽이 그때그때 다르다**. 13차에서는 `--no-install-hook` 쪽(→ 업데이트 경고 알림), 14차에서는 온보딩 쪽(`init-pack` 단독 · exit 0x1 · 알림 없음)이 졌다. 온보딩이 지면 `~/.cys/.gui-onboarded` 가 안 쓰이고 제품은 **다음 기동**에 온보딩을 다시 한다 — 그 다음 기동을 잰다.
+
+1. **표식에 온보딩 파일 둘** — `.gui-onboarded`(내용) · `.gui-onboard-attempts`(유무 + 앞 200자)를 네 시점과 데몬 관찰 틱의 변화 기록에 더했다. 표식 요약 줄 끝에 `.gui-onboarded before=… right after the relaunch=… after the page watch=… at the end=…; onboard-attempts at the end=…`.
+2. **기준 상태가 "가라앉은" 뒤에 업그레이드** — `upg-base-state` 가 종전 준비 조건(데몬 + 팩) 뒤에 **최대 90초 더**(2초 간격) 기다린다: `.last-app-version` == 기준 버전 · `.gui-onboarded` == 기준 버전 · `.pack-staging*` 없음 · `init-pack`/`restore` 인자의 `cys.exe` 없음(틱마다 `Win32_Process` 한 번). `base_state.settled` · `settled_after_sec` · `settle_missing` 에 적고, 요약의 「state before the upgrade」 줄에 `settled=True after +N s` / `settled=False (…)`. 못 가라앉아도 장면은 그대로 가고 NOTE 만 남는다(「the upgrade was applied while the older app was still in its first-run work: …」).
+3. **두 번째 기동** — 스텝 `upg-second-start`(TEAM 뒤 · 판정 앞). TEAM 의 정리가 앱·데몬을 끝내고 WebView2 정책을 지운 상태가 보통이므로 **콜드 스타트**다(앱이 남아 있으면 `cys-app.exe` 본체만 끝내고 데몬은 둔다). 표식 → 정책을 다시 걸고 `Start-CysApp`(매니페스트 env 없음) → `uipre` 로 버전 → `uiobs` 최소 30초(알림 · `daemon_status` · 상태바) → 그 구간의 프로세스 감사(`appe2e-upg-second-proc-audit.json/.txt` · 감사가 안 되면 대체 관측 `…-second-proc-poll.json`) → 표식. 요약 한 줄 `second start (cold start; …): app version …; cys.exe init-pack N (onboarding a, --no-install-hook b) [pid … "인자" 시작..끝 exit=…]; daemon install=…; update-error toast seen=…; .gui-onboarded 전 -> 후; stamp …; toasts: …`. NOTE 가 되는 것: 두 번째 기동의 init-pack 이 0 아닌 종료 · 업데이트 경고 알림 · 끝난 뒤에도 `.gui-onboarded` 가 목표 버전이 아님 · 앱이 안 뜸. 남은 작업 시간이 4분 미만이거나 업그레이드가 목표에 못 닿았으면 건너뛰고 NOTE 한 줄. 이 스텝에서 무슨 일이 나도 판정·요약·정리는 그대로 돈다.
+
+`init-pack` 줄은 이제 프로세스마다 인자를 적는다(`[pid 1560 "init-pack" …]` = 온보딩 · `[pid 6880 "init-pack --no-install-hook" …]` = 팩 반영). 요약은 **18줄**이다.
+
 ### 설치 사실 기록 (`Get-InstallFacts` · 두 장면 공통 · 읽기 전용 · 판정에 안 넣음)
 
 HKCU `…\Uninstall\cys` 의 DisplayName·DisplayVersion·UninstallString · 시작 메뉴·바탕화면 바로가기(대상 경로) · 설치 폴더 파일 수·바이트 · 세 실행 파일(크기·버전·sha256) · `cys.exe --version`·`cysd.exe --version`(각 15초 · 둘 다 데몬을 띄우지 않는다 — 근거는 스크립트 주석 · `cysd.exe` 는 인자 판정이 생긴 0.14.41 이상에서만 부른다) · 동봉 `bash.exe`·`python3.exe` 의 존재와 `--version` rc. fresh 는 `install-off` 바로 뒤 스텝 `install-facts` 에서 한 번(`appe2e-install-facts.json`), upgrade 는 0.14.42 설치 뒤(`upg-facts-base` → `…-base.json`)와 업그레이드 뒤(`upg-facts-after` → `…-after.json` — 7번 전체가 끝난 다음이다. 새 앱과 옛 데몬이 만나는 순간의 관찰을 늦추지 않으려고 7(a) 바로 뒤가 아니라 7번 뒤에 둔다).
