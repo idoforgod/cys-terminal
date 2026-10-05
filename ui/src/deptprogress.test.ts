@@ -6,7 +6,7 @@
 //   · 표지 파서는 Rust 쪽 같은 이름의 파서와 **같은 벡터표**를 잰다(이 파일이 src-tauri/src/main.rs 의 표를 소스에서 읽어 자기 표와 대조한다).
 //   · 팀원 부팅 안내(R1F-UB 개정 · 성찰 2회차에서 5상태로): 문구 5상태(켜는 중 · 자리가 모두 붙음 · 15분 경과 · 팀 데몬 무응답 · 자리 정체) · 갱신 열쇠(자리 수·경과 분·45초 칸) · 15분 상한 · 첫 자리 창(60초).
 //     완료 판정(좌석 목록의 역할 다섯)은 deptprogressseats.test.ts 가 지킨다 — 편성 결과 feed 를 읽던 판정·사유 정제(deptFormationStateOfKind·deptFormationDetail)는 걷었다(S4 B1).
-//   · 화면 문구의 수치는 **잰 만큼만**(S4 M1): 사전 검사는 「10~30초」(실측: 개발 맥 12.8초 · 윈도우 11 러너 28.4초 — '최대 12초'도 '약 12초'도 아니다) · 팀원이 켜지는 데는 「보통 5분 안팎」(실측 1회 약 5분 — 3분 쪽은 잰 적이 없다).
+//   · 화면 문구의 수치는 **잰 만큼만**(S4 M1): 사전 검사는 「보통 10~30초 · 느린 컴퓨터는 더 걸립니다」(실측: 개발 맥 12.8초 · 윈도우 11 러너 27.4·28.4·31.9초 — '최대 12초'도 '약 12초'도 닫힌 범위 「10~30초」 도 아니다) · 팀원이 켜지는 데는 「보통 5분 안팎」(실측 1회 약 5분 — 3분 쪽은 잰 적이 없다).
 //   · 신뢰할 수 없는 입력(이벤트 payload)은 걸러 낸다 — 단계 키 정규식.
 //   · 순수 모듈 불변식: 최상위 부수효과 0 · 문서/창/저장소 낱말 0 · 구형 WKWebView 비호환 문법 0.
 //   · ★성찰 2회차 R2F-UI(A2 B-1 · A3 M1): 팀원 안내는 **설치 여부에 기대지 않는다** — 편성 도구는 설치된 프로그램(claude·agy·codex)의 역할만 띄우므로(미설치 역할은 건너뛰어 정상 종결 partial·pending-cli)
@@ -55,7 +55,7 @@ const NORMAL = (elapsed: string): string => `팀을 만드는 중입니다 — �
 const SLOW = (elapsed: string): string => `평소보다 오래 걸리고 있습니다 — 그대로 기다려 주세요(중간에 닫으면 만들던 팀이 정리됩니다) · 경과 ${elapsed}`;
 const STAGES: [string, string][] = [
   ["reserve", "팀 번호를 잡는 중"],
-  ["probe", "이미 켜진 데몬이 있는지 확인하는 중(10~30초)"],
+  ["probe", "이미 켜진 데몬이 있는지 확인하는 중(보통 10~30초 · 느린 컴퓨터는 더 걸립니다)"],
   ["spawn", "데몬을 켜는 중"],
   ["wait", "데몬이 팩을 설치하는 중(파일 수백 개)"],
   ["up", "데몬이 켜졌습니다 — 설정을 심는 중"],
@@ -105,8 +105,9 @@ describe("deptStageLabel — 키 7종 + 모르는 키", () => {
     expect(deptStageLabel(null)).toBeNull();
     expect(deptStageLabel(undefined)).toBeNull();
   });
-  it("★S4 M1 · W11 5차: 사전 검사 문구는 「10~30초」 — 실측이 맥 12.8초·윈도우 11 러너 28.4초라 한 숫자('최대 12초'·'약 12초')로 약속하지 않는다 · 어느 단계 문구에도 '최대'가 없다", () => {
-    expect(deptStageLabel("probe")).toBe("이미 켜진 데몬이 있는지 확인하는 중(10~30초)");
+  it("★S4 M1 · W11 5차·9차: 사전 검사 문구는 「보통 10~30초 · 느린 컴퓨터는 더 걸립니다」 — 실측이 맥 12.8초·윈도우 11 러너 27.4·28.4·31.9초라 한 숫자('최대 12초'·'약 12초')로도 닫힌 범위(「10~30초」 — 9차 런에서 31.9초로 넘었다)로도 약속하지 않는다 · 어느 단계 문구에도 '최대'가 없다", () => {
+    expect(deptStageLabel("probe")).toBe("이미 켜진 데몬이 있는지 확인하는 중(보통 10~30초 · 느린 컴퓨터는 더 걸립니다)");
+    expect(deptStageLabel("probe")).not.toContain("(10~30초)"); // 닫힌 범위로 되돌리면 붉다 — 윈도우 11 러너 실측 31.9초(W11 런 37251762864)
     expect(deptStageLabel("probe")).not.toContain("12초");
     for (const [key] of STAGES) expect({ 키: key, 최대: (deptStageLabel(key) ?? "").includes("최대") }).toEqual({ 키: key, 최대: false });
     for (const rel of ["./deptprogress.ts", "./main.ts"]) expect({ 파일: rel, 최대12초: read(rel).includes("최대 12초") }).toEqual({ 파일: rel, 최대12초: false });
