@@ -1,0 +1,16 @@
+{
+ "by_location": {},
+ "by_module": {},
+ "by_type": {},
+ "failed": [],
+ "failed_count": 0,
+ "last_started": "write_stall_tests::write_stall_default_leaves_release_margin",
+ "last_started_ended": true,
+ "rc": "0",
+ "ref": "2bf75a12405b438a9bcafb6f398240bc305c192b",
+ "result_lines": [
+  "test result: ok. 1853 passed; 0 failed; 47 ignored; 0 measured; 2 filtered out; finished in 846.95s"
+ ],
+ "tool": "cysdwin-digest.py",
+ "version": 1
+}

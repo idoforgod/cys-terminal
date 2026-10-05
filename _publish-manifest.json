@@ -1,0 +1,40 @@
+{
+  "generated": "2026-10-05T01:09:25.519Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37249118071",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37249118071",
+  "job": "cysd-win",
+  "os": "windows-latest",
+  "branch": "diag-results/37249118071-1-cysd-win-windows-latest",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "cysdwin-cargo.log",
+      "bytes": 194828
+    },
+    {
+      "path": "cysdwin-digest.json",
+      "bytes": 438
+    },
+    {
+      "path": "cysdwin-digest.tsv",
+      "bytes": 120
+    },
+    {
+      "path": "cysdwin-env.txt",
+      "bytes": 2372
+    },
+    {
+      "path": "cysdwin-meta.json",
+      "bytes": 555
+    },
+    {
+      "path": "cysdwin-summary.txt",
+      "bytes": 3821
+    }
+  ],
+  "skipped": [],
+  "inline_files": 6,
+  "blob_files": 0
+}
