@@ -3037,6 +3037,7 @@ function pageW44Office() {
   try { doc = fr && fr.contentDocument ? ('title=' + fr.contentDocument.title) : 'no contentDocument (cross-origin or not loaded)'; } catch (e) { doc = 'blocked: ' + e.name; }
   return {
     view_visible: view ? !view.hidden : null,
+    panel_open: (document.getElementById('cc-panel') ? !document.getElementById('cc-panel').hidden : null),
     frame_src: fr ? fr.getAttribute('src') : null,
     frame_w: fr ? fr.clientWidth : null,
     frame_h: fr ? fr.clientHeight : null,
@@ -3221,8 +3222,12 @@ async function runW44OfficeMode() {
       try { if ((await evalJs("(!!document.getElementById('btn-cc')) ? 'yes' : 'no'", { awaitPromise: false, timeoutMs: 8000 })) === 'yes') break; } catch (e) { /* loading */ }
       await sleep(1500);
     }
-    await evalJs(w44Expr(pageW44Click, '#btn-cc'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
-    await sleep(1500);
+    // the Control Center button TOGGLES: open the panel only when it is closed, and blank the office frame so that the tab really loads it again
+    const open0 = await evalJs("(function(){var p=document.getElementById('cc-panel');return p ? !p.hidden : null;})()", { awaitPromise: false, timeoutMs: 8000 }).catch(() => null);
+    W.panel_open_before = open0;
+    if (open0 !== true) { await evalJs(w44Expr(pageW44Click, '#btn-cc'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false); await sleep(1500); }
+    await evalJs("(function(){var f=document.getElementById('cc-office-frame'); if (f) { f.src = 'about:blank'; } return true;})()", { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+    await sleep(500);
     await evalJs(w44Expr(pageW44Click, '.cc-tab[data-view="live"]'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
     await sleep(1500);
     await evalJs(w44Expr(pageW44Click, '.cc-tab[data-view="office"]'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
@@ -3232,7 +3237,7 @@ async function runW44OfficeMode() {
       try { o = await evalJs(w44Expr(pageW44Office), { awaitPromise: false, timeoutMs: 8000 }); } catch (e) { o = { error: String(e && e.message ? e.message : e) }; }
       o.t_ms = Date.now() - t0;
       if (W.samples.length < 60) W.samples.push(o);
-      if (o && o.frame_src && o.hint_hidden === true) { W.loaded = true; W.loaded_after_ms = o.t_ms; break; }
+      if (o && o.frame_src && String(o.frame_src).indexOf('8642') >= 0 && o.hint_hidden === true && o.panel_open === true) { W.loaded = true; W.loaded_after_ms = o.t_ms; break; }
       await sleep(2000);
     }
     await sleep(settleMs);
