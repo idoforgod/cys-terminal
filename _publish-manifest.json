@@ -1,0 +1,65 @@
+{
+  "generated": "2026-10-06T08:29:01.032Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37435638593",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37435638593",
+  "job": "w44-doctor",
+  "os": "windows-2025",
+  "branch": "diag-results/37435638593-1-w44-doctor-windows-2025",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "done-w44-doctor.json",
+      "bytes": 142
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-w44-doctor.txt",
+      "bytes": 170
+    },
+    {
+      "path": "w44-doctor-new-app-stdout.txt",
+      "bytes": 1771
+    },
+    {
+      "path": "w44-doctor-new-app2-stdout.txt",
+      "bytes": 1771
+    },
+    {
+      "path": "w44-doctor-old-app-stdout.txt",
+      "bytes": 1771
+    },
+    {
+      "path": "w44-doctor-old-app2-stdout.txt",
+      "bytes": 1771
+    },
+    {
+      "path": "w44-doctor-results.json",
+      "bytes": 6914
+    }
+  ],
+  "skipped": [
+    {
+      "path": "w44-doctor-new-app-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctor-new-app2-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctor-old-app-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctor-old-app2-stderr.txt",
+      "reason": "empty file"
+    }
+  ],
+  "inline_files": 8,
+  "blob_files": 0
+}
