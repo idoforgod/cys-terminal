@@ -1,0 +1,56 @@
+{
+  "generated": "2026-10-06T13:03:41.008Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37467214171",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37467214171",
+  "job": "w44-wh",
+  "os": "windows-2025",
+  "branch": "diag-results/37467214171-1-w44-wh-windows-2025",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "cargo-test-build-executables.txt",
+      "bytes": 48323
+    },
+    {
+      "path": "cargo-test-build-tail.txt",
+      "bytes": 1441
+    },
+    {
+      "path": "done-w44-wh.json",
+      "bytes": 138
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-w44-wh.txt",
+      "bytes": 162
+    },
+    {
+      "path": "w44-wh-cysd-elev.err.txt",
+      "bytes": 796
+    },
+    {
+      "path": "w44-wh-daemon-elev.txt",
+      "bytes": 2211
+    },
+    {
+      "path": "w44-wh-results.json",
+      "bytes": 43594
+    },
+    {
+      "path": "w44-wh-test-elevated-stderr.txt",
+      "bytes": 525
+    },
+    {
+      "path": "w44-wh-test-elevated-stdout.txt",
+      "bytes": 196
+    }
+  ],
+  "skipped": [],
+  "inline_files": 10,
+  "blob_files": 0
+}
