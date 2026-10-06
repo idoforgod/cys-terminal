@@ -1,0 +1,59 @@
+{
+    "os":  "windows-11-arm",
+    "started":  "2026-10-06T04:39:17.648Z",
+    "steps":  {
+                  "S0-inputs":  {
+                                    "seconds":  6.1,
+                                    "error":  null
+                                },
+                  "S1-install":  {
+                                     "seconds":  80.3,
+                                     "error":  null
+                                 },
+                  "S1b-old-0.14.43":  {
+                                          "seconds":  31.2,
+                                          "error":  null
+                                      },
+                  "TA-approval":  {
+                                      "seconds":  656.6,
+                                      "error":  null
+                                  },
+                  "TB-bridge":  {
+                                    "seconds":  0.1,
+                                    "error":  "System.Management.Automation.RuntimeException: Cannot index into a null array. At C:\\a\\cys-terminal\\cys-terminal\\diag\\w44-measure.ps1:685 char:5\r\n+     $pr = Invoke-Proc -File $X[\u0027new\u0027][\u0027py\u0027] -Arguments (\u0027\"{0}\"\u0027 -f $p ...\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+                                },
+                  "TC-daemon":  {
+                                    "seconds":  1.4,
+                                    "error":  "System.Management.Automation.RuntimeException: Cannot index into a null array. At C:\\a\\cys-terminal\\cys-terminal\\diag\\w44-measure.ps1:130 char:9\r\n+         $script:proc = Start-Process -FilePath $Set[\u0027cysd\u0027] -PassThru ...\r\n+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+                                },
+                  "TD-hook":  {
+                                  "seconds":  0,
+                                  "error":  "System.Management.Automation.ParameterBindingValidationException: Cannot bind argument to parameter \u0027LiteralPath\u0027 because it is null. At C:\\a\\cys-terminal\\cys-terminal\\diag\\w44-measure.ps1:879 char:40\r\n+     $hook = Get-ChildItem -LiteralPath $pk -Filter \u0027role-capability-g ...\r\n+                                        ~~~"
+                              },
+                  "SUMMARY":  {
+                                  "seconds":  0,
+                                  "error":  null
+                              }
+              },
+    "items":  {
+                  "installer":  {
+                                    "name":  "cys_0.14.43_x64-setup.exe",
+                                    "size":  143348191,
+                                    "sha256":  "74a8e1d5c5a0e20e853c610bf4627ad93b16e680f38c6762cb0cc347c837594a",
+                                    "source":  "release v0.14.43 (harness debugging)"
+                                },
+                  "installed":  {
+                                    "installer_rc":  0,
+                                    "cys":  "cys 0.14.43",
+                                    "cysd":  "cysd 0.14.43 (build 55d3d2d60d7f)",
+                                    "has_python":  true,
+                                    "has_bash":  true
+                                },
+                  "old_binaries":  {
+                                       "cys":  "cys 0.14.43",
+                                       "cysd":  "cysd 0.14.43 (build 55d3d2d60d7f)",
+                                       "cysd_sha":  "87bd2bb0ce795bbcdd7a3aa82f3b032f3acdf28778beca67d8605a62721adf5b"
+                                   },
+                  "approval":  "see w44-approval-new.json / w44-approval-old.json"
+              }
+}

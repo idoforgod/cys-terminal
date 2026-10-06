@@ -1,0 +1,22 @@
+{
+    "script":  "w44-measure",
+    "finished":  "2026-10-06T04:52:13.413Z",
+    "error_count":  3,
+    "errors":  [
+                   {
+                       "step":  "TB-bridge",
+                       "time":  "2026-10-06T04:52:11.972Z",
+                       "error":  "System.Management.Automation.RuntimeException: Cannot index into a null array. At C:\\a\\cys-terminal\\cys-terminal\\diag\\w44-measure.ps1:685 char:5\r\n+     $pr = Invoke-Proc -File $X[\u0027new\u0027][\u0027py\u0027] -Arguments (\u0027\"{0}\"\u0027 -f $p ...\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+                   },
+                   {
+                       "step":  "TC-daemon",
+                       "time":  "2026-10-06T04:52:13.345Z",
+                       "error":  "System.Management.Automation.RuntimeException: Cannot index into a null array. At C:\\a\\cys-terminal\\cys-terminal\\diag\\w44-measure.ps1:130 char:9\r\n+         $script:proc = Start-Process -FilePath $Set[\u0027cysd\u0027] -PassThru ...\r\n+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+                   },
+                   {
+                       "step":  "TD-hook",
+                       "time":  "2026-10-06T04:52:13.393Z",
+                       "error":  "System.Management.Automation.ParameterBindingValidationException: Cannot bind argument to parameter \u0027LiteralPath\u0027 because it is null. At C:\\a\\cys-terminal\\cys-terminal\\diag\\w44-measure.ps1:879 char:40\r\n+     $hook = Get-ChildItem -LiteralPath $pk -Filter \u0027role-capability-g ...\r\n+                                        ~~~"
+                   }
+               ]
+}
