@@ -46,6 +46,12 @@
 - 닫힌 좌석의 **화면 감지 승인**(`daemon-` 항목)은 데몬이 스스로 `stale-cleared` 로 닫습니다(0.14.43 은 데몬 재시작 때만). 끄는 법: `CYS_FEED_ORPHAN_SWEEP=0`.
 - 이를 위해 `feed.list` 항목에 파생 칸 `waiter` · `publisher_alive` 를 더했습니다(옛 데몬이면 칸이 없어 화면은 종전 그대로).
 
+## 3-1. 프로세스 과다 경보 오탐 — 좌석 자손 세기
+
+- **증상**: 좌석의 임시 자식 프로세스가 우연히 윈도우 부팅 때 끝난 프로세스의 번호를 받으면, 그 번호를 부모로 적고 있는 시스템 프로세스(wininit.exe · csrss.exe 등)까지 그 좌석의 자식으로 세어 「프로세스 과다」 경보가 났습니다.
+- **고친 것**: 부모보다 **30초 넘게 먼저** 만들어진 프로세스는 그 부모의 자식으로 세지 않습니다(번호가 재사용된 흔적). 부모·자식 둘 다 시작 시각을 읽을 수 있을 때만 비교하고, 하나라도 못 읽으면 종전대로 자식으로 셉니다. 센 결과는 줄어들기만 하므로 좌석을 닫을 때 끝내는 대상도 줄기만 합니다.
+- 끄는 법: `CYS_DESC_START_GUARD=0`(환경변수만 · 데몬 재시작 후 적용).
+
 ## 4. 사용량 칸 — 여러 계정을 함께
 
 - 머리줄 단추로 **자동 → 모두 → 하나** 중 보기 방식을 고릅니다(고른 값은 기억됩니다). 자동 = 계정 3개 이하면 전부 막대, 더 많으면 제공자(Claude · Codex · Antigravity)별 묶음(대표 계정 막대 + 나머지 한 줄씩 · 최대 8 + 「외 N개」 · 묶음 머리를 눌러 접기). 하나 = 0.14.43 과 같은 보기입니다.
@@ -85,7 +91,7 @@
 ## 8. 되돌리는 손잡이
 
 전부 지원·개발자용입니다. 표(이름 · 값 · 기본값 · 맥/윈도우)와 해석은 **USER-MANUAL §4 「사용량 칸 보기 방식 · 오피스 탭 · 되돌리는 손잡이 (v0.14.44)」** 가 정본입니다(코드에서 다시 확인한 값).
-데몬이 읽는 `CYS_OFFICE_BRIDGE_MODE`(`legacy`) · `CYS_OFFICE_BRIDGE_REPLACE_OLD`(`0`) · `CYS_OFFICE_BRIDGE_ANY_OWNER`(`1`) · `CYS_FEED_ORPHAN_SWEEP`(`0`) 는 환경변수 또는 `~/.cys/policy.json`(되돌리는 값만), 승인은 정책 파일 `approval_cwd_neutral: false`,
+데몬이 읽는 `CYS_DESC_START_GUARD`(`0` · 환경변수만) · `CYS_OFFICE_BRIDGE_MODE`(`legacy`) · `CYS_OFFICE_BRIDGE_REPLACE_OLD`(`0`) · `CYS_OFFICE_BRIDGE_ANY_OWNER`(`1`) · `CYS_FEED_ORPHAN_SWEEP`(`0`) 는 환경변수 또는 `~/.cys/policy.json`(되돌리는 값만), 승인은 정책 파일 `approval_cwd_neutral: false`,
 앱이 읽는 `CYS_OFFICE_ASSET_REPAIR: 0`(자동 복구 끔 · 단추만), 브리지 스크립트의 `HUD_REQ_TIMEOUT=0` · 윈도우 스위치 `HUD_WIN_NEW=1`, 기존 `CYS_AGY_STATUSLINE=0` 입니다. **데몬 env 는 데몬을 다시 켜야 반영됩니다.**
 
 ## 9. 검증
