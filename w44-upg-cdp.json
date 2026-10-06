@@ -1,0 +1,421 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "w44",
+  "port": 9333,
+  "started": "2026-10-06T22:00:32.891Z",
+  "finished": "2026-10-06T22:00:55.600Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "cys — CYSJavis Terminal",
+      "url": "http://tauri.localhost/",
+      "id": "21AF99C9EB1EEC5B4872033F4B305059"
+    }
+  ],
+  "chosen_target": {
+    "url": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "id": "21AF99C9EB1EEC5B4872033F4B305059"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.44",
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": null,
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 0,
+    "progress_count": 0,
+    "progress_first": null,
+    "progress_last": null,
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-06T22:00:32.893Z",
+      "name": "start",
+      "argv": "--mode w44 --port 9333 --out C:\\a\\_temp\\diag-out --prefix w44-upg --max-wait-sec 120 --ready-wait-sec 30 --w44-cys C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe --w44-office-wait-sec 150 --w44-feed-wait-sec 60 --w44-dept-pipes \\\\.\\pipe\\cys-dept-dept-1",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-06T22:00:32.920Z",
+      "name": "targets",
+      "count": 1,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-06T22:00:32.930Z",
+      "name": "connected",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-06T22:00:32.934Z",
+      "name": "attached",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "id": "21AF99C9EB1EEC5B4872033F4B305059"
+    },
+    {
+      "t": "2026-10-06T22:00:32.935Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-06T22:00:32.940Z",
+      "name": "app_version",
+      "value": "0.14.44"
+    }
+  ],
+  "errors": [],
+  "ui": {
+    "mode": "w44",
+    "stage": "done",
+    "ready": null,
+    "clicks": [],
+    "states": [],
+    "shots": [
+      {
+        "name": "w44-start",
+        "file": "w44-upg-ui-w44-start.png",
+        "t": "2026-10-06T22:00:36.017Z",
+        "bytes": 56244
+      },
+      {
+        "name": "w44-usage-1",
+        "file": "w44-upg-ui-w44-usage-1.png",
+        "t": "2026-10-06T22:00:37.595Z",
+        "bytes": 55804
+      },
+      {
+        "name": "w44-usage-2",
+        "file": "w44-upg-ui-w44-usage-2.png",
+        "t": "2026-10-06T22:00:39.158Z",
+        "bytes": 55936
+      },
+      {
+        "name": "w44-usage-3",
+        "file": "w44-upg-ui-w44-usage-3.png",
+        "t": "2026-10-06T22:00:40.736Z",
+        "bytes": 56176
+      },
+      {
+        "name": "w44-feed-tab",
+        "file": "w44-upg-ui-w44-feed-tab.png",
+        "t": "2026-10-06T22:00:46.052Z",
+        "bytes": 78012
+      },
+      {
+        "name": "w44-feed-hq-seen",
+        "file": "w44-upg-ui-w44-feed-hq-seen.png",
+        "t": "2026-10-06T22:00:47.243Z",
+        "bytes": 93192
+      },
+      {
+        "name": "w44-feed-dept1-seen",
+        "file": "w44-upg-ui-w44-feed-dept1-seen.png",
+        "t": "2026-10-06T22:00:48.945Z",
+        "bytes": 101332
+      },
+      {
+        "name": "w44-office",
+        "file": "w44-upg-ui-w44-office.png",
+        "t": "2026-10-06T22:00:54.097Z",
+        "bytes": 271520
+      },
+      {
+        "name": "w44-office-end",
+        "file": "w44-upg-ui-w44-office-end.png",
+        "t": "2026-10-06T22:00:55.568Z",
+        "bytes": 271552
+      }
+    ]
+  },
+  "w44": {
+    "started": "2026-10-06T22:00:32.941Z",
+    "cys": "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+    "dept_pipes": [
+      "\\\\.\\pipe\\cys-dept-dept-1"
+    ],
+    "ready": 2,
+    "usage": {
+      "states": [
+        {
+          "host": true,
+          "button": "자동",
+          "button_title": "보기 방식: 자동 — 눌러서 모두(으)로 바꿉니다. 자동 = 계정이 적으면 모두, 많으면 제공자별로 묶어서 · 모두 = 전 계정 막대 · 하나 = 주 계정 1개",
+          "summary": "대기 중",
+          "body_text": "사용량 확인 대기 중 — 바로 보려면 Control Center > Live",
+          "body_boxes": 0,
+          "body_children": 1,
+          "stored_mode": null,
+          "tag": "initial"
+        },
+        {
+          "host": true,
+          "button": "모두",
+          "button_title": "보기 방식: 모두 — 눌러서 하나(으)로 바꿉니다. 자동 = 계정이 적으면 모두, 많으면 제공자별로 묶어서 · 모두 = 전 계정 막대 · 하나 = 주 계정 1개",
+          "summary": "대기 중",
+          "body_text": "사용량 확인 대기 중 — 바로 보려면 Control Center > Live",
+          "body_boxes": 0,
+          "body_children": 1,
+          "stored_mode": "all",
+          "tag": "after-click-1"
+        },
+        {
+          "host": true,
+          "button": "하나",
+          "button_title": "보기 방식: 하나 — 눌러서 자동(으)로 바꿉니다. 자동 = 계정이 적으면 모두, 많으면 제공자별로 묶어서 · 모두 = 전 계정 막대 · 하나 = 주 계정 1개",
+          "summary": "대기 중",
+          "body_text": "사용량 확인 대기 중 — 바로 보려면 Control Center > Live",
+          "body_boxes": 0,
+          "body_children": 1,
+          "stored_mode": "one",
+          "tag": "after-click-2"
+        },
+        {
+          "host": true,
+          "button": "자동",
+          "button_title": "보기 방식: 자동 — 눌러서 모두(으)로 바꿉니다. 자동 = 계정이 적으면 모두, 많으면 제공자별로 묶어서 · 모두 = 전 계정 막대 · 하나 = 주 계정 1개",
+          "summary": "대기 중",
+          "body_text": "사용량 확인 대기 중 — 바로 보려면 Control Center > Live",
+          "body_boxes": 0,
+          "body_children": 1,
+          "stored_mode": "auto",
+          "tag": "after-click-3"
+        }
+      ],
+      "clicks": 3,
+      "button_labels": [
+        "자동",
+        "모두",
+        "하나",
+        "자동"
+      ],
+      "cycle_ok": true
+    },
+    "feed": [
+      {
+        "label": "hq",
+        "title": "w44 probe approval HQ 1791324046052",
+        "pipe": "(default)",
+        "pushed": {
+          "pid": 10880,
+          "error": null
+        },
+        "seen_after_ms": 1010,
+        "seen_item": {
+          "cls": "feed-item pending",
+          "title": "w44 probe approval HQ 1791324046052",
+          "meta": "permission · req-4516-1791324046-0",
+          "buttons": [
+            "Allow",
+            "Deny"
+          ]
+        },
+        "clicked": {
+          "ok": true,
+          "cls": "feed-item pending"
+        },
+        "exit_code": 0,
+        "exit_after_click_ms": 502,
+        "verdict": "PASS (seen, Allow clicked, the pushing process got allow = exit 0)",
+        "stdout": "allow\n",
+        "stderr": "",
+        "spawn_error": null
+      },
+      {
+        "label": "dept1",
+        "title": "w44 probe approval DEPT1 1791324047749",
+        "pipe": "\\\\.\\pipe\\cys-dept-dept-1",
+        "pushed": {
+          "pid": 5036,
+          "error": null
+        },
+        "seen_after_ms": 1013,
+        "seen_item": {
+          "cls": "feed-item pending",
+          "title": "w44 probe approval DEPT1 1791324047749",
+          "meta": "permission · req-5792-1791324047-0",
+          "buttons": [
+            "Allow",
+            "Deny"
+          ]
+        },
+        "clicked": {
+          "ok": true,
+          "cls": "feed-item pending"
+        },
+        "exit_code": 0,
+        "exit_after_click_ms": 502,
+        "verdict": "PASS (seen, Allow clicked, the pushing process got allow = exit 0)",
+        "stdout": "allow\n",
+        "stderr": "",
+        "spawn_error": null
+      }
+    ],
+    "office": {
+      "samples": [
+        {
+          "view_visible": true,
+          "panel_open": true,
+          "frame_src": "http://127.0.0.1:8642/",
+          "frame_w": 988,
+          "frame_h": 528,
+          "hint_hidden": true,
+          "hint_text": "",
+          "repair_button_hidden": true,
+          "frame_document": "no contentDocument (cross-origin or not loaded)",
+          "t_ms": 2
+        }
+      ],
+      "bridge_health": {
+        "status": 200,
+        "bytes": 177,
+        "head": "{\"ok\": true, \"pid\": 6424, \"boot_id\": \"906b42daf05ac535\", \"pack_version\": null, \"assets\": {\"office3d_html\": true, \"office_boot_js\": true, \"three_module_js\": true}, \"timeouts\": 0}"
+      },
+      "bridge_world": {
+        "status": 200,
+        "bytes": 1444,
+        "top_keys": [
+          "v",
+          "ts",
+          "seq",
+          "daemon",
+          "departments",
+          "todo",
+          "lobby",
+          "server_room",
+          "blocked",
+          "kanban",
+          "review",
+          "board"
+        ],
+        "counts": {
+          "seats": null,
+          "surfaces": null,
+          "depts": null,
+          "agents": null,
+          "hq": null
+        },
+        "compact": "{\"v\":2,\"ts\":1791324054.7384672,\"seq\":520,\"daemon\":{\"version\":\"0.14.44\",\"paused\":false},\"departments\":[{\"id\":\"ë³¸ë¶€ Â· CEO\",\"floor\":2,\"nodes\":[]},{\"id\":\"dept-1\",\"floor\":1,\"nodes\":[]}],\"todo\":{},\"lobby\":{\"unassigned\":[{\"key\":\"main@surface:2\",\"surface_id\":2,\"dept_label\":\"ë³¸ë¶€ Â· CEO\",\"role\":\"무소속\",\"agent\":null,\"presence\":\"waiting\",\"presence_conf\":0.7,\"task\":\"\",\"idle_secs\":0,\"ctx\":{\"pct\":null,\"window\":null},\"rate\":[],\"activity\":0,\"flags\":[],\"progress\":null,\"run\":null},{\"key\":\"dept-1@surface:2\",\"surface_id\":2,\"dept_label\":\"dept-1\",\"role\":\"무소속\",\"agent\":null,\"presence\":\"waiting\",\"presence_conf\":0.7,\"task\":\"\",\"idle_secs\":0,\"ctx\":{\"pct\":null,\"window\":null},\"rate\":[],\"activity\":0,\"flags\":[],\"progress\":null,\"run\":null}]},\"server_room\":[],\"blocked\":[],\"kanban\":{\"ts\":1791324001.840417,\"tasks\":[]},\"review\":{\"ts\":1791324001.8700879,\"items\":[]},\"board\":{\"heat\":{\"dept-1@surface:1\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\"main@surface:2\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],\"dept-1@surface:2\":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]},\"cost_today\":{\"usd\":null,\"tokens\":null}}}"
+      },
+      "targets": [
+        {
+          "type": "page",
+          "title": "cys — CYSJavis Terminal",
+          "url": "http://tauri.localhost/"
+        },
+        {
+          "type": "iframe",
+          "title": "http://127.0.0.1:8642/",
+          "url": "http://127.0.0.1:8642/"
+        }
+      ],
+      "loaded_after_ms": 2,
+      "loaded_signal": true,
+      "office_boot_js": {
+        "status": 200,
+        "bytes": 8473
+      }
+    },
+    "errors": [],
+    "feed_tab": {
+      "box": true,
+      "visible": true,
+      "item_count": 2,
+      "items": [
+        {
+          "cls": "feed-item pending",
+          "title": "부서 팀 편성 대기(CLI 미설치)",
+          "meta": "formation-pending · req-6456-1791323672-1",
+          "buttons": [
+            "확인"
+          ]
+        },
+        {
+          "cls": "feed-item pending",
+          "title": "CEO 승격 보류(부트 필요)",
+          "meta": "ceo-notice · req-6456-1791323669-0",
+          "buttons": [
+            "확인"
+          ]
+        }
+      ],
+      "tab_badge": {
+        "text": "2",
+        "hidden": false
+      },
+      "cc_badge": {
+        "text": "2",
+        "hidden": false
+      },
+      "text_head": "본부 — 대기 2건\n정보성 알림 2건 모두 확인\nceo-notice 1 · formation-pending 1\n부서 팀 편성 대기(CLI 미설치)\nformation-pending · req-6456-1791323672-1\nclaude CLI 미설치 — 빈 셸 master 자리는 유지됩니다(팀 없이도 마스터 단독 사용 가능). PowerShell: `irm https://claude.ai/install.ps1 | iex` 로 설치한 뒤 앱 재시작 또는 부서 재기동 시 편성이 이어집니다.\n확인\nCEO 승격 보류(부트 필요)\nceo-notice · req-6456-1791323669-0\n부서가 생성되었으나 base master가 아직 부트되지 않았습니다. base에서 '너는 마스터다' 또는 '마스터 시작' 버튼으로 부트를 완료하면 명령 팔레트의 'CEO 승격 진행'으로 승인할 수 있습니다.\n확인\ndept-1 — 대기 0건"
+    },
+    "finished": "2026-10-06T22:00:55.584Z"
+  }
+}
