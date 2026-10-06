@@ -1,0 +1,14 @@
+== runner ==
+ImageOS=win25-vs2026 ImageVersion=20260925.250.1 RUNNER_ARCH=X64
+rustc 1.99.0 (b940084d7 2026-09-28)
+binary: rustc
+commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4
+commit-date: 2026-09-28
+host: x86_64-pc-windows-msvc
+release: 1.99.0
+LLVM version: 23.1.1
+cargo 1.99.0 (5f94df478 2026-08-27)
+Python 3.12.10
+GNU bash, version 5.3.15(2)-release (x86_64-pc-cygwin)
+git version 2.55.0.windows.5
+product: ce76b43f822f89de66e1dc9c3422bac89be2f590 test(approval): 시험 검체의 윈도우 경로 글자를 개인 홈 꼴이 아닌 것으로 — 발행 차단 스캐너(H-SECRET-1)에 걸렸다

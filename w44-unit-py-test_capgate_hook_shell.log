@@ -1,0 +1,197 @@
+test_counter_counts_every_call (test_capgate_hook_shell.HookBudgetCounter.test_counter_counts_every_call) ... ok
+test_counter_is_atomic_under_parallel_calls (test_capgate_hook_shell.HookBudgetCounter.test_counter_is_atomic_under_parallel_calls)
+★동시 12회 호출에서 **하나도 유실되지 않는다**(read-modify-write 회귀 차단). ... ok
+test_cache_dirname_matches_both_sibling_layers (test_capgate_hook_shell.HookCacheIdentity.test_cache_dirname_matches_both_sibling_layers)
+★G14: 역할 캐시 디렉터리 이름이 세 층에서 같은가(보호가 조용히 늙지 않게). ... ok
+test_cache_lives_in_the_shared_0700_directory (test_capgate_hook_shell.HookCacheIdentity.test_cache_lives_in_the_shared_0700_directory)
+캐시는 TMPDIR **루트**가 아니라 공용 0700 전용 디렉터리 안이다(이름 예측·심기 차단). ... FAIL
+test_colliding_socket_slugs_share_a_file_but_not_a_verdict (test_capgate_hook_shell.HookCacheIdentity.test_colliding_socket_slugs_share_a_file_but_not_a_verdict)
+두 소켓이 **같은 캐시 파일**을 가리켜도 남의 레코드는 권위가 아니다. ... ok
+test_gated_surface_role_hint_still_forces_a_query (test_capgate_hook_shell.HookCacheIdentity.test_gated_surface_role_hint_still_forces_a_query)
+대조군 — 힌트가 **게이트 대상**이라고 말하면 캐시 fast-path 는 끈다(막는 축은 넓게). ... ok
+test_hostile_boot_epoch_folds_to_unknown (test_capgate_hook_shell.HookCacheIdentity.test_hostile_boot_epoch_folds_to_unknown)
+★G7: 거대한 한 줄·FIFO `boot-epoch` 에서 유계로 접힌다(훅이 매달리지 않는다). ... ERROR
+test_legacy_two_field_record_is_not_authoritative (test_capgate_hook_shell.HookCacheIdentity.test_legacy_two_field_record_is_not_authoritative)
+구형 `<ts> <역할>` 2필드 레코드(신원 없음)는 권위가 아니다 — 데몬에 묻는다. ... ok
+test_matching_socket_identity_is_still_a_fastpath (test_capgate_hook_shell.HookCacheIdentity.test_matching_socket_identity_is_still_a_fastpath)
+대조군 — 신원이 **맞으면** 종전대로 fast-path 다(비대상 좌석의 RPC 폭풍 방지). ... FAIL
+test_named_pipe_endpoint_does_not_read_cwd_boot_epoch (test_capgate_hook_shell.HookCacheIdentity.test_named_pipe_endpoint_does_not_read_cwd_boot_epoch)
+★G7: 유닉스 `dirname '\\.\pipe\cys'` 는 `.` 이다 — cwd 의 `boot-epoch` 를 읽지 않는다. ... ok
+test_role_query_never_spawns_a_daemon (test_capgate_hook_shell.HookCacheIdentity.test_role_query_never_spawns_a_daemon)
+★G5: 역할을 묻는 행위가 **데몬을 낳지 않는다**(`CYS_NO_AUTOSTART=1`). ... ok
+test_surface_role_env_alone_is_not_a_seat_identity (test_capgate_hook_shell.HookCacheIdentity.test_surface_role_env_alone_is_not_a_seat_identity)
+`CYS_SURFACE_ROLE` 만 있고 `CYS_ROLE` 이 없으면 그것은 신원이 아니다(무역할=통과). ... ok
+test_surface_role_env_is_an_output_not_an_identity (test_capgate_hook_shell.HookCacheIdentity.test_surface_role_env_is_an_output_not_an_identity)
+★G6: `CYS_SURFACE_ROLE` 한 줄로 **절대 deny 집합**이 열리지 않는다. ... ok
+test_allow_path_is_silent (test_capgate_hook_shell.HookDegradation.test_allow_path_is_silent)
+허용 경로는 stdout 무출력 + exit 0(defer) — 하네스 계약. ... ok
+test_large_write_reaches_cap_and_leaves_no_residue (test_capgate_hook_shell.HookDegradation.test_large_write_reaches_cap_and_leaves_no_residue)
+2MB Write 본문이 **판정에 도달**하고(상한 deny) 임시 파일이 남지 않는다. ... ok
+test_python_missing_asymmetry (test_capgate_hook_shell.HookDegradation.test_python_missing_asymmetry)
+★reviewer=fail-closed(exit 2) · CSO=강등(exit 0) — 비대칭이 코드에 살아 있는가. ... FAIL
+test_broken_native_path_allows_normal_call (test_capgate_hook_shell.HookInputHandoff.test_broken_native_path_allows_normal_call) ... ok
+test_broken_native_path_does_not_brick_reviewer (test_capgate_hook_shell.HookInputHandoff.test_broken_native_path_does_not_brick_reviewer)
+★인계 실패에서도 reviewer 는 **판정을 수행**한다 — 벽돌이 되지 않는다. ... ok
+test_broken_native_path_still_judges_cso (test_capgate_hook_shell.HookInputHandoff.test_broken_native_path_still_judges_cso) ... ok
+test_destroyed_input_large_payload_degrades_for_cso (test_capgate_hook_shell.HookInputHandoff.test_destroyed_input_large_payload_degrades_for_cso)
+CSO 는 같은 상황에서 **강등**이다(전 도구 차단 = 좌석 사망 금지 · 비대칭 유지). ... ok
+test_destroyed_input_large_payload_fails_closed_for_reviewer (test_capgate_hook_shell.HookInputHandoff.test_destroyed_input_large_payload_fails_closed_for_reviewer)
+★대용량(>64KB)은 env 로 못 싣는다 — 그때 통과시키면 **배관 실패가 권한 확대**가 된다. ... ok
+test_destroyed_input_small_payload_uses_env_fallback (test_capgate_hook_shell.HookInputHandoff.test_destroyed_input_small_payload_uses_env_fallback)
+원본까지 사라져도 **소용량은 env 로도 실려 있다** — 판정이 계속된다. ... ok
+test_no_temp_file_leftover_on_broken_conversion (test_capgate_hook_shell.HookInputHandoff.test_no_temp_file_leftover_on_broken_conversion)
+★`exec` 뒤에는 셸 trap 이 돌지 않는다 — 판정기가 **두 경로를 다** 지워야 한다. ... ok
+test_ambiguous_candidates_intersect (test_capgate_hook_shell.HookRoleResolution.test_ambiguous_candidates_intersect)
+★조회 실패 + 캐시(reviewer)와 env(cso) 불일치 → **두 정책 모두** 적용한다. ... ok
+test_authoritative_none_is_cached (test_capgate_hook_shell.HookRoleResolution.test_authoritative_none_is_cached)
+권위 있는 '역할 없음'도 캐시된다 — 무역할 pane 이 매 호출 RPC 를 내지 않게. ... ERROR
+test_env_role_denies_without_daemon (test_capgate_hook_shell.HookRoleResolution.test_env_role_denies_without_daemon)
+`cys` 부재 + CYS_ROLE=cso → env 폴백으로 게이트가 산다(deny JSON · exit 0). ... ok
+test_failed_query_backs_off (test_capgate_hook_shell.HookRoleResolution.test_failed_query_backs_off)
+★조회 실패는 **짧게 기억**한다 — 데몬 무응답이 도구 호출마다 데드라인을 무는 ... ERROR
+test_gated_cache_is_never_fastpath (test_capgate_hook_shell.HookRoleResolution.test_gated_cache_is_never_fastpath)
+★게이트 대상 캐시는 fast-path 가 아니다 — 승계(reviewer→CSO)를 데몬이 정정한다. ... ok
+test_nongated_cache_is_fastpath_no_rpc (test_capgate_hook_shell.HookRoleResolution.test_nongated_cache_is_fastpath_no_rpc)
+비대상(master) 캐시는 fast-path — 데몬 RPC 0(전 pane 지연 방지). ... FAIL
+test_poisoned_cache_cannot_open_gate (test_capgate_hook_shell.HookRoleResolution.test_poisoned_cache_cannot_open_gate)
+★캐시에 `master` 를 심어도 CYS_ROLE=cso 좌석의 게이트는 열리지 않는다(R1 major). ... ok
+test_stale_cache_is_requeried (test_capgate_hook_shell.HookRoleResolution.test_stale_cache_is_requeried)
+TTL 밖 캐시는 권위가 아니다(시간 창의 상한을 고정한다). ... ok
+test_removing_a_check_fails_self_test (test_capgate_hook_shell.NegativeControls.test_removing_a_check_fails_self_test) ... FAIL
+test_foreign_axis_is_not_a_dead_branch_on_either_platform (test_capgate_hook_shell.NullSinkPlatformAxis.test_foreign_axis_is_not_a_dead_branch_on_either_platform)
+이물 이름 판정의 **양변 모양**이 같은가 — 종전 nt 분기는 영원히 거짓이었다. ... ok
+test_git_bash_dev_null_survives_on_windows (test_capgate_hook_shell.NullSinkPlatformAxis.test_git_bash_dev_null_survives_on_windows) ... ok
+test_unix_NUL_is_not_a_sink (test_capgate_hook_shell.NullSinkPlatformAxis.test_unix_NUL_is_not_a_sink) ... ok
+test_queued_report_is_allowed (test_capgate_hook_shell.QueuedReportChannel.test_queued_report_is_allowed) ... ok
+test_queued_string_in_body_or_after_double_dash_is_not_the_option (test_capgate_hook_shell.QueuedReportChannel.test_queued_string_in_body_or_after_double_dash_is_not_the_option) ... ok
+test_unqueued_report_is_denied_with_the_prescription (test_capgate_hook_shell.QueuedReportChannel.test_unqueued_report_is_denied_with_the_prescription) ... ok
+test_ansi_c_quoted_cargo_option_is_validated (test_capgate_hook_shell.TriageConvergenceR2.test_ansi_c_quoted_cargo_option_is_validated)
+★R2 major(codex): shlex 는 `$'…'` 를 모른다 — 게이트는 `$--config=…` 라는 **없는 ... ok
+test_glob_in_command_name_position_is_refused (test_capgate_hook_shell.TriageConvergenceR2.test_glob_in_command_name_position_is_refused)
+★R2 minor(claude): `/bin/r?` 는 bash 가 `/bin/rm` 으로 바꾼다(중괄호와 같은 층). ... ok
+test_leading_env_assignment_cannot_inject_a_runner (test_capgate_hook_shell.TriageConvergenceR2.test_leading_env_assignment_cannot_inject_a_runner)
+★R2 minor(claude): `--config=build.rustc-wrapper=…` 를 막고 `RUSTC_WRAPPER=…` 를 ... ok
+test_mixed_literal_token_still_cannot_forge_a_pack_tool (test_capgate_hook_shell.TriageConvergenceR2.test_mixed_literal_token_still_cannot_forge_a_pack_tool)
+codex 지적(deny→allow 확대)의 **안전 축**을 못으로 박는다: 혼합 토큰을 판정하게 ... ok
+test_reviewer_deny_names_the_notation_that_blocked_it (test_capgate_hook_shell.TriageConvergenceR2.test_reviewer_deny_names_the_notation_that_blocked_it)
+★R2 minor(claude): 읽기 명령이 **표기 때문에** 막혔으면 문면이 그것을 가리켜야 한다. ... ok
+test_cargo_config_equals_form_is_validated (test_capgate_hook_shell.TriageQuotingAndExpansion.test_cargo_config_equals_form_is_validated)
+★triage blocking(claude)/major(codex): `--config=<k=v>` 는 `t in value_opts` 를 ... ok
+test_double_quoted_tilde_is_not_the_installed_pack_tool (test_capgate_hook_shell.TriageQuotingAndExpansion.test_double_quoted_tilde_is_not_the_installed_pack_tool)
+★triage blocking(codex): bash 는 **큰따옴표 안 틸드를 확장하지 않는다**. ... ok
+test_nested_brace_expansion_is_refused (test_capgate_hook_shell.TriageQuotingAndExpansion.test_nested_brace_expansion_is_refused)
+★triage blocking(claude): `--{clear-first,x{y}}` 는 `--clear-first` 로 펼쳐진다. ... ok
+test_nested_brace_expansion_is_refused_for_stream_flags (test_capgate_hook_shell.TriageQuotingAndExpansion.test_nested_brace_expansion_is_refused_for_stream_flags)
+같은 구멍으로 `tail -f`(종결 없는 관측)가 통과한다. ... ok
+test_quoted_redirection_operator_does_not_swallow_the_next_option (test_capgate_hook_shell.TriageQuotingAndExpansion.test_quoted_redirection_operator_does_not_swallow_the_next_option)
+★triage blocking(codex): `'>'` 는 **연산자가 아니라 인자**다. ... ok
+test_reviewer_write_shell_survives_brace_expansion (test_capgate_hook_shell.TriageQuotingAndExpansion.test_reviewer_write_shell_survives_brace_expansion)
+★triage(claude major): reviewer 의 write-shell deny 에는 중괄호 처리가 **아예 없다**. ... ok
+test_single_quoted_tilde_is_not_the_installed_pack_tool (test_capgate_hook_shell.TriageQuotingAndExpansion.test_single_quoted_tilde_is_not_the_installed_pack_tool)
+작은따옴표도 같다 — 센티널로 복원한 뒤 `_norm` 이 다시 확장해 버린다. ... ok
+test_unix_NUL_redirect_is_an_ordinary_file (test_capgate_hook_shell.TriageQuotingAndExpansion.test_unix_NUL_redirect_is_an_ordinary_file)
+★triage(codex major): `> NUL` 은 unix 에서 **cwd 의 일반 파일**을 만들거나 자른다. ... skipped 'unix 전용 계약(nt 에서는 NUL 이 실제 장치다)'
+
+======================================================================
+ERROR: test_hostile_boot_epoch_folds_to_unknown (test_capgate_hook_shell.HookCacheIdentity.test_hostile_boot_epoch_folds_to_unknown)
+★G7: 거대한 한 줄·FIFO `boot-epoch` 에서 유계로 접힌다(훅이 매달리지 않는다).
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\a\cys-terminal\cys-terminal\p\cysjavis-pack\bin\tests\test_capgate_hook_shell.py", line 1117, in test_hostile_boot_epoch_folds_to_unknown
+    rec = self.cache_path(socket=sock).read_text(encoding="utf-8").split()
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\pathlib.py", line 1027, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\capgate-hook-mbk100u9\\tmp\\cys-role-authority.d\\cys-capgate-role-7-'
+
+======================================================================
+ERROR: test_authoritative_none_is_cached (test_capgate_hook_shell.HookRoleResolution.test_authoritative_none_is_cached)
+권위 있는 '역할 없음'도 캐시된다 — 무역할 pane 이 매 호출 RPC 를 내지 않게.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\a\cys-terminal\cys-terminal\p\cysjavis-pack\bin\tests\test_capgate_hook_shell.py", line 279, in test_authoritative_none_is_cached
+    self.assertEqual(self.cache_path().read_text(encoding="utf-8").split()[1], "-")
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\pathlib.py", line 1027, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\pathlib.py", line 1013, in open
+    return io.open(self, mode, buffering, encoding, errors, newline)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\capgate-hook-hwn2p82p\\tmp\\cys-role-authority.d\\cys-capgate-role-7-default_C_3A_Users_RUNNER_1_AppData_Local_Temp_capgate-hook-hwn2p82p_home'
+
+======================================================================
+ERROR: test_failed_query_backs_off (test_capgate_hook_shell.HookRoleResolution.test_failed_query_backs_off)
+★조회 실패는 **짧게 기억**한다 — 데몬 무응답이 도구 호출마다 데드라인을 무는
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\a\cys-terminal\cys-terminal\p\cysjavis-pack\bin\tests\test_capgate_hook_shell.py", line 304, in test_failed_query_backs_off
+    (self.cache_path().parent / (self.cache_path().name + ".fail")).unlink()
+  File "C:\hostedtoolcache\windows\Python\3.12.10\x64\Lib\pathlib.py", line 1342, in unlink
+    os.unlink(self)
+FileNotFoundError: [WinError 2] The system cannot find the file specified: 'C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\capgate-hook-my0bolr3\\tmp\\cys-role-authority.d\\cys-capgate-role-7-default_C_3A_Users_RUNNER_1_AppData_Local_Temp_capgate-hook-my0bolr3_home.fail'
+
+======================================================================
+FAIL: test_cache_lives_in_the_shared_0700_directory (test_capgate_hook_shell.HookCacheIdentity.test_cache_lives_in_the_shared_0700_directory)
+캐시는 TMPDIR **루트**가 아니라 공용 0700 전용 디렉터리 안이다(이름 예측·심기 차단).
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\a\cys-terminal\cys-terminal\p\cysjavis-pack\bin\tests\test_capgate_hook_shell.py", line 1080, in test_cache_lives_in_the_shared_0700_directory
+    self.assertEqual(d.stat().st_mode & 0o777, 0o700, "캐시 디렉터리가 0700 이 아니다")
+AssertionError: 511 != 448 : 캐시 디렉터리가 0700 이 아니다
+
+======================================================================
+FAIL: test_matching_socket_identity_is_still_a_fastpath (test_capgate_hook_shell.HookCacheIdentity.test_matching_socket_identity_is_still_a_fastpath)
+대조군 — 신원이 **맞으면** 종전대로 fast-path 다(비대상 좌석의 RPC 폭풍 방지).
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\a\cys-terminal\cys-terminal\p\cysjavis-pack\bin\tests\test_capgate_hook_shell.py", line 1056, in test_matching_socket_identity_is_still_a_fastpath
+    self.assertEqual(self.calls_log(), "",
+AssertionError: 'surface-role\n' != ''
+- surface-role
+ : 신원이 맞는 비대상 캐시가 fast-path 가 아니다: 'surface-role\n'
+
+======================================================================
+FAIL: test_python_missing_asymmetry (test_capgate_hook_shell.HookDegradation.test_python_missing_asymmetry)
+★reviewer=fail-closed(exit 2) · CSO=강등(exit 0) — 비대칭이 코드에 살아 있는가.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\a\cys-terminal\cys-terminal\p\cysjavis-pack\bin\tests\test_capgate_hook_shell.py", line 354, in test_python_missing_asymmetry
+    self.assertEqual(rev.rc, 2, "reviewer 가 fail-closed 가 아니다: rc=%d %r" % (rev.rc, rev.err))
+AssertionError: 0 != 2 : reviewer 가 fail-closed 가 아니다: rc=0 '[cys-hook] _lib.sh 소실 — 훅 강등(role-capability-gate)\n'
+
+======================================================================
+FAIL: test_nongated_cache_is_fastpath_no_rpc (test_capgate_hook_shell.HookRoleResolution.test_nongated_cache_is_fastpath_no_rpc)
+비대상(master) 캐시는 fast-path — 데몬 RPC 0(전 pane 지연 방지).
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\a\cys-terminal\cys-terminal\p\cysjavis-pack\bin\tests\test_capgate_hook_shell.py", line 261, in test_nongated_cache_is_fastpath_no_rpc
+    self.assertEqual(self.calls_log(), "",
+AssertionError: 'surface-role\n' != ''
+- surface-role
+ : 비대상 좌석이 매 호출 데몬 RPC 를 냈다: 'surface-role\n'
+
+======================================================================
+FAIL: test_removing_a_check_fails_self_test (test_capgate_hook_shell.NegativeControls.test_removing_a_check_fails_self_test)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "D:\a\cys-terminal\cys-terminal\p\cysjavis-pack\bin\tests\test_capgate_hook_shell.py", line 690, in test_removing_a_check_fails_self_test
+    self.assertEqual(base.returncode, 0,
+AssertionError: 1 != 0 : 기준 self-test 가 이미 실패한다: Traceback (most recent call last):
+  File "<stdin>", line 3797, in <module>
+  File "<stdin>", line 3759, in run_self_test
+  File "<stdin>", line 3287, in self_test_r1
+  File "<stdin>", line 2180, in bump_tool_calls
+  File "<frozen os>", line 215, in makedirs
+  File "<frozen os>", line 225, in makedirs
+ValueError: mkdir: embedded null character in path
+
+
+----------------------------------------------------------------------
+Ran 51 tests in 45.815s
+
+FAILED (failures=5, errors=3, skipped=1)
