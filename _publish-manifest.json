@@ -1,0 +1,32 @@
+{
+  "generated": "2026-10-06T04:37:32.125Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37414113029",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37414113029",
+  "job": "w44",
+  "os": "windows-11-arm",
+  "branch": "diag-results/37414113029-1-w44-windows-11-arm",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-w44-measure.txt",
+      "bytes": 172
+    },
+    {
+      "path": "syntax-check.txt",
+      "bytes": 54
+    },
+    {
+      "path": "w44-results.json",
+      "bytes": 195
+    }
+  ],
+  "skipped": [],
+  "inline_files": 4,
+  "blob_files": 0
+}
