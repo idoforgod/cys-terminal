@@ -1,0 +1,11 @@
+[cysd] v0.14.43 cys-fix-w2-gen-0.14.4
+[cysd] lane: socket=\\.\pipe\cys-w44cnewmanagedseat pack=C:\Users\runneradmin\.cys/pack (dept=false)
+[pack] 격리 config 각성 훅 병합: C:\Users\runneradmin\.cys\claude\settings.json (SessionStart←session-start.sh, UserPromptSubmit←role-bootstrap.sh)
+[cysd] CYSJavis Pack: 470 file(s) installed at C:\Users\runneradmin\.cys/pack
+[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료
+cysd (CYSJavis terminal daemon) listening on \\.\pipe\cys-w44cnewmanagedseat
+[cysd] auto-restore triggered (phoenix restore --auto · 임베드 추출 우선)
+[cysd] auto-restore non-zero (exit=Some(1)) — 60000ms 후 1회 재시도 (lease/liveness 재산정에 위임)
+[cysd] office-bridge spawned (127.0.0.1:8642)
+[cysd] office-bridge exited — 60s 후 재확인
+[cysd] schedule: 첫 가동 — 주기 잡 11개의 기준 시각을 now 로 초기화(동시 만기 방지)

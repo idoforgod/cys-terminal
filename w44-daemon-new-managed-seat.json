@@ -1,0 +1,67 @@
+{
+    "tag":  "newmanagedseat",
+    "env":  {
+                "CYS_OFFICE_BRIDGE_MODE":  "managed"
+            },
+    "with_seat":  true,
+    "daemon":  {
+                   "pid":  6176,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  10.8
+               },
+    "bridge_found":  true,
+    "bridge":  {
+                   "pid":  7312,
+                   "ppid":  6176,
+                   "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_hud_bridge.py",
+                   "started_after_s":  2.1,
+                   "parent_is_daemon":  true
+               },
+    "health":  null,
+    "world":  {
+                  "url":  "http://127.0.0.1:8642/world",
+                  "status":  null,
+                  "body":  "",
+                  "error":  "Exception calling \"GetResponse\" with \"0\" argument(s): \"Unable to connect to the remote server\"",
+                  "ms":  2010
+              },
+    "seat":  {
+                 "rc":  0,
+                 "out":  "surface:1",
+                 "err":  ""
+             },
+    "seat2":  {
+                  "rc":  0,
+                  "out":  "surface:2"
+              },
+    "bridge_alive_after_hold":  false,
+    "bridge_same_pid_after_hold":  false,
+    "bridge_count_after_hold":  0,
+    "bridge_children":  [
+
+                        ],
+    "daemon_children":  [
+                            "conhost.exe#8468 \\\\?\\C:\\Windows\\system32\\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0x71...",
+                            "powershell.exe#8284 C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command cmd.exe",
+                            "conhost.exe#5160 \\\\?\\C:\\Windows\\system32\\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0x7d...",
+                            "powershell.exe#512 C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command cmd.exe",
+                            "cmd.exe#9472 \"C:\\Windows\\system32\\cmd.exe\"",
+                            "cmd.exe#1220 \"C:\\Windows\\system32\\cmd.exe\"",
+                            "PING.EXE#6140 ping  -n 600 127.0.0.1"
+                        ],
+    "after_daemon_kill":  {
+                              "bridge_gone_after_s":  0,
+                              "children_gone_after_s":  0,
+                              "bridge_alive_at_end":  false,
+                              "children_alive_at_end":  0,
+                              "children_before":  0,
+                              "watched_s":  0
+                          },
+    "bridges_left_at_end":  0,
+    "port_8642_answers_at_end":  false,
+    "log_bridge_lines":  [
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인"
+                         ]
+}

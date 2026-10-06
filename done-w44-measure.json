@@ -1,0 +1,12 @@
+{
+    "script":  "w44-measure",
+    "finished":  "2026-10-06T05:13:41.220Z",
+    "error_count":  1,
+    "errors":  [
+                   {
+                       "step":  "TD-hook",
+                       "time":  "2026-10-06T05:13:41.205Z",
+                       "error":  "System.Management.Automation.RuntimeException: Cannot index into a null array. At D:\\a\\cys-terminal\\cys-terminal\\diag\\w44-measure.ps1:40 char:5\r\n+     $R[\u0027items\u0027][$Key] = $Value\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~"
+                   }
+               ]
+}

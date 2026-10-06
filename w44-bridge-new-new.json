@@ -1,0 +1,39 @@
+{
+    "tag":  "new-new",
+    "mode":  "new",
+    "script":  "D:\\a\\_temp\\w44\\pack-new\\bin\\javis_hud_bridge.py",
+    "A_up":  false,
+    "A_pid":  8808,
+    "A_alive_after_start":  false,
+    "health_first":  null,
+    "world":  {
+                  "url":  "http://127.0.0.1:18700/world",
+                  "status":  null,
+                  "body":  "",
+                  "error":  "Exception calling \"GetResponse\" with \"0\" argument(s): \"Unable to connect to the remote server\"",
+                  "ms":  2009
+              },
+    "root_page":  {
+                      "url":  "http://127.0.0.1:18700/",
+                      "status":  null,
+                      "body":  "",
+                      "error":  "Exception calling \"GetResponse\" with \"0\" argument(s): \"Unable to connect to the remote server\"",
+                      "ms":  2024
+                  },
+    "token_before_B":  "c1aa4499d400f846b964a73906814cec3ffa231d82602ce293ba0ac726c03568",
+    "idle_connection":  {
+                            "closed_by_server":  false,
+                            "seconds":  2,
+                            "limit":  14
+                        },
+    "B_alive_after_6s":  false,
+    "B_exit_code":  null,
+    "health_pid_counts":  {
+
+                          },
+    "health_no_pid":  40,
+    "token_after_B":  "892afb6bf0931418025acd3a3d291c6396dcbe3d3d3c2231b8ad69a18c525ae6",
+    "token_file_changed_by_B":  true,
+    "A_err_head":  "Traceback (most recent call last):\r\n  File \"D:\\a\\_temp\\w44\\pack-new\\bin\\javis_hud_bridge.py\", line 2034, in \u003cmodule\u003e\r\n    main()\r\n  File \"D:\\a\\_temp\\w44\\pack-new\\bin\\javis_hud_bridge.py\", line 2026, in main\r\n    print(f\"[hud-bridge] http://{BIND}:{PORT}  (\\uc77d\\uae30 \\uc804\\uc6a9 � 127.0.0.1 \\ud55c\\uc815)\", flush=True)\r\n  File \"encodings\\cp1252.py\", line 19, in encode\r\nUnicodeEncodeError: \u0027charmap\u0027 codec can\u0027t encode characters in position 38-39: character maps to \u003cundefined\u003e",
+    "B_err_head":  "Traceback (most recent call last):\r\n  File \"D:\\a\\_temp\\w44\\pack-new\\bin\\javis_hud_bridge.py\", line 2034, in \u003cmodule\u003e\r\n    main()\r\n  File \"D:\\a\\_temp\\w44\\pack-new\\bin\\javis_hud_bridge.py\", line 2026, in main\r\n    print(f\"[hud-bridge] http://{BIND}:{PORT}  (\\uc77d\\uae30 \\uc804\\uc6a9 � 127.0.0.1 \\ud55c\\uc815)\", flush=True)\r\n  File \"encodings\\cp1252.py\", line 19, in encode\r\nUnicodeEncodeError: \u0027charmap\u0027 codec can\u0027t encode characters in position 38-39: character maps to \u003cundefined\u003e"
+}
