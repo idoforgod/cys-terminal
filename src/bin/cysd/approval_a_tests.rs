@@ -577,3 +577,30 @@ fn a3_simple_command_scanner_works_on_raw_text_not_on_tokens() {
     let body = &body[..body.find("\n}\n").expect("끝")];
     assert!(body.contains("scan_words(raw)"), "단순 명령 판정이 원문 스캐너를 쓰지 않는다");
 }
+
+/// 손잡이를 끈 채 서명하고 확인하면 **데몬 하나 · 데몬 둘 · 스케줄 게이트** 모두 0.14.43 의 규칙과 결과가 같다 — 폴더가 같으면 어느 데몬에서든 맞고, 다르면 거부.
+#[test]
+fn a3_with_the_knob_off_two_daemons_and_the_schedule_gate_behave_like_0_14_43() {
+    let _g = A_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = fixture("a3-off2", false, 980_030);
+    let other = crate::team_gate_tests::tmp_daemon("a3-off2-dept", true);
+    set_policy(&f, r#"{"approval_cwd_neutral": false}"#);
+    let cmd = "cys close-surface surface:5";
+    assert_eq!(sign_text(&f, cmd, HQ, Some(3600))["ok"], json!(true));
+    assert!(lane_of_record(&f, "close-surface").is_none(), "끈 채 서명했는데 예약 값이 들어갔다");
+    // 데몬 하나: 같은 폴더만.
+    assert!(approved(&check(&f, cmd, HQ, true)));
+    assert!(!approved(&check(&f, cmd, OTHER, true)));
+    // 데몬 둘: 0.14.43 은 폴더가 같으면 다른 데몬에서도 맞는다(넓히지도 조이지도 않는다).
+    let r = rpc(&other, None, "approval.check", json!({"command": cmd, "cwd": HQ, "require_ttl": true}));
+    assert!(approved(&r), "{r}");
+    let r = rpc(&other, None, "approval.check", json!({"command": cmd, "cwd": OTHER, "require_ttl": true}));
+    assert!(!approved(&r), "{r}");
+    // 스케줄 게이트(환경 없음): 예약 값이 없는 레코드라 종전대로 폴더가 같으면 맞는다.
+    let secret = crate::approval::signing_secret().expect("secret");
+    let records = crate::approval::load_records();
+    assert!(crate::approval::best_match(&records, &secret, cmd, Some(HQ), &[]).is_some());
+    assert!(crate::approval::best_match(&records, &secret, cmd, Some(OTHER), &[]).is_none());
+    // 끈 채로는 `--socket` 옵션도 종전 규칙대로(예약 값이 없는 레코드이므로 접두 매칭 · 폴더가 같으면 맞는다).
+    assert!(approved(&check(&f, &format!("{cmd} --socket /x"), HQ, true)));
+}
