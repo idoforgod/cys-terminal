@@ -528,6 +528,10 @@ function Invoke-ApprovalSuite {
     foreach ($fk in $forms.Keys) {
         foreach ($ck in $kinds) { $chk.Add((Run-Check $ck ('launch-' + $fk) $forms[$fk] $D2 '--require-ttl')) }
     }
+    # the same texts checked from the SIGNER's folder (D1): a pure text match (A4: sign and check tokenize the same way)
+    foreach ($fk in $forms.Keys) {
+        foreach ($ck in $kinds) { $chk.Add((Run-Check $ck ('launch-samefolder-' + $fk) $forms[$fk] $D1 '--require-ttl')) }
+    }
     $S['checks'] = $chk.ToArray()
     $st = Invoke-Cys $Set $pipe 'approval check --prefix "git nothing signed" --require-ttl' 30 $D1
     $S['unsigned_check'] = [ordered]@{ rc = $st.rc; err = (Limit $st.err 300) }
