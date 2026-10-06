@@ -5,13 +5,41 @@
 //! (받으면 윈도우에서 끈 채로 낸 브리지 감독이 파일의 한 줄로 켜진다). 켜는 값이 파일에 적혀 있으면 무시하고 로그 한 줄(처음 보았을 때와 값이 바뀌었을 때만).
 //! 판정은 전부 순수 함수(입력 = 환경 문자열 · 정책 JSON)이고, 읽는 얇은 껍질이 그것을 부른다.
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
 use serde_json::Value;
 
 /// 정책 파일을 읽는다 — 없거나 읽지 못하거나 깨졌으면 `None`(손잡이는 기본값으로 둔다 — 되돌리는 값만 읽으므로 모를 때는 기본이 안전한 쪽이다).
 /// 경로는 승인 손잡이(`approval::cwd_neutral_enabled`)와 같다(시험 이음매 포함).
 pub fn read_policy() -> Option<Value> {
-    let text = std::fs::read_to_string(crate::approval::policy_path()).ok()?;
-    serde_json::from_str::<Value>(&text).ok()
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let path = crate::approval::policy_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn_unreadable(&WARNED, &format!("{e}"));
+            return None;
+        }
+    };
+    // UTF-8 BOM 을 벗긴다(앱 쪽 판독과 같다 — 윈도우 편집기가 붙인 BOM 때문에 되돌리는 손잡이가 말없이 안 듣지 않게).
+    match serde_json::from_str::<Value>(cys::strip_utf8_bom(&text)) {
+        Ok(v) => {
+            WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+            Some(v)
+        }
+        Err(e) => {
+            warn_unreadable(&WARNED, &format!("JSON 해석 실패: {e}"));
+            None
+        }
+    }
+}
+
+/// 정책 파일이 **있는데** 읽지 못했을 때 로그 한 줄(바뀔 때만 — 읽는 데 성공하면 다시 무장한다). 이 파일의 되돌리는 손잡이는 이때 적용되지 않는다.
+fn warn_unreadable(flag: &std::sync::atomic::AtomicBool, why: &str) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("[cysd] 정책 파일(~/.cys/policy.json)을 읽지 못해 되돌리는 손잡이(CYS_OFFICE_BRIDGE_MODE=legacy · CYS_OFFICE_BRIDGE_REPLACE_OLD=0 · CYS_FEED_ORPHAN_SWEEP=0 · CYS_OFFICE_BRIDGE_ANY_OWNER=1)가 적용되지 않는다 — {why}");
+    }
 }
 
 /// 환경변수의 값(앞뒤 공백 제거 · 비었으면 없음).

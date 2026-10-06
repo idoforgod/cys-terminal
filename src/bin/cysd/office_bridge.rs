@@ -9,6 +9,8 @@
 //! · **Feed 발행 없음** — 재기동·상한 도달은 데몬 로그에만 남긴다(master 가 손쓸 수 없는 알림으로 턴을 쓰게 하지 않는다).
 //! · **데몬의 잠금을 쥐지 않는다** · 모든 대기에 시간 상한 · `unwrap`/`expect`/색인 접근 없음.
 
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -264,7 +266,8 @@ pub fn terminate_pid(pid: u32) {
     #[cfg(unix)]
     {
         // pid 0 · 1 · 데몬 자신은 절대 보내지 않는다(방어 — 호출부가 이미 검증한 번호만 온다).
-        if pid > 1 && pid != std::process::id() {
+        // pid 가 i32 범위를 넘으면 `pid_t` 로 바꿀 때 음수(= 그룹 신호 · −1 은 전 프로세스)가 된다 — 절대 보내지 않는다.
+        if pid > 1 && pid <= i32::MAX as u32 && pid != std::process::id() {
             unsafe {
                 libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
@@ -576,6 +579,7 @@ pub async fn supervise_managed_child(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use crate::knobs::{bridge_mode_from, BridgeMode};
@@ -749,7 +753,7 @@ mod tests {
     #[test]
     fn mechanical_pins_no_group_signal_no_feed_no_spawn_no_panic_in_the_supervision_code() {
         let me = include_str!("office_bridge.rs");
-        let prod = &me[..me.find("\n#[cfg(test)]\nmod tests {").expect("앵커")];
+        let prod = &me[..me.find("\n#[cfg(test)]\n#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]\nmod tests {").expect("앵커")];
         let main = include_str!("main.rs");
         let a = main.find("fn spawn_office_bridge(").expect("감독 함수");
         let b = main.find("/// ★B3: 동봉 runtime python3 절대경로").expect("끝");

@@ -168,12 +168,12 @@ fn c3_publisher_alive_is_true_false_or_null_and_waiter_follows_the_live_connecti
 
 /// 소스 고정 — 파생 칸을 만드는 두 함수에는 패닉 경로가 없고, 잠금을 하나씩 쥔다.
 #[test]
-fn c3_derived_input_helpers_are_panic_free_and_lock_one_at_a_time() {
+fn c3_derived_input_helpers_are_panic_free() {
     let src = include_str!("handlers.rs");
     let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("앵커")];
-    let a = prod.find("fn feed_list_derived_inputs(").expect("함수");
+    let a = prod.find("fn feed_list_alive_seats(").expect("함수");
     let body = &prod[a..a + prod[a..].find("\n}\n").expect("끝")];
-    assert!(body.contains("#[deny(clippy::unwrap_used") || prod[a - 200..a].contains("#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]"));
+    assert!(prod[..a].trim_end().ends_with("indexing_slicing)]"), "린트 속성이 없다");
     assert!(!body.contains(".unwrap()") && !body.contains(".expect("), "패닉 경로");
     assert!(!body.contains(".await"));
 }

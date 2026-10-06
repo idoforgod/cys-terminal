@@ -4912,6 +4912,11 @@ fn approval_strip_hook_digits(command: &str) -> String {
             break;
         }
         let head: Vec<&String> = tokens.iter().take(keep).collect();
+        // 다시 인용이 필요한 토큰(안전 글자 밖)이 하나라도 있으면 떼지 않고 **원문 그대로** 보낸다 — 다시 인용하면 원문의 `"$(…)"`(큰따옴표 = 셸이 실행)가
+        // `'$(…)'`(리터럴)로 바뀌어 데몬의 원문 스캐너(㉢)를 우회한다(리뷰 1 의 2번). 안전한 토큰뿐이면 이어 붙인 결과는 원문과 의미가 같다.
+        if head.iter().any(|t| approval_shell_quote(t) != **t) {
+            break;
+        }
         if Cli::try_parse_from(head.iter().copied()).is_ok() {
             return head.iter().map(|t| approval_shell_quote(t)).collect::<Vec<_>>().join(" ");
         }
@@ -9989,9 +9994,13 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
     if !missing.is_empty() || unreadable > 0 {
         // ★(0.14.44 · B6-3) 같은 버전에서는 데몬을 다시 띄워도 누락 파일이 복원되지 않는다[실측 R8] — 사실이 아닌 방법("데몬 재기동")은 권하지 않는다.
         //   실제로 되는 방법만: 없는 파일만 되살리는 `cys pack-heal --missing-only <파일>`(원장 무접촉) 또는 팩 전체를 다시 설치하는 `cys init-pack`.
-        action.push_str(
-            " · 누락·판독 불가: cys pack-heal --missing-only <파일>(없는 파일만 · 병합 원장 무접촉) 또는 cys init-pack",
-        );
+        // 누락(파일 없음)과 판독 불가(파일은 있음)를 가른다 — `--missing-only` 는 있는 파일에는 무변경이다(리뷰 1 의 9번).
+        if !missing.is_empty() {
+            action.push_str(" · 누락: cys pack-heal --missing-only <파일>(없는 파일만 · 병합 원장 무접촉) 또는 cys init-pack");
+        }
+        if unreadable > 0 {
+            action.push_str(" · 판독 불가: cys init-pack");
+        }
     }
     let status = if !suspects.is_empty() || n_qr > 0 || !missing.is_empty() || unreadable > 0 {
         DiagStatus::Warn
@@ -23895,6 +23904,11 @@ fn run_pack_heal_missing_only(rel: &str) -> i32 {
         eprintln!("'{rel}' 은 system 소유가 아님({own}) — 헌법·user 파일의 해소는 cys pack-merge 경로를 쓰세요");
         return 1;
     }
+    // 팩 루트가 없으면(팩을 바꿔 끼우는 순간 · 설치 전) 아무것도 만들지 않고 거부한다 — 빈 `pack/` 뼈대가 뒤따르는 교체를 막을 수 있다.
+    if !dir.is_dir() {
+        eprintln!("팩 폴더({})가 없음 — 아무것도 만들지 않는다(무변경)", dir.display());
+        return 1;
+    }
     let target = dir.join(rel);
     // 있으면(심볼릭 링크·디렉터리·내용이 다른 파일 포함) 아무것도 하지 않는다.
     if std::fs::symlink_metadata(&target).is_ok() {
@@ -33295,9 +33309,10 @@ mod tests {
         ] {
             assert_eq!(approval_strip_hook_digits(c), c, "{c}");
         }
-        // 떼면서 인용이 필요한 토큰은 다시 쪼갰을 때 같은 토큰이 되도록 인용한다.
-        let out = approval_strip_hook_digits("cys tombstone 'a b' 2");
-        assert_eq!(cys::approval_tokenize(&out), Some(vec!["cys".to_string(), "tombstone".into(), "a b".into()]));
+        // 다시 인용이 필요한 토큰(안전 글자 밖)이 하나라도 있으면 떼지 않고 원문 그대로 — 다시 인용하면 원문 스캐너(㉢)를 우회한다(리뷰 1 의 2번).
+        for c in ["cys tombstone 'a b' 2", "cys tombstone \"$(cat /tmp/t)\" 2", "cys tombstone '$(cat /tmp/t)' 2", "cys tombstone a;b 2"] {
+            assert_eq!(approval_strip_hook_digits(c), c, "{c}");
+        }
     }
 
     /// `cys reclaim-role --auto` 는 계약 인자 3종(+`--env-role`)을 받는다. 훅이 넘기는 그 형태로 핀.
@@ -35791,10 +35806,12 @@ mod tests {
     #[test]
     fn b6_doctor_missing_hint_no_longer_recommends_a_daemon_restart() {
         let src = include_str!("cys.rs");
-        let i = src.find("누락·판독 불가:").expect("안내 문구");
+        let i = src.find(" · 누락: cys pack-heal").expect("누락 안내 문구");
         let line = &src[i..i + 200];
         assert!(!line.contains("데몬 재기동"), "{line}");
         assert!(line.contains("pack-heal --missing-only") && line.contains("init-pack"), "{line}");
+        let j = src.find(" · 판독 불가: cys init-pack").expect("판독 불가 안내 문구");
+        assert!(!src[j..j + 80].contains("missing-only"), "판독 불가(파일 있음)에 --missing-only 를 권했다");
         let old = ["부팅 install 이 보존 모드로 ", "누락 파일을 다시 쓴다) 또는"].concat(); // 이 시험 자신에 걸리지 않게 조각으로 잇는다
         assert!(!src.contains(&old), "옛 안내가 남았다");
     }

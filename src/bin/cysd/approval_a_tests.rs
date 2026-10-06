@@ -604,3 +604,74 @@ fn a3_with_the_knob_off_two_daemons_and_the_schedule_gate_behave_like_0_14_43() 
     // 끈 채로는 `--socket` 옵션도 종전 규칙대로(예약 값이 없는 레코드이므로 접두 매칭 · 폴더가 같으면 맞는다).
     assert!(approved(&check(&f, &format!("{cmd} --socket /x"), HQ, true)));
 }
+
+// ── 기계 강제(설계 §5-9 · 리뷰 2 의 M1) ────────────────────────────────────────
+
+const DENY: &str = "#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]";
+
+/// 함수 정의 바로 앞(문서 주석·다른 속성 줄 건너뜀)에 린트 속성이 있는가.
+fn has_deny_before(src: &str, sig: &str) -> bool {
+    let Some(i) = src.find(sig) else { return false };
+    let line_start = src[..i].rfind('\n').map(|n| n + 1).unwrap_or(0);
+    src[..line_start]
+        .lines()
+        .rev()
+        .take_while(|l| {
+            let t = l.trim_start();
+            t.starts_with("///") || t.starts_with("#[") || t.starts_with("//")
+        })
+        .any(|l| l.trim() == DENY)
+}
+
+/// 새 데몬 코드 전부에 `unwrap`·`expect`·색인 접근 거부 린트가 걸려 있다(clippy 를 돌릴 때 집행된다).
+#[test]
+fn m1_new_daemon_code_carries_the_panic_free_lint() {
+    let ap = include_str!("approval.rs");
+    for sig in [
+        "pub fn matches_ctx(", "pub fn neutral_skip(", "pub fn neutral_skip_verdict(", "fn target_verb(", "pub fn lane_eligible_prefix(",
+        "pub fn has_socket_option(", "pub fn launch_cwd_literal_absolute(", "fn scan_words(", "pub fn simple_command_core(",
+        "pub fn strip_reserved_env(", "pub fn with_lane_env(", "pub fn explain_no_match(", "pub fn lane_value(socket_path",
+        "fn load_or_create_lane_id(", "pub fn cwd_neutral_enabled(",
+    ] {
+        assert!(has_deny_before(ap, sig), "approval.rs `{sig}` 에 린트 속성이 없다");
+    }
+    let h = include_str!("handlers.rs");
+    for sig in ["fn approval_match_ctx(", "fn feed_list_alive_seats(", "fn feed_list_waiting(", "fn feed_publisher_alive("] {
+        assert!(has_deny_before(h, sig), "handlers.rs `{sig}` 에 린트 속성이 없다");
+    }
+    assert!(has_deny_before(include_str!("main.rs"), "fn spawn_office_bridge("), "main.rs 브리지 감독부에 린트 속성이 없다");
+    assert!(has_deny_before(include_str!("governance.rs"), "fn sweep_orphan_daemon_approvals("));
+    for (name, src) in [("office_bridge.rs", include_str!("office_bridge.rs")), ("knobs.rs", include_str!("knobs.rs"))] {
+        assert!(src.contains(&format!("#!{}", &DENY[1..])), "{name}: 모듈 전체 린트(#![deny …])가 없다");
+    }
+}
+
+/// 저장소 잠금(`mutate_records`) 안에서 도는 코드에는 파일 읽기 · 기다림 · 정책/묶음 조회가 없다 — 정책·묶음은 트랜잭션 **앞**에서 읽어 값으로 넘긴다(X7).
+#[test]
+fn m1_no_file_io_or_waiting_inside_the_store_lock() {
+    const BAD: [&str; 9] = [
+        "read_to_string", "std::fs", "fs::read", "sleep", ".await", "cwd_neutral_enabled", "lane_value(&", "approval_match_ctx", "File::open",
+    ];
+    // ① `approval.check` 의 트랜잭션 클로저 본문.
+    let h = include_str!("handlers.rs");
+    let arm = h.find("\"approval.check\" =>").expect("check 팔");
+    let start = arm + h[arm..].find("crate::approval::mutate_records(|records| {").expect("트랜잭션");
+    let end = start + h[start..].find("(hit, detail)").expect("클로저 끝");
+    let body = &h[start..end];
+    for b in BAD {
+        assert!(!body.contains(b), "트랜잭션 클로저 안에 `{b}`");
+    }
+    // 정책·묶음 조회는 트랜잭션 앞에서 이뤄진다.
+    let pre = &h[arm..start];
+    assert!(pre.contains("approval_match_ctx(daemon)"), "정책·묶음이 트랜잭션 앞에서 읽히지 않는다");
+    // ② 잠금 안에서 불리는 순수 판정 함수 본문.
+    let ap = include_str!("approval.rs");
+    let prod = &ap[..ap.find("\n#[cfg(test)]\npub(crate) mod tests {").expect("앵커")];
+    for sig in ["pub fn explain_no_match(", "pub fn matches_ctx(", "pub fn neutral_skip_verdict(", "pub fn simple_command_core(", "fn scan_words("] {
+        let i = prod.find(sig).expect(sig);
+        let body = &prod[i..i + prod[i..].find("\n}\n").or_else(|| prod[i..].find("\n    }\n")).expect("끝")];
+        for b in BAD {
+            assert!(!body.contains(b), "`{sig}` 안에 `{b}` — 이 함수는 저장소 잠금 안에서 돈다");
+        }
+    }
+}

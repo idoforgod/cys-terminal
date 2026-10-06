@@ -684,12 +684,9 @@ fn same_dir_on_disk(a: &str, b: &str) -> bool {
     }
 }
 
-/// ★(0.14.44 · C3) `feed.list` 파생 칸의 재료 — (살아 있는 좌석 번호 집합, 지금 결정을 기다리는 연결이 있는 request_id 집합).
-/// 잠금은 하나씩 쥐었다 놓는다(좌석 맵 → 대기 연결 맵). 순수 읽기 · poison 관용.
+/// ★(0.14.44 · C3) `feed.list` 파생 칸의 재료 ① — 살아 있는 좌석 번호 집합(좌석 맵 잠금은 이 함수 안에서 끝난다). 순수 읽기 · poison 관용.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn feed_list_derived_inputs(
-    daemon: &Arc<Daemon>,
-) -> (std::collections::HashSet<u64>, std::collections::HashSet<String>) {
+fn feed_list_alive_seats(daemon: &Arc<Daemon>) -> std::collections::HashSet<u64> {
     let seats: Vec<(u64, Arc<crate::state::Surface>)> = daemon
         .surfaces
         .lock()
@@ -697,23 +694,28 @@ fn feed_list_derived_inputs(
         .iter()
         .map(|(k, v)| (*k, v.clone()))
         .collect();
-    let alive: std::collections::HashSet<u64> = seats
+    seats
         .iter()
         .filter(|(_, s)| !s.exited.load(std::sync::atomic::Ordering::Relaxed))
         .map(|(k, _)| *k)
-        .collect();
-    let waiting: std::collections::HashSet<String> = daemon
+        .collect()
+}
+
+/// ★(0.14.44 · C3) 재료 ② — 지금 결정을 기다리는 연결이 있는 request_id 집합. 호출부가 항목 잠금을 쥔 채 부른다(잠금 순서 feed_items → feed_waiters).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn feed_list_waiting(daemon: &Arc<Daemon>) -> std::collections::HashSet<String> {
+    daemon
         .feed_waiters
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|(_, tx)| !tx.is_closed())
         .map(|(k, _)| k.clone())
-        .collect();
-    (alive, waiting)
+        .collect()
 }
 
 /// ★(0.14.44 · C3) `publisher_alive` — 올린 좌석이 살아 있는가. 올린 좌석을 모르거나 이 데몬이 뜨기 전에 만들어진 항목이면 `null`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn feed_publisher_alive(
     publisher_surface: Option<u64>,
     created_at: f64,
@@ -728,6 +730,7 @@ fn feed_publisher_alive(
 }
 
 /// ★(0.14.44 · A3) 승인 매칭 문맥 — 이 데몬의 묶음 값과 "폴더 건너뛰기" 손잡이. 저장소 잠금 **밖에서** 부른다(파일 입출력이 든다).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn approval_match_ctx(daemon: &Arc<Daemon>) -> crate::approval::MatchCtx {
     let dir = crate::state::state_dir(&daemon.socket_path);
     crate::approval::MatchCtx {
@@ -8269,9 +8272,12 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         "feed.list" => {
             let status_filter = param_str(&params, "status");
             // ★(0.14.44 · C3) 파생 칸 둘의 재료 — **잠금을 하나씩** 쥐었다 놓는다(겹쳐 쥐지 않는다): 살아 있는 좌석 집합 → 지금 결정을 기다리는 연결 집합 → 항목 목록.
-            let (alive_seats, waiting) = feed_list_derived_inputs(daemon);
+            let alive_seats = feed_list_alive_seats(daemon);
             let daemon_started_at = daemon.started_at;
             let items = daemon.feed_items.lock().unwrap();
+            // ★대기 연결 집합은 **항목 잠금을 쥔 채**(기존 잠금 순서 feed_items → feed_waiters — `feed.push --wait` 와 같다) 뜬다: `--wait` 항목이 보이는 순간
+            //   waiter 는 이미 있다는 push 쪽의 보장과 같은 시점에 맞춘다(그 사이에 끼면 방금 올라온 대기 항목이 `waiter:false` 로 나가 「확인」이 거부를 보낸다 — 리뷰 1 의 4번).
+            let waiting = feed_list_waiting(daemon);
             let list: Vec<Value> = items
                 .iter()
                 .filter(|i| {

@@ -1915,9 +1915,11 @@ fn decide_auto_restore(
 /// 메타버스 오피스 브리지(팩 javis_hud_bridge.py · 127.0.0.1 한정) 자동기동 — CC "🏢 오피스" 탭이
 /// 수동 python3 기동 없이 항상 열리게 한다. 단일 인스턴스 가드: HUD 포트가 이미 listen 중이면
 /// (선행 cysd·수동 기동) 스폰하지 않는다 — 동일 서버 누적이 구조적으로 0(자원 거버넌스 '누적·미종료' 차단).
-/// 사망·부재는 60s 주기 재확인이 이어받고(KeepAlive), cysd 정상 종료 시 kill_on_drop이 자식을 동반 정리한다.
+/// 사망·부재는 주기 재확인이 이어받는다. ★(0.14.44) 데몬이 정상 종료(`process::exit`)·강제 종료돼도 브리지가 같이 죽는다는 보장은 `kill_on_drop` 이 아니라 managed 모드의 **표준입력 수명줄**이다
+/// (legacy — 윈도우 기본 — 에서는 종전처럼 살아남는다[실측 R4]).
 /// CYS_NO_OFFICE_BRIDGE=1 opt-out · 팩에 브리지 부재(구팩)면 조용히 skip.
 /// python 해석·PATH·cys 주입은 auto-restore(★B3)와 동일 SOT(bundled_python3·runtime_prefixed_path).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn spawn_office_bridge(state_dir: std::path::PathBuf, socket_path: std::path::PathBuf) {
     if cys::env_compat("CYS_NO_OFFICE_BRIDGE").map(|v| v == "1").unwrap_or(false) {
         eprintln!("[cysd] office-bridge skipped (CYS_NO_OFFICE_BRIDGE=1)");
@@ -2014,7 +2016,15 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf, socket_path: std::path::Pa
                                 eprintln!("[cysd] office-bridge: 옛 브리지 후보가 하나로 좁혀지지 않아({n}개) 교체하지 않는다 — 옛 브리지를 계속 쓴다");
                             }
                         }
-                        Ok(Rs::NotOld) | Ok(Rs::NoOwner) | Err(_) => {}
+                        Ok(Rs::NoOwner) => {
+                            // 주인을 가리지 못한 채 토큰을 포트 주인에게 60초마다 보내지 않게 — Ambiguous 와 같은 주기 상한(리뷰 1 의 5번).
+                            replace_rounds += 1;
+                            if replace_rounds >= crate::office_bridge::REPLACE_AMBIGUOUS_ROUNDS {
+                                replace_done = true;
+                                eprintln!("[cysd] office-bridge: 옛 세대 브리지의 주인을 가리지 못해 교체하지 않는다 — 옛 브리지를 계속 쓴다");
+                            }
+                        }
+                        Ok(Rs::NotOld) | Err(_) => {}
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;

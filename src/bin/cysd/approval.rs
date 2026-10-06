@@ -238,6 +238,7 @@ impl ApprovalRecord {
     /// `ctx` 가 있을 때만: ① 예약 값(`CYS_APPROVAL_LANE`)이 든 레코드는 명령에 대상 데몬을 바꾸는 옵션이 있으면 맞지 않는다
     /// ② 폴더가 다른데 [`neutral_skip`] 의 다섯 조건이 모두 참이면 폴더 비교만 건너뛴다.
     /// (예약 값 일치 자체는 기존 규칙 "레코드 환경 ⊆ 확인 환경"이 맡는다 — 데몬이 확인용 환경에 자기 값을 넣는다.)
+    #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     pub fn matches_ctx(
         &self,
         command: &str,
@@ -254,7 +255,7 @@ impl ApprovalRecord {
         if toks.len() < self.command_prefix.len() {
             return false;
         }
-        if toks[..self.command_prefix.len()] != self.command_prefix[..] {
+        if toks.get(..self.command_prefix.len()) != Some(self.command_prefix.as_slice()) {
             return false;
         }
         if ctx.is_some() && self.lane_value().is_some() && has_socket_option(&toks) {
@@ -794,6 +795,7 @@ pub struct MatchCtx {
 
 impl ApprovalRecord {
     /// 레코드의 예약 값(데몬 묶음). 없으면 `None` — 무기한 승인과 대상 동사가 아닌 명령의 승인이 그렇다.
+    #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     pub fn lane_value(&self) -> Option<&str> {
         self.environment
             .iter()
@@ -803,11 +805,13 @@ impl ApprovalRecord {
 }
 
 /// 요청이 실어 온 환경에서 예약 이름을 버린다 — 데몬만 넣는다(서명·확인의 모든 갈래).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn strip_reserved_env(env: Vec<(String, String)>) -> Vec<(String, String)> {
     env.into_iter().filter(|(k, _)| k != LANE_ENV_KEY).collect()
 }
 
 /// 환경에 데몬의 묶음 값을 더해 다시 정렬한다(서명과 매칭이 "정렬돼 있음"을 전제한다).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn with_lane_env(env: Vec<(String, String)>, lane: &str) -> Vec<(String, String)> {
     let mut e = strip_reserved_env(env);
     e.push((LANE_ENV_KEY.to_string(), lane.to_string()));
@@ -815,6 +819,7 @@ pub fn with_lane_env(env: Vec<(String, String)>, lane: &str) -> Vec<(String, Str
 }
 
 /// 접두가 `cys`(또는 `cys.exe`) + 대상 동사 7종인가 — 그 동사(소문자 그대로)를 돌려준다.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn target_verb(prefix: &[String]) -> Option<&'static str> {
     let bin = prefix.first()?;
     if bin != "cys" && bin != "cys.exe" {
@@ -825,11 +830,13 @@ fn target_verb(prefix: &[String]) -> Option<&'static str> {
 }
 
 /// 이 접두의 서명에 묶음 값을 넣는가(㉡ 의 앞 반 — 접두가 cys + 대상 동사이고 대상 데몬을 바꾸는 옵션이 없다). 시간 한정·손잡이는 호출부가 본다.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn lane_eligible_prefix(prefix: &[String]) -> bool {
     target_verb(prefix).is_some() && !has_socket_option(prefix)
 }
 
 /// 대상 데몬을 바꾸는 옵션(`--socket` · `--socket=…` · `-S`)이 **따옴표를 푼 토큰** 가운데 있는가.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn has_socket_option(tokens: &[String]) -> bool {
     tokens
         .iter()
@@ -839,6 +846,7 @@ pub fn has_socket_option(tokens: &[String]) -> bool {
 /// `launch-agent` 의 `--cwd` 값이 **글자 그대로의 절대 경로**인가(마지막 확인 D1) — 데몬이 쪼갠 토큰 기준:
 /// `--cwd` 가 정확히 하나, 값이 비어 있지 않고, `/` 로 시작하거나 `<드라이브 문자>:` 뒤에 `/` 또는 `\` 가 오며,
 /// 셸이나 CLI 가 실행 좌석의 폴더로 풀어 버릴 글자(`$` · 백틱 · `~` · `*` · `?` · `[` · `{`)가 없다.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn launch_cwd_literal_absolute(tokens: &[String]) -> bool {
     let mut value: Option<&str> = None;
     let mut count = 0usize;
@@ -975,9 +983,11 @@ fn scan_words(raw: &str) -> Option<Vec<ScanWord>> {
 }
 
 /// 출력을 버리는 꼬리 — 토큰이 **정확히** 이 글자일 때만(띄어 쓴 꼴은 이어진 두 토큰).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn is_tail_single(t: &str) -> bool {
     matches!(t, "2>&1" | ">/dev/null" | "2>/dev/null" | "&>/dev/null")
 }
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 fn is_tail_pair(a: &str, b: &str) -> bool {
     b == "/dev/null" && matches!(a, ">" | "2>" | "&>")
 }
@@ -1025,6 +1035,7 @@ pub fn simple_command_core(raw: &str) -> Option<Vec<String>> {
 /// ㉠ 레코드에 이 데몬의 예약 값이 있다 · ㉡ 접두가 `cys`(`cys.exe`) + 대상 동사 7종(`launch-agent` 는 낳을 폴더가 글자 그대로의 절대 경로로 적힘)
 /// · ㉢ 확인하는 명령이 단순 명령 · ㉣ 정확 명령(꼬리를 뗀 토큰 전체 = 레코드 토큰) · ㉤ 만료 전의 시간 한정 승인(호출부의 만료 필터 + 여기서 `expires_at` 유무).
 /// 손잡이(`ctx.neutral`)가 꺼져 있으면 항상 거짓이다.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 pub fn neutral_skip(rec: &ApprovalRecord, raw_command: &str, ctx: &MatchCtx) -> bool {
     neutral_skip_verdict(rec, raw_command, ctx) == SkipVerdict::Applies
 }
@@ -1107,7 +1118,7 @@ fn load_or_create_lane_id(state_dir: &std::path::Path) -> String {
     }
     let id = match random_32() {
         Some(b) => b.iter().take(16).map(|x| format!("{x:02x}")).collect::<String>(),
-        None => format!("t{:x}{:x}", std::process::id(), crate::state::now_epoch() as u64),
+        None => format!("t{:x}x{:x}fallback", std::process::id(), crate::state::now_epoch() as u64),
     };
     let written = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(state_dir)?;
@@ -1140,7 +1151,7 @@ pub fn cwd_neutral_enabled() -> bool {
         match std::fs::read_to_string(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
             Err(_) => None,
-            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(cys::strip_utf8_bom(&text)) {
                 Err(_) => None,
                 Ok(v) => match v.get("approval_cwd_neutral") {
                     None => Some(true),
@@ -1908,7 +1919,7 @@ pub(crate) mod tests {
     fn r2f_json_roundtrip(x: f64) -> (f64, f64, String) {
         let text = serde_json::to_string(&x).expect("직렬화");
         let via_f64: f64 = serde_json::from_str(&text).expect("f64 판독");
-        let via_value = serde_json::from_str::<serde_json::Value>(&text).expect("Value 판독").as_f64().expect("수치");
+        let via_value = serde_json::from_str::<serde_json::Value>(cys::strip_utf8_bom(&text)).expect("Value 판독").as_f64().expect("수치");
         (via_f64, via_value, text)
     }
 

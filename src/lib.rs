@@ -2566,6 +2566,10 @@ pub fn bridge_probe_request(
                 return Ok(BridgeProbeReply { status, body, complete: true });
             }
         }
+        // 머리 끝(`\r\n\r\n`)을 보내지 않는 포트 주인에게서 5초 동안 쌓고 다시 훑지 않게 — 머리를 못 찾은 채 16KB 를 넘으면 잘못된 응답이다.
+        if buf.len() > 16 * 1024 && bridge_parse_head(&buf).is_none() {
+            return Err(BridgeProbeError::BadReply);
+        }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(BridgeProbeError::NoResponse);
@@ -7639,6 +7643,17 @@ mod bridge_probe_tests {
         let (port, h) = serve(Some(cut), 0);
         let r = bridge_probe_request(port, "/world", &[], 0, 3000).expect("응답");
         assert_eq!((r.status, r.complete), (200, false));
+        let _ = h.join();
+    }
+
+    /// 머리 끝을 보내지 않고 계속 쏟아내는 상대 — 16KB 를 넘으면 상한(5초)을 기다리지 않고 `BadReply`.
+    #[test]
+    fn probe_rejects_an_endless_header_without_waiting_for_the_budget() {
+        let junk = vec![b'a'; 64 * 1024];
+        let (port, h) = serve(Some(junk), 300);
+        let t0 = Instant::now();
+        assert_eq!(bridge_probe_request(port, "/health", &[], 0, 5000), Err(BridgeProbeError::BadReply));
+        assert!(t0.elapsed() < Duration::from_millis(2500), "{:?}", t0.elapsed());
         let _ = h.join();
     }
 
