@@ -1,0 +1,18 @@
+{
+    "tag":  "a",
+    "new_env":  {
+
+                },
+    "old_bridge_pid":  2424,
+    "old_bridge_alive_after_old_daemon_stop":  true,
+    "old_bridge_alive_after_new_daemon_45s":  true,
+    "bridges_now":  [
+                        {
+                            "id":  2424,
+                            "ppid":  7812
+                        }
+                    ],
+    "new_daemon_log_bridge_lines":  [
+
+                                    ]
+}

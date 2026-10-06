@@ -1,0 +1,309 @@
+{
+  "generated": "2026-10-06T13:39:19.361Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37469727753",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37469727753",
+  "job": "w44",
+  "os": "windows-2025",
+  "branch": "diag-results/37469727753-1-w44-windows-2025",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "done-w44-measure.json",
+      "bytes": 143
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-w44-measure.txt",
+      "bytes": 1964
+    },
+    {
+      "path": "syntax-check.txt",
+      "bytes": 125
+    },
+    {
+      "path": "w44-approval-new-approvals-ttl.json",
+      "bytes": 5543
+    },
+    {
+      "path": "w44-approval-new-approvals.json",
+      "bytes": 19
+    },
+    {
+      "path": "w44-approval-new-cysd-approval-new.err.txt",
+      "bytes": 1130
+    },
+    {
+      "path": "w44-approval-new-list.txt",
+      "bytes": 75
+    },
+    {
+      "path": "w44-approval-new.json",
+      "bytes": 43216
+    },
+    {
+      "path": "w44-approval-old-approvals-ttl.json",
+      "bytes": 4669
+    },
+    {
+      "path": "w44-approval-old-approvals.json",
+      "bytes": 19
+    },
+    {
+      "path": "w44-approval-old-cysd-approval-old.err.txt",
+      "bytes": 965
+    },
+    {
+      "path": "w44-approval-old-list.txt",
+      "bytes": 75
+    },
+    {
+      "path": "w44-approval-old.json",
+      "bytes": 36635
+    },
+    {
+      "path": "w44-bindprobe.txt",
+      "bytes": 678
+    },
+    {
+      "path": "w44-bridge-bridge-new-default-A.err.txt",
+      "bytes": 124
+    },
+    {
+      "path": "w44-bridge-bridge-new-default-B.err.txt",
+      "bytes": 124
+    },
+    {
+      "path": "w44-bridge-bridge-new-new-A.err.txt",
+      "bytes": 124
+    },
+    {
+      "path": "w44-bridge-bridge-new-new-B.err.txt",
+      "bytes": 124
+    },
+    {
+      "path": "w44-bridge-bridge-old-default-A.err.txt",
+      "bytes": 483
+    },
+    {
+      "path": "w44-bridge-bridge-old-default-B.err.txt",
+      "bytes": 483
+    },
+    {
+      "path": "w44-bridge-new-default.json",
+      "bytes": 2608
+    },
+    {
+      "path": "w44-bridge-new-new.json",
+      "bytes": 2595
+    },
+    {
+      "path": "w44-bridge-old-default.json",
+      "bytes": 3476
+    },
+    {
+      "path": "w44-daemon-b7-new-default.json",
+      "bytes": 466
+    },
+    {
+      "path": "w44-daemon-b7-new-managed-winnew.json",
+      "bytes": 564
+    },
+    {
+      "path": "w44-daemon-mwn1-cysd-daemon-mwn1.err.txt",
+      "bytes": 751
+    },
+    {
+      "path": "w44-daemon-mwn2-cysd-daemon-mwn2.err.txt",
+      "bytes": 751
+    },
+    {
+      "path": "w44-daemon-mwn3-cysd-daemon-mwn3.err.txt",
+      "bytes": 751
+    },
+    {
+      "path": "w44-daemon-mwnprobe-cysd-daemon-mwnprobe.err.txt",
+      "bytes": 855
+    },
+    {
+      "path": "w44-daemon-mws1-cysd-daemon-mws1.err.txt",
+      "bytes": 751
+    },
+    {
+      "path": "w44-daemon-mws2-cysd-daemon-mws2.err.txt",
+      "bytes": 751
+    },
+    {
+      "path": "w44-daemon-mws3-cysd-daemon-mws3.err.txt",
+      "bytes": 751
+    },
+    {
+      "path": "w44-daemon-new-default-kill.json",
+      "bytes": 3314
+    },
+    {
+      "path": "w44-daemon-new-default.json",
+      "bytes": 7803
+    },
+    {
+      "path": "w44-daemon-new-managed-only.json",
+      "bytes": 3371
+    },
+    {
+      "path": "w44-daemon-new-managed-winnew-noseat-1.json",
+      "bytes": 3402
+    },
+    {
+      "path": "w44-daemon-new-managed-winnew-noseat-2.json",
+      "bytes": 3403
+    },
+    {
+      "path": "w44-daemon-new-managed-winnew-noseat-3.json",
+      "bytes": 3403
+    },
+    {
+      "path": "w44-daemon-new-managed-winnew-probe.json",
+      "bytes": 4184
+    },
+    {
+      "path": "w44-daemon-new-managed-winnew-seat-1.json",
+      "bytes": 4446
+    },
+    {
+      "path": "w44-daemon-new-managed-winnew-seat-2.json",
+      "bytes": 4435
+    },
+    {
+      "path": "w44-daemon-new-managed-winnew-seat-3.json",
+      "bytes": 4441
+    },
+    {
+      "path": "w44-daemon-new-policy-managed.json",
+      "bytes": 3613
+    },
+    {
+      "path": "w44-daemon-newdefault-cysd-daemon-newdefault.err.txt",
+      "bytes": 1021
+    },
+    {
+      "path": "w44-daemon-newdefaultkill-cysd-daemon-newdefaultkill.err.txt",
+      "bytes": 771
+    },
+    {
+      "path": "w44-daemon-newmanagedonly-cysd-daemon-newmanagedonly.err.txt",
+      "bytes": 771
+    },
+    {
+      "path": "w44-daemon-newpolicymanaged-cysd-daemon-newpolicymanaged.err.txt",
+      "bytes": 961
+    },
+    {
+      "path": "w44-daemon-old-default-utf8.json",
+      "bytes": 3082
+    },
+    {
+      "path": "w44-daemon-old-default.json",
+      "bytes": 1903
+    },
+    {
+      "path": "w44-daemon-olddefault-cysd-daemon-olddefault.err.txt",
+      "bytes": 922
+    },
+    {
+      "path": "w44-daemon-oldutf8-cysd-daemon-oldutf8.err.txt",
+      "bytes": 683
+    },
+    {
+      "path": "w44-doctor-agyfolder-newdefault.txt",
+      "bytes": 2677
+    },
+    {
+      "path": "w44-doctor-newdefault.txt",
+      "bytes": 2397
+    },
+    {
+      "path": "w44-hook.json",
+      "bytes": 4649
+    },
+    {
+      "path": "w44-old-extract.json",
+      "bytes": 883
+    },
+    {
+      "path": "w44-results.json",
+      "bytes": 7897
+    },
+    {
+      "path": "w44-summary.txt",
+      "bytes": 228
+    }
+  ],
+  "skipped": [
+    {
+      "path": "w44-approval-new-cysd-approval-new.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-approval-old-cysd-approval-old.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-mwn1-cysd-daemon-mwn1.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-mwn2-cysd-daemon-mwn2.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-mwn3-cysd-daemon-mwn3.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-mwnprobe-cysd-daemon-mwnprobe.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-mws1-cysd-daemon-mws1.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-mws2-cysd-daemon-mws2.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-mws3-cysd-daemon-mws3.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-newdefault-cysd-daemon-newdefault.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-newdefaultkill-cysd-daemon-newdefaultkill.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-newmanagedonly-cysd-daemon-newmanagedonly.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-newpolicymanaged-cysd-daemon-newpolicymanaged.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-olddefault-cysd-daemon-olddefault.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-daemon-oldutf8-cysd-daemon-oldutf8.out.txt",
+      "reason": "empty file"
+    }
+  ],
+  "inline_files": 58,
+  "blob_files": 0
+}
