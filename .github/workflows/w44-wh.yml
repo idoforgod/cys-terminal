@@ -1,0 +1,66 @@
+# w44 wh: the product's own windows test `wh_windows` (descendant counting guard) run under an ELEVATED and a STANDARD-USER token,
+# plus a real cysd as the standard user (watchdog false alarm check). Product commit e0250a83. Tag [w44-wh].
+name: w44 wh (descendant guard, elevated vs standard user)
+on:
+  push:
+    branches: ['diag/win11-update']
+permissions:
+  contents: write
+jobs:
+  wh:
+    name: 'w44-wh (${{ matrix.os }})'
+    if: ${{ contains(github.event.head_commit.message, '[w44-wh]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-11-arm]
+    env:
+      DIAG_MATRIX_OS: ${{ matrix.os }}
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: e0250a837642e6b51fb98939201def6a19a64ede
+          path: p
+          fetch-depth: 1
+      - uses: actions/checkout@v4
+        with:
+          path: d
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: build test executable and binaries (elevated token)
+        shell: powershell
+        working-directory: p
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path C:\w44pub\bin | Out-Null
+          $env:CYS_PACK_DIR = (Join-Path $env:RUNNER_TEMP 'packdir'); New-Item -ItemType Directory -Force -Path $env:CYS_PACK_DIR | Out-Null
+          cargo test --bin cysd --no-run --message-format=json > $env:RUNNER_TEMP\cargo-test-build.jsonl 2> $env:RUNNER_TEMP\cargo-test-build.err.txt
+          "cargo test --no-run rc=$LASTEXITCODE"
+          $exe = $null
+          foreach ($ln in (Get-Content $env:RUNNER_TEMP\cargo-test-build.jsonl)) { if ($ln -match '"executable":"([^"]+cysd[^"]*\.exe)"' -and $ln -match '"test":true') { $exe = ($Matches[1] -replace '\\\\', '\') } }
+          "test exe: $exe"
+          if ($exe) { Copy-Item -LiteralPath $exe -Destination C:\w44pub\bin\cysd-test.exe -Force }
+          cargo build --bin cys --bin cysd 2> $env:RUNNER_TEMP\cargo-build.err.txt
+          "cargo build rc=$LASTEXITCODE"
+          Copy-Item -LiteralPath target\debug\cys.exe -Destination C:\w44pub\bin\cys.exe -Force
+          Copy-Item -LiteralPath target\debug\cysd.exe -Destination C:\w44pub\bin\cysd.exe -Force
+          exit 0
+      - name: w44-wh
+        shell: powershell
+        continue-on-error: true
+        timeout-minutes: 40
+        run: |
+          $ErrorActionPreference = 'Continue'
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$env:GITHUB_WORKSPACE\d\diag\w44-wh.ps1"
+          exit 0
+      - name: publish-results
+        if: always()
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node d\diag\publish-results.mjs --job w44-wh --os ${{ matrix.os }} --out "%RUNNER_TEMP%\diag-out"
