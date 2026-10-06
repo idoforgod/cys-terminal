@@ -1,0 +1,44 @@
+2026-10-06T05:04:26.222Z [INFO] === w44-measure start (PowerShell 5.1.26100.33438, LanguageMode FullLanguage) ===
+2026-10-06T05:04:26.251Z [INFO] --- step S0-inputs start
+2026-10-06T05:18:46.984Z [INFO] artifact found: id 11391447366 size 143464982 after 14.3 min
+2026-10-06T05:18:52.038Z [INFO] download rc 0 err 
+2026-10-06T05:18:53.285Z [INFO] --- step S0-inputs end (867s) 
+2026-10-06T05:18:53.287Z [INFO] --- step S1-install start
+2026-10-06T05:19:55.068Z [INFO] installer rc 0, killed after install: 
+2026-10-06T05:19:55.497Z [INFO] tar new rc 0 
+2026-10-06T05:19:55.499Z [INFO] --- step S1-install end (62.2s) 
+2026-10-06T05:19:55.501Z [INFO] --- step S1b-old-0.14.43 start
+2026-10-06T05:20:00.928Z [INFO] fetch old rc 0 
+2026-10-06T05:20:06.721Z [INFO] 7z rc 0 7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03
+
+Scanning the drive for archives:
+1 file, 143348191 bytes (137 MiB)
+
+Extracting archive: D:\a\_temp\w44\old-dl\cys_0.14.43_x64-setup.exe
+--
+Path = D:\a\_temp\w44\old-dl\cys_0.14.43_x64-setup.exe
+Type = Nsis
+Physical Size = 143348191
+Method = LZMA:23
+Solid = +
+Headers Size = 2358206
+Embedded Stub Size = 52736
+SubType...
+2026-10-06T05:20:07.050Z [INFO] tar old rc 0
+2026-10-06T05:20:07.052Z [INFO] --- step S1b-old-0.14.43 end (11.6s) 
+2026-10-06T05:20:07.056Z [INFO] --- step TA-approval start
+2026-10-06T05:23:32.439Z [INFO] --- step TA-approval end (205.4s) 
+2026-10-06T05:23:32.442Z [INFO] --- step TB-bridge start
+2026-10-06T05:24:37.316Z [INFO] --- step TB-bridge end (64.9s) 
+2026-10-06T05:24:37.321Z [INFO] --- step TC-daemon start
+2026-10-06T05:31:12.439Z [INFO] --- step TC-daemon end (395.1s) 
+2026-10-06T05:31:12.443Z [INFO] --- step TD-hook start
+2026-10-06T05:31:15.498Z [ERROR] STEP FAILED [TD-hook]: System.Management.Automation.RuntimeException: Cannot index into a null array. At D:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:40 char:5
++     $R['items'][$Key] = $Value
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~
+2026-10-06T05:31:15.502Z [INFO] --- step TD-hook end (3.1s) System.Management.Automation.RuntimeException: Cannot index into a null array. At D:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:40 char:5
++     $R['items'][$Key] = $Value
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~
+2026-10-06T05:31:15.504Z [INFO] --- step SUMMARY start
+2026-10-06T05:31:15.510Z [INFO] --- step SUMMARY end (0s) 
+2026-10-06T05:31:15.516Z [INFO] === w44-measure end ===

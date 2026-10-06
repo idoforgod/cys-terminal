@@ -1,0 +1,45 @@
+{
+    "tag":  "old-default",
+    "mode":  "default",
+    "script":  "D:\\a\\_temp\\w44\\pack-old\\bin\\javis_hud_bridge.py",
+    "A_up":  true,
+    "A_pid":  4696,
+    "A_alive_after_start":  false,
+    "health_first":  {
+                         "url":  "http://127.0.0.1:18700/health",
+                         "status":  200,
+                         "body":  "{\"ok\": true, \"pid\": 8388, \"boot_id\": \"9578effac7ccdfef\", \"pack_version\": null, \"assets\": {\"office3d_html\": true, \"office_boot_js\": true, \"three_module_js\": true}, \"timeouts\": 0}",
+                         "error":  null,
+                         "ms":  3014
+                     },
+    "world":  {
+                  "url":  "http://127.0.0.1:18700/world",
+                  "status":  200,
+                  "body":  "{\"v\": 2, \"ts\": 1791264255.7193038, \"seq\": 513, \"daemon\": {\"version\": \"0.14.43\", \"paused\": false}, \"departments\": [{\"id\": \"ë³¸ë¶€ Â· CEO\", \"floor\": 1, \"nodes\": []}], \"todo\": {}, \"lobby\": {\"unassigned\": []}, \"server_room\": [], \"blocked\": [], \"kanban\": {\"ts\": 1791264255.523163, \"tasks\": []}, \"review\": ",
+                  "error":  null,
+                  "ms":  1
+              },
+    "root_page":  {
+                      "url":  "http://127.0.0.1:18700/",
+                      "status":  200,
+                      "body":  "\u003c!doctype html\u003e\n\u003chtml lang=\"ko\"\u003e\n\u003chead\u003e\n\u003cmeta charset=\"utf-8\"\u003e\n\u003ctitle\u003eCYSJAVIS · Metaverse Office\u003c/title\u003e\n\u003cstyle\u003e\n  html",
+                      "error":  null,
+                      "ms":  1
+                  },
+    "token_before_B":  "fa2a353293e05dda75eb1616e79550f2fddd1e656c88c67588464dbe4ea4dd26",
+    "idle_connection":  {
+                            "closed_by_server":  false,
+                            "seconds":  14.3,
+                            "limit":  14
+                        },
+    "B_alive_after_6s":  false,
+    "B_exit_code":  null,
+    "health_pid_counts":  {
+                              "8388":  40
+                          },
+    "health_no_pid":  0,
+    "token_after_B":  "2e0337741973eea999526a5af70766218cec1d3f02127153d374517b5f8e147e",
+    "token_file_changed_by_B":  true,
+    "A_err_head":  "Traceback (most recent call last):\r\n  File \"D:\\a\\_temp\\w44\\pack-old\\bin\\javis_hud_bridge.py\", line 2034, in \u003cmodule\u003e\r\n    main()\r\n  File \"D:\\a\\_temp\\w44\\pack-old\\bin\\javis_hud_bridge.py\", line 2026, in main\r\n    print(f\"[hud-bridge] http://{BIND}:{PORT}  (\\uc77d\\uae30 \\uc804\\uc6a9 � 127.0.0.1 \\ud55c\\uc815)\", flush=True)\r\n  File \"encodings\\cp1252.py\", line 19, in encode\r\nUnicodeEncodeError: \u0027charmap\u0027 codec can\u0027t encode characters in position 38-39: character maps to \u003cundefined\u003e",
+    "B_err_head":  "Traceback (most recent call last):\r\n  File \"D:\\a\\_temp\\w44\\pack-old\\bin\\javis_hud_bridge.py\", line 2034, in \u003cmodule\u003e\r\n    main()\r\n  File \"D:\\a\\_temp\\w44\\pack-old\\bin\\javis_hud_bridge.py\", line 2026, in main\r\n    print(f\"[hud-bridge] http://{BIND}:{PORT}  (\\uc77d\\uae30 \\uc804\\uc6a9 � 127.0.0.1 \\ud55c\\uc815)\", flush=True)\r\n  File \"encodings\\cp1252.py\", line 19, in encode\r\nUnicodeEncodeError: \u0027charmap\u0027 codec can\u0027t encode characters in position 38-39: character maps to \u003cundefined\u003e"
+}

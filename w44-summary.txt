@@ -1,0 +1,10 @@
+w44 summary on windows-2025 (2026-10-06T05:31:15.508Z)
+step S0-inputs: 867s 
+step S1-install: 62.2s 
+step S1b-old-0.14.43: 11.6s 
+step TA-approval: 205.4s 
+step TB-bridge: 64.9s 
+step TC-daemon: 395.1s 
+step TD-hook: 3.1s System.Management.Automation.RuntimeException: Cannot index into a null array. At D:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:40 char:5
++     $R['items'][$Key] = $Value
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~
