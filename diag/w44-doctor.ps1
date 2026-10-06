@@ -74,7 +74,14 @@ function Invoke-Doctor { param([string]$Label, [string]$Scenario, [int]$MaxSec =
     $o['version'] = (Invoke-Proc -File $cys -Arguments '--version' -TimeoutSec 30).out.Trim()
     # the daemon on the DEFAULT pipe, like the app's
     $errF = Join-Path $WORK ($Label + '-cysd.err.txt')
-    $dp = Start-Process -FilePath $cysd -PassThru -WindowStyle Hidden -RedirectStandardError $errF -RedirectStandardOutput (Join-Path $WORK ($Label + '-cysd.out.txt'))
+    if ($Scenario -eq 'app') {
+        # the whole app (cys-app.exe starts its own daemon on the default pipe) - what the scene had
+        $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9333 --remote-allow-origins=*'
+        $dp = Start-Process -FilePath (Join-Path $INST 'cys-app.exe') -PassThru
+        Remove-Item Env:\WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS -ErrorAction SilentlyContinue
+    } else {
+        $dp = Start-Process -FilePath $cysd -PassThru -WindowStyle Hidden -RedirectStandardError $errF -RedirectStandardOutput (Join-Path $WORK ($Label + '-cysd.out.txt'))
+    }
     $t0 = Get-Date
     while (((Get-Date) - $t0).TotalSeconds -lt 90) { Start-Sleep -Seconds 2; $pg = Invoke-Proc -File $cys -Arguments 'ping' -TimeoutSec 10; if ($pg.rc -eq 0) { $o['daemon_ready'] = $true; break } }
     if ($Scenario -eq 'dept') {
@@ -82,7 +89,7 @@ function Invoke-Doctor { param([string]$Label, [string]$Scenario, [int]$MaxSec =
         [System.IO.File]::WriteAllText((Join-Path $dot 'depts.json'), $DEPT, (New-Object System.Text.UTF8Encoding($false)))
         Start-Sleep -Seconds 2
     }
-    Start-Sleep -Seconds 8
+    if ($Scenario -eq 'app') { Start-Sleep -Seconds 40 } else { Start-Sleep -Seconds 8 }
     # doctor, output streamed line by line into files
     $of = Join-Path $global:DiagOut ('w44-doctor-' + $Label + '-stdout.txt'); $ef = Join-Path $global:DiagOut ('w44-doctor-' + $Label + '-stderr.txt')
     foreach ($f in @($of, $ef)) { [System.IO.File]::WriteAllText($f, '') }
@@ -141,10 +148,9 @@ foreach ($v in @(@('new', $new), @('old', $old))) {
     if (-not $v[1]) { continue }
     $code = Install-From $v[1]
     $R[$v[0] + '_install_rc'] = $code
-    Invoke-Doctor ($v[0] + '-plain') 'plain'
-    Invoke-Doctor ($v[0] + '-dept') 'dept'
     # a second pass with the doctor run twice in a row on the same daemon is not needed; repeat the dept case once more for timing noise
-    Invoke-Doctor ($v[0] + '-dept2') 'dept'
+    Invoke-Doctor ($v[0] + '-app') 'app'
+    Invoke-Doctor ($v[0] + '-app2') 'app'
 }
 SaveR
 Complete-DiagScript 'w44-doctor'
