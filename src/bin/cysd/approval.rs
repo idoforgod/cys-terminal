@@ -1126,7 +1126,7 @@ fn load_or_create_lane_id(state_dir: &std::path::Path) -> String {
 
 static NEUTRAL_LOGGED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-fn policy_path() -> PathBuf {
+pub(crate) fn policy_path() -> PathBuf {
     store_root().join(".cys").join("policy.json")
 }
 

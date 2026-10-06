@@ -220,6 +220,8 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 if tick_no.is_multiple_of(3) {
                     check_todo(&daemon);
                     check_approvals(&daemon, &mut approval_debounce, &mut scan_caches);
+                    // ★(0.14.44 · C1) 닫힌 좌석의 화면 감지 승인 쓸기 — 별도 함수(화면 감지 함수 안에 넣지 않는다 · 아래 설명).
+                    sweep_orphan_daemon_approvals(&daemon);
                     check_launch_flags(
                         &daemon,
                         &sys,
@@ -2091,6 +2093,78 @@ impl ScanCaches {
         self.gate_debounce.retain(|(sid, _), _| live.contains(sid));
         self.gate_escalations.retain(|sid, _| live.contains(sid));
     }
+}
+
+/// ★(0.14.44 · C1) **닫힌 좌석의 '데몬이 올린 감지 승인'을 데몬이 스스로 닫는다.**
+///
+/// 좌석을 닫거나(`close-surface`) 셸이 스스로 끝나도, 데몬이 화면에서 감지해 올린 승인 항목은 대기로 남는다(데몬을 다시 띄울 때에야 닫힌다 · 실측 R6). 낡은 대기 항목은
+/// 5분마다 재알림 이벤트를 만들고 대기 건수가 문턱(기본 25)에 닿으면 적체 경보를 낸다(`check_feed_aging`·`check_feed_backlog`) — 치명 위험 ① 쪽이다.
+///
+/// 대상은 **세 조건을 모두 채우는 대기 항목뿐**이다: ① request_id 가 `daemon-` 접두(클라이언트는 이 접두를 쓸 수 없다 — 위조 불가) ② 종류가 `approval` 또는 `first_run_gate`
+/// ③ 좌석 번호가 있고 그 좌석이 좌석 맵에 없거나 종료 상태. 이것들을 `stale-cleared`(화면에서 문구가 사라졌을 때 쓰는 기존 결정 문자열)로 닫는다.
+/// 클라이언트가 올린 항목(사람이 읽어야 할 보고가 섞여 있고 기계가 가를 칸이 없다) · 살아 있는 좌석의 항목 · 정보성 알림은 건드리지 않는다.
+///
+/// 별도 함수인 이유: 화면 감지 함수(`check_approvals`)는 에이전트 정의 파일을 읽지 못하면 일찍 돌아가고, 본문의 순서를 고정한 시험이 있다. 이 쓸기는 정의 파일과 무관하게 돈다.
+/// 틱 계약: **기다림(`.await`)이 없다** · 잠금은 한 문장 안에서 끝나고 둘을 겹쳐 쥐지 않는다(대기 항목 id 를 복사해 잠금을 놓고 → 좌석 맵을 보고 → 기존 해소 함수를 부른다) ·
+/// 한 번에 닫는 건수에 상한이 있다. 손잡이: `CYS_FEED_ORPHAN_SWEEP=0`(환경변수 또는 정책 파일의 `0`) → 종전 동작.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn sweep_orphan_daemon_approvals(daemon: &Arc<Daemon>) {
+    if !crate::knobs::feed_orphan_sweep_enabled() {
+        return;
+    }
+    sweep_orphan_daemon_approvals_inner(daemon);
+}
+
+/// 쓸기 본체 — 손잡이 판정과 분리해 시험이 직접 부른다. 닫은 건수를 돌려준다.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub(crate) fn sweep_orphan_daemon_approvals_inner(daemon: &Arc<Daemon>) -> usize {
+    // 한 번에 닫는 상한(틱 시간 상한) — 남은 것은 다음 틱(15초 뒤)이 닫는다.
+    const SWEEP_CAP: usize = 200;
+    // ① 대기 항목 스냅샷(잠금은 이 문장 안에서 끝난다 · poison 관용 — 읽기 전용 순회).
+    let candidates: Vec<(String, u64)> = daemon
+        .feed_items
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|i| {
+            i.status == "pending"
+                && crate::state::is_daemon_issued(&i.request_id)
+                && (i.kind == "approval" || i.kind == GATE_FEED_KIND)
+        })
+        .filter_map(|i| i.surface_id.map(|sid| (i.request_id.clone(), sid)))
+        .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+    // ② 좌석 사실 — 좌석 맵의 Arc 만 복사하고 잠금을 놓은 뒤 종료 여부를 본다.
+    let mut dead: HashMap<u64, bool> = HashMap::new();
+    for (_, sid) in &candidates {
+        if dead.contains_key(sid) {
+            continue;
+        }
+        let seat = daemon
+            .surfaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(sid)
+            .cloned();
+        let gone = match seat {
+            None => true,
+            Some(s) => s.exited.load(Ordering::Relaxed),
+        };
+        dead.insert(*sid, gone);
+    }
+    // ③ 닫는다(기존 해소 함수 — 멱등 · 다른 잠금을 쥔 채 부르지 않는다).
+    let mut closed = 0usize;
+    for (rid, sid) in candidates {
+        if closed >= SWEEP_CAP {
+            break;
+        }
+        if dead.get(&sid).copied().unwrap_or(false) && daemon.resolve_feed_item(&rid, "stale-cleared").is_some() {
+            closed += 1;
+        }
+    }
+    closed
 }
 
 /// T4-16 승인 격상 스캔: agents.json의 approval_patterns를 visible screen에 매칭.

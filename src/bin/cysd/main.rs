@@ -44,6 +44,7 @@ mod fdlimit;
 mod governance;
 mod handlers;
 mod hwmon;
+mod knobs;
 mod recall;
 mod reclaim;
 mod schedule;
@@ -7603,3 +7604,7 @@ mod send_settle_tests;
 // ★(0.14.44 · WP-A) 승인 사유·데몬 묶음·command_text RPC 시험 — 테스트 전용 모듈(프로덕션 코드 0 · 파일 끝 규약은 위와 같다).
 #[cfg(test)]
 mod approval_a_tests;
+
+// ★(0.14.44 · C1·C3) 승인 Feed 쓸기·파생 칸 시험 — 테스트 전용 모듈(프로덕션 코드 0 · 파일 끝 규약은 위와 같다).
+#[cfg(test)]
+mod feed_sweep_tests;
