@@ -1,0 +1,18 @@
+2026-10-06 13:23:39.837: [INFO] CurrentProfilePath: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-06 13:23:39.837: [INFO] Profiles total count: 1
+2026-10-06 13:23:39.837: [INFO] Profile: name=Profile 1 path=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default lastActive=null
+2026-10-06 13:23:39.837: [INFO] LastUsedProfileDir: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-06 13:23:39.837: [INFO] OnDoneLoading sync enabled: 0
+2026-10-06 13:23:39.837: [INFO] BookmarkModelLoaded, ids_reassigned: 0
+2026-10-06 13:23:39.837: [INFO] BookmarksLoadDropped droppedNodes=0
+2026-10-06 13:23:39.838: [INFO] BookmarksSnapshot Startup total=0 bar=0 other=0 mobile=0 showBar=0 showBarNTP=1
+2026-10-06 13:24:49.597: [INFO] BookmarksSnapshot Shutdown total=0 bar=0 other=0 mobile=0 showBar=0 showBarNTP=1
+2026-10-06 13:25:36.182: [INFO] CurrentProfilePath: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-06 13:25:36.182: [INFO] Profiles total count: 1
+2026-10-06 13:25:36.182: [INFO] Profile: name=Profile 1 path=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default lastActive=2026-10-06T13:23:56.710Z
+2026-10-06 13:25:36.182: [INFO] LastUsedProfileDir: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-06 13:25:36.182: [INFO] MostRecentlyActiveProfile: name=Profile 1 path=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default lastActive=2026-10-06T13:23:56.710Z
+2026-10-06 13:25:36.183: [INFO] OnDoneLoading sync enabled: 0
+2026-10-06 13:25:36.183: [INFO] BookmarkModelLoaded, ids_reassigned: 0
+2026-10-06 13:25:36.183: [INFO] BookmarksLoadDropped droppedNodes=0
+2026-10-06 13:25:36.183: [INFO] BookmarksSnapshot Startup total=0 bar=0 other=0 mobile=0 showBar=0 showBarNTP=1

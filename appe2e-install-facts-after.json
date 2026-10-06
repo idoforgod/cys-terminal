@@ -1,0 +1,193 @@
+{
+    "tag":  "upgrade-after",
+    "time":  "2026-10-06T13:26:40.111Z",
+    "install_dir":  "C:\\Users\\runneradmin\\AppData\\Local\\cys",
+    "install_dir_exists":  true,
+    "marker":  "0.14.44",
+    "failure_file_present":  false,
+    "uninstall":  {
+                      "hkcu_entry_found":  true,
+                      "display_version":  "0.14.44",
+                      "entries":  [
+                                      {
+                                          "hive":  "HKCU",
+                                          "root":  "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                                          "key":  "cys",
+                                          "DisplayName":  "cys",
+                                          "DisplayVersion":  "0.14.44",
+                                          "UninstallString":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\uninstall.exe\"",
+                                          "InstallLocation":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\"",
+                                          "Publisher":  "cysjavis",
+                                          "DisplayIcon":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe\"",
+                                          "EstimatedSize":  671322
+                                      }
+                                  ]
+                  },
+    "shortcuts":  {
+                      "start_menu_present":  true,
+                      "desktop_present":  true,
+                      "start_menu":  [
+                                         {
+                                             "path":  "C:\\Users\\runneradmin\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\cys.lnk",
+                                             "target":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe"
+                                         }
+                                     ],
+                      "desktop":  [
+                                      {
+                                          "path":  "C:\\Users\\runneradmin\\Desktop\\cys.lnk",
+                                          "target":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe"
+                                      }
+                                  ]
+                  },
+    "files":  {
+                  "count":  11810,
+                  "bytes":  694276188,
+                  "ms":  180,
+                  "via":  "DirectoryInfo.EnumerateFiles",
+                  "error":  null,
+                  "top_level":  [
+                                    "analytics.db",
+                                    "analytics.db-shm",
+                                    "analytics.db-wal",
+                                    "approval-lane",
+                                    "boot-epoch",
+                                    "channels.db",
+                                    "channels.db-shm",
+                                    "channels.db-wal",
+                                    "cys.exe",
+                                    "cys-app.exe",
+                                    "cysd.exe",
+                                    "cys-installed-version.txt",
+                                    "event.seq",
+                                    "office-bridge\\",
+                                    "office-bridge.log",
+                                    "operator.token",
+                                    "pack.tar.gz",
+                                    "pack-manifest.json",
+                                    "phoenix\\",
+                                    "phoenix-embed\\",
+                                    "phoenix-restore.log",
+                                    "queue-blocked.json",
+                                    "runtime\\",
+                                    "runtime-manifest.json",
+                                    "schedule_state.json",
+                                    "transcripts.db",
+                                    "transcripts.db-shm",
+                                    "transcripts.db-wal",
+                                    "uninstall.exe"
+                                ]
+              },
+    "core":  {
+                 "cys-app.exe":  {
+                                     "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe",
+                                     "exists":  true,
+                                     "size":  16893440,
+                                     "file_version":  "0.14.44",
+                                     "product_version":  "0.14.44",
+                                     "version3":  "0.14.44",
+                                     "sha256":  "842c3cc45439f5326972b5ccd2df768a5f48588c1a4b0fc7962e648242d3385c"
+                                 },
+                 "cys.exe":  {
+                                 "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                                 "exists":  true,
+                                 "size":  31008256,
+                                 "file_version":  "0.14.44",
+                                 "product_version":  "0.14.44",
+                                 "version3":  "0.14.44",
+                                 "sha256":  "427649e5c78e8e27874f9f9dd66d3ed1f9f3ce23b2d6c909c6c78b74e9b6f5b9"
+                             },
+                 "cysd.exe":  {
+                                  "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                  "exists":  true,
+                                  "size":  45822976,
+                                  "file_version":  "0.14.44",
+                                  "product_version":  "0.14.44",
+                                  "version3":  "0.14.44",
+                                  "sha256":  "0bf44bce1e1c7bf5cab2bf868f646bc23dea8600201a11a18668cafe5d8b5e62"
+                              }
+             },
+    "cli":  {
+                "cys.exe":  {
+                                "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                                "ran":  true,
+                                "skipped":  null,
+                                "rc":  0,
+                                "timed_out":  false,
+                                "start_error":  null,
+                                "ms":  51,
+                                "out":  "cys 0.14.44",
+                                "err":  ""
+                            },
+                "cysd.exe":  {
+                                 "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                 "ran":  true,
+                                 "skipped":  null,
+                                 "rc":  0,
+                                 "timed_out":  false,
+                                 "start_error":  null,
+                                 "ms":  36,
+                                 "out":  "cysd 0.14.44 (build 1b09395e9251)",
+                                 "err":  ""
+                             }
+            },
+    "bundled":  [
+                    {
+                        "rel":  "runtime\\git\\bin\\bash.exe",
+                        "exists":  true,
+                        "size":  47464,
+                        "version_rc":  0,
+                        "version_out":  "GNU bash, version 5.3.15(1)-release (x86_64-pc-cygwin)",
+                        "version_timed_out":  false,
+                        "version_ms":  90
+                    },
+                    {
+                        "rel":  "runtime\\git\\usr\\bin\\bash.exe",
+                        "exists":  true,
+                        "size":  2456832,
+                        "version_rc":  null,
+                        "version_out":  null,
+                        "version_timed_out":  null,
+                        "version_ms":  null
+                    },
+                    {
+                        "rel":  "runtime\\git\\cmd\\git.exe",
+                        "exists":  true,
+                        "size":  46936,
+                        "version_rc":  null,
+                        "version_out":  null,
+                        "version_timed_out":  null,
+                        "version_ms":  null
+                    },
+                    {
+                        "rel":  "runtime\\python\\python3.exe",
+                        "exists":  true,
+                        "size":  104952,
+                        "version_rc":  0,
+                        "version_out":  "Python 3.12.10",
+                        "version_timed_out":  false,
+                        "version_ms":  35
+                    },
+                    {
+                        "rel":  "runtime\\python\\python.exe",
+                        "exists":  true,
+                        "size":  104952,
+                        "version_rc":  null,
+                        "version_out":  null,
+                        "version_timed_out":  null,
+                        "version_ms":  null
+                    },
+                    {
+                        "rel":  "runtime\\node\\node.exe",
+                        "exists":  true,
+                        "size":  85193344,
+                        "version_rc":  null,
+                        "version_out":  null,
+                        "version_timed_out":  null,
+                        "version_ms":  null
+                    }
+                ],
+    "ms":  1297,
+    "errors":  [
+
+               ]
+}

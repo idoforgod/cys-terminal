@@ -1,0 +1,490 @@
+### C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal  (newest 300 files)
+2026-10-06T13:25:46.952Z             0  \EBWebView\Default\History-journal
+2026-10-06T13:25:46.915Z        212992  \EBWebView\Default\History
+2026-10-06T13:25:46.426Z         26041  \EBWebView\Default\settings_diagnostic.log
+2026-10-06T13:25:46.250Z            40  \EBWebView\Default\Network\Sdch Dictionaries
+2026-10-06T13:25:46.211Z          8894  \EBWebView\Default\Preferences
+2026-10-06T13:25:46.176Z          9676  \EBWebView\Local State
+2026-10-06T13:25:46.176Z          9856  \EBWebView\Default\Secure Preferences
+2026-10-06T13:25:39.401Z          1873  \EBWebView\Default\favorites_diagnostic.log
+2026-10-06T13:25:39.288Z             0  \EBWebView\Default\Feature Engagement Tracker\EventDB\LOG
+2026-10-06T13:25:39.285Z             0  \EBWebView\Default\Feature Engagement Tracker\AvailabilityDB\LOG
+2026-10-06T13:25:39.266Z             0  \EBWebView\Default\BudgetDatabase\LOG
+2026-10-06T13:25:39.266Z             0  \EBWebView\Default\AutofillStrikeDatabase\LOG
+2026-10-06T13:25:39.264Z           621  \EBWebView\Default\EdgeSessions\SessionRestoreLog
+2026-10-06T13:25:39.199Z             0  \EBWebView\Default\AutofillAiModelCache\LOG
+2026-10-06T13:25:39.191Z             0  \EBWebView\Default\optimization_guide_hint_cache_store\LOG
+2026-10-06T13:25:39.082Z             6  \EBWebView\Default\BookmarkMergedSurfaceOrdering
+2026-10-06T13:25:39.082Z            32  \EBWebView\Default\DIPS-wal
+2026-10-06T13:25:38.818Z           429  \EBWebView\VariationsRuntimeSeedV2
+2026-10-06T13:25:37.460Z          1195  \EBWebView\VariationsSafeSeedV2
+2026-10-06T13:25:37.460Z            76  \EBWebView\VariationsSeedV2
+2026-10-06T13:25:36.788Z            30  \EBWebView\Default\Session Storage\000003.log
+2026-10-06T13:25:36.772Z           305  \EBWebView\Default\Session Storage\LOG
+2026-10-06T13:25:36.762Z            16  \EBWebView\Default\Session Storage\CURRENT
+2026-10-06T13:25:36.692Z             2  \EBWebView\Default\Network\SCT Auditing Pending Reports
+2026-10-06T13:25:36.676Z             0  \EBWebView\Default\Session Storage\LOCK
+2026-10-06T13:25:36.676Z            41  \EBWebView\Default\Session Storage\MANIFEST-000001
+2026-10-06T13:25:36.501Z           239  \EBWebView\Default\Code Cache\js\f99a136b2be9ee76_0
+2026-10-06T13:25:36.304Z           357  \EBWebView\Default\Local Storage\leveldb\LOG
+2026-10-06T13:25:36.210Z             0  \EBWebView\Default\shared_proto_db\LOG
+2026-10-06T13:25:36.208Z             0  \EBWebView\Default\commerce_subscription_db\LOG
+2026-10-06T13:25:36.206Z             0  \EBWebView\Default\LOG
+2026-10-06T13:25:36.206Z             0  \EBWebView\Default\shared_proto_db\metadata\LOG
+2026-10-06T13:25:36.202Z             0  \EBWebView\Default\discounts_db\LOG
+2026-10-06T13:25:36.202Z             0  \EBWebView\Default\discount_infos_db\LOG
+2026-10-06T13:25:36.200Z             0  \EBWebView\Default\parcel_tracking_db\LOG
+2026-10-06T13:25:36.198Z             0  \EBWebView\Default\Extension State\LOG
+2026-10-06T13:25:36.194Z             0  \EBWebView\Default\Sync Data\LevelDB\LOG
+2026-10-06T13:25:36.176Z             0  \EBWebView\Default\PersistentOriginTrials\LOG
+2026-10-06T13:25:36.172Z             0  \EBWebView\Default\ClientCertificates\LOG
+2026-10-06T13:25:36.166Z             0  \EBWebView\Default\Site Characteristics Database\LOG
+2026-10-06T13:25:36.128Z            13  \EBWebView\Last Version
+2026-10-06T13:25:36.126Z           288  \EBWebView\Crashpad\settings.dat
+2026-10-06T13:25:36.048Z            86  \EBWebView\Variations
+2026-10-06T13:25:36.038Z             0  \EBWebView\lockfile
+2026-10-06T13:24:49.871Z         36864  \EBWebView\Default\DIPS
+2026-10-06T13:24:49.752Z        270336  \EBWebView\ShaderCache\data_1
+2026-10-06T13:24:49.748Z        270336  \EBWebView\GrShaderCache\data_1
+2026-10-06T13:24:49.639Z           111  \EBWebView\Default\Network\Network Persistent State
+2026-10-06T13:24:49.601Z        270336  \EBWebView\Default\Cache\Cache_Data\data_1
+2026-10-06T13:24:49.599Z          8192  \EBWebView\Default\Cache\Cache_Data\data_3
+2026-10-06T13:24:49.594Z          8192  \EBWebView\Default\Cache\Cache_Data\data_2
+2026-10-06T13:24:49.594Z          8192  \EBWebView\Default\Cache\Cache_Data\data_0
+2026-10-06T13:24:49.594Z        270336  \EBWebView\Default\DawnGraphiteCache\data_1
+2026-10-06T13:24:49.594Z        270336  \EBWebView\Default\GPUCache\data_1
+2026-10-06T13:24:49.594Z        270336  \EBWebView\Default\DawnWebGPUCache\data_1
+2026-10-06T13:24:49.586Z        524656  \EBWebView\Default\Cache\Cache_Data\index
+2026-10-06T13:24:49.577Z           112  \EBWebView\Default\Site Characteristics Database\000003.log
+2026-10-06T13:24:29.457Z           345  \EBWebView\Default\Local Storage\leveldb\000003.log
+2026-10-06T13:24:19.861Z            13  \EBWebView\extensions_crx_cache\metadata.json
+2026-10-06T13:24:18.543Z            72  \EBWebView\Default\Code Cache\js\index-dir\the-real-index
+2026-10-06T13:23:56.650Z          5472  \EBWebView\Default\shared_proto_db\000003.log
+2026-10-06T13:23:56.635Z           818  \EBWebView\Default\shared_proto_db\metadata\000003.log
+2026-10-06T13:23:56.608Z             0  \EBWebView\Default\Feature Engagement Tracker\EventDB\LOCK
+2026-10-06T13:23:56.603Z             0  \EBWebView\Default\Feature Engagement Tracker\AvailabilityDB\LOCK
+2026-10-06T13:23:56.603Z             0  \EBWebView\Default\Feature Engagement Tracker\EventDB\LOG.old
+2026-10-06T13:23:56.603Z             0  \EBWebView\Default\Feature Engagement Tracker\AvailabilityDB\LOG.old
+2026-10-06T13:23:56.578Z             0  \EBWebView\Default\AutofillStrikeDatabase\LOG.old
+2026-10-06T13:23:56.578Z             0  \EBWebView\Default\BudgetDatabase\LOG.old
+2026-10-06T13:23:56.578Z             0  \EBWebView\Default\AutofillStrikeDatabase\LOCK
+2026-10-06T13:23:56.578Z             0  \EBWebView\Default\BudgetDatabase\LOCK
+2026-10-06T13:23:56.574Z             0  \EBWebView\Default\AutofillAiModelCache\LOG.old
+2026-10-06T13:23:56.574Z             0  \EBWebView\Default\AutofillAiModelCache\LOCK
+2026-10-06T13:23:56.571Z             0  \EBWebView\Default\optimization_guide_hint_cache_store\LOG.old
+2026-10-06T13:23:56.571Z             0  \EBWebView\Default\optimization_guide_hint_cache_store\LOCK
+2026-10-06T13:23:56.524Z             0  \EBWebView\Default\Network Action Predictor-journal
+2026-10-06T13:23:56.524Z         53248  \EBWebView\Default\Network Action Predictor
+2026-10-06T13:23:56.492Z             0  \EBWebView\Default\Network\Cookies-journal
+2026-10-06T13:23:56.460Z         20480  \EBWebView\Default\Network\Cookies
+2026-10-06T13:23:56.333Z             0  \EBWebView\Default\ExtensionActivityEdge-journal
+2026-10-06T13:23:56.333Z         32768  \EBWebView\Default\ExtensionActivityEdge
+2026-10-06T13:23:56.305Z             0  \EBWebView\Default\declarative_performance_observer.db-journal
+2026-10-06T13:23:56.303Z             0  \EBWebView\Default\Network\Reporting and NEL-journal
+2026-10-06T13:23:55.624Z         32768  \EBWebView\Default\declarative_performance_observer.db
+2026-10-06T13:23:55.237Z         36864  \EBWebView\Default\Network\Reporting and NEL
+2026-10-06T13:23:53.443Z             0  \EBWebView\Default\Web Data-journal
+2026-10-06T13:23:53.119Z           114  \EBWebView\Default\Extension State\000003.log
+2026-10-06T13:23:53.111Z        262512  \EBWebView\Default\DawnGraphiteCache\index
+2026-10-06T13:23:53.111Z          8192  \EBWebView\Default\DawnGraphiteCache\data_3
+2026-10-06T13:23:53.111Z          8192  \EBWebView\Default\DawnGraphiteCache\data_2
+2026-10-06T13:23:53.111Z          8192  \EBWebView\Default\DawnGraphiteCache\data_0
+2026-10-06T13:23:53.111Z           305  \EBWebView\Default\Extension State\LOG.old
+2026-10-06T13:23:52.653Z            16  \EBWebView\Default\Extension State\CURRENT
+2026-10-06T13:23:52.401Z             0  \EBWebView\Default\Top Sites-journal
+2026-10-06T13:23:51.557Z          8192  \EBWebView\Default\DawnWebGPUCache\data_0
+2026-10-06T13:23:51.557Z          8192  \EBWebView\Default\DawnWebGPUCache\data_2
+2026-10-06T13:23:51.557Z          8192  \EBWebView\Default\DawnWebGPUCache\data_3
+2026-10-06T13:23:51.557Z        262512  \EBWebView\Default\DawnWebGPUCache\index
+2026-10-06T13:23:50.618Z           307  \EBWebView\Default\shared_proto_db\LOG.old
+2026-10-06T13:23:50.414Z            41  \EBWebView\Default\Extension State\MANIFEST-000001
+2026-10-06T13:23:50.414Z            38  \EBWebView\Default\Extension Scripts\000003.log
+2026-10-06T13:23:50.414Z             0  \EBWebView\Default\Extension State\LOCK
+2026-10-06T13:23:50.414Z            38  \EBWebView\Default\Extension Rules\000003.log
+2026-10-06T13:23:50.366Z          8192  \EBWebView\Default\GPUCache\data_3
+2026-10-06T13:23:50.366Z          8192  \EBWebView\Default\GPUCache\data_2
+2026-10-06T13:23:50.332Z           309  \EBWebView\Default\Extension Scripts\LOG
+2026-10-06T13:23:50.332Z           319  \EBWebView\Default\Local Storage\leveldb\LOG.old
+2026-10-06T13:23:50.316Z         20480  \EBWebView\Default\Top Sites
+2026-10-06T13:23:50.300Z            16  \EBWebView\Default\shared_proto_db\CURRENT
+2026-10-06T13:23:50.237Z        223232  \EBWebView\Default\Web Data
+2026-10-06T13:23:50.237Z          8192  \EBWebView\Default\GPUCache\data_0
+2026-10-06T13:23:50.237Z             0  \EBWebView\Default\Vpn Tokens-journal
+2026-10-06T13:23:50.214Z        262512  \EBWebView\Default\GPUCache\index
+2026-10-06T13:23:50.202Z            16  \EBWebView\Default\Extension Scripts\CURRENT
+2026-10-06T13:23:50.158Z            41  \EBWebView\Default\shared_proto_db\MANIFEST-000001
+2026-10-06T13:23:50.158Z         28672  \EBWebView\Default\Vpn Tokens
+2026-10-06T13:23:50.157Z             0  \EBWebView\Default\shared_proto_db\LOCK
+2026-10-06T13:23:50.154Z             0  \EBWebView\Default\Favicons-journal
+2026-10-06T13:23:49.795Z            13  \EBWebView\component_crx_cache\metadata.json
+2026-10-06T13:23:49.231Z            16  \EBWebView\Default\Local Storage\leveldb\CURRENT
+2026-10-06T13:23:49.231Z         20480  \EBWebView\Default\Favicons
+2026-10-06T13:23:48.814Z             0  \EBWebView\Default\Network\Trust Tokens-journal
+2026-10-06T13:23:48.785Z             0  \EBWebView\Default\Network\Device Bound Sessions-journal
+2026-10-06T13:23:48.143Z             0  \EBWebView\Default\Shared Dictionary\db-journal
+2026-10-06T13:23:47.841Z            41  \EBWebView\Default\Local Storage\leveldb\MANIFEST-000001
+2026-10-06T13:23:47.841Z           325  \EBWebView\Default\shared_proto_db\metadata\LOG.old
+2026-10-06T13:23:47.477Z             0  \EBWebView\Default\Local Storage\leveldb\LOCK
+2026-10-06T13:23:47.279Z         20480  \EBWebView\Default\Network\Device Bound Sessions
+2026-10-06T13:23:47.279Z         36864  \EBWebView\Default\Network\Trust Tokens
+2026-10-06T13:23:46.925Z         45056  \EBWebView\Default\Shared Dictionary\db
+2026-10-06T13:23:46.696Z             0  \EBWebView\Default\Extension Scripts\LOCK
+2026-10-06T13:23:46.696Z            41  \EBWebView\Default\Extension Scripts\MANIFEST-000001
+2026-10-06T13:23:46.684Z           335  \EBWebView\Default\Site Characteristics Database\LOG.old
+2026-10-06T13:23:46.684Z             0  \EBWebView\Default\Login Data-journal
+2026-10-06T13:23:46.669Z            16  \EBWebView\Default\shared_proto_db\metadata\CURRENT
+2026-10-06T13:23:46.621Z             0  \EBWebView\Default\parcel_tracking_db\LOCK
+2026-10-06T13:23:45.224Z            16  \EBWebView\Default\Site Characteristics Database\CURRENT
+2026-10-06T13:23:45.224Z            41  \EBWebView\Default\shared_proto_db\metadata\MANIFEST-000001
+2026-10-06T13:23:45.224Z         43008  \EBWebView\Default\Login Data
+2026-10-06T13:23:45.224Z             0  \EBWebView\Default\parcel_tracking_db\LOG.old
+2026-10-06T13:23:43.341Z          8192  \EBWebView\GrShaderCache\data_2
+2026-10-06T13:23:43.341Z             0  \EBWebView\Default\ServerCertificate-journal
+2026-10-06T13:23:43.341Z          8192  \EBWebView\GrShaderCache\data_0
+2026-10-06T13:23:43.341Z            65  \EBWebView\Default\Sync Data\LevelDB\000003.log
+2026-10-06T13:23:43.341Z          8192  \EBWebView\GrShaderCache\data_3
+2026-10-06T13:23:43.341Z             0  \EBWebView\Default\shared_proto_db\metadata\LOCK
+2026-10-06T13:23:41.767Z            48  \EBWebView\Default\Shared Dictionary\cache\index-dir\the-real-index
+2026-10-06T13:23:41.767Z           305  \EBWebView\Default\Extension Rules\LOG
+2026-10-06T13:23:41.742Z         20480  \EBWebView\Default\ServerCertificate
+2026-10-06T13:23:41.742Z        262512  \EBWebView\GrShaderCache\index
+2026-10-06T13:23:41.742Z           309  \EBWebView\Default\Sync Data\LevelDB\LOG.old
+2026-10-06T13:23:41.690Z            41  \EBWebView\Default\Site Characteristics Database\MANIFEST-000001
+2026-10-06T13:23:41.672Z             0  \EBWebView\Default\LOG.old
+2026-10-06T13:23:41.672Z             0  \EBWebView\Default\LOCK
+2026-10-06T13:23:41.672Z             0  \EBWebView\Default\commerce_subscription_db\LOCK
+2026-10-06T13:23:41.672Z            48  \EBWebView\Default\Code Cache\wasm\index-dir\the-real-index
+2026-10-06T13:23:41.672Z             0  \EBWebView\Default\commerce_subscription_db\LOG.old
+2026-10-06T13:23:41.656Z             0  \EBWebView\Default\Login Data For Account-journal
+2026-10-06T13:23:41.656Z             0  \EBWebView\Default\discount_infos_db\LOCK
+2026-10-06T13:23:41.656Z             0  \EBWebView\Default\discounts_db\LOCK
+2026-10-06T13:23:40.736Z            16  \EBWebView\Default\Extension Rules\CURRENT
+2026-10-06T13:23:40.736Z            24  \EBWebView\Default\Code Cache\wasm\index
+2026-10-06T13:23:40.736Z             0  \EBWebView\Default\discount_infos_db\LOG.old
+2026-10-06T13:23:40.736Z             0  \EBWebView\Default\discounts_db\LOG.old
+2026-10-06T13:23:39.964Z            24  \EBWebView\Default\Code Cache\js\index
+2026-10-06T13:23:39.964Z         43008  \EBWebView\Default\Login Data For Account
+2026-10-06T13:23:39.919Z            41  \EBWebView\Default\Extension Rules\MANIFEST-000001
+2026-10-06T13:23:39.917Z            24  \EBWebView\Default\Shared Dictionary\cache\index
+2026-10-06T13:23:39.891Z             0  \EBWebView\Default\Extension Rules\LOCK
+2026-10-06T13:23:39.881Z            16  \EBWebView\Default\Sync Data\LevelDB\CURRENT
+2026-10-06T13:23:39.840Z             0  \EBWebView\Default\Site Characteristics Database\LOCK
+2026-10-06T13:23:39.840Z             0  \EBWebView\Default\PersistentOriginTrials\LOCK
+2026-10-06T13:23:39.838Z             0  \EBWebView\Default\ClientCertificates\LOCK
+2026-10-06T13:23:39.838Z             0  \EBWebView\Default\PersistentOriginTrials\LOG.old
+2026-10-06T13:23:39.838Z             0  \EBWebView\Default\ClientCertificates\LOG.old
+2026-10-06T13:23:39.836Z            41  \EBWebView\Default\Sync Data\LevelDB\MANIFEST-000001
+2026-10-06T13:23:39.836Z             0  \EBWebView\Default\Sync Data\LevelDB\LOCK
+2026-10-06T13:23:39.834Z             0  \EBWebView\Default\Network\NetworkDataMigrated
+2026-10-06T13:23:39.811Z          8192  \EBWebView\ShaderCache\data_2
+2026-10-06T13:23:39.811Z          8192  \EBWebView\ShaderCache\data_3
+2026-10-06T13:23:39.806Z        262512  \EBWebView\ShaderCache\index
+2026-10-06T13:23:39.806Z          8192  \EBWebView\ShaderCache\data_0
+2026-10-06T13:23:39.788Z           182  \EBWebView\Default\README
+2026-10-06T13:23:39.786Z             0  \EBWebView\GPUPersistentCache\DawnGraphiteCache\TLVJWQT6NJWKNBUVMWJ4BCR6DK7MJALX\cache.db-wal
+2026-10-06T13:23:39.786Z             0  \EBWebView\GPUPersistentCache\DawnGraphiteCache\TLVJWQT6NJWKNBUVMWJ4BCR6DK7MJALX\cache.db
+2026-10-06T13:23:39.786Z             0  \EBWebView\GPUPersistentCache\DawnGraphiteCache\TLVJWQT6NJWKNBUVMWJ4BCR6DK7MJALX\cache.journal
+2026-10-06T13:23:39.710Z             0  \EBWebView\Crashpad\metadata
+2026-10-06T13:23:39.689Z            20  \EBWebView\Crashpad\throttle_store.dat
+2024-11-06T21:07:28.000Z            43  \EBWebView\OriginTrials\0.0.1.7\manifest.json
+### C:\Users\runneradmin\AppData\Local\cys  (newest 300 files)
+2026-10-06T13:26:12.766Z           601  \office-bridge.log
+2026-10-06T13:26:12.756Z             4  \office-bridge\cursor-main.seq
+2026-10-06T13:26:11.455Z           664  \office-bridge\fx_archive.jsonl
+2026-10-06T13:26:09.426Z           542  \schedule_state.json
+2026-10-06T13:25:44.626Z           107  \queue-blocked.json
+2026-10-06T13:25:42.068Z         10161  \phoenix-restore.log
+2026-10-06T13:25:42.036Z            32  \office-bridge\token
+2026-10-06T13:25:39.763Z         87781  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\skillscan_rules.json
+2026-10-06T13:25:39.761Z          1960  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\route_triggers.json
+2026-10-06T13:25:39.761Z          7386  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_waiver.py
+2026-10-06T13:25:39.761Z         45665  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_wakeup.py
+2026-10-06T13:25:39.761Z         26341  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\rsi-gate.sh
+2026-10-06T13:25:39.759Z         50273  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_txindex.py
+2026-10-06T13:25:39.759Z         20135  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_verdict.py
+2026-10-06T13:25:39.759Z         21988  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_viberoute.py
+2026-10-06T13:25:39.759Z         30349  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_vibecheck.py
+2026-10-06T13:25:39.752Z         44828  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_snapshot.py
+2026-10-06T13:25:39.752Z         31604  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_todo_stamp.py
+2026-10-06T13:25:39.752Z         50670  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_skillscan.py
+2026-10-06T13:25:39.752Z        109612  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_teamtoken.py
+2026-10-06T13:25:39.752Z        178328  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_task.py
+2026-10-06T13:25:39.752Z         36141  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_todo_decl.py
+2026-10-06T13:25:39.752Z         19389  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_timeline.py
+2026-10-06T13:25:39.752Z          7653  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_transcript_stats.py
+2026-10-06T13:25:39.752Z         28904  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_state_ledger.py
+2026-10-06T13:25:39.752Z         35753  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_state_snapshot.py
+2026-10-06T13:25:39.752Z          9532  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_state_rotate.py
+2026-10-06T13:25:39.750Z         10348  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_session.py
+2026-10-06T13:25:39.746Z         14062  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_serena_eval.py
+2026-10-06T13:25:39.746Z         43967  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_select.py
+2026-10-06T13:25:39.746Z         14671  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_semver.py
+2026-10-06T13:25:39.746Z          7982  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_serena_probe.py
+2026-10-06T13:25:39.744Z         15813  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_runtime_seal.py
+2026-10-06T13:25:39.744Z         18701  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_route.py
+2026-10-06T13:25:39.744Z         77430  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_rsi.py
+2026-10-06T13:25:39.744Z          4165  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_scrub.py
+2026-10-06T13:25:39.742Z        270583  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_resource_gate.py
+2026-10-06T13:25:39.742Z         56076  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_role.py
+2026-10-06T13:25:39.742Z          4951  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_retry.py
+2026-10-06T13:25:39.740Z        144048  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_report_gate.py
+2026-10-06T13:25:39.737Z          3521  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_replay.py
+2026-10-06T13:25:39.737Z         29021  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_registry.py
+2026-10-06T13:25:39.737Z         75409  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_report.py
+2026-10-06T13:25:39.737Z         14763  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_reflect.py
+2026-10-06T13:25:39.736Z         22050  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_reap_exited.py
+2026-10-06T13:25:39.720Z        170928  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_radio.py
+2026-10-06T13:25:39.706Z          5517  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_purge_verify.py
+2026-10-06T13:25:39.705Z          1923  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_prod_deny_e2e.sh
+2026-10-06T13:25:39.705Z         10872  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_purge_e2e.sh
+2026-10-06T13:25:39.700Z          7836  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_prereg.py
+2026-10-06T13:25:39.699Z        707300  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_preflight.py
+2026-10-06T13:25:39.697Z         34020  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_phoenix_win_smoke.py
+2026-10-06T13:25:39.696Z        116391  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_phoenix_harness.py
+2026-10-06T13:25:39.695Z        266370  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_phoenix.py
+2026-10-06T13:25:39.693Z         16960  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_params.py
+2026-10-06T13:25:39.692Z          4494  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_org_e2e.sh
+2026-10-06T13:25:39.692Z         10347  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_orient_log.py
+2026-10-06T13:25:39.691Z         73942  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_org.py
+2026-10-06T13:25:39.690Z        405014  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_orchestra.py
+2026-10-06T13:25:39.685Z        313354  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_mission.py
+2026-10-06T13:25:39.684Z          9079  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_memory_inject.py
+2026-10-06T13:25:39.684Z          7072  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_merge_check.py
+2026-10-06T13:25:39.683Z         50959  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_memory.py
+2026-10-06T13:25:39.682Z         14896  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_mcpgate.py
+2026-10-06T13:25:39.682Z         40798  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_manifest.py
+2026-10-06T13:25:39.681Z         77218  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_learn.py
+2026-10-06T13:25:39.681Z         19771  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_lock.py
+2026-10-06T13:25:39.680Z         18056  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_idle_audit.py
+2026-10-06T13:25:39.680Z         18822  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_lane.py
+2026-10-06T13:25:39.679Z        107444  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_hud_bridge.py
+2026-10-06T13:25:39.679Z         27347  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_idempotency.py
+2026-10-06T13:25:39.678Z          8393  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_handoff_fallback.py
+2026-10-06T13:25:39.676Z          4666  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_gate_check.py
+2026-10-06T13:25:39.676Z         88121  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_guard_register.py
+2026-10-06T13:25:39.662Z         18808  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_fleet_report.py
+2026-10-06T13:25:39.662Z        128786  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_formation.py
+2026-10-06T13:25:39.612Z         15079  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_event.py
+2026-10-06T13:25:39.612Z         30275  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_distill.py
+2026-10-06T13:25:39.612Z         10500  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_directive_bench.py
+2026-10-06T13:25:39.612Z         70364  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_detect.py
+2026-10-06T13:25:39.612Z         12159  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_docsdiff.py
+2026-10-06T13:25:39.612Z          9857  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_factcheck_gate.py
+2026-10-06T13:25:39.612Z          4651  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_evidence_manifest.py
+2026-10-06T13:25:39.605Z         40365  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_compete.py
+2026-10-06T13:25:39.605Z        166692  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_completion_guard.py
+2026-10-06T13:25:39.605Z         10485  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_cli_probe.py
+2026-10-06T13:25:39.605Z          5235  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_checklist.py
+2026-10-06T13:25:39.605Z         23272  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_cleanroom.py
+2026-10-06T13:25:39.605Z        234377  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_cycle_autopilot.py
+2026-10-06T13:25:39.605Z         19203  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_dept_migrate.py
+2026-10-06T13:25:39.605Z          6032  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_dept_schedule.py
+2026-10-06T13:25:39.605Z         68502  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_cycle_verifier.py
+2026-10-06T13:25:39.605Z          7633  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_decision.py
+2026-10-06T13:25:39.475Z        229845  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_approval_queue.py
+2026-10-06T13:25:39.475Z         30473  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_adr.py
+2026-10-06T13:25:39.475Z          6064  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_board_catalog.py
+2026-10-06T13:25:39.475Z         22742  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_backup.py
+2026-10-06T13:25:39.475Z        251672  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\cys-dept
+2026-10-06T13:25:39.475Z         41685  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\check_timeline.py
+2026-10-06T13:25:39.475Z         28982  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_actprobe.py
+2026-10-06T13:25:39.475Z         37077  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\grill_gate.py
+2026-10-06T13:25:39.475Z         35136  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_budget.py
+2026-10-06T13:25:39.475Z         11508  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_channels.py
+2026-10-06T13:25:39.475Z         10807  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_channel_watch.py
+2026-10-06T13:25:39.475Z         17794  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_brief_lint.py
+2026-10-06T13:25:39.475Z        326711  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_bootstrap.py
+2026-10-06T13:25:39.475Z         86362  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_boot_node.py
+2026-10-06T13:25:39.475Z         10006  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\javis_briefing.py
+2026-10-06T13:25:39.444Z          7841  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\check_entity_registry.py
+2026-10-06T13:25:39.444Z         12193  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\caption_shape.py
+2026-10-06T13:25:39.444Z          4730  \phoenix-embed\0.14.44-10548-1791293139441802300\bin\check_manifest.py
+2026-10-06T13:25:39.429Z             3  \event.seq
+2026-10-06T13:25:39.262Z            19  \boot-epoch
+2026-10-06T13:25:39.160Z         32768  \transcripts.db-shm
+2026-10-06T13:25:39.160Z            32  \approval-lane
+2026-10-06T13:25:39.151Z             0  \transcripts.db-wal
+2026-10-06T13:25:39.036Z         28672  \transcripts.db
+2026-10-06T13:25:39.012Z         32768  \channels.db-shm
+2026-10-06T13:25:38.996Z         32768  \analytics.db-shm
+2026-10-06T13:25:38.986Z            64  \operator.token
+2026-10-06T13:25:33.767Z             7  \cys-installed-version.txt
+2026-10-06T13:25:32.957Z        168920  \uninstall.exe
+2026-10-06T13:24:24.959Z             0  \phoenix\roster.lock
+2026-10-06T13:24:24.817Z             0  \phoenix\restore.run.lock
+2026-10-06T13:24:24.817Z             0  \phoenix\restore.lease
+2026-10-06T13:24:24.676Z           233  \phoenix\journal-resolve.json
+2026-10-06T13:24:23.430Z        152472  \channels.db-wal
+2026-10-06T13:24:22.768Z          4096  \channels.db
+2026-10-06T13:24:22.618Z        177192  \analytics.db-wal
+2026-10-06T13:24:22.296Z          4096  \analytics.db
+2026-10-06T12:35:54.000Z      16893440  \cys-app.exe
+2026-10-06T12:34:18.000Z         53089  \pack-manifest.json
+2026-10-06T12:34:18.000Z       3391491  \pack.tar.gz
+2026-10-06T12:34:16.000Z      31008256  \cys.exe
+2026-10-06T12:34:16.000Z      45822976  \cysd.exe
+2026-10-06T12:32:42.000Z       1737729  \runtime-manifest.json
+2026-10-06T12:32:36.000Z           419  \runtime\LICENSES\BUNDLED-RUNTIMES.txt
+2026-10-06T12:32:34.000Z          3301  \runtime\python\Lib\site-packages\pip\_vendor\resolvelib\__pycache__\reporters.cpython-312.pyc
+2026-10-06T12:32:34.000Z         12456  \runtime\python\Lib\site-packages\pip\_vendor\resolvelib\__pycache__\structs.cpython-312.pyc
+2026-10-06T12:32:34.000Z           646  \runtime\python\Lib\site-packages\pip\_vendor\resolvelib\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         25157  \runtime\python\Lib\site-packages\pip\_vendor\resolvelib\resolvers\__pycache__\resolution.cpython-312.pyc
+2026-10-06T12:32:34.000Z           751  \runtime\python\Lib\site-packages\pip\_vendor\resolvelib\resolvers\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         10137  \runtime\python\Lib\site-packages\pip\_vendor\resolvelib\__pycache__\providers.cpython-312.pyc
+2026-10-06T12:32:34.000Z          4284  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\bar.cpython-312.pyc
+2026-10-06T12:32:34.000Z         11703  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\box.cpython-312.pyc
+2026-10-06T12:32:34.000Z          5572  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\cells.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1620  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\abc.cpython-312.pyc
+2026-10-06T12:32:34.000Z         12256  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\align.cpython-312.pyc
+2026-10-06T12:32:34.000Z          9093  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\ansi.cpython-312.pyc
+2026-10-06T12:32:34.000Z          7297  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\structures.cpython-312.pyc
+2026-10-06T12:32:34.000Z         40053  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\utils.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2140  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\_internal_utils.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1278  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\packages.cpython-312.pyc
+2026-10-06T12:32:34.000Z         31920  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\sessions.cpython-312.pyc
+2026-10-06T12:32:34.000Z          6152  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\status_codes.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2457  \runtime\python\Lib\site-packages\pip\_vendor\resolvelib\resolvers\__pycache__\abstract.cpython-312.pyc
+2026-10-06T12:32:34.000Z          3288  \runtime\python\Lib\site-packages\pip\_vendor\resolvelib\resolvers\__pycache__\criterion.cpython-312.pyc
+2026-10-06T12:32:34.000Z          4095  \runtime\python\Lib\site-packages\pip\_vendor\resolvelib\resolvers\__pycache__\exceptions.cpython-312.pyc
+2026-10-06T12:32:34.000Z          7278  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\_types.cpython-312.pyc
+2026-10-06T12:32:34.000Z          5626  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z           596  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\__version__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         26564  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\color.cpython-312.pyc
+2026-10-06T12:32:34.000Z         20170  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\layout.cpython-312.pyc
+2026-10-06T12:32:34.000Z         20005  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\live.cpython-312.pyc
+2026-10-06T12:32:34.000Z          4757  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\live_render.cpython-312.pyc
+2026-10-06T12:32:34.000Z          9900  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\highlighter.cpython-312.pyc
+2026-10-06T12:32:34.000Z          6047  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\json.cpython-312.pyc
+2026-10-06T12:32:34.000Z          5220  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\jupyter.cpython-312.pyc
+2026-10-06T12:32:34.000Z          6945  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\padding.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1823  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\pager.cpython-312.pyc
+2026-10-06T12:32:34.000Z          5309  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\palette.cpython-312.pyc
+2026-10-06T12:32:34.000Z         14086  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\logging.cpython-312.pyc
+2026-10-06T12:32:34.000Z          9579  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\markup.cpython-312.pyc
+2026-10-06T12:32:34.000Z          6390  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\measure.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2270  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\constrain.cpython-312.pyc
+2026-10-06T12:32:34.000Z          9222  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\containers.cpython-312.pyc
+2026-10-06T12:32:34.000Z         10808  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\control.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1713  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\color_triplet.cpython-312.pyc
+2026-10-06T12:32:34.000Z          8596  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\columns.cpython-312.pyc
+2026-10-06T12:32:34.000Z        115054  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\console.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1857  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\errors.cpython-312.pyc
+2026-10-06T12:32:34.000Z          3059  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\filesize.cpython-312.pyc
+2026-10-06T12:32:34.000Z          3583  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\file_proxy.cpython-312.pyc
+2026-10-06T12:32:34.000Z         10533  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\default_styles.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1533  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\diagnose.cpython-312.pyc
+2026-10-06T12:32:34.000Z          4093  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\emoji.cpython-312.pyc
+2026-10-06T12:32:34.000Z         43332  \runtime\python\Lib\site-packages\pip\_vendor\pygments\lexers\__pycache__\python.cpython-312.pyc
+2026-10-06T12:32:34.000Z         70142  \runtime\python\Lib\site-packages\pip\_vendor\pygments\lexers\__pycache__\_mapping.cpython-312.pyc
+2026-10-06T12:32:34.000Z         14636  \runtime\python\Lib\site-packages\pip\_vendor\pygments\lexers\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         37928  \runtime\python\Lib\site-packages\pip\_vendor\pygments\filters\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z          4227  \runtime\python\Lib\site-packages\pip\_vendor\pygments\formatters\__pycache__\_mapping.cpython-312.pyc
+2026-10-06T12:32:34.000Z          6917  \runtime\python\Lib\site-packages\pip\_vendor\pygments\formatters\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z          3236  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\filter.cpython-312.pyc
+2026-10-06T12:32:34.000Z          4735  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\formatter.cpython-312.pyc
+2026-10-06T12:32:34.000Z         38461  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\lexer.cpython-312.pyc
+2026-10-06T12:32:34.000Z          3660  \runtime\python\Lib\site-packages\pip\_vendor\pygments\styles\__pycache__\_mapping.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2679  \runtime\python\Lib\site-packages\pip\_vendor\pygments\styles\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2643  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\console.cpython-312.pyc
+2026-10-06T12:32:34.000Z         14012  \runtime\python\Lib\site-packages\pip\_vendor\platformdirs\__pycache__\android.cpython-312.pyc
+2026-10-06T12:32:34.000Z         20880  \runtime\python\Lib\site-packages\pip\_vendor\platformdirs\__pycache__\api.cpython-312.pyc
+2026-10-06T12:32:34.000Z         14398  \runtime\python\Lib\site-packages\pip\_vendor\platformdirs\__pycache__\macos.cpython-312.pyc
+2026-10-06T12:32:34.000Z        108371  \runtime\python\Scripts\pip3.exe
+2026-10-06T12:32:34.000Z         41810  \runtime\python\Lib\site-packages\pip\_vendor\packaging\__pycache__\version.cpython-312.pyc
+2026-10-06T12:32:34.000Z        161260  \runtime\python\Lib\site-packages\pip\_vendor\pkg_resources\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         13528  \runtime\python\Lib\site-packages\pip\_vendor\platformdirs\__pycache__\_xdg.cpython-312.pyc
+2026-10-06T12:32:34.000Z         29882  \runtime\python\Lib\site-packages\pip\_vendor\platformdirs\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2161  \runtime\python\Lib\site-packages\pip\_vendor\platformdirs\__pycache__\__main__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         19821  \runtime\python\Lib\site-packages\pip\_vendor\platformdirs\__pycache__\unix.cpython-312.pyc
+2026-10-06T12:32:34.000Z           661  \runtime\python\Lib\site-packages\pip\_vendor\platformdirs\__pycache__\version.cpython-312.pyc
+2026-10-06T12:32:34.000Z         21933  \runtime\python\Lib\site-packages\pip\_vendor\platformdirs\__pycache__\windows.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1574  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\modeline.cpython-312.pyc
+2026-10-06T12:32:34.000Z          8058  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\api.cpython-312.pyc
+2026-10-06T12:32:34.000Z         15798  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\auth.cpython-312.pyc
+2026-10-06T12:32:34.000Z           690  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\certs.cpython-312.pyc
+2026-10-06T12:32:34.000Z         18058  \runtime\python\Lib\site-packages\pip\_vendor\pyproject_hooks\__pycache__\_impl.cpython-312.pyc
+2026-10-06T12:32:34.000Z           759  \runtime\python\Lib\site-packages\pip\_vendor\pyproject_hooks\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         29707  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\adapters.cpython-312.pyc
+2026-10-06T12:32:34.000Z          4231  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\help.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1597  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\hooks.cpython-312.pyc
+2026-10-06T12:32:34.000Z         41994  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\models.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2062  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\compat.cpython-312.pyc
+2026-10-06T12:32:34.000Z         28377  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\cookies.cpython-312.pyc
+2026-10-06T12:32:34.000Z          7976  \runtime\python\Lib\site-packages\pip\_vendor\requests\__pycache__\exceptions.cpython-312.pyc
+2026-10-06T12:32:34.000Z         12113  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\sphinxext.cpython-312.pyc
+2026-10-06T12:32:34.000Z          6708  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\style.cpython-312.pyc
+2026-10-06T12:32:34.000Z          8204  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\token.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2701  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\plugin.cpython-312.pyc
+2026-10-06T12:32:34.000Z          4462  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\regexopt.cpython-312.pyc
+2026-10-06T12:32:34.000Z          4771  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\scanner.cpython-312.pyc
+2026-10-06T12:32:34.000Z           749  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\__main__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         15326  \runtime\python\Lib\site-packages\pip\_vendor\pyproject_hooks\_in_process\__pycache__\_in_process.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1088  \runtime\python\Lib\site-packages\pip\_vendor\pyproject_hooks\_in_process\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         32987  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\unistring.cpython-312.pyc
+2026-10-06T12:32:34.000Z         14089  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\util.cpython-312.pyc
+2026-10-06T12:32:34.000Z          3503  \runtime\python\Lib\site-packages\pip\_vendor\pygments\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z           210  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\contrib\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         16984  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\http2\__pycache__\connection.cpython-312.pyc
+2026-10-06T12:32:34.000Z          3674  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\http2\__pycache__\probe.cpython-312.pyc
+2026-10-06T12:32:34.000Z           987  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\contrib\emscripten\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         28266  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\contrib\__pycache__\pyopenssl.cpython-312.pyc
+2026-10-06T12:32:34.000Z          8188  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\contrib\__pycache__\socks.cpython-312.pyc
+2026-10-06T12:32:34.000Z          8151  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\request.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2894  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\response.cpython-312.pyc
+2026-10-06T12:32:34.000Z         21198  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\retry.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1763  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\http2\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z          4704  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\connection.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1235  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\proxy.cpython-312.pyc
+2026-10-06T12:32:34.000Z         18999  \runtime\python\Lib\site-packages\pip\_vendor\truststore\__pycache__\_macos.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2268  \runtime\python\Lib\site-packages\pip\_vendor\truststore\__pycache__\_openssl.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1111  \runtime\python\Lib\site-packages\pip\_vendor\truststore\__pycache__\_ssl_constants.cpython-312.pyc
+2026-10-06T12:32:34.000Z         10361  \runtime\python\Lib\site-packages\pip\_vendor\tomli_w\__pycache__\_writer.cpython-312.pyc
+2026-10-06T12:32:34.000Z           339  \runtime\python\Lib\site-packages\pip\_vendor\tomli_w\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         17544  \runtime\python\Lib\site-packages\pip\_vendor\truststore\__pycache__\_api.cpython-312.pyc
+2026-10-06T12:32:34.000Z         28656  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\contrib\emscripten\__pycache__\fetch.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1438  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\contrib\emscripten\__pycache__\request.cpython-312.pyc
+2026-10-06T12:32:34.000Z         12356  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\contrib\emscripten\__pycache__\response.cpython-312.pyc
+2026-10-06T12:32:34.000Z         15777  \runtime\python\Lib\site-packages\pip\_vendor\truststore\__pycache__\_windows.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1464  \runtime\python\Lib\site-packages\pip\_vendor\truststore\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         10399  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\contrib\emscripten\__pycache__\connection.cpython-312.pyc
+2026-10-06T12:32:34.000Z         13323  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\ssltransport.cpython-312.pyc
+2026-10-06T12:32:34.000Z         22748  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\_collections.cpython-312.pyc
+2026-10-06T12:32:34.000Z         10619  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\_request_methods.cpython-312.pyc
+2026-10-06T12:32:34.000Z           656  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\_version.cpython-312.pyc
+2026-10-06T12:32:34.000Z         24432  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\poolmanager.cpython-312.pyc
+2026-10-06T12:32:34.000Z         57524  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\response.cpython-312.pyc
+2026-10-06T12:32:34.000Z          6889  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\_base_connection.cpython-312.pyc
+2026-10-06T12:32:34.000Z             0  \runtime\python\Lib\site-packages\pip-26.2.1.dist-info\REQUESTED
+2026-10-06T12:32:34.000Z        108371  \runtime\python\Scripts\pip.exe
+2026-10-06T12:32:34.000Z        108371  \runtime\python\Scripts\pip3.12.exe
+2026-10-06T12:32:34.000Z          7327  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z             4  \runtime\python\Lib\site-packages\pip-26.2.1.dist-info\INSTALLER
+2026-10-06T12:32:34.000Z         68999  \runtime\python\Lib\site-packages\pip-26.2.1.dist-info\RECORD
+2026-10-06T12:32:34.000Z         16296  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\url.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2012  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\util.cpython-312.pyc
+2026-10-06T12:32:34.000Z          3458  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\wait.cpython-312.pyc
+2026-10-06T12:32:34.000Z         15676  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\ssl_.cpython-312.pyc
+2026-10-06T12:32:34.000Z          5412  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\ssl_match_hostname.cpython-312.pyc
+2026-10-06T12:32:34.000Z         11724  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\timeout.cpython-312.pyc
+2026-10-06T12:32:34.000Z         16621  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\exceptions.cpython-312.pyc
+2026-10-06T12:32:34.000Z         12010  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\fields.cpython-312.pyc
+2026-10-06T12:32:34.000Z          3496  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\filepost.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1023  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\util\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z         38909  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\connection.cpython-312.pyc
+2026-10-06T12:32:34.000Z         40111  \runtime\python\Lib\site-packages\pip\_vendor\urllib3\__pycache__\connectionpool.cpython-312.pyc
+2026-10-06T12:32:34.000Z           350  \runtime\python\Lib\site-packages\pip\_vendor\tomli\__pycache__\__init__.cpython-312.pyc
+2026-10-06T12:32:34.000Z          2151  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\styled.cpython-312.pyc
+2026-10-06T12:32:34.000Z         40975  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\syntax.cpython-312.pyc
+2026-10-06T12:32:34.000Z         43849  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\table.cpython-312.pyc
+2026-10-06T12:32:34.000Z          5935  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\spinner.cpython-312.pyc
+2026-10-06T12:32:34.000Z          6073  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\status.cpython-312.pyc
+2026-10-06T12:32:34.000Z         33429  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\style.cpython-312.pyc
+2026-10-06T12:32:34.000Z           326  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\themes.cpython-312.pyc
+2026-10-06T12:32:34.000Z         36185  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\traceback.cpython-312.pyc
+2026-10-06T12:32:34.000Z         11805  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\tree.cpython-312.pyc
+2026-10-06T12:32:34.000Z          3360  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\terminal_theme.cpython-312.pyc
+2026-10-06T12:32:34.000Z         61222  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\text.cpython-312.pyc
+2026-10-06T12:32:34.000Z          6339  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\theme.cpython-312.pyc
+2026-10-06T12:32:34.000Z         10389  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\progress_bar.cpython-312.pyc
+2026-10-06T12:32:34.000Z         16017  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\prompt.cpython-312.pyc
+2026-10-06T12:32:34.000Z          1804  \runtime\python\Lib\site-packages\pip\_vendor\rich\__pycache__\protocol.cpython-312.pyc
