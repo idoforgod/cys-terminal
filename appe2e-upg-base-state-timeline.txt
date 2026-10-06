@@ -1,0 +1,14 @@
+# base state: waiting (every 3 s, at most 120 s) for a cysd.exe of the install folder AND a committed pack (.pack-version); start 2026-10-06T05:25:55.793Z
+[   0s 2026-10-06T05:25:55.919Z] cysd=[pid 5688 (parent 10984, created 2026-10-06T05:25:53.961Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=52 version=
+[   3s 2026-10-06T05:25:59.024Z] cysd=[pid 5688 (parent 10984, created 2026-10-06T05:25:53.961Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=126 version=
+[   6s 2026-10-06T05:26:02.134Z] cysd=[pid 5688 (parent 10984, created 2026-10-06T05:25:53.961Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=208 version=
+[   9s 2026-10-06T05:26:05.321Z] cysd=[pid 5688 (parent 10984, created 2026-10-06T05:25:53.961Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=347 version=
+[  13s 2026-10-06T05:26:08.432Z] cysd=[pid 5688 (parent 10984, created 2026-10-06T05:25:53.961Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=579 version=
+[  16s 2026-10-06T05:26:11.559Z] cysd=[pid 5688 (parent 10984, created 2026-10-06T05:25:53.961Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=804 version=
+[  19s 2026-10-06T05:26:14.819Z] cysd=[pid 5688 (parent 10984, created 2026-10-06T05:25:53.961Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=942 version=0.14.43
+# end: a daemon runs and the pack is committed
+[settle +  0s 2026-10-06T05:26:15.797Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[.pack-staging-init-5064] gui-onboarded=none onboard-attempts=none busy=[cys.exe#5064 init-pack] missing=4
+[settle +  3s 2026-10-06T05:26:17.855Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[.pack-staging-init-5052] gui-onboarded=0.14.43 onboard-attempts=none busy=[cys.exe#5052 init-pack --no-install-hook] missing=3
+[settle +  5s 2026-10-06T05:26:19.903Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[.pack-staging-init-5052] gui-onboarded=0.14.43 onboard-attempts=none busy=[cys.exe#5052 init-pack --no-install-hook] missing=3
+[settle +  7s 2026-10-06T05:26:21.949Z] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[] gui-onboarded=0.14.43 onboard-attempts=none busy=[] missing=0
+# settled=True after +7 s; missing: 
