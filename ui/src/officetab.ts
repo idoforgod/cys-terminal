@@ -52,6 +52,8 @@ export interface OfficeCtx {
   repairing: boolean;
   /** 마지막 복구 시도의 결과 — none(시도 전) · failed(실패·상한) · blocked(원장 항목·팩 버전 불일치 — 앱이 손대지 않는 상태). */
   repairOutcome: "none" | "failed" | "blocked";
+  /** 윈도우인가 — 윈도우는 자동 복구(B6)가 꺼져 있어 자산이 없어도 0.14.43 처럼 화면을 싣는다(막지 않는다). 생략하면 맥·리눅스 규칙. */
+  isWindows?: boolean;
 }
 
 /** 화면이 아직 실리지 않았을 때의 확인 간격 — 3분 동안 3초, 그 뒤 15초(설계 B5). */
@@ -95,6 +97,8 @@ export function planOfficeTab(h: unknown, ctx: OfficeCtx): OfficePlan {
   if (ok) {
     // 브리지는 떠 있는데 화면 자산이 없다 — B6. 앱이 할 수 있는 일은 실행 방식(repair)이 정한다.
     const mode = hh.repair === "auto" || hh.repair === "button" ? hh.repair : "none";
+    // 윈도우(복구 방식 none): 앱이 고칠 수 없다. 0.14.43 은 /world 에 닿기만 하면 화면을 실었고 office-boot.js 만 없는 PC 도 정상으로 떴다 — 막다른 안내로 바꾸지 않는다(리뷰 M2).
+    if (ctx.isWindows === true && mode === "none") return { stage: "loaded", text: "", buttonLabel: "", autoRepair: false, loadFrame: true, nextPollMs: 0 };
     if (ctx.repairing) return { stage: "repairing", text: OFFICE_TEXT_REPAIRING, buttonLabel: "", autoRepair: false, loadFrame: false, nextPollMs: OFFICE_POLL_FAST_MS };
     if (ctx.repairOutcome === "blocked" || mode === "none")
       return { stage: "assets_none", text: OFFICE_TEXT_ASSETS_NONE, buttonLabel: "", autoRepair: false, loadFrame: false, nextPollMs: poll };

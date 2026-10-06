@@ -80,6 +80,24 @@ describe("planOfficeTab — 화면 자산이 없을 때(B6)", () => {
       expect({ stage: p.stage, text: p.text, btn: p.buttonLabel, auto: p.autoRepair }).toEqual({ stage: "assets_none", text: OFFICE_TEXT_ASSETS_NONE, btn: "", auto: false });
     }
   });
+  it("OS 별 표(리뷰 M2): 자산이 없을 때 윈도우는 화면을 싣고(0.14.43 과 같다) 맥은 설계대로 복구/안내", () => {
+    const rows: Array<[boolean, string, "none" | "failed" | "blocked", boolean, string]> = [
+      // [윈도우?, repair, outcome, 화면 싣나, stage]
+      [true, "none", "none", true, "loaded"],
+      [true, "weird", "none", true, "loaded"],
+      [true, "button", "none", false, "assets_button"], // 윈도우 단추가 결재로 켜진 경우는 단추
+      [false, "auto", "none", false, "repairing"],
+      [false, "auto", "blocked", false, "assets_none"],
+      [false, "button", "none", false, "assets_button"],
+      [false, "none", "none", false, "assets_none"],
+    ];
+    for (const [win, repair, outcome, load, stage] of rows) {
+      const p = planOfficeTab(noAssets(repair), ctx({ isWindows: win, repairOutcome: outcome }));
+      expect({ win, repair, outcome, load: p.loadFrame, stage: p.stage }).toEqual({ win, repair, outcome, load, stage });
+    }
+    const p = planOfficeTab(noAssets("none"), ctx({ isWindows: true }));
+    expect({ text: p.text, btn: p.buttonLabel, poll: p.nextPollMs }).toEqual({ text: "", btn: "", poll: 0 });
+  });
   it("앱이 손대지 않는 상태(원장 항목 · 팩 버전 불일치)는 피드백 안내만 — 단추를 내지 않는다", () => {
     const p = planOfficeTab(noAssets("auto"), ctx({ repairOutcome: "blocked" }));
     expect({ stage: p.stage, btn: p.buttonLabel, auto: p.autoRepair }).toEqual({ stage: "assets_none", btn: "", auto: false });

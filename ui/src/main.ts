@@ -1075,7 +1075,7 @@ async function officeWatchTick(gen: number) {
     h = null; // 호출 실패 — 준비 중으로 본다(브리지가 없을 때와 같은 안내)
   }
   if (gen !== officeWatchGen) return; // 기다리는 사이 탭을 떠났다
-  const plan = planOfficeTab(h, { elapsedMs: Date.now() - officeWatchSince, repairing: officeRepairing, repairOutcome: officeRepairOutcome });
+  const plan = planOfficeTab(h, { elapsedMs: Date.now() - officeWatchSince, repairing: officeRepairing, repairOutcome: officeRepairOutcome, isWindows: IS_WINDOWS });
   if (plan.loadFrame) {
     officeRenderHint("", "");
     if (!frame.src) frame.src = OFFICE_URL;
