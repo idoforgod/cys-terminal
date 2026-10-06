@@ -211,6 +211,33 @@ class LogAndHealth(unittest.TestCase):
         self.assertEqual(HB._STATS["timeouts"], before + 1)
         self.assertEqual(buf.getvalue(), "", "시간 제한 접속은 줄을 찍지 않는다")
 
+    def test_handle_error_silences_timeout_and_broken_pipe_but_logs_real_errors(self):
+        srv = HB._BridgeServer.__new__(HB._BridgeServer)
+        before = HB._STATS["timeouts"]
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            for exc in (TimeoutError("w"), BrokenPipeError(), ConnectionResetError()):
+                try:
+                    raise exc
+                except Exception:
+                    srv.handle_error(None, ("127.0.0.1", 1))
+        self.assertEqual(buf.getvalue(), "", "끊긴 쓰기·연결은 줄도 추적도 없다")
+        self.assertEqual(HB._STATS["timeouts"], before + 1, "시간 제한(TimeoutError)만 계수")
+        with contextlib.redirect_stderr(buf):
+            try:
+                raise ValueError("boom")
+            except Exception:
+                srv.handle_error(None, ("127.0.0.1", 1))
+        self.assertIn("[hud-bridge] ", buf.getvalue())
+        self.assertIn("요청 처리 예외", buf.getvalue())
+        self.assertIn("ValueError", buf.getvalue(), "진짜 예외는 추적이 남는다")
+
+    def test_lifeline_reads_without_buffer_lock(self):
+        i = SRC.index("def _lifeline():")
+        body = SRC[i:i + 600]
+        self.assertIn("os.read(0, 1)", body)
+        self.assertNotIn("sys.stdin.buffer", body)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

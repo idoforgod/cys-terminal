@@ -2071,6 +2071,13 @@ def health_body():
 
 class _BridgeServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
+        # 시간 제한으로 끊긴 쓰기(멈춘 수신자)·끊긴 연결은 줄도 추적도 없이 넘긴다 — 시간 제한은 /health 계수로만 센다(B4-3).
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (TimeoutError, BrokenPipeError, ConnectionResetError)):
+            if isinstance(exc, TimeoutError):
+                with _STATS_LOCK:
+                    _STATS["timeouts"] += 1
+            return
         # B4-3 요청 처리 중 예외 — 표준 추적 앞에 시각·스레드 이름 한 줄을 먼저 찍는다.
         _log("요청 처리 예외 (client=%s)" % (client_address,))
         super().handle_error(request, client_address)
@@ -2112,7 +2119,7 @@ def _lifeline():
     """B2 수명줄 — 표준입력이 닫히면(데몬이 어떤 이유로든 사라짐) 종료 절차. 신호·부모 번호 폴링은 쓰지 않는다."""
     try:
         while True:
-            b = sys.stdin.buffer.read(1)
+            b = os.read(0, 1)    # 버퍼 잠금 없는 읽기(종료 길의 "could not acquire lock" 방지)
             if not b:
                 break
     except Exception:
