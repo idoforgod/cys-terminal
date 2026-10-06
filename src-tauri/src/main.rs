@@ -4983,10 +4983,8 @@ async fn feed_reply(request_id: String, decision: String, socket: Option<String>
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 0.14.44 WP-B B5·B6 — 오피스 브리지 건강 확인(`office_health`)과 화면 자산 복구(`repair_office_assets`)
 //
-// ★통합 완료: 건강 확인 탐침은 lib 도우미(`cys::bridge_probe_get` — 데몬 감독과 같은 코드)를 쓴다(아래 별칭). 옛 메모: 설계 B3 는 데몬 감독과 이 앱 명령이 같은 건강 확인 도우미(`src/lib.rs`)를 쓰게 한다.
-//   그 도우미(WB 소유)가 들어오기 전까지 같은 꼴(탐침의 정의 = 접속 → 0.3초 → `GET /health` → 전송 뒤 5초 안에 200 과
-//   본문 min(Content-Length, 64KB) 바이트 · 404 면 같은 꼴로 `/world`)의 작은 함수를 여기에 둔다. 통합 단계에서 `office_probe_get` 을
-//   lib 의 도우미 호출로 바꾸고 이 주석을 지운다 — 판정(`office_health_value`)과 화면 계약은 그대로다.
+// ★건강 확인 탐침은 lib 도우미(`cys::bridge_probe_get` — 데몬 감독과 같은 코드)를 쓴다(아래 별칭). 탐침의 정의 = 접속 → 0.3초 → `GET /health` → 전송 뒤 5초 안에 200 과 본문
+//   min(Content-Length, 64KB) 바이트 · 404 면 같은 꼴로 `/world`. 판정(`office_health_value`)과 화면 계약은 이 파일이 가진다.
 // ★화면 안(127.0.0.1:8642 에서 온 내용)은 이 명령을 부를 수 없다 — capabilities 에 `remote` 가 없고 tauri 가 원격 출처의 앱 명령을
 //   기본 거부한다(`tauri-2.11.2/src/webview/mod.rs:1818-1822`). 핀: `office_iframe_has_no_ipc_path`.
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
