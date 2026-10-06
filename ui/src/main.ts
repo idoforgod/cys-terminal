@@ -47,6 +47,15 @@ import {
   CYCLE_VERIFY_NOTE,
   CYCLE_VERIFY_DISMISS_TITLE,
   feedCreatedToastTitle,
+  isEndedSeatRequest,
+  isConfirmableNotice,
+  isBulkConfirmable,
+  bulkConfirmSummary,
+  isHeadOnlyProcedureKind,
+  ENDED_SEAT_MARK,
+  NOTICE_CONFIRM_LABEL,
+  BULK_CONFIRM_MAX,
+  BULK_CONFIRM_TITLE,
 } from "./feedclass";
 import {
   parseTeamProposal,
@@ -5825,6 +5834,16 @@ interface FeedItem {
   // state::is_daemon_issued). 아래 isDaemonDetectedApproval 하나만 읽는다.
   // optional 인 이유는 구 데몬 프로세스가 살아 있는 스큐뿐이다(그 경우의 폴백도 그 함수에 있다).
   daemon_issued?: boolean;
+  // ★0.14.44 C3 — 데몬 feed.list 의 파생 칸(옛 데몬은 없다): 이 항목의 결정을 기다리는 연결이 지금 있는가 · 올린 좌석이 살아 있는가(모르면 null).
+  //   표지·「확인」·「모두 확인」의 판정은 feedclass.ts 의 순수 함수가 한다(칸이 없으면 전부 '아니오' = 종전 화면).
+  waiter?: boolean | null;
+  publisher_alive?: boolean | null;
+}
+// ★0.14.44 C2 — 한 항목이 어느 데몬에서 왔는가. socket 이 없으면 본부(종전) · 있으면 그 부서 소켓(응답에도 이 소켓을 쓴다 — 열쇠 = (소켓, request_id)).
+interface FeedOrigin {
+  socket?: string;
+  label: string;
+  replyable: boolean;
 }
 
 // '데몬이 화면 패턴으로 감지해 올린 승인 항목'인가 — CC 패널(refreshFeed)과 커맨드 팔레트의
@@ -6240,6 +6259,8 @@ function feedReplyErrorText(e: unknown): string {
   // 새 토큰으로 다시 붙는다(allocate 는 멱등이라 팀이 이미 만들어졌어도 다시 만들지 않는다).
   if (s.includes("owner_gui_required"))
     return "앱에서만 처리할 수 있는 항목입니다 — 다시 눌러 주세요(데몬 토큰이 막 바뀌었을 수 있습니다).";
+  // ★0.14.44 C2: 백엔드가 응답을 보낼 수 없는 소켓(부서 등록부에 없음 · 토큰 폴더가 본부와 같음)을 거부한 코드.
+  if (s.includes("socket_not_allowed")) return "이 부서의 항목은 앱에서 처리할 수 없습니다 — 해당 부서로 이동해 그 pane 에서 처리하세요.";
   if (s.includes("not_found")) return "항목을 찾을 수 없습니다(만료·삭제되었을 수 있음).";
   if (s.includes("already resolved")) return "이미 처리된 항목입니다.";
   return `전송 오류: ${s}`;
@@ -6253,11 +6274,11 @@ function feedReplyErrorText(e: unknown): string {
 // 여기서 또 부르면 클릭 1회당 전체 재렌더가 2회 난다(N 건 정리 = O(N²) DOM 재구성).
 // 배지 갱신은 이벤트 경로에도 있으나(refreshSidebarStatus) 데몬 이벤트 유실 대비로 남긴다
 // — 그것은 목록 DOM 을 만들지 않아 비용이 다르다.
-function wireFeedDismiss(dismiss: HTMLButtonElement, requestId: string) {
+function wireFeedDismiss(dismiss: HTMLButtonElement, requestId: string, socket?: string) {
   dismiss.addEventListener("click", async () => {
     dismiss.disabled = true;
     try {
-      await invoke("feed_reply", { requestId, decision: "dismissed" });
+      await invoke("feed_reply", { requestId, decision: "dismissed", socket }); // socket 없음 = 본부(종전) · 부서 항목은 그 부서 소켓
     } catch (e) {
       toast("health", "알림 치우기 실패", feedReplyErrorText(e));
       refreshFeed(); // 실패 시엔 이벤트가 오지 않으므로 여기서 되돌린다(버튼 상태 복구)
@@ -6339,19 +6360,99 @@ function renderOtherWorkspacePending(box: HTMLElement): number {
   return total;
 }
 
+// ★0.14.44 C2 「그 화면으로 이동」 — 부서 워크스페이스로 바꾸고 그 좌석을 띄워 잠깐 강조한다(기존 inject-flash 재사용). 이미 닫힌 탭이면 사실대로 알린다.
+function jumpToDeptSurface(socket: string, sid: number | null, label: string) {
+  const out = switchToWorkspaceBySocket(socket);
+  if (out === "missing") {
+    toast("feed", "이동 불가", `${label} 탭이 이미 닫혔습니다 — 부서를 다시 열어 주세요.`);
+    return;
+  }
+  if (out === "pending") {
+    toast("feed", "부서 데몬 준비 중", `${label} 워크스페이스로 이동했습니다 — 기동이 끝나면 pane 이 나타납니다.`);
+  } else if (sid != null) {
+    jumpToSurface(sid, socket);
+    const rt = panes.get(paneKey(sid, socket));
+    if (rt) {
+      rt.el.classList.add("inject-flash");
+      setTimeout(() => rt.el.classList.remove("inject-flash"), 700);
+    }
+  }
+  setCcOpen(false); // CC 패널이 pane 을 가리므로 닫는다
+}
+
+// ★0.14.44 C3 「정보성 알림 N건 모두 확인」 — 정보성 종류 ∧ 기다리는 연결 없음 ∧ 데몬이 올린 것 아님 만(판정 = feedclass.ts isBulkConfirmable). 소켓별 · 한 번에 최대 BULK_CONFIRM_MAX.
+//   decision="dismissed"(판정 어휘 아님 — 거부 카운터 비오염). 순서대로 하나씩 보내고(동시 폭주 금지) 실패는 건수로 알린다.
+function renderBulkConfirm(box: HTMLElement, items: FeedItem[], socket?: string) {
+  const targets = items.filter((i) => isBulkConfirmable(i)).slice(0, BULK_CONFIRM_MAX);
+  if (targets.length === 0) return;
+  const row = document.createElement("div");
+  row.className = "feed-bulk";
+  const btn = document.createElement("button");
+  btn.textContent = `정보성 알림 ${targets.length}건 모두 확인`;
+  btn.title = BULK_CONFIRM_TITLE;
+  const sum = document.createElement("span");
+  sum.className = "fi-meta";
+  sum.textContent = bulkConfirmSummary(targets);
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    let failed = 0;
+    try {
+      for (const t of targets) {
+        try {
+          await invoke("feed_reply", { requestId: t.request_id, decision: "dismissed", socket });
+        } catch {
+          failed++;
+        }
+      }
+    } finally {
+      if (failed > 0) toast("health", "일부 알림을 확인하지 못했습니다", `${failed}건 — 이미 처리됐거나 부서 응답이 없습니다.`);
+      btn.disabled = false;
+      refreshFeed();
+      refreshSidebarStatus();
+    }
+  });
+  row.append(btn, sum);
+  box.appendChild(row);
+}
+
+interface FeedSection {
+  socket?: string;
+  label: string;
+  ok: boolean;
+  replyable: boolean;
+  items: FeedItem[]; // 최신순
+}
+
 async function refreshFeed() {
-  const r = (await invoke("feed_list", { status: null }).catch(() => null)) as
-    | { items: FeedItem[] }
+  // ★0.14.44 C2: 본부 + 등록된 부서를 한꺼번에(feed_list_all) — 이 목록을 그리는 **이 한 곳**만 바꿨다(다른 feed_list 호출처는 본부 전용 그대로).
+  //   호출 실패(옛 백엔드 등)이거나 본부 행이 실패면 종전 경로(feed_list + 부서 이동 띠)로 돌아간다.
+  const all = (await invoke("feed_list_all", { status: null }).catch(() => null)) as
+    | { sockets?: { socket: string; dept: string | null; display_name?: string | null; ok: boolean; items?: FeedItem[]; replyable?: boolean }[] }
     | null;
+  let sections: FeedSection[] | null = null;
+  if (all && Array.isArray(all.sockets) && all.sockets.length > 0 && all.sockets[0].dept === null && all.sockets[0].ok) {
+    sections = all.sockets.map((x) => ({
+      socket: x.dept === null ? undefined : x.socket,
+      label: x.dept === null ? "본부" : x.display_name || x.dept,
+      ok: x.ok,
+      replyable: x.dept === null ? true : x.replyable === true,
+      items: Array.isArray(x.items) ? x.items : [], // 데몬 순서(오래된 것 먼저) — 그릴 때 뒤집는다
+    }));
+  }
+  const legacyMode = sections === null;
+  const r = sections
+    ? { items: sections[0].items }
+    : ((await invoke("feed_list", { status: null }).catch(() => null)) as { items: FeedItem[] } | null);
   if (!r) return;
   const items = r.items.slice().reverse();
+  const deptSections = sections ? sections.slice(1) : [];
 
   // 대기 배지는 refreshSidebarStatus(전체 소켓 집계)가 단독 소유 — 여기선 목록만 렌더.
   // (feed_list는 기본 데몬 1개만 조회하므로 멀티부서 집계와 스코프가 달라 배지 구동에 부적합.)
   if (!(ccOpen && ccTab === "feed")) return;
   const box = document.getElementById("cc-feed-items")!;
   box.innerHTML = "";
-  if (items.length === 0) {
+  if (items.length === 0 && !(deptSections.some((d) => d.items.length > 0 || !d.ok))) {
     // ★'비어 있음'만 적으면 거짓말이 될 수 있다 — 이 목록은 기본 데몬 1개만 보므로 부서 데몬에
     //  대기가 남아 있어도 비기 때문이다. 그 경우 사유를 함께 적는다.
     //  ※ 수치는 **타 소켓 직접 합**(pendingBySocket 소켓별 값)이다 — 전 소켓 합산(pendingApprovals)을
@@ -6411,7 +6512,15 @@ async function refreshFeed() {
   //     ★#4-b(2026-08-22): 그 값을 문장 한 줄로만 쓰던 것을 **부서별 행 + 이동 버튼**으로 바꾼다.
   //     "N건이 어딘가에 있다"는 고지는 사각을 아는 데까지만 데려다줄 뿐, 오너를 그 부서로
   //     데려가지 못했다(그래서 부서 상태가 '멈춤'으로 체감됐다).
-  renderOtherWorkspacePending(box);
+  if (legacyMode) renderOtherWorkspacePending(box); // 종전 경로(feed_list_all 을 쓸 수 없을 때)의 대비 — 새 경로에서는 부서가 아래에 같은 목록으로 나온다(C2)
+  else if (deptSections.length > 0) {
+    const hh = document.createElement("div");
+    hh.className = "feed-dept-head";
+    hh.textContent = `본부 — 대기 ${pendingItems.length}건`;
+    box.appendChild(hh);
+  }
+  // ★0.14.44 C3 「정보성 알림 N건 모두 확인」 — 이 소켓(본부)의 목록 위에.
+  renderBulkConfirm(box, pendingItems);
   // (b) 상한 초과분은 '나머지 보기'로 연다 — 지울 수 없는 pending 을 만들지 않기 위함이다.
   if (pendingHidden > 0) {
     const more = document.createElement("button");
@@ -6423,7 +6532,9 @@ async function refreshFeed() {
     });
     box.appendChild(more);
   }
-  for (const item of shown) {
+  const headOrigin: FeedOrigin = { label: "본부", replyable: true };
+  const renderItem = (item: FeedItem, origin: FeedOrigin) => {
+    const sock = origin.socket; // 없으면 본부(종전) · 있으면 그 부서 소켓 — 응답·치우기에 그대로 쓴다(열쇠 = (소켓, request_id))
     const el = document.createElement("div");
     el.className = `feed-item ${item.status}`;
     const title = document.createElement("div");
@@ -6497,7 +6608,7 @@ async function refreshFeed() {
       const actions = document.createElement("div");
       actions.className = "fi-actions";
       const jump = document.createElement("button");
-      jump.textContent = "이 pane에서 직접 응답";
+      jump.textContent = sock ? "그 화면으로 이동" : "이 pane에서 직접 응답";
       const target = item.surface_id;
       if (target == null) {
         // surface 미상(구 영속 라인 등) — 점프 대상이 없으면 비활성해 헛클릭을 막는다.
@@ -6506,7 +6617,11 @@ async function refreshFeed() {
         jump.title = "대상 surface 미상 — 해당 pane을 직접 찾아 응답하세요";
       } else {
         jump.addEventListener("click", () => {
-          // feed_list는 기본 데몬 1개만 조회한다(위 refreshFeed 주석) → socket 미지정 = 기본 데몬 ws.
+          if (sock) {
+            jumpToDeptSurface(sock, target, origin.label); // ★0.14.44 C2 — 부서 워크스페이스로 바꾸고 그 좌석을 띄워 잠깐 강조
+            return;
+          }
+          // 본부 항목 — socket 미지정 = 기본 데몬 ws(종전).
           jumpToSurface(target);
           setCcOpen(false); // CC 패널이 pane을 가리므로 닫는다 — 프롬프트를 바로 보고 답하게.
         });
@@ -6517,7 +6632,7 @@ async function refreshFeed() {
         "이 알림 항목만 목록에서 지웁니다 — 앱에는 아무것도 전달되지 않습니다(pane 종료 등으로 데몬 자동 정리가 닿지 않는 항목의 수동 해소 경로).\n" +
         "⚠ 해당 pane에 승인 프롬프트가 아직 떠 있으면 데몬이 잠시 뒤(최대 1분) 다시 감지해 항목이 재등장합니다 — 정상 동작입니다.\n" +
         "⚠ 치울 때마다 '사람 개입 필요' 방치 경보(approval.stalled)의 대기시간이 처음부터 다시 시작됩니다.";
-      wireFeedDismiss(dismiss, item.request_id); // 클릭 배선 = 공용 헬퍼(주석·근거는 그쪽)
+      wireFeedDismiss(dismiss, item.request_id, sock); // 클릭 배선 = 공용 헬퍼(주석·근거는 그쪽)
       actions.append(jump, dismiss);
       el.append(note, actions);
     } else if (item.status === "pending" && classifyPendingFeed(item) === "cycle-verify") {
@@ -6538,8 +6653,32 @@ async function refreshFeed() {
       const dismiss = document.createElement("button");
       dismiss.textContent = "알림 치우기";
       dismiss.title = CYCLE_VERIFY_DISMISS_TITLE;
-      wireFeedDismiss(dismiss, item.request_id);
+      wireFeedDismiss(dismiss, item.request_id, sock);
       actions.append(dismiss);
+      el.append(note, actions);
+    } else if (item.status === "pending" && sock && isHeadOnlyProcedureKind(item.kind)) {
+      // ★0.14.44 C2 — 본부 전용 절차가 붙은 두 종류(팀 만들기 제안 · CEO 승격 요청)가 부서 소켓에서 보이면 Allow 를 두지 않고 「그 부서로 이동」만.
+      const note = document.createElement("div");
+      note.className = "fi-meta";
+      note.textContent = "본부에서만 처리하는 종류의 요청이 이 부서에 올라와 있습니다 — 해당 부서로 이동해 확인하세요.";
+      const actions = document.createElement("div");
+      actions.className = "fi-actions";
+      const go = document.createElement("button");
+      go.textContent = "그 부서로 이동";
+      go.addEventListener("click", () => jumpToDeptSurface(sock, null, origin.label));
+      actions.append(go);
+      el.append(note, actions);
+    } else if (item.status === "pending" && sock && !origin.replyable) {
+      // 이 앱이 응답을 보낼 수 없는 소켓(부서 등록부에 없음 · 토큰 폴더가 본부와 같음) — 단추를 내리고 이동만(백엔드도 거부한다).
+      const note = document.createElement("div");
+      note.className = "fi-meta";
+      note.textContent = "이 부서의 항목은 앱에서 처리할 수 없습니다 — 해당 부서로 이동해 그 pane 에서 처리하세요.";
+      const actions = document.createElement("div");
+      actions.className = "fi-actions";
+      const go = document.createElement("button");
+      go.textContent = "그 부서로 이동";
+      go.addEventListener("click", () => jumpToDeptSurface(sock, item.surface_id ?? null, origin.label));
+      actions.append(go);
       el.append(note, actions);
     } else if (item.status === "pending" && classifyPendingFeed(item) === "team-create") {
       // ★U16(0.14.41) 팀 만들기 제안 카드 — 일반 Allow/Deny 를 두지 않는다(Allow 는 팀을 만들지 않고
@@ -6589,6 +6728,17 @@ async function refreshFeed() {
       });
       actions.append(openBtn, noBtn);
       el.append(note, actions);
+    } else if (item.status === "pending" && isConfirmableNotice(item)) {
+      // ★0.14.44 C3 — 정보성 알림(기다리는 연결 없음)에는 Allow·Deny 대신 「확인」 하나(`dismissed`) — 알림에 승인 단추가 달려 있으면 초보가 무엇을 승인하는지 알 수 없다.
+      //   기다리는 연결이 있으면(waiter=true) 이 분기를 타지 않고 종전 단추를 그대로 둔다(「확인」의 응답은 기다리는 쪽에 거부로 가기 때문 — 마지막 확인 D2).
+      const actions = document.createElement("div");
+      actions.className = "fi-actions";
+      const ok = document.createElement("button");
+      ok.textContent = NOTICE_CONFIRM_LABEL;
+      ok.title = "이 알림을 확인했습니다 — 목록에서 닫습니다(승인이 아닙니다).";
+      wireFeedDismiss(ok, item.request_id, sock);
+      actions.append(ok);
+      el.append(actions);
     } else if (item.status === "pending") {
       const actions = document.createElement("div");
       actions.className = "fi-actions";
@@ -6627,7 +6777,7 @@ async function refreshFeed() {
               }
             } else {
               try {
-                await invoke("feed_reply", { requestId: item.request_id, decision });
+                await invoke("feed_reply", { requestId: item.request_id, decision, socket: sock }); // 부서 항목은 그 부서 소켓으로(C2)
               } catch (e) {
                 toast("health", decision === "allow" ? "승인 실패" : "거부 실패", feedReplyErrorText(e));
               }
@@ -6641,6 +6791,17 @@ async function refreshFeed() {
         btns.push(btn);
         actions.appendChild(btn);
       }
+      // ★0.14.44 C3 표지 「요청한 좌석이 종료됨」 — 정보일 뿐 Allow·Deny 는 그대로 두고 「치우기」를 **더한다**(판정 = feedclass.ts isEndedSeatRequest — 다섯 조건 + 오너의 카드 제외).
+      if (isEndedSeatRequest(item)) {
+        const mark = document.createElement("span");
+        mark.className = "fi-ended-mark";
+        mark.textContent = ENDED_SEAT_MARK;
+        const clear = document.createElement("button");
+        clear.textContent = "치우기";
+        clear.title = "이 항목만 목록에서 지웁니다(판정이 아닙니다) — 요청한 좌석이 이미 끝나 응답을 받을 쪽이 없습니다.";
+        wireFeedDismiss(clear, item.request_id, sock);
+        actions.append(mark, clear);
+      }
       el.appendChild(actions);
     } else {
       const d = document.createElement("div");
@@ -6649,6 +6810,27 @@ async function refreshFeed() {
       el.appendChild(d);
     }
     box.appendChild(el);
+  };
+  for (const item of shown) renderItem(item, headOrigin);
+  // ★0.14.44 C2 부서별 묶음 — 머리글("부서 이름 — 대기 N건") + 같은 항목 그리기. 응답 없는 부서는 한 줄 안내(다음 갱신 틱에 다시 확인).
+  for (const sec of deptSections) {
+    const sItems = sec.items.slice().reverse();
+    const sPending = sItems.filter((i) => i.status === "pending");
+    const hh = document.createElement("div");
+    hh.className = "feed-dept-head";
+    hh.textContent = `${sec.label} — 대기 ${sPending.length}건`;
+    box.appendChild(hh);
+    if (!sec.ok) {
+      const down = document.createElement("div");
+      down.className = "cc-empty";
+      down.textContent = "이 부서는 지금 응답이 없습니다 — 자동으로 다시 확인합니다";
+      box.appendChild(down);
+      continue;
+    }
+    renderBulkConfirm(box, sPending, sec.socket);
+    const sShown = sPending.slice(0, PENDING_RENDER_CAP).concat(sItems.filter((i) => i.status !== "pending").slice(0, Math.max(0, 50 - Math.min(sPending.length, PENDING_RENDER_CAP))));
+    const origin: FeedOrigin = { socket: sec.socket, label: sec.label, replyable: sec.replyable };
+    for (const item of sShown) renderItem(item, origin);
   }
 }
 

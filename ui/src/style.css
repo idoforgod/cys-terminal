@@ -1054,3 +1054,10 @@ body.cc-office #cc-view-office { flex: 1; min-height: 0; }
 #cc-office-repair { margin-left: 8px; font-size: 11px; padding: 1px 10px; border-radius: 8px; border: 1px solid rgba(148,163,184,.4); background: none; color: #cbd5e1; cursor: pointer; }
 #cc-office-repair:hover { color: #f1f5f9; border-color: rgba(226,232,240,.6); }
 #cc-office-repair[hidden] { display: none; }
+/* ★0.14.44 C2·C3 승인 Feed — 부서 묶음 머리글 · 「모두 확인」 줄 · 「요청한 좌석이 종료됨」 표지(정보일 뿐 · 단추를 바꾸지 않는다) */
+.feed-dept-head { margin-top: 6px; font-size: 12px; font-weight: 700; color: #cbd5e1; padding-bottom: 2px; border-bottom: 1px solid rgba(255,255,255,.08); }
+.feed-bulk { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.feed-bulk button { font-size: 11px; padding: 2px 10px; border-radius: 8px; border: 1px solid rgba(148,163,184,.4); background: none; color: #cbd5e1; cursor: pointer; }
+.feed-bulk button:hover:not(:disabled) { color: #f1f5f9; border-color: rgba(226,232,240,.6); }
+.feed-bulk .fi-meta { margin-bottom: 0; }
+.feed-item .fi-ended-mark { align-self: center; font-size: 10px; color: #8b949e; }

@@ -4785,53 +4785,157 @@ async fn feed_list(status: Option<String>) -> Result<Value, String> {
 /// 매 호출 신선 재독(캐시 금지) — 데몬 재시작(churn)마다 토큰이 재발급되기 때문.
 /// 부재·빈 파일=None(구 데몬 호환 — 첨부 없이 호출).
 fn read_operator_token_for(socket: &std::path::Path) -> Option<String> {
-    #[cfg(windows)]
-    let dir = {
-        // cysd state::pipe_slug 미러: `\\.\pipe\<name>` 의 마지막 컴포넌트에서 파일시스템
-        // 안전 문자만 남긴다. 기본 데몬(`cys`)은 루트 유지, 부서는 슬러그 하위(격리).
-        let root = std::path::PathBuf::from(std::env::var("LOCALAPPDATA").ok()?).join("cys");
-        let last = socket
-            .to_string_lossy()
-            .rsplit(|c| c == '\\' || c == '/')
-            .next()
-            .unwrap_or("")
-            .to_string();
-        let slug: String = last
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-            .collect();
-        if slug.is_empty() || slug == "cys" {
-            root
-        } else {
-            root.join(slug)
-        }
-    };
-    #[cfg(not(windows))]
-    let dir = socket.parent()?.to_path_buf();
+    let dir = operator_token_dir_for(socket)?;
     let tok = std::fs::read_to_string(dir.join("operator.token")).ok()?;
     let tok = tok.trim().to_string();
     (!tok.is_empty()).then_some(tok)
 }
 
-/// 기본 데몬(feed_reply 전용) 토큰 — 소켓 인지 판을 기본 소켓으로 부른다(사본 금지).
-fn read_operator_token() -> Option<String> {
-    read_operator_token_for(&default_socket())
+/// 소켓이 가리키는 데몬의 **조작자 토큰 파일이 놓이는 폴더**(맥·리눅스 = 소켓의 부모 폴더 · 윈도우 = `%LOCALAPPDATA%\cys` 아래의 파이프 슬러그 폴더).
+/// `read_operator_token_for` 가 쓰던 계산을 그대로 뺐다(동작 불변) — 부서 항목 응답 허용 판정(`feed_reply_socket_allowed_with`)이 같은 계산을 쓴다.
+fn operator_token_dir_for(socket: &std::path::Path) -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        Some(windows_token_dir(&std::path::PathBuf::from(std::env::var("LOCALAPPDATA").ok()?), &socket.to_string_lossy()))
+    }
+    #[cfg(not(windows))]
+    {
+        Some(socket.parent()?.to_path_buf())
+    }
 }
 
+/// 윈도우 토큰 폴더 계산(순수 — 맥에서도 시험된다). cysd `state::pipe_slug` 미러: `\\.\pipe\<name>` 의 마지막 컴포넌트에서 파일시스템
+/// 안전 문자만 남긴다. 기본 데몬(`cys`)은 루트 유지, 부서는 슬러그 하위(격리). ★소켓의 부모 폴더로 비교하면 안 된다 —
+/// 윈도우에서는 모든 파이프의 부모가 `\\.\pipe` 로 같아 부서 소켓이 전부 거부된다(Fable 검증 V3).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_token_dir(local_app_data: &std::path::Path, socket: &str) -> std::path::PathBuf {
+    let root = local_app_data.join("cys");
+    let last = socket.rsplit(|c| c == '\\' || c == '/').next().unwrap_or("").to_string();
+    let slug: String = last.chars().filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_').collect();
+    if slug.is_empty() || slug == "cys" {
+        root
+    } else {
+        root.join(slug)
+    }
+}
+
+/// ★0.14.44 C2 — 사람(앱 화면)이 응답을 보낼 수 있는 소켓인가(순수 — 폴더 계산은 주입).
+/// 허용: 본부 소켓, 그리고 세 조건을 **모두** 채우는 부서 소켓뿐 — ① 부서 등록부에 있음 ② 이름 규칙(`cys-dept-<이름>`)에 맞음
+/// ③ 그 소켓의 조작자 토큰 폴더가 본부의 그것과 **다름**. ③을 두는 이유: 등록부에 본부와 같은 토큰 폴더의 소켓이 끼어들면 본부 토큰이
+/// 엉뚱한 소켓으로 간다(설계 리뷰 1 의 22번). 폴더는 `operator_token_dir_for` 가 끌어낸 것으로 비교한다 — 소켓의 부모 폴더로 비교하면 안 된다
+/// (윈도우에서는 모든 파이프의 부모가 같다 · Fable 검증 V3).
+fn feed_reply_socket_allowed_with(
+    sock: &std::path::Path,
+    head: &std::path::Path,
+    registered: &[std::path::PathBuf],
+    dir_of: &dyn Fn(&std::path::Path) -> Option<std::path::PathBuf>,
+) -> bool {
+    if sock == head {
+        return true;
+    }
+    if !registered.iter().any(|r| r == sock) {
+        return false;
+    }
+    if dept_name_from_socket(&sock.to_string_lossy()).is_none() {
+        return false;
+    }
+    match (dir_of(sock), dir_of(head)) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
+/// 부서 등록부(depts.json)의 소켓 목록 — `(이름, 소켓 경로, 표시명)`. 소켓이 비어 있는 등재는 canonical 경로로 채워져 있다(list_depts).
+fn registered_dept_sockets() -> Vec<(String, std::path::PathBuf, Option<String>)> {
+    let mut out = Vec::new();
+    if let Ok(reg) = list_depts() {
+        if let Some(depts) = reg.get("depts").and_then(|d| d.as_object()) {
+            for (name, meta) in depts {
+                let sock = meta
+                    .get("socket")
+                    .and_then(|s| s.as_str())
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| dept_socket_path(name));
+                let display = meta.get("display_name").and_then(|d| d.as_str()).map(|s| s.to_string());
+                out.push((name.clone(), sock, display));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn feed_reply_socket_allowed(sock: &std::path::Path) -> bool {
+    let registered: Vec<std::path::PathBuf> = registered_dept_sockets().into_iter().map(|(_, p, _)| p).collect();
+    feed_reply_socket_allowed_with(sock, &default_socket(), &registered, &operator_token_dir_for)
+}
+
+/// ★0.14.44 C2 — 본부와 등록된 부서의 승인 Feed 를 한꺼번에 묻는다(소켓당 2초 · 동시 · 응답 없는 부서는 빼지 않고 오류 행으로).
+/// 반환 `{sockets:[{socket, dept(이름|null=본부), display_name, ok, items, error, replyable}]}` — 본부가 맨 앞, 부서는 이름순.
+/// `replyable` = 그 소켓에 이 앱이 응답을 보낼 수 있는가(`feed_reply_socket_allowed` 와 같은 판정 — 화면이 단추를 내릴 근거).
+/// 종전 `feed_list`(본부 전용)는 그대로 둔다 — 승인 전환 스케줄러·팔레트 등 다른 호출처는 본부 전용이다.
 #[tauri::command]
-async fn feed_reply(request_id: String, decision: String) -> Result<(), String> {
+async fn feed_list_all(status: Option<String>) -> Result<Value, String> {
+    use std::time::Duration;
+    let head = default_socket();
+    let mut targets: Vec<(Option<String>, std::path::PathBuf, Option<String>)> = vec![(None, head.clone(), None)];
+    let depts = registered_dept_sockets();
+    let registered: Vec<std::path::PathBuf> = depts.iter().map(|(_, p, _)| p.clone()).collect();
+    for (name, sock, display) in depts {
+        targets.push((Some(name), sock, display));
+    }
+    let handles: Vec<_> = targets
+        .iter()
+        .map(|(_, sock, _)| {
+            let sock = sock.clone();
+            let params = json!({"status": status});
+            tauri::async_runtime::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(2), rpc_oneshot(&sock, "feed.list", params)).await
+            })
+        })
+        .collect();
+    let mut rows: Vec<Value> = Vec::new();
+    for ((dept, sock, display), h) in targets.iter().zip(handles) {
+        let replyable = feed_reply_socket_allowed_with(sock, &head, &registered, &operator_token_dir_for);
+        let (ok, items, error) = match h.await {
+            Ok(Ok(Ok(resp))) => (true, resp.get("items").cloned().unwrap_or_else(|| json!([])), Value::Null),
+            Ok(Ok(Err(e))) => (false, json!([]), json!(e)),
+            Ok(Err(_)) => (false, json!([]), json!("timeout")),
+            Err(e) => (false, json!([]), json!(e.to_string())),
+        };
+        rows.push(json!({
+            "socket": sock.to_string_lossy(),
+            "dept": dept,
+            "display_name": display,
+            "ok": ok,
+            "items": items,
+            "error": error,
+            "replyable": replyable,
+        }));
+    }
+    Ok(json!({"sockets": rows}))
+}
+
+/// `socket` — 부서 항목에 응답할 때만(없으면 종전처럼 본부). 허용 소켓은 `feed_reply_socket_allowed` 가 가른다(본부 · 세 조건을 채우는 부서).
+/// 그 소켓의 조작자 토큰을 **매번 새로** 읽어 붙인다(데몬을 다시 띄우면 바뀐다). 토큰은 이 백엔드에서만 다루고 화면으로 내보내지 않는다.
+#[tauri::command]
+async fn feed_reply(request_id: String, decision: String, socket: Option<String>) -> Result<(), String> {
+    let sock = resolve_socket(&socket);
+    if socket.is_some() && !feed_reply_socket_allowed(&sock) {
+        return Err("socket_not_allowed: 이 소켓의 항목은 앱에서 처리할 수 없습니다(부서 등록부에 없거나 토큰 폴더가 본부와 같습니다)".to_string());
+    }
     // ★GUI 오퍼레이터 승인(오너 2026-07-15): operator.token을 첨부해 §3.2 자기승인 가드의 GUI 오탐
     // (부서 생성 체인 pgid 각인 + surface 미귀속 fail-closed)을 면제한다. 첨부 지점은 이 Tauri 백엔드
     // 단 한 곳 — 공용 cys CLI 무첨부는 워커의 **우발적** 면제만 차단한다(의도적 동일사용자
     // 프로세스는 토큰 파일을 읽어 raw RPC로 우회 가능 — M11 수준·사고 방지용).
-    async fn call(request_id: &str, decision: &str) -> Result<Value, String> {
+    async fn call(sock: &std::path::Path, request_id: &str, decision: &str) -> Result<Value, String> {
         let mut params = json!({"request_id": request_id, "decision": decision});
-        if let Some(tok) = read_operator_token() {
+        if let Some(tok) = read_operator_token_for(sock) {
             params["operator_token"] = json!(tok);
         }
-        rpc_full(&default_socket(), "feed.reply", params).await
+        rpc_full(sock, "feed.reply", params).await
     }
-    let mut resp = call(&request_id, &decision).await?;
+    let mut resp = call(&sock, &request_id, &decision).await?;
     // ★REVIEW1 m4: `owner_gui_required` 도 같은 좁은 창(토큰 회전 경합)에서 난다 — 팀 제안
     // 해소는 operator token 전용(team_spec::reply_allowed)이라, 첫 호출의 파일 읽기와 데몬
     // 재시작(토큰 회전)이 겹치면 방금 읽은 토큰이 이미 낡아 이 코드로 떨어진다. 그대로 두면
@@ -4845,7 +4949,7 @@ async fn feed_reply(request_id: String, decision: String) -> Result<(), String> 
         )
     {
         // 첫 호출의 파일 읽기와 데몬 재시작(토큰 회전)이 겹친 좁은 창 — 신선 재독으로 1회만 재시도.
-        resp = call(&request_id, &decision).await?;
+        resp = call(&sock, &request_id, &decision).await?;
     }
     if resp["ok"].as_bool() == Some(true) {
         Ok(())
@@ -8093,6 +8197,7 @@ fn main() {
             attach_surface,
             start_surface_stream,
             feed_list,
+            feed_list_all,
             feed_reply,
             office_health,
             repair_office_assets,
@@ -16088,5 +16193,93 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         let body = &prod[s..s + prod[s..].find("\n}\n").unwrap()];
         assert!(body.contains("sealed_sidecar_cys(&[\"pack-heal\", \"--missing-only\", rel])"));
         assert!(!body.contains("Command::new"));
+    }
+
+    // ═════════ 0.14.44 WC — C2 부서 항목 응답(feed_list_all · feed_reply 의 socket 인자) ═════════
+
+    fn pb(s: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(s)
+    }
+
+    /// 맥: 본부는 항상 허용 · 부서는 등록부에 있고 이름 규칙에 맞고 토큰 폴더가 본부와 다를 때만.
+    #[test]
+    fn c2_reply_socket_allowed_unix_rules() {
+        let dir_of = |p: &std::path::Path| p.parent().map(|d| d.to_path_buf());
+        let head = pb("/state/cys/cys.sock");
+        let sales = pb("/state/cys-dept-sales/cys.sock");
+        let reg = vec![sales.clone(), pb("/state/cys-dept-ops/cys.sock")];
+        assert!(feed_reply_socket_allowed_with(&head, &head, &reg, &dir_of), "본부는 허용");
+        assert!(feed_reply_socket_allowed_with(&sales, &head, &reg, &dir_of), "등록된 부서는 허용");
+        // 등록부에 없다
+        assert!(!feed_reply_socket_allowed_with(&pb("/state/cys-dept-ghost/cys.sock"), &head, &reg, &dir_of));
+        // 이름 규칙에 안 맞는다(등록부에는 있다)
+        let odd = pb("/state/other/cys.sock");
+        assert!(!feed_reply_socket_allowed_with(&odd, &head, &[odd.clone()], &dir_of));
+        // 토큰 폴더가 본부와 같다 — 등록부에 본부와 같은 폴더의 소켓이 끼어든 검체: 본부 토큰이 엉뚱한 소켓으로 가지 않는다
+        let same_dir = pb("/state/cys/cys-dept-evil.sock");
+        assert_eq!(dept_name_from_socket(&same_dir.to_string_lossy()).as_deref(), Some("evil.sock"), "이름 규칙은 통과하는 검체여야 ③을 시험한다");
+        assert!(!feed_reply_socket_allowed_with(&same_dir, &head, &[same_dir.clone()], &dir_of), "본부와 같은 토큰 폴더의 소켓은 거부");
+        // 폴더를 계산하지 못하면 거부(fail-closed)
+        assert!(!feed_reply_socket_allowed_with(&sales, &head, &reg, &|_| None));
+    }
+
+    /// 윈도우: 모든 파이프의 부모가 `\\.\pipe` 로 같다 — 소켓의 부모로 비교하면 부서가 전부 거부된다. 토큰 폴더(슬러그)로 비교하면 허용된다.
+    #[test]
+    fn c2_reply_socket_allowed_windows_pipe_rules() {
+        let lad = pb("C:/Users/x/AppData/Local");
+        let dir_of = move |p: &std::path::Path| Some(windows_token_dir(&lad, &p.to_string_lossy()));
+        let head = pb(r"\\.\pipe\cys");
+        let sales = pb(r"\\.\pipe\cys-dept-sales");
+        let reg = vec![sales.clone()];
+        // 계산 규칙: 본부는 루트 · 부서는 슬러그 하위
+        assert_eq!(windows_token_dir(&pb("C:/L"), r"\\.\pipe\cys"), pb("C:/L/cys"));
+        assert_eq!(windows_token_dir(&pb("C:/L"), r"\\.\pipe\cys-dept-sales"), pb("C:/L/cys/cys-dept-sales"));
+        assert_eq!(windows_token_dir(&pb("C:/L"), r"\\.\pipe\cys-dept-s!ales"), pb("C:/L/cys/cys-dept-sales"), "파일시스템 안전 문자만");
+        assert!(feed_reply_socket_allowed_with(&sales, &head, &reg, &dir_of), "윈도우 부서 파이프가 거부되면 안 된다(Fable V3)");
+        // 대조: 부모 폴더 비교였다면 거부됐을 것이다
+        let parent_of = |p: &std::path::Path| p.to_string_lossy().rsplit_once('\\').map(|(a, _)| pb(a));
+        assert!(!feed_reply_socket_allowed_with(&sales, &head, &reg, &parent_of), "대조: 부모 비교는 모든 부서를 거부한다");
+        // 이름이 본부와 같은 슬러그로 접히는 파이프는 폴더가 같아 거부
+        let alias = pb(r"\\.\pipe\cys");
+        assert!(feed_reply_socket_allowed_with(&alias, &head, &[], &dir_of), "본부 자신은 허용(소켓이 같다)");
+    }
+
+    /// 배선 핀 — feed_reply 는 socket 인자를 받고 그 소켓의 토큰을 매번 새로 읽는다 · 토큰은 응답 값으로 나가지 않는다 · 본부 토큰을 부서 소켓에 붙이지 않는다 ·
+    /// 에이전트 CLI(`cys.rs`)는 조작자 토큰을 모른다 · 명령 등재.
+    #[test]
+    fn c2_feed_reply_and_list_all_wiring() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let seg = |start: &str| -> &str {
+            let s = prod.find(start).unwrap_or_else(|| panic!("`{start}` 소실"));
+            &prod[s..s + prod[s..].find("\n}\n").expect("fn 끝")]
+        };
+        let reply = seg("async fn feed_reply(");
+        assert!(reply.contains("socket: Option<String>"));
+        assert!(reply.contains("feed_reply_socket_allowed(&sock)"), "허용 판정이 응답 앞에 있어야 한다");
+        assert!(reply.contains("read_operator_token_for(sock)"), "토큰은 그 소켓의 것을 매번 새로 읽는다");
+        assert!(!reply.contains("read_operator_token()") && !reply.contains("default_socket()"), "본부 고정으로 되돌아가면 안 된다");
+        assert!(reply.contains("self_approval_denied") && reply.contains("owner_gui_required"), "거부 응답 때 토큰을 다시 읽어 1회 재시도하는 종전 규칙이 남아 있다");
+        let all = seg("async fn feed_list_all(");
+        assert!(all.contains("Duration::from_secs(2)"), "소켓당 2초");
+        assert!(!all.contains("read_operator_token") && !all.contains("\"operator_token\""), "목록 응답에는 토큰이 실리지 않는다");
+        let i = prod.find("tauri::generate_handler![").expect("invoke_handler 소실");
+        let reg = &prod[i..i + prod[i..].find("\n        ])").expect("핸들러 목록 끝")];
+        for name in ["feed_list", "feed_list_all", "feed_reply"] {
+            assert!(reg.lines().any(|l| l.trim() == format!("{name},")), "{name} 미등재");
+        }
+        // 에이전트 CLI 불변 — operator_token 0건
+        let cys_rs = include_str!("../../src/bin/cys.rs");
+        assert!(!cys_rs.contains("operator_token"), "cys CLI 에 조작자 토큰이 생겼다");
+    }
+
+    /// 목록 응답 — 응답 없는 부서(닫힌 소켓)가 있어도 본부와 나머지가 오고, 그 부서는 오류 행으로 남는다 — 실제 소켓 없이 볼 수 있는 부분: 기본 소켓이 없으면 본부 행이 ok=false.
+    /// (등록부·소켓 접속은 라이브라 시험에서 부르지 않는다 — 판정은 위 순수 함수가 맡는다.)
+    #[test]
+    fn c2_registered_dept_sockets_sorted_and_canonical_filled() {
+        let mut reg = json!({"depts": {"zeta": {"display_name": "제타"}, "alpha": {"socket": "/x/cys-dept-alpha/cys.sock"}}});
+        fill_canonical_dept_sockets(&mut reg);
+        assert_eq!(reg["depts"]["alpha"]["socket"], "/x/cys-dept-alpha/cys.sock", "값이 있는 소켓은 건드리지 않는다");
+        assert!(reg["depts"]["zeta"]["socket"].as_str().map(|s| s.contains("cys-dept-zeta")).unwrap_or(false), "빈 등재는 canonical 로 채운다");
     }
 }

@@ -88,3 +88,80 @@ export const FEED_TOAST_APPROVAL_TITLE = "📥 승인 요청";
 export function feedCreatedToastTitle(kind: unknown): string {
   return isNoticeFeedKind(kind) ? FEED_TOAST_NOTICE_TITLE : FEED_TOAST_APPROVAL_TITLE;
 }
+
+// ═════════ 0.14.44 C2·C3 — 부서 항목 · 끝난 좌석 표지 · 정보성 알림 「확인」 ═════════
+// 데몬 `feed.list` 가 더한 파생 칸 둘: `waiter`(지금 이 항목의 결정을 기다리는 연결이 있는가) · `publisher_alive`(올린 좌석이 살아 있는가 —
+// 올린 좌석을 모르거나 이 데몬이 뜨기 전의 항목이면 null). 옛 데몬은 두 칸이 없다(undefined) — 그때는 아래 판정이 전부 "아니오"라 화면은 종전 그대로다.
+//
+// ★고친 원칙 둘(설계 C3):
+//   ① **표지는 정보일 뿐 단추를 바꾸지 않는다.** 어떤 판정이 틀려도 Allow 가 사라지지 않는다 — 「모르는 종류는 승인 요청으로 둔다」(위 isNoticeFeedKind 주석)와 같은 쪽.
+//   ② **한 번에 정리는 정보성 알림에만** 둔다 — 그것도 기다리는 연결이 없고 데몬이 직접 올린 보고가 아닌 것만.
+
+/** 오너의 카드·결정 카드 종류 — 요청한 좌석이 끝났어도 「요청한 좌석이 종료됨」 표지를 붙이지 않는다(기다리지 않고 올리는 것이 규칙인 카드가 있다 — `handlers.rs` 팀 제안은 `--wait` 불가).
+ *  `learn_proposal` 은 데몬이 올리는 학습 제안(state.rs NOTICE_FEED_KINDS 주석이 결정성으로 못박은 kind). */
+export const OWNER_CARD_FEED_KINDS: readonly string[] = [TEAM_CREATE_KIND, "ceo-promote-request", "cycle-verify", "learn_proposal"];
+
+export function isOwnerCardKind(kind: unknown): boolean {
+  return typeof kind === "string" && OWNER_CARD_FEED_KINDS.indexOf(kind) >= 0;
+}
+
+export interface FeedFacts {
+  kind: string;
+  request_id: string;
+  status?: string;
+  daemon_issued?: boolean;
+  /** 데몬 파생 칸 — 옛 데몬은 없다(undefined). true/false 만 사실이고 null·없음은 모름. */
+  waiter?: boolean | null;
+  publisher_alive?: boolean | null;
+}
+
+const daemonIssuedOf = (i: FeedFacts): boolean => i.daemon_issued ?? i.request_id.startsWith("daemon-");
+
+/** 표지 「요청한 좌석이 종료됨」 — 다섯이 모두 참일 때만: 대기 중 · 데몬이 올린 것이 아님 · 정보성 알림이 아님 · `waiter` = false · `publisher_alive` = false.
+ *  그리고 오너의 카드 종류면 붙이지 않는다. 주제 좌석(surface_id)은 판정에 쓰지 않는다. 표지는 단추를 바꾸지 않는다(「치우기」를 **더할** 뿐). */
+export function isEndedSeatRequest(i: FeedFacts): boolean {
+  return (
+    (i.status ?? "pending") === "pending" &&
+    !daemonIssuedOf(i) &&
+    !isNoticeFeedKind(i.kind) &&
+    i.waiter === false &&
+    i.publisher_alive === false &&
+    !isOwnerCardKind(i.kind)
+  );
+}
+
+/** 정보성 알림의 「확인」 — 정보성 종류 ∧ 기다리는 연결 없음(`waiter` = false)일 때만 Allow·Deny 대신 「확인」 하나(`dismissed`).
+ *  종류는 올린 쪽이 스스로 적는 값이라, 정보성 종류로 올라왔어도 **기다리는 연결이 있으면 종전 단추(Allow·Deny)를 그대로 둔다** —
+ *  「확인」의 응답은 기다리는 쪽에 거부로 가기 때문이다(마지막 확인 D2 · 원칙 ①). */
+export function isConfirmableNotice(i: FeedFacts): boolean {
+  return (i.status ?? "pending") === "pending" && isNoticeFeedKind(i.kind) && i.waiter === false;
+}
+
+/** 「정보성 알림 N건 모두 확인」 대상 — 정보성 종류 ∧ 기다리는 연결 없음 ∧ **데몬이 올린 것이 아님**. 데몬이 직접 올린 보고(부트 실패·경고·오류)는
+ *  한꺼번에 닫지 않고 하나씩 「확인」으로 닫는다 — 부트 실패 보고는 코드가 '조용히 사라지면 안 되는 것'으로 다룬다(`boot_supervisor.rs`). */
+export function isBulkConfirmable(i: FeedFacts): boolean {
+  return isConfirmableNotice(i) && !daemonIssuedOf(i);
+}
+
+/** 한 번에 최대 건수(설계 C3). */
+export const BULK_CONFIRM_MAX = 200;
+
+/** 「모두 확인」 단추 옆에 보일 종류별 건수 문구 — 예 `warn 2 · formation-complete 1`(건수 많은 순 · 종류 이름 순). 대상이 없으면 빈 문자열. */
+export function bulkConfirmSummary(items: readonly FeedFacts[]): string {
+  const counts = new Map<string, number>();
+  for (const i of items) {
+    if (!isBulkConfirmable(i)) continue;
+    counts.set(i.kind, (counts.get(i.kind) ?? 0) + 1);
+  }
+  const rows = [...counts.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return rows.map(([k, n]) => `${k} ${n}`).join(" · ");
+}
+
+export const ENDED_SEAT_MARK = "요청한 좌석이 종료됨";
+export const NOTICE_CONFIRM_LABEL = "확인";
+export const BULK_CONFIRM_TITLE = "기다리는 쪽이 없는 정보성 알림을 한 번에 닫습니다(데몬이 직접 올린 보고·승인 요청·결정 카드는 닫지 않습니다).";
+
+/** 부서 항목의 단추 규칙(설계 C2) — 본부 전용 절차가 붙은 두 종류(팀 만들기 제안 · CEO 승격 요청)는 부서 소켓에서 Allow 를 두지 않고 「그 부서로 이동」만. */
+export function isHeadOnlyProcedureKind(kind: unknown): boolean {
+  return kind === TEAM_CREATE_KIND || kind === "ceo-promote-request";
+}
