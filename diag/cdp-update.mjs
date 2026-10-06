@@ -2955,6 +2955,9 @@ async function main() {
 // ---------------------------------------------------------------------------
 const W44_CYS = args['w44-cys'] === undefined || args['w44-cys'] === true ? '' : String(args['w44-cys']);
 const W44_DEPT_PIPES = args['w44-dept-pipes'] === undefined || args['w44-dept-pipes'] === true ? [] : String(args['w44-dept-pipes']).split(',').map((s) => s.trim()).filter(Boolean);
+const W44_NO_OFFICE = args['w44-no-office'] === true;
+const W44_ONLY_OFFICE = args['w44-only-office'] === true;
+const W44_LEAVE_OFFICE = args['w44-leave-office'] === true;
 const W44_OFFICE_WAIT_MS = Math.max(10, Number(args['w44-office-wait-sec'] || 120)) * 1000;
 const W44_FEED_WAIT_MS = Math.max(10, Number(args['w44-feed-wait-sec'] || 60)) * 1000;
 
@@ -3115,11 +3118,21 @@ async function runW44Mode() {
     await sleep(3000);
     await uiShot('w44-start');
 
+    if (W44_LEAVE_OFFICE) {
+      // only: go back from the office tab to the Live tab (the 3D page stops being the visible tab)
+      await evalJs(w44Expr(pageW44Click, '#btn-cc'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+      await sleep(1500);
+      W.left_office = await evalJs(w44Expr(pageW44Click, '.cc-tab[data-view="live"]'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+      await sleep(3000);
+      await uiShot('w44-left-office');
+      W.finished = iso(); U.stage = 'done'; save();
+      return;
+    }
     // ---- usage view mode ----
     const US = (W.usage = { states: [], clicks: 0 });
     const snap = async (tag) => { try { const s = await evalJs(w44Expr(pageW44Usage), { awaitPromise: false, timeoutMs: 8000 }); s.tag = tag; US.states.push(s); return s; } catch (e) { US.states.push({ tag, error: String(e && e.message ? e.message : e) }); return null; } };
     const first = await snap('initial');
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < (W44_ONLY_OFFICE ? 0 : 3); i++) {
       const c = await evalJs(w44Expr(pageW44ClickUsageMode), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
       US.clicks += c ? 1 : 0;
       await sleep(1500);
@@ -3138,7 +3151,7 @@ async function runW44Mode() {
     await sleep(2500);
     W.feed_tab = await evalJs(w44Expr(pageW44Feed), { awaitPromise: false, timeoutMs: 10000 }).catch((e) => ({ error: String(e) }));
     await uiShot('w44-feed-tab');
-    if (W44_CYS) {
+    if (W44_CYS && !W44_ONLY_OFFICE) {
       await w44Feed(W, 'hq', 'w44 probe approval HQ ' + Date.now(), '');
       for (let i = 0; i < Math.min(W44_DEPT_PIPES.length, 2); i++) {
         await w44Feed(W, 'dept' + (i + 1), 'w44 probe approval DEPT' + (i + 1) + ' ' + Date.now(), W44_DEPT_PIPES[i]);
@@ -3148,6 +3161,7 @@ async function runW44Mode() {
     }
 
     // ---- Control Center > office ----
+    if (W44_NO_OFFICE) { W.finished = iso(); U.stage = 'done'; save(); return; }
     await evalJs(w44Expr(pageW44Click, '.cc-tab[data-view="office"]'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
     const OF = (W.office = { samples: [], bridge_health: null, bridge_world: null, targets: null });
     const to = Date.now();

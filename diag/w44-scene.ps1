@@ -119,29 +119,32 @@ function Invoke-W44Scene {
         $rec['bridge_rows_before'] = Get-W44BridgeRows 'scene-before'
         $extra = ('--w44-cys "{0}" --w44-office-wait-sec 150 --w44-feed-wait-sec 60' -f $cys)
         if ($dp.Count -gt 0) { $extra += (' --w44-dept-pipes "{0}"' -f ($dp.ToArray() -join ',')) }
-        $x = Invoke-UpgNode -Prefix $Prefix -NodeExe $node -Mode 'w44' -Extra $extra -TimeoutSec 700
+        # A) usage + Feed only (no office tab) -> doctor   B) the office tab -> doctor   C) back to the Live tab -> doctor : which step makes the machine slow?
+        $xa = Invoke-UpgNode -Prefix ($Prefix + '-a') -NodeExe $node -Mode 'w44' -Extra ($extra + ' --w44-no-office') -TimeoutSec 400
+        $ja = Read-UpgJson ($Prefix + '-a-cdp.json')
+        if ($null -ne $ja) { $rec['w44_a'] = $ja.w44 }
+        try { $da = Invoke-W44DoctorProbe ('A-no-office-' + $Prefix) 120; $rec['doctor_A_no_office'] = [ordered]@{ seconds = $da['seconds']; finished = $da['finished']; timed_out = $da['timed_out']; rc = $da['rc']; bytes = $da['stdout_bytes'] } } catch { }
+        $x = Invoke-UpgNode -Prefix $Prefix -NodeExe $node -Mode 'w44' -Extra ($extra + ' --w44-only-office') -TimeoutSec 400
         $rec['node'] = $x
         $j = Read-UpgJson ($Prefix + '-cdp.json')
         if ($null -ne $j) { $rec['w44'] = $j.w44; $rec['attached'] = [bool]$j.attached; $rec['app_version'] = $j.app_version }
+        if ($null -ne $ja -and $null -ne $rec['w44']) { $rec['w44'] | Add-Member -NotePropertyName usage -NotePropertyValue $ja.w44.usage -Force; $rec['w44'] | Add-Member -NotePropertyName feed -NotePropertyValue $ja.w44.feed -Force }
         try { $null = Save-Screenshot ($Prefix + '-screen-end.png') } catch { }
         # cys doctor as a streamed probe (also gives the Antigravity / asset lines when it ends)
         try {
-            $dp0 = Invoke-W44DoctorProbe ('scene-' + $Prefix) 300
+            $dp0 = Invoke-W44DoctorProbe ('scene-' + $Prefix) 150
             $txt = ''
             try { $txt = [System.IO.File]::ReadAllText((Join-Path $global:DiagOut ('w44-doctorprobe-scene-' + $Prefix + '-stdout.txt')), [System.Text.Encoding]::UTF8) } catch { }
             $ag = @(); $asset = @()
             foreach ($ln in ($txt -split "`r?`n")) { if ($ln -match 'Antigravity|agy') { $ag += (Limit-Text $ln 400) }; if ($ln -match 'office|web/|assets|pack-heal') { $asset += (Limit-Text $ln 300) } }
+            $rec['doctor_C_after_leaving_office'] = $null
+            try {
+                $null = Invoke-UpgNode -Prefix ($Prefix + '-c') -NodeExe $node -Mode 'w44' -Extra '--w44-leave-office' -TimeoutSec 120
+                Start-Sleep -Seconds 20
+                $dc = Invoke-W44DoctorProbe ('C-left-office-' + $Prefix) 150
+                $rec['doctor_C_after_leaving_office'] = [ordered]@{ seconds = $dc['seconds']; finished = $dc['finished']; timed_out = $dc['timed_out']; rc = $dc['rc']; bytes = $dc['stdout_bytes'] }
+            } catch { $rec['doctor_C_after_leaving_office'] = [ordered]@{ error = $_.Exception.Message } }
             $rec['doctor_after_bridge_killed'] = $null
-            if ($dp0['timed_out']) {
-                # kill the office bridge (python) and run the doctor once more: is the slowness the bridge's / the office tab's doing?
-                try {
-                    $killed = @()
-                    foreach ($pr in @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 20)) { if (([string]$pr.CommandLine) -like '*javis_hud_bridge.py*') { try { Stop-Process -Id ([int]$pr.ProcessId) -Force -ErrorAction Stop; $killed += [int]$pr.ProcessId } catch { } } }
-                    Start-Sleep -Seconds 3
-                    $dp1 = Invoke-W44DoctorProbe ('nobridge-' + $Prefix) 150
-                    $rec['doctor_after_bridge_killed'] = [ordered]@{ killed = $killed; seconds = $dp1['seconds']; finished = $dp1['finished']; timed_out = $dp1['timed_out']; rc = $dp1['rc']; bytes = $dp1['stdout_bytes'] }
-                } catch { $rec['doctor_after_bridge_killed'] = [ordered]@{ error = $_.Exception.Message } }
-            }
             $rec['doctor'] = [ordered]@{ rc = $dp0['rc']; timed_out = $dp0['timed_out']; seconds = $dp0['seconds']; antigravity_lines = $ag; office_or_asset_lines = $asset; bytes = $txt.Length }
         } catch { $rec['doctor'] = [ordered]@{ error = $_.Exception.Message } }
         try {
