@@ -1,0 +1,104 @@
+test_banner_in_iframe_without_terminal_command_and_retry_schedule (test_hud_bridge_0144_bootjs.BootJs.test_banner_in_iframe_without_terminal_command_and_retry_schedule) ... ok
+test_health_boot_id_change_refreshes_once (test_hud_bridge_0144_bootjs.BootJs.test_health_boot_id_change_refreshes_once) ... ok
+test_health_missing_or_old_bridge_does_nothing (test_hud_bridge_0144_bootjs.BootJs.test_health_missing_or_old_bridge_does_nothing) ... ok
+test_no_storage_falls_back_to_url_param (test_hud_bridge_0144_bootjs.BootJs.test_no_storage_falls_back_to_url_param) ... ok
+test_session_cap_10 (test_hud_bridge_0144_bootjs.BootJs.test_session_cap_10) ... ok
+test_source_has_no_new_syntax (test_hud_bridge_0144_bootjs.BootJs.test_source_has_no_new_syntax) ... D:\a\cys-terminal\cys-terminal\p\cysjavis-pack\bin\tests\test_hud_bridge_0144_bootjs.py:170: ResourceWarning: unclosed file <_io.TextIOWrapper name='D:\\a\\cys-terminal\\cys-terminal\\p\\cysjavis-pack\\web\\office-boot.js' mode='r' encoding='utf-8'>
+  src = open(JS, encoding="utf-8").read()
+ResourceWarning: Enable tracemalloc to get the object allocation traceback
+ok
+test_health_200 (test_hud_bridge_0144_specimen.Specimen.test_health_200) ... skipped '유닉스 전용 검체'
+test_lifeline_eof_exits_within_1s_and_no_children (test_hud_bridge_0144_specimen.Specimen.test_lifeline_eof_exits_within_1s_and_no_children) ... skipped '유닉스 전용 검체'
+test_manual_start_without_lifeline_env_ignores_stdin_eof (test_hud_bridge_0144_specimen.Specimen.test_manual_start_without_lifeline_env_ignores_stdin_eof) ... skipped '유닉스 전용 검체'
+test_port_held_exits_fast_and_leaves_token_alone (test_hud_bridge_0144_specimen.Specimen.test_port_held_exits_fast_and_leaves_token_alone) ... skipped '유닉스 전용 검체'
+test_sigterm_exits_within_1s_and_no_children (test_hud_bridge_0144_specimen.Specimen.test_sigterm_exits_within_1s_and_no_children) ... skipped '유닉스 전용 검체'
+test_silent_connection_is_cut_at_30s_and_counted (test_hud_bridge_0144_specimen.Specimen.test_silent_connection_is_cut_at_30s_and_counted) ... skipped '유닉스 전용 검체'
+test_timeout_knob_short_and_off (test_hud_bridge_0144_specimen.Specimen.test_timeout_knob_short_and_off) ... skipped '유닉스 전용 검체'
+test_handle_error_silences_timeout_and_broken_pipe_but_logs_real_errors (test_hud_bridge_0144_unit.LogAndHealth.test_handle_error_silences_timeout_and_broken_pipe_but_logs_real_errors) ... ok
+test_health_assets_reflect_missing_file (test_hud_bridge_0144_unit.LogAndHealth.test_health_assets_reflect_missing_file) ... ok
+test_health_body_fields (test_hud_bridge_0144_unit.LogAndHealth.test_health_body_fields) ... ok
+test_lifeline_reads_without_buffer_lock (test_hud_bridge_0144_unit.LogAndHealth.test_lifeline_reads_without_buffer_lock) ... ok
+test_log_line_head_time_and_thread (test_hud_bridge_0144_unit.LogAndHealth.test_log_line_head_time_and_thread) ... ok
+test_log_never_raises_on_broken_stderr (test_hud_bridge_0144_unit.LogAndHealth.test_log_never_raises_on_broken_stderr) ... ok
+test_timeout_log_error_counts_and_is_silent (test_hud_bridge_0144_unit.LogAndHealth.test_timeout_log_error_counts_and_is_silent) ... ok
+test_asset_response_is_sent_outside_try (test_hud_bridge_0144_unit.SourcePins.test_asset_response_is_sent_outside_try) ... ok
+test_creationflags_and_tmp_and_pick_ctx_pins (test_hud_bridge_0144_unit.SourcePins.test_creationflags_and_tmp_and_pick_ctx_pins) ... ok
+test_every_child_spawn_has_nostdin (test_hud_bridge_0144_unit.SourcePins.test_every_child_spawn_has_nostdin) ... ok
+test_no_parent_probe_calls (test_hud_bridge_0144_unit.SourcePins.test_no_parent_probe_calls) ... ok
+test_lifeline_not_started_without_env (test_hud_bridge_0144_unit.WindowsFake.test_lifeline_not_started_without_env) ... ok
+test_mac_defaults (test_hud_bridge_0144_unit.WindowsFake.test_mac_defaults) ... ok
+test_main_on_posix_binds_first_then_signal_then_lifeline (test_hud_bridge_0144_unit.WindowsFake.test_main_on_posix_binds_first_then_signal_then_lifeline) ... ok
+test_main_on_windows_legacy_binds_late_and_installs_no_signal_or_lifeline (test_hud_bridge_0144_unit.WindowsFake.test_main_on_windows_legacy_binds_late_and_installs_no_signal_or_lifeline) ... ok
+test_timeout_knob (test_hud_bridge_0144_unit.WindowsFake.test_timeout_knob) ... ok
+test_win_new_switch_turns_new_behavior_on (test_hud_bridge_0144_unit.WindowsFake.test_win_new_switch_turns_new_behavior_on) ... ok
+test_windows_variants_are_legacy (test_hud_bridge_0144_unit.WindowsFake.test_windows_variants_are_legacy) ... ok
+test_first_respawn_starts_at_base (test_hud_bridge_backoff.EdgeInputs.test_first_respawn_starts_at_base) ... ok
+test_negative_alive_is_rapid_not_crash (test_hud_bridge_backoff.EdgeInputs.test_negative_alive_is_rapid_not_crash) ... ok
+test_policy_constants_are_sane (test_hud_bridge_backoff.EdgeInputs.test_policy_constants_are_sane) ... ok
+test_cap_is_never_exceeded (test_hud_bridge_backoff.ExponentialBackoff.test_cap_is_never_exceeded) ... ok
+test_monotonic_nondecreasing_under_rapid_exits (test_hud_bridge_backoff.ExponentialBackoff.test_monotonic_nondecreasing_under_rapid_exits) ... ok
+test_rapid_exit_sequence_doubles_to_cap (test_hud_bridge_backoff.ExponentialBackoff.test_rapid_exit_sequence_doubles_to_cap) ... ok
+test_base_exceptions_are_not_swallowed (test_hud_bridge_backoff.ReaderEventFaultIsolation.test_base_exceptions_are_not_swallowed) ... ok
+test_exception_in_one_event_does_not_kill_the_subscription (test_hud_bridge_backoff.ReaderEventFaultIsolation.test_exception_in_one_event_does_not_kill_the_subscription) ... ok
+test_exceptions_at_every_stage_are_isolated (test_hud_bridge_backoff.ReaderEventFaultIsolation.test_exceptions_at_every_stage_are_isolated) ... ok
+test_json_decode_failures_stay_silent (test_hud_bridge_backoff.ReaderEventFaultIsolation.test_json_decode_failures_stay_silent) ... ok
+test_log_is_deduped_per_consecutive_exception_type (test_hud_bridge_backoff.ReaderEventFaultIsolation.test_log_is_deduped_per_consecutive_exception_type) ... ok
+test_log_line_is_single_line_even_for_multiline_messages (test_hud_bridge_backoff.ReaderEventFaultIsolation.test_log_line_is_single_line_even_for_multiline_messages) ... ok
+test_non_dict_json_lines_are_skipped_and_5000_digit_from_is_external (test_hud_bridge_backoff.ReaderEventFaultIsolation.test_non_dict_json_lines_are_skipped_and_5000_digit_from_is_external) ... ok
+test_stop_signal_is_still_an_exit_path (test_hud_bridge_backoff.ReaderEventFaultIsolation.test_stop_signal_is_still_an_exit_path) ... ok
+test_unprintable_exception_and_broken_stderr_do_not_kill_the_reader (test_hud_bridge_backoff.ReaderEventFaultIsolation.test_unprintable_exception_and_broken_stderr_do_not_kill_the_reader) ... ok
+test_stable_life_resets_the_wired_backoff (test_hud_bridge_backoff.ReaderLoopWiring.test_stable_life_resets_the_wired_backoff) ... [hud-bridge] 2026-10-06T06:30:06 [MainThread] events 자식 종료 (sub=wiring-test rc=1 alive=0.1s) — 2s 후 재수립 (지수 백오프)
+[hud-bridge] 2026-10-06T06:30:06 [MainThread] events 자식 종료 (sub=wiring-test rc=1 alive=31.0s) — 2s 후 재수립 (안정 생존 — 백오프 초기화)
+[hud-bridge] 2026-10-06T06:30:06 [MainThread] events 자식 종료 (sub=wiring-test rc=1 alive=0.1s) — 4s 후 재수립 (지수 백오프)
+ok
+test_three_rapid_exits_sleep_exponentially (test_hud_bridge_backoff.ReaderLoopWiring.test_three_rapid_exits_sleep_exponentially) ... [hud-bridge] 2026-10-06T06:30:06 [MainThread] events 자식 종료 (sub=wiring-test rc=1 alive=0.1s) — 2s 후 재수립 (지수 백오프)
+ok
+test_after_reset_storm_restarts_from_base (test_hud_bridge_backoff.StableReset.test_after_reset_storm_restarts_from_base) ... ok
+test_reset_boundary_is_inclusive (test_hud_bridge_backoff.StableReset.test_reset_boundary_is_inclusive) ... ok
+test_stable_life_resets_to_base (test_hud_bridge_backoff.StableReset.test_stable_life_resets_to_base) ... ok
+test_backlog_master_idle_emits_no_fx (test_hud_bridge_master_idle.BacklogGate.test_backlog_master_idle_emits_no_fx) ... ok
+test_v2_payload_yields_same_deadman_frame (test_hud_bridge_master_idle.DeadmanV2Unchanged.test_v2_payload_yields_same_deadman_frame) ... ok
+test_distinct_surfaces_do_not_suppress_each_other (test_hud_bridge_master_idle.MasterIdleCoalesce.test_distinct_surfaces_do_not_suppress_each_other) ... ok
+test_registered_with_pane_idle_parity_window (test_hud_bridge_master_idle.MasterIdleCoalesce.test_registered_with_pane_idle_parity_window) ... ok
+test_second_event_within_window_is_suppressed (test_hud_bridge_master_idle.MasterIdleCoalesce.test_second_event_within_window_is_suppressed) ... ok
+test_window_expiry_reallows (test_hud_bridge_master_idle.MasterIdleCoalesce.test_window_expiry_reallows) ... ok
+test_master_idle_emits_idle_fx_with_role (test_hud_bridge_master_idle.MasterIdleFrame.test_master_idle_emits_idle_fx_with_role) ... ok
+test_payload_field_is_idle_secs_not_idle_seconds (test_hud_bridge_master_idle.MasterIdleFrame.test_payload_field_is_idle_secs_not_idle_seconds) ... ok
+test_role_generalization_passthrough (test_hud_bridge_master_idle.MasterIdleFrame.test_role_generalization_passthrough) ... ok
+test_master_idle_does_not_suppress_pane_idle (test_hud_bridge_master_idle.PaneIdleIsolation.test_master_idle_does_not_suppress_pane_idle) ... ok
+test_completed_file_does_not_shadow_pending_one (test_hud_bridge_skew.DeclaredOwnerLabel.test_completed_file_does_not_shadow_pending_one)
+★재현 — 같은 라벨 dict 덮어쓰기로 **완료 5/5 가 미완 0/2 를 덮었다**. ... ok
+test_declared_owner_wins_over_filename (test_hud_bridge_skew.DeclaredOwnerLabel.test_declared_owner_wins_over_filename) ... ok
+test_hyphen_and_digit_filenames_are_not_dropped (test_hud_bridge_skew.DeclaredOwnerLabel.test_hyphen_and_digit_filenames_are_not_dropped)
+★재현 — 종전 정규식 `[A-Z_]+` 는 숫자·하이픈 파일명을 **통째로 탈락**시켰다. ... ok
+test_old_daemon_without_owner_falls_back_to_filename (test_hud_bridge_skew.DeclaredOwnerLabel.test_old_daemon_without_owner_falls_back_to_filename)
+스큐 안전(ADR-2) — 구버전 데몬(owner 필드 없음)에서는 종전 동작 그대로다. ... ok
+test_owner_label_is_normalized_to_role_space (test_hud_bridge_skew.DeclaredOwnerLabel.test_owner_label_is_normalized_to_role_space) ... ok
+test_event_frame_with_5000_digit_from_is_external (test_hud_bridge_skew.InjectedFromHostileInput.test_event_frame_with_5000_digit_from_is_external) ... ok
+test_huge_python_int_is_external_and_never_raises (test_hud_bridge_skew.InjectedFromHostileInput.test_huge_python_int_is_external_and_never_raises) ... ok
+test_non_numbers_and_mixed_whitespace_are_external_and_never_raise (test_hud_bridge_skew.InjectedFromHostileInput.test_non_numbers_and_mixed_whitespace_are_external_and_never_raise) ... ok
+test_overflowing_digit_strings_are_external_and_never_raise (test_hud_bridge_skew.InjectedFromHostileInput.test_overflowing_digit_strings_are_external_and_never_raise) ... ok
+test_slug_scoped_key_and_digit_limit_constant (test_hud_bridge_skew.InjectedFromHostileInput.test_slug_scoped_key_and_digit_limit_constant) ... ok
+test_surrounding_whitespace_is_trimmed_like_the_daemon (test_hud_bridge_skew.InjectedFromHostileInput.test_surrounding_whitespace_is_trimmed_like_the_daemon) ... ok
+test_zero_padded_long_numbers_are_seats_like_the_daemon_parse (test_hud_bridge_skew.InjectedFromHostileInput.test_zero_padded_long_numbers_are_seats_like_the_daemon_parse) ... ok
+test_dept_slug_scopes_the_key (test_hud_bridge_skew.InjectedFromLabel.test_dept_slug_scopes_the_key) ... ok
+test_event_frame_label_from_is_external_not_a_node_key (test_hud_bridge_skew.InjectedFromLabel.test_event_frame_label_from_is_external_not_a_node_key) ... ok
+test_event_frame_missing_or_null_from_is_external (test_hud_bridge_skew.InjectedFromLabel.test_event_frame_missing_or_null_from_is_external) ... ok
+test_event_frame_seat_from_keeps_the_canonical_key (test_hud_bridge_skew.InjectedFromLabel.test_event_frame_seat_from_keeps_the_canonical_key) ... ok
+test_helper_truth_table (test_hud_bridge_skew.InjectedFromLabel.test_helper_truth_table) ... ok
+test_label_is_informational_not_warning (test_hud_bridge_skew.OnboardingDefense.test_label_is_informational_not_warning) ... ok
+test_no_todo_no_section (test_hud_bridge_skew.OnboardingDefense.test_no_todo_no_section) ... ok
+test_unclaimed_keeps_its_progress (test_hud_bridge_skew.OnboardingDefense.test_unclaimed_keeps_its_progress) ... ok
+test_old_daemon_event_does_not_erase_known_verdict (test_hud_bridge_skew.SkewSafety.test_old_daemon_event_does_not_erase_known_verdict) ... ok
+test_old_daemon_event_frame_is_byte_identical (test_hud_bridge_skew.SkewSafety.test_old_daemon_event_frame_is_byte_identical) ... ok
+test_old_daemon_status_snapshot_is_untouched (test_hud_bridge_skew.SkewSafety.test_old_daemon_status_snapshot_is_untouched) ... ok
+test_event_frame_carries_flag (test_hud_bridge_skew.VerdictDisplay.test_event_frame_carries_flag) ... ok
+test_flag_is_released_when_file_becomes_counted (test_hud_bridge_skew.VerdictDisplay.test_flag_is_released_when_file_becomes_counted) ... ok
+test_snapshot_exposes_flag_to_hud_clients (test_hud_bridge_skew.VerdictDisplay.test_snapshot_exposes_flag_to_hud_clients) ... ok
+test_status_snapshot_labels_unclaimed_and_orphan (test_hud_bridge_skew.VerdictDisplay.test_status_snapshot_labels_unclaimed_and_orphan) ... ok
+test_unknown_verdict_is_silent (test_hud_bridge_skew.VerdictDisplay.test_unknown_verdict_is_silent) ... ok
+
+----------------------------------------------------------------------
+Ran 89 tests in 0.469s
+
+OK (skipped=7)

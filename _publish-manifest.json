@@ -1,0 +1,76 @@
+{
+  "generated": "2026-10-06T06:30:06.589Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37423510218",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37423510218",
+  "job": "w44-unit-v0.14.44-candidate",
+  "os": "windows-latest",
+  "branch": "diag-results/37423510218-1-w44-unit-v0.14.44-candidate-windows-latest",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "w44-unit-cys-approval-bigstack.log",
+      "bytes": 1988
+    },
+    {
+      "path": "w44-unit-cys-approval.log",
+      "bytes": 2278
+    },
+    {
+      "path": "w44-unit-cysd-approval.log",
+      "bytes": 19895
+    },
+    {
+      "path": "w44-unit-cysd-knobs.log",
+      "bytes": 8542
+    },
+    {
+      "path": "w44-unit-cysd-office_bridge.log",
+      "bytes": 10340
+    },
+    {
+      "path": "w44-unit-env.txt",
+      "bytes": 606
+    },
+    {
+      "path": "w44-unit-lib-all-approval.log",
+      "bytes": 2170
+    },
+    {
+      "path": "w44-unit-lib-bridge-probe.log",
+      "bytes": 2602
+    },
+    {
+      "path": "w44-unit-lib-is_dept_socket.log",
+      "bytes": 2066
+    },
+    {
+      "path": "w44-unit-list-cysd-all.txt",
+      "bytes": 152342
+    },
+    {
+      "path": "w44-unit-list-lib-is_dept_socket.txt",
+      "bytes": 13947
+    },
+    {
+      "path": "w44-unit-py-test_capgate_hook_shell.log",
+      "bytes": 19465
+    },
+    {
+      "path": "w44-unit-py-test_hud_bridge.log",
+      "bytes": 13756
+    },
+    {
+      "path": "w44-unit-py-test_hud_detail_v11.log",
+      "bytes": 113
+    },
+    {
+      "path": "w44-unit-summary.txt",
+      "bytes": 1955
+    }
+  ],
+  "skipped": [],
+  "inline_files": 15,
+  "blob_files": 0
+}

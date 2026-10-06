@@ -1,0 +1,308 @@
+[1m[92m    Updating[0m crates.io index
+[1m[92m Downloading[0m crates ...
+[1m[92m  Downloaded[0m anstyle-wincon v3.0.11
+[1m[92m  Downloaded[0m adler2 v2.0.1
+[1m[92m  Downloaded[0m quote v1.0.45
+[1m[92m  Downloaded[0m arrayvec v0.7.6
+[1m[92m  Downloaded[0m block-buffer v0.10.4
+[1m[92m  Downloaded[0m cfg-if v1.0.4
+[1m[92m  Downloaded[0m anstyle-query v1.1.5
+[1m[92m  Downloaded[0m colorchoice v1.0.5
+[1m[92m  Downloaded[0m crypto-common v0.1.7
+[1m[92m  Downloaded[0m ct-codecs v1.1.7
+[1m[92m  Downloaded[0m pbkdf2 v0.12.2
+[1m[92m  Downloaded[0m clap_lex v1.1.0
+[1m[92m  Downloaded[0m generic-array v0.14.7
+[1m[92m  Downloaded[0m inout v0.1.4
+[1m[92m  Downloaded[0m cpufeatures v0.2.17
+[1m[92m  Downloaded[0m downcast-rs v1.2.1
+[1m[92m  Downloaded[0m is_terminal_polyfill v1.70.2
+[1m[92m  Downloaded[0m itoa v1.0.18
+[1m[92m  Downloaded[0m dirs-sys v0.5.0
+[1m[92m  Downloaded[0m salsa20 v0.10.2
+[1m[92m  Downloaded[0m serde_spanned v1.1.1
+[1m[92m  Downloaded[0m equivalent v1.0.2
+[1m[92m  Downloaded[0m heck v0.5.0
+[1m[92m  Downloaded[0m shared_library v0.1.9
+[1m[92m  Downloaded[0m option-ext v0.2.0
+[1m[92m  Downloaded[0m strsim v0.11.1
+[1m[92m  Downloaded[0m cfg_aliases v0.1.1
+[1m[92m  Downloaded[0m windows-result v0.1.2
+[1m[92m  Downloaded[0m version_check v0.9.5
+[1m[92m  Downloaded[0m utf8parse v0.2.2
+[1m[92m  Downloaded[0m shell-words v1.1.1
+[1m[92m  Downloaded[0m strip-ansi-escapes v0.2.1
+[1m[92m  Downloaded[0m fallible-streaming-iterator v0.1.9
+[1m[92m  Downloaded[0m once_cell_polyfill v1.70.2
+[1m[92m  Downloaded[0m subtle v2.6.1
+[1m[92m  Downloaded[0m filedescriptor v0.8.3
+[1m[92m  Downloaded[0m rtoolbox v0.0.5
+[1m[92m  Downloaded[0m scrypt v0.11.0
+[1m[92m  Downloaded[0m anstream v1.0.0
+[1m[92m  Downloaded[0m bitflags v1.3.2
+[1m[92m  Downloaded[0m autocfg v1.5.1
+[1m[92m  Downloaded[0m dirs v6.0.0
+[1m[92m  Downloaded[0m cipher v0.4.4
+[1m[92m  Downloaded[0m shlex v2.0.1
+[1m[92m  Downloaded[0m digest v0.10.7
+[1m[92m  Downloaded[0m filetime v0.2.29
+[1m[92m  Downloaded[0m lazy_static v1.5.0
+[1m[92m  Downloaded[0m anstyle v1.0.14
+[1m[92m  Downloaded[0m minisign v0.7.9
+[1m[92m  Downloaded[0m vte_generate_state_changes v0.1.2
+[1m[92m  Downloaded[0m anstyle-parse v1.0.0
+[1m[92m  Downloaded[0m foldhash v0.2.0
+[1m[92m  Downloaded[0m pin-project-lite v0.2.17
+[1m[92m  Downloaded[0m rpassword v7.5.4
+[1m[92m  Downloaded[0m windows-targets v0.52.6
+[1m[92m  Downloaded[0m tokio-macros v2.7.0
+[1m[92m  Downloaded[0m windows-implement v0.57.0
+[1m[92m  Downloaded[0m windows-interface v0.57.0
+[1m[92m  Downloaded[0m minisign-verify v0.2.5
+[1m[92m  Downloaded[0m pkg-config v0.3.33
+[1m[92m  Downloaded[0m sha2 v0.10.9
+[1m[92m  Downloaded[0m find-msvc-tools v0.1.9
+[1m[92m  Downloaded[0m simd-adler32 v0.3.9
+[1m[92m  Downloaded[0m clap_derive v4.6.1
+[1m[92m  Downloaded[0m thiserror-impl v1.0.69
+[1m[92m  Downloaded[0m once_cell v1.21.4
+[1m[92m  Downloaded[0m serial2 v0.2.37
+[1m[92m  Downloaded[0m getrandom v0.2.17
+[1m[92m  Downloaded[0m hmac v0.12.1
+[1m[92m  Downloaded[0m smallvec v1.15.1
+[1m[92m  Downloaded[0m fallible-iterator v0.3.0
+[1m[92m  Downloaded[0m hashlink v0.9.1
+[1m[92m  Downloaded[0m serde_derive v1.0.228
+[1m[92m  Downloaded[0m ahash v0.8.12
+[1m[92m  Downloaded[0m bitflags v2.13.0
+[1m[92m  Downloaded[0m crc32fast v1.5.0
+[1m[92m  Downloaded[0m serde_core v1.0.228
+[1m[92m  Downloaded[0m anyhow v1.0.102
+[1m[92m  Downloaded[0m clap v4.6.1
+[1m[92m  Downloaded[0m num-traits v0.2.19
+[1m[92m  Downloaded[0m proc-macro2 v1.0.106
+[1m[92m  Downloaded[0m socket2 v0.6.4
+[1m[92m  Downloaded[0m thiserror v1.0.69
+[1m[92m  Downloaded[0m log v0.4.32
+[1m[92m  Downloaded[0m toml v1.1.2+spec-1.1.0
+[1m[92m  Downloaded[0m base64 v0.22.1
+[1m[92m  Downloaded[0m bytes v1.11.1
+[1m[92m  Downloaded[0m cc v1.2.63
+[1m[92m  Downloaded[0m diffy v0.5.1
+[1m[92m  Downloaded[0m miniz_oxide v0.8.9
+[1m[92m  Downloaded[0m windows-link v0.2.1
+[1m[92m  Downloaded[0m toml_datetime v1.1.1+spec-1.1.0
+[1m[92m  Downloaded[0m winreg v0.10.1
+[1m[92m  Downloaded[0m toml_writer v1.1.1+spec-1.1.0
+[1m[92m  Downloaded[0m serde v1.0.228
+[1m[92m  Downloaded[0m indexmap v2.14.0
+[1m[92m  Downloaded[0m vt100 v0.15.2
+[1m[92m  Downloaded[0m vte v0.11.1
+[1m[92m  Downloaded[0m zmij v1.0.21
+[1m[92m  Downloaded[0m flate2 v1.1.9
+[1m[92m  Downloaded[0m memchr v2.8.1
+[1m[92m  Downloaded[0m mio v1.2.1
+[1m[92m  Downloaded[0m toml_parser v1.1.2+spec-1.1.0
+[1m[92m  Downloaded[0m ntapi v0.4.3
+[1m[92m  Downloaded[0m serde_json v1.0.150
+[1m[92m  Downloaded[0m hashbrown v0.14.5
+[1m[92m  Downloaded[0m regex v1.12.4
+[1m[92m  Downloaded[0m rusqlite v0.32.1
+[1m[92m  Downloaded[0m aho-corasick v1.1.4
+[1m[92m  Downloaded[0m clap_builder v4.6.0
+[1m[92m  Downloaded[0m sysinfo v0.33.1
+[1m[92m  Downloaded[0m hashbrown v0.17.1
+[1m[92m  Downloaded[0m chrono v0.4.45
+[1m[92m  Downloaded[0m syn v2.0.117
+[1m[92m  Downloaded[0m nix v0.28.0
+[1m[92m  Downloaded[0m regex-syntax v0.8.11
+[1m[92m  Downloaded[0m unicode-ident v1.0.24
+[1m[92m  Downloaded[0m vte v0.14.1
+[1m[92m  Downloaded[0m regex-automata v0.4.14
+[1m[92m  Downloaded[0m windows-core v0.57.0
+[1m[92m  Downloaded[0m tar v0.4.46
+[1m[92m  Downloaded[0m winresource v0.1.31
+[1m[92m  Downloaded[0m libc v0.2.186
+[1m[92m  Downloaded[0m typenum v1.20.1
+[1m[92m  Downloaded[0m unicode-width v0.1.14
+[1m[92m  Downloaded[0m winnow v1.0.3
+[1m[92m  Downloaded[0m vcpkg v0.2.15
+[1m[92m  Downloaded[0m zerocopy v0.8.52
+[1m[92m  Downloaded[0m windows_x86_64_msvc v0.52.6
+[1m[92m  Downloaded[0m tokio v1.52.3
+[1m[92m  Downloaded[0m winapi v0.3.9
+[1m[92m  Downloaded[0m libsqlite3-sys v0.30.1
+[1m[92m  Downloaded[0m windows-sys v0.59.0
+[1m[92m  Downloaded[0m windows-sys v0.61.2
+[1m[92m  Downloaded[0m windows v0.57.0
+[1m[92m   Compiling[0m version_check v0.9.5
+[1m[92m   Compiling[0m proc-macro2 v1.0.106
+[1m[92m   Compiling[0m quote v1.0.45
+[1m[92m   Compiling[0m unicode-ident v1.0.24
+[1m[92m   Compiling[0m windows-link v0.2.1
+[1m[92m   Compiling[0m windows-sys v0.61.2
+[1m[92m   Compiling[0m cfg-if v1.0.4
+[1m[92m   Compiling[0m generic-array v0.14.7
+[1m[92m   Compiling[0m typenum v1.20.1
+[1m[92m   Compiling[0m windows_x86_64_msvc v0.52.6
+[1m[92m   Compiling[0m serde_core v1.0.228
+[1m[92m   Compiling[0m syn v2.0.117
+[1m[92m   Compiling[0m windows-targets v0.52.6
+[1m[92m   Compiling[0m crypto-common v0.1.7
+[1m[92m   Compiling[0m memchr v2.8.1
+[1m[92m   Compiling[0m winapi v0.3.9
+[1m[92m   Compiling[0m libc v0.2.186
+[1m[92m   Compiling[0m block-buffer v0.10.4
+[1m[92m   Compiling[0m zmij v1.0.21
+[1m[92m   Compiling[0m subtle v2.6.1
+[1m[92m   Compiling[0m zerocopy v0.8.52
+[1m[92m   Compiling[0m utf8parse v0.2.2
+[1m[92m   Compiling[0m digest v0.10.7
+[1m[92m   Compiling[0m ahash v0.8.12
+[1m[92m   Compiling[0m itoa v1.0.18
+[1m[92m   Compiling[0m find-msvc-tools v0.1.9
+[1m[92m   Compiling[0m serde_json v1.0.150
+[1m[92m   Compiling[0m shlex v2.0.1
+[1m[92m   Compiling[0m winnow v1.0.3
+[1m[92m   Compiling[0m toml_parser v1.1.2+spec-1.1.0
+[1m[92m   Compiling[0m cc v1.2.63
+[1m[92m   Compiling[0m toml_datetime v1.1.1+spec-1.1.0
+[1m[92m   Compiling[0m serde_spanned v1.1.1
+[1m[92m   Compiling[0m inout v0.1.4
+[1m[92m   Compiling[0m anstyle v1.0.14
+[1m[92m   Compiling[0m vcpkg v0.2.15
+[1m[92m   Compiling[0m once_cell v1.21.4
+[1m[92m   Compiling[0m autocfg v1.5.1
+[1m[92m   Compiling[0m thiserror v1.0.69
+[1m[92m   Compiling[0m once_cell_polyfill v1.70.2
+[1m[92m   Compiling[0m cfg_aliases v0.1.1
+[1m[92m   Compiling[0m pkg-config v0.3.33
+[1m[92m   Compiling[0m nix v0.28.0
+[1m[92m   Compiling[0m anstyle-wincon v3.0.11
+[1m[92m   Compiling[0m num-traits v0.2.19
+[1m[92m   Compiling[0m cipher v0.4.4
+[1m[92m   Compiling[0m libsqlite3-sys v0.30.1
+[1m[92m   Compiling[0m toml v1.1.2+spec-1.1.0
+[1m[92m   Compiling[0m windows-implement v0.57.0
+[1m[92m   Compiling[0m windows-interface v0.57.0
+[1m[92m   Compiling[0m thiserror-impl v1.0.69
+[1m[92m   Compiling[0m hmac v0.12.1
+[1m[92m   Compiling[0m anstyle-parse v1.0.0
+[1m[92m   Compiling[0m anstyle-query v1.1.5
+[1m[92m   Compiling[0m windows-result v0.1.2
+[1m[92m   Compiling[0m windows-sys v0.59.0
+[1m[92m   Compiling[0m cpufeatures v0.2.17
+[1m[92m   Compiling[0m bitflags v2.13.0
+[1m[92m   Compiling[0m winreg v0.10.1
+[1m[92m   Compiling[0m is_terminal_polyfill v1.70.2
+[1m[92m   Compiling[0m ntapi v0.4.3
+[1m[92m   Compiling[0m anyhow v1.0.102
+[1m[92m   Compiling[0m colorchoice v1.0.5
+[1m[92m   Compiling[0m crc32fast v1.5.0
+[1m[92m   Compiling[0m anstream v1.0.0
+[1m[92m   Compiling[0m sha2 v0.10.9
+[1m[92m   Compiling[0m hashbrown v0.14.5
+[1m[92m   Compiling[0m windows-core v0.57.0
+[1m[92m   Compiling[0m pbkdf2 v0.12.2
+[1m[92m   Compiling[0m winresource v0.1.31
+[1m[92m   Compiling[0m salsa20 v0.10.2
+[1m[92m   Compiling[0m aho-corasick v1.1.4
+[1m[92m   Compiling[0m vte_generate_state_changes v0.1.2
+[1m[92m   Compiling[0m regex-syntax v0.8.11
+[1m[92m   Compiling[0m rtoolbox v0.0.5
+[1m[92m   Compiling[0m strsim v0.11.1
+[1m[92m   Compiling[0m arrayvec v0.7.6
+[1m[92m   Compiling[0m clap_lex v1.1.0
+[1m[92m   Compiling[0m simd-adler32 v0.3.9
+[1m[92m   Compiling[0m option-ext v0.2.0
+[1m[92m   Compiling[0m serde v1.0.228
+[1m[92m   Compiling[0m foldhash v0.2.0
+[1m[92m   Compiling[0m log v0.4.32
+[1m[92m   Compiling[0m adler2 v2.0.1
+[1m[92m   Compiling[0m heck v0.5.0
+[1m[92m   Compiling[0m lazy_static v1.5.0
+[1m[92m   Compiling[0m miniz_oxide v0.8.9
+[1m[92m   Compiling[0m shared_library v0.1.9
+[1m[92m   Compiling[0m clap_derive v4.6.1
+[1m[92m   Compiling[0m regex-automata v0.4.14
+[1m[92m   Compiling[0m hashbrown v0.17.1
+[1m[92m   Compiling[0m dirs-sys v0.5.0
+[1m[92m   Compiling[0m clap_builder v4.6.0
+[1m[92m   Compiling[0m vte v0.11.1
+[1m[92m   Compiling[0m rpassword v7.5.4
+[1m[92m   Compiling[0m scrypt v0.11.0
+[1m[92m   Compiling[0m cys-terminal v0.14.44 (D:\a\cys-terminal\cys-terminal\p)
+[1m[92m   Compiling[0m windows v0.57.0
+[1m[92m   Compiling[0m hashlink v0.9.1
+[1m[92m   Compiling[0m filedescriptor v0.8.3
+[1m[92m   Compiling[0m tokio-macros v2.7.0
+[1m[92m   Compiling[0m serde_derive v1.0.228
+[1m[92m   Compiling[0m serial2 v0.2.37
+[1m[92m   Compiling[0m socket2 v0.6.4
+[1m[92m   Compiling[0m mio v1.2.1
+[1m[92m   Compiling[0m vte v0.14.1
+[1m[92m   Compiling[0m getrandom v0.2.17
+[1m[92m   Compiling[0m filetime v0.2.29
+[1m[92m   Compiling[0m bytes v1.11.1
+[1m[92m   Compiling[0m smallvec v1.15.1
+[1m[92m   Compiling[0m pin-project-lite v0.2.17
+[1m[92m   Compiling[0m bitflags v1.3.2
+[1m[92m   Compiling[0m fallible-streaming-iterator v0.1.9
+[1m[92m   Compiling[0m fallible-iterator v0.3.0
+[1m[92m   Compiling[0m unicode-width v0.1.14
+[1m[92m   Compiling[0m shell-words v1.1.1
+[1m[92m   Compiling[0m downcast-rs v1.2.1
+[1m[92m   Compiling[0m ct-codecs v1.1.7
+[1m[92m   Compiling[0m portable-pty v0.9.0 (D:\a\cys-terminal\cys-terminal\p\vendor\portable-pty)
+[1m[92m   Compiling[0m minisign v0.7.9
+[1m[92m   Compiling[0m vt100 v0.15.2
+[1m[92m   Compiling[0m rusqlite v0.32.1
+[1m[92m   Compiling[0m tokio v1.52.3
+[1m[92m   Compiling[0m tar v0.4.46
+[1m[92m   Compiling[0m strip-ansi-escapes v0.2.1
+[1m[92m   Compiling[0m flate2 v1.1.9
+[1m[92m   Compiling[0m clap v4.6.1
+[1m[92m   Compiling[0m chrono v0.4.45
+[1m[92m   Compiling[0m regex v1.12.4
+[1m[92m   Compiling[0m dirs v6.0.0
+[1m[92m   Compiling[0m diffy v0.5.1
+[1m[92m   Compiling[0m base64 v0.22.1
+[1m[92m   Compiling[0m minisign-verify v0.2.5
+[1m[92m   Compiling[0m sysinfo v0.33.1
+[1m[93mwarning[0m[1m[97m: unused import: `ChildLifetime`[0m
+    [1m[96m--> [0msrc\lib.rs:5385:17
+     [1m[96m|[0m
+[1m[96m5385[0m [1m[96m|[0m     use super::{ChildLifetime, SpawnPolicy, ENV_NO_AUTOSTART, NO_AUTOSTART_ON};
+     [1m[96m|[0m                 [1m[93m^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: method `unix_setsid` is never used[0m
+   [1m[96m--> [0msrc\lib.rs:295:14
+    [1m[96m|[0m
+[1m[96m272[0m [1m[96m|[0m impl ChildLifetime {
+    [1m[96m|[0m [1m[96m------------------[0m [1m[96mmethod in this implementation[0m
+[1m[96m...[0m
+[1m[96m295[0m [1m[96m|[0m     const fn unix_setsid(self) -> bool {
+    [1m[96m|[0m              [1m[93m^^^^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: function `marker_of` is never used[0m
+    [1m[96m--> [0msrc\app_bundle.rs:1177:8
+     [1m[96m|[0m
+[1m[96m1177[0m [1m[96m|[0m     fn marker_of(app: &Path) -> String {
+     [1m[96m|[0m        [1m[93m^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `residue` is never used[0m
+    [1m[96m--> [0msrc\app_bundle.rs:1182:8
+     [1m[96m|[0m
+[1m[96m1182[0m [1m[96m|[0m     fn residue(root: &Path, dest_name: &str) -> Vec<String> {
+     [1m[96m|[0m        [1m[93m^^^^^^^[0m
+
+[1m[93mwarning[0m: `cys-terminal` (lib test) generated 4 warnings (run `cargo fix --lib -p cys-terminal --tests` to apply 1 suggestion)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 1m 43s
+[1m[92m     Running[0m unittests src\lib.rs (target\debug\deps\cys-66c3ebe14de53cc6.exe)
+tests::is_dept_socket_detects_dept_not_main: test
+
+1 test, 0 benchmarks
