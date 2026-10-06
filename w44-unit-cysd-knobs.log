@@ -1,0 +1,165 @@
+### cargo test --bin cysd knobs:: -- --test-threads=1 --nocapture
+[1m[93mwarning[0m[1m[97m: method `unix_setsid` is never used[0m
+   [1m[96m--> [0msrc\lib.rs:295:14
+    [1m[96m|[0m
+[1m[96m272[0m [1m[96m|[0m impl ChildLifetime {
+    [1m[96m|[0m [1m[96m------------------[0m [1m[96mmethod in this implementation[0m
+[1m[96m...[0m
+[1m[96m295[0m [1m[96m|[0m     const fn unix_setsid(self) -> bool {
+    [1m[96m|[0m              [1m[93m^^^^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m: `cys-terminal` (lib) generated 1 warning
+[1m[93mwarning[0m[1m[97m: unused import: `check_surfaces`[0m
+     [1m[96m--> [0msrc\bin\cysd\governance.rs:11421:37
+      [1m[96m|[0m
+[1m[96m11421[0m [1m[96m|[0m         approval_wakeup_suppressed, check_surfaces, collect_descendants, endpoint_key,
+      [1m[96m|[0m                                     [1m[93m^^^^^^^^^^^^^^[0m
+      [1m[96m|[0m
+      [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: unused import: `run_auto_restore_once`[0m
+    [1m[96m--> [0msrc\bin\cysd\main.rs:4971:9
+     [1m[96m|[0m
+[1m[96m4971[0m [1m[96m|[0m         run_auto_restore_once, AutoRestore,
+     [1m[96m|[0m         [1m[93m^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency[0m
+    [1m[96m--> [0msrc\bin\cysd\state.rs:1277:14
+     [1m[96m|[0m
+[1m[96m1277[0m [1m[96m|[0m             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+     [1m[96m|[0m              [1m[93m^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: `#[warn(deprecated)]` on by default
+[1m[96mhelp[0m: replace the use of the deprecated method
+     [1m[96m|[0m
+[1m[96m1277[0m [91m- [0m            .[91mfetch_update[0m(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+[1m[96m1277[0m [92m+ [0m            .[92mtry_update[0m(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+     [1m[96m|[0m
+
+[1m[93mwarning[0m[1m[97m: function `lock_retry_schedule` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\main.rs:1791:4
+     [1m[96m|[0m
+[1m[96m1791[0m [1m[96m|[0m fn lock_retry_schedule() -> Vec<std::time::Duration> {
+     [1m[96m|[0m    [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: function `schedule_for_budget` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\main.rs:1800:4
+     [1m[96m|[0m
+[1m[96m1800[0m [1m[96m|[0m fn schedule_for_budget(budget_ms: u64) -> Vec<std::time::Duration> {
+     [1m[96m|[0m    [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `jittered` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\main.rs:1814:4
+     [1m[96m|[0m
+[1m[96m1814[0m [1m[96m|[0m fn jittered(d: std::time::Duration) -> std::time::Duration {
+     [1m[96m|[0m    [1m[93m^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: method `foldable_len` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\alert_route.rs:852:12
+    [1m[96m|[0m
+[1m[96m554[0m [1m[96m|[0m impl RouteState {
+    [1m[96m|[0m [1m[96m---------------[0m [1m[96mmethod in this implementation[0m
+[1m[96m...[0m
+[1m[96m852[0m [1m[96m|[0m     pub fn foldable_len(&self) -> usize {
+    [1m[96m|[0m            [1m[93m^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `cso_seats` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\alert_route.rs:1767:8
+     [1m[96m|[0m
+[1m[96m1767[0m [1m[96m|[0m pub fn cso_seats(daemon: &Arc<Daemon>) -> (Vec<u64>, Vec<u64>) {
+     [1m[96m|[0m        [1m[93m^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `queue_holds_entry` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\alert_route.rs:2355:4
+     [1m[96m|[0m
+[1m[96m2355[0m [1m[96m|[0m fn queue_holds_entry(daemon: &Arc<Daemon>, entry_id: &str) -> bool {
+     [1m[96m|[0m    [1m[93m^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `echo_token` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\boot_supervisor.rs:1158:8
+     [1m[96m|[0m
+[1m[96m1158[0m [1m[96m|[0m pub fn echo_token(nonce: &str) -> String {
+     [1m[96m|[0m        [1m[93m^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `EVIDENCE` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\boot_supervisor.rs:4744:15
+     [1m[96m|[0m
+[1m[96m4744[0m [1m[96m|[0m         const EVIDENCE: [(&str, &str); 8] = [
+     [1m[96m|[0m               [1m[93m^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: variant `Failed` is never constructed[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:536:5
+    [1m[96m|[0m
+[1m[96m532[0m [1m[96m|[0m pub(crate) enum DirSyncMiss {
+    [1m[96m|[0m                 [1m[96m-----------[0m [1m[96mvariant in this enum[0m
+[1m[96m...[0m
+[1m[96m536[0m [1m[96m|[0m     Failed(String),
+    [1m[96m|[0m     [1m[93m^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `DirSyncMiss` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+[1m[93mwarning[0m[1m[97m: function `note_call` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:591:19
+    [1m[96m|[0m
+[1m[96m591[0m [1m[96m|[0m     pub(crate) fn note_call(real_err: bool) {
+    [1m[96m|[0m                   [1m[93m^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `attempts` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:597:19
+    [1m[96m|[0m
+[1m[96m597[0m [1m[96m|[0m     pub(crate) fn attempts() -> u64 {
+    [1m[96m|[0m                   [1m[93m^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `real_errors` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:601:19
+    [1m[96m|[0m
+[1m[96m601[0m [1m[96m|[0m     pub(crate) fn real_errors() -> u64 {
+    [1m[96m|[0m                   [1m[93m^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `fault_armed` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:604:19
+    [1m[96m|[0m
+[1m[96m604[0m [1m[96m|[0m     pub(crate) fn fault_armed() -> bool {
+    [1m[96m|[0m                   [1m[93m^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: struct `Fault` is never constructed[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:608:23
+    [1m[96m|[0m
+[1m[96m608[0m [1m[96m|[0m     pub(crate) struct Fault;
+    [1m[96m|[0m                       [1m[93m^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: associated function `arm` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:610:23
+    [1m[96m|[0m
+[1m[96m609[0m [1m[96m|[0m     impl Fault {
+    [1m[96m|[0m     [1m[96m----------[0m [1m[96massociated function in this implementation[0m
+[1m[96m610[0m [1m[96m|[0m         pub(crate) fn arm() -> Self {
+    [1m[96m|[0m                       [1m[93m^^^[0m
+
+[1m[93mwarning[0m[1m[97m: calls to `std::mem::drop` with a value that implements `Copy` does nothing[0m
+     [1m[96m--> [0msrc\bin\cysd\handlers.rs:28762:9
+      [1m[96m|[0m
+[1m[96m28762[0m [1m[96m|[0m         drop(old);
+      [1m[96m|[0m         [1m[93m^^^^^[0m[1m[96m---[0m[1m[93m^[0m
+      [1m[96m|[0m              [1m[96m|[0m
+      [1m[96m|[0m              [1m[96margument has type `u64`[0m
+      [1m[96m|[0m
+      [1m[96m= [0m[1m[97mnote[0m: `#[warn(dropping_copy_types)]` on by default
+[1m[96mhelp[0m: use `let _ = ...` to ignore the expression or result
+      [1m[96m|[0m
+[1m[96m28762[0m [91m- [0m        [91mdrop([0mold[91m)[0m;
+[1m[96m28762[0m [92m+ [0m        [92mlet _ = [0mold;
+      [1m[96m|[0m
+
+[1m[93mwarning[0m: `cys-terminal` (bin "cysd" test) generated 19 warnings (run `cargo fix --bin "cysd" -p cys-terminal --tests` to apply 3 suggestions)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+[1m[92m     Running[0m unittests src\bin\cysd\main.rs (target\debug\deps\cysd-bc8fa840eaf549aa.exe)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1902 filtered out; finished in 0.00s
+
