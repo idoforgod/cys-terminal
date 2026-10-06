@@ -2393,6 +2393,75 @@ pub fn is_dept_socket(socket_path: &std::path::Path) -> bool {
         .any(|comp| comp.starts_with("cys-dept-"))
 }
 
+/// ★(0.14.44 · A3) 승인의 "폴더 건너뛰기"·CLI 숫자 토큰 떼기가 다루는 **대상 동사 7종** — 대상을 하나만 받거나 받지 않는 cys 명령.
+/// 게이트 훅(`role-capability-gate.sh`)의 `CSO_CYS_TTL_VERBS`(6종) + `CSO_CYS_OPT_TTL` 의 열쇠(`cycle-agent`)의 합집합과 같아야 한다(데몬 시험이 대조한다).
+pub const APPROVAL_TARGET_VERBS: [&str; 7] =
+    ["kill", "close-surface", "pause", "resume", "tombstone", "launch-agent", "cycle-agent"];
+
+// ★(0.14.44 · A3) 승인 명령 토크나이저 — `src/bin/cysd/approval.rs` 에서 옮겨 왔다(본문 불변 · 데몬과 CLI 가 같은 코드를 쓴다).
+/// 셸 토크나이저(cmux SurfaceResumeCommandCanonicalizer.tokens 포팅): 따옴표('/")·백슬래시
+/// 인식. 미닫힌 따옴표는 None(거부). shell Turing-complete 한계(파이프·;·$())는 prefix
+/// 매칭으로 blast radius만 좁힌다(완전차단 아님).
+pub fn approval_tokenize(command: &str) -> Option<Vec<String>> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut has_token = false;
+    let mut chars = command.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None; // 따옴표 닫힘
+                } else if c == '\\' && q == '"' {
+                    // 큰따옴표 안의 백슬래시: 다음 문자 리터럴(POSIX 근사)
+                    if let Some(&n) = chars.peek() {
+                        if n == '"' || n == '\\' || n == '$' || n == '`' {
+                            cur.push(chars.next().unwrap());
+                        } else {
+                            cur.push('\\');
+                        }
+                    } else {
+                        cur.push('\\');
+                    }
+                } else {
+                    cur.push(c);
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    has_token = true;
+                }
+                '\\' => {
+                    if let Some(n) = chars.next() {
+                        cur.push(n);
+                        has_token = true;
+                    }
+                }
+                ' ' | '\t' | '\n' | '\r' => {
+                    if has_token {
+                        tokens.push(std::mem::take(&mut cur));
+                        has_token = false;
+                    }
+                }
+                _ => {
+                    cur.push(c);
+                    has_token = true;
+                }
+            },
+        }
+    }
+    if quote.is_some() {
+        return None; // 미닫힌 따옴표 = 거부
+    }
+    if has_token {
+        tokens.push(cur);
+    }
+    Some(tokens)
+}
+
 /// Parse a surface reference: "surface:31", "31", or 31 → 31.
 pub fn parse_surface_ref(s: &str) -> Option<u64> {
     let t = s.trim();

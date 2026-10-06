@@ -684,6 +684,15 @@ fn same_dir_on_disk(a: &str, b: &str) -> bool {
     }
 }
 
+/// ★(0.14.44 · A3) 승인 매칭 문맥 — 이 데몬의 묶음 값과 "폴더 건너뛰기" 손잡이. 저장소 잠금 **밖에서** 부른다(파일 입출력이 든다).
+fn approval_match_ctx(daemon: &Arc<Daemon>) -> crate::approval::MatchCtx {
+    let dir = crate::state::state_dir(&daemon.socket_path);
+    crate::approval::MatchCtx {
+        lane: crate::approval::lane_value(&daemon.socket_path, &dir),
+        neutral: crate::approval::cwd_neutral_enabled(),
+    }
+}
+
 /// 승인 저장소 사고를 **stderr 에 한 번만** 남긴다(수렴 R2 · claude minor).
 ///
 /// 왜 한 번인가: 읽기 실패는 사람이 파일을 고칠 때까지 **매 호출** 재발하고, guard.sh 는 위험
@@ -11020,10 +11029,17 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         // 구 데몬은 `method_not_found` 로 답하므로 그 자체가 판정이다(fail-closed).
         // 부작용 0: 어떤 레코드도 읽거나 쓰지 않고 이벤트도 내지 않는다.
         "approval.capabilities" => {
+            // ★(0.14.44 · A3) `cwd_neutral_verbs` — 폴더 건너뛰기가 **켜져 있을 때만** 대상 동사 7종을 싣는다(꺼져 있으면 빈 배열 — 꺼진 상태가 조용히 숨지 않게).
+            let neutral_verbs: Vec<&str> = if crate::approval::cwd_neutral_enabled() {
+                crate::approval::CWD_NEUTRAL_VERBS.to_vec()
+            } else {
+                Vec::new()
+            };
             return Reply::Single(ok_response(
                 &id,
                 json!({"ttl_secs": true, "require_ttl": true,
-                       "ttl_max_secs": APPROVAL_TTL_MAX_SECS}),
+                       "ttl_max_secs": APPROVAL_TTL_MAX_SECS,
+                       "cwd_neutral_verbs": neutral_verbs}),
             ));
         }
 
@@ -11032,10 +11048,16 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 return Reply::Single(err_response(&id, "invalid_params", "missing command"));
             };
             let cwd = param_str(&params, "cwd");
-            let env = params
-                .get("env")
-                .map(crate::approval::env_from_json)
-                .unwrap_or_default();
+            // ★(0.14.44 · A3) 확인용 환경: 요청이 실어 온 예약 이름은 버리고 **데몬이 자기 묶음 값을 넣는다** — 기존 규칙 "레코드 환경 ⊆ 확인 환경"에 따라
+            //   예약 값이 든 레코드는 서명한 그 데몬(같은 상태 폴더)에서만 맞는다. 정책 손잡이는 저장소 잠금 **밖에서** 읽어 값으로 넘긴다(잠금 안에서는 파일 읽기·기다림이 없다).
+            let neutral_ctx = approval_match_ctx(daemon);
+            let env = crate::approval::with_lane_env(
+                params
+                    .get("env")
+                    .map(crate::approval::env_from_json)
+                    .unwrap_or_default(),
+                &neutral_ctx.lane,
+            );
             // ★(0.14.31 · CONTRACTS B-3) TTL 요구 — `cys approval check --require-ttl` 이 싣는다.
             //   true 면 만료되지 않은 **TTL 레코드**만 통과(무기한 구 레코드는 거부).
             //   응답의 `ttl_enforced` 는 "이 데몬이 그 요구를 실제로 집행했다"는 증거다 — 구 데몬은
@@ -11067,7 +11089,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 //   **만료된 승인이 exit 0** 을 받았다(게이트 면제). 이 자리에서 뜬 값 하나로
                 //   선택(`is_expired`)과 응답의 `expires_at` 을 **같이** 판정한다.
                 let now_check_ttl = crate::state::now_epoch();
-                let hit = crate::approval::best_match_index_at(
+                let hit = crate::approval::best_match_index_ctx(
                     records,
                     &secret,
                     &command,
@@ -11075,6 +11097,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     &env,
                     now_check_ttl,
                     require_ttl,
+                    Some(&neutral_ctx),
                 )
                 .filter(|i| {
                     // 응답 계약 재확인: 고른 레코드의 만료가 **이 시각 기준으로도** 미래인가.
@@ -11105,6 +11128,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         &env,
                         now_check_ttl,
                         require_ttl,
+                        Some(&neutral_ctx),
                     ))
                 } else {
                     None
@@ -11226,7 +11250,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             // ★(0.14.44 · A4) `command_text`(명령 원문)가 있으면 **확인(`approval.check`)과 같은 토크나이저**로 쪼갠 결과가 접두다 — 서명이 공백으로만
             //   쪼개 따옴표 문자가 토큰에 남던 것을 없앤다. 옛 CLI 는 이 키를 보내지 않고(종전 배열), 옛 데몬은 이 키를 무시한다(모르는 키).
-            //   · 따옴표가 닫히지 않았으면 `invalid_params`. 토큰 수(2 이상)와 빈 토큰 검사는 **토큰화 결과**에 적용한다(빈 토큰은 거부 — 조용히 버려 접두를 넓히지 않는다).
+            //   · 따옴표가 닫히지 않았으면 `invalid_params`. 토큰 수(2 이상)와 빈 토큰 검사는 **토큰화 결과**에 적용한다(빈 토큰은 종전과 같이 버린다).
             //   · 배열은 접두로 쓰지 않는다. 다만 원문과 어긋난 배열(CLI 가 보내는 종전 공백 분할이나 토큰화 결과가 아닌 것)은 거부한다(독립 검증 X10).
             let prefix: Vec<String> = match params.get("command_text").and_then(|v| v.as_str()) {
                 Some(text) => {
@@ -11245,14 +11269,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             "command_prefix does not match command_text (배열과 원문이 어긋난다)",
                         ));
                     }
-                    if toks.iter().any(|t| t.is_empty()) {
-                        return Reply::Single(err_response(
-                            &id,
-                            "invalid_params",
-                            "command_text has an empty token (빈 토큰은 승인 접두로 쓸 수 없다)",
-                        ));
-                    }
-                    toks
+                    // 빈 토큰은 종전 배열 경로와 같은 규칙으로 버린다(검사는 토큰화 결과에 적용 — 토큰 수 2 이상은 아래 R-GOV-1).
+                    toks.into_iter().filter(|t| !t.is_empty()).collect()
                 }
                 None => raw_prefix.into_iter().filter(|t| !t.is_empty()).collect(),
             };
@@ -11276,10 +11294,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "cwd is required (광역 전-디렉터리 매칭 차단)",
                 ));
             }
-            let env = params
-                .get("env")
-                .map(crate::approval::env_from_json)
-                .unwrap_or_default();
+            // ★(0.14.44 · A3) 요청이 실어 온 예약 이름은 **버린다**(대상 동사가 아니거나 시간 한정이 아닐 때도 — 데몬만 넣는다).
+            let mut env = crate::approval::strip_reserved_env(
+                params
+                    .get("env")
+                    .map(crate::approval::env_from_json)
+                    .unwrap_or_default(),
+            );
             let Some(secret) = crate::approval::signing_secret() else {
                 return Reply::Single(err_response(
                     &id,
@@ -11309,6 +11330,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             };
             // ★(R2F-DM · 성찰 2회차) 서명 시각 셋(`created_at`·`updated_at`·`expires_at`)은 마이크로초로 양자화한 시계에서 나온다(`approval::record_now`·
             //   `quantize_epoch_us`) — 윈도우 100ns 시계의 17자리 값이 JSON 저장→읽기에서 바뀌어 서명이 죽던 것을 막는다(위 check 재서명과 같은 규칙).
+            // ★(0.14.44 · A3) 묶기: 시간 한정(`--ttl`) 서명이고 접두가 `cys`(`cys.exe`) + 대상 동사 7종이며 대상 데몬을 바꾸는 옵션이 없으면, 데몬이
+            //   레코드 `environment` 에 예약 값(이 데몬의 묶음)을 넣는다. 이 칸은 서명 범위 안이라 위조할 수 없고 레코드 형식도 바뀌지 않는다.
+            //   손잡이(`approval_cwd_neutral: false`)가 꺼져 있으면 넣지 않는다 = 0.14.43 의 레코드.
+            if ttl_secs.is_some() && crate::approval::lane_eligible_prefix(&prefix) {
+                let ctx = approval_match_ctx(daemon);
+                if ctx.neutral {
+                    env = crate::approval::with_lane_env(env, &ctx.lane);
+                }
+            }
             let now = crate::approval::record_now();
             let mut rec = crate::approval::ApprovalRecord {
                 version: 1,

@@ -4873,6 +4873,59 @@ const APPROVAL_TTL_UNSUPPORTED: &str = "--ttl 미지원 데몬 — **아무 승�
 이 데몬은 ttl_secs 를 버리고 무기한 승인을 만들었을 것이므로 서명 전에 멈춘다. 데몬을 0.14.31 이상으로 \
 갱신한 뒤 다시 서명하라(무기한 승인이 정말 필요하면 --ttl 을 생략하라).";
 
+/// ★(0.14.44 · A3) 게이트 훅이 남기는 **숫자 한 글자**를 가려낸다. CSO 가 명령 끝에 `2>&1` 이나 `2>/dev/null` 을 붙이면 훅은 방향 전환 기호와 그 대상만 떼어 내고
+/// 앞의 숫자를 명령에 남긴 채 확인에 넘긴다(`cys close-surface surface:5 2>&1` → `… surface:5 2`). 정확 명령 비교(㉣)가 깨지지 않게 CLI 가 그 숫자를 뗀다.
+///
+/// 떼는 조건(전부): ① 대상 동사 7종의 cys 명령이다 ② **원래 명령이 CLI 문법으로 읽히지 않는다 — 문법 오류의 종류가 "남는 인자"(`UnknownArgument`)일 때뿐**(도움말·버전,
+/// 값이 틀린 경우, 옵션 충돌에서는 떼지 않는다) ③ 끝에서 한 자리 숫자 토큰을 하나 또는 둘 떼면 **완전한 명령으로 읽힌다**. 문법은 CLI 가 이미 가진 것(clap)을 그대로 쓴다.
+/// 그대로 읽히는 명령(`cys kill 2` · `cys close-surface 2`)은 손대지 않는다 — 그 `2` 는 대상이다. 뗐을 때만 토큰을 안전하게 다시 이어 붙여 돌려준다. 그 밖에는 **원문 그대로**.
+fn approval_strip_hook_digits(command: &str) -> String {
+    use clap::Parser;
+    let Some(tokens) = cys::approval_tokenize(command) else {
+        return command.to_string();
+    };
+    let is_target = tokens.first().map(|b| b == "cys" || b == "cys.exe").unwrap_or(false)
+        && tokens
+            .get(1)
+            .map(|v| cys::APPROVAL_TARGET_VERBS.contains(&v.as_str()))
+            .unwrap_or(false);
+    if !is_target {
+        return command.to_string();
+    }
+    match Cli::try_parse_from(tokens.iter()) {
+        Ok(_) => return command.to_string(),
+        Err(e) if e.kind() == clap::error::ErrorKind::UnknownArgument => {}
+        Err(_) => return command.to_string(),
+    }
+    let is_digit = |t: &String| t.len() == 1 && t.chars().all(|c| c.is_ascii_digit());
+    for n in 1..=2usize {
+        if tokens.len() < n + 2 {
+            break;
+        }
+        let keep = tokens.len() - n;
+        let tail_ok = tokens.iter().skip(keep).all(is_digit);
+        if !tail_ok {
+            break;
+        }
+        let head: Vec<&String> = tokens.iter().take(keep).collect();
+        if Cli::try_parse_from(head.iter().copied()).is_ok() {
+            return head.iter().map(|t| approval_shell_quote(t)).collect::<Vec<_>>().join(" ");
+        }
+    }
+    command.to_string()
+}
+
+/// 데몬의 토크나이저로 다시 쪼개면 원래 토큰이 나오는 인용(게이트 훅의 `shlex.quote` 와 같은 규칙).
+fn approval_shell_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg.chars().all(|c| c.is_ascii_alphanumeric() || "@%+=:,./-_".contains(c));
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\"'\"'"))
+    }
+}
+
 /// ★(0.14.44 · A2) 데몬의 미승인 응답 `detail` 을 표준오류에 쓸 쉬운 말 한 줄로 바꾼다. 표준출력·종료코드는 건드리지 않는다.
 /// `detail` 이 없거나 모르는 코드면 `None` — 종전(무출력)과 같다.
 fn approval_detail_line(detail: &Value) -> Option<String> {
@@ -5746,6 +5799,8 @@ fn run(command: Command) -> i32 {
             return match action {
                 // exit 0 = 서명됨(통과) / 비0 = 미서명·차단. cysd 미가용 시 fail-closed(비0).
                 ApprovalAction::Check { command, cwd, require_ttl } => {
+                    // ★(0.14.44 · A3) 게이트 훅이 남긴 끝의 숫자 한 글자(`2>&1` 의 `2`)를 가려낸다 — 조건은 함수 설명.
+                    let command = approval_strip_hook_digits(&command);
                     let cwd = cwd.or_else(|| {
                         std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string())
                     });
@@ -33126,6 +33181,67 @@ mod tests {
         assert!(l.contains("글자가 달라") && l.contains("낳을 폴더") && l.contains("꺼져 있습니다"), "{l}");
         assert!(line(json!({"code": "something_new"})).is_none());
         assert!(line(json!(null)).is_none());
+    }
+
+    /// ★(0.14.44 · A3) CLI `approval check` 의 끝 숫자 토큰 떼기 — 대상 동사 7종 × (`2` · `1` · `3` · `1 2`) 는 떼어지고, 숫자 셋 · 그대로 읽히는 명령 · 대상 밖 명령 ·
+    /// 모르는 옵션 · 도움말 · 인자가 모자란 꼴은 **원문 그대로**. 그리고 7종의 완전한 명령 뒤에 인자 하나를 더 붙이면 "남는 인자" 오류다(성질 고정 — 동사 문법이 바뀌면 멈춘다).
+    #[test]
+    fn a3_strip_hook_digits_only_for_the_seven_target_verbs_when_the_rest_is_leftover_args() {
+        use clap::Parser;
+        let complete = [
+            "cys kill 123",
+            "cys close-surface surface:5",
+            "cys pause",
+            "cys resume",
+            "cys tombstone worker",
+            "cys launch-agent --role worker --agent claude --cwd /a/hq",
+            "cys cycle-agent --surface surface:5",
+        ];
+        assert_eq!(complete.len(), cys::APPROVAL_TARGET_VERBS.len());
+        for c in complete {
+            // 성질 ①: 완전한 명령은 그대로 읽히고, 뒤에 인자 하나를 더 붙이면 "남는 인자" 오류다.
+            let toks: Vec<&str> = c.split_whitespace().collect();
+            assert!(Cli::try_parse_from(toks.iter()).is_ok(), "{c}: 완전한 명령이 아니다");
+            let more: Vec<&str> = toks.iter().copied().chain(std::iter::once("2")).collect();
+            let e = Cli::try_parse_from(more.iter()).err().unwrap_or_else(|| panic!("{c} 2: 오류여야 한다"));
+            assert_eq!(e.kind(), clap::error::ErrorKind::UnknownArgument, "{c} 2: {e}");
+            // 성질 ②: 숫자 토큰 하나 또는 둘이 붙은 꼴은 떼어진다.
+            for tail in ["2", "1", "3", "1 2"] {
+                let with = format!("{c} {tail}");
+                assert_eq!(approval_strip_hook_digits(&with), *c, "{with}");
+            }
+            // 숫자 셋은 떼지 않는다.
+            let three = format!("{c} 1 2 3");
+            assert_eq!(approval_strip_hook_digits(&three), three);
+            // 숫자 아닌 한 글자 · 두 자리 숫자는 떼지 않는다.
+            for tail in ["x", "22", "2>&1"] {
+                let with = format!("{c} {tail}");
+                assert_eq!(approval_strip_hook_digits(&with), with, "{with}");
+            }
+            // 완전한 명령은 손대지 않는다.
+            assert_eq!(approval_strip_hook_digits(c), *c);
+        }
+        // 그대로 읽히는 명령의 `2` 는 대상이다.
+        for c in ["cys kill 2", "cys close-surface 2", "cys cycle-agent --surface 2", "cys pause --reason 2"] {
+            assert_eq!(approval_strip_hook_digits(c), c, "{c}");
+        }
+        // 대상 밖 명령 · 다른 cys 동사 · 비 cys 명령.
+        for c in ["git push origin main 2", "cys list 2", "cys send --text x 2", "rm -rf x 2"] {
+            assert_eq!(approval_strip_hook_digits(c), c, "{c}");
+        }
+        // 인자가 모자란 꼴 · 모르는 옵션 · 도움말 · 따옴표가 닫히지 않음.
+        for c in [
+            "cys launch-agent --role worker 2",
+            "cys close-surface surface:5 --bogus 2",
+            "cys close-surface --help 2",
+            "cys kill abc 2",
+            "cys close-surface 'surface:5 2",
+        ] {
+            assert_eq!(approval_strip_hook_digits(c), c, "{c}");
+        }
+        // 떼면서 인용이 필요한 토큰은 다시 쪼갰을 때 같은 토큰이 되도록 인용한다.
+        let out = approval_strip_hook_digits("cys tombstone 'a b' 2");
+        assert_eq!(cys::approval_tokenize(&out), Some(vec!["cys".to_string(), "tombstone".into(), "a b".into()]));
     }
 
     /// `cys reclaim-role --auto` 는 계약 인자 3종(+`--env-role`)을 받는다. 훅이 넘기는 그 형태로 핀.

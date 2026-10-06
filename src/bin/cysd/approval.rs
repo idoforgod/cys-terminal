@@ -229,7 +229,22 @@ impl ApprovalRecord {
 
     /// 명령이 이 레코드 prefix에 매칭하는가: prefix가 명령 토큰의 정확한 접두 + cwd 완전일치
     /// + environment 부분집합(레코드 env가 호출 env에 모두 포함). 빈 prefix·미닫힌 따옴표 거부.
+    #[cfg_attr(not(test), allow(dead_code))] // 운영 경로는 `matches_ctx` 를 부른다 — 이 이름은 종전 호출처·시험용으로 남긴다
     pub fn matches(&self, command: &str, cwd: Option<&str>, env: &[(String, String)]) -> bool {
+        self.matches_ctx(command, cwd, env, None)
+    }
+
+    /// [`matches`] + ★(0.14.44 · A3) 데몬 묶음 문맥. `ctx` 가 `None` 이면 0.14.43 의 규칙 그대로다(스케줄 게이트가 이 길을 쓴다).
+    /// `ctx` 가 있을 때만: ① 예약 값(`CYS_APPROVAL_LANE`)이 든 레코드는 명령에 대상 데몬을 바꾸는 옵션이 있으면 맞지 않는다
+    /// ② 폴더가 다른데 [`neutral_skip`] 의 다섯 조건이 모두 참이면 폴더 비교만 건너뛴다.
+    /// (예약 값 일치 자체는 기존 규칙 "레코드 환경 ⊆ 확인 환경"이 맡는다 — 데몬이 확인용 환경에 자기 값을 넣는다.)
+    pub fn matches_ctx(
+        &self,
+        command: &str,
+        cwd: Option<&str>,
+        env: &[(String, String)],
+        ctx: Option<&MatchCtx>,
+    ) -> bool {
         if self.command_prefix.is_empty() {
             return false; // 폴백 차단
         }
@@ -242,9 +257,15 @@ impl ApprovalRecord {
         if toks[..self.command_prefix.len()] != self.command_prefix[..] {
             return false;
         }
+        if ctx.is_some() && self.lane_value().is_some() && has_socket_option(&toks) {
+            return false; // 이 데몬에서 확인받고 다른 데몬에 집행하는 길을 막는다(A3 · 재확인 R6)
+        }
         if let Some(rc) = &self.cwd {
             if normalize_cwd(cwd).as_deref() != Some(rc.as_str()) {
-                return false;
+                let skip = ctx.is_some_and(|c| neutral_skip(self, command, c));
+                if !skip {
+                    return false;
+                }
             }
         }
         // environment 부분집합: 레코드의 (민감키 drop·정렬된) env 항목이 모두 호출 env에 존재.
@@ -304,6 +325,21 @@ pub fn best_match_index_at(
     now: f64,
     require_ttl: bool,
 ) -> Option<usize> {
+    best_match_index_ctx(records, secret, command, cwd, env, now, require_ttl, None)
+}
+
+/// [`best_match_index_at`] + ★(0.14.44 · A3) 데몬 묶음 문맥(`ctx = None` 이면 0.14.43 과 같은 선택).
+#[allow(clippy::too_many_arguments)]
+pub fn best_match_index_ctx(
+    records: &[ApprovalRecord],
+    secret: &[u8],
+    command: &str,
+    cwd: Option<&str>,
+    env: &[(String, String)],
+    now: f64,
+    require_ttl: bool,
+    ctx: Option<&MatchCtx>,
+) -> Option<usize> {
     records
         .iter()
         .enumerate()
@@ -311,7 +347,7 @@ pub fn best_match_index_at(
             r.has_valid_signature(secret)
                 && !r.is_expired(now)
                 && (!require_ttl || r.expires_at.is_some())
-                && r.matches(command, cwd, env)
+                && r.matches_ctx(command, cwd, env, ctx)
         })
         .max_by(|(_, a), (_, b)| {
             a.command_prefix
@@ -328,68 +364,9 @@ pub fn best_match_index_at(
 
 // ── 토큰화 / 정규화 / 민감 env ─────────────────────────────────────────────────
 
-/// 셸 토크나이저(cmux SurfaceResumeCommandCanonicalizer.tokens 포팅): 따옴표('/")·백슬래시
-/// 인식. 미닫힌 따옴표는 None(거부). shell Turing-complete 한계(파이프·;·$())는 prefix
-/// 매칭으로 blast radius만 좁힌다(완전차단 아님).
-pub fn tokenize(command: &str) -> Option<Vec<String>> {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut has_token = false;
-    let mut chars = command.chars().peekable();
-    let mut quote: Option<char> = None;
-
-    while let Some(c) = chars.next() {
-        match quote {
-            Some(q) => {
-                if c == q {
-                    quote = None; // 따옴표 닫힘
-                } else if c == '\\' && q == '"' {
-                    // 큰따옴표 안의 백슬래시: 다음 문자 리터럴(POSIX 근사)
-                    if let Some(&n) = chars.peek() {
-                        if n == '"' || n == '\\' || n == '$' || n == '`' {
-                            cur.push(chars.next().unwrap());
-                        } else {
-                            cur.push('\\');
-                        }
-                    } else {
-                        cur.push('\\');
-                    }
-                } else {
-                    cur.push(c);
-                }
-            }
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
-                    has_token = true;
-                }
-                '\\' => {
-                    if let Some(n) = chars.next() {
-                        cur.push(n);
-                        has_token = true;
-                    }
-                }
-                ' ' | '\t' | '\n' | '\r' => {
-                    if has_token {
-                        tokens.push(std::mem::take(&mut cur));
-                        has_token = false;
-                    }
-                }
-                _ => {
-                    cur.push(c);
-                    has_token = true;
-                }
-            },
-        }
-    }
-    if quote.is_some() {
-        return None; // 미닫힌 따옴표 = 거부
-    }
-    if has_token {
-        tokens.push(cur);
-    }
-    Some(tokens)
-}
+/// 셸 토크나이저 — ★(0.14.44 · A3) 본문은 공용 라이브러리 `cys::approval_tokenize`(src/lib.rs)로 **한 글자도 바꾸지 않고** 옮겼다(CLI 의 `approval check` 숫자 토큰 떼기가
+/// 데몬과 같은 코드를 쓰게 하려는 것). 이 이름은 그대로 쓰는 호출처·시험을 위한 재공개다.
+pub use cys::approval_tokenize as tokenize;
 
 /// cwd 정규화 — tilde 확장 + 후행 슬래시 제거. 단일머신 전제(symlink 정규화는 비용·미사용).
 pub fn normalize_cwd(cwd: Option<&str>) -> Option<String> {
@@ -798,6 +775,399 @@ pub fn env_from_json(v: &serde_json::Value) -> Vec<(String, String)> {
     sort_norm_env(&raw)
 }
 
+// ── ★(0.14.44 · A3) 대상을 직접 지정하는 cys 명령의 승인은 "폴더" 대신 "서명한 데몬"에 묶는다 ─────────
+
+/// 레코드 `environment` 에 데몬이 넣는 예약 이름. **민감 키 거르기**(`sort_norm_env` — 이름에 TOKEN·SECRET·PASSWORD 같은 글자가 들어 있으면 값을 지운다)에
+/// 걸리지 않는 글자로 정했고, 걸리지 않음을 단위 시험이 고정한다(걸리면 묶음이 조용히 사라진다). 요청이 같은 이름을 실어 오면 모든 갈래에서 버린다.
+pub const LANE_ENV_KEY: &str = "CYS_APPROVAL_LANE";
+
+/// 폴더 비교를 건너뛸 수 있는 대상 동사 7종 — 게이트 훅이 시간 한정 승인을 요구하는 대상 전부(`role-capability-gate.sh` 의 `CSO_CYS_TTL_VERBS` 6종 + `CSO_CYS_OPT_TTL` 열쇠 `cycle-agent`).
+/// 훅의 두 집합과 같은지 대조하는 시험이 있다(`approval_a_tests`).
+pub const CWD_NEUTRAL_VERBS: [&str; 7] = cys::APPROVAL_TARGET_VERBS;
+
+/// 매칭 문맥 — 이 데몬의 묶음 값과 "폴더 건너뛰기" 손잡이. 잠금 **밖에서** 만들어 값으로 넘긴다(잠금 안에서는 파일 읽기·기다림이 없다).
+#[derive(Clone, Debug)]
+pub struct MatchCtx {
+    pub lane: String,
+    pub neutral: bool,
+}
+
+impl ApprovalRecord {
+    /// 레코드의 예약 값(데몬 묶음). 없으면 `None` — 무기한 승인과 대상 동사가 아닌 명령의 승인이 그렇다.
+    pub fn lane_value(&self) -> Option<&str> {
+        self.environment
+            .iter()
+            .find(|(k, _)| k == LANE_ENV_KEY)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// 요청이 실어 온 환경에서 예약 이름을 버린다 — 데몬만 넣는다(서명·확인의 모든 갈래).
+pub fn strip_reserved_env(env: Vec<(String, String)>) -> Vec<(String, String)> {
+    env.into_iter().filter(|(k, _)| k != LANE_ENV_KEY).collect()
+}
+
+/// 환경에 데몬의 묶음 값을 더해 다시 정렬한다(서명과 매칭이 "정렬돼 있음"을 전제한다).
+pub fn with_lane_env(env: Vec<(String, String)>, lane: &str) -> Vec<(String, String)> {
+    let mut e = strip_reserved_env(env);
+    e.push((LANE_ENV_KEY.to_string(), lane.to_string()));
+    sort_norm_env(&e)
+}
+
+/// 접두가 `cys`(또는 `cys.exe`) + 대상 동사 7종인가 — 그 동사(소문자 그대로)를 돌려준다.
+fn target_verb(prefix: &[String]) -> Option<&'static str> {
+    let bin = prefix.first()?;
+    if bin != "cys" && bin != "cys.exe" {
+        return None;
+    }
+    let verb = prefix.get(1)?;
+    CWD_NEUTRAL_VERBS.iter().copied().find(|v| *v == verb.as_str())
+}
+
+/// 이 접두의 서명에 묶음 값을 넣는가(㉡ 의 앞 반 — 접두가 cys + 대상 동사이고 대상 데몬을 바꾸는 옵션이 없다). 시간 한정·손잡이는 호출부가 본다.
+pub fn lane_eligible_prefix(prefix: &[String]) -> bool {
+    target_verb(prefix).is_some() && !has_socket_option(prefix)
+}
+
+/// 대상 데몬을 바꾸는 옵션(`--socket` · `--socket=…` · `-S`)이 **따옴표를 푼 토큰** 가운데 있는가.
+pub fn has_socket_option(tokens: &[String]) -> bool {
+    tokens
+        .iter()
+        .any(|t| t == "--socket" || t.starts_with("--socket=") || t == "-S")
+}
+
+/// `launch-agent` 의 `--cwd` 값이 **글자 그대로의 절대 경로**인가(마지막 확인 D1) — 데몬이 쪼갠 토큰 기준:
+/// `--cwd` 가 정확히 하나, 값이 비어 있지 않고, `/` 로 시작하거나 `<드라이브 문자>:` 뒤에 `/` 또는 `\` 가 오며,
+/// 셸이나 CLI 가 실행 좌석의 폴더로 풀어 버릴 글자(`$` · 백틱 · `~` · `*` · `?` · `[` · `{`)가 없다.
+pub fn launch_cwd_literal_absolute(tokens: &[String]) -> bool {
+    let mut value: Option<&str> = None;
+    let mut count = 0usize;
+    let mut iter = tokens.iter().peekable();
+    while let Some(t) = iter.next() {
+        if t == "--cwd" {
+            count += 1;
+            match iter.peek() {
+                Some(v) => value = Some(v.as_str()),
+                None => return false, // 값 없이 끝남
+            }
+        } else if let Some(v) = t.strip_prefix("--cwd=") {
+            count += 1;
+            value = Some(v);
+        }
+    }
+    if count != 1 {
+        return false;
+    }
+    let Some(v) = value else { return false };
+    if v.is_empty() || v.chars().any(|c| matches!(c, '$' | '`' | '~' | '*' | '?' | '[' | '{')) {
+        return false;
+    }
+    if v.starts_with('/') {
+        return true;
+    }
+    let mut cs = v.chars();
+    match (cs.next(), cs.next(), cs.next()) {
+        (Some(d), Some(':'), Some(sep)) => d.is_ascii_alphabetic() && (sep == '/' || sep == '\\'),
+        _ => false,
+    }
+}
+
+/// 원문 스캔의 한 낱말 — 따옴표 · 이스케이프를 따라가며 모은 **원문 그대로의 글자**와, 따옴표 밖에 연결 기호가 있었는지.
+struct ScanWord {
+    raw: String,
+    meta: bool,
+}
+
+/// 토큰화 **전의 원문**을 인용 상태를 따라가며 훑는다(독립 검증 X21 — 토크나이저는 따옴표를 벗겨 `"$(x)"` 와 `'$(x)'` 의 토큰이 같아진다).
+/// 복합 명령의 표지(따옴표 밖의 줄바꿈 · 작은따옴표 밖의 백틱과 `$(` · 닫히지 않은 따옴표)가 있으면 `None`.
+/// 따옴표 밖의 `;` `&` `|` `<` `>` 는 낱말의 `meta` 로 표시만 한다(출력을 버리는 꼬리는 호출부가 가려낸다).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn scan_words(raw: &str) -> Option<Vec<ScanWord>> {
+    let mut words: Vec<ScanWord> = Vec::new();
+    let mut cur = String::new();
+    let mut meta = false;
+    let mut has_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some('\'') => {
+                cur.push(c);
+                if c == '\'' {
+                    quote = None;
+                }
+            }
+            Some(_) => {
+                // 큰따옴표 안: 백슬래시는 `" \ $ \`` 를 이스케이프한다. 백틱과 `$(` 는 명령 치환(셸이 실행한다)이라 복합으로 본다.
+                match c {
+                    '"' => {
+                        cur.push(c);
+                        quote = None;
+                    }
+                    '\\' => {
+                        cur.push(c);
+                        if let Some(&n) = chars.peek() {
+                            if matches!(n, '"' | '\\' | '$' | '`') {
+                                cur.push(n);
+                                chars.next();
+                            }
+                        }
+                    }
+                    '`' => return None,
+                    '$' => {
+                        if chars.peek() == Some(&'(') {
+                            return None;
+                        }
+                        cur.push(c);
+                    }
+                    _ => cur.push(c),
+                }
+            }
+            None => match c {
+                '\\' => {
+                    cur.push(c);
+                    has_word = true;
+                    match chars.next() {
+                        Some('\n') => return None, // 줄 이음 — 보수적으로 복합
+                        Some(n) => cur.push(n),
+                        None => {}
+                    }
+                }
+                '\'' | '"' => {
+                    quote = Some(c);
+                    cur.push(c);
+                    has_word = true;
+                }
+                '\n' | '`' => return None,
+                '$' => {
+                    if chars.peek() == Some(&'(') {
+                        return None;
+                    }
+                    cur.push(c);
+                    has_word = true;
+                }
+                ';' | '&' | '|' | '<' | '>' => {
+                    meta = true;
+                    cur.push(c);
+                    has_word = true;
+                }
+                ' ' | '\t' | '\r' => {
+                    if has_word {
+                        words.push(ScanWord { raw: std::mem::take(&mut cur), meta });
+                        meta = false;
+                        has_word = false;
+                    }
+                }
+                _ => {
+                    cur.push(c);
+                    has_word = true;
+                }
+            },
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if has_word {
+        words.push(ScanWord { raw: cur, meta });
+    }
+    Some(words)
+}
+
+/// 출력을 버리는 꼬리 — 토큰이 **정확히** 이 글자일 때만(띄어 쓴 꼴은 이어진 두 토큰).
+fn is_tail_single(t: &str) -> bool {
+    matches!(t, "2>&1" | ">/dev/null" | "2>/dev/null" | "&>/dev/null")
+}
+fn is_tail_pair(a: &str, b: &str) -> bool {
+    b == "/dev/null" && matches!(a, ">" | "2>" | "&>")
+}
+
+/// ㉢ **단순 명령**인가 — 따옴표 밖에 `;` `&` `|` `<` `>` · 줄바꿈이 없고 작은따옴표 밖에 백틱 · `$(` 가 없다(출력을 버리는 꼬리는 연결 기호로 치지 않는다).
+/// 단순 명령이면 **꼬리를 뗀 토큰**을 돌려준다(㉣ 정확 명령 비교용). 토큰화 결과로 판정하지 않는다 — 원문 스캐너 + 토큰화의 낱말 수 일치.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn simple_command_core(raw: &str) -> Option<Vec<String>> {
+    let words = scan_words(raw)?;
+    let toks = tokenize(raw)?;
+    if words.len() != toks.len() {
+        return None; // 두 눈이 어긋나면 복합으로 본다(보수)
+    }
+    let mut n = toks.len();
+    loop {
+        let raw_at = |i: usize| words.get(i).map(|w| w.raw.as_str());
+        let tok_at = |i: usize| toks.get(i).map(|t| t.as_str());
+        if n >= 1 {
+            let i = n - 1;
+            if let (Some(t), Some(r)) = (tok_at(i), raw_at(i)) {
+                if is_tail_single(t) && t == r {
+                    n -= 1;
+                    continue;
+                }
+            }
+        }
+        if n >= 2 {
+            let (i, j) = (n - 2, n - 1);
+            if let (Some(ta), Some(tb), Some(ra), Some(rb)) = (tok_at(i), tok_at(j), raw_at(i), raw_at(j)) {
+                if is_tail_pair(ta, tb) && ta == ra && tb == rb {
+                    n -= 2;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    if words.iter().take(n).any(|w| w.meta) {
+        return None;
+    }
+    Some(toks.into_iter().take(n).collect())
+}
+
+/// **폴더 비교를 건너뛰는가**(A3 매칭의 5번 조건) — 아래가 전부 참일 때뿐이다.
+/// ㉠ 레코드에 이 데몬의 예약 값이 있다 · ㉡ 접두가 `cys`(`cys.exe`) + 대상 동사 7종(`launch-agent` 는 낳을 폴더가 글자 그대로의 절대 경로로 적힘)
+/// · ㉢ 확인하는 명령이 단순 명령 · ㉣ 정확 명령(꼬리를 뗀 토큰 전체 = 레코드 토큰) · ㉤ 만료 전의 시간 한정 승인(호출부의 만료 필터 + 여기서 `expires_at` 유무).
+/// 손잡이(`ctx.neutral`)가 꺼져 있으면 항상 거짓이다.
+pub fn neutral_skip(rec: &ApprovalRecord, raw_command: &str, ctx: &MatchCtx) -> bool {
+    neutral_skip_verdict(rec, raw_command, ctx) == SkipVerdict::Applies
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SkipVerdict {
+    Applies,
+    /// 건너뛰지 않는다 — 이유 표시(A2 의 보조 표시)
+    No { not_exact: bool, needs_launch_cwd: bool, neutral_off: bool },
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn neutral_skip_verdict(rec: &ApprovalRecord, raw_command: &str, ctx: &MatchCtx) -> SkipVerdict {
+    let none = SkipVerdict::No { not_exact: false, needs_launch_cwd: false, neutral_off: false };
+    // ㉡ + ㉤(접두가 cys + 대상 동사이고 만료 시각이 있는 시간 한정 레코드만)
+    let Some(verb) = target_verb(&rec.command_prefix) else { return none };
+    if rec.expires_at.is_none() {
+        return none;
+    }
+    // 손잡이가 꺼져 있으면 건너뛰지 않는다 — 꺼진 상태가 조용히 숨지 않게 `neutral_off` 를 말한다(재확인 R7 · 예약 값 유무와 무관).
+    if !ctx.neutral {
+        return SkipVerdict::No { not_exact: false, needs_launch_cwd: false, neutral_off: true };
+    }
+    // ㉠
+    if rec.lane_value() != Some(ctx.lane.as_str()) {
+        return none;
+    }
+    if verb == "launch-agent" && !launch_cwd_literal_absolute(&rec.command_prefix) {
+        return SkipVerdict::No { not_exact: false, needs_launch_cwd: true, neutral_off: false };
+    }
+    // ㉢ + ㉣
+    match simple_command_core(raw_command) {
+        Some(core) if core == rec.command_prefix => SkipVerdict::Applies,
+        _ => SkipVerdict::No { not_exact: true, needs_launch_cwd: false, neutral_off: false },
+    }
+}
+
+// ── 묶음 식별자(상태 폴더의 파일) · 정책 손잡이 ─────────────────────────────────────
+
+/// 묶음 식별자 파일 이름 — 데몬의 상태 폴더 안. 데몬마다 다르고(부서 격리), 부서를 지우면 상태 폴더가 보관함으로 옮겨져 다시 만든 부서는 새 값을 받는다.
+pub const LANE_FILE: &str = "approval-lane";
+
+fn lane_cache() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, String>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, String>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 이 데몬의 예약 값(`소켓 경로|묶음 식별자`). **프로세스가 사는 동안 바뀌지 않는다**(소켓 경로별 캐시 — 같은 값만 돌려준다).
+/// 식별자는 `<상태 폴더>/approval-lane` 의 무작위 값이다. 없으면 만든다. 읽지도 만들지도 못하면(권한 · 디스크) 메모리에만 두는 값으로 떨어지고 로그 한 줄을 남긴다.
+/// 잠금은 이 함수의 캐시 하나뿐이고 그 안에서 파일 입출력을 하지 않는다.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn lane_value(socket_path: &std::path::Path, state_dir: &std::path::Path) -> String {
+    {
+        let g = lane_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(v) = g.get(socket_path) {
+            return v.clone();
+        }
+    }
+    let id = load_or_create_lane_id(state_dir);
+    let value = format!("{}|{}", socket_path.display(), id);
+    let mut g = lane_cache().lock().unwrap_or_else(|e| e.into_inner());
+    g.entry(socket_path.to_path_buf()).or_insert(value).clone()
+}
+
+/// 시험 이음매 — 캐시를 비워 "데몬을 다시 띄움"을 흉내 낸다(릴리스 경로에는 호출처가 없다).
+#[cfg(test)]
+pub(crate) fn forget_lane_cache() {
+    lane_cache().lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn load_or_create_lane_id(state_dir: &std::path::Path) -> String {
+    let path = state_dir.join(LANE_FILE);
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let t = text.trim();
+        if (16..=128).contains(&t.len()) && t.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return t.to_string();
+        }
+    }
+    let id = match random_32() {
+        Some(b) => b.iter().take(16).map(|x| format!("{x:02x}")).collect::<String>(),
+        None => format!("t{:x}{:x}", std::process::id(), crate::state::now_epoch() as u64),
+    };
+    let written = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all(state_dir)?;
+        std::fs::write(&path, id.as_bytes())?;
+        set_owner_only(&path);
+        Ok(())
+    })();
+    if let Err(e) = written {
+        eprintln!(
+            "[approval] 묶음 식별자 파일을 만들지 못해 메모리 값으로 둔다({}: {e}) — 데몬을 다시 띄우면 이 데몬의 시간 한정 승인은 다시 서명해야 한다",
+            path.display()
+        );
+    }
+    id
+}
+
+static NEUTRAL_LOGGED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn policy_path() -> PathBuf {
+    store_root().join(".cys").join("policy.json")
+}
+
+/// 손잡이 `approval_cwd_neutral` — `~/.cys/policy.json`. 파일이나 키가 없으면 켬(기본). **파일이 있는데 읽지 못하거나 깨졌거나 값이 불리언이 아니면 끈 것으로 본다**
+/// (설정을 확실히 읽었을 때만 새 규칙을 쓴다 · 쓰는 도중의 파일을 위해 한 번은 잠깐 뒤에 다시 읽는다). 이 파일은 좌석도 쓸 수 있으므로,
+/// 이 키로 갈 수 있는 가장 느슨한 상태가 0.14.43 의 규칙이다. **저장소 잠금 밖에서** 부른다. 켬/끔이 바뀔 때마다 데몬 로그에 한 줄.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn cwd_neutral_enabled() -> bool {
+    let path = policy_path();
+    let read_once = || -> Option<bool> {
+        match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
+            Err(_) => None,
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Err(_) => None,
+                Ok(v) => match v.get("approval_cwd_neutral") {
+                    None => Some(true),
+                    Some(x) => x.as_bool(),
+                },
+            },
+        }
+    };
+    let on = match read_once() {
+        Some(b) => b,
+        None => {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            read_once().unwrap_or(false)
+        }
+    };
+    let now = if on { 1u8 } else { 2u8 };
+    let prev = NEUTRAL_LOGGED.swap(now, std::sync::atomic::Ordering::Relaxed);
+    if prev != now {
+        eprintln!(
+            "[approval] approval_cwd_neutral {} (정책 파일 {})",
+            if on { "켬 — 대상 동사 승인은 서명한 데몬에 묶고 폴더를 건너뜀" } else { "끔 — 0.14.43 의 규칙(폴더 비교)으로 돌아감" },
+            path.display()
+        );
+    }
+    on
+}
+
 // ── ★(0.14.44 · A2) 미승인 사유 설명 — 읽기 전용 순수 함수 ──────────────────────────────
 
 /// 미승인 응답의 `detail`(객체)을 만든다. **저장소를 쓰지 않고 판정을 바꾸지도 않는다** — 이미 "맞는 레코드 없음"으로 끝난 확인에 사유 한 줄을 붙일 뿐이다.
@@ -809,6 +1179,7 @@ pub fn env_from_json(v: &serde_json::Value) -> Vec<(String, String)> {
 /// 고르는 순서: `bad_quote` 는 레코드를 보기 전에. 그다음은 이 데몬의 레코드(예약 값이 없거나 이 데몬 것)를 먼저 설명한다
 /// (`cwd_mismatch` → `ttl_required` → `expired`). 그런 레코드가 없을 때만 `lane_mismatch`, 아무것도 없으면 `no_record`.
 #[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(clippy::too_many_arguments)]
 pub fn explain_no_match(
     records: &[ApprovalRecord],
     secret: &[u8],
@@ -817,16 +1188,21 @@ pub fn explain_no_match(
     env: &[(String, String)],
     now: f64,
     require_ttl: bool,
+    ctx: Option<&MatchCtx>,
 ) -> serde_json::Value {
     let requested_cwd = normalize_cwd(cwd);
     let Some(toks) = tokenize(command) else {
         return serde_json::json!({"code": "bad_quote", "requested_cwd": requested_cwd});
     };
+    let socket_opt = has_socket_option(&toks);
     let call_env = sort_norm_env(env);
-    // 후보 = 서명이 유효하고 접두가 맞고 환경이 맞는 레코드(폴더 · 만료 · TTL 요구만 따로 본다).
+    // 후보 = 서명이 유효하고 접두가 맞는 레코드. 예약 값이 없거나 이 데몬 것이면 "이 데몬의 레코드"(폴더 · 만료 · TTL 요구를 따로 본다),
+    // 다른 데몬 것이면 `lane_mismatch` 후보다(예약 값이 아예 없는 레코드는 이 데몬의 레코드와 같이 설명한다 — 마지막 확인 D9).
     let mut cwd_bad: Vec<&ApprovalRecord> = Vec::new();
     let mut ttl_missing: Option<&ApprovalRecord> = None;
     let mut expired: Option<&ApprovalRecord> = None;
+    let mut target_opt: Option<&ApprovalRecord> = None;
+    let mut other_lane: Option<&ApprovalRecord> = None;
     for r in records {
         if r.command_prefix.is_empty() || toks.len() < r.command_prefix.len() {
             continue;
@@ -837,7 +1213,25 @@ pub fn explain_no_match(
         if !r.has_valid_signature(secret) {
             continue;
         }
-        if !r.environment.iter().all(|kv| call_env.binary_search(kv).is_ok()) {
+        let ours = match (r.lane_value(), ctx) {
+            (None, _) => false,
+            (Some(l), Some(c)) if l == c.lane => true,
+            (Some(_), _) => {
+                other_lane = newer(other_lane, r);
+                continue;
+            }
+        };
+        // 환경은 예약 값을 뺀 나머지로 본다(예약 값은 위에서 갈랐다).
+        if !r
+            .environment
+            .iter()
+            .filter(|(k, _)| k != LANE_ENV_KEY)
+            .all(|kv| call_env.binary_search(kv).is_ok())
+        {
+            continue;
+        }
+        if ours && socket_opt {
+            target_opt = newer(target_opt, r);
             continue;
         }
         if r.is_expired(now) {
@@ -852,7 +1246,12 @@ pub fn explain_no_match(
             Some(rc) => requested_cwd.as_deref() == Some(rc.as_str()),
             None => true,
         };
-        if !cwd_ok {
+        if cwd_ok {
+            continue;
+        }
+        // 폴더가 다르다 — 건너뛰기가 적용되는 레코드면 폴더 때문에 거부될 일이 아니다(다른 이유로 안 맞았다).
+        let skipped = ctx.is_some_and(|c| neutral_skip(r, command, c));
+        if !skipped {
             cwd_bad.push(r);
         }
     }
@@ -865,10 +1264,20 @@ pub fn explain_no_match(
                 }
             }
         }
-        return serde_json::json!({
+        let mut d = serde_json::json!({
             "code": "cwd_mismatch", "record_id": first.id,
             "signed_cwd": signed, "requested_cwd": requested_cwd,
         });
+        if let (Some(c), Some(o)) = (ctx, d.as_object_mut()) {
+            if let SkipVerdict::No { not_exact, needs_launch_cwd, neutral_off } = neutral_skip_verdict(first, command, c) {
+                for (k, on) in [("not_exact", not_exact), ("needs_launch_cwd", needs_launch_cwd), ("neutral_off", neutral_off)] {
+                    if on {
+                        o.insert(k.into(), serde_json::Value::Bool(true));
+                    }
+                }
+            }
+        }
+        return d;
     }
     if let Some(r) = ttl_missing {
         return serde_json::json!({
@@ -879,6 +1288,17 @@ pub fn explain_no_match(
         return serde_json::json!({
             "code": "expired", "record_id": r.id, "expired_at": r.expires_at,
             "requested_cwd": requested_cwd,
+        });
+    }
+    if let Some(r) = target_opt {
+        return serde_json::json!({
+            "code": "lane_mismatch", "target_option": true, "record_id": r.id,
+            "requested_cwd": requested_cwd,
+        });
+    }
+    if let Some(r) = other_lane {
+        return serde_json::json!({
+            "code": "lane_mismatch", "record_id": r.id, "requested_cwd": requested_cwd,
         });
     }
     serde_json::json!({"code": "no_record", "requested_cwd": requested_cwd})

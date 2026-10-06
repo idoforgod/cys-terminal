@@ -1353,6 +1353,8 @@ async fn async_main() {
         }
     }
     let daemon = Daemon::new(socket_path.clone());
+    // ★(0.14.44 · A3) 승인 묶음 식별자를 부팅 때 한 번 만들어 둔다(상태 폴더의 `approval-lane` 파일 · 만들지 못하면 메모리 값 + 로그 한 줄 · 부팅을 막지 않는다).
+    let _ = approval::lane_value(&socket_path, &crate::state::state_dir(&socket_path));
     // ★R1 배달 원장: 이 데몬 인스턴스 표식을 팩 계약 상태 디렉터리에 쓴다(best-effort).
     //   임무 대장(javis_mission)이 이 값을 **세션 결박**에 쓴다 — 데몬이 재기동하면 과거 세션의
     //   오너 임무는 무효가 된다(적발 (a): ts 를 기록만 하고 읽지 않아 과거 임무가 무기한 유효했다).
