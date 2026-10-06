@@ -1,0 +1,8 @@
+2026-10-06T21:49:07.847Z [INFO] === app-e2e start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-06T21:49:07.925Z [INFO] --- step prepare (minutes left 33.7, language mode FullLanguage) ---
+2026-10-06T21:49:15.505Z [INFO] --- step install-off (minutes left 33.6, language mode FullLanguage) ---
+2026-10-06T21:50:14.160Z [INFO] --- step install-facts (minutes left 32.6, language mode FullLanguage) ---
+2026-10-06T21:50:15.884Z [INFO] --- step off-run (minutes left 32.5, language mode FullLanguage) ---
+2026-10-06T21:51:49.765Z [INFO] --- step reinstall (minutes left 31, language mode FullLanguage) ---
+2026-10-06T21:52:34.730Z [INFO] --- step on-pre (minutes left 30.2, language mode FullLanguage) ---
+2026-10-06T21:52:36.164Z [INFO] --- step checkpoint-pre-sac (minutes left 30.2, language mode FullLanguage) ---
