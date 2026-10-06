@@ -1,0 +1,3 @@
+# uiobs start 2026-10-06T08:39:02.469Z obs_sec=0 interval_sec=5 expect_daemon=- app_version=0.14.43
+[+0.0s 2026-10-06T08:39:02.496Z] daemon v0.14.43 pid=5020 surfaces=1 started_at=1791275930.168755 | status bar: "daemon pid=5020 sock=\\\\.\\pipe\\cys" | badge: none | toasts(2): [toast health] Claude Code CLI가 없습니다 :: PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작 || [toast watchdog] ✅ 직원 복귀 완료 :: 노드 세션 복원 완료 (부서 0). | windows: 0
+# end: observation window elapsed (0 s)

@@ -1,0 +1,32 @@
+
+===== phoenix auto-restore @ epoch=1791276136 (pid cysd=1088) =====
+[phoenix] cys 채택(PHOENIX_CYS): C:\Users\runneradmin\AppData\Local\cys\cys.exe — 3중 identity match(build_id=ce76b43f822f proto=1)
+[phoenix] ★A-S1: legacy topology(schema_version 부재) — 조건부 replace 생략, add-merge 유지·부활 정상 진행.
+[phoenix] 부활 대상 죽은 역할 0 — restore 무작업(멱등).
+[phoenix] 티켓=default · 대상역할=[] · 이번 진행=[] (완료 skip=[])
+[phoenix] ★restore lease(공유 축) 조기 해제 — 스폰 구간 종료 · spawn 완료 · 이후는 관측/재주입/재검증. 이후 구간은 restore.run.lock 으로만 배타한다
+{
+  "phoenix_restore": "NOOP",
+  "completeness": "NOOP",
+  "incomplete_roles": [],
+  "manual_seats": [],
+  "fresh_fallback_roles": [],
+  "fresh_roles": [],
+  "fresh_reasons": {},
+  "fresh_expected_roles": [],
+  "fresh_unverified_roles": [],
+  "fresh_fork_suspect_roles": [],
+  "ready_roles": [],
+  "ticket": "default",
+  "boot_epoch": "sa:1791276136.041428",
+  "epoch_gate": true,
+  "backend": "production(cys restore)",
+  "target_roles": [],
+  "per_role_outcome": {},
+  "c6_stale_surfaces": [],
+  "c6_reaped": [],
+  "c6_reap_failed": [],
+  "cys_identity": "verified",
+  "journal": "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-dept-dept-1\\phoenix\\journal-default.json",
+  "honesty_note": "★M9: phoenix_restore 값만 신뢰하라. UNVERIFIED/FAILED 는 정상 완료가 아니다 (자기채점 금지·무출력을 정상으로 해석 금지). 세션 대조가 일치할 때만 VERIFIED. ★완결성: COMPLETE 는 roster 전원이 실 ready_marker 로 응답 가능함을 뜻한다."
+}
