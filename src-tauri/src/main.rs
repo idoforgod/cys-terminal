@@ -4966,7 +4966,7 @@ async fn feed_reply(request_id: String, decision: String, socket: Option<String>
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 // 0.14.44 WP-B B5·B6 — 오피스 브리지 건강 확인(`office_health`)과 화면 자산 복구(`repair_office_assets`)
 //
-// ★통합 때 lib 도우미로 교체(WC 메모): 설계 B3 는 데몬 감독과 이 앱 명령이 같은 건강 확인 도우미(`src/lib.rs`)를 쓰게 한다.
+// ★통합 완료: 건강 확인 탐침은 lib 도우미(`cys::bridge_probe_get` — 데몬 감독과 같은 코드)를 쓴다(아래 별칭). 옛 메모: 설계 B3 는 데몬 감독과 이 앱 명령이 같은 건강 확인 도우미(`src/lib.rs`)를 쓰게 한다.
 //   그 도우미(WB 소유)가 들어오기 전까지 같은 꼴(탐침의 정의 = 접속 → 0.3초 → `GET /health` → 전송 뒤 5초 안에 200 과
 //   본문 min(Content-Length, 64KB) 바이트 · 404 면 같은 꼴로 `/world`)의 작은 함수를 여기에 둔다. 통합 단계에서 `office_probe_get` 을
 //   lib 의 도우미 호출로 바꾸고 이 주석을 지운다 — 판정(`office_health_value`)과 화면 계약은 그대로다.
@@ -4974,14 +4974,10 @@ async fn feed_reply(request_id: String, decision: String, socket: Option<String>
 //   기본 거부한다(`tauri-2.11.2/src/webview/mod.rs:1818-1822`). 핀: `office_iframe_has_no_ipc_path`.
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-const OFFICE_BRIDGE_PORT: u16 = 8642;
-const OFFICE_PROBE_CONNECT_MS: u64 = 1500;
-/// 접속한 뒤 요청을 보내기 전의 기다림 — 접속 직후의 요청은 '닫히는 중' 표식 상태를 가려내지 못한다(설계 B3 · 실측 R1·R2).
-const OFFICE_PROBE_WAIT_MS: u64 = 300;
-/// 요청을 보낸 뒤 응답을 기다리는 상한.
-const OFFICE_PROBE_BUDGET_MS: u64 = 5000;
-/// 이 이상의 본문은 읽지 않고 성공으로 친다(좌석이 많으면 `/world` 폴백이 64KB 를 넘는다 — 설계 B3 · 독립 검증 X6).
-const OFFICE_PROBE_BODY_CAP: usize = 64 * 1024;
+use cys::{
+    bridge_parse_head as office_parse_head, bridge_probe_get as office_probe_get, BridgeProbeError as OfficeProbeError,
+    BridgeProbeReply as OfficeProbeReply, BRIDGE_PROBE_BODY_CAP as OFFICE_PROBE_BODY_CAP, OFFICE_BRIDGE_PORT,
+};
 /// B6 파일당 복구 명령의 시간 상한(설계 B6).
 const OFFICE_REPAIR_TIMEOUT_SECS: u64 = 10;
 /// B6-2 윈도우의 [복구] 단추 — CI 윈도우 레인(데몬·브리지가 도는 중의 실행)과 실기 확인을 통과하기 전에는 꺼 둔다.
@@ -4995,100 +4991,6 @@ const OFFICE_ASSET_FILES: [(&str, &str); 3] = [
 ];
 /// 앱 세션당 자동 복구 1회 상한(설계 B6-2).
 static OFFICE_AUTO_REPAIR_TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[derive(Debug, Clone, PartialEq)]
-struct OfficeProbeReply {
-    status: u16,
-    body: Vec<u8>,
-    /// 본문을 min(Content-Length, 64KB) 만큼 다 받았는가.
-    complete: bool,
-}
-#[derive(Debug, Clone, PartialEq)]
-enum OfficeProbeError {
-    /// 접속 자체가 안 된다(브리지가 없다).
-    NoConnect,
-    /// 접속은 됐으나 시간 안에 응답을 못 받았다(표식 상태 등).
-    NoResponse,
-    /// 응답 머리를 읽을 수 없다.
-    BadReply,
-}
-
-/// HTTP 응답 머리 해석(순수) — (상태 번호, Content-Length, 머리 끝 위치). 머리가 아직 다 오지 않았으면 None.
-fn office_parse_head(buf: &[u8]) -> Option<(u16, Option<usize>, usize)> {
-    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
-    let head = std::str::from_utf8(buf.get(..end)?).ok()?;
-    let mut lines = head.split("\r\n");
-    let status_line = lines.next()?;
-    let mut parts = status_line.split_whitespace();
-    let proto = parts.next()?;
-    if !proto.starts_with("HTTP/") {
-        return None;
-    }
-    let status: u16 = parts.next()?.parse().ok()?;
-    let mut cl: Option<usize> = None;
-    for l in lines {
-        if let Some((k, v)) = l.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("content-length") {
-                cl = v.trim().parse().ok();
-            }
-        }
-    }
-    Some((status, cl, end + 4))
-}
-
-/// 탐침 하나(블로킹 · 모든 대기에 상한) — 접속 → 0.3초 → `GET <path>` → 전송 뒤 5초 안에 응답 머리와 본문 min(CL, 64KB).
-fn office_probe_get(port: u16, path: &str) -> Result<OfficeProbeReply, OfficeProbeError> {
-    use std::io::{Read, Write};
-    use std::time::{Duration, Instant};
-    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(OFFICE_PROBE_CONNECT_MS))
-        .map_err(|_| OfficeProbeError::NoConnect)?;
-    std::thread::sleep(Duration::from_millis(OFFICE_PROBE_WAIT_MS));
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(OFFICE_PROBE_BUDGET_MS)));
-    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nAccept: */*\r\n\r\n");
-    if stream.write_all(req.as_bytes()).is_err() {
-        return Err(OfficeProbeError::NoResponse);
-    }
-    let deadline = Instant::now() + Duration::from_millis(OFFICE_PROBE_BUDGET_MS);
-    let mut buf: Vec<u8> = Vec::new();
-    let mut tmp = [0u8; 8192];
-    loop {
-        if let Some((status, cl, hdr_end)) = office_parse_head(&buf) {
-            let have = buf.len().saturating_sub(hdr_end);
-            let want = cl.map(|c| c.min(OFFICE_PROBE_BODY_CAP)).unwrap_or(OFFICE_PROBE_BODY_CAP);
-            if have >= want {
-                let body = buf.get(hdr_end..hdr_end.saturating_add(want)).unwrap_or(&[]).to_vec();
-                return Ok(OfficeProbeReply { status, body, complete: true });
-            }
-        }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(OfficeProbeError::NoResponse);
-        }
-        let _ = stream.set_read_timeout(Some(left.max(Duration::from_millis(1))));
-        match stream.read(&mut tmp) {
-            Ok(0) => {
-                // 상대가 닫았다 — 머리를 읽었고 길이를 몰랐으면(=닫힘이 끝) 받은 만큼이 전부다.
-                return match office_parse_head(&buf) {
-                    Some((status, None, hdr_end)) => Ok(OfficeProbeReply {
-                        status,
-                        body: buf.get(hdr_end..).unwrap_or(&[]).to_vec(),
-                        complete: true,
-                    }),
-                    Some((status, Some(_), hdr_end)) => Ok(OfficeProbeReply {
-                        status,
-                        body: buf.get(hdr_end..).unwrap_or(&[]).to_vec(),
-                        complete: false,
-                    }),
-                    None if buf.is_empty() => Err(OfficeProbeError::NoResponse),
-                    None => Err(OfficeProbeError::BadReply),
-                };
-            }
-            Ok(n) => buf.extend_from_slice(tmp.get(..n).unwrap_or(&[])),
-            Err(_) => return Err(OfficeProbeError::NoResponse),
-        }
-    }
-}
 
 /// 건강 확인 결과를 화면 계약으로 모은다(순수 — 탐침은 주입).
 /// `/health` 가 200 이면 그 본문에서 기동 식별자·팩 버전·자산 유무를 읽고, 404 면(옛 스크립트) 같은 꼴로 `/world` 를 본다(legacy).
