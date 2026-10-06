@@ -6429,6 +6429,9 @@ let feedRefreshGen = 0;
 const feedDeptExpanded = new Set<string>();
 async function refreshFeed() {
   const myGen = ++feedRefreshGen;
+  // 패널이 닫혀 있으면 조회하지 않는다 — 배지·알림 숫자는 refreshSidebarStatus(전체 소켓 집계)가 단독 소유라 이 조회 결과는 닫힌 동안 쓰이지 않는다.
+  //   (feed_list_all 은 본부 + 전 부서 데몬을 부르므로 닫힌 채 이벤트마다 도는 것은 순수 비용이다 — 성찰 2회차 m-2. 위 세대 번호는 올려 두어 진행 중이던 낡은 응답은 계속 버려진다.)
+  if (!(ccOpen && ccTab === "feed")) return;
   // ★0.14.44 C2: 본부 + 등록된 부서를 한꺼번에(feed_list_all) — 이 목록을 그리는 **이 한 곳**만 바꿨다(다른 feed_list 호출처는 본부 전용 그대로).
   //   호출 실패(옛 백엔드 등)이거나 본부 행이 실패면 종전 경로(feed_list + 부서 이동 띠)로 돌아간다.
   const all = (await invoke("feed_list_all", { status: null }).catch(() => null)) as

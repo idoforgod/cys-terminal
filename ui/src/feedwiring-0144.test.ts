@@ -30,6 +30,13 @@ describe("C2 — 목록을 그리는 한 곳만 새 명령 · 나머지 feed_lis
     expect(code.split('feedList: () => invoke("feed_list", { status: null }),').length - 1).toBe(1); // 승인 전환 스케줄러(probefail.test.ts:450 이 같은 줄을 고정)
     expect(code.includes('invoke("feed_list", { status: "pending" })')).toBe(true);
   });
+  it("패널이 닫혀 있으면 조회 전에 돌아간다 — 닫힌 채 본부+전 부서를 부르지 않는다(성찰 2회차 m-2) · 세대 번호는 먼저 올린다", () => {
+    const b = fnBody("refreshFeed");
+    const iGen = b.indexOf("++feedRefreshGen");
+    const iClosed = b.indexOf('if (!(ccOpen && ccTab === "feed")) return;');
+    const iAll = b.indexOf('invoke("feed_list_all"');
+    expect(iGen >= 0 && iClosed > iGen && iAll > iClosed).toBe(true);
+  });
   it("`refreshFeed();` 라는 호출 꼴이 남아 있다(소스를 이 글자로 자르는 시험 셋이 의존)", () => {
     expect(code.includes("refreshFeed();")).toBe(true);
     const i = code.indexOf('if (name === "feed.item.created") {');
