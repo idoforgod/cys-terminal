@@ -232,6 +232,15 @@ class LogAndHealth(unittest.TestCase):
         self.assertIn("요청 처리 예외", buf.getvalue())
         self.assertIn("ValueError", buf.getvalue(), "진짜 예외는 추적이 남는다")
 
+    def test_server_bind_does_no_reverse_name_lookup(self):
+        with mock.patch("socket.getfqdn", side_effect=AssertionError("getfqdn 호출 금지")):
+            srv = HB._BridgeServer(("127.0.0.1", 0), HB.Handler)
+            try:
+                self.assertEqual(srv.server_name, "127.0.0.1")
+                self.assertEqual(srv.server_port, srv.server_address[1])
+            finally:
+                srv.server_close()
+
     def test_lifeline_reads_without_buffer_lock(self):
         i = SRC.index("def _lifeline():")
         body = SRC[i:i + 600]

@@ -19,6 +19,7 @@ import os
 import re
 import secrets
 import signal
+import socketserver
 import subprocess
 import sys
 import threading
@@ -2070,6 +2071,15 @@ def health_body():
 
 
 class _BridgeServer(ThreadingHTTPServer):
+    def server_bind(self):
+        # 표준 HTTPServer.server_bind 는 바인드 직후 socket.getfqdn(host) 를 불러 역방향 이름 조회를 한다 — 이름 해석이 느린 기계
+        # (CI 러너 등)에서는 그 몇 초~수십 초 동안 listen 이 시작되지 않아 /health·/world 가 열리지 않는다. server_name 은 어디에서도
+        # 쓰지 않으므로 조회 없이 호스트 문자열을 그대로 둔다(동작 변화 없음 · 윈도우 포함 같은 효과).
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = port
+
     def handle_error(self, request, client_address):
         # 시간 제한으로 끊긴 쓰기(멈춘 수신자)·끊긴 연결은 줄도 추적도 없이 넘긴다 — 시간 제한은 /health 계수로만 센다(B4-3).
         exc = sys.exc_info()[1]

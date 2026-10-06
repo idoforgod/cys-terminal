@@ -80,16 +80,28 @@ class Specimen(unittest.TestCase):
         with urllib.request.urlopen("http://127.0.0.1:%d/health" % PORT, timeout=timeout) as r:
             return r.status, json.loads(r.read())
 
-    def wait_health(self, p, limit=8.0):
+    def diag(self, p):
+        """실패 메시지용 진단 — 프로세스 생존·rc·포트 상태·stderr/stdout 꼬리(빈 err.log 라도 살아 있었는지 죽었는지 구별)."""
+        rc = p.poll()
+        try:
+            c = socket.create_connection(("127.0.0.1", PORT), timeout=1)
+            c.close()
+            port = "접속 됨"
+        except OSError as e:
+            port = "접속 실패(%s)" % e.__class__.__name__
+        return "pid=%s %s rc=%s · 포트 %d %s · python=%s · stderr=%r" % (
+            p.pid, "생존" if rc is None else "종료", rc, PORT, port, sys.version.split()[0], self.errlog())
+
+    def wait_health(self, p, limit=25.0):
         end = time.monotonic() + limit
         while time.monotonic() < end:
             if p.poll() is not None:
-                self.fail("브리지가 일찍 끝남 rc=%s: %s" % (p.returncode, self.errlog()))
+                self.fail("브리지가 일찍 끝남: " + self.diag(p))
             try:
                 return self.health(1)
             except Exception:
                 time.sleep(0.1)
-        self.fail("health 없음: " + self.errlog())
+        self.fail("health 없음(%.0fs): %s" % (limit, self.diag(p)))
 
     def errlog(self):
         try:
@@ -130,6 +142,22 @@ class Specimen(unittest.TestCase):
         first = self.errlog().splitlines()[0]
         self.assertRegex(first, r"^\[hud-bridge\] \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d \[MainThread\] http://127\.0\.0\.1:%d" % PORT)
         # 다른 기동은 다른 기동 식별자
+        p.send_signal(signal.SIGTERM)
+        p.wait(3)
+
+    # ①-b ---------------------------------------------------------------
+    def test_health_opens_fast_even_when_reverse_name_lookup_is_slow(self):
+        # CI 맥 러너 6/7 실패의 유력 후보(미확정) 재현: 표준 HTTPServer.server_bind 가 바인드 직후 socket.getfqdn 을 불러
+        # 이름 해석이 느리면 listen 이 그만큼 늦다. 가짜 sitecustomize 로 getfqdn 을 12초 지연시켜도 /health 가 바로 열려야 한다.
+        slow = os.path.join(self.tmp, "slowdns")
+        os.makedirs(slow)
+        with open(os.path.join(slow, "sitecustomize.py"), "w") as f:
+            f.write("import socket, time\n_o = socket.getfqdn\n"
+                    "def _slow(name=''):\n    time.sleep(12)\n    return _o(name)\nsocket.getfqdn = _slow\n")
+        p = self.start(PYTHONPATH=slow)
+        t0 = time.monotonic()
+        self.wait_health(p, limit=6.0)
+        self.assertLess(time.monotonic() - t0, 4.0)
         p.send_signal(signal.SIGTERM)
         p.wait(3)
 
