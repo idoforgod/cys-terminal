@@ -1,0 +1,45 @@
+{
+    "tag":  "new-default",
+    "mode":  "default",
+    "script":  "D:\\a\\_temp\\w44\\pack-new\\bin\\javis_hud_bridge.py",
+    "A_up":  true,
+    "A_pid":  9368,
+    "A_alive_after_start":  true,
+    "health_first":  {
+                         "url":  "http://127.0.0.1:18700/health",
+                         "status":  200,
+                         "body":  "{\"ok\": true, \"pid\": 9368, \"boot_id\": \"8e512c77e8106b3a\", \"pack_version\": null, \"assets\": {\"office3d_html\": true, \"office_boot_js\": true, \"three_module_js\": true}, \"timeouts\": 0}",
+                         "error":  null,
+                         "ms":  547
+                     },
+    "world":  {
+                  "url":  "http://127.0.0.1:18700/world",
+                  "status":  200,
+                  "body":  "{\"v\": 2, \"ts\": 1791268122.7325752, \"seq\": 0, \"daemon\": {\"version\": null, \"paused\": false}, \"departments\": [], \"todo\": {}, \"lobby\": {\"unassigned\": []}, \"server_room\": [], \"blocked\": [], \"kanban\": {\"ts\": 1791268122.3291538, \"tasks\": []}, \"review\": {\"ts\": 1791268122.3291538, \"items\": []}, \"board\": {\"he",
+                  "error":  null,
+                  "ms":  2
+              },
+    "root_page":  {
+                      "url":  "http://127.0.0.1:18700/",
+                      "status":  200,
+                      "body":  "\u003c!doctype html\u003e\n\u003chtml lang=\"ko\"\u003e\n\u003chead\u003e\n\u003cmeta charset=\"utf-8\"\u003e\n\u003ctitle\u003eCYSJAVIS · Metaverse Office\u003c/title\u003e\n\u003cstyle\u003e\n  html",
+                      "error":  null,
+                      "ms":  15
+                  },
+    "token_before_B":  "19adc32731c2087eae2bc9b8900c0c817126fda9f04299846628559abad39c5c",
+    "idle_connection":  {
+                            "closed_by_server":  false,
+                            "seconds":  14.4,
+                            "limit":  14
+                        },
+    "B_alive_after_6s":  true,
+    "B_exit_code":  null,
+    "health_pid_counts":  {
+                              "9368":  40
+                          },
+    "health_no_pid":  0,
+    "token_after_B":  "304cf06c45db6541b230b9419b5e6953d0d202139f91563728ebd33a263f714c",
+    "token_file_changed_by_B":  true,
+    "A_err_head":  "[hud-bridge] 2026-10-06T06:28:42 [MainThread] http://127.0.0.1:18700  (\\uc77d\\uae30 \\uc804\\uc6a9 � 127.0.0.1 \\ud55c\\uc815)",
+    "B_err_head":  "[hud-bridge] 2026-10-06T06:28:57 [MainThread] http://127.0.0.1:18700  (\\uc77d\\uae30 \\uc804\\uc6a9 � 127.0.0.1 \\ud55c\\uc815)"
+}

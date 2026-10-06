@@ -1,0 +1,37 @@
+{
+ "none+none": {
+  "first": "ok",
+  "second": "bind fail winerror=10048"
+ },
+ "reuse+reuse": {
+  "first": "ok",
+  "second": "BIND OK",
+  "second_listen": "ok"
+ },
+ "reuse+none": {
+  "first": "ok",
+  "second": "bind fail winerror=10048"
+ },
+ "none+reuse": {
+  "first": "ok",
+  "second": "bind fail winerror=10013"
+ },
+ "excl+reuse": {
+  "first": "ok",
+  "second": "bind fail winerror=10013"
+ },
+ "excl+excl": {
+  "first": "ok",
+  "second": "bind fail winerror=10048"
+ },
+ "excl+none": {
+  "first": "ok",
+  "second": "bind fail winerror=10048"
+ },
+ "reuse+excl": {
+  "first": "ok",
+  "second": "bind fail winerror=10048"
+ }
+}
+python 3.12.10
+

@@ -1,0 +1,39 @@
+2026-10-06T06:24:20.707Z [INFO] === w44-measure start (PowerShell 5.1.26100.33438, LanguageMode FullLanguage) ===
+2026-10-06T06:24:20.760Z [INFO] --- step S0-inputs start
+2026-10-06T06:24:21.981Z [INFO] artifact found: id 11391447366 size 143464982 after 0 min
+2026-10-06T06:24:23.687Z [INFO] download rc 0 err 
+2026-10-06T06:24:24.533Z [INFO] --- step S0-inputs end (3.8s) 
+2026-10-06T06:24:24.537Z [INFO] --- step S1-install start
+2026-10-06T06:25:18.058Z [INFO] installer rc 0, killed after install: 
+2026-10-06T06:25:18.372Z [INFO] tar new rc 0 
+2026-10-06T06:25:18.374Z [INFO] --- step S1-install end (53.8s) 
+2026-10-06T06:25:18.378Z [INFO] --- step S1b-old-0.14.43 start
+2026-10-06T06:25:22.630Z [INFO] fetch old rc 0 
+2026-10-06T06:25:28.016Z [INFO] 7z rc 0 7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03
+
+Scanning the drive for archives:
+1 file, 143348191 bytes (137 MiB)
+
+Extracting archive: D:\a\_temp\w44\old-dl\cys_0.14.43_x64-setup.exe
+--
+Path = D:\a\_temp\w44\old-dl\cys_0.14.43_x64-setup.exe
+Type = Nsis
+Physical Size = 143348191
+Method = LZMA:23
+Solid = +
+Headers Size = 2358206
+Embedded Stub Size = 52736
+SubType...
+2026-10-06T06:25:28.346Z [INFO] tar old rc 0
+2026-10-06T06:25:28.348Z [INFO] --- step S1b-old-0.14.43 end (10s) 
+2026-10-06T06:25:28.352Z [INFO] --- step TA-approval start
+2026-10-06T06:28:41.265Z [INFO] --- step TA-approval end (192.9s) 
+2026-10-06T06:28:41.269Z [INFO] --- step TB-bridge start
+2026-10-06T06:29:47.749Z [INFO] --- step TB-bridge end (66.5s) 
+2026-10-06T06:29:47.751Z [INFO] --- step TC-daemon start
+2026-10-06T06:41:01.782Z [INFO] --- step TC-daemon end (674s) 
+2026-10-06T06:41:01.786Z [INFO] --- step TD-hook start
+2026-10-06T06:41:05.243Z [INFO] --- step TD-hook end (3.5s) 
+2026-10-06T06:41:05.247Z [INFO] --- step SUMMARY start
+2026-10-06T06:41:05.253Z [INFO] --- step SUMMARY end (0s) 
+2026-10-06T06:41:05.267Z [INFO] === w44-measure end ===
