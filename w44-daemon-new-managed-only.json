@@ -1,0 +1,63 @@
+{
+    "tag":  "newmanagedonly",
+    "env":  {
+                "CYS_OFFICE_BRIDGE_MODE":  "managed"
+            },
+    "with_seat":  false,
+    "daemon":  {
+                   "pid":  9228,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  10.2
+               },
+    "bridge_found":  true,
+    "bridge":  {
+                   "pid":  1876,
+                   "ppid":  9228,
+                   "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_hud_bridge.py",
+                   "started_after_s":  2.1,
+                   "parent_is_daemon":  true
+               },
+    "health":  {
+                   "url":  "http://127.0.0.1:8642/health",
+                   "status":  200,
+                   "body":  "{\"ok\": true, \"pid\": 1876, \"boot_id\": \"d0d6838b3d93dfe0\", \"pack_version\": \"0.14.44\", \"assets\": {\"office3d_html\": true, \"office_boot_js\": true, \"three_module_js\": true}, \"timeouts\": 0}",
+                   "error":  null,
+                   "ms":  3
+               },
+    "world":  {
+                  "url":  "http://127.0.0.1:8642/world",
+                  "status":  200,
+                  "body":  "{\"v\": 2, \"ts\": 1791293388.6452923, \"seq\": 1, \"daemon\": {\"version\": \"0.14.44\", \"paused\": false}, \"departments\": [{\"id\": \"ë³¸ë¶€ Â· CEO\", \"floor\": 1, \"nodes\": []}], \"todo\": {}, \"lobby\": {\"unassigned\": [",
+                  "error":  null,
+                  "ms":  2
+              },
+    "bridge_alive_after_hold":  true,
+    "bridge_same_pid_after_hold":  true,
+    "bridge_count_after_hold":  1,
+    "bridge_children":  [
+                            "conhost.exe#7984 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                            "cys.exe#7480 C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe events --reconnect --cursor-file C:\\Users\\runneradmin\\AppData\\Local\\cys\\c...",
+                            "conhost.exe#7004 \\??\\C:\\Windows\\system32\\conhost.exe 0x4"
+                        ],
+    "daemon_children":  [
+                            "python3.exe#1876 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\b...",
+                            "conhost.exe#7984 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                            "cys.exe#7480 C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe events --reconnect --cursor-file C:\\Users\\runneradmin...",
+                            "conhost.exe#7004 \\??\\C:\\Windows\\system32\\conhost.exe 0x4"
+                        ],
+    "bridge_pid_at_kill":  1876,
+    "after_daemon_kill":  {
+                              "bridge_gone_after_s":  null,
+                              "children_gone_after_s":  null,
+                              "bridge_alive_at_end":  true,
+                              "children_alive_at_end":  3,
+                              "children_before":  3,
+                              "watched_s":  25.2
+                          },
+    "bridges_left_at_end":  1,
+    "port_8642_answers_at_end":  true,
+    "log_bridge_lines":  [
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)"
+                         ]
+}

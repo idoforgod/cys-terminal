@@ -1,0 +1,31 @@
+{
+    "tag":  "olddefault",
+    "env":  {
+
+            },
+    "with_seat":  false,
+    "daemon":  {
+                   "pid":  9492,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  10.2
+               },
+    "bridge_found":  false,
+    "bridge_alive_after_hold":  null,
+    "bridge_same_pid_after_hold":  null,
+    "bridge_count_after_hold":  0,
+    "bridge_children":  [
+
+                        ],
+    "daemon_children":  [
+
+                        ],
+    "bridges_left_at_end":  0,
+    "port_8642_answers_at_end":  false,
+    "log_bridge_lines":  [
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인",
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인"
+                         ]
+}

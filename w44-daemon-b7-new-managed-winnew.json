@@ -1,0 +1,19 @@
+{
+    "tag":  "b",
+    "new_env":  {
+                    "HUD_WIN_NEW":  "1",
+                    "CYS_OFFICE_BRIDGE_MODE":  "managed"
+                },
+    "old_bridge_pid":  8060,
+    "old_bridge_alive_after_old_daemon_stop":  true,
+    "old_bridge_alive_after_new_daemon_45s":  true,
+    "bridges_now":  [
+                        {
+                            "id":  8060,
+                            "ppid":  4652
+                        }
+                    ],
+    "new_daemon_log_bridge_lines":  [
+
+                                    ]
+}

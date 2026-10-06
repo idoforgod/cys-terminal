@@ -1,0 +1,37 @@
+{
+    "hook":  "C:\\a\\_temp\\w44\\pack-new\\hooks\\role-capability-gate.sh",
+    "cases":  {
+                  "plain-denied":  {
+                                       "rc":  0,
+                                       "stdout_bytes":  846,
+                                       "json_valid":  true,
+                                       "decision":  "deny",
+                                       "stdout":  "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"[CSO \\ub2a5\\ub825 \\uac8c\\uc774\\ud2b8] `cys kill` \\ub294 master \\uc758 **\\uc2dc\\uac04 \\ud55c\\uc815** \\uc2b9\\uc778\\uc774 \\ud544\\uc694\\ud558\\ub2e4 \\u2014 `cys approval sign --prefix \\\"\u003c\\uc815\\ud6...",
+                                       "stderr":  "role-capability-gate DENY: `cys kill` \\ub294 master \\uc758 **\\uc2dc\\uac04 \\ud55c\\uc815** \\uc2b9\\uc778\\uc774 \\ud544\\uc694\\ud558\\ub2e4 � `cys approval sign --prefix \"\u003c\\uc815\\ud655 \\uba85\\ub839\u003e\" --ttl \u003c\\ucd08\u003e` \\ubc1c\\uae09 \\ub4a4 `cys approval check --prefix \"\u003c\\uc815\\ud655 \\uba85\\ub839\u003e\" --require-tt..."
+                                   },
+                  "quote-backslash":  {
+                                          "rc":  0,
+                                          "stdout_bytes":  854,
+                                          "json_valid":  true,
+                                          "decision":  "deny",
+                                          "stdout":  "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"[CSO \\ub2a5\\ub825 \\uac8c\\uc774\\ud2b8] `cys launch-agent` \\ub294 master \\uc758 **\\uc2dc\\uac04 \\ud55c\\uc815** \\uc2b9\\uc778\\uc774 \\ud544\\uc694\\ud558\\ub2e4 \\u2014 `cys approval sign --prefix \\\"\u003c\\u...",
+                                          "stderr":  "role-capability-gate DENY: `cys launch-agent` \\ub294 master \\uc758 **\\uc2dc\\uac04 \\ud55c\\uc815** \\uc2b9\\uc778\\uc774 \\ud544\\uc694\\ud558\\ub2e4 � `cys approval sign --prefix \"\u003c\\uc815\\ud655 \\uba85\\ub839\u003e\" --ttl \u003c\\ucd08\u003e` \\ubc1c\\uae09 \\ub4a4 `cys approval check --prefix \"\u003c\\uc815\\ud655 \\uba85\\ub839\u003e\" --re..."
+                                      },
+                  "korean":  {
+                                 "rc":  0,
+                                 "stdout_bytes":  846,
+                                 "json_valid":  true,
+                                 "decision":  "deny",
+                                 "stdout":  "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"[CSO \\ub2a5\\ub825 \\uac8c\\uc774\\ud2b8] `cys kill` \\ub294 master \\uc758 **\\uc2dc\\uac04 \\ud55c\\uc815** \\uc2b9\\uc778\\uc774 \\ud544\\uc694\\ud558\\ub2e4 \\u2014 `cys approval sign --prefix \\\"\u003c\\uc815\\ud6...",
+                                 "stderr":  "role-capability-gate DENY: `cys kill` \\ub294 master \\uc758 **\\uc2dc\\uac04 \\ud55c\\uc815** \\uc2b9\\uc778\\uc774 \\ud544\\uc694\\ud558\\ub2e4 � `cys approval sign --prefix \"\u003c\\uc815\\ud655 \\uba85\\ub839\u003e\" --ttl \u003c\\ucd08\u003e` \\ubc1c\\uae09 \\ub4a4 `cys approval check --prefix \"\u003c\\uc815\\ud655 \\uba85\\ub839\u003e\" --require-tt..."
+                             },
+                  "unpaired-surrogate":  {
+                                             "rc":  0,
+                                             "stdout_bytes":  846,
+                                             "json_valid":  true,
+                                             "decision":  "deny",
+                                             "stdout":  "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"[CSO \\ub2a5\\ub825 \\uac8c\\uc774\\ud2b8] `cys kill` \\ub294 master \\uc758 **\\uc2dc\\uac04 \\ud55c\\uc815** \\uc2b9\\uc778\\uc774 \\ud544\\uc694\\ud558\\ub2e4 \\u2014 `cys approval sign --prefix \\\"\u003c\\uc815\\ud6...",
+                                             "stderr":  "role-capability-gate DENY: `cys kill` \\ub294 master \\uc758 **\\uc2dc\\uac04 \\ud55c\\uc815** \\uc2b9\\uc778\\uc774 \\ud544\\uc694\\ud558\\ub2e4 � `cys approval sign --prefix \"\u003c\\uc815\\ud655 \\uba85\\ub839\u003e\" --ttl \u003c\\ucd08\u003e` \\ubc1c\\uae09 \\ub4a4 `cys approval check --prefix \"\u003c\\uc815\\ud655 \\uba85\\ub839\u003e\" --require-tt..."
+                                         }
+              }
+}

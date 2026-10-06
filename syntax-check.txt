@@ -1,0 +1,6 @@
+PowerShell 5.1.26100.9457 on ARM64
+ok w44-doctor.ps1
+ok w44-measure.ps1
+ok w44-procs.ps1
+ok w44-scene.ps1
+ok w44-wh.ps1
