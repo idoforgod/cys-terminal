@@ -1,0 +1,174 @@
+{
+    "tag":  "scene-w44-upg",
+    "time":  "2026-10-06T09:44:55.494Z",
+    "version":  "cys 0.14.44",
+    "seconds":  300.5,
+    "finished":  false,
+    "timed_out":  true,
+    "rc":  null,
+    "stdout_bytes":  0,
+    "stdout_lines":  0,
+    "last_lines":  [
+
+                   ],
+    "snapshots":  [
+                      {
+                          "at_sec":  16,
+                          "doctor_children":  [
+                                                  "conhost.exe#10220 cpu_s=0 read_bytes=0 write_bytes=0 threads=4 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                                                  "python3.exe#10576 cpu_s=0.1 read_bytes=64235796 write_bytes=0 threads=3 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_runtime_seal.py verify --root C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime --manifest C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime-manifest.json --json --max-list 3"
+                                              ],
+                          "cys_pipes":  [
+                                            "cys",
+                                            "cys-dept-dept-1"
+                                        ],
+                          "loopback":  [
+                                           "  TCP    127.0.0.1:8642         0.0.0.0:0              LISTENING       5348",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49883        ESTABLISHED     5348",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:50648        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:50649        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:50650        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:51909        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:52655        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:53385        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:54256        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:56137        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:57412        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         0.0.0.0:0              LISTENING       1584",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:51319        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:51342        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:51916        ESTABLISHED     1584",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:62182        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:49883        127.0.0.1:8642         ESTABLISHED     9736",
+                                           "  TCP    127.0.0.1:50639        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:50641        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51322        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51323        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51343        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51344        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51350        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51916        127.0.0.1:9333         ESTABLISHED     6516",
+                                           "  TCP    127.0.0.1:62913        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  UDP    127.0.0.1:1900         *:*                                    6312",
+                                           "  UDP    127.0.0.1:58328        *:*                                    6312",
+                                           "  UDP    127.0.0.1:62668        127.0.0.1:62668                        3476"
+                                       ],
+                          "stdout_tail":  ""
+                      },
+                      {
+                          "at_sec":  45,
+                          "doctor_children":  [
+                                                  "conhost.exe#10220 cpu_s=0 read_bytes=0 write_bytes=0 threads=4 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                                                  "python3.exe#10576 cpu_s=0.3 read_bytes=93543220 write_bytes=0 threads=3 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_runtime_seal.py verify --root C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime --manifest C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime-manifest.json --json --max-list 3"
+                                              ],
+                          "cys_pipes":  [
+                                            "cys",
+                                            "cys-dept-dept-1"
+                                        ],
+                          "loopback":  [
+                                           "  TCP    127.0.0.1:8642         0.0.0.0:0              LISTENING       5348",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49883        ESTABLISHED     5348",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:50648        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:50649        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:50650        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:51195        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:52655        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:53385        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:54256        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:56137        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:57412        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         0.0.0.0:0              LISTENING       1584",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:51319        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:51342        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:51916        ESTABLISHED     1584",
+                                           "  TCP    127.0.0.1:49883        127.0.0.1:8642         ESTABLISHED     9736",
+                                           "  TCP    127.0.0.1:50639        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:50641        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51322        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51323        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51343        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51344        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51350        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:51916        127.0.0.1:9333         ESTABLISHED     6516",
+                                           "  TCP    127.0.0.1:61267        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:62913        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  UDP    127.0.0.1:1900         *:*                                    6312",
+                                           "  UDP    127.0.0.1:58328        *:*                                    6312",
+                                           "  UDP    127.0.0.1:62668        127.0.0.1:62668                        3476"
+                                       ],
+                          "stdout_tail":  ""
+                      },
+                      {
+                          "at_sec":  120,
+                          "doctor_children":  [
+                                                  "conhost.exe#10220 cpu_s=0 read_bytes=0 write_bytes=0 threads=2 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                                                  "python3.exe#10576 cpu_s=1.4 read_bytes=193030958 write_bytes=0 threads=1 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_runtime_seal.py verify --root C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime --manifest C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime-manifest.json --json --max-list 3"
+                                              ],
+                          "cys_pipes":  [
+                                            "cys",
+                                            "cys-dept-dept-1"
+                                        ],
+                          "loopback":  [
+                                           "  TCP    127.0.0.1:8642         0.0.0.0:0              LISTENING       5348",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49883        ESTABLISHED     5348",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:50828        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:51195        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:51404        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:53385        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:53523        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:62854        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         0.0.0.0:0              LISTENING       1584",
+                                           "  TCP    127.0.0.1:49883        127.0.0.1:8642         ESTABLISHED     9736",
+                                           "  TCP    127.0.0.1:51916        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:61267        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:63446        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  UDP    127.0.0.1:1900         *:*                                    6312",
+                                           "  UDP    127.0.0.1:58328        *:*                                    6312",
+                                           "  UDP    127.0.0.1:62668        127.0.0.1:62668                        3476"
+                                       ],
+                          "stdout_tail":  ""
+                      },
+                      {
+                          "at_sec":  241,
+                          "doctor_children":  [
+                                                  "conhost.exe#10220 cpu_s=0 read_bytes=0 write_bytes=0 threads=2 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                                                  "python3.exe#10576 cpu_s=3.6 read_bytes=347349790 write_bytes=0 threads=1 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_runtime_seal.py verify --root C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime --manifest C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime-manifest.json --json --max-list 3"
+                                              ],
+                          "cys_pipes":  [
+                                            "cys",
+                                            "cys-dept-dept-1"
+                                        ],
+                          "loopback":  [
+                                           "  TCP    127.0.0.1:8642         0.0.0.0:0              LISTENING       5348",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49174        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49883        ESTABLISHED     5348",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:51395        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:52854        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:56742        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:59537        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         0.0.0.0:0              LISTENING       1584",
+                                           "  TCP    127.0.0.1:49883        127.0.0.1:8642         ESTABLISHED     9736",
+                                           "  TCP    127.0.0.1:51395        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:55727        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:56609        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:64155        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  UDP    127.0.0.1:1900         *:*                                    6312",
+                                           "  UDP    127.0.0.1:58328        *:*                                    6312",
+                                           "  UDP    127.0.0.1:62668        127.0.0.1:62668                        3476"
+                                       ],
+                          "stdout_tail":  ""
+                      }
+                  ],
+    "env_notes":  [
+
+                  ],
+    "error":  null,
+    "direct_seal_verify":  {
+                               "seconds":  285.5,
+                               "rc":  1,
+                               "timed_out":  false,
+                               "out":  "✗ 런타임 봉인 파손 — 누락 5 · 추가 6 · 변경 0\r\n  [누락] git/etc/post-install/01-devices.post\r\n  [누락] git/etc/post-install/03-mtab.post\r\n  [누락] git/etc/post-install/06-windows-files.post\r\n  [누락] git/etc/post-install/13-copy-dlls.post\r\n  [누락] git/etc/post-install/99-post-install-cleanup.post\r\n  [추가] git/etc/hosts\r\n ...[cut]",
+                               "err":  "",
+                               "manifest_exists":  true
+                           }
+}

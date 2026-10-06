@@ -1,0 +1,17 @@
+2026-10-06T09:33:45.548Z [INFO] === app-e2e start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-06T09:33:45.594Z [INFO] scene UPGRADE (APPE2E_SCENE=upgrade): diag/app-upgrade.ps1
+2026-10-06T09:33:45.626Z [INFO] --- step prepare (minutes left 33.9, language mode FullLanguage) ---
+2026-10-06T09:33:49.224Z [INFO] upgrade parameters: mode=emulate from=0.14.43 to=0.14.44 usable=True
+2026-10-06T09:33:49.245Z [INFO] --- step upg-audit-on (minutes left 33.8, language mode FullLanguage) ---
+2026-10-06T09:33:51.026Z [INFO] --- step upg-base-installer (minutes left 33.8, language mode FullLanguage) ---
+2026-10-06T09:33:52.528Z [INFO] --- step upg-install-base (minutes left 33.8, language mode FullLanguage) ---
+2026-10-06T09:34:47.038Z [INFO] --- step upg-facts-base (minutes left 32.9, language mode FullLanguage) ---
+2026-10-06T09:34:49.279Z [INFO] --- step upg-start-base (minutes left 32.8, language mode FullLanguage) ---
+2026-10-06T09:34:55.201Z [INFO] --- step upg-base-state (minutes left 32.7, language mode FullLanguage) ---
+2026-10-06T09:35:36.495Z [INFO] --- step upg-apply (minutes left 32, language mode FullLanguage) ---
+2026-10-06T09:36:26.833Z [INFO] --- step upg-after (minutes left 31.2, language mode FullLanguage) ---
+2026-10-06T09:37:29.684Z [INFO] --- step upg-facts-after (minutes left 30.2, language mode FullLanguage) ---
+2026-10-06T09:37:31.027Z [INFO] --- step upg-proc-audit (minutes left 30.1, language mode FullLanguage) ---
+2026-10-06T09:37:36.477Z [INFO] --- step team (minutes left 30, language mode FullLanguage) ---
+2026-10-06T09:43:56.159Z [INFO] --- step upg-second-start (minutes left 23.7, language mode FullLanguage) ---
+2026-10-06T10:10:38.924Z [INFO] --- step upg-verdict (minutes left -3, language mode FullLanguage) ---

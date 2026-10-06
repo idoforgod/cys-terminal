@@ -1,0 +1,14 @@
+# base state: waiting (every 3 s, at most 120 s) for a cysd.exe of the install folder AND a committed pack (.pack-version); start 2026-10-06T09:34:55.246Z
+[   0s 2026-10-06T09:34:55.401Z] cysd=[pid 5708 (parent 8932, created 2026-10-06T09:34:52.862Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=50 version=
+[   3s 2026-10-06T09:34:58.503Z] cysd=[pid 5708 (parent 8932, created 2026-10-06T09:34:52.862Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=128 version=
+[   6s 2026-10-06T09:35:01.590Z] cysd=[pid 5708 (parent 8932, created 2026-10-06T09:34:52.862Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=219 version=
+[   9s 2026-10-06T09:35:04.693Z] cysd=[pid 5708 (parent 8932, created 2026-10-06T09:34:52.862Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=292 version=
+[  12s 2026-10-06T09:35:07.792Z] cysd=[pid 5708 (parent 8932, created 2026-10-06T09:34:52.862Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=390 version=
+[  16s 2026-10-06T09:35:10.916Z] cysd=[pid 5708 (parent 8932, created 2026-10-06T09:34:52.862Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=577 version=
+[  19s 2026-10-06T09:35:14.035Z] cysd=[pid 5708 (parent 8932, created 2026-10-06T09:34:52.862Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=785 version=
+[  22s 2026-10-06T09:35:17.175Z] cysd=[pid 5708 (parent 8932, created 2026-10-06T09:34:52.862Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=942 version=0.14.43
+# end: a daemon runs and the pack is committed
+[settle +  0s 2026-10-06T09:35:17.228Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[] gui-onboarded=none onboard-attempts=none busy=[] missing=2
+[settle +  2s 2026-10-06T09:35:19.275Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[.pack-staging-init-7808] gui-onboarded=0.14.43 onboard-attempts=none busy=[cys.exe#7808 init-pack --no-install-hook] missing=3
+[settle +  4s 2026-10-06T09:35:21.319Z] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[] gui-onboarded=0.14.43 onboard-attempts=none busy=[] missing=0
+# settled=True after +4 s; missing: 
