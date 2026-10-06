@@ -421,8 +421,8 @@ fn a3_launch_agent_skips_the_folder_only_when_a_literal_absolute_cwd_is_written(
         format!("{base} --cwd /a/hq"),
         format!("{base} --cwd=/a/hq"),
         format!("{base} --cwd \"/a/hq w\""),
-        format!("{base} --cwd C:/Users/me/ws"),
-        format!("{base} --cwd 'C:\\Users\\me\\ws'"),
+        format!("{base} --cwd C:/work/me/ws"),
+        format!("{base} --cwd 'C:\\work\\me\\ws'"),
     ]
     .iter()
     .enumerate()
@@ -442,8 +442,8 @@ fn a3_launch_agent_skips_the_folder_only_when_a_literal_absolute_cwd_is_written(
         format!("{base} --cwd rel/dir"),
         format!("{base} --cwd"),
         format!("{base} --cwd /a/*"),
-        format!("{base} --cwd=C:Usersmews"),
-        format!("{base} --cwd C:\\Users\\me\\ws"), // 따옴표 밖의 역슬래시는 토크나이저가 지운다 → `C:Usersmews`
+        format!("{base} --cwd=C:workmews"),
+        format!("{base} --cwd C:\\work\\me\\ws"), // 따옴표 밖의 역슬래시는 토크나이저가 지운다 → `C:workmews`
     ] {
         let s = sign_text(&f, &cmd, HQ, Some(3600));
         assert_eq!(s["ok"], json!(true), "{cmd}: {s}");
