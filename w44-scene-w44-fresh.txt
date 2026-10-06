@@ -1,0 +1,5 @@
+usage view-mode button labels over 3 clicks: [자동 > 모두 > 하나 > 자동] cycle_ok=True
+feed hq: PASS (seen, Allow clicked, the pushing process got allow = exit 0) (seen after 1017 ms, exit code 0, pipe (default))
+office tab: loaded_signal=True after 3 ms; bridge /health status 200; /world status 200 bytes 871; office-boot.js 200
+bridge processes: before the scene 0, after 1
+doctor Antigravity line(s): 

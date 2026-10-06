@@ -1,0 +1,1 @@
+{"ok": false, "state": "pending-cli:cso,master,reviewer-codex,reviewer-gemini,worker", "kind": "pending-cli", "detail": "CLI 미설치 — 빈 셸 유지·편성 대기(설치 시 자동 완결)", "socket": "\\\\.\\pipe\\cys-dept-dept-1"}

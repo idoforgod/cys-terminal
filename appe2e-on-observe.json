@@ -1,0 +1,73 @@
+{
+    "run_mode":  "on",
+    "started":  "2026-10-06T05:27:49.800Z",
+    "ended":  "2026-10-06T05:29:28.776Z",
+    "end_reason":  "the node driver finished its observation window after the click",
+    "ticks":  47,
+    "click_at":  "2026-10-06T05:27:51.620Z",
+    "node_exited_at":  "2026-10-06T05:29:22.260Z",
+    "node_exit_code":  0,
+    "app_alive_first_at":  "2026-10-06T05:27:50.102Z",
+    "app_gone_at":  null,
+    "app_relaunched":  false,
+    "alive_samples_after_click":  46,
+    "dead_samples_after_click":  0,
+    "last_alive_after_click_sec":  97,
+    "first_dead_after_click_sec":  null,
+    "installer_seen":  false,
+    "installer_first_seen_at":  null,
+    "installer_first_seen":  null,
+    "updater_dirs_seen":  [
+                              "cys-0.14.99-updater-VcZlN3"
+                          ],
+    "updater_dir_first_seen_at":  "2026-10-06T05:27:57.000Z",
+    "updater_dir_max_bytes":  143202847,
+    "updater_dirs_at_end":  [
+
+                            ],
+    "attempt_seen":  true,
+    "attempt_first_seen_at":  "2026-10-06T05:27:52.248Z",
+    "attempt_present_at_end":  false,
+    "attempt_text":  "{\"from\":\"0.14.44\",\"to\":\"0.14.99\",\"at\":1791264471}",
+    "installer_alive_at_end":  false,
+    "windows_at_end":  "csrss#6936:bash.exe - Bad Image | cys-app#7856:cys — CYSJavis Terminal | hosted-compute-agent#6748:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#5820:C:\\Windows\\system32\\wsl.exe",
+    "marker_initial":  "0.14.44",
+    "marker_last":  "0.14.44",
+    "marker_changed_at":  null,
+    "marker_reached_target_at":  null,
+    "file_version_last":  "0.14.44 / product 0.14.44",
+    "screenshots":  [
+                        {
+                            "name":  "appe2e-on-screen-click5s.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "csrss#6936:bash.exe - Bad Image | cys-app#7856:cys — CYSJavis Terminal | hosted-compute-agent#6748:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#4956:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "appe2e-on-screen-click30s.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "csrss#6936:bash.exe - Bad Image | cys-app#7856:cys — CYSJavis Terminal | hosted-compute-agent#6748:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#4956:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "appe2e-on-screen-click60s.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "csrss#6936:bash.exe - Bad Image | cys-app#7856:cys — CYSJavis Terminal | hosted-compute-agent#6748:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#4956:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "appe2e-on-screen-end.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "csrss#6936:bash.exe - Bad Image | cys-app#7856:cys — CYSJavis Terminal | hosted-compute-agent#6748:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#5820:C:\\Windows\\system32\\wsl.exe"
+                        }
+                    ]
+}
