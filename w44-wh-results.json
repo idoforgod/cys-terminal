@@ -1,0 +1,565 @@
+{
+    "os":  "windows-11-arm",
+    "files":  [
+
+              ],
+    "tests":  {
+                  "elevated_rc":  0,
+                  "standard_rc":  "",
+                  "elevated_lines":  [
+                                         "test governance::tests::wh_windows_protected_start_time_measure_and_guard ... ok",
+                                         "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1961 filtered out; finished in 0.62s",
+                                         "WH-WIN-MEASURE csrss.exe pid=7128 ppid=Some(7104) start_time=1791290623 handle_opened_estimate=true now=1791291853",
+                                         "WH-WIN-GUARD parent=7104 child=7128 off_has=true on_has=false",
+                                         "WH-WIN-MEASURE csrss.exe pid=780 ppid=Some(768) start_time=1791290532 handle_opened_estimate=true now=1791291853",
+                                         "WH-WIN-GUARD parent=768 child=780 off_has=true on_has=false",
+                                         "WH-WIN-MEASURE wininit.exe pid=904 ppid=Some(768) start_time=1791290533 handle_opened_estimate=true now=1791291853",
+                                         "WH-WIN-GUARD parent=768 child=904 off_has=true on_has=false"
+                                     ],
+                  "standard_lines":  [
+
+                                     ]
+              },
+    "daemon":  {
+                   "elevated_rc":  0,
+                   "standard_rc":  "",
+                   "elev":  [
+                                {
+                                    "value":  "2026-10-06T06:04:16.4501592-07:00 user=runneradmin profile=C:\\Users\\runneradmin admin=True",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  1
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:17.1180521-07:00 daemon pid 10924",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  2
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:31.6735540-07:00 ready=True",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  3
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:31.7437842-07:00 seat: surface:1",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  4
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:38.8740741-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -      4s     0  w44seat",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  5
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:38.9058495-07:00 list: surface:1\trole=-\tpid=6324\texited=false\tw44seat\tC:\\Users\\runneradmin",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  6
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:43.9221590-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -      9s     0  w44seat",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  7
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:43.9556839-07:00 list: surface:1\trole=-\tpid=6324\texited=false\tw44seat\tC:\\Users\\runneradmin",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  8
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:48.9881427-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     14s     0  w44seat",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  9
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:49.0159098-07:00 list: surface:1\trole=-\tpid=6324\texited=false\tw44seat\tC:\\Users\\runneradmin",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  10
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:54.0334481-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     20s     0  w44seat",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  11
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:54.0649481-07:00 list: surface:1\trole=-\tpid=6324\texited=false\tw44seat\tC:\\Users\\runneradmin",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  12
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:59.0962724-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     25s     0  w44seat",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  13
+                                },
+                                {
+                                    "value":  "2026-10-06T06:04:59.1186657-07:00 list: surface:1\trole=-\tpid=6324\texited=false\tw44seat\tC:\\Users\\runneradmin",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  14
+                                },
+                                {
+                                    "value":  "2026-10-06T06:05:04.1412921-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     30s     0  w44seat",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  15
+                                },
+                                {
+                                    "value":  "2026-10-06T06:05:04.1572882-07:00 list: surface:1\trole=-\tpid=6324\texited=false\tw44seat\tC:\\Users\\runneradmin",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  16
+                                },
+                                {
+                                    "value":  "2026-10-06T06:05:04.1732340-07:00 proc_count_high lines in daemon stderr: 0",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  17
+                                },
+                                {
+                                    "value":  "2026-10-06T06:05:04.2412572-07:00 done",
+                                    "PSPath":  "C:\\w44pub\\daemon-elev.txt",
+                                    "PSParentPath":  "C:\\w44pub",
+                                    "PSChildName":  "daemon-elev.txt",
+                                    "PSDrive":  {
+                                                    "CurrentLocation":  "a\\cys-terminal\\cys-terminal",
+                                                    "Name":  "C",
+                                                    "Provider":  "Microsoft.PowerShell.Core\\FileSystem",
+                                                    "Root":  "C:\\",
+                                                    "Description":  "Windows",
+                                                    "MaximumSize":  null,
+                                                    "Credential":  "System.Management.Automation.PSCredential",
+                                                    "DisplayRoot":  null
+                                                },
+                                    "PSProvider":  {
+                                                       "ImplementingType":  "Microsoft.PowerShell.Commands.FileSystemProvider",
+                                                       "HelpFile":  "System.Management.Automation.dll-Help.xml",
+                                                       "Name":  "FileSystem",
+                                                       "PSSnapIn":  "Microsoft.PowerShell.Core",
+                                                       "ModuleName":  "Microsoft.PowerShell.Core",
+                                                       "Module":  null,
+                                                       "Description":  "",
+                                                       "Capabilities":  52,
+                                                       "Home":  "C:\\Users\\runneradmin",
+                                                       "Drives":  "C"
+                                                   },
+                                    "ReadCount":  18
+                                }
+                            ]
+               },
+    "errors":  [
+
+               ],
+    "test_exe_exists":  true,
+    "bins":  [
+                 "cys.exe 34699776",
+                 "cysd-test.exe 116913152",
+                 "cysd.exe 50921472"
+             ],
+    "whoami_rc":  "",
+    "whoami_elevated":  [
+                            "\"BUILTIN\\Administrators\",\"Alias\",\"S-1-5-32-544\",\"Mandatory group, Enabled by default, Enabled group, Group owner\"",
+                            "\"Mandatory Label\\High Mandatory Level\",\"Label\",\"S-1-16-12288\",\"\""
+                        ]
+}

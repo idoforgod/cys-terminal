@@ -1,0 +1,2 @@
+2026-10-06T13:04:08.830Z [INFO] === w44-wh start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-06T13:05:04.496Z [INFO] === w44-wh end ===

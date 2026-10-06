@@ -1,0 +1,18 @@
+2026-10-06T06:04:16.4501592-07:00 user=runneradmin profile=C:\Users\runneradmin admin=True
+2026-10-06T06:04:17.1180521-07:00 daemon pid 10924
+2026-10-06T06:04:31.6735540-07:00 ready=True
+2026-10-06T06:04:31.7437842-07:00 seat: surface:1
+2026-10-06T06:04:38.8740741-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -      4s     0  w44seat
+2026-10-06T06:04:38.9058495-07:00 list: surface:1	role=-	pid=6324	exited=false	w44seat	C:\Users\runneradmin
+2026-10-06T06:04:43.9221590-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -      9s     0  w44seat
+2026-10-06T06:04:43.9556839-07:00 list: surface:1	role=-	pid=6324	exited=false	w44seat	C:\Users\runneradmin
+2026-10-06T06:04:48.9881427-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     14s     0  w44seat
+2026-10-06T06:04:49.0159098-07:00 list: surface:1	role=-	pid=6324	exited=false	w44seat	C:\Users\runneradmin
+2026-10-06T06:04:54.0334481-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     20s     0  w44seat
+2026-10-06T06:04:54.0649481-07:00 list: surface:1	role=-	pid=6324	exited=false	w44seat	C:\Users\runneradmin
+2026-10-06T06:04:59.0962724-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     25s     0  w44seat
+2026-10-06T06:04:59.1186657-07:00 list: surface:1	role=-	pid=6324	exited=false	w44seat	C:\Users\runneradmin
+2026-10-06T06:05:04.1412921-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     30s     0  w44seat
+2026-10-06T06:05:04.1572882-07:00 list: surface:1	role=-	pid=6324	exited=false	w44seat	C:\Users\runneradmin
+2026-10-06T06:05:04.1732340-07:00 proc_count_high lines in daemon stderr: 0
+2026-10-06T06:05:04.2412572-07:00 done
