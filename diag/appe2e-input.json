@@ -2,7 +2,7 @@
   "windows_build_run_id": 37416696562,
   "artifact": "cys-windows-x64-nsis",
   "release_tag": "",
-  "scenes": ["fresh", "upgrade"],
+  "scenes": ["upgrade"],
   "upgrade_from": "0.14.43",
   "upgrade_mode": "emulate",
   "upgrade_expect": "0.14.44"

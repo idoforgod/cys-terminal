@@ -81,6 +81,37 @@ function Invoke-W44Scene {
         $pp = Get-TeamPipes
         $dp = New-Object System.Collections.Generic.List[string]
         foreach ($n in @($pp['cys'])) { if ([string]$n -like 'cys-dept-*') { $dp.Add('\\.\pipe\' + [string]$n) } }
+        # a department is registered but its daemon is not running (the TEAM scene cleanup ended it): start that department daemon the way the
+        # product names it (pipe from ~/.cys/depts.json) so that the Feed of the app can show - and route - a department item (C2)
+        $rec['dept_daemon'] = $null
+        if ($dp.Count -eq 0) {
+            try {
+                $regF = Join-Path $env:USERPROFILE '.cys\depts.json'
+                if (Test-Path -LiteralPath $regF) {
+                    $reg = ConvertFrom-Json (Read-FileShared $regF)
+                    foreach ($pn in @($reg.depts.PSObject.Properties)) {
+                        $sock = [string]$pn.Value.socket
+                        if ($sock -like '\\.\pipe\cys-dept-*') {
+                            $errF = Join-Path $global:DiagOut ('w44-dept-cysd-' + $pn.Name + '.err.txt')
+                            $old = $env:CYS_SOCKET
+                            $env:CYS_SOCKET = $sock
+                            $dpr = $null
+                            try { $dpr = Start-Process -FilePath (Join-Path (Get-InstallDir) 'cysd.exe') -PassThru -WindowStyle Hidden -RedirectStandardError $errF -RedirectStandardOutput (Join-Path $global:DiagWork ('w44-dept-cysd-' + $pn.Name + '.out.txt')) } finally { $env:CYS_SOCKET = $old }
+                            $t0 = Get-Date
+                            $up = $false
+                            while (((Get-Date) - $t0).TotalSeconds -lt 60) {
+                                Start-Sleep -Seconds 2
+                                $pp2 = Get-TeamPipes
+                                if (@($pp2['cys']) -contains ($sock -replace '^.*\\', '')) { $up = $true; break }
+                            }
+                            $rec['dept_daemon'] = [ordered]@{ name = $pn.Name; socket = $sock; pid = $dpr.Id; pipe_up = $up; waited_s = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1) }
+                            if ($up) { $dp.Add($sock) }
+                            break
+                        }
+                    }
+                }
+            } catch { $rec['dept_daemon'] = [ordered]@{ error = $_.Exception.Message } }
+        }
         $rec['dept_pipes'] = $dp.ToArray()
         $rec['pipes_all'] = @($pp['cys'])
         $rec['bridge_rows_before'] = Get-W44BridgeRows 'scene-before'
@@ -103,6 +134,10 @@ function Invoke-W44Scene {
             }
             $rec['doctor'] = [ordered]@{ rc = $d['rc']; timed_out = $d['timedOut']; antigravity_lines = $ag; office_or_asset_lines = $asset; bytes = $txt.Length }
         } catch { $rec['doctor'] = [ordered]@{ error = $_.Exception.Message } }
+        try {
+            $ef = Join-Path $global:DiagOut 'w44-dept-cysd-dept-1.err.txt'
+            if (Test-Path -LiteralPath $ef) { $rec['dept_daemon_log_bridge_lines'] = @((Read-FileShared $ef) -split "`r?`n" | Where-Object { $_ -match 'office-bridge' } | Select-Object -First 5) }
+        } catch { }
         $rec['bridge_rows'] = Get-W44BridgeRows 'scene-after'
         $rec['log_lines'] = Get-W44LogLines 'office-bridge|bridge' 60
         # one short summary text
