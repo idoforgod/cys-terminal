@@ -1,0 +1,2 @@
+2026-10-06T08:15:26.541Z [INFO] === w44-doctor start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-06T08:20:27.370Z [INFO] === w44-doctor end ===

@@ -1,0 +1,81 @@
+{
+  "generated": "2026-10-06T08:20:27.666Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37434794948",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37434794948",
+  "job": "w44-doctor",
+  "os": "windows-11-arm",
+  "branch": "diag-results/37434794948-1-w44-doctor-windows-11-arm",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "done-w44-doctor.json",
+      "bytes": 142
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-w44-doctor.txt",
+      "bytes": 169
+    },
+    {
+      "path": "w44-doctor-new-dept-stdout.txt",
+      "bytes": 1903
+    },
+    {
+      "path": "w44-doctor-new-dept2-stdout.txt",
+      "bytes": 1903
+    },
+    {
+      "path": "w44-doctor-new-plain-stdout.txt",
+      "bytes": 1903
+    },
+    {
+      "path": "w44-doctor-old-dept-stdout.txt",
+      "bytes": 1903
+    },
+    {
+      "path": "w44-doctor-old-dept2-stdout.txt",
+      "bytes": 1903
+    },
+    {
+      "path": "w44-doctor-old-plain-stdout.txt",
+      "bytes": 1903
+    },
+    {
+      "path": "w44-doctor-results.json",
+      "bytes": 10413
+    }
+  ],
+  "skipped": [
+    {
+      "path": "w44-doctor-new-dept-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctor-new-dept2-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctor-new-plain-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctor-old-dept-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctor-old-dept2-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctor-old-plain-stderr.txt",
+      "reason": "empty file"
+    }
+  ],
+  "inline_files": 10,
+  "blob_files": 0
+}

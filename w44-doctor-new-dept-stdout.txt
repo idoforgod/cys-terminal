@@ -1,0 +1,20 @@
+﻿cys doctor — 시스템 자기진단
+  [OK  ] pack-version     팩 0.14.44 = 바이너리 0.14.44
+  [OK  ] pack-state       채널 상태 미기록(free 기본)
+  [OK  ] install-manifest 설치 매니페스트 470개 항목·정상 파싱
+  [OK  ] pack-drift       드리프트 1건(원장: healed 0·new-pending 0·kept-drift 0·merged 0·conflicted 0·quarantined 0·adopted 0) · 캡처 저장소 0건 · 0B(GC 없음 — 수동 정리 가능)
+           └ 손상 의심: cys pack-heal <rel>(백업 후 vendor 복원) · 드리프트 검토: cys pack-merge
+  [WARN] hook             실소비 config(C:\Users\runneradmin\.cys\claude) 각성 hook 등록됨 · 개인 프로필: 각성 hook 미등록(1개 settings 확인) — C:\Users\runneradmin\.claude/settings.json: session-start.sh+role-bootstrap.sh
+           └ cys doctor --fix 또는 cys init-pack 로 등록
+  [OK  ] dept-hook-residue 공용·개인 settings 2개에 부서 훅 잔존 0
+  [OK  ] dept-awakening-seed 부서 팩 0 — 해당 없음
+  [OK  ] config-dir-target 각성 훅 설치 표적 = 실소비 dir (C:\Users\runneradmin\.cys\claude)
+  [SKIP] agy-statusline   agy 설정 폴더 없음(agy 미설치) — 점검 대상 아님
+  [SKIP] socket           판정 불가 — 소켓 진단은 unix 전용이라 이 플랫폼에서는 검사하지 않았다
+  [SKIP] startup-lock     판정 불가 — 락 진단은 unix 전용이라 이 플랫폼에서는 검사하지 않았다
+  [OK  ] staging-residue  staging 잔재 없음
+  [OK  ] channels-db      채널 DB 없음(온디맨드 생성)
+  [OK  ] legacy-config    레거시 env 미사용(canonical CYS_*)
+  [SKIP] app-seal         macOS 아님 — 코드서명 봉인 검사 미해당
+  [OK  ] runtime-seal     동봉 런타임 봉인 무결 — C:\Users\runneradmin\AppData\Local\cys\runtime
+요약: 11 OK · 1 WARN · 0 FAIL · 4 SKIP(판정 불가)
