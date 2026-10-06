@@ -161,9 +161,8 @@
           <div class="cc-section"><div class="cc-h">알람 이력</div><div id="cc-alarm-list"></div></div>
         </div>
         <div id="cc-view-office" hidden>
-          <div id="cc-office-hint" class="cc-board-note" hidden>메타버스 오피스 브리지가 꺼져 있습니다 —
-            cysd가 60초 내 자동 재기동합니다. 급하면 수동 기동:
-            <code>python3 ~/.cys/pack/bin/javis_hud_bridge.py</code> 후 이 탭을 다시 여세요.</div>
+          <div id="cc-office-hint" class="cc-board-note" hidden><span id="cc-office-hint-text">오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.</span>
+            <button id="cc-office-repair" type="button" hidden>복구</button></div>
           <iframe id="cc-office-frame" title="Metaverse Office"></iframe>
         </div>
         <div id="cc-footer"></div>

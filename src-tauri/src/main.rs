@@ -4859,6 +4859,322 @@ async fn feed_reply(request_id: String, decision: String) -> Result<(), String> 
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// 0.14.44 WP-B B5·B6 — 오피스 브리지 건강 확인(`office_health`)과 화면 자산 복구(`repair_office_assets`)
+//
+// ★통합 때 lib 도우미로 교체(WC 메모): 설계 B3 는 데몬 감독과 이 앱 명령이 같은 건강 확인 도우미(`src/lib.rs`)를 쓰게 한다.
+//   그 도우미(WB 소유)가 들어오기 전까지 같은 꼴(탐침의 정의 = 접속 → 0.3초 → `GET /health` → 전송 뒤 5초 안에 200 과
+//   본문 min(Content-Length, 64KB) 바이트 · 404 면 같은 꼴로 `/world`)의 작은 함수를 여기에 둔다. 통합 단계에서 `office_probe_get` 을
+//   lib 의 도우미 호출로 바꾸고 이 주석을 지운다 — 판정(`office_health_value`)과 화면 계약은 그대로다.
+// ★화면 안(127.0.0.1:8642 에서 온 내용)은 이 명령을 부를 수 없다 — capabilities 에 `remote` 가 없고 tauri 가 원격 출처의 앱 명령을
+//   기본 거부한다(`tauri-2.11.2/src/webview/mod.rs:1818-1822`). 핀: `office_iframe_has_no_ipc_path`.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+const OFFICE_BRIDGE_PORT: u16 = 8642;
+const OFFICE_PROBE_CONNECT_MS: u64 = 1500;
+/// 접속한 뒤 요청을 보내기 전의 기다림 — 접속 직후의 요청은 '닫히는 중' 표식 상태를 가려내지 못한다(설계 B3 · 실측 R1·R2).
+const OFFICE_PROBE_WAIT_MS: u64 = 300;
+/// 요청을 보낸 뒤 응답을 기다리는 상한.
+const OFFICE_PROBE_BUDGET_MS: u64 = 5000;
+/// 이 이상의 본문은 읽지 않고 성공으로 친다(좌석이 많으면 `/world` 폴백이 64KB 를 넘는다 — 설계 B3 · 독립 검증 X6).
+const OFFICE_PROBE_BODY_CAP: usize = 64 * 1024;
+/// B6 파일당 복구 명령의 시간 상한(설계 B6).
+const OFFICE_REPAIR_TIMEOUT_SECS: u64 = 10;
+/// B6-2 윈도우의 [복구] 단추 — CI 윈도우 레인(데몬·브리지가 도는 중의 실행)과 실기 확인을 통과하기 전에는 꺼 둔다.
+/// 켜는 것은 코드 변경이고 릴리스 결재 사항이다(설계 B6 · §5-4 ㉥).
+const OFFICE_REPAIR_WINDOWS_BUTTON: bool = false;
+/// 화면 자산 세 파일 — (`/health` 의 `assets` 키, 팩 상대경로).
+const OFFICE_ASSET_FILES: [(&str, &str); 3] = [
+    ("office3d_html", "web/office3d.html"),
+    ("office_boot_js", "web/office-boot.js"),
+    ("three_module_js", "web/vendor/three.module.js"),
+];
+/// 앱 세션당 자동 복구 1회 상한(설계 B6-2).
+static OFFICE_AUTO_REPAIR_TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[derive(Debug, Clone, PartialEq)]
+struct OfficeProbeReply {
+    status: u16,
+    body: Vec<u8>,
+    /// 본문을 min(Content-Length, 64KB) 만큼 다 받았는가.
+    complete: bool,
+}
+#[derive(Debug, Clone, PartialEq)]
+enum OfficeProbeError {
+    /// 접속 자체가 안 된다(브리지가 없다).
+    NoConnect,
+    /// 접속은 됐으나 시간 안에 응답을 못 받았다(표식 상태 등).
+    NoResponse,
+    /// 응답 머리를 읽을 수 없다.
+    BadReply,
+}
+
+/// HTTP 응답 머리 해석(순수) — (상태 번호, Content-Length, 머리 끝 위치). 머리가 아직 다 오지 않았으면 None.
+fn office_parse_head(buf: &[u8]) -> Option<(u16, Option<usize>, usize)> {
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(buf.get(..end)?).ok()?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next()?;
+    let mut parts = status_line.split_whitespace();
+    let proto = parts.next()?;
+    if !proto.starts_with("HTTP/") {
+        return None;
+    }
+    let status: u16 = parts.next()?.parse().ok()?;
+    let mut cl: Option<usize> = None;
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                cl = v.trim().parse().ok();
+            }
+        }
+    }
+    Some((status, cl, end + 4))
+}
+
+/// 탐침 하나(블로킹 · 모든 대기에 상한) — 접속 → 0.3초 → `GET <path>` → 전송 뒤 5초 안에 응답 머리와 본문 min(CL, 64KB).
+fn office_probe_get(port: u16, path: &str) -> Result<OfficeProbeReply, OfficeProbeError> {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(OFFICE_PROBE_CONNECT_MS))
+        .map_err(|_| OfficeProbeError::NoConnect)?;
+    std::thread::sleep(Duration::from_millis(OFFICE_PROBE_WAIT_MS));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(OFFICE_PROBE_BUDGET_MS)));
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nAccept: */*\r\n\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return Err(OfficeProbeError::NoResponse);
+    }
+    let deadline = Instant::now() + Duration::from_millis(OFFICE_PROBE_BUDGET_MS);
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        if let Some((status, cl, hdr_end)) = office_parse_head(&buf) {
+            let have = buf.len().saturating_sub(hdr_end);
+            let want = cl.map(|c| c.min(OFFICE_PROBE_BODY_CAP)).unwrap_or(OFFICE_PROBE_BODY_CAP);
+            if have >= want {
+                let body = buf.get(hdr_end..hdr_end.saturating_add(want)).unwrap_or(&[]).to_vec();
+                return Ok(OfficeProbeReply { status, body, complete: true });
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(OfficeProbeError::NoResponse);
+        }
+        let _ = stream.set_read_timeout(Some(left.max(Duration::from_millis(1))));
+        match stream.read(&mut tmp) {
+            Ok(0) => {
+                // 상대가 닫았다 — 머리를 읽었고 길이를 몰랐으면(=닫힘이 끝) 받은 만큼이 전부다.
+                return match office_parse_head(&buf) {
+                    Some((status, None, hdr_end)) => Ok(OfficeProbeReply {
+                        status,
+                        body: buf.get(hdr_end..).unwrap_or(&[]).to_vec(),
+                        complete: true,
+                    }),
+                    Some((status, Some(_), hdr_end)) => Ok(OfficeProbeReply {
+                        status,
+                        body: buf.get(hdr_end..).unwrap_or(&[]).to_vec(),
+                        complete: false,
+                    }),
+                    None if buf.is_empty() => Err(OfficeProbeError::NoResponse),
+                    None => Err(OfficeProbeError::BadReply),
+                };
+            }
+            Ok(n) => buf.extend_from_slice(tmp.get(..n).unwrap_or(&[])),
+            Err(_) => return Err(OfficeProbeError::NoResponse),
+        }
+    }
+}
+
+/// 건강 확인 결과를 화면 계약으로 모은다(순수 — 탐침은 주입).
+/// `/health` 가 200 이면 그 본문에서 기동 식별자·팩 버전·자산 유무를 읽고, 404 면(옛 스크립트) 같은 꼴로 `/world` 를 본다(legacy).
+/// ok = 탐침 통과(상태 200 ∧ 본문을 다 받음). 반환 키: ok · reachable · reason · legacy · boot_id · pack_version · assets_missing(팩 상대경로 목록).
+fn office_health_value(probe: &dyn Fn(&str) -> Result<OfficeProbeReply, OfficeProbeError>) -> Value {
+    let fail = |reachable: bool, reason: String, legacy: bool| {
+        json!({"ok": false, "reachable": reachable, "reason": reason, "legacy": legacy,
+               "boot_id": Value::Null, "pack_version": Value::Null, "assets_missing": Vec::<String>::new()})
+    };
+    let err_reason = |e: &OfficeProbeError| match e {
+        OfficeProbeError::NoConnect => ("no_connect".to_string(), false),
+        OfficeProbeError::NoResponse => ("no_response".to_string(), true),
+        OfficeProbeError::BadReply => ("bad_reply".to_string(), true),
+    };
+    match probe("/health") {
+        Ok(r) if r.status == 200 && r.complete => {
+            let v: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+            let boot_id = v.get("boot_id").and_then(|x| x.as_str()).map(|s| s.to_string());
+            let pack_version = v.get("pack_version").and_then(|x| x.as_str()).map(|s| s.to_string());
+            // 자산: `assets` 객체가 있을 때만 판정한다 — 키가 없거나 모양이 다르면 '모름'(빈 목록 · 지어내지 않는다). false 인 것만 없는 것.
+            let mut missing: Vec<String> = Vec::new();
+            if let Some(a) = v.get("assets").and_then(|x| x.as_object()) {
+                for (key, rel) in OFFICE_ASSET_FILES {
+                    if a.get(key).and_then(|x| x.as_bool()) == Some(false) {
+                        missing.push(rel.to_string());
+                    }
+                }
+            }
+            json!({"ok": true, "reachable": true, "reason": "ok", "legacy": false,
+                   "boot_id": boot_id, "pack_version": pack_version, "assets_missing": missing})
+        }
+        Ok(r) if r.status == 404 => match probe("/world") {
+            Ok(w) if w.status == 200 && w.complete => json!({"ok": true, "reachable": true, "reason": "ok", "legacy": true,
+                "boot_id": Value::Null, "pack_version": Value::Null, "assets_missing": Vec::<String>::new()}),
+            Ok(w) => fail(true, format!("status_{}", w.status), true),
+            Err(e) => {
+                let (reason, reachable) = err_reason(&e);
+                fail(reachable, reason, true)
+            }
+        },
+        Ok(r) => fail(true, if r.status == 200 { "incomplete".to_string() } else { format!("status_{}", r.status) }, false),
+        Err(e) => {
+            let (reason, reachable) = err_reason(&e);
+            fail(reachable, reason, false)
+        }
+    }
+}
+
+/// 자산 복구의 실행 방식(순수) — `auto`(자동 실행 + 단추) · `button`(단추만) · `none`(안내 문구만).
+/// 윈도우: 자동 없음, 단추는 `windows_button` 플래그 뒤(꺼져 있으면 none). 그 밖(맥·리눅스): 정책 파일이 끄지 않았으면 auto, 껐으면 button.
+fn office_repair_mode(is_windows: bool, policy_off: bool, windows_button: bool) -> &'static str {
+    if is_windows {
+        if windows_button {
+            "button"
+        } else {
+            "none"
+        }
+    } else if policy_off {
+        "button"
+    } else {
+        "auto"
+    }
+}
+
+/// 정책 파일의 `CYS_OFFICE_ASSET_REPAIR` 값이 '끔'인가 — 0 · "0" · false 만 끈다(그 밖·키 없음은 기본 = 켬). 끄는 값만 받는다.
+fn office_policy_value_is_off(v: Option<&Value>) -> bool {
+    match v {
+        Some(Value::Number(n)) => n.as_i64() == Some(0),
+        Some(Value::String(s)) => s.trim() == "0",
+        Some(Value::Bool(b)) => !*b,
+        _ => false,
+    }
+}
+
+fn office_asset_repair_policy_off() -> bool {
+    let path = cys::home_dir().join(".cys").join("policy.json");
+    let Ok(text) = std::fs::read_to_string(&path) else { return false };
+    let Ok(v) = serde_json::from_str::<Value>(strip_utf8_bom(&text)) else { return false };
+    office_policy_value_is_off(v.get("CYS_OFFICE_ASSET_REPAIR"))
+}
+
+/// B5 — 오피스 브리지 건강 확인. 오피스 탭이 보이는 동안 화면이 부른다(실리지 않았을 때 3초 · 3분 뒤 15초 간격 — 간격은 화면이 정한다).
+/// 반환: office_health_value 의 키 + `repair`(auto|button|none — B6 의 실행 방식).
+#[tauri::command]
+async fn office_health() -> Result<Value, String> {
+    let mut v = tokio::task::spawn_blocking(|| office_health_value(&|p| office_probe_get(OFFICE_BRIDGE_PORT, p)))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mode = office_repair_mode(cfg!(windows), office_asset_repair_policy_off(), OFFICE_REPAIR_WINDOWS_BUTTON);
+    if let Some(o) = v.as_object_mut() {
+        o.insert("repair".into(), json!(mode));
+    }
+    Ok(v)
+}
+
+/// 자식 프로세스를 시간 상한 안에서 기다린다 — 표준입력은 닫고(물려주면 질문을 기다리며 멈춘 실측이 있다 · R8) 출력은 버린다.
+/// 상한을 넘기면 그 프로세스만 끝낸다(`Child::kill` — 그룹 신호 아님). 성공 = 종료코드 0.
+fn run_command_with_timeout(mut cmd: std::process::Command, limit: std::time::Duration) -> Result<(), String> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                return if st.success() { Ok(()) } else { Err(format!("exit {}", st.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()))) };
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("timeout".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(40));
+            }
+            Err(e) => return Err(format!("wait: {e}")),
+        }
+    }
+}
+
+/// 동봉 CLI 의 `pack-heal --missing-only <rel>` 한 번 — 사이드카 실행 도우미(`sealed_sidecar_cys`)로 띄운다(새 스폰 지점을 만들지 않는다 · 독립 검증 X14).
+fn run_pack_heal_missing_only(rel: &str) -> Result<(), String> {
+    let cmd = sealed_sidecar_cys(&["pack-heal", "--missing-only", rel]);
+    run_command_with_timeout(cmd, std::time::Duration::from_secs(OFFICE_REPAIR_TIMEOUT_SECS))
+}
+
+/// B6 — 없는 화면 자산만 되살린다(순수 조율 — 팩 폴더·앱 버전·실행기는 주입).
+/// 순서: ① 팩 버전 표식(`.pack-version`)이 앱 버전과 같을 때만(다르면 `version_mismatch` — 판이 섞인다) ② 없는 파일 고르기(없으면 `nothing_missing` · 명령은 한 번도 안 부른다)
+/// ③ 병합 대기 원장에 항목이 이미 있는 파일은 건드리지 않는다(`skipped` — 사용자가 손댄 이력) ④ 나머지를 한 번에 하나씩 실행하고 파일이 실제로 생겼는지 확인한다.
+/// 반환 status: repaired · partial · failed · ledger_entry · nothing_missing · version_mismatch.
+fn repair_office_assets_with(dir: &std::path::Path, app_version: &str, run: &mut dyn FnMut(&str) -> Result<(), String>) -> Value {
+    let disk_version = std::fs::read_to_string(dir.join(".pack-version")).ok().map(|s| s.trim().to_string());
+    if disk_version.as_deref() != Some(app_version) {
+        return json!({"status": "version_mismatch", "pack_version": disk_version, "app_version": app_version,
+                      "repaired": Vec::<String>::new(), "failed": Vec::<String>::new(), "skipped": Vec::<String>::new()});
+    }
+    let missing: Vec<&str> = OFFICE_ASSET_FILES.iter().map(|(_, rel)| *rel).filter(|rel| !dir.join(rel).is_file()).collect();
+    if missing.is_empty() {
+        return json!({"status": "nothing_missing", "repaired": Vec::<String>::new(), "failed": Vec::<String>::new(), "skipped": Vec::<String>::new()});
+    }
+    let ledger = cys::pack::load_merge_pending(dir);
+    let (mut repaired, mut failed, mut skipped) = (Vec::<String>::new(), Vec::<String>::new(), Vec::<String>::new());
+    for rel in &missing {
+        if ledger.contains_key(*rel) {
+            skipped.push((*rel).to_string());
+            continue;
+        }
+        match run(rel) {
+            Ok(()) if dir.join(rel).is_file() => repaired.push((*rel).to_string()),
+            _ => failed.push((*rel).to_string()),
+        }
+    }
+    let status = if repaired.len() == missing.len() {
+        "repaired"
+    } else if repaired.is_empty() && failed.is_empty() {
+        "ledger_entry"
+    } else if repaired.is_empty() {
+        "failed"
+    } else {
+        "partial"
+    };
+    json!({"status": status, "repaired": repaired, "failed": failed, "skipped": skipped})
+}
+
+/// B6 — 앱 백엔드 명령. 오피스 탭이 `/health` 에서 '자산이 없다'를 보면 화면이 부른다.
+/// `manual` = 사람이 단추를 눌렀는가. 자동(manual=false)은 실행 방식이 auto 일 때만, 앱 세션당 1회 — 두 번째부터는 `already_tried`.
+/// 윈도우는 자동 없음, 단추는 플래그 뒤(꺼져 있으면 `unavailable`). 정책 파일 `CYS_OFFICE_ASSET_REPAIR: 0` 이면 자동은 `auto_disabled`(단추만).
+#[tauri::command]
+async fn repair_office_assets(manual: Option<bool>) -> Result<Value, String> {
+    let manual = manual.unwrap_or(false);
+    let mode = office_repair_mode(cfg!(windows), office_asset_repair_policy_off(), OFFICE_REPAIR_WINDOWS_BUTTON);
+    if mode == "none" {
+        return Ok(json!({"status": "unavailable"}));
+    }
+    if !manual {
+        if mode != "auto" {
+            return Ok(json!({"status": "auto_disabled"}));
+        }
+        if OFFICE_AUTO_REPAIR_TRIED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(json!({"status": "already_tried"}));
+        }
+    }
+    tokio::task::spawn_blocking(|| {
+        let dir = cys::pack::pack_dir();
+        repair_office_assets_with(&dir, env!("CARGO_PKG_VERSION"), &mut |rel| run_pack_heal_missing_only(rel))
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Attach: 부서 소켓의 surface PTY 출력을 base64 이벤트로 webview에 스트리밍.
 /// 이벤트명은 (소켓 slug, surface_id)로 데몬 간 충돌을 막고, 그 이름을 반환해 UI가 구독한다
 /// (백엔드 단일 진실 — UI 독립 재계산 금지, 검증 mustFix).
@@ -7778,6 +8094,8 @@ fn main() {
             start_surface_stream,
             feed_list,
             feed_reply,
+            office_health,
+            repair_office_assets,
             list_dir,
             open_path,
             reveal_path,
@@ -15531,5 +15849,244 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         // 대조: 키 없는 행끼리(둘 다 읽지 못함·구버전)는 키를 만들지 않는다 — 위의 결과가 '키 부재 = 빈 배열' 로 뭉개진 것이 아니다
         let m = merge_account_rows(&[missing(100.0), missing(200.0)]);
         assert!(m[0].get("current_profiles").is_none(), "키 없는 행끼리의 병합이 키를 만들었다: {}", m[0]);
+    }
+
+    // ═════════ 0.14.44 WC — B5·B6 오피스 건강 확인 · 화면 자산 복구 ═════════
+
+    fn office_reply(status: u16, body: &str) -> Result<OfficeProbeReply, OfficeProbeError> {
+        Ok(OfficeProbeReply { status, body: body.as_bytes().to_vec(), complete: true })
+    }
+
+    /// 응답 머리 해석 — 상태 번호 · Content-Length(대소문자 무관) · 머리 끝. 머리가 덜 왔으면 None · HTTP 가 아니면 None.
+    #[test]
+    fn b5_parse_head_status_length_and_partial() {
+        let raw = b"HTTP/1.0 200 OK\r\nServer: x\r\ncontent-length: 5\r\n\r\nhello";
+        assert_eq!(office_parse_head(raw), Some((200, Some(5), raw.len() - 5)));
+        assert_eq!(office_parse_head(b"HTTP/1.1 404 Not Found\r\n\r\n"), Some((404, None, 26)));
+        assert_eq!(office_parse_head(b"HTTP/1.1 200 OK\r\nContent-Le"), None, "머리가 덜 왔다");
+        assert_eq!(office_parse_head(b"garbage\r\n\r\n"), None, "HTTP 가 아니다");
+        assert_eq!(office_parse_head(b"HTTP/1.1 abc OK\r\n\r\n"), None, "상태 번호가 숫자가 아니다");
+    }
+
+    /// 건강 확인 판정 — /health 200 이면 기동 식별자·팩 버전·없는 자산(팩 상대경로)을 읽는다 · 자산 키가 없으면 '모름'(빈 목록).
+    #[test]
+    fn b5_health_value_reads_boot_id_and_missing_assets() {
+        let body = r#"{"ok":true,"pid":1,"boot_id":"abc","pack_version":"0.14.44","assets":{"office3d_html":true,"office_boot_js":false,"three_module_js":false},"timeouts":0}"#;
+        let v = office_health_value(&|p| {
+            assert_eq!(p, "/health");
+            office_reply(200, body)
+        });
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["reachable"], true);
+        assert_eq!(v["legacy"], false);
+        assert_eq!(v["boot_id"], "abc");
+        assert_eq!(v["pack_version"], "0.14.44");
+        assert_eq!(v["assets_missing"], json!(["web/office-boot.js", "web/vendor/three.module.js"]));
+        // assets 가 없거나 모양이 다르면 모름 — 없다고 지어내지 않는다
+        for b in [r#"{"ok":true,"boot_id":"x"}"#, r#"{"assets":"nope"}"#, "not json"] {
+            let v = office_health_value(&|_| office_reply(200, b));
+            assert_eq!(v["ok"], true, "{b}");
+            assert_eq!(v["assets_missing"], json!([]), "{b}");
+        }
+    }
+
+    /// 옛 브리지(/health 404)는 같은 꼴로 /world 를 본다 · 둘 다 안 되면 사유를 구분해 돌려준다(접속 불가 / 응답 없음 / 상태 번호).
+    #[test]
+    fn b5_health_value_legacy_world_fallback_and_reasons() {
+        let v = office_health_value(&|p| if p == "/health" { office_reply(404, "") } else { office_reply(200, "{}") });
+        assert_eq!((v["ok"].as_bool(), v["legacy"].as_bool(), v["reason"].as_str()), (Some(true), Some(true), Some("ok")));
+        let v = office_health_value(&|p| if p == "/health" { office_reply(404, "") } else { Err(OfficeProbeError::NoResponse) });
+        assert_eq!((v["ok"].as_bool(), v["legacy"].as_bool(), v["reason"].as_str()), (Some(false), Some(true), Some("no_response")));
+        let v = office_health_value(&|_| Err(OfficeProbeError::NoConnect));
+        assert_eq!((v["ok"].as_bool(), v["reachable"].as_bool(), v["reason"].as_str()), (Some(false), Some(false), Some("no_connect")));
+        let v = office_health_value(&|_| Err(OfficeProbeError::NoResponse));
+        assert_eq!((v["ok"].as_bool(), v["reachable"].as_bool(), v["reason"].as_str()), (Some(false), Some(true), Some("no_response")));
+        let v = office_health_value(&|_| office_reply(500, ""));
+        assert_eq!((v["ok"].as_bool(), v["reason"].as_str()), (Some(false), Some("status_500")));
+        let v = office_health_value(&|_| Ok(OfficeProbeReply { status: 200, body: vec![], complete: false }));
+        assert_eq!((v["ok"].as_bool(), v["reason"].as_str()), (Some(false), Some("incomplete")), "본문을 다 못 받은 200 은 통과가 아니다");
+    }
+
+    /// 실제 소켓으로 탐침 — 접속 불가 / 정상(Content-Length) / 응답 머리만 오고 본문이 멈춘 서버(시간 상한) / 64KB 이상 본문은 읽지 않고 성공.
+    #[test]
+    fn b5_probe_get_against_local_servers() {
+        use std::io::{Read, Write};
+        // 닫힌 포트
+        // (병렬로 도는 다른 시험이 같은 임시 포트를 막 잡을 수 있다 — 실제로 접속이 거절되는 포트를 확인한 것만 쓴다)
+        let closed = (0..50)
+            .find_map(|_| {
+                let l = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+                let p = l.local_addr().ok()?.port();
+                drop(l);
+                std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], p)), std::time::Duration::from_millis(300)).is_err().then_some(p)
+            })
+            .expect("닫힌 포트를 찾지 못했다");
+        assert_eq!(office_probe_get(closed, "/health"), Err(OfficeProbeError::NoConnect));
+        // 정상
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut b = [0u8; 512];
+            let n = s.read(&mut b).unwrap();
+            let req = String::from_utf8_lossy(&b[..n]).to_string();
+            let body = r#"{"ok":true,"boot_id":"z"}"#;
+            let _ = s.write_all(format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).as_bytes());
+            req
+        });
+        let r = office_probe_get(port, "/health").unwrap();
+        assert_eq!((r.status, r.complete), (200, true));
+        assert!(String::from_utf8_lossy(&r.body).contains("\"boot_id\":\"z\""));
+        let req = h.join().unwrap();
+        assert!(req.starts_with("GET /health HTTP/1.1\r\n"), "{req}");
+        // 64KB 보다 큰 본문 — 상한만큼만 읽고 성공으로 친다
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut b = [0u8; 512];
+            let _ = s.read(&mut b);
+            let body = vec![b'x'; 200 * 1024];
+            let _ = s.write_all(format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes());
+            let _ = s.write_all(&body);
+        });
+        let r = office_probe_get(port, "/world").unwrap();
+        assert_eq!((r.status, r.complete, r.body.len()), (200, true, OFFICE_PROBE_BODY_CAP));
+        let _ = h.join();
+    }
+
+    /// 실행 방식 — 맥: 자동(정책이 끄면 단추만) · 윈도우: 자동 없음, 단추는 플래그 뒤 · 플래그는 꺼져 있다.
+    #[test]
+    fn b6_repair_mode_matrix_and_windows_flag_off() {
+        assert_eq!(office_repair_mode(false, false, false), "auto");
+        assert_eq!(office_repair_mode(false, true, false), "button");
+        assert_eq!(office_repair_mode(true, false, false), "none");
+        assert_eq!(office_repair_mode(true, true, false), "none");
+        assert_eq!(office_repair_mode(true, false, true), "button", "윈도우 단추는 플래그가 켜져야만");
+        assert_eq!(office_repair_mode(true, true, true), "button");
+        assert!(!OFFICE_REPAIR_WINDOWS_BUTTON, "윈도우 [복구] 단추는 CI 윈도우 레인·실기 확인 전에는 꺼 둔다(설계 B6-2)");
+        assert!(office_policy_value_is_off(Some(&json!(0))));
+        assert!(office_policy_value_is_off(Some(&json!("0"))));
+        assert!(office_policy_value_is_off(Some(&json!(false))));
+        assert!(!office_policy_value_is_off(Some(&json!(1))));
+        assert!(!office_policy_value_is_off(Some(&json!("on"))));
+        assert!(!office_policy_value_is_off(None), "키가 없으면 기본(켬)");
+    }
+
+    fn office_pack_dir(tag: &str, version: Option<&str>, present: &[&str]) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("wc-office-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("web/vendor")).unwrap();
+        if let Some(v) = version {
+            std::fs::write(d.join(".pack-version"), format!("{v}\n")).unwrap();
+        }
+        for rel in present {
+            std::fs::write(d.join(rel), b"x").unwrap();
+        }
+        d
+    }
+
+    /// 복구 조율 — 없는 것만 · 파일이 있을 때는 명령 0회 · 버전이 다르면 실행 0회 · 원장 항목이 있는 파일은 건드리지 않는다 · 부분 성공.
+    #[test]
+    fn b6_repair_orchestration_missing_only_version_and_ledger() {
+        let all = ["web/office3d.html", "web/office-boot.js", "web/vendor/three.module.js"];
+        let ver = env!("CARGO_PKG_VERSION");
+        // 전부 있다 → 명령 0회
+        let d = office_pack_dir("allpresent", Some(ver), &all);
+        let mut calls: Vec<String> = vec![];
+        let v = repair_office_assets_with(&d, ver, &mut |r| { calls.push(r.to_string()); Ok(()) });
+        assert_eq!(v["status"], "nothing_missing");
+        assert!(calls.is_empty(), "파일이 있을 때 명령이 불렸다: {calls:?}");
+        // 버전 표식이 다르거나 없다 → 실행 0회
+        for (tag, version) in [("badver", Some("0.0.1")), ("nover", None)] {
+            let d = office_pack_dir(tag, version, &[]);
+            let v = repair_office_assets_with(&d, ver, &mut |r| { calls.push(r.to_string()); Ok(()) });
+            assert_eq!(v["status"], "version_mismatch", "{tag}");
+        }
+        assert!(calls.is_empty(), "판이 다른 팩에서 명령이 불렸다: {calls:?}");
+        // 하나만 없다 → 그 파일에만 · 파일이 실제로 생겨야 repaired
+        let d = office_pack_dir("one", Some(ver), &[all[0], all[1]]);
+        let dd = d.clone();
+        let v = repair_office_assets_with(&d, ver, &mut |r| { calls.push(r.to_string()); std::fs::write(dd.join(r), b"healed").unwrap(); Ok(()) });
+        assert_eq!(v["status"], "repaired");
+        assert_eq!(calls, vec!["web/vendor/three.module.js".to_string()]);
+        // 명령은 성공(0)이라고 했으나 파일이 안 생겼다 → failed(거짓 성공 금지)
+        let d = office_pack_dir("liar", Some(ver), &[all[0], all[1]]);
+        let v = repair_office_assets_with(&d, ver, &mut |_| Ok(()));
+        assert_eq!((v["status"].as_str(), v["failed"].as_array().map(|a| a.len())), (Some("failed"), Some(1)));
+        // 원장 항목이 있는 파일은 건드리지 않는다
+        let d = office_pack_dir("ledger", Some(ver), &[all[0], all[1]]);
+        std::fs::write(d.join(".merge-pending.json"), r#"{"web/vendor/three.module.js":{"kind":"kept-drift","ts":1}}"#).unwrap();
+        calls.clear();
+        let v = repair_office_assets_with(&d, ver, &mut |r| { calls.push(r.to_string()); Ok(()) });
+        assert_eq!(v["status"], "ledger_entry");
+        assert!(calls.is_empty(), "원장 항목이 있는 파일에 명령이 불렸다: {calls:?}");
+        assert_eq!(v["skipped"], json!(["web/vendor/three.module.js"]));
+        // 셋 다 없다 → 한 번에 하나씩 순서대로(부분 성공 포함)
+        let d = office_pack_dir("three", Some(ver), &[]);
+        calls.clear();
+        let dd = d.clone();
+        let v = repair_office_assets_with(&d, ver, &mut |r| {
+            calls.push(r.to_string());
+            if r.ends_with("office-boot.js") { Err("exit 1".into()) } else { std::fs::write(dd.join(r), b"healed").unwrap(); Ok(()) }
+        });
+        assert_eq!(calls, all.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(v["status"], "partial");
+        assert_eq!(v["failed"], json!(["web/office-boot.js"]));
+    }
+
+    /// 병합 대기 원장을 만들거나 바꾸지 않는다 — 조율 함수가 원장 파일에 쓰지 않는다(읽기만).
+    #[test]
+    fn b6_repair_orchestration_never_writes_ledger() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let s = prod.find("fn repair_office_assets_with(").expect("조율 함수 소실");
+        let body = &prod[s..s + prod[s..].find("\n}\n").expect("fn 끝")];
+        for bad in ["save_merge_pending", "write_atomic", "std::fs::write", "remove_file", "rename("] {
+            assert!(!body.contains(bad), "복구 조율이 원장·파일에 쓴다: {bad}");
+        }
+        assert!(body.contains("load_merge_pending"), "원장을 읽어 항목이 있는 파일을 건너뛰어야 한다");
+    }
+
+    /// 자식 실행기 — 표준입력은 닫혀 있고(읽으려는 자식이 즉시 끝난다) · 시간 상한을 넘기면 끝낸다 · 실패 종료코드는 Err.
+    #[cfg(unix)]
+    #[test]
+    fn b6_run_command_with_timeout_closes_stdin_and_kills() {
+        use std::time::{Duration, Instant};
+        // cat 은 표준입력이 열려 있으면 영원히 기다린다 — 닫혀 있으면 즉시 끝난다.
+        let t = Instant::now();
+        assert!(run_command_with_timeout(std::process::Command::new("cat"), Duration::from_secs(5)).is_ok());
+        assert!(t.elapsed() < Duration::from_secs(3), "표준입력이 닫혀 있지 않다");
+        let mut c = std::process::Command::new("sleep");
+        c.arg("30");
+        let t = Instant::now();
+        assert_eq!(run_command_with_timeout(c, Duration::from_millis(300)), Err("timeout".to_string()));
+        assert!(t.elapsed() < Duration::from_secs(3));
+        assert!(run_command_with_timeout(std::process::Command::new("false"), Duration::from_secs(5)).is_err());
+    }
+
+    /// 명령 등재 + 오피스 화면(원격 출처)이 백엔드 명령에 닿는 길이 없다 — capabilities 에 remote 없음 · 원격 도메인 IPC 허용 설정 없음 ·
+    /// 앱 명령은 파일에 적지 않는다 · 자산 복구 명령은 사이드카 도우미 하나로만 부른다(새 스폰 지점 없음).
+    #[test]
+    fn office_iframe_has_no_ipc_path_and_commands_registered() {
+        let src = include_str!("main.rs");
+        let prod = &src[..src.find("#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계 소실")];
+        let i = prod.find("tauri::generate_handler![").expect("invoke_handler 소실");
+        let reg = &prod[i..i + prod[i..].find("\n        ])").expect("핸들러 목록 끝")];
+        for name in ["office_health", "repair_office_assets"] {
+            assert!(reg.lines().any(|l| l.trim() == format!("{name},")), "{name} 이 invoke_handler 에 등재되지 않았다");
+        }
+        let cap: Value = serde_json::from_str(include_str!("../capabilities/default.json")).expect("capabilities 파싱");
+        assert!(cap.get("remote").is_none(), "capabilities 에 remote 가 생겼다 — 오피스 화면이 백엔드 명령을 부를 수 있게 된다");
+        assert_eq!(cap["windows"], json!(["main"]));
+        let perms = cap["permissions"].as_array().unwrap();
+        assert!(perms.iter().all(|p| p.as_str().map(|s| !s.contains("office") && !s.contains("feed")).unwrap_or(false)), "앱 명령은 capabilities 에 적지 않는다");
+        let conf = include_str!("../tauri.conf.json");
+        assert!(!conf.contains("dangerousRemoteDomainIpcAccess"), "원격 도메인 IPC 허용 설정이 생겼다");
+        // 화면 자산 복구는 사이드카 도우미로만 — `Command::new` 를 새로 만들지 않는다
+        let s = prod.find("fn run_pack_heal_missing_only(").expect("소실");
+        let body = &prod[s..s + prod[s..].find("\n}\n").unwrap()];
+        assert!(body.contains("sealed_sidecar_cys(&[\"pack-heal\", \"--missing-only\", rel])"));
+        assert!(!body.contains("Command::new"));
     }
 }

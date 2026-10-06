@@ -157,6 +157,7 @@ import {
   type UsageLine,
   type UsageViewMode,
 } from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보·전 좌석 폴백 집계
+import { planOfficeTab, repairOutcomeOf, type OfficeCtx } from "./officetab"; // 0.14.44 B5·B6 오피스 탭 안내(순수 판정)
 import { starvedNotice, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
 import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
@@ -836,6 +837,7 @@ function setCcOpen(open: boolean) {
     if (ccHwTimer == null) ccHwTimer = setInterval(refreshHw, 2000) as unknown as number;
     if (ccClockTimer == null) ccClockTimer = setInterval(tickCc, 1000) as unknown as number;
   } else {
+    officeStopWatch(); // ★0.14.44 B5 패널을 닫으면 오피스 건강 확인도 멈춘다
     if (ccTimer != null) { clearInterval(ccTimer); ccTimer = null; }
     if (ccHwTimer != null) { clearInterval(ccHwTimer); ccHwTimer = null; }
     if (ccClockTimer != null) { clearInterval(ccClockTimer); ccClockTimer = null; }
@@ -977,6 +979,7 @@ function setCcTab(view: CcTab) {
   document.getElementById("cc-view-feed")!.hidden = view !== "feed";
   document.getElementById("cc-view-alarms")!.hidden = view !== "alarms";
   document.getElementById("cc-view-office")!.hidden = view !== "office";
+  if (view !== "office") officeStopWatch(); // ★0.14.44 B5 탭을 떠나면 건강 확인을 멈춘다
   // 오피스 탭 전면 모드 — cc-body의 대시보드 폭 상한(780px)을 해제해 3D를 창 크기에 연동(cc-glance 패턴).
   document.body.classList.toggle("cc-office", view === "office");
   document.querySelectorAll("#cc-tabs .cc-tab").forEach((b) =>
@@ -1004,22 +1007,85 @@ function setCcTab(view: CcTab) {
 }
 
 // 메타버스 오피스 탭 — 로컬 브리지(127.0.0.1:8642, 3D 실시간 오피스)를 iframe으로 내장.
-// 탭 진입 시에만 로드(상시 연결 방지)·브리지 부재 시 기동 안내만 표시.
+// 탭 진입 시에만 로드(상시 연결 방지).
+// ★0.14.44 B5·B6: 화면이 아직 실리지 않았을 때만 앱 백엔드 `office_health`(브리지의 실제 응답 확인)를 3초(3분 뒤부터 15초)마다 부르고,
+//   탭을 떠나거나 패널을 닫으면 멈춘다. 새 setInterval 없이 setTimeout 연쇄(탭 틱 수 핀 불변). 문구·판정은 officetab.ts(순수) —
+//   터미널 명령은 화면 어디에도 없다. 화면이 실린 뒤의 문제는 화면 안 배너(office-boot.js)가 맡는다 — 탭 안내와 겹치지 않는다.
+//   자산이 없으면(B6) 맥은 앱 세션당 1회 스스로 `repair_office_assets` 를 부르고(백엔드가 상한을 지킨다), 단추는 사람이 누를 때만(manual).
 const OFFICE_URL = "http://127.0.0.1:8642/";
-async function openOfficeView() {
-  const frame = document.getElementById("cc-office-frame") as HTMLIFrameElement | null;
-  const hint = document.getElementById("cc-office-hint");
-  if (!frame || !hint) return;
-  try {
-    // no-cors: 도달성 프로브만(응답은 opaque). tauri://localhost → http://127.0.0.1 은
-    // 교차출처라 CORS-fetch는 ACAO 없이 reject되어 브리지가 살아있어도 hint에 갇혔다(근본 수리).
-    await fetch(OFFICE_URL + "world", { mode: "no-cors", signal: AbortSignal.timeout(1500) });
-    hint.hidden = true;
-    if (!frame.src) frame.src = OFFICE_URL;
-  } catch {
-    hint.hidden = false;
-    frame.removeAttribute("src");
+let officeWatchGen = 0; // 확인 루프의 세대 — 탭을 떠나거나 다시 열면 올라가 낡은 루프가 스스로 끝난다
+let officeWatchTimer: number | undefined;
+let officeWatchSince = 0;
+let officeRepairing = false;
+let officeRepairOutcome: OfficeCtx["repairOutcome"] = "none";
+function officeStopWatch() {
+  officeWatchGen++;
+  if (officeWatchTimer !== undefined) {
+    clearTimeout(officeWatchTimer);
+    officeWatchTimer = undefined;
   }
+}
+function officeRenderHint(text: string, buttonLabel: string) {
+  const hint = document.getElementById("cc-office-hint");
+  const txt = document.getElementById("cc-office-hint-text");
+  const btn = document.getElementById("cc-office-repair") as HTMLButtonElement | null;
+  if (!hint || !txt || !btn) return;
+  hint.hidden = text === "";
+  if (txt.textContent !== text) txt.textContent = text;
+  btn.hidden = buttonLabel === "";
+  if (btn.textContent !== buttonLabel) btn.textContent = buttonLabel;
+}
+async function officeRunRepair(manual: boolean, gen: number) {
+  if (officeRepairing) return;
+  officeRepairing = true;
+  try {
+    const r = (await invoke("repair_office_assets", { manual })) as { status?: string } | null;
+    const o = repairOutcomeOf(r?.status);
+    officeRepairOutcome = o === "retry" ? "none" : o;
+  } catch {
+    officeRepairOutcome = "failed";
+  } finally {
+    officeRepairing = false;
+  }
+  // 복구 뒤 바로 한 번 다시 확인한다(성공 여부는 건강 확인이 판정 — 명령의 종료코드를 믿지 않는다).
+  if (gen === officeWatchGen) {
+    if (officeWatchTimer !== undefined) clearTimeout(officeWatchTimer);
+    officeWatchTimer = setTimeout(() => void officeWatchTick(gen), 300) as unknown as number;
+  }
+}
+async function officeWatchTick(gen: number) {
+  if (gen !== officeWatchGen) return;
+  officeWatchTimer = undefined;
+  const frame = document.getElementById("cc-office-frame") as HTMLIFrameElement | null;
+  if (!frame) return;
+  let h: unknown = null;
+  try {
+    h = await invoke("office_health");
+  } catch {
+    h = null; // 호출 실패 — 준비 중으로 본다(브리지가 없을 때와 같은 안내)
+  }
+  if (gen !== officeWatchGen) return; // 기다리는 사이 탭을 떠났다
+  const plan = planOfficeTab(h, { elapsedMs: Date.now() - officeWatchSince, repairing: officeRepairing, repairOutcome: officeRepairOutcome });
+  if (plan.loadFrame) {
+    officeRenderHint("", "");
+    if (!frame.src) frame.src = OFFICE_URL;
+    return; // 실렸다 — 확인을 멈춘다
+  }
+  frame.removeAttribute("src"); // 화면이 실리지 않은 상태에서는 빈 틀을 두지 않는다
+  officeRenderHint(plan.text, plan.buttonLabel);
+  if (plan.autoRepair && !officeRepairing) void officeRunRepair(false, gen);
+  if (plan.nextPollMs > 0) officeWatchTimer = setTimeout(() => void officeWatchTick(gen), plan.nextPollMs) as unknown as number;
+}
+document.getElementById("cc-office-repair")?.addEventListener("click", () => {
+  officeRepairOutcome = "none";
+  void officeRunRepair(true, officeWatchGen);
+});
+function openOfficeView() {
+  if (!document.getElementById("cc-office-frame")) return;
+  officeStopWatch();
+  officeWatchSince = Date.now();
+  officeRepairOutcome = "none"; // 탭을 다시 열면 처음부터(복구 실패의 잔상을 끌고 가지 않는다)
+  void officeWatchTick(officeWatchGen);
 }
 
 // D5: 스킬 버튼 보드 — 카탈로그 큐레이션 렌더 + 일회용 워커 실행 + 산출물 회수(터미널 입력 0회).

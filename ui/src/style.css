@@ -1050,3 +1050,7 @@ body.cc-office #cc-view-office { flex: 1; min-height: 0; }
 .pane.inject-flash .pane-title { background: rgba(47,129,247,.35); transition: background .6s; }
 /* F6: 전출 대상 ws 탭 하이라이트 */
 .ws-tab.transfer-target { outline: 2px dashed var(--accent); outline-offset: -2px; }
+/* ★0.14.44 B6 오피스 탭 안내의 복구 단추 — 안내 문구 옆(.cc-acct-hide 와 같은 결). 누를 때만 보인다(hidden). */
+#cc-office-repair { margin-left: 8px; font-size: 11px; padding: 1px 10px; border-radius: 8px; border: 1px solid rgba(148,163,184,.4); background: none; color: #cbd5e1; cursor: pointer; }
+#cc-office-repair:hover { color: #f1f5f9; border-color: rgba(226,232,240,.6); }
+#cc-office-repair[hidden] { display: none; }
