@@ -1,0 +1,6 @@
+WH-WIN-MEASURE csrss.exe pid=7736 ppid=Some(7724) start_time=0 handle_opened_estimate=false now=1791292228
+WH-WIN-GUARD parent=7724 child=7736 off_has=true on_has=false
+WH-WIN-MEASURE csrss.exe pid=748 ppid=Some(736) start_time=0 handle_opened_estimate=false now=1791292228
+WH-WIN-GUARD parent=736 child=748 off_has=true on_has=false
+WH-WIN-MEASURE wininit.exe pid=844 ppid=Some(736) start_time=0 handle_opened_estimate=false now=1791292228
+WH-WIN-GUARD parent=736 child=844 off_has=true on_has=false
