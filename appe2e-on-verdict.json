@@ -1,0 +1,36 @@
+{
+    "result":  "PASS",
+    "reasons":  [
+                    "under real SAC the blocked update left the app running, no installer started, the notification named 4551, the temp folder and the attempt record were cleaned up"
+                ],
+    "facts":  {
+                  "app_version_seen_by_cdp":  "0.14.44",
+                  "button_click":  true,
+                  "fallback_invoke":  false,
+                  "flow_error":  "",
+                  "confirm_title":  "새 본체 버전 0.14.99 — 패치 설치",
+                  "confirm_names_smart_app_control":  true,
+                  "blocked_toast_found":  true,
+                  "blocked_toast_name":  "설치 파일 실행이 차단되었습니다",
+                  "blocked_toast_has_4551":  true,
+                  "blocked_toast_says_app_not_closed":  true,
+                  "blocked_toast_detail":  "Windows 의 앱 제어 정책(스마트 앱 컨트롤 등)이 새 버전(0.14.99) 설치 파일의 실행을 막았습니다(오류 4551). 업데이트는 설치되지 않았고 지금 버전(0.14.44)이 그대로 실행 중입니다. 앱은 닫히지 않았습니다. 스마트 앱 컨트롤이 켜진 PC 에서는 Windows 가 신뢰하는 코드 서명이나 평판이 없는 프로그램이 실행되지 않습니다. 스마트 앱 컨트롤이 켜져 있는 동안에는 이 앱을 닫으면 다시 열 때도 막힐 수 있으니, 작업을 마치기 전에는 앱을 닫지 마세요. 확인하는 곳: Windows 보안 → 앱 및 브라우저 컨트롤 → 스마트 앱 컨트롤. 스마트 앱 컨트롤을 사용하지 않도록 바꾸면 설치할 수 있지만 PC 의 보호 수준을 낮추는 선택이며, Windows 업데이트 상태에 따라 다시 켜지 못할 수 있습니다.",
+                  "cdp_socket_closed":  false,
+                  "app_alive_seconds_after_click":  98,
+                  "app_dead_samples_after_click":  0,
+                  "installer_process_seen":  false,
+                  "installer_process":  null,
+                  "updater_dirs_seen":  [
+                                            "cys-0.14.99-updater-fTUeAJ"
+                                        ],
+                  "updater_dirs_left_at_end":  [
+
+                                               ],
+                  "attempt_record_seen_while_running":  true,
+                  "attempt_record_present_at_end":  false,
+                  "marker_initial":  "0.14.44",
+                  "marker_last":  "0.14.44",
+                  "download_progress_events":  8797,
+                  "watch_end":  "the node driver finished its observation window after the click"
+              }
+}

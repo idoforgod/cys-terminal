@@ -1,0 +1,301 @@
+{
+    "prefix":  "w44b-fresh",
+    "started":  "2026-10-06T13:39:11.665Z",
+    "finished":  "2026-10-06T13:45:48.679Z",
+    "skipped":  null,
+    "assets":  {
+                   "boot-js-missing":  {
+                                           "file":  "C:\\Users\\runneradmin\\.cys\\pack\\web\\office-boot.js",
+                                           "existed":  true,
+                                           "health_assets":  {
+                                                                 "office3d_html":  true,
+                                                                 "office_boot_js":  false,
+                                                                 "three_module_js":  true
+                                                             },
+                                           "node":  {
+                                                        "prefix":  "w44b-fresh-boot-js-missing",
+                                                        "mode":  "w44office",
+                                                        "rc":  0,
+                                                        "timed_out":  false,
+                                                        "error":  null
+                                                    },
+                                           "office":  {
+                                                          "loaded":  true,
+                                                          "loaded_after_ms":  1,
+                                                          "first_sample":  {
+                                                                               "view_visible":  true,
+                                                                               "frame_src":  "http://127.0.0.1:8642/",
+                                                                               "frame_w":  0,
+                                                                               "frame_h":  0,
+                                                                               "hint_hidden":  true,
+                                                                               "hint_text":  "",
+                                                                               "repair_button_hidden":  true,
+                                                                               "frame_document":  "no contentDocument (cross-origin or not loaded)",
+                                                                               "t_ms":  1
+                                                                           },
+                                                          "final":  {
+                                                                        "view_visible":  true,
+                                                                        "frame_src":  "http://127.0.0.1:8642/",
+                                                                        "frame_w":  0,
+                                                                        "frame_h":  0,
+                                                                        "hint_hidden":  true,
+                                                                        "hint_text":  "",
+                                                                        "repair_button_hidden":  true,
+                                                                        "frame_document":  "no contentDocument (cross-origin or not loaded)"
+                                                                    },
+                                                          "samples":  1,
+                                                          "shot":  "w44b-fresh-boot-js-missing-ui-w44-boot-js-missing.png"
+                                                      },
+                                           "boot_js_http":  404,
+                                           "root_http":  200,
+                                           "restored":  true
+                                       },
+                   "three-missing":  {
+                                         "file":  "C:\\Users\\runneradmin\\.cys\\pack\\web\\vendor\\three.module.js",
+                                         "existed":  true,
+                                         "health_assets":  {
+                                                               "office3d_html":  true,
+                                                               "office_boot_js":  true,
+                                                               "three_module_js":  false
+                                                           },
+                                         "node":  {
+                                                      "prefix":  "w44b-fresh-three-missing",
+                                                      "mode":  "w44office",
+                                                      "rc":  0,
+                                                      "timed_out":  false,
+                                                      "error":  null
+                                                  },
+                                         "office":  {
+                                                        "loaded":  true,
+                                                        "loaded_after_ms":  3,
+                                                        "first_sample":  {
+                                                                             "view_visible":  true,
+                                                                             "frame_src":  "http://127.0.0.1:8642/",
+                                                                             "frame_w":  988,
+                                                                             "frame_h":  528,
+                                                                             "hint_hidden":  true,
+                                                                             "hint_text":  "",
+                                                                             "repair_button_hidden":  true,
+                                                                             "frame_document":  "no contentDocument (cross-origin or not loaded)",
+                                                                             "t_ms":  3
+                                                                         },
+                                                        "final":  {
+                                                                      "view_visible":  true,
+                                                                      "frame_src":  "http://127.0.0.1:8642/",
+                                                                      "frame_w":  988,
+                                                                      "frame_h":  528,
+                                                                      "hint_hidden":  true,
+                                                                      "hint_text":  "",
+                                                                      "repair_button_hidden":  true,
+                                                                      "frame_document":  "no contentDocument (cross-origin or not loaded)"
+                                                                  },
+                                                        "samples":  1,
+                                                        "shot":  "w44b-fresh-three-missing-ui-w44-three-missing.png"
+                                                    },
+                                         "boot_js_http":  200,
+                                         "root_http":  200,
+                                         "restored":  true
+                                     }
+               },
+    "late":  {
+                 "killed":  [
+                                10380
+                            ],
+                 "node":  {
+                              "prefix":  "w44b-fresh-late",
+                              "mode":  "w44office",
+                              "rc":  0,
+                              "timed_out":  false,
+                              "error":  null
+                          },
+                 "office":  {
+                                "loaded":  true,
+                                "loaded_after_ms":  2,
+                                "hint_texts_seen":  [
+
+                                                    ],
+                                "final":  {
+                                              "view_visible":  true,
+                                              "frame_src":  null,
+                                              "frame_w":  0,
+                                              "frame_h":  0,
+                                              "hint_hidden":  false,
+                                              "hint_text":  "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+                                              "repair_button_hidden":  true,
+                                              "frame_document":  "title="
+                                          },
+                                "samples":  1,
+                                "shot":  "w44b-fresh-late-ui-w44-late.png"
+                            },
+                 "bridge_rows_after":  {
+                                           "tag":  "after-late",
+                                           "time":  "2026-10-06T13:40:32.924Z",
+                                           "rows":  [
+
+                                                    ],
+                                           "count":  0,
+                                           "error":  null
+                                       }
+             },
+    "hold":  {
+                 "seats":  {
+                               "w44a":  {
+                                            "ref":  "surface:5",
+                                            "rc":  0
+                                        },
+                               "w44b":  {
+                                            "ref":  "surface:6",
+                                            "rc":  0
+                                        },
+                               "w44m":  {
+                                            "ref":  "surface:7",
+                                            "rc":  0
+                                        }
+                           },
+                 "samples":  [
+                                 {
+                                     "at_sec":  4,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:5\trole=-\tpid=8352\texited=false\tw44a\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  173
+                                 },
+                                 {
+                                     "at_sec":  24,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:5\trole=-\tpid=8352\texited=false\tw44a\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  172
+                                 },
+                                 {
+                                     "at_sec":  44,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:5\trole=-\tpid=8352\texited=false\tw44a\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  175
+                                 },
+                                 {
+                                     "at_sec":  65,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:5\trole=-\tpid=8352\texited=false\tw44a\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  173
+                                 },
+                                 {
+                                     "at_sec":  85,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:5\trole=-\tpid=8352\texited=false\tw44a\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  173
+                                 },
+                                 {
+                                     "at_sec":  106,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:5\trole=-\tpid=8352\texited=false\tw44a\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  175
+                                 },
+                                 {
+                                     "at_sec":  127,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:5\trole=-\tpid=8352\texited=false\tw44a\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  175
+                                 },
+                                 {
+                                     "at_sec":  147,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:5\trole=-\tpid=8352\texited=false\tw44a\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  175
+                                 },
+                                 {
+                                     "at_sec":  167,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:5\trole=-\tpid=8352\texited=false\tw44a\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  173
+                                 },
+                                 {
+                                     "at_sec":  187,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:5\trole=-\tpid=8352\texited=false\tw44a\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  175
+                                 },
+                                 {
+                                     "at_sec":  214,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  172
+                                 },
+                                 {
+                                     "at_sec":  234,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  201
+                                 },
+                                 {
+                                     "at_sec":  254,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  170
+                                 },
+                                 {
+                                     "at_sec":  274,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  172
+                                 },
+                                 {
+                                     "at_sec":  294,
+                                     "list":  "surface:4\trole=-\tpid=1652\texited=false\tsurface 4\tC:\\Users\\runneradmin | surface:6\trole=-\tpid=7508\texited=false\tw44b\tC:\\Users\\runneradmin | surface:7\trole=master\tpid=2492\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  182
+                                 }
+                             ],
+                 "proc_count_high_lines":  0,
+                 "log_lines":  [
+                                   "no cysd.log at C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.log"
+                               ],
+                 "close_test":  {
+                                    "closed":  "surface:5",
+                                    "rc":  0,
+                                    "out":  "closed surface:5 (descendants killed)\n ",
+                                    "seat_a_pid":  8352,
+                                    "seat_a_tree":  3,
+                                    "seat_a_alive_after":  0,
+                                    "seat_b_pid":  7508,
+                                    "seat_b_tree":  3,
+                                    "seat_b_alive_after":  3,
+                                    "sys_before":  {
+                                                       "total":  175,
+                                                       "wininit.exe":  1,
+                                                       "csrss.exe":  2,
+                                                       "services.exe":  1,
+                                                       "smss.exe":  1,
+                                                       "lsass.exe":  1,
+                                                       "winlogon.exe":  1,
+                                                       "svchost.exe":  74
+                                                   },
+                                    "sys_after":  {
+                                                      "total":  172,
+                                                      "wininit.exe":  1,
+                                                      "csrss.exe":  2,
+                                                      "services.exe":  1,
+                                                      "smss.exe":  1,
+                                                      "lsass.exe":  1,
+                                                      "winlogon.exe":  1,
+                                                      "svchost.exe":  74
+                                                  }
+                                },
+                 "sys_before":  {
+                                    "total":  163,
+                                    "wininit.exe":  1,
+                                    "csrss.exe":  2,
+                                    "services.exe":  1,
+                                    "smss.exe":  1,
+                                    "lsass.exe":  1,
+                                    "winlogon.exe":  1,
+                                    "svchost.exe":  76
+                                },
+                 "sys_after":  {
+                                   "total":  172,
+                                   "wininit.exe":  1,
+                                   "csrss.exe":  2,
+                                   "services.exe":  1,
+                                   "smss.exe":  1,
+                                   "lsass.exe":  1,
+                                   "winlogon.exe":  1,
+                                   "svchost.exe":  74
+                               },
+                 "feed_items_matching":  0
+             },
+    "approval":  {
+                     "sign_out":  "signed: ap-8320-1791294118-0 (expires_at=1791294718) | rc=0  | ",
+                     "lane_file":  true,
+                     "lane_len":  32,
+                     "tmp_leftovers":  [
+
+                                       ],
+                     "state_dir":  "C:\\Users\\runneradmin\\AppData\\Local\\cys",
+                     "ttl_store_has_record":  true,
+                     "check_other_folder_rc":  0
+                 },
+    "error":  null
+}

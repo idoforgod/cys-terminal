@@ -1,0 +1,122 @@
+{
+    "tag":  "scene-w44-fresh",
+    "time":  "2026-10-06T13:34:22.317Z",
+    "version":  "cys 0.14.44",
+    "seconds":  128.5,
+    "finished":  false,
+    "timed_out":  true,
+    "rc":  null,
+    "stdout_bytes":  0,
+    "stdout_lines":  0,
+    "last_lines":  [
+
+                   ],
+    "snapshots":  [
+                      {
+                          "at_sec":  16,
+                          "doctor_children":  [
+                                                  "conhost.exe#10180 cpu_s=0 read_bytes=0 write_bytes=0 threads=4 \\??\\C:\\Windows\\system32\\conhost.exe 0x4"
+                                              ],
+                          "cys_pipes":  [
+                                            "cys",
+                                            "cys-dept-dept-1"
+                                        ],
+                          "loopback":  [
+                                           "  TCP    127.0.0.1:8642         0.0.0.0:0              LISTENING       10380",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49344        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49346        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49353        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49354        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49355        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49884        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:50246        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:53180        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:53236        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:55400        ESTABLISHED     10380",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:57679        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:60340        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:62440        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:63677        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:65018        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         0.0.0.0:0              LISTENING       5980",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:50252        ESTABLISHED     5980",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:62070        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:50252        127.0.0.1:9333         ESTABLISHED     9104",
+                                           "  TCP    127.0.0.1:55400        127.0.0.1:8642         ESTABLISHED     9408",
+                                           "  TCP    127.0.0.1:61961        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:61967        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:61968        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:61974        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  UDP    127.0.0.1:1900         *:*                                    6032",
+                                           "  UDP    127.0.0.1:49721        127.0.0.1:49721                        3536",
+                                           "  UDP    127.0.0.1:51579        *:*                                    6032"
+                                       ],
+                          "stdout_tail":  "",
+                          "busiest_processes_3s":  [
+                                                       "msedgewebview2.exe#9436 io_bytes_3s=15213072 cpu_s_3s=117.48 \"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.37\\msedgewebview2.exe\" --type=gpu-process --gpu-recent-crash-count=0 --noerrdialogs --user-...[cut]",
+                                                       "svchost.exe#10276 io_bytes_3s=22090960 cpu_s_3s=0.67 C:\\Windows\\system32\\svchost.exe -k InvSvcGroup -p -s InventorySvc",
+                                                       "python3.exe#10908 io_bytes_3s=17528690 cpu_s_3s=0.08 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_runtime_seal.py verify --root C:\\Users\\runneradmin\\...[cut]",
+                                                       "msedgewebview2.exe#10368 io_bytes_3s=12590032 cpu_s_3s=1.88 \"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.37\\msedgewebview2.exe\" --type=renderer --noerrdialogs --user-data-dir=\"C:\\Users\\runneradmin...[cut]",
+                                                       "msedgewebview2.exe#8768 io_bytes_3s=2656744 cpu_s_3s=5.81 \"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.37\\msedgewebview2.exe\" --type=renderer --noerrdialogs --user-data-dir=\"C:\\Users\\runneradmin...[cut]",
+                                                       "python3.exe#1764 io_bytes_3s=933438 cpu_s_3s=0.02 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\AppData\\Local\\cys\\phoenix-embed\\0.14.44-8320-1791293631337434300\\bin\\ja...[cut]",
+                                                       "python3.exe#7868 io_bytes_3s=491650 cpu_s_3s=0.09 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-dept-dept-1\\phoenix-embed\\0.14.44-8416-1791293631...[cut]",
+                                                       "python3.exe#9312 io_bytes_3s=377507 cpu_s_3s=0 C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe C:\\Users\\runneradmin\\.cys\\pack\\bin\\javis_task.py list"
+                                                   ]
+                      },
+                      {
+                          "at_sec":  84,
+                          "doctor_children":  [
+                                                  "conhost.exe#10180 cpu_s=0 read_bytes=0 write_bytes=0 threads=2 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                                                  "python3.exe#10908 cpu_s=0.4 read_bytes=93441305 write_bytes=0 threads=1 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_runtime_seal.py verify --root C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime --manifest C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime-manifest.json --json --max-list 3"
+                                              ],
+                          "cys_pipes":  [
+                                            "cys",
+                                            "cys-dept-dept-1"
+                                        ],
+                          "loopback":  [
+                                           "  TCP    127.0.0.1:8642         0.0.0.0:0              LISTENING       10380",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49353        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49354        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49355        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:49884        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:51983        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:55400        ESTABLISHED     10380",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:57679        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:61977        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:62440        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:63677        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         0.0.0.0:0              LISTENING       5980",
+                                           "  TCP    127.0.0.1:50252        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:55400        127.0.0.1:8642         ESTABLISHED     9408",
+                                           "  TCP    127.0.0.1:59848        127.0.0.1:8642         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:61968        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  UDP    127.0.0.1:1900         *:*                                    6032",
+                                           "  UDP    127.0.0.1:49721        127.0.0.1:49721                        3536",
+                                           "  UDP    127.0.0.1:51579        *:*                                    6032"
+                                       ],
+                          "stdout_tail":  "",
+                          "busiest_processes_3s":  [
+                                                       "msedgewebview2.exe#9436 io_bytes_3s=10508112 cpu_s_3s=65.66 \"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.37\\msedgewebview2.exe\" --type=gpu-process --gpu-recent-crash-count=0 --noerrdialogs --user-...[cut]",
+                                                       "svchost.exe#10276 io_bytes_3s=22656848 cpu_s_3s=1 C:\\Windows\\system32\\svchost.exe -k InvSvcGroup -p -s InventorySvc",
+                                                       "msedgewebview2.exe#10368 io_bytes_3s=8771840 cpu_s_3s=0.97 \"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.37\\msedgewebview2.exe\" --type=renderer --noerrdialogs --user-data-dir=\"C:\\Users\\runneradmin...[cut]",
+                                                       "msedgewebview2.exe#8768 io_bytes_3s=1746880 cpu_s_3s=5.44 \"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.37\\msedgewebview2.exe\" --type=renderer --noerrdialogs --user-data-dir=\"C:\\Users\\runneradmin...[cut]",
+                                                       "python3.exe#10908 io_bytes_3s=178510 cpu_s_3s=0.34 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_runtime_seal.py verify --root C:\\Users\\runneradmin\\...[cut]",
+                                                       "powershell.exe#9104 io_bytes_3s=0 cpu_s_3s=0.34 \"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\a\\cys-terminal\\cys-terminal\\diag\\app-e2e...[cut]",
+                                                       "MsMpEng.exe#3844 io_bytes_3s=0 cpu_s_3s=0.16 ",
+                                                       "msedgewebview2.exe#5980 io_bytes_3s=46528 cpu_s_3s=0.11 \"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.37\\msedgewebview2.exe\" --embedded-browser-webview=1 --webview-exe-name=cys-app.exe --webvie...[cut]"
+                                                   ]
+                      }
+                  ],
+    "env_notes":  [
+
+                  ],
+    "error":  null,
+    "direct_seal_verify":  {
+                               "seconds":  131,
+                               "rc":  1,
+                               "timed_out":  true,
+                               "out":  "",
+                               "err":  "",
+                               "manifest_exists":  true
+                           }
+}

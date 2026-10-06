@@ -1,0 +1,7 @@
+[cysd] v0.14.44 cys-fix-w2-gen-0.14.4
+[cysd] ⚠ 레인↔팩 불일치: socket=\\.\pipe\cys-dept-dept-1 (dept=true) pack=C:\Users\runneradmin\.cys/pack (dept=false) — 부서 데몬은 `cys-dept launch <name>`(CYS_SOCKET+CYS_PACK_DIR 쌍)으로 기동해야 한다. 이 조합은 부서 부트 차단·팩 교차 서빙을 유발한다.
+[cysd] office-bridge skipped (dept daemon)
+cysd (CYSJavis terminal daemon) listening on \\.\pipe\cys-dept-dept-1
+[cysd] auto-restore triggered (phoenix restore --auto · 임베드 추출 우선)
+[cysd] auto-restore non-zero (exit=Some(1)) — 60000ms 후 1회 재시도 (lease/liveness 재산정에 위임)
+[cysd] auto-restore finished (exit=Some(1)) — 재시도 소진(1회). phoenix-restore.log 참조
