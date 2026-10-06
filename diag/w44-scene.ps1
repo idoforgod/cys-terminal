@@ -114,6 +114,8 @@ function Invoke-W44Scene {
         }
         $rec['dept_pipes'] = $dp.ToArray()
         $rec['pipes_all'] = @($pp['cys'])
+        $rec['doctor_pre'] = $null
+        try { $dpre = Invoke-W44DoctorProbe ('pre-' + $Prefix) 120; $rec['doctor_pre'] = [ordered]@{ seconds = $dpre['seconds']; finished = $dpre['finished']; timed_out = $dpre['timed_out']; rc = $dpre['rc']; bytes = $dpre['stdout_bytes'] } } catch { }
         $rec['bridge_rows_before'] = Get-W44BridgeRows 'scene-before'
         $extra = ('--w44-cys "{0}" --w44-office-wait-sec 150 --w44-feed-wait-sec 60' -f $cys)
         if ($dp.Count -gt 0) { $extra += (' --w44-dept-pipes "{0}"' -f ($dp.ToArray() -join ',')) }
@@ -129,6 +131,17 @@ function Invoke-W44Scene {
             try { $txt = [System.IO.File]::ReadAllText((Join-Path $global:DiagOut ('w44-doctorprobe-scene-' + $Prefix + '-stdout.txt')), [System.Text.Encoding]::UTF8) } catch { }
             $ag = @(); $asset = @()
             foreach ($ln in ($txt -split "`r?`n")) { if ($ln -match 'Antigravity|agy') { $ag += (Limit-Text $ln 400) }; if ($ln -match 'office|web/|assets|pack-heal') { $asset += (Limit-Text $ln 300) } }
+            $rec['doctor_after_bridge_killed'] = $null
+            if ($dp0['timed_out']) {
+                # kill the office bridge (python) and run the doctor once more: is the slowness the bridge's / the office tab's doing?
+                try {
+                    $killed = @()
+                    foreach ($pr in @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 20)) { if (([string]$pr.CommandLine) -like '*javis_hud_bridge.py*') { try { Stop-Process -Id ([int]$pr.ProcessId) -Force -ErrorAction Stop; $killed += [int]$pr.ProcessId } catch { } } }
+                    Start-Sleep -Seconds 3
+                    $dp1 = Invoke-W44DoctorProbe ('nobridge-' + $Prefix) 150
+                    $rec['doctor_after_bridge_killed'] = [ordered]@{ killed = $killed; seconds = $dp1['seconds']; finished = $dp1['finished']; timed_out = $dp1['timed_out']; rc = $dp1['rc']; bytes = $dp1['stdout_bytes'] }
+                } catch { $rec['doctor_after_bridge_killed'] = [ordered]@{ error = $_.Exception.Message } }
+            }
             $rec['doctor'] = [ordered]@{ rc = $dp0['rc']; timed_out = $dp0['timed_out']; seconds = $dp0['seconds']; antigravity_lines = $ag; office_or_asset_lines = $asset; bytes = $txt.Length }
         } catch { $rec['doctor'] = [ordered]@{ error = $_.Exception.Message } }
         try {
@@ -185,7 +198,7 @@ function Invoke-W44DoctorProbe {
         [void]$p.Start()
         try { $p.StandardInput.Close() } catch { }
         $p.BeginOutputReadLine(); $p.BeginErrorReadLine()
-        $snapAt = @(15, 45, 120, 240)
+        $snapAt = @(15, 45, 120)
         $si = 0
         while (-not $p.HasExited -and ((Get-Date) - $ts).TotalSeconds -lt $MaxSec) {
             Start-Sleep -Seconds 1
@@ -203,7 +216,24 @@ function Invoke-W44DoctorProbe {
                 $lo = @($net -split "`r?`n" | Where-Object { $_ -match '127\.0\.0\.1' } | Select-Object -First 30)
                 $pp = @(); try { $pp = @([System.IO.Directory]::GetFiles('\\.\pipe\') | ForEach-Object { $_.Substring($_.LastIndexOf('\') + 1) } | Where-Object { $_ -match 'cys' }) } catch { }
                 $tail = ''; try { $tail = (Get-Content -LiteralPath $of -Tail 3 -ErrorAction SilentlyContinue) -join ' | ' } catch { }
-                $o['snapshots'] += [ordered]@{ at_sec = [int]$el; doctor_children = $kids; cys_pipes = $pp; loopback = $lo; stdout_tail = (Limit-Text $tail 400) }
+                # who is busy on this machine right now: two samples 3 s apart of every process's CPU time and I/O bytes; the top ones
+                $busy = @()
+                try {
+                    $s1 = @{}; foreach ($pr in @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 20)) { $s1[[int]$pr.ProcessId] = @([double]$pr.ReadTransferCount, [double]$pr.WriteTransferCount, [string]$pr.Name, [string]$pr.CommandLine) }
+                    $c1 = @{}; foreach ($gp in @(Get-Process -ErrorAction SilentlyContinue)) { try { $c1[$gp.Id] = $gp.TotalProcessorTime.TotalSeconds } catch { } }
+                    Start-Sleep -Seconds 3
+                    $rowsB = New-Object System.Collections.Generic.List[object]
+                    foreach ($pr in @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 20)) {
+                        $id = [int]$pr.ProcessId
+                        if ($s1.ContainsKey($id)) {
+                            $dio = ([double]$pr.ReadTransferCount - $s1[$id][0]) + ([double]$pr.WriteTransferCount - $s1[$id][1])
+                            $dcpu = 0; try { $dcpu = (Get-Process -Id $id -ErrorAction Stop).TotalProcessorTime.TotalSeconds - [double]$c1[$id] } catch { }
+                            $rowsB.Add([pscustomobject]@{ n = $s1[$id][2]; id = $id; io = $dio; cpu = $dcpu; cmd = $s1[$id][3] })
+                        }
+                    }
+                    $busy = @($rowsB.ToArray() | Sort-Object { $_.io + ($_.cpu * 1000000) } -Descending | Select-Object -First 8 | ForEach-Object { '{0}#{1} io_bytes_3s={2} cpu_s_3s={3} {4}' -f $_.n, $_.id, [int64]$_.io, [math]::Round($_.cpu, 2), (Limit-Text $_.cmd 160) })
+                } catch { $busy = @('busy sample failed: ' + $_.Exception.Message) }
+                $o['snapshots'] += [ordered]@{ at_sec = [int]$el; doctor_children = $kids; cys_pipes = $pp; loopback = $lo; stdout_tail = (Limit-Text $tail 400); busiest_processes_3s = $busy }
             }
         }
         $o['seconds'] = [math]::Round(((Get-Date) - $ts).TotalSeconds, 1)
