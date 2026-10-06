@@ -1,0 +1,245 @@
+{
+    "started":  "2026-10-06T14:29:13.190Z",
+    "repo":  "idoforgod/cys-terminal",
+    "versions":  {
+                     "0.14.37":  {
+                                     "version":  "0.14.37",
+                                     "usable":  true,
+                                     "installer":  "C:\\a\\_temp\\diag-work\\dl\\0.14.37\\cys_0.14.37_x64-setup.exe",
+                                     "download":  {
+                                                      "url":  "https://github.com/idoforgod/cys-terminal/releases/download/v0.14.37/cys_0.14.37_x64-setup.exe",
+                                                      "dest":  "C:\\a\\_temp\\diag-work\\dl\\0.14.37\\cys_0.14.37_x64-setup.exe",
+                                                      "ok":  true,
+                                                      "rc":  0,
+                                                      "err":  "",
+                                                      "ms":  988,
+                                                      "size":  141952812
+                                                  },
+                                     "sums_download":  {
+                                                           "url":  "https://github.com/idoforgod/cys-terminal/releases/download/v0.14.37/SHA256SUMS.txt",
+                                                           "dest":  "C:\\a\\_temp\\diag-work\\dl\\0.14.37\\SHA256SUMS.txt",
+                                                           "ok":  true,
+                                                           "rc":  0,
+                                                           "err":  "",
+                                                           "ms":  246,
+                                                           "size":  1146
+                                                       },
+                                     "size":  141952812,
+                                     "sha256":  "e46b9f8d65ca65e2e90fafb516c255eae15ba4b5e2437ec79ca7e899627e22f7",
+                                     "sums_expected":  "e46b9f8d65ca65e2e90fafb516c255eae15ba4b5e2437ec79ca7e899627e22f7",
+                                     "sums_match":  true,
+                                     "sums_note":  null,
+                                     "sig":  {
+                                                 "status":  "NotSigned",
+                                                 "message":  "The file C:\\a\\_temp\\diag-work\\dl\\0.14.37\\cys_0.14.37_x64-setup.exe is not digitally signed. You cannot run this script on the current system. For more information about running scripts and setting execution policy, see about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170",
+                                                 "subject":  null,
+                                                 "issuer":  null,
+                                                 "thumbprint":  null,
+                                                 "timestamped":  false
+                                             },
+                                     "extract":  {
+                                                     "dir":  "C:\\a\\_temp\\diag-work\\x\\0.14.37",
+                                                     "mode":  "root exes only",
+                                                     "first":  {
+                                                                   "rc":  0,
+                                                                   "ms":  9907,
+                                                                   "timedOut":  false,
+                                                                   "startError":  null,
+                                                                   "out_tail":  "\r\n7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03\r\n\r\nScanning the drive for archives:\r\n1 file, 141952812 bytes (136 MiB)\r\n\r\nExtracting archive: C:\\a\\_temp\\diag-work\\dl\\0.14.37\\cys_0.14.37_x64-setup.exe\r\n--\r\nPath = C:\\a\\_temp\\diag-work\\dl\\0.14.37\\cys_0.14.37_x64-setup.exe\r\nType = Nsis\r\nPhysical Size = 141952812\r\nMethod = LZMA:23\r\nSolid = +\r\nHeaders Size = 2358206\r\nEmbedded Stub Size = 52736\r\nSubType = NSIS-3 Unicode\r\n\r\nEverything is Ok\r\n\r\nFiles: 3\r\nSize:       87790080\r\nCompressed: 141952812\r\n",
+                                                                   "err_tail":  ""
+                                                               },
+                                                     "fallback":  null,
+                                                     "root_exes":  {
+                                                                       "cys-app.exe":  true,
+                                                                       "cys.exe":  true,
+                                                                       "cysd.exe":  true
+                                                                   },
+                                                     "exe_count":  3
+                                                 }
+                                 },
+                     "0.14.41":  {
+                                     "version":  "0.14.41",
+                                     "usable":  true,
+                                     "installer":  "C:\\a\\_temp\\diag-work\\dl\\0.14.41\\cys_0.14.41_x64-setup.exe",
+                                     "download":  {
+                                                      "url":  "https://github.com/idoforgod/cys-terminal/releases/download/v0.14.41/cys_0.14.41_x64-setup.exe",
+                                                      "dest":  "C:\\a\\_temp\\diag-work\\dl\\0.14.41\\cys_0.14.41_x64-setup.exe",
+                                                      "ok":  true,
+                                                      "rc":  0,
+                                                      "err":  "",
+                                                      "ms":  780,
+                                                      "size":  142531747
+                                                  },
+                                     "sums_download":  {
+                                                           "url":  "https://github.com/idoforgod/cys-terminal/releases/download/v0.14.41/SHA256SUMS.txt",
+                                                           "dest":  "C:\\a\\_temp\\diag-work\\dl\\0.14.41\\SHA256SUMS.txt",
+                                                           "ok":  true,
+                                                           "rc":  0,
+                                                           "err":  "",
+                                                           "ms":  235,
+                                                           "size":  1146
+                                                       },
+                                     "size":  142531747,
+                                     "sha256":  "e066e689d2806f085ac1f5a9c3321371489b6f843c55b411fb6793387782b10b",
+                                     "sums_expected":  "e066e689d2806f085ac1f5a9c3321371489b6f843c55b411fb6793387782b10b",
+                                     "sums_match":  true,
+                                     "sums_note":  null,
+                                     "sig":  {
+                                                 "status":  "NotSigned",
+                                                 "message":  "The file C:\\a\\_temp\\diag-work\\dl\\0.14.41\\cys_0.14.41_x64-setup.exe is not digitally signed. You cannot run this script on the current system. For more information about running scripts and setting execution policy, see about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170",
+                                                 "subject":  null,
+                                                 "issuer":  null,
+                                                 "thumbprint":  null,
+                                                 "timestamped":  false
+                                             },
+                                     "extract":  {
+                                                     "dir":  "C:\\a\\_temp\\diag-work\\x\\0.14.41",
+                                                     "mode":  "root exes only",
+                                                     "first":  {
+                                                                   "rc":  0,
+                                                                   "ms":  5330,
+                                                                   "timedOut":  false,
+                                                                   "startError":  null,
+                                                                   "out_tail":  "\r\n7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03\r\n\r\nScanning the drive for archives:\r\n1 file, 142531747 bytes (136 MiB)\r\n\r\nExtracting archive: C:\\a\\_temp\\diag-work\\dl\\0.14.41\\cys_0.14.41_x64-setup.exe\r\n--\r\nPath = C:\\a\\_temp\\diag-work\\dl\\0.14.41\\cys_0.14.41_x64-setup.exe\r\nType = Nsis\r\nPhysical Size = 142531747\r\nMethod = LZMA:23\r\nSolid = +\r\nHeaders Size = 2358206\r\nEmbedded Stub Size = 52736\r\nSubType = NSIS-3 Unicode\r\n\r\nEverything is Ok\r\n\r\nFiles: 3\r\nSize:       90083328\r\nCompressed: 142531747\r\n",
+                                                                   "err_tail":  ""
+                                                               },
+                                                     "fallback":  null,
+                                                     "root_exes":  {
+                                                                       "cys-app.exe":  true,
+                                                                       "cys.exe":  true,
+                                                                       "cysd.exe":  true
+                                                                   },
+                                                     "exe_count":  3
+                                                 }
+                                 },
+                     "0.14.42":  {
+                                     "version":  "0.14.42",
+                                     "usable":  true,
+                                     "installer":  "C:\\a\\_temp\\diag-work\\dl\\0.14.42\\cys_0.14.42_x64-setup.exe",
+                                     "download":  {
+                                                      "url":  "https://github.com/idoforgod/cys-terminal/releases/download/v0.14.42/cys_0.14.42_x64-setup.exe",
+                                                      "dest":  "C:\\a\\_temp\\diag-work\\dl\\0.14.42\\cys_0.14.42_x64-setup.exe",
+                                                      "ok":  true,
+                                                      "rc":  0,
+                                                      "err":  "",
+                                                      "ms":  837,
+                                                      "size":  143202847
+                                                  },
+                                     "sums_download":  {
+                                                           "url":  "https://github.com/idoforgod/cys-terminal/releases/download/v0.14.42/SHA256SUMS.txt",
+                                                           "dest":  "C:\\a\\_temp\\diag-work\\dl\\0.14.42\\SHA256SUMS.txt",
+                                                           "ok":  true,
+                                                           "rc":  0,
+                                                           "err":  "",
+                                                           "ms":  251,
+                                                           "size":  1146
+                                                       },
+                                     "size":  143202847,
+                                     "sha256":  "e0810a429c757d81e33c7b3655fd55aaa746be94ecfd68961e6c2d6da0eec37e",
+                                     "sums_expected":  "e0810a429c757d81e33c7b3655fd55aaa746be94ecfd68961e6c2d6da0eec37e",
+                                     "sums_match":  true,
+                                     "sums_note":  null,
+                                     "sig":  {
+                                                 "status":  "NotSigned",
+                                                 "message":  "The file C:\\a\\_temp\\diag-work\\dl\\0.14.42\\cys_0.14.42_x64-setup.exe is not digitally signed. You cannot run this script on the current system. For more information about running scripts and setting execution policy, see about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170",
+                                                 "subject":  null,
+                                                 "issuer":  null,
+                                                 "thumbprint":  null,
+                                                 "timestamped":  false
+                                             },
+                                     "extract":  {
+                                                     "dir":  "C:\\a\\_temp\\diag-work\\x\\0.14.42",
+                                                     "mode":  "all",
+                                                     "first":  {
+                                                                   "rc":  0,
+                                                                   "ms":  26516,
+                                                                   "timedOut":  false,
+                                                                   "startError":  null,
+                                                                   "out_tail":  "\r\n7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03\r\n\r\nScanning the drive for archives:\r\n1 file, 143202847 bytes (137 MiB)\r\n\r\nExtracting archive: C:\\a\\_temp\\diag-work\\dl\\0.14.42\\cys_0.14.42_x64-setup.exe\r\n--\r\nPath = C:\\a\\_temp\\diag-work\\dl\\0.14.42\\cys_0.14.42_x64-setup.exe\r\nType = Nsis\r\nPhysical Size = 143202847\r\nMethod = LZMA:23\r\nSolid = +\r\nHeaders Size = 2358206\r\nEmbedded Stub Size = 52736\r\nSubType = NSIS-3 Unicode\r\n\r\nEverything is Ok\r\n\r\nFiles: 11691\r\nSize:       779198805\r\nCompressed: 143202847\r\n",
+                                                                   "err_tail":  ""
+                                                               },
+                                                     "fallback":  null,
+                                                     "root_exes":  {
+                                                                       "cys-app.exe":  true,
+                                                                       "cys.exe":  true,
+                                                                       "cysd.exe":  true
+                                                                   },
+                                                     "exe_count":  371
+                                                 }
+                                 }
+                 },
+    "tools":  {
+                  "7z":  "C:\\ProgramData\\Chocolatey\\bin\\7z.exe",
+                  "rustc":  "C:\\Users\\runneradmin\\.cargo\\bin\\rustc.exe"
+              },
+    "controls":  {
+                     "neg":  {
+                                 "path":  "C:\\a\\_temp\\diag-work\\ctl\\ctl-neg-fresh.exe",
+                                 "built_with":  "rustc",
+                                 "uuid":  "58a2dc7c-6da7-48a9-95cf-57d51f095118",
+                                 "sha256":  "74e481205b26e801238b7bba119f2c77667ad4e4facb2e5cad209ea26408d067",
+                                 "sig":  "NotSigned",
+                                 "notes":  [
+                                               "rustc rc=0 err="
+                                           ]
+                             },
+                     "pos_unsigned":  {
+                                          "setup":  "C:\\a\\_temp\\diag-work\\ctl\\7z2501-x64.exe",
+                                          "download":  {
+                                                           "url":  "https://www.7-zip.org/a/7z2501-x64.exe",
+                                                           "dest":  "C:\\a\\_temp\\diag-work\\ctl\\7z2501-x64.exe",
+                                                           "ok":  true,
+                                                           "rc":  0,
+                                                           "err":  "",
+                                                           "ms":  1051,
+                                                           "size":  1643509
+                                                       },
+                                          "sig":  {
+                                                      "status":  "NotSigned",
+                                                      "message":  "The file C:\\a\\_temp\\diag-work\\ctl\\7z2501-x64.exe is not digitally signed. You cannot run this script on the current system. For more information about running scripts and setting execution policy, see about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170",
+                                                      "subject":  null,
+                                                      "issuer":  null,
+                                                      "thumbprint":  null,
+                                                      "timestamped":  false
+                                                  },
+                                          "suitable":  true,
+                                          "extract":  {
+                                                          "rc":  0,
+                                                          "ms":  430,
+                                                          "timedOut":  false,
+                                                          "startError":  null,
+                                                          "out_tail":  "\r\n7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03\r\n\r\nScanning the drive for archives:\r\n1 file, 1643509 bytes (1605 KiB)\r\n\r\nExtracting archive: C:\\a\\_temp\\diag-work\\ctl\\7z2501-x64.exe\r\n--\r\nPath = C:\\a\\_temp\\diag-work\\ctl\\7z2501-x64.exe\r\nType = 7z\r\nOffset = 36864\r\nPhysical Size = 1606645\r\nHeaders Size = 1359\r\nMethod = LZMA:5m BCJ2\r\nSolid = +\r\nBlocks = 2\r\n\r\nEverything is Ok\r\n\r\nFiles: 7\r\nSize:       4058112\r\nCompressed: 1643509\r\n",
+                                                          "err_tail":  ""
+                                                      },
+                                          "z_exe":  "C:\\a\\_temp\\diag-work\\x\\7zip-setup\\7z.exe",
+                                          "zfm_exe":  "C:\\a\\_temp\\diag-work\\x\\7zip-setup\\7zFM.exe",
+                                          "notes":  [
+                                                        "download https://www.7-zip.org/a/7z2501-x64.exe ok=True rc=0 "
+                                                    ]
+                                      },
+                     "pos_signed":  {
+                                        "path":  "C:\\a\\_temp\\diag-work\\x\\0.14.42\\runtime\\node\\node.exe",
+                                        "sig":  {
+                                                    "status":  "Valid",
+                                                    "message":  "Signature verified.",
+                                                    "subject":  "CN=OpenJS Foundation, O=OpenJS Foundation, L=San Francisco, S=California, C=US",
+                                                    "issuer":  "CN=Microsoft ID Verified CS EOC CA 01, O=Microsoft Corporation, C=US",
+                                                    "thumbprint":  "FE9F6A143750DD94E9C8E61AF14C9BD5F546F4F0",
+                                                    "timestamped":  true
+                                                },
+                                        "notes":  [
+
+                                                  ]
+                                    }
+                 },
+    "bundled_sig_summary":  {
+                                "NotSigned":  333,
+                                "Valid":  36,
+                                "UnknownError":  2
+                            },
+    "subjects_count":  388,
+    "notes":  [
+
+              ],
+    "finished":  "2026-10-06T14:31:04.879Z"
+}
