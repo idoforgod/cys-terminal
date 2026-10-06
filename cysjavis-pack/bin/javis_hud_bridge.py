@@ -2083,7 +2083,7 @@ class _BridgeServer(ThreadingHTTPServer):
     def handle_error(self, request, client_address):
         # 시간 제한으로 끊긴 쓰기(멈춘 수신자)·끊긴 연결은 줄도 추적도 없이 넘긴다 — 시간 제한은 /health 계수로만 센다(B4-3).
         exc = sys.exc_info()[1]
-        if isinstance(exc, (TimeoutError, BrokenPipeError, ConnectionResetError)):
+        if isinstance(exc, (TimeoutError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
             if isinstance(exc, TimeoutError):
                 with _STATS_LOCK:
                     _STATS["timeouts"] += 1

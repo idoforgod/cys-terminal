@@ -216,7 +216,7 @@ class LogAndHealth(unittest.TestCase):
         before = HB._STATS["timeouts"]
         buf = io.StringIO()
         with contextlib.redirect_stderr(buf):
-            for exc in (TimeoutError("w"), BrokenPipeError(), ConnectionResetError()):
+            for exc in (TimeoutError("w"), BrokenPipeError(), ConnectionResetError(), ConnectionAbortedError()):
                 try:
                     raise exc
                 except Exception:
