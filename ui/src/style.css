@@ -245,6 +245,23 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 #wsbar-usage .usage-inuse-dot { color: var(--ok); margin-right: 3px; font-weight: 400; }
 #wsbar-usage .usage-other .usage-other-txt.usage-fold { text-align: left; } /* 잘려 나간 관측 전 계정 나열 — 라벨 목록이라 왼쪽 정렬 */
 #wsbar-usage .usage-hidden { margin-top: 4px; color: #8b949e; overflow-wrap: anywhere; } /* 숨긴 계정 N — 다시 보이게 하는 곳 안내 */
+/* ★0.14.44 D1 보기 방식 전환 단추 — 머리줄 단추(.usage-head)의 형제(.usage-headrow 안). 같은 줄이라 머리줄 높이를 더 쓰지 않는다(패딩 0 · 줄높이 1.2). */
+#wsbar-usage .usage-headrow { flex: none; display: flex; align-items: center; gap: 4px; min-width: 0; }
+#wsbar-usage .usage-headrow > .usage-head { flex: 1 1 auto; width: auto; }
+#wsbar-usage .usage-mode {
+  flex: none; background: none; border: 1px solid var(--hairline); border-radius: 3px; color: #8b949e;
+  font: inherit; font-size: .88em; line-height: 1.2; padding: 0 4px; margin: 0; cursor: pointer; white-space: nowrap;
+}
+#wsbar-usage .usage-mode:hover { color: var(--text); }
+/* ★0.14.44 D1·D2 막대 상자가 여럿 — 이름 줄의 윗여백을 걷고 상자 사이 간격만 둔다(마지막 상자 아래에는 여백이 없다). 창 600·배율 1 에서 상자 3개가 스크롤 없이 들어가게(종전엔 쌓일 때 상자마다 2px 가 붙어 0.3px 넘쳤다 — 설계 R7). */
+#wsbar-usage .usage-primary > .usage-acct { margin-top: 0; }
+#wsbar-usage .usage-body > .usage-primary:not(:first-child) { margin-top: 2px; }
+/* 제공자 묶음 머리줄(자동 방식 · 계정 4개 이상) — 누르면 그 묶음의 나머지 줄을 접거나 편다. */
+#wsbar-usage .usage-group-head {
+  display: block; width: 100%; background: none; border: none; padding: 2px 0 0; margin: 2px 0 0; cursor: pointer; text-align: left;
+  font: inherit; color: #8b949e; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#wsbar-usage .usage-group-head:hover { color: var(--text); }
 /* U17 전문가용 칸 — 토글(기본 접힘) + 본문(팀 직접 만들기). 본문은 hidden 으로 접는다. */
 #wsbar-expert { font-size: calc(11px * var(--wsbar-font, 1)); border-top: 1px solid var(--hairline); padding-top: 2px; }
 #btn-expert-toggle .expert-label { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }

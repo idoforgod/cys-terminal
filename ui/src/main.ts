@@ -148,7 +148,14 @@ import {
   kpiCandidates,
   aggSeatRates,
   sanitizeHiddenKeys,
+  sanitizeUsageMode,
+  nextUsageMode,
+  sanitizeFoldKeys,
+  USAGE_MODE_LABEL,
   USAGE_HIDDEN_MAX,
+  type UsagePrimary,
+  type UsageLine,
+  type UsageViewMode,
 } from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보·전 좌석 폴백 집계
 import { starvedNotice, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
 import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
@@ -4301,6 +4308,22 @@ try {
 } catch {
   /* 저장소 차단 — 펼친 채로 시작 */
 }
+// ★0.14.44(D1) 보기 방식(자동 · 모두 · 하나)과 제공자 묶음 접기 상태 — 뷰어별 편의 설정. 읽기·쓰기 모두 try 안(저장소 차단·깨진 값이면 기본값 = 자동 · 접힘 없음).
+// 값 검증은 순수 함수(sanitizeUsageMode · sanitizeFoldKeys) — 저장소는 main.ts 만 만진다. 선언은 첫 최상위 renderUsageBar() 호출보다 앞이어야 한다(TDZ 면 패널이 빈 채로 남는다).
+const USAGE_MODE_KEY = "cys-usage-mode";
+const USAGE_FOLD_KEY = "cys-usage-fold";
+let usageMode: UsageViewMode = "auto";
+try {
+  usageMode = sanitizeUsageMode(localStorage.getItem(USAGE_MODE_KEY));
+} catch {
+  /* 저장소 차단 — 자동으로 시작 */
+}
+let usageFolded: Set<string> = new Set();
+try {
+  usageFolded = sanitizeFoldKeys(JSON.parse(localStorage.getItem(USAGE_FOLD_KEY) || "[]"));
+} catch {
+  /* 저장소 차단·깨진 JSON — 접힘 없음으로 시작 */
+}
 
 /** 계정 사용량 공유 fetcher — 사이드바 10초 틱(void)과 Control Center Live(force·await) 두 곳에서만 부른다.
  *  어떤 오류도 던지지 않는다(표시 전용 — 호출측 틱·CC 갱신으로 새지 않게). */
@@ -4345,6 +4368,29 @@ function setUsageCollapsed(v: boolean): void {
   renderUsageBar();
 }
 
+/** 보기 방식을 바꾸고 저장한다(자동 → 모두 → 하나). 저장이 막혀도 이번 실행 동안은 유지된다. */
+function setUsageMode(m: UsageViewMode): void {
+  usageMode = m;
+  try {
+    localStorage.setItem(USAGE_MODE_KEY, m);
+  } catch {
+    /* 저장소 차단 — 이번 실행 동안만 유지 */
+  }
+  renderUsageBar();
+}
+/** 제공자 묶음 하나의 접힘을 뒤집고 저장한다. */
+function toggleUsageFold(key: string): void {
+  if (!key) return;
+  if (usageFolded.has(key)) usageFolded.delete(key);
+  else usageFolded.add(key);
+  try {
+    localStorage.setItem(USAGE_FOLD_KEY, JSON.stringify([...usageFolded]));
+  } catch {
+    /* 저장소 차단 — 이번 실행 동안만 유지 */
+  }
+  renderUsageBar();
+}
+
 /** #wsbar-usage 렌더 — 모델(usagebar.ts)을 textContent 로만 옮긴다. 머리(접기 버튼)는 한 번 만들고 재사용해
  *  10초마다 다시 그려도 키보드 포커스가 날아가지 않는다. 어떤 오류도 삼킨다(표시 전용). */
 function renderUsageBar(): void {
@@ -4369,9 +4415,17 @@ function renderUsageBar(): void {
       sum.className = "usage-sum";
       head.append(chev, title, sum);
       head.addEventListener("click", () => setUsageCollapsed(!usageCollapsed));
+      // ★0.14.44(D1) 보기 방식 전환 단추 — 머리줄 단추의 **형제**(단추 안에 단추를 넣지 않는다 · 같은 줄이라 높이를 더 쓰지 않는다).
+      const modeBtn = document.createElement("button");
+      modeBtn.type = "button";
+      modeBtn.className = "usage-mode";
+      modeBtn.addEventListener("click", () => setUsageMode(nextUsageMode(usageMode)));
+      const headRow = document.createElement("div");
+      headRow.className = "usage-headrow";
+      headRow.append(head, modeBtn);
       body = document.createElement("div");
       body.className = "usage-body";
-      host.append(head, body);
+      host.append(headRow, body);
     }
     const model = buildUsageBarModel(
       ccAccounts,
@@ -4380,6 +4434,7 @@ function renderUsageBar(): void {
       ccAcctLabel, // 🔒 가림(CC 와 같은 키 cys-cc-acct-redact) — 이메일은 툴팁과 겹침 꼬리표에만 나온다(꼬리표도 이 가림을 거친다)
       ccAcctRedact, // 🔒 가림이면 툴팁의 설정 폴더도 끝 이름만(윈도우 절대경로의 OS 사용자명 — 리뷰1 M9)
       usageHidden, // ★0.14.43 뷰어별 숨김 계정 — 후보·줄·요약에서 뺀다(저장소는 main.ts 만 읽는다)
+      { mode: usageMode, fontScale: Number(document.documentElement.style.getPropertyValue("--wsbar-font")) || 1, folded: usageFolded }, // ★0.14.44 D1 보기 방식 · 글자 배율(사이드바 배율 변수) · 묶음 접기
     );
     // 머리줄은 값이 바뀔 때만 건드린다(같은 값 재대입도 호버 중인 요소의 텍스트 노드를 갈아 끼운다).
     const setText = (el: HTMLElement, t: string) => {
@@ -4399,6 +4454,13 @@ function renderUsageBar(): void {
     if (model.headlineTitle) {
       if (sumEl.title !== model.headlineTitle) sumEl.title = model.headlineTitle;
     } else if (sumEl.hasAttribute("title")) sumEl.removeAttribute("title");
+    // ★0.14.44 D1 전환 단추 — 지금 방식을 글자로(자동·모두·하나). 값이 바뀔 때만 건드린다.
+    const modeBtnEl = host.querySelector(".usage-mode") as HTMLButtonElement | null;
+    if (modeBtnEl) {
+      setText(modeBtnEl, USAGE_MODE_LABEL[model.mode]);
+      const modeTip = `보기 방식: ${USAGE_MODE_LABEL[model.mode]} — 눌러서 ${USAGE_MODE_LABEL[nextUsageMode(model.mode)]}(으)로 바꿉니다. 자동 = 계정이 적으면 모두, 많으면 제공자별로 묶어서 · 모두 = 전 계정 막대 · 하나 = 주 계정 1개`;
+      if (modeBtnEl.title !== modeTip) modeBtnEl.title = modeTip;
+    }
     host.classList.toggle("collapsed", usageCollapsed);
     body.hidden = usageCollapsed;
     const sig = JSON.stringify(model);
@@ -4419,8 +4481,8 @@ function renderUsageBar(): void {
       s.title = USAGE_INUSE_TIP;
       return s;
     };
-    const p = model.primary;
-    if (p) {
+    // ★0.14.44(D1·D2) 막대 상자 하나 — 모든 상자가 같은 DOM 꼴(이름 줄 · 5시간/7일 막대 · 리셋 시각 · 소진 예상)이라 제공자가 달라도 높이가 같다.
+    const boxEl = (p: UsagePrimary): HTMLElement => {
       const box = el("usage-primary" + (p.fresh.level === "stale" ? " dim" : ""), "", p.tooltip);
       // 계정 이름 옆 '● 사용 중' 배지(in_use === true 일 때만). 이름은 줄어들고(말줄임) 배지는 늘 보인다.
       const acctRow = el("usage-acct", "");
@@ -4452,24 +4514,63 @@ function renderUsageBar(): void {
       }
       if (p.fresh.note) box.appendChild(el("usage-note", p.fresh.note));
       if (p.exhaust) box.appendChild(el("usage-exhaust", p.exhaust));
-      kids.push(box);
+      return box;
+    };
+    // 한 줄형(자동 방식 ∧ 글자 배율 1.6 이상) — 게이지 없이 이름과 두 창의 값만. 사용 중 표지는 줄과 같은 점.
+    const compactEl = (p: UsagePrimary): HTMLElement => {
+      const row = el("usage-other" + (p.fresh.level === "stale" ? " dim" : ""), "", p.tooltip);
+      const lab = document.createElement("span");
+      lab.className = "usage-other-lab";
+      if (p.inUse) lab.appendChild(inUseMark("usage-inuse-dot", "●"));
+      lab.appendChild(document.createTextNode(p.label));
+      const txt = document.createElement("span");
+      txt.className = "usage-other-txt";
+      const vals = p.windows.map((w) => `${w.label} ${w.text}`).join(" · ");
+      txt.textContent = p.fresh.note && p.fresh.level !== "fresh" ? `${vals} (${p.fresh.note})` : vals;
+      row.append(lab, txt);
+      return row;
+    };
+    // 계정 한 줄(관측 줄 · 관측 전 줄 · 묶음 안의 줄 공용) — 관측 전 계정도 한 줄씩(0.14.42 — 개수로 접지 않는다). 값 대신 "관측 전·관측 실패 · 사유".
+    const lineEl = (o: UsageLine): HTMLElement => {
+      const row = el("usage-other" + (o.dim ? " dim" : "") + (o.unobserved ? " unobs" : ""), "", o.tooltip);
+      const lab = document.createElement("span");
+      lab.className = "usage-other-lab";
+      if (o.inUse) lab.appendChild(inUseMark("usage-inuse-dot", "●")); // ★0.14.43 사용 중인 계정 — 라벨 앞 점
+      lab.appendChild(document.createTextNode(o.label));
+      const txt = document.createElement("span");
+      txt.className = "usage-other-txt";
+      txt.textContent = o.text;
+      row.append(lab, txt);
+      return row;
+    };
+    // ★0.14.44(D1) 상자들 — 자동 방식에서 계정이 많으면 제공자 묶음(대표 상자 + 나머지 줄 · 묶음은 접을 수 있다), 아니면 boxes 를 순서대로.
+    if (model.groups.length) {
+      for (const g of model.groups) {
+        kids.push(model.compact ? compactEl(g.box) : boxEl(g.box));
+        if (g.count > 0) {
+          const gh = document.createElement("button");
+          gh.type = "button";
+          gh.className = "usage-group-head";
+          gh.textContent = `${g.folded ? "▸" : "▾"} ${g.label} 나머지 ${g.count}개`;
+          gh.title = g.folded ? "눌러서 펼치기" : "눌러서 접기";
+          gh.setAttribute("aria-expanded", g.folded ? "false" : "true");
+          gh.addEventListener("click", () => toggleUsageFold(g.key));
+          kids.push(gh);
+          if (!g.folded) {
+            const gbox = el("usage-others", "");
+            for (const o of g.lines) gbox.appendChild(lineEl(o));
+            if (g.moreCount) gbox.appendChild(el("usage-more", `외 ${g.moreCount}개 — Control Center > Live`, g.moreTooltip));
+            kids.push(gbox);
+          }
+        }
+      }
+    } else {
+      for (const p of model.boxes) kids.push(model.compact ? compactEl(p) : boxEl(p));
     }
     if (model.message) kids.push(el("usage-msg", model.message));
     if (model.others.length || model.moreCount || model.unobservedFold) {
       const box = el("usage-others", "");
-      for (const o of model.others) {
-        // 관측 전 계정도 한 줄씩(0.14.42 — 개수로 접지 않는다). 값 대신 "관측 전·관측 실패 · 사유".
-        const row = el("usage-other" + (o.dim ? " dim" : "") + (o.unobserved ? " unobs" : ""), "", o.tooltip);
-        const lab = document.createElement("span");
-        lab.className = "usage-other-lab";
-        if (o.inUse) lab.appendChild(inUseMark("usage-inuse-dot", "●")); // ★0.14.43 사용 중인 계정 — 라벨 앞 점
-        lab.appendChild(document.createTextNode(o.label));
-        const txt = document.createElement("span");
-        txt.className = "usage-other-txt";
-        txt.textContent = o.text;
-        row.append(lab, txt);
-        box.appendChild(row);
-      }
+      for (const o of model.others) box.appendChild(lineEl(o));
       // ★0.14.43 줄 상한에 잘려 나간 관측 전 계정 — 개수로만 사라지지 않게 라벨을 나열한 접힘 줄(툴팁 = 전체 나열). '외 N개' 줄 앞.
       if (model.unobservedFold) {
         const row = el("usage-other unobs dim", "", model.unobservedFold.tooltip);
@@ -10019,6 +10120,7 @@ function applyWsbarFontStep(dir: number) {
   wsbarFont = clampWsbarFont(wsbarFont + dir * WSBAR_FONT_STEP);
   applyWsbarVars();
   localStorage.setItem("cys-wsbar-font", String(wsbarFont));
+  renderUsageBar(); // ★0.14.44 D1 — 글자 배율 1.6 이상이면 자동 방식이 한 줄형으로 바뀐다(본문 모델이 달라지면 다시 그린다)
 }
 document.getElementById("btn-ws-font-minus")?.addEventListener("click", () => applyWsbarFontStep(-1));
 document.getElementById("btn-ws-font-plus")?.addEventListener("click", () => applyWsbarFontStep(+1));

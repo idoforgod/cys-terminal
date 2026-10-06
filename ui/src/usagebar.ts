@@ -388,6 +388,8 @@ export interface UsageLine {
   inUse: boolean;
 }
 export interface UsagePrimary {
+  /** 0.14.44(D1) 계정 키(`provider:account_id`) — 상자 목록(boxes)·묶음에서 같은 계정을 가리키는 열쇠. */
+  key: string;
   label: string;
   tooltip: string;
   windows: WindowView[];
@@ -395,6 +397,59 @@ export interface UsagePrimary {
   exhaust: string;
   /** 지금 로그인돼 쓰이는 계정(in_use === true) — 이름 옆에 '● 사용 중' 배지. */
   inUse: boolean;
+}
+/** 0.14.44(D1) 보기 방식 — auto(기본: 관측 계정 3개 이하면 전부 막대 · 4개 이상이면 제공자 묶음) · all(전부 막대) · one(주 계정 1개 막대 + 나머지 한 줄 = 0.14.43 동작). */
+export type UsageViewMode = "auto" | "all" | "one";
+/** 전환 단추가 도는 순서(자동 → 모두 → 하나 → 자동). */
+export const USAGE_MODES: UsageViewMode[] = ["auto", "all", "one"];
+/** 전환 단추에 지금 방식을 보이는 글자. */
+export const USAGE_MODE_LABEL: Record<UsageViewMode, string> = { auto: "자동", all: "모두", one: "하나" };
+/** 자동 방식에서 전부 막대로 보이는 관측 계정 수의 상한 — 넘으면 제공자 묶음. */
+export const USAGE_AUTO_BOXES_MAX = 3;
+/** 글자 배율이 이 값 이상이면 자동 방식은 게이지 없는 한 줄형(결재 2026-09-30 · 0.14.43 설계 A3). '모두'를 직접 고른 경우는 배율과 무관하게 막대. */
+export const USAGE_COMPACT_SCALE = 1.6;
+/** 접힌 묶음 목록의 최대 항목 수(제공자 수보다 넉넉히). */
+export const USAGE_FOLD_KEYS_MAX = 16;
+/** 한 제공자 묶음 — 대표 계정 1개는 상자(box), 나머지는 한 줄씩(최대 USAGE_OTHERS_MAX · 넘으면 moreCount). */
+export interface UsageGroup {
+  /** 제공자 묶음 키(claude · codex · antigravity …) — 접기 상태의 열쇠. */
+  key: string;
+  /** 제공자 표시명(머리줄 글자). */
+  label: string;
+  box: UsagePrimary;
+  /** 대표 밖의 관측 계정 줄 — 접힌 묶음이면 빈 배열(개수는 count). */
+  lines: UsageLine[];
+  /** 대표 밖의 관측 계정 전체 수(접혀 있어도 그대로). */
+  count: number;
+  folded: boolean;
+  /** 상한에 잘려 나간 줄 수와 그 라벨(툴팁). */
+  moreCount: number;
+  moreTooltip: string;
+}
+/** buildUsageBarModel 의 선택 인자 — 생략하면 mode "one"(0.14.43 동작 그대로). IPC·저장소에서 온 값일 수 있어 전부 의심한다. */
+export interface UsageBarOptions {
+  mode?: unknown;
+  fontScale?: unknown;
+  /** 접힌 묶음 키 집합(저장소는 main.ts 만 읽는다). */
+  folded?: ReadonlySet<string>;
+}
+/** 저장된 보기 방식의 검증 — 세 값 밖이면 fallback(저장소 기본은 "auto", 모델 인자 생략은 "one"). */
+export function sanitizeUsageMode(raw: unknown, fallback: UsageViewMode = "auto"): UsageViewMode {
+  return raw === "auto" || raw === "all" || raw === "one" ? raw : fallback;
+}
+/** 전환 단추의 다음 방식(자동 → 모두 → 하나 → 자동). */
+export function nextUsageMode(m: UsageViewMode): UsageViewMode {
+  return m === "auto" ? "all" : m === "all" ? "one" : "auto";
+}
+/** 저장소에서 읽은 접힘 목록의 검증 — 배열 · 문자열 원소 · 최대 USAGE_FOLD_KEYS_MAX 개. */
+export function sanitizeFoldKeys(raw: unknown): Set<string> {
+  const out = new Set<string>();
+  if (!Array.isArray(raw)) return out;
+  for (const k of raw) {
+    if (out.size >= USAGE_FOLD_KEYS_MAX) break;
+    if (typeof k === "string" && k !== "") out.add(k);
+  }
+  return out;
 }
 export interface UsageBarModel {
   /** 접힘 상태·헤더 요약 한 줄. */
@@ -404,6 +459,14 @@ export interface UsageBarModel {
   /** 요약 줄 툴팁 — 제공자별 약식(`C 5h12%·7d30% │ X 7d50%`)일 때 풀이. 아니면 빈 문자열. */
   headlineTitle: string;
   primary: UsagePrimary | null;
+  /** 0.14.44(D1) 실제로 적용된 보기 방식(전환 단추 글자 · 다시 그리기 판정에 들어간다). 인자를 생략하면 "one". */
+  mode: UsageViewMode;
+  /** 0.14.44(D1) 게이지 없는 한 줄형 — 자동 방식 ∧ 글자 배율 ≥ USAGE_COMPACT_SCALE. */
+  compact: boolean;
+  /** 0.14.44(D1·D2) 막대 상자로 보일 계정들(제공자 순서) — "하나"면 primary 하나, 묶음이면 각 묶음의 대표. 상자마다 리셋 시각·소진 예상을 가진다. */
+  boxes: UsagePrimary[];
+  /** 0.14.44(D1) 제공자 묶음 — 자동 방식에서 관측 계정이 4개 이상일 때만(아니면 빈 배열). 묶음의 대표는 boxes 와 같은 순서. */
+  groups: UsageGroup[];
   others: UsageLine[];
   /** 상한에 잘려 나간 **관측 줄** 수(관측 전 계정은 unobservedFold 가 따로 맡는다). */
   moreCount: number;
@@ -627,6 +690,32 @@ function providerSummary(observed: AcctRow[], nowSec: number): { short: string; 
   return { short: shorts.join(" │ "), title: titles.join(" / "), sev };
 }
 
+/** 제공자별 대표(주 계정 규칙을 제공자 안에서 적용)와 나머지(라이브 먼저 → 최신 관측). 제공자 순서 = PROVIDER_ORDER. */
+function providerBuckets(observed: AcctRow[], nowSec: number): { key: string; rep: AcctRow; rest: AcctRow[] }[] {
+  const m = new Map<string, AcctRow[]>();
+  for (const a of observed) {
+    const k = provGroup(a);
+    const g = m.get(k);
+    if (g) g.push(a);
+    else m.set(k, [a]);
+  }
+  const keys = [...m.keys()].sort((x, y) => groupRank(x) - groupRank(y) || (x < y ? -1 : x > y ? 1 : 0));
+  const out: { key: string; rep: AcctRow; rest: AcctRow[] }[] = [];
+  for (const k of keys) {
+    const g = m.get(k) ?? [];
+    const rep = pickPrimaryAccount(g, nowSec);
+    if (!rep) continue;
+    out.push({ key: k, rep, rest: g.filter((a) => a !== rep).sort(restOrder) });
+  }
+  return out;
+}
+/** 대표 밖 계정의 줄 순서 — 라이브 먼저, 그 안에서 최신 관측 먼저. */
+function restOrder(x: AcctRow, y: AcctRow): number {
+  const dl = Number(isLiveAccount(y)) - Number(isLiveAccount(x));
+  if (dl) return dl;
+  return (finiteNum(y.updated_at) ?? 0) - (finiteNum(x.updated_at) ?? 0);
+}
+
 /** 렌더용 모델. main.ts 는 이 모델을 textContent 로만 옮긴다.
  *  redactEmail = CC 🔒 가림 함수(신원 줄·겹침 꼬리표) · hidePaths = 🔒 가림 상태(설정 폴더를 끝 이름으로 — 리뷰1 M9) ·
  *  hidden = 뷰어가 숨긴 계정 키(`provider:account_id`) 집합 — 후보·줄·제공자 요약에서 뺀다(저장소는 main.ts 만 읽는다). */
@@ -637,7 +726,13 @@ export function buildUsageBarModel(
   redactEmail: (s: string) => string,
   hidePaths = false,
   hidden?: ReadonlySet<string>,
+  opts?: UsageBarOptions,
 ): UsageBarModel {
+  // 0.14.44(D1) 보기 방식 — 인자를 생략하면 "one"(0.14.43 동작 그대로 · 기존 시험 무수정 통과). 글자 배율은 자동 방식에서만 한 줄형을 정한다.
+  const mode: UsageViewMode = opts ? sanitizeUsageMode(opts.mode, "one") : "one";
+  const fontScale = opts ? finiteNum(opts.fontScale) ?? 1 : 1;
+  const compact = mode === "auto" && fontScale >= USAGE_COMPACT_SCALE;
+  const folded: ReadonlySet<string> = opts && opts.folded && typeof opts.folded.has === "function" ? opts.folded : new Set<string>();
   const everyone = (Array.isArray(accounts) ? accounts : []).filter(isObj) as AcctRow[];
   const list = everyone.filter((a) => !isHiddenAcct(a, hidden)); // 이하 list = 화면에 나올 계정
   const hiddenCount = everyone.length - list.length;
@@ -652,6 +747,10 @@ export function buildUsageBarModel(
     headlineSev: "",
     headlineTitle: "",
     primary: null,
+    mode,
+    compact,
+    boxes: [],
+    groups: [],
     others: [],
     moreCount: 0,
     moreTooltip: "",
@@ -722,26 +821,23 @@ export function buildUsageBarModel(
   }
 
   const pv = acctWindowViews(primaryAcct, nowSec);
-  const pf = displayFresh(primaryAcct, nowSec);
   const primaryStale = isStaleGrade(freshGrade(primaryAcct, nowSec));
-  const ex = finiteNum(primaryAcct.exhaust_at);
-  const primary: UsagePrimary = {
-    label: labels.get(primaryAcct)!,
-    tooltip: tooltipFor(primaryAcct, pv, pf, redactEmail, hidePaths),
-    windows: pv,
-    fresh: pf,
-    exhaust: ex !== null && ex > nowSec && (pf.level === "fresh" || pf.level === "recent") ? `이 속도면 ${hhmm(ex)} 소진` : "",
-    inUse: primaryAcct.in_use === true,
+  // 막대 상자 하나 — 리셋 시각(windows[].resetText)과 소진 예상(exhaust)이 상자마다 붙는다(0.14.44 D2). 소진 예상은 값이 있고 · 아직 오지 않았고 · 관측이 30분 안(fresh·recent)일 때만.
+  const boxOf = (a: AcctRow): UsagePrimary => {
+    const v = acctWindowViews(a, nowSec);
+    const f = displayFresh(a, nowSec);
+    const ex = finiteNum(a.exhaust_at);
+    return {
+      key: acctKey(a),
+      label: labels.get(a)!,
+      tooltip: tooltipFor(a, v, f, redactEmail, hidePaths),
+      windows: v,
+      fresh: f,
+      exhaust: ex !== null && ex > nowSec && (f.level === "fresh" || f.level === "recent") ? `이 속도면 ${hhmm(ex)} 소진` : "",
+      inUse: a.in_use === true,
+    };
   };
-
-  const rest = list
-    .filter((a) => a !== primaryAcct && isObserved(a))
-    .sort((x, y) => {
-      const dl = Number(isLiveAccount(y)) - Number(isLiveAccount(x));
-      if (dl) return dl;
-      return (finiteNum(y.updated_at) ?? 0) - (finiteNum(x.updated_at) ?? 0);
-    });
-  const observedLines: UsageLine[] = rest.map((a) => {
+  const lineOf = (a: AcctRow): UsageLine => {
     const v = acctWindowViews(a, nowSec);
     const f = displayFresh(a, nowSec);
     const txt = v.map((w) => `${w.label} ${w.text}`).join(" · ");
@@ -753,12 +849,43 @@ export function buildUsageBarModel(
       unobserved: false,
       inUse: a.in_use === true,
     };
-  });
+  };
+  const primary: UsagePrimary = boxOf(primaryAcct);
+
+  const rest = list.filter((a) => a !== primaryAcct && isObserved(a)).sort(restOrder);
+  const observedLines: UsageLine[] = rest.map(lineOf);
   // 관측 행이 먼저 — 상한이 관측값을 밀어내지 않는다. 잘려 나간 줄은 종류별로 따로 알린다: 관측 줄은 개수(외 N개 · 툴팁에 라벨),
   // 관측 전 계정은 라벨을 나열한 접힘 줄(개수로만 사라지지 않게).
-  const all = observedLines.concat(unobservedLines);
+  // ★0.14.44(D1) "하나"가 아니면 관측 계정은 상자(boxes) 또는 묶음(groups)으로 가고, others 에는 관측 전 계정 줄만 남는다.
+  const all = mode === "one" ? observedLines.concat(unobservedLines) : unobservedLines;
   const cut = all.slice(USAGE_OTHERS_MAX);
   const cutObserved = cut.filter((l) => !l.unobserved);
+  const observedAccts = list.filter(isObserved);
+  const buckets = mode === "one" ? [] : providerBuckets(observedAccts, nowSec);
+  const grouped = mode === "auto" && observedAccts.length > USAGE_AUTO_BOXES_MAX;
+  const groups: UsageGroup[] = grouped
+    ? buckets.map((b) => {
+        const ls = b.rest.map(lineOf);
+        const isFolded = folded.has(b.key);
+        const over = ls.slice(USAGE_OTHERS_MAX);
+        return {
+          key: b.key,
+          label: providerLabel(b.key),
+          box: boxOf(b.rep),
+          lines: isFolded ? [] : ls.slice(0, USAGE_OTHERS_MAX),
+          count: ls.length,
+          folded: isFolded,
+          moreCount: isFolded ? 0 : over.length,
+          moreTooltip: isFolded ? "" : over.map((l) => l.label).join(" · "),
+        };
+      })
+    : [];
+  const boxes: UsagePrimary[] =
+    mode === "one"
+      ? [primary]
+      : grouped
+        ? groups.map((g) => g.box)
+        : buckets.reduce((acc: UsagePrimary[], b) => acc.concat([boxOf(b.rep)], b.rest.map(boxOf)), []);
 
   // 접힘 요약 — 관측 계정이 두 제공자 이상이면 제공자별 약식, 아니면 종전 형식(주 계정의 두 창). 종전 형식에서 주 계정이 오래된 값이면 끝에 '(오래됨)'.
   // ★R2F-UI(A3 m3): 제공자별 약식에는 그 꼬리를 붙이지 않는다 — 약식에서는 오래된 값마다 이미 `?` 가 붙고(providerSummary), 꼬리는 **주 계정** 한 곳의 신선도라 숫자·색이 보는
@@ -780,6 +907,10 @@ export function buildUsageBarModel(
     headlineSev,
     headlineTitle: sum ? sum.title : "",
     primary,
+    mode,
+    compact,
+    boxes,
+    groups,
     others: all.slice(0, USAGE_OTHERS_MAX),
     moreCount: cutObserved.length,
     moreTooltip: cutObserved.map((l) => l.label).join(" · "),

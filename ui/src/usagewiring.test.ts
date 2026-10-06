@@ -259,7 +259,7 @@ describe("0.14.43 UI1 — 사이드바 본문 배선(모델의 가산 필드를 
     expect(b.includes('inUseMark("usage-inuse", "● 사용 중")')).toBe(true);
     expect(b.includes('inUseMark("usage-inuse-dot", "●")')).toBe(true);
     expect(code.includes('const USAGE_INUSE_TIP = "지금 로그인돼 쓰이고 있는 계정";')).toBe(true);
-    const mark = b.slice(b.indexOf("const inUseMark ="), b.indexOf("const p = model.primary;"));
+    const mark = b.slice(b.indexOf("const inUseMark ="), b.indexOf("const boxEl = "));
     for (const needle of ["s.className = cls;", "s.textContent = text;", "s.title = USAGE_INUSE_TIP;"])
       expect({ 구현: needle, 있음: mark.includes(needle) }).toEqual({ 구현: needle, 있음: true });
   });
@@ -271,7 +271,8 @@ describe("0.14.43 UI1 — 사이드바 본문 배선(모델의 가산 필드를 
   it("잘려 나간 관측 전 접힘 줄(.usage-other.unobs.dim · title = tooltip)이 '외 N개' 줄 앞에 · 그 줄에는 title = moreTooltip", () => {
     const b = body();
     const fold = b.indexOf("if (model.unobservedFold) {");
-    const more = b.indexOf('el("usage-more"');
+    // 0.14.44(D1): 묶음 안의 '외 N개' 줄(g.moreCount)이 앞에 하나 더 있으므로 — 모델 전체의 moreCount 줄을 짚는다.
+    const more = b.indexOf('el("usage-more", `외 ${model.moreCount}개');
     expect({ 접힘줄: fold >= 0, 외N개: more >= 0, 접힘줄이_앞: fold >= 0 && fold < more }).toEqual({ 접힘줄: true, 외N개: true, 접힘줄이_앞: true });
     expect(b.slice(fold, more).includes('el("usage-other unobs dim", "", model.unobservedFold.tooltip)')).toBe(true);
     expect(b.slice(more, b.indexOf(");", more)).includes("model.moreTooltip")).toBe(true);
@@ -482,5 +483,110 @@ describe("R1F-UB(S2 m-1 ⓑ) — Control Center '이전 로그인' 배지는 순
   it("요약 줄 색 주석은 약식 요약의 실제(요약에 실린 값들)를 말한다 — 주 계정 창들뿐이라고 적지 않는다", () => {
     expect(src.includes("제공자별 약식이면 요약에 실린 값들")).toBe(true);
     expect(src.includes("요약 줄 색 = 주 계정 창들의 최고 심각도(headlineSev")).toBe(false);
+  });
+});
+
+// ═════════ 0.14.44 (WC · D1 · D2) — 상자 반복·제공자 묶음·전환 단추·저장 키 배선 ═════════
+// 순수 판정(boxes · groups · 보기 방식 · 한 줄형 · 상자별 소진 예상)은 usagebar-modes.test.ts 가 표로 잡는다 — 여기는 main.ts·style.css 가 그 모델을 어떻게 옮기는가.
+// 0.14.43 의 핀 중 `const p = model.primary;` 앵커(사용 중 표식 구현을 자르는 기준)는 boxes 반복에 맞게 `const boxEl = ` 앵커로 바뀌었다 — 같은 취지(사용 중 표지를 상자와 줄에 그린다)를 새 꼴로 다시 고정한다.
+describe("0.14.44 D1·D2 — 상자는 boxes 반복으로(같은 DOM 꼴 · textContent 만)", () => {
+  const body = () => fnBody("renderUsageBar");
+  it("종전 `const p = model.primary;` 단일 상자 그리기는 없다 — boxes(또는 묶음의 대표) 를 반복한다", () => {
+    const b = body();
+    expect(b.includes("const p = model.primary;")).toBe(false);
+    expect(b.includes("for (const p of model.boxes)")).toBe(true);
+    expect(b.includes("for (const g of model.groups)")).toBe(true);
+    expect(b.includes("model.boxes")).toBe(true);
+  });
+  it("상자 하나를 그리는 함수(boxEl)가 사용 중 배지 · 리셋 시각 · 소진 예상(상자마다)을 그린다 — 모두 textContent", () => {
+    const b = body();
+    const box = b.slice(b.indexOf("const boxEl = "), b.indexOf("const compactEl = "));
+    for (const needle of ['inUseMark("usage-inuse", "● 사용 중")', "rs.textContent = w.resetText;", 'el("usage-exhaust", p.exhaust)', 'el("usage-note", p.fresh.note)', "fill.style.width"])
+      expect({ 구현: needle, 있음: box.includes(needle) }).toEqual({ 구현: needle, 있음: true });
+    expect(box.includes("innerHTML")).toBe(false);
+  });
+  it("한 줄형(compactEl)은 게이지 없이 이름·두 창 값 · 사용 중 점 — model.compact 일 때만 쓴다", () => {
+    const b = body();
+    const c = b.slice(b.indexOf("const compactEl = "), b.indexOf("const lineEl = "));
+    expect(c.includes("usage-gauge")).toBe(false);
+    expect(c.includes('inUseMark("usage-inuse-dot", "●")')).toBe(true);
+    expect(b.includes("model.compact ? compactEl(")).toBe(true);
+  });
+  it("관측 전·관측 줄·묶음 줄은 한 함수(lineEl)로 — 줄마다 o.inUse 점 · o.unobserved 클래스", () => {
+    const b = body();
+    const l = b.slice(b.indexOf("const lineEl = "), b.indexOf("// ★0.14.44(D1) 상자들"));
+    expect(l.includes("if (o.inUse) lab.appendChild(")).toBe(true);
+    expect(l.includes('o.unobserved ? " unobs" : ""')).toBe(true);
+    expect(b.includes("for (const o of model.others) box.appendChild(lineEl(o));")).toBe(true);
+    expect(b.includes("for (const o of g.lines) gbox.appendChild(lineEl(o));")).toBe(true);
+  });
+  it("묶음 머리줄은 button · 접기는 g.key 로 toggleUsageFold · 접힌 묶음은 줄을 그리지 않는다", () => {
+    const b = body();
+    const g = b.slice(b.indexOf("for (const g of model.groups)"), b.indexOf('if (model.message) kids.push'));
+    for (const needle of ['document.createElement("button")', 'gh.className = "usage-group-head";', "toggleUsageFold(g.key)", "if (!g.folded) {", 'gh.setAttribute("aria-expanded"'])
+      expect({ 구현: needle, 있음: g.includes(needle) }).toEqual({ 구현: needle, 있음: true });
+  });
+  it("꼬리 경고 → 숨김 안내 → 본문 교체의 순서는 그대로(상자·묶음은 그 앞)", () => {
+    const b = body();
+    const iGroups = b.indexOf("for (const g of model.groups)");
+    const iMsg = b.indexOf('el("usage-msg"');
+    const iFoot = b.indexOf('el("usage-foot"');
+    const iHid = b.indexOf('el("usage-hidden"');
+    const iRep = b.indexOf("body.replaceChildren(");
+    expect({ 순서: iGroups >= 0 && iGroups < iMsg && iMsg < iFoot && iFoot < iHid && iHid < iRep }).toEqual({ 순서: true });
+  });
+});
+
+describe("0.14.44 D1 — 보기 방식 전환 단추(머리줄의 형제) · 저장 키 · 다시 그리기 판정", () => {
+  const body = () => fnBody("renderUsageBar");
+  it("전환 단추는 머리줄 단추(.usage-head)의 형제 — 같은 줄 래퍼(.usage-headrow) 안에 둘을 나란히 · 단추 안에 단추 없음", () => {
+    const b = body();
+    expect(b.includes("headRow.append(head, modeBtn);")).toBe(true);
+    expect(b.includes("host.append(headRow, body);")).toBe(true);
+    expect(b.includes("head.append(chev, title, sum);")).toBe(true); // 머리 단추의 자식에는 전환 단추가 없다
+    expect(b.includes('modeBtn.className = "usage-mode";')).toBe(true);
+    expect(b.includes("setUsageMode(nextUsageMode(usageMode))")).toBe(true);
+  });
+  it("저장 키 cys-usage-mode · cys-usage-fold — 읽기 각 1곳 · 쓰기 각 1곳 · 전부 try 안(저장소 차단·깨진 값이어도 기본값)", () => {
+    expect(code.includes('const USAGE_MODE_KEY = "cys-usage-mode";')).toBe(true);
+    expect(code.includes('const USAGE_FOLD_KEY = "cys-usage-fold";')).toBe(true);
+    for (const k of ["USAGE_MODE_KEY", "USAGE_FOLD_KEY"]) {
+      expect({ k, 읽기: code.split(`localStorage.getItem(${k}`).length - 1 }).toEqual({ k, 읽기: 1 });
+      expect({ k, 쓰기: code.split(`localStorage.setItem(${k}`).length - 1 }).toEqual({ k, 쓰기: 1 });
+    }
+    expect(/\ntry \{\n\s*usageMode = sanitizeUsageMode\(localStorage\.getItem\(USAGE_MODE_KEY\)\);\n\} catch/.test(code)).toBe(true);
+    expect(/\ntry \{\n\s*usageFolded = sanitizeFoldKeys\(JSON\.parse\(localStorage\.getItem\(USAGE_FOLD_KEY\) \|\| "\[\]"\)\);\n\} catch/.test(code)).toBe(true);
+    expect(/\n\s*try \{\n\s*localStorage\.setItem\(USAGE_MODE_KEY, m\);\n\s*\} catch/.test(code)).toBe(true);
+    expect(/\n\s*try \{\n\s*localStorage\.setItem\(USAGE_FOLD_KEY, JSON\.stringify\(\[\.\.\.usageFolded\]\)\);\n\s*\} catch/.test(code)).toBe(true);
+  });
+  it("값 검증은 순수 함수(sanitizeUsageMode · sanitizeFoldKeys) · 저장 값을 그대로 쓰지 않는다 · 기본은 자동", () => {
+    expect(code.includes("usageMode = sanitizeUsageMode(localStorage.getItem(USAGE_MODE_KEY));")).toBe(true);
+    expect(code.includes('let usageMode: UsageViewMode = "auto";')).toBe(true);
+  });
+  it("두 상태 선언은 첫 최상위 renderUsageBar() 호출보다 앞(TDZ 면 renderUsageBar 가 catch 로 삼켜 패널이 빈 채로 남는다)", () => {
+    const firstTop = code.indexOf("\nrenderUsageBar();");
+    for (const decl of ["let usageMode:", "let usageFolded:"]) {
+      const at = code.indexOf(decl);
+      expect({ decl, 선언: at >= 0, 선언이_먼저: at >= 0 && at < firstTop }).toEqual({ decl, 선언: true, 선언이_먼저: true });
+    }
+  });
+  it("모델 호출이 보기 방식 · 글자 배율 · 접힘을 넘긴다 — 본문 시그니처는 모델 전체라 방식·접힘이 바뀌면 다시 그린다", () => {
+    const b = body();
+    const call = b.slice(b.indexOf("buildUsageBarModel("), b.indexOf(");", b.indexOf("ccAcctLabel,")) + 2);
+    for (const needle of ["mode: usageMode", 'getPropertyValue("--wsbar-font")', "folded: usageFolded"])
+      expect({ 인자: needle, 있음: call.includes(needle) }).toEqual({ 인자: needle, 있음: true });
+    expect(b.includes("const sig = JSON.stringify(model);")).toBe(true);
+  });
+  it("글자 배율 단추가 사이드바 사용량을 다시 그린다(1.6 이상이면 자동 방식이 한 줄형으로 — 새 타이머 없음)", () => {
+    const b = fnBody("applyWsbarFontStep");
+    expect(b.includes("renderUsageBar();")).toBe(true);
+  });
+  it("전환 단추·묶음 머리줄 규칙이 style.css 에 있다 · 머리줄 래퍼는 같은 줄(flex) · 새 색 정의 없음", () => {
+    const flat = css.replace(/\s+/g, " ");
+    for (const sel of ["#wsbar-usage .usage-headrow", "#wsbar-usage .usage-mode", "#wsbar-usage .usage-group-head"]) expect({ 규칙: sel, 있음: flat.includes(`${sel} {`) }).toEqual({ 규칙: sel, 있음: true });
+    const head = /#wsbar-usage \.usage-headrow \{([^}]*)\}/.exec(flat);
+    expect(head).not.toBeNull();
+    expect(head![1]).toContain("display: flex");
+    expect(/#[0-9a-fA-F]{3,6}\b/.test(/#wsbar-usage \.usage-mode \{([^}]*)\}/.exec(flat)![1].replace("#8b949e", ""))).toBe(false);
   });
 });
