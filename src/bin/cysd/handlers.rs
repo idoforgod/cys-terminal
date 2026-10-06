@@ -11095,7 +11095,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         r.sign(&secret);
                     }
                 }
-                hit
+                // ★(0.14.44 · A2) 무매칭이면 **같은 트랜잭션 안에서** 사유를 만든다(읽기 전용 순수 함수 — 저장소를 쓰지 않는다).
+                let detail = if hit.is_none() {
+                    Some(crate::approval::explain_no_match(
+                        records,
+                        &secret,
+                        &command,
+                        cwd.as_deref(),
+                        &env,
+                        now_check_ttl,
+                        require_ttl,
+                    ))
+                } else {
+                    None
+                };
+                (hit, detail)
             });
             // ★(수렴 R2 · claude minor) 실패 사유를 **어디에도 남기지 않던** 자리다.
             //   · `hit == None` = 저장소를 읽지 못해 트랜잭션이 아예 돌지 않았다. 그 거부는
@@ -11107,6 +11121,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //     승인 자체는 디스크의 서명으로 이미 유효하므로 판정을 뒤집지 않는다
             //     (장부 갱신 실패 ≠ 미승인). 그래도 **사실은 남긴다**.
             let ran = hit.is_some();
+            let (hit, deny_detail) = match hit {
+                Some((h, d)) => (Some(h), d),
+                None => (None, None),
+            };
             let store_error = saved.err();
             if let Some(e) = store_error.as_deref() {
                 warn_approval_store_once(if ran { "ledger" } else { "read" }, e);
@@ -11138,11 +11156,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         json!({"approved": false, "require_ttl": require_ttl,
                                "reason": deny_reason}),
                     );
-                    Reply::Single(ok_response(
-                        &id,
-                        json!({"approved": false, "ttl_enforced": require_ttl,
-                               "reason": deny_reason}),
-                    ))
+                    // ★(0.14.44 · A2) `detail` 은 **가산 키**다 — `reason` 의 뜻은 종전 그대로(저장소를 읽지 못했을 때만)이고, 옛 CLI 는 모르는 키를 무시한다.
+                    let mut out = json!({"approved": false, "ttl_enforced": require_ttl,
+                                         "reason": deny_reason});
+                    if let (Some(d), Some(o)) = (deny_detail, out.as_object_mut()) {
+                        o.insert("detail".into(), d);
+                    }
+                    Reply::Single(ok_response(&id, out))
                 }
             }
         }

@@ -798,6 +798,100 @@ pub fn env_from_json(v: &serde_json::Value) -> Vec<(String, String)> {
     sort_norm_env(&raw)
 }
 
+// ── ★(0.14.44 · A2) 미승인 사유 설명 — 읽기 전용 순수 함수 ──────────────────────────────
+
+/// 미승인 응답의 `detail`(객체)을 만든다. **저장소를 쓰지 않고 판정을 바꾸지도 않는다** — 이미 "맞는 레코드 없음"으로 끝난 확인에 사유 한 줄을 붙일 뿐이다.
+///
+/// 저장소 잠금(`mutate_records`) **안에서** 불린다(레코드는 그 트랜잭션 안에서만 보인다) — 그래서 패닉이 없어야 한다: 새 코드는 `unwrap`·`expect`·색인 접근을 린트로 거부한다.
+/// 서명값·비밀키는 싣지 않는다.
+///
+/// 코드 여섯: `bad_quote` · `cwd_mismatch` · `ttl_required` · `expired` · `lane_mismatch` · `no_record`.
+/// 고르는 순서: `bad_quote` 는 레코드를 보기 전에. 그다음은 이 데몬의 레코드(예약 값이 없거나 이 데몬 것)를 먼저 설명한다
+/// (`cwd_mismatch` → `ttl_required` → `expired`). 그런 레코드가 없을 때만 `lane_mismatch`, 아무것도 없으면 `no_record`.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn explain_no_match(
+    records: &[ApprovalRecord],
+    secret: &[u8],
+    command: &str,
+    cwd: Option<&str>,
+    env: &[(String, String)],
+    now: f64,
+    require_ttl: bool,
+) -> serde_json::Value {
+    let requested_cwd = normalize_cwd(cwd);
+    let Some(toks) = tokenize(command) else {
+        return serde_json::json!({"code": "bad_quote", "requested_cwd": requested_cwd});
+    };
+    let call_env = sort_norm_env(env);
+    // 후보 = 서명이 유효하고 접두가 맞고 환경이 맞는 레코드(폴더 · 만료 · TTL 요구만 따로 본다).
+    let mut cwd_bad: Vec<&ApprovalRecord> = Vec::new();
+    let mut ttl_missing: Option<&ApprovalRecord> = None;
+    let mut expired: Option<&ApprovalRecord> = None;
+    for r in records {
+        if r.command_prefix.is_empty() || toks.len() < r.command_prefix.len() {
+            continue;
+        }
+        if toks.get(..r.command_prefix.len()) != Some(r.command_prefix.as_slice()) {
+            continue;
+        }
+        if !r.has_valid_signature(secret) {
+            continue;
+        }
+        if !r.environment.iter().all(|kv| call_env.binary_search(kv).is_ok()) {
+            continue;
+        }
+        if r.is_expired(now) {
+            expired = newer(expired, r);
+            continue;
+        }
+        if require_ttl && r.expires_at.is_none() {
+            ttl_missing = newer(ttl_missing, r);
+            continue;
+        }
+        let cwd_ok = match &r.cwd {
+            Some(rc) => requested_cwd.as_deref() == Some(rc.as_str()),
+            None => true,
+        };
+        if !cwd_ok {
+            cwd_bad.push(r);
+        }
+    }
+    if let Some(first) = cwd_bad.iter().copied().reduce(|a, b| newer(Some(a), b).unwrap_or(a)) {
+        let mut signed: Vec<String> = Vec::new();
+        for r in &cwd_bad {
+            if let Some(c) = &r.cwd {
+                if !signed.contains(c) && signed.len() < 3 {
+                    signed.push(c.clone());
+                }
+            }
+        }
+        return serde_json::json!({
+            "code": "cwd_mismatch", "record_id": first.id,
+            "signed_cwd": signed, "requested_cwd": requested_cwd,
+        });
+    }
+    if let Some(r) = ttl_missing {
+        return serde_json::json!({
+            "code": "ttl_required", "record_id": r.id, "requested_cwd": requested_cwd,
+        });
+    }
+    if let Some(r) = expired {
+        return serde_json::json!({
+            "code": "expired", "record_id": r.id, "expired_at": r.expires_at,
+            "requested_cwd": requested_cwd,
+        });
+    }
+    serde_json::json!({"code": "no_record", "requested_cwd": requested_cwd})
+}
+
+/// 둘 중 더 최근에 갱신된 레코드(같으면 새로 들어온 쪽이 아니라 기존 쪽을 유지).
+fn newer<'a>(cur: Option<&'a ApprovalRecord>, cand: &'a ApprovalRecord) -> Option<&'a ApprovalRecord> {
+    match cur {
+        Some(c) if c.updated_at >= cand.updated_at => Some(c),
+        _ => Some(cand),
+    }
+}
+
 // ── 테스트 (E-n: 10종, hmac_kat = RFC 4231) ──────────────────────────────────
 
 #[cfg(test)]

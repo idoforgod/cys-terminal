@@ -4873,6 +4873,62 @@ const APPROVAL_TTL_UNSUPPORTED: &str = "--ttl 미지원 데몬 — **아무 승�
 이 데몬은 ttl_secs 를 버리고 무기한 승인을 만들었을 것이므로 서명 전에 멈춘다. 데몬을 0.14.31 이상으로 \
 갱신한 뒤 다시 서명하라(무기한 승인이 정말 필요하면 --ttl 을 생략하라).";
 
+/// ★(0.14.44 · A2) 데몬의 미승인 응답 `detail` 을 표준오류에 쓸 쉬운 말 한 줄로 바꾼다. 표준출력·종료코드는 건드리지 않는다.
+/// `detail` 이 없거나 모르는 코드면 `None` — 종전(무출력)과 같다.
+fn approval_detail_line(detail: &Value) -> Option<String> {
+    let code = detail.get("code")?.as_str()?;
+    let id = detail.get("record_id").and_then(|v| v.as_str()).unwrap_or("?");
+    let flag = |k: &str| detail.get(k).and_then(|v| v.as_bool()) == Some(true);
+    let requested = detail.get("requested_cwd").and_then(|v| v.as_str()).unwrap_or("(알 수 없음)");
+    let mut line = match code {
+        "bad_quote" => "[approval] 미승인 — 명령의 따옴표가 닫히지 않았습니다. 따옴표를 맞춰 다시 확인하세요.".to_string(),
+        "cwd_mismatch" => {
+            let signed = detail
+                .get("signed_cwd")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
+            format!(
+                "[approval] 미승인 — 같은 명령의 승인({id})이 있지만 폴더가 다릅니다. 서명한 폴더: {signed} · 확인한 폴더: {requested}. \
+                 master 가 `--cwd \"{requested}\"` 를 붙여 다시 서명하면 됩니다."
+            )
+        }
+        "ttl_required" => format!(
+            "[approval] 미승인 — 같은 명령의 승인({id})이 있지만 만료 시각이 없는 승인이라 시간 한정 확인(--require-ttl)에는 쓸 수 없습니다. \
+             master 가 `--ttl <초>` 를 붙여 다시 서명하면 됩니다."
+        ),
+        "expired" => {
+            let at = detail.get("expired_at").and_then(|v| v.as_f64()).map(|t| t as u64);
+            match at {
+                Some(t) => format!("[approval] 미승인 — 같은 명령의 승인({id})이 만료됐습니다(만료 시각 epoch {t}). master 가 다시 서명하면 됩니다."),
+                None => format!("[approval] 미승인 — 같은 명령의 승인({id})이 만료됐습니다. master 가 다시 서명하면 됩니다."),
+            }
+        }
+        "lane_mismatch" => {
+            if flag("target_option") {
+                format!("[approval] 미승인 — 이 데몬의 승인({id})이 있지만 명령에 대상 데몬을 바꾸는 옵션(--socket 등)이 들어 있어 맞지 않습니다.")
+            } else {
+                format!(
+                    "[approval] 미승인 — 같은 명령의 승인({id})이 있지만 다른 데몬에서(또는 이 데몬의 상태 폴더가 새로 만들어지기 전에) 서명된 것입니다. \
+                     이 데몬에서 master 가 다시 서명하면 됩니다."
+                )
+            }
+        }
+        "no_record" => "[approval] 미승인 — 이 명령으로 시작하는 승인이 없습니다. master 가 이 명령을 서명해야 합니다.".to_string(),
+        _ => return None,
+    };
+    if flag("not_exact") {
+        line.push_str(" 서명한 명령과 글자가 달라 폴더를 건너뛰지 못했습니다.");
+    }
+    if flag("needs_launch_cwd") {
+        line.push_str(" launch-agent 는 낳을 폴더(`--cwd`)를 명령에 적어 서명받으면 어느 폴더에서든 통합니다.");
+    }
+    if flag("neutral_off") {
+        line.push_str(" 정책 파일 설정으로 폴더 건너뛰기가 꺼져 있습니다.");
+    }
+    Some(line)
+}
+
 /// ★(0.14.31 · 성찰 C8) TTL 서명 — 능력 조회와 변이를 **같은 연결 위에서** 잇는다.
 ///
 /// 【고치는 결함】 종전 `approval sign --ttl` 은 `approval.capabilities`(조회)와 `approval.sign`(변이)을
@@ -5719,6 +5775,9 @@ fn run(command: Command) -> i32 {
                                 //   판정은 그대로 차단이다(사유는 거부에만 실린다).
                                 if let Some(why) = r["reason"].as_str() {
                                     eprintln!("[approval] 차단(승인 없음이 아니라 판정 불가): {why}");
+                                } else if let Some(line) = r.get("detail").and_then(approval_detail_line) {
+                                    // ★(0.14.44 · A2) 왜 안 맞았는지 쉬운 말 한 줄(표준오류 · 종료코드·표준출력은 종전과 같다).
+                                    eprintln!("{line}");
                                 }
                                 2 // 미서명 — 차단 유지
                             }
@@ -33042,6 +33101,30 @@ mod tests {
             assert_eq!(help.matches(needle).count(), 1, "{verb}: 새 문구가 정확히 한 번 있어야 한다\n{help}");
             assert!(help.contains("지금 폴더"), "{verb}: 핵심 낱말");
         }
+    }
+
+    /// ★(0.14.44 · A2) 데몬의 `detail` → 표준오류 한 줄. 여섯 코드 · 보조 표시 · 모르는 코드/없음은 종전(무출력).
+    #[test]
+    fn a2_detail_line_covers_six_codes_and_aux_flags() {
+        let line = |v: Value| approval_detail_line(&v);
+        let l = line(json!({"code": "cwd_mismatch", "record_id": "ap-1", "signed_cwd": ["/a/hq"], "requested_cwd": "/a/other"})).expect("cwd_mismatch");
+        assert!(l.contains("/a/hq") && l.contains("/a/other") && l.contains("--cwd \"/a/other\""), "{l}");
+        for (code, needle) in [
+            ("bad_quote", "따옴표"),
+            ("ttl_required", "--ttl"),
+            ("expired", "만료"),
+            ("lane_mismatch", "다른 데몬"),
+            ("no_record", "승인이 없습니다"),
+        ] {
+            let l = line(json!({"code": code, "record_id": "ap-9"})).unwrap_or_default();
+            assert!(l.contains(needle), "{code}: {l}");
+        }
+        let l = line(json!({"code": "lane_mismatch", "target_option": true})).unwrap_or_default();
+        assert!(l.contains("--socket"), "{l}");
+        let l = line(json!({"code": "cwd_mismatch", "not_exact": true, "needs_launch_cwd": true, "neutral_off": true})).unwrap_or_default();
+        assert!(l.contains("글자가 달라") && l.contains("낳을 폴더") && l.contains("꺼져 있습니다"), "{l}");
+        assert!(line(json!({"code": "something_new"})).is_none());
+        assert!(line(json!(null)).is_none());
     }
 
     /// `cys reclaim-role --auto` 는 계약 인자 3종(+`--env-role`)을 받는다. 훅이 넘기는 그 형태로 핀.

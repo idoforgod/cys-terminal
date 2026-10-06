@@ -7597,3 +7597,7 @@ mod return_absorb_tests;
 // team_gate_tests 와 같은 이유로 파일 맨 끝에 둔다(부트스트랩 건강성 러너의 첫 #[cfg(test)] 앵커).
 #[cfg(test)]
 mod send_settle_tests;
+
+// ★(0.14.44 · WP-A) 승인 사유·데몬 묶음·command_text RPC 시험 — 테스트 전용 모듈(프로덕션 코드 0 · 파일 끝 규약은 위와 같다).
+#[cfg(test)]
+mod approval_a_tests;
