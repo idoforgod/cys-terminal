@@ -1,0 +1,44 @@
+{
+  "generated": "2026-10-06T12:45:31.424Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37464565306",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37464565306",
+  "job": "w44-wh",
+  "os": "windows-2025",
+  "branch": "diag-results/37464565306-1-w44-wh-windows-2025",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "done-w44-wh.json",
+      "bytes": 138
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-w44-wh.txt",
+      "bytes": 297
+    },
+    {
+      "path": "w44-wh-cysd-elev.err.txt",
+      "bytes": 796
+    },
+    {
+      "path": "w44-wh-daemon-elev.txt",
+      "bytes": 2059
+    },
+    {
+      "path": "w44-wh-results.json",
+      "bytes": 664
+    },
+    {
+      "path": "w44-wh-results.json.error.txt",
+      "bytes": 1818
+    }
+  ],
+  "skipped": [],
+  "inline_files": 7,
+  "blob_files": 0
+}

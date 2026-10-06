@@ -1,0 +1,22 @@
+ConvertTo-Json : Exception of type 'System.OutOfMemoryException' was thrown.
+At D:\a\cys-terminal\cys-terminal\d\diag\lib.ps1:101 char:17
++         $json = ConvertTo-Json -InputObject $Object -Depth $Depth
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (:) [ConvertTo-Json], OutOfMemoryException
+    + FullyQualifiedErrorId : System.OutOfMemoryException,Microsoft.PowerShell.Commands.ConvertToJsonCommand
+ 
+
+
+Name                           Value                                                                                   
+----                           -----                                                                                   
+os                             windows-2025                                                                            
+files                          {}                                                                                      
+tests                          {}                                                                                      
+daemon                         {elevated_rc, standard_rc, elev}                                                        
+errors                         {}                                                                                      
+test_exe_exists                False                                                                                   
+bins                           {cys.exe 36375040, cysd.exe 53198848}                                                   
+whoami_rc                                                                                                              
+whoami_elevated                {"BUILTIN\Administrators","Alias","S-1-5-32-544","Mandatory group, Enabled by default...
+
+
