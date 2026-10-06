@@ -18,6 +18,7 @@ import json
 import os
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import threading
@@ -43,6 +44,52 @@ SUB_RECONCILE_SECS = 2.0                                 # 타깃 reconcile 주�
 # 스폰하면 새 콘솔 창이 할당된다(상주 events 자식 = AppData 경로 제목의 검은 WT 탭 실사고
 # 2026-07-11). 이 파일의 모든 subprocess 호출에 **NOWIN 을 전개해 숨긴다. 타 OS 무동작.
 NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}
+
+
+# ---------------------------------------------------------------- 0.14.44 B4 — 윈도우 판별·로그·수명줄
+# 이 파일은 두 운영체제가 같이 쓴다. 소켓·신호·프로세스 동작에 기대는 변경(B4 의 1·5·6)은 윈도우에서 종전대로 돈다 —
+# `HUD_WIN_NEW=1` 일 때만 새 동작(CI 윈도우 레인·실기 확인 뒤의 판에서 기본으로 바꾼다). 유닉스 흉내 계열의 파이썬
+# (cygwin·msys)도 윈도우로 친다. 호출 때마다 판정한다(시험이 운영체제 이름을 바꿔치기해 볼 수 있게).
+def _is_windows():
+    return os.name == "nt" or sys.platform.startswith(("win", "cygwin", "msys"))
+
+
+def _legacy_win():
+    """윈도우이고 HUD_WIN_NEW=1 이 아니면 True — 시간 제한·포트 먼저·신호/수명줄/자식 정리는 종전대로."""
+    return _is_windows() and os.environ.get("HUD_WIN_NEW") != "1"
+
+
+def _req_timeout():
+    """B4-1 요청 처리 시간 제한(초). HUD_REQ_TIMEOUT=0 이면 끔(None). 윈도우 종전은 제한 없음."""
+    if _legacy_win():
+        return None
+    try:
+        v = float(os.environ.get("HUD_REQ_TIMEOUT", "30"))
+    except ValueError:
+        v = 30.0
+    return v if v > 0 else None
+
+
+def _nostdin():
+    """자식에게 표준입력을 물려주지 않는다(수명줄 파이프가 자식에게 새지 않게). 윈도우 종전은 그대로."""
+    return {} if _legacy_win() else {"stdin": subprocess.DEVNULL}
+
+
+def _log(msg):
+    """B4-3 브리지가 스스로 찍는 줄 — 머리 `[hud-bridge] ` 뒤에 시각과 스레드 이름. 한 번의 write 로 한 줄."""
+    try:
+        sys.stderr.write("[hud-bridge] %s [%s] %s\n" % (
+            time.strftime("%Y-%m-%dT%H:%M:%S"), threading.current_thread().name, msg))
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+BOOT_ID = secrets.token_hex(8)        # B4-4 기동 식별자 — 프로세스가 뜰 때마다 새 값
+_STATS = {"timeouts": 0}              # B4-1 시간 제한으로 끊은 접속 수(/health 로만 센다 — 접속마다 로그 금지)
+_STATS_LOCK = threading.Lock()
+_CHILDREN = set()                     # B4-6 정리 대상 자식(이벤트 구독 Popen)
+_CHILDREN_LOCK = threading.Lock()
 BACKLOG_FX_SECS = 90.0   # 이보다 오래된 이벤트는 상태만 반영, fx(연출) 억제 — 콜드스타트 폭주 방지
 CMD_MAX_LEN = 2000       # 조작 지시 텍스트 상한
 
@@ -1498,7 +1545,7 @@ def peek_surface(key, socket=None, lines=12):
         args += ["--socket", socket]
     args += ["read-screen", "--surface", bare, "--lines", "40"]
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=10, **NOWIN)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=10, **_nostdin(), **NOWIN)
         if r.returncode != 0:
             return None
         txt = ANSI_RE.sub("", r.stdout)
@@ -1510,7 +1557,7 @@ def peek_surface(key, socket=None, lines=12):
 
 def run_json(args, timeout=10):
     try:
-        out = subprocess.run([CYS] + args, capture_output=True, text=True, timeout=timeout, **NOWIN)
+        out = subprocess.run([CYS] + args, capture_output=True, text=True, timeout=timeout, **_nostdin(), **NOWIN)
         if out.returncode != 0:
             return None
         return json.loads(out.stdout)
@@ -1589,7 +1636,10 @@ class SubscriptionSupervisor:
         while not stop.is_set():
             born = time.monotonic()
             proc = subprocess.Popen(args_base, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True, bufsize=1, **NOWIN)
+                                    stderr=subprocess.DEVNULL, text=True, bufsize=1, **_nostdin(), **NOWIN)
+            if not _legacy_win():
+                with _CHILDREN_LOCK:
+                    _CHILDREN.add(proc)
             holder[0] = proc
             try:
                 for line in proc.stdout:
@@ -1622,10 +1672,8 @@ class SubscriptionSupervisor:
                         if sig != last_evt_err:
                             last_evt_err = sig
                             try:
-                                sys.stderr.write(
-                                    "[hud-bridge] 이벤트 처리 예외 — 그 이벤트만 건너뜀 (sub=%s %s: %s) — 같은 예외 연속분은 로그 생략\n"
-                                    % (slug, sig, " ".join(str(e).split())[:120]))
-                                sys.stderr.flush()
+                                _log("이벤트 처리 예외 — 그 이벤트만 건너뜀 (sub=%s %s: %s) — 같은 예외 연속분은 로그 생략"
+                                     % (slug, sig, " ".join(str(e).split())[:120]))
                             except Exception:
                                 pass
             finally:
@@ -1633,6 +1681,8 @@ class SubscriptionSupervisor:
                     proc.terminate()
                 except Exception:
                     pass
+                with _CHILDREN_LOCK:
+                    _CHILDREN.discard(proc)
             if stop.is_set():
                 break
             # W2 재스폰 스톰 차단: 조기 종료는 지수 백오프(2→4→…→60s), 안정 생존
@@ -1645,11 +1695,9 @@ class SubscriptionSupervisor:
                 rc = proc.poll()
             note = (alive < SUB_STABLE_RESET_SECS, rc)
             if note != last_note:     # 같은 (급속여부, rc) 연속이면 첫 1회만 — 로그 폭주 억제
-                sys.stderr.write(
-                    "[hud-bridge] events 자식 종료 (sub=%s rc=%s alive=%.1fs) — %.0fs 후 재수립%s\n"
-                    % (slug, rc, alive, backoff,
-                       " (지수 백오프)" if note[0] else " (안정 생존 — 백오프 초기화)"))
-                sys.stderr.flush()
+                _log("events 자식 종료 (sub=%s rc=%s alive=%.1fs) — %.0fs 후 재수립%s"
+                     % (slug, rc, alive, backoff,
+                        " (지수 백오프)" if note[0] else " (안정 생존 — 백오프 초기화)"))
                 last_note = note
             stop.wait(backoff)        # 구독 재수립 백오프 — Event.wait: reap 시 즉시 깨어남
 
@@ -1821,6 +1869,7 @@ def board_loop(world, hub):
 
 # ------------------------------------------------------------------ HTTP
 class Handler(BaseHTTPRequestHandler):
+    timeout = _req_timeout()    # B4-1 — 요청 처리 소켓 시간 제한(HUD_REQ_TIMEOUT · 0=끔 · 윈도우 종전=없음)
     world = None
     hub = None
     routes = {}
@@ -1829,6 +1878,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):  # 조용히
         pass
+
+    def log_error(self, fmt, *a):
+        # 시간 제한으로 끊은 접속은 줄을 찍지 않고 /health 의 계수로만 센다(접속마다 한 줄이면 로그가 불어난다).
+        if isinstance(fmt, str) and fmt.startswith("Request timed out"):
+            with _STATS_LOCK:
+                _STATS["timeouts"] += 1
 
     def _send(self, code, ctype, body, cache=False):
         self.send_response(code)
@@ -1854,6 +1909,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "application/json; charset=utf-8", body)
         if path == "/stream":
             return self._sse()
+        if path == "/health":   # B4-4 — 데몬의 건강 확인·오피스 화면·앱이 쓴다. 기존 주소의 응답은 바꾸지 않는다.
+            return self._send(200, "application/json; charset=utf-8", health_body())
         if path == "/history":
             try:
                 after = float((self.path.split("after=")[1].split("&")[0])
@@ -1896,9 +1953,10 @@ class Handler(BaseHTTPRequestHandler):
                             "[hud_bridge] WARN: office-boot.js 주입 실패 — "
                             "%s 에 </head> 앵커 부재\n" % fp)
                         sys.stderr.flush()
-                return self._send(200, ctype, body, cache)
             except OSError:
                 return self._send(404, "text/plain", b"missing asset")
+            # B4-2 — 응답 전송은 try 밖: try 는 파일 읽기와 본문 치환만 감싼다(끊긴 응답 뒤에 404 를 덧붙이지 않는다).
+            return self._send(200, ctype, body, cache)
         if path == "/favicon.ico":
             return self._send(204, "text/plain", b"")
         return self._send(404, "text/plain", b"not found")
@@ -1934,12 +1992,12 @@ class Handler(BaseHTTPRequestHandler):
         # 전달이라 shell 해석 표면 없음. 주입은 surface.input_injected 이벤트로
         # 데몬→브리지→SSE로 되돌아와 화면에 배달 연출로 확인된다(동시성).
         r1 = subprocess.run(pre + ["send", "--surface", bare, "--", text],
-                            capture_output=True, text=True, timeout=10, **NOWIN)
+                            capture_output=True, text=True, timeout=10, **_nostdin(), **NOWIN)
         if r1.returncode != 0:
             return self._cmd_result(502, False,
                                     "send_failed: " + (r1.stderr or "")[:120], cleaned)
         r2 = subprocess.run(pre + ["send-key", "--surface", bare, "Return"],
-                            capture_output=True, text=True, timeout=10, **NOWIN)
+                            capture_output=True, text=True, timeout=10, **_nostdin(), **NOWIN)
         if r2.returncode != 0:
             return self._cmd_result(502, False,
                                     "return_failed: " + (r2.stderr or "")[:120], cleaned)
@@ -1980,13 +2038,104 @@ class Handler(BaseHTTPRequestHandler):
                 except Empty:
                     self.wfile.write(b": keepalive\n\n")
                 self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            pass
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            if isinstance(e, TimeoutError):
+                with _STATS_LOCK:
+                    _STATS["timeouts"] += 1
         finally:
             self.hub.detach(q)
 
 
+def health_body():
+    """B4-4 /health 본문 — 프로세스 번호·기동 식별자·팩 버전·화면 자산 세 파일 유무(파일 정보만 · 내용 안 읽음)·시간 제한 계수."""
+    def has(*parts):
+        try:
+            return os.path.isfile(os.path.join(WEB_DIR, *parts))
+        except OSError:
+            return False
+    with _STATS_LOCK:
+        touts = _STATS["timeouts"]
+    return json.dumps({
+        "ok": True,
+        "pid": os.getpid(),
+        "boot_id": BOOT_ID,
+        "pack_version": os.environ.get("HUD_PACK_VERSION") or None,
+        "assets": {
+            "office3d_html": has("office3d.html"),
+            "office_boot_js": has("office-boot.js"),
+            "three_module_js": has("vendor", "three.module.js"),
+        },
+        "timeouts": touts,
+    }, ensure_ascii=False).encode()
+
+
+class _BridgeServer(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # B4-3 요청 처리 중 예외 — 표준 추적 앞에 시각·스레드 이름 한 줄을 먼저 찍는다.
+        _log("요청 처리 예외 (client=%s)" % (client_address,))
+        super().handle_error(request, client_address)
+
+
+_SHUTDOWN_LOCK = threading.Lock()
+
+
+def _shutdown(reason):
+    """B4-6 종료 절차 — 자식에게 종료 신호 → 최대 1초 대기 → 남은 것 강제 종료 → 프로세스 종료."""
+    if not _SHUTDOWN_LOCK.acquire(blocking=False):   # 동시에 두 번 들어와도 한 번만 실행
+        return
+    try:
+        _log("shutdown: %s" % reason)
+        with _CHILDREN_LOCK:
+            procs = list(_CHILDREN)
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        t_end = time.monotonic() + 1.0
+        while time.monotonic() < t_end:
+            if all(p.poll() is not None for p in procs):
+                break
+            time.sleep(0.05)
+        for p in procs:
+            if p.poll() is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        os._exit(0)
+    except Exception:
+        os._exit(0)
+
+
+def _lifeline():
+    """B2 수명줄 — 표준입력이 닫히면(데몬이 어떤 이유로든 사라짐) 종료 절차. 신호·부모 번호 폴링은 쓰지 않는다."""
+    try:
+        while True:
+            b = sys.stdin.buffer.read(1)
+            if not b:
+                break
+    except Exception:
+        pass
+    _shutdown("lifeline")
+
+
+def _bind_or_exit():
+    """B4-5 포트를 먼저 잡는다 — 못 잡으면 한 줄 찍고 바로 끝낸다(토큰 파일을 건드리기 전)."""
+    try:
+        return _BridgeServer((BIND, PORT), Handler)
+    except OSError as e:
+        _log("포트 %s 를 잡지 못해 종료합니다 (%s) — 토큰 파일은 건드리지 않았습니다" % (PORT, " ".join(str(e).split())[:80]))
+        sys.exit(1)
+
+
 def main():
+    srv = None
+    if not _legacy_win():
+        srv = _bind_or_exit()                          # B4-5 — 윈도우 종전 순서는 아래 srv is None 분기
+        signal.signal(signal.SIGTERM, lambda *_: _shutdown("sigterm"))     # B4-6
+        if os.environ.get("HUD_LIFELINE") == "stdin":  # B2 — 파이프를 줄 때만(잘못된 배선은 브리지를 곧바로 끝낸다)
+            threading.Thread(target=_lifeline, name="lifeline", daemon=True).start()
     world = World()
     hub = Hub()
     poke = threading.Event()
@@ -2022,8 +2171,10 @@ def main():
     threading.Thread(target=kanban_loop, args=(world, hub), daemon=True).start()
     threading.Thread(target=verdict_loop, args=(world, hub), daemon=True).start()
     threading.Thread(target=board_loop, args=(world, hub), daemon=True).start()
-    srv = ThreadingHTTPServer((BIND, PORT), Handler)
-    print(f"[hud-bridge] http://{BIND}:{PORT}  (읽기 전용 · 127.0.0.1 한정)", flush=True)
+    if srv is None:
+        srv = _BridgeServer((BIND, PORT), Handler)
+    Handler.timeout = _req_timeout()
+    _log(f"http://{BIND}:{PORT}  (읽기 전용 · 127.0.0.1 한정)")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
