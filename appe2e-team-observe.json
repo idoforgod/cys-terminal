@@ -1,0 +1,616 @@
+{
+    "started":  "2026-10-06T17:51:14.415Z",
+    "ended":  "2026-10-06T17:57:29.958Z",
+    "end_reason":  "the node driver ended",
+    "ticks":  183,
+    "click_at":  "2026-10-06T17:51:22.509Z",
+    "node_exited_at":  "2026-10-06T17:57:25.772Z",
+    "node_exit_code":  0,
+    "procs_seen":  [
+                       {
+                           "name":  "cys-app.exe",
+                           "id":  9504,
+                           "ppid":  1412,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe\" ",
+                           "created":  "2026-10-06T17:51:13.587Z",
+                           "first_seen":  "2026-10-06T17:51:14.466Z",
+                           "last_seen":  "2026-10-06T17:57:29.956Z",
+                           "after_click":  false
+                       },
+                       {
+                           "name":  "cysd.exe",
+                           "id":  4648,
+                           "ppid":  9504,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe\"",
+                           "created":  "2026-10-06T17:51:14.017Z",
+                           "first_seen":  "2026-10-06T17:51:14.470Z",
+                           "last_seen":  "2026-10-06T17:57:29.956Z",
+                           "after_click":  false
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  8340,
+                           "ppid":  9504,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe\" agent-detect --json",
+                           "created":  "2026-10-06T17:51:14.114Z",
+                           "first_seen":  "2026-10-06T17:51:14.470Z",
+                           "last_seen":  "2026-10-06T17:51:14.472Z",
+                           "after_click":  false
+                       },
+                       {
+                           "name":  "python3.exe",
+                           "id":  5444,
+                           "ppid":  4648,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_hud_bridge.py",
+                           "created":  "2026-10-06T17:51:16.721Z",
+                           "first_seen":  "2026-10-06T17:51:18.597Z",
+                           "last_seen":  "2026-10-06T17:57:29.956Z",
+                           "after_click":  false
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  7972,
+                           "ppid":  5444,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe events --reconnect --cursor-file C:\\Users\\runneradmin\\AppData\\Local\\cys\\office-bridge\\cursor-main.seq",
+                           "created":  "2026-10-06T17:51:16.959Z",
+                           "first_seen":  "2026-10-06T17:51:18.597Z",
+                           "last_seen":  "2026-10-06T17:51:47.568Z",
+                           "after_click":  false
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  2940,
+                           "ppid":  9504,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:51:22.603Z",
+                           "first_seen":  "2026-10-06T17:51:22.731Z",
+                           "last_seen":  "2026-10-06T17:52:14.444Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  3656,
+                           "ppid":  2940,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:51:22.682Z",
+                           "first_seen":  "2026-10-06T17:51:22.731Z",
+                           "last_seen":  "2026-10-06T17:51:22.731Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  940,
+                           "ppid":  2940,
+                           "path":  "",
+                           "cmd":  "",
+                           "created":  "2026-10-06T17:51:24.734Z",
+                           "first_seen":  "2026-10-06T17:51:24.803Z",
+                           "last_seen":  "2026-10-06T17:51:24.804Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  5340,
+                           "ppid":  5444,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe --socket \\\\.\\pipe\\cys-dept-dept-1 events --reconnect --cursor-file C:\\Users\\runneradmin\\AppData\\Local\\cys\\office-bridge\\cursor-dept-1.seq",
+                           "created":  "2026-10-06T17:51:26.962Z",
+                           "first_seen":  "2026-10-06T17:51:28.939Z",
+                           "last_seen":  "2026-10-06T17:53:43.159Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  6672,
+                           "ppid":  2940,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:51:28.866Z",
+                           "first_seen":  "2026-10-06T17:51:28.940Z",
+                           "last_seen":  "2026-10-06T17:51:28.940Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  7928,
+                           "ppid":  2940,
+                           "path":  "",
+                           "cmd":  "",
+                           "created":  "2026-10-06T17:51:30.887Z",
+                           "first_seen":  "2026-10-06T17:51:31.001Z",
+                           "last_seen":  "2026-10-06T17:51:31.001Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  5440,
+                           "ppid":  2940,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:51:32.995Z",
+                           "first_seen":  "2026-10-06T17:51:33.063Z",
+                           "last_seen":  "2026-10-06T17:51:33.063Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  7124,
+                           "ppid":  9504,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe\" agent-detect --json",
+                           "created":  "2026-10-06T17:51:35.922Z",
+                           "first_seen":  "2026-10-06T17:51:37.206Z",
+                           "last_seen":  "2026-10-06T17:51:37.206Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  8684,
+                           "ppid":  2940,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:51:41.270Z",
+                           "first_seen":  "2026-10-06T17:51:41.339Z",
+                           "last_seen":  "2026-10-06T17:51:41.339Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  8836,
+                           "ppid":  2940,
+                           "path":  "",
+                           "cmd":  "",
+                           "created":  "2026-10-06T17:51:43.309Z",
+                           "first_seen":  "2026-10-06T17:51:43.410Z",
+                           "last_seen":  "2026-10-06T17:51:43.410Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  10668,
+                           "ppid":  8836,
+                           "path":  "",
+                           "cmd":  "",
+                           "created":  "2026-10-06T17:51:43.345Z",
+                           "first_seen":  "2026-10-06T17:51:43.410Z",
+                           "last_seen":  "2026-10-06T17:51:43.410Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  2724,
+                           "ppid":  4648,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                           "created":  "2026-10-06T17:51:44.738Z",
+                           "first_seen":  "2026-10-06T17:51:45.491Z",
+                           "last_seen":  "2026-10-06T17:51:47.568Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "python3.exe",
+                           "id":  1716,
+                           "ppid":  2724,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe C:/Users/runneradmin/.cys/pack/bin/javis_cycle_autopilot.py tick",
+                           "created":  "2026-10-06T17:51:44.819Z",
+                           "first_seen":  "2026-10-06T17:51:45.492Z",
+                           "last_seen":  "2026-10-06T17:51:47.569Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  8496,
+                           "ppid":  2940,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:51:47.497Z",
+                           "first_seen":  "2026-10-06T17:51:47.569Z",
+                           "last_seen":  "2026-10-06T17:51:47.569Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  9576,
+                           "ppid":  2940,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:51:49.566Z",
+                           "first_seen":  "2026-10-06T17:51:49.633Z",
+                           "last_seen":  "2026-10-06T17:51:49.633Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cysd.exe",
+                           "id":  4484,
+                           "ppid":  7672,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                           "created":  "2026-10-06T17:51:55.327Z",
+                           "first_seen":  "2026-10-06T17:51:55.832Z",
+                           "last_seen":  "2026-10-06T17:57:29.956Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  788,
+                           "ppid":  2940,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:51:55.406Z",
+                           "first_seen":  "2026-10-06T17:51:55.833Z",
+                           "last_seen":  "2026-10-06T17:52:12.375Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  5476,
+                           "ppid":  788,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe ping",
+                           "created":  "2026-10-06T17:51:55.444Z",
+                           "first_seen":  "2026-10-06T17:51:55.833Z",
+                           "last_seen":  "2026-10-06T17:52:12.376Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  2932,
+                           "ppid":  5444,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe fleet --json",
+                           "created":  "2026-10-06T17:51:57.303Z",
+                           "first_seen":  "2026-10-06T17:51:57.910Z",
+                           "last_seen":  "2026-10-06T17:52:02.049Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  3240,
+                           "ppid":  5444,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe fleet --json",
+                           "created":  "2026-10-06T17:52:04.686Z",
+                           "first_seen":  "2026-10-06T17:52:06.188Z",
+                           "last_seen":  "2026-10-06T17:52:08.252Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  2416,
+                           "ppid":  5444,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe fleet --json",
+                           "created":  "2026-10-06T17:52:11.967Z",
+                           "first_seen":  "2026-10-06T17:52:12.376Z",
+                           "last_seen":  "2026-10-06T17:52:12.376Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  7556,
+                           "ppid":  2940,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:52:14.378Z",
+                           "first_seen":  "2026-10-06T17:52:14.445Z",
+                           "last_seen":  "2026-10-06T17:52:14.445Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  2000,
+                           "ppid":  2940,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:52:15.483Z",
+                           "first_seen":  "2026-10-06T17:52:16.522Z",
+                           "last_seen":  "2026-10-06T17:52:22.724Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  5956,
+                           "ppid":  2000,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                           "created":  "2026-10-06T17:52:15.509Z",
+                           "first_seen":  "2026-10-06T17:52:16.522Z",
+                           "last_seen":  "2026-10-06T17:52:22.724Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "python3.exe",
+                           "id":  5140,
+                           "ppid":  5956,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe C:/Users/runneradmin/.cys/pack/bin/javis_formation.py ensure --socket \\\\.\\pipe\\cys-dept-dept-1 --cwd C:/Users/runneradmin --json",
+                           "created":  "2026-10-06T17:52:15.553Z",
+                           "first_seen":  "2026-10-06T17:52:16.522Z",
+                           "last_seen":  "2026-10-06T17:52:22.724Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  10908,
+                           "ppid":  5140,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE -lc \"command -v -- codex\"",
+                           "created":  "2026-10-06T17:52:15.763Z",
+                           "first_seen":  "2026-10-06T17:52:16.523Z",
+                           "last_seen":  "2026-10-06T17:52:20.659Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  4904,
+                           "ppid":  10908,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE -lc \"command -v -- codex\"",
+                           "created":  "2026-10-06T17:52:16.437Z",
+                           "first_seen":  "2026-10-06T17:52:16.523Z",
+                           "last_seen":  "2026-10-06T17:52:16.523Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  7348,
+                           "ppid":  10908,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE -lc \"command -v -- codex\"",
+                           "created":  "2026-10-06T17:52:18.537Z",
+                           "first_seen":  "2026-10-06T17:52:18.596Z",
+                           "last_seen":  "2026-10-06T17:52:18.596Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  5068,
+                           "ppid":  10908,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE -lc \"command -v -- codex\"",
+                           "created":  "2026-10-06T17:52:20.597Z",
+                           "first_seen":  "2026-10-06T17:52:20.660Z",
+                           "last_seen":  "2026-10-06T17:52:20.660Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  9864,
+                           "ppid":  4648,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                           "created":  "2026-10-06T17:52:44.772Z",
+                           "first_seen":  "2026-10-06T17:52:45.388Z",
+                           "last_seen":  "2026-10-06T17:52:45.388Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "python3.exe",
+                           "id":  7300,
+                           "ppid":  9864,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe C:/Users/runneradmin/.cys/pack/bin/javis_cycle_autopilot.py tick",
+                           "created":  "2026-10-06T17:52:44.826Z",
+                           "first_seen":  "2026-10-06T17:52:45.388Z",
+                           "last_seen":  "2026-10-06T17:52:45.388Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  3760,
+                           "ppid":  5444,
+                           "path":  "",
+                           "cmd":  "",
+                           "created":  "2026-10-06T17:53:24.506Z",
+                           "first_seen":  "2026-10-06T17:53:24.592Z",
+                           "last_seen":  "2026-10-06T17:53:24.592Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  4464,
+                           "ppid":  5444,
+                           "path":  "",
+                           "cmd":  "",
+                           "created":  "2026-10-06T17:53:26.568Z",
+                           "first_seen":  "2026-10-06T17:53:26.653Z",
+                           "last_seen":  "2026-10-06T17:53:26.653Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  7740,
+                           "ppid":  4484,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                           "created":  "2026-10-06T17:53:42.651Z",
+                           "first_seen":  "2026-10-06T17:53:43.160Z",
+                           "last_seen":  "2026-10-06T17:53:43.160Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "python3.exe",
+                           "id":  6224,
+                           "ppid":  7740,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe C:/Users/runneradmin/.cys/pack-dept-dept-1/bin/javis_cycle_autopilot.py tick",
+                           "created":  "2026-10-06T17:53:42.710Z",
+                           "first_seen":  "2026-10-06T17:53:43.160Z",
+                           "last_seen":  "2026-10-06T17:53:43.160Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  7448,
+                           "ppid":  4648,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                           "created":  "2026-10-06T17:53:44.795Z",
+                           "first_seen":  "2026-10-06T17:53:45.227Z",
+                           "last_seen":  "2026-10-06T17:53:45.227Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "python3.exe",
+                           "id":  8596,
+                           "ppid":  7448,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe C:/Users/runneradmin/.cys/pack/bin/javis_cycle_autopilot.py tick",
+                           "created":  "2026-10-06T17:53:44.848Z",
+                           "first_seen":  "2026-10-06T17:53:45.227Z",
+                           "last_seen":  "2026-10-06T17:53:45.227Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  8084,
+                           "ppid":  4484,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                           "created":  "2026-10-06T17:54:42.679Z",
+                           "first_seen":  "2026-10-06T17:54:42.920Z",
+                           "last_seen":  "2026-10-06T17:54:42.920Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "python3.exe",
+                           "id":  7644,
+                           "ppid":  8084,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe C:/Users/runneradmin/.cys/pack-dept-dept-1/bin/javis_cycle_autopilot.py tick",
+                           "created":  "2026-10-06T17:54:42.735Z",
+                           "first_seen":  "2026-10-06T17:54:42.920Z",
+                           "last_seen":  "2026-10-06T17:54:42.921Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "bash.exe",
+                           "id":  2080,
+                           "ppid":  4648,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                           "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                           "created":  "2026-10-06T17:54:44.812Z",
+                           "first_seen":  "2026-10-06T17:54:44.988Z",
+                           "last_seen":  "2026-10-06T17:54:44.989Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "python3.exe",
+                           "id":  7204,
+                           "ppid":  2080,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe C:/Users/runneradmin/.cys/pack/bin/javis_cycle_autopilot.py tick",
+                           "created":  "2026-10-06T17:54:44.866Z",
+                           "first_seen":  "2026-10-06T17:54:44.989Z",
+                           "last_seen":  "2026-10-06T17:54:44.989Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  8216,
+                           "ppid":  5444,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe status --json",
+                           "created":  "2026-10-06T17:54:44.930Z",
+                           "first_seen":  "2026-10-06T17:54:44.989Z",
+                           "last_seen":  "2026-10-06T17:54:44.989Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  2088,
+                           "ppid":  5444,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe fleet --json",
+                           "created":  "2026-10-06T17:54:46.997Z",
+                           "first_seen":  "2026-10-06T17:54:47.047Z",
+                           "last_seen":  "2026-10-06T17:54:47.047Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  6184,
+                           "ppid":  5444,
+                           "path":  "",
+                           "cmd":  "",
+                           "created":  "2026-10-06T17:56:03.247Z",
+                           "first_seen":  "2026-10-06T17:56:03.331Z",
+                           "last_seen":  "2026-10-06T17:56:03.331Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  884,
+                           "ppid":  5444,
+                           "path":  "",
+                           "cmd":  "",
+                           "created":  "2026-10-06T17:56:05.308Z",
+                           "first_seen":  "2026-10-06T17:56:05.405Z",
+                           "last_seen":  "2026-10-06T17:56:05.406Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  4976,
+                           "ppid":  5444,
+                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                           "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe status --json",
+                           "created":  "2026-10-06T17:57:23.689Z",
+                           "first_seen":  "2026-10-06T17:57:23.764Z",
+                           "last_seen":  "2026-10-06T17:57:23.764Z",
+                           "after_click":  true
+                       },
+                       {
+                           "name":  "cys.exe",
+                           "id":  6484,
+                           "ppid":  5444,
+                           "path":  "",
+                           "cmd":  "",
+                           "created":  "2026-10-06T17:57:25.743Z",
+                           "first_seen":  "2026-10-06T17:57:25.826Z",
+                           "last_seen":  "2026-10-06T17:57:25.826Z",
+                           "after_click":  true
+                       }
+                   ],
+    "pipes_first_seen":  {
+                             "cys":  "2026-10-06T17:51:14.472Z",
+                             "cys-dept-dept-1":  "2026-10-06T17:51:55.835Z"
+                         },
+    "pipes_last":  {
+                       "ok":  true,
+                       "total":  73,
+                       "cys":  [
+                                   "cys",
+                                   "cys-dept-dept-1"
+                               ],
+                       "error":  null
+                   },
+    "dept_dirs_last":  [
+                           {
+                               "name":  "cys-dept-dept-1",
+                               "files":  "analytics.db:4096B,analytics.db-shm:32768B,analytics.db-wal:177192B,approval-lane:32B,boot-epoch:19B,channels.db:4096B,channels.db-shm:32768B,channels.db-wal:152472B,cysd.log:38B,event.seq:3B,formation.log:240B,operator.token:64B,phoenix-restore.log:1704B,queue-blocked.json:108B,schedule_state.json:337B,topology.json:456B,transcripts.db:4096B,transcripts.db-shm:32768B,transcripts.db-wal:65952B"
+                           }
+                       ],
+    "new_cysd":  [
+                     {
+                         "name":  "cysd.exe",
+                         "id":  4484,
+                         "ppid":  7672,
+                         "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                         "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                         "created":  "2026-10-06T17:51:55.327Z",
+                         "first_seen":  "2026-10-06T17:51:55.832Z",
+                         "last_seen":  "2026-10-06T17:57:29.956Z",
+                         "after_click":  true
+                     }
+                 ],
+    "windows_at_end":  "csrss#7156:bash.exe - Bad Image | cys-app#9504:cys — CYSJavis Terminal | hosted-compute-agent#11160:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#8756:C:\\Windows\\system32\\wsl.exe"
+}

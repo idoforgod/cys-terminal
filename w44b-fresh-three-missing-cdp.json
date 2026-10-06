@@ -1,0 +1,210 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "w44office",
+  "port": 9333,
+  "started": "2026-10-06T18:02:07.286Z",
+  "finished": "2026-10-06T18:02:23.598Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "cys — CYSJavis Terminal",
+      "url": "http://tauri.localhost/",
+      "id": "D69CDB70DACD7C497FA0340E21B8E32A"
+    },
+    {
+      "type": "iframe",
+      "title": "http://127.0.0.1:8642/",
+      "url": "http://127.0.0.1:8642/",
+      "id": "C9AD17BA886E2FD10A2FDA55EE07707F"
+    }
+  ],
+  "chosen_target": {
+    "url": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "id": "D69CDB70DACD7C497FA0340E21B8E32A"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.44",
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": null,
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 0,
+    "progress_count": 0,
+    "progress_first": null,
+    "progress_last": null,
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-06T18:02:07.316Z",
+      "name": "start",
+      "argv": "--mode w44office --port 9333 --out C:\\a\\_temp\\diag-out --prefix w44b-fresh-three-missing --max-wait-sec 120 --ready-wait-sec 30 --w44-office-wait-sec 60 --w44-settle-sec 10 --w44-shot w44-three-missing",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-06T18:02:07.846Z",
+      "name": "targets",
+      "count": 2,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-06T18:02:08.186Z",
+      "name": "connected",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-06T18:02:08.218Z",
+      "name": "attached",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "id": "D69CDB70DACD7C497FA0340E21B8E32A"
+    },
+    {
+      "t": "2026-10-06T18:02:08.221Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-06T18:02:08.424Z",
+      "name": "app_version",
+      "value": "0.14.44"
+    }
+  ],
+  "errors": [],
+  "ui": {
+    "mode": "w44office",
+    "stage": "done",
+    "shots": [
+      {
+        "name": "w44-three-missing",
+        "file": "w44b-fresh-three-missing-ui-w44-three-missing.png",
+        "t": "2026-10-06T18:02:23.443Z",
+        "bytes": 271764
+      }
+    ]
+  },
+  "w44office": {
+    "started": "2026-10-06T18:02:08.433Z",
+    "samples": [
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 2
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "http://127.0.0.1:8642/",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "no contentDocument (cross-origin or not loaded)",
+        "t_ms": 2118
+      }
+    ],
+    "loaded": true,
+    "loaded_after_ms": 2118,
+    "final": {
+      "view_visible": true,
+      "panel_open": true,
+      "frame_src": "http://127.0.0.1:8642/",
+      "frame_w": 988,
+      "frame_h": 528,
+      "hint_hidden": true,
+      "hint_text": "",
+      "repair_button_hidden": true,
+      "frame_document": "no contentDocument (cross-origin or not loaded)"
+    },
+    "shot": "w44b-fresh-three-missing-ui-w44-three-missing.png",
+    "panel_open_before": true,
+    "targets": [
+      {
+        "type": "page",
+        "title": "cys — CYSJavis Terminal",
+        "url": "http://tauri.localhost/"
+      },
+      {
+        "type": "iframe",
+        "title": "http://127.0.0.1:8642/",
+        "url": "http://127.0.0.1:8642/"
+      }
+    ],
+    "finished": "2026-10-06T18:02:23.596Z"
+  }
+}
