@@ -79,6 +79,9 @@ jobs:
           # the same with a bigger test-thread stack: tells a stack-only abort from a logic failure
           RUST_MIN_STACK=33554432 run_cargo cys-approval-bigstack --bin cys approval -- --test-threads=1 --nocapture
           run_cargo lib-all-approval --lib approval -- --test-threads=1 --nocapture
+          # the one cysd specimen that failed in the product's windows-health run at ce76b43f (it passed at v0.14.43): five single runs + the whole c5 group
+          for i in 1 2 3 4 5; do run_cargo cysd-c5-single-$i --bin cysd c5_direct_send_denial_appends_ctrl_u_only_for_ghost_count -- --test-threads=1 --nocapture; done
+          run_cargo cysd-c5-group --bin cysd handlers::tests::c5_ -- --test-threads=1 --nocapture
           # pack specimens on Windows: the gate hook (shell) and the bridge script
           for pat in 'test_capgate_hook_shell.py' 'test_hud_bridge*.py' 'test_hud_detail_v11.py'; do
             log="$OUT/w44-unit-py-${pat%%.*}.log"
