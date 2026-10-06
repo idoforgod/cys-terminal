@@ -206,6 +206,22 @@ Step 'S0-inputs' {
     } catch { Write-Log ('w44-input.json: ' + $_.Exception.Message) 'WARN' }
     $runId = [int64]$inp['build_run_id']
     if ([string]$env:W44_BUILD_IN_RUN -eq '1') { $runId = [int64]$env:W44_THIS_RUN }
+    # debugging the harness itself: a public release installer instead of a build artifact (input key installer_release_tag, e.g. v0.14.43)
+    $relTag = ''
+    try { $jj = ConvertFrom-Json (Read-TextUtf8 (Join-Path $env:GITHUB_WORKSPACE 'diag\w44-input.json')); if ($jj.installer_release_tag) { $relTag = [string]$jj.installer_release_tag } } catch { }
+    if (($relTag -ne '') -and ([string]$env:W44_BUILD_IN_RUN -ne '1')) {
+        $dir0 = Join-Path $WORK 'installer'
+        New-Item -ItemType Directory -Path $dir0 -Force | Out-Null
+        $node0 = Find-Exe 'node.exe'
+        $cmd0 = ('"{0}" "{1}" --tag {2} --suffix _x64-setup.exe --out "{3}" --report "{4}"' -f $node0, (Join-Path $env:GITHUB_WORKSPACE 'diag\fetch-release-asset.mjs'), $relTag, $dir0, (Join-Path $WORK 'installer-fetch.json'))
+        $f0 = Invoke-Proc -File (Join-Path $env:windir 'System32\cmd.exe') -Arguments ('/d /c "' + $cmd0 + '"') -TimeoutSec 900
+        $exe0 = Get-ChildItem -LiteralPath $dir0 -Filter '*.exe' | Select-Object -First 1
+        if (-not $exe0) { throw ('release installer ' + $relTag + ' not downloaded: ' + (Limit $f0.err 300)) }
+        $X['installer'] = $exe0.FullName
+        $X['run_id'] = 0
+        Item 'installer' ([ordered]@{ name = $exe0.Name; size = $exe0.Length; sha256 = (Get-Sha256 $exe0.FullName); source = ('release ' + $relTag + ' (harness debugging)') })
+        return
+    }
     $X['run_id'] = $runId
     $X['artifact'] = $inp['artifact']
     Item 'build_run' $runId
