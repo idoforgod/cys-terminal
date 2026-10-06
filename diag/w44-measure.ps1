@@ -882,6 +882,34 @@ function Invoke-HealTests {
     return $H
 }
 
+# B7 on Windows (the design says: off). An OLD bridge (0.14.43 daemon, UTF-8 forced so that it runs) is left behind by a forced stop of its daemon;
+# then a NEW daemon starts: does it replace that old bridge (log line + pid change)?  (also a mode-managed + HUD_WIN_NEW=1 variant)
+function Invoke-B7Probe {
+    param([string]$Tag, [hashtable]$NewEnv)
+    $S = [ordered]@{ tag = $Tag; new_env = $NewEnv }
+    $null = Stop-AllW44Procs
+    $dotcys = Join-Path $env:USERPROFILE '.cys'
+    if (Test-Path -LiteralPath $dotcys) { Remove-Item -LiteralPath $dotcys -Recurse -Force -ErrorAction SilentlyContinue }
+    $oldPipe = '\\.\pipe\cys-w44b7old' + $Tag
+    $d1 = Start-W44Daemon $X['old'] $oldPipe ('b7old-' + $Tag) @{ PYTHONUTF8 = '1'; PYTHONIOENCODING = 'utf-8' } 120
+    $t0 = Get-Date; $b1 = $null
+    while (((Get-Date) - $t0).TotalSeconds -lt 40) { $g = Get-BridgeProcs; if ($g['bridges'].Count -gt 0) { $b1 = $g['bridges'][0]; break }; Start-Sleep -Seconds 2 }
+    $S['old_bridge_pid'] = $(if ($b1) { $b1.Id } else { $null })
+    try { Stop-Process -Id $d1['pid'] -Force -ErrorAction SilentlyContinue } catch { }
+    Start-Sleep -Seconds 3
+    $S['old_bridge_alive_after_old_daemon_stop'] = $(if ($b1) { Test-PidAlive $b1.Id } else { $null })
+    $newPipe = '\\.\pipe\cys-w44b7new' + $Tag
+    $d2 = Start-W44Daemon $X['new'] $newPipe ('b7new-' + $Tag) $NewEnv 120
+    Start-Sleep -Seconds 45
+    $S['old_bridge_alive_after_new_daemon_45s'] = $(if ($b1) { Test-PidAlive $b1.Id } else { $null })
+    $g2 = Get-BridgeProcs
+    $S['bridges_now'] = @($g2['bridges'] | ForEach-Object { [ordered]@{ id = $_.Id; ppid = $_.Ppid } })
+    $S['new_daemon_log_bridge_lines'] = @((Read-OutFile $d2['err_file']) -split "`r?`n" | Where-Object { $_ -match 'office-bridge' } | Select-Object -First 12)
+    try { Stop-Process -Id $d2['pid'] -Force -ErrorAction SilentlyContinue } catch { }
+    $null = Stop-AllW44Procs
+    return $S
+}
+
 Step 'TC-daemon' {
     $res = [ordered]@{}
     $new = $X['new']
@@ -913,6 +941,12 @@ Step 'TC-daemon' {
     if ($X['old']) {
         Run-One 'old-default' 'olddefault' $X['old'] @{} $false 20
         Run-One 'old-default-utf8' 'oldutf8' $X['old'] @{ PYTHONUTF8 = '1'; PYTHONIOENCODING = 'utf-8' } $false 20
+    }
+    if ($X['old']) {
+        $res['b7-new-default'] = Invoke-B7Probe 'a' @{}
+        Save-Json 'w44-daemon-b7-new-default.json' $res['b7-new-default'] 8
+        $res['b7-new-managed-winnew'] = Invoke-B7Probe 'b' @{ CYS_OFFICE_BRIDGE_MODE = 'managed'; HUD_WIN_NEW = '1' }
+        Save-Json 'w44-daemon-b7-new-managed-winnew.json' $res['b7-new-managed-winnew'] 8
     }
 }
 
