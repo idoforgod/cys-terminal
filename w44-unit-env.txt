@@ -1,0 +1,14 @@
+== runner ==
+ImageOS=win25-vs2026 ImageVersion=20260925.250.1 RUNNER_ARCH=X64
+rustc 1.99.0 (b940084d7 2026-09-28)
+binary: rustc
+commit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4
+commit-date: 2026-09-28
+host: x86_64-pc-windows-msvc
+release: 1.99.0
+LLVM version: 23.1.1
+cargo 1.99.0 (5f94df478 2026-08-27)
+Python 3.12.10
+GNU bash, version 5.3.15(2)-release (x86_64-pc-cygwin)
+git version 2.55.0.windows.5
+product: 4544eb3f095987eec24bc31de63b4a4e123f36c3 docs(0.14.44): 릴리스 노트에서 내부 검증 사고 기록 한 줄을 뺀다 — 사용자용 문서가 아니라 내부 보고의 자리
