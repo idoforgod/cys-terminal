@@ -1,0 +1,110 @@
+{
+    "os":  "windows-11-arm",
+    "runs":  {
+                 "new-app":  {
+                                 "label":  "new-app",
+                                 "scenario":  "app",
+                                 "version":  "cys 0.14.44",
+                                 "daemon_ready":  true,
+                                 "seconds":  12.1,
+                                 "finished":  true,
+                                 "timed_out":  false,
+                                 "rc":  0,
+                                 "stdout_lines":  19,
+                                 "stderr_lines":  0,
+                                 "stdout_bytes":  1265,
+                                 "last_lines":  [
+                                                    "[OK  ] staging-residue  staging 잔재 없음",
+                                                    "[OK  ] channels-db      채널 DB 없음(온디맨드 생성)",
+                                                    "[OK  ] legacy-config    레거시 env 미사용(canonical CYS_*)",
+                                                    "[SKIP] app-seal         macOS 아님 — 코드서명 봉인 검사 미해당",
+                                                    "[OK  ] runtime-seal     동봉 런타임 봉인 무결 — C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime",
+                                                    "요약: 12 OK · 0 WARN · 0 FAIL · 4 SKIP(판정 불가)"
+                                                ],
+                                 "snapshots":  [
+
+                                               ]
+                             },
+                 "new-app2":  {
+                                  "label":  "new-app2",
+                                  "scenario":  "app",
+                                  "version":  "cys 0.14.44",
+                                  "daemon_ready":  true,
+                                  "seconds":  12.1,
+                                  "finished":  true,
+                                  "timed_out":  false,
+                                  "rc":  0,
+                                  "stdout_lines":  19,
+                                  "stderr_lines":  0,
+                                  "stdout_bytes":  1265,
+                                  "last_lines":  [
+                                                     "[OK  ] staging-residue  staging 잔재 없음",
+                                                     "[OK  ] channels-db      채널 DB 없음(온디맨드 생성)",
+                                                     "[OK  ] legacy-config    레거시 env 미사용(canonical CYS_*)",
+                                                     "[SKIP] app-seal         macOS 아님 — 코드서명 봉인 검사 미해당",
+                                                     "[OK  ] runtime-seal     동봉 런타임 봉인 무결 — C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime",
+                                                     "요약: 12 OK · 0 WARN · 0 FAIL · 4 SKIP(판정 불가)"
+                                                 ],
+                                  "snapshots":  [
+
+                                                ]
+                              },
+                 "old-app":  {
+                                 "label":  "old-app",
+                                 "scenario":  "app",
+                                 "version":  "cys 0.14.43",
+                                 "daemon_ready":  true,
+                                 "seconds":  12.1,
+                                 "finished":  true,
+                                 "timed_out":  false,
+                                 "rc":  0,
+                                 "stdout_lines":  19,
+                                 "stderr_lines":  0,
+                                 "stdout_bytes":  1265,
+                                 "last_lines":  [
+                                                    "[OK  ] staging-residue  staging 잔재 없음",
+                                                    "[OK  ] channels-db      채널 DB 없음(온디맨드 생성)",
+                                                    "[OK  ] legacy-config    레거시 env 미사용(canonical CYS_*)",
+                                                    "[SKIP] app-seal         macOS 아님 — 코드서명 봉인 검사 미해당",
+                                                    "[OK  ] runtime-seal     동봉 런타임 봉인 무결 — C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime",
+                                                    "요약: 12 OK · 0 WARN · 0 FAIL · 4 SKIP(판정 불가)"
+                                                ],
+                                 "snapshots":  [
+
+                                               ]
+                             },
+                 "old-app2":  {
+                                  "label":  "old-app2",
+                                  "scenario":  "app",
+                                  "version":  "cys 0.14.43",
+                                  "daemon_ready":  true,
+                                  "seconds":  11.1,
+                                  "finished":  true,
+                                  "timed_out":  false,
+                                  "rc":  0,
+                                  "stdout_lines":  19,
+                                  "stderr_lines":  0,
+                                  "stdout_bytes":  1265,
+                                  "last_lines":  [
+                                                     "[OK  ] staging-residue  staging 잔재 없음",
+                                                     "[OK  ] channels-db      채널 DB 없음(온디맨드 생성)",
+                                                     "[OK  ] legacy-config    레거시 env 미사용(canonical CYS_*)",
+                                                     "[SKIP] app-seal         macOS 아님 — 코드서명 봉인 검사 미해당",
+                                                     "[OK  ] runtime-seal     동봉 런타임 봉인 무결 — C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime",
+                                                     "요약: 12 OK · 0 WARN · 0 FAIL · 4 SKIP(판정 불가)"
+                                                 ],
+                                  "snapshots":  [
+
+                                                ]
+                              }
+             },
+    "errors":  [
+
+               ],
+    "installers":  {
+                       "new":  "C:\\a\\_temp\\w44d\\new\\cys_0.14.44_x64-setup.exe",
+                       "old":  "C:\\a\\_temp\\w44d\\oldinst\\cys_0.14.43_x64-setup.exe"
+                   },
+    "new_install_rc":  0,
+    "old_install_rc":  0
+}
