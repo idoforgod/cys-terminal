@@ -1,0 +1,28 @@
+{
+  "generated": "2026-10-06T13:51:43.098Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37473910657",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37473910657",
+  "job": "app-upgrade",
+  "os": "windows-11-arm",
+  "branch": "diag-results/37473910657-1-app-upgrade-windows-11-arm",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "ensure-sac-restored-citool-lp.json",
+      "bytes": 6761
+    },
+    {
+      "path": "ensure-sac-restored.txt",
+      "bytes": 391
+    },
+    {
+      "path": "syntax-check.txt",
+      "bytes": 353
+    }
+  ],
+  "skipped": [],
+  "inline_files": 3,
+  "blob_files": 0
+}
