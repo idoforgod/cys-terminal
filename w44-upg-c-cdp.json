@@ -1,0 +1,174 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "w44",
+  "port": 9333,
+  "started": "2026-10-06T12:54:51.358Z",
+  "finished": "2026-10-06T12:54:59.280Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "cys — CYSJavis Terminal",
+      "url": "http://tauri.localhost/",
+      "id": "A68732B1834588E6788D8079E9BC9999"
+    },
+    {
+      "type": "iframe",
+      "title": "http://127.0.0.1:8642/",
+      "url": "http://127.0.0.1:8642/",
+      "id": "CF0A26E2EB4171673C8696B9B582D9B4"
+    }
+  ],
+  "chosen_target": {
+    "url": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "id": "A68732B1834588E6788D8079E9BC9999"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.44",
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": null,
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 0,
+    "progress_count": 0,
+    "progress_first": null,
+    "progress_last": null,
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-06T12:54:51.359Z",
+      "name": "start",
+      "argv": "--mode w44 --port 9333 --out C:\\a\\_temp\\diag-out --prefix w44-upg-c --max-wait-sec 120 --ready-wait-sec 30 --w44-leave-office",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-06T12:54:51.382Z",
+      "name": "targets",
+      "count": 2,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-06T12:54:51.391Z",
+      "name": "connected",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-06T12:54:51.393Z",
+      "name": "attached",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "id": "A68732B1834588E6788D8079E9BC9999"
+    },
+    {
+      "t": "2026-10-06T12:54:51.395Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-06T12:54:51.401Z",
+      "name": "app_version",
+      "value": "0.14.44"
+    }
+  ],
+  "errors": [],
+  "ui": {
+    "mode": "w44",
+    "stage": "done",
+    "ready": null,
+    "clicks": [],
+    "states": [],
+    "shots": [
+      {
+        "name": "w44-start",
+        "file": "w44-upg-c-ui-w44-start.png",
+        "t": "2026-10-06T12:54:54.474Z",
+        "bytes": 50468
+      },
+      {
+        "name": "w44-left-office",
+        "file": "w44-upg-c-ui-w44-left-office.png",
+        "t": "2026-10-06T12:54:59.279Z",
+        "bytes": 110640
+      }
+    ]
+  },
+  "w44": {
+    "started": "2026-10-06T12:54:51.402Z",
+    "cys": "",
+    "dept_pipes": [],
+    "ready": 2,
+    "usage": null,
+    "feed": [],
+    "office": null,
+    "errors": [],
+    "left_office": true,
+    "finished": "2026-10-06T12:54:59.280Z"
+  }
+}

@@ -1,0 +1,11 @@
+{
+    "result":  "PASS",
+    "upgrade":  "PASS",
+    "team":  "PASS",
+    "reasons":  [
+                    "UPGRADE PASS: the installed 0.14.43 app was upgraded to 0.14.44 (emulate): the marker and the three executables are 0.14.44, no failure file, the app came back, reports 0.14.44 and its UI is up",
+                    "TEAM PASS: the button flow started by clicks, a new team tab stood (waiting screen -\u003e real tab), a new cysd.exe was created after the click and no failure notification was shown",
+                    "NOTE the status bar still shows daemon pid 8208 at the end while daemon_status answers pid 9028 (the text is not rewritten after the rotation)",
+                    "NOTE 1 of the 2 \"cys.exe init-pack\" process(es) after the upgrade ended with a non-zero exit status (overlap=True; see appe2e-upg-proc-audit.txt)"
+                ]
+}

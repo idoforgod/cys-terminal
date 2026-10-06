@@ -1,0 +1,61 @@
+{
+    "tag":  "pre-w44-upg",
+    "time":  "2026-10-06T12:53:34.196Z",
+    "version":  "cys 0.14.44",
+    "seconds":  18.7,
+    "finished":  true,
+    "timed_out":  false,
+    "rc":  0,
+    "stdout_bytes":  1372,
+    "stdout_lines":  19,
+    "last_lines":  [
+                       "  [OK  ] staging-residue  staging 잔재 없음",
+                       "  [OK  ] channels-db      채널 DB 없음(온디맨드 생성)",
+                       "  [OK  ] legacy-config    레거시 env 미사용(canonical CYS_*)",
+                       "  [SKIP] app-seal         macOS 아님 — 코드서명 봉인 검사 미해당",
+                       "  [OK  ] runtime-seal     동봉 런타임 봉인 무결 — C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime",
+                       "요약: 12 OK · 0 WARN · 0 FAIL · 4 SKIP(판정 불가)"
+                   ],
+    "snapshots":  [
+                      {
+                          "at_sec":  15,
+                          "doctor_children":  [
+
+                                              ],
+                          "cys_pipes":  [
+                                            "cys",
+                                            "cys-dept-dept-1"
+                                        ],
+                          "loopback":  [
+                                           "  TCP    127.0.0.1:8642         0.0.0.0:0              LISTENING       11008",
+                                           "  TCP    127.0.0.1:8642         127.0.0.1:62229        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         0.0.0.0:0              LISTENING       4588",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:57829        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:59990        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:59994        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:60011        TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:9333         127.0.0.1:62236        ESTABLISHED     4588",
+                                           "  TCP    127.0.0.1:59993        127.0.0.1:9333         TIME_WAIT       0",
+                                           "  TCP    127.0.0.1:62236        127.0.0.1:9333         ESTABLISHED     7768",
+                                           "  UDP    127.0.0.1:1900         *:*                                    6152",
+                                           "  UDP    127.0.0.1:54866        *:*                                    6152",
+                                           "  UDP    127.0.0.1:63760        127.0.0.1:63760                        3540"
+                                       ],
+                          "stdout_tail":  "  [SKIP] app-seal         macOS 아님 — 코드서명 봉인 검사 미해당 |   [OK  ] runtime-seal     동봉 런타임 봉인 무결 — C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime | 요약: 12 OK · 0 WARN · 0 FAIL · 4 SKIP(판정 불가)",
+                          "busiest_processes_3s":  [
+                                                       "msedgewebview2.exe#5816 io_bytes_3s=3391400 cpu_s_3s=0 \"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.37\\msedgewebview2.exe\" --type=renderer --noerrdialogs --user-data-dir=\"C:\\Users\\runneradmin...[cut]",
+                                                       "msedgewebview2.exe#2440 io_bytes_3s=3386936 cpu_s_3s=0 \"C:\\Program Files (x86)\\Microsoft\\EdgeWebView\\Application\\154.0.4258.37\\msedgewebview2.exe\" --type=gpu-process --gpu-recent-crash-count=0 --noerrdialogs --user-...[cut]",
+                                                       "powershell.exe#7768 io_bytes_3s=0 cpu_s_3s=0.19 \"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\\a\\cys-terminal\\cys-terminal\\diag\\app-e2e...[cut]",
+                                                       "System#4 io_bytes_3s=0 cpu_s_3s=0.08 ",
+                                                       "cysd.exe#1584 io_bytes_3s=4771 cpu_s_3s=0.03 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe\"",
+                                                       "WindowsAzureGuestAgent.exe#7956 io_bytes_3s=542 cpu_s_3s=0.03 C:\\WindowsAzure\\GuestAgent_2.7.41491.1243_2026-10-06_123643\\WindowsAzureGuestAgent.exe",
+                                                       "MsMpEng.exe#3844 io_bytes_3s=0 cpu_s_3s=0.03 ",
+                                                       "WmiPrvSE.exe#7996 io_bytes_3s=0 cpu_s_3s=0.03 C:\\Windows\\system32\\wbem\\wmiprvse.exe"
+                                                   ]
+                      }
+                  ],
+    "env_notes":  [
+
+                  ],
+    "error":  null
+}
