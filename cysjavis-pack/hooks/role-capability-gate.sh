@@ -2828,7 +2828,14 @@ def context_payload(text):
 def emit_deny(reason):
     """modern Claude Code permission-decision deny JSON을 stdout에 내고 exit 0.
     printf 고정 형태(외부 jq/python 의존 없음 — reason만 보간·이스케이프)."""
-    sys.stdout.write(deny_payload(reason) + "\n")
+    try:
+        sys.stdout.write(deny_payload(reason) + "\n")
+    except UnicodeEncodeError:
+        # 짝 없는 대리 문자 등 인코딩 불가 문자가 사유에 있어도 거부 JSON 은 나가야 한다(0.14.44 A5) —
+        # 출력 인코딩 실패는 표준출력 0바이트 + exit 1(비차단)이 되어 판정은 거부인데 명령이 통과한다.
+        # 사유만 ASCII(backslashreplace)로 바꿔 같은 꼴 JSON 으로 다시 낸다. 판정 경로·문구는 그대로.
+        sys.stdout.write(
+            deny_payload(reason.encode("ascii", "backslashreplace").decode("ascii")) + "\n")
     sys.exit(0)
 
 
