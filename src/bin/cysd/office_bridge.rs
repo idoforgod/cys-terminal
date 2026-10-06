@@ -534,6 +534,12 @@ pub enum SuperviseExit {
     Stopped { reason: &'static str, how: &'static str },
 }
 
+/// 다음 탐침 시각 — 깨어난 시각 + 주기. 밀린 탐침을 몰아 보내지 않는다(순수 — 시계는 인자).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn next_probe_deadline(woke: tokio::time::Instant) -> tokio::time::Instant {
+    woke + std::time::Duration::from_secs(PROBE_INTERVAL_SECS)
+}
+
 /// 우리가 띄운 브리지가 **살아 있는 동안** 60초마다 건강을 확인한다. 연속 3회 실패하면(약 3분) · 팩 버전이 다르면(한 번) B2 의 순서로 끝내고 돌아간다(다시 띄우는 것은 호출부).
 /// `child.stdin` 에서 꺼낸 쓰기 쪽(`lifeline`)을 이 함수가 쥔다 — `Child::wait` 는 기다리기 전에 자식의 표준입력을 닫기 때문에(tokio 문서) 꺼내지 않으면 감독을 시작하는 순간
 /// 수명줄이 닫혀 브리지가 뜨자마자 끝난다. 데몬이 어떤 이유로든 사라지면 운영체제가 파이프를 닫는다. 데몬의 잠금을 쥐지 않고, 모든 대기에 시간 상한이 있다.
@@ -554,7 +560,9 @@ pub async fn supervise_managed_child(
             }
             _ = tokio::time::sleep_until(next) => {}
         }
-        next += std::time::Duration::from_secs(PROBE_INTERVAL_SECS);
+        // 다음 탐침은 **깨어난 시각** 기준이다(tokio `MissedTickBehavior::Delay` 와 같은 방식). 종전의 `next += 60초` 는 태스크가 몇 분 멈췄다 깨면 밀린 탐침이
+        // 연달아 나가 "연속 3회 ≈ 3분" 이 몇 초로 줄 수 있었다 — 일시 정지가 끝난 직후 브리지를 잘못 죽이는 길(성찰 1회차 m3).
+        next = next_probe_deadline(tokio::time::Instant::now());
         let installed = installed_pack_version(pack_dir);
         let path: &'static str = if tracker.use_world { "/world" } else { "/health" };
         let reply = tokio::task::spawn_blocking(move || cys::bridge_probe_get(port, path))
@@ -617,6 +625,35 @@ mod tests {
         let p = spawn_plan(sock, true, BridgeMode::Managed, None);
         assert!(!p.env.iter().any(|(k, _)| *k == "CYS_SOCKET"));
         assert!(!p.env.iter().any(|(k, _)| *k == "HUD_PACK_VERSION"), "팩 버전을 못 읽었으면 싣지 않는다");
+    }
+
+    /// 성찰 1회차 m3: 태스크가 오래 멈췄다 깨도 다음 탐침은 깨어난 시각에서 한 주기 뒤다 — 밀린 탐침이 연달아 나가지 않는다(연속 3회 ≈ 3분 보존).
+    /// 시계를 흉내 낸다: 마감이 정지 구간(100~360초) 안이면 360초에 깨어난다. 종전식(`마감 += 주기`)은 360 에서 연달아 4번 나가고, 새 방식은 한 번 뒤 60초 간격이다.
+    #[test]
+    fn b3_probe_cadence_after_a_stall_is_measured_from_the_wake_not_the_missed_slots() {
+        let t0 = tokio::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
+        let simulate = |delay_style: bool| -> Vec<u64> {
+            let mut deadline = 60u64;
+            let mut fired: Vec<u64> = Vec::new();
+            while fired.len() < 8 {
+                let woke = if (100..360).contains(&deadline) { 360 } else { deadline };
+                fired.push(woke);
+                deadline = if delay_style {
+                    let n = next_probe_deadline(t0 + secs(woke)) - t0;
+                    n.as_secs()
+                } else {
+                    deadline + PROBE_INTERVAL_SECS
+                };
+            }
+            fired
+        };
+        let old = simulate(false);
+        assert!(old.windows(2).any(|w| w[1] - w[0] < PROBE_INTERVAL_SECS), "종전식이 몰아 보내지 않으면 이 시험이 아무것도 못 잡는다: {old:?}");
+        let new = simulate(true);
+        let gaps: Vec<u64> = new.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.iter().all(|g| *g >= PROBE_INTERVAL_SECS), "탐침 간격이 한 주기 미만으로 줄었다: {new:?}");
+        assert_eq!(next_probe_deadline(t0) - t0, secs(PROBE_INTERVAL_SECS));
     }
 
     // ── B2·B3 윈도우 종전 ────────────────────────────────────────────────────
