@@ -45,6 +45,7 @@ mod governance;
 mod handlers;
 mod hwmon;
 mod knobs;
+mod office_bridge;
 mod recall;
 mod reclaim;
 mod schedule;
@@ -1400,7 +1401,7 @@ async fn async_main() {
     skillrun::reconcile_boot(&daemon);
     skillrun::spawn_watcher(Arc::clone(&daemon));
     // CC "🏢 오피스" 탭의 상시 가용성 — 메타버스 오피스 브리지(127.0.0.1:8642) 자동기동.
-    spawn_office_bridge(crate::state::state_dir(&socket_path));
+    spawn_office_bridge(crate::state::state_dir(&socket_path), socket_path.clone());
     // C0: 채널 부팅 재조정(고아 선-kill→새 토큰 재스폰) — 이벤트버스·state 준비 후(§2.1-2).
     // 불사조 복원 프로토콜의 "채널 재조정" 단계. 그 다음 주기 sweep(재배달·타임아웃·재스폰) 등록.
     channels::reconcile(&daemon);
@@ -1917,9 +1918,16 @@ fn decide_auto_restore(
 /// 사망·부재는 60s 주기 재확인이 이어받고(KeepAlive), cysd 정상 종료 시 kill_on_drop이 자식을 동반 정리한다.
 /// CYS_NO_OFFICE_BRIDGE=1 opt-out · 팩에 브리지 부재(구팩)면 조용히 skip.
 /// python 해석·PATH·cys 주입은 auto-restore(★B3)와 동일 SOT(bundled_python3·runtime_prefixed_path).
-fn spawn_office_bridge(state_dir: std::path::PathBuf) {
+fn spawn_office_bridge(state_dir: std::path::PathBuf, socket_path: std::path::PathBuf) {
     if cys::env_compat("CYS_NO_OFFICE_BRIDGE").map(|v| v == "1").unwrap_or(false) {
         eprintln!("[cysd] office-bridge skipped (CYS_NO_OFFICE_BRIDGE=1)");
+        return;
+    }
+    // ★(0.14.44 · B1) 브리지는 **본부 데몬만** 띄운다 — 부서 데몬이 띄우면 그 부서의 좌석을 "본부 · CEO"로 보여 주고 진짜 본부 좌석이 화면에서 사라졌다[실측 R3-b].
+    //   판별은 데몬 자신의 소켓 경로 하나(`cys::is_dept_socket`). 손잡이 `CYS_OFFICE_BRIDGE_ANY_OWNER=1` → 종전처럼 어느 데몬이든(환경도 그대로 물려준다).
+    let any_owner = crate::knobs::bridge_any_owner();
+    if !crate::office_bridge::owner_may_spawn(&socket_path, any_owner) {
+        eprintln!("[cysd] office-bridge skipped (dept daemon)");
         return;
     }
     let script = cys::pack::pack_dir().join("bin").join("javis_hud_bridge.py");
@@ -1934,15 +1942,95 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf) {
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
     tokio::spawn(async move {
+        use crate::knobs::BridgeMode;
         let exe_dir_ref = exe_dir.as_deref().unwrap_or_else(|| std::path::Path::new("."));
         let python = bundled_python3(exe_dir_ref).unwrap_or_else(|| "python3".to_string());
         let log_path = state_dir.join("office-bridge.log");
+        // ★(0.14.44 · B3·B7) 감독 상태 — 재기동 상한(30분 3회) · 죽은 뒤 대기 단계 · 옛 브리지 교체(데몬 수명당 한 번). 데몬의 잠금은 하나도 쥐지 않는다.
+        let started = std::time::Instant::now();
+        let mut limiter = crate::office_bridge::SpawnLimiter::default();
+        let mut deaths: u32 = 0;
+        let mut replace_done = false;
+        let mut replace_rounds: u32 = 0;
         loop {
+            // 스폰마다 읽는다 — 실행 중에 정책 파일로 `legacy` 가 되면 **다음 스폰부터** 적용된다(수명줄로 이어진 지금의 브리지를 그 자리에서 넘기지 않는다).
+            let mode = crate::knobs::bridge_mode();
+            let managed = mode == BridgeMode::Managed;
             // 단일 인스턴스 가드 — 이미 서비스 중(선행 데몬·수동 기동)이면 스폰하지 않고 재확인만.
-            if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
+            let port_busy = if managed {
+                matches!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(2),
+                        tokio::net::TcpStream::connect(("127.0.0.1", port)),
+                    )
+                    .await,
+                    Ok(Ok(_))
+                )
+            } else {
+                tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok()
+            };
+            if port_busy {
+                // ★(0.14.44 · B7 · 맥) 판을 올린 직후 남아 있는 **옛 세대** 브리지를 한 번 교체한다 — 브리지는 데몬·앱과 따로 살아남아[실측 R4] 0.14.43 의 브리지가 포트를 쥐고
+                //   있으면 새 판의 수정이 재부팅 전까지 닿지 않는다. 옛 세대 확인 + 토큰으로 가린 포트 주인 + 경로 완전 일치 + 후보 하나일 때만(절차는 office_bridge::replace_old_bridge).
+                if managed
+                    && !replace_done
+                    && cfg!(target_os = "macos")
+                    && crate::knobs::bridge_replace_old_enabled()
+                {
+                    let owners = crate::office_bridge::owner_dirs(
+                        &state_dir,
+                        &script,
+                        &std::env::var("CYS_DEPTS_JSON")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|_| cys::home_dir().join(".cys").join("depts.json")),
+                        &cys::home_dir(),
+                    );
+                    let step = tokio::task::spawn_blocking(move || {
+                        crate::office_bridge::replace_old_bridge(
+                            &crate::office_bridge::RealReplaceEnv { port },
+                            &owners,
+                        )
+                    })
+                    .await;
+                    use crate::office_bridge::ReplaceStep as Rs;
+                    match step {
+                        Ok(Rs::Replaced { pid, owner, children }) => {
+                            replace_done = true;
+                            eprintln!("[cysd] office-bridge: 옛 세대 브리지 교체(pid {pid} · 주인 {owner} · 이벤트 구독 자식 {children}개 정리) — 새 브리지를 띄운다");
+                            continue; // 포트가 비었다 — 곧바로 새 브리지
+                        }
+                        Ok(Rs::PortNotFreed { pid }) => {
+                            replace_done = true;
+                            eprintln!("[cysd] office-bridge: 옛 브리지(pid {pid})가 종료 신호 뒤 3초 안에 포트를 놓지 않아 멈춘다(강제 종료 없음 · 이 데몬이 사는 동안 다시 시도하지 않는다)");
+                        }
+                        Ok(Rs::Changed) => {
+                            replace_done = true;
+                            eprintln!("[cysd] office-bridge: 후보 프로세스가 신호 직전에 달라져 교체를 중단한다(다시 시도하지 않는다)");
+                        }
+                        Ok(Rs::Ambiguous(n)) => {
+                            replace_rounds += 1;
+                            if replace_rounds >= crate::office_bridge::REPLACE_AMBIGUOUS_ROUNDS {
+                                replace_done = true;
+                                eprintln!("[cysd] office-bridge: 옛 브리지 후보가 하나로 좁혀지지 않아({n}개) 교체하지 않는다 — 옛 브리지를 계속 쓴다");
+                            }
+                        }
+                        Ok(Rs::NotOld) | Ok(Rs::NoOwner) | Err(_) => {}
+                    }
+                }
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 continue;
             }
+            // ★(0.14.44 · B3) 재기동 상한 — 30분에 3회. 넘으면 30분 쉬고(로그 한 줄) 다시 센다. 종전(legacy)에는 상한이 없다.
+            if managed {
+                let now = started.elapsed().as_secs_f64();
+                if let crate::office_bridge::SpawnGate::Rest(secs) = limiter.gate(now) {
+                    eprintln!("[cysd] office-bridge: 30분 안에 {}회 띄웠다 — {secs}초 쉬고 다시 센다(재기동 상한)", crate::office_bridge::RESTART_MAX);
+                    tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                    continue;
+                }
+            }
+            let pack_version = crate::office_bridge::installed_pack_version(&cys::pack::pack_dir());
+            let plan = crate::office_bridge::spawn_plan(&socket_path, any_owner, mode, pack_version.as_deref());
             let mut cmd = tokio::process::Command::new(&python);
             cmd.arg(&script)
                 // 브리지의 cys 호출이 라이벌 데몬을 autostart하는 재귀 차단(auto-restore와 동일 계약).
@@ -1953,8 +2041,17 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf) {
                 .env(cys::ENV_PY_NO_BYTECODE, cys::PY_NO_BYTECODE_ON)
                 // 런타임 상태는 팩 트리 밖으로(팩 본체 오염 0 — 팩 편입 계약 HUD_STATE_DIR).
                 .env("HUD_STATE_DIR", state_dir.join("office-bridge"))
-                .stdin(std::process::Stdio::null())
                 .kill_on_drop(true);
+            // ★(0.14.44 · B1·B2) 더하는 설정: `CYS_SOCKET`(이 데몬 — 본부) · managed 면 수명줄(`HUD_LIFELINE=stdin` + 표준입력 파이프)과 `HUD_PACK_VERSION`.
+            //   legacy 는 표준입력 `null` · 수명줄 환경 없음 = 0.14.43 의 스폰 설정(윈도우 기본 · 단위 시험이 고정한다).
+            for (k, v) in &plan.env {
+                cmd.env(k, v);
+            }
+            if plan.stdin_piped {
+                cmd.stdin(std::process::Stdio::piped());
+            } else {
+                cmd.stdin(std::process::Stdio::null());
+            }
             {
                 // Windows: 콘솔 없는 cysd가 콘솔 자식(python3.exe)을 그냥 스폰하면 새 콘솔 창이
                 // 할당된다(Win11 기본터미널=WT → AppData 경로 제목의 검은 상주 탭). 브리지는
@@ -1983,15 +2080,47 @@ fn spawn_office_bridge(state_dir: std::path::PathBuf) {
                     cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
                 }
             }
+            let mut delay_secs: u64 = 60;
             match cmd.spawn() {
                 Ok(mut child) => {
+                    let born = std::time::Instant::now();
+                    if managed {
+                        limiter.record(started.elapsed().as_secs_f64());
+                    }
                     eprintln!("[cysd] office-bridge spawned (127.0.0.1:{port})");
-                    let _ = child.wait().await; // 사망 감지 → 아래 백오프 후 루프가 재스폰 판단
-                    eprintln!("[cysd] office-bridge exited — 60s 후 재확인");
+                    if managed {
+                        // ★(0.14.44 · B2) 표준입력의 **쓰기 쪽을 스폰 직후 자식 객체에서 꺼내** 감독 태스크가 따로 쥔다 — `child.wait()` 는 기다리기 전에 자식의 표준입력을 닫는다.
+                        let lifeline = child.stdin.take();
+                        let exit = crate::office_bridge::supervise_managed_child(
+                            &mut child,
+                            lifeline,
+                            port,
+                            &cys::pack::pack_dir(),
+                        )
+                        .await;
+                        match exit {
+                            crate::office_bridge::SuperviseExit::Died => {
+                                eprintln!("[cysd] office-bridge exited — 곧 다시 확인");
+                            }
+                            crate::office_bridge::SuperviseExit::Stopped { reason, how } => {
+                                eprintln!("[cysd] office-bridge: {reason} — 끝내고 다시 띄운다({how})");
+                            }
+                        }
+                        // 죽은 뒤 기다리는 시간은 5초 → 30초 → 60초로 늘린다(오래 산 자식이었으면 처음부터 다시).
+                        if born.elapsed().as_secs_f64() >= crate::office_bridge::HEALTHY_LIFE_SECS {
+                            deaths = 1;
+                        } else {
+                            deaths += 1;
+                        }
+                        delay_secs = crate::office_bridge::restart_delay_secs(deaths);
+                    } else {
+                        let _ = child.wait().await; // 사망 감지 → 아래 백오프 후 루프가 재스폰 판단
+                        eprintln!("[cysd] office-bridge exited — 60s 후 재확인");
+                    }
                 }
                 Err(e) => eprintln!("[cysd] office-bridge spawn failed: {e}"),
             }
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
         }
     });
 }
