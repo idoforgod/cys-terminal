@@ -321,6 +321,21 @@ function Invoke-W44Scene2 {
             $texts = @($wo.samples | ForEach-Object { [string]$_.hint_text } | Where-Object { $_ } | Select-Object -Unique)
             $late['office'] = [ordered]@{ loaded = $wo.loaded; loaded_after_ms = $wo.loaded_after_ms; hint_texts_seen = $texts; final = $wo.final; samples = @($wo.samples).Count; shot = $wo.shot }
         }
+        # the first pass only shows the "preparing" state; now wait until the daemon has brought the bridge back (legacy loop: about 60 s), then open the tab again
+        $tb = Get-Date; $back = $null
+        while (((Get-Date) - $tb).TotalSeconds -lt 180) {
+            $rows = Get-W44BridgeRows 'poll'
+            $hc = GetCode 'http://127.0.0.1:8642/health'
+            if ($rows['count'] -gt 0 -and $hc -eq 200) { $back = [math]::Round(((Get-Date) - $tb).TotalSeconds, 1); break }
+            Start-Sleep -Seconds 3
+        }
+        $late['bridge_back_after_s_from_first_pass_end'] = $back
+        if ($null -ne $back) {
+            $pfx2 = $Prefix + '-late2'
+            $late['node2'] = Invoke-UpgNode -Prefix $pfx2 -NodeExe $node -Mode 'w44office' -Extra '--w44-office-wait-sec 60 --w44-settle-sec 30 --w44-shot w44-late2' -TimeoutSec 240
+            $j2 = Read-UpgJson ($pfx2 + '-cdp.json')
+            if ($null -ne $j2 -and $null -ne $j2.w44office) { $w2 = $j2.w44office; $late['office2'] = [ordered]@{ loaded = $w2.loaded; final = $w2.final; shot = $w2.shot } }
+        }
         $late['bridge_rows_after'] = Get-W44BridgeRows 'after-late'
         $rec['late'] = $late
         Save-Json ('w44-scene2-' + $Prefix + '.json') $rec 9
@@ -332,6 +347,9 @@ function Invoke-W44Scene2 {
         $logBefore = 0
         try { if (Test-Path -LiteralPath $logF) { $logBefore = @((Read-FileShared $logF) -split "`r?`n").Count } } catch { }
         function CysRun { param([string]$a, [int]$sec = 60) return (Invoke-Proc -File $cys -Arguments $a -TimeoutSec $sec) }
+        $evOut = Join-Path $env:RUNNER_TEMP 'w44-events.txt'
+        $evProc = $null
+        try { $evProc = Start-Process -FilePath $cys -ArgumentList 'events --reconnect' -PassThru -WindowStyle Hidden -RedirectStandardOutput $evOut -RedirectStandardError (Join-Path $env:RUNNER_TEMP 'w44-events.err.txt') } catch { }
         $refs = @{}
         foreach ($nm in @('w44a', 'w44b')) { $o = CysRun ('new-surface --title {0} --cmd cmd.exe' -f $nm); $refs[$nm] = ([string]$o.out).Trim(); $H['seats'][$nm] = [ordered]@{ ref = $refs[$nm]; rc = $o.rc } }
         $om = CysRun 'new-surface --role master --title w44m --cmd cmd.exe'
@@ -389,6 +407,15 @@ function Invoke-W44Scene2 {
             Start-Sleep -Seconds 20
         }
         $H['sys_after'] = Get-W44SysCount
+        try {
+            if ($evProc -and -not $evProc.HasExited) { Stop-Process -Id $evProc.Id -Force -ErrorAction SilentlyContinue }
+            $evLines = @(); if (Test-Path -LiteralPath $evOut) { $evLines = @((Read-FileShared $evOut) -split "`r?`n" | Where-Object { $_ }) }
+            $H['events_total_lines'] = $evLines.Count
+            $H['events_proc_count_high'] = @($evLines | Where-Object { $_ -match 'proc_count_high' }).Count
+            $H['events_watchdog_lines'] = @($evLines | Where-Object { $_ -match 'watchdog\.' } | Select-Object -First 8 | ForEach-Object { Limit-Text $_ 200 })
+            $H['events_names_seen'] = @($evLines | ForEach-Object { $m = [regex]::Match($_, '"name"\s*:\s*"([^"]+)"'); if ($m.Success) { $m.Groups[1].Value } } | Group-Object | Sort-Object Count -Descending | Select-Object -First 15 | ForEach-Object { '{0} x{1}' -f $_.Name, $_.Count })
+            $H['events_sample_head'] = @($evLines | Select-Object -First 2 | ForEach-Object { Limit-Text $_ 200 })
+        } catch { $H['events_error'] = $_.Exception.Message }
         try {
             if (Test-Path -LiteralPath $logF) {
                 $all = @((Read-FileShared $logF) -split "`r?`n")
