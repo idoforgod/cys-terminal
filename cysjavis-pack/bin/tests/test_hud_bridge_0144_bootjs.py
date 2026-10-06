@@ -25,10 +25,11 @@ function makeEnv(opt) {
   let now = 0, seq = 0; const timers = [];
   const hrefs = [];
   const store = {};
-  const body = { children: [], appendChild(c) { this.children.push(c); return c; } };
+  const body = { children: [], appendChild(c) { c.parentNode = this; this.children.push(c); return c; },
+                removeChild(c) { const i = this.children.indexOf(c); if (i >= 0) this.children.splice(i, 1); c.parentNode = null; return c; } };
   function el() { return { style: {}, children: [], _t: '', setAttribute() {}, appendChild(c) { this.children.push(c); return c; },
                     set textContent(v) { this._t = v; }, get textContent() { return this._t; } }; }
-  const doc = { body, getElementById(id) { if (id === 'scene') return opt.down ? null : { style: { width: '800px' }, width: 800 }; return id === 'office-boot-banner' ? (body.children.find(c => c.id === id) || null) : null; },
+  const doc = { body, getElementById(id) { if (id === 'scene') return (opt.down && !(opt.upAt != null && now >= opt.upAt)) ? null : { style: { width: '800px' }, width: 800 }; return id === 'office-boot-banner' ? (body.children.find(c => c.id === id) || null) : null; },
                 querySelector() { return null; }, createElement() { return el(); }, addEventListener() {} };
   const listeners = {};
   const win = {
@@ -78,6 +79,20 @@ function makeEnv(opt) {
       delays.push(env.hrefs.length ? env.hrefs[0] : null);
     }
     out.delays = delays;
+  }
+  if (scenario === 'late') {
+    // 지연 로드: 4초에 화면이 정상으로 뜬다 → 3초 백스톱이 배너를 띄웠다가 1초 안에 지운다
+    const env = makeEnv({ down: true, upAt: 4000, iframe: true, fetch: async () => ({ status: 404 }) });
+    await env.advance(3100);
+    out.shown = env.body.children.length;
+    await env.advance(1500);                             // 4.6초 — 떴으니 배너가 사라져야 한다
+    out.afterUp = env.body.children.length;
+    await env.advance(60000);
+    out.hrefs = env.hrefs.length;                        // 떴으니 다시 불러오기도 없다
+    // 끝까지 안 뜨는 경우는 배너가 그대로 남는다(지우는 코드가 정상 신호에만 반응)
+    const env2 = makeEnv({ down: true, iframe: true, fetch: async () => ({ status: 404 }) });
+    await env2.advance(5000);
+    out.stillDown = env2.body.children.length;
   }
   if (scenario === 'health') {
     let ids = ['aaa', 'aaa', 'bbb'];
@@ -144,6 +159,13 @@ class BootJs(unittest.TestCase):
         self.assertEqual(got, want)
         self.assertIsNone(o["delays"][5], "여섯 번째(ob_retry=5)부터는 새로 고침이 없다 — 정확히 5회에서 멈춤")
         self.assertEqual(o["finalBanner"][0], "오피스 화면을 불러오지 못했습니다.", "멈춘 뒤에는 '자동으로 다시 시도' 문구가 없다")
+
+    def test_late_success_clears_banner(self):
+        o = run("late")
+        self.assertEqual(o["shown"], 1, "3초 백스톱이 배너를 띄운다")
+        self.assertEqual(o["afterUp"], 0, "4초에 화면이 정상으로 뜨면 배너가 사라진다(리뷰 M3)")
+        self.assertEqual(o["hrefs"], 0, "뜬 화면은 다시 불러오지 않는다")
+        self.assertEqual(o["stillDown"], 1, "끝까지 안 뜨면 배너는 남는다")
 
     def test_health_boot_id_change_refreshes_once(self):
         o = run("health")

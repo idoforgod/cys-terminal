@@ -126,6 +126,14 @@
     describe(failedUrl, function (line) { detail.textContent = line; });
   }
 
+  // 화면이 뒤늦게라도 정상으로 뜨면 배너를 지운다(느린 PC·부하 중에 3초를 넘겨 뜬 경우 정상 화면 위에 실패 문구가 남지 않게).
+  function clearBannerIfUp() {
+    if (!threeIsUp()) return;
+    var b = document.getElementById(BANNER_ID);
+    if (b && b.parentNode) b.parentNode.removeChild(b);
+  }
+  setInterval(clearBannerIfUp, 1000);
+
   // 빠른 경로: 모듈/자산 로드 실패 포착. 리소스 로드 에러는 window.onerror로
   // 버블하지 않으므로 캡처 단계 리스너로 잡는다(three.module.js 404 포함).
   // 리소스 로드 에러는 message가 없다 — 런타임 예외(message 有)와 구별해
