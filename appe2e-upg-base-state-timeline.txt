@@ -1,0 +1,13 @@
+# base state: waiting (every 3 s, at most 120 s) for a cysd.exe of the install folder AND a committed pack (.pack-version); start 2026-10-06T14:31:07.062Z
+[   0s 2026-10-06T14:31:07.212Z] cysd=[pid 2492 (parent 2136, created 2026-10-06T14:31:05.465Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=55 version=
+[   3s 2026-10-06T14:31:10.316Z] cysd=[pid 2492 (parent 2136, created 2026-10-06T14:31:05.465Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=166 version=
+[   6s 2026-10-06T14:31:13.420Z] cysd=[pid 2492 (parent 2136, created 2026-10-06T14:31:05.465Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=401 version=
+[   9s 2026-10-06T14:31:16.576Z] cysd=[pid 2492 (parent 2136, created 2026-10-06T14:31:05.465Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=646 version=
+[  13s 2026-10-06T14:31:19.745Z] cysd=[pid 2492 (parent 2136, created 2026-10-06T14:31:05.465Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=75 version=0.14.43
+# end: a daemon runs and the pack is committed
+[settle +  0s 2026-10-06T14:31:19.792Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[.pack-staging-init-472] gui-onboarded=none onboard-attempts=none busy=[cys.exe#472 init-pack] missing=4
+[settle +  2s 2026-10-06T14:31:21.858Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[.pack-staging-init-472] gui-onboarded=none onboard-attempts=none busy=[cys.exe#472 init-pack] missing=4
+[settle +  4s 2026-10-06T14:31:23.922Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[.pack-staging-init-10360] gui-onboarded=0.14.43 onboard-attempts=none busy=[cys.exe#10360 init-pack --no-install-hook] missing=3
+[settle +  6s 2026-10-06T14:31:25.986Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[.pack-staging-init-10360] gui-onboarded=0.14.43 onboard-attempts=none busy=[cys.exe#10360 init-pack --no-install-hook] missing=3
+[settle +  8s 2026-10-06T14:31:28.037Z] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[] gui-onboarded=0.14.43 onboard-attempts=none busy=[] missing=0
+# settled=True after +8 s; missing: 

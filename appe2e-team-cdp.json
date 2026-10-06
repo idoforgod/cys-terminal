@@ -1,0 +1,2172 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "uiteam",
+  "port": 9333,
+  "started": "2026-10-06T14:33:49.888Z",
+  "finished": "2026-10-06T14:39:58.747Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "cys — CYSJavis Terminal",
+      "url": "http://tauri.localhost/",
+      "id": "6D1689DC08BDCA4DBE917CDEBA3292D7"
+    }
+  ],
+  "chosen_target": {
+    "url": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "id": "6D1689DC08BDCA4DBE917CDEBA3292D7"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.44",
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": null,
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 0,
+    "progress_count": 0,
+    "progress_first": null,
+    "progress_last": null,
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-06T14:33:49.889Z",
+      "name": "start",
+      "argv": "--mode uiteam --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-team --max-wait-sec 300 --team-observe-sec 360 --team-ready-wait-sec 150",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-06T14:33:49.916Z",
+      "name": "targets",
+      "count": 1,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-06T14:33:49.931Z",
+      "name": "connected",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-06T14:33:49.937Z",
+      "name": "attached",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "id": "6D1689DC08BDCA4DBE917CDEBA3292D7"
+    },
+    {
+      "t": "2026-10-06T14:33:49.946Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-06T14:33:49.969Z",
+      "name": "app_version",
+      "value": "0.14.44"
+    },
+    {
+      "t": "2026-10-06T14:33:49.973Z",
+      "name": "team: wait for the UI (a workspace tab and a pane drawn)",
+      "ready_ms": 150000
+    },
+    {
+      "t": "2026-10-06T14:33:56.081Z",
+      "name": "team: listeners",
+      "dept-create-progress": "ok",
+      "daemon-event": "ok"
+    },
+    {
+      "t": "2026-10-06T14:33:56.144Z",
+      "name": "team: open the expert section (click on its toggle)"
+    },
+    {
+      "t": "2026-10-06T14:33:56.226Z",
+      "name": "team: click the team button"
+    },
+    {
+      "t": "2026-10-06T14:33:56.818Z",
+      "name": "team: confirm window",
+      "title": "팀 만들기 확인",
+      "buttons": [
+        "취소",
+        "만들기"
+      ]
+    },
+    {
+      "t": "2026-10-06T14:33:56.950Z",
+      "name": "team: execute button clicked",
+      "method": "mouse",
+      "at": "2026-10-06T14:33:56.854Z"
+    },
+    {
+      "t": "2026-10-06T14:33:56.958Z",
+      "name": "team: observing",
+      "observe_ms": 360000
+    },
+    {
+      "t": "2026-10-06T14:39:57.421Z",
+      "name": "team: observation ended",
+      "reason": "observation window elapsed (360 s)",
+      "tab_created": true
+    },
+    {
+      "t": "2026-10-06T14:39:57.501Z",
+      "name": "team: seats",
+      "ok": true,
+      "count": 1,
+      "roles": [
+        "master"
+      ]
+    },
+    {
+      "t": "2026-10-06T14:39:58.739Z",
+      "name": "team: alarms",
+      "ok": true,
+      "count": 7,
+      "note": null
+    }
+  ],
+  "errors": [],
+  "ui": {
+    "mode": "uiteam",
+    "stage": "done",
+    "ready": {
+      "ok": true,
+      "waited_ms": 6081
+    },
+    "clicks": [
+      {
+        "label": "expert toggle",
+        "t": "2026-10-06T14:33:56.148Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 107.5,
+          "y": 732.3046875,
+          "w": 195,
+          "h": 21.390625,
+          "hit": true,
+          "top": "SPAN.expert-label",
+          "el": "BUTTON#btn-expert-toggle",
+          "text": "▸전문가용",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      },
+      {
+        "label": "team entry button",
+        "t": "2026-10-06T14:33:56.230Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 115.5,
+          "y": 727,
+          "w": 179,
+          "h": 28,
+          "hit": true,
+          "top": "BUTTON#btn-ws-dept",
+          "el": "BUTTON#btn-ws-dept",
+          "text": "팀 직접 만들기",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      },
+      {
+        "label": "team confirm yes",
+        "t": "2026-10-06T14:33:56.854Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 684.5,
+          "y": 513.375,
+          "w": 73,
+          "h": 33,
+          "hit": true,
+          "top": "BUTTON.modal-yes",
+          "el": "BUTTON.modal-yes",
+          "text": "만들기",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      },
+      {
+        "label": "cc button",
+        "t": "2026-10-06T14:39:57.509Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 643.09375,
+          "y": 18.5,
+          "w": 119.375,
+          "h": 22,
+          "hit": true,
+          "top": "BUTTON#btn-cc",
+          "el": "BUTTON#btn-cc",
+          "text": "Control Center 2",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      },
+      {
+        "label": "cc alarms tab",
+        "t": "2026-10-06T14:39:57.645Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 692.359375,
+          "y": 115.5,
+          "w": 75.46875,
+          "h": 35,
+          "hit": true,
+          "top": "BUTTON.cc-tab",
+          "el": "BUTTON.cc-tab",
+          "text": "🔔 알람",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      },
+      {
+        "label": "cc close",
+        "t": "2026-10-06T14:39:58.656Z",
+        "method": "mouse",
+        "ok": true,
+        "find": {
+          "found": true,
+          "x": 981.15625,
+          "y": 64,
+          "w": 23.6875,
+          "h": 22,
+          "hit": true,
+          "top": "BUTTON#btn-cc-close",
+          "el": "BUTTON#btn-cc-close",
+          "text": "×",
+          "disabled": false,
+          "vw": 1028,
+          "vh": 749
+        }
+      }
+    ],
+    "states": [],
+    "shots": [
+      {
+        "name": "ready",
+        "file": "appe2e-team-ui-ready.png",
+        "t": "2026-10-06T14:33:56.143Z",
+        "bytes": 42680
+      },
+      {
+        "name": "confirm",
+        "file": "appe2e-team-ui-confirm.png",
+        "t": "2026-10-06T14:33:56.853Z",
+        "bytes": 75016
+      },
+      {
+        "name": "after-click",
+        "file": "appe2e-team-ui-after-click.png",
+        "t": "2026-10-06T14:33:59.049Z",
+        "bytes": 34688
+      },
+      {
+        "name": "first-stage",
+        "file": "appe2e-team-ui-first-stage.png",
+        "t": "2026-10-06T14:33:59.112Z",
+        "bytes": 34676
+      },
+      {
+        "name": "new-tab",
+        "file": "appe2e-team-ui-new-tab.png",
+        "t": "2026-10-06T14:34:44.510Z",
+        "bytes": 53564
+      },
+      {
+        "name": "end",
+        "file": "appe2e-team-ui-end.png",
+        "t": "2026-10-06T14:39:57.487Z",
+        "bytes": 45152
+      },
+      {
+        "name": "alarms",
+        "file": "appe2e-team-ui-alarms.png",
+        "t": "2026-10-06T14:39:58.655Z",
+        "bytes": 78668
+      }
+    ],
+    "button_flow_complete": false,
+    "fallback_invoke": false,
+    "observe": null
+  },
+  "team": {
+    "stage": "done",
+    "params": {
+      "observe_ms": 360000,
+      "ready_ms": 150000,
+      "settle_ms": 6000,
+      "react_ms": 60000,
+      "fail_grace_ms": 20000
+    },
+    "last": {
+      "t": 1791297597643,
+      "title": "cys — CYSJavis Terminal",
+      "daemon_info": "daemon pid=2492 sock=\\\\.\\pipe\\cys",
+      "toggle": {
+        "exists": true,
+        "visible": true,
+        "expanded": "true"
+      },
+      "entry": {
+        "exists": true,
+        "visible": true,
+        "disabled": false,
+        "text": "팀 직접 만들기"
+      },
+      "tabs": [
+        {
+          "id": "2",
+          "name": "non title",
+          "sub": "1 pane · C:\\Users\\runneradmin\\ · 상태 미확인",
+          "active": false,
+          "busy": false
+        },
+        {
+          "id": "4",
+          "name": "dept-1",
+          "sub": "1 pane · C:\\Users\\runneradmin\\ · 💤1 · 미등록 1",
+          "active": true,
+          "busy": false
+        }
+      ],
+      "tab_count": 2,
+      "root": {
+        "kind": "panes",
+        "msg": "",
+        "stage": "",
+        "idle_btn": "",
+        "pane_count": 1,
+        "role_slots": 0,
+        "pane_titles": [
+          "C:\\Users\\runneradmin\\"
+        ]
+      },
+      "confirm": null,
+      "menu": null,
+      "overlays": 0,
+      "toasts": [],
+      "cc_open": true
+    },
+    "polls": 368,
+    "timeline": [
+      {
+        "t": 1791297229992,
+        "ms_entry": null,
+        "ms_create": null,
+        "kind": "tabs",
+        "count": 1,
+        "names": [
+          "non title"
+        ],
+        "added": [
+          "non title"
+        ],
+        "removed": [],
+        "active": "non title"
+      },
+      {
+        "t": 1791297229992,
+        "ms_entry": null,
+        "ms_create": null,
+        "kind": "root",
+        "root": {
+          "kind": "panes",
+          "msg": "",
+          "stage": "",
+          "idle_btn": "",
+          "pane_count": 1,
+          "role_slots": 0,
+          "pane_titles": [
+            "C:\\Users\\runneradmin\\"
+          ]
+        }
+      },
+      {
+        "t": 1791297229992,
+        "ms_entry": null,
+        "ms_create": null,
+        "kind": "entry",
+        "entry": {
+          "exists": true,
+          "visible": false,
+          "disabled": false,
+          "text": "팀 직접 만들기"
+        }
+      },
+      {
+        "t": 1791297229992,
+        "ms_entry": null,
+        "ms_create": null,
+        "kind": "toggle",
+        "toggle": {
+          "exists": true,
+          "visible": true,
+          "expanded": "false"
+        }
+      },
+      {
+        "t": 1791297229992,
+        "ms_entry": null,
+        "ms_create": null,
+        "kind": "daemon_info",
+        "text": "daemon pid=2492 sock=\\\\.\\pipe\\cys"
+      },
+      {
+        "t": 1791297236224,
+        "ms_entry": null,
+        "ms_create": null,
+        "kind": "entry",
+        "entry": {
+          "exists": true,
+          "visible": true,
+          "disabled": false,
+          "text": "팀 직접 만들기"
+        }
+      },
+      {
+        "t": 1791297236224,
+        "ms_entry": null,
+        "ms_create": null,
+        "kind": "toggle",
+        "toggle": {
+          "exists": true,
+          "visible": true,
+          "expanded": "true"
+        }
+      },
+      {
+        "t": 1791297236816,
+        "ms_entry": 587,
+        "ms_create": null,
+        "kind": "confirm_open",
+        "title": "팀 만들기 확인",
+        "body": "만들 팀: 새 번호 팀 — 예상 이름 dept-1 (만들 때 확정)\n자리: 최대 5개 — 부서장 1 + 팀원 최대 4(CSO·워커·검토 2). 부서장 자리가 먼저 뜨고, 팀원 자리는 필요한 프로그램(claude·agy·codex)이 설치돼 있으면 자동으로 채워집니다.\n작업 폴더: 홈 폴더(따로 지정하지 않은 경우)\n계정: 기본 계정의 팀 전용 설정 폴더를 새로 씁니다 — 처음 한 번 로그인이 필요할 수 있습니다.\n본부 대표: CEO 역할로 바뀝니다 (본부 대표가 아직 시작 전이면 나중에 명령 팔레트에서 승인합니다. 팀이 0개가 되면 되돌아갑니다.)\n\n[취소]를 누르면 아무것도 만들지 않습니다.",
+        "buttons": [
+          {
+            "text": "취소",
+            "cls": "modal-no",
+            "disabled": false
+          },
+          {
+            "text": "만들기",
+            "cls": "modal-yes",
+            "disabled": false
+          }
+        ]
+      },
+      {
+        "t": 1791297236956,
+        "ms_entry": 727,
+        "ms_create": 102,
+        "kind": "tabs",
+        "count": 1,
+        "names": [
+          "non title"
+        ],
+        "added": [],
+        "removed": [],
+        "active": ""
+      },
+      {
+        "t": 1791297236956,
+        "ms_entry": 727,
+        "ms_create": 102,
+        "kind": "root",
+        "root": {
+          "kind": "pending",
+          "msg": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 0초",
+          "stage": "",
+          "idle_btn": "",
+          "pane_count": 0,
+          "role_slots": 0,
+          "pane_titles": []
+        }
+      },
+      {
+        "t": 1791297236956,
+        "ms_entry": 727,
+        "ms_create": 102,
+        "kind": "entry",
+        "entry": {
+          "exists": true,
+          "visible": true,
+          "disabled": true,
+          "text": "만드는 중…"
+        }
+      },
+      {
+        "t": 1791297236956,
+        "ms_entry": 727,
+        "ms_create": 102,
+        "kind": "confirm_close",
+        "title": "팀 만들기 확인"
+      },
+      {
+        "t": 1791297238523,
+        "ms_entry": 2294,
+        "ms_create": 1669,
+        "kind": "stage_event",
+        "stage": "reserve",
+        "id": "dp-4",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"reserve\"}"
+      },
+      {
+        "t": 1791297238988,
+        "ms_entry": 2759,
+        "ms_create": 2134,
+        "kind": "root",
+        "root": {
+          "kind": "pending",
+          "msg": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 2초",
+          "stage": "지금: 팀 번호를 잡는 중",
+          "idle_btn": "",
+          "pane_count": 0,
+          "role_slots": 0,
+          "pane_titles": []
+        }
+      },
+      {
+        "t": 1791297240770,
+        "ms_entry": 4541,
+        "ms_create": 3916,
+        "kind": "stage_event",
+        "stage": "probe",
+        "id": "dp-4",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"probe\"}"
+      },
+      {
+        "t": 1791297241143,
+        "ms_entry": 4914,
+        "ms_create": 4289,
+        "kind": "root",
+        "root": {
+          "kind": "pending",
+          "msg": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 4초",
+          "stage": "지금: 이미 켜진 데몬이 있는지 확인하는 중(보통 10~30초 · 느린 컴퓨터는 더 걸립니다)",
+          "idle_btn": "",
+          "pane_count": 0,
+          "role_slots": 0,
+          "pane_titles": []
+        }
+      },
+      {
+        "t": 1791297271161,
+        "ms_entry": 34932,
+        "ms_create": 34307,
+        "kind": "stage_event",
+        "stage": "spawn",
+        "id": "dp-4",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"spawn\"}"
+      },
+      {
+        "t": 1791297271473,
+        "ms_entry": 35244,
+        "ms_create": 34619,
+        "kind": "stage_event",
+        "stage": "wait",
+        "id": "dp-4",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"wait\"}"
+      },
+      {
+        "t": 1791297271579,
+        "ms_entry": 35350,
+        "ms_create": 34725,
+        "kind": "root",
+        "root": {
+          "kind": "pending",
+          "msg": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 34초",
+          "stage": "지금: 데몬이 팩을 설치하는 중(파일 수백 개)",
+          "idle_btn": "",
+          "pane_count": 0,
+          "role_slots": 0,
+          "pane_titles": []
+        }
+      },
+      {
+        "t": 1791297280131,
+        "ms_entry": 43902,
+        "ms_create": 43277,
+        "kind": "stage_event",
+        "stage": "up",
+        "id": "dp-4",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"up\"}"
+      },
+      {
+        "t": 1791297280677,
+        "ms_entry": 44448,
+        "ms_create": 43823,
+        "kind": "root",
+        "root": {
+          "kind": "pending",
+          "msg": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 43초",
+          "stage": "지금: 데몬이 켜졌습니다 — 설정을 심는 중",
+          "idle_btn": "",
+          "pane_count": 0,
+          "role_slots": 0,
+          "pane_titles": []
+        }
+      },
+      {
+        "t": 1791297281346,
+        "ms_entry": 45117,
+        "ms_create": 44492,
+        "kind": "daemon_event",
+        "name": "feed.item.created",
+        "category": "feed",
+        "event_kind": "ceo-notice",
+        "title": "CEO 승격 보류(부트 필요)",
+        "body": "부서가 생성되었으나 base master가 아직 부트되지 않았습니다. base에서 '너는 마스터다' 또는 '마스터 시작' 버튼으로 부트를 완료하면 명령 팔레트의 'CEO 승격 진행'으로 승인할 수 있습니다."
+      },
+      {
+        "t": 1791297281700,
+        "ms_entry": 45471,
+        "ms_create": 44846,
+        "kind": "toast_new",
+        "cls": "toast feed",
+        "name": "ℹ 알림",
+        "detail": "CEO 승격 보류(부트 필요)"
+      },
+      {
+        "t": 1791297281802,
+        "ms_entry": 45573,
+        "ms_create": 44948,
+        "kind": "stage_event",
+        "stage": "seat",
+        "id": "dp-4",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"seat\"}"
+      },
+      {
+        "t": 1791297282707,
+        "ms_entry": 46478,
+        "ms_create": 45853,
+        "kind": "root",
+        "root": {
+          "kind": "pending",
+          "msg": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 45초",
+          "stage": "지금: 부서장 자리를 여는 중",
+          "idle_btn": "",
+          "pane_count": 0,
+          "role_slots": 0,
+          "pane_titles": []
+        }
+      },
+      {
+        "t": 1791297283374,
+        "ms_entry": 47145,
+        "ms_create": 46520,
+        "kind": "stage_event",
+        "stage": "done",
+        "id": "dp-4",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"done\"}"
+      },
+      {
+        "t": 1791297283723,
+        "ms_entry": 47494,
+        "ms_create": 46869,
+        "kind": "tabs",
+        "count": 2,
+        "names": [
+          "non title",
+          "dept-1"
+        ],
+        "added": [
+          "dept-1"
+        ],
+        "removed": [],
+        "active": "dept-1"
+      },
+      {
+        "t": 1791297283723,
+        "ms_entry": 47494,
+        "ms_create": 46869,
+        "kind": "root",
+        "root": {
+          "kind": "panes",
+          "msg": "",
+          "stage": "",
+          "idle_btn": "",
+          "pane_count": 1,
+          "role_slots": 0,
+          "pane_titles": [
+            "…"
+          ]
+        }
+      },
+      {
+        "t": 1791297283723,
+        "ms_entry": 47494,
+        "ms_create": 46869,
+        "kind": "entry",
+        "entry": {
+          "exists": true,
+          "visible": true,
+          "disabled": false,
+          "text": "팀 직접 만들기"
+        }
+      },
+      {
+        "t": 1791297283723,
+        "ms_entry": 47494,
+        "ms_create": 46869,
+        "kind": "toast_new",
+        "cls": "toast feed",
+        "name": "팀원을 켜는 중",
+        "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 미만"
+      },
+      {
+        "t": 1791297284667,
+        "ms_entry": 48438,
+        "ms_create": 47813,
+        "kind": "daemon_event",
+        "name": "feed.item.created",
+        "category": "feed",
+        "event_kind": "formation-pending",
+        "title": "부서 팀 편성 대기(CLI 미설치)",
+        "body": "claude CLI 미설치 — 빈 셸 master 자리는 유지됩니다(팀 없이도 마스터 단독 사용 가능). PowerShell: `irm https://claude.ai/install.ps1 | iex` 로 설치한 뒤 앱 재시작 또는 부서 재기동 시 편성이 이어집니다."
+      },
+      {
+        "t": 1791297285522,
+        "ms_entry": 49293,
+        "ms_create": 48668,
+        "kind": "root",
+        "root": {
+          "kind": "panes",
+          "msg": "",
+          "stage": "",
+          "idle_btn": "",
+          "pane_count": 1,
+          "role_slots": 0,
+          "pane_titles": [
+            "C:\\Users\\runneradmin\\"
+          ]
+        }
+      },
+      {
+        "t": 1791297285522,
+        "ms_entry": 49293,
+        "ms_create": 48668,
+        "kind": "toast_text",
+        "cls": "toast feed",
+        "name": "ℹ 알림",
+        "detail": "부서 팀 편성 대기(CLI 미설치)",
+        "prev_detail": "CEO 승격 보류(부트 필요)"
+      },
+      {
+        "t": 1791297286532,
+        "ms_entry": 50303,
+        "ms_create": 49678,
+        "kind": "toast_text",
+        "cls": "toast feed",
+        "name": "ℹ 알림",
+        "detail": "CEO 승격 보류(부트 필요)",
+        "prev_detail": "부서 팀 편성 대기(CLI 미설치)"
+      },
+      {
+        "t": 1791297287542,
+        "ms_entry": 51313,
+        "ms_create": 50688,
+        "kind": "tab_sub",
+        "id": "4",
+        "name": "dept-1",
+        "sub": "1 pane · C:\\Users\\runneradmin\\ · 미등록 1"
+      },
+      {
+        "t": 1791297287542,
+        "ms_entry": 51313,
+        "ms_create": 50688,
+        "kind": "toast_text",
+        "cls": "toast feed",
+        "name": "ℹ 알림",
+        "detail": "CEO 승격 보류(부트 필요)",
+        "prev_detail": "부서 팀 편성 대기(CLI 미설치)"
+      },
+      {
+        "t": 1791297288550,
+        "ms_entry": 52321,
+        "ms_create": 51696,
+        "kind": "toast_text",
+        "cls": "toast feed",
+        "name": "ℹ 알림",
+        "detail": "CEO 승격 보류(부트 필요)",
+        "prev_detail": "부서 팀 편성 대기(CLI 미설치)"
+      },
+      {
+        "t": 1791297293611,
+        "ms_entry": 57382,
+        "ms_create": 56757,
+        "kind": "toast_gone",
+        "cls": "toast feed",
+        "name": "ℹ 알림"
+      },
+      {
+        "t": 1791297345237,
+        "ms_entry": 109008,
+        "ms_create": 108383,
+        "kind": "toast_text",
+        "cls": "toast feed",
+        "name": "팀원을 켜는 중",
+        "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분",
+        "prev_detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 미만"
+      },
+      {
+        "t": 1791297347268,
+        "ms_entry": 111039,
+        "ms_create": 110414,
+        "kind": "tab_sub",
+        "id": "4",
+        "name": "dept-1",
+        "sub": "1 pane · C:\\Users\\runneradmin\\ · 💤1 · 미등록 1"
+      },
+      {
+        "t": 1791297406018,
+        "ms_entry": 169789,
+        "ms_create": 169164,
+        "kind": "toast_text",
+        "cls": "toast feed",
+        "name": "팀원을 켜는 중",
+        "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 2분",
+        "prev_detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분"
+      },
+      {
+        "t": 1791297465738,
+        "ms_entry": 229509,
+        "ms_create": 228884,
+        "kind": "toast_new",
+        "cls": "toast feed",
+        "name": "팀원 켜기 — 자리가 더 붙지 않습니다",
+        "detail": "3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 1개 · 경과 3분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요"
+      },
+      {
+        "t": 1791297465738,
+        "ms_entry": 229509,
+        "ms_create": 228884,
+        "kind": "toast_gone",
+        "cls": "toast feed",
+        "name": "팀원을 켜는 중"
+      },
+      {
+        "t": 1791297525519,
+        "ms_entry": 289290,
+        "ms_create": 288665,
+        "kind": "toast_gone",
+        "cls": "toast feed",
+        "name": "팀원 켜기 — 자리가 더 붙지 않습니다"
+      },
+      {
+        "t": 1791297586282,
+        "ms_entry": 350053,
+        "ms_create": 349428,
+        "kind": "toast_new",
+        "cls": "toast idle",
+        "name": "💤 노드 유휴",
+        "detail": "surface:1 — 302s 무출력"
+      },
+      {
+        "t": 1791297594377,
+        "ms_entry": 358148,
+        "ms_create": 357523,
+        "kind": "toast_gone",
+        "cls": "toast idle",
+        "name": "💤 노드 유휴"
+      },
+      {
+        "t": 1791297597643,
+        "ms_entry": 361414,
+        "ms_create": 360789,
+        "kind": "cc",
+        "open": true
+      }
+    ],
+    "timeline_dropped": 0,
+    "sub_events": 2,
+    "seen_before": {},
+    "entry_ms": 1791297236229,
+    "entry_at": "2026-10-06T14:33:56.229Z",
+    "create_ms": 1791297236854,
+    "create_at": "2026-10-06T14:33:56.854Z",
+    "create_click_ok": true,
+    "observe_end_ms": 1791297597421,
+    "observe_end_reason": "observation window elapsed (360 s)",
+    "tab_ids_before": [
+      "2"
+    ],
+    "tab_names_before": [
+      "non title"
+    ],
+    "tab_count_before": 1,
+    "tab_ms": 1791297283723,
+    "tab_id": "4",
+    "tab_name": "dept-1",
+    "pending_seen": true,
+    "pending_first_ms": 102,
+    "busy_seen": true,
+    "stage_texts": [
+      {
+        "ms": 2134,
+        "text": "지금: 팀 번호를 잡는 중"
+      },
+      {
+        "ms": 4289,
+        "text": "지금: 이미 켜진 데몬이 있는지 확인하는 중(보통 10~30초 · 느린 컴퓨터는 더 걸립니다)"
+      },
+      {
+        "ms": 34725,
+        "text": "지금: 데몬이 팩을 설치하는 중(파일 수백 개)"
+      },
+      {
+        "ms": 43823,
+        "text": "지금: 데몬이 켜졌습니다 — 설정을 심는 중"
+      },
+      {
+        "ms": 45853,
+        "text": "지금: 부서장 자리를 여는 중"
+      }
+    ],
+    "pending_samples": [
+      {
+        "ms_create": 102,
+        "msg": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 0초",
+        "stage": ""
+      },
+      {
+        "ms_create": 15450,
+        "msg": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 15초",
+        "stage": "지금: 이미 켜진 데몬이 있는지 확인하는 중(보통 10~30초 · 느린 컴퓨터는 더 걸립니다)"
+      },
+      {
+        "ms_create": 30660,
+        "msg": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 30초",
+        "stage": "지금: 이미 켜진 데몬이 있는지 확인하는 중(보통 10~30초 · 느린 컴퓨터는 더 걸립니다)"
+      },
+      {
+        "ms_create": 45853,
+        "msg": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 45초",
+        "stage": "지금: 부서장 자리를 여는 중"
+      }
+    ],
+    "pending_norms": {
+      "팀을 만드는 중입니다 — 보통 N초 안팎, 컴퓨터에 따라 N분 넘게 걸릴 수 있어요 · 경과 N초": true
+    },
+    "last_pending_sample_t": 1791297282707,
+    "stage_events": [
+      {
+        "t": 1791297238523,
+        "ms_create": 1669,
+        "id": "dp-4",
+        "stage": "reserve",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"reserve\"}"
+      },
+      {
+        "t": 1791297240770,
+        "ms_create": 3916,
+        "id": "dp-4",
+        "stage": "probe",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"probe\"}"
+      },
+      {
+        "t": 1791297271161,
+        "ms_create": 34307,
+        "id": "dp-4",
+        "stage": "spawn",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"spawn\"}"
+      },
+      {
+        "t": 1791297271473,
+        "ms_create": 34619,
+        "id": "dp-4",
+        "stage": "wait",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"wait\"}"
+      },
+      {
+        "t": 1791297280131,
+        "ms_create": 43277,
+        "id": "dp-4",
+        "stage": "up",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"up\"}"
+      },
+      {
+        "t": 1791297281802,
+        "ms_create": 44948,
+        "id": "dp-4",
+        "stage": "seat",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"seat\"}"
+      },
+      {
+        "t": 1791297283374,
+        "ms_create": 46520,
+        "id": "dp-4",
+        "stage": "done",
+        "raw": "{\"id\":\"dp-4\",\"stage\":\"done\"}"
+      }
+    ],
+    "daemon_events": [
+      {
+        "t": 1791297251487,
+        "ms_create": 14633,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297251487,
+        "ms_create": 14633,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297281346,
+        "ms_create": 44492,
+        "name": "feed.item.created",
+        "category": "feed",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": "ceo-notice",
+        "title": "CEO 승격 보류(부트 필요)",
+        "body": "부서가 생성되었으나 base master가 아직 부트되지 않았습니다. base에서 '너는 마스터다' 또는 '마스터 시작' 버튼으로 부트를 완료하면 명령 팔레트의 'CEO 승격 진행'으로 승인할 수 있습니다."
+      },
+      {
+        "t": 1791297284667,
+        "ms_create": 47813,
+        "name": "feed.item.created",
+        "category": "feed",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": "formation-pending",
+        "title": "부서 팀 편성 대기(CLI 미설치)",
+        "body": "claude CLI 미설치 — 빈 셸 master 자리는 유지됩니다(팀 없이도 마스터 단독 사용 가능). PowerShell: `irm https://claude.ai/install.ps1 | iex` 로 설치한 뒤 앱 재시작 또는 부서 재기동 시 편성이 이어집니다."
+      },
+      {
+        "t": 1791297310556,
+        "ms_create": 73702,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "ef41bb88c6fd5cd4",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297310873,
+        "ms_create": 74019,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297310873,
+        "ms_create": 74019,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297370655,
+        "ms_create": 133801,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297370656,
+        "ms_create": 133802,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297371870,
+        "ms_create": 135016,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "ef41bb88c6fd5cd4",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297371871,
+        "ms_create": 135017,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "ef41bb88c6fd5cd4",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297429509,
+        "ms_create": 192655,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297429510,
+        "ms_create": 192656,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297430651,
+        "ms_create": 193797,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297430651,
+        "ms_create": 193797,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297431827,
+        "ms_create": 194973,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "ef41bb88c6fd5cd4",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297431827,
+        "ms_create": 194973,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "ef41bb88c6fd5cd4",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297490692,
+        "ms_create": 253838,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297490692,
+        "ms_create": 253838,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297491879,
+        "ms_create": 255025,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "ef41bb88c6fd5cd4",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297491879,
+        "ms_create": 255025,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "ef41bb88c6fd5cd4",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297550716,
+        "ms_create": 313862,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297550716,
+        "ms_create": 313862,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297551858,
+        "ms_create": 315004,
+        "name": "schedule.command_done",
+        "category": "schedule",
+        "slug": "ef41bb88c6fd5cd4",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297551858,
+        "ms_create": 315004,
+        "name": "schedule.fired",
+        "category": "schedule",
+        "slug": "ef41bb88c6fd5cd4",
+        "sid": null,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297584575,
+        "ms_create": 347721,
+        "name": "feed.item.aging",
+        "category": "feed",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": "CEO 승격 보류(부트 필요)",
+        "body": null
+      },
+      {
+        "t": 1791297585634,
+        "ms_create": 348780,
+        "name": "pane.idle",
+        "category": "watchdog",
+        "slug": "ef41bb88c6fd5cd4",
+        "sid": 1,
+        "kind": null,
+        "title": null,
+        "body": null
+      },
+      {
+        "t": 1791297589578,
+        "ms_create": 352724,
+        "name": "feed.item.aging",
+        "category": "feed",
+        "slug": "7388b52dbfb962da",
+        "sid": null,
+        "kind": null,
+        "title": "부서 팀 편성 대기(CLI 미설치)",
+        "body": null
+      }
+    ],
+    "event_counts": {
+      "dept-create-progress": 7,
+      "daemon-event:schedule.command_done": 11,
+      "daemon-event:schedule.fired": 12,
+      "daemon-event:feed.item.created": 2,
+      "daemon-event:feed.item.aging": 2,
+      "daemon-event:pane.idle": 1
+    },
+    "ev_cursor": 35,
+    "confirm": {
+      "title": "팀 만들기 확인",
+      "body": "만들 팀: 새 번호 팀 — 예상 이름 dept-1 (만들 때 확정)\n자리: 최대 5개 — 부서장 1 + 팀원 최대 4(CSO·워커·검토 2). 부서장 자리가 먼저 뜨고, 팀원 자리는 필요한 프로그램(claude·agy·codex)이 설치돼 있으면 자동으로 채워집니다.\n작업 폴더: 홈 폴더(따로 지정하지 않은 경우)\n계정: 기본 계정의 팀 전용 설정 폴더를 새로 씁니다 — 처음 한 번 로그인이 필요할 수 있습니다.\n본부 대표: CEO 역할로 바뀝니다 (본부 대표가 아직 시작 전이면 나중에 명령 팔레트에서 승인합니다. 팀이 0개가 되면 되돌아갑니다.)\n\n[취소]를 누르면 아무것도 만들지 않습니다.",
+      "buttons": [
+        {
+          "text": "취소",
+          "cls": "modal-no",
+          "disabled": false
+        },
+        {
+          "text": "만들기",
+          "cls": "modal-yes",
+          "disabled": false
+        }
+      ],
+      "seen_at": "2026-10-06T14:33:56.818Z"
+    },
+    "menu": null,
+    "confirm_closed": true,
+    "ready": {
+      "ok": true,
+      "waited_ms": 6081,
+      "snapshot": {
+        "t": 1791297236069,
+        "title": "cys — CYSJavis Terminal",
+        "daemon_info": "daemon pid=2492 sock=\\\\.\\pipe\\cys",
+        "toggle": {
+          "exists": true,
+          "visible": true,
+          "expanded": "false"
+        },
+        "entry": {
+          "exists": true,
+          "visible": false,
+          "disabled": false,
+          "text": "팀 직접 만들기"
+        },
+        "tabs": [
+          {
+            "id": "2",
+            "name": "non title",
+            "sub": "1 pane · C:\\Users\\runneradmin\\ · 상태 미확인",
+            "active": true,
+            "busy": false
+          }
+        ],
+        "tab_count": 1,
+        "root": {
+          "kind": "panes",
+          "msg": "",
+          "stage": "",
+          "idle_btn": "",
+          "pane_count": 1,
+          "role_slots": 0,
+          "pane_titles": [
+            "C:\\Users\\runneradmin\\"
+          ]
+        },
+        "confirm": null,
+        "menu": null,
+        "overlays": 0,
+        "toasts": [],
+        "cc_open": false
+      }
+    },
+    "seats": {
+      "ok": true,
+      "count": 1,
+      "roles": [
+        "master"
+      ],
+      "surfaces": [
+        {
+          "ack_nonce_ok": false,
+          "ack_source": null,
+          "agent": null,
+          "agent_alive": null,
+          "alt_screen": false,
+          "awakened_at": null,
+          "boot_nonce_generation": null,
+          "claude_config_dir": "C:/Users/runneradmin/.cys/claude-default-dept-1",
+          "cmd": "powershell.exe",
+          "created_at": 1791297282.226966,
+          "created_by": null,
+          "cwd": "C:/Users/runneradmin",
+          "cwd_blocked": null,
+          "directive_verified": null,
+          "env_injected": false,
+          "exited": false,
+          "gate_pending": null,
+          "input_paste_open": false,
+          "line_count": 89,
+          "live_cwd": "C:\\Users\\runneradmin\\",
+          "pending_input_bytes": 0,
+          "pending_input_human_bytes": 0,
+          "pid": 5112,
+          "role": "master",
+          "seat": "empty",
+          "surface_id": 1,
+          "surface_ref": "surface:1",
+          "title": "surface 1",
+          "usage": null
+        }
+      ],
+      "raw": {
+        "surfaces": [
+          {
+            "ack_nonce_ok": false,
+            "ack_source": null,
+            "agent": null,
+            "agent_alive": null,
+            "alt_screen": false,
+            "awakened_at": null,
+            "boot_nonce_generation": null,
+            "claude_config_dir": "C:/Users/runneradmin/.cys/claude-default-dept-1",
+            "cmd": "powershell.exe",
+            "created_at": 1791297282.226966,
+            "created_by": null,
+            "cwd": "C:/Users/runneradmin",
+            "cwd_blocked": null,
+            "directive_verified": null,
+            "env_injected": false,
+            "exited": false,
+            "gate_pending": null,
+            "input_paste_open": false,
+            "line_count": 89,
+            "live_cwd": "C:\\Users\\runneradmin\\",
+            "pending_input_bytes": 0,
+            "pending_input_human_bytes": 0,
+            "pid": 5112,
+            "role": "master",
+            "seat": "empty",
+            "surface_id": 1,
+            "surface_ref": "surface:1",
+            "title": "surface 1",
+            "usage": null
+          }
+        ]
+      }
+    },
+    "alarms": {
+      "ok": true,
+      "note": null,
+      "items": [
+        {
+          "time": "07:39:45",
+          "category": "idle",
+          "id": null,
+          "title": "💤 노드 유휴",
+          "body": "surface:1 — 302s 무출력",
+          "cls": "alarm-item idle"
+        },
+        {
+          "time": "07:37:45",
+          "category": "feed",
+          "id": "dept-formation:\\\\.\\pipe\\cys-dept-dept-1",
+          "title": "팀원 켜기 — 자리가 더 붙지 않습니다",
+          "body": "3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 1개 · 경과 3분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요",
+          "cls": "alarm-item feed"
+        },
+        {
+          "time": "07:34:44",
+          "category": "feed",
+          "id": null,
+          "title": "ℹ 알림",
+          "body": "부서 팀 편성 대기(CLI 미설치)",
+          "cls": "alarm-item feed"
+        },
+        {
+          "time": "07:34:41",
+          "category": "feed",
+          "id": null,
+          "title": "ℹ 알림",
+          "body": "CEO 승격 보류(부트 필요)",
+          "cls": "alarm-item feed"
+        },
+        {
+          "time": "07:32:41",
+          "category": "watchdog",
+          "id": null,
+          "title": "✅ 직원 복귀 완료",
+          "body": "노드 세션 복원 완료 (부서 0).",
+          "cls": "alarm-item watchdog"
+        },
+        {
+          "time": "07:32:41",
+          "category": "feed",
+          "id": "restore",
+          "title": "👥 직원 복귀 중",
+          "body": "노드 세션 복원 중… (본부·부서)",
+          "cls": "alarm-item feed"
+        },
+        {
+          "time": "07:32:38",
+          "category": "health",
+          "id": "claude-missing",
+          "title": "Claude Code CLI가 없습니다",
+          "body": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+          "cls": "alarm-item health"
+        }
+      ]
+    },
+    "flow_error": null,
+    "recorder_installed": "already",
+    "listeners": {
+      "dept-create-progress": "ok",
+      "daemon-event": "ok"
+    },
+    "before_registry": {
+      "depts": {}
+    },
+    "before_catalog": {
+      "departments": {}
+    },
+    "before_dept_keys": [],
+    "toggle_click": {
+      "ok": true,
+      "method": "mouse",
+      "error": null
+    },
+    "entry_click": {
+      "ok": true,
+      "method": "mouse",
+      "error": null
+    },
+    "reaction": {
+      "ok": true,
+      "kind": "confirm",
+      "waited_ms": 517
+    },
+    "create_click": {
+      "ok": true,
+      "method": "mouse",
+      "error": null
+    },
+    "facts": {
+      "ready_ok": true,
+      "entry_found": true,
+      "entry_click_ok": true,
+      "entry_click_method": "mouse",
+      "toggle_click_method": "mouse",
+      "menu_seen": false,
+      "menu_picked": null,
+      "menu_click_ok": false,
+      "confirm_seen": true,
+      "confirm_title": "팀 만들기 확인",
+      "confirm_click_ok": true,
+      "confirm_click_method": "mouse",
+      "confirm_closed": true,
+      "any_dom_click": false,
+      "flow_started": true,
+      "pending_seen": true,
+      "pending_first_ms": 102,
+      "busy_button_seen": true,
+      "tab_created": true,
+      "tab_ms": 46869,
+      "tab_name": "dept-1",
+      "tab_id": "4",
+      "tab_count_before": 1,
+      "tab_names_before": [
+        "non title"
+      ],
+      "tab_count_after": 2,
+      "tab_names_after": [
+        "non title",
+        "dept-1"
+      ],
+      "rolled_back": false,
+      "failure_alert_count": 0,
+      "failure_alerts": [],
+      "post_creation_alert_count": 0,
+      "post_creation_alerts": [],
+      "other_new_toast_count": 4,
+      "stage_event_count": 7,
+      "stage_source": "event",
+      "observe_end_reason": "observation window elapsed (360 s)",
+      "flow_error": null
+    },
+    "reference": {
+      "stages": [
+        {
+          "stage": "reserve",
+          "at_s": 1.7,
+          "dur_s": 2.2
+        },
+        {
+          "stage": "probe",
+          "at_s": 3.9,
+          "dur_s": 30.4
+        },
+        {
+          "stage": "spawn",
+          "at_s": 34.3,
+          "dur_s": 0.3
+        },
+        {
+          "stage": "wait",
+          "at_s": 34.6,
+          "dur_s": 8.7
+        },
+        {
+          "stage": "up",
+          "at_s": 43.3,
+          "dur_s": 1.7
+        },
+        {
+          "stage": "seat",
+          "at_s": 44.9,
+          "dur_s": 1.6
+        },
+        {
+          "stage": "done",
+          "at_s": 46.5,
+          "dur_s": 0.3
+        }
+      ],
+      "stage_line": "reserve at 1.7s (2.2s) > probe at 3.9s (30.4s) > spawn at 34.3s (0.3s) > wait at 34.6s (8.7s) > up at 43.3s (1.7s) > seat at 44.9s (1.6s) > done at 46.5s (0.3s)",
+      "stage_source": "event",
+      "stage_texts": [
+        {
+          "ms": 2134,
+          "text": "지금: 팀 번호를 잡는 중"
+        },
+        {
+          "ms": 4289,
+          "text": "지금: 이미 켜진 데몬이 있는지 확인하는 중(보통 10~30초 · 느린 컴퓨터는 더 걸립니다)"
+        },
+        {
+          "ms": 34725,
+          "text": "지금: 데몬이 팩을 설치하는 중(파일 수백 개)"
+        },
+        {
+          "ms": 43823,
+          "text": "지금: 데몬이 켜졌습니다 — 설정을 심는 중"
+        },
+        {
+          "ms": 45853,
+          "text": "지금: 부서장 자리를 여는 중"
+        }
+      ],
+      "tab_line": "tab \"dept-1\" stood 46.9 s after the execute click (tabs 1 -> 2)",
+      "confirm": {
+        "title": "팀 만들기 확인",
+        "body_head": "만들 팀: 새 번호 팀 — 예상 이름 dept-1 (만들 때 확정)\n자리: 최대 5개 — 부서장 1 + 팀원 최대 4(CSO·워커·검토 2). 부서장 자리가 먼저 뜨고, 팀원 자리는 필요한 프로그램(claude·agy·codex)이 설치돼 있으면 자동으로 채워집니다.\n작업 폴더: 홈 폴더(따로 지정하지 않은 경우)\n계정: 기본 계정의 팀 전용 설정 폴더를 새로 씁니다 — 처음 한 번 로그인이 필요할 수 있습니다.\n본부 대표: CEO 역할로 바뀝니다 (본부 대표가 아직 시작 전이면 나중에 명령 팔레트에서 승인합니다. 팀이 0개가 되면 되돌아갑니다.)\n\n[취소]를 누르면 아무것도 만들지 않습니다.",
+        "buttons": [
+          "취소",
+          "만들기"
+        ]
+      },
+      "menu": null,
+      "pending_first_text": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 0초",
+      "pending_last_text": "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 45초",
+      "pending_text_variants": 1,
+      "post_creation_notices": [
+        {
+          "ms_create": 46869,
+          "kind": "toast_new",
+          "cls": "toast feed",
+          "name": "팀원을 켜는 중",
+          "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 미만"
+        },
+        {
+          "ms_create": 48668,
+          "kind": "toast_text",
+          "cls": "toast feed",
+          "name": "ℹ 알림",
+          "detail": "부서 팀 편성 대기(CLI 미설치)"
+        },
+        {
+          "ms_create": 49678,
+          "kind": "toast_text",
+          "cls": "toast feed",
+          "name": "ℹ 알림",
+          "detail": "CEO 승격 보류(부트 필요)"
+        },
+        {
+          "ms_create": 50688,
+          "kind": "toast_text",
+          "cls": "toast feed",
+          "name": "ℹ 알림",
+          "detail": "CEO 승격 보류(부트 필요)"
+        },
+        {
+          "ms_create": 51696,
+          "kind": "toast_text",
+          "cls": "toast feed",
+          "name": "ℹ 알림",
+          "detail": "CEO 승격 보류(부트 필요)"
+        },
+        {
+          "ms_create": 108383,
+          "kind": "toast_text",
+          "cls": "toast feed",
+          "name": "팀원을 켜는 중",
+          "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분"
+        },
+        {
+          "ms_create": 169164,
+          "kind": "toast_text",
+          "cls": "toast feed",
+          "name": "팀원을 켜는 중",
+          "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 2분"
+        },
+        {
+          "ms_create": 228884,
+          "kind": "toast_new",
+          "cls": "toast feed",
+          "name": "팀원 켜기 — 자리가 더 붙지 않습니다",
+          "detail": "3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 1개 · 경과 3분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요"
+        },
+        {
+          "ms_create": 349428,
+          "kind": "toast_new",
+          "cls": "toast idle",
+          "name": "💤 노드 유휴",
+          "detail": "surface:1 — 302s 무출력"
+        }
+      ],
+      "formation_line": "46.9s [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 미만 | 48.7s [toast feed] ℹ 알림 :: 부서 팀 편성 대기(CLI 미설치) | 49.7s [toast feed] ℹ 알림 :: CEO 승격 보류(부트 필요) | 50.7s [toast feed] ℹ 알림 :: CEO 승격 보류(부트 필요) | 51.7s [toast feed] ℹ 알림 :: CEO 승격 보류(부트 필요) | 108.4s [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 | 169.2s [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 2분 | 228.9s [toast feed] 팀원 켜기 — 자리가 더 붙지 않습니다 :: 3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 1개 · 경과 3분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요",
+      "seats": {
+        "ok": true,
+        "count": 1,
+        "roles": [
+          "master"
+        ],
+        "surfaces": [
+          {
+            "ack_nonce_ok": false,
+            "ack_source": null,
+            "agent": null,
+            "agent_alive": null,
+            "alt_screen": false,
+            "awakened_at": null,
+            "boot_nonce_generation": null,
+            "claude_config_dir": "C:/Users/runneradmin/.cys/claude-default-dept-1",
+            "cmd": "powershell.exe",
+            "created_at": 1791297282.226966,
+            "created_by": null,
+            "cwd": "C:/Users/runneradmin",
+            "cwd_blocked": null,
+            "directive_verified": null,
+            "env_injected": false,
+            "exited": false,
+            "gate_pending": null,
+            "input_paste_open": false,
+            "line_count": 89,
+            "live_cwd": "C:\\Users\\runneradmin\\",
+            "pending_input_bytes": 0,
+            "pending_input_human_bytes": 0,
+            "pid": 5112,
+            "role": "master",
+            "seat": "empty",
+            "surface_id": 1,
+            "surface_ref": "surface:1",
+            "title": "surface 1",
+            "usage": null
+          }
+        ],
+        "raw": {
+          "surfaces": [
+            {
+              "ack_nonce_ok": false,
+              "ack_source": null,
+              "agent": null,
+              "agent_alive": null,
+              "alt_screen": false,
+              "awakened_at": null,
+              "boot_nonce_generation": null,
+              "claude_config_dir": "C:/Users/runneradmin/.cys/claude-default-dept-1",
+              "cmd": "powershell.exe",
+              "created_at": 1791297282.226966,
+              "created_by": null,
+              "cwd": "C:/Users/runneradmin",
+              "cwd_blocked": null,
+              "directive_verified": null,
+              "env_injected": false,
+              "exited": false,
+              "gate_pending": null,
+              "input_paste_open": false,
+              "line_count": 89,
+              "live_cwd": "C:\\Users\\runneradmin\\",
+              "pending_input_bytes": 0,
+              "pending_input_human_bytes": 0,
+              "pid": 5112,
+              "role": "master",
+              "seat": "empty",
+              "surface_id": 1,
+              "surface_ref": "surface:1",
+              "title": "surface 1",
+              "usage": null
+            }
+          ]
+        }
+      },
+      "seats_line": "count=1 roles=[master]",
+      "event_counts": {
+        "dept-create-progress": 7,
+        "daemon-event:schedule.command_done": 11,
+        "daemon-event:schedule.fired": 12,
+        "daemon-event:feed.item.created": 2,
+        "daemon-event:feed.item.aging": 2,
+        "daemon-event:pane.idle": 1
+      },
+      "alarm_count": 7,
+      "alarm_id_count": 3,
+      "alarm_ids": [
+        {
+          "id": "dept-formation:\\\\.\\pipe\\cys-dept-dept-1",
+          "category": "feed",
+          "title": "팀원 켜기 — 자리가 더 붙지 않습니다"
+        },
+        {
+          "id": "restore",
+          "category": "feed",
+          "title": "👥 직원 복귀 중"
+        },
+        {
+          "id": "claude-missing",
+          "category": "health",
+          "title": "Claude Code CLI가 없습니다"
+        }
+      ],
+      "final_daemon_info": "daemon pid=2492 sock=\\\\.\\pipe\\cys",
+      "final_root": {
+        "kind": "panes",
+        "msg": "",
+        "stage": "",
+        "idle_btn": "",
+        "pane_count": 1,
+        "role_slots": 0,
+        "pane_titles": [
+          "C:\\Users\\runneradmin\\"
+        ]
+      }
+    },
+    "node_ok": true,
+    "node_missing": [],
+    "observe": {
+      "polls": 366,
+      "ms": 360567,
+      "socket_closed": false,
+      "socket_closed_at": null
+    },
+    "recorder": {
+      "events": [
+        {
+          "ev": "toast_appear",
+          "name": "Claude Code CLI가 없습니다",
+          "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+          "cls": "toast health",
+          "t": 1791297158366
+        },
+        {
+          "ev": "toast_appear",
+          "name": "👥 직원 복귀 중",
+          "detail": "노드 세션 복원 중… (본부·부서)",
+          "cls": "toast feed",
+          "t": 1791297161728
+        },
+        {
+          "ev": "toast_appear",
+          "name": "✅ 직원 복귀 완료",
+          "detail": "노드 세션 복원 완료 (부서 0).",
+          "cls": "toast watchdog",
+          "t": 1791297161857
+        },
+        {
+          "ev": "toast_gone",
+          "name": "👥 직원 복귀 중",
+          "t": 1791297161857
+        },
+        {
+          "ev": "toast_gone",
+          "name": "✅ 직원 복귀 완료",
+          "t": 1791297169870
+        },
+        {
+          "ev": "toast_gone",
+          "name": "Claude Code CLI가 없습니다",
+          "t": 1791297218371
+        },
+        {
+          "ev": "modal_open",
+          "cls": "modal-overlay confirm-overlay",
+          "title": "팀 만들기 확인",
+          "body": "만들 팀: 새 번호 팀 — 예상 이름 dept-1 (만들 때 확정)\n자리: 최대 5개 — 부서장 1 + 팀원 최대 4(CSO·워커·검토 2). 부서장 자리가 먼저 뜨고, 팀원 자리는 필요한 프로그램(claude·agy·codex)이 설치돼 있으면 자동으로 채워집니다.\n작업 폴더: 홈 폴더(따로 지정하지 않은 경우)\n계정: 기본 계정의 팀 전용 설정 폴더를 새로 씁니다 — 처음 한 번 로그인이 필요할 수 있습니다.\n본부 대표: CEO 역할로 바뀝니다 (본부 대표가 아직 시작 전이면 나중에 명령 팔레트에서 승인합니다. 팀이 0개가 되면 되돌아갑니다.)\n\n[취소]를 누르면 아무것도 만들지 않습니다.",
+          "buttons": [
+            "취소",
+            "만들기"
+          ],
+          "t": 1791297236389
+        },
+        {
+          "ev": "modal_close",
+          "cls": "modal-overlay confirm-overlay",
+          "title": "팀 만들기 확인",
+          "t": 1791297236939
+        },
+        {
+          "ev": "toast_appear",
+          "name": "ℹ 알림",
+          "detail": "CEO 승격 보류(부트 필요)",
+          "cls": "toast feed",
+          "t": 1791297281346
+        },
+        {
+          "ev": "toast_appear",
+          "name": "팀원을 켜는 중",
+          "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 0 · 경과 1분 미만",
+          "cls": "toast feed",
+          "t": 1791297283389
+        },
+        {
+          "ev": "toast_detail",
+          "name": "팀원을 켜는 중",
+          "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 미만",
+          "t": 1791297283448
+        },
+        {
+          "ev": "toast_detail",
+          "name": "ℹ 알림",
+          "detail": "부서 팀 편성 대기(CLI 미설치)",
+          "t": 1791297284668
+        },
+        {
+          "ev": "toast_gone",
+          "name": "ℹ 알림",
+          "t": 1791297292671
+        },
+        {
+          "ev": "toast_detail",
+          "name": "팀원을 켜는 중",
+          "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분",
+          "t": 1791297345072
+        },
+        {
+          "ev": "toast_detail",
+          "name": "팀원을 켜는 중",
+          "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 2분",
+          "t": 1791297405071
+        },
+        {
+          "ev": "toast_appear",
+          "name": "팀원 켜기 — 자리가 더 붙지 않습니다",
+          "detail": "3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 1개 · 경과 3분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요",
+          "cls": "toast feed",
+          "t": 1791297465071
+        },
+        {
+          "ev": "toast_gone",
+          "name": "팀원을 켜는 중",
+          "t": 1791297465071
+        },
+        {
+          "ev": "toast_gone",
+          "name": "팀원 켜기 — 자리가 더 붙지 않습니다",
+          "t": 1791297525072
+        },
+        {
+          "ev": "toast_appear",
+          "name": "💤 노드 유휴",
+          "detail": "surface:1 — 302s 무출력",
+          "cls": "toast idle",
+          "t": 1791297585634
+        },
+        {
+          "ev": "toast_gone",
+          "name": "💤 노드 유휴",
+          "t": 1791297593641
+        }
+      ],
+      "names": {
+        "Claude Code CLI가 없습니다": {
+          "first": 1791297158366,
+          "last": 1791297169870,
+          "n": 4,
+          "detail": "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+          "cls": "toast health",
+          "shown": false,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "👥 직원 복귀 중": {
+          "first": 1791297161728,
+          "last": 1791297161728,
+          "n": 1,
+          "detail": "노드 세션 복원 중… (본부·부서)",
+          "cls": "toast feed",
+          "shown": false,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "✅ 직원 복귀 완료": {
+          "first": 1791297161857,
+          "last": 1791297161857,
+          "n": 1,
+          "detail": "노드 세션 복원 완료 (부서 0).",
+          "cls": "toast watchdog",
+          "shown": false,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "ℹ 알림": {
+          "first": 1791297281346,
+          "last": 1791297289359,
+          "n": 6,
+          "detail": "부서 팀 편성 대기(CLI 미설치)",
+          "cls": "toast feed",
+          "shown": false,
+          "detail_events": 1,
+          "last_detail_event": 1791297284668,
+          "reappears": 0
+        },
+        "팀원을 켜는 중": {
+          "first": 1791297283389,
+          "last": 1791297420070,
+          "n": 10,
+          "detail": "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 2분",
+          "cls": "toast feed",
+          "shown": false,
+          "detail_events": 3,
+          "last_detail_event": 1791297405071,
+          "reappears": 0
+        },
+        "팀원 켜기 — 자리가 더 붙지 않습니다": {
+          "first": 1791297465071,
+          "last": 1791297465071,
+          "n": 1,
+          "detail": "3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 1개 · 경과 3분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요",
+          "cls": "toast feed",
+          "shown": false,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        },
+        "💤 노드 유휴": {
+          "first": 1791297585634,
+          "last": 1791297585634,
+          "n": 1,
+          "detail": "surface:1 — 302s 무출력",
+          "cls": "toast idle",
+          "shown": false,
+          "detail_events": 0,
+          "last_detail_event": 0,
+          "reappears": 0
+        }
+      }
+    },
+    "seats_dept": {
+      "registry_ok": true,
+      "registry_error": null,
+      "key": "dept-1",
+      "socket": "\\\\.\\pipe\\cys-dept-dept-1",
+      "entry": {
+        "account_dir": "C:/Users/runneradmin/.cys/claude-default-dept-1",
+        "cwd": "C:/Users/runneradmin",
+        "pack_dir": "C:\\Users\\runneradmin/.cys/pack-dept-dept-1",
+        "reserved_at": 1791297271.424065,
+        "role": "dept-master",
+        "socket": "\\\\.\\pipe\\cys-dept-dept-1"
+      },
+      "dept_keys_after": [
+        "dept-1"
+      ]
+    }
+  }
+}
