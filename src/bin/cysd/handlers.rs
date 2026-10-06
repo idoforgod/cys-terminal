@@ -11218,13 +11218,44 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 }
                 Some(_) => {} // 안정된 장수 master → 통과
             }
-            let prefix: Vec<String> = match params.get("command_prefix") {
+            let raw_prefix: Vec<String> = match params.get("command_prefix") {
                 Some(Value::Array(a)) => {
                     a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect()
                 }
                 _ => Vec::new(),
             };
-            let prefix: Vec<String> = prefix.into_iter().filter(|t| !t.is_empty()).collect();
+            // ★(0.14.44 · A4) `command_text`(명령 원문)가 있으면 **확인(`approval.check`)과 같은 토크나이저**로 쪼갠 결과가 접두다 — 서명이 공백으로만
+            //   쪼개 따옴표 문자가 토큰에 남던 것을 없앤다. 옛 CLI 는 이 키를 보내지 않고(종전 배열), 옛 데몬은 이 키를 무시한다(모르는 키).
+            //   · 따옴표가 닫히지 않았으면 `invalid_params`. 토큰 수(2 이상)와 빈 토큰 검사는 **토큰화 결과**에 적용한다(빈 토큰은 거부 — 조용히 버려 접두를 넓히지 않는다).
+            //   · 배열은 접두로 쓰지 않는다. 다만 원문과 어긋난 배열(CLI 가 보내는 종전 공백 분할이나 토큰화 결과가 아닌 것)은 거부한다(독립 검증 X10).
+            let prefix: Vec<String> = match params.get("command_text").and_then(|v| v.as_str()) {
+                Some(text) => {
+                    let Some(toks) = crate::approval::tokenize(text) else {
+                        return Reply::Single(err_response(
+                            &id,
+                            "invalid_params",
+                            "command_text has an unclosed quote (따옴표가 닫히지 않았다)",
+                        ));
+                    };
+                    let legacy: Vec<String> = text.split_whitespace().map(|t| t.to_string()).collect();
+                    if raw_prefix != toks && raw_prefix != legacy {
+                        return Reply::Single(err_response(
+                            &id,
+                            "invalid_params",
+                            "command_prefix does not match command_text (배열과 원문이 어긋난다)",
+                        ));
+                    }
+                    if toks.iter().any(|t| t.is_empty()) {
+                        return Reply::Single(err_response(
+                            &id,
+                            "invalid_params",
+                            "command_text has an empty token (빈 토큰은 승인 접두로 쓸 수 없다)",
+                        ));
+                    }
+                    toks
+                }
+                None => raw_prefix.into_iter().filter(|t| !t.is_empty()).collect(),
+            };
             // R-GOV-1: 최소 2토큰 강제 — 단일 토큰(git·bash 등) 광역 prefix는 넓은 명령군을 자동
             // 통과시키므로 거부(비어있음 폴백 차단 + 광역 단일토큰 차단). 서명 후 위조불가라 생성
             // 게이트가 광역 승인 발급을 원천 봉인한다.

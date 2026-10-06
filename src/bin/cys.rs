@@ -5806,8 +5806,9 @@ fn run(command: Command) -> i32 {
                     //   창은 남는다 · codex major). 연결 하나로 묶으면 세대 교체 = EOF 라 서명이
                     //   어느 데몬에도 닿지 않는다 — 근거 전문은 `approval_sign_ttl_bound` doc.
                     //   실패 방향은 어느 갈래든 **서명하지 않음**(fail-closed).
-                    let sign_params =
-                        json!({"command_prefix": tokens, "cwd": cwd, "ttl_secs": ttl});
+                    // ★(0.14.44 · A4) 명령 원문(`command_text`)을 함께 보낸다 — 새 데몬은 확인과 같은 토크나이저로 쪼갠다. 옛 데몬은 모르는 키를 무시하고 종전 배열을 쓴다.
+                    let sign_params = json!({"command_prefix": tokens, "command_text": prefix,
+                                             "cwd": cwd, "ttl_secs": ttl});
                     let signed = connect().and_then(|mut stream| {
                         let dl = RpcDeadline::arm(
                             &stream,

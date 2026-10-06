@@ -143,3 +143,83 @@ fn a2_corrupt_inputs_never_panic_and_never_approve() {
     assert_eq!(r["result"]["approved"], json!(false), "{r}");
     assert!(r["result"]["reason"].as_str().is_some(), "{r}");
 }
+
+// ── A4: command_text ─────────────────────────────────────────────────────
+
+/// 파이썬 `shlex.quote` 와 같은 규칙(게이트 훅이 공백이 든 인자에 쓴다 · `role-capability-gate.sh:2364-2369`).
+fn shlex_quote(arg: &str) -> String {
+    let safe = !arg.is_empty()
+        && arg.chars().all(|c| c.is_ascii_alphanumeric() || "@%+=:,./-_".contains(c));
+    if safe {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn sign_text(f: &Fixture, text: &str, cwd: &str, ttl: Option<u64>) -> Value {
+    let legacy: Vec<&str> = text.split_whitespace().collect();
+    sign(
+        f,
+        json!({"command_prefix": legacy, "command_text": text, "cwd": cwd, "ttl_secs": ttl}),
+    )
+}
+
+#[test]
+fn a4_quoted_command_signed_and_checked_with_the_same_text() {
+    let _g = A_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = fixture("a4-quote", false, 980_010);
+    // R5-11 의 꼴: 따옴표가 든 정확 명령을 그대로 서명하고 그대로 확인 → 통과.
+    for (signed, checked) in [
+        (r#"cys close-surface "surface:5""#, r#"cys close-surface "surface:5""#),
+        (r#"cys close-surface "surface:5""#, "cys close-surface surface:5"),
+        ("cys close-surface surface:5", r#"cys close-surface "surface:5""#),
+        ("cys send --text 'a b' x", "cys send --text 'a b' x"),
+        ("cys send --text 'a b' x", r#"cys send --text "a b" x"#),
+    ] {
+        let s = sign_text(&f, signed, "/a/hq", None);
+        assert_eq!(s["ok"], json!(true), "{signed}: {s}");
+        let c = check(&f, checked, "/a/hq", false);
+        assert_eq!(c["result"]["approved"], json!(true), "서명 {signed} / 확인 {checked}: {c}");
+    }
+}
+
+#[test]
+fn a4_unclosed_quote_and_mismatched_array_and_empty_token_are_rejected() {
+    let _g = A_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = fixture("a4-reject", false, 980_011);
+    let s = sign(&f, json!({"command_prefix": ["cys", "x"], "command_text": "cys 'x", "cwd": "/a"}));
+    assert_eq!(s["error"]["code"], json!("invalid_params"), "{s}");
+    let s = sign(&f, json!({"command_prefix": ["cys", "y"], "command_text": "cys x", "cwd": "/a"}));
+    assert_eq!(s["error"]["code"], json!("invalid_params"), "배열과 원문이 어긋남: {s}");
+    let s = sign(&f, json!({"command_prefix": ["cys", "x"], "command_text": "cys ''", "cwd": "/a"}));
+    assert_eq!(s["error"]["code"], json!("invalid_params"), "빈 토큰: {s}");
+    // 토큰 수 2 미만(토큰화 결과 기준).
+    let s = sign(&f, json!({"command_prefix": ["cys"], "command_text": "cys", "cwd": "/a"}));
+    assert_eq!(s["error"]["code"], json!("invalid_params"), "{s}");
+    // 토큰화 결과 배열도 허용(원문과 일치).
+    let s = sign(&f, json!({"command_prefix": ["cys", "a b"], "command_text": "cys 'a b'", "cwd": "/a"}));
+    assert_eq!(s["ok"], json!(true), "{s}");
+    // command_text 없는 종전 호출은 그대로.
+    let s = sign(&f, json!({"command_prefix": ["git", "push"], "cwd": "/a"}));
+    assert_eq!(s["ok"], json!(true), "{s}");
+}
+
+/// 교차 검체: 인자 30종에 대해 `shlex.quote` 로 만든 문자열을 데몬 `tokenize` 로 쪼개면 원래 인자가 나온다.
+#[test]
+fn a4_shlex_quote_roundtrips_through_the_daemon_tokenizer_for_30_args() {
+    let args: Vec<String> = [
+        "plain", "a b", "a  b", " lead", "trail ", "it's", "say \"hi\"", "back\\slash", "한글 인자", "한글",
+        "", "  ", "tab\there", "new\nline", "$HOME", "`x`", "$(x)", "a;b", "a|b", "a&b", "a>b", "a<b",
+        "*", "?", "[x]", "{a,b}", "~", "a'b'c", "\"'\"", "mix 'q' \"d\" \\ end",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(args.len(), 30);
+    for a in &args {
+        let quoted = format!("cmd {}", shlex_quote(a));
+        let toks = crate::approval::tokenize(&quoted).expect("닫힌 따옴표");
+        assert_eq!(toks, vec!["cmd".to_string(), a.clone()], "인자 {a:?} → {quoted:?}");
+    }
+}
