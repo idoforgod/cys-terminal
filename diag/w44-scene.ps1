@@ -122,17 +122,14 @@ function Invoke-W44Scene {
         $j = Read-UpgJson ($Prefix + '-cdp.json')
         if ($null -ne $j) { $rec['w44'] = $j.w44; $rec['attached'] = [bool]$j.attached; $rec['app_version'] = $j.app_version }
         try { $null = Save-Screenshot ($Prefix + '-screen-end.png') } catch { }
-        # cys doctor (the Antigravity line and the pack asset lines on Windows)
+        # cys doctor as a streamed probe (also gives the Antigravity / asset lines when it ends)
         try {
-            $d = Invoke-Proc -File $cys -Arguments 'doctor' -TimeoutSec 180
-            $txt = ([string]$d['out']) + "`r`n" + ([string]$d['err'])
-            Save-Text ('w44-doctor-' + $Prefix + '.txt') $txt
+            $dp0 = Invoke-W44DoctorProbe ('scene-' + $Prefix) 300
+            $txt = ''
+            try { $txt = [System.IO.File]::ReadAllText((Join-Path $global:DiagOut ('w44-doctorprobe-scene-' + $Prefix + '-stdout.txt')), [System.Text.Encoding]::UTF8) } catch { }
             $ag = @(); $asset = @()
-            foreach ($ln in ($txt -split "`r?`n")) {
-                if ($ln -match 'Antigravity|agy') { $ag += (Limit-Text $ln 400) }
-                if ($ln -match 'office|web/|assets|pack-heal') { $asset += (Limit-Text $ln 300) }
-            }
-            $rec['doctor'] = [ordered]@{ rc = $d['rc']; timed_out = $d['timedOut']; antigravity_lines = $ag; office_or_asset_lines = $asset; bytes = $txt.Length }
+            foreach ($ln in ($txt -split "`r?`n")) { if ($ln -match 'Antigravity|agy') { $ag += (Limit-Text $ln 400) }; if ($ln -match 'office|web/|assets|pack-heal') { $asset += (Limit-Text $ln 300) } }
+            $rec['doctor'] = [ordered]@{ rc = $dp0['rc']; timed_out = $dp0['timed_out']; seconds = $dp0['seconds']; antigravity_lines = $ag; office_or_asset_lines = $asset; bytes = $txt.Length }
         } catch { $rec['doctor'] = [ordered]@{ error = $_.Exception.Message } }
         try {
             $ef = Join-Path $global:DiagOut 'w44-dept-cysd-dept-1.err.txt'
@@ -160,4 +157,64 @@ function Invoke-W44Scene {
     $rec['finished'] = (Get-IsoNow)
     try { Save-Json ('w44-scene-' + $Prefix + '.json') $rec 9 } catch { }
     return $rec
+}
+
+# ---- doctor probe: `cys.exe doctor` of the INSTALLED version under the conditions of the scene (app running, harness environment) ----
+# Streams stdout/stderr to files line by line; waits up to MaxSec; on a timeout records the child processes of the doctor, the cys pipes, the
+# loopback connections and the last printed lines. A record only.
+function Invoke-W44DoctorProbe {
+    param([string]$Tag, [int]$MaxSec = 300)
+    $o = [ordered]@{ tag = $Tag; time = (Get-IsoNow); version = $null; seconds = $null; finished = $false; timed_out = $false; rc = $null; stdout_bytes = 0; stdout_lines = 0; last_lines = @(); snapshots = @(); env_notes = @(); error = $null }
+    try {
+        $cys = Join-Path (Get-InstallDir) 'cys.exe'
+        if (-not (Test-Path -LiteralPath $cys)) { $o['error'] = 'no cys.exe'; return $o }
+        $o['version'] = ([string](Invoke-Proc -File $cys -Arguments '--version' -TimeoutSec 30).out).Trim()
+        foreach ($k in @('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', 'CYS_UPDATE_MANIFEST_URL', 'CYS_SOCKET', 'AITERM_SURFACE_ID')) { if ([Environment]::GetEnvironmentVariable($k, 'Process')) { $o['env_notes'] += ($k + ' is set in the harness process') } }
+        $of = Join-Path $global:DiagOut ('w44-doctorprobe-' + $Tag + '-stdout.txt')
+        $ef = Join-Path $global:DiagOut ('w44-doctorprobe-' + $Tag + '-stderr.txt')
+        foreach ($f in @($of, $ef)) { [System.IO.File]::WriteAllText($f, '') }
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $cys; $psi.Arguments = 'doctor'; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8; $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $psi
+        $ho = Register-ObjectEvent -InputObject $p -EventName OutputDataReceived -Action { if ($null -ne $EventArgs.Data) { [System.IO.File]::AppendAllText($Event.MessageData.o, $EventArgs.Data + "`r`n", [System.Text.Encoding]::UTF8) } } -MessageData @{ o = $of }
+        $he = Register-ObjectEvent -InputObject $p -EventName ErrorDataReceived -Action { if ($null -ne $EventArgs.Data) { [System.IO.File]::AppendAllText($Event.MessageData.o, $EventArgs.Data + "`r`n", [System.Text.Encoding]::UTF8) } } -MessageData @{ o = $ef }
+        $ts = Get-Date
+        [void]$p.Start()
+        try { $p.StandardInput.Close() } catch { }
+        $p.BeginOutputReadLine(); $p.BeginErrorReadLine()
+        $snapAt = @(15, 45, 120, 240)
+        $si = 0
+        while (-not $p.HasExited -and ((Get-Date) - $ts).TotalSeconds -lt $MaxSec) {
+            Start-Sleep -Seconds 1
+            $el = ((Get-Date) - $ts).TotalSeconds
+            if ($si -lt $snapAt.Count -and $el -ge $snapAt[$si]) {
+                $si++
+                $kids = @()
+                try {
+                    $all = @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 30 -ErrorAction Stop)
+                    $q = New-Object System.Collections.Generic.Queue[int]; $q.Enqueue($p.Id); $seen = @{}
+                    while ($q.Count -gt 0) { $c = $q.Dequeue(); foreach ($r in $all) { if ([int]$r.ParentProcessId -eq $c -and -not $seen.ContainsKey([int]$r.ProcessId)) { $seen[[int]$r.ProcessId] = 1; $q.Enqueue([int]$r.ProcessId); $kids += ('{0}#{1} {2}' -f $r.Name, $r.ProcessId, (Limit-Text ([string]$r.CommandLine) 240)) } } }
+                } catch { }
+                $net = ''
+                try { $net = [string](Invoke-Proc -File (Join-Path $env:windir 'System32\netstat.exe') -Arguments '-ano' -TimeoutSec 30).out } catch { }
+                $lo = @($net -split "`r?`n" | Where-Object { $_ -match '127\.0\.0\.1' } | Select-Object -First 30)
+                $pp = @(); try { $pp = @([System.IO.Directory]::GetFiles('\\.\pipe\') | ForEach-Object { $_.Substring($_.LastIndexOf('\') + 1) } | Where-Object { $_ -match 'cys' }) } catch { }
+                $tail = ''; try { $tail = (Get-Content -LiteralPath $of -Tail 3 -ErrorAction SilentlyContinue) -join ' | ' } catch { }
+                $o['snapshots'] += [ordered]@{ at_sec = [int]$el; doctor_children = $kids; cys_pipes = $pp; loopback = $lo; stdout_tail = (Limit-Text $tail 400) }
+            }
+        }
+        $o['seconds'] = [math]::Round(((Get-Date) - $ts).TotalSeconds, 1)
+        if ($p.HasExited) { $o['finished'] = $true; $p.WaitForExit(); $o['rc'] = $p.ExitCode } else { $o['timed_out'] = $true; try { Stop-ProcessTree -ProcessId $p.Id } catch { } }
+        Start-Sleep -Milliseconds 800
+        Unregister-Event -SourceIdentifier $ho.Name -ErrorAction SilentlyContinue; Unregister-Event -SourceIdentifier $he.Name -ErrorAction SilentlyContinue
+        $txt = [System.IO.File]::ReadAllText($of, [System.Text.Encoding]::UTF8)
+        $o['stdout_bytes'] = $txt.Length
+        $o['stdout_lines'] = @($txt -split "`r?`n" | Where-Object { $_ -ne '' }).Count
+        $o['last_lines'] = @($txt -split "`r?`n" | Where-Object { $_ -ne '' } | Select-Object -Last 6 | ForEach-Object { Limit-Text $_ 300 })
+    } catch { $o['error'] = $_.Exception.Message }
+    try { Save-Json ('w44-doctorprobe-' + $Tag + '.json') $o 8 } catch { }
+    return $o
 }

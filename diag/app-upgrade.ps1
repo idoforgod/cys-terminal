@@ -2403,6 +2403,7 @@ function Invoke-UpgradeMain {
                 $up['base_state'] = $bs
                 $up['pack']['before'] = $bs['pack']
                 try { if (Get-Command -Name 'Get-W44BridgeRows' -CommandType Function -ErrorAction SilentlyContinue) { $up['w44_bridge_base'] = Get-W44BridgeRows 'base-state-before-upgrade' } } catch { }
+                try { if (Get-Command -Name 'Invoke-W44DoctorProbe' -CommandType Function -ErrorAction SilentlyContinue) { $up['w44_doctor_base'] = Invoke-W44DoctorProbe 'base-0.14.43' 300 } } catch { }
                 if (-not $bs['ready']) { $up['notes'].Add(('the older app was not fully up before the upgrade ({0}); the upgrade was applied anyway' -f [string]$bs['end_reason'])) }
                 elseif (-not $bs['settled']) { $up['notes'].Add(('the upgrade was applied while the older app was still in its first-run work: {0}' -f (Limit-Text ((@($bs['settle_missing']) -join '; ')) 400))) }
                 Save-Run
@@ -2596,6 +2597,7 @@ function Invoke-UpgradeMain {
                 # (d) leftovers at the end of the observation, (e) the pack after the upgrade, the desktop, the app's files
                 $up['stamps']['points']['after_observation'] = Get-UpgStamps 'after-observation'
                 $up['leftovers']['after_observation'] = Get-UpgLeftovers 'after-observation'
+                try { if (Get-Command -Name 'Invoke-W44DoctorProbe' -CommandType Function -ErrorAction SilentlyContinue) { $up['w44_doctor_after'] = Invoke-W44DoctorProbe 'after-upgrade-0.14.44' 300 } } catch { }
                 try { if (Get-Command -Name 'Get-W44BridgeRows' -CommandType Function -ErrorAction SilentlyContinue) { $up['w44_bridge_after_observation'] = Get-W44BridgeRows 'after-observation'; $up['w44_log_lines_after_observation'] = Get-W44LogLines 'office-bridge|bridge' 60 } } catch { }
                 $up['pack']['after'] = Get-UpgPackState
                 try { $null = Save-Screenshot ($K_UPG_PFX + '-screen-after.png') } catch { }
