@@ -4839,6 +4839,12 @@ fn feed_reply_socket_allowed_with(
     if dept_name_from_socket(&sock.to_string_lossy()).is_none() {
         return false;
     }
+    // 윈도우 파이프: 이름의 마지막 요소가 슬러그 허용 글자만으로 이루어져야 한다 — 슬러그가 글자를 걸러 내므로(`cys-dept-x.` → `cys-dept-x`)
+    // 다른 파이프가 부서 x 의 토큰 폴더로 풀리는 길을 닫는다(리뷰 1 의 7번).
+    let ss = sock.to_string_lossy();
+    if ss.starts_with("\\\\") && !pipe_name_is_slug_exact(&ss) {
+        return false;
+    }
     match (dir_of(sock), dir_of(head)) {
         (Some(a), Some(b)) => a != b,
         _ => false,
@@ -4865,9 +4871,20 @@ fn registered_dept_sockets() -> Vec<(String, std::path::PathBuf, Option<String>)
     out
 }
 
+/// 파이프 이름의 마지막 요소가 슬러그 허용 글자(영숫자 · `-` · `_`)로만 이루어졌는가(순수).
+fn pipe_name_is_slug_exact(socket: &str) -> bool {
+    let last = socket.rsplit(|c| c == '\\' || c == '/').next().unwrap_or("");
+    !last.is_empty() && last.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+}
+
+/// 토큰 폴더를 실경로로 정규화한다(순수 — 심볼릭 링크를 풀어 본부 폴더와 같은 곳을 가리키는 소켓 경로를 가려낸다). 폴더가 없거나 풀지 못하면 None(= 거부, fail-closed).
+fn canonical_dir(dir: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    dir?.canonicalize().ok()
+}
+
 fn feed_reply_socket_allowed(sock: &std::path::Path) -> bool {
     let registered: Vec<std::path::PathBuf> = registered_dept_sockets().into_iter().map(|(_, p, _)| p).collect();
-    feed_reply_socket_allowed_with(sock, &default_socket(), &registered, &operator_token_dir_for)
+    feed_reply_socket_allowed_with(sock, &default_socket(), &registered, &|p| canonical_dir(operator_token_dir_for(p)))
 }
 
 /// ★0.14.44 C2 — 본부와 등록된 부서의 승인 Feed 를 한꺼번에 묻는다(소켓당 2초 · 동시 · 응답 없는 부서는 빼지 않고 오류 행으로).
@@ -4896,7 +4913,7 @@ async fn feed_list_all(status: Option<String>) -> Result<Value, String> {
         .collect();
     let mut rows: Vec<Value> = Vec::new();
     for ((dept, sock, display), h) in targets.iter().zip(handles) {
-        let replyable = feed_reply_socket_allowed_with(sock, &head, &registered, &operator_token_dir_for);
+        let replyable = feed_reply_socket_allowed_with(sock, &head, &registered, &|p| canonical_dir(operator_token_dir_for(p)));
         let (ok, items, error) = match h.await {
             Ok(Ok(Ok(resp))) => (true, resp.get("items").cloned().unwrap_or_else(|| json!([])), Value::Null),
             Ok(Ok(Err(e))) => (false, json!([]), json!(e)),
@@ -16144,6 +16161,34 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         // 이름이 본부와 같은 슬러그로 접히는 파이프는 폴더가 같아 거부
         let alias = pb(r"\\.\pipe\cys");
         assert!(feed_reply_socket_allowed_with(&alias, &head, &[], &dir_of), "본부 자신은 허용(소켓이 같다)");
+    }
+
+    /// 리뷰 1 의 7번 — 본부 상태 폴더를 가리키는 심볼릭 링크 아래의 소켓은 실경로 비교로 거부 · 폴더가 없으면 거부 · 윈도우 파이프 이름은 슬러그와 완전히 같아야 한다.
+    #[cfg(unix)]
+    #[test]
+    fn c2_reply_socket_rejects_symlinked_head_dir_and_inexact_pipe_names() {
+        let base = std::env::temp_dir().join(format!("wc-c2-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("head")).unwrap();
+        std::fs::create_dir_all(base.join("other")).unwrap();
+        std::os::unix::fs::symlink(base.join("head"), base.join("cys-dept-x")).unwrap();
+        let head = base.join("head/cys.sock");
+        let linked = base.join("cys-dept-x/cys.sock"); // 문자열로는 다른 폴더 · 실경로는 본부 폴더
+        let ok_dept = base.join("other/cys-dept-y/cys.sock");
+        std::fs::create_dir_all(ok_dept.parent().unwrap()).unwrap();
+        let reg = vec![linked.clone(), ok_dept.clone()];
+        let dir_of = |p: &std::path::Path| canonical_dir(p.parent().map(|d| d.to_path_buf()));
+        assert!(!feed_reply_socket_allowed_with(&linked, &head, &reg, &dir_of), "심볼릭 링크로 본부 폴더를 가리키는 소켓은 거부");
+        assert!(feed_reply_socket_allowed_with(&ok_dept, &head, &reg, &dir_of), "진짜 다른 폴더의 부서는 허용");
+        let missing = base.join("none/cys-dept-z/cys.sock");
+        assert!(!feed_reply_socket_allowed_with(&missing, &head, &[missing.clone()], &dir_of), "폴더를 풀지 못하면 거부");
+        assert!(pipe_name_is_slug_exact(r"\\.\pipe\cys-dept-x") && !pipe_name_is_slug_exact(r"\\.\pipe\cys-dept-x.") && !pipe_name_is_slug_exact(r"\\.\pipe\cys-dept-x!"));
+        let lad = pb("C:/L");
+        let wdir = move |p: &std::path::Path| Some(windows_token_dir(&lad, &p.to_string_lossy()));
+        let h = pb(r"\\.\pipe\cys");
+        let bad = pb(r"\\.\pipe\cys-dept-x.");
+        assert!(!feed_reply_socket_allowed_with(&bad, &h, &[bad.clone()], &wdir), "슬러그와 다른 파이프 이름은 거부");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 배선 핀 — feed_reply 는 socket 인자를 받고 그 소켓의 토큰을 매번 새로 읽는다 · 토큰은 응답 값으로 나가지 않는다 · 본부 토큰을 부서 소켓에 붙이지 않는다 ·

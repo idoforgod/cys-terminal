@@ -1009,6 +1009,7 @@ function setCcTab(view: CcTab) {
     // 탭 진입 시 대기 렌더 상한을 되살린다 — '더 보기'로 푼 확장이 세션 내내 상주하면
     // 5초 주기 refreshFeed 가 매번 전건 DOM 을 재구성한다(상한을 둔 취지가 사라진다).
     feedPendingExpanded = false;
+    feedDeptExpanded.clear();
     refreshFeed();
   }
   if (view === "alarms") renderAlarmHistory();
@@ -6423,7 +6424,11 @@ interface FeedSection {
   items: FeedItem[]; // 최신순
 }
 
+// 세대 가드(리뷰 1 의 4번) — 늦게 끝난 낡은 응답이 마지막 그림이 되지 않게 한다. 부서 묶음의 '더 보기' 펼침 상태(소켓 키)도 여기 둔다.
+let feedRefreshGen = 0;
+const feedDeptExpanded = new Set<string>();
 async function refreshFeed() {
+  const myGen = ++feedRefreshGen;
   // ★0.14.44 C2: 본부 + 등록된 부서를 한꺼번에(feed_list_all) — 이 목록을 그리는 **이 한 곳**만 바꿨다(다른 feed_list 호출처는 본부 전용 그대로).
   //   호출 실패(옛 백엔드 등)이거나 본부 행이 실패면 종전 경로(feed_list + 부서 이동 띠)로 돌아간다.
   const all = (await invoke("feed_list_all", { status: null }).catch(() => null)) as
@@ -6444,6 +6449,7 @@ async function refreshFeed() {
     ? { items: sections[0].items }
     : ((await invoke("feed_list", { status: null }).catch(() => null)) as { items: FeedItem[] } | null);
   if (!r) return;
+  if (myGen !== feedRefreshGen) return; // 기다리는 사이 더 새 갱신이 시작됐다 — 이 응답은 버린다
   const items = r.items.slice().reverse();
   const deptSections = sections ? sections.slice(1) : [];
 
@@ -6827,8 +6833,23 @@ async function refreshFeed() {
       box.appendChild(down);
       continue;
     }
-    renderBulkConfirm(box, sPending, sec.socket);
-    const sShown = sPending.slice(0, PENDING_RENDER_CAP).concat(sItems.filter((i) => i.status !== "pending").slice(0, Math.max(0, 50 - Math.min(sPending.length, PENDING_RENDER_CAP))));
+    if (sec.replyable) renderBulkConfirm(box, sPending, sec.socket); // 응답할 수 없는 부서에는 「모두 확인」을 내지 않는다(누르면 전부 실패)
+    const sExpanded = !!sec.socket && feedDeptExpanded.has(sec.socket);
+    const sPendingShown = sExpanded ? sPending : sPending.slice(0, PENDING_RENDER_CAP);
+    const sHidden = sPending.length - sPendingShown.length;
+    if (sHidden > 0) {
+      // 부서 묶음에도 본부와 같은 '더 보기' — 넘는 항목을 볼 수도 치울 수도 없는 사각을 만들지 않는다(리뷰 1 의 10번).
+      const more = document.createElement("button");
+      more.textContent = `대기 ${sHidden}건 더 보기 (총 ${sPending.length}건)`;
+      more.title = "대량 렌더는 UI 를 느리게 만들 수 있습니다 — 필요할 때만 펼치세요.";
+      const key = sec.socket;
+      more.addEventListener("click", () => {
+        if (key) feedDeptExpanded.add(key);
+        refreshFeed();
+      });
+      box.appendChild(more);
+    }
+    const sShown = sPendingShown.concat(sItems.filter((i) => i.status !== "pending").slice(0, Math.max(0, 50 - sPendingShown.length)));
     const origin: FeedOrigin = { socket: sec.socket, label: sec.label, replyable: sec.replyable };
     for (const item of sShown) renderItem(item, origin);
   }

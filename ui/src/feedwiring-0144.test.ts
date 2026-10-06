@@ -105,3 +105,21 @@ describe("C3 — 표지 · 「확인」 · 「모두 확인」 배선", () => {
     for (const sel of [".feed-dept-head", ".feed-bulk", ".feed-item .fi-ended-mark"]) expect({ 규칙: sel, 있음: css.includes(`${sel} {`) }).toEqual({ 규칙: sel, 있음: true });
   });
 });
+
+describe("리뷰 반영 — 세대 가드 · 부서 더 보기 · 응답 불가 부서의 모두 확인 · waiter 모름", () => {
+  it("refreshFeed 는 세대 가드를 둔다 — 응답을 기다린 뒤 더 새 갱신이 있으면 그리지 않는다", () => {
+    const b = fnBody("refreshFeed");
+    expect(b.includes("const myGen = ++feedRefreshGen;")).toBe(true);
+    expect(b.indexOf("if (myGen !== feedRefreshGen) return;") > b.indexOf('invoke("feed_list"')).toBe(true);
+  });
+  it("부서 묶음에도 '더 보기'가 있고(소켓 키로 펼침 기억) 응답 불가 부서에는 「모두 확인」이 없다", () => {
+    const b = fnBody("refreshFeed");
+    expect(b.includes("feedDeptExpanded.has(sec.socket)")).toBe(true);
+    expect(b.includes("if (sec.replyable) renderBulkConfirm(box, sPending, sec.socket);")).toBe(true);
+  });
+  it("정보성 알림 「확인」은 waiter === false 일 때만 — true 이거나 모름(칸 없음)이면 종전 Allow·Deny", () => {
+    const fc = read("./feedclass.ts");
+    expect(fc.includes("i.waiter === false")).toBe(true);
+    expect(fc.includes("i.waiter !== true")).toBe(false);
+  });
+});
