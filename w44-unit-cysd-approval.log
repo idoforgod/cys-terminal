@@ -1,0 +1,256 @@
+### cargo test --bin cysd approval -- --test-threads=1 --nocapture
+[1m[93mwarning[0m[1m[97m: method `unix_setsid` is never used[0m
+   [1m[96m--> [0msrc\lib.rs:295:14
+    [1m[96m|[0m
+[1m[96m272[0m [1m[96m|[0m impl ChildLifetime {
+    [1m[96m|[0m [1m[96m------------------[0m [1m[96mmethod in this implementation[0m
+[1m[96m...[0m
+[1m[96m295[0m [1m[96m|[0m     const fn unix_setsid(self) -> bool {
+    [1m[96m|[0m              [1m[93m^^^^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m: `cys-terminal` (lib) generated 1 warning
+[1m[93mwarning[0m[1m[97m: unused import: `check_surfaces`[0m
+     [1m[96m--> [0msrc\bin\cysd\governance.rs:11421:37
+      [1m[96m|[0m
+[1m[96m11421[0m [1m[96m|[0m         approval_wakeup_suppressed, check_surfaces, collect_descendants, endpoint_key,
+      [1m[96m|[0m                                     [1m[93m^^^^^^^^^^^^^^[0m
+      [1m[96m|[0m
+      [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: unused import: `run_auto_restore_once`[0m
+    [1m[96m--> [0msrc\bin\cysd\main.rs:4971:9
+     [1m[96m|[0m
+[1m[96m4971[0m [1m[96m|[0m         run_auto_restore_once, AutoRestore,
+     [1m[96m|[0m         [1m[93m^^^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: use of deprecated method `std::sync::atomic::Atomic::<u64>::fetch_update`: renamed to `try_update` for consistency[0m
+    [1m[96m--> [0msrc\bin\cysd\state.rs:1277:14
+     [1m[96m|[0m
+[1m[96m1277[0m [1m[96m|[0m             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+     [1m[96m|[0m              [1m[93m^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: `#[warn(deprecated)]` on by default
+[1m[96mhelp[0m: replace the use of the deprecated method
+     [1m[96m|[0m
+[1m[96m1277[0m [91m- [0m            .[91mfetch_update[0m(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+[1m[96m1277[0m [92m+ [0m            .[92mtry_update[0m(Ordering::AcqRel, Ordering::Acquire, |n| Some(n.saturating_sub(1)));
+     [1m[96m|[0m
+
+[1m[93mwarning[0m[1m[97m: function `lock_retry_schedule` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\main.rs:1791:4
+     [1m[96m|[0m
+[1m[96m1791[0m [1m[96m|[0m fn lock_retry_schedule() -> Vec<std::time::Duration> {
+     [1m[96m|[0m    [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: function `schedule_for_budget` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\main.rs:1800:4
+     [1m[96m|[0m
+[1m[96m1800[0m [1m[96m|[0m fn schedule_for_budget(budget_ms: u64) -> Vec<std::time::Duration> {
+     [1m[96m|[0m    [1m[93m^^^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `jittered` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\main.rs:1814:4
+     [1m[96m|[0m
+[1m[96m1814[0m [1m[96m|[0m fn jittered(d: std::time::Duration) -> std::time::Duration {
+     [1m[96m|[0m    [1m[93m^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: method `foldable_len` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\alert_route.rs:852:12
+    [1m[96m|[0m
+[1m[96m554[0m [1m[96m|[0m impl RouteState {
+    [1m[96m|[0m [1m[96m---------------[0m [1m[96mmethod in this implementation[0m
+[1m[96m...[0m
+[1m[96m852[0m [1m[96m|[0m     pub fn foldable_len(&self) -> usize {
+    [1m[96m|[0m            [1m[93m^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `cso_seats` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\alert_route.rs:1767:8
+     [1m[96m|[0m
+[1m[96m1767[0m [1m[96m|[0m pub fn cso_seats(daemon: &Arc<Daemon>) -> (Vec<u64>, Vec<u64>) {
+     [1m[96m|[0m        [1m[93m^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `queue_holds_entry` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\alert_route.rs:2355:4
+     [1m[96m|[0m
+[1m[96m2355[0m [1m[96m|[0m fn queue_holds_entry(daemon: &Arc<Daemon>, entry_id: &str) -> bool {
+     [1m[96m|[0m    [1m[93m^^^^^^^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `echo_token` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\boot_supervisor.rs:1158:8
+     [1m[96m|[0m
+[1m[96m1158[0m [1m[96m|[0m pub fn echo_token(nonce: &str) -> String {
+     [1m[96m|[0m        [1m[93m^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: constant `EVIDENCE` is never used[0m
+    [1m[96m--> [0msrc\bin\cysd\boot_supervisor.rs:4744:15
+     [1m[96m|[0m
+[1m[96m4744[0m [1m[96m|[0m         const EVIDENCE: [(&str, &str); 8] = [
+     [1m[96m|[0m               [1m[93m^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: variant `Failed` is never constructed[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:536:5
+    [1m[96m|[0m
+[1m[96m532[0m [1m[96m|[0m pub(crate) enum DirSyncMiss {
+    [1m[96m|[0m                 [1m[96m-----------[0m [1m[96mvariant in this enum[0m
+[1m[96m...[0m
+[1m[96m536[0m [1m[96m|[0m     Failed(String),
+    [1m[96m|[0m     [1m[93m^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `DirSyncMiss` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+[1m[93mwarning[0m[1m[97m: function `note_call` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:591:19
+    [1m[96m|[0m
+[1m[96m591[0m [1m[96m|[0m     pub(crate) fn note_call(real_err: bool) {
+    [1m[96m|[0m                   [1m[93m^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `attempts` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:597:19
+    [1m[96m|[0m
+[1m[96m597[0m [1m[96m|[0m     pub(crate) fn attempts() -> u64 {
+    [1m[96m|[0m                   [1m[93m^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `real_errors` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:601:19
+    [1m[96m|[0m
+[1m[96m601[0m [1m[96m|[0m     pub(crate) fn real_errors() -> u64 {
+    [1m[96m|[0m                   [1m[93m^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `fault_armed` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:604:19
+    [1m[96m|[0m
+[1m[96m604[0m [1m[96m|[0m     pub(crate) fn fault_armed() -> bool {
+    [1m[96m|[0m                   [1m[93m^^^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: struct `Fault` is never constructed[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:608:23
+    [1m[96m|[0m
+[1m[96m608[0m [1m[96m|[0m     pub(crate) struct Fault;
+    [1m[96m|[0m                       [1m[93m^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: associated function `arm` is never used[0m
+   [1m[96m--> [0msrc\bin\cysd\delivery.rs:610:23
+    [1m[96m|[0m
+[1m[96m609[0m [1m[96m|[0m     impl Fault {
+    [1m[96m|[0m     [1m[96m----------[0m [1m[96massociated function in this implementation[0m
+[1m[96m610[0m [1m[96m|[0m         pub(crate) fn arm() -> Self {
+    [1m[96m|[0m                       [1m[93m^^^[0m
+
+[1m[93mwarning[0m[1m[97m: calls to `std::mem::drop` with a value that implements `Copy` does nothing[0m
+     [1m[96m--> [0msrc\bin\cysd\handlers.rs:28762:9
+      [1m[96m|[0m
+[1m[96m28762[0m [1m[96m|[0m         drop(old);
+      [1m[96m|[0m         [1m[93m^^^^^[0m[1m[96m---[0m[1m[93m^[0m
+      [1m[96m|[0m              [1m[96m|[0m
+      [1m[96m|[0m              [1m[96margument has type `u64`[0m
+      [1m[96m|[0m
+      [1m[96m= [0m[1m[97mnote[0m: `#[warn(dropping_copy_types)]` on by default
+[1m[96mhelp[0m: use `let _ = ...` to ignore the expression or result
+      [1m[96m|[0m
+[1m[96m28762[0m [91m- [0m        [91mdrop([0mold[91m)[0m;
+[1m[96m28762[0m [92m+ [0m        [92mlet _ = [0mold;
+      [1m[96m|[0m
+
+[1m[93mwarning[0m: `cys-terminal` (bin "cysd" test) generated 19 warnings (run `cargo fix --bin "cysd" -p cys-terminal --tests` to apply 3 suggestions)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.26s
+[1m[92m     Running[0m unittests src\bin\cysd\main.rs (target\debug\deps\cysd-bc8fa840eaf549aa.exe)
+
+running 83 tests
+test approval::tests::b64_roundtrip ... ok
+test approval::tests::determinism ... ok
+test approval::tests::duplicate_id_forgery_is_never_the_selected_index ... ok
+test approval::tests::empty_prefix_no_fallback ... ok
+test approval::tests::expired_longest_prefix_does_not_shadow_live_shorter ... ok
+test approval::tests::hmac_kat ... ok
+test approval::tests::longest_prefix_wins ... ok
+test approval::tests::prefix_match ... ok
+test approval::tests::r2f_dm_approvals_signed_on_the_quantized_clock_survive_save_load_and_one_use ... ok
+test approval::tests::r2f_dm_no_daemon_test_turns_only_the_home_env_without_a_seam ... ok
+test approval::tests::r2f_dm_quantized_record_clock_survives_json_exactly_on_the_100ns_and_1ns_grids ... ok
+test approval::tests::r2f_dm_record_producers_use_the_quantized_clock ... ok
+test approval::tests::resigning_updated_at_preserves_absolute_expiry ... ok
+test approval::tests::saving_migrates_ttl_records_out_of_the_shared_store ... ok
+test approval::tests::sensitive_env_dropped ... ok
+test approval::tests::sign_verify_roundtrip ... ok
+test approval::tests::store_root_seam_moves_every_approval_path ... ok
+test approval::tests::tampered_rejected ... ok
+test approval::tests::ttl_absent_payload_is_byte_identical_to_legacy ... ok
+test approval::tests::ttl_expired_never_matches ... ok
+test approval::tests::ttl_fresh_matches_both_modes ... ok
+test approval::tests::ttl_missing_record_fails_require_ttl_but_keeps_legacy_check ... ok
+test approval::tests::ttl_record_survives_an_old_daemon_rewriting_the_shared_store ... ok
+test approval::tests::ttl_tamper_rejected ... ok
+test approval::tests::unclosed_quote_rejected ... ok
+test approval::tests::wrong_secret_rejected ... ok
+test approval_risk::tests::as_str_stable ... ok
+test approval_risk::tests::cycle_markers_never_auto ... ok
+test approval_risk::tests::denylist_beats_allowlist_no_auto_leak ... ok
+test approval_risk::tests::english_destructive_verbs_caught ... ok
+test approval_risk::tests::gh_release_and_credit_caught ... ok
+test approval_risk::tests::git_push_noncontiguous_caught ... ok
+test approval_risk::tests::kind_excluded_from_risk_input ... ok
+test approval_risk::tests::real_samples_classify_correctly ... ok
+test approval_risk::tests::rm_token_boundary ... ok
+test approval_risk::tests::unknown_is_fail_closed ... ok
+test channels::tests::register_reprompts_sent_approval_with_pending_feed ... ok
+test governance::tests::approval_patterns_union_disk_wins_vendor_fills ... ok
+test governance::tests::approval_patterns_union_excludes_first_run_gate_corpus ... ok
+test governance::tests::approval_stall_fires_once_per_item ... ok
+test governance::tests::approval_wakeup_dedupe_disabled_when_window_zero ... ok
+test governance::tests::approval_wakeup_suppressed_when_same_text_still_queued ... ok
+test governance::tests::approval_wakeup_window_boundary_in_and_out ... ok
+test governance::tests::b1_prompt_boundary_alt_screen_or_approval_blocks_delivery ... ok
+test governance::tests::d12_verdict_submit_key_approval_pending_passes ... ok
+test governance::tests::daemon_approval_dedup_helpers_and_stale_clear ... ok
+test governance::tests::gate_feed_kind_is_isolated_from_approval_namespace ... ok
+test governance::tests::triage_r1wp1hf_alt_screen_handoff_rereads_approval_control ... cysd(test): CYS_STATE_DIR 미설정 — 배달 원장을 실 HOME(~/.cys/state) 대신 C:\Users\RUNNER~1\AppData\Local\Temp\cys-test-state-7784 로 강제 격리한다(R5-B). ★위반 판정은 이 줄이 아니라 다음 개수로 한다: 이 디렉터리 **최상위**의 delivery-* 가 0 이 아니면 격리를 잊은 테스트가 있다 (delivery::tests::isolate_state_dir* 를 그 테스트/하네스에 적용할 것).
+ok
+test governance::tests::u10_approval_stall_skips_exited_surface ... ok
+test governance::tests::u10_approval_stall_skips_orphan_surface ... ok
+test governance::tests::u10_approval_stall_target_live_table ... ok
+test governance::tests::wp5_r1_no_marker_quiet_fallback_refuses_pending_approval ... ok
+test handlers::tests::a2f1_narrow_absorb_for_approval_table ... ok
+test handlers::tests::approval_capabilities_is_readonly_and_declares_ttl ... ok
+test handlers::tests::approval_check_never_rewrites_a_store_it_could_not_read ... [approval] 승인 저장소 read: 승인 저장소를 읽지 못해 트랜잭션을 중단했다 — C:\Users\RUNNER~1\AppData\Local\Temp\cys-acl-ttl-wipe-7784-1791271601\.cys\approvals-ttl.json: records 디코드 실패: missing field `version`
+ok
+test handlers::tests::approval_check_rechecks_expiry_after_it_gets_the_store_lock ... ok
+test handlers::tests::approval_sign_allowed_when_master_stable ... ok
+test handlers::tests::approval_sign_denied_when_caller_not_master ... ok
+test handlers::tests::approval_sign_denied_when_master_just_claimed ... ok
+test handlers::tests::approval_sign_denied_when_no_master ... ok
+test handlers::tests::approval_ttl_roundtrip_through_rpc ... ok
+test handlers::tests::feed_reply_blocks_self_approval ... cysd: feed.reply 거부(self_approval_denied) — request_id=f_self caller pid=Some(4242) pgid=None sid=None / publisher pid=Some(4242) pgid=None sid=None
+cysd: feed.reply 거부(self_approval_denied) — request_id=f_anon caller pid=Some(4242) pgid=None sid=None / publisher pid=None pgid=None sid=None
+ok
+test handlers::tests::feed_reply_operator_token_bypasses_self_approval ... cysd: feed.reply 거부(self_approval_denied) — request_id=f_op caller pid=Some(4242) pgid=None sid=None / publisher pid=Some(4242) pgid=None sid=None
+cysd: feed.reply 거부(self_approval_denied) — request_id=f_op caller pid=Some(4242) pgid=None sid=None / publisher pid=Some(4242) pgid=None sid=None
+ok
+test handlers::tests::h4_burst_second_approval_not_held_by_own_paste ... ignored, 윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다
+test handlers::tests::owner_token_does_not_exempt_feed_reply_self_approval ... cysd: feed.reply 거부(self_approval_denied) — request_id=f_owner caller pid=Some(4343) pgid=None sid=None / publisher pid=Some(4343) pgid=None sid=None
+ok
+test handlers::tests::r2f_dm_windows_like_100ns_clock_approvals_survive_reload_through_the_rpc_handlers ... ok
+test return_absorb_tests::a2f1_feed_approval_return_beyond_reflex_is_not_absorbed ... ok
+test return_absorb_tests::a2f1_modal_approval_return_beyond_reflex_is_written_once ... ok
+test return_absorb_tests::a2f1_no_approval_keeps_ttl_absorb ... ok
+test return_absorb_tests::a2f1_reflex_zero_never_absorbs_while_approval_live ... ok
+test return_absorb_tests::rf1_gate_feed_alone_is_not_approval ... ok
+test return_absorb_tests::rf1_gate_feed_is_veto_not_approval ... ok
+test return_absorb_tests::rf1_gate_veto_beats_approval_feed_and_reflex_zero ... ok
+test return_absorb_tests::rf1_seat_approval_live_truth_table ... ok
+test send_settle_tests::f1_approval_return_on_visible_dialog_is_written ... ok
+test send_settle_tests::r3c_long_agent_turn_after_quick_approval_resubmits_once ... ignored, S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)
+test state::tests::is_self_approval_pgid_promotion ... ok
+test state::tests::is_self_approval_surface_promotion ... ok
+test state::tests::is_self_approval_unattributed_caller_uniform_fail_closed ... ok
+test state::tests::triage_wp5_guard_must_not_adopt_a_pending_approval_as_its_expectation ... ok
+test state::tests::wp5_r2_inject_guard_carries_the_approval_axis_on_every_path ... ok
+test state::u10_feed_restart_tests::u10_restart_closes_orphan_daemon_approval_and_gate ... [cysd] feed 재시작 정리: 고아 화면감지 2건(stale-restart) · 만료 알림 0건(expired-notice) — 서빙 전·allow 0
+ok
+test team_token_tests::p5_body_changed_after_approval_is_token_body_mismatch ... ok
+
+test result: ok. 81 passed; 0 failed; 2 ignored; 0 measured; 1819 filtered out; finished in 22.31s
+
