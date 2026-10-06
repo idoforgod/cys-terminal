@@ -1,0 +1,2 @@
+2026-10-06T13:59:29.881Z lvl=4 id=16394 prov=Microsoft-Windows-Security-SPP :: Offline downlevel migration succeeded.
+2026-10-06T13:59:27.161Z lvl=4 id=15 prov=SecurityCenter :: Updated Windows Defender status successfully to SECURITY_PRODUCT_STATE_ON.

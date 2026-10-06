@@ -1,0 +1,10 @@
+{"t":"2026-10-06T13:57:24.628Z","name":"start","argv":"--mode uiobs --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-upg-base-obs --max-wait-sec 120 --ready-wait-sec 30 --obs-sec 0","native_websocket":true}
+{"t":"2026-10-06T13:57:24.650Z","name":"targets","count":1,"pages":1}
+{"t":"2026-10-06T13:57:24.659Z","name":"connected","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","ws_impl":"mini"}
+{"t":"2026-10-06T13:57:24.661Z","name":"attached","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","id":"9FCA8F78FE4DC8CD4D70A1D60795B969"}
+{"t":"2026-10-06T13:57:24.663Z","name":"page_info","href":"http://tauri.localhost/"}
+{"t":"2026-10-06T13:57:24.669Z","name":"app_version","value":"0.14.43"}
+{"t":"2026-10-06T13:57:24.671Z","name":"obs: wait for the status bar (#daemon-info)"}
+{"t":"2026-10-06T13:57:24.703Z","name":"obs: observing","obs_ms":0,"interval_ms":5000,"expect_daemon":null,"ready":true}
+{"t":"2026-10-06T13:57:24.747Z","name":"obs: ended","reason":"observation window elapsed (0 s)","polls":1,"daemon_version_last":"0.14.43","badge_seen":false}
+

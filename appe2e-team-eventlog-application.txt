@@ -1,0 +1,1 @@
+2026-10-06T14:00:00.187Z lvl=4 id=16384 prov=Microsoft-Windows-Security-SPP :: Successfully scheduled Software Protection service for re-start at 2026-10-13T13:49:00Z. Reason: RulesEngine.

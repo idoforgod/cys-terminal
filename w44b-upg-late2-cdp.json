@@ -1,0 +1,541 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "w44office",
+  "port": 9333,
+  "started": "2026-10-06T14:15:12.024Z",
+  "finished": "2026-10-06T14:16:45.946Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "cys — CYSJavis Terminal",
+      "url": "http://tauri.localhost/",
+      "id": "CF5CEA3B5707DFCE6F0BD6302CEDB59A"
+    },
+    {
+      "type": "iframe",
+      "title": "http://127.0.0.1:8642/",
+      "url": "http://127.0.0.1:8642/",
+      "id": "6340B674F920E161CC041FB1E84C8952"
+    }
+  ],
+  "chosen_target": {
+    "url": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "id": "CF5CEA3B5707DFCE6F0BD6302CEDB59A"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.44",
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": null,
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 0,
+    "progress_count": 0,
+    "progress_first": null,
+    "progress_last": null,
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-06T14:15:12.083Z",
+      "name": "start",
+      "argv": "--mode w44office --port 9333 --out C:\\a\\_temp\\diag-out --prefix w44b-upg-late2 --max-wait-sec 120 --ready-wait-sec 30 --w44-office-wait-sec 60 --w44-settle-sec 30 --w44-shot w44-late2",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-06T14:15:12.642Z",
+      "name": "targets",
+      "count": 2,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-06T14:15:12.935Z",
+      "name": "connected",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-06T14:15:12.967Z",
+      "name": "attached",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "id": "CF5CEA3B5707DFCE6F0BD6302CEDB59A"
+    },
+    {
+      "t": "2026-10-06T14:15:13.045Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-06T14:15:13.118Z",
+      "name": "app_version",
+      "value": "0.14.44"
+    }
+  ],
+  "errors": [],
+  "ui": {
+    "mode": "w44office",
+    "stage": "done",
+    "shots": [
+      {
+        "name": "w44-late2",
+        "file": "w44b-upg-late2-ui-w44-late2.png",
+        "t": "2026-10-06T14:16:45.941Z",
+        "bytes": 30880
+      }
+    ]
+  },
+  "w44office": {
+    "started": "2026-10-06T14:15:13.122Z",
+    "samples": [
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 2
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 2016
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 4032
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 6046
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 8062
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 10077
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 12093
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 14109
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 16124
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 18140
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 20156
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 22172
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 24188
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 26202
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 28203
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 30218
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 32219
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 34234
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 36249
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 38264
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 40281
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 42297
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 44312
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 46327
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 48343
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 50360
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 52365
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 54374
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 56390
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 58406
+      }
+    ],
+    "loaded": false,
+    "loaded_after_ms": null,
+    "final": {
+      "view_visible": true,
+      "panel_open": true,
+      "frame_src": "about:blank",
+      "frame_w": 988,
+      "frame_h": 528,
+      "hint_hidden": true,
+      "hint_text": "",
+      "repair_button_hidden": true,
+      "frame_document": "title="
+    },
+    "shot": "w44b-upg-late2-ui-w44-late2.png",
+    "panel_open_before": true,
+    "targets": [
+      {
+        "type": "page",
+        "title": "cys — CYSJavis Terminal",
+        "url": "http://tauri.localhost/"
+      }
+    ],
+    "finished": "2026-10-06T14:16:45.945Z"
+  }
+}

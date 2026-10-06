@@ -1,0 +1,552 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "w44office",
+  "port": 9333,
+  "started": "2026-10-06T14:13:36.187Z",
+  "finished": "2026-10-06T14:15:04.375Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "cys — CYSJavis Terminal",
+      "url": "http://tauri.localhost/",
+      "id": "CF5CEA3B5707DFCE6F0BD6302CEDB59A"
+    }
+  ],
+  "chosen_target": {
+    "url": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "id": "CF5CEA3B5707DFCE6F0BD6302CEDB59A"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.44",
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": null,
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 0,
+    "progress_count": 0,
+    "progress_first": null,
+    "progress_last": null,
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-06T14:13:36.188Z",
+      "name": "start",
+      "argv": "--mode w44office --port 9333 --out C:\\a\\_temp\\diag-out --prefix w44b-upg-late --max-wait-sec 120 --ready-wait-sec 30 --w44-office-wait-sec 150 --w44-settle-sec 25 --w44-shot w44-late",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-06T14:13:36.210Z",
+      "name": "targets",
+      "count": 1,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-06T14:13:36.219Z",
+      "name": "connected",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-06T14:13:36.221Z",
+      "name": "attached",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "id": "CF5CEA3B5707DFCE6F0BD6302CEDB59A"
+    },
+    {
+      "t": "2026-10-06T14:13:36.223Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-06T14:13:36.228Z",
+      "name": "app_version",
+      "value": "0.14.44"
+    }
+  ],
+  "errors": [],
+  "ui": {
+    "mode": "w44office",
+    "stage": "done",
+    "shots": [
+      {
+        "name": "w44-late",
+        "file": "w44b-upg-late-ui-w44-late.png",
+        "t": "2026-10-06T14:15:04.326Z",
+        "bytes": 260744
+      }
+    ]
+  },
+  "w44office": {
+    "started": "2026-10-06T14:13:36.229Z",
+    "samples": [
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "about:blank",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 2
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 2019
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 4035
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 6055
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 8066
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 10081
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 12083
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 14097
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 16112
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 18128
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 20144
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 22161
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 24162
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 26175
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 28182
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 30190
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 32207
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 34222
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 36238
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 38254
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 40269
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 42271
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 44284
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 46286
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 48301
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 50315
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 52331
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 54333
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 56348
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": null,
+        "frame_w": 988,
+        "frame_h": 485,
+        "hint_hidden": false,
+        "hint_text": "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다.",
+        "repair_button_hidden": true,
+        "frame_document": "title=",
+        "t_ms": 58364
+      },
+      {
+        "view_visible": true,
+        "panel_open": true,
+        "frame_src": "http://127.0.0.1:8642/",
+        "frame_w": 988,
+        "frame_h": 528,
+        "hint_hidden": true,
+        "hint_text": "",
+        "repair_button_hidden": true,
+        "frame_document": "no contentDocument (cross-origin or not loaded)",
+        "t_ms": 60503
+      }
+    ],
+    "loaded": true,
+    "loaded_after_ms": 60503,
+    "final": {
+      "view_visible": true,
+      "panel_open": true,
+      "frame_src": "http://127.0.0.1:8642/",
+      "frame_w": 988,
+      "frame_h": 528,
+      "hint_hidden": true,
+      "hint_text": "",
+      "repair_button_hidden": true,
+      "frame_document": "no contentDocument (cross-origin or not loaded)"
+    },
+    "shot": "w44b-upg-late-ui-w44-late.png",
+    "panel_open_before": true,
+    "targets": [
+      {
+        "type": "page",
+        "title": "cys — CYSJavis Terminal",
+        "url": "http://tauri.localhost/"
+      },
+      {
+        "type": "iframe",
+        "title": "http://127.0.0.1:8642/",
+        "url": "http://127.0.0.1:8642/"
+      }
+    ],
+    "finished": "2026-10-06T14:15:04.344Z"
+  }
+}

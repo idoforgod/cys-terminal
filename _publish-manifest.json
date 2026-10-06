@@ -1,0 +1,701 @@
+{
+  "generated": "2026-10-06T14:24:03.281Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37474032074",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37474032074",
+  "job": "app-upgrade",
+  "os": "windows-11-arm",
+  "branch": "diag-results/37474032074-1-app-upgrade-windows-11-arm",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "app-e2e.json",
+      "bytes": 1512740
+    },
+    {
+      "path": "appe2e-citool-lp-before-team.json",
+      "bytes": 6761
+    },
+    {
+      "path": "appe2e-citool-lp-initial.json",
+      "bytes": 6761
+    },
+    {
+      "path": "appe2e-install-facts-after.json",
+      "bytes": 9697
+    },
+    {
+      "path": "appe2e-install-facts-base.json",
+      "bytes": 8603
+    },
+    {
+      "path": "appe2e-state-before-team.json",
+      "bytes": 5525
+    },
+    {
+      "path": "appe2e-state-initial.json",
+      "bytes": 5521
+    },
+    {
+      "path": "appe2e-team-appfile-01-settings_diagnostic.log",
+      "bytes": 26962
+    },
+    {
+      "path": "appe2e-team-appfile-02-000003.log",
+      "bytes": 1517
+    },
+    {
+      "path": "appe2e-team-appfile-03-000003.log",
+      "bytes": 5605
+    },
+    {
+      "path": "appe2e-team-appfile-04-favorites_diagnostic.log",
+      "bytes": 1873
+    },
+    {
+      "path": "appe2e-team-appfile-05-000003.log",
+      "bytes": 30
+    },
+    {
+      "path": "appe2e-team-appfile-06-000003.log",
+      "bytes": 852
+    },
+    {
+      "path": "appe2e-team-appfile-07-000003.log",
+      "bytes": 112
+    },
+    {
+      "path": "appe2e-team-appfile-08-000003.log",
+      "bytes": 114
+    },
+    {
+      "path": "appe2e-team-appfile-09-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "appe2e-team-appfile-10-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "appe2e-team-appfile-11-000003.log",
+      "bytes": 65
+    },
+    {
+      "path": "appe2e-team-appfile-12-cysd.log",
+      "bytes": 1065
+    },
+    {
+      "path": "appe2e-team-appfile-13-formation.log",
+      "bytes": 240
+    },
+    {
+      "path": "appe2e-team-appfile-14-phoenix-restore.log",
+      "bytes": 1704
+    },
+    {
+      "path": "appe2e-team-appfile-15-phoenix-restore.log",
+      "bytes": 13532
+    },
+    {
+      "path": "appe2e-team-appfiles.txt",
+      "bytes": 59642
+    },
+    {
+      "path": "appe2e-team-cdp-stdout.txt",
+      "bytes": 1771
+    },
+    {
+      "path": "appe2e-team-cdp.json",
+      "bytes": 64050
+    },
+    {
+      "path": "appe2e-team-cys-dept-dept-1-cysd.log-tail.txt",
+      "bytes": 1065
+    },
+    {
+      "path": "appe2e-team-cys-dept-dept-1-formation.log-tail.txt",
+      "bytes": 240
+    },
+    {
+      "path": "appe2e-team-cys-dept-dept-1-phoenix-restore.log-tail.txt",
+      "bytes": 1704
+    },
+    {
+      "path": "appe2e-team-depts.json",
+      "bytes": 344
+    },
+    {
+      "path": "appe2e-team-eventlog-application.txt",
+      "bytes": 188
+    },
+    {
+      "path": "appe2e-team-facts.json",
+      "bytes": 10101
+    },
+    {
+      "path": "appe2e-team-live.json",
+      "bytes": 197
+    },
+    {
+      "path": "appe2e-team-observe.json",
+      "bytes": 37354
+    },
+    {
+      "path": "appe2e-team-pipes-after.txt",
+      "bytes": 20
+    },
+    {
+      "path": "appe2e-team-pipes-before.txt",
+      "bytes": 3
+    },
+    {
+      "path": "appe2e-team-procs-after.txt",
+      "bytes": 28995
+    },
+    {
+      "path": "appe2e-team-procs-before.txt",
+      "bytes": 28525
+    },
+    {
+      "path": "appe2e-team-screen-end.png",
+      "bytes": 178634
+    },
+    {
+      "path": "appe2e-team-timeline.txt",
+      "bytes": 7939
+    },
+    {
+      "path": "appe2e-team-ui-after-click.png",
+      "bytes": 25972
+    },
+    {
+      "path": "appe2e-team-ui-alarms.png",
+      "bytes": 57792
+    },
+    {
+      "path": "appe2e-team-ui-confirm.png",
+      "bytes": 56246
+    },
+    {
+      "path": "appe2e-team-ui-end.png",
+      "bytes": 36328
+    },
+    {
+      "path": "appe2e-team-ui-first-stage.png",
+      "bytes": 25989
+    },
+    {
+      "path": "appe2e-team-ui-new-tab.png",
+      "bytes": 40173
+    },
+    {
+      "path": "appe2e-team-ui-ready.png",
+      "bytes": 31994
+    },
+    {
+      "path": "appe2e-team-ui-timeline.txt",
+      "bytes": 7571
+    },
+    {
+      "path": "appe2e-team-verdict.json",
+      "bytes": 51783
+    },
+    {
+      "path": "appe2e-upg-after-cdp-stdout.txt",
+      "bytes": 1259
+    },
+    {
+      "path": "appe2e-upg-after-cdp.json",
+      "bytes": 76568
+    },
+    {
+      "path": "appe2e-upg-after-obs-facts.json",
+      "bytes": 2955
+    },
+    {
+      "path": "appe2e-upg-after-obs-timeline.txt",
+      "bytes": 16728
+    },
+    {
+      "path": "appe2e-upg-after-pre-cdp-stdout.txt",
+      "bytes": 802
+    },
+    {
+      "path": "appe2e-upg-after-pre-cdp.json",
+      "bytes": 4408
+    },
+    {
+      "path": "appe2e-upg-after-pre-ui-ready.png",
+      "bytes": 31856
+    },
+    {
+      "path": "appe2e-upg-after-ui-obs-end.png",
+      "bytes": 37095
+    },
+    {
+      "path": "appe2e-upg-after-ui-obs-start.png",
+      "bytes": 36969
+    },
+    {
+      "path": "appe2e-upg-appfile-01-settings_diagnostic.log",
+      "bytes": 25935
+    },
+    {
+      "path": "appe2e-upg-appfile-02-favorites_diagnostic.log",
+      "bytes": 1873
+    },
+    {
+      "path": "appe2e-upg-appfile-03-000003.log",
+      "bytes": 30
+    },
+    {
+      "path": "appe2e-upg-appfile-04-000003.log",
+      "bytes": 112
+    },
+    {
+      "path": "appe2e-upg-appfile-05-000003.log",
+      "bytes": 700
+    },
+    {
+      "path": "appe2e-upg-appfile-06-000003.log",
+      "bytes": 5510
+    },
+    {
+      "path": "appe2e-upg-appfile-07-000003.log",
+      "bytes": 852
+    },
+    {
+      "path": "appe2e-upg-appfile-08-000003.log",
+      "bytes": 114
+    },
+    {
+      "path": "appe2e-upg-appfile-09-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "appe2e-upg-appfile-10-000003.log",
+      "bytes": 38
+    },
+    {
+      "path": "appe2e-upg-appfile-11-000003.log",
+      "bytes": 65
+    },
+    {
+      "path": "appe2e-upg-appfile-12-office-bridge.log",
+      "bytes": 123
+    },
+    {
+      "path": "appe2e-upg-appfile-13-phoenix-restore.log",
+      "bytes": 13532
+    },
+    {
+      "path": "appe2e-upg-appfile-14-cys-installed-version.txt",
+      "bytes": 7
+    },
+    {
+      "path": "appe2e-upg-appfile-15-BUNDLED-RUNTIMES.txt",
+      "bytes": 419
+    },
+    {
+      "path": "appe2e-upg-appfiles.txt",
+      "bytes": 51184
+    },
+    {
+      "path": "appe2e-upg-base-obs-cdp-stdout.txt",
+      "bytes": 1105
+    },
+    {
+      "path": "appe2e-upg-base-obs-cdp.json",
+      "bytes": 8628
+    },
+    {
+      "path": "appe2e-upg-base-obs-obs-facts.json",
+      "bytes": 2358
+    },
+    {
+      "path": "appe2e-upg-base-obs-obs-timeline.txt",
+      "bytes": 548
+    },
+    {
+      "path": "appe2e-upg-base-obs-ui-obs-end.png",
+      "bytes": 34791
+    },
+    {
+      "path": "appe2e-upg-base-obs-ui-obs-start.png",
+      "bytes": 34791
+    },
+    {
+      "path": "appe2e-upg-base-pre-cdp-stdout.txt",
+      "bytes": 801
+    },
+    {
+      "path": "appe2e-upg-base-pre-cdp.json",
+      "bytes": 4342
+    },
+    {
+      "path": "appe2e-upg-base-pre-ui-ready.png",
+      "bytes": 15720
+    },
+    {
+      "path": "appe2e-upg-base-state-processes.txt",
+      "bytes": 27362
+    },
+    {
+      "path": "appe2e-upg-base-state-screen.png",
+      "bytes": 178634
+    },
+    {
+      "path": "appe2e-upg-base-state-timeline.txt",
+      "bytes": 1919
+    },
+    {
+      "path": "appe2e-upg-daemon-timeline.txt",
+      "bytes": 3250
+    },
+    {
+      "path": "appe2e-upg-daemon-watch.json",
+      "bytes": 15568
+    },
+    {
+      "path": "appe2e-upg-eventlog-application.txt",
+      "bytes": 253
+    },
+    {
+      "path": "appe2e-upg-observe.json",
+      "bytes": 4677
+    },
+    {
+      "path": "appe2e-upg-proc-audit-end.json",
+      "bytes": 12665488
+    },
+    {
+      "path": "appe2e-upg-proc-audit-end.txt",
+      "bytes": 1475368
+    },
+    {
+      "path": "appe2e-upg-proc-audit.json",
+      "bytes": 844272
+    },
+    {
+      "path": "appe2e-upg-proc-audit.txt",
+      "bytes": 89224
+    },
+    {
+      "path": "appe2e-upg-screen-after.png",
+      "bytes": 178634
+    },
+    {
+      "path": "appe2e-upg-screen-app-gone.png",
+      "bytes": 178634
+    },
+    {
+      "path": "appe2e-upg-screen-before-apply.png",
+      "bytes": 178634
+    },
+    {
+      "path": "appe2e-upg-screen-end.png",
+      "bytes": 178634
+    },
+    {
+      "path": "appe2e-upg-screen-installer.png",
+      "bytes": 178634
+    },
+    {
+      "path": "appe2e-upg-second-cdp-stdout.txt",
+      "bytes": 1260
+    },
+    {
+      "path": "appe2e-upg-second-cdp.json",
+      "bytes": 53080
+    },
+    {
+      "path": "appe2e-upg-second-obs-facts.json",
+      "bytes": 2503
+    },
+    {
+      "path": "appe2e-upg-second-obs-timeline.txt",
+      "bytes": 11250
+    },
+    {
+      "path": "appe2e-upg-second-pre-cdp-stdout.txt",
+      "bytes": 803
+    },
+    {
+      "path": "appe2e-upg-second-pre-cdp.json",
+      "bytes": 4651
+    },
+    {
+      "path": "appe2e-upg-second-pre-ui-ready.png",
+      "bytes": 21609
+    },
+    {
+      "path": "appe2e-upg-second-proc-audit.json",
+      "bytes": 9620608
+    },
+    {
+      "path": "appe2e-upg-second-proc-audit.txt",
+      "bytes": 1116929
+    },
+    {
+      "path": "appe2e-upg-second-screen-end.png",
+      "bytes": 178634
+    },
+    {
+      "path": "appe2e-upg-second-ui-obs-end.png",
+      "bytes": 27215
+    },
+    {
+      "path": "appe2e-upg-second-ui-obs-start.png",
+      "bytes": 26604
+    },
+    {
+      "path": "appe2e-upg-timeline.txt",
+      "bytes": 6498
+    },
+    {
+      "path": "appe2e-upgrade-summary.txt",
+      "bytes": 6503
+    },
+    {
+      "path": "appe2e-upgrade-verdict.json",
+      "bytes": 10615
+    },
+    {
+      "path": "appe2e-verdict.json",
+      "bytes": 1104
+    },
+    {
+      "path": "done-app-e2e.json",
+      "bytes": 139
+    },
+    {
+      "path": "done-p0-facts.json",
+      "bytes": 140
+    },
+    {
+      "path": "done-p1-assets.json",
+      "bytes": 141
+    },
+    {
+      "path": "ensure-sac-restored-citool-lp.json",
+      "bytes": 6761
+    },
+    {
+      "path": "ensure-sac-restored.txt",
+      "bytes": 391
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-app-e2e.txt",
+      "bytes": 9290
+    },
+    {
+      "path": "log-p0-facts.txt",
+      "bytes": 165
+    },
+    {
+      "path": "log-p1-assets.txt",
+      "bytes": 167
+    },
+    {
+      "path": "p0-example-SmartAppControl.xml",
+      "bytes": 9489
+    },
+    {
+      "path": "p0-facts.json",
+      "bytes": 48850
+    },
+    {
+      "path": "p0-facts.txt",
+      "bytes": 42145
+    },
+    {
+      "path": "p1-assets.json",
+      "bytes": 20909
+    },
+    {
+      "path": "subjects.json",
+      "bytes": 182280
+    },
+    {
+      "path": "syntax-check.txt",
+      "bytes": 353
+    },
+    {
+      "path": "w44-dept-cysd-dept-1.err.txt",
+      "bytes": 745
+    },
+    {
+      "path": "w44-doctorprobe-after-upgrade-0.14.44-stdout.txt",
+      "bytes": 1771
+    },
+    {
+      "path": "w44-doctorprobe-after-upgrade-0.14.44.json",
+      "bytes": 1006
+    },
+    {
+      "path": "w44-doctorprobe-base-0.14.43-stdout.txt",
+      "bytes": 1771
+    },
+    {
+      "path": "w44-doctorprobe-base-0.14.43.json",
+      "bytes": 1074
+    },
+    {
+      "path": "w44-doctorprobe-scene-w44-upg.json",
+      "bytes": 14236
+    },
+    {
+      "path": "w44-scene-w44-upg.json",
+      "bytes": 22434
+    },
+    {
+      "path": "w44-scene-w44-upg.txt",
+      "bytes": 563
+    },
+    {
+      "path": "w44-scene2-w44b-upg.json",
+      "bytes": 26219
+    },
+    {
+      "path": "w44-upg-cdp-stdout.txt",
+      "bytes": 872
+    },
+    {
+      "path": "w44-upg-cdp.json",
+      "bytes": 13793
+    },
+    {
+      "path": "w44-upg-pre-cdp-stdout.txt",
+      "bytes": 793
+    },
+    {
+      "path": "w44-upg-pre-cdp.json",
+      "bytes": 4666
+    },
+    {
+      "path": "w44-upg-pre-ui-ready.png",
+      "bytes": 27215
+    },
+    {
+      "path": "w44-upg-screen-end.png",
+      "bytes": 178634
+    },
+    {
+      "path": "w44-upg-ui-w44-feed-dept1-seen.png",
+      "bytes": 75594
+    },
+    {
+      "path": "w44-upg-ui-w44-feed-hq-seen.png",
+      "bytes": 69986
+    },
+    {
+      "path": "w44-upg-ui-w44-feed-tab.png",
+      "bytes": 58323
+    },
+    {
+      "path": "w44-upg-ui-w44-office-end.png",
+      "bytes": 196824
+    },
+    {
+      "path": "w44-upg-ui-w44-office.png",
+      "bytes": 196692
+    },
+    {
+      "path": "w44-upg-ui-w44-start.png",
+      "bytes": 42038
+    },
+    {
+      "path": "w44-upg-ui-w44-usage-1.png",
+      "bytes": 41986
+    },
+    {
+      "path": "w44-upg-ui-w44-usage-2.png",
+      "bytes": 42091
+    },
+    {
+      "path": "w44-upg-ui-w44-usage-3.png",
+      "bytes": 42060
+    },
+    {
+      "path": "w44b-upg-boot-js-missing-cdp-stdout.txt",
+      "bytes": 813
+    },
+    {
+      "path": "w44b-upg-boot-js-missing-cdp.json",
+      "bytes": 13673
+    },
+    {
+      "path": "w44b-upg-boot-js-missing-ui-w44-boot-js-missing.png",
+      "bytes": 23226
+    },
+    {
+      "path": "w44b-upg-late-cdp-stdout.txt",
+      "bytes": 792
+    },
+    {
+      "path": "w44b-upg-late-cdp.json",
+      "bytes": 16003
+    },
+    {
+      "path": "w44b-upg-late-ui-w44-late.png",
+      "bytes": 195558
+    },
+    {
+      "path": "w44b-upg-late2-cdp-stdout.txt",
+      "bytes": 793
+    },
+    {
+      "path": "w44b-upg-late2-cdp.json",
+      "bytes": 13603
+    },
+    {
+      "path": "w44b-upg-late2-ui-w44-late2.png",
+      "bytes": 23160
+    },
+    {
+      "path": "w44b-upg-three-missing-cdp-stdout.txt",
+      "bytes": 809
+    },
+    {
+      "path": "w44b-upg-three-missing-cdp.json",
+      "bytes": 13495
+    },
+    {
+      "path": "w44b-upg-three-missing-ui-w44-three-missing.png",
+      "bytes": 23436
+    }
+  ],
+  "skipped": [
+    {
+      "path": "appe2e-team-cdp-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "appe2e-upg-after-cdp-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctorprobe-after-upgrade-0.14.44-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctorprobe-base-0.14.43-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctorprobe-scene-w44-upg-stderr.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-doctorprobe-scene-w44-upg-stdout.txt",
+      "reason": "empty file"
+    }
+  ],
+  "inline_files": 99,
+  "blob_files": 66
+}

@@ -1,0 +1,92 @@
+{
+    "mode":  "emulate",
+    "started":  "2026-10-06T13:57:40.245Z",
+    "ended":  "2026-10-06T13:58:27.862Z",
+    "end_reason":  "success: the version marker reached the target and a new cys-app.exe is running",
+    "end_kind":  "success",
+    "success":  true,
+    "ticks":  23,
+    "node_exited_at":  null,
+    "node_exit_code":  null,
+    "base_app_pid":  5936,
+    "base_app_gone_at":  "2026-10-06T13:57:40.508Z",
+    "base_app_gone_sec":  0,
+    "installer_seen":  true,
+    "installer_first_seen_at":  "2026-10-06T13:57:40.508Z",
+    "installer_first_seen_sec":  0,
+    "installer_first_seen":  {
+                                 "name":  "cys-0.14.44-installer.exe",
+                                 "id":  8400,
+                                 "ppid":  3768,
+                                 "path":  "C:\\Users\\runneradmin\\AppData\\Local\\Temp\\cys-0.14.44-updater-diagdb9a0e\\cys-0.14.44-installer.exe",
+                                 "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\Temp\\cys-0.14.44-updater-diagdb9a0e\\cys-0.14.44-installer.exe\" /P /R /UPDATE /ARGS"
+                             },
+    "installer_last_seen_sec":  45,
+    "updater_dirs_seen":  [
+                              "cys-0.14.44-updater-diagdb9a0e"
+                          ],
+    "updater_dir_max_bytes":  143434357,
+    "marker_initial":  "0.14.43",
+    "marker_last":  "0.14.44",
+    "marker_changed_at":  "2026-10-06T13:58:27.857Z",
+    "marker_changed_sec":  47,
+    "marker_reached_at":  "2026-10-06T13:58:27.857Z",
+    "marker_reached_sec":  47,
+    "file_version_last":  "0.14.44 / product 0.14.44",
+    "failure_file_seen":  false,
+    "failure_file_text":  null,
+    "new_app_seen":  true,
+    "new_app_first_seen_at":  "2026-10-06T13:58:27.857Z",
+    "new_app_first_seen_sec":  47,
+    "new_app_pid":  8664,
+    "daemons_first":  [
+                          {
+                              "id":  3996,
+                              "ppid":  5936,
+                              "created":  "2026-10-06T13:57:03.702Z",
+                              "name":  "cysd.exe",
+                              "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                              "image":  "cysd.exe",
+                              "image_version":  "0.14.43"
+                          }
+                      ],
+    "daemons_last":  [
+                         {
+                             "id":  3996,
+                             "ppid":  5936,
+                             "created":  "2026-10-06T13:57:03.702Z",
+                             "name":  "cysd.exe",
+                             "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                             "image":  "cysd.exe",
+                             "image_version":  "0.14.44"
+                         }
+                     ],
+    "installer_alive_at_end":  false,
+    "windows_at_end":  "cys-app#8664:cys — CYSJavis Terminal | hosted-compute-agent#3724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#5536:C:\\Windows\\system32\\wsl.exe",
+    "screenshots":  [
+                        {
+                            "name":  "appe2e-upg-screen-installer.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "hosted-compute-agent#3724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#8024:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "appe2e-upg-screen-app-gone.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "cys-0.14.44-installer#8400:cys Setup  | hosted-compute-agent#3724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent"
+                        },
+                        {
+                            "name":  "appe2e-upg-screen-end.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "cys-app#8664:cys — CYSJavis Terminal | hosted-compute-agent#3724:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#5536:C:\\Windows\\system32\\wsl.exe"
+                        }
+                    ]
+}
