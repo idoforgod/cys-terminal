@@ -1,0 +1,450 @@
+{
+    "tag":  "old",
+    "daemon":  {
+                   "pid":  9204,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  13.1
+               },
+    "master":  {
+                   "rc":  0,
+                   "out":  "surface:1",
+                   "err":  "",
+                   "wait_for_cooldown_sec":  66
+               },
+    "signs":  {
+                  "plain-cmd":  {
+                                    "typed":  "call \"C:\\a\\_temp\\w44\\wrap-sign-old-cmd.bat\"",
+                                    "send":  {
+                                                 "key_rc":  0,
+                                                 "send_rc":  0,
+                                                 "send_err":  ""
+                                             },
+                                    "out":  "signed: ap-9204-1791271770-0 (expires_at=1791272670)\nrc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one"
+                                },
+                  "plain-ps":  {
+                                   "typed":  "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\\a\\_temp\\w44\\wrap-sign-old-ps.ps1\"",
+                                   "send":  {
+                                                "key_rc":  0,
+                                                "send_rc":  0,
+                                                "send_err":  ""
+                                            },
+                                   "out":  "signed: ap-9204-1791271773-1 (expires_at=1791272673)\r\nrc=0\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D1 one"
+                               },
+                  "plain-bash":  {
+                                     "typed":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\bin\\bash.exe\" -l \"/c/a/_temp/w44/wrap-sign-old-bash.sh\"",
+                                     "send":  {
+                                                  "key_rc":  0,
+                                                  "send_rc":  0,
+                                                  "send_err":  ""
+                                              },
+                                     "out":  "signed: ap-9204-1791271774-2 (expires_at=1791272674)\nrc=0\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D1 one / C:/a/_temp/w44/dirs/D1 one"
+                                 },
+                  "kill-4242":  {
+                                    "out":  "signed: ap-9204-1791271775-3 (expires_at=1791272675)\nrc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one"
+                                },
+                  "F1-unquoted-backslash":  {
+                                                "text":  "cys launch-agent --role worker --agent claude --cwd C:\\a\\_temp\\w44\\dirs\\w44proj",
+                                                "out":  "signed: ap-9204-1791271776-4 (expires_at=1791272676)\nrc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one"
+                                            },
+                  "F2-quoted-backslash":  {
+                                              "text":  "cys launch-agent --role worker --agent claude --cwd \"C:\\a\\_temp\\w44\\dirs\\w44proj\"",
+                                              "out":  "signed: ap-9204-1791271777-5 (expires_at=1791272677)\nrc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one"
+                                          },
+                  "F3-slash":  {
+                                   "text":  "cys launch-agent --role worker --agent claude --cwd C:/a/_temp/w44/dirs/w44proj",
+                                   "out":  "signed: ap-9204-1791271778-6 (expires_at=1791272678)\nrc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one"
+                               },
+                  "F4-drive-only":  {
+                                        "text":  "cys launch-agent --role worker --agent claude --cwd C:",
+                                        "out":  "signed: ap-9204-1791271780-7 (expires_at=1791272680)\nrc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one"
+                                    },
+                  "F5-drive-backslash":  {
+                                             "text":  "cys launch-agent --role worker --agent claude --cwd C:\\",
+                                             "out":  "signed: ap-9204-1791271781-8 (expires_at=1791272681)\nrc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one"
+                                         },
+                  "F6-no-cwd":  {
+                                    "text":  "cys launch-agent --role worker --agent claude",
+                                    "out":  "signed: ap-9204-1791271782-9 (expires_at=1791272682)\nrc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one"
+                                }
+              },
+    "checks":  [
+                   {
+                       "label":  "plain-signed-in-cmd",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44cmd",
+                       "rc":  0,
+                       "out":  "rc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-cmd",
+                       "shell":  "ps",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44cmd",
+                       "rc":  0,
+                       "out":  "rc=0\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-cmd",
+                       "shell":  "bash",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44cmd",
+                       "rc":  0,
+                       "out":  "rc=0\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D1 one / C:/a/_temp/w44/dirs/D1 one",
+                       "shell_cwd":  "/c/a/_temp/w44/dirs/D1 one / C:/a/_temp/w44/dirs/D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-ps",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44ps",
+                       "rc":  0,
+                       "out":  "rc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-ps",
+                       "shell":  "ps",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44ps",
+                       "rc":  0,
+                       "out":  "rc=0\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-ps",
+                       "shell":  "bash",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44ps",
+                       "rc":  0,
+                       "out":  "rc=0\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D1 one / C:/a/_temp/w44/dirs/D1 one",
+                       "shell_cwd":  "/c/a/_temp/w44/dirs/D1 one / C:/a/_temp/w44/dirs/D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-bash",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44bash",
+                       "rc":  0,
+                       "out":  "rc=0 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-bash",
+                       "shell":  "ps",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44bash",
+                       "rc":  0,
+                       "out":  "rc=0\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-bash",
+                       "shell":  "bash",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44bash",
+                       "rc":  0,
+                       "out":  "rc=0\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D1 one / C:/a/_temp/w44/dirs/D1 one",
+                       "shell_cwd":  "/c/a/_temp/w44/dirs/D1 one / C:/a/_temp/w44/dirs/D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-from-other-folder-cmd",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "git w44cmd",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "probe-signed-folder-of-cmd",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44cmd",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "probe-signed-folder-of-ps",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44ps",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "probe-signed-folder-of-bash",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44bash",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "kill-from-other-folder",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys kill 4242",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "kill-from-other-folder",
+                       "shell":  "ps",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys kill 4242",
+                       "rc":  2,
+                       "out":  "rc=2\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "kill-from-other-folder",
+                       "shell":  "bash",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys kill 4242",
+                       "rc":  2,
+                       "out":  "rc=2\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F1-unquoted-backslash",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:\\a\\_temp\\w44\\dirs\\w44proj",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "launch-F1-unquoted-backslash",
+                       "shell":  "ps",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:\\a\\_temp\\w44\\dirs\\w44proj",
+                       "rc":  2,
+                       "out":  "rc=2\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F1-unquoted-backslash",
+                       "shell":  "bash",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:\\a\\_temp\\w44\\dirs\\w44proj",
+                       "rc":  2,
+                       "out":  "rc=2\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F2-quoted-backslash",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd \"C:\\a\\_temp\\w44\\dirs\\w44proj\"",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "launch-F2-quoted-backslash",
+                       "shell":  "ps",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd \"C:\\a\\_temp\\w44\\dirs\\w44proj\"",
+                       "rc":  2,
+                       "out":  "rc=2\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F2-quoted-backslash",
+                       "shell":  "bash",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd \"C:\\a\\_temp\\w44\\dirs\\w44proj\"",
+                       "rc":  2,
+                       "out":  "rc=2\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F3-slash",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:/a/_temp/w44/dirs/w44proj",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "launch-F3-slash",
+                       "shell":  "ps",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:/a/_temp/w44/dirs/w44proj",
+                       "rc":  2,
+                       "out":  "rc=2\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F3-slash",
+                       "shell":  "bash",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:/a/_temp/w44/dirs/w44proj",
+                       "rc":  2,
+                       "out":  "rc=2\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F4-drive-only",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "launch-F4-drive-only",
+                       "shell":  "ps",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:",
+                       "rc":  2,
+                       "out":  "rc=2\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F4-drive-only",
+                       "shell":  "bash",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:",
+                       "rc":  2,
+                       "out":  "rc=2\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F5-drive-backslash",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:\\",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "launch-F5-drive-backslash",
+                       "shell":  "ps",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:\\",
+                       "rc":  2,
+                       "out":  "rc=2\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F5-drive-backslash",
+                       "shell":  "bash",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:\\",
+                       "rc":  2,
+                       "out":  "rc=2\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F6-no-cwd",
+                       "shell":  "cmd",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude",
+                       "rc":  2,
+                       "out":  "rc=2 \r\ncwd-seen-by-cmd=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "launch-F6-no-cwd",
+                       "shell":  "ps",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude",
+                       "rc":  2,
+                       "out":  "rc=2\r\ncwd-seen-by-ps=C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F6-no-cwd",
+                       "shell":  "bash",
+                       "dir":  "C:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude",
+                       "rc":  2,
+                       "out":  "rc=2\ncwd-seen-by-bash=/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/c/a/_temp/w44/dirs/D2 two / C:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   }
+               ],
+    "store":  null,
+    "lane_file":  [
+                      "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-w44anew\\approval-lane"
+                  ],
+    "notes":  [
+
+              ],
+    "help_approval_sign___help":  {
+                                      "rc":  0,
+                                      "bytes":  556,
+                                      "stack_overflow":  false,
+                                      "head":  "위험명령 prefix를 서명·영속 (master role surface에서만 허용 — 위조 서명 차단)\n\nUsage: cys.exe approval sign [OPTIONS] --prefix \u003cPREFIX\u003e\n\nOptions:\n      --prefix \u003cPREFIX\u003e  승인할 명령 prefix (공백 구분 토큰, 예: \"git push\")\n      --s..."
+                                  },
+    "help_approval_check___help":  {
+                                       "rc":  0,
+                                       "bytes":  788,
+                                       "stack_overflow":  false,
+                                       "head":  "명령이 서명된 prefix에 매칭하는지 확인 (exit 0=서명됨/통과, 비0=미서명/차단). guard.sh가 호출\n\nUsage: cys.exe approval check [OPTIONS] --command \u003cCOMMAND\u003e\n\nOptions:\n      --command \u003cCOMMAND\u003e  검사할 전체 명령 문자열. ★`--prefix` 는 **같은 인자..."
+                                   },
+    "help_approval___help":  {
+                                 "rc":  0,
+                                 "bytes":  469,
+                                 "stack_overflow":  false,
+                                 "head":  "HMAC signed-prefix 승인 — 위험명령 prefix를 1회 서명하면 이후 자동 통과(guard.sh 연동)\n\nUsage: cys.exe approval [OPTIONS] \u003cCOMMAND\u003e\n\nCommands:\n  check  명령이 서명된 prefix에 매칭하는지 확인 (exit 0=서명됨/통과, 비0=미서명/차단). guard.sh가 호출\n  ..."
+                             },
+    "forms":  {
+                  "F1-unquoted-backslash":  "cys launch-agent --role worker --agent claude --cwd C:\\a\\_temp\\w44\\dirs\\w44proj",
+                  "F2-quoted-backslash":  "cys launch-agent --role worker --agent claude --cwd \"C:\\a\\_temp\\w44\\dirs\\w44proj\"",
+                  "F3-slash":  "cys launch-agent --role worker --agent claude --cwd C:/a/_temp/w44/dirs/w44proj",
+                  "F4-drive-only":  "cys launch-agent --role worker --agent claude --cwd C:",
+                  "F5-drive-backslash":  "cys launch-agent --role worker --agent claude --cwd C:\\",
+                  "F6-no-cwd":  "cys launch-agent --role worker --agent claude"
+              },
+    "unsigned_check":  {
+                           "rc":  2,
+                           "err":  ""
+                       }
+}

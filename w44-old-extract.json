@@ -1,0 +1,10 @@
+{
+    "installer":  "cys_0.14.43_x64-setup.exe",
+    "rc":  0,
+    "found":  {
+                  "cys.exe":  "C:\\a\\_temp\\w44\\old-x\\cys.exe",
+                  "cysd.exe":  "C:\\a\\_temp\\w44\\old-x\\cysd.exe",
+                  "pack.tar.gz":  "C:\\a\\_temp\\w44\\old-x\\pack.tar.gz"
+              },
+    "listing_out":  "7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03\r\n\r\nScanning the drive for archives:\r\n1 file, 143348191 bytes (137 MiB)\r\n\r\nExtracting archive: C:\\a\\_temp\\w44\\old-dl\\cys_0.14.43_x64-setup.exe\r\n--\r\nPath = C:\\a\\_temp\\w44\\old-dl\\cys_0.14.43_x64-setup.exe\r\nType = Nsis\r\nPhysical Size = 143348191\r\nMethod = LZMA:23\r\nSolid = +\r\nHeaders Size = 2358206\r\nEmbedded Stub Size = 52736\r\nSubType = NSIS-3 Unicode\r\n\r\nEverything is Ok\r\n\r\nFiles: 3\r\nSize:       79999368\r\nCompressed: 143348191"
+}

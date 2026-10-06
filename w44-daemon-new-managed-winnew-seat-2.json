@@ -1,0 +1,80 @@
+{
+    "tag":  "mws2",
+    "env":  {
+                "HUD_WIN_NEW":  "1",
+                "CYS_OFFICE_BRIDGE_MODE":  "managed"
+            },
+    "with_seat":  true,
+    "daemon":  {
+                   "pid":  5964,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  11.2
+               },
+    "bridge_found":  true,
+    "bridge":  {
+                   "pid":  2952,
+                   "ppid":  5964,
+                   "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_hud_bridge.py",
+                   "started_after_s":  2.1,
+                   "parent_is_daemon":  true
+               },
+    "health":  {
+                   "url":  "http://127.0.0.1:8642/health",
+                   "status":  200,
+                   "body":  "{\"ok\": true, \"pid\": 2952, \"boot_id\": \"19ad5473cd962825\", \"pack_version\": \"0.14.44\", \"assets\": {\"office3d_html\": true, \"office_boot_js\": true, \"three_module_js\": true}, \"timeouts\": 0}",
+                   "error":  null,
+                   "ms":  514
+               },
+    "world":  {
+                  "url":  "http://127.0.0.1:8642/world",
+                  "status":  200,
+                  "body":  "{\"v\": 2, \"ts\": 1791272315.744947, \"seq\": 1, \"daemon\": {\"version\": \"0.14.44\", \"paused\": false}, \"departments\": [{\"id\": \"ë³¸ë¶€ Â· CEO\", \"floor\": 1, \"nodes\": []}], \"todo\": {}, \"lobby\": {\"unassigned\": []",
+                  "error":  null,
+                  "ms":  2
+              },
+    "seat":  {
+                 "rc":  0,
+                 "out":  "surface:1",
+                 "err":  ""
+             },
+    "seat2":  {
+                  "rc":  0,
+                  "out":  "surface:2"
+              },
+    "bridge_alive_after_hold":  true,
+    "bridge_same_pid_after_hold":  true,
+    "bridge_count_after_hold":  1,
+    "bridge_children":  [
+                            "conhost.exe#6716 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                            "cys.exe#10340 C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe events --reconnect --cursor-file C:\\Users\\runneradmin\\AppData\\Local\\cys\\c...",
+                            "conhost.exe#10984 \\??\\C:\\Windows\\system32\\conhost.exe 0x4"
+                        ],
+    "daemon_children":  [
+                            "python3.exe#2952 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\b...",
+                            "conhost.exe#3416 \\\\?\\C:\\Windows\\system32\\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0x46...",
+                            "powershell.exe#1360 C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command cmd.exe",
+                            "conhost.exe#4220 \\\\?\\C:\\Windows\\system32\\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0x53...",
+                            "powershell.exe#10356 C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command cmd.exe",
+                            "conhost.exe#6716 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                            "cys.exe#10340 C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe events --reconnect --cursor-file C:\\Users\\runneradmin...",
+                            "cmd.exe#4844 \"C:\\Windows\\system32\\cmd.exe\"",
+                            "cmd.exe#1380 \"C:\\Windows\\system32\\cmd.exe\"",
+                            "conhost.exe#10984 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                            "PING.EXE#10332 ping  -n 600 127.0.0.1"
+                        ],
+    "bridge_pid_at_kill":  2952,
+    "after_daemon_kill":  {
+                              "bridge_gone_after_s":  0.26,
+                              "children_gone_after_s":  0.26,
+                              "bridge_alive_at_end":  false,
+                              "children_alive_at_end":  0,
+                              "children_before":  3,
+                              "watched_s":  0.3
+                          },
+    "bridges_left_at_end":  0,
+    "port_8642_answers_at_end":  false,
+    "log_bridge_lines":  [
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)"
+                         ]
+}
