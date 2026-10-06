@@ -569,6 +569,10 @@ enum Command {
         /// 확인 프롬프트 없이 적용(병합 결과(kind=merged)에는 비허용 — 대화형 확인 또는 --revert-merge)
         #[arg(long)]
         yes: bool,
+        /// ★(0.14.44 · B6) 그 파일이 **없을 때만** 내장본으로 되살린다. 파일이 있으면 내용이 무엇이든 아무것도 하지 않고 종료코드 0.
+        /// 덮어쓰는 것이 없으므로 확인 질문도 없고, 병합 대기 원장에는 아무것도 적지 않는다(감사 기록에 한 줄만).
+        #[arg(long = "missing-only")]
+        missing_only: bool,
     },
     /// pro 라이선스("열쇠") 관리 — 검증·설치·typed 진단 (DESIGN-pro-license.md §7)
     License {
@@ -5986,7 +5990,9 @@ fn run(command: Command) -> i32 {
         Command::PackAdopt { rel, all, from, merge_after, yes } => {
             return run_pack_adopt(rel, all, from, merge_after, yes);
         }
-        Command::PackHeal { rel, yes } => return run_pack_heal(&rel, yes),
+        Command::PackHeal { rel, yes, missing_only } => {
+            return if missing_only { run_pack_heal_missing_only(&rel) } else { run_pack_heal(&rel, yes) };
+        }
         Command::HooksPrune { pack_dir, dry_run, allow_base } => {
             return run_hooks_prune(&pack_dir, dry_run, allow_base);
         }
@@ -9981,8 +9987,10 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
         fmt_bytes(cap_bytes)
     ));
     if !missing.is_empty() || unreadable > 0 {
+        // ★(0.14.44 · B6-3) 같은 버전에서는 데몬을 다시 띄워도 누락 파일이 복원되지 않는다[실측 R8] — 사실이 아닌 방법("데몬 재기동")은 권하지 않는다.
+        //   실제로 되는 방법만: 없는 파일만 되살리는 `cys pack-heal --missing-only <파일>`(원장 무접촉) 또는 팩 전체를 다시 설치하는 `cys init-pack`.
         action.push_str(
-            " · 누락·판독 불가: 데몬 재기동(부팅 install 이 보존 모드로 누락 파일을 다시 쓴다) 또는 cys init-pack",
+            " · 누락·판독 불가: cys pack-heal --missing-only <파일>(없는 파일만 · 병합 원장 무접촉) 또는 cys init-pack",
         );
     }
     let status = if !suspects.is_empty() || n_qr > 0 || !missing.is_empty() || unreadable > 0 {
@@ -23867,6 +23875,54 @@ fn run_pack_heal(rel: &str, yes: bool) -> i32 {
     0
 }
 
+/// ★(0.14.44 · B6) `pack-heal --missing-only <rel>` — **없는 파일만** 내장본으로 되살린다(앱의 오피스 화면 자산 복구가 쓴다).
+///
+/// 왜 따로 두는가: 기존 `pack-heal` 은 없는 파일을 되살릴 때에도 병합 대기 원장(`.merge-pending.json`)에 "healed"(사용자 수정을 원본으로 되돌렸다) 항목을 남기고,
+/// 그 항목은 저절로 지워지지 않아 부트 사전 점검의 경고(C62)와 14일 뒤 master 앞 병합 검토 신호(C68)를 만든다 — 앱이 조용히 한 복구가 master 에게 일을 만드는 셈이다.
+/// 여기서는 밀려난 사용자 수정이 없으므로 병합할 것이 없다 → **원장에 적지 않는다**. `init-pack` 처럼 팩 전체를 바꿔 끼우지도, 직전 보관본(`pack.prev`)을 덮지도 않는다.
+///
+/// 규칙: 내장 팩에 없는 경로 · system 소유가 아닌 경로는 기존처럼 거부(rc 1) · 파일이 있으면(내용이 무엇이든) 무변경 rc 0 · 없으면 쓰기(원자적)와 기준선 전진은 기존 함수 그대로 ·
+/// 감사 기록에 한 줄. 확인 질문 없음(덮어쓰는 것이 없다).
+fn run_pack_heal_missing_only(rel: &str) -> i32 {
+    let dir = cys::pack::pack_dir();
+    let Some(embed) = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == rel).map(|(_, c)| *c)
+    else {
+        eprintln!("'{rel}' 은 임베드 팩에 없음(자작·폐기 파일) — pack-heal 대상 아님");
+        return 1;
+    };
+    let own = cys::pack::ownership_name_scoped(rel, &dir);
+    if own != "system" {
+        eprintln!("'{rel}' 은 system 소유가 아님({own}) — 헌법·user 파일의 해소는 cys pack-merge 경로를 쓰세요");
+        return 1;
+    }
+    let target = dir.join(rel);
+    // 있으면(심볼릭 링크·디렉터리·내용이 다른 파일 포함) 아무것도 하지 않는다.
+    if std::fs::symlink_metadata(&target).is_ok() {
+        println!("'{rel}' 은 이미 있음 — 무변경(--missing-only)");
+        return 0;
+    }
+    if let Some(parent) = target.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!("폴더 생성 실패({e}) — 무변경");
+            return 1;
+        }
+    }
+    if let Err(e) = cys::pack::write_atomic(&target, embed.as_bytes()) {
+        eprintln!("복원 쓰기 실패: {e}");
+        return 1;
+    }
+    advance_vendor_baseline(&dir, rel, embed);
+    // 병합 대기 원장은 읽지도 쓰지도 않는다. 감사 기록 실패는 loud 경고 후 계속(관측이지 게이트가 아니다).
+    if let Err(e) = cys::pack::append_merge_audit(
+        &dir,
+        &merge_audit_entry(rel, "pack-heal-missing-only", "", embed, "n/a", &["missing-only".to_string()]),
+    ) {
+        eprintln!("⚠ 감사 원장 기록 실패(복원은 완료): {e}");
+    }
+    println!("✅ {rel} ← 내장본으로 되살림(없던 파일 · 병합 대기 원장 무접촉)");
+    0
+}
+
 /// ★T4(v2 §5): --revert-merge — 자동 병합 1명령 가역화(merged 원장 전용). 순서 고정:
 /// 캡처 부재=fail-closed 거부(무변경) → 확인 → 기존 .user 세대 보존(R1-적대 #2 동계열) →
 /// 현 디스크 전문 {rel}.user 백업(병합 후 사용자 재수정 보호 — 원칙 4) → disk←캡처본 →
@@ -35684,6 +35740,63 @@ mod tests {
         assert_eq!(t4_ledger_kind(&td, &rel).as_deref(), Some("healed"), "원장 healed 전환");
         assert_triple_advanced(&td, &rel, &embed);
         let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★(0.14.44 · B6) `pack-heal --missing-only`: 없는 파일은 되살리되 **병합 대기 원장을 만들지도 바꾸지도 않고**(원장 파일 자체가 생기지 않는다),
+    /// 있는 파일은 내용이 무엇이든 무변경 rc 0, 내장 팩에 없는 경로는 거부. 인자가 없는 `pack-heal` 은 종전과 같다(원장 healed 항목을 남긴다).
+    #[test]
+    fn b6_pack_heal_missing_only_restores_without_touching_the_ledger() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (td, rel, embed, _env) = t4_system_fixture("b6mo");
+        let target = td.join(&rel);
+        let ledger = td.join(cys::pack::MERGE_PENDING_FILE);
+        let audit_before = std::fs::read_to_string(td.join(".merge-audit.jsonl")).unwrap_or_default();
+        assert!(!target.exists() && !ledger.exists());
+        // ① 없는 파일 → 복원 · 기준선 전진 · 원장 파일 없음 · 감사 한 줄.
+        assert_eq!(run_pack_heal_missing_only(&rel), 0);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), embed, "내장본으로 되살아나야 한다");
+        assert_triple_advanced(&td, &rel, &embed);
+        assert!(!ledger.exists(), "병합 대기 원장이 생겼다");
+        assert!(!td.join(format!("{rel}.user")).exists(), ".user 가 생겼다");
+        let audit = std::fs::read_to_string(td.join(".merge-audit.jsonl")).unwrap_or_default();
+        assert_eq!(audit.lines().count(), audit_before.lines().count() + 1, "감사 기록은 정확히 한 줄");
+        assert!(audit.contains("pack-heal-missing-only"));
+        // ② 있는 파일(내용이 다름) → 무변경 · 원장 무접촉 · rc 0.
+        std::fs::write(&target, "MY EDIT\n").unwrap();
+        assert_eq!(run_pack_heal_missing_only(&rel), 0);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "MY EDIT\n", "있는 파일을 건드렸다");
+        assert!(!ledger.exists() && !td.join(format!("{rel}.user")).exists());
+        // ③ 원장 항목이 이미 있어도 원장 파일은 바이트 그대로.
+        t4_write_ledger(&td, &rel, serde_json::json!({"kind": "kept-drift", "side": rel, "version": "x", "ts": 0}));
+        let led_bytes = std::fs::read(&ledger).unwrap();
+        std::fs::remove_file(&target).unwrap();
+        assert_eq!(run_pack_heal_missing_only(&rel), 0);
+        assert_eq!(std::fs::read(&ledger).unwrap(), led_bytes, "원장이 바뀌었다");
+        // ④ 내장 팩에 없는 경로 · system 이 아닌 경로는 거부.
+        assert_eq!(run_pack_heal_missing_only("no/such/file.txt"), 1);
+        // ⑤ 새 인자는 CLI 문법으로 파싱된다.
+        use clap::Parser;
+        assert!(matches!(
+            Cli::try_parse_from(["cys", "pack-heal", "--missing-only", "web/office3d.html"]).map(|c| c.command),
+            Ok(Command::PackHeal { missing_only: true, yes: false, .. })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["cys", "pack-heal", "--yes", "web/office3d.html"]).map(|c| c.command),
+            Ok(Command::PackHeal { missing_only: false, yes: true, .. })
+        ));
+        let _ = std::fs::remove_dir_all(td.parent().unwrap());
+    }
+
+    /// ★(0.14.44 · B6-3) doctor 의 누락 안내에 사실이 아닌 방법("데몬 재기동")이 없다.
+    #[test]
+    fn b6_doctor_missing_hint_no_longer_recommends_a_daemon_restart() {
+        let src = include_str!("cys.rs");
+        let i = src.find("누락·판독 불가:").expect("안내 문구");
+        let line = &src[i..i + 200];
+        assert!(!line.contains("데몬 재기동"), "{line}");
+        assert!(line.contains("pack-heal --missing-only") && line.contains("init-pack"), "{line}");
+        let old = ["부팅 install 이 보존 모드로 ", "누락 파일을 다시 쓴다) 또는"].concat(); // 이 시험 자신에 걸리지 않게 조각으로 잇는다
+        assert!(!src.contains(&old), "옛 안내가 남았다");
     }
 
     /// ★T4(ⓕ): merged 원장의 pack-heal --yes = 프롬프트 없이 즉시 거부(rc 1·전면 무변경 —
