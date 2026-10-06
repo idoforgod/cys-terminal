@@ -1,0 +1,14 @@
+# base state: waiting (every 3 s, at most 120 s) for a cysd.exe of the install folder AND a committed pack (.pack-version); start 2026-10-06T06:30:10.117Z
+[   0s 2026-10-06T06:30:10.252Z] cysd=[pid 10080 (parent 1808, created 2026-10-06T06:30:06.776Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=52 version=
+[   3s 2026-10-06T06:30:13.363Z] cysd=[pid 10080 (parent 1808, created 2026-10-06T06:30:06.776Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=106 version=
+[   6s 2026-10-06T06:30:16.458Z] cysd=[pid 10080 (parent 1808, created 2026-10-06T06:30:06.776Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=183 version=
+[   9s 2026-10-06T06:30:19.583Z] cysd=[pid 10080 (parent 1808, created 2026-10-06T06:30:06.776Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=300 version=
+[  12s 2026-10-06T06:30:22.686Z] cysd=[pid 10080 (parent 1808, created 2026-10-06T06:30:06.776Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=475 version=
+[  16s 2026-10-06T06:30:25.799Z] cysd=[pid 10080 (parent 1808, created 2026-10-06T06:30:06.776Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=643 version=
+[  19s 2026-10-06T06:30:28.909Z] cysd=[pid 10080 (parent 1808, created 2026-10-06T06:30:06.776Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=809 version=
+[  22s 2026-10-06T06:30:32.067Z] cysd=[pid 10080 (parent 1808, created 2026-10-06T06:30:06.776Z, image cysd.exe v0.14.43)] pipes=[cys] pack: files=942 version=0.14.43
+# end: a daemon runs and the pack is committed
+[settle +  0s 2026-10-06T06:30:32.194Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[.pack-staging-init-2008] gui-onboarded=0.14.43 onboard-attempts=none busy=[cys.exe#2008 init-pack --no-install-hook] missing=3
+[settle +  2s 2026-10-06T06:30:34.241Z] stamp=none pending-restore=False pack=0.14.43 pack.prev=True staging=[.pack-staging-init-2008] gui-onboarded=0.14.43 onboard-attempts=none busy=[cys.exe#2008 init-pack --no-install-hook] missing=3
+[settle +  4s 2026-10-06T06:30:36.290Z] stamp=0.14.43 pending-restore=False pack=0.14.43 pack.prev=True staging=[] gui-onboarded=0.14.43 onboard-attempts=none busy=[] missing=0
+# settled=True after +4 s; missing: 
