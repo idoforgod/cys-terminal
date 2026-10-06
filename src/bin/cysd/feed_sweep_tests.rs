@@ -112,3 +112,68 @@ fn c1_sweep_is_a_separate_tick_function_without_await_or_panics() {
     // 쓸기 본체에서 잠금 둘을 겹쳐 쥐지 않는다 — `feed_items` 와 `surfaces` 잠금이 각각 한 문장에서 끝난다(`let` 로 가드를 묶어 두는 꼴이 없다).
     assert!(!body.contains("let _g") && !body.contains("let g ="), "잠금 가드를 변수로 쥔다");
 }
+
+// ── C3: `feed.list` 파생 칸 `waiter` · `publisher_alive` ───────────────────────
+
+fn feed_list(d: &Arc<Daemon>) -> Vec<Value> {
+    let req = Request { id: json!(1), method: "feed.list".into(), params: json!({}) };
+    match dispatch(d, req, None) {
+        Reply::Single(v) => v["result"]["items"].as_array().cloned().unwrap_or_default(),
+        _ => panic!("single"),
+    }
+}
+
+fn item<'a>(list: &'a [Value], rid: &str) -> &'a Value {
+    list.iter().find(|i| i["request_id"] == json!(rid)).unwrap_or_else(|| panic!("{rid} 없음"))
+}
+
+#[test]
+fn c3_publisher_alive_is_true_false_or_null_and_waiter_follows_the_live_connection() {
+    let d = crate::team_gate_tests::tmp_daemon("c3-derived", false);
+    let alive = crate::team_gate_tests::seat(&d, "worker", 990_011);
+    let dying = crate::team_gate_tests::seat(&d, "worker", 990_012);
+    // 같은 부팅에서 올린 항목 — 올린 좌석(publisher_surface)은 클라이언트 push 가 호출자 pid 로 각인한다.
+    for (rid, pid) in [("c3-alive", 990_011u32), ("c3-dying", 990_012u32)] {
+        let r = client_push(&d, Some(pid), rid, "question", None);
+        assert_eq!(r["ok"], json!(true), "{r}");
+    }
+    let r = client_push(&d, None, "c3-unknown", "question", None);
+    assert_eq!(r["ok"], json!(true), "{r}");
+    // 좌석 하나를 종료시킨다.
+    d.surfaces.lock().unwrap().get(&dying).expect("seat").exited.store(true, Ordering::Relaxed);
+    let list = feed_list(&d);
+    assert_eq!(item(&list, "c3-alive")["publisher_alive"], json!(true));
+    assert_eq!(item(&list, "c3-dying")["publisher_alive"], json!(false));
+    assert_eq!(item(&list, "c3-unknown")["publisher_alive"], json!(null), "올린 좌석을 모르면 null");
+    // 좌석 맵에서 아예 사라진 경우도 false.
+    d.surfaces.lock().unwrap().remove(&alive);
+    assert_eq!(item(&feed_list(&d), "c3-alive")["publisher_alive"], json!(false));
+    // 이 데몬이 뜨기 전에 만들어진 항목(복원된 항목)은 null — 좌석 번호로 "사라졌다"를 말할 수 없다.
+    d.feed_items.lock().unwrap().iter_mut().find(|i| i.request_id == "c3-dying").expect("item").created_at =
+        d.started_at - 10.0;
+    assert_eq!(item(&feed_list(&d), "c3-dying")["publisher_alive"], json!(null));
+    // waiter: 결정을 기다리는 연결이 살아 있으면 true, 연결이 끊기면(수신 쪽이 사라지면) false, 등록이 없으면 false.
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    d.feed_waiters.lock().unwrap().insert("c3-unknown".into(), tx);
+    assert_eq!(item(&feed_list(&d), "c3-unknown")["waiter"], json!(true));
+    assert_eq!(item(&feed_list(&d), "c3-alive")["waiter"], json!(false));
+    drop(rx);
+    assert_eq!(item(&feed_list(&d), "c3-unknown")["waiter"], json!(false), "끊긴 연결을 기다림으로 셌다");
+    // 기존 키는 그대로 있다(가산만).
+    let it = item(&feed_list(&d), "c3-unknown").clone();
+    for k in ["request_id", "kind", "title", "body", "surface_id", "status", "decision", "created_at", "resolved_at", "tier", "daemon_issued", "resolver_surface", "resolver_pid"] {
+        assert!(it.get(k).is_some(), "기존 키 {k} 가 사라졌다");
+    }
+}
+
+/// 소스 고정 — 파생 칸을 만드는 두 함수에는 패닉 경로가 없고, 잠금을 하나씩 쥔다.
+#[test]
+fn c3_derived_input_helpers_are_panic_free_and_lock_one_at_a_time() {
+    let src = include_str!("handlers.rs");
+    let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("앵커")];
+    let a = prod.find("fn feed_list_derived_inputs(").expect("함수");
+    let body = &prod[a..a + prod[a..].find("\n}\n").expect("끝")];
+    assert!(body.contains("#[deny(clippy::unwrap_used") || prod[a - 200..a].contains("#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]"));
+    assert!(!body.contains(".unwrap()") && !body.contains(".expect("), "패닉 경로");
+    assert!(!body.contains(".await"));
+}
