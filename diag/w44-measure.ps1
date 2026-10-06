@@ -335,15 +335,15 @@ function Write-Wrapper {
     if ($Kind -eq 'cmd') {
         $bat = $base + '.bat'
         $lines = @('@echo off', ('cd /d "{0}"' -f $Dir))
-        foreach ($l in $CysLines) { $lines += ('"{0}" {1} >> "{2}" 2>&1' -f $Set['cys'], $l, $OutFile); $lines += ('echo rc=%errorlevel%>> "{0}"' -f $OutFile) }
-        $lines += ('echo cwd-seen-by-cmd=%CD%>> "{0}"' -f $OutFile)
+        foreach ($l in $CysLines) { $lines += ('"{0}" {1} >> "{2}" 2>&1' -f $Set['cys'], $l, $OutFile); $lines += ('echo rc=%errorlevel% >> "{0}"' -f $OutFile) }
+        $lines += ('echo cwd-seen-by-cmd=%CD% >> "{0}"' -f $OutFile)
         [System.IO.File]::WriteAllText($bat, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
         return @{ file = (Join-Path $env:windir 'System32\cmd.exe'); args = ('/d /c call "{0}"' -f $bat); typed = ('call "{0}"' -f $bat); script = $bat }
     }
     if ($Kind -eq 'ps') {
         $ps1 = $base + '.ps1'
         $lines = @(('Set-Location -LiteralPath ''{0}''' -f $Dir))
-        foreach ($l in $CysLines) { $lines += ('$a = {0}; & ''{1}'' @a *>> ''{2}''' -f $l, $Set['cys'], $OutFile); $lines += ('"rc=$LASTEXITCODE" | Out-File -Append -Encoding ascii -LiteralPath ''{0}''' -f $OutFile) }
+        foreach ($l in $CysLines) { $lines += ('$a = {0}; & ''{1}'' @a 2>&1 | ForEach-Object {{ $_.ToString() }} | Out-File -Append -Encoding ascii -LiteralPath ''{2}''' -f $l, $Set['cys'], $OutFile); $lines += ('"rc=$LASTEXITCODE" | Out-File -Append -Encoding ascii -LiteralPath ''{0}''' -f $OutFile) }
         $lines += ('"cwd-seen-by-ps=$((Get-Location).Path)" | Out-File -Append -Encoding ascii -LiteralPath ''{0}''' -f $OutFile)
         [System.IO.File]::WriteAllText($ps1, (($lines -join "`r`n") + "`r`n"), (New-Object System.Text.UTF8Encoding($false)))
         $psexe = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -423,6 +423,10 @@ function Invoke-ApprovalSuite {
     $d = Start-W44Daemon $Set $pipe ('approval-' + $Tag) @{ CYS_NO_OFFICE_BRIDGE = '1' }
     $S['daemon'] = [ordered]@{ pid = $d['pid']; ready = $d['ready']; exited = $d['exited']; waited = $d['waited'] }
     if (-not $d['ready']) { Save-DaemonLogs ('approval-' + $Tag) $d; $S['notes'] += 'daemon did not answer ping'; return $S }
+    foreach ($hp in @('approval sign --help', 'approval check --help', 'approval --help')) {
+        $hh = Invoke-Cys $Set $pipe $hp 30
+        $S['help_' + ($hp -replace '[^a-z]', '_')] = [ordered]@{ rc = $hh.rc; bytes = ($hh.out.Length + $hh.err.Length); stack_overflow = [bool](($hh.rc -eq -1073741571) -or ($hh.rc -eq 3221225725)); head = (Limit $hh.out 200) }
+    }
     $ms = Invoke-Cys $Set $pipe 'new-surface --role master --title w44master --cmd cmd.exe' 60
     $ref = (Limit $ms.out 80)
     $S['master'] = [ordered]@{ rc = $ms.rc; out = $ref; err = (Limit $ms.err 300) }
@@ -496,8 +500,8 @@ function Invoke-ApprovalSuite {
         $w = Write-Wrapper $Kind ('chk-' + $Tag + '-' + $Label + '-' + $Kind) $Dir @($argt) $o $Set
         $envm = @{ CYS_SOCKET = $pipe }
         $x = $null
-        Use-Env $envm { $script:x = Invoke-Proc -File $w['file'] -Arguments $w['args'] -TimeoutSec 60 }
-        $x = $script:x
+        Use-Env $envm { $script:tmpx = Invoke-Proc -File $w['file'] -Arguments $w['args'] -TimeoutSec 60 }
+        $x = $script:tmpx
         $txt = Read-OutFile $o
         $rc = $null
         $m = [regex]::Match($txt, '(?m)^rc=(\d+)')
@@ -715,7 +719,7 @@ function Measure-DaemonKill {
 
 function Invoke-DaemonBridgeRun {
     # one real daemon run: mode env (or none), optional seat, wait for the bridge, hold, kill
-    param([string]$Tag, [hashtable]$Set, [hashtable]$ExtraEnv, [bool]$WithSeat, [int]$HoldSec = 20, [bool]$DoHeal = $false, [bool]$ExpectBridge = $true)
+    param([string]$Tag, [hashtable]$Set, [hashtable]$ExtraEnv, [bool]$WithSeat, [int]$HoldSec = 20, [bool]$DoHeal = $false, [bool]$KillBridgeProbe = $false)
     $S = [ordered]@{ tag = $Tag; env = $ExtraEnv; with_seat = $WithSeat }
     $null = Stop-AllW44Procs
     $dotcys = Join-Path $env:USERPROFILE '.cys'
@@ -771,6 +775,25 @@ function Invoke-DaemonBridgeRun {
     $S['daemon_children'] = @($dd | ForEach-Object { '{0}#{1} {2}' -f $_.Name, $_.Id, (Limit $_.Cmd 100) })
     if ($DoHeal) {
         $S['heal'] = Invoke-HealTests $Set $pipe $bp
+    }
+    if ($DoHeal) {
+        $dr = Invoke-Cys $Set $pipe 'doctor' 180
+        $dtxt = ([string]$dr.out) + "`r`n" + ([string]$dr.err)
+        Save-Text ('w44-doctor-' + $Tag + '.txt') $dtxt
+        $S['doctor'] = [ordered]@{ rc = $dr.rc; antigravity_lines = @($dtxt -split "`r?`n" | Where-Object { $_ -match 'Antigravity|agy' } | ForEach-Object { Limit $_ 400 }); office_lines = @($dtxt -split "`r?`n" | Where-Object { $_ -match 'office|pack-heal|web/' } | ForEach-Object { Limit $_ 300 }) }
+    }
+    if ($KillBridgeProbe -and $bp) {
+        $pb = [ordered]@{ killed_pid = $bp.Id; new_bridge_pid = $null; new_bridge_after_s = $null }
+        try { Stop-Process -Id $bp.Id -Force -ErrorAction Stop } catch { }
+        $tk = Get-Date
+        while (((Get-Date) - $tk).TotalSeconds -lt 20) {
+            Start-Sleep -Milliseconds 500
+            $gg = Get-BridgeProcs
+            $nb = @($gg['bridges'] | Where-Object { $_.Id -ne $bp.Id })
+            if ($nb.Count -gt 0) { $pb['new_bridge_pid'] = $nb[0].Id; $pb['new_bridge_after_s'] = [math]::Round(((Get-Date) - $tk).TotalSeconds, 1); $bp = $nb[0]; break }
+        }
+        $pb['log_lines'] = @((Read-OutFile $d['err_file']) -split "`r?`n" | Where-Object { $_ -match 'office-bridge' } | Select-Object -Last 12)
+        $S['bridge_kill_probe'] = $pb
     }
     if ($bp) {
         $kidIds = @($kids | ForEach-Object { $_.Id })
@@ -853,10 +876,12 @@ Step 'TC-daemon' {
     $res = [ordered]@{}
     $new = $X['new']
     # (1) the default on Windows: legacy. Heal tests run here too (daemon + bridge running).
-    $res['new-default'] = Invoke-DaemonBridgeRun 'newdefault' $new @{} $true 25 $true
+    $res['new-default'] = Invoke-DaemonBridgeRun 'newdefault' $new @{} $true 25 $true $true
     Save-Json 'w44-daemon-new-default.json' $res['new-default'] 10
+    $res['new-default-kill'] = Invoke-DaemonBridgeRun 'newdefaultkill' $new @{} $false 15
+    Save-Json 'w44-daemon-new-default-kill.json' $res['new-default-kill'] 10
     # (2) managed mode through the environment, without a seat
-    $res['new-managed-noseat'] = Invoke-DaemonBridgeRun 'newmanagednoseat' $new @{ CYS_OFFICE_BRIDGE_MODE = 'managed' } $false 25
+    $res['new-managed-noseat'] = Invoke-DaemonBridgeRun 'newmanagednoseat' $new @{ CYS_OFFICE_BRIDGE_MODE = 'managed' } $false 25 $false $true
     Save-Json 'w44-daemon-new-managed-noseat.json' $res['new-managed-noseat'] 10
     # (3) managed mode with seats and a background child of a seat
     $res['new-managed-seat'] = Invoke-DaemonBridgeRun 'newmanagedseat' $new @{ CYS_OFFICE_BRIDGE_MODE = 'managed' } $true 25
