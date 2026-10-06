@@ -1,0 +1,7 @@
+{"t":"2026-10-06T11:08:58.935Z","name":"start","argv":"--mode w44 --port 9333 --out C:\\a\\_temp\\diag-out --prefix w44-upg --max-wait-sec 120 --ready-wait-sec 30 --w44-cys C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe --w44-office-wait-sec 150 --w44-feed-wait-sec 60 --w44-dept-pipes \\\\.\\pipe\\cys-dept-dept-1","native_websocket":true}
+{"t":"2026-10-06T11:08:58.957Z","name":"targets","count":1,"pages":1}
+{"t":"2026-10-06T11:08:58.965Z","name":"connected","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","ws_impl":"mini"}
+{"t":"2026-10-06T11:08:58.968Z","name":"attached","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","id":"6FDDD280EA92B3FC02BB906E3C5E1E30"}
+{"t":"2026-10-06T11:08:58.969Z","name":"page_info","href":"http://tauri.localhost/"}
+{"t":"2026-10-06T11:08:58.974Z","name":"app_version","value":"0.14.43"}
+

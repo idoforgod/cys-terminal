@@ -1,0 +1,162 @@
+conhost.exe  pid=10724 ppid=10728  path=C:\Windows\system32\conhost.exe  cmd=\??\C:\Windows\system32\conhost.exe 0x4
+conhost.exe  pid=7844 ppid=9536  path=C:\Windows\system32\conhost.exe  cmd=\??\C:\Windows\system32\conhost.exe 0x4
+conhost.exe  pid=10936 ppid=10916  path=C:\Windows\system32\conhost.exe  cmd=\??\C:\Windows\system32\conhost.exe 0x4
+conhost.exe  pid=4744 ppid=10176  path=C:\Windows\system32\conhost.exe  cmd=\??\C:\Windows\system32\conhost.exe 0x4
+conhost.exe  pid=9832 ppid=3664  path=\\?\C:\Windows\system32\conhost.exe  cmd=\\?\C:\Windows\system32\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0x3f0 --server 0x3e8
+CrossDeviceResume.exe  pid=504 ppid=6052  path=C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\CrossDeviceResume.exe  cmd="C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\CrossDeviceResume.exe" /tileid MicrosoftWindows.Client.CBS_cw5n1h2txyewy!CrossDeviceResumeApp
+csrss.exe  pid=6176 ppid=3636  path=  cmd=
+csrss.exe  pid=804 ppid=796  path=  cmd=
+ctfmon.exe  pid=7860 ppid=3244  path=C:\Windows\system32\ctfmon.exe  cmd=/QuitInfo:0000000000000324;0000000000000338; 
+cys-app.exe  pid=7448 ppid=4292  path=C:\Users\runneradmin\AppData\Local\cys\cys-app.exe  cmd="C:\Users\runneradmin\AppData\Local\cys\cys-app.exe" 
+cysd.exe  pid=3664 ppid=7448  path=C:\Users\runneradmin\AppData\Local\cys\cysd.exe  cmd="C:\Users\runneradmin\AppData\Local\cys\cysd.exe"
+DefenderAiPlatformHost.exe  pid=4856 ppid=3888  path=  cmd=
+DefenderSessionHelper.exe  pid=6704 ppid=3888  path=C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.4-0\DefenderSessionHelper.exe  cmd="C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.26080.4-0\DefenderSessionHelper.exe"
+dllhost.exe  pid=2072 ppid=1100  path=C:\Windows\system32\DllHost.exe  cmd=C:\Windows\system32\DllHost.exe /Processid:{973D20D7-562D-44B9-B70B-5A0F49CCDF3F}
+dwm.exe  pid=2336 ppid=6020  path=C:\Windows\system32\dwm.exe  cmd="dwm.exe"
+explorer.exe  pid=2088 ppid=6524  path=C:\Windows\Explorer.EXE  cmd=C:\Windows\Explorer.EXE
+fontdrvhost.exe  pid=1148 ppid=928  path=C:\Windows\system32\fontdrvhost.exe  cmd="fontdrvhost.exe"
+fontdrvhost.exe  pid=2084 ppid=6020  path=C:\Windows\system32\fontdrvhost.exe  cmd="fontdrvhost.exe"
+hosted-compute-agent  pid=10728 ppid=2572  path=C:\ProgramData\GitHub\HostedComputeAgent\hosted-compute-agent  cmd="C:\ProgramData\GitHub\HostedComputeAgent\hosted-compute-agent"
+LsaIso.exe  pid=696 ppid=928  path=  cmd=
+lsass.exe  pid=692 ppid=928  path=  cmd=
+Memory Compression  pid=2904 ppid=4  path=  cmd=
+MpDefenderCoreService.exe  pid=3896 ppid=532  path=  cmd=
+msedgewebview2.exe  pid=9124 ppid=1756  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --embedded-browser-webview=1 --webview-exe-name=SearchHost.exe --webview-exe-version=2607.28006.200.0 --user-data-dir="C:\Users\runneradmin\AppData\...
+msedgewebview2.exe  pid=3172 ppid=9124  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=utility --utility-sub-type=network.mojom.NetworkService --lang=en-US --service-sandbox-type=none --noerrdialogs --user-agent="Mozilla/5.0 (Wi...
+msedgewebview2.exe  pid=8600 ppid=9124  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=crashpad-handler --user-data-dir=C:\Users\runneradmin\AppData\Local\Packages\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\LocalState\EBWebView /...
+msedgewebview2.exe  pid=9460 ppid=9124  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=utility --utility-sub-type=storage.mojom.StorageService --lang=en-US --service-sandbox-type=service --noerrdialogs --user-agent="Mozilla/5.0 ...
+msedgewebview2.exe  pid=8844 ppid=9124  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=gpu-process --gpu-recent-crash-count=0 --noerrdialogs --user-agent="Mozilla/5.0 (Windows NT 10.0; Cortana 1.18.9.23723; 10.0.0.0.26200.9457) ...
+msedgewebview2.exe  pid=9708 ppid=9124  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=renderer --noerrdialogs --user-agent="Mozilla/5.0 (Windows NT 10.0; Cortana 1.18.9.23723; 10.0.0.0.26200.9457) AppleWebKit/537.36 (KHTML, lik...
+msedgewebview2.exe  pid=4796 ppid=6216  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=gpu-process --gpu-recent-crash-count=0 --noerrdialogs --user-data-dir="C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView" --...
+msedgewebview2.exe  pid=2660 ppid=6216  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=crashpad-handler --user-data-dir=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView /prefetch:4 /pfhostedapp:2f198bb71d93b04f...
+msedgewebview2.exe  pid=6216 ppid=7448  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --embedded-browser-webview=1 --webview-exe-name=cys-app.exe --webview-exe-version=0.14.42 --user-data-dir="C:\Users\runneradmin\AppData\Local\com.cy...
+msedgewebview2.exe  pid=2632 ppid=6216  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=renderer --noerrdialogs --user-data-dir="C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView" --webview-exe-name=cys-app.exe -...
+msedgewebview2.exe  pid=10600 ppid=6216  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=utility --utility-sub-type=storage.mojom.StorageService --lang=en-US --service-sandbox-type=service --noerrdialogs --user-data-dir="C:\Users\...
+msedgewebview2.exe  pid=9168 ppid=6216  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=utility --utility-sub-type=network.mojom.NetworkService --lang=en-US --service-sandbox-type=none --noerrdialogs --user-data-dir="C:\Users\run...
+msedgewebview2.exe  pid=3600 ppid=4184  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=utility --utility-sub-type=storage.mojom.StorageService --lang=en-US --service-sandbox-type=service --noerrdialogs --user-data-dir="C:\Users\...
+msedgewebview2.exe  pid=10320 ppid=4184  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=gpu-process --gpu-recent-crash-count=0 --noerrdialogs --user-data-dir="C:\Users\runneradmin\AppData\Local\Packages\MicrosoftWindows.Client.We...
+msedgewebview2.exe  pid=1984 ppid=4184  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=crashpad-handler --user-data-dir=C:\Users\runneradmin\AppData\Local\Packages\MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy\LocalState\E...
+msedgewebview2.exe  pid=4516 ppid=4184  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=utility --utility-sub-type=network.mojom.NetworkService --lang=en-US --service-sandbox-type=none --noerrdialogs --user-data-dir="C:\Users\run...
+msedgewebview2.exe  pid=4184 ppid=8704  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --embedded-browser-webview=1 --webview-exe-name=Widgets.exe --webview-exe-version=526.21100.10.0 --user-data-dir="C:\Users\runneradmin\AppData\Local...
+msedgewebview2.exe  pid=2348 ppid=4184  path=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe  cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=renderer --noerrdialogs --user-data-dir="C:\Users\runneradmin\AppData\Local\Packages\MicrosoftWindows.Client.WebExperience_cw5n1h2txyewy\Loca...
+MsMpEng.exe  pid=3888 ppid=532  path=  cmd=
+NisSrv.exe  pid=5820 ppid=532  path=  cmd=
+powershell.exe  pid=9644 ppid=10176  path=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.EXE  cmd="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.EXE" -command ". 'C:\a\_temp\fd245f86-26c2-45c9-87b9-e4d5fd2c108c.ps1'"
+powershell.exe  pid=4292 ppid=9644  path=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe  cmd="C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:\a\cys-terminal\cys-terminal\diag\app-e2e.ps1
+powershell.exe  pid=5176 ppid=3664  path=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe  cmd=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+provjobd.exe2939970958  pid=10840 ppid=10728  path=C:\Users\RUNNER~1\AppData\Local\Temp\provjobd.exe2939970958  cmd=C:\Users\RUNNER~1\AppData\Local\Temp\provjobd.exe2939970958
+Registry  pid=132 ppid=4  path=  cmd=
+Runner.Listener.exe  pid=10152 ppid=10728  path=C:\actions-runner\cached\2.337.0\bin\Runner.Listener.exe  cmd=C:\actions-runner\cached\2.337.0\bin\Runner.Listener.exe run
+Runner.Worker.exe  pid=10176 ppid=10152  path=C:\actions-runner\cached\2.337.0\bin\Runner.Worker.exe  cmd="C:\actions-runner\cached\2.337.0\bin\Runner.Worker.exe" spawnclient 1880 1892
+RuntimeBroker.exe  pid=9048 ppid=1100  path=C:\Windows\System32\RuntimeBroker.exe  cmd=C:\Windows\System32\RuntimeBroker.exe -Embedding
+RuntimeBroker.exe  pid=3216 ppid=1100  path=C:\Windows\System32\RuntimeBroker.exe  cmd=C:\Windows\System32\RuntimeBroker.exe -Embedding
+SearchHost.exe  pid=1756 ppid=1100  path=C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe  cmd="C:\Windows\SystemApps\MicrosoftWindows.Client.CBS_cw5n1h2txyewy\SearchHost.exe" -ServerName:CortanaUI.AppXstmwaab17q5s3y22tp6apqz7a45vwv65.mca
+SearchIndexer.exe  pid=6240 ppid=532  path=C:\Windows\system32\SearchIndexer.exe  cmd=C:\Windows\system32\SearchIndexer.exe /Embedding
+SearchProtocolHost.exe  pid=4088 ppid=6240  path=C:\Windows\System32\SearchProtocolHost.exe  cmd="C:\Windows\System32\SearchProtocolHost.exe" Global\UsGthrFltPipeMssGthrPipe3_ Global\UsGthrCtrlFltPipeMssGthrPipe3 1 -2147483646 "Software\Microsoft\Windows Search" "Mozilla/4.0 (compatible; MSIE 6.0; Windows NT; MS Search 4.0 Robot)" "C:\...
+Secure System  pid=92 ppid=4  path=  cmd=
+services.exe  pid=532 ppid=928  path=  cmd=
+ShellHost.exe  pid=5620 ppid=6052  path=C:\Windows\System32\ShellHost.exe  cmd="C:\Windows\System32\ShellHost.exe"
+sihost.exe  pid=6052 ppid=3352  path=C:\Windows\system32\sihost.exe  cmd=sihost.exe
+smss.exe  pid=648 ppid=4  path=  cmd=
+spoolsv.exe  pid=3420 ppid=532  path=C:\Windows\System32\spoolsv.exe  cmd=C:\Windows\System32\spoolsv.exe
+sqlwriter.exe  pid=3824 ppid=532  path=C:\Program Files\Microsoft SQL Server\90\Shared\sqlwriter.exe  cmd="C:\Program Files\Microsoft SQL Server\90\Shared\sqlwriter.exe"
+StartMenuExperienceHost.exe  pid=7556 ppid=1100  path=C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe  cmd="C:\Windows\SystemApps\Microsoft.Windows.StartMenuExperienceHost_cw5n1h2txyewy\StartMenuExperienceHost.exe" -ServerName:FullTrustApp.AppXykjsye98af63ez2annt9djke8trg8stn.mca
+svchost.exe  pid=2392 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k NetSvcs -p -s hns
+svchost.exe  pid=2328 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalServiceNetworkRestricted -p -s Dhcp
+svchost.exe  pid=2104 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalServiceNoNetwork -p
+svchost.exe  pid=11176 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalService -p -s CDPSvc
+svchost.exe  pid=2196 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k NetworkService -p
+svchost.exe  pid=10436 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalSystemNetworkRestricted -p -s SensorService
+svchost.exe  pid=2484 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalServiceHttp -p
+svchost.exe  pid=8368 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k ClipboardSvcGroup -p -s cbdhsvc
+svchost.exe  pid=7660 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k UdkSvcGroup -s UdkUserSvc
+svchost.exe  pid=3208 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalServiceNetworkRestricted -p
+svchost.exe  pid=8216 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k WuqiSvcGroup -p -s wuqisvc
+svchost.exe  pid=2608 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalServiceNetworkRestricted -p -s EventLog
+svchost.exe  pid=2572 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p -s Schedule
+svchost.exe  pid=2624 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcsRedirectionGuard -p -s lfsvc
+svchost.exe  pid=7996 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalSystemNetworkRestricted -p -s WdiSystemHost
+svchost.exe  pid=1592 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalSystemNetworkRestricted -p -s NcbService
+svchost.exe  pid=1400 ppid=532  path=  cmd=
+svchost.exe  pid=1636 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalServiceNetworkRestricted -p -s lmhosts
+svchost.exe  pid=1708 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k ICService -p -s vmicheartbeat
+svchost.exe  pid=1644 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalServiceNetworkRestricted -p -s TimeBrokerSvc
+svchost.exe  pid=1212 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k RPCSS -p
+svchost.exe  pid=1100 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k DcomLaunch -p
+svchost.exe  pid=1272 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k DcomLaunch -p -s LSM
+svchost.exe  pid=5040 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k netsvcs -p -s NetSetupSvc
+svchost.exe  pid=1452 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k appmodel -p -s StateRepository
+svchost.exe  pid=1716 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalSystemNetworkRestrictedRedirectionGuard -p -s vmickvpexchange
+svchost.exe  pid=1020 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p -s winmgmt
+svchost.exe  pid=2512 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p -s wlidsvc
+svchost.exe  pid=10260 ppid=532  path=  cmd=
+svchost.exe  pid=7488 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k InvSvcGroup -p -s InventorySvc
+svchost.exe  pid=7220 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k whesvc -p -s whesvc
+svchost.exe  pid=1800 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalServiceNetworkRestricted -p -s vmictimesync
+svchost.exe  pid=1724 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalSystemNetworkRestrictedRedirectionGuard -p -s vmicshutdown
+svchost.exe  pid=1920 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalService -p -s nsi
+svchost.exe  pid=1976 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k netprofm -p -s netprofm
+svchost.exe  pid=7228 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p -s seclogon
+svchost.exe  pid=3704 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k NetworkService -s TermService
+svchost.exe  pid=5196 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k WSAIFabricSvcGroup -p -s WSAIFabricSvc
+svchost.exe  pid=5320 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalSystemNetworkRestricted -p -s UmRdpService
+svchost.exe  pid=3148 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k netsvcs -p -s SharedAccess
+svchost.exe  pid=2460 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p -s LanmanServer
+svchost.exe  pid=4376 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k osprivacy -p -s camsvc
+svchost.exe  pid=2996 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalService -p -s FontCache
+svchost.exe  pid=2988 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalSystemNetworkRestricted -p -s AudioEndpointBuilder
+svchost.exe  pid=5968 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalServiceNoNetwork -p -s pla
+svchost.exe  pid=5432 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k netsvcs -p -s SessionEnv
+svchost.exe  pid=5472 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -s CertPropSvc
+svchost.exe  pid=6124 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalServiceNetworkRestricted -s RmSvc
+svchost.exe  pid=3340 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k netsvcs -p -s ShellHWDetection
+svchost.exe  pid=3352 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p -s UserManager
+svchost.exe  pid=3488 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k NetworkService -p -s LanmanWorkstation
+svchost.exe  pid=3244 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalSystemNetworkRestricted -p -s TextInputManagementService
+svchost.exe  pid=3288 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalServiceNetworkRestricted -p -s DusmSvc
+svchost.exe  pid=3296 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalServiceNetworkRestricted -p -s Wcmsvc
+svchost.exe  pid=3572 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalServiceNoNetwork -p -s DPS
+svchost.exe  pid=3684 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k NetworkService -p -s WinRM
+svchost.exe  pid=3732 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p -s WpnService
+svchost.exe  pid=3544 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k NetSvcs -p -s iphlpsvc
+svchost.exe  pid=3552 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalService -p -s DispBrokerDesktopSvc
+svchost.exe  pid=3564 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k NetworkService -p
+svchost.exe  pid=6824 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalServiceAndNoImpersonationRedirectionGuard -p -s SSDPSRV
+svchost.exe  pid=2896 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcsRedirectionGuard -p -s SENS
+svchost.exe  pid=2836 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k NetSvcs -s nvagent
+svchost.exe  pid=2696 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalServiceRedirectionGuard -p -s EventSystem
+svchost.exe  pid=5108 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p -s Appinfo
+svchost.exe  pid=2688 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k netsvcs -p -s Themes
+svchost.exe  pid=3496 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k UnistackSvcGroup -s WpnUserService
+svchost.exe  pid=6244 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalSystemNetworkRestricted -p -s webthreatdefusersvc
+svchost.exe  pid=2356 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p
+svchost.exe  pid=1472 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k WebThreatDefense -p -s webthreatdefsvc
+svchost.exe  pid=6876 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k LocalService -p -s LicenseManager
+svchost.exe  pid=6596 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p -s wuauserv
+svchost.exe  pid=2680 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalSystemNetworkRestricted -p -s SysMain
+svchost.exe  pid=2672 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k UserProfileService -p -s ProfSvc
+svchost.exe  pid=7032 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k netsvcs -p -s UsoSvc
+svchost.exe  pid=4820 ppid=532  path=C:\Windows\System32\svchost.exe  cmd=C:\Windows\System32\svchost.exe -k AppReadiness -p -s AppReadiness
+svchost.exe  pid=2960 ppid=532  path=C:\Windows\system32\svchost.exe  cmd=C:\Windows\system32\svchost.exe -k LocalServiceNoNetworkFirewall -p
+System  pid=4 ppid=0  path=  cmd=
+System Idle Process  pid=0 ppid=0  path=  cmd=
+SystemPropertiesPerformance.exe  pid=6852 ppid=6524  path=C:\Windows\System32\SystemPropertiesPerformance.exe  cmd="C:\Windows\System32\SystemPropertiesPerformance.exe" /pagefile
+taskhostw.exe  pid=7516 ppid=2572  path=C:\Windows\system32\taskhostw.exe  cmd=taskhostw.exe {222A245B-E637-4AE9-A93F-A59CA119A75E}
+taskhostw.exe  pid=7452 ppid=2572  path=C:\Windows\system32\taskhostw.exe  cmd=taskhostw.exe $(Arg0)
+taskhostw.exe  pid=3124 ppid=2572  path=C:\Windows\system32\taskhostw.exe  cmd=taskhostw.exe ExploitGuardPolicy
+vctip.exe  pid=3024 ppid=8052  path=C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\HostARM64\arm64\VCTIP.EXE  cmd="C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\HostARM64\arm64\VCTIP.EXE"
+vmcompute.exe  pid=3512 ppid=532  path=C:\Windows\system32\vmcompute.exe  cmd=C:\Windows\system32\vmcompute.exe
+vmms.exe  pid=2052 ppid=532  path=C:\Windows\system32\vmms.exe  cmd=C:\Windows\system32\vmms.exe
+WaAppAgent.exe  pid=9364 ppid=532  path=C:\WindowsAzure\GuestAgent_2.7.41491.1243_2026-10-06_104832\WaAppAgent.exe  cmd=C:\WindowsAzure\GuestAgent_2.7.41491.1243_2026-10-06_104832\WaAppAgent.exe
+WaSecAgentProv.exe  pid=10916 ppid=9364  path=C:\WindowsAzure\SecAgent\WaSecAgentProv.exe  cmd="C:\WindowsAzure\SecAgent\WaSecAgentProv.exe" -startPoll C:\WindowsAzure\Logs\ 168.63.129.16 5248000 3600000 21600000
+Widgets.exe  pid=8704 ppid=1100  path=C:\Program Files\WindowsApps\MicrosoftWindows.Client.WebExperience_526.21100.40.0_arm64__cw5n1h2txyewy\Dashboard\Widgets.exe  cmd="C:\Program Files\WindowsApps\MicrosoftWindows.Client.WebExperience_526.21100.40.0_arm64__cw5n1h2txyewy\Dashboard\Widgets.exe" -ServerName:Microsoft.Windows.DashboardServer
+WidgetService.exe  pid=7296 ppid=1100  path=C:\Program Files\WindowsApps\Microsoft.WidgetsPlatformRuntime_1.6.19.0_arm64__8wekyb3d8bbwe\WidgetService\WidgetService.exe  cmd="C:\Program Files\WindowsApps\Microsoft.WidgetsPlatformRuntime_1.6.19.0_arm64__8wekyb3d8bbwe\WidgetService\WidgetService.exe" -RegisterProcessAsComServer -Embedding
+WindowsAzureGuestAgent.exe  pid=9684 ppid=532  path=C:\WindowsAzure\GuestAgent_2.7.41491.1243_2026-10-06_104832\WindowsAzureGuestAgent.exe  cmd=C:\WindowsAzure\GuestAgent_2.7.41491.1243_2026-10-06_104832\WindowsAzureGuestAgent.exe
+wininit.exe  pid=928 ppid=796  path=  cmd=
+winlogon.exe  pid=6020 ppid=3636  path=C:\Windows\system32\winlogon.exe  cmd=winlogon.exe {F481F418-1EE8-4389-8309-0DBD89160000}
+WmiPrvSE.exe  pid=4648 ppid=1100  path=C:\Windows\system32\wbem\wmiprvse.exe  cmd=C:\Windows\system32\wbem\wmiprvse.exe
+WmiPrvSE.exe  pid=8516 ppid=1100  path=C:\Windows\system32\wbem\wmiprvse.exe  cmd=C:\Windows\system32\wbem\wmiprvse.exe
+WmiPrvSE.exe  pid=11064 ppid=1100  path=C:\Windows\system32\wbem\wmiprvse.exe  cmd=C:\Windows\system32\wbem\wmiprvse.exe
+wsl.exe  pid=9536 ppid=10568  path=C:\Windows\system32\wsl.exe  cmd=C:\Windows\system32\wsl.exe --update --confirm --prompt-before-exit
+WWAHost.exe  pid=6520 ppid=1100  path=C:\Windows\system32\wwahost.exe  cmd="C:\Windows\system32\wwahost.exe" -ServerName:App.wwa
+XtaCache.exe  pid=2636 ppid=532  path=  cmd=

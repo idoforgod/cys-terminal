@@ -1,0 +1,6 @@
+usage view-mode button labels over 3 clicks: [ >  >  > ] cycle_ok=False
+feed hq: PASS (seen, Allow clicked, the pushing process got allow = exit 0) (seen after 1004 ms, exit code 0, pipe (default))
+feed dept1: NOT SEEN in the Feed list (seen after  ms, exit code , pipe \\.\pipe\cys-dept-dept-1)
+office tab: loaded_signal=False after  ms; bridge /health status ; /world status  bytes ; office-boot.js 
+bridge processes: before the scene 0, after 0
+doctor Antigravity line(s):   [SKIP] agy-statusline   agy 설정 폴더 없음(agy 미설치) — 점검 대상 아님

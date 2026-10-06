@@ -1,0 +1,16 @@
+# base state: waiting (every 3 s, at most 120 s) for a cysd.exe of the install folder AND a committed pack (.pack-version); start 2026-10-06T10:58:56.013Z
+[   0s 2026-10-06T10:58:56.177Z] cysd=[pid 3664 (parent 7448, created 2026-10-06T10:58:53.840Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=68 version=
+[   3s 2026-10-06T10:58:59.270Z] cysd=[pid 3664 (parent 7448, created 2026-10-06T10:58:53.840Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=175 version=
+[   6s 2026-10-06T10:59:02.369Z] cysd=[pid 3664 (parent 7448, created 2026-10-06T10:58:53.840Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=345 version=
+[   9s 2026-10-06T10:59:05.514Z] cysd=[pid 3664 (parent 7448, created 2026-10-06T10:58:53.840Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=509 version=
+[  13s 2026-10-06T10:59:08.715Z] cysd=[pid 3664 (parent 7448, created 2026-10-06T10:58:53.840Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=669 version=
+[  16s 2026-10-06T10:59:11.847Z] cysd=[pid 3664 (parent 7448, created 2026-10-06T10:58:53.840Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=831 version=
+[  19s 2026-10-06T10:59:14.990Z] cysd=[pid 3664 (parent 7448, created 2026-10-06T10:58:53.840Z, image cysd.exe v0.14.42)] pipes=[cys] pack: files=942 version=0.14.42
+# end: a daemon runs and the pack is committed
+[settle +  0s 2026-10-06T10:59:15.048Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-5012] gui-onboarded=none onboard-attempts=none busy=[cys.exe#5012 init-pack] missing=4
+[settle +  2s 2026-10-06T10:59:17.096Z] stamp=none pending-restore=False pack=none pack.prev=True staging=[.pack-staging-init-5012] gui-onboarded=none onboard-attempts=none busy=[cys.exe#5012 init-pack] missing=4
+[settle +  4s 2026-10-06T10:59:19.136Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-2036] gui-onboarded=0.14.42 onboard-attempts=none busy=[cys.exe#2036 init-pack --no-install-hook] missing=3
+[settle +  6s 2026-10-06T10:59:21.171Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-2036] gui-onboarded=0.14.42 onboard-attempts=none busy=[cys.exe#2036 init-pack --no-install-hook] missing=3
+[settle +  8s 2026-10-06T10:59:23.223Z] stamp=none pending-restore=False pack=0.14.42 pack.prev=True staging=[.pack-staging-init-2036] gui-onboarded=0.14.42 onboard-attempts=none busy=[cys.exe#2036 init-pack --no-install-hook] missing=3
+[settle + 10s 2026-10-06T10:59:25.280Z] stamp=0.14.42 pending-restore=False pack=0.14.42 pack.prev=True staging=[] gui-onboarded=0.14.42 onboard-attempts=none busy=[] missing=0
+# settled=True after +10 s; missing: 
