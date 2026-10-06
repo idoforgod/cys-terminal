@@ -1,0 +1,14 @@
+w44 summary on windows-11-arm (2026-10-06T05:12:36.257Z)
+step S0-inputs: 1227.1s 
+step S1-install: 85.1s 
+step S1b-old-0.14.43: 38.7s 
+step TA-approval: 656.4s 
+step TB-bridge: 0.1s System.Management.Automation.RuntimeException: Cannot index into a null array. At C:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:685 char:5
++     $pr = Invoke-Proc -File $X['new']['py'] -Arguments ('"{0}"' -f $p ...
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+step TC-daemon: 1.3s System.Management.Automation.RuntimeException: Cannot index into a null array. At C:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:130 char:9
++         $script:proc = Start-Process -FilePath $Set['cysd'] -PassThru ...
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+step TD-hook: 0s System.Management.Automation.ParameterBindingValidationException: Cannot bind argument to parameter 'LiteralPath' because it is null. At C:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:879 char:40
++     $hook = Get-ChildItem -LiteralPath $pk -Filter 'role-capability-g ...
++                                        ~~~

@@ -1,0 +1,69 @@
+{
+  "generated": "2026-10-06T05:12:37.244Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37414618670",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37414618670",
+  "job": "w44",
+  "os": "windows-11-arm",
+  "branch": "diag-results/37414618670-1-w44-windows-11-arm",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "done-w44-measure.json",
+      "bytes": 1700
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-w44-measure.txt",
+      "bytes": 3965
+    },
+    {
+      "path": "syntax-check.txt",
+      "bytes": 72
+    },
+    {
+      "path": "w44-approval-new-approvals-ttl.json",
+      "bytes": 5549
+    },
+    {
+      "path": "w44-approval-new-approvals.json",
+      "bytes": 19
+    },
+    {
+      "path": "w44-approval-new-cysd-approval-new.err.txt",
+      "bytes": 1130
+    },
+    {
+      "path": "w44-approval-new-list.txt",
+      "bytes": 75
+    },
+    {
+      "path": "w44-approval-new.json",
+      "bytes": 33467
+    },
+    {
+      "path": "w44-old-extract.json",
+      "bytes": 883
+    },
+    {
+      "path": "w44-results.json",
+      "bytes": 3877
+    },
+    {
+      "path": "w44-summary.txt",
+      "bytes": 1140
+    }
+  ],
+  "skipped": [
+    {
+      "path": "w44-approval-new-cysd-approval-new.out.txt",
+      "reason": "empty file"
+    }
+  ],
+  "inline_files": 12,
+  "blob_files": 0
+}
