@@ -2346,7 +2346,7 @@ enum ApprovalAction {
         ///   의미는 하나다: **검사할 전체 명령 문자열**(서명된 prefix 와 매칭한다).
         #[arg(long, alias = "prefix")]
         command: String,
-        /// 명령 실행 cwd (생략 시 미지정 — 레코드가 cwd 무관이면 매칭)
+        /// 명령을 실행할 폴더. 생략하면 지금 폴더로 확인한다
         #[arg(long)]
         cwd: Option<String>,
         /// ★(0.14.31 · CONTRACTS B-3) **만료되지 않은 TTL 승인**만 통과시킨다.
@@ -2360,7 +2360,9 @@ enum ApprovalAction {
         /// 승인할 명령 prefix (공백 구분 토큰, 예: "git push")
         #[arg(long)]
         prefix: String,
-        /// 승인 범위를 고정할 cwd (생략 시 cwd 무관 승인)
+        /// 승인을 묶을 폴더. 생략하면 지금 폴더에 묶인다 — 다른 폴더의 좌석이 실행할 명령이면 그 좌석의 폴더를 적는다.
+        /// 대상을 직접 지정하는 cys 명령(kill·close-surface·launch-agent 등)을 시간 한정(`--ttl`)으로 서명하면,
+        /// 정확히 그 명령은 이 데몬 안에서 폴더와 무관하게 통한다
         #[arg(long)]
         cwd: Option<String>,
         /// ★(0.14.31 · CONTRACTS B-3) 승인 수명(초). 지정하면 레코드에 `expires_at`(epoch)이
@@ -33023,6 +33025,23 @@ mod tests {
                 .is_err(),
             "같은 인자를 두 번 준 호출이 조용히 통과했다"
         );
+    }
+
+    /// ★(0.14.44 · A1) `cys approval sign --help` · `check --help` 의 폴더 설명이 **실제 동작**(생략하면 지금 폴더)을 말한다.
+    /// 옛 문구("cwd 무관 승인" · "생략 시 미지정")는 0건, 새 문구의 핵심 낱말("지금 폴더")은 각 1건 이상.
+    #[test]
+    fn a1_approval_help_texts_describe_the_actual_cwd_behavior() {
+        use clap::CommandFactory;
+        let mut root = <Cli as CommandFactory>::command();
+        let approval = root.find_subcommand_mut("approval").expect("approval 동사");
+        for (verb, needle) in [("sign", "지금 폴더에 묶인다"), ("check", "지금 폴더로 확인한다")] {
+            let sub = approval.find_subcommand_mut(verb).expect("하위 동사");
+            let help = sub.render_long_help().to_string();
+            assert!(!help.contains("cwd 무관 승인"), "{verb}: 옛 문구가 남았다\n{help}");
+            assert!(!help.contains("생략 시 미지정"), "{verb}: 옛 문구가 남았다\n{help}");
+            assert_eq!(help.matches(needle).count(), 1, "{verb}: 새 문구가 정확히 한 번 있어야 한다\n{help}");
+            assert!(help.contains("지금 폴더"), "{verb}: 핵심 낱말");
+        }
     }
 
     /// `cys reclaim-role --auto` 는 계약 인자 3종(+`--env-role`)을 받는다. 훅이 넘기는 그 형태로 핀.
