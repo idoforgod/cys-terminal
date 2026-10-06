@@ -1,0 +1,18 @@
+2026-10-06T05:43:51.8233399-07:00 user=runneradmin profile=C:\Users\runneradmin admin=True
+2026-10-06T05:43:52.3195444-07:00 daemon pid 5764
+2026-10-06T05:45:48.3715824-07:00 ready=False
+2026-10-06T05:45:48.8203647-07:00 seat: System.Management.Automation.RemoteException thread 'main' (4312) has overflowed its stack
+2026-10-06T05:45:57.3156949-07:00 status: System.Management.Automation.RemoteException | thread 'main' (7116) has overflowed its stack
+2026-10-06T05:45:57.8540674-07:00 list: System.Management.Automation.RemoteException | thread 'main' (6596) has overflowed its stack
+2026-10-06T05:46:03.3231291-07:00 status: System.Management.Automation.RemoteException | thread 'main' (9188) has overflowed its stack
+2026-10-06T05:46:03.7748156-07:00 list: System.Management.Automation.RemoteException | thread 'main' (796) has overflowed its stack
+2026-10-06T05:46:09.2317998-07:00 status: System.Management.Automation.RemoteException | thread 'main' (7876) has overflowed its stack
+2026-10-06T05:46:09.6909356-07:00 list: System.Management.Automation.RemoteException | thread 'main' (5920) has overflowed its stack
+2026-10-06T05:46:15.1366447-07:00 status: System.Management.Automation.RemoteException | thread 'main' (128) has overflowed its stack
+2026-10-06T05:46:15.5993457-07:00 list: System.Management.Automation.RemoteException | thread 'main' (2448) has overflowed its stack
+2026-10-06T05:46:21.0487019-07:00 status: System.Management.Automation.RemoteException | thread 'main' (9304) has overflowed its stack
+2026-10-06T05:46:21.5630295-07:00 list: System.Management.Automation.RemoteException | thread 'main' (6968) has overflowed its stack
+2026-10-06T05:46:27.0171526-07:00 status: System.Management.Automation.RemoteException | thread 'main' (3220) has overflowed its stack
+2026-10-06T05:46:27.4737125-07:00 list: System.Management.Automation.RemoteException | thread 'main' (9172) has overflowed its stack
+2026-10-06T05:46:27.4945534-07:00 proc_count_high lines in daemon stderr: 0
+2026-10-06T05:46:27.5169705-07:00 done

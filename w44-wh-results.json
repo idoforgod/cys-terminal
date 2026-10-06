@@ -1,0 +1,25 @@
+{
+    "os":  "windows-11-arm",
+    "files":  [
+
+              ],
+    "tests":  {
+
+              },
+    "daemon":  {
+
+               },
+    "errors":  [
+
+               ],
+    "test_exe_exists":  false,
+    "bins":  [
+                 "cys.exe 34816512",
+                 "cysd.exe 51051520"
+             ],
+    "whoami_rc":  null,
+    "whoami_elevated":  [
+                            "\"BUILTIN\\Administrators\",\"Alias\",\"S-1-5-32-544\",\"Mandatory group, Enabled by default, Enabled group, Group owner\"",
+                            "\"Mandatory Label\\High Mandatory Level\",\"Label\",\"S-1-16-12288\",\"\""
+                        ]
+}

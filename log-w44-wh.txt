@@ -1,0 +1,3 @@
+2026-10-06T12:43:44.947Z [INFO] === w44-wh start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-06T12:49:29.776Z [WARN] Save-Json failed for w44-wh-results.json: Exception of type 'System.OutOfMemoryException' was thrown.
+2026-10-06T12:49:29.836Z [INFO] === w44-wh end ===
