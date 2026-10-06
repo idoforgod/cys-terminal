@@ -12,16 +12,24 @@ permissions:
 
 jobs:
   unit:
-    name: 'w44-unit (windows-latest)'
-    if: ${{ contains(github.event.head_commit.message, '[w44-ci]') }}
+    name: 'w44-unit (windows-latest, ${{ matrix.label }})'
+    if: ${{ contains(github.event.head_commit.message, '[w44-ci]') || contains(github.event.head_commit.message, '[w44-ub]') }}
     runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: 'v0.14.44-candidate'
+            ref: 4544eb3f095987eec24bc31de63b4a4e123f36c3
+          - label: 'baseline-v0.14.43'
+            ref: 55d3d2d60d7fa9d044135976c236d6abb6088081
     timeout-minutes: 120
     env:
       PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4544eb3f095987eec24bc31de63b4a4e123f36c3
+          ref: ${{ matrix.ref }}
           path: p
           fetch-depth: 0
       - uses: actions/checkout@v4
@@ -68,6 +76,8 @@ jobs:
           run_cargo cysd-knobs --bin cysd knobs:: -- --test-threads=1 --nocapture
           run_cargo cysd-approval --bin cysd approval -- --test-threads=1 --nocapture
           run_cargo cys-approval --bin cys approval -- --test-threads=1 --nocapture
+          # the same with a bigger test-thread stack: tells a stack-only abort from a logic failure
+          RUST_MIN_STACK=33554432 run_cargo cys-approval-bigstack --bin cys approval -- --test-threads=1 --nocapture
           run_cargo lib-all-approval --lib approval -- --test-threads=1 --nocapture
           # pack specimens on Windows: the gate hook (shell) and the bridge script
           for pat in 'test_capgate_hook_shell.py' 'test_hud_bridge*.py' 'test_hud_detail_v11.py'; do
@@ -83,13 +93,13 @@ jobs:
         shell: cmd
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: node d\diag\publish-results.mjs --job w44-unit --os windows-latest --out "%RUNNER_TEMP%\diag-out"
+        run: node d\diag\publish-results.mjs --job w44-unit-${{ matrix.label }} --os windows-latest --out "%RUNNER_TEMP%\diag-out"
 
       - name: upload-artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diag-w44-unit
+          name: diag-w44-unit-${{ matrix.label }}
           path: ${{ runner.temp }}\diag-out
           if-no-files-found: warn
           retention-days: 14

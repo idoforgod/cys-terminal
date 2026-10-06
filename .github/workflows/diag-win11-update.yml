@@ -721,7 +721,7 @@ jobs:
     needs: appe2e-gate
     if: ${{ !contains(github.event.head_commit.message, '[w44-') && (contains(github.event.head_commit.message, '[appe2e-only]') || (needs.appe2e-gate.outputs.go == 'true' && !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]'))) }}
     runs-on: windows-11-arm
-    timeout-minutes: 65
+    timeout-minutes: 85
     strategy:
       fail-fast: false
       matrix:
@@ -734,7 +734,7 @@ jobs:
     env:
       DIAG_MATRIX_OS: windows-11-arm
       DIAG_JOB_LIMIT_MIN: '40'
-      DIAG_TEAM_EXTRA_MIN: '15'
+      DIAG_TEAM_EXTRA_MIN: '28'
       APPE2E_RUN_ID: ${{ needs.appe2e-gate.outputs.run_id }}
       APPE2E_ARTIFACT: ${{ needs.appe2e-gate.outputs.artifact }}
       APPE2E_MANIFEST_URL: https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/diag/appe2e-manifest.json
@@ -829,7 +829,7 @@ jobs:
       - name: app-e2e
         shell: powershell
         continue-on-error: true
-        timeout-minutes: 51
+        timeout-minutes: 71
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPE2E_INSTALLER_DIR: ${{ runner.temp }}\appe2e-installer

@@ -5,7 +5,7 @@
 // RFC 6455 over node:http upgrade, NO extensions offered) because Node's global WebSocket (undici) offers
 // 'permessage-deflate' and Chromium's DevTools server would accept it. The global WebSocket stays as a fallback.
 //
-//   node cdp-update.mjs --port 9333 --out <dir> [--prefix e2e] [--mode update|version|attach|ui|uipre|uiteam|uiobs] [--max-wait-sec 720] [--ws mini|native]
+//   node cdp-update.mjs --port 9333 --out <dir> [--prefix e2e] [--mode update|version|attach|ui|uipre|uiteam|uiobs|w44] [--max-wait-sec 720] [--ws mini|native]
 //   mode update (default): attach, app version, screenshot, check_update, listeners, install_update {force:true}
 //   mode version:          attach and read the app version only (<prefix>-cdp-after.json)
 //   mode attach:           attach, app version, screenshot, check_update - and STOP (install_update is NOT called);
@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 
 function parseArgs(argv) {
   const o = {};
@@ -2842,6 +2843,10 @@ async function main() {
     await runObsMode();
     return;
   }
+  if (MODE === 'w44') {
+    await runW44Mode();
+    return;
+  }
 
   // screenshot before
   try {
@@ -2936,6 +2941,251 @@ async function main() {
   } else {
     await pollEvents();
   }
+}
+
+// ---------------------------------------------------------------------------
+// w44 task (diag/w44-scene.ps1): mode w44 = the 0.14.44 screens on a real Windows 11, driven over CDP.
+//   usage     the view-mode button of the usage box (#wsbar-usage .usage-mode): its text, the box text, 3 clicks (auto -> all -> one -> auto)
+//   feed      Control Center > approval Feed: the tab, a pushed HQ item shows up, Allow on it is received by the pushing process
+//             (`cys feed push --wait` exits 0 = allow), and the same for an item pushed to a department daemon (--w44-dept-pipes)
+//   office    Control Center > office tab: does the page load (hint hidden, iframe src), the targets, the bridge /health and /world
+// Nothing outside the app is touched except the feed items pushed here (`cys feed push` of the product) and the bridge GETs.
+// Options: --w44-cys <cys.exe> --w44-dept-pipes <pipe,pipe> --w44-office-wait-sec 120 --w44-feed-wait-sec 60
+// Files: <prefix>-cdp.json (R.w44), <prefix>-ui-w44-*.png
+// ---------------------------------------------------------------------------
+const W44_CYS = args['w44-cys'] === undefined || args['w44-cys'] === true ? '' : String(args['w44-cys']);
+const W44_DEPT_PIPES = args['w44-dept-pipes'] === undefined || args['w44-dept-pipes'] === true ? [] : String(args['w44-dept-pipes']).split(',').map((s) => s.trim()).filter(Boolean);
+const W44_OFFICE_WAIT_MS = Math.max(10, Number(args['w44-office-wait-sec'] || 120)) * 1000;
+const W44_FEED_WAIT_MS = Math.max(10, Number(args['w44-feed-wait-sec'] || 60)) * 1000;
+
+const w44Expr = (fn, ...a) => '(' + fn.toString() + ')(' + a.map((x) => JSON.stringify(x)).join(',') + ')';
+
+function pageW44Usage() {
+  const host = document.getElementById('wsbar-usage');
+  const btn = host ? host.querySelector('.usage-mode') : null;
+  const body = host ? host.querySelector('.usage-body') : null;
+  const sum = host ? host.querySelector('.usage-sum') : null;
+  let stored = null;
+  try { stored = localStorage.getItem('cys-usage-mode'); } catch (e) { stored = 'blocked'; }
+  return {
+    host: !!host,
+    button: btn ? btn.textContent : null,
+    button_title: btn ? btn.title : null,
+    summary: sum ? sum.textContent : null,
+    body_text: body ? String(body.innerText || '').slice(0, 700) : null,
+    body_boxes: body ? body.querySelectorAll('.usage-box, .ub-box, [class*="box"]').length : null,
+    body_children: body ? body.children.length : null,
+    stored_mode: stored,
+  };
+}
+function pageW44ClickUsageMode() {
+  const btn = document.querySelector('#wsbar-usage .usage-mode');
+  if (!btn) return false;
+  btn.click();
+  return true;
+}
+function pageW44Click(sel) {
+  const el = document.querySelector(sel);
+  if (!el) return false;
+  el.click();
+  return true;
+}
+function pageW44Feed() {
+  const box = document.getElementById('cc-feed-items');
+  const items = box ? Array.from(box.querySelectorAll('.feed-item')) : [];
+  const badge = document.getElementById('cc-feed-tabbadge');
+  const pend = document.getElementById('cc-pending-badge');
+  return {
+    box: !!box,
+    visible: box ? !!(box.offsetParent) : null,
+    item_count: items.length,
+    items: items.slice(0, 12).map((e) => ({
+      cls: e.className,
+      title: (e.querySelector('.fi-title') || {}).textContent || '',
+      meta: (e.querySelector('.fi-meta') || {}).textContent || '',
+      buttons: Array.from(e.querySelectorAll('button')).map((b) => (b.textContent || '') + (b.disabled ? '(off)' : '')),
+    })),
+    tab_badge: badge ? { text: badge.textContent, hidden: !!badge.hidden } : null,
+    cc_badge: pend ? { text: pend.textContent, hidden: !!pend.hidden } : null,
+    text_head: box ? String(box.innerText || '').slice(0, 500) : null,
+  };
+}
+function pageW44FeedClickAllow(title) {
+  const box = document.getElementById('cc-feed-items');
+  if (!box) return { ok: false, why: 'no #cc-feed-items' };
+  const items = Array.from(box.querySelectorAll('.feed-item'));
+  const it = items.find((e) => String((e.querySelector('.fi-title') || {}).textContent || '').indexOf(title) >= 0);
+  if (!it) return { ok: false, why: 'item not in the list', count: items.length };
+  const b = it.querySelector('.fi-actions button.allow');
+  if (!b) return { ok: false, why: 'no Allow button', buttons: Array.from(it.querySelectorAll('button')).map((x) => x.textContent), cls: it.className };
+  b.click();
+  return { ok: true, cls: it.className };
+}
+function pageW44Office() {
+  const fr = document.getElementById('cc-office-frame');
+  const hint = document.getElementById('cc-office-hint');
+  const txt = document.getElementById('cc-office-hint-text');
+  const view = document.getElementById('cc-view-office');
+  let doc = 'n/a';
+  try { doc = fr && fr.contentDocument ? ('title=' + fr.contentDocument.title) : 'no contentDocument (cross-origin or not loaded)'; } catch (e) { doc = 'blocked: ' + e.name; }
+  return {
+    view_visible: view ? !view.hidden : null,
+    frame_src: fr ? fr.getAttribute('src') : null,
+    frame_w: fr ? fr.clientWidth : null,
+    frame_h: fr ? fr.clientHeight : null,
+    hint_hidden: hint ? !!hint.hidden : null,
+    hint_text: txt ? txt.textContent : null,
+    repair_button_hidden: (document.getElementById('cc-office-repair') || {}).hidden,
+    frame_document: doc,
+  };
+}
+
+function w44SpawnFeed(title, body, pipe) {
+  const rec = { title, pipe: pipe || '(default)', started: iso(), pid: null, exit_code: null, exited_at: null, stdout: '', stderr: '', error: null, child: null };
+  try {
+    const env = { ...process.env };
+    if (pipe) env.CYS_SOCKET = pipe;
+    const child = spawn(W44_CYS, ['feed', 'push', '--kind', 'permission', '--title', title, '--body', body, '--wait', '--timeout-secs', '170'], { env, windowsHide: true });
+    rec.pid = child.pid;
+    child.stdout.on('data', (d) => { rec.stdout = (rec.stdout + d).slice(-600); });
+    child.stderr.on('data', (d) => { rec.stderr = (rec.stderr + d).slice(-600); });
+    child.on('exit', (c) => { rec.exit_code = c; rec.exited_at = iso(); });
+    child.on('error', (e) => { rec.error = String(e && e.message ? e.message : e); });
+    rec.child = child;
+  } catch (e) { rec.error = String(e && e.message ? e.message : e); }
+  return rec;
+}
+
+async function w44HttpGet(url, ms) {
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(ms || 5000) });
+    const t = await r.text();
+    return { url, status: r.status, bytes: t.length, head: t.slice(0, 600), text: t };
+  } catch (e) { return { url, error: String(e && e.message ? e.message : e) }; }
+}
+
+async function w44Feed(W, label, title, pipe) {
+  const F = { label, title, pipe: pipe || '(default)', pushed: null, seen_after_ms: null, seen_item: null, clicked: null, exit_code: null, exit_after_click_ms: null, verdict: null };
+  W.feed.push(F);
+  save();
+  const sp = w44SpawnFeed(title, 'w44 probe: the harness pushed this item and presses Allow on it', pipe);
+  F.pushed = { pid: sp.pid, error: sp.error };
+  const t0 = Date.now();
+  let seen = null;
+  while (Date.now() - t0 < W44_FEED_WAIT_MS && !closed) {
+    if (sp.exit_code !== null || sp.error) break;
+    try {
+      const f = await evalJs(w44Expr(pageW44Feed), { awaitPromise: false, timeoutMs: 10000 });
+      const it = (f.items || []).find((x) => String(x.title).indexOf(title) >= 0);
+      if (it) { seen = it; F.seen_after_ms = Date.now() - t0; break; }
+    } catch (e) { /* page busy */ }
+    await sleep(1000);
+  }
+  F.seen_item = seen;
+  if (seen) {
+    await uiShot('w44-feed-' + label + '-seen');
+    try {
+      F.clicked = await evalJs(w44Expr(pageW44FeedClickAllow, title), { awaitPromise: false, timeoutMs: 10000 });
+    } catch (e) { F.clicked = { ok: false, why: String(e && e.message ? e.message : e) }; }
+    const tc = Date.now();
+    while (Date.now() - tc < 25000 && sp.exit_code === null && !sp.error) await sleep(500);
+    F.exit_after_click_ms = Date.now() - tc;
+  }
+  F.exit_code = sp.exit_code;
+  F.stdout = sp.stdout; F.stderr = sp.stderr; F.spawn_error = sp.error;
+  if (sp.exit_code === null) { try { sp.child && sp.child.kill(); } catch (e) { /* ignore */ } }
+  F.verdict = !seen ? 'NOT SEEN in the Feed list' : (F.clicked && F.clicked.ok ? (sp.exit_code === 0 ? 'PASS (seen, Allow clicked, the pushing process got allow = exit 0)' : ('Allow clicked but exit code ' + sp.exit_code)) : 'seen but no Allow button');
+  save();
+}
+
+async function runW44Mode() {
+  armWatchdog(12 * 60 * 1000);
+  const U = (R.ui = { mode: MODE, stage: 'start', ready: null, clicks: [], states: [], shots: [] });
+  const W = (R.w44 = { started: iso(), cys: W44_CYS, dept_pipes: W44_DEPT_PIPES, ready: null, usage: null, feed: [], office: null, errors: [] });
+  try {
+    // ready: the sidebar usage box and the Control Center button exist
+    const tr = Date.now();
+    while (Date.now() - tr < 90000 && !closed) {
+      try {
+        const ok = await evalJs("(!!document.getElementById('btn-cc') && !!document.getElementById('wsbar-usage')) ? 'yes' : 'no'", { awaitPromise: false, timeoutMs: 8000 });
+        if (ok === 'yes') { W.ready = Date.now() - tr; break; }
+      } catch (e) { /* loading */ }
+      await sleep(1500);
+    }
+    await sleep(3000);
+    await uiShot('w44-start');
+
+    // ---- usage view mode ----
+    const US = (W.usage = { states: [], clicks: 0 });
+    const snap = async (tag) => { try { const s = await evalJs(w44Expr(pageW44Usage), { awaitPromise: false, timeoutMs: 8000 }); s.tag = tag; US.states.push(s); return s; } catch (e) { US.states.push({ tag, error: String(e && e.message ? e.message : e) }); return null; } };
+    const first = await snap('initial');
+    for (let i = 0; i < 3; i++) {
+      const c = await evalJs(w44Expr(pageW44ClickUsageMode), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+      US.clicks += c ? 1 : 0;
+      await sleep(1500);
+      await snap('after-click-' + (i + 1));
+      await uiShot('w44-usage-' + (i + 1));
+    }
+    const labels = US.states.map((s) => s.button);
+    US.button_labels = labels;
+    US.cycle_ok = !!(first && labels.length === 4 && labels[1] !== labels[0] && labels[2] !== labels[1] && labels[2] !== labels[0] && labels[3] === labels[0]);
+    save();
+
+    // ---- Control Center > Feed ----
+    await evalJs(w44Expr(pageW44Click, '#btn-cc'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+    await sleep(2000);
+    await evalJs(w44Expr(pageW44Click, '.cc-tab[data-view="feed"]'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+    await sleep(2500);
+    W.feed_tab = await evalJs(w44Expr(pageW44Feed), { awaitPromise: false, timeoutMs: 10000 }).catch((e) => ({ error: String(e) }));
+    await uiShot('w44-feed-tab');
+    if (W44_CYS) {
+      await w44Feed(W, 'hq', 'w44 probe approval HQ ' + Date.now(), '');
+      for (let i = 0; i < Math.min(W44_DEPT_PIPES.length, 2); i++) {
+        await w44Feed(W, 'dept' + (i + 1), 'w44 probe approval DEPT' + (i + 1) + ' ' + Date.now(), W44_DEPT_PIPES[i]);
+      }
+    } else {
+      W.errors.push('no --w44-cys: the feed push probes were not run');
+    }
+
+    // ---- Control Center > office ----
+    await evalJs(w44Expr(pageW44Click, '.cc-tab[data-view="office"]'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+    const OF = (W.office = { samples: [], bridge_health: null, bridge_world: null, targets: null });
+    const to = Date.now();
+    let loaded = false;
+    while (Date.now() - to < W44_OFFICE_WAIT_MS && !closed) {
+      let o = null;
+      try { o = await evalJs(w44Expr(pageW44Office), { awaitPromise: false, timeoutMs: 8000 }); } catch (e) { o = { error: String(e && e.message ? e.message : e) }; }
+      o.t_ms = Date.now() - to;
+      if (OF.samples.length < 40) OF.samples.push(o);
+      if (o && o.frame_src && o.hint_hidden === true) { loaded = true; OF.loaded_after_ms = o.t_ms; break; }
+      await sleep(3000);
+    }
+    OF.loaded_signal = loaded;
+    await sleep(4000);
+    await uiShot('w44-office');
+    try { const l = await listTargets(); OF.targets = l.map((t) => ({ type: t.type, title: t.title, url: String(t.url).slice(0, 160) })); } catch (e) { OF.targets = String(e); }
+    const h = await w44HttpGet('http://127.0.0.1:8642/health', 5000);
+    OF.bridge_health = { status: h.status, bytes: h.bytes, head: h.head, error: h.error };
+    const w = await w44HttpGet('http://127.0.0.1:8642/world', 8000);
+    OF.bridge_world = { status: w.status, bytes: w.bytes, error: w.error };
+    try {
+      const j = JSON.parse(w.text);
+      OF.bridge_world.top_keys = Object.keys(j).slice(0, 30);
+      const pick = (o, k) => (o && o[k] !== undefined ? o[k] : undefined);
+      const seatsOf = (x) => (Array.isArray(x) ? x.length : (x && typeof x === 'object' ? Object.keys(x).length : null));
+      OF.bridge_world.counts = { seats: seatsOf(pick(j, 'seats')), surfaces: seatsOf(pick(j, 'surfaces')), depts: seatsOf(pick(j, 'depts')), agents: seatsOf(pick(j, 'agents')), hq: seatsOf(pick(j, 'hq')) };
+      OF.bridge_world.compact = JSON.stringify(j).slice(0, 1500);
+    } catch (e) { OF.bridge_world.parse_error = String(e && e.message ? e.message : e); OF.bridge_world.head = String(w.head || '').slice(0, 300); }
+    const f2 = await w44HttpGet('http://127.0.0.1:8642/office-boot.js', 5000);
+    OF.office_boot_js = { status: f2.status, bytes: f2.bytes };
+    await uiShot('w44-office-end');
+  } catch (e) {
+    fail('w44 flow', e);
+    W.errors.push(String(e && e.message ? e.message : e));
+  }
+  W.finished = iso();
+  U.stage = 'done';
+  save();
 }
 
 process.on('uncaughtException', (e) => {

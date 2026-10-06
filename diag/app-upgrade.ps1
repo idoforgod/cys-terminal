@@ -1745,6 +1745,8 @@ function Invoke-UpgSecondStart {
             $ob['rc'] = $x['rc']
             $ss['obs'] = $ob
             if ((-not $ss['app_version']) -and $ob['app_version']) { $ss['app_version'] = $ob['app_version'] }
+            # 0.14.44 scene on this live (second-started) app: usage button, Feed, office tab, bridge, doctor line
+            try { if (Get-Command -Name 'Invoke-W44Scene' -CommandType Function -ErrorAction SilentlyContinue) { $ss['w44'] = Invoke-W44Scene 'w44-upg' $false } } catch { Add-DiagError 'second start w44 scene' $_ }
         } else {
             $ss['notes'].Add(('the app did not come up at the second start (no answer on the debugging port): {0}' -f [string]$st['error']))
             try { $null = Save-Screenshot ($pfx + '-screen-nocdp.png') } catch { }
@@ -2400,6 +2402,7 @@ function Invoke-UpgradeMain {
                 $bs = Get-UpgBaseState (Find-Exe 'node.exe')
                 $up['base_state'] = $bs
                 $up['pack']['before'] = $bs['pack']
+                try { if (Get-Command -Name 'Get-W44BridgeRows' -CommandType Function -ErrorAction SilentlyContinue) { $up['w44_bridge_base'] = Get-W44BridgeRows 'base-state-before-upgrade' } } catch { }
                 if (-not $bs['ready']) { $up['notes'].Add(('the older app was not fully up before the upgrade ({0}); the upgrade was applied anyway' -f [string]$bs['end_reason'])) }
                 elseif (-not $bs['settled']) { $up['notes'].Add(('the upgrade was applied while the older app was still in its first-run work: {0}' -f (Limit-Text ((@($bs['settle_missing']) -join '; ')) 400))) }
                 Save-Run
@@ -2430,6 +2433,7 @@ function Invoke-UpgradeMain {
                 }
                 $CTX['upg_daemon_pids_before'] = $ids.ToArray()
                 $null = Save-Screenshot ($K_UPG_PFX + '-screen-before-apply.png')
+                try { if (Get-Command -Name 'Get-W44BridgeRows' -CommandType Function -ErrorAction SilentlyContinue) { $up['w44_bridge_before_apply'] = Get-W44BridgeRows 'before-apply' } } catch { }
                 $up['stamps']['points']['before_apply'] = Get-UpgStamps 'before-apply'
                 $nodeProc = $null
                 $go = $false
@@ -2524,6 +2528,7 @@ function Invoke-UpgradeMain {
                 $to = [string]$CTX['upg_to_version']
                 $af = [ordered]@{ started = (Get-IsoNow); marker = $null; marker_ok = $false; failure_file = $null; failure_file_absent = $false; file_versions = [ordered]@{}; file_versions_ok = $false; a_done = $false; a_ok = $false; app_alive = $null; cdp_wait_sec = $null; pre = $null; app_version = $null; app_version_ok = $false; ui_ready = $false; b_ok = $false }
                 $up['after'] = $af
+                try { if (Get-Command -Name 'Get-W44BridgeRows' -CommandType Function -ErrorAction SilentlyContinue) { $up['w44_bridge_right_after'] = Get-W44BridgeRows 'upg-after-start' } } catch { }
                 # (d) leftovers, right after the installer
                 $up['leftovers']['right_after'] = Get-UpgLeftovers 'right-after'
                 # (a) what is on disk
@@ -2591,6 +2596,7 @@ function Invoke-UpgradeMain {
                 # (d) leftovers at the end of the observation, (e) the pack after the upgrade, the desktop, the app's files
                 $up['stamps']['points']['after_observation'] = Get-UpgStamps 'after-observation'
                 $up['leftovers']['after_observation'] = Get-UpgLeftovers 'after-observation'
+                try { if (Get-Command -Name 'Get-W44BridgeRows' -CommandType Function -ErrorAction SilentlyContinue) { $up['w44_bridge_after_observation'] = Get-W44BridgeRows 'after-observation'; $up['w44_log_lines_after_observation'] = Get-W44LogLines 'office-bridge|bridge' 60 } } catch { }
                 $up['pack']['after'] = Get-UpgPackState
                 try { $null = Save-Screenshot ($K_UPG_PFX + '-screen-after.png') } catch { }
                 try { $up['app_evidence'] = Save-AppEvidence $K_UPG_PFX } catch { }

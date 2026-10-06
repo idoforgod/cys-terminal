@@ -40,6 +40,9 @@ $ErrorActionPreference = 'Continue'
 # be the one of this file; a load problem (parse error) is kept as text and never stops the fresh scene.
 $K_UPG_LOAD_ERROR = ''
 try { . (Join-Path $PSScriptRoot 'app-upgrade.ps1') } catch { $K_UPG_LOAD_ERROR = 'diag/app-upgrade.ps1 could not be loaded: ' + $_.Exception.Message }
+# 0.14.44 scene (diag/w44-scene.ps1, functions only): a load problem is kept as text and never stops a scene
+$K_W44_LOAD_ERROR = ''
+try { . (Join-Path $PSScriptRoot 'w44-scene.ps1') } catch { $K_W44_LOAD_ERROR = 'diag/w44-scene.ps1 could not be loaded: ' + $_.Exception.Message }
 Start-DiagScript -Name 'app-e2e'
 
 $K_CITOOL = Join-Path $env:windir 'System32\CiTool.exe'
@@ -2019,6 +2022,8 @@ try {
     # appe2e-verdict.json and two TEAM lines to appe2e-summary.txt (the 10 lines written above stay byte for byte as they are).
     Invoke-Step 'team' { Invoke-TeamScene }
     Invoke-Step 'team-report' { Add-TeamSummary; Add-TeamToVerdict }
+    # 0.14.44 scene (after everything else is on disk; starts the app cold when the TEAM cleanup ended it)
+    Invoke-Step 'w44' { if (Get-Command -Name 'Invoke-W44Scene' -CommandType Function -ErrorAction SilentlyContinue) { $RUN['w44'] = Invoke-W44Scene 'w44-fresh' $true; Save-Run } else { $RUN['w44'] = [ordered]@{ skipped = ('Invoke-W44Scene is not defined ' + $K_W44_LOAD_ERROR) }; Save-Run } }
     $RUN['finished'] = (Get-IsoNow)
     Save-Run
     Complete-DiagScript 'app-e2e'
