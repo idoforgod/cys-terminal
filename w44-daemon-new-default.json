@@ -1,0 +1,132 @@
+{
+    "tag":  "newdefault",
+    "env":  {
+
+            },
+    "with_seat":  true,
+    "daemon":  {
+                   "pid":  9460,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  5.1
+               },
+    "bridge_found":  true,
+    "bridge":  {
+                   "pid":  6576,
+                   "ppid":  9460,
+                   "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_hud_bridge.py",
+                   "started_after_s":  2.1,
+                   "parent_is_daemon":  true
+               },
+    "health":  {
+                   "url":  "http://127.0.0.1:8642/health",
+                   "status":  200,
+                   "body":  "{\"ok\": true, \"pid\": 6576, \"boot_id\": \"73f8daaf640823c5\", \"pack_version\": null, \"assets\": {\"office3d_html\": true, \"office_boot_js\": true, \"three_module_js\": true}, \"timeouts\": 0}",
+                   "error":  null,
+                   "ms":  503
+               },
+    "world":  {
+                  "url":  "http://127.0.0.1:8642/world",
+                  "status":  200,
+                  "body":  "{\"v\": 2, \"ts\": 1791273326.6655488, \"seq\": 1, \"daemon\": {\"version\": \"0.14.44\", \"paused\": false}, \"departments\": [{\"id\": \"ë³¸ë¶€ Â· CEO\", \"floor\": 1, \"nodes\": []}], \"todo\": {}, \"lobby\": {\"unassigned\": [",
+                  "error":  null,
+                  "ms":  0
+              },
+    "seat":  {
+                 "rc":  0,
+                 "out":  "surface:1",
+                 "err":  ""
+             },
+    "seat2":  {
+                  "rc":  0,
+                  "out":  "surface:2"
+              },
+    "bridge_alive_after_hold":  true,
+    "bridge_same_pid_after_hold":  true,
+    "bridge_count_after_hold":  1,
+    "bridge_children":  [
+                            "conhost.exe#3736 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                            "cys.exe#7756 C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe events --reconnect --cursor-file C:\\Users\\runneradmin\\AppData\\Local\\cys\\c...",
+                            "conhost.exe#7064 \\??\\C:\\Windows\\system32\\conhost.exe 0x4"
+                        ],
+    "daemon_children":  [
+                            "python3.exe#6576 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\b...",
+                            "conhost.exe#10052 \\\\?\\C:\\Windows\\system32\\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0x37...",
+                            "powershell.exe#3028 C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command cmd.exe",
+                            "conhost.exe#7868 \\\\?\\C:\\Windows\\system32\\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0x61...",
+                            "powershell.exe#1392 C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command cmd.exe",
+                            "conhost.exe#3736 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                            "cys.exe#7756 C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe events --reconnect --cursor-file C:\\Users\\runneradmin...",
+                            "cmd.exe#7584 \"C:\\Windows\\system32\\cmd.exe\"",
+                            "cmd.exe#2608 \"C:\\Windows\\system32\\cmd.exe\"",
+                            "conhost.exe#7064 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                            "PING.EXE#7280 ping  -n 600 127.0.0.1"
+                        ],
+    "heal":  {
+                 "pack_dir_exists":  true,
+                 "target_exists_before":  true,
+                 "a_missing":  {
+                                   "rc":  0,
+                                   "out":  "✅ web/office-boot.js ← 내장본으로 되살림(없던 파일 · 병합 대기 원장 무접촉)",
+                                   "err":  "",
+                                   "restored":  true,
+                                   "bridge_serves_it":  200
+                               },
+                 "b_present_locked":  {
+                                          "rc":  0,
+                                          "out":  "\u0027web/office-boot.js\u0027 은 이미 있음 — 무변경(--missing-only)",
+                                          "err":  ""
+                                      },
+                 "c_missing_with_watcher":  {
+                                                "rc":  0,
+                                                "out":  "✅ web/office-boot.js ← 내장본으로 되살림(없던 파일 · 병합 대기 원장 무접촉)",
+                                                "err":  "",
+                                                "restored":  true
+                                            },
+                 "ledger_changes":  [
+                                        "NEW pack\\.merge-audit.jsonl",
+                                        "NEW pack\\web\\office-boot.js.w44bak"
+                                    ],
+                 "ledger_files_counted":  946
+             },
+    "doctor_with_agy_folder":  {
+                                   "rc":  1,
+                                   "antigravity_lines":  [
+                                                             "[SKIP] agy-statusline   Antigravity 사용량은 윈도우에서 아직 자동으로 연결되지 않습니다 — 다음 판에서 다시 확인합니다(측정 불능은 통과가 아니다)",
+                                                             "└ 직접 연결: statusLine command = `bash C:/Users/runneradmin/.cys/pack/hooks/cys-agy-statusline.sh` (사용 설명서 §4 사용량「Antigravity(agy) 값」)"
+                                                         ]
+                               },
+    "doctor":  {
+                   "rc":  1,
+                   "antigravity_lines":  [
+                                             "[SKIP] agy-statusline   agy 설정 폴더 없음(agy 미설치) — 점검 대상 아님"
+                                         ],
+                   "office_lines":  [
+                                        "└ 손상 의심: cys pack-heal \u003crel\u003e(백업 후 vendor 복원) · 드리프트 검토: cys pack-merge"
+                                    ]
+               },
+    "bridge_kill_probe":  {
+                              "killed_pid":  6576,
+                              "new_bridge_pid":  null,
+                              "new_bridge_after_s":  null,
+                              "log_lines":  [
+                                                "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                                                "[cysd] office-bridge exited — 60s 후 재확인"
+                                            ]
+                          },
+    "bridge_pid_at_kill":  6576,
+    "after_daemon_kill":  {
+                              "bridge_gone_after_s":  0,
+                              "children_gone_after_s":  0,
+                              "bridge_alive_at_end":  false,
+                              "children_alive_at_end":  0,
+                              "children_before":  0,
+                              "watched_s":  0
+                          },
+    "bridges_left_at_end":  0,
+    "port_8642_answers_at_end":  false,
+    "log_bridge_lines":  [
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인"
+                         ]
+}

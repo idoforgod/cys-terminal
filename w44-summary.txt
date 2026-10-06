@@ -1,0 +1,8 @@
+w44 summary on windows-2025 (2026-10-06T08:08:20.370Z)
+step S0-inputs: 6.5s 
+step S1-install: 42.7s 
+step S1b-old-0.14.43: 8.9s 
+step TA-approval: 186.4s 
+step TB-bridge: 63s 
+step TC-daemon: 780.3s 
+step TD-hook: 2.1s 

@@ -1,0 +1,214 @@
+{
+  "records": [
+    {
+      "command_prefix": [
+        "git",
+        "w44cmd"
+      ],
+      "created_at": 1791273141.172602,
+      "cwd": "D:\\a\\_temp\\w44\\dirs\\D1 one",
+      "environment": [],
+      "expires_at": 1791274041.172602,
+      "id": "ap-892-1791273141-0",
+      "signature": "vZseMvMJUD4mUcCJZtFoD8L0L4AsI7GLeh1rfzpB4as=",
+      "updated_at": 1791273141.172602,
+      "version": 1
+    },
+    {
+      "command_prefix": [
+        "git",
+        "w44ps"
+      ],
+      "created_at": 1791273142.542718,
+      "cwd": "D:\\a\\_temp\\w44\\dirs\\D1 one",
+      "environment": [],
+      "expires_at": 1791274042.542718,
+      "id": "ap-892-1791273142-1",
+      "signature": "QifLzxV3Stc/13pOGJxWn3xPDvdLpgu4RvkcLrHRLIk=",
+      "updated_at": 1791273142.542718,
+      "version": 1
+    },
+    {
+      "command_prefix": [
+        "git",
+        "w44bash"
+      ],
+      "created_at": 1791273144.986587,
+      "cwd": "D:\\a\\_temp\\w44\\dirs\\D1 one",
+      "environment": [],
+      "expires_at": 1791274044.986587,
+      "id": "ap-892-1791273144-2",
+      "signature": "tg/sy7UEHHxTAg0QoXpZpDs/YWHC1Td6EcsO+FP2umU=",
+      "updated_at": 1791273144.986587,
+      "version": 1
+    },
+    {
+      "command_prefix": [
+        "cys",
+        "kill",
+        "4242"
+      ],
+      "created_at": 1791273146.038105,
+      "cwd": "D:\\a\\_temp\\w44\\dirs\\D1 one",
+      "environment": [
+        [
+          "CYS_APPROVAL_LANE",
+          "\\\\.\\pipe\\cys-w44anew|c54575aa9de9e459df611cf8dbde9506"
+        ]
+      ],
+      "expires_at": 1791274046.038105,
+      "id": "ap-892-1791273146-3",
+      "signature": "4mcz6t7+tOTdxIvbZsHgtQhxgVO/uX+McZ3Bdl6ytJ0=",
+      "updated_at": 1791273146.038105,
+      "version": 1
+    },
+    {
+      "command_prefix": [
+        "cys",
+        "launch-agent",
+        "--role",
+        "worker",
+        "--agent",
+        "claude",
+        "--cwd",
+        "D:a_tempw44dirsw44proj"
+      ],
+      "created_at": 1791273147.200869,
+      "cwd": "D:\\a\\_temp\\w44\\dirs\\D1 one",
+      "environment": [
+        [
+          "CYS_APPROVAL_LANE",
+          "\\\\.\\pipe\\cys-w44anew|c54575aa9de9e459df611cf8dbde9506"
+        ]
+      ],
+      "expires_at": 1791274047.200869,
+      "id": "ap-892-1791273147-4",
+      "signature": "17taNThuKt2vi9qNBs4lw/SBrVhJKHibFdS0Kbd72AE=",
+      "updated_at": 1791273147.200869,
+      "version": 1
+    },
+    {
+      "command_prefix": [
+        "cys",
+        "launch-agent",
+        "--role",
+        "worker",
+        "--agent",
+        "claude",
+        "--cwd",
+        "D:\\a\\_temp\\w44\\dirs\\w44proj"
+      ],
+      "created_at": 1791273148.35797,
+      "cwd": "D:\\a\\_temp\\w44\\dirs\\D1 one",
+      "environment": [
+        [
+          "CYS_APPROVAL_LANE",
+          "\\\\.\\pipe\\cys-w44anew|c54575aa9de9e459df611cf8dbde9506"
+        ]
+      ],
+      "expires_at": 1791274048.35797,
+      "id": "ap-892-1791273148-5",
+      "signature": "LziC94zG0WJ7WwkzxFOaMxsosG8hYHXj/8/kaFuc/+4=",
+      "updated_at": 1791273148.35797,
+      "version": 1
+    },
+    {
+      "command_prefix": [
+        "cys",
+        "launch-agent",
+        "--role",
+        "worker",
+        "--agent",
+        "claude",
+        "--cwd",
+        "D:/a/_temp/w44/dirs/w44proj"
+      ],
+      "created_at": 1791273149.498193,
+      "cwd": "D:\\a\\_temp\\w44\\dirs\\D1 one",
+      "environment": [
+        [
+          "CYS_APPROVAL_LANE",
+          "\\\\.\\pipe\\cys-w44anew|c54575aa9de9e459df611cf8dbde9506"
+        ]
+      ],
+      "expires_at": 1791274049.498193,
+      "id": "ap-892-1791273149-6",
+      "signature": "pIA/WgzUQhmYXeOcHamhOhlsuEWMEMzhAfRdAw5gzzk=",
+      "updated_at": 1791273149.498193,
+      "version": 1
+    },
+    {
+      "command_prefix": [
+        "cys",
+        "launch-agent",
+        "--role",
+        "worker",
+        "--agent",
+        "claude",
+        "--cwd",
+        "C:"
+      ],
+      "created_at": 1791273150.640495,
+      "cwd": "D:\\a\\_temp\\w44\\dirs\\D1 one",
+      "environment": [
+        [
+          "CYS_APPROVAL_LANE",
+          "\\\\.\\pipe\\cys-w44anew|c54575aa9de9e459df611cf8dbde9506"
+        ]
+      ],
+      "expires_at": 1791274050.640495,
+      "id": "ap-892-1791273150-7",
+      "signature": "uRRkEqy3sutXgO7VgAbJPbSEFe5w6tjCKBqeEeelZEs=",
+      "updated_at": 1791273150.640495,
+      "version": 1
+    },
+    {
+      "command_prefix": [
+        "cys",
+        "launch-agent",
+        "--role",
+        "worker",
+        "--agent",
+        "claude",
+        "--cwd",
+        "C:"
+      ],
+      "created_at": 1791273151.792806,
+      "cwd": "D:\\a\\_temp\\w44\\dirs\\D1 one",
+      "environment": [
+        [
+          "CYS_APPROVAL_LANE",
+          "\\\\.\\pipe\\cys-w44anew|c54575aa9de9e459df611cf8dbde9506"
+        ]
+      ],
+      "expires_at": 1791274051.792806,
+      "id": "ap-892-1791273151-8",
+      "signature": "PI9TPruKUS/+pn57O/zadPfOfAuSePANGxISCr7+/LI=",
+      "updated_at": 1791273151.792806,
+      "version": 1
+    },
+    {
+      "command_prefix": [
+        "cys",
+        "launch-agent",
+        "--role",
+        "worker",
+        "--agent",
+        "claude"
+      ],
+      "created_at": 1791273152.950369,
+      "cwd": "D:\\a\\_temp\\w44\\dirs\\D1 one",
+      "environment": [
+        [
+          "CYS_APPROVAL_LANE",
+          "\\\\.\\pipe\\cys-w44anew|c54575aa9de9e459df611cf8dbde9506"
+        ]
+      ],
+      "expires_at": 1791274052.950369,
+      "id": "ap-892-1791273152-9",
+      "signature": "xhhT9sLoz5qhcaKEuns2875FVeL1j7Uu5AQKbXcPcJw=",
+      "updated_at": 1791273152.950369,
+      "version": 1
+    }
+  ]
+}
