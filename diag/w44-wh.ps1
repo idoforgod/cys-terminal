@@ -8,7 +8,7 @@ $PUB = 'C:\w44pub'
 $BIN = Join-Path $PUB 'bin'
 & icacls.exe $PUB /grant 'Everyone:(OI)(CI)M' | Out-Null
 $R = [ordered]@{ os = [string]$env:DIAG_MATRIX_OS; files = @(); tests = [ordered]@{}; daemon = [ordered]@{}; errors = @() }
-function SaveR { Save-Json 'w44-wh-results.json' $R 8 }
+function SaveR { Save-Json 'w44-wh-results.json' $R 4 }
 $testExe = Join-Path $BIN 'cysd-test.exe'
 $R['test_exe_exists'] = Test-Path -LiteralPath $testExe
 $R['bins'] = @(Get-ChildItem -LiteralPath $BIN -ErrorAction SilentlyContinue | ForEach-Object { '{0} {1}' -f $_.Name, $_.Length })
@@ -27,26 +27,27 @@ function Run-Std { param([string]$File, [string]$Args, [string]$Tag, [int]$MaxSe
     if (-not $p.WaitForExit($MaxSec * 1000)) { try { Stop-ProcessTree -ProcessId $p.Id } catch { } }
     $rc = $null; try { $rc = $p.ExitCode } catch { }
     foreach ($f in @($so, $se)) { if (Test-Path -LiteralPath $f) { Copy-Item -LiteralPath $f -Destination (Join-Path $OUT (Split-Path -Leaf $f)) -Force } }
-    return $rc
+    return ([string]$rc)
 }
 
 # identity proof for the standard user (written by the user itself)
 $idScript = Join-Path $PUB 'whoami-std.ps1'
 [System.IO.File]::WriteAllText($idScript, "whoami /groups /fo csv /nh | Out-File -Encoding ascii C:\w44pub\whoami-std.txt; `$env:USERPROFILE | Out-File -Append -Encoding ascii C:\w44pub\whoami-std.txt; ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) | Out-File -Append -Encoding ascii C:\w44pub\whoami-std.txt")
 $R['whoami_rc'] = Run-Std $psexe ('-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}"' -f $idScript) 'whoami-std' 120
-if (Test-Path 'C:\w44pub\whoami-std.txt') { Copy-Item 'C:\w44pub\whoami-std.txt' (Join-Path $OUT 'w44-wh-whoami-std.txt') -Force; $R['whoami_std'] = @(Get-Content 'C:\w44pub\whoami-std.txt' | Where-Object { $_ -match 'Mandatory Label|Administrators|True|False|Users' } | Select-Object -First 8) }
-$R['whoami_elevated'] = @(& whoami.exe /groups /fo csv /nh | Where-Object { $_ -match 'Mandatory Label|BUILTIN\\Administrators' })
+if (Test-Path 'C:\w44pub\whoami-std.txt') { Copy-Item 'C:\w44pub\whoami-std.txt' (Join-Path $OUT 'w44-wh-whoami-std.txt') -Force; $R['whoami_std'] = @(Get-Content 'C:\w44pub\whoami-std.txt' | Where-Object { $_ -match 'Mandatory Label|Administrators|True|False|Users' } | Select-Object -First 8 | ForEach-Object { [string]$_ }) }
+$R['whoami_elevated'] = @(& whoami.exe /groups /fo csv /nh | Where-Object { $_ -match 'Mandatory Label|BUILTIN\\Administrators' } | ForEach-Object { [string]$_ })
 
 # 1) the product test: elevated token, then standard user
 $envs = 'set CYS_PACK_DIR={0}&& ' 
 $o1 = Join-Path $OUT 'w44-wh-test-elevated-stdout.txt'; $e1 = Join-Path $OUT 'w44-wh-test-elevated-stderr.txt'
 if ($R['test_exe_exists']) {
+    $env:RUST_MIN_STACK = '33554432'
     $env:CYS_PACK_DIR = Join-Path $env:RUNNER_TEMP 'pk-elev'; New-Item -ItemType Directory -Force -Path $env:CYS_PACK_DIR | Out-Null
     $p = Start-Process -FilePath $testExe -ArgumentList 'wh_windows --nocapture --test-threads=1' -PassThru -Wait -RedirectStandardOutput $o1 -RedirectStandardError $e1 -WorkingDirectory $PUB
     $R['tests']['elevated_rc'] = $p.ExitCode
     $stdPack = Join-Path $PUB 'pk-std'; New-Item -ItemType Directory -Force -Path $stdPack | Out-Null
     $bat = Join-Path $PUB 'run-test-std.bat'
-    [System.IO.File]::WriteAllText($bat, ("@echo off`r`nset CYS_PACK_DIR=" + $stdPack + "`r`n" + $testExe + " wh_windows --nocapture --test-threads=1`r`n"))
+    [System.IO.File]::WriteAllText($bat, ("@echo off`r`nset RUST_MIN_STACK=33554432`r`nset CYS_PACK_DIR=" + $stdPack + "`r`n" + $testExe + " wh_windows --nocapture --test-threads=1`r`n"))
     $rc = Run-Std $cmdexe ('/d /c ' + $bat) 'w44-wh-test-standard' 600
     $R['tests']['standard_rc'] = $rc
     foreach ($k in @('elevated', 'standard')) {
@@ -54,7 +55,7 @@ if ($R['test_exe_exists']) {
         foreach ($f in @((Join-Path $OUT ('w44-wh-test-' + $k + '-stdout.txt')), (Join-Path $OUT ('w44-wh-test-' + $k + '-stderr.txt')), (Join-Path $OUT ('w44-wh-test-' + $k + '.out.txt')), (Join-Path $OUT ('w44-wh-test-' + $k + '.err.txt')))) {
             if (Test-Path -LiteralPath $f) { $lines += @(Get-Content -LiteralPath $f | Where-Object { $_ -match 'WH-WIN|^test |test result|panicked|assert' }) }
         }
-        $R['tests'][$k + '_lines'] = @($lines | Select-Object -First 40)
+        $R['tests'][$k + '_lines'] = @($lines | Select-Object -First 40 | ForEach-Object { [string]$_ })
     }
 }
 SaveR

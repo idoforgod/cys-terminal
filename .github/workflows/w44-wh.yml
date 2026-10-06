@@ -37,18 +37,23 @@ jobs:
         working-directory: p
         run: |
           $ErrorActionPreference = 'Continue'
+          # debug binaries overflow the default 1 MB main-thread stack on Windows (seen in the first run): link them with a 16 MB stack
+          $env:RUSTFLAGS = '-C link-arg=/STACK:16777216'
           New-Item -ItemType Directory -Force -Path C:\w44pub\bin | Out-Null
           $env:CYS_PACK_DIR = (Join-Path $env:RUNNER_TEMP 'packdir'); New-Item -ItemType Directory -Force -Path $env:CYS_PACK_DIR | Out-Null
           cargo test --bin cysd --no-run --message-format=json > $env:RUNNER_TEMP\cargo-test-build.jsonl 2> $env:RUNNER_TEMP\cargo-test-build.err.txt
           "cargo test --no-run rc=$LASTEXITCODE"
           $exe = $null
-          foreach ($ln in (Get-Content $env:RUNNER_TEMP\cargo-test-build.jsonl)) { if ($ln -match '"executable":"([^"]+cysd[^"]*\.exe)"' -and $ln -match '"test":true') { $exe = ($Matches[1] -replace '\\\\', '\') } }
+          foreach ($ln in (Get-Content $env:RUNNER_TEMP\cargo-test-build.jsonl)) { if ($ln -match '"test":true' -and $ln -match '"executable":"([^"]+cysd[^"]*\.exe)"') { $exe = ($Matches[1] -replace '\\\\', '\') } }
           "test exe: $exe"
           if ($exe) { Copy-Item -LiteralPath $exe -Destination C:\w44pub\bin\cysd-test.exe -Force }
           cargo build --bin cys --bin cysd 2> $env:RUNNER_TEMP\cargo-build.err.txt
           "cargo build rc=$LASTEXITCODE"
           Copy-Item -LiteralPath target\debug\cys.exe -Destination C:\w44pub\bin\cys.exe -Force
           Copy-Item -LiteralPath target\debug\cysd.exe -Destination C:\w44pub\bin\cysd.exe -Force
+          $od = Join-Path $env:RUNNER_TEMP 'diag-out'; New-Item -ItemType Directory -Force -Path $od | Out-Null
+          Get-Content $env:RUNNER_TEMP\cargo-test-build.err.txt -Tail 30 | Out-File -Encoding utf8 (Join-Path $od 'cargo-test-build-tail.txt')
+          Select-String -Path $env:RUNNER_TEMP\cargo-test-build.jsonl -Pattern '"executable"' | ForEach-Object { $_.Line.Substring(0, [Math]::Min(300, $_.Line.Length)) } | Out-File -Encoding utf8 (Join-Path $od 'cargo-test-build-executables.txt')
           exit 0
       - name: w44-wh
         shell: powershell
