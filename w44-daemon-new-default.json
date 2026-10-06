@@ -1,0 +1,78 @@
+{
+    "tag":  "newdefault",
+    "env":  {
+
+            },
+    "with_seat":  true,
+    "daemon":  {
+                   "pid":  6704,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  10.2
+               },
+    "bridge_found":  false,
+    "seat":  {
+                 "rc":  0,
+                 "out":  "surface:1",
+                 "err":  ""
+             },
+    "seat2":  {
+                  "rc":  0,
+                  "out":  "surface:2"
+              },
+    "bridge_alive_after_hold":  null,
+    "bridge_same_pid_after_hold":  null,
+    "bridge_count_after_hold":  0,
+    "bridge_children":  [
+
+                        ],
+    "daemon_children":  [
+                            "conhost.exe#5616 \\\\?\\C:\\Windows\\system32\\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0x3e...",
+                            "powershell.exe#4252 C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command cmd.exe",
+                            "conhost.exe#10440 \\\\?\\C:\\Windows\\system32\\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0x9d...",
+                            "powershell.exe#6320 C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command cmd.exe",
+                            "cmd.exe#3684 \"C:\\Windows\\system32\\cmd.exe\"",
+                            "cmd.exe#4968 \"C:\\Windows\\system32\\cmd.exe\"",
+                            "PING.EXE#9456 ping  -n 600 127.0.0.1"
+                        ],
+    "heal":  {
+                 "pack_dir_exists":  true,
+                 "target_exists_before":  true,
+                 "a_missing":  {
+                                   "rc":  2,
+                                   "out":  "",
+                                   "err":  "error: unexpected argument \u0027--missing-only\u0027 found\n\n  tip: to pass \u0027--missing-only\u0027 as a value, use \u0027-- --missing-only\u0027\n\nUsage: cys.exe pack-heal \u003cREL\u003e\n\nFor more information, try \u0027--help\u0027.",
+                                   "restored":  false
+                               },
+                 "b_present_locked":  "could not open: Exception calling \"Open\" with \"4\" argument(s): \"Could not find file \u0027C:\\Users\\runneradmin\\.cys\\pack\\web\\office-boot.js\u0027.\"",
+                 "c_missing_with_watcher":  {
+                                                "rc":  2,
+                                                "out":  "",
+                                                "err":  "error: unexpected argument \u0027--missing-only\u0027 found\n\n  tip: to pass \u0027--missing-only\u0027 as a value, use \u0027-- --missing-only\u0027\n\nUsage: cys.exe pack-heal \u003cREL\u003e\n\nFor more information, try \u0027--help\u0027.",
+                                                "restored":  false
+                                            },
+                 "ledger_changes":  [
+                                        "NEW pack\\web\\office-boot.js.w44bak",
+                                        "GONE pack\\web\\office-boot.js"
+                                    ],
+                 "ledger_files_counted":  948
+             },
+    "doctor":  {
+                   "rc":  1,
+                   "antigravity_lines":  [
+                                             "[SKIP] agy-statusline   agy 설정 폴더 없음(agy 미설치) — 점검 대상 아님"
+                                         ],
+                   "office_lines":  [
+                                        "[WARN] pack-drift       드리프트 1건(원장: healed 0·new-pending 0·kept-drift 0·merged 0·conflicted 0·quarantined 0·adopted 0) · ★누락 1건(매니페스트에 있는데 디스크에 없음 · 예: web/office-boot.js) · 캡처 저장소 0건 · 0B(GC 없음 — 수동 정리 가능)",
+                                        "└ 손상 의심: cys pack-heal \u003crel\u003e(백업 후 vendor 복원) · 드리프트 검토: cys pack-merge · 누락·판독 불가: 데몬 재기동(부팅 install 이 보존 모드로 누락 파일을 다시 쓴다) 또는 cys init-pack"
+                                    ]
+               },
+    "bridges_left_at_end":  0,
+    "port_8642_answers_at_end":  false,
+    "log_bridge_lines":  [
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인",
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인"
+                         ]
+}

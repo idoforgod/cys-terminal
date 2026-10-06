@@ -1,0 +1,65 @@
+{
+    "tag":  "newmanagednoseat",
+    "env":  {
+                "CYS_OFFICE_BRIDGE_MODE":  "managed"
+            },
+    "with_seat":  false,
+    "daemon":  {
+                   "pid":  8568,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  10.2
+               },
+    "bridge_found":  true,
+    "bridge":  {
+                   "pid":  6344,
+                   "ppid":  8568,
+                   "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_hud_bridge.py",
+                   "started_after_s":  2.1,
+                   "parent_is_daemon":  true
+               },
+    "health":  null,
+    "world":  {
+                  "url":  "http://127.0.0.1:8642/world",
+                  "status":  null,
+                  "body":  "",
+                  "error":  "Exception calling \"GetResponse\" with \"0\" argument(s): \"Unable to connect to the remote server\"",
+                  "ms":  2020
+              },
+    "bridge_alive_after_hold":  false,
+    "bridge_same_pid_after_hold":  false,
+    "bridge_count_after_hold":  0,
+    "bridge_children":  [
+
+                        ],
+    "daemon_children":  [
+
+                        ],
+    "bridge_kill_probe":  {
+                              "killed_pid":  6344,
+                              "new_bridge_pid":  10740,
+                              "new_bridge_after_s":  8,
+                              "log_lines":  [
+                                                "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                                                "[cysd] office-bridge exited — 60s 후 재확인",
+                                                "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                                                "[cysd] office-bridge exited — 60s 후 재확인"
+                                            ]
+                          },
+    "after_daemon_kill":  {
+                              "bridge_gone_after_s":  0.01,
+                              "children_gone_after_s":  0.01,
+                              "bridge_alive_at_end":  false,
+                              "children_alive_at_end":  0,
+                              "children_before":  0,
+                              "watched_s":  0
+                          },
+    "bridges_left_at_end":  0,
+    "port_8642_answers_at_end":  false,
+    "log_bridge_lines":  [
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인",
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인"
+                         ]
+}

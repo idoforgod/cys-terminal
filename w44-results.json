@@ -1,0 +1,59 @@
+{
+    "os":  "windows-11-arm",
+    "started":  "2026-10-06T04:55:10.902Z",
+    "steps":  {
+                  "S0-inputs":  {
+                                    "seconds":  6.6,
+                                    "error":  null
+                                },
+                  "S1-install":  {
+                                     "seconds":  62.2,
+                                     "error":  null
+                                 },
+                  "S1b-old-0.14.43":  {
+                                          "seconds":  14.2,
+                                          "error":  null
+                                      },
+                  "TA-approval":  {
+                                      "seconds":  226,
+                                      "error":  null
+                                  },
+                  "TB-bridge":  {
+                                    "seconds":  409.8,
+                                    "error":  null
+                                },
+                  "TC-daemon":  {
+                                    "seconds":  636,
+                                    "error":  null
+                                },
+                  "TD-hook":  {
+                                  "seconds":  7.5,
+                                  "error":  "System.Management.Automation.RuntimeException: Cannot index into a null array. At C:\\a\\cys-terminal\\cys-terminal\\diag\\w44-measure.ps1:40 char:5\r\n+     $R[\u0027items\u0027][$Key] = $Value\r\n+     ~~~~~~~~~~~~~~~~~~~~~~~~~~"
+                              },
+                  "SUMMARY":  {
+                                  "seconds":  0,
+                                  "error":  null
+                              }
+              },
+    "items":  {
+                  "installer":  {
+                                    "name":  "cys_0.14.43_x64-setup.exe",
+                                    "size":  143348191,
+                                    "sha256":  "74a8e1d5c5a0e20e853c610bf4627ad93b16e680f38c6762cb0cc347c837594a",
+                                    "source":  "release v0.14.43 (harness debugging)"
+                                },
+                  "installed":  {
+                                    "installer_rc":  0,
+                                    "cys":  "cys 0.14.43",
+                                    "cysd":  "cysd 0.14.43 (build 55d3d2d60d7f)",
+                                    "has_python":  true,
+                                    "has_bash":  true
+                                },
+                  "old_binaries":  {
+                                       "cys":  "cys 0.14.43",
+                                       "cysd":  "cysd 0.14.43 (build 55d3d2d60d7f)",
+                                       "cysd_sha":  "87bd2bb0ce795bbcdd7a3aa82f3b032f3acdf28778beca67d8605a62721adf5b"
+                                   },
+                  "approval":  "see w44-approval-new.json / w44-approval-old.json"
+              }
+}

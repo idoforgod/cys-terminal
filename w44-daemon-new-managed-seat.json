@@ -1,0 +1,46 @@
+{
+    "tag":  "newmanagedseat",
+    "env":  {
+                "CYS_OFFICE_BRIDGE_MODE":  "managed"
+            },
+    "with_seat":  true,
+    "daemon":  {
+                   "pid":  6724,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  10.2
+               },
+    "bridge_found":  false,
+    "seat":  {
+                 "rc":  0,
+                 "out":  "surface:1",
+                 "err":  ""
+             },
+    "seat2":  {
+                  "rc":  0,
+                  "out":  "surface:2"
+              },
+    "bridge_alive_after_hold":  null,
+    "bridge_same_pid_after_hold":  null,
+    "bridge_count_after_hold":  0,
+    "bridge_children":  [
+
+                        ],
+    "daemon_children":  [
+                            "conhost.exe#5504 \\\\?\\C:\\Windows\\system32\\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0x83...",
+                            "powershell.exe#9280 C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command cmd.exe",
+                            "conhost.exe#4832 \\\\?\\C:\\Windows\\system32\\conhost.exe --headless --inheritcursor --width 120 --height 35 --signal 0xab...",
+                            "powershell.exe#10660 C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -Command cmd.exe",
+                            "cmd.exe#2792 \"C:\\Windows\\system32\\cmd.exe\"",
+                            "cmd.exe#6128 \"C:\\Windows\\system32\\cmd.exe\"",
+                            "PING.EXE#4916 ping  -n 600 127.0.0.1"
+                        ],
+    "bridges_left_at_end":  0,
+    "port_8642_answers_at_end":  false,
+    "log_bridge_lines":  [
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인",
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인"
+                         ]
+}

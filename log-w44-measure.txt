@@ -1,0 +1,42 @@
+2026-10-06T04:55:10.890Z [INFO] === w44-measure start (PowerShell 5.1.26100.9457, LanguageMode FullLanguage) ===
+2026-10-06T04:55:10.910Z [INFO] --- step S0-inputs start
+2026-10-06T04:55:17.514Z [INFO] --- step S0-inputs end (6.6s) 
+2026-10-06T04:55:17.514Z [INFO] --- step S1-install start
+2026-10-06T04:56:18.956Z [INFO] installer rc 0, killed after install: 
+2026-10-06T04:56:19.729Z [INFO] tar new rc 0 
+2026-10-06T04:56:19.729Z [INFO] --- step S1-install end (62.2s) 
+2026-10-06T04:56:19.729Z [INFO] --- step S1b-old-0.14.43 start
+2026-10-06T04:56:24.883Z [INFO] fetch old rc 0 
+2026-10-06T04:56:32.656Z [INFO] 7z rc 0 7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03
+
+Scanning the drive for archives:
+1 file, 143348191 bytes (137 MiB)
+
+Extracting archive: C:\a\_temp\w44\old-dl\cys_0.14.43_x64-setup.exe
+--
+Path = C:\a\_temp\w44\old-dl\cys_0.14.43_x64-setup.exe
+Type = Nsis
+Physical Size = 143348191
+Method = LZMA:23
+Solid = +
+Headers Size = 2358206
+Embedded Stub Size = 52736
+SubType...
+2026-10-06T04:56:33.912Z [INFO] tar old rc 0
+2026-10-06T04:56:33.912Z [INFO] --- step S1b-old-0.14.43 end (14.2s) 
+2026-10-06T04:56:33.912Z [INFO] --- step TA-approval start
+2026-10-06T05:00:19.930Z [INFO] --- step TA-approval end (226s) 
+2026-10-06T05:00:19.930Z [INFO] --- step TB-bridge start
+2026-10-06T05:07:09.716Z [INFO] --- step TB-bridge end (409.8s) 
+2026-10-06T05:07:09.716Z [INFO] --- step TC-daemon start
+2026-10-06T05:17:45.731Z [INFO] --- step TC-daemon end (636s) 
+2026-10-06T05:17:45.731Z [INFO] --- step TD-hook start
+2026-10-06T05:17:53.270Z [ERROR] STEP FAILED [TD-hook]: System.Management.Automation.RuntimeException: Cannot index into a null array. At C:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:40 char:5
++     $R['items'][$Key] = $Value
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~
+2026-10-06T05:17:53.272Z [INFO] --- step TD-hook end (7.5s) System.Management.Automation.RuntimeException: Cannot index into a null array. At C:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:40 char:5
++     $R['items'][$Key] = $Value
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~
+2026-10-06T05:17:53.279Z [INFO] --- step SUMMARY start
+2026-10-06T05:17:53.288Z [INFO] --- step SUMMARY end (0s) 
+2026-10-06T05:17:53.288Z [INFO] === w44-measure end ===
