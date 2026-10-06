@@ -193,7 +193,7 @@ describe("D2 — 상자마다 리셋 시각 · 소진 예상 · Antigravity 도 
     const none = base({ account_id: "none", exhaust_at: null });
     const m = build([ok, past, old, none], "all", 1);
     const by = (id: string) => m.boxes.find((b) => b.key === `claude:${id}`)!;
-    expect(by("ok").exhaust).toMatch(/^이 속도면 \d\d:\d\d 소진$/);
+    expect(/^이 속도면 \d\d:\d\d 소진$/.test(by("ok").exhaust)).toBe(true);
     expect(by("past").exhaust).toBe("");
     expect(by("old").exhaust).toBe("");
     expect(by("none").exhaust).toBe("");
