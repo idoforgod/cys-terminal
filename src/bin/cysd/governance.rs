@@ -3732,78 +3732,37 @@ pub fn cmdline_matches_agent_exec(cmdline: &str, bin_base: &str) -> bool {
 /// 자손 pid 트리만 수집한다(문자열 미조회) — collect_descendants 계열의 공통 골격.
 /// pid 재사용으로 부모 링크에 사이클이 생겨도 무한루프하지 않게 방문 집합을 유지한다.
 /// 반환 순서는 종전 collect_descendants 의 DFS 순서와 동일하다(소비자 순서 의존 무변경).
+///
+/// ★(0.14.44) **윈도우에서만** 시작 시각 보정을 적용한다(`guard_applies`): 윈도우는 죽은 부모 번호가 재사용되면 옛 고아가 새 프로세스에
+/// 매달린 채 남지만, 맥·리눅스는 고아가 1번(또는 서브리퍼)으로 재부모되어 이 오탐이 없고 시계 역행 위험만 진다.
+/// 적용하지 않으면(맥·리눅스 · 손잡이 끔) `legacy_descendant_pids` 를 그대로 부른다 — 추가 할당 0.
+/// 윈도우에서 켜졌을 때의 추가 비용(사실): 표 `Vec` 1개 + pid→시작 시각 `HashMap` 1개를 호출마다 더 만든다(차수는 종전 순회와 같다 · 미측정).
 fn descendant_pids(sys: &System, root: u32) -> Vec<u32> {
+    if !guard_applies(start_guard_enabled(), cfg!(windows)) {
+        return legacy_descendant_pids(sys, root);
+    }
     let table: Vec<(u32, Option<u32>, u64)> = sys
         .processes()
         .iter()
         .map(|(pid, p)| (pid.as_u32(), p.parent().map(|x| x.as_u32()), p.start_time()))
         .collect();
-    descendants_from_table(&table, root, start_guard_enabled())
+    let (out, drops) = descendants_report(&table, root, true);
+    if !drops.is_empty() {
+        let legacy_n = descendants_report(&table, root, false).0.len();
+        log_drops_debounced(root, &drops, legacy_n, out.len());
+    }
+    out
 }
 
-/// 연결 버림의 여유(초) — 자식의 시작 시각이 부모보다 **이 값을 넘게** 이를 때만 연결을 버린다.
-/// 근거: ① sysinfo 의 start_time 은 초 단위(맥 `pbi_start_tvsec` · 윈도우 FILETIME/1e7 · 리눅스 `btime`+틱/클럭)라 반올림 1초,
-/// ② 맥·윈도우는 프로세스를 처음 본 시점의 벽시계 초를 그대로 쓰므로 작은 시계 보정(NTP 슬루·몇 초 단계)이 낄 수 있다.
-/// 제보의 경우(고아의 시작은 부팅 때 · 부모 번호를 받은 새 프로세스는 며칠 뒤)는 차이가 부팅 이후 전체라 이 값과 무관하게 걸린다.
-/// 클수록 "버리는 일"이 줄어든다(= 종전 동작 쪽으로 안전).
-const DESC_START_SLACK_SECS: u64 = 30;
-
-/// 시작 시각으로 인정하는 상한(2100-01-01 UTC). 윈도우 sysinfo 는 GetProcessTimes 가 실패해도 `0/1e7-11644473600` 을 계산하므로
-/// 값이 0 으로 오지 않고 u64 가 한 바퀴 돈 거대한 수가 될 수 있다 — 그런 값은 "모름" 으로 본다.
-const DESC_START_MAX_PLAUSIBLE: u64 = 4_102_444_800;
-
-/// 되돌리는 손잡이 `CYS_DESC_START_GUARD` — `0` 이면 끈다(0.14.43 동작). 환경변수만 읽는다(좌석이 쓸 수 있는 정책 파일로는 못 끈다).
-/// 데몬 시작 때 한 번만 읽는다(틱마다 환경을 뒤지지 않는다).
-fn start_guard_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("CYS_DESC_START_GUARD").ok().as_deref().map(str::trim), Some("0")))
-}
-
-/// 다른 모듈(`office_bridge::event_children_of`)이 같은 규칙을 쓰는 입구.
-pub fn start_guard_enabled_pub() -> bool {
-    start_guard_enabled()
-}
-
-/// 다른 모듈용 입구 — `child_predates_parent` 와 같다.
-pub fn child_predates_parent_pub(parent_start: u64, child_start: u64) -> bool {
-    child_predates_parent(parent_start, child_start)
-}
-
-/// 시작 시각을 아는가(0 · 상한 초과는 모름).
-fn start_known(s: u64) -> bool {
-    s > 0 && s < DESC_START_MAX_PLAUSIBLE
-}
-
-/// 부모 번호가 가리키는 프로세스보다 **먼저** 만들어진 "자식"인가 — 번호가 재사용되어 엉뚱한 고아가 매달린 연결.
-/// 부모·자식 둘 다 시작 시각을 알 때만 참이 된다(모르면 종전대로 연결 유지 — 모르는 것을 근거로 진짜 자식을 떼지 않는다).
-#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn child_predates_parent(parent_start: u64, child_start: u64) -> bool {
-    start_known(parent_start)
-        && start_known(child_start)
-        && child_start.saturating_add(DESC_START_SLACK_SECS) < parent_start
-}
-
-/// 자손 판정의 순수 부분 — 입력은 (pid, 부모 pid, 시작 시각 epoch 초) 목록과 root. `System` 에 기대지 않는다.
-/// 반환 순서는 종전 `descendant_pids` 의 DFS 순서(입력 순서대로 children 인덱스를 만들고 스택으로 순회)와 같다.
-/// `guard` 가 참이면 "자식이 부모보다 이른" 연결을 버린다(root 도 같은 규칙 — root 의 시작 시각을 알면 그보다 이른 "자식"은 버린다).
-/// 줄어드는 방향으로만 바뀐다: 버려진 연결 아래 가지는 통째로 빠진다.
-#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
-fn descendants_from_table(table: &[(u32, Option<u32>, u64)], root: u32, guard: bool) -> Vec<u32> {
-    let starts: HashMap<u32, u64> = if guard {
-        table.iter().map(|(pid, _, st)| (*pid, *st)).collect()
-    } else {
-        HashMap::new()
-    };
+/// 0.14.43 의 `descendant_pids` 그대로(시작 시각을 보지 않는다).
+fn legacy_descendant_pids(sys: &System, root: u32) -> Vec<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for (pid, parent, start) in table {
-        if let Some(parent) = parent {
-            if guard {
-                let ps = starts.get(parent).copied().unwrap_or(0);
-                if child_predates_parent(ps, *start) {
-                    continue;
-                }
-            }
-            children.entry(*parent).or_default().push(*pid);
+    for (pid, proc_) in sys.processes() {
+        if let Some(parent) = proc_.parent() {
+            children
+                .entry(parent.as_u32())
+                .or_default()
+                .push(pid.as_u32());
         }
     }
     let mut out = Vec::new();
@@ -3822,6 +3781,134 @@ fn descendants_from_table(table: &[(u32, Option<u32>, u64)], root: u32, guard: b
         }
     }
     out
+}
+
+/// 연결 버림의 여유(초) — 자식의 시작 시각이 부모(또는 root)보다 **이 값을 넘게** 이를 때만 연결을 버린다.
+/// 근거: ① sysinfo 의 start_time 은 초 단위(윈도우 FILETIME/1e7)라 반올림 1초, ② 윈도우는 프로세스를 만든 시점의 벽시계 초를
+/// 그대로 쓰므로 작은 시계 보정(NTP 슬루·몇 초 단계)이 낄 수 있다.
+/// 제보의 경우(고아의 시작은 부팅 때 · 부모 번호를 받은 새 프로세스는 며칠 뒤)는 차이가 부팅 이후 전체라 이 값과 무관하게 걸린다.
+/// 알려진 한계: 부모가 태어난 뒤 시계가 이 값보다 크게 뒤로 가면 그 뒤 태어난 진짜 자식도 버려진다(시험으로 고정).
+const DESC_START_SLACK_SECS: u64 = 30;
+
+/// 시작 시각으로 인정하는 상한(2100-01-01 UTC). 윈도우 sysinfo 는 GetProcessTimes 가 실패해도 `0/1e7-11644473600` 을 계산하므로
+/// 릴리스 빌드에서는 u64 가 한 바퀴 돈 거대한 수가 될 수 있다(디버그 빌드는 뺄셈 넘침 패닉) — 그런 값은 "모름" 으로 본다.
+const DESC_START_MAX_PLAUSIBLE: u64 = 4_102_444_800;
+
+/// 되돌리는 손잡이 `CYS_DESC_START_GUARD` — `0` 이면 끈다(0.14.43 동작). 환경변수만 읽는다(좌석이 쓸 수 있는 정책 파일로는 못 끈다).
+/// 데몬 시작 때 한 번만 읽는다(틱마다 환경을 뒤지지 않는다).
+fn start_guard_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !matches!(std::env::var("CYS_DESC_START_GUARD").ok().as_deref().map(str::trim), Some("0")))
+}
+
+/// 보정을 적용하는가 — 윈도우이고 손잡이가 켜져 있을 때만(순수 함수 · 시험은 인자로 넣는다).
+fn guard_applies(knob_on: bool, is_windows: bool) -> bool {
+    knob_on && is_windows
+}
+
+/// 시작 시각을 아는가(0 · 상한 이상은 모름).
+fn start_known(s: u64) -> bool {
+    s > 0 && s < DESC_START_MAX_PLAUSIBLE
+}
+
+/// `child` 가 `anchor`(부모 또는 root)보다 **한참 먼저** 만들어진 것인가 — 번호가 재사용되어 엉뚱한 고아가 매달린 연결.
+/// 둘 다 시작 시각을 알 때만 참이 된다(모르면 종전대로 유지 — 모르는 것을 근거로 진짜 자식을 떼지 않는다).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn child_predates_parent(parent_start: u64, child_start: u64) -> bool {
+    start_known(parent_start)
+        && start_known(child_start)
+        && child_start.saturating_add(DESC_START_SLACK_SECS) < parent_start
+}
+
+/// 버려진 연결 하나(로그용): 부모 번호 · 자식 번호 · 두 시작 시각 · root 닻 때문이었는가.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DropRec {
+    parent: u32,
+    child: u32,
+    parent_start: u64,
+    child_start: u64,
+    by_root_anchor: bool,
+}
+
+/// 자손 판정의 순수 부분 — 입력은 (pid, 부모 pid, 시작 시각 epoch 초) 목록과 root. `System` 에 기대지 않는다.
+/// 반환 순서는 종전 DFS 순서(입력 순서대로 children 인덱스를 만들고 스택으로 순회)와 같다.
+/// `guard` 가 참이면 ① 자식이 부모보다 이른 연결 ② 자식이 **root** 보다 이른 후보(중간 부모의 시작 시각을 몰라도 걸린다)를 버린다.
+/// 줄어드는 방향으로만 바뀐다: 버려진 후보 아래 가지는 통째로 빠진다. 버린 것은 두 번째 값으로 돌려준다.
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+fn descendants_report(table: &[(u32, Option<u32>, u64)], root: u32, guard: bool) -> (Vec<u32>, Vec<DropRec>) {
+    let starts: HashMap<u32, u64> = if guard {
+        table.iter().map(|(pid, _, st)| (*pid, *st)).collect()
+    } else {
+        HashMap::new()
+    };
+    let root_start = starts.get(&root).copied().unwrap_or(0);
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (pid, parent, _start) in table {
+        if let Some(parent) = parent {
+            children.entry(*parent).or_default().push(*pid);
+        }
+    }
+    let mut out = Vec::new();
+    let mut drops = Vec::new();
+    let mut stack = vec![root];
+    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    seen.insert(root);
+    while let Some(p) = stack.pop() {
+        if let Some(kids) = children.get(&p) {
+            for &kid in kids {
+                if !seen.insert(kid) {
+                    continue;
+                }
+                if guard {
+                    let ps = starts.get(&p).copied().unwrap_or(0);
+                    let ks = starts.get(&kid).copied().unwrap_or(0);
+                    let by_parent = child_predates_parent(ps, ks);
+                    if by_parent || child_predates_parent(root_start, ks) {
+                        drops.push(DropRec { parent: p, child: kid, parent_start: ps, child_start: ks, by_root_anchor: !by_parent });
+                        continue;
+                    }
+                }
+                out.push(kid);
+                stack.push(kid);
+            }
+        }
+    }
+    (out, drops)
+}
+
+/// 같은 (root, 부모 번호) 의 버림 로그는 이 간격(초)에 한 번만.
+const DESC_DROP_LOG_INTERVAL_SECS: u64 = 600;
+
+/// 디바운스 판정(순수): 키를 마지막으로 남긴 뒤 간격이 지났거나 처음이면 참이고 시각을 갱신한다.
+fn debounce_allows(map: &mut HashMap<(u32, u32), u64>, key: (u32, u32), now: u64, interval: u64) -> bool {
+    match map.get(&key) {
+        Some(&last) if now.saturating_sub(last) < interval => false,
+        _ => {
+            if map.len() > 256 {
+                map.retain(|_, t| now.saturating_sub(*t) < interval);
+            }
+            map.insert(key, now);
+            true
+        }
+    }
+}
+
+/// 버린 연결을 데몬 로그(stderr)에 남긴다 — (root, 부모 번호) 별로 간격당 한 줄. 자체 작은 잠금만 쥐고(다른 잠금과 겹치지 않음) 파일 I/O 는 없다.
+fn log_drops_debounced(root: u32, drops: &[DropRec], legacy_n: usize, kept_n: usize) {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<HashMap<(u32, u32), u64>>> = std::sync::OnceLock::new();
+    let m = SEEN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let now = now_epoch() as u64;
+    let Ok(mut g) = m.lock() else { return };
+    for d in drops {
+        if debounce_allows(&mut g, (root, d.parent), now, DESC_DROP_LOG_INTERVAL_SECS) {
+            eprintln!(
+                "[cysd] 자손 세기: 시작 시각이 이른 연결을 버림 root={root} 부모={}(시작 {}) 자식={}(시작 {}) {} · 연결 {}건 버림 · 자손 {}→{}개 (끄기: CYS_DESC_START_GUARD=0)",
+                d.parent, d.parent_start, d.child, d.child_start,
+                if d.by_root_anchor { "root 닻" } else { "부모 비교" },
+                drops.len(), legacy_n, kept_n
+            );
+        }
+    }
 }
 
 /// 프로세스 표에 **이미 실린 사실만으로** 만드는 관측 문자열.
@@ -11560,6 +11647,11 @@ mod tests {
         plan_duplicate_alerts, plan_duplicate_kills, wakeup_entry_ids, ProcObs,
     };
 
+    /// 시험 편의 — 결과만(소스 핀 시험이 `#[cfg(test)]` 앞까지만 읽으므로 본문 쪽에는 cfg(test) 항목을 두지 않는다).
+    fn descendants_from_table(table: &[(u32, Option<u32>, u64)], root: u32, guard: bool) -> Vec<u32> {
+        super::descendants_report(table, root, guard).0
+    }
+
     /// 제보 꼴 표 — root(좌석 셸) → 824(임시 자식 · 최근) · 부팅 때 만들어진 옛 고아 둘이 부모를 824 로 적고 있고 그 아래 200개.
     fn report_shape_table() -> (Vec<(u32, Option<u32>, u64)>, u32) {
         let boot = 1_700_000_000u64;
@@ -11577,7 +11669,7 @@ mod tests {
     #[test]
     fn wh_before_fix_report_shape_counts_over_200() {
         let (t, root) = report_shape_table();
-        let n = super::descendants_from_table(&t, root, false).len();
+        let n = descendants_from_table(&t, root, false).len();
         eprintln!("WH-BEFORE descendants={n}");
         assert!(n > 200, "종전 로직은 제보 꼴에서 200개 넘게 센다: {n}");
     }
@@ -11585,10 +11677,10 @@ mod tests {
     #[test]
     fn wh_report_shape_guard_drops_reused_pid_orphans() {
         let (t, root) = report_shape_table();
-        let got = super::descendants_from_table(&t, root, true);
+        let got = descendants_from_table(&t, root, true);
         assert_eq!(got, vec![824], "고아 둘과 그 아래 200개는 버려지고 진짜 자식 824 만 남는다");
         // 손잡이를 끄면 종전과 같다.
-        assert_eq!(super::descendants_from_table(&t, root, false).len(), 203);
+        assert_eq!(descendants_from_table(&t, root, false).len(), 203);
     }
 
     #[test]
@@ -11602,8 +11694,8 @@ mod tests {
             (14, Some(13), n + 5),
             (99, Some(77), n), // 무관
         ];
-        let a = super::descendants_from_table(&t, 10, true);
-        let b = super::descendants_from_table(&t, 10, false);
+        let a = descendants_from_table(&t, 10, true);
+        let b = descendants_from_table(&t, 10, false);
         assert_eq!(a, b);
         assert_eq!(a.len(), 4);
     }
@@ -11611,22 +11703,91 @@ mod tests {
     #[test]
     fn wh_unknown_start_keeps_link() {
         let n = 1_800_000_000u64;
-        // 자식 모름 · 부모 모름 · 둘 다 모름 · 거대한 값(한 바퀴 돈 수) — 전부 종전대로 유지.
+        // 자식 모름 · 거대한 값(한 바퀴 돈 수 = 모름) — 종전대로 유지. root 닻은 "아는 자손 후보"만 거른다.
         let t = vec![
             (10, Some(1), n),
             (11, Some(10), 0),
-            (12, Some(11), n - 1_000_000),
-            (20, Some(10), n - 1_000_000),
-            (21, Some(20), 0),
             (30, Some(10), u64::MAX - 5),
-            (31, Some(30), n - 1_000_000),
+            (31, Some(30), 0),
         ];
-        let got = super::descendants_from_table(&t, 10, true);
-        // 11(자식 모름) 유지 · 12 는 부모 11 의 시작을 모르니 유지 · 20 은 둘 다 알고 한참 이르다 → 버림 · 21 은 20 아래라 빠짐
-        // 30(거대 = 모름) 유지 · 31 은 부모 30 의 시작을 모르니 유지.
-        let mut g = got.clone();
+        let mut g = descendants_from_table(&t, 10, true);
         g.sort();
-        assert_eq!(g, vec![11, 12, 30, 31]);
+        assert_eq!(g, vec![11, 30, 31]);
+    }
+
+    #[test]
+    fn wh_root_anchor_drops_known_old_descendant_under_unknown_middle() {
+        let n = 1_800_000_000u64;
+        // 중간 부모(11)의 시작을 몰라도, 시작을 아는 옛 후손(12)은 root 보다 이르니 버린다. 모르는 후손(13)은 유지.
+        let t = vec![(10, Some(1), n), (11, Some(10), 0), (12, Some(11), n - 1_000_000), (13, Some(11), 0)];
+        let (g, d) = super::descendants_report(&t, 10, true);
+        assert_eq!(g, vec![11, 13]);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].by_root_anchor && d[0].child == 12 && d[0].parent == 11);
+    }
+
+    /// 한계 고정 — 제보 꼴이라도 **자식(wininit 류)의 시작 시각이 0(모름)이면 고쳐지지 않는다**(비상승 권한에서 핸들을 못 여는 경우).
+    #[test]
+    fn wh_limit_report_shape_with_unknown_child_start_is_not_fixed() {
+        let n = 1_800_000_000u64;
+        let mut t = vec![(1000, Some(1), n - 3600), (824, Some(1000), n - 2), (600, Some(824), 0), (610, Some(824), 0)];
+        for i in 0..200u32 {
+            t.push((2000 + i, Some(600), 0));
+        }
+        let on = descendants_from_table(&t, 1000, true);
+        let off = descendants_from_table(&t, 1000, false);
+        assert_eq!(on, off, "시작 시각을 모르면 줄지 않는다(알려진 한계)");
+        assert!(on.len() > 200);
+    }
+
+    /// 사실 고정 — 시계가 뒤로 가서 진짜 자식이 부모보다 30초 넘게 이르게 기록되면 **버려진다**(윈도우 적용분의 알려진 위험).
+    #[test]
+    fn wh_clock_rollback_real_child_is_dropped_known_risk() {
+        let p = 1_800_000_000u64;
+        let t = vec![(10, Some(1), p), (11, Some(10), p - 3600 + 120), (12, Some(11), p - 3600 + 125)];
+        assert!(descendants_from_table(&t, 10, true).is_empty());
+        assert_eq!(descendants_from_table(&t, 10, false), vec![11, 12]);
+    }
+
+    #[test]
+    fn wh_plausible_upper_bound_and_exact_slack() {
+        let m = super::DESC_START_MAX_PLAUSIBLE;
+        assert!(super::start_known(m - 1));
+        assert!(!super::start_known(m));
+        assert!(!super::start_known(0));
+        let n = 1_800_000_000u64;
+        assert!(!super::child_predates_parent(n, n - 30), "정확히 30초 = 유지");
+        assert!(super::child_predates_parent(n, n - 31), "31초 = 버림");
+        // 상한 이상 값은 모름 → 유지
+        assert!(!super::child_predates_parent(m, 5));
+    }
+
+    #[test]
+    fn wh_guard_applies_only_on_windows_with_knob() {
+        assert!(super::guard_applies(true, true));
+        assert!(!super::guard_applies(false, true));
+        assert!(!super::guard_applies(true, false));
+        assert!(!super::guard_applies(false, false));
+    }
+
+    /// 맥·리눅스는 종전과 글자 그대로 같은 결과(같은 함수를 부른다 · 순서까지 동일).
+    #[cfg(not(windows))]
+    #[test]
+    fn wh_non_windows_result_identical_to_legacy() {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        for root in [1u32, std::process::id()] {
+            assert_eq!(super::descendant_pids(&sys, root), super::legacy_descendant_pids(&sys, root));
+        }
+    }
+
+    #[test]
+    fn wh_drop_log_debounce() {
+        let mut m = std::collections::HashMap::new();
+        assert!(super::debounce_allows(&mut m, (1, 2), 100, 600));
+        assert!(!super::debounce_allows(&mut m, (1, 2), 699, 600));
+        assert!(super::debounce_allows(&mut m, (1, 3), 150, 600), "다른 부모는 따로");
+        assert!(super::debounce_allows(&mut m, (1, 2), 700, 600));
     }
 
     #[test]
@@ -11634,12 +11795,12 @@ mod tests {
         let n = 1_800_000_000u64;
         let t = vec![(11, Some(10), n - 9_999_999)];
         // root(10) 이 표에 없거나 시작을 모르면 유지.
-        assert_eq!(super::descendants_from_table(&t, 10, true), vec![11]);
+        assert_eq!(descendants_from_table(&t, 10, true), vec![11]);
         let t2 = vec![(10, Some(1), 0), (11, Some(10), n - 9_999_999)];
-        assert_eq!(super::descendants_from_table(&t2, 10, true), vec![11]);
+        assert_eq!(descendants_from_table(&t2, 10, true), vec![11]);
         // root 의 시작을 알면 그보다 한참 이른 "자식"은 버린다.
         let t3 = vec![(10, Some(1), n), (11, Some(10), n - 9_999_999)];
-        assert!(super::descendants_from_table(&t3, 10, true).is_empty());
+        assert!(descendants_from_table(&t3, 10, true).is_empty());
     }
 
     #[test]
@@ -11663,7 +11824,7 @@ mod tests {
     fn wh_cycle_terminates() {
         let n = 1_800_000_000u64;
         let t = vec![(10, Some(11), n), (11, Some(10), n), (12, Some(12), n)];
-        let got = super::descendants_from_table(&t, 10, true);
+        let got = descendants_from_table(&t, 10, true);
         assert_eq!(got, vec![11]);
     }
 
@@ -11689,8 +11850,8 @@ mod tests {
             .iter()
             .map(|(p, pr)| (p.as_u32(), pr.parent().map(|x| x.as_u32()), pr.start_time()))
             .collect();
-        let on = super::descendants_from_table(&table, me, true);
-        let off = super::descendants_from_table(&table, me, false);
+        let on = descendants_from_table(&table, me, true);
+        let off = descendants_from_table(&table, me, false);
         let kid_start = table.iter().find(|r| r.0 == kid).map(|r| r.2);
         let me_start = table.iter().find(|r| r.0 == me).map(|r| r.2);
         let _ = child.kill();
@@ -11749,8 +11910,8 @@ mod tests {
                     }
                 }
             }
-            let on = super::descendants_from_table(&t, parent, true);
-            let off = super::descendants_from_table(&t, parent, false);
+            let on = descendants_from_table(&t, parent, true);
+            let off = descendants_from_table(&t, parent, false);
             eprintln!("WH-WIN-GUARD parent={parent} child={pid} start={st} on_has={} off_has={}", on.contains(&pid), off.contains(&pid));
             assert!(off.contains(&pid), "전제: 종전 로직은 센다");
             assert!(!on.contains(&pid), "시작 시각이 부팅 때인 보호 프로세스는 자손으로 세지 않는다");

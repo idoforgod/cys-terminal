@@ -248,15 +248,10 @@ pub fn is_event_subscriber(cmd: &[String]) -> bool {
 }
 
 /// 부모 번호가 `pid` 인 이벤트 구독 프로세스들(끝내기 전에 적어 둘 사실).
-/// 부모 번호가 같아도 **자식의 시작 시각이 부모보다 한참 이르면**(번호가 재사용되어 옛 고아가 매달린 꼴) 자식으로 세지 않는다 —
-/// 판정은 좌석 자손 세기와 같은 순수 규칙(`governance::child_predates_parent`)이다. 시작 시각을 모르면 종전대로 센다.
 pub fn event_children_of(procs: &[ProcRec], pid: u32) -> Vec<ProcRec> {
-    let parent_start = procs.iter().find(|p| p.pid == pid).map(|p| p.start).unwrap_or(0);
-    let guard = crate::governance::start_guard_enabled_pub();
     procs
         .iter()
         .filter(|p| p.ppid == Some(pid) && is_event_subscriber(&p.cmd))
-        .filter(|p| !(guard && crate::governance::child_predates_parent_pub(parent_start, p.start)))
         .cloned()
         .collect()
 }
@@ -1039,17 +1034,6 @@ mod tests {
         let z = py(12, Some(10), 101, &["cys", "ping"]);
         let all = vec![b.clone(), k.clone(), z];
         assert_eq!(event_children_of(&all, 10), vec![k.clone()]);
-        // 번호 재사용 꼴 — 부모(10)보다 한참 이른 구독 프로세스는 자식으로 세지 않는다 · 시작 시각을 모르면(0) 센다.
-        let old_orphan = py(13, Some(10), 1_800_000_000 - 5000, &["cys", "events", "--reconnect"]);
-        let unk_orphan = py(14, Some(10), 0, &["cys", "events", "--reconnect"]);
-        let mut with = all.clone();
-        with.push(old_orphan);
-        with.push(unk_orphan.clone());
-        let b2 = py(10, Some(1), 1_800_000_000, &["/rt/python3", "x.py"]);
-        with[0] = b2;
-        let got: Vec<u32> = event_children_of(&with, 10).iter().map(|r| r.pid).collect();
-        assert!(!got.contains(&13), "부모보다 이른 옛 구독 프로세스는 제외: {got:?}");
-        assert!(got.contains(&14), "시작 시각을 모르면 종전대로 센다: {got:?}");
         assert!(same_process(&k, &all));
         assert!(!same_process(&py(11, Some(10), 999, &k.cmd.iter().map(|s| s.as_str()).collect::<Vec<_>>()), &all), "시작 시각이 다르면 다른 프로세스");
         // 실제 프로세스 목록 — 내 프로세스가 같은 사용자의 것으로 보여야 한다.
