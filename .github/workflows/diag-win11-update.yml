@@ -23,7 +23,7 @@ concurrency:
 jobs:
   e2e:
     name: 'e2e (${{ matrix.os }})'
-    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[w44-') && (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 55
     strategy:
@@ -160,7 +160,7 @@ jobs:
 
   sacrules:
     name: 'sacrules (${{ matrix.os }})'
-    if: ${{ !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[w44-') && (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -332,7 +332,7 @@ jobs:
   # message runs ONLY this job; it is skipped by [product-only] or [appe2e-only] alone (and runs when [sacreal-only] is present).
   sacreal-e2e:
     name: 'sacreal-e2e (windows-11-arm)'
-    if: ${{ contains(github.event.head_commit.message, '[sacreal-only]') || (!contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
+    if: ${{ !contains(github.event.head_commit.message, '[w44-') && (contains(github.event.head_commit.message, '[sacreal-only]') || (!contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]'))) }}
     runs-on: windows-11-arm
     timeout-minutes: 50
     env:
@@ -467,7 +467,7 @@ jobs:
   # [sacreal-only] or [appe2e-only] alone (and runs when [product-only] is present).
   product-launch:
     name: 'product-launch (windows-11-arm)'
-    if: ${{ contains(github.event.head_commit.message, '[product-only]') || (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
+    if: ${{ !contains(github.event.head_commit.message, '[w44-') && (contains(github.event.head_commit.message, '[product-only]') || (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[appe2e-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]'))) }}
     runs-on: windows-11-arm
     timeout-minutes: 30
     env:
@@ -607,7 +607,7 @@ jobs:
   # forced by [appe2e-only] then allocates ONE runner, as before, and writes the reason into its result.
   appe2e-gate:
     name: 'appe2e-gate'
-    if: ${{ contains(github.event.head_commit.message, '[appe2e-only]') || (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
+    if: ${{ !contains(github.event.head_commit.message, '[w44-') && (contains(github.event.head_commit.message, '[appe2e-only]') || (!contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]'))) }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -719,7 +719,7 @@ jobs:
   app-e2e:
     name: 'app-e2e (windows-11-arm, ${{ matrix.scene }})'
     needs: appe2e-gate
-    if: ${{ contains(github.event.head_commit.message, '[appe2e-only]') || (needs.appe2e-gate.outputs.go == 'true' && !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]')) }}
+    if: ${{ !contains(github.event.head_commit.message, '[w44-') && (contains(github.event.head_commit.message, '[appe2e-only]') || (needs.appe2e-gate.outputs.go == 'true' && !contains(github.event.head_commit.message, '[sacreal-only]') && !contains(github.event.head_commit.message, '[product-only]') && !contains(github.event.head_commit.message, '[cysdwin-only]'))) }}
     runs-on: windows-11-arm
     timeout-minutes: 65
     strategy:
@@ -906,7 +906,7 @@ jobs:
   # a tag it does not run at all (unlike the other jobs it has no default run). The cargo step may take 45 minutes (build included).
   cysd-win:
     name: 'cysd-win (windows-latest)'
-    if: ${{ contains(github.event.head_commit.message, '[cysdwin-only]') }}
+    if: ${{ !contains(github.event.head_commit.message, '[w44-') && (contains(github.event.head_commit.message, '[cysdwin-only]')) }}
     runs-on: windows-latest
     timeout-minutes: 90
     env:
