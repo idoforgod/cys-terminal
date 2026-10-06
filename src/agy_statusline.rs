@@ -59,6 +59,12 @@
 //! Git Bash 인지(WSL 의 `System32\bash.exe` 가 먼저 잡힐 수 있다), 아예 없는지도 기계마다 다르다. 그래서 윈도우는
 //! 쓰지 않고 안내만 한다(`WindowsManualOnly` — agy 가 설치돼 있고 cys 연결이 아직 없을 때만). 제거 경로는 OS 무관하다
 //! (표지 달린 연결만 지운다).
+//!
+//! 0.14.44 의 확인(정적 분석 · 증거: 보고서 폴더 `_evidence/impl-0.14.44-20261006/WD/RESULT.md` · 윈도우 파일은 실행하지 않았다):
+//! 윈도우 판 agy 1.2.17(x64·arm64)의 `store.(*StatusLineRunner).run` 은 상태줄 명령을 `sh -c` 가 아니라 `cmd /c <명령>` 으로 부른다
+//! (맥의 `sh -c` 와 다른 플랫폼 분기로 추정). 그래서 `sh.exe` 가 PATH 에 있어야 한다는 우려는 풀렸지만, 명령은 cmd 문법이어야 하고
+//! 따옴표 처리는 공개 보고와 부합하는 추정일 뿐이다. **실제 윈도우 PC 에서 호출을 본 것은 아니다** — 측정 3단계를 통과하지 못했으므로
+//! 자동 연결은 이번 판에도 끈 채이고(코드 동작 불변), 화면·로그 안내는 「다음 판에서 다시 확인합니다」 문구로 맞췄다.
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -762,8 +768,8 @@ pub fn describe(o: &Outcome, settings: &Path) -> Option<String> {
     Some(match o {
         Outcome::NotInstalled | Outcome::AlreadyLinked(_) | Outcome::NothingToUnlink(_) => return None,
         Outcome::WindowsManualOnly => format!(
-            "윈도우는 자동 연결을 하지 않습니다(agy 가 상태줄 명령을 어떤 셸로 부르는지 미확인) — {p} 에 직접 넣는 방법은 \
-             사용 설명서 agy 절"
+            "Antigravity 사용량은 윈도우에서 아직 자동으로 연결되지 않습니다 — 다음 판에서 다시 확인합니다. \
+             지금은 {p} 에 직접 넣는 방법이 있습니다(사용 설명서 agy 절)"
         ),
         Outcome::UnsafePath(pack) => format!(
             "팩 경로({pack})에 공백·따옴표 등이 있어 안전한 연결 명령을 만들 수 없어 연결하지 않았습니다 — 사용 설명서 agy 절"
@@ -1258,7 +1264,7 @@ mod tests {
         assert!(describe(&Outcome::AlreadyLinked(Slot::OursAuto { enabled: Some(true) }), s).is_none());
         assert!(describe(&Outcome::NotInstalled, s).is_none());
         assert!(describe(&Outcome::UserOwned, s).unwrap().contains("덮지 않았습니다"));
-        assert!(describe(&Outcome::WindowsManualOnly, s).unwrap().contains("윈도우는 자동 연결을 하지 않습니다"));
+        assert!(describe(&Outcome::WindowsManualOnly, s).unwrap().contains("Antigravity 사용량은 윈도우에서 아직 자동으로 연결되지 않습니다 — 다음 판에서 다시 확인합니다"));
         assert!(describe(&Outcome::Linked { created: false }, s).unwrap().contains("CYS_AGY_STATUSLINE=0"));
     }
 }

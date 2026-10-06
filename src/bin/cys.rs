@@ -8885,7 +8885,7 @@ fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         (_, true) => item(DiagStatus::Ok, "꺼짐(되돌리기 노브) — 연결 없음".into(), with_done(String::new())),
         (_, false) if cfg!(windows) => item(
             DiagStatus::Skip,
-            "윈도우는 자동 연결하지 않는다(agy 가 상태줄 명령을 어떤 셸로 부르는지 미확인 — 측정 불능은 통과가 아니다)".into(),
+            "Antigravity 사용량은 윈도우에서 아직 자동으로 연결되지 않습니다 — 다음 판에서 다시 확인합니다(측정 불능은 통과가 아니다)".into(),
             with_done(match agy::link_command_for(&ctx.pack_dir.to_string_lossy(), true, false) {
                 Some(c) => format!("직접 연결: statusLine command = `{c}` ({manual})"),
                 None => format!("팩 경로에 공백 등이 있어 붙여 넣을 명령을 만들 수 없다 — {manual}"),
