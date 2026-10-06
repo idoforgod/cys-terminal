@@ -21,9 +21,9 @@ $cred = New-Object System.Management.Automation.PSCredential('.\w44std', $sec)
 $psexe = Join-Path $env:windir 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $cmdexe = Join-Path $env:windir 'System32\cmd.exe'
 
-function Run-Std { param([string]$File, [string]$Args, [string]$Tag, [int]$MaxSec = 600)
+function Run-Std { param([string]$File, [string]$ArgText, [string]$Tag, [int]$MaxSec = 600)
     $so = Join-Path $PUB ($Tag + '.out.txt'); $se = Join-Path $PUB ($Tag + '.err.txt')
-    $p = Start-Process -FilePath $File -ArgumentList $Args -Credential $cred -LoadUserProfile -WorkingDirectory $PUB -PassThru -RedirectStandardOutput $so -RedirectStandardError $se
+    $p = Start-Process -FilePath $File -ArgumentList $ArgText -Credential $cred -LoadUserProfile -WorkingDirectory $PUB -PassThru -RedirectStandardOutput $so -RedirectStandardError $se
     if (-not $p.WaitForExit($MaxSec * 1000)) { try { Stop-ProcessTree -ProcessId $p.Id } catch { } }
     $rc = $null; try { $rc = $p.ExitCode } catch { }
     foreach ($f in @($so, $se)) { if (Test-Path -LiteralPath $f) { Copy-Item -LiteralPath $f -Destination (Join-Path $OUT (Split-Path -Leaf $f)) -Force } }
