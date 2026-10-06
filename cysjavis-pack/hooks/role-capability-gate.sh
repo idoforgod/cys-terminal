@@ -2825,6 +2825,21 @@ def context_payload(text):
             '"additionalContext":"%s"}}' % _json_escape(text))
 
 
+def _ascii_json(payload):
+    """완성된 JSON 문자열의 비ASCII 글자를 `\\uXXXX` 로(출력 인코딩이 ASCII 뿐일 때 — emit_deny 대체 출력 전용)."""
+    out = []
+    for ch in payload:
+        o = ord(ch)
+        if o < 0x80:
+            out.append(ch)
+        elif o > 0xFFFF:
+            o -= 0x10000
+            out.append("\\u%04x\\u%04x" % (0xD800 + (o >> 10), 0xDC00 + (o & 0x3FF)))
+        else:
+            out.append("\\u%04x" % o)
+    return "".join(out)
+
+
 def emit_deny(reason):
     """modern Claude Code permission-decision deny JSON을 stdout에 내고 exit 0.
     printf 고정 형태(외부 jq/python 의존 없음 — reason만 보간·이스케이프)."""
@@ -2833,9 +2848,9 @@ def emit_deny(reason):
     except UnicodeEncodeError:
         # 짝 없는 대리 문자 등 인코딩 불가 문자가 사유에 있어도 거부 JSON 은 나가야 한다(0.14.44 A5) —
         # 출력 인코딩 실패는 표준출력 0바이트 + exit 1(비차단)이 되어 판정은 거부인데 명령이 통과한다.
-        # 사유만 ASCII(backslashreplace)로 바꿔 같은 꼴 JSON 으로 다시 낸다. 판정 경로·문구는 그대로.
-        sys.stdout.write(
-            deny_payload(reason.encode("ascii", "backslashreplace").decode("ascii")) + "\n")
+        # 같은 꼴 JSON 을 만든 뒤 비ASCII 글자만 JSON \uXXXX 이스케이프(BMP 밖은 서로게이트 쌍)로 바꿔 다시 낸다 —
+        # 역슬래시를 미리 넣고 _json_escape 가 다시 겹치면 `\\ub2a5` 로 나가 사유가 읽히지 않는다(리뷰 m1). 판정 경로·문구는 그대로.
+        sys.stdout.write(_ascii_json(deny_payload(reason)) + "\n")
     sys.exit(0)
 
 
