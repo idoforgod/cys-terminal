@@ -196,7 +196,7 @@ function Invoke-W44DoctorProbe {
                 try {
                     $all = @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec 30 -ErrorAction Stop)
                     $q = New-Object System.Collections.Generic.Queue[int]; $q.Enqueue($p.Id); $seen = @{}
-                    while ($q.Count -gt 0) { $c = $q.Dequeue(); foreach ($r in $all) { if ([int]$r.ParentProcessId -eq $c -and -not $seen.ContainsKey([int]$r.ProcessId)) { $seen[[int]$r.ProcessId] = 1; $q.Enqueue([int]$r.ProcessId); $kids += ('{0}#{1} {2}' -f $r.Name, $r.ProcessId, (Limit-Text ([string]$r.CommandLine) 240)) } } }
+                    while ($q.Count -gt 0) { $c = $q.Dequeue(); foreach ($r in $all) { if ([int]$r.ParentProcessId -eq $c -and -not $seen.ContainsKey([int]$r.ProcessId)) { $seen[[int]$r.ProcessId] = 1; $q.Enqueue([int]$r.ProcessId); $cpu = ''; try { $gp = Get-Process -Id ([int]$r.ProcessId) -ErrorAction Stop; $cpu = (' cpu_s={0} read_bytes={1} write_bytes={2} threads={3}' -f [math]::Round($gp.TotalProcessorTime.TotalSeconds, 1), $r.ReadTransferCount, $r.WriteTransferCount, $r.ThreadCount) } catch { }; $kids += ('{0}#{1}{2} {3}' -f $r.Name, $r.ProcessId, $cpu, (Limit-Text ([string]$r.CommandLine) 700)) } } }
                 } catch { }
                 $net = ''
                 try { $net = [string](Invoke-Proc -File (Join-Path $env:windir 'System32\netstat.exe') -Arguments '-ano' -TimeoutSec 30).out } catch { }
@@ -207,7 +207,20 @@ function Invoke-W44DoctorProbe {
             }
         }
         $o['seconds'] = [math]::Round(((Get-Date) - $ts).TotalSeconds, 1)
-        if ($p.HasExited) { $o['finished'] = $true; $p.WaitForExit(); $o['rc'] = $p.ExitCode } else { $o['timed_out'] = $true; try { Stop-ProcessTree -ProcessId $p.Id } catch { } }
+        if ($p.HasExited) { $o['finished'] = $true; $p.WaitForExit(); $o['rc'] = $p.ExitCode } else {
+            $o['timed_out'] = $true
+            try { Stop-ProcessTree -ProcessId $p.Id } catch { }
+            # the same seal verification the doctor runs, on its own, timed (is the machine slow at reading the runtime tree, or is it blocked?)
+            try {
+                $inst = Get-InstallDir
+                $py = Join-Path $inst 'runtime\python\python3.exe'
+                $sealPy = Join-Path $env:USERPROFILE '.cys\pack\bin\javis_runtime_seal.py'
+                $man = Join-Path $inst 'runtime-manifest.json'
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $vx = Invoke-Proc -File $py -Arguments ('"{0}" verify --root "{1}" --manifest "{2}"' -f $sealPy, (Join-Path $inst 'runtime'), $man) -TimeoutSec 300
+                $o['direct_seal_verify'] = [ordered]@{ seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1); rc = $vx['rc']; timed_out = $vx['timedOut']; out = (Limit-Text ([string]$vx['out']) 300); err = (Limit-Text ([string]$vx['err']) 300); manifest_exists = (Test-Path -LiteralPath $man) }
+            } catch { $o['direct_seal_verify'] = [ordered]@{ error = $_.Exception.Message } }
+        }
         Start-Sleep -Milliseconds 800
         Unregister-Event -SourceIdentifier $ho.Name -ErrorAction SilentlyContinue; Unregister-Event -SourceIdentifier $he.Name -ErrorAction SilentlyContinue
         $txt = [System.IO.File]::ReadAllText($of, [System.Text.Encoding]::UTF8)
