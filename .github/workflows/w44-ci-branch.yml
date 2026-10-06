@@ -1,4 +1,4 @@
-name: w44 ci-branch (product 4544eb3f, verbatim jobs)
+name: w44 ci-branch (product ce76b43f, verbatim jobs)
 
 # 브랜치 푸시 기계검증. 태그·릴리스 트리거 없음(feat/** push 전용).
 # 릴리스 게이트(release.yml)와 별개 — 이건 브랜치 개발 중 회귀를 조기에 잡는 가벼운 CI다.
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4544eb3f095987eec24bc31de63b4a4e123f36c3
+          ref: ce76b43f822f89de66e1dc9c3422bac89be2f590
 
       # ★팩 스위트 레인 대조(S31 · 2026-07-26 / **3레인 확장 W19 · 같은 날**). **이 스텝이 왜
       #   존재하는가**: 브랜치 레인(ci-branch.yml)·태그 레인(release.yml)·팩-only 레인
@@ -1440,7 +1440,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4544eb3f095987eec24bc31de63b4a4e123f36c3
+          ref: ce76b43f822f89de66e1dc9c3422bac89be2f590
           fetch-depth: 0          # ★계측기 자기검증(git show 기준커밋)의 전제 — 위 머리말 참조
 
       # 러너는 stdlib 전용이라 의존성 설치가 없다. 3.12 = windows-health 잡과 같은 마이너.
@@ -1522,7 +1522,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4544eb3f095987eec24bc31de63b4a4e123f36c3
+          ref: ce76b43f822f89de66e1dc9c3422bac89be2f590
 
       - name: Install makensis (brew)
         shell: bash
@@ -1574,7 +1574,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4544eb3f095987eec24bc31de63b4a4e123f36c3
+          ref: ce76b43f822f89de66e1dc9c3422bac89be2f590
 
       # 잡1·잡2·windows-health·release pack-artifacts 와 같은 핀(CONTRACTS E-4 ②). 러너 이미지
       # 기본 python3 로 돌면 같은 스위트를 레인마다 다른 인터프리터로 재는 셈이고, 그 차이는
@@ -1684,7 +1684,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4544eb3f095987eec24bc31de63b4a4e123f36c3
+          ref: ce76b43f822f89de66e1dc9c3422bac89be2f590
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2

@@ -1,7 +1,7 @@
 # w44 unit lane: the Windows unit specimens that the product's own Windows lanes do NOT cover for 0.14.44 (design 5-4 items 8 and 9 and
 # the pack specimens of the hook / the bridge script), run on the product commit under test. windows-latest = x64.
 # Tag: [w44-ci] in the commit message. Output: results branch diag-results/<run>-<attempt>-w44-unit-windows-latest.
-name: w44 unit (product 4544eb3f)
+name: w44 unit (product ce76b43f)
 
 on:
   push:
@@ -20,7 +20,7 @@ jobs:
       matrix:
         include:
           - label: 'v0.14.44-candidate'
-            ref: 4544eb3f095987eec24bc31de63b4a4e123f36c3
+            ref: ce76b43f822f89de66e1dc9c3422bac89be2f590
           - label: 'baseline-v0.14.43'
             ref: 55d3d2d60d7fa9d044135976c236d6abb6088081
     timeout-minutes: 120

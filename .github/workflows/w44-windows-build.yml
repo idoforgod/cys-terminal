@@ -1,4 +1,4 @@
-name: w44 windows-build (product 4544eb3f, verbatim jobs)
+name: w44 windows-build (product ce76b43f, verbatim jobs)
 
 # ★목적: Windows x64 자기완결 설치파일(cys-terminal + cysjavis 팩 + bash/python 런타임) 빌드·검증.
 #   feat/windows-x64-dist 브랜치 push 시 자동 실행 → setup.exe 를 Actions 아티팩트로 업로드.
@@ -26,13 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: 4544eb3f095987eec24bc31de63b4a4e123f36c3
+          ref: ce76b43f822f89de66e1dc9c3422bac89be2f590
 
       # ★시크릿/개인정보 발행 hard-gate (빌드·임베드 전 최우선 — fail-fast). git-추적 전 트리를
       # fail-closed로 스캔해 개인 홈경로·개인 프로필 디렉토리·개인 계정 핸들·이메일·키토큰
       # 누출을 차단한다. 비0이면 워크플로우 실패. windows 러너라 Git Bash로 실행(shell: bash).
       - name: Secret/PII scan (pre-build hard-gate)
-        continue-on-error: true   # HARNESS CHANGE (the only one in this job): the product step is red at 4544eb3f (3 hits in src/bin/cysd/approval_a_tests.rs) - the build must go on to be measured
         shell: bash
         run: bash scripts/secret-scan.sh --all
 

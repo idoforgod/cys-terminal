@@ -1,4 +1,4 @@
-name: w44 windows-health (product 4544eb3f, verbatim jobs)
+name: w44 windows-health (product ce76b43f, verbatim jobs)
 
 # ★목적(T-0147-7 W4 · 부채 V4 해소 · 검체 H-WIN-11): 부트스트랩 건강성 러너의 **Windows 검체군을
 #   실제 Windows 에서 돌린다.** 지금까지 G18–G25(백슬래시·드라이브 경로·named pipe·taskkill·CYS_PY
@@ -69,7 +69,7 @@ jobs:
       #   대조도 실측정으로 승격된다(부수 이득).
       - uses: actions/checkout@v4
         with:
-          ref: 4544eb3f095987eec24bc31de63b4a4e123f36c3
+          ref: ce76b43f822f89de66e1dc9c3422bac89be2f590
           fetch-depth: 0
 
       # 러너는 stdlib 전용(네트워크 0)이라 별도 의존성 설치가 없다. 3.12 = 동봉 embeddable
