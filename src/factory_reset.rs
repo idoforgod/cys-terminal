@@ -130,7 +130,7 @@ const TEMP_SWEEP_PREFIX: [&str; 7] = [
 /// 격리하면 **앱 자신(cys.exe·cysd.exe·runtime/·resources/)을 언인스톨**해 버린다.
 /// → `~/.cys` 와 같은 교리를 적용한다: **알려진 상태 항목만** 격리하고 나머지(=설치본)는 보존.
 /// 놓친 상태 파일이 남는 것은 불편이지만, 앱을 옮기는 것은 복구 불능급 사고다(fail-safe 방향).
-const WIN_STATE_EXACT: [&str; 23] = [
+const WIN_STATE_EXACT: [&str; 24] = [
     "transcripts.db",
     "analytics.db",
     "channels.db",
@@ -156,6 +156,9 @@ const WIN_STATE_EXACT: [&str; 23] = [
     //   `queue-blocked.json` 은 `write_json_atomic` 이 쓰고(임시 잔재 `.queue-blocked.json.tmp` 는 아래 [`WIN_STATE_ATOMIC`] 이 잡는다), `queue-blocked.prev.json` 은 한 부트에 한 번 직전 파일을 옮겨 둔 1세대 보존본이다.
     "queue-blocked.json",
     "queue-blocked.prev.json",
+    // ★(성찰 2회차 m-1 · 0.14.44 A4) 승인 묶음 식별자 — 상태 폴더의 무작위 값 파일(`approval::LANE_FILE`). 윈도우 본부의 상태 폴더는 설치 폴더와 같아 알려진 이름만 격리하므로 여기 없으면 초기화 뒤에도 남는다.
+    //   `write_json_atomic` 으로 쓰므로 임시 잔재 `.approval-lane.tmp` 는 [`WIN_STATE_ATOMIC`] 이 잡는다.
+    "approval-lane",
 ];
 
 /// 접두로 잡는 Windows 상태 항목(부서 슬러그 디렉토리·저널/스풀 디렉토리·손상 격리본).
@@ -173,7 +176,7 @@ const WIN_STATE_PREFIX: [&str; 8] = [
 /// `write_json_atomic`(governance.rs)이 **실제로 쓰는** 상태 파일 이름 전량.
 /// 임시 잔재(`.{name}.tmp`)의 판정은 이 목록·[`WIN_STATE_EXACT`] 와의 **정확 일치**로만 한다 —
 /// 접두 가족으로 넓히면 임의의 점 파일이 상태로 잡힌다(아래 X14 주석).
-const WIN_STATE_ATOMIC: [&str; 8] = [
+const WIN_STATE_ATOMIC: [&str; 9] = [
     "topology.json",
     "dept_tombstones.json",
     "queue-state.json",
@@ -183,6 +186,8 @@ const WIN_STATE_ATOMIC: [&str; 8] = [
     "alert-route-folded.jsonl",
     // ★(R2F-DM · 성찰 2회차 A3 m2) 0.14.43 C5 가 더한 `write_json_atomic` 대상 — 위 주석의 "전량" 을 다시 사실로 만든다(소스 핀: `r2f_dm_factory_reset_inventory_covers_the_new_persistent_files`).
     "queue-blocked.json",
+    // ★(성찰 2회차 m-1 · 0.14.44 A4) 승인 묶음 식별자 파일도 `write_json_atomic` 으로 쓴다.
+    "approval-lane",
 ];
 
 /// Windows 상태 항목인가 — 정확 이름 · 접두 · **원자쓰기 임시 잔재**의 세 축.
@@ -3708,16 +3713,18 @@ mod r2f_dm_factory_reset {
     }
 
     /// [목록 핀] 목록의 **길이·내용**을 박는다 — 이번 판이 더한 세 이름이 들어 있고(없으면 완전 초기화 뒤에도 남는다) 목록 안에 중복이 없다. 길이는 컴파일 시점에 고정된 배열 형(`[&str; N]`)이라
-    /// 이름을 더하고도 형을 안 고치면 컴파일이 깨지지만, 형을 고쳐 맞추면서 **내용 단언**을 잊는 일을 이 검체가 막는다(길이 11·23·8).
+    /// 이름을 더하고도 형을 안 고치면 컴파일이 깨지지만, 형을 고쳐 맞추면서 **내용 단언**을 잊는 일을 이 검체가 막는다(길이 11·24·9).
     #[test]
     fn r2f_dm_factory_reset_inventory_lists_carry_the_new_persistent_files() {
         assert_eq!(CYS_BASE_EXACT2.len(), 11, "~/.cys 직하 정확 이름 목록(2차)의 길이");
         assert!(CYS_BASE_EXACT2.contains(&".update-attempt.json"), "~/.cys/.update-attempt.json(인앱 업데이트 시도 기록)이 기본 격리 목록에 없다");
-        assert_eq!(WIN_STATE_EXACT.len(), 23, "윈도우 상태 폴더 정확 이름 목록의 길이");
-        for n in ["queue-blocked.json", "queue-blocked.prev.json"] {
+        assert_eq!(WIN_STATE_EXACT.len(), 24, "윈도우 상태 폴더 정확 이름 목록의 길이");
+        for n in ["queue-blocked.json", "queue-blocked.prev.json", "approval-lane"] {
             assert!(WIN_STATE_EXACT.contains(&n), "윈도우 상태 폴더의 {n} 이 정확 일치 목록에 없다");
         }
-        assert_eq!(WIN_STATE_ATOMIC.len(), 8, "원자 쓰기 목록의 길이");
+        assert_eq!(WIN_STATE_ATOMIC.len(), 9, "원자 쓰기 목록의 길이");
+        assert!(WIN_STATE_ATOMIC.contains(&"approval-lane"), "approval-lane 이 원자 쓰기 목록에 없다 — `.approval-lane.tmp` 잔재가 설치 파일로 분류된다");
+        assert!(is_win_state_name("approval-lane") && is_win_state_name(".approval-lane.tmp"), "승인 묶음 식별자 파일과 그 임시 잔재가 윈도우 상태로 분류돼야 한다");
         assert!(WIN_STATE_ATOMIC.contains(&"queue-blocked.json"), "queue-blocked.json 이 원자 쓰기 목록에 없다 — `.queue-blocked.json.tmp` 잔재가 설치 파일로 분류된다");
         // 목록 안 중복 0 · `~/.cys` 두 목록 사이 중복 0.
         for (label, list) in [

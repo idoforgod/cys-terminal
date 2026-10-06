@@ -1122,7 +1122,8 @@ fn load_or_create_lane_id(state_dir: &std::path::Path) -> String {
     };
     let written = (|| -> std::io::Result<()> {
         std::fs::create_dir_all(state_dir)?;
-        std::fs::write(&path, id.as_bytes())?;
+        // 임시 파일 → rename(저장소의 기존 원자 쓰기 도우미) — 쓰는 도중 끊겨도 반쪽 파일이 남지 않는다(성찰 2회차 m-1).
+        crate::governance::write_json_atomic(state_dir, LANE_FILE, &id)?;
         set_owner_only(&path);
         Ok(())
     })();

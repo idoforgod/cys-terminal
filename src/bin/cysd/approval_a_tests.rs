@@ -675,3 +675,21 @@ fn m1_no_file_io_or_waiting_inside_the_store_lock() {
         }
     }
 }
+
+#[test]
+fn a3_lane_file_is_written_atomically_and_leaves_no_temp() {
+    let _g = A_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("cys-a3-atomic-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let sock = dir.join("cysd.sock");
+    crate::approval::forget_lane_cache();
+    let v = crate::approval::lane_value(&sock, &dir);
+    let on_disk = std::fs::read_to_string(dir.join(crate::approval::LANE_FILE)).unwrap_or_default();
+    assert!(!on_disk.is_empty() && v.ends_with(on_disk.trim()), "파일 값과 예약 값이 다르다: {v} / {on_disk}");
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .map(|r| r.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    assert!(names.iter().all(|n| !n.ends_with(".tmp")), "임시 파일이 남았다: {names:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+    crate::approval::forget_lane_cache();
+}
