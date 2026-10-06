@@ -1,0 +1,653 @@
+{
+    "result":  "PASS",
+    "reasons":  [
+                    "the button flow started by clicks, a new team tab stood (waiting screen -\u003e real tab), a new cysd.exe was created after the click and no failure notification was shown"
+                ],
+    "facts":  {
+                  "team_clicked_at":  "2026-10-06T14:38:28.640Z",
+                  "app_version_seen_by_cdp":  "0.14.44",
+                  "ready_ok":  true,
+                  "toggle_click_method":  "mouse",
+                  "entry_click_ok":  true,
+                  "entry_click_method":  "mouse",
+                  "menu_seen":  false,
+                  "confirm_seen":  true,
+                  "confirm_title":  "팀 만들기 확인",
+                  "confirm_click_ok":  true,
+                  "confirm_click_method":  "mouse",
+                  "any_dom_click":  false,
+                  "flow_started":  true,
+                  "pending_seen":  true,
+                  "tab_created":  true,
+                  "tab_ms":  52980,
+                  "tab_name":  "dept-1",
+                  "tab_count_before":  1,
+                  "tab_count_after":  2,
+                  "failure_alert_count":  0,
+                  "failure_alerts":  [
+
+                                     ],
+                  "post_creation_alert_count":  0,
+                  "stage_source":  "event",
+                  "observe_end_reason":  "observation window elapsed (360 s)",
+                  "flow_error":  "",
+                  "new_cysd_count":  1,
+                  "new_cysd":  [
+                                   {
+                                       "id":  8568,
+                                       "ppid":  3404,
+                                       "created":  "2026-10-06T14:39:02.177Z",
+                                       "first_seen":  "2026-10-06T14:39:04.001Z",
+                                       "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe"
+                                   }
+                               ],
+                  "click_at_seen_by_powershell":  "2026-10-06T14:38:28.640Z",
+                  "node_exit_code":  0,
+                  "watch_end":  "the node driver ended"
+              },
+    "reference":  {
+                      "stages":  [
+                                     {
+                                         "stage":  "reserve",
+                                         "at_s":  1.6,
+                                         "dur_s":  2.3
+                                     },
+                                     {
+                                         "stage":  "probe",
+                                         "at_s":  3.9,
+                                         "dur_s":  29
+                                     },
+                                     {
+                                         "stage":  "spawn",
+                                         "at_s":  32.9,
+                                         "dur_s":  0.4
+                                     },
+                                     {
+                                         "stage":  "wait",
+                                         "at_s":  33.3,
+                                         "dur_s":  16.2
+                                     },
+                                     {
+                                         "stage":  "up",
+                                         "at_s":  49.5,
+                                         "dur_s":  1.5
+                                     },
+                                     {
+                                         "stage":  "seat",
+                                         "at_s":  51,
+                                         "dur_s":  1.3
+                                     },
+                                     {
+                                         "stage":  "done",
+                                         "at_s":  52.3,
+                                         "dur_s":  0.7
+                                     }
+                                 ],
+                      "stage_line":  "reserve at 1.6s (2.3s) \u003e probe at 3.9s (29s) \u003e spawn at 32.9s (0.4s) \u003e wait at 33.3s (16.2s) \u003e up at 49.5s (1.5s) \u003e seat at 51s (1.3s) \u003e done at 52.3s (0.7s)",
+                      "stage_source":  "event",
+                      "stage_texts":  [
+                                          {
+                                              "ms":  2122,
+                                              "text":  "지금: 팀 번호를 잡는 중"
+                                          },
+                                          {
+                                              "ms":  4293,
+                                              "text":  "지금: 이미 켜진 데몬이 있는지 확인하는 중(보통 10~30초 · 느린 컴퓨터는 더 걸립니다)"
+                                          },
+                                          {
+                                              "ms":  33715,
+                                              "text":  "지금: 데몬이 팩을 설치하는 중(파일 수백 개)"
+                                          },
+                                          {
+                                              "ms":  49936,
+                                              "text":  "지금: 데몬이 켜졌습니다 — 설정을 심는 중"
+                                          },
+                                          {
+                                              "ms":  51969,
+                                              "text":  "지금: 부서장 자리를 여는 중"
+                                          }
+                                      ],
+                      "tab_line":  "tab \"dept-1\" stood 53 s after the execute click (tabs 1 -\u003e 2)",
+                      "confirm":  {
+                                      "title":  "팀 만들기 확인",
+                                      "body_head":  "만들 팀: 새 번호 팀 — 예상 이름 dept-1 (만들 때 확정)\n자리: 최대 5개 — 부서장 1 + 팀원 최대 4(CSO·워커·검토 2). 부서장 자리가 먼저 뜨고, 팀원 자리는 필요한 프로그램(claude·agy·codex)이 설치돼 있으면 자동으로 채워집니다.\n작업 폴더: 홈 폴더(따로 지정하지 않은 경우)\n계정: 기본 계정의 팀 전용 설정 폴더를 새로 씁니다 — 처음 한 번 로그인이 필요할 수 있습니다.\n본부 대표: CEO 역할로 바뀝니다 (본부 대표가 아직 시작 전이면 나중에 명령 팔레트에서 승인합니다. 팀이 0개가 되면 되돌아갑니다.)\n\n[취소]를 누르면 아무것도 만들지 않습니다.",
+                                      "buttons":  [
+                                                      "취소",
+                                                      "만들기"
+                                                  ]
+                                  },
+                      "menu":  null,
+                      "pending_first_text":  "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 0초",
+                      "pending_last_text":  "팀을 만드는 중입니다 — 보통 30초 안팎, 컴퓨터에 따라 1분 넘게 걸릴 수 있어요 · 경과 45초",
+                      "pending_text_variants":  1,
+                      "post_creation_notices":  [
+                                                    {
+                                                        "ms_create":  52980,
+                                                        "kind":  "toast_new",
+                                                        "cls":  "toast feed",
+                                                        "name":  "팀원을 켜는 중",
+                                                        "detail":  "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 미만"
+                                                    },
+                                                    {
+                                                        "ms_create":  61871,
+                                                        "kind":  "toast_new",
+                                                        "cls":  "toast feed",
+                                                        "name":  "ℹ 알림",
+                                                        "detail":  "부서 팀 편성 대기(CLI 미설치)"
+                                                    },
+                                                    {
+                                                        "ms_create":  115482,
+                                                        "kind":  "toast_text",
+                                                        "cls":  "toast feed",
+                                                        "name":  "팀원을 켜는 중",
+                                                        "detail":  "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분"
+                                                    },
+                                                    {
+                                                        "ms_create":  175156,
+                                                        "kind":  "toast_text",
+                                                        "cls":  "toast feed",
+                                                        "name":  "팀원을 켜는 중",
+                                                        "detail":  "설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 2분"
+                                                    },
+                                                    {
+                                                        "ms_create":  234838,
+                                                        "kind":  "toast_new",
+                                                        "cls":  "toast feed",
+                                                        "name":  "팀원 켜기 — 자리가 더 붙지 않습니다",
+                                                        "detail":  "3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 1개 · 경과 3분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요"
+                                                    },
+                                                    {
+                                                        "ms_create":  298619,
+                                                        "kind":  "toast_new",
+                                                        "cls":  "toast idle",
+                                                        "name":  "💤 노드 유휴",
+                                                        "detail":  "surface:3 — 304s 무출력"
+                                                    },
+                                                    {
+                                                        "ms_create":  355340,
+                                                        "kind":  "toast_new",
+                                                        "cls":  "toast idle",
+                                                        "name":  "💤 노드 유휴",
+                                                        "detail":  "surface:1 — 302s 무출력"
+                                                    }
+                                                ],
+                      "formation_line":  "53s [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 미만 | 61.9s [toast feed] ℹ 알림 :: 부서 팀 편성 대기(CLI 미설치) | 115.5s [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 1분 | 175.2s [toast feed] 팀원을 켜는 중 :: 설치된 프로그램(claude·agy·codex)의 자리가 차례로 붙습니다(최대 5자리 · 보통 5분 안팎) · 붙은 자리 1 · 경과 2분 | 234.8s [toast feed] 팀원 켜기 — 자리가 더 붙지 않습니다 :: 3분 동안 자리가 더 붙지 않았습니다 — 붙은 자리 1개 · 경과 3분. 설치하지 않은 프로그램(claude·agy·codex)의 자리는 생기지 않습니다. 더 붙어야 한다면 Control Center 에서 자리 상태를 확인하세요 | 298.6s [toast idle] 💤 노드 유휴 :: surface:3 — 304s 무출력 | 355.3s [toast idle] 💤 노드 유휴 :: surface:1 — 302s 무출력",
+                      "seats":  {
+                                    "ok":  true,
+                                    "count":  1,
+                                    "roles":  [
+                                                  "master"
+                                              ],
+                                    "surfaces":  [
+                                                     {
+                                                         "ack_nonce_ok":  false,
+                                                         "ack_source":  null,
+                                                         "agent":  null,
+                                                         "agent_alive":  null,
+                                                         "alt_screen":  false,
+                                                         "awakened_at":  null,
+                                                         "boot_nonce_generation":  null,
+                                                         "claude_config_dir":  "C:/Users/runneradmin/.cys/claude-default-dept-1",
+                                                         "cmd":  "powershell.exe",
+                                                         "created_at":  1791297559.995877,
+                                                         "created_by":  null,
+                                                         "cwd":  "C:/Users/runneradmin",
+                                                         "cwd_blocked":  null,
+                                                         "directive_verified":  null,
+                                                         "env_injected":  false,
+                                                         "exited":  false,
+                                                         "gate_pending":  null,
+                                                         "input_paste_open":  false,
+                                                         "line_count":  89,
+                                                         "live_cwd":  "C:\\Users\\runneradmin\\",
+                                                         "pending_input_bytes":  0,
+                                                         "pending_input_human_bytes":  0,
+                                                         "pid":  6556,
+                                                         "role":  "master",
+                                                         "seat":  "empty",
+                                                         "surface_id":  1,
+                                                         "surface_ref":  "surface:1",
+                                                         "title":  "surface 1",
+                                                         "usage":  null
+                                                     }
+                                                 ],
+                                    "raw":  {
+                                                "surfaces":  [
+                                                                 {
+                                                                     "ack_nonce_ok":  false,
+                                                                     "ack_source":  null,
+                                                                     "agent":  null,
+                                                                     "agent_alive":  null,
+                                                                     "alt_screen":  false,
+                                                                     "awakened_at":  null,
+                                                                     "boot_nonce_generation":  null,
+                                                                     "claude_config_dir":  "C:/Users/runneradmin/.cys/claude-default-dept-1",
+                                                                     "cmd":  "powershell.exe",
+                                                                     "created_at":  1791297559.995877,
+                                                                     "created_by":  null,
+                                                                     "cwd":  "C:/Users/runneradmin",
+                                                                     "cwd_blocked":  null,
+                                                                     "directive_verified":  null,
+                                                                     "env_injected":  false,
+                                                                     "exited":  false,
+                                                                     "gate_pending":  null,
+                                                                     "input_paste_open":  false,
+                                                                     "line_count":  89,
+                                                                     "live_cwd":  "C:\\Users\\runneradmin\\",
+                                                                     "pending_input_bytes":  0,
+                                                                     "pending_input_human_bytes":  0,
+                                                                     "pid":  6556,
+                                                                     "role":  "master",
+                                                                     "seat":  "empty",
+                                                                     "surface_id":  1,
+                                                                     "surface_ref":  "surface:1",
+                                                                     "title":  "surface 1",
+                                                                     "usage":  null
+                                                                 }
+                                                             ]
+                                            }
+                                },
+                      "seats_line":  "count=1 roles=[master]",
+                      "event_counts":  {
+                                           "dept-create-progress":  7,
+                                           "daemon-event:schedule.command_done":  11,
+                                           "daemon-event:schedule.fired":  12,
+                                           "daemon-event:feed.item.created":  2,
+                                           "daemon-event:pane.idle":  2,
+                                           "daemon-event:feed.item.aging":  1
+                                       },
+                      "alarm_count":  7,
+                      "alarm_id_count":  2,
+                      "alarm_ids":  [
+                                        {
+                                            "id":  "dept-formation:\\\\.\\pipe\\cys-dept-dept-1",
+                                            "category":  "feed",
+                                            "title":  "팀원 켜기 — 자리가 더 붙지 않습니다"
+                                        },
+                                        {
+                                            "id":  "claude-missing",
+                                            "category":  "health",
+                                            "title":  "Claude Code CLI가 없습니다"
+                                        }
+                                    ],
+                      "final_daemon_info":  "daemon pid=1368 sock=\\\\.\\pipe\\cys",
+                      "final_root":  {
+                                         "kind":  "panes",
+                                         "msg":  "",
+                                         "stage":  "",
+                                         "idle_btn":  "",
+                                         "pane_count":  1,
+                                         "role_slots":  0,
+                                         "pane_titles":  [
+                                                             "C:\\Users\\runneradmin\\"
+                                                         ]
+                                     }
+                  },
+    "ps_reference":  {
+                         "bash_summary":  "bundled (install dir runtime) x25, unknown (no path) x4",
+                         "bash_rows":  [
+                                           {
+                                               "id":  2816,
+                                               "ppid":  8564,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:38:28.726Z",
+                                               "first_seen":  "2026-10-06T14:38:28.825Z",
+                                               "last_seen":  "2026-10-06T14:39:20.569Z"
+                                           },
+                                           {
+                                               "id":  3980,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:38:30.842Z",
+                                               "first_seen":  "2026-10-06T14:38:30.907Z",
+                                               "last_seen":  "2026-10-06T14:38:30.907Z"
+                                           },
+                                           {
+                                               "id":  5596,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:38:32.918Z",
+                                               "first_seen":  "2026-10-06T14:38:32.970Z",
+                                               "last_seen":  "2026-10-06T14:38:32.970Z"
+                                           },
+                                           {
+                                               "id":  2160,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:38:39.060Z",
+                                               "first_seen":  "2026-10-06T14:38:39.159Z",
+                                               "last_seen":  "2026-10-06T14:38:39.159Z"
+                                           },
+                                           {
+                                               "id":  11032,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:38:43.197Z",
+                                               "first_seen":  "2026-10-06T14:38:43.305Z",
+                                               "last_seen":  "2026-10-06T14:38:43.305Z"
+                                           },
+                                           {
+                                               "id":  3660,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:38:47.376Z",
+                                               "first_seen":  "2026-10-06T14:38:47.448Z",
+                                               "last_seen":  "2026-10-06T14:38:47.448Z"
+                                           },
+                                           {
+                                               "id":  10512,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:38:49.433Z",
+                                               "first_seen":  "2026-10-06T14:38:49.514Z",
+                                               "last_seen":  "2026-10-06T14:38:49.514Z"
+                                           },
+                                           {
+                                               "id":  2184,
+                                               "ppid":  1368,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                                               "created":  "2026-10-06T14:38:50.828Z",
+                                               "first_seen":  "2026-10-06T14:38:51.589Z",
+                                               "last_seen":  "2026-10-06T14:38:57.802Z"
+                                           },
+                                           {
+                                               "id":  5752,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:38:53.578Z",
+                                               "first_seen":  "2026-10-06T14:38:53.665Z",
+                                               "last_seen":  "2026-10-06T14:38:53.666Z"
+                                           },
+                                           {
+                                               "id":  9756,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:38:57.754Z",
+                                               "first_seen":  "2026-10-06T14:38:57.802Z",
+                                               "last_seen":  "2026-10-06T14:38:57.802Z"
+                                           },
+                                           {
+                                               "id":  4756,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:39:01.875Z",
+                                               "first_seen":  "2026-10-06T14:39:01.927Z",
+                                               "last_seen":  "2026-10-06T14:39:01.927Z"
+                                           },
+                                           {
+                                               "id":  1120,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:39:02.264Z",
+                                               "first_seen":  "2026-10-06T14:39:04.001Z",
+                                               "last_seen":  "2026-10-06T14:39:16.406Z"
+                                           },
+                                           {
+                                               "id":  7312,
+                                               "ppid":  2816,
+                                               "kind":  "unknown (no path)",
+                                               "path":  "",
+                                               "cmd":  "",
+                                               "created":  "2026-10-06T14:39:18.380Z",
+                                               "first_seen":  "2026-10-06T14:39:18.499Z",
+                                               "last_seen":  "2026-10-06T14:39:18.499Z"
+                                           },
+                                           {
+                                               "id":  2652,
+                                               "ppid":  2816,
+                                               "kind":  "unknown (no path)",
+                                               "path":  "",
+                                               "cmd":  "",
+                                               "created":  "2026-10-06T14:39:20.153Z",
+                                               "first_seen":  "2026-10-06T14:39:20.570Z",
+                                               "last_seen":  "2026-10-06T14:39:20.570Z"
+                                           },
+                                           {
+                                               "id":  3772,
+                                               "ppid":  2816,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:39:20.908Z",
+                                               "first_seen":  "2026-10-06T14:39:22.646Z",
+                                               "last_seen":  "2026-10-06T14:39:28.882Z"
+                                           },
+                                           {
+                                               "id":  6524,
+                                               "ppid":  3772,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"bash\" C:\\Users\\runneradmin\\.cys/pack\\bin\\cys-dept allocate",
+                                               "created":  "2026-10-06T14:39:20.936Z",
+                                               "first_seen":  "2026-10-06T14:39:22.646Z",
+                                               "last_seen":  "2026-10-06T14:39:28.882Z"
+                                           },
+                                           {
+                                               "id":  3936,
+                                               "ppid":  1192,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE",
+                                               "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE -lc \"command -v -- claude\"",
+                                               "created":  "2026-10-06T14:39:21.176Z",
+                                               "first_seen":  "2026-10-06T14:39:22.647Z",
+                                               "last_seen":  "2026-10-06T14:39:26.808Z"
+                                           },
+                                           {
+                                               "id":  6420,
+                                               "ppid":  3936,
+                                               "kind":  "unknown (no path)",
+                                               "path":  "",
+                                               "cmd":  "",
+                                               "created":  "2026-10-06T14:39:22.207Z",
+                                               "first_seen":  "2026-10-06T14:39:22.648Z",
+                                               "last_seen":  "2026-10-06T14:39:24.740Z"
+                                           },
+                                           {
+                                               "id":  888,
+                                               "ppid":  3936,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE",
+                                               "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE -lc \"command -v -- claude\"",
+                                               "created":  "2026-10-06T14:39:26.727Z",
+                                               "first_seen":  "2026-10-06T14:39:26.809Z",
+                                               "last_seen":  "2026-10-06T14:39:26.809Z"
+                                           },
+                                           {
+                                               "id":  6956,
+                                               "ppid":  1192,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE",
+                                               "cmd":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.EXE -lc \"command -v -- codex\"",
+                                               "created":  "2026-10-06T14:39:28.408Z",
+                                               "first_seen":  "2026-10-06T14:39:28.883Z",
+                                               "last_seen":  "2026-10-06T14:39:28.883Z"
+                                           },
+                                           {
+                                               "id":  8076,
+                                               "ppid":  6956,
+                                               "kind":  "unknown (no path)",
+                                               "path":  "",
+                                               "cmd":  "",
+                                               "created":  "2026-10-06T14:39:28.821Z",
+                                               "first_seen":  "2026-10-06T14:39:28.883Z",
+                                               "last_seen":  "2026-10-06T14:39:28.883Z"
+                                           },
+                                           {
+                                               "id":  7028,
+                                               "ppid":  1368,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                                               "created":  "2026-10-06T14:39:50.863Z",
+                                               "first_seen":  "2026-10-06T14:39:51.630Z",
+                                               "last_seen":  "2026-10-06T14:39:51.630Z"
+                                           },
+                                           {
+                                               "id":  6024,
+                                               "ppid":  8568,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                                               "created":  "2026-10-06T14:40:48.169Z",
+                                               "first_seen":  "2026-10-06T14:40:49.397Z",
+                                               "last_seen":  "2026-10-06T14:40:49.398Z"
+                                           },
+                                           {
+                                               "id":  6284,
+                                               "ppid":  1368,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                                               "created":  "2026-10-06T14:40:50.890Z",
+                                               "first_seen":  "2026-10-06T14:40:51.475Z",
+                                               "last_seen":  "2026-10-06T14:40:51.475Z"
+                                           },
+                                           {
+                                               "id":  1472,
+                                               "ppid":  8568,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                                               "created":  "2026-10-06T14:41:48.201Z",
+                                               "first_seen":  "2026-10-06T14:41:49.222Z",
+                                               "last_seen":  "2026-10-06T14:41:49.222Z"
+                                           },
+                                           {
+                                               "id":  11104,
+                                               "ppid":  1368,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                                               "created":  "2026-10-06T14:41:50.923Z",
+                                               "first_seen":  "2026-10-06T14:41:51.286Z",
+                                               "last_seen":  "2026-10-06T14:41:51.286Z"
+                                           },
+                                           {
+                                               "id":  5488,
+                                               "ppid":  8568,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                                               "created":  "2026-10-06T14:42:48.222Z",
+                                               "first_seen":  "2026-10-06T14:42:49.001Z",
+                                               "last_seen":  "2026-10-06T14:42:49.001Z"
+                                           },
+                                           {
+                                               "id":  9368,
+                                               "ppid":  1368,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                                               "created":  "2026-10-06T14:42:50.952Z",
+                                               "first_seen":  "2026-10-06T14:42:51.075Z",
+                                               "last_seen":  "2026-10-06T14:42:51.075Z"
+                                           },
+                                           {
+                                               "id":  9148,
+                                               "ppid":  8568,
+                                               "kind":  "bundled (install dir runtime)",
+                                               "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe",
+                                               "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\usr\\bin\\bash.exe\" -c \"CYS_PROJECT_ROOT=\\\"${CYS_PROJECT_ROOT:-$HOME}\\\" python3 \\\"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\\\" tick\"",
+                                               "created":  "2026-10-06T14:43:48.263Z",
+                                               "first_seen":  "2026-10-06T14:43:48.779Z",
+                                               "last_seen":  "2026-10-06T14:43:48.780Z"
+                                           }
+                                       ],
+                         "bash_static":  {
+                                             "install_dir":  "C:\\Users\\runneradmin\\AppData\\Local\\cys",
+                                             "bundled":  [
+                                                             {
+                                                                 "rel":  "runtime\\git\\bin\\bash.exe",
+                                                                 "exists":  true,
+                                                                 "size":  47464
+                                                             },
+                                                             {
+                                                                 "rel":  "runtime\\git\\usr\\bin\\bash.exe",
+                                                                 "exists":  true,
+                                                                 "size":  2456832
+                                                             },
+                                                             {
+                                                                 "rel":  "runtime\\git\\cmd\\git.exe",
+                                                                 "exists":  true,
+                                                                 "size":  46936
+                                                             },
+                                                             {
+                                                                 "rel":  "runtime\\python\\python.exe",
+                                                                 "exists":  true,
+                                                                 "size":  104952
+                                                             },
+                                                             {
+                                                                 "rel":  "runtime\\python\\python3.exe",
+                                                                 "exists":  true,
+                                                                 "size":  104952
+                                                             },
+                                                             {
+                                                                 "rel":  "runtime\\node\\node.exe",
+                                                                 "exists":  true,
+                                                                 "size":  85193344
+                                                             }
+                                                         ],
+                                             "runner_path_hits":  [
+                                                                      "C:\\Program Files\\Git\\bin\\bash.exe",
+                                                                      "C:\\Windows\\system32\\bash.exe",
+                                                                      "C:\\Program Files\\Git\\usr\\bin\\bash.exe"
+                                                                  ],
+                                             "where_bash":  {
+                                                                "rc":  0,
+                                                                "out":  "C:\\Program Files\\Git\\bin\\bash.exe\r\nC:\\Windows\\System32\\bash.exe\r\nC:\\Program Files\\Git\\usr\\bin\\bash.exe\r\n"
+                                                            },
+                                             "path_entries":  [
+                                                                  "C:\\Program Files (x86)\\GitHub CLI",
+                                                                  "C:\\Program Files\\Git\\bin",
+                                                                  "C:\\Windows\\system32",
+                                                                  "C:\\Program Files\\Git\\cmd",
+                                                                  "C:\\Program Files\\Git\\clangarm64\\bin",
+                                                                  "C:\\Program Files\\Git\\usr\\bin",
+                                                                  "C:\\Program Files\\GitHub CLI\\"
+                                                              ]
+                                         },
+                         "new_pipes":  [
+                                           "cys-dept-dept-1"
+                                       ],
+                         "pipes_first_seen":  {
+                                                  "cys":  "2026-10-06T14:38:20.572Z",
+                                                  "cys-dept-dept-1":  "2026-10-06T14:39:04.003Z"
+                                              },
+                         "proc_rows_seen":  61,
+                         "dept_dirs_after":  [
+                                                 {
+                                                     "name":  "cys-dept-dept-1",
+                                                     "files":  "analytics.db:4096B,analytics.db-shm:32768B,analytics.db-wal:177192B,approval-lane:32B,boot-epoch:18B,channels.db:4096B,channels.db-shm:32768B,channels.db-wal:152472B,cysd.log:38B,event.seq:3B,formation.log:240B,operator.token:64B,phoenix-restore.log:1704B,queue-blocked.json:108B,schedule_state.json:337B,topology.json:457B,transcripts.db:4096B,transcripts.db-shm:32768B,transcripts.db-wal:65952B"
+                                                 }
+                                             ],
+                         "daemon_log_tails":  {
+                                                  "cys-dept-dept-1\\cysd.log":  "[cysd] v0.14.44 cys-fix-w2-gen-0.14.4\n[cysd] lane: socket=\\\\.\\pipe\\cys-dept-dept-1 pack=C:/Users/runneradmin/.cys/pack-dept-dept-1 (dept=true)\n[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 1건 (내 수정본 .user 보존 0건 · vendor 신버전 .new 병치 1건)\n  검토·병합: `cys pack-merge` · 직전 상태 파일 복원: `cys pack-rollback`\n[pack] 격리 config 각성 훅 병합: C:/Users/runneradmin/.cys/claude-default-dept-1\\settings.json (SessionStart←session-start.sh, UserPromptSubmit←role-bootstrap.sh)\n[cysd] CYSJavis Pack: 469 file(s) installed at C:/Users/runneradmin/.cys/pack-dept-dept-1\n[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료\n[cysd] office-bridge skipped (dept daemon)\ncysd (CYSJavis terminal daemon) listening on \\\\.\\pipe\\cys-dept-dept-1\n[cysd] auto-restore triggered (phoenix restore --auto · 임베드 추출 우선)\n[cysd] auto-restore finished (exit=0)\n[cysd] schedule: 첫 가동 — 주기 잡 6개의 기준 시각을 now 로 초기화(동시 만기 방지)\n",
+                                                  "cys-dept-dept-1\\formation.log":  "{\"ok\": false, \"state\": \"pending-cli:cso,master,reviewer-codex,reviewer-gemini,worker\", \"kind\": \"pending-cli\", \"detail\": \"CLI 미설치 — 빈 셸 유지·편성 대기(설치 시 자동 완결)\", \"socket\": \"\\\\\\\\.\\\\pipe\\\\cys-dept-dept-1\"}\r\n",
+                                                  "cys-dept-dept-1\\phoenix-restore.log":  "\n===== phoenix auto-restore @ epoch=1791297558 (pid cysd=8568) =====\n[phoenix] cys 채택(PHOENIX_CYS): C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe — 3중 identity match(build_id=1b09395e9251 proto=1)\r\n[phoenix] ★A-S1: legacy topology(schema_version 부재) — 조건부 replace 생략, add-merge 유지·부활 정상 진행.\r\n[phoenix] 부활 대상 죽은 역할 0 — restore 무작업(멱등).\r\n[phoenix] 티켓=default · 대상역할=[] · 이번 진행=[] (완료 skip=[])\r\n[phoenix] ★restore lease(공유 축) 조기 해제 — 스폰 구간 종료 · spawn 완료 · 이후는 관측/재주입/재검증. 이후 구간은 restore.run.lock 으로만 배타한다\r\n{\r\n  \"phoenix_restore\": \"NOOP\",\r\n  \"completeness\": \"NOOP\",\r\n  \"incomplete_roles\": [],\r\n  \"manual_seats\": [],\r\n  \"fresh_fallback_roles\": [],\r\n  \"fresh_roles\": [],\r\n  \"fresh_reasons\": {},\r\n  \"fresh_expected_roles\": [],\r\n  \"fresh_unverified_roles\": [],\r\n  \"fresh_fork_suspect_roles\": [],\r\n  \"ready_roles\": [],\r\n  \"ticket\": \"default\",\r\n  \"boot_epoch\": \"sa:1791297558.064476\",\r\n  \"epoch_gate\": true,\r\n  \"backend\": \"production(cys restore)\",\r\n  \"target_roles\": [],\r\n  \"per_role_outcome\": {},\r\n  \"c6_stale_surfaces\": [],\r\n  \"c6_reaped\": [],\r\n  \"c6_reap_failed\": [],\r\n  \"cys_identity\": \"verified\",\r\n  \"journal\": \"C:\\\\Users\\\\runneradmin\\\\AppData\\\\Local\\\\cys\\\\cys-dept-dept-1\\\\phoenix\\\\journal-default.json\",\r\n  \"honesty_note\": \"★M9: phoenix_restore 값만 신뢰하라. UNVERIFIED/FAILED 는 정상 완료가 아니다 (자기채점 금지·무출력을 정상으로 해석 금지). 세션 대조가 일치할 때만 VERIFIED. ★완결성: COMPLETE 는 roster 전원이 실 ready_marker 로 응답 가능함을 뜻한다.\"\r\n}\r\n"
+                                              }
+                     }
+}
