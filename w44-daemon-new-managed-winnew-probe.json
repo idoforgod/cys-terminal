@@ -1,0 +1,76 @@
+{
+    "tag":  "mwnprobe",
+    "env":  {
+                "HUD_WIN_NEW":  "1",
+                "CYS_OFFICE_BRIDGE_MODE":  "managed"
+            },
+    "with_seat":  false,
+    "daemon":  {
+                   "pid":  4688,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  6.8
+               },
+    "bridge_found":  true,
+    "bridge":  {
+                   "pid":  4864,
+                   "ppid":  4688,
+                   "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_hud_bridge.py",
+                   "started_after_s":  2.2,
+                   "parent_is_daemon":  true
+               },
+    "health":  {
+                   "url":  "http://127.0.0.1:8642/health",
+                   "status":  200,
+                   "body":  "{\"ok\": true, \"pid\": 4864, \"boot_id\": \"e948ac0739b3d299\", \"pack_version\": \"0.14.44\", \"assets\": {\"office3d_html\": true, \"office_boot_js\": true, \"three_module_js\": true}, \"timeouts\": 0}",
+                   "error":  null,
+                   "ms":  508
+               },
+    "world":  {
+                  "url":  "http://127.0.0.1:8642/world",
+                  "status":  200,
+                  "body":  "{\"v\": 2, \"ts\": 1791268765.7434938, \"seq\": 1, \"daemon\": {\"version\": \"0.14.44\", \"paused\": false}, \"departments\": [{\"id\": \"ë³¸ë¶€ Â· CEO\", \"floor\": 1, \"nodes\": []}], \"todo\": {}, \"lobby\": {\"unassigned\": [",
+                  "error":  null,
+                  "ms":  2
+              },
+    "bridge_alive_after_hold":  true,
+    "bridge_same_pid_after_hold":  true,
+    "bridge_count_after_hold":  1,
+    "bridge_children":  [
+                            "conhost.exe#3984 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                            "cys.exe#3552 C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe events --reconnect --cursor-file C:\\Users\\runneradmin\\AppData\\Local\\cys\\c...",
+                            "conhost.exe#8208 \\??\\C:\\Windows\\system32\\conhost.exe 0x4"
+                        ],
+    "daemon_children":  [
+                            "python3.exe#4864 \"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\b...",
+                            "conhost.exe#3984 \\??\\C:\\Windows\\system32\\conhost.exe 0x4",
+                            "cys.exe#3552 C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe events --reconnect --cursor-file C:\\Users\\runneradmin...",
+                            "conhost.exe#8208 \\??\\C:\\Windows\\system32\\conhost.exe 0x4"
+                        ],
+    "bridge_kill_probe":  {
+                              "killed_pid":  4864,
+                              "new_bridge_pid":  8572,
+                              "new_bridge_after_s":  7.3,
+                              "log_lines":  [
+                                                "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                                                "[cysd] office-bridge exited — 곧 다시 확인",
+                                                "[cysd] office-bridge spawned (127.0.0.1:8642)"
+                                            ]
+                          },
+    "bridge_pid_at_kill":  8572,
+    "after_daemon_kill":  {
+                              "bridge_gone_after_s":  0.27,
+                              "children_gone_after_s":  0.27,
+                              "bridge_alive_at_end":  false,
+                              "children_alive_at_end":  0,
+                              "children_before":  5,
+                              "watched_s":  0.3
+                          },
+    "bridges_left_at_end":  0,
+    "port_8642_answers_at_end":  false,
+    "log_bridge_lines":  [
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 곧 다시 확인",
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)"
+                         ]
+}
