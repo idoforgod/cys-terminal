@@ -1,0 +1,26 @@
+{
+    "tag":  "base-0.14.43",
+    "time":  "2026-10-06T11:21:02.540Z",
+    "version":  "cys 0.14.43",
+    "seconds":  12.2,
+    "finished":  true,
+    "timed_out":  false,
+    "rc":  0,
+    "stdout_bytes":  1265,
+    "stdout_lines":  19,
+    "last_lines":  [
+                       "  [OK  ] channels-db      채널 DB 없음(온디맨드 생성)",
+                       "  [OK  ] legacy-config    레거시 env 미사용(canonical CYS_*)",
+                       "  [SKIP] app-seal         macOS 아님 — 코드서명 봉인 검사 미해당",
+                       "  [OK  ] runtime-seal     동봉 런타임 봉인 무결 — C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime",
+                       "요약: 12 OK · 0 WARN · 0 FAIL · 4 SKIP(판정 불가)",
+                       "  [OK  ] install-manifest 설치 매니페스트 470개 항목·정상 파싱"
+                   ],
+    "snapshots":  [
+
+                  ],
+    "env_notes":  [
+
+                  ],
+    "error":  null
+}
