@@ -1,0 +1,8 @@
+w44 summary on windows-11-arm (2026-10-06T08:09:53.188Z)
+step S0-inputs: 9.8s 
+step S1-install: 58.4s 
+step S1b-old-0.14.43: 15.2s 
+step TA-approval: 237.7s 
+step TB-bridge: 64s 
+step TC-daemon: 733.1s 
+step TD-hook: 7.9s 
