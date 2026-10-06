@@ -2024,6 +2024,7 @@ try {
     Invoke-Step 'team-report' { Add-TeamSummary; Add-TeamToVerdict }
     # 0.14.44 scene (after everything else is on disk; starts the app cold when the TEAM cleanup ended it)
     Invoke-Step 'w44' { if (Get-Command -Name 'Invoke-W44Scene' -CommandType Function -ErrorAction SilentlyContinue) { $RUN['w44'] = Invoke-W44Scene 'w44-fresh' $true; Save-Run } else { $RUN['w44'] = [ordered]@{ skipped = ('Invoke-W44Scene is not defined ' + $K_W44_LOAD_ERROR) }; Save-Run } }
+    Invoke-Step 'w44b' { if (Get-Command -Name 'Invoke-W44Scene2' -CommandType Function -ErrorAction SilentlyContinue) { $RUN['w44b'] = Invoke-W44Scene2 'w44b-fresh'; Save-Run } }
     $RUN['finished'] = (Get-IsoNow)
     Save-Run
     Complete-DiagScript 'app-e2e'

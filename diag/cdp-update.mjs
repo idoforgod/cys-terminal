@@ -2847,6 +2847,10 @@ async function main() {
     await runW44Mode();
     return;
   }
+  if (MODE === 'w44office') {
+    await runW44OfficeMode();
+    return;
+  }
 
   // screenshot before
   try {
@@ -3200,6 +3204,43 @@ async function runW44Mode() {
   W.finished = iso();
   U.stage = 'done';
   save();
+}
+
+
+// w44office: open Control Center > Live then > office again and watch the office tab: hint text, repair button, frame src/size, until the
+// screen is "loaded" (hint hidden + frame src) or the wait ends; then --w44-settle-sec more and a screenshot (--w44-shot <name>).
+async function runW44OfficeMode() {
+  armWatchdog(8 * 60 * 1000);
+  const U = (R.ui = { mode: MODE, stage: 'start', shots: [] });
+  const W = (R.w44office = { started: iso(), samples: [], loaded: false, loaded_after_ms: null, final: null, shot: null });
+  const shotName = args['w44-shot'] === undefined || args['w44-shot'] === true ? 'w44office' : String(args['w44-shot']);
+  const settleMs = Math.max(0, Number(args['w44-settle-sec'] || 15)) * 1000;
+  try {
+    const tr = Date.now();
+    while (Date.now() - tr < 60000 && !closed) {
+      try { if ((await evalJs("(!!document.getElementById('btn-cc')) ? 'yes' : 'no'", { awaitPromise: false, timeoutMs: 8000 })) === 'yes') break; } catch (e) { /* loading */ }
+      await sleep(1500);
+    }
+    await evalJs(w44Expr(pageW44Click, '#btn-cc'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+    await sleep(1500);
+    await evalJs(w44Expr(pageW44Click, '.cc-tab[data-view="live"]'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+    await sleep(1500);
+    await evalJs(w44Expr(pageW44Click, '.cc-tab[data-view="office"]'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+    const t0 = Date.now();
+    while (Date.now() - t0 < W44_OFFICE_WAIT_MS && !closed) {
+      let o = null;
+      try { o = await evalJs(w44Expr(pageW44Office), { awaitPromise: false, timeoutMs: 8000 }); } catch (e) { o = { error: String(e && e.message ? e.message : e) }; }
+      o.t_ms = Date.now() - t0;
+      if (W.samples.length < 60) W.samples.push(o);
+      if (o && o.frame_src && o.hint_hidden === true) { W.loaded = true; W.loaded_after_ms = o.t_ms; break; }
+      await sleep(2000);
+    }
+    await sleep(settleMs);
+    try { W.final = await evalJs(w44Expr(pageW44Office), { awaitPromise: false, timeoutMs: 8000 }); } catch (e) { W.final = { error: String(e) }; }
+    W.shot = await uiShot(shotName);
+    try { const l = await listTargets(); W.targets = l.map((t) => ({ type: t.type, title: t.title, url: String(t.url).slice(0, 120) })); } catch (e) { W.targets = String(e); }
+  } catch (e) { fail('w44office', e); }
+  W.finished = iso(); U.stage = 'done'; save();
 }
 
 process.on('uncaughtException', (e) => {

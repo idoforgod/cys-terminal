@@ -1747,6 +1747,7 @@ function Invoke-UpgSecondStart {
             if ((-not $ss['app_version']) -and $ob['app_version']) { $ss['app_version'] = $ob['app_version'] }
             # 0.14.44 scene on this live (second-started) app: usage button, Feed, office tab, bridge, doctor line
             try { if (Get-Command -Name 'Invoke-W44Scene' -CommandType Function -ErrorAction SilentlyContinue) { $ss['w44'] = Invoke-W44Scene 'w44-upg' $false } } catch { Add-DiagError 'second start w44 scene' $_ }
+            try { if (Get-Command -Name 'Invoke-W44Scene2' -CommandType Function -ErrorAction SilentlyContinue) { $ss['w44b'] = Invoke-W44Scene2 'w44b-upg' } } catch { Add-DiagError 'second start w44 scene2' $_ }
         } else {
             $ss['notes'].Add(('the app did not come up at the second start (no answer on the debugging port): {0}' -f [string]$st['error']))
             try { $null = Save-Screenshot ($pfx + '-screen-nocdp.png') } catch { }
