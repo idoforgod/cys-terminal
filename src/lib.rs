@@ -2462,6 +2462,139 @@ pub fn approval_tokenize(command: &str) -> Option<Vec<String>> {
     Some(tokens)
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// ★(0.14.44 · B3) 오피스 브리지 건강 확인 도우미 — 데몬의 감독 루프와 앱 백엔드(`office_health`)가 **같은 탐침**을 쓴다.
+//
+// 탐침의 정의(R2 에서 잰 꼴 그대로): 접속 → **0.3초 기다림** → `GET <path>` 전송 → 전송 뒤 **5초** 안에 응답 머리와 본문 `min(Content-Length, 64KB)` 바이트 수신.
+// 접속 직후에 보내는 요청은 '닫히는 중' 표식 상태(접속 대기 소켓에 표시가 붙어 큰 응답이 끊기는 상태)를 가려내지 못하므로 기다림을 빼지 않는다[실측 R1·R2].
+// 64KB 를 넘는 본문은 읽지 않고 성공으로 친다(`/world` 폴백은 좌석·부서가 많으면 64KB 를 넘는다 — '전체 수신'을 요구하면 멀쩡한 브리지를 되풀이해 끝낸다 · 독립 검증 X6).
+// 모든 대기에 시간 상한이 있다 · 데몬의 잠금을 쥐지 않는다(순수 소켓 입출력) · 패닉 경로 없음.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+/// 오피스 브리지 기본 포트(`HUD_PORT` 로 바꿀 수 있다).
+pub const OFFICE_BRIDGE_PORT: u16 = 8642;
+pub const BRIDGE_PROBE_CONNECT_MS: u64 = 1500;
+/// 접속한 뒤 요청을 보내기 전의 기다림.
+pub const BRIDGE_PROBE_WAIT_MS: u64 = 300;
+/// 요청을 보낸 뒤 응답을 기다리는 상한.
+pub const BRIDGE_PROBE_BUDGET_MS: u64 = 5000;
+/// 이 이상의 본문은 읽지 않고 성공으로 친다.
+pub const BRIDGE_PROBE_BODY_CAP: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BridgeProbeReply {
+    pub status: u16,
+    pub body: Vec<u8>,
+    /// 본문을 min(Content-Length, 64KB) 만큼 다 받았는가.
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BridgeProbeError {
+    /// 접속 자체가 안 된다(브리지가 없다).
+    NoConnect,
+    /// 접속은 됐으나 시간 안에 응답을 못 받았다(표식 상태 등).
+    NoResponse,
+    /// 응답 머리를 읽을 수 없다.
+    BadReply,
+}
+
+/// HTTP 응답 머리 해석(순수) — (상태 번호, Content-Length, 머리 끝 위치). 머리가 아직 다 오지 않았으면 `None`.
+pub fn bridge_parse_head(buf: &[u8]) -> Option<(u16, Option<usize>, usize)> {
+    let end = buf.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(buf.get(..end)?).ok()?;
+    let mut lines = head.split("\r\n");
+    let status_line = lines.next()?;
+    let mut parts = status_line.split_whitespace();
+    let proto = parts.next()?;
+    if !proto.starts_with("HTTP/") {
+        return None;
+    }
+    let status: u16 = parts.next()?.parse().ok()?;
+    let mut cl: Option<usize> = None;
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                cl = v.trim().parse().ok();
+            }
+        }
+    }
+    Some((status, cl, end + 4))
+}
+
+/// 탐침 하나(블로킹 · 모든 대기에 상한) — `GET <path>` 를 기본 대기(0.3초)와 상한(5초)으로.
+pub fn bridge_probe_get(port: u16, path: &str) -> Result<BridgeProbeReply, BridgeProbeError> {
+    bridge_probe_request(port, path, &[], BRIDGE_PROBE_WAIT_MS, BRIDGE_PROBE_BUDGET_MS)
+}
+
+/// 탐침의 일반형 — 요청 머리 추가(`(이름, 값)` 쌍) · 접속 뒤 기다림(`wait_ms`) · 응답 상한(`budget_ms`)을 고른다.
+/// `wait_ms = 0` 은 "접속 직후의 요청"(옛 세대 판별 · 브리지 주인 확인에 쓴다 — 표식 상태의 브리지도 접속 직후의 요청에는 답한다[실측 R1]).
+#[deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+pub fn bridge_probe_request(
+    port: u16,
+    path: &str,
+    headers: &[(&str, &str)],
+    wait_ms: u64,
+    budget_ms: u64,
+) -> Result<BridgeProbeReply, BridgeProbeError> {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(BRIDGE_PROBE_CONNECT_MS))
+        .map_err(|_| BridgeProbeError::NoConnect)?;
+    if wait_ms > 0 {
+        std::thread::sleep(Duration::from_millis(wait_ms));
+    }
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(budget_ms.max(1))));
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\nAccept: */*\r\n");
+    for (k, v) in headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    if stream.write_all(req.as_bytes()).is_err() {
+        return Err(BridgeProbeError::NoResponse);
+    }
+    let deadline = Instant::now() + Duration::from_millis(budget_ms.max(1));
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        if let Some((status, cl, hdr_end)) = bridge_parse_head(&buf) {
+            let have = buf.len().saturating_sub(hdr_end);
+            let want = cl.map(|c| c.min(BRIDGE_PROBE_BODY_CAP)).unwrap_or(BRIDGE_PROBE_BODY_CAP);
+            if have >= want {
+                let body = buf.get(hdr_end..hdr_end.saturating_add(want)).unwrap_or(&[]).to_vec();
+                return Ok(BridgeProbeReply { status, body, complete: true });
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(BridgeProbeError::NoResponse);
+        }
+        let _ = stream.set_read_timeout(Some(left.max(Duration::from_millis(1))));
+        match stream.read(&mut tmp) {
+            Ok(0) => {
+                // 상대가 닫았다 — 머리를 읽었고 길이를 몰랐으면(=닫힘이 끝) 받은 만큼이 전부다.
+                return match bridge_parse_head(&buf) {
+                    Some((status, None, hdr_end)) => Ok(BridgeProbeReply {
+                        status,
+                        body: buf.get(hdr_end..).unwrap_or(&[]).to_vec(),
+                        complete: true,
+                    }),
+                    Some((status, Some(_), hdr_end)) => Ok(BridgeProbeReply {
+                        status,
+                        body: buf.get(hdr_end..).unwrap_or(&[]).to_vec(),
+                        complete: false,
+                    }),
+                    None if buf.is_empty() => Err(BridgeProbeError::NoResponse),
+                    None => Err(BridgeProbeError::BadReply),
+                };
+            }
+            Ok(n) => buf.extend_from_slice(tmp.get(..n).unwrap_or(&[])),
+            Err(_) => return Err(BridgeProbeError::NoResponse),
+        }
+    }
+}
+
 /// Parse a surface reference: "surface:31", "31", or 31 → 31.
 pub fn parse_surface_ref(s: &str) -> Option<u64> {
     let t = s.trim();
@@ -7419,3 +7552,102 @@ mod spawn_policy_tests {
         );
     }
 }
+
+/// ★(0.14.44 · B3) 오피스 브리지 건강 확인 도우미 시험 — 가짜 서버(로컬 소켓 · 스레드)로 탐침의 정의(접속 → 0.3초 → 요청 → 5초 · min(CL,64KB))를 잰다. 프로세스를 띄우지 않는다.
+#[cfg(test)]
+mod bridge_probe_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    /// 한 접속만 받는 가짜 서버 — 접속과 요청 도착 사이의 간격을 재고 `reply` 를 돌려준다(`None` 이면 답하지 않고 붙들고 있는다).
+    fn serve(reply: Option<Vec<u8>>, hold_ms: u64) -> (u16, std::thread::JoinHandle<(Duration, String)>) {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        let h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().expect("accept");
+            let t0 = Instant::now();
+            let mut buf = [0u8; 4096];
+            let n = s.read(&mut buf).unwrap_or(0);
+            let gap = t0.elapsed();
+            let req = String::from_utf8_lossy(buf.get(..n).unwrap_or(&[])).into_owned();
+            if let Some(r) = reply {
+                let _ = s.write_all(&r);
+            }
+            std::thread::sleep(Duration::from_millis(hold_ms));
+            (gap, req)
+        });
+        (port, h)
+    }
+
+    fn http(status: u16, body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}", body.len()).into_bytes()
+    }
+
+    #[test]
+    fn probe_waits_300ms_after_connect_and_sends_get_with_host() {
+        let (port, h) = serve(Some(http(200, r#"{"ok":true}"#)), 0);
+        let r = bridge_probe_get(port, "/health").expect("응답");
+        assert_eq!((r.status, r.complete), (200, true));
+        assert_eq!(r.body, br#"{"ok":true}"#);
+        let (gap, req) = h.join().expect("join");
+        assert!(gap >= Duration::from_millis(280), "접속 직후에 요청을 보냈다({gap:?}) — 표식 상태를 가려내지 못한다");
+        assert!(req.starts_with("GET /health HTTP/1.1\r\n") && req.contains("Host: 127.0.0.1:"), "{req}");
+    }
+
+    #[test]
+    fn immediate_request_has_no_wait_and_carries_headers() {
+        let (port, h) = serve(Some(http(403, r#"{"error":"bad_key"}"#)), 0);
+        let r = bridge_probe_request(port, "/peek?key=none", &[("X-HUD-Token", "abc")], 0, 3000).expect("응답");
+        assert_eq!(r.status, 403);
+        let (gap, req) = h.join().expect("join");
+        assert!(gap < Duration::from_millis(250), "접속 직후의 요청이 늦었다({gap:?})");
+        assert!(req.contains("X-HUD-Token: abc\r\n"), "{req}");
+    }
+
+    #[test]
+    fn probe_gives_up_within_the_budget_when_the_server_never_answers() {
+        let (port, h) = serve(None, 1500);
+        let t0 = Instant::now();
+        let r = bridge_probe_request(port, "/health", &[], 0, 600);
+        assert_eq!(r, Err(BridgeProbeError::NoResponse));
+        assert!(t0.elapsed() < Duration::from_millis(1400), "상한을 넘겨 기다렸다: {:?}", t0.elapsed());
+        let _ = h.join();
+    }
+
+    #[test]
+    fn probe_reports_no_connect_when_nothing_listens() {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        drop(l);
+        assert_eq!(bridge_probe_get(port, "/health"), Err(BridgeProbeError::NoConnect));
+    }
+
+    /// 64KB 를 넘는 본문은 읽지 않고 성공으로 친다(`/world` 폴백이 좌석이 많으면 64KB 를 넘는다 — 독립 검증 X6) · 본문이 모자라게 끊기면 `complete=false`.
+    #[test]
+    fn probe_caps_the_body_at_64kb_and_flags_truncated_replies() {
+        let big = "x".repeat(200_000);
+        let (port, h) = serve(Some(http(200, &big)), 200);
+        let r = bridge_probe_request(port, "/world", &[], 0, 3000).expect("응답");
+        assert!(r.complete && r.status == 200);
+        assert_eq!(r.body.len(), BRIDGE_PROBE_BODY_CAP, "min(Content-Length, 64KB) 바이트만 받는다");
+        let _ = h.join();
+        // Content-Length 보다 적게 보내고 닫는다 — 끊긴 응답.
+        let mut cut = http(200, &"y".repeat(100));
+        cut.truncate(cut.len() - 40);
+        let (port, h) = serve(Some(cut), 0);
+        let r = bridge_probe_request(port, "/world", &[], 0, 3000).expect("응답");
+        assert_eq!((r.status, r.complete), (200, false));
+        let _ = h.join();
+    }
+
+    #[test]
+    fn parse_head_reads_status_and_length() {
+        assert_eq!(bridge_parse_head(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"), Some((404, Some(0), 45)));
+        assert_eq!(bridge_parse_head(b"HTTP/1.0 200 OK\r\nX: y\r\n\r\nbody"), Some((200, None, 25)));
+        assert_eq!(bridge_parse_head(b"HTTP/1.1 200 OK\r\nContent-Le"), None, "머리가 다 오지 않았다");
+        assert_eq!(bridge_parse_head(b"garbage\r\n\r\n"), None);
+    }
+}
+

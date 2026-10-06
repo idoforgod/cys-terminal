@@ -58,3 +58,90 @@ pub fn feed_orphan_sweep_enabled_from(env: Option<&str>, policy: Option<&Value>)
 pub fn feed_orphan_sweep_enabled() -> bool {
     feed_orphan_sweep_enabled_from(env_value("CYS_FEED_ORPHAN_SWEEP").as_deref(), read_policy().as_ref())
 }
+
+// ── 오피스 브리지 손잡이(B1·B2·B3·B7) ─────────────────────────────────────────────
+
+/// 브리지 감독 방식. `Legacy` = 0.14.43 의 감독 루프 그대로(표준입력 `null` · 수명줄·탐침·재기동 상한·교체 없음).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeMode {
+    Managed,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeDecision {
+    pub mode: BridgeMode,
+    /// 정책 파일에 **켜는 값**(`managed`)이 적혀 있어 무시했다 — 켜는 값은 환경변수로만 받는다(재확인 R3).
+    pub ignored_policy_managed: bool,
+}
+
+/// `CYS_OFFICE_BRIDGE_MODE` — 기본은 맥·리눅스 `Managed` · **윈도우 `Legacy`**(CI 윈도우 레인과 실기 확인을 통과하기 전에는 종전대로). 환경변수 `managed`|`legacy` 를 받고,
+/// 정책 파일은 **`legacy` 만** 받는다(되돌리는 값). 파일의 `managed` 는 무시한다(좌석도 쓸 수 있는 파일이므로 켜는 값을 받으면 윈도우에서 끈 채로 낸 감독이 한 줄로 켜진다).
+/// 환경이 `managed` 여도 파일이 `legacy` 면 `Legacy`(되돌리는 쪽이 이긴다).
+pub fn bridge_mode_from(env: Option<&str>, policy: Option<&Value>, windows: bool) -> ModeDecision {
+    let mut mode = if windows { BridgeMode::Legacy } else { BridgeMode::Managed };
+    match env.map(|e| e.trim().to_ascii_lowercase()).as_deref() {
+        Some("managed") => mode = BridgeMode::Managed,
+        Some("legacy") => mode = BridgeMode::Legacy,
+        _ => {}
+    }
+    let mut ignored = false;
+    if let Some(v) = policy.and_then(|p| p.get("CYS_OFFICE_BRIDGE_MODE")).and_then(|v| v.as_str()) {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "legacy" => mode = BridgeMode::Legacy,
+            "managed" => ignored = true,
+            _ => {}
+        }
+    }
+    ModeDecision { mode, ignored_policy_managed: ignored }
+}
+
+/// 지금의 감독 방식을 읽는다(스폰 때마다 — 실행 중에 파일로 `legacy` 로 바뀌면 **다음 스폰부터** 적용된다). 파일의 켜는 값이 처음 보였거나 값이 바뀌었을 때만 로그 한 줄.
+pub fn bridge_mode() -> BridgeMode {
+    static SEEN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    let d = bridge_mode_from(
+        env_value("CYS_OFFICE_BRIDGE_MODE").as_deref(),
+        read_policy().as_ref(),
+        cfg!(windows),
+    );
+    let now = if d.ignored_policy_managed { 1u8 } else { 2u8 };
+    let prev = SEEN.swap(now, std::sync::atomic::Ordering::Relaxed);
+    if d.ignored_policy_managed && prev != 1 {
+        eprintln!(
+            "[cysd] office-bridge: 정책 파일의 CYS_OFFICE_BRIDGE_MODE=managed 는 무시한다(켜는 값은 환경변수로만 받는다 — 되돌리는 값 legacy 만 파일에서 받는다)"
+        );
+    }
+    d.mode
+}
+
+/// `CYS_OFFICE_BRIDGE_ANY_OWNER=1`(환경변수 또는 정책 파일의 `1`) — 종전처럼 어느 데몬이든 브리지를 띄운다(지원·개발자용).
+pub fn bridge_any_owner_from(env: Option<&str>, policy: Option<&Value>) -> bool {
+    if env.map(|e| e.trim() == "1").unwrap_or(false) {
+        return true;
+    }
+    policy
+        .and_then(|p| p.get("CYS_OFFICE_BRIDGE_ANY_OWNER"))
+        .map(policy_is_one)
+        .unwrap_or(false)
+}
+
+pub fn bridge_any_owner() -> bool {
+    bridge_any_owner_from(env_value("CYS_OFFICE_BRIDGE_ANY_OWNER").as_deref(), read_policy().as_ref())
+}
+
+/// `CYS_OFFICE_BRIDGE_REPLACE_OLD=0`(환경변수 또는 정책 파일의 `0`) — 옛 브리지 교체(B7)만 끈다. 그 밖은 켬(맥). 윈도우는 호출처가 따로 막는다.
+pub fn bridge_replace_old_enabled_from(env: Option<&str>, policy: Option<&Value>) -> bool {
+    if env.map(|e| e.trim() == "0").unwrap_or(false) {
+        return false;
+    }
+    if let Some(v) = policy.and_then(|p| p.get("CYS_OFFICE_BRIDGE_REPLACE_OLD")) {
+        if policy_is_zero(v) {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn bridge_replace_old_enabled() -> bool {
+    bridge_replace_old_enabled_from(env_value("CYS_OFFICE_BRIDGE_REPLACE_OLD").as_deref(), read_policy().as_ref())
+}
