@@ -1,0 +1,79 @@
+{
+    "run_mode":  "off",
+    "started":  "2026-10-06T17:46:42.217Z",
+    "ended":  "2026-10-06T17:48:05.025Z",
+    "end_reason":  "success: the version marker reached the target and cys-app.exe is running again",
+    "ticks":  39,
+    "click_at":  "2026-10-06T17:46:46.625Z",
+    "node_exited_at":  "2026-10-06T17:47:18.938Z",
+    "node_exit_code":  0,
+    "app_alive_first_at":  "2026-10-06T17:46:42.533Z",
+    "app_gone_at":  "2026-10-06T17:47:19.048Z",
+    "app_relaunched":  true,
+    "alive_samples_after_click":  15,
+    "dead_samples_after_click":  21,
+    "last_alive_after_click_sec":  78,
+    "first_dead_after_click_sec":  32,
+    "installer_seen":  true,
+    "installer_first_seen_at":  "2026-10-06T17:47:19.048Z",
+    "installer_first_seen":  {
+                                 "name":  "cys-0.14.99-installer.exe",
+                                 "id":  5032,
+                                 "ppid":  1932,
+                                 "path":  "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cys-0.14.99-updater-4fzaP1\\cys-0.14.99-installer.exe",
+                                 "cmd":  "\"C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cys-0.14.99-updater-4fzaP1\\cys-0.14.99-installer.exe\" /P /R /UPDATE /ARGS"
+                             },
+    "updater_dirs_seen":  [
+                              "cys-0.14.99-updater-4fzaP1"
+                          ],
+    "updater_dir_first_seen_at":  "2026-10-06T17:47:08.407Z",
+    "updater_dir_max_bytes":  143202847,
+    "updater_dirs_at_end":  [
+                                "cys-0.14.99-updater-4fzaP1"
+                            ],
+    "attempt_seen":  true,
+    "attempt_first_seen_at":  "2026-10-06T17:47:06.255Z",
+    "attempt_present_at_end":  true,
+    "attempt_text":  "{\"from\":\"0.14.44\",\"to\":\"0.14.99\",\"at\":1791308824}",
+    "installer_alive_at_end":  true,
+    "windows_at_end":  "cys-app#9624:cys — CYSJavis Terminal | hosted-compute-agent#11160:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#5872:C:\\Windows\\system32\\wsl.exe",
+    "marker_initial":  "0.14.44",
+    "marker_last":  "0.14.42",
+    "marker_changed_at":  "2026-10-06T17:48:05.023Z",
+    "marker_reached_target_at":  "2026-10-06T17:48:05.023Z",
+    "file_version_last":  "0.14.42 / product 0.14.42",
+    "screenshots":  [
+                        {
+                            "name":  "appe2e-off-screen-installer.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "hosted-compute-agent#11160:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent"
+                        },
+                        {
+                            "name":  "appe2e-off-screen-app-gone.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "cys-0.14.99-installer#5032:cys Setup  | hosted-compute-agent#11160:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#5872:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "appe2e-off-screen-installer-wait1.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "cys-0.14.99-installer#5032:cys Setup  | hosted-compute-agent#11160:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#5872:C:\\Windows\\system32\\wsl.exe"
+                        },
+                        {
+                            "name":  "appe2e-off-screen-end.png",
+                            "ok":  true,
+                            "error":  null,
+                            "width":  1024,
+                            "height":  768,
+                            "windows":  "cys-app#9624:cys — CYSJavis Terminal | hosted-compute-agent#11160:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#5872:C:\\Windows\\system32\\wsl.exe"
+                        }
+                    ]
+}
