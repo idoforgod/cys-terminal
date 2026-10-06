@@ -1,0 +1,93 @@
+{
+  "generated": "2026-10-06T13:13:14.900Z",
+  "repository": "idoforgod/cys-terminal",
+  "run_id": "37468241455",
+  "run_attempt": "1",
+  "run_url": "https://github.com/idoforgod/cys-terminal/actions/runs/37468241455",
+  "job": "w44-wh",
+  "os": "windows-11-arm",
+  "branch": "diag-results/37468241455-1-w44-wh-windows-11-arm",
+  "node": "v22.23.3",
+  "files": [
+    {
+      "path": "cargo-test-build-executables.txt",
+      "bytes": 48323
+    },
+    {
+      "path": "cargo-test-build-tail.txt",
+      "bytes": 1441
+    },
+    {
+      "path": "done-w44-wh.json",
+      "bytes": 138
+    },
+    {
+      "path": "job-start.txt",
+      "bytes": 24
+    },
+    {
+      "path": "log-w44-wh.txt",
+      "bytes": 161
+    },
+    {
+      "path": "w44-wh-cysd-elev.err.txt",
+      "bytes": 796
+    },
+    {
+      "path": "w44-wh-cysd-std.err.txt",
+      "bytes": 853
+    },
+    {
+      "path": "w44-wh-daemon-elev.txt",
+      "bytes": 2211
+    },
+    {
+      "path": "w44-wh-daemon-std.txt",
+      "bytes": 2172
+    },
+    {
+      "path": "w44-wh-results.json",
+      "bytes": 87023
+    },
+    {
+      "path": "w44-wh-test-elevated-stderr.txt",
+      "bytes": 525
+    },
+    {
+      "path": "w44-wh-test-elevated-stdout.txt",
+      "bytes": 196
+    },
+    {
+      "path": "w44-wh-test-standard.err.txt",
+      "bytes": 501
+    },
+    {
+      "path": "w44-wh-test-standard.out.txt",
+      "bytes": 196
+    },
+    {
+      "path": "w44-wh-whoami-std.txt",
+      "bytes": 1050
+    }
+  ],
+  "skipped": [
+    {
+      "path": "w44-wh-daemon-std-runner.err.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "w44-wh-daemon-std-runner.out.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "whoami-std.err.txt",
+      "reason": "empty file"
+    },
+    {
+      "path": "whoami-std.out.txt",
+      "reason": "empty file"
+    }
+  ],
+  "inline_files": 15,
+  "blob_files": 0
+}

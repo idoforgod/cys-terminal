@@ -1,0 +1,18 @@
+2026-10-06T06:12:33.6671193-07:00 user=w44std profile=C:\Users\w44std admin=False
+2026-10-06T06:12:33.7796097-07:00 daemon pid 7100
+2026-10-06T06:12:42.0200964-07:00 ready=True
+2026-10-06T06:12:42.0951686-07:00 seat: surface:1
+2026-10-06T06:12:49.1855775-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -      4s     0  w44seat
+2026-10-06T06:12:49.2192065-07:00 list: surface:1	role=-	pid=3048	exited=false	w44seat	C:\Users\w44std
+2026-10-06T06:12:54.2624277-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -      9s     0  w44seat
+2026-10-06T06:12:54.2939473-07:00 list: surface:1	role=-	pid=3048	exited=false	w44seat	C:\Users\w44std
+2026-10-06T06:12:59.3141404-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     15s     0  w44seat
+2026-10-06T06:12:59.3458573-07:00 list: surface:1	role=-	pid=3048	exited=false	w44seat	C:\Users\w44std
+2026-10-06T06:13:04.3734243-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     20s     0  w44seat
+2026-10-06T06:13:04.3988849-07:00 list: surface:1	role=-	pid=3048	exited=false	w44seat	C:\Users\w44std
+2026-10-06T06:13:09.4302593-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     25s     0  w44seat
+2026-10-06T06:13:09.4540451-07:00 list: surface:1	role=-	pid=3048	exited=false	w44seat	C:\Users\w44std
+2026-10-06T06:13:14.4875136-07:00 status: ROLE           SURFACE      AGENT    STATE       CTX    IDLE QUEUE  TASK/TITLE | -              surface:1    -        -             -     30s     0  w44seat
+2026-10-06T06:13:14.5175805-07:00 list: surface:1	role=-	pid=3048	exited=false	w44seat	C:\Users\w44std
+2026-10-06T06:13:14.5352422-07:00 proc_count_high lines in daemon stderr: 0
+2026-10-06T06:13:14.5422085-07:00 done
