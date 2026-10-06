@@ -263,6 +263,11 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   따라서 새 python 진입점도 강제점도 아니다. 니들을 보유하는 이유는 단 하나, 프리루드의
     #   봉인(SEAL-1)이 훅 본체까지 **상속되는지 관측**하기 때문이다(PRELUDE-1b).
     "cysjavis-pack/bin/tests/test_hook_launcher_split.py",
+    # ★2026-10-06 0.14.44 WA 등재 — 브리지 스크립트 단독 실행 검체. **봉인 점검 결과(등재 = 이 선언)**:
+    #   강제점이 아니라 **밀폐 env 를 짜는 한 줄**이다 — 검체가 `sys.executable` 로 `javis_hud_bridge.py` 를 띄울 때
+    #   env 를 `os.environ` 상속 없이 새로 짜므로 봉인(`PYTHONDONTWRITEBYTECODE=1`)을 직접 실어 준다(벗기지 않고
+    #   거는 방향 · test_lane_redirect 와 같은 계급). 새 번들 python 진입점은 아니다.
+    "cysjavis-pack/bin/tests/test_hud_bridge_0144_specimen.py",
     # ★2026-09-21 WP-B-hooks 등재 — 레인 가드 위임(R안)·표식·C83 검체. **봉인 점검 결과(등재 = 이 선언)**:
     #   새 python 진입점도 강제점도 **아니다**. 이 검체가 띄우는 것은 `sh <훅>`(훅이 `$CYS_PY` 로 python 을
     #   exec 하는 능력 게이트 포함)과 `sys.executable` 로 도는 `javis_mission.py status --json` 뿐이고,
