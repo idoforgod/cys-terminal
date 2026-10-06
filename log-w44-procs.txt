@@ -1,0 +1,2 @@
+2026-10-06T10:53:01.606Z [INFO] === w44-procs start (PowerShell 5.1.26100.33438, LanguageMode FullLanguage) ===
+2026-10-06T10:53:43.461Z [INFO] === w44-procs end ===

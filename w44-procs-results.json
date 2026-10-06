@@ -1,0 +1,32 @@
+{
+    "os":  "windows-2025",
+    "elevated_run":  {
+                         "rc":  0,
+                         "err":  "",
+                         "file":  "w44-procs-elevated.json"
+                     },
+    "standard_user_run":  {
+                              "rc":  0,
+                              "stderr":  {
+
+                                         },
+                              "file":  "w44-procs-standard.json",
+                              "exists":  true
+                          },
+    "taskkill_probe":  {
+                           "attempted":  true,
+                           "reused":  false,
+                           "spawns":  4000,
+                           "a_pid":  6112,
+                           "b_pid":  6388,
+                           "new_owner_pid":  null,
+                           "b_alive_before":  null,
+                           "taskkill_rc":  null,
+                           "taskkill_out":  null,
+                           "b_alive_after":  null,
+                           "note":  "the id of A was not handed to another own process within the attempts: not measured"
+                       },
+    "errors":  [
+
+               ]
+}
