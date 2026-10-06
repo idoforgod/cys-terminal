@@ -780,6 +780,13 @@ function Invoke-DaemonBridgeRun {
         $dr = Invoke-Cys $Set $pipe 'doctor' 180
         $dtxt = ([string]$dr.out) + "`r`n" + ([string]$dr.err)
         Save-Text ('w44-doctor-' + $Tag + '.txt') $dtxt
+        $agyDir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli'
+        New-Item -ItemType Directory -Path $agyDir -Force | Out-Null
+        $dr2 = Invoke-Cys $Set $pipe 'doctor' 180
+        $dtxt2 = ([string]$dr2.out) + "`r`n" + ([string]$dr2.err)
+        Save-Text ('w44-doctor-agyfolder-' + $Tag + '.txt') $dtxt2
+        $S['doctor_with_agy_folder'] = [ordered]@{ rc = $dr2.rc; antigravity_lines = @($dtxt2 -split "`r?`n" | Where-Object { $_ -match 'Antigravity|agy' } | ForEach-Object { Limit $_ 500 }) }
+        Remove-Item -LiteralPath (Join-Path $env:USERPROFILE '.gemini') -Recurse -Force -ErrorAction SilentlyContinue
         $S['doctor'] = [ordered]@{ rc = $dr.rc; antigravity_lines = @($dtxt -split "`r?`n" | Where-Object { $_ -match 'Antigravity|agy' } | ForEach-Object { Limit $_ 400 }); office_lines = @($dtxt -split "`r?`n" | Where-Object { $_ -match 'office|pack-heal|web/' } | ForEach-Object { Limit $_ 300 }) }
     }
     if ($KillBridgeProbe -and $bp) {
@@ -796,7 +803,10 @@ function Invoke-DaemonBridgeRun {
         $S['bridge_kill_probe'] = $pb
     }
     if ($bp) {
-        $kidIds = @($kids | ForEach-Object { $_.Id })
+        $g3 = Get-BridgeProcs
+        $kids3 = @(Get-Descendants $bp.Id $g3['rows'])
+        $kidIds = @($kids3 | ForEach-Object { $_.Id })
+        $S['bridge_pid_at_kill'] = $bp.Id
         $S['after_daemon_kill'] = Measure-DaemonKill $d['pid'] $bp.Id $kidIds 25
     } else {
         try { Stop-Process -Id $d['pid'] -Force -ErrorAction SilentlyContinue } catch { }
@@ -875,24 +885,34 @@ function Invoke-HealTests {
 Step 'TC-daemon' {
     $res = [ordered]@{}
     $new = $X['new']
-    # (1) the default on Windows: legacy. Heal tests run here too (daemon + bridge running).
-    $res['new-default'] = Invoke-DaemonBridgeRun 'newdefault' $new @{} $true 25 $true $true
-    Save-Json 'w44-daemon-new-default.json' $res['new-default'] 10
-    $res['new-default-kill'] = Invoke-DaemonBridgeRun 'newdefaultkill' $new @{} $false 15
-    Save-Json 'w44-daemon-new-default-kill.json' $res['new-default-kill'] 10
-    # (2) managed mode through the environment, without a seat
-    $res['new-managed-noseat'] = Invoke-DaemonBridgeRun 'newmanagednoseat' $new @{ CYS_OFFICE_BRIDGE_MODE = 'managed' } $false 25 $false $true
-    Save-Json 'w44-daemon-new-managed-noseat.json' $res['new-managed-noseat'] 10
-    # (3) managed mode with seats and a background child of a seat
-    $res['new-managed-seat'] = Invoke-DaemonBridgeRun 'newmanagedseat' $new @{ CYS_OFFICE_BRIDGE_MODE = 'managed' } $true 25
-    Save-Json 'w44-daemon-new-managed-seat.json' $res['new-managed-seat'] 10
-    # (4) the policy file asks for managed: it must be ignored on Windows (default stays legacy) and the log says so
-    $res['new-policy-managed'] = Invoke-DaemonBridgeRun 'newpolicymanaged' $new @{ __policy_json = '{"CYS_OFFICE_BRIDGE_MODE": "managed"}' } $false 20
-    Save-Json 'w44-daemon-new-policy-managed.json' $res['new-policy-managed'] 10
-    # (5) the 0.14.43 daemon as it is: legacy bridge; after its forced stop does the bridge survive?  (the "old bridge after an upgrade" mechanism)
+    function Run-One {
+        param([string]$Key, [string]$Tag, [hashtable]$Set, [hashtable]$EnvX, [bool]$Seat, [int]$Hold, [bool]$Heal = $false, [bool]$Probe = $false)
+        $o = Invoke-DaemonBridgeRun $Tag $Set $EnvX $Seat $Hold $Heal $Probe
+        $res[$Key] = $o
+        Save-Json ('w44-daemon-' + $Key + '.json') $o 10
+    }
+    # (1) the default on Windows: legacy. Heal tests + doctor run here (daemon + bridge running); the bridge is killed alone (what does the daemon log say, does it come back?)
+    Run-One 'new-default' 'newdefault' $new @{} $true 25 $true $true
+    # (1b) legacy: the daemon is stopped by force - does the bridge (and its event children) survive?
+    Run-One 'new-default-kill' 'newdefaultkill' $new @{} $false 15
+    # (2) the policy file asks for managed: ignored on Windows (default stays legacy), the log says so
+    Run-One 'new-policy-managed' 'newpolicymanaged' $new @{ __policy_json = '{"CYS_OFFICE_BRIDGE_MODE": "managed"}' } $false 20
+    # (3) managed through the environment ONLY (as the design says the switch is) - the bridge script still treats Windows as legacy without HUD_WIN_NEW
+    Run-One 'new-managed-only' 'newmanagedonly' $new @{ CYS_OFFICE_BRIDGE_MODE = 'managed' } $false 20
+    # (4) managed + HUD_WIN_NEW=1 (both switches): items 4 and 5 of 5-4, three times each (no seat / two seats and a background child of a seat)
+    for ($i = 1; $i -le 3; $i++) {
+        Run-One ('new-managed-winnew-noseat-' + $i) ('mwn' + $i) $new @{ CYS_OFFICE_BRIDGE_MODE = 'managed'; HUD_WIN_NEW = '1' } $false 15
+    }
+    for ($i = 1; $i -le 3; $i++) {
+        Run-One ('new-managed-winnew-seat-' + $i) ('mws' + $i) $new @{ CYS_OFFICE_BRIDGE_MODE = 'managed'; HUD_WIN_NEW = '1' } $true 15
+    }
+    # (4b) the bridge alone is killed in this mode: restart after 5 s ("곧 다시 확인")
+    Run-One 'new-managed-winnew-probe' 'mwnprobe' $new @{ CYS_OFFICE_BRIDGE_MODE = 'managed'; HUD_WIN_NEW = '1' } $false 15 $false $true
+    # (5) the 0.14.43 daemon as it is on this runner (code page 1252: its bridge dies at start - UnicodeEncodeError) and with UTF-8 forced
+    #     (what a working bridge looks like, e.g. on a Korean Windows): after the forced stop of the OLD daemon does the OLD bridge survive?
     if ($X['old']) {
-        $res['old-default'] = Invoke-DaemonBridgeRun 'olddefault' $X['old'] @{} $false 20
-        Save-Json 'w44-daemon-old-default.json' $res['old-default'] 10
+        Run-One 'old-default' 'olddefault' $X['old'] @{} $false 20
+        Run-One 'old-default-utf8' 'oldutf8' $X['old'] @{ PYTHONUTF8 = '1'; PYTHONIOENCODING = 'utf-8' } $false 20
     }
 }
 
@@ -917,10 +937,10 @@ Step 'TD-hook' {
         $sh = Join-Path $WORK ('hook-run-' + $k + '.sh')
         $script = ('export CYS_ROLE=cso' + "`n" + 'export CYS_SOCKET=''\\.\pipe\cys-w44-nohook''' + "`n" + '''{0}'' < ''{1}''' + "`n") -f (ConvertTo-PosixPath $hook.FullName), (ConvertTo-PosixPath $inF)
         [System.IO.File]::WriteAllText($sh, $script, (New-Object System.Text.UTF8Encoding($false)))
-        $r = Invoke-Proc -File $bash -Arguments ('-l "{0}"' -f (ConvertTo-PosixPath $sh)) -TimeoutSec 60
+        $hr = Invoke-Proc -File $bash -Arguments ('-l "{0}"' -f (ConvertTo-PosixPath $sh)) -TimeoutSec 60
         $js = $null
-        try { $js = ConvertFrom-Json $r.out } catch { }
-        $rows[$k] = [ordered]@{ rc = $r.rc; stdout_bytes = $r.out.Length; json_valid = ($null -ne $js); decision = $(if ($js -and $js.hookSpecificOutput) { [string]$js.hookSpecificOutput.permissionDecision } else { $null }); stdout = (Limit $r.out 300); stderr = (Limit $r.err 300) }
+        try { $js = ConvertFrom-Json $hr.out } catch { }
+        $rows[$k] = [ordered]@{ rc = $hr.rc; stdout_bytes = $hr.out.Length; json_valid = ($null -ne $js); decision = $(if ($js -and $js.hookSpecificOutput) { [string]$js.hookSpecificOutput.permissionDecision } else { $null }); stdout = (Limit $hr.out 300); stderr = (Limit $hr.err 300) }
     }
     Save-Json 'w44-hook.json' ([ordered]@{ hook = $hook.FullName; cases = $rows }) 6
     Item 'hook' $rows
