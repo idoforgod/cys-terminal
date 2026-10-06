@@ -1,0 +1,42 @@
+### cargo test --lib approval -- --test-threads=1 --nocapture
+[1m[93mwarning[0m[1m[97m: unused import: `ChildLifetime`[0m
+    [1m[96m--> [0msrc\lib.rs:5385:17
+     [1m[96m|[0m
+[1m[96m5385[0m [1m[96m|[0m     use super::{ChildLifetime, SpawnPolicy, ENV_NO_AUTOSTART, NO_AUTOSTART_ON};
+     [1m[96m|[0m                 [1m[93m^^^^^^^^^^^^^[0m
+     [1m[96m|[0m
+     [1m[96m= [0m[1m[97mnote[0m: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: method `unix_setsid` is never used[0m
+   [1m[96m--> [0msrc\lib.rs:295:14
+    [1m[96m|[0m
+[1m[96m272[0m [1m[96m|[0m impl ChildLifetime {
+    [1m[96m|[0m [1m[96m------------------[0m [1m[96mmethod in this implementation[0m
+[1m[96m...[0m
+[1m[96m295[0m [1m[96m|[0m     const fn unix_setsid(self) -> bool {
+    [1m[96m|[0m              [1m[93m^^^^^^^^^^^[0m
+    [1m[96m|[0m
+    [1m[96m= [0m[1m[97mnote[0m: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+[1m[93mwarning[0m[1m[97m: function `marker_of` is never used[0m
+    [1m[96m--> [0msrc\app_bundle.rs:1177:8
+     [1m[96m|[0m
+[1m[96m1177[0m [1m[96m|[0m     fn marker_of(app: &Path) -> String {
+     [1m[96m|[0m        [1m[93m^^^^^^^^^[0m
+
+[1m[93mwarning[0m[1m[97m: function `residue` is never used[0m
+    [1m[96m--> [0msrc\app_bundle.rs:1182:8
+     [1m[96m|[0m
+[1m[96m1182[0m [1m[96m|[0m     fn residue(root: &Path, dest_name: &str) -> Vec<String> {
+     [1m[96m|[0m        [1m[93m^^^^^^^[0m
+
+[1m[93mwarning[0m: `cys-terminal` (lib test) generated 4 warnings (run `cargo fix --lib -p cys-terminal --tests` to apply 1 suggestion)
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+[1m[92m     Running[0m unittests src\lib.rs (target\debug\deps\cys-66c3ebe14de53cc6.exe)
+
+running 2 tests
+test factory_reset::tests::plan_quarantines_every_approval_store ... ok
+test factory_reset::tests::plan_sweeps_approval_write_leftovers_but_keeps_owner_files ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 671 filtered out; finished in 0.01s
+
