@@ -1,0 +1,52 @@
+{
+    "tag":  "olddefault",
+    "env":  {
+
+            },
+    "with_seat":  false,
+    "daemon":  {
+                   "pid":  10972,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  12
+               },
+    "bridge_found":  true,
+    "bridge":  {
+                   "pid":  1680,
+                   "ppid":  10972,
+                   "cmd":  "\"python3\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_hud_bridge.py",
+                   "started_after_s":  2.2,
+                   "parent_is_daemon":  true
+               },
+    "health":  null,
+    "world":  {
+                  "url":  "http://127.0.0.1:8642/world",
+                  "status":  null,
+                  "body":  "",
+                  "error":  "Exception calling \"GetResponse\" with \"0\" argument(s): \"Unable to connect to the remote server\"",
+                  "ms":  2041
+              },
+    "bridge_alive_after_hold":  false,
+    "bridge_same_pid_after_hold":  false,
+    "bridge_count_after_hold":  0,
+    "bridge_children":  [
+
+                        ],
+    "daemon_children":  [
+
+                        ],
+    "after_daemon_kill":  {
+                              "bridge_gone_after_s":  0,
+                              "children_gone_after_s":  0,
+                              "bridge_alive_at_end":  false,
+                              "children_alive_at_end":  0,
+                              "children_before":  0,
+                              "watched_s":  0
+                          },
+    "bridges_left_at_end":  0,
+    "port_8642_answers_at_end":  false,
+    "log_bridge_lines":  [
+                             "[cysd] office-bridge spawned (127.0.0.1:8642)",
+                             "[cysd] office-bridge exited — 60s 후 재확인"
+                         ]
+}
