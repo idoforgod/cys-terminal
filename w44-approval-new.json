@@ -1,0 +1,432 @@
+{
+    "tag":  "new",
+    "daemon":  {
+                   "pid":  6804,
+                   "ready":  true,
+                   "exited":  false,
+                   "waited":  9.2
+               },
+    "master":  {
+                   "rc":  0,
+                   "out":  "surface:1",
+                   "err":  "",
+                   "wait_for_cooldown_sec":  66
+               },
+    "signs":  {
+                  "plain-cmd":  {
+                                    "typed":  "call \"D:\\a\\_temp\\w44\\wrap-sign-new-cmd.bat\"",
+                                    "send":  {
+                                                 "key_rc":  0,
+                                                 "send_rc":  0,
+                                                 "send_err":  ""
+                                             },
+                                    "out":  "signed: ap-6804-1791262917-0 (expires_at=1791263817)\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one"
+                                },
+                  "plain-ps":  {
+                                   "typed":  "powershell -NoProfile -ExecutionPolicy Bypass -File \"D:\\a\\_temp\\w44\\wrap-sign-new-ps.ps1\"",
+                                   "send":  {
+                                                "key_rc":  0,
+                                                "send_rc":  0,
+                                                "send_err":  ""
+                                            },
+                                   "out":  "signed: ap-6804-1791262979-1 (expires_at=1791263879)\r\n捲〽਍督ⵤ敳湥戭⵹獰䐽尺屡瑟浥屰㑷尴楤獲䑜‱湯൥"
+                               },
+                  "plain-bash":  {
+                                     "typed":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\git\\bin\\bash.exe\" -l \"/d/a/_temp/w44/wrap-sign-new-bash.sh\"",
+                                     "send":  {
+                                                  "key_rc":  0,
+                                                  "send_rc":  0,
+                                                  "send_err":  ""
+                                              },
+                                     "out":  "signed: ap-6804-1791263042-2 (expires_at=1791263942)\nrc=0\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D1 one / D:/a/_temp/w44/dirs/D1 one"
+                                 },
+                  "kill-4242":  {
+                                    "out":  "signed: ap-6804-1791263043-3 (expires_at=1791263943)\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one"
+                                },
+                  "F1-unquoted-backslash":  {
+                                                "text":  "cys launch-agent --role worker --agent claude --cwd D:\\a\\_temp\\w44\\dirs\\w44proj",
+                                                "out":  "signed: ap-6804-1791263104-4 (expires_at=1791264004)\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one"
+                                            },
+                  "F2-quoted-backslash":  {
+                                              "text":  "cys launch-agent --role worker --agent claude --cwd \"D:\\a\\_temp\\w44\\dirs\\w44proj\"",
+                                              "out":  "signed: ap-6804-1791263165-5 (expires_at=1791264065)\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one"
+                                          },
+                  "F3-slash":  {
+                                   "text":  "cys launch-agent --role worker --agent claude --cwd D:/a/_temp/w44/dirs/w44proj",
+                                   "out":  "signed: ap-6804-1791263226-6 (expires_at=1791264126)\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one"
+                               },
+                  "F4-drive-only":  {
+                                        "text":  "cys launch-agent --role worker --agent claude --cwd C:",
+                                        "out":  "signed: ap-6804-1791263287-7 (expires_at=1791264187)\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one"
+                                    },
+                  "F5-drive-backslash":  {
+                                             "text":  "cys launch-agent --role worker --agent claude --cwd C:\\",
+                                             "out":  "signed: ap-6804-1791263348-8 (expires_at=1791264248)\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one"
+                                         },
+                  "F6-no-cwd":  {
+                                    "text":  "cys launch-agent --role worker --agent claude",
+                                    "out":  "signed: ap-6804-1791263409-9 (expires_at=1791264309)\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one"
+                                }
+              },
+    "checks":  [
+                   {
+                       "label":  "plain-signed-in-cmd",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44cmd",
+                       "rc":  null,
+                       "out":  "cwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-cmd",
+                       "shell":  "ps",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44cmd",
+                       "rc":  0,
+                       "out":  "rc=0\r\ncwd-seen-by-ps=D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-cmd",
+                       "shell":  "bash",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44cmd",
+                       "rc":  0,
+                       "out":  "rc=0\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D1 one / D:/a/_temp/w44/dirs/D1 one",
+                       "shell_cwd":  "/d/a/_temp/w44/dirs/D1 one / D:/a/_temp/w44/dirs/D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-ps",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44ps",
+                       "rc":  null,
+                       "out":  "cwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-ps",
+                       "shell":  "ps",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44ps",
+                       "rc":  0,
+                       "out":  "rc=0\r\ncwd-seen-by-ps=D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-ps",
+                       "shell":  "bash",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44ps",
+                       "rc":  0,
+                       "out":  "rc=0\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D1 one / D:/a/_temp/w44/dirs/D1 one",
+                       "shell_cwd":  "/d/a/_temp/w44/dirs/D1 one / D:/a/_temp/w44/dirs/D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-bash",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44bash",
+                       "rc":  null,
+                       "out":  "cwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-bash",
+                       "shell":  "ps",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44bash",
+                       "rc":  0,
+                       "out":  "rc=0\r\ncwd-seen-by-ps=D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-signed-in-bash",
+                       "shell":  "bash",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44bash",
+                       "rc":  0,
+                       "out":  "rc=0\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D1 one / D:/a/_temp/w44/dirs/D1 one",
+                       "shell_cwd":  "/d/a/_temp/w44/dirs/D1 one / D:/a/_temp/w44/dirs/D1 one",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "plain-from-other-folder-cmd",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "git w44cmd",
+                       "rc":  null,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791262917-0)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: D:\\a\\_temp\\w44\\dirs\\D2 two. master 가 `--cwd \"D:\\a\\_temp\\w44\\dirs\\D2 two\"` 를 붙여 다시 서명하면 됩니다.\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "probe-signed-folder-of-cmd",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44cmd",
+                       "rc":  null,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791262917-0)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: Z:\\w44-none. master 가 `--cwd \"Z:\\w44-none\"` 를 붙여 다시 서명하면 됩니다.\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "probe-signed-folder-of-ps",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44ps",
+                       "rc":  null,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791262979-1)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: Z:\\w44-none. master 가 `--cwd \"Z:\\w44-none\"` 를 붙여 다시 서명하면 됩니다.\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "probe-signed-folder-of-bash",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "text":  "git w44bash",
+                       "rc":  null,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791263042-2)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: Z:\\w44-none. master 가 `--cwd \"Z:\\w44-none\"` 를 붙여 다시 서명하면 됩니다.\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D1 one",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "kill-from-other-folder",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys kill 4242",
+                       "rc":  null,
+                       "out":  "cwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "kill-from-other-folder",
+                       "shell":  "ps",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys kill 4242",
+                       "rc":  0,
+                       "out":  "rc=0\r\ncwd-seen-by-ps=D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "kill-from-other-folder",
+                       "shell":  "bash",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys kill 4242",
+                       "rc":  0,
+                       "out":  "rc=0\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F1-unquoted-backslash",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd D:\\a\\_temp\\w44\\dirs\\w44proj",
+                       "rc":  null,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791263409-9)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: D:\\a\\_temp\\w44\\dirs\\D2 two. master 가 `--cwd \"D:\\a\\_temp\\w44\\dirs\\D2 two\"` 를 붙여 다시 서명하면 됩니다. launch-agent 는 낳을 폴더(`--cwd`)를 명령에 적어 서명받으면 어느 폴더에서든 통합니다.\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "launch-F1-unquoted-backslash",
+                       "shell":  "ps",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd D:\\a\\_temp\\w44\\dirs\\w44proj",
+                       "rc":  null,
+                       "out":  "cys.exe : [approval] δ»╕∞è╣∞¥╕ ΓÇö Ω░Ö∞¥Ç δ¬àδá╣∞¥ÿ ∞è╣∞¥╕(ap-6804-1791263409-9)∞¥┤ ∞₧ê∞ºÇδºî φÅ┤δìöΩ░Ç δïñδªàδïêδïñ. \r\n∞ä£δ¬àφò£ φÅ┤δìö: D:\\a\\_temp\\w44\\dirs\\D1 one ┬╖ φÖò∞¥╕φò£ φÅ┤δìö: D:\\a\\_temp\\w44\\dirs\\D2 two. master Ω░Ç `--cwd \r\n\"D:\\a\\_temp\\w44\\dirs\\D2 two\"` δÑ╝ δ╢Ö∞ù¼ δïñ∞ï£ ∞ä£δ¬àφòÿδ⌐┤ δÉ⌐δïêδïñ. launch-agent δèö δé│∞¥ä φÅ┤δìö(`--cwd`)δÑ╝ \r\nδ¬àδá╣∞ùÉ ∞áü∞û┤ ∞ä£δ¬àδ░¢∞£╝δ⌐┤ ∞û┤δèÉ φÅ┤δìö∞ùÉ∞ä£δôá φå╡φò⌐δïêδïñ.\r\nAt D:\\a\\_temp\\w44\\wrap-chk-new-launch-F1-unquoted-backslash-ps.ps1:2 char:138\r\n+ ... uire-ttl\u0027); \u0026 \u0027C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe\u0027 @a *\u003e\u003e ...\r\n+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecifie...",
+                       "shell_cwd":  "",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F1-unquoted-backslash",
+                       "shell":  "bash",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd D:\\a\\_temp\\w44\\dirs\\w44proj",
+                       "rc":  2,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791263409-9)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: D:\\a\\_temp\\w44\\dirs\\D2 two. master 가 `--cwd \"D:\\a\\_temp\\w44\\dirs\\D2 two\"` 를 붙여 다시 서명하면 됩니다. launch-agent 는 낳을 폴더(`--cwd`)를 명령에 적어 서명받으면 어느 폴더에서든 통합니다.\nrc=2\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F2-quoted-backslash",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd \"D:\\a\\_temp\\w44\\dirs\\w44proj\"",
+                       "rc":  null,
+                       "out":  "cwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F2-quoted-backslash",
+                       "shell":  "ps",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd \"D:\\a\\_temp\\w44\\dirs\\w44proj\"",
+                       "rc":  null,
+                       "out":  "cys.exe : [approval] δ»╕∞è╣∞¥╕ ΓÇö Ω░Ö∞¥Ç δ¬àδá╣∞¥ÿ ∞è╣∞¥╕(ap-6804-1791263409-9)∞¥┤ ∞₧ê∞ºÇδºî φÅ┤δìöΩ░Ç δïñδªàδïêδïñ. \r\n∞ä£δ¬àφò£ φÅ┤δìö: D:\\a\\_temp\\w44\\dirs\\D1 one ┬╖ φÖò∞¥╕φò£ φÅ┤δìö: D:\\a\\_temp\\w44\\dirs\\D2 two. master Ω░Ç `--cwd \r\n\"D:\\a\\_temp\\w44\\dirs\\D2 two\"` δÑ╝ δ╢Ö∞ù¼ δïñ∞ï£ ∞ä£δ¬àφòÿδ⌐┤ δÉ⌐δïêδïñ. launch-agent δèö δé│∞¥ä φÅ┤δìö(`--cwd`)δÑ╝ \r\nδ¬àδá╣∞ùÉ ∞áü∞û┤ ∞ä£δ¬àδ░¢∞£╝δ⌐┤ ∞û┤δèÉ φÅ┤δìö∞ùÉ∞ä£δôá φå╡φò⌐δïêδïñ.\r\nAt D:\\a\\_temp\\w44\\wrap-chk-new-launch-F2-quoted-backslash-ps.ps1:2 char:140\r\n+ ... uire-ttl\u0027); \u0026 \u0027C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe\u0027 @a *\u003e\u003e ...\r\n+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified:...",
+                       "shell_cwd":  "",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F2-quoted-backslash",
+                       "shell":  "bash",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd \"D:\\a\\_temp\\w44\\dirs\\w44proj\"",
+                       "rc":  0,
+                       "out":  "rc=0\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F3-slash",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd D:/a/_temp/w44/dirs/w44proj",
+                       "rc":  null,
+                       "out":  "cwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F3-slash",
+                       "shell":  "ps",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd D:/a/_temp/w44/dirs/w44proj",
+                       "rc":  0,
+                       "out":  "rc=0\r\ncwd-seen-by-ps=D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F3-slash",
+                       "shell":  "bash",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd D:/a/_temp/w44/dirs/w44proj",
+                       "rc":  0,
+                       "out":  "rc=0\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F4-drive-only",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:",
+                       "rc":  null,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791263409-9)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: D:\\a\\_temp\\w44\\dirs\\D2 two. master 가 `--cwd \"D:\\a\\_temp\\w44\\dirs\\D2 two\"` 를 붙여 다시 서명하면 됩니다. launch-agent 는 낳을 폴더(`--cwd`)를 명령에 적어 서명받으면 어느 폴더에서든 통합니다.\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "launch-F4-drive-only",
+                       "shell":  "ps",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:",
+                       "rc":  null,
+                       "out":  "cys.exe : [approval] δ»╕∞è╣∞¥╕ ΓÇö Ω░Ö∞¥Ç δ¬àδá╣∞¥ÿ ∞è╣∞¥╕(ap-6804-1791263409-9)∞¥┤ ∞₧ê∞ºÇδºî φÅ┤δìöΩ░Ç δïñδªàδïêδïñ. \r\n∞ä£δ¬àφò£ φÅ┤δìö: D:\\a\\_temp\\w44\\dirs\\D1 one ┬╖ φÖò∞¥╕φò£ φÅ┤δìö: D:\\a\\_temp\\w44\\dirs\\D2 two. master Ω░Ç `--cwd \r\n\"D:\\a\\_temp\\w44\\dirs\\D2 two\"` δÑ╝ δ╢Ö∞ù¼ δïñ∞ï£ ∞ä£δ¬àφòÿδ⌐┤ δÉ⌐δïêδïñ. launch-agent δèö δé│∞¥ä φÅ┤δìö(`--cwd`)δÑ╝ \r\nδ¬àδá╣∞ùÉ ∞áü∞û┤ ∞ä£δ¬àδ░¢∞£╝δ⌐┤ ∞û┤δèÉ φÅ┤δìö∞ùÉ∞ä£δôá φå╡φò⌐δïêδïñ.\r\nAt D:\\a\\_temp\\w44\\wrap-chk-new-launch-F4-drive-only-ps.ps1:2 char:113\r\n+ ... uire-ttl\u0027); \u0026 \u0027C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe\u0027 @a *\u003e\u003e ...\r\n+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: ([app...",
+                       "shell_cwd":  "",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F4-drive-only",
+                       "shell":  "bash",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:",
+                       "rc":  2,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791263409-9)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: D:\\a\\_temp\\w44\\dirs\\D2 two. master 가 `--cwd \"D:\\a\\_temp\\w44\\dirs\\D2 two\"` 를 붙여 다시 서명하면 됩니다. launch-agent 는 낳을 폴더(`--cwd`)를 명령에 적어 서명받으면 어느 폴더에서든 통합니다.\nrc=2\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F5-drive-backslash",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:\\",
+                       "rc":  null,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791263409-9)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: D:\\a\\_temp\\w44\\dirs\\D2 two. master 가 `--cwd \"D:\\a\\_temp\\w44\\dirs\\D2 two\"` 를 붙여 다시 서명하면 됩니다. launch-agent 는 낳을 폴더(`--cwd`)를 명령에 적어 서명받으면 어느 폴더에서든 통합니다.\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "launch-F5-drive-backslash",
+                       "shell":  "ps",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:\\",
+                       "rc":  null,
+                       "out":  "cys.exe : [approval] δ»╕∞è╣∞¥╕ ΓÇö δ¬àδá╣∞¥ÿ δö░∞ÿ┤φæ£Ω░Ç δï½φ₧ê∞ºÇ ∞òè∞òÿ∞è╡δïêδïñ. δö░∞ÿ┤φæ£δÑ╝ δº₧∞╢░ δïñ∞ï£ \r\nφÖò∞¥╕φòÿ∞ä╕∞Üö.\r\nAt D:\\a\\_temp\\w44\\wrap-chk-new-launch-F5-drive-backslash-ps.ps1:2 char:114\r\n+ ... uire-ttl\u0027); \u0026 \u0027C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe\u0027 @a *\u003e\u003e ...\r\n+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: ([approval] δ»╕∞...Öò∞¥╕φòÿ∞ä╕∞Üö.:String) [], RemoteException\r\n    + FullyQualifiedErrorId : NativeCommandError\r\n \r\n捲㈽਍督ⵤ敳湥戭⵹獰䐽尺屡瑟浥屰㑷尴楤獲䑜′睴൯",
+                       "shell_cwd":  "",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F5-drive-backslash",
+                       "shell":  "bash",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude --cwd C:\\",
+                       "rc":  2,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791263409-9)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: D:\\a\\_temp\\w44\\dirs\\D2 two. master 가 `--cwd \"D:\\a\\_temp\\w44\\dirs\\D2 two\"` 를 붙여 다시 서명하면 됩니다. launch-agent 는 낳을 폴더(`--cwd`)를 명령에 적어 서명받으면 어느 폴더에서든 통합니다.\nrc=2\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F6-no-cwd",
+                       "shell":  "cmd",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude",
+                       "rc":  null,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791263409-9)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: D:\\a\\_temp\\w44\\dirs\\D2 two. master 가 `--cwd \"D:\\a\\_temp\\w44\\dirs\\D2 two\"` 를 붙여 다시 서명하면 됩니다. launch-agent 는 낳을 폴더(`--cwd`)를 명령에 적어 서명받으면 어느 폴더에서든 통합니다.\ncwd-seen-by-cmd=D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "shell_cwd":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "runner_rc":  2
+                   },
+                   {
+                       "label":  "launch-F6-no-cwd",
+                       "shell":  "ps",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude",
+                       "rc":  null,
+                       "out":  "cys.exe : [approval] δ»╕∞è╣∞¥╕ ΓÇö Ω░Ö∞¥Ç δ¬àδá╣∞¥ÿ ∞è╣∞¥╕(ap-6804-1791263409-9)∞¥┤ ∞₧ê∞ºÇδºî φÅ┤δìöΩ░Ç δïñδªàδïêδïñ. \r\n∞ä£δ¬àφò£ φÅ┤δìö: D:\\a\\_temp\\w44\\dirs\\D1 one ┬╖ φÖò∞¥╕φò£ φÅ┤δìö: D:\\a\\_temp\\w44\\dirs\\D2 two. master Ω░Ç `--cwd \r\n\"D:\\a\\_temp\\w44\\dirs\\D2 two\"` δÑ╝ δ╢Ö∞ù¼ δïñ∞ï£ ∞ä£δ¬àφòÿδ⌐┤ δÉ⌐δïêδïñ. launch-agent δèö δé│∞¥ä φÅ┤δìö(`--cwd`)δÑ╝ \r\nδ¬àδá╣∞ùÉ ∞áü∞û┤ ∞ä£δ¬àδ░¢∞£╝δ⌐┤ ∞û┤δèÉ φÅ┤δìö∞ùÉ∞ä£δôá φå╡φò⌐δïêδïñ.\r\nAt D:\\a\\_temp\\w44\\wrap-chk-new-launch-F6-no-cwd-ps.ps1:2 char:104\r\n+ ... uire-ttl\u0027); \u0026 \u0027C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe\u0027 @a *\u003e\u003e ...\r\n+                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\r\n    + CategoryInfo          : NotSpecified: ([approva...",
+                       "shell_cwd":  "",
+                       "runner_rc":  0
+                   },
+                   {
+                       "label":  "launch-F6-no-cwd",
+                       "shell":  "bash",
+                       "dir":  "D:\\a\\_temp\\w44\\dirs\\D2 two",
+                       "text":  "cys launch-agent --role worker --agent claude",
+                       "rc":  2,
+                       "out":  "[approval] 미승인 — 같은 명령의 승인(ap-6804-1791263409-9)이 있지만 폴더가 다릅니다. 서명한 폴더: D:\\a\\_temp\\w44\\dirs\\D1 one · 확인한 폴더: D:\\a\\_temp\\w44\\dirs\\D2 two. master 가 `--cwd \"D:\\a\\_temp\\w44\\dirs\\D2 two\"` 를 붙여 다시 서명하면 됩니다. launch-agent 는 낳을 폴더(`--cwd`)를 명령에 적어 서명받으면 어느 폴더에서든 통합니다.\nrc=2\ncwd-seen-by-bash=/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "shell_cwd":  "/d/a/_temp/w44/dirs/D2 two / D:/a/_temp/w44/dirs/D2 two",
+                       "runner_rc":  0
+                   }
+               ],
+    "store":  null,
+    "lane_file":  [
+                      "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-w44anew\\approval-lane"
+                  ],
+    "notes":  [
+
+              ],
+    "forms":  {
+                  "F1-unquoted-backslash":  "cys launch-agent --role worker --agent claude --cwd D:\\a\\_temp\\w44\\dirs\\w44proj",
+                  "F2-quoted-backslash":  "cys launch-agent --role worker --agent claude --cwd \"D:\\a\\_temp\\w44\\dirs\\w44proj\"",
+                  "F3-slash":  "cys launch-agent --role worker --agent claude --cwd D:/a/_temp/w44/dirs/w44proj",
+                  "F4-drive-only":  "cys launch-agent --role worker --agent claude --cwd C:",
+                  "F5-drive-backslash":  "cys launch-agent --role worker --agent claude --cwd C:\\",
+                  "F6-no-cwd":  "cys launch-agent --role worker --agent claude"
+              },
+    "unsigned_check":  {
+                           "rc":  2,
+                           "err":  "[approval] 미승인 — 이 명령으로 시작하는 승인이 없습니다. master 가 이 명령을 서명해야 합니다."
+                       }
+}

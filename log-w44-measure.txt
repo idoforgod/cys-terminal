@@ -1,0 +1,54 @@
+2026-10-06T04:38:10.889Z [INFO] === w44-measure start (PowerShell 5.1.26100.33438, LanguageMode FullLanguage) ===
+2026-10-06T04:38:10.917Z [INFO] --- step S0-inputs start
+2026-10-06T04:59:18.646Z [INFO] artifact found: id 11391925355 size 143480786 after 21.1 min
+2026-10-06T04:59:24.971Z [INFO] download rc 0 err 
+2026-10-06T04:59:25.787Z [INFO] --- step S0-inputs end (1274.9s) 
+2026-10-06T04:59:25.791Z [INFO] --- step S1-install start
+2026-10-06T05:00:18.784Z [INFO] installer rc 0, killed after install: 
+2026-10-06T05:00:19.122Z [INFO] tar new rc 0 
+2026-10-06T05:00:19.124Z [INFO] --- step S1-install end (53.3s) 
+2026-10-06T05:00:19.128Z [INFO] --- step S1b-old-0.14.43 start
+2026-10-06T05:00:31.885Z [INFO] fetch old rc 0 
+2026-10-06T05:00:40.231Z [INFO] 7z rc 0 7-Zip 26.03 (x64) : Copyright (c) 1999-2026 Igor Pavlov : 2026-09-03
+
+Scanning the drive for archives:
+1 file, 143348191 bytes (137 MiB)
+
+Extracting archive: D:\a\_temp\w44\old-dl\cys_0.14.43_x64-setup.exe
+--
+Path = D:\a\_temp\w44\old-dl\cys_0.14.43_x64-setup.exe
+Type = Nsis
+Physical Size = 143348191
+Method = LZMA:23
+Solid = +
+Headers Size = 2358206
+Embedded Stub Size = 52736
+SubType...
+2026-10-06T05:00:40.692Z [INFO] tar old rc 0
+2026-10-06T05:00:40.694Z [INFO] --- step S1b-old-0.14.43 end (21.6s) 
+2026-10-06T05:00:40.733Z [INFO] --- step TA-approval start
+2026-10-06T05:11:20.448Z [INFO] --- step TA-approval end (639.7s) 
+2026-10-06T05:11:20.452Z [INFO] --- step TB-bridge start
+2026-10-06T05:11:20.569Z [ERROR] STEP FAILED [TB-bridge]: System.Management.Automation.RuntimeException: Cannot index into a null array. At D:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:685 char:5
++     $pr = Invoke-Proc -File $X['new']['py'] -Arguments ('"{0}"' -f $p ...
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+2026-10-06T05:11:20.577Z [INFO] --- step TB-bridge end (0.1s) System.Management.Automation.RuntimeException: Cannot index into a null array. At D:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:685 char:5
++     $pr = Invoke-Proc -File $X['new']['py'] -Arguments ('"{0}"' -f $p ...
++     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+2026-10-06T05:11:20.581Z [INFO] --- step TC-daemon start
+2026-10-06T05:11:21.931Z [ERROR] STEP FAILED [TC-daemon]: System.Management.Automation.RuntimeException: Cannot index into a null array. At D:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:130 char:9
++         $script:proc = Start-Process -FilePath $Set['cysd'] -PassThru ...
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+2026-10-06T05:11:21.933Z [INFO] --- step TC-daemon end (1.4s) System.Management.Automation.RuntimeException: Cannot index into a null array. At D:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:130 char:9
++         $script:proc = Start-Process -FilePath $Set['cysd'] -PassThru ...
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+2026-10-06T05:11:21.935Z [INFO] --- step TD-hook start
+2026-10-06T05:11:22.060Z [ERROR] STEP FAILED [TD-hook]: System.Management.Automation.ParameterBindingValidationException: Cannot bind argument to parameter 'LiteralPath' because it is null. At D:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:879 char:40
++     $hook = Get-ChildItem -LiteralPath $pk -Filter 'role-capability-g ...
++                                        ~~~
+2026-10-06T05:11:22.062Z [INFO] --- step TD-hook end (0.1s) System.Management.Automation.ParameterBindingValidationException: Cannot bind argument to parameter 'LiteralPath' because it is null. At D:\a\cys-terminal\cys-terminal\diag\w44-measure.ps1:879 char:40
++     $hook = Get-ChildItem -LiteralPath $pk -Filter 'role-capability-g ...
++                                        ~~~
+2026-10-06T05:11:22.066Z [INFO] --- step SUMMARY start
+2026-10-06T05:11:22.070Z [INFO] --- step SUMMARY end (0s) 
+2026-10-06T05:11:22.078Z [INFO] === w44-measure end ===
