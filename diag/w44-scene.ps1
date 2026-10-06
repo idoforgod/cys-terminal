@@ -309,6 +309,9 @@ function Invoke-W44Scene2 {
             $rec['assets'][$c[0]] = $r
         }
 
+        $assetsOnly = $false
+        try { $inp2 = ConvertFrom-Json (Read-TextUtf8 (Join-Path $env:GITHUB_WORKSPACE 'diag\w44-input.json')); if ($inp2.scene2_assets_only) { $assetsOnly = $true } } catch { }
+        if ($assetsOnly) { $rec['note'] = 'assets only (late / hold / approval skipped by w44-input.json scene2_assets_only)'; return $rec }
         # ---- late: the bridge is down when the tab opens; the daemon brings it back (legacy loop: about 60 s) ----
         $late = [ordered]@{ killed = @(); node = $null; office = $null; bridge_rows_after = $null }
         foreach ($pr in (Get-W44ProcTable)) { if ($pr.Cmd -like '*javis_hud_bridge.py*') { try { Stop-Process -Id $pr.Id -Force -ErrorAction Stop; $late['killed'] += $pr.Id } catch { } } }

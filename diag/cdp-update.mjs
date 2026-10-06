@@ -3226,7 +3226,7 @@ async function runW44OfficeMode() {
     const open0 = await evalJs("(function(){var p=document.getElementById('cc-panel');return p ? !p.hidden : null;})()", { awaitPromise: false, timeoutMs: 8000 }).catch(() => null);
     W.panel_open_before = open0;
     if (open0 !== true) { await evalJs(w44Expr(pageW44Click, '#btn-cc'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false); await sleep(1500); }
-    await evalJs("(function(){var f=document.getElementById('cc-office-frame'); if (f) { f.src = 'about:blank'; } return true;})()", { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
+    await evalJs("(function(){var f=document.getElementById('cc-office-frame'); if (f) { f.removeAttribute('src'); } return true;})()", { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
     await sleep(500);
     await evalJs(w44Expr(pageW44Click, '.cc-tab[data-view="live"]'), { awaitPromise: false, timeoutMs: 8000 }).catch(() => false);
     await sleep(1500);
