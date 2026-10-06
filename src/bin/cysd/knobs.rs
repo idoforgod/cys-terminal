@@ -173,3 +173,21 @@ pub fn bridge_replace_old_enabled_from(env: Option<&str>, policy: Option<&Value>
 pub fn bridge_replace_old_enabled() -> bool {
     bridge_replace_old_enabled_from(env_value("CYS_OFFICE_BRIDGE_REPLACE_OLD").as_deref(), read_policy().as_ref())
 }
+
+/// `CYS_DESC_START_GUARD` — 윈도우 좌석 자손 세기의 시작 시각 보정(WH). 환경 `0` 또는 정책 파일 `0`(숫자 0 · false · "0")이면 꺼짐(0.14.43 동작).
+/// 끄는 값만 인정한다(켜는 값은 파일에서 받지 않는다 — 기본이 켬이므로 파일로 더 느슨해질 길이 없다).
+pub fn desc_start_guard_enabled_from(env: Option<&str>, policy: Option<&Value>) -> bool {
+    if env.map(|e| e.trim() == "0").unwrap_or(false) {
+        return false;
+    }
+    if let Some(v) = policy.and_then(|p| p.get("CYS_DESC_START_GUARD")) {
+        if policy_is_zero(v) {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn desc_start_guard_enabled() -> bool {
+    desc_start_guard_enabled_from(env_value("CYS_DESC_START_GUARD").as_deref(), read_policy().as_ref())
+}

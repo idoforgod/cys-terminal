@@ -3729,33 +3729,12 @@ pub fn cmdline_matches_agent_exec(cmdline: &str, bin_base: &str) -> bool {
     })
 }
 
-/// 자손 pid 트리만 수집한다(문자열 미조회) — collect_descendants 계열의 공통 골격.
+/// 자손 pid 트리만 수집한다(문자열 미조회) — collect_descendants 계열의 공통 골격. **0.14.43 의 본문 그대로**(시작 시각을 보지 않는다).
 /// pid 재사용으로 부모 링크에 사이클이 생겨도 무한루프하지 않게 방문 집합을 유지한다.
 /// 반환 순서는 종전 collect_descendants 의 DFS 순서와 동일하다(소비자 순서 의존 무변경).
-///
-/// ★(0.14.44) **윈도우에서만** 시작 시각 보정을 적용한다(`guard_applies`): 윈도우는 죽은 부모 번호가 재사용되면 옛 고아가 새 프로세스에
-/// 매달린 채 남지만, 맥·리눅스는 고아가 1번(또는 서브리퍼)으로 재부모되어 이 오탐이 없고 시계 역행 위험만 진다.
-/// 적용하지 않으면(맥·리눅스 · 손잡이 끔) `legacy_descendant_pids` 를 그대로 부른다 — 추가 할당 0.
-/// 윈도우에서 켜졌을 때의 추가 비용(사실): 표 `Vec` 1개 + pid→시작 시각 `HashMap` 1개를 호출마다 더 만든다(차수는 종전 순회와 같다 · 미측정).
+/// ★(0.14.44 · WH2) 생존 판정·에이전트 찾기·상태 판정 등 대부분의 소비자는 이 경로를 쓴다 — 보정판(`guarded_descendant_pids`)은
+/// 감시 틱의 계수·중복 판정과 좌석 닫기의 종료 목록 두 곳에서만 부른다(소스 핀 시험으로 고정).
 fn descendant_pids(sys: &System, root: u32) -> Vec<u32> {
-    if !guard_applies(start_guard_enabled(), cfg!(windows)) {
-        return legacy_descendant_pids(sys, root);
-    }
-    let table: Vec<(u32, Option<u32>, u64)> = sys
-        .processes()
-        .iter()
-        .map(|(pid, p)| (pid.as_u32(), p.parent().map(|x| x.as_u32()), p.start_time()))
-        .collect();
-    let (out, drops) = descendants_report(&table, root, true);
-    if !drops.is_empty() {
-        let legacy_n = descendants_report(&table, root, false).0.len();
-        log_drops_debounced(root, &drops, legacy_n, out.len());
-    }
-    out
-}
-
-/// 0.14.43 의 `descendant_pids` 그대로(시작 시각을 보지 않는다).
-fn legacy_descendant_pids(sys: &System, root: u32) -> Vec<u32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for (pid, proc_) in sys.processes() {
         if let Some(parent) = proc_.parent() {
@@ -3783,6 +3762,26 @@ fn legacy_descendant_pids(sys: &System, root: u32) -> Vec<u32> {
     out
 }
 
+/// 보정판 자손 수집 — **윈도우에서만**(`guard_applies`) 시작 시각 보정을 적용하고, 아니면 `descendant_pids`(0.14.43)를 그대로 부른다(추가 할당 0).
+/// 윈도우는 죽은 부모 번호가 재사용되면 옛 고아(wininit.exe · csrss.exe …)가 새 프로세스에 매달린 채 남지만, 맥·리눅스는 고아가 1번으로 재부모되어 이 오탐이 없다.
+/// 윈도우에서 켜졌을 때의 추가 비용(사실): 표 `Vec` 1개 + pid→시작 시각 `HashMap` 1개를 호출마다 더 만든다(차수는 종전 순회와 같다 · 미측정).
+fn guarded_descendant_pids(sys: &System, root: u32) -> Vec<u32> {
+    if !guard_applies(start_guard_enabled(), cfg!(windows)) {
+        return descendant_pids(sys, root);
+    }
+    let table: Vec<(u32, Option<u32>, u64)> = sys
+        .processes()
+        .iter()
+        .map(|(pid, p)| (pid.as_u32(), p.parent().map(|x| x.as_u32()), p.start_time()))
+        .collect();
+    let (out, drops) = descendants_report(&table, root, true);
+    if !drops.is_empty() {
+        let legacy_n = descendants_report(&table, root, false).0.len();
+        log_drops_debounced(root, &drops, legacy_n, out.len());
+    }
+    out
+}
+
 /// 연결 버림의 여유(초) — 자식의 시작 시각이 부모(또는 root)보다 **이 값을 넘게** 이를 때만 연결을 버린다.
 /// 근거: ① sysinfo 의 start_time 은 초 단위(윈도우 FILETIME/1e7)라 반올림 1초, ② 윈도우는 프로세스를 만든 시점의 벽시계 초를
 /// 그대로 쓰므로 작은 시계 보정(NTP 슬루·몇 초 단계)이 낄 수 있다.
@@ -3794,11 +3793,11 @@ const DESC_START_SLACK_SECS: u64 = 30;
 /// 릴리스 빌드에서는 u64 가 한 바퀴 돈 거대한 수가 될 수 있다(디버그 빌드는 뺄셈 넘침 패닉) — 그런 값은 "모름" 으로 본다.
 const DESC_START_MAX_PLAUSIBLE: u64 = 4_102_444_800;
 
-/// 되돌리는 손잡이 `CYS_DESC_START_GUARD` — `0` 이면 끈다(0.14.43 동작). 환경변수만 읽는다(좌석이 쓸 수 있는 정책 파일로는 못 끈다).
-/// 데몬 시작 때 한 번만 읽는다(틱마다 환경을 뒤지지 않는다).
+/// 되돌리는 손잡이 `CYS_DESC_START_GUARD` — 환경변수 `0` 또는 정책 파일(`~/.cys/policy.json`)의 같은 이름 키 `0` 이면 끈다(0.14.43 동작 · 끄는 값만 인정).
+/// 처음 쓸 때 한 번만 읽는다(틱마다 환경·파일을 뒤지지 않는다 — 바꾸면 데몬 재시작 후 적용).
 fn start_guard_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !matches!(std::env::var("CYS_DESC_START_GUARD").ok().as_deref().map(str::trim), Some("0")))
+    *ON.get_or_init(crate::knobs::desc_start_guard_enabled)
 }
 
 /// 보정을 적용하는가 — 윈도우이고 손잡이가 켜져 있을 때만(순수 함수 · 시험은 인자로 넣는다).
@@ -3827,7 +3826,8 @@ struct DropRec {
     child: u32,
     parent_start: u64,
     child_start: u64,
-    by_root_anchor: bool,
+    /// "parent_predates" | "root_anchor" | "child_start_unknown"
+    reason: &'static str,
 }
 
 /// 자손 판정의 순수 부분 — 입력은 (pid, 부모 pid, 시작 시각 epoch 초) 목록과 root. `System` 에 기대지 않는다.
@@ -3862,9 +3862,20 @@ fn descendants_report(table: &[(u32, Option<u32>, u64)], root: u32, guard: bool)
                 if guard {
                     let ps = starts.get(&p).copied().unwrap_or(0);
                     let ks = starts.get(&kid).copied().unwrap_or(0);
-                    let by_parent = child_predates_parent(ps, ks);
-                    if by_parent || child_predates_parent(root_start, ks) {
-                        drops.push(DropRec { parent: p, child: kid, parent_start: ps, child_start: ks, by_root_anchor: !by_parent });
+                    // ① 자식이 부모보다 한참 이름 ② 부모의 시작은 아는데 자식의 시작은 모름(0 — 윈도우 sysinfo 가 핸들을 못 열면 0.
+                    //   표준 사용자 실측: 시스템 프로세스는 0, 같은 사용자의 좌석 자손은 읽힘 · 한계: 더 높은 권한으로 상승해 뜬 진짜 자식도 빠진다)
+                    // ③ 자식이 root 보다 한참 이름(root 닻 — 중간 부모를 몰라도 걸린다)
+                    let reason = if child_predates_parent(ps, ks) {
+                        Some("parent_predates")
+                    } else if start_known(ps) && ks == 0 {
+                        Some("child_start_unknown")
+                    } else if child_predates_parent(root_start, ks) {
+                        Some("root_anchor")
+                    } else {
+                        None
+                    };
+                    if let Some(reason) = reason {
+                        drops.push(DropRec { parent: p, child: kid, parent_start: ps, child_start: ks, reason });
                         continue;
                     }
                 }
@@ -3904,7 +3915,7 @@ fn log_drops_debounced(root: u32, drops: &[DropRec], legacy_n: usize, kept_n: us
             eprintln!(
                 "[cysd] 자손 세기: 시작 시각이 이른 연결을 버림 root={root} 부모={}(시작 {}) 자식={}(시작 {}) {} · 연결 {}건 버림 · 자손 {}→{}개 (끄기: CYS_DESC_START_GUARD=0)",
                 d.parent, d.parent_start, d.child, d.child_start,
-                if d.by_root_anchor { "root 닻" } else { "부모 비교" },
+                d.reason,
                 drops.len(), legacy_n, kept_n
             );
         }
@@ -4002,7 +4013,23 @@ pub enum CmdSource {
 /// 기존 소비자는 얇은 래퍼(`collect_descendants_with_cmd`)를 그대로 쓰므로 거동 무변이고,
 /// 관측 실패를 구분해야 하는 소비자만 이 함수를 쓴다.
 pub fn collect_descendants_with_cmd_src(sys: &System, root: u32) -> Vec<(u32, String, CmdSource)> {
-    let kids = descendant_pids(sys, root);
+    with_cmd_src_of(sys, descendant_pids(sys, root))
+}
+
+/// 보정판(`guarded_descendant_pids`)의 출처 동반 수집 — **감시 틱의 계수·중복 판정 루프에서만** 부른다(소스 핀 시험).
+pub fn collect_descendants_with_cmd_src_guarded(sys: &System, root: u32) -> Vec<(u32, String, CmdSource)> {
+    with_cmd_src_of(sys, guarded_descendant_pids(sys, root))
+}
+
+/// 보정판 자손 (pid, 관측문자열) — **좌석 닫기의 종료 목록에서만** 부른다(소스 핀 시험).
+pub fn collect_descendants_guarded(sys: &System, root: u32) -> Vec<(u32, String)> {
+    guarded_descendant_pids(sys, root)
+        .into_iter()
+        .map(|kid| (kid, observed_cmdline(sys, kid)))
+        .collect()
+}
+
+fn with_cmd_src_of(sys: &System, kids: Vec<u32>) -> Vec<(u32, String, CmdSource)> {
     if kids.is_empty() {
         return Vec::new();
     }
@@ -4591,7 +4618,7 @@ fn check_surfaces(
         // 종전 관측(이름)을 유지한다 — 완화가 아니라 **무변경**이다.
         // ★B3(#20): 중복 판정에 쓰는 관측은 **argv 승격판**이어야 한다 — 이름 폴백은
         //   서로 다른 파이썬 스크립트를 한 문자열로 접어 정상 편성을 중복으로 만든다.
-        let descendants = collect_descendants_with_cmd_src(sys, *root_pid);
+        let descendants = collect_descendants_with_cmd_src_guarded(sys, *root_pid);
         if descendants.len() > daemon.config.proc_count_threshold {
             // 디바운스 — 임계 초과 상태가 지속돼도 5초마다 영구 발행하지 않는다
             let now = now_epoch();
@@ -5058,7 +5085,7 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
     // 시간이 걸리는 sysinfo refresh·프로세스 킬은 락 밖에서 수행
     let mut sys = System::new();
     sys.refresh_processes(ProcessesToUpdate::All, true);
-    let descendants = collect_descendants(&sys, surface.pid);
+    let descendants = collect_descendants_guarded(&sys, surface.pid);
     for (pid, _) in &descendants {
         kill_pid(*pid);
     }
@@ -11701,43 +11728,116 @@ mod tests {
     }
 
     #[test]
-    fn wh_unknown_start_keeps_link() {
+    fn wh_unknown_parent_keeps_link_wraparound_value_is_not_zero() {
         let n = 1_800_000_000u64;
-        // 자식 모름 · 거대한 값(한 바퀴 돈 수 = 모름) — 종전대로 유지. root 닻은 "아는 자손 후보"만 거른다.
+        // 부모 모름 + 자식 모름 = 유지 · 부모 모름 + 자식 앎(root 닻에 안 걸리는 값) = 유지 · 자식이 한 바퀴 돈 거대한 값(0 아님)은 이 규칙으로 버리지 않는다.
         let t = vec![
             (10, Some(1), n),
-            (11, Some(10), 0),
-            (30, Some(10), u64::MAX - 5),
-            (31, Some(30), 0),
+            (11, Some(10), 0),          // 부모(root) 앎 + 자식 모름 → 버림(WH2)
+            (20, Some(10), n + 1),
+            (21, Some(20), 0),          // 부모 앎 + 자식 모름 → 버림
+            (30, Some(10), u64::MAX - 5), // 거대값 = 모름이지만 0 이 아니라 유지
+            (31, Some(30), 0),          // 부모(거대값) 모름 + 자식 모름 → 유지
+            (32, Some(30), n + 2),      // 부모 모름 + 자식 앎 → 유지
         ];
         let mut g = descendants_from_table(&t, 10, true);
         g.sort();
-        assert_eq!(g, vec![11, 30, 31]);
+        assert_eq!(g, vec![20, 30, 31, 32]);
     }
 
     #[test]
     fn wh_root_anchor_drops_known_old_descendant_under_unknown_middle() {
         let n = 1_800_000_000u64;
-        // 중간 부모(11)의 시작을 몰라도, 시작을 아는 옛 후손(12)은 root 보다 이르니 버린다. 모르는 후손(13)은 유지.
-        let t = vec![(10, Some(1), n), (11, Some(10), 0), (12, Some(11), n - 1_000_000), (13, Some(11), 0)];
+        // 중간 부모(11)가 거대값(모름 · 0 아님 → 유지)이어도 시작을 아는 옛 후손(12)은 root 보다 이르니 버린다. 모르는 후손(13)은 부모를 모르니 유지.
+        let t = vec![(10, Some(1), n), (11, Some(10), u64::MAX - 1), (12, Some(11), n - 1_000_000), (13, Some(11), 0)];
         let (g, d) = super::descendants_report(&t, 10, true);
         assert_eq!(g, vec![11, 13]);
         assert_eq!(d.len(), 1);
-        assert!(d[0].by_root_anchor && d[0].child == 12 && d[0].parent == 11);
+        assert!(d[0].reason == "root_anchor" && d[0].child == 12 && d[0].parent == 11);
     }
 
-    /// 한계 고정 — 제보 꼴이라도 **자식(wininit 류)의 시작 시각이 0(모름)이면 고쳐지지 않는다**(비상승 권한에서 핸들을 못 여는 경우).
+    /// 비상승(표준 사용자) 실측 꼴 — root → 824(시작 앎 · 최근) → wininit/csrss(시작 0) → 아래 111개 시작 0 + 28개 시작 앎. 보정 뒤 [824] 만 남는다.
     #[test]
-    fn wh_limit_report_shape_with_unknown_child_start_is_not_fixed() {
+    fn wh_nonelevated_measured_shape_only_real_child_remains() {
         let n = 1_800_000_000u64;
+        let boot = n - 5_000_000;
         let mut t = vec![(1000, Some(1), n - 3600), (824, Some(1000), n - 2), (600, Some(824), 0), (610, Some(824), 0)];
-        for i in 0..200u32 {
-            t.push((2000 + i, Some(600), 0));
+        for i in 0..111u32 {
+            t.push((2000 + i, Some(if i % 2 == 0 { 600 } else { 610 }), 0));
         }
-        let on = descendants_from_table(&t, 1000, true);
-        let off = descendants_from_table(&t, 1000, false);
-        assert_eq!(on, off, "시작 시각을 모르면 줄지 않는다(알려진 한계)");
-        assert!(on.len() > 200);
+        for i in 0..28u32 {
+            t.push((3000 + i, Some(600), boot + 60 + i as u64));
+        }
+        let (on, drops) = super::descendants_report(&t, 1000, true);
+        assert_eq!(on, vec![824]);
+        assert!(drops.iter().all(|d| d.reason == "child_start_unknown"));
+        assert!(descendants_from_table(&t, 1000, false).len() > 140);
+    }
+
+    /// 상승 꼴(전부 시작 앎) — 종전 규칙(부모보다 이른 자식)으로 버린다.
+    #[test]
+    fn wh_elevated_shape_all_known_dropped_by_predates() {
+        let n = 1_800_000_000u64;
+        let boot = n - 5_000_000;
+        let t = vec![(1000, Some(1), n - 3600), (824, Some(1000), n - 2), (600, Some(824), boot), (601, Some(600), boot + 5)];
+        let (on, drops) = super::descendants_report(&t, 1000, true);
+        assert_eq!(on, vec![824]);
+        assert_eq!(drops[0].reason, "parent_predates");
+    }
+
+    /// 한계 고정 — 좌석의 진짜 자식이 더 높은 권한으로 상승해 떠서 시작 시각이 0 으로 읽히면(부모는 앎) **버려진다**.
+    #[test]
+    fn wh_limit_elevated_real_child_with_unknown_start_is_dropped() {
+        let n = 1_800_000_000u64;
+        let t = vec![(10, Some(1), n - 100), (11, Some(10), 0), (12, Some(11), 0)];
+        assert!(descendants_from_table(&t, 10, true).is_empty());
+        assert_eq!(descendants_from_table(&t, 10, false), vec![11, 12]);
+    }
+
+    #[test]
+    fn wh_knob_off_by_env_or_policy_zero_only() {
+        use serde_json::json;
+        let on = crate::knobs::desc_start_guard_enabled_from;
+        assert!(on(None, None));
+        assert!(!on(Some("0"), None));
+        assert!(!on(Some(" 0 "), None));
+        assert!(on(Some("1"), None));
+        assert!(!on(None, Some(&json!({"CYS_DESC_START_GUARD": 0}))));
+        assert!(!on(None, Some(&json!({"CYS_DESC_START_GUARD": false}))));
+        assert!(!on(None, Some(&json!({"CYS_DESC_START_GUARD": "0"}))));
+        // 켜는 값은 파일에서 받지 않는다 — 환경이 끈 것을 파일이 켜지 못한다.
+        assert!(!on(Some("0"), Some(&json!({"CYS_DESC_START_GUARD": 1}))));
+        assert!(on(None, Some(&json!({"CYS_DESC_START_GUARD": 1}))));
+    }
+
+    /// 소스 핀 — 보정판은 감시 틱의 계수·중복 판정 루프(check_surfaces)와 좌석 닫기의 종료 목록 두 곳에서만 부른다.
+    #[test]
+    fn wh_guarded_collectors_called_only_from_two_sites() {
+        let src = include_str!("governance.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("프로덕션 구간");
+        let mut hits: Vec<&str> = Vec::new();
+        for line in prod.lines() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            if (line.contains("collect_descendants_guarded(") || line.contains("collect_descendants_with_cmd_src_guarded(") || line.contains("guarded_descendant_pids("))
+                && !t.starts_with("pub fn ")
+                && !t.starts_with("fn ")
+            {
+                hits.push(t);
+            }
+        }
+        // 호출처: 계수·중복 루프 1 · 닫기 목록 1 · 보정판 내부 위임 2(두 collect 함수가 guarded_descendant_pids 를 부름)
+        let callers: Vec<_> = hits.iter().filter(|h| !h.contains("guarded_descendant_pids(")).collect();
+        assert_eq!(callers.len(), 2, "보정판 호출처가 둘이 아니다: {callers:?}");
+        assert!(callers.iter().any(|h| h.contains("let descendants = collect_descendants_with_cmd_src_guarded(sys, *root_pid)")));
+        assert!(callers.iter().any(|h| h.contains("let descendants = collect_descendants_guarded(&sys, surface.pid)")));
+        assert_eq!(hits.iter().filter(|h| h.contains("guarded_descendant_pids(")).count(), 2);
+        // 다른 파일은 보정판을 부르지 않는다.
+        for (name, other) in [("handlers.rs", include_str!("handlers.rs")), ("usage.rs", include_str!("usage.rs"))] {
+            assert!(!other.contains("collect_descendants_guarded") && !other.contains("_guarded("), "{name} 가 보정판을 부른다");
+        }
     }
 
     /// 사실 고정 — 시계가 뒤로 가서 진짜 자식이 부모보다 30초 넘게 이르게 기록되면 **버려진다**(윈도우 적용분의 알려진 위험).
@@ -11777,7 +11877,7 @@ mod tests {
         let mut sys = sysinfo::System::new();
         sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         for root in [1u32, std::process::id()] {
-            assert_eq!(super::descendant_pids(&sys, root), super::legacy_descendant_pids(&sys, root));
+            assert_eq!(super::guarded_descendant_pids(&sys, root), super::descendant_pids(&sys, root));
         }
     }
 
@@ -11863,7 +11963,8 @@ mod tests {
         assert_eq!(on, off, "정상 트리에서는 종전과 같다");
     }
 
-    /// 윈도우 실측 — wininit.exe · csrss.exe 의 start_time(0 이면 "모름" — 값을 출력하고 건너뛴다) 과, 그 부모 번호를 새 프로세스가 받은 꼴의 가짜 표.
+    /// 윈도우 실표 시험(표준 사용자로 돌려도 통과) — wininit.exe · csrss.exe 의 start_time 을 측정해 찍고(0 = 핸들을 못 연 것으로 추정),
+    /// 그것들의 (죽은) 부모 번호를 새 프로세스(시작 = 지금)가 받은 꼴의 가짜 표에서 **읽히든 0 이든** 자손으로 세어지지 않는지 본다.
     #[cfg(windows)]
     #[test]
     fn wh_windows_protected_start_time_measure_and_guard() {
@@ -11873,48 +11974,40 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut table: Vec<(u32, Option<u32>, u64)> = Vec::new();
-        for (pid, p) in sys.processes() {
-            table.push((pid.as_u32(), p.parent().map(|x| x.as_u32()), p.start_time()));
-        }
-        let mut measured = Vec::new();
+        let table: Vec<(u32, Option<u32>, u64)> = sys
+            .processes()
+            .iter()
+            .map(|(pid, p)| (pid.as_u32(), p.parent().map(|x| x.as_u32()), p.start_time()))
+            .collect();
+        let mut seen_any = false;
         for (pid, p) in sys.processes() {
             let n = p.name().to_string_lossy().to_ascii_lowercase();
-            if n == "wininit.exe" || n == "csrss.exe" {
-                eprintln!(
-                    "WH-WIN-MEASURE {} pid={} ppid={:?} start_time={} (now={now})",
-                    n, pid.as_u32(), p.parent().map(|x| x.as_u32()), p.start_time()
-                );
-                measured.push((pid.as_u32(), p.parent().map(|x| x.as_u32()), p.start_time()));
+            if n != "wininit.exe" && n != "csrss.exe" {
+                continue;
             }
-        }
-        if measured.is_empty() {
-            eprintln!("WH-WIN-SKIP wininit.exe/csrss.exe 가 표에 없다 — 건너뜀");
-            return;
-        }
-        let known: Vec<_> = measured.iter().filter(|m| super::start_known(m.2)).cloned().collect();
-        if known.is_empty() {
-            eprintln!("WH-WIN-SKIP 보호 프로세스의 start_time 이 모두 0(모름) — 이 권한으로는 시작 시각을 못 읽어 종전 규칙으로는 걸러지지 않는다. 건너뜀");
-            return;
-        }
-        for (pid, ppid, st) in known {
+            seen_any = true;
+            let st = p.start_time();
+            let ppid = p.parent().map(|x| x.as_u32());
+            eprintln!(
+                "WH-WIN-MEASURE {n} pid={} ppid={ppid:?} start_time={st} handle_opened_estimate={} now={now}",
+                pid.as_u32(),
+                st != 0
+            );
             let Some(parent) = ppid else { continue };
-            // 부모 번호를 새 프로세스(시작 = 지금)가 받은 꼴 — 실제 표에 그 번호가 이미 없을 때만 가짜 행을 더한다.
             let mut t = table.clone();
-            if !t.iter().any(|r| r.0 == parent) {
-                t.push((parent, Some(1), now));
+            if let Some(r) = t.iter_mut().find(|r| r.0 == parent) {
+                r.2 = now;
             } else {
-                for r in t.iter_mut() {
-                    if r.0 == parent {
-                        r.2 = now;
-                    }
-                }
+                t.push((parent, Some(1), now));
             }
             let on = descendants_from_table(&t, parent, true);
             let off = descendants_from_table(&t, parent, false);
-            eprintln!("WH-WIN-GUARD parent={parent} child={pid} start={st} on_has={} off_has={}", on.contains(&pid), off.contains(&pid));
-            assert!(off.contains(&pid), "전제: 종전 로직은 센다");
-            assert!(!on.contains(&pid), "시작 시각이 부팅 때인 보호 프로세스는 자손으로 세지 않는다");
+            eprintln!("WH-WIN-GUARD parent={parent} child={} off_has={} on_has={}", pid.as_u32(), off.contains(&pid.as_u32()), on.contains(&pid.as_u32()));
+            assert!(off.contains(&pid.as_u32()), "전제: 종전 로직은 센다");
+            assert!(!on.contains(&pid.as_u32()), "{n}: 읽히든(부모보다 이름) 0 이든(자식 시작 모름) 자손으로 세지 않는다");
+        }
+        if !seen_any {
+            eprintln!("WH-WIN-SKIP wininit.exe/csrss.exe 가 표에 없다");
         }
     }
 
