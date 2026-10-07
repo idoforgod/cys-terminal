@@ -241,7 +241,77 @@ struct Ledger {
 // Windows 의 pack 락은 미획득이므로 프로세스 내부 RMW 도 직렬화한다. 파일락 순서는 항상 설정 → 원장이다.
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
 static PERSONAL_DESCRIBED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// ★(0.14.45 · 성찰 M3) `tui:"fullscreen"` 이 이미 있어 덮지 않은 폴더 — 프로세스당 폴더별 1회만 알린다(기동마다 같은 줄 반복 금지).
+static FULLSCREEN_DESCRIBED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 static ROLLBACK_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// fullscreen 렌더러 값 — Claude Code 가 업셀·다운셀 경로에서 스스로 쓰기도 하는 값(사용자 `/tui fullscreen` 과 구분할 수 없다).
+pub const TUI_FULLSCREEN: &str = "fullscreen";
+
+/// ★(성찰 M3) `AlreadySet` 이 **fullscreen** 인가(순수) — `AlreadySet` 의 값은 JSON 표기(`"\"fullscreen\""`)다.
+pub fn already_set_is_fullscreen(json_repr: &str) -> bool {
+    serde_json::from_str::<Value>(json_repr).ok().and_then(|v| v.as_str().map(|s| s == TUI_FULLSCREEN)).unwrap_or(false)
+}
+
+/// ★(성찰 M3) fullscreen 이 이미 적혀 있는 좌석의 안내 한 줄(순수) — launch 로그(`describe`)와 `cys doctor` 가 같은 문장을 쓴다.
+pub fn fullscreen_already_set_line(settings: &Path) -> String {
+    format!(
+        "{} 에 \"tui\": \"fullscreen\" 이 이미 적혀 있어 cys 는 덮지 않습니다(사용자 선택인지 Claude Code 의 전체화면 승격인지 구분할 수 없습니다) — \
+         이 좌석은 전체화면이라 마우스 휠 스크롤이 꺼집니다 · 그 pane 에서 /tui default 를 치면 다음 기동부터 classic(휠 스크롤)입니다",
+        settings.display()
+    )
+}
+
+/// ★(성찰 M3 · doctor) 설정 폴더의 `tui` 값 판독 결과.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TuiProbe {
+    /// 설정 폴더 자체가 없다(좌석 미사용).
+    NoConfigDir,
+    /// settings.json 이 없거나 `tui` 키가 없다(기동 때 cys 가 classic 을 넣는 대상).
+    Absent,
+    /// `"default"`(classic).
+    Classic,
+    /// `"fullscreen"` — 휠 스크롤이 꺼지는 좌석.
+    Fullscreen,
+    /// 그 밖 값(JSON 표기).
+    Other(String),
+    /// 판독 실패(사유).
+    Unreadable(String),
+}
+
+/// ★(성찰 M3 · doctor) 설정 폴더 하나의 `tui` 값(읽기 전용 · 판독기는 조정과 같은 `surgery::load`).
+pub fn tui_probe(config_dir: &Path) -> TuiProbe {
+    if !config_dir.is_dir() {
+        return TuiProbe::NoConfigDir;
+    }
+    match surgery::load(&config_dir.join("settings.json")) {
+        Err(e) => TuiProbe::Unreadable(e),
+        Ok(None) => TuiProbe::Absent,
+        Ok(Some((_, _, _, v))) => match v.as_ref().and_then(|v| v.get(TUI_KEY)) {
+            None => TuiProbe::Absent,
+            Some(Value::String(s)) if s == TUI_CLASSIC => TuiProbe::Classic,
+            Some(Value::String(s)) if s == TUI_FULLSCREEN => TuiProbe::Fullscreen,
+            Some(other) => TuiProbe::Other(other.to_string()),
+        },
+    }
+}
+
+/// ★(성찰 M3 · doctor) 원장(`~/.cys/claude-tui-written.json`)에 적힌 폴더들 — cys 가 classic 을 넣은 적 있는 좌석 폴더(= 알려진 좌석 폴더). 원장 없음·훼손 = 빈 목록.
+pub fn ledger_dirs(home: &Path) -> Vec<PathBuf> {
+    read_ledger(&home.join(LEDGER_FILE)).map(|(l, _)| l.entries.into_iter().map(|e| e.dir).collect()).unwrap_or_default()
+}
+
+/// ★(성찰 M3 · doctor) 알려진 좌석 폴더들을 중복 없이(정규화 비교) 판독한다 — 입력 순서 보존. 순수(각 폴더 stat·판독만).
+pub fn tui_probe_dirs(dirs: &[PathBuf]) -> Vec<(PathBuf, TuiProbe)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for d in dirs {
+        if seen.insert(normalize_profile_path(d, cfg!(windows))) {
+            out.push((d.clone(), tui_probe(d)));
+        }
+    }
+    out
+}
 
 /// `"tui": "default"` 를 최상위 객체의 마지막 멤버로 붙인 새 텍스트(순수). `text` 는 BOM 을 뗀 본문이고,
 /// `tui` 키가 이미 있으면 Err(호출부가 먼저 거르지만 이 함수도 덮어쓰기를 구조적으로 거부한다).
@@ -663,7 +733,16 @@ pub fn describe(o: &Outcome, config_dir: &Path) -> Option<String> {
     let p = config_dir.join("settings.json");
     let p = p.display();
     Some(match o {
-        Outcome::NoConfigDir | Outcome::AlreadySet(_) | Outcome::RolledBack(_) => return None,
+        Outcome::NoConfigDir | Outcome::RolledBack(_) => return None,
+        // ★(성찰 M3) fullscreen 이 이미 적혀 있으면 침묵하지 않는다 — 덮지는 않되(사용자 선택과 Claude Code 승격을 구분 못 한다) 폴더당 1회 안내.
+        Outcome::AlreadySet(v) if already_set_is_fullscreen(v) => {
+            let mut dirs = FULLSCREEN_DESCRIBED.get_or_init(|| Mutex::new(HashSet::new())).lock().ok()?;
+            if !dirs.insert(normalize_profile_path(config_dir, cfg!(windows))) {
+                return None;
+            }
+            fullscreen_already_set_line(&config_dir.join("settings.json"))
+        }
+        Outcome::AlreadySet(_) => return None,
         Outcome::PersonalProfile => {
             let mut dirs = PERSONAL_DESCRIBED.get_or_init(|| Mutex::new(HashSet::new())).lock().ok()?;
             if !dirs.insert(normalize_profile_path(config_dir, cfg!(windows))) {
@@ -981,6 +1060,43 @@ mod tests {
         assert_eq!(describe(&Outcome::PersonalProfile, &dir), None);
         assert_eq!(describe(&Outcome::PersonalProfile, &dir.join(".")), None);
         assert!(describe(&Outcome::PersonalProfile, &home.join(".claude-other")).is_some());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// ★(성찰 M3) 이미 `fullscreen` 이면 덮지 않되 침묵하지 않는다 — 폴더당 1회 `/tui default` 안내 · `default`·그 밖 값은 종전처럼 무언.
+    #[test]
+    fn claude_tui_already_fullscreen_is_described_once_with_tui_default_guidance() {
+        let home = sandbox("describe-fullscreen");
+        let dir = home.join(".claude-7");
+        assert!(already_set_is_fullscreen("\"fullscreen\"") && !already_set_is_fullscreen("\"default\"") && !already_set_is_fullscreen("null") && !already_set_is_fullscreen("fullscreen"));
+        let line = describe(&Outcome::AlreadySet("\"fullscreen\"".into()), &dir).expect("첫 안내");
+        assert!(line.contains("fullscreen") && line.contains("/tui default") && line.contains("휠 스크롤") && line.contains("덮지 않습니다"), "{line}");
+        assert_eq!(describe(&Outcome::AlreadySet("\"fullscreen\"".into()), &dir), None, "같은 폴더는 1회");
+        assert_eq!(describe(&Outcome::AlreadySet("\"fullscreen\"".into()), &dir.join(".")), None, "정규화된 같은 폴더");
+        assert!(describe(&Outcome::AlreadySet("\"fullscreen\"".into()), &home.join(".claude-8")).is_some());
+        assert_eq!(describe(&Outcome::AlreadySet("\"default\"".into()), &home.join(".claude-9")), None, "classic 은 알릴 것 없음");
+        assert_eq!(describe(&Outcome::AlreadySet("null".into()), &home.join(".claude-9")), None);
+        // doctor 판독기 — 폴더 없음 · 키 없음 · default · fullscreen · 그 밖 · 판독 실패(심볼릭 링크).
+        assert_eq!(tui_probe(&home.join("nope")), TuiProbe::NoConfigDir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(tui_probe(&dir), TuiProbe::Absent, "settings.json 없음");
+        let s = dir.join("settings.json");
+        std::fs::write(&s, "{\"hooks\":{}}").unwrap();
+        assert_eq!(tui_probe(&dir), TuiProbe::Absent);
+        std::fs::write(&s, "{\"tui\":\"default\"}").unwrap();
+        assert_eq!(tui_probe(&dir), TuiProbe::Classic);
+        std::fs::write(&s, "\u{feff}{\n  \"tui\": \"fullscreen\"\n}\n").unwrap();
+        assert_eq!(tui_probe(&dir), TuiProbe::Fullscreen);
+        std::fs::write(&s, "{\"tui\":null}").unwrap();
+        assert_eq!(tui_probe(&dir), TuiProbe::Other("null".into()));
+        std::fs::write(&s, "{not json").unwrap();
+        assert!(matches!(tui_probe(&dir), TuiProbe::Unreadable(_)));
+        // 중복 폴더는 한 번 · 원장 폴더 열거(없으면 빈 목록).
+        std::fs::write(&s, "{\"tui\":\"fullscreen\"}").unwrap();
+        let got = tui_probe_dirs(&[dir.clone(), dir.join("."), home.join("nope")]);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0].1, TuiProbe::Fullscreen);
+        assert!(ledger_dirs(&home).is_empty());
         let _ = std::fs::remove_dir_all(home);
     }
 

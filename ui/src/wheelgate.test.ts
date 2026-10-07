@@ -19,6 +19,9 @@ import {
   type WheelTermView,
   type WheelLedgerView,
 } from "./wheelgate";
+// ★(0.14.45 · 성찰 M4) 억제 안내 1회 게이트 — 별도 import(위 줄들은 기존 단언의 입력).
+import { WinWheelNoticeGate, WIN_WHEEL_NOTICE_TEXT, WIN_WHEEL_NOTICE_TITLE } from "./wheelgate";
+import { readFileSync } from "node:fs";
 
 const base: WheelGateState = {
   altActive: true,
@@ -335,5 +338,59 @@ describe("술어 입력 조립 — 오배선 검출(장부 접근자·xterm 리�
     const m = macGateInputs(termView(true, false), claudeLedger, true, true);
     expect(m.allowAppMouse).toBe(true);
     expect(m.isWindows).toBe(true); // 현 배선에서는 도달 불가 — 술어 인터페이스 동결의 잔여항
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ★(0.14.45 · 성찰 M4) Windows 휠 억제 안내 — pane 당 **정확히 한 번**(폭주 금지) · 억제가 아닌 호출은 기록하지 않는다 · 닫힌 pane 은 거둔다.
+describe("Windows 휠 억제 안내 — pane 당 한 번", () => {
+  it("첫 억제에만 참 · 같은 pane 의 두 번째 억제는 거짓 · 다른 pane 은 따로", () => {
+    const g = new WinWheelNoticeGate();
+    expect(g.shouldNotify("sock#1", true)).toBe(true);
+    expect(g.shouldNotify("sock#1", true)).toBe(false);
+    expect(g.shouldNotify("sock#1", true)).toBe(false);
+    expect(g.shouldNotify("sock#2", true)).toBe(true);
+    expect(g.size).toBe(2);
+  });
+  it("억제가 아닌 호출은 소비도 기록도 하지 않는다 — 나중에 억제가 걸리면 그때 한 번", () => {
+    const g = new WinWheelNoticeGate();
+    for (let i = 0; i < 50; i++) expect(g.shouldNotify("sock#1", false)).toBe(false);
+    expect(g.size).toBe(0);
+    expect(g.shouldNotify("sock#1", true)).toBe(true);
+    expect(g.shouldNotify("sock#1", false)).toBe(false);
+    expect(g.shouldNotify("sock#1", true)).toBe(false);
+  });
+  it("폭주 없음 — 한 pane 에서 억제 1000회 연속이어도 안내 1회", () => {
+    const g = new WinWheelNoticeGate();
+    let n = 0;
+    for (let i = 0; i < 1000; i++) if (g.shouldNotify("sock#9", true)) n++;
+    expect(n).toBe(1);
+  });
+  it("pane 을 닫으면(forget) 집합에서 빠지고 · 새 pane(재부착)은 다시 한 번", () => {
+    const g = new WinWheelNoticeGate();
+    expect(g.shouldNotify("sock#1", true)).toBe(true);
+    g.forget("sock#1");
+    expect(g.size).toBe(0);
+    expect(g.shouldNotify("sock#1", true)).toBe(true);
+    g.forget("never-seen"); // 없는 키는 무동작
+  });
+  it("문안 — 한국어 · /tui default 처방 · '다음부터'(지금 당장이 아니라 다음 기동) 를 말한다", () => {
+    expect(WIN_WHEEL_NOTICE_TEXT).toContain("Claude 전체화면 모드");
+    expect(WIN_WHEEL_NOTICE_TEXT).toContain("/tui default");
+    expect(WIN_WHEEL_NOTICE_TEXT).toContain("다음부터");
+    expect(WIN_WHEEL_NOTICE_TITLE.length).toBeGreaterThan(0);
+  });
+  it("배선 핀(main.ts) — win 갈래의 휠 핸들러 안에서만 shouldNotify · 토스트 문안은 상수 · 닫을 때 forget · 모듈 인스턴스 하나", () => {
+    const src = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
+    expect(src.split("new WinWheelNoticeGate(").length - 1).toBe(1);
+    const win = src.slice(src.indexOf('wheelKind === "win"'), src.indexOf("const un1 = await listen(ev.output_event"));
+    expect(win).toContain("winWheelNotice.shouldNotify(noticeKey, suppressed)");
+    expect(win).toContain("toast(\"health\", WIN_WHEEL_NOTICE_TITLE, WIN_WHEEL_NOTICE_TEXT)");
+    expect(win).toContain("return !suppressed;");
+    // mac 갈래에는 안내가 없다(억제가 수 ms 과도구간뿐이라 알릴 것이 없다).
+    const mac = src.slice(src.indexOf('wheelKind === "mac"'), src.indexOf('wheelKind === "win"'));
+    expect(mac).not.toContain("shouldNotify");
+    const destroy = src.slice(src.indexOf("function destroyPaneRuntime("), src.indexOf("// ---------- pane drag"));
+    expect(destroy).toContain("winWheelNotice.forget(paneKey(sid, socket))");
   });
 });

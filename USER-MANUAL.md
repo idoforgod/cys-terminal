@@ -816,6 +816,12 @@ Control Center Live 의 계정 표가 "지금 어느 계정이 쓰이는가"를 
   · 그런데도 전체화면으로 뜨면 그 `settings.json` 에 `"tui": "fullscreen"` 이 이미 적혀 있거나
   (사용자 `/tui fullscreen` · Claude Code 전체화면 체험 승격) env `CLAUDE_CODE_NO_FLICKER=1` 이 걸린
   것입니다 — 그 pane 에서 `/tui default` 를 치세요.
+  · **침묵하지 않습니다(0.14.45 성찰 1회차 M3·M4)**: `"tui": "fullscreen"` 이 이미 적혀 있으면 cys 는 덮지 않되(사용자 선택인지
+    Claude Code 의 승격인지 구분할 수 없습니다) 기동 로그에 폴더당 한 번 「… 이미 적혀 있어 cys 는 덮지 않습니다 … /tui default」 를
+    찍고, `cys doctor` 의 `claude-tui-fullscreen` 항목(Windows 전용 · 읽기 전용)이 알려진 좌석 설정 폴더(이 레인의 실소비 폴더 ·
+    부서 팩이 시드한 계정 폴더 · 원장 `~/.cys/claude-tui-written.json` 의 폴더)에서 fullscreen 인 곳을 경고로 보여 줍니다. 또 그
+    pane 에서 **휠이 처음 억제되는 순간** 화면에 한 번만 「이 창은 Claude 전체화면 모드라 마우스 휠 스크롤이 꺼져 있습니다 — 그 창에서
+    /tui default 를 실행하면 다음부터 휠로 스크롤됩니다」 토스트가 뜹니다(pane 당 1회 · 닫으면 초기화).
   · **끄는 법**: PowerShell `New-Item -ItemType File -Force $HOME\.cys\win-tui-classic-off`(다음
   기동부터 · 되돌리기 `Remove-Item $HOME\.cys\win-tui-classic-off`) · env `CYS_WIN_TUI_CLASSIC_OFF=1`
   도 동등(GUI 가 상속한 값만 읽으므로 `setx` 후 GUI 재시작). 끄면 **이후 기록을 멈추고, 원장에 적힌

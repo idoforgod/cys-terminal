@@ -198,6 +198,9 @@ import { MouseTrackingFilter, MOUSE_ALL_OFF } from "./trackfilter";
 import {
   shouldSuppressWheel,
   shouldSuppressWheelWin,
+  WinWheelNoticeGate,
+  WIN_WHEEL_NOTICE_TEXT,
+  WIN_WHEEL_NOTICE_TITLE,
   wheelHandlerKind,
   macGateInputs,
   winGateInputs,
@@ -2170,6 +2173,8 @@ let groups: GroupMeta[] = []; // 06: 그룹 메타 배열(진실원=localStorage
 let groupCounter = 1; // 06: 그룹 id 발급(ws의 wsCounter와 분리)
 let focusedSid: number | null = null;
 const panes = new Map<string, PaneRuntime>(); // 키 = paneKey(sid, socket)
+// ★(0.14.45 · 성찰 M4) Windows 휠 억제 안내 — pane 키당 1회(wheelgate.WinWheelNoticeGate · 순수 판정 · 시험 고정).
+const winWheelNotice = new WinWheelNoticeGate();
 // 부서 데몬 socket_slug(F3 백엔드 단일진실) → socket 경로. launch_dept_daemon 반환·daemon-event로 채운다.
 const socketForSlug = new Map<string, string>();
 // 사이드바 노드 신호 캐시(B3) — org.status 응답을 워크스페이스 행 집계용으로 보관.
@@ -3161,9 +3166,13 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
       () => !shouldSuppressWheel(macGateInputs(term, trackFilter, allowAppMouse, IS_WINDOWS)),
     );
   } else if (wheelKind === "win") {
-    term.attachCustomWheelEventHandler(
-      () => !shouldSuppressWheelWin(winGateInputs(term, trackFilter, allowAppMouse)),
-    );
+    // ★(0.14.45 · 성찰 M4) 억제가 **처음** 걸리는 pane 마다 한 번만 안내(폭주 금지 — pane 키당 1회 · 닫히면 거둔다). 억제 판정 자체는 그대로다.
+    const noticeKey = paneKey(sid, socket);
+    term.attachCustomWheelEventHandler(() => {
+      const suppressed = shouldSuppressWheelWin(winGateInputs(term, trackFilter, allowAppMouse));
+      if (winWheelNotice.shouldNotify(noticeKey, suppressed)) toast("health", WIN_WHEEL_NOTICE_TITLE, WIN_WHEEL_NOTICE_TEXT);
+      return !suppressed;
+    });
   }
   const un1 = await listen(ev.output_event, (e) => {
     outStamp.t = Date.now();
@@ -3216,6 +3225,7 @@ function destroyPaneRuntime(sid: number, socket?: string) {
   rt.term.dispose();
   rt.el.remove();
   panes.delete(paneKey(sid, socket));
+  winWheelNotice.forget(paneKey(sid, socket)); // ★(M4) 휠 억제 안내 1회 기록도 pane 과 함께 거둔다
 }
 
 // ---------- pane drag 이동 (탭을 끌어 자유 배치) ----------

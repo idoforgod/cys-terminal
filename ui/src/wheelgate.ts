@@ -189,6 +189,36 @@ export function shouldSuppressWheelWin(s: WinWheelGateState): boolean {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ★(0.14.45 · 성찰 M4) Windows 휠 억제 **안내** — 억제가 처음 걸리는 pane 마다 한 번만(폭주 금지) 토스트를 띄운다.
+//
+// 왜: 억제된 pane 에서 휠은 **완전 무동작**이다((d) 정직 고지). 사용자는 "휠이 아무것도 안 한다" 만 보고 원인(Claude Code 전체화면
+// 렌더러 · settings 의 `tui:"fullscreen"` — cys 는 덮지 않는다)을 알 길이 없었다(0.14.45 성찰 1회차 M3/M4: 침묵 금지). 처방은 하나뿐이다 —
+// 그 창에서 `/tui default`(Claude Code 가 classic 으로 다시 시작하고 설정에 저장 · 다음 기동부터 유지).
+// 계약: 판정은 순수(DOM·토스트 무관) · pane 키당 **정확히 한 번** · 억제가 아닌 호출은 소비하지 않는다(처음 억제가 걸리는 순간에만 참) ·
+// pane 이 닫히면 `forget` 으로 키를 거둔다(재부착 pane 은 새 pane). 억제 자체(술어 반환값)는 이 안내와 무관하다.
+export const WIN_WHEEL_NOTICE_TITLE = "휠 스크롤 꺼짐";
+export const WIN_WHEEL_NOTICE_TEXT =
+  "이 창은 Claude 전체화면 모드라 마우스 휠 스크롤이 꺼져 있습니다 — 그 창에서 /tui default 를 실행하면 다음부터 휠로 스크롤됩니다";
+
+export class WinWheelNoticeGate {
+  private readonly shown = new Set<string>();
+  /** 이 호출이 pane 의 **첫 억제**인가 — 참이면 호출자가 안내를 한 번 띄운다. 억제가 아니면 언제나 거짓(기록도 하지 않는다). */
+  shouldNotify(paneKey: string, suppressed: boolean): boolean {
+    if (!suppressed || this.shown.has(paneKey)) return false;
+    this.shown.add(paneKey);
+    return true;
+  }
+  /** pane 이 닫혔다 — 키를 거둔다(집합이 pane 수명과 같이 유계). */
+  forget(paneKey: string): void {
+    this.shown.delete(paneKey);
+  }
+  /** 시험·진단용 — 지금까지 안내한 pane 수. */
+  get size(): number {
+    return this.shown.size;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 배선 계층 — main.ts 가 들고 있던 판정을 순수 함수로 내린다(성찰3 테스트렌즈 major ×2).
 //
 // 왜 여기로 옮기는가: 술어(위 둘)와 장부 접근자(trackfilter)는 각각 변이 전건에 죽지만, **둘을

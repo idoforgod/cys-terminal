@@ -8095,6 +8095,8 @@ struct DoctorCtx {
     /// ★0.14.42 agy 상태줄 점검의 홈(`~/.gemini/antigravity-cli/settings.json` 의 기준). None = 점검 안 함(Skip) —
     /// 테스트 기본값이다(실 홈의 agy 설정을 진단·수리하지 않는다).
     agy_home: Option<std::path::PathBuf>,
+    /// ★0.14.45(성찰 M3) claude 렌더러(tui) 점검이 원장(`~/.cys/claude-tui-written.json`)을 읽는 홈. None = 원장 폴더를 보지 않는다(테스트 기본값).
+    tui_home: Option<std::path::PathBuf>,
 }
 
 /// settings.json 루트에 우리 SessionStart hook 명령이 등록돼 있는가.
@@ -8953,6 +8955,63 @@ fn probe_failure_note(pack_dir: &std::path::Path) -> String {
     )
 }
 
+/// ★(0.14.45 · 성찰 M3 · Windows) 알려진 좌석 claude 설정 폴더에 `"tui": "fullscreen"` 이 적혀 있는가 — cys 는 덮지 않지만(사용자 선택인지 Claude Code 승격인지 구분 못 한다)
+/// 그 좌석은 휠 스크롤이 꺼지므로 **보이게** 한다. 알려진 폴더 = 이 레인의 실소비 폴더 + 부서 팩 agents.json 이 시드한 계정 폴더 + 원장(`~/.cys/claude-tui-written.json`)의 폴더.
+/// 읽기 전용(--fix 없음 · 수리는 사람이 그 pane 에서 `/tui default`). 비-Windows 는 Skip(classic 보장 자체가 Windows 전용).
+fn diag_claude_tui(ctx: &DoctorCtx) -> DiagItem {
+    let mut dirs = vec![ctx.consumed_config_dir.clone()];
+    if let Some(d) = dept_seeded_acct_dir(&ctx.pack_dir) {
+        dirs.push(d);
+    }
+    if let Some(home) = &ctx.tui_home {
+        dirs.extend(cys::claude_tui::ledger_dirs(home));
+    }
+    diag_claude_tui_for(&dirs, cfg!(windows))
+}
+
+/// [`diag_claude_tui`] 의 본체(OS 주입 — mac 검체가 Windows 갈래를 잰다).
+fn diag_claude_tui_for(dirs: &[std::path::PathBuf], windows: bool) -> DiagItem {
+    use cys::claude_tui::{tui_probe_dirs, TuiProbe};
+    let item = |status, detail: String, action: String| DiagItem { name: "claude-tui-fullscreen", status, detail, action };
+    if !windows {
+        return item(DiagStatus::Skip, "Windows 전용 점검(classic 렌더러 보장) — 이 OS 는 대상 아님".into(), String::new());
+    }
+    let probed = tui_probe_dirs(dirs);
+    let fullscreen: Vec<&std::path::PathBuf> = probed.iter().filter(|(_, p)| *p == TuiProbe::Fullscreen).map(|(d, _)| d).collect();
+    let unreadable: Vec<String> = probed
+        .iter()
+        .filter_map(|(d, p)| match p {
+            TuiProbe::Unreadable(e) => Some(format!("{}({e})", d.join("settings.json").display())),
+            _ => None,
+        })
+        .collect();
+    let checked = probed.iter().filter(|(_, p)| *p != TuiProbe::NoConfigDir).count();
+    if !fullscreen.is_empty() {
+        return item(
+            DiagStatus::Warn,
+            format!(
+                "{}개 좌석 설정 폴더에 \"tui\": \"fullscreen\" 이 적혀 있다 — 그 좌석은 전체화면이라 마우스 휠 스크롤이 꺼진다(cys 는 덮지 않는다: 사용자 선택인지 \
+                 Claude Code 의 전체화면 승격인지 구분할 수 없다): {}{}",
+                fullscreen.len(),
+                fullscreen.iter().map(|d| d.join("settings.json").display().to_string()).collect::<Vec<_>>().join(" · "),
+                if unreadable.is_empty() { String::new() } else { format!(" · 판독 실패: {}", unreadable.join(" · ")) }
+            ),
+            "그 좌석 pane 에서 `/tui default` 를 치면 Claude Code 가 classic(휠 스크롤)으로 다시 시작하고 설정에 저장된다(다음 기동부터 유지) — 자동 수리 대상 아님(사용자 값 불가침)".into(),
+        );
+    }
+    if !unreadable.is_empty() {
+        return item(
+            DiagStatus::Warn,
+            format!("좌석 설정 파일을 판독하지 못했다 — {}", unreadable.join(" · ")),
+            "파일을 고친 뒤 다시 점검(판독 불가 좌석의 렌더러는 알 수 없다)".into(),
+        );
+    }
+    item(
+        DiagStatus::Ok,
+        format!("알려진 좌석 설정 폴더 {checked}곳에 fullscreen 없음(tui 없음 = 기동 때 cys 가 classic 을 넣는다 · default = classic)"),
+        String::new(),
+    )
+}
 
 #[cfg(unix)]
 fn doctor_socket_connectable(p: &std::path::Path) -> bool {
@@ -10074,6 +10133,8 @@ fn run_doctor_diagnostics(ctx: &DoctorCtx, fix: bool) -> Vec<DiagItem> {
         diag_config_dir_target(ctx),
         // ★0.14.42 agy 상태줄 자동 연결(사용자 설정 불가침 · --fix 는 비었을 때만 연결 · base 팩 전용).
         diag_agy_statusline(ctx, fix),
+        // ★0.14.45(성찰 M3 · Windows) 좌석 설정에 tui=fullscreen 이 이미 적혀 있으면 휠 스크롤이 꺼진다 — 덮지 않되 보이게(읽기 전용).
+        diag_claude_tui(ctx),
         diag_orphan_socket(ctx, fix),
         diag_stale_lock(ctx, fix),
         diag_staging_residue(ctx, fix),
@@ -10497,6 +10558,7 @@ fn run_doctor(fix: bool, json_out: bool) -> i32 {
             .and_then(|p| p.parent().map(|d| d.to_path_buf())),
         consumed_config_dir: std::path::PathBuf::from(cys::resolve_claude_config_dir()),
         agy_home: dirs::home_dir(),
+        tui_home: dirs::home_dir(),
     };
     let items = run_doctor_diagnostics(&ctx, fix);
     let fails = items.iter().filter(|i| i.status == DiagStatus::Fail).count();
@@ -31688,6 +31750,7 @@ mod tests {
             // 기본은 실소비 폴더 = settings_paths[0] 의 폴더(같은 파일) — 기존 hook 검체의 의미 보존.
             consumed_config_dir: base.to_path_buf(),
             agy_home: None, // 기본은 agy 점검 Skip(다른 doctor 테스트에 부작용 0)
+            tui_home: None, // 기본은 원장 미판독(실 홈 무접촉)
         }
     }
 
@@ -32606,6 +32669,45 @@ mod tests {
         std::fs::write(&p, agy::probe_failure_record_text_at(env!("CARGO_PKG_VERSION"), "timeout", two_h_ago - 23 * 3600)).unwrap();
         let it = diag_agy_statusline(&ctx, false);
         assert!(it.detail.contains("25시간 전") && it.detail.contains("24시간이 지나 다음 설치"), "{}", it.detail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ★(0.14.45 · 성찰 M3 · doctor) Windows 갈래: 알려진 좌석 폴더에 tui=fullscreen 이면 Warn + `/tui default` 안내 · 없으면 Ok · 판독 실패는 Warn · 비-Windows 는 Skip.
+    /// 폴더 목록 = 실소비 폴더 + 부서 팩 시드 폴더 + 원장 폴더(중복 제거). 쓰기 0(읽기 전용).
+    #[test]
+    fn doctor_claude_tui_reports_fullscreen_seats_on_windows_and_skips_elsewhere() {
+        let base = std::env::temp_dir().join(format!("cys-doc-tui-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let a = base.join("home").join(".claude-4");
+        let b = base.join("home").join(".cys").join("claude");
+        let c = base.join("home").join(".claude-9");
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(a.join("settings.json"), "{\"tui\":\"fullscreen\"}").unwrap();
+        std::fs::write(b.join("settings.json"), "{\"tui\":\"default\"}").unwrap();
+        // c: settings.json 없음(기동 때 classic 을 넣는 대상)
+        let dirs = vec![a.clone(), b.clone(), c.clone(), a.clone(), base.join("nope")];
+        let it = diag_claude_tui_for(&dirs, false);
+        assert_eq!(it.status, DiagStatus::Skip, "{}", it.detail);
+        let it = diag_claude_tui_for(&dirs, true);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(it.detail.starts_with("1개 좌석 설정 폴더에") && it.detail.contains(&a.join("settings.json").display().to_string()) && it.detail.contains("휠 스크롤이 꺼진다"), "{}", it.detail);
+        assert!(!it.detail.contains(&b.display().to_string()), "classic 좌석은 목록에 없다: {}", it.detail);
+        assert!(it.action.contains("/tui default") && it.action.contains("자동 수리 대상 아님"), "{}", it.action);
+        assert_eq!(std::fs::read_to_string(a.join("settings.json")).unwrap(), "{\"tui\":\"fullscreen\"}", "읽기 전용");
+        std::fs::write(a.join("settings.json"), "{\"tui\":\"default\"}").unwrap();
+        let it = diag_claude_tui_for(&dirs, true);
+        assert_eq!(it.status, DiagStatus::Ok, "{}", it.detail);
+        assert!(it.detail.contains("3곳"), "중복·부재 폴더를 뺀 수: {}", it.detail);
+        std::fs::write(c.join("settings.json"), "{broken").unwrap();
+        let it = diag_claude_tui_for(&dirs, true);
+        assert_eq!(it.status, DiagStatus::Warn);
+        assert!(it.detail.contains("판독하지 못했다"), "{}", it.detail);
+        // 배선: 기본 ctx(원장 홈 없음)는 실소비 폴더만 — 비-Windows 에서는 Skip · 목록 포함.
+        let items = run_doctor_diagnostics(&doctor_ctx_at(&base), false);
+        let it = items.iter().find(|i| i.name == "claude-tui-fullscreen").expect("진단 목록에 없다");
+        assert_eq!(it.status, if cfg!(windows) { DiagStatus::Ok } else { DiagStatus::Skip });
         let _ = std::fs::remove_dir_all(&base);
     }
 
