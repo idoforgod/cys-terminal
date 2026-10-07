@@ -14186,6 +14186,22 @@ fn apply_config_dir_override(
     }
 }
 
+/// 0.14.45 렌더러 설정의 표적 — 이 좌석 claude 가 쓰는 설정 폴더(순수). `bin == "claude"` 이고 spec env 에
+/// `CLAUDE_CONFIG_DIR` 가 있을 때만 그 값을 **이 프로세스 env 로 해소**한다([`resolve_env_value`] — Windows 의
+/// launch-agent 가 surface.create 로 pane 에 싣는 값과 같은 해소). restore 면 호출부가 이미
+/// [`apply_config_dir_override`] 로 기록된 원 폴더를 넣어 두었다. 키가 없거나 비면 `None`(표적 없음 = 쓰지 않음 —
+/// 추측한 폴더에 쓰지 않는다).
+fn seat_claude_config_dir(env_pairs: &[(String, String)], bin: &str) -> Option<String> {
+    if bin != "claude" {
+        return None;
+    }
+    env_pairs
+        .iter()
+        .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+        .map(|(_, v)| resolve_env_value(v))
+        .filter(|v| !v.trim().is_empty())
+}
+
 /// ★(W4 · D5 관측) launch-agent ready 판정 직후의 alternate-screen 통지 판정 — 순수 함수.
 ///
 /// 입력 `alt_screen` = 데몬 surface.list 의 동명 필드(`as_bool()` — **필드 부재(구 데몬)는
@@ -14237,9 +14253,15 @@ fn alt_screen_notice(
     if is_windows {
         return Some((
             "[launch-agent] hint: claude 가 alternate screen(fullscreen)으로 떴습니다 — Windows \
-             fullscreen 은 비지원(릴리스 노트 '알려진 제한'). fullscreen 여부는 OS 가 아니라 \
-             계정·롤아웃이 결정하므로 설정을 만진 적이 없어도 이렇게 뜹니다: settings 의 tui 키 \
-             제거는 판정을 서버측 기능 게이트에 넘길 뿐 inline 을 보장하지 않습니다. 휠→방향키 \
+             fullscreen 은 비지원(릴리스 노트 '알려진 제한') · 이 pane 에서는 휠로 대화가 올라가지 \
+             않습니다. **가장 빠른 해결: 이 pane 의 claude 에서 `/tui default`** (classic 화면으로 \
+             다시 시작하고 그 설정 폴더의 다음 세션에도 남습니다). 0.14.45 부터 cys 는 Windows 에서 \
+             claude 를 띄우기 직전 좌석 설정 폴더 settings.json 에 tui 키가 **없을 때만** \
+             \"tui\": \"default\"(classic)를 넣습니다 — 그런데도 fullscreen 이면 그 파일의 tui 가 \
+             'fullscreen' 으로 이미 적혀 있거나(/tui fullscreen · Claude Code 체험 승격 — cys 는 \
+             덮지 않습니다) env CLAUDE_CODE_NO_FLICKER=1 이 걸린 것이고, 그 기록을 끈 경우 \
+             (CYS_WIN_TUI_CLASSIC_OFF=1 · ~/.cys/win-tui-classic-off)에는 판정이 Claude Code 의 \
+             계정·롤아웃 게이트로 돌아갑니다. 휠→방향키 \
              합성 오염은 GUI 의 Windows 휠 가드가 막습니다 — 끄려면 PowerShell 에서 \
              `New-Item -ItemType File -Force $HOME\\.cys\\win-wheel-guard-off` 를 실행한 뒤 \
              **새 pane 을 여세요** (`touch` 는 PowerShell·cmd 에 없는 명령입니다. 되돌리기 \
@@ -14705,6 +14727,19 @@ fn boot_agent_on_surface(
     // 있다는 이유로 "Windows 는 env 로 막힌다"고 판단하지 마라 — 규약 단일화(사본 금지)를 위해
     // 두 소비처가 모두 lib 헬퍼를 경유할 뿐이다.
     cys::inject_claude_alt_screen_default(&mut env_pairs, extract_bin(&cmd, agent));
+    // ★0.14.45 휠 스크롤 수리 A — Windows 좌석 claude 의 classic 렌더러 보장(`cys::claude_tui` 모듈 doc 정본).
+    //   이 함수는 launch-agent(GUI 포함) · node-recover · in-seat restore 가 모두 지나는 기동 직전 지점이라, 여기
+    //   한 곳에서 좌석 설정 폴더 settings.json 에 `tui` 가 **없을 때만** "default" 를 넣는다(D5 env 와 달리 설정
+    //   파일은 기존 pane 재기동에도 닿는다). 게이트(Windows ∧ ¬`CYS_WIN_TUI_CLASSIC_OFF`)는 그 모듈이 건다.
+    //   ★결과가 무엇이든 기동은 계속한다 — 로그 1줄뿐이다(치명위험 ④: 이 기록이 claude 기동을 막으면 안 된다).
+    if let Some(dir) = seat_claude_config_dir(&env_pairs, extract_bin(&cmd, agent)) {
+        let dir = std::path::PathBuf::from(dir);
+        if let Some(line) = cys::claude_tui::reconcile_for_launch(&dir)
+            .and_then(|o| cys::claude_tui::describe(&o, &dir))
+        {
+            eprintln!("[launch-agent] 렌더러 설정: {line}");
+        }
+    }
     let (send, _send_env) = render_launch(&cmd, &env_pairs);
     // ★(W2 · B4) **기동 send 직전 line_count 스냅샷** — readiness 판정의 시간 귀속 기준선.
     //
@@ -26381,6 +26416,25 @@ mod tests {
         assert!(alt_screen_notice(Some(true), "codex", true, false).is_none());
         // 기타 OS(linux 등) → 무발화.
         assert!(alt_screen_notice(Some(true), "claude", false, false).is_none());
+    }
+
+    /// 0.14.45 렌더러 설정 표적(순수) — claude 이고 spec env 에 CLAUDE_CONFIG_DIR 가 있을 때만, 해소된 값.
+    /// 키 부재·빈 값·타 에이전트는 None(추측한 폴더에 쓰지 않는다).
+    #[test]
+    fn seat_claude_config_dir_truth_table() {
+        let pairs = |v: &str| vec![("CLAUDE_CONFIG_DIR".to_string(), v.to_string())];
+        assert_eq!(seat_claude_config_dir(&pairs("/x/acct"), "claude").as_deref(), Some("/x/acct"));
+        assert_eq!(seat_claude_config_dir(&pairs("/x/acct"), "codex"), None, "claude 한정");
+        assert_eq!(seat_claude_config_dir(&pairs(""), "claude"), None, "빈 값 = 표적 없음");
+        assert_eq!(seat_claude_config_dir(&[], "claude"), None, "키 부재 = 표적 없음");
+        // `${VAR:-default}` 템플릿은 이 프로세스 env 로 해소된다(Windows surface.create 주입과 같은 해소).
+        let home = cys::home_dir().to_string_lossy().into_owned();
+        let got = seat_claude_config_dir(
+            &pairs("${CYS_TEST_UNSET_ACCOUNT_DIR_0145:-$HOME/.cys/claude}"),
+            "claude",
+        )
+        .expect("템플릿 해소");
+        assert_eq!(got, format!("{home}/.cys/claude"));
     }
 
     // ★루트 cwd 교정(2026-07-15 실사고): 루트류는 home으로, 정상 경로는 불변.
