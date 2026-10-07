@@ -136,6 +136,16 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 .ws-tab.active .ws-name { color: #fff; }
 .ws-tab.active .ws-sub { color: rgba(255, 255, 255, .75); }
 .ws-tab .ws-sub-pending { color: #58a6ff; animation: cc-blink 1.4s infinite; }
+/* ★0.14.45 노드별 계정 줄 — 같은 계정을 쓰는 노드 묶음(이름 굵게 + 역할). 좁은 폭에서는 묶음 단위로 줄바꿈된다. 이메일은 툴팁(title)에만. */
+.ws-tab .ws-accts {
+  display: flex; flex-wrap: wrap; column-gap: 8px; row-gap: 1px; min-width: 0;
+  font-size: calc(10.5px * var(--wsbar-font, 1)); color: #8b949e;
+}
+.ws-tab .ws-acct { min-width: 0; max-width: 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ws-tab .ws-acct-name { color: #c9d1d9; font-weight: 600; margin-right: 3px; }
+.ws-tab .ws-acct.unknown .ws-acct-name { color: var(--warn); font-weight: 400; }
+.ws-tab.active .ws-accts { color: rgba(255, 255, 255, .75); }
+.ws-tab.active .ws-acct-name { color: #fff; }
 /* 사이드바 노드 신호(B3): 상태 dot + 심각도 색 + 승인대기 배지 (CC_STATE working/idle/error 명명 재사용) */
 .ws-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
 .ws-dot.working { background: var(--ok); }
@@ -244,6 +254,9 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 #wsbar-usage .usage-inuse { flex: none; color: var(--ok); font-weight: 600; font-size: .92em; white-space: nowrap; }
 #wsbar-usage .usage-inuse-dot { color: var(--ok); margin-right: 3px; font-weight: 400; }
 #wsbar-usage .usage-other .usage-other-txt.usage-fold { text-align: left; } /* 잘려 나간 관측 전 계정 나열 — 라벨 목록이라 왼쪽 정렬 */
+/* ★0.14.45 사용처 — 이 계정을 지금 쓰는 부서·노드(역매핑). 줄 아래 작은 글씨 · 길면 줄바꿈. */
+#wsbar-usage .usage-users { margin-top: 1px; color: #8b949e; font-size: .9em; overflow-wrap: anywhere; }
+#wsbar-usage .usage-other + .usage-users { padding-left: 10px; }
 #wsbar-usage .usage-hidden { margin-top: 4px; color: #8b949e; overflow-wrap: anywhere; } /* 숨긴 계정 N — 다시 보이게 하는 곳 안내 */
 /* ★0.14.44 D1 보기 방식 전환 단추 — 머리줄 단추(.usage-head)의 형제(.usage-headrow 안). 같은 줄이라 머리줄 높이를 더 쓰지 않는다(패딩 0 · 줄높이 1.2). */
 #wsbar-usage .usage-headrow { flex: none; display: flex; align-items: center; gap: 4px; min-width: 0; }

@@ -2040,6 +2040,71 @@ pub fn seat_usage_wire(
     v
 }
 
+// ───────────────── ★0.14.45 좌석별 계정(`account`) — `surface.list`·`org.status` 좌석의 표시 전용 가산 키 ─────────────────
+//
+// 오너 요청(2026-10-07): "어느 부서·노드가 어느 계정을 쓰는지 몰라 pane 마다 `/config` 를 쳐야 한다." 데몬은 이미 좌석마다 설정 폴더와 그 폴더의
+// **현재** 신원을 안다([`SeatIdentityView`] — 경보·`in_use` 의 재료). 그 사실을 좌석 행에 그대로 싣는다 — 화면은 이 키를 `usage.accounts` 행의
+// (provider, account_id)와 맞춰 별명·이메일(툴팁)을 고른다. **새 IO 0**: 신원 표는 부른 쪽이 이미 만들었고(60초 캐시), 상태 구분은 캐시 엿보기([`peek_folder_state`])뿐이다.
+// ★결측은 값이 아니다 — 모르는 것은 `account_id: null` + 사유(`state`)로 보낸다. 추측(폴더 이름으로 계정을 짐작)하지 않는다.
+
+/// 좌석 에이전트 이름 → 계정 축 provider(`usage.accounts` 의 키와 같은 표기). 모르는 에이전트는 None — cys 가 그 신원을 읽는 경로가 없다.
+fn seat_provider(agent: &str) -> Option<&'static str> {
+    match agent {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "gemini" | "agy" | "antigravity" => Some("antigravity"),
+        _ => None,
+    }
+}
+
+/// ★순수: 좌석 하나의 `account` 객체. 에이전트 증거가 없는 좌석(셸)은 `null`.
+///   · claude: `who` 가 `Known(id)` 면 `state:"known"` + `account_id`. 폴더 미상이면 `"folder_unknown"`, 로그인 없음 확정이면 `"no_login"`, 읽지 못했으면 `"unread"` — 셋 다 `account_id:null`.
+///     `profile` 은 설정 폴더(`usage.accounts` 의 `profiles` 와 같은 홈 상대 표기) — 모를 때도 근거로 싣지만 **계정의 대용이 아니다**.
+///   · codex · antigravity: 이 데몬의 계정 축에 그 제공자의 계정은 하나(`default` — 기기의 로그인 하나)뿐이다 → `state:"known"` · `account_id:"default"`.
+///   · 그 밖 에이전트: `state:"unsupported"`(provider null).
+pub(crate) fn seat_account_json(agent: Option<&str>, folder: Option<&str>, who: Option<&FolderWho>, home: Option<&Path>) -> Value {
+    let Some(agent) = agent else {
+        return Value::Null;
+    };
+    let Some(provider) = seat_provider(agent) else {
+        return json!({"provider": Value::Null, "agent": agent, "account_id": Value::Null, "profile": Value::Null, "state": "unsupported"});
+    };
+    if provider != "claude" {
+        return json!({"provider": provider, "agent": agent, "account_id": "default", "profile": Value::Null, "state": "known"});
+    }
+    let profile = folder.map(|f| profile_short(home, Path::new(f)));
+    let (account_id, state) = match (folder, who) {
+        (None, _) => (None, "folder_unknown"),
+        (Some(_), Some(FolderWho::Known(id))) => (Some(id.clone()), "known"),
+        (Some(_), Some(FolderWho::NoLogin)) => (None, "no_login"),
+        (Some(_), _) => (None, "unread"),
+    };
+    json!({"provider": provider, "agent": agent, "account_id": account_id, "profile": profile, "state": state})
+}
+
+/// 좌석 id → `account` 객체 표 — `surface.list`·`org.status` 가 **surfaces 락을 잡기 전에** 한 번 만든다(락 순서: 신원 표는 이미 만들어졌고, 여기서는 신원 캐시 락을
+/// 폴더마다 순간 잡을 뿐이다 · 파일 IO 0). 표에 없는 좌석(종료 · 표를 만든 뒤 생성 · 수집 실패)은 부른 쪽이 `null` 로 싣는다.
+/// 신원 표의 `current_account` 가 없는데 캐시가 `Known` 이면(표를 만든 뒤 다른 요청이 읽었다) 표와 어긋나지 않게 `unread` 로 둔다 — 한 응답 안의 `usage.rate_in_use` 와 다른 사실을 말하지 않는다.
+pub fn seat_account_map(daemon: &Arc<Daemon>, view: &SeatIdentityView) -> HashMap<u64, Value> {
+    let mut out = HashMap::new();
+    if !view.collect_ok {
+        return out;
+    }
+    let home = account_home();
+    for s in &view.seats {
+        let who = match (&s.current_account, &s.folder) {
+            (Some(id), _) => Some(FolderWho::Known(id.clone())),
+            (None, Some(f)) => match peek_folder_state(daemon, f) {
+                FolderWho::Known(_) => Some(FolderWho::Unread),
+                other => Some(other),
+            },
+            (None, None) => None,
+        };
+        out.insert(s.surface_id, seat_account_json(s.agent.as_deref(), s.folder.as_deref(), who.as_ref(), home.as_deref()));
+    }
+    out
+}
+
 // ───────────────── ★0.14.43(B1) 현재 로그인 폴더(`current_profiles`) · 별명(`alias`) — `usage.accounts` 행의 표시 전용 가산 키 ─────────────────
 
 /// 별명 파일(`~/.cys/accounts.json`)의 확인 주기 하한(초) — 이 안에서는 stat 도 하지 않는다(사용량 RPC 폴링이 파일 접근을 늘리지 않게). 시계가 뒤로 가면(now < 마지막 확인) 만료로 본다.
@@ -5877,6 +5942,130 @@ mod tests {
             // 표 파서를 거쳐도 같다(별명 파일 → 표)
             let t = parse_alias_table("{\"aliases\":{\"k\":\"\\u202e업무\\u200b용\"}}".as_bytes());
             assert_eq!(t.get("k").map(String::as_str), Some("업무용"));
+        }
+    }
+
+    /// ★0.14.45 좌석별 계정(`account`) — 사이드바 부서 카드·사용량 패널 역매핑의 재료.
+    mod seat_account_0145 {
+        use super::b3_scenarios::{b3_login, b3_seat};
+        use super::*;
+
+        /// 순수 표 — claude 의 네 상태(known · folder_unknown · no_login · unread) · codex/agy 는 기기 로그인 하나(`default`) · 모르는 에이전트 · 셸(null).
+        /// 모르는 것은 `account_id: null` 이다 — 폴더 이름으로 계정을 짐작하지 않는다(결측은 값이 아니다).
+        #[test]
+        fn seat_account_json_table() {
+            let home = Path::new("/h");
+            let known = FolderWho::Known("u-1".into());
+            let cases: Vec<(&str, Option<&str>, Option<&str>, Option<&FolderWho>, Value)> = vec![
+                ("셸", None, None, None, Value::Null),
+                (
+                    "claude known",
+                    Some("claude"),
+                    Some("/h/.claude-4"),
+                    Some(&known),
+                    json!({"provider":"claude","agent":"claude","account_id":"u-1","profile":".claude-4","state":"known"}),
+                ),
+                (
+                    "claude 폴더 미상",
+                    Some("claude"),
+                    None,
+                    None,
+                    json!({"provider":"claude","agent":"claude","account_id":null,"profile":null,"state":"folder_unknown"}),
+                ),
+                (
+                    "claude 로그아웃",
+                    Some("claude"),
+                    Some("/h/.cys/claude"),
+                    Some(&FolderWho::NoLogin),
+                    json!({"provider":"claude","agent":"claude","account_id":null,"profile":".cys/claude","state":"no_login"}),
+                ),
+                (
+                    "claude 판독 실패",
+                    Some("claude"),
+                    Some("/h/.claude-2"),
+                    Some(&FolderWho::Unread),
+                    json!({"provider":"claude","agent":"claude","account_id":null,"profile":".claude-2","state":"unread"}),
+                ),
+                (
+                    "claude 캐시 항목 없음",
+                    Some("claude"),
+                    Some("/elsewhere/acct"),
+                    None,
+                    json!({"provider":"claude","agent":"claude","account_id":null,"profile":"/elsewhere/acct","state":"unread"}),
+                ),
+                (
+                    "codex",
+                    Some("codex"),
+                    None,
+                    None,
+                    json!({"provider":"codex","agent":"codex","account_id":"default","profile":null,"state":"known"}),
+                ),
+                (
+                    "agy(gemini 키)",
+                    Some("gemini"),
+                    None,
+                    None,
+                    json!({"provider":"antigravity","agent":"gemini","account_id":"default","profile":null,"state":"known"}),
+                ),
+                (
+                    "모르는 에이전트",
+                    Some("grok"),
+                    None,
+                    None,
+                    json!({"provider":null,"agent":"grok","account_id":null,"profile":null,"state":"unsupported"}),
+                ),
+            ];
+            for (what, agent, folder, who, want) in cases {
+                assert_eq!(seat_account_json(agent, folder, who, Some(home)), want, "{what}");
+            }
+        }
+
+        /// 실제 좌석으로 만든 표 — 같은 계정을 나눠 쓰는 두 좌석 · 다른 계정 좌석 · 로그아웃 폴더 · 폴더 미상 · codex · 셸 · 종료 좌석.
+        /// 로그인을 바꾸면(캐시 하한이 지난 뒤) 같은 좌석의 account_id 가 바뀐다 — 좌석을 다른 계정으로 다시 띄운 경우와 같다. 수집 실패면 표가 비어 전부 null.
+        #[test]
+        fn seat_account_map_follows_each_seats_current_folder_login() {
+            let dir = tmp("acct0145-daemon");
+            let home = tmp("acct0145-home");
+            let _g = test_home::set(&home);
+            let d = crate::state::Daemon::new(dir.join("cysd.sock"));
+            let fa = b3_login(&home, ".claude-4", "u-a", "a@example.test", 1);
+            let fb = b3_login(&home, ".claude-1", "u-b", "b@example.test", 2);
+            let fout = home.join(".claude-2");
+            std::fs::create_dir_all(&fout).unwrap(); // 신원 파일 없음 = 로그인 없음 확정
+            let master = b3_seat(&d, "master", "claude", Some(&fa));
+            let worker = b3_seat(&d, "worker", "claude", Some(&fa));
+            let cso = b3_seat(&d, "cso", "claude", Some(&fb));
+            let out = b3_seat(&d, "worker-2", "claude", Some(&fout));
+            let nofolder = b3_seat(&d, "worker-3", "claude", None);
+            let codex = b3_seat(&d, "reviewer-codex", "codex", None);
+            let gone = b3_seat(&d, "worker-4", "claude", Some(&fb));
+            gone.exited.store(true, Ordering::Relaxed);
+            let shell = d.create_surface(None, Some("sleep 30".into()), None, None, 24, 80).expect("create surface");
+            d.surfaces.lock().unwrap().insert(shell.id, shell.clone());
+            let t0 = crate::state::now_epoch();
+            let view = seat_identity_view_in(&d, Some(&home), t0);
+            let m = seat_account_map(&d, &view);
+            let acct = |id: u64| m.get(&id).cloned();
+            assert_eq!(acct(master.id).unwrap()["account_id"], json!("u-a"));
+            assert_eq!(acct(worker.id).unwrap()["account_id"], json!("u-a"), "같은 폴더를 쓰는 두 좌석은 같은 계정이다");
+            assert_eq!(acct(master.id).unwrap()["profile"], json!(".claude-4"), "profile 은 usage.accounts 의 profiles 와 같은 홈 상대 표기");
+            assert_eq!(acct(cso.id).unwrap()["account_id"], json!("u-b"));
+            let o = acct(out.id).unwrap();
+            assert_eq!((o["account_id"].clone(), o["state"].clone()), (Value::Null, json!("no_login")), "로그아웃 폴더에 계정을 지어냈다: {o}");
+            let n = acct(nofolder.id).unwrap();
+            assert_eq!((n["account_id"].clone(), n["state"].clone()), (Value::Null, json!("folder_unknown")));
+            assert_eq!(acct(codex.id).unwrap()["account_id"], json!("default"));
+            assert_eq!(acct(shell.id), Some(Value::Null), "셸 좌석은 null");
+            assert_eq!(acct(gone.id), None, "종료 좌석은 표에 없다(부른 쪽이 null)");
+            // 같은 폴더의 로그인을 B 로 바꾼다 — 60초 하한이 지난 뒤의 조회가 새 계정을 본다
+            b3_login(&home, ".claude-4", "u-c", "c@example.test", 3);
+            let view = seat_identity_view_in(&d, Some(&home), t0 + SEAT_IDENT_CACHE_SECS + 1.0);
+            let m = seat_account_map(&d, &view);
+            assert_eq!(m[&master.id]["account_id"], json!("u-c"), "계정 전환이 좌석 계정에 반영되지 않았다");
+            // 수집 실패(기본값) — 표가 비어 전부 null
+            assert!(seat_account_map(&d, &SeatIdentityView::default()).is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+            let _ = std::fs::remove_dir_all(&home);
         }
     }
 }

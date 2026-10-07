@@ -5517,6 +5517,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let usage_now = crate::state::now_epoch();
             let usage_view = crate::accounts::seat_identity_view_at(daemon, usage_now);
             let usage_stale_secs = crate::accounts::account_alert_stale_secs();
+            // ★0.14.45 좌석별 계정(`account`) — 같은 신원 표에서 만든다(추가 파일 IO 0 · surfaces 락 밖).
+            let seat_accounts = crate::accounts::seat_account_map(daemon, &usage_view);
             let surfaces = daemon.surfaces.lock().unwrap();
             let mut list: Vec<Value> = surfaces
                 .values()
@@ -5626,6 +5628,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                 usage_stale_secs,
                             )
                         }),
+                        // ★0.14.45 좌석별 계정 — org.status 와 같은 키·같은 의미(표시 전용 가산 · null = 에이전트 아님·종료·수집 실패).
+                        "account": seat_accounts.get(&s.id).cloned().unwrap_or(Value::Null),
                     })
                 })
                 .collect();
@@ -9369,6 +9373,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             // ★0.14.43(B3) 좌석 `usage` 계산 키용 좌석 신원 표 — surfaces 락 **밖**에서(파일 IO · 폴더별 60초 캐시). surface.list 와 같은 도우미.
             let usage_view = crate::accounts::seat_identity_view_at(daemon, now);
             let usage_stale_secs = crate::accounts::account_alert_stale_secs();
+            // ★0.14.45 좌석별 계정(`account`) — 같은 신원 표에서 만든다(추가 파일 IO 0 · surfaces 락 밖). 사이드바 부서 카드·사용량 패널의 역매핑이 소비한다.
+            let seat_accounts = crate::accounts::seat_account_map(daemon, &usage_view);
             let surfaces = daemon.surfaces.lock().unwrap();
             // ★(0.14.43 · C5) 막힌 좌석(이 순회에서 사유를 읽은 좌석)의 조치 코드는 `surfaces` 가드를 **놓은 뒤** 계산한다 — 진단이 파서·어댑터를
             //   읽기 때문이다(좌석 맵 락을 쥔 채 파서 락을 잡지 않는다).
@@ -9506,6 +9512,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         // ★(0.14.42 · clear 가드 v3) 좌석 clear 가드 — autopilot 게이트 3(미해결 발화 · `fire_id`)의 입력. 부재는
                         //   구 데몬 — 소비자는 fail-closed(발화 없음)로 읽는다. 가드 락은 말단(surfaces 락 안에서 잡아도 역순 없음).
                         "ctx_guard": crate::usage::ctx_guard_wire(daemon, s),
+                        // ★0.14.45 좌석별 계정 — {provider, agent, account_id, profile, state} · null = 에이전트 아님·종료·수집 실패. surface.list 와 같은 키·같은 의미.
+                        "account": seat_accounts.get(&s.id).cloned().unwrap_or(Value::Null),
                         "line_count": s.line_count.load(Ordering::Relaxed),
                         "created_at": s.created_at,
                         // (W4) 파서 패닉 격리 재발 관측 — surface별 누적·마지막 발생 시각.
@@ -30765,6 +30773,46 @@ mod tests {
             }
             let _ = b3_rpc(&daemon, "usage.accounts");
             assert_eq!(daemon.seat_ident_cache.lock().unwrap().enum_reads, 1, "5초 폴링 13회에 홈 열거가 1회가 아니다(폴링이 read_dir 을 늘린다)");
+        }
+    }
+
+    /// ★0.14.45 좌석별 계정(`account`) — surface.list · org.status 두 RPC 가 같은 값을 싣는다(가산 키 · 기존 키 불변).
+    mod seat_account_0145_status {
+        use super::b3_status_tests::b3_rpc;
+        use super::*;
+
+        #[test]
+        fn surface_list_and_org_status_carry_the_same_seat_account() {
+            let daemon = claim_daemon();
+            let seat = make_surface(&daemon, Some("worker-acct0145"));
+            set_agent(&daemon, seat, "claude", "claude");
+            let shell = make_surface(&daemon, None);
+            let codex = make_surface(&daemon, Some("reviewer-codex-acct0145"));
+            set_agent(&daemon, codex, "codex", "codex");
+            let home = std::env::temp_dir().join(format!("cys-acct0145-{}-{}", std::process::id(), seat));
+            let _ = std::fs::remove_dir_all(&home);
+            seat_profile(&home, ".cys/claude-acct0145", "u-acct0145", "x-acct0145@example.test", false);
+            set_config_dir(&daemon, seat, &home.join(".cys/claude-acct0145"));
+            let pick = |method: &str, sid: u64| -> Value {
+                b3_rpc(&daemon, method)["result"]["surfaces"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["surface_id"].as_u64() == Some(sid))
+                    .map(|e| e.as_object().map(|o| o.get("account").cloned()))
+                    .unwrap_or_else(|| panic!("{method}: sid {sid} 없음"))
+                    .flatten()
+                    .unwrap_or_else(|| panic!("{method}: account 키 부재"))
+            };
+            for method in ["surface.list", "org.status"] {
+                let a = pick(method, seat);
+                assert_eq!((a["provider"].clone(), a["account_id"].clone(), a["state"].clone()), (json!("claude"), json!("u-acct0145"), json!("known")), "{method}: {a}");
+                assert!(!a.to_string().contains("x-acct0145@example.test"), "{method}: 이메일은 좌석 행에 싣지 않는다(화면은 usage.accounts 의 label 을 툴팁에만)");
+                assert_eq!(pick(method, shell), Value::Null, "{method}: 셸 좌석");
+                assert_eq!(pick(method, codex)["account_id"], json!("default"), "{method}: codex");
+            }
+            assert_eq!(pick("surface.list", seat), pick("org.status", seat), "두 RPC 의 좌석 계정이 다르다");
+            let _ = std::fs::remove_dir_all(&home);
         }
     }
 }
