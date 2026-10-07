@@ -221,6 +221,9 @@ jobs:
                   "--bin cysd hwmon::":
                       "윈도우 실기에서 hwmon 검체(특히 맥에서는 컴파일되지 않는 비 macOS 스텁 `e2_non_macos_stub_reports_platform`)가 도는 **유일하게 보증된** 자리 — cysd 전량 스텝은 비차단이고 "
                       "이름순 실행이 그 앞 검체에서 멈추거나(1회차 두 런) 실패가 쌓여(bd0a0ca3 런 195건) hwmon 에 닿는다고 말할 수 없다.",
+                  "--lib agy_statusline::":
+                      "윈도우 Antigravity 상태줄 자동 연결(0.14.45)의 `.cmd` 래퍼를 agy 처럼 `cmd /c` + Go 인용으로 실제 실행하는 검체 "
+                      "(`windows_cmd_wrapper_runs_under_cmd_c_like_agy`)가 도는 유일한 자리 — 빠지면 쓰기 전 실연 검사가 대변한다는 근거가 맥 초록뿐이 된다.",
               },
           }
 

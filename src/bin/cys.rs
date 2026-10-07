@@ -8808,8 +8808,8 @@ fn diag_config_dir_target(ctx: &DoctorCtx) -> DiagItem {
 /// ★0.14.42 agy(Antigravity CLI) 상태줄 연결 점검 — 계약 전문은 `cys::agy_statusline`.
 ///
 /// 진단은 읽기 전용이다. `--fix` 는 **base 팩**(`~/.cys/pack`)에서만 설치 경로와 같은 조정을 하되 '연결한 적 있음' 기록을
-/// 무시한다(사람이 부른 수리 = 다시 연결 의사) — 그래도 **사용자 statusLine 은 덮지 않고**, 윈도우는 쓰지 않으며, 노브가
-/// 꺼져 있으면 cys 가 넣은 연결만 뺀다. 부서·임시 팩 레인의 doctor 는 개인 설정을 만지지 않는다(설치 경로와 같은 게이트).
+/// 무시한다(사람이 부른 수리 = 다시 연결 의사) — 그래도 **사용자 statusLine 은 덮지 않고**, 윈도우는 쓰기 직전 실연 검사
+/// (`agy::live_probe`)를 통과할 때만 쓰며, 노브가 꺼져 있으면 cys 가 넣은 연결만 뺀다. 부서·임시 팩 레인의 doctor 는 개인 설정을 만지지 않는다(설치 경로와 같은 게이트).
 fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
     use cys::agy_statusline as agy;
     let item = |status, detail: String, action: String| DiagItem { name: "agy-statusline", status, detail, action };
@@ -8830,7 +8830,13 @@ fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             agy::unlink(&settings, Some(&record), agy::Backup::Beside)
         } else {
             agy::ensure_linked(
-                &agy::Ctx { settings: &settings, pack_dir: &ctx.pack_dir, record: &record, windows: cfg!(windows) },
+                &agy::Ctx {
+                    settings: &settings,
+                    pack_dir: &ctx.pack_dir,
+                    record: &record,
+                    windows: cfg!(windows),
+                    probe: Some(&agy::live_probe),
+                },
                 true,
             )
         };
@@ -8872,25 +8878,32 @@ fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             format!("cys 가 자동으로 연결함{}", disabled_note(&enabled)),
             with_done(String::new()),
         ),
-        (Some(Slot::CysManual { enabled }), _) => item(
-            DiagStatus::Ok,
-            format!("직접 넣은 cys 연결{} (되돌리기 노브는 cys 가 넣은 연결만 뺀다)", disabled_note(&enabled)),
-            with_done(String::new()),
-        ),
+        (Some(Slot::CysManual { enabled }), _) => {
+            // ★0.14.45: 윈도우에서 0.14.44 이전 안내대로 직접 넣은 `bash …/cys-agy-statusline.sh` 는 바꾸지 않고 `.cmd` 명령을
+            //   권한다 — 윈도우 판 agy 는 `cmd /c` 로 부르므로 `bash` 가 WSL 의 System32\bash.exe 로 잡힐 수 있다.
+            let legacy = cfg!(windows)
+                && agy::inspect_command(&settings).is_some_and(|c| agy::command_is_legacy_windows_sh(&c));
+            let advice = match (legacy, agy::link_command_for(&ctx.pack_dir.to_string_lossy(), true, false)) {
+                (true, Some(c)) => format!(
+                    "윈도우 판 agy 는 상태줄을 `cmd /c` 로 부릅니다 — `bash …sh` 연결은 WSL bash 로 잡혀 값이 안 들어올 수 \
+                     있습니다. 권장: statusLine command 를 `{c}` 로 바꾸거나, 칸을 비운 뒤 {fix_hint} (cys 는 직접 넣은 연결을 \
+                     바꾸지 않는다)"
+                ),
+                (true, None) => format!("윈도우 판 agy 는 상태줄을 `cmd /c` 로 부릅니다 — `bash …sh` 연결은 동작하지 않을 수 있습니다({manual})"),
+                (false, _) => String::new(),
+            };
+            item(
+                DiagStatus::Ok,
+                format!("직접 넣은 cys 연결{} (되돌리기 노브는 cys 가 넣은 연결만 뺀다)", disabled_note(&enabled)),
+                with_done(advice),
+            )
+        }
         (Some(Slot::User), _) => item(
             DiagStatus::Warn,
             format!("{} 에 사용자 statusLine 이 있다 — 덮지 않는다 · agy 쿼터 값은 들어오지 않는다", settings.display()),
             with_done(format!("cys 값을 받으려면 {manual} 을 보고 직접 바꾼다")),
         ),
         (_, true) => item(DiagStatus::Ok, "꺼짐(되돌리기 노브) — 연결 없음".into(), with_done(String::new())),
-        (_, false) if cfg!(windows) => item(
-            DiagStatus::Skip,
-            "Antigravity 사용량은 윈도우에서 아직 자동으로 연결되지 않습니다 — 다음 판에서 다시 확인합니다(측정 불능은 통과가 아니다)".into(),
-            with_done(match agy::link_command_for(&ctx.pack_dir.to_string_lossy(), true, false) {
-                Some(c) => format!("직접 연결: statusLine command = `{c}` ({manual})"),
-                None => format!("팩 경로에 공백 등이 있어 붙여 넣을 명령을 만들 수 없다 — {manual}"),
-            }),
-        ),
         (_, false) if record.exists() => item(
             DiagStatus::Warn,
             "전에 cys 가 연결했던 statusLine 이 비어 있다(agy 의 /statusline delete 등) — 설치는 다시 넣지 않는다".into(),
@@ -28591,6 +28604,21 @@ mod tests {
         let cmd = cys::agy_statusline::link_command_for("/Users/x/.cys/pack", false, true).unwrap();
         assert!(cmd.contains(&format!("/hooks/{}", cys::agy_statusline::SCRIPT)) && cmd.ends_with(cys::agy_statusline::MARKER));
         assert_eq!(cys::agy_statusline::SCRIPT, "cys-agy-statusline.sh");
+        // ★0.14.45 윈도우 래퍼(`.cmd` — agy 가 `cmd /c` 로 부른다): 같은 플래그 · 항상 exit /b 0 · LF · 라벨/goto 없음(LF 배치
+        //   파일에서 라벨 탐색이 어긋나는 cmd 의 알려진 함정) · 따옴표 없음 · 연결 명령이 이 파일을 가리킨다.
+        let cmdw = include_str!("../../cysjavis-pack/hooks/cys-agy-statusline.cmd");
+        assert!(cmdw.starts_with("@echo off\n"), "{cmdw}");
+        assert!(cmdw.contains("cys usage-report-stdin --agy 2>nul"), "{cmdw}");
+        assert!(cmdw.trim_end().ends_with("exit /b 0"), "{cmdw}");
+        assert!(!cmdw.contains('\r') && !cmdw.contains('"'), "LF · 따옴표 없음: {cmdw:?}");
+        assert!(!cmdw.lines().any(|l| l.trim_start().starts_with(':')) && !cmdw.to_ascii_lowercase().contains("goto"));
+        assert!(cmdw.is_ascii(), "코드페이지 해석을 타지 않게 ASCII 만");
+        let wcmd = cys::agy_statusline::link_command_for(r"C:\Users\x\.cys\pack", true, true).unwrap();
+        assert!(wcmd.contains(&format!(r"\hooks\{}", cys::agy_statusline::SCRIPT_CMD)) && wcmd.ends_with(cys::agy_statusline::MARKER));
+        // 윈도우 실연 검사의 통과 줄은 이 CLI 가 검사 입력(빈 쿼터)에 실제로 찍는 줄과 같아야 한다(두 크레이트 사이의 계약)
+        let probe_in: Value = serde_json::from_str(cys::agy_statusline::PROBE_INPUT).unwrap();
+        assert_eq!(agy_statusline_human_line(&probe_in), cys::agy_statusline::PROBE_EXPECT);
+        assert!(cys::agy_statusline::probe_output_ok(&format!("{}\n", agy_statusline_human_line(&probe_in))).is_ok());
     }
 
     /// ★0.14.42 agy 자동 연결: 자동 연결 뒤에는 모든 agy 좌석이 상태 변화마다 push 한다 — 값 서명에 리셋 시각을 넣으면
@@ -32519,7 +32547,7 @@ mod tests {
         assert!(!settings.parent().unwrap().exists());
         // agy 기본형 = 미연결 Warn → --fix 로 연결 → Ok (설치된 팩처럼 래퍼를 둔다 — 없으면 연결하지 않는다)
         std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-        let wrapper = ctx.pack_dir.join("hooks").join(agy::SCRIPT);
+        let wrapper = ctx.pack_dir.join("hooks").join(agy::script_name(cfg!(windows)));
         std::fs::create_dir_all(wrapper.parent().unwrap()).unwrap();
         std::fs::write(&wrapper, "#!/bin/sh\nexit 0\n").unwrap();
         let dflt = "{\n  \"statusLine\": {\n    \"type\": \"\",\n    \"command\": \"\",\n    \"enabled\": false\n  }\n}\n";
@@ -32534,8 +32562,27 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), dflt, "base 팩이 아닌 레인이 개인 설정을 고쳤다");
         assert!(it.action.contains("base 팩"), "{}", it.action);
         if cfg!(windows) {
+            // ★0.14.45 윈도우: --fix 는 쓰기 직전 실연 검사(`cmd /c` · 실제 PATH)를 부른다. 검체 환경에 cys 가 PATH 에 있는지는
+            //   러너마다 다르므로 두 갈래만 허용한다 — 통과면 `.cmd` 연결 · 실패면 파일 바이트 동일 + 붙여 넣을 `.cmd` 명령 안내.
+            //   (검사 자체의 통과·실패 판정은 agy_statusline 의 윈도우 검체가 가짜 cys 로 잰다.)
+            let it = by(&ctx, true);
+            let now = std::fs::read_to_string(&settings).unwrap();
+            if now == dflt {
+                assert_eq!(it.status, DiagStatus::Warn, "{} / {}", it.detail, it.action);
+                if agy::link_command_for(&ctx.pack_dir.to_string_lossy(), true, true).is_some() {
+                    assert!(it.action.contains("시험 실행") && it.action.contains(agy::SCRIPT_CMD), "{}", it.action);
+                } else {
+                    // 임시 폴더가 8.3 짧은 이름(`RUNNER~1`) 등이면 윈도우 안전 규칙 밖 → UnsafePath 안내(검사 전 거절)
+                    assert!(it.action.contains("안전한 연결 명령"), "{}", it.action);
+                }
+            } else {
+                assert_eq!(it.status, DiagStatus::Ok, "{} / {}", it.detail, it.action);
+                let v: Value = serde_json::from_str(&now).unwrap();
+                let c = v["statusLine"]["command"].as_str().unwrap();
+                assert!(agy::command_is_ours_auto(c) && c.contains(agy::SCRIPT_CMD), "{v}");
+            }
             let _ = std::fs::remove_dir_all(&base);
-            return; // 윈도우는 자동 연결 안 함 — 아래 쓰기 시나리오는 유닉스 전용
+            return; // 아래 쓰기 시나리오는 유닉스(검사 없음) 기준이다
         }
         let it = by(&ctx, true);
         assert_eq!(it.status, DiagStatus::Ok, "{} / {}", it.detail, it.action);

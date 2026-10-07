@@ -322,9 +322,10 @@ Control Center 머리의 경보 배지도 같은 원칙입니다. 경보 조회�
     `관측 실패 · agy 상태줄 연결 필요` 가 나옵니다(cys 는 이 확인을 agy 한 개당 30분에 한 번만 합니다).
     Windows 에서는 cys 가 agy 내부 서버를 아예 찾을 수 없어(포트 조회 수단이 없습니다) 확인 없이 곧바로
     같은 `agy 상태줄 연결 필요` 를 보입니다 — 값은 상태줄로만 들어옵니다.
-    **Windows (v0.14.44)**: Antigravity 사용량은 윈도우에서 아직 자동으로 연결되지 않습니다 — 다음 판에서 다시 확인합니다. 윈도우 판 agy 1.2.17 은 상태줄 명령을
-    `cmd /c` 로 부르는 것까지는 파일 분석으로 확인했지만 실제 윈도우 PC 에서 호출을 본 것은 아니어서 자동 연결은 이번 판에도 끈 채입니다.
-    - **자동 연결**(v0.14.42 · macOS·Linux): cys 를 설치하거나 업데이트할 때(팩을 반영할 때) `~/.gemini/antigravity-cli/settings.json`
+    **Windows (v0.14.45)**: 이제 Windows 도 자동으로 연결합니다. 윈도우 판 agy 1.2.17 은 상태줄 명령을 `cmd /c` 로 부릅니다(파일
+    분석으로 확인). 실제 윈도우 PC 에서 agy 가 부르는 모습을 본 것은 아니어서, cys 는 **쓰기 직전에 그 명령을 agy 와 같은 방식으로
+    한 번 실행해 보고** 통과할 때만 넣습니다(아래 「Windows」).
+    - **자동 연결**(v0.14.42 macOS·Linux · v0.14.45 Windows): cys 를 설치하거나 업데이트할 때(팩을 반영할 때) `~/.gemini/antigravity-cli/settings.json`
       의 `statusLine` 이 **비어 있거나 없으면** cys 가 연결을 넣습니다. agy 기본 상태줄은 그대로 보이고 그 아래에
       `5h 12% · 7d 25% · cys` 한 줄이 붙습니다(`stack_with_default`). 이 설정은 이 컴퓨터의 **모든** agy 에 적용됩니다 —
       cys 창 밖에서 쓴 agy 에도 그 한 줄이 보이지만, 값을 cys 로 보내는 것은 cys 창의 agy 좌석뿐입니다. 이미 떠 있는 agy 는
@@ -337,7 +338,8 @@ Control Center 머리의 경보 배지도 같은 원칙입니다. 경보 조회�
       끝의 `--cys-autolink` 는 "cys 가 넣었다"는 표지입니다. 되돌릴 때는 이 표지가 달린 연결만 뺍니다.
       - 이럴 때는 **넣지 않고 알리기만** 합니다(설치 기록과 `cys doctor` 의 `agy-statusline` 항목): 직접 설정한 statusLine 이
         이미 있을 때(덮지 않습니다) · 파일이 JSON 으로 읽히지 않거나 UTF-8 이 아닐 때 · 읽기 전용이거나 쓸 수 없을 때 · 심볼릭
-        링크일 때 · 팩 경로에 공백이나 따옴표가 있을 때 · 팩에 상태줄 래퍼 파일(`hooks/cys-agy-statusline.sh`)이 없을 때 ·
+        링크일 때 · 팩 경로에 공백이나 따옴표가 있을 때 · 팩에 상태줄 래퍼 파일(`hooks/cys-agy-statusline.sh` · Windows 는
+        `hooks/cys-agy-statusline.cmd`)이 없을 때 · (Windows) 시험 실행이 통과하지 못했을 때 ·
         agy 가 설치돼 있지 않을 때(폴더를 새로 만들지 않습니다).
       - 쓰기 전에 원본을 `settings.json.bak-cys` 로 남기고 `statusLine` 한 칸만 바꿉니다. 다른 설정 값·순서·들여쓰기·줄바꿈은
         그대로입니다. 쓰기 직전에 파일을 다시 읽어 그 사이 agy 가 파일을 바꿨으면 이번에는 쓰지 않습니다.
@@ -353,20 +355,30 @@ Control Center 머리의 경보 배지도 같은 원칙입니다. 경보 조회�
         실패 기록 함수가 `Statusline disabled after %d consecutive failures` 를 씁니다 — 실제 화면은 확인하지 못했습니다).
       - agy(macOS 판 1.2.9)는 상태줄 명령을 `sh -c` 로 부르고 한 번에 **5초**까지 기다립니다(프로그램을 풀어 확인 · 공식 문서에는
         없습니다). cys 연결 명령은 입력 판독 1초 + 보내기 0.4초 안에 끝나고 언제나 정상 종료(exit 0)합니다.
-    - **Windows 는 자동으로 연결하지 않습니다.** agy 가 이 명령을 어떤 셸로 부르는지 공식 문서에 없고, 공개된 사용자 보고끼리
-      어긋나기 때문입니다(명령 안의 따옴표가 글자 그대로 넘어가 경로가 깨졌다는 보고와, 공백 경로는 따옴표로 감싸라는 안내가 함께
-      있습니다). 위의 `sh -c` 는 macOS 판에서 확인한 것이고, Windows 판 agy 는 따로 만들어진 프로그램이라 이 컴퓨터에서 확인할 수
-      없습니다. Windows 판도 `sh -c` 로 부른다면 `sh` 가 PATH 에 있어야 합니다(Git for Windows 기본 설치는 `sh.exe` 가 든
-      `Git\bin`·`Git\usr\bin` 을 PATH 에 넣지 않습니다). 직접 연결하려면 `%USERPROFILE%\.gemini\antigravity-cli\settings.json` 에 아래처럼 적습니다 — Git Bash 의 `bash` +
-      정슬래시 전체 경로, **따옴표 없이**. 사용자 폴더 이름에 공백이 있으면 이 방법은 동작하지 않을 수 있고, `bash` 가 Git Bash 가
-      아니라 WSL 의 `bash.exe` 로 잡히는 컴퓨터도 있습니다. `cys doctor` 의 `agy-statusline` 항목이 이 컴퓨터에 맞는 명령을
-      보여 줍니다. Git Bash 가 없거나 PATH 에 잡히지 않으면 이 연결은 동작하지 않고, agy 가 상태줄 오류를 몇 번 보인 뒤 스스로
-      끕니다 — 그때는 agy 안에서 `/statusline delete` 로 지웁니다. **Windows 의 agy 상태줄은 아직 실제로 확인하지 못했습니다**(값이
-      안 들어올 수는 있어도 틀린 값이 들어오지는 않습니다).
+    - **Windows**(v0.14.45): 윈도우 판 agy(1.2.17 · x64·arm64)는 상태줄 명령을 `cmd /c <명령>` 으로 부르고 한 번에 5초까지
+      기다립니다(프로그램 파일을 풀어 확인 · 실제 PC 에서 본 것은 아닙니다). 그래서 Windows 에서 넣는 명령은 인터프리터(`bash`·`sh`)
+      없이 **`.cmd` 래퍼를 바로 부르는** 꼴이고, **따옴표가 없습니다**(agy 가 명령 안의 `"` 를 `\"` 로 바꿔 넘기므로 따옴표 경로는
+      깨집니다):
       ```json
-      "statusLine": { "type": "command", "command": "bash C:/Users/<you>/.cys/pack/hooks/cys-agy-statusline.sh",
+      "statusLine": { "type": "command",
+                      "command": "C:\\Users\\<you>\\.cys\\pack\\hooks\\cys-agy-statusline.cmd --cys-autolink",
                       "enabled": true, "stack_with_default": true }
       ```
+      (JSON 안이라 역슬래시가 두 번씩 적힙니다 — 실제 명령은 `C:\Users\<you>\.cys\pack\hooks\cys-agy-statusline.cmd --cys-autolink`.)
+      - **쓰기 전 시험 실행**: cys 는 넣기 직전에 이 명령을 agy 와 같은 방식(`cmd /c` · 같은 따옴표 규칙 · 5초 제한)으로 창 없이 한 번
+        실행해, 끝까지 cys 에 닿아 `cys` 한 줄이 나오는지 봅니다(빈 쿼터를 넣고 좌석 번호는 빼서 아무 값도 보내지 않습니다). 통과하지
+        못하면 **파일을 한 바이트도 바꾸지 않고** 설치 기록과 `cys doctor` 에 붙여 넣을 명령을 안내합니다. 설치·실행은 그대로 계속됩니다.
+      - 팩 경로가 `C:\` 처럼 드라이브 글자로 시작하고 영문·숫자와 `\ . _ -` 로만 되어 있을 때만 넣습니다. 사용자 폴더 이름에 공백 ·
+        한글 같은 비ASCII 글자 · `% ^ & ( ) !` · 따옴표가 있거나 네트워크 경로(`\\server\…`)이면 넣지 않고 알리기만 합니다(cmd 에서
+        뜻이 바뀌는 글자들입니다).
+      - 직접 연결하려면 `%USERPROFILE%\.gemini\antigravity-cli\settings.json` 에 위 모양을 표지(`--cys-autolink`) 없이 적습니다 —
+        `cys doctor` 의 `agy-statusline` 항목이 이 컴퓨터에 맞는 명령을 보여 줍니다. 예전(v0.14.44 까지) 안내대로 넣은
+        `bash C:/…/cys-agy-statusline.sh` 연결은 cys 가 바꾸지 않습니다. 다만 Windows 판 agy 는 `cmd /c` 로 부르므로 `bash` 가 Git Bash
+        가 아니라 WSL 의 `bash.exe` 로 잡혀 값이 안 들어올 수 있습니다 — `cys doctor` 가 `.cmd` 명령으로 바꾸기를 권합니다.
+      - **아직 실제로 확인하지 못했습니다**: 실제 Windows PC 의 agy 가 이 명령을 불러 사이드바 값이 바뀌는 모습. 시험 실행은 agy 의
+        호출 방식을 흉내 낸 것이지 agy 자체가 아닙니다(값이 안 들어올 수는 있어도 틀린 값이 들어오지는 않습니다). 상태줄이 계속
+        실패하면 agy 가 몇 번 오류를 보인 뒤 스스로 끕니다 — 그때는 agy 안에서 `/statusline delete` 로 지우거나
+        `~/.cys/agy-statusline-off` 를 만든 뒤 `cys doctor --fix` 를 실행합니다.
     - macOS·Linux 에서 직접 연결할 때(자동 연결을 끈 뒤 등)는 표지 없이 `"command": "sh ~/.cys/pack/hooks/cys-agy-statusline.sh"`
       를 씁니다. 예전 안내대로 `cys-statusline.sh` 를 넣어 둔 연결도 cys 연결로 보고 그대로 둡니다.
     - agy 가 상태줄에 넘겨 주는 정보 가운데 **쿼터 숫자만**(Gemini 5시간·주간) cys 로 보냅니다. 이메일·대화
@@ -493,7 +505,7 @@ Control Center Live 의 계정 표가 "지금 어느 계정이 쓰이는가"를 
 | `HUD_REQ_TIMEOUT` | `0` | `30`초 / **없음** | 브리지의 요청 처리 시간 제한(요청을 보내지 않는 접속을 정리). 윈도우는 `HUD_WIN_NEW=1` 일 때만 30초가 켜집니다 |
 | `HUD_WIN_NEW` | (윈도우) `1` 이면 새 동작을 켬 | — / 꺼짐 | 윈도우 브리지의 새 동작(시간 제한 · 포트 먼저 잡기 · 종료 신호 처리 · 자식 정리)을 켭니다. 안 켜면 0.14.43 순서 그대로입니다 |
 | `HUD_LIFELINE` | 데몬이 `managed` 일 때만 `stdin` 을 줌 | — | 브리지가 표준입력이 닫히면 스스로 끝나게 하는 수명줄입니다(직접 줄 일은 없습니다) |
-| `CYS_AGY_STATUSLINE` | `0`(또는 `~/.cys/agy-statusline-off` 파일) | 켬(0.14.42 와 같음) / 윈도우는 자동 연결 자체가 없음 | Antigravity 상태줄 자동 연결을 끄고 cys 가 넣은 연결을 뺍니다. 이번 판에서 바뀐 것은 없습니다 |
+| `CYS_AGY_STATUSLINE` | `0`(또는 `~/.cys/agy-statusline-off` 파일) | 켬(0.14.42 와 같음) / 켬(0.14.45 부터 · 쓰기 전 시험 실행을 통과할 때만) | Antigravity 상태줄 자동 연결을 끄고 cys 가 넣은 연결을 뺍니다(Windows 의 `.cmd` 연결 포함) |
 
 사용량 보기 방식(`cys-usage-mode`)과 접기 상태(`cys-usage-fold`)는 화면 저장소의 값이고 되돌릴 때는 보기 방식을 `하나` 로 두면 됩니다.
 
@@ -1866,7 +1878,7 @@ claude       a-b1@example.test                5h 12% · 7d 40% | ● 사용 중 
 | `CYS_TODO_DIRS` | — | todo 감시 추가 루트(콜론 구분) |
 | `CYS_NO_AUTOSTART` / `CYS_NO_AUTORESTORE` | — | 자동 기동/자동 복원 끄기 |
 | `CYS_CLEAR_REPIN` | 켜짐 (`0`=끔) | /clear 뒤 resume 핀 교체(v0.14.42 · 데몬 env) — 재기동 복원이 비운 뒤의 새 대화로 재개합니다. 받는 신호는 **SessionStart 훅의 `source=clear` 등록**이고, 데몬은 그것이 좌석 최상위 claude 의 훅에서 왔는지를 **프로세스 조상 사슬로 판정**합니다(발신 → 좌석 루트 사이에 claude 실행이 정확히 1개이고 그 아래에 `session-start.sh` 실행이 있음 · 직전의 좌석 자신의 등록이 현재 핀과 이어짐 · 다른 좌석(끝난 좌석 포함)의 세션이 아님). 대상 대화는 **새 세션**이어야 합니다(파일이 아직 없거나 10분 안에 생긴 256 KiB 이하) — 옛 대화로는 바꾸지 않습니다. 판정은 argv 문자열 기반이라 같은 사용자가 훅을 가짜 입력으로 직접 돌리는 것까지 막지는 않습니다(그 경로로도 옛·큰 대화로는 바뀌지 않습니다). 어느 조건이든 어긋나면 종전처럼 옛 대화로 재개합니다. `0` 이면 종전처럼 옛 대화로 재개합니다(판정·이벤트·영속 모두 없음). 데몬 env 라 데몬을 재시작해야 반영됩니다 |
-| `CYS_AGY_STATUSLINE` | 켜짐 (`0`=끔 · `~/.cys/agy-statusline-off` 파일과 동등) | agy 상태줄 자동 연결(v0.14.42 · macOS·Linux · §4 사이드바 사용량 「Antigravity(agy) 값」). 설치·업데이트 때 읽습니다. 끄면 cys 가 넣은(표지 `--cys-autolink`) 연결만 빼고 다시 넣지 않습니다 — 직접 넣은 연결·사용자 설정은 건드리지 않습니다. `cys doctor --fix` 도 같은 판정을 씁니다 |
+| `CYS_AGY_STATUSLINE` | 켜짐 (`0`=끔 · `~/.cys/agy-statusline-off` 파일과 동등) | agy 상태줄 자동 연결(v0.14.42 macOS·Linux · v0.14.45 Windows — 쓰기 전 시험 실행 · §4 사이드바 사용량 「Antigravity(agy) 값」). 설치·업데이트 때 읽습니다. 끄면 cys 가 넣은(표지 `--cys-autolink`) 연결만 빼고 다시 넣지 않습니다 — 직접 넣은 연결·사용자 설정은 건드리지 않습니다. `cys doctor --fix` 도 같은 판정을 씁니다 |
 | `CYS_OUTSIDE_USAGE` | 켜짐 (`0`=끔) | cys 창 밖(외부 터미널) Claude 세션의 사용량을 계정 줄로 보내기(v0.14.42 · §4 사이드바 사용량 「집계 범위」). 창 밖 세션 쪽 환경에서 읽습니다. 끄면 종전처럼 보내지 않습니다 |
 | `CYS_UPDATE_VERIFY` | 켬 (`0`=끔) | 인앱 업데이트 '설치되지 않았습니다' 알림(v0.14.43 · §11)의 되돌리기. `0` 이면 설치 직전 시도 기록(`~/.cys/.update-attempt.json`)을 쓰지 않고 재시작 뒤 판정은 늘 '알릴 것 없음'입니다(Windows 의 스마트 앱 컨트롤 사전 고지 문단은 이 노브와 무관하게 계속 붙습니다 — §11). 앞뒤 공백을 걷은 값이 `0` 이면(`0 `·` 0` 포함) 끄고, 그 밖의 값(`false`·`off`·`00` 포함)은 켠 채이며 빈 값은 미설정으로 읽어 옛 접두 변수를 확인합니다. 앱(GUI)이 상속한 값만 읽으므로 설정 뒤 **앱 재시작**이 필요합니다(데몬 재시작 불필요). 이전 접두 `JAVIS_UPDATE_VERIFY`·`AITERM_UPDATE_VERIFY` 도 같은 이름으로 읽습니다(`CYS_` 가 있으면 우선). |
 | `CYS_UPDATE_CHECKED_LAUNCH` | 켬 (`0`=끔) | **Windows 전용** 인앱 업데이트의 설치 파일 실행 결과 확인(0.14.43 · §11 「설치 파일 실행이 막혔을 때(윈도우)」) — 켜져 있으면 앱이 설치 파일을 띄운 결과를 보고, 막히면(예: 스마트 앱 컨트롤) 앱을 닫지 않고 받아 둔 임시 설치 파일·시도 기록을 지운 뒤 곧바로 알림을 띄웁니다. 앞뒤 공백을 걷은 값이 `0` 이면(`0 `·` 0` 포함) 종전 경로(업데이터 플러그인 그대로 — 결과를 보지 않고 앱 종료 · 이때 설치 전 안내의 "막히면" 문장은 "이 앱이 알림 없이 닫힙니다" 로 바뀝니다)이고 그 밖의 값(`00`·`false` 포함)·미설정은 켠 채이며 빈 값은 미설정으로 읽어 옛 접두 변수(`JAVIS_`·`AITERM_`)를 확인합니다. 앱(GUI)이 상속한 값만 읽으므로 설정 뒤 **앱 재시작**이 필요합니다(데몬 재시작 불필요). macOS·Linux 는 이 노브를 보지 않습니다 |

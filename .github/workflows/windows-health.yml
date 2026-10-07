@@ -190,7 +190,7 @@ jobs:
       - name: Rust 툴체인 (factory-reset Windows 계약 검증용)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: cargo test --lib factory_reset + readiness + inject_guard + first_run_gates + update_launch (Windows 실기)
+      - name: cargo test --lib factory_reset + readiness + inject_guard + first_run_gates + update_launch + agy_statusline (Windows 실기)
         shell: bash
         run: |
           set -euo pipefail
@@ -254,6 +254,12 @@ jobs:
           #   이 두 줄에도 `if:` 를 달지 마라.
           cargo_filter_count --lib update_launch::
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib update_launch:: -- --test-threads=1
+          # ★(0.14.45) 여섯째 모듈 `agy_statusline::` 편입 — Windows Antigravity 상태줄 자동 연결. 이 모듈의 **윈도우 전용 검체**
+          #   `windows_cmd_wrapper_runs_under_cmd_c_like_agy` 는 팩의 LF `.cmd` 래퍼를 agy 와 같은 방식(`cmd /c` + Go `EscapeArg`
+          #   인용 · 창 없음 · 5초 상한)으로 실제 실행해, 가짜 `cys.cmd` 가 PATH 에 있으면 통과 · 없으면 실패(구별)임을 잰다.
+          #   mac 초록은 그 축(cmd 의 따옴표 처리·LF 배치 파일 실행)의 증거가 아니다(정본 §8). 이 두 줄에도 `if:` 를 달지 마라.
+          cargo_filter_count --lib agy_statusline::
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib agy_statusline:: -- --test-threads=1
 
       # ★D5 env 게이트의 Windows 파이프라인 실기 검증 (v0.14 품질 라인 · 적대검증 2R major 수리).
       #
