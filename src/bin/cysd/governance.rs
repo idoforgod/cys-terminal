@@ -8024,6 +8024,16 @@ pub(crate) struct QueueBlockDiag {
     pub(crate) cursor_lead_cp: Option<String>,
     pub(crate) last_parser_panic_at: Option<u64>,
     pub(crate) repaint_requested_at: Option<u64>,
+    /// ★(성찰 M1) 진단 시점의 출력 정적 초(`last_output` 경과) — 바쁨·모달 사유가 [`STALE_SCREEN_QUIET_SECS`] 넘게 정적이면 낡은 사본 후보. `None` = 미측정(검체 기본값).
+    pub(crate) quiet_secs: Option<u64>,
+    /// ★(성찰 M2) 대체 화면 좌석이고 PTY 전경이 에이전트(마커 좌석)다 — 다시 그리기 요청 대상. 비-unix 는 전경을 모르므로 마커 좌석이면 참([`seat_foreground_is_agent`]).
+    pub(crate) alt_fg_agent: bool,
+    /// ★(성찰 M2) 다시 그리기 노브(`CYS_SCREEN_REPAINT_NUDGE=0`)가 꺼져 있다.
+    pub(crate) repaint_knob_off: bool,
+    /// ★(성찰 M2) 화면 높이가 [`crate::repaint::REPAINT_MIN_ROWS`] 미만이라 흔들 수 없다.
+    pub(crate) rows_too_small: bool,
+    /// ★(성찰 M2) 다시 그리기를 요청한 뒤 아직 판독 가능한 화면을 보지 못했다(`RepaintState::unrecovered > 0`).
+    pub(crate) repaint_unresolved: bool,
 }
 
 /// ★(0.14.45 · F3) 화면 동기 진단 묶음 — [`QueueBlockDiag`] 의 `cursor_row`·`marker_row`·`cursor_lead_cp`.
@@ -8238,8 +8248,14 @@ pub(crate) fn queue_block_diag_with(
     let (draft_visible, ghost_after_cursor) = seat_input_line_visibility_with(s, defs);
     let probe = seat_screen_probe_with(s, defs);
     let last_parser_panic_at = s.last_parser_panic.lock().unwrap_or_else(|e| e.into_inner()).map(|t| t.max(0.0) as u64);
-    let repaint_requested_at =
-        s.repaint.lock().unwrap_or_else(|e| e.into_inner()).last_request_epoch.map(|t| t.max(0.0) as u64);
+    let (repaint_requested_at, repaint_unresolved) = {
+        let st = s.repaint.lock().unwrap_or_else(|e| e.into_inner());
+        (st.last_request_epoch.map(|t| t.max(0.0) as u64), st.last_request.is_some() && st.unrecovered > 0)
+    };
+    // ★(성찰 M1·M2) 처방 문장의 사실 재료 — 출력 정적 초 · 대체 화면 ∧ 전경 에이전트 · 노브 · 화면 높이. 파서 락은 순간(크기만).
+    let quiet_secs = Some(s.last_output.lock().unwrap_or_else(|e| e.into_inner()).elapsed().as_secs());
+    let alt_fg_agent = s.alt_screen.load(Ordering::Relaxed) && seat_foreground_is_agent(s);
+    let rows_too_small = s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().size().0 < crate::repaint::REPAINT_MIN_ROWS;
     QueueBlockDiag {
         pending_input_bytes: pending,
         pending_input_human_bytes: human,
@@ -8254,6 +8270,11 @@ pub(crate) fn queue_block_diag_with(
         cursor_lead_cp: probe.cursor_lead_cp,
         last_parser_panic_at,
         repaint_requested_at,
+        quiet_secs,
+        alt_fg_agent,
+        repaint_knob_off: !crate::repaint::repaint_nudge_enabled(),
+        rows_too_small,
+        repaint_unresolved,
     }
 }
 
@@ -8341,14 +8362,49 @@ pub(crate) fn blocked_is_input_line(blocked_by: &str) -> bool {
 /// ★(0.14.45 · F3) 표 9행(`input_pending_unknown`) 처방 — 계수는 있는데 커서 행에서 입력줄을 못 읽었다. 종전 문장("비어 있으면 Ctrl-U")만으로는 풀리지 않았다:
 /// 데몬의 화면 사본이 어긋나 있으면(파서 패닉 뒤 · 유휴 좌석은 프롬프트를 다시 그리지 않는다) Ctrl-U 로 계수를 지워도 화면 판독(`line`)이 계속 비어 다음 사유가
 /// `prompt_unknown` 으로 바뀔 뿐이다. 그래서 다시 그리기(`repaint`)를 먼저 말한다 — 사람이 하는 일은 창 크기를 한 번 바꾸는 것뿐이고 키 입력은 아니다.
+/// ★(성찰 M1·M2) 이 문장은 **다시 그리기 요청이 실제로 올 때**의 문장이다 — 노브 끔·창이 너무 작음·이미 요청했으나 풀리지 않음이면 [`repaint_promise`] 의
+/// 다른 구절로 바꿔 쓴다(약속하지 않을 것을 약속하지 않는다). 기본 갈래의 바이트는 종전 그대로다(문서가 인용한다).
 pub(crate) const REMEDY_BODY_INPUT_PENDING_UNKNOWN: &str =
     "입력줄에 미제출 입력이 있다고 계수됐으나 화면을 판독하지 못했다 — 데몬의 화면 사본이 어긋났을 수 있다(1분 넘게 못 읽으면 cys 가 키 입력 없이 \
      창 크기를 한 칸 흔들어 다시 그리기를 요청한다 · 사람이 그 창 크기를 한 번 바꿔도 다시 그려진다). 다시 그려진 뒤에도 막혀 있으면 사람이 그 창을 확인한다\
      (비어 있으면 Ctrl-U · 글이 있으면 제출하거나 지운다)";
-/// ★(0.14.45 · F3) 표 14행(`prompt_unknown`) 처방 — 커서 행에서 프롬프트 표지를 못 찾았다. 화면 사본 어긋남이면 다시 그리기로 풀린다.
+/// ★(0.14.45 · F3) 표 14행(`prompt_unknown`) 처방 — 커서 행에서 프롬프트 표지를 못 찾았다. 화면 사본 어긋남이면 다시 그리기로 풀린다. 갈래 규칙은 9행과 같다.
 pub(crate) const REMEDY_BODY_PROMPT_UNKNOWN: &str =
     "입력 대기 표지(프롬프트)를 화면에서 찾지 못했다 — 다른 화면이 떠 있거나 데몬의 화면 사본이 어긋났을 수 있다(사본 어긋남이면 1분 뒤 cys 가 키 입력 없이 \
      창 크기를 한 칸 흔들어 다시 그리기를 요청한다 · 사람이 그 창 크기를 한 번 바꿔도 풀린다). 그래도 막혀 있으면 그 창이 입력을 기다리는 상태인지 사람이 확인한다";
+
+/// ★(0.14.45 · 성찰 M2) 다시 그리기 요청에 관한 **사실 그대로의 구절**(순수) — `None` = 요청이 **올 것이다**(호출자가 자기 문장의 약속 구절을 그대로 쓴다) ·
+/// `Some(구절)` = 약속할 수 없거나 이미 해 봤다(호출자가 약속 구절 자리에 이 구절을 쓴다). 위에서부터 첫 일치: 노브 끔 → 창이 너무 작음 → 요청했으나 풀리지 않음.
+/// 호출자가 처방 문장에 "cys 가 다시 그리기를 요청한다" 고 적을 수 있는 것은 이 함수가 `None` 일 때뿐이다(약속하지 않을 것을 약속하지 않는다).
+pub(crate) fn repaint_promise(d: &QueueBlockDiag) -> Option<&'static str> {
+    if d.repaint_knob_off {
+        Some("다시 그리기 요청은 꺼져 있다(`CYS_SCREEN_REPAINT_NUDGE=0`) — 사람이 그 창 크기를 한 번 바꾸면 다시 그려진다")
+    } else if d.rows_too_small {
+        Some("창이 너무 작아 cys 가 크기를 흔들지 못한다(4행 미만) — 창을 키우거나 사람이 그 창 크기를 한 번 바꾼다")
+    } else if d.repaint_unresolved {
+        Some("cys 가 다시 그리기를 요청했으나 풀리지 않았다 — 사람이 그 창 크기를 한 번 바꾸거나 그 창을 확인한다")
+    } else {
+        None
+    }
+}
+
+/// ★(성찰 M1) 바쁨·모달 사유를 '낡은 화면 사본' 후보로 보는 출력 정적 하한(초) — 큐 틱의 nudge 분류([`nudge_screen_obs`])와 처방 문장이 같은 값을 쓴다.
+pub(crate) const STALE_SCREEN_QUIET_SECS: u64 = 60;
+
+/// ★(성찰 M1·M2) 판독 불가 두 갈래(9행·14행)의 본문 — 기본 갈래는 상수 그대로(바이트 불변) · 그 밖은 약속 구절을 [`repaint_promise`] 로 바꾼다.
+fn unreadable_body(base: &'static str, d: &QueueBlockDiag) -> String {
+    let Some(alt) = repaint_promise(d) else {
+        return base.to_string();
+    };
+    // 상수의 괄호 안 약속 구절("…(1분 넘게 못 읽으면 cys 가 … 다시 그려진다)" / "(사본 어긋남이면 1분 뒤 cys 가 … 풀린다)")을 통째로 바꾼다 — 괄호 밖 문장은
+    // 그대로다. 약속 구절은 "cys 가" 를 품은 괄호다(앞의 "(프롬프트)" 같은 다른 괄호가 아니다).
+    let Some(at) = base.find("cys 가") else {
+        return base.to_string();
+    };
+    let open = base[..at].rfind('(').unwrap_or(0);
+    let close = base[at..].find(')').map_or(base.len(), |i| at + i + 1);
+    format!("{}({alt}){}", &base[..open], &base[close..])
+}
 
 /// kill-switch 동결 처방(표 1행) — 정체가 아니라 동결이다. 해제는 오너(사람)가 한다.
 const REMEDY_BODY_KILL_SWITCH: &str = "kill-switch 동결 중 — 정체가 아니라 동결이다. 해제는 오너(사람)가 한다. \
@@ -8413,59 +8469,94 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
     let input_line = blocked_is_input_line(blocked_by);
     // 본문 뒤·패닉 주석 앞에 붙는 한 구절 — 지금은 `empty_seat` 의 계수 구절 하나뿐이다(그 밖 행은 빈 문자열이라 바이트 불변).
     let mut clause: &str = "";
-    let (code, body): (&'static str, &str) = if let Some(body) = pause_remedy_body(d.kill_switch, d.paused) {
-        ("paused", body)
+    // ★(성찰 M1) 출력이 이만큼 조용한 채 바쁨·모달 사유면 그 표지가 낡은 화면 사본일 수 있다 — 큐 틱이 같은 하한으로 다시 그리기 후보로 본다.
+    let stale_quiet = d.quiet_secs.filter(|q| *q >= STALE_SCREEN_QUIET_SECS);
+    // ★(성찰 M2) 다시 그리기 약속 구절 — 바쁨·모달·대체 화면 갈래가 공유한다(기본 = 요청이 온다 · 그 밖 = 사실 그대로).
+    let promise = |d: &QueueBlockDiag| -> &'static str {
+        repaint_promise(d).unwrap_or("1분 넘게 이어지면 cys 가 키 입력 없이 창 크기를 한 칸 흔들어 다시 그리기를 요청한다 · 사람이 그 창 크기를 한 번 바꿔도 다시 그려진다")
+    };
+    let (code, body): (&'static str, String) = if let Some(body) = pause_remedy_body(d.kill_switch, d.paused) {
+        ("paused", body.into())
     } else if input_line && d.pending_input_bytes == 0 && d.draft_visible == Some(true) {
-        ("human_draft", REMEDY_BODY_HUMAN_DRAFT)
+        ("human_draft", REMEDY_BODY_HUMAN_DRAFT.into())
     } else if input_line && d.pending_input_bytes == 0 {
-        ("wait", "입력줄 계수는 이미 0 이다 — 다음 틱에 다시 판정된다(스스로 풀린다)")
+        ("wait", "입력줄 계수는 이미 0 이다 — 다음 틱에 다시 판정된다(스스로 풀린다)".into())
     } else if input_line && d.draft_visible == Some(true) && d.pending_input_human_bytes == 0 {
         (
             "machine_residue",
-            "기계가 넣고 제출되지 않은 본문이 입력줄에 보인다 — 사람이 그 창을 확인하고 Enter 로 제출하거나 지운다",
+            "기계가 넣고 제출되지 않은 본문이 입력줄에 보인다 — 사람이 그 창을 확인하고 Enter 로 제출하거나 지운다".into(),
         )
     } else if input_line && d.draft_visible == Some(true) {
-        ("human_draft", REMEDY_BODY_HUMAN_DRAFT)
+        ("human_draft", REMEDY_BODY_HUMAN_DRAFT.into())
     } else if input_line && d.draft_visible == Some(false) && d.ghost_after_cursor == Some(true) {
         (
             REMEDY_CODE_AFTER_CURSOR,
             "커서 앞은 비어 있는데 커서 뒤에 글자가 있다 — 회색 자동 제안이면 유령 계수다(사람이 그 창을 클릭하고 Ctrl-U 한 번). \
-             직접 쓴 글이면 초안이다(제출하거나 지운다). 사람이 화면을 보고 가린다",
+             직접 쓴 글이면 초안이다(제출하거나 지운다). 사람이 화면을 보고 가린다"
+                .into(),
         )
     } else if input_line && d.draft_visible == Some(false) {
         (
             REMEDY_CODE_PHANTOM,
-            "입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) — 사람이 그 창을 클릭하고 Ctrl-U 한 번(잠시 뒤 배달 재개)",
+            "입력줄은 비어 있는데 미제출 계수가 남았다(유령 계수) — 사람이 그 창을 클릭하고 Ctrl-U 한 번(잠시 뒤 배달 재개)".into(),
         )
     } else if input_line {
-        ("input_pending_unknown", REMEDY_BODY_INPUT_PENDING_UNKNOWN)
+        ("input_pending_unknown", unreadable_body(REMEDY_BODY_INPUT_PENDING_UNKNOWN, d))
     } else if blocked_by.starts_with("modal_pending") {
-        ("answer_modal", "질문·선택 창이 떠 있다 — 사람이 답한다")
+        // ★(성찰 M1) 오래 정적인 선택 창은 낡은 사본일 수 있다 — 다시 그리기는 키 입력이 아니라 진짜 선택 창이면 그대로 남는다(사람이 답한다는 처방은 불변).
+        match stale_quiet {
+            Some(q) => (
+                "answer_modal",
+                format!("질문·선택 창이 떠 있다 — 사람이 답한다({q}초째 화면 변화가 없다 — 선택 창이 낡은 화면 사본일 수도 있어 {}; 진짜 선택 창이면 다시 그려져도 그대로다)", promise(d)),
+            ),
+            None => ("answer_modal", "질문·선택 창이 떠 있다 — 사람이 답한다".into()),
+        }
     } else if blocked_by.starts_with("approval_pending") {
         (
             "approval",
-            "승인·관문 대기 — 승인 절차(feed)로 처리한다. 큐로 승인을 누르지 않는다",
+            "승인·관문 대기 — 승인 절차(feed)로 처리한다. 큐로 승인을 누르지 않는다".into(),
         )
     } else if blocked_by.starts_with("alt_screen") {
-        (
-            "alt_screen",
-            "전체화면(대체 화면)이라 프롬프트를 확인하지 못한다 — 전체화면 프로그램을 끝내거나, Claude Code 면 `/tui default`; \
-             Windows 는 `~/.cys/win-no-alt-screen` 파일을 만들고 새 pane 으로 띄운다",
-        )
+        // ★(성찰 M2) 전경이 에이전트(Claude Code 등)인 전체화면 좌석은 cys 가 다시 그리기를 요청한다 — 그 사실(또는 못 하는 사유)을 그대로 적는다.
+        //   전경이 다른 프로그램(vim·less 등)이면 종전 문장(약속 없음).
+        if d.alt_fg_agent {
+            (
+                "alt_screen",
+                format!(
+                    "전체화면(대체 화면)이라 프롬프트를 확인하지 못한다 — 전경이 에이전트라 {}. 그래도 막혀 있으면 Claude Code 면 `/tui default`; \
+                     Windows 는 `~/.cys/win-no-alt-screen` 파일을 만들고 새 pane 으로 띄운다",
+                    promise(d)
+                ),
+            )
+        } else {
+            (
+                "alt_screen",
+                "전체화면(대체 화면)이라 프롬프트를 확인하지 못한다 — 전체화면 프로그램을 끝내거나, Claude Code 면 `/tui default`; \
+                 Windows 는 `~/.cys/win-no-alt-screen` 파일을 만들고 새 pane 으로 띄운다"
+                    .into(),
+            )
+        }
     } else if blocked_by.starts_with("empty_seat") {
         if d.pending_input_bytes > 0 {
             clause = REMEDY_EMPTY_SEAT_COUNT_CLAUSE;
         }
         (
             "empty_seat",
-            "그 자리에 에이전트가 붙어 있지 않다(빈 셸) — 에이전트를 다시 띄우면 순서대로 배달된다",
+            "그 자리에 에이전트가 붙어 있지 않다(빈 셸) — 에이전트를 다시 띄우면 순서대로 배달된다".into(),
         )
     } else if blocked_by.starts_with("prompt_unknown") {
-        ("prompt_unknown", REMEDY_BODY_PROMPT_UNKNOWN)
+        ("prompt_unknown", unreadable_body(REMEDY_BODY_PROMPT_UNKNOWN, d))
+    } else if blocked_by.starts_with("busy") && stale_quiet.is_some() {
+        // ★(성찰 M1) 바쁨 표지("esc to interrupt")가 보이는데 출력이 1분 넘게 없다 — 표지가 낡은 화면 사본일 수 있다. 종전 "스스로 풀린다" 는 거짓이 될 수 있었다.
+        let q = stale_quiet.unwrap_or(0);
+        (
+            "wait",
+            format!("출력 중 표지가 보이지만 {q}초째 출력이 없다 — 표지가 낡은 화면 사본일 수 있다({}). 그래도 이어지면 그 창 화면을 확인", promise(d)),
+        )
     } else if REMEDY_WAIT_PREFIXES.iter().any(|p| blocked_by.starts_with(p)) {
-        ("wait", "일시 보류 — 스스로 풀린다(오래 지속되면 그 창 화면을 확인)")
+        ("wait", "일시 보류 — 스스로 풀린다(오래 지속되면 그 창 화면을 확인)".into())
     } else {
-        ("unknown", "사유 미분류 — 그 창 화면을 확인")
+        ("unknown", "사유 미분류 — 그 창 화면을 확인".into())
     };
     // ★(0.14.45 · F3) 화면을 못 읽어 막힌 두 갈래(`input_pending_unknown`·`prompt_unknown`)에서는 패닉이 '순간' 이 아니라 **사본 어긋남**의 원인이다 —
     //   본문이 다시 그리기 요청을 말하므로 주석은 사실만 적는다. 그 밖 갈래의 주석은 종전 바이트 그대로다.
@@ -11276,6 +11367,58 @@ pub(crate) fn force_deliver_entry(
 /// 양성 유휴 관측 포함) / 마커 없는 좌석은 `no_marker_gate` + quiet 규칙 → human_typing →
 /// 배달 최소 간격 → `deliver_head_locked`(임계영역: 간격·만료·프레임 신선도 재확인).
 /// 틱 머리에서 `queue_expiry_pass`(TTL 스윕·pause 크레딧·만료 통지)가 먼저 돈다.
+/// ★(0.14.45 · 성찰 M1·M2) 큐 틱이 마커 좌석의 한 관측을 다시 그리기 분류([`crate::repaint::ScreenObs`])로 접는 **순수 판정** — 배달 판정(`verdict`)의 입력이 아니다
+/// (nudge 전용 · 어떤 게이트도 바꾸지 않는다). 다시 그리기는 stdin 0 바이트(PTY 높이 한 줄 흔들기)라 진짜 모달·진짜 바쁨에도 해가 없다.
+///
+/// `Unreadable`(시계가 간다) = 발행된 프레임에서 다음 중 하나 ∧ (비-대체 화면 ∨ 전경이 에이전트):
+///   ⓐ 종전 — `prompt_unknown`·`input_pending` 막힘 ∧ 커서 행 마커 없음 ∧ 선택기 행 아님(화면 사본 어긋남의 지문).
+///   ⓑ ★M1 — `busy`·`modal_pending` 막힘 또는 선택기 행인데 출력이 [`STALE_SCREEN_QUIET_SECS`] 넘게 정적 — 낡은 사본의 "esc to interrupt"·`❯ 1. Yes` 는
+///      출력 없이 영원히 남아 큐가 굶는다(종전엔 이 꼴에 nudge 가 없고 처방은 "스스로 풀린다" 고 했다).
+///   ⓒ ★M2 — `alt_screen` 막힘 ∧ 전경이 에이전트(`alt_fg_agent`) — 종전엔 대체 화면이면 무조건 제외였는데 처방은 nudge 를 약속했다.
+/// `Readable`(시계·미복구 배수 리셋) = 준비 판정, 또는 발행된 프레임의 비-대체 화면·비-선택기 행에서 커서 행을 읽었다(종전 그대로 — 선택기 행은 복구 증거가 아니다 · A4).
+/// `Other` = 그 밖(발행 중 프레임 · 승인 대기 · 전경이 에이전트가 아닌 대체 화면 · 짧은 바쁨 등) — 시계만 지운다.
+pub(crate) fn nudge_screen_obs(verdict: &PromptGate, obs: &PromptObs, alt_fg_agent: bool) -> crate::repaint::ScreenObs {
+    use crate::repaint::ScreenObs;
+    if !obs.frame_published() {
+        return ScreenObs::Other;
+    }
+    let PromptGate::Blocked(blocked) = verdict else {
+        return ScreenObs::Readable;
+    };
+    let blocked = *blocked;
+    let screen_ok_to_nudge = !obs.alt_screen || alt_fg_agent;
+    // ⓑ 낡은 표지 — 커서 행이 읽혀도(바쁨 표지는 보통 입력줄 **근처**에 남는다) '판독 가능' 보다 먼저 본다: 그 화면은 복구의 증거가 아니라 굶김의 원인이다.
+    let stale_marker = (blocked == BLOCKED_BUSY || blocked == BLOCKED_MODAL || obs.selector_row) && obs.quiet_secs >= STALE_SCREEN_QUIET_SECS;
+    if stale_marker {
+        return if screen_ok_to_nudge { ScreenObs::Unreadable } else { ScreenObs::Other };
+    }
+    if obs.line.is_some() && !obs.alt_screen && !obs.selector_row {
+        return ScreenObs::Readable;
+    }
+    let desync = (blocked == BLOCKED_PROMPT_UNKNOWN || blocked == BLOCKED_INPUT_PENDING) && obs.line.is_none() && !obs.selector_row;
+    let alt_agent = blocked == BLOCKED_ALT_SCREEN && alt_fg_agent;
+    if screen_ok_to_nudge && (desync || alt_agent) {
+        ScreenObs::Unreadable
+    } else {
+        ScreenObs::Other
+    }
+}
+
+/// ★(0.14.45 · 성찰 M2) 이 좌석 PTY 의 **전경이 에이전트인가** — unix 는 틱이 적어 둔 에이전트 전경 그룹(`Surface::agent_fg_pgid` · 엄격 생존 증거)과 지금의
+/// `tcgetpgrp` 를 [`foreground_is_agent`] 로 대조한다(모르면 거짓 — 대체 화면의 vim·less 를 흔들지 않는다). 비-unix(윈도우)는 전경 판정이 없다 — 호출자가 이미
+/// **마커를 아는 에이전트 좌석**에서만 부르므로 참으로 둔다(다시 그리기는 stdin 0 바이트라 과잉의 손실은 한 번의 다시 그리기뿐).
+#[cfg(unix)]
+pub(crate) fn seat_foreground_is_agent(s: &crate::state::Surface) -> bool {
+    let agent = s.agent_fg_pgid.load(Ordering::Relaxed);
+    agent > 0 && foreground_is_agent(s.foreground_pgid_now(), agent)
+}
+
+/// 비-unix: 전경을 알 수 없다 — 마커 좌석(호출자 조건)이면 참.
+#[cfg(not(unix))]
+pub(crate) fn seat_foreground_is_agent(s: &crate::state::Surface) -> bool {
+    s.agent_meta.lock().map(|m| m.is_some()).unwrap_or(false)
+}
+
 fn deliver_queued(
     daemon: &Arc<Daemon>,
     depth_alerted: &mut HashMap<u64, f64>,
@@ -11509,22 +11652,10 @@ fn deliver_queued(
             //   다시 그리기를 요청한다(PTY 높이 한 줄 흔들기 · 전용 스레드 · 좌석당 5분 이상 간격). 판독 불가가 아니면 시계를
             //   지우고, **판독 가능**(준비 판정 또는 커서 행 관측)일 때만 미복구 배수도 지운다(A4 — 대체 화면·선택기 행 같은
             //   다른 사유는 '복구' 의 증거가 아니다).
-            let screen_unreadable = matches!(verdict, PromptGate::Blocked(w) if w == BLOCKED_PROMPT_UNKNOWN || w == BLOCKED_INPUT_PENDING)
-                && obs.line.is_none()
-                && !obs.alt_screen
-                && !obs.selector_row
-                && obs.frame_published();
-            //   '판독 가능' = 준비 판정, 또는 발행된 프레임의 비-대체 화면·비-선택기 행에서 커서 행을 읽었다 — 선택기 행
-            //   (`❯ 1. Yes`)은 커서 행이 읽혀도 작성기 복구의 증거가 아니라 배수를 지우지 않는다(리뷰 지적 #6).
-            let screen_obs = if screen_unreadable {
-                crate::repaint::ScreenObs::Unreadable
-            } else if matches!(verdict, PromptGate::Ready)
-                || (obs.line.is_some() && !obs.alt_screen && !obs.selector_row && obs.frame_published())
-            {
-                crate::repaint::ScreenObs::Readable
-            } else {
-                crate::repaint::ScreenObs::Other
-            };
+            //   ★(성찰 M1·M2) 분류는 순수 함수 [`nudge_screen_obs`] — 판독 불가(커서 행 마커 없음) 외에 **오래 정적인 바쁨·모달·선택기 행**(낡은
+            //   사본의 "esc to interrupt"·`❯ 1. Yes`)과 **전경이 에이전트인 대체 화면**도 다시 그리기 후보다. 배달 판정(`verdict`)은 손대지 않는다.
+            let alt_fg_agent = obs.alt_screen && seat_foreground_is_agent(&s);
+            let screen_obs = nudge_screen_obs(&verdict, &obs, alt_fg_agent);
             crate::repaint::note_queue_screen(daemon, &s, screen_obs);
             match verdict {
                 PromptGate::Blocked(why) => {
@@ -19671,7 +19802,10 @@ mod tests {
         assert_eq!(d.draft_visible, None, "판독 불가 = 결측");
         let (code, text) = super::queue_remedy(BLOCKED_INPUT_PENDING, &d);
         assert_eq!(code, "input_pending_unknown");
-        assert!(text.contains("다시 그리기를 요청한다"), "{text}");
+        // ★(성찰 M2) 이미 요청했고 아직 판독 가능한 화면을 못 봤다 — 처방은 '요청한다' 가 아니라 사실(요청했으나 풀리지 않음)을 말한다.
+        assert!(d.repaint_unresolved && d.quiet_secs.is_some() && !d.repaint_knob_off && !d.rows_too_small, "{d:?}");
+        assert!(text.contains("다시 그리기를 요청했으나 풀리지 않았다") && text.contains("창 크기를 한 번 바꾸거나"), "{text}");
+        assert!(!text.contains("다시 그리기를 요청한다"), "풀리지 않은 요청 뒤에 또 약속하지 않는다: {text}");
         // ③ 다시 그려졌다(커서가 마커 뒤) — 계수 0 이면 배달되고 재동기 시계·미복구 수가 지워진다.
         s.set_pending_input(0);
         paint_screen(&s, &idle, 1, 2, false);
@@ -19712,6 +19846,215 @@ mod tests {
         tick(&daemon);
         assert_eq!(blocked_reason(&s), BLOCKED_PROMPT_UNKNOWN);
         assert_eq!(count(&daemon), 0, "노브 끔이면 요청하지 않는다");
+        // ★(성찰 M2) 노브가 꺼져 있으면 처방도 약속하지 않는다 — '꺼져 있다 · 사람이 창 크기를 바꾼다'.
+        let d = super::queue_block_diag(&daemon, &s);
+        assert!(d.repaint_knob_off, "{d:?}");
+        let (_, t) = super::queue_remedy(BLOCKED_PROMPT_UNKNOWN, &d);
+        assert!(t.contains("다시 그리기 요청은 꺼져 있다") && t.contains("CYS_SCREEN_REPAINT_NUDGE=0") && !t.contains("다시 그리기를 요청한다"), "{t}");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(0.14.45 · 성찰 M1·M2) nudge 분류 순수 표 — 배달 판정은 건드리지 않고 **다시 그리기 후보**만 넓힌다: 낡은 사본의 바쁨·모달·선택기 행(출력 정적 ≥ 60초) ·
+    /// 전경이 에이전트인 대체 화면. 짧은 정적·발행 중 프레임·승인 대기·전경이 다른 프로그램인 대체 화면은 종전처럼 후보가 아니다.
+    #[test]
+    fn m1m2_nudge_screen_obs_table() {
+        use crate::repaint::ScreenObs::*;
+        let obs = |line: bool, alt: bool, sel: bool, quiet: u64, published: bool| super::PromptObs {
+            marker: "❯".into(),
+            marker_seen: true,
+            line: line.then(|| (String::new(), String::new())),
+            screen: String::new(),
+            selector_row: sel,
+            busy_near_cursor: false,
+            output_gen: 20,
+            output_gen_after: if published { 20 } else { 21 },
+            quiet_secs: quiet,
+            alt_screen: alt,
+            block: None,
+        };
+        let b = |w: &'static str| PromptGate::Blocked(w);
+        let cases: Vec<(&str, PromptGate, super::PromptObs, bool, crate::repaint::ScreenObs)> = vec![
+            ("준비 = 판독 가능", PromptGate::Ready, obs(true, false, false, 0, true), false, Readable),
+            ("커서 행 읽힘(비-alt·비-선택기) = 판독 가능", b(BLOCKED_INPUT_PENDING), obs(true, false, false, 0, true), false, Readable),
+            ("종전 ⓐ prompt_unknown ∧ 마커 없음", b(BLOCKED_PROMPT_UNKNOWN), obs(false, false, false, 0, true), false, Unreadable),
+            ("종전 ⓐ input_pending ∧ 마커 없음", b(BLOCKED_INPUT_PENDING), obs(false, false, false, 0, true), false, Unreadable),
+            ("발행 중 프레임은 어느 것도 아니다", b(BLOCKED_PROMPT_UNKNOWN), obs(false, false, false, 600, false), false, Other),
+            ("M1 바쁨 ∧ 정적 60초 = 낡은 표지 후보", b(BLOCKED_BUSY), obs(true, false, false, 60, true), false, Unreadable),
+            ("바쁨 ∧ 정적 59초 = 아직(커서 행이 읽히면 종전대로 판독 가능)", b(BLOCKED_BUSY), obs(true, false, false, 59, true), false, Readable),
+            ("바쁨 ∧ 정적 59초 ∧ 커서 행 없음 = 그 밖", b(BLOCKED_BUSY), obs(false, false, false, 59, true), false, Other),
+            ("M1 모달 ∧ 정적 60초", b(BLOCKED_MODAL), obs(true, false, false, 60, true), false, Unreadable),
+            ("M1 선택기 행 ∧ 정적 60초(커서 행이 읽혀도)", b(BLOCKED_MODAL), obs(true, false, true, 60, true), false, Unreadable),
+            ("선택기 행 ∧ 정적 10초 = 그 밖(복구 증거도 아니다 · A4)", b(BLOCKED_MODAL), obs(true, false, true, 10, true), false, Other),
+            ("승인 대기는 화면이 아니다 — 정적이어도 후보 아님(커서 행 읽힘 = 종전대로 판독 가능)", b(BLOCKED_APPROVAL), obs(true, false, false, 600, true), false, Readable),
+            ("승인 대기 ∧ 커서 행 없음 = 그 밖", b(BLOCKED_APPROVAL), obs(false, false, false, 600, true), false, Other),
+            ("M2 대체 화면 ∧ 전경 에이전트", b(BLOCKED_ALT_SCREEN), obs(false, true, false, 0, true), true, Unreadable),
+            ("대체 화면 ∧ 전경이 다른 프로그램 = 그 밖(vim·less 를 흔들지 않는다)", b(BLOCKED_ALT_SCREEN), obs(false, true, false, 600, true), false, Other),
+            ("대체 화면 ∧ 전경 에이전트 ∧ 낡은 바쁨", b(BLOCKED_BUSY), obs(true, true, false, 60, true), true, Unreadable),
+            ("대체 화면의 커서 행 읽힘은 '판독 가능' 이 아니다(종전 A4)", b(BLOCKED_ALT_SCREEN), obs(true, true, false, 0, true), false, Other),
+            ("짧은 바쁨(비-alt)은 그 밖", b(BLOCKED_BUSY), obs(false, false, false, 3, true), false, Other),
+        ];
+        for (name, v, o, fg, want) in cases {
+            assert_eq!(super::nudge_screen_obs(&v, &o, fg), want, "{name}");
+        }
+        assert_eq!(super::STALE_SCREEN_QUIET_SECS, 60);
+    }
+
+    /// ★(0.14.45 · 성찰 M1·M2) 처방 문장은 사실만 약속한다 — 바쁨·모달은 정적 60초부터 '낡은 사본일 수 있다 + 다시 그리기' 를 말하고, 대체 화면은 전경이 에이전트일 때만
+    /// 다시 그리기를 말하며, 노브 끔·창 너무 작음·요청했으나 미복구는 그 사실로 약속 구절을 바꾼다(code·접미·패닉 주석 위치는 불변 · 기본 갈래 바이트 불변).
+    #[test]
+    fn m1m2_remedy_text_tells_the_truth_about_the_nudge() {
+        let base = |q: Option<u64>| QueueBlockDiag { quiet_secs: q, input_model: "v3", ..QueueBlockDiag::default() };
+        // 바쁨: 59초까지는 종전 문장 · 60초부터 낡은 표지 문장(code 는 그대로 wait).
+        let (c, t) = queue_remedy(BLOCKED_BUSY, &base(Some(59)));
+        assert_eq!((c, t.as_str()), ("wait", &*format!("일시 보류 — 스스로 풀린다(오래 지속되면 그 창 화면을 확인){REMEDY_LLM_SUFFIX}")));
+        let (c, t) = queue_remedy(BLOCKED_BUSY, &base(Some(60)));
+        assert_eq!(c, "wait");
+        assert!(t.contains("60초째 출력이 없다") && t.contains("낡은 화면 사본일 수 있다") && t.contains("다시 그리기를 요청한다") && t.ends_with(REMEDY_LLM_SUFFIX), "{t}");
+        assert!(!t.contains("스스로 풀린다"), "낡은 표지에 '스스로 풀린다' 는 거짓이다: {t}");
+        assert_eq!(queue_remedy(BLOCKED_BUSY, &base(None)).1, queue_remedy(BLOCKED_BUSY, &base(Some(0))).1, "미측정은 짧은 정적과 같은 문장");
+        // 모달: 정적 60초부터 낡은 사본 가능성을 덧붙이되 '사람이 답한다' 는 그대로.
+        let (c, t) = queue_remedy(BLOCKED_MODAL, &base(Some(120)));
+        assert_eq!(c, "answer_modal");
+        assert!(t.starts_with("질문·선택 창이 떠 있다 — 사람이 답한다(120초째") && t.contains("진짜 선택 창이면 다시 그려져도 그대로다"), "{t}");
+        assert_eq!(queue_remedy(BLOCKED_MODAL, &base(Some(5))).1, format!("질문·선택 창이 떠 있다 — 사람이 답한다{REMEDY_LLM_SUFFIX}"));
+        // 대체 화면: 전경이 에이전트일 때만 다시 그리기 약속 · 아니면 종전 문장(약속 없음).
+        let (_, t) = queue_remedy(BLOCKED_ALT_SCREEN, &base(None));
+        assert!(!t.contains("다시 그리기") && t.contains("전체화면 프로그램을 끝내거나"), "{t}");
+        let fg = QueueBlockDiag { alt_fg_agent: true, ..base(None) };
+        let (c, t) = queue_remedy(BLOCKED_ALT_SCREEN, &fg);
+        assert_eq!(c, "alt_screen");
+        assert!(t.contains("전경이 에이전트라") && t.contains("다시 그리기를 요청한다") && t.contains("`/tui default`") && t.contains("~/.cys/win-no-alt-screen"), "{t}");
+        // 약속 구절 셋 — 어느 갈래(9행·14행·바쁨·모달·대체 화면)에서도 같은 사실 문장으로 바뀌고 '요청한다' 는 사라진다.
+        for (what, d, needle) in [
+            ("노브 끔", QueueBlockDiag { repaint_knob_off: true, ..base(Some(90)) }, "다시 그리기 요청은 꺼져 있다"),
+            ("창 너무 작음", QueueBlockDiag { rows_too_small: true, ..base(Some(90)) }, "창이 너무 작아 cys 가 크기를 흔들지 못한다"),
+            ("요청했으나 미복구", QueueBlockDiag { repaint_unresolved: true, ..base(Some(90)) }, "다시 그리기를 요청했으나 풀리지 않았다"),
+        ] {
+            let fg = QueueBlockDiag { alt_fg_agent: true, ..d.clone() };
+            let dpos = QueueBlockDiag { pending_input_bytes: 3, ..d.clone() };
+            for (blocked, dd, code) in [
+                (BLOCKED_INPUT_PENDING, &dpos, "input_pending_unknown"),
+                (BLOCKED_PROMPT_UNKNOWN, &d, "prompt_unknown"),
+                (BLOCKED_BUSY, &d, "wait"),
+                (BLOCKED_MODAL, &d, "answer_modal"),
+                (BLOCKED_ALT_SCREEN, &fg, "alt_screen"),
+            ] {
+                let (c, t) = queue_remedy(blocked, dd);
+                assert_eq!(c, code, "{what}: {blocked}");
+                assert!(t.contains(needle), "{what}: {blocked}: {t}");
+                assert!(!t.contains("다시 그리기를 요청한다"), "{what}: {blocked}: 약속할 수 없는데 약속한다: {t}");
+                assert!(t.ends_with(REMEDY_LLM_SUFFIX), "{t}");
+            }
+            // 우선순위: 노브 끔 > 창 너무 작음 > 미복구.
+        }
+        let all = QueueBlockDiag { repaint_knob_off: true, rows_too_small: true, repaint_unresolved: true, ..base(None) };
+        assert!(super::repaint_promise(&all).unwrap().contains("꺼져 있다"));
+        assert!(super::repaint_promise(&QueueBlockDiag { rows_too_small: true, repaint_unresolved: true, ..base(None) }).unwrap().contains("너무 작아"));
+        assert!(super::repaint_promise(&base(None)).is_none());
+        // 9행·14행 기본 갈래는 상수 바이트 그대로(문서가 인용) · 괄호 밖 문장("(프롬프트)" 포함)은 갈래가 바뀌어도 그대로다.
+        assert_eq!(queue_remedy(BLOCKED_PROMPT_UNKNOWN, &base(None)).1, format!("{}{REMEDY_LLM_SUFFIX}", super::REMEDY_BODY_PROMPT_UNKNOWN));
+        let (_, t) = queue_remedy(BLOCKED_PROMPT_UNKNOWN, &QueueBlockDiag { repaint_unresolved: true, ..base(None) });
+        assert!(t.starts_with("입력 대기 표지(프롬프트)를 화면에서 찾지 못했다 — 다른 화면이 떠 있거나 데몬의 화면 사본이 어긋났을 수 있다(cys 가 다시 그리기를 요청했으나") && t.contains("). 그래도 막혀 있으면"), "{t}");
+        let (_, t) = queue_remedy(BLOCKED_INPUT_PENDING, &QueueBlockDiag { pending_input_bytes: 2, repaint_unresolved: true, ..base(None) });
+        assert!(t.contains("). 다시 그려진 뒤에도 막혀 있으면 사람이 그 창을 확인한다(비어 있으면 Ctrl-U"), "{t}");
+        // 패닉 주석은 여전히 본문 뒤·접미 앞.
+        let (_, t) = queue_remedy(BLOCKED_BUSY, &QueueBlockDiag { parser_panics: 2, ..base(Some(70)) });
+        assert!(t.ends_with(&format!(" (이 좌석 화면 파서 패닉 2회 — 화면 판독이 순간 비었을 수 있다){REMEDY_LLM_SUFFIX}")), "{t}");
+    }
+
+    /// ★(0.14.45 · 성찰 M1) 실제 좌석 — 낡은 "esc to interrupt" 가 커서 근처에 남아 `busy` 로 막힌 채 출력이 60초 넘게 없으면 판독 불가 시계가 서고, 60초 뒤 다시 그리기 요청 1건
+    /// (키 입력 없음). 정적 59초면 시계가 서지 않는다. 배달 판정은 그대로 `busy` 다(nudge 전용).
+    #[test]
+    fn m1_stale_busy_marker_requests_repaint_without_touching_the_verdict() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("m1-stale-busy");
+        let (daemon, s) = wp5_seat("m1-stale-busy", "claude");
+        let e = daemon.next_queue_entry("[보고] m1".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        let count = |d: &Arc<Daemon>| d.bus.replay_after(0).into_iter().filter(|e| e["name"] == "screen.repaint_requested").count();
+        let stale = ["✻ Thinking… (esc to interrupt)", RULE, "❯ ", RULE, STATUS1];
+        // 정적 59초 — busy 이지만 후보가 아니다(시계 없음).
+        paint_screen(&s, &stale, 2, 2, false);
+        quiet_since(&s, 59);
+        tick(&daemon);
+        assert_eq!(blocked_reason(&s), BLOCKED_BUSY);
+        assert!(s.repaint.lock().unwrap().unreadable_since.is_none(), "59초 정적의 바쁨은 시계를 세우지 않는다");
+        // 정적 61초 — 후보(시계가 선다) · 아직 60초가 안 됐으니 요청 0.
+        quiet_since(&s, 61);
+        tick(&daemon);
+        assert_eq!(blocked_reason(&s), BLOCKED_BUSY, "배달 판정은 그대로다");
+        assert!(s.repaint.lock().unwrap().unreadable_since.is_some(), "낡은 바쁨 표지 = 판독 불가 시계");
+        assert_eq!(count(&daemon), 0);
+        let d = super::queue_block_diag(&daemon, &s);
+        let (code, t) = super::queue_remedy(BLOCKED_BUSY, &d);
+        assert_eq!(code, "wait");
+        assert!(t.contains("낡은 화면 사본일 수 있다") && t.contains("다시 그리기를 요청한다"), "{t}");
+        // 61초 전부터 시계 → 요청 1건 · stdin 불변 · 크기 원복.
+        s.repaint.lock().unwrap().unreadable_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+        let pending_before = s.pending_input_bytes.load(AtomicOrdering::Relaxed);
+        tick(&daemon);
+        assert_eq!(count(&daemon), 1, "낡은 바쁨 표지 60초 = 요청 1건");
+        let dl = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while s.repaint_in_flight.load(AtomicOrdering::Acquire) && std::time::Instant::now() < dl {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), pending_before, "stdin 0 바이트");
+        assert_eq!(s.parser.lock().unwrap().screen().size(), (24, 80));
+        // 요청 뒤 아직 판독 가능 화면을 못 봤다 → 처방은 '요청했으나 풀리지 않았다'.
+        let d = super::queue_block_diag(&daemon, &s);
+        assert!(d.repaint_unresolved);
+        assert!(super::queue_remedy(BLOCKED_BUSY, &d).1.contains("요청했으나 풀리지 않았다"));
+        // 다시 그려져 깨끗한 프롬프트 → 배달 · 시계·배수 리셋.
+        paint_screen(&s, &[RULE, "❯ ", RULE, STATUS1, STATUS2], 1, 2, false);
+        quiet_since(&s, 30);
+        *s.queue_blocked.lock().unwrap() = None;
+        tick(&daemon);
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 0, "다시 그려진 뒤 배달: {}", blocked_reason(&s));
+        let st = s.repaint.lock().unwrap();
+        assert!(st.unreadable_since.is_none() && st.unrecovered == 0);
+        drop(st);
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(0.14.45 · 성찰 M2 · unix) 대체 화면 좌석 — 전경이 에이전트 그룹(틱이 적어 둔 `agent_fg_pgid` == `tcgetpgrp`)이면 다시 그리기 후보다(종전엔 무조건 제외) ·
+    /// 처방도 '전경이 에이전트라 … 요청한다'. 전경 표식이 0 이면 종전처럼 제외(`f2_no_repaint_on_alt_screen_or_when_knob_is_off`).
+    #[cfg(unix)]
+    #[test]
+    fn m2_alt_screen_with_agent_foreground_is_nudged() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("m2-alt-fg");
+        let (daemon, s) = wp5_seat("m2-alt-fg", "claude");
+        let e = daemon.next_queue_entry("[보고] m2".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        let count = |d: &Arc<Daemon>| d.bus.replay_after(0).into_iter().filter(|e| e["name"] == "screen.repaint_requested").count();
+        let fg = s.foreground_pgid_now().expect("PTY 전경 그룹");
+        s.agent_fg_pgid.store(fg, AtomicOrdering::Relaxed);
+        assert!(super::seat_foreground_is_agent(&s));
+        // 괘선·상태줄 없는 맨 마커 행(레이아웃 미확인) · 커서는 마커 뒤 → 종전 판정 `alt_screen`.
+        paint_screen(&s, &["❯ "], 0, 2, true);
+        quiet_since(&s, 30);
+        tick(&daemon);
+        assert_eq!(blocked_reason(&s), BLOCKED_ALT_SCREEN, "배달 판정은 그대로(대체 화면)");
+        assert!(s.repaint.lock().unwrap().unreadable_since.is_some(), "전경이 에이전트인 대체 화면 = 후보");
+        let d = super::queue_block_diag(&daemon, &s);
+        assert!(d.alt_fg_agent, "{d:?}");
+        let (_, t) = super::queue_remedy(BLOCKED_ALT_SCREEN, &d);
+        assert!(t.contains("전경이 에이전트라") && t.contains("다시 그리기를 요청한다"), "{t}");
+        s.repaint.lock().unwrap().unreadable_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+        tick(&daemon);
+        assert_eq!(count(&daemon), 1, "대체 화면 + 전경 에이전트 = 요청 1건");
+        let dl = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while s.repaint_in_flight.load(AtomicOrdering::Acquire) && std::time::Instant::now() < dl {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // 전경 표식을 내리면(다른 프로그램이 전경) 후보가 아니다 — 시계가 지워지고 처방도 약속하지 않는다.
+        s.agent_fg_pgid.store(0, AtomicOrdering::Relaxed);
+        s.repaint.lock().unwrap().unreadable_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(600));
+        tick(&daemon);
+        assert_eq!(count(&daemon), 1);
+        assert!(s.repaint.lock().unwrap().unreadable_since.is_none());
+        let (_, t) = super::queue_remedy(BLOCKED_ALT_SCREEN, &super::queue_block_diag(&daemon, &s));
+        assert!(!t.contains("다시 그리기"), "{t}");
         let _ = s.child.lock().unwrap().kill();
     }
 
