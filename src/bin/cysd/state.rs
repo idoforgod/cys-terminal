@@ -487,6 +487,8 @@ pub fn queue_starved_payload(
         "input_model": diag.input_model,
         "remedy_code": remedy_code,
         "remedy": remedy,
+        // ★(0.14.45 · F3) 화면 동기 진단(커서 행 · 마커 행 · 커서 행 선두 코드포인트 · 마지막 패닉 · 마지막 다시 그리기 요청).
+        "screen_diag": crate::governance::screen_diag_json(diag),
     })
 }
 
@@ -1957,6 +1959,10 @@ pub struct Surface {
     pub dsr_dropped: AtomicU64,
     /// (W4) 마지막 파서 패닉 발생 epoch초(없으면 None) — 상습 트리거 포렌식용 health 신호.
     pub last_parser_panic: Mutex<Option<f64>>,
+    /// ★(0.14.45 · F2) 화면 사본 재동기(다시 그리기 요청) 상태 — leaf 락. 쓰는 곳은 `repaint::note_queue_screen` 하나다.
+    pub repaint: Mutex<crate::repaint::RepaintState>,
+    /// ★(0.14.45 · F2) 이 좌석에 크기 흔들기 스레드가 떠 있다(좌석당 동시 1건).
+    pub repaint_in_flight: AtomicBool,
     /// ★(T-0147-7 W2 · B6) **각성 래치** — 이 surface 가 처음 `status.set`(=cys set-status)을 보낸
     /// epoch초. 단일 write path = status.set 핸들러의 `get_or_insert`(1회성 래치 · 이후 불변).
     ///
@@ -2967,6 +2973,18 @@ pub fn send_write_req_bounded(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// 시험 전용: true 면 다음 `process_chunk_isolated` 한 번이 파서 반영 전에 패닉한다(한 번 쓰고 꺼진다).
+    static FORCE_PARSER_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 시험 전용: 이 스레드의 다음 청크 처리 한 번에 파서 패닉을 주입한다.
+#[cfg(test)]
+pub(crate) fn force_parser_panic_once() {
+    FORCE_PARSER_PANIC.with(|f| f.set(true));
+}
+
 /// (W4) PTY 청크를 vt100 파서에 반영하되, 파서 내부 인덱스 패닉을 격리한다.
 ///
 /// ★(0.14.45) 아래 row89 경로는 벤더 패치(vendor/vt100 — `Row::resize` 가 마지막 칸 넓은 글자 머리를
@@ -2988,18 +3006,6 @@ pub fn send_write_req_bounded(
 /// 않는다. rows/cols는 process 이전에 포착해 재초기화에 쓰므로(패닉 후 파서 재접근 없음),
 /// 이중 패닉 위험도 없다. `set_size`(escape) 등으로 청크 내 크기 변경이 있었다 해도 패닉 시엔
 /// 그 청크 전체를 폐기하므로 이전 크기 보존이 정합적이다(다음 resize RPC가 최종 정정).
-#[cfg(test)]
-thread_local! {
-    /// 시험 전용: true 면 다음 `process_chunk_isolated` 한 번이 파서 반영 전에 패닉한다(한 번 쓰고 꺼진다).
-    static FORCE_PARSER_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// 시험 전용: 이 스레드의 다음 청크 처리 한 번에 파서 패닉을 주입한다.
-#[cfg(test)]
-pub(crate) fn force_parser_panic_once() {
-    FORCE_PARSER_PANIC.with(|f| f.set(true));
-}
-
 fn process_chunk_isolated(
     parser: &mut vt100::Parser,
     chunk: &[u8],
@@ -6549,6 +6555,8 @@ impl Daemon {
             parser_panics: AtomicU64::new(0),
             dsr_dropped: AtomicU64::new(0),
             last_parser_panic: Mutex::new(None),
+            repaint: Mutex::new(crate::repaint::RepaintState::default()),
+            repaint_in_flight: AtomicBool::new(false),
             // ★W2 B6: 래치는 항상 None 으로 시작한다 — 생성 시점엔 아직 어떤 각성 증거도 없다.
             // restore 경로의 하이드레이션은 surface.create 핸들러가 topology 값으로 명시 주입한다
             // (여기서 유추하지 않는다 — 유추는 곧 위양성 래치이고, 그건 재주입 스킵 오판이 된다).
@@ -11147,6 +11155,7 @@ mod tests {
             paused: false,
             kill_switch: false,
             input_model: "v3",
+            ..crate::governance::QueueBlockDiag::default()
         }
     }
 
@@ -11182,7 +11191,13 @@ mod tests {
         let remedy = p["remedy"].as_str().expect("remedy 문장");
         assert!(remedy.contains("Ctrl-U"), "유령 계수 처방: {remedy}");
         assert!(remedy.ends_with(crate::governance::REMEDY_LLM_SUFFIX), "자동 조치 금지 접미: {remedy}");
-        assert_eq!(p.as_object().unwrap().len(), 15, "기존 7 + 가산 8 — 그 밖의 키가 새면 계약 변경이다: {p}");
+        // ★(0.14.45 · F3) 가산 키 1개 더 — `screen_diag`(객체 · 관측 불능 필드는 null).
+        assert_eq!(p.as_object().unwrap().len(), 16, "기존 7 + 가산 8 + screen_diag 1 — 그 밖의 키가 새면 계약 변경이다: {p}");
+        assert_eq!(
+            p["screen_diag"],
+            json!({"cursor_row": null, "marker_row": null, "cursor_lead_cp": null, "last_parser_panic_at": null, "repaint_requested_at": null}),
+            "결측은 null(값이 아니다)"
+        );
         // 커서 뒤에 글자가 있으면(회색 제안인지 직접 쓴 글인지 모른다) 유령 단정이 아니라 `after_cursor_text`(표 7행) — 사람이 화면을 보고 가린다.
         let p_after = queue_starved_payload("surface:5", Some("cso".into()), &head, 4200, 3, blocked, &c5_diag_ga(Some(false), Some(true)));
         assert_eq!(p_after["remedy_code"], json!("after_cursor_text"));
