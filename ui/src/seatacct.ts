@@ -34,8 +34,10 @@ export interface SeatAcct {
   provider: string;
   accountId: string;
   profile: string;
-  /** 모를 때의 사유 코드(no_key · none · folder_unknown · no_login · unread · unsupported · stale · bad). known 이면 "known". */
+  /** 모를 때의 사유 코드(no_key · none · folder_unknown · no_login · unread · unsupported · stale · bad · pending · mismatch). known 이면 "known". */
   state: string;
+  /** ★(2회차 M2) `mismatch` 일 때 데몬이 기록한 설정 폴더(`recorded_profile`) — `profile` 은 실제 관측 폴더다. 그 밖은 "". */
+  recordedProfile: string;
 }
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
@@ -51,16 +53,20 @@ export const SEAT_ACCT_REASON: Record<string, string> = {
   unsupported: "이 에이전트의 계정은 cys 가 확인할 수 없습니다",
   stale: "데몬 응답이 끊겨 최근 계정 정보가 없습니다",
   bad: "데몬이 보낸 계정 정보를 해석하지 못했습니다",
-  // ★(0.14.45 · 성찰 M5) 데몬이 기록한 설정 폴더를 믿을 수 없다(호출자가 계정 폴더를 바꿨거나 복원 좌석) + 실제 대화 기록이 아직 관측되지 않았다.
-  mismatch: "데몬이 기록한 설정 폴더와 실제 실행 폴더가 다를 수 있습니다(복원 좌석·수동 CLAUDE_CONFIG_DIR) — 대화가 시작되면 실제 폴더로 확인되고, 급하면 그 창에서 /config 로 확인",
+  // ★(0.14.45 · 성찰 M5 · 2회차 M2) 데몬이 기록한 설정 폴더를 아직 확인하지 못했다(복원 좌석·수동 CLAUDE_CONFIG_DIR) — 실제 대화 기록이 관측되면 확인된다. 불일치가 아니다.
+  pending: "데몬이 기록한 설정 폴더를 아직 확인하지 못했습니다(복원 좌석·수동 CLAUDE_CONFIG_DIR) — 대화가 시작되면 실제 폴더로 확인되고, 급하면 그 창에서 /config 로 확인",
+  // ★(2회차 M2) 실제 대화 기록의 폴더가 데몬이 기록한 폴더 **밖**이다 — 관측이 기록을 부정했다(경보·사용량 귀속은 여전히 기록 폴더).
+  mismatch: "실제 대화 기록의 설정 폴더가 데몬이 기록한 폴더와 다릅니다 — 그 창에서 /config 로 확인하고, 계정을 바꾸려면 좌석을 다시 띄우세요",
 };
 export const SEAT_ACCT_UNKNOWN_LABEL = "계정 미확인";
-/** ★(0.14.45 · 성찰 M5) 확인되지 않은 기록 폴더뿐인 좌석 — '미확인' 과 달리 **기록은 있으나 검증 불가** 라 따로 묶는다(확인된 계정으로 보이지 않게). */
+/** ★(2회차 M2) 기록은 있으나 아직 관측으로 확인되지 않은 좌석(복원 좌석 등) — '미확인'·'불일치' 와 다른 묶음(확인된 계정으로도 불일치로도 보이지 않게). */
+export const SEAT_ACCT_PENDING_LABEL = "계정 확인 중";
+/** ★(0.14.45 · 성찰 M5 · 2회차 M2) 관측이 기록 폴더를 **실제로 부정**한 좌석 — 확인된 계정으로 보이지 않게 따로 묶는다. */
 export const SEAT_ACCT_MISMATCH_LABEL = "계정 불일치·확인 필요";
 
 /** 좌석 신호 → 계정 해석. 낡은 신호(staleMs 초과)는 stale — 옛 계정을 지금 것으로 말하지 않는다. */
 export function parseSeatAccount(sig: SeatAcctSig, nowMs: number, staleMs: number): SeatAcct {
-  const unknown = (state: string, provider = "", profile = ""): SeatAcct => ({ known: false, key: "", provider, accountId: "", profile, state });
+  const unknown = (state: string, provider = "", profile = "", recordedProfile = ""): SeatAcct => ({ known: false, key: "", provider, accountId: "", profile, state, recordedProfile });
   if (!(Number.isFinite(sig.at) && nowMs - sig.at <= staleMs)) return unknown("stale");
   if (!sig.present) return unknown("no_key");
   const r = sig.raw;
@@ -70,8 +76,9 @@ export function parseSeatAccount(sig: SeatAcctSig, nowMs: number, staleMs: numbe
   const accountId = str(r.account_id);
   const profile = str(r.profile);
   const state = str(r.state);
-  if (state === "known" && provider && accountId) return { known: true, key: `${provider}:${accountId}`, provider, accountId, profile, state };
-  return unknown(state && SEAT_ACCT_REASON[state] ? state : "bad", provider, profile);
+  if (state === "known" && provider && accountId) return { known: true, key: `${provider}:${accountId}`, provider, accountId, profile, state, recordedProfile: "" };
+  // ★(2회차 M2) `mismatch` 는 관측 폴더의 계정(account_id)이 실려 올 수 있지만 **known 이 아니다** — 어느 계정 묶음에도 붙이지 않는다(툴팁에만 두 폴더).
+  return unknown(state && SEAT_ACCT_REASON[state] ? state : "bad", provider, profile, state === "mismatch" ? str(r.recorded_profile) : "");
 }
 
 /** 역할 → 짧은 표기(사이드바 폭). reviewer-codex → rv-codex. 역할이 없으면 `#sid`. */
@@ -146,6 +153,8 @@ export function buildWsAccountGroups(
   const known = new Map<string, { sa: SeatAcct; roles: string[] }>();
   const unknownRoles: { role: string; why: string }[] = [];
   const mismatchRoles: { role: string; why: string }[] = [];
+  const pendingRoles: { role: string; why: string }[] = [];
+  const shown = (p: string): string => (hidePaths ? profileTail(p) : p);
   for (const { sid, sig } of seats) {
     if (!sig || sig.exited) continue;
     const hasRole = typeof sig.role === "string" && sig.role.trim() !== "";
@@ -154,9 +163,14 @@ export function buildWsAccountGroups(
     const role = roleShort(sig.role, sid);
     if (!sa.known) {
       const why = SEAT_ACCT_REASON[sa.state] ?? SEAT_ACCT_REASON.bad;
-      // ★(M5) 불일치는 '미확인' 과 다른 묶음 — 기록 폴더는 툴팁에만(계정의 대용이 아니다 · 🔒 가림 규칙 그대로).
-      if (sa.state === "mismatch") mismatchRoles.push({ role, why: sa.profile ? `${why} · 기록된 폴더: ${hidePaths ? profileTail(sa.profile) : sa.profile}` : why });
-      else unknownRoles.push({ role, why });
+      // ★(M5 · 2회차 M2) 확인 중·불일치는 '미확인' 과 다른 묶음 — 폴더는 툴팁에만(계정의 대용이 아니다 · 🔒 가림 규칙 그대로).
+      if (sa.state === "pending") pendingRoles.push({ role, why: sa.profile ? `${why} · 기록된 폴더: ${shown(sa.profile)}` : why });
+      else if (sa.state === "mismatch") {
+        const parts = [why];
+        if (sa.profile) parts.push(`실제 폴더: ${shown(sa.profile)}`);
+        if (sa.recordedProfile) parts.push(`기록된 폴더: ${shown(sa.recordedProfile)}`);
+        mismatchRoles.push({ role, why: parts.join(" · ") });
+      } else unknownRoles.push({ role, why });
       continue;
     }
     const g = known.get(sa.key);
@@ -180,7 +194,17 @@ export function buildWsAccountGroups(
       key: "",
       label: SEAT_ACCT_MISMATCH_LABEL,
       roles: mismatchRoles.map((u) => u.role),
-      title: [`${SEAT_ACCT_MISMATCH_LABEL} — 기록된 설정 폴더의 계정을 확인된 것으로 표시하지 않습니다`, ...mismatchRoles.map((u) => `${u.role}: ${u.why}`)].join("\n"),
+      title: [`${SEAT_ACCT_MISMATCH_LABEL} — 실제 대화 기록의 폴더가 기록된 설정 폴더와 달라 확인된 계정으로 표시하지 않습니다`, ...mismatchRoles.map((u) => `${u.role}: ${u.why}`)].join("\n"),
+      unknown: true,
+    });
+  }
+  if (pendingRoles.length) {
+    pendingRoles.sort((x, y) => byRole(x.role, y.role));
+    out.push({
+      key: "",
+      label: SEAT_ACCT_PENDING_LABEL,
+      roles: pendingRoles.map((u) => u.role),
+      title: [`${SEAT_ACCT_PENDING_LABEL} — 기록된 설정 폴더를 아직 대화 기록으로 확인하지 못해 계정을 표시하지 않습니다`, ...pendingRoles.map((u) => `${u.role}: ${u.why}`)].join("\n"),
       unknown: true,
     });
   }

@@ -478,16 +478,27 @@ fn claude_resolution(home: Option<&Path>, dir: &Path, ident: Ident) -> Resolutio
     )
 }
 
-/// 단일 홈 provider(codex·agy) → 귀속 결과. 미지 agent → None. (agy 는 데이터 폴더 **존재**만 본다 — 메타데이터.)
-fn fixed_resolution(home: Option<&Path>, agent: &str) -> Option<Resolution> {
+/// ★(성찰 2회차 C2 · 순수) 좌석 에이전트 이름 → 계정 축 provider(`usage.accounts` 의 키와 같은 표기) — **한 정의처**. 사용량 귀속([`fixed_resolution`])과
+/// 좌석별 `account` 키([`seat_account_json`])가 같은 표를 쓴다(둘이 갈리면 같은 좌석이 사용량 칸과 부서 카드에서 다른 제공자로 보인다). 모르는 에이전트는 None.
+fn provider_for_agent(agent: &str) -> Option<&'static str> {
     match agent {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "gemini" | "agy" | "antigravity" => Some("antigravity"),
+        _ => None,
+    }
+}
+
+/// 단일 홈 provider(codex·agy) → 귀속 결과. 미지 agent·claude(폴더 축) → None. (agy 는 데이터 폴더 **존재**만 본다 — 메타데이터.)
+fn fixed_resolution(home: Option<&Path>, agent: &str) -> Option<Resolution> {
+    match provider_for_agent(agent)? {
         "codex" => Some((
             AccountKey { provider: "codex".into(), account_id: "default".into() },
             "OpenAI Codex".into(),
             None,
             Some(".codex".into()),
         )),
-        "gemini" | "agy" | "antigravity" => Some((
+        "antigravity" => Some((
             AccountKey { provider: "antigravity".into(), account_id: "default".into() },
             "Antigravity (agy)".into(),
             None,
@@ -1567,12 +1578,12 @@ pub struct SeatIdent {
     pub surface_id: u64,
     /// 좌석 에이전트 — `agent_meta` 이름, 없으면 관측 스냅샷의 agent. None = 모름(에이전트 증거 없는 셸 등).
     pub agent: Option<String>,
-    /// 신원을 읽은 설정 폴더(claude 좌석만 · None = 폴더 미상 **또는** 검증되지 않은 기록뿐 — 아래 `unverified_dir`).
+    /// **경보 귀속** 설정 폴더(claude 좌석만 · [`alert_seat_folder`] — 기록이 이긴다 · None = 폴더 미상). `in_use`·워치독·`rate_in_use` 가 이 폴더의 신원을 쓴다.
     pub folder: Option<String>,
-    /// ★(0.14.45 · 성찰 M5) 검증되지 않은 기록 폴더(claude 좌석만 · [`SeatFolder::Unverified`]) — 호출자가 계정 폴더를 갈아끼웠거나 복원 좌석인데 transcript 가
-    /// 아직 관측되지 않았다. 이 폴더의 신원을 읽지 않는다(계정 불일치·확인 필요 = `account.state:"mismatch"`). `folder` 가 Some 이면 늘 None.
-    pub unverified_dir: Option<String>,
-    /// 그 폴더의 **현재** 신원 account_id(None = 폴더 미상이거나 신원 판독 실패).
+    /// ★(0.14.45 · 성찰 M5 · 2회차 M2) **표시** 판정([`SeatFolder`] · claude 좌석만 · 그 밖은 `Unknown`) — `account` 키(부서 카드)만 쓴다. 복원 좌석 등 신뢰되지 않은 기록에
+    /// 관측이 없으면 `Pending`(「계정 확인 중」) · 관측이 기록을 부정하면 `Mismatch`. 경보 귀속(`folder`)과 다를 수 있다(그때 표시 신원은 캐시에서 따로 읽는다).
+    pub(crate) display: SeatFolder,
+    /// 경보 귀속 폴더(`folder`)의 **현재** 신원 account_id(None = 폴더 미상이거나 신원 판독 실패).
     pub current_account: Option<String>,
     /// 신원을 판독해 account_id 를 얻었는가(= `current_account.is_some()`).
     pub known: bool,
@@ -1661,33 +1672,45 @@ fn agent_is_claude(agent: Option<&str>) -> bool {
     agent == Some("claude")
 }
 
-/// ★(0.14.45 · 성찰 M5) 좌석 설정 폴더의 **3값** — 기록된 폴더를 그대로 믿지 않는다.
+/// ★(0.14.45 · 성찰 M5 · 2회차 M2) 좌석 설정 폴더의 **표시 판정**(4값) — `surface.list`·`org.status` 의 `account` 키(화면의 부서 카드)만 쓴다.
+/// 경보·`in_use`·워치독의 좌석 신원 표는 이것을 쓰지 **않는다**([`alert_seat_folder`] — 기록 폴더가 이긴다 · v0.14.44 규칙 그대로).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SeatFolder {
-    /// 신원을 읽어도 되는 폴더 — 데몬이 스스로 해소한 기록(`config_dir_trusted`)이거나, 관측된 transcript 가 **실제로** 그 폴더 아래다.
+    /// 신원을 읽어도 되는 폴더 — 데몬이 스스로 해소한 기록(`config_dir_trusted`)이거나, 관측된 transcript 가 **실제로** 그 폴더 아래거나, 기록 없이 관측만 있다.
     Verified(String),
-    /// 기록은 있으나 **검증할 수 없다** — 호출자 env 가 계정 폴더를 갈아끼웠거나(`config_dir_trusted=false` · 복원 좌석 · 수동 `CLAUDE_CONFIG_DIR`)
-    /// 아직 transcript 가 관측되지 않았다. 그 폴더의 신원을 이 좌석의 계정으로 **말하지 않는다**(값 = 기록된 폴더 · 표시 근거일 뿐).
-    Unverified(String),
+    /// 기록은 있으나 아직 **확인 전** — 호출자가 계정 폴더를 준 좌석(`config_dir_trusted=false` · 복원 좌석 · 수동 `CLAUDE_CONFIG_DIR`)인데 transcript 가
+    /// 아직 관측되지 않았다. 화면은 「계정 확인 중」(`state:"pending"`) — 불일치가 아니다(아무 관측도 기록을 부정하지 않았다). 값 = 기록된 폴더(표기 근거).
+    Pending(String),
+    /// 관측된 transcript 의 프로필 폴더가 기록 폴더 **밖**이다 — 관측이 기록을 실제로 부정했다(`state:"mismatch"` · 계정 불일치·확인 필요).
+    /// `observed` = 관측 폴더(표시 신원은 이 폴더에서) · `recorded` = 기록 폴더(경보 귀속은 여전히 이 폴더).
+    Mismatch { observed: String, recorded: String },
     /// 폴더 미상 — 기록도 관측도 없다.
     Unknown,
 }
 
 impl SeatFolder {
-    /// 신원을 읽어도 되는 폴더만.
-    fn verified(&self) -> Option<&str> {
+    /// 표시 신원을 읽을 폴더 — `Verified` 의 폴더 또는 `Mismatch` 의 **관측** 폴더. `Pending`·`Unknown` 은 None(신원을 읽지 않는다).
+    fn display_folder(&self) -> Option<&str> {
         match self {
             SeatFolder::Verified(f) => Some(f.as_str()),
-            SeatFolder::Unverified(_) | SeatFolder::Unknown => None,
+            SeatFolder::Mismatch { observed, .. } => Some(observed.as_str()),
+            SeatFolder::Pending(_) | SeatFolder::Unknown => None,
         }
     }
-    /// 검증되지 않은 기록 폴더만.
-    fn unverified(&self) -> Option<&str> {
-        match self {
-            SeatFolder::Unverified(f) => Some(f.as_str()),
-            SeatFolder::Verified(_) | SeatFolder::Unknown => None,
-        }
+}
+
+/// ★(성찰 2회차 M2 · 순수) **경보 귀속용** 좌석 설정 폴더 — v0.14.44 의 `resolve_seat_folder` 와 같은 규칙(바이트 동일): 기록(`claude_config_dir` · 데몬이 좌석에 넣어 준
+/// `CLAUDE_CONFIG_DIR` — restore 좌석은 topology 원값)이 있으면 **그 기록** · 없으면 관측 transcript 경로의 프로필 폴더 · 그것도 없으면 None(폴더 미상).
+/// `config_dir_trusted` 를 요구하지 않고 호출자가 준 transcript 경로로 신원 파일을 고르지 않는다(handlers.rs `usage.report` 의 fatal-fix (a)·ROLE-2 와 같은 원칙 —
+/// restore 좌석은 전부 `trusted=false` 라 그것을 요구하면 재시작마다 모든 claude 계정의 `in_use` 가 '모름' 이 돼 낡은 경보 억제(B3)가 꺼지고 워치독 신원 표가 전멸한다).
+pub(crate) fn alert_seat_folder(config_dir: Option<&str>, session_file: &str) -> Option<String> {
+    if let Some(c) = config_dir.map(str::trim).filter(|c| !c.is_empty()) {
+        return Some(c.to_string());
     }
+    if session_file.trim().is_empty() {
+        return None;
+    }
+    profile_dir_from_session(session_file).map(|p| p.to_string_lossy().into_owned())
 }
 
 /// 두 폴더 경로가 같은 곳을 가리키는가(순수 · 문자열 비교 · 플랫폼 의미론 주입) — [`crate::reclaim::norm_path_on`] 으로 표기(역슬래시·MSYS `/c/`·확장 접두·
@@ -1735,10 +1758,12 @@ pub(crate) fn resolve_seat_folder(config_dir: Option<&str>, trusted: bool, sessi
 /// 부서 계정 폴더나 손으로 준 `CLAUDE_CONFIG_DIR` 로 떠 있으면, 카드가 **엉뚱한 계정을 확인된 것처럼** 보였다. 규칙(위에서부터 첫 일치):
 ///   1. 관측된 transcript 가 **기록 폴더 아래**(`<기록>/projects/…` — 표기를 접어 비교 · [`session_in_profile_on`])면 기록이 확인된 것이다 → `Verified(기록)`
 ///      (기록 폴더 이름에 `/projects/` 가 있어도 · 윈도우 MSYS 표기여도 기록의 네이티브 표기를 쓴다).
-///   2. 그 밖에 관측된 transcript 의 프로필 폴더가 있으면 **그것**이 사실이다(기록과 다르면 관측이 이긴다) → `Verified(관측)`.
-///   3. 관측이 없고 기록이 신뢰되면 → `Verified(기록)`.
-///   4. 관측이 없고 기록은 있으나 신뢰되지 않으면 → `Unverified(기록)`(계정 불일치·확인 필요 — 확인되지 않은 계정을 확인된 것으로 내지 않는다).
-///   5. 둘 다 없으면 → `Unknown`.
+///   2. 그 밖에 관측된 transcript 의 프로필 폴더가 있고 기록도 있으면 관측이 기록을 **실제로 부정**한 것이다 → `Mismatch{관측, 기록}`(표시 신원은 관측 폴더 · 성찰 2회차 M2).
+///   3. 관측만 있으면(기록 없음) → `Verified(관측)`.
+///   4. 관측이 없고 기록이 신뢰되면 → `Verified(기록)`.
+///   5. 관측이 없고 기록은 있으나 신뢰되지 않으면 → `Pending(기록)`(「계정 확인 중」 — 아직 아무 관측도 기록을 부정하지 않았으니 불일치가 아니다 · 확인된 계정으로도 내지 않는다).
+///   6. 둘 다 없으면 → `Unknown`.
+/// ★이 판정은 **표시 전용**이다 — 경보·`in_use` 의 좌석 신원 표는 [`alert_seat_folder`](기록이 이긴다)를 쓴다(성찰 2회차 M2 — 두 소비자를 갈랐다).
 pub(crate) fn resolve_seat_folder_on(config_dir: Option<&str>, trusted: bool, session_file: &str, windows: bool) -> SeatFolder {
     let recorded = config_dir.map(str::trim).filter(|c| !c.is_empty());
     if let Some(r) = recorded {
@@ -1747,9 +1772,10 @@ pub(crate) fn resolve_seat_folder_on(config_dir: Option<&str>, trusted: bool, se
         }
     }
     match (observed_profile_dir_on(session_file, windows), recorded) {
-        (Some(o), _) => SeatFolder::Verified(o),
+        (Some(o), Some(r)) => SeatFolder::Mismatch { observed: o, recorded: r.to_string() },
+        (Some(o), None) => SeatFolder::Verified(o),
         (None, Some(r)) if trusted => SeatFolder::Verified(r.to_string()),
-        (None, Some(r)) => SeatFolder::Unverified(r.to_string()),
+        (None, Some(r)) => SeatFolder::Pending(r.to_string()),
         (None, None) => SeatFolder::Unknown,
     }
 }
@@ -1759,10 +1785,10 @@ pub(crate) fn resolve_seat_folder_on(config_dir: Option<&str>, trusted: bool, se
 pub(crate) struct SeatRow {
     pub(crate) id: u64,
     pub(crate) agent: Option<String>,
-    /// 신원을 읽어도 되는 폴더(claude 좌석만 · [`SeatFolder::verified`]).
+    /// **경보 귀속** 폴더(claude 좌석만 · [`alert_seat_folder`] — 기록이 이긴다 · v0.14.44 규칙). 신원 표(`in_use`·워치독)가 신원을 읽는 폴더.
     pub(crate) folder: Option<String>,
-    /// 검증되지 않은 기록 폴더(claude 좌석만 · [`SeatFolder::unverified`]) — 신원을 읽지 않는다.
-    pub(crate) unverified_dir: Option<String>,
+    /// **표시** 판정(claude 좌석만 · [`resolve_seat_folder`]) — `account` 키만 쓴다. claude 가 아니면 `Unknown`.
+    pub(crate) display: SeatFolder,
 }
 
 /// 좌석 표 복사(surfaces 락 안 — 메모리 복사뿐 · 파일 IO 없음). None = 수집 실패(락 오염).
@@ -1780,17 +1806,16 @@ fn collect_seat_rows(daemon: &Arc<Daemon>) -> Option<Vec<SeatRow>> {
             None => (None, String::new()),
         };
         let agent = meta_agent.or(obs_agent);
-        let folder = if agent_is_claude(agent.as_deref()) {
-            resolve_seat_folder(config_dir.as_deref(), s.config_dir_trusted, &session_file)
+        // ★(성찰 2회차 M2) 두 판정을 가른다 — 경보 귀속은 기록이 이기는 v0.14.44 규칙(`alert_seat_folder` · trusted 무관) · 표시는 4값(`resolve_seat_folder`).
+        let (folder, display) = if agent_is_claude(agent.as_deref()) {
+            (
+                alert_seat_folder(config_dir.as_deref(), &session_file),
+                resolve_seat_folder(config_dir.as_deref(), s.config_dir_trusted, &session_file),
+            )
         } else {
-            SeatFolder::Unknown
+            (None, SeatFolder::Unknown)
         };
-        out.push(SeatRow {
-            id: s.id,
-            agent,
-            folder: folder.verified().map(str::to_string),
-            unverified_dir: folder.unverified().map(str::to_string),
-        });
+        out.push(SeatRow { id: s.id, agent, folder, display });
     }
     Some(out)
 }
@@ -1890,6 +1915,16 @@ pub(crate) fn seat_identity_view_in(daemon: &Arc<Daemon>, home: Option<&Path>, n
             }
         }
     }
+    // ★(성찰 2회차 M2) 표시 폴더가 경보 귀속 폴더와 다른 좌석(`Mismatch` 의 관측 폴더 · 기록 없이 관측만 있는데 프로필 자르기가 다른 경우)은 그 폴더의 신원도
+    //   같은 60초 캐시로 읽어 둔다(읽기-통과 · `seat_account_map` 은 캐시만 엿본다 · 추가 IO 는 그런 좌석이 있을 때만). 신원 표(`claude_folders` · `in_use`)에는 넣지 않는다.
+    let mut warmed: BTreeSet<&str> = BTreeSet::new();
+    for r in &rows {
+        if let Some(f) = r.display.display_folder() {
+            if !by_folder.contains_key(f) && warmed.insert(f) {
+                let _ = folder_identity(daemon, home, f, now);
+            }
+        }
+    }
     {
         // **낡은 항목만** 걷는다(확인한 지 [`SEAT_IDENT_PRUNE_SECS`] 가 지난 폴더) — 좌석이 오가며 폴더가 바뀌어도 크기가 유계이고, 같은 캐시를 쓰는 다른 소비자(알려진 프로필
         // 폴더 전체 등 — `folder_identity`)의 항목은 신원 표를 만들 때 지워지지 않는다(지우면 그 소비자의 60초 하한이 무력화돼 폴더를 매번 stat 한다).
@@ -1925,7 +1960,7 @@ fn assemble_seat_view(rows: Vec<SeatRow>, by_folder: BTreeMap<String, Option<Str
     let mut agents = AgentsAlive::default();
     let mut claude_folder_unknown = false;
     let mut seats = Vec::with_capacity(rows.len());
-    for SeatRow { id, agent, folder, unverified_dir } in rows {
+    for SeatRow { id, agent, folder, display } in rows {
         match agent.as_deref() {
             Some("claude") => {
                 agents.claude = true;
@@ -1942,7 +1977,7 @@ fn assemble_seat_view(rows: Vec<SeatRow>, by_folder: BTreeMap<String, Option<Str
             surface_id: id,
             agent,
             folder,
-            unverified_dir,
+            display,
             known: current_account.is_some(),
             current_account,
         });
@@ -2148,24 +2183,21 @@ pub fn seat_usage_wire(
 // (provider, account_id)와 맞춰 별명·이메일(툴팁)을 고른다. **새 IO 0**: 신원 표는 부른 쪽이 이미 만들었고(60초 캐시), 상태 구분은 캐시 엿보기([`peek_folder_state`])뿐이다.
 // ★결측은 값이 아니다 — 모르는 것은 `account_id: null` + 사유(`state`)로 보낸다. 추측(폴더 이름으로 계정을 짐작)하지 않는다.
 
-/// 좌석 에이전트 이름 → 계정 축 provider(`usage.accounts` 의 키와 같은 표기). 모르는 에이전트는 None — cys 가 그 신원을 읽는 경로가 없다.
+/// 좌석 에이전트 이름 → 계정 축 provider — [`provider_for_agent`] 의 별칭(C2 · 한 정의처). 모르는 에이전트는 None — cys 가 그 신원을 읽는 경로가 없다.
 fn seat_provider(agent: &str) -> Option<&'static str> {
-    match agent {
-        "claude" => Some("claude"),
-        "codex" => Some("codex"),
-        "gemini" | "agy" | "antigravity" => Some("antigravity"),
-        _ => None,
-    }
+    provider_for_agent(agent)
 }
 
 /// ★순수: 좌석 하나의 `account` 객체. 에이전트 증거가 없는 좌석(셸)은 `null`.
-///   · claude: `who` 가 `Known(id)` 면 `state:"known"` + `account_id`. 폴더 미상이면 `"folder_unknown"`, 로그인 없음 확정이면 `"no_login"`, 읽지 못했으면 `"unread"` — 셋 다 `account_id:null`.
-///     `profile` 은 설정 폴더(`usage.accounts` 의 `profiles` 와 같은 홈 상대 표기) — 모를 때도 근거로 싣지만 **계정의 대용이 아니다**.
-///     ★(0.14.45 · 성찰 M5) `unverified`(검증되지 않은 기록 폴더 — [`SeatFolder::Unverified`])가 있으면 `state:"mismatch"` · `account_id:null` · `profile` = 그 기록 폴더(근거 표기용).
-///     기록 폴더의 신원을 읽어 내지 않는다 — 확인되지 않은 계정을 확인된 것처럼 보이지 않게(화면은 「계정 불일치·확인 필요」).
+///   · claude(`display` = 표시 판정 [`SeatFolder`] · `who` = 표시 폴더의 신원 상태):
+///     `Verified(f)` — `who` 가 `Known(id)` 면 `state:"known"` + `account_id` · 로그인 없음 확정이면 `"no_login"` · 읽지 못했으면 `"unread"`(둘 다 `account_id:null`).
+///     `Unknown` — `"folder_unknown"`. `profile` 은 설정 폴더(`usage.accounts` 의 `profiles` 와 같은 홈 상대 표기) — 모를 때도 근거로 싣지만 **계정의 대용이 아니다**.
+///     ★(0.14.45 · 성찰 M5 · 2회차 M2) `Pending(r)` — `state:"pending"` · `account_id:null` · `profile` = 기록 폴더(화면 「계정 확인 중」 — 복원 좌석 등 신뢰되지 않은 기록에
+///     아직 관측이 없다 · 기록 폴더의 신원을 읽어 내지 않는다). `Mismatch{observed, recorded}` — `state:"mismatch"` · `profile` = **관측** 폴더 · `recorded_profile` = 기록 폴더 ·
+///     `account_id` = 관측 폴더의 신원(`Known` 일 때만 · 아니면 null — 화면은 `known` 이 아니라 어느 계정에도 붙이지 않는다). 관측이 기록을 **실제로** 부정했을 때만 이 상태다.
 ///   · codex · antigravity: 이 데몬의 계정 축에 그 제공자의 계정은 하나(`default` — 기기의 로그인 하나)뿐이다 → `state:"known"` · `account_id:"default"`.
 ///   · 그 밖 에이전트: `state:"unsupported"`(provider null).
-pub(crate) fn seat_account_json(agent: Option<&str>, folder: Option<&str>, unverified: Option<&str>, who: Option<&FolderWho>, home: Option<&Path>) -> Value {
+pub(crate) fn seat_account_json(agent: Option<&str>, display: &SeatFolder, who: Option<&FolderWho>, home: Option<&Path>) -> Value {
     let Some(agent) = agent else {
         return Value::Null;
     };
@@ -2175,23 +2207,34 @@ pub(crate) fn seat_account_json(agent: Option<&str>, folder: Option<&str>, unver
     if provider != "claude" {
         return json!({"provider": provider, "agent": agent, "account_id": "default", "profile": Value::Null, "state": "known"});
     }
-    if let (None, Some(u)) = (folder, unverified) {
-        let profile = profile_short(home, Path::new(u));
-        return json!({"provider": provider, "agent": agent, "account_id": Value::Null, "profile": profile, "state": "mismatch"});
-    }
-    let profile = folder.map(|f| profile_short(home, Path::new(f)));
-    let (account_id, state) = match (folder, who) {
-        (None, _) => (None, "folder_unknown"),
-        (Some(_), Some(FolderWho::Known(id))) => (Some(id.clone()), "known"),
-        (Some(_), Some(FolderWho::NoLogin)) => (None, "no_login"),
-        (Some(_), _) => (None, "unread"),
+    let short = |f: &str| profile_short(home, Path::new(f));
+    let known_id = || match who {
+        Some(FolderWho::Known(id)) => Some(id.clone()),
+        _ => None,
     };
-    json!({"provider": provider, "agent": agent, "account_id": account_id, "profile": profile, "state": state})
+    match display {
+        SeatFolder::Unknown => json!({"provider": provider, "agent": agent, "account_id": Value::Null, "profile": Value::Null, "state": "folder_unknown"}),
+        SeatFolder::Pending(r) => json!({"provider": provider, "agent": agent, "account_id": Value::Null, "profile": short(r), "state": "pending"}),
+        SeatFolder::Mismatch { observed, recorded } => json!({
+            "provider": provider, "agent": agent, "account_id": known_id(), "profile": short(observed),
+            "recorded_profile": short(recorded), "state": "mismatch",
+        }),
+        SeatFolder::Verified(f) => {
+            let (account_id, state) = match who {
+                Some(FolderWho::Known(id)) => (Some(id.clone()), "known"),
+                Some(FolderWho::NoLogin) => (None, "no_login"),
+                _ => (None, "unread"),
+            };
+            json!({"provider": provider, "agent": agent, "account_id": account_id, "profile": short(f), "state": state})
+        }
+    }
 }
 
 /// 좌석 id → `account` 객체 표 — `surface.list`·`org.status` 가 **surfaces 락을 잡기 전에** 한 번 만든다(락 순서: 신원 표는 이미 만들어졌고, 여기서는 신원 캐시 락을
 /// 폴더마다 순간 잡을 뿐이다 · 파일 IO 0). 표에 없는 좌석(종료 · 표를 만든 뒤 생성 · 수집 실패)은 부른 쪽이 `null` 로 싣는다.
-/// 신원 표의 `current_account` 가 없는데 캐시가 `Known` 이면(표를 만든 뒤 다른 요청이 읽었다) 표와 어긋나지 않게 `unread` 로 둔다 — 한 응답 안의 `usage.rate_in_use` 와 다른 사실을 말하지 않는다.
+/// 표시 폴더가 경보 귀속 폴더와 같으면 신원 표의 값을 그대로 쓴다 — `current_account` 가 없는데 캐시가 `Known` 이면(표를 만든 뒤 다른 요청이 읽었다) 표와 어긋나지 않게
+/// `unread` 로 둔다(한 응답 안의 `usage.rate_in_use` 와 다른 사실을 말하지 않는다). 표시 폴더가 다르면(`Mismatch` 의 관측 폴더 등) 캐시의 상태를 그대로 쓴다
+/// (`seat_identity_view_in` 이 읽어 두었다 · 워치독 캐시 전용 표에서는 항목이 없을 수 있다 → `unread`).
 pub fn seat_account_map(daemon: &Arc<Daemon>, view: &SeatIdentityView) -> HashMap<u64, Value> {
     let mut out = HashMap::new();
     if !view.collect_ok {
@@ -2199,18 +2242,18 @@ pub fn seat_account_map(daemon: &Arc<Daemon>, view: &SeatIdentityView) -> HashMa
     }
     let home = account_home();
     for s in &view.seats {
-        let who = match (&s.current_account, &s.folder) {
-            (Some(id), _) => Some(FolderWho::Known(id.clone())),
-            (None, Some(f)) => match peek_folder_state(daemon, f) {
-                FolderWho::Known(_) => Some(FolderWho::Unread),
-                other => Some(other),
+        let who = match s.display.display_folder() {
+            None => None,
+            Some(f) if Some(f) == s.folder.as_deref() => match &s.current_account {
+                Some(id) => Some(FolderWho::Known(id.clone())),
+                None => match peek_folder_state(daemon, f) {
+                    FolderWho::Known(_) => Some(FolderWho::Unread),
+                    other => Some(other),
+                },
             },
-            (None, None) => None,
+            Some(f) => Some(peek_folder_state(daemon, f)),
         };
-        out.insert(
-            s.surface_id,
-            seat_account_json(s.agent.as_deref(), s.folder.as_deref(), s.unverified_dir.as_deref(), who.as_ref(), home.as_deref()),
-        );
+        out.insert(s.surface_id, seat_account_json(s.agent.as_deref(), &s.display, who.as_ref(), home.as_deref()));
     }
     out
 }
@@ -6060,6 +6103,24 @@ mod tests {
         use super::b3_scenarios::{b3_login, b3_seat};
         use super::*;
 
+        /// ★(성찰 2회차 C2) 에이전트 → provider 표는 **한 정의처**다 — 사용량 귀속(`fixed_resolution`)과 좌석 `account` 키(`seat_account_json`)가 같은 provider 를 말한다
+        /// (모든 알려진 별칭 · 모르는 에이전트는 둘 다 없음 · claude 는 폴더 축이라 fixed 가 없다).
+        #[test]
+        fn c2_agent_provider_table_is_shared_by_usage_and_seat_account() {
+            for (agent, want) in [("claude", Some("claude")), ("codex", Some("codex")), ("gemini", Some("antigravity")), ("agy", Some("antigravity")), ("antigravity", Some("antigravity")), ("grok", None), ("", None)] {
+                assert_eq!(provider_for_agent(agent), want, "{agent}");
+                assert_eq!(seat_provider(agent), want, "{agent}");
+                let fixed = fixed_resolution(None, agent).map(|(k, _, _, _)| k.provider);
+                let seat = seat_account_json(Some(agent), &SeatFolder::Unknown, None, None);
+                let seat_provider_json = seat["provider"].as_str().map(str::to_string);
+                match want {
+                    Some("claude") => assert!(fixed.is_none() && seat_provider_json.as_deref() == Some("claude")),
+                    Some(p) => assert_eq!((fixed.as_deref(), seat_provider_json.as_deref()), (Some(p), Some(p)), "{agent}"),
+                    None => assert!(fixed.is_none() && seat_provider_json.is_none() && seat["state"] == "unsupported", "{agent}: {seat}"),
+                }
+            }
+        }
+
         /// 순수 표 — claude 의 네 상태(known · folder_unknown · no_login · unread) · codex/agy 는 기기 로그인 하나(`default`) · 모르는 에이전트 · 셸(null).
         /// 모르는 것은 `account_id: null` 이다 — 폴더 이름으로 계정을 짐작하지 않는다(결측은 값이 아니다).
         #[test]
@@ -6126,20 +6187,25 @@ mod tests {
                 ),
             ];
             for (what, agent, folder, who, want) in cases {
-                assert_eq!(seat_account_json(agent, folder, None, who, Some(home)), want, "{what}");
+                let display = folder.map_or(SeatFolder::Unknown, |f| SeatFolder::Verified(f.into()));
+                assert_eq!(seat_account_json(agent, &display, who, Some(home)), want, "{what}");
             }
-            // ★(성찰 M5) 검증되지 않은 기록 폴더 = mismatch(계정 null · profile 은 기록 폴더 — 근거 표기) · 검증된 폴더가 있으면 기록은 무시된다.
+            // ★(성찰 M5 · 2회차 M2) 확인 전 기록 폴더 = pending(계정 null · profile 은 기록 폴더 — 근거 표기 · 「계정 확인 중」) — 신원이 캐시에 있어도 내지 않는다.
+            let pending = SeatFolder::Pending("/h/.cys/claude".into());
             assert_eq!(
-                seat_account_json(Some("claude"), None, Some("/h/.cys/claude"), None, Some(home)),
-                json!({"provider":"claude","agent":"claude","account_id":null,"profile":".cys/claude","state":"mismatch"}),
-                "검증되지 않은 기록 폴더의 신원을 계정으로 내면 안 된다"
+                seat_account_json(Some("claude"), &pending, Some(&known), Some(home)),
+                json!({"provider":"claude","agent":"claude","account_id":null,"profile":".cys/claude","state":"pending"}),
+                "확인 전 기록 폴더의 신원을 계정으로 내면 안 된다"
             );
+            // 관측이 기록을 부정 = mismatch(profile 은 관측 폴더 · recorded_profile 은 기록 폴더 · account_id 는 관측 폴더의 신원 — Known 일 때만).
+            let mm = SeatFolder::Mismatch { observed: "/h/.claude-4".into(), recorded: "/h/.cys/claude".into() };
             assert_eq!(
-                seat_account_json(Some("claude"), Some("/h/.claude-4"), Some("/h/.cys/claude"), Some(&known), Some(home))["state"],
-                json!("known"),
-                "검증된 폴더가 있으면 그 신원이다"
+                seat_account_json(Some("claude"), &mm, Some(&known), Some(home)),
+                json!({"provider":"claude","agent":"claude","account_id":"u-1","profile":".claude-4","recorded_profile":".cys/claude","state":"mismatch"}),
             );
-            assert_eq!(seat_account_json(Some("codex"), None, Some("/h/x"), None, Some(home))["state"], json!("known"), "codex 는 폴더 축이 없다");
+            assert_eq!(seat_account_json(Some("claude"), &mm, Some(&FolderWho::Unread), Some(home))["account_id"], Value::Null);
+            assert_eq!(seat_account_json(Some("claude"), &mm, None, Some(home))["state"], json!("mismatch"));
+            assert_eq!(seat_account_json(Some("codex"), &pending, None, Some(home))["state"], json!("known"), "codex 는 폴더 축이 없다");
         }
 
         /// 실제 좌석으로 만든 표 — 같은 계정을 나눠 쓰는 두 좌석 · 다른 계정 좌석 · 로그아웃 폴더 · 폴더 미상 · codex · 셸 · 종료 좌석.
@@ -6190,27 +6256,36 @@ mod tests {
             let _ = std::fs::remove_dir_all(&home);
         }
 
-        /// ★(0.14.45 · 성찰 M5 · 순수 표) 좌석 폴더 3값 — 관측 transcript 가 이기고 · 관측이 없으면 신뢰된 기록만 검증된 폴더 · 신뢰되지 않은 기록은 `Unverified` · 둘 다 없으면 `Unknown`.
+        /// ★(0.14.45 · 성찰 M5 · 2회차 M2 · 순수 표) 좌석 **표시** 폴더 4값 — 기록 아래의 관측은 기록을 확인 · 기록 밖의 관측은 `Mismatch`(관측이 기록을 실제로 부정) ·
+        /// 관측만 있으면 관측 · 관측이 없으면 신뢰된 기록만 `Verified` · 신뢰되지 않은 기록은 `Pending`(확인 중 — 불일치가 아니다) · 둘 다 없으면 `Unknown`.
         #[test]
         fn resolve_seat_folder_table() {
             use SeatFolder::*;
             let rec = "/h/.cys/claude";
             let tr = "/h/.claude-4/projects/-x/abc.jsonl";
+            let mm = |o: &str| Mismatch { observed: o.into(), recorded: rec.into() };
             let cases: Vec<(&str, Option<&str>, bool, &str, SeatFolder)> = vec![
                 ("기록 신뢰 · 관측 없음 → 기록", Some(rec), true, "", Verified(rec.into())),
-                ("기록 불신 · 관측 없음 → 불일치(검증 불가)", Some(rec), false, "", Unverified(rec.into())),
-                ("기록 신뢰 · 관측이 다른 폴더 → 관측이 이긴다", Some(rec), true, tr, Verified("/h/.claude-4".into())),
-                ("기록 불신 · 관측이 다른 폴더 → 관측", Some(rec), false, tr, Verified("/h/.claude-4".into())),
+                ("기록 불신 · 관측 없음 → 확인 중(불일치 아님)", Some(rec), false, "", Pending(rec.into())),
+                ("기록 신뢰 · 관측이 다른 폴더 → 불일치(관측이 기록을 부정)", Some(rec), true, tr, mm("/h/.claude-4")),
+                ("기록 불신 · 관측이 다른 폴더 → 불일치", Some(rec), false, tr, mm("/h/.claude-4")),
                 ("기록 불신 · 관측이 같은 폴더 → 검증됨(기록 표기)", Some("/h/.claude-4/"), false, tr, Verified("/h/.claude-4/".into())),
                 ("기록 없음 · 관측 → 관측", None, true, tr, Verified("/h/.claude-4".into())),
                 ("빈 기록 · 관측 → 관측", Some("  "), false, tr, Verified("/h/.claude-4".into())),
                 ("기록 없음 · 관측 없음 → 미상", None, true, "", Unknown),
                 ("기록 없음 · 프로필을 못 자르는 관측 → 미상", None, true, "/projects/x.jsonl", Unknown),
-                ("기록 불신 · 프로필을 못 자르는 관측 → 불일치", Some(rec), false, "/tmp/noproj.jsonl", Unverified(rec.into())),
+                ("기록 불신 · 프로필을 못 자르는 관측 → 확인 중", Some(rec), false, "/tmp/noproj.jsonl", Pending(rec.into())),
             ];
             for (what, cfg, trusted, sf, want) in cases {
                 assert_eq!(resolve_seat_folder(cfg, trusted, sf), want, "{what}");
             }
+            // ★(2회차 M2) 경보 귀속 폴더는 v0.14.44 규칙 그대로 — 기록이 있으면 trusted 와 관측에 무관하게 기록 · 없으면 transcript 의 첫 `/projects/` 앞 · 둘 다 없으면 None.
+            assert_eq!(alert_seat_folder(Some(rec), ""), Some(rec.into()));
+            assert_eq!(alert_seat_folder(Some(rec), tr), Some(rec.into()), "관측이 다른 폴더여도 경보 귀속은 기록");
+            assert_eq!(alert_seat_folder(Some("  "), tr), Some("/h/.claude-4".into()));
+            assert_eq!(alert_seat_folder(None, tr), Some("/h/.claude-4".into()));
+            assert_eq!(alert_seat_folder(None, ""), None);
+            assert_eq!(alert_seat_folder(None, "/projects/x.jsonl"), None);
             // ★(codex 2차 검토 #1) 기록 폴더 이름에 `/projects/` 가 있어도 그 아래의 transcript 는 기록을 확인한 것이다 — 첫 `/projects/` 로 잘라 홈을 계정으로 내지 않는다.
             let team = "/home/alice/projects/claude-team";
             let team_tr = "/home/alice/projects/claude-team/projects/-w/s.jsonl";
@@ -6229,16 +6304,19 @@ mod tests {
             }
             assert_eq!(
                 resolve_seat_folder_on(Some(win_rec), false, "/d/Users/x/.claude-4/projects/C--p/s.jsonl", true),
-                Verified("d:/Users/x/.claude-4".into()),
-                "다른 폴더의 MSYS 표기는 네이티브 IO 가 읽는 드라이브 표기로 접는다"
+                Mismatch { observed: "d:/Users/x/.claude-4".into(), recorded: win_rec.into() },
+                "다른 폴더의 MSYS 표기는 네이티브 IO 가 읽는 드라이브 표기로 접는다(관측이 기록을 부정 = 불일치)"
             );
             assert!(same_dir("/h/.claude-4", "/h/.claude-4/") && same_dir_on(r"C:\u\.claude-4", "/c/u/.claude-4", true));
             assert!(!same_dir("/h/.claude-4", "/h/.claude-40") && !same_dir("/h/.claude-4", "/h/.cys/claude"));
             assert!(same_dir_on("/h/A", "/h/a", true) && !same_dir_on("/h/A", "/h/a", false), "대소문자 무시는 윈도우만");
         }
 
-        /// ★(0.14.45 · 성찰 M5) 실제 좌석 — 호출자가 계정 폴더를 준 좌석(`config_dir_trusted=false`)은 기록 폴더에 로그인이 있어도 `mismatch`(그 계정을 확인된 것으로
-        /// 내지 않는다). transcript 가 관측되면 **그 폴더**의 신원이 계정이다(기록과 달라도). 신뢰된 기록 좌석은 종전대로. 신원 표의 `in_use` 도 불일치 좌석을 '모름' 으로 센다.
+        /// ★(0.14.45 · 성찰 M5 · 2회차 M2) 실제 좌석 — 호출자가 계정 폴더를 준 좌석(`config_dir_trusted=false` · 복원 좌석과 같은 꼴)은 기록 폴더에 로그인이 있어도 화면에는
+        /// `pending`(「계정 확인 중」 — 그 계정을 확인된 것으로 내지 않고 · 불일치도 아니다). transcript 가 기록 **밖** 폴더에서 관측되면 `mismatch`(profile = 관측 폴더 · recorded_profile =
+        /// 기록 폴더 · account_id = 관측 폴더의 신원). 신뢰된 기록 좌석은 종전대로.
+        /// ★핀(경보 귀속은 v0.14.44 와 같다): 신원 표(`claude_folders`·`in_use`·`current_for`)는 두 경우 모두 **기록 폴더**의 신원을 쓴다 — `claude_folder_unknown=false` ·
+        /// `in_use(u-rec)=Some(true)` · 다른 계정은 `Some(false)`(낡은 경보 억제 B3 가 살아 있다 · 모든 claude 계정이 '모름' 으로 접히지 않는다 · `config_dir_trusted` 를 요구하지 않는다).
         #[test]
         fn seat_account_map_never_confirms_an_unverified_recorded_folder() {
             let dir = tmp("acct0145m5-daemon");
@@ -6260,14 +6338,23 @@ mod tests {
             let view = seat_identity_view_in(&d, Some(&home), t0);
             let m = seat_account_map(&d, &view);
             let u = &m[&untrusted.id];
-            assert_eq!((u["state"].clone(), u["account_id"].clone(), u["profile"].clone()), (json!("mismatch"), Value::Null, json!(".cys/claude")), "{u}");
+            assert_eq!((u["state"].clone(), u["account_id"].clone(), u["profile"].clone()), (json!("pending"), Value::Null, json!(".cys/claude")), "{u}");
             assert_eq!(m[&trusted.id]["account_id"], json!("u-rec"), "신뢰된 기록 좌석은 종전대로");
             let ident = view.seats.iter().find(|s| s.surface_id == untrusted.id).unwrap();
-            assert_eq!((ident.folder.clone(), ident.unverified_dir.as_deref(), ident.known), (None, Some(recorded.to_str().unwrap()), false));
-            assert!(view.claude_folder_unknown, "불일치 좌석은 신원 표에서 폴더 미상과 같은 급(어느 계정의 in_use 도 확정하지 않는다)");
-            assert_eq!(account_in_use("claude", "u-rec", &view), Some(true), "신뢰된 좌석이 u-rec 을 쓴다");
-            assert_eq!(account_in_use("claude", "u-act", &view), None, "불일치 좌석이 있으면 다른 계정의 '안 씀' 을 확정하지 않는다");
-            // transcript 관측 → 관측 폴더의 신원(기록과 다르다)
+            assert_eq!(ident.display, SeatFolder::Pending(recorded.to_string_lossy().into_owned()));
+            // ★핀 — 경보 귀속은 기록 폴더(v0.14.44): 복원 좌석도 u-rec 사용 중으로 센다 · 폴더 미상이 아니다.
+            assert_eq!((ident.folder.as_deref(), ident.current_account.as_deref(), ident.known), (Some(recorded.to_str().unwrap()), Some("u-rec"), true));
+            assert!(!view.claude_folder_unknown, "복원 좌석은 폴더 미상이 아니다(경보 귀속은 기록 폴더)");
+            assert_eq!(view.claude_folders, vec![(recorded.to_string_lossy().into_owned(), Some("u-rec".into()))], "신원 표에는 기록 폴더만");
+            assert_eq!(account_in_use("claude", "u-rec", &view), Some(true), "두 좌석 다 u-rec 을 쓴다");
+            assert_eq!(account_in_use("claude", "u-act", &view), Some(false), "모든 폴더가 판독됐고 아무도 u-act 가 아니다 — 낡은 경보 억제가 산다");
+            assert_eq!(view.current_for(untrusted.id), Some("u-rec"), "rate_in_use 의 재료도 기록 폴더 신원");
+            // 워치독 캐시 전용 표도 같은 귀속(IO 0 · 캐시는 방금 채워졌다).
+            let cached = seat_identity_view_cached(&d);
+            assert_eq!(account_in_use("claude", "u-rec", &cached), Some(true));
+            assert_eq!(account_in_use("claude", "u-act", &cached), Some(false));
+            assert_eq!(seat_account_map(&d, &cached)[&untrusted.id]["state"], json!("pending"));
+            // transcript 관측(기록 밖 폴더) → 표시는 불일치(관측 폴더의 신원 · 기록 폴더 병기) · 경보 귀속은 여전히 기록 폴더
             let sf = actual.join("projects").join("-x").join("abc.jsonl").to_string_lossy().into_owned();
             *untrusted.observed_usage.lock().unwrap() = Some(crate::usage::ObservedUsage {
                 agent: "claude".into(),
@@ -6284,8 +6371,17 @@ mod tests {
             let view = seat_identity_view_in(&d, Some(&home), t0 + SEAT_IDENT_CACHE_SECS + 1.0);
             let m = seat_account_map(&d, &view);
             let u = &m[&untrusted.id];
-            assert_eq!((u["state"].clone(), u["account_id"].clone(), u["profile"].clone()), (json!("known"), json!("u-act"), json!(".claude-4")), "관측 폴더가 계정이다: {u}");
+            assert_eq!(
+                (u["state"].clone(), u["account_id"].clone(), u["profile"].clone(), u["recorded_profile"].clone()),
+                (json!("mismatch"), json!("u-act"), json!(".claude-4"), json!(".cys/claude")),
+                "관측이 기록을 부정했다 — 관측 폴더의 신원과 기록 폴더를 함께 보인다: {u}"
+            );
+            let ident = view.seats.iter().find(|s| s.surface_id == untrusted.id).unwrap();
+            assert_eq!(ident.display, SeatFolder::Mismatch { observed: actual.to_string_lossy().into_owned(), recorded: recorded.to_string_lossy().into_owned() });
+            assert_eq!((ident.folder.as_deref(), ident.current_account.as_deref()), (Some(recorded.to_str().unwrap()), Some("u-rec")), "경보 귀속은 여전히 기록 폴더(v0.14.44)");
             assert!(!view.claude_folder_unknown);
+            assert_eq!(view.claude_folders.len(), 1, "관측 폴더는 신원 표(in_use)에 들어가지 않는다");
+            assert_eq!(account_in_use("claude", "u-act", &view), Some(false), "관측 폴더의 계정을 '사용 중' 으로 올리지 않는다(경보 귀속 불변)");
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
