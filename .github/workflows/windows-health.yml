@@ -190,7 +190,7 @@ jobs:
       - name: Rust 툴체인 (factory-reset Windows 계약 검증용)
         uses: dtolnay/rust-toolchain@stable
 
-      - name: cargo test --lib factory_reset + readiness + inject_guard + first_run_gates + update_launch + agy_statusline (Windows 실기)
+      - name: cargo test --lib factory_reset + readiness + inject_guard + first_run_gates + update_launch + agy_statusline + claude_tui (Windows 실기)
         shell: bash
         run: |
           set -euo pipefail
@@ -260,6 +260,14 @@ jobs:
           #   mac 초록은 그 축(cmd 의 따옴표 처리·LF 배치 파일 실행)의 증거가 아니다(정본 §8). 이 두 줄에도 `if:` 를 달지 마라.
           cargo_filter_count --lib agy_statusline::
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib agy_statusline:: -- --test-threads=1
+          # ★(0.14.45) 일곱째 모듈 `claude_tui::` 편입 — Windows 에서 Claude Code 기본 화면 모드(classic) 설정 파일 기록·롤백 계약.
+          #   이 모듈의 **윈도우 전용 검체 둘**(`claude_tui_windows_personal_comparison_ignores_case_and_verbatim_prefix` ·
+          #   `claude_tui_ensure_refuses_short_name_spelling_of_personal_profile`)은 개인 프로필 판정이 대소문자·`\\?\` 접두·8.3 짧은 이름
+          #   철자를 같은 폴더로 보는지 Windows 실기에서만 잰다 — mac 초록은 그 축의 증거가 아니다(정본 §8). 검체는 전부 temp_dir 샌드박스에서
+          #   돌고 reconcile 은 테스트 빌드에서 무동작이라 실 HOME·~/.claude 를 만지지 않는다(킬스위치 파일 존재 stat 1회뿐 · 읽기 전용).
+          #   이 두 줄에도 `if:` 를 달지 마라.
+          cargo_filter_count --lib claude_tui::
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib claude_tui:: -- --test-threads=1
 
       # ★D5 env 게이트의 Windows 파이프라인 실기 검증 (v0.14 품질 라인 · 적대검증 2R major 수리).
       #

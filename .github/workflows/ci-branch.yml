@@ -224,6 +224,9 @@ jobs:
                   "--lib agy_statusline::":
                       "윈도우 Antigravity 상태줄 자동 연결(0.14.45)의 `.cmd` 래퍼를 agy 처럼 `cmd /c` + Go 인용으로 실제 실행하는 검체 "
                       "(`windows_cmd_wrapper_runs_under_cmd_c_like_agy`)가 도는 유일한 자리 — 빠지면 쓰기 전 실연 검사가 대변한다는 근거가 맥 초록뿐이 된다.",
+                  "--lib claude_tui::":
+                      "Windows 기본 classic 화면 모드 설정(0.14.45)의 윈도우 전용 검체 둘(개인 프로필 비교의 대소문자·verbatim 접두 · 8.3 짧은 이름 철자)이 "
+                      "도는 유일한 자리 — 빠지면 개인 프로필 보호가 윈도우에서 실측 없이 맥 초록으로만 대변된다.",
               },
           }
 
