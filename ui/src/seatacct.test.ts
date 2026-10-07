@@ -8,6 +8,7 @@ import {
   parseSeatAccount,
   roleShort,
   wsAccountLineText,
+  SEAT_ACCT_MISMATCH_LABEL,
   SEAT_ACCT_UNKNOWN_LABEL,
   type SeatAcctSig,
 } from "./seatacct";
@@ -114,6 +115,31 @@ describe("부서 카드 — 노드별 계정 묶음", () => {
     expect(u.title).toContain("데몬 응답이 끊겨");
     // 폴더 이름(.claude-2 → claude-2)으로 짐작한 라벨이 나오지 않는다
     expect(wsAccountLineText(g).includes("claude-2")).toBe(false);
+  });
+  it("★(M5) 계정 불일치(검증되지 않은 기록 폴더)는 '계정 불일치·확인 필요' 묶음 — 확인된 계정으로 보이지 않고 · 미확인 묶음 앞 · 기록 폴더는 툴팁에만(🔒 가림)", () => {
+    const mm = { provider: "claude", agent: "claude", account_id: null, profile: ".cys/claude", state: "mismatch" };
+    expect(verdict(parseSeatAccount(sig("worker", mm), NOW, STALE))).toEqual({ known: false, state: "mismatch" });
+    const g = buildWsAccountGroups(
+      seats(sig("master", claude("u-4")), sig("worker", mm), sig("cso", { provider: "claude", agent: "claude", account_id: null, profile: ".claude-2", state: "no_login" })),
+      idx,
+      plain,
+      false,
+      NOW,
+      STALE,
+    );
+    expect(g.map((x) => x.label)).toEqual(["claude-4", SEAT_ACCT_MISMATCH_LABEL, SEAT_ACCT_UNKNOWN_LABEL]);
+    expect(g[1].unknown).toBe(true);
+    expect(g[1].roles).toEqual(["worker"]);
+    expect(g[1].title).toContain("확인된 것으로 표시하지 않습니다");
+    expect(g[1].title).toContain("기록된 폴더: .cys/claude");
+    expect(g[1].title).toContain("/config");
+    expect(g[2].roles).toEqual(["cso"]);
+    // 기록 폴더 이름으로 짐작한 라벨이 본문에 없다 · 역매핑에도 붙지 않는다
+    expect(wsAccountLineText(g)).toBe(`claude-4 master · ${SEAT_ACCT_MISMATCH_LABEL} worker · ${SEAT_ACCT_UNKNOWN_LABEL} cso`);
+    expect(accountUsers([{ name: "d", seats: seats(sig("worker", mm)) }], NOW, STALE).size).toBe(0);
+    // 🔒 가림이면 툴팁의 기록 폴더도 꼬리표만
+    const h = buildWsAccountGroups(seats(sig("worker", { ...mm, profile: "/Users/x/.cys/claude" })), idx, redact, true, NOW, STALE);
+    expect(h[0].title.includes("/Users/x")).toBe(false);
   });
   it("셸 pane·종료 좌석·아직 조회 안 된 좌석은 뺀다", () => {
     const g = buildWsAccountGroups(

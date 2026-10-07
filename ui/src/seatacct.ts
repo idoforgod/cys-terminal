@@ -51,8 +51,12 @@ export const SEAT_ACCT_REASON: Record<string, string> = {
   unsupported: "이 에이전트의 계정은 cys 가 확인할 수 없습니다",
   stale: "데몬 응답이 끊겨 최근 계정 정보가 없습니다",
   bad: "데몬이 보낸 계정 정보를 해석하지 못했습니다",
+  // ★(0.14.45 · 성찰 M5) 데몬이 기록한 설정 폴더를 믿을 수 없다(호출자가 계정 폴더를 바꿨거나 복원 좌석) + 실제 대화 기록이 아직 관측되지 않았다.
+  mismatch: "데몬이 기록한 설정 폴더와 실제 실행 폴더가 다를 수 있습니다(복원 좌석·수동 CLAUDE_CONFIG_DIR) — 대화가 시작되면 실제 폴더로 확인되고, 급하면 그 창에서 /config 로 확인",
 };
 export const SEAT_ACCT_UNKNOWN_LABEL = "계정 미확인";
+/** ★(0.14.45 · 성찰 M5) 확인되지 않은 기록 폴더뿐인 좌석 — '미확인' 과 달리 **기록은 있으나 검증 불가** 라 따로 묶는다(확인된 계정으로 보이지 않게). */
+export const SEAT_ACCT_MISMATCH_LABEL = "계정 불일치·확인 필요";
 
 /** 좌석 신호 → 계정 해석. 낡은 신호(staleMs 초과)는 stale — 옛 계정을 지금 것으로 말하지 않는다. */
 export function parseSeatAccount(sig: SeatAcctSig, nowMs: number, staleMs: number): SeatAcct {
@@ -141,6 +145,7 @@ export function buildWsAccountGroups(
 ): WsAcctGroup[] {
   const known = new Map<string, { sa: SeatAcct; roles: string[] }>();
   const unknownRoles: { role: string; why: string }[] = [];
+  const mismatchRoles: { role: string; why: string }[] = [];
   for (const { sid, sig } of seats) {
     if (!sig || sig.exited) continue;
     const hasRole = typeof sig.role === "string" && sig.role.trim() !== "";
@@ -148,7 +153,10 @@ export function buildWsAccountGroups(
     const sa = parseSeatAccount(sig, nowMs, staleMs);
     const role = roleShort(sig.role, sid);
     if (!sa.known) {
-      unknownRoles.push({ role, why: SEAT_ACCT_REASON[sa.state] ?? SEAT_ACCT_REASON.bad });
+      const why = SEAT_ACCT_REASON[sa.state] ?? SEAT_ACCT_REASON.bad;
+      // ★(M5) 불일치는 '미확인' 과 다른 묶음 — 기록 폴더는 툴팁에만(계정의 대용이 아니다 · 🔒 가림 규칙 그대로).
+      if (sa.state === "mismatch") mismatchRoles.push({ role, why: sa.profile ? `${why} · 기록된 폴더: ${hidePaths ? profileTail(sa.profile) : sa.profile}` : why });
+      else unknownRoles.push({ role, why });
       continue;
     }
     const g = known.get(sa.key);
@@ -166,6 +174,16 @@ export function buildWsAccountGroups(
     const py = provRank(y.key.split(":")[0] ?? "");
     return px - py || (x.label < y.label ? -1 : x.label > y.label ? 1 : 0);
   });
+  if (mismatchRoles.length) {
+    mismatchRoles.sort((x, y) => byRole(x.role, y.role));
+    out.push({
+      key: "",
+      label: SEAT_ACCT_MISMATCH_LABEL,
+      roles: mismatchRoles.map((u) => u.role),
+      title: [`${SEAT_ACCT_MISMATCH_LABEL} — 기록된 설정 폴더의 계정을 확인된 것으로 표시하지 않습니다`, ...mismatchRoles.map((u) => `${u.role}: ${u.why}`)].join("\n"),
+      unknown: true,
+    });
+  }
   if (unknownRoles.length) {
     unknownRoles.sort((x, y) => byRole(x.role, y.role));
     out.push({
