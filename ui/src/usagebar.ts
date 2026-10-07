@@ -610,6 +610,13 @@ function overlapTag(a: AcctRow, redactEmail: (s: string) => string): string {
   return tag4(acctKey(a));
 }
 
+/** ★0.14.45 부서 카드용 라벨(C1) — 패널과 같은 이름 규칙(accountDisplayLabels)이되 겹침 꼬리표는 **언제나 가린 형**(`#hash6`)이다.
+ *  패널은 🔒 끔이면 꼬리표에 이메일 원문을 쓰지만, 카드 본문은 이름만 보여야 한다(이메일은 툴팁만). 🔒 켬일 때의 패널 라벨과
+ *  같은 문자열이라 두 화면과 Control Center 계정 표를 대조할 수 있다. `hash6` = 패널의 가림 함수(main.ts ccHash6). */
+export function accountCardLabels(list: AcctRow[], hash6: (s: string) => string): Map<AcctRow, string> {
+  return accountDisplayLabels(list, (s) => `#${hash6(s)}`);
+}
+
 /** 줄 상한에 잘려 나간 관측 전 계정 — 개수로만 사라지지 않게 라벨을 나열한다(전체 줄이 60자를 넘으면 말줄임 · 툴팁은 전체 나열). */
 function unobservedFoldOf(cut: UsageLine[]): { text: string; tooltip: string } | null {
   if (!cut.length) return null;

@@ -162,7 +162,7 @@ import {
   sanitizeFoldKeys,
   USAGE_MODE_LABEL,
   USAGE_HIDDEN_MAX,
-  accountDisplayLabels,
+  accountCardLabels,
   type AcctRow,
   type UsagePrimary,
   type UsageLine,
@@ -4714,11 +4714,19 @@ const WS_COLORS = ["#2f81f7", "#3fb950", "#d29922", "#f85149", "#a371f7", "#db61
 
 // ---------- ★0.14.45 부서 카드 노드별 계정 줄 · 사용량 패널 역매핑 ----------
 // 판정·표기는 seatacct.ts(순수 · seatacct.test.ts), 여기는 배선이다. 재료는 org.status 10초 틱이 적는 seatAccts 와
-// 사용량 패널이 이미 가진 계정 행(ccAccounts) — 새 RPC·타이머 0. 이름은 사용량 패널과 같은 함수(accountDisplayLabels)로 짓는다.
+// 사용량 패널이 이미 가진 계정 행(ccAccounts) — 새 RPC·타이머 0. 이름은 사용량 패널과 같은 규칙(accountCardLabels =
+// accountDisplayLabels 의 카드판)으로 짓되, 겹침 꼬리표는 🔒 상태와 무관하게 **언제나 가린 형**(#hash6)이다(C1 — 카드 본문에
+// 이메일 원문이 나오는 경로 0 · 이메일은 툴팁만).
 function wsAcctIndex(): AcctIndex {
   const all = (Array.isArray(ccAccounts) ? ccAccounts : []).filter((a) => a && typeof a === "object") as AcctRow[];
   const visible = all.filter((a) => !usageHidden.has(acctKey(a))); // 패널에 보이는 계정끼리 겹침 꼬리표를 정한다(패널과 같은 이름)
-  return buildAcctIndex(all, accountDisplayLabels(visible, ccAcctLabel));
+  return buildAcctIndex(all, accountCardLabels(visible, ccHash6));
+}
+// ★(C2) 탭 한 번 그리기(renderWsTabs)당 계정 표는 한 번만 만든다 — buildTab 은 탭마다 불리므로 종전엔 탭 수만큼 다시 만들었다.
+//   renderWsTabs 밖에서 buildTab 이 불리면(지금은 없음 — 호출부 둘 다 renderWsTabs 안) 그때만 폴백으로 새로 만든다.
+let wsAcctIdxForRender: AcctIndex | null = null;
+function wsAcctIndexCached(): AcctIndex {
+  return wsAcctIdxForRender ?? wsAcctIndex();
 }
 function wsSeatAccts(ws: Workspace): { sid: number; sig: SeatAcctSig | undefined }[] {
   return collectSids(ws.tree).map((sid) => ({ sid, sig: seatAccts.get(`${ws.socket}#${sid}`) }));
@@ -4736,7 +4744,7 @@ function accountUsersNow(): Map<string, string[]> {
 }
 function buildWsAcctLine(ws: Workspace): HTMLElement | null {
   try {
-    const groups = buildWsAccountGroups(wsSeatAccts(ws), wsAcctIndex(), ccAcctLabel, ccAcctRedact, Date.now(), SIG_STALE_MS_UI);
+    const groups = buildWsAccountGroups(wsSeatAccts(ws), wsAcctIndexCached(), ccAcctLabel, ccAcctRedact, Date.now(), SIG_STALE_MS_UI);
     if (!groups.length) return null;
     const line = document.createElement("div");
     line.className = "ws-accts";
@@ -4762,6 +4770,12 @@ function buildWsAcctLine(ws: Workspace): HTMLElement | null {
 function renderWsTabs() {
   const bar = document.getElementById("ws-tabs")!;
   bar.innerHTML = "";
+  // ★(C2) 계정 표는 이 렌더에서 한 번 — 실패해도 탭은 그대로(계정 줄만 빠진다 · buildWsAcctLine 의 try 가 받는다).
+  try {
+    wsAcctIdxForRender = wsAcctIndex();
+  } catch {
+    wsAcctIdxForRender = null;
+  }
   // 06: 2계층 tier 정렬 — pinned 그룹 → unpinned 그룹 → ungrouped ws(배열 순서). 시각 순서≠배열 순서이므로
   // 탭 핸들러는 캡처 idx 대신 workspaces.indexOf(ws)로 활성 비교/전환(stale idx 회피, close 핸들러 패턴 일치).
   // 06: 멤버0 그룹은 렌더에서 제외(유령 헤더 차단 · 적대검증 교정 — saveLayout이 모듈 상태도 청소).
@@ -4770,6 +4784,7 @@ function renderWsTabs() {
   const unpinnedG = groups.filter((g) => !g.pinned && hasMembers(g));
   for (const g of [...pinnedG, ...unpinnedG]) bar.appendChild(buildGroupSection(g));
   for (const ws of workspaces.filter((w) => !w.pending && w.groupId == null)) bar.appendChild(buildTab(ws));
+  wsAcctIdxForRender = null; // (C2) 렌더 밖에서는 캐시를 쓰지 않는다(다음 렌더가 새로 만든다)
 }
 
 // 06: ws 1행 탭 DOM 생성(기존 renderWsTabs forEach 본문을 외과적으로 추출 — idx→workspaces.indexOf(ws)만 치환).

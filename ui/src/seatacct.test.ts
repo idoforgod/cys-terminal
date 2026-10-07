@@ -11,7 +11,7 @@ import {
   SEAT_ACCT_UNKNOWN_LABEL,
   type SeatAcctSig,
 } from "./seatacct";
-import { accountDisplayLabels, buildUsageBarModel, type AcctRow } from "./usagebar";
+import { accountCardLabels, accountDisplayLabels, buildUsageBarModel, type AcctRow } from "./usagebar";
 
 const NOW = 1_800_000_000_000; // ms
 const STALE = 30_000;
@@ -189,6 +189,36 @@ describe("배선 핀(main.ts·style.css)", () => {
     expect(body).toContain("catch");
     expect(body.includes("innerHTML")).toBe(false);
     expect(body).toContain("ccAcctLabel"); // 🔒 가림 함수
+  });
+  it("★(C1) 카드 라벨은 🔒 상태와 무관하게 가린 꼬리표 — 본문에 이메일 원문 0 · (C2) 계정 표는 렌더당 한 번", () => {
+    // 순수: 같은 이름 둘(별명 없음 · 폴더 라벨 같음)에 이메일이 있어도 카드 라벨에는 '@' 가 없고 패널의 🔒 켬 라벨과 같다.
+    const twins: AcctRow[] = [
+      { provider: "claude", account_id: "u-a", label: "alpha@example.test", profiles: [".claude-9"], current_profiles: [".claude-9"], in_use: true },
+      { provider: "claude", account_id: "u-b", label: "beta@example.test", profiles: [".claude-9"], current_profiles: [".claude-9"], in_use: true },
+    ];
+    const hash6 = (x: string) => `h${x.length}`;
+    const card = accountCardLabels(twins, hash6);
+    const panelLocked = accountDisplayLabels(twins, (x) => `#${hash6(x)}`);
+    const panelOpen = accountDisplayLabels(twins, (x) => x);
+    for (const a of twins) {
+      expect(card.get(a)!.includes("@")).toBe(false);
+      expect(card.get(a)).toBe(panelLocked.get(a)!);
+      expect(panelOpen.get(a)!.includes("@")).toBe(true); // 패널(🔒 끔)만 이메일 꼬리표 — 카드는 아니다
+    }
+    expect(card.get(twins[0])).not.toBe(card.get(twins[1]));
+    // 배선: 카드 표는 accountCardLabels(ccHash6) 로 만들고(ccAcctLabel 아님), buildWsAcctLine 은 렌더 캐시를 쓴다.
+    const a = src.indexOf("function wsAcctIndex(");
+    const idxBody = src.slice(a, src.indexOf("\n}\n", a));
+    expect(idxBody).toContain("accountCardLabels(visible, ccHash6)");
+    expect(idxBody.includes("accountDisplayLabels(")).toBe(false);
+    const r = src.indexOf("function renderWsTabs(");
+    const renderBody = src.slice(r, src.indexOf("\n}\n", r));
+    expect(renderBody).toContain("wsAcctIdxForRender = wsAcctIndex();");
+    expect(renderBody).toContain("wsAcctIdxForRender = null;");
+    const b = src.indexOf("function buildWsAcctLine(");
+    const lineBody = src.slice(b, src.indexOf("\n}\n", b));
+    expect(lineBody).toContain("wsAcctIndexCached()");
+    expect(lineBody.includes("wsAcctIndex()")).toBe(false);
   });
   it("사용량 패널은 역매핑을 모델 인자로만 받는다(renderUsageBar 안에 nodeSig 0)", () => {
     expect(src).toContain("users: accountUsersNow()");
