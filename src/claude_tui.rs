@@ -92,7 +92,7 @@ use std::sync::{
     Mutex, OnceLock,
 };
 
-use crate::agy_statusline as surgery;
+use crate::settings_surgery as surgery;
 
 /// Claude Code 사용자 설정의 렌더러 키.
 pub const TUI_KEY: &str = "tui";

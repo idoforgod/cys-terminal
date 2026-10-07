@@ -8,6 +8,7 @@ pub mod action_catalog;
 /// agy(Antigravity CLI) 상태줄 자동 연결(0.14.42 · 오너 승인 2026-09-24) — 설정 칸이 비었거나 없을 때만 넣고,
 /// 사용자 설정은 덮지 않으며, 표지 달린 cys 연결만 뺀다. 윈도우는 자동 연결 끔(안내만).
 pub mod agy_statusline;
+pub mod settings_surgery;
 /// Windows 좌석 Claude Code classic 렌더러 보장(0.14.45 휠 스크롤 수리) — 좌석 설정 폴더 settings.json 에
 /// `tui` 키가 없을 때만 `"default"` 를 넣는다(사용자 값 불가침 · 실패는 기동을 막지 않는다).
 pub mod claude_tui;
