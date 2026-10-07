@@ -48,7 +48,7 @@ const CYS_BASE_EXACT: [&str; 27] = [
 
 /// ~/.cys 직하에서 격리하는 정확 이름(2차) — 배열 상수 길이 고정을 피하려 분리하지 않고
 /// 접두로 못 잡는 단건들을 이어 담는다.
-const CYS_BASE_EXACT2: [&str; 11] = [
+const CYS_BASE_EXACT2: [&str; 12] = [
     // ★(0.14.31 · 독립 재유도) TTL 승인 전용 저장소와 두 저장소의 **원자적 쓰기 잔재**.
     //   0.14.31 이 `expires_at` 레코드를 `approvals-ttl.json` 으로 분리했는데 인벤토리는
     //   `approvals.json` 하나였다 → 초기화 뒤에도 미만료 승인이 남는다(시크릿을 env 로 고정한
@@ -74,6 +74,9 @@ const CYS_BASE_EXACT2: [&str; 11] = [
     //   (`src-tauri/src/main.rs update_attempt_path`). 이 이름이 빠지면 완전 초기화 뒤에도 기록이 남아, 설치기가 뜬 뒤 실패했고 아직 판정 전인 구간에 초기화한 사람의 다음 기동이
     //   '업데이트가 설치되지 않았습니다' 를 낼 수 있다. `.pending-restore`·`.last-app-version`·`.gui-onboarded` 와 같은 등급(앱 마커) — 업데이트 이력을 지우는 것은 초기화의 뜻이다.
     ".update-attempt.json",
+    // ★(0.14.45 · 성찰 2회차 m4) Windows 좌석 classic 렌더러 기록 원장(`claude_tui::LEDGER_FILE` — cys 가 `"tui": "default"` 를 넣은 설정 폴더 목록). 계획 단계가 먼저 읽어
+    //   그 항목으로 설정을 되돌리고(`claude_tui_entries`), 원장 자체는 사용 흔적이라 격리한다(남으면 다음 설치의 킬스위치 되돌림이 옛 폴더를 다시 건드린다).
+    "claude-tui-written.json",
 ];
 
 /// ~/.cys 직하에서 격리하는 접두. `pack-dept-<name>`(유령 `pack-dept---help` 포함),
@@ -350,6 +353,9 @@ pub struct ResetPlan {
     /// ★0.14.42 cys 가 **자동으로 넣은**(표지 달린) agy 상태줄 연결을 뺄 agy settings.json — 없으면 None.
     /// 사용자가 직접 넣은 cys 연결·사용자 statusLine 은 대상이 아니다(`report_only` 안내만 · agy_statusline 계약).
     pub strip_agy_statusline: Option<PathBuf>,
+    /// ★(0.14.45 · 성찰 2회차 m4) cys 가 Windows 좌석 설정 폴더에 넣은 `"tui": "default"` 의 원장 항목(`~/.cys/claude-tui-written.json` — 격리되기 **전에** 읽어 둔다).
+    /// 실행 단계가 킬스위치 되돌림과 같은 안전 규약으로 되돌린다(`claude_tui::reset_entries` — 값이 아직 `"default"` 일 때만 · 백업은 격리 폴더 · 우리가 만든 `.bak-cys-tui` 만 옮긴다).
+    pub claude_tui_entries: Vec<crate::claude_tui::LedgerEntry>,
     pub temp_sweep: Vec<PathBuf>,
     /// launchd plist(존재 시에만 등록 해제 수행 — 테스트 temp 홈에선 자연히 스킵).
     pub launchd_plist: Option<PathBuf>,
@@ -746,6 +752,19 @@ pub fn build_plan(roots: &ResetRoots, opts: &ResetOptions) -> ResetPlan {
         }
     };
 
+    // ── ★(0.14.45 · 성찰 2회차 m4) Windows 좌석 classic 렌더러 기록(`"tui": "default"`)의 원장 — 격리 전에 읽어 둔다(원장은 ~/.cys 와 함께 격리된다).
+    //   훼손·링크 원장은 항목 없음으로 다루지 않고 알린다(원본은 격리 폴더에 남는다 · 자동 수정 없음).
+    let claude_tui_entries = match crate::claude_tui::ledger_entries(&roots.home) {
+        Ok(entries) => entries,
+        Err(e) => {
+            report_only.push(format!(
+                "{} 를 판독하지 못해 cys 가 좌석 설정에 넣은 \"tui\": \"default\" 를 되돌리지 못합니다({e}) — 그 pane 에서 /tui fullscreen 으로 바꾸거나 settings.json 의 tui 키를 직접 지우세요",
+                roots.home.join(crate::claude_tui::LEDGER_FILE).display()
+            ));
+            Vec::new()
+        }
+    };
+
     // ── $TMPDIR 캐시 소거 대상 ──
     let mut temp_sweep = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&roots.temp) {
@@ -899,6 +918,7 @@ pub fn build_plan(roots: &ResetRoots, opts: &ResetOptions) -> ResetPlan {
         strip_settings,
         strip_skill_dirs,
         strip_agy_statusline,
+        claude_tui_entries,
         temp_sweep,
         launchd_plist,
         purge_license: opts.purge_license,
@@ -1726,6 +1746,28 @@ pub fn execute_quarantine(
                     "agy 상태줄 연결 제거 실패(파일 무변경): {other:?} — agy 안에서 `/statusline delete` 로 지우세요"
                 ),
             )),
+        }
+    }
+    // ★(0.14.45 · 성찰 2회차 m4) cys 가 Windows 좌석 설정 폴더에 넣은 `"tui": "default"` 를 원장 항목으로 되돌린다(격리 뒤라 원장 파일은 이미 없다 · 항목은 계획에 있다).
+    //   킬스위치 되돌림과 같은 안전 규약 — 값이 아직 정확히 "default" 일 때만 · 백업은 격리 폴더 · 우리가 만든 `.bak-cys-tui` 만 옮긴다 · 사용자 변경값은 그대로(무언급).
+    if !plan.claude_tui_entries.is_empty() {
+        use crate::claude_tui::{reset_entries, RollbackOutcome};
+        progress("strip", &format!("cys 가 넣은 claude tui 설정 되돌림 {}건", plan.claude_tui_entries.len()));
+        for t in reset_entries(&plan.claude_tui_entries, &roots.home, &backup_dir) {
+            let s = t.dir.join("settings.json");
+            match t.outcome {
+                RollbackOutcome::Removed => stripped.push(format!(
+                    "{}: \"tui\": \"default\"(cys 삽입){}",
+                    s.display(),
+                    if t.backup_moved { " · 백업 .bak-cys-tui 격리" } else { "" }
+                )),
+                RollbackOutcome::Dropped if t.backup_moved => stripped.push(format!("{}: 백업 .bak-cys-tui 격리(값은 사용자 변경·파일 없음이라 그대로)", s.display())),
+                RollbackOutcome::Dropped => {}
+                RollbackOutcome::Refused(why) => failed.push((
+                    s.clone(),
+                    format!("claude tui 설정 되돌림 실패(파일 무변경): {why} — 그 pane 에서 /tui fullscreen 으로 바꾸거나 settings.json 의 tui 키를 직접 지우세요"),
+                )),
+            }
         }
     }
     progress("strip", "pack 스킬 심링크 정리");
@@ -2741,6 +2783,57 @@ mod tests {
         assert!(rep2.moved.is_empty());
     }
 
+    /// ★(0.14.45 · 성찰 2회차 m4) 완전 초기화가 cys 가 좌석 설정 폴더에 넣은 `"tui": "default"` 를 원장으로 되돌린다 — 원장은 ~/.cys 와 함께 격리되므로 계획 단계에서
+    /// 읽어 두고, 실행 단계가 킬스위치 되돌림과 같은 규약으로 되돌린다(바이트 원복 · 백업은 격리 폴더 `settings-backups/` · 우리가 만든 `.bak-cys-tui` 도 격리 · 사용자 변경값은 그대로).
+    #[test]
+    fn claude_tui_classic_insert_is_rolled_back_from_ledger_on_reset() {
+        let td = test_home("tui");
+        let r = seed_practice_tree(&td);
+        let seat = td.join(".claude-2");
+        std::fs::create_dir_all(&seat).unwrap();
+        let settings = seat.join("settings.json");
+        let orig = "{\n  \"model\": \"opus\"\n}\n";
+        touch(&settings, orig);
+        assert!(matches!(
+            crate::claude_tui::ensure_classic(&seat, &td, crate::claude_tui::DirOrigin::SeatSpec),
+            crate::claude_tui::Outcome::Written { created: false, ledger_error: None }
+        ));
+        assert!(settings.with_file_name("settings.json.bak-cys-tui").is_file());
+        let user = td.join(".claude-3");
+        std::fs::create_dir_all(&user).unwrap();
+        touch(&user.join("settings.json"), "{\"a\":1}");
+        assert!(matches!(crate::claude_tui::ensure_classic(&user, &td, crate::claude_tui::DirOrigin::SeatSpec), crate::claude_tui::Outcome::Written { .. }));
+        let user_changed = "{\"a\":1,\"tui\":\"fullscreen\"}";
+        touch(&user.join("settings.json"), user_changed);
+        let opts = ResetOptions { purge_license: false, purge_local: false, purge_round: false };
+        let plan = build_plan(&r, &opts);
+        assert_eq!(plan.claude_tui_entries.len(), 2, "원장 항목은 계획 단계에서 읽어 둔다");
+        let not_cysd = |_p: u32| false;
+        let no_daemon = || false;
+        let mut noop = |_p: &str, _d: &str| {};
+        let rep = execute_quarantine(&plan, &r, &not_cysd, &no_daemon, &mut noop).unwrap();
+        assert!(rep.ok(), "{:?}", rep.failed);
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), orig, "cys 삽입만 빠지고 바이트 원복");
+        assert!(!settings.with_file_name("settings.json.bak-cys-tui").exists(), "우리가 만든 백업은 격리됐다");
+        assert_eq!(std::fs::read_to_string(user.join("settings.json")).unwrap(), user_changed, "사용자 변경값 불가침");
+        assert!(!user.join("settings.json.bak-cys-tui").exists(), "그 좌석의 우리 백업도 격리");
+        let backups = plan.trash_dir.join("settings-backups");
+        let names: Vec<String> = std::fs::read_dir(&backups).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert!(names.iter().any(|n| n.starts_with("claude-tui.") && n.ends_with(".settings.json")), "되돌림 백업은 격리 폴더 안: {names:?}");
+        assert_eq!(names.iter().filter(|n| n.ends_with(".bak-cys-tui")).count(), 2, "{names:?}");
+        assert!(rep.stripped.iter().any(|m| m.contains("\"tui\": \"default\"(cys 삽입)")), "{:?}", rep.stripped);
+        assert!(!td.join(".cys").join(crate::claude_tui::LEDGER_FILE.trim_start_matches(".cys/")).exists(), "원장은 ~/.cys 와 함께 격리됐다");
+        // 원장이 없는 홈 — 계획에 항목 0 · 보고 없음. 훼손 원장 — 항목 0 + 안내(자동 수정 없음).
+        let td2 = test_home("tui-none");
+        let r2 = seed_practice_tree(&td2);
+        let plan2 = build_plan(&r2, &opts);
+        assert!(plan2.claude_tui_entries.is_empty() && !plan2.report_only.iter().any(|m| m.contains("claude-tui-written")), "{:?}", plan2.report_only);
+        std::fs::create_dir_all(td2.join(".cys")).unwrap();
+        touch(&td2.join(crate::claude_tui::LEDGER_FILE), "{not json");
+        let plan3 = build_plan(&r2, &opts);
+        assert!(plan3.claude_tui_entries.is_empty() && plan3.report_only.iter().any(|m| m.contains("claude-tui-written")), "{:?}", plan3.report_only);
+    }
+
     /// ★0.14.42 agy 상태줄 자동 연결의 제거 경로(완전 초기화) — cys 가 넣은(표지 달린) 연결만 빼고 나머지 키는 그대로,
     /// 백업은 격리 폴더 안에 둔다. 사용자가 직접 넣은 cys 연결·사용자 statusLine 은 건드리지 않는다(직접 넣은 cys 연결은 안내).
     #[test]
@@ -3733,7 +3826,8 @@ mod r2f_dm_factory_reset {
     /// 이름을 더하고도 형을 안 고치면 컴파일이 깨지지만, 형을 고쳐 맞추면서 **내용 단언**을 잊는 일을 이 검체가 막는다(길이 11·24·9).
     #[test]
     fn r2f_dm_factory_reset_inventory_lists_carry_the_new_persistent_files() {
-        assert_eq!(CYS_BASE_EXACT2.len(), 11, "~/.cys 직하 정확 이름 목록(2차)의 길이");
+        assert_eq!(CYS_BASE_EXACT2.len(), 12, "~/.cys 직하 정확 이름 목록(2차)의 길이");
+        assert!(CYS_BASE_EXACT2.contains(&"claude-tui-written.json") && crate::claude_tui::LEDGER_FILE.ends_with("/claude-tui-written.json"), "claude tui 원장이 기본 격리 목록에 없다");
         assert!(CYS_BASE_EXACT2.contains(&".update-attempt.json"), "~/.cys/.update-attempt.json(인앱 업데이트 시도 기록)이 기본 격리 목록에 없다");
         assert_eq!(WIN_STATE_EXACT.len(), 24, "윈도우 상태 폴더 정확 이름 목록의 길이");
         for n in ["queue-blocked.json", "queue-blocked.prev.json", "approval-lane"] {

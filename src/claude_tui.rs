@@ -224,12 +224,15 @@ pub enum RollbackOutcome {
     Refused(String),
 }
 
+/// 원장 항목 — cys 가 `"tui": "default"` 를 넣은 설정 폴더 하나. `pub` 인 것은 완전 초기화(`factory_reset`)가 `~/.cys` 를 격리하기 **전에** 읽어 두고
+/// 격리 뒤에 항목으로 되돌리기 때문이다([`reset_entries`] · 성찰 2회차 m4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct LedgerEntry {
-    dir: PathBuf,
-    settings: PathBuf,
-    written_at: u64,
-    created: bool,
+pub struct LedgerEntry {
+    pub dir: PathBuf,
+    pub settings: PathBuf,
+    pub written_at: u64,
+    /// 설정 파일을 cys 가 **새로 만들었다**(true) / 있던 파일에 키만 넣었다(false — 이때만 옆자리 백업 `.bak-cys-tui` 를 만든다).
+    pub created: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -237,6 +240,11 @@ struct Ledger {
     version: u32,
     entries: Vec<LedgerEntry>,
 }
+
+/// 원장 쓰기의 **충돌** 사유 문면 — `write_ledger` 가 '읽은 뒤 다른 쪽이 썼다' 를 이 바이트로 알리고 [`update_ledger`] 가 이것만 재시도한다.
+const LEDGER_CONFLICT: &str = "그 사이 원장이 바뀌었다 — 쓰지 않는다";
+/// 원장 RMW 재시도 상한 — 그 안에 다섯 번 연속 충돌하면(동시 기동이 다섯 이상) 포기하고 사유를 돌려준다(설정 쓰기는 이미 끝났고 원장만 빠진다 · 로그로 알린다).
+const LEDGER_RETRY_MAX: usize = 5;
 
 // Windows 의 pack 락은 미획득이므로 프로세스 내부 RMW 도 직렬화한다. 파일락 순서는 항상 설정 → 원장이다.
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
@@ -469,7 +477,7 @@ fn write_ledger(path: &Path, ledger: &Ledger, original: Option<&[u8]>) -> Result
     // 링크 교체도 재판독으로 거부한다. 파일이 없어야 하는 경우도 읽기 오류와 구분한다.
     let (_, current) = read_ledger(path)?;
     if current.as_deref() != original {
-        return Err("그 사이 원장이 바뀌었다 — 쓰지 않는다".into());
+        return Err(LEDGER_CONFLICT.into());
     }
     if original.is_some() {
         surgery::probe_writable(path).map_err(|e| format!("원장 쓰기 거부: {e}"))?;
@@ -496,25 +504,45 @@ fn append_ledger(home: &Path, config_dir: &Path, created: bool) -> Result<(), St
         Err(e) => return Err(format!("원장 폴더 판독 실패: {e}")),
     }
     let _ledger_lock = crate::pack::acquire_settings_lock(&path);
-    let (mut ledger, raw) = read_ledger(&path)?;
     let key = normalize_profile_path(config_dir, cfg!(windows));
-    ledger
-        .entries
-        .retain(|e| normalize_profile_path(&e.dir, cfg!(windows)) != key);
-    ledger.entries.push(LedgerEntry {
-        dir: config_dir.to_path_buf(),
-        settings: config_dir.join("settings.json"),
-        written_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| format!("원장 시각 판독 실패: {e}"))?
-            .as_secs(),
-        created,
-    });
-    ledger.entries.sort_by_key(|e| e.written_at);
-    if ledger.entries.len() > MAX_LEDGER_ENTRIES {
-        ledger.entries.drain(..ledger.entries.len() - MAX_LEDGER_ENTRIES);
+    let written_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("원장 시각 판독 실패: {e}"))?
+        .as_secs();
+    // ★(성찰 2회차 C5) 병합형 RMW — 충돌이면 다시 읽은 원장 **위에** 이 항목을 다시 얹는다(다른 좌석의 항목을 지우지 않는다).
+    update_ledger(&path, |ledger| {
+        ledger
+            .entries
+            .retain(|e| normalize_profile_path(&e.dir, cfg!(windows)) != key);
+        ledger.entries.push(LedgerEntry {
+            dir: config_dir.to_path_buf(),
+            settings: config_dir.join("settings.json"),
+            written_at,
+            created,
+        });
+        ledger.entries.sort_by_key(|e| e.written_at);
+        if ledger.entries.len() > MAX_LEDGER_ENTRIES {
+            ledger.entries.drain(..ledger.entries.len() - MAX_LEDGER_ENTRIES);
+        }
+    })
+}
+
+/// ★(성찰 2회차 C5) 원장 갱신 = 읽기 → `apply`(병합) → 재판독 대조 + 원자 쓰기 — **충돌이면 다시 읽어 그 위에 다시 적용**한다(최대 [`LEDGER_RETRY_MAX`]회).
+/// 윈도우에는 설정 락이 없어(`acquire_settings_lock` = None) 동시에 뜨는 launch-agent 둘이 같은 원장을 읽고 각자 쓰면 뒤의 것이 앞의 항목을 지웠다
+/// (종전엔 뒤의 쓰기가 '바뀜' 으로 거부돼 그 좌석의 항목만 빠졌다 — 킬스위치 되돌림에서 그 폴더가 누락된다). `apply` 는 멱등이어야 한다(재시도마다 새 원장에 다시 적용).
+/// 유닉스는 락이 직렬화하므로 충돌 분기가 실행되지 않는다(동작 동일).
+fn update_ledger(path: &Path, mut apply: impl FnMut(&mut Ledger)) -> Result<(), String> {
+    let mut conflicts = 0usize;
+    loop {
+        let (mut ledger, raw) = read_ledger(path)?;
+        apply(&mut ledger);
+        match write_ledger(path, &ledger, raw.as_deref()) {
+            Ok(()) => return Ok(()),
+            Err(e) if e == LEDGER_CONFLICT && conflicts + 1 < LEDGER_RETRY_MAX => conflicts += 1,
+            Err(e) if e == LEDGER_CONFLICT => return Err(format!("{e}(재시도 {LEDGER_RETRY_MAX}회 모두 충돌)")),
+            Err(e) => return Err(e),
+        }
     }
-    write_ledger(&path, &ledger, raw.as_deref())
 }
 
 fn validate_ledger_entry(entry: &LedgerEntry, home: &Path) -> Result<(), String> {
@@ -530,7 +558,26 @@ fn validate_ledger_entry(entry: &LedgerEntry, home: &Path) -> Result<(), String>
     Ok(())
 }
 
+/// 되돌림 백업의 위치 — 킬스위치 되돌림은 설정 파일 옆(`.bak-cys-tui`), 완전 초기화는 격리 폴더 안(흔적을 남기지 않는다 · 성찰 2회차 m4).
+enum BackupWhere<'a> {
+    Beside,
+    Dir(&'a Path),
+}
+
+/// 격리 폴더 안 백업 파일 이름 — `claude-tui.<폴더를 파일명으로 접은 것>.settings.json[.bak-cys-tui]`(agy 의 `agy-antigravity-cli.settings.json` 규약과 같은 폴더).
+fn reset_backup_name(dir: &Path, suffix: &str) -> String {
+    let folded: String = normalize_profile_path(dir, cfg!(windows))
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    format!("claude-tui.{}.settings.json{suffix}", folded.trim_matches('_'))
+}
+
 fn rollback_entry(entry: &LedgerEntry, home: &Path) -> Result<RollbackOutcome, String> {
+    rollback_entry_with(entry, home, BackupWhere::Beside)
+}
+
+fn rollback_entry_with(entry: &LedgerEntry, home: &Path, how: BackupWhere<'_>) -> Result<RollbackOutcome, String> {
     validate_ledger_entry(entry, home)?;
     let Some((raw, text, bom, orig)) = surgery::load(&entry.settings)? else {
         return Ok(RollbackOutcome::Dropped);
@@ -550,7 +597,14 @@ fn rollback_entry(entry: &LedgerEntry, home: &Path) -> Result<RollbackOutcome, S
     }
     bytes.extend_from_slice(body.as_bytes());
     let mode = surgery::file_mode(&entry.settings);
-    backup(&entry.settings, &raw)?;
+    match how {
+        BackupWhere::Beside => backup(&entry.settings, &raw)?,
+        BackupWhere::Dir(d) => {
+            std::fs::create_dir_all(d).map_err(|e| format!("백업 폴더를 만들지 못했다: {e}"))?;
+            let dest = d.join(reset_backup_name(&entry.dir, ""));
+            crate::pack::write_atomic_mode(&dest, &raw, mode).map_err(|e| format!("백업 실패({}): {e}", dest.display()))?;
+        }
+    }
     match surgery::load(&entry.settings)? {
         Some((current, _, _, _)) if current == raw => {}
         _ => return Err("그 사이 설정 파일이 바뀌었다 — 되돌리지 않는다".into()),
@@ -587,7 +641,7 @@ pub fn rollback_from_ledger(home: &Path) -> Vec<(PathBuf, RollbackOutcome)> {
         }
         let _settings_lock = crate::pack::acquire_settings_lock(&entry.settings);
         let _ledger_lock = crate::pack::acquire_settings_lock(&path);
-        let (mut ledger, raw) = match read_ledger(&path) {
+        let (ledger, _raw) = match read_ledger(&path) {
             Ok(loaded) => loaded,
             Err(e) => {
                 outcomes.push((path.clone(), RollbackOutcome::Refused(e)));
@@ -599,8 +653,8 @@ pub fn rollback_from_ledger(home: &Path) -> Vec<(PathBuf, RollbackOutcome)> {
         }
         let outcome = match rollback_entry(&entry, home) {
             Ok(outcome) => {
-                ledger.entries.retain(|e| e != &entry);
-                match write_ledger(&path, &ledger, raw.as_deref()) {
+                // ★(C5) 병합형 제거 — 그 사이 다른 프로세스가 원장에 항목을 더했어도 그 항목은 살리고 이 항목만 뺀다.
+                match update_ledger(&path, |l| l.entries.retain(|e| e != &entry)) {
                     Ok(()) => outcome,
                     Err(e) => RollbackOutcome::Refused(format!("설정 확인/되돌림 후 원장 항목 제거 실패: {e}")),
                 }
@@ -610,6 +664,50 @@ pub fn rollback_from_ledger(home: &Path) -> Vec<(PathBuf, RollbackOutcome)> {
         outcomes.push((entry.dir, outcome));
     }
     outcomes
+}
+
+/// 원장의 항목들(읽기 전용) — 완전 초기화가 `~/.cys` 를 격리하기 **전에** 읽어 둔다. 원장이 없으면 빈 목록 · 훼손·링크·버전 불일치는 Err(원본 보존 · 항목 없음으로 다루지 않는다).
+pub fn ledger_entries(home: &Path) -> Result<Vec<LedgerEntry>, String> {
+    read_ledger(&home.join(LEDGER_FILE)).map(|(l, _)| l.entries)
+}
+
+/// 완전 초기화의 되돌림 결과 한 건.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetTrace {
+    pub dir: PathBuf,
+    pub outcome: RollbackOutcome,
+    /// cys 가 만들었던 옆자리 백업 `settings.json.bak-cys-tui` 를 격리 폴더로 옮겼다.
+    pub backup_moved: bool,
+}
+
+/// ★(성찰 2회차 m4) **완전 초기화**의 흔적 되돌림 — 원장 항목(`entries` · 격리 전에 읽어 둔 것)마다 킬스위치 되돌림과 **같은 안전 규약**으로 cys 가 넣은
+/// `"tui": "default"` 를 뺀다(값이 아직 정확히 `"default"` 일 때만 · 개인 프로필·상대 경로 거부 · 쓰기 직전 재판독 · 원자 쓰기 · 되읽기). 다른 점 둘:
+///   · 되돌림 백업은 설정 파일 옆이 아니라 격리 폴더 `backup_dir` 안(`claude-tui.<폴더>.settings.json`) — 초기화가 새 흔적을 남기지 않는다.
+///   · cys 가 만들었던 옆자리 백업 `settings.json.bak-cys-tui` 는 **우리가 만들었을 때만**(원장 `created=false` — 있던 파일을 고칠 때만 백업을 만든다) 격리 폴더로 옮긴다
+///     (거부된 항목은 사용자가 되돌릴 근거로 남긴다). 원장 파일 자체는 쓰지 않는다(`~/.cys` 와 함께 격리된다). 호출부(`factory_reset`)는 결과를 보고만 한다.
+pub fn reset_entries(entries: &[LedgerEntry], home: &Path, backup_dir: &Path) -> Vec<ResetTrace> {
+    let _serial = MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let _settings_lock = crate::pack::acquire_settings_lock(&entry.settings);
+        let outcome = match rollback_entry_with(entry, home, BackupWhere::Dir(backup_dir)) {
+            Ok(o) => o,
+            Err(e) => RollbackOutcome::Refused(e),
+        };
+        let mut backup_moved = false;
+        if !entry.created && !matches!(outcome, RollbackOutcome::Refused(_)) && validate_ledger_entry(entry, home).is_ok() {
+            let beside = PathBuf::from(format!("{}{BACKUP_SUFFIX}", entry.settings.display()));
+            if std::fs::symlink_metadata(&beside).map(|m| m.is_file()).unwrap_or(false) {
+                let dest = backup_dir.join(reset_backup_name(&entry.dir, BACKUP_SUFFIX));
+                let moved = std::fs::create_dir_all(backup_dir).is_ok()
+                    && (std::fs::rename(&beside, &dest).is_ok()
+                        || (std::fs::copy(&beside, &dest).is_ok() && std::fs::remove_file(&beside).is_ok()));
+                backup_moved = moved;
+            }
+        }
+        out.push(ResetTrace { dir: entry.dir.clone(), outcome, backup_moved });
+    }
+    out
 }
 
 fn backup(settings: &Path, raw: &[u8]) -> Result<(), String> {
@@ -1480,6 +1578,113 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&s).unwrap(), "{\"a\":1}");
         std::fs::set_permissions(&s, std::fs::Permissions::from_mode(0o644)).unwrap();
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// ★(성찰 2회차 C5) 원장 RMW 는 병합형이다 — 읽은 뒤 다른 프로세스가 원장을 바꿨으면(윈도우에는 설정 락이 없다) 다시 읽어 **그 위에** 적용한다.
+    /// 재현: `apply` 첫 호출 때 밖에서 다른 좌석의 항목을 써 넣는다(동시 launch-agent 흉내) → 결과 원장에 두 항목이 모두 있다 · 적용 횟수 2(재시도 1회).
+    /// 계속 충돌하면 상한(5회)에서 사유와 함께 포기한다(원장만 빠지고 설정 쓰기는 영향 없음).
+    #[test]
+    fn claude_tui_ledger_update_merges_on_conflict_and_gives_up_after_cap() {
+        let home = sandbox("ledger-merge");
+        std::fs::create_dir_all(home.join(".cys")).unwrap();
+        let path = home.join(LEDGER_FILE);
+        let other = LedgerEntry { dir: home.join("other"), settings: home.join("other/settings.json"), written_at: 5, created: false };
+        let mine = LedgerEntry { dir: home.join("mine"), settings: home.join("mine/settings.json"), written_at: 7, created: true };
+        let mut applied = 0usize;
+        let other_bytes = serde_json::to_vec(&Ledger { version: 1, entries: vec![other.clone()] }).unwrap();
+        update_ledger(&path, |l| {
+            applied += 1;
+            if applied == 1 {
+                // 읽기와 쓰기 사이에 다른 프로세스가 원장을 썼다.
+                crate::pack::write_atomic(&path, &other_bytes).unwrap();
+            }
+            l.entries.retain(|e| e.dir != mine.dir);
+            l.entries.push(mine.clone());
+        })
+        .unwrap();
+        assert_eq!(applied, 2, "첫 쓰기는 충돌 → 다시 읽어 다시 적용");
+        let (ledger, _) = read_ledger(&path).unwrap();
+        assert_eq!(ledger.entries, vec![other.clone(), mine.clone()], "다른 프로세스의 항목을 지우지 않고 내 항목을 얹는다");
+        // append_ledger 도 같은 경로 — 같은 폴더는 갈아끼우고 다른 폴더는 남는다.
+        append_ledger(&home, &home.join("mine"), false).unwrap();
+        let (ledger, _) = read_ledger(&path).unwrap();
+        assert_eq!(ledger.entries.len(), 2);
+        assert!(ledger.entries.iter().any(|e| e.dir == other.dir) && ledger.entries.iter().any(|e| e.dir == mine.dir && !e.created));
+        // 계속 충돌 — 상한에서 포기(사유에 재시도 횟수).
+        let mut n = 0usize;
+        let bump = |n: usize| serde_json::to_vec(&Ledger { version: 1, entries: vec![LedgerEntry { written_at: n as u64, ..other.clone() }] }).unwrap();
+        let err = update_ledger(&path, |l| {
+            n += 1;
+            crate::pack::write_atomic(&path, &bump(100 + n)).unwrap();
+            l.entries.push(mine.clone());
+        })
+        .unwrap_err();
+        assert_eq!(n, LEDGER_RETRY_MAX);
+        assert!(err.contains("재시도") && err.contains(LEDGER_CONFLICT), "{err}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// ★(성찰 2회차 m4) 완전 초기화의 흔적 되돌림 — 원장 항목으로(원장 파일 없이) 되돌린다: 값이 아직 `"default"` 면 빼고(바이트 원복 · 백업은 격리 폴더 안) ·
+    /// cys 가 만든 옆자리 `.bak-cys-tui` 는 우리가 만든 것(created=false)만 격리 폴더로 옮긴다 · 사용자가 바꾼 값은 그대로(Dropped) · 새로 만든 파일(created=true)의
+    /// 되돌림은 키만 빼고 옆자리 백업은 건드리지 않는다(우리가 만든 백업이 없다) · 개인 프로필 항목은 거부 · 설정 파일 옆에 새 흔적 0.
+    #[test]
+    fn claude_tui_reset_entries_removes_our_traces_only() {
+        let home = sandbox("reset-entries");
+        let trash = home.join("trash").join("settings-backups");
+        // ① 있던 파일에 넣은 경우 — 백업이 생긴다.
+        let d1 = home.join(".claude-2");
+        std::fs::create_dir(&d1).unwrap();
+        let orig1 = "{\n  \"model\": \"opus\"\n}\n";
+        std::fs::write(d1.join("settings.json"), orig1).unwrap();
+        assert!(matches!(ensure_classic(&d1, &home, DirOrigin::SeatSpec), Outcome::Written { created: false, .. }));
+        assert!(d1.join("settings.json.bak-cys-tui").is_file());
+        // ② 새로 만든 경우 — 백업이 없다.
+        let d2 = home.join(".claude-3");
+        std::fs::create_dir(&d2).unwrap();
+        assert!(matches!(ensure_classic(&d2, &home, DirOrigin::SeatSpec), Outcome::Written { created: true, .. }));
+        assert!(!d2.join("settings.json.bak-cys-tui").exists());
+        // ③ 사용자가 값을 바꾼 경우 — 건드리지 않는다(우리 백업은 옮긴다).
+        let d3 = home.join(".claude-4");
+        std::fs::create_dir(&d3).unwrap();
+        std::fs::write(d3.join("settings.json"), "{\"a\":1}").unwrap();
+        assert!(matches!(ensure_classic(&d3, &home, DirOrigin::SeatSpec), Outcome::Written { created: false, .. }));
+        let user3 = "{\"a\":1,\"tui\":\"fullscreen\"}";
+        std::fs::write(d3.join("settings.json"), user3).unwrap();
+        // ④ 다른 사용자 백업(우리 이름이 아닌 것)은 그대로.
+        std::fs::write(d1.join("settings.json.bak-cys"), "x").unwrap();
+        let entries = ledger_entries(&home).unwrap();
+        assert_eq!(entries.len(), 3);
+        // 원장 파일이 격리돼 사라진 뒤에도 항목으로 되돌린다.
+        std::fs::remove_file(home.join(LEDGER_FILE)).unwrap();
+        let traces = reset_entries(&entries, &home, &trash);
+        let by = |d: &Path| traces.iter().find(|t| t.dir == d).unwrap();
+        assert_eq!((by(&d1).outcome.clone(), by(&d1).backup_moved), (RollbackOutcome::Removed, true));
+        assert_eq!((by(&d2).outcome.clone(), by(&d2).backup_moved), (RollbackOutcome::Removed, false));
+        assert_eq!((by(&d3).outcome.clone(), by(&d3).backup_moved), (RollbackOutcome::Dropped, true));
+        assert_eq!(std::fs::read_to_string(d1.join("settings.json")).unwrap(), orig1, "바이트 원복");
+        assert!(!d1.join("settings.json.bak-cys-tui").exists(), "우리가 만든 백업은 옮겨졌다");
+        assert!(d1.join("settings.json.bak-cys").is_file(), "남의 백업은 그대로");
+        assert_eq!(std::fs::read_to_string(d3.join("settings.json")).unwrap(), user3, "사용자 변경값 불가침");
+        assert!(!d3.join("settings.json.bak-cys-tui").exists());
+        let v2: Value = serde_json::from_str(&std::fs::read_to_string(d2.join("settings.json")).unwrap()).unwrap();
+        assert!(v2.get(TUI_KEY).is_none(), "새로 만든 파일도 키는 뺀다: {v2}");
+        // 격리 폴더에 되돌림 백업 2건(d1·d2 — 되돌린 것만) + 옮긴 옆자리 백업 2건(d1·d3) · 설정 폴더 옆에 새 파일 0.
+        let names: Vec<String> = std::fs::read_dir(&trash).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.iter().filter(|n| n.starts_with("claude-tui.") && n.ends_with(".settings.json")).count(), 2, "{names:?}");
+        assert_eq!(names.iter().filter(|n| n.ends_with(BACKUP_SUFFIX)).count(), 2, "{names:?}");
+        for d in [&d1, &d2, &d3] {
+            // 설정 락 파일(`.cys-lock` · 유닉스)은 훅 병합과 공유하는 기존 흔적이라 세지 않는다.
+            let n = std::fs::read_dir(d).unwrap().filter(|e| !e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".cys-lock")).count();
+            assert!(n <= 2, "{}: 설정 폴더에 새 흔적이 생겼다", d.display());
+        }
+        // 멱등 — 다시 돌리면 전부 Dropped · 옮길 백업 없음.
+        let again = reset_entries(&entries, &home, &trash);
+        assert!(again.iter().all(|t| t.outcome == RollbackOutcome::Dropped && !t.backup_moved), "{again:?}");
+        // 개인 프로필 항목은 거부(킬스위치 되돌림과 같은 규약).
+        let personal = LedgerEntry { dir: home.join(".claude"), settings: home.join(".claude/settings.json"), written_at: 1, created: false };
+        let t = reset_entries(&[personal], &home, &trash);
+        assert!(matches!(t[0].outcome, RollbackOutcome::Refused(_)) && !t[0].backup_moved);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
