@@ -1690,36 +1690,63 @@ impl SeatFolder {
     }
 }
 
-/// 두 폴더 경로가 같은 곳을 가리키는가(순수 · 문자열 비교) — 구분자(`\`→`/`)·끝 구분자를 접고, 윈도우에서는 ASCII 대소문자를 무시한다.
-/// transcript 경로([`profile_dir_from_session`])는 정슬래시로 나오고 기록(`CLAUDE_CONFIG_DIR`)은 OS 표기라 그대로 비교하면 늘 다르다.
-pub(crate) fn same_dir(a: &str, b: &str) -> bool {
-    let norm = |p: &str| p.trim().replace('\\', "/").trim_end_matches('/').to_string();
+/// 두 폴더 경로가 같은 곳을 가리키는가(순수 · 문자열 비교 · 플랫폼 의미론 주입) — [`crate::reclaim::norm_path_on`] 으로 표기(역슬래시·MSYS `/c/`·확장 접두·
+/// 드라이브 대소·끝 구분자)를 접고, 윈도우에서는 ASCII 대소문자를 무시한다. transcript 경로는 Claude 가 싣는 표기, 기록(`CLAUDE_CONFIG_DIR`)은 네이티브 표기라
+/// 그대로 비교하면 윈도우 전 좌석이 늘 다르다(codex 2차 검토 #2).
+#[cfg(test)]
+pub(crate) fn same_dir_on(a: &str, b: &str, windows: bool) -> bool {
+    let norm = |p: &str| crate::reclaim::norm_path_on(p.trim(), windows).trim_end_matches('/').to_string();
     let (a, b) = (norm(a), norm(b));
-    if cfg!(windows) {
+    if windows {
         a.eq_ignore_ascii_case(&b)
     } else {
         a == b
     }
 }
 
-/// 이 좌석 설정 폴더(순수 · 3값 [`SeatFolder`]) — `config_dir` = 데몬이 좌석에 기록한 `CLAUDE_CONFIG_DIR` · `trusted` = 그 기록의 출처가 데몬인가
+/// [`same_dir_on`] 의 이 플랫폼 판(검체 전용 — 운영 판정은 [`session_in_profile_on`] 이 접두 비교로 한다).
+#[cfg(test)]
+pub(crate) fn same_dir(a: &str, b: &str) -> bool {
+    same_dir_on(a, b, cfg!(windows))
+}
+
+/// ★(M5 · 순수) 관측 transcript 경로 → 프로필 폴더 — **마지막** `/projects/` 앞(기록 없이 관측만 있을 때 쓴다). transcript 는 `<프로필>/projects/<cwd 부호화>/<세션>.jsonl`
+/// 이고 cwd 부호화는 `/` 를 `-` 로 바꾸므로 프로필 뒤에는 `/projects/` 가 다시 나오지 않는다 — 첫 `/projects/` 로 자르면 홈 아래 `projects/claude-team` 같은 프로필 폴더가
+/// 홈으로 오판된다(codex 2차 검토 #1 · [`profile_dir_from_session`] 은 rate 귀속의 종전 계약이라 그대로 둔다). 표기는 [`crate::reclaim::norm_path_on`] 으로 접는다
+/// (윈도우 MSYS `/c/…` → `c:/…` — 네이티브 IO 가 읽는 꼴).
+pub(crate) fn observed_profile_dir_on(session_file: &str, windows: bool) -> Option<String> {
+    if session_file.trim().is_empty() {
+        return None;
+    }
+    let norm = crate::reclaim::norm_path_on(session_file.trim(), windows);
+    let idx = norm.rfind("/projects/")?;
+    (idx > 0).then(|| norm[..idx].to_string())
+}
+
+/// 이 좌석 설정 폴더(순수 · 3값 [`SeatFolder`]) — 이 플랫폼 판([`resolve_seat_folder_on`]).
+pub(crate) fn resolve_seat_folder(config_dir: Option<&str>, trusted: bool, session_file: &str) -> SeatFolder {
+    resolve_seat_folder_on(config_dir, trusted, session_file, cfg!(windows))
+}
+
+/// 이 좌석 설정 폴더(순수 · 3값 [`SeatFolder`] · 플랫폼 의미론 주입) — `config_dir` = 데몬이 좌석에 기록한 `CLAUDE_CONFIG_DIR` · `trusted` = 그 기록의 출처가 데몬인가
 /// (`Surface::config_dir_trusted`) · `session_file` = 관측된 transcript 경로(빈 문자열 = 관측 없음).
 ///
 /// ★(0.14.45 · 성찰 M5) 종전에는 기록된 폴더를 **그대로** 썼다 — 데몬이 `~/.cys/claude` 를 기록했는데(CYS_ACCOUNT_DIR 없음) claude 는 팩 agents.json 의
 /// 부서 계정 폴더나 손으로 준 `CLAUDE_CONFIG_DIR` 로 떠 있으면, 카드가 **엉뚱한 계정을 확인된 것처럼** 보였다. 규칙(위에서부터 첫 일치):
-///   1. 관측된 transcript 의 프로필 폴더가 있으면 **그것**이 사실이다(기록과 다르면 관측이 이긴다 · 같으면 그대로) → `Verified(관측)`.
-///   2. 관측이 없고 기록이 신뢰되면 → `Verified(기록)`.
-///   3. 관측이 없고 기록은 있으나 신뢰되지 않으면 → `Unverified(기록)`(계정 불일치·확인 필요 — 확인되지 않은 계정을 확인된 것으로 내지 않는다).
-///   4. 둘 다 없으면 → `Unknown`.
-pub(crate) fn resolve_seat_folder(config_dir: Option<&str>, trusted: bool, session_file: &str) -> SeatFolder {
+///   1. 관측된 transcript 가 **기록 폴더 아래**(`<기록>/projects/…` — 표기를 접어 비교 · [`session_in_profile_on`])면 기록이 확인된 것이다 → `Verified(기록)`
+///      (기록 폴더 이름에 `/projects/` 가 있어도 · 윈도우 MSYS 표기여도 기록의 네이티브 표기를 쓴다).
+///   2. 그 밖에 관측된 transcript 의 프로필 폴더가 있으면 **그것**이 사실이다(기록과 다르면 관측이 이긴다) → `Verified(관측)`.
+///   3. 관측이 없고 기록이 신뢰되면 → `Verified(기록)`.
+///   4. 관측이 없고 기록은 있으나 신뢰되지 않으면 → `Unverified(기록)`(계정 불일치·확인 필요 — 확인되지 않은 계정을 확인된 것으로 내지 않는다).
+///   5. 둘 다 없으면 → `Unknown`.
+pub(crate) fn resolve_seat_folder_on(config_dir: Option<&str>, trusted: bool, session_file: &str, windows: bool) -> SeatFolder {
     let recorded = config_dir.map(str::trim).filter(|c| !c.is_empty());
-    let observed = if session_file.trim().is_empty() {
-        None
-    } else {
-        profile_dir_from_session(session_file).map(|p| p.to_string_lossy().into_owned())
-    };
-    match (observed, recorded) {
-        (Some(o), Some(r)) if same_dir(&o, r) => SeatFolder::Verified(r.to_string()),
+    if let Some(r) = recorded {
+        if session_in_profile_on(session_file, r, windows) {
+            return SeatFolder::Verified(r.to_string());
+        }
+    }
+    match (observed_profile_dir_on(session_file, windows), recorded) {
         (Some(o), _) => SeatFolder::Verified(o),
         (None, Some(r)) if trusted => SeatFolder::Verified(r.to_string()),
         (None, Some(r)) => SeatFolder::Unverified(r.to_string()),
@@ -6184,9 +6211,30 @@ mod tests {
             for (what, cfg, trusted, sf, want) in cases {
                 assert_eq!(resolve_seat_folder(cfg, trusted, sf), want, "{what}");
             }
-            assert!(same_dir("/h/.claude-4", "/h/.claude-4/") && same_dir(r"C:\u\.claude-4", "C:/u/.claude-4"));
+            // ★(codex 2차 검토 #1) 기록 폴더 이름에 `/projects/` 가 있어도 그 아래의 transcript 는 기록을 확인한 것이다 — 첫 `/projects/` 로 잘라 홈을 계정으로 내지 않는다.
+            let team = "/home/alice/projects/claude-team";
+            let team_tr = "/home/alice/projects/claude-team/projects/-w/s.jsonl";
+            assert_eq!(resolve_seat_folder(Some(team), false, team_tr), Verified(team.into()));
+            assert_eq!(resolve_seat_folder(None, false, team_tr), Verified(team.into()), "기록 없이도 마지막 /projects/ 앞");
+            assert_eq!(observed_profile_dir_on("/projects/x.jsonl", false), None);
+            assert_eq!(observed_profile_dir_on("/h/.claude-4/projects/-x/abc/subagents/a.jsonl", false).as_deref(), Some("/h/.claude-4"));
+            // ★(codex 2차 검토 #2) 윈도우 표기(MSYS `/c/` · 정슬래시 · 확장 접두 · 드라이브 대소)의 transcript 는 네이티브 기록 폴더 아래로 읽힌다 — 기록(네이티브)을 쓴다.
+            let win_rec = r"C:\Users\x\.cys\claude";
+            for sf in [
+                "/c/Users/x/.cys/claude/projects/C--Users-x-p/s.jsonl",
+                "C:/Users/x/.cys/claude/projects/C--Users-x-p/s.jsonl",
+                r"\\?\c:\Users\x\.cys\claude\projects\C--Users-x-p\s.jsonl",
+            ] {
+                assert_eq!(resolve_seat_folder_on(Some(win_rec), false, sf, true), Verified(win_rec.into()), "{sf}");
+            }
+            assert_eq!(
+                resolve_seat_folder_on(Some(win_rec), false, "/d/Users/x/.claude-4/projects/C--p/s.jsonl", true),
+                Verified("d:/Users/x/.claude-4".into()),
+                "다른 폴더의 MSYS 표기는 네이티브 IO 가 읽는 드라이브 표기로 접는다"
+            );
+            assert!(same_dir("/h/.claude-4", "/h/.claude-4/") && same_dir_on(r"C:\u\.claude-4", "/c/u/.claude-4", true));
             assert!(!same_dir("/h/.claude-4", "/h/.claude-40") && !same_dir("/h/.claude-4", "/h/.cys/claude"));
-            assert_eq!(same_dir("/h/A", "/h/a"), cfg!(windows), "대소문자 무시는 윈도우만");
+            assert!(same_dir_on("/h/A", "/h/a", true) && !same_dir_on("/h/A", "/h/a", false), "대소문자 무시는 윈도우만");
         }
 
         /// ★(0.14.45 · 성찰 M5) 실제 좌석 — 호출자가 계정 폴더를 준 좌석(`config_dir_trusted=false`)은 기록 폴더에 로그인이 있어도 `mismatch`(그 계정을 확인된 것으로

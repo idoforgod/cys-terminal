@@ -8034,6 +8034,9 @@ pub(crate) struct QueueBlockDiag {
     pub(crate) rows_too_small: bool,
     /// ★(성찰 M2) 다시 그리기를 요청한 뒤 아직 판독 가능한 화면을 보지 못했다(`RepaintState::unrecovered > 0`).
     pub(crate) repaint_unresolved: bool,
+    /// ★(codex 2차 검토 #4) 이 좌석은 다시 그리기 요청 **대상이 아니다** — 프롬프트 표지를 모르는 좌석(맨 셸·마커 미선언 어댑터 — 큐 틱의 마커 없는 경로는 nudge 를 부르지 않는다)
+    /// 또는 전경이 에이전트가 아닌 대체 화면. 처방은 이 좌석에 요청을 약속하지 않는다.
+    pub(crate) nudge_ineligible: bool,
 }
 
 /// ★(0.14.45 · F3) 화면 동기 진단 묶음 — [`QueueBlockDiag`] 의 `cursor_row`·`marker_row`·`cursor_lead_cp`.
@@ -8254,8 +8257,12 @@ pub(crate) fn queue_block_diag_with(
     };
     // ★(성찰 M1·M2) 처방 문장의 사실 재료 — 출력 정적 초 · 대체 화면 ∧ 전경 에이전트 · 노브 · 화면 높이. 파서 락은 순간(크기만).
     let quiet_secs = Some(s.last_output.lock().unwrap_or_else(|e| e.into_inner()).elapsed().as_secs());
-    let alt_fg_agent = s.alt_screen.load(Ordering::Relaxed) && seat_foreground_is_agent(s);
+    let alt = s.alt_screen.load(Ordering::Relaxed);
+    let alt_fg_agent = alt && seat_foreground_is_agent(s);
     let rows_too_small = s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().size().0 < crate::repaint::REPAINT_MIN_ROWS;
+    // (codex 2차 검토 #4) nudge 대상 = 마커 좌석(큐 틱의 마커 경로만 nudge 를 부른다) ∧ (비-대체 화면 ∨ 전경 에이전트). 맨 셸은 어댑터를 읽지 않는다(RQFIX F4 와 같은 규율).
+    let has_marker = s.agent_meta.lock().map(|m| m.is_some()).unwrap_or(false) && surface_prompt_marker(s, &defs()).is_some();
+    let nudge_ineligible = !has_marker || (alt && !alt_fg_agent);
     QueueBlockDiag {
         pending_input_bytes: pending,
         pending_input_human_bytes: human,
@@ -8275,6 +8282,7 @@ pub(crate) fn queue_block_diag_with(
         repaint_knob_off: !crate::repaint::repaint_nudge_enabled(),
         rows_too_small,
         repaint_unresolved,
+        nudge_ineligible,
     }
 }
 
@@ -8374,11 +8382,13 @@ pub(crate) const REMEDY_BODY_PROMPT_UNKNOWN: &str =
      창 크기를 한 칸 흔들어 다시 그리기를 요청한다 · 사람이 그 창 크기를 한 번 바꿔도 풀린다). 그래도 막혀 있으면 그 창이 입력을 기다리는 상태인지 사람이 확인한다";
 
 /// ★(0.14.45 · 성찰 M2) 다시 그리기 요청에 관한 **사실 그대로의 구절**(순수) — `None` = 요청이 **올 것이다**(호출자가 자기 문장의 약속 구절을 그대로 쓴다) ·
-/// `Some(구절)` = 약속할 수 없거나 이미 해 봤다(호출자가 약속 구절 자리에 이 구절을 쓴다). 위에서부터 첫 일치: 노브 끔 → 창이 너무 작음 → 요청했으나 풀리지 않음.
+/// `Some(구절)` = 약속할 수 없거나 이미 해 봤다(호출자가 약속 구절 자리에 이 구절을 쓴다). 위에서부터 첫 일치: 노브 끔 → 대상 아님(마커 없는 좌석·전경이 에이전트가 아닌 대체 화면) → 창이 너무 작음 → 요청했으나 풀리지 않음.
 /// 호출자가 처방 문장에 "cys 가 다시 그리기를 요청한다" 고 적을 수 있는 것은 이 함수가 `None` 일 때뿐이다(약속하지 않을 것을 약속하지 않는다).
 pub(crate) fn repaint_promise(d: &QueueBlockDiag) -> Option<&'static str> {
     if d.repaint_knob_off {
         Some("다시 그리기 요청은 꺼져 있다(`CYS_SCREEN_REPAINT_NUDGE=0`) — 사람이 그 창 크기를 한 번 바꾸면 다시 그려진다")
+    } else if d.nudge_ineligible {
+        Some("이 좌석은 cys 가 다시 그리기를 요청하는 대상이 아니다(프롬프트 표지를 모르는 좌석이거나 전경이 에이전트가 아닌 전체화면) — 사람이 그 창 크기를 한 번 바꾸면 다시 그려진다")
     } else if d.rows_too_small {
         Some("창이 너무 작아 cys 가 크기를 흔들지 못한다(4행 미만) — 창을 키우거나 사람이 그 창 크기를 한 번 바꾼다")
     } else if d.repaint_unresolved {
@@ -11391,6 +11401,11 @@ pub(crate) fn nudge_screen_obs(verdict: &PromptGate, obs: &PromptObs, alt_fg_age
     let stale_marker = (blocked == BLOCKED_BUSY || blocked == BLOCKED_MODAL || obs.selector_row) && obs.quiet_secs >= STALE_SCREEN_QUIET_SECS;
     if stale_marker {
         return if screen_ok_to_nudge { ScreenObs::Unreadable } else { ScreenObs::Other };
+    }
+    // ⓑ′ 바쁨·모달 사유에서 커서 행이 읽히는 것은 복구의 증거가 아니다(codex 2차 검토 #3) — 요청 뒤 제어 출력 한 조각(`ESC[0m`)이 quiet 를 0 으로 되돌려도
+    //    표지는 그대로인데 `Readable` 로 배수를 지우면 600·1200… 간격 대신 매 300초 재요청이 된다. 시계만 지운다(`Other`) · 복구 = 준비 판정.
+    if blocked == BLOCKED_BUSY || blocked == BLOCKED_MODAL {
+        return ScreenObs::Other;
     }
     if obs.line.is_some() && !obs.alt_screen && !obs.selector_row {
         return ScreenObs::Readable;
@@ -19880,8 +19895,10 @@ mod tests {
             ("종전 ⓐ input_pending ∧ 마커 없음", b(BLOCKED_INPUT_PENDING), obs(false, false, false, 0, true), false, Unreadable),
             ("발행 중 프레임은 어느 것도 아니다", b(BLOCKED_PROMPT_UNKNOWN), obs(false, false, false, 600, false), false, Other),
             ("M1 바쁨 ∧ 정적 60초 = 낡은 표지 후보", b(BLOCKED_BUSY), obs(true, false, false, 60, true), false, Unreadable),
-            ("바쁨 ∧ 정적 59초 = 아직(커서 행이 읽히면 종전대로 판독 가능)", b(BLOCKED_BUSY), obs(true, false, false, 59, true), false, Readable),
+            ("바쁨 ∧ 정적 59초 = 아직 · 커서 행이 읽혀도 복구 증거가 아니다(배수 유지 · codex #3)", b(BLOCKED_BUSY), obs(true, false, false, 59, true), false, Other),
             ("바쁨 ∧ 정적 59초 ∧ 커서 행 없음 = 그 밖", b(BLOCKED_BUSY), obs(false, false, false, 59, true), false, Other),
+            ("모달 ∧ 정적 0초 ∧ 커서 행 읽힘 = 그 밖(복구 = 준비 판정뿐)", b(BLOCKED_MODAL), obs(true, false, false, 0, true), false, Other),
+            ("prompt_not_ready ∧ 커서 행 읽힘 = 종전대로 판독 가능", b(super::BLOCKED_PROMPT_NOT_READY), obs(true, false, false, 0, true), false, Readable),
             ("M1 모달 ∧ 정적 60초", b(BLOCKED_MODAL), obs(true, false, false, 60, true), false, Unreadable),
             ("M1 선택기 행 ∧ 정적 60초(커서 행이 읽혀도)", b(BLOCKED_MODAL), obs(true, false, true, 60, true), false, Unreadable),
             ("선택기 행 ∧ 정적 10초 = 그 밖(복구 증거도 아니다 · A4)", b(BLOCKED_MODAL), obs(true, false, true, 10, true), false, Other),
@@ -19927,6 +19944,7 @@ mod tests {
         // 약속 구절 셋 — 어느 갈래(9행·14행·바쁨·모달·대체 화면)에서도 같은 사실 문장으로 바뀌고 '요청한다' 는 사라진다.
         for (what, d, needle) in [
             ("노브 끔", QueueBlockDiag { repaint_knob_off: true, ..base(Some(90)) }, "다시 그리기 요청은 꺼져 있다"),
+            ("대상 아님(마커 없는 좌석 · codex #4)", QueueBlockDiag { nudge_ineligible: true, ..base(Some(90)) }, "요청하는 대상이 아니다"),
             ("창 너무 작음", QueueBlockDiag { rows_too_small: true, ..base(Some(90)) }, "창이 너무 작아 cys 가 크기를 흔들지 못한다"),
             ("요청했으나 미복구", QueueBlockDiag { repaint_unresolved: true, ..base(Some(90)) }, "다시 그리기를 요청했으나 풀리지 않았다"),
         ] {
@@ -19947,8 +19965,9 @@ mod tests {
             }
             // 우선순위: 노브 끔 > 창 너무 작음 > 미복구.
         }
-        let all = QueueBlockDiag { repaint_knob_off: true, rows_too_small: true, repaint_unresolved: true, ..base(None) };
+        let all = QueueBlockDiag { repaint_knob_off: true, nudge_ineligible: true, rows_too_small: true, repaint_unresolved: true, ..base(None) };
         assert!(super::repaint_promise(&all).unwrap().contains("꺼져 있다"));
+        assert!(super::repaint_promise(&QueueBlockDiag { nudge_ineligible: true, rows_too_small: true, ..base(None) }).unwrap().contains("대상이 아니다"));
         assert!(super::repaint_promise(&QueueBlockDiag { rows_too_small: true, repaint_unresolved: true, ..base(None) }).unwrap().contains("너무 작아"));
         assert!(super::repaint_promise(&base(None)).is_none());
         // 9행·14행 기본 갈래는 상수 바이트 그대로(문서가 인용) · 괄호 밖 문장("(프롬프트)" 포함)은 갈래가 바뀌어도 그대로다.
@@ -19986,6 +20005,7 @@ mod tests {
         assert!(s.repaint.lock().unwrap().unreadable_since.is_some(), "낡은 바쁨 표지 = 판독 불가 시계");
         assert_eq!(count(&daemon), 0);
         let d = super::queue_block_diag(&daemon, &s);
+        assert!(!d.nudge_ineligible, "마커 좌석은 대상이다: {d:?}");
         let (code, t) = super::queue_remedy(BLOCKED_BUSY, &d);
         assert_eq!(code, "wait");
         assert!(t.contains("낡은 화면 사본일 수 있다") && t.contains("다시 그리기를 요청한다"), "{t}");
@@ -20053,8 +20073,13 @@ mod tests {
         tick(&daemon);
         assert_eq!(count(&daemon), 1);
         assert!(s.repaint.lock().unwrap().unreadable_since.is_none());
-        let (_, t) = super::queue_remedy(BLOCKED_ALT_SCREEN, &super::queue_block_diag(&daemon, &s));
+        let d = super::queue_block_diag(&daemon, &s);
+        assert!(d.nudge_ineligible && !d.alt_fg_agent, "{d:?}");
+        let (_, t) = super::queue_remedy(BLOCKED_ALT_SCREEN, &d);
         assert!(!t.contains("다시 그리기"), "{t}");
+        // 같은 좌석의 바쁨·모달 처방도 '대상이 아니다' 로 — 요청을 약속하지 않는다(codex #4).
+        let (_, t) = super::queue_remedy(BLOCKED_BUSY, &QueueBlockDiag { quiet_secs: Some(90), ..d.clone() });
+        assert!(t.contains("요청하는 대상이 아니다") && !t.contains("다시 그리기를 요청한다"), "{t}");
         let _ = s.child.lock().unwrap().kill();
     }
 
