@@ -6221,6 +6221,18 @@ impl Daemon {
         self.create_surface_with_env(cwd, cmd, title, role, rows, cols, &[], None)
     }
 
+    /// ★검체 전용 — 호출자 오버라이드 계정 dir 로 좌석을 만든다(`config_dir_trusted=false` · 복원 좌석·수동 CLAUDE_CONFIG_DIR 과 같은 꼴).
+    /// 운영 스폰은 `handlers` 의 `surface.create` 한 곳뿐이다(H-AUTH-SELFLOOP 가 스폰 함수의 소비 파일을 센다 — 검체는 이 이음매를 쓴다).
+    #[cfg(test)]
+    pub fn create_surface_untrusted_config_dir(
+        self: &Arc<Self>,
+        cmd: Option<String>,
+        role: Option<String>,
+        config_dir: String,
+    ) -> Result<Arc<Surface>, String> {
+        self.create_surface_with_env(None, cmd, None, role, 24, 80, &[], Some(config_dir))
+    }
+
     /// create_surface + PTY env 주입(RC-3 B′). `env`의 (k,v)를 builder.env로 실어 pane에 직접 전달한다
     /// (Windows launch-agent가 해소한 CLAUDE_CONFIG_DIR 등 — 순수 cmd send와 짝). unix는 빈 슬라이스라
     /// 무동작(셸 인라인 전개가 진실원). CYS_PACK_DIR·CYS_ACCOUNT_DIR 등 기존 주입과 동형.

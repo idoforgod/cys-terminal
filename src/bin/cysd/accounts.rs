@@ -6249,7 +6249,7 @@ mod tests {
             let actual = b3_login(&home, ".claude-4", "u-act", "act@example.test", 2);
             // 호출자 오버라이드 = 신뢰되지 않은 기록(복원 좌석 · 수동 CLAUDE_CONFIG_DIR 과 같은 꼴)
             let untrusted = d
-                .create_surface_with_env(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80, &[], Some(recorded.to_string_lossy().into_owned()))
+                .create_surface_untrusted_config_dir(Some("sleep 30".into()), Some("worker".into()), recorded.to_string_lossy().into_owned())
                 .expect("create surface");
             d.surfaces.lock().unwrap().insert(untrusted.id, untrusted.clone());
             *untrusted.agent_meta.lock().unwrap() = Some(("claude".into(), "claude".into()));
