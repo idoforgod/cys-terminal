@@ -6059,6 +6059,7 @@ mod pure_tests {
             paused: false,
             kill_switch: false,
             input_model: "v3",
+            ..crate::governance::QueueBlockDiag::default()
         }
     }
 

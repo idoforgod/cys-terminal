@@ -48,6 +48,7 @@ mod knobs;
 mod office_bridge;
 mod recall;
 mod reclaim;
+mod repaint;
 mod schedule;
 mod severity;
 mod skillrun;

@@ -2,7 +2,7 @@
 members = ["src-tauri"]
 # 벤더링된 portable-pty(ConPTY pane 자식 생성)는 워크스페이스 멤버가 아니라 path 의존이다.
 #   ConPTY 자식에 CREATE_NO_WINDOW 금지 — 29행 참조.
-exclude = ["vendor/portable-pty"]
+exclude = ["vendor/portable-pty", "vendor/vt100"]
 
 [package]
 name = "cys-terminal"
@@ -32,7 +32,11 @@ serde_json = "1"
 #   셸 출력이 pane 에 닿지 않는 검은 pane 이 되어 22ff28f6 에서 원복했다. 창 번쩍임(U5)은 콘솔 없는 cysd·cys-app 이
 #   띄우는 **비 ConPTY** 자식의 문제다(lib.rs census). 재추가는 spawn_policy_tests 가 막는다. vendor/portable-pty/ 참조.
 portable-pty = { path = "vendor/portable-pty" }
-vt100 = "0.15"
+# ★벤더링: vt100 0.15.2(upstream 최신 · 오프라인 레지스트리 기준 후속판 없음)를 vendor/vt100/ 로 들여와 고친다.
+#   폭을 줄일 때 Row::resize 가 마지막 칸의 넓은 글자 머리(wide head)를 지우지 않아(truncate 와 달리) 다음 그리기가
+#   cells[col+1] 을 짚어 패닉했다(state.rs row89 재현) — 패닉 격리가 파서를 빈 것으로 갈아 화면 사본이 영구 어긋나
+#   큐가 prompt_unknown·input_pending 으로 굶었다(0.14.45 윈도우 11 제보). 패치 지점은 vendor/vt100/src 의 "cys 패치" 주석.
+vt100 = { path = "vendor/vt100" }
 clap = { version = "4", features = ["derive"] }
 regex = "1"
 # ★FATAL-1(0.14.42 WP-transport 리뷰): 기본 feature 의 `multithread`(rayon 전역 풀)를 끈다 — 나머지 기본
