@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-const WATCHDOG_INTERVAL_SECS: u64 = 5;
+pub(crate) const WATCHDOG_INTERVAL_SECS: u64 = 5;
 const LOAD_DEBOUNCE_SECS: f64 = 60.0;
 
 /// ★(0.14.31 · 성찰 Q8) watchdog 루프가 **어디서 도는가**. 관측·보고용(기동 1회).
@@ -11506,13 +11506,22 @@ fn deliver_queued(
             let input = prompt_gate_input(daemon, &s, marker, placeholder, &obs);
             let verdict = prompt_gate_verdict(&input);
             // ★(0.14.45 · F2) 화면 사본이 어긋난 좌석(커서 행에 마커가 없어 입력줄을 못 읽는 채 막힘)은 키 입력 없이
-            //   다시 그리기를 요청한다(PTY 크기 한 칸 흔들기 · 전용 스레드 · 좌석당 5분 이상 간격). 판독 불가가 아니면 시계를 지운다.
+            //   다시 그리기를 요청한다(PTY 높이 한 줄 흔들기 · 전용 스레드 · 좌석당 5분 이상 간격). 판독 불가가 아니면 시계를
+            //   지우고, **판독 가능**(준비 판정 또는 커서 행 관측)일 때만 미복구 배수도 지운다(A4 — 대체 화면·선택기 행 같은
+            //   다른 사유는 '복구' 의 증거가 아니다).
             let screen_unreadable = matches!(verdict, PromptGate::Blocked(w) if w == BLOCKED_PROMPT_UNKNOWN || w == BLOCKED_INPUT_PENDING)
                 && obs.line.is_none()
                 && !obs.alt_screen
                 && !obs.selector_row
                 && obs.frame_published();
-            crate::repaint::note_queue_screen(daemon, &s, screen_unreadable);
+            let screen_obs = if screen_unreadable {
+                crate::repaint::ScreenObs::Unreadable
+            } else if matches!(verdict, PromptGate::Ready) || obs.line.is_some() {
+                crate::repaint::ScreenObs::Readable
+            } else {
+                crate::repaint::ScreenObs::Other
+            };
+            crate::repaint::note_queue_screen(daemon, &s, screen_obs);
             match verdict {
                 PromptGate::Blocked(why) => {
                     // 사유를 갈라 기록한다 — 손잡이가 다르다(입력줄 점유는 사람이 비워야 풀리고,

@@ -6733,29 +6733,15 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "invalid_params", &e)),
             };
-            let res = surface
-                .master
-                .lock()
-                .unwrap()
-                .resize(portable_pty::PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
-            match res {
-                Ok(()) => {
-                    surface
-                        .parser
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .set_size(rows, cols);
-                    Reply::Single(ok_response(
-                        &id,
-                        json!({"surface_id": sid, "rows": rows, "cols": cols}),
-                    ))
-                }
-                Err(e) => Reply::Single(err_response(&id, "resize_failed", &e.to_string())),
+            // ★(0.14.45 · F2-A1) PTY · 파서 두 단계를 좌석 `resize_serial` 락 아래에서 한 번에 한다 — 재동기 스레드
+            //   (`repaint::nudge_resize` · 크기 흔들기)와 엇갈려 끝 크기가 어긋나거나 GUI 크기가 사라지는 경합 차단.
+            //   세대가 오르므로 흔들기 중이던 스레드는 이 크기를 존중하고 되돌리지 않는다.
+            match crate::repaint::apply_resize(&surface, rows, cols) {
+                Ok(()) => Reply::Single(ok_response(
+                    &id,
+                    json!({"surface_id": sid, "rows": rows, "cols": cols}),
+                )),
+                Err(e) => Reply::Single(err_response(&id, "resize_failed", &e)),
             }
         }
 
