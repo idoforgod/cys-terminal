@@ -63,6 +63,13 @@
 //!   `System32\bash.exe` 로 잡힐 수 있다) · **따옴표 없음** · 역슬래시 · `\\?\` 확장 접두는 벗기고 UNC 는 만들지 않는다.
 //! - 경로는 `X:\` + ASCII 영숫자 + `\ . _ -` 만 허용한다. 공백 · `% ^ & ( ) !` · 따옴표 · 비ASCII(코드페이지 해석)는
 //!   cmd 문법에서 뜻이 바뀌거나 확신이 없으므로 `UnsafePath`(안내만)다.
+//! - ★(0.14.45 · 윈도우 CI 실측 run 37579579063) **8.3 짧은 이름**(사용자 폴더 구성요소가 `RUNNER~1` 꼴 — 긴 사용자 이름의 `%TEMP%` 등)은
+//!   검사 **전에** `GetLongPathNameW` 로 긴 이름으로 펼친다([`long_path`]). `~` 자체는 허용 문자에 **넣지 않는다**: cmd 와 Go
+//!   `EscapeArg` 에서는 `~` 단독이 메타문자가 아니지만(`%~`·`!…:~…!` 는 `%`·`!` 거절로 이미 막힌다), 윈도우 판 agy 는 `cmd /c`
+//!   앞에서 `store.expandTilde(command)` 를 부르고(WD/RESULT.md (a) · 함수 본문은 미확인) 그 함수가 중간의 `~` 를 어떻게
+//!   다루는지 모른다 — 실연 검사(`live_probe`)는 `cmd /c` 만 재현하고 `expandTilde` 는 재현하지 않으므로 거기서 깨지면 검사가
+//!   통과해도 agy 에서 실패한다. 펼치기 실패(경로 없음 · 8.3 꺼짐 · API 오류)면 원문 그대로 → `~` 가 남아 `UnsafePath`(안내만 ·
+//!   실패 방향 = 쓰지 않음). 펼친 긴 이름이 비ASCII 면 종전 그대로 `%USERPROFILE%` 꼴 흐름으로 간다.
 //!
 //! 정적 분석은 실기 관측이 아니다. 그래서 윈도우는 **쓰기 직전에 그 명령을 agy 와 같은 방식으로 한 번 실행해 본다**
 //! (`live_probe`): `cmd /c <Go 규칙으로 인용한 명령>` · 콘솔 창 없음(`ChildLifetime::Attached` = `CREATE_NO_WINDOW`) ·
@@ -240,6 +247,50 @@ fn windows_path_is_safe(p: &str) -> bool {
         && b[3..].iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'\\' | b'.' | b'_' | b'-'))
 }
 
+/// ★(0.14.45 · 윈도우 CI 실측) 8.3 짧은 이름 펼침 정책(순수 · 해석기 주입 — 맥에서 윈도우 문자열로 시험한다). 이 정책의 목적은
+/// 자동 생성 짧은 이름의 `~`(`RUNNER~1`) 제거 하나다 — 경로에 `~` 가 없으면 해석기를 부르지 않고 그대로 둔다(`~` 없는 별도 지정 짧은
+/// 이름도 있을 수 있으나 그 철자는 안전 규칙이 글자 그대로 판정한다 · 동작 변경 최소). 있으면 해석기 결과(긴 이름)를 쓰고, 해석기가
+/// 실패하면(`None`·빈 경로) **원문 그대로** — `~` 가 남아 윈도우 안전 규칙에서 거절된다(실패 방향 = 쓰지 않음 · 모듈 머리 '윈도우').
+pub fn expand_short_names_with(p: &Path, resolve: impl FnOnce(&Path) -> Option<PathBuf>) -> PathBuf {
+    if !p.to_string_lossy().contains('~') {
+        return p.to_path_buf();
+    }
+    resolve(p).filter(|l| !l.as_os_str().is_empty()).unwrap_or_else(|| p.to_path_buf())
+}
+
+/// 윈도우: 8.3 짧은 이름 구성요소를 긴 이름으로 펼친다(`GetLongPathNameW` — 심볼릭 링크·정션은 풀지 않는다 · `canonicalize` 와 달리
+/// `\\?\` 접두를 붙이지 않는다). 유닉스: 그대로. 실패하면 원문(→ [`expand_short_names_with`]).
+pub fn long_path(p: &Path) -> PathBuf {
+    expand_short_names_with(p, os_long_path)
+}
+
+#[cfg(windows)]
+fn os_long_path(p: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut buf = vec![0u16; 512];
+    // 버퍼가 작으면 필요한 길이(널 포함)를 돌려준다 — 두 번이면 충분하다(세 번째는 경로가 그 사이 바뀐 경우 · 포기 = 원문).
+    for _ in 0..3 {
+        // SAFETY: `wide` 는 널 종료 UTF-16 · `buf` 는 `buf.len()` 칸의 쓰기 가능한 버퍼다.
+        let n = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 {
+            return None;
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            return Some(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+        }
+        buf.resize(n, 0);
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn os_long_path(_: &Path) -> Option<PathBuf> {
+    None
+}
+
 /// ★(0.14.45 · 성찰 m1) 윈도우 **비ASCII 사용자 폴더**(한글 이름 등) — 팩이 `%USERPROFILE%` 아래이고 **안전하지 않은 글자가 비ASCII 뿐**이면
 /// (공백·`% ^ & ( ) !`·따옴표는 여전히 거절) `%USERPROFILE%\<나머지>\hooks\cys-agy-statusline.cmd` 를 만든다 — `cmd /c` 가 `%USERPROFILE%` 을
 /// 전개한다(그 기계의 실연 검사 [`live_probe`] 가 **이 문자열 그대로** `cmd /c` 로 돌려 검증한다). 순수: `pack` = 역슬래시·확장 접두를 정리한 팩 경로 ·
@@ -282,6 +333,20 @@ pub fn home_matches_userprofile(home: &str, userprofile: Option<&str>) -> bool {
     let h = norm(home);
     h.chars().count() == up.chars().count()
         && h.chars().zip(up.chars()).all(|(a, b)| a == b || (a.is_ascii() && b.is_ascii() && a.eq_ignore_ascii_case(&b)))
+}
+
+/// ★(0.14.45 · codex 교차 검토 C) `%USERPROFILE%` **원문** env 값이 cmd 전개 뒤에도 안전한 글자뿐인가(순수) — `X:\` + ASCII 안전 집합
+/// (`영숫자 \ . _ -`) 또는 비ASCII(공백·제어 제외). `~` 도 거절한다(모듈 머리 '윈도우' — 보수 쪽). 끝 구분자·`\\?\` 접두는 접는다.
+pub fn userprofile_env_is_cmd_safe(up: &str) -> bool {
+    let up = up.strip_prefix(r"\\?\").unwrap_or(up).trim_end_matches('\\');
+    let b = up.as_bytes();
+    b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && b[2] == b'\\'
+        && up[3..].chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '\\' | '.' | '_' | '-') || (!c.is_ascii() && !c.is_whitespace() && !c.is_control())
+        })
 }
 
 /// 연결 명령 문자열(순수 · OS 규칙 주입) — 홈을 모르는 판([`link_command_for_home`] 의 `home = None`).
@@ -848,12 +913,26 @@ fn write_record(record: &Path, settings: &Path) {
 /// statusLine 칸이 비어 있거나 없을 때만 cys 연결을 넣는다. `force` = '연결한 적 있음' 기록을 무시한다
 /// (사람이 부른 `cys doctor --fix` 만 쓴다 — 설치 경로는 false).
 pub fn ensure_linked(ctx: &Ctx, force: bool) -> Outcome {
-    // ★(codex 3차 검토 #3) `%USERPROFILE%` 꼴은 홈이 실제 env 전개값과 같을 때만 — 다르면 홈을 모르는 것으로 둔다(평문 경로 규칙 · 비ASCII 면 UnsafePath).
-    let home = ctx
-        .home
-        .map(|h| h.to_string_lossy().into_owned())
-        .filter(|h| !ctx.windows || home_matches_userprofile(h, std::env::var("USERPROFILE").ok().as_deref()));
-    ensure_linked_cmd(ctx, force, link_command_for_home(&ctx.pack_dir.to_string_lossy(), ctx.windows, true, home.as_deref()))
+    ensure_linked_cmd(ctx, force, link_command_resolved(ctx.pack_dir, ctx.windows, true, ctx.home))
+}
+
+/// 실제 경로로 연결 명령을 만든다(운영 조정 [`ensure_linked`] 과 doctor 안내가 **같은 규칙**을 쓴다 — codex 교차 검토 2차 MAJOR).
+/// ★(codex 3차 검토 #3) `%USERPROFILE%` 꼴은 홈이 실제 env 전개값과 같을 때만 — 다르면 홈을 모르는 것으로 둔다(평문 경로 규칙 · 비ASCII 면 거절).
+/// ★(0.14.45 · 윈도우 CI 실측) 윈도우는 팩·홈·`%USERPROFILE%` 의 8.3 짧은 이름(`RUNNER~1`)을 검사 전에 긴 이름으로 펼친다 —
+///   `~` 는 안전 문자로 받지 않는다(모듈 머리 '윈도우' · agy `expandTilde` 미확인). 유닉스는 종전 그대로.
+/// ★(codex 교차 검토 C · MAJOR) 동일성 비교는 펼친 철자로 하되, cmd 가 실제로 전개하는 것은 **원문** env 다 — 원문 자체가 안전 글자
+///   ([`userprofile_env_is_cmd_safe`])가 아니면(별도 지정 짧은 이름 `A&B~1` 등) `%USERPROFILE%` 꼴을 쓰지 않는다(실패 방향 = 평문 규칙 → 거절).
+pub fn link_command_resolved(pack_dir: &Path, windows: bool, marker: bool, home: Option<&Path>) -> Option<String> {
+    let widen = |p: &Path| if windows { long_path(p) } else { p.to_path_buf() };
+    let pack = widen(pack_dir);
+    let userprofile = std::env::var("USERPROFILE")
+        .ok()
+        .filter(|u| !windows || userprofile_env_is_cmd_safe(u))
+        .map(|u| widen(Path::new(&u)).to_string_lossy().into_owned());
+    let home = home
+        .map(|h| widen(h).to_string_lossy().into_owned())
+        .filter(|h| !windows || home_matches_userprofile(h, userprofile.as_deref()));
+    link_command_for_home(&pack.to_string_lossy(), windows, marker, home.as_deref())
 }
 
 /// [`ensure_linked`] 의 본체 — 넣을 명령을 인자로 받는다(시험 이음매: 맥 샌드박스 파일로 윈도우 꼴 명령의 흐름을 잰다).
@@ -1084,9 +1163,16 @@ mod tests {
         fn read(&self) -> String {
             std::fs::read_to_string(self.settings()).unwrap()
         }
+        /// 유닉스 규칙으로 조정. ★(0.14.45 · 윈도우 CI 실측) 윈도우 호스트의 샌드박스 경로(`C:\…`)는 유닉스 규칙(`/` 시작)을
+        /// 만족할 수 없다 — 그 호스트에서는 명령을 주입해([`Self::want_cmd`]) 파일 수술 흐름만 잰다(경로 규칙은 순수 검체가 잰다).
         fn ensure(&self, force: bool) -> Outcome {
             let (s, p, r) = (self.settings(), self.pack(), self.record());
-            ensure_linked(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: false, home: None, probe: None }, force)
+            let ctx = Ctx { settings: &s, pack_dir: &p, record: &r, windows: false, home: None, probe: None };
+            if cfg!(windows) {
+                ensure_linked_cmd(&ctx, force, Some(self.want_cmd()))
+            } else {
+                ensure_linked(&ctx, force)
+            }
         }
         /// 윈도우 규칙으로 조정(검사 주입) — 래퍼 `.cmd` 를 함께 둔다(설치된 윈도우 팩처럼).
         fn ensure_win(&self, force: bool, probe: Option<Probe>) -> Outcome {
@@ -1098,6 +1184,9 @@ mod tests {
             ensure_linked_cmd(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: true, home: None, probe }, force, Some(WIN_CMD.to_string()))
         }
         fn want_cmd(&self) -> String {
+            if cfg!(windows) {
+                return UNIX_DUMMY_CMD.to_string();
+            }
             link_command_for(&self.pack().to_string_lossy(), false, true).unwrap()
         }
     }
@@ -1117,6 +1206,8 @@ mod tests {
 
     /// 윈도우 시험의 넣을 명령(맥 샌드박스 경로는 윈도우 규칙으로 명령을 못 만들므로 고정 꼴을 준다 — 파일은 샌드박스).
     const WIN_CMD: &str = r"C:\Users\x\.cys\pack\hooks\cys-agy-statusline.cmd --cys-autolink";
+    /// 윈도우 호스트에서 유닉스 규칙 흐름을 잴 때 주입하는 명령(유닉스 꼴 더미 — [`Sandbox::ensure`]).
+    const UNIX_DUMMY_CMD: &str = "sh /h/.cys/pack/hooks/cys-agy-statusline.sh --cys-autolink";
 
     // ───────── 순수 함수 ─────────
 
@@ -1733,11 +1824,92 @@ mod tests {
             called.set(true);
             Ok(())
         };
-        let (s, p, r) = (sb.settings(), sb.pack(), sb.record());
+        // ★(0.14.45) 샌드박스 팩 자체(`/…` · 윈도우 러너 `%TEMP%` 의 `RUNNER~1` 구성요소)에 기대지 않는다 — 윈도우에서 8.3 이 펼쳐지면
+        //   안전 경로가 되므로, 어느 OS 에서도 안전하지 않은 공백 경로로 잰다.
+        let (s, r) = (sb.settings(), sb.record());
+        let p = sb.root.join("with space").join("pack");
+        std::fs::create_dir_all(&p).unwrap(); // 실재 폴더 — 펼치기 실패(`~` 잔존)가 아니라 공백으로 거절됨을 잰다
         let o = ensure_linked(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: true, home: None, probe: Some(&probe) }, true);
         assert!(matches!(o, Outcome::UnsafePath(_)), "{o:?}");
         assert!(!called.get());
         assert_eq!(sb.read(), AGY_DEFAULT);
+    }
+
+    /// ★(0.14.45 · 윈도우 CI 실측 run 37579579063) 8.3 짧은 이름(`RUNNER~1`) — `~` 는 안전 문자가 아니다(agy `expandTilde` 미확인 ·
+    /// 모듈 머리 '윈도우'). 긴 이름으로 펼치면 평문 명령 · 펼치기 실패면 원문(`~`)이 남아 거절 · 비ASCII 긴 이름은 `%USERPROFILE%` 꼴.
+    #[test]
+    fn short_name_tilde_is_expanded_or_refused() {
+        let short = r"C:\Users\x\AppData\Local\Temp\LONGFO~1\home\.cys\pack";
+        let long = r"C:\Users\x\AppData\Local\Temp\longfoldername\home\.cys\pack";
+        // 1) `~` 는 그대로면 거절(평문 · `%USERPROFILE%` 꼴 둘 다)
+        assert_eq!(link_command_for(short, true, true), None);
+        assert_eq!(link_command_for_home(r"C:\Users\x\LONGFO~1\.cys\pack", true, true, Some(r"C:\Users\x\LONGFO~1")), None);
+        assert!(!windows_path_is_safe(r"C:\a~b\x.cmd"));
+        // 2) 펼치기 정책 — `~` 없으면 해석기를 부르지 않는다 · 있으면 해석 결과 · 실패(None·빈 경로)면 원문
+        assert_eq!(expand_short_names_with(Path::new(long), |_| panic!("`~` 없는 경로에 해석기를 불렀다")), PathBuf::from(long));
+        let widened = expand_short_names_with(Path::new(short), |p| Some(PathBuf::from(p.to_string_lossy().replace("LONGFO~1", "longfoldername"))));
+        assert_eq!(widened, PathBuf::from(long));
+        assert_eq!(
+            link_command_for(&widened.to_string_lossy(), true, true).as_deref(),
+            Some(r"C:\Users\x\AppData\Local\Temp\longfoldername\home\.cys\pack\hooks\cys-agy-statusline.cmd --cys-autolink")
+        );
+        let failed = expand_short_names_with(Path::new(short), |_| None);
+        assert_eq!(failed, PathBuf::from(short));
+        assert_eq!(link_command_for(&failed.to_string_lossy(), true, true), None, "펼치기 실패 = 거절(쓰지 않음)");
+        assert_eq!(expand_short_names_with(Path::new(short), |_| Some(PathBuf::new())), PathBuf::from(short));
+        // 3) 펼친 긴 이름이 비ASCII 면 종전 `%USERPROFILE%` 꼴 흐름
+        let kshort = r"C:\Users\홍길~1\.cys\pack";
+        let klong = expand_short_names_with(Path::new(kshort), |p| Some(PathBuf::from(p.to_string_lossy().replace("홍길~1", "홍길동"))));
+        assert_eq!(
+            link_command_for_home(&klong.to_string_lossy(), true, true, Some(r"C:\Users\홍길동")).as_deref(),
+            Some(r"%USERPROFILE%\.cys\pack\hooks\cys-agy-statusline.cmd --cys-autolink")
+        );
+        // 펼치지 못한 비ASCII 8.3 꼴은 `%USERPROFILE%` 꼴로도 만들지 않는다(나머지 경로의 `~` 거절)
+        assert_eq!(link_command_for_home(r"C:\Users\홍길동\LONGFO~1\pack", true, true, Some(r"C:\Users\홍길동")), None);
+        // 4) 유닉스 규칙도 `~` 를 받지 않는다(종전 그대로 · 이번 변경은 윈도우 펼침만)
+        assert_eq!(link_command_for("/Users/x/a~b/.cys/pack", false, true), None);
+        // 5) `%USERPROFILE%` 원문 env 안전성(codex 교차 검토 C) — 펼친 철자가 같아도 원문에 cmd 위험 글자·`~` 가 있으면 그 꼴을 쓰지 않는다
+        assert!(userprofile_env_is_cmd_safe(r"C:\Users\홍길동"));
+        assert!(userprofile_env_is_cmd_safe(r"C:\Users\x\"));
+        assert!(userprofile_env_is_cmd_safe(r"\\?\C:\Users\x"));
+        for bad in [r"C:\Users\x\A&B~1", r"C:\Users\x\LONGFO~1", r"C:\Users\x\a b", r"C:\Users\x\%y%", r"C:\Users\x\a^b", "", r"\\srv\share", "Users\\x"] {
+            assert!(!userprofile_env_is_cmd_safe(bad), "{bad:?}");
+        }
+        // 6) 이 OS 의 `long_path` — `~` 없는 경로는 그대로
+        assert_eq!(long_path(Path::new("/tmp/no-tilde")), PathBuf::from("/tmp/no-tilde"));
+    }
+
+    /// ★(0.14.45) 윈도우 실기: `GetLongPathNameW` 가 임시 폴더의 8.3 이름을 펼치고(같은 폴더), 그 팩으로 실제 `ensure_linked`
+    /// (윈도우 규칙 · 검사 주입)가 `~` 없는 `.cmd` 명령으로 연결한다. 러너 사용자 폴더가 원래 안전하지 않으면(공백 등) 건너뛴다.
+    #[cfg(windows)]
+    #[test]
+    fn windows_short_temp_path_is_expanded_and_linked() {
+        let sb = Sandbox::new("win83");
+        sb.put(AGY_DEFAULT.as_bytes());
+        let pack = sb.pack();
+        let wide = long_path(&pack);
+        assert_eq!(std::fs::canonicalize(&wide).unwrap(), std::fs::canonicalize(&pack).unwrap(), "다른 폴더로 펼쳤다");
+        eprintln!("[win83] 원문 {} → {}", pack.display(), wide.display());
+        // 독립 기준: 실경로(canonicalize = 긴 이름 최종 경로)가 안전 규칙을 통과하면 펼침도 반드시 성공해야 한다(펼침 실패를 건너뜀으로 숨기지 않는다).
+        let canon = std::fs::canonicalize(&pack).unwrap().to_string_lossy().into_owned();
+        let canon = canon.strip_prefix(r"\\?\").unwrap_or(&canon).to_string();
+        if link_command_for(&canon, true, true).is_none() {
+            eprintln!("[win83] 이 러너의 실경로가 윈도우 안전 규칙 밖(공백 등) — 건너뜀: {canon}");
+            return;
+        }
+        assert!(!wide.to_string_lossy().contains('~'), "펼침 실패: {}", wide.display());
+        assert!(link_command_for(&wide.to_string_lossy(), true, true).is_some(), "{}", wide.display());
+        std::fs::write(pack.join("hooks").join(SCRIPT_CMD), "@echo off\nexit /b 0\n").unwrap();
+        let seen = std::cell::RefCell::new(String::new());
+        let probe = |c: &str| {
+            *seen.borrow_mut() = c.to_string();
+            Ok(())
+        };
+        let (s, r) = (sb.settings(), sb.record());
+        let o = ensure_linked(&Ctx { settings: &s, pack_dir: &pack, record: &r, windows: true, home: None, probe: Some(&probe) }, true);
+        assert_eq!(o, Outcome::Linked { created: false }, "{}", seen.borrow());
+        let c = seen.borrow().clone();
+        assert!(!c.contains('~') && c.contains(SCRIPT_CMD) && command_is_ours_auto(&c), "{c}");
     }
 
     /// ★(0.14.45 · B1) 실연 검사 실패 기록 — 같은 버전만 유효(다른 버전·훼손 본문 = 다시 검사) · 기록/지움 왕복 · 사유의 줄바꿈 접기.
@@ -1856,7 +2028,8 @@ mod tests {
             "@echo off\r\nif not \"%1 %2\"==\"usage-report-stdin --agy\" exit /b 9\r\necho cys\r\nexit /b 0\r\n",
         )
         .unwrap();
-        let cmd = link_command_for(&pack.to_string_lossy(), true, true)
+        // ★(0.14.45) 운영 경로와 같이 8.3 짧은 이름을 펼친 경로로 만든다(체크아웃 경로의 `~` 철자 대비).
+        let cmd = link_command_for(&long_path(&pack).to_string_lossy(), true, true)
             .unwrap_or_else(|| panic!("시험 폴더 경로가 윈도우 안전 규칙을 통과하지 못했다(계측 무효): {}", pack.display()));
         let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
         let sys32 = format!(r"{sysroot}\System32");

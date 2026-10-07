@@ -808,6 +808,15 @@ pub fn ensure_classic(config_dir: &Path, home: &Path, origin: DirOrigin) -> Outc
     if !config_dir.is_dir() {
         return Outcome::NoConfigDir;
     }
+    // ★(0.14.45 · 윈도우 CI 실측 8.3 짧은 이름) 문자열 판정은 같은 개인 프로필의 다른 철자(사용자 폴더가 `JOHNSM~1` 꼴인 `.claude` 대 긴 이름
+    //   홈 · 심볼릭 링크)를 놓친다 — 되돌림([`rollback_entry_with`])과 같이 실경로로 한 번 더 본다(`canonicalize` 는 윈도우에서 8.3 을
+    //   긴 이름으로 펼친 최종 경로 · `\\?\` 접두는 정규화가 접는다). 실경로가 개인 프로필이면 쓰지 않는다(실패 방향 = 쓰지 않음 ·
+    //   실경로를 못 구하면 문자열 판정만으로 간다 — 종전 그대로).
+    if let (Ok(real_dir), Ok(real_home)) = (std::fs::canonicalize(config_dir), std::fs::canonicalize(home)) {
+        if is_personal_profile(&real_dir, &real_home, origin) {
+            return Outcome::PersonalProfile;
+        }
+    }
     let _serial = match MUTATION_LOCK.lock() {
         Ok(lock) => lock,
         Err(_) => return Outcome::Refused("조정 락이 손상되었다".into()),
@@ -1821,6 +1830,39 @@ mod tests {
         let t = reset_entries(&entries, &home, &home.join("trash"));
         assert!(matches!(&t[0].outcome, RollbackOutcome::Refused(_)) && !t[0].backup_moved, "{t:?}");
         assert_eq!(std::fs::read_to_string(personal.join("settings.json")).unwrap(), personal_settings);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// ★(0.14.45 · 8.3 짧은 이름) 기록 시점에도 실경로로 개인 프로필을 한 번 더 본다 — 좌석 폴더가 개인 `~/.claude` 를 가리키는
+    /// 심볼릭 링크면 문자열 판정은 통과해도 쓰지 않는다(윈도우 8.3 철자 차이와 같은 판정 경로 · 맥 재현판).
+    #[cfg(unix)]
+    #[test]
+    fn claude_tui_ensure_refuses_symlinked_seat_dir_to_personal_profile() {
+        let home = sandbox("ensure-symlink");
+        let personal = home.join(".claude");
+        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::write(personal.join("settings.json"), "{\"keep\":true}").unwrap();
+        let seat = home.join(".claude-team");
+        std::os::unix::fs::symlink(&personal, &seat).unwrap();
+        assert!(!is_personal_profile(&seat, &home, DirOrigin::SeatSpec), "문자열 판정만으로는 놓친다(전제)");
+        assert_eq!(ensure_classic(&seat, &home, DirOrigin::SeatSpec), Outcome::PersonalProfile);
+        assert_eq!(std::fs::read_to_string(personal.join("settings.json")).unwrap(), "{\"keep\":true}", "개인 설정 불변");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// ★(0.14.45 · 윈도우 CI 실측 `RUNNER~1`) 좌석 폴더는 8.3 철자(`%TEMP%` 그대로) · 홈은 긴 이름(실경로)으로 주어져도 개인 프로필이다.
+    #[cfg(windows)]
+    #[test]
+    fn claude_tui_ensure_refuses_short_name_spelling_of_personal_profile() {
+        let home = sandbox("ensure-83");
+        let personal = home.join(".claude");
+        std::fs::create_dir_all(&personal).unwrap();
+        let real = std::fs::canonicalize(&home).unwrap();
+        let s = real.to_string_lossy().into_owned();
+        let long_home = PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s));
+        eprintln!("[ensure-83] 좌석 {} · 홈 {}", personal.display(), long_home.display());
+        assert_eq!(ensure_classic(&personal, &long_home, DirOrigin::SeatSpec), Outcome::PersonalProfile);
+        assert!(!personal.join("settings.json").exists());
         let _ = std::fs::remove_dir_all(home);
     }
 

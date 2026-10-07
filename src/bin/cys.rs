@@ -8823,7 +8823,8 @@ fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         return item(DiagStatus::Skip, "agy 설정 폴더 없음(agy 미설치) — 점검 대상 아님".into(), String::new());
     }
     let cys_base = home.join(".cys");
-    let base_pack = ctx.pack_dir == cys_base.join("pack");
+    // ★(0.14.45 · codex 교차 검토 F) 같은 팩의 8.3 짧은/긴 철자 차이로 base 팩을 놓치지 않게 펼친 경로로 비교한다(유닉스는 그대로).
+    let base_pack = ctx.pack_dir == cys_base.join("pack") || agy::long_path(&ctx.pack_dir) == agy::long_path(&cys_base.join("pack"));
     let off = agy::knob_off(cys::env_compat(agy::ENV_KNOB).as_deref(), cys_base.join(agy::OFF_FILE).exists());
     let record = ctx.pack_dir.join(agy::RECORD_REL);
     let mut done = String::new();
@@ -8893,7 +8894,7 @@ fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             //   권한다 — 윈도우 판 agy 는 `cmd /c` 로 부르므로 `bash` 가 WSL 의 System32\bash.exe 로 잡힐 수 있다.
             let legacy = cfg!(windows)
                 && agy::inspect_command(&settings).is_some_and(|c| agy::command_is_legacy_windows_sh(&c));
-            let advice = match (legacy, agy::link_command_for_home(&ctx.pack_dir.to_string_lossy(), true, false, Some(&home.to_string_lossy()))) {
+            let advice = match (legacy, agy::link_command_resolved(&ctx.pack_dir, true, false, Some(home))) {
                 (true, Some(c)) => format!(
                     "윈도우 판 agy 는 상태줄을 `cmd /c` 로 부릅니다 — `bash …sh` 연결은 WSL bash 로 잡혀 값이 안 들어올 수 \
                      있습니다. 권장: statusLine command 를 `{c}` 로 바꾸거나, 칸을 비운 뒤 {fix_hint} (cys 는 직접 넣은 연결을 \
@@ -32793,10 +32794,11 @@ mod tests {
             let now = std::fs::read_to_string(&settings).unwrap();
             if now == dflt {
                 assert_eq!(it.status, DiagStatus::Warn, "{} / {}", it.detail, it.action);
-                if agy::link_command_for(&ctx.pack_dir.to_string_lossy(), true, true).is_some() {
+                // ★(0.14.45) 운영 경로(`ensure_linked`)와 같이 8.3 짧은 이름을 펼친 경로로 판정한다(`agy::long_path`).
+                if agy::link_command_for(&agy::long_path(&ctx.pack_dir).to_string_lossy(), true, true).is_some() {
                     assert!(it.action.contains("시험 실행") && it.action.contains(agy::SCRIPT_CMD), "{}", it.action);
                 } else {
-                    // 임시 폴더가 8.3 짧은 이름(`RUNNER~1`) 등이면 윈도우 안전 규칙 밖 → UnsafePath 안내(검사 전 거절)
+                    // 8.3 을 펼친 뒤에도 윈도우 안전 규칙 밖(공백 등 · 펼치기 실패로 `~` 잔존)이면 UnsafePath 안내(검사 전 거절)
                     assert!(it.action.contains("안전한 연결 명령"), "{}", it.action);
                 }
             } else {
