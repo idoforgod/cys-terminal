@@ -158,6 +158,22 @@ export function shouldSuppressWheel(s: WheelGateState): boolean {
 //     게이트가 꺼지면 wheelHandlerKind 가 "none" 을 돌려주고 main.ts 가 이 술어를 아예 호출하지
 //     않는다(아래 배선 계층). 기존 allow-app-mouse 킬스위치를 탈출구로 재사용하면 안 된다 —
 //     그것은 입·출력 양측을 열어 Windows ConPTY 결함 1호(마우스 보고 리터럴 타이핑)를 되살린다.
+//
+// (e) ★억제된 휠을 PgUp/PgDn(`\x1b[5~`/`\x1b[6~`)으로 바꿔 보내지 **않는** 이유(0.14.45 검토 · 2026-10-07).
+//     배경: 억제가 걸린 pane(claude fullscreen)에서는 휠이 완전 무동작이라 대화가 안 올라간다(오너 제보).
+//     Claude Code 2.1.291 바이너리 정적 판독으로 fullscreen 렌더러가 PageUp/PageDown 으로 트랜스크립트를
+//     스크롤하는 것은 **확인됐다** — 키바인딩 표 `{context:"Scroll",bindings:{pageup:"scroll:pageUp",
+//     pagedown:"scroll:pageDown",wheelup:"scroll:lineUp",…}}` 와 그 처리기(트랜스크립트 viewport 를 반 화면씩
+//     이동), 그리고 tmux 안내문 "scroll with PgUp/PgDn". 그래도 싣지 않았다:
+//       · 모달(권한 확인 Select 등)이 떠 있고 내용이 화면에 들어가면 Scroll 처리기가 페이지 키를 **양보**한다
+//         (`yieldsPageKeysWhenContentFits: modalSlotActive`) → PgUp/PgDn 이 Select 의 `select:pageUp/pageDown`
+//         으로 가 **선택 항목이 휠로 움직인다**. 그 상태에서 Enter 는 다른 선택지를 승인한다 — 휠이 방향키로
+//         합성되던 원 결함과 같은 계열의 위험을 새로 여는 셈이다(mac 의 보고 경로는 wheelup→scroll:lineUp 이라
+//         Select 에 닿지 않는다).
+//       · 1003 을 켜는 다른 전체화면 앱에도 페이지 키가 들어간다(판별자가 claude 전용이 아니다).
+//     대신 화면 모드를 고친다: 0.14.45 부터 cys 는 Windows 좌석 설정 폴더 settings.json 에 `tui` 가 없을 때
+//     `"default"`(classic)를 넣는다(src/claude_tui.rs). classic 에서는 이 술어가 애초에 불충족(alt 아님)이다.
+//     재검토 조건: 모달 활성 여부를 UI 가 알 수 있게 되거나, Claude Code 가 페이지 키를 모달에 양보하지 않게 될 때.
 export interface WinWheelGateState {
   altActive: boolean; // term.buffer.active.type === "alternate"
   ledgerWantsAnyMotion: boolean; // 장부에 1003(any-motion) 활성(trackFilter.ledgerWantsAnyMotion())
