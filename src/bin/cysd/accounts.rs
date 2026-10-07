@@ -6263,6 +6263,9 @@ mod tests {
         #[test]
         fn resolve_seat_folder_table() {
             use SeatFolder::*;
+            // ★(windows-health 37586250048) 아래 표는 유닉스 표기 픽스처(`/h/…`)다 — 플랫폼 판(`resolve_seat_folder` = cfg!(windows))으로 돌리면 윈도우에서는
+            //   `/h/` 를 MSYS 드라이브로 읽어 `h:/…` 로 접는다(제품 의도 · 네이티브 IO 표기). 유닉스 의미론으로 고정하고, 윈도우 의미론은 아래 `_on(.., true)` 사례가 맡는다.
+            let resolve_seat_folder = |c: Option<&str>, t: bool, sf: &str| resolve_seat_folder_on(c, t, sf, false);
             let rec = "/h/.cys/claude";
             let tr = "/h/.claude-4/projects/-x/abc.jsonl";
             let mm = |o: &str| Mismatch { observed: o.into(), recorded: rec.into() };
@@ -6315,6 +6318,8 @@ mod tests {
             assert_eq!(resolve_seat_folder_on(Some("/h/X/.claude-4"), false, "/h/x/.claude-4/projects/-p/s.jsonl", false), Mismatch { observed: "/h/x/.claude-4".into(), recorded: "/h/X/.claude-4".into() });
             assert!(!same_dir("/h/.claude-4", "/h/.claude-40") && !same_dir("/h/.claude-4", "/h/.cys/claude"));
             assert!(same_dir_on("/h/A", "/h/a", true) && !same_dir_on("/h/A", "/h/a", false), "대소문자 무시는 윈도우만");
+            // ★(windows-health 37586250048) 같은 유닉스 표기 픽스처를 윈도우 의미론으로 — `/h/` 는 MSYS 드라이브라 관측 폴더는 `h:/…`(네이티브 IO 표기)로 실린다.
+            assert_eq!(resolve_seat_folder_on(Some(rec), true, tr, true), Mismatch { observed: "h:/.claude-4".into(), recorded: rec.into() });
         }
 
         /// ★(0.14.45 · 성찰 M5 · 2회차 M2) 실제 좌석 — 호출자가 계정 폴더를 준 좌석(`config_dir_trusted=false` · 복원 좌석과 같은 꼴)은 기록 폴더에 로그인이 있어도 화면에는
@@ -6368,7 +6373,7 @@ mod tests {
                 ctx_pct: None,
                 rate: vec![],
                 source: "transcript".into(),
-                session_file: sf,
+                session_file: sf.clone(),
                 updated_at: t0,
                 rate_observed_at: 0.0,
                 rate_account: None,
@@ -6382,7 +6387,18 @@ mod tests {
                 "관측이 기록을 부정했다 — 관측 폴더의 신원과 기록 폴더를 함께 보인다: {u}"
             );
             let ident = view.seats.iter().find(|s| s.surface_id == untrusted.id).unwrap();
-            assert_eq!(ident.display, SeatFolder::Mismatch { observed: actual.to_string_lossy().into_owned(), recorded: recorded.to_string_lossy().into_owned() });
+            // ★(windows-health 37586250048) 관측 폴더는 [`observed_profile_dir_on`] 의 정규형이다 — 윈도우는 드라이브 소문자·정슬래시(`c:/Users/…` · 신원 IO 가 그대로 읽는 꼴),
+            //   유닉스는 원문 그대로. 같은 폴더인지는 표기를 접어 본다(`same_dir`) · 기록 폴더는 원문 그대로 실린다.
+            match &ident.display {
+                SeatFolder::Mismatch { observed, recorded: r } => {
+                    assert_eq!(Some(observed.as_str()), observed_profile_dir_on(&sf, cfg!(windows)).as_deref(), "관측 폴더 = 관측 transcript 의 정규형 프로필 폴더");
+                    assert!(same_dir(observed, &actual.to_string_lossy()), "관측 폴더는 실제 폴더와 같은 곳: {observed} vs {}", actual.display());
+                    assert_eq!(r, &recorded.to_string_lossy().into_owned(), "기록 폴더는 원문 그대로");
+                    #[cfg(unix)]
+                    assert_eq!(observed, &actual.to_string_lossy().into_owned(), "유닉스는 원문 그대로");
+                }
+                other => panic!("불일치여야 한다: {other:?}"),
+            }
             assert_eq!((ident.folder.as_deref(), ident.current_account.as_deref()), (Some(recorded.to_str().unwrap()), Some("u-rec")), "경보 귀속은 여전히 기록 폴더(v0.14.44)");
             assert!(!view.claude_folder_unknown);
             assert_eq!(view.claude_folders.len(), 1, "관측 폴더는 신원 표(in_use)에 들어가지 않는다");

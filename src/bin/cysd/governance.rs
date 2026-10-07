@@ -19853,13 +19853,36 @@ mod tests {
         let e = daemon.next_queue_entry("[보고] f2-neg".into(), None, "test");
         s.pending_queue.lock().unwrap().push_back(e);
         let count = |d: &Arc<Daemon>| d.bus.replay_after(0).into_iter().filter(|e| e["name"] == "screen.repaint_requested").count();
-        // 대체 화면 — 판독 불가로 세지 않는다(시계 없음).
+        // 대체 화면 — 유닉스: 전경이 에이전트로 확인되지 않으면(`agent_fg_pgid` 0 = 모름) 판독 불가로 세지 않는다(시계 없음 · vim·less 를 흔들지 않는다).
         paint_screen(&s, &[RULE, "❯ ", RULE, STATUS1], 0, 0, true);
         quiet_since(&s, 30);
         s.repaint.lock().unwrap().unreadable_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(600));
         tick(&daemon);
-        assert_eq!(count(&daemon), 0, "대체 화면은 요청하지 않는다: {}", blocked_reason(&s));
-        assert!(s.repaint.lock().unwrap().unreadable_since.is_none(), "대체 화면은 판독 불가 시계를 지운다");
+        #[cfg(unix)]
+        {
+            assert_eq!(count(&daemon), 0, "대체 화면은 요청하지 않는다: {}", blocked_reason(&s));
+            assert!(s.repaint.lock().unwrap().unreadable_since.is_none(), "대체 화면은 판독 불가 시계를 지운다");
+        }
+        // ★(windows-health 37586250048) 윈도우는 전경 판정이 없다 — `seat_foreground_is_agent` 의 비-unix 판은 마커를 아는 에이전트 좌석이면 참(문서화된 선택 ·
+        //   claude 가 윈도우에서 기본 대체 화면이라 M2 복구가 여기서 산다). 그 대신 폭주 없음(①)을 핀한다: 요청 1건 · 간격(300초) 안에서는 판독 불가가 이어져도 추가 0 ·
+        //   키 입력 0 · 크기 원복. (④ 사람 화면은 보장하지 않는다 — 에이전트 좌석 안의 전체화면 vim 도 한 번 다시 그려질 수 있다 · repaint.rs 【치명위험 렌즈】④.)
+        #[cfg(not(unix))]
+        {
+            assert_eq!(count(&daemon), 1, "윈도우 대체 화면 에이전트 좌석은 요청 1건: {}", blocked_reason(&s));
+            let dl = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while s.repaint_in_flight.load(AtomicOrdering::Acquire) && std::time::Instant::now() < dl {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert_eq!(s.parser.lock().unwrap().screen().size(), (24, 80), "파서 크기 원복");
+            for _ in 0..5 {
+                paint_screen(&s, &[RULE, "❯ ", RULE, STATUS1], 0, 0, true);
+                quiet_since(&s, 30);
+                s.repaint.lock().unwrap().unreadable_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(600));
+                tick(&daemon);
+            }
+            assert_eq!(count(&daemon), 1, "간격(300초) 안에서는 추가 요청 0 — 폭주 없음");
+        }
+        let before_knob = count(&daemon);
         // 노브 끔 — 비대체 화면 판독 불가라도 요청 0.
         let _k = super::HKnobGuard::set(&[("CYS_SCREEN_REPAINT_NUDGE", "0")]);
         s.alt_screen.store(false, AtomicOrdering::Relaxed);
@@ -19870,7 +19893,7 @@ mod tests {
         s.repaint.lock().unwrap().unreadable_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(600));
         tick(&daemon);
         assert_eq!(blocked_reason(&s), BLOCKED_PROMPT_UNKNOWN);
-        assert_eq!(count(&daemon), 0, "노브 끔이면 요청하지 않는다");
+        assert_eq!(count(&daemon), before_knob, "노브 끔이면 요청하지 않는다");
         // ★(성찰 M2) 노브가 꺼져 있으면 처방도 약속하지 않는다 — '꺼져 있다 · 사람이 창 크기를 바꾼다'.
         let d = super::queue_block_diag(&daemon, &s);
         assert!(d.repaint_knob_off, "{d:?}");
@@ -20064,9 +20087,15 @@ mod tests {
         assert_eq!(s.pending_input_bytes.load(AtomicOrdering::Relaxed), pending_before, "stdin 0 바이트");
         assert_eq!(s.parser.lock().unwrap().screen().size(), (24, 80));
         // 요청 뒤 아직 판독 가능 화면을 못 봤다 → 처방은 '요청했으나 풀리지 않았다'.
+        // ★(windows-health 37586250048) 크기 흔들기 뒤의 출력은 좌석 프로그램이 아니라 단말 층이 낼 수도 있다 — 윈도우 ConPTY 는 크기 변경에 화면을
+        //   스스로 다시 내보내 `last_output` 이 새로 찍힌다(유닉스의 `sleep` 은 SIGWINCH 에 침묵). 실제 claude 는 두 플랫폼 모두 다시 그리며 출력하므로,
+        //   여기서 재는 것은 '다시 그려졌는데도 낡은 표지가 1분 넘게 정적' 인 상태의 문장이다 — 흔들기 출력을 흡수한 뒤 정적 61초를 다시 세운다.
+        quiesce(&s);
+        quiet_since(&s, 61);
         let d = super::queue_block_diag(&daemon, &s);
         assert!(d.repaint_unresolved);
-        assert!(super::queue_remedy(BLOCKED_BUSY, &d).1.contains("요청했으나 풀리지 않았다"));
+        let (_, t) = super::queue_remedy(BLOCKED_BUSY, &d);
+        assert!(t.contains("요청했으나 풀리지 않았다"), "quiet={:?}: {t}", d.quiet_secs);
         // 다시 그려져 깨끗한 프롬프트 → 배달 · 시계·배수 리셋.
         paint_screen(&s, &[RULE, "❯ ", RULE, STATUS1, STATUS2], 1, 2, false);
         quiet_since(&s, 30);
