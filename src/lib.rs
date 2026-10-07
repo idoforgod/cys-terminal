@@ -8,6 +8,9 @@ pub mod action_catalog;
 /// agy(Antigravity CLI) 상태줄 자동 연결(0.14.42 · 오너 승인 2026-09-24) — 설정 칸이 비었거나 없을 때만 넣고,
 /// 사용자 설정은 덮지 않으며, 표지 달린 cys 연결만 뺀다. 윈도우는 자동 연결 끔(안내만).
 pub mod agy_statusline;
+/// Windows 좌석 Claude Code classic 렌더러 보장(0.14.45 휠 스크롤 수리) — 좌석 설정 폴더 settings.json 에
+/// `tui` 키가 없을 때만 `"default"` 를 넣는다(사용자 값 불가침 · 실패는 기동을 막지 않는다).
+pub mod claude_tui;
 pub mod factory_reset;
 /// 앱 번들 완본 검증 + 원자 교체 계약(ATOMIC-1) — 2026-08-01 "손상되었기 때문에 열 수 없습니다" 사고의
 /// 재발 차단. SEAL-1(아래 `ENV_PY_NO_BYTECODE`)이 **번들이 스스로 봉인을 깨는 것**을 막는다면,
@@ -2157,6 +2160,9 @@ pub const ENV_CLAUDE_NO_ALT_SCREEN: &str = "CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN
 /// ∴ 기존 pane 에 붙는 기동·GUI 기동에는 이 벨트가 닿지 않는다. Windows 휠 오염의 **본체 방어는
 /// UI 가드**(`ui/src/wheelgate.ts` 의 Windows 전용 억제 술어)이고, 이 함수는 그 위에 덧대는
 /// 벨트일 뿐이다. 여기를 고쳤다고 Windows 문제가 닫혔다고 판단하지 마라.
+/// ★0.14.45: Windows 의 **화면 모드 자체**는 이 env 가 아니라 [`crate::claude_tui`] 가 기본 on 으로 다룬다 —
+/// 좌석 설정 폴더 settings.json 에 `tui` 가 없을 때만 `"default"`(classic) 를 넣어, env 가 닿지 않는 기존 pane
+/// 재기동(node-recover · in-seat restore)까지 덮는다. 이 env 의 Windows 옵트인 계약은 그대로다.
 ///
 /// ★CI 실행 경로(2026-08-17 갱신 — 종전의 "Windows 레인 0건" 고지는 **해소됐다**):
 /// 적대검증 2R 이 major 로 지목한 "Windows 전용 신규 코드가 Windows 러너에서 한 줄도

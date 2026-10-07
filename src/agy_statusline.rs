@@ -238,17 +238,17 @@ pub fn desired_value(cmd: &str) -> Value {
 
 // ───────────────────────────── 텍스트 외과 수술 (순수) ─────────────────────────────
 
-struct Member {
-    key_start: usize,
-    key: String,
-    val_start: usize,
-    val_end: usize,
+pub(crate) struct Member {
+    pub(crate) key_start: usize,
+    pub(crate) key: String,
+    pub(crate) val_start: usize,
+    pub(crate) val_end: usize,
 }
 
-struct RootScan {
-    open: usize,
-    close: usize,
-    members: Vec<Member>,
+pub(crate) struct RootScan {
+    pub(crate) open: usize,
+    pub(crate) close: usize,
+    pub(crate) members: Vec<Member>,
 }
 
 fn skip_ws(b: &[u8], mut i: usize) -> usize {
@@ -314,7 +314,7 @@ fn skip_value(b: &[u8], i: usize) -> Result<usize, String> {
 }
 
 /// 최상위 객체의 멤버 위치를 잰다. 입력은 이미 serde_json 으로 유효성이 확인된 텍스트(BOM 제거 뒤)다.
-fn scan_root(t: &str) -> Result<RootScan, String> {
+pub(crate) fn scan_root(t: &str) -> Result<RootScan, String> {
     let b = t.as_bytes();
     let mut i = skip_ws(b, 0);
     if b.get(i) != Some(&b'{') {
@@ -347,7 +347,7 @@ fn scan_root(t: &str) -> Result<RootScan, String> {
     }
 }
 
-fn line_indent(t: &str, pos: usize) -> Option<&str> {
+pub(crate) fn line_indent(t: &str, pos: usize) -> Option<&str> {
     let line_start = t[..pos].rfind('\n').map_or(0, |i| i + 1);
     let ind = &t[line_start..pos];
     (!ind.is_empty() && ind.chars().all(|c| c == ' ' || c == '\t')).then_some(ind)
@@ -516,9 +516,9 @@ pub struct Ctx<'a> {
 }
 
 /// 파일 판독 결과: (원문 바이트, BOM 뗀 본문, BOM 여부, 파싱 값 — 빈 파일이면 None).
-type Loaded = (Vec<u8>, String, bool, Option<Value>);
+pub(crate) type Loaded = (Vec<u8>, String, bool, Option<Value>);
 
-fn load(settings: &Path) -> Result<Option<Loaded>, String> {
+pub(crate) fn load(settings: &Path) -> Result<Option<Loaded>, String> {
     let meta = match std::fs::symlink_metadata(settings) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -555,7 +555,7 @@ pub fn inspect(settings: &Path) -> Result<Option<Slot>, String> {
 }
 
 /// 쓰기 가능 확인 — 추가 모드로 열어 보기만 한다(내용·mtime 무변경). 읽기 전용·권한 없음·(윈도우) 잠김이면 Err.
-fn probe_writable(settings: &Path) -> Result<(), String> {
+pub(crate) fn probe_writable(settings: &Path) -> Result<(), String> {
     if std::fs::metadata(settings).map(|m| m.permissions().readonly()).unwrap_or(false) {
         return Err("읽기 전용 파일이다".into());
     }
@@ -567,12 +567,12 @@ fn probe_writable(settings: &Path) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn file_mode(settings: &Path) -> Option<u32> {
+pub(crate) fn file_mode(settings: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(settings).ok().map(|m| m.permissions().mode() & 0o7777)
 }
 #[cfg(not(unix))]
-fn file_mode(_settings: &Path) -> Option<u32> {
+pub(crate) fn file_mode(_settings: &Path) -> Option<u32> {
     None
 }
 
