@@ -8305,12 +8305,14 @@ pub(crate) fn queue_block_diag(
     queue_block_diag_with(daemon, s, &diag_adapter_defs)
 }
 
-/// `queue_remedy` 가 돌려주는 code 의 **전량**(허용 목록 · 13종) — 소비자(경보 라우팅 요약)는 이 목록과 정확히 일치할 때만 싣는다
+/// `queue_remedy` 가 돌려주는 code 의 **전량**(허용 목록 · 14종) — 소비자(경보 라우팅 요약)는 이 목록과 정확히 일치할 때만 싣는다
 /// (요약은 pane stdin 으로 가므로 payload 의 자유 문자열을 그대로 싣지 않는다). GUI(`ui/src/starvednotice.ts`)의 어휘 대조 검체가 이 선언의 배열 리터럴을
 /// 소스에서 읽는다 — 선언 꼴(상수 이름·`[&str; 개수]` 타입 표기·배열 리터럴)을 바꾸지 않고 배열 안에 닫는 대괄호를 쓰지 않는다.
 /// ★(RQFIX I-5) 유령 계수 코드는 `phantom_count` 다(옛 이름은 끝에 누를 키 이름이 붙어 있었다) — 요약의 `remedy=<code>` 는 금지 문구 없이 LLM 좌석으로 가는데 코드 이름이
 /// **누를 키**를 말했다(키 이름을 코드에서 뺐다. 사람용 문장에는 Ctrl-U 가 그대로 있다).
-pub(crate) const QUEUE_REMEDY_CODES: [&str; 13] = [
+/// ★(0.14.45 · 성찰 2회차 M3) 14번째 `stale_screen` — 바쁨 표지가 출력 정적 60초를 넘겼는데 cys 가 다시 그리기를 **약속할 수 없을 때**(노브 끔 · 대상 아님 · 창 너무 작음 ·
+/// 요청했으나 풀리지 않음) 사람이 할 일이 있는 처방이다. 종전에는 같은 문장이 calm `wait` 로 나가 GUI 가 OS 배너를 내지 않았다(사람에게 하라고 적고는 알리지 않았다).
+pub(crate) const QUEUE_REMEDY_CODES: [&str; 14] = [
     "paused",
     "machine_residue",
     "phantom_count",
@@ -8322,9 +8324,13 @@ pub(crate) const QUEUE_REMEDY_CODES: [&str; 13] = [
     "alt_screen",
     "empty_seat",
     "prompt_unknown",
+    "stale_screen",
     "wait",
     "unknown",
 ];
+
+/// ★(성찰 2회차 M3) 낡은 화면 처방의 code — 바쁨 표지 ∧ 정적 ≥ [`STALE_SCREEN_QUIET_SECS`] ∧ 다시 그리기를 약속할 수 없음([`repaint_promise`] = Some).
+pub(crate) const REMEDY_CODE_STALE_SCREEN: &str = "stale_screen";
 
 /// 유령 계수 처방의 code — `queue_remedy` 8행과 직접 send 거부 이벤트(`queue.draft_gate_denied.remedy_code`)가 **같은 값**을 쓴다(어휘 한 곳).
 pub(crate) const REMEDY_CODE_PHANTOM: &str = "phantom_count";
@@ -8468,7 +8474,8 @@ pub(crate) fn paused_queue_remedy(
 /// | 12 | `alt_screen` | `alt_screen` |
 /// | 13 | `empty_seat` (입력줄 계수 > 0 이면 문장에 [`REMEDY_EMPTY_SEAT_COUNT_CLAUSE`] 한 구절이 더 붙는다 — code 는 같다) | `empty_seat` |
 /// | 14 | `prompt_unknown` | `prompt_unknown` |
-/// | 15 | `busy`·`delivery_interval`·`settle`·`quiescing`·`prompt_not_ready`·`human_typing`·`queue_paused` | `wait` |
+/// | 15′ | `busy` ∧ 출력 정적 ≥ [`STALE_SCREEN_QUIET_SECS`] ∧ 다시 그리기 약속 불가([`repaint_promise`] = Some — 노브 끔·대상 아님·창 너무 작음·요청했으나 미복구) | `stale_screen`(2회차 M3 · 사람 조치) |
+/// | 15 | `busy`(정적 ≥ 60초여도 cys 가 다시 그리기를 요청할 것이면 여기)·`delivery_interval`·`settle`·`quiescing`·`prompt_not_ready`·`human_typing`·`queue_paused` | `wait` |
 /// | 16 | 그 밖(`schedule_divert` 의 그 밖 꼴·미등재) | `unknown` |
 ///
 /// 모든 문장 끝에 [`REMEDY_LLM_SUFFIX`] 가 붙고, `d.parser_panics > 0` 이면 그 앞(문장 뒤)에 패닉 횟수 주석이 들어간다.
@@ -8558,9 +8565,12 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
         ("prompt_unknown", unreadable_body(REMEDY_BODY_PROMPT_UNKNOWN, d))
     } else if blocked_by.starts_with("busy") && stale_quiet.is_some() {
         // ★(성찰 M1) 바쁨 표지("esc to interrupt")가 보이는데 출력이 1분 넘게 없다 — 표지가 낡은 화면 사본일 수 있다. 종전 "스스로 풀린다" 는 거짓이 될 수 있었다.
+        // ★(성찰 2회차 M3) cys 가 다시 그리기를 약속할 수 있으면(요청이 올 것이다) 아직 calm `wait` 다 · 약속할 수 없으면(노브 끔·대상 아님·창 너무 작음·요청했으나 미복구)
+        //   처방이 사람에게 창 크기 변경·확인을 요구하므로 code 도 사람 조치 `stale_screen` 이다(GUI 가 OS 배너를 낸다 · 문장은 두 갈래 모두 종전 그대로).
         let q = stale_quiet.unwrap_or(0);
+        let code = if repaint_promise(d).is_some() { REMEDY_CODE_STALE_SCREEN } else { "wait" };
         (
-            "wait",
+            code,
             format!("출력 중 표지가 보이지만 {q}초째 출력이 없다 — 표지가 낡은 화면 사본일 수 있다({}). 그래도 이어지면 그 창 화면을 확인", promise(d)),
         )
     } else if REMEDY_WAIT_PREFIXES.iter().any(|p| blocked_by.starts_with(p)) {
@@ -19929,6 +19939,18 @@ mod tests {
         assert!(t.contains("60초째 출력이 없다") && t.contains("낡은 화면 사본일 수 있다") && t.contains("다시 그리기를 요청한다") && t.ends_with(REMEDY_LLM_SUFFIX), "{t}");
         assert!(!t.contains("스스로 풀린다"), "낡은 표지에 '스스로 풀린다' 는 거짓이다: {t}");
         assert_eq!(queue_remedy(BLOCKED_BUSY, &base(None)).1, queue_remedy(BLOCKED_BUSY, &base(Some(0))).1, "미측정은 짧은 정적과 같은 문장");
+        // ★(2회차 M3) 약속할 수 없는 네 갈래(노브 끔·대상 아님·창 너무 작음·미복구)는 사람 조치 code `stale_screen` — 문장은 그대로고 code 만 바뀐다. 정적 59초면 약속 불가여도 calm.
+        for d in [
+            QueueBlockDiag { repaint_knob_off: true, ..base(Some(60)) },
+            QueueBlockDiag { nudge_ineligible: true, ..base(Some(60)) },
+            QueueBlockDiag { rows_too_small: true, ..base(Some(60)) },
+            QueueBlockDiag { repaint_unresolved: true, ..base(Some(60)) },
+        ] {
+            let (c, t) = queue_remedy(BLOCKED_BUSY, &d);
+            assert_eq!(c, super::REMEDY_CODE_STALE_SCREEN, "{d:?}: {t}");
+            assert!(t.starts_with("출력 중 표지가 보이지만 60초째 출력이 없다") && t.ends_with(REMEDY_LLM_SUFFIX), "{t}");
+            assert_eq!(queue_remedy(BLOCKED_BUSY, &QueueBlockDiag { quiet_secs: Some(59), ..d.clone() }).0, "wait", "정적 59초는 종전 calm");
+        }
         // 모달: 정적 60초부터 낡은 사본 가능성을 덧붙이되 '사람이 답한다' 는 그대로.
         let (c, t) = queue_remedy(BLOCKED_MODAL, &base(Some(120)));
         assert_eq!(c, "answer_modal");
@@ -19950,10 +19972,11 @@ mod tests {
         ] {
             let fg = QueueBlockDiag { alt_fg_agent: true, ..d.clone() };
             let dpos = QueueBlockDiag { pending_input_bytes: 3, ..d.clone() };
+            // ★(2회차 M3) 바쁨 + 정적 60초 + 약속 불가 = `stale_screen`(사람 조치 — GUI 가 배너를 낸다) · 그 밖 갈래의 code 는 그대로.
             for (blocked, dd, code) in [
                 (BLOCKED_INPUT_PENDING, &dpos, "input_pending_unknown"),
                 (BLOCKED_PROMPT_UNKNOWN, &d, "prompt_unknown"),
-                (BLOCKED_BUSY, &d, "wait"),
+                (BLOCKED_BUSY, &d, "stale_screen"),
                 (BLOCKED_MODAL, &d, "answer_modal"),
                 (BLOCKED_ALT_SCREEN, &fg, "alt_screen"),
             ] {
@@ -19979,6 +20002,26 @@ mod tests {
         // 패닉 주석은 여전히 본문 뒤·접미 앞.
         let (_, t) = queue_remedy(BLOCKED_BUSY, &QueueBlockDiag { parser_panics: 2, ..base(Some(70)) });
         assert!(t.ends_with(&format!(" (이 좌석 화면 파서 패닉 2회 — 화면 판독이 순간 비었을 수 있다){REMEDY_LLM_SUFFIX}")), "{t}");
+    }
+
+    /// ★(0.14.45 · 성찰 2회차 m2) 처방 문장의 숫자와 노브 상수의 **핀** — "1분" 은 [`crate::repaint::REPAINT_UNREADABLE_SECS`](60초) · "4행 미만" 은
+    /// [`crate::repaint::REPAINT_MIN_ROWS`](4) · "60초째" 의 하한은 [`STALE_SCREEN_QUIET_SECS`](60) 다. 상수를 바꾸면 이 검체가 적색이 되어 문장(기본 갈래는 바이트 핀 · 문서가 인용)을
+    /// 같이 고치게 한다 — 문장을 `format!` 로 짜면 바이트 핀이 깨지므로 핀 검체를 택했다.
+    #[test]
+    fn m2_remedy_numbers_match_the_knob_constants() {
+        assert_eq!(crate::repaint::REPAINT_UNREADABLE_SECS, 60, "처방 문장의 '1분' 이 이 상수를 말한다 — 바꾸면 아래 문장들도 고친다");
+        assert_eq!(crate::repaint::REPAINT_MIN_ROWS, 4, "처방 문장의 '4행 미만' 이 이 상수를 말한다");
+        assert_eq!(super::STALE_SCREEN_QUIET_SECS, 60, "바쁨·모달 낡은 사본 문장의 'N초째' 하한");
+        let minute = format!("{}분", crate::repaint::REPAINT_UNREADABLE_SECS / 60);
+        assert_eq!(minute, "1분");
+        assert!(super::REMEDY_BODY_INPUT_PENDING_UNKNOWN.contains(&format!("{minute} 넘게 못 읽으면")), "{}", super::REMEDY_BODY_INPUT_PENDING_UNKNOWN);
+        assert!(super::REMEDY_BODY_PROMPT_UNKNOWN.contains(&format!("{minute} 뒤 cys 가")), "{}", super::REMEDY_BODY_PROMPT_UNKNOWN);
+        let base = QueueBlockDiag { quiet_secs: Some(super::STALE_SCREEN_QUIET_SECS), input_model: "v3", ..QueueBlockDiag::default() };
+        let (_, t) = queue_remedy(BLOCKED_BUSY, &base);
+        assert!(t.contains(&format!("{minute} 넘게 이어지면")), "약속 구절의 분 표기: {t}");
+        let rows = format!("{}행 미만", crate::repaint::REPAINT_MIN_ROWS);
+        assert_eq!(rows, "4행 미만");
+        assert!(super::repaint_promise(&QueueBlockDiag { rows_too_small: true, ..QueueBlockDiag::default() }).unwrap().contains(&rows));
     }
 
     /// ★(0.14.45 · 성찰 M1) 실제 좌석 — 낡은 "esc to interrupt" 가 커서 근처에 남아 `busy` 로 막힌 채 출력이 60초 넘게 없으면 판독 불가 시계가 서고, 60초 뒤 다시 그리기 요청 1건
@@ -25122,7 +25165,7 @@ mod tests {
         serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{QUEUE_BLOCKED_FILE} 이 JSON 이 아니다: {e}\n{raw}"))
     }
 
-    /// `queue_remedy` 표의 **16행 전수** — 위에서부터 첫 일치 · 모든 문장 끝 "LLM 에이전트는 자동 조치…" · code 어휘는 허용 목록 13종 전부.
+    /// `queue_remedy` 표의 **16행 전수** — 위에서부터 첫 일치 · 모든 문장 끝 "LLM 에이전트는 자동 조치…" · code 어휘는 허용 목록 14종 전부.
     /// ★(RQFIX) 표가 재정의됐다: 입력줄 계열(`input_pending…`·`schedule_divert(gate:draft…`)은 계수 0 → 가시성 → 계수 → 커서 뒤 글자 순으로 갈린다.
     #[test]
     fn c5_queue_remedy_table_every_row_in_order() {
@@ -25283,6 +25326,10 @@ mod tests {
         ] {
             check(blocked, &d0, "wait", &["일시 보류", "스스로 풀린다", "오래 지속되면 그 창 화면을 확인"]);
         }
+        // 15행 ′ stale_screen(2회차 M3) — 바쁨 + 정적 60초 + 다시 그리기 약속 불가(요청했으나 미복구 등).
+        let stale = QueueBlockDiag { quiet_secs: Some(60), repaint_unresolved: true, ..d0.clone() };
+        check(BLOCKED_BUSY, &stale, "stale_screen", &["60초째 출력이 없다", "낡은 화면 사본일 수 있다", "요청했으나 풀리지 않았다", "그 창 화면을 확인"]);
+        check(BLOCKED_BUSY, &QueueBlockDiag { quiet_secs: Some(60), ..d0.clone() }, "wait", &["낡은 화면 사본일 수 있다", "다시 그리기를 요청한다"]);
         // 16행 unknown — 그 밖(표에 없는 사유 · `schedule_divert` 의 `gate:draft` 가 아닌 꼴 · 빈 문자열 포함).
         for blocked in ["schedule_divert(gate:other · job j1)", "schedule_divert(other)", "zzz", ""] {
             check(blocked, &d0, "unknown", &["사유 미분류", "그 창 화면을 확인"]);
@@ -25291,9 +25338,9 @@ mod tests {
         assert!(!blocked_is_input_line("schedule_divert(other)") && !blocked_is_input_line(BLOCKED_BUSY));
         assert_eq!(super::REMEDY_CODE_PHANTOM, "phantom_count", "와이어 어휘(소비자 계약) 고정 — 코드 이름은 누를 키를 말하지 않는다(I-5)");
         assert!(QUEUE_REMEDY_CODES.contains(&super::REMEDY_CODE_PHANTOM), "유령 처방 code 상수가 허용 목록 밖이다");
-        // 표의 열세 code 가 전부 한 번 이상 나왔다(공허 방지 — 허용 목록 13종 = 실제로 낼 수 있는 code 전량).
+        // 표의 열네 code 가 전부 한 번 이상 나왔다(공허 방지 — 허용 목록 14종 = 실제로 낼 수 있는 code 전량).
         let want: BTreeSet<&str> = QUEUE_REMEDY_CODES.iter().copied().collect();
-        assert_eq!(QUEUE_REMEDY_CODES.len(), 13, "허용 목록은 13종");
+        assert_eq!(QUEUE_REMEDY_CODES.len(), 14, "허용 목록은 14종");
         assert_eq!(seen.iter().copied().collect::<BTreeSet<&str>>(), want, "표가 내지 못하는 허용 목록 code 가 있다");
     }
 
@@ -26355,17 +26402,18 @@ mod tests {
         assert!(super::queue_blocked_err_should_log(Some(&last), "권한 없음", t0 + s(1)), "오류 문구가 바뀌면 바로 찍는다");
     }
 
-    /// 어휘 계약 — 허용 목록 13종 · 유령 처방 code 는 `phantom_count`(키 이름을 코드에서 뺐다) · 금지 접미의 **앞부분은 바이트 그대로**(GUI 가 이 접두로 꼬리를 뗀다) ·
+    /// 어휘 계약 — 허용 목록 14종 · 유령 처방 code 는 `phantom_count`(키 이름을 코드에서 뺐다) · 금지 접미의 **앞부분은 바이트 그대로**(GUI 가 이 접두로 꼬리를 뗀다) ·
     /// GUI 어휘 대조가 읽는 두 선언의 꼴이 유지된다 · 유령 처방 접미의 정의처는 `src/lib.rs` 하나이며 제품 코드에 옛 코드 이름이 0건이다.
     #[test]
     fn rqfix_vocabulary_contract_for_codes_suffix_and_declarations() {
-        assert_eq!(QUEUE_REMEDY_CODES.len(), 13);
+        assert_eq!(QUEUE_REMEDY_CODES.len(), 14);
         let uniq: std::collections::BTreeSet<&&str> = QUEUE_REMEDY_CODES.iter().collect();
-        assert_eq!(uniq.len(), 13, "중복 없음");
+        assert_eq!(uniq.len(), 14, "중복 없음");
         assert!(QUEUE_REMEDY_CODES.iter().all(|c| !c.contains("ctrl_u") && !c.contains("Ctrl")), "코드 이름이 누를 키를 말하지 않는다(I-5)");
-        for code in ["paused", "machine_residue", "phantom_count", "after_cursor_text", "human_draft", "input_pending_unknown", "answer_modal", "approval", "alt_screen", "empty_seat", "prompt_unknown", "wait", "unknown"] {
+        for code in ["paused", "machine_residue", "phantom_count", "after_cursor_text", "human_draft", "input_pending_unknown", "answer_modal", "approval", "alt_screen", "empty_seat", "prompt_unknown", "stale_screen", "wait", "unknown"] {
             assert!(QUEUE_REMEDY_CODES.contains(&code), "{code}");
         }
+        assert_eq!(super::REMEDY_CODE_STALE_SCREEN, "stale_screen", "와이어 어휘(GUI STARVED_HUMAN_CODES · 경보 라우팅 허용 목록) 고정");
         assert!(
             REMEDY_LLM_SUFFIX.starts_with(" · LLM 에이전트는 자동 조치("),
             "GUI(starvednotice.ts STARVED_LLM_TAIL)가 이 접두로 꼬리를 뗀다 — 바이트 그대로: {REMEDY_LLM_SUFFIX:?}"
@@ -26374,8 +26422,8 @@ mod tests {
         assert_eq!(GHOST_CTRL_U_SUFFIX, cys::GHOST_CTRL_U_SUFFIX, "한 정의처(src/lib.rs) — 데몬과 CLI 가 같은 문자열을 쓴다");
         // GUI 어휘 대조(`ui/src/starvednotice.test.ts`)가 소스에서 읽는 두 선언의 꼴 — 같은 문법으로 파싱해 본다.
         let src = include_str!("governance.rs");
-        let decl = "const QUEUE_REMEDY_CODES: [&str; 13] = [";
-        let a = src.find(decl).expect("선언 꼴(const QUEUE_REMEDY_CODES: [&str; 13] = [) 소실 — GUI 어휘 대조가 파싱하지 못한다") + decl.len();
+        let decl = "const QUEUE_REMEDY_CODES: [&str; 14] = [";
+        let a = src.find(decl).expect("선언 꼴(const QUEUE_REMEDY_CODES: [&str; 14] = [) 소실 — GUI 어휘 대조가 파싱하지 못한다") + decl.len();
         let body = &src[a..a + src[a..].find("];").expect("배열 끝")];
         assert!(!body.contains(']'), "배열 안에 닫는 대괄호가 있으면 GUI 정규식이 잘린다");
         let parsed: Vec<&str> = body.split('"').skip(1).step_by(2).collect();

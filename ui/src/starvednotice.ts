@@ -35,7 +35,9 @@ export const STARVED_DETAIL_MAX = 200;
 /** 데몬이 모든 remedy 끝에 붙이는 LLM 소비자용 꼬리의 **접두**(governance.rs REMEDY_LLM_SUFFIX 의 앞부분) — 사람에게는 불필요해 떼어 낸다.
  *  뒤따르는 괄호 안 금지 목록(강제 배달·드레인·키 주입·동결 해제·항목 삭제 …)은 데몬 판마다 늘 수 있어 문면 전체가 아니라 이 접두로 찾는다. */
 export const STARVED_LLM_TAIL = " · LLM 에이전트는 자동 조치";
-/** 사람이 조치해야 하는 remedy_code — 처방 code 13종(데몬 리뷰 확정 · governance.rs QUEUE_REMEDY_CODES) 가운데 calm 3종을 뺀 10종. */
+/** 사람이 조치해야 하는 remedy_code — 처방 code 14종(데몬 리뷰 확정 · governance.rs QUEUE_REMEDY_CODES) 가운데 calm 3종을 뺀 11종.
+ *  ★(0.14.45 성찰 2회차 M3) `stale_screen` — 바쁨 표지가 60초 넘게 정적인데 cys 가 다시 그리기를 약속할 수 없어(노브 끔·대상 아님·창 너무 작음·요청했으나 미복구)
+ *  처방이 사람에게 창 크기 변경·확인을 요구한다. 종전에는 같은 문장이 calm `wait` 로 와 OS 배너가 나가지 않았다. */
 export const STARVED_HUMAN_CODES: readonly string[] = [
   "machine_residue",
   "phantom_count",
@@ -46,6 +48,7 @@ export const STARVED_HUMAN_CODES: readonly string[] = [
   "alt_screen",
   "empty_seat",
   "prompt_unknown",
+  "stale_screen",
   "unknown",
 ];
 /** 구버전 데몬이 보낼 수 있는 옛 code 이름 — `phantom_count_ctrl_u` 는 `phantom_count` 로 개명됐다(코드 이름에서 키 이름을 뺐다). 같은 뜻이라 똑같이 사람 조치 필요다. */

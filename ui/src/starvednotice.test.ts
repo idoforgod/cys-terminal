@@ -68,8 +68,8 @@ const legacyPayload = (o: Record<string, unknown> = {}): Record<string, unknown>
   ...o,
 });
 
-describe("remedy_code 별 humanNeeded 표 — approval·paused·wait 만 false, 코드가 없거나 모르면 true(처방 code 13종)", () => {
-  // 처방 code 13종(데몬 리뷰 확정) = 사람 조치 10종 + calm 3종. phantom_count_ctrl_u 는 phantom_count 의 옛 이름이다(구버전 데몬이 보낼 수 있다).
+describe("remedy_code 별 humanNeeded 표 — approval·paused·wait 만 false, 코드가 없거나 모르면 true(처방 code 14종)", () => {
+  // 처방 code 14종(데몬 리뷰 확정 · 0.14.45 성찰 2회차 M3 stale_screen 추가) = 사람 조치 11종 + calm 3종. phantom_count_ctrl_u 는 phantom_count 의 옛 이름이다(구버전 데몬이 보낼 수 있다).
   const HUMAN = [
     "machine_residue",
     "phantom_count",
@@ -80,6 +80,7 @@ describe("remedy_code 별 humanNeeded 표 — approval·paused·wait 만 false, 
     "alt_screen",
     "empty_seat",
     "prompt_unknown",
+    "stale_screen",
     "unknown",
   ];
   const LEGACY_HUMAN = ["phantom_count_ctrl_u"];
@@ -109,11 +110,11 @@ describe("remedy_code 별 humanNeeded 표 — approval·paused·wait 만 false, 
       expect({ 값: String(v), humanNeeded: starvedNotice(payload({ remedy_code: v }))!.humanNeeded }).toEqual({ 값: String(v), humanNeeded: true });
     expect(starvedHumanNeeded(undefined)).toBe(true);
   });
-  it("표의 목록(소스 상수)은 확정된 13종 + 옛 이름 1개와 같다 · humanNeeded=false 는 정확히 셋 · 서로 겹치지 않는다", () => {
+  it("표의 목록(소스 상수)은 확정된 14종 + 옛 이름 1개와 같다 · humanNeeded=false 는 정확히 셋 · 서로 겹치지 않는다", () => {
     expect([...STARVED_HUMAN_CODES].sort()).toEqual([...HUMAN].sort());
     expect([...STARVED_LEGACY_HUMAN_CODES].sort()).toEqual([...LEGACY_HUMAN].sort());
     expect([...STARVED_CALM_CODES].sort()).toEqual([...CALM].sort());
-    expect(HUMAN.length + CALM.length).toBe(13);
+    expect(HUMAN.length + CALM.length).toBe(14);
     const all = [...STARVED_HUMAN_CODES, ...STARVED_LEGACY_HUMAN_CODES, ...STARVED_CALM_CODES];
     expect(new Set(all).size).toBe(all.length); // 어느 code 도 두 목록에 걸리지 않는다
     const calmOnes = all.filter((c) => !starvedHumanNeeded(c));
