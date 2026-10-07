@@ -8829,7 +8829,10 @@ fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         let o = if off {
             agy::unlink(&settings, Some(&record), agy::Backup::Beside)
         } else {
-            agy::ensure_linked(
+            // ★(0.14.45 · B1) 사람이 부른 수리는 지난 실연 검사 실패 기록을 **무시하고** 다시 검사한다 — 결과로 기록을 덮는다
+            //   (통과 = 지움 · 실패 = 이 버전으로 다시 기록 → 설치 경로는 버전이 바뀔 때까지 재검사하지 않는다).
+            agy::clear_probe_failure(&ctx.pack_dir);
+            let o = agy::ensure_linked(
                 &agy::Ctx {
                     settings: &settings,
                     pack_dir: &ctx.pack_dir,
@@ -8838,7 +8841,11 @@ fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
                     probe: Some(&agy::live_probe),
                 },
                 true,
-            )
+            );
+            if let agy::Outcome::WindowsProbeFailed { reason, .. } = &o {
+                agy::record_probe_failure(&ctx.pack_dir, env!("CARGO_PKG_VERSION"), reason);
+            }
+            o
         };
         done = agy::describe(&o, &settings).map(|l| format!("--fix: {l}")).unwrap_or_default();
     }
@@ -14280,8 +14287,9 @@ fn alt_screen_notice(
              **새 pane 을 여세요** (`touch` 는 PowerShell·cmd 에 없는 명령입니다. 되돌리기 \
              취소는 Remove-Item). \
              env(CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN)로 inline 을 강제하려면 **두 가지가 함께** \
-             필요합니다 — ①Windows 는 이 env 주입이 **기본 off(옵트인)** 입니다(실기 검증 전이라 \
-             그렇습니다): `New-Item -ItemType File -Force $HOME\\.cys\\win-no-alt-screen` \
+             필요합니다 — ①Windows 는 이 env 주입이 **기본 off(옵트인)** 입니다(이 env 경로만 Windows 실기 검증 \
+             전입니다 — 위의 설정 경로 classic 기본값(0.14.45)과는 별개의 벨트입니다): \
+             `New-Item -ItemType File -Force $HOME\\.cys\\win-no-alt-screen` \
              (되돌리기 Remove-Item · env CYS_WIN_NO_ALT_SCREEN=1 도 동등하나 GUI 재시작 필요). \
              ②그 뒤 이 pane 이 아니라 **새 pane 을 launch-agent 로 기동**하세요 — Windows 에서 \
              env 는 새 surface 를 만들 때만 실립니다(기존 pane 재기동 경로는 env 를 싣지 \
@@ -14744,13 +14752,20 @@ fn boot_agent_on_surface(
     //   이 함수는 launch-agent(GUI 포함) · node-recover · in-seat restore 가 모두 지나는 기동 직전 지점이라, 여기
     //   한 곳에서 좌석 설정 폴더 settings.json 에 `tui` 가 **없을 때만** "default" 를 넣는다(D5 env 와 달리 설정
     //   파일은 기존 pane 재기동에도 닿는다). 게이트(Windows ∧ ¬`CYS_WIN_TUI_CLASSIC_OFF`)는 그 모듈이 건다.
-    //   ★결과가 무엇이든 기동은 계속한다 — 로그 1줄뿐이다(치명위험 ④: 이 기록이 claude 기동을 막으면 안 된다).
+    //   ★이 dir 은 좌석 spec env 에 CLAUDE_CONFIG_DIR 이 명시된 경우만 온다(SeatSpec 출처).
+    //   킬스위치는 원장의 cys 삽입값도 되돌린다. 결과가 무엇이든 기동은 계속한다 — 항목별 로그뿐이다.
     if let Some(dir) = seat_claude_config_dir(&env_pairs, extract_bin(&cmd, agent)) {
         let dir = std::path::PathBuf::from(dir);
-        if let Some(line) = cys::claude_tui::reconcile_for_launch(&dir)
-            .and_then(|o| cys::claude_tui::describe(&o, &dir))
-        {
-            eprintln!("[launch-agent] 렌더러 설정: {line}");
+        if let Some(outcome) = cys::claude_tui::reconcile_for_launch(&dir) {
+            if let cys::claude_tui::Outcome::RolledBack(entries) = &outcome {
+                for (dir, outcome) in entries {
+                    if let Some(line) = cys::claude_tui::describe_rollback(outcome, dir) {
+                        eprintln!("[launch-agent] 렌더러 설정: {line}");
+                    }
+                }
+            } else if let Some(line) = cys::claude_tui::describe(&outcome, &dir) {
+                eprintln!("[launch-agent] 렌더러 설정: {line}");
+            }
         }
     }
     let (send, _send_env) = render_launch(&cmd, &env_pairs);
@@ -28608,7 +28623,11 @@ mod tests {
         //   파일에서 라벨 탐색이 어긋나는 cmd 의 알려진 함정) · 따옴표 없음 · 연결 명령이 이 파일을 가리킨다.
         let cmdw = include_str!("../../cysjavis-pack/hooks/cys-agy-statusline.cmd");
         assert!(cmdw.starts_with("@echo off\n"), "{cmdw}");
-        assert!(cmdw.contains("cys usage-report-stdin --agy 2>nul"), "{cmdw}");
+        // ★(0.14.45 · B4) 작업 폴더 탈취 차단 — cmd 는 기본적으로 현재 폴더의 `cys.exe/.cmd` 를 PATH 보다 먼저 찾는다.
+        //   agy 가 상태줄을 어느 작업 폴더에서 부르든 PATH 의 cys 만 실행되게 `set` 한 줄을 cys 호출 **앞**에 둔다.
+        let set_at = cmdw.find("set NoDefaultCurrentDirectoryInExePath=1\n").expect("NoDefaultCurrentDirectoryInExePath 줄 없음");
+        let call_at = cmdw.find("cys usage-report-stdin --agy 2>nul").expect("cys 호출 줄 없음");
+        assert!(set_at < call_at, "set 은 cys 호출 앞이어야 한다:\n{cmdw}");
         assert!(cmdw.trim_end().ends_with("exit /b 0"), "{cmdw}");
         assert!(!cmdw.contains('\r') && !cmdw.contains('"'), "LF · 따옴표 없음: {cmdw:?}");
         assert!(!cmdw.lines().any(|l| l.trim_start().starts_with(':')) && !cmdw.to_ascii_lowercase().contains("goto"));

@@ -2277,6 +2277,14 @@ pub fn d5_win_opt_in_from(env_val: Option<&str>, file_exists: bool) -> bool {
 /// 업데이트에 신중에 신중")과도 같은 방향이다. **조건을 건너뛴 것이 아니라, 조건이 걸린 변경
 /// 자체를 무장 해제한 것**이다.
 ///
+/// ★0.14.45 정정(두 경로의 지위 — 혼동 금지): 여기의 '옵트인'·'Windows 회귀 0'·'실기 검증 전' 은 **env 경로**
+/// (`CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` 주입)에 한정된 서술이다. **설정 경로**(`src/claude_tui.rs` —
+/// 좌석 설정 폴더 `settings.json` 에 `tui` 가 없을 때만 `"default"` 를 넣어 classic 렌더러를 고른다)는
+/// 0.14.45 부터 **Windows 기본 on** 이며 그 근거는 그 모듈 doc(같은 기계의 classic 좌석이 정상 동작한 실기
+/// 증거 · 실패 방향 = 쓰지 않음 · 킬스위치 `CYS_WIN_TUI_CLASSIC_OFF` 는 원장으로 되돌린다)이다. 두 경로는 서로를
+/// 대체하지 않는다 — env 는 새 surface 기동에만 닿고 설정 파일은 모든 기동 경로에 닿는다. 사용자 안내
+/// (`alt_screen_notice` Windows 힌트 · USER-MANUAL env 표)는 둘을 나눠 말한다.
+///
 /// ★기본 on 승격 절차(다음 사람은 이 주석만 읽고 승격할 수 있어야 한다):
 ///  · 조건 — Windows 실기에서 **B-5 1회 통과**. 즉 옵트인(`~/.cys/win-no-alt-screen` 생성)
 ///    상태로 `cys boot` 가 4종 노드를 정상 기동하고, 각 pane 에서
@@ -2297,6 +2305,10 @@ pub fn d5_win_opt_in_from(env_val: Option<&str>, file_exists: bool) -> bool {
 ///    ⑤ `src/bin/cys.rs` 의 `alt_screen_notice` **Windows 힌트 문안** — '①Windows 는 이 env
 ///       주입이 기본 off(옵트인) 입니다' 가 통째로 거짓이 되고, 사용자에게 없는 절차를 시킨다.
 ///       진리표 핀은 `hint` 토큰만 보므로 **자동 검출되지 않는다**(문안은 사람이 지켜야 한다).
+///    ⑥ (0.14.45) `src/claude_tui.rs` 모듈 doc '왜 설정 파일인가' 절과 위 ★0.14.45 정정 문단 — 승격하면
+///       'D5 env 는 Windows 옵트인' 이라는 전제가 사라지므로 두 경로의 관계(env = 새 surface 기동만 ·
+///       설정 파일 = 모든 기동 경로)를 다시 써야 하고, 설정 경로의 킬스위치(`CYS_WIN_TUI_CLASSIC_OFF` ·
+///       원장 되돌림)와 env 롤백 킬스위치가 **각각** 있음을 USER-MANUAL env 표에 남겨야 한다.
 ///  · 승격하면 이 옵트인 스위치는 무의미해지고, 그때 필요한 것은 **롤백 킬스위치**다 —
 ///    그 이름으로 `CYS_WIN_ALT_SCREEN_OFF`(파일 `~/.cys/win-alt-screen-off`)를 비워 두었다
 ///    (형제 `CYS_WIN_WHEEL_GUARD_OFF` 와 같은 `_OFF` = '우리 기능 끄기' 극성).

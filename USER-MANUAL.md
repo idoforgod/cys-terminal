@@ -796,8 +796,10 @@ Control Center Live 의 계정 표가 "지금 어느 계정이 쓰이는가"를 
   없을 때만** 넣습니다. classic 화면에서는 휠이 pane 스크롤백을 움직입니다.
   · **이미 `tui` 가 적혀 있으면 값과 무관하게 덮지 않습니다** — `/tui fullscreen` 으로 전체화면을
   고른 사용자 선택은 그대로입니다. 쓰기 전 원본을 `settings.json.bak-cys-tui` 로 남기고, 파일이
-  깨져 있거나(JSON 오류) 읽기 전용·심볼릭 링크면 건드리지 않습니다. 개인 프로필(`~/.claude`·
-  `~/.claude-*`)에는 쓰지 않습니다. 기록에 실패해도 claude 기동은 그대로 진행합니다.
+  깨져 있거나(JSON 오류) 읽기 전용·심볼릭 링크면 건드리지 않습니다. 개인 기본 프로필(`~/.claude`)에는
+  쓰지 않습니다 — 계정 선택으로 좌석에 명시된 `~/.claude-2` 같은 폴더는 **좌석 계정**이므로 씁니다(그
+  좌석이 바로 제보된 master·worker 입니다). 기록에 실패해도 claude 기동은 그대로 진행합니다.
+  cys 가 쓴 폴더는 원장 `~/.cys/claude-tui-written.json` 에 적어 둡니다(아래 '끄는 법'의 되돌리기 근거).
   · **이미 전체화면으로 떠 있는 pane 은 다음 기동부터** 바뀝니다 — 지금 바로 바꾸려면 그 pane 의
   claude 에서 `/tui default`(Claude Code 가 스스로 classic 으로 다시 시작합니다).
   · 그런데도 전체화면으로 뜨면 그 `settings.json` 에 `"tui": "fullscreen"` 이 이미 적혀 있거나
@@ -805,9 +807,11 @@ Control Center Live 의 계정 표가 "지금 어느 계정이 쓰이는가"를 
   것입니다 — 그 pane 에서 `/tui default` 를 치세요.
   · **끄는 법**: PowerShell `New-Item -ItemType File -Force $HOME\.cys\win-tui-classic-off`(다음
   기동부터 · 되돌리기 `Remove-Item $HOME\.cys\win-tui-classic-off`) · env `CYS_WIN_TUI_CLASSIC_OFF=1`
-  도 동등(GUI 가 상속한 값만 읽으므로 `setx` 후 GUI 재시작). 끄는 것은 **이후 기록**뿐입니다 — 이미
-  들어간 `"tui": "default"` 는 사용자가 직접 친 `/tui default` 와 구별할 수 없어 지우지 않으니,
-  전체화면으로 돌아가려면 pane 에서 `/tui fullscreen` 을 치세요.
+  도 동등(GUI 가 상속한 값만 읽으므로 `setx` 후 GUI 재시작). 끄면 **이후 기록을 멈추고, 원장에 적힌
+  폴더의 값이 아직 정확히 `"default"` 이면 cys 가 넣은 그 키를 빼서 되돌립니다**(다음 claude 기동 때 ·
+  같은 외과 수술 규약 — 백업 `.bak-cys-tui` · 쓰기 직전 재판독 · 원자 쓰기 · 되읽기). 사용자가 그 사이
+  `/tui fullscreen` 등으로 값을 바꿨으면 그 값은 그대로 두고 원장에서만 뺍니다. 원장에 없는 폴더(사용자가
+  직접 친 `/tui default`)는 건드리지 않습니다 — 그런 pane 은 `/tui fullscreen` 을 치세요.
   · macOS 는 이 기록을 하지 않습니다(아래 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` 기본 주입이 같은
   역할을 합니다).
 - **Windows 에서 claude 를 전체화면 대신 inline 으로 띄우기**(옵트인 · **기본 off**): 위 휠 가드는
@@ -1907,8 +1911,8 @@ claude       a-b1@example.test                5h 12% · 7d 40% | ● 사용 중 
 | `CYS_CLAUDE_CTX_WINDOW` | 200k (`[1m]`=1M) | 컨텍스트 창 크기 힌트 |
 | `CYS_ALLOW_APP_MOUSE` | — (`1`=on) | 앱 마우스 킬스위치 — TUI가 마우스를 갖는다 (§4.6b · `~/.cys/allow-app-mouse` 파일과 동등 · 새 pane부터). ⚠ **Windows에서는 켜지 마세요** — ConPTY가 마우스 시퀀스를 깨뜨려 입력창에 `[555;98;34M` 같은 리터럴이 타이핑됩니다. Windows 휠 가드를 끄는 용도로도 쓰면 안 됩니다(그건 아래 전용 스위치) |
 | `CYS_WIN_WHEEL_GUARD_OFF` | — (`1`=off로 되돌림) | **Windows 전용** 휠 가드 롤백 — 전체화면 TUI 휠 억제를 끄고 종전(방향키 합성)으로 복귀 (§4.6b). ⚠ **적용 시점이 파일 게이트와 다릅니다**: env는 **GUI 프로세스가 상속한 값만** 읽으므로 `setx` 후 **GUI 재시작**이 필요하고, 동등 수단인 `~/.cys/win-wheel-guard-off` **파일은 새 pane부터 즉시** 반영됩니다(Windows 권장 수단은 파일 — PowerShell `New-Item -ItemType File -Force $HOME\.cys\win-wheel-guard-off`, `touch`는 PowerShell에 없는 명령입니다). ⚠ **결함 복원 스위치** — 켜면 claude fullscreen에서 휠이 다시 방향키로 합성돼 **프롬프트 입력창이 오염될 수 있습니다.** ⚠ 이 용도로 `CYS_ALLOW_APP_MOUSE`를 대신 쓰지 마세요 — 입·출력 양측이 열려 ConPTY 리터럴 타이핑이 되살아납니다 |
-| `CYS_WIN_NO_ALT_SCREEN` | — (`1`=on · **Windows 기본 off**) | **Windows 전용 옵트인** — claude를 기동할 때 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`을 함께 실어 **전체화면(alt screen) 대신 inline으로 뜨게** 합니다(아래 줄과 짝 · macOS는 이 스위치 없이 늘 주입됩니다). **왜 Windows만 기본 off인가**: 이 env가 Windows의 claude를 깨뜨리면 `cys boot`로 띄운 **모든 pane이 한꺼번에 죽는** 경로라, 실기 Windows에서 그 확인(`cys boot` 4종 노드 정상 기동)을 마치기 전에는 기본값으로 켜지 않습니다. 켜지 않아도 **전체화면 휠 오염은 Windows 휠 가드가 막습니다**(위 §4.6b — 그쪽이 본체 방어이고 이 env는 덧대는 벨트입니다). **켜는 법**: PowerShell `New-Item -ItemType File -Force $HOME\.cys\win-no-alt-screen` 후 **`cys launch-agent`로 새 pane 기동**(되돌리기 `Remove-Item …`). env `CYS_WIN_NO_ALT_SCREEN=1`도 동등하지만 **GUI가 상속한 값만** 읽으므로 `setx` 후 GUI 재시작이 필요합니다(권장 수단은 파일). ⚠ **켜도 새 surface를 만들며 기동한 pane에만** 도달합니다 — 이미 열린 pane의 재기동(node-recover)·GUI에서 연 pane에는 실리지 않습니다. ⚠ `agents.json` env에 `"0"`이 적혀 있으면 켜도 주입하지 않습니다(사용자 값 우선) |
-| `CYS_WIN_TUI_CLASSIC_OFF` | — (`1`=off로 되돌림 · **Windows 기본 on**) | **Windows 전용** 롤백 — 0.14.45 부터 cys 는 Windows 에서 claude 를 띄우기 직전 좌석 설정 폴더 `settings.json` 에 `tui` 키가 **없을 때만** `"tui": "default"`(classic 화면 — 휠 스크롤이 되는 화면)를 넣습니다(§4.6b). 이 스위치는 그 **이후 기록만** 멈춥니다(이미 들어간 값은 사용자의 `/tui default` 와 구별할 수 없어 지우지 않습니다 — 전체화면으로 돌아가려면 pane 에서 `/tui fullscreen`). 동등 파일 `~/.cys/win-tui-classic-off`(다음 기동부터 · PowerShell `New-Item -ItemType File -Force $HOME\.cys\win-tui-classic-off`) — env 는 GUI 가 상속한 값만 읽으므로 `setx` 후 GUI 재시작(권장은 파일) |
+| `CYS_WIN_NO_ALT_SCREEN` | — (`1`=on · **Windows 기본 off**) | **Windows 전용 옵트인** — claude를 기동할 때 `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1`을 함께 실어 **전체화면(alt screen) 대신 inline으로 뜨게** 합니다(아래 줄과 짝 · macOS는 이 스위치 없이 늘 주입됩니다). **왜 Windows만 기본 off인가**: 이 env가 Windows의 claude를 깨뜨리면 `cys boot`로 띄운 **모든 pane이 한꺼번에 죽는** 경로라, 실기 Windows에서 그 확인(`cys boot` 4종 노드 정상 기동)을 마치기 전에는 기본값으로 켜지 않습니다(옵트인·실기 검증 전이라는 말은 **이 env 경로에만** 해당합니다). 0.14.45 부터는 **설정 경로**(§4.6b — 좌석 `settings.json` 의 `"tui": "default"`)가 Windows 기본 on 이라 cys 가 띄운 claude 는 보통 classic 으로 뜹니다 — 이 env 는 그 위에 덧대는 옵트인 벨트이고, 켜지 않아도 **전체화면 휠 오염은 Windows 휠 가드가 막습니다**(위 §4.6b — 그쪽이 본체 방어입니다). **켜는 법**: PowerShell `New-Item -ItemType File -Force $HOME\.cys\win-no-alt-screen` 후 **`cys launch-agent`로 새 pane 기동**(되돌리기 `Remove-Item …`). env `CYS_WIN_NO_ALT_SCREEN=1`도 동등하지만 **GUI가 상속한 값만** 읽으므로 `setx` 후 GUI 재시작이 필요합니다(권장 수단은 파일). ⚠ **켜도 새 surface를 만들며 기동한 pane에만** 도달합니다 — 이미 열린 pane의 재기동(node-recover)·GUI에서 연 pane에는 실리지 않습니다. ⚠ `agents.json` env에 `"0"`이 적혀 있으면 켜도 주입하지 않습니다(사용자 값 우선) |
+| `CYS_WIN_TUI_CLASSIC_OFF` | — (`1`=off로 되돌림 · **Windows 기본 on**) | **Windows 전용** 롤백 — 0.14.45 부터 cys 는 Windows 에서 claude 를 띄우기 직전 좌석 설정 폴더 `settings.json` 에 `tui` 키가 **없을 때만** `"tui": "default"`(classic 화면 — 휠 스크롤이 되는 화면)를 넣고, 쓴 폴더를 원장 `~/.cys/claude-tui-written.json` 에 적습니다(§4.6b). 이 스위치는 그 **이후 기록을 멈추고 원장의 폴더에서 cys 가 넣은 값을 되돌립니다**(다음 claude 기동 때 · 값이 아직 정확히 `"default"` 일 때만 — 사용자가 `/tui fullscreen` 등으로 바꾼 값은 그대로 두고 원장에서만 뺍니다 · 백업 `.bak-cys-tui`). 원장에 없는 폴더(사용자가 직접 친 `/tui default`)는 건드리지 않습니다. 동등 파일 `~/.cys/win-tui-classic-off`(다음 기동부터 · PowerShell `New-Item -ItemType File -Force $HOME\.cys\win-tui-classic-off`) — env 는 GUI 가 상속한 값만 읽으므로 `setx` 후 GUI 재시작(권장은 파일) |
 | `CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN` | macOS: claude 기동 시 `"1"` 기본 주입 · **Windows: 기본 주입 없음**(위 `CYS_WIN_NO_ALT_SCREEN` 옵트인 시에만) | cys가 읽는 게 아니라 **주입**하는 변수(claude가 소비) — fullscreen(alt screen) 진입 차단. 계정별 되살리기는 팩 `agents.json` env에 `"0"`(키가 있으면 주입하지 않음 · §4.6b). ⚠ Windows는 옵트인해도 **새 surface를 만들며 기동한 pane에만** 주입이 도달합니다(벨트 — 이것만으로 fullscreen을 막았다고 보면 안 됩니다) |
 | `CYS_DEPT_FALLBACK` | — (`0`/`off`=끔) | 마스터 선언→부서 자동 생성 폴백 끄기 (§4.4 · 구계약 rc=7 복원) |
 | `CYS_DEPT_CREATE_STREAM` | 켬 (`0`=끔) | 「팀 직접 만들기」 단계 표시(v0.14.43 · §4.4)의 되돌리기. 켜져 있으면 앱이 `cys-dept` 를 띄울 때 표준 오류를 **실시간으로** 읽어 `[cys-dept] @stage <키>` 줄마다 화면의 단계 줄(「지금: …」)을 고칩니다. 앞뒤 공백을 걷은 값이 `0` 이면(`0 `·` 0` 포함) 종전처럼 자식이 끝난 뒤에야 읽어 대기 화면에는 경과 시간만 보입니다(팀원 부팅 안내·첫 자리 문구는 계속 나옵니다 — 다만 단계 표지를 받지 못해 기존 팀을 돌려받은 경우와 새 팀을 구분하지 못하므로 성공한 호출마다 새 팀으로 보고 냅니다). 그 밖의 값·빈 값은 켠 채입니다(`false`·`00`·공백뿐인 값 포함). 어느 쪽이든 팀을 만드는 판정과 실패 메시지는 같고 메시지에서는 표지 줄을 뺍니다. 앱(GUI)이 상속한 값만 읽으므로 설정 뒤 **앱 재시작**이 필요합니다(데몬 재시작은 필요 없음). |
