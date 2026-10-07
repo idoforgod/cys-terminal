@@ -737,8 +737,7 @@ fn probe_spawn(
         match child.try_wait() {
             Ok(Some(st)) => break st,
             Ok(None) if std::time::Instant::now() >= deadline => {
-                kill_probe_tree(&mut child);
-                let _ = child.wait();
+                kill_probe_tree(&mut child); // 트리째 · 상한 있음(끝나지 않으면 포기하고 돌아온다 — 호출 스레드를 붙들지 않는다)
                 return Err(format!("{}초 안에 끝나지 않았다(agy 도 같은 상한에서 실패한다)", timeout.as_secs_f32()));
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
@@ -761,6 +760,9 @@ fn probe_spawn(
 /// (B5) 상한을 넘긴 검사 자식을 **트리째** 끝낸다. 윈도우의 검사는 `cmd.exe → cys.exe` 두 단이라 `cmd` 만 죽이면 손자 `cys`
 /// 가 파이프를 쥔 채 남는다(고아 · 다음 검사와 겹침). `taskkill /T /F /PID <cmd pid>` 를 콘솔 창 없이 돌려 손자까지 끝낸 뒤
 /// 부모도 `kill` 한다(taskkill 부재·실패 시의 폴백 — 적어도 종전만큼은 한다). 유닉스는 손자가 없다(`sh` 없이 직접 실행) — `kill` 만.
+/// 정리에도 상한이 있다(리뷰 지적 #10): `taskkill` 자체가 멈추면 [`PROBE_KILL_BUDGET`] 뒤 그것을 죽이고 직접 `kill` 로 간다.
+/// 호출부는 그 뒤 `wait` 하지 않는다 — 직접 `kill` 뒤에도 끝나지 않으면 같은 상한만큼 `try_wait` 로 기다리고 포기한다
+/// (손자가 쥔 stdout 파이프는 읽기 스레드가 버린다 — 부모 reap 은 파이프 EOF 와 무관하다).
 fn kill_probe_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
@@ -776,10 +778,30 @@ fn kill_probe_tree(child: &mut std::process::Child) {
             .stderr(std::process::Stdio::null());
         c.spawn_policy(crate::ChildLifetime::Attached);
         if let Ok(mut tk) = c.spawn() {
-            let _ = tk.wait();
+            if !wait_bounded(&mut tk, PROBE_KILL_BUDGET) {
+                let _ = tk.kill();
+                let _ = tk.wait();
+            }
         }
     }
     let _ = child.kill();
+    let _ = wait_bounded(child, PROBE_KILL_BUDGET);
+}
+
+/// 검사 정리(taskkill · kill 뒤 reap)의 상한 — 검사 상한(5초)과 별개로 더한다.
+const PROBE_KILL_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `try_wait` 폴링으로 자식 종료를 상한까지 기다린다 — 참 = 끝났다(reap 됨).
+fn wait_bounded(child: &mut std::process::Child, budget: std::time::Duration) -> bool {
+    let dl = std::time::Instant::now() + budget;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < dl => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Ok(None) => return false,
+            Err(_) => return false,
+        }
+    }
 }
 
 /// 운영 실연 검사 — 윈도우 판 agy 1.2.17 이 상태줄 명령을 부르는 방식(`cmd /c` + Go `EscapeArg` · 5초 · 자기 환경)을 그대로

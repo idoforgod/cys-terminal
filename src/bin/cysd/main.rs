@@ -2172,10 +2172,12 @@ fn post_listen_boot(socket_path: &std::path::Path, daemon: &Arc<Daemon>) {
     spawn_deferred_agy_statusline_reconcile();
 }
 
-/// ★(0.14.45 · B1) 부트 설치 경로가 미뤄 둔 agy 상태줄 조정(윈도우 실연 검사 포함)을 **소켓 바인드 뒤** 별도 스레드에서 한다 —
-/// 데몬 락 0 · 결과는 로그 한 줄(실패해도 데몬·설치는 유효). 미뤄 둔 것이 없으면(팩이 최신이라 설치가 돌지 않았다) 무동작.
+/// ★(0.14.45 · B1) agy 상태줄 조정(윈도우 실연 검사 포함)을 **소켓 바인드 뒤** 별도 스레드에서 매 부트 한 번 한다 —
+/// 데몬 락 0 · 결과는 로그 한 줄(실패해도 데몬·설치는 유효). 이미 연결·전에 연결·같은 버전 실패 기록이면 stat 몇 번으로 끝난다.
 /// 스레드 생성 실패도 로그 한 줄이다(조정은 다음 설치 경로·`cys doctor --fix` 가 다시 한다).
 fn spawn_deferred_agy_statusline_reconcile() {
+    // 표식은 **여기서 동기로** 내린다 — 스레드 생성이 실패해도 그 뒤 설치 경로(런타임 pack-update)가 영영 미뤄지지 않는다.
+    cys::pack::end_agy_statusline_deferral();
     let spawned = std::thread::Builder::new().name("cysd-agy-statusline".into()).spawn(|| {
         if cys::pack::run_deferred_agy_statusline_reconcile() {
             eprintln!("[cysd] agy 상태줄 조정(부트에서 미뤄 둔 실연 검사) 완료");

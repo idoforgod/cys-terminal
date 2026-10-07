@@ -11514,9 +11514,13 @@ fn deliver_queued(
                 && !obs.alt_screen
                 && !obs.selector_row
                 && obs.frame_published();
+            //   '판독 가능' = 준비 판정, 또는 발행된 프레임의 비-대체 화면·비-선택기 행에서 커서 행을 읽었다 — 선택기 행
+            //   (`❯ 1. Yes`)은 커서 행이 읽혀도 작성기 복구의 증거가 아니라 배수를 지우지 않는다(리뷰 지적 #6).
             let screen_obs = if screen_unreadable {
                 crate::repaint::ScreenObs::Unreadable
-            } else if matches!(verdict, PromptGate::Ready) || obs.line.is_some() {
+            } else if matches!(verdict, PromptGate::Ready)
+                || (obs.line.is_some() && !obs.alt_screen && !obs.selector_row && obs.frame_published())
+            {
                 crate::repaint::ScreenObs::Readable
             } else {
                 crate::repaint::ScreenObs::Other

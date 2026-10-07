@@ -15,26 +15,30 @@
 //!     너비가 아니라 **높이**를 흔들어도 다시 그리기는 같은 효과다.
 //!   · 너비(cols)를 흔들면 윈도우 conhost(ConPTY)는 **버퍼 전체를 재줄바꿈(reflow)** 하고 바뀐 줄을 클라이언트에
 //!     다시 내보낸다 — 긴 대화일수록 많은 줄이 재방송되고 그 줄들이 클라이언트 스크롤백(데몬 줄 버퍼·GUI xterm)에
-//!     **중복으로 쌓인다**(ConPTY 의 알려진 동작). 높이만 바꾸면 재줄바꿈이 없다 — 되돌릴 때 가려졌던 **한 줄**이
-//!     다시 드러나 재방송될 뿐이다(그 한 줄도 A2 반향 제외 창이 룰·색인에서 가린다).
+//!     **중복으로 쌓인다**(ConPTY 의 알려진 동작). 높이만 바꾸면 재줄바꿈이 없다 — 되돌릴 때 가려졌던 줄(기대값은 한
+//!     줄)이 다시 드러나 재방송된다(그 줄들도 A2 반향 제외 창이 룰·색인에서 가린다). ★정직 고지: 이 ConPTY 서술은
+//!     공개 동작 기록에 근거한 **추론**이고 이 저장소의 PTY 검체는 유닉스 전용이다 — 윈도우 실기(windows-health)에서
+//!     재방송 줄 수와 3행 화면(커서가 맨 아랫줄)의 동작은 아직 재지 않았다. 재기 전까지는 '보장' 이 아니라 '선택 근거' 다.
 //!   · 줄였다가 되돌린다(rows-1 → rows), 늘렸다가 되돌리지 않는다(rows+1 → rows): 늘리면 그 순간 PTY 가 GUI 의 실제
 //!     화면보다 한 줄 크다 — TUI 가 그 여분 행에 그리면 xterm 은 범위 밖 커서 이동을 맨 아래 행으로 접고 줄바꿈이
 //!     화면을 밀어 올린다(GUI 스크롤백에 찌꺼기 줄). 줄이면 모든 출력이 언제나 실제 화면 안에 머문다. 되돌릴 때
 //!     conhost 가 한 줄을 다시 드러내는 것은 두 방향이 같으므로 줄이기 쪽이 손실이 더 적다.
-//!   · 최소 크기: rows ≥ 3(줄여도 2행 — Ink 의 '터미널이 너무 작다' 경로를 밟지 않는다) · cols ≥ 2.
+//!   · 최소 크기: rows ≥ 4(줄여도 3행 · `REPAINT_MIN_ROWS` — Ink 의 '터미널이 너무 작다' 경로와 2행 화면을 보수적으로 피한다) · cols ≥ 2.
 //!
 //! 【치명위험 렌즈】
 //!   ① 폭주 없음 — 좌석당 동시 1건(`repaint_in_flight` · Drop 가드가 패닉에도 내린다) · 좌석당 최소 간격 300초 ·
 //!      복구되지 않은 연속 요청은 간격을 두 배씩(최대 16배 = 80분) 늘린다. **판독 가능한** 화면(준비 판정 또는 커서
 //!      행 관측)을 한 번이라도 보면 간격이 원래대로 돌아간다 — 다른 사유의 막힘(대체 화면·선택기 행 등)은 시계만
 //!      지우고 배수는 유지한다(A4). 다시 그려진 화면은 옛 줄의 재방송이라 흔들기 시작부터 되돌린 뒤 3초까지 건강
-//!      룰·회상 색인을 타지 않는다(A2 · `Surface::repaint_echo_until`).
+//!      룰·회상 색인을 타지 않는다(A2 · `Surface::repaint_echo_until` — 최선 노력: 창 안에 시작돼 창 뒤에 끝나는 미완성
+//!      줄 하나는 샐 수 있다 · 창은 유한해 영구 봉인은 없다).
 //!   ② clear 게이트 무관 — stdin 에 아무것도 쓰지 않는다(입력줄 계수·초안·clear 가드 경로를 건드리지 않는다).
 //!   ③ 데몬 생존 — 크기 변경은 틱·reader 스레드 밖 전용 스레드에서 하고, 오류는 기록하고 건너뛴다(패닉·unwrap 0).
-//!      크기 변경은 좌석 `resize_serial` 락 아래에서 두 단계(master → parser)를 한 번에 한다 — GUI `surface.resize`
+//!      크기 변경은 좌석 `resize_gate` 락 아래에서 두 단계(master → parser)를 한 번에 한다 — GUI `surface.resize`
 //!      ([`apply_resize`])와 같은 락이라 '줄이기'·'대조+되돌리기' 가 바깥 변경과 엇갈리지 않는다(A1). 잠든 사이(settle)
-//!      에는 락을 놓고, 그 사이 바깥 변경(세대 증가)이 있었으면 되돌리지 않는다. 파서 `set_size` 는 `catch_unwind`
-//!      로 감싸 파서 락이 독(poison)에 들지 않게 한다(A6).
+//!      에는 락을 놓고, 그 사이 바깥 변경(세대 증가 — PTY 가 실제로 바뀐 뒤에만 오른다)이 있었으면 되돌리지 않는다.
+//!      흔들기 중 바깥이 치수를 생략하면 핸들러는 파서의 임시 크기가 아니라 정식 크기(`ResizeGate::nudge_origin`)를 채운다.
+//!      파서 `set_size` 는 `catch_unwind` 로 감싸 파서 락이 독(poison)에 들지 않게 하고, 패닉하면 새 파서로 간다(A6).
 //!   ④ 사람 화면 — 마커를 아는 에이전트 좌석(Claude Code 등 — 크기 변경을 견디는 TUI)에서, 대체 화면(전체화면 앱)이
 //!      아닐 때만 부른다(호출부 조건). ★정직 고지(A7): 대체 화면 판정은 **파서 사본**에서 나온다 — 파서 패닉 격리가
 //!      사본을 빈 파서로 갈았으면 그 사본은 대체 화면이 아니라고 읽히므로, 패닉 직후에는 전체화면 앱도 흔들릴 수 있다.
@@ -162,7 +166,7 @@ pub(crate) fn repaint_due(f: &RepaintFacts) -> Option<RepaintReason> {
 /// (A5 · 순수) 판독 불가 시계를 다시 세워야 하는가 — 직전 관측에서 [`REPAINT_OBS_STALE_SECS`] 보다 긴 틈이 있었다.
 /// 직전 관측이 없으면(기동 직후 · 시험이 시계를 손으로 둔 경우) 다시 세우지 않는다.
 pub(crate) fn clock_is_stale(last_observed: Option<Instant>, now: Instant) -> bool {
-    last_observed.is_some_and(|t| now.saturating_duration_since(t).as_secs() > REPAINT_OBS_STALE_SECS)
+    last_observed.is_some_and(|t| now.saturating_duration_since(t) > Duration::from_secs(REPAINT_OBS_STALE_SECS))
 }
 
 /// 노브 — `CYS_SCREEN_REPAINT_NUDGE=0` 이면 끈다(기본 켬). 검체는 H 노브 덮개로 주입한다.
@@ -285,50 +289,77 @@ pub(crate) enum NudgeOutcome {
     SupersededByOtherResize,
 }
 
-/// (A1) 바깥(GUI `surface.resize`)의 크기 변경 — `resize_serial` 락 아래에서 세대를 올리고 PTY · 파서를 한 번에 맞춘다.
-/// 핸들러는 이 함수만 부른다(두 단계를 따로 하면 재동기 스레드와 엇갈린다). 실패는 `Err`(PTY 는 바뀌지 않았다 · 파서
-/// 실패는 PTY 만 바뀐 상태 — 그 사유를 돌려준다).
+/// (A1) 좌석 크기 변경 관문 — `Surface::resize_gate` 의 내용. `gen` 은 **바깥**(GUI `surface.resize`) 변경의 세대, `nudge_origin` 은
+/// 흔들기가 진행 중일 때의 **정식 크기**(줄이기 전 크기 · 되돌릴 목표). 핸들러가 생략된 치수를 채울 때 파서의 임시 크기(rows-1)
+/// 대신 이것을 읽어야 흔들린 높이가 GUI 변경에 실려 굳지 않는다(리뷰 지적 #3).
+#[derive(Debug, Default)]
+pub(crate) struct ResizeGate {
+    pub(crate) gen: u64,
+    pub(crate) nudge_origin: Option<(u16, u16)>,
+}
+
+/// (A1) 바깥(GUI `surface.resize`)이 생략한 치수를 채울 때 쓰는 '지금 정식 크기' — 흔들기 중이면 줄이기 전 크기, 아니면 파서 크기.
+pub(crate) fn current_size_for_resize(s: &Surface) -> (u16, u16) {
+    let gate = s.resize_gate.lock().unwrap_or_else(|e| e.into_inner());
+    match gate.nudge_origin {
+        Some(origin) => origin,
+        None => s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().size(),
+    }
+}
+
+/// (A1) 바깥(GUI `surface.resize`)의 크기 변경 — `resize_gate` 락 아래에서 PTY → 파서를 한 번에 맞춘다. 세대는 **PTY 가 실제로
+/// 바뀐 뒤에만** 올린다(실패한 변경이 흔들기의 되돌리기를 취소해 PTY 가 rows-1 에 굳는 경로 차단 — 리뷰 지적 #1). 핸들러는
+/// 이 함수만 부른다(두 단계를 따로 하면 재동기 스레드와 엇갈린다). 파서 실패는 PTY 만 바뀐 상태 — 그 사유를 돌려준다
+/// (파서는 패닉 시 새 파서로 갈아 PTY 크기에 맞춘다 · `set_parser_size`).
 pub(crate) fn apply_resize(s: &Surface, rows: u16, cols: u16) -> Result<(), String> {
-    let mut serial = s.resize_serial.lock().unwrap_or_else(|e| e.into_inner());
-    *serial = serial.wrapping_add(1);
+    let mut gate = s.resize_gate.lock().unwrap_or_else(|e| e.into_inner());
     resize_pty(s, rows, cols)?;
+    gate.gen = gate.gen.wrapping_add(1);
+    gate.nudge_origin = None; // 바깥 크기가 새 정식 크기다 — 흔들기는 되돌리지 않는다
     set_parser_size(s, rows, cols)
 }
 
 /// PTY 를 (rows-1, cols) 로 줄였다가 `settle` 뒤 (rows, cols) 로 되돌린다 — 파서 크기도 같이 맞춘다(높이만 · 사유는 모듈 doc A3).
-/// 두 단계(줄이기 · 대조+되돌리기)는 각각 `resize_serial` 락 아래에서 하고 잠든 사이에는 놓는다. 그 사이 바깥 변경(세대
-/// 증가)이 있었으면 되돌리지 않는다. 오류는 `Err` 로 돌려준다(패닉 없음).
+/// 두 단계(줄이기 · 대조+되돌리기)는 각각 `resize_gate` 락 아래에서 하고 잠든 사이에는 놓는다. 그 사이 바깥 변경(세대
+/// 증가)이 있었으면 되돌리지 않는다. 줄인 뒤 파서를 못 맞추면 PTY 를 곧장 되돌리고 포기한다(두 크기가 어긋난 채 두지 않는다).
+/// 오류는 `Err` 로 돌려준다(패닉 없음). 흔들기 중에는 `nudge_origin` 이 정식 크기를 들고 있다(어느 경로로 끝나도 지운다).
 pub(crate) fn nudge_resize(s: &Surface, settle: Duration) -> Result<NudgeOutcome, String> {
     if s.exited.load(Ordering::Relaxed) {
         return Err("좌석이 종료됐다".into());
     }
-    let (rows, cols, serial_seen) = {
-        let serial = s.resize_serial.lock().unwrap_or_else(|e| e.into_inner());
+    let (rows, cols, gen_seen) = {
+        let mut gate = s.resize_gate.lock().unwrap_or_else(|e| e.into_inner());
         let (rows, cols) = s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().size();
-        if rows < 3 || cols < 2 {
+        if rows < REPAINT_MIN_ROWS || cols < 2 {
             return Err(format!("크기가 너무 작다({rows}x{cols})"));
         }
         let short = rows - 1;
         resize_pty(s, short, cols)?;
         if let Err(e) = set_parser_size(s, short, cols) {
-            // 파서만 못 줄였다 — PTY 를 곧장 되돌리고 포기한다(두 크기가 어긋난 채 두지 않는다).
             let _ = resize_pty(s, rows, cols);
+            let _ = set_parser_size(s, rows, cols);
             return Err(e);
         }
-        (rows, cols, *serial)
+        gate.nudge_origin = Some((rows, cols));
+        (rows, cols, gate.gen)
     };
     std::thread::sleep(settle);
-    let serial = s.resize_serial.lock().unwrap_or_else(|e| e.into_inner());
-    if *serial != serial_seen {
+    let mut gate = s.resize_gate.lock().unwrap_or_else(|e| e.into_inner());
+    if gate.gen != gen_seen {
+        gate.nudge_origin = None;
         return Ok(NudgeOutcome::SupersededByOtherResize);
     }
     if s.exited.load(Ordering::Relaxed) {
+        gate.nudge_origin = None;
         return Err("되돌리기 전에 좌석이 종료됐다".into());
     }
-    resize_pty(s, rows, cols)?;
-    set_parser_size(s, rows, cols)?;
-    Ok(NudgeOutcome::Restored)
+    let restored = resize_pty(s, rows, cols).and_then(|()| set_parser_size(s, rows, cols));
+    gate.nudge_origin = None;
+    restored.map(|()| NudgeOutcome::Restored)
 }
+
+/// 흔들 수 있는 최소 높이 — 줄여도 3행이 남는다(Ink 의 '터미널이 너무 작다' 경로와 커서가 맨 아랫줄인 2행 화면을 피한다 · 보수적).
+pub(crate) const REPAINT_MIN_ROWS: u16 = 4;
 
 fn resize_pty(s: &Surface, rows: u16, cols: u16) -> Result<(), String> {
     s.master
@@ -339,11 +370,21 @@ fn resize_pty(s: &Surface, rows: u16, cols: u16) -> Result<(), String> {
 }
 
 /// (A6) 파서 크기 변경 — `catch_unwind` 로 감싼다. 파서 락을 쥔 채 안에서 패닉이 나면 가드가 unwinding 중에 떨어져 락이
-/// 독에 들고, 그 뒤 모든 `parser.lock()` 이 `into_inner` 로 독을 삼키며 반쯤 바뀐 파서를 쓰게 된다. 패닉은 `Err` 가 된다.
+/// 독에 들고, 그 뒤 모든 `parser.lock()` 이 `into_inner` 로 독을 삼키며 반쯤 바뀐 파서를 쓰게 된다. 패닉을 잡으면 **반쯤
+/// 바뀐 파서를 그대로 두지 않고** 목표 크기의 새 파서로 간다(reader 의 패닉 격리 `process_chunk_isolated` 와 같은 처방 ·
+/// `parser_panics`·`last_parser_panic` 에 남긴다 — 리뷰 지적 #2). 그 뒤 다시 그리기가 사본을 채운다. 패닉은 `Err` 가 된다.
 fn set_parser_size(s: &Surface, rows: u16, cols: u16) -> Result<(), String> {
     let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.set_size(rows, cols)))
-        .map_err(|_| format!("파서 크기 변경 중 패닉({rows}x{cols})"))
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.set_size(rows, cols))) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            *p = vt100::Parser::new(rows, cols, crate::state::SCROLLBACK_LINES);
+            drop(p);
+            s.parser_panics.fetch_add(1, Ordering::Relaxed);
+            *s.last_parser_panic.lock().unwrap_or_else(|e| e.into_inner()) = Some(now_epoch());
+            Err(format!("파서 크기 변경 중 패닉({rows}x{cols}) — 새 파서로 갈았다"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +448,7 @@ mod tests {
         let now = Instant::now();
         assert!(!clock_is_stale(None, now), "직전 관측 없음 = 다시 세우지 않는다");
         assert!(!clock_is_stale(Some(now - Duration::from_secs(15)), now), "경계(15초)는 아직");
+        assert!(clock_is_stale(Some(now - Duration::from_millis(15_500)), now), "15초를 조금이라도 넘으면 오래됨(초 단위 절삭 없음)");
         assert!(clock_is_stale(Some(now - Duration::from_secs(16)), now));
         assert!(clock_is_stale(Some(now - Duration::from_secs(3600)), now));
     }
@@ -492,7 +534,7 @@ mod tests {
         assert!(until > Instant::now() && until <= Instant::now() + Duration::from_millis(REPAINT_ECHO_AFTER_MS));
         assert!(Daemon::repaint_echo_active(&s));
         // 바깥 크기 변경 세대는 흔들기로 오르지 않는다(자기 변경을 바깥 변경으로 세지 않는다).
-        assert_eq!(*s.resize_serial.lock().unwrap(), 0);
+        assert_eq!(s.resize_gate.lock().unwrap().gen, 0);
         // 판독 가능 관측 → 시계·미복구 수 리셋.
         assert!(!note_queue_screen(&daemon, &s, ScreenObs::Readable));
         let st = s.repaint.lock().unwrap();
@@ -559,18 +601,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(150));
         assert_eq!(s.parser.lock().unwrap().screen().size(), (23, 80), "높이만 한 줄 줄인다");
         assert_eq!(pty_size(&s), (23, 80));
+        // 흔들기 중 바깥이 치수를 생략하면 임시 크기(23)가 아니라 정식 크기(24)를 읽는다(리뷰 지적 #3).
+        assert_eq!(current_size_for_resize(&s), (24, 80));
+        assert_eq!(s.resize_gate.lock().unwrap().nudge_origin, Some((24, 80)));
         apply_resize(&s, 30, 100).unwrap();
+        assert_eq!(s.resize_gate.lock().unwrap().nudge_origin, None, "바깥 변경이 정식 크기다");
+        assert_eq!(current_size_for_resize(&s), (30, 100));
         assert_eq!(h.join().unwrap(), Ok(NudgeOutcome::SupersededByOtherResize));
         assert_eq!(s.parser.lock().unwrap().screen().size(), (30, 100), "GUI 크기 유지(파서)");
         assert_eq!(pty_size(&s), (30, 100), "GUI 크기 유지(PTY)");
-        assert_eq!(*s.resize_serial.lock().unwrap(), 1, "바깥 변경 1회 = 세대 1");
-        // 바깥 변경이 없으면 되돌린다.
+        assert_eq!(s.resize_gate.lock().unwrap().gen, 1, "바깥 변경 1회 = 세대 1");
+        // 바깥 변경이 없으면 되돌린다 · 끝나면 정식 크기 표식은 비어 있다.
         assert_eq!(nudge_resize(&s, Duration::from_millis(1)), Ok(NudgeOutcome::Restored));
         assert_eq!(s.parser.lock().unwrap().screen().size(), (30, 100));
         assert_eq!(pty_size(&s), (30, 100));
-        // 너무 작은 화면은 건드리지 않는다(높이 2행 · 너비 1열).
-        s.parser.lock().unwrap().set_size(2, 80);
+        assert_eq!(s.resize_gate.lock().unwrap().nudge_origin, None);
+        assert_eq!(current_size_for_resize(&s), (30, 100), "흔들기 밖에서는 파서 크기");
+        // 너무 작은 화면은 건드리지 않는다(높이 3행 이하 · 너비 1열).
+        s.parser.lock().unwrap().set_size(3, 80);
         assert!(nudge_resize(&s, Duration::from_millis(1)).is_err());
+        assert_eq!(pty_size(&s), (30, 100), "거부는 PTY 를 건드리지 않는다");
         s.parser.lock().unwrap().set_size(24, 1);
         assert!(nudge_resize(&s, Duration::from_millis(1)).is_err());
         let _ = s.child.lock().unwrap().kill();

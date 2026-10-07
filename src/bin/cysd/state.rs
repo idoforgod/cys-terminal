@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::broadcast;
 
-const SCROLLBACK_LINES: usize = 10_000;
+pub(crate) const SCROLLBACK_LINES: usize = 10_000;
 pub const DEFAULT_ROWS: u16 = 35;
 pub const DEFAULT_COLS: u16 = 120;
 
@@ -1966,14 +1966,17 @@ pub struct Surface {
     /// ★(0.14.45 · F2-A1) 크기 변경 직렬화 — 값은 **바깥(GUI `surface.resize`) 크기 변경의 세대**다. PTY(master) 크기와
     /// 파서 크기는 두 단계라 원자적이지 않다: 재동기 스레드의 '줄이기'·'대조+되돌리기' 와 GUI 의 변경이 엇갈리면 최종
     /// PTY 크기가 파서·xterm 과 어긋나거나 GUI 크기가 사라진다. 그래서 **모든** 크기 변경은 이 락을 쥔 채 두 단계를
-    /// 한 번에 한다([`crate::repaint::apply_resize`] · [`crate::repaint::nudge_resize`]). 바깥 변경은 세대를 올리고,
-    /// 재동기는 자기 세대를 기억해 그 사이 바깥 변경이 있었으면 되돌리지 않는다. 락 순서: resize_serial → master → parser
-    /// (master·parser 는 그 안에서 따로·잠깐씩). 잠든 사이(settle)에는 쥐지 않는다.
-    pub resize_serial: Mutex<u64>,
+    /// 한 번에 한다([`crate::repaint::apply_resize`] · [`crate::repaint::nudge_resize`]). 바깥 변경은 세대를 올리고(PTY 가
+    /// 실제로 바뀐 뒤에만), 재동기는 자기 세대를 기억해 그 사이 바깥 변경이 있었으면 되돌리지 않는다. 흔들기 중에는
+    /// 정식 크기(`nudge_origin`)를 들고 있어 치수를 생략한 바깥 변경이 임시 높이를 굳히지 않는다. 락 순서: resize_gate →
+    /// master → parser(master·parser 는 그 안에서 따로·잠깐씩). 잠든 사이(settle)에는 쥐지 않는다.
+    pub resize_gate: Mutex<crate::repaint::ResizeGate>,
     /// ★(0.14.45 · F2-A2) 다시 그리기 요청의 **반향 제외 창** 끝 — 흔들기 시작부터 되돌린 뒤 [`crate::repaint::REPAINT_ECHO_AFTER_MS`]
     /// 까지 이 좌석의 출력은 건강 룰(`run_health_rules`)·회상 색인(`persist_for_recall`)을 타지 않는다. 다시 그려진 화면은
     /// **옛 줄의 재방송**이라(이미 처리한 "rate limit"·"Error" 줄) 경보·조치 바인딩(큐 일시정지)을 다시 당기고 색인을
-    /// 중복시킨다(치명위험 ①). `last_injected` 의 2초 에코 제외와 같은 꼴이다. `None` = 창 없음.
+    /// 중복시킨다(치명위험 ①). `last_injected` 의 2초 에코 제외와 같은 꼴이다. `None` = 창 없음. 최선 노력이다 — 창 안에
+    /// 시작돼 창이 닫힌 뒤 줄바꿈으로 완성되는 미완성 줄 하나는 룰을 탈 수 있고(기존 에코 제외와 같은 한계), 창은 유한해
+    /// 영구 봉인은 없다(상한 60초 · 보통 되돌린 뒤 3초).
     pub repaint_echo_until: Mutex<Option<Instant>>,
     /// ★(T-0147-7 W2 · B6) **각성 래치** — 이 surface 가 처음 `status.set`(=cys set-status)을 보낸
     /// epoch초. 단일 write path = status.set 핸들러의 `get_or_insert`(1회성 래치 · 이후 불변).
@@ -6569,7 +6572,7 @@ impl Daemon {
             last_parser_panic: Mutex::new(None),
             repaint: Mutex::new(crate::repaint::RepaintState::default()),
             repaint_in_flight: AtomicBool::new(false),
-            resize_serial: Mutex::new(0),
+            resize_gate: Mutex::new(crate::repaint::ResizeGate::default()),
             repaint_echo_until: Mutex::new(None),
             // ★W2 B6: 래치는 항상 None 으로 시작한다 — 생성 시점엔 아직 어떤 각성 증거도 없다.
             // restore 경로의 하이드레이션은 surface.create 핸들러가 topology 값으로 명시 주입한다

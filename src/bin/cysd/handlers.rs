@@ -6720,11 +6720,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     &format!("surface {sid} not found"),
                 ));
             };
-            // 미제공 시 현재 크기 유지 (surface 조회 후 fallback 계산)
-            let (cur_rows, cur_cols) = {
-                let parser = surface.parser.lock().unwrap_or_else(|e| e.into_inner());
-                parser.screen().size()
-            };
+            // 미제공 시 현재 크기 유지 (surface 조회 후 fallback 계산) — ★(0.14.45 · F2-A1) 재동기 흔들기 중이면 파서의
+            //   임시 높이(rows-1)가 아니라 정식 크기를 읽는다(너비만 바꾸는 GUI 변경이 흔들린 높이를 굳히는 경로 차단).
+            let (cur_rows, cur_cols) = crate::repaint::current_size_for_resize(&surface);
             let rows = match param_dim(&params, "rows", cur_rows, MAX_ROWS) {
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "invalid_params", &e)),
@@ -6733,7 +6731,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "invalid_params", &e)),
             };
-            // ★(0.14.45 · F2-A1) PTY · 파서 두 단계를 좌석 `resize_serial` 락 아래에서 한 번에 한다 — 재동기 스레드
+            // ★(0.14.45 · F2-A1) PTY · 파서 두 단계를 좌석 `resize_gate` 락 아래에서 한 번에 한다 — 재동기 스레드
             //   (`repaint::nudge_resize` · 크기 흔들기)와 엇갈려 끝 크기가 어긋나거나 GUI 크기가 사라지는 경합 차단.
             //   세대가 오르므로 흔들기 중이던 스레드는 이 크기를 존중하고 되돌리지 않는다.
             match crate::repaint::apply_resize(&surface, rows, cols) {

@@ -1193,15 +1193,20 @@ pub fn defer_agy_statusline_probe() {
     AGY_PROBE_DEFERRED.store(true, std::sync::atomic::Ordering::Release);
 }
 
-/// (B1) cysd 가 소켓을 바인드한 뒤(별도 스레드 · 락 0) 부른다 — 미뤄 둔 조정이 있으면 지금 실연 검사까지 한다. 반환 = 돌았는가.
-/// 표식을 내리므로 그 뒤의 설치 경로(런타임 pack-update 등)는 종전처럼 동기다.
-pub fn run_deferred_agy_statusline_reconcile() -> bool {
+/// (B1) cysd 가 소켓을 바인드한 직후 **동기로** 부른다 — 미루기 표식을 내려 그 뒤의 설치 경로(런타임 pack-update 등)가 종전처럼
+/// 동기가 되게 한다(소비 스레드 생성이 실패해도 표식이 남아 뒤 설치가 영영 미뤄지는 경로 차단 — 리뷰 지적 #8).
+pub fn end_agy_statusline_deferral() {
     AGY_PROBE_DEFERRED.store(false, std::sync::atomic::Ordering::Release);
-    if !AGY_RECONCILE_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel) {
-        return false;
-    }
+}
+
+/// (B1) cysd 가 소켓을 바인드한 뒤(별도 스레드 · 락 0) 부른다 — 조정을 **매 부트** 한 번 한다(미뤄 둔 설치가 있었든 없었든).
+/// 설치 뒤 소비 전에 데몬이 죽으면 다음 부트는 팩이 최신이라 설치를 건너뛰므로, 소비를 설치에 묶지 않는다. 이미 연결된 기계·
+/// 전에 연결했던 기계·같은 버전 실패 기록이 있는 기계는 파일 stat 몇 번으로 끝난다(실연 검사 없음). 반환 = 미뤄 둔 설치가 있었는가.
+pub fn run_deferred_agy_statusline_reconcile() -> bool {
+    end_agy_statusline_deferral();
+    let pending = AGY_RECONCILE_PENDING.swap(false, std::sync::atomic::Ordering::AcqRel);
     reconcile_agy_statusline_now();
-    true
+    pending
 }
 
 /// [`reconcile_agy_statusline_at_install`] 의 본체(미루기 표식 무관).
@@ -10138,6 +10143,11 @@ mod tests {
         assert!(run_deferred_agy_statusline_reconcile(), "바인드 뒤 소비 1회");
         assert!(!run_deferred_agy_statusline_reconcile(), "두 번째 소비는 없다");
         // 소비가 표식을 내렸으므로 그 뒤 설치 경로는 종전처럼 동기다(표식 미설정 → pending 도 서지 않는다).
+        reconcile_agy_statusline_at_install();
+        assert!(!run_deferred_agy_statusline_reconcile());
+        // 표식만 내리는 동기 경로 — 그 뒤 설치는 pending 을 세우지 않는다(스레드 생성 실패에도 영영 미뤄지지 않는다).
+        defer_agy_statusline_probe();
+        end_agy_statusline_deferral();
         reconcile_agy_statusline_at_install();
         assert!(!run_deferred_agy_statusline_reconcile());
     }
