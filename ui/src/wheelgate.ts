@@ -197,8 +197,9 @@ export function shouldSuppressWheelWin(s: WinWheelGateState): boolean {
 // 계약: 판정은 순수(DOM·토스트 무관) · pane 키당 **정확히 한 번** · 억제가 아닌 호출은 소비하지 않는다(처음 억제가 걸리는 순간에만 참) ·
 // pane 이 닫히면 `forget` 으로 키를 거둔다(재부착 pane 은 새 pane). 억제 자체(술어 반환값)는 이 안내와 무관하다.
 export const WIN_WHEEL_NOTICE_TITLE = "휠 스크롤 꺼짐";
+// ★(codex 3차 검토 #4) 억제 조건에는 앱 신원이 없다(1049h+1003h 를 켜는 어떤 전체화면 앱이든) — 원인 단정은 "전체화면 프로그램" 으로, 처방은 Claude Code 에 한정한다.
 export const WIN_WHEEL_NOTICE_TEXT =
-  "이 창은 Claude 전체화면 모드라 마우스 휠 스크롤이 꺼져 있습니다 — 그 창에서 /tui default 를 실행하면 다음부터 휠로 스크롤됩니다";
+  "이 창은 전체화면 프로그램(Claude Code 전체화면 모드 등)이 마우스를 가져가 휠 스크롤이 꺼져 있습니다 — Claude Code 라면 그 창에서 /tui default 를 실행하면 다음부터 휠로 스크롤됩니다";
 
 export class WinWheelNoticeGate {
   private readonly shown = new Set<string>();

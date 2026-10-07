@@ -375,7 +375,9 @@ describe("Windows 휠 억제 안내 — pane 당 한 번", () => {
     g.forget("never-seen"); // 없는 키는 무동작
   });
   it("문안 — 한국어 · /tui default 처방 · '다음부터'(지금 당장이 아니라 다음 기동) 를 말한다", () => {
-    expect(WIN_WHEEL_NOTICE_TEXT).toContain("Claude 전체화면 모드");
+    expect(WIN_WHEEL_NOTICE_TEXT).toContain("전체화면 프로그램");
+    expect(WIN_WHEEL_NOTICE_TEXT).toContain("Claude Code 라면"); // (codex #4) 비Claude 앱에도 뜨므로 처방은 Claude 에 한정
+    expect(WIN_WHEEL_NOTICE_TEXT).toContain("휠 스크롤이 꺼져 있습니다");
     expect(WIN_WHEEL_NOTICE_TEXT).toContain("/tui default");
     expect(WIN_WHEEL_NOTICE_TEXT).toContain("다음부터");
     expect(WIN_WHEEL_NOTICE_TITLE.length).toBeGreaterThan(0);

@@ -8959,14 +8959,35 @@ fn probe_failure_note(pack_dir: &std::path::Path) -> String {
 /// 그 좌석은 휠 스크롤이 꺼지므로 **보이게** 한다. 알려진 폴더 = 이 레인의 실소비 폴더 + 부서 팩 agents.json 이 시드한 계정 폴더 + 원장(`~/.cys/claude-tui-written.json`)의 폴더.
 /// 읽기 전용(--fix 없음 · 수리는 사람이 그 pane 에서 `/tui default`). 비-Windows 는 Skip(classic 보장 자체가 Windows 전용).
 fn diag_claude_tui(ctx: &DoctorCtx) -> DiagItem {
-    let mut dirs = vec![ctx.consumed_config_dir.clone()];
-    if let Some(d) = dept_seeded_acct_dir(&ctx.pack_dir) {
-        dirs.push(d);
+    diag_claude_tui_for(&claude_tui_known_dirs(ctx), cfg!(windows))
+}
+
+/// ★(codex 3차 검토 #1) `claude-tui-fullscreen` 이 보는 **알려진 좌석 폴더** — 이 레인 실소비 폴더 · 기본 좌석 폴더 `<state_base>/claude` · 이 팩과 `<state_base>/pack-dept-*`
+/// **전부**의 agents.json 시드 폴더(기동과 같은 env 전개 `resolve_env_value` — `$HOME/.claude-7` 같은 값을 상대 경로로 읽지 않는다) · 원장 폴더. 순서 보존 · 중복은 판독기가 접는다.
+fn claude_tui_known_dirs(ctx: &DoctorCtx) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![ctx.consumed_config_dir.clone(), ctx.state_base.join("claude")];
+    let mut packs = vec![ctx.pack_dir.clone()];
+    if let Ok(rd) = std::fs::read_dir(&ctx.state_base) {
+        let mut depts: Vec<std::path::PathBuf> = rd
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("pack-dept-") && e.path().is_dir())
+            .map(|e| e.path())
+            .collect();
+        depts.sort();
+        packs.extend(depts);
+    }
+    for pack in packs {
+        if let Some(d) = dept_seeded_acct_dir(&pack) {
+            let expanded = resolve_env_value(&d.to_string_lossy());
+            if !expanded.trim().is_empty() {
+                dirs.push(std::path::PathBuf::from(expanded));
+            }
+        }
     }
     if let Some(home) = &ctx.tui_home {
         dirs.extend(cys::claude_tui::ledger_dirs(home));
     }
-    diag_claude_tui_for(&dirs, cfg!(windows))
+    dirs
 }
 
 /// [`diag_claude_tui`] 의 본체(OS 주입 — mac 검체가 Windows 갈래를 잰다).
@@ -32704,7 +32725,21 @@ mod tests {
         let it = diag_claude_tui_for(&dirs, true);
         assert_eq!(it.status, DiagStatus::Warn);
         assert!(it.detail.contains("판독하지 못했다"), "{}", it.detail);
-        // 배선: 기본 ctx(원장 홈 없음)는 실소비 폴더만 — 비-Windows 에서는 Skip · 목록 포함.
+        // ★(codex 3차 검토 #1) 알려진 폴더 수집 — 실소비 + `<state_base>/claude` + 이 팩·모든 pack-dept-* 의 시드 폴더(env 전개 · `$HOME` 상대 경로 금지) + 원장.
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(&ctx.pack_dir).unwrap();
+        std::env::set_var("CYS_TEST_TUI_D7", base.join("home").join(".claude-7").to_str().unwrap());
+        std::fs::write(ctx.pack_dir.join("agents.json"), r#"{"claude":{"env":{"CLAUDE_CONFIG_DIR":"${CYS_TEST_TUI_D7:-/nope}"}}}"#).unwrap();
+        let d1 = base.join("pack-dept-d1");
+        std::fs::create_dir_all(&d1).unwrap();
+        std::fs::write(d1.join("agents.json"), format!(r#"{{"claude":{{"cmd":"CLAUDE_CONFIG_DIR=\"{}\" claude"}}}}"#, base.join("home").join(".claude-8").display())).unwrap();
+        let known = claude_tui_known_dirs(&ctx);
+        std::env::remove_var("CYS_TEST_TUI_D7");
+        assert!(known.contains(&base.to_path_buf()) && known.contains(&base.join("claude")), "{known:?}");
+        assert!(known.contains(&base.join("home").join(".claude-7")), "env 전개된 시드 폴더: {known:?}");
+        assert!(known.contains(&base.join("home").join(".claude-8")), "모든 pack-dept-* 의 시드 폴더: {known:?}");
+        assert!(!known.iter().any(|d| d.to_string_lossy().contains("${")), "미전개 경로 없음: {known:?}");
+        // 배선: 기본 ctx(원장 홈 없음) — 비-Windows 에서는 Skip · 목록 포함.
         let items = run_doctor_diagnostics(&doctor_ctx_at(&base), false);
         let it = items.iter().find(|i| i.name == "claude-tui-fullscreen").expect("진단 목록에 없다");
         assert_eq!(it.status, if cfg!(windows) { DiagStatus::Ok } else { DiagStatus::Skip });

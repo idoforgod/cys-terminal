@@ -267,6 +267,23 @@ fn windows_userprofile_script(pack: &str, home: &str) -> Option<String> {
     Some(format!("%USERPROFILE%\\{}\\hooks\\{SCRIPT_CMD}", rest.trim_end_matches('\\')))
 }
 
+/// ★(codex 3차 검토 #3 · 순수) 검증한 홈이 **실제 `%USERPROFILE%` 전개값**과 같은 폴더인가 — `%USERPROFILE%` 꼴은 cmd 가 env 로 전개하므로 `dirs::home_dir()`
+/// (윈도우 프로필 API)와 env 가 다르면 검증한 폴더가 아닌 곳의 래퍼를 부른다. 다르거나 env 가 없으면 거짓(= 그 꼴을 쓰지 않는다 · 평문 경로 규칙으로 돌아간다).
+/// 비교는 역슬래시·`\\?\` 접두·끝 구분자를 접고 ASCII 대소문자를 무시한다(비ASCII 는 그대로).
+pub fn home_matches_userprofile(home: &str, userprofile: Option<&str>) -> bool {
+    let norm = |p: &str| -> String {
+        let p = p.trim().replace('/', "\\");
+        let p = p.strip_prefix(r"\\?\").unwrap_or(&p);
+        p.trim_end_matches('\\').to_string()
+    };
+    let Some(up) = userprofile.map(norm).filter(|u| !u.is_empty()) else {
+        return false;
+    };
+    let h = norm(home);
+    h.chars().count() == up.chars().count()
+        && h.chars().zip(up.chars()).all(|(a, b)| a == b || (a.is_ascii() && b.is_ascii() && a.eq_ignore_ascii_case(&b)))
+}
+
 /// 연결 명령 문자열(순수 · OS 규칙 주입) — 홈을 모르는 판([`link_command_for_home`] 의 `home = None`).
 pub fn link_command_for(pack_dir: &str, windows: bool, marker: bool) -> Option<String> {
     link_command_for_home(pack_dir, windows, marker, None)
@@ -1002,11 +1019,12 @@ fn write_record(record: &Path, settings: &Path) {
 /// statusLine 칸이 비어 있거나 없을 때만 cys 연결을 넣는다. `force` = '연결한 적 있음' 기록을 무시한다
 /// (사람이 부른 `cys doctor --fix` 만 쓴다 — 설치 경로는 false).
 pub fn ensure_linked(ctx: &Ctx, force: bool) -> Outcome {
-    ensure_linked_cmd(
-        ctx,
-        force,
-        link_command_for_home(&ctx.pack_dir.to_string_lossy(), ctx.windows, true, ctx.home.map(|h| h.to_string_lossy()).as_deref()),
-    )
+    // ★(codex 3차 검토 #3) `%USERPROFILE%` 꼴은 홈이 실제 env 전개값과 같을 때만 — 다르면 홈을 모르는 것으로 둔다(평문 경로 규칙 · 비ASCII 면 UnsafePath).
+    let home = ctx
+        .home
+        .map(|h| h.to_string_lossy().into_owned())
+        .filter(|h| !ctx.windows || home_matches_userprofile(h, std::env::var("USERPROFILE").ok().as_deref()));
+    ensure_linked_cmd(ctx, force, link_command_for_home(&ctx.pack_dir.to_string_lossy(), ctx.windows, true, home.as_deref()))
 }
 
 /// [`ensure_linked`] 의 본체 — 넣을 명령을 인자로 받는다(시험 이음매: 맥 샌드박스 파일로 윈도우 꼴 명령의 흐름을 잰다).
@@ -1335,6 +1353,10 @@ mod tests {
                 assert_eq!(got, None, "{why}: {got:?}");
             }
         }
+        // (codex 3차 검토 #3) 검증한 홈 = 실제 %USERPROFILE% 일 때만 그 꼴을 쓴다 — 표기 차이는 접고 · 다른 폴더·env 없음은 거짓.
+        assert!(home_matches_userprofile(home, Some(r"c:\users\홍길동\")) && home_matches_userprofile("C:/Users/홍길동", Some(r"\\?\C:\Users\홍길동")));
+        assert!(!home_matches_userprofile(home, Some(r"D:\다른홈")) && !home_matches_userprofile(home, None) && !home_matches_userprofile(home, Some("")));
+        assert!(!home_matches_userprofile(r"C:\Users\홍길동", Some(r"C:\Users\홍길순")), "비ASCII 는 그대로 비교");
         // 그 꼴은 cys 자동 연결로 인식되고(제거 경로 OS 무관) · Go 인용은 공백 때문에 통째 따옴표(cmd 가 벗긴 뒤 %USERPROFILE% 전개).
         let up = r"%USERPROFILE%\.cys\pack\hooks\cys-agy-statusline.cmd --cys-autolink";
         assert!(command_is_ours_auto(up) && command_is_cys(up) && !command_is_legacy_windows_sh(up));
