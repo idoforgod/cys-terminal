@@ -3430,7 +3430,7 @@ async fn handle_connection_capped(
                             &format!("surface {surface_id} closed"),
                         );
                     };
-                    let (lines, start) = {
+                    let (lines, start, echo) = {
                         // ★레이스 차단: scrollback 락을 먼저 잡고 그 안에서 line_count를 읽는다
                         // (writer가 push·fetch_add를 같은 락 아래 수행 — total/sb.len 일관 관측).
                         let sb = surface.scrollback.lock().unwrap_or_else(|e| e.into_inner());
@@ -3441,15 +3441,12 @@ async fn handle_connection_capped(
                         let start = cursor.max(oldest);
                         let skip = (start - oldest) as usize;
                         let lines: Vec<String> = sb.iter().skip(skip).cloned().collect();
-                        (lines, start)
+                        // ★(0.14.45 · 성찰 2회차 M1-a) 다시 그리기 요청의 반향 줄 구간 — 같은 락 아래에서 읽어 줄과 구간이 한 관측이다.
+                        let echo = crate::repaint::echo_ranges(&surface);
+                        (lines, start, echo)
                     };
-                    let mut matched = None;
-                    for (i, line) in lines.iter().enumerate() {
-                        if pattern.is_match(line) {
-                            matched = Some((start + i as u64, line.clone()));
-                            break;
-                        }
-                    }
+                    // 반향 구간(다시 그려진 옛 줄의 재방송)은 건너뛴다 — 옛 "완료" 표지에 거짓 일치하지 않는다.
+                    let matched = crate::repaint::wait_for_match(&lines, start, &echo, &pattern);
                     cursor = start + lines.len() as u64;
                     if let Some((line_no, line)) = matched {
                         break cys::ok_response(

@@ -1971,13 +1971,14 @@ pub struct Surface {
     /// 정식 크기(`nudge_origin`)를 들고 있어 치수를 생략한 바깥 변경이 임시 높이를 굳히지 않는다. 락 순서: resize_gate →
     /// master → parser(master·parser 는 그 안에서 따로·잠깐씩). 잠든 사이(settle)에는 쥐지 않는다.
     pub resize_gate: Mutex<crate::repaint::ResizeGate>,
-    /// ★(0.14.45 · F2-A2) 다시 그리기 요청의 **반향 제외 창** 끝 — 흔들기 시작부터 되돌린 뒤 [`crate::repaint::REPAINT_ECHO_AFTER_MS`]
-    /// 까지 이 좌석의 출력은 건강 룰(`run_health_rules`)·회상 색인(`persist_for_recall`)을 타지 않는다. 다시 그려진 화면은
-    /// **옛 줄의 재방송**이라(이미 처리한 "rate limit"·"Error" 줄) 경보·조치 바인딩(큐 일시정지)을 다시 당기고 색인을
-    /// 중복시킨다(치명위험 ①). `last_injected` 의 2초 에코 제외와 같은 꼴이다. `None` = 창 없음. 최선 노력이다 — 창 안에
-    /// 시작돼 창이 닫힌 뒤 줄바꿈으로 완성되는 미완성 줄 하나는 룰을 탈 수 있고(기존 에코 제외와 같은 한계), 창은 유한해
-    /// 영구 봉인은 없다(상한 60초 · 보통 되돌린 뒤 3초).
-    pub repaint_echo_until: Mutex<Option<Instant>>,
+    /// ★(0.14.45 · F2-A2 · 성찰 2회차 M1) 다시 그리기 요청의 **반향 제외 창**([`crate::repaint::RepaintEcho`]) — 흔들기 시작부터 되돌린 뒤
+    /// 출력이 [`crate::repaint::REPAINT_ECHO_QUIET_MS`] 이상 조용해질 때까지(상한 [`crate::repaint::REPAINT_ECHO_CAP_SECS`]) 이 좌석의 출력은
+    /// 건강 룰(`run_health_rules`)·회상 색인(`persist_for_recall`)을 타지 않는다. 다시 그려진 화면은 **옛 줄의 재방송**이라(이미 처리한
+    /// "rate limit"·"Error" 줄) 경보·조치 바인딩(큐 일시정지)을 다시 당기고 색인을 중복시킨다(치명위험 ①). `last_injected` 의 2초 에코
+    /// 제외와 같은 꼴이다. 창 안에 줄 버퍼로 들어온 줄 번호 구간은 창이 닫힌 뒤에도 남아 `surface.wait_for`·델타 read 가 건너뛴다.
+    /// 최선 노력이다 — 창 안에 시작돼 창이 닫힌 뒤 줄바꿈으로 완성되는 미완성 줄 하나는 룰을 탈 수 있고(기존 에코 제외와 같은 한계),
+    /// 창은 유한해 영구 봉인은 없다. leaf 락.
+    pub repaint_echo: Mutex<crate::repaint::RepaintEcho>,
     /// ★(T-0147-7 W2 · B6) **각성 래치** — 이 surface 가 처음 `status.set`(=cys set-status)을 보낸
     /// epoch초. 단일 write path = status.set 핸들러의 `get_or_insert`(1회성 래치 · 이후 불변).
     ///
@@ -6585,7 +6586,7 @@ impl Daemon {
             repaint: Mutex::new(crate::repaint::RepaintState::default()),
             repaint_in_flight: AtomicBool::new(false),
             resize_gate: Mutex::new(crate::repaint::ResizeGate::default()),
-            repaint_echo_until: Mutex::new(None),
+            repaint_echo: Mutex::new(crate::repaint::RepaintEcho::default()),
             // ★W2 B6: 래치는 항상 None 으로 시작한다 — 생성 시점엔 아직 어떤 각성 증거도 없다.
             // restore 경로의 하이드레이션은 surface.create 핸들러가 topology 값으로 명시 주입한다
             // (여기서 유추하지 않는다 — 유추는 곧 위양성 래치이고, 그건 재주입 스킵 오판이 된다).
@@ -6905,6 +6906,9 @@ impl Daemon {
     /// 청크 경계 안전: 미완성 ESC 시퀀스·UTF-8 멀티바이트 꼬리는 다음 청크와 합쳐 처리한다
     /// (경계에서 한글 파괴·escape 잔재 혼입 차단).
     fn ingest_output(&self, surface: &Surface, chunk: &[u8]) {
+        // ★(0.14.45 · 성찰 2회차 M1) 반향 제외 창 — 청크 도착마다 한 번 묻는다(창의 끝은 '되돌린 뒤 출력 정적 1초' 라 도착 시각이 재료다).
+        //   참이면 이 청크의 완성 줄은 재방송이다 — 아래에서 줄 번호 구간을 기억해 wait_for·델타 read 가 건너뛴다. leaf 락 · 다른 락 없이.
+        let echo = crate::repaint::echo_note_output(surface, Instant::now());
         let mut st = surface.ingest.lock().unwrap();
         st.carry.extend_from_slice(chunk);
         let mut cut = st.carry.len();
@@ -6968,9 +6972,14 @@ impl Daemon {
             // 읽으므로, push(N)과 fetch_add(N)이 분리되면 '증가 전 total + push 후 sb.len()'을
             // 관측하는 인터리빙으로 oldest가 N 작아져 skip이 N 과도해지고 최신 N라인을 건너뛴다.
             // 둘을 같은 락 아래로 묶어 reader가 (sb.len, line_count)를 항상 일관되게 본다.
-            surface
+            let before = surface
                 .line_count
                 .fetch_add(completed.len() as u64, Ordering::Relaxed);
+            // ★(M1-a) 반향 창 안의 완성 줄은 번호 구간으로 기억한다 — 같은 scrollback 락 아래라 wait_for·델타 read(락 안에서 구간을 읽는다)가
+            //   '줄은 보이는데 구간은 아직' 인 틈을 보지 않는다. 락 순서: scrollback → repaint_echo(leaf).
+            if echo {
+                crate::repaint::echo_record_lines(surface, before, before + completed.len() as u64);
+            }
             drop(sb);
             self.persist_for_recall(surface, &completed);
             self.run_health_rules(surface, &completed);
@@ -6978,17 +6987,9 @@ impl Daemon {
     }
 
     /// ★(0.14.45 · F2-A2) 다시 그리기 요청의 반향 제외 창 안인가 — 창 안이면 건강 룰·회상 색인을 건너뛴다(사유는
-    /// `Surface::repaint_echo_until` doc). 창이 지났으면 지워 둔다(이후 락 1회 비용 0).
+    /// `Surface::repaint_echo` doc). 창이 지났으면 지워 둔다(이후 락 1회 비용 0).
     pub(crate) fn repaint_echo_active(surface: &Surface) -> bool {
-        let mut g = surface.repaint_echo_until.lock().unwrap_or_else(|e| e.into_inner());
-        match *g {
-            Some(t) if Instant::now() < t => true,
-            Some(_) => {
-                *g = None;
-                false
-            }
-            None => false,
-        }
+        crate::repaint::echo_active(surface)
     }
 
     /// FTS 영속: 의미 있는 라인만 (3자 미만·연속 중복 스킵 — TUI 리드로우 노이즈 억제).
@@ -7029,7 +7030,7 @@ impl Daemon {
             }
         }
         // ★(0.14.45 · F2-A2) 다시 그리기 요청(크기 흔들기)의 반향 창 — 다시 그려진 화면은 옛 줄의 재방송이라 룰을 타지 않는다
-        //   (옛 "rate limit"·"Error" 줄이 경보·조치 바인딩을 다시 당기는 폭주 ① 차단). 창 = 흔들기 시작 ~ 되돌린 뒤 3초.
+        //   (옛 "rate limit"·"Error" 줄이 경보·조치 바인딩을 다시 당기는 폭주 ① 차단). 창 = 흔들기 시작 ~ 되돌린 뒤 출력 정적 1초(상한 60초).
         if Self::repaint_echo_active(surface) {
             return;
         }
@@ -9814,21 +9815,53 @@ mod tests {
     #[test]
     fn repaint_echo_window_mutes_health_rules_and_recall_then_expires() {
         let (daemon, s) = health_probe_daemon("repaint-echo");
-        // 창 열림(흔들기 중) — 경보 0 · 색인 0(마지막 색인 줄 불변).
-        *s.repaint_echo_until.lock().unwrap() = Some(Instant::now() + std::time::Duration::from_secs(3));
+        let start = s.line_count.load(Ordering::Relaxed);
+        // 창 열림(흔들기 중 — 되돌리기 전) — 경보 0 · 색인 0(마지막 색인 줄 불변).
+        s.repaint_echo.lock().unwrap().cap_until = Some(Instant::now() + std::time::Duration::from_secs(3));
         let before = s.last_recall_line.lock().unwrap().clone();
         let fired = feed_lines_collect_alerts(&daemon, &s, REAL_FAILURE_LINES);
         assert!(fired.is_empty(), "반향 창 안의 재방송 줄은 경보가 아니다: {fired:?}");
         assert_eq!(*s.last_recall_line.lock().unwrap(), before, "반향 창 안의 줄은 회상 색인에 들어가지 않는다");
-        assert!(s.repaint_echo_until.lock().unwrap().is_some(), "창은 아직 열려 있다");
-        // 줄 버퍼(scrollback)·줄 계수는 그대로 쌓인다 — 창은 룰·색인만 가린다(화면 판독·델타 read 는 계속된다).
-        assert!(s.line_count.load(Ordering::Relaxed) >= REAL_FAILURE_LINES.len() as u64);
-        // 창 닫힘(과거) — 같은 줄이 경보를 낸다 · 창 표식은 지워진다.
-        *s.repaint_echo_until.lock().unwrap() = Some(Instant::now() - std::time::Duration::from_millis(1));
+        assert!(s.repaint_echo.lock().unwrap().cap_until.is_some(), "창은 아직 열려 있다");
+        // 줄 버퍼(scrollback)·줄 계수는 그대로 쌓인다 — 창은 룰·색인만 가린다(화면 판독은 계속된다).
+        let after_echo = s.line_count.load(Ordering::Relaxed);
+        assert!(after_echo >= start + REAL_FAILURE_LINES.len() as u64);
+        // ★(성찰 2회차 M1-a) 창 안에 들어온 줄은 번호 구간으로 남는다 — wait_for·델타 read 가 건너뛴다.
+        let ranges = crate::repaint::echo_ranges(&s);
+        assert!((start..after_echo).all(|n| crate::repaint::line_in_echo(&ranges, n)), "창 안의 줄 {start}..{after_echo} 가 구간에 없다: {ranges:?}");
+        // 창 닫힘(과거) — 같은 줄이 경보를 낸다 · 창 표식은 지워진다 · 새 줄은 구간 밖이다 · 옛 구간은 남는다.
+        s.repaint_echo.lock().unwrap().cap_until = Some(Instant::now() - std::time::Duration::from_millis(1));
         let fired = feed_lines_collect_alerts(&daemon, &s, REAL_FAILURE_LINES);
         assert!(!fired.is_empty(), "창이 닫히면 진짜 고장은 경보를 낸다");
-        assert!(s.repaint_echo_until.lock().unwrap().is_none(), "지난 창은 지운다");
+        assert!(s.repaint_echo.lock().unwrap().cap_until.is_none(), "지난 창은 지운다");
         assert_ne!(*s.last_recall_line.lock().unwrap(), before, "창 밖의 줄은 색인된다");
+        let after_all = s.line_count.load(Ordering::Relaxed);
+        let ranges = crate::repaint::echo_ranges(&s);
+        assert!((after_echo..after_all).all(|n| !crate::repaint::line_in_echo(&ranges, n)), "창 밖의 줄이 구간에 들었다: {ranges:?}");
+        assert!(crate::repaint::line_in_echo(&ranges, start), "닫힌 창의 구간은 남는다(재방송 줄은 계속 건너뛴다)");
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// ★(성찰 2회차 M1-a) 되돌린 뒤의 재방송이 종전 고정 3초를 넘어도 창 안이다 — 실제 좌석에 '되돌린 뒤 2.5초 · 4초' 시점의 줄을 흉내 내 넣으면
+    /// (출력이 0.5초 간격으로 이어진 것으로) 둘 다 룰을 타지 않고 구간에 남는다. 정적 1초 뒤의 줄은 룰을 탄다(창 닫힘).
+    #[test]
+    fn repaint_echo_window_follows_long_replay_then_closes_on_quiet() {
+        let (daemon, s) = health_probe_daemon("repaint-echo-long");
+        let t0 = Instant::now();
+        {
+            let mut e = s.repaint_echo.lock().unwrap();
+            e.cap_until = Some(t0 + std::time::Duration::from_secs(crate::repaint::REPAINT_ECHO_CAP_SECS));
+            e.restored_at = Some(t0 - std::time::Duration::from_secs(4)); // 4초 전에 되돌렸다
+            e.last_output = Some(t0 - std::time::Duration::from_millis(100)); // 재방송이 0.1초 전까지 이어졌다
+        }
+        let fired = feed_lines_collect_alerts(&daemon, &s, REAL_FAILURE_LINES);
+        assert!(fired.is_empty(), "되돌린 뒤 4초가 지났어도 재방송이 이어지는 동안은 창 안이다: {fired:?}");
+        assert!(!crate::repaint::echo_ranges(&s).is_empty());
+        // 정적 1초 — 다음 줄은 창 밖.
+        s.repaint_echo.lock().unwrap().last_output = Some(Instant::now() - std::time::Duration::from_millis(crate::repaint::REPAINT_ECHO_QUIET_MS + 1));
+        let fired = feed_lines_collect_alerts(&daemon, &s, REAL_FAILURE_LINES);
+        assert!(!fired.is_empty(), "정적 1초 뒤의 줄은 재방송이 아니다");
+        assert!(s.repaint_echo.lock().unwrap().cap_until.is_none());
         let _ = s.child.lock().unwrap().kill();
     }
 

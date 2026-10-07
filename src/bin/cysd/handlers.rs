@@ -6659,7 +6659,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 // writer(state.rs)가 push(N)과 fetch_add(N)을 같은 락 아래에서 수행하므로,
                 // 락 보유 중 읽으면 (sb.len, total)이 항상 일관 — oldest/skip 오프셋 어긋남 차단.
                 // ★스냅샷 값만 꺼내고 락은 **이 블록에서 놓는다** — quiet 표본은 락 밖에서(중첩 0).
-                let (lines, start, next_cursor, total, truncated) = {
+                let (lines, start, next_cursor, total, truncated, echo) = {
                     let sb = surface.scrollback.lock().unwrap_or_else(|e| e.into_inner());
                     let total = surface.line_count.load(Ordering::Relaxed);
                     let oldest = total.saturating_sub(sb.len() as u64); // sb[0]의 라인 번호
@@ -6668,15 +6668,28 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     let skip = (start - oldest) as usize;
                     let lines: Vec<String> = sb.iter().skip(skip).take(max_lines).cloned().collect();
                     let next_cursor = start + lines.len() as u64;
-                    (lines, start, next_cursor, total, truncated)
+                    // ★(0.14.45 · 성찰 2회차 M1-a) 다시 그리기 요청의 반향 줄 구간 — 같은 락 아래 한 관측(ingest 가 같은 락 아래 기록한다).
+                    let echo = crate::repaint::echo_ranges(&surface);
+                    (lines, start, next_cursor, total, truncated, echo)
                 };
+                // 반향 구간(다시 그려진 옛 줄의 재방송)은 델타 본문에서 뺀다 — 옛 오류·완료 줄이 `since_line` 뒤의 새 사실로 보이지 않게.
+                //   커서 셈(`since`·`next_cursor`·`latest_cursor`)은 종전 그대로(번호는 빠진 줄을 포함해 매겨진다) · 뺀 줄 수는 `repaint_echo_skipped`.
+                let kept: Vec<&String> = lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !crate::repaint::line_in_echo(&echo, start + *i as u64))
+                    .map(|(_, l)| l)
+                    .collect();
+                let skipped = lines.len() - kept.len();
+                let text = kept.iter().map(|l| l.as_str()).collect::<Vec<_>>().join("\n");
                 let quiet_secs = quiet_secs_consistent(&surface, gen_before);
                 return Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "surface_ref": surface_ref(sid),
-                           "text": lines.join("\n"), "line_count": lines.len(),
+                           "text": text, "line_count": kept.len(),
                            "since": start, "next_cursor": next_cursor,
                            "latest_cursor": total, "truncated": truncated,
+                           "repaint_echo_skipped": skipped,
                            "quiet_secs": quiet_secs}),
                 ));
             }
@@ -12151,6 +12164,55 @@ mod tests {
                 );
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// ★(0.14.45 · 성찰 2회차 M1-a) `surface.read_text since_line` 델타는 다시 그리기 요청의 **반향 줄 구간**을 본문에서 뺀다 — 재방송된 옛 오류·완료 줄이
+    /// `since_line` 뒤의 새 사실로 보이지 않게. 커서 셈(`since`·`next_cursor`·`latest_cursor`)은 종전 그대로이고 뺀 줄 수는 `repaint_echo_skipped` 로 보인다.
+    /// 구간이 없으면(보통) 종전 응답과 같다(`repaint_echo_skipped: 0`). `surface.wait_for` 의 한 회전(`wait_for_match`)도 같은 구간을 건너뛴다.
+    #[test]
+    fn read_text_delta_skips_repaint_echo_lines() {
+        let dir = std::env::temp_dir().join(format!("cys-echo-delta-{}-{}", std::process::id(), crate::state::now_epoch() as u64));
+        let _ = std::fs::create_dir_all(&dir);
+        let daemon = Daemon::new(dir.join("cysd.sock"));
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("worker-echo".into()), 24, 80)
+            .expect("create surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        // 줄 버퍼 6줄(0..6) — 2·3·4 는 반향 구간(다시 그려진 옛 줄의 재방송).
+        {
+            let mut sb = s.scrollback.lock().unwrap();
+            for l in ["one", "two", "Error: old failure", "DONE marker", "five", "six"] {
+                sb.push_back(l.to_string());
+            }
+            s.line_count.store(6, Ordering::Relaxed);
+            s.repaint_echo.lock().unwrap().record_lines(2, 5);
+        }
+        let read = |since: u64| -> serde_json::Value {
+            let req = Request { id: json!(1), method: "surface.read_text".into(), params: json!({"surface_id": s.id, "since_line": since}) };
+            let Reply::Single(resp) = dispatch(&daemon, req, None) else { panic!("single reply") };
+            assert_eq!(resp["ok"], json!(true), "read_text 실패: {resp}");
+            resp["result"].clone()
+        };
+        let r = read(0);
+        assert_eq!(r["text"], json!("one\ntwo\nsix"), "{r}");
+        assert_eq!((r["line_count"].clone(), r["repaint_echo_skipped"].clone()), (json!(3), json!(3)));
+        assert_eq!((r["since"].clone(), r["next_cursor"].clone(), r["latest_cursor"].clone()), (json!(0), json!(6), json!(6)), "커서 셈은 종전 그대로");
+        let r = read(3);
+        assert_eq!((r["text"].clone(), r["repaint_echo_skipped"].clone(), r["next_cursor"].clone()), (json!("six"), json!(2), json!(6)));
+        // 구간 밖만 읽으면 종전과 같다.
+        let r = read(5);
+        assert_eq!((r["text"].clone(), r["line_count"].clone(), r["repaint_echo_skipped"].clone()), (json!("six"), json!(1), json!(0)));
+        // wait_for 의 한 회전 — 반향 구간의 "DONE" 은 일치가 아니다 · 구간 밖의 같은 표지는 일치다.
+        let lines: Vec<String> = s.scrollback.lock().unwrap().iter().cloned().collect();
+        let echo = crate::repaint::echo_ranges(&s);
+        let re = regex::Regex::new("DONE").unwrap();
+        assert_eq!(crate::repaint::wait_for_match(&lines, 0, &echo, &re), None, "재방송된 옛 완료 표지에 거짓 일치했다");
+        assert_eq!(crate::repaint::wait_for_match(&lines, 0, &[], &re), Some((3, "DONE marker".to_string())), "구간이 없으면 종전과 같다");
+        let mut lines2 = lines.clone();
+        lines2.push("DONE again".into());
+        assert_eq!(crate::repaint::wait_for_match(&lines2, 0, &echo, &re), Some((6, "DONE again".to_string())));
+        let _ = s.child.lock().unwrap().kill();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
