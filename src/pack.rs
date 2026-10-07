@@ -1192,7 +1192,14 @@ pub fn reconcile_agy_statusline_at_install() {
         agy::unlink(&settings, Some(&record), agy::Backup::Beside)
     } else {
         agy::ensure_linked(
-            &agy::Ctx { settings: &settings, pack_dir: &pack, record: &record, windows: cfg!(windows) },
+            &agy::Ctx {
+                settings: &settings,
+                pack_dir: &pack,
+                record: &record,
+                windows: cfg!(windows),
+                // 윈도우는 쓰기 직전 실연 검사(콘솔 창 없음 · 5초 상한) — 실패는 결과 한 줄일 뿐 설치는 계속된다.
+                probe: Some(&agy::live_probe),
+            },
             false,
         )
     };

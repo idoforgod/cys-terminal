@@ -2780,6 +2780,23 @@ mod tests {
         let plan3 = build_plan(&r2, &opts);
         assert!(plan3.strip_agy_statusline.is_none());
         assert!(!plan3.report_only.iter().any(|m| m.contains("statusLine")));
+        // ★0.14.45 윈도우 꼴 연결(`…\hooks\cys-agy-statusline.cmd --cys-autolink`)도 같은 규칙 — 표지 달린 것은 외과 제거,
+        //   표지 없는 `.cmd` 연결은 안내만(OS 무관 — 판정은 명령 문자열로 한다).
+        let td4 = test_home("agy-win");
+        let r4 = seed_practice_tree(&td4);
+        let s4 = crate::agy_statusline::settings_path_under(&td4);
+        let win_ours = "{\n  \"statusLine\": {\n    \"type\": \"command\",\n    \"command\": \"C:\\\\Users\\\\x\\\\.cys\\\\pack\\\\hooks\\\\cys-agy-statusline.cmd --cys-autolink\",\n    \"enabled\": true,\n    \"stack_with_default\": true\n  },\n  \"a\": 1\n}\n";
+        touch(&s4, win_ours);
+        let plan4 = build_plan(&r4, &opts);
+        assert_eq!(plan4.strip_agy_statusline.as_deref(), Some(s4.as_path()), "{win_ours}");
+        let rep4 = execute_quarantine(&plan4, &r4, &not_cysd, &no_daemon, &mut noop).unwrap();
+        assert!(rep4.ok(), "{:?}", rep4.failed);
+        assert_eq!(std::fs::read_to_string(&s4).unwrap(), "{\n  \"a\": 1\n}\n");
+        let win_manual = "{\"statusLine\": {\"command\": \"C:\\\\Users\\\\x\\\\.cys\\\\pack\\\\hooks\\\\cys-agy-statusline.cmd\"}}";
+        touch(&s4, win_manual);
+        let plan5 = build_plan(&r4, &opts);
+        assert!(plan5.strip_agy_statusline.is_none());
+        assert!(plan5.report_only.iter().any(|m| m.contains("/statusline delete")), "{:?}", plan5.report_only);
     }
 
     #[test]
