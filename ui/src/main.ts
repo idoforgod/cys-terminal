@@ -168,7 +168,7 @@ import {
   type UsageLine,
   type UsageViewMode,
 } from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보·전 좌석 폴백 집계
-import { accountUsers, buildAcctIndex, buildWsAccountGroups, type SeatAcctSig, type AcctIndex } from "./seatacct"; // ★0.14.45 부서 카드 노드별 계정 줄 · 사용량 패널 역매핑(순수 판정)
+import { buildAcctIndex, buildWsAccountGroups, type SeatAcctSig, type AcctIndex } from "./seatacct"; // ★0.14.45 부서 카드 노드별 계정 줄(순수 판정)
 import { planOfficeTab, repairOutcomeOf, type OfficeCtx } from "./officetab"; // 0.14.44 B5·B6 오피스 탭 안내(순수 판정)
 import { starvedNotice, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
 import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
@@ -4536,7 +4536,7 @@ function renderUsageBar(): void {
       ccAcctLabel, // 🔒 가림(CC 와 같은 키 cys-cc-acct-redact) — 이메일은 툴팁과 겹침 꼬리표에만 나온다(꼬리표도 이 가림을 거친다)
       ccAcctRedact, // 🔒 가림이면 툴팁의 설정 폴더도 끝 이름만(윈도우 절대경로의 OS 사용자명 — 리뷰1 M9)
       usageHidden, // ★0.14.43 뷰어별 숨김 계정 — 후보·줄·요약에서 뺀다(저장소는 main.ts 만 읽는다)
-      { mode: usageMode, fontScale: Number(document.documentElement.style.getPropertyValue("--wsbar-font")) || 1, folded: usageFolded, users: accountUsersNow() }, // ★0.14.44 D1 보기 방식 · 글자 배율(사이드바 배율 변수) · 묶음 접기 · ★0.14.45 역매핑(사용처)
+      { mode: usageMode, fontScale: Number(document.documentElement.style.getPropertyValue("--wsbar-font")) || 1, folded: usageFolded }, // ★0.14.44 D1 보기 방식 · 글자 배율(사이드바 배율 변수) · 묶음 접기
     );
     // 머리줄은 값이 바뀔 때만 건드린다(같은 값 재대입도 호버 중인 요소의 텍스트 노드를 갈아 끼운다).
     const setText = (el: HTMLElement, t: string) => {
@@ -4583,9 +4583,6 @@ function renderUsageBar(): void {
       s.title = USAGE_INUSE_TIP;
       return s;
     };
-    // ★0.14.45 사용처 줄 — 이 계정을 지금 쓰는 부서·노드(없으면 줄 없음). 툴팁은 한 줄에 하나씩.
-    const usersEl = (users: string[] | undefined): HTMLElement | null =>
-      users && users.length ? el("usage-users", `사용처: ${users.join(" · ")}`, `이 계정을 지금 쓰는 부서·노드\n${users.join("\n")}`) : null;
     // ★0.14.44(D1·D2) 막대 상자 하나 — 모든 상자가 같은 DOM 꼴(이름 줄 · 5시간/7일 막대 · 리셋 시각 · 소진 예상)이라 제공자가 달라도 높이가 같다.
     const boxEl = (p: UsagePrimary): HTMLElement => {
       const box = el("usage-primary" + (p.fresh.level === "stale" ? " dim" : ""), "", p.tooltip);
@@ -4619,8 +4616,6 @@ function renderUsageBar(): void {
       }
       if (p.fresh.note) box.appendChild(el("usage-note", p.fresh.note));
       if (p.exhaust) box.appendChild(el("usage-exhaust", p.exhaust));
-      const ub = usersEl(p.users);
-      if (ub) box.appendChild(ub);
       return box;
     };
     // 한 줄형(자동 방식 ∧ 글자 배율 1.6 이상) — 게이지 없이 이름과 두 창의 값만. 사용 중 표지는 줄과 같은 점.
@@ -4635,14 +4630,10 @@ function renderUsageBar(): void {
       const vals = p.windows.map((w) => `${w.label} ${w.text}`).join(" · ");
       txt.textContent = p.fresh.note && p.fresh.level !== "fresh" ? `${vals} (${p.fresh.note})` : vals;
       row.append(lab, txt);
-      const ub = usersEl(p.users);
-      if (!ub) return row;
-      const wrap = el("usage-other-wrap", "");
-      wrap.append(row, ub);
-      return wrap;
+      return row;
     };
     // 계정 한 줄(관측 줄 · 관측 전 줄 · 묶음 안의 줄 공용) — 관측 전 계정도 한 줄씩(0.14.42 — 개수로 접지 않는다). 값 대신 "관측 전·관측 실패 · 사유".
-    const lineEl = (o: UsageLine): HTMLElement | DocumentFragment => {
+    const lineEl = (o: UsageLine): HTMLElement => {
       const row = el("usage-other" + (o.dim ? " dim" : "") + (o.unobserved ? " unobs" : ""), "", o.tooltip);
       const lab = document.createElement("span");
       lab.className = "usage-other-lab";
@@ -4652,11 +4643,7 @@ function renderUsageBar(): void {
       txt.className = "usage-other-txt";
       txt.textContent = o.text;
       row.append(lab, txt);
-      const ub = usersEl(o.users);
-      if (!ub) return row;
-      const frag = document.createDocumentFragment(); // ★0.14.45 줄 아래 사용처 — 줄(flex)의 형제로 둔다(줄의 말줄임 규칙 불변)
-      frag.append(row, ub);
-      return frag;
+      return row;
     };
     // ★0.14.44(D1) 상자들 — 자동 방식에서 계정이 많으면 제공자 묶음(대표 상자 + 나머지 줄 · 묶음은 접을 수 있다), 아니면 boxes 를 순서대로.
     if (model.groups.length) {
@@ -4740,17 +4727,6 @@ function wsAcctIndexCached(): AcctIndex {
 }
 function wsSeatAccts(ws: Workspace): { sid: number; sig: SeatAcctSig | undefined }[] {
   return collectSids(ws.tree).map((sid) => ({ sid, sig: seatAccts.get(`${ws.socket}#${sid}`) }));
-}
-function accountUsersNow(): Map<string, string[]> {
-  try {
-    return accountUsers(
-      workspaces.filter((w) => !w.pending).map((w) => ({ name: deptPlaceholderLabel(w), seats: wsSeatAccts(w) })),
-      Date.now(),
-      SIG_STALE_MS_UI,
-    );
-  } catch {
-    return new Map(); // 표시 전용 — 역매핑이 없을 뿐 패널은 그대로
-  }
 }
 function buildWsAcctLine(ws: Workspace): HTMLElement | null {
   try {

@@ -2,7 +2,6 @@
 import { describe, it, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
-  accountUsers,
   buildAcctIndex,
   buildWsAccountGroups,
   parseSeatAccount,
@@ -129,7 +128,6 @@ describe("부서 카드 — 노드별 계정 묶음", () => {
     expect(g[1].title).toContain("기록된 폴더: .cys/claude");
     expect(g[1].title.includes("불일치")).toBe(false);
     expect(wsAccountLineText(g)).toBe(`claude-4 master · ${SEAT_ACCT_PENDING_LABEL} cso·worker`);
-    expect(accountUsers([{ name: "d", seats: seats(sig("worker", pd)) }], NOW, STALE).size).toBe(0);
     const h = buildWsAccountGroups(seats(sig("worker", { ...pd, profile: "/Users/x/.cys/claude" })), idx, plain, true, NOW, STALE);
     expect(h[0].title.includes("/Users/x")).toBe(false);
   });
@@ -158,7 +156,6 @@ describe("부서 카드 — 노드별 계정 묶음", () => {
     expect(g[2].roles).toEqual(["cso"]);
     // 기록 폴더 이름으로 짐작한 라벨이 본문에 없다 · 역매핑에도 붙지 않는다
     expect(wsAccountLineText(g)).toBe(`claude-4 master · ${SEAT_ACCT_MISMATCH_LABEL} worker · ${SEAT_ACCT_UNKNOWN_LABEL} cso`);
-    expect(accountUsers([{ name: "d", seats: seats(sig("worker", mm)) }], NOW, STALE).size).toBe(0);
     // 🔒 가림이면 툴팁의 기록 폴더도 꼬리표만
     const h = buildWsAccountGroups(seats(sig("worker", { ...mm, profile: "/Users/x/.cys/claude" })), idx, redact, true, NOW, STALE);
     expect(h[0].title.includes("/Users/x")).toBe(false);
@@ -186,33 +183,6 @@ describe("부서 카드 — 노드별 계정 묶음", () => {
     );
     expect(wsAccountLineText(g)).toBe("claude-9 master · Codex rv");
     expect(g[0].title).toContain("(이메일 미확인)");
-  });
-});
-
-describe("역매핑 — 계정 → 부서·노드", () => {
-  const depts = [
-    { name: "CEO", seats: seats(sig("worker", claude("u-4")), sig("master", claude("u-1"))) },
-    { name: "일반저술출판부", seats: seats(sig("master", claude("u-4")), sig("worker", claude("u-4")), sig("cso", { provider: "claude", account_id: null, state: "unread" })) },
-    { name: "심층리서치부", seats: seats(sig("master", claude("u-4"), { exited: true })) },
-  ];
-  it("여러 부서가 한 계정을 쓰면 부서별로 · 미확인·종료 좌석은 어느 계정에도 붙지 않는다", () => {
-    const m = accountUsers(depts, NOW, STALE);
-    expect(m.get("claude:u-4")).toEqual(["CEO worker", "일반저술출판부 master·worker"]);
-    expect(m.get("claude:u-1")).toEqual(["CEO master"]);
-    expect([...m.keys()].sort()).toEqual(["claude:u-1", "claude:u-4"]);
-  });
-  it("사용량 모델이 계정마다 사용처를 싣는다 — 쓰는 곳이 없는 계정은 키 자체가 없다", () => {
-    const users = accountUsers(depts, NOW, STALE);
-    const model = buildUsageBarModel(rows, 2, { everOk: true, failStreak: 0, okAtSec: 2 }, plain, false, undefined, { mode: "one", users });
-    const all = [model.primary, ...model.others].filter(Boolean) as { label: string; users?: string[] }[];
-    const by = new Map(all.map((x) => [x.label, x.users]));
-    expect(by.get("claude-4")).toEqual(["CEO worker", "일반저술출판부 master·worker"]);
-    expect(by.get("claude-1")).toEqual(["CEO master"]);
-    expect(by.has("Codex") && by.get("Codex")).toBe(undefined);
-    for (const x of all) if (x.label !== "claude-4" && x.label !== "claude-1") expect("users" in x).toBe(false);
-    // 인자를 생략하면 종전 모델과 같다(키 없음)
-    const old = buildUsageBarModel(rows, 2, { everOk: true, failStreak: 0, okAtSec: 2 }, plain, false, undefined, { mode: "one" });
-    expect(JSON.stringify(old).includes('"users"')).toBe(false);
   });
 });
 
@@ -268,15 +238,11 @@ describe("배선 핀(main.ts·style.css)", () => {
     expect(lineBody).toContain("wsAcctIndexCached()");
     expect(lineBody.includes("wsAcctIndex()")).toBe(false);
   });
-  it("사용량 패널은 역매핑을 모델 인자로만 받는다(renderUsageBar 안에 nodeSig 0)", () => {
-    expect(src).toContain("users: accountUsersNow()");
-  });
   it("좌석 제거 시 계정 캐시도 지운다", () => {
     expect(src.split("seatAccts.delete(").length - 1).toBe(2);
   });
   it("CSS 와 모듈 불변식(최상위 부수효과·구형 WebKit 비호환 문법 0)", () => {
     expect(css).toContain(".ws-tab .ws-accts");
-    expect(css).toContain("#wsbar-usage .usage-users");
     for (const bad of ["localStorage", "sessionStorage", "document.", "window.", "setTimeout", "setInterval", ".at(", "findLast", "structuredClone", "Object.hasOwn", "replaceAll", "(?<"])
       expect({ bad, 있음: mod.includes(bad) }).toEqual({ bad, 있음: false });
   });

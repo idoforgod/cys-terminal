@@ -237,33 +237,3 @@ function acctTitle(sa: SeatAcct, idx: AcctIndex, label: string, roles: string[],
 export function wsAccountLineText(groups: WsAcctGroup[]): string {
   return groups.map((g) => `${g.label} ${g.roles.join("·")}`).join(" · ");
 }
-
-/** 역매핑 — 계정 키 → `부서이름 역할·역할` 목록(부서 순서 = 입력 순서). 확인된 좌석만 센다(미확인 좌석은 어느 계정에도 붙지 않는다). */
-export function accountUsers(
-  depts: { name: string; seats: { sid: number; sig: SeatAcctSig | undefined }[] }[],
-  nowMs: number,
-  staleMs: number,
-): Map<string, string[]> {
-  const out = new Map<string, string[]>();
-  for (const d of depts) {
-    const per = new Map<string, string[]>();
-    for (const { sid, sig } of d.seats) {
-      if (!sig || sig.exited) continue;
-      const sa = parseSeatAccount(sig, nowMs, staleMs);
-      if (!sa.known) continue;
-      const r = roleShort(sig.role, sid);
-      const l = per.get(sa.key);
-      if (l) l.push(r);
-      else per.set(sa.key, [r]);
-    }
-    for (const [k, roles] of per) {
-      roles.sort(byRole);
-      const name = d.name.trim() || "이름 없는 부서";
-      const l = out.get(k);
-      const item = `${name} ${roles.join("·")}`;
-      if (l) l.push(item);
-      else out.set(k, [item]);
-    }
-  }
-  return out;
-}

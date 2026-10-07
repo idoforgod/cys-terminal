@@ -254,9 +254,6 @@ body.wsbar-resizing { cursor: col-resize; -webkit-user-select: none; user-select
 #wsbar-usage .usage-inuse { flex: none; color: var(--ok); font-weight: 600; font-size: .92em; white-space: nowrap; }
 #wsbar-usage .usage-inuse-dot { color: var(--ok); margin-right: 3px; font-weight: 400; }
 #wsbar-usage .usage-other .usage-other-txt.usage-fold { text-align: left; } /* 잘려 나간 관측 전 계정 나열 — 라벨 목록이라 왼쪽 정렬 */
-/* ★0.14.45 사용처 — 이 계정을 지금 쓰는 부서·노드(역매핑). 줄 아래 작은 글씨 · 길면 줄바꿈. */
-#wsbar-usage .usage-users { margin-top: 1px; color: #8b949e; font-size: .9em; overflow-wrap: anywhere; }
-#wsbar-usage .usage-other + .usage-users { padding-left: 10px; }
 #wsbar-usage .usage-hidden { margin-top: 4px; color: #8b949e; overflow-wrap: anywhere; } /* 숨긴 계정 N — 다시 보이게 하는 곳 안내 */
 /* ★0.14.44 D1 보기 방식 전환 단추 — 머리줄 단추(.usage-head)의 형제(.usage-headrow 안). 같은 줄이라 머리줄 높이를 더 쓰지 않는다(패딩 0 · 줄높이 1.2). */
 #wsbar-usage .usage-headrow { flex: none; display: flex; align-items: center; gap: 4px; min-width: 0; }
