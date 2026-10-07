@@ -23,7 +23,7 @@ impl Grid {
             saved_pos: Pos::default(),
             rows: vec![],
             scroll_top: 0,
-            scroll_bottom: size.rows - 1,
+            scroll_bottom: size.rows.saturating_sub(1),
             origin_mode: false,
             saved_origin_mode: false,
             scrollback: std::collections::VecDeque::new(),
@@ -54,7 +54,7 @@ impl Grid {
             row.clear(crate::attrs::Attrs::default());
         }
         self.scroll_top = 0;
-        self.scroll_bottom = self.size.rows - 1;
+        self.scroll_bottom = self.size.rows.saturating_sub(1);
         self.origin_mode = false;
         self.saved_origin_mode = false;
     }
@@ -70,8 +70,8 @@ impl Grid {
             }
         }
 
-        if self.scroll_bottom == self.size.rows - 1 {
-            self.scroll_bottom = size.rows - 1;
+        if self.scroll_bottom == self.size.rows.saturating_sub(1) {
+            self.scroll_bottom = size.rows.saturating_sub(1);
         }
 
         self.size = size;
@@ -81,7 +81,7 @@ impl Grid {
         self.rows.resize(usize::from(size.rows), self.new_row());
 
         if self.scroll_bottom >= size.rows {
-            self.scroll_bottom = size.rows - 1;
+            self.scroll_bottom = size.rows.saturating_sub(1);
         }
         if self.scroll_bottom < self.scroll_top {
             self.scroll_top = 0;
@@ -114,6 +114,12 @@ impl Grid {
     pub fn restore_cursor(&mut self) {
         self.pos = self.saved_pos;
         self.origin_mode = self.saved_origin_mode;
+        // cys 패치: DECSC 뒤 화면이 줄었으면 저장 위치가 격자 밖이다 — 원본은 다음 그리기에서
+        //   current_row_mut().unwrap()·색인 패닉. 행은 마지막 행으로, 열은 cols(줄 끝 대기 위치)까지로 묶는다.
+        self.row_clamp();
+        if self.pos.col > self.size.cols {
+            self.pos.col = self.size.cols;
+        }
     }
 
     pub fn visible_rows(&self) -> impl Iterator<Item = &crate::row::Row> {
@@ -511,7 +517,8 @@ impl Grid {
         let size = self.size;
         let pos = self.pos;
         let row = self.current_row_mut();
-        for _ in 0..(count.min(size.cols - pos.col)) {
+        // cys 패치: pos.col > cols 언더플로 방지.
+        for _ in 0..(count.min(size.cols.saturating_sub(pos.col))) {
             row.remove(pos.col);
         }
         row.resize(size.cols, crate::cell::Cell::default());
@@ -665,18 +672,17 @@ impl Grid {
     }
 
     pub fn col_wrap(&mut self, width: u16, wrap: bool) {
-        if self.pos.col > self.size.cols - width {
+        // cys 패치: cols < width 일 때 u16 언더플로 방지.
+        if self.pos.col > self.size.cols.saturating_sub(width) {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
-            prev_pos.row -= scrolled;
+            // cys 패치: 크기 변경 뒤 스크롤 영역과 커서가 어긋나도 언더플로·unwrap 패닉 없이 진행한다.
+            prev_pos.row = prev_pos.row.saturating_sub(scrolled);
             let new_pos = self.pos;
-            self.drawing_row_mut(prev_pos.row)
-                // we assume self.pos.row is always valid, and so prev_pos.row
-                // must be valid because it is always less than or equal to
-                // self.pos.row
-                .unwrap()
-                .wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            if let Some(row) = self.drawing_row_mut(prev_pos.row) {
+                row.wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            }
         }
     }
 
@@ -706,14 +712,14 @@ impl Grid {
     }
 
     fn row_clamp(&mut self) {
-        if self.pos.row > self.size.rows - 1 {
-            self.pos.row = self.size.rows - 1;
+        if self.pos.row > self.size.rows.saturating_sub(1) {
+            self.pos.row = self.size.rows.saturating_sub(1);
         }
     }
 
     fn col_clamp(&mut self) {
-        if self.pos.col > self.size.cols - 1 {
-            self.pos.col = self.size.cols - 1;
+        if self.pos.col > self.size.cols.saturating_sub(1) {
+            self.pos.col = self.size.cols.saturating_sub(1);
         }
     }
 }

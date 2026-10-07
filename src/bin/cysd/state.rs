@@ -2969,6 +2969,10 @@ pub fn send_write_req_bounded(
 
 /// (W4) PTY 청크를 vt100 파서에 반영하되, 파서 내부 인덱스 패닉을 격리한다.
 ///
+/// ★(0.14.45) 아래 row89 경로는 벤더 패치(vendor/vt100 — `Row::resize` 가 마지막 칸 넓은 글자 머리를
+/// 지운다 · 짝 칸 접근은 get_mut)로 더는 패닉하지 않는다. 격리는 알려지지 않은 다른 패닉을 위한 마지막
+/// 그물로 남긴다 — 패닉 뒤에는 화면 사본이 비므로 좌석이 다시 그리기 전까지 판독이 어긋난다(F2 재그리기 요청).
+///
 /// vt100 0.15.2는 와이드(CJK·이모지) 문자의 선두 셀이 마지막 열에 놓인 상태에서 그 셀을
 /// 지우거나 덮어쓰면 `row.rs:89 clear_wide`가 `cells[col+1]`을 경계 밖 인덱싱해 패닉한다
 /// (좁은 pane으로의 resize가 선두 와이드 셀을 마지막 열로 밀어내는 경로 — 한국어 CLI 출력에서
@@ -2984,6 +2988,18 @@ pub fn send_write_req_bounded(
 /// 않는다. rows/cols는 process 이전에 포착해 재초기화에 쓰므로(패닉 후 파서 재접근 없음),
 /// 이중 패닉 위험도 없다. `set_size`(escape) 등으로 청크 내 크기 변경이 있었다 해도 패닉 시엔
 /// 그 청크 전체를 폐기하므로 이전 크기 보존이 정합적이다(다음 resize RPC가 최종 정정).
+#[cfg(test)]
+thread_local! {
+    /// 시험 전용: true 면 다음 `process_chunk_isolated` 한 번이 파서 반영 전에 패닉한다(한 번 쓰고 꺼진다).
+    static FORCE_PARSER_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 시험 전용: 이 스레드의 다음 청크 처리 한 번에 파서 패닉을 주입한다.
+#[cfg(test)]
+pub(crate) fn force_parser_panic_once() {
+    FORCE_PARSER_PANIC.with(|f| f.set(true));
+}
+
 fn process_chunk_isolated(
     parser: &mut vt100::Parser,
     chunk: &[u8],
@@ -2992,6 +3008,12 @@ fn process_chunk_isolated(
     // rows/cols를 process '이전'에 포착 — 패닉 후 파서를 재접근하지 않고 fresh 재초기화에 쓴다.
     let (rows, cols) = parser.screen().size();
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // 시험 전용 패닉 주입 — 0.14.45 벤더 패치로 row89 시퀀스가 더는 패닉하지 않으므로, 격리 장치 자체는
+        //   이 훅으로 계속 시험한다(실제 빌드에는 없는 코드다).
+        #[cfg(test)]
+        if FORCE_PARSER_PANIC.with(|f| f.replace(false)) {
+            panic!("시험 주입 파서 패닉");
+        }
         parser.process(chunk);
         // ★G5-④: 질의 수만큼 CPR 응답 — 좌표는 청크 반영 '후' 커서 위치로 동일하다(실단말도
         // 미처리 큐를 소진한 시점에 응답하므로 등가 · ConPTY 목적은 '응답 수 일치'가 본질).
@@ -3115,16 +3137,24 @@ mod dedup_tests {
 
 #[cfg(test)]
 mod panic_isolation_tests {
-    use super::{process_chunk_isolated, SCROLLBACK_LINES};
+    use super::{force_parser_panic_once, process_chunk_isolated, SCROLLBACK_LINES};
 
-    /// row.rs:89 clear_wide OOB 재현 시퀀스: 와이드(CJK) 문자의 선두 셀을 26열 그리드 끝에 놓고
-    /// 25열로 축소하면 선두 와이드 셀이 마지막 열(index 24, len 25)로 밀린다. 그 셀을 덮어쓰면
-    /// vt100 0.15.2가 `cells[col+1]`=cells[25]를 경계 밖 인덱싱해 패닉한다(프로덕션 "len 25 index 25").
-    /// 좁은 pane으로의 resize + 한국어 CLI 출력이라는 실제 경로를 그대로 박제한다.
-    fn drive_row89_panic(parser: &mut vt100::Parser) -> bool {
+    /// row.rs:89 clear_wide OOB 재현 시퀀스(종전 프로덕션 "len 25 index 25"): 와이드(CJK) 문자의 선두 셀을
+    /// 26열 그리드 끝에 놓고 25열로 축소하면 선두 와이드 셀이 마지막 열(index 24, len 25)로 밀린다.
+    /// 그 셀을 덮어쓰면 원본 vt100 0.15.2 가 `cells[25]` 를 짚어 패닉했다. 반환 = 마지막 청크의 panicked.
+    fn drive_row89(parser: &mut vt100::Parser) -> bool {
         process_chunk_isolated(parser, b"\x1b[1;25H", 0);
         process_chunk_isolated(parser, "\u{ac00}".as_bytes(), 0); // '가'(wide)
         parser.set_size(10, 25); // 축소 → 선두 와이드 셀이 마지막 열로
+        let (_, panicked) = process_chunk_isolated(parser, b"\x1b[1;25Ha", 0);
+        panicked
+    }
+
+    /// 격리 장치 시험용: row89 와 같은 상태를 만든 뒤 마지막 청크에 시험 훅으로 패닉을 주입한다.
+    fn drive_forced_panic(parser: &mut vt100::Parser) -> bool {
+        process_chunk_isolated(parser, b"\x1b[1;1Hkeep", 0);
+        parser.set_size(10, 25);
+        force_parser_panic_once();
         let (_, panicked) = process_chunk_isolated(parser, b"\x1b[1;25Ha", 0);
         panicked
     }
@@ -3137,27 +3167,106 @@ mod panic_isolation_tests {
         assert!(p.screen().contents().contains("hello world"));
     }
 
+    /// ★(0.14.45 · F1) 벤더 패치 적색→녹색: row89 시퀀스는 더는 패닉하지 않고 화면도 지워지지 않는다.
+    ///   패치 전에는 panicked=true 이고 화면이 빈 fresh 파서로 갈렸다(같은 줄의 다른 글자까지 소실).
     #[test]
-    fn row89_sequence_is_contained_not_propagated() {
-        // 격리가 없다면 이 시퀀스는 스레드를 죽인다 — catch_unwind가 panicked=true로 흡수해야 한다.
+    fn row89_sequence_no_longer_panics_and_screen_is_preserved() {
         let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
-        let panicked = drive_row89_panic(&mut p);
-        assert!(panicked, "row.rs:89 clear_wide OOB 시퀀스가 격리(패닉 흡수)를 발동해야 한다");
+        process_chunk_isolated(&mut p, b"\x1b[3;1H\xe2\x9d\xaf ready", 0); // 3행 '❯ ready'
+        let panicked = drive_row89(&mut p);
+        assert!(!panicked, "row89 시퀀스가 여전히 패닉한다 — vendor/vt100 패치 소실?");
+        let scr = p.screen();
+        assert_eq!(scr.size(), (10, 25));
+        assert_eq!(scr.cursor_position().0, 0, "커서는 같은 줄(0행)에 머문다");
+        let row0 = scr.contents_between(0, 0, 0, 25);
+        assert!(row0.ends_with('a'), "마지막 칸 머리를 지우고 'a' 를 썼다: {row0:?}");
+        assert!(scr.contents().contains("\u{276f} ready"), "다른 줄(프롬프트)이 보존돼야 한다: {:?}", scr.contents());
+        // 넓은 글자 머리만 남은 칸이 없어야 한다(짝 없는 머리 = 다음 쓰기에서 패닉하던 상태).
+        let last = scr.cell(0, 24).expect("마지막 칸");
+        assert!(!last.is_wide(), "마지막 칸에 짝 없는 넓은 글자 머리가 남았다");
+    }
+
+    /// 축소만으로도 짝 없는 머리가 남지 않는다(Row::resize 패치 직접 핀) · 1열까지 줄여도 패닉 없다.
+    #[test]
+    fn shrink_clears_orphan_wide_head_down_to_one_col() {
+        for cols in (1u16..=25).rev() {
+            let mut p = vt100::Parser::new(4, 26, SCROLLBACK_LINES);
+            let line = "\u{ac00}".repeat(13); // 26칸 꽉 채움
+            let (_, pan) = process_chunk_isolated(&mut p, line.as_bytes(), 0);
+            assert!(!pan);
+            p.set_size(4, cols);
+            let last = p.screen().cell(0, cols - 1).expect("마지막 칸");
+            assert!(!last.is_wide(), "cols={cols}: 마지막 칸에 짝 없는 머리");
+            let (_, pan) = process_chunk_isolated(&mut p, b"\x1b[1;200Hxy\x1b[1;1H\xea\xb0\x80\xea\xb0\x80z", 0);
+            assert!(!pan, "cols={cols}: 축소 뒤 쓰기가 패닉했다");
+        }
+    }
+
+    /// 결정론 난수 스트레스: 넓은 글자·좁은 글자·커서 이동·삽입/삭제/지우기·크기 변경을 섞어도 패치된 파서는
+    ///   패닉하지 않는다(격리 장치에 기대지 않는다). 씨앗 고정 — 실패하면 같은 순서로 재현된다.
+    #[test]
+    fn randomized_wide_char_resize_stress_never_panics() {
+        let mut seed: u64 = 0x0145_0145_dead_beef;
+        let mut next = move |n: u64| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for round in 0..400 {
+            let mut p = vt100::Parser::new(6, 30, SCROLLBACK_LINES);
+            for step in 0..120 {
+                let tok: Vec<u8> = match next(17) {
+                    11 => format!("\x1b[{};{}r", next(7) + 1, next(7) + 1).into_bytes(),
+                    12 => if next(2) == 0 { b"\x1b[?1049h".to_vec() } else { b"\x1b[?1049l".to_vec() },
+                    13 => format!("\x1b[{}L\x1b[{}M", next(3) + 1, next(3) + 1).into_bytes(),
+                    14 => b"\x1bD\x1bM\x1b7\x1b8\x1b[?6h\t\x1b[?6l".to_vec(),
+                    15 => format!("\x1b[{}S\x1b[{}T", next(3), next(3)).into_bytes(),
+                    0 | 1 => "\u{ac00}\u{ac01}".as_bytes().to_vec(),
+                    2 => "\u{1f600}".as_bytes().to_vec(),
+                    3 => b"ab".to_vec(),
+                    4 => format!("\x1b[{};{}H", next(8) + 1, next(40) + 1).into_bytes(),
+                    5 => format!("\x1b[{}@", next(5) + 1).into_bytes(),
+                    6 => format!("\x1b[{}P", next(5) + 1).into_bytes(),
+                    7 => format!("\x1b[{}X", next(5) + 1).into_bytes(),
+                    8 => format!("\x1b[{}K", next(3)).into_bytes(),
+                    9 => b"\r\n\x08".to_vec(),
+                    _ => {
+                        p.set_size(next(6) as u16 + 1, next(32) as u16 + 1);
+                        continue;
+                    }
+                };
+                let (_, pan) = process_chunk_isolated(&mut p, &tok, 0);
+                assert!(!pan, "round={round} step={step}: 패치된 파서가 패닉했다 tok={tok:?}");
+                let _ = p.screen().contents();
+                let _ = p.screen().contents_formatted();
+            }
+        }
+    }
+
+    #[test]
+    fn forced_panic_is_contained_not_propagated() {
+        // 격리가 없다면 패닉은 reader 스레드를 죽인다 — catch_unwind가 panicked=true로 흡수해야 한다.
+        let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
+        let panicked = drive_forced_panic(&mut p);
+        assert!(panicked, "시험 주입 패닉이 격리(패닉 흡수)를 발동해야 한다");
+        // 훅은 한 번만 쏜다 — 다음 청크는 정상.
+        let (_, again) = process_chunk_isolated(&mut p, b"x", 0);
+        assert!(!again, "주입 훅은 한 번 쓰고 꺼져야 한다");
     }
 
     #[test]
     fn reinit_preserves_rows_cols() {
         let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
-        assert!(drive_row89_panic(&mut p));
+        assert!(drive_forced_panic(&mut p));
         // 패닉 직전 크기(축소 후 10x25)를 fresh 파서가 그대로 보존해야 한다.
         assert_eq!(p.screen().size(), (10, 25), "재초기화가 rows/cols를 보존해야 한다");
+        assert!(!p.screen().contents().contains("keep"), "재초기화 = 화면 사본 소실(재그리기 요청의 근거)");
     }
 
     #[test]
     fn parser_survives_and_processes_after_panic() {
         // 격리 후 파서는 계속 동작 — 후속 청크가 정상 반영돼야 한다(reader 배수 지속의 파서측 보증).
         let mut p = vt100::Parser::new(10, 26, SCROLLBACK_LINES);
-        assert!(drive_row89_panic(&mut p));
+        assert!(drive_forced_panic(&mut p));
         let (_, panicked) = process_chunk_isolated(&mut p, b"\x1b[2J\x1b[1;1Halive", 0);
         assert!(!panicked, "재초기화된 파서는 후속 청크를 패닉 없이 반영해야 한다");
         assert!(
@@ -8272,11 +8381,10 @@ mod tests {
         process_chunk_isolated(&mut q, b"\x1b[?2004h", 0);
         mirror_screen_modes(&s, q.screen());
         assert!(s.bracketed_paste.load(Ordering::Relaxed));
-        process_chunk_isolated(&mut q, b"\x1b[1;25H", 0);
-        process_chunk_isolated(&mut q, "\u{ac00}".as_bytes(), 0);
-        q.set_size(10, 25);
+        // (0.14.45) row89 시퀀스는 벤더 패치로 더는 패닉하지 않는다 — 시험 훅으로 패닉을 주입한다.
+        super::force_parser_panic_once();
         let (_, panicked) = process_chunk_isolated(&mut q, b"\x1b[1;25Ha", 0);
-        assert!(panicked, "전제: row.rs:89 패닉 재현");
+        assert!(panicked, "전제: 파서 패닉 격리 발동");
         mirror_screen_modes(&s, q.screen());
         assert!(!s.bracketed_paste.load(Ordering::Relaxed), "재초기화 → false → 원문(종전) 폴백");
         let _ = std::fs::remove_dir_all(&dir);

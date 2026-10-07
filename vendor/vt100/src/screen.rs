@@ -834,7 +834,8 @@ impl Screen {
         // (xterm handles this by introducing the concept of triple width
         // cells, which i really don't want to do).
         let mut wrap = false;
-        if pos.col > size.cols - width {
+        // cys 패치: cols < width 일 때 u16 언더플로 방지.
+        if pos.col > size.cols.saturating_sub(width) {
             let last_cell = self
                 .grid()
                 .drawing_cell(crate::grid::Pos {
@@ -934,21 +935,17 @@ impl Screen {
                 .unwrap()
                 .is_wide_continuation()
             {
-                let prev_cell = self
-                    .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
-                        row: pos.row,
-                        col: pos.col - 1,
-                    })
-                    // pos.row is valid because we assume self.grid().pos() to
-                    // always have a valid row value. pos.col is valid because
-                    // we called col_wrap() immediately before this, which
-                    // ensures that self.grid().pos().col has a valid value.
-                    // pos.col - 1 is valid because the cell at pos.col is a
-                    // wide continuation character, so it must have the first
-                    // half of the wide character before it.
-                    .unwrap();
-                prev_cell.clear(attrs);
+                // cys 패치: 불변식이 깨져 col 0 에 continuation 이 있어도 패닉하지 않는다.
+                if let Some(prev_col) = pos.col.checked_sub(1) {
+                    if let Some(prev_cell) =
+                        self.grid_mut().drawing_cell_mut(crate::grid::Pos {
+                            row: pos.row,
+                            col: prev_col,
+                        })
+                    {
+                        prev_cell.clear(attrs);
+                    }
+                }
             }
 
             if self
@@ -961,21 +958,16 @@ impl Screen {
                 .unwrap()
                 .is_wide()
             {
-                let next_cell = self
-                    .grid_mut()
-                    .drawing_cell_mut(crate::grid::Pos {
+                // cys 패치(0.14.45 · row89 패닉 지점): 폭 축소로 마지막 칸에 머리만 남은 넓은 글자는
+                //   짝 칸이 없다 — 원본은 여기서 unwrap 패닉했다. 짝 칸이 있을 때만 비운다.
+                if let Some(next_cell) =
+                    self.grid_mut().drawing_cell_mut(crate::grid::Pos {
                         row: pos.row,
-                        col: pos.col + 1,
+                        col: pos.col.saturating_add(1),
                     })
-                    // pos.row is valid because we assume self.grid().pos() to
-                    // always have a valid row value. pos.col is valid because
-                    // we called col_wrap() immediately before this, which
-                    // ensures that self.grid().pos().col has a valid value.
-                    // pos.col + 1 is valid because the cell at pos.col is a
-                    // wide character, so it must have the second half of the
-                    // wide character after it.
-                    .unwrap();
-                next_cell.set(' ', attrs);
+                {
+                    next_cell.set(' ', attrs);
+                }
             }
 
             let cell = self
@@ -988,7 +980,9 @@ impl Screen {
                 .unwrap();
             cell.set(c, attrs);
             self.grid_mut().col_inc(1);
-            if width > 1 {
+            // cys 패치: 폭 1칸 화면처럼 짝(continuation) 칸 자리가 아예 없으면 건너뛴다 — 원본은
+            //   아래 drawing_cell(pos).unwrap() 에서 패닉했다. 짝 없는 머리는 위 패치들로 무해하다.
+            if width > 1 && self.grid().drawing_cell(self.grid().pos()).is_some() {
                 let pos = self.grid().pos();
                 if self
                     .grid()
@@ -1005,24 +999,15 @@ impl Screen {
                 {
                     let next_next_pos = crate::grid::Pos {
                         row: pos.row,
-                        col: pos.col + 1,
+                        col: pos.col.saturating_add(1),
                     };
-                    let next_next_cell = self
-                        .grid_mut()
-                        .drawing_cell_mut(next_next_pos)
-                        // pos.row is valid because we assume
-                        // self.grid().pos() to always have a valid row value.
-                        // pos.col is valid because we called col_wrap()
-                        // earlier, which ensures that self.grid().pos().col
-                        // has a valid value. this is true even though we just
-                        // called col_inc, because this branch only happens if
-                        // width > 1, and col_wrap takes width into account.
-                        // pos.col + 1 is valid because the cell at pos.col is
-                        // wide, and so it must have the second half of the
-                        // wide character after it.
-                        .unwrap();
-                    next_next_cell.clear(attrs);
-                    if next_next_pos.col == size.cols - 1 {
+                    // cys 패치: 짝 칸이 없으면(깨진 불변식) 건너뛴다 — 원본은 unwrap 패닉.
+                    if let Some(next_next_cell) =
+                        self.grid_mut().drawing_cell_mut(next_next_pos)
+                    {
+                        next_next_cell.clear(attrs);
+                    }
+                    if next_next_pos.col == size.cols.saturating_sub(1) {
                         self.grid_mut()
                             .drawing_row_mut(pos.row)
                             // we assume self.grid().pos().row is always valid

@@ -53,10 +53,17 @@ impl Row {
     }
 
     pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
-        let wide = self.cells[usize::from(i)].is_wide();
+        // cys 패치: 범위 밖 i 는 조용히 무시한다(원본은 색인 패닉).
+        let Some(wide) = self.cells.get(usize::from(i)).map(|c| c.is_wide())
+        else {
+            return;
+        };
         self.clear_wide(i);
-        self.cells[usize::from(i)].clear(attrs);
-        if i == self.cols() - if wide { 2 } else { 1 } {
+        if let Some(cell) = self.cells.get_mut(usize::from(i)) {
+            cell.clear(attrs);
+        }
+        // cys 패치: cols 가 1 이하일 때 u16 뺄셈 언더플로를 막는다.
+        if i == self.cols().saturating_sub(if wide { 2 } else { 1 }) {
             self.wrapped = false;
         }
     }
@@ -64,15 +71,25 @@ impl Row {
     pub fn truncate(&mut self, len: u16) {
         self.cells.truncate(usize::from(len));
         self.wrapped = false;
-        let last_cell = &mut self.cells[usize::from(len) - 1];
-        if last_cell.is_wide() {
-            last_cell.clear(*last_cell.attrs());
-        }
+        self.clear_trailing_wide_head();
     }
 
     pub fn resize(&mut self, len: u16, cell: crate::cell::Cell) {
         self.cells.resize(usize::from(len), cell);
         self.wrapped = false;
+        // cys 패치(0.14.45): 폭을 줄인 뒤 마지막 칸에 넓은 글자의 머리만 남으면(짝 continuation 은 잘려 나감)
+        //   truncate 와 같은 규칙으로 지운다. 원본은 지우지 않아 다음 그리기(screen.rs text 의 cells[col+1])가
+        //   범위 밖을 짚어 패닉했다 — 26칸 '가' 줄을 25칸으로 줄인 뒤 ESC[1;25H 에 글자를 쓰면 재현된다.
+        self.clear_trailing_wide_head();
+    }
+
+    // cys 패치: 마지막 칸이 넓은 글자 머리면 비운다(짝 칸이 없으므로). 빈 줄이면 아무것도 안 한다.
+    fn clear_trailing_wide_head(&mut self) {
+        if let Some(last_cell) = self.cells.last_mut() {
+            if last_cell.is_wide() {
+                last_cell.clear(*last_cell.attrs());
+            }
+        }
     }
 
     pub fn wrap(&mut self, wrap: bool) {
@@ -84,15 +101,23 @@ impl Row {
     }
 
     pub fn clear_wide(&mut self, col: u16) {
-        let cell = &self.cells[usize::from(col)];
-        let other = if cell.is_wide() {
-            &mut self.cells[usize::from(col + 1)]
+        // cys 패치: 짝 칸이 범위 밖이면(깨진 불변식) 패닉 대신 건너뛴다.
+        let Some(cell) = self.cells.get(usize::from(col)) else {
+            return;
+        };
+        let other_col = if cell.is_wide() {
+            usize::from(col) + 1
         } else if cell.is_wide_continuation() {
-            &mut self.cells[usize::from(col - 1)]
+            match usize::from(col).checked_sub(1) {
+                Some(c) => c,
+                None => return,
+            }
         } else {
             return;
         };
-        other.clear(*other.attrs());
+        if let Some(other) = self.cells.get_mut(other_col) {
+            other.clear(*other.attrs());
+        }
     }
 
     pub fn write_contents(
