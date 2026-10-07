@@ -1716,7 +1716,6 @@ pub(crate) fn alert_seat_folder(config_dir: Option<&str>, session_file: &str) ->
 /// 두 폴더 경로가 같은 곳을 가리키는가(순수 · 문자열 비교 · 플랫폼 의미론 주입) — [`crate::reclaim::norm_path_on`] 으로 표기(역슬래시·MSYS `/c/`·확장 접두·
 /// 드라이브 대소·끝 구분자)를 접고, 윈도우에서는 ASCII 대소문자를 무시한다. transcript 경로는 Claude 가 싣는 표기, 기록(`CLAUDE_CONFIG_DIR`)은 네이티브 표기라
 /// 그대로 비교하면 윈도우 전 좌석이 늘 다르다(codex 2차 검토 #2).
-#[cfg(test)]
 pub(crate) fn same_dir_on(a: &str, b: &str, windows: bool) -> bool {
     let norm = |p: &str| crate::reclaim::norm_path_on(p.trim(), windows).trim_end_matches('/').to_string();
     let (a, b) = (norm(a), norm(b));
@@ -1772,6 +1771,9 @@ pub(crate) fn resolve_seat_folder_on(config_dir: Option<&str>, trusted: bool, se
         }
     }
     match (observed_profile_dir_on(session_file, windows), recorded) {
+        // ★(2차 검토 MINOR) 윈도우는 대소문자를 가리지 않는 파일시스템이라 `C:\Users\Alice` 기록과 `c:\users\alice\…` 관측이 접두 비교(대소 보존)에 실패한다 —
+        //   폴더가 같은 곳이면(`same_dir_on` · 윈도우는 ASCII 대소 무시) 기록이 확인된 것이다(불일치 아님).
+        (Some(o), Some(r)) if same_dir_on(&o, r, windows) => SeatFolder::Verified(r.to_string()),
         (Some(o), Some(r)) => SeatFolder::Mismatch { observed: o, recorded: r.to_string() },
         (Some(o), None) => SeatFolder::Verified(o),
         (None, Some(r)) if trusted => SeatFolder::Verified(r.to_string()),
@@ -6308,6 +6310,9 @@ mod tests {
                 "다른 폴더의 MSYS 표기는 네이티브 IO 가 읽는 드라이브 표기로 접는다(관측이 기록을 부정 = 불일치)"
             );
             assert!(same_dir("/h/.claude-4", "/h/.claude-4/") && same_dir_on(r"C:\u\.claude-4", "/c/u/.claude-4", true));
+            // (2차 검토 MINOR) 윈도우 대소문자만 다른 같은 폴더의 관측은 기록을 확인한 것 — 불일치가 아니다. 유닉스에서는 다른 폴더다.
+            assert_eq!(resolve_seat_folder_on(Some(r"C:\Users\Alice\.claude-4"), false, r"c:\users\alice\.claude-4\projects\C--p\s.jsonl", true), Verified(r"C:\Users\Alice\.claude-4".into()));
+            assert_eq!(resolve_seat_folder_on(Some("/h/Alice/.claude-4"), false, "/h/alice/.claude-4/projects/-p/s.jsonl", false), Mismatch { observed: "/h/alice/.claude-4".into(), recorded: "/h/Alice/.claude-4".into() });
             assert!(!same_dir("/h/.claude-4", "/h/.claude-40") && !same_dir("/h/.claude-4", "/h/.cys/claude"));
             assert!(same_dir_on("/h/A", "/h/a", true) && !same_dir_on("/h/A", "/h/a", false), "대소문자 무시는 윈도우만");
         }

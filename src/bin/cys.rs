@@ -10201,6 +10201,8 @@ fn factory_reset_plan_json(plan: &cys::factory_reset::ResetPlan) -> Value {
         "strip_settings": plan.strip_settings.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         "strip_skill_dirs": plan.strip_skill_dirs.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         "strip_agy_statusline": plan.strip_agy_statusline.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        // ★(0.14.45 · 2차 검토 MINOR) cys 가 좌석 설정에 넣은 "tui": "default" 의 되돌림 대상(원장 항목 · 폴더).
+        "claude_tui_rollback": plan.claude_tui_entries.iter().map(|e| e.dir.to_string_lossy().into_owned()).collect::<Vec<_>>(),
         "temp_sweep_count": plan.temp_sweep.len(),
         "report_only": plan.report_only,
         "purge_license": plan.purge_license,
@@ -10382,6 +10384,9 @@ fn run_factory_reset(
         }
         if let Some(s) = &plan.strip_agy_statusline {
             println!("  해제  {}  (cys 가 넣은 agy 상태줄 연결 제거)", s.display());
+        }
+        for e in &plan.claude_tui_entries {
+            println!("  해제  {}  (cys 가 넣은 \"tui\": \"default\" 되돌림 — 값이 아직 default 일 때만 · 백업은 격리 폴더)", e.settings.display());
         }
         if !plan.temp_sweep.is_empty() {
             println!("  소거  임시 캐시 {}건 ($TMPDIR)", plan.temp_sweep.len());

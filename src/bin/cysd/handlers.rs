@@ -12186,7 +12186,7 @@ mod tests {
                 sb.push_back(l.to_string());
             }
             s.line_count.store(6, Ordering::Relaxed);
-            s.repaint_echo.lock().unwrap().record_lines(2, 5);
+            s.repaint_echo.lock().unwrap().record_lines(2, 5, 0);
         }
         let read = |since: u64| -> serde_json::Value {
             let req = Request { id: json!(1), method: "surface.read_text".into(), params: json!({"surface_id": s.id, "since_line": since}) };

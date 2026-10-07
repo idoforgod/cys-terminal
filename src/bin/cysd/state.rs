@@ -1971,8 +1971,8 @@ pub struct Surface {
     /// 정식 크기(`nudge_origin`)를 들고 있어 치수를 생략한 바깥 변경이 임시 높이를 굳히지 않는다. 락 순서: resize_gate →
     /// master → parser(master·parser 는 그 안에서 따로·잠깐씩). 잠든 사이(settle)에는 쥐지 않는다.
     pub resize_gate: Mutex<crate::repaint::ResizeGate>,
-    /// ★(0.14.45 · F2-A2 · 성찰 2회차 M1) 다시 그리기 요청의 **반향 제외 창**([`crate::repaint::RepaintEcho`]) — 흔들기 시작부터 되돌린 뒤
-    /// 출력이 [`crate::repaint::REPAINT_ECHO_QUIET_MS`] 이상 조용해질 때까지(상한 [`crate::repaint::REPAINT_ECHO_CAP_SECS`]) 이 좌석의 출력은
+    /// ★(0.14.45 · F2-A2 · 성찰 2회차 M1) 다시 그리기 요청의 **반향 제외 창**([`crate::repaint::RepaintEcho`]) — 흔들기 시작부터 되돌린 뒤 최소
+    /// [`crate::repaint::REPAINT_ECHO_GRACE_MS`] · 재방송이 이어지면 마지막 출력 + [`crate::repaint::REPAINT_ECHO_QUIET_MS`] 까지(상한 [`crate::repaint::REPAINT_ECHO_CAP_SECS`]) 이 좌석의 출력은
     /// 건강 룰(`run_health_rules`)·회상 색인(`persist_for_recall`)을 타지 않는다. 다시 그려진 화면은 **옛 줄의 재방송**이라(이미 처리한
     /// "rate limit"·"Error" 줄) 경보·조치 바인딩(큐 일시정지)을 다시 당기고 색인을 중복시킨다(치명위험 ①). `last_injected` 의 2초 에코
     /// 제외와 같은 꼴이다. 창 안에 줄 버퍼로 들어온 줄 번호 구간은 창이 닫힌 뒤에도 남아 `surface.wait_for`·델타 read 가 건너뛴다.
@@ -6906,7 +6906,7 @@ impl Daemon {
     /// 청크 경계 안전: 미완성 ESC 시퀀스·UTF-8 멀티바이트 꼬리는 다음 청크와 합쳐 처리한다
     /// (경계에서 한글 파괴·escape 잔재 혼입 차단).
     fn ingest_output(&self, surface: &Surface, chunk: &[u8]) {
-        // ★(0.14.45 · 성찰 2회차 M1) 반향 제외 창 — 청크 도착마다 한 번 묻는다(창의 끝은 '되돌린 뒤 출력 정적 1초' 라 도착 시각이 재료다).
+        // ★(0.14.45 · 성찰 2회차 M1) 반향 제외 창 — 청크 도착마다 한 번 묻는다(창의 끝은 '되돌린 뒤 바닥 3초 · 그 뒤 재방송 + 1초' 라 도착 시각이 재료다).
         //   참이면 이 청크의 완성 줄은 재방송이다 — 아래에서 줄 번호 구간을 기억해 wait_for·델타 read 가 건너뛴다. leaf 락 · 다른 락 없이.
         let echo = crate::repaint::echo_note_output(surface, Instant::now());
         let mut st = surface.ingest.lock().unwrap();
@@ -6978,7 +6978,8 @@ impl Daemon {
             // ★(M1-a) 반향 창 안의 완성 줄은 번호 구간으로 기억한다 — 같은 scrollback 락 아래라 wait_for·델타 read(락 안에서 구간을 읽는다)가
             //   '줄은 보이는데 구간은 아직' 인 틈을 보지 않는다. 락 순서: scrollback → repaint_echo(leaf).
             if echo {
-                crate::repaint::echo_record_lines(surface, before, before + completed.len() as u64);
+                let total = before + completed.len() as u64;
+                crate::repaint::echo_record_lines(surface, before, total, total.saturating_sub(sb.len() as u64));
             }
             drop(sb);
             self.persist_for_recall(surface, &completed);
@@ -7030,7 +7031,7 @@ impl Daemon {
             }
         }
         // ★(0.14.45 · F2-A2) 다시 그리기 요청(크기 흔들기)의 반향 창 — 다시 그려진 화면은 옛 줄의 재방송이라 룰을 타지 않는다
-        //   (옛 "rate limit"·"Error" 줄이 경보·조치 바인딩을 다시 당기는 폭주 ① 차단). 창 = 흔들기 시작 ~ 되돌린 뒤 출력 정적 1초(상한 60초).
+        //   (옛 "rate limit"·"Error" 줄이 경보·조치 바인딩을 다시 당기는 폭주 ① 차단). 창 = 흔들기 시작 ~ 되돌린 뒤 최소 3초 · 재방송이 이어지면 마지막 출력 + 1초(상한 60초).
         if Self::repaint_echo_active(surface) {
             return;
         }
@@ -9842,8 +9843,8 @@ mod tests {
         let _ = s.child.lock().unwrap().kill();
     }
 
-    /// ★(성찰 2회차 M1-a) 되돌린 뒤의 재방송이 종전 고정 3초를 넘어도 창 안이다 — 실제 좌석에 '되돌린 뒤 2.5초 · 4초' 시점의 줄을 흉내 내 넣으면
-    /// (출력이 0.5초 간격으로 이어진 것으로) 둘 다 룰을 타지 않고 구간에 남는다. 정적 1초 뒤의 줄은 룰을 탄다(창 닫힘).
+    /// ★(성찰 2회차 M1-a) 되돌린 뒤의 재방송이 종전 고정 3초를 넘어도 창 안이다 — 실제 좌석에 '되돌린 뒤 4초' 시점의 줄을 흉내 내 넣으면(재방송이 0.1초 전까지
+    /// 이어진 것으로) 룰을 타지 않고 구간에 남는다. 바닥 3초가 지나고 정적 1초 뒤의 줄은 룰을 탄다(창 닫힘).
     #[test]
     fn repaint_echo_window_follows_long_replay_then_closes_on_quiet() {
         let (daemon, s) = health_probe_daemon("repaint-echo-long");

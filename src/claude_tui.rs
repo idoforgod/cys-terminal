@@ -245,6 +245,46 @@ struct Ledger {
 const LEDGER_CONFLICT: &str = "그 사이 원장이 바뀌었다 — 쓰지 않는다";
 /// 원장 RMW 재시도 상한 — 그 안에 다섯 번 연속 충돌하면(동시 기동이 다섯 이상) 포기하고 사유를 돌려준다(설정 쓰기는 이미 끝났고 원장만 빠진다 · 로그로 알린다).
 const LEDGER_RETRY_MAX: usize = 5;
+/// ★(2차 검토 MAJOR-4 · C5) 원장 **전용 잠금 파일**(`<원장>.lock` · 생성 배타 `create_new` — 모든 OS 에서 상호 배제). 윈도우에는 설정 락(flock)이 없어 병합 재시도만으로는
+/// '비교 통과 → 둘 다 쓰기' 의 좁은 창(TOCTOU)이 남았다. 획득은 최대 [`LEDGER_LOCK_WAIT_MS`] 동안 기다리고, 그보다 오래된([`LEDGER_LOCK_STALE_SECS`]) 잠금은 죽은
+/// 프로세스의 것으로 보아 치운다. 끝내 못 얻으면 잠금 없이 진행한다(실패 방향 = 종전 동작 + 병합 재시도 · 설정 쓰기는 이미 끝났고 원장만 걸린다).
+const LEDGER_LOCK_WAIT_MS: u64 = 2_000;
+const LEDGER_LOCK_STALE_SECS: u64 = 60;
+
+/// 원장 잠금 — 떨어질 때 잠금 파일을 지운다.
+struct LedgerLock(PathBuf);
+
+impl Drop for LedgerLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn ledger_lock(path: &Path) -> Option<LedgerLock> {
+    let lock = PathBuf::from(format!("{}.lock", path.display()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(LEDGER_LOCK_WAIT_MS);
+    loop {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => return Some(LedgerLock(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = std::fs::metadata(&lock)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age.as_secs() >= LEDGER_LOCK_STALE_SECS);
+                if stale {
+                    let _ = std::fs::remove_file(&lock);
+                    continue;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None, // 폴더 없음·권한 — 잠금 없이 진행(원장 쓰기 자체가 그 오류를 돌려준다)
+        }
+    }
+}
 
 // Windows 의 pack 락은 미획득이므로 프로세스 내부 RMW 도 직렬화한다. 파일락 순서는 항상 설정 → 원장이다.
 static MUTATION_LOCK: Mutex<()> = Mutex::new(());
@@ -504,6 +544,7 @@ fn append_ledger(home: &Path, config_dir: &Path, created: bool) -> Result<(), St
         Err(e) => return Err(format!("원장 폴더 판독 실패: {e}")),
     }
     let _ledger_lock = crate::pack::acquire_settings_lock(&path);
+    let _ledger_file_lock = ledger_lock(&path);
     let key = normalize_profile_path(config_dir, cfg!(windows));
     let written_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -564,13 +605,31 @@ enum BackupWhere<'a> {
     Dir(&'a Path),
 }
 
-/// 격리 폴더 안 백업 파일 이름 — `claude-tui.<폴더를 파일명으로 접은 것>.settings.json[.bak-cys-tui]`(agy 의 `agy-antigravity-cli.settings.json` 규약과 같은 폴더).
+/// 격리 폴더 안 백업 파일 이름 — `claude-tui.<폴더를 파일명으로 접은 것>-<경로 해시 8자리>.settings.json[.bak-cys-tui]`(agy 의 `agy-antigravity-cli.settings.json`
+/// 규약과 같은 폴더). ★(2차 검토 MAJOR-2) 접은 이름만으로는 `a_b` 와 `a/b` 가 같은 파일로 접혀 뒤 항목이 앞 항목의 복구 사본을 덮었다 — 정규화 경로의 해시를 붙이고,
+/// 쓰는 쪽은 [`reset_backup_dest`] 로 **있는 파일을 덮지 않는다**.
 fn reset_backup_name(dir: &Path, suffix: &str) -> String {
-    let folded: String = normalize_profile_path(dir, cfg!(windows))
+    use std::hash::{Hash, Hasher};
+    let norm = normalize_profile_path(dir, cfg!(windows));
+    let folded: String = norm
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
         .collect();
-    format!("claude-tui.{}.settings.json{suffix}", folded.trim_matches('_'))
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    norm.hash(&mut h);
+    format!("claude-tui.{}-{:08x}.settings.json{suffix}", folded.trim_matches('_'), (h.finish() & 0xffff_ffff) as u32)
+}
+
+/// 격리 폴더 안에서 **아직 없는** 목적지 — 같은 이름이 있으면 `.1` `.2` … 를 붙인다(덮어쓰기 0 · 복구 사본은 서로를 지우지 않는다).
+fn reset_backup_dest(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    (1..=999u32)
+        .map(|n| dir.join(format!("{name}.{n}")))
+        .find(|p| !p.exists())
+        .unwrap_or(first)
 }
 
 fn rollback_entry(entry: &LedgerEntry, home: &Path) -> Result<RollbackOutcome, String> {
@@ -579,6 +638,19 @@ fn rollback_entry(entry: &LedgerEntry, home: &Path) -> Result<RollbackOutcome, S
 
 fn rollback_entry_with(entry: &LedgerEntry, home: &Path, how: BackupWhere<'_>) -> Result<RollbackOutcome, String> {
     validate_ledger_entry(entry, home)?;
+    // ★(2차 검토 MAJOR-3) 경로 문자열 검증만으로는 원장에 적힌 `.claude-team` 이 **그 뒤** 개인 `~/.claude` 를 가리키는 심볼릭 링크로 바뀐 경우를 못 거른다
+    //   (`load` 는 settings.json 자신의 링크만 본다). 설정 폴더가 링크면 거부하고, 실경로(canonicalize)로 개인 프로필 판정을 한 번 더 한다(파일이 없으면 Dropped 로 간다).
+    match std::fs::symlink_metadata(&entry.dir) {
+        Ok(m) if m.file_type().is_symlink() => return Err("설정 폴더가 심볼릭 링크다 — 되돌리지 않는다".into()),
+        Ok(_) => {
+            if let (Ok(real_dir), Ok(real_home)) = (std::fs::canonicalize(&entry.dir), std::fs::canonicalize(home)) {
+                if is_personal_profile(&real_dir, &real_home, DirOrigin::SeatSpec) {
+                    return Err("실경로가 개인 기본 프로필이다 — 되돌리지 않는다".into());
+                }
+            }
+        }
+        Err(_) => {}
+    }
     let Some((raw, text, bom, orig)) = surgery::load(&entry.settings)? else {
         return Ok(RollbackOutcome::Dropped);
     };
@@ -601,7 +673,7 @@ fn rollback_entry_with(entry: &LedgerEntry, home: &Path, how: BackupWhere<'_>) -
         BackupWhere::Beside => backup(&entry.settings, &raw)?,
         BackupWhere::Dir(d) => {
             std::fs::create_dir_all(d).map_err(|e| format!("백업 폴더를 만들지 못했다: {e}"))?;
-            let dest = d.join(reset_backup_name(&entry.dir, ""));
+            let dest = reset_backup_dest(d, &reset_backup_name(&entry.dir, ""));
             crate::pack::write_atomic_mode(&dest, &raw, mode).map_err(|e| format!("백업 실패({}): {e}", dest.display()))?;
         }
     }
@@ -641,6 +713,7 @@ pub fn rollback_from_ledger(home: &Path) -> Vec<(PathBuf, RollbackOutcome)> {
         }
         let _settings_lock = crate::pack::acquire_settings_lock(&entry.settings);
         let _ledger_lock = crate::pack::acquire_settings_lock(&path);
+        let _ledger_file_lock = ledger_lock(&path);
         let (ledger, _raw) = match read_ledger(&path) {
             Ok(loaded) => loaded,
             Err(e) => {
@@ -689,19 +762,25 @@ pub fn reset_entries(entries: &[LedgerEntry], home: &Path, backup_dir: &Path) ->
     let _serial = MUTATION_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
+        // (2차 검토 MINOR) 거부할 경로(개인 프로필·상대 경로)에는 잠금 파일부터 만들지 않는다 — 검증이 먼저다(킬스위치 되돌림과 같은 순서).
+        if let Err(e) = validate_ledger_entry(entry, home) {
+            out.push(ResetTrace { dir: entry.dir.clone(), outcome: RollbackOutcome::Refused(e), backup_moved: false });
+            continue;
+        }
         let _settings_lock = crate::pack::acquire_settings_lock(&entry.settings);
         let outcome = match rollback_entry_with(entry, home, BackupWhere::Dir(backup_dir)) {
             Ok(o) => o,
             Err(e) => RollbackOutcome::Refused(e),
         };
         let mut backup_moved = false;
-        if !entry.created && !matches!(outcome, RollbackOutcome::Refused(_)) && validate_ledger_entry(entry, home).is_ok() {
+        if !entry.created && !matches!(outcome, RollbackOutcome::Refused(_)) {
             let beside = PathBuf::from(format!("{}{BACKUP_SUFFIX}", entry.settings.display()));
             if std::fs::symlink_metadata(&beside).map(|m| m.is_file()).unwrap_or(false) {
-                let dest = backup_dir.join(reset_backup_name(&entry.dir, BACKUP_SUFFIX));
-                let moved = std::fs::create_dir_all(backup_dir).is_ok()
-                    && (std::fs::rename(&beside, &dest).is_ok()
-                        || (std::fs::copy(&beside, &dest).is_ok() && std::fs::remove_file(&beside).is_ok()));
+                let moved = std::fs::create_dir_all(backup_dir).is_ok() && {
+                    let dest = reset_backup_dest(backup_dir, &reset_backup_name(&entry.dir, BACKUP_SUFFIX));
+                    std::fs::rename(&beside, &dest).is_ok()
+                        || (std::fs::copy(&beside, &dest).is_ok() && std::fs::remove_file(&beside).is_ok())
+                };
                 backup_moved = moved;
             }
         }
@@ -1684,6 +1763,91 @@ mod tests {
         let personal = LedgerEntry { dir: home.join(".claude"), settings: home.join(".claude/settings.json"), written_at: 1, created: false };
         let t = reset_entries(&[personal], &home, &trash);
         assert!(matches!(t[0].outcome, RollbackOutcome::Refused(_)) && !t[0].backup_moved);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// ★(2차 검토 MAJOR-2) 격리 백업 이름은 경로마다 다르고(`a_b` 와 `a/b` 가 같은 이름으로 접히지 않는다) 있는 파일을 덮지 않는다(`.1` `.2` …).
+    #[test]
+    fn claude_tui_reset_backup_names_do_not_collide_or_overwrite() {
+        let home = sandbox("reset-names");
+        let a = home.join("seats").join("a_b");
+        let b = home.join("seats").join("a").join("b");
+        assert_ne!(reset_backup_name(&a, ""), reset_backup_name(&b, ""));
+        assert!(reset_backup_name(&a, "").ends_with(".settings.json") && reset_backup_name(&a, BACKUP_SUFFIX).ends_with(BACKUP_SUFFIX));
+        let trash = home.join("trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let n = reset_backup_name(&a, "");
+        let d1 = reset_backup_dest(&trash, &n);
+        std::fs::write(&d1, "1").unwrap();
+        let d2 = reset_backup_dest(&trash, &n);
+        assert_ne!(d1, d2);
+        assert_eq!(d2, trash.join(format!("{n}.1")));
+        assert_eq!(std::fs::read_to_string(&d1).unwrap(), "1", "있던 사본은 그대로");
+        // 실제 되돌림 두 번(같은 폴더 항목 둘) — 두 복구 사본이 모두 남는다.
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::write(a.join("settings.json"), "{\"x\":1}").unwrap();
+        assert!(matches!(ensure_classic(&a, &home, DirOrigin::SeatSpec), Outcome::Written { .. }));
+        let entries = ledger_entries(&home).unwrap();
+        let t = reset_entries(&entries, &home, &trash);
+        assert_eq!(t[0].outcome, RollbackOutcome::Removed);
+        assert!(matches!(ensure_classic(&a, &home, DirOrigin::SeatSpec), Outcome::Written { .. }));
+        let t = reset_entries(&entries, &home, &trash);
+        assert_eq!(t[0].outcome, RollbackOutcome::Removed);
+        let copies = std::fs::read_dir(&trash).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".settings.json")).count();
+        assert!(copies >= 4, "되돌림 사본 2 + 옆자리 백업 2 가 모두 남는다({copies})");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// ★(2차 검토 MAJOR-3) 원장에 적힌 폴더가 그 뒤 개인 `~/.claude` 로 가는 심볼릭 링크로 바뀌면 되돌리지 않는다(킬스위치 되돌림·완전 초기화 공통).
+    #[cfg(unix)]
+    #[test]
+    fn claude_tui_rollback_refuses_symlinked_dir_to_personal_profile() {
+        let home = sandbox("rollback-symlink");
+        let personal = home.join(".claude");
+        std::fs::create_dir_all(&personal).unwrap();
+        let personal_settings = "{\"tui\":\"default\",\"keep\":true}";
+        std::fs::write(personal.join("settings.json"), personal_settings).unwrap();
+        let team = home.join(".claude-team");
+        std::fs::create_dir_all(&team).unwrap();
+        std::fs::write(team.join("settings.json"), "{}").unwrap();
+        assert!(matches!(ensure_classic(&team, &home, DirOrigin::SeatSpec), Outcome::Written { created: false, .. }));
+        // 폴더를 링크로 갈아 끼운다.
+        std::fs::remove_dir_all(&team).unwrap();
+        std::os::unix::fs::symlink(&personal, &team).unwrap();
+        let out = rollback_from_ledger(&home);
+        assert!(matches!(&out[0].1, RollbackOutcome::Refused(why) if why.contains("심볼릭 링크")), "{out:?}");
+        assert_eq!(std::fs::read_to_string(personal.join("settings.json")).unwrap(), personal_settings, "개인 설정 불변");
+        let entries = ledger_entries(&home).unwrap();
+        let t = reset_entries(&entries, &home, &home.join("trash"));
+        assert!(matches!(&t[0].outcome, RollbackOutcome::Refused(_)) && !t[0].backup_moved, "{t:?}");
+        assert_eq!(std::fs::read_to_string(personal.join("settings.json")).unwrap(), personal_settings);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// ★(2차 검토 MAJOR-4 · C5) 원장 전용 잠금 파일 — 생성 배타 · 잡힌 동안은 2초 뒤 포기(None) · 죽은 프로세스의 낡은 잠금(60초 이상)은 치우고 얻는다 · 떨어지면 지운다.
+    #[test]
+    fn claude_tui_ledger_lock_is_exclusive_and_clears_stale_locks() {
+        let home = sandbox("ledger-lock");
+        std::fs::create_dir_all(home.join(".cys")).unwrap();
+        let path = home.join(LEDGER_FILE);
+        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+        let held = ledger_lock(&path).expect("첫 획득");
+        assert!(lock_path.is_file());
+        let t = std::time::Instant::now();
+        assert!(ledger_lock(&path).is_none(), "잡힌 동안은 얻지 못한다");
+        assert!(t.elapsed() >= std::time::Duration::from_millis(LEDGER_LOCK_WAIT_MS - 100));
+        drop(held);
+        assert!(!lock_path.exists(), "떨어지면 지운다");
+        // 낡은 잠금 — mtime 을 과거로.
+        std::fs::write(&lock_path, "").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(LEDGER_LOCK_STALE_SECS + 5);
+        let f = std::fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        f.set_modified(old).unwrap();
+        drop(f);
+        assert!(ledger_lock(&path).is_some(), "낡은 잠금은 치우고 얻는다");
+        assert!(!lock_path.exists());
+        // 원장이 들어갈 폴더가 없으면 잠금 없이 진행(None) — 원장 쓰기가 그 오류를 돌려준다.
+        assert!(ledger_lock(&home.join("nope").join("ledger.json")).is_none());
         let _ = std::fs::remove_dir_all(home);
     }
 

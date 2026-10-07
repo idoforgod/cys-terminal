@@ -29,7 +29,7 @@
 //!   ① 폭주 없음 — 좌석당 동시 1건(`repaint_in_flight` · Drop 가드가 패닉에도 내린다) · 좌석당 최소 간격 300초 ·
 //!      복구되지 않은 연속 요청은 간격을 두 배씩(최대 16배 = 80분) 늘린다. **판독 가능한** 화면(준비 판정 또는 커서
 //!      행 관측)을 한 번이라도 보면 간격이 원래대로 돌아간다 — 다른 사유의 막힘(대체 화면·선택기 행 등)은 시계만
-//!      지우고 배수는 유지한다(A4). 다시 그려진 화면은 옛 줄의 재방송이라 흔들기 시작부터 **되돌린 뒤 출력이 1초 이상 조용해질 때까지**
+//!      지우고 배수는 유지한다(A4). 다시 그려진 화면은 옛 줄의 재방송이라 흔들기 시작부터 **되돌린 뒤 최소 3초 · 재방송이 이어지면 마지막 출력 + 1초까지**
 //!      (상한 60초) 건강 룰·회상 색인을 타지 않는다(A2 · `Surface::repaint_echo` — 최선 노력: 창 안에 시작돼 창 뒤에 끝나는 미완성
 //!      줄 하나는 샐 수 있다 · 창은 유한해 영구 봉인은 없다). 창 안에 줄 버퍼로 들어온 줄 번호 구간은 창이 닫힌 뒤에도 남아
 //!      `surface.wait_for`·델타 read 가 건너뛴다(성찰 2회차 M1 — 재방송 줄을 `since_line` 뒤의 새 줄로 거짓 일치하지 않는다).
@@ -71,6 +71,9 @@ pub(crate) const REPAINT_SETTLE_MS: u64 = 500;
 /// 종전 고정 3초는 윈도우 classic(주 화면) 좌석의 긴 재방송(ConPTY 가 가려졌던 줄·프레임을 통째로 다시 내보낸다)이 창을 넘길 수 있었다 —
 /// 옛 "rate limit"·"Error" 줄이 창 밖에서 룰을 다시 당긴다(폭주 ①). 정적 기준이면 재방송이 길어도 끝난 뒤 1초에 닫히고, 짧으면 더 일찍 닫힌다.
 pub(crate) const REPAINT_ECHO_QUIET_MS: u64 = 1_000;
+/// (A2 · 2차 검토 MAJOR-1) 되돌린 뒤 창이 **최소한** 열려 있는 시간(ms) — 첫 재방송 청크가 되돌린 뒤 1초 넘게 늦게 와도(TUI 가 크기 변경을 늦게 읽는다) 창 밖으로
+/// 떨어지지 않게 하는 바닥. 종전 고정 창과 같은 3초다 — 정적 규칙은 이 바닥 **위에** 더해져 창을 늘릴 뿐 줄이지 않는다.
+pub(crate) const REPAINT_ECHO_GRACE_MS: u64 = 3_000;
 /// (A2) 흔들기 시작 때 거는 반향 제외 창의 상한(초) — 되돌린 뒤 출력이 끊이지 않아도 이 시간 뒤에는 룰·색인이 되살아난다(실패 방향 = 룰 복귀).
 pub(crate) const REPAINT_ECHO_CAP_SECS: u64 = 60;
 /// (M1-a) 좌석마다 기억하는 반향 줄 구간의 상한 — 넘으면 가장 오래된 구간부터 잊는다(그 줄들은 보통 스크롤백에서도 이미 밀려났다).
@@ -98,7 +101,7 @@ pub(crate) struct RepaintState {
 
 /// ★(A2 · 성찰 2회차 M1) 좌석별 **반향 제외 창** 상태 — `Surface::repaint_echo`(leaf 락 · 다른 락을 쥔 채 잡아도 되지만 이 락을 쥔 채 다른 락은 잡지 않는다).
 ///
-/// 창 = 흔들기 시작(`cap_until` 설정) ~ 되돌린 뒤(`restored_at`) 출력이 [`REPAINT_ECHO_QUIET_MS`] 이상 조용해진 순간 · 상한 [`REPAINT_ECHO_CAP_SECS`].
+/// 창 = 흔들기 시작(`cap_until` 설정) ~ 되돌린 뒤(`restored_at`) [`REPAINT_ECHO_GRACE_MS`] 가 지나고 **그 뒤 도착한** 출력이 [`REPAINT_ECHO_QUIET_MS`] 이상 조용해진 순간 · 상한 [`REPAINT_ECHO_CAP_SECS`].
 /// 창 안에 줄 버퍼로 들어온 줄의 번호 구간(`ranges` · `[start, end)` · 단조 줄 번호 `Surface::line_count` 기준)은 창이 닫힌 **뒤에도** 남아
 /// `surface.wait_for`·`surface.read_text since_line` 이 그 줄을 건너뛴다 — 다시 그려진 화면은 **옛 줄의 재방송**이라 `since_line` 뒤의 '새 줄'로
 /// 보이지만 새 사실이 아니다(옛 "완료" 표지에 wait_for 가 거짓 일치 · 옛 오류 줄이 델타 소비자에게 새 오류로 보인다).
@@ -115,7 +118,7 @@ pub(crate) struct RepaintEcho {
 }
 
 impl RepaintEcho {
-    /// 순수: `now` 에 창이 열려 있는가. 되돌린 뒤에는 '되돌린 시각과 마지막 출력 가운데 늦은 쪽 + 정적 하한' 전까지만 열려 있고, 어느 경우든 상한을 넘기면 닫힌다.
+    /// 순수: `now` 에 창이 열려 있는가. 되돌린 뒤에는 '되돌린 시각 + 바닥 3초' 와 '되돌린 뒤 마지막 출력 + 1초' 가운데 늦은 쪽 전까지만 열려 있고, 어느 경우든 상한을 넘기면 닫힌다.
     pub(crate) fn active_at(&self, now: Instant) -> bool {
         let Some(cap) = self.cap_until else {
             return false;
@@ -126,8 +129,12 @@ impl RepaintEcho {
         match self.restored_at {
             None => true,
             Some(restored) => {
-                let anchor = self.last_output.map_or(restored, |o| o.max(restored));
-                now < anchor + Duration::from_millis(REPAINT_ECHO_QUIET_MS)
+                // 바닥(되돌린 뒤 3초) 위에 '되돌린 뒤 도착한 마지막 출력 + 1초' 를 얹는다 — 되돌리기 전 출력은 재방송이 아니라 세지 않는다.
+                let mut end = restored + Duration::from_millis(REPAINT_ECHO_GRACE_MS);
+                if let Some(o) = self.last_output.filter(|o| *o >= restored) {
+                    end = end.max(o + Duration::from_millis(REPAINT_ECHO_QUIET_MS));
+                }
+                now < end
             }
         }
     }
@@ -151,8 +158,10 @@ impl RepaintEcho {
         true
     }
 
-    /// 순수: 창 안에 들어온 줄 번호 구간 `[start, end)` 를 기억한다 — 직전 구간과 맞닿으면 잇고, 상한을 넘으면 가장 오래된 구간을 잊는다.
-    pub(crate) fn record_lines(&mut self, start: u64, end: u64) {
+    /// 순수: 창 안에 들어온 줄 번호 구간 `[start, end)` 를 기억한다 — 직전 구간과 맞닿으면 잇고, 스크롤백에서 이미 밀려난 구간(`end <= oldest` · 2차 검토 MINOR)을 먼저 잊고,
+    /// 그래도 상한을 넘으면 가장 오래된 구간을 잊는다(그 줄은 아직 버퍼에 있을 수 있다 — 최선 노력 · 상한은 메모리 유계를 위한 것).
+    pub(crate) fn record_lines(&mut self, start: u64, end: u64, oldest: u64) {
+        self.ranges.retain(|&(_, e)| e > oldest);
         if end <= start {
             return;
         }
@@ -192,9 +201,9 @@ pub(crate) fn echo_note_output(s: &Surface, now: Instant) -> bool {
     s.repaint_echo.lock().unwrap_or_else(|e| e.into_inner()).note_output(now)
 }
 
-/// 창 안에 들어온 줄 구간을 기억한다(`ingest_output` 이 스크롤백 락을 쥔 채 부른다).
-pub(crate) fn echo_record_lines(s: &Surface, start: u64, end: u64) {
-    s.repaint_echo.lock().unwrap_or_else(|e| e.into_inner()).record_lines(start, end);
+/// 창 안에 들어온 줄 구간을 기억한다(`ingest_output` 이 스크롤백 락을 쥔 채 부른다 · `oldest` = 스크롤백에 남은 가장 오래된 줄 번호).
+pub(crate) fn echo_record_lines(s: &Surface, start: u64, end: u64, oldest: u64) {
+    s.repaint_echo.lock().unwrap_or_else(|e| e.into_inner()).record_lines(start, end, oldest);
 }
 
 /// 지금 창이 열려 있는가(순수 판정의 지금 판 — 지났으면 표식을 지워 둔다). 건강 룰·회상 색인이 부른다.
@@ -365,7 +374,7 @@ pub(crate) fn note_queue_screen(daemon: &Arc<Daemon>, s: &Arc<Surface>, obs: Scr
     let spawned = std::thread::Builder::new()
         .name(format!("cysd-repaint-{}", s.id))
         .spawn(move || {
-            // (A6) Drop 가드 — 정상 종료·오류·패닉 어느 경로로 끝나도 진행 중 표식을 내리고 반향 창을 3초로 마감한다.
+            // (A6) Drop 가드 — 정상 종료·오류·패닉 어느 경로로 끝나도 진행 중 표식을 내리고 반향 창에 되돌린 시각을 찍는다(바닥 3초 · 재방송이 이어지면 연장).
             let _guard = InFlightGuard(&seat);
             if let Err(e) = nudge_resize(&seat, Duration::from_millis(REPAINT_SETTLE_MS)) {
                 eprintln!("[cysd] surface {} 다시 그리기 요청(크기 흔들기) 건너뜀: {e}", seat.id);
@@ -653,13 +662,13 @@ mod tests {
         assert!(!s.repaint_in_flight.load(Ordering::Acquire), "진행 중 표식이 내려가야 한다");
         assert_eq!(s.parser.lock().unwrap().screen().size(), (24, 80), "파서 크기 원복");
         assert_eq!(pty_size(&s), (24, 80), "PTY 크기 원복");
-        // (A2 · M1-b) 되돌린 시각이 찍혔고 창은 아직 열려 있다(되돌린 뒤 1초 정적 전) — 출력 없이 1초가 지나면 닫힌다.
+        // (A2 · M1-b) 되돌린 시각이 찍혔고 창은 아직 열려 있다(바닥 3초 안) — 출력 없이 바닥이 지나면 닫힌다.
         {
             let e = s.repaint_echo.lock().unwrap();
             assert!(e.restored_at.is_some() && e.cap_until.is_some(), "{e:?}");
             assert!(e.active_at(Instant::now()));
-            let later = e.restored_at.unwrap() + Duration::from_millis(REPAINT_ECHO_QUIET_MS);
-            assert!(!e.active_at(later), "되돌린 뒤 출력 없이 정적 하한이 지나면 창이 닫힌다");
+            let later = e.restored_at.unwrap() + Duration::from_millis(REPAINT_ECHO_GRACE_MS);
+            assert!(!e.active_at(later), "되돌린 뒤 출력 없이 바닥(3초)이 지나면 창이 닫힌다");
         }
         assert!(Daemon::repaint_echo_active(&s));
         // 바깥 크기 변경 세대는 흔들기로 오르지 않는다(자기 변경을 바깥 변경으로 세지 않는다).
@@ -799,7 +808,7 @@ mod tests {
         {
             let e = s.repaint_echo.lock().unwrap();
             let restored = e.restored_at.expect("되돌린 시각");
-            assert!(e.active_at(restored) && !e.active_at(restored + Duration::from_millis(REPAINT_ECHO_QUIET_MS)));
+            assert!(e.active_at(restored) && !e.active_at(restored + Duration::from_millis(REPAINT_ECHO_GRACE_MS)));
         }
         // 파서 락은 독에 들지 않았다(set_parser_size 는 catch_unwind — 정상 호출도 Ok).
         assert!(set_parser_size(&s, 24, 80).is_ok());
@@ -808,28 +817,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// ★(성찰 2회차 M1-b · 순수) 반향 창의 끝은 **되돌린 뒤 출력 정적 1초**다(고정 3초가 아니다) — 긴 재방송은 창을 늘리고(마지막 출력 + 1초),
+    /// ★(성찰 2회차 M1-b · 순수) 반향 창의 끝은 **되돌린 뒤 바닥 3초 위에 '마지막 재방송 + 1초'** 다(고정 3초가 아니다) — 긴 재방송은 창을 늘리고(마지막 출력 + 1초),
     /// 출력이 없으면 되돌린 뒤 1초에 닫히며, 어느 경우든 상한 60초를 넘기지 않는다. 흔드는 중(되돌리기 전)에는 정적과 무관하게 열려 있다.
     #[test]
     fn echo_window_ends_on_quiet_after_restore_capped() {
         let t0 = Instant::now();
         let q = Duration::from_millis(REPAINT_ECHO_QUIET_MS);
+        let g = Duration::from_millis(REPAINT_ECHO_GRACE_MS);
         let mut e = RepaintEcho::default();
         assert!(!e.active_at(t0), "창 없음");
         assert!(!e.note_output(t0) && e.ranges.is_empty());
         e.cap_until = Some(t0 + Duration::from_secs(REPAINT_ECHO_CAP_SECS));
         // 흔드는 중 — 출력이 없어도 열려 있다(정적 판정은 되돌린 뒤에만).
         assert!(e.active_at(t0 + Duration::from_secs(5)));
-        // 되돌림 — 출력 없이 1초: 닫힘 · 그 전: 열림.
-        e.restored_at = Some(t0 + Duration::from_secs(1));
-        assert!(e.active_at(t0 + Duration::from_secs(1) + q - Duration::from_millis(1)));
-        assert!(!e.active_at(t0 + Duration::from_secs(1) + q));
-        // 긴 재방송 — 0.5초 간격 출력이 이어지면 창이 따라 늘어난다(종전 고정 3초를 넘어서도).
-        let mut t = t0 + Duration::from_secs(1);
+        // 되돌림 — 출력 없이 바닥 3초: 닫힘 · 그 전: 열림(2차 검토 MAJOR-1: 첫 재방송이 1초 넘게 늦어도 창 안).
+        let restored = t0 + Duration::from_secs(1);
+        e.restored_at = Some(restored);
+        assert!(e.active_at(restored + g - Duration::from_millis(1)));
+        assert!(!e.active_at(restored + g));
+        assert!(e.note_output(restored + Duration::from_millis(2_000)), "되돌린 뒤 2초에 온 첫 재방송 청크는 창 안이다");
+        // 되돌리기 전 출력은 재방송이 아니다 — 창을 늘리지 않는다.
+        let mut e2 = RepaintEcho::default();
+        e2.cap_until = e.cap_until;
+        e2.last_output = Some(restored - Duration::from_millis(10));
+        e2.restored_at = Some(restored);
+        assert!(!e2.active_at(restored + g));
+        // 긴 재방송 — 0.5초 간격 출력이 이어지면 창이 따라 늘어난다(바닥 3초를 넘어서도).
+        let mut t = restored + Duration::from_millis(2_000);
         for _ in 0..10 {
             t += Duration::from_millis(500);
             assert!(e.note_output(t), "재방송이 이어지는 동안은 창 안이다({t:?})");
         }
+        assert!(t > restored + g, "검체 전제: 바닥을 넘겼다");
         assert!(e.active_at(t + q - Duration::from_millis(1)) && !e.active_at(t + q), "마지막 출력 + 1초에 닫힌다");
         // 정적 뒤 도착한 출력은 창 밖 — 표식을 지운다.
         assert!(!e.note_output(t + q), "정적 1초 뒤의 출력은 재방송이 아니다");
@@ -839,6 +858,7 @@ mod tests {
         e.cap_until = Some(t0 + Duration::from_secs(REPAINT_ECHO_CAP_SECS));
         e.restored_at = Some(t0 + Duration::from_secs(1));
         e.last_output = Some(t0 + Duration::from_secs(REPAINT_ECHO_CAP_SECS));
+        assert!(e.active_at(t0 + Duration::from_secs(REPAINT_ECHO_CAP_SECS) - Duration::from_millis(1)));
         assert!(!e.active_at(t0 + Duration::from_secs(REPAINT_ECHO_CAP_SECS)));
         // 되돌리기 전에 상한이 지나도 닫힌다.
         let mut e = RepaintEcho::default();
@@ -847,20 +867,28 @@ mod tests {
         assert!(!e.note_output(t0 + Duration::from_secs(REPAINT_ECHO_CAP_SECS + 1)) && e.cap_until.is_none());
     }
 
-    /// ★(성찰 2회차 M1-a · 순수) 반향 줄 구간 — 맞닿은 구간은 잇고 · 겹치면 끝을 늘리고 · 빈 구간은 무시 · 상한 64 를 넘으면 가장 오래된 것부터 잊는다.
-    /// 구간 판정 `line_in_echo` 는 `[start, end)` 다. 창이 닫혀도(`clear_window`) 구간은 남는다.
+    /// ★(성찰 2회차 M1-a · 순수) 반향 줄 구간 — 맞닿은 구간은 잇고 · 겹치면 끝을 늘리고 · 빈 구간은 무시 · 스크롤백에서 밀려난 구간은 먼저 잊고 · 그래도 상한 64 를 넘으면
+    /// 가장 오래된 것부터 잊는다. 구간 판정 `line_in_echo` 는 `[start, end)` 다. 창이 닫혀도(`clear_window`) 구간은 남는다.
     #[test]
     fn echo_line_ranges_merge_and_cap() {
         let mut e = RepaintEcho::default();
-        e.record_lines(10, 10);
+        e.record_lines(10, 10, 0);
         assert!(e.ranges.is_empty(), "빈 구간");
-        e.record_lines(10, 13);
-        e.record_lines(13, 15); // 맞닿음 → 잇는다
+        e.record_lines(10, 13, 0);
+        e.record_lines(13, 15, 0); // 맞닿음 → 잇는다
         assert_eq!(e.ranges, vec![(10, 15)]);
-        e.record_lines(14, 16); // 겹침 → 끝만 늘린다
+        e.record_lines(14, 16, 0); // 겹침 → 끝만 늘린다
         assert_eq!(e.ranges, vec![(10, 16)]);
-        e.record_lines(20, 22); // 틈 → 새 구간
+        e.record_lines(20, 22, 0); // 틈 → 새 구간
         assert_eq!(e.ranges, vec![(10, 16), (20, 22)]);
+        // 스크롤백에서 밀려난 구간(end <= oldest)은 잊는다 · 아직 일부라도 남은 구간은 둔다.
+        e.record_lines(30, 31, 16);
+        assert_eq!(e.ranges, vec![(20, 22), (30, 31)]);
+        e.record_lines(40, 41, 21);
+        assert_eq!(e.ranges, vec![(20, 22), (30, 31), (40, 41)], "21 < 22 라 (20,22) 는 아직 남는다");
+        let mut e = RepaintEcho::default();
+        e.record_lines(10, 16, 0);
+        e.record_lines(20, 22, 0);
         for n in [9u64, 16, 19, 22] {
             assert!(!line_in_echo(&e.ranges, n), "{n}");
         }
@@ -871,7 +899,7 @@ mod tests {
         assert_eq!(e.ranges.len(), 2, "창이 닫혀도 구간은 남는다");
         let mut e = RepaintEcho::default();
         for i in 0..(REPAINT_ECHO_RANGES_MAX as u64 + 5) {
-            e.record_lines(i * 10, i * 10 + 1);
+            e.record_lines(i * 10, i * 10 + 1, 0);
         }
         assert_eq!(e.ranges.len(), REPAINT_ECHO_RANGES_MAX);
         assert_eq!(e.ranges[0], (50, 51), "가장 오래된 다섯 구간을 잊었다");
