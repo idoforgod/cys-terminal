@@ -386,6 +386,8 @@ export interface UsageLine {
   unobserved: boolean;
   /** 지금 로그인돼 쓰이는 계정 — in_use === true 일 때만 true(null·false·키 없음은 false). 줄 앞에 '●' 표식. */
   inUse: boolean;
+  /** ★0.14.45 이 계정을 지금 쓰는 부서·노드(예 `일반저술출판부 master·worker`) — 있을 때만 키가 있다. */
+  users?: string[];
 }
 export interface UsagePrimary {
   /** 0.14.44(D1) 계정 키(`provider:account_id`) — 상자 목록(boxes)·묶음에서 같은 계정을 가리키는 열쇠. */
@@ -397,6 +399,8 @@ export interface UsagePrimary {
   exhaust: string;
   /** 지금 로그인돼 쓰이는 계정(in_use === true) — 이름 옆에 '● 사용 중' 배지. */
   inUse: boolean;
+  /** ★0.14.45 이 계정을 지금 쓰는 부서·노드 — 있을 때만 키가 있다. */
+  users?: string[];
 }
 /** 0.14.44(D1) 보기 방식 — auto(기본: 관측 계정 3개 이하면 전부 막대 · 4개 이상이면 제공자 묶음) · all(전부 막대) · one(주 계정 1개 막대 + 나머지 한 줄 = 0.14.43 동작). */
 export type UsageViewMode = "auto" | "all" | "one";
@@ -432,6 +436,8 @@ export interface UsageBarOptions {
   fontScale?: unknown;
   /** 접힌 묶음 키 집합(저장소는 main.ts 만 읽는다). */
   folded?: ReadonlySet<string>;
+  /** ★0.14.45 계정 키(`provider:account_id`) → 그 계정을 지금 쓰는 부서·노드 표기(seatacct.ts accountUsers). 생략하면 역매핑 없음. */
+  users?: ReadonlyMap<string, string[]>;
 }
 /** 저장된 보기 방식의 검증 — 세 값 밖이면 fallback(저장소 기본은 "auto", 모델 인자 생략은 "one"). */
 export function sanitizeUsageMode(raw: unknown, fallback: UsageViewMode = "auto"): UsageViewMode {
@@ -716,6 +722,30 @@ function restOrder(x: AcctRow, y: AcctRow): number {
   return (finiteNum(y.updated_at) ?? 0) - (finiteNum(x.updated_at) ?? 0);
 }
 
+/** 화면에 나올 계정들의 표시 라벨(계정 → 라벨) — accountShortLabel 이 겹치면 구분 꼬리표를 붙인다: 이메일(🔒 가림 거침)로 먼저, 그래도 같으면(같은 이메일·이메일 없음)
+ *  결정론 tag4. 사용량 패널과 ★0.14.45 부서 카드의 계정 줄이 **이 함수 하나**를 써서 같은 계정을 같은 이름으로 부른다. */
+export function accountDisplayLabels(list: AcctRow[], redactEmail: (s: string) => string): Map<AcctRow, string> {
+  const base = new Map<AcctRow, string>();
+  const baseCount = new Map<string, number>();
+  for (const a of list) {
+    const l = accountShortLabel(a);
+    base.set(a, l);
+    baseCount.set(l, (baseCount.get(l) ?? 0) + 1);
+  }
+  const labels = new Map<AcctRow, string>();
+  const labelCount = new Map<string, number>();
+  for (const a of list) {
+    const b = base.get(a)!;
+    const l = (baseCount.get(b) ?? 0) > 1 ? `${b} ·${overlapTag(a, redactEmail)}` : b;
+    labels.set(a, l);
+    labelCount.set(l, (labelCount.get(l) ?? 0) + 1);
+  }
+  for (const a of list) {
+    if ((labelCount.get(labels.get(a)!) ?? 0) > 1) labels.set(a, `${base.get(a)!} ·${tag4(acctKey(a))}`);
+  }
+  return labels;
+}
+
 /** 렌더용 모델. main.ts 는 이 모델을 textContent 로만 옮긴다.
  *  redactEmail = CC 🔒 가림 함수(신원 줄·겹침 꼬리표) · hidePaths = 🔒 가림 상태(설정 폴더를 끝 이름으로 — 리뷰1 M9) ·
  *  hidden = 뷰어가 숨긴 계정 키(`provider:account_id`) 집합 — 후보·줄·제공자 요약에서 뺀다(저장소는 main.ts 만 읽는다). */
@@ -768,26 +798,19 @@ export function buildUsageBarModel(
         { ...empty, headline: "대기 중", message: "사용량 확인 대기 중 — 바로 보려면 Control Center > Live" };
   }
 
-  // 라벨: 겹치면 구분 꼬리표로(둘 다 "Claude" 로 보이지 않게) — 이메일(🔒 가림 거침)로 먼저, 그래도 같으면(같은 이메일·이메일 없음)
-  // 종전 결정론 tag4. 숨긴 계정은 화면에 없으므로 겹침 계산에서도 뺀다.
-  const base = new Map<AcctRow, string>();
-  const baseCount = new Map<string, number>();
-  for (const a of list) {
-    const l = accountShortLabel(a);
-    base.set(a, l);
-    baseCount.set(l, (baseCount.get(l) ?? 0) + 1);
-  }
-  const labels = new Map<AcctRow, string>();
-  const labelCount = new Map<string, number>();
-  for (const a of list) {
-    const b = base.get(a)!;
-    const l = (baseCount.get(b) ?? 0) > 1 ? `${b} ·${overlapTag(a, redactEmail)}` : b;
-    labels.set(a, l);
-    labelCount.set(l, (labelCount.get(l) ?? 0) + 1);
-  }
-  for (const a of list) {
-    if ((labelCount.get(labels.get(a)!) ?? 0) > 1) labels.set(a, `${base.get(a)!} ·${tag4(acctKey(a))}`);
-  }
+  // 라벨: 겹치면 구분 꼬리표로(둘 다 "Claude" 로 보이지 않게) — accountDisplayLabels 한 벌(0.14.45 부서 카드도 같은 함수를 쓴다).
+  // 숨긴 계정은 화면에 없으므로 겹침 계산에서도 뺀다.
+  const labels = accountDisplayLabels(list, redactEmail);
+  // ★0.14.45 역매핑 — 이 계정을 지금 쓰는 부서·노드(있을 때만 키를 단다 · 없으면 종전 모델 그대로).
+  const usersOf = (a: AcctRow): string[] => {
+    const u = opts && opts.users && typeof opts.users.get === "function" ? opts.users.get(acctKey(a)) : undefined;
+    return Array.isArray(u) ? u.filter((x) => typeof x === "string" && x !== "") : [];
+  };
+  const withUsers = <T extends { users?: string[] }>(o: T, a: AcctRow): T => {
+    const u = usersOf(a);
+    if (u.length) o.users = u;
+    return o;
+  };
 
   // 관측 전 계정 — 개수로 접지 않고 한 줄씩(0.14.42). 제공자 순(claude·codex·antigravity) → 라벨 순(결정론).
   const unobserved = list
@@ -796,14 +819,17 @@ export function buildUsageBarModel(
   const unobservedLines: UsageLine[] = unobserved.map((a) => {
     const v = USAGE_WINDOWS.map((l) => windowView(a, l, nowSec));
     const st = unobservedStatus(a);
-    return {
-      label: labels.get(a)!,
-      text: st.text,
-      tooltip: tooltipFor(a, v, freshness(a, nowSec), redactEmail, hidePaths, st.detail),
-      dim: true,
-      unobserved: true,
-      inUse: a.in_use === true,
-    };
+    return withUsers<UsageLine>(
+      {
+        label: labels.get(a)!,
+        text: st.text,
+        tooltip: tooltipFor(a, v, freshness(a, nowSec), redactEmail, hidePaths, st.detail),
+        dim: true,
+        unobserved: true,
+        inUse: a.in_use === true,
+      },
+      a,
+    );
   });
   const primaryAcct = pickPrimaryAccount(list, nowSec);
   if (!primaryAcct) {
@@ -827,7 +853,7 @@ export function buildUsageBarModel(
     const v = acctWindowViews(a, nowSec);
     const f = displayFresh(a, nowSec);
     const ex = finiteNum(a.exhaust_at);
-    return {
+    const box: UsagePrimary = {
       key: acctKey(a),
       label: labels.get(a)!,
       tooltip: tooltipFor(a, v, f, redactEmail, hidePaths),
@@ -836,19 +862,23 @@ export function buildUsageBarModel(
       exhaust: ex !== null && ex > nowSec && (f.level === "fresh" || f.level === "recent") ? `이 속도면 ${hhmm(ex)} 소진` : "",
       inUse: a.in_use === true,
     };
+    return withUsers(box, a);
   };
   const lineOf = (a: AcctRow): UsageLine => {
     const v = acctWindowViews(a, nowSec);
     const f = displayFresh(a, nowSec);
     const txt = v.map((w) => `${w.label} ${w.text}`).join(" · ");
-    return {
-      label: labels.get(a)!,
-      text: f.note && f.level !== "fresh" ? `${txt} (${f.note})` : txt,
-      tooltip: tooltipFor(a, v, f, redactEmail, hidePaths),
-      dim: f.level === "stale",
-      unobserved: false,
-      inUse: a.in_use === true,
-    };
+    return withUsers<UsageLine>(
+      {
+        label: labels.get(a)!,
+        text: f.note && f.level !== "fresh" ? `${txt} (${f.note})` : txt,
+        tooltip: tooltipFor(a, v, f, redactEmail, hidePaths),
+        dim: f.level === "stale",
+        unobserved: false,
+        inUse: a.in_use === true,
+      },
+      a,
+    );
   };
   const primary: UsagePrimary = boxOf(primaryAcct);
 
