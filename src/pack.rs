@@ -1234,10 +1234,12 @@ fn reconcile_agy_statusline_now() {
     } else {
         // ★(B1) 같은 버전에서 이미 실연 검사가 실패했으면 다시 검사하지 않는다(부트마다 5초 검사 반복 금지) — 버전이 바뀌거나
         //   사람이 `cys doctor --fix` 를 부르면(기록 무시 · 결과로 덮는다) 다시 검사한다. 유닉스에는 검사가 없어 기록도 없다.
-        if let Some(reason) = agy::probe_failure_recorded(&pack, version) {
+        // ★(성찰 m2) 같은 버전이라도 24시간이 지나면 다시 검사한다(기계 환경이 바뀌었을 수 있다) — 시각 없는 옛 기록도 다시 검사.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        if let Some(reason) = agy::probe_failure_deferring(&pack, version, now) {
             eprintln!(
-                "[pack] agy 상태줄: 이 버전({version})의 실연 검사 실패 기록이 있어 다시 검사하지 않았습니다({reason}) — \
-                 다시 시도: `cys doctor --fix`"
+                "[pack] agy 상태줄: 이 버전({version})의 실연 검사 실패 기록(24시간 이내)이 있어 다시 검사하지 않았습니다({reason}) — \
+                 24시간 뒤 자동 재검사 · 지금 다시 시도: `cys doctor --fix`"
             );
             return;
         }
@@ -1247,6 +1249,7 @@ fn reconcile_agy_statusline_now() {
                 pack_dir: &pack,
                 record: &record,
                 windows: cfg!(windows),
+                home: Some(&home),
                 // 윈도우는 쓰기 직전 실연 검사(콘솔 창 없음 · 5초 상한) — 실패는 결과 한 줄일 뿐 설치는 계속된다.
                 probe: Some(&agy::live_probe),
             },

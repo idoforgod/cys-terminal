@@ -8838,6 +8838,7 @@ fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
                     pack_dir: &ctx.pack_dir,
                     record: &record,
                     windows: cfg!(windows),
+                    home: Some(home),
                     probe: Some(&agy::live_probe),
                 },
                 true,
@@ -8890,7 +8891,7 @@ fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
             //   권한다 — 윈도우 판 agy 는 `cmd /c` 로 부르므로 `bash` 가 WSL 의 System32\bash.exe 로 잡힐 수 있다.
             let legacy = cfg!(windows)
                 && agy::inspect_command(&settings).is_some_and(|c| agy::command_is_legacy_windows_sh(&c));
-            let advice = match (legacy, agy::link_command_for(&ctx.pack_dir.to_string_lossy(), true, false)) {
+            let advice = match (legacy, agy::link_command_for_home(&ctx.pack_dir.to_string_lossy(), true, false, Some(&home.to_string_lossy()))) {
                 (true, Some(c)) => format!(
                     "윈도우 판 agy 는 상태줄을 `cmd /c` 로 부릅니다 — `bash …sh` 연결은 WSL bash 로 잡혀 값이 안 들어올 수 \
                      있습니다. 권장: statusLine command 를 `{c}` 로 바꾸거나, 칸을 비운 뒤 {fix_hint} (cys 는 직접 넣은 연결을 \
@@ -8913,16 +8914,45 @@ fn diag_agy_statusline(ctx: &DoctorCtx, fix: bool) -> DiagItem {
         (_, true) => item(DiagStatus::Ok, "꺼짐(되돌리기 노브) — 연결 없음".into(), with_done(String::new())),
         (_, false) if record.exists() => item(
             DiagStatus::Warn,
-            "전에 cys 가 연결했던 statusLine 이 비어 있다(agy 의 /statusline delete 등) — 설치는 다시 넣지 않는다".into(),
+            format!("전에 cys 가 연결했던 statusLine 이 비어 있다(agy 의 /statusline delete 등) — 설치는 다시 넣지 않는다{}", probe_failure_note(&ctx.pack_dir)),
             with_done(format!("다시 연결: {fix_hint}")),
         ),
         (_, false) => item(
             DiagStatus::Warn,
-            "아직 연결되지 않았다 — agy 쿼터 값은 들어오지 않는다".into(),
+            format!("아직 연결되지 않았다 — agy 쿼터 값은 들어오지 않는다{}", probe_failure_note(&ctx.pack_dir)),
             with_done(format!("{fix_hint} (다음 설치·업데이트 때도 자동으로 연결된다)")),
         ),
     }
 }
+
+/// ★(0.14.45 · 성찰 m2) 지난 윈도우 실연 검사 실패 기록(`state/agy-statusline-probe-failed`)을 doctor 에 **보이게** — 사유 · 버전 · 나이 · 재검사 규칙(같은 버전 24시간 뒤 자동 ·
+/// 버전 변경 · `--fix` 는 기록 무시). 기록 없음 = 빈 문자열.
+fn probe_failure_note(pack_dir: &std::path::Path) -> String {
+    use cys::agy_statusline as agy;
+    let Some(f) = agy::probe_failure_record(pack_dir) else {
+        return String::new();
+    };
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let age = match f.age_secs(now) {
+        Some(a) if a >= 3600 => format!("{}시간 전", a / 3600),
+        Some(a) => format!("{}분 전", a / 60),
+        None => "시각 모름".into(),
+    };
+    let me = env!("CARGO_PKG_VERSION");
+    let state = if f.defers_retry(me, now) {
+        "설치 경로는 24시간이 지나면 자동 재검사"
+    } else if f.version == me {
+        "24시간이 지나 다음 설치·부트 조정 때 다시 검사한다"
+    } else {
+        "다른 버전의 기록이라 다음 설치·부트 조정 때 다시 검사한다"
+    };
+    format!(
+        " · 지난 실연 검사 실패 기록(버전 {} · {age}): {} — {state} · 지금 다시: `cys doctor --fix`(기록 무시)",
+        f.version,
+        if f.reason.is_empty() { "사유 없음" } else { f.reason.as_str() }
+    )
+}
+
 
 #[cfg(unix)]
 fn doctor_socket_connectable(p: &std::path::Path) -> bool {
@@ -32546,6 +32576,39 @@ mod tests {
 
     /// ★0.14.42 agy 상태줄 자동 연결 — doctor 는 가짜 홈에서만 본다(기본 ctx 는 Skip). 사용자 설정은 --fix 로도 덮지
     /// 않고, 부서·임시 팩 레인의 --fix 는 개인 설정을 만지지 않으며, 끔 파일이 있으면 cys 가 넣은 연결만 뺀다.
+    /// ★(0.14.45 · 성찰 m2) 지난 실연 검사 실패 기록은 doctor 에 **보인다**(사유 · 버전 · 나이 · 재검사 규칙) — 연결되지 않은 두 Warn 행에 붙고, 기록이 없으면 빈 문자열.
+    #[test]
+    fn doctor_agy_statusline_shows_the_recorded_probe_failure_reason() {
+        use cys::agy_statusline as agy;
+        let base = std::env::temp_dir().join(format!("cys-doc-agy-pf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let home = base.join("home");
+        let settings = agy::settings_path_under(&home);
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, "{\n  \"statusLine\": {\n    \"type\": \"\",\n    \"command\": \"\",\n    \"enabled\": false\n  }\n}\n").unwrap();
+        let mut ctx = doctor_ctx_at(&base);
+        ctx.agy_home = Some(home.clone());
+        assert_eq!(probe_failure_note(&ctx.pack_dir), "", "기록 없음 = 빈 문자열");
+        let it = diag_agy_statusline(&ctx, false);
+        assert_eq!(it.status, DiagStatus::Warn);
+        assert!(!it.detail.contains("실연 검사 실패 기록"), "{}", it.detail);
+        // 이 버전 · 방금 — '24시간 뒤 자동 재검사'
+        agy::record_probe_failure(&ctx.pack_dir, env!("CARGO_PKG_VERSION"), "출력이 기대한 cys 가 아니다");
+        let it = diag_agy_statusline(&ctx, false);
+        assert!(it.detail.contains("지난 실연 검사 실패 기록") && it.detail.contains("출력이 기대한 cys 가 아니다") && it.detail.contains("24시간이 지나면 자동 재검사") && it.detail.contains("--fix"), "{}", it.detail);
+        // 다른 버전 · 2시간 전 — '다른 버전의 기록'
+        let p = ctx.pack_dir.join(agy::PROBE_FAIL_REL);
+        let two_h_ago = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 7200;
+        std::fs::write(&p, agy::probe_failure_record_text_at("0.0.1", "", two_h_ago)).unwrap();
+        let it = diag_agy_statusline(&ctx, false);
+        assert!(it.detail.contains("버전 0.0.1 · 2시간 전") && it.detail.contains("사유 없음") && it.detail.contains("다른 버전의 기록"), "{}", it.detail);
+        // 같은 버전 · 25시간 전 — '24시간이 지나'
+        std::fs::write(&p, agy::probe_failure_record_text_at(env!("CARGO_PKG_VERSION"), "timeout", two_h_ago - 23 * 3600)).unwrap();
+        let it = diag_agy_statusline(&ctx, false);
+        assert!(it.detail.contains("25시간 전") && it.detail.contains("24시간이 지나 다음 설치"), "{}", it.detail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn doctor_agy_statusline_reports_and_fixes_only_in_the_fake_home() {
         use cys::agy_statusline as agy;

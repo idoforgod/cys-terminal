@@ -113,29 +113,82 @@ pub fn settings_path_under(home: &Path) -> PathBuf {
     home.join(".gemini").join("antigravity-cli").join("settings.json")
 }
 
-/// (B1) 실패 기록 본문(순수) — 첫 줄 `version=` · 둘째 줄 `reason=`(한 줄로 접는다).
+/// ★(0.14.45 · 성찰 m2) 같은 버전이라도 실패 기록이 이만큼 지나면 다시 검사한다(초 · 24시간) — 기계 환경(PATH·cys 설치)이 바뀌었을 수 있다.
+/// 버전이 바뀌면 즉시 · 사람이 부른 `cys doctor --fix` 는 기록을 무시한다(종전 그대로).
+pub const PROBE_FAIL_RETRY_SECS: u64 = 24 * 3600;
+
+/// (B1) 실패 기록 본문(순수) — `version=` · `reason=`(한 줄로 접는다) · ★(m2) `at=<epoch 초>`.
 pub fn probe_failure_record_text(version: &str, reason: &str) -> String {
+    probe_failure_record_text_at(version, reason, epoch_now())
+}
+
+/// [`probe_failure_record_text`] 의 시각 주입판(순수).
+pub fn probe_failure_record_text_at(version: &str, reason: &str, at: u64) -> String {
     let reason: String = reason.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).take(400).collect();
-    format!("version={version}\nreason={reason}\n")
+    format!("version={version}\nreason={reason}\nat={at}\n")
 }
 
-/// (B1 · 순수) 기록 본문이 **이 버전**의 실패인가 — 맞으면 사유를 돌려준다. 버전이 다르거나 본문이 어긋나면 `None`(= 다시 검사).
-pub fn probe_failure_for_version(text: &str, version: &str) -> Option<String> {
-    let mut lines = text.lines();
-    let v = lines.next()?.strip_prefix("version=")?.trim();
-    if v != version {
-        return None;
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// ★(m2) 실패 기록 한 건(판독 결과) — `at` 은 옛 판(0.14.45 초기)의 기록에 없을 수 있다(`None` = 시각 모름 = 만료로 본다).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeFailure {
+    pub version: String,
+    pub reason: String,
+    pub at: Option<u64>,
+}
+
+impl ProbeFailure {
+    /// ★(m2 · 순수) 이 기록이 **지금 재검사를 미루게 하는가** — 같은 버전 ∧ 시각이 있고 ∧ 24시간 미만(시계가 뒤로 갔으면 만료로 본다).
+    pub fn defers_retry(&self, version: &str, now: u64) -> bool {
+        self.version == version && self.at.is_some_and(|at| now >= at && now - at < PROBE_FAIL_RETRY_SECS)
     }
-    Some(lines.next().and_then(|l| l.strip_prefix("reason=")).unwrap_or("").trim().to_string())
+    /// 기록 나이(초) — 시각이 없거나 미래면 `None`.
+    pub fn age_secs(&self, now: u64) -> Option<u64> {
+        self.at.filter(|at| now >= *at).map(|at| now - at)
+    }
 }
 
-/// (B1) `<pack>/state/agy-statusline-probe-failed` 가 **이 버전**의 실패를 적고 있으면 그 사유. 없음·판독 불가·다른 버전 = `None`.
-pub fn probe_failure_recorded(pack_dir: &Path, version: &str) -> Option<String> {
+/// ★(m2 · 순수) 기록 본문 판독 — 첫 줄이 `version=` 이 아니면 `None`. 사유·시각은 없어도 된다.
+pub fn probe_failure_parse(text: &str) -> Option<ProbeFailure> {
+    let mut lines = text.lines();
+    let version = lines.next()?.strip_prefix("version=")?.trim().to_string();
+    let mut reason = String::new();
+    let mut at = None;
+    for l in lines {
+        if let Some(r) = l.strip_prefix("reason=") {
+            reason = r.trim().to_string();
+        } else if let Some(a) = l.strip_prefix("at=") {
+            at = a.trim().parse::<u64>().ok();
+        }
+    }
+    Some(ProbeFailure { version, reason, at })
+}
+
+/// (B1 · 순수) 기록 본문이 **이 버전**의 실패인가 — 맞으면 사유를 돌려준다. 버전이 다르거나 본문이 어긋나면 `None`(= 다시 검사). 시각은 보지 않는다(시각 판정은 [`ProbeFailure::defers_retry`]).
+pub fn probe_failure_for_version(text: &str, version: &str) -> Option<String> {
+    probe_failure_parse(text).filter(|f| f.version == version).map(|f| f.reason)
+}
+
+/// ★(m2) `<pack>/state/agy-statusline-probe-failed` 의 기록(버전 무관 · 없음·판독 불가 = `None`) — doctor 가 사유를 보여 주는 데 쓴다.
+pub fn probe_failure_record(pack_dir: &Path) -> Option<ProbeFailure> {
     let text = std::fs::read_to_string(pack_dir.join(PROBE_FAIL_REL)).ok()?;
-    probe_failure_for_version(&text, version)
+    probe_failure_parse(&text)
 }
 
-/// (B1) 실패를 기록한다(best-effort · 원자 쓰기). 기록 실패는 다음 부트가 한 번 더 검사하는 것뿐이다.
+/// (B1) `<pack>/state/agy-statusline-probe-failed` 가 **이 버전**의 실패를 적고 있으면 그 사유. 없음·판독 불가·다른 버전 = `None`. 시각은 보지 않는다.
+pub fn probe_failure_recorded(pack_dir: &Path, version: &str) -> Option<String> {
+    probe_failure_record(pack_dir).filter(|f| f.version == version).map(|f| f.reason)
+}
+
+/// ★(m2) 설치 경로(cysd 부트 뒤 조정 · init-pack)가 쓰는 판 — 이 버전의 실패이고 **24시간이 안 지났을 때만** 사유(= 재검사 미룸). 그 밖(없음·다른 버전·24시간 경과·시각 없는 옛 기록)은 `None`(= 다시 검사).
+pub fn probe_failure_deferring(pack_dir: &Path, version: &str, now: u64) -> Option<String> {
+    probe_failure_record(pack_dir).filter(|f| f.defers_retry(version, now)).map(|f| f.reason)
+}
+
+/// (B1) 실패를 기록한다(best-effort · 원자 쓰기 · 시각 포함). 기록 실패는 다음 부트가 한 번 더 검사하는 것뿐이다.
 pub fn record_probe_failure(pack_dir: &Path, version: &str, reason: &str) {
     let p = pack_dir.join(PROBE_FAIL_REL);
     if let Some(d) = p.parent() {
@@ -187,21 +240,58 @@ fn windows_path_is_safe(p: &str) -> bool {
         && b[3..].iter().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'\\' | b'.' | b'_' | b'-'))
 }
 
+/// ★(0.14.45 · 성찰 m1) 윈도우 **비ASCII 사용자 폴더**(한글 이름 등) — 팩이 `%USERPROFILE%` 아래이고 **안전하지 않은 글자가 비ASCII 뿐**이면
+/// (공백·`% ^ & ( ) !`·따옴표는 여전히 거절) `%USERPROFILE%\<나머지>\hooks\cys-agy-statusline.cmd` 를 만든다 — `cmd /c` 가 `%USERPROFILE%` 을
+/// 전개한다(그 기계의 실연 검사 [`live_probe`] 가 **이 문자열 그대로** `cmd /c` 로 돌려 검증한다). 순수: `pack` = 역슬래시·확장 접두를 정리한 팩 경로 ·
+/// `home` = 같은 규칙으로 정리한 홈. 홈이 전부 ASCII 안전 글자면(= 평문 경로가 이미 안전) 이 꼴을 쓰지 않는다(`None` — 호출자가 평문 경로를 쓴다).
+fn windows_userprofile_script(pack: &str, home: &str) -> Option<String> {
+    let safe_ascii = |c: char| c.is_ascii_alphanumeric() || matches!(c, '\\' | '.' | '_' | '-');
+    let home = home.trim_end_matches('\\');
+    let hb = home.as_bytes();
+    // 홈은 `X:\…` 꼴 · 글자는 ASCII 안전 집합 또는 비ASCII(공백·제어 제외)만 · 비ASCII 가 하나는 있어야 이 꼴이 필요하다.
+    if hb.len() < 4 || !hb[0].is_ascii_alphabetic() || hb[1] != b':' || hb[2] != b'\\' {
+        return None;
+    }
+    // `X:\` 뒤의 글자만 본다(드라이브 콜론은 안전 집합 밖이지만 접두의 일부다).
+    if !home[3..].chars().all(|c| safe_ascii(c) || (!c.is_ascii() && !c.is_whitespace() && !c.is_control())) || home.is_ascii() {
+        return None;
+    }
+    // 팩이 홈 바로 아래(홈 + `\`) — 홈 부분은 ASCII 대소문자 무시로 맞춘다(비ASCII 는 그대로).
+    let (ph, rest) = (pack.get(..home.len())?, pack.get(home.len()..)?);
+    let same_home = ph.chars().count() == home.chars().count()
+        && ph.chars().zip(home.chars()).all(|(a, b)| a == b || (a.is_ascii() && b.is_ascii() && a.eq_ignore_ascii_case(&b)));
+    let rest = rest.strip_prefix('\\')?;
+    if !same_home || rest.is_empty() || !rest.chars().all(safe_ascii) {
+        return None;
+    }
+    Some(format!("%USERPROFILE%\\{}\\hooks\\{SCRIPT_CMD}", rest.trim_end_matches('\\')))
+}
+
+/// 연결 명령 문자열(순수 · OS 규칙 주입) — 홈을 모르는 판([`link_command_for_home`] 의 `home = None`).
+pub fn link_command_for(pack_dir: &str, windows: bool, marker: bool) -> Option<String> {
+    link_command_for_home(pack_dir, windows, marker, None)
+}
+
 /// 연결 명령 문자열(순수 · OS 규칙 주입). `None` = 이 경로로는 안전한 명령을 만들 수 없다(공백·따옴표·상대경로 등).
 ///
 /// - 유닉스: `sh <pack>/hooks/cys-agy-statusline.sh[ --cys-autolink]`
 /// - 윈도우: `<pack>\hooks\cys-agy-statusline.cmd[ --cys-autolink]` — 인터프리터 없음(cmd 가 `.cmd` 를 직접 실행) ·
 ///   정슬래시는 역슬래시로 · `\\?\` 확장 접두는 벗기고 UNC(`\\server\…` · `\\?\UNC\…`)는 만들지 않는다 ·
 ///   **따옴표를 두르지 않는다**(Go `EscapeArg` 가 `\"` 로 바꿔 경로가 깨진다 — 모듈 머리).
-pub fn link_command_for(pack_dir: &str, windows: bool, marker: bool) -> Option<String> {
+///   ★(성찰 m1) 평문 경로가 안전하지 않고 `home` 이 주어졌으면 `%USERPROFILE%` 꼴([`windows_userprofile_script`])을 시도한다.
+pub fn link_command_for_home(pack_dir: &str, windows: bool, marker: bool, home: Option<&str>) -> Option<String> {
     let script = if windows {
-        let p = pack_dir.replace('/', "\\");
-        let p = p.strip_prefix(r"\\?\").unwrap_or(&p);
+        let norm = |p: &str| -> String {
+            let p = p.replace('/', "\\");
+            p.strip_prefix(r"\\?\").unwrap_or(&p).to_string()
+        };
+        let p = norm(pack_dir);
         let script = format!("{}\\hooks\\{SCRIPT_CMD}", p.trim_end_matches('\\'));
-        if !windows_path_is_safe(&script) {
-            return None;
+        if windows_path_is_safe(&script) {
+            script
+        } else {
+            windows_userprofile_script(p.trim_end_matches('\\'), &home.map(norm)?)?
         }
-        script
     } else {
         let script = format!("{}/hooks/{SCRIPT}", pack_dir.trim_end_matches('/'));
         if !path_is_shell_safe(&script) {
@@ -625,6 +715,8 @@ pub struct Ctx<'a> {
     pub pack_dir: &'a Path,
     pub record: &'a Path,
     pub windows: bool,
+    /// ★(성찰 m1) 사용자 홈 — 윈도우에서 팩 경로에 비ASCII(한글 사용자 폴더)가 있을 때 `%USERPROFILE%` 꼴 명령을 만드는 데만 쓴다. `None` = 평문 경로만.
+    pub home: Option<&'a Path>,
     /// 윈도우에서 쓰기 직전에 부르는 실연 검사(운영 = [`live_probe`]). `None` 이면 윈도우는 쓰지 않는다(실패 방향 =
     /// 쓰지 않음). 유닉스는 부르지 않는다(맥 판 agy 의 `sh -c` 는 역어셈블로 확인 · 종전 동작 그대로).
     pub probe: Option<Probe<'a>>,
@@ -910,7 +1002,11 @@ fn write_record(record: &Path, settings: &Path) {
 /// statusLine 칸이 비어 있거나 없을 때만 cys 연결을 넣는다. `force` = '연결한 적 있음' 기록을 무시한다
 /// (사람이 부른 `cys doctor --fix` 만 쓴다 — 설치 경로는 false).
 pub fn ensure_linked(ctx: &Ctx, force: bool) -> Outcome {
-    ensure_linked_cmd(ctx, force, link_command_for(&ctx.pack_dir.to_string_lossy(), ctx.windows, true))
+    ensure_linked_cmd(
+        ctx,
+        force,
+        link_command_for_home(&ctx.pack_dir.to_string_lossy(), ctx.windows, true, ctx.home.map(|h| h.to_string_lossy()).as_deref()),
+    )
 }
 
 /// [`ensure_linked`] 의 본체 — 넣을 명령을 인자로 받는다(시험 이음매: 맥 샌드박스 파일로 윈도우 꼴 명령의 흐름을 잰다).
@@ -1143,7 +1239,7 @@ mod tests {
         }
         fn ensure(&self, force: bool) -> Outcome {
             let (s, p, r) = (self.settings(), self.pack(), self.record());
-            ensure_linked(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: false, probe: None }, force)
+            ensure_linked(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: false, home: None, probe: None }, force)
         }
         /// 윈도우 규칙으로 조정(검사 주입) — 래퍼 `.cmd` 를 함께 둔다(설치된 윈도우 팩처럼).
         fn ensure_win(&self, force: bool, probe: Option<Probe>) -> Outcome {
@@ -1152,7 +1248,7 @@ mod tests {
                 std::fs::write(&cmd_script, "@echo off\ncys usage-report-stdin --agy 2>nul\nexit /b 0\n").unwrap();
             }
             let (s, p, r) = (self.settings(), self.pack(), self.record());
-            ensure_linked_cmd(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: true, probe }, force, Some(WIN_CMD.to_string()))
+            ensure_linked_cmd(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: true, home: None, probe }, force, Some(WIN_CMD.to_string()))
         }
         fn want_cmd(&self) -> String {
             link_command_for(&self.pack().to_string_lossy(), false, true).unwrap()
@@ -1205,6 +1301,53 @@ mod tests {
             link_command_for("//?/D:/cys-pack", true, true).as_deref(),
             Some(r"D:\cys-pack\hooks\cys-agy-statusline.cmd --cys-autolink")
         );
+        // ★(성찰 m1) 비ASCII 사용자 폴더 — 홈을 알면 `%USERPROFILE%` 꼴(cmd 가 전개) · 홈을 모르면 종전대로 None · 공백·특수문자는 여전히 거절.
+        let home = r"C:\Users\홍길동";
+        assert_eq!(
+            link_command_for_home(r"C:\Users\홍길동\.cys\pack", true, true, Some(home)).as_deref(),
+            Some(r"%USERPROFILE%\.cys\pack\hooks\cys-agy-statusline.cmd --cys-autolink")
+        );
+        assert_eq!(
+            link_command_for_home(r"\\?\C:\Users\홍길동\.cys\pack\", true, false, Some("C:/Users/홍길동/")).as_deref(),
+            Some(r"%USERPROFILE%\.cys\pack\hooks\cys-agy-statusline.cmd"),
+            "확장 접두·정슬래시·끝 구분자 정리"
+        );
+        assert_eq!(
+            link_command_for_home(r"c:\users\홍길동\.cys\pack", true, false, Some(home)).as_deref(),
+            Some(r"%USERPROFILE%\.cys\pack\hooks\cys-agy-statusline.cmd"),
+            "홈의 ASCII 부분은 대소문자 무시"
+        );
+        assert_eq!(link_command_for_home(r"C:\Users\홍길동\.cys\pack", true, true, None), None, "홈을 모르면 종전대로 거절");
+        assert_eq!(link_command_for(r"C:\Users\홍길동\.cys\pack", true, true), None);
+        for (pack, h, why) in [
+            (r"C:\Users\홍 길동\.cys\pack", r"C:\Users\홍 길동", "홈에 공백"),
+            (r"C:\Users\홍길동%\.cys\pack", r"C:\Users\홍길동%", "홈에 % (cmd 확장 문법)"),
+            (r"C:\Users\홍길동\.cys\pa ck", r"C:\Users\홍길동", "나머지에 공백"),
+            (r"C:\Users\홍길동\.cys\팩", r"C:\Users\홍길동", "나머지에 비ASCII"),
+            (r"D:\cys\홍길동\pack", r"C:\Users\홍길동", "홈 밖"),
+            (r"C:\Users\홍길동", r"C:\Users\홍길동", "홈 자체(나머지 없음)"),
+            (r"C:\Users\x\.cys\pack", r"C:\Users\x", "홈이 전부 ASCII 면 평문 경로(이미 안전)"),
+        ] {
+            let got = link_command_for_home(pack, true, true, Some(h));
+            if why.starts_with("홈이 전부 ASCII") {
+                assert_eq!(got.as_deref(), Some(r"C:\Users\x\.cys\pack\hooks\cys-agy-statusline.cmd --cys-autolink"), "{why}");
+            } else {
+                assert_eq!(got, None, "{why}: {got:?}");
+            }
+        }
+        // 그 꼴은 cys 자동 연결로 인식되고(제거 경로 OS 무관) · Go 인용은 공백 때문에 통째 따옴표(cmd 가 벗긴 뒤 %USERPROFILE% 전개).
+        let up = r"%USERPROFILE%\.cys\pack\hooks\cys-agy-statusline.cmd --cys-autolink";
+        assert!(command_is_ours_auto(up) && command_is_cys(up) && !command_is_legacy_windows_sh(up));
+        assert_eq!(classify(&json!({"statusLine": {"command": up}})), Slot::OursAuto { enabled: None });
+        assert_eq!(classify(&json!({"statusLine": {"command": r"%USERPROFILE%\.cys\pack\hooks\cys-agy-statusline.cmd"}})), Slot::CysManual { enabled: None });
+        assert_eq!(go_escape_arg(up), format!("\"{up}\""));
+        {
+            let sb = Sandbox::new("userprofile-unlink");
+            let out = render_linked(AGY_DEFAULT, up).unwrap();
+            sb.put(out.as_bytes());
+            assert_eq!(unlink(&sb.settings(), None, Backup::Beside), Outcome::Unlinked);
+            assert_eq!(render_unlinked(&out).unwrap(), sb.read());
+        }
         // 윈도우 cmd 문법에서 뜻이 바뀌는 글자 · 공백 · 따옴표 · 비ASCII · UNC · 상대경로 → 명령을 만들지 않는다(안내만)
         for bad in [
             r"C:\Users\x\Kim Lee\.cys\pack",
@@ -1597,7 +1740,7 @@ mod tests {
         sb.put(AGY_DEFAULT.as_bytes());
         let (s, p, r) = (sb.settings(), sb.pack(), sb.record());
         let _ = std::fs::remove_file(sb.pack().join("hooks").join(SCRIPT_CMD));
-        let o = ensure_linked_cmd(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: true, probe: Some(&probe) }, true, Some(WIN_CMD.into()));
+        let o = ensure_linked_cmd(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: true, home: None, probe: Some(&probe) }, true, Some(WIN_CMD.into()));
         assert!(matches!(&o, Outcome::Refused(w) if w.contains(SCRIPT_CMD)), "{o:?}");
         assert_eq!(called.get(), 0);
         assert_eq!(sb.read(), AGY_DEFAULT);
@@ -1628,7 +1771,7 @@ mod tests {
         sb.put(AGY_DEFAULT.as_bytes());
         let (s, r) = (sb.settings(), sb.record());
         let p = sb.root.join("with space").join("pack");
-        assert!(matches!(ensure_linked(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: false, probe: None }, false), Outcome::UnsafePath(_)));
+        assert!(matches!(ensure_linked(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: false, home: None, probe: None }, false), Outcome::UnsafePath(_)));
         assert_eq!(sb.read(), AGY_DEFAULT);
     }
 
@@ -1740,7 +1883,7 @@ mod tests {
             Ok(())
         };
         let (s, p, r) = (sb.settings(), sb.pack(), sb.record());
-        let o = ensure_linked(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: true, probe: Some(&probe) }, true);
+        let o = ensure_linked(&Ctx { settings: &s, pack_dir: &p, record: &r, windows: true, home: None, probe: Some(&probe) }, true);
         assert!(matches!(o, Outcome::UnsafePath(_)), "{o:?}");
         assert!(!called.get());
         assert_eq!(sb.read(), AGY_DEFAULT);
@@ -1749,8 +1892,8 @@ mod tests {
     /// ★(0.14.45 · B1) 실연 검사 실패 기록 — 같은 버전만 유효(다른 버전·훼손 본문 = 다시 검사) · 기록/지움 왕복 · 사유의 줄바꿈 접기.
     #[test]
     fn probe_failure_record_is_version_scoped() {
-        let text = probe_failure_record_text("0.14.45", "출력이 기대한 `cys` 가 아니다\n둘째 줄");
-        assert_eq!(text, "version=0.14.45\nreason=출력이 기대한 `cys` 가 아니다 둘째 줄\n");
+        let text = probe_failure_record_text_at("0.14.45", "출력이 기대한 `cys` 가 아니다\n둘째 줄", 1_700_000_000);
+        assert_eq!(text, "version=0.14.45\nreason=출력이 기대한 `cys` 가 아니다 둘째 줄\nat=1700000000\n");
         assert_eq!(probe_failure_for_version(&text, "0.14.45").as_deref(), Some("출력이 기대한 `cys` 가 아니다 둘째 줄"));
         assert!(probe_failure_for_version(&text, "0.14.46").is_none(), "버전이 바뀌면 다시 검사");
         assert!(probe_failure_for_version("", "0.14.45").is_none());
@@ -1763,9 +1906,38 @@ mod tests {
         assert_eq!(probe_failure_recorded(&pack, "0.14.45").as_deref(), Some("timeout"));
         assert!(probe_failure_recorded(&pack, "0.14.46").is_none());
         assert!(pack.join(PROBE_FAIL_REL).is_file());
+        let rec = probe_failure_record(&pack).expect("기록");
+        assert_eq!((rec.version.as_str(), rec.reason.as_str()), ("0.14.45", "timeout"));
+        assert!(rec.at.is_some_and(|a| a > 1_700_000_000), "지금 시각이 적힌다");
         clear_probe_failure(&pack);
         assert!(!pack.join(PROBE_FAIL_REL).exists());
         clear_probe_failure(&pack); // 없어도 무동작
+    }
+
+    /// ★(성찰 m2) 실패 기록은 같은 버전이라도 24시간이 지나면 재검사를 미루지 않는다 · 버전이 다르면 즉시 · 시각 없는 옛 기록·미래 시각은 만료로 본다.
+    #[test]
+    fn probe_failure_record_expires_after_a_day_within_the_same_version() {
+        let t0 = 1_700_000_000u64;
+        let f = probe_failure_parse(&probe_failure_record_text_at("0.14.45", "r", t0)).unwrap();
+        assert!(f.defers_retry("0.14.45", t0) && f.defers_retry("0.14.45", t0 + PROBE_FAIL_RETRY_SECS - 1));
+        assert!(!f.defers_retry("0.14.45", t0 + PROBE_FAIL_RETRY_SECS), "24시간 = 재검사");
+        assert!(!f.defers_retry("0.14.46", t0 + 1), "버전 변경 = 재검사");
+        assert!(!f.defers_retry("0.14.45", t0 - 1), "시계가 뒤로 갔으면 만료");
+        assert_eq!((f.age_secs(t0 + 5), f.age_secs(t0 - 1)), (Some(5), None));
+        let old = probe_failure_parse("version=0.14.45\nreason=r\n").unwrap();
+        assert_eq!(old.at, None);
+        assert!(!old.defers_retry("0.14.45", t0), "시각 없는 옛 기록은 미루지 않는다");
+        assert_eq!(PROBE_FAIL_RETRY_SECS, 86_400);
+        let sb = Sandbox::new("probe-fail-expiry");
+        let pack = sb.pack();
+        assert!(probe_failure_deferring(&pack, "0.14.45", t0).is_none(), "기록 없음");
+        let p = pack.join(PROBE_FAIL_REL);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, probe_failure_record_text_at("0.14.45", "timeout", t0)).unwrap();
+        assert_eq!(probe_failure_deferring(&pack, "0.14.45", t0 + 3600).as_deref(), Some("timeout"));
+        assert!(probe_failure_deferring(&pack, "0.14.45", t0 + PROBE_FAIL_RETRY_SECS).is_none());
+        assert!(probe_failure_deferring(&pack, "0.14.46", t0 + 1).is_none());
+        assert_eq!(probe_failure_recorded(&pack, "0.14.45").as_deref(), Some("timeout"), "버전 판은 시각을 보지 않는다(doctor 표시용)");
     }
 
     #[test]
@@ -1852,7 +2024,7 @@ mod tests {
         std::fs::write(&settings, AGY_DEFAULT).unwrap();
         let record = pack.join(RECORD_REL);
         let probe = |c: &str| probe_output_ok(&run_like_agy(c, Some(std::ffi::OsStr::new(&with_cys)))?);
-        let o = ensure_linked(&Ctx { settings: &settings, pack_dir: &pack, record: &record, windows: true, probe: Some(&probe) }, false);
+        let o = ensure_linked(&Ctx { settings: &settings, pack_dir: &pack, record: &record, windows: true, home: None, probe: Some(&probe) }, false);
         assert_eq!(o, Outcome::Linked { created: false });
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v["statusLine"]["command"].as_str(), Some(cmd.as_str()));
