@@ -1341,6 +1341,9 @@ async fn async_main() {
         // ★리뷰어1 F1: install(false)도 동기 블로킹(최대 320파일 read+해시+write)이라 위 heartbeat 굶김
         // 위험이 동일 — spawn_blocking 으로 분리한다. (pack_current_for 게이트는 stat 2회라 동기 유지.)
         // W0-d: cysd 부팅 자동설치는 라이브 팩 쓰기 프로덕션 진입점 — 인가 부여.
+        // ★(0.14.45 · B1 · 치명위험 ④) 설치 경로의 agy 상태줄 조정(윈도우 실연 검사 ≤5.2초)은 **소켓 바인드 뒤**로 미룬다 —
+        //   바인드 앞에서 돌면 CLI 자동기동의 4초 폴링이 데몬을 못 본다. 소비는 post_listen_boot(별도 스레드 · 락 0 · 로그만).
+        cys::pack::defer_agy_statusline_probe();
         match tokio::task::spawn_blocking(|| {
             cys::pack::install(false, Some(cys::pack::PackWriteAuth::production()))
         })
@@ -2166,6 +2169,21 @@ fn post_listen_boot(socket_path: &std::path::Path, daemon: &Arc<Daemon>) {
     let state_dir = crate::state::state_dir(socket_path);
     prune_stale_phoenix_embed(&state_dir);
     spawn_auto_restore(&state_dir, socket_path, daemon);
+    spawn_deferred_agy_statusline_reconcile();
+}
+
+/// ★(0.14.45 · B1) 부트 설치 경로가 미뤄 둔 agy 상태줄 조정(윈도우 실연 검사 포함)을 **소켓 바인드 뒤** 별도 스레드에서 한다 —
+/// 데몬 락 0 · 결과는 로그 한 줄(실패해도 데몬·설치는 유효). 미뤄 둔 것이 없으면(팩이 최신이라 설치가 돌지 않았다) 무동작.
+/// 스레드 생성 실패도 로그 한 줄이다(조정은 다음 설치 경로·`cys doctor --fix` 가 다시 한다).
+fn spawn_deferred_agy_statusline_reconcile() {
+    let spawned = std::thread::Builder::new().name("cysd-agy-statusline".into()).spawn(|| {
+        if cys::pack::run_deferred_agy_statusline_reconcile() {
+            eprintln!("[cysd] agy 상태줄 조정(부트에서 미뤄 둔 실연 검사) 완료");
+        }
+    });
+    if let Err(e) = spawned {
+        eprintln!("[cysd] agy 상태줄 조정 스레드 생성 실패 — 건너뜀(다음 설치 경로·cys doctor --fix 가 다시 한다): {e}");
+    }
 }
 
 /// 콜드부트 auto-restore를 detached 스폰한다(env에 CYS_NO_AUTOSTART=1 — 자식 CLI가 라이벌
@@ -5128,6 +5146,22 @@ mod auto_restore_tests {
             "콜드부트 부트 호출이 양 accept_loop(unix+windows)에 정확히 2회여야 한다(현재 {calls}회) — \
              한쪽 미배선/중복은 콜드부트 auto-restore 플랫폼 비대칭(P0-7) 재발"
         );
+    }
+
+    /// ★(0.14.45 · B1) agy 상태줄 실연 검사는 소켓 바인드 **앞**에서 돌지 않는다 — 부트 설치 앞에서 미루기 표식을 세우고,
+    /// 바인드 뒤 공통 부트(post_listen_boot)가 별도 스레드로 소비한다(양 플랫폼 공통 — 한쪽 누락 불가).
+    #[test]
+    fn agy_statusline_probe_is_deferred_until_after_bind() {
+        let src = include_str!("main.rs");
+        let defer = src.find("cys::pack::defer_agy_statusline_probe();").expect("부트 설치 앞 미루기 표식 소실");
+        let install = src.find("cys::pack::install(false, Some(cys::pack::PackWriteAuth::production()))").expect("부트 설치");
+        assert!(defer < install, "미루기 표식은 부트 설치 호출 앞이어야 한다");
+        let plb = src.find("fn post_listen_boot(").expect("post_listen_boot");
+        let body = &src[plb..src[plb..].find("\n}\n").expect("fn end") + plb];
+        assert!(body.contains("spawn_deferred_agy_statusline_reconcile();"), "바인드 뒤 공통 부트에 소비 배선이 없다");
+        let consumer = src.find("fn spawn_deferred_agy_statusline_reconcile(").expect("소비 함수");
+        let cbody = &src[consumer..src[consumer..].find("\n}\n").expect("fn end") + consumer];
+        assert!(cbody.contains("std::thread::Builder::new()") && cbody.contains("run_deferred_agy_statusline_reconcile()"));
     }
 
     /// ★P0-5(D3/W5·CI 28780215417): auto-restore 스레드 panic 을 삼키지 않고 포착·기록하는지 — 재현 테스트.

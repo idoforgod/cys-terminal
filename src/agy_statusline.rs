@@ -99,6 +99,10 @@ pub const ENV_KNOB: &str = "CYS_AGY_STATUSLINE";
 pub const OFF_FILE: &str = "agy-statusline-off";
 /// '연결한 적 있음' 기록(팩 상대 · 팩 설치의 prune 대상이 아닌 state/ 아래).
 pub const RECORD_REL: &str = "state/agy-statusline-linked";
+/// ★(0.14.45 · B1) 윈도우 실연 검사 **실패 기록**(팩 상대 · state/ 아래) — `version=<cys 버전>` 한 줄 + `reason=…`. 같은 버전의
+/// 설치 경로(cysd 부트 뒤 미뤄 둔 조정 · init-pack)는 이 기록이 있으면 다시 검사하지 않는다(부트마다 5초 검사 반복 금지).
+/// 버전이 바뀌면 자동으로 무효 · 사람이 부른 `cys doctor --fix` 는 기록을 무시하고 다시 검사한 뒤 결과로 덮는다.
+pub const PROBE_FAIL_REL: &str = "state/agy-statusline-probe-failed";
 /// 쓰기 전 백업 접미(설정 파일 옆 · 실제로 쓸 때만 만든다).
 pub const BACKUP_SUFFIX: &str = ".bak-cys";
 /// 이보다 큰 settings.json 은 건드리지 않는다(정상 파일은 수백 바이트 — 2026-09-24 이 맥 316B).
@@ -107,6 +111,45 @@ const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 /// agy 설정 파일 경로(순수) — `<home>/.gemini/antigravity-cli/settings.json`.
 pub fn settings_path_under(home: &Path) -> PathBuf {
     home.join(".gemini").join("antigravity-cli").join("settings.json")
+}
+
+/// (B1) 실패 기록 본문(순수) — 첫 줄 `version=` · 둘째 줄 `reason=`(한 줄로 접는다).
+pub fn probe_failure_record_text(version: &str, reason: &str) -> String {
+    let reason: String = reason.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).take(400).collect();
+    format!("version={version}\nreason={reason}\n")
+}
+
+/// (B1 · 순수) 기록 본문이 **이 버전**의 실패인가 — 맞으면 사유를 돌려준다. 버전이 다르거나 본문이 어긋나면 `None`(= 다시 검사).
+pub fn probe_failure_for_version(text: &str, version: &str) -> Option<String> {
+    let mut lines = text.lines();
+    let v = lines.next()?.strip_prefix("version=")?.trim();
+    if v != version {
+        return None;
+    }
+    Some(lines.next().and_then(|l| l.strip_prefix("reason=")).unwrap_or("").trim().to_string())
+}
+
+/// (B1) `<pack>/state/agy-statusline-probe-failed` 가 **이 버전**의 실패를 적고 있으면 그 사유. 없음·판독 불가·다른 버전 = `None`.
+pub fn probe_failure_recorded(pack_dir: &Path, version: &str) -> Option<String> {
+    let text = std::fs::read_to_string(pack_dir.join(PROBE_FAIL_REL)).ok()?;
+    probe_failure_for_version(&text, version)
+}
+
+/// (B1) 실패를 기록한다(best-effort · 원자 쓰기). 기록 실패는 다음 부트가 한 번 더 검사하는 것뿐이다.
+pub fn record_probe_failure(pack_dir: &Path, version: &str, reason: &str) {
+    let p = pack_dir.join(PROBE_FAIL_REL);
+    if let Some(d) = p.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    let _ = crate::pack::write_atomic(&p, probe_failure_record_text(version, reason).as_bytes());
+}
+
+/// (B1) 실패 기록을 지운다(통과했거나 사람이 다시 검사를 명령했다). 없으면 무동작.
+pub fn clear_probe_failure(pack_dir: &Path) {
+    let p = pack_dir.join(PROBE_FAIL_REL);
+    if p.exists() {
+        let _ = std::fs::remove_file(&p);
+    }
 }
 
 /// 안내 문구용 설정 파일 경로 문자열(순수 · OS 규칙 주입) — 윈도우는 `%USERPROFILE%\.gemini\antigravity-cli\settings.json`
@@ -694,7 +737,7 @@ fn probe_spawn(
         match child.try_wait() {
             Ok(Some(st)) => break st,
             Ok(None) if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_probe_tree(&mut child);
                 let _ = child.wait();
                 return Err(format!("{}초 안에 끝나지 않았다(agy 도 같은 상한에서 실패한다)", timeout.as_secs_f32()));
             }
@@ -713,6 +756,30 @@ fn probe_spawn(
         return Err(format!("종료 코드 {:?}", status.code()));
     }
     Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// (B5) 상한을 넘긴 검사 자식을 **트리째** 끝낸다. 윈도우의 검사는 `cmd.exe → cys.exe` 두 단이라 `cmd` 만 죽이면 손자 `cys`
+/// 가 파이프를 쥔 채 남는다(고아 · 다음 검사와 겹침). `taskkill /T /F /PID <cmd pid>` 를 콘솔 창 없이 돌려 손자까지 끝낸 뒤
+/// 부모도 `kill` 한다(taskkill 부재·실패 시의 폴백 — 적어도 종전만큼은 한다). 유닉스는 손자가 없다(`sh` 없이 직접 실행) — `kill` 만.
+fn kill_probe_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        use crate::SpawnPolicy as _;
+        let taskkill = std::env::var_os("SystemRoot")
+            .map(|r| PathBuf::from(r).join("System32").join("taskkill.exe"))
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| PathBuf::from("taskkill"));
+        let mut c = std::process::Command::new(taskkill);
+        c.args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        c.spawn_policy(crate::ChildLifetime::Attached);
+        if let Ok(mut tk) = c.spawn() {
+            let _ = tk.wait();
+        }
+    }
+    let _ = child.kill();
 }
 
 /// 운영 실연 검사 — 윈도우 판 agy 1.2.17 이 상태줄 명령을 부르는 방식(`cmd /c` + Go `EscapeArg` · 5초 · 자기 환경)을 그대로
@@ -1655,6 +1722,28 @@ mod tests {
         assert!(matches!(o, Outcome::UnsafePath(_)), "{o:?}");
         assert!(!called.get());
         assert_eq!(sb.read(), AGY_DEFAULT);
+    }
+
+    /// ★(0.14.45 · B1) 실연 검사 실패 기록 — 같은 버전만 유효(다른 버전·훼손 본문 = 다시 검사) · 기록/지움 왕복 · 사유의 줄바꿈 접기.
+    #[test]
+    fn probe_failure_record_is_version_scoped() {
+        let text = probe_failure_record_text("0.14.45", "출력이 기대한 `cys` 가 아니다\n둘째 줄");
+        assert_eq!(text, "version=0.14.45\nreason=출력이 기대한 `cys` 가 아니다 둘째 줄\n");
+        assert_eq!(probe_failure_for_version(&text, "0.14.45").as_deref(), Some("출력이 기대한 `cys` 가 아니다 둘째 줄"));
+        assert!(probe_failure_for_version(&text, "0.14.46").is_none(), "버전이 바뀌면 다시 검사");
+        assert!(probe_failure_for_version("", "0.14.45").is_none());
+        assert!(probe_failure_for_version("garbage", "0.14.45").is_none());
+        assert_eq!(probe_failure_for_version("version=0.14.45\n", "0.14.45").as_deref(), Some(""), "사유 없는 기록도 이 버전의 실패다");
+        let sb = Sandbox::new("probe-fail-record");
+        let pack = sb.pack();
+        assert!(probe_failure_recorded(&pack, "0.14.45").is_none(), "기록 없음");
+        record_probe_failure(&pack, "0.14.45", "timeout");
+        assert_eq!(probe_failure_recorded(&pack, "0.14.45").as_deref(), Some("timeout"));
+        assert!(probe_failure_recorded(&pack, "0.14.46").is_none());
+        assert!(pack.join(PROBE_FAIL_REL).is_file());
+        clear_probe_failure(&pack);
+        assert!(!pack.join(PROBE_FAIL_REL).exists());
+        clear_probe_failure(&pack); // 없어도 무동작
     }
 
     #[test]
