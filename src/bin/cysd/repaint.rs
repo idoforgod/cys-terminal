@@ -5,7 +5,7 @@
 //!   청크가 버려졌다) 커서 행에서 마커를 영영 못 찾고 큐가 `prompt_unknown`·`input_pending`(판독 불가)으로 굶는다
 //!   (0.14.45 윈도우 11 제보 — master 16분 · worker 의 빈 프롬프트). 사람이 직접 send + Return 을 하면 풀렸던 것은
 //!   그것이 다시 그리기를 일으켰기 때문이다. 여기서는 **키를 한 바이트도 쓰지 않고** 같은 효과를 낸다 — PTY 를
-//!   (rows, cols-1) 로 줄였다가 ~150ms 뒤 (rows, cols) 로 되돌리면 SIGWINCH(유닉스)·ConPTY 크기 변경(윈도우)을 받은
+//!   (rows, cols-1) 로 줄였다가 ~500ms 뒤 (rows, cols) 로 되돌리면 SIGWINCH(유닉스)·ConPTY 크기 변경(윈도우)을 받은
 //!   TUI 가 화면 전체를 다시 그린다. 화면 사본(vt100 파서)의 크기도 같이 맞춘다.
 //!
 //! 【치명위험 렌즈】
@@ -34,7 +34,7 @@ pub(crate) const REPAINT_MIN_INTERVAL_SECS: u64 = 300;
 /// 복구되지 않은 연속 요청의 간격 배수 상한(2^4 = 16배).
 const REPAINT_BACKOFF_MAX_SHIFT: u32 = 4;
 /// 줄였다가 되돌리기까지의 간격(ms) — TUI 가 첫 크기 변경을 읽을 시간.
-pub(crate) const REPAINT_SETTLE_MS: u64 = 150;
+pub(crate) const REPAINT_SETTLE_MS: u64 = 500;
 
 /// 좌석별 재동기 상태(leaf 락 · 다른 락을 쥔 채 잡지 않는다).
 #[derive(Debug, Default)]
