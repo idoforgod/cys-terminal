@@ -1771,7 +1771,7 @@ pub(crate) fn resolve_seat_folder_on(config_dir: Option<&str>, trusted: bool, se
         }
     }
     match (observed_profile_dir_on(session_file, windows), recorded) {
-        // ★(2차 검토 MINOR) 윈도우는 대소문자를 가리지 않는 파일시스템이라 `C:\Users\Alice` 기록과 `c:\users\alice\…` 관측이 접두 비교(대소 보존)에 실패한다 —
+        // ★(2차 검토 MINOR) 윈도우는 대소문자를 가리지 않는 파일시스템이라 `C:\Users\user` 기록과 `c:\users\user\…` 관측이 접두 비교(대소 보존)에 실패한다 —
         //   폴더가 같은 곳이면(`same_dir_on` · 윈도우는 ASCII 대소 무시) 기록이 확인된 것이다(불일치 아님).
         (Some(o), Some(r)) if same_dir_on(&o, r, windows) => SeatFolder::Verified(r.to_string()),
         (Some(o), Some(r)) => SeatFolder::Mismatch { observed: o, recorded: r.to_string() },
@@ -6311,8 +6311,8 @@ mod tests {
             );
             assert!(same_dir("/h/.claude-4", "/h/.claude-4/") && same_dir_on(r"C:\u\.claude-4", "/c/u/.claude-4", true));
             // (2차 검토 MINOR) 윈도우 대소문자만 다른 같은 폴더의 관측은 기록을 확인한 것 — 불일치가 아니다. 유닉스에서는 다른 폴더다.
-            assert_eq!(resolve_seat_folder_on(Some(r"C:\Users\Alice\.claude-4"), false, r"c:\users\alice\.claude-4\projects\C--p\s.jsonl", true), Verified(r"C:\Users\Alice\.claude-4".into()));
-            assert_eq!(resolve_seat_folder_on(Some("/h/Alice/.claude-4"), false, "/h/alice/.claude-4/projects/-p/s.jsonl", false), Mismatch { observed: "/h/alice/.claude-4".into(), recorded: "/h/Alice/.claude-4".into() });
+            assert_eq!(resolve_seat_folder_on(Some(r"C:\Users\user\.claude-4"), false, r"c:\users\user\.claude-4\projects\C--p\s.jsonl", true), Verified(r"C:\Users\user\.claude-4".into()));
+            assert_eq!(resolve_seat_folder_on(Some("/h/X/.claude-4"), false, "/h/x/.claude-4/projects/-p/s.jsonl", false), Mismatch { observed: "/h/x/.claude-4".into(), recorded: "/h/X/.claude-4".into() });
             assert!(!same_dir("/h/.claude-4", "/h/.claude-40") && !same_dir("/h/.claude-4", "/h/.cys/claude"));
             assert!(same_dir_on("/h/A", "/h/a", true) && !same_dir_on("/h/A", "/h/a", false), "대소문자 무시는 윈도우만");
         }

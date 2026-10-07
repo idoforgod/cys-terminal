@@ -103,13 +103,16 @@
 - agy 상태줄 자동 연결: `CYS_AGY_STATUSLINE=0` 또는 `~/.cys/agy-statusline-off`.
 - 처방 코드 · 계정 표시: 되돌리는 노브가 없습니다(표시·안내뿐이며 어떤 배달 판정도 바꾸지 않습니다).
 
-## 9. 검증 (이 워크트리 · 맥 · 발행 때 갱신)
+## 9. 검증 (이 워크트리 · 맥 · 2026-10-07 · 발행 때 갱신)
 
-- `cargo test --lib`: 738 통과 · 0 실패 · 1 ignored (C1 이동 뒤 · 성찰 2회차 전체 반영 뒤 재측정 예정)
-- `cargo test --bin cysd`: (재측정 예정 — 허용된 유일 실패 `b3_status_polling_does_not_restat_the_identity_file`)
-- `cargo test --bin cys`: (재측정 예정)
+- `cargo test --lib`: 744 통과 · 0 실패 · 1 ignored
+- `cargo test --bin cysd`: 2222 통과 · 2 실패 · 6 ignored — 허용된 기존 실패 `b3_status_polling_does_not_restat_the_identity_file` 1건 + `claim_role_cso_variant_goes_through_the_privileged_gate` 1건(좌석 판정과 디스패치 사이의 시간 경쟁 · 이번 변경과 무관 · 단독 재실행 3/3 통과 — 간헐)
+- `cargo test --bin cys`: 472 통과 · 0 실패
+- `sh scripts/win-typecheck.sh`: 오류 0 · 경고 30(변경 전과 같은 수 · 바뀐 파일에 새 경고 0)
 - ui `bun test`: 2312 통과 · 0 실패 (61 파일) · `bunx tsc -p tsconfig.check.json`: 오류 0
-- `scripts/secret-scan.sh --all`: clean(1113 파일) · `scripts/scan-pack-secrets.sh`: OK
+- `run_bootstrap_health.py --json`(격리 CYS_PACK_DIR · target/debug 우선): GREEN — 163 통과 · 0 실패 · 1 skip (164)
+- `scripts/secret-scan.sh --all`: clean(1114 파일) · `scripts/scan-pack-secrets.sh`: OK
+- codex(gpt-6-astra) 독립 2차 검토: BLOCK 0 · MAJOR 4(전부 반영 · 위 §2·§4·§7) · MINOR 5(전부 반영)
 - 윈도우 실기: **미측정**(§7).
 
 ## 10. 업그레이드하실 때
