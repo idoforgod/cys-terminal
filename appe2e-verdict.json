@@ -1,0 +1,13 @@
+{
+    "result":  "PASS",
+    "upgrade":  "PASS",
+    "team":  "PASS",
+    "reasons":  [
+                    "UPGRADE PASS: the installed 0.14.46 app was upgraded to 0.14.47 (emulate): the marker and the three executables are 0.14.47, no failure file, the app came back, reports 0.14.47 and its UI is up",
+                    "TEAM PASS: the button flow started by clicks, a new team tab stood (waiting screen -\u003e real tab), a new cysd.exe was created after the click and no failure notification was shown",
+                    "NOTE the upgraded app showed the update-error notification at +4.8 s of the page watch: \"업데이트 경고 :: 새 팩 반영(init-pack) 실패 — 노드 복원 보류, 다음 재시작에 재시도\"",
+                    "NOTE the status bar still shows daemon pid 4204 at the end while daemon_status answers pid 1348 (the text is not rewritten after the rotation)",
+                    "NOTE 1 of the 3 \"cys.exe init-pack\" process(es) after the upgrade ended with a non-zero exit status (overlap=True; see appe2e-upg-proc-audit.txt)",
+                    "NOTE leftovers in the install folder (after_observation): 16 *.prev* file(s), 0 *.new.exe file(s): .cys-update-trash\\cys.prev.exe.prev1791498196000, .cys-update-trash\\libcrypto-3.dll.prev57287.prev1791498196002, .cys-update-trash\\libssl-3.dll.prev68087.prev1791498196003, .cys-update-trash\\python3.dll.prev7044.prev1791498196004, .cys-update-trash\\python3.exe.prev23757.prev1791498196005, .cys-update-trash\\python312.dll.prev9028.prev1791498196006, .cys-update-trash\\select.pyd.prev11204.prev1791498...[cut]"
+                ]
+}

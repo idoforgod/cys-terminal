@@ -1,0 +1,186 @@
+{
+  "script": "cdp-update.mjs",
+  "node": "v22.23.3",
+  "mode": "uipre",
+  "port": 9333,
+  "started": "2026-10-08T22:23:17.537Z",
+  "finished": "2026-10-08T22:23:17.635Z",
+  "has_native_websocket": true,
+  "ws_impl": "mini",
+  "has_fetch": true,
+  "targets": [
+    {
+      "type": "page",
+      "title": "cys — CYSJavis Terminal",
+      "url": "http://tauri.localhost/",
+      "id": "BCC232C0CD4D851C43C5A455D2450E4D"
+    }
+  ],
+  "chosen_target": {
+    "url": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "id": "BCC232C0CD4D851C43C5A455D2450E4D"
+  },
+  "attached": true,
+  "tauri_global": null,
+  "page_info": {
+    "href": "http://tauri.localhost/",
+    "title": "cys — CYSJavis Terminal",
+    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36 Edg/154.0.0.0",
+    "tauri_keys": [
+      "app",
+      "core",
+      "dpi",
+      "event",
+      "image",
+      "menu",
+      "mocks",
+      "path",
+      "tray",
+      "webview",
+      "webviewWindow",
+      "window"
+    ],
+    "core_keys": [
+      "Channel",
+      "PluginListener",
+      "Resource",
+      "SERIALIZE_TO_IPC_FN",
+      "addPluginListener",
+      "checkPermissions",
+      "convertFileSrc",
+      "invoke",
+      "isTauri",
+      "requestPermissions",
+      "transformCallback"
+    ],
+    "app_keys": [
+      "BundleType",
+      "defaultWindowIcon",
+      "fetchDataStoreIdentifiers",
+      "getBundleType",
+      "getIdentifier",
+      "getName",
+      "getTauriVersion",
+      "getVersion",
+      "hide",
+      "onBackButtonPress",
+      "removeDataStore",
+      "setDockVisibility",
+      "setTheme",
+      "show",
+      "supportsMultipleWindows"
+    ],
+    "event_keys": [
+      "TauriEvent",
+      "emit",
+      "emitTo",
+      "listen",
+      "once"
+    ]
+  },
+  "app_version": "0.14.47",
+  "check_update": null,
+  "check_update_error": null,
+  "listeners": null,
+  "install_update_started_at": null,
+  "install_update_outcome": null,
+  "socket_closed_at": null,
+  "events": {
+    "total": 0,
+    "progress_count": 0,
+    "progress_first": null,
+    "progress_last": null,
+    "non_progress": []
+  },
+  "steps": [
+    {
+      "t": "2026-10-08T22:23:17.539Z",
+      "name": "start",
+      "argv": "--mode uipre --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-upg-after-pre --max-wait-sec 200 --ready-wait-sec 90",
+      "native_websocket": true
+    },
+    {
+      "t": "2026-10-08T22:23:17.570Z",
+      "name": "targets",
+      "count": 1,
+      "pages": 1
+    },
+    {
+      "t": "2026-10-08T22:23:17.579Z",
+      "name": "connected",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "ws_impl": "mini"
+    },
+    {
+      "t": "2026-10-08T22:23:17.584Z",
+      "name": "attached",
+      "url": "http://tauri.localhost/",
+      "title": "cys — CYSJavis Terminal",
+      "id": "BCC232C0CD4D851C43C5A455D2450E4D"
+    },
+    {
+      "t": "2026-10-08T22:23:17.587Z",
+      "name": "page_info",
+      "href": "http://tauri.localhost/"
+    },
+    {
+      "t": "2026-10-08T22:23:17.594Z",
+      "name": "app_version",
+      "value": "0.14.47"
+    },
+    {
+      "t": "2026-10-08T22:23:17.595Z",
+      "name": "ui: wait for the Update button"
+    }
+  ],
+  "errors": [],
+  "ui": {
+    "mode": "uipre",
+    "stage": "done",
+    "ready": {
+      "ok": true,
+      "waited_ms": 2,
+      "snapshot": {
+        "t": 1791498197598,
+        "ready": true,
+        "update_button": {
+          "text": "Update ✓",
+          "badge_text": "✓",
+          "badge_hidden": false,
+          "badge_title": "최신 — 본체 v0.14.47 · 팩 0.14.46 (확인 오후 03:23)"
+        },
+        "panel": null,
+        "confirm": null,
+        "overlays": [],
+        "toasts": [],
+        "title": "cys — CYSJavis Terminal"
+      }
+    },
+    "clicks": [],
+    "states": [
+      {
+        "t": "2026-10-08T22:23:17.598Z",
+        "ready": true,
+        "panel_headline": null,
+        "panel_buttons": null,
+        "confirm_title": null,
+        "toasts": [],
+        "overlays": 0
+      }
+    ],
+    "shots": [
+      {
+        "name": "ready",
+        "file": "appe2e-upg-after-pre-ui-ready.png",
+        "t": "2026-10-08T22:23:17.634Z",
+        "bytes": 42540
+      }
+    ],
+    "button_flow_complete": false,
+    "fallback_invoke": false,
+    "observe": null,
+    "recorder_installed": "installed"
+  }
+}

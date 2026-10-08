@@ -1,0 +1,335 @@
+{
+    "prefix":  "w44b-upg",
+    "started":  "2026-10-08T22:35:32.498Z",
+    "finished":  "2026-10-08T22:45:05.440Z",
+    "skipped":  null,
+    "assets":  {
+                   "boot-js-missing":  {
+                                           "file":  "C:\\Users\\runneradmin\\.cys\\pack\\web\\office-boot.js",
+                                           "existed":  true,
+                                           "health_assets":  {
+                                                                 "office3d_html":  true,
+                                                                 "office_boot_js":  false,
+                                                                 "three_module_js":  true
+                                                             },
+                                           "node":  {
+                                                        "prefix":  "w44b-upg-boot-js-missing",
+                                                        "mode":  "w44office",
+                                                        "rc":  0,
+                                                        "timed_out":  false,
+                                                        "error":  null
+                                                    },
+                                           "office":  {
+                                                          "loaded":  true,
+                                                          "loaded_after_ms":  2395,
+                                                          "first_sample":  {
+                                                                               "view_visible":  true,
+                                                                               "panel_open":  true,
+                                                                               "frame_src":  null,
+                                                                               "frame_w":  988,
+                                                                               "frame_h":  528,
+                                                                               "hint_hidden":  true,
+                                                                               "hint_text":  "",
+                                                                               "repair_button_hidden":  true,
+                                                                               "frame_document":  "title=",
+                                                                               "t_ms":  3
+                                                                           },
+                                                          "final":  {
+                                                                        "view_visible":  true,
+                                                                        "panel_open":  true,
+                                                                        "frame_src":  "http://127.0.0.1:8642/",
+                                                                        "frame_w":  988,
+                                                                        "frame_h":  528,
+                                                                        "hint_hidden":  true,
+                                                                        "hint_text":  "",
+                                                                        "repair_button_hidden":  true,
+                                                                        "frame_document":  "no contentDocument (cross-origin or not loaded)"
+                                                                    },
+                                                          "samples":  2,
+                                                          "shot":  "w44b-upg-boot-js-missing-ui-w44-boot-js-missing.png"
+                                                      },
+                                           "boot_js_http":  404,
+                                           "root_http":  200,
+                                           "restored":  true
+                                       },
+                   "three-missing":  {
+                                         "file":  "C:\\Users\\runneradmin\\.cys\\pack\\web\\vendor\\three.module.js",
+                                         "existed":  true,
+                                         "health_assets":  {
+                                                               "office3d_html":  true,
+                                                               "office_boot_js":  true,
+                                                               "three_module_js":  false
+                                                           },
+                                         "node":  {
+                                                      "prefix":  "w44b-upg-three-missing",
+                                                      "mode":  "w44office",
+                                                      "rc":  0,
+                                                      "timed_out":  false,
+                                                      "error":  null
+                                                  },
+                                         "office":  {
+                                                        "loaded":  true,
+                                                        "loaded_after_ms":  2346,
+                                                        "first_sample":  {
+                                                                             "view_visible":  true,
+                                                                             "panel_open":  true,
+                                                                             "frame_src":  null,
+                                                                             "frame_w":  988,
+                                                                             "frame_h":  528,
+                                                                             "hint_hidden":  true,
+                                                                             "hint_text":  "",
+                                                                             "repair_button_hidden":  true,
+                                                                             "frame_document":  "title=",
+                                                                             "t_ms":  2
+                                                                         },
+                                                        "final":  {
+                                                                      "view_visible":  true,
+                                                                      "panel_open":  true,
+                                                                      "frame_src":  "http://127.0.0.1:8642/",
+                                                                      "frame_w":  988,
+                                                                      "frame_h":  528,
+                                                                      "hint_hidden":  true,
+                                                                      "hint_text":  "",
+                                                                      "repair_button_hidden":  true,
+                                                                      "frame_document":  "no contentDocument (cross-origin or not loaded)"
+                                                                  },
+                                                        "samples":  2,
+                                                        "shot":  "w44b-upg-three-missing-ui-w44-three-missing.png"
+                                                    },
+                                         "boot_js_http":  200,
+                                         "root_http":  200,
+                                         "restored":  true
+                                     }
+               },
+    "late":  {
+                 "killed":  [
+                                10832
+                            ],
+                 "node":  {
+                              "prefix":  "w44b-upg-late",
+                              "mode":  "w44office",
+                              "rc":  0,
+                              "timed_out":  false,
+                              "error":  null
+                          },
+                 "office":  {
+                                "loaded":  true,
+                                "loaded_after_ms":  56380,
+                                "hint_texts_seen":  [
+                                                        "오피스를 준비하고 있습니다… 자동으로 다시 확인합니다."
+                                                    ],
+                                "final":  {
+                                              "view_visible":  true,
+                                              "panel_open":  true,
+                                              "frame_src":  "http://127.0.0.1:8642/",
+                                              "frame_w":  988,
+                                              "frame_h":  528,
+                                              "hint_hidden":  true,
+                                              "hint_text":  "",
+                                              "repair_button_hidden":  true,
+                                              "frame_document":  "no contentDocument (cross-origin or not loaded)"
+                                          },
+                                "samples":  29,
+                                "shot":  "w44b-upg-late-ui-w44-late.png"
+                            },
+                 "bridge_rows_after":  {
+                                           "tag":  "after-late",
+                                           "time":  "2026-10-08T22:39:02.326Z",
+                                           "rows":  [
+                                                        {
+                                                            "id":  8492,
+                                                            "ppid":  8076,
+                                                            "parent_alive":  true,
+                                                            "parent_name":  "cysd.exe",
+                                                            "created":  "10/08/2026 15:37:43",
+                                                            "cmd":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\runtime\\python\\python3.exe\" C:\\Users\\runneradmin\\.cys/pack\\bin\\javis_hud_bridge.py"
+                                                        }
+                                                    ],
+                                           "count":  1,
+                                           "error":  null
+                                       },
+                 "bridge_back_after_s_from_first_pass_end":  2.2,
+                 "node2":  {
+                               "prefix":  "w44b-upg-late2",
+                               "mode":  "w44office",
+                               "rc":  0,
+                               "timed_out":  false,
+                               "error":  null
+                           },
+                 "office2":  {
+                                 "loaded":  true,
+                                 "final":  {
+                                               "view_visible":  true,
+                                               "panel_open":  true,
+                                               "frame_src":  "http://127.0.0.1:8642/",
+                                               "frame_w":  988,
+                                               "frame_h":  528,
+                                               "hint_hidden":  true,
+                                               "hint_text":  "",
+                                               "repair_button_hidden":  true,
+                                               "frame_document":  "no contentDocument (cross-origin or not loaded)"
+                                           },
+                                 "shot":  "w44b-upg-late2-ui-w44-late2.png"
+                             }
+             },
+    "hold":  {
+                 "seats":  {
+                               "w44a":  {
+                                            "ref":  "surface:3",
+                                            "rc":  0
+                                        },
+                               "w44b":  {
+                                            "ref":  "surface:4",
+                                            "rc":  0
+                                        },
+                               "w44m":  {
+                                            "ref":  "surface:5",
+                                            "rc":  0
+                                        }
+                           },
+                 "samples":  [
+                                 {
+                                     "at_sec":  27,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:3\trole=-\tpid=244\texited=false\tw44a\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  183
+                                 },
+                                 {
+                                     "at_sec":  51,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:3\trole=-\tpid=244\texited=false\tw44a\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  186
+                                 },
+                                 {
+                                     "at_sec":  74,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:3\trole=-\tpid=244\texited=false\tw44a\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  187
+                                 },
+                                 {
+                                     "at_sec":  96,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:3\trole=-\tpid=244\texited=false\tw44a\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  184
+                                 },
+                                 {
+                                     "at_sec":  125,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:3\trole=-\tpid=244\texited=false\tw44a\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  199
+                                 },
+                                 {
+                                     "at_sec":  149,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:3\trole=-\tpid=244\texited=false\tw44a\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  195
+                                 },
+                                 {
+                                     "at_sec":  173,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:3\trole=-\tpid=244\texited=false\tw44a\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  192
+                                 },
+                                 {
+                                     "at_sec":  227,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  190
+                                 },
+                                 {
+                                     "at_sec":  251,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  187
+                                 },
+                                 {
+                                     "at_sec":  277,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  184
+                                 },
+                                 {
+                                     "at_sec":  300,
+                                     "list":  "surface:2\trole=-\tpid=4056\texited=false\tsurface 2\tC:\\Users\\runneradmin | surface:4\trole=-\tpid=2608\texited=false\tw44b\tC:\\Users\\runneradmin | surface:5\trole=master\tpid=7336\texited=false\tw44m\tC:\\Users\\runneradmin",
+                                     "procs_total":  180
+                                 }
+                             ],
+                 "proc_count_high_lines":  0,
+                 "log_lines":  [
+                                   "no cysd.log at C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.log"
+                               ],
+                 "close_test":  {
+                                    "closed":  "surface:3",
+                                    "rc":  0,
+                                    "out":  "closed surface:3 (descendants killed)\n ",
+                                    "seat_a_pid":  244,
+                                    "seat_a_tree":  3,
+                                    "seat_a_alive_after":  0,
+                                    "seat_b_pid":  2608,
+                                    "seat_b_tree":  3,
+                                    "seat_b_alive_after":  3,
+                                    "sys_before":  {
+                                                       "total":  191,
+                                                       "wininit.exe":  1,
+                                                       "csrss.exe":  2,
+                                                       "services.exe":  1,
+                                                       "smss.exe":  1,
+                                                       "lsass.exe":  1,
+                                                       "winlogon.exe":  1,
+                                                       "svchost.exe":  75
+                                                   },
+                                    "sys_after":  {
+                                                      "total":  189,
+                                                      "wininit.exe":  1,
+                                                      "csrss.exe":  2,
+                                                      "services.exe":  1,
+                                                      "smss.exe":  1,
+                                                      "lsass.exe":  1,
+                                                      "winlogon.exe":  1,
+                                                      "svchost.exe":  75
+                                                  }
+                                },
+                 "sys_before":  {
+                                    "total":  168,
+                                    "wininit.exe":  1,
+                                    "csrss.exe":  2,
+                                    "services.exe":  1,
+                                    "smss.exe":  1,
+                                    "lsass.exe":  1,
+                                    "winlogon.exe":  1,
+                                    "svchost.exe":  75
+                                },
+                 "sys_after":  {
+                                   "total":  182,
+                                   "wininit.exe":  1,
+                                   "csrss.exe":  2,
+                                   "services.exe":  1,
+                                   "smss.exe":  1,
+                                   "lsass.exe":  1,
+                                   "winlogon.exe":  1,
+                                   "svchost.exe":  75
+                               },
+                 "feed_items_matching":  0,
+                 "events_total_lines":  52,
+                 "events_proc_count_high":  0,
+                 "events_watchdog_lines":  [
+
+                                           ],
+                 "events_names_seen":  [
+                                           "schedule.command_done x9",
+                                           "schedule.fired x9",
+                                           "surface.created x3",
+                                           "surface.input_injected x3",
+                                           "feed.item.aging x2",
+                                           "surface.closed x1",
+                                           "autopilot.approval_checked x1",
+                                           "autopilot.approval_signed x1"
+                                       ],
+                 "events_sample_head":  [
+                                            "{\"_flen\":0,\"_pv\":1,\"heartbeat_interval_seconds\":15,\"latest_seq\":550,\"ok\":true,\"resume\":{\"after_seq\":null,\"gap\":false,\"latest_seq\":550,\"next_seq\":551,\"oldest_seq\":513},\"type\":\"ack\"}",
+                                            "{\"_flen\":0,\"_pv\":1,\"category\":\"surface\",\"name\":\"surface.created\",\"payload\":{\"cmd\":\"cmd.exe\",\"cwd\":\"C:\\\\Users\\\\runneradmin\",\"pid\":244,\"role\":null,\"surface_ref\":\"surface:3\"},\"seq\":551,\"surface_id\":3,\"ti...[cut]"
+                                        ]
+             },
+    "approval":  {
+                     "sign_out":  "signed: ap-8076-1791499262-0 (expires_at=1791499862) | rc=0  | ",
+                     "lane_file":  true,
+                     "lane_len":  32,
+                     "tmp_leftovers":  [
+
+                                       ],
+                     "state_dir":  "C:\\Users\\runneradmin\\AppData\\Local\\cys",
+                     "ttl_store_has_record":  true,
+                     "check_other_folder_rc":  0
+                 },
+    "error":  null
+}
