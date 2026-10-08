@@ -42,7 +42,7 @@ jobs:
           set -uo pipefail
           OUT="$RUNNER_TEMP/b1"; mkdir -p "$OUT"
           echo "label=${{ matrix.label }} sha=$(git rev-parse HEAD)" | tee "$OUT/summary.txt"
-          K=10
+          K=10   # fixed before launch for both arms
           i=1
           while [ "$i" -le "$K" ]; do
             t0=$(date +%s)
@@ -52,10 +52,6 @@ jobs:
             res="$(grep -E '^test result:' "$OUT/round-$i.log" | tail -1)"
             names="$(awk '/^failures:$/{f=1;next} f&&/^    [a-zA-Z_]/{print $1} f&&/^$/{f=0}' "$OUT/round-$i.log" | sort -u | tr '\n' ' ')"
             echo "ROUND $i rc=$rc secs=$el :: ${res:-NO-RESULT-LINE} :: failed-tests: ${names:-none}" | tee -a "$OUT/summary.txt"
-            if [ "$i" -eq 1 ]; then
-              if [ "$el" -le 60 ]; then K=20; fi
-              echo "K=$K (round 1 took ${el}s)" | tee -a "$OUT/summary.txt"
-            fi
             i=$((i+1))
           done
           echo "DONE rounds=$K" | tee -a "$OUT/summary.txt"
