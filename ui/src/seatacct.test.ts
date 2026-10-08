@@ -1,4 +1,4 @@
-// ★0.14.45 부서 카드 노드별 계정 줄 · 사용량 패널 역매핑 — 순수 판정(seatacct.ts) + 배선 핀(main.ts·style.css 를 데이터로 읽는다).
+// ★0.14.45 부서 카드 노드별 계정 줄 — 순수 판정(seatacct.ts) + 배선 핀(main.ts·style.css 를 데이터로 읽는다).
 import { describe, it, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
@@ -154,7 +154,7 @@ describe("부서 카드 — 노드별 계정 묶음", () => {
     // 관측 폴더의 account_id(u-1) 로 계정 묶음(claude-4 등)에 붙지 않는다
     expect(g[0].roles).toEqual(["master"]);
     expect(g[2].roles).toEqual(["cso"]);
-    // 기록 폴더 이름으로 짐작한 라벨이 본문에 없다 · 역매핑에도 붙지 않는다
+    // 기록 폴더 이름으로 짐작한 라벨이 본문에 없다
     expect(wsAccountLineText(g)).toBe(`claude-4 master · ${SEAT_ACCT_MISMATCH_LABEL} worker · ${SEAT_ACCT_UNKNOWN_LABEL} cso`);
     // 🔒 가림이면 툴팁의 기록 폴더도 꼬리표만
     const h = buildWsAccountGroups(seats(sig("worker", { ...mm, profile: "/Users/x/.cys/claude" })), idx, redact, true, NOW, STALE);

@@ -1,4 +1,4 @@
-// ★0.14.45 부서(워크스페이스) 카드의 노드별 계정 줄 + 사용량 패널의 역매핑 — 순수 판정·표기 모듈 (DOM·Tauri·저장소 무관).
+// ★0.14.45 부서(워크스페이스) 카드의 노드별 계정 줄 — 순수 판정·표기 모듈 (DOM·Tauri·저장소 무관).
 //
 // 오너 요청(2026-10-07): "어느 부서·노드가 어느 Claude·AI 계정을 쓰는지 몰라 pane 마다 `/config` 를 쳐야 한다 — 그걸 없애 달라."
 // 데몬은 좌석마다 설정 폴더의 **현재** 신원을 이미 안다(accounts.rs SeatIdentityView). 0.14.45 부터 `org.status` 좌석 행에
@@ -135,7 +135,7 @@ function labelWithoutRow(sa: SeatAcct): string {
   return providerLabel(sa.provider);
 }
 
-/** 계정 키·라벨 — 카드와 역매핑이 같은 이름을 쓴다. */
+/** 계정 키·라벨 — 카드가 쓰는 이름. */
 export function seatAcctLabel(sa: SeatAcct, idx: AcctIndex): string {
   return idx.labels.get(sa.key) ?? labelWithoutRow(sa);
 }

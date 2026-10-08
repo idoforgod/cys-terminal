@@ -4709,7 +4709,7 @@ function updatePendingBadges(n: number) {
 // ws별 고유색 (id 기반 — 세션 복원에도 같은 ws는 같은 색)
 const WS_COLORS = ["#2f81f7", "#3fb950", "#d29922", "#f85149", "#a371f7", "#db61a2", "#39c5cf", "#e3b341"];
 
-// ---------- ★0.14.45 부서 카드 노드별 계정 줄 · 사용량 패널 역매핑 ----------
+// ---------- ★0.14.45 부서 카드 노드별 계정 줄 ----------
 // 판정·표기는 seatacct.ts(순수 · seatacct.test.ts), 여기는 배선이다. 재료는 org.status 10초 틱이 적는 seatAccts 와
 // 사용량 패널이 이미 가진 계정 행(ccAccounts) — 새 RPC·타이머 0. 이름은 사용량 패널과 같은 규칙(accountCardLabels =
 // accountDisplayLabels 의 카드판)으로 짓되, 겹침 꼬리표는 🔒 상태와 무관하게 **언제나 가린 형**(#hash6)이다(C1 — 카드 본문에
