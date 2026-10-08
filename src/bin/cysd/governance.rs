@@ -8024,6 +8024,14 @@ pub(crate) struct QueueBlockDiag {
     pub(crate) cursor_lead_cp: Option<String>,
     pub(crate) last_parser_panic_at: Option<u64>,
     pub(crate) repaint_requested_at: Option<u64>,
+    /// ★(0.14.47 · 계측) 커서 열(0 기반) — `cursor_row` 와 같은 탐침의 값. 커서 행이 화면 밖이면 `None`.
+    pub(crate) cursor_col: Option<u16>,
+    /// ★(0.14.47 · 계측) 커서 뒤 글자가 전부 흐림(SGR 2)인가 — [`after_cursor_dim_of`]. **진단 전용**이다(게이트·배달·사이클은 읽지 않는다).
+    pub(crate) after_cursor_dim: Option<bool>,
+    /// ★(0.14.47 · 계측) 이 좌석이 대체 화면인가(진단 시점).
+    pub(crate) alt_screen: bool,
+    /// ★(0.14.47 · 계측) 마지막 사람 입력(`last_human_input`) 뒤 경과 초 — 기록이 없으면 `None`(결측은 값이 아니다).
+    pub(crate) human_idle_secs: Option<u64>,
     /// ★(성찰 M1) 진단 시점의 출력 정적 초(`last_output` 경과) — 바쁨·모달 사유가 [`STALE_SCREEN_QUIET_SECS`] 넘게 정적이면 낡은 사본 후보. `None` = 미측정(검체 기본값).
     pub(crate) quiet_secs: Option<u64>,
     /// ★(성찰 M2) 대체 화면 좌석이고 PTY 전경이 에이전트(마커 좌석)다 — 다시 그리기 요청 대상. 비-unix 는 전경을 모르므로 마커 좌석이면 참([`seat_foreground_is_agent`]).
@@ -8045,6 +8053,36 @@ pub(crate) struct ScreenProbe {
     pub(crate) cursor_row: Option<u16>,
     pub(crate) marker_row: Option<u16>,
     pub(crate) cursor_lead_cp: Option<String>,
+    /// ★(0.14.47 · 계측) 커서 열 · 커서 뒤 흐림 — [`seat_screen_probe_with`] 가 같은 파서 락 안에서 채운다([`screen_probe_of`] 는 글자만 보므로 채우지 않는다).
+    pub(crate) cursor_col: Option<u16>,
+    pub(crate) after_cursor_dim: Option<bool>,
+}
+
+/// ★(0.14.47 · 계측) 커서 행의 **커서 뒤 글자가 전부 흐림(SGR 2)인가**(순수 · 진단 전용 — 게이트는 이 값을 읽지 않는다).
+///
+/// 훑는 칸 = 커서 행의 커서 열부터 줄 끝까지. 커서 열의 칸이 반전이면(그려 놓은 커서) 그 한 칸을 뺀다 — 커서 열이 아닌 자리의 반전 칸은 빼지 않는다.
+/// 글자 칸 = 내용이 있고 공백류가 아닌 칸(넓은 글자의 짝 칸은 내용이 없어 빠진다). 남은 글자 칸이 **1개 이상이고 전부 흐림**이면 `Some(true)` ·
+/// 흐림이 아닌 것이 하나라도 있으면 `Some(false)` · 남은 글자 칸이 0 이거나 커서가 화면 밖이면 `None`(확인할 글자가 없다 — 결측은 값이 아니다).
+/// 패닉 없음: `cell()` 은 범위 밖이면 `None` 이다.
+pub(crate) fn after_cursor_dim_of(screen: &vt100::Screen, cursor_row: u16, cursor_col: u16) -> Option<bool> {
+    let (rows, cols) = screen.size();
+    if cursor_row >= rows || cursor_col >= cols {
+        return None;
+    }
+    let mut glyphs = 0usize;
+    let mut all_dim = true;
+    for col in cursor_col..cols {
+        let Some(cell) = screen.cell(cursor_row, col) else { break };
+        if col == cursor_col && cell.inverse() {
+            continue;
+        }
+        if !cell.has_contents() || cell.contents().chars().all(char::is_whitespace) {
+            continue;
+        }
+        glyphs += 1;
+        all_dim &= cell.dim();
+    }
+    (glyphs > 0).then_some(all_dim)
 }
 
 /// 화면 동기 진단(순수) — `rows_text` = 화면 행들(0 기반) · `cursor_row` = 커서 행 · `markers` = 이 좌석의 프롬프트 마커 후보(빈 목록이면 `marker_row` 는 `None`).
@@ -8058,7 +8096,8 @@ pub(crate) fn screen_probe_of(rows_text: &[String], cursor_row: u16, markers: &[
     let cursor_lead_cp = row
         .and_then(|r| r.trim_start().chars().next())
         .map(|c| format!("U+{:04X}", u32::from(c)));
-    ScreenProbe { cursor_row: row.map(|_| cursor_row), marker_row, cursor_lead_cp }
+    // 칸 속성(커서 열·흐림)은 글자 행만으로는 알 수 없다 — [`seat_screen_probe_with`] 가 파서에서 채운다.
+    ScreenProbe { cursor_row: row.map(|_| cursor_row), marker_row, cursor_lead_cp, cursor_col: None, after_cursor_dim: None }
 }
 
 /// 좌석 한 곳의 화면 동기 진단(IO) — 파서 락 1회. 마커는 `agent_meta` 가 있는 좌석만 어댑터에서 읽는다(맨 셸 = 빈 목록 · 디스크 판독 0).
@@ -8079,11 +8118,14 @@ pub(crate) fn seat_screen_probe_with(
         };
         let p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
         let screen = p.screen();
-        let (_, cols) = screen.size();
-        let (cr, _) = screen.cursor_position();
+        let (rows, cols) = screen.size();
+        let (cr, cc) = screen.cursor_position();
         let rows_text: Vec<String> = screen.rows(0, cols).collect();
+        // ★(0.14.47 · 계측) 커서 열과 커서 뒤 흐림 — 글자 행을 뜬 **같은 락 안**에서 읽는다(한 프레임). 커서 행이 화면 밖이면 둘 다 결측.
+        let cursor_col = (cr < rows).then_some(cc);
+        let after_cursor_dim = after_cursor_dim_of(screen, cr, cc);
         drop(p);
-        screen_probe_of(&rows_text, cr, &markers)
+        ScreenProbe { cursor_col, after_cursor_dim, ..screen_probe_of(&rows_text, cr, &markers) }
     }))
     .unwrap_or_default()
 }
@@ -8257,6 +8299,8 @@ pub(crate) fn queue_block_diag_with(
     };
     // ★(성찰 M1·M2) 처방 문장의 사실 재료 — 출력 정적 초 · 대체 화면 ∧ 전경 에이전트 · 노브 · 화면 높이. 파서 락은 순간(크기만).
     let quiet_secs = Some(s.last_output.lock().unwrap_or_else(|e| e.into_inner()).elapsed().as_secs());
+    // ★(0.14.47 · 계측) 사람 입력 뒤 경과 초 — 기록이 없으면 None(0 으로 접지 않는다).
+    let human_idle_secs = s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()).map(|t| t.elapsed().as_secs());
     let alt = s.alt_screen.load(Ordering::Relaxed);
     let alt_fg_agent = alt && seat_foreground_is_agent(s);
     let rows_too_small = s.parser.lock().unwrap_or_else(|e| e.into_inner()).screen().size().0 < crate::repaint::REPAINT_MIN_ROWS;
@@ -8277,6 +8321,10 @@ pub(crate) fn queue_block_diag_with(
         cursor_lead_cp: probe.cursor_lead_cp,
         last_parser_panic_at,
         repaint_requested_at,
+        cursor_col: probe.cursor_col,
+        after_cursor_dim: probe.after_cursor_dim,
+        alt_screen: alt,
+        human_idle_secs,
         quiet_secs,
         alt_fg_agent,
         repaint_knob_off: !crate::repaint::repaint_nudge_enabled(),
@@ -8294,6 +8342,11 @@ pub(crate) fn screen_diag_json(d: &QueueBlockDiag) -> Value {
         "cursor_lead_cp": d.cursor_lead_cp,
         "last_parser_panic_at": d.last_parser_panic_at,
         "repaint_requested_at": d.repaint_requested_at,
+        // ★(0.14.47 · 계측) 추가형 키 넷 — 기존 다섯 키는 이름·뜻 불변. 관측 불능은 null.
+        "cursor_col": d.cursor_col,
+        "after_cursor_dim": d.after_cursor_dim,
+        "alt_screen": d.alt_screen,
+        "human_idle_secs": d.human_idle_secs,
     })
 }
 
@@ -26496,6 +26549,152 @@ mod tests {
         assert!(ks_text.contains("해제는 오너(사람)가 한다"), "{ks_text}");
         assert_ne!(seat_text, ks_text, "좌석 pause 와 kill-switch 문장은 다르다(F8)");
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // ★(0.14.47 · 계측·관측 보강) 진단 탐침의 새 키 넷 — `after_cursor_dim` · `cursor_col` · `alt_screen` · `human_idle_secs`.
+    //   이 판은 큐 막힘의 **판정을 바꾸지 않는다** — 아래 `instr_gate_verdict_unchanged_*` 가 그것을 틱을 실제로 돌려 잰다.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// 시험 5 — `after_cursor_dim_of` 의 정의 표(순수). 검체의 꼴은 시험 자리에서 본 claude 2.1.294 의 입력줄 그리기다
+    /// (안내문 = 첫 글자 반전 + 나머지 SGR 2 · 사람 글 = 기본 표현).
+    #[test]
+    fn instr_after_cursor_dim_table() {
+        fn at(bytes: &str, row: u16, col: u16) -> Option<bool> {
+            let mut p = vt100::Parser::new(6, 40, 0);
+            p.process(bytes.as_bytes());
+            super::after_cursor_dim_of(p.screen(), row, col)
+        }
+        let m = "❯\u{a0}";
+        // 안내문 꼴: 그려 놓은 커서(반전 한 칸) + 나머지 전부 흐림.
+        assert_eq!(at(&format!("{m}\x1b[7mT\x1b[27m\x1b[2mry \"fix lint errors\"\x1b[22m"), 0, 2), Some(true), "안내문");
+        // 초안 + Home: 첫 글자 반전 + 나머지 기본 표현.
+        assert_eq!(at(&format!("{m}\x1b[7ma\x1b[27mbcdef"), 0, 2), Some(false), "초안+Home");
+        // 한 글자 초안 + Home · 빈 줄(반전 빈칸): 반전 한 칸을 빼면 글자 0 → 결측.
+        assert_eq!(at(&format!("{m}\x1b[7ma\x1b[27m"), 0, 2), None, "한 글자 초안+Home");
+        assert_eq!(at(&format!("{m}\x1b[7m \x1b[27m"), 0, 2), None, "빈 줄");
+        // 흐림과 기본이 섞임 → 거짓.
+        assert_eq!(at(&format!("{m}\x1b[7ms\x1b[27m\x1b[2mdim\x1b[22mplain"), 0, 2), Some(false), "섞임");
+        // ★반전 칸을 빼지 않으면 죽는 행: 커서 열이 **반전·기본 표현 글자**이고 나머지가 전부 흐림 — 그 한 칸을 빼야 참이다.
+        assert_eq!(at(&format!("{m}\x1b[7mX\x1b[27m\x1b[2mrest\x1b[22m"), 0, 2), Some(true), "커서 열의 반전 칸은 뺀다");
+        // 진짜 커서 꼴(반전 없음): 커서 열부터 전부 흐림 = 참 · 커서 열이 기본 표현 글자면 거짓(반전이 아니므로 빼지 않는다).
+        assert_eq!(at(&format!("{m}\x1b[2mghost text\x1b[22m"), 0, 2), Some(true), "진짜 커서 꼴의 흐린 글");
+        assert_eq!(at(&format!("{m}a\x1b[2mbc\x1b[22m"), 0, 2), Some(false), "커서 열이 반전이 아니면 빼지 않는다");
+        // 커서 열이 아닌 자리의 반전 칸은 글자 칸으로 남는다(흐림이 아니므로 거짓).
+        assert_eq!(at(&format!("{m}\x1b[2mab\x1b[22m\x1b[7mc\x1b[27m"), 0, 2), Some(false), "다른 자리의 반전 칸");
+        // 넓은 글자(짝 칸은 내용이 없다) · 흐림 사이의 공백(속성 무관).
+        assert_eq!(at(&format!("{m}\x1b[2m한글 제안\x1b[22m"), 0, 2), Some(true), "넓은 글자");
+        assert_eq!(at(&format!("{m}\x1b[2mab\x1b[22m   \x1b[2mcd\x1b[22m"), 0, 2), Some(true), "사이 공백은 속성을 보지 않는다");
+        // 커서가 글 끝 뒤 · 화면 밖(행·열) → 결측. 패닉 없음.
+        assert_eq!(at(&format!("{m}\x1b[2mabc\x1b[22m"), 0, 10), None, "커서 뒤에 글자 없음");
+        assert_eq!(at("abc", 99, 0), None, "행이 화면 밖");
+        assert_eq!(at("abc", 0, 999), None, "열이 화면 밖");
+        // SGR 22 뒤의 색 글자(명령 인자 안내의 꼴 — 흐림이 아니라 색 246)는 거짓이다.
+        assert_eq!(at(&format!("{m}/model \x1b[7m \x1b[27m\x1b[38;5;246m[model]\x1b[39m"), 0, 9), Some(false), "색으로 그린 인자 안내");
+    }
+
+    /// 좌석 진단에 실리는 값 — 탐침이 파서에서 읽은 커서 열·흐림 · 대체 화면 · 사람 입력 뒤 경과 초(시험 9: 기록 없음 = None).
+    #[test]
+    fn instr_queue_block_diag_carries_dim_col_alt_and_human_idle() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("instr-diag");
+        let (daemon, s) = wp5_seat("instr-diag", "claude");
+        let ghost_dim = "❯\u{a0}\x1b[7mT\x1b[27m\x1b[2mry \"fix lint errors\"\x1b[22m";
+        let draft_home = "❯\u{a0}\x1b[7ma\x1b[27mbcdef";
+        // 비-alt · 안내문.
+        paint_screen(&s, &["  출력", RULE, ghost_dim, RULE, STATUS1], 2, 2, false);
+        *s.last_human_input.lock().unwrap() = None;
+        let d = queue_block_diag(&daemon, &s);
+        assert_eq!((d.cursor_row, d.cursor_col), (Some(2), Some(2)), "{d:?}");
+        assert_eq!(d.after_cursor_dim, Some(true), "{d:?}");
+        assert!(!d.alt_screen);
+        assert_eq!(d.human_idle_secs, None, "시험 9 — 사람 입력 기록이 없으면 결측(0 으로 접지 않는다)");
+        assert_eq!(d.ghost_after_cursor, Some(true), "기존 키는 그대로(커서 뒤에 글자가 있다)");
+        // alt · 초안+Home — 기존 키 ghost_after_cursor 는 여전히 참이고(이름과 달리 「커서 뒤 글자 있음」), 새 키가 거짓으로 가른다.
+        paint_screen(&s, &["  출력", RULE, draft_home, RULE, STATUS1], 2, 2, true);
+        *s.last_human_input.lock().unwrap() = Some(std::time::Instant::now() - std::time::Duration::from_secs(40));
+        let d = queue_block_diag(&daemon, &s);
+        assert_eq!((d.after_cursor_dim, d.ghost_after_cursor), (Some(false), Some(true)), "{d:?}");
+        assert!(d.alt_screen);
+        let idle = d.human_idle_secs.expect("사람 입력 기록이 있으면 경과 초");
+        assert!((40..50).contains(&idle), "경과 초 {idle}");
+        // wire — screen_diag 객체는 기존 다섯 키 + 새 네 키(시험 6). 사유 파일 행과 payload 가 이 함수 하나를 쓴다.
+        let j = super::screen_diag_json(&d);
+        let keys: std::collections::BTreeSet<&str> = j.as_object().unwrap().keys().map(String::as_str).collect();
+        let want: std::collections::BTreeSet<&str> = [
+            "cursor_row", "marker_row", "cursor_lead_cp", "last_parser_panic_at", "repaint_requested_at",
+            "cursor_col", "after_cursor_dim", "alt_screen", "human_idle_secs",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, want, "screen_diag 키 집합");
+        assert_eq!(j["cursor_col"], json!(2));
+        assert_eq!(j["after_cursor_dim"], json!(false));
+        assert_eq!(j["alt_screen"], json!(true));
+        assert_eq!(j["human_idle_secs"], json!(idle));
+        assert_eq!(j["cursor_row"], json!(2), "기존 키 불변");
+        // 빈 줄(반전 빈칸만) → 흐림 결측 = null.
+        paint_screen(&s, &["  출력", RULE, "❯\u{a0}\x1b[7m \x1b[27m", RULE, STATUS1], 2, 2, true);
+        let j = super::screen_diag_json(&queue_block_diag(&daemon, &s));
+        assert!(j["after_cursor_dim"].is_null(), "{j}");
+        assert_eq!(j["cursor_col"], json!(2));
+    }
+
+    /// `bytes` 에서 SGR 의 흐림(2)만 뺀 쌍둥이 줄(색 지정 38;5;n·48;5;n 의 숫자는 건드리지 않는다 — 이 검체들은 단독 `ESC[2m` 만 쓴다).
+    fn instr_strip_dim(line: &str) -> String {
+        line.replace("\x1b[2m", "")
+    }
+
+    /// 한 화면을 좌석에 그리고 큐 틱을 **실제로** 돌려 (남은 큐 길이, 기록된 막힘 사유)를 돌려준다.
+    fn instr_tick_outcome(tag: &str, lines: &[String], row: u16, col: u16, alt: bool) -> (usize, String) {
+        let (daemon, s) = wp5_seat(tag, "claude");
+        let e = daemon.next_queue_entry("[보고] 계측 판 게이트 무변경 검체".into(), None, "test");
+        s.pending_queue.lock().unwrap().push_back(e);
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        paint_screen(&s, &refs, row, col, alt);
+        quiet_since(&s, 5);
+        tick(&daemon);
+        let out = (s.pending_queue.lock().unwrap().len(), blocked_reason(&s));
+        out
+    }
+
+    /// 시험 7 — **게이트 판정 무변경**: 흐림이 섞인 화면과 흐림만 뺀 같은 화면에서 큐 틱의 결과(배달 여부 · 막힘 사유)가 같다(alt · 비-alt 각각).
+    /// 흐림은 칸에만 기억되고 게이트가 읽는 화면 글자·커서·반전에는 닿지 않는다. 한 쌍이라도 다르면 이 판은 내보낼 수 없다.
+    #[test]
+    fn instr_gate_verdict_unchanged_by_dim_cells() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("instr-gate");
+        let m = "❯\u{a0}";
+        // (이름, 화면 줄, 커서 행, 커서 열)
+        let layouts: Vec<(&str, Vec<String>, u16, u16)> = vec![
+            ("안내문(흐림)", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[7mT\x1b[27m\x1b[2mry \"fix lint errors\"\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
+            ("초안+Home 뒤에 흐린 꼬리", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[7ma\x1b[27mbc \x1b[2mtail\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
+            ("커서 앞에 흐린 글", vec!["  출력".into(), RULE.into(), format!("{m}\x1b[2mabc\x1b[22m"), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 5),
+            ("빈 줄 + 윗 행의 흐린 꼬리표", vec!["  출력".into(), format!("── \x1b[2mHistory 2/2\x1b[22m ──"), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
+            ("빈 줄 + 흐린 출력 줄", vec![format!("  \x1b[2m흐린 출력 한 줄\x1b[22m"), "".into(), RULE.into(), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 3, 2),
+            ("작업 중 표지(흐림)", vec![format!("\x1b[2m✻ Thinking… (esc to interrupt)\x1b[22m"), RULE.into(), "❯ ".into(), RULE.into(), STATUS1.into(), STATUS2.into()], 2, 2),
+        ];
+        let mut table = Vec::new();
+        for alt in [true, false] {
+            for (i, (name, lines, row, col)) in layouts.iter().enumerate() {
+                let twin: Vec<String> = lines.iter().map(|l| instr_strip_dim(l)).collect();
+                assert_ne!(&twin, lines, "{name}: 검체에 흐림이 없다(공허한 쌍)");
+                let with_dim = instr_tick_outcome(&format!("ig-d{}-{i}", u8::from(alt)), lines, *row, *col, alt);
+                let without = instr_tick_outcome(&format!("ig-p{}-{i}", u8::from(alt)), &twin, *row, *col, alt);
+                table.push(format!("alt={alt} · {name}: 흐림 있음 {with_dim:?} · 흐림 뺌 {without:?}"));
+                assert_eq!(with_dim, without, "alt={alt} · {name}: 흐림 유무로 큐 틱의 결과가 갈렸다 — 게이트 판정이 바뀌었다");
+            }
+        }
+        println!("INSTR-GATE-TABLE\n{}", table.join("\n"));
+        // 공허 방지 — 이 표 안에 배달된 화면과 막힌 화면이 둘 다 있어야 한다(전부 같은 사유로 막혔다면 게이트의 갈래를 지나지 않은 것이다).
+        assert!(table.iter().any(|l| l.contains("흐림 있음 (0, ")), "배달된 검체가 하나도 없다:\n{}", table.join("\n"));
+        assert!(table.iter().any(|l| l.contains("흐림 있음 (1, ")), "막힌 검체가 하나도 없다:\n{}", table.join("\n"));
+        // 오늘 판의 사실 그대로: alt 좌석의 안내문 화면은 여전히 막힌다(이 판은 그것을 풀지 않는다).
+        assert!(
+            table.iter().any(|l| l.starts_with("alt=true · 안내문(흐림): 흐림 있음 (1, ")),
+            "alt 좌석의 안내문 화면이 배달됐다 — 이 판은 큐 막힘의 판정을 바꾸지 않는다:\n{}",
+            table.join("\n")
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -29743,7 +29942,7 @@ mod f3_screen_probe_tests {
         // 커서가 마커 행 — 선두 '❯' = U+276F.
         assert_eq!(
             screen_probe_of(&screen, 2, &claude),
-            ScreenProbe { cursor_row: Some(2), marker_row: Some(2), cursor_lead_cp: Some("U+276F".into()) }
+            ScreenProbe { cursor_row: Some(2), marker_row: Some(2), cursor_lead_cp: Some("U+276F".into()), cursor_col: None, after_cursor_dim: None }
         );
         // 패닉 뒤 빈 사본의 꼴 — 커서 (0,0) · 0행은 출력 줄.
         let p = screen_probe_of(&screen, 0, &claude);

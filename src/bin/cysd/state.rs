@@ -11305,8 +11305,9 @@ mod tests {
         assert_eq!(p.as_object().unwrap().len(), 16, "기존 7 + 가산 8 + screen_diag 1 — 그 밖의 키가 새면 계약 변경이다: {p}");
         assert_eq!(
             p["screen_diag"],
-            json!({"cursor_row": null, "marker_row": null, "cursor_lead_cp": null, "last_parser_panic_at": null, "repaint_requested_at": null}),
-            "결측은 null(값이 아니다)"
+            json!({"cursor_row": null, "marker_row": null, "cursor_lead_cp": null, "last_parser_panic_at": null, "repaint_requested_at": null,
+                   "cursor_col": null, "after_cursor_dim": null, "alt_screen": false, "human_idle_secs": null}),
+            "결측은 null(값이 아니다) — ★(0.14.47 · 계측) 추가형 키 넷은 screen_diag 객체 안이다(최상위 키 수 16 은 그대로)"
         );
         // 커서 뒤에 글자가 있으면(회색 제안인지 직접 쓴 글인지 모른다) 유령 단정이 아니라 `after_cursor_text`(표 7행) — 사람이 화면을 보고 가린다.
         let p_after = queue_starved_payload("surface:5", Some("cso".into()), &head, 4200, 3, blocked, &c5_diag_ga(Some(false), Some(true)));

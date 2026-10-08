@@ -6097,6 +6097,10 @@ mod pure_tests {
             assert!(!summary.contains("LLM"), "자유 문장이 요약에 실렸다: {summary}");
             assert!(!summary.contains("hint"), "hint 가 요약에 실렸다: {summary}");
             assert!(!summary.contains("draft_visible"), "진단 필드가 요약에 실렸다: {summary}");
+            // ★(0.14.47 · 계측) 새 진단 키 넷과 그 그릇(screen_diag)도 요약(pane stdin)에 실리지 않는다.
+            for key in ["screen_diag", "after_cursor_dim", "cursor_col", "alt_screen=", "\"alt_screen\"", "human_idle_secs"] {
+                assert!(!summary.contains(key), "진단 키 {key} 가 요약에 실렸다: {summary}");
+            }
         }
         // 허용 목록 전량이 요약에 실린다(열거형 하나라도 막히면 그 처방이 CSO 에게 안 간다).
         for code in crate::governance::QUEUE_REMEDY_CODES {
