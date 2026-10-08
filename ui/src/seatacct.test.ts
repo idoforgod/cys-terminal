@@ -12,7 +12,7 @@ import {
   SEAT_ACCT_UNKNOWN_LABEL,
   type SeatAcctSig,
 } from "./seatacct";
-import { accountCardLabels, accountDisplayLabels, buildUsageBarModel, type AcctRow } from "./usagebar";
+import { accountCardLabels, accountDisplayLabels, type AcctRow } from "./usagebar";
 
 const NOW = 1_800_000_000_000; // ms
 const STALE = 30_000;
