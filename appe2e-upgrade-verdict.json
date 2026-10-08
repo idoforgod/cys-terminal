@@ -1,0 +1,161 @@
+{
+    "result":  "PASS",
+    "upgrade":  "PASS",
+    "team":  "PASS",
+    "mode":  "emulate",
+    "from_version":  "0.14.45",
+    "to_version":  "0.14.46",
+    "failures":  [
+
+                 ],
+    "not_measurable":  [
+
+                       ],
+    "notes":  [
+                  "the upgraded app showed the update-error notification at +5.2 s of the page watch: \"업데이트 경고 :: 새 팩 반영(init-pack) 실패 — 노드 복원 보류, 다음 재시작에 재시도\"",
+                  "the status bar still shows daemon pid 2828 at the end while daemon_status answers pid 2632 (the text is not rewritten after the rotation)",
+                  "2 of the 3 \"cys.exe init-pack\" process(es) after the upgrade ended with a non-zero exit status (overlap=True; see appe2e-upg-proc-audit.txt)",
+                  "leftovers in the install folder (after_observation): 1 *.prev* file(s), 0 *.new.exe file(s): .cys-update-trash\\cys.prev.exe.prev1791429920000"
+              ],
+    "reasons":  [
+                    "UPGRADE PASS: the installed 0.14.45 app was upgraded to 0.14.46 (emulate): the marker and the three executables are 0.14.46, no failure file, the app came back, reports 0.14.46 and its UI is up",
+                    "TEAM PASS: the button flow started by clicks, a new team tab stood (waiting screen -\u003e real tab), a new cysd.exe was created after the click and no failure notification was shown",
+                    "NOTE the upgraded app showed the update-error notification at +5.2 s of the page watch: \"업데이트 경고 :: 새 팩 반영(init-pack) 실패 — 노드 복원 보류, 다음 재시작에 재시도\"",
+                    "NOTE the status bar still shows daemon pid 2828 at the end while daemon_status answers pid 2632 (the text is not rewritten after the rotation)",
+                    "NOTE 2 of the 3 \"cys.exe init-pack\" process(es) after the upgrade ended with a non-zero exit status (overlap=True; see appe2e-upg-proc-audit.txt)",
+                    "NOTE leftovers in the install folder (after_observation): 1 *.prev* file(s), 0 *.new.exe file(s): .cys-update-trash\\cys.prev.exe.prev1791429920000"
+                ],
+    "facts":  {
+                  "mode":  "emulate",
+                  "from_version":  "0.14.45",
+                  "to_version":  "0.14.46",
+                  "base_install_ok":  true,
+                  "base_start_ok":  true,
+                  "apply_started":  true,
+                  "apply_ok":  true,
+                  "marker_reached_sec":  52,
+                  "new_app_first_seen_sec":  52,
+                  "installer_seen":  true,
+                  "watch_end":  "success: the version marker reached the target and a new cys-app.exe is running",
+                  "watch_end_kind":  "success",
+                  "marker_after":  "0.14.46",
+                  "failure_file_absent":  true,
+                  "file_versions":  {
+                                        "cys-app.exe":  "0.14.46",
+                                        "cys.exe":  "0.14.46",
+                                        "cysd.exe":  "0.14.46"
+                                    },
+                  "app_version_after":  "0.14.46",
+                  "ui_ready_after":  true,
+                  "daemon_rotated_auto":  true,
+                  "daemon_version_last":  "0.14.46",
+                  "skew_badge_seen":  false,
+                  "toasts_after_upgrade":  [
+                                               {
+                                                   "kind":  "toast feed",
+                                                   "title":  "↻ 무중단 팩 업데이트",
+                                                   "text":  "팩 0.14.46 — 상단 Update(재시작 없음)",
+                                                   "first_sec":  0,
+                                                   "gone_sec":  5.2,
+                                                   "at_start":  true,
+                                                   "at_end":  false,
+                                                   "polls":  5
+                                               },
+                                               {
+                                                   "kind":  "toast health",
+                                                   "title":  "Claude Code CLI가 없습니다",
+                                                   "text":  "PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작",
+                                                   "first_sec":  0,
+                                                   "gone_sec":  null,
+                                                   "at_start":  true,
+                                                   "at_end":  true,
+                                                   "polls":  46
+                                               },
+                                               {
+                                                   "kind":  "toast health",
+                                                   "title":  "업데이트 경고",
+                                                   "text":  "새 팩 반영(init-pack) 실패 — 노드 복원 보류, 다음 재시작에 재시도",
+                                                   "first_sec":  5.2,
+                                                   "gone_sec":  13.3,
+                                                   "at_start":  false,
+                                                   "at_end":  false,
+                                                   "polls":  8
+                                               },
+                                               {
+                                                   "kind":  "toast watchdog",
+                                                   "title":  "✅ 직원 복귀 완료",
+                                                   "text":  "노드 세션 복원 완료 (부서 0).",
+                                                   "first_sec":  5.2,
+                                                   "gone_sec":  13.3,
+                                                   "at_start":  false,
+                                                   "at_end":  false,
+                                                   "polls":  8
+                                               }
+                                           ],
+                  "update_error_toast_seen":  true,
+                  "restore_done_toast_seen":  true,
+                  "status_bar_pid_differs_from_daemon_status":  true,
+                  "proc_audit_source":  "audit",
+                  "init_pack_count":  3,
+                  "init_pack_overlap":  true,
+                  "init_pack_nonzero_exits":  2,
+                  "init_pack":  [
+                                    {
+                                        "pid":  7532,
+                                        "ppid":  9500,
+                                        "parent_image":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe",
+                                        "args":  "init-pack",
+                                        "start":  "2026-10-08T03:25:19.200Z",
+                                        "end":  "2026-10-08T03:25:24.801Z",
+                                        "seconds":  5.6,
+                                        "exit_status":  "0x1",
+                                        "exit_status_dec":  1,
+                                        "kind":  "onboarding"
+                                    },
+                                    {
+                                        "pid":  10396,
+                                        "ppid":  9500,
+                                        "parent_image":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe",
+                                        "args":  "init-pack --no-install-hook",
+                                        "start":  "2026-10-08T03:25:20.330Z",
+                                        "end":  "2026-10-08T03:25:27.524Z",
+                                        "seconds":  7.2,
+                                        "exit_status":  "0x0",
+                                        "exit_status_dec":  0,
+                                        "kind":  "no-install-hook"
+                                    },
+                                    {
+                                        "pid":  6396,
+                                        "ppid":  9500,
+                                        "parent_image":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe",
+                                        "args":  "init-pack --no-install-hook",
+                                        "start":  "2026-10-08T03:25:24.946Z",
+                                        "end":  "2026-10-08T03:25:27.403Z",
+                                        "seconds":  2.5,
+                                        "exit_status":  "0x1",
+                                        "exit_status_dec":  1,
+                                        "kind":  "no-install-hook"
+                                    }
+                                ],
+                  "new_daemon_started_at":  "2026-10-08T03:25:20.208Z",
+                  "stamps":  "stamp (.last-app-version) 0.14.45 -\u003e 0.14.46 (first seen at 2026-10-08T03:25:27.824Z in sample \"daemon-watch\", 7.7 s after the new app was seen); .pending-restore before=False right after the relaunch=True at the end=False; pack version 0.14.45 -\u003e 0.14.46; pack.prev at the end=True; staging leftovers at the end=[.pack-staging-init-6396]; .gui-onboarded before=0.14.45 right after the relaunch=0.14.45 after the page watch=0.14.45 at the end=0.14.46; onboard-attempts at the end=none",
+                  "second_start":  {
+                                       "ran":  true,
+                                       "skipped":  null,
+                                       "cold_start":  true,
+                                       "app_version":  "0.14.46",
+                                       "gui_onboarded_before":  "0.14.45",
+                                       "gui_onboarded_after":  "0.14.46",
+                                       "init_pack_count":  1,
+                                       "init_pack_onboarding":  1,
+                                       "init_pack_nonzero":  0,
+                                       "daemon_install":  1,
+                                       "update_error_toast_seen":  false,
+                                       "line":  "second start (cold start; Security 4688/4689): app version 0.14.46, CDP ready=True, UI ready=True; cys.exe init-pack 1 (onboarding 1, --no-install-hook 0) [pid 9072 \"init-pack\" 03:32:54.898..03:33:00.626 exit=0x0]; daemon install=1; cys.exe processes=520; update-error toast seen=False; .gui-onboarded 0.14.45 -\u003e 0.14.46; stamp 0.14.46 -\u003e 0.14.46; toasts: [toast feed] CEO 승격 대기 중 :: 부서가 존재합니다 — base 부트 완료 후 명령 팔레트의 \u0027CEO 승격 진행\u0027으로 승인할 수 있습니다. (+0 s, gone at +8.1 s) || [toast health] Claude Code CLI가 없습니다 :: PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작 (+2.2 s)"
+                                   },
+                  "leftovers_after_observation":  "prev=1 new.exe=0",
+                  "leftovers_at_end":  "prev=0 new.exe=0",
+                  "pack":  "files 944 -\u003e 944, version 0.14.45 -\u003e 0.14.46",
+                  "team_app_reused":  true
+              }
+}

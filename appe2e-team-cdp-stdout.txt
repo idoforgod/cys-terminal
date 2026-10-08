@@ -1,0 +1,16 @@
+{"t":"2026-10-08T03:26:34.560Z","name":"start","argv":"--mode uiteam --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-team --max-wait-sec 300 --team-observe-sec 360 --team-ready-wait-sec 150","native_websocket":true}
+{"t":"2026-10-08T03:26:34.588Z","name":"targets","count":1,"pages":1}
+{"t":"2026-10-08T03:26:34.600Z","name":"connected","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","ws_impl":"mini"}
+{"t":"2026-10-08T03:26:34.606Z","name":"attached","url":"http://tauri.localhost/","title":"cys — CYSJavis Terminal","id":"AF30C2843B48D67BCE6864F76B3B93EB"}
+{"t":"2026-10-08T03:26:34.623Z","name":"page_info","href":"http://tauri.localhost/"}
+{"t":"2026-10-08T03:26:34.633Z","name":"app_version","value":"0.14.46"}
+{"t":"2026-10-08T03:26:34.653Z","name":"team: wait for the UI (a workspace tab and a pane drawn)","ready_ms":150000}
+{"t":"2026-10-08T03:26:40.756Z","name":"team: listeners","dept-create-progress":"ok","daemon-event":"ok"}
+{"t":"2026-10-08T03:26:40.806Z","name":"team: open the expert section (click on its toggle)"}
+{"t":"2026-10-08T03:26:40.889Z","name":"team: click the team button"}
+{"t":"2026-10-08T03:26:41.497Z","name":"team: confirm window","title":"팀 만들기 확인","buttons":["취소","만들기"]}
+{"t":"2026-10-08T03:26:41.610Z","name":"team: execute button clicked","method":"mouse","at":"2026-10-08T03:26:41.530Z"}
+{"t":"2026-10-08T03:26:41.619Z","name":"team: observing","observe_ms":360000}
+{"t":"2026-10-08T03:32:42.006Z","name":"team: observation ended","reason":"observation window elapsed (360 s)","tab_created":true}
+{"t":"2026-10-08T03:32:42.096Z","name":"team: seats","ok":true,"count":1,"roles":["master"]}
+{"t":"2026-10-08T03:32:43.377Z","name":"team: alarms","ok":true,"count":9,"note":null}

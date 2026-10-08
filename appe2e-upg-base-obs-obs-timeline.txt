@@ -1,0 +1,3 @@
+# uiobs start 2026-10-08T03:24:12.015Z obs_sec=0 interval_sec=5 expect_daemon=- app_version=0.14.45
+[+0.0s 2026-10-08T03:24:12.046Z] daemon v0.14.45 pid=2828 surfaces=1 started_at=1791429843.673386 | status bar: "daemon pid=2828 sock=\\\\.\\pipe\\cys" | badge: none | toasts(3): [toast health] Claude Code CLI가 없습니다 :: PowerShell: `irm https://claude.ai/install.ps1 | iex` 후 자비스 재시작 || [toast feed] ↻ 무중단 팩 + 새 본체 :: 팩 0.14.46은 상단 Update로 무중단 적용(재시작 없음) · 새 본체 0.14.46은 Update 버튼으로 패치 설치(재시작·자동 복원) || [toast watchdog] ✅ 직원 복귀 완료 :: 노드 세션 복원 완료 (부서 0). | windows: 0
+# end: observation window elapsed (0 s)

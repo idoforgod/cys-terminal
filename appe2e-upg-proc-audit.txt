@@ -1,0 +1,774 @@
+# Security 4688 (create) / 4689 (exit) since 2026-10-08T03:23:56.058Z: 992 read, 773 kept (product images and what they started)
+2026-10-08T03:24:04.707Z CREATE pid=7848 parent=2828 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe" C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.45-2828-1791429843781221000\bin\javis_phoenix.py --selftest
+2026-10-08T03:24:04.725Z CREATE pid=1388 parent=7848 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:05.217Z EXIT   pid=7848 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:24:05.220Z EXIT   pid=1388 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:24:05.222Z CREATE pid=1428 parent=2828 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe" C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.45-2828-1791429843781221000\bin\javis_phoenix.py --socket \\.\pipe\cys restore --auto
+2026-10-08T03:24:05.266Z CREATE pid=6304 parent=1428 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:05.803Z CREATE pid=1960 parent=2828 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe" C:\Users\runneradmin\.cys/pack\bin\javis_hud_bridge.py
+2026-10-08T03:24:05.834Z CREATE pid=2868 parent=1960 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:05.900Z EXIT   pid=1960 status=0x2 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:24:05.902Z EXIT   pid=2868 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:24:05.931Z CREATE pid=8752 parent=1428 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe phoenix-identity
+2026-10-08T03:24:05.977Z EXIT   pid=1060 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:05.982Z CREATE pid=2952 parent=5960 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" daemon install
+2026-10-08T03:24:05.996Z CREATE pid=8824 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:06.013Z EXIT   pid=8752 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:06.019Z CREATE pid=9096 parent=1428 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:24:06.067Z EXIT   pid=9096 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:06.089Z CREATE pid=10360 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\schtasks.exe cmd="schtasks" /Create /XML C:\Users\RUNNER~1\AppData\Local\Temp\cysd-task.xml /TN cysd /F
+2026-10-08T03:24:06.107Z CREATE pid=8548 parent=1428 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:24:06.155Z EXIT   pid=8548 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:06.164Z CREATE pid=6424 parent=1428 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:24:06.213Z EXIT   pid=6424 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:06.330Z EXIT   pid=1428 status=0x1 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:24:06.332Z EXIT   pid=6304 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:24:06.339Z EXIT   pid=10360 status=0x0 image=C:\Windows\System32\schtasks.exe
+2026-10-08T03:24:06.355Z EXIT   pid=2952 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:06.361Z EXIT   pid=8824 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:24:06.365Z CREATE pid=3020 parent=5960 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" init-pack --no-install-hook
+2026-10-08T03:24:06.379Z CREATE pid=7840 parent=3020 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:09.587Z EXIT   pid=3020 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:09.588Z EXIT   pid=7840 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:24:09.597Z CREATE pid=5680 parent=5960 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" restore --include-master
+2026-10-08T03:24:09.610Z CREATE pid=1776 parent=5680 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:09.655Z EXIT   pid=5680 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:09.657Z EXIT   pid=1776 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:24:11.321Z CREATE pid=5664 parent=5960 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" agent-detect --json
+2026-10-08T03:24:11.331Z CREATE pid=11088 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:11.381Z CREATE pid=5368 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude
+2026-10-08T03:24:11.454Z EXIT   pid=5368 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:11.456Z CREATE pid=5652 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.cmd
+2026-10-08T03:24:11.532Z EXIT   pid=5652 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:11.537Z CREATE pid=10324 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.exe
+2026-10-08T03:24:11.613Z EXIT   pid=10324 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:11.615Z CREATE pid=6556 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.bat
+2026-10-08T03:24:11.692Z EXIT   pid=6556 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:11.694Z CREATE pid=2856 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.ps1
+2026-10-08T03:24:11.770Z EXIT   pid=2856 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:11.773Z CREATE pid=4056 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex
+2026-10-08T03:24:11.852Z EXIT   pid=4056 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:11.854Z CREATE pid=9336 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.cmd
+2026-10-08T03:24:11.932Z EXIT   pid=9336 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:11.935Z CREATE pid=1616 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.exe
+2026-10-08T03:24:12.013Z EXIT   pid=1616 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.016Z CREATE pid=9328 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.bat
+2026-10-08T03:24:12.096Z EXIT   pid=9328 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.099Z CREATE pid=6756 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.ps1
+2026-10-08T03:24:12.175Z EXIT   pid=6756 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.178Z CREATE pid=3160 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.cmd
+2026-10-08T03:24:12.252Z EXIT   pid=3160 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.254Z CREATE pid=1352 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.exe
+2026-10-08T03:24:12.330Z EXIT   pid=1352 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.333Z CREATE pid=9380 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.bat
+2026-10-08T03:24:12.408Z EXIT   pid=9380 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.410Z CREATE pid=7912 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.ps1
+2026-10-08T03:24:12.471Z CREATE pid=8212 parent=7528 [C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" --version
+2026-10-08T03:24:12.480Z CREATE pid=8784 parent=8212 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:12.485Z EXIT   pid=7912 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.488Z CREATE pid=1912 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok
+2026-10-08T03:24:12.522Z EXIT   pid=8212 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:12.524Z EXIT   pid=8784 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:24:12.562Z EXIT   pid=1912 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.564Z CREATE pid=1920 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.cmd
+2026-10-08T03:24:12.639Z EXIT   pid=1920 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.641Z CREATE pid=4484 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.exe
+2026-10-08T03:24:12.715Z EXIT   pid=4484 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.718Z CREATE pid=7916 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.bat
+2026-10-08T03:24:12.792Z EXIT   pid=7916 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.795Z CREATE pid=10572 parent=5664 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.ps1
+2026-10-08T03:24:12.830Z CREATE pid=10488 parent=7528 [C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" doctor
+2026-10-08T03:24:12.844Z CREATE pid=7220 parent=10488 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:12.875Z EXIT   pid=10572 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:24:12.878Z EXIT   pid=5664 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:12.880Z EXIT   pid=11088 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:24:12.973Z CREATE pid=10252 parent=10488 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe" C:\Users\runneradmin\.cys/pack\bin\javis_runtime_seal.py verify --root C:\Users\runneradmin\AppData\Local\cys\runtime --manifest C:\Users\runneradmin\AppData\Local\cys\runtime-manifest.json --json --max-list 3
+2026-10-08T03:24:24.642Z EXIT   pid=10252 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:24:24.650Z EXIT   pid=10488 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:24:24.654Z EXIT   pid=7220 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:24:27.631Z CREATE pid=7848 parent=7528 [C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe] image=C:\Users\runneradmin\AppData\Local\Temp\cys-0.14.46-updater-diag2f803a\cys-0.14.46-installer.exe cmd="C:\Users\runneradmin\AppData\Local\Temp\cys-0.14.46-updater-diag2f803a\cys-0.14.46-installer.exe" /P /R /UPDATE /ARGS
+2026-10-08T03:24:28.034Z EXIT   pid=5960 status=0xffffffff image=C:\Users\runneradmin\AppData\Local\cys\cys-app.exe
+2026-10-08T03:24:29.041Z CREATE pid=8788 parent=7848 [C:\Users\runneradmin\AppData\Local\Temp\cys-0.14.46-updater-diag2f803a\cys-0.14.46-installer.exe] image=C:\Windows\SysWOW64\taskkill.exe cmd=taskkill /F /IM cys-app.exe
+2026-10-08T03:24:29.057Z CREATE pid=1060 parent=8788 [C:\Windows\SysWOW64\taskkill.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:29.178Z EXIT   pid=8788 status=0x80 image=C:\Windows\SysWOW64\taskkill.exe
+2026-10-08T03:24:29.181Z EXIT   pid=1060 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:24:29.280Z CREATE pid=8448 parent=7848 [C:\Users\runneradmin\AppData\Local\Temp\cys-0.14.46-updater-diag2f803a\cys-0.14.46-installer.exe] image=C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe cmd=powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Users\RUNNER~1\AppData\Local\Temp\nsmA6FE.tmp\unlock-sweep.ps1" "C:\Users\runneradmin\AppData\Local\cys"
+2026-10-08T03:24:29.299Z CREATE pid=1088 parent=8448 [C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:24:34.637Z EXIT   pid=8448 status=0x0 image=C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe
+2026-10-08T03:24:34.640Z EXIT   pid=1088 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:06.338Z CREATE pid=10556 parent=2828 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe" C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.45-2828-1791429843781221000\bin\javis_phoenix.py --socket \\.\pipe\cys restore --auto
+2026-10-08T03:25:06.351Z CREATE pid=8268 parent=10556 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:06.590Z CREATE pid=7244 parent=10556 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe phoenix-identity
+2026-10-08T03:25:06.669Z EXIT   pid=7244 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:06.676Z CREATE pid=5192 parent=10556 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:25:06.723Z EXIT   pid=5192 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:06.734Z CREATE pid=2632 parent=10556 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:25:06.774Z EXIT   pid=2632 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:06.782Z CREATE pid=1448 parent=10556 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:25:06.820Z EXIT   pid=1448 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:06.859Z EXIT   pid=10556 status=0x1 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:25:06.862Z EXIT   pid=8268 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:07.943Z CREATE pid=10512 parent=2828 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe" C:\Users\runneradmin\.cys/pack\bin\javis_hud_bridge.py
+2026-10-08T03:25:07.959Z CREATE pid=8556 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:08.239Z CREATE pid=4972 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:08.242Z CREATE pid=3876 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe events --reconnect --cursor-file C:\Users\runneradmin\AppData\Local\cys\office-bridge\cursor-main.seq
+2026-10-08T03:25:08.256Z CREATE pid=10928 parent=4972 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:08.264Z CREATE pid=4044 parent=3876 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:08.320Z EXIT   pid=4972 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:08.323Z EXIT   pid=10928 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:08.326Z CREATE pid=7640 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:08.341Z CREATE pid=5168 parent=7640 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:08.387Z EXIT   pid=7640 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:08.389Z EXIT   pid=5168 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:10.397Z CREATE pid=10916 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:10.408Z CREATE pid=3092 parent=10916 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:10.460Z EXIT   pid=10916 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:10.462Z EXIT   pid=3092 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:10.464Z CREATE pid=2400 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:10.474Z CREATE pid=7220 parent=2400 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:10.519Z EXIT   pid=2400 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:10.521Z EXIT   pid=7220 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:12.523Z CREATE pid=1760 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:12.534Z CREATE pid=8692 parent=1760 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:12.587Z EXIT   pid=1760 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:12.589Z EXIT   pid=8692 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:12.590Z CREATE pid=2952 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:12.601Z CREATE pid=10588 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:12.649Z EXIT   pid=2952 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:12.651Z EXIT   pid=10588 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:14.664Z CREATE pid=1344 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:14.673Z CREATE pid=9104 parent=1344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:14.723Z EXIT   pid=1344 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:14.725Z EXIT   pid=9104 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:14.727Z CREATE pid=6608 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:14.737Z CREATE pid=9356 parent=6608 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:14.780Z EXIT   pid=6608 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:14.782Z EXIT   pid=9356 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:16.792Z CREATE pid=10256 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:16.802Z CREATE pid=5452 parent=10256 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:16.852Z EXIT   pid=10256 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:16.854Z EXIT   pid=5452 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:16.856Z CREATE pid=3272 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:16.866Z CREATE pid=1540 parent=3272 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:16.910Z EXIT   pid=3272 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:16.912Z EXIT   pid=1540 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:18.619Z CREATE pid=9500 parent=7848 [C:\Users\runneradmin\AppData\Local\Temp\cys-0.14.46-updater-diag2f803a\cys-0.14.46-installer.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys-app.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys-app.exe"
+2026-10-08T03:25:18.770Z CREATE pid=10764 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --embedded-browser-webview=1 --webview-exe-name=cys-app.exe --webview-exe-version=0.14.46 --user-data-dir="C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView" --noerrdialogs --embedded-browser-webview-dpi-awareness=2 --autoplay-policy=no-user-gesture-required --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --remote-allow-origins=* --remote-debugging-port=9333 --lang=en-US --mojo-named-platform-channel-pipe=9500.6716.12606503907865120924 /pfhostedapp:2f198bb71d93b04fcee61df...[cut]
+2026-10-08T03:25:18.796Z CREATE pid=3376 parent=10764 [C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe] image=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=crashpad-handler --user-data-dir=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView /prefetch:4 /pfhostedapp:2f198bb71d93b04fcee61df9abbf6520a49109a4 --monitor-self-annotation=ptype=crashpad-handler --database=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Crashpad --annotation=IsOfficialBuild=1 --annotation=channel= --annotation=chromium-version=154.0.8037.58 "--annotation=exe=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview...[cut]
+2026-10-08T03:25:18.811Z EXIT   pid=7848 status=0x0 image=C:\Users\runneradmin\AppData\Local\Temp\cys-0.14.46-updater-diag2f803a\cys-0.14.46-installer.exe
+2026-10-08T03:25:18.893Z CREATE pid=5832 parent=10764 [C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe] image=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=gpu-process --gpu-recent-crash-count=0 --noerrdialogs --user-data-dir="C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView" --webview-exe-name=cys-app.exe --webview-exe-version=0.14.46 --embedded-browser-webview=1 --embedded-browser-webview-dpi-awareness=2 --gpu-preferences=WAAAAAAAAADgAAAEAAAAAAAAAAAAAGAAQAAAAAAAAAADAAAAAAAAADgAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAKAAAAAAAAAAoAAAAAAAAAAgAAAAAAAAAEAAAAAIAAAABAAAAAAAAAAgAAAAAAAAACAAAAAAAAAA= --startup-read-main-dll --metrics-shme...[cut]
+2026-10-08T03:25:18.904Z CREATE pid=5220 parent=10764 [C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe] image=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=utility --utility-sub-type=network.mojom.NetworkService --lang=en-US --service-sandbox-type=none --noerrdialogs --user-data-dir="C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView" --webview-exe-name=cys-app.exe --webview-exe-version=0.14.46 --embedded-browser-webview=1 --embedded-browser-webview-dpi-awareness=2 --startup-read-main-dll --metrics-shmem-handle=2020,i,12441604755334100069,3212438797664011408,524288 --field-trial-handle=1904,i,3105539573173597783,115286070178469920,26...[cut]
+2026-10-08T03:25:18.928Z CREATE pid=7812 parent=10764 [C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe] image=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=utility --utility-sub-type=storage.mojom.StorageService --lang=en-US --service-sandbox-type=service --noerrdialogs --user-data-dir="C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView" --webview-exe-name=cys-app.exe --webview-exe-version=0.14.46 --embedded-browser-webview=1 --embedded-browser-webview-dpi-awareness=2 --startup-read-main-dll --metrics-shmem-handle=2144,i,6618127208368162696,954885600975501173,524288 --field-trial-handle=1904,i,3105539573173597783,115286070178469920,2...[cut]
+2026-10-08T03:25:19.013Z CREATE pid=1132 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:19.050Z CREATE pid=2492 parent=10764 [C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe] image=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=renderer --noerrdialogs --user-data-dir="C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView" --webview-exe-name=cys-app.exe --webview-exe-version=0.14.46 --embedded-browser-webview=1 --embedded-browser-webview-dpi-awareness=2 --autoplay-policy=no-user-gesture-required --remote-debugging-port=9333 --disable-gpu-compositing --video-capture-use-gpu-memory-buffer --lang=en-US --js-flags --device-scale-factor=1 --num-raster-threads=2 --enable-main-frame-before-activation --renderer-cli...[cut]
+2026-10-08T03:25:19.119Z CREATE pid=8320 parent=1132 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:19.200Z CREATE pid=7532 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" init-pack
+2026-10-08T03:25:19.254Z CREATE pid=3208 parent=7532 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:19.274Z EXIT   pid=1132 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:19.282Z EXIT   pid=8320 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:19.283Z CREATE pid=1232 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:19.296Z CREATE pid=10464 parent=1232 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:19.334Z CREATE pid=6224 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" agent-detect --json
+2026-10-08T03:25:19.357Z CREATE pid=6292 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:19.427Z EXIT   pid=1232 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:19.429Z EXIT   pid=10464 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:19.449Z CREATE pid=6944 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude
+2026-10-08T03:25:19.520Z EXIT   pid=6944 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:19.523Z CREATE pid=10276 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.cmd
+2026-10-08T03:25:19.597Z EXIT   pid=10276 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:19.599Z CREATE pid=9264 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.exe
+2026-10-08T03:25:19.677Z CREATE pid=3996 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" drain
+2026-10-08T03:25:19.701Z CREATE pid=10924 parent=3996 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:19.729Z CREATE pid=8716 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Windows\System32\curl.exe cmd="curl" -fsSL https://github.com/idoforgod/cys-terminal/releases/latest/download/pack-manifest.json
+2026-10-08T03:25:19.769Z CREATE pid=10380 parent=8716 [C:\Windows\System32\curl.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:19.843Z EXIT   pid=9264 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:19.845Z CREATE pid=5160 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.bat
+2026-10-08T03:25:19.904Z EXIT   pid=3996 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:19.908Z EXIT   pid=10924 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:19.928Z CREATE pid=1608 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Windows\System32\taskkill.exe cmd="taskkill" /PID 2828 /F
+2026-10-08T03:25:19.938Z CREATE pid=2856 parent=1608 [C:\Windows\System32\taskkill.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:19.947Z EXIT   pid=5160 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:19.951Z CREATE pid=3824 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.ps1
+2026-10-08T03:25:19.958Z EXIT   pid=8716 status=0x0 image=C:\Windows\System32\curl.exe
+2026-10-08T03:25:19.959Z EXIT   pid=10380 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:20.065Z EXIT   pid=3824 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:20.070Z CREATE pid=10852 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex
+2026-10-08T03:25:20.079Z EXIT   pid=2828 status=0x1 image=C:\Users\runneradmin\AppData\Local\cys\cysd.exe
+2026-10-08T03:25:20.080Z EXIT   pid=1608 status=0x0 image=C:\Windows\System32\taskkill.exe
+2026-10-08T03:25:20.102Z EXIT   pid=2856 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:20.167Z EXIT   pid=10852 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:20.170Z CREATE pid=2196 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.cmd
+2026-10-08T03:25:20.208Z CREATE pid=2632 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cysd.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cysd.exe"
+2026-10-08T03:25:20.287Z EXIT   pid=2196 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:20.289Z CREATE pid=8428 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.exe
+2026-10-08T03:25:20.330Z CREATE pid=10396 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" init-pack --no-install-hook
+2026-10-08T03:25:20.355Z CREATE pid=8268 parent=10396 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:20.410Z EXIT   pid=8428 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:20.413Z CREATE pid=7524 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.bat
+2026-10-08T03:25:20.534Z EXIT   pid=7524 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:20.537Z CREATE pid=2960 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.ps1
+2026-10-08T03:25:20.665Z EXIT   pid=2960 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:20.669Z CREATE pid=4972 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.cmd
+2026-10-08T03:25:20.795Z EXIT   pid=4972 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:20.798Z CREATE pid=10928 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.exe
+2026-10-08T03:25:20.883Z EXIT   pid=10928 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:20.885Z CREATE pid=7640 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.bat
+2026-10-08T03:25:20.970Z EXIT   pid=7640 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:20.973Z CREATE pid=8672 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.ps1
+2026-10-08T03:25:21.065Z EXIT   pid=8672 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:21.068Z CREATE pid=10916 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok
+2026-10-08T03:25:21.157Z EXIT   pid=10916 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:21.160Z CREATE pid=9096 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.cmd
+2026-10-08T03:25:21.264Z EXIT   pid=9096 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:21.266Z CREATE pid=1908 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.exe
+2026-10-08T03:25:21.351Z EXIT   pid=1908 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:21.353Z CREATE pid=7220 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.bat
+2026-10-08T03:25:21.442Z CREATE pid=2400 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:21.445Z EXIT   pid=7220 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:21.452Z CREATE pid=11064 parent=6224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.ps1
+2026-10-08T03:25:21.477Z CREATE pid=7604 parent=2400 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:21.640Z EXIT   pid=11064 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:21.657Z EXIT   pid=6224 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:21.661Z EXIT   pid=6292 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:21.722Z EXIT   pid=2400 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:21.727Z CREATE pid=2952 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:21.730Z EXIT   pid=7604 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:21.737Z CREATE pid=10588 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:21.821Z EXIT   pid=2952 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:21.823Z EXIT   pid=10588 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:22.847Z CREATE pid=8896 parent=2632 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe" C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.46-2632-1791429921597296400\bin\javis_phoenix.py --selftest
+2026-10-08T03:25:22.870Z CREATE pid=6668 parent=8896 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:23.223Z EXIT   pid=8896 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:25:23.227Z EXIT   pid=6668 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:23.228Z CREATE pid=6416 parent=2632 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe" C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.46-2632-1791429921597296400\bin\javis_phoenix.py --socket \\.\pipe\cys restore --auto
+2026-10-08T03:25:23.265Z CREATE pid=1344 parent=6416 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:23.548Z CREATE pid=3252 parent=6416 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe phoenix-identity
+2026-10-08T03:25:23.674Z EXIT   pid=3252 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:23.679Z CREATE pid=9356 parent=6416 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:25:23.759Z EXIT   pid=9356 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:23.787Z CREATE pid=7432 parent=6416 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:25:23.834Z CREATE pid=8816 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:23.894Z CREATE pid=2364 parent=8816 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:23.946Z EXIT   pid=7432 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:23.955Z CREATE pid=7416 parent=6416 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:25:24.027Z EXIT   pid=8816 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:24.042Z CREATE pid=3272 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:24.042Z EXIT   pid=2364 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:24.054Z CREATE pid=11012 parent=3272 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:24.066Z EXIT   pid=7416 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:24.214Z EXIT   pid=6416 status=0x1 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:25:24.217Z EXIT   pid=1344 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:24.308Z EXIT   pid=3272 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:24.313Z EXIT   pid=11012 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:24.801Z EXIT   pid=7532 status=0x1 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:24.806Z EXIT   pid=3208 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:24.809Z CREATE pid=2276 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" daemon install
+2026-10-08T03:25:24.826Z CREATE pid=4556 parent=2276 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:24.907Z CREATE pid=5316 parent=2276 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\schtasks.exe cmd="schtasks" /Create /XML C:\Users\RUNNER~1\AppData\Local\Temp\cysd-task.xml /TN cysd /F
+2026-10-08T03:25:24.933Z EXIT   pid=5316 status=0x0 image=C:\Windows\System32\schtasks.exe
+2026-10-08T03:25:24.938Z EXIT   pid=2276 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:24.942Z EXIT   pid=4556 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:24.946Z CREATE pid=6396 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" init-pack --no-install-hook
+2026-10-08T03:25:24.956Z CREATE pid=1120 parent=6396 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:26.341Z CREATE pid=3844 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:26.431Z CREATE pid=732 parent=3844 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:26.534Z EXIT   pid=3844 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:26.535Z EXIT   pid=732 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:26.538Z CREATE pid=6076 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:26.549Z CREATE pid=8936 parent=6076 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:26.635Z EXIT   pid=6076 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:26.638Z EXIT   pid=8936 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:27.403Z EXIT   pid=6396 status=0x1 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:27.405Z EXIT   pid=1120 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:27.524Z EXIT   pid=10396 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:27.526Z EXIT   pid=8268 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:27.533Z CREATE pid=1988 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" restore --include-master
+2026-10-08T03:25:27.548Z CREATE pid=7592 parent=1988 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:27.635Z EXIT   pid=1988 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:27.638Z EXIT   pid=7592 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:28.642Z CREATE pid=7032 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:28.652Z CREATE pid=9696 parent=7032 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:28.701Z EXIT   pid=7032 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:28.704Z EXIT   pid=9696 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:28.705Z CREATE pid=10796 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:28.715Z CREATE pid=10140 parent=10796 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:28.760Z EXIT   pid=10796 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:28.763Z EXIT   pid=10140 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:30.768Z CREATE pid=10496 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:30.778Z CREATE pid=2120 parent=10496 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:30.826Z EXIT   pid=10496 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:30.828Z EXIT   pid=2120 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:30.830Z CREATE pid=11000 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:30.841Z CREATE pid=10156 parent=11000 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:30.883Z EXIT   pid=11000 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:30.885Z EXIT   pid=10156 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:32.894Z CREATE pid=4264 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:32.904Z CREATE pid=2600 parent=4264 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:32.956Z EXIT   pid=4264 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:32.958Z EXIT   pid=2600 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:32.960Z CREATE pid=10568 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:32.970Z CREATE pid=9904 parent=10568 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:33.014Z EXIT   pid=10568 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:33.016Z EXIT   pid=9904 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:35.018Z CREATE pid=9036 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:35.028Z CREATE pid=1696 parent=9036 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:35.076Z EXIT   pid=9036 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:35.078Z EXIT   pid=1696 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:35.081Z CREATE pid=6184 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:35.091Z CREATE pid=4780 parent=6184 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:35.133Z EXIT   pid=6184 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:35.135Z EXIT   pid=4780 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:37.143Z CREATE pid=5868 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:37.153Z CREATE pid=10128 parent=5868 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:37.204Z EXIT   pid=5868 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:37.207Z EXIT   pid=10128 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:37.208Z CREATE pid=5192 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:37.218Z CREATE pid=6152 parent=5192 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:37.261Z EXIT   pid=5192 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:37.263Z EXIT   pid=6152 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:39.270Z CREATE pid=7524 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:39.280Z CREATE pid=7336 parent=7524 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:39.327Z EXIT   pid=7524 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:39.329Z EXIT   pid=7336 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:39.331Z CREATE pid=2868 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:39.343Z CREATE pid=4500 parent=2868 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:39.385Z EXIT   pid=2868 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:39.387Z EXIT   pid=4500 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:41.395Z CREATE pid=6096 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:41.405Z CREATE pid=5660 parent=6096 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:41.451Z EXIT   pid=6096 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:41.453Z EXIT   pid=5660 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:41.456Z CREATE pid=8420 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:41.465Z CREATE pid=8620 parent=8420 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:41.506Z EXIT   pid=8420 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:41.507Z EXIT   pid=8620 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:41.674Z CREATE pid=3344 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" agent-detect --json
+2026-10-08T03:25:41.684Z CREATE pid=8500 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:41.728Z CREATE pid=8088 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude
+2026-10-08T03:25:41.796Z EXIT   pid=8088 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:41.798Z CREATE pid=8180 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.cmd
+2026-10-08T03:25:41.869Z EXIT   pid=8180 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:41.871Z CREATE pid=8964 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.exe
+2026-10-08T03:25:41.942Z EXIT   pid=8964 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:41.944Z CREATE pid=10864 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.bat
+2026-10-08T03:25:42.015Z EXIT   pid=10864 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.017Z CREATE pid=848 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.ps1
+2026-10-08T03:25:42.089Z EXIT   pid=848 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.092Z CREATE pid=9324 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex
+2026-10-08T03:25:42.160Z EXIT   pid=9324 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.162Z CREATE pid=10936 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.cmd
+2026-10-08T03:25:42.234Z EXIT   pid=10936 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.236Z CREATE pid=8780 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.exe
+2026-10-08T03:25:42.308Z EXIT   pid=8780 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.310Z CREATE pid=7348 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.bat
+2026-10-08T03:25:42.383Z EXIT   pid=7348 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.385Z CREATE pid=3644 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.ps1
+2026-10-08T03:25:42.456Z EXIT   pid=3644 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.459Z CREATE pid=8896 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.cmd
+2026-10-08T03:25:42.528Z EXIT   pid=8896 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.531Z CREATE pid=6124 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.exe
+2026-10-08T03:25:42.601Z EXIT   pid=6124 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.604Z CREATE pid=10520 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.bat
+2026-10-08T03:25:42.673Z EXIT   pid=10520 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.676Z CREATE pid=780 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.ps1
+2026-10-08T03:25:42.746Z EXIT   pid=780 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.752Z CREATE pid=8332 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok
+2026-10-08T03:25:42.825Z EXIT   pid=8332 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.827Z CREATE pid=8448 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.cmd
+2026-10-08T03:25:42.898Z EXIT   pid=8448 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.900Z CREATE pid=10084 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.exe
+2026-10-08T03:25:42.970Z EXIT   pid=10084 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:42.972Z CREATE pid=1088 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.bat
+2026-10-08T03:25:43.043Z EXIT   pid=1088 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:43.045Z CREATE pid=11076 parent=3344 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.ps1
+2026-10-08T03:25:43.115Z EXIT   pid=11076 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:25:43.118Z EXIT   pid=3344 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:43.120Z EXIT   pid=8500 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:43.518Z CREATE pid=4784 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:43.528Z CREATE pid=11060 parent=4784 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:43.575Z EXIT   pid=4784 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:43.577Z EXIT   pid=11060 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:43.579Z CREATE pid=7416 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:43.589Z CREATE pid=7512 parent=7416 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:43.631Z EXIT   pid=7416 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:43.633Z EXIT   pid=7512 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:45.644Z CREATE pid=2540 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:45.654Z CREATE pid=11096 parent=2540 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:45.701Z EXIT   pid=2540 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:45.703Z EXIT   pid=11096 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:45.705Z CREATE pid=10688 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:45.714Z CREATE pid=10176 parent=10688 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:45.754Z EXIT   pid=10688 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:45.756Z EXIT   pid=10176 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:47.769Z CREATE pid=7912 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:47.779Z CREATE pid=8740 parent=7912 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:47.828Z EXIT   pid=7912 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:47.830Z EXIT   pid=8740 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:47.832Z CREATE pid=2404 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:47.842Z CREATE pid=5152 parent=2404 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:47.884Z EXIT   pid=2404 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:47.886Z EXIT   pid=5152 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:49.888Z CREATE pid=3260 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:49.898Z CREATE pid=2348 parent=3260 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:49.944Z EXIT   pid=3260 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:49.945Z EXIT   pid=2348 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:49.948Z CREATE pid=10556 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:49.960Z CREATE pid=5676 parent=10556 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:49.999Z EXIT   pid=10556 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:50.001Z EXIT   pid=5676 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:51.568Z CREATE pid=6588 parent=2632 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; rc=0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; lp=\"$HOME/.cys/pack-dept-$d\"; { [ -f \"$lp/bin/javis_boot_node.py\" ] && [ ! -e \"$pk/AUTOPILOT_PAUSED\" ]; } || lp=\"$pk\"; CYS_PACK_DIR=\"$lp\" python3 \"$pk/bin/javis_formati...[cut]
+2026-10-08T03:25:51.579Z CREATE pid=8472 parent=2632 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "printf '[heartbeat] phoenix 세대 스냅샷 정기화(6h·P2-4) — 손상 치유 소스 최신화.\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" snapshot 2>&1 | tail -3"
+2026-10-08T03:25:51.587Z CREATE pid=1132 parent=2632 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "CYS_PROJECT_ROOT=\"${CYS_PROJECT_ROOT:-$HOME}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\" tick"
+2026-10-08T03:25:51.588Z CREATE pid=8884 parent=6588 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:51.594Z CREATE pid=8800 parent=2632 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; env -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN <redacted> CYS_DEPT_ROTATE \"$pk/bin/cys-dept\" promote-if-pending"
+2026-10-08T03:25:51.596Z CREATE pid=1752 parent=8472 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:51.602Z CREATE pid=4464 parent=2632 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "CYS_PROJECT_ROOT=\"${CYS_PROJECT_ROOT:-$HOME}\" python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_cycle_autopilot.py\" bootstrap-verifier --ensure"
+2026-10-08T03:25:51.609Z CREATE pid=7656 parent=2632 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "printf '[heartbeat] phoenix 주간 격리 드릴(원자성·중단내성 self-test·라이브 무접촉) — 실전이 첫 테스트인 상태 종료(축E E2).\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" self-test 2>&1 | tail -5"
+2026-10-08T03:25:51.611Z CREATE pid=6748 parent=1132 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:51.618Z CREATE pid=10784 parent=8800 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:51.630Z CREATE pid=1232 parent=4464 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:51.638Z CREATE pid=10700 parent=7656 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:51.713Z CREATE pid=7096 parent=8472 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "printf '[heartbeat] phoenix 세대 스냅샷 정기화(6h·P2-4) — 손상 치유 소스 최신화.\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" snapshot 2>&1 | tail -3"
+2026-10-08T03:25:51.715Z CREATE pid=732 parent=6588 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; rc=0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; lp=\"$HOME/.cys/pack-dept-$d\"; { [ -f \"$lp/bin/javis_boot_node.py\" ] && [ ! -e \"$pk/AUTOPILOT_PAUSED\" ]; } || lp=\"$pk\"; CYS_PACK_DIR=\"$lp\" python3 \"$pk/bin/javis_formati...[cut]
+2026-10-08T03:25:51.757Z CREATE pid=7208 parent=4464 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe C:/Users/runneradmin/.cys/pack/bin/javis_cycle_autopilot.py bootstrap-verifier --ensure
+2026-10-08T03:25:51.758Z CREATE pid=7500 parent=1132 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe C:/Users/runneradmin/.cys/pack/bin/javis_cycle_autopilot.py tick
+2026-10-08T03:25:51.759Z CREATE pid=8212 parent=8800 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe -u CYS_ROLE -u CYS_SURFACE_ID -u CYS_SURFACE_REF -u CYS_SEAT_TOKEN <redacted> CYS_DEPT_ROTATE /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:51.767Z CREATE pid=8716 parent=8472 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "printf '[heartbeat] phoenix 세대 스냅샷 정기화(6h·P2-4) — 손상 치유 소스 최신화.\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" snapshot 2>&1 | tail -3"
+2026-10-08T03:25:51.780Z CREATE pid=10380 parent=7096 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe C:/Users/runneradmin/.cys/pack/bin/javis_state_snapshot.py snapshot
+2026-10-08T03:25:51.794Z CREATE pid=2908 parent=7656 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "printf '[heartbeat] phoenix 주간 격리 드릴(원자성·중단내성 self-test·라이브 무접촉) — 실전이 첫 테스트인 상태 종료(축E E2).\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" self-test 2>&1 | tail -5"
+2026-10-08T03:25:51.804Z CREATE pid=5064 parent=732 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "pk=\"${CYS_PACK_DIR:-$HOME/.cys/pack}\"; [ -x \"$pk/bin/cys-dept\" ] || exit 0; [ -f \"$pk/bin/javis_formation.py\" ] || exit 0; rc=0; for d in $(\"$pk/bin/cys-dept\" list 2>/dev/null); do s=\"$(\"$pk/bin/cys-dept\" sock \"$d\" 2>/dev/null)\" || continue; [ -n \"$s\" ] || continue; c=\"$(\"$pk/bin/cys-dept\" cwd \"$d\" 2>/dev/null)\" || c=\"\"; lp=\"$HOME/.cys/pack-dept-$d\"; { [ -f \"$lp/bin/javis_boot_node.py\" ] && [ ! -e \"$pk/AUTOPILOT_PAUSED\" ]; } || lp=\"$pk\"; CYS_PACK_DIR=\"$lp\" python3 \"$pk/bin/javis_formati...[cut]
+2026-10-08T03:25:51.840Z CREATE pid=5900 parent=8212 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe bash /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:51.840Z CREATE pid=1412 parent=8716 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tail.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tail.exe -3
+2026-10-08T03:25:51.881Z CREATE pid=7100 parent=7656 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe" -c "printf '[heartbeat] phoenix 주간 격리 드릴(원자성·중단내성 self-test·라이브 무접촉) — 실전이 첫 테스트인 상태 종료(축E E2).\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_state_snapshot.py\" self-test 2>&1 | tail -5"
+2026-10-08T03:25:51.893Z CREATE pid=11004 parent=2908 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe C:/Users/runneradmin/.cys/pack/bin/javis_state_snapshot.py self-test
+2026-10-08T03:25:51.916Z CREATE pid=8640 parent=5064 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe bash /c/Users/runneradmin/.cys/pack/bin/cys-dept list
+2026-10-08T03:25:51.944Z CREATE pid=6184 parent=5900 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:51.948Z EXIT   pid=8716 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:51.955Z EXIT   pid=8212 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe
+2026-10-08T03:25:51.995Z CREATE pid=5524 parent=7100 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tail.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tail.exe -5
+2026-10-08T03:25:52.003Z CREATE pid=8996 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:52.027Z EXIT   pid=5064 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.032Z CREATE pid=4260 parent=8640 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept list
+2026-10-08T03:25:52.054Z CREATE pid=2196 parent=8996 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:52.091Z CREATE pid=10652 parent=7208 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=cys gate-check
+2026-10-08T03:25:52.118Z EXIT   pid=5900 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe
+2026-10-08T03:25:52.118Z CREATE pid=5192 parent=7500 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=cys gate-check
+2026-10-08T03:25:52.121Z CREATE pid=6236 parent=6184 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.128Z EXIT   pid=7100 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.132Z EXIT   pid=10380 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:25:52.138Z CREATE pid=8736 parent=10652 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:52.151Z EXIT   pid=1412 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tail.exe
+2026-10-08T03:25:52.162Z EXIT   pid=8640 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\env.exe
+2026-10-08T03:25:52.163Z EXIT   pid=7096 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.165Z CREATE pid=3920 parent=5192 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:52.210Z EXIT   pid=8472 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.214Z EXIT   pid=1752 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:52.218Z EXIT   pid=6236 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.224Z EXIT   pid=10652 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:52.225Z EXIT   pid=8996 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:52.233Z EXIT   pid=2196 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:52.236Z CREATE pid=10780 parent=4260 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept list
+2026-10-08T03:25:52.237Z CREATE pid=5536 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:52.241Z EXIT   pid=8736 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:52.250Z EXIT   pid=7208 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:25:52.254Z CREATE pid=5984 parent=6184 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.264Z EXIT   pid=4464 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.264Z CREATE pid=1836 parent=5536 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:52.275Z EXIT   pid=1232 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:52.276Z EXIT   pid=5192 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:52.282Z EXIT   pid=3920 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:52.286Z CREATE pid=5660 parent=7500 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=cys status --json
+2026-10-08T03:25:52.312Z EXIT   pid=11004 status=0x1 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:25:52.313Z CREATE pid=8420 parent=5660 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:52.314Z EXIT   pid=5984 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.321Z EXIT   pid=10780 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.322Z EXIT   pid=5524 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tail.exe
+2026-10-08T03:25:52.330Z CREATE pid=3164 parent=4260 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept list
+2026-10-08T03:25:52.331Z CREATE pid=6180 parent=6184 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.333Z EXIT   pid=2908 status=0x100 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.366Z EXIT   pid=7656 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.380Z EXIT   pid=10700 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:52.380Z EXIT   pid=5536 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:52.389Z EXIT   pid=1836 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:52.391Z EXIT   pid=3164 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.401Z EXIT   pid=5660 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:52.406Z CREATE pid=2952 parent=6180 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.409Z CREATE pid=10936 parent=7500 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe cmd=powershell -NoProfile -NonInteractive -Command "Get-CimInstance Win32_Process -Filter \"Name='cys.exe' OR Name='cys'\" | Where-Object { $_.CommandLine -match 'cycle-agent' -and $_.ProcessId -ne $PID } | Measure-Object | Select-Object -ExpandProperty Count"
+2026-10-08T03:25:52.413Z EXIT   pid=8420 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:52.414Z CREATE pid=1296 parent=4260 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept list
+2026-10-08T03:25:52.441Z CREATE pid=1428 parent=10936 [C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:52.466Z CREATE pid=5928 parent=1296 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept list
+2026-10-08T03:25:52.476Z CREATE pid=6428 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.506Z CREATE pid=3612 parent=1296 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept list
+2026-10-08T03:25:52.522Z CREATE pid=8664 parent=5928 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe - C:/Users/runneradmin/.cys/depts.json
+2026-10-08T03:25:52.535Z CREATE pid=10896 parent=6428 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.562Z CREATE pid=2480 parent=3612 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe -d \r
+2026-10-08T03:25:52.606Z CREATE pid=8072 parent=10896 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\cygpath.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\cygpath.exe -w /c/Users/runneradmin/.cys/state
+2026-10-08T03:25:52.609Z EXIT   pid=3612 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.634Z EXIT   pid=8664 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:25:52.637Z EXIT   pid=5928 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.646Z EXIT   pid=10896 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.646Z EXIT   pid=2480 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe
+2026-10-08T03:25:52.650Z EXIT   pid=8072 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\cygpath.exe
+2026-10-08T03:25:52.657Z EXIT   pid=6428 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.664Z EXIT   pid=1296 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.667Z CREATE pid=10828 parent=4260 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept list
+2026-10-08T03:25:52.683Z CREATE pid=6416 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.710Z CREATE pid=8648 parent=10828 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept list
+2026-10-08T03:25:52.731Z EXIT   pid=6416 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.741Z CREATE pid=7704 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.780Z CREATE pid=7516 parent=8648 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\uname.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\uname.exe -s
+2026-10-08T03:25:52.814Z CREATE pid=9228 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.833Z CREATE pid=4556 parent=7704 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\locale.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\locale.exe -a
+2026-10-08T03:25:52.873Z CREATE pid=6556 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.875Z EXIT   pid=8648 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.882Z EXIT   pid=7516 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\uname.exe
+2026-10-08T03:25:52.886Z CREATE pid=9964 parent=9228 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe A-Z a-z
+2026-10-08T03:25:52.912Z CREATE pid=2228 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:52.924Z CREATE pid=5272 parent=6556 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe -d _-
+2026-10-08T03:25:52.934Z EXIT   pid=10828 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.942Z EXIT   pid=7704 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:52.990Z EXIT   pid=4260 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.007Z EXIT   pid=6556 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.010Z EXIT   pid=9228 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.013Z CREATE pid=2320 parent=2228 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.023Z EXIT   pid=732 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.028Z EXIT   pid=6588 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.033Z EXIT   pid=8884 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:53.064Z CREATE pid=7376 parent=2320 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.074Z EXIT   pid=4556 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\locale.exe
+2026-10-08T03:25:53.078Z EXIT   pid=9964 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe
+2026-10-08T03:25:53.081Z EXIT   pid=5272 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe
+2026-10-08T03:25:53.110Z CREATE pid=6020 parent=2320 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.130Z EXIT   pid=7376 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.176Z CREATE pid=2448 parent=2320 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.183Z CREATE pid=6476 parent=6020 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe A-Z a-z
+2026-10-08T03:25:53.220Z EXIT   pid=6020 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.225Z EXIT   pid=6476 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe
+2026-10-08T03:25:53.230Z CREATE pid=5864 parent=2448 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe -d _-
+2026-10-08T03:25:53.255Z EXIT   pid=2448 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.258Z EXIT   pid=5864 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe
+2026-10-08T03:25:53.266Z EXIT   pid=2320 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.281Z CREATE pid=10224 parent=2228 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\grep.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\grep.exe -qxF c.utf8
+2026-10-08T03:25:53.311Z EXIT   pid=2228 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.315Z EXIT   pid=10224 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\grep.exe
+2026-10-08T03:25:53.332Z CREATE pid=2212 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.378Z EXIT   pid=2212 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.390Z CREATE pid=5596 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.430Z EXIT   pid=5596 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.432Z CREATE pid=4752 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.472Z CREATE pid=1420 parent=4752 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.516Z EXIT   pid=1420 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.522Z EXIT   pid=4752 status=0x100 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.524Z CREATE pid=10140 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.566Z CREATE pid=5880 parent=10140 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.614Z EXIT   pid=5880 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.621Z EXIT   pid=10140 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.624Z EXIT   pid=2952 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.629Z EXIT   pid=6180 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.638Z CREATE pid=1492 parent=6184 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.679Z CREATE pid=8156 parent=1492 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.715Z CREATE pid=6880 parent=1492 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe /c/Users/runneradmin/.cys/pack/bin/cys-dept promote-if-pending
+2026-10-08T03:25:53.732Z CREATE pid=10624 parent=8156 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe - C:/Users/runneradmin/.cys/depts.json
+2026-10-08T03:25:53.775Z CREATE pid=5088 parent=6880 [C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe cmd=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe -d \r
+2026-10-08T03:25:53.806Z EXIT   pid=6880 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.838Z EXIT   pid=10624 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:25:53.842Z EXIT   pid=8156 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.842Z EXIT   pid=5088 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\tr.exe
+2026-10-08T03:25:53.848Z EXIT   pid=1492 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.851Z EXIT   pid=6184 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.853Z EXIT   pid=8800 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:53.855Z EXIT   pid=10784 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:54.406Z CREATE pid=2948 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:54.417Z CREATE pid=11040 parent=2948 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:54.465Z EXIT   pid=2948 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:54.467Z EXIT   pid=11040 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:54.469Z CREATE pid=9224 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:54.480Z CREATE pid=10748 parent=9224 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:54.526Z EXIT   pid=9224 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:54.528Z EXIT   pid=10748 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:55.424Z EXIT   pid=10936 status=0x0 image=C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe
+2026-10-08T03:25:55.429Z EXIT   pid=1428 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:55.458Z EXIT   pid=7500 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:25:55.463Z EXIT   pid=1132 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\git\usr\bin\bash.exe
+2026-10-08T03:25:55.464Z EXIT   pid=6748 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:55.472Z EXIT   pid=3876 status=0x1 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:55.478Z EXIT   pid=4044 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:56.531Z CREATE pid=4464 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:56.541Z CREATE pid=10860 parent=4464 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:56.589Z EXIT   pid=4464 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:56.590Z EXIT   pid=10860 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:56.593Z CREATE pid=2240 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:56.603Z CREATE pid=6640 parent=2240 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:56.646Z EXIT   pid=2240 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:56.649Z EXIT   pid=6640 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:58.656Z CREATE pid=8596 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:25:58.670Z CREATE pid=7100 parent=8596 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:58.717Z EXIT   pid=8596 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:58.719Z EXIT   pid=7100 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:25:58.721Z CREATE pid=9232 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:25:58.731Z CREATE pid=8180 parent=9232 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:25:58.773Z EXIT   pid=9232 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:25:58.775Z EXIT   pid=8180 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:00.779Z CREATE pid=6304 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:00.789Z CREATE pid=5552 parent=6304 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:00.837Z EXIT   pid=6304 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:00.838Z EXIT   pid=5552 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:00.840Z CREATE pid=7232 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:00.851Z CREATE pid=6292 parent=7232 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:00.891Z EXIT   pid=7232 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:00.893Z EXIT   pid=6292 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:01.679Z CREATE pid=7616 parent=9500 [C:\Users\runneradmin\AppData\Local\cys\cys-app.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" agent-detect --json
+2026-10-08T03:26:01.689Z CREATE pid=9356 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:01.737Z CREATE pid=8664 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude
+2026-10-08T03:26:01.810Z EXIT   pid=8664 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:01.812Z CREATE pid=2556 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.cmd
+2026-10-08T03:26:01.886Z EXIT   pid=2556 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:01.889Z CREATE pid=6776 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.exe
+2026-10-08T03:26:01.962Z EXIT   pid=6776 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:01.964Z CREATE pid=1540 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.bat
+2026-10-08T03:26:02.038Z EXIT   pid=1540 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.040Z CREATE pid=8072 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" claude.ps1
+2026-10-08T03:26:02.113Z EXIT   pid=8072 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.116Z CREATE pid=11220 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex
+2026-10-08T03:26:02.186Z EXIT   pid=11220 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.189Z CREATE pid=8448 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.cmd
+2026-10-08T03:26:02.262Z EXIT   pid=8448 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.264Z CREATE pid=1296 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.exe
+2026-10-08T03:26:02.337Z EXIT   pid=1296 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.340Z CREATE pid=10632 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.bat
+2026-10-08T03:26:02.413Z EXIT   pid=10632 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.415Z CREATE pid=7416 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" codex.ps1
+2026-10-08T03:26:02.488Z EXIT   pid=7416 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.491Z CREATE pid=6416 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.cmd
+2026-10-08T03:26:02.562Z EXIT   pid=6416 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.564Z CREATE pid=2540 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.exe
+2026-10-08T03:26:02.637Z EXIT   pid=2540 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.640Z CREATE pid=2276 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.bat
+2026-10-08T03:26:02.710Z EXIT   pid=2276 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.712Z CREATE pid=8992 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" agy.ps1
+2026-10-08T03:26:02.787Z EXIT   pid=8992 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.790Z CREATE pid=10828 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok
+2026-10-08T03:26:02.859Z EXIT   pid=10828 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.862Z CREATE pid=2008 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.cmd
+2026-10-08T03:26:02.905Z CREATE pid=7764 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:02.916Z CREATE pid=10128 parent=7764 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:02.942Z EXIT   pid=2008 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:02.945Z CREATE pid=1100 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.exe
+2026-10-08T03:26:02.965Z EXIT   pid=7764 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:02.968Z CREATE pid=6396 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:02.973Z EXIT   pid=10128 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:02.980Z CREATE pid=10276 parent=6396 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:03.024Z EXIT   pid=6396 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:03.026Z EXIT   pid=10276 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:03.030Z EXIT   pid=1100 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:03.032Z CREATE pid=848 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.bat
+2026-10-08T03:26:03.103Z EXIT   pid=848 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:03.106Z CREATE pid=5792 parent=7616 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\where.exe cmd="where" grok.ps1
+2026-10-08T03:26:03.177Z EXIT   pid=5792 status=0x1 image=C:\Windows\System32\where.exe
+2026-10-08T03:26:03.180Z EXIT   pid=7616 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:03.182Z EXIT   pid=9356 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:05.031Z CREATE pid=3916 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:05.041Z CREATE pid=6556 parent=3916 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:05.088Z EXIT   pid=3916 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:05.090Z EXIT   pid=6556 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:05.092Z CREATE pid=7392 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:05.102Z CREATE pid=5624 parent=7392 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:05.143Z EXIT   pid=7392 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:05.145Z EXIT   pid=5624 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:07.156Z CREATE pid=5864 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:07.167Z CREATE pid=8936 parent=5864 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:07.213Z EXIT   pid=5864 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:07.215Z EXIT   pid=8936 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:07.217Z CREATE pid=3260 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:07.227Z CREATE pid=1940 parent=3260 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:07.268Z EXIT   pid=3260 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:07.269Z EXIT   pid=1940 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:09.281Z CREATE pid=10556 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:09.291Z CREATE pid=4748 parent=10556 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:09.338Z EXIT   pid=10556 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:09.340Z EXIT   pid=4748 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:09.343Z CREATE pid=10464 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:09.353Z CREATE pid=8436 parent=10464 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:09.396Z EXIT   pid=10464 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:09.399Z EXIT   pid=8436 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:09.475Z CREATE pid=4632 parent=7528 [C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" --version
+2026-10-08T03:26:09.485Z CREATE pid=6580 parent=4632 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:09.526Z EXIT   pid=4632 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:09.528Z EXIT   pid=6580 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:09.533Z CREATE pid=2952 parent=7528 [C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd="C:\Users\runneradmin\AppData\Local\cys\cys.exe" doctor
+2026-10-08T03:26:09.543Z CREATE pid=6764 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:09.682Z CREATE pid=3756 parent=2952 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe" C:\Users\runneradmin\.cys/pack\bin\javis_runtime_seal.py verify --root C:\Users\runneradmin\AppData\Local\cys\runtime --manifest C:\Users\runneradmin\AppData\Local\cys\runtime-manifest.json --json --max-list 3
+2026-10-08T03:26:11.405Z CREATE pid=5600 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:11.415Z CREATE pid=6880 parent=5600 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:11.462Z EXIT   pid=5600 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:11.464Z EXIT   pid=6880 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:11.466Z CREATE pid=10852 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:11.475Z CREATE pid=3996 parent=10852 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:11.517Z EXIT   pid=10852 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:11.518Z EXIT   pid=3996 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:13.531Z CREATE pid=5744 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:13.541Z CREATE pid=7096 parent=5744 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:13.587Z EXIT   pid=5744 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:13.589Z EXIT   pid=7096 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:13.591Z CREATE pid=2948 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:13.601Z CREATE pid=3692 parent=2948 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:13.643Z EXIT   pid=2948 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:13.645Z EXIT   pid=3692 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:15.657Z CREATE pid=1780 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:15.667Z CREATE pid=3672 parent=1780 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:15.714Z EXIT   pid=1780 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:15.716Z EXIT   pid=3672 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:15.718Z CREATE pid=10084 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:15.728Z CREATE pid=6684 parent=10084 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:15.770Z EXIT   pid=10084 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:15.772Z EXIT   pid=6684 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:17.782Z CREATE pid=7400 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:17.791Z CREATE pid=2424 parent=7400 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:17.838Z EXIT   pid=7400 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:17.840Z EXIT   pid=2424 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:17.842Z CREATE pid=8380 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:17.852Z CREATE pid=876 parent=8380 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:17.894Z EXIT   pid=8380 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:17.896Z EXIT   pid=876 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:19.905Z CREATE pid=8640 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:19.915Z CREATE pid=6588 parent=8640 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:19.962Z EXIT   pid=8640 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:19.963Z EXIT   pid=6588 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:19.966Z CREATE pid=8428 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:19.976Z CREATE pid=1120 parent=8428 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:20.017Z EXIT   pid=8428 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:20.019Z EXIT   pid=1120 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:21.200Z EXIT   pid=3756 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:26:21.207Z EXIT   pid=2952 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:21.209Z EXIT   pid=6764 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:22.031Z CREATE pid=6176 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:22.041Z CREATE pid=10204 parent=6176 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:22.088Z EXIT   pid=6176 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:22.090Z EXIT   pid=10204 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:22.093Z CREATE pid=1732 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:22.102Z CREATE pid=8088 parent=1732 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:22.144Z EXIT   pid=1732 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:22.146Z EXIT   pid=8088 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:23.229Z CREATE pid=2400 parent=10764 [C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe] image=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe cmd="C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe" --type=utility --utility-sub-type=unzip.mojom.Unzipper --lang=en-US --service-sandbox-type=service --noerrdialogs --user-data-dir="C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView" --webview-exe-name=cys-app.exe --webview-exe-version=0.14.46 --embedded-browser-webview=1 --embedded-browser-webview-dpi-awareness=2 --ssd-no-pressure-read-main-dll --metrics-shmem-handle=1224,i,15376147617949716533,9474055500161887801,524288 --field-trial-handle=1904,i,3105539573173597783,115286070178469920...[cut]
+2026-10-08T03:26:23.282Z EXIT   pid=2400 status=0x0 image=C:\Program Files (x86)\Microsoft\EdgeWebView\Application\154.0.4258.37\msedgewebview2.exe
+2026-10-08T03:26:24.156Z CREATE pid=9064 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe fleet --json
+2026-10-08T03:26:24.169Z CREATE pid=7464 parent=9064 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:24.223Z EXIT   pid=9064 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:24.225Z EXIT   pid=7464 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:24.228Z CREATE pid=6428 parent=2632 [C:\Users\runneradmin\AppData\Local\cys\cysd.exe] image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe cmd="C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe" C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.46-2632-1791429921597296400\bin\javis_phoenix.py --socket \\.\pipe\cys restore --auto
+2026-10-08T03:26:24.229Z CREATE pid=2556 parent=10512 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe status --json
+2026-10-08T03:26:24.243Z CREATE pid=2828 parent=6428 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:24.243Z CREATE pid=5572 parent=2556 [C:\Users\runneradmin\AppData\Local\cys\cys.exe] image=C:\Windows\System32\conhost.exe cmd=\??\C:\Windows\system32\conhost.exe 0xffffffff -ForceV1
+2026-10-08T03:26:24.295Z EXIT   pid=2556 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:24.301Z EXIT   pid=5572 status=0x0 image=C:\Windows\System32\conhost.exe
+2026-10-08T03:26:24.525Z CREATE pid=6172 parent=6428 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe phoenix-identity
+2026-10-08T03:26:24.603Z EXIT   pid=6172 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:24.611Z CREATE pid=11060 parent=6428 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:26:24.652Z EXIT   pid=11060 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:24.662Z CREATE pid=10828 parent=6428 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:26:24.696Z EXIT   pid=10828 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:24.705Z CREATE pid=10688 parent=6428 [C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe] image=C:\Users\runneradmin\AppData\Local\cys\cys.exe cmd=C:\Users\runneradmin\AppData\Local\cys\cys.exe --socket \\.\pipe\cys status --json
+2026-10-08T03:26:24.744Z EXIT   pid=10688 status=0x0 image=C:\Users\runneradmin\AppData\Local\cys\cys.exe
+2026-10-08T03:26:24.797Z EXIT   pid=6428 status=0x1 image=C:\Users\runneradmin\AppData\Local\cys\runtime\python\python3.exe
+2026-10-08T03:26:24.799Z EXIT   pid=2828 status=0x0 image=C:\Windows\System32\conhost.exe

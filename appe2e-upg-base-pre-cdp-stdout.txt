@@ -1,0 +1,8 @@
+{"t":"2026-10-08T03:23:42.867Z","name":"start","argv":"--mode uipre --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-upg-base-pre --max-wait-sec 200 --ready-wait-sec 90","native_websocket":true}
+{"t":"2026-10-08T03:23:42.948Z","name":"targets","count":1,"pages":1}
+{"t":"2026-10-08T03:23:43.046Z","name":"connected","url":"about:blank","title":"about:blank","ws_impl":"mini"}
+{"t":"2026-10-08T03:23:45.051Z","name":"attached","url":"about:blank","title":"about:blank","id":"3AFD14963A3A778CC754F9AC58406433"}
+{"t":"2026-10-08T03:23:45.053Z","name":"page_info","href":"http://tauri.localhost/"}
+{"t":"2026-10-08T03:23:45.059Z","name":"app_version","value":"0.14.45"}
+{"t":"2026-10-08T03:23:45.060Z","name":"ui: wait for the Update button"}
+
