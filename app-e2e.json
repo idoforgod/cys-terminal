@@ -1,0 +1,621 @@
+{
+    "started":  "2026-10-08T22:20:00.372Z",
+    "matrix_os":  "windows-11-arm",
+    "inputs":  {
+                   "run_id":  "37463451383",
+                   "artifact":  "cys-windows-x64-nsis",
+                   "installer_dir":  "C:\\a\\_temp\\appe2e-installer",
+                   "manifest_url":  "https://raw.githubusercontent.com/idoforgod/cys-terminal/064b51846750f7beb9b9388680414d6c12c3b57e/diag/appe2e-manifest.json",
+                   "commit":  "064b51846750f7beb9b9388680414d6c12c3b57e",
+                   "no_input":  false,
+                   "installer":  {
+                                     "path":  "C:\\a\\_temp\\appe2e-installer\\cys_0.14.47_x64-setup.exe",
+                                     "name":  "cys_0.14.47_x64-setup.exe",
+                                     "size":  143610067,
+                                     "sha256":  "11ed7fec5bbe3f022540e39b9e961a5ebacf2fba1654eaa77f9b26edace68268",
+                                     "signature":  "NotSigned",
+                                     "file_version":  "0.14.47",
+                                     "product_version":  "0.14.47"
+                                 },
+                   "installer_ok":  true,
+                   "from_version":  "0.14.47",
+                   "manifest":  {
+                                    "url":  "https://raw.githubusercontent.com/idoforgod/cys-terminal/064b51846750f7beb9b9388680414d6c12c3b57e/diag/appe2e-manifest.json",
+                                    "attempts":  [
+                                                     {
+                                                         "n":  1,
+                                                         "ok":  true,
+                                                         "rc":  0,
+                                                         "size":  1451,
+                                                         "err":  ""
+                                                     }
+                                                 ],
+                                    "ok":  true,
+                                    "version":  "0.14.99",
+                                    "platform_keys":  [
+                                                          "windows-x86_64",
+                                                          "windows-x86_64-nsis"
+                                                      ],
+                                    "target_key":  "windows-x86_64-nsis",
+                                    "installer_url":  "https://github.com/idoforgod/cys-terminal/releases/download/v0.14.42/cys_0.14.42_x64-setup.exe",
+                                    "installer_version":  "0.14.42",
+                                    "signature_chars":  416,
+                                    "same_as_repo_copy":  true,
+                                    "error":  null
+                                },
+                   "problems":  [
+
+                                ],
+                   "release_tag":  "v0.14.47",
+                   "gate_why":  "",
+                   "installer_source":  {
+                                            "kind":  "release-asset",
+                                            "tag":  "v0.14.47",
+                                            "report_found":  true,
+                                            "ok":  true,
+                                            "error":  null,
+                                            "http_status":  null,
+                                            "release_id":  407248273,
+                                            "draft":  true,
+                                            "prerelease":  false,
+                                            "release_name":  "cys v0.14.47",
+                                            "asset_name":  "cys_0.14.47_x64-setup.exe",
+                                            "asset_id":  622982012,
+                                            "size":  143610067,
+                                            "sha256":  "11ed7fec5bbe3f022540e39b9e961a5ebacf2fba1654eaa77f9b26edace68268",
+                                            "digest":  "sha256:11ed7fec5bbe3f022540e39b9e961a5ebacf2fba1654eaa77f9b26edace68268",
+                                            "digest_match":  true,
+                                            "asset_updated_at":  "2026-10-08T20:54:44Z",
+                                            "saved_to":  "C:\\a\\_temp\\appe2e-installer\\cys_0.14.47_x64-setup.exe",
+                                            "duplicates_note":  null,
+                                            "file_sha256_same":  true
+                                        }
+               },
+    "measurable":  null,
+    "sac_initially_enforced":  false,
+    "sac_on_confirmed":  null,
+    "sac_on_utc":  null,
+    "restore_ok":  null,
+    "verdict":  null,
+    "steps":  {
+                  "prepare":  {
+                                  "started":  "2026-10-08T22:20:00.396Z",
+                                  "ended":  "2026-10-08T22:20:11.600Z",
+                                  "ok":  true,
+                                  "error":  null,
+                                  "language_mode_at_start":  "FullLanguage",
+                                  "language_mode_at_end":  "FullLanguage",
+                                  "minutes_left_at_start":  33.2
+                              },
+                  "install-off":  {
+                                      "started":  "2026-10-08T22:20:11.605Z",
+                                      "ended":  "2026-10-08T22:21:35.433Z",
+                                      "ok":  true,
+                                      "error":  null,
+                                      "language_mode_at_start":  "FullLanguage",
+                                      "language_mode_at_end":  "FullLanguage",
+                                      "minutes_left_at_start":  33
+                                  },
+                  "install-facts":  {
+                                        "started":  "2026-10-08T22:21:35.433Z",
+                                        "ended":  "2026-10-08T22:21:37.199Z",
+                                        "ok":  true,
+                                        "error":  null,
+                                        "language_mode_at_start":  "FullLanguage",
+                                        "language_mode_at_end":  "FullLanguage",
+                                        "minutes_left_at_start":  31.6
+                                    },
+                  "off-run":  {
+                                  "started":  "2026-10-08T22:21:37.199Z",
+                                  "ended":  "2026-10-08T22:23:34.323Z",
+                                  "ok":  true,
+                                  "error":  null,
+                                  "language_mode_at_start":  "FullLanguage",
+                                  "language_mode_at_end":  "FullLanguage",
+                                  "minutes_left_at_start":  31.6
+                              },
+                  "reinstall":  {
+                                    "started":  "2026-10-08T22:23:34.328Z",
+                                    "ended":  "2026-10-08T22:24:39.507Z",
+                                    "ok":  true,
+                                    "error":  null,
+                                    "language_mode_at_start":  "FullLanguage",
+                                    "language_mode_at_end":  "FullLanguage",
+                                    "minutes_left_at_start":  29.6
+                                },
+                  "on-pre":  {
+                                 "started":  "2026-10-08T22:24:39.507Z",
+                                 "ended":  "2026-10-08T22:24:41.072Z",
+                                 "ok":  true,
+                                 "error":  null,
+                                 "language_mode_at_start":  "FullLanguage",
+                                 "language_mode_at_end":  "FullLanguage",
+                                 "minutes_left_at_start":  28.5
+                             }
+              },
+    "states":  {
+                   "initial":  {
+                                   "tag":  "initial",
+                                   "time":  "2026-10-08T22:20:07.653Z",
+                                   "language_mode":  "FullLanguage",
+                                   "registry":  {
+                                                    "rc":  0,
+                                                    "out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                                                    "present":  true,
+                                                    "value":  0
+                                                },
+                                   "citool":  {
+                                                  "rc":  0,
+                                                  "json_parsed":  true,
+                                                  "error":  null,
+                                                  "desktop_policy":  {
+                                                                         "name":  "VerifiedAndReputableDesktop",
+                                                                         "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                         "is_enforced":  false,
+                                                                         "is_authorized":  false,
+                                                                         "is_on_disk":  true
+                                                                     },
+                                                  "enforced_names":  [
+
+                                                                     ],
+                                                  "verified_and_reputable":  [
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktop",
+                                                                                     "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 },
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktopEvaluation",
+                                                                                     "policy_id":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 },
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                                                     "policy_id":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 },
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                                                     "policy_id":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 },
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                                                     "policy_id":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 },
+                                                                                 {
+                                                                                     "name":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                                                     "policy_id":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                                                     "is_enforced":  false,
+                                                                                     "is_authorized":  false,
+                                                                                     "is_on_disk":  true
+                                                                                 }
+                                                                             ]
+                                              },
+                                   "defender":  {
+                                                    "SmartAppControlState":  "Off",
+                                                    "SmartAppControlExpiration":  null,
+                                                    "AMRunningMode":  "Normal",
+                                                    "RealTimeProtectionEnabled":  true
+                                                },
+                                   "ci_state":  {
+                                                    "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                                                    "options_hex":  "0x00282203",
+                                                    "flags":  [
+                                                                  "ENABLED",
+                                                                  "TESTSIGN",
+                                                                  "FLIGHTING_ENABLED",
+                                                                  "HVCI_IUM_ENABLED"
+                                                              ]
+                                                },
+                                   "signals":  {
+                                                   "registry_is_1":  false,
+                                                   "citool_desktop_enforced":  false,
+                                                   "defender_on":  false,
+                                                   "umci_flag":  false
+                                               },
+                                   "enforced":  false
+                               }
+               },
+    "checkpoints":  {
+
+                    },
+    "notes":  [
+
+              ],
+    "prepare":  {
+                    "native_ready":  true,
+                    "native_error":  null,
+                    "language_mode":  "FullLanguage",
+                    "os_product":  "Windows 10 Enterprise 25H2 build 26200.9457",
+                    "node_exe":  "C:\\hostedtoolcache\\windows\\node\\22.23.3\\arm64\\node.exe",
+                    "subjects_loaded":  388,
+                    "ci_log_size_set_rc":  0
+                },
+    "reset_before_off":  {
+                             "why":  "before-off",
+                             "time":  "2026-10-08T22:20:11.617Z",
+                             "killed_under_install_dir":  [
+
+                                                          ],
+                             "killed_webview2":  [
+
+                                                 ],
+                             "killed_installers":  [
+
+                                                   ],
+                             "updater_dirs_removed":  [
+
+                                                      ],
+                             "attempt_before":  {
+                                                    "path":  "C:\\Users\\runneradmin\\.cys\\.update-attempt.json",
+                                                    "exists":  false,
+                                                    "text":  null
+                                                }
+                         },
+    "off_install":  {
+                        "installer":  "C:\\a\\_temp\\appe2e-installer\\cys_0.14.47_x64-setup.exe",
+                        "expect":  "0.14.47",
+                        "started":  "2026-10-08T22:20:13.812Z",
+                        "rc":  0,
+                        "timed_out":  false,
+                        "marker":  "0.14.47",
+                        "failure_file":  null,
+                        "file_version":  "0.14.47 / product 0.14.47",
+                        "killed":  [
+
+                                   ],
+                        "ok":  true,
+                        "error":  null,
+                        "finished":  "2026-10-08T22:21:35.433Z"
+                    },
+    "install_facts":  {
+                          "tag":  "fresh-after-first-install",
+                          "time":  "2026-10-08T22:21:35.484Z",
+                          "install_dir":  "C:\\Users\\runneradmin\\AppData\\Local\\cys",
+                          "install_dir_exists":  true,
+                          "marker":  "0.14.47",
+                          "failure_file_present":  false,
+                          "uninstall":  {
+                                            "hkcu_entry_found":  true,
+                                            "display_version":  "0.14.47",
+                                            "entries":  [
+                                                            {
+                                                                "hive":  "HKCU",
+                                                                "root":  "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                                                                "key":  "cys",
+                                                                "DisplayName":  "cys",
+                                                                "DisplayVersion":  "0.14.47",
+                                                                "UninstallString":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\uninstall.exe\"",
+                                                                "InstallLocation":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\"",
+                                                                "Publisher":  "cysjavis",
+                                                                "DisplayIcon":  "\"C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe\"",
+                                                                "EstimatedSize":  671826
+                                                            }
+                                                        ]
+                                        },
+                          "shortcuts":  {
+                                            "start_menu_present":  true,
+                                            "desktop_present":  true,
+                                            "start_menu":  [
+                                                               {
+                                                                   "path":  "C:\\Users\\runneradmin\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\cys.lnk",
+                                                                   "target":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe"
+                                                               }
+                                                           ],
+                                            "desktop":  [
+                                                            {
+                                                                "path":  "C:\\Users\\runneradmin\\Desktop\\cys.lnk",
+                                                                "target":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe"
+                                                            }
+                                                        ]
+                                        },
+                          "files":  {
+                                        "count":  11682,
+                                        "bytes":  687951133,
+                                        "ms":  227,
+                                        "via":  "DirectoryInfo.EnumerateFiles",
+                                        "error":  null,
+                                        "top_level":  [
+                                                          "cys.exe",
+                                                          "cys-app.exe",
+                                                          "cysd.exe",
+                                                          "cys-installed-version.txt",
+                                                          "pack.tar.gz",
+                                                          "pack-manifest.json",
+                                                          "runtime\\",
+                                                          "runtime-manifest.json",
+                                                          "uninstall.exe"
+                                                      ]
+                                    },
+                          "core":  {
+                                       "cys-app.exe":  {
+                                                           "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-app.exe",
+                                                           "exists":  true,
+                                                           "size":  16952320,
+                                                           "file_version":  "0.14.47",
+                                                           "product_version":  "0.14.47",
+                                                           "version3":  "0.14.47",
+                                                           "sha256":  "cd4155115bc1cf14123d47f66da28f135b6a80ecd20417074d7af3aef2fbf401"
+                                                       },
+                                       "cys.exe":  {
+                                                       "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                                                       "exists":  true,
+                                                       "size":  31256064,
+                                                       "file_version":  "0.14.47",
+                                                       "product_version":  "0.14.47",
+                                                       "version3":  "0.14.47",
+                                                       "sha256":  "f7b7ed5421a7d7637c69119b94ac8634c82919e99cdae89d9d31311f3041aade"
+                                                   },
+                                       "cysd.exe":  {
+                                                        "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                                        "exists":  true,
+                                                        "size":  46031872,
+                                                        "file_version":  "0.14.47",
+                                                        "product_version":  "0.14.47",
+                                                        "version3":  "0.14.47",
+                                                        "sha256":  "e5acbf120858006ee4dc01bc4d1e08e940d2f602ac7696d20fc3087aea4033d1"
+                                                    }
+                                   },
+                          "cli":  {
+                                      "cys.exe":  {
+                                                      "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys.exe",
+                                                      "ran":  true,
+                                                      "skipped":  null,
+                                                      "rc":  0,
+                                                      "timed_out":  false,
+                                                      "start_error":  null,
+                                                      "ms":  176,
+                                                      "out":  "cys 0.14.47",
+                                                      "err":  ""
+                                                  },
+                                      "cysd.exe":  {
+                                                       "path":  "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cysd.exe",
+                                                       "ran":  true,
+                                                       "skipped":  null,
+                                                       "rc":  0,
+                                                       "timed_out":  false,
+                                                       "start_error":  null,
+                                                       "ms":  55,
+                                                       "out":  "cysd 0.14.47 (build 5a9f7be8dcaa)",
+                                                       "err":  ""
+                                                   }
+                                  },
+                          "bundled":  [
+                                          {
+                                              "rel":  "runtime\\git\\bin\\bash.exe",
+                                              "exists":  true,
+                                              "size":  47464,
+                                              "version_rc":  0,
+                                              "version_out":  "GNU bash, version 5.3.15(1)-release (x86_64-pc-cygwin)",
+                                              "version_timed_out":  false,
+                                              "version_ms":  152
+                                          },
+                                          {
+                                              "rel":  "runtime\\git\\usr\\bin\\bash.exe",
+                                              "exists":  true,
+                                              "size":  2456832,
+                                              "version_rc":  null,
+                                              "version_out":  null,
+                                              "version_timed_out":  null,
+                                              "version_ms":  null
+                                          },
+                                          {
+                                              "rel":  "runtime\\git\\cmd\\git.exe",
+                                              "exists":  true,
+                                              "size":  46936,
+                                              "version_rc":  null,
+                                              "version_out":  null,
+                                              "version_timed_out":  null,
+                                              "version_ms":  null
+                                          },
+                                          {
+                                              "rel":  "runtime\\python\\python3.exe",
+                                              "exists":  true,
+                                              "size":  104952,
+                                              "version_rc":  0,
+                                              "version_out":  "Python 3.12.10",
+                                              "version_timed_out":  false,
+                                              "version_ms":  64
+                                          },
+                                          {
+                                              "rel":  "runtime\\python\\python.exe",
+                                              "exists":  true,
+                                              "size":  104952,
+                                              "version_rc":  null,
+                                              "version_out":  null,
+                                              "version_timed_out":  null,
+                                              "version_ms":  null
+                                          },
+                                          {
+                                              "rel":  "runtime\\node\\node.exe",
+                                              "exists":  true,
+                                              "size":  85193344,
+                                              "version_rc":  null,
+                                              "version_out":  null,
+                                              "version_timed_out":  null,
+                                              "version_ms":  null
+                                          }
+                                      ],
+                          "ms":  1709,
+                          "errors":  [
+
+                                     ]
+                      },
+    "webview2_policy":  {
+                            "key":  "HKLM\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments",
+                            "value_name":  "cys-app.exe",
+                            "key_existed":  false,
+                            "old_value_present":  false,
+                            "old_value_query":  "",
+                            "set_rc":  0,
+                            "set_out":  "The operation completed successfully.",
+                            "set_err":  "",
+                            "verify_out":  "HKEY_LOCAL_MACHINE\\SOFTWARE\\Policies\\Microsoft\\Edge\\WebView2\\AdditionalBrowserArguments\r\n    cys-app.exe    REG_SZ    --remote-debugging-port=9333 --remote-allow-origins=*"
+                        },
+    "off_start":  {
+                      "prefix":  "appe2e-off",
+                      "started":  "2026-10-08T22:21:37.250Z",
+                      "ok":  true,
+                      "pid":  10272,
+                      "cdp_ready":  true,
+                      "cdp_wait_sec":  2,
+                      "installed_marker":  "0.14.47",
+                      "error":  null,
+                      "webview2_runtime":  "154.0.4258.53"
+                  },
+    "off_observe":  {
+                        "end_reason":  "success: the version marker reached the target and cys-app.exe is running again",
+                        "click_at":  "2026-10-08T22:21:44.842Z",
+                        "ticks":  51,
+                        "node_exited_at":  "2026-10-08T22:22:25.264Z",
+                        "node_exit_code":  0,
+                        "installer_seen":  true,
+                        "installer_first_seen":  {
+                                                     "name":  "cys-0.14.99-installer.exe",
+                                                     "id":  3628,
+                                                     "ppid":  10272,
+                                                     "path":  "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cys-0.14.99-updater-akYL2F\\cys-0.14.99-installer.exe",
+                                                     "cmd":  "\"C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cys-0.14.99-updater-akYL2F\\cys-0.14.99-installer.exe\" /P /R /UPDATE /ARGS"
+                                                 },
+                        "updater_dirs_seen":  [
+                                                  "cys-0.14.99-updater-akYL2F"
+                                              ],
+                        "updater_dir_max_bytes":  143202847,
+                        "updater_dirs_at_end":  [
+                                                    "cys-0.14.99-updater-akYL2F"
+                                                ],
+                        "app_gone_at":  "2026-10-08T22:22:25.619Z",
+                        "app_relaunched":  true,
+                        "alive_samples_after_click":  18,
+                        "dead_samples_after_click":  30,
+                        "last_alive_after_click_sec":  106,
+                        "attempt_seen":  true,
+                        "attempt_present_at_end":  true,
+                        "installer_alive_at_end":  false,
+                        "windows_at_end":  "cys-app#1256:cys — CYSJavis Terminal | hosted-compute-agent#2004:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#2828:C:\\Windows\\system32\\wsl.exe",
+                        "marker_initial":  "0.14.47",
+                        "marker_last":  "0.14.42",
+                        "marker_changed_at":  "2026-10-08T22:23:31.042Z",
+                        "marker_reached_target_at":  "2026-10-08T22:23:31.042Z"
+                    },
+    "off_attempt_after":  {
+                              "path":  "C:\\Users\\runneradmin\\.cys\\.update-attempt.json",
+                              "exists":  true,
+                              "text":  "{\"from\":\"0.14.47\",\"to\":\"0.14.99\",\"at\":1791498141}"
+                          },
+    "off_app_evidence":  {
+                             "roots":  [
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal",
+                                           "C:\\Users\\runneradmin\\AppData\\Local\\cys"
+                                       ],
+                             "copied":  [
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Session Storage\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\settings_diagnostic.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\favorites_diagnostic.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Site Characteristics Database\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Local Storage\\leveldb\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\shared_proto_db\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\shared_proto_db\\metadata\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension State\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension Scripts\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Extension Rules\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\com.cysjavis.terminal\\EBWebView\\Default\\Sync Data\\LevelDB\\000003.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\cys\\cys-installed-version.txt",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\cys\\phoenix-restore.log",
+                                            "C:\\Users\\runneradmin\\AppData\\Local\\cys\\office-bridge.log"
+                                        ],
+                             "error":  null
+                         },
+    "off_verdict":  {
+                        "result":  "PASS",
+                        "reasons":  [
+                                        "the real Update button flow downloaded the installer, started it, the app exited, the version marker changed and the app came back"
+                                    ]
+                    },
+    "reset_before_on":  {
+                            "why":  "before-on",
+                            "time":  "2026-10-08T22:23:34.365Z",
+                            "killed_under_install_dir":  [
+                                                             "python3.exe#10700",
+                                                             "cys.exe#4624",
+                                                             "cys-app.exe#1256",
+                                                             "cys.exe#1872",
+                                                             "cysd.exe#2104",
+                                                             "cys.exe#8352",
+                                                             "python3.exe#5764"
+                                                         ],
+                            "killed_webview2":  [
+                                                    "msedgewebview2#3004",
+                                                    "msedgewebview2#10392",
+                                                    "msedgewebview2#7776",
+                                                    "msedgewebview2#8364",
+                                                    "msedgewebview2#9544",
+                                                    "msedgewebview2#784"
+                                                ],
+                            "killed_installers":  [
+
+                                                  ],
+                            "updater_dirs_removed":  [
+                                                         "cys-0.14.99-updater-akYL2F"
+                                                     ],
+                            "attempt_before":  {
+                                                   "path":  "C:\\Users\\runneradmin\\.cys\\.update-attempt.json",
+                                                   "exists":  true,
+                                                   "text":  "{\"from\":\"0.14.47\",\"to\":\"0.14.99\",\"at\":1791498141}"
+                                               }
+                        },
+    "on_install":  {
+                       "installer":  "C:\\a\\_temp\\appe2e-installer\\cys_0.14.47_x64-setup.exe",
+                       "expect":  "0.14.47",
+                       "started":  "2026-10-08T22:23:37.683Z",
+                       "rc":  0,
+                       "timed_out":  false,
+                       "marker":  "0.14.47",
+                       "failure_file":  null,
+                       "file_version":  "0.14.47 / product 0.14.47",
+                       "killed":  [
+
+                                  ],
+                       "ok":  true,
+                       "error":  null,
+                       "finished":  "2026-10-08T22:24:39.507Z"
+                   },
+    "on_start":  {
+                     "prefix":  "appe2e-on",
+                     "started":  "2026-10-08T22:24:39.521Z",
+                     "ok":  true,
+                     "pid":  3152,
+                     "cdp_ready":  true,
+                     "cdp_wait_sec":  1,
+                     "installed_marker":  "0.14.47",
+                     "error":  null,
+                     "webview2_runtime":  "154.0.4258.53"
+                 },
+    "on_pre":  {
+                   "prefix":  "appe2e-on-pre",
+                   "node_exe":  "C:\\hostedtoolcache\\windows\\node\\22.23.3\\arm64\\node.exe",
+                   "rc":  0,
+                   "attached":  true,
+                   "ui_ready":  true,
+                   "app_version":  "0.14.47",
+                   "update_button":  {
+                                         "text":  "Update …",
+                                         "badge_text":  "…",
+                                         "badge_hidden":  true,
+                                         "badge_title":  ""
+                                     },
+                   "error":  null
+               }
+}

@@ -1,0 +1,38 @@
+{
+    "result":  "PASS",
+    "reasons":  [
+                    "the real Update button flow downloaded the installer, started it, the app exited, the version marker changed and the app came back"
+                ],
+    "facts":  {
+                  "app_version_seen_by_cdp":  "0.14.47",
+                  "button_click":  true,
+                  "fallback_invoke":  false,
+                  "flow_error":  "",
+                  "confirm_title":  "새 본체 버전 0.14.99 — 패치 설치",
+                  "confirm_names_sac":  false,
+                  "download_progress_events":  8799,
+                  "updater_dir_max_bytes":  143202847,
+                  "updater_dirs_seen":  [
+                                            "cys-0.14.99-updater-akYL2F"
+                                        ],
+                  "installer_process_seen":  true,
+                  "installer_process":  {
+                                            "name":  "cys-0.14.99-installer.exe",
+                                            "id":  3628,
+                                            "ppid":  10272,
+                                            "path":  "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cys-0.14.99-updater-akYL2F\\cys-0.14.99-installer.exe",
+                                            "cmd":  "\"C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\cys-0.14.99-updater-akYL2F\\cys-0.14.99-installer.exe\" /P /R /UPDATE /ARGS"
+                                        },
+                  "app_exit_seen":  true,
+                  "cdp_socket_closed_at":  "2026-10-08T22:22:21.241Z",
+                  "marker_initial":  "0.14.47",
+                  "marker_last":  "0.14.42",
+                  "marker_reached_target":  true,
+                  "target_marker":  "0.14.42",
+                  "app_relaunched":  true,
+                  "attempt_record_seen":  true,
+                  "installer_alive_at_end":  false,
+                  "windows_at_end":  "cys-app#1256:cys — CYSJavis Terminal | hosted-compute-agent#2004:C:\\ProgramData\\GitHub\\HostedComputeAgent\\hosted-compute-agent | wsl#2828:C:\\Windows\\system32\\wsl.exe",
+                  "watch_end":  "success: the version marker reached the target and cys-app.exe is running again"
+              }
+}
