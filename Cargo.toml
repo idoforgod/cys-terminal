@@ -36,6 +36,7 @@ portable-pty = { path = "vendor/portable-pty" }
 #   폭을 줄일 때 Row::resize 가 마지막 칸의 넓은 글자 머리(wide head)를 지우지 않아(truncate 와 달리) 다음 그리기가
 #   cells[col+1] 을 짚어 패닉했다(state.rs row89 재현) — 패닉 격리가 파서를 빈 것으로 갈아 화면 사본이 영구 어긋나
 #   큐가 prompt_unknown·input_pending 으로 굶었다(0.14.45 윈도우 11 제보). 패치 지점은 vendor/vt100/src 의 "cys 패치" 주석.
+#   (0.14.47) 흐림(SGR 2) 비트 패치가 더 얹혔다 — 패치 대장과 상류 갱신 절차는 vendor/vt100/CYS-PATCHES.md.
 vt100 = { path = "vendor/vt100" }
 clap = { version = "4", features = ["derive"] }
 regex = "1"

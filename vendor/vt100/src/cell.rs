@@ -155,4 +155,11 @@ impl Cell {
     pub fn inverse(&self) -> bool {
         self.attrs.inverse()
     }
+
+    /// cys 패치(0.14.47): 흐림(SGR 2)으로 그려진 칸인가. 칸 비교와 다시 그리기 출력에는
+    /// 쓰이지 않는다 — 읽는 쪽이 이 함수로만 본다.
+    #[must_use]
+    pub fn dim(&self) -> bool {
+        self.attrs.dim()
+    }
 }

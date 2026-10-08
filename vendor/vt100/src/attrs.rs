@@ -23,15 +23,44 @@ const TEXT_MODE_BOLD: u8 = 0b0000_0001;
 const TEXT_MODE_ITALIC: u8 = 0b0000_0010;
 const TEXT_MODE_UNDERLINE: u8 = 0b0000_0100;
 const TEXT_MODE_INVERSE: u8 = 0b0000_1000;
+// cys 패치(0.14.47): 흐림(SGR 2) 비트. **읽기 전용 재료**다 — 칸 비교(아래 PartialEq)와 다시 그리기 출력
+// (write_escape_code_diff)에는 넣지 않는다. 재적용 경로 = vendor/vt100/CYS-PATCHES.md.
+const TEXT_MODE_DIM: u8 = 0b0001_0000;
 
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default, Clone, Copy, Debug)]
 pub struct Attrs {
     pub fgcolor: Color,
     pub bgcolor: Color,
     pub mode: u8,
 }
 
+// cys 패치(0.14.47): 원본의 파생 비교를 손 구현으로 바꿨다 — **흐림 비트만** 가리고 나머지(전경·배경·굵게·기울임·밑줄·반전)는
+// 원본과 같이 본다. 흐림이 비교에 들어가면 contents_formatted/contents_diff 의 바이트가 바뀐다(흐림을 쓸 줄 모르는 출력부가
+// 경계마다 속성 초기화를 더 찍는다).
+impl PartialEq for Attrs {
+    fn eq(&self, other: &Self) -> bool {
+        self.fgcolor == other.fgcolor
+            && self.bgcolor == other.bgcolor
+            && (self.mode & !TEXT_MODE_DIM) == (other.mode & !TEXT_MODE_DIM)
+    }
+}
+
+impl Eq for Attrs {}
+
 impl Attrs {
+    // cys 패치(0.14.47): 흐림 읽기·쓰기.
+    pub fn dim(&self) -> bool {
+        self.mode & TEXT_MODE_DIM != 0
+    }
+
+    pub fn set_dim(&mut self, dim: bool) {
+        if dim {
+            self.mode |= TEXT_MODE_DIM;
+        } else {
+            self.mode &= !TEXT_MODE_DIM;
+        }
+    }
+
     pub fn bold(&self) -> bool {
         self.mode & TEXT_MODE_BOLD != 0
     }
