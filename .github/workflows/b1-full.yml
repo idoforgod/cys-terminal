@@ -1,0 +1,58 @@
+name: diag-b1-full (0.14.47 gate-1 measurement, full suite)
+# 측정 전용 · 제품 소스·태그·릴리스 무접촉. windows-health 9번 스텝의 명령을 두 커밋에서 10잡씩 돌린다.
+on:
+  push:
+    branches: ['diag/b1-full-0.14.47']
+permissions:
+  contents: read
+jobs:
+  full:
+    name: full ${{ matrix.arm.label }} r${{ matrix.round }}
+    runs-on: windows-latest
+    timeout-minutes: 55
+    strategy:
+      fail-fast: false
+      matrix:
+        arm:
+          - { label: A-v0.14.46, sha: b0a3c08a7db6bed500e3ac7c9f14a76960b1c168 }
+          - { label: B-v0.14.47, sha: 5a9f7be8dcaa50e65f60c79c43c81554e126bf67 }
+        round: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.arm.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: facts
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          rustc --version
+          mkdir -p "$RUNNER_TEMP/b1"
+          echo "label=${{ matrix.arm.label }} round=${{ matrix.round }} sha=$(git rev-parse HEAD) rustc=$(rustc --version)" > "$RUNNER_TEMP/b1/facts.txt"
+      - name: build test binary
+        shell: bash
+        run: cargo test --bin cysd --no-run
+      - name: cargo test --bin cysd (full, same args as windows-health step 9)
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/b1"; LOG="$OUT/cysd.log"
+          t0=$(date +%s)
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections --skip attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery > "$LOG" 2>&1
+          rc=$?
+          el=$(( $(date +%s) - t0 ))
+          echo "$rc" > "$OUT/rc"
+          res="$(grep -E '^test result:' "$LOG" | tail -1)"
+          names="$(awk '/^failures:$/{f=1;next} f&&/^    [a-zA-Z_]/{print $1} f&&/^$/{f=0}' "$LOG" | sort -u | tr '\n' ' ')"
+          echo "RESULT label=${{ matrix.arm.label }} round=${{ matrix.round }} rc=$rc secs=$el :: ${res:-NO-RESULT-LINE} :: failed-tests: ${names:-none}" | tee "$OUT/summary.txt"
+          tail -30 "$LOG"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: b1-full-${{ matrix.arm.label }}-r${{ matrix.round }}
+          path: ${{ runner.temp }}/b1
