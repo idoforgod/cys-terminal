@@ -1,0 +1,38 @@
+2026-10-08 22:21:39.027: [INFO] CurrentProfilePath: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-08 22:21:39.027: [INFO] Profiles total count: 1
+2026-10-08 22:21:39.027: [INFO] Profile: name=Profile 1 path=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default lastActive=null
+2026-10-08 22:21:39.027: [INFO] LastUsedProfileDir: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-08 22:21:39.027: [INFO] OnDoneLoading sync enabled: 0
+2026-10-08 22:21:39.027: [INFO] BookmarkModelLoaded, ids_reassigned: 0
+2026-10-08 22:21:39.027: [INFO] BookmarksLoadDropped droppedNodes=0
+2026-10-08 22:21:39.027: [INFO] BookmarksSnapshot Startup total=0 bar=0 other=0 mobile=0 showBar=0 showBarNTP=1
+2026-10-08 22:22:21.254: [INFO] BookmarksSnapshot Shutdown total=0 bar=0 other=0 mobile=0 showBar=0 showBarNTP=1
+2026-10-08 22:23:30.033: [INFO] CurrentProfilePath: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-08 22:23:30.033: [INFO] Profiles total count: 1
+2026-10-08 22:23:30.033: [INFO] Profile: name=Profile 1 path=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default lastActive=2026-10-08T22:21:40.569Z
+2026-10-08 22:23:30.033: [INFO] LastUsedProfileDir: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-08 22:23:30.033: [INFO] MostRecentlyActiveProfile: name=Profile 1 path=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default lastActive=2026-10-08T22:21:40.569Z
+2026-10-08 22:23:30.033: [INFO] OnDoneLoading sync enabled: 0
+2026-10-08 22:23:30.033: [INFO] BookmarkModelLoaded, ids_reassigned: 0
+2026-10-08 22:23:30.033: [INFO] BookmarksLoadDropped droppedNodes=0
+2026-10-08 22:23:30.033: [INFO] BookmarksSnapshot Startup total=0 bar=0 other=0 mobile=0 showBar=0 showBarNTP=1
+2026-10-08 22:23:34.489: [INFO] BookmarksSnapshot Shutdown total=0 bar=0 other=0 mobile=0 showBar=0 showBarNTP=1
+2026-10-08 22:24:39.804: [INFO] CurrentProfilePath: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-08 22:24:39.804: [INFO] Profiles total count: 1
+2026-10-08 22:24:39.804: [INFO] Profile: name=Profile 1 path=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default lastActive=2026-10-08T22:23:30.212Z
+2026-10-08 22:24:39.804: [INFO] LastUsedProfileDir: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-08 22:24:39.804: [INFO] MostRecentlyActiveProfile: name=Profile 1 path=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default lastActive=2026-10-08T22:23:30.212Z
+2026-10-08 22:24:39.804: [INFO] OnDoneLoading sync enabled: 0
+2026-10-08 22:24:39.804: [INFO] BookmarkModelLoaded, ids_reassigned: 0
+2026-10-08 22:24:39.804: [INFO] BookmarksLoadDropped droppedNodes=0
+2026-10-08 22:24:39.804: [INFO] BookmarksSnapshot Startup total=0 bar=0 other=0 mobile=0 showBar=0 showBarNTP=1
+2026-10-08 22:26:56.523: [INFO] BookmarksSnapshot Shutdown total=0 bar=0 other=0 mobile=0 showBar=0 showBarNTP=1
+2026-10-08 22:27:06.413: [INFO] CurrentProfilePath: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-08 22:27:06.413: [INFO] Profiles total count: 1
+2026-10-08 22:27:06.413: [INFO] Profile: name=Profile 1 path=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default lastActive=2026-10-08T22:24:39.984Z
+2026-10-08 22:27:06.413: [INFO] LastUsedProfileDir: C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default
+2026-10-08 22:27:06.413: [INFO] MostRecentlyActiveProfile: name=Profile 1 path=C:\Users\runneradmin\AppData\Local\com.cysjavis.terminal\EBWebView\Default lastActive=2026-10-08T22:24:39.984Z
+2026-10-08 22:27:06.413: [INFO] OnDoneLoading sync enabled: 0
+2026-10-08 22:27:06.413: [INFO] BookmarkModelLoaded, ids_reassigned: 0
+2026-10-08 22:27:06.413: [INFO] BookmarksLoadDropped droppedNodes=0
+2026-10-08 22:27:06.413: [INFO] BookmarksSnapshot Startup total=0 bar=0 other=0 mobile=0 showBar=0 showBarNTP=1
