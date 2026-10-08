@@ -1,0 +1,67 @@
+name: diag-b1-repeat (0.14.47 gate-1 measurement)
+# 측정 전용 · 제품 소스·태그·릴리스 무접촉. 두 커밋에서 같은 명령을 K 번 돌려 바퀴마다 통과·실패를 남긴다.
+on:
+  push:
+    branches: ['diag/b1-repeat-0.14.47']
+permissions:
+  contents: read
+jobs:
+  repeat:
+    name: repeat ${{ matrix.label }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: A-v0.14.46
+            sha: b0a3c08a7db6bed500e3ac7c9f14a76960b1c168
+          - label: B-v0.14.47
+            sha: 5a9f7be8dcaa50e65f60c79c43c81554e126bf67
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: facts
+        shell: bash
+        run: |
+          git rev-parse HEAD
+          rustc --version
+          cargo --version
+          nproc || true
+      - name: build test binary
+        shell: bash
+        run: cargo test --bin cysd --no-run
+      - name: repeat rounds
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/b1"; mkdir -p "$OUT"
+          echo "label=${{ matrix.label }} sha=$(git rev-parse HEAD)" | tee "$OUT/summary.txt"
+          K=10
+          i=1
+          while [ "$i" -le "$K" ]; do
+            t0=$(date +%s)
+            CYS_PACK_DIR="$(mktemp -d)" timeout 900 cargo test --bin cysd governance::tests > "$OUT/round-$i.log" 2>&1
+            rc=$?
+            el=$(( $(date +%s) - t0 ))
+            res="$(grep -E '^test result:' "$OUT/round-$i.log" | tail -1)"
+            names="$(awk '/^failures:$/{f=1;next} f&&/^    [a-zA-Z_]/{print $1} f&&/^$/{f=0}' "$OUT/round-$i.log" | sort -u | tr '\n' ' ')"
+            echo "ROUND $i rc=$rc secs=$el :: ${res:-NO-RESULT-LINE} :: failed-tests: ${names:-none}" | tee -a "$OUT/summary.txt"
+            if [ "$i" -eq 1 ]; then
+              if [ "$el" -le 60 ]; then K=20; fi
+              echo "K=$K (round 1 took ${el}s)" | tee -a "$OUT/summary.txt"
+            fi
+            i=$((i+1))
+          done
+          echo "DONE rounds=$K" | tee -a "$OUT/summary.txt"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: b1-repeat-${{ matrix.label }}
+          path: ${{ runner.temp }}/b1
