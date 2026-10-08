@@ -1,0 +1,13 @@
+[cysd] v0.14.46 cys-fix-w2-gen-0.14.4
+[cysd] lane: socket=\\.\pipe\cys-dept-dept-1 pack=C:/Users/runneradmin/.cys/pack-dept-dept-1 (dept=true)
+[init-pack] 내 커스텀은 지워지지 않았습니다 — 병합 대기 1건 (내 수정본 .user 보존 0건 · vendor 신버전 .new 병치 1건)
+  검토·병합: `cys pack-merge` · 직전 상태 파일 복원: `cys pack-rollback`
+[pack] 격리 config 각성 훅 병합: C:/Users/runneradmin/.cys/claude-default-dept-1\settings.json (SessionStart←session-start.sh, UserPromptSubmit←role-bootstrap.sh)
+[cysd] CYSJavis Pack: 470 file(s) installed at C:/Users/runneradmin/.cys/pack-dept-dept-1
+[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료
+[cysd] office-bridge skipped (dept daemon)
+cysd (CYSJavis terminal daemon) listening on \\.\pipe\cys-dept-dept-1
+[cysd] auto-restore triggered (phoenix restore --auto · 임베드 추출 우선)
+[cysd] agy 상태줄 조정(부트에서 미뤄 둔 실연 검사) 완료
+[cysd] auto-restore finished (exit=0)
+[cysd] schedule: 첫 가동 — 주기 잡 6개의 기준 시각을 now 로 초기화(동시 만기 방지)
