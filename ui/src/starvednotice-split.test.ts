@@ -18,6 +18,7 @@ import * as SN from "./starvednotice";
 // F1-R 의 새 export — 아직 없던 시점(빨강)에도 파일이 읽히도록 네임스페이스로 받는다.
 const starvedKeyHasHead = (SN as any).starvedKeyHasHead as (key: unknown, entryId: unknown) => boolean;
 const STARVED_REPOP_MS = (SN as any).STARVED_REPOP_MS as number;
+const starvedPopAgeMs = (SN as any).starvedPopAgeMs as (nowWall: number, popWall: number, nowMono: number, popMono: number) => number;
 
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf-8");
 const TAIL = " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지";
@@ -400,10 +401,11 @@ describe("0.14.48 D F1-R — 만료·되살림(같은 머리 id)과 억제 상�
     const rec = (fn: string) => (...args: unknown[]) => void calls.push({ fn, args });
     const starvedLastKey = new Map<string, string>();
     const starvedLastPopAt = new Map<string, number>();
-    let clock = 1_000_000;
+    let wall = 1_000_000; // 벽시계(Date.now) — 조정·절전으로 뛰거나 거꾸로 갈 수 있다
+    let mono = 5_000; // 단조 시계(performance.now) — 벽시계 조정의 영향을 받지 않는다
     const deps = {
-      starvedNotice, surfaceIdOfRef, starvedShouldPop, starvedKeyHasHead, starvedLastKey, starvedLastPopAt, starvedDismissId,
-      Date: { now: () => clock },
+      starvedNotice, surfaceIdOfRef, starvedShouldPop, starvedKeyHasHead, starvedPopAgeMs, starvedLastKey, starvedLastPopAt, starvedDismissId,
+      Date: { now: () => wall }, performance: { now: () => mono },
       stickyToast: rec("stickyToast"), osBanner: rec("osBanner"), recordAlarm: rec("recordAlarm"), focusStarvedSeat: rec("focusStarvedSeat"), dismissToast: rec("dismissToast"),
     };
     const run = (src: string, name: string, event: unknown, payload: unknown, sid: number) =>
@@ -415,7 +417,9 @@ describe("0.14.48 D F1-R — 만료·되살림(같은 머리 id)과 억제 상�
     };
     return {
       calls, starvedLastKey, starvedLastPopAt,
-      at: (ms: number) => { clock = 1_000_000 + ms; },
+      at: (ms: number) => { wall = 1_000_000 + ms; mono = 5_000 + ms; },
+      /** 시계를 따로 움직인다: 벽시계·단조 시계가 처음(at(0))보다 각각 몇 ms 뒤인가(음수 = 벽시계 역행). */
+      clocks: (wallMs: number, monoMs: number) => { wall = 1_000_000 + wallMs; mono = 5_000 + monoMs; },
       wait: (id: unknown, slug = "abc") => send("queue.starved", mk("wait", { head_entry_id: id }), slug),
       expired: (id: string, slug = "abc") => send("queue.expired", { surface_ref: "surface:12", queue_entry_id: id }, slug),
       revived: (id: string, slug = "abc") => send("queue.revived", { surface_ref: "surface:12", queue_entry_id: id, already_active: false }, slug),
@@ -464,7 +468,7 @@ describe("0.14.48 D F1-R — 만료·되살림(같은 머리 id)과 억제 상�
     const a = app();
     a.wait("q-1");
     a.at(30 * MIN); a.wait("q-1");
-    expect(a.starvedLastPopAt.get("starved:abc:surface:12")).toBe(1_000_000);
+    expect(a.starvedLastPopAt.get("starved:abc:surface:12")).toEqual({ wall: 1_000_000, mono: 5_000 });
     const h = app();
     h.wait("q-1");
     for (let k = 1; k <= 3; k++) { h.at(k * 1000); h.human("q-1"); }
@@ -490,6 +494,47 @@ describe("0.14.48 D F1-R — 만료·되살림(같은 머리 id)과 억제 상�
   it("⑧ 소스 핀: 만료·되살림 분기는 return 하지 않고(다른 처리 보존) forgetStarvedHead 만 부른다", () => {
     expect(evBranch).toContain("forgetStarvedHead(event.socket_slug, sid, payload.queue_entry_id);");
     expect(/\n    return;\n  \}\n$/.test(evBranch)).toBe(false);
+  });
+  // ── F1-T (reviewer-codex r3): 상한은 벽시계만 믿지 않는다 ──
+  it("F1-T ① 벽시계가 20분 거꾸로 간 뒤에도 상한은 실제 60분: 실제 59분(벽 39분)은 억제 · 실제 60분(벽 40분)은 다시 띄움", () => {
+    const a = app();
+    a.wait("q-1");
+    a.clocks(-20 * MIN + 59 * MIN, 59 * MIN); a.wait("q-1");
+    expect(a.pops()).toBe(1);
+    a.clocks(-20 * MIN + 60 * MIN, 60 * MIN); a.wait("q-1");
+    expect(a.pops()).toBe(2);
+  });
+  it("F1-T ② 지금이 마지막 팝업 시각보다 과거이면(벽 역행이 팝업 시각 아래로 내려감) 상한에 닿은 것으로 본다 — 모르면 다시 띄운다", () => {
+    const a = app();
+    a.at(10 * MIN); a.wait("q-1");
+    a.clocks(5 * MIN, 12 * MIN); a.wait("q-1"); // 벽시계 5분 < 팝업 때 10분, 단조는 2분만 지남
+    expect(a.pops()).toBe(2);
+  });
+  it("F1-T ③ 절전에서 깨어나 벽시계만 크게 앞으로 뛰어도(단조 시계는 거의 안 감) 상한 도달로 처리한다", () => {
+    const a = app();
+    a.wait("q-1");
+    a.clocks(3 * 60 * MIN, 5 * MIN); a.wait("q-1");
+    expect(a.pops()).toBe(2);
+  });
+  it("F1-T ④ 두 시계가 함께 정상이면 59분은 억제 · 같은 구간의 갱신은 그대로 이력만", () => {
+    const a = app();
+    a.wait("q-1");
+    a.at(59 * MIN); a.wait("q-1");
+    expect(a.pops()).toBe(1);
+  });
+  it("F1-T ⑤ 순수: starvedPopAgeMs — 정상이면 두 경과 중 큰 쪽 · 어느 한쪽이 음수이거나 숫자가 아니면 무한대(다시 띄운다)", () => {
+    expect(starvedPopAgeMs(1_000 + 30, 1_000, 5_000 + 10, 5_000)).toBe(30);
+    expect(starvedPopAgeMs(1_000 + 10, 1_000, 5_000 + 30, 5_000)).toBe(30);
+    expect(starvedPopAgeMs(900, 1_000, 5_010, 5_000)).toBe(Infinity);
+    expect(starvedPopAgeMs(1_010, 1_000, 4_900, 5_000)).toBe(Infinity);
+    expect(starvedPopAgeMs(NaN, 1_000, 5_010, 5_000)).toBe(Infinity);
+    expect(starvedPopAgeMs(1_010, 1_000, 5_010, undefined as unknown as number)).toBe(Infinity);
+  });
+  it("F1-T ⑥ 사람 손 11종은 시계와 무관하게 매번 팝업+배너(상한 변경이 건드리지 않는다)", () => {
+    const h = app();
+    h.wait("q-1");
+    h.clocks(-30 * MIN, 1000); h.human("q-1"); h.clocks(5 * MIN, 2000); h.human("q-1");
+    expect({ 팝업: h.pops(), 배너: h.banners() }).toEqual({ 팝업: 3, 배너: 2 });
   });
 });
 });
