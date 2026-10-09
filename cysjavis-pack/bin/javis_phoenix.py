@@ -3430,7 +3430,7 @@ def cmd_gen_manual(args):
     _atomic_write_json(os.path.join(dest, "topology.json"),
                        {"entries": topo.get("entries", []), "updated_at": topo.get("updated_at", 0)})
     sp = os.path.join(dest, "manual_restore.sh")
-    with open(sp, "w", encoding="utf-8") as f:
+    with open(sp, "w", encoding="utf-8", newline="\n") as f:  # ★(0.14.48) bash 가 읽는 파일 — 윈도우 텍스트 모드의 \n→\r\n 변환을 끈다(CRLF 면 실행이 깨질 수 있다)
         f.write(MANUAL_RESTORE_TEMPLATE)
     os.chmod(sp, 0o755)
     out = {"manual_restore_script": sp, "topology_copy": os.path.join(dest, "topology.json"),
