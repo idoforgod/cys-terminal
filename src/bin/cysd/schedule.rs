@@ -1720,21 +1720,17 @@ fn approval_raw_has_prefix_trace(raw: Option<&[u8]>, toks: &[String]) -> Result<
         .as_array()
         .or_else(|| value.as_object()?.get("records")?.as_array())
         .ok_or(())?;
+    // 승인 로더가 거부하는 레코드를 '흔적 없음'으로 받아들이지 않는다.
+    let records = serde_json::from_value::<Vec<crate::approval::ApprovalRecord>>(
+        serde_json::Value::Array(records.clone()),
+    )
+    .map_err(|_| ())?;
     let mut has_trace = false;
     for record in records {
-        let prefix = record
-            .as_object()
-            .and_then(|r| r.get("command_prefix"))
-            .and_then(|prefix| prefix.as_array())
-            .ok_or(())?;
-        let prefix: Vec<&str> = prefix
-            .iter()
-            .map(|token| token.as_str().ok_or(()))
-            .collect::<Result<_, _>>()?;
+        let prefix = record.command_prefix;
         // 빈 접두는 approval.rs matches_ctx 에서도 매칭을 거부한다.
-        has_trace |= !prefix.is_empty() && toks.get(..prefix.len()).is_some_and(|head| {
-            head.iter().map(String::as_str).eq(prefix.iter().copied())
-        });
+        has_trace |= !prefix.is_empty()
+            && toks.get(..prefix.len()).is_some_and(|head| head == prefix.as_slice());
     }
     Ok(has_trace)
 }
