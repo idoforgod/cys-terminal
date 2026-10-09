@@ -171,8 +171,8 @@ describe("0.14.48 D — 「막힘」 낱말: 기다림 3종이 만드는 사람�
 });
 
 describe("0.14.48 D — starvedShouldPop(구간당 1회) 순수 표", () => {
-  const calm = (title: string) => ({ id: "starved:abc:surface:12", title, detail: "d", humanNeeded: false, level: "idle" as const });
-  const human = { id: "starved:abc:surface:12", title: HUMAN_TITLE, detail: "d", humanNeeded: true, level: "health" as const };
+  const calm = (title: string) => ({ id: "starved:abc:surface:12", title, detail: "d", humanNeeded: false, level: "idle" as const, stateKey: title });
+  const human = { id: "starved:abc:surface:12", title: HUMAN_TITLE, detail: "d", humanNeeded: true, level: "health" as const, stateKey: HUMAN_TITLE };
   it("사람 손: 직전 제목이 무엇이든(없음·같은 제목·calm 제목) 항상 true", () => {
     for (const last of [undefined, HUMAN_TITLE, T_WAIT, T_APPROVAL, T_PAUSED, "아무거나"]) expect(starvedShouldPop(last, human)).toBe(true);
   });

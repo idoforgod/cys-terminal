@@ -9073,7 +9073,7 @@ function onDaemonEvent(event: Record<string, unknown>) {
       } else {
         recordAlarm(starved.level, starved.title, starved.detail, starved.id);
       }
-      starvedLastKey.set(starved.id, starved.title);
+      starvedLastKey.set(starved.id, starved.stateKey);
       if (starved.humanNeeded) osBanner(starved.title, starved.detail);
     }
     return;

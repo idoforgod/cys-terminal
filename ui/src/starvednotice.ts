@@ -32,6 +32,8 @@ export interface StarvedNotice {
   humanNeeded: boolean;
   /** 사람 손은 health, 기다림은 idle. */
   level: StarvedLevel;
+  /** 대기 구간의 정체 — 제목, 쓸 수 있는 head_entry_id 가 있으면 `제목\n머리id`. 머리가 바뀌면 새 구간이다(구간당 1회 억제의 비교 키). */
+  stateKey: string;
 }
 
 /** 토스트 본문(detail)의 글자 수 상한(코드 포인트) — 넘으면 앞 199자 + `…` = 200자(usagebar.ts 의 말줄임과 같은 관례: 총 길이가 상한). */
@@ -90,6 +92,7 @@ const STARVED_REASON_HEAD_CALM = "대기 사유:";
 
 const ROLE_MAX = 40;
 const BLOCKED_BY_MAX = 80;
+const HEAD_ID_MAX = 64;
 const SLUG_MAX = 64;
 /** 대기 분 표기의 상한(≈69일) — 이상한 값이 지수 표기로 화면을 어지럽히지 않게. */
 const WAIT_MINUTES_MAX = 99_999;
@@ -135,9 +138,9 @@ export function starvedCalmKind(code: unknown, blockedBy?: unknown): "wait" | "a
   return "wait";
 }
 
-/** DESIGN-D-v3 §4(B): 사람 손은 매번, 기다림은 구간의 마지막 제목이 달라질 때 팝업한다. */
-export function starvedShouldPop(lastTitle: string | undefined, n: StarvedNotice): boolean {
-  return n.humanNeeded || lastTitle !== n.title;
+/** DESIGN-D-v3 §4(B) + F1: 사람 손은 매번, 기다림은 구간의 마지막 키(제목+머리 항목)가 달라질 때 팝업한다. 머리 유무가 한쪽만이면 키가 달라 다시 띄운다. */
+export function starvedShouldPop(lastKey: string | undefined, n: StarvedNotice): boolean {
+  return n.humanNeeded || lastKey !== n.stateKey;
 }
 
 /** 이 UI 가 아는 remedy_code 인가(사람 조치 필요 ∪ 옛 이름 ∪ calm). 모르는 값이면 조치 문장을 믿지 않고 `blocked_by` 만 보인다. */
@@ -208,10 +211,13 @@ export function starvedNotice(payload: unknown, socketSlug?: unknown): StarvedNo
   const blockedBy = clip(clean(payload.blocked_by), BLOCKED_BY_MAX);
   const sentence = remedy || `${humanNeeded ? STARVED_REASON_HEAD_HUMAN : STARVED_REASON_HEAD_CALM} ${blockedBy || "알 수 없음"}`;
   const wait = starvedWaitText(payload.waited_secs);
+  const title = [titleHead, clip(clean(payload.role), ROLE_MAX), ref].filter((x) => x !== "").join(" ");
+  const head = clip(clean(payload.head_entry_id), HEAD_ID_MAX); // 문자열이 아니면 빈 문자열 = 머리 없음(구판·이상값)
 
   return {
     id: toastId(socketSlug, ref),
-    title: [titleHead, clip(clean(payload.role), ROLE_MAX), ref].filter((x) => x !== "").join(" "),
+    title,
+    stateKey: head === "" ? title : `${title}\n${head}`,
     detail: clip(wait ? `${wait} · ${sentence}` : sentence, STARVED_DETAIL_MAX),
     humanNeeded,
     level: humanNeeded ? "health" : "idle",

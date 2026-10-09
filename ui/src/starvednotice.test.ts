@@ -184,7 +184,7 @@ describe("★R2F-UI(A3 m1) 코드가 아예 없는 payload(0.14.42 데몬) — �
   });
   it("calm 사유는 대기 제목·대체 문장·idle 로 뜨고 id 는 그대로다(OS 배너는 없다)", () => {
     const n = starvedNotice(legacy("busy(출력 중)"), "abc")!;
-    expect(n).toEqual({ id: "starved:abc:surface:3", title: "⏳ 배달 대기 중 — worker surface:3", detail: "10분째 · 대기 사유: busy(출력 중)", humanNeeded: false, level: "idle" });
+    expect(n).toEqual({ id: "starved:abc:surface:3", title: "⏳ 배달 대기 중 — worker surface:3", detail: "10분째 · 대기 사유: busy(출력 중)", humanNeeded: false, level: "idle", stateKey: "⏳ 배달 대기 중 — worker surface:3\nq-9" });
   });
 });
 
@@ -254,10 +254,11 @@ describe("starvedNotice — 제목·상세·id", () => {
       detail: `12분째 · ${REMEDY_BODY}`,
       humanNeeded: true,
       level: "health",
+      stateKey: "⏳ 큐 막힘 — worker surface:12\nq-1",
     });
   });
-  it("돌려주는 객체의 키는 정확히 5개(id·title·detail·humanNeeded·level)", () => {
-    expect(Object.keys(starvedNotice(payload(), "x")!).sort()).toEqual(["detail", "humanNeeded", "id", "level", "title"]);
+  it("돌려주는 객체의 키는 정확히 6개(id·title·detail·humanNeeded·level·stateKey)", () => {
+    expect(Object.keys(starvedNotice(payload(), "x")!).sort()).toEqual(["detail", "humanNeeded", "id", "level", "stateKey", "title"]);
   });
   it("역할이 없거나(null·undefined·빈 값·공백·문자열이 아님) 이상하면 제목에서 빠지고 공백이 겹치지 않는다", () => {
     for (const r of [null, undefined, "", "   ", "\n\t", 7, {}, [], true])
@@ -393,6 +394,7 @@ describe("구버전 데몬 payload(remedy_code·remedy 없음) · 조치 문장�
       detail: "10분째 · 막힘 사유: input_pending(입력줄에 미제출 입력)",
       humanNeeded: true,
       level: "health",
+      stateKey: "⏳ 큐 막힘 — worker surface:3\nq-9",
     });
     expect(starvedNotice(legacyPayload(), "base")).toEqual({
       id: "starved:base:surface:3",
@@ -400,6 +402,7 @@ describe("구버전 데몬 payload(remedy_code·remedy 없음) · 조치 문장�
       detail: "10분째 · 대기 사유: busy",
       humanNeeded: false,
       level: "idle",
+      stateKey: "⏳ 배달 대기 중 — worker surface:3\nq-9",
     });
   });
   it("remedy_code 가 없거나 모르는 값이면 remedy 문장이 있어도 쓰지 않는다 — blocked_by 만(티켓 문면)", () => {
@@ -554,7 +557,7 @@ describe("신뢰할 수 없는 payload — 결정론 난수 600판(던지지 않
       const n = starvedNotice(p, slug);
       if (n === null) continue;
       nonNull++;
-      expect(Object.keys(n).sort()).toEqual(["detail", "humanNeeded", "id", "level", "title"]);
+      expect(Object.keys(n).sort()).toEqual(["detail", "humanNeeded", "id", "level", "stateKey", "title"]);
       if (n.humanNeeded) {
         expect(n.title.startsWith("⏳ 큐 막힘")).toBe(true);
         expect(n.level).toBe("health");
@@ -687,7 +690,7 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
     expect(b).toContain("stickyToast(starved.id, starved.level, starved.title, starved.detail, ");
     expect(b).toContain("if (starvedShouldPop(starvedLastKey.get(starved.id), starved)) {");
     expect(b).toContain("recordAlarm(starved.level, starved.title, starved.detail, starved.id);");
-    expect(b).toContain("starvedLastKey.set(starved.id, starved.title);");
+    expect(b).toContain("starvedLastKey.set(starved.id, starved.stateKey);");
     expect(b.split("stickyToast(").length - 1).toBe(1);
     expect(/(^|[^A-Za-z])toast\(/.test(b)).toBe(false); // 일회성 toast( 를 따로 부르지 않는다(같은 좌석의 토스트가 쌓이지 않는다)
   });
