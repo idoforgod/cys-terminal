@@ -1,0 +1,12 @@
+{
+    "result":  "PASS",
+    "upgrade":  "PASS",
+    "team":  "PASS",
+    "reasons":  [
+                    "UPGRADE PASS: the installed 0.14.46 app was upgraded to 0.14.47 (emulate): the marker and the three executables are 0.14.47, no failure file, the app came back, reports 0.14.47 and its UI is up",
+                    "TEAM PASS: the button flow started by clicks, a new team tab stood (waiting screen -\u003e real tab), a new cysd.exe was created after the click and no failure notification was shown",
+                    "NOTE the status bar still shows daemon pid 2468 at the end while daemon_status answers pid 7680 (the text is not rewritten after the rotation)",
+                    "NOTE 1 of the 2 \"cys.exe init-pack\" process(es) after the upgrade ended with a non-zero exit status (overlap=True; see appe2e-upg-proc-audit.txt)",
+                    "NOTE leftovers in the install folder (after_observation): 16 *.prev* file(s), 0 *.new.exe file(s): .cys-update-trash\\cys.prev.exe.prev1791570717000, .cys-update-trash\\libcrypto-3.dll.prev70200.prev1791570717001, .cys-update-trash\\libssl-3.dll.prev48650.prev1791570717002, .cys-update-trash\\python3.dll.prev71879.prev1791570717003, .cys-update-trash\\python3.exe.prev37656.prev1791570717004, .cys-update-trash\\python312.dll.prev67324.prev1791570717005, .cys-update-trash\\select.pyd.prev91148.prev17915...[cut]"
+                ]
+}

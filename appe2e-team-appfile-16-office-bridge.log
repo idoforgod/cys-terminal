@@ -1,0 +1,19 @@
+[hud-bridge] 2026-10-09T11:30:49 [MainThread] http://127.0.0.1:8642  (\uc77d\uae30 \uc804\uc6a9 · 127.0.0.1 \ud55c\uc815)
+Exception in thread Thread-4 (_reader):
+Traceback (most recent call last):
+  File "threading.py", line 1075, in _bootstrap_inner
+  File "threading.py", line 1012, in run
+  File "C:\Users\runneradmin\.cys/pack\bin\javis_hud_bridge.py", line 1646, in _reader
+    for line in proc.stdout:
+                ^^^^^^^^^^^
+  File "encodings\cp1252.py", line 23, in decode
+UnicodeDecodeError: 'charmap' codec can't decode byte 0x9d in position 114: character maps to <undefined>
+Exception in thread Thread-294 (_reader):
+Traceback (most recent call last):
+  File "threading.py", line 1075, in _bootstrap_inner
+  File "threading.py", line 1012, in run
+  File "C:\Users\runneradmin\.cys/pack\bin\javis_hud_bridge.py", line 1646, in _reader
+    for line in proc.stdout:
+                ^^^^^^^^^^^
+  File "encodings\cp1252.py", line 23, in decode
+UnicodeDecodeError: 'charmap' codec can't decode byte 0x81 in position 233: character maps to <undefined>
