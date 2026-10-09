@@ -876,6 +876,11 @@ jobs:
           #     기동 단위 수 비례 · 행 의심 90 · 롤백 노브 · cys.rs 구조 핀). stdlib·데몬 불요 밀폐 검체라
           #     ALLOWED `test_phoenix_` 글롭 면제(release 전용)에 맡기지 않고 3완전 레인에 이름으로 싣는다.
           #     실측 2026-09-25 · macOS arm64 · python 3.9.6·3.14.7 · CYS_PACK_DIR 임시 · rc=0 · 약 2s.
+          #   ★A(0.14.48) 1종 추가 등재 — test_phoenix_encoding_default(phoenix 기본 인코딩 내성 · PYTHONUTF8 을 자식에서 벗긴다).
+          #     stdlib·데몬 불요(끝에서 끝 E 는 PHOENIX_HARNESS_CYSD 가 없으면 「건너뜀 E」를 찍고 넘어간다). 종전에는 windows-build 의
+          #     T5b 걸음에만 있어 부분 레인 계약 위반이었다 — test_phoenix_r32_restore_budget 옆 5곳(ci-branch mac·ubuntu · pack-release · release 2곳).
+          #     러너별 조건: 끼움쇠(shim:cp949·cp1252·utf-8)와 native 는 어느 OS 에서나 돈다 · locale:cp949 는 ko_KR.CP949 로케일이 있는
+          #     러너에서만 성립하고 없으면 「조건 탐침 locale:cp949 → 미성립」 줄을 찍는다(조용히 통과하지 않는다) · 진짜 cp1252 는 윈도우 T5b.
           #   ★R3-4(0.14.42) 1종 추가 등재 — test_hook_r34(프롬프트 훅 ⑥ 완료 감지·능력 프로브 양성 캐시·입력 GC 게이트 ·
           #     도구 훅 빠른 길). 임시 디렉터리·스텁 cys·호출 기록 래퍼만 쓰는 밀폐 검체다(데몬 불요 · 라이브 무접촉).
           #     test_hook_launcher_split 옆 5곳(ci-branch mac·ubuntu · pack-release · release 2곳)에 싣는다. Windows 레인은
@@ -912,7 +917,7 @@ jobs:
                    test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
                    test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only \
-                   test_phoenix_r32_restore_budget \
+                   test_phoenix_r32_restore_budget test_phoenix_encoding_default \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate test_bootstrap_resource_recheck test_silentpass_pack_c2 \
@@ -1638,7 +1643,7 @@ jobs:
                    test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
                    test_refl_wakeup_expiry_attribution \
                    test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only \
-                   test_phoenix_r32_restore_budget \
+                   test_phoenix_r32_restore_budget test_phoenix_encoding_default \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
                    test_state_rotate test_bootstrap_resource_recheck test_silentpass_pack_c2 \

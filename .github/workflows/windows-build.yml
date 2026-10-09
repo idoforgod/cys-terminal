@@ -1175,6 +1175,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $dir = $env:CYS_INSTALL_DIR
           if (-not $dir) { throw "T5b: CYS_INSTALL_DIR 미확정 — 앞의 '자기완결 검증' 스텝이 실패했거나 스텝 순서가 바뀌었다" }
+          if ((Get-Content (Join-Path $dir 'cys-installed-version.txt') -Raw).Trim() -ne $env:CYS_INSTALL_VER) { throw "T5b: 설치본이 그 사이 바뀌었다 — 마커 != 설치 시 확정값($env:CYS_INSTALL_VER)" }
           $py = Join-Path $dir 'runtime\python\python3.exe'
           if (-not (Test-Path $py)) { throw "T5b: 동봉 python3.exe 미발견: $py" }
           $t = Join-Path (Get-Location) 'cysjavis-pack\bin\tests\test_phoenix_encoding_default.py'
