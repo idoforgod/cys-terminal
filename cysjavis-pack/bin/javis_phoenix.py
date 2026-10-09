@@ -1264,8 +1264,8 @@ def _prune_corrupt(path, keep=3):
             pass
 
 
-_NOTICE_MAX_FILES = 30          # 격리본 알림이 열어 보는 파일 수 상한(로스터 2종 × 3 + 저널 티켓별 3 을 넉넉히 덮는다)
-_NOTICE_MAX_BYTES = 1 << 20     # 파일당 1 MiB — 로스터·저널의 통상 크기(수 KB)를 크게 웃돈다
+_NOTICE_MAX_FILES = 30          # 전체 폴더 목록을 한 번 훑어 고른 후보 중 여는 파일 수 상한(목록 크기 상한 아님)
+_NOTICE_MAX_BYTES = 1 << 20     # 일반 파일의 열기 전 getsize 기준 1 MiB(읽는 바이트 수 자체의 상한 아님)
 _NOTICE_MAX_LINES = 3           # 로그에 경로를 적는 줄 수 상한(넘는 것은 개수만 한 줄)
 
 
@@ -1274,8 +1274,11 @@ def _notice_requalified_corrupt(socket):
     `.corrupt-<시각>` 으로 치웠다. 그렇게 치워진 것 가운데 UTF-8 로 읽으면 유효한 JSON 인 격리본을 찾아 한 줄씩 알린다.
     **되돌리지 않는다** — 격리본이 지금 상태보다 낡았을 수 있고, 역할 묘비의 원본은 데몬의 topology 다(부서 묘비는
     dept_roster 가 원본). 사람이 내용을 보고 정한다. 파일은 건드리지 않는다(읽기만). 반환 = 알린 경로 목록(시험용).
-    · 복원 잠금을 쥔 채 도는 덤 알림이라 일의 양을 묶는다: 이름순 최근 `_NOTICE_MAX_FILES` 개 · 파일당 `_NOTICE_MAX_BYTES` 까지만
-      열어 본다(넘는 것은 건너뛴다 — 알림이 빠질 뿐 복원 판정에는 쓰이지 않는다)."""
+    · 복원 잠금을 쥔 채 도는 덤 알림이다. 폴더 전체 목록을 한 번 훑고(목록 크기 상한 없음), 격리 시각순 최근
+      `_NOTICE_MAX_FILES` 개를 후보로 고른 뒤 이름순으로 검사한다. 후보 중 여는 파일은 최대 `_NOTICE_MAX_FILES` 개다.
+    · 일반 파일을 전제로 열기 전 getsize 가 `_NOTICE_MAX_BYTES` 를 넘으면 건너뛴다. 읽는 바이트 수 자체의 상한은 아니다.
+    · 유효한 격리본 중 이름순 끝의 `_NOTICE_MAX_LINES` 개를 예시로 로그에 적는다. 시간상 가장 최근이라는 보장은 없다.
+      건너뛴 것은 알림에서 빠질 뿐 복원 판정에는 쓰이지 않는다."""
     found = []
     try:
         home = phoenix_home(socket)
@@ -1301,7 +1304,7 @@ def _notice_requalified_corrupt(socket):
         except Exception:
             continue  # 진짜 손상본 — 알릴 것이 없다
         found.append(path)
-    for path in found[-_NOTICE_MAX_LINES:]:  # 로그는 최근 것 몇 줄만 — 복원 때마다 되풀이되는 알림이 로그를 채우지 않게
+    for path in found[-_NOTICE_MAX_LINES:]:  # 로그는 이름순 끝의 몇 개를 예시로만 기록(시간상 최신 보장 없음) — 반복 알림의 줄 수 제한
         log("★격리본 알림: %s 은 UTF-8 로 읽으면 멀쩡한 JSON 이다 - 앞선 판이 인코딩 오판으로 치운 파일일 수 있다. "
             "자동으로 되돌리지 않는다(내용 확인 뒤 필요하면 사람이 되돌린다)." % path)
     if len(found) > _NOTICE_MAX_LINES:
