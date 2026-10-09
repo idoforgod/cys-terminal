@@ -170,7 +170,7 @@ import {
 } from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보·전 좌석 폴백 집계
 import { buildAcctIndex, buildWsAccountGroups, type SeatAcctSig, type AcctIndex } from "./seatacct"; // ★0.14.45 부서 카드 노드별 계정 줄(순수 판정)
 import { planOfficeTab, repairOutcomeOf, type OfficeCtx } from "./officetab"; // 0.14.44 B5·B6 오피스 탭 안내(순수 판정)
-import { starvedNotice, starvedShouldPop, starvedKeyHasHead, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
+import { starvedNotice, starvedShouldPop, starvedKeyHasHead, starvedPopAgeMs, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
 import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
 import {
@@ -8832,7 +8832,7 @@ function toast(category: string, name: string, detail: string, onClick?: () => v
 // TTL이 최후 방어선으로 화면을 정리한다(구 구현은 타이머가 없어 영구 잔존했다).
 const stickyToasts = new Map<string, { el: HTMLElement; timer: ReturnType<typeof setTimeout> }>();
 const starvedLastKey = new Map<string, string>();
-const starvedLastPopAt = new Map<string, number>();
+const starvedLastPopAt = new Map<string, { wall: number; mono: number }>();
 
 /// `onClick`(선택) — 본문을 눌렀을 때의 동작. ★(0.14.41 · U14) **대입**(`el.onclick =`)으로 건다:
 /// 같은 id 는 요소를 재사용하므로 addEventListener 로 붙이면 다시 띄울 때마다 처리기가 쌓여
@@ -9076,9 +9076,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
       const seat = surfaceIdOfRef(payload.surface_ref);
       const slug = typeof event.socket_slug === "string" ? event.socket_slug : "";
       const lastPopAt = starvedLastPopAt.get(starved.id);
-      if (starvedShouldPop(starvedLastKey.get(starved.id), starved, lastPopAt === undefined ? undefined : Date.now() - lastPopAt)) {
+      if (starvedShouldPop(starvedLastKey.get(starved.id), starved, lastPopAt === undefined ? undefined : starvedPopAgeMs(Date.now(), lastPopAt.wall, performance.now(), lastPopAt.mono))) {
         stickyToast(starved.id, starved.level, starved.title, starved.detail, seat === null ? undefined : () => void focusStarvedSeat(slug, seat));
-        starvedLastPopAt.set(starved.id, Date.now());
+        starvedLastPopAt.set(starved.id, { wall: Date.now(), mono: performance.now() });
       } else {
         recordAlarm(starved.level, starved.title, starved.detail, starved.id);
       }

@@ -141,6 +141,15 @@ export function starvedCalmKind(code: unknown, blockedBy?: unknown): "wait" | "a
 /** F1-R: 마지막 팝업 뒤 이만큼(1시간) 지나면 같은 구간이어도 다시 띄운다 — 구간을 끝낸 이벤트(배달·만료·되살림)를 모두 잃어도 침묵이 무한히 이어지지 않게 하는 상한(조용해지는 쪽이 아니라 다시 띄우는 쪽으로 떨어진다). */
 export const STARVED_REPOP_MS = 60 * 60 * 1000;
 
+/** F1-T: 마지막 팝업 뒤 경과 — 벽시계(Date.now)와 단조 시계(performance.now) 중 **더 많이 흐른 쪽**. 벽시계가 거꾸로 가면(조정·NTP) 단조 시계가 실제 경과를 지키고, 절전으로 벽시계만 앞으로 뛰면 벽시계가 상한 도달을 알린다.
+ *  어느 한쪽이 음수(역행)이거나 숫자가 아니면(측정 불능) Infinity — 모르면 다시 띄운다. */
+export function starvedPopAgeMs(nowWall: number, popWall: number, nowMono: number, popMono: number): number {
+  const wall = nowWall - popWall;
+  const mono = nowMono - popMono;
+  if (!(Number.isFinite(wall) && Number.isFinite(mono)) || wall < 0 || mono < 0) return Infinity;
+  return Math.max(wall, mono);
+}
+
 /** DESIGN-D-v3 §4(B) + F1 + F1-R: 사람 손은 매번, 기다림은 구간의 마지막 키(제목+머리 항목)가 달라지거나 마지막 팝업 뒤 `ageMs` 가 상한(STARVED_REPOP_MS)에 닿으면 팝업한다. 머리 유무가 한쪽만이면 키가 달라 다시 띄운다. */
 export function starvedShouldPop(lastKey: string | undefined, n: StarvedNotice, ageMs?: number): boolean {
   return n.humanNeeded || lastKey !== n.stateKey || (typeof ageMs === "number" && ageMs >= STARVED_REPOP_MS);

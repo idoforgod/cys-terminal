@@ -15,6 +15,7 @@ import { readFileSync } from "node:fs";
 import {
   starvedNotice,
   starvedShouldPop,
+  starvedPopAgeMs,
   starvedHumanNeeded,
   starvedWaitText,
   starvedSlug,
@@ -688,7 +689,7 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
     const b = branch("queue.starved");
     expect(b).toContain("const starved = starvedNotice(payload, event.socket_slug);");
     expect(b).toContain("stickyToast(starved.id, starved.level, starved.title, starved.detail, ");
-    expect(b).toContain("if (starvedShouldPop(starvedLastKey.get(starved.id), starved, lastPopAt === undefined ? undefined : Date.now() - lastPopAt)) {");
+    expect(b).toContain("if (starvedShouldPop(starvedLastKey.get(starved.id), starved, lastPopAt === undefined ? undefined : starvedPopAgeMs(Date.now(), lastPopAt.wall, performance.now(), lastPopAt.mono))) {");
     expect(b).toContain("recordAlarm(starved.level, starved.title, starved.detail, starved.id);");
     expect(b).toContain("starvedLastKey.set(starved.id, starved.stateKey);");
     expect(b.split("stickyToast(").length - 1).toBe(1);
@@ -726,7 +727,7 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
       expect(part.includes("innerHTML")).toBe(false);
   });
   it("starvednotice 의 도우미를 import 한다", () => {
-    expect(code).toContain('import { starvedNotice, starvedShouldPop, starvedKeyHasHead, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice";');
+    expect(code).toContain('import { starvedNotice, starvedShouldPop, starvedKeyHasHead, starvedPopAgeMs, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice";');
   });
 });
 
@@ -827,7 +828,10 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
       starvedNotice,
       starvedShouldPop,
       starvedLastKey,
-      starvedLastPopAt: new Map<string, number>(),
+      starvedLastPopAt: new Map<string, { wall: number; mono: number }>(),
+      starvedPopAgeMs,
+      Date: { now: () => 0 },
+      performance: { now: () => 0 },
       surfaceIdOfRef,
       stickyToast: rec("stickyToast"),
       recordAlarm: rec("recordAlarm"),
