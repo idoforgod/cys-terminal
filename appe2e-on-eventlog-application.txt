@@ -1,0 +1,2 @@
+2026-10-09T16:54:34.234Z lvl=4 id=15 prov=SecurityCenter :: Updated Windows Defender status successfully to SECURITY_PRODUCT_STATE_ON.
+2026-10-09T16:54:12.566Z lvl=4 id=15 prov=SecurityCenter :: Updated Windows Defender status successfully to SECURITY_PRODUCT_STATE_ON.

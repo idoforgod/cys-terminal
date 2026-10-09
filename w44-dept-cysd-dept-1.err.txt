@@ -1,0 +1,9 @@
+[cysd] v0.14.48 cys-fix-w2-gen-0.14.4
+[cysd] ⚠ 레인↔팩 불일치: socket=\\.\pipe\cys-dept-dept-1 (dept=true) pack=C:\Users\runneradmin\.cys/pack (dept=false) — 부서 데몬은 `cys-dept launch <name>`(CYS_SOCKET+CYS_PACK_DIR 쌍)으로 기동해야 한다. 이 조합은 부서 부트 차단·팩 교차 서빙을 유발한다.
+[cysd] schedule: 잡 'fleet-adoption-cost-digest' 는 은퇴한 시드 문구다 — 서명 승인이 없으면 실행하지 않는다(오류로 세지 않는다). 지우려면: cys schedule remove fleet-adoption-cost-digest
+[cysd] schedule: 잡 'content-channel-health-watch' 는 은퇴한 시드 문구다 — 서명 승인이 없으면 실행하지 않는다(오류로 세지 않는다). 지우려면: cys schedule remove content-channel-health-watch
+[cysd] office-bridge skipped (dept daemon)
+cysd (CYSJavis terminal daemon) listening on \\.\pipe\cys-dept-dept-1
+[cysd] auto-restore triggered (phoenix restore --auto · 임베드 추출 우선)
+[cysd] auto-restore non-zero (exit=Some(1)) — 60000ms 후 1회 재시도 (lease/liveness 재산정에 위임)
+[cysd] auto-restore finished (exit=Some(1)) — 재시도 소진(1회). phoenix-restore.log 참조
