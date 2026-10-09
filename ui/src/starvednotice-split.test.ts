@@ -211,7 +211,7 @@ describe("0.14.48 D — main.ts 배선: 분기 인자 실행 검증(판정 조�
     const rec = (fn: string) => (...args: unknown[]) => void calls.push({ fn, args });
     const starvedLastKey = new Map<string, string>();
     const deps = {
-      starvedNotice, surfaceIdOfRef, starvedShouldPop, starvedLastKey, starvedDismissId,
+      starvedNotice, surfaceIdOfRef, starvedShouldPop, starvedLastKey, starvedLastPopAt: new Map<string, number>(), starvedDismissId,
       stickyToast: rec("stickyToast"), osBanner: rec("osBanner"), recordAlarm: rec("recordAlarm"), focusStarvedSeat: rec("focusStarvedSeat"), dismissToast: rec("dismissToast"),
     };
     const fireFn = new Function("deps", "name", "event", "payload", "sid", `with (deps) {\n${branch}\n}\nreturn "fell-through";`) as (...a: unknown[]) => unknown;

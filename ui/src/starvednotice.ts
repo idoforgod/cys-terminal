@@ -138,9 +138,20 @@ export function starvedCalmKind(code: unknown, blockedBy?: unknown): "wait" | "a
   return "wait";
 }
 
-/** DESIGN-D-v3 §4(B) + F1: 사람 손은 매번, 기다림은 구간의 마지막 키(제목+머리 항목)가 달라질 때 팝업한다. 머리 유무가 한쪽만이면 키가 달라 다시 띄운다. */
-export function starvedShouldPop(lastKey: string | undefined, n: StarvedNotice): boolean {
-  return n.humanNeeded || lastKey !== n.stateKey;
+/** F1-R: 마지막 팝업 뒤 이만큼(1시간) 지나면 같은 구간이어도 다시 띄운다 — 구간을 끝낸 이벤트(배달·만료·되살림)를 모두 잃어도 침묵이 무한히 이어지지 않게 하는 상한(조용해지는 쪽이 아니라 다시 띄우는 쪽으로 떨어진다). */
+export const STARVED_REPOP_MS = 60 * 60 * 1000;
+
+/** DESIGN-D-v3 §4(B) + F1 + F1-R: 사람 손은 매번, 기다림은 구간의 마지막 키(제목+머리 항목)가 달라지거나 마지막 팝업 뒤 `ageMs` 가 상한(STARVED_REPOP_MS)에 닿으면 팝업한다. 머리 유무가 한쪽만이면 키가 달라 다시 띄운다. */
+export function starvedShouldPop(lastKey: string | undefined, n: StarvedNotice, ageMs?: number): boolean {
+  return n.humanNeeded || lastKey !== n.stateKey || (typeof ageMs === "number" && ageMs >= STARVED_REPOP_MS);
+}
+
+/** F1-R: 기억한 구간 키(`제목\n머리id`)의 머리가 이 항목 id 인가 — 만료·되살림 이벤트가 **그 머리의** 기억만 지우는 데 쓴다. 키에 머리가 없거나 id 가 문자열이 아니거나 비면 false. */
+export function starvedKeyHasHead(key: string | undefined, entryId: unknown): boolean {
+  if (typeof key !== "string") return false;
+  const head = clip(clean(entryId), HEAD_ID_MAX);
+  const at = key.indexOf("\n");
+  return head !== "" && at >= 0 && key.slice(at + 1) === head;
 }
 
 /** 이 UI 가 아는 remedy_code 인가(사람 조치 필요 ∪ 옛 이름 ∪ calm). 모르는 값이면 조치 문장을 믿지 않고 `blocked_by` 만 보인다. */

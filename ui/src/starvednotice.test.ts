@@ -688,7 +688,7 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
     const b = branch("queue.starved");
     expect(b).toContain("const starved = starvedNotice(payload, event.socket_slug);");
     expect(b).toContain("stickyToast(starved.id, starved.level, starved.title, starved.detail, ");
-    expect(b).toContain("if (starvedShouldPop(starvedLastKey.get(starved.id), starved)) {");
+    expect(b).toContain("if (starvedShouldPop(starvedLastKey.get(starved.id), starved, lastPopAt === undefined ? undefined : Date.now() - lastPopAt)) {");
     expect(b).toContain("recordAlarm(starved.level, starved.title, starved.detail, starved.id);");
     expect(b).toContain("starvedLastKey.set(starved.id, starved.stateKey);");
     expect(b.split("stickyToast(").length - 1).toBe(1);
@@ -698,7 +698,8 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
     const b = branch("queue.starved");
     expect(b).toContain("if (starved.humanNeeded) osBanner(starved.title, starved.detail);");
     expect(b.split("osBanner(").length - 1).toBe(1);
-    for (const timer of ["setTimeout", "setInterval", "Date.now("]) expect({ 금지: timer, 있음: b.includes(timer) }).toEqual({ 금지: timer, 있음: false });
+    // ★F1-R(0.14.48): 시계 읽기(Date.now)는 억제 상한(STARVED_REPOP_MS)이 쓴다 — 타이머(예약 실행)는 여전히 0 이다.
+    for (const timer of ["setTimeout", "setInterval"]) expect({ 금지: timer, 있음: b.includes(timer) }).toEqual({ 금지: timer, 있음: false });
   });
   it("★분기는 return 으로 끝난다 — 폴백 레인을 타지 않는다(이중 표시 금지)", () => {
     const b = branch("queue.starved");
@@ -725,7 +726,7 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
       expect(part.includes("innerHTML")).toBe(false);
   });
   it("starvednotice 의 도우미를 import 한다", () => {
-    expect(code).toContain('import { starvedNotice, starvedShouldPop, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice";');
+    expect(code).toContain('import { starvedNotice, starvedShouldPop, starvedKeyHasHead, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice";');
   });
 });
 
@@ -767,7 +768,7 @@ describe("main.ts 배선 — 풀림(queue.delivered)·좌석 종료가 토스트
   it("dismissStarvedToast 는 starvednotice 가 정한 id 로 기존 dismissToast 를 부른다(id 모양의 진실원은 한 곳)", () => {
     const b = fnBody("dismissStarvedToast");
     expect(b).toContain("starvedDismissId(socketSlug, surfaceId)");
-    expect(b).toContain("if (id) { dismissToast(id); starvedLastKey.delete(id); }");
+    expect(b).toContain("if (id) { dismissToast(id); starvedLastKey.delete(id); starvedLastPopAt.delete(id); }");
     expect(code.includes("`starved:")).toBe(false); // main.ts 가 id 모양을 따로 만들지 않는다
     expect(code.includes('"starved:')).toBe(false);
   });
@@ -826,6 +827,7 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
       starvedNotice,
       starvedShouldPop,
       starvedLastKey,
+      starvedLastPopAt: new Map<string, number>(),
       surfaceIdOfRef,
       stickyToast: rec("stickyToast"),
       recordAlarm: rec("recordAlarm"),
