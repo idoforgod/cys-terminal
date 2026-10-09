@@ -1,0 +1,93 @@
+{
+    "tag":  "final",
+    "time":  "2026-10-09T18:35:13.293Z",
+    "language_mode":  "FullLanguage",
+    "registry":  {
+                     "rc":  0,
+                     "out":  "HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy\r\n    VerifiedAndReputablePolicyState    REG_DWORD    0x0",
+                     "present":  true,
+                     "value":  0
+                 },
+    "citool":  {
+                   "rc":  0,
+                   "json_parsed":  true,
+                   "error":  null,
+                   "desktop_policy":  {
+                                          "name":  "VerifiedAndReputableDesktop",
+                                          "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                          "is_enforced":  false,
+                                          "is_authorized":  false,
+                                          "is_on_disk":  true
+                                      },
+                   "enforced_names":  [
+
+                                      ],
+                   "verified_and_reputable":  [
+                                                  {
+                                                      "name":  "VerifiedAndReputableDesktop",
+                                                      "policy_id":  "0283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                      "is_enforced":  false,
+                                                      "is_authorized":  false,
+                                                      "is_on_disk":  true
+                                                  },
+                                                  {
+                                                      "name":  "VerifiedAndReputableDesktopEvaluation",
+                                                      "policy_id":  "1283ac0f-fff1-49ae-ada1-8a933130cad6",
+                                                      "is_enforced":  false,
+                                                      "is_authorized":  false,
+                                                      "is_on_disk":  true
+                                                  },
+                                                  {
+                                                      "name":  "VerifiedAndReputableDesktopFlightSupplemental",
+                                                      "policy_id":  "1678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                      "is_enforced":  false,
+                                                      "is_authorized":  false,
+                                                      "is_on_disk":  true
+                                                  },
+                                                  {
+                                                      "name":  "VerifiedAndReputableDesktopEvaluationFlightSupplemental",
+                                                      "policy_id":  "2678656c-05ef-481f-bc5b-ebd8c991502d",
+                                                      "is_enforced":  false,
+                                                      "is_authorized":  false,
+                                                      "is_on_disk":  true
+                                                  },
+                                                  {
+                                                      "name":  "VerifiedAndReputableDesktopTestSupplemental",
+                                                      "policy_id":  "0939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                      "is_enforced":  false,
+                                                      "is_authorized":  false,
+                                                      "is_on_disk":  true
+                                                  },
+                                                  {
+                                                      "name":  "VerifiedAndReputableDesktopEvaluationTestSupplemental",
+                                                      "policy_id":  "1939ed82-bfd5-4d32-b58e-d31d3c49715a",
+                                                      "is_enforced":  false,
+                                                      "is_authorized":  false,
+                                                      "is_on_disk":  true
+                                                  }
+                                              ]
+               },
+    "defender":  {
+                     "SmartAppControlState":  "Off",
+                     "SmartAppControlExpiration":  null,
+                     "AMRunningMode":  "Normal",
+                     "RealTimeProtectionEnabled":  true
+                 },
+    "ci_state":  {
+                     "raw":  "status=0x00000000;options=0x00282203;retLen=8",
+                     "options_hex":  "0x00282203",
+                     "flags":  [
+                                   "ENABLED",
+                                   "TESTSIGN",
+                                   "FLIGHTING_ENABLED",
+                                   "HVCI_IUM_ENABLED"
+                               ]
+                 },
+    "signals":  {
+                    "registry_is_1":  false,
+                    "citool_desktop_enforced":  false,
+                    "defender_on":  false,
+                    "umci_flag":  false
+                },
+    "enforced":  false
+}
