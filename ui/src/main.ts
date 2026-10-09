@@ -8831,7 +8831,7 @@ function toast(category: string, name: string, detail: string, onClick?: () => v
 // 완료·실패 때 dismissToast로 내리는 기존 계약은 그대로 유지되고, 페어가 유실돼도
 // TTL이 최후 방어선으로 화면을 정리한다(구 구현은 타이머가 없어 영구 잔존했다).
 const stickyToasts = new Map<string, { el: HTMLElement; timer: ReturnType<typeof setTimeout> }>();
-const starvedLastTitle = new Map<string, string>();
+const starvedLastKey = new Map<string, string>();
 
 /// `onClick`(선택) — 본문을 눌렀을 때의 동작. ★(0.14.41 · U14) **대입**(`el.onclick =`)으로 건다:
 /// 같은 id 는 요소를 재사용하므로 addEventListener 로 붙이면 다시 띄울 때마다 처리기가 쌓여
@@ -8932,7 +8932,7 @@ async function osBanner(title: string, body: string) {
 /// ★0.14.43(UI2): 그 좌석의 대기·막힘 토스트를 거두고 구간을 끝낸다(없으면 무동작) — id 의 모양은 starvednotice.ts 한 곳이 정한다.
 function dismissStarvedToast(socketSlug: unknown, surfaceId: unknown): void {
   const id = starvedDismissId(socketSlug, surfaceId);
-  if (id) { dismissToast(id); starvedLastTitle.delete(id); }
+  if (id) { dismissToast(id); starvedLastKey.delete(id); }
 }
 
 /// ★0.14.43(UI2): '큐 막힘' 토스트를 **눌렀을 때만** 그 좌석 pane 으로 간다(자동 전환·포커스 강탈 없음 — 클릭은 사람의 의사표시다).
@@ -9068,12 +9068,12 @@ function onDaemonEvent(event: Record<string, unknown>) {
     if (starved) {
       const seat = surfaceIdOfRef(payload.surface_ref);
       const slug = typeof event.socket_slug === "string" ? event.socket_slug : "";
-      if (starvedShouldPop(starvedLastTitle.get(starved.id), starved)) {
+      if (starvedShouldPop(starvedLastKey.get(starved.id), starved)) {
         stickyToast(starved.id, starved.level, starved.title, starved.detail, seat === null ? undefined : () => void focusStarvedSeat(slug, seat));
       } else {
         recordAlarm(starved.level, starved.title, starved.detail, starved.id);
       }
-      starvedLastTitle.set(starved.id, starved.title);
+      starvedLastKey.set(starved.id, starved.title);
       if (starved.humanNeeded) osBanner(starved.title, starved.detail);
     }
     return;

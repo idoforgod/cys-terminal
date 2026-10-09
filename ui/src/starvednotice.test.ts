@@ -685,9 +685,9 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
     const b = branch("queue.starved");
     expect(b).toContain("const starved = starvedNotice(payload, event.socket_slug);");
     expect(b).toContain("stickyToast(starved.id, starved.level, starved.title, starved.detail, ");
-    expect(b).toContain("if (starvedShouldPop(starvedLastTitle.get(starved.id), starved)) {");
+    expect(b).toContain("if (starvedShouldPop(starvedLastKey.get(starved.id), starved)) {");
     expect(b).toContain("recordAlarm(starved.level, starved.title, starved.detail, starved.id);");
-    expect(b).toContain("starvedLastTitle.set(starved.id, starved.title);");
+    expect(b).toContain("starvedLastKey.set(starved.id, starved.title);");
     expect(b.split("stickyToast(").length - 1).toBe(1);
     expect(/(^|[^A-Za-z])toast\(/.test(b)).toBe(false); // 일회성 toast( 를 따로 부르지 않는다(같은 좌석의 토스트가 쌓이지 않는다)
   });
@@ -764,7 +764,7 @@ describe("main.ts 배선 — 풀림(queue.delivered)·좌석 종료가 토스트
   it("dismissStarvedToast 는 starvednotice 가 정한 id 로 기존 dismissToast 를 부른다(id 모양의 진실원은 한 곳)", () => {
     const b = fnBody("dismissStarvedToast");
     expect(b).toContain("starvedDismissId(socketSlug, surfaceId)");
-    expect(b).toContain("if (id) { dismissToast(id); starvedLastTitle.delete(id); }");
+    expect(b).toContain("if (id) { dismissToast(id); starvedLastKey.delete(id); }");
     expect(code.includes("`starved:")).toBe(false); // main.ts 가 id 모양을 따로 만들지 않는다
     expect(code.includes('"starved:')).toBe(false);
   });
@@ -814,7 +814,7 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
   };
   type Call = { fn: string; args: unknown[] };
   /** 분기 본문을 그대로 실행한다 — 분기가 return 하면 undefined, 안 하고 지나가면 "fell-through". */
-  function run(evName: string, event: Record<string, unknown>, p: unknown, starvedLastTitle = new Map<string, string>()): { ret: unknown; calls: Call[] } {
+  function run(evName: string, event: Record<string, unknown>, p: unknown, starvedLastKey = new Map<string, string>()): { ret: unknown; calls: Call[] } {
     const calls: Call[] = [];
     const rec = (fn: string) => (...args: unknown[]) => {
       calls.push({ fn, args });
@@ -822,7 +822,7 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
     const deps = {
       starvedNotice,
       starvedShouldPop,
-      starvedLastTitle,
+      starvedLastKey,
       surfaceIdOfRef,
       stickyToast: rec("stickyToast"),
       recordAlarm: rec("recordAlarm"),
@@ -858,14 +858,14 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
   });
   it("calm 사유(approval·paused·wait): idle 토스트는 같은 제목의 구간당 1회, 이후 이력만 — OS 배너 0", () => {
     for (const code of ["approval", "paused", "wait"]) {
-      const starvedLastTitle = new Map<string, string>();
+      const starvedLastKey = new Map<string, string>();
       const ev = { name: "queue.starved", socket_slug: "abc", surface_id: 12 };
       const p = payload({ remedy_code: code });
       const n = starvedNotice(p, "abc")!;
-      const { ret, calls } = run("queue.starved", ev, p, starvedLastTitle);
+      const { ret, calls } = run("queue.starved", ev, p, starvedLastKey);
       expect({ 코드: code, 호출: calls.map((c) => c.fn), ret }).toEqual({ 코드: code, 호출: ["stickyToast"], ret: undefined });
       expect(calls[0].args.slice(0, 4)).toEqual([n.id, "idle", n.title, n.detail]);
-      const again = run("queue.starved", ev, p, starvedLastTitle);
+      const again = run("queue.starved", ev, p, starvedLastKey);
       expect({ 코드: code, 호출: again.calls.map((c) => c.fn), ret: again.ret }).toEqual({ 코드: code, 호출: ["recordAlarm"], ret: undefined });
       expect(again.calls[0].args).toEqual(["idle", n.title, n.detail, n.id]);
     }

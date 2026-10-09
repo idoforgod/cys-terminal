@@ -205,15 +205,15 @@ describe("0.14.48 D — main.ts 배선: 분기 인자 실행 검증(판정 조�
   function scenario() {
     const calls: Call[] = [];
     const rec = (fn: string) => (...args: unknown[]) => void calls.push({ fn, args });
-    const starvedLastTitle = new Map<string, string>();
+    const starvedLastKey = new Map<string, string>();
     const deps = {
-      starvedNotice, surfaceIdOfRef, starvedShouldPop, starvedLastTitle, starvedDismissId,
+      starvedNotice, surfaceIdOfRef, starvedShouldPop, starvedLastKey, starvedDismissId,
       stickyToast: rec("stickyToast"), osBanner: rec("osBanner"), recordAlarm: rec("recordAlarm"), focusStarvedSeat: rec("focusStarvedSeat"), dismissToast: rec("dismissToast"),
     };
     const fireFn = new Function("deps", "name", "event", "payload", "sid", `with (deps) {\n${branch}\n}\nreturn "fell-through";`) as (...a: unknown[]) => unknown;
     const dismissRun = new Function("deps", "slug", "sid", `with (deps) {\n${dismissFn}\n dismissStarvedToast(slug, sid);\n}`) as (...a: unknown[]) => unknown;
     return {
-      calls, starvedLastTitle,
+      calls, starvedLastKey,
       fire: (p: unknown, slug = "abc") => { expect(fireFn(deps, "queue.starved", { name: "queue.starved", socket_slug: slug, surface_id: 12 }, p, 12)).toBeUndefined(); },
       delivered: (slug = "abc", sid = 12) => dismissRun(deps, slug, sid),
       count: (fn: string) => calls.filter((c) => c.fn === fn).length,
@@ -224,11 +224,11 @@ describe("0.14.48 D — main.ts 배선: 분기 인자 실행 검증(판정 조�
   it("소스 핀: 분기에 「health」 리터럴 0 · 배너 줄은 원문 그대로 · 마지막 제목 맵 사용 · return 으로 끝남", () => {
     expect(branch).not.toContain('"health"');
     expect(branch).toContain("if (starved.humanNeeded) osBanner(starved.title, starved.detail);");
-    expect(branch).toContain("starvedLastTitle");
+    expect(branch).toContain("starvedLastKey");
     expect(branch).toContain("starvedShouldPop(");
     expect(branch).toContain("recordAlarm(");
     expect(/\n    return;\n  \}\n$/.test(branch)).toBe(true);
-    expect(dismissFn).toContain("starvedLastTitle.delete(");
+    expect(dismissFn).toContain("starvedLastKey.delete(");
   });
   it("③ 같은 기다림 2회: 팝업 1회 + 이력 직접 기록 1회, 구간 끝(delivered) 뒤 다시 1회 팝업", () => {
     const s = scenario();
@@ -323,6 +323,60 @@ describe("0.14.48 D — main.ts 배선: 분기 인자 실행 검증(판정 조�
     for (const bad of [null, undefined, "x", 7, [], {}, { surface_ref: "surface:abc" }]) s.fire(bad);
     expect(s.calls.length).toBe(0);
   });
+
+// ★0.14.48 D F1(REFLECT-D-impl-3): 구간의 정체 = (제목, head_entry_id). 배달 없이 끝난 구간(dropped·expired·clear·이벤트 유실) 뒤의 새 머리는 새 구간이다.
+describe("0.14.48 D F1 — 머리 항목(head_entry_id)으로 구간을 가른다", () => {
+  const h = (id: unknown, o: Record<string, unknown> = {}) => mk("wait", { head_entry_id: id, ...o });
+  it("① 머리가 X→Y 로 바뀌면(종료 이벤트 없이도) 새 구간 — 첫 팝업 다시 1회", () => {
+    const s = scenario();
+    s.fire(h("q-1")); s.fire(h("q-2"));
+    expect(s.count("stickyToast")).toBe(2);
+    expect(s.count("recordAlarm")).toBe(0);
+  });
+  it("② 같은 머리의 반복은 계속 억제 — 3회 = 팝업 1 + 직접 기록 2", () => {
+    const s = scenario();
+    for (let k = 0; k < 3; k++) s.fire(h("q-1", { waited_secs: 700 + 300 * k }));
+    expect({ 팝업: s.count("stickyToast"), 직접기록: s.count("recordAlarm") }).toEqual({ 팝업: 1, 직접기록: 2 });
+  });
+  it("③ 꼬리 항목 폐기 대조군: 머리가 그대로면(depth 만 줄어도) 억제 유지 — 좌석 단위 reset 이 아니다", () => {
+    const s = scenario();
+    s.fire(h("q-1", { depth: 3 })); s.fire(h("q-1", { depth: 2, waited_secs: 1020 }));
+    expect({ 팝업: s.count("stickyToast"), 직접기록: s.count("recordAlarm") }).toEqual({ 팝업: 1, 직접기록: 1 });
+  });
+  it("④ 머리가 없는 구판 payload 끼리는 기존 동작(제목 비교) — 반복 억제", () => {
+    const s = scenario();
+    s.fire(mk("wait")); s.fire(mk("wait", { waited_secs: 1020 }));
+    expect(s.count("stickyToast")).toBe(1);
+  });
+  it("⑤ 머리 유무가 섞이면(못 가르면) 다시 띄운다 — 양방향", () => {
+    const a = scenario();
+    a.fire(mk("wait")); a.fire(h("q-1"));
+    expect(a.count("stickyToast")).toBe(2);
+    const b = scenario();
+    b.fire(h("q-1")); b.fire(mk("wait"));
+    expect(b.count("stickyToast")).toBe(2);
+  });
+  it("⑥ 쓸 수 없는 머리 값(빈 문자열·숫자·객체·null)은 없는 것으로 본다", () => {
+    for (const bad of ["", "   ", 7, {}, [], null]) {
+      const n = starvedNotice(h(bad), "abc")!;
+      expect({ bad, key: n.stateKey }).toEqual({ bad, key: n.title });
+    }
+    expect(starvedNotice(h("q-1"), "abc")!.stateKey).not.toBe(starvedNotice(h("q-2"), "abc")!.stateKey);
+  });
+  it("⑦ 사람 손은 머리와 무관하게 매번 팝업+배너 — 11종 약화 없음", () => {
+    const s = scenario();
+    s.fire(mk("stale_screen", { head_entry_id: "q-1" })); s.fire(mk("stale_screen", { head_entry_id: "q-1" }));
+    expect({ 팝업: s.count("stickyToast"), 배너: s.count("osBanner") }).toEqual({ 팝업: 2, 배너: 2 });
+  });
+  it("⑧ 배달(delivered) 뒤 같은 머리 id 가 다시 와도 새 구간 1회 — 기존 종료 규칙 유지", () => {
+    const s = scenario();
+    s.fire(h("q-1")); s.delivered(); s.fire(h("q-1"));
+    expect(s.count("stickyToast")).toBe(2);
+  });
+  it("⑨ 소스 핀: 맵에는 제목이 아니라 stateKey 를 넣는다", () => {
+    expect(read("./main.ts")).toContain("starvedLastKey.set(starved.id, starved.stateKey);");
+  });
+});
 });
 
 describe("0.14.48 D — 등급은 기존 토스트 등급 중 하나", () => {
