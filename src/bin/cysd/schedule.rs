@@ -1692,6 +1692,7 @@ fn is_retired_seed_text_command(cmd: &str) -> bool {
 }
 
 // 모르면 false = 종전 경로(거부 + schedule.error). 승인 흔적을 건너뜀으로 숨기지 않는다.
+// 폴더·환경이 달라 지금은 통과하지 못하는 승인도 「흔적」이다 — 건너뜀으로 숨기지 않는다(접두 비교는 approval.rs matches_ctx 의 접두 판정과 같은 식이다 · 그쪽을 고치면 여기도 본다).
 fn retired_text_command_confirmed_unapproved(cmd: &str) -> bool {
     if !is_retired_seed_text_command(cmd) || is_trusted_builtin_text_command(cmd) {
         return false;
@@ -1702,10 +1703,8 @@ fn retired_text_command_confirmed_unapproved(cmd: &str) -> bool {
     let Ok(records) = crate::approval::try_load_records() else {
         return false;
     };
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-    !records.iter().any(|r| r.matches(cmd, cwd.as_deref(), &[]))
+    let Some(toks) = crate::approval::tokenize(cmd) else { return false; };
+    !records.iter().any(|r| !r.command_prefix.is_empty() && toks.get(..r.command_prefix.len()) == Some(r.command_prefix.as_slice()))
 }
 
 fn text_command_notes(jobs: &[serde_json::Value]) -> Vec<(String, &'static str)> {
@@ -6338,7 +6337,10 @@ mod b_textcmd_retired_gate {
     fn retired_gate_confirmed_unapproved_implies_text_command_denied() {
         let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (seed_id, cmd) in retired_seed_texts() {
-            for case in ["unapproved", "broken-ttl", "broken-main", "secret-directory", "expired", "wrong-secret"] {
+            for case in [
+                "unapproved", "broken-ttl", "broken-main", "secret-directory", "expired", "wrong-secret",
+                "other-cwd", "other-env", "unnormalized-cwd", "unrelated-record",
+            ] {
                 let root = TempRoot::new(case);
                 let _store = approval::tests::with_store_root(&root.0);
                 let _env = WithoutSecretEnv::new();
@@ -6367,10 +6369,39 @@ mod b_textcmd_retired_gate {
                         }
                         approval::save_records(&[record]).expect("시험 승인 저장");
                     }
+                    "other-cwd" | "other-env" | "unnormalized-cwd" => {
+                        let secret = approval::signing_secret().expect("시험 루트 시크릿");
+                        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+                        let mut record = matching_record(&cmd, cwd.as_deref());
+                        match case {
+                            "other-cwd" => record.cwd = approval::normalize_cwd(Some("/nonexistent-other-cwd")),
+                            "other-env" => record.environment.push(("CYS_B_TEST_ENV".into(), "1".into())),
+                            "unnormalized-cwd" => record.cwd = Some("/nonexistent-other-cwd/".into()),
+                            _ => unreachable!(),
+                        }
+                        record.sign(&secret);
+                        approval::save_records(&[record]).expect("시험 승인 저장");
+                        let records = approval::try_load_records().expect("시험 승인 다시 읽기");
+                        assert_eq!(records.len(), 1);
+                        let record = &records[0];
+                        assert!(!record.matches(&cmd, cwd.as_deref(), &[]), "{case}: 폴더·환경 불일치 전제");
+                        assert!(record.has_valid_signature(&secret), "{case}: 유효 서명 전제");
+                        assert!(!record.is_expired(now_epoch()), "{case}: 미만료 전제");
+                    }
+                    "unrelated-record" => {
+                        let secret = approval::signing_secret().expect("시험 루트 시크릿");
+                        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+                        let mut record = matching_record("printf unrelated", cwd.as_deref());
+                        record.sign(&secret);
+                        assert!(!record.matches(&cmd, cwd.as_deref(), &[]), "무관한 명령 전제");
+                        assert!(record.has_valid_signature(&secret), "유효 서명 전제");
+                        assert!(!record.is_expired(now_epoch()), "미만료 전제");
+                        approval::save_records(&[record]).expect("시험 승인 저장");
+                    }
                     _ => unreachable!(),
                 }
                 let confirmed = retired_text_command_confirmed_unapproved(&cmd);
-                assert_eq!(confirmed, case == "unapproved", "{seed_id}/{case}");
+                assert_eq!(confirmed, matches!(case, "unapproved" | "unrelated-record"), "{seed_id}/{case}");
                 let denied = text_command_allowed(&cmd).is_err();
                 assert!(!confirmed || denied, "{seed_id}/{case}: 건너뜀 관문과 실행 검사 불일치");
                 assert!(denied, "{seed_id}/{case}: 기존 거부 유지");
@@ -6565,7 +6596,10 @@ mod b_textcmd_retired_gate {
     async fn retired_seed_text_with_unreadable_approval_state_keeps_error() {
         let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         for (seed_id, cmd) in retired_seed_texts() {
-            for case in ["broken-ttl", "broken-main", "secret-directory", "expired", "wrong-secret"] {
+            for case in [
+                "broken-ttl", "broken-main", "secret-directory", "expired", "wrong-secret",
+                "other-cwd", "other-env", "unnormalized-cwd",
+            ] {
                 let root = TempRoot::new(case);
                 let _store = approval::tests::with_store_root(&root.0);
                 let _env = WithoutSecretEnv::new();
@@ -6603,6 +6637,25 @@ mod b_textcmd_retired_gate {
                         if case == "wrong-secret" {
                             assert!(record.has_valid_signature(&other_secret), "다른 키로 서명한 레코드");
                         }
+                    }
+                    "other-cwd" | "other-env" | "unnormalized-cwd" => {
+                        let secret = approval::signing_secret().expect("시험 루트 시크릿");
+                        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+                        let mut record = matching_record(&cmd, cwd.as_deref());
+                        match case {
+                            "other-cwd" => record.cwd = approval::normalize_cwd(Some("/nonexistent-other-cwd")),
+                            "other-env" => record.environment.push(("CYS_B_TEST_ENV".into(), "1".into())),
+                            "unnormalized-cwd" => record.cwd = Some("/nonexistent-other-cwd/".into()),
+                            _ => unreachable!(),
+                        }
+                        record.sign(&secret);
+                        approval::save_records(&[record]).expect("시험 승인 저장");
+                        let records = approval::try_load_records().expect("시험 승인 다시 읽기");
+                        assert_eq!(records.len(), 1);
+                        let record = &records[0];
+                        assert!(!record.matches(&cmd, cwd.as_deref(), &[]), "{case}: 폴더·환경 불일치 전제");
+                        assert!(record.has_valid_signature(&secret), "{case}: 유효 서명 전제");
+                        assert!(!record.is_expired(now_epoch()), "{case}: 미만료 전제");
                     }
                     _ => unreachable!(),
                 }
