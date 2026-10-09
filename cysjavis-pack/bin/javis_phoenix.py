@@ -768,9 +768,40 @@ def die(msg, code=2):
     sys.exit(code)
 
 
+def _force_utf8_stdio():
+    """★(0.14.48 · A) 이 프로세스의 stdout·stderr 를 UTF-8 로 재설정한다 — `main()` 첫 줄에서만 부른다.
+
+    왜: 데몬은 자동 복원용 phoenix 를 UTF-8 강제 변수 없이 띄우고 stdout 을 파일로 돌린다. 그러면 파이썬은
+    시스템 기본 코드페이지(한국어 윈도우 cp949 · 영문 윈도우 cp1252)로 쓰는데, 로그·결과 JSON 의 줄표(—)·★·한글이
+    그 코드페이지에 없으면 UnicodeEncodeError 로 복원 전체가 종료코드 1 이 됐다(실측: 윈도우 11 러너 cp1252 ·
+    맥 cp949 모의). 코드가 인코딩을 직접 적으면 인터프리터가 어떤 모드로 뜨든 결과가 같다.
+    · errors="backslashreplace" — 대리 문자처럼 UTF-8 로도 못 쓰는 값이 와도 죽지 않는다.
+    · None·닫힌 스트림·reconfigure 가 없는 대역은 그대로 둔다(지원 전제 = 열린 표준 스트림).
+    · import 시점에는 부르지 않는다 — 이 모듈을 불러 쓰는 쪽의 stdout 을 import 만으로 바꾸지 않는다."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
+
 def log(msg):
-    sys.stdout.write("[phoenix] %s\n" % msg)
-    sys.stdout.flush()
+    line = "[phoenix] %s\n" % msg
+    try:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        # ★(0.14.48 · A) `main()` 을 거치지 않은 호출(이 모듈을 import 해 쓰는 경로)은 stdout 이 재설정돼 있지 않다 —
+        #   그 스트림이 못 쓰는 글자는 이스케이프로 바꿔 남긴다. 진단 한 줄 때문에 복원이 죽지 않는다.
+        try:
+            enc = getattr(sys.stdout, "encoding", None) or "ascii"
+            sys.stdout.write(line.encode(enc, "backslashreplace").decode(enc, "replace"))
+            sys.stdout.flush()
+        except Exception:
+            pass
+    except (ValueError, AttributeError, OSError):
+        pass  # 닫혔거나 없는 스트림 — 쓸 곳이 없다(버린다 · 죽지 않는다)
 
 
 def _emit_evt(evt_type, **fields):
@@ -4118,6 +4149,7 @@ def cmd_deploy(args):
 
 def main():
     global CYS
+    _force_utf8_stdio()  # ★(0.14.48 · A) selftest 판정보다 앞 — 이 프로세스의 모든 출력이 UTF-8 로 나간다
     # ★B1 self-test(임베드 추출 직후 cysd 가 호출): 추출된 phoenix 가 실행가능한지만 확인한다 — 데몬·cys 해석·
     #   상태파일 무접촉. argparse(서브커맨드 required)·_resolve_cys 이전에 조기 종료해 순수 실행성만 검증.
     #   설계 §2 B1③ 수용조건. --pack-version 은 별칭(설계 표기 정합).
