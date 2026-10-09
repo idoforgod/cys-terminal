@@ -156,8 +156,8 @@ describe("0.14.48 D — 「막힘」 낱말: 기다림 3종이 만드는 사람�
       expect(MAKHIM.test(n.title + n.detail)).toBe(false);
     }
   });
-  it("데몬 소스가 기다림 3종 조치 문장 상수에 「막힘」을 넣으면 이 시험이 빨개진다(소스를 읽기만 한다 — 어휘 핀)", () => {
-    const gov = readFileSync("/Users/cys/Desktop/CYSjavis/_worktrees/impl-0.14.48-D/src/bin/cysd/governance.rs", "utf-8");
+  it("데몬 소스의 일부 calm 문장 머리(12자)가 그대로 있고 kill-switch 상수 앞 600자에 「막힘」이 없다(소스를 읽기만 한다 — 어휘 핀 · 범위는 이 둘로 한정)", () => {
+    const gov = read("../../src/bin/cysd/governance.rs");
     for (const lit of DAEMON_CALM_SENTENCES.slice(0, 3).concat(DAEMON_CALM_SENTENCES.slice(4, 6))) {
       const head = lit.split("(")[0].slice(0, 12);
       expect({ 문장머리: head, 소스에있음: gov.includes(head) }).toEqual({ 문장머리: head, 소스에있음: true });
