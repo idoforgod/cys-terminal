@@ -1265,6 +1265,36 @@ def _prune_corrupt(path, keep=3):
             pass
 
 
+def _notice_requalified_corrupt(socket):
+    """★(0.14.48 · A) 앞선 판(0.14.44~0.14.47)은 기본 인코딩이 UTF-8 이 아닌 기계에서 **멀쩡한** 로스터·저널을 못 읽어
+    `.corrupt-<시각>` 으로 치웠다. 그렇게 치워진 것 가운데 UTF-8 로 읽으면 유효한 JSON 인 격리본을 찾아 한 줄씩 알린다.
+    **되돌리지 않는다** — 격리본이 지금 상태보다 낡았을 수 있고, 묘비의 원본은 데몬의 topology 다. 사람이 내용을 보고 정한다.
+    파일은 건드리지 않는다(읽기만). 반환 = 알린 경로 목록(시험용)."""
+    found = []
+    try:
+        home = phoenix_home(socket)
+        names = sorted(os.listdir(home))
+    except Exception:
+        return found
+    for name in names:
+        if ".corrupt-" not in name:
+            continue
+        base = name.split(".corrupt-", 1)[0]
+        if not (base in ("desired_roster.json", "dept_roster.json") or (base.startswith("journal-") and base.endswith(".json"))):
+            continue
+        path = os.path.join(home, name)
+        try:
+            with open(path, encoding="utf-8") as f:
+                json.load(f)
+        except Exception:
+            continue  # 진짜 손상본 — 알릴 것이 없다
+        found.append(path)
+    for path in found:
+        log("★격리본 알림: %s 은 UTF-8 로 읽으면 멀쩡한 JSON 이다 - 앞선 판이 인코딩 오판으로 치운 파일일 수 있다. "
+            "자동으로 되돌리지 않는다(내용 확인 뒤 필요하면 사람이 되돌린다)." % path)
+    return found
+
+
 def _recovered_provenance(path):
     """복구본에 영속된 degraded provenance(`recovered_from`)를 읽는다 — 있으면 dict{source,ts}, 없으면 None.
     ★codex W3 BLOCKING: 이 필드가 존재하는 한(파일이 유효 JSON 이어도) 부활 보류가 유지된다 — degraded 가
@@ -2566,6 +2596,7 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
         atexit.register(lambda h=_lease_handle: _release_lease(h))
     # ★Phase 6: 이 부팅 세대(재시작마다 변경)를 취득 — 저널 완료 마킹의 유효성 기준.
     _ACTIVE_EPOCH = get_boot_epoch(socket)
+    _notice_requalified_corrupt(socket)  # ★(0.14.48 · A) 앞선 판이 오판으로 치운 격리본 알림(읽기만 · 되돌리지 않는다)
 
     # ★C2 손상 대응 — 2단계 계층화(W4 sentinel + W3 폴백 체인). missing(부재)=fresh install 정상 진행.
     #   corrupt(파싱 실패)=격리(.corrupt-<ts>·최근3 prune) 후 폴백 체인(.bak → 세대 스냅샷 → dept 재발견):

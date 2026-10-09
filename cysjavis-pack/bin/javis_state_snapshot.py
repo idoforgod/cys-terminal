@@ -387,7 +387,7 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None)
             })
 
         mpath = os.path.join(tmp_dir, "manifest.json")
-        with open(mpath, "w") as mf:
+        with open(mpath, "w", encoding="utf-8") as mf:  # ★(0.14.48 · A) 기본 인코딩에 맡기지 않는다 — 읽는 쪽과 모드가 달라도 같은 바이트
             json.dump(manifest, mf, indent=2, ensure_ascii=False)
             mf.flush()
             os.fsync(mf.fileno())
@@ -510,9 +510,15 @@ def do_verify(gen_root=GEN_ROOT, gen=None):
             all_ok = False
             continue
         try:
-            with open(mpath) as f:
-                manifest = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
+            # ★(0.14.48 · A) UTF-8 로 먼저 읽는다. 앞선 판은 기본 인코딩으로 썼으므로(cp949 프로세스가 쓴 manifest 가
+            #   있을 수 있다) UTF-8 이 아니면 시스템 기본 인코딩으로 한 번 더 읽는다 — 옛 세대를 버리지 않는다.
+            try:
+                with open(mpath, encoding="utf-8") as f:
+                    manifest = json.load(f)
+            except UnicodeDecodeError:
+                with open(mpath) as f:
+                    manifest = json.load(f)
+        except (OSError, ValueError) as e:
             print(f"[verify] {name}: manifest 파싱 실패 {e} FAIL")
             all_ok = False
             continue
