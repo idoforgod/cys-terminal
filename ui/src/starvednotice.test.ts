@@ -14,6 +14,8 @@ import { describe, it, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
   starvedNotice,
+  starvedShouldPop,
+  starvedPopAgeMs,
   starvedHumanNeeded,
   starvedWaitText,
   starvedSlug,
@@ -181,9 +183,9 @@ describe("★R2F-UI(A3 m1) 코드가 아예 없는 payload(0.14.42 데몬) — �
     expect([...STARVED_LEGACY_CALM_PREFIXES].sort()).toEqual(["approval_pending", "busy", "delivery_interval", "human_typing", "paused", "prompt_not_ready", "queue_paused", "quiescing", "settle"]);
     for (const a of STARVED_LEGACY_CALM_PREFIXES) for (const b of STARVED_LEGACY_CALM_PREFIXES) if (a !== b) expect({ a, b, 겹침: b.startsWith(a) }).toEqual({ a, b, 겹침: false });
   });
-  it("조치 문구·제목·id 는 종전 그대로다 — 사유가 calm 이어도 상세는 `막힘 사유: …` 이고 토스트는 뜬다(OS 배너만 없다)", () => {
+  it("calm 사유는 대기 제목·대체 문장·idle 로 뜨고 id 는 그대로다(OS 배너는 없다)", () => {
     const n = starvedNotice(legacy("busy(출력 중)"), "abc")!;
-    expect(n).toEqual({ id: "starved:abc:surface:3", title: "⏳ 큐 막힘 — worker surface:3", detail: "10분째 · 막힘 사유: busy(출력 중)", humanNeeded: false });
+    expect(n).toEqual({ id: "starved:abc:surface:3", title: "⏳ 배달 대기 중 — worker surface:3", detail: "10분째 · 대기 사유: busy(출력 중)", humanNeeded: false, level: "idle", stateKey: "⏳ 배달 대기 중 — worker surface:3\nq-9" });
   });
 });
 
@@ -252,10 +254,12 @@ describe("starvedNotice — 제목·상세·id", () => {
       title: "⏳ 큐 막힘 — worker surface:12",
       detail: `12분째 · ${REMEDY_BODY}`,
       humanNeeded: true,
+      level: "health",
+      stateKey: "⏳ 큐 막힘 — worker surface:12\nq-1",
     });
   });
-  it("돌려주는 객체의 키는 정확히 4개(id·title·detail·humanNeeded)", () => {
-    expect(Object.keys(starvedNotice(payload(), "x")!).sort()).toEqual(["detail", "humanNeeded", "id", "title"]);
+  it("돌려주는 객체의 키는 정확히 6개(id·title·detail·humanNeeded·level·stateKey)", () => {
+    expect(Object.keys(starvedNotice(payload(), "x")!).sort()).toEqual(["detail", "humanNeeded", "id", "level", "stateKey", "title"]);
   });
   it("역할이 없거나(null·undefined·빈 값·공백·문자열이 아님) 이상하면 제목에서 빠지고 공백이 겹치지 않는다", () => {
     for (const r of [null, undefined, "", "   ", "\n\t", 7, {}, [], true])
@@ -383,23 +387,27 @@ describe("200자 절단 — 넘으면 앞 199자 + … (총 200자, 코드 포�
 
 describe("구버전 데몬 payload(remedy_code·remedy 없음) · 조치 문장을 믿을 수 없는 경우", () => {
   // ★R2F-UI(A3 m1): 이름·기대를 고쳤다 — 종전 「remedy 없음 → humanNeeded true」 는 코드가 없으면 **모든** 사유를 '모르면 알린다'로 읽었다. 이제 코드가 아예 없는 payload 는 막힘 사유의 접두로 가린다:
-  //   기본 legacyPayload(blocked_by=`busy`)는 스스로 풀리는 사유라 토스트만(humanNeeded false), 사람 조치 사유(`input_pending…`)는 그대로 true. 상세 문구(`막힘 사유: <blocked_by>`)·분 표기·id·제목은 그대로다.
-  it("remedy 없음 → 상세는 `막힘 사유: <blocked_by>` 만(분 표기는 유지) · humanNeeded 는 사유로 가른다 — 사람 조치 사유(입력줄)면 true, 스스로 풀리는 사유(busy)면 false", () => {
+  //   기본 legacyPayload(blocked_by=`busy`)는 스스로 풀리는 사유라 대기 제목·대체 문장·idle(humanNeeded false), 사람 조치 사유(`input_pending…`)는 기존 문구·health(true). 분 표기·id 는 그대로다.
+  it("remedy 없음 → 상세는 사람 손이면 `막힘 사유: <blocked_by>`, calm 이면 `대기 사유: <blocked_by>`(분 표기는 유지) · humanNeeded 는 사유로 가른다 — 사람 조치 사유(입력줄)면 true, 스스로 풀리는 사유(busy)면 false", () => {
     expect(starvedNotice(legacyPayload({ blocked_by: "input_pending(입력줄에 미제출 입력)" }), "base")).toEqual({
       id: "starved:base:surface:3",
       title: "⏳ 큐 막힘 — worker surface:3",
       detail: "10분째 · 막힘 사유: input_pending(입력줄에 미제출 입력)",
       humanNeeded: true,
+      level: "health",
+      stateKey: "⏳ 큐 막힘 — worker surface:3\nq-9",
     });
     expect(starvedNotice(legacyPayload(), "base")).toEqual({
       id: "starved:base:surface:3",
-      title: "⏳ 큐 막힘 — worker surface:3",
-      detail: "10분째 · 막힘 사유: busy",
+      title: "⏳ 배달 대기 중 — worker surface:3",
+      detail: "10분째 · 대기 사유: busy",
       humanNeeded: false,
+      level: "idle",
+      stateKey: "⏳ 배달 대기 중 — worker surface:3\nq-9",
     });
   });
   it("remedy_code 가 없거나 모르는 값이면 remedy 문장이 있어도 쓰지 않는다 — blocked_by 만(티켓 문면)", () => {
-    expect(starvedNotice(legacyPayload({ remedy: `조치 문장${TAIL}` }))!.detail).toBe("10분째 · 막힘 사유: busy");
+    expect(starvedNotice(legacyPayload({ remedy: `조치 문장${TAIL}` }))!.detail).toBe("10분째 · 대기 사유: busy");
     const futureCode = starvedNotice(legacyPayload({ remedy_code: "future_code", remedy: `새 조치${TAIL}` }))!;
     expect(futureCode.detail).toBe("10분째 · 막힘 사유: busy");
     expect(futureCode.humanNeeded).toBe(true); // ★코드가 **있는데** 모르는 값이면 사유가 busy 여도 알린다 — 사유 접두 규칙은 코드가 아예 없는 payload 에만 쓴다(A3 m1)
@@ -550,8 +558,14 @@ describe("신뢰할 수 없는 payload — 결정론 난수 600판(던지지 않
       const n = starvedNotice(p, slug);
       if (n === null) continue;
       nonNull++;
-      expect(Object.keys(n).sort()).toEqual(["detail", "humanNeeded", "id", "title"]);
-      expect(n.title.startsWith("⏳ 큐 막힘")).toBe(true);
+      expect(Object.keys(n).sort()).toEqual(["detail", "humanNeeded", "id", "level", "stateKey", "title"]);
+      if (n.humanNeeded) {
+        expect(n.title.startsWith("⏳ 큐 막힘")).toBe(true);
+        expect(n.level).toBe("health");
+      } else {
+        expect(["⏳ 배달 대기 중 —", "⏳ 승인 대기 중 —", "⏳ 일시 정지 중 —"].some((head) => n.title.startsWith(head))).toBe(true);
+        expect(n.level).toBe("idle");
+      }
       expect(n.id.startsWith("starved:")).toBe(true);
       expect(n.id.endsWith(":" + String(p.surface_ref))).toBe(true);
       expect(CONTROL.test(n.title) || CONTROL.test(n.detail) || CONTROL.test(n.id)).toBe(false);
@@ -564,7 +578,7 @@ describe("신뢰할 수 없는 payload — 결정론 난수 600판(던지지 않
   it("HTML 은 해석하지 않고 글자 그대로 둔다 — 화면은 textContent 로만 그린다(이스케이프는 렌더 층의 일이 아니다)", () => {
     const evil = "<img src=x onerror=alert(1)>";
     const n = starvedNotice(payload({ role: evil, remedy: evil, remedy_code: "wait" }))!;
-    expect(n.title).toBe(`⏳ 큐 막힘 — ${evil} surface:12`);
+    expect(n.title).toBe(`⏳ 배달 대기 중 — ${evil} surface:12`);
     expect(n.detail).toBe(`12분째 · ${evil}`);
   });
 });
@@ -671,10 +685,13 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
     const chain = handler.indexOf('if (category === "health") {');
     expect({ 분기: at >= 0, 폴백_사슬: chain >= 0, 분기가_앞: at >= 0 && chain > at }).toEqual({ 분기: true, 폴백_사슬: true, 분기가_앞: true });
   });
-  it("starvedNotice 로 문구를 만들고 stickyToast(id, \"health\", 제목, 상세, …) 로만 올린다 — 같은 id 라 갱신된다", () => {
+  it("starvedNotice 로 문구·등급을 만들고 stickyToast(id, level, 제목, 상세, …) 로 올린다 — 같은 제목의 calm 은 이력만 갱신된다", () => {
     const b = branch("queue.starved");
     expect(b).toContain("const starved = starvedNotice(payload, event.socket_slug);");
-    expect(b).toContain('stickyToast(starved.id, "health", starved.title, starved.detail, ');
+    expect(b).toContain("stickyToast(starved.id, starved.level, starved.title, starved.detail, ");
+    expect(b).toContain("if (starvedShouldPop(starvedLastKey.get(starved.id), starved, lastPopAt === undefined ? undefined : starvedPopAgeMs(Date.now(), lastPopAt.wall, performance.now(), lastPopAt.mono))) {");
+    expect(b).toContain("recordAlarm(starved.level, starved.title, starved.detail, starved.id);");
+    expect(b).toContain("starvedLastKey.set(starved.id, starved.stateKey);");
     expect(b.split("stickyToast(").length - 1).toBe(1);
     expect(/(^|[^A-Za-z])toast\(/.test(b)).toBe(false); // 일회성 toast( 를 따로 부르지 않는다(같은 좌석의 토스트가 쌓이지 않는다)
   });
@@ -682,7 +699,8 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
     const b = branch("queue.starved");
     expect(b).toContain("if (starved.humanNeeded) osBanner(starved.title, starved.detail);");
     expect(b.split("osBanner(").length - 1).toBe(1);
-    for (const timer of ["setTimeout", "setInterval", "Date.now("]) expect({ 금지: timer, 있음: b.includes(timer) }).toEqual({ 금지: timer, 있음: false });
+    // ★F1-R(0.14.48): 시계 읽기(Date.now)는 억제 상한(STARVED_REPOP_MS)이 쓴다 — 타이머(예약 실행)는 여전히 0 이다.
+    for (const timer of ["setTimeout", "setInterval"]) expect({ 금지: timer, 있음: b.includes(timer) }).toEqual({ 금지: timer, 있음: false });
   });
   it("★분기는 return 으로 끝난다 — 폴백 레인을 타지 않는다(이중 표시 금지)", () => {
     const b = branch("queue.starved");
@@ -709,7 +727,7 @@ describe("main.ts 배선 — queue.starved 분기(name-우선 · 끝의 return �
       expect(part.includes("innerHTML")).toBe(false);
   });
   it("starvednotice 의 도우미를 import 한다", () => {
-    expect(code).toContain('import { starvedNotice, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice";');
+    expect(code).toContain('import { starvedNotice, starvedShouldPop, starvedKeyHasHead, starvedPopAgeMs, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice";');
   });
 });
 
@@ -751,7 +769,7 @@ describe("main.ts 배선 — 풀림(queue.delivered)·좌석 종료가 토스트
   it("dismissStarvedToast 는 starvednotice 가 정한 id 로 기존 dismissToast 를 부른다(id 모양의 진실원은 한 곳)", () => {
     const b = fnBody("dismissStarvedToast");
     expect(b).toContain("starvedDismissId(socketSlug, surfaceId)");
-    expect(b).toContain("if (id) dismissToast(id);");
+    expect(b).toContain("if (id) { dismissToast(id); starvedLastKey.delete(id); starvedLastPopAt.delete(id); }");
     expect(code.includes("`starved:")).toBe(false); // main.ts 가 id 모양을 따로 만들지 않는다
     expect(code.includes('"starved:')).toBe(false);
   });
@@ -801,15 +819,22 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
   };
   type Call = { fn: string; args: unknown[] };
   /** 분기 본문을 그대로 실행한다 — 분기가 return 하면 undefined, 안 하고 지나가면 "fell-through". */
-  function run(evName: string, event: Record<string, unknown>, p: unknown): { ret: unknown; calls: Call[] } {
+  function run(evName: string, event: Record<string, unknown>, p: unknown, starvedLastKey = new Map<string, string>()): { ret: unknown; calls: Call[] } {
     const calls: Call[] = [];
     const rec = (fn: string) => (...args: unknown[]) => {
       calls.push({ fn, args });
     };
     const deps = {
       starvedNotice,
+      starvedShouldPop,
+      starvedLastKey,
+      starvedLastPopAt: new Map<string, { wall: number; mono: number }>(),
+      starvedPopAgeMs,
+      Date: { now: () => 0 },
+      performance: { now: () => 0 },
       surfaceIdOfRef,
       stickyToast: rec("stickyToast"),
+      recordAlarm: rec("recordAlarm"),
       osBanner: rec("osBanner"),
       focusStarvedSeat: rec("focusStarvedSeat"),
       dismissStarvedToast: rec("dismissStarvedToast"),
@@ -840,10 +865,18 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
     (onClick as () => void)();
     expect(calls.filter((c) => c.fn === "focusStarvedSeat").map((c) => c.args)).toEqual([["abc", 12]]);
   });
-  it("calm 사유(approval·paused·wait): 토스트만 — OS 배너 0", () => {
+  it("calm 사유(approval·paused·wait): idle 토스트는 같은 제목의 구간당 1회, 이후 이력만 — OS 배너 0", () => {
     for (const code of ["approval", "paused", "wait"]) {
-      const { ret, calls } = run("queue.starved", { name: "queue.starved", socket_slug: "abc", surface_id: 12 }, payload({ remedy_code: code }));
+      const starvedLastKey = new Map<string, string>();
+      const ev = { name: "queue.starved", socket_slug: "abc", surface_id: 12 };
+      const p = payload({ remedy_code: code });
+      const n = starvedNotice(p, "abc")!;
+      const { ret, calls } = run("queue.starved", ev, p, starvedLastKey);
       expect({ 코드: code, 호출: calls.map((c) => c.fn), ret }).toEqual({ 코드: code, 호출: ["stickyToast"], ret: undefined });
+      expect(calls[0].args.slice(0, 4)).toEqual([n.id, "idle", n.title, n.detail]);
+      const again = run("queue.starved", ev, p, starvedLastKey);
+      expect({ 코드: code, 호출: again.calls.map((c) => c.fn), ret: again.ret }).toEqual({ 코드: code, 호출: ["recordAlarm"], ret: undefined });
+      expect(again.calls[0].args).toEqual(["idle", n.title, n.detail, n.id]);
     }
   });
   // ★R2F-UI(A3 m1): 이름·기대를 고쳤다 — 종전 「구버전 payload(remedy_code 없음): 토스트 + OS 배너(모르면 알린다)」 는 기본 legacyPayload(blocked_by=`busy`)로 배너를 기대했다. 코드가 없는 payload 는 이제
@@ -858,7 +891,8 @@ describe("main.ts 배선 — 이벤트 분기의 실제 본문을 대역 위에�
     for (const reason of ["busy", "busy(출력 중)", "approval_pending(승인·관문 대기)", "queue_paused(헬스 조치)", "paused(kill-switch 동결)", "human_typing(사람이 입력 중)"]) {
       const { ret, calls } = run("queue.starved", { name: "queue.starved", surface_id: 3 }, legacyPayload({ blocked_by: reason }));
       expect({ 사유: reason, 호출: calls.map((c) => c.fn), ret }).toEqual({ 사유: reason, 호출: ["stickyToast"], ret: undefined });
-      expect(calls[0].args[3]).toBe(`10분째 · 막힘 사유: ${reason}`); // 토스트는 그대로 뜬다
+      expect(calls[0].args[1]).toBe("idle");
+      expect(calls[0].args[3]).toBe(`10분째 · 대기 사유: ${reason}`); // 구간의 첫 대기 토스트
     }
   });
   it("socket_slug 가 문자열이 아니면 클릭 처리기는 빈 slug(= 본부)로 부른다", () => {
