@@ -1445,6 +1445,14 @@ cys schedule list / remove <id> / run <id>
   기록)이지 성공 여부가 아닙니다 — 두 칸을 함께 봐야 "제때 돌았는데 매번 실패"를 구분합니다. 결과
   기록은 데몬 메모리에만 있어 데몬을 다시 켜면 비고(`result=-`), 구버전 데몬이면 `result=?`(판정
   불가)로 보입니다.
+- **`text_command` 잡과 승인(0.14.48)**: `text_command` 는 데몬이 셸로 돌리는 글이라, 데몬에 내장된 문구가
+  아니면 서명 승인(「6.2 승인 서명」)이 있어야 돕니다. 승인이 없으면 실행하지 않고 `result=error` 로 남습니다.
+  예외는 예전 판이 넣어 둔 두 잡(`fleet-adoption-cost-digest` · `content-channel-health-watch`)의 원래 문구입니다 —
+  승인 파일을 읽었고 그 문구의 승인이 **없다는 것이 확인되면** 오류로 세지 않고 `result=skipped` 로 건너뜁니다.
+  승인 파일을 읽지 못했거나 승인이 만료·무효이면 종전처럼 `result=error` 입니다(고장을 건너뜀으로 숨기지 않습니다).
+  줄 끝의 `note=retired-seed-text` 는 그 문구라는 표시이고, `note=builtin-text-mismatch` 는 내장 잡의 문구가
+  내장 문구와 달라졌다는 표시입니다(데몬은 고쳐 쓰지 않습니다). 두 표시는 문구만 보고 붙이며 승인 여부를 말하지
+  않습니다. 필요 없는 잡은 `cys schedule remove <id>` 로 지우세요.
 - **직접 push 의 화면 판정(0.14.42 · H2)**: 큐를 쓰지 않는 push 잡(하트비트·wakeup 등)은 대상 좌석에 질문 창·초안·
   사람 입력(30초)·사이클 창이 **보이면** 그 좌석 큐로 돌리고(`result=queued`), 창이 닫히면 큐가 배달합니다.
   돌린 항목은 큐의 절반(50칸)까지만 쓰고(나머지 50칸은 `send --queued` 몫 — 넘치면 `result=error` · `queue_full`),
