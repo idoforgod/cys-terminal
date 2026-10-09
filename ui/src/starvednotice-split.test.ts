@@ -14,6 +14,10 @@ import {
   STARVED_CALM_CODES,
   STARVED_LEGACY_HUMAN_CODES,
 } from "./starvednotice";
+import * as SN from "./starvednotice";
+// F1-R 의 새 export — 아직 없던 시점(빨강)에도 파일이 읽히도록 네임스페이스로 받는다.
+const starvedKeyHasHead = (SN as any).starvedKeyHasHead as (key: unknown, entryId: unknown) => boolean;
+const STARVED_REPOP_MS = (SN as any).STARVED_REPOP_MS as number;
 
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf-8");
 const TAIL = " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지";
@@ -375,6 +379,117 @@ describe("0.14.48 D F1 — 머리 항목(head_entry_id)으로 구간을 가른�
   });
   it("⑨ 소스 핀: 맵에는 제목이 아니라 stateKey 를 넣는다", () => {
     expect(read("./main.ts")).toContain("starvedLastKey.set(starved.id, starved.stateKey);");
+  });
+});
+
+// ★0.14.48 D F1-R(REFLECT-D-impl-4, reviewer-codex r2): 같은 id 가 만료 → 되살림으로 다시 활성이 되는 경우의 새 구간 + 이벤트 유실 상한.
+describe("0.14.48 D F1-R — 만료·되살림(같은 머리 id)과 억제 상한", () => {
+  const MIN = 60_000;
+  const forgetFn = (() => {
+    const i = code.indexOf("function forgetStarvedHead(");
+    if (i < 0) return "";
+    return code.slice(i, code.indexOf("\n}\n", i) + 3).replace("(socketSlug: unknown, surfaceId: unknown, entryId: unknown): void", "(socketSlug, surfaceId, entryId)");
+  })();
+  const evBranch = (() => {
+    const i = code.indexOf('  if (name === "queue.expired" || name === "queue.revived") {');
+    return i < 0 ? "" : code.slice(i, code.indexOf("\n  }\n", i) + 5);
+  })();
+  /** 앱 한 개: 맵 둘 + 시계. starved/expired/revived/dropped 이벤트를 앱 분기 본문으로 흘린다(분기가 소스에 없으면 그 이벤트는 무시 = 지금의 앱). */
+  function app() {
+    const calls: Call[] = [];
+    const rec = (fn: string) => (...args: unknown[]) => void calls.push({ fn, args });
+    const starvedLastKey = new Map<string, string>();
+    const starvedLastPopAt = new Map<string, number>();
+    let clock = 1_000_000;
+    const deps = {
+      starvedNotice, surfaceIdOfRef, starvedShouldPop, starvedKeyHasHead, starvedLastKey, starvedLastPopAt, starvedDismissId,
+      Date: { now: () => clock },
+      stickyToast: rec("stickyToast"), osBanner: rec("osBanner"), recordAlarm: rec("recordAlarm"), focusStarvedSeat: rec("focusStarvedSeat"), dismissToast: rec("dismissToast"),
+    };
+    const run = (src: string, name: string, event: unknown, payload: unknown, sid: number) =>
+      new Function("deps", "name", "event", "payload", "sid", `with (deps) {\n${forgetFn}\n${dismissFn}\n${src}\n}\nreturn "fell-through";`)(deps, name, event, payload, sid);
+    const send = (name: string, payload: Record<string, unknown>, slug = "abc", sid = 12) => {
+      const event = { name, socket_slug: slug, surface_id: sid };
+      if (name === "queue.starved") run(branch, name, event, payload, sid);
+      else if ((name === "queue.expired" || name === "queue.revived") && evBranch) run(evBranch, name, event, payload, sid);
+    };
+    return {
+      calls, starvedLastKey, starvedLastPopAt,
+      at: (ms: number) => { clock = 1_000_000 + ms; },
+      wait: (id: unknown, slug = "abc") => send("queue.starved", mk("wait", { head_entry_id: id }), slug),
+      expired: (id: string, slug = "abc") => send("queue.expired", { surface_ref: "surface:12", queue_entry_id: id }, slug),
+      revived: (id: string, slug = "abc") => send("queue.revived", { surface_ref: "surface:12", queue_entry_id: id, already_active: false }, slug),
+      dropped: (ids: string[], slug = "abc") => send("queue.dropped", { reason: "cleared", queue_entry_ids: ids }, slug),
+      human: (id: unknown, slug = "abc") => send("queue.starved", mk("stale_screen", { head_entry_id: id }), slug),
+      pops: () => calls.filter((c) => c.fn === "stickyToast").length,
+      banners: () => calls.filter((c) => c.fn === "osBanner").length,
+    };
+  }
+  it("① wait(X) → expired(X) → revived(X) → wait(X): 새 활성 구간이라 첫 팝업 다시 1회(codex 가 돌린 순서 그대로)", () => {
+    const a = app();
+    a.wait("q-1"); a.expired("q-1"); a.revived("q-1"); a.wait("q-1");
+    expect(a.pops()).toBe(2);
+  });
+  it("② expired(X) 만으로도 그 머리의 기억이 지워지고, revived(X) 만으로도(만료 이벤트를 잃은 경우) 지워진다", () => {
+    const a = app();
+    a.wait("q-1");
+    expect(a.starvedLastKey.size).toBe(1);
+    a.expired("q-1");
+    expect(a.starvedLastKey.size).toBe(0);
+    const b = app();
+    b.wait("q-1"); b.revived("q-1"); b.wait("q-1");
+    expect(b.pops()).toBe(2);
+  });
+  it("③ 대조군: 꼬리 Z 폐기(queue.dropped)·다른 항목 Z 의 만료/되살림은 머리 X 의 기억을 지우지 않는다 — 팝업 1회", () => {
+    const a = app();
+    a.wait("q-1"); a.dropped(["q-9"]); a.expired("q-9"); a.revived("q-9"); a.wait("q-1");
+    expect(a.pops()).toBe(1);
+  });
+  it("④ 다른 소켓(부서)·다른 좌석의 같은 id 사건은 건드리지 않는다", () => {
+    const a = app();
+    a.wait("q-1"); a.expired("q-1", "zzz"); a.wait("q-1");
+    expect(a.pops()).toBe(1);
+  });
+  it("⑤ 이벤트를 모두 잃어도 상한이 있다: 마지막 팝업 뒤 59분 59초는 억제 · 60분부터는 다시 띄운다(조용해지는 쪽으로 무한히 떨어지지 않는다)", () => {
+    const a = app();
+    a.wait("q-1");
+    a.at(60 * MIN - 1000); a.wait("q-1");
+    expect(a.pops()).toBe(1);
+    a.at(60 * MIN); a.wait("q-1");
+    expect(a.pops()).toBe(2);
+    a.at(60 * MIN + 5000); a.wait("q-1"); // 다시 띄운 시각이 새 기준이다
+    expect(a.pops()).toBe(2);
+  });
+  it("⑥ 억제된 갱신은 팝업 시각을 갱신하지 않는다(상한이 흘러간다) · 사람 손은 머리·시계와 무관하게 매번 팝업+배너", () => {
+    const a = app();
+    a.wait("q-1");
+    a.at(30 * MIN); a.wait("q-1");
+    expect(a.starvedLastPopAt.get("starved:abc:surface:12")).toBe(1_000_000);
+    const h = app();
+    h.wait("q-1");
+    for (let k = 1; k <= 3; k++) { h.at(k * 1000); h.human("q-1"); }
+    expect({ 팝업: h.pops(), 배너: h.banners() }).toEqual({ 팝업: 4, 배너: 3 });
+  });
+  it("⑦ 순수: starvedShouldPop(키, 알림, 나이) 표 · starvedKeyHasHead", () => {
+    const n = starvedNotice(mk("wait", { head_entry_id: "q-1" }), "abc")!;
+    expect(starvedShouldPop(n.stateKey, n)).toBe(false);
+    expect(starvedShouldPop(n.stateKey, n, 0)).toBe(false);
+    expect(starvedShouldPop(n.stateKey, n, STARVED_REPOP_MS - 1)).toBe(false);
+    expect(starvedShouldPop(n.stateKey, n, STARVED_REPOP_MS)).toBe(true);
+    const hum = starvedNotice(mk("stale_screen", { head_entry_id: "q-1" }), "abc")!;
+    expect(starvedShouldPop(hum.stateKey, hum, 0)).toBe(true);
+    expect(starvedKeyHasHead(n.stateKey, "q-1")).toBe(true);
+    expect(starvedKeyHasHead(n.stateKey, "q-2")).toBe(false);
+    expect(starvedKeyHasHead(n.stateKey, "q-")).toBe(false);
+    expect(starvedKeyHasHead(undefined, "q-1")).toBe(false);
+    expect(starvedKeyHasHead(n.stateKey, 7)).toBe(false);
+    expect(starvedKeyHasHead(n.stateKey, "")).toBe(false);
+    const noHead = starvedNotice(mk("wait"), "abc")!;
+    expect(starvedKeyHasHead(noHead.stateKey, "q-1")).toBe(false);
+  });
+  it("⑧ 소스 핀: 만료·되살림 분기는 return 하지 않고(다른 처리 보존) forgetStarvedHead 만 부른다", () => {
+    expect(evBranch).toContain("forgetStarvedHead(event.socket_slug, sid, payload.queue_entry_id);");
+    expect(/\n    return;\n  \}\n$/.test(evBranch)).toBe(false);
   });
 });
 });
