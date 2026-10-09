@@ -1,0 +1,38 @@
+
+===== phoenix auto-restore @ epoch=1791570679 (pid cysd=11056) =====
+[phoenix] cys \ucc44\ud0dd(PHOENIX_CYS): C:\Users\runneradmin\AppData\Local\cys\cys.exe — 3\uc911 identity match(build_id=5a9f7be8dcaa proto=1)
+Traceback (most recent call last):
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 2476, in run_restore
+    return _run_restore_locked(socket, ticket=ticket, stub=stub, no_breaker=no_breaker, roles=roles,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 2552, in _run_restore_locked
+    entries, _tombstones = observe_and_persist_roster(socket)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 1453, in observe_and_persist_roster
+    return _observe_and_persist_roster_locked(socket, rebase)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 1530, in _observe_and_persist_roster_locked
+    log("\u2605A-S1: legacy topology(schema_version \ubd80\uc7ac) — \uc870\uac74\ubd80 replace \uc0dd\ub7b5, add-merge \uc720\uc9c0·\ubd80\ud65c \uc815\uc0c1 \uc9c4\ud589.")
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 772, in log
+    sys.stdout.write("[phoenix] %s\n" % msg)
+  File "encodings\cp1252.py", line 19, in encode
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2605' in position 10: character maps to <undefined>
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 4186, in <module>
+    main()
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 4177, in main
+    {
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 3081, in cmd_restore
+    result = run_restore(
+             ^^^^^^^^^^^^
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 2480, in run_restore
+    _release_shared_restore_lease("run_restore \uc885\ub8cc")
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 2408, in _release_shared_restore_lease
+    log("\u2605restore lease(\uacf5\uc720 \ucd95) \uc870\uae30 \ud574\uc81c — \uc2a4\ud3f0 \uad6c\uac04 \uc885\ub8cc%s. \uc774\ud6c4 \uad6c\uac04\uc740 restore.run.lock \uc73c\ub85c\ub9cc \ubc30\ud0c0\ud55c\ub2e4"
+  File "C:\Users\runneradmin\AppData\Local\cys\phoenix-embed\0.14.47-11056-1791570678258808700\bin\javis_phoenix.py", line 772, in log
+    sys.stdout.write("[phoenix] %s\n" % msg)
+  File "encodings\cp1252.py", line 19, in encode
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2605' in position 10: character maps to <undefined>
