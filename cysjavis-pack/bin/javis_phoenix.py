@@ -1266,6 +1266,7 @@ def _prune_corrupt(path, keep=3):
 
 _NOTICE_MAX_FILES = 30          # 격리본 알림이 열어 보는 파일 수 상한(로스터 2종 × 3 + 저널 티켓별 3 을 넉넉히 덮는다)
 _NOTICE_MAX_BYTES = 1 << 20     # 파일당 1 MiB — 로스터·저널의 통상 크기(수 KB)를 크게 웃돈다
+_NOTICE_MAX_LINES = 3           # 로그에 경로를 적는 줄 수 상한(넘는 것은 개수만 한 줄)
 
 
 def _notice_requalified_corrupt(socket):
@@ -1300,9 +1301,11 @@ def _notice_requalified_corrupt(socket):
         except Exception:
             continue  # 진짜 손상본 — 알릴 것이 없다
         found.append(path)
-    for path in found:
+    for path in found[-_NOTICE_MAX_LINES:]:  # 로그는 최근 것 몇 줄만 — 복원 때마다 되풀이되는 알림이 로그를 채우지 않게
         log("★격리본 알림: %s 은 UTF-8 로 읽으면 멀쩡한 JSON 이다 - 앞선 판이 인코딩 오판으로 치운 파일일 수 있다. "
             "자동으로 되돌리지 않는다(내용 확인 뒤 필요하면 사람이 되돌린다)." % path)
+    if len(found) > _NOTICE_MAX_LINES:
+        log("★격리본 알림: 같은 폴더에 그런 파일이 %d개 더 있다(%s)." % (len(found) - _NOTICE_MAX_LINES, home))
     return found
 
 

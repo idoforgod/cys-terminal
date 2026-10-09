@@ -408,7 +408,9 @@ def t_extra(td, child, cond):
     rc, res, _ = run_child(td, child, cond, "log_flush")
     check("%s log(): flush 가 실패해도 죽지 않고 같은 줄을 두 번 쓰지 않는다" % L,
           rc == 0 and bool(res) and res.get("log_flush") == {"oserror": 1, "unicode": 1}, "rc=%s %s exc=%s" % (rc, res and res.get("log_flush"), res and res.get("exc")))
-    rc, res, _ = run_child(td, child, cond, "notice_cap")
+    rc, res, out = run_child(td, child, cond, "notice_cap")
+    check("%s 치워진 파일: 알림 로그는 경로 3줄 + 개수 1줄까지" % L, out.count(b".corrupt-") == 3 and out.count(b"\n") == 4,
+          "paths=%d lines=%d" % (out.count(b".corrupt-"), out.count(b"\n")))
     check("%s 치워진 파일: 알림이 여는 격리본을 30개·1 MiB 로 묶고 아무것도 지우지 않는다" % L,
           bool(res) and res.get("notice_n") == 29 and res.get("notice_has_big") is False and res.get("notice_left") == 36,  # 36개 중 최근 30개를 살피고 그 안의 큰 파일 1개는 건너뛴다
           "n=%s big=%s left=%s exc=%s" % (res and res.get("notice_n"), res and res.get("notice_has_big"), res and res.get("notice_left"), res and res.get("exc")))
