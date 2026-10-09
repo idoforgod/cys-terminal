@@ -6370,29 +6370,94 @@ mod b_textcmd_retired_gate {
         }
     }
 
+    // ★F3(BR2-F1): 원자료 판독이 받아들이는 범위는 승인 경로의 typed 디코더(`ApprovalRecord`)가 받아들이는 범위의 부분집합이다 —
+    // 필수 필드가 빠진 레코드는 접두만 맞아도 「흔적 없음」이 아니라 판독 불능(Err)이다.
+    fn full_record_json(cmd: &str, empty_prefix: bool) -> Value {
+        let mut r = matching_record(cmd, None);
+        if empty_prefix {
+            r.command_prefix = Vec::new();
+        }
+        serde_json::to_value(&r).expect("레코드 직렬화")
+    }
+
     #[test]
     fn approval_raw_has_prefix_trace_cases() {
         let toks = vec!["python3".to_string(), "job.py".to_string()];
-        let cases: &[(&str, Option<&[u8]>, Result<bool, ()>)] = &[
+        let py = full_record_json("python3 job.py", false);
+        let echo = full_record_json("echo hi", false);
+        let bytes = |v: Value| Some(serde_json::to_vec(&v).expect("검체 직렬화"));
+        let cases: Vec<(&str, Option<Vec<u8>>, Result<bool, ()>)> = vec![
             ("absent", None, Ok(false)),
-            ("empty", Some(b""), Ok(false)),
-            ("whitespace", Some(b" \t\r\n"), Ok(false)),
-            ("empty-records", Some(br#"{"records":[]}"#), Ok(false)),
-            ("array-match", Some(br#"[{"command_prefix":["python3"]}]"#), Ok(true)),
-            ("object-mismatch", Some(br#"{"records":[{"command_prefix":["echo"]}]}"#), Ok(false)),
-            ("broken-json", Some(b"{broken-json"), Err(())),
-            ("invalid-utf8", Some(b"\xff"), Err(())),
-            ("records-object", Some(br#"{"records":{}}"#), Err(())),
-            ("records-missing", Some(b"{}"), Err(())),
-            ("non-object-record", Some(b"[null]"), Err(())),
-            ("prefix-missing", Some(br#"{"records":[{}]}"#), Err(())),
-            ("prefix-not-array", Some(br#"[{"command_prefix":"python3"}]"#), Err(())),
-            ("prefix-mixed-types", Some(br#"[{"command_prefix":["python3","job.py",3]}]"#), Err(())),
-            ("match-then-malformed", Some(br#"[{"command_prefix":["python3"]},{}]"#), Err(())),
-            ("empty-prefix", Some(br#"{"records":[{"command_prefix":[]}]}"#), Ok(false)),
+            ("empty", Some(b"".to_vec()), Ok(false)),
+            ("whitespace", Some(b" \t\r\n".to_vec()), Ok(false)),
+            ("empty-records", Some(br#"{"records":[]}"#.to_vec()), Ok(false)),
+            ("array-match", bytes(json!([py.clone()])), Ok(true)),
+            ("object-match", bytes(json!({"records": [py.clone()]})), Ok(true)),
+            ("object-mismatch", bytes(json!({"records": [echo.clone()]})), Ok(false)),
+            ("match-then-mismatch", bytes(json!([py.clone(), echo.clone()])), Ok(true)),
+            ("empty-prefix", bytes(json!({"records": [full_record_json("python3 job.py", true)]})), Ok(false)),
+            ("broken-json", Some(b"{broken-json".to_vec()), Err(())),
+            ("invalid-utf8", Some(b"\xff".to_vec()), Err(())),
+            ("records-object", Some(br#"{"records":{}}"#.to_vec()), Err(())),
+            ("records-missing", Some(b"{}".to_vec()), Err(())),
+            ("non-object-record", Some(b"[null]".to_vec()), Err(())),
+            ("prefix-missing", Some(br#"{"records":[{}]}"#.to_vec()), Err(())),
+            ("prefix-not-array", Some(br#"[{"command_prefix":"python3"}]"#.to_vec()), Err(())),
+            ("prefix-mixed-types", Some(br#"[{"command_prefix":["python3","job.py",3]}]"#.to_vec()), Err(())),
+            ("match-then-malformed", bytes(json!([py.clone(), {}])), Err(())),
+            // BR2-F1: 접두만 있는 불완전 레코드(필수 필드 없음)는 typed 디코더가 거부한다 — 흔적 없음으로 받으면 안 된다.
+            ("incomplete-mismatch", Some(br#"{"records":[{"command_prefix":["echo"]}]}"#.to_vec()), Err(())),
+            ("incomplete-match", Some(br#"[{"command_prefix":["python3"]}]"#.to_vec()), Err(())),
+            ("missing-signature", {
+                let mut v = py.clone();
+                v.as_object_mut().expect("레코드 객체").remove("signature");
+                bytes(json!([v]))
+            }, Err(())),
+            ("wrong-type-created_at", {
+                let mut v = py.clone();
+                v["created_at"] = json!("x");
+                bytes(json!([v]))
+            }, Err(())),
         ];
-        for &(case, raw, expected) in cases {
-            assert_eq!(approval_raw_has_prefix_trace(raw, &toks), expected, "{case}");
+        for (case, raw, expected) in &cases {
+            assert_eq!(approval_raw_has_prefix_trace(raw.as_deref(), &toks), *expected, "{case}");
+        }
+    }
+
+    // raw 수용 ⊆ typed 수용: 원자료 판독이 Ok 인 모든 검체를 승인 경로의 읽기(`try_load_records`)도 받아들인다.
+    #[test]
+    fn approval_raw_acceptance_is_a_subset_of_the_typed_decoder() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = TempRoot::new("raw-subset-of-typed");
+        let _store = approval::tests::with_store_root(&root.0);
+        let cys = root.0.join(".cys");
+        std::fs::create_dir(&cys).expect("시험 승인 디렉터리");
+        let main_path = cys.join("approvals.json");
+        let toks = vec!["python3".to_string(), "job.py".to_string()];
+        let py = full_record_json("python3 job.py", false);
+        let mut corpus: Vec<Vec<u8>> = vec![
+            b"".to_vec(), b"  ".to_vec(), b"{}".to_vec(), b"[]".to_vec(), b"null".to_vec(), b"[null]".to_vec(), b"{broken".to_vec(),
+            br#"{"records":[]}"#.to_vec(), br#"{"records":{}}"#.to_vec(), br#"{"records":[{}]}"#.to_vec(),
+            br#"{"records":[{"command_prefix":["echo"]}]}"#.to_vec(), br#"[{"command_prefix":["python3"]}]"#.to_vec(),
+            br#"[{"command_prefix":["python3"],"cwd":null}]"#.to_vec(),
+            serde_json::to_vec(&json!([py])).unwrap(), serde_json::to_vec(&json!({"records": [py]})).unwrap(),
+            serde_json::to_vec(&json!({"records": [full_record_json("echo hi", false), {"command_prefix": ["echo"]}]})).unwrap(),
+            serde_json::to_vec(&json!({"records": [full_record_json("python3 job.py", true)]})).unwrap(),
+        ];
+        // 필드 하나씩 빼거나 타입을 바꾼 변형
+        for key in ["version", "id", "command_prefix", "cwd", "environment", "created_at", "updated_at", "signature"] {
+            let mut v = py.clone();
+            v.as_object_mut().expect("레코드 객체").remove(key);
+            corpus.push(serde_json::to_vec(&json!([v])).unwrap());
+            let mut w = py.clone();
+            w[key] = json!(true);
+            corpus.push(serde_json::to_vec(&json!({"records": [w]})).unwrap());
+        }
+        for (n, raw) in corpus.iter().enumerate() {
+            std::fs::write(&main_path, raw).expect("검체 기록");
+            let raw_ok = approval_raw_has_prefix_trace(Some(raw), &toks).is_ok();
+            let typed_ok = approval::try_load_records().is_ok();
+            assert!(!raw_ok || typed_ok, "검체 {n}: 원자료 판독은 받았는데 typed 디코더는 거부한다: {}", String::from_utf8_lossy(raw));
         }
     }
 
@@ -6449,6 +6514,37 @@ mod b_textcmd_retired_gate {
         assert!(TEST_AFTER_FIRST_TTL_READ.lock().unwrap_or_else(|e| e.into_inner()).is_none());
         assert!(!retired_text_command_confirmed_unapproved(&cmd), "이주 뒤 TTL 흔적을 놓쳤다");
         assert_eq!(hook_calls.load(Ordering::Relaxed), 1, "훅은 한 번만 실행한다");
+    }
+
+    // BR2-F1: 구조(typed)를 검사한 뒤 main 이 「필수 필드가 없는 접두 echo 레코드」로 한 번 원자 교체돼도 건너뛰지 않는다(오류 유지).
+    #[test]
+    fn retired_gate_does_not_skip_when_a_malformed_record_replaces_the_store_after_the_structure_check() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = TempRoot::new("malformed-swap-after-structure-check");
+        let _store = approval::tests::with_store_root(&root.0);
+        let _env = WithoutSecretEnv::new();
+        let cys = root.0.join(".cys");
+        std::fs::create_dir(&cys).expect("시험 승인 디렉터리");
+        let _secret = approval::signing_secret().expect("시험 루트 시크릿");
+        let (_, cmd) = retired_seed_texts().into_iter().next().expect("은퇴 시드 문구");
+        let ttl_path = cys.join("approvals-ttl.json");
+        let main_path = cys.join("approvals.json");
+        let mut old = matching_record(&cmd, None);
+        old.expires_at = Some(1.0); // 이미 만료 — 흔적은 있으나 유효 승인은 아니다
+        std::fs::write(&ttl_path, br#"{"records":[]}"#).expect("빈 TTL 저장소");
+        std::fs::write(&main_path, serde_json::to_vec(&json!({"records": [old]})).unwrap()).expect("만료 레코드가 든 main");
+        let (swap_tmp, swap_to) = (cys.join("approvals.json.swap"), main_path.clone());
+        let hook_calls = Arc::new(AtomicU64::new(0));
+        let calls = Arc::clone(&hook_calls);
+        let _hook = AfterFirstTtlRead::new(move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            std::fs::write(&swap_tmp, br#"{"records":[{"command_prefix":["echo"]}]}"#).expect("손상 레코드 임시 파일");
+            std::fs::rename(&swap_tmp, &swap_to).expect("main 원자 교체");
+        });
+        assert!(!retired_text_command_confirmed_unapproved(&cmd), "구조 검사 뒤 손상 레코드로 바뀐 main 을 흔적 없음으로 받아 건너뛴다");
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1, "첫 TTL 판독 뒤 교체 훅 실행 전제");
+        // 대조군: 같은 손상 파일이 처음부터 있었다면 오류 유지(종전부터)
+        assert!(!retired_text_command_confirmed_unapproved(&cmd), "처음부터 손상이면 오류 유지");
     }
 
     // 마커 유무와 무관하게 시드의 모든 text_command가 신뢰 또는 은퇴 목록에 있어야 한다.
