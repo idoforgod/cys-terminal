@@ -181,7 +181,7 @@ function Save-AppEvidence {
             foreach ($f in $files) {
                 [void]$sb.AppendLine(('{0}  {1,12}  {2}' -f (ConvertTo-IsoUtc $f.LastWriteTime), $f.Length, $f.FullName.Substring($root.Length)))
                 $ext = [string]$f.Extension
-                if (($n -lt 15) -and ($f.Length -le 204800) -and (($ext -eq '.log') -or ($ext -eq '.txt')) -and ($f.LastWriteTime -gt $cutoff)) {
+                if ((($n -lt 15) -or ($f.Name -eq 'office-bridge.log')) -and ($f.Length -le 204800) -and (($ext -eq '.log') -or ($ext -eq '.txt')) -and ($f.LastWriteTime -gt $cutoff)) {
                     $n++
                     $dest = Join-Path $global:DiagOut ('{0}-appfile-{1:D2}-{2}' -f $Prefix, $n, $f.Name)
                     try { Copy-Item -LiteralPath $f.FullName -Destination $dest -Force -ErrorAction Stop; $copied.Add([string]$f.FullName) } catch { }
