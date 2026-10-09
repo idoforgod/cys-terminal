@@ -1077,7 +1077,7 @@ def read_topology(socket):
     if not os.path.exists(p):
         return {"entries": [], "updated_at": 0, "_path": p, "_missing": True}
     try:
-        t = json.load(open(p))
+        t = json.load(open(p, encoding="utf-8"))
         t["_path"] = p
         return t
     except Exception as e:
@@ -1098,7 +1098,7 @@ def _roster_file_status(path):
     if not os.path.exists(path):
         return "missing"
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             json.load(f)
         return "valid"
     except Exception:
@@ -1113,7 +1113,7 @@ def load_desired_roster(socket):
     p = desired_roster_path(socket)
     if os.path.exists(p):
         try:
-            d = json.load(open(p))
+            d = json.load(open(p, encoding="utf-8"))
             return d.get("roster", {}), set(d.get("tombstones", []))
         except Exception:
             # ★C2: 손상은 침묵 빈집합이 아니라 로그(sentinel 이 run_restore 진입에서 부활 차단). 전체 복원 체인=W3.
@@ -1140,7 +1140,7 @@ def _snapshot_roster_entries(socket):
         tp = os.path.join(gen_root, g, "topology.json")
         if os.path.exists(tp):
             try:
-                t = json.load(open(tp))
+                t = json.load(open(tp, encoding="utf-8"))
                 return {e["role"]: e for e in t.get("entries", []) if e.get("role")}
             except Exception:
                 continue
@@ -1161,7 +1161,7 @@ def _snapshot_tombstones(socket):
         tp = os.path.join(gen_root, g, "topology.json")
         if os.path.exists(tp):
             try:
-                t = json.load(open(tp))
+                t = json.load(open(tp, encoding="utf-8"))
                 return set(x for x in t.get("tombstones", []) if isinstance(x, str))
             except Exception:
                 continue
@@ -1470,7 +1470,7 @@ def _observe_and_persist_roster_locked(socket, rebase=False):
     try:
         _dp = desired_roster_path(socket)
         if os.path.exists(_dp):
-            prev = json.load(open(_dp))
+            prev = json.load(open(_dp, encoding="utf-8"))
     except Exception:
         prev = {}
     last_seen_rev = prev.get("tombstones_rev")
@@ -1647,7 +1647,7 @@ def load_dept_roster(socket):
     p = dept_roster_path(socket)
     if os.path.exists(p):
         try:
-            d = json.load(open(p))
+            d = json.load(open(p, encoding="utf-8"))
             return d.get("roster", {}), set(d.get("tombstones", []))
         except Exception:
             pass
@@ -1674,7 +1674,7 @@ def _observe_and_persist_depts_locked(socket, rebase=False):
     try:
         _dp = dept_roster_path(socket)
         if os.path.exists(_dp):
-            _prev_prov = json.load(open(_dp)).get("recovered_from")
+            _prev_prov = json.load(open(_dp, encoding="utf-8")).get("recovered_from")
     except Exception:
         _prev_prov = None
     for dept, info in discover_depts().items():
@@ -1797,7 +1797,7 @@ def load_journal(socket, ticket_id):
     p = journal_path(socket, ticket_id)
     if os.path.exists(p):
         try:
-            return json.load(open(p))
+            return json.load(open(p, encoding="utf-8"))
         except Exception as _e:
             # ★C2 2단계 보조상태(W3): 저널은 retention-critical 이 아니다(단계 진행 캐시 — 소실 시 재수행). 손상 시
             #   hard-fail 하지 않고 격리(.corrupt-<ts>·최근3)+경고 후 fresh 로 시작한다. 단 '침묵 삼킴'(try:pass)은
@@ -1862,7 +1862,7 @@ def breaker_check_and_record(socket):
     attempts = []
     if os.path.exists(p):
         try:
-            attempts = json.load(open(p)).get("attempts", [])
+            attempts = json.load(open(p, encoding="utf-8")).get("attempts", [])
         except Exception:
             isolated = _isolate_corrupt(p)  # 손상 격리(.corrupt-<ts>·최근3 prune)
             log("★P2-6: breaker.json 손상 — 격리(%s) 후 빈 카운트 재시작(침묵 리셋 아님·경고). "
@@ -3230,7 +3230,7 @@ def _read_worker_todo():
     per_file, last_section = [], None
     for cand in files:
         try:
-            txt = open(cand, errors="replace").read()
+            txt = open(cand, encoding="utf-8", errors="replace").read()
         except OSError:
             continue
         o, d = txt.count("- [ ]"), txt.count("- [x]")
@@ -3263,7 +3263,7 @@ def cmd_status(args):
     home = phoenix_home(socket)
     journals = [f for f in os.listdir(home) if f.startswith("journal-")] if os.path.isdir(home) else []
     bp = breaker_file(socket)
-    breaker = json.load(open(bp)) if os.path.exists(bp) else {"attempts": []}
+    breaker = json.load(open(bp, encoding="utf-8")) if os.path.exists(bp) else {"attempts": []}
     now = _now()
     recent = [t for t in breaker.get("attempts", []) if now - t <= BREAKER_T]
     st = {
@@ -3294,12 +3294,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 TOPO="$HERE/topology.json"
 echo "== 불사조 수동 복원 (세대: $HERE) =="
 if [ ! -f "$TOPO" ]; then echo "!! topology.json 없음 — 복원 불가"; exit 1; fi
-echo "재건 대상 역할:"; python3 -c "import json;[print(' -',e['role'],'/',e.get('agent'),'/ sid',e.get('session_id')) for e in json.load(open('$TOPO'))['entries']]"
+echo "재건 대상 역할:"; python3 -c "import json;[print(' -',e['role'],'/',e.get('agent'),'/ sid',e.get('session_id')) for e in json.load(open('$TOPO', encoding='utf-8'))['entries']]"
 echo ""
 echo "아래 명령을 한 줄씩 확인 후 실행하라(순차 기동 — 동시 resume 폭주 방지 §10.4):"
 python3 - "$TOPO" <<'PY'
 import json,sys
-t=json.load(open(sys.argv[1]))
+t=json.load(open(sys.argv[1], encoding='utf-8'))
 for e in t.get('entries',[]):
     role=e['role']; agent=e.get('agent','claude')
     print("cys launch-agent --role %s --agent %s   # 기동 후 각성 확인, 필요시 cys reinject --role %s" % (role, agent, role))
@@ -3319,7 +3319,7 @@ def cmd_gen_manual(args):
     _atomic_write_json(os.path.join(dest, "topology.json"),
                        {"entries": topo.get("entries", []), "updated_at": topo.get("updated_at", 0)})
     sp = os.path.join(dest, "manual_restore.sh")
-    with open(sp, "w") as f:
+    with open(sp, "w", encoding="utf-8") as f:
         f.write(MANUAL_RESTORE_TEMPLATE)
     os.chmod(sp, 0o755)
     out = {"manual_restore_script": sp, "topology_copy": os.path.join(dest, "topology.json"),
@@ -3376,7 +3376,7 @@ def cmd_gen_protect(args):
 done
 echo "※ hook 사망=조용한 해제 방향이므로 hook 생존을 신뢰 원장의 감시 항목에 포함할 것(§11.2 meta-drill)."
 '''
-    with open(dest, "w") as f:
+    with open(dest, "w", encoding="utf-8") as f:
         f.write(body)
     os.chmod(dest, 0o755)
     out = {"protect_script": dest, "applied": False, "mode": "dry-run",
@@ -3653,7 +3653,7 @@ def load_deploy_journal(socket, ticket):
     p = deploy_journal_path(socket, ticket)
     if os.path.exists(p):
         try:
-            return json.load(open(p))
+            return json.load(open(p, encoding="utf-8"))
         except Exception:
             # ★C2 2단계 보조상태(W3): deploy 저널도 재개 캐시(비 retention) — 손상 시 격리+경고 후 fresh.
             isolated = _isolate_corrupt(p)
@@ -3795,7 +3795,7 @@ def _deploy_snapshot(socket, roster):
         # ★.ps1 은 PowerShell 로 실행 — 실행권한 비트(chmod) 개념 없음(생략).
     else:
         runbook = os.path.join(gen_dir, "MANUAL_RESTORE.sh")
-        with open(runbook, "w") as f:
+        with open(runbook, "w", encoding="utf-8") as f:
             f.write(_render_deploy_runbook(roster))
         os.chmod(runbook, 0o755)
     return {"ok": bool(gen_name), "gen_root": gen_root, "gen": gen_name, "gen_dir": gen_dir,
