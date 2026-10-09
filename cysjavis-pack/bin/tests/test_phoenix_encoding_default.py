@@ -111,6 +111,14 @@ try:
         m.cmd_gen_manual(a)
         raw = builtins.open(os.path.join(work, "manual", "manual_restore.sh"), "rb").read()
         res["manual_utf8_ok"] = raw.decode("utf-8") == m.MANUAL_RESTORE_TEMPLATE
+        # 만든 스크립트를 실제로 돌린다 — 그 안의 python3 는 별도 프로세스라 부모의 재설정을 물려받지 않는다.
+        #   터미널이 한글을 못 쓰는 코드페이지(cp1252 · strict)여도 복원 명령 줄이 끝까지 나와야 한다.
+        import shutil, subprocess
+        if os.name != "nt" and shutil.which("bash") and shutil.which("python3"):
+            seed(os.path.join(work, "manual", "topology.json"), {"entries": [{"role": "worker", "agent": "claude", "session_id": "s1"}]})
+            env = dict(os.environ, PYTHONIOENCODING="cp1252:strict")
+            pr = subprocess.run(["bash", os.path.join(work, "manual", "manual_restore.sh")], capture_output=True, env=env, timeout=60)
+            res["manual_run"] = [b"cys launch-agent --role worker --agent claude" in pr.stdout, b"UnicodeEncodeError" not in pr.stderr]
     elif scenario == "status_recv":
         # 가짜 cys — 좌석 제목·작업 폴더에 한글·줄표가 든 UTF-8 JSON 을 낸다(Rust CLI 의 출력 계약과 같은 바이트).
         payload = os.path.join(work, "status.json")
@@ -172,6 +180,60 @@ try:
             res["locale_pref"] = locale.getpreferredencoding(False)
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 res["verify_old_cp949"] = snap.do_verify(gen_root=gen_root)
+            # 「징」의 cp949 바이트(c2 a1)는 UTF-8 로도 읽힌다(¡) — 디코딩 성공만 믿으면 저장 파일 이름이 조용히 바뀐다.
+            try:
+                amb = os.path.join(srcdir, "징.md")
+                with builtins.open(amb, "wb") as f: f.write(b"x")
+            except (OSError, UnicodeError):
+                amb = None                 # 이 파일 시스템이 그 이름을 못 쓴다 — 이 칸은 재지 않는다
+            if amb:
+                gen2 = os.path.join(work, "gens2")
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    name2 = snap.do_snapshot(sources=[amb], gen_root=gen2)
+                mp2 = os.path.join(gen2, name2, "manifest.json")
+                o2 = json.loads(builtins.open(mp2, "rb").read().decode("utf-8"))
+                for e in o2.get("files", []): e["source"] = "/Users/x/징.md"
+                with builtins.open(mp2, "wb") as f: f.write(json.dumps(o2, indent=2, ensure_ascii=False).encode("cp949"))
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    res["verify_ambiguous_cp949"] = snap.do_verify(gen_root=gen2)
+    elif scenario == "emit_child":
+        # 진짜 _emit_evt — 형제 javis_event.py 자리에 「어느 인코딩으로도 풀리지 않는 바이트」를 내는 가짜를 둔다(버스에 닿지 않는다).
+        spec2 = importlib.util.spec_from_file_location("javis_phoenix_evt", ph); m2 = importlib.util.module_from_spec(spec2); spec2.loader.exec_module(m2)
+        fdir = os.path.join(work, "evt"); os.makedirs(fdir)
+        with builtins.open(os.path.join(fdir, "javis_event.py"), "wb") as f:
+            f.write(b"import sys\nsys.stdout.buffer.write(b'\\xff\\x81\\xff\\x81 \\xed\\x95\\x9c\\n'); sys.stdout.buffer.flush()\nsys.exit(0)\n")
+        m2.__file__ = os.path.join(fdir, "javis_phoenix.py")
+        res["emit_ok"] = m2._emit_evt("test.event", note=KO)
+    elif scenario == "log_flush":
+        class S:
+            encoding = "utf-8"
+            def __init__(self): self.w = []
+            def write(self, t): self.w.append(t)
+            def flush(self): raise OSError("disk full")
+        class U(S):
+            def flush(self): raise UnicodeEncodeError("x", "y", 0, 1, "flush")
+        out = {}
+        for nm, cls in (("oserror", S), ("unicode", U)):
+            st = cls(); keep = sys.stdout; sys.stdout = st
+            try:
+                m.log(KO); out[nm] = len(st.w)
+            except Exception as e:
+                out[nm] = type(e).__name__
+            finally:
+                sys.stdout = keep
+        res["log_flush"] = out
+    elif scenario == "notice_cap":
+        notice = getattr(m, "_notice_requalified_corrupt", None)
+        for i in range(35):
+            seed(m.journal_path(sock, "t%02d" % i) + ".corrupt-20260101T0000%02d-000001" % i, {"ticket_id": "t", "events": []})
+        big = m.desired_roster_path(sock) + ".corrupt-20260101T000059-000001"
+        with builtins.open(big, "wb") as f: f.write(b'{"roster": {}, "pad": "' + b"a" * (1 << 20) + b'"}')
+        got = None if notice is None else [os.path.basename(x) for x in notice(sock)]
+        res["notice_n"] = None if got is None else len(got)
+        res["notice_has_big"] = None if got is None else (os.path.basename(big) in got)
+        res["notice_left"] = len([f for f in os.listdir(home) if ".corrupt-" in f])
+        with io.open(resfile, "w", encoding="ascii") as f: json.dump(res, f, ensure_ascii=True)
+        sys.stdout.flush(); os._exit(0)
     elif scenario == "tombstone":
         force = getattr(m, "_force_utf8_stdio", None)
         if force: force()
@@ -294,6 +356,8 @@ def t_gen_manual(td, child, cond):
     L = label(cond)
     check("%s gen-manual: 수동 복구 스크립트를 UTF-8 로 쓴다" % L, rc == 0 and bool(res) and res.get("manual_utf8_ok") is True,
           "rc=%s exc=%s" % (rc, res and res.get("exc")))
+    if res and res.get("manual_run") is not None:
+        check("%s gen-manual: 만든 스크립트가 cp1252 터미널에서도 복원 명령 줄을 끝까지 낸다" % L, res.get("manual_run") == [True, True], str(res.get("manual_run")))
 
 
 def t_status_recv(td, child, cond):
@@ -321,6 +385,9 @@ def t_manifest(td, child, cond):
           "rc=%s utf8=%s verify=%s exc=%s" % (rc, res and res.get("manifest_utf8"), res and res.get("verify_new"), res and res.get("exc")))
     if res and _norm(res.get("locale_pref")) == "cp949":
         check("%s 스냅샷 manifest: 과거 cp949 로 쓰인 것도 읽는다" % L, res.get("verify_old_cp949") == 0, "verify_old=%s" % res.get("verify_old_cp949"))
+    if res and _norm(res.get("open_default")) == "cp949" and res.get("verify_ambiguous_cp949") is not None:
+        check("%s 스냅샷 manifest: UTF-8 로도 읽히는 cp949 이름(징.md)을 저장 파일로 가려 읽는다" % L, res.get("verify_ambiguous_cp949") == 0,
+              "verify=%s" % res.get("verify_ambiguous_cp949"))
 
 
 def t_tombstone(td, child, cond):
@@ -331,6 +398,20 @@ def t_tombstone(td, child, cond):
     check("%s 치워진 파일: 멀쩡히 읽히는 격리본을 알리되 건드리지 않는다" % L,
           bool(res) and res.get("notice") == ["desired_roster.json.corrupt-20260101T000000-000001"] and res.get("parked_still_there") is True,
           "notice=%s still=%s" % (res and res.get("notice"), res and res.get("parked_still_there")))
+
+
+def t_extra(td, child, cond):
+    L = label(cond)
+    rc, res, _ = run_child(td, child, cond, "emit_child")
+    check("%s 이벤트 자식: 어느 인코딩으로도 안 풀리는 출력을 내도 _emit_evt 가 예외 없이 종료코드만 본다" % L,
+          rc == 0 and bool(res) and res.get("emit_ok") is True, "rc=%s emit=%s exc=%s" % (rc, res and res.get("emit_ok"), res and res.get("exc")))
+    rc, res, _ = run_child(td, child, cond, "log_flush")
+    check("%s log(): flush 가 실패해도 죽지 않고 같은 줄을 두 번 쓰지 않는다" % L,
+          rc == 0 and bool(res) and res.get("log_flush") == {"oserror": 1, "unicode": 1}, "rc=%s %s exc=%s" % (rc, res and res.get("log_flush"), res and res.get("exc")))
+    rc, res, _ = run_child(td, child, cond, "notice_cap")
+    check("%s 치워진 파일: 알림이 여는 격리본을 30개·1 MiB 로 묶고 아무것도 지우지 않는다" % L,
+          bool(res) and res.get("notice_n") == 29 and res.get("notice_has_big") is False and res.get("notice_left") == 36,  # 36개 중 최근 30개를 살피고 그 안의 큰 파일 1개는 건너뛴다
+          "n=%s big=%s left=%s exc=%s" % (res and res.get("notice_n"), res and res.get("notice_has_big"), res and res.get("notice_left"), res and res.get("exc")))
 
 
 def t_source_pins():
@@ -438,6 +519,7 @@ def main():
             t_native_recv(td, child, cond)
             t_manifest(td, child, cond)
             t_tombstone(td, child, cond)
+            t_extra(td, child, cond)
         t_source_pins()
         t_e2e_daemon(td, conds)
     finally:

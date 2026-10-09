@@ -790,19 +790,17 @@ def _force_utf8_stdio():
 def log(msg):
     line = "[phoenix] %s\n" % msg
     try:
-        sys.stdout.write(line)
-        sys.stdout.flush()
-    except UnicodeEncodeError:
-        # ★(0.14.48 · A) `main()` 을 거치지 않은 호출(이 모듈을 import 해 쓰는 경로)은 stdout 이 재설정돼 있지 않다 —
-        #   그 스트림이 못 쓰는 글자는 이스케이프로 바꿔 남긴다. 진단 한 줄 때문에 복원이 죽지 않는다.
         try:
+            sys.stdout.write(line)
+        except UnicodeEncodeError:
+            # ★(0.14.48 · A) `main()` 을 거치지 않은 호출(이 모듈을 import 해 쓰는 경로)은 stdout 이 재설정돼 있지 않다 —
+            #   그 스트림이 못 쓰는 글자는 이스케이프로 바꿔 남긴다. 진단 한 줄 때문에 복원이 죽지 않는다.
+            #   (다시 쓰는 것은 write 가 실패했을 때뿐이다 — flush 실패로는 같은 줄을 두 번 쓰지 않는다.)
             enc = getattr(sys.stdout, "encoding", None) or "ascii"
             sys.stdout.write(line.encode(enc, "backslashreplace").decode(enc, "replace"))
-            sys.stdout.flush()
-        except Exception:
-            pass
-    except (ValueError, AttributeError, OSError):
-        pass  # 닫혔거나 없는 스트림 — 쓸 곳이 없다(버린다 · 죽지 않는다)
+        sys.stdout.flush()
+    except (ValueError, AttributeError, OSError, LookupError):
+        pass  # 진단 스트림에 쓰지 못함(닫힘 · 없음 · write/flush 의 OSError) — 버린다 · 죽지 않는다
 
 
 def _emit_evt(evt_type, **fields):
@@ -946,8 +944,9 @@ def _decode_captured(b):
 def _dec_any(b):
     """★(0.14.48 · A) 상대가 **무슨 인코딩으로 쓰는지 정해져 있지 않은** 출력(운영체제 도구 · 사용자가 준 셸 명령 ·
     자식 파이썬)을 예외 없이 문자열로 만든다. UTF-8 로 먼저 풀고, 안 되면 시스템 기본 인코딩으로 대체 문자와 함께 푼다.
-    글자는 표시·세대 이름 추출에만 쓰고 성패는 호출처가 종료코드로 본다 — 여기서 예외가 나면 이미 실행된 명령의
-    종료코드까지 잃는다. (Rust CLI 출력처럼 UTF-8 이 계약인 자리는 `_decode_captured` 를 쓴다.)"""
+    글자는 표시 · 세대 이름(숫자·영문) 추출 · ASCII 표지(KeepAlive·RunAtLoad) 검색에만 쓰고 — 셋 다 ASCII 라 오독에
+    영향받지 않는다 — 성패는 호출처가 종료코드로 본다. 여기서 예외가 나면 이미 실행된 명령의 종료코드까지 잃는다.
+    글자의 정확성은 약속하지 않는다(두 인코딩 모두에서 유효한 바이트는 UTF-8 로 읽힌다). (Rust CLI 출력처럼 UTF-8 이 계약인 자리는 `_decode_captured` 를 쓴다.)"""
     if b is None:
         return ""
     if not isinstance(b, bytes):
@@ -1265,25 +1264,37 @@ def _prune_corrupt(path, keep=3):
             pass
 
 
+_NOTICE_MAX_FILES = 30          # 격리본 알림이 열어 보는 파일 수 상한(로스터 2종 × 3 + 저널 티켓별 3 을 넉넉히 덮는다)
+_NOTICE_MAX_BYTES = 1 << 20     # 파일당 1 MiB — 로스터·저널의 통상 크기(수 KB)를 크게 웃돈다
+
+
 def _notice_requalified_corrupt(socket):
     """★(0.14.48 · A) 앞선 판(0.14.44~0.14.47)은 기본 인코딩이 UTF-8 이 아닌 기계에서 **멀쩡한** 로스터·저널을 못 읽어
     `.corrupt-<시각>` 으로 치웠다. 그렇게 치워진 것 가운데 UTF-8 로 읽으면 유효한 JSON 인 격리본을 찾아 한 줄씩 알린다.
-    **되돌리지 않는다** — 격리본이 지금 상태보다 낡았을 수 있고, 묘비의 원본은 데몬의 topology 다. 사람이 내용을 보고 정한다.
-    파일은 건드리지 않는다(읽기만). 반환 = 알린 경로 목록(시험용)."""
+    **되돌리지 않는다** — 격리본이 지금 상태보다 낡았을 수 있고, 역할 묘비의 원본은 데몬의 topology 다(부서 묘비는
+    dept_roster 가 원본). 사람이 내용을 보고 정한다. 파일은 건드리지 않는다(읽기만). 반환 = 알린 경로 목록(시험용).
+    · 복원 잠금을 쥔 채 도는 덤 알림이라 일의 양을 묶는다: 이름순 최근 `_NOTICE_MAX_FILES` 개 · 파일당 `_NOTICE_MAX_BYTES` 까지만
+      열어 본다(넘는 것은 건너뛴다 — 알림이 빠질 뿐 복원 판정에는 쓰이지 않는다)."""
     found = []
     try:
         home = phoenix_home(socket)
         names = sorted(os.listdir(home))
     except Exception:
         return found
+    cands = []
     for name in names:
         if ".corrupt-" not in name:
             continue
         base = name.split(".corrupt-", 1)[0]
         if not (base in ("desired_roster.json", "dept_roster.json") or (base.startswith("journal-") and base.endswith(".json"))):
             continue
+        cands.append(name)
+    cands.sort(key=lambda n: n.split(".corrupt-", 1)[1])  # 격리 시각 순(이름 규약) — 최근 것부터 남긴다
+    for name in sorted(cands[-_NOTICE_MAX_FILES:]):
         path = os.path.join(home, name)
         try:
+            if os.path.getsize(path) > _NOTICE_MAX_BYTES:
+                continue
             with open(path, encoding="utf-8") as f:
                 json.load(f)
         except Exception:
@@ -3387,11 +3398,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 TOPO="$HERE/topology.json"
 echo "== 불사조 수동 복원 (세대: $HERE) =="
 if [ ! -f "$TOPO" ]; then echo "!! topology.json 없음 — 복원 불가"; exit 1; fi
-echo "재건 대상 역할:"; python3 -c "import json;[print(' -',e['role'],'/',e.get('agent'),'/ sid',e.get('session_id')) for e in json.load(open('$TOPO', encoding='utf-8'))['entries']]"
+echo "재건 대상 역할:"; python3 -c "import json,sys;sys.stdout.reconfigure(errors='backslashreplace');[print(' -',e['role'],'/',e.get('agent'),'/ sid',e.get('session_id')) for e in json.load(open('$TOPO', encoding='utf-8'))['entries']]"
 echo ""
 echo "아래 명령을 한 줄씩 확인 후 실행하라(순차 기동 — 동시 resume 폭주 방지 §10.4):"
 python3 - "$TOPO" <<'PY'
 import json,sys
+sys.stdout.reconfigure(errors='backslashreplace')
 t=json.load(open(sys.argv[1], encoding='utf-8'))
 for e in t.get('entries',[]):
     role=e['role']; agent=e.get('agent','claude')
