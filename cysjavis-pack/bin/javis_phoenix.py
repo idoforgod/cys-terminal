@@ -46,6 +46,7 @@ import argparse
 import atexit
 import glob
 import json
+import locale
 import math
 import os
 import re
@@ -601,7 +602,7 @@ _IDENTITY_RETRY_SLEEP = float(os.environ.get("PHOENIX_IDENTITY_RETRY_SLEEP", "1.
 def _cys_self_identity(candidate):
     """후보 cys 자신의 3필드 self-report(`cys phoenix-identity` — 데몬 불요·컴파일타임 상수). 실패=None."""
     try:
-        r = subprocess.run([candidate, "phoenix-identity"], capture_output=True, text=True, timeout=10)
+        r = _run_decoded([candidate, "phoenix-identity"], timeout=10)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
     try:
@@ -617,7 +618,7 @@ def _daemon_identity(candidate, socket):
         cmd += ["--socket", socket]
     cmd += ["status", "--json"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        r = _run_decoded(cmd, timeout=12)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
     try:
@@ -815,7 +816,7 @@ def _emit_evt(evt_type, **fields):
     for k, v in fields.items():
         cmd += ["--field", "%s=%s" % (k, v)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        r = subprocess.run(cmd, capture_output=True, timeout=8)  # ★(0.14.48 · A) 종료코드만 쓴다 — 출력을 글자로 풀지 않는다
         return r.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
@@ -942,6 +943,36 @@ def _decode_captured(b):
     return b or ""
 
 
+def _dec_any(b):
+    """★(0.14.48 · A) 상대가 **무슨 인코딩으로 쓰는지 정해져 있지 않은** 출력(운영체제 도구 · 사용자가 준 셸 명령 ·
+    자식 파이썬)을 예외 없이 문자열로 만든다. UTF-8 로 먼저 풀고, 안 되면 시스템 기본 인코딩으로 대체 문자와 함께 푼다.
+    글자는 표시·세대 이름 추출에만 쓰고 성패는 호출처가 종료코드로 본다 — 여기서 예외가 나면 이미 실행된 명령의
+    종료코드까지 잃는다. (Rust CLI 출력처럼 UTF-8 이 계약인 자리는 `_decode_captured` 를 쓴다.)"""
+    if b is None:
+        return ""
+    if not isinstance(b, bytes):
+        return b or ""
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return b.decode(locale.getpreferredencoding(False) or "utf-8", "replace")
+    except LookupError:
+        return b.decode("utf-8", "replace")
+
+
+def _run_decoded(cmd, dec=_decode_captured, **kw):
+    """★(0.14.48 · A) 하위 프로세스 출력을 **바이트로 받아 명시적으로** 푼다 — `text=True`(= 부모의 기본 인코딩으로 풀기)를
+    쓰지 않는다. 종전에는 cp949 부모가 `cys status --json` 의 UTF-8 출력(좌석 제목·작업 폴더의 한글)을 받다
+    UnicodeDecodeError 로 복원 본체에 닿기도 전에 죽었다(실측). 반환은 `subprocess.run` 과 같은 꼴이고
+    stdout·stderr 만 문자열이다. TimeoutExpired 등 예외는 그대로 올린다(호출처의 기존 처리 유지)."""
+    r = subprocess.run(cmd, capture_output=True, **kw)
+    r.stdout = dec(r.stdout)
+    r.stderr = dec(r.stderr)
+    return r
+
+
 def _run_capture_progress(cmd, env, timeout, stall_s, poll_s=1.0):
     """★리뷰 F1·W4(0.14.42): `_run_capture` 에 **진행 감시**를 더한 실행기 — 상한(timeout) 안이라도 stdout·stderr 가
     stall_s 초 동안 한 바이트도 늘지 않으면 행으로 보고 끊는다(rc 124 · `stalled=True`). 임시파일 캡처라 파이프 EOF
@@ -1035,7 +1066,7 @@ def cys(*args, socket=None, timeout=25):
     if IS_WINDOWS:
         return _run_capture(cmd, env, timeout)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        r = _run_decoded(cmd, timeout=timeout, env=env)
         return r
     except subprocess.TimeoutExpired as e:
         class _R:
@@ -1922,7 +1953,7 @@ def rollback_proposal(socket):
         #   무가드 시 스냅샷 도구가 15초 초과하면 traceback→이유 없는 exit 1(P1-5). 롤백 '제안'은 부가정보이므로
         #   실패해도 restore 판정을 죽이지 않고 note 로 정직히 남긴다.
         try:
-            r = subprocess.run([sys.executable, snap, "list"], capture_output=True, text=True, timeout=15)
+            r = _run_decoded([sys.executable, snap, "list"], _dec_any, timeout=15)
             prop["generations_raw"] = (r.stdout or r.stderr or "").strip()[:600]
             gens = re.findall(r"(\d{8}T\d{6}Z)", r.stdout or "")
             prop["generations"] = gens
@@ -3432,8 +3463,7 @@ def _launchctl_bin():
 
 def _launchctl(*args, timeout=10):
     try:
-        return subprocess.run([_launchctl_bin()] + [str(a) for a in args],
-                              capture_output=True, text=True, timeout=timeout)
+        return _run_decoded([_launchctl_bin()] + [str(a) for a in args], _dec_any, timeout=timeout)
     except Exception as e:
         class _R:
             returncode = 127
@@ -3511,8 +3541,7 @@ def cmd_launchd_ensure(args):
 
 def _schtasks(*args, timeout=10):
     try:
-        return subprocess.run(["schtasks"] + [str(a) for a in args],
-                              capture_output=True, text=True, timeout=timeout)
+        return _run_decoded(["schtasks"] + [str(a) for a in args], _dec_any, timeout=timeout)
     except Exception as e:
         class _R:
             returncode = 127
@@ -3604,8 +3633,7 @@ def _win_restart_daemon(socket, timeout):
     res["daemon_pid"] = pid
     if pid:
         try:
-            kr = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                                capture_output=True, text=True, timeout=15)
+            kr = _run_decoded(["taskkill", "/PID", str(pid), "/T", "/F"], _dec_any, timeout=15)
             res["taskkill_rc"] = kr.returncode
             res["taskkill_out"] = ((kr.stdout or "") + (kr.stderr or "")).strip()[:200]
         except Exception as e:
@@ -3842,7 +3870,7 @@ def _deploy_restart(socket, restart_hook, timeout):
         res["path"] = "hook(격리·injected)"
         res["hook"] = restart_hook
         try:
-            r = subprocess.run(restart_hook, shell=True, capture_output=True, text=True, timeout=max(timeout, 30))
+            r = _run_decoded(restart_hook, _dec_any, shell=True, timeout=max(timeout, 30))
             res["hook_rc"] = r.returncode
             res["hook_out"] = (r.stdout or r.stderr or "").strip()[-500:]
         except subprocess.TimeoutExpired:
@@ -4039,7 +4067,7 @@ def cmd_deploy(args):
         # ── apply (선택) — 실패 시 재시작 진입 금지(부작용 확산 차단) ──
         if apply_cmd and not _same_gen("apply"):
             try:
-                ar = subprocess.run(apply_cmd, shell=True, capture_output=True, text=True, timeout=600)
+                ar = _run_decoded(apply_cmd, _dec_any, shell=True, timeout=600)
                 arc, aout, aerr = ar.returncode, (ar.stdout or "")[-600:], (ar.stderr or "")[-400:]
             except subprocess.TimeoutExpired:
                 arc, aout, aerr = 124, "", "TIMEOUT"
