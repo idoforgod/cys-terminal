@@ -1691,8 +1691,63 @@ fn is_retired_seed_text_command(cmd: &str) -> bool {
     RETIRED_SEED_TEXT_COMMANDS.iter().any(|(_, text)| *text == cmd)
 }
 
-// 모르면 false = 종전 경로(거부 + schedule.error). 승인 흔적을 건너뜀으로 숨기지 않는다.
-// 폴더·환경이 달라 지금은 통과하지 못하는 승인도 「흔적」이다 — 건너뜀으로 숨기지 않는다(접두 비교는 approval.rs matches_ctx 의 접두 판정과 같은 식이다 · 그쪽을 고치면 여기도 본다).
+// approval.rs 의 store_root·ttl_records_path·records_path 와 같은 경로 규칙이다.
+// 그쪽 경로가 바뀌면 여기도 본다 · approval_store_raw_paths_match_where_approval_saves 시험이 묶는다.
+fn approval_store_raw_paths() -> (PathBuf /* ttl */, PathBuf /* main */) {
+    let root = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(test)]
+    let root = crate::approval::tests::store_root_override().unwrap_or(root);
+    let cys = root.join(".cys");
+    (cys.join("approvals-ttl.json"), cys.join("approvals.json"))
+}
+
+fn read_approval_raw(path: &std::path::Path) -> Result<Option<Vec<u8>>, ()> {
+    match std::fs::read(path) {
+        Ok(raw) => Ok(Some(raw)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(()),
+    }
+}
+
+fn approval_raw_has_prefix_trace(raw: Option<&[u8]>, toks: &[String]) -> Result<bool, ()> {
+    let Some(raw) = raw else { return Ok(false); };
+    let content = std::str::from_utf8(raw).map_err(|_| ())?;
+    if content.trim().is_empty() {
+        return Ok(false);
+    }
+    let value: serde_json::Value = serde_json::from_str(content).map_err(|_| ())?;
+    let records = value
+        .as_array()
+        .or_else(|| value.as_object()?.get("records")?.as_array())
+        .ok_or(())?;
+    let mut has_trace = false;
+    for record in records {
+        let prefix = record
+            .as_object()
+            .and_then(|r| r.get("command_prefix"))
+            .and_then(|prefix| prefix.as_array())
+            .ok_or(())?;
+        let prefix: Vec<&str> = prefix
+            .iter()
+            .map(|token| token.as_str().ok_or(()))
+            .collect::<Result<_, _>>()?;
+        // 빈 접두는 approval.rs matches_ctx 에서도 매칭을 거부한다.
+        has_trace |= !prefix.is_empty() && toks.get(..prefix.len()).is_some_and(|head| {
+            head.iter().map(String::as_str).eq(prefix.iter().copied())
+        });
+    }
+    Ok(has_trace)
+}
+
+#[cfg(test)]
+static TEST_AFTER_FIRST_TTL_READ: std::sync::Mutex<Option<Box<dyn FnMut() + Send>>> =
+    std::sync::Mutex::new(None);
+
+// 모르면 false = 종전 경로(거부 + schedule.error). 건너뜀은 두 저장소 원자료를 두 번 읽어
+// 같았고 어느 쪽에도 이 명령의 접두 흔적이 없을 때만이다. 병합 결과는 같은 ID 의 TTL 이
+// main 을 가리므로(F1) 흔적 판정에 쓰지 않는다. 두 파일은 따로 원자적으로 쓰인다(F2).
+// 폴더·환경이 달라 지금은 통과하지 못하는 승인도 흔적이다(접두 비교는 approval.rs
+// matches_ctx 와 같은 식이다 · 그쪽을 고치면 여기도 본다). 네 판독 사이 ABA 쓰기는 못 잡는다.
 fn retired_text_command_confirmed_unapproved(cmd: &str) -> bool {
     if !is_retired_seed_text_command(cmd) || is_trusted_builtin_text_command(cmd) {
         return false;
@@ -1700,11 +1755,31 @@ fn retired_text_command_confirmed_unapproved(cmd: &str) -> bool {
     let Some(_secret) = crate::approval::signing_secret() else {
         return false;
     };
-    let Ok(records) = crate::approval::try_load_records() else {
+    if crate::approval::try_load_records().is_err() {
         return false;
-    };
+    }
     let Some(toks) = crate::approval::tokenize(cmd) else { return false; };
-    !records.iter().any(|r| !r.command_prefix.is_empty() && toks.get(..r.command_prefix.len()) == Some(r.command_prefix.as_slice()))
+    let (ttl_path, main_path) = approval_store_raw_paths();
+    let Ok(ttl1) = read_approval_raw(&ttl_path) else { return false; };
+    #[cfg(test)]
+    {
+        // 훅을 꺼내 잠금을 푼 뒤 호출한다: 훅 안에서 승인 저장소를 만질 수 있다.
+        let hook = TEST_AFTER_FIRST_TTL_READ
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(mut hook) = hook {
+            hook();
+        }
+    }
+    let Ok(main1) = read_approval_raw(&main_path) else { return false; };
+    let Ok(ttl2) = read_approval_raw(&ttl_path) else { return false; };
+    let Ok(main2) = read_approval_raw(&main_path) else { return false; };
+    if ttl1 != ttl2 || main1 != main2 {
+        return false;
+    }
+    matches!(approval_raw_has_prefix_trace(ttl1.as_deref(), &toks), Ok(false))
+        && matches!(approval_raw_has_prefix_trace(main1.as_deref(), &toks), Ok(false))
 }
 
 fn text_command_notes(jobs: &[serde_json::Value]) -> Vec<(String, &'static str)> {
@@ -6191,6 +6266,23 @@ mod b_textcmd_retired_gate {
         }
     }
 
+    struct AfterFirstTtlRead;
+
+    impl AfterFirstTtlRead {
+        fn new(hook: impl FnMut() + Send + 'static) -> Self {
+            let mut slot = TEST_AFTER_FIRST_TTL_READ.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(slot.is_none(), "이전 TTL 판독 훅이 남았다");
+            *slot = Some(Box::new(hook));
+            Self
+        }
+    }
+
+    impl Drop for AfterFirstTtlRead {
+        fn drop(&mut self) {
+            *TEST_AFTER_FIRST_TTL_READ.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
     // 원래 id·my-renamed-job 행렬은 같은 id를 반복한다. 해당 칸만 비우고 패닉 때도 복원한다.
     struct IsolatedResult {
         id: String,
@@ -6278,6 +6370,87 @@ mod b_textcmd_retired_gate {
         }
     }
 
+    #[test]
+    fn approval_raw_has_prefix_trace_cases() {
+        let toks = vec!["python3".to_string(), "job.py".to_string()];
+        let cases: &[(&str, Option<&[u8]>, Result<bool, ()>)] = &[
+            ("absent", None, Ok(false)),
+            ("empty", Some(b""), Ok(false)),
+            ("whitespace", Some(b" \t\r\n"), Ok(false)),
+            ("empty-records", Some(br#"{"records":[]}"#), Ok(false)),
+            ("array-match", Some(br#"[{"command_prefix":["python3"]}]"#), Ok(true)),
+            ("object-mismatch", Some(br#"{"records":[{"command_prefix":["echo"]}]}"#), Ok(false)),
+            ("broken-json", Some(b"{broken-json"), Err(())),
+            ("invalid-utf8", Some(b"\xff"), Err(())),
+            ("records-object", Some(br#"{"records":{}}"#), Err(())),
+            ("records-missing", Some(b"{}"), Err(())),
+            ("non-object-record", Some(b"[null]"), Err(())),
+            ("prefix-missing", Some(br#"{"records":[{}]}"#), Err(())),
+            ("prefix-not-array", Some(br#"[{"command_prefix":"python3"}]"#), Err(())),
+            ("prefix-mixed-types", Some(br#"[{"command_prefix":["python3","job.py",3]}]"#), Err(())),
+            ("match-then-malformed", Some(br#"[{"command_prefix":["python3"]},{}]"#), Err(())),
+            ("empty-prefix", Some(br#"{"records":[{"command_prefix":[]}]}"#), Ok(false)),
+        ];
+        for &(case, raw, expected) in cases {
+            assert_eq!(approval_raw_has_prefix_trace(raw, &toks), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn approval_store_raw_paths_match_where_approval_saves() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = TempRoot::new("approval-raw-paths");
+        let _store = approval::tests::with_store_root(&root.0);
+        let mut plain = matching_record("printf plain", None);
+        plain.id = "raw-path-plain-id".to_string();
+        let mut ttl = matching_record("printf ttl", None);
+        ttl.id = "raw-path-ttl-id".to_string();
+        ttl.expires_at = Some(4_102_444_800.0);
+        approval::save_records(&[plain.clone(), ttl.clone()]).expect("경로 묶음 승인 저장");
+        let (ttl_path, main_path) = approval_store_raw_paths();
+        for (path, record) in [(ttl_path, ttl), (main_path, plain)] {
+            assert!(path.is_file(), "승인 저장 경로에 파일이 없다: {}", path.display());
+            let raw = std::fs::read_to_string(&path).expect("저장한 승인 원자료 읽기");
+            assert!(raw.contains(&record.id), "{}: 레코드 {} 부재", path.display(), record.id);
+        }
+    }
+
+    #[test]
+    fn retired_gate_survives_migration_between_store_reads() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = TempRoot::new("migration-between-store-reads");
+        let _store = approval::tests::with_store_root(&root.0);
+        let _env = WithoutSecretEnv::new();
+        let cys = root.0.join(".cys");
+        std::fs::create_dir(&cys).expect("시험 승인 디렉터리");
+        let secret = approval::signing_secret().expect("시험 루트 시크릿");
+        let (_, cmd) = retired_seed_texts().into_iter().next().expect("은퇴 시드 문구");
+        let cwd = std::env::current_dir().expect("현재 폴더").to_string_lossy().to_string();
+        let mut record = matching_record(&cmd, Some(&cwd));
+        record.expires_at = Some(4_102_444_800.0);
+        record.sign(&secret);
+        assert!(record.has_valid_signature(&secret), "이주할 승인 유효 서명 전제");
+        assert!(!record.is_expired(now_epoch()), "이주할 승인 미만료 전제");
+        assert!(record.matches(&cmd, Some(&cwd), &[]), "이주할 승인 명령 일치 전제");
+        let raw = serde_json::to_vec(&json!({"records": [record]})).expect("이주할 승인 직렬화");
+        let ttl_path = cys.join("approvals-ttl.json");
+        let main_path = cys.join("approvals.json");
+        std::fs::write(&ttl_path, br#"{"records":[]}"#).expect("빈 TTL 저장소");
+        std::fs::write(&main_path, &raw).expect("main 에 TTL 승인 직접 저장");
+        let hook_calls = Arc::new(AtomicU64::new(0));
+        let calls = Arc::clone(&hook_calls);
+        let _hook = AfterFirstTtlRead::new(move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            std::fs::write(&ttl_path, &raw).expect("TTL 로 승인 이주");
+            std::fs::write(&main_path, br#"{"records":[]}"#).expect("main 에서 이주한 승인 제거");
+        });
+        assert!(!retired_text_command_confirmed_unapproved(&cmd), "판독 사이 이주를 미승인으로 오인했다");
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1, "첫 TTL 판독 뒤 이주 훅 실행 전제");
+        assert!(TEST_AFTER_FIRST_TTL_READ.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert!(!retired_text_command_confirmed_unapproved(&cmd), "이주 뒤 TTL 흔적을 놓쳤다");
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1, "훅은 한 번만 실행한다");
+    }
+
     // 마커 유무와 무관하게 시드의 모든 text_command가 신뢰 또는 은퇴 목록에 있어야 한다.
     #[test]
     fn seed_text_command_jobs_are_trusted_builtin_or_retired() {
@@ -6340,6 +6513,7 @@ mod b_textcmd_retired_gate {
             for case in [
                 "unapproved", "broken-ttl", "broken-main", "secret-directory", "expired", "wrong-secret",
                 "other-cwd", "other-env", "unnormalized-cwd", "unrelated-record",
+                "main-only-trace-masked-by-ttl-id", "empty-records-both-files",
             ] {
                 let root = TempRoot::new(case);
                 let _store = approval::tests::with_store_root(&root.0);
@@ -6348,6 +6522,34 @@ mod b_textcmd_retired_gate {
                 std::fs::create_dir(&cys).expect("시험 승인 디렉터리");
                 match case {
                     "unapproved" => {}
+                    "empty-records-both-files" => {
+                        for file in ["approvals-ttl.json", "approvals.json"] {
+                            std::fs::write(cys.join(file), br#"{"records":[]}"#).expect("빈 records 저장소");
+                        }
+                    }
+                    "main-only-trace-masked-by-ttl-id" => {
+                        let secret = approval::signing_secret().expect("시험 루트 시크릿");
+                        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+                        let mut main = matching_record(&cmd, cwd.as_deref());
+                        main.sign(&secret);
+                        let mut ttl = matching_record("echo", cwd.as_deref());
+                        ttl.id = main.id.clone();
+                        ttl.expires_at = Some(4_102_444_800.0);
+                        ttl.sign(&secret);
+                        std::fs::write(
+                            cys.join("approvals.json"),
+                            serde_json::to_vec(&json!({"records": [main]})).expect("main 흔적 직렬화"),
+                        )
+                        .expect("main 흔적 직접 저장");
+                        std::fs::write(
+                            cys.join("approvals-ttl.json"),
+                            serde_json::to_vec(&json!({"records": [ttl]})).expect("TTL 가림 직렬화"),
+                        )
+                        .expect("TTL 가림 직접 저장");
+                        let records = approval::try_load_records().expect("같은 ID 승인 병합 성공 전제");
+                        assert_eq!(records.len(), 1, "TTL 이 main 흔적을 가린 전제");
+                        assert_eq!(records[0].command_prefix, ["echo"], "병합 뒤 무관한 TTL 접두만 남는다");
+                    }
                     "broken-ttl" | "broken-main" => {
                         let file = if case == "broken-ttl" { "approvals-ttl.json" } else { "approvals.json" };
                         std::fs::write(cys.join(file), b"{broken-json").expect("깨진 승인 JSON");
@@ -6401,7 +6603,7 @@ mod b_textcmd_retired_gate {
                     _ => unreachable!(),
                 }
                 let confirmed = retired_text_command_confirmed_unapproved(&cmd);
-                assert_eq!(confirmed, matches!(case, "unapproved" | "unrelated-record"), "{seed_id}/{case}");
+                assert_eq!(confirmed, matches!(case, "unapproved" | "unrelated-record" | "empty-records-both-files"), "{seed_id}/{case}");
                 let denied = text_command_allowed(&cmd).is_err();
                 assert!(!confirmed || denied, "{seed_id}/{case}: 건너뜀 관문과 실행 검사 불일치");
                 assert!(denied, "{seed_id}/{case}: 기존 거부 유지");
