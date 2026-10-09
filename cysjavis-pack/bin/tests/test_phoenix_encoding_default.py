@@ -13,7 +13,7 @@ CI 는 잡 수준에서 PYTHONUTF8=1 을 두르고 돌아 이 조건을 본 적�
   · shim:cp949 · shim:cp1252 — 인코딩 없는 텍스트 open 의 기본값과 stdout 을 그 코덱으로 갈아 끼운다(어느 OS 에서나 돈다)
   · native — 벗기기만 한다(윈도우 러너에서는 이것이 진짜 ANSI 코드페이지 조건이다 · 맥/리눅스는 UTF-8 이라 대조군 구실)
   · shim:utf-8 — 대조군(모의 장치 자체의 오류를 가른다)
-추가 시나리오: 상태 응답 수신(가짜 cys 가 한글 든 UTF-8 JSON) · 외부 도구 수신(cp949 바이트를 내는 가짜 schtasks) · 스냅샷 manifest · 묘비+치워진 파일 알림.
+추가 시나리오: 상태 응답 수신(가짜 cys 가 한글 든 UTF-8 JSON) · 외부 도구 수신(cp949 바이트를 내는 가짜 schtasks) · 스냅샷 manifest · 묘비+치워진 파일 알림. · 수동 복구 스크립트의 줄바꿈(윈도우 변환 모사)
 선택(E): PHOENIX_HARNESS_CYSD·PHOENIX_CYS 가 둘 다 있고 locale:cp949 가 성립하면, 격리 데몬에 `restore --auto` 를
   데몬이 주는 것과 같은 환경 키로 한 번 불러 종료코드 0 · `.corrupt-*` 0 · Traceback 0 을 본다. 없으면 건너뛰고 그 사실을 찍는다.
 
@@ -119,6 +119,23 @@ try:
             env = dict(os.environ, PYTHONIOENCODING="cp1252:strict")
             pr = subprocess.run(["bash", os.path.join(work, "manual", "manual_restore.sh")], capture_output=True, env=env, timeout=60)
             res["manual_run"] = [b"cys launch-agent --role worker --agent claude" in pr.stdout, b"UnicodeEncodeError" not in pr.stderr]
+    elif scenario == "gen_manual_crlf":
+        force = getattr(m, "_force_utf8_stdio", None)
+        if force: force()
+        seed(os.path.join(sd, "topology.json"), {"entries": [], "updated_at": 1})
+        class A: pass
+        a = A(); a.socket = sock; a.dest = os.path.join(work, "manual")
+        _before_crlf_open = builtins.open
+        def _crlf_open(file, mode="r", buffering=-1, encoding=None, errors=None, newline=None, closefd=True, opener=None):
+            if "b" not in mode and any(c in mode for c in "wax+") and newline is None:
+                newline = "\r\n"
+            return _before_crlf_open(file, mode, buffering, encoding, errors, newline, closefd, opener)
+        builtins.open = _crlf_open
+        io.open = _crlf_open
+        m.cmd_gen_manual(a)
+        raw = _before_crlf_open(os.path.join(work, "manual", "manual_restore.sh"), "rb").read()
+        res["manual_lf_ok"] = (raw == m.MANUAL_RESTORE_TEMPLATE.encode("utf-8"))
+        res["manual_cr_count"] = raw.count(b"\r")
     elif scenario == "status_recv":
         # 가짜 cys — 좌석 제목·작업 폴더에 한글·줄표가 든 UTF-8 JSON 을 낸다(Rust CLI 의 출력 계약과 같은 바이트).
         payload = os.path.join(work, "status.json")
@@ -360,6 +377,12 @@ def t_gen_manual(td, child, cond):
         check("%s gen-manual: 만든 스크립트가 cp1252 터미널에서도 복원 명령 줄을 끝까지 낸다" % L, res.get("manual_run") == [True, True], str(res.get("manual_run")))
 
 
+def t_gen_manual_crlf(td, child):
+    rc, res, _ = run_child(td, child, ("native", None), "gen_manual_crlf")
+    check("gen-manual: 윈도우 줄바꿈 변환(\\n→\\r\\n) 아래에서도 수동 복구 스크립트를 LF 그대로 쓴다", rc == 0 and bool(res) and res.get("manual_lf_ok") is True,
+          "rc=%s exc=%s cr=%s" % (rc, res and res.get("exc"), res and res.get("manual_cr_count")))
+
+
 def t_status_recv(td, child, cond):
     rc, res, _ = run_child(td, child, cond, "status_recv")
     L = label(cond)
@@ -522,6 +545,7 @@ def main():
             t_manifest(td, child, cond)
             t_tombstone(td, child, cond)
             t_extra(td, child, cond)
+        t_gen_manual_crlf(td, child)
         t_source_pins()
         t_e2e_daemon(td, conds)
     finally:
