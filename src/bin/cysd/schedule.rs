@@ -207,6 +207,23 @@ pub fn schedule_path() -> PathBuf {
 /// v2: R6 W0-4/W0-5 — cycle 전자동 잡 2종(cycle-autopilot-tick·cycle-verifier-watchdog) 추가.
 const BUILTIN_JOBS_VERSION: u64 = 2;
 
+// 허용 목록이 아니라 승인 없음이 확인되면 조용히 건너뛰는 목록이다. 실행 권한을 주지 않는다.
+// 시드에서 해당 잡이 빠지는 판에서 지울 수 있다.
+const RETIRED_SEED_TEXT_COMMANDS: &[(&str, &str)] = &[
+    (
+        "fleet-adoption-cost-digest",
+        "printf '[heartbeat] 일일 fleet 채택/비용 digest — 결정론 read-only 집계. 수치 불변으로 보고하고 COVERAGE DRIFT 경고가 있으면 javis_preflight.py --fix 하라.\\n'; python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_fleet_report.py\" --days 7",
+    ),
+    (
+        "content-channel-health-watch",
+        "python3 \"${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_channel_watch.py\" --no-push",
+    ),
+];
+
+#[cfg(test)]
+static TEST_RETIRED_SEED_TEXT_COMMANDS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// built-in 잡 정의(phoenix 인프라 + learn 학습 루프) — 팩 schedule.json 배달이 아니라 코드가 소유한다
 /// (schedule.json 이 user-owned 로 전환돼 팩 강제갱신이 사용자 잡을 보존하므로, built-in 잡 진화는 이 코드가
 /// 담당). 각 항목에 `_builtin`/`_builtin_version` 마커를 달아 ensure 가 id 로 upsert·버전 대조한다(Job 의
@@ -835,6 +852,10 @@ fn ensure_builtin_jobs_locked(path: &std::path::Path) {
              이 잡의 큐 경유가 필요하면 action 을 '{ACTION_PUSH_QUEUED}' 로 되돌리라(id 는 그대로 두라)."
         );
     }
+    let notes = text_command_notes(arr);
+    for (id, kind) in notes {
+        eprintln!("{}", text_command_note_detail(&id, kind));
+    }
     if changed {
         if write_schedule_atomic(path, &root) {
             eprintln!("[cysd] ensure_builtin_jobs: built-in phoenix 잡 보장(생성/갱신) 완료");
@@ -1262,6 +1283,16 @@ fn schedule_for(job: &Job, date: chrono::NaiveDate) -> Option<i64> {
 
 pub fn spawn_scheduler(daemon: Arc<Daemon>) {
     tokio::spawn(async move {
+        if let Some(jobs) = read_schedule_jobs_raw(&schedule_path()) {
+            for (id, kind) in text_command_notes(&jobs) {
+                daemon.bus.publish(
+                    "schedule.warning",
+                    "schedule",
+                    None,
+                    json!({"kind": kind, "job_id": id, "detail": text_command_note_detail(&id, kind)}),
+                );
+            }
+        }
         loop {
             tokio::time::sleep(Duration::from_secs(TICK_SECS)).await;
             // 패닉 격리: 한 틱의 패닉이 scheduler 태스크를 죽여 하트비트 발화가
@@ -1562,6 +1593,22 @@ async fn fire(daemon: Arc<Daemon>, job: Job) {
         record_job_result(&job.id, JobResultKind::Skipped, "base_only job on dept socket");
         return;
     }
+    if matches!(job.action.as_str(), "push" | ACTION_PUSH_QUEUED)
+        && job.to.is_some()
+        && job.text_command.as_deref().is_some_and(retired_text_command_confirmed_unapproved)
+    {
+        daemon.bus.publish(
+            "schedule.skipped",
+            "schedule",
+            None,
+            json!({"job_id": job.id, "why": format!(
+                "은퇴한 시드 문구 — 서명 승인이 없어 실행하지 않는다(오류로 세지 않는다). 돌리려면 서명 승인 · 지우려면 cys schedule remove {}",
+                job.id
+            )}),
+        );
+        record_job_result(&job.id, JobResultKind::Skipped, "은퇴한 시드 문구 — 승인 없음 확인");
+        return;
+    }
     let result = match job.action.as_str() {
         // ★(0.14.31 · 리뷰 R1 · codex blocking) `push_queued` 는 **큐 경유가 계약인 push** 다.
         //   `action:"push"` + `via_queue:true` 로만 표현하면 구 데몬(강등·롤백)이 미지 필드를
@@ -1631,10 +1678,93 @@ fn is_trusted_builtin_text_command(cmd: &str) -> bool {
         .any(|j| j.get("text_command").and_then(|v| v.as_str()) == Some(cmd))
 }
 
+fn is_retired_seed_text_command(cmd: &str) -> bool {
+    #[cfg(test)]
+    if TEST_RETIRED_SEED_TEXT_COMMANDS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|text| text == cmd)
+    {
+        return true;
+    }
+    RETIRED_SEED_TEXT_COMMANDS.iter().any(|(_, text)| *text == cmd)
+}
+
+// 모르면 false = 종전 경로(거부 + schedule.error). 승인 흔적을 건너뜀으로 숨기지 않는다.
+fn retired_text_command_confirmed_unapproved(cmd: &str) -> bool {
+    if !is_retired_seed_text_command(cmd) || is_trusted_builtin_text_command(cmd) {
+        return false;
+    }
+    let Some(_secret) = crate::approval::signing_secret() else {
+        return false;
+    };
+    let Ok(records) = crate::approval::try_load_records() else {
+        return false;
+    };
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+    !records.iter().any(|r| r.matches(cmd, cwd.as_deref(), &[]))
+}
+
+fn text_command_notes(jobs: &[serde_json::Value]) -> Vec<(String, &'static str)> {
+    let builtins = builtin_jobs();
+    jobs.iter()
+        .filter_map(|job| {
+            let id = job.get("id").and_then(|v| v.as_str())?;
+            if let Some(builtin) = builtins.iter().find(|b| b["id"].as_str() == Some(id)) {
+                let want_marker = builtin.get("_builtin").and_then(|v| v.as_str());
+                let is_ours = want_marker.is_some()
+                    && job.get("_builtin").and_then(|v| v.as_str()) == want_marker;
+                if is_ours
+                    && job.get("_builtin_version").and_then(|v| v.as_u64()) == Some(BUILTIN_JOBS_VERSION)
+                    && builtin.get("text_command").and_then(|v| v.as_str()).is_some()
+                    && job.get("text_command") != builtin.get("text_command")
+                {
+                    return Some((id.to_string(), "builtin-text-mismatch"));
+                }
+            }
+            job.get("text_command")
+                .and_then(|v| v.as_str())
+                .filter(|cmd| is_retired_seed_text_command(cmd))
+                .map(|_| (id.to_string(), "retired-seed-text"))
+        })
+        .collect()
+}
+
+fn text_command_note_detail(id: &str, kind: &str) -> String {
+    match kind {
+        "builtin-text-mismatch" => format!(
+            "[cysd] schedule: 내장 잡 '{id}' 의 text_command 가 내장 문구와 다르다 — 서명 승인이 없으면 실행이 거부된다(고치지 않는다). 내장 문구로 되돌리려면 그 잡을 지우고 데몬을 다시 띄우라: cys schedule remove {id}"
+        ),
+        _ => format!(
+            "[cysd] schedule: 잡 '{id}' 는 은퇴한 시드 문구다 — 서명 승인이 없으면 실행하지 않는다(오류로 세지 않는다). 지우려면: cys schedule remove {id}"
+        ),
+    }
+}
+
+fn read_schedule_jobs_raw(path: &std::path::Path) -> Option<Vec<serde_json::Value>> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let root: serde_json::Value = serde_json::from_str(&content).ok()?;
+    root.get("jobs")?.as_array().cloned()
+}
+
+fn text_command_notes_at(path: &std::path::Path) -> serde_json::Value {
+    let jobs = read_schedule_jobs_raw(path).unwrap_or_default();
+    serde_json::Value::Object(
+        text_command_notes(&jobs)
+            .into_iter()
+            .map(|(id, kind)| (id, json!(kind)))
+            .collect(),
+    )
+}
+
 /// R-CLI-4: text_command는 데몬이 셸로 실행하므로(schedule.json 편집자 = 임의 셸 실행 벡터) 실행
 /// 前 게이트한다. ① 코드 소유 built-in 잡(팩·데몬 저작)의 text_command와 정확 일치 = 신뢰 허용.
 /// ② 그 외(사용자·외부 주입·변조된 built-in) = 서명된 승인 레코드(approval.rs) 필요 — 부재 시
 /// fail-closed 거부. 서명 시크릿 없이는 레코드 위조 불가라 무게이트 임의 셸 실행을 봉인한다.
+/// ③ 은퇴 관문은 fire() 진입부에서 건너뛸지만 정한다 — 실행 권한을 주지 않는다.
 fn text_command_allowed(cmd: &str) -> Result<(), String> {
     if is_trusted_builtin_text_command(cmd) {
         return Ok(());
@@ -2720,6 +2850,7 @@ pub fn status(daemon: &Daemon) -> serde_json::Value {
         "job_results_scope": "daemon-memory (since daemon start)",
         // 수리 세대 노출(가산 필드) — 릴리스 게이트 마커의 live 참조 지점(링커 제거 불가 보장)
         "fix_generation": FIX_GENERATION,
+        "text_command_notes": text_command_notes_at(&schedule_path()),
     })
 }
 
@@ -6148,9 +6279,9 @@ mod b_textcmd_retired_gate {
         }
     }
 
-    // 마커 유무와 무관하게 시드의 모든 text_command를 신뢰 검사한다(1단계: 두 은퇴 잡에서 빨강).
+    // 마커 유무와 무관하게 시드의 모든 text_command가 신뢰 또는 은퇴 목록에 있어야 한다.
     #[test]
-    fn seed_text_command_jobs_are_trusted_builtin_red_first() {
+    fn seed_text_command_jobs_are_trusted_builtin_or_retired() {
         let mut untrusted = Vec::new();
         let mut checked = 0;
         for job in seed_jobs() {
@@ -6158,13 +6289,245 @@ mod b_textcmd_retired_gate {
                 let id = job["id"].as_str().expect("시드 잡 id");
                 let cmd = cmd.as_str().unwrap_or_else(|| panic!("'{id}' text_command는 문자열이어야 한다"));
                 checked += 1;
-                if !is_trusted_builtin_text_command(cmd) {
+                if !(is_trusted_builtin_text_command(cmd) || is_retired_seed_text_command(cmd)) {
                     untrusted.push(id.to_string());
                 }
             }
         }
         assert!(checked > 0, "text_command 시드 검사가 공허하다");
-        assert!(untrusted.is_empty(), "내장 신뢰가 아닌 시드 text_command 잡 id: {untrusted:?}");
+        assert!(untrusted.is_empty(), "내장 신뢰도 은퇴 문구도 아닌 시드 text_command 잡 id: {untrusted:?}");
+    }
+
+    #[test]
+    fn retired_seed_texts_pin_seed_bytes_and_do_not_overlap_builtin() {
+        assert_eq!(RETIRED_SEED_TEXT_COMMANDS.len(), 2);
+        let jobs = seed_jobs();
+        for &(id, cmd) in RETIRED_SEED_TEXT_COMMANDS {
+            let seed_cmd = jobs
+                .iter()
+                .find(|job| job["id"].as_str() == Some(id))
+                .and_then(|job| job["text_command"].as_str())
+                .unwrap_or_else(|| panic!("시드 '{id}' text_command 부재"));
+            assert_eq!(cmd.as_bytes(), seed_cmd.as_bytes(), "'{id}' 시드 바이트");
+            assert!(is_retired_seed_text_command(cmd), "'{id}' 은퇴 분류");
+            assert!(!is_trusted_builtin_text_command(cmd), "'{id}' 신뢰 목록과 겹침");
+        }
+    }
+
+    #[test]
+    fn retired_seed_text_tampered_variants_are_not_retired() {
+        for (seed_id, cmd) in retired_seed_texts() {
+            let root = TempRoot::new("retired-variants");
+            let marker = root.0.join("must-not-exist");
+            let quoted_marker = marker.to_string_lossy().replace('\'', "'\\''");
+            let variants = [
+                ("prefix", format!("true; {cmd}")),
+                ("suffix", format!("{cmd}; touch '{quoted_marker}'")),
+                ("leading-space", format!(" {cmd}")),
+                ("trailing-space", format!("{cmd} ")),
+                ("double-space", cmd.replacen(' ', "  ", 1)),
+            ];
+            for (variant, changed) in variants {
+                assert_ne!(changed, cmd, "{seed_id}/{variant}: 실제 변조 전제");
+                assert!(!is_retired_seed_text_command(&changed), "{seed_id}/{variant}");
+            }
+        }
+    }
+
+    #[test]
+    fn retired_gate_confirmed_unapproved_implies_text_command_denied() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (seed_id, cmd) in retired_seed_texts() {
+            for case in ["unapproved", "broken-ttl", "broken-main", "secret-directory", "expired", "wrong-secret"] {
+                let root = TempRoot::new(case);
+                let _store = approval::tests::with_store_root(&root.0);
+                let _env = WithoutSecretEnv::new();
+                let cys = root.0.join(".cys");
+                std::fs::create_dir(&cys).expect("시험 승인 디렉터리");
+                match case {
+                    "unapproved" => {}
+                    "broken-ttl" | "broken-main" => {
+                        let file = if case == "broken-ttl" { "approvals-ttl.json" } else { "approvals.json" };
+                        std::fs::write(cys.join(file), b"{broken-json").expect("깨진 승인 JSON");
+                    }
+                    "secret-directory" => {
+                        std::fs::create_dir(cys.join(".approval-secret")).expect("시크릿 경로를 디렉터리로");
+                    }
+                    "expired" | "wrong-secret" => {
+                        let secret = approval::signing_secret().expect("시험 루트 시크릿");
+                        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+                        let mut record = matching_record(&cmd, cwd.as_deref());
+                        if case == "expired" {
+                            record.expires_at = Some(1001.0);
+                            record.sign(&secret);
+                        } else {
+                            let mut other_secret = secret.clone();
+                            other_secret[0] ^= 0xff;
+                            record.sign(&other_secret);
+                        }
+                        approval::save_records(&[record]).expect("시험 승인 저장");
+                    }
+                    _ => unreachable!(),
+                }
+                let confirmed = retired_text_command_confirmed_unapproved(&cmd);
+                assert_eq!(confirmed, case == "unapproved", "{seed_id}/{case}");
+                let denied = text_command_allowed(&cmd).is_err();
+                assert!(!confirmed || denied, "{seed_id}/{case}: 건너뜀 관문과 실행 검사 불일치");
+                assert!(denied, "{seed_id}/{case}: 기존 거부 유지");
+            }
+        }
+    }
+
+    // 조회 중 같은 뮤텍스를 다시 잡으므로 주입 때만 잠그고, 패닉 때도 그 문구를 거둔다.
+    struct InjectedRetiredText(String);
+
+    impl InjectedRetiredText {
+        fn new(cmd: &str) -> Self {
+            TEST_RETIRED_SEED_TEXT_COMMANDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(cmd.to_string());
+            Self(cmd.to_string())
+        }
+    }
+
+    impl Drop for InjectedRetiredText {
+        fn drop(&mut self) {
+            TEST_RETIRED_SEED_TEXT_COMMANDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|cmd| cmd != &self.0);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn approved_retired_text_runs_and_recovers_after_store_outage() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for use_env in [false, true] {
+            let root = TempRoot::new(if use_env { "approved-env" } else { "approved-file" });
+            let _store = approval::tests::with_store_root(&root.0);
+            let _env = WithoutSecretEnv::new();
+            let secret = if use_env {
+                let secret = b"retired-text-test-env-secret-only".to_vec();
+                std::env::set_var("CYS_APPROVAL_SECRET_B64", approval::b64_encode(&secret));
+                secret
+            } else {
+                approval::signing_secret().expect("시험 루트 시크릿")
+            };
+            let marker = root.0.join("ran");
+            let quoted_marker = marker.to_string_lossy().replace('\'', "'\\''");
+            let cmd = format!("touch '{quoted_marker}' && printf ok");
+            let _retired = InjectedRetiredText::new(&cmd);
+            assert!(is_retired_seed_text_command(&cmd));
+            assert!(!is_trusted_builtin_text_command(&cmd));
+            let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+            let mut record = matching_record(&cmd, cwd.as_deref());
+            record.sign(&secret);
+            approval::save_records(&[record]).expect("유효 승인 저장");
+            assert!(text_command_allowed(&cmd).is_ok(), "실행 전 유효 승인");
+            if use_env {
+                assert!(!root.0.join(".cys/.approval-secret").exists(), "파일 키 없는 환경키 승인");
+            }
+            let daemon = test_daemon();
+            let _daemon_dir = TempRoot(daemon.socket_path.parent().expect("임시 소켓 부모").to_path_buf());
+            let id = unique("approved-retired");
+            let _result = IsolatedResult::new(&id);
+            let job = text_job(&id, &cmd, "push");
+            let result_kind = || {
+                job_result_ledger()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&id)
+                    .and_then(|entry| entry.last_result.map(JobResultKind::as_str))
+                    .expect("발화 원장 결과")
+            };
+            fire(Arc::clone(&daemon), job.clone()).await;
+            assert!(marker.exists(), "유효 승인 문구 실행: env={use_env}");
+            assert_ne!(result_kind(), "skipped", "유효 승인을 건너뛰지 않는다");
+            if !use_env {
+                let ttl = root.0.join(".cys/approvals-ttl.json");
+                std::fs::write(&ttl, b"{broken-json").expect("TTL 저장소 손상");
+                std::fs::remove_file(&marker).expect("첫 실행 표지 제거");
+                fire(Arc::clone(&daemon), job.clone()).await;
+                assert_eq!(result_kind(), "error", "저장소 손상은 오류 유지");
+                assert!(!marker.exists(), "저장소 손상 중에는 실행하지 않는다");
+                std::fs::remove_file(&ttl).expect("손상된 TTL 파일 제거");
+                fire(Arc::clone(&daemon), job).await;
+                assert!(marker.exists(), "기존 승인으로 실행 복구");
+                assert_ne!(result_kind(), "skipped", "복구한 승인을 건너뛰지 않는다");
+            }
+            drop(daemon);
+        }
+    }
+
+    #[test]
+    fn text_command_notes_classifies_raw_jobs() {
+        let mut definitions = builtin_jobs().into_iter().filter(|job| job["text_command"].is_string());
+        let mut mismatch = definitions.next().expect("문구 다른 내장 잡");
+        let mismatch_id = mismatch["id"].as_str().unwrap().to_string();
+        mismatch["text_command"] = json!("printf edited");
+        let mut preempted = definitions.next().expect("선점 대조 잡");
+        preempted.as_object_mut().unwrap().remove("_builtin");
+        preempted["text_command"] = json!("printf edited");
+        let mut old_version = definitions.next().expect("판 번호 대조 잡");
+        old_version["_builtin_version"] = json!(BUILTIN_JOBS_VERSION + 1);
+        old_version["text_command"] = json!("printf edited");
+        let normal = definitions.next().expect("정상 내장 잡");
+        let retired = json!({
+            "id": "renamed-retired-note", "action": "push", "to": "master",
+            "text_command": RETIRED_SEED_TEXT_COMMANDS[0].1
+        });
+        let jobs = vec![mismatch, retired, preempted, old_version, normal];
+        assert_eq!(text_command_notes(&jobs), vec![
+            (mismatch_id, "builtin-text-mismatch"),
+            ("renamed-retired-note".to_string(), "retired-seed-text"),
+        ]);
+        let typed: Vec<Job> = serde_json::from_value(Value::Array(jobs)).expect("typed 잡 대조");
+        let folded = serde_json::to_value(typed).expect("typed 잡 다시 직렬화");
+        assert_eq!(text_command_notes(folded.as_array().expect("다시 접은 잡 배열")), vec![
+            ("renamed-retired-note".to_string(), "retired-seed-text"),
+        ]);
+    }
+
+    #[test]
+    fn read_schedule_jobs_raw_is_none_on_missing_or_broken() {
+        let root = TempRoot::new("raw-jobs");
+        let path = root.0.join("schedule.json");
+        assert!(read_schedule_jobs_raw(&path).is_none());
+        assert!(!path.exists(), "없는 파일을 만들지 않는다");
+        for body in ["{broken-json", "{\"jobs\":{}}"] {
+            std::fs::write(&path, body).expect("읽기 실패 검체 저장");
+            assert!(read_schedule_jobs_raw(&path).is_none());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), body, "읽기 실패도 무접촉");
+        }
+        let jobs = vec![json!({"id": "raw", "_builtin": "learn", "_builtin_version": BUILTIN_JOBS_VERSION})];
+        std::fs::write(&path, serde_json::to_vec(&json!({"jobs": jobs})).unwrap()).expect("정상 검체 저장");
+        assert_eq!(read_schedule_jobs_raw(&path), Some(jobs));
+    }
+
+    #[test]
+    fn text_command_notes_at_exposes_raw_notes_and_refreshes() {
+        let root = TempRoot::new("status-notes");
+        let path = root.0.join("schedule.json");
+        assert_eq!(text_command_notes_at(&path), json!({}));
+        std::fs::write(&path, b"{broken-json").expect("깨진 스케줄 검체");
+        assert_eq!(text_command_notes_at(&path), json!({}));
+        std::fs::write(&path, b"{\"jobs\":{}}").expect("비배열 스케줄 검체");
+        assert_eq!(text_command_notes_at(&path), json!({}));
+        let mut builtin = builtin_jobs()
+            .into_iter()
+            .find(|job| job["text_command"].is_string())
+            .expect("text_command 내장 잡");
+        let id = builtin["id"].as_str().unwrap().to_string();
+        let original = builtin["text_command"].clone();
+        builtin["text_command"] = json!("printf edited");
+        std::fs::write(&path, serde_json::to_vec(&json!({"jobs": [builtin.clone()]})).unwrap()).expect("편집 검체 저장");
+        let notes = text_command_notes_at(&path);
+        assert_eq!(notes.as_object().expect("notes object").len(), 1);
+        assert_eq!(notes[&id], "builtin-text-mismatch");
+        builtin["text_command"] = original;
+        std::fs::write(&path, serde_json::to_vec(&json!({"jobs": [builtin]})).unwrap()).expect("복원 검체 저장");
+        assert_eq!(text_command_notes_at(&path), json!({}), "조회마다 편집을 다시 읽는다");
     }
 
     // 승인 없는 은퇴 문구 두 개 × push 계열 두 개 × 원래/변경 id는 skipped 한 건이며 실패가 아니다.
