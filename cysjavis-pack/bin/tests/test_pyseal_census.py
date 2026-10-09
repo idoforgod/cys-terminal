@@ -277,6 +277,12 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   tempfile 과 함께 사라지므로 봉인 관측 축은 아니다.
     "cysjavis-pack/bin/tests/test_lane_redirect.py",
     "cysjavis-pack/bin/tests/test_org_audit.py",
+    # ★2026-10-09 0.14.48 A 등재 — phoenix 기본 인코딩 내성 검체. **봉인 점검 결과(등재 = 이 선언)**:
+    #   강제점이 아니라 **자식 env 를 짜는 두 줄**이다 — `_bare_env()`(os.environ 사본에서 UTF-8 강제 변수만 벗기고
+    #   `PYTHONDONTWRITEBYTECODE=1` 을 직접 싣는다 — 벗기지 않고 상속 방향으로 다시 건다)와 끝에서 끝 E 의 데몬 자식 env 한 줄.
+    #   검체가 `sys.executable` 로 띄우는 python 자식은 전부 `_bare_env()` 를 거치므로 봉인이 그 실행에 적용된다
+    #   (test_lane_redirect.py·test_role_authority_shell.py 와 같은 계급). 프로덕션 경로의 새 python 진입점이 아니다.
+    "cysjavis-pack/bin/tests/test_phoenix_encoding_default.py",
     # ★2026-09-08 통합 단계 등재(오너 참고1 · CONTRACTS §B-11 "음성 검체 1개 추가").
     #   **봉인 점검 결과(등재 = 이 선언)**: 새 python 진입점도 강제점도 **아니다** — 이 파일은
     #   봉인을 *강제*하는 게 아니라 봉인이 실제로 듣는지를 **관측**한다(데몬이 주입하는 env 를
