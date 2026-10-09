@@ -170,7 +170,7 @@ import {
 } from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보·전 좌석 폴백 집계
 import { buildAcctIndex, buildWsAccountGroups, type SeatAcctSig, type AcctIndex } from "./seatacct"; // ★0.14.45 부서 카드 노드별 계정 줄(순수 판정)
 import { planOfficeTab, repairOutcomeOf, type OfficeCtx } from "./officetab"; // 0.14.44 B5·B6 오피스 탭 안내(순수 판정)
-import { starvedNotice, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
+import { starvedNotice, starvedShouldPop, starvedDismissId, surfaceIdOfRef, locateStarvedSeat } from "./starvednotice"; // 0.14.43 UI2 큐 기아 경보 → 토스트·배너(순수 문구·좌석 확정)
 import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
 import {
@@ -8831,6 +8831,7 @@ function toast(category: string, name: string, detail: string, onClick?: () => v
 // 완료·실패 때 dismissToast로 내리는 기존 계약은 그대로 유지되고, 페어가 유실돼도
 // TTL이 최후 방어선으로 화면을 정리한다(구 구현은 타이머가 없어 영구 잔존했다).
 const stickyToasts = new Map<string, { el: HTMLElement; timer: ReturnType<typeof setTimeout> }>();
+const starvedLastTitle = new Map<string, string>();
 
 /// `onClick`(선택) — 본문을 눌렀을 때의 동작. ★(0.14.41 · U14) **대입**(`el.onclick =`)으로 건다:
 /// 같은 id 는 요소를 재사용하므로 addEventListener 로 붙이면 다시 띄울 때마다 처리기가 쌓여
@@ -8928,10 +8929,10 @@ async function osBanner(title: string, body: string) {
   }
 }
 
-/// ★0.14.43(UI2): 그 좌석의 '큐 막힘' 토스트를 거둔다(없으면 무동작) — id 의 모양은 starvednotice.ts 한 곳이 정한다.
+/// ★0.14.43(UI2): 그 좌석의 대기·막힘 토스트를 거두고 구간을 끝낸다(없으면 무동작) — id 의 모양은 starvednotice.ts 한 곳이 정한다.
 function dismissStarvedToast(socketSlug: unknown, surfaceId: unknown): void {
   const id = starvedDismissId(socketSlug, surfaceId);
-  if (id) dismissToast(id);
+  if (id) { dismissToast(id); starvedLastTitle.delete(id); }
 }
 
 /// ★0.14.43(UI2): '큐 막힘' 토스트를 **눌렀을 때만** 그 좌석 pane 으로 간다(자동 전환·포커스 강탈 없음 — 클릭은 사람의 의사표시다).
@@ -9060,14 +9061,19 @@ function onDaemonEvent(event: Record<string, unknown>) {
     //   질문 창에 답하기 …) — 알리는 표면이 없어 몇 시간씩 막혀도 아무도 몰랐다(CSO 좌석 자신의 경보는 라우터가 폐기한다).
     //   ① 문구·분류·id 는 순수 starvedNotice(starvednotice.ts) — payload 는 신뢰하지 않는다(타입 검사·길이 절단). 화면에는 stickyToast(textContent)로만 간다.
     //   ② 같은 좌석은 같은 id 하나로 갱신된다(데몬 쿨다운 5분이 빈도를 묶는다 — GUI 쪽 추가 타이머 없음). 풀리면 queue.delivered·좌석 종료가 거둔다(아래).
-    //   ③ 사람이 조치해야 하는 사유만 OS 배너를 겸한다(approval·paused·wait 는 토스트만 — 승인은 기존 승인 알림 경로).
+    //   ③ DESIGN-D-v3 §4: 사람 손은 매번 팝업·OS 배너, 대기(approval·paused·wait)는 같은 제목으로 구간당 1회 팝업하고 이후 이력만 갱신한다.
     //   ④ **자동 전환·포커스 강탈 없음** — 토스트를 눌렀을 때만 그 좌석으로 간다(다른 탭이면 탭 전환 포함 · 못 찾으면 무동작 · focusStarvedSeat).
     //   ⑤ 끝의 return — 폴백 레인(category)을 타지 않는다(이중 표시 금지).
     const starved = starvedNotice(payload, event.socket_slug);
     if (starved) {
       const seat = surfaceIdOfRef(payload.surface_ref);
       const slug = typeof event.socket_slug === "string" ? event.socket_slug : "";
-      stickyToast(starved.id, "health", starved.title, starved.detail, seat === null ? undefined : () => void focusStarvedSeat(slug, seat));
+      if (starvedShouldPop(starvedLastTitle.get(starved.id), starved)) {
+        stickyToast(starved.id, starved.level, starved.title, starved.detail, seat === null ? undefined : () => void focusStarvedSeat(slug, seat));
+      } else {
+        recordAlarm(starved.level, starved.title, starved.detail, starved.id);
+      }
+      starvedLastTitle.set(starved.id, starved.title);
       if (starved.humanNeeded) osBanner(starved.title, starved.detail);
     }
     return;

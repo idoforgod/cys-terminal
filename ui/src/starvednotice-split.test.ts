@@ -8,14 +8,12 @@ import { readFileSync } from "node:fs";
 import {
   starvedNotice,
   starvedDismissId,
+  starvedShouldPop,
   surfaceIdOfRef,
   STARVED_HUMAN_CODES,
   STARVED_CALM_CODES,
   STARVED_LEGACY_HUMAN_CODES,
 } from "./starvednotice";
-import * as SN from "./starvednotice";
-// (수정 전 빨강 증거용) 아직 없는 export 를 import 문법 오류로 두면 파일 전체가 한 덩어리 오류가 되어 시험별 빨강이 안 보인다 — 구현 뒤 named import 로 바꾼다.
-const starvedShouldPop = (SN as unknown as Record<string, (last: string | undefined, n: unknown) => boolean>).starvedShouldPop;
 
 const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf-8");
 const TAIL = " · LLM 에이전트는 자동 조치(강제 배달·드레인·키 주입·동결 해제·항목 삭제) 금지";
@@ -199,7 +197,8 @@ describe("0.14.48 D — main.ts 배선: 분기 인자 실행 검증(판정 조�
   const dismissFn = (() => {
     const i = code.indexOf("function dismissStarvedToast(");
     expect(i >= 0).toBe(true);
-    return code.slice(i, code.indexOf("\n}\n", i) + 3);
+    // new Function 은 JS 만 받으므로 타입 표기(: unknown / : void)만 걷어 낸다 — 본문은 한 글자도 안 바꾼다.
+    return code.slice(i, code.indexOf("\n}\n", i) + 3).replace("(socketSlug: unknown, surfaceId: unknown): void", "(socketSlug, surfaceId)");
   })();
   type Call = { fn: string; args: unknown[] };
   /** 한 시나리오 = 하나의 맵·호출 기록. fire = queue.starved 분기 실행, delivered = queue.delivered/좌석 종료가 부르는 dismissStarvedToast 실행. */

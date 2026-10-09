@@ -18,16 +18,20 @@
 //   · 구형 WKWebView 가 파싱하지 못하는 문법 0 — 정규식 뒤돌아보기(lookbehind)·배열 끝 인덱스 접근·뒤에서 찾기·구조 복제·소유 판정 정적 메서드·전체 치환 계열.
 //     `bun build --target browser` 는 다운레벨하지 않으므로 파싱 실패가 곧 백지다.
 
+export type StarvedLevel = "health" | "idle";
+
 /** 화면에 올릴 알림 한 건. */
 export interface StarvedNotice {
   /** 토스트 id — `starved:<소켓 slug>:surface:<n>`. 같은 좌석은 같은 id 라 갱신된다(중첩 없음). */
   id: string;
-  /** `⏳ 큐 막힘 — <역할> surface:<n>`. */
+  /** 사람 손이면 `⏳ 큐 막힘 —`, 기다림이면 종류별 대기 제목 + `<역할> surface:<n>`. */
   title: string;
   /** `<N분째> · <조치 문장>`(200자 상한). */
   detail: string;
   /** 사람이 조치해야 하는가 — true 면 OS 배너를 겸한다(false 는 토스트만). */
   humanNeeded: boolean;
+  /** 사람 손은 health, 기다림은 idle. */
+  level: StarvedLevel;
 }
 
 /** 토스트 본문(detail)의 글자 수 상한(코드 포인트) — 넘으면 앞 199자 + `…` = 200자(usagebar.ts 의 말줄임과 같은 관례: 총 길이가 상한). */
@@ -74,6 +78,16 @@ export const STARVED_LEGACY_CALM_PREFIXES: readonly string[] = [
   "paused",
 ];
 
+// ★(0.14.48 · DESIGN-D-v3 §2~4) 사람 손 경보는 그대로 두고, 기다림 3종은 상태 제목·idle 로 구분한다.
+const STARVED_TITLE_HEAD_HUMAN = "⏳ 큐 막힘 —";
+const STARVED_CALM_TITLE_HEADS = {
+  wait: "⏳ 배달 대기 중 —",
+  approval: "⏳ 승인 대기 중 —",
+  paused: "⏳ 일시 정지 중 —",
+};
+const STARVED_REASON_HEAD_HUMAN = "막힘 사유:";
+const STARVED_REASON_HEAD_CALM = "대기 사유:";
+
 const ROLE_MAX = 40;
 const BLOCKED_BY_MAX = 80;
 const SLUG_MAX = 64;
@@ -111,6 +125,21 @@ export function starvedHumanNeeded(code: unknown, blockedBy?: unknown): boolean 
   return !(typeof code === "string" && STARVED_CALM_CODES.indexOf(code) >= 0);
 }
 
+/** 기다림의 종류 — 코드가 없는 구판은 기존 접두 판정을 따르며, queue_paused 는 공통 wait 로 둔다. */
+export function starvedCalmKind(code: unknown, blockedBy?: unknown): "wait" | "approval" | "paused" | null {
+  if (starvedHumanNeeded(code, blockedBy)) return null;
+  if (code === "approval" || code === "paused" || code === "wait") return code;
+  const b = clean(blockedBy);
+  if (b.startsWith("approval_pending")) return "approval";
+  if (b.startsWith("paused")) return "paused";
+  return "wait";
+}
+
+/** DESIGN-D-v3 §4(B): 사람 손은 매번, 기다림은 구간의 마지막 제목이 달라질 때 팝업한다. */
+export function starvedShouldPop(lastTitle: string | undefined, n: StarvedNotice): boolean {
+  return n.humanNeeded || lastTitle !== n.title;
+}
+
 /** 이 UI 가 아는 remedy_code 인가(사람 조치 필요 ∪ 옛 이름 ∪ calm). 모르는 값이면 조치 문장을 믿지 않고 `blocked_by` 만 보인다. */
 function knownCode(code: unknown): boolean {
   if (typeof code !== "string") return false;
@@ -142,7 +171,7 @@ export function surfaceIdOfRef(surfaceRef: unknown): number | null {
 }
 
 /**
- * 좌석 번호(이벤트의 surface_id)로 그 좌석의 '큐 막힘' 토스트 id 를 만든다 — 막힘이 풀리거나(queue.delivered) 좌석이 끝났을 때(surface.exited·closed)
+ * 좌석 번호(이벤트의 surface_id)로 그 좌석의 막힘·대기 토스트 id 를 만든다 — 막힘이 풀리거나(queue.delivered) 좌석이 끝났을 때(surface.exited·closed)
  * 토스트를 거두는 데 쓴다. id 의 모양은 starvedNotice().id 와 같은 함수 하나(toastId)가 만든다. 번호가 0 이상의 안전한 정수가 아니면 null.
  */
 export function starvedDismissId(socketSlug: unknown, surfaceId: unknown): string | null {
@@ -164,7 +193,7 @@ function stripLlmTail(remedy: string): string {
  *  · humanNeeded — remedy_code 가 approval·paused·wait 가 아니면 true(모르는 값이면 true). 승인은 기존 승인 알림 경로가, 동결·일시 보류는
  *    스스로 풀리는 것이라 사람이 할 일이 없다. 코드가 **아예 없는** payload(구버전 데몬)는 `blocked_by` 의 접두로 가린다(starvedHumanNeeded · R2F-UI A3 m1) — 스스로 풀리는 사유면 토스트만.
  *  · detail — `<N분째> · <조치 문장>`. 조치 문장 = remedy 에서 LLM 꼬리를 뗀 것. remedy 가 없거나 비었거나 remedy_code 를 모르면(구버전 데몬·새 코드)
- *    `막힘 사유: <blocked_by>`(없으면 "알 수 없음"). 대기 시간이 유한한 양수가 아니면 분 표기만 생략한다. 총 길이는 200자 이내.
+ *    사람 손은 `막힘 사유: <blocked_by>`, 기다림은 `대기 사유: <blocked_by>`(없으면 "알 수 없음"). 대기 시간이 유한한 양수가 아니면 분 표기만 생략한다. 총 길이는 200자 이내.
  */
 export function starvedNotice(payload: unknown, socketSlug?: unknown): StarvedNotice | null {
   if (!isObj(payload)) return null;
@@ -172,16 +201,20 @@ export function starvedNotice(payload: unknown, socketSlug?: unknown): StarvedNo
   if (typeof ref !== "string" || !SURFACE_REF.test(ref)) return null;
 
   const code = payload.remedy_code;
+  const humanNeeded = starvedHumanNeeded(code, payload.blocked_by);
+  const calmKind = starvedCalmKind(code, payload.blocked_by);
+  const titleHead = calmKind === null ? STARVED_TITLE_HEAD_HUMAN : STARVED_CALM_TITLE_HEADS[calmKind];
   const remedy = knownCode(code) ? stripLlmTail(clean(payload.remedy)) : "";
   const blockedBy = clip(clean(payload.blocked_by), BLOCKED_BY_MAX);
-  const sentence = remedy || `막힘 사유: ${blockedBy || "알 수 없음"}`;
+  const sentence = remedy || `${humanNeeded ? STARVED_REASON_HEAD_HUMAN : STARVED_REASON_HEAD_CALM} ${blockedBy || "알 수 없음"}`;
   const wait = starvedWaitText(payload.waited_secs);
 
   return {
     id: toastId(socketSlug, ref),
-    title: ["⏳ 큐 막힘 —", clip(clean(payload.role), ROLE_MAX), ref].filter((x) => x !== "").join(" "),
+    title: [titleHead, clip(clean(payload.role), ROLE_MAX), ref].filter((x) => x !== "").join(" "),
     detail: clip(wait ? `${wait} · ${sentence}` : sentence, STARVED_DETAIL_MAX),
-    humanNeeded: starvedHumanNeeded(code, payload.blocked_by),
+    humanNeeded,
+    level: humanNeeded ? "health" : "idle",
   };
 }
 
@@ -196,7 +229,7 @@ export interface StarvedSeatLookup {
 }
 
 /**
- * 큐 막힘 토스트를 **눌렀을 때** 갈 좌석의 소켓을 확정한다 — 확정하지 못하면 null(호출부는 무동작).
+ * 막힘·대기 토스트를 **눌렀을 때** 갈 좌석의 소켓을 확정한다 — 확정하지 못하면 null(호출부는 무동작).
  * 좌석 번호(sid)는 데몬마다 독립 발급이라 번호만으로 고르면 **다른 데몬의 같은 번호 좌석**이 열린다(onDaemonEvent 의 surface.exited 가
  * slug 미해석을 기본 데몬으로 폴백하지 않는 이유와 같다). 그래서 데몬을 먼저 확정한다:
  *   · slug 가 비었으면(구분 필드 없음) 본부 · slug 가 부서 소켓으로 풀리면 그 부서 · 풀리지 않으면 본부인지 확인(isBaseSlug) — 아니면 null
