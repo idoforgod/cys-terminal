@@ -6711,6 +6711,12 @@ fn schedule_result_cell(r: &Value, id: &str) -> String {
     }
 }
 
+fn schedule_note_cell(r: &Value, id: &str) -> Option<String> {
+    r["text_command_notes"][id]
+        .as_str()
+        .map(|kind| format!("note={kind}"))
+}
+
 fn chrono_fmt(epoch: i64) -> String {
     use std::time::{Duration, UNIX_EPOCH};
     let dt = UNIX_EPOCH + Duration::from_secs(epoch.max(0) as u64);
@@ -7502,7 +7508,7 @@ fn run_schedule(action: ScheduleAction) -> i32 {
                     .map(String::from)
                     .or_else(|| j["at"].as_i64().map(|a| format!("once@{}", chrono_fmt(a))))
                     .unwrap_or_else(|| "?".into());
-                println!(
+                let line = format!(
                     "{}\t{} {}\t{}\t{}\tlast_fired={}\t{}",
                     j["id"].as_str().unwrap_or("?"),
                     when,
@@ -7522,6 +7528,11 @@ fn run_schedule(action: ScheduleAction) -> i32 {
                     lf.map(|t| t.to_string()).unwrap_or_else(|| "-".into()),
                     res,
                 );
+                if let Some(note) = schedule_note_cell(&r, j["id"].as_str().unwrap_or("")) {
+                    println!("{line}\t{note}");
+                } else {
+                    println!("{line}");
+                }
             }
         }),
         ScheduleAction::Remove { id } => (|| {
@@ -41133,6 +41144,17 @@ mod tests {
         // 줄 형식: last_fired 칸 뒤에 결과 칸이 **덧붙는다**(기존 칸 순서 불변).
         let src = include_str!("cys.rs");
         assert!(src.contains("\"{}\\t{} {}\\t{}\\t{}\\tlast_fired={}\\t{}\","));
+    }
+
+    #[test]
+    fn schedule_note_cell_handles_old_daemon_and_job_notes() {
+        assert_eq!(schedule_note_cell(&json!({"jobs": []}), "a"), None);
+        let r = json!({"text_command_notes": {"a": "retired-seed-text"}});
+        assert_eq!(
+            schedule_note_cell(&r, "a"),
+            Some("note=retired-seed-text".into())
+        );
+        assert_eq!(schedule_note_cell(&r, "other"), None);
     }
 
     /// ★U4-B2① 소스 핀(review1 M2 FIX #3 · blocking): 위 검체는 순수 함수 `schedule_result_cell`만
