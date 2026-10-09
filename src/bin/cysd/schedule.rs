@@ -6668,6 +6668,58 @@ mod b_textcmd_retired_gate {
         }
     }
 
+    // 병합 결과가 가린 main 의 접두 흔적도 흔적이다(codex 구현 검증 F1).
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_seed_text_with_same_id_ttl_record_masking_main_trace_keeps_error() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = TempRoot::new("same-id-ttl-masking-main");
+        let _store = approval::tests::with_store_root(&root.0);
+        let _env = WithoutSecretEnv::new();
+        let cys = root.0.join(".cys");
+        std::fs::create_dir(&cys).expect("시험 승인 디렉터리");
+        let secret = approval::signing_secret().expect("시험 루트 시크릿");
+        let cwd = std::env::current_dir().expect("현재 폴더").to_string_lossy().to_string();
+        let mut main = matching_record("python3", Some(&cwd));
+        main.id = "same-id-x".to_string();
+        main.sign(&secret);
+        assert!(main.expires_at.is_none(), "main 무기한 전제");
+        assert!(main.has_valid_signature(&secret), "main 유효 서명 전제");
+        let mut ttl = matching_record("echo", Some(&cwd));
+        ttl.id = "same-id-x".to_string();
+        ttl.expires_at = Some(4_102_444_800.0);
+        ttl.sign(&secret);
+        assert!(!ttl.is_expired(now_epoch()), "TTL 미만료 전제");
+        assert!(ttl.has_valid_signature(&secret), "TTL 유효 서명 전제");
+        std::fs::write(
+            cys.join("approvals.json"),
+            serde_json::to_vec(&json!({"records": [main]})).expect("main 승인 직렬화"),
+        )
+        .expect("main 승인 직접 저장");
+        std::fs::write(
+            cys.join("approvals-ttl.json"),
+            serde_json::to_vec(&json!({"records": [ttl]})).expect("TTL 승인 직렬화"),
+        )
+        .expect("TTL 승인 직접 저장");
+        let records = approval::try_load_records().expect("같은 id 승인 병합 성공 전제");
+        assert_eq!(records.len(), 1, "TTL이 main을 가린 전제");
+        assert_eq!(records[0].command_prefix, ["echo"], "병합 뒤 TTL 접두만 남는다");
+        let (seed_id, cmd) = retired_seed_texts()
+            .into_iter()
+            .find(|(id, _)| id == "content-channel-health-watch")
+            .expect("python3 은퇴 시드 문구");
+        let tokens = approval::tokenize(&cmd).expect("은퇴 시드 토큰화");
+        assert_eq!(tokens.first().map(String::as_str), Some("python3"), "main 접두 흔적 전제");
+        let id = unique(&format!("{seed_id}-same-id-ttl-masking-main"));
+        let (result, events) = fire_observed(text_job(&id, &cmd, "push")).await;
+        drop(_env);
+        drop(_store);
+        drop(root);
+        drop(_lock);
+        assert_eq!(result.last_result.map(JobResultKind::as_str), Some("error"), "{id}: {result:?}");
+        assert_eq!(result.consecutive_failures, 1, "{id}: {result:?}");
+        assert_eq!(event_counts(&events, &id), [0, 1, 0], "{id}: {events:?}");
+    }
+
     // 은퇴 문구의 접두·접미·앞/뒤/이중 공백 변조는 계속 error이며 touch 표지가 생기지 않는다.
     #[tokio::test(flavor = "current_thread")]
     async fn retired_seed_text_tampered_variants_keep_error() {
