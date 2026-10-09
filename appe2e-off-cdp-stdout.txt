@@ -1,0 +1,13 @@
+{"t":"2026-10-09T16:50:27.612Z","name":"start","argv":"--mode ui --port 9333 --out C:\\a\\_temp\\diag-out --prefix appe2e-off --max-wait-sec 300 --observe-sec 300 --ready-wait-sec 90 --panel-wait-sec 180 --modal-wait-sec 60","native_websocket":true}
+{"t":"2026-10-09T16:50:27.693Z","name":"targets","count":1,"pages":1}
+{"t":"2026-10-09T16:50:27.915Z","name":"connected","url":"about:blank","title":"about:blank","ws_impl":"mini"}
+{"t":"2026-10-09T16:50:29.968Z","name":"attached","url":"about:blank","title":"about:blank","id":"58B54BF490F64019A46BE057D4B3EEFB"}
+{"t":"2026-10-09T16:50:30.018Z","name":"page_info","href":"http://tauri.localhost/"}
+{"t":"2026-10-09T16:50:30.089Z","name":"app_version","value":"0.14.48"}
+{"t":"2026-10-09T16:50:30.145Z","name":"ui: wait for the Update button"}
+{"t":"2026-10-09T16:50:30.227Z","name":"listeners","update-progress":"ok","update-error":"ok","update-available":"ok","update-downloaded":"ok","update-finished":"ok","update-installing":"ok"}
+{"t":"2026-10-09T16:50:30.278Z","name":"ui: click the Update button","attempt":1}
+{"t":"2026-10-09T16:50:30.598Z","name":"ui: panel open, waiting for the bin patch button","attempt":1}
+{"t":"2026-10-09T16:50:31.477Z","name":"ui: click the bin patch button","panel_headline":"설치할 수 있는 업데이트 1건","attempt":1}
+{"t":"2026-10-09T16:50:32.076Z","name":"ui: confirm window","title":"새 본체 버전 0.14.99 — 패치 설치","sac_note":false}
+{"t":"2026-10-09T16:50:32.230Z","name":"ui: observing","observe_ms":300000,"fallback_invoke":false}
