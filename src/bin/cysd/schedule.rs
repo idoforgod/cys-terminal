@@ -5984,3 +5984,353 @@ mod c8_push_counts_submit_tests {
         assert!(dp.contains("note_push_cleared_pending(daemon, &surface, job, cleared)"), "이벤트 배선 소실");
     }
 }
+
+#[cfg(test)]
+mod b_textcmd_retired_gate {
+    use super::tests::test_daemon;
+    use super::*;
+    use crate::approval::{self, ApprovalRecord};
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn unique(tag: &str) -> String {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        format!(
+            "b-textcmd-{tag}-{}-{}-{}",
+            std::process::id(),
+            now_epoch().to_bits(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn seed_jobs() -> Vec<Value> {
+        let seed: Value =
+            serde_json::from_str(include_str!("../../../cysjavis-pack/schedule.json"))
+                .expect("seed schedule.json 파싱");
+        seed["jobs"].as_array().expect("seed jobs 배열").clone()
+    }
+
+    fn retired_seed_texts() -> Vec<(String, String)> {
+        let jobs = seed_jobs();
+        ["fleet-adoption-cost-digest", "content-channel-health-watch"]
+            .into_iter()
+            .map(|id| {
+                let cmd = jobs
+                    .iter()
+                    .find(|j| j["id"].as_str() == Some(id))
+                    .and_then(|j| j["text_command"].as_str())
+                    .unwrap_or_else(|| panic!("seed '{id}' text_command 부재"));
+                (id.to_string(), cmd.to_string())
+            })
+            .collect()
+    }
+
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(unique(tag));
+            std::fs::create_dir(&path).expect("빈 시험 루트 생성");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // PACK_ENV_LOCK → with_store_root → 이 가드 순서: 시크릿 환경값을 복원한 뒤 루트를 푼다.
+    struct WithoutSecretEnv(Option<std::ffi::OsString>);
+
+    impl WithoutSecretEnv {
+        fn new() -> Self {
+            let old = std::env::var_os("CYS_APPROVAL_SECRET_B64");
+            std::env::remove_var("CYS_APPROVAL_SECRET_B64");
+            Self(old)
+        }
+    }
+
+    impl Drop for WithoutSecretEnv {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(old) => std::env::set_var("CYS_APPROVAL_SECRET_B64", old),
+                None => std::env::remove_var("CYS_APPROVAL_SECRET_B64"),
+            }
+        }
+    }
+
+    // 원래 id·my-renamed-job 행렬은 같은 id를 반복한다. 해당 칸만 비우고 패닉 때도 복원한다.
+    struct IsolatedResult {
+        id: String,
+        previous: Option<JobResultEntry>,
+    }
+
+    impl IsolatedResult {
+        fn new(id: &str) -> Self {
+            let previous = job_result_ledger()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .remove(id);
+            Self { id: id.to_string(), previous }
+        }
+    }
+
+    impl Drop for IsolatedResult {
+        fn drop(&mut self) {
+            let mut ledger = job_result_ledger().lock().unwrap_or_else(|e| e.into_inner());
+            ledger.entries.remove(&self.id);
+            if let Some(previous) = self.previous.take() {
+                ledger.entries.insert(self.id.clone(), previous);
+            }
+        }
+    }
+
+    fn text_job(id: &str, cmd: &str, action: &str) -> Job {
+        serde_json::from_value(json!({
+            "id": id, "action": action, "to": "master", "text_command": cmd
+        }))
+        .expect("text_command 시험 잡")
+    }
+
+    // 호출자는 반드시 with_store_root 가드를 보유한다. status()의 실제 팩 읽기는 피한다.
+    async fn fire_observed(job: Job) -> (JobResultEntry, Vec<Value>) {
+        assert!(
+            !is_trusted_builtin_text_command(job.text_command.as_deref().expect("text_command")),
+            "시험 입력이 내장 신뢰 문구가 됐다 — 셸 실행 전에 중단: {}",
+            job.id
+        );
+        let daemon = test_daemon();
+        let _daemon_dir = TempRoot(daemon.socket_path.parent().expect("임시 소켓 부모").to_path_buf());
+        let _result = IsolatedResult::new(&job.id);
+        let id = job.id.clone();
+        let after = daemon.bus.latest_seq();
+        fire(Arc::clone(&daemon), job).await;
+        let result = job_result_ledger()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| panic!("'{id}' 발화 결과 부재"));
+        let events = daemon.bus.replay_after(after);
+        // 좌석을 만들지 않는 fixture: 셸·PTY 없이 승인 거부 경로만 발화한다.
+        assert!(daemon.surfaces.lock().unwrap().is_empty(), "'{id}'가 좌석을 만들었다");
+        drop(daemon);
+        (result, events)
+    }
+
+    fn event_counts(events: &[Value], id: &str) -> [usize; 3] {
+        ["schedule.skipped", "schedule.error", "schedule.fired"].map(|name| {
+            events
+                .iter()
+                .filter(|e| {
+                    e["name"].as_str() == Some(name)
+                        && e["payload"]["job_id"].as_str() == Some(id)
+                })
+                .count()
+        })
+    }
+
+    fn matching_record(cmd: &str, cwd: Option<&str>) -> ApprovalRecord {
+        // approval::tests::rec/rec_ttl은 private이므로 같은 공개 필드·sign 패턴을 쓴다.
+        ApprovalRecord {
+            version: 1,
+            id: unique("approval"),
+            command_prefix: approval::tokenize(cmd).expect("시드 명령 토큰화"),
+            cwd: approval::normalize_cwd(cwd),
+            environment: Vec::new(),
+            created_at: 1000.0,
+            updated_at: 1000.0,
+            expires_at: None,
+            signature: String::new(),
+        }
+    }
+
+    // 마커 유무와 무관하게 시드의 모든 text_command를 신뢰 검사한다(1단계: 두 은퇴 잡에서 빨강).
+    #[test]
+    fn seed_text_command_jobs_are_trusted_builtin_red_first() {
+        let mut untrusted = Vec::new();
+        let mut checked = 0;
+        for job in seed_jobs() {
+            if let Some(cmd) = job.get("text_command") {
+                let id = job["id"].as_str().expect("시드 잡 id");
+                let cmd = cmd.as_str().unwrap_or_else(|| panic!("'{id}' text_command는 문자열이어야 한다"));
+                checked += 1;
+                if !is_trusted_builtin_text_command(cmd) {
+                    untrusted.push(id.to_string());
+                }
+            }
+        }
+        assert!(checked > 0, "text_command 시드 검사가 공허하다");
+        assert!(untrusted.is_empty(), "내장 신뢰가 아닌 시드 text_command 잡 id: {untrusted:?}");
+    }
+
+    // 승인 없는 은퇴 문구 두 개 × push 계열 두 개 × 원래/변경 id는 skipped 한 건이며 실패가 아니다.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_seed_text_without_approval_is_skipped_not_error() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut failures = Vec::new();
+        for (seed_id, cmd) in retired_seed_texts() {
+            for action in ["push", "push_queued"] {
+                for id in [seed_id.as_str(), "my-renamed-job"] {
+                    let root = TempRoot::new("unapproved");
+                    let _store = approval::tests::with_store_root(&root.0);
+                    let _env = WithoutSecretEnv::new();
+                    let (result, events) = fire_observed(text_job(id, &cmd, action)).await;
+                    let counts = event_counts(&events, id);
+                    if result.last_result.map(JobResultKind::as_str) != Some("skipped")
+                        || result.consecutive_failures != 0
+                        || counts != [1, 0, 0]
+                    {
+                        failures.push(format!(
+                            "seed={seed_id}, action={action}, id={id}: {result:?}, \
+                             [skipped,error,fired]={counts:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        // 의도된 빨강의 패닉이 공용 환경 락을 poison하지 않도록 관측 뒤 먼저 푼다.
+        drop(_lock);
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    // 저장소/시크릿 판독 오류와 일치 레코드의 만료·서명 불일치는 건너뜀으로 숨기지 않고 error로 남긴다.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_seed_text_with_unreadable_approval_state_keeps_error() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (seed_id, cmd) in retired_seed_texts() {
+            for case in ["broken-ttl", "broken-main", "secret-directory", "expired", "wrong-secret"] {
+                let root = TempRoot::new(case);
+                let _store = approval::tests::with_store_root(&root.0);
+                let _env = WithoutSecretEnv::new();
+                let cys = root.0.join(".cys");
+                std::fs::create_dir(&cys).expect("시험 승인 디렉터리");
+                match case {
+                    "broken-ttl" | "broken-main" => {
+                        let file = if case == "broken-ttl" { "approvals-ttl.json" } else { "approvals.json" };
+                        std::fs::write(cys.join(file), b"{broken-json").expect("깨진 승인 JSON");
+                        assert!(approval::try_load_records().is_err(), "{case} 전제: 판독 실패");
+                    }
+                    "secret-directory" => {
+                        std::fs::create_dir(cys.join(".approval-secret")).expect("시크릿 경로를 디렉터리로");
+                        assert!(approval::signing_secret().is_none(), "시크릿 읽기 오류 전제");
+                    }
+                    "expired" | "wrong-secret" => {
+                        let secret = approval::signing_secret().expect("시험 루트 시크릿");
+                        let cwd = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+                        let mut record = matching_record(&cmd, cwd.as_deref());
+                        let mut other_secret = secret.clone();
+                        other_secret[0] ^= 0xff;
+                        if case == "expired" {
+                            record.expires_at = Some(1001.0);
+                            record.sign(&secret);
+                        } else {
+                            record.sign(&other_secret);
+                        }
+                        approval::save_records(&[record]).expect("시험 승인 저장");
+                        let records = approval::try_load_records().expect("시험 승인 다시 읽기");
+                        assert_eq!(records.len(), 1);
+                        let record = &records[0];
+                        assert!(record.matches(&cmd, cwd.as_deref(), &[]), "{case}: 명령·cwd가 맞는 레코드");
+                        assert_eq!(record.has_valid_signature(&secret), case == "expired", "{case}: 서명 전제");
+                        assert_eq!(record.is_expired(now_epoch()), case == "expired", "{case}: 만료 전제");
+                        if case == "wrong-secret" {
+                            assert!(record.has_valid_signature(&other_secret), "다른 키로 서명한 레코드");
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                let id = unique(&format!("{seed_id}-{case}"));
+                let (result, events) = fire_observed(text_job(&id, &cmd, "push")).await;
+                assert_eq!(result.last_result.map(JobResultKind::as_str), Some("error"), "{id}: {result:?}");
+                assert_eq!(result.consecutive_failures, 1, "{id}: {result:?}");
+                assert_eq!(event_counts(&events, &id), [0, 1, 0], "{id}: {events:?}");
+            }
+        }
+    }
+
+    // 은퇴 문구의 접두·접미·앞/뒤/이중 공백 변조는 계속 error이며 touch 표지가 생기지 않는다.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_seed_text_tampered_variants_keep_error() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (seed_id, cmd) in retired_seed_texts() {
+            let root = TempRoot::new("tampered");
+            let _store = approval::tests::with_store_root(&root.0);
+            let _env = WithoutSecretEnv::new();
+            let marker = root.0.join("must-not-exist");
+            let quoted_marker = marker.to_string_lossy().replace('\'', "'\\''");
+            let variants = [
+                ("prefix", format!("true; {cmd}")),
+                ("suffix", format!("{cmd}; touch '{quoted_marker}'")),
+                ("leading-space", format!(" {cmd}")),
+                ("trailing-space", format!("{cmd} ")),
+                ("double-space", cmd.replacen(' ', "  ", 1)),
+            ];
+            assert!(!marker.exists(), "표지 파일이 없는 초기 상태");
+            for (variant, changed) in variants {
+                assert_ne!(changed, cmd, "{seed_id}/{variant}: 실제 변조 전제");
+                let id = unique(&format!("{seed_id}-{variant}"));
+                let (result, events) = fire_observed(text_job(&id, &changed, "push")).await;
+                assert_eq!(result.last_result.map(JobResultKind::as_str), Some("error"), "{id}: {result:?}");
+                assert_eq!(result.consecutive_failures, 1, "{id}: {result:?}");
+                assert_eq!(event_counts(&events, &id), [0, 1, 0], "{id}: {events:?}");
+                assert!(!marker.exists(), "{id}: 거부한 명령의 touch가 실행됐다");
+            }
+        }
+    }
+
+    // to 없는 push는 기존 missing-to 오류를 먼저 내며 승인 시크릿을 만들지 않는다.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retired_seed_text_job_missing_to_keeps_missing_to_error_and_creates_no_secret() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (seed_id, cmd) in retired_seed_texts() {
+            let root = TempRoot::new("missing-to");
+            let _store = approval::tests::with_store_root(&root.0);
+            let _env = WithoutSecretEnv::new();
+            let id = unique(&format!("{seed_id}-missing-to"));
+            let mut job = text_job(&id, &cmd, "push");
+            job.to = None;
+            let (result, events) = fire_observed(job).await;
+            assert_eq!(result.last_result.map(JobResultKind::as_str), Some("error"), "{id}: {result:?}");
+            assert_eq!(result.consecutive_failures, 1, "{id}: {result:?}");
+            assert!(result.last_detail.contains("push job missing 'to'"), "{id}: {result:?}");
+            assert_eq!(event_counts(&events, &id), [0, 1, 0], "{id}: {events:?}");
+            assert!(events.iter().any(|e| {
+                e["name"] == "schedule.error"
+                    && e["payload"]["job_id"].as_str() == Some(id.as_str())
+                    && e["payload"]["error"].as_str().unwrap_or("").contains("push job missing 'to'")
+            }), "{id}: {events:?}");
+            assert!(!root.0.join(".cys/.approval-secret").exists(), "{id}: missing-to 전에 시크릿을 만들었다");
+        }
+    }
+
+    // skipped·warning·error 스케줄 이벤트는 경보 라우팅으로 좌석에 재주입되지 않는다.
+    #[test]
+    fn schedule_skipped_and_warning_are_not_routable() {
+        for name in ["schedule.skipped", "schedule.warning", "schedule.error"] {
+            assert!(!crate::alert_route::routable(name), "{name}은 라우팅 대상이 아니다");
+        }
+    }
+
+    // 현재 마커·버전을 유지한 내장 잡의 text_command 편집은 apply_builtin_jobs가 바이트 그대로 보존한다.
+    #[test]
+    fn builtin_job_with_edited_text_command_is_left_untouched() {
+        let mut edited = builtin_jobs()
+            .into_iter()
+            .find(|job| job["text_command"].is_string())
+            .expect("text_command가 있는 내장 잡");
+        let id = edited["id"].as_str().expect("내장 잡 id").to_string();
+        assert!(edited["_builtin"].is_string());
+        assert_eq!(edited["_builtin_version"].as_u64(), Some(BUILTIN_JOBS_VERSION));
+        edited["text_command"] = json!(format!("true; {}", edited["text_command"].as_str().unwrap()));
+        let before = serde_json::to_vec(&edited).expect("편집한 내장 잡 바이트");
+        let mut jobs = vec![edited];
+        let _ = apply_builtin_jobs(&mut jobs);
+        let matches: Vec<_> = jobs.iter().filter(|job| job["id"].as_str() == Some(id.as_str())).collect();
+        assert_eq!(matches.len(), 1, "'{id}' 중복 생성 금지");
+        assert_eq!(serde_json::to_vec(matches[0]).expect("반영 뒤 잡 바이트"), before, "'{id}' 편집 보존");
+    }
+}
