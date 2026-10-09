@@ -387,7 +387,7 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None)
             })
 
         mpath = os.path.join(tmp_dir, "manifest.json")
-        with open(mpath, "w") as mf:
+        with open(mpath, "w", encoding="utf-8") as mf:  # ★(0.14.48 · A) 기본 인코딩에 맡기지 않는다 — 읽는 쪽과 모드가 달라도 같은 바이트
             json.dump(manifest, mf, indent=2, ensure_ascii=False)
             mf.flush()
             os.fsync(mf.fileno())
@@ -510,9 +510,30 @@ def do_verify(gen_root=GEN_ROOT, gen=None):
             all_ok = False
             continue
         try:
-            with open(mpath) as f:
-                manifest = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
+            # ★(0.14.48 · A) 새 manifest 는 UTF-8 이다. 앞선 판은 기본 인코딩으로 썼으므로(cp949 프로세스가 쓴 manifest 가
+            #   있을 수 있다) 두 해석을 후보로 두고 **저장 파일이 실제로 다 있는 해석**을 고른다 — 한글 이름의 cp949 바이트는
+            #   UTF-8 로도 「읽히는」 경우가 있어(징.md → ¡.md) 디코딩 성공만으로는 가를 수 없다. 둘 다 아니면 먼저 읽힌 것.
+            #   (같은 기본 인코딩의 기계에서 쓴 옛 세대까지다 — 다른 인코딩의 기계로 옮긴 옛 세대는 보장하지 않는다.)
+            manifest = None
+            _first_err = None
+            for _enc in ("utf-8", None):
+                try:
+                    with open(mpath, encoding=_enc) as f:
+                        _cand = json.load(f)
+                except ValueError as _e:  # UnicodeDecodeError · JSONDecodeError
+                    _first_err = _first_err or _e
+                    continue
+                if manifest is None:
+                    manifest = _cand
+                try:
+                    if all(os.path.isfile(os.path.join(gdir, _x["stored_as"])) for _x in _cand.get("files", [])):
+                        manifest = _cand
+                        break
+                except (AttributeError, KeyError, TypeError):
+                    pass  # 꼴이 다른 manifest — 아래 본 검사가 종전대로 다룬다
+            if manifest is None:
+                raise _first_err
+        except (OSError, ValueError) as e:
             print(f"[verify] {name}: manifest 파싱 실패 {e} FAIL")
             all_ok = False
             continue
@@ -647,7 +668,7 @@ def do_self_test():
         gen6_root = os.path.join(workdir, "gen6")
         do_snapshot(sources=srcs6, gen_root=gen6_root)
         gdir6 = os.path.join(gen6_root, list_generations(gen6_root)[0])
-        man6 = json.load(open(os.path.join(gdir6, "manifest.json")))
+        man6 = json.load(open(os.path.join(gdir6, "manifest.json"), encoding="utf-8"))  # ★(0.14.48 · A) 쓰는 쪽이 UTF-8 이다
         stored_srcs = [e["source"] for e in man6["files"]]
         assert any("cys-dept-dept-B" in s for s in stored_srcs), "T6: 스냅샷에 부서 선언상태 미포함"
         assert do_verify(gen_root=gen6_root) == 0, "T6: 부서 포함 세대 무결성 실패"

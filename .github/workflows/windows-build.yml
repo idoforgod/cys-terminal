@@ -1161,6 +1161,33 @@ jobs:
           # ★Actions pwsh 래퍼는 스크립트 말미에 exit $LASTEXITCODE 를 붙인다 — 위 방어적 uninstall(스모크 finally 가
           #   이미 제거해 rc=1)이 그 값을 오염시켜 '스모크 성공인데 스텝 exit 1'(run 28738140283 실증). 판정은 $code 로 끝 — 명시 exit 0.
           exit 0
+      # ─────────────────────────────────────────────────────────────────────────
+      # ★(0.14.48 · A) phoenix 기본 인코딩 내성 — **PYTHONUTF8 을 두르지 않고** 동봉 파이썬으로 돈다.
+      #   왜: 데몬은 자동 복원용 phoenix 를 UTF-8 강제 변수 없이 띄운다. 위 T5 를 포함해 이 워크플로의 python 걸음은
+      #   전부 PYTHONUTF8=1 을 두르고 돌아, 0.14.44~0.14.47 의 「cp1252 stdout 에 ★·한글을 쓰다 UnicodeEncodeError 로
+      #   복원이 종료코드 1」을 한 번도 보지 못했다(설치된 앱의 phoenix-restore.log 에는 찍혀 있었다 — 런 37852313440).
+      #   이 걸음의 `native` 조건이 이 러너의 진짜 기본 코드페이지(cp1252)이고, cp949·cp1252 끼움쇠 조건이 함께 돈다.
+      #   시험이 조건마다 실제 인코딩 값을 찍는다 — 로그에서 `조건 native: stdout=cp1252` 를 확인한다.
+      - name: T5b 피닉스 기본 인코딩 내성 (PYTHONUTF8 없이 — cp1252 네이티브 + cp949·cp1252 끼움쇠)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = $env:CYS_INSTALL_DIR
+          if (-not $dir) { throw "T5b: CYS_INSTALL_DIR 미확정 — 앞의 '자기완결 검증' 스텝이 실패했거나 스텝 순서가 바뀌었다" }
+          $py = Join-Path $dir 'runtime\python\python3.exe'
+          if (-not (Test-Path $py)) { throw "T5b: 동봉 python3.exe 미발견: $py" }
+          $t = Join-Path (Get-Location) 'cysjavis-pack\bin\tests\test_phoenix_encoding_default.py'
+          if (-not (Test-Path $t)) { throw "T5b: 시험 파일 미발견(checkout 경로): $t" }
+          # 이 걸음에는 env 로 PYTHONUTF8 을 주지 않는다 — 물려받은 값이 있어도 지운다(시험도 자식 환경에서 한 번 더 벗긴다).
+          Remove-Item Env:PYTHONUTF8 -ErrorAction SilentlyContinue
+          Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
+          $env:PYTHONDONTWRITEBYTECODE = '1'
+          & $py $t
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "T5b: 피닉스 기본 인코딩 내성 시험 실패 (exit=$code)" }
+          Write-Host "OK: T5b 피닉스 기본 인코딩 내성 통과"
+          exit 0
 
       # ─────────────────────────────────────────────────────────────────────────
       # T6 형제 import 가드 회귀 (D1) — ★**이 레인에서만 진짜 조건으로 돈다**.

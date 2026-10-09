@@ -46,6 +46,7 @@ import argparse
 import atexit
 import glob
 import json
+import locale
 import math
 import os
 import re
@@ -601,7 +602,7 @@ _IDENTITY_RETRY_SLEEP = float(os.environ.get("PHOENIX_IDENTITY_RETRY_SLEEP", "1.
 def _cys_self_identity(candidate):
     """후보 cys 자신의 3필드 self-report(`cys phoenix-identity` — 데몬 불요·컴파일타임 상수). 실패=None."""
     try:
-        r = subprocess.run([candidate, "phoenix-identity"], capture_output=True, text=True, timeout=10)
+        r = _run_decoded([candidate, "phoenix-identity"], timeout=10)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
     try:
@@ -617,7 +618,7 @@ def _daemon_identity(candidate, socket):
         cmd += ["--socket", socket]
     cmd += ["status", "--json"]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        r = _run_decoded(cmd, timeout=12)
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return None
     try:
@@ -768,9 +769,38 @@ def die(msg, code=2):
     sys.exit(code)
 
 
+def _force_utf8_stdio():
+    """★(0.14.48 · A) 이 프로세스의 stdout·stderr 를 UTF-8 로 재설정한다 — `main()` 첫 줄에서만 부른다.
+
+    왜: 데몬은 자동 복원용 phoenix 를 UTF-8 강제 변수 없이 띄우고 stdout 을 파일로 돌린다. 그러면 파이썬은
+    시스템 기본 코드페이지(한국어 윈도우 cp949 · 영문 윈도우 cp1252)로 쓰는데, 로그·결과 JSON 의 줄표(—)·★·한글이
+    그 코드페이지에 없으면 UnicodeEncodeError 로 복원 전체가 종료코드 1 이 됐다(실측: 윈도우 11 러너 cp1252 ·
+    맥 cp949 모의). 코드가 인코딩을 직접 적으면 인터프리터가 어떤 모드로 뜨든 결과가 같다.
+    · errors="backslashreplace" — 대리 문자처럼 UTF-8 로도 못 쓰는 값이 와도 죽지 않는다.
+    · None·닫힌 스트림·reconfigure 가 없는 대역은 그대로 둔다(지원 전제 = 열린 표준 스트림).
+    · import 시점에는 부르지 않는다 — 이 모듈을 불러 쓰는 쪽의 stdout 을 import 만으로 바꾸지 않는다."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None:
+                stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass
+
+
 def log(msg):
-    sys.stdout.write("[phoenix] %s\n" % msg)
-    sys.stdout.flush()
+    line = "[phoenix] %s\n" % msg
+    try:
+        try:
+            sys.stdout.write(line)
+        except UnicodeEncodeError:
+            # ★(0.14.48 · A) `main()` 을 거치지 않은 호출(이 모듈을 import 해 쓰는 경로)은 stdout 이 재설정돼 있지 않다 —
+            #   그 스트림이 못 쓰는 글자는 이스케이프로 바꿔 남긴다. 진단 한 줄 때문에 복원이 죽지 않는다.
+            #   (다시 쓰는 것은 write 가 실패했을 때뿐이다 — flush 실패로는 같은 줄을 두 번 쓰지 않는다.)
+            enc = getattr(sys.stdout, "encoding", None) or "ascii"
+            sys.stdout.write(line.encode(enc, "backslashreplace").decode(enc, "replace"))
+        sys.stdout.flush()
+    except (ValueError, AttributeError, OSError, LookupError):
+        pass  # 진단 스트림에 쓰지 못함(닫힘 · 없음 · write/flush 의 OSError) — 버린다 · 죽지 않는다
 
 
 def _emit_evt(evt_type, **fields):
@@ -784,7 +814,7 @@ def _emit_evt(evt_type, **fields):
     for k, v in fields.items():
         cmd += ["--field", "%s=%s" % (k, v)]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        r = subprocess.run(cmd, capture_output=True, timeout=8)  # ★(0.14.48 · A) 종료코드만 쓴다 — 출력을 글자로 풀지 않는다
         return r.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         return False
@@ -911,6 +941,37 @@ def _decode_captured(b):
     return b or ""
 
 
+def _dec_any(b):
+    """★(0.14.48 · A) 상대가 **무슨 인코딩으로 쓰는지 정해져 있지 않은** 출력(운영체제 도구 · 사용자가 준 셸 명령 ·
+    자식 파이썬)을 예외 없이 문자열로 만든다. UTF-8 로 먼저 풀고, 안 되면 시스템 기본 인코딩으로 대체 문자와 함께 푼다.
+    글자는 표시 · 세대 이름(숫자·영문) 추출 · ASCII 표지(KeepAlive·RunAtLoad) 검색에만 쓰고 — 셋 다 ASCII 라 오독에
+    영향받지 않는다 — 성패는 호출처가 종료코드로 본다. 여기서 예외가 나면 이미 실행된 명령의 종료코드까지 잃는다.
+    글자의 정확성은 약속하지 않는다(두 인코딩 모두에서 유효한 바이트는 UTF-8 로 읽힌다). (Rust CLI 출력처럼 UTF-8 이 계약인 자리는 `_decode_captured` 를 쓴다.)"""
+    if b is None:
+        return ""
+    if not isinstance(b, bytes):
+        return b or ""
+    try:
+        return b.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return b.decode(locale.getpreferredencoding(False) or "utf-8", "replace")
+    except LookupError:
+        return b.decode("utf-8", "replace")
+
+
+def _run_decoded(cmd, dec=_decode_captured, **kw):
+    """★(0.14.48 · A) 하위 프로세스 출력을 **바이트로 받아 명시적으로** 푼다 — `text=True`(= 부모의 기본 인코딩으로 풀기)를
+    쓰지 않는다. 종전에는 cp949 부모가 `cys status --json` 의 UTF-8 출력(좌석 제목·작업 폴더의 한글)을 받다
+    UnicodeDecodeError 로 복원 본체에 닿기도 전에 죽었다(실측). 반환은 `subprocess.run` 과 같은 꼴이고
+    stdout·stderr 만 문자열이다. TimeoutExpired 등 예외는 그대로 올린다(호출처의 기존 처리 유지)."""
+    r = subprocess.run(cmd, capture_output=True, **kw)
+    r.stdout = dec(r.stdout)
+    r.stderr = dec(r.stderr)
+    return r
+
+
 def _run_capture_progress(cmd, env, timeout, stall_s, poll_s=1.0):
     """★리뷰 F1·W4(0.14.42): `_run_capture` 에 **진행 감시**를 더한 실행기 — 상한(timeout) 안이라도 stdout·stderr 가
     stall_s 초 동안 한 바이트도 늘지 않으면 행으로 보고 끊는다(rc 124 · `stalled=True`). 임시파일 캡처라 파이프 EOF
@@ -1004,7 +1065,7 @@ def cys(*args, socket=None, timeout=25):
     if IS_WINDOWS:
         return _run_capture(cmd, env, timeout)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        r = _run_decoded(cmd, timeout=timeout, env=env)
         return r
     except subprocess.TimeoutExpired as e:
         class _R:
@@ -1077,7 +1138,7 @@ def read_topology(socket):
     if not os.path.exists(p):
         return {"entries": [], "updated_at": 0, "_path": p, "_missing": True}
     try:
-        t = json.load(open(p))
+        t = json.load(open(p, encoding="utf-8"))
         t["_path"] = p
         return t
     except Exception as e:
@@ -1098,7 +1159,7 @@ def _roster_file_status(path):
     if not os.path.exists(path):
         return "missing"
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             json.load(f)
         return "valid"
     except Exception:
@@ -1113,7 +1174,7 @@ def load_desired_roster(socket):
     p = desired_roster_path(socket)
     if os.path.exists(p):
         try:
-            d = json.load(open(p))
+            d = json.load(open(p, encoding="utf-8"))
             return d.get("roster", {}), set(d.get("tombstones", []))
         except Exception:
             # ★C2: 손상은 침묵 빈집합이 아니라 로그(sentinel 이 run_restore 진입에서 부활 차단). 전체 복원 체인=W3.
@@ -1140,7 +1201,7 @@ def _snapshot_roster_entries(socket):
         tp = os.path.join(gen_root, g, "topology.json")
         if os.path.exists(tp):
             try:
-                t = json.load(open(tp))
+                t = json.load(open(tp, encoding="utf-8"))
                 return {e["role"]: e for e in t.get("entries", []) if e.get("role")}
             except Exception:
                 continue
@@ -1161,7 +1222,7 @@ def _snapshot_tombstones(socket):
         tp = os.path.join(gen_root, g, "topology.json")
         if os.path.exists(tp):
             try:
-                t = json.load(open(tp))
+                t = json.load(open(tp, encoding="utf-8"))
                 return set(x for x in t.get("tombstones", []) if isinstance(x, str))
             except Exception:
                 continue
@@ -1201,6 +1262,54 @@ def _prune_corrupt(path, keep=3):
             os.remove(os.path.join(d, f))
         except OSError:
             pass
+
+
+_NOTICE_MAX_FILES = 30          # 전체 폴더 목록을 한 번 훑어 고른 후보 중 여는 파일 수 상한(목록 크기 상한 아님)
+_NOTICE_MAX_BYTES = 1 << 20     # 일반 파일의 열기 전 getsize 기준 1 MiB(읽는 바이트 수 자체의 상한 아님)
+_NOTICE_MAX_LINES = 3           # 로그에 경로를 적는 줄 수 상한(넘는 것은 개수만 한 줄)
+
+
+def _notice_requalified_corrupt(socket):
+    """★(0.14.48 · A) 앞선 판(0.14.44~0.14.47)은 기본 인코딩이 UTF-8 이 아닌 기계에서 **멀쩡한** 로스터·저널을 못 읽어
+    `.corrupt-<시각>` 으로 치웠다. 그렇게 치워진 것 가운데 UTF-8 로 읽으면 유효한 JSON 인 격리본을 찾아 한 줄씩 알린다.
+    **되돌리지 않는다** — 격리본이 지금 상태보다 낡았을 수 있고, 역할 묘비의 원본은 데몬의 topology 다(부서 묘비는
+    dept_roster 가 원본). 사람이 내용을 보고 정한다. 파일은 건드리지 않는다(읽기만). 반환 = 알린 경로 목록(시험용).
+    · 복원 잠금을 쥔 채 도는 덤 알림이다. 폴더 전체 목록을 한 번 훑고(목록 크기 상한 없음), 격리 시각순 최근
+      `_NOTICE_MAX_FILES` 개를 후보로 고른 뒤 이름순으로 검사한다. 후보 중 여는 파일은 최대 `_NOTICE_MAX_FILES` 개다.
+    · 일반 파일을 전제로 열기 전 getsize 가 `_NOTICE_MAX_BYTES` 를 넘으면 건너뛴다. 읽는 바이트 수 자체의 상한은 아니다.
+    · 유효한 격리본 중 이름순 끝의 `_NOTICE_MAX_LINES` 개를 예시로 로그에 적는다. 시간상 가장 최근이라는 보장은 없다.
+      건너뛴 것은 알림에서 빠질 뿐 복원 판정에는 쓰이지 않는다."""
+    found = []
+    try:
+        home = phoenix_home(socket)
+        names = sorted(os.listdir(home))
+    except Exception:
+        return found
+    cands = []
+    for name in names:
+        if ".corrupt-" not in name:
+            continue
+        base = name.split(".corrupt-", 1)[0]
+        if not (base in ("desired_roster.json", "dept_roster.json") or (base.startswith("journal-") and base.endswith(".json"))):
+            continue
+        cands.append(name)
+    cands.sort(key=lambda n: n.split(".corrupt-", 1)[1])  # 격리 시각 순(이름 규약) — 최근 것부터 남긴다
+    for name in sorted(cands[-_NOTICE_MAX_FILES:]):
+        path = os.path.join(home, name)
+        try:
+            if os.path.getsize(path) > _NOTICE_MAX_BYTES:
+                continue
+            with open(path, encoding="utf-8") as f:
+                json.load(f)
+        except Exception:
+            continue  # 진짜 손상본 — 알릴 것이 없다
+        found.append(path)
+    for path in found[-_NOTICE_MAX_LINES:]:  # 로그는 이름순 끝의 몇 개를 예시로만 기록(시간상 최신 보장 없음) — 반복 알림의 줄 수 제한
+        log("★격리본 알림: %s 은 UTF-8 로 읽으면 멀쩡한 JSON 이다 - 앞선 판이 인코딩 오판으로 치운 파일일 수 있다. "
+            "자동으로 되돌리지 않는다(내용 확인 뒤 필요하면 사람이 되돌린다)." % path)
+    if len(found) > _NOTICE_MAX_LINES:
+        log("★격리본 알림: 같은 폴더에 그런 파일이 %d개 더 있다(%s)." % (len(found) - _NOTICE_MAX_LINES, home))
+    return found
 
 
 def _recovered_provenance(path):
@@ -1470,7 +1579,7 @@ def _observe_and_persist_roster_locked(socket, rebase=False):
     try:
         _dp = desired_roster_path(socket)
         if os.path.exists(_dp):
-            prev = json.load(open(_dp))
+            prev = json.load(open(_dp, encoding="utf-8"))
     except Exception:
         prev = {}
     last_seen_rev = prev.get("tombstones_rev")
@@ -1647,7 +1756,7 @@ def load_dept_roster(socket):
     p = dept_roster_path(socket)
     if os.path.exists(p):
         try:
-            d = json.load(open(p))
+            d = json.load(open(p, encoding="utf-8"))
             return d.get("roster", {}), set(d.get("tombstones", []))
         except Exception:
             pass
@@ -1674,7 +1783,7 @@ def _observe_and_persist_depts_locked(socket, rebase=False):
     try:
         _dp = dept_roster_path(socket)
         if os.path.exists(_dp):
-            _prev_prov = json.load(open(_dp)).get("recovered_from")
+            _prev_prov = json.load(open(_dp, encoding="utf-8")).get("recovered_from")
     except Exception:
         _prev_prov = None
     for dept, info in discover_depts().items():
@@ -1797,7 +1906,7 @@ def load_journal(socket, ticket_id):
     p = journal_path(socket, ticket_id)
     if os.path.exists(p):
         try:
-            return json.load(open(p))
+            return json.load(open(p, encoding="utf-8"))
         except Exception as _e:
             # ★C2 2단계 보조상태(W3): 저널은 retention-critical 이 아니다(단계 진행 캐시 — 소실 시 재수행). 손상 시
             #   hard-fail 하지 않고 격리(.corrupt-<ts>·최근3)+경고 후 fresh 로 시작한다. 단 '침묵 삼킴'(try:pass)은
@@ -1862,7 +1971,7 @@ def breaker_check_and_record(socket):
     attempts = []
     if os.path.exists(p):
         try:
-            attempts = json.load(open(p)).get("attempts", [])
+            attempts = json.load(open(p, encoding="utf-8")).get("attempts", [])
         except Exception:
             isolated = _isolate_corrupt(p)  # 손상 격리(.corrupt-<ts>·최근3 prune)
             log("★P2-6: breaker.json 손상 — 격리(%s) 후 빈 카운트 재시작(침묵 리셋 아님·경고). "
@@ -1891,7 +2000,7 @@ def rollback_proposal(socket):
         #   무가드 시 스냅샷 도구가 15초 초과하면 traceback→이유 없는 exit 1(P1-5). 롤백 '제안'은 부가정보이므로
         #   실패해도 restore 판정을 죽이지 않고 note 로 정직히 남긴다.
         try:
-            r = subprocess.run([sys.executable, snap, "list"], capture_output=True, text=True, timeout=15)
+            r = _run_decoded([sys.executable, snap, "list"], _dec_any, timeout=15)
             prop["generations_raw"] = (r.stdout or r.stderr or "").strip()[:600]
             gens = re.findall(r"(\d{8}T\d{6}Z)", r.stdout or "")
             prop["generations"] = gens
@@ -2504,6 +2613,7 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
         atexit.register(lambda h=_lease_handle: _release_lease(h))
     # ★Phase 6: 이 부팅 세대(재시작마다 변경)를 취득 — 저널 완료 마킹의 유효성 기준.
     _ACTIVE_EPOCH = get_boot_epoch(socket)
+    _notice_requalified_corrupt(socket)  # ★(0.14.48 · A) 앞선 판이 오판으로 치운 격리본 알림(읽기만 · 되돌리지 않는다)
 
     # ★C2 손상 대응 — 2단계 계층화(W4 sentinel + W3 폴백 체인). missing(부재)=fresh install 정상 진행.
     #   corrupt(파싱 실패)=격리(.corrupt-<ts>·최근3 prune) 후 폴백 체인(.bak → 세대 스냅샷 → dept 재발견):
@@ -3230,7 +3340,7 @@ def _read_worker_todo():
     per_file, last_section = [], None
     for cand in files:
         try:
-            txt = open(cand, errors="replace").read()
+            txt = open(cand, encoding="utf-8", errors="replace").read()
         except OSError:
             continue
         o, d = txt.count("- [ ]"), txt.count("- [x]")
@@ -3263,7 +3373,7 @@ def cmd_status(args):
     home = phoenix_home(socket)
     journals = [f for f in os.listdir(home) if f.startswith("journal-")] if os.path.isdir(home) else []
     bp = breaker_file(socket)
-    breaker = json.load(open(bp)) if os.path.exists(bp) else {"attempts": []}
+    breaker = json.load(open(bp, encoding="utf-8")) if os.path.exists(bp) else {"attempts": []}
     now = _now()
     recent = [t for t in breaker.get("attempts", []) if now - t <= BREAKER_T]
     st = {
@@ -3294,12 +3404,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 TOPO="$HERE/topology.json"
 echo "== 불사조 수동 복원 (세대: $HERE) =="
 if [ ! -f "$TOPO" ]; then echo "!! topology.json 없음 — 복원 불가"; exit 1; fi
-echo "재건 대상 역할:"; python3 -c "import json;[print(' -',e['role'],'/',e.get('agent'),'/ sid',e.get('session_id')) for e in json.load(open('$TOPO'))['entries']]"
+echo "재건 대상 역할:"; python3 -c "import json,sys;sys.stdout.reconfigure(errors='backslashreplace');[print(' -',e['role'],'/',e.get('agent'),'/ sid',e.get('session_id')) for e in json.load(open('$TOPO', encoding='utf-8'))['entries']]"
 echo ""
 echo "아래 명령을 한 줄씩 확인 후 실행하라(순차 기동 — 동시 resume 폭주 방지 §10.4):"
 python3 - "$TOPO" <<'PY'
 import json,sys
-t=json.load(open(sys.argv[1]))
+sys.stdout.reconfigure(errors='backslashreplace')
+t=json.load(open(sys.argv[1], encoding='utf-8'))
 for e in t.get('entries',[]):
     role=e['role']; agent=e.get('agent','claude')
     print("cys launch-agent --role %s --agent %s   # 기동 후 각성 확인, 필요시 cys reinject --role %s" % (role, agent, role))
@@ -3319,7 +3430,7 @@ def cmd_gen_manual(args):
     _atomic_write_json(os.path.join(dest, "topology.json"),
                        {"entries": topo.get("entries", []), "updated_at": topo.get("updated_at", 0)})
     sp = os.path.join(dest, "manual_restore.sh")
-    with open(sp, "w") as f:
+    with open(sp, "w", encoding="utf-8") as f:
         f.write(MANUAL_RESTORE_TEMPLATE)
     os.chmod(sp, 0o755)
     out = {"manual_restore_script": sp, "topology_copy": os.path.join(dest, "topology.json"),
@@ -3376,7 +3487,7 @@ def cmd_gen_protect(args):
 done
 echo "※ hook 사망=조용한 해제 방향이므로 hook 생존을 신뢰 원장의 감시 항목에 포함할 것(§11.2 meta-drill)."
 '''
-    with open(dest, "w") as f:
+    with open(dest, "w", encoding="utf-8") as f:
         f.write(body)
     os.chmod(dest, 0o755)
     out = {"protect_script": dest, "applied": False, "mode": "dry-run",
@@ -3401,8 +3512,7 @@ def _launchctl_bin():
 
 def _launchctl(*args, timeout=10):
     try:
-        return subprocess.run([_launchctl_bin()] + [str(a) for a in args],
-                              capture_output=True, text=True, timeout=timeout)
+        return _run_decoded([_launchctl_bin()] + [str(a) for a in args], _dec_any, timeout=timeout)
     except Exception as e:
         class _R:
             returncode = 127
@@ -3480,8 +3590,7 @@ def cmd_launchd_ensure(args):
 
 def _schtasks(*args, timeout=10):
     try:
-        return subprocess.run(["schtasks"] + [str(a) for a in args],
-                              capture_output=True, text=True, timeout=timeout)
+        return _run_decoded(["schtasks"] + [str(a) for a in args], _dec_any, timeout=timeout)
     except Exception as e:
         class _R:
             returncode = 127
@@ -3573,8 +3682,7 @@ def _win_restart_daemon(socket, timeout):
     res["daemon_pid"] = pid
     if pid:
         try:
-            kr = subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                                capture_output=True, text=True, timeout=15)
+            kr = _run_decoded(["taskkill", "/PID", str(pid), "/T", "/F"], _dec_any, timeout=15)
             res["taskkill_rc"] = kr.returncode
             res["taskkill_out"] = ((kr.stdout or "") + (kr.stderr or "")).strip()[:200]
         except Exception as e:
@@ -3653,7 +3761,7 @@ def load_deploy_journal(socket, ticket):
     p = deploy_journal_path(socket, ticket)
     if os.path.exists(p):
         try:
-            return json.load(open(p))
+            return json.load(open(p, encoding="utf-8"))
         except Exception:
             # ★C2 2단계 보조상태(W3): deploy 저널도 재개 캐시(비 retention) — 손상 시 격리+경고 후 fresh.
             isolated = _isolate_corrupt(p)
@@ -3795,7 +3903,7 @@ def _deploy_snapshot(socket, roster):
         # ★.ps1 은 PowerShell 로 실행 — 실행권한 비트(chmod) 개념 없음(생략).
     else:
         runbook = os.path.join(gen_dir, "MANUAL_RESTORE.sh")
-        with open(runbook, "w") as f:
+        with open(runbook, "w", encoding="utf-8") as f:
             f.write(_render_deploy_runbook(roster))
         os.chmod(runbook, 0o755)
     return {"ok": bool(gen_name), "gen_root": gen_root, "gen": gen_name, "gen_dir": gen_dir,
@@ -3811,7 +3919,7 @@ def _deploy_restart(socket, restart_hook, timeout):
         res["path"] = "hook(격리·injected)"
         res["hook"] = restart_hook
         try:
-            r = subprocess.run(restart_hook, shell=True, capture_output=True, text=True, timeout=max(timeout, 30))
+            r = _run_decoded(restart_hook, _dec_any, shell=True, timeout=max(timeout, 30))
             res["hook_rc"] = r.returncode
             res["hook_out"] = (r.stdout or r.stderr or "").strip()[-500:]
         except subprocess.TimeoutExpired:
@@ -4008,7 +4116,7 @@ def cmd_deploy(args):
         # ── apply (선택) — 실패 시 재시작 진입 금지(부작용 확산 차단) ──
         if apply_cmd and not _same_gen("apply"):
             try:
-                ar = subprocess.run(apply_cmd, shell=True, capture_output=True, text=True, timeout=600)
+                ar = _run_decoded(apply_cmd, _dec_any, shell=True, timeout=600)
                 arc, aout, aerr = ar.returncode, (ar.stdout or "")[-600:], (ar.stderr or "")[-400:]
             except subprocess.TimeoutExpired:
                 arc, aout, aerr = 124, "", "TIMEOUT"
@@ -4118,6 +4226,7 @@ def cmd_deploy(args):
 
 def main():
     global CYS
+    _force_utf8_stdio()  # ★(0.14.48 · A) selftest 판정보다 앞 — 이 프로세스의 모든 출력이 UTF-8 로 나간다
     # ★B1 self-test(임베드 추출 직후 cysd 가 호출): 추출된 phoenix 가 실행가능한지만 확인한다 — 데몬·cys 해석·
     #   상태파일 무접촉. argparse(서브커맨드 required)·_resolve_cys 이전에 조기 종료해 순수 실행성만 검증.
     #   설계 §2 B1③ 수용조건. --pack-version 은 별칭(설계 표기 정합).
