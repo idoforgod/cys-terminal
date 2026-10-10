@@ -437,7 +437,7 @@ def _ev(name, cat, payload, seq):
 # 윈도우 로그에서 재구성한 틀(키 순서·머리·한글 본문) — 0.14.48 조사에서 쓴 세 줄과 같은 꼴이다. 뒤따르는 AFTER(557)가 "다음 이벤트가 처리되는가"의 표지.
 F_ACK = (b'{"_flen":0,"_pv":1,"heartbeat_interval_seconds":15,"latest_seq":553,"ok":true,"resume":{"after_seq":null,"gap":false,'
          b'"latest_seq":553,"next_seq":554,"oldest_seq":513},"type":"ack"}')
-F_ASCII = _ev("surface.created", "surface", {"cmd": "cmd.exe", "cwd": "C:\\Users\\runneradmin", "pid": 6084, "role": None, "surface_ref": "surface:5"}, 554)
+F_ASCII = _ev("surface.created", "surface", {"cmd": "cmd.exe", "cwd": "C:\\Users\\runner", "pid": 6084, "role": None, "surface_ref": "surface:5"}, 554)
 _TICK_OUT = json.dumps({"result": "skip", "roles": [{"role": "worker", "pass": False, "reason": "대상 유휴: role=worker surface 부재; 미해결 발화(clear 가드)·측정 유효: "
                         "phase=부재(구 데몬 — fail-closed) fire_id=None executed=False · 측정 ok=False reason=x ctx_pct=None"}],
                         "sweep": {}, "gate_exit": 3}, ensure_ascii=False) + "\n"
