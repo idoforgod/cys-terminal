@@ -175,7 +175,7 @@ class ReaderLoopWiring(unittest.TestCase):
 
     def _run_reader(self, alive_secs_per_iter):
         sup = HB.SubscriptionSupervisor(
-            world=types.SimpleNamespace(seq=0), hub=None, coal=None, poke=None,
+            world=types.SimpleNamespace(seq=0), hub=None, coal=None, poke=types.SimpleNamespace(set=lambda: None),   # 0.14.49: 재수립마다 poke.set() 을 부른다
             state_dir=tempfile.mkdtemp(prefix="hud-backoff-wiring-"))
         stop = _RecordingStop(n=len(alive_secs_per_iter))
         orig_popen, orig_mono = HB.subprocess.Popen, HB.time.monotonic

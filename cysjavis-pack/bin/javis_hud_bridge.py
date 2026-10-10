@@ -40,6 +40,9 @@ SUB_CAP = int(os.environ.get("HUD_SUB_CAP", "12"))     # 동시 구독 상한(�
 SUB_BACKOFF_SECS = 2.0                                   # 구독 재수립 백오프(바닥 — W2 지수의 시작값)
 SUB_BACKOFF_CAP_SECS = 60.0                              # W2: 급속 재종료 지수 백오프 상한
 SUB_STABLE_RESET_SECS = 30.0                             # W2: 이만큼 살았으면 정상 구독 — 백오프 초기화
+SUB_REVIVE_STABLE_SECS = 600.0                           # (0.14.49) a reader THREAD must live this long before its restart pacing resets
+SUBS_HEALTH_MAX = 16                                     # (0.14.49) /health lists at most this many subscriptions (dead/errored first)
+SUB_BEHIND_NOTE_SECS = 120.0                             # (0.14.49) main reader this far behind the daemon with no line -> one log line (observe only)
 SUB_RECONCILE_SECS = 2.0                                 # 타깃 reconcile 주기
 # Windows: 이 브리지는 콘솔 없는 cysd가 NO_WINDOW로 띄운다 — 콘솔 자식(cys.exe)을 그냥
 # 스폰하면 새 콘솔 창이 할당된다(상주 events 자식 = AppData 경로 제목의 검은 WT 탭 실사고
@@ -74,6 +77,14 @@ def _req_timeout():
 def _nostdin():
     """자식에게 표준입력을 물려주지 않는다(수명줄 파이프가 자식에게 새지 않게). 윈도우 종전은 그대로."""
     return {} if _legacy_win() else {"stdin": subprocess.DEVNULL}
+
+
+def _has_escape(s):
+    """(0.14.49) True when text decoded with errors="surrogateescape" carries a byte that was not valid UTF-8."""
+    return any("\udc80" <= c <= "\udcff" for c in s)
+
+
+_SUPERVISOR = None   # (0.14.49) set once in main(); read by health_body()
 
 
 def _log(msg):
@@ -1546,7 +1557,7 @@ def peek_surface(key, socket=None, lines=12):
         args += ["--socket", socket]
     args += ["read-screen", "--surface", bare, "--lines", "40"]
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=10, **_nostdin(), **NOWIN)
+        r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, **_nostdin(), **NOWIN)
         if r.returncode != 0:
             return None
         txt = ANSI_RE.sub("", r.stdout)
@@ -1558,8 +1569,12 @@ def peek_surface(key, socket=None, lines=12):
 
 def run_json(args, timeout=10):
     try:
-        out = subprocess.run([CYS] + args, capture_output=True, text=True, timeout=timeout, **_nostdin(), **NOWIN)
+        out = subprocess.run([CYS] + args, capture_output=True, text=True, encoding="utf-8", errors="surrogateescape", timeout=timeout, **_nostdin(), **NOWIN)
         if out.returncode != 0:
+            return None
+        if _has_escape(out.stdout):   # (0.14.49) bytes that are not UTF-8: skip this snapshot round (same result as any failed call)
+            with _STATS_LOCK:
+                _STATS["damaged_snapshots"] = _STATS.get("damaged_snapshots", 0) + 1
             return None
         return json.loads(out.stdout)
     except Exception:
@@ -1626,6 +1641,84 @@ class SubscriptionSupervisor:
         self.poke = poke
         self.state_dir = state_dir
         self.subs = {}   # slug → {"stop":Event, "proc":[Popen|None], "thread":Thread, "socket":..}
+        self.stats = {}   # (0.14.49) slug -> counters and last-line marks; survives thread restarts; read by /health
+        self.revive = {}  # (0.14.49) slug -> {"backoff", "next_at", "born"} - dead-thread restart pacing
+        self.behind = {}  # (0.14.49) slug -> monotonic time since which the reader is behind the daemon with no line
+
+    def _st(self, slug):
+        return self.stats.setdefault(slug, {"read_errors": 0, "respawns": 0, "thread_restarts": 0, "damaged": 0,
+                                            "last_seq": 0, "last_line_at": None})
+
+    def _note(self, slug, key):
+        self._st(slug)[key] += 1
+
+    def liveness(self, now=None):
+        """(0.14.49) Bounded snapshot for /health. Copies only - safe to call from HTTP threads."""
+        now = time.monotonic() if now is None else now
+        rows = []
+        for slug, sub in list(self.subs.items()):
+            d = dict(self.stats.get(slug) or {})
+            at = d.pop("last_line_at", None)
+            rows.append((slug, {"alive": bool(sub["thread"].is_alive()),
+                                "read_errors": d.get("read_errors", 0), "respawns": d.get("respawns", 0),
+                                "thread_restarts": d.get("thread_restarts", 0), "damaged": d.get("damaged", 0),
+                                "last_seq": d.get("last_seq", 0),
+                                "idle_s": None if at is None else int(max(0, now - at))}))
+        dead = sum(1 for _, r in rows if not r["alive"])
+        rows.sort(key=lambda x: (x[1]["alive"], -(x[1]["read_errors"] + x[1]["thread_restarts"] + x[1]["damaged"]), x[0] != "main", x[0]))
+        shown = rows[:SUBS_HEALTH_MAX]
+        return {"total": len(rows), "dead": dead, "omitted": len(rows) - len(shown),
+                "items": {str(slug)[:48]: r for slug, r in shown}}
+
+    def revive_dead(self, now=None):
+        """(0.14.49) Restart reader threads that ENDED without being reaped. Never touches a live thread (a live, blocked
+        reader is the normal state). Pacing: 2 s doubling to the 60 s cap; it resets to 2 s only after the thread lived
+        SUB_REVIVE_STABLE_SECS, so a thread that keeps dying - at once or after half a minute - settles at one restart
+        per cap interval. The restart is never done in the pass that first sees the death."""
+        now = time.monotonic() if now is None else now
+        for slug, sub in list(self.subs.items()):
+            if sub["thread"].is_alive() or sub["stop"].is_set():
+                continue
+            st = self.revive.setdefault(slug, {"backoff": None, "next_at": None, "born": sub.get("born", now)})
+            if st["next_at"] is None:
+                lived = now - st["born"]
+                st["backoff"] = next_sub_backoff(st["backoff"], lived, stable=SUB_REVIVE_STABLE_SECS)
+                st["next_at"] = now + st["backoff"]
+                _log("reader thread ended (sub=%s, lived %.0fs) - restart in %.0fs" % (slug, lived, st["backoff"]))
+                continue
+            if now < st["next_at"]:
+                continue
+            proc = sub["proc"][0]
+            if proc is not None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            st["next_at"] = None
+            st["born"] = now
+            self._note(slug, "thread_restarts")
+            self._spawn(slug, sub["socket"], born=now)
+            self.poke.set()
+
+    def note_behind(self, now=None):
+        """(0.14.49) Observe only: the main reader has printed nothing while the daemon's latest_seq (2 s snapshot) moved past
+        the reader's last seq for SUB_BEHIND_NOTE_SECS -> one log line per episode. No kill, no restart."""
+        now = time.monotonic() if now is None else now
+        sub = self.subs.get("main")
+        if not sub:
+            return None
+        st = self._st("main")
+        daemon_seq = (getattr(self.world, "daemon", None) or {}).get("latest_seq") or 0
+        at = st["last_line_at"]
+        quiet = (now - at) if at is not None else (now - sub.get("born", now))
+        if daemon_seq > st["last_seq"] and quiet >= SUB_BEHIND_NOTE_SECS and sub["thread"].is_alive():
+            if "main" not in self.behind:
+                self.behind["main"] = now
+                _log("events reader is behind the daemon (sub=main reader_seq=%s daemon_seq=%s quiet %.0fs) - observed only"
+                     % (st["last_seq"], daemon_seq, quiet))
+            return True
+        self.behind.pop("main", None)
+        return False
 
     def _reader(self, slug, socket, stop, holder):
         cursor = os.path.join(self.state_dir, f"cursor-{slug}.seq")
@@ -1633,11 +1726,12 @@ class SubscriptionSupervisor:
                     ["events", "--reconnect", "--cursor-file", cursor]
         backoff = None    # W2: 직전에 잔 대기(초) — None = 첫 재수립(지수 백오프 상태)
         last_note = None  # W2: 같은 사유 연속 재종료는 1회만 로그(반복 억제)
+        last_read_err = None  # (0.14.49) read-step exception type - log the first of a run only
         last_evt_err = None  # R1F-PK: 이벤트 처리 예외도 같은 형이 연속이면 첫 1회만 로그(이벤트 폭주 시 로그 폭주 억제)
         while not stop.is_set():
             born = time.monotonic()
             proc = subprocess.Popen(args_base, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True, bufsize=1, **_nostdin(), **NOWIN)
+                                    stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="surrogateescape", bufsize=1, **_nostdin(), **NOWIN)
             if not _legacy_win():
                 with _CHILDREN_LOCK:
                     _CHILDREN.add(proc)
@@ -1651,6 +1745,17 @@ class SubscriptionSupervisor:
                     #   않았다(그 구독의 HUD 표시가 영구히 멎는다). 그 이벤트만 건너뛰고 다음 줄을 처리한다.
                     #   삼키는 것은 `Exception` 계열뿐이다 — KeyboardInterrupt·SystemExit(BaseException)은 그대로 통과한다. 종료 신호(`stop` ·
                     #   위 break)와 자식 EOF(for 문 끝) 와 읽기 단계의 예외(for 문 머리)는 이 try 밖이라 종전 그대로다.
+                    st = self._st(slug)
+                    st["last_line_at"] = time.monotonic()
+                    if _has_escape(line):
+                        # (0.14.49) the child wrote bytes that are not UTF-8 (cys never does): the line is not trusted and is
+                        # not routed. State converges from the 2 s snapshot; one log line per run of damaged lines.
+                        st["damaged"] += 1
+                        if last_read_err != "damaged":
+                            last_read_err = "damaged"
+                            _log("events line with non-UTF-8 bytes skipped (sub=%s) - repeats not logged" % slug)
+                        self.poke.set()
+                        continue
                     try:
                         try:
                             ev = json.loads(line)
@@ -1659,6 +1764,7 @@ class SubscriptionSupervisor:
                         if ev.get("type") != "event":
                             continue
                         self.world.seq = max(self.world.seq, ev.get("seq") or 0)
+                        st["last_seq"] = max(st["last_seq"], ev.get("seq") or 0)
                         frames, want_poke = route_event(ev, self.world, self.coal, slug)
                         for fr in frames:
                             self.hub.publish(fr)
@@ -1677,6 +1783,15 @@ class SubscriptionSupervisor:
                                      % (slug, sig, " ".join(str(e).split())[:120]))
                             except Exception:
                                 pass
+            except Exception as e:
+                # (0.14.49) an exception raised by the READ step (the `for` head) used to leave _reader and end the thread for good.
+                # It now ends only this child: the code below terminates it and re-establishes through the shipped backoff.
+                self._note(slug, "read_errors")
+                sig = type(e).__name__
+                if sig != last_read_err:
+                    last_read_err = sig
+                    _log("events read error - child will be re-established with backoff (sub=%s %s: %s) - repeats not logged"
+                         % (slug, sig, " ".join(str(e).split())[:120]))
             finally:
                 try:
                     proc.terminate()
@@ -1686,6 +1801,8 @@ class SubscriptionSupervisor:
                     _CHILDREN.discard(proc)
             if stop.is_set():
                 break
+            self._note(slug, "respawns")
+            self.poke.set()   # (0.14.49) events may have been lost while the child was down - take a snapshot now
             # W2 재스폰 스톰 차단: 조기 종료는 지수 백오프(2→4→…→60s), 안정 생존
             # (>= SUB_STABLE_RESET_SECS) 후 종료는 정상 회전으로 보고 백오프 초기화.
             alive = time.monotonic() - born
@@ -1702,15 +1819,18 @@ class SubscriptionSupervisor:
                 last_note = note
             stop.wait(backoff)        # 구독 재수립 백오프 — Event.wait: reap 시 즉시 깨어남
 
-    def _spawn(self, slug, socket):
+    def _spawn(self, slug, socket, born=None):
         stop = threading.Event()
         holder = [None]
         t = threading.Thread(target=self._reader, args=(slug, socket, stop, holder), daemon=True)
-        self.subs[slug] = {"stop": stop, "proc": holder, "thread": t, "socket": socket}
+        self.subs[slug] = {"stop": stop, "proc": holder, "thread": t, "socket": socket,
+                           "born": time.monotonic() if born is None else born}
         t.start()
 
     def _reap(self, slug):
         sub = self.subs.pop(slug, None)
+        self.revive.pop(slug, None)
+        self.behind.pop(slug, None)
         if not sub:
             return
         sub["stop"].set()
@@ -1721,7 +1841,7 @@ class SubscriptionSupervisor:
             except Exception:
                 pass
 
-    def reconcile_once(self):
+    def reconcile_once(self, now=None):
         desired = {"main": None}
         desired.update(self.world.dept_targets())
         to_spawn, to_reap = reconcile_targets(desired, self.subs)
@@ -1729,6 +1849,8 @@ class SubscriptionSupervisor:
             self._reap(slug)
         for slug, sock in to_spawn.items():
             self._spawn(slug, sock)
+        self.revive_dead(now)
+        self.note_behind(now)
 
     def run(self):
         os.makedirs(self.state_dir, exist_ok=True)
@@ -1993,12 +2115,12 @@ class Handler(BaseHTTPRequestHandler):
         # 전달이라 shell 해석 표면 없음. 주입은 surface.input_injected 이벤트로
         # 데몬→브리지→SSE로 되돌아와 화면에 배달 연출로 확인된다(동시성).
         r1 = subprocess.run(pre + ["send", "--surface", bare, "--", text],
-                            capture_output=True, text=True, timeout=10, **_nostdin(), **NOWIN)
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, **_nostdin(), **NOWIN)
         if r1.returncode != 0:
             return self._cmd_result(502, False,
                                     "send_failed: " + (r1.stderr or "")[:120], cleaned)
         r2 = subprocess.run(pre + ["send-key", "--surface", bare, "Return"],
-                            capture_output=True, text=True, timeout=10, **_nostdin(), **NOWIN)
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, **_nostdin(), **NOWIN)
         if r2.returncode != 0:
             return self._cmd_result(502, False,
                                     "return_failed: " + (r2.stderr or "")[:120], cleaned)
@@ -2056,7 +2178,16 @@ def health_body():
             return False
     with _STATS_LOCK:
         touts = _STATS["timeouts"]
+        dsnap = _STATS.get("damaged_snapshots", 0)
+    sup = _SUPERVISOR
+    try:
+        subs = sup.liveness() if sup is not None else None
+    except Exception:
+        subs = None   # /health must answer even if the snapshot fails
+    if subs is not None:
+        subs["damaged_snapshots"] = dsnap
     return json.dumps({
+        "subs": subs,
         "ok": True,
         "pid": os.getpid(),
         "boot_id": BOOT_ID,
@@ -2183,6 +2314,8 @@ def main():
     threading.Thread(target=fleet_loop, args=(world, hub, poke), daemon=True).start()
     # P2-1: 단일 events_loop → 부서별 멀티 구독 슈퍼바이저(공유 hub·coal·poke)
     sup = SubscriptionSupervisor(world, hub, coal, poke, STATE_DIR)
+    global _SUPERVISOR
+    _SUPERVISOR = sup   # (0.14.49) before the supervisor thread starts, so /health never sees a half-built object
     threading.Thread(target=sup.run, daemon=True).start()
     threading.Thread(target=spool_loop, args=(world, hub, coal), daemon=True).start()
     threading.Thread(target=kanban_loop, args=(world, hub), daemon=True).start()
