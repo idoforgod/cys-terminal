@@ -5975,17 +5975,7 @@ fn run(command: Command) -> i32 {
             } else {
                 let dept_soul = cys::pack::dept_scope_of(&dir).is_some()
                     && (rel == "soul.md" || rel.ends_with("/soul.md"));
-                let meaning = if dept_soul && name == "seed-once" {
-                    "부서 soul — base 헌장 승계(최초 1회 시드), 존재하면 force 여도 불가침"
-                } else {
-                    match name {
-                        "custom" => "비출하 자작 파일 — 업데이트·치유·정리 전부 불가침(생존 보증 대상)",
-                        "user" => "사용자 소유 — 업데이트가 절대 덮지 않음(vendor 전진은 .new 병치)",
-                        "seed-once" => "런타임 상태 — 부재 시에만 시드, 존재하면 불가침",
-                        _ => "vendor 소유 — 수정본은 제자리 보존(kept-drift)·벤더 전진 시 자동 병합(충돌 시 .user 보존). 자작은 새 파일로",
-                    }
-                };
-                println!("{rel}: {name} — {meaning}");
+                println!("{}", pack_ownership_line(&rel, name, dept_soul));
             }
             return 0;
         }
@@ -10594,6 +10584,25 @@ fn run_factory_reset(
             1
         }
     }
+}
+
+/// `cys pack-ownership <rel>` 의 사람용 한 줄(순수). ★F10 C3: vendor 소유 `hooks/` 파일에는 안내 문장(단일 출처 `pack::HOOKS_LOCAL_GUIDANCE`)을 덧붙인다.
+/// `--quiet` 어휘 4종({system,user,seed-once,custom})은 이 함수와 무관하게 그대로다.
+fn pack_ownership_line(rel: &str, name: &str, dept_soul: bool) -> String {
+    let meaning = if dept_soul && name == "seed-once" {
+        "부서 soul — base 헌장 승계(최초 1회 시드), 존재하면 force 여도 불가침"
+    } else {
+        match name {
+            "custom" => "비출하 자작 파일 — 업데이트·치유·정리 전부 불가침(생존 보증 대상)",
+            "user" => "사용자 소유 — 업데이트가 절대 덮지 않음(vendor 전진은 .new 병치)",
+            "seed-once" => "런타임 상태 — 부재 시에만 시드, 존재하면 불가침",
+            _ => "vendor 소유 — 수정본은 제자리 보존(kept-drift)·벤더 전진 시 자동 병합(충돌 시 .user 보존). 자작은 새 파일로",
+        }
+    };
+    if name == "system" && rel.starts_with("hooks/") {
+        return format!("{rel}: {name} — {meaning}\n{}", cys::pack::HOOKS_LOCAL_GUIDANCE);
+    }
+    format!("{rel}: {name} — {meaning}")
 }
 
 fn run_doctor(fix: bool, json_out: bool) -> i32 {
@@ -41529,6 +41538,19 @@ mod tests {
         assert_eq!(worst.status, DiagStatus::Warn, "{}", worst.detail);
         assert_ne!(worst.status, DiagStatus::Fail);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// F10 C3: `cys pack-ownership hooks/…` (vendor) 는 안내 문장을 같은 출처로 덧붙이고, 그 밖의 파일 · 다른 소유 등급은 종전 문구 그대로다.
+    #[test]
+    fn f10_c3_pack_ownership_line_carries_the_guidance_only_for_vendor_hooks() {
+        let hook = pack_ownership_line("hooks/guard.sh", "system", false);
+        assert!(hook.contains(cys::pack::HOOKS_LOCAL_GUIDANCE), "{hook}");
+        assert!(hook.starts_with("hooks/guard.sh: system — vendor 소유"), "종전 문구 보존: {hook}");
+        for (rel, name) in [("skills/x/SKILL.md", "system"), ("hooks/mine.sh", "custom"), ("hooks/u.sh", "user"), ("state.json", "seed-once")] {
+            let line = pack_ownership_line(rel, name, false);
+            assert!(!line.contains("~/.cys/local/hooks"), "{line}");
+        }
+        assert!(pack_ownership_line("soul.md", "seed-once", true).contains("부서 soul"));
     }
 
     /// T10-7(합친 행 포함): 판독 불가는 vendor 전진에 가려지지 않고(behind 로 둔갑하지 않고) 세어진다.
