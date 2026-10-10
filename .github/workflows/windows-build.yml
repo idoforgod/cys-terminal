@@ -1189,6 +1189,71 @@ jobs:
           if ($code -ne 0) { throw "T5b: 피닉스 기본 인코딩 내성 시험 실패 (exit=$code)" }
           Write-Host "OK: T5b 피닉스 기본 인코딩 내성 통과"
           exit 0
+      # ─────────────────────────────────────────────────────────────────────────
+      # ★(0.14.49 · A2) office HUD bridge — event reader under the runner's native code page, **no PYTHONUTF8**.
+      #   Why: the daemon starts the bridge without a UTF-8 switch. On Windows 11 (runs 37973201747 · 37961405467)
+      #   the subscription reader thread died on the first Korean event with UnicodeDecodeError ('charmap' 0x81 @233,
+      #   0x9d @114 / @143) and nothing restarted it. Every other python step here wraps PYTHONUTF8=1, so none of them
+      #   could see it. This step runs the WHOLE bridge backoff suite (the seat that owns the bridge adds the encoding
+      #   cases there — no test names are agreed between seats) with the bundled interpreter that ships to users.
+      #   It prints the native encoding it saw and pass/total as numbers. total 0 or UTF-8 mode on = "not measured"
+      #   = fail (never a silent green). Limit: the runner is cp1252; cp949 is covered only by the suite's emulation.
+      #   Do not write the suite file name in the step title or comments (see the T6 note below) — the $t line is
+      #   the only evidence that this lane runs it.
+      - name: T5c HUD 브리지 구독 읽기 기본 인코딩 내성 (PYTHONUTF8 없이 — 러너 네이티브 코드페이지)
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = $env:CYS_INSTALL_DIR
+          if (-not $dir) { throw "T5c: CYS_INSTALL_DIR not set - the self-contained install step failed or the step order changed" }
+          if ((Get-Content (Join-Path $dir 'cys-installed-version.txt') -Raw).Trim() -ne $env:CYS_INSTALL_VER) { throw "T5c: the install changed in between - marker != value fixed at install ($env:CYS_INSTALL_VER)" }
+          $py = Join-Path $dir 'runtime\python\python3.exe'
+          if (-not (Test-Path $py)) { throw "T5c: bundled python3.exe not found: $py" }
+          $t = Join-Path (Get-Location) 'cysjavis-pack\bin\tests\test_hud_bridge_backoff.py'
+          if (-not (Test-Path $t)) { throw "T5c: suite not found (checkout path): $t" }
+          # No PYTHONUTF8 in this step - strip an inherited value too.
+          Remove-Item Env:PYTHONUTF8 -ErrorAction SilentlyContinue
+          Remove-Item Env:PYTHONIOENCODING -ErrorAction SilentlyContinue
+          $env:PYTHONDONTWRITEBYTECODE = '1'
+          # Small runner: loads the suite file as a module, runs every test, prints the counts as numbers.
+          # The unittest stream goes to stderr (backslashreplace on Windows), so Korean test text cannot crash
+          # the runner's own cp1252 stdout; the summary lines on stdout are ASCII.
+          $runner = Join-Path $env:RUNNER_TEMP 't5c_hud_suite_runner.py'
+          @'
+          import importlib.util, locale, os, sys, unittest
+          path = sys.argv[1]
+          try:
+              getenc = locale.getencoding()
+          except AttributeError:
+              getenc = "n/a"
+          print("T5c native: preferred_encoding=%s getencoding=%s utf8_mode=%d PYTHONUTF8=%s stdout=%s python=%s"
+                % (locale.getpreferredencoding(False), getenc, sys.flags.utf8_mode,
+                   os.environ.get("PYTHONUTF8", "<unset>"), sys.stdout.encoding, sys.version.split()[0]), flush=True)
+          if sys.flags.utf8_mode:
+              print("T5c: UTF-8 mode is on - the native-code-page condition is not established (not measured)", flush=True)
+              sys.exit(3)
+          spec = importlib.util.spec_from_file_location("hud_bridge_backoff_suite", path)
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          suite = unittest.defaultTestLoader.loadTestsFromModule(mod)
+          res = unittest.TextTestRunner(stream=sys.stderr, verbosity=2).run(suite)
+          total = res.testsRun
+          bad = len(res.failures) + len(res.errors) + len(res.unexpectedSuccesses)
+          skipped = len(res.skipped)
+          for case, why in res.skipped:
+              print("T5c skipped: %s (%s)" % (case.id(), str(why).encode("ascii", "backslashreplace").decode("ascii")), flush=True)
+          print("T5c result: pass=%d total=%d failed=%d skipped=%d" % (total - bad - skipped, total, bad, skipped), flush=True)
+          if total == 0:
+              print("T5c: zero tests ran - not measured", flush=True)
+              sys.exit(3)
+          sys.exit(0 if bad == 0 else 1)
+          '@ | Set-Content -Path $runner -Encoding ascii
+          & $py $runner $t
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "T5c: HUD bridge suite under the native code page failed (exit=$code; 3 = not measured)" }
+          Write-Host "OK: T5c HUD bridge suite passed under the native code page"
+          exit 0
 
       # ─────────────────────────────────────────────────────────────────────────
       # T6 형제 import 가드 회귀 (D1) — ★**이 레인에서만 진짜 조건으로 돈다**.
