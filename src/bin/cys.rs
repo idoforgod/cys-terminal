@@ -9993,6 +9993,34 @@ const RUNTIME_SEAL_RECOVERY: &str = "복구는 v0.14.30 이상으로 재설치 �
 폴더)을 통째로 교체하므로 오염 파일이 함께 사라지고 봉인이 자연 복원된다(부분 삭제 불요·권장하지 \
 않음). 전역 npm 설치가 원인이면 그 패키지를 앱 밖 prefix 로 다시 설치하라";
 
+/// ★F10: `hooks/` 행 → doctor 상세 조각. 센 행(drift · drift+behind · missing · unreadable)은 이름과 세 해시(디스크·매니페스트·vendor 앞 8자)로,
+/// 안 센 행(behind · extra)은 이름만. 고친 훅(drift 계열)이 있으면 C3 안내 문장을 한 번 붙인다.
+fn hook_drift_parts(rows: &[cys::pack::HookRow]) -> Vec<String> {
+    let sh = |h: &Option<String>| h.as_deref().map(cys::pack::short_hash).unwrap_or("-").to_string();
+    let mut parts = Vec::new();
+    let counted: Vec<String> = rows
+        .iter()
+        .filter(|r| r.state.counted())
+        .map(|r| format!("{}({}·디스크 {}·매니페스트 {}·vendor {})", r.rel, r.state.as_str(), sh(&r.disk), sh(&r.manifest), sh(&r.vendor)))
+        .collect();
+    if !counted.is_empty() {
+        parts.push(format!("★hooks 점검 {}건: {}", counted.len(), counted.join(", ")));
+    }
+    let names = |st: cys::pack::HookState| -> Vec<&str> { rows.iter().filter(|r| r.state == st).map(|r| r.rel.as_str()).collect() };
+    let behind = names(cys::pack::HookState::Behind);
+    if !behind.is_empty() {
+        parts.push(format!("hooks 설치 대기(behind) {}건: {} — 다음 설치가 갱신한다(등급 무관)", behind.len(), behind.join(", ")));
+    }
+    let extra = names(cys::pack::HookState::Extra);
+    if !extra.is_empty() {
+        parts.push(format!("hooks 자작(extra) {}건: {} — vendor 가 모르는 파일(등급 무관)", extra.len(), extra.join(", ")));
+    }
+    if rows.iter().any(|r| matches!(r.state, cys::pack::HookState::Drift | cys::pack::HookState::DriftBehind)) {
+        parts.push(cys::pack::HOOKS_LOCAL_GUIDANCE.to_string());
+    }
+    parts
+}
+
 /// ★T4: 팩 드리프트 관측 — 읽기 전용(--fix 무관 · "pack 본체 불가침" 계약 유지).
 /// manifest↔디스크 해시 대조 + 원장 kind 별 계상(pending_kind_counts 자구 동형 — pub(crate)라
 /// bin 비가시·직접 집계) + 손상 의심 라벨(cys::merge3::suspect_damage + json_gate import 소비 —
@@ -10066,6 +10094,9 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
             Err(_) => missing.push(rel.clone()),
         }
     }
+    // ★F10(0.14.50): hooks/ 드리프트 보고 — 순수 분류기(pack::hooks_report)로 일곱 상태를 가른다. 읽기 전용이고 등급 계약은 그대로
+    //   (OK/WARN/SKIP · FAIL 없음): 고친 훅(drift · drift+behind) · 누락 · 판독 불가만 세고, 설치 대기(behind)와 자작(extra)은 이름만 올린다.
+    let hook_rows = cys::pack::hooks_report(&ctx.pack_dir, &manifest, &cys::pack::vendor_hook_hashes());
     let pending = cys::pack::load_merge_pending(&ctx.pack_dir);
     // ★성찰 차단 수리(계상 SOT 3분산): 자구 동형 count_kind 클로저 재구현 제거 —
     // pack::pending_kind_counts(pub 승격) 위임 소비. 신 kind 추가 시 계상기는 한 곳이고,
@@ -10129,6 +10160,7 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
             bin_set.len()
         ));
     }
+    parts.extend(hook_drift_parts(&hook_rows));
     parts.push(format!(
         "캡처 저장소 {cap_n}건 · {}(GC 없음 — 수동 정리 가능)",
         fmt_bytes(cap_bytes)
@@ -10144,7 +10176,8 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
             action.push_str(" · 판독 불가: cys init-pack");
         }
     }
-    let status = if !suspects.is_empty() || n_qr > 0 || !missing.is_empty() || unreadable > 0 {
+    let hooks_counted = hook_rows.iter().any(|r| r.state.counted());
+    let status = if !suspects.is_empty() || n_qr > 0 || !missing.is_empty() || unreadable > 0 || hooks_counted {
         DiagStatus::Warn
     } else {
         DiagStatus::Ok
@@ -41422,6 +41455,97 @@ mod tests {
         assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
         assert!(it.detail.contains("판독 불가 1건"), "{}", it.detail);
         assert_ne!(it.status, DiagStatus::Fail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── F10 (0.14.50): hooks/ 드리프트 — 고친 훅은 WARN 으로 이름·해시 셋과 함께 보이되 FAIL 은 없다 ──
+    fn f10_two_embedded_hooks() -> (String, String, String, String) {
+        let v = cys::pack::vendor_hook_hashes();
+        let mut it = v.into_iter();
+        let (a, ah) = it.next().expect("임베드 hooks/ 첫 파일");
+        let (b, bh) = it.next().expect("임베드 hooks/ 둘째 파일");
+        (a, ah, b, bh)
+    }
+    fn f10_ctx(tag: &str) -> (DoctorCtx, std::path::PathBuf) {
+        let base = b2_tmp(tag);
+        let ctx = doctor_ctx_at(&base);
+        std::fs::create_dir_all(ctx.pack_dir.join("hooks")).unwrap();
+        (ctx, base)
+    }
+    fn f10_write_manifest(ctx: &DoctorCtx, m: &Value) {
+        std::fs::write(ctx.pack_dir.join(cys::pack::INSTALL_MANIFEST), serde_json::to_string_pretty(m).unwrap()).unwrap();
+    }
+
+    /// T10-1(설계 시험 1): 매니페스트 해시와 다른 훅 파일 → pack-drift 는 WARN 이고 파일을 이름과 세 해시(디스크·매니페스트·vendor)로 보인다.
+    #[test]
+    fn f10_t1_edited_hook_makes_pack_drift_warn_with_name_and_three_hashes() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (ctx, base) = f10_ctx("f10-t1");
+        let (a, ah, _, _) = f10_two_embedded_hooks();
+        // 대조군: 디스크 = 매니페스트 = vendor → Ok.
+        let body = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == a).unwrap().1;
+        std::fs::write(ctx.pack_dir.join(&a), body).unwrap();
+        f10_write_manifest(&ctx, &json!({ a.clone(): ah.clone() }));
+        let ctl = diag_pack_drift(&ctx);
+        assert_eq!(ctl.status, DiagStatus::Ok, "{}", ctl.detail);
+        // 수정: 같은 파일을 고친다.
+        std::fs::write(ctx.pack_dir.join(&a), format!("{body}\n# edited\n")).unwrap();
+        let it = diag_pack_drift(&ctx);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert_eq!(it.name, "pack-drift");
+        assert!(it.detail.contains(&a), "{}", it.detail);
+        let disk = cys::pack::content_hash_pub(&format!("{body}\n# edited\n"));
+        for h in [&disk, &ah] {
+            assert!(it.detail.contains(cys::pack::short_hash(h)), "해시 {h} 의 앞 8자가 없다: {}", it.detail);
+        }
+        assert!(it.detail.contains("drift"), "{}", it.detail);
+        assert!(it.detail.contains(cys::pack::HOOKS_LOCAL_GUIDANCE), "C3 안내 문장이 drift 행 아래에 있어야 한다: {}", it.detail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// T10-2 + T10-4: 등급은 FAIL 이 아니다 · `behind`(설치 대기)와 `extra`(자작)는 등급을 올리지 않는다.
+    #[test]
+    fn f10_t2_t4_never_fail_and_behind_extra_do_not_raise_the_grade() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (ctx, base) = f10_ctx("f10-t24");
+        let (a, _, b, bh) = f10_two_embedded_hooks();
+        // a: 안 고쳤고 매니페스트가 옛 해시(= vendor 전진) → behind. 자작 훅 하나 → extra.
+        let abody = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == a).unwrap().1;
+        std::fs::write(ctx.pack_dir.join(&a), abody).unwrap();
+        let bbody = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == b).unwrap().1;
+        std::fs::write(ctx.pack_dir.join(&b), bbody).unwrap();
+        std::fs::write(ctx.pack_dir.join("hooks/my-own-hook.sh"), "echo mine\n").unwrap();
+        f10_write_manifest(&ctx, &json!({ a.clone(): cys::pack::content_hash_pub("옛 판\n"), b.clone(): bh }));
+        // a 의 디스크가 옛 판이어야 behind 다(디스크 = 매니페스트 ≠ vendor).
+        std::fs::write(ctx.pack_dir.join(&a), "옛 판\n").unwrap();
+        let it = diag_pack_drift(&ctx);
+        assert_eq!(it.status, DiagStatus::Ok, "behind/extra 는 등급을 올리지 않는다: {}", it.detail);
+        assert!(it.detail.contains("behind") && it.detail.contains(&a), "{}", it.detail);
+        assert!(it.detail.contains("extra") && it.detail.contains("my-own-hook.sh"), "{}", it.detail);
+        // 최악의 조합에서도 FAIL 은 없다.
+        std::fs::write(ctx.pack_dir.join(&b), [0xffu8, 0xfe]).unwrap();
+        std::fs::remove_file(ctx.pack_dir.join(&a)).unwrap();
+        let worst = diag_pack_drift(&ctx);
+        assert_eq!(worst.status, DiagStatus::Warn, "{}", worst.detail);
+        assert_ne!(worst.status, DiagStatus::Fail);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// T10-7(합친 행 포함): 판독 불가는 vendor 전진에 가려지지 않고(behind 로 둔갑하지 않고) 세어진다.
+    #[test]
+    fn f10_t7_unreadable_stays_unreadable_and_counted_even_when_vendor_advanced() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (ctx, base) = f10_ctx("f10-t7");
+        let (a, _, b, _) = f10_two_embedded_hooks();
+        // 매니페스트는 둘 다 옛 해시(= 두 파일 모두 vendor 전진). a 는 판독 불가, b 는 안 고친 옛 판(behind).
+        f10_write_manifest(&ctx, &json!({ a.clone(): cys::pack::content_hash_pub("옛 a\n"), b.clone(): cys::pack::content_hash_pub("옛 b\n") }));
+        std::fs::write(ctx.pack_dir.join(&a), [0xffu8, 0xfe, 0x00]).unwrap();
+        std::fs::write(ctx.pack_dir.join(&b), "옛 b\n").unwrap();
+        let it = diag_pack_drift(&ctx);
+        assert_eq!(it.status, DiagStatus::Warn, "{}", it.detail);
+        assert!(it.detail.contains(&format!("{a}(unreadable")), "합친 행은 behind 가 아니라 unreadable 이다: {}", it.detail);
+        assert!(it.detail.contains("판독 불가 1건"), "종전 계수 문구 유지: {}", it.detail);
+        assert!(it.detail.contains("behind") && it.detail.contains(&b), "{}", it.detail);
         let _ = std::fs::remove_dir_all(&base);
     }
 
