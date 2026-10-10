@@ -1346,3 +1346,46 @@ jobs:
           if ($code -ne 0) { throw "T6: 형제 import 가드 회귀 실패 (exit=$code) — 배송 런타임에서 팩 스크립트의 형제 import 가 깨진다" }
           Write-Host "OK: T6 형제 import 가드 회귀 통과 (동봉 embeddable python312._pth 실런타임 · 음성 대조 확인)"
           exit 0
+
+      # ── T-50-P3 진단 전용(work/diag-help-stack-0.14.50 · 측정만, 제품 0줄): 릴리스 빌드 cys.exe/cysd.exe 의 --help 가 윈도우에서
+      #   메인 스레드 스택을 넘기는가(windows-health 디버그 빌드는 0xC00000FD). 판정하지 않고 종료 코드·출력 앞 3줄·바이트 수·스택 예약값만 찍는다.
+      #   비차단 · 맨 마지막 · 모든 줄이 rc 를 잡고 exit 0 — 이 스텝이 런을 붉히거나 앞 결과를 바꾸지 못한다.
+      - name: 릴리스 exe --help 스택 측정 (진단 · 비차단 · 맨 뒤)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $exes = @('src-tauri/binaries/cys-x86_64-pc-windows-msvc.exe','target/release/cys.exe','src-tauri/binaries/cysd-x86_64-pc-windows-msvc.exe','target/release/cysd.exe')
+          foreach ($e in $exes) {
+            try {
+              if (-not (Test-Path $e)) { Write-Host "[measure] $e : 없음"; continue }
+              $it = Get-Item $e
+              Write-Host "[measure] exe=$($it.FullName) size=$($it.Length)"
+              $calls = if ($e -match 'cysd') { @(@('--help'),@('--version')) } else { @(@('--help'),@('queue','--help'),@('queue','list','--help'),@('--version'),@('doctor','--help'),@('send','--help')) }
+              foreach ($a in $calls) {
+                try {
+                  $out = & $it.FullName @a 2>&1 | Out-String
+                  $code = $LASTEXITCODE
+                  $bytes = [Text.Encoding]::UTF8.GetByteCount($out)
+                  $first = ($out -split "`r?`n" | Select-Object -First 3) -join ' / '
+                  Write-Host ("[measure] {0} {1} native-exit=0x{2:X8} bytes={3} first3=[{4}]" -f (Split-Path $e -Leaf), ($a -join ' '), $code, $bytes, $first)
+                } catch { Write-Host "[measure] $e $($a -join ' ') 예외: $_" }
+              }
+              $db = Get-Command dumpbin -ErrorAction SilentlyContinue
+              if (-not $db) {
+                $vw = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+                if (Test-Path $vw) {
+                  $vs = & $vw -latest -products * -property installationPath 2>$null
+                  if ($vs) { $db = Get-ChildItem -Path $vs -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match 'Hostx64\\x64' } | Select-Object -First 1 }
+                }
+              }
+              if ($db) {
+                $path = if ($db.Source) { $db.Source } else { $db.FullName }
+                $h = & $path /headers $it.FullName 2>&1 | Select-String -Pattern 'size of stack (reserve|commit)'
+                $h | ForEach-Object { Write-Host "[measure] $(Split-Path $e -Leaf) dumpbin: $($_.Line.Trim())" }
+              } else { Write-Host "[measure] dumpbin 없음 — 스택 예약값 생략" }
+            } catch { Write-Host "[measure] $e 예외: $_" }
+          }
+          exit 0
