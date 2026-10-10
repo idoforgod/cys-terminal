@@ -115,7 +115,7 @@ command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 | `grill-arm.sh` / `grill-gate.sh` | PreToolUse | grill-me 무장 · 최소 질문 게이트 |
 | `serena-nudge.sh` | PreToolUse | 심볼 탐색 권고(알림 전용) |
 | `cys-hook.sh` | PreToolUse | 툴 이벤트를 데몬으로 전달 |
-| `pack-guard.sh` | PostToolUse | 팩 파일 직접 수정 감지 |
+| `pack-guard.sh` | PostToolUse | 팩 파일 직접 수정 감지(`hooks/` 아래면 §7 의 안내 문장을 함께 낸다 · 차단 없음) |
 | `brief-lint-warn.sh` | PostToolUse(Task\|Agent) | 위임 브리프 경고 |
 | `commit-memory-nudge.sh` | PostToolUse(Bash) | git commit 감지 → 기억 증류 넛지 |
 | `grill-count.sh` | PostToolUse | grill 결정축 카운트 |
@@ -143,3 +143,25 @@ command -v cys_lane_redirect >/dev/null 2>&1 && cys_lane_redirect "$@"
 3. 무장 env 가 필요한 훅인가 — completion-guard 는 §3 두 층을 모두 요구한다.
 4. 프리루드가 살아 있는가 — `_lib.sh 소실 — 훅 강등` 이 보이면 팩이 깨진 것이다(`cys doctor`).
 5. 그래도 조용하면 훅을 직접 실행해 본다: `printf '{"source":"clear","cwd":"'"$PWD"'"}' | sh hooks/inject-context.sh`
+
+## 7. 내가 고친 훅은 어떻게 되나 — 드리프트 점검 (0.14.50)
+
+`hooks/` 아래 vendor 파일을 고치면 그 수정은 **제자리에 보존**된다(kept-drift — 업데이트가 덮어쓰지 않는다). 다음 벤더
+업데이트가 그 파일을 바꾸면 병합하거나, 충돌 시 `.user` 사본을 남긴다. 무엇이 고쳐졌는지는 **읽기 전용**으로 볼 수 있다:
+
+- `cys doctor` 의 `pack-drift` 항목 — 고친 훅·없어진 훅·읽을 수 없는 훅이 있으면 WARN 이고 파일 이름과 해시 세 개(디스크 · 설치
+  매니페스트 · vendor)를 보인다. FAIL 은 내지 않는다.
+- `cys doctor --lanes` — 본부 팩(`~/.cys/pack`)과 모든 부서 팩(`~/.cys/pack-dept-*`)의 `hooks/` 를 한 번에 보인다. 아무것도
+  쓰지 않고 데몬에 접속하지 않는다.
+- 파일마다 일곱 상태: `same`(같음) · `drift`(고쳤고 vendor 는 그대로) · `behind`(안 고쳤고 vendor 만 전진 — 다음 설치가 갱신) ·
+  `drift+behind`(고쳤고 vendor 도 전진) · `missing`(있어야 하는데 없음) · `unreadable`(텍스트로 못 읽음 — vendor 비교보다 먼저
+  판정) · `extra`(vendor 가 모르는 자작 파일). `same`·`behind`·`extra` 는 WARN 으로 세지 않는다.
+- `hooks/` 순회가 상한(깊이 8 · 항목 4096) 또는 열 수 없는 폴더에 막혀 끝까지 못 갔으면 "순회 불완전" 을 밝히고 WARN 이다 —
+  깨끗하다는 뜻이 아니다.
+
+수정을 **오래 두려면** 팩 파일을 고치지 말고 `~/.cys/local/hooks/<이벤트>.d/` 에 자기 훅 파일을 둔다(§1 의 사용자 오버레이 —
+업데이트·치유 불가침). 제품에 반영할 개선이면 `cys pack-merge --file <rel> --propose` 로 제안 패치를 만든다. `pack-guard.sh` 는
+`hooks/` 아래 파일을 고칠 때 이 안내를 한 문장으로 낸다(문장의 단일 출처는 `src/pack.rs` 의 `HOOKS_LOCAL_GUIDANCE` — 훅 쪽
+문구가 달라지면 `bin/tests/test_pack_guard_hooks_guidance.py` 가 붉어진다).
+
+이 릴리스가 만들지 **않은** 것: `cys pack-drift` 명령 · 내보내기(`--export`) · 앱의 업데이트 알림에 고친 파일 수 표시(백로그 B-072).

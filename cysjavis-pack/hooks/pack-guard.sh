@@ -64,6 +64,11 @@ case "$REL" in
       MSG="$MSG ★동명 로컬 오버레이($_LOCAL_ROOT/skills/$_SKILL_DIR)가 실재 — shadowing 으로 로컬이 이겨 이 팩 사본 수정은 비활성입니다(활성 반영은 로컬 오버레이 쪽에서)."
     fi
     ;;
+  # ★F10-B(0.14.50): hooks/ 아래 vendor 파일의 수정 — 보존 사실 + 영속 경로(로컬 훅 폴더) + 제안 경로를 1문장으로 고지.
+  #   문장의 단일 출처는 src/pack.rs 의 HOOKS_LOCAL_GUIDANCE(<rel> 만 $REL 로 치환) — 낱말을 바꾸면 test_pack_guard_hooks_guidance.py 가 붉어진다. 차단 없음.
+  hooks/*)
+    MSG="$MSG hooks/ 아래 vendor 파일의 수정은 제자리에 보존됩니다. 영속하는 쪽은 ~/.cys/local/hooks/<이벤트>.d/ 에 자기 훅 파일을 두는 것입니다(업데이트·치유 불가침). 제품에 반영할 개선이면 cys pack-merge --file $REL --propose 로 제안 패치를 만드세요."
+    ;;
 esac
 
 printf '%s' "$MSG" | "$CYS_PY" -c "import json,sys
