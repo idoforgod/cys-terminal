@@ -830,6 +830,96 @@ class T10SelfTestSpawnsNothing(unittest.TestCase):
             h.close()
 
 
+class T16NoProductFileWrites(unittest.TestCase):
+    """Lane B review R1 M1: the product gate must not write ANY file because of an environment value.
+    The old product seam took `pid_file` / `trace_file` from CYS_GATE_PRODUCT_CPU_LOOKUP_OVERRIDE and opened them
+    (w / a): pointed at the redirected output of a text `check`, the report child truncated the verdict the parent
+    had already flushed. The test sets the product's OLD variable name directly (no harness wrapper), so a seam
+    that is still in the product shows up as a damaged verdict file."""
+
+    OLD_ENV = "CYS_GATE_PRODUCT_CPU_LOOKUP_OVERRIDE"
+
+    def _text_check_to(self, h, out_path, spec=None):
+        args = ["check"] + fixture_args("servers_soft")
+        env = h.env()
+        env.pop(LOOKUP_ENV, None)
+        env.pop(self.OLD_ENV, None)
+        if spec is not None:
+            env[self.OLD_ENV] = json.dumps(spec)
+        with open(out_path, "wb") as fh:
+            r = subprocess.run([sys.executable, GATE] + args, stdout=fh, stderr=subprocess.DEVNULL,
+                               env=env, timeout=60)
+        with open(out_path, "rb") as fh:
+            return r.returncode, fh.read()
+
+    def _verdict_prefix(self, h):
+        r_rc, r_out, _e, _ = h.run_main_only(GATE, ["check"] + fixture_args("servers_soft"))
+        return r_rc, r_out
+
+    def test_16_pid_and_trace_targets_cannot_damage_a_redirected_verdict(self):
+        h = Harness()
+        try:
+            ref_rc, ref = self._verdict_prefix(h)
+            self.assertTrue(ref, "reference verdict is empty")
+            out = os.path.join(h.td, "gate-result.txt")
+            sym = os.path.join(h.td, "alias-sym.txt")
+            hard = os.path.join(h.td, "alias-hard.txt")
+            for name, key in (("pid_file", "pid_file"), ("trace_file", "trace_file")):
+                for alias in ("same", "symlink", "hardlink"):
+                    if os.path.lexists(out):
+                        os.remove(out)
+                    for a in (sym, hard):
+                        if os.path.lexists(a):
+                            os.remove(a)
+                    open(out, "wb").close()
+                    target = out
+                    if alias == "symlink":
+                        os.symlink(out, sym)
+                        target = sym
+                    elif alias == "hardlink":
+                        os.link(out, hard)
+                        target = hard
+                    spec = {"map": MAP_RICH, key: target}
+                    if key == "pid_file":
+                        spec["hang_s"] = 12
+                    rc, data = self._text_check_to(h, out, spec)
+                    label = "%s/%s" % (name, alias)
+                    self.assertEqual(rc, ref_rc, label)
+                    self.assertTrue(data.startswith(ref),
+                                    "%s: the verdict was damaged by an environment-selected write: %r" % (label, data[:200]))
+                    tail = data[len(ref):].decode("utf-8", "replace")
+                    self.assertEqual(tail.count("\n"), 1, (label, tail))
+                    self.assertNotIn("\x00", data.decode("utf-8", "replace"), label)
+        finally:
+            h.close()
+
+    def test_16_no_value_of_the_override_makes_the_product_create_a_file(self):
+        h = Harness()
+        try:
+            for key in ("pid_file", "trace_file"):
+                made = os.path.join(h.td, "must-not-exist-%s" % key)
+                spec = {"map": MAP_RICH, "hang_s": 12, key: made}
+                out = os.path.join(h.td, "o-%s.txt" % key)
+                rc, data = self._text_check_to(h, out, spec)
+                self.assertFalse(os.path.exists(made), "%s: product code created %s" % (key, made))
+            made = os.path.join(h.td, "must-not-exist-json.pid")
+            out = os.path.join(h.td, "o-json.txt")
+            spec = {"map": MAP_RICH, "hang_s": 12, "pid_file": made, "trace_file": made}
+            env = h.env()
+            env[self.OLD_ENV] = json.dumps(spec)
+            subprocess.run([sys.executable, GATE, "product-cpu", "--json"], capture_output=True, env=env, timeout=60)
+            self.assertFalse(os.path.exists(made), "product-cpu --json created %s" % made)
+        finally:
+            h.close()
+
+    def test_16_static_pin_the_product_has_no_environment_selected_lookup_seam(self):
+        with open(GATE, encoding="utf-8") as f:
+            txt = f.read()
+        for needle in ("CYS_GATE_PRODUCT_CPU_LOOKUP_OVERRIDE", "PRODUCT_CPU_LOOKUP_ENV", "_pc_override_lookup",
+                       "pid_file", "trace_file"):
+            self.assertNotIn(needle, txt, "the product gate still carries %r" % needle)
+
+
 class T11StaticPin(unittest.TestCase):
     ALLOWED = {"cysjavis-pack/bin/javis_resource_gate.py",
                "cysjavis-pack/hooks/role-capability-gate.sh"}
