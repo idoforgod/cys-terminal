@@ -159,6 +159,10 @@ NODE_EXCLUDE_PATTERNS = [r"codex-darwin-arm64"]
 #   **우리 소관이 아닌 호스트 부하**로 조직 기동을 거부했다. 그래서 사실을 둘로 가른다:
 #     load_ratio      = 호스트 전체 1분 부하/코어 — 우리가 못 고치는 성분이 섞인다 → **soft 전용**
 #     fleet_cpu_ratio = 우리 프로세스들의 %CPU 합 / 100 / ncpu(**분율**) → soft 0.5 · hard 1.0
+#     product itself  = (0.14.50 F5) the product's own %CPU - app, its screen (WebKit) helpers,
+#                       daemons, product jobs; agent CLIs as a separate figure. REPORT-ONLY: made
+#                       only by the separate subcommand `product-cpu` (never by `check --json`),
+#                       never a gate input, no threshold. Text `check` shows it as one extra line.
 #   "막는 쪽으로만 틀린다"는 여기서 **차단을 우리가 실제로 회수할 수 있는 자원에만 건다**는 뜻이다.
 #
 #   ★계측 한계(라벨을 실제보다 강하게 쓰지 않는다 · codex R1 #2 정정): `ps` 의 %CPU 는 어느
@@ -215,6 +219,12 @@ FLEET_EXE_SUFFIXES = tuple(sorted({os.path.splitext(n)[1].lower()
                                    for n in _CLAUDE_EXE_NAMES if os.path.splitext(n)[1]})) \
     or (".exe", ".cmd")
 _APP_BUNDLE_MARKER = ".app/contents/"          # macOS GUI 앱 번들 — CLI 함대가 아니다(실측 반례)
+# ★F5 (0.14.50, report-only `product-cpu`): the product's own GUI binary and bundle. HIGH COUPLING
+#   (design F5 section 6): this is a second place that knows the bundle layout (the first is the
+#   exclusion via `_APP_BUNDLE_MARKER` in `_fleet_owner`); a rename of the app binary
+#   (`src-tauri/Cargo.toml` name) or of the bundle must update both. Read by `product-cpu` only.
+PRODUCT_GUI_BINARY = "cys-app"                  # argv0 basename of the app process (measured)
+PRODUCT_BUNDLE_MARKER = "/cys.app/contents/"    # lower-cased; argv0 inside it = a product job
 # argv0 자체가 우리 설치 레이아웃인 형상(basename 이 버전 문자열이라 이름이 안 남는다)
 #   ★실측(2026-09-08 02:28 이 기계)으로 넣은 것: codex 는 wrapper 아래에 vendor 네이티브를 여러 개
 #     띄우고 그 basename 이 `codex` 가 아닌 것도 있다 —
@@ -2797,6 +2807,435 @@ def _nonneg_float(text):
     return v
 
 
+# ══ ★F5 (0.14.50 · backlog B-050) — `product-cpu`: the product's OWN CPU, REPORT-ONLY ══════════
+#   Design: DESIGN-F5 (closed round 2) with the binding amendments F5-A1 / F5-A2.
+#   - Lives ONLY in the separate subcommand `product-cpu [--json]`. `check --json` (every
+#     programmatic caller: completion guard 10 s, formation 30/15 s, bootstrap 30 s, the app) runs
+#     none of this code, so its bytes and its time are the tag's (F5-A1 option (c)).
+#   - Text `check` (a person or an agent typing it) gets ONE extra line, made by running
+#     `product-cpu --json` as a child with a 3.0 s deadline AFTER the verdict text is flushed; the
+#     exit code is the one decided before the child started. Attached at the program entry, not in
+#     `cmd_check`/`main()`, so the in-process self-test starts no child.
+#   - Never a gate input: nothing here reaches `checks`, `trips`, `warnings`, `measure_errors` or
+#     the exit code of `check`. `product-cpu` itself always exits 0; a failure is `state`+`reason`.
+#   - Own single `ps` read (pid, ppid, pcpu, command; timeout 1.5 s). Does NOT call
+#     `_ps_cpu_lines` or `_ppid_map`; reuses only `_fleet_owner`.
+#   - macOS helper attribution: the NON-PUBLIC `responsibility_get_pid_responsible_for_pid` via
+#     ctypes, inside ONE guard catching every Exception (F5-A2 / head D2): any failure -> no helper
+#     attributed in that run (`app_helpers` null, helpers `unattributed`, `total` null), never zero;
+#     an answer that is not a positive int naming a process of the same table -> that helper alone
+#     is unattributed. Windows host: `unavailable`, no ps, no child, no ctypes. Other platforms: a
+#     helper is a descendant of the app (parent chain of the same ps read) - NOT verified on a real
+#     Linux machine (design section 4 / MEASURE line 38).
+PRODUCT_CPU_PS_TIMEOUT_S = 1.5        # the separate invocation's own ps timeout (F5-A1 rule 4)
+PRODUCT_CPU_CHILD_DEADLINE_S = 3.0    # text `check` waits at most this long for the child (rule 3/4)
+PRODUCT_CPU_LINE_HEAD = "product itself (report-only, not a gate input): "
+PRODUCT_CPU_LABEL = "ps average, report-only, not a gate input"
+# Test injection ONLY (report-only figures; never read by `check`): replaces the helper
+# attribution in `product-cpu` with a fixture, so subprocess tests are platform-independent and
+# never call the real system lookup. JSON object, keys (all optional):
+#   {"missing": true}                     resolving the lookup raises AttributeError
+#   {"raise": "OSError"|"RuntimeError"|"ArgumentError"}  every call raises that exception
+#   {"hang_s": N, "pid_file": PATH}       first call writes this process's pid to PATH, sleeps N s
+#   {"map": {"<pid>": <any JSON>}}        answer per helper pid (absent pid -> -1)
+#   {"trace_file": PATH}                  append one line per resolve / call (spawn-free proof)
+PRODUCT_CPU_LOOKUP_ENV = "CYS_GATE_PRODUCT_CPU_LOOKUP_OVERRIDE"
+_PC_CLASSES = ("app", "app_helper", "unattributed", "foreign_helper", "daemon", "agent_cli",
+               "fleet_other", "product_job")
+
+
+def _pc_argv0(cmd):
+    """command -> (normalised argv0 path, basename without .exe/.cmd). Pure."""
+    toks = (cmd or "").split()
+    return _fleet_exe_name(toks[0]) if toks else ("", "")
+
+
+def _pc_is_app(cmd):
+    """The product GUI process: argv0 basename is the product GUI binary. Pure."""
+    return _pc_argv0(cmd)[1] == PRODUCT_GUI_BINARY
+
+
+def _pc_is_webkit_helper(cmd):
+    """A screen-helper CANDIDATE (whose it is, is decided by attribution). Pure.
+    macOS shape: argv0 inside `WebKit.framework` (measured: com.apple.WebKit.WebContent / .GPU /
+    .Networking under /System/Library/Frameworks/WebKit.framework/..., parent = launchd).
+    WebKitGTK shape: argv0 basename starting `WebKit` (`WebKitWebProcess`,
+    `WebKitNetworkProcess`) - general knowledge, not verified on a real machine.
+    Both shapes are recognised on every platform (neither occurs on the other platform); the
+    platform decides only the ATTRIBUTION rule (responsible pid vs parent chain)."""
+    norm, base = _pc_argv0(cmd)
+    return "/webkit.framework/" in norm.lower() or base.startswith("WebKit")
+
+
+def _pc_job_subject(cmd):
+    """Executing subject for the product-job rule (same 'executing subject, not any argument'
+    rule as `_fleet_owner`): argv0, or for a python runtime its first non-option token; a code
+    mode (`-c`/`-m`) has no script subject. Pure."""
+    toks = (cmd or "").split()
+    if not toks:
+        return ""
+    norm0, base0 = _fleet_exe_name(toks[0])
+    if base0 in FLEET_PY_RUNTIMES or _PY_VERSIONED_RE.match(base0):
+        for t in toks[1:1 + FLEET_RUNNER_SCAN_MAX]:
+            if t in ("-c", "-m") or (t.startswith("-") and not t.startswith("--")
+                                     and ("c" in t[1:] or "m" in t[1:])):
+                return ""
+            if t.startswith("-"):
+                continue
+            return _fleet_exe_name(t)[0]
+        return ""
+    return norm0
+
+
+def _pc_is_product_job(cmd):
+    """A product job: argv0 inside the product bundle, or a pack `bin/javis_*` script as the
+    executing subject. Report-only - a wrong match mislabels a figure, it blocks nothing. Pure."""
+    norm0 = _pc_argv0(cmd)[0].lower()
+    if PRODUCT_BUNDLE_MARKER in norm0:
+        return True
+    subj = _pc_job_subject(cmd)
+    low = subj.lower()
+    return "/bin/javis_" in low and ("/.cys/pack" in low or "/cysjavis-pack/" in low)
+
+
+def _pc_parse_ps(text):
+    """`ps -axo pid=,ppid=,pcpu=,command=` stdout -> (rows, unparsed_product_rows). Pure.
+    row = (pid:int, ppid:int, pcpu:float, cmd:str). A line that does not parse is skipped, but if
+    its command would belong to a product class it is counted - silently dropping it would
+    under-count and still say 'ok'."""
+    rows, bad = [], 0
+    for ln in (text or "").splitlines():
+        f = ln.split(None, 3)
+        if len(f) < 4:
+            continue
+        try:
+            pid, ppid, pcpu = int(f[0]), int(f[1]), float(f[2])
+            if pid <= 0 or not math.isfinite(pcpu) or pcpu < 0:
+                raise ValueError(ln)
+        except ValueError:
+            c = f[-1]
+            if _pc_is_app(c) or _fleet_owner(c) is not None or _pc_is_product_job(c):
+                bad += 1
+            continue
+        rows.append((pid, ppid, pcpu, f[3]))
+    return rows, bad
+
+
+def _pc_read_ps():
+    """The ONE own ps read of `product-cpu` -> (rows|None, state|None, reason|None)."""
+    try:
+        p = subprocess.run(["ps", "-axo", "pid=,ppid=,pcpu=,command="], capture_output=True,
+                           text=True, errors="replace", timeout=PRODUCT_CPU_PS_TIMEOUT_S)
+    except FileNotFoundError:
+        return None, "unavailable", "ps absent on this platform"
+    except subprocess.TimeoutExpired:
+        return None, "not_measured", "ps timeout %.1f s" % PRODUCT_CPU_PS_TIMEOUT_S
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        return None, "not_measured", "ps failed: %s" % type(e).__name__
+    if p.returncode != 0:
+        return None, "not_measured", "ps failed (rc %s)" % p.returncode
+    rows, bad = _pc_parse_ps(p.stdout)
+    if not rows:
+        return None, "not_measured", "ps returned no usable rows"
+    if bad:
+        return None, "not_measured", "ps rows of product processes unreadable: %d" % bad
+    return rows, None, None
+
+
+def _pc_resolve_responsible_lookup():
+    """macOS: the non-public responsible-pid call -> callable(pid) -> int. Raises on a missing
+    library or symbol; the CALLER holds the one guard (`_pc_attribute_lookup`)."""
+    import ctypes
+    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    fn = lib.responsibility_get_pid_responsible_for_pid    # AttributeError if the symbol is gone
+    fn.argtypes = [ctypes.c_int]
+    fn.restype = ctypes.c_int
+    return lambda pid: fn(int(pid))
+
+
+def _pc_override_lookup(spec_text):
+    """Resolver built from PRODUCT_CPU_LOOKUP_ENV (test injection). Raises like the real one."""
+    spec = json.loads(spec_text)
+    if not isinstance(spec, dict):
+        raise ValueError("lookup override is not a JSON object")
+    trace = spec.get("trace_file")
+
+    def note(msg):
+        if trace:
+            with open(trace, "a", encoding="utf-8") as fh:
+                fh.write(msg + "\n")
+    note("resolve")
+    if spec.get("missing"):
+        raise AttributeError("responsibility_get_pid_responsible_for_pid: symbol not found "
+                             "(override)")
+    state = {"n": 0}
+
+    def fn(pid):
+        state["n"] += 1
+        note("call %s" % pid)
+        exc = spec.get("raise")
+        if exc:
+            import ctypes
+            raise {"OSError": OSError, "RuntimeError": RuntimeError,
+                   "ArgumentError": ctypes.ArgumentError}.get(exc, RuntimeError)(
+                "override: the lookup failed")
+        if spec.get("hang_s") and state["n"] == 1:
+            if spec.get("pid_file"):
+                with open(spec["pid_file"], "w", encoding="utf-8") as fh:
+                    fh.write(str(os.getpid()))
+            time.sleep(float(spec["hang_s"]))
+        return (spec.get("map") or {}).get(str(pid), -1)
+    return fn
+
+
+def _pc_attribute_lookup(resolve, helper_pids, table_pids):
+    """F5-A2 guard. -> (answers {pid: responsible pid}, bad {pid: reason}, run_reason|None).
+    ANY exception while resolving or calling -> no helper attributed in this run (run_reason).
+    An answer that is not a positive int naming a process of the same table -> that helper
+    alone is unattributed, with the value in the reason."""
+    answers, bad = {}, {}
+    try:
+        fn = resolve()
+        raw = {p: fn(p) for p in helper_pids}
+    except Exception as e:                      # noqa: BLE001 - "anything" is the rule (F5-A2)
+        return {}, {}, "lookup failed: %s: %s" % (type(e).__name__, e)
+    for p, rp in raw.items():
+        if isinstance(rp, bool) or not isinstance(rp, int) or rp <= 0 or rp not in table_pids:
+            bad[p] = "lookup returned %r, which is not a process of the same table" % (rp,)
+        else:
+            answers[p] = rp
+    return answers, bad, None
+
+
+def _pc_attribute_parent(helper_pids, ppid_of, app_pids):
+    """Other platforms: a helper is the app's if its parent chain reaches an app pid. Pure.
+    -> same shape as `_pc_attribute_lookup` (never a run failure). Cycle-safe, depth-capped."""
+    answers = {}
+    for p in helper_pids:
+        seen, cur = set(), ppid_of.get(p)
+        while cur and cur not in seen and len(seen) < 64:
+            if cur in app_pids:
+                answers[p] = cur                # reached the app: the app's helper
+                break
+            seen.add(cur)
+            cur = ppid_of.get(cur)
+    return answers, {}, None                    # not in answers = another application's helper
+
+
+def _pc_classify(rows, attribute, self_pid=None):
+    """PURE classifier: rows in, classes out; attribution injected (the `_fleet_rows` pattern).
+    `attribute(helper_pids, table_pids, app_pids, ppid_of)` -> (answers, bad, run_reason).
+    Each process gets ONE class, first match wins: app, helper (app_helper | unattributed |
+    foreign_helper), daemon / agent_cli / fleet_other (the existing `_fleet_owner` answer),
+    product_job; anything else is not ours and is left out. -> (totals, run_reason, bad)."""
+    if self_pid is None:
+        self_pid = os.getpid()
+    rows = [r for r in rows if r[0] != self_pid]          # self-exclusion by PID (fleet-axis rule)
+    table_pids = {r[0] for r in rows}
+    ppid_of = {r[0]: r[1] for r in rows}
+    app_pids = {r[0] for r in rows if _pc_is_app(r[3])}
+    helper_pids = [r[0] for r in rows
+                   if r[0] not in app_pids and _pc_is_webkit_helper(r[3])]
+    if helper_pids and app_pids:
+        answers, bad, run_reason = attribute(helper_pids, table_pids, app_pids, ppid_of)
+    else:
+        answers, bad, run_reason = {}, {}, None           # no app -> no helper can be ours
+    tot = {k: [0, 0.0] for k in _PC_CLASSES}
+    hset = set(helper_pids)
+    for pid, _ppid, pcpu, cmd in rows:
+        if pid in app_pids:
+            c = "app"
+        elif pid in hset:
+            if run_reason is not None or pid in bad:
+                c = "unattributed"
+            elif answers.get(pid) in app_pids:
+                c = "app_helper"
+            else:
+                c = "foreign_helper"
+        else:
+            owner = _fleet_owner(cmd)
+            if owner == "cysd":
+                c = "daemon"
+            elif owner in NODE_OWNERS:
+                c = "agent_cli"
+            elif owner is not None:
+                c = "fleet_other"
+            elif _pc_is_product_job(cmd):
+                c = "product_job"
+            else:
+                continue
+        tot[c][0] += 1
+        tot[c][1] += pcpu
+    return tot, run_reason, bad
+
+
+def _pc_cell(tot, k):
+    pc = round(tot[k][1], 1)
+    return {"procs": tot[k][0], "pcpu": pc, "cores": round(pc / 100.0, 3)}
+
+
+def _pc_empty(state, reason):
+    out = {"state": state, "reason": reason, "label": PRODUCT_CPU_LABEL}
+    for k in ("app", "app_helpers", "helpers_unattributed", "daemons", "jobs", "total",
+              "total_known", "agent_cli"):
+        out[k] = None
+    return out
+
+
+def _product_cpu_collect(read_ps=None, resolve=None, windows=None, darwin=None,
+                         self_pid=None, ncpu=None):
+    """The `product-cpu` block (dict). Every dependency is injectable for fixture tests.
+    Never raises for a measurement problem: failure = `state` + `reason`."""
+    t0 = time.monotonic()
+    windows = _is_windows_host() if windows is None else windows
+    if windows:
+        return _pc_empty("unavailable", "Windows host - no ps read, no lookup (like the fleet axis)")
+    darwin = (sys.platform == "darwin") if darwin is None else darwin
+    rows, st, why = (read_ps or _pc_read_ps)()
+    if rows is None:
+        return _pc_empty(st or "not_measured", why)
+    override = os.environ.get(PRODUCT_CPU_LOOKUP_ENV)
+    if resolve is None and override:
+        resolve = lambda: _pc_override_lookup(override)          # noqa: E731
+        rule = "override"
+    elif resolve is None and darwin:
+        resolve = _pc_resolve_responsible_lookup
+        rule = "responsible-pid"
+    else:
+        rule = "injected" if resolve is not None else "parent-chain"
+    if resolve is not None:
+        def attribute(hp, tp, _ap, _pm):
+            return _pc_attribute_lookup(resolve, hp, tp)
+    else:
+        def attribute(hp, _tp, ap, pm):
+            return _pc_attribute_parent(hp, pm, ap)
+    tot, run_reason, bad = _pc_classify(rows, attribute, self_pid=self_pid)
+    unattr = tot["unattributed"][0] > 0
+    known = tot["app"][1] + tot["app_helper"][1] + tot["daemon"][1] + tot["product_job"][1]
+    known_cell = {"pcpu": round(known, 1), "cores": round(round(known, 1) / 100.0, 3)}
+    out = {
+        "state": "partial" if unattr else "ok",
+        "reason": (run_reason or "; ".join(sorted(set(bad.values())))) if unattr else None,
+        "label": PRODUCT_CPU_LABEL,
+        "app": _pc_cell(tot, "app"),
+        "app_helpers": None if run_reason is not None else _pc_cell(tot, "app_helper"),
+        "helpers_unattributed": _pc_cell(tot, "unattributed"),
+        "daemons": _pc_cell(tot, "daemon"),
+        "jobs": _pc_cell(tot, "product_job"),
+        "total": None if unattr else known_cell,
+        "total_known": known_cell,
+        "agent_cli": _pc_cell(tot, "agent_cli"),
+        "fleet_other": _pc_cell(tot, "fleet_other"),
+        "foreign_helpers_left_out": tot["foreign_helper"][0],
+        "ncpu": ncpu or os.cpu_count() or 1,
+        "attribution": rule,
+    }
+    out["elapsed_s"] = round(time.monotonic() - t0, 3)
+    return out
+
+
+def _product_cpu_line(b):
+    """The block -> the ONE human line (always starts with PRODUCT_CPU_LINE_HEAD)."""
+    st = b.get("state") if isinstance(b, dict) else None
+    if st not in ("ok", "partial"):
+        return PRODUCT_CPU_LINE_HEAD + "%s - %s" % (
+            (st or "not_measured").replace("_", " "), b.get("reason") if isinstance(b, dict) else "?")
+    n = b.get("ncpu") or 1
+    ag = b["agent_cli"]["pcpu"]
+    agents = "agent CLIs %.1f %%CPU = %.3f core (separate figure); ps average" % (ag, ag / 100.0)
+    if st == "ok":
+        t = b["total"]["pcpu"]
+        return PRODUCT_CPU_LINE_HEAD + (
+            "%.1f %%CPU = %.3f core of %d - app %.1f, screen helpers %.1f, daemons %.1f, "
+            "jobs %.1f; %s" % (t, t / 100.0, n, b["app"]["pcpu"], b["app_helpers"]["pcpu"],
+                                b["daemons"]["pcpu"], b["jobs"]["pcpu"], agents))
+    helpers = "n/a" if b["app_helpers"] is None else "%.1f" % b["app_helpers"]["pcpu"]
+    return PRODUCT_CPU_LINE_HEAD + (
+        "total unknown (known part %.1f %%CPU) - app %.1f, screen helpers %s, UNATTRIBUTED %d "
+        "WebKit helpers using %.1f %%CPU (%s), daemons %.1f, jobs %.1f; %s" % (
+            b["total_known"]["pcpu"], b["app"]["pcpu"], helpers,
+            b["helpers_unattributed"]["procs"], b["helpers_unattributed"]["pcpu"], b["reason"],
+            b["daemons"]["pcpu"], b["jobs"]["pcpu"], agents))
+
+
+def cmd_product_cpu(a):
+    """`product-cpu [--json]` - ALWAYS exit 0 (F5 design section 3 / derived test 14)."""
+    try:
+        b = _product_cpu_collect()
+    except Exception as e:                      # noqa: BLE001 - a failure is a field, not an exit
+        b = _pc_empty("not_measured", "internal: %s: %s" % (type(e).__name__, e))
+    print(json.dumps(b, ensure_ascii=False) if a.json else _product_cpu_line(b))
+    return EXIT_ALLOW
+
+
+def _pc_text_check_argv(argv):
+    """Is this invocation TEXT `check`? Conservative: any token starting `--j` (argparse accepts
+    the abbreviations `--j`/`--js`/`--jso` of `--json`) counts as JSON - erring toward 'no tail'
+    keeps the gate-critical shape untouched."""
+    return bool(argv) and argv[0] == "check" and not any(t.startswith("--j") for t in argv[1:])
+
+
+def _pc_run_child():
+    """Run `product-cpu --json` as a child with the 3.0 s deadline -> block dict.
+    Own session, so a kill at the deadline also takes the child's `ps`; reaped before return."""
+    argv = [sys.executable, os.path.abspath(__file__), "product-cpu", "--json"]
+    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL}
+    if os.name == "posix":
+        kw["start_new_session"] = True
+    try:
+        p = subprocess.Popen(argv, **kw)
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        return {"state": "not_measured", "reason": "could not run: %s" % type(e).__name__}
+    try:
+        out, _ = p.communicate(timeout=PRODUCT_CPU_CHILD_DEADLINE_S)
+    except subprocess.TimeoutExpired:
+        try:
+            if os.name == "posix":
+                os.killpg(p.pid, 9)             # the child's own session: child + its `ps`
+            else:
+                p.kill()
+        except OSError:
+            try:
+                p.kill()
+            except OSError:
+                pass
+        try:
+            p.communicate(timeout=2.0)          # reap: no child left behind (test 9)
+        except Exception:                       # noqa: BLE001 - report-only path
+            pass
+        return {"state": "not_measured",
+                "reason": "deadline %.1f s exceeded" % PRODUCT_CPU_CHILD_DEADLINE_S}
+    if p.returncode != 0:
+        return {"state": "not_measured", "reason": "separate invocation exited %s" % p.returncode}
+    try:
+        b = json.loads(out.decode("utf-8", "replace"))
+    except ValueError:
+        return {"state": "not_measured", "reason": "unreadable output"}
+    if not isinstance(b, dict) or "state" not in b:
+        return {"state": "not_measured", "reason": "unreadable output"}
+    return b
+
+
+def _product_cpu_tail(windows=None, run_child=None):
+    """Text `check` tail: print ONE line. Never raises, never changes an exit code (the caller
+    keeps the code it decided before this ran). Windows host: no child, line `unavailable`."""
+    try:
+        sys.stdout.flush()
+        windows = _is_windows_host() if windows is None else windows
+        if windows:
+            b = _pc_empty("unavailable", "Windows host - no ps read, no child (like the fleet axis)")
+        else:
+            b = (run_child or _pc_run_child)()
+        line = _product_cpu_line(b)
+    except Exception as e:                      # noqa: BLE001 - report-only, must not break check
+        line = PRODUCT_CPU_LINE_HEAD + "not measured - internal: %s" % type(e).__name__
+    try:
+        print(line)
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
+
+
 class _GateArgumentParser(argparse.ArgumentParser):
     """★A13: argparse 의 사용오류 종료를 exit 2(=EXIT_HARD) 로 흘려보내지 않는다.
 
@@ -2890,6 +3329,11 @@ def main(argv=None):
 
     c = sub.add_parser("classify")
     c.set_defaults(fn=cmd_classify)
+
+    # ★F5 (0.14.50): report-only, read-only, always exit 0; never called by a gate-critical caller.
+    c = sub.add_parser("product-cpu")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=cmd_product_cpu)
 
     c = sub.add_parser("enforce")
     c.add_argument("--servers-hard", type=int, default=3)
@@ -3977,6 +4421,45 @@ def _self_test_body(fails):
             rc = main(q + det_boot + ["--fleet-cpu-override", "0.0"] + bad)
         chk(rc == EXIT_USAGE, "%r 가 EX_USAGE(64) 로 거부되지 않았다: rc=%r" % (bad, rc))
 
+    # (F5 · 0.14.50) product-cpu classifier on the captured shapes - pure: rows injected,
+    #   attribution stubbed; this self-test starts no child, makes no ps read, no lookup call.
+    _wk = "/System/Library/Frameworks/WebKit.framework/Versions/A/XPCServices/"
+    _pc_rows = [(14305, 1, 1.3, "/Applications/cys.app/Contents/MacOS/cys-app"),
+                (14362, 1, 75.5, _wk + "com.apple.WebKit.WebContent.xpc/Contents/MacOS/x"),
+                (14363, 1, 1.0, _wk + "com.apple.WebKit.GPU.xpc/Contents/MacOS/x"),
+                (14371, 1, 1.0, _wk + "com.apple.WebKit.Networking.xpc/Contents/MacOS/x"),
+                (1301, 1, 0.0, "/System/Applications/Mail.app/Contents/MacOS/Mail"),
+                (1391, 1, 2.5, _wk + "com.apple.WebKit.GPU.xpc/Contents/MacOS/x"),
+                (14209, 1, 1.4, "/Applications/cys.app/Contents/MacOS/cysd")]
+    _pc_map = {14362: 14305, 14363: 14305, 14371: 14305, 1391: 1301}
+
+    def _pc_stub(m):
+        return lambda: (lambda pid: m.get(pid, -1))
+
+    def _pc_run(resolve):
+        return _product_cpu_collect(read_ps=lambda: (list(_pc_rows), None, None),
+                                    resolve=resolve, windows=False, darwin=True, self_pid=-1,
+                                    ncpu=16)
+    _b = _pc_run(_pc_stub(_pc_map))
+    chk(_b["state"] == "ok" and _b["app_helpers"]["pcpu"] == 77.5
+        and _b["foreign_helpers_left_out"] == 1 and _b["total"]["pcpu"] == 80.2,
+        "F5: product-cpu fixture (app + 3 helpers + 1 foreign) wrong: %r" % (_b,))
+
+    def _pc_missing():
+        raise AttributeError("symbol not found (self-test stub)")
+    _b = _pc_run(_pc_missing)
+    chk(_b["state"] == "partial" and _b["app_helpers"] is None and _b["total"] is None
+        and _b["helpers_unattributed"]["procs"] == 4 and "AttributeError" in _b["reason"],
+        "F5: a missing lookup must give unattributed, never zero: %r" % (_b,))
+    _b = _pc_run(_pc_stub({**_pc_map, 14362: -1}))
+    chk(_b["state"] == "partial" and _b["helpers_unattributed"]["pcpu"] == 75.5
+        and _b["total"] is None, "F5: a garbage answer must make that helper unattributed: %r" % (_b,))
+    _b = _product_cpu_collect(windows=True)
+    chk(_b["state"] == "unavailable", "F5: Windows host must be unavailable: %r" % (_b,))
+    chk(_pc_text_check_argv(["check"]) and not _pc_text_check_argv(["check", "--json"])
+        and not _pc_text_check_argv(["check", "--js"]) and not _pc_text_check_argv(["product-cpu"]),
+        "F5: text-check detection wrong")
+
     if fails:
         print("javis_resource_gate self-test FAIL:")
         for f in fails:
@@ -4002,11 +4485,19 @@ def _self_test_body(fails):
           " 래치(임계 격리 3·만료 영속 2·읽기불능 1·관측공백 표기 1·레인 해시 3·임계 키 1·레인 변수 2) ·"
           " 음수 분율 EX_USAGE 7 · codex 위임 검체 D1/D2/D3~D7/D9/D10 16)"
           " + A3 부서 로스터 8종(좌석 합산 22·floor 유지·응답 실패 soft·실데이터 9좌석 soft/hard 판별+"
-          "음성 대조·--nodes-hard 우선·잘못된 주입 64·override 단락·라이브 경로 대역)")
+          "음성 대조·--nodes-hard 우선·잘못된 주입 64·override 단락·라이브 경로 대역)"
+          " + F5 product-cpu 5 (helper attribution · lookup missing = unattributed · garbage "
+          "answer · Windows unavailable · text-check detection; no child, no lookup)")
     return 0
 
 
 if __name__ == "__main__":
     if "--self-test" in sys.argv[1:]:
         sys.exit(self_test())
-    sys.exit(main())
+    _rc = main()
+    # ★F5-A1: the tail exists ONLY here (not in cmd_check/main) - text `check` with a verdict
+    #   (0/1/2) gets one report-only line; `_rc` was decided before the child starts and is
+    #   returned unchanged. `check --json` and every other shape run nothing new.
+    if _rc in (EXIT_ALLOW, EXIT_SOFT, EXIT_HARD) and _pc_text_check_argv(sys.argv[1:]):
+        _product_cpu_tail()
+    sys.exit(_rc)

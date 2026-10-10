@@ -892,7 +892,8 @@ CSO_PY_TOOLS = {
     "javis_cycle_autopilot.py": {"tick", "status", "audit", "self-test"},
     "javis_orchestra.py": {"check", "round-status", "gate-status", "next-action",
                            "channel-health", "silent-failure-catalog", "self-test"},
-    "javis_resource_gate.py": {"check", "classify"},          # `enforce` 는 kill 집행이다
+    # ★F5 (0.14.50 · head D5): `product-cpu` = read-only report (own ps read, always exit 0).
+    "javis_resource_gate.py": {"check", "classify", "product-cpu"},  # `enforce` 는 kill 집행이다
     "javis_report_gate.py": {"status"},                       # `run` 은 배달+원장 기록이다
     "javis_state_snapshot.py": {"list", "verify"},            # `snapshot`·`gc` 는 세대 변형
     "javis_mission.py": {"status", "path", "delivery-path", "machine-origin"},
@@ -3137,6 +3138,7 @@ def self_test():
                              '--title "[CSO] master hang" --body "근거 1줄"'}),
         ("Bash", {"command": 'python3 "${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_orchestra.py" check'}),
         ("Bash", {"command": "python3 /w/pack/bin/javis_resource_gate.py check"}),
+        ("Bash", {"command": "python3 /w/pack/bin/javis_resource_gate.py product-cpu --json"}),
         ("Bash", {"command": "cys status --json | grep alert_route"}),
         ("Bash", {"command": "cys status 2>&1"}),
         ("Bash", {"command": "shasum -a 256 /w/pack/round/SESSION_STATE.md"}),
@@ -3445,6 +3447,16 @@ def self_test_r1(fails):
          "resource_gate enforce --kill")
     want(False, "Bash", {"command": "python3 /w/pack/bin/javis_resource_gate.py check"},
          "resource_gate check 는 지침이 명한 판정")
+    # ★F5 derived test 13 (head D5): the read-only report is allowed where `check` is; the kill
+    #   path stays refused, also when disguised behind the new sub-verb.
+    want(False, "Bash", {"command": "python3 /w/pack/bin/javis_resource_gate.py product-cpu"},
+         "F5 resource_gate product-cpu (read-only report)")
+    want(False, "Bash", {"command": "python3 /w/pack/bin/javis_resource_gate.py product-cpu --json"},
+         "F5 resource_gate product-cpu --json (read-only report)")
+    want(True, "Bash", {"command": "python3 /w/pack/bin/javis_resource_gate.py product-cpu --kill"},
+         "F5 product-cpu does not open the --kill flag")
+    want(True, "Bash", {"command": "python3 /w/pack/bin/javis_resource_gate.py enforce --kill --pids 424242"},
+         "F5 enforce --kill still refused after product-cpu was added")
     want(True, "Bash", {"command": "python3 /w/pack/bin/javis_report_gate.py run"},
          "report_gate run(배달+원장)")
     want(False, "Bash", {"command": "python3 /w/pack/bin/javis_report_gate.py status"},

@@ -478,7 +478,7 @@ jobs:
                    test_trust_seed test_capgate_registration test_capgate_hook_shell \
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
-                   test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu \
+                   test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
                    test_inject_context_role_seat test_inject_context_soul_l0 test_carry_unproven_scope \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
                    test_capgate_remeasure_order test_phoenix_p10_lease_split \
@@ -570,7 +570,7 @@ jobs:
           #   레인은 여전히 적색(fail-closed)이지만 이 스텝이 존재하는 이유인 **진단**이 사라진다.
           #   `if <명령>; then …; else r=$?; fi` 는 그 명령에 한해 `-e` 를 끈다(POSIX 셸 규약).
           rc=0
-          for t in test_resource_gate test_resource_gate_fleet_cpu \
+          for t in test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
                    test_inject_context_role_seat test_wp7_gate_triage; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
@@ -1295,7 +1295,7 @@ jobs:
                    test_trust_seed test_capgate_registration test_capgate_hook_shell \
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
-                   test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu \
+                   test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
                    test_inject_context_role_seat test_inject_context_soul_l0 test_carry_unproven_scope \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
                    test_capgate_remeasure_order test_phoenix_p10_lease_split \
@@ -1400,7 +1400,7 @@ jobs:
           #   레인은 여전히 적색(fail-closed)이지만 이 스텝이 존재하는 이유인 **진단**이 사라진다.
           #   `if <명령>; then …; else r=$?; fi` 는 그 명령에 한해 `-e` 를 끈다(POSIX 셸 규약).
           rc=0
-          for t in test_resource_gate test_resource_gate_fleet_cpu \
+          for t in test_resource_gate test_resource_gate_fleet_cpu test_resource_gate_product_cpu \
                    test_inject_context_role_seat test_wp7_gate_triage; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
