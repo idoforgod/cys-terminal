@@ -763,6 +763,28 @@ class T09TextCheckBounded(unittest.TestCase):
         finally:
             h.close()
 
+    def test_9d_hang_key_cannot_delay_check_json(self):
+        """Head D-F5-2 (2026-10-10): the test seam's hang key must not be able to delay the gate.
+        The gate-critical shape is `check --json` (completion guard 10 s, formation, bootstrap, app).
+        With the hang key set: stdout and exit code are byte-identical to `main()` without the entry,
+        it finishes inside the reference time + 1.0 s, and the seam is never reached (its pid file,
+        written only when the hang starts, does not exist). Text `check` with the same key = test 9b."""
+        h = Harness()
+        try:
+            pid_file = os.path.join(h.td, "hang-json.pid")
+            key = {LOOKUP_ENV: json.dumps({"map": MAP_RICH, "hang_s": 12, "pid_file": pid_file})}
+            for name in CHECK_FIXTURES:
+                args = ["check", "--json"] + fixture_args(name)
+                r_rc, r_out, _e, r_dt = h.run_main_only(GATE, args)
+                t0 = time.monotonic()
+                n_rc, n_out, _e, _ = h.run(GATE, args, **key)
+                dt = time.monotonic() - t0
+                self.assertEqual((n_rc, n_out), (r_rc, r_out), name)
+                self.assertLessEqual(dt, r_dt + 1.0, "%s dt=%.2f ref=%.2f" % (name, dt, r_dt))
+                self.assertFalse(os.path.exists(pid_file), "%s: the hang seam was reached" % name)
+        finally:
+            h.close()
+
 
 class T10SelfTestSpawnsNothing(unittest.TestCase):
     def test_10_in_process(self):
