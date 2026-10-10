@@ -2831,15 +2831,9 @@ PRODUCT_CPU_PS_TIMEOUT_S = 1.5        # the separate invocation's own ps timeout
 PRODUCT_CPU_CHILD_DEADLINE_S = 3.0    # text `check` waits at most this long for the child (rule 3/4)
 PRODUCT_CPU_LINE_HEAD = "product itself (report-only, not a gate input): "
 PRODUCT_CPU_LABEL = "ps average, report-only, not a gate input"
-# Test injection ONLY (report-only figures; never read by `check`): replaces the helper
-# attribution in `product-cpu` with a fixture, so subprocess tests are platform-independent and
-# never call the real system lookup. JSON object, keys (all optional):
-#   {"missing": true}                     resolving the lookup raises AttributeError
-#   {"raise": "OSError"|"RuntimeError"|"ArgumentError"}  every call raises that exception
-#   {"hang_s": N, "pid_file": PATH}       first call writes this process's pid to PATH, sleeps N s
-#   {"map": {"<pid>": <any JSON>}}        answer per helper pid (absent pid -> -1)
-#   {"trace_file": PATH}                  append one line per resolve / call (spawn-free proof)
-PRODUCT_CPU_LOOKUP_ENV = "CYS_GATE_PRODUCT_CPU_LOOKUP_OVERRIDE"
+# No environment-selected behaviour here (lane B review R1 M1, 0.14.50): an earlier test seam read a JSON spec from an
+# environment variable and could write files (pid / trace). Product code reads no variable to pick a lookup and
+# opens no file for writing in this block; fixtures are injected by the test harness (tests/pc_harness_gate.py).
 _PC_CLASSES = ("app", "app_helper", "unattributed", "foreign_helper", "daemon", "agent_cli",
                "fleet_other", "product_job")
 
@@ -2953,41 +2947,6 @@ def _pc_resolve_responsible_lookup():
     return lambda pid: fn(int(pid))
 
 
-def _pc_override_lookup(spec_text):
-    """Resolver built from PRODUCT_CPU_LOOKUP_ENV (test injection). Raises like the real one."""
-    spec = json.loads(spec_text)
-    if not isinstance(spec, dict):
-        raise ValueError("lookup override is not a JSON object")
-    trace = spec.get("trace_file")
-
-    def note(msg):
-        if trace:
-            with open(trace, "a", encoding="utf-8") as fh:
-                fh.write(msg + "\n")
-    note("resolve")
-    if spec.get("missing"):
-        raise AttributeError("responsibility_get_pid_responsible_for_pid: symbol not found "
-                             "(override)")
-    state = {"n": 0}
-
-    def fn(pid):
-        state["n"] += 1
-        note("call %s" % pid)
-        exc = spec.get("raise")
-        if exc:
-            import ctypes
-            raise {"OSError": OSError, "RuntimeError": RuntimeError,
-                   "ArgumentError": ctypes.ArgumentError}.get(exc, RuntimeError)(
-                "override: the lookup failed")
-        if spec.get("hang_s") and state["n"] == 1:
-            if spec.get("pid_file"):
-                with open(spec["pid_file"], "w", encoding="utf-8") as fh:
-                    fh.write(str(os.getpid()))
-            time.sleep(float(spec["hang_s"]))
-        return (spec.get("map") or {}).get(str(pid), -1)
-    return fn
-
-
 def _pc_attribute_lookup(resolve, helper_pids, table_pids):
     """F5-A2 guard. -> (answers {pid: responsible pid}, bad {pid: reason}, run_reason|None).
     ANY exception while resolving or calling -> no helper attributed in this run (run_reason).
@@ -3094,11 +3053,7 @@ def _product_cpu_collect(read_ps=None, resolve=None, windows=None, darwin=None,
     rows, st, why = (read_ps or _pc_read_ps)()
     if rows is None:
         return _pc_empty(st or "not_measured", why)
-    override = os.environ.get(PRODUCT_CPU_LOOKUP_ENV)
-    if resolve is None and override:
-        resolve = lambda: _pc_override_lookup(override)          # noqa: E731
-        rule = "override"
-    elif resolve is None and darwin:
+    if resolve is None and darwin:
         resolve = _pc_resolve_responsible_lookup
         rule = "responsible-pid"
     else:

@@ -57,7 +57,9 @@ TAG_REF = "51b00d7a"            # v0.14.49 = base of integ/0.14.50-b (the "tag" 
 TAG_PATH = "cysjavis-pack/bin/javis_resource_gate.py"
 LINE_HEAD = "product itself (report-only, not a gate input): "
 NEW_COLS = "pid=,ppid=,pcpu=,command="
-LOOKUP_ENV = "CYS_GATE_PRODUCT_CPU_LOOKUP_OVERRIDE"
+# Harness-side fixture variable: read ONLY by tests/pc_harness_gate.py (the product reads no such variable - lane B review R1 M1).
+LOOKUP_ENV = "PC_HARNESS_LOOKUP"
+WRAPPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pc_harness_gate.py")
 POSIX = os.name == "posix"
 
 
@@ -183,10 +185,20 @@ class Harness:
         return env
 
     def run(self, gate, args, timeout=60, **extra):
+        """The program entry of `gate`. For the tree's own gate the fixture lookup is injected by the harness wrapper
+        (the product cannot be told a lookup through the environment); any other gate (the tag's copy) runs as is."""
         t0 = time.monotonic()
-        r = subprocess.run([sys.executable, gate] + list(args), capture_output=True,
-                           timeout=timeout, env=self.env(**extra))
+        argv, env = self.entry(gate, **extra)
+        r = subprocess.run(argv + list(args), capture_output=True, timeout=timeout, env=env)
         return r.returncode, r.stdout, r.stderr, time.monotonic() - t0
+
+    def entry(self, gate, **extra):
+        """-> (argv prefix, env) that start the program entry of `gate` (the harness wrapper for this tree's gate)."""
+        env = self.env(**extra)
+        if os.path.abspath(gate) == os.path.abspath(GATE):
+            env["PC_HARNESS_GATE"] = gate
+            return [sys.executable, WRAPPER], env
+        return [sys.executable, gate], env
 
     def run_main_only(self, gate, args, timeout=60, **extra):
         """The module's own `main()` WITHOUT the program entry (= the tag's code path)."""
@@ -710,8 +722,8 @@ class T08CallerBoundary(unittest.TestCase):
 class T09TextCheckBounded(unittest.TestCase):
     def _timed_lines(self, h, args, **extra):
         t0 = time.monotonic()
-        p = subprocess.Popen([sys.executable, GATE] + args, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, env=h.env(**extra))
+        argv, env = h.entry(GATE, **extra)
+        p = subprocess.Popen(argv + args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
         lines = []
         for raw in iter(p.stdout.readline, b""):
             lines.append((time.monotonic() - t0, raw))
