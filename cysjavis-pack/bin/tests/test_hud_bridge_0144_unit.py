@@ -185,7 +185,8 @@ class LogAndHealth(unittest.TestCase):
     def test_health_body_fields(self):
         with mock.patch.dict(os.environ, {"HUD_PACK_VERSION": "9.9.9"}):
             j = json.loads(HB.health_body())
-        self.assertEqual(sorted(j), ["assets", "boot_id", "ok", "pack_version", "pid", "timeouts"])
+        self.assertEqual(sorted(j), ["assets", "boot_id", "ok", "pack_version", "pid", "subs", "timeouts"])
+        self.assertIsNone(j["subs"], "감독자가 없는 시험에서는 subs 가 null 이다")
         self.assertTrue(j["ok"])
         self.assertEqual(j["pid"], os.getpid())
         self.assertEqual(j["boot_id"], HB.BOOT_ID)

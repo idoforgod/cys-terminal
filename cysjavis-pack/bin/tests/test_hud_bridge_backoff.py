@@ -18,16 +18,24 @@
      만나도 그 이벤트만 건너뛰고 다음 줄을 처리한다(종전엔 예외 하나로 스레드가 끝나고 `reconcile_targets` 는 스레드 생존을 보지 않아 다시
      띄우지도 않았다). 의도된 탈출 경로(종료 신호 `stop` · KeyboardInterrupt/SystemExit)는 삼키지 않는다. 삼킨 사실은 stderr 한 줄(같은
      예외 형 연속은 첫 1회만).
+  ⑧ ★(0.14.49 · T-49-3) **구독 스레드 사망 수리** — 윈도우(로케일이 cp949·cp1252)에서 한글 이벤트 한 줄이 읽기 단계(`for line in proc.stdout`)에서
+     UnicodeDecodeError 를 일으켜 리더 스레드가 영구히 끝나던 결함. 진짜 파이프로 한글·손상 바이트를 읽는 시험, 읽기 단계 예외의 지수 재수립,
+     끝난 스레드의 한정 재시작(2→60s 지수 · 600s 살아야 초기화), `/health` 의 `subs`, 다섯 자식 읽기 자리의 인코딩 명시(AST 점검).
+     손상(UTF-8 아닌) 바이트가 든 줄·스냅샷은 **버린다**(설계 v2 D2 — 라우팅하지 않음). 종전의 "errors=replace 로 라우팅" 문면은 폐기됐다.
 
 실행: python3 test_hud_bridge_backoff.py   (unittest·파일 직접 실행 — 저장소 관례 준거)
 """
+import ast
 import contextlib
 import io
 import json
+import locale
 import os
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -394,6 +402,558 @@ class ReaderEventFaultIsolation(unittest.TestCase):
                                                 route=lambda ev, world, coal, slug="main", now=None: ([{"t": "fx", "n": ev["seq"]}], False))
         self.assertEqual([f["n"] for f in hub.frames], [7])
         self.assertEqual(self.evt_logs(err), [])
+
+
+# ── ⑧ 0.14.49 · 구독 스레드 사망 수리 (T-49-3 · 설계 DESIGN-49-v2 §7) ──────────────────────────────────────────────
+
+_REAL_POPEN = HB.subprocess.Popen
+_FAKE_CYS = "FAKE-CYS"      # HB.CYS 자리에 세우는 표지 — 아래 Popen 대역이 `python 가짜cys.py` 로 바꿔 끼운다(윈도우에서도 shebang 불필요)
+
+# 가짜 `cys` — 진짜 자식 프로세스이고 진짜 파이프로 바이트를 쓴다(스텁 이터레이터가 아니다: 디코딩은 Popen 의 텍스트 래퍼가 한다).
+_FAKE_CYS_SRC = r"""
+import json, os, sys, time
+w = sys.stdout.buffer
+a = sys.argv[1:]
+if "events" in a:
+    for h in json.loads(os.environ.get("T49_LINES", "[]")):
+        w.write(bytes.fromhex(h) + b"\n"); w.flush(); time.sleep(0.05)
+    tail = os.environ.get("T49_TAIL", "")
+    if tail:
+        w.write(bytes.fromhex(tail)); w.flush()
+    time.sleep(float(os.environ.get("T49_HOLD", "20")))
+elif "read-screen" in a:
+    w.write("한글 화면 줄 ready\n".encode("utf-8"))
+else:
+    w.write(bytes.fromhex(os.environ.get("T49_JSON", "7b7d")) + b"\n")
+"""
+
+
+def _ev(name, cat, payload, seq):
+    o = {"_flen": 0, "_pv": 1, "type": "event", "seq": seq, "name": name, "category": cat, "timestamp": 1791564757.7,
+         "surface_id": None, "payload": payload}
+    return json.dumps(o, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+# 윈도우 로그에서 재구성한 틀(키 순서·머리·한글 본문) — 0.14.48 조사에서 쓴 세 줄과 같은 꼴이다. 뒤따르는 AFTER(557)가 "다음 이벤트가 처리되는가"의 표지.
+F_ACK = (b'{"_flen":0,"_pv":1,"heartbeat_interval_seconds":15,"latest_seq":553,"ok":true,"resume":{"after_seq":null,"gap":false,'
+         b'"latest_seq":553,"next_seq":554,"oldest_seq":513},"type":"ack"}')
+F_ASCII = _ev("surface.created", "surface", {"cmd": "cmd.exe", "cwd": "C:\\Users\\runneradmin", "pid": 6084, "role": None, "surface_ref": "surface:5"}, 554)
+_TICK_OUT = json.dumps({"result": "skip", "roles": [{"role": "worker", "pass": False, "reason": "대상 유휴: role=worker surface 부재; 미해결 발화(clear 가드)·측정 유효: "
+                        "phase=부재(구 데몬 — fail-closed) fire_id=None executed=False · 측정 ok=False reason=x ctx_pct=None"}],
+                        "sweep": {}, "gate_exit": 3}, ensure_ascii=False) + "\n"
+F_TICK = _ev("schedule.command_done", "schedule", {"job_id": "cycle-autopilot-tick", "exit": 0, "stdout_tail": _TICK_OUT}, 555)
+F_WARN = _ev("schedule.warning", "schedule", {"kind": "retired-seed-text", "job_id": "fleet-adoption-cost-digest", "detail":
+             "[cysd] schedule: 잡 'fleet-adoption-cost-digest' 는 은퇴한 시드 문구다 — 서명 승인이 없으면 실행하지 않는다(오류로 세지 않는다). 지우려면: cys schedule remove x"}, 556)
+F_FEED = _ev("feed.item.created", "feed", {"request_id": "x", "kind": "ceo-notice", "title": "CEO 승격 보류(부트 필요)", "body":
+             "부서가 생성되었으나 base master가 아직 부트되지 않았습니다. base에서 '너는 마스터다' 또는 '마스터 시작' 버튼으로 부트를 완료하면 명령 팔레트의 'CEO 승격 진행'으로 승인할 수 있습니다.",
+             "wait": False, "tier": "d", "auto_route": False}, 558)
+F_AFTER = _ev("pane.idle", "pane", {"idle_secs": 303, "surface_ref": "surface:3"}, 557)
+F_BAD1 = b'{"type":"event","seq":600,"name":"x","payload":{"t":"\xff\xfe raw"}}'                       # 문자열 안의 UTF-8 아닌 바이트
+_i = next(i for i, b in enumerate(F_TICK) if b >= 0x80)
+F_BAD2 = F_TICK[:_i + 1]                                                                             # 여러 바이트 글자의 머리 바이트에서 잘린 줄
+F_FFFD = '{"type":"event","seq":601,"name":"x","payload":{"t":"ok \ufffd ok 한글"}}'.encode("utf-8")  # 진짜 U+FFFD 가 든 유효한 줄
+
+
+def _kor(text):
+    return sum(1 for c in text if "\uac00" <= c <= "\ud7a3")
+
+
+class _Rig:
+    """가짜 cys 자식 + 진짜 파이프 + 진짜 SubscriptionSupervisor. emu 가 있으면 "인코딩을 이름 붙이지 않은 text=True 호출"만 그 인코딩을 기본으로 받는다
+    (로케일 기본값이 cp949·cp1252 인 윈도우를 모사 — 이름을 붙인 호출은 건드리지 않으므로 수리된 코드는 이 대역의 도움을 받지 못한다)."""
+
+    def __init__(self, tc, emu=None, lines=(), tail=b"", hold=20, json_bytes=None):
+        self.tc, self.emu = tc, emu
+        self.dir = tempfile.mkdtemp(prefix="hud-t49-")
+        tc.addCleanup(shutil.rmtree, self.dir, True)
+        self.script = os.path.join(self.dir, "fakecys.py")
+        with open(self.script, "w", encoding="utf-8") as f:
+            f.write(_FAKE_CYS_SRC)
+        self.seen, self.err, self.texc = [], io.StringIO(), []
+        self.world = types.SimpleNamespace(seq=0, dept_targets=lambda: {}, daemon={})
+        self.poke = threading.Event()
+        self.sup = HB.SubscriptionSupervisor(self.world, _Hub(), HB.Coalescer(), self.poke, self.dir)
+        rig = self
+
+        class FakePopen(_REAL_POPEN):
+            def __init__(p, args, *a, **k):
+                if isinstance(args, (list, tuple)) and args and args[0] == _FAKE_CYS:
+                    args = [sys.executable, rig.script] + list(args[1:])
+                if rig.emu and (k.get("text") or k.get("universal_newlines")) and "encoding" not in k:
+                    k["encoding"] = rig.emu
+                super().__init__(args, *a, **k)
+
+        env = {"T49_LINES": json.dumps([l.hex() for l in lines]), "T49_TAIL": tail.hex(), "T49_HOLD": str(hold)}
+        if json_bytes is not None:
+            env["T49_JSON"] = json_bytes.hex()
+        self.stack = contextlib.ExitStack()
+        st = self.stack
+        st.enter_context(mock.patch.object(HB, "CYS", _FAKE_CYS))
+        st.enter_context(mock.patch.object(HB.subprocess, "Popen", FakePopen))
+        st.enter_context(mock.patch.object(HB, "route_event", self._route))
+        st.enter_context(mock.patch.object(HB, "archive_fx", lambda ts, fr: None))
+        st.enter_context(mock.patch.dict(os.environ, env))
+        st.enter_context(mock.patch.object(threading, "excepthook", lambda a: self.texc.append("%s: %s" % (a.exc_type.__name__, str(a.exc_value)[:140]))))
+        st.enter_context(contextlib.redirect_stderr(self.err))
+        tc.addCleanup(self.close)
+
+    def _route(self, ev, world, coal, slug="main", now=None):
+        p = json.dumps(ev.get("payload"), ensure_ascii=False)
+        self.seen.append({"seq": ev.get("seq"), "kor": _kor(p), "fffd": p.count("\ufffd"),
+                          "escapes": sum(1 for c in p if "\udc80" <= c <= "\udcff")})
+        return [], False
+
+    def thread(self):
+        return self.sup.subs["main"]["thread"]
+
+    def seqs(self):
+        return [e["seq"] for e in self.seen]
+
+    def logs(self, needle=None):
+        ls = self.err.getvalue().splitlines()
+        return [l for l in ls if needle in l] if needle else ls
+
+    def stats(self):
+        return dict((getattr(self.sup, "stats", {}) or {}).get("main") or {})
+
+    def run(self, until=None, secs=8.0):
+        """리더 스레드를 띄우고 until() 이 참이 되거나 스레드가 끝나거나 secs 가 지날 때까지 기다린다(죽은 스레드를 헛기다리지 않는다)."""
+        self.sup._spawn("main", None)
+        end = time.monotonic() + secs
+        until = until or (lambda: 557 in self.seqs())
+        while time.monotonic() < end and not until() and self.thread().is_alive():
+            time.sleep(0.02)
+        time.sleep(0.15)        # until 직후 같은 읽기 흐름의 나머지 줄·로그가 도착할 틈
+        return self
+
+    def close(self):
+        for slug in list(self.sup.subs):
+            proc = self.sup.subs[slug]["proc"][0]
+            self.sup._reap(slug)
+            try:
+                if proc is not None:
+                    proc.kill()
+            except Exception:
+                pass
+        self.stack.close()
+
+
+class HudBridgeEncodingOnRealPipe(unittest.TestCase):
+    """★윈도우 CI 걸음이 번들 python3.exe 로 이 클래스를 돈다. 진짜 자식·진짜 파이프로 한글·손상 바이트를 읽는다(0.14.48 에서는 붉다)."""
+
+    EMUS = ("cp949", "cp1252")
+
+    def test_korean_events_are_routed_and_the_next_event_arrives(self):
+        for emu in self.EMUS:
+            for name, frame, seq in (("tick", F_TICK, 555), ("warn", F_WARN, 556), ("feed", F_FEED, 558)):
+                with self.subTest(default_encoding=emu, frame=name):
+                    rig = _Rig(self, emu=emu, lines=[F_ACK, F_ASCII, frame, F_AFTER]).run()
+                    try:
+                        self.assertTrue(rig.thread().is_alive(), "한글 이벤트 한 줄에 리더 스레드가 끝났다: %s" % rig.texc[:1])
+                        self.assertIn(seq, rig.seqs(), "한글 이벤트가 라우팅되지 않았다")
+                        row = [e for e in rig.seen if e["seq"] == seq][0]
+                        self.assertGreater(row["kor"], 0, "한글이 사라졌다")
+                        self.assertEqual((row["fffd"], row["escapes"]), (0, 0), "한글이 깨졌다(대체문자·이스케이프)")
+                        self.assertIn(557, rig.seqs(), "한글 이벤트 **다음** 이벤트가 처리되지 않았다")
+                    finally:
+                        rig.close()
+
+    def test_ascii_positive_control(self):
+        for emu in self.EMUS:
+            with self.subTest(default_encoding=emu):
+                rig = _Rig(self, emu=emu, lines=[F_ACK, F_ASCII, F_AFTER]).run()
+                try:
+                    self.assertTrue(rig.thread().is_alive())
+                    self.assertEqual([s for s in rig.seqs() if s in (554, 557)], [554, 557])
+                finally:
+                    rig.close()
+
+    def test_native_locale_condition(self):
+        # 이 기계의 진짜 기본값 — UTF-8 기계에서는 조건이 성립하지 않으니 조용히 통과하지 않고 그 사실을 찍는다.
+        enc = (locale.getpreferredencoding(False) or "?")
+        utf8 = sys.flags.utf8_mode or enc.lower().replace("-", "") == "utf8"
+        print("[T-49-3] native default encoding seen: %s utf8_mode=%s%s" % (enc, sys.flags.utf8_mode,
+              "  -> condition not established (UTF-8 machine); the emulated rows above are the proof here" if utf8 else ""), file=sys.__stderr__)
+        rig = _Rig(self, emu=None, lines=[F_ACK, F_TICK, F_AFTER]).run()
+        try:
+            self.assertTrue(rig.thread().is_alive(), "native: %s %s" % (enc, rig.texc[:1]))
+            self.assertIn(555, rig.seqs())
+            self.assertIn(557, rig.seqs())
+        finally:
+            rig.close()
+
+    def test_bytes_that_are_not_utf8_are_dropped_counted_and_logged_once(self):
+        for emu in (None, "cp1252"):
+            with self.subTest(default_encoding=emu):
+                rig = _Rig(self, emu=emu, lines=[F_ACK, F_BAD1, F_BAD2, F_AFTER]).run()
+                try:
+                    self.assertTrue(rig.thread().is_alive(), "손상 바이트 줄에 스레드가 끝났다: %s" % rig.texc[:1])
+                    self.assertNotIn(600, rig.seqs(), "손상 줄이 라우팅됐다(설계 v2 D2: 버린다)")
+                    self.assertTrue(all(e["escapes"] == 0 and e["fffd"] == 0 for e in rig.seen), rig.seen)
+                    self.assertIn(557, rig.seqs(), "손상 줄 다음 이벤트가 처리되지 않았다")
+                    self.assertEqual(rig.stats().get("damaged"), 2)
+                    self.assertEqual(len(rig.logs("non-UTF-8")), 1, rig.logs())
+                    self.assertTrue(rig.poke.is_set(), "손상 줄은 스냅샷을 요청한다")
+                finally:
+                    rig.close()
+
+    def test_a_valid_line_with_a_real_u_fffd_is_routed_unchanged(self):
+        for emu in (None, "cp1252"):
+            with self.subTest(default_encoding=emu):
+                rig = _Rig(self, emu=emu, lines=[F_ACK, F_FFFD, F_AFTER]).run()
+                try:
+                    row = [e for e in rig.seen if e["seq"] == 601]
+                    self.assertEqual(len(row), 1, "정상 줄(진짜 U+FFFD 포함)이 버려졌다")
+                    self.assertEqual((row[0]["fffd"], row[0]["kor"], row[0]["escapes"]), (1, 2, 0))
+                    self.assertEqual(rig.stats().get("damaged", 0), 0)
+                finally:
+                    rig.close()
+
+    def test_snapshot_korean_is_parsed_and_damaged_snapshot_returns_none(self):
+        good = '{"daemon":{"latest_seq":5},"label":"한글 부서 이름"}'.encode("utf-8")
+        bad = b'{"daemon":{"latest_seq":5},"label":"\xff\xfe"}'
+        for emu in self.EMUS:
+            with self.subTest(default_encoding=emu, body="korean"):
+                rig = _Rig(self, emu=emu, json_bytes=good)
+                try:
+                    r = HB.run_json(["status", "--json"])
+                    self.assertIsNotNone(r, "한글이 든 스냅샷을 못 읽었다")
+                    self.assertEqual(_kor(r["label"]), 6)
+                finally:
+                    rig.close()
+            with self.subTest(default_encoding=emu, body="damaged"):
+                rig = _Rig(self, emu=emu, json_bytes=bad)
+                try:
+                    before = HB._STATS.get("damaged_snapshots", 0)
+                    self.assertIsNone(HB.run_json(["status", "--json"]), "손상 바이트 스냅샷을 받아들였다")
+                    self.assertEqual(HB._STATS.get("damaged_snapshots", 0), before + 1)
+                finally:
+                    rig.close()
+
+    def test_screen_text_keeps_its_korean(self):
+        for emu in self.EMUS:
+            with self.subTest(default_encoding=emu):
+                rig = _Rig(self, emu=emu)
+                try:
+                    rows = HB.peek_surface("main@surface:1")
+                    self.assertTrue(rows and "한글" in " ".join(rows), rows)
+                finally:
+                    rig.close()
+
+
+class _RaisingProc:
+    """읽기 단계가 터지는 자식 — 첫 줄 뒤 `for line in proc.stdout` 의 다음 걸음이 OSError."""
+    spawned = 0
+
+    def __init__(self, *a, **k):
+        type(self).spawned += 1
+
+        class Out:
+            n = 0
+
+            def __iter__(o):
+                return o
+
+            def __next__(o):
+                o.n += 1
+                if o.n == 1:
+                    return ev_line(1)
+                raise OSError("model: pipe read failed")
+        self.stdout = Out()
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 1
+
+    def poll(self):
+        return 1
+
+
+class ReaderReadStepError(unittest.TestCase):
+    """(b1) 읽기 단계 예외는 그 자식만 끝내고 기존 지수 백오프로 다시 세운다 — 스레드를 죽이지 않는다."""
+
+    def test_read_error_goes_through_the_shipped_backoff_and_keeps_retrying(self):
+        pokes, err = [], io.StringIO()
+        _RaisingProc.spawned = 0
+        sup = HB.SubscriptionSupervisor(world=types.SimpleNamespace(seq=0), hub=_Hub(), coal=HB.Coalescer(),
+                                        poke=types.SimpleNamespace(set=lambda: pokes.append(1)), state_dir=tempfile.mkdtemp(prefix="hud-t49-rd-"))
+        self.addCleanup(shutil.rmtree, sup.state_dir, True)
+        stop = _RecordingStop(n=8)
+        raised = None
+        with mock.patch.object(HB.subprocess, "Popen", _RaisingProc), \
+                mock.patch.object(HB, "route_event", lambda *a, **k: ([], False)), \
+                mock.patch.object(HB, "archive_fx", lambda ts, fr: None), \
+                contextlib.redirect_stderr(err):
+            try:
+                sup._reader("rd", None, stop, [None])
+            except Exception as e:                                  # noqa: BLE001
+                raised = "%s: %s" % (type(e).__name__, e)
+        self.assertIsNone(raised, "읽기 단계 예외가 _reader 밖으로 나갔다(스레드가 끝난다)")
+        self.assertEqual(stop.waits, [2.0, 4.0, 8.0, 16.0, 32.0, 60.0, 60.0, 60.0])
+        self.assertEqual(_RaisingProc.spawned, 8, "한 번 재시도하고 멎었다 — 계속 재시도해야 한다")
+        self.assertEqual(len([l for l in err.getvalue().splitlines() if "events read error" in l]), 1, err.getvalue())
+        self.assertTrue(pokes, "다시 세울 때는 스냅샷을 요청한다")
+
+
+class ThreadRevival(unittest.TestCase):
+    """(b2) 끝난 스레드의 한정 재시작. 주입 시계로 1시간(1800 번의 reconcile) — 실제 sleep 없음(스레드 종료는 join 으로 결정론)."""
+
+    PASSES, STEP = 1800, 2.0
+
+    def simulate(self, life):
+        """life: 스레드가 사는 모의 초(0=즉사 · None=살아서 막혀 있음)."""
+        clock = {"t": 1000.0}
+        starts, live = [], []                               # live: [(시작 모의시각, 문, 스레드)]
+        world = types.SimpleNamespace(seq=0, dept_targets=lambda: {}, daemon={})
+        sup = HB.SubscriptionSupervisor(world, _Hub(), HB.Coalescer(), threading.Event(), tempfile.mkdtemp(prefix="hud-t49-rev-"))
+        self.addCleanup(shutil.rmtree, sup.state_dir, True)
+
+        def reader(slug, socket, stop, holder):
+            g = threading.Event()
+            starts.append(clock["t"])
+            live.append([clock["t"], g, None])
+            if life == 0:
+                raise RuntimeError("model: reader dies at once")
+            g.wait(30)
+            if life is not None and not stop.is_set():
+                raise RuntimeError("model: reader dies after %ss" % life)
+        sup._reader = reader
+        same_pass, logs = 0, io.StringIO()
+        with mock.patch.object(threading, "excepthook", lambda a: None), contextlib.redirect_stderr(logs):
+            for i in range(self.PASSES):
+                t = clock["t"]
+                for row in live:                            # 살 만큼 산 스레드를 끝내고 끝났음을 확인한다
+                    th = row[2]
+                    if th is not None and th.is_alive() and life is not None and t - row[0] >= life:
+                        row[1].set()
+                        th.join(2)
+                    elif th is not None and th.is_alive() and life == 0:
+                        th.join(2)
+                n0 = len(starts)
+                dead_before = "main" in sup.subs and not sup.subs["main"]["thread"].is_alive()
+                sup.reconcile_once(now=t)
+                if "main" in sup.subs and live and live[-1][2] is None:
+                    live[-1][2] = sup.subs["main"]["thread"]
+                    if life == 0:
+                        live[-1][2].join(2)
+                if len(starts) != n0 and i > 0 and not dead_before:
+                    same_pass += 1
+                clock["t"] += self.STEP
+            for row in live:
+                row[1].set()
+        rel = [round(s - 1000.0) for s in starts]
+        gaps = [b - a for a, b in zip(rel, rel[1:])]
+        return {"rel": rel, "gaps": gaps, "same_pass": same_pass, "log": logs.getvalue(), "end": self.PASSES * self.STEP}
+
+    def check_continued_progress(self, life, r):
+        """C2: 지속 진행 점검은 **생애별**로 정의한다 — 연속한 시작 사이는 `life + 64` 초(= 생애 + 상한 60 + 한 번의 reconcile 주기 2 + 사망 감지 한 걸음 2)를
+        넘지 않고, 마지막 시작 뒤 남은 시간도 같은 값을 넘지 않는다. 생애 601 은 주기가 약 604 초라 마지막 300 초가 비어도 이 점검은 참이고,
+        한 번 재시도하고 멎은 경우는(남은 시간 ≈ 3598) 어떤 생애에서도 거짓이다."""
+        limit = life + 64
+        self.assertGreater(len(r["rel"]), 3, "재시도가 이어지지 않았다: %s" % r["rel"][:8])
+        self.assertTrue(all(g <= limit for g in r["gaps"]), "시작 사이가 %s 초를 넘었다: %s" % (limit, r["gaps"][:12]))
+        self.assertLessEqual(r["end"] - r["rel"][-1], limit, "마지막 시작 뒤 %s 초 넘게 시작이 없다 — 재시도가 멎었다" % limit)
+
+    def test_dies_at_once_restarts_continue_at_the_cap_and_are_bounded(self):
+        r = self.simulate(0)
+        self.check_continued_progress(0, r)
+        self.assertLessEqual(len(r["rel"]), 62)
+        late = r["gaps"][len(r["gaps"]) // 2:]
+        self.assertGreaterEqual(min(late), 60, "정상 상태에서 62초보다 촘촘히 재시작했다: %s" % late[:10])
+        self.assertEqual(r["rel"][:6], [0, 2, 8, 18, 36, 70], "초기 지수 단계(2→4→8→16→32→60) 이탈")
+        self.assertEqual(r["same_pass"], 0, "죽음을 처음 본 걸음에서 재시작했다")
+        self.assertGreaterEqual(len([l for l in r["log"].splitlines() if "reader thread ended" in l]), len(r["rel"]) - 1, "스레드 사망마다 한 줄")
+
+    def test_lives_30_seconds_pacing_does_not_reset_at_the_child_rule(self):
+        r = self.simulate(30)
+        self.check_continued_progress(30, r)
+        self.assertLessEqual(len(r["rel"]), 62, "30초 사는 스레드가 시간당 %d 번 재시작 — 30초 규칙으로 초기화되고 있다" % len(r["rel"]))
+        late = r["gaps"][len(r["gaps"]) // 2:]
+        self.assertGreaterEqual(min(late), 60, late[:10])
+        self.assertEqual(r["same_pass"], 0)
+
+    def test_lives_601_seconds_resets_pacing_and_continues(self):
+        r = self.simulate(601)
+        self.check_continued_progress(601, r)
+        self.assertGreaterEqual(min(r["gaps"]), 601, "601초 사는 스레드가 자기 수명보다 빨리 재시작됐다: %s" % r["gaps"])
+        self.assertEqual(r["same_pass"], 0)
+
+    def test_healthy_blocked_reader_is_never_restarted(self):
+        r = self.simulate(None)
+        self.assertEqual(len(r["rel"]), 1, "살아서 막혀 있는 리더가 다시 시작됐다(리더 중복 = 이벤트 폭주): %s" % r["rel"])
+
+    def test_a_reaped_subscription_is_never_revived(self):
+        world = types.SimpleNamespace(seq=0, dept_targets=lambda: {}, daemon={})
+        sup = HB.SubscriptionSupervisor(world, _Hub(), HB.Coalescer(), threading.Event(), tempfile.mkdtemp(prefix="hud-t49-reap-"))
+        self.addCleanup(shutil.rmtree, sup.state_dir, True)
+        n = {"s": 0}
+
+        def reader(slug, socket, stop, holder):
+            n["s"] += 1
+            raise RuntimeError("model: dies at once")
+        sup._reader = reader
+        with mock.patch.object(threading, "excepthook", lambda a: None), contextlib.redirect_stderr(io.StringIO()):
+            sup.reconcile_once(now=1000.0)
+            sup.subs["main"]["thread"].join(2)
+            sup._reap("main")
+            for i in range(100):
+                sup.revive_dead(1002.0 + 2 * i)
+        self.assertEqual(n["s"], 1)
+        self.assertNotIn("main", sup.subs)
+        self.assertFalse(getattr(sup, "revive", None), "reap 이 재시작 장부를 비우지 않았다")
+
+
+class SilentReaderObservation(unittest.TestCase):
+    """(e) 살아 있지만 조용한 리더 — 관측하고 한 줄 남길 뿐 죽이지 않는다(D1)."""
+
+    def run_case(self, lines, tail=b""):
+        self.assertTrue(hasattr(HB.SubscriptionSupervisor, "note_behind"), "note_behind 가 없다")
+        rig = _Rig(self, emu="cp1252", lines=lines, tail=tail)
+        rig.run(until=(lambda: bool(lines) and (lines[-1] == F_ASCII and 554 in rig.seqs())) if lines else (lambda: False), secs=1.2)
+        return rig
+
+    def check(self, rig, partial):
+        sup, t0 = rig.sup, time.monotonic()
+        last = rig.stats().get("last_seq", 0)
+        rig.world.daemon = {"latest_seq": last + 40}
+        r1, r2, r3 = sup.note_behind(t0 + 60), sup.note_behind(t0 + 130), sup.note_behind(t0 + 400)
+        sup.revive_dead(t0 + 400)
+        lv = sup.liveness(t0 + 400)
+        rig.world.daemon = {"latest_seq": last}
+        r4 = sup.note_behind(t0 + 500)
+        self.assertTrue(rig.thread().is_alive(), "조용한 리더가 죽었다/재시작됐다")
+        self.assertEqual(rig.stats().get("thread_restarts", 0), 0)
+        self.assertIs(r1, False, "120초 전에 표시됐다")
+        self.assertIs(r2, True)
+        self.assertIs(r3, True)
+        self.assertEqual(len(rig.logs("behind the daemon")), 1, "에피소드당 한 줄이 아니다: %s" % rig.logs())
+        self.assertIs(r4, False, "따라잡았는데 표시가 안 풀렸다")
+        idle = lv["items"]["main"]["idle_s"]
+        if partial:
+            self.assertIsNone(idle, "줄이 하나도 없었는데 idle_s 가 숫자다")
+        else:
+            self.assertGreaterEqual(idle, 398)
+
+    def test_reader_silent_after_its_lines(self):
+        rig = self.run_case([F_ACK, F_ASCII])
+        try:
+            self.check(rig, partial=False)
+        finally:
+            rig.close()
+
+    def test_reader_with_half_a_line_then_silence(self):
+        rig = self.run_case([], tail=b'{"type":"event","seq":70,"name":"x","pay')
+        try:
+            self.check(rig, partial=True)
+        finally:
+            rig.close()
+
+
+class HealthSubs(unittest.TestCase):
+    """(d) `/health` 의 `subs` — 한정된 객체 · 감독자 배선 · 실패해도 응답."""
+
+    def setUp(self):
+        self._had = hasattr(HB, "_SUPERVISOR")
+        self._old = getattr(HB, "_SUPERVISOR", None)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._had:
+            HB._SUPERVISOR = self._old
+        elif hasattr(HB, "_SUPERVISOR"):
+            del HB._SUPERVISOR
+
+    def sup_with(self, n, blk, hot=None):
+        s = HB.SubscriptionSupervisor(types.SimpleNamespace(seq=0, dept_targets=lambda: {}, daemon={}), _Hub(), HB.Coalescer(),
+                                      threading.Event(), tempfile.mkdtemp(prefix="hud-t49-h-"))
+        self.addCleanup(shutil.rmtree, s.state_dir, True)
+        s._reader = lambda slug, socket, stop, holder: blk.wait(20)
+        for i in range(n):
+            s._spawn("main" if i == 0 else "dept-with-a-rather-long-slug-name-%04d" % i, None)
+        if hot:
+            st = s._st(hot)
+            st.update(read_errors=10 ** 9, respawns=10 ** 9, thread_restarts=10 ** 9, damaged=10 ** 9, last_seq=10 ** 12)
+        return s
+
+    def test_old_keys_stay_and_subs_is_null_without_a_supervisor(self):
+        HB._SUPERVISOR = None
+        j = json.loads(HB.health_body())
+        for k in ("ok", "pid", "boot_id", "pack_version", "assets", "timeouts"):
+            self.assertIn(k, j)
+        self.assertIn("subs", j)
+        self.assertIsNone(j["subs"])
+
+    def test_subs_is_bounded_at_any_subscription_count(self):
+        blk = threading.Event()
+        self.addCleanup(blk.set)
+        sizes = {}
+        for n in (1, 12, 64, 500):
+            hot = "dept-with-a-rather-long-slug-name-%04d" % (n - 1) if n > 1 else None
+            HB._SUPERVISOR = self.sup_with(n, blk, hot)
+            body = HB.health_body()
+            sizes[n] = len(body)
+            j = json.loads(body)["subs"]
+            self.assertEqual(j["total"], n)
+            self.assertEqual(len(j["items"]), min(n, HB.SUBS_HEALTH_MAX))
+            self.assertEqual(j["omitted"], n - len(j["items"]))
+            self.assertIn("damaged_snapshots", j)
+            if hot:
+                self.assertIn(hot[:48], j["items"], "오류가 많은 구독이 한정된 목록에서 밀려났다")
+            if n == 1:
+                self.assertEqual(sorted(j["items"]["main"]), ["alive", "damaged", "idle_s", "last_seq", "read_errors", "respawns", "thread_restarts"])
+        self.assertLess(max(sizes.values()), 8192, sizes)
+
+    def test_health_answers_when_the_snapshot_raises(self):
+        class Boom:
+            def liveness(self):
+                raise RuntimeError("model")
+        HB._SUPERVISOR = Boom()
+        self.assertIsNone(json.loads(HB.health_body())["subs"])
+
+
+class SourceCensus(unittest.TestCase):
+    """다섯 자식 읽기 자리가 모두 인코딩을 이름 붙였는가(AST) — 호출 4·5(`/cmd`)는 이 점검만이 지킨다."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(HB.__file__, encoding="utf-8") as f:
+            cls.tree = ast.parse(f.read())
+
+    def sites(self):
+        found = {}
+        for fn in ast.walk(self.tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("run", "Popen", "check_output") \
+                        and isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess":
+                    kw = {k.arg: k.value for k in node.keywords if k.arg}
+                    if "text" in kw or "universal_newlines" in kw:
+                        found[(node.lineno, node.col_offset)] = (fn.name, getattr(kw.get("encoding"), "value", None), getattr(kw.get("errors"), "value", None))
+        return sorted((k[0], v) for k, v in found.items())
+
+    def test_five_text_mode_child_reads_name_utf8_and_the_right_errors(self):
+        rows = self.sites()
+        self.assertEqual(len(rows), 5, rows)
+        for line, (fn, enc, errs) in rows:
+            self.assertEqual(enc, "utf-8", "javis_hud_bridge.py:%d (%s) 가 인코딩을 이름 붙이지 않았다" % (line, fn))
+            want = "surrogateescape" if fn in ("_reader", "run_json") else "replace"
+            self.assertEqual(errs, want, "javis_hud_bridge.py:%d (%s) errors=%r (기대 %r) — 라우팅·JSON 으로 가는 읽기는 surrogateescape, 화면에만 보이는 읽기는 replace" % (line, fn, errs, want))
+
+    def test_main_hands_the_supervisor_to_health_before_its_thread_starts(self):
+        main = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+        assign = [n for n in ast.walk(main) if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "_SUPERVISOR" for t in n.targets)]
+        self.assertEqual(len(assign), 1, "main() 이 _SUPERVISOR 를 정확히 한 번 대입해야 한다")
+        self.assertTrue(any(isinstance(n, ast.Global) and "_SUPERVISOR" in n.names for n in ast.walk(main)))
+        starts = [n.lineno for n in ast.walk(main) if isinstance(n, ast.Call) and any(
+            k.arg == "target" and isinstance(k.value, ast.Attribute) and k.value.attr == "run" and isinstance(k.value.value, ast.Name) and k.value.value.id == "sup"
+            for k in n.keywords)]
+        self.assertEqual(len(starts), 1)
+        self.assertLess(assign[0].lineno, starts[0], "감독자 스레드가 뜬 뒤에 대입했다 — /health 가 반쯤 만들어진 객체를 볼 수 있다")
+        hb = next(n for n in self.tree.body if isinstance(n, ast.FunctionDef) and n.name == "health_body")
+        self.assertTrue(any(isinstance(n, ast.Attribute) and n.attr == "liveness" for n in ast.walk(hb)))
 
 
 if __name__ == "__main__":
