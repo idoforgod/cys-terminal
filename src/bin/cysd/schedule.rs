@@ -6457,6 +6457,131 @@ mod b_textcmd_retired_gate {
         }
     }
 
+    // ── F7 (0.14.50): 승인 저장소 디코더는 하나다 ─────────────────────────────────────────────
+    // 알려진 필드가 두 번 나오는 레코드: typed 로더(`from_str::<Vec<ApprovalRecord>>`)는 거부하고,
+    // 일반 값(Value)을 거친 경로는 한쪽 값만 남겨 받아들인다. `key` 의 첫 출현을 맨 앞에 하나 더 붙인다.
+    fn with_duplicate_key(record: &Value, key: &str, extra: &str) -> String {
+        let s = serde_json::to_string(record).expect("레코드 직렬화");
+        format!("{{\"{key}\":{extra},{}", &s[1..])
+    }
+
+    /// 21행 검체: (이름, 바이트, 승인 로더가 거부하는가). 로더 열은 태그 코드에서 실측해 고정했다.
+    fn approval_store_rows() -> Vec<(&'static str, Vec<u8>, bool)> {
+        let py = full_record_json("python3 job.py", false);
+        let echo = full_record_json("echo hi", false);
+        let one = |v: &Value| serde_json::to_string(&json!([v])).unwrap().into_bytes();
+        let obj = |v: &Value| serde_json::to_string(&json!({"records": [v]})).unwrap().into_bytes();
+        let dup_id = with_duplicate_key(&echo, "id", "\"dup-id\"");
+        let dup_unknown = with_duplicate_key(&echo, "zzz_unknown", "1").replacen("\"zzz_unknown\":1,", "\"zzz_unknown\":1,\"zzz_unknown\":2,", 1);
+        let mut missing = py.clone();
+        missing.as_object_mut().expect("레코드 객체").remove("signature");
+        let mut wrong = py.clone();
+        wrong["created_at"] = json!("x");
+        vec![
+            ("empty", b"".to_vec(), false),
+            ("blank", b" \t\r\n".to_vec(), false),
+            ("bare-empty", b"[]".to_vec(), false),
+            ("obj-empty", br#"{"records":[]}"#.to_vec(), false),
+            ("obj-no-records", b"{}".to_vec(), true),
+            ("null", b"null".to_vec(), true),
+            ("broken", b"{broken".to_vec(), true),
+            ("not-utf8", b"\xff".to_vec(), true),
+            ("obj-records-not-array", br#"{"records":{}}"#.to_vec(), true),
+            ("bare-null-item", b"[null]".to_vec(), true),
+            ("bare-normal-other", one(&echo), false),
+            ("obj-normal-other", obj(&echo), false),
+            ("bare-normal-match", one(&py), false),
+            ("obj-normal-match", obj(&py), false),
+            ("bare-missing-field", one(&missing), true),
+            ("obj-missing-field", obj(&missing), true),
+            ("bare-wrong-type", one(&wrong), true),
+            ("bare-dup-unknown", format!("[{dup_unknown}]").into_bytes(), false),
+            ("bare-dup-known-field", format!("[{dup_id}]").into_bytes(), true),
+            ("obj-dup-known-field", format!("{{\"records\":[{dup_id}]}}").into_bytes(), false),
+            ("obj-dup-records-key", format!("{{\"records\":[],\"records\":[{}]}}", serde_json::to_string(&echo).unwrap()).into_bytes(), false),
+        ]
+    }
+
+    // 로더 열 고정: 이 시험은 추출 전(태그 코드)에도 후에도 초록이어야 한다 — 로더 동작 불변의 증거(조건 6).
+    #[test]
+    fn f7_loader_outcome_per_row_is_pinned() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = TempRoot::new("f7-loader-pinned");
+        let _store = approval::tests::with_store_root(&root.0);
+        let cys = root.0.join(".cys");
+        std::fs::create_dir(&cys).expect("시험 승인 디렉터리");
+        let rows = approval_store_rows();
+        assert_eq!(rows.len(), 21, "검체 21행");
+        let mut wrong = Vec::new();
+        for (name, raw, loader_err) in &rows {
+            std::fs::write(cys.join("approvals.json"), raw).expect("검체 기록");
+            if approval::try_load_records().is_err() != *loader_err {
+                wrong.push(*name);
+            }
+        }
+        assert!(wrong.is_empty(), "로더 결과가 고정 열과 다르다: {wrong:?}");
+    }
+
+    // 설계 시험 2 + 조건 6: 같은 바이트에 대해 흔적 검사는 로더가 거부할 때, 그때만 오류다(양방향).
+    #[test]
+    fn f7_raw_check_and_loader_agree_on_every_row() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = TempRoot::new("f7-parity");
+        let _store = approval::tests::with_store_root(&root.0);
+        let cys = root.0.join(".cys");
+        std::fs::create_dir(&cys).expect("시험 승인 디렉터리");
+        let toks = vec!["python3".to_string(), "job.py".to_string()];
+        let mut disagree = Vec::new();
+        for (name, raw, _) in approval_store_rows() {
+            std::fs::write(cys.join("approvals.json"), &raw).expect("검체 기록");
+            let loader_err = approval::try_load_records().is_err();
+            let check_err = approval_raw_has_prefix_trace(Some(&raw), &toks).is_err();
+            if loader_err != check_err {
+                disagree.push(format!("{name}(loader_err={loader_err}, check_err={check_err})"));
+            }
+        }
+        assert!(disagree.is_empty(), "흔적 검사와 로더가 갈린다: {disagree:?}");
+    }
+
+    // 설계 시험 1: 알려진 필드(id)가 두 번 나오는 완전한 레코드가 든 bare 배열 — 접두가 맞지 않아도 오류여야 한다.
+    #[test]
+    fn f7_duplicate_known_field_in_bare_array_is_an_error_not_no_trace() {
+        let toks = vec!["python3".to_string(), "job.py".to_string()];
+        let echo = full_record_json("echo hi", false);
+        let raw = format!("[{}]", with_duplicate_key(&echo, "id", "\"dup-id\"")).into_bytes();
+        assert_eq!(approval_raw_has_prefix_trace(Some(&raw), &toks), Err(()));
+    }
+
+    // 설계 시험 3: 구조 검사(typed 읽기) 뒤 main 이 id 중복 레코드 bare 배열로 한 번 교체돼도 건너뛰지 않는다(오류 유지).
+    #[test]
+    fn f7_retired_gate_does_not_skip_when_main_is_replaced_by_duplicate_field_bytes() {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = TempRoot::new("f7-gate-sequence");
+        let _store = approval::tests::with_store_root(&root.0);
+        let _env = WithoutSecretEnv::new();
+        let cys = root.0.join(".cys");
+        std::fs::create_dir(&cys).expect("시험 승인 디렉터리");
+        let _secret = approval::signing_secret().expect("시험 루트 시크릿");
+        let (_, cmd) = retired_seed_texts().into_iter().next().expect("은퇴 시드 문구");
+        let ttl_path = cys.join("approvals-ttl.json");
+        let main_path = cys.join("approvals.json");
+        let mut old = matching_record(&cmd, None);
+        old.expires_at = Some(1.0);
+        std::fs::write(&ttl_path, br#"{"records":[]}"#).expect("빈 TTL 저장소");
+        std::fs::write(&main_path, serde_json::to_vec(&json!({"records": [old]})).unwrap()).expect("만료 레코드가 든 main");
+        let dup = format!("[{}]", with_duplicate_key(&full_record_json("echo hi", false), "id", "\"dup-id\"")).into_bytes();
+        let (swap_tmp, swap_to) = (cys.join("approvals.json.swap"), main_path.clone());
+        let hook_calls = Arc::new(AtomicU64::new(0));
+        let calls = Arc::clone(&hook_calls);
+        let _hook = AfterFirstTtlRead::new(move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            std::fs::write(&swap_tmp, &dup).expect("중복 필드 임시 파일");
+            std::fs::rename(&swap_tmp, &swap_to).expect("main 원자 교체");
+        });
+        assert!(!retired_text_command_confirmed_unapproved(&cmd), "id 중복 레코드로 바뀐 main 을 흔적 없음으로 받아 건너뛴다");
+        assert_eq!(hook_calls.load(Ordering::Relaxed), 1, "첫 TTL 판독 뒤 교체 훅 실행 전제");
+    }
+
     #[test]
     fn approval_store_raw_paths_match_where_approval_saves() {
         let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
