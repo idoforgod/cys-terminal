@@ -4902,6 +4902,82 @@ def h_win_16():
             % (verdict.get("result"), os.name, bool(want), ",".join(hw) or "-", len(counts), npy))
 
 
+# B-057(0.14.50) 계측 대조 기준: L0 선택자(`awk '/^## \[/{p=1} p'`)가 살아 있던 마지막 트리(0.14.49 헤드).
+B057_BASE_REF = "51b00d7a"
+
+
+@specimen("H-WIN-17", "W6", "B-057 soul L0 — 제목 전수+포인터 · 0제목 경보 · CR 제거(Git Bash 실기)", ["B-057"])
+def h_win_17():
+    """B-057 (0.14.50): the L0 soul block printed its banner and 0 bytes in every lane (the `## [` selector matched
+    no heading of today's soul files). The repair lists every `## ` heading plus a pointer, and is loud on zero
+    headings. The POSIX test (test_inject_context_soul_l0) does not run on Windows; this specimen runs the same hook
+    under Git Bash (it is registered there as `bash ".../inject-context.sh"`): plain headings listed, CRLF soul
+    (the Windows checkout / editor default) gives titles without CR, zero headings -> loud line. The pointer's path
+    form on Windows is RECORDED, not judged (open question for the owner: PLAN-50 B-057 G item 8).
+    Calibration: the base hook (B057_BASE_REF) must print the banner with no heading (the defect FIRES)."""
+    banner = "■ 불변 정체·절대규칙 (L0 · soul.md ANCHOR — 매 부팅 재확립)"
+
+    def block(out):
+        lines = out.split("\n")
+        if banner not in lines:
+            return None
+        b = []
+        for l in lines[lines.index(banner) + 1:]:
+            if l == "":
+                break
+            b.append(l)
+        return b
+
+    notes = []
+    with tempfile.TemporaryDirectory() as tmp:
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(proj)
+        pack = os.path.join(tmp, "pack")
+
+        def run(soul_bytes, hook=None):
+            with open(os.path.join(pack, "soul.md"), "wb") as f:
+                f.write(soul_bytes)
+            env = _base_env({"HOME": os.path.join(tmp, "home"), "CYS_PACK_DIR": pack, "CYS_ROLE": "master"})
+            return _run([BASH, hook or _hook("inject-context.sh")], env=env, cwd=tmp,
+                        input=json.dumps({"source": "startup", "cwd": proj}))
+
+        os.makedirs(pack)
+        plain = "# s\nbody B057-BODY\n## 금지선 하나\nx\n## 오너 규칙 둘\ny\n".encode("utf-8")
+        r = run(plain)
+        need(r.returncode == 0, "exit=%d %r" % (r.returncode, r.stderr[-200:]))
+        b = block(r.stdout)
+        need(b is not None, "L0 banner absent on startup: %r" % r.stdout[:300])
+        need([l for l in b if l.startswith("## ")] == ["## 금지선 하나", "## 오너 규칙 둘"],
+             "headings not listed (B-057 regression): %r" % b)
+        ptr = [l for l in b if "지금 바로 읽어라: cat " in l]
+        need(len(ptr) == 1, "pointer line missing: %r" % b)
+        need(not [l for l in b if "B057-BODY" in l], "body text injected (H1 lists titles only): %r" % b)
+        notes.append("제목 2·포인터 1")
+        r = run(plain.replace(b"\n", b"\r\n"))
+        b = block(r.stdout) or []
+        hs = [l for l in b if l.startswith("## ")]
+        need(len(hs) == 2 and not [l for l in hs if "\r" in l], "CRLF soul: %r" % hs)
+        notes.append("CRLF 제목 CR 0")
+        r = run("# s\nonly body\n".encode("utf-8"))
+        b = block(r.stdout) or []
+        need([l for l in b if "절 제목을 0개 찾았다" in l], "zero headings not loud: %r" % b)
+        notes.append("0제목 경보")
+        notes.append("포인터 경로 형상(기록)=%r" % (ptr[0].split("cat ", 1)[1][:120]))
+        calib = "skip(no-git)"
+        old = _git_show("cysjavis-pack/hooks/inject-context.sh", ref=B057_BASE_REF)
+        if old is not None:
+            oldd = os.path.join(tmp, "oldhooks")
+            _w(os.path.join(oldd, "inject-context.sh"), old)
+            _w(os.path.join(oldd, "_lib.sh"), _read(os.path.join(HOOKS_DIR, "_lib.sh")), 0o644)
+            r0 = run(plain, hook=os.path.join(oldd, "inject-context.sh"))
+            b0 = block(r0.stdout)
+            need(b0 is not None and not [l for l in b0 if l.startswith("## ")],
+                 "calibration failed: base hook (%s) did not reproduce 'banner + no heading': %r" % (B057_BASE_REF, b0))
+            calib = "기준 %s 훅 배너+제목 0 FIRE" % B057_BASE_REF
+        notes.append("계측검증=%s" % calib)
+    return " · ".join(notes)
+
+
 @specimen("H-PYSEAL-1", "W6",
           "훅 셸 층 SEAL-1 — 프리루드 source 만으로 PYTHONDONTWRITEBYTECODE=1 무조건 export",
           ["SEAL-1-HOOK"])
@@ -10064,10 +10140,14 @@ def h_soul_lane_1():
         proj = os.path.join(tmp, "proj")
         os.makedirs(os.path.join(proj, "_round"), exist_ok=True)
         _w(os.path.join(proj, "_round", "SESSION_STATE.md"), "S\n", 0o644)
+        # ★B-057(0.14.50) 핀 이사 — 판정 완화가 아닌 이유: 이 검체의 축은 '어느 soul 이 주입되는가(레인 우선)'다.
+        #   종전 L0 는 `## [` 절부터 **본문**을 넣었으므로 표식을 본문 줄에 뒀다. B-057 수리(H1)는 본문을 넣지 않고
+        #   `## ` **제목 전수 + 그 파일을 가리키는 포인터**를 넣는다 — 그래서 표식을 제목 줄로 옮긴다. 아래 need 4개는
+        #   문자열·조건이 그대로이고, 레인 포인터 단언 1개를 **더한다**(포인터가 레인 파일을 가리켜야 한다).
         _w(os.path.join(home, ".claude", "soul.md"),
-           "# hq\n## [HQ-ANCHOR]\nHQ-SOUL-MARKER\n", 0o644)
+           "# hq\n## [HQ-ANCHOR] HQ-SOUL-MARKER\nbody\n", 0o644)
         _w(os.path.join(lane, "soul.md"),
-           "# lane\n## [LANE-ANCHOR]\nLANE-SOUL-MARKER\n", 0o644)
+           "# lane\n## [LANE-ANCHOR] LANE-SOUL-MARKER\nbody\n", 0o644)
         payload = json.dumps({"source": "startup", "cwd": proj})
         env = _base_env({"HOME": home, "CYS_PACK_DIR": lane})
         r = _run([BASH, _hook("inject-context.sh")], env=env, input=payload)
@@ -10075,6 +10155,8 @@ def h_soul_lane_1():
         need("LANE-SOUL-MARKER" in r.stdout, "레인 soul 이 주입되지 않았다: %r" % r.stdout[:400])
         need("HQ-SOUL-MARKER" not in r.stdout,
              "레인 pane 인데 **본부 soul** 이 주입됐다(레인 정체가 덮인다): %r" % r.stdout[:400])
+        need("cat %s  [" % os.path.join(lane, "soul.md") in r.stdout,
+             "L0 포인터가 레인 soul 파일을 가리키지 않는다: %r" % r.stdout[:600])
         # 회귀 0: 레인에 soul 이 없으면 종전대로 레거시 ~/.claude/soul.md 로 폴백한다
         nosoul = os.path.join(tmp, "lanepack-nosoul")
         os.makedirs(nosoul, exist_ok=True)

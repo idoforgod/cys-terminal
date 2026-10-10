@@ -479,7 +479,7 @@ jobs:
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu \
-                   test_inject_context_role_seat test_carry_unproven_scope \
+                   test_inject_context_role_seat test_inject_context_soul_l0 test_carry_unproven_scope \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
                    test_capgate_remeasure_order test_phoenix_p10_lease_split \
                    test_preflight_only_dispatch test_preflight_settings_fifo \
@@ -1296,7 +1296,7 @@ jobs:
                    test_cso_directive_rev test_role_authority test_role_authority_shell \
                    test_role_authority_triage \
                    test_round_stop_reason test_resource_gate test_resource_gate_fleet_cpu \
-                   test_inject_context_role_seat test_carry_unproven_scope \
+                   test_inject_context_role_seat test_inject_context_soul_l0 test_carry_unproven_scope \
                    test_wakeup_durable_receipt test_wakeup_park_failure \
                    test_capgate_remeasure_order test_phoenix_p10_lease_split \
                    test_preflight_only_dispatch test_preflight_settings_fifo \

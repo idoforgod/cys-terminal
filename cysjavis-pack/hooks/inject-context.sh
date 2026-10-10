@@ -1,7 +1,7 @@
 #!/bin/bash
 # javis 영속성 — SessionStart 컨텍스트 주입 hook
 # 설계: _round/PERSISTENCE_ARCHITECTURE.md §5·§8.1
-# 역할: source(startup/resume/clear/compact) 분기 → L0 soul ANCHOR + L2 SESSION_STATE 주입 + 복원 신호
+# 역할: source(startup/resume/clear/compact) 분기 → L0 soul 절 제목 목록+전문 포인터 + L2 SESSION_STATE 주입 + 복원 신호
 # 안전: 모든 단계 graceful, 반드시 exit 0 (hook 실패가 세션을 깨지 않게)
 # 경로: SOUL·ROOT는 환경변수(CYS_SOUL·CYS_ROOT)로 오버라이드 가능. 미설정 시 portable 기본값(아래).
 set +e
@@ -75,15 +75,37 @@ _gate() {
 # \c 등 이스케이프가 %b 로 해석돼 출력이 무음 절단되는 사고 봉인(H-HOOK-1).
 _esc() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
 
-# ---------- L0: soul ANCHOR 전문 (startup/resume에서 풍요 주입) ----------
+# ---------- L0: soul 절 제목 전수 + 전문 포인터 (startup/resume) ----------
+# B-057 (0.14.50, base-lane H1 form): the old selector `awk '/^## \[/{p=1} p'` matched no heading of
+#   today's soul files (`## title`, not `## [title]`), so every lane printed this banner followed by 0 B,
+#   silently. The selector is removed, not repaired: every `## ` heading is listed (no choosing - a new
+#   section is always named) plus one imperative pointer to read the whole file. Whole-file text is not
+#   injected here because session-start.sh prints soul.md whole on the role path; on its seven early-exit
+#   paths this block is the only soul carrier. Zero headings or an unreadable file is LOUD, never empty.
+#   SOUL_SZ and the cap warning measure the WHOLE file (bloat report - nothing is cut from a title list).
 if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -f "$SOUL" ]; then
   OUT="${OUT}■ 불변 정체·절대규칙 (L0 · soul.md ANCHOR — 매 부팅 재확립)\n"
-  # ★캡(head -c): ANCHOR 비대 시에도 컨텍스트 예산 보호 — 초과분은 온디맨드(cat)로 안내.
   SOUL_CAP=32768
-  SOUL_SZ=$(awk '/^## \[/{p=1} p' "$SOUL" | wc -c | tr -d ' ')
-  OUT="${OUT}$(awk '/^## \[/{p=1} p' "$SOUL" | head -c "$SOUL_CAP" | sed 's/\\/\\\\/g')\n"
-  if [ -n "$SOUL_SZ" ] && [ "$SOUL_SZ" -gt "$SOUL_CAP" ]; then
-    OUT="${OUT}⚠ soul ANCHOR ${SOUL_SZ}B>${SOUL_CAP} — 앞부분만 주입(컨텍스트 예산 보호). 전문: cat $(_esc "$SOUL")\n"
+  SOUL_SZ=""
+  [ -r "$SOUL" ] && SOUL_SZ=$(wc -c < "$SOUL" 2>/dev/null | tr -d ' ')
+  if [ -z "$SOUL_SZ" ]; then
+    OUT="${OUT}⚠ soul 파일을 읽지 못했다 — L0 주입 0B(정체·절대규칙 미주입). 이 상태로 작업하지 말고 파일과 권한을 확인하라: $(_esc "$SOUL")\n"
+  else
+    SOUL_NSEC=$(grep -c '^## ' "$SOUL" 2>/dev/null | tr -d ' ')
+    SOUL_TITLES=$(grep '^## ' "$SOUL" 2>/dev/null | tr -d '\r' | sed 's/\\/\\\\/g')
+    SOUL_TCAP=8192
+    SOUL_TSZ=$(printf '%s' "$SOUL_TITLES" | wc -c | tr -d ' ')
+    if [ "${SOUL_NSEC:-0}" = "0" ]; then
+      OUT="${OUT}⚠ soul 에서 '## ' 절 제목을 0개 찾았다 — 제목 목록이 비었다(L0 0B 경보). 아래 명령으로 전문을 읽어라.\n"
+    elif [ -n "$SOUL_TSZ" ] && [ "$SOUL_TSZ" -gt "$SOUL_TCAP" ]; then
+      OUT="${OUT}⚠ soul 절 제목 목록 ${SOUL_TSZ}B>${SOUL_TCAP} (절 ${SOUL_NSEC}개) — 목록을 생략한다. 아래 명령으로 전문을 읽어라.\n"
+    else
+      OUT="${OUT}${SOUL_TITLES}\n"
+    fi
+    OUT="${OUT}★위 ${SOUL_NSEC:-0}개 절의 전문(금지선·오너 절대규칙 포함)은 제목만으로 지킬 수 없다 — 지금 바로 읽어라: cat $(_esc "$SOUL")  [전문 ${SOUL_SZ}B]\n"
+    if [ "$SOUL_SZ" -gt "$SOUL_CAP" ]; then
+      OUT="${OUT}⚠ soul 전문 ${SOUL_SZ}B>${SOUL_CAP}(캡) — 이 주입은 제목 목록이라 잘린 것은 없다. 전문이 캡을 넘었다는 비대 보고다.\n"
+    fi
   fi
   OUT="${OUT}\n"
 fi

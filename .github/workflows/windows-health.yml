@@ -133,7 +133,9 @@ jobs:
           #   호출에 CREATE_NO_WINDOW 를 걸었다. 그 대가로 **윈도우 실기에서** 실스폰 tick 이 gate-check
           #   rc=0 으로 kill-switch 를 통과하고 status 파싱까지 가는지(② 무clear 방지) · stdin 왕복 · verifier
           #   (pane 거주) 무 NOWIN 을 잰다. NOWIN 이 실제로 걸리는 플랫폼은 여기뿐이다(맥은 비-NOWIN 대조).
-          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-WIN-13,H-WIN-14,H-WIN-15,H-WIN-16,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF,H-CLT-2"
+          # ★H-WIN-17 편입(0.14.50 B-057): soul L0 블록(제목 전수+포인터 · 0제목 경보 · CRLF soul 의 CR 제거)을 Git Bash
+          #   실기로 잰다 — POSIX 전용 test_inject_context_soul_l0 이 닿지 않는 자리. 포인터의 Windows 경로 형상은 기록만 한다.
+          WIN_SPECIMENS="H-WIN-1,H-WIN-2,H-WIN-3,H-WIN-4,H-WIN-5,H-WIN-6,H-WIN-7,H-WIN-8,H-WIN-9,H-WIN-10,H-WIN-11,H-WIN-12,H-WIN-13,H-WIN-14,H-WIN-15,H-WIN-16,H-WIN-17,H-CONC-1,H-CONC-3,H-DETECT-10,H-MISSION-1,H-IDENT-1,H-CYCLE-1,H-PACK-CRLF,H-CLT-2"
           echo "== H-WIN 실기: $WIN_SPECIMENS =="
           # ★단일 실행 + rc 포획으로 교체(2026-09-04 실사고). 종전엔 bare 실행이 먼저 돌아
           #   `set -euo pipefail` 아래에서 스텝을 **즉사**시켰고, 검체별 사유를 찍는 아래 블록은
