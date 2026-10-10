@@ -743,6 +743,9 @@ class ThreadRevival(unittest.TestCase):
                 clock["t"] += self.STEP
             for row in live:
                 row[1].set()
+            for row in live:                                # 남은 스레드가 훅이 살아 있는 동안 끝나게 한다(끝난 뒤 역추적 소음 방지)
+                if row[2] is not None:
+                    row[2].join(2)
         rel = [round(s - 1000.0) for s in starts]
         gaps = [b - a for a, b in zip(rel, rel[1:])]
         return {"rel": rel, "gaps": gaps, "same_pass": same_pass, "log": logs.getvalue(), "end": self.PASSES * self.STEP}
