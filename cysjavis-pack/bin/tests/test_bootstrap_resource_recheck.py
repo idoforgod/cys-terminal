@@ -20,6 +20,7 @@
 출력: PASS/FAIL 행 · 실패 시 exit 1 · 전부 통과 시 종료 토큰 BOOT-RESOURCE-RECHECK-OK.
 """
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -286,28 +287,96 @@ rig.cleanup()
 #   회차 소요만큼 **누적**된다(회차 k 드리프트 ≈ k×게이트소요). 문턱을 게이트 소요에 비례시켜
 #   (0.5×게이트) 잡으면 정상 구현(드리프트≈스폰 지터)은 통과하고 MU3(드리프트≈k×게이트)는
 #   1회차부터 즉시 떨어진다.
-GATE_DELAY_B9 = 0.15
-rig9 = Rig([fleet_hard()], gate_delay=GATE_DELAY_B9).run()
-calls9 = rig9.gate_calls()
+#   (B-070: the old values were gate 0.15 s on the shared rig, interval 0.5 s / total 1.5 s - see the rules below.)
 # ★CI 러너 지터·고정 지연(2026-09-23 · ci-branch run 35884936211 · 35891677759): 느린 러너에서 두 패턴을
 #   관측했다 — ⓐ 한 회차만 늦게 뜬 독립 스폰 지터(starts=[0, .534, 1.166, 1.537]) ⓑ 회차마다 거의 같은
 #   고정 지연(starts=[0, .67, 1.114, 1.676] — 재확인 직전 진행 기록 쓰기 등 회차당 고정 비용). 둘 다 **누적하지
 #   않는다** = 절대 스케줄 정상. 상대 스케줄(MU3)은 회차마다 (게이트+고정 비용)이 **누적**된다(.15/.30/.45…).
 #   그래서 판정 모델을 '절대 스케줄 + 회차 공통 상수 지연 c' 로 두고, c(=재확인 편차의 중앙값)를 뺀 잔차의
 #   **중앙값**으로 가른다 — ⓐ·ⓑ 는 잔차 중앙값≈0 으로 통과, MU3 는 잔차 [.15, 0, .15] 의 중앙값 .15 로 떨어진다.
-if len(calls9) >= 2:
-    first9 = calls9[0][1]
-    starts9 = [c[1] - first9 for c in calls9]
-    offs9 = [s - k * INTERVAL for k, s in enumerate(starts9) if k >= 1]
-    c9 = sorted(offs9)[len(offs9) // 2]
-    resid9 = sorted(abs(o - c9) for o in offs9)
-    med9 = resid9[len(resid9) // 2]
-    thresh9 = 0.5 * GATE_DELAY_B9
-    check("b9 절대 스케줄(게이트 소요 %.2fs 주입 · 공통 지연 %.3fs 제거 후 잔차 중앙값 %.3fs < %.3fs=0.5×게이트소요 · 최대 %.3fs)"
-          % (GATE_DELAY_B9, c9, med9, thresh9, resid9[-1]), med9 < thresh9,
-          "starts=%r" % [round(s, 3) for s in starts9])
-else:
-    check("b9 절대 스케줄(측정 불충분)", False, "calls=%d" % len(calls9))
+#
+# ★B-070 (0.14.50 · T-50-B2): the b9 numbers are now DERIVED from the saved runs, not picked.
+#   Table (laneB/B070-REPORT.md section 2; 64 saved b9 lines 2026-09-23..2026-10-10, both red runs included):
+#   · normal (absolute schedule) residual median: largest 0.075 s = the 0.14.49 release red run
+#     (macos-26-arm64, S2-release-job-114221181475.log:13443, starts [0, .602, 1.177, 1.525]) - exactly on
+#     the old threshold 0.5 x 0.15 = 0.075 under a strict '<'. Next largest 0.035 s; ubuntu CI <= 0.001 s.
+#   · common per-round delay c (spawn of the mock gate): largest 0.171 s (ci-branch-job-114202929281.log:6184).
+#   · MU3 (relative schedule) on the old rig, measured: residual median 0.195 s (laneB/b070-02-mu3-vs-base-b9.txt).
+#   Rules (each pinned by check b9r below):
+#     GATE_DELAY_B9 = 2 x B9_FACTOR x B9_NORMAL_MED_MAX  -> threshold 0.5 x gate = B9_FACTOR x the largest
+#                     normal median ever seen; MU3 still adds ~one gate delay per round = 2 x threshold.
+#     INTERVAL_B9   = GATE_DELAY_B9 + B9_FACTOR x B9_COMMON_MAX, rounded UP to 0.1 s: one gate call plus the
+#                     worst spawn delay fits in one interval with the same factor, so a slow runner cannot push
+#                     a NORMAL round past its due time.
+#     TOTAL_B9      = 3 x INTERVAL_B9 (four measurements, as before).
+#   And b9 now needs >= 3 measurements (>= 2 rechecks): with one recheck the median residual is 0 by
+#   construction, so a schedule that lost rounds would pass without being measured.
+B9_NORMAL_MED_MAX = 0.075
+B9_COMMON_MAX = 0.171
+B9_FACTOR = 2.0
+GATE_DELAY_B9 = round(2 * B9_FACTOR * B9_NORMAL_MED_MAX, 3)                                  # 0.3
+INTERVAL_B9 = math.ceil(round((GATE_DELAY_B9 + B9_FACTOR * B9_COMMON_MAX) * 10, 6)) / 10.0   # 0.642 -> 0.7
+TOTAL_B9 = round(3 * INTERVAL_B9, 3)                                                         # 2.1
+
+
+def b9_verdict(starts, interval, gate):
+    """-> (passed, detail). Absolute schedule = residual median (after removing the common delay) < 0.5 x gate."""
+    if len(starts) < 3:
+        return False, "측정 불충분(starts=%r · 재확인 2회 이상 필요)" % [round(s, 3) for s in starts]
+    offs = [s - k * interval for k, s in enumerate(starts) if k >= 1]
+    c = sorted(offs)[len(offs) // 2]
+    resid = sorted(abs(o - c) for o in offs)
+    med = resid[len(resid) // 2]
+    thresh = 0.5 * gate
+    return med < thresh, ("게이트 소요 %.2fs 주입 · 간격 %.1fs · 공통 지연 %.3fs 제거 후 잔차 중앙값 %.3fs < %.3fs=0.5×게이트소요 · 최대 %.3fs"
+                          % (gate, interval, c, med, thresh, resid[-1]))
+
+
+def _b9_model(relative, c, jitter=(0.0, 0.0, 0.0), post=0.02):
+    """Start times of the mock gate under the bootstrap loop (javis_bootstrap.py `_resource_recheck_wait`):
+    absolute `due = min(t0 + k x interval, deadline)` or MU3 `due = min(now + interval, deadline)`;
+    each call costs spawn c + gate + post. Pure arithmetic - used only by the b9f fixtures."""
+    t0 = 0.0
+    deadline = t0 + TOTAL_B9
+    starts = [t0 + c]
+    end = starts[0] + GATE_DELAY_B9 + post
+    for k in range(1, int(TOTAL_B9 / INTERVAL_B9 + 1e-9) + 1):
+        now = end
+        if now >= deadline:
+            break
+        due = min((now + INTERVAL_B9) if relative else (t0 + k * INTERVAL_B9), deadline)
+        s = max(due, now) + c + jitter[k - 1]
+        starts.append(s)
+        end = s + GATE_DELAY_B9 + post
+    return [s - starts[0] for s in starts]
+
+
+check("b9r1 게이트 소요 = 2×계수×관측 최대 정상 잔차 중앙값(%.3f) → 문턱 0.5×게이트 = 계수×관측 최대" % B9_NORMAL_MED_MAX,
+      abs(GATE_DELAY_B9 - 2 * B9_FACTOR * B9_NORMAL_MED_MAX) < 1e-9 and B9_FACTOR >= 2.0,
+      "gate=%r factor=%r" % (GATE_DELAY_B9, B9_FACTOR))
+check("b9r2 간격 ≥ 게이트 소요 + 계수×관측 최대 공통 지연(%.3f) · 0.1s 올림" % B9_COMMON_MAX,
+      INTERVAL_B9 >= GATE_DELAY_B9 + B9_FACTOR * B9_COMMON_MAX
+      and INTERVAL_B9 - (GATE_DELAY_B9 + B9_FACTOR * B9_COMMON_MAX) < 0.1 + 1e-9,
+      "interval=%r" % INTERVAL_B9)
+check("b9r3 총 시간 = 3×간격(측정 4회 · 종전과 같다)", int(TOTAL_B9 / INTERVAL_B9 + 1e-9) == 3, "total=%r" % TOTAL_B9)
+for _c in (0.0, 0.05, B9_COMMON_MAX):
+    _ok, _d = b9_verdict(_b9_model(True, _c), INTERVAL_B9, GATE_DELAY_B9)
+    check("b9f1 상대 스케줄(MU3 모형 · 공통 지연 %.3fs)은 새 규칙에서도 떨어진다" % _c, not _ok, _d)
+for _c, _j in ((0.0, (0.0, 0.0, 0.0)), (B9_COMMON_MAX, (0.0, 0.0, 0.0)),
+               (B9_COMMON_MAX, (0.075, 0.075, 0.0)), (B9_COMMON_MAX, (0.1, 0.177, 0.025))):
+    _ok, _d = b9_verdict(_b9_model(False, _c, _j), INTERVAL_B9, GATE_DELAY_B9)
+    check("b9f2 절대 스케줄(공통 지연 %.3fs · 회차 지터 %r)은 통과한다" % (_c, _j), _ok, _d)
+_ok, _d = b9_verdict([0.0, 0.602], 0.5, 0.15)
+check("b9f3 재확인 1회뿐이면(잔차가 구조적으로 0) 통과가 아니라 측정 불충분", not _ok, _d)
+
+rig9 = Rig([fleet_hard()], gate_delay=GATE_DELAY_B9,
+           env_extra={"CYS_BOOT_RESOURCE_RECHECK_INTERVAL_S": str(INTERVAL_B9),
+                      "CYS_BOOT_RESOURCE_RECHECK_TOTAL_S": str(TOTAL_B9)}).run()
+calls9 = rig9.gate_calls()
+first9 = calls9[0][1] if calls9 else 0.0
+starts9 = [c[1] - first9 for c in calls9]
+ok9, det9 = b9_verdict(starts9, INTERVAL_B9, GATE_DELAY_B9)
+check("b9 절대 스케줄(%s)" % det9, ok9, "starts=%r" % [round(s, 3) for s in starts9])
 rig9.cleanup()
 
 rig0 = Rig([fleet_hard()], env_extra={"CYS_BOOT_RESOURCE_RECHECK_TOTAL_S": "0"}).run()

@@ -70,6 +70,7 @@ stdlib만 사용. 네트워크 0. 어떤 검체도 사용자 HOME·실 데몬을
 """
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -560,6 +561,25 @@ def _run_ledgers(state, timeout=8.0):
 #   양성 표본을 리터럴로 적으면 스캐너가 이 파일을 잡아 ⓐ가 영구 적색이 된다. 그때의
 #   유혹은 "러너를 스캐너 제외 목록에 넣는 것"인데 그것은 **판정 완화**다(러너 헤더 계약 ②).
 #   조각 이어붙이기는 그 유혹 자체를 없앤다 — ⓒ가 그 상태를 동결한다.
+#
+# ★B-070 (0.14.50 · T-50-B2) — the `--all` scan limit is DERIVED from saved runs, not picked.
+#   Table (laneB/B070-REPORT.md section 1; pinned in tests/test_secret_scan_limit.py): wall time of
+#   `secret-scan.sh --all` in every saved CI span 2026-09-22..2026-10-10 —
+#     windows-2025-vs2026 210.5..311.6 s (13 runs, 1001..1122 files) · macos-26-arm64 32.0..55.9 s (7) ·
+#     ubuntu-24.04 11.8..18.7 s (4). The largest, 311.6 s, is the 0.14.49 release job 114221181479
+#     (Run line 135 -> clean line 148). The old flat 300 s sat BELOW the Windows maximum: that same job
+#     went red on it (H-SECRET-1 TimeoutExpired after 300 seconds, its line 166).
+#   Rule: SECRET_SCAN_ALL_TIMEOUT_S = ceil(SECRET_SCAN_ALL_OBSERVED_MAX_S x SECRET_SCAN_ALL_FACTOR).
+#     Factor 2 covers the observed runner spread on one OS (210.5 -> 311.6 s = x1.48) plus file growth
+#     (1001 -> 1122 tracked files in 18 days). Re-derive from a new table when a run comes within x1.5.
+#   What the limit protects: a hung or looping scanner still ends this specimen as a failure
+#     (TimeoutExpired) well inside the release job's 50-minute limit (release.yml:61), instead of eating
+#     the job. One-file scans (7 probes + negative control + feedback.rs) keep their old 300 s.
+SECRET_SCAN_ALL_OBSERVED_MAX_S = 311.6
+SECRET_SCAN_ALL_FACTOR = 2.0
+SECRET_SCAN_ALL_TIMEOUT_S = int(math.ceil(SECRET_SCAN_ALL_OBSERVED_MAX_S * SECRET_SCAN_ALL_FACTOR))
+SECRET_SCAN_ONE_FILE_TIMEOUT_S = 300      # unchanged; named so the wiring test can see it
+
 _SECRET_PROBES = (
     # (표본 id, 기대 라벨, 본문) — 라벨은 `scripts/secret-scan.sh` 의 규칙 이름 그대로다.
     ("path", "PATH", "log: wrote /Users/%s/work/notes.md" % ("jd" + "oe")),
@@ -617,14 +637,16 @@ def h_secret_1():
     scan = os.path.join(REPO_DIR, "scripts", "secret-scan.sh")
     need(os.path.isfile(scan), "발행 게이트 스캐너 부재: %s" % scan)
 
-    def _scan(*args):
-        return _run([BASH, scan] + list(args), cwd=REPO_DIR, timeout=300)
+    def _scan(*args, timeout=SECRET_SCAN_ONE_FILE_TIMEOUT_S):
+        return _run([BASH, scan] + list(args), cwd=REPO_DIR, timeout=timeout)
 
     def _labels(out):
         return {ln.split("\t", 1)[0] for ln in out.splitlines() if "\t" in ln}
 
     # ⓐ 산 트리
-    r = _scan("--all")
+    t_all = time.monotonic()
+    r = _scan("--all", timeout=SECRET_SCAN_ALL_TIMEOUT_S)
+    all_s = time.monotonic() - t_all
     need(r.returncode == 0,
          "산 트리에 시크릿·개인정보가 남아 있다(발행 차단) — exit=%d\n%s"
          % (r.returncode, (r.stdout + r.stderr)[-2000:]))
@@ -683,8 +705,8 @@ def h_secret_1():
     need("run_bootstrap_health" not in stext,
          "스캐너 제외 목록에 이 러너가 등재됐다 — 계측기가 자기 판정 대상을 줄인 것이다(완화 금지)")
 
-    return ("산 트리 %d파일 clean · 합성 변조 %d/%d FIRE(%s) · 음성 대조 0건"
-            % (scanned, len(fired), len(_SECRET_PROBES), " ".join(fired)))
+    return ("산 트리 %d파일 clean · 합성 변조 %d/%d FIRE(%s) · 음성 대조 0건 · --all %.1fs (limit %ds)"
+            % (scanned, len(fired), len(_SECRET_PROBES), " ".join(fired), all_s, SECRET_SCAN_ALL_TIMEOUT_S))
 
 
 @specimen("H-SECRET-2", "W0",
