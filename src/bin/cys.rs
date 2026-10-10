@@ -635,6 +635,9 @@ enum Command {
         /// 커스터마이즈 실태 리포트 생성(로컬 파일 — 자발 제출용·자동 전송 없음)
         #[arg(long)]
         custom_report: bool,
+        /// ★F10: 모든 레인(기본 팩 + pack-dept-*)의 hooks/ 드리프트 표 — 읽기 전용(아무것도 쓰지 않고 데몬에 닿지 않는다 · 종료코드는 항상 0).
+        #[arg(long)]
+        lanes: bool,
     },
     /// 완전 초기화(팩토리 리셋) — 연습·사용 흔적 전부(부서·세션·대화기억·상태·훅·스킬링크)를
     /// cys-trash 로 격리하고 "설치 초기 상태"로 되돌린다. 라이선스·미등록 파일(오너 배치 *.env 등)은
@@ -5996,9 +5999,12 @@ fn run(command: Command) -> i32 {
             return run_pack_manifest(key_id, signed_at, expires_at, &min_binary_version, pack_version);
         }
 
-        Command::Doctor { fix, json, custom_report } => {
+        Command::Doctor { fix, json, custom_report, lanes } => {
             if custom_report {
                 return run_doctor_custom_report();
+            }
+            if lanes {
+                return run_doctor_lanes(json);
             }
             return run_doctor(fix, json);
         }
@@ -10603,6 +10609,113 @@ fn pack_ownership_line(rel: &str, name: &str, dept_soul: bool) -> String {
         return format!("{rel}: {name} — {meaning}\n{}", cys::pack::HOOKS_LOCAL_GUIDANCE);
     }
     format!("{rel}: {name} — {meaning}")
+}
+
+/// ★F10 `cys doctor --lanes` — 한 레인의 hooks/ 드리프트.
+struct LaneDrift {
+    lane: String,
+    pack_dir: std::path::PathBuf,
+    status: DiagStatus,
+    rows: Vec<cys::pack::HookRow>,
+}
+
+/// 레인 열거(순수 읽기): `<cys_root>/pack`(기본) + `<cys_root>/pack-dept-*`. 같은 폴더의 두 철자는 한 번만(정규화 경로 기준).
+/// vendor 쪽은 인자로 받는다(운영은 실행 중인 바이너리의 임베드 팩 · 시험은 주입). 아무것도 만들지 않고 쓰지 않는다.
+fn lanes_report(cys_root: &std::path::Path, vendor: &std::collections::BTreeMap<String, String>) -> Vec<LaneDrift> {
+    let mut packs: Vec<(String, std::path::PathBuf)> = Vec::new();
+    let base = cys_root.join("pack");
+    if base.is_dir() {
+        packs.push(("base".to_string(), base));
+    }
+    let mut depts: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(cys_root)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    let dept = name.strip_prefix("pack-dept-")?.to_string();
+                    (!dept.is_empty() && e.path().is_dir()).then(|| (format!("dept-{dept}"), e.path()))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    depts.sort();
+    packs.extend(depts);
+    let mut seen: std::collections::BTreeSet<std::path::PathBuf> = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for (lane, dir) in packs {
+        let key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if !seen.insert(key) {
+            continue;
+        }
+        let manifest: Option<std::collections::BTreeMap<String, String>> =
+            std::fs::read_to_string(dir.join(cys::pack::INSTALL_MANIFEST)).ok().and_then(|t| serde_json::from_str(&t).ok());
+        let (status, rows) = match manifest {
+            None => (DiagStatus::Skip, Vec::new()),
+            Some(m) => {
+                let rows = cys::pack::hooks_report(&dir, &m, vendor);
+                let st = if rows.iter().any(|r| r.state.counted()) { DiagStatus::Warn } else { DiagStatus::Ok };
+                (st, rows)
+            }
+        };
+        out.push(LaneDrift { lane, pack_dir: dir, status, rows });
+    }
+    out
+}
+
+fn render_lanes_text(lanes: &[LaneDrift]) -> String {
+    let mut o = String::new();
+    let word = |s: DiagStatus| match s {
+        DiagStatus::Ok => "OK",
+        DiagStatus::Warn => "WARN",
+        DiagStatus::Fail => "FAIL",
+        DiagStatus::Skip => "SKIP(매니페스트 없음 — 대조 불가)",
+    };
+    let mut any_drift = false;
+    for l in lanes {
+        let counted = l.rows.iter().filter(|r| r.state.counted()).count();
+        o.push_str(&format!("{}: {} — 확인할 파일 {counted}건 ({})\n", l.lane, word(l.status), l.pack_dir.display()));
+        for r in &l.rows {
+            let sh = |h: &Option<String>| h.as_deref().map(cys::pack::short_hash).unwrap_or("-").to_string();
+            any_drift |= matches!(r.state, cys::pack::HookState::Drift | cys::pack::HookState::DriftBehind);
+            o.push_str(&format!(
+                "  {} [{}] 디스크 {} · 매니페스트 {} · vendor {}{}\n",
+                r.rel,
+                r.state.as_str(),
+                sh(&r.disk),
+                sh(&r.manifest),
+                sh(&r.vendor),
+                if r.state.counted() { "" } else { " (등급 무관)" }
+            ));
+        }
+    }
+    if any_drift {
+        o.push_str(&format!("{}\n", cys::pack::HOOKS_LOCAL_GUIDANCE));
+    }
+    o
+}
+
+/// `cys doctor --lanes`: 읽기 전용 · 데몬 무접촉(connect/request 를 부르지 않는다 — 자동 기동 호출자가 되지 않는다) · 종료코드 0.
+fn run_doctor_lanes(json_out: bool) -> i32 {
+    let root = cys::pack::pack_dir().parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
+    let lanes = lanes_report(&root, &cys::pack::vendor_hook_hashes());
+    if json_out {
+        let arr: Vec<Value> = lanes
+            .iter()
+            .map(|l| {
+                json!({
+                    "lane": l.lane,
+                    "pack_dir": l.pack_dir.display().to_string(),
+                    "status": format!("{:?}", l.status).to_uppercase(),
+                    "rows": l.rows.iter().map(|r| json!({"rel": r.rel, "state": r.state.as_str(), "counted": r.state.counted(),
+                        "disk": r.disk, "manifest": r.manifest, "vendor": r.vendor})).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json!({"lanes": arr})).unwrap_or_default());
+    } else {
+        print!("{}", render_lanes_text(&lanes));
+    }
+    0
 }
 
 fn run_doctor(fix: bool, json_out: bool) -> i32 {
@@ -41551,6 +41664,55 @@ mod tests {
             assert!(!line.contains("~/.cys/local/hooks"), "{line}");
         }
         assert!(pack_ownership_line("soul.md", "seed-once", true).contains("부서 soul"));
+    }
+
+    /// T10-3(설계 시험 3): 두 레인(하나는 고친 훅) → WARN 한 레인과 OK 한 레인 · 폴더 목록 전후 동일(아무것도 쓰지 않음) · 소켓 접속 없음(소스 핀).
+    #[test]
+    fn f10_t3_lanes_report_two_scratch_packs_writes_nothing_and_never_connects() {
+        let root = b2_tmp("f10-t3");
+        let (a, ah, _, _) = f10_two_embedded_hooks();
+        let body = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == a).unwrap().1;
+        let mk = |pack: &str, text: &str| {
+            let d = root.join(pack);
+            std::fs::create_dir_all(d.join("hooks")).unwrap();
+            std::fs::write(d.join(&a), text).unwrap();
+            std::fs::write(d.join(cys::pack::INSTALL_MANIFEST), serde_json::to_string(&json!({ a.clone(): ah.clone() })).unwrap()).unwrap();
+        };
+        mk("pack", body);
+        mk("pack-dept-x", &format!("{body}\n# edited\n"));
+        std::fs::create_dir_all(root.join("pack-dept-nomanifest")).unwrap();
+        let list = |r: &std::path::Path| {
+            let mut v = Vec::new();
+            fn walk(d: &std::path::Path, root: &std::path::Path, v: &mut Vec<String>) {
+                for e in std::fs::read_dir(d).unwrap().flatten() {
+                    v.push(format!("{}:{}", e.path().strip_prefix(root).unwrap().display(), e.metadata().map(|m| m.len()).unwrap_or(0)));
+                    if e.path().is_dir() { walk(&e.path(), root, v); }
+                }
+            }
+            walk(r, r, &mut v);
+            v.sort();
+            v
+        };
+        let before = list(&root);
+        let lanes = lanes_report(&root, &cys::pack::vendor_hook_hashes());
+        assert_eq!(list(&root), before, "보고가 파일을 썼다");
+        let by = |n: &str| lanes.iter().find(|l| l.lane == n).unwrap_or_else(|| panic!("레인 {n} 없음"));
+        assert_eq!(by("base").status, DiagStatus::Ok);
+        assert_eq!(by("dept-x").status, DiagStatus::Warn);
+        assert_eq!(by("dept-nomanifest").status, DiagStatus::Skip);
+        assert_eq!(by("dept-x").rows.len(), 1);
+        let text = render_lanes_text(&lanes);
+        assert!(text.contains("base: OK") && text.contains("dept-x: WARN") && text.contains(&a), "{text}");
+        assert!(text.contains(cys::pack::HOOKS_LOCAL_GUIDANCE));
+        // 소켓 접속 없음: 이 경로는 connect()/request() 를 부르지 않는다(자동 기동 호출자가 되지 않는다 — F8 과의 결합 점검).
+        let src = include_str!("cys.rs");
+        let start = src.find("\nfn run_doctor_lanes(").expect("앵커");
+        let body_src = &src[start..];
+        let body_src = &body_src[..body_src.find("\n}\n").unwrap()];
+        for forbidden in ["connect(", "request(", "request_on", "UnixStream", "socket_path("] {
+            assert!(!body_src.contains(forbidden), "run_doctor_lanes 가 {forbidden} 를 부른다");
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// T10-7(합친 행 포함): 판독 불가는 vendor 전진에 가려지지 않고(behind 로 둔갑하지 않고) 세어진다.
