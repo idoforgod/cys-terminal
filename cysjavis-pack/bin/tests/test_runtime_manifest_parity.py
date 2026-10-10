@@ -198,8 +198,9 @@ class ManifestSchemaParityTests(unittest.TestCase):
                       "windows-build 가 fix/** 에서 돌지 않는다 — 수리 레인의 Windows 변경이 "
                       "태그 레인에 가서야 드러난다")
         consumers = code.count("$dir = $env:CYS_INSTALL_DIR")
-        self.assertGreaterEqual(consumers, 7,
-                                "확정값을 받는 스텝이 7곳 미만이다 — 어딘가 자체 탐색으로 돌아갔다")
+        # (0.14.49) floor 7 -> 10 = today's exact count incl. T5c (HUD bridge native-code-page step) — dropping it fails.
+        self.assertGreaterEqual(consumers, 10,
+                                "확정값을 받는 스텝이 10곳 미만이다 — 어딘가 자체 탐색으로 돌아갔거나 스텝이 빠졌다")
         # 소비 스텝은 전부 **그 사이 설치본이 바뀌지 않았음**까지 확인해야 한다.
         self.assertEqual(consumers - 1, code.count("-ne $env:CYS_INSTALL_VER"),
                          "확정값을 받고도 마커 동일성을 확인하지 않는 스텝이 있다 "
