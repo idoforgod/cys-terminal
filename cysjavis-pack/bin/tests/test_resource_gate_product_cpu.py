@@ -90,7 +90,7 @@ ROWS_RICH = ROWS_T1 + [
     (901391, 1, 2.5, WK + "/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU"),
     (914209, 1, 1.4, "/Applications/cys.app/Contents/MacOS/cysd"),
     (914452, 914209, 0.1, "/Applications/cys.app/Contents/Resources/runtime/python/bin/python3 "
-                          "/opt/home/.cys/pack/bin/javis_hud_bridge.py"),
+                          "/opt/x/.cys/pack/bin/javis_hud_bridge.py"),
     (914461, 914452, 0.0, "/Applications/cys.app/Contents/MacOS/cys events --reconnect"),
     (902001, 1, 10.0, "/opt/bin/claude --resume"),
     (902002, 1, 3.0, "/opt/bin/codex exec"),
