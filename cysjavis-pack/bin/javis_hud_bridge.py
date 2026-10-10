@@ -1754,7 +1754,10 @@ class SubscriptionSupervisor:
                         if last_read_err != "damaged":
                             last_read_err = "damaged"
                             _log("events line with non-UTF-8 bytes skipped (sub=%s) - repeats not logged" % slug)
-                        self.poke.set()
+                        # at most one snapshot request per reconcile period: a pipe that stays damaged must not turn every line into a snapshot
+                        if st["last_line_at"] - st.get("damaged_poke_at", -1e9) >= SUB_RECONCILE_SECS:
+                            st["damaged_poke_at"] = st["last_line_at"]
+                            self.poke.set()
                         continue
                     try:
                         try:

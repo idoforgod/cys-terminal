@@ -416,8 +416,10 @@ class SupervisorReconcile(unittest.TestCase):
     def _fake_sup(self, world):
         sup = B.SubscriptionSupervisor(world, None, None, threading.Event(), tempfile.mkdtemp())
         spawned, reaped = [], []
+        # 0.14.49: reconcile_once 가 끝난 스레드 재시작(revive_dead)을 부르므로 가짜 구독도 진짜 구독의 키(thread·stop)를 갖는다 — 살아 있는 스레드로 모사.
+        alive = type("AliveThread", (), {"is_alive": staticmethod(lambda: True)})()
         sup._spawn = lambda slug, sock: (spawned.append((slug, sock)),
-                                         sup.subs.__setitem__(slug, {"socket": sock}))
+                                         sup.subs.__setitem__(slug, {"socket": sock, "thread": alive, "stop": threading.Event()}))
         sup._reap = lambda slug: (reaped.append(slug), sup.subs.pop(slug, None))
         return sup, spawned, reaped
 

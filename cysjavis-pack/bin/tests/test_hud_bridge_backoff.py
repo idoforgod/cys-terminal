@@ -916,6 +916,26 @@ class HealthSubs(unittest.TestCase):
         self.assertIsNone(json.loads(HB.health_body())["subs"])
 
 
+class DamagedLinePokeIsRateLimited(unittest.TestCase):
+    """성찰 1회차 발견: 손상 줄마다 poke 하면 계속 손상된 파이프가 fleet_loop 의 스냅샷(자식 2개 기동)을 연달아 일으킨다 — 줄 수가 아니라 시간으로 한정한다."""
+
+    def test_two_hundred_damaged_lines_poke_at_most_once_per_reconcile_period(self):
+        pokes = []
+        sup = HB.SubscriptionSupervisor(world=types.SimpleNamespace(seq=0), hub=_Hub(), coal=HB.Coalescer(),
+                                        poke=types.SimpleNamespace(set=lambda: pokes.append(1)), state_dir=tempfile.mkdtemp(prefix="hud-t49-pk-"))
+        self.addCleanup(shutil.rmtree, sup.state_dir, True)
+        bad = '{"type":"event","seq":9,"payload":{"t":"\udcff\udcfe"}}\n'
+        proc = _EventProc([bad] * 200 + [ev_line(1)])
+        with mock.patch.object(HB.subprocess, "Popen", lambda *a, **k: proc), \
+                mock.patch.object(HB, "route_event", lambda *a, **k: ([], False)), \
+                mock.patch.object(HB, "archive_fx", lambda ts, fr: None), \
+                contextlib.redirect_stderr(io.StringIO()):
+            sup._reader("pk", None, _RecordingStop(n=1), [None])
+        self.assertEqual(sup.stats["pk"]["damaged"], 200)
+        # 손상 줄 쪽 poke 는 한 번, 그 밖에 끝난 자식을 다시 세울 때의 poke 가 한 번 — 200 번이 아니다.
+        self.assertLessEqual(len(pokes), 2, "손상 줄마다 poke 했다: %d" % len(pokes))
+
+
 class SourceCensus(unittest.TestCase):
     """다섯 자식 읽기 자리가 모두 인코딩을 이름 붙였는가(AST) — 호출 4·5(`/cmd`)는 이 점검만이 지킨다."""
 
