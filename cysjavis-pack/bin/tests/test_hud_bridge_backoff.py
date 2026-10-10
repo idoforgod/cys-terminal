@@ -783,6 +783,35 @@ class ThreadRevival(unittest.TestCase):
         self.assertGreaterEqual(min(r["gaps"]), 601, "601초 사는 스레드가 자기 수명보다 빨리 재시작됐다: %s" % r["gaps"])
         self.assertEqual(r["same_pass"], 0)
 
+    def test_pacing_resets_to_base_only_after_a_life_of_600_seconds(self):
+        """IMPL-R1 M1: 600초 초기화를 **직접** 재는 시험 — 대기를 60초까지 올린 뒤, 599초 산 스레드의 다음 대기는 60초(초기화 없음), 601초 산 스레드의
+        다음 대기는 2초(초기화). SUB_REVIVE_STABLE_SECS 를 꺼 버리면(10**9) 601초 칸이 60초가 되어 붉다(생애+64 진행 점검만으로는 못 잡던 변이)."""
+        world = types.SimpleNamespace(seq=0, dept_targets=lambda: {}, daemon={})
+        sup = HB.SubscriptionSupervisor(world, _Hub(), HB.Coalescer(), threading.Event(), tempfile.mkdtemp(prefix="hud-t49-r6-"))
+        self.addCleanup(shutil.rmtree, sup.state_dir, True)
+        sup._reader = lambda slug, socket, stop, holder: None            # 시작하자마자 끝나는 스레드
+        th = threading.Thread(target=lambda: None)
+        th.start()
+        th.join()
+        sup.subs["main"] = {"stop": threading.Event(), "proc": [None], "thread": th, "socket": None, "born": 1000.0}
+        now = 1000.0
+        for _ in range(8):                                               # 즉사 반복으로 대기를 2→4→…→60 까지 올린다
+            sup.revive_dead(now)
+            now = sup.revive["main"]["next_at"]
+            sup.revive_dead(now)                                         # 이 회차에 다시 세운다
+            sup.subs["main"]["thread"].join(2)
+        self.assertEqual(sup.revive["main"]["backoff"], 60.0, "준비 단계: 대기가 상한까지 올라가야 한다")
+        born = sup.subs["main"]["born"]
+        for life, want in ((599.0, 60.0), (601.0, 2.0)):
+            with self.subTest(life=life):
+                snap = dict(sup.revive["main"])
+                sup.revive["main"].update(next_at=None, backoff=60.0)    # 같은 출발점(대기 60초)에서 각 생애를 잰다
+                sup.subs["main"]["born"] = born
+                sup.revive_dead(born + life)                             # 죽음을 처음 보는 회차: 다음 대기만 정한다
+                self.assertEqual(sup.revive["main"]["backoff"], want)
+                self.assertEqual(sup.revive["main"]["next_at"], born + life + want)
+                sup.revive["main"].update(snap)
+
     def test_healthy_blocked_reader_is_never_restarted(self):
         r = self.simulate(None)
         self.assertEqual(len(r["rel"]), 1, "살아서 막혀 있는 리더가 다시 시작됐다(리더 중복 = 이벤트 폭주): %s" % r["rel"])
