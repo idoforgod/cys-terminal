@@ -40,7 +40,7 @@ HOOK = os.environ.get("INJECT_HOOK_UNDER_TEST") or os.path.normpath(
 BASH = shutil.which("bash") or "/bin/bash"
 
 BANNER = "■ 불변 정체·절대규칙 (L0 · soul.md ANCHOR — 매 부팅 재확립)"
-POINTER_HEAD = "개 절의 전문(금지선·오너 절대규칙 포함)은 제목만으로 지킬 수 없다 — 지금 바로 읽어라: cat "
+POINTER_HEAD = "개 절의 전문(금지선·오너 절대규칙 포함)은 제목만으로 지킬 수 없다 — 지금 바로 읽어라: cat '"
 ZERO_MARK = "절 제목을 0개 찾았다"
 UNREADABLE_MARK = "soul 파일을 읽지 못했다"
 TCAP_MARK = "— 목록을 생략한다. 아래 명령으로 전문을 읽어라."
@@ -66,10 +66,10 @@ def _write_exec(path, body):
 
 
 class Case(object):
-    def __init__(self):
+    def __init__(self, pack_name="pack"):
         self.tmp = tempfile.mkdtemp(prefix="b057-")
         self.home = os.path.join(self.tmp, "home")
-        self.pack = os.path.join(self.tmp, "pack")
+        self.pack = os.path.join(self.tmp, pack_name)
         self.cwd = os.path.join(self.tmp, "work")
         self.bindir = os.path.join(self.tmp, "stubbin")
         for d in (self.home, self.pack, self.cwd, self.bindir):
@@ -135,9 +135,11 @@ class SoulL0(unittest.TestCase):
         ptr = [l for l in block if POINTER_HEAD in l]
         self.assertEqual(len(ptr), 1, "exactly one pointer line expected: %r" % block)
         size = os.path.getsize(self.c.soul)
-        self.assertTrue(ptr[0].startswith("★위 %d" % n), "pointer heading count: %r" % ptr[0])
-        self.assertTrue(ptr[0].endswith("cat %s  [전문 %dB]" % (self.c.soul, size)),
-                        "pointer must name the resolved soul path and its whole-file size: %r" % ptr[0])
+        self.assertTrue(ptr[0].startswith("★아래 %d" % n), "pointer heading count: %r" % ptr[0])
+        self.assertTrue(ptr[0].endswith("cat '%s'  [전문 %dB]" % (self.c.soul, size)),
+                        "pointer must name the resolved soul path (single-quoted) and its whole-file size: %r" % ptr[0])
+        # R1 m1: the essential pointer comes BEFORE any title / warning of the block.
+        self.assertEqual(block.index(ptr[0]), 0, "the pointer must be the first line of the block: %r" % block[:3])
 
     def test_t1_startup_lists_every_plain_heading_and_points_to_the_file(self):
         self.c.write_soul(PLAIN_SOUL)
@@ -236,6 +238,56 @@ class SoulL0(unittest.TestCase):
         _, block = self._block("startup")
         self.assertNotIn("## BASE-ONLY HEADING", block, "the lane soul must win over the base default")
         self._assert_pointer(block, 3)
+
+
+    # ---- lane B review R1 (m1 pointer position · m2 quoting · gemini: no soul / 5,000-char heading) ----
+    def test_t13_pointer_is_inside_the_first_2000_chars_even_with_a_3000_char_heading(self):
+        self.c.write_soul("# soul\n## " + "가" * 1500 + "x" * 1500 + "\n- body\n## short\n")
+        r, block = self._block("startup")
+        at = r.stdout.index(POINTER_HEAD)
+        self.assertLess(at, 2000, "pointer starts at char %d of the hook output" % at)
+        self.assertLess(r.stdout.index(POINTER_HEAD), r.stdout.index("## " + "가"), "pointer before the long title")
+        self.assertTrue(any(l.startswith("## 가") and len(l) > 3000 for l in block), "the long heading is still listed whole")
+
+    def test_t14_path_with_a_space_or_quote_is_a_safe_command(self):
+        for name in ("my pack", "o'brien pack"):
+            c = Case(pack_name=name)
+            try:
+                c.write_soul(PLAIN_SOUL)
+                r = c.run("startup")
+                self.assertEqual(r.returncode, 0)
+                block = l0_block(r.stdout)
+                ptr = [l for l in block if POINTER_HEAD in l]
+                self.assertEqual(len(ptr), 1, (name, block))
+                cmd = ptr[0][ptr[0].index("cat '"):ptr[0].rindex("  [전문")]
+                out = subprocess.run([BASH, "-c", cmd], capture_output=True, text=True, encoding="utf-8", timeout=30)
+                self.assertEqual(out.returncode, 0, (name, cmd, out.stderr))
+                with open(c.soul, encoding="utf-8") as f:
+                    self.assertEqual(out.stdout, f.read(), "the emitted command reads the whole soul file: %r" % cmd)
+            finally:
+                c.cleanup()
+
+    def test_t15_no_soul_file_means_no_l0_block_and_exit_zero(self):
+        self.assertFalse(os.path.exists(self.c.soul))
+        r = self.c.run("startup")
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertIsNone(l0_block(r.stdout), "the accepted silent case: no file, no banner")
+        self.assertNotIn(POINTER_HEAD, r.stdout)
+
+    def test_t16_5000_char_heading_is_listed_and_the_pointer_still_leads(self):
+        self.c.write_soul("# soul\n## " + "h" * 5000 + "\n## after\n")
+        r, block = self._block("startup")
+        self._assert_pointer(block, 2)
+        self.assertLess(r.stdout.index(POINTER_HEAD), 2000)
+        self.assertIn("## " + "h" * 5000, block)
+        self.assertIn("## after", block)
+
+    def test_t17_title_list_over_cap_keeps_the_pointer_first(self):
+        self.c.write_soul("# soul\n## " + "z" * 9000 + "\n## b\n")
+        r, block = self._block("startup")
+        self._assert_pointer(block, 2)
+        self.assertTrue(any(TCAP_MARK in l for l in block), block[:3])
+        self.assertLess(r.stdout.index(POINTER_HEAD), 2000)
 
 
 if __name__ == "__main__":
