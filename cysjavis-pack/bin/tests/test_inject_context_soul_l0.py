@@ -43,7 +43,7 @@ BANNER = "■ 불변 정체·절대규칙 (L0 · soul.md ANCHOR — 매 부팅 �
 POINTER_HEAD = "개 절의 전문(금지선·오너 절대규칙 포함)은 제목만으로 지킬 수 없다 — 지금 바로 읽어라: cat '"
 ZERO_MARK = "절 제목을 0개 찾았다"
 UNREADABLE_MARK = "soul 파일을 읽지 못했다"
-TCAP_MARK = "— 목록을 생략한다. 아래 명령으로 전문을 읽어라."
+TCAP_MARK = "— 목록을 생략한다. 위 명령으로 전문을 읽어라."
 BLOAT_MARK = "이 주입은 제목 목록이라 잘린 것은 없다"
 
 PLAIN_SOUL = (

@@ -4971,7 +4971,7 @@ def h_win_17():
         need(b is not None, "L0 banner absent on startup: %r" % r.stdout[:300])
         need([l for l in b if l.startswith("## ")] == ["## 금지선 하나", "## 오너 규칙 둘"],
              "headings not listed (B-057 regression): %r" % b)
-        ptr = [l for l in b if "지금 바로 읽어라: cat " in l]
+        ptr = [l for l in b if "지금 바로 읽어라: cat '" in l]
         need(len(ptr) == 1, "pointer line missing: %r" % b)
         need(not [l for l in b if "B057-BODY" in l], "body text injected (H1 lists titles only): %r" % b)
         notes.append("제목 2·포인터 1")
@@ -10177,7 +10177,7 @@ def h_soul_lane_1():
         need("LANE-SOUL-MARKER" in r.stdout, "레인 soul 이 주입되지 않았다: %r" % r.stdout[:400])
         need("HQ-SOUL-MARKER" not in r.stdout,
              "레인 pane 인데 **본부 soul** 이 주입됐다(레인 정체가 덮인다): %r" % r.stdout[:400])
-        need("cat %s  [" % os.path.join(lane, "soul.md") in r.stdout,
+        need("cat '%s'  [" % os.path.join(lane, "soul.md") in r.stdout,
              "L0 포인터가 레인 soul 파일을 가리키지 않는다: %r" % r.stdout[:600])
         # 회귀 0: 레인에 soul 이 없으면 종전대로 레거시 ~/.claude/soul.md 로 폴백한다
         nosoul = os.path.join(tmp, "lanepack-nosoul")

@@ -924,6 +924,32 @@ class T16NoProductFileWrites(unittest.TestCase):
         finally:
             h.close()
 
+    def test_16_the_harness_own_instrumentation_is_create_only(self):
+        """The wrapper that injects the fixture (tests/pc_harness_gate.py) must not itself truncate or append a caller-owned
+        file: with its pid_file / trace_file aimed at the redirected verdict (or an alias), the verdict stays intact."""
+        h = Harness()
+        try:
+            ref_rc, ref = self._verdict_prefix(h)
+            out = os.path.join(h.td, "gate-result.txt")
+            alias = os.path.join(h.td, "alias.txt")
+            for key in ("pid_file", "trace_file"):
+                for p in (out, alias):
+                    if os.path.lexists(p):
+                        os.remove(p)
+                open(out, "wb").close()
+                os.symlink(out, alias)
+                spec = {"map": MAP_RICH, "hang_s": 12, key: alias}
+                argv, env = h.entry(GATE, **{LOOKUP_ENV: json.dumps(spec)})
+                with open(out, "wb") as fh:
+                    subprocess.run(argv + ["check"] + fixture_args("servers_soft"), stdout=fh,
+                                   stderr=subprocess.DEVNULL, env=env, timeout=60)
+                with open(out, "rb") as fh:
+                    data = fh.read()
+                self.assertTrue(data.startswith(ref), "%s: harness damaged the verdict: %r" % (key, data[:120]))
+                self.assertEqual(data[len(ref):].decode().count("\n"), 1, key)
+        finally:
+            h.close()
+
     def test_16_static_pin_the_product_has_no_environment_selected_lookup_seam(self):
         with open(GATE, encoding="utf-8") as f:
             txt = f.read()

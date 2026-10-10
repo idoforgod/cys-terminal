@@ -95,14 +95,18 @@ if { [ "$SOURCE" = "startup" ] || [ "$SOURCE" = "resume" ]; } && [ -f "$SOUL" ];
     SOUL_TITLES=$(grep '^## ' "$SOUL" 2>/dev/null | tr -d '\r' | sed 's/\\/\\\\/g')
     SOUL_TCAP=8192
     SOUL_TSZ=$(printf '%s' "$SOUL_TITLES" | wc -c | tr -d ' ')
+    # R1 m1/m2 (lane B review): the pointer is the FIRST line of the block (a long title can no longer push it out of
+    #   the first 2,000 characters of the hook output) and the path is single-quoted (a space or a quote in the path
+    #   no longer splits the command; a quote becomes '\'' - the standard safe form). _esc doubles backslashes last.
+    SOUL_QPATH=$(printf '%s' "$SOUL" | sed "s/'/'\\\\''/g")
+    OUT="${OUT}★아래 ${SOUL_NSEC:-0}개 절의 전문(금지선·오너 절대규칙 포함)은 제목만으로 지킬 수 없다 — 지금 바로 읽어라: cat '$(_esc "$SOUL_QPATH")'  [전문 ${SOUL_SZ}B]\n"
     if [ "${SOUL_NSEC:-0}" = "0" ]; then
-      OUT="${OUT}⚠ soul 에서 '## ' 절 제목을 0개 찾았다 — 제목 목록이 비었다(L0 0B 경보). 아래 명령으로 전문을 읽어라.\n"
+      OUT="${OUT}⚠ soul 에서 '## ' 절 제목을 0개 찾았다 — 제목 목록이 비었다(L0 0B 경보). 위 명령으로 전문을 읽어라.\n"
     elif [ -n "$SOUL_TSZ" ] && [ "$SOUL_TSZ" -gt "$SOUL_TCAP" ]; then
-      OUT="${OUT}⚠ soul 절 제목 목록 ${SOUL_TSZ}B>${SOUL_TCAP} (절 ${SOUL_NSEC}개) — 목록을 생략한다. 아래 명령으로 전문을 읽어라.\n"
+      OUT="${OUT}⚠ soul 절 제목 목록 ${SOUL_TSZ}B>${SOUL_TCAP} (절 ${SOUL_NSEC}개) — 목록을 생략한다. 위 명령으로 전문을 읽어라.\n"
     else
       OUT="${OUT}${SOUL_TITLES}\n"
     fi
-    OUT="${OUT}★위 ${SOUL_NSEC:-0}개 절의 전문(금지선·오너 절대규칙 포함)은 제목만으로 지킬 수 없다 — 지금 바로 읽어라: cat $(_esc "$SOUL")  [전문 ${SOUL_SZ}B]\n"
     if [ "$SOUL_SZ" -gt "$SOUL_CAP" ]; then
       OUT="${OUT}⚠ soul 전문 ${SOUL_SZ}B>${SOUL_CAP}(캡) — 이 주입은 제목 목록이라 잘린 것은 없다. 전문이 캡을 넘었다는 비대 보고다.\n"
     fi
