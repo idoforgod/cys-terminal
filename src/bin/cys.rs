@@ -10064,7 +10064,8 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
     let mut missing: Vec<String> = Vec::new();
     for (rel, mhash) in &manifest {
         let p = ctx.pack_dir.join(rel);
-        match std::fs::read_to_string(&p) {
+        // ★F10 M2: 비정규 파일(FIFO 등)에서 doctor 가 멈추지 않도록 블로킹 없는 읽기를 쓴다(일반 파일의 결과는 종전과 같다).
+        match cys::pack::read_pack_text_bounded(&p) {
             Ok(d) => {
                 if &cys::pack::content_hash_pub(&d) != mhash {
                     let mut labeled = false;
@@ -41713,6 +41714,45 @@ mod tests {
             assert!(!body_src.contains(forbidden), "run_doctor_lanes 가 {forbidden} 를 부른다");
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F10 M2(리뷰 1회차): hooks/ 아래 FIFO 가 있어도 doctor 와 --lanes 는 시한 안에 끝나고 WARN 이다(FAIL 아님) — 부팅·좌석을 막을 수 없다.
+    #[cfg(unix)]
+    #[test]
+    fn f10_m2_fifo_never_blocks_doctor_or_lanes_and_stays_warn() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (ctx, base) = f10_ctx("f10-m2");
+        let (a, ah, _, _) = f10_two_embedded_hooks();
+        let body = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == a).unwrap().1;
+        std::fs::write(ctx.pack_dir.join(&a), body).unwrap();
+        let mk = |rel: &str| {
+            let p = ctx.pack_dir.join(rel);
+            let st = std::process::Command::new("/usr/bin/mkfifo").arg(&p).status().unwrap();
+            assert!(st.success());
+            p
+        };
+        let extra = mk("hooks/local.pipe"); // 매니페스트에 없는 FIFO
+        let listed = mk("hooks/listed.pipe"); // 매니페스트에 있는 FIFO(종전 루프도 멈추던 자리)
+        f10_write_manifest(&ctx, &json!({ a.clone(): ah.clone(), "hooks/listed.pipe": cys::pack::content_hash_pub("x") }));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pack_root = base.clone();
+        std::thread::spawn(move || {
+            let ctx2 = doctor_ctx_at(&pack_root);
+            let item = diag_pack_drift(&ctx2);
+            let lanes = lanes_report(&pack_root, &cys::pack::vendor_hook_hashes());
+            let _ = tx.send((item.status, item.detail, lanes.len()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(8));
+        if got.is_err() {
+            for f in [&extra, &listed] {
+                let _ = std::fs::OpenOptions::new().write(true).open(f); // 막힌 읽기를 풀어 시험 프로세스가 남지 않게 한다
+            }
+        }
+        let (status, detail, _n) = got.expect("doctor/--lanes 가 FIFO 에서 8초 안에 끝나지 않았다(블로킹 읽기)");
+        assert_eq!(status, DiagStatus::Warn, "{detail}");
+        assert_ne!(status, DiagStatus::Fail);
+        assert!(detail.contains("hooks/local.pipe") && detail.contains("hooks/listed.pipe"), "{detail}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// T10-7(합친 행 포함): 판독 불가는 vendor 전진에 가려지지 않고(behind 로 둔갑하지 않고) 세어진다.

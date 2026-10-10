@@ -2222,12 +2222,53 @@ pub fn vendor_hook_hashes() -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
+/// F10 M2(리뷰 1회차): hooks/ 보고가 읽는 파일 크기 상한 · 순회 깊이 · 항목 수 상한 — 병적인 폴더가 보고를 늘리거나 멈추게 하지 못한다.
+pub const HOOKS_READ_CAP: u64 = 8 * 1024 * 1024;
+const HOOKS_WALK_MAX_DEPTH: usize = 8;
+const HOOKS_WALK_MAX_ENTRIES: usize = 4096;
+
+/// 팩 파일 하나를 **블로킹 없이** 텍스트로 읽는다: unix 에서는 `O_NONBLOCK` 로 열어(쓰는 쪽이 없는 FIFO 도 즉시 열린다) 핸들의 stat 이
+/// 일반 파일이고 상한 이하일 때만 읽는다. 일반 파일이 아닌 것(FIFO · 소켓 · 장치) · 상한 초과 · 심링크 순환 · 읽기 오류는 `Err`
+/// (호출부는 '판독 불가/미지원'으로 보고한다). 심링크는 일반 파일을 가리킬 때만 따라간다. 부재는 `NotFound` 그대로.
+pub fn read_pack_text_bounded(p: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let f = opts.open(p)?;
+    let m = f.metadata()?;
+    if !m.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "비정규 파일(FIFO·소켓·장치 등)은 읽지 않는다"));
+    }
+    if m.len() > HOOKS_READ_CAP {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "크기 상한 초과"));
+    }
+    let mut text = String::new();
+    f.take(HOOKS_READ_CAP).read_to_string(&mut text)?;
+    Ok(text)
+}
+
 fn walk_hooks_dir(dir: &Path, base: &Path, out: &mut Vec<String>) {
+    walk_hooks_dir_bounded(dir, base, out, 0);
+}
+
+fn walk_hooks_dir_bounded(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize) {
+    if depth > HOOKS_WALK_MAX_DEPTH {
+        return;
+    }
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
+        if out.len() >= HOOKS_WALK_MAX_ENTRIES {
+            return;
+        }
         let p = e.path();
-        if p.is_dir() {
-            walk_hooks_dir(&p, base, out);
+        // 디렉터리 심링크는 따라가지 않는다(file_type 은 따라가지 않는다) — 순환 · 팩 밖으로의 이탈 없음. 나머지는 항목으로 올려 분류에 맡긴다.
+        if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            walk_hooks_dir_bounded(&p, base, out, depth + 1);
         } else if let Ok(rel) = p.strip_prefix(base) {
             out.push(normalize_manifest_key(&rel.to_string_lossy()));
         }
@@ -2255,10 +2296,10 @@ pub fn hooks_report(
     let mut rows = Vec::new();
     for rel in rels {
         let p = pack_dir.join(&rel);
-        let disk = match std::fs::read_to_string(&p) {
+        let disk = match read_pack_text_bounded(&p) {
             Ok(text) => DiskRead::Hash(content_hash(&text)),
-            Err(_) if p.exists() => DiskRead::Unreadable,
-            Err(_) => DiskRead::Missing,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(&p).is_err() => DiskRead::Missing,
+            Err(_) => DiskRead::Unreadable,
         };
         let m = man.get(&rel).map(|s| s.as_str());
         let v = vendor.get(&rel).map(|s| s.as_str());
@@ -10438,4 +10479,78 @@ mod tests {
         assert!(!HOOKS_LOCAL_GUIDANCE.contains("pack-drift"), "만들지 않은 명령을 약속하지 않는다");
         assert!(!vendor_hook_hashes().is_empty(), "임베드 팩에 hooks/ 가 있다");
     }
+    // ── F10 M2 (리뷰 1회차): hooks/ 아래 비정규 파일(FIFO) · 심링크가 보고를 멈추게 하면 안 된다 ──
+    #[cfg(unix)]
+    fn f10_bounded<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(secs)).ok()
+    }
+    #[cfg(unix)]
+    fn f10_mkfifo(p: &Path) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let st = std::process::Command::new("/usr/bin/mkfifo").arg(p).status().expect("mkfifo");
+        assert!(st.success());
+    }
+    /// 시한 안에 못 끝나면 실패한다 — 시험 자체는 멈추지 않는다(막힌 스레드는 쓰기 쪽을 열어 풀어 준다).
+    #[cfg(unix)]
+    fn f10_release_fifo(p: &Path) {
+        let _ = std::fs::OpenOptions::new().write(true).custom_flags_nonblock().open(p);
+    }
+    #[cfg(unix)]
+    trait NonBlockOpen { fn custom_flags_nonblock(&mut self) -> &mut Self; }
+    #[cfg(unix)]
+    impl NonBlockOpen for std::fs::OpenOptions {
+        fn custom_flags_nonblock(&mut self) -> &mut Self {
+            use std::os::unix::fs::OpenOptionsExt;
+            self.custom_flags(0x4) // O_NONBLOCK (macOS/Linux 0x4/0x800): 읽는 쪽이 대기 중이면 열려서 풀어 준다
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f10_m2_unmanifested_fifo_under_hooks_is_reported_without_blocking() {
+        let pack = f10_pack("fifo", &[("hooks/guard.sh", b"g\n")]);
+        let fifo = pack.join("hooks/local.pipe");
+        f10_mkfifo(&fifo);
+        let man = f10_hashes(&[("hooks/guard.sh", "g\n")]);
+        let (p2, m2) = (pack.clone(), man.clone());
+        let got = f10_bounded(5, move || hooks_report(&p2, &m2, &m2));
+        if got.is_none() {
+            f10_release_fifo(&fifo);
+        }
+        let rows = got.expect("FIFO 에서 보고가 5초 안에 끝나지 않았다(블로킹 읽기)");
+        assert_eq!(f10_states(&rows), vec![("hooks/local.pipe".to_string(), "unreadable")], "비정규 파일은 unreadable(미지원)로 보고한다");
+        assert!(rows[0].state.counted());
+        let _ = std::fs::remove_dir_all(pack);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn f10_m2_manifested_fifo_symlink_to_fifo_and_symlink_loops_are_bounded() {
+        let pack = f10_pack("fifo2", &[("hooks/guard.sh", b"g\n")]);
+        let fifo = pack.join("hooks/listed.pipe");
+        f10_mkfifo(&fifo);
+        std::os::unix::fs::symlink(&fifo, pack.join("hooks/via-link")).unwrap();
+        std::os::unix::fs::symlink(pack.join("hooks/loop-b"), pack.join("hooks/loop-a")).unwrap();
+        std::os::unix::fs::symlink(pack.join("hooks/loop-a"), pack.join("hooks/loop-b")).unwrap();
+        std::os::unix::fs::symlink(pack.join("hooks"), pack.join("hooks/dir-loop")).unwrap();
+        let mut man = f10_hashes(&[("hooks/guard.sh", "g\n")]);
+        man.insert("hooks/listed.pipe".into(), content_hash("x"));
+        let (p2, m2) = (pack.clone(), man.clone());
+        let got = f10_bounded(5, move || hooks_report(&p2, &m2, &m2));
+        if got.is_none() {
+            f10_release_fifo(&fifo);
+        }
+        let rows = got.expect("FIFO · 심링크 순환에서 보고가 5초 안에 끝나지 않았다");
+        let st: std::collections::BTreeMap<_, _> = f10_states(&rows).into_iter().collect();
+        assert_eq!(st.get("hooks/listed.pipe"), Some(&"unreadable"));
+        assert_eq!(st.get("hooks/via-link"), Some(&"unreadable"), "FIFO 를 가리키는 심링크도 열지 않는다");
+        assert_eq!(st.get("hooks/loop-a"), Some(&"unreadable"));
+        assert!(!st.keys().any(|k| k.starts_with("hooks/dir-loop/")), "디렉터리 심링크는 따라가지 않는다(순환 없음): {st:?}");
+        let _ = std::fs::remove_dir_all(pack);
+    }
+
 }
