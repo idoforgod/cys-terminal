@@ -316,35 +316,6 @@ jobs:
           cargo_filter_count --bin cys d5_env_injection
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys d5_env_injection -- --test-threads=1
 
-      # ── 0.14.50 F10(훅 드리프트 보고): 윈도우 달라지는 코드(매니페스트 키의 역슬래시 · 폴더 중복 제거 ·
-      #   읽기 상한)가 있는데 어느 윈도우 걸음도 그 Rust 시험을 돌리지 않았다. FIFO·심볼릭 링크 시험은
-      #   `#[cfg(unix)]` 로 막혀 있어(지우지 않았다) 윈도우에서는 컴파일되지 않는다.
-      #   이 스텝은 차단이다(continue-on-error 없음) — 필터가 0건이면 cargo_filter_count 가 붉힌다.
-      - name: cargo test F10 훅 드리프트 (--lib · --bin cys f10_ · Windows 실기)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo_filter_count() {
-            local list="${RUNNER_TEMP:-/tmp}/cargo-filter-list.txt" n rc
-            if CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
-            if [ "$rc" -ne 0 ]; then
-              cat "$list"
-              echo "::error::cargo test $* -- --list 실패(rc=$rc) — 필터를 셀 수 없으면 실행도 근거가 없다(fail-closed)"
-              exit 1
-            fi
-            n=$(grep -c ': test$' "$list" || true)
-            if [ "${n:-0}" -lt 1 ]; then
-              tail -20 "$list"
-              echo "::error::cargo test $* 필터에 걸리는 테스트가 0건 — 필터 이름이 바뀌었다(돌지 않는 초록 금지)"
-              exit 1
-            fi
-            echo "[filter-count] cargo test $* → ${n}건"
-          }
-          cargo_filter_count --lib f10_
-          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib f10_ -- --test-threads=1
-          cargo_filter_count --bin cys f10_
-          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys f10_ -- --test-threads=1
-
       # ── IG-31(★C4 선행 · master 배정 2026-09-05): cysd 검체가 **어느 CI 레인에서도 Windows 에서
       #   돌지 않았다**(W-B 실측). windows-build=cargo test 0건 · 이 파일=factory_reset::/d5 둘만 ·
       #   release.yml 의 --bin cysd 는 aarch64-apple-darwin 조건이라 macOS 전용. 그래서 R5 persist_epoch
@@ -703,6 +674,83 @@ jobs:
             echo "> 이 스텝은 **비차단**이다. 잡·런이 초록이어도 판정이 '완주·통과' 가 아니면 hwmon Windows 검체는 통과가 아니다 — 초록을 셀 때 종류를 병기하라."
           } >> "$SUM" 2>/dev/null
           exit 0
+
+      # ── 0.14.50 T-50-P2 Unit C(측정 전용 · 고치지 않는다): `queue list --help` 시험이 윈도우에서 스택을 넘겼다. 시험 하네스
+      #   스레드 문제인지 제품(cys.exe) 문제인지 모른다. 이 스텝은 판정을 하지 않고 종료 코드만 찍는다.
+      #   ⚠ 비차단 · `if: always()` — 앞 스텝이 붉어도 돌고, 이 스텝이 붉어 뒤 스텝을 막지 못한다(모든 줄이 rc 를 잡고 `exit 0`).
+      #   이 잡에는 릴리스 빌드가 없다 — 디버그 빌드(cargo build --bin cys)만 잰다.
+      - name: 스택 넘침 측정 (비차단 · cys.exe --help 종료 코드 · 단일 시험 · RUST_MIN_STACK)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          export CYS_PACK_DIR="$(mktemp -d)"
+          cargo build --bin cys; echo "[measure] cargo build --bin cys rc=$?"
+          EXE=target/debug/cys.exe
+          for args in "queue list --help" "queue --help" "--help"; do
+            # shellcheck disable=SC2086
+            "$EXE" $args > "${RUNNER_TEMP:-/tmp}/m.out" 2>&1; echo "[measure] cys.exe $args rc=$?"
+          done
+          # 측정 스텝이라 `exit` 대신 `return` — 센 값이 틀려도 아래 측정은 계속 돈다(rc 는 로그에 찍힌다).
+          cargo_filter_count() {
+            local list="${RUNNER_TEMP:-/tmp}/cargo-filter-list.txt" n rc
+            if CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
+            if [ "$rc" -ne 0 ]; then
+              cat "$list"
+              echo "::error::cargo test $* -- --list 실패(rc=$rc) — 필터를 셀 수 없으면 실행도 근거가 없다(fail-closed)"
+              return 1
+            fi
+            n=$(grep -c ': test$' "$list" || true)
+            if [ "${n:-0}" -lt 1 ]; then
+              tail -20 "$list"
+              echo "::error::cargo test $* 필터에 걸리는 테스트가 0건 — 모듈 경로가 바뀌었다(돌지 않는 초록 금지)"
+              return 1
+            fi
+            echo "[filter-count] cargo test $* → ${n}건"
+          }
+          T=queue_list_row_tests::rqfix_f10_queue_list_long_help_documents_the_stderr_notice_line
+          cargo_filter_count --bin cys "$T"
+          (unset RUST_MIN_STACK; cargo test --bin cys "$T" -- --exact --test-threads=1; echo "[measure] single test RUST_MIN_STACK=unset rc=$?")
+          (export RUST_MIN_STACK=8388608; cargo test --bin cys "$T" -- --exact --test-threads=1; echo "[measure] single test RUST_MIN_STACK=8388608 rc=$?")
+          exit 0
+
+      # ── 0.14.50 F10(훅 드리프트 보고): 윈도우 달라지는 코드(매니페스트 키의 역슬래시 · 폴더 중복 제거 ·
+      #   읽기 상한)가 있는데 어느 윈도우 걸음도 그 Rust 시험을 돌리지 않았다. FIFO·심볼릭 링크 시험은
+      #   `#[cfg(unix)]` 로 막혀 있어(지우지 않았다) 윈도우에서는 컴파일되지 않는다.
+      #   이 스텝은 차단이다(continue-on-error 없음) — 필터가 0건이면 cargo_filter_count 가 붉힌다.
+      # ★필터는 경로 접두까지 쓴다: `f10_` 만 쓰면 부분 문자열이라 `queue_list_row_tests::rqfix_f10_…`(0.14.43 부터 있던
+      #   별개 시험)까지 걸려 윈도우에서 STATUS_STACK_OVERFLOW 로 스텝이 죽었다(T-50-P 런 38080140850). 그 시험은 아래 측정 스텝이 따로 본다.
+      #   맥 `--list` 실측: --lib pack::tests::f10_ = 9건 · --bin cys tests::f10_ = 7건. 윈도우는 FIFO·심볼릭 링크 시험이 `#[cfg(unix)]` 라
+      #   더 적게 컴파일된다(T-50-P 로그: --lib 7건) — 계수 가드는 0건만 붉힌다.
+      # ★위치: cysd 스텝·판독·hwmon 스텝 **뒤**다. 이 스텝이 차단이라 앞에 두면 붉을 때 비차단 cysd 스위트(G6 판독 대상)가 건너뛰어진다
+      #   (T-50-P 에서 실발생). 맨 뒤 UI 스텝과 같은 이유로 뒤에 둔다.
+      - name: cargo test F10 훅 드리프트 (--lib pack::tests::f10_ · --bin cys tests::f10_ · Windows 실기)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_filter_count() {
+            local list="${RUNNER_TEMP:-/tmp}/cargo-filter-list.txt" n rc
+            if CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
+            if [ "$rc" -ne 0 ]; then
+              cat "$list"
+              echo "::error::cargo test $* -- --list 실패(rc=$rc) — 필터를 셀 수 없으면 실행도 근거가 없다(fail-closed)"
+              exit 1
+            fi
+            n=$(grep -c ': test$' "$list" || true)
+            if [ "${n:-0}" -lt 1 ]; then
+              tail -20 "$list"
+              echo "::error::cargo test $* 필터에 걸리는 테스트가 0건 — 필터 이름이 바뀌었다(돌지 않는 초록 금지)"
+              exit 1
+            fi
+            echo "[filter-count] cargo test $* → ${n}건"
+          }
+          cargo_filter_count --lib pack::tests::f10_
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib pack::tests::f10_ -- --test-threads=1
+          cargo_filter_count --bin cys tests::f10_
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys tests::f10_ -- --test-threads=1
 
       # ★R2F-PK(성찰 2회차 · A4 m5): **화면 검체가 태그 전에 윈도우에서 한 번도 돌지 않는다** — 브랜치 ui-check 는 macOS 뿐이고(ci-branch 잡5), `release.yml` 의 `cd ui && bun test`(윈도우 레그 포함 · `if` 없음)가 첫
       #   윈도우 실행이라 이번 판이 더한 검체 파일(deptprogress · deptprogressseats · deptprogresswiring · sendfailwiring · starvednotice · updatenotice)과 크게 늘어난 기존 검체(usagebar · usagewiring · restartplan · toastttl)의
