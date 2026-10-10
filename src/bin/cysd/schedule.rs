@@ -1715,16 +1715,8 @@ fn approval_raw_has_prefix_trace(raw: Option<&[u8]>, toks: &[String]) -> Result<
     if content.trim().is_empty() {
         return Ok(false);
     }
-    let value: serde_json::Value = serde_json::from_str(content).map_err(|_| ())?;
-    let records = value
-        .as_array()
-        .or_else(|| value.as_object()?.get("records")?.as_array())
-        .ok_or(())?;
-    // 승인 로더가 거부하는 레코드를 '흔적 없음'으로 받아들이지 않는다.
-    let records = serde_json::from_value::<Vec<crate::approval::ApprovalRecord>>(
-        serde_json::Value::Array(records.clone()),
-    )
-    .map_err(|_| ())?;
+    // 승인 로더와 같은 디코더(F7): 로더가 거부하는 바이트는 '흔적 없음'이 아니라 오류다.
+    let records = crate::approval::decode_records_text(content).map_err(|_| ())?;
     let mut has_trace = false;
     for record in records {
         let prefix = record.command_prefix;
