@@ -535,8 +535,9 @@ jobs:
       #   ┌ 평상(R2F-PK · bd0a0ca3 런 37185687205 실측): 잡 14.0분 = 앞 8스텝 4.65분(279초 = 체크아웃 13 · H-WIN 건강성 84 · Rust 툴체인 20 · lib 필터 119 · D5 41 …) + cysd 전량 스텝 9.2분(552초 — **완주**)
       #   │   + 판독 1초 + 이 hwmon 스텝 2초 + 판독 0초 + 업로드 2초. 맨 뒤의 UI 스텝(아래 `cd ui && bun test`)이 약 0.5분을 더한다 → 약 14.5분.
       #   └ 전량 스텝이 **다시 멈출 때**(30분 상한에 닿는 최악 — 1회차 두 런이 실제로 그랬다: 잡 33.9분(9650334f)·35.0분(bde5e557) = 앞 8스텝 3.7·4.8분 + 전량 스텝 30.1분(상한)): 35.0분 + 이 스텝의 실행분
-      #       (실측 2초 · 하네스가 없는 예외까지 덮는 상한 6분) + UI 스텝(setup-bun 약 0.3분 + 상한 3분) → **이론 최악 35.0 + 6 + 0.3 + 3 = 44.3분 < 45분**(여유 0.7분 · 잡 상한 55분에는 10.7분) · 실측에 기댄 현실적 최악은
+      #       (실측 2초 · 하네스가 없는 예외까지 덮는 상한 6분) + UI 스텝(setup-bun 약 0.3분 + 상한 3분) → **(0.14.50 T-50-P2 이전) 이론 최악 35.0 + 6 + 0.3 + 3 = 44.3분 < 45분**(여유 0.7분 · 잡 상한 55분에는 10.7분) · 실측에 기댄 현실적 최악은
       #       35.0 + 0.1 + 0.5 ≈ 36분(두 한도에 각 19분·9분 여유). 어느 쪽이든 release 게이트의 45분 안이다. 한도를 건드리는 변경(스텝·상한 추가)은 이 표를 다시 계산하라.
+      #   ★0.14.50 T-50-P2 재계산: F10 스텝(빌드 재사용 — 실측 전 1분 안팎[추정])과 맨 뒤 측정 스텝(상한 5분)이 더해졌다. 이론 최악(전량 스텝이 30분 상한까지 돌 때) 44.3 + 1 + 5 ≈ 50.3분은 45분 release 게이트를 넘는다 — 이 이론값은 더 이상 45분 안이라고 주장하지 않는다(잡 상한 55분 안). 현실 최악은 35.0 + 0.1 + 0.5 + 1 + 측정 수 분 ≈ 40분 안팎[추정 — 이번 런이 첫 실측]. 필수 검사는 모두 측정 스텝 앞에 있다.
       #   · 뒤에 두면: 위 스텝이 `--bin cysd` 테스트 하네스를 이미 빌드해 둔 상태라 이 스텝은 거의 **실행만**(실측 2초 · 5건)이다.
       #   · 앞에 두면: 이 스텝이 테스트 빌드를 먹어 제한시간이 빌드를 덮어야 한다(예 12분) — 위 스텝은 빌드 시간을 되찾아도 어차피 상한까지 돌므로 합이 그만큼 늘고, 같은 최악 가정이면
       #     4.8 + 12 + 30.1 ≈ 47분 > 45분이다(release 게이트가 '측정 불능'으로 적색).
@@ -675,48 +676,6 @@ jobs:
           } >> "$SUM" 2>/dev/null
           exit 0
 
-      # ── 0.14.50 T-50-P2 Unit C(측정 전용 · 고치지 않는다): `queue list --help` 시험이 윈도우에서 스택을 넘겼다. 시험 하네스
-      #   스레드 문제인지 제품(cys.exe) 문제인지 모른다. 이 스텝은 판정을 하지 않고 종료 코드만 찍는다.
-      #   ⚠ 비차단 · `if: always()` — 앞 스텝이 붉어도 돌고, 이 스텝이 붉어 뒤 스텝을 막지 못한다(모든 줄이 rc 를 잡고 `exit 0`).
-      #   이 잡에는 릴리스 빌드가 없다 — 디버그 빌드(cargo build --bin cys)만 잰다.
-      - name: 스택 넘침 측정 (비차단 · cys.exe --help 종료 코드 · 단일 시험 · RUST_MIN_STACK)
-        if: always()
-        continue-on-error: true
-        timeout-minutes: 10
-        shell: bash
-        run: |
-          set +e
-          set -uo pipefail
-          export CYS_PACK_DIR="$(mktemp -d)"
-          cargo build --bin cys; echo "[measure] cargo build --bin cys rc=$?"
-          EXE=target/debug/cys.exe
-          for args in "queue list --help" "queue --help" "--help"; do
-            # shellcheck disable=SC2086
-            "$EXE" $args > "${RUNNER_TEMP:-/tmp}/m.out" 2>&1; echo "[measure] cys.exe $args rc=$?"
-          done
-          # 측정 스텝이라 `exit` 대신 `return` — 센 값이 틀려도 아래 측정은 계속 돈다(rc 는 로그에 찍힌다).
-          cargo_filter_count() {
-            local list="${RUNNER_TEMP:-/tmp}/cargo-filter-list.txt" n rc
-            if CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
-            if [ "$rc" -ne 0 ]; then
-              cat "$list"
-              echo "::error::cargo test $* -- --list 실패(rc=$rc) — 필터를 셀 수 없으면 실행도 근거가 없다(fail-closed)"
-              return 1
-            fi
-            n=$(grep -c ': test$' "$list" || true)
-            if [ "${n:-0}" -lt 1 ]; then
-              tail -20 "$list"
-              echo "::error::cargo test $* 필터에 걸리는 테스트가 0건 — 모듈 경로가 바뀌었다(돌지 않는 초록 금지)"
-              return 1
-            fi
-            echo "[filter-count] cargo test $* → ${n}건"
-          }
-          T=queue_list_row_tests::rqfix_f10_queue_list_long_help_documents_the_stderr_notice_line
-          cargo_filter_count --bin cys "$T"
-          (unset RUST_MIN_STACK; cargo test --bin cys "$T" -- --exact --test-threads=1; echo "[measure] single test RUST_MIN_STACK=unset rc=$?")
-          (export RUST_MIN_STACK=8388608; cargo test --bin cys "$T" -- --exact --test-threads=1; echo "[measure] single test RUST_MIN_STACK=8388608 rc=$?")
-          exit 0
-
       # ── 0.14.50 F10(훅 드리프트 보고): 윈도우 달라지는 코드(매니페스트 키의 역슬래시 · 폴더 중복 제거 ·
       #   읽기 상한)가 있는데 어느 윈도우 걸음도 그 Rust 시험을 돌리지 않았다. FIFO·심볼릭 링크 시험은
       #   `#[cfg(unix)]` 로 막혀 있어(지우지 않았다) 윈도우에서는 컴파일되지 않는다.
@@ -777,3 +736,51 @@ jobs:
           name: win-health-json
           path: win-health.json
           if-no-files-found: warn
+
+      # ── 0.14.50 T-50-P2 Unit C(측정 전용 · 고치지 않는다): `queue list --help` 시험이 윈도우에서 스택을 넘겼다. 시험 하네스
+      #   스레드 문제인지 제품(cys.exe) 문제인지 모른다. 이 스텝은 판정을 하지 않고 종료 코드만 찍는다.
+      #   ⚠ 비차단 · `if: always()` — 앞 스텝이 붉어도 돌고, 이 스텝이 붉어 뒤 스텝을 막지 못한다(모든 줄이 rc 를 잡고 `exit 0`).
+      #   ★위치·상한: 잡의 맨 마지막(필수 검사 전부 뒤)이고 제한시간 5분 — 잡 55분 상한이 취소하면 step 의 continue-on-error 로는 못 막으므로 필수 검사를 앞에 두었다(codex M1).
+      #   이 잡에는 릴리스 빌드가 없다 — 디버그 빌드(cargo build --bin cys)만 잰다.
+      - name: 스택 넘침 측정 — 맨 뒤 (비차단 · cys.exe --help 종료 코드 · 단일 시험 · RUST_MIN_STACK)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set +e
+          set -uo pipefail
+          export CYS_PACK_DIR="$(mktemp -d)"
+          cargo build --bin cys; echo "[measure] cargo build --bin cys rc=$?"
+          EXE=target/debug/cys.exe
+          i=0
+          for args in "queue list --help" "queue --help" "--help"; do
+            i=$((i+1)); out="${RUNNER_TEMP:-/tmp}/m$i.out"
+            # shellcheck disable=SC2086
+            "$EXE" $args > "$out" 2>&1; echo "[measure] cys.exe $args bash-rc=$?"
+            head -n 5 "$out" | sed 's/^/[measure]   | /'
+            # Git Bash 의 $? 는 NTSTATUS 를 접는다(0xc00000fd 가 127 로 보인 적이 있다) — 원래 종료 코드는 PowerShell 로 16진수 한 번 더.
+            powershell -NoProfile -Command "& './target/debug/cys.exe' $args *> \$null; '[measure] cys.exe $args native-exit=0x{0:X8}' -f \$LASTEXITCODE"
+          done
+          # 측정 스텝이라 `exit` 대신 `return` — 센 값이 틀려도 아래 측정은 계속 돈다(rc 는 로그에 찍힌다).
+          cargo_filter_count() {
+            local list="${RUNNER_TEMP:-/tmp}/cargo-filter-list.txt" n rc
+            if CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
+            if [ "$rc" -ne 0 ]; then
+              cat "$list"
+              echo "::error::cargo test $* -- --list 실패(rc=$rc) — 필터를 셀 수 없으면 실행도 근거가 없다(fail-closed)"
+              return 1
+            fi
+            n=$(grep -c ': test$' "$list" || true)
+            if [ "${n:-0}" -lt 1 ]; then
+              tail -20 "$list"
+              echo "::error::cargo test $* 필터에 걸리는 테스트가 0건 — 모듈 경로가 바뀌었다(돌지 않는 초록 금지)"
+              return 1
+            fi
+            echo "[filter-count] cargo test $* → ${n}건"
+          }
+          T=queue_list_row_tests::rqfix_f10_queue_list_long_help_documents_the_stderr_notice_line
+          cargo_filter_count --bin cys "$T"
+          (unset RUST_MIN_STACK; cargo test --bin cys "$T" -- --exact --test-threads=1; echo "[measure] single test RUST_MIN_STACK=unset rc=$?")
+          (export RUST_MIN_STACK=8388608; cargo test --bin cys "$T" -- --exact --test-threads=1; echo "[measure] single test RUST_MIN_STACK=8388608 rc=$?")
+          exit 0
