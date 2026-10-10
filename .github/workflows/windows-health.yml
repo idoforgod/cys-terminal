@@ -316,6 +316,35 @@ jobs:
           cargo_filter_count --bin cys d5_env_injection
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys d5_env_injection -- --test-threads=1
 
+      # ── 0.14.50 F10(훅 드리프트 보고): 윈도우 달라지는 코드(매니페스트 키의 역슬래시 · 폴더 중복 제거 ·
+      #   읽기 상한)가 있는데 어느 윈도우 걸음도 그 Rust 시험을 돌리지 않았다. FIFO·심볼릭 링크 시험은
+      #   `#[cfg(unix)]` 로 막혀 있어(지우지 않았다) 윈도우에서는 컴파일되지 않는다.
+      #   이 스텝은 차단이다(continue-on-error 없음) — 필터가 0건이면 cargo_filter_count 가 붉힌다.
+      - name: cargo test F10 훅 드리프트 (--lib · --bin cys f10_ · Windows 실기)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_filter_count() {
+            local list="${RUNNER_TEMP:-/tmp}/cargo-filter-list.txt" n rc
+            if CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
+            if [ "$rc" -ne 0 ]; then
+              cat "$list"
+              echo "::error::cargo test $* -- --list 실패(rc=$rc) — 필터를 셀 수 없으면 실행도 근거가 없다(fail-closed)"
+              exit 1
+            fi
+            n=$(grep -c ': test$' "$list" || true)
+            if [ "${n:-0}" -lt 1 ]; then
+              tail -20 "$list"
+              echo "::error::cargo test $* 필터에 걸리는 테스트가 0건 — 필터 이름이 바뀌었다(돌지 않는 초록 금지)"
+              exit 1
+            fi
+            echo "[filter-count] cargo test $* → ${n}건"
+          }
+          cargo_filter_count --lib f10_
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --lib f10_ -- --test-threads=1
+          cargo_filter_count --bin cys f10_
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys f10_ -- --test-threads=1
+
       # ── IG-31(★C4 선행 · master 배정 2026-09-05): cysd 검체가 **어느 CI 레인에서도 Windows 에서
       #   돌지 않았다**(W-B 실측). windows-build=cargo test 0건 · 이 파일=factory_reset::/d5 둘만 ·
       #   release.yml 의 --bin cysd 는 aarch64-apple-darwin 조건이라 macOS 전용. 그래서 R5 persist_epoch
