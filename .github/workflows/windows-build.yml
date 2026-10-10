@@ -1196,8 +1196,9 @@ jobs:
       #   0x9d @114 / @143) and nothing restarted it. Every other python step here wraps PYTHONUTF8=1, so none of them
       #   could see it. This step runs the WHOLE bridge backoff suite (the seat that owns the bridge adds the encoding
       #   cases there — no test names are agreed between seats) with the bundled interpreter that ships to users.
-      #   It prints the native encoding it saw and pass/total as numbers. total 0 or UTF-8 mode on = "not measured"
-      #   = fail (never a silent green). Limit: the runner is cp1252; cp949 is covered only by the suite's emulation.
+      #   It prints the native encoding it saw and pass/total as numbers. total 0, UTF-8 mode on, or a UTF-8 native
+      #   encoding (utf8_mode 0) = "not measured" = fail (never a silent green). Limit: the runner is cp1252; cp949 is
+      #   covered only by the suite's emulation.
       #   Do not write the suite file name in the step title or comments (see the T6 note below) — the $t line is
       #   the only evidence that this lane runs it.
       - name: T5c HUD 브리지 구독 읽기 기본 인코딩 내성 (PYTHONUTF8 없이 — 러너 네이티브 코드페이지)
@@ -1221,18 +1222,33 @@ jobs:
           # the runner's own cp1252 stdout; the summary lines on stdout are ASCII.
           $runner = Join-Path $env:RUNNER_TEMP 't5c_hud_suite_runner.py'
           @'
-          import importlib.util, locale, os, sys, unittest
+          import codecs, importlib.util, locale, os, sys, unittest
           path = sys.argv[1]
           try:
               getenc = locale.getencoding()
           except AttributeError:
               getenc = "n/a"
+          pref = locale.getpreferredencoding(False)
           print("T5c native: preferred_encoding=%s getencoding=%s utf8_mode=%d PYTHONUTF8=%s stdout=%s python=%s"
-                % (locale.getpreferredencoding(False), getenc, sys.flags.utf8_mode,
+                % (pref, getenc, sys.flags.utf8_mode,
                    os.environ.get("PYTHONUTF8", "<unset>"), sys.stdout.encoding, sys.version.split()[0]), flush=True)
           if sys.flags.utf8_mode:
               print("T5c: UTF-8 mode is on - the native-code-page condition is not established (not measured)", flush=True)
               sys.exit(3)
+          # A UTF-8 NATIVE locale with utf8_mode 0 is not the condition either (the suite would only print
+          # 'condition not established' and pass): compare normalized codec names, fail as not measured.
+          def _norm(e):
+              try:
+                  return codecs.lookup(e).name
+              except (LookupError, TypeError):
+                  return "unknown:%s" % e
+          seen = [(n, e, _norm(e)) for n, e in (("preferred_encoding", pref), ("getencoding", getenc)) if e != "n/a"]
+          utf8 = [s for s in seen if s[2] == "utf-8"]
+          if utf8:
+              print("T5c: native encoding is UTF-8 (%s) - the non-UTF-8 native-code-page condition is not established (not measured)"
+                    % ", ".join("%s=%s->%s" % s for s in utf8), flush=True)
+              sys.exit(3)
+          print("T5c native condition: %s (non-UTF-8)" % ", ".join("%s=%s->%s" % s for s in seen), flush=True)
           spec = importlib.util.spec_from_file_location("hud_bridge_backoff_suite", path)
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
