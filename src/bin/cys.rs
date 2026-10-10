@@ -9991,6 +9991,11 @@ const RUNTIME_SEAL_RECOVERY: &str = "복구는 v0.14.30 이상으로 재설치 �
 
 /// ★F10: `hooks/` 행 → doctor 상세 조각. 센 행(drift · drift+behind · missing · unreadable)은 이름과 세 해시(디스크·매니페스트·vendor 앞 8자)로,
 /// 안 센 행(behind · extra)은 이름만. 고친 훅(drift 계열)이 있으면 C3 안내 문장을 한 번 붙인다.
+/// hooks/ 순회 불완전 한 줄(doctor · `--lanes` 공통 문구).
+fn hooks_incomplete_part(inc: &cys::pack::HooksIncomplete) -> String {
+    format!("★hooks/ 순회 불완전({}) — 이 점검은 hooks/ 전체를 보지 못했다(깨끗하다는 뜻이 아님)", inc.describe())
+}
+
 fn hook_drift_parts(rows: &[cys::pack::HookRow]) -> Vec<String> {
     let sh = |h: &Option<String>| h.as_deref().map(cys::pack::short_hash).unwrap_or("-").to_string();
     let mut parts = Vec::new();
@@ -10093,7 +10098,8 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
     }
     // ★F10(0.14.50): hooks/ 드리프트 보고 — 순수 분류기(pack::hooks_report)로 일곱 상태를 가른다. 읽기 전용이고 등급 계약은 그대로
     //   (OK/WARN/SKIP · FAIL 없음): 고친 훅(drift · drift+behind) · 누락 · 판독 불가만 세고, 설치 대기(behind)와 자작(extra)은 이름만 올린다.
-    let hook_rows = cys::pack::hooks_report(&ctx.pack_dir, &manifest, &cys::pack::vendor_hook_hashes());
+    let hook_scan = cys::pack::hooks_report_scan(&ctx.pack_dir, &manifest, &cys::pack::vendor_hook_hashes());
+    let hook_rows = hook_scan.rows;
     let pending = cys::pack::load_merge_pending(&ctx.pack_dir);
     // ★성찰 차단 수리(계상 SOT 3분산): 자구 동형 count_kind 클로저 재구현 제거 —
     // pack::pending_kind_counts(pub 승격) 위임 소비. 신 kind 추가 시 계상기는 한 곳이고,
@@ -10158,6 +10164,10 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
         ));
     }
     parts.extend(hook_drift_parts(&hook_rows));
+    // ★F10 R2-m2: 순회가 끝까지 가지 못했으면 '깨끗함'으로 읽지 않는다 — 사유를 밝히고 WARN.
+    if let Some(inc) = &hook_scan.incomplete {
+        parts.push(hooks_incomplete_part(inc));
+    }
     parts.push(format!(
         "캡처 저장소 {cap_n}건 · {}(GC 없음 — 수동 정리 가능)",
         fmt_bytes(cap_bytes)
@@ -10173,7 +10183,7 @@ fn diag_pack_drift(ctx: &DoctorCtx) -> DiagItem {
             action.push_str(" · 판독 불가: cys init-pack");
         }
     }
-    let hooks_counted = hook_rows.iter().any(|r| r.state.counted());
+    let hooks_counted = hook_rows.iter().any(|r| r.state.counted()) || hook_scan.incomplete.is_some();
     let status = if !suspects.is_empty() || n_qr > 0 || !missing.is_empty() || unreadable > 0 || hooks_counted {
         DiagStatus::Warn
     } else {
@@ -10618,6 +10628,8 @@ struct LaneDrift {
     pack_dir: std::path::PathBuf,
     status: DiagStatus,
     rows: Vec<cys::pack::HookRow>,
+    /// R2-m2: hooks/ 순회가 끝까지 가지 못한 사유(있으면 상태는 WARN 이다).
+    incomplete: Option<cys::pack::HooksIncomplete>,
 }
 
 /// 레인 열거(순수 읽기): `<cys_root>/pack`(기본) + `<cys_root>/pack-dept-*`. 같은 폴더의 두 철자는 한 번만(정규화 경로 기준).
@@ -10650,15 +10662,15 @@ fn lanes_report(cys_root: &std::path::Path, vendor: &std::collections::BTreeMap<
         }
         let manifest: Option<std::collections::BTreeMap<String, String>> =
             std::fs::read_to_string(dir.join(cys::pack::INSTALL_MANIFEST)).ok().and_then(|t| serde_json::from_str(&t).ok());
-        let (status, rows) = match manifest {
-            None => (DiagStatus::Skip, Vec::new()),
+        let (status, rows, incomplete) = match manifest {
+            None => (DiagStatus::Skip, Vec::new(), None),
             Some(m) => {
-                let rows = cys::pack::hooks_report(&dir, &m, vendor);
-                let st = if rows.iter().any(|r| r.state.counted()) { DiagStatus::Warn } else { DiagStatus::Ok };
-                (st, rows)
+                let scan = cys::pack::hooks_report_scan(&dir, &m, vendor);
+                let st = if scan.rows.iter().any(|r| r.state.counted()) || scan.incomplete.is_some() { DiagStatus::Warn } else { DiagStatus::Ok };
+                (st, scan.rows, scan.incomplete)
             }
         };
-        out.push(LaneDrift { lane, pack_dir: dir, status, rows });
+        out.push(LaneDrift { lane, pack_dir: dir, status, rows, incomplete });
     }
     out
 }
@@ -10675,6 +10687,9 @@ fn render_lanes_text(lanes: &[LaneDrift]) -> String {
     for l in lanes {
         let counted = l.rows.iter().filter(|r| r.state.counted()).count();
         o.push_str(&format!("{}: {} — 확인할 파일 {counted}건 ({})\n", l.lane, word(l.status), l.pack_dir.display()));
+        if let Some(inc) = &l.incomplete {
+            o.push_str(&format!("  {}\n", hooks_incomplete_part(inc)));
+        }
         for r in &l.rows {
             let sh = |h: &Option<String>| h.as_deref().map(cys::pack::short_hash).unwrap_or("-").to_string();
             any_drift |= matches!(r.state, cys::pack::HookState::Drift | cys::pack::HookState::DriftBehind);
@@ -10707,6 +10722,7 @@ fn run_doctor_lanes(json_out: bool) -> i32 {
                     "lane": l.lane,
                     "pack_dir": l.pack_dir.display().to_string(),
                     "status": format!("{:?}", l.status).to_uppercase(),
+                    "incomplete": l.incomplete.as_ref().map(|i| i.describe()),
                     "rows": l.rows.iter().map(|r| json!({"rel": r.rel, "state": r.state.as_str(), "counted": r.state.counted(),
                         "disk": r.disk, "manifest": r.manifest, "vendor": r.vendor})).collect::<Vec<_>>(),
                 })
@@ -41744,14 +41760,43 @@ mod tests {
         });
         let got = rx.recv_timeout(std::time::Duration::from_secs(8));
         if got.is_err() {
+            use std::os::unix::fs::OpenOptionsExt;
             for f in [&extra, &listed] {
-                let _ = std::fs::OpenOptions::new().write(true).open(f); // 막힌 읽기를 풀어 시험 프로세스가 남지 않게 한다
+                // R2-m4: 비블로킹으로 연다 — 읽는 쪽이 있으면 열려 풀어 주고, 없으면 즉시 실패한다(정리가 스스로 멈추지 않는다).
+                let _ = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(f);
             }
         }
         let (status, detail, _n) = got.expect("doctor/--lanes 가 FIFO 에서 8초 안에 끝나지 않았다(블로킹 읽기)");
         assert_eq!(status, DiagStatus::Warn, "{detail}");
         assert_ne!(status, DiagStatus::Fail);
         assert!(detail.contains("hooks/local.pipe") && detail.contains("hooks/listed.pipe"), "{detail}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R2-m2: hooks/ 순회가 상한에 닿으면 doctor 와 --lanes 는 '깨끗함(OK)'이 아니라 WARN 과 사유를 낸다(대조군은 OK).
+    #[test]
+    fn f10_r2m2_incomplete_hooks_scan_is_warn_with_reason_never_ok() {
+        let _lock = DOCTOR_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (ctx, base) = f10_ctx("f10-r2m2");
+        let (a, ah, _, _) = f10_two_embedded_hooks();
+        let body = cys::pack::PACK_ALL.iter().find(|(r, _)| *r == a).unwrap().1;
+        std::fs::write(ctx.pack_dir.join(&a), body).unwrap();
+        f10_write_manifest(&ctx, &json!({ a.clone(): ah.clone() }));
+        // 대조군: 완전한 순회 → OK.
+        let ctl = diag_pack_drift(&ctx);
+        assert_eq!(ctl.status, DiagStatus::Ok, "{}", ctl.detail);
+        assert!(!ctl.detail.contains("순회 불완전"));
+        // 디렉터리만 4096+ 개 — 파일 셈만으로는 상한에 닿지 않는 나무.
+        for i in 0..4100 {
+            std::fs::create_dir(ctx.pack_dir.join("hooks").join(format!("w{i}"))).unwrap();
+        }
+        let item = diag_pack_drift(&ctx);
+        assert_eq!(item.status, DiagStatus::Warn, "{}", item.detail);
+        assert!(item.detail.contains("순회 불완전") && item.detail.contains("항목 수 상한"), "{}", item.detail);
+        let lanes = lanes_report(&base, &cys::pack::vendor_hook_hashes());
+        let l = lanes.iter().find(|l| l.pack_dir == ctx.pack_dir).expect("레인");
+        assert_eq!(l.status, DiagStatus::Warn);
+        assert!(render_lanes_text(&lanes).contains("순회 불완전"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

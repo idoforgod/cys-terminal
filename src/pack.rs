@@ -2247,32 +2247,106 @@ pub fn read_pack_text_bounded(p: &Path) -> std::io::Result<String> {
     if m.len() > HOOKS_READ_CAP {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "크기 상한 초과"));
     }
-    let mut text = String::new();
-    f.take(HOOKS_READ_CAP).read_to_string(&mut text)?;
-    Ok(text)
+    read_capped_utf8(f, HOOKS_READ_CAP)
+}
+
+/// ★F10 R2-m3: 상한 + 1 바이트까지 읽어 넘치면 거부한다 — stat 뒤에 파일이 자라도 앞부분(상한까지)만 해시한 '성공'이 나오지 않는다.
+fn read_capped_utf8<R: std::io::Read>(r: R, cap: u64) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    r.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "크기 상한 초과(읽는 동안 커졌다)"));
+    }
+    String::from_utf8(bytes).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))
+}
+
+/// ★F10 R2-m2: 순회가 끝까지 가지 못한 사유(보고는 이것을 '깨끗함'으로 읽지 않는다 — 진단은 WARN).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HooksIncomplete {
+    /// 깊이 상한(`HOOKS_WALK_MAX_DEPTH`)에서 멈춘 디렉터리 수.
+    pub depth_cut: usize,
+    /// 방문 항목(파일 + 디렉터리) 수 상한(`HOOKS_WALK_MAX_ENTRIES`)에 닿아 멈췄는가.
+    pub entries_cut: bool,
+    /// 열 수 없던 디렉터리 수(최상위 `hooks/` 가 없는 경우는 세지 않는다 — 설치된 적 없는 팩).
+    pub unreadable_dirs: usize,
+}
+
+impl HooksIncomplete {
+    fn is_empty(&self) -> bool {
+        self.depth_cut == 0 && !self.entries_cut && self.unreadable_dirs == 0
+    }
+    /// 한 줄 사유.
+    pub fn describe(&self) -> String {
+        let mut v = Vec::new();
+        if self.depth_cut > 0 {
+            v.push(format!("깊이 상한({}) 초과 폴더 {}개", HOOKS_WALK_MAX_DEPTH, self.depth_cut));
+        }
+        if self.entries_cut {
+            v.push(format!("항목 수 상한({}) 도달", HOOKS_WALK_MAX_ENTRIES));
+        }
+        if self.unreadable_dirs > 0 {
+            v.push(format!("열 수 없는 폴더 {}개", self.unreadable_dirs));
+        }
+        v.join(" · ")
+    }
 }
 
 fn walk_hooks_dir(dir: &Path, base: &Path, out: &mut Vec<String>) {
-    walk_hooks_dir_bounded(dir, base, out, 0);
+    let _ = walk_hooks_dir_checked(dir, base, out);
 }
 
-fn walk_hooks_dir_bounded(dir: &Path, base: &Path, out: &mut Vec<String>, depth: usize) {
+/// 순회 + 불완전 결과. 방문 수는 파일뿐 아니라 **디렉터리도** 센다(디렉터리만 있는 넓은 나무가 상한을 우회하지 못하게).
+fn walk_hooks_dir_checked(dir: &Path, base: &Path, out: &mut Vec<String>) -> Option<HooksIncomplete> {
+    let mut inc = HooksIncomplete { depth_cut: 0, entries_cut: false, unreadable_dirs: 0 };
+    let mut visited = 0usize;
+    walk_hooks_dir_bounded(dir, base, out, 0, &mut visited, &mut inc, true);
+    (!inc.is_empty()).then_some(inc)
+}
+
+fn walk_hooks_dir_bounded(
+    dir: &Path,
+    base: &Path,
+    out: &mut Vec<String>,
+    depth: usize,
+    visited: &mut usize,
+    inc: &mut HooksIncomplete,
+    top: bool,
+) {
     if depth > HOOKS_WALK_MAX_DEPTH {
+        inc.depth_cut += 1;
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for e in rd.flatten() {
-        if out.len() >= HOOKS_WALK_MAX_ENTRIES {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            if !(top && e.kind() == std::io::ErrorKind::NotFound) {
+                inc.unreadable_dirs += 1;
+            }
             return;
         }
+    };
+    for e in rd.flatten() {
+        if *visited >= HOOKS_WALK_MAX_ENTRIES {
+            inc.entries_cut = true;
+            return;
+        }
+        *visited += 1;
         let p = e.path();
         // 디렉터리 심링크는 따라가지 않는다(file_type 은 따라가지 않는다) — 순환 · 팩 밖으로의 이탈 없음. 나머지는 항목으로 올려 분류에 맡긴다.
         if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            walk_hooks_dir_bounded(&p, base, out, depth + 1);
+            walk_hooks_dir_bounded(&p, base, out, depth + 1, visited, inc, false);
         } else if let Ok(rel) = p.strip_prefix(base) {
             out.push(normalize_manifest_key(&rel.to_string_lossy()));
         }
     }
+}
+
+/// `hooks_report_scan` 의 결과 — 행과, 순회가 끝까지 가지 못했는가.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HooksScan {
+    pub rows: Vec<HookRow>,
+    pub incomplete: Option<HooksIncomplete>,
 }
 
 /// 읽기 전용 수집: `pack_dir/hooks/` 아래를 매니페스트 · vendor 와 대조해 `same` 이 아닌 행만 돌려준다(정렬).
@@ -2282,6 +2356,15 @@ pub fn hooks_report(
     manifest: &std::collections::BTreeMap<String, String>,
     vendor: &std::collections::BTreeMap<String, String>,
 ) -> Vec<HookRow> {
+    hooks_report_scan(pack_dir, manifest, vendor).rows
+}
+
+/// `hooks_report` 와 같되 순회가 끝까지 갔는지도 알려 준다(R2-m2) — 진단(doctor)은 이쪽을 쓴다.
+pub fn hooks_report_scan(
+    pack_dir: &Path,
+    manifest: &std::collections::BTreeMap<String, String>,
+    vendor: &std::collections::BTreeMap<String, String>,
+) -> HooksScan {
     let mut rels: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let man: std::collections::BTreeMap<String, &String> = manifest
         .iter()
@@ -2291,7 +2374,7 @@ pub fn hooks_report(
     rels.extend(man.keys().cloned());
     // vendor 에만 있고 매니페스트에도 디스크에도 없는 파일은 보고하지 않는다(아직 설치된 적 없음 — 다음 설치가 들여온다).
     let mut on_disk = Vec::new();
-    walk_hooks_dir(&pack_dir.join("hooks"), pack_dir, &mut on_disk);
+    let incomplete = walk_hooks_dir_checked(&pack_dir.join("hooks"), pack_dir, &mut on_disk);
     rels.extend(on_disk);
     let mut rows = Vec::new();
     for rel in rels {
@@ -2315,7 +2398,7 @@ pub fn hooks_report(
             vendor: v.map(str::to_string),
         });
     }
-    rows
+    HooksScan { rows, incomplete }
 }
 
 /// ★F10 C3 — 안내 문장의 **단일 출처**. 이 상수를 `cys doctor` 의 `hooks/` drift 행 아래와 `cys pack-ownership <hooks/…>` 가 찍는다.
@@ -10479,6 +10562,62 @@ mod tests {
         assert!(!HOOKS_LOCAL_GUIDANCE.contains("pack-drift"), "만들지 않은 명령을 약속하지 않는다");
         assert!(!vendor_hook_hashes().is_empty(), "임베드 팩에 hooks/ 가 있다");
     }
+    // ── F10 R2 minors (리뷰 2회차): r2-m2 불완전 순회 · r2-m3 읽는 동안 자란 파일 ──
+    #[test]
+    fn f10_r2m3_a_file_that_grows_past_the_cap_while_being_read_is_rejected_not_hashed_as_a_prefix() {
+        // 정확히 상한: 통과. 상한 + 1: 거부(앞 상한 바이트만 해시한 '성공'이 아니다).
+        let at_cap = vec![b'a'; 16];
+        assert_eq!(read_capped_utf8(&at_cap[..], 16).unwrap().len(), 16);
+        let over = vec![b'a'; 17];
+        let e = read_capped_utf8(&over[..], 16).expect_err("상한 + 1 바이트는 거부");
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        // 비 UTF-8 은 종전처럼 오류.
+        assert!(read_capped_utf8(&[0xffu8, 0xfe][..], 16).is_err());
+    }
+
+    #[test]
+    fn f10_r2m2_depth_cut_entry_cut_and_wide_directory_trees_are_reported_incomplete_never_clean() {
+        let root = std::env::temp_dir().join(format!("cys-f10-r2m2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // 대조군: 얕고 작은 나무는 불완전이 아니다.
+        let ctl = root.join("ctl");
+        std::fs::create_dir_all(ctl.join("hooks/sub")).unwrap();
+        std::fs::write(ctl.join("hooks/a.sh"), b"a").unwrap();
+        std::fs::write(ctl.join("hooks/sub/b.sh"), b"b").unwrap();
+        let mut out = Vec::new();
+        assert_eq!(walk_hooks_dir_checked(&ctl.join("hooks"), &ctl, &mut out), None, "대조군은 완전");
+        assert_eq!(out.len(), 2);
+        // 팩에 hooks/ 자체가 없는 경우도 불완전이 아니다(설치된 적 없음).
+        let mut out = Vec::new();
+        assert_eq!(walk_hooks_dir_checked(&root.join("nope/hooks"), &root.join("nope"), &mut out), None);
+        // 깊이 상한: 상한보다 깊은 폴더.
+        let deep = root.join("deep");
+        let mut d = deep.join("hooks");
+        for i in 0..(HOOKS_WALK_MAX_DEPTH + 3) {
+            d = d.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("x.sh"), b"x").unwrap();
+        let mut out = Vec::new();
+        let inc = walk_hooks_dir_checked(&deep.join("hooks"), &deep, &mut out).expect("깊이 초과는 불완전");
+        assert!(inc.depth_cut >= 1 && !inc.entries_cut, "{inc:?}");
+        // 항목 수 상한: 디렉터리만으로도 센다(파일 0개).
+        let wide = root.join("wide");
+        std::fs::create_dir_all(wide.join("hooks")).unwrap();
+        for i in 0..(HOOKS_WALK_MAX_ENTRIES + 5) {
+            std::fs::create_dir(wide.join("hooks").join(format!("e{i}"))).unwrap();
+        }
+        let mut out = Vec::new();
+        let inc = walk_hooks_dir_checked(&wide.join("hooks"), &wide, &mut out).expect("디렉터리만 많아도 불완전");
+        assert!(inc.entries_cut, "{inc:?}");
+        assert!(out.is_empty(), "파일은 하나도 없다 — 종전 셈(파일만)이면 상한에 닿지 않았다");
+        // 보고 단계로 전파된다.
+        let scan = hooks_report_scan(&wide, &std::collections::BTreeMap::new(), &std::collections::BTreeMap::new());
+        assert!(scan.incomplete.as_ref().is_some_and(|i| i.entries_cut));
+        assert!(scan.incomplete.unwrap().describe().contains("항목 수 상한"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ── F10 M2 (리뷰 1회차): hooks/ 아래 비정규 파일(FIFO) · 심링크가 보고를 멈추게 하면 안 된다 ──
     #[cfg(unix)]
     fn f10_bounded<T: Send + 'static>(secs: u64, f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
@@ -10505,7 +10644,7 @@ mod tests {
     impl NonBlockOpen for std::fs::OpenOptions {
         fn custom_flags_nonblock(&mut self) -> &mut Self {
             use std::os::unix::fs::OpenOptionsExt;
-            self.custom_flags(0x4) // O_NONBLOCK (macOS/Linux 0x4/0x800): 읽는 쪽이 대기 중이면 열려서 풀어 준다
+            self.custom_flags(libc::O_NONBLOCK) // 플랫폼 상수(macOS 0x4 · Linux 0x800): 읽는 쪽이 대기 중이면 열려서 풀어 준다
         }
     }
 
