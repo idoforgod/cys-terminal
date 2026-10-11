@@ -1,0 +1,22 @@
+# DIAGNOSTIC (non-release ref) — T-50-7 S2-23. Reads the status of ONE notarization submission. Builds, signs, uploads and releases nothing.
+name: diag-notary-orphan-read
+
+on:
+  push:
+    branches: ['diag/notary-orphan-read-v0.14.50']
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: macos-latest
+    timeout-minutes: 5
+    steps:
+      - name: DIAGNOSTIC (non-release ref) - read orphan submission status
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool info 51922496-32b9-4e29-a957-0214f06b92a5 --apple-id "$APPLE_ID" --password "$APPLE_PASSWORD" --team-id "$APPLE_TEAM_ID"
