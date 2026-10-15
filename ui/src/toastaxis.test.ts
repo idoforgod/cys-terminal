@@ -6,9 +6,12 @@
 //
 // 이 파일이 지키는 것:
 //   T-1  이벤트 전수(2-B 13분기 + category×name 퍼즈) 에서 #toasts 자식 0 · OS 배너 0 · 알람 이력 0 · Feed 화면 전환 0  (+ 양성 대조: quiet=false 와 직접 호출은 그대로 보인다)
+//        ※ 예외는 하나: `--wait` 대기 항목(wait===true ∧ auto_route!==true)의 feed.item.created 가 내는 OS 배너 1면 — 아래 AT-19/AT-20 이 따로 지킨다.
 //   AT-10 같은 이벤트들이 부르는 비표시 부작용(refreshSidebarStatus·refreshFeed·upsertTaskCell·removeDeadPane·마우스 소등 정합기)이 기대표대로 보존
-//   출처 핀  onDaemonEvent 본문에 toast/stickyToast/osBanner/openFeed 직접 호출 0 · toast/sticky/osBanner 본문에 통짜 가드 0
-//   커버리지  소스의 alertsQuiet("<sink>") 개수 == EXPECTED_GUARDS · 런마다 선언 출력
+//   R2   AT-19  `--wait` 요청자 대기 항목에는 stalled 가 닿지 않는다(그 스캔은 kind==approval ∧ 데몬 발행 id 만 · feed.push 는 일반 id 만 만든다) — 소스를 읽어 단언
+//        AT-20  producer(handlers.rs)가 실제로 내는 feed.item.created 모양으로 소비자(onDaemonEvent)까지: 배너 정확히 1 · 토스트 0 · 전환 0 + 양성 대조(auto_route 항목 0 · approval.request 0)
+//   출처 핀  onDaemonEvent 본문의 직접 호출은 **넷뿐**(approval.stalled 의 toast/osBanner/openFeed 3 + feed.item.created 의 osBanner 1) · approval.request 는 직접 호출 0 · toast/sticky/osBanner 본문에 통짜 가드 0
+//   커버리지  소스의 alertsQuiet("<sink>") 개수 == EXPECTED_GUARDS · 런마다 선언 출력(채널 13 = UI 가드 11 + 경로 덮임 1 + CLI 군 1)
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
@@ -20,6 +23,7 @@ import {
   alertsQuiet,
   coverageDeclaration,
 } from "./alertquiet";
+import { FEED_TOAST_APPROVAL_TITLE, feedCreatedToastTitle } from "./feedclass";
 import { bodyPrint, fingerprint, findAnchor, normLine } from "./siteprint";
 
 const SRC = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
@@ -169,7 +173,7 @@ function build(opts: { quiet: boolean; ccOpen?: boolean; slugs?: Record<string, 
     isPermissionGranted: getSpy("isPermissionGranted", () => Promise.resolve(true)),
     requestPermission: getSpy("requestPermission", () => Promise.resolve("granted")),
     sendNotification: getSpy("sendNotification"),
-    feedCreatedToastTitle: (k: unknown) => `feed:${String(k)}`,
+    feedCreatedToastTitle, // 실물(feedclass.ts) — 배너 제목을 스텁이 아니라 실제 분류로 단언한다
     paneKey: (sid: number, sock: unknown) => `${String(sock)}:${sid}`,
     isClosingSid: () => false,
     formatAlarmTime: () => "t",
@@ -201,8 +205,9 @@ function build(opts: { quiet: boolean; ccOpen?: boolean; slugs?: Record<string, 
       return true;
     },
   });
+  // ★MINOR-2(codex R1): 예전에는 여기서 `const stickyToasts = new Map();` 을 한 번 더 선언해 store.stickyToasts 를 가렸고, 반환한 맵은 아무도 쓰지 않는 것이라
+  //   「sticky 맵 0」 단언이 sticky 토스트가 떠 있어도 초록이었다. 이제 선언하지 않는다 — 추출된 함수의 `stickyToasts` 는 프록시를 거쳐 store 의 **그 맵**에 닿는다.
   const src =
-    "const stickyToasts = new Map();\n" +
     names.map((n) => transpiler.transformSync(extractFn(n))).join("\n") +
     `\n__out(${JSON.stringify(names)}.reduce((o,n)=>{o[n]=eval(n);return o;},{}));`;
   const run = new Function("__sb", `with(__sb){ ${src} }`);
@@ -247,9 +252,14 @@ const EVENTS: { id: string; ev: Record<string, unknown>; expect: string[] }[] = 
 /** 부서장 판정 R5: approval.stalled 세 표면(박스·OS 배너·Feed 전환)은 보류 = 복원이라 quiet 에서도 뜬다(아래 남김 단언). */
 const KEPT_IDS = ["approval.stalled"];
 const SIDE_EFFECTS = ["refreshSidebarStatus", "refreshFeed", "upsertTaskCell", "removeDeadPane"];
-/** OS 배너 한 면이 거치는 호출 이름(sendNotification 과 그 권한 확인) — approval.request 에서만 남는다(R6 C-R2). */
+/** OS 배너 한 면이 거치는 호출 이름(sendNotification 과 그 권한 확인) — `--wait` 대기 항목(waitBannerEvent)의 feed.item.created 에서만 남는다(R2 · AT-20 이 정확한 호출 수를 단언). */
 const BANNER_CALLS = ["sendNotification", "isPermissionGranted", "requestPermission"];
 const SINK_CALLS = ["sendNotification", "isPermissionGranted", "requestPermission", "pushAlarm", "openFeed", "scheduleFeedSwitchIfStillPending"];
+/** 배너가 남는 유일한 모집단 술어 — 기계 라우트가 없는 `--wait` 대기 항목. T-1 의 예외도, AT-20 의 기대값도 이 한 함수에서 나온다(두 곳이 따로 늙지 않게). */
+function waitBannerEvent(ev: Record<string, unknown>): boolean {
+  const p = (ev.payload ?? {}) as Record<string, unknown>;
+  return ev.name === "feed.item.created" && p.wait === true && p.auto_route !== true;
+}
 
 function sideEffectList(sb: Sandbox): string[] {
   const out: string[] = [];
@@ -264,9 +274,9 @@ describe("TOAST 축 T-1 — 데몬 이벤트가 밀어 올린 사람 싱크 0", 
       sb.fn.onDaemonEvent(c.ev);
       await flush();
       expect(sb.toasts.children.length).toBe(0);
-      // R6 C-R2: approval.request 의 OS 배너 한 면은 남긴다(방향 뒤집힘 · AT-20 이 호출 수와 문면을 단언). 나머지 싱크는 여전히 0.
-      for (const n of SINK_CALLS.filter((x) => !(c.id === "approval.request" && BANNER_CALLS.includes(x)))) expect([n, sb.calls[n]?.length ?? 0]).toEqual([n, 0]);
-      expect(sb.stickyMap.size).toBe(0);
+      // R2: `--wait` 대기 항목(waitBannerEvent)의 OS 배너 한 면만 남는다(AT-20 이 호출 수와 문면을 단언). 그 밖의 모든 이벤트·싱크는 0 — approval.request 도 0(R6 의 직접 배너는 되돌렸다).
+      for (const n of SINK_CALLS.filter((x) => !(waitBannerEvent(c.ev) && BANNER_CALLS.includes(x)))) expect([n, sb.calls[n]?.length ?? 0]).toEqual([n, 0]);
+      expect(sb.stickyMap.size).toBe(0); // MINOR-2: 이제 실제 레지스트리를 본다 — 양성 대조는 아래 「sticky 레지스트리」 시험
     });
   }
 
@@ -280,7 +290,7 @@ describe("TOAST 축 T-1 — 데몬 이벤트가 밀어 올린 사람 싱크 0", 
         sb.fn.onDaemonEvent({ name, category, surface_id: 3, payload: { kind: "k", title: "t", context_pct: 95 } });
         await flush();
         expect(`${category}/${name}:${sb.toasts.children.length}`).toBe(`${category}/${name}:0`);
-        for (const s of SINK_CALLS.filter((x) => !(name === "approval.request" && BANNER_CALLS.includes(x)))) expect(`${category}/${name}:${s}:${sb.calls[s]?.length ?? 0}`).toBe(`${category}/${name}:${s}:0`);
+        for (const s of SINK_CALLS) expect(`${category}/${name}:${s}:${sb.calls[s]?.length ?? 0}`).toBe(`${category}/${name}:${s}:0`); // 퍼즈 payload 에는 wait 가 없다 — 배너 예외도 없다(R2)
         n++;
       }
     expect(n).toBe(cats.length * names.length);
@@ -396,6 +406,20 @@ describe("TOAST 축 — 가드 싱크(함수 실행)", () => {
     sb.fn.stickyToast("safe-mode", "health", "안전모드 — 설치 위치를 옮겨 주세요", "g");
     expect(sb.toasts.children.length).toBe(2);
     expect(sb.calls.pushAlarm?.length ?? 0).toBe(2);
+    expect(sb.stickyMap.size).toBe(2); // MINOR-2: 추출된 stickyToast 가 쓰는 **그 레지스트리**에 두 id 가 실제로 선다(0 에 고정된 헛맵이 아니다)
+  });
+
+  test("sticky 레지스트리(MINOR-2) — master.idle: quiet 면 레지스트리 0·박스 0·알람 0 / 가드를 풀면 레지스트리 1·박스 1·알람 1(양성 대조: 이 맵 단언이 0 이 아닌 값을 볼 수 있다)", async () => {
+    const ev = EVENTS.find((e) => e.id === "master.idle")!.ev;
+    const q = build({ quiet: true });
+    q.fn.onDaemonEvent(ev);
+    await flush();
+    expect([q.stickyMap.size, q.toasts.children.length, q.calls.pushAlarm?.length ?? 0]).toEqual([0, 0, 0]);
+    const l = build({ quiet: false });
+    l.fn.onDaemonEvent(ev);
+    await flush();
+    expect([l.stickyMap.size, l.toasts.children.length, l.calls.pushAlarm?.length ?? 0]).toEqual([1, 1, 1]);
+    expect([...l.stickyMap.keys()]).toEqual(["master-idle:base:master"]); // 데몬 이벤트가 만든 id — role별 안정 id(데몬 출처 sticky 는 이 하나뿐)
   });
 
   test("updatePendingBadges — quiet 에서 배지 요소를 건드리지 않고, 가드가 풀리면 건드린다(양성 대조)", () => {
@@ -412,44 +436,135 @@ describe("TOAST 축 — 가드 싱크(함수 실행)", () => {
   });
 });
 
-describe("TOAST 축 R6 C-R2 — approval.request 의 OS 배너 한 면 복원 (AT-19 수 · AT-20 배너)", () => {
-  // AT-19: 복원 근거인 두 수를 **손으로 나르지 않고** Rust 소스에서 읽어 단언한다(생산 구역 한정 + 히트 수 1).
-  const CYS_RS = readFileSync(new URL("../../src/bin/cys.rs", import.meta.url), "utf8");
-  const GOV_RS = readFileSync(new URL("../../src/bin/cysd/governance.rs", import.meta.url), "utf8");
-  const reqHits = [...CYS_RS.matchAll(/wait: bool,\s*\n\s*#\[arg\(long, default_value_t = (\d+)\)\]\s*\n\s*timeout_secs: u64,/g)];
-  const stallHits = [...GOV_RS.matchAll(/env_u64\("CYS_APPROVAL_STALL_SECS", (\d+)\)/g)];
+describe("TOAST 축 R2 — `--wait` 대기 항목의 생성 시점 배너 1면 (AT-19 근거 · AT-20 producer→consumer)", () => {
+  // 배경(codex R1 MAJOR-1 · 부서장 결정 2026-10-15T21:26 ④): 이전 판(R6)은 `approval.request`(pane 화면 패턴이 올린 승인)에 배너를 붙였다. 그러나 `cys feed push --wait` 요청자의
+  //   대기 항목은 **다른 이벤트**(feed.item.created)로 오고, stalled 는 그 항목을 세지 않는다 — 측정한 모집단과 구제한 모집단이 달랐다(범주 오류). AT-19 가 그 두 사실을 소스에서 읽고,
+  //   AT-20 이 producer 가 실제로 내는 모양을 소비자까지 흘린다.
+  const read = (rel: string) => readFileSync(new URL(rel, import.meta.url), "utf8");
+  const CYS_RS = read("../../src/bin/cys.rs");
+  const GOV_RS = read("../../src/bin/cysd/governance.rs");
+  const HDL_RS = read("../../src/bin/cysd/handlers.rs");
+  const STATE_RS = read("../../src/bin/cysd/state.rs");
+  /** 히트를 파일 전체에서 센다 — 시험 모듈에 숨은 같은 모양의 문장은 **개수를 바꿔** 적색이 된다(정확한 개수 단언 · fail-closed). */
+  const hits = (src: string, re: RegExp): RegExpMatchArray[] => [...src.matchAll(re)];
 
-  test("AT-19 — 요청자 기본·stalled 임계를 소스에서 읽어 120 < 300 · 격차 180 을 단언한다(네트워크 없음)", () => {
-    expect([reqHits.length, stallHits.length]).toEqual([1, 1]); // 동명 상수·시험 구역에 숨은 둘째 히트가 없다
-    const requester = Number(reqHits[0][1]);
-    const stall = Number(stallHits[0][1]);
-    const why = `요청자 기본이 ${requester} 로, stalled 임계가 ${stall} 로 바뀌었다. C-R2(OS 배너 복원)의 근거는 120 < 300 이었다 — 복원을 유지할지 다시 판정하라(TOAST R6 §1).`;
-    expect([why, requester]).toEqual([why, 120]);
-    expect([why, stall]).toEqual([why, 300]);
-    expect(requester).toBeLessThan(stall);
-    expect(stall - requester).toBe(180);
+  test("AT-19 ⑴ 요청자 — `cys feed push --wait` 의 기본 대기 시간은 소스에서 120초다 (히트 정확히 1)", () => {
+    const h = hits(CYS_RS, /wait: bool,\s*\n\s*#\[arg\(long, default_value_t = (\d+)\)\]\s*\n\s*timeout_secs: u64,/g);
+    expect(h.length).toBe(1);
+    const why = `요청자 기본이 ${h[0]?.[1]} 로 바뀌었다. 이 배너의 근거는 120 이라는 수가 아니라 「--wait 항목에 stalled 가 닿지 않는다」(⑵⑶)다 — 그 둘이 아직 참인지 확인하고 이 수를 갱신하라(TOAST R2).`;
+    expect([why, Number(h[0][1])]).toEqual([why, 120]);
   });
 
-  // AT-20: 배너 1회 + 같은 런에서 토스트 0 을 함께 잰다(둘을 같이 재야 「가드 미설치」와 구별된다).
-  const REQ = EVENTS.find((e) => e.id === "approval.request")!.ev;
-  test("AT-20 — approval.request: sendNotification 정확히 1회 · 제목이 「⚠ 승인 대기」로 시작 · 같은 런에서 #toasts 자식 0 · 알람 이력 0", async () => {
+  test("AT-19 ⑵ stalled — 방치 스캔은 `kind == approval ∧ 데몬 발행 id` 항목만 센다: 일반 feed 항목은 대상이 아니다", () => {
+    // 대기 집합과 방치 집합, 두 필터가 같은 세 조건(pending ∧ kind==approval ∧ is_daemon_issued)을 쓴다 → 2. 방치를 내는 쪽만 거기에 나이 조건이 붙는다 → 1.
+    const three = hits(GOV_RS, /i\.status == "pending"\s*&&\s*i\.kind == "approval"\s*&&\s*crate::state::is_daemon_issued\(&i\.request_id\)/g);
+    const aged = hits(GOV_RS, /i\.status == "pending"\s*&&\s*i\.kind == "approval"\s*&&\s*crate::state::is_daemon_issued\(&i\.request_id\)\s*&&\s*now - i\.created_at >= stall as f64/g);
+    expect([three.length, aged.length]).toEqual([2, 1]);
+    // 그 스캔이 approval.stalled 를 내는 유일한 생산 자리다(이벤트 이름 → 스캔 연결).
+    expect(hits(GOV_RS, /daemon\.bus\.publish\(\s*"approval\.stalled",/g).length).toBe(1);
+  });
+
+  test("AT-19 ⑶ 일반 id — feed.push 는 `req-…` id 를 만들고 `daemon-` 접두 지정을 거부한다 · is_daemon_issued 는 그 접두 판정이다", () => {
+    expect(hits(HDL_RS, /format!\(\s*"req-\{\}-\{\}-\{\}",/g).length).toBe(1);
+    expect(
+      hits(HDL_RS, /if crate::state::is_daemon_issued\(&request_id\) \{\s*return Reply::Single\(err_response\(\s*&id,\s*"invalid_params",\s*"request_id prefix 'daemon-' is reserved for daemon-issued items",/g).length,
+    ).toBe(1);
+    expect(hits(STATE_RS, /pub const DAEMON_REQ_PREFIX: &str = "daemon-";/g).length).toBe(1);
+    expect(hits(STATE_RS, /pub fn is_daemon_issued\(request_id: &str\) -> bool \{\s*request_id\.starts_with\(DAEMON_REQ_PREFIX\)\s*\}/g).length).toBe(1);
+    // ⑵⑶ ⇒ 일반 `feed push --wait` 항목(id `req-…`)은 stalled 대상이 아니다 → 생성 시점 알림이 그 항목이 사람에게 닿는 **유일한** 경로다.
+  });
+
+  // ---- AT-20: producer 가 실제로 내는 모양을 소비자(onDaemonEvent)까지 ----
+  const PUB = hits(HDL_RS, /daemon\.bus\.publish\(\s*"feed\.item\.created",\s*"(\w+)",\s*surface_id,\s*json!\(\{([\s\S]*?)\}\),\s*\);/g);
+  const PUBLISHED_KEYS: string[] = PUB.length ? [...PUB[0][2].matchAll(/"(\w+)":/g)].map((m) => m[1]).sort() : [];
+  const PUB_CATEGORY = PUB[0]?.[1] ?? "";
+  test("AT-20 전제 — producer 의 feed.item.created 발행은 소스에 정확히 한 자리이고 category 는 `feed`, 페이로드 키 여덟이 `wait`·`auto_route` 를 싣는다", () => {
+    expect(PUB.length).toBe(1);
+    expect(PUB[0][1]).toBe("feed");
+    expect(PUBLISHED_KEYS).toEqual(["auto_route", "body", "kind", "request_id", "risk_class", "tier", "title", "wait"]);
+  });
+
+  /** producer 모양 그대로의 이벤트 — 키 집합이 handlers.rs 의 json! 과 다르면(키 추가·개명) 여기서 적색이라, 시험이 소비자만 보는 합성 입력으로 초록이 되지 않는다. */
+  function published(over: Record<string, unknown> = {}, drop: string[] = []): Record<string, unknown> {
+    const payload: Record<string, unknown> = {
+      request_id: "req-4242-1760000000-0", // 일반 id: feed.push 가 만드는 `req-<pid>-<epoch>-<n>` (AT-19 ⑶)
+      kind: "approval",
+      title: "Bash 실행을 허용할까요?",
+      body: "rm -rf ./tmp",
+      wait: true,
+      tier: "d",
+      risk_class: "high",
+      auto_route: false,
+      ...over,
+    };
+    for (const k of drop) delete payload[k];
+    expect(Object.keys(payload).sort()).toEqual(PUBLISHED_KEYS.filter((k) => !drop.includes(k)));
+    expect(/^req-\d+-\d+-\d+$/.test(String(payload.request_id)) && !String(payload.request_id).startsWith("daemon-")).toBe(true);
+    return { name: "feed.item.created", category: PUB_CATEGORY, surface_id: 3, socket_slug: "dept-5", payload };
+  }
+
+  test("AT-20 — producer 모양(wait=true · auto_route=false · 일반 id)의 feed.item.created: OS 배너 정확히 1 · 제목=승인 요청 분류 · 본문=항목 제목 · 같은 런에서 토스트 0·알람 0·Feed 전환(예약 포함) 0", async () => {
     const sb = build({ quiet: true });
-    sb.fn.onDaemonEvent(REQ);
+    sb.fn.onDaemonEvent(published());
     await flush();
     const sent = sb.calls.sendNotification ?? [];
     expect(sent.length).toBe(1);
-    expect(String((sent[0][0] as { title?: string }).title).startsWith("⚠ 승인 대기")).toBe(true);
+    expect(sent[0][0]).toEqual({ title: FEED_TOAST_APPROVAL_TITLE, body: "Bash 실행을 허용할까요?" });
     expect(sb.toasts.children.length).toBe(0); // 토스트는 꺼진 채(오너가 지목한 우하단 박스)
     expect(sb.calls.pushAlarm?.length ?? 0).toBe(0);
     expect(sb.calls.openFeed?.length ?? 0).toBe(0);
+    expect(sb.calls.scheduleFeedSwitchIfStillPending?.length ?? 0).toBe(0); // 자동 Feed 전환 예약도 꺼진 채
+    expect(sb.stickyMap.size).toBe(0);
+    expect(sideEffectList(sb)).toEqual(["refreshFeed", "refreshSidebarStatus"]); // 비표시 부작용은 그대로(AT-10)
   });
 
-  test("AT-20 대조 — 같은 배너가 가드를 지나 억제되면(래퍼 경유) 0회: 시험이 '안 뜸'을 볼 수 있다(양성 대조)", async () => {
-    // 다른 이벤트(context.threshold ≥80)의 배너는 래퍼 경유라 quiet 에서 0 — 같은 하네스가 0 과 1 을 구별한다.
+  test("AT-20 양성 대조 1 — auto_route=true 항목(기계 라우트가 있는 쪽)은 같은 런에서 배너 0 · 토스트 0 · 전환 0", async () => {
     const sb = build({ quiet: true });
-    sb.fn.onDaemonEvent({ name: "context.threshold", category: "context", payload: { context_pct: 91, threshold: 80, role: "master", action: "cycle" } });
+    sb.fn.onDaemonEvent(published({ auto_route: true }));
     await flush();
-    expect(sb.calls.sendNotification?.length ?? 0).toBe(0);
+    expect([sb.calls.sendNotification?.length ?? 0, sb.toasts.children.length, sb.calls.scheduleFeedSwitchIfStillPending?.length ?? 0, sb.calls.openFeed?.length ?? 0]).toEqual([0, 0, 0, 0]);
+  });
+
+  test("AT-20 양성 대조 2 — approval.request(R6 에서 배너를 붙였던 이벤트)는 되돌렸으므로 배너 0 · 토스트 0", async () => {
+    const sb = build({ quiet: true });
+    sb.fn.onDaemonEvent(EVENTS.find((e) => e.id === "approval.request")!.ev);
+    await flush();
+    expect([sb.calls.sendNotification?.length ?? 0, sb.calls.isPermissionGranted?.length ?? 0, sb.toasts.children.length, sb.calls.pushAlarm?.length ?? 0]).toEqual([0, 0, 0, 0]);
+  });
+
+  test("AT-20 판별 행렬 — wait × auto_route × kind 전 조합: 배너 수 == (wait===true ∧ auto_route!==true ? 1 : 0), 토스트·전환·알람은 언제나 0", async () => {
+    let n = 0;
+    for (const wait of [true, false])
+      for (const auto_route of [true, false])
+        for (const kind of ["approval", "team-create-request", "formation-failed", "ceo-notice"]) {
+          const ev = published({ wait, auto_route, kind });
+          const sb = build({ quiet: true });
+          sb.fn.onDaemonEvent(ev);
+          await flush();
+          const row = `wait=${wait} auto_route=${auto_route} kind=${kind}`;
+          expect([row, sb.calls.sendNotification?.length ?? 0]).toEqual([row, waitBannerEvent(ev) ? 1 : 0]);
+          expect([row, sb.toasts.children.length, sb.calls.pushAlarm?.length ?? 0, sb.calls.openFeed?.length ?? 0, sb.calls.scheduleFeedSwitchIfStillPending?.length ?? 0]).toEqual([row, 0, 0, 0, 0]);
+          n++;
+        }
+    expect(n).toBe(16);
+  });
+
+  test("AT-20 — auto_route 키가 없는 이전 데몬의 페이로드는 auto_route 아님으로 읽어 배너 1 / 알림 종류(ℹ 알림)도 같은 술어를 따른다(종류로 거르지 않는다)", async () => {
+    const old = build({ quiet: true });
+    old.fn.onDaemonEvent(published({}, ["auto_route"]));
+    await flush();
+    expect(old.calls.sendNotification?.length ?? 0).toBe(1);
+    const notice = build({ quiet: true });
+    notice.fn.onDaemonEvent(published({ kind: "formation-failed", title: "부서 팀 편성 실패" }));
+    await flush();
+    expect(notice.calls.sendNotification?.[0]?.[0]).toEqual({ title: feedCreatedToastTitle("formation-failed"), body: "부서 팀 편성 실패" });
+  });
+
+  test("AT-20 대조(보이는 쪽) — 가드를 푼 같은 이벤트는 토스트 1 · 알람 1 · 전환 예약 1 · 배너 1 이 모두 선다: 시험이 '보이는 것'을 실제로 볼 수 있다", async () => {
+    const sb = build({ quiet: false });
+    sb.fn.onDaemonEvent(published());
+    await flush();
+    expect([sb.toasts.children.length, sb.calls.pushAlarm?.length ?? 0, sb.calls.scheduleFeedSwitchIfStillPending?.length ?? 0, sb.calls.sendNotification?.length ?? 0]).toEqual([1, 1, 1, 1]);
   });
 });
 
@@ -532,20 +647,22 @@ describe("TOAST 축 — R1b 구멍 넷 (자동 전환 · 푸터 · 부서 오류
 });
 
 // ---------------------------------------------------------------------------------------------------------------------------
-// 남긴 자리의 **도달 가능성 지문**(44 적대 리뷰 major1 · 부서장 판정 R3·R5 조건) — 토큰이 아니라 **효과**를 잰다.
-//   · 지문 = 그 문장에 이르는 길(opener 사슬 + 선행 제어 흐름 줄)의 해시(siteprint.ts). 핀 4bad39ca 에서 같은 알고리즘으로 계산한 값을 박아 둔다.
-//     early return · category 비교 가드 · 삼항 · && · 래핑 블록 · 같은 줄 접두 가드 — 어떤 모양이든 그 길이 바뀌면 적색이다.
+// 남긴 자리의 **필터된 소스 줄 표류 탐지**(44 적대 리뷰 major1 · 부서장 판정 R3·R5 조건; codex R1 minor 1 로 보장 범위를 좁혔다).
+//   · 지문 = 그 문장 줄 + 조상 opener 줄 + 같은 들여쓰기(또는 조상) 수준에서 앞서는 제어 키워드/alertsQuiet/category 줄의 해시(siteprint.ts). 핀은 같은 알고리즘으로 계산해 박아 둔다.
+//     early return · category 비교 가드 · 삼항 · && · 래핑 블록 · 같은 줄 접두 가드가 **그 줄들 중 하나로 나타나면** 적색이다.
+//   · ⛔이 시험은 도달 가능성(실행 흐름)을 증명하지 않는다: 더 깊이 들여쓴 앞선 블록 속에 끼워 넣은 `return;` 은 지문이 건너뛰어 **초록으로 남는다**(아래 「알려진 한계」 시험이 그 사각을 못박는다).
+//     실행 흐름 자체는 위 이벤트·싱크 실행 시험(T-1·AT-20 등)이 지킨다.
 //   · 의도된 변경으로 지문이 바뀌면 실패 메시지가 실제 값을 찍는다 — 이 표의 pin 을 다시 계산해 넣는다(변경 이유를 커밋에 적는다).
-//   · kind: daemon-info(상단바 오류 표기) · update(업데이트·팩 적용 고지) · K6(부트·설치본·온보딩 고지)
+//   · kind: daemon-info(상단바 오류 표기) · update(업데이트·팩 적용 고지) · K6(부트·설치본·온보딩 고지) · R2(`--wait` 대기 항목 배너 — 핀은 R2 수리 시점에서 계산, 나머지는 4bad39ca)
 interface KeptSite {
   id: string;
-  kind: "daemon-info" | "update" | "K6" | "R6";
+  kind: "daemon-info" | "update" | "K6" | "R2";
   anchor: string;
   nth: number;
   pin: string;
 }
 const KEPT_SITES: KeptSite[] = [
-  { id: "request-banner", kind: "R6", anchor: "osBanner(\"⚠ 승인 대기\", `${payload.role ?? \"\"} ${payload.surface_ref ?? \"\"} — ${String(payload.excerpt ?? \"\").slice(0, 100)}`);", nth: 0, pin: "055fde3054324a9f" },
+  { id: "feed-wait-banner", kind: "R2", anchor: "if (payload.wait === true && payload.auto_route !== true) osBanner(feedCreatedToastTitle(payload.kind), String(payload.title ?? \"\"));", nth: 0, pin: "095ff275a023d511" },
   { id: "K5-daemon-error", kind: "daemon-info", anchor: "info.textContent = `daemon error: ${e.payload}`;", nth: 0, pin: "1fc56231bf45df6e" },
   { id: "K5-startup-failed", kind: "daemon-info", anchor: "document.getElementById(\"daemon-info\")!.textContent = `startup failed: ${e}`;", nth: 0, pin: "607b4ac9163cc886" },
   { id: "K5-recovery-failed", kind: "daemon-info", anchor: "document.getElementById(\"daemon-info\")!.textContent = `startup failed: ${e} / recovery failed: ${e2}`;", nth: 0, pin: "bd517611b51bc743" },
@@ -592,7 +709,7 @@ const MAIN_LINES = SRC.split("\n");
 
 describe("TOAST 축 — 남긴 자리 지문 (K5·K6·daemon-info 전수 · 업데이트 고지)", () => {
   for (const site of KEPT_SITES) {
-    test(`남김 [${site.kind}] ${site.id} — 그 문장에 이르는 길이 핀(4bad39ca)과 같다`, () => {
+    test(`남김 [${site.kind}] ${site.id} — 그 문장의 필터된 소스 줄(opener 사슬·제어 흐름 줄)이 핀과 같다 (표류 탐지 · 도달 가능성 증명 아님)`, () => {
       const i = findAnchor(MAIN_LINES, site.anchor, site.nth);
       expect([site.id, "앵커 존재", i >= 0]).toEqual([site.id, "앵커 존재", true]);
       const got = fingerprint(MAIN_LINES, i);
@@ -609,11 +726,11 @@ describe("TOAST 축 — 남긴 자리 지문 (K5·K6·daemon-info 전수 · 업�
     for (const l of calls) expect(/daemonStickyToast\(/.test(l)).toBe(false);
   });
 
-  test("싱크 본문 전체 지문 — toast/stickyToast/osBanner/recordAlarm 에 어떤 모양의 조기 반환·가드도 없다(토큰이 아니라 본문 효과)", () => {
+  test("싱크 본문 전체 지문 — toast/stickyToast/osBanner/recordAlarm 의 본문(주석·빈 줄 제외)이 핀과 같다: 조기 반환·가드가 어떤 모양으로 들어와도 본문 줄이 바뀌므로 적색(본문 표류 탐지)", () => {
     for (const n of Object.keys(SINK_BODY_PINS)) expect([n, bodyPrint(extractFn(n))]).toEqual([n, SINK_BODY_PINS[n]]);
   });
 
-  test("지문은 가드의 모양을 가리지 않는다 — category 비교 조기 반환·래핑 블록·같은 줄 접두 가드 모두 지문을 바꾼다(알고리즘 자체의 변별력)", () => {
+  test("지문의 변별력 — category 비교 조기 반환·래핑 블록·같은 줄 접두 가드가 **그 줄들 중 하나로 나타나면** 지문이 바뀐다(알고리즘이 보는 범위 안의 변별력)", () => {
     const base = ["function f() {", "  if (a) {", "    keep();", "  }", "  stickyToast(\"x\");", "}"];
     const fp0 = fingerprint(base, 4);
     const early = ["function f() {", '  if (event.category === "watchdog") return;', "  if (a) {", "    keep();", "  }", "  stickyToast(\"x\");", "}"];
@@ -626,33 +743,53 @@ describe("TOAST 축 — 남긴 자리 지문 (K5·K6·daemon-info 전수 · 업�
     const benign = ["function f() {", "  // 주석", "", "  other();", "  if (a) {", "    keep();", "  }", "  stickyToast(\"x\"); // 꼬리 주석", "}"];
     expect(fingerprint(benign, 7)).toBe(fp0);
   });
+
+  test("알려진 한계(codex R1 minor 1) — 더 깊이 들여쓴 앞선 블록 속에 끼워 넣은 `return;` 은 뒤 자리의 지문을 바꾸지 못한다: 이 지문은 도달 가능성을 증명하지 않는다", () => {
+    // 모형: 안전모드 토스트(앞선 try 안 if 블록) 직후에 `return;` 을 끼우면 뒤의 try 속 자리는 실행되지 못하지만, 그 return 은 뒤 자리보다 깊이 들여쓴 **다른 블록의 속**이라 지문 재료에서 건너뛴다.
+    const base = ["function f() {", "  try {", "    if (g) {", "      first();", "    }", "  } catch {}", "  try {", "    later();", "  } catch {}", "}"];
+    const mutated = ["function f() {", "  try {", "    if (g) {", "      first();", "      return;", "    }", "  } catch {}", "  try {", "    later();", "  } catch {}", "}"];
+    expect(fingerprint(mutated, 8)).toBe(fingerprint(base, 7)); // 같다 = 사각. 이 단언이 적색이 되면 지문이 넓어진 것이니 위 주석과 siteprint.ts 머리말을 함께 갱신하라.
+    // 같은 return 이 **그 자리 자신의 블록**(같은 들여쓰기 수준의 앞 줄)에 있으면 지문이 바뀐다 — 범위 안/밖의 경계.
+    const sameLevel = ["function f() {", "  try {", "    if (g) {", "      first();", "    }", "  } catch {}", "  try {", "    return;", "    later();", "  } catch {}", "}"];
+    expect(fingerprint(sameLevel, 8)).not.toBe(fingerprint(base, 7));
+  });
 });
 
 describe("TOAST 축 — 출처 핀 · 통짜 가드 금지 · 커버리지", () => {
   const body = stripComments(extractFn("onDaemonEvent"));
 
-  test("onDaemonEvent 본문의 직접 호출은 approval.request 의 osBanner 1 + approval.stalled 의 toast/osBanner/openFeed 셋뿐이다(그 밖은 래퍼만)", () => {
+  test("onDaemonEvent 본문의 직접 호출은 넷뿐이다 — approval.stalled 의 toast/osBanner/openFeed 셋 + feed.item.created 의 osBanner 하나 (approval.request 는 0 · 그 밖은 래퍼만)", () => {
     const rq = body.indexOf('name === "approval.request"');
     const st = body.indexOf('name === "approval.stalled"');
     const en = body.indexOf('name === "context.threshold"');
-    expect(rq).toBeGreaterThanOrEqual(0);
-    expect(st).toBeGreaterThan(rq);
-    expect(en).toBeGreaterThan(st);
+    const fi = body.indexOf('name === "feed.item.created"');
+    const fe = body.indexOf('name === "surface.exited"');
+    for (const [k, v] of Object.entries({ rq, st, en, fi, fe })) expect([k, v >= 0]).toEqual([k, true]);
+    expect(rq).toBeLessThan(st);
+    expect(st).toBeLessThan(en);
+    expect(en).toBeLessThan(fi);
+    expect(fi).toBeLessThan(fe);
+    expect(body.indexOf('name === "feed.item.created"', fi + 1)).toBe(-1); // 분기는 한 자리
     const request = body.slice(rq, st);
     const stalled = body.slice(st, en);
-    const rest = body.slice(0, rq) + body.slice(en);
+    const feed = body.slice(fi, fe);
+    const rest = body.slice(0, rq) + body.slice(en, fi) + body.slice(fe);
     const direct = (src: string, n: string) => (src.match(new RegExp(`(?<![A-Za-z0-9_.])${n}\\(`, "g")) ?? []).length;
     for (const n of ["toast", "stickyToast", "osBanner", "openFeed"]) {
-      expect([n, direct(rest, n)]).toEqual([n, 0]);
-      expect([n, direct(stalled, n)]).toEqual([n, n === "stickyToast" ? 0 : 1]);
-      // R6 C-R2: request 블록은 osBanner 한 면만 직접 호출(토스트·배지·유예 전환은 꺼진 채 — 최소성)
-      expect([n, direct(request, n)]).toEqual([n, n === "osBanner" ? 1 : 0]);
+      expect([n, "rest", direct(rest, n)]).toEqual([n, "rest", 0]);
+      expect([n, "stalled", direct(stalled, n)]).toEqual([n, "stalled", n === "stickyToast" ? 0 : 1]);
+      // R2: approval.request 는 직접 호출 0 — R6 의 배너 복원은 범주 오류라 되돌렸다(래퍼 경유 = 꺼짐)
+      expect([n, "request", direct(request, n)]).toEqual([n, "request", 0]);
+      // R2: feed.item.created 분기는 osBanner 한 면만 직접 호출(토스트·배지·유예 전환은 꺼진 채 — 최소성)
+      expect([n, "feed", direct(feed, n)]).toEqual([n, "feed", n === "osBanner" ? 1 : 0]);
     }
+    // 그 한 면의 술어는 정확히 이 문장이다(wait===true ∧ auto_route!==true) — AT-20 판별 행렬이 동작으로, 이 줄이 소스로 못박는다.
+    expect(feed).toContain("if (payload.wait === true && payload.auto_route !== true) osBanner(");
     expect(SRC).not.toContain("function daemonOpenFeed("); // 호출자 0 이 된 죽은 래퍼는 남기지 않는다(실효 0 장치)
     expect(SRC).not.toContain("daemonOpenFeed(");
     expect((body.match(/daemonToast\(/g) ?? []).length).toBe(10);
     expect((body.match(/daemonStickyToast\(/g) ?? []).length).toBe(1);
-    expect((body.match(/daemonOsBanner\(/g) ?? []).length).toBe(3); // approval.request 의 배너는 R6 로 직접 호출 복원 — 래퍼 호출자 4 → 3(래퍼 생존 · EXPECTED_GUARDS.osBanner 1 불변)
+    expect((body.match(/daemonOsBanner\(/g) ?? []).length).toBe(4); // approval.request 의 배너가 래퍼로 돌아와 호출자 4(context.threshold · agent.exited · master.deadman · approval.request)
     // 유예 후 자동 전환 예약은 호출부 인라인 가드(probefail 핀 보존): 가드 줄 + 호출 1
     expect(body).toContain('(payload.wait === true || autoRoute) && !alertsQuiet("feedSwitch")');
     expect((body.match(/(?<![A-Za-z0-9_])scheduleFeedSwitchIfStillPending\(/g) ?? []).length).toBe(1);

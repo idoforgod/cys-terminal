@@ -3261,7 +3261,7 @@ fn read_send_body(
 }
 
 // ★0.14.51 TOAST 축 — 사람이 읽는 **경보 산문**의 stderr 싱크(큐 막힘·데몬 상태 경고)를 끈다(오너 2026-10-15 「전부 보이지 않게」·2026-10-12 「내부 신호는 없애지말라, 내 눈에서 보이지 않게만」).
-//   · 끄는 자리는 문구를 **만드는 함수**(queue_blocked_notice_lines 등 — 다른 소비자·`--json` 경로와 공유될 수 있다)가 아니라 바이트가 stderr 에 **닿는 호출부 3곳**이다(부서장 판정):
+//   · 끄는 자리는 문구를 **만드는 함수**(queue_blocked_notice_lines 등 — 다른 소비자·`--json` 경로와 공유될 수 있다)가 아니라 바이트가 출력에 **닿는 호출부**다. 최초 판정(부서장)은 stderr 세 곳이었고 이후 넷이 더해져 **최종 재고는 아래 7곳**이다 — 최초 세 곳:
 //     `queue_durable_suffix`(durable=false 경고) · `warn_if_daemon_paused`(pause 안내) · `queue list` 의 막힌 좌석 안내 루프. 호출부는 지우지 않고 이 함수를 통한다 — 되돌리는 것은 아래 상수 한 줄이다.
 //   · 호출부 7곳 = stderr 6(위 3 + 유령 계수 처방 2 + 구데몬 --queued 경고 1) + stdout 1(`cys fleet` 도달불가 경고 산문 — fleet_unreachable_to, 머리줄 `■ 부서명` 은 남김). 전수 분해표 = _evidence/dept5-TOAST-impl-20261015/print-census.tsv.
 //   · 남기는 것: `--json` 필드·exit code(stdout/종료 코드 경로는 이 함수를 지나지 않는다) · 명령 오류·사용법·진단 stderr(eprintln! 336건 그대로) · `[approval]` 3건(명령 거부 사유라 경보가 아니다).
@@ -3281,9 +3281,12 @@ fn alert_prose(line: &str) {
 
 /// `cys fleet` 의 도달불가 부서 행(부서장 판정 R1 §1-3 + MAJOR12): 머리줄 `■ 부서명` 은 **데이터 뷰라 남기고**, 「⚠ 도달불가: 사유」 경고 산문만 `alert_prose_to` 로 끈다.
 /// `--json` 경로는 이 함수를 지나지 않는다(error 필드 그대로). 쓰기 대상·quiet 를 주입해 시험한다.
-fn fleet_unreachable_to<W: std::io::Write>(w: &mut W, disp: &str, e: &str, quiet: bool) {
-    let _ = writeln!(w, "\n■ {disp}");
+/// ★머리줄 쓰기 오류는 **돌려준다**(codex R1 minor 3): 기준선은 `println!` 이라 stdout 이 닫힌 파이프면 패닉(`failed printing to stdout`)했는데, 이 함수가 오류를 삼키면 같은 상황이 조용한 exit 0 이 된다.
+/// 호출부가 기준선과 같은 패닉으로 이어 받는다. 경고 산문 쪽은 `alert_prose_to` 의 best-effort 그대로다(출하값은 quiet 라 쓰지 않는다).
+fn fleet_unreachable_to<W: std::io::Write>(w: &mut W, disp: &str, e: &str, quiet: bool) -> std::io::Result<()> {
+    writeln!(w, "\n■ {disp}")?;
     alert_prose_to(w, &format!("   ⚠ 도달불가: {e}"), quiet);
+    Ok(())
 }
 
 /// ★B3 보조 — 큐 전환 직후 데몬이 pause 중이면 한 줄 경고한다.
@@ -20153,7 +20156,10 @@ fn run_fleet(as_json: bool) -> i32 {
     for d in &out {
         let disp = d["department"].as_str().unwrap_or("");
         if let Some(e) = d["error"].as_str() {
-            fleet_unreachable_to(&mut std::io::stdout(), disp, e, ALERT_PROSE_QUIET);
+            // 머리줄 쓰기 실패(닫힌 파이프 등)는 기준선의 `println!` 과 같은 패닉으로 잇는다 — 조용한 exit 0 이 되지 않게(위 함수 주석).
+            if let Err(werr) = fleet_unreachable_to(&mut std::io::stdout(), disp, e, ALERT_PROSE_QUIET) {
+                panic!("failed printing to stdout: {werr}");
+            }
             continue;
         }
         let surfaces = d["surfaces"].as_array().cloned().unwrap_or_default();
@@ -42627,7 +42633,7 @@ mod usage_accounts_line_tests {
     }
 }
 
-/// ★0.14.51 TOAST 축 — CLI 경보 산문 싱크(stderr 3 + stdout 1)가 꺼졌고, 끈 자리가 정확히 그 넷뿐임을 못박는다.
+/// ★0.14.51 TOAST 축 — CLI 경보 산문 싱크 호출부 7곳(stderr 6 + stdout 1)이 꺼졌음을, 그리고 쓰기 대상을 주입한 단위로 「quiet 면 0바이트 · 양성 대조는 쓴다 · 머리줄 쓰기 오류는 전파」를 못박는다.
 /// 전수 분해표(print 매크로 전체의 5갈래 처분)는 `_evidence/dept5-TOAST-impl-20261015/print-census.tsv`(행 수 == 독립 계수 − 주석·문자열 출현).
 #[cfg(test)]
 mod toast_axis_tests {
@@ -42649,13 +42655,48 @@ mod toast_axis_tests {
     #[test]
     fn toast_axis_fleet_unreachable_keeps_head_line_and_drops_only_the_alert_prose() {
         let mut quiet: Vec<u8> = Vec::new();
-        fleet_unreachable_to(&mut quiet, "테스트부", "connect /x.sock: No such file", true);
+        fleet_unreachable_to(&mut quiet, "테스트부", "connect /x.sock: No such file", true).unwrap();
         assert_eq!(String::from_utf8(quiet).unwrap(), "\n■ 테스트부\n", "quiet: 머리줄만 — 부서가 목록에서 사라지면 안 된다");
         // 양성 대조 — 같은 함수가 quiet=false 에서는 경고 산문을 실제로 쓴다(시험이 '쓰임'을 볼 수 있다).
         let mut loud: Vec<u8> = Vec::new();
-        fleet_unreachable_to(&mut loud, "테스트부", "connect /x.sock: No such file", false);
+        fleet_unreachable_to(&mut loud, "테스트부", "connect /x.sock: No such file", false).unwrap();
         let loud = String::from_utf8(loud).unwrap();
         assert!(loud.starts_with("\n■ 테스트부\n") && loud.contains("⚠ 도달불가: connect /x.sock"), "{loud:?}");
+    }
+
+    /// 항상 BrokenPipe 로 실패하는 쓰기 대상 — stdout 의 읽는 쪽이 이미 닫힌 파이프를 흉내 낸다.
+    struct ClosedPipe;
+    impl std::io::Write for ClosedPipe {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+    }
+
+    /// MINOR-3(codex R1) — 머리줄 쓰기 실패는 호출자에게 돌아간다(quiet 여부와 무관). 기준선 `println!` 은 이 상황에서 패닉이었다.
+    #[test]
+    fn toast_axis_fleet_unreachable_propagates_header_write_error_on_closed_pipe() {
+        for quiet in [true, false] {
+            let err = fleet_unreachable_to(&mut ClosedPipe, "테스트부", "connect /x.sock: No such file", quiet)
+                .expect_err("닫힌 파이프인데 Ok — 쓰기 오류가 삼켜졌다");
+            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "quiet={quiet}");
+        }
+        // 양성 대조 — 같은 호출이 정상 쓰기 대상에서는 Ok 이고 머리줄을 쓴다(「항상 Err」 로 초록이 되지 않는다).
+        let mut ok: Vec<u8> = Vec::new();
+        assert!(fleet_unreachable_to(&mut ok, "테스트부", "x", true).is_ok());
+        assert_eq!(String::from_utf8(ok).unwrap(), "\n■ 테스트부\n");
+    }
+
+    /// 진짜 닫힌 파이프(유닉스 소켓 쌍의 읽는 쪽을 닫는다) — 흉내 쓰기 대상이 아니라 운영체제가 EPIPE 를 돌려주는 경로로도 같은 결과다.
+    #[cfg(unix)]
+    #[test]
+    fn toast_axis_fleet_unreachable_real_closed_pipe_returns_error() {
+        let (mut w, r) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(r);
+        let err = fleet_unreachable_to(&mut w, "테스트부", "x", true).expect_err("읽는 쪽이 닫혔는데 Ok");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]
@@ -42672,7 +42713,9 @@ mod toast_axis_tests {
         // 호출 1(fleet 도달불가: 머리줄은 남기고 경고 산문만 alert_prose_to) — 정의는 제네릭 `<W>` 때문에 `_to(` 패턴에 안 잡힌다.
         assert_eq!(code.matches(concat!("fleet_unreachable", "_to(")).count(), 1);
         assert_eq!(code.matches(concat!("fn fleet_unreachable", "_to<")).count(), 1);
-        assert!(code.contains(concat!("fleet_unreachable_to(&mut std::io::stdout(), disp, e, ", "ALERT_PROSE_QUIET);")));
+        assert!(code.contains(concat!("fleet_unreachable_to(&mut std::io::stdout(), disp, e, ", "ALERT_PROSE_QUIET)")));
+        // 머리줄 쓰기 오류는 호출부가 기준선 println! 과 같은 패닉으로 잇는다(조용한 exit 0 금지 · codex R1 minor 3).
+        assert!(code.contains(concat!("panic!(\"failed printing to stdout: ", "{werr}\");")));
         assert!(code.contains(concat!("alert_prose(\"[queue] 데몬 pause 중", " — 큐는 resume 후 배달됩니다\");")));
         assert!(code.contains(concat!("alert_prose(&", "line);")));
         // 끈 자리에 맨 출력 매크로가 남지 않았다.

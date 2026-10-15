@@ -755,8 +755,9 @@ describe("onDaemonEvent feed.item.created 분기 — 실제 본문 실행(실제
       calls.push({ fn, args });
     };
     const js = new Bun.Transpiler({ loader: "ts" }).transformSync(branch);
-    const f = new Function("name", "event", "payload", "daemonToast", "feedCreatedToastTitle", "TEAM_CREATE_KIND", "scheduleFeedSwitchIfStillPending", "alertsQuiet", js);
-    f("feed.item.created", event, payload, rec("toast"), feedCreatedToastTitle, TEAM_CREATE_KIND, rec("scheduleFeedSwitchIfStillPending"), () => false);
+    // osBanner: TOAST R2 로 이 분기가 `--wait` 대기 항목(wait ∧ ¬auto_route)에만 OS 배너 한 면을 직접 부른다 — 기록 스파이로 주입한다(그 밖의 새 이름은 여전히 ReferenceError 로 적색).
+    const f = new Function("name", "event", "payload", "daemonToast", "feedCreatedToastTitle", "TEAM_CREATE_KIND", "scheduleFeedSwitchIfStillPending", "alertsQuiet", "osBanner", js);
+    f("feed.item.created", event, payload, rec("toast"), feedCreatedToastTitle, TEAM_CREATE_KIND, rec("scheduleFeedSwitchIfStillPending"), () => false, rec("osBanner"));
     return calls;
   }
   /** 편성 도구(javis_formation.py _feed_for_state)가 실제로 내는 완결 feed — 본부 데몬 소속이다(소켓 지정 없는 `cys feed push`). */
@@ -772,8 +773,9 @@ describe("onDaemonEvent feed.item.created 분기 — 실제 본문 실행(실제
       expect({ kind, calls }).toEqual({ kind, calls: [{ fn: "toast", args: ["feed", "ℹ 알림", title] }] });
     }
     const wait = run({ ...HQ_COMPLETE, kind: "formation-failed", wait: true, request_id: "feed-18" }, { socket_slug: HQ_SLUG });
-    expect(wait.map((c) => c.fn)).toEqual(["toast", "scheduleFeedSwitchIfStillPending"]);
-    expect(wait[1].args).toEqual(["feed-18", false]);
+    expect(wait.map((c) => c.fn)).toEqual(["toast", "osBanner", "scheduleFeedSwitchIfStillPending"]); // R2: wait ∧ ¬auto_route → 배너 한 면(제목·본문은 토스트와 같은 분류)
+    expect(wait[1].args).toEqual(["ℹ 알림", "부서 팀 편성 완결"]); // 픽스처 HQ_COMPLETE 의 title
+    expect(wait[2].args).toEqual(["feed-18", false]);
   });
   it("승인 요청 종류는 종전 토스트 그대로('📥 승인 요청') · 팀 제안 종류(team-create-request)는 종전 안내 그대로 — 이 분기가 편성 배선을 가졌던 자리는 비었다", () => {
     const approval = run({ kind: "approval", title: "권한 요청", request_id: "r1" }, { socket_slug: HQ_SLUG });

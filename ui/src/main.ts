@@ -9472,7 +9472,8 @@ async function osBanner(title: string, body: string) {
 // 판별자는 **출처**다(부서장 판정): 사용자가 아무것도 하지 않았는데 데몬 이벤트(`onDaemonEvent`)가 띄운 박스·배너·화면 전환만 끈다.
 // 사용자 행동의 응답(전송 실패·전출 실패·복사됨)과 업데이트 경로·앱 백엔드 알림(안전모드·번들 손상 등)은 toast/stickyToast/osBanner 를 **직접** 불러 그대로 남는다.
 // ⛔toast()/stickyToast()/osBanner() 첫 줄에 통짜 가드를 두지 않는다(출처를 구별할 수 없다). ⛔onDaemonEvent 에서 early return 하지 않는다(AT-10 — 비표시 부작용이 함께 죽는다).
-// 출처 = 호출 경로: onDaemonEvent 본문은 이 세 래퍼를 부르고, 직접 호출은 approval.stalled 블록의 toast/osBanner/openFeed 셋뿐이다(부서장 판정 R5 — 그 셋은 보류 = 복원. 시험 toastaxis 가 소스에서 센다).
+// 출처 = 호출 경로: onDaemonEvent 본문은 이 세 래퍼를 부르고, 직접 호출은 **넷뿐**이다(시험 toastaxis 가 소스에서 센다) —
+//   approval.stalled 블록의 toast/osBanner/openFeed 셋(부서장 판정 R5 — 보류 = 복원) + feed.item.created 분기의 osBanner 하나(R2 — `--wait` 대기 항목 중 auto_route 아닌 것의 생성 시점 알림. R6 의 approval.request 직접 배너는 범주 오류라 되돌렸다).
 function daemonToast(...a: Parameters<typeof toast>): void {
   if (alertsQuiet("toast")) return;
   toast(...a);
@@ -9494,11 +9495,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
   // --- name-우선 전용 처리(B1) : name 매칭이 category 폴백보다 우선 ---
   if (name === "approval.request") {
     daemonToast("approval", "⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`);
-    // ★TOAST R6(C-R2): approval.request 의 **OS 배너 한 면만** 데몬 출처 예외로 남긴다(토스트·배지·유예 전환은 꺼진 채). 사유는 가시성 크기가 아니라 **시점** —
-    //   요청이 생길 때 알려야 `--wait` 요청자가 죽기 전에 닿는다: 요청자 기본(`src/bin/cys.rs` feed push `timeout_secs` default_value_t)이 stalled 임계
-    //   (`src/bin/cysd/governance.rs` `CYS_APPROVAL_STALL_SECS`)보다 짧아 stalled 는 어떤 --wait 요청도 구하지 못한다. 두 수와 관계(요청자 < stalled)는 **toastaxis.test.ts AT-19 가 소스에서 읽어 대조한다**
-    //   (이 주석의 수를 사실로 인용하지 말고 AT-19 를 보라). 부서장 결정 dept-5/dept-ops/HEAD-RULING-TOAST-R6-MAJOR3-20261015.md.
-    osBanner("⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`); // B4 OS 배너(고우선)
+    // ★TOAST R2: 이 이벤트는 pane 화면 패턴이 올린 승인(governance.rs 의 감지)이라 R6 의 배너 복원은 **범주 오류**였고 되돌린다(래퍼 경유 = 꺼짐) — 이 승인에는 stalled 3표면(R5 복원)이라는 상승 경로가 있다.
+    //   `--wait` 요청자의 대기 항목은 이 이벤트가 아니라 feed.item.created 로 온다 — 그 면은 아래 feed.item.created 분기의 배너 1면이다(근거·수치는 toastaxis.test.ts AT-19 가 소스에서 읽는다).
+    daemonOsBanner("⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`); // B4 OS 배너(고우선)
     // 자동 화면전환 없음 — 페인 승인 프롬프트는 master 즉각 자동승인 관할.
     // 토스트·OS 배너·사이드바 배지로만 알린다(feed.item.created의 유예 경로와 정합).
     refreshFeed();
@@ -9624,6 +9623,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
       if (payload.kind === TEAM_CREATE_KIND)
         daemonToast("feed", "팀 만들기 제안 1건", `${String(payload.title ?? "")} — Control Center 의 '승인 Feed' 탭 카드에서 [확인 창 열기]를 누르세요.`);
       else daemonToast("feed", feedCreatedToastTitle(payload.kind), String(payload.title ?? ""));
+      // ★TOAST R2(codex MAJOR-1): `cys feed push --wait` 요청자가 기다리는 항목 중 **기계 라우트가 없는**(auto_route 아님) 것에만 OS 배너 **한 면**을 직접 남긴다 — 토스트·Feed 자동 전환·배지는 꺼진 채, auto_route 항목은 기계 라우트(W3.4)가 있어 무음.
+      //   사유는 크기가 아니라 **시점**: 이 항목은 stalled 의 대상이 아니라서(그 스캔은 kind==approval ∧ 데몬 발행 id 만 센다) 생성 시점 알림이 유일한 경로다. 근거 소스는 toastaxis.test.ts AT-19 가 읽고, 발행 모양은 AT-20 이 producer 소스에서 읽는다.
+      if (payload.wait === true && payload.auto_route !== true) osBanner(feedCreatedToastTitle(payload.kind), String(payload.title ?? "")); // 직접 호출 — 출처 예외(래퍼 아님)
       // ★R1F-UB(S4 B1): 편성 결과(formation-*) feed 는 팀원 부팅 안내를 건드리지 않는다 — 편성 도구(javis_formation.py _feed)는 소켓 지정 없이 `cys feed push` 를 불러 **본부 데몬**으로 가고,
       //   화면의 socketForSlug 에는 부서 소켓만 있어 그 이벤트의 socket_slug 를 새로 만든 부서 탭에 대응시킬 수 없다(종전 배선은 닿지 않았다). 팀원 안내의 완료 판정은
       //   3초 틱이 받는 그 팀 소켓의 좌석 목록(checkDeptFormationNotices)이다. 위의 일반 알림(ℹ 알림 · 부서 팀 편성 완결)은 종전 그대로다.
