@@ -9494,7 +9494,11 @@ function onDaemonEvent(event: Record<string, unknown>) {
   // --- name-우선 전용 처리(B1) : name 매칭이 category 폴백보다 우선 ---
   if (name === "approval.request") {
     daemonToast("approval", "⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`);
-    daemonOsBanner("⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`); // B4 OS 배너(고우선)
+    // ★TOAST R6(C-R2): approval.request 의 **OS 배너 한 면만** 데몬 출처 예외로 남긴다(토스트·배지·유예 전환은 꺼진 채). 사유는 가시성 크기가 아니라 **시점** —
+    //   요청이 생길 때 알려야 `--wait` 요청자가 죽기 전에 닿는다: 요청자 기본(`src/bin/cys.rs` feed push `timeout_secs` default_value_t)이 stalled 임계
+    //   (`src/bin/cysd/governance.rs` `CYS_APPROVAL_STALL_SECS`)보다 짧아 stalled 는 어떤 --wait 요청도 구하지 못한다. 두 수와 관계(요청자 < stalled)는 **toastaxis.test.ts AT-19 가 소스에서 읽어 대조한다**
+    //   (이 주석의 수를 사실로 인용하지 말고 AT-19 를 보라). 부서장 결정 dept-5/dept-ops/HEAD-RULING-TOAST-R6-MAJOR3-20261015.md.
+    osBanner("⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`); // B4 OS 배너(고우선)
     // 자동 화면전환 없음 — 페인 승인 프롬프트는 master 즉각 자동승인 관할.
     // 토스트·OS 배너·사이드바 배지로만 알린다(feed.item.created의 유예 경로와 정합).
     refreshFeed();
