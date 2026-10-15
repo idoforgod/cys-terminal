@@ -447,12 +447,22 @@ describe("TOAST 축 — R1b 구멍 넷 (자동 전환 · 푸터 · 부서 오류
     expect(l).toContain("부서 데몬 응답 없음");
   });
 
-  test("daemon-info — 세 표기 자리 모두 가드 뒤(소스 핀) · 가드 밖 대입 0", () => {
-    const code = stripComments(SRC);
-    const lines = code.split("\n").filter((l) => /getElementById\("daemon-info"\)!\.textContent =|info\.textContent = `daemon error/.test(l));
-    expect(lines.length).toBe(3);
-    for (const l of lines) expect(l).toContain('alertsQuiet("daemonInfo")');
-  });
+  // ★남김 단언(부서장 판정 R2 · T-TOAST-FIX-DAEMONINFO): #daemon-info 의 세 표기는 부트·복구 실패를 구별하는 유일한 신호(제품 주석 :11259-11265 의 「백지」·「자가치유 영구 꺼짐」)라
+  //   끄지 않는다. 억제 가드(alertsQuiet) 가 한 줄이라도 붙으면 적색 — 통상 변이가 아니라 억제 *추가* 가 죽는 시험이다.
+  const KEPT_DAEMON_INFO: [string, string][] = [
+    ["daemon-error 리스너(부트 대기 중 신호)", "info.textContent = `daemon error: ${e.payload}`;"],
+    ["start().catch — startup failed", 'document.getElementById("daemon-info")!.textContent = `startup failed: ${e}`;'],
+    ["내부 catch — recovery failed", 'document.getElementById("daemon-info")!.textContent = `startup failed: ${e} / recovery failed: ${e2}`;'],
+  ];
+  for (const [label, stmt] of KEPT_DAEMON_INFO) {
+    test(`남김: ${label} — 무조건 실행(가드·조건 없이 줄 머리에서 시작)`, () => {
+      const rows = SRC.split("\n").filter((l) => l.includes(stmt));
+      expect(rows.length).toBe(1);
+      expect(rows[0].trim()).toBe(stmt); // 앞에 if/가드/삼항이 붙지 않았다 · 뒤 주석도 없다
+      expect(/alertsQuiet\("daemonInfo"\)/.test(SRC)).toBe(false);
+      expect((QUIET_SINKS as readonly string[]).includes("daemonInfo")).toBe(false);
+    });
+  }
 });
 
 describe("TOAST 축 — 출처 핀 · 통짜 가드 금지 · 커버리지", () => {
@@ -524,7 +534,7 @@ describe("TOAST 축 — 출처 핀 · 통짜 가드 금지 · 커버리지", () 
     for (const m of stripComments(SRC).matchAll(/alertsQuiet\("(\w+)"\)/g)) counts[m[1]] = (counts[m[1]] ?? 0) + 1;
     for (const s of QUIET_SINKS) expect([s, counts[s] ?? 0]).toEqual([s, EXPECTED_GUARDS[s]]);
     expect(Object.keys(counts).sort()).toEqual([...QUIET_SINKS].sort());
-    expect(CHANNEL_COUNT).toBe(14); // UI 가드 12 + 경로 덮임 1(recordAlarm) + CLI 군 1(호출부 4: stderr 3 + stdout 1) = 14 (UI 13 + CLI 1)
+    expect(CHANNEL_COUNT).toBe(13); // UI 가드 11 + 경로 덮임 1(recordAlarm) + CLI 군 1(호출부 7) = 13 (UI 12 + CLI 1)
     expect(ROUTE_COVERED).toEqual(["recordAlarm"]);
     expect(CLI_PROSE_CALLSITES).toBe(7);
     // eslint-disable-next-line no-console

@@ -9738,7 +9738,7 @@ async function start() {
   await new Promise<void>((resolve) => {
     listen("daemon-ready", () => resolve());
     listen("daemon-error", (e) => {
-      if (!alertsQuiet("daemonInfo")) info.textContent = `daemon error: ${e.payload}`; // ★TOAST
+      info.textContent = `daemon error: ${e.payload}`;
     });
     // ★신선 머신 부트 수리 짝(오너 2026-07-15): 백엔드 재시도 4회째 발화 — 상단바 텍스트는
     // 초보자가 놓치므로 sticky 토스트로 로그인 항목 승인 안내(데몬이 뜨면 daemon-ready가 진행).
@@ -11288,7 +11288,7 @@ window.addEventListener("keydown", (e) => {
 
 start()
   .catch((e) => {
-    if (!alertsQuiet("daemonInfo")) document.getElementById("daemon-info")!.textContent = `startup failed: ${e}`; // ★TOAST
+    document.getElementById("daemon-info")!.textContent = `startup failed: ${e}`;
     // ★복원이 예외로 죽어도 **화면은 떠야 하고 자가치유는 켜져야 한다**(2026-09-16 성찰 1회).
     // 종전에는 여기서 죽으면 start() 말미의 render() 와 `started = true` 에 도달하지 못해
     //   ① 탭이 하나도 그려지지 않고(백지)
@@ -11328,7 +11328,7 @@ start()
         "화면은 계속 쓰실 수 있습니다. 살아 있는 노드는 몇 초 안에 자동으로 다시 붙습니다.",
       );
     } catch (e2) {
-      if (!alertsQuiet("daemonInfo")) document.getElementById("daemon-info")!.textContent = `startup failed: ${e} / recovery failed: ${e2}`; // ★TOAST
+      document.getElementById("daemon-info")!.textContent = `startup failed: ${e} / recovery failed: ${e2}`;
     }
   })
   .finally(() => {

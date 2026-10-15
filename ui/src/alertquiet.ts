@@ -12,7 +12,7 @@
 //
 // 동결 재고(부서장 판정 2026-10-15, 출처 판별자로 개정):
 //   끄는 것 = 데몬 이벤트 출처의 모든 사람 싱크 — toast·stickyToast·osBanner(래퍼 경유) · recordAlarm(그 래퍼가 닿지 않아 기록 0) · renderAlerts · 사이드바 ⚠ ·
-//             탭 부제 상태 점 · 승인 대기 건수 배지 · Feed 자동 화면 전환 · Control Center 실패 배지  (= UI 13)  +  CLI 경보 산문 호출부 7곳 (= 채널 1) ⇒ 채널 14
+//             탭 부제 상태 점 · 승인 대기 건수 배지 · Feed 자동 화면 전환 · Control Center 실패 배지  (= UI 12)  +  CLI 경보 산문 호출부 7곳 (= 채널 1) ⇒ 채널 13
 //   남기는 것 = 사용자 행동 응답 토스트 · 업데이트 경로 전부 · 앱 백엔드 알림 · 데이터 뷰 · `--json` 필드·exit code · 명령 오류·사용법·진단 stderr
 // 런마다 coverageDeclaration() 이 이 재고를 출력하고 시험이 소스의 실제 가드 수와 대조한다(B-216).
 
@@ -29,7 +29,6 @@ export const QUIET_SINKS = [
   "feedSwitch", // 데몬 출처 승인 Feed 화면 자동 전환(daemonOpenFeed 즉시 전환 + feed.item.created 호출부 인라인 가드의 유예 후 전환 — 포커스 강탈 방지)
   "ccFooter", // Control Center 푸터 「⚠ 데몬 응답 없음」(updateCcStale)
   "ccTaskError", // Tasks 부서 오류 안내 행(renderTasks d.error)
-  "daemonInfo", // 상단바 #daemon-info 직접 오류 표기(daemon-error 이벤트·startup failed 2곳)
 ] as const;
 export type QuietSink = (typeof QUIET_SINKS)[number];
 
@@ -46,7 +45,6 @@ export const EXPECTED_GUARDS: Readonly<Record<QuietSink, number>> = {
   feedSwitch: 2, // daemonOpenFeed · feed.item.created 호출부 인라인 가드
   ccFooter: 1,
   ccTaskError: 1,
-  daemonInfo: 3,
 };
 
 /** 가드 호출이 없고 **경로로** 덮이는 채널 — recordAlarm 은 toast/stickyToast 만 부르고, 데몬 출처 호출은 래퍼에서 돌아가므로 닿지 않는다(시험: 알람 이력 0). */
