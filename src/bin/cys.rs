@@ -3263,7 +3263,7 @@ fn read_send_body(
 // ★0.14.51 TOAST 축 — 사람이 읽는 **경보 산문**의 stderr 싱크(큐 막힘·데몬 상태 경고)를 끈다(오너 2026-10-15 「전부 보이지 않게」·2026-10-12 「내부 신호는 없애지말라, 내 눈에서 보이지 않게만」).
 //   · 끄는 자리는 문구를 **만드는 함수**(queue_blocked_notice_lines 등 — 다른 소비자·`--json` 경로와 공유될 수 있다)가 아니라 바이트가 stderr 에 **닿는 호출부 3곳**이다(부서장 판정):
 //     `queue_durable_suffix`(durable=false 경고) · `warn_if_daemon_paused`(pause 안내) · `queue list` 의 막힌 좌석 안내 루프. 호출부는 지우지 않고 이 함수를 통한다 — 되돌리는 것은 아래 상수 한 줄이다.
-//   · 호출부 7곳 = stderr 6(위 3 + 유령 계수 처방 2 + 구데몬 --queued 경고 1) + stdout 1(`cys org status` 도달불가 행 — alert_prose_out). 전수 분해표 = _evidence/dept5-TOAST-impl-20261015/print-census.tsv.
+//   · 호출부 7곳 = stderr 6(위 3 + 유령 계수 처방 2 + 구데몬 --queued 경고 1) + stdout 1(`cys fleet` 도달불가 경고 산문 — fleet_unreachable_to, 머리줄 `■ 부서명` 은 남김). 전수 분해표 = _evidence/dept5-TOAST-impl-20261015/print-census.tsv.
 //   · 남기는 것: `--json` 필드·exit code(stdout/종료 코드 경로는 이 함수를 지나지 않는다) · 명령 오류·사용법·진단 stderr(eprintln! 336건 그대로) · `[approval]` 3건(명령 거부 사유라 경보가 아니다).
 //   · 시험: `toast_axis_*` — 쓰기 대상을 주입해 0 바이트를 단언하고, 세 호출부가 실제로 이 함수를 지나는지 소스 핀으로 못박는다.
 const ALERT_PROSE_QUIET: bool = true;
@@ -3279,9 +3279,11 @@ fn alert_prose(line: &str) {
     alert_prose_to(&mut std::io::stderr(), line, ALERT_PROSE_QUIET);
 }
 
-/// stdout 판 — `cys org status` 의 「⚠ 도달불가」 부서 행(부서장 판정 R1 §1-3). `--json` 경로는 이 함수를 지나지 않는다(error 필드 그대로).
-fn alert_prose_out(line: &str) {
-    alert_prose_to(&mut std::io::stdout(), line, ALERT_PROSE_QUIET);
+/// `cys fleet` 의 도달불가 부서 행(부서장 판정 R1 §1-3 + MAJOR12): 머리줄 `■ 부서명` 은 **데이터 뷰라 남기고**, 「⚠ 도달불가: 사유」 경고 산문만 `alert_prose_to` 로 끈다.
+/// `--json` 경로는 이 함수를 지나지 않는다(error 필드 그대로). 쓰기 대상·quiet 를 주입해 시험한다.
+fn fleet_unreachable_to<W: std::io::Write>(w: &mut W, disp: &str, e: &str, quiet: bool) {
+    let _ = writeln!(w, "\n■ {disp}");
+    alert_prose_to(w, &format!("   ⚠ 도달불가: {e}"), quiet);
 }
 
 /// ★B3 보조 — 큐 전환 직후 데몬이 pause 중이면 한 줄 경고한다.
@@ -20102,7 +20104,8 @@ fn state_cell(s: &serde_json::Value) -> String {
 }
 
 /// Tasks Control Center(CLI) — depts.json을 읽어 본부+각 부서 소켓에 org.status를 순회 집계한다.
-/// master 능동 모니터링: 모든 부서의 모든 노드가 지금 하는 업무를 1콜로 본다. 도달불가 부서는 표기.
+/// master 능동 모니터링: 모든 부서의 모든 노드가 지금 하는 업무를 1콜로 본다.
+/// 도달불가 부서는 머리줄(`■ 부서명`)만 표기한다 — 「⚠ 도달불가: 사유」 경고 산문은 TOAST 축이 끈다(`fleet_unreachable_to`·`--json` 의 error 필드는 그대로).
 fn run_fleet(as_json: bool) -> i32 {
     // RC-7: HOME 미설정(Windows) 함정 회피 — dirs 기반 공용 해소.
     let home = cys::home_dir().to_string_lossy().into_owned();
@@ -20150,7 +20153,7 @@ fn run_fleet(as_json: bool) -> i32 {
     for d in &out {
         let disp = d["department"].as_str().unwrap_or("");
         if let Some(e) = d["error"].as_str() {
-            alert_prose_out(&format!("\n■ {disp}  ⚠ 도달불가: {e}"));
+            fleet_unreachable_to(&mut std::io::stdout(), disp, e, ALERT_PROSE_QUIET);
             continue;
         }
         let surfaces = d["surfaces"].as_array().cloned().unwrap_or_default();
@@ -42642,6 +42645,19 @@ mod toast_axis_tests {
         assert!(ALERT_PROSE_QUIET, "출하 값은 quiet=true");
     }
 
+    /// MAJOR12 — `cys fleet` 의 도달불가 부서는 **머리줄(`■ 부서명`)이 남고** 경고 산문만 꺼진다(데이터 뷰 손실 금지).
+    #[test]
+    fn toast_axis_fleet_unreachable_keeps_head_line_and_drops_only_the_alert_prose() {
+        let mut quiet: Vec<u8> = Vec::new();
+        fleet_unreachable_to(&mut quiet, "테스트부", "connect /x.sock: No such file", true);
+        assert_eq!(String::from_utf8(quiet).unwrap(), "\n■ 테스트부\n", "quiet: 머리줄만 — 부서가 목록에서 사라지면 안 된다");
+        // 양성 대조 — 같은 함수가 quiet=false 에서는 경고 산문을 실제로 쓴다(시험이 '쓰임'을 볼 수 있다).
+        let mut loud: Vec<u8> = Vec::new();
+        fleet_unreachable_to(&mut loud, "테스트부", "connect /x.sock: No such file", false);
+        let loud = String::from_utf8(loud).unwrap();
+        assert!(loud.starts_with("\n■ 테스트부\n") && loud.contains("⚠ 도달불가: connect /x.sock"), "{loud:?}");
+    }
+
     #[test]
     fn toast_axis_call_sites_pass_through_alert_prose_and_json_path_untouched() {
         let all = include_str!("cys.rs");
@@ -42653,9 +42669,10 @@ mod toast_axis_tests {
             .join("\n");
         // 정의 1 + 호출 6(+핀 문자열 1)(큐 durable=false · pause 안내 · 막힌 좌석 안내 루프 · 유령 처방 2 · 구데몬 --queued 경고)
         assert_eq!(code.matches(concat!("alert_prose", "(")).count(), 8); // 정의 1 + 호출 6 + 유령 처방 핀 시험의 문자열 1
-        // 정의 1 + 호출 1(org status 도달불가 행)
-        assert_eq!(code.matches(concat!("alert_prose_out", "(")).count(), 2);
-        assert!(code.contains(concat!("alert_prose_out(&format!(\"\\n■ {disp}  ", "⚠ 도달불가: {e}\"));")));
+        // 호출 1(fleet 도달불가: 머리줄은 남기고 경고 산문만 alert_prose_to) — 정의는 제네릭 `<W>` 때문에 `_to(` 패턴에 안 잡힌다.
+        assert_eq!(code.matches(concat!("fleet_unreachable", "_to(")).count(), 1);
+        assert_eq!(code.matches(concat!("fn fleet_unreachable", "_to<")).count(), 1);
+        assert!(code.contains(concat!("fleet_unreachable_to(&mut std::io::stdout(), disp, e, ", "ALERT_PROSE_QUIET);")));
         assert!(code.contains(concat!("alert_prose(\"[queue] 데몬 pause 중", " — 큐는 resume 후 배달됩니다\");")));
         assert!(code.contains(concat!("alert_prose(&", "line);")));
         // 끈 자리에 맨 출력 매크로가 남지 않았다.

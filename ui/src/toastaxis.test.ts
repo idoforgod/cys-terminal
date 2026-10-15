@@ -20,6 +20,7 @@ import {
   alertsQuiet,
   coverageDeclaration,
 } from "./alertquiet";
+import { bodyPrint, fingerprint, findAnchor, normLine } from "./siteprint";
 
 const SRC = readFileSync(new URL("./main.ts", import.meta.url), "utf8");
 const LINES = SRC.split("\n");
@@ -484,6 +485,102 @@ describe("TOAST 축 — R1b 구멍 넷 (자동 전환 · 푸터 · 부서 오류
       expect((QUIET_SINKS as readonly string[]).includes("daemonInfo")).toBe(false);
     });
   }
+});
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// 남긴 자리의 **도달 가능성 지문**(44 적대 리뷰 major1 · 부서장 판정 R3·R5 조건) — 토큰이 아니라 **효과**를 잰다.
+//   · 지문 = 그 문장에 이르는 길(opener 사슬 + 선행 제어 흐름 줄)의 해시(siteprint.ts). 핀 4bad39ca 에서 같은 알고리즘으로 계산한 값을 박아 둔다.
+//     early return · category 비교 가드 · 삼항 · && · 래핑 블록 · 같은 줄 접두 가드 — 어떤 모양이든 그 길이 바뀌면 적색이다.
+//   · 의도된 변경으로 지문이 바뀌면 실패 메시지가 실제 값을 찍는다 — 이 표의 pin 을 다시 계산해 넣는다(변경 이유를 커밋에 적는다).
+//   · kind: daemon-info(상단바 오류 표기) · update(업데이트·팩 적용 고지) · K6(부트·설치본·온보딩 고지)
+interface KeptSite {
+  id: string;
+  kind: "daemon-info" | "update" | "K6";
+  anchor: string;
+  nth: number;
+  pin: string;
+}
+const KEPT_SITES: KeptSite[] = [
+  { id: "K5-daemon-error", kind: "daemon-info", anchor: "info.textContent = `daemon error: ${e.payload}`;", nth: 0, pin: "1fc56231bf45df6e" },
+  { id: "K5-startup-failed", kind: "daemon-info", anchor: "document.getElementById(\"daemon-info\")!.textContent = `startup failed: ${e}`;", nth: 0, pin: "607b4ac9163cc886" },
+  { id: "K5-recovery-failed", kind: "daemon-info", anchor: "document.getElementById(\"daemon-info\")!.textContent = `startup failed: ${e} / recovery failed: ${e2}`;", nth: 0, pin: "bd517611b51bc743" },
+  { id: "info-verskew", kind: "daemon-info", anchor: "info.appendChild(verSkewBadge);", nth: 0, pin: "f1f0e053fc42afc9" },
+  { id: "info-blocked", kind: "daemon-info", anchor: "info.textContent = daemonActionBlockedMsg();", nth: 0, pin: "c8b805cf81306f13" },
+  { id: "info-pid", kind: "daemon-info", anchor: "info.textContent = `daemon pid=${status.daemon_pid} sock=${status.socket_path}`;", nth: 0, pin: "a16c137737a92fb7" },
+  { id: "info-noresp", kind: "daemon-info", anchor: "info.textContent = \"데몬 응답 없음 — 화면은 계속 사용할 수 있습니다(연결되면 자동으로 붙습니다)\";", nth: 0, pin: "f9baef97e329c860" },
+  { id: "upd-pack-start", kind: "update", anchor: "stickyToast(\"upd-pack\", \"feed\", \"↻ 무중단 팩 업데이트\", `팩 ${pv} 적용 중… 세션·데몬 유지(재시작 없음).`);", nth: 0, pin: "8ce6fd934d60bf6e" },
+  { id: "upd-pack-fail-toast", kind: "update", anchor: "toast(\"health\", \"팩 업데이트 실패\", String(e));", nth: 0, pin: "d0cd2fbfa976eb51" },
+  { id: "silent-update-toast", kind: "update", anchor: "if (t) toast(\"feed\", t.title, t.msg);", nth: 0, pin: "9c92b98f8b000ab0" },
+  { id: "safe-mode-start", kind: "K6", anchor: "stickyToast(\"safe-mode\", \"health\", \"안전모드 — 설치 위치를 옮겨 주세요\", guidance);", nth: 0, pin: "a408a3d221e3cde7" },
+  { id: "bundle-damaged-start", kind: "K6", anchor: "stickyToast(\"bundle-damaged\", \"health\", \"설치본이 온전하지 않습니다 — 재설치 필요\", damage);", nth: 0, pin: "8179f4e7bca32541" },
+  { id: "claude-missing", kind: "K6", anchor: "stickyToast(\"claude-missing\", \"health\", \"Claude Code CLI가 없습니다\", hint);", nth: 0, pin: "cd63b1333f50d07d" },
+  { id: "upd-bin-1", kind: "update", anchor: "stickyToast(\"upd-bin\", \"feed\", \"⬇ 업데이트 설치\", \"다운로드 시작…\");", nth: 0, pin: "1ab88556f3ff9cd5" },
+  { id: "upd-bin-2", kind: "update", anchor: "stickyToast(\"upd-bin\", \"feed\", \"⬇ 업데이트 설치\", `다운로드 중 ${mb(updDownloaded)} / ${mb(p.total)} MB (${pct}%)`);", nth: 0, pin: "c47d425a280ecee0" },
+  { id: "upd-bin-3", kind: "update", anchor: "stickyToast(\"upd-bin\", \"feed\", \"⬇ 업데이트 설치\", `다운로드 중 ${mb(updDownloaded)} MB`);", nth: 0, pin: "410d4fb4a3da9819" },
+  { id: "upd-bin-4", kind: "update", anchor: "stickyToast(\"upd-bin\", \"feed\", \"⬇ 업데이트 설치\", \"세션 정리 중…\");", nth: 0, pin: "a5be5464d81aeea3" },
+  { id: "upd-bin-5", kind: "update", anchor: "stickyToast(\"upd-bin\", \"feed\", \"⬇ 업데이트 설치\", \"재시작 준비 중…\");", nth: 0, pin: "afdcd1969e2f7e93" },
+  { id: "upd-pack-apply", kind: "update", anchor: "stickyToast(\"upd-pack\", \"feed\", \"🔄 무중단 적용 중\", \"서명검증 → 다운로드 → 원자적 팩 교체 → 노드 reinject…\");", nth: 0, pin: "c6179312c9d356cd" },
+  { id: "pack-already", kind: "update", anchor: "toast(\"watchdog\", \"ℹ 이미 적용돼 있음\", `팩 ${p.disk_version ?? \"\"} — 반영할 것이 없습니다(이미 최신).`);", nth: 0, pin: "98d9acbe744e0208" },
+  { id: "pack-partial", kind: "update", anchor: "toast(\"health\", \"⚠ 팩 일부 미각성\", p.message ?? \"디스크 팩은 갱신됐으나 일부 노드 reinject 보류/실패(라이브 유지).\");", nth: 0, pin: "3facd62da87e228a" },
+  { id: "update-warn", kind: "update", anchor: "toast(\"health\", \"업데이트 경고\", msg);", nth: 0, pin: "30467694c59a4023" },
+  { id: "boot-warn", kind: "K6", anchor: "stickyToast(\"boot-warn\", \"health\", \"팀 기동 경고\", msg);", nth: 0, pin: "567bfe96cc30d932" },
+  { id: "boot-info", kind: "K6", anchor: "stickyToast(\"boot-info\", \"health\", \"팀 기동 안내\", msg);", nth: 0, pin: "63af881eb2cefa72" },
+  { id: "boot-degrade", kind: "K6", anchor: "stickyToast(\"boot-degrade\", \"health\", \"팀 부트 경로 강등\", msg);", nth: 0, pin: "a0b21799994a3004" },
+  { id: "safe-mode-evt", kind: "K6", anchor: "stickyToast(\"safe-mode\", \"health\", \"안전모드 — 설치 위치를 옮겨 주세요\", msg);", nth: 0, pin: "5ab03be213acbc0a" },
+  { id: "bundle-damaged-evt", kind: "K6", anchor: "stickyToast(\"bundle-damaged\", \"health\", \"설치본이 온전하지 않습니다 — 재설치 필요\", msg);", nth: 0, pin: "a2652bf6c11d9a8c" },
+  { id: "bundle-damaged-pull", kind: "K6", anchor: "stickyToast(\"bundle-damaged\", \"health\", \"설치본이 온전하지 않습니다 — 재설치 필요\", damage);", nth: 1, pin: "5a4ac8e7839c0e6f" },
+  { id: "onboard-capped", kind: "K6", anchor: "if (kind === \"capped\") stickyToast(\"onboard-capped\", \"health\", \"Claude 설정 파일을 고쳐 주세요\", message);", nth: 0, pin: "ccaa6290cb9cd4c4" },
+  { id: "onboard-restored", kind: "K6", anchor: "else if (kind === \"restored\") stickyToast(\"onboard-restored\", \"health\", \"Claude 연결 설정을 다시 넣었습니다\", message);", nth: 0, pin: "2c57cd9493198257" },
+  { id: "onboard-devtools", kind: "K6", anchor: "else if (kind === \"devtools-missing\") stickyToast(\"onboard-devtools\", \"health\", \"개발자 도구 없이 동작 중입니다\", message);", nth: 0, pin: "d7780395e2c8965d" },
+  { id: "upd-bin-patch", kind: "update", anchor: "stickyToast(\"upd-bin\", \"feed\", \"⬇ 패치 설치(자동 테스트)\", \"패치 업데이트 확인·설치 중…\");", nth: 0, pin: "f7cbba739b0fb1fa" },
+  { id: "update-failed", kind: "update", anchor: "if (plan.kind === \"notice\") stickyToast(UPDATE_FAILED_TOAST_ID, \"health\", plan.title, plan.body);", nth: 0, pin: "995ec2c77d9286ab" },
+];
+const SINK_BODY_PINS: Record<string, string> = {
+  toast: "0112c5af32addf86",
+  stickyToast: "08c33dfc6cb3ae9f",
+  osBanner: "0c60fbe8ba648c4a",
+  recordAlarm: "fbca511a1e48fe1a",
+};
+
+
+const MAIN_LINES = SRC.split("\n");
+
+describe("TOAST 축 — 남긴 자리 지문 (K5·K6·daemon-info 전수 · 업데이트 고지)", () => {
+  for (const site of KEPT_SITES) {
+    test(`남김 [${site.kind}] ${site.id} — 그 문장에 이르는 길이 핀(4bad39ca)과 같다`, () => {
+      const i = findAnchor(MAIN_LINES, site.anchor, site.nth);
+      expect([site.id, "앵커 존재", i >= 0]).toEqual([site.id, "앵커 존재", true]);
+      const got = fingerprint(MAIN_LINES, i);
+      expect([site.id, got]).toEqual([site.id, site.pin]);
+    });
+  }
+
+  test("열거 완전성 — 남긴 id(업데이트·안전모드·설치본·부트·온보딩·CLI 없음)를 직접 부르는 줄은 전부 표에 있다(표에 없는 새 자리는 적색)", () => {
+    const ids = /["'](upd-pack|upd-bin|safe-mode|bundle-damaged|claude-missing|boot-warn|boot-info|boot-degrade|onboard-capped|onboard-restored|onboard-devtools)["']|UPDATE_FAILED_TOAST_ID,/;
+    const have = new Set(KEPT_SITES.map((k) => k.anchor));
+    const calls = MAIN_LINES.map(normLine).filter((l) => ids.test(l) && /(^|[^A-Za-z])stickyToast\(/.test(l));
+    expect(calls.length).toBeGreaterThanOrEqual(20);
+    for (const l of calls) expect([l.slice(0, 80), have.has(l)]).toEqual([l.slice(0, 80), true]);
+    for (const l of calls) expect(/daemonStickyToast\(/.test(l)).toBe(false);
+  });
+
+  test("싱크 본문 전체 지문 — toast/stickyToast/osBanner/recordAlarm 에 어떤 모양의 조기 반환·가드도 없다(토큰이 아니라 본문 효과)", () => {
+    for (const n of Object.keys(SINK_BODY_PINS)) expect([n, bodyPrint(extractFn(n))]).toEqual([n, SINK_BODY_PINS[n]]);
+  });
+
+  test("지문은 가드의 모양을 가리지 않는다 — category 비교 조기 반환·래핑 블록·같은 줄 접두 가드 모두 지문을 바꾼다(알고리즘 자체의 변별력)", () => {
+    const base = ["function f() {", "  if (a) {", "    keep();", "  }", "  stickyToast(\"x\");", "}"];
+    const fp0 = fingerprint(base, 4);
+    const early = ["function f() {", '  if (event.category === "watchdog") return;', "  if (a) {", "    keep();", "  }", "  stickyToast(\"x\");", "}"];
+    const wrapped = ["function f() {", "  if (a) {", "    keep();", "  }", "  if (!quiet) {", "    stickyToast(\"x\");", "  }", "}"];
+    const prefixed = ["function f() {", "  if (a) {", "    keep();", "  }", "  if (!quiet) stickyToast(\"x\");", "}"];
+    expect(fingerprint(early, 5)).not.toBe(fp0);
+    expect(fingerprint(wrapped, 5)).not.toBe(fp0);
+    expect(fingerprint(prefixed, 4)).not.toBe(fp0);
+    // 무관한 줄(주석·빈 줄·무관 문장)은 지문을 바꾸지 않는다 — 평상시 편집이 거짓 적색을 만들지 않는다.
+    const benign = ["function f() {", "  // 주석", "", "  other();", "  if (a) {", "    keep();", "  }", "  stickyToast(\"x\"); // 꼬리 주석", "}"];
+    expect(fingerprint(benign, 7)).toBe(fp0);
+  });
 });
 
 describe("TOAST 축 — 출처 핀 · 통짜 가드 금지 · 커버리지", () => {
