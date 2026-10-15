@@ -9472,7 +9472,7 @@ async function osBanner(title: string, body: string) {
 // 판별자는 **출처**다(부서장 판정): 사용자가 아무것도 하지 않았는데 데몬 이벤트(`onDaemonEvent`)가 띄운 박스·배너·화면 전환만 끈다.
 // 사용자 행동의 응답(전송 실패·전출 실패·복사됨)과 업데이트 경로·앱 백엔드 알림(안전모드·번들 손상 등)은 toast/stickyToast/osBanner 를 **직접** 불러 그대로 남는다.
 // ⛔toast()/stickyToast()/osBanner() 첫 줄에 통짜 가드를 두지 않는다(출처를 구별할 수 없다). ⛔onDaemonEvent 에서 early return 하지 않는다(AT-10 — 비표시 부작용이 함께 죽는다).
-// 출처 = 호출 경로: onDaemonEvent 본문은 이 네 래퍼만 부르고 toast/stickyToast/osBanner/openFeed 를 직접 부르지 않는다(시험 daemonorigin 이 소스에서 센다).
+// 출처 = 호출 경로: onDaemonEvent 본문은 이 세 래퍼를 부르고, 직접 호출은 approval.stalled 블록의 toast/osBanner/openFeed 셋뿐이다(부서장 판정 R5 — 그 셋은 보류 = 복원. 시험 toastaxis 가 소스에서 센다).
 function daemonToast(...a: Parameters<typeof toast>): void {
   if (alertsQuiet("toast")) return;
   toast(...a);
@@ -9485,12 +9485,6 @@ function daemonOsBanner(title: string, body: string): void {
   if (alertsQuiet("osBanner")) return;
   void osBanner(title, body);
 }
-/// 데몬 이벤트가 일으키는 승인 Feed 화면 전환(approval.stalled · 유예 후 pending 전환). 사용자가 직접 여는 길(명령 팔레트)은 openFeed 를 그대로 부른다.
-function daemonOpenFeed(): void {
-  if (alertsQuiet("feedSwitch")) return;
-  openFeed();
-}
-
 function onDaemonEvent(event: Record<string, unknown>) {
   const name = String(event.name ?? "");
   const category = String(event.category ?? "");
@@ -9510,9 +9504,9 @@ function onDaemonEvent(event: Record<string, unknown>) {
   if (name === "approval.stalled") {
     // master가 stall 임계(기본 5분) 내 처리하지 못한 승인 = 사람 개입 필요 신호 —
     // 이때만 화면을 전환한다(승인 UX 원칙: 알림과 포커스 강탈의 분리, escalation 짝).
-    daemonToast("approval", "⚠ 승인 방치", `${payload.surface_ref ?? ""} ${String(payload.title ?? "").slice(0, 80)} — ${payload.age_secs}s 경과`);
-    daemonOsBanner("⚠ 승인 방치 — 사람 확인 필요", `${payload.surface_ref ?? ""} ${String(payload.title ?? "").slice(0, 80)}`);
-    daemonOpenFeed();
+    toast("approval", "⚠ 승인 방치", `${payload.surface_ref ?? ""} ${String(payload.title ?? "").slice(0, 80)} — ${payload.age_secs}s 경과`);
+    osBanner("⚠ 승인 방치 — 사람 확인 필요", `${payload.surface_ref ?? ""} ${String(payload.title ?? "").slice(0, 80)}`);
+    openFeed();
     refreshFeed();
     refreshSidebarStatus();
     return;

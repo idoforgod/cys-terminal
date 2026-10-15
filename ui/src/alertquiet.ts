@@ -2,7 +2,7 @@
 //
 // ★판별자는 **출처**다(부서장 판정 2026-10-15): 사용자가 아무것도 하지 않았는데 **데몬 이벤트가 밀어 올린** 박스·배너·배지·카드·화면 전환만 끈다.
 //   사용자 행동의 응답(전송 실패·전출 실패·복사됨)과 업데이트 경로·앱 백엔드 알림은 toast/stickyToast/osBanner 를 **직접** 불러 그대로 남는다.
-//   출처는 **호출 경로**로 판정한다 — onDaemonEvent 본문은 daemonToast/daemonStickyToast/daemonOsBanner/daemonOpenFeed 래퍼만 부르고(시험이 소스에서 센다),
+//   출처는 **호출 경로**로 판정한다 — onDaemonEvent 본문은 daemonToast/daemonStickyToast/daemonOsBanner 래퍼를 부르고, 직접 호출은 approval.stalled 의 셋뿐이다(R5 복원 · 시험이 소스에서 센다),
 //   문구의 낱말로 추정하지 않는다.
 //
 // 이 모듈은 **끄는 자리의 단일 진실**이다. 순수 — DOM·타이머·invoke 를 모른다.
@@ -26,7 +26,7 @@ export const QUIET_SINKS = [
   "ccFailBadge", // Control Center 부서 데몬 실패 배지(cc-fail-badge)
   "wsDot", // 워크스페이스 탭 부제 상태 점(ws-dot)·사망/CTX/유휴 비트·심각도 색 — 탭에는 pane 수·대표 제목만 남는다
   "pendingBadges", // Control Center 버튼(cc-pending-badge)·승인 Feed 탭(cc-feed-tabbadge) 건수 배지
-  "feedSwitch", // 데몬 출처 승인 Feed 화면 자동 전환(daemonOpenFeed 즉시 전환 + feed.item.created 호출부 인라인 가드의 유예 후 전환 — 포커스 강탈 방지)
+  "feedSwitch", // 데몬 출처 승인 Feed 화면 자동 전환(feed.item.created 호출부 인라인 가드의 유예 후 전환 예약 — 포커스 강탈 방지. approval.stalled 의 즉시 전환은 R5 로 복원되어 래퍼 daemonOpenFeed 는 제거됨)
   "ccFooter", // Control Center 푸터 「⚠ 데몬 응답 없음」(updateCcStale)
   "ccTaskError", // Tasks 부서 오류 안내 행(renderTasks d.error)
 ] as const;
@@ -42,7 +42,7 @@ export const EXPECTED_GUARDS: Readonly<Record<QuietSink, number>> = {
   ccFailBadge: 1,
   wsDot: 1,
   pendingBadges: 1,
-  feedSwitch: 2, // daemonOpenFeed · feed.item.created 호출부 인라인 가드
+  feedSwitch: 1, // feed.item.created 호출부 인라인 가드 (daemonOpenFeed 래퍼는 R5 복원 뒤 호출자 0 이라 제거)
   ccFooter: 1,
   ccTaskError: 1,
 };

@@ -59,7 +59,6 @@ const FN_NAMES = [
   "daemonToast",
   "daemonStickyToast",
   "daemonOsBanner",
-  "daemonOpenFeed",
   "onDaemonEvent",
   "renderAlerts",
   "refreshFeed",
@@ -244,6 +243,8 @@ const EVENTS: { id: string; ev: Record<string, unknown>; expect: string[] }[] = 
 ];
 
 /** 비표시 부작용으로 세는 호출 이름(AT-10 기대표가 비교하는 모집단). */
+/** 부서장 판정 R5: approval.stalled 세 표면(박스·OS 배너·Feed 전환)은 보류 = 복원이라 quiet 에서도 뜬다(아래 남김 단언). */
+const KEPT_IDS = ["approval.stalled"];
 const SIDE_EFFECTS = ["refreshSidebarStatus", "refreshFeed", "upsertTaskCell", "removeDeadPane"];
 const SINK_CALLS = ["sendNotification", "isPermissionGranted", "requestPermission", "pushAlarm", "openFeed", "scheduleFeedSwitchIfStillPending"];
 
@@ -254,7 +255,7 @@ function sideEffectList(sb: Sandbox): string[] {
 }
 
 describe("TOAST 축 T-1 — 데몬 이벤트가 밀어 올린 사람 싱크 0", () => {
-  for (const c of EVENTS) {
+  for (const c of EVENTS.filter((e) => !KEPT_IDS.includes(e.id))) {
     test(`quiet: ${c.id} → 박스 0 · OS 배너 0 · 알람 이력 0 · Feed 전환 0`, async () => {
       const sb = build({ quiet: true });
       sb.fn.onDaemonEvent(c.ev);
@@ -267,7 +268,7 @@ describe("TOAST 축 T-1 — 데몬 이벤트가 밀어 올린 사람 싱크 0", 
 
   test("category × name 퍼즈 — 어떤 조합도 박스·배너·알람 이력·Feed 전환을 만들지 않는다", async () => {
     const cats = ["", "health", "watchdog", "feed", "info", "alert", "approval", "context", "osc", "unknown-x"];
-    const names = ["", "x", "approval.request", "approval.stalled", "context.threshold", "pane.idle", "master.idle", "agent.exited", "master.deadman", "queue.starved", "queue.delivered", "status.changed", "task.changed", "osc.notify", "feed.item.created", "watchdog.duplicate_procs", "surface.exited", "surface.closed", "surface.reaped", "health.stuck"];
+    const names = ["", "x", "approval.request", "context.threshold", "pane.idle", "master.idle", "agent.exited", "master.deadman", "queue.starved", "queue.delivered", "status.changed", "task.changed", "osc.notify", "feed.item.created", "watchdog.duplicate_procs", "surface.exited", "surface.closed", "surface.reaped", "health.stuck"];
     let n = 0;
     for (const category of cats)
       for (const name of names) {
@@ -285,12 +286,32 @@ describe("TOAST 축 T-1 — 데몬 이벤트가 밀어 올린 사람 싱크 0", 
   test("양성 대조 A — 가드를 푼 상태(quiet=false)에서는 같은 이벤트가 박스·배너·알람 이력·Feed 전환을 만든다", async () => {
     const sb = build({ quiet: false });
     sb.fn.onDaemonEvent(EVENTS.find((e) => e.id === "approval.request")!.ev);
-    sb.fn.onDaemonEvent(EVENTS.find((e) => e.id === "approval.stalled")!.ev);
     sb.fn.onDaemonEvent(EVENTS.find((e) => e.id === "master.idle")!.ev);
     await flush();
-    expect(sb.toasts.children.length).toBeGreaterThanOrEqual(3);
-    expect(sb.calls.sendNotification?.length ?? 0).toBeGreaterThanOrEqual(2);
-    expect(sb.calls.pushAlarm?.length ?? 0).toBeGreaterThanOrEqual(3);
+    expect(sb.toasts.children.length).toBeGreaterThanOrEqual(2);
+    expect(sb.calls.sendNotification?.length ?? 0).toBeGreaterThanOrEqual(1);
+    expect(sb.calls.pushAlarm?.length ?? 0).toBeGreaterThanOrEqual(2);
+  });
+
+  // ---- 남김 단언 3건(T-TOAST-RESTORE-STALLED · 부서장 판정 R5): approval.stalled 의 세 표면은 quiet=true 에서도 실제로 뜬다 ----
+  const STALLED = EVENTS.find((e) => e.id === "approval.stalled")!.ev;
+  test("남김 1/3 — approval.stalled 박스(toast)가 quiet=true 에서 그려지고 알람 이력에 남는다", async () => {
+    const sb = build({ quiet: true });
+    sb.fn.onDaemonEvent(STALLED);
+    await flush();
+    expect(sb.toasts.children.length).toBe(1);
+    expect(sb.calls.pushAlarm?.length ?? 0).toBe(1);
+  });
+  test("남김 2/3 — approval.stalled OS 배너(osBanner)가 quiet=true 에서 나간다", async () => {
+    const sb = build({ quiet: true });
+    sb.fn.onDaemonEvent(STALLED);
+    await flush();
+    expect(sb.calls.sendNotification?.length ?? 0).toBe(1);
+  });
+  test("남김 3/3 — approval.stalled Feed 화면 전환(openFeed)이 quiet=true 에서 1회 불린다", async () => {
+    const sb = build({ quiet: true });
+    sb.fn.onDaemonEvent(STALLED);
+    await flush();
     expect(sb.calls.openFeed?.length ?? 0).toBe(1);
   });
 
@@ -468,15 +489,23 @@ describe("TOAST 축 — R1b 구멍 넷 (자동 전환 · 푸터 · 부서 오류
 describe("TOAST 축 — 출처 핀 · 통짜 가드 금지 · 커버리지", () => {
   const body = stripComments(extractFn("onDaemonEvent"));
 
-  test("onDaemonEvent 본문에는 toast/stickyToast/osBanner/openFeed 직접 호출이 없다(래퍼만)", () => {
+  test("onDaemonEvent 본문의 직접 호출은 approval.stalled 블록의 toast/osBanner/openFeed 셋뿐이다(그 밖은 래퍼만)", () => {
+    const st = body.indexOf('name === "approval.stalled"');
+    const en = body.indexOf('name === "context.threshold"');
+    expect(st).toBeGreaterThan(0);
+    expect(en).toBeGreaterThan(st);
+    const stalled = body.slice(st, en);
+    const rest = body.slice(0, st) + body.slice(en);
     for (const n of ["toast", "stickyToast", "osBanner", "openFeed"]) {
       const re = new RegExp(`(?<![A-Za-z0-9_.])${n}\\(`, "g");
-      expect([n, (body.match(re) ?? []).length]).toEqual([n, 0]);
+      expect([n, (rest.match(re) ?? []).length]).toEqual([n, 0]);
+      expect([n, (stalled.match(re) ?? []).length]).toEqual([n, n === "stickyToast" ? 0 : 1]);
     }
-    expect((body.match(/daemonToast\(/g) ?? []).length).toBe(11);
+    expect(SRC).not.toContain("function daemonOpenFeed("); // 호출자 0 이 된 죽은 래퍼는 남기지 않는다(실효 0 장치)
+    expect(SRC).not.toContain("daemonOpenFeed(");
+    expect((body.match(/daemonToast\(/g) ?? []).length).toBe(10);
     expect((body.match(/daemonStickyToast\(/g) ?? []).length).toBe(1);
-    expect((body.match(/daemonOsBanner\(/g) ?? []).length).toBe(5);
-    expect((body.match(/daemonOpenFeed\(/g) ?? []).length).toBe(1);
+    expect((body.match(/daemonOsBanner\(/g) ?? []).length).toBe(4);
     // 유예 후 자동 전환 예약은 호출부 인라인 가드(probefail 핀 보존): 가드 줄 + 호출 1
     expect(body).toContain('(payload.wait === true || autoRoute) && !alertsQuiet("feedSwitch")');
     expect((body.match(/(?<![A-Za-z0-9_])scheduleFeedSwitchIfStillPending\(/g) ?? []).length).toBe(1);
@@ -494,13 +523,13 @@ describe("TOAST 축 — 출처 핀 · 통짜 가드 금지 · 커버리지", () 
     }
   });
 
-  test("feed 스케줄러의 자동 화면 전환은 daemonOpenFeed 를 지난다 / 팔레트 수동 열기는 openFeed 그대로", () => {
+  test("feed 스케줄러 배선은 openFeed 그대로(가드는 호출부 인라인) / 팔레트 수동 열기도 openFeed 그대로", () => {
     expect(/^\s*open: openFeed,/m.test(SRC)).toBe(true); // 스케줄러 배선은 그대로(probefail 핀) — 가드는 호출부 daemonScheduleFeedSwitch
     expect(/^\s*open: daemonOpenFeed,/m.test(SRC)).toBe(false);
   });
 
   test("래퍼 4개는 첫 문장이 alertsQuiet 가드다", () => {
-    const want: Record<string, string> = { daemonToast: "toast", daemonStickyToast: "stickyToast", daemonOsBanner: "osBanner", daemonOpenFeed: "feedSwitch" };
+    const want: Record<string, string> = { daemonToast: "toast", daemonStickyToast: "stickyToast", daemonOsBanner: "osBanner" };
     for (const [fn, sink] of Object.entries(want)) {
       const first = stripComments(extractFn(fn)).split("\n").slice(1).find((l) => l.trim() !== "")!;
       expect(first.trim()).toBe(`if (alertsQuiet("${sink}")) return;`);
