@@ -2081,13 +2081,14 @@ mod queue_list_row_tests {
             let g = arm.find(&call).unwrap_or_else(|| panic!("처방 줄 호출 소실: {call}"));
             let q = arm.find(queued_line).unwrap_or_else(|| panic!("stdout QUEUED 줄 소실: {queued_line}"));
             assert!(n < g && g < q, "{start}: 안내 줄 → 처방 줄 → stdout 순서여야 한다");
-            let print_at = arm[g..].find("eprintln!(\"{line}\")").expect("처방 줄은 eprintln 으로만 찍는다");
-            assert!(print_at < 160, "{start}: 호출 바로 뒤에서 stderr 로 찍는다");
+            // ★TOAST: 처방 줄은 경보 산문이라 alert_prose(끄는 단일 경유)로만 나간다 — 맨 eprintln/println 이 아니다.
+            let print_at = arm[g..].find("alert_prose(&line)").expect("처방 줄은 alert_prose 로만 찍는다");
+            assert!(print_at < 160, "{start}: 호출 바로 뒤에서 alert_prose 로 찍는다");
             assert_eq!(arm.matches("ghost_fallback_stderr_line(").count(), 1, "{start}: 처방 줄은 갈래당 한 번");
             // `eprintln!("{line}")` 도 부분 문자열로 `println!("{line}")` 를 품는다 — stdout 판은 앞 글자가 `e` 가 아닌 것만 센다.
             let total = arm.matches("println!(\"{line}\")").count();
             let stderr_only = arm.matches("eprintln!(\"{line}\")").count();
-            assert_eq!((total, stderr_only), (1, 1), "{start}: 처방 줄이 stdout 으로 나가면 안 된다(println 1 = eprintln 1)");
+            assert_eq!((total, stderr_only), (0, 0), "{start}: 처방 줄이 맨 출력 매크로로 나가면 안 된다(alert_prose 경유만)");
         }
     }
 
@@ -3259,6 +3260,30 @@ fn read_send_body(
     send_body_from_bytes(parts, raw.as_deref())
 }
 
+// ★0.14.51 TOAST 축 — 사람이 읽는 **경보 산문**의 stderr 싱크(큐 막힘·데몬 상태 경고)를 끈다(오너 2026-10-15 「전부 보이지 않게」·2026-10-12 「내부 신호는 없애지말라, 내 눈에서 보이지 않게만」).
+//   · 끄는 자리는 문구를 **만드는 함수**(queue_blocked_notice_lines 등 — 다른 소비자·`--json` 경로와 공유될 수 있다)가 아니라 바이트가 stderr 에 **닿는 호출부 3곳**이다(부서장 판정):
+//     `queue_durable_suffix`(durable=false 경고) · `warn_if_daemon_paused`(pause 안내) · `queue list` 의 막힌 좌석 안내 루프. 호출부는 지우지 않고 이 함수를 통한다 — 되돌리는 것은 아래 상수 한 줄이다.
+//   · 호출부 7곳 = stderr 6(위 3 + 유령 계수 처방 2 + 구데몬 --queued 경고 1) + stdout 1(`cys org status` 도달불가 행 — alert_prose_out). 전수 분해표 = _evidence/dept5-TOAST-impl-20261015/print-census.tsv.
+//   · 남기는 것: `--json` 필드·exit code(stdout/종료 코드 경로는 이 함수를 지나지 않는다) · 명령 오류·사용법·진단 stderr(eprintln! 336건 그대로) · `[approval]` 3건(명령 거부 사유라 경보가 아니다).
+//   · 시험: `toast_axis_*` — 쓰기 대상을 주입해 0 바이트를 단언하고, 세 호출부가 실제로 이 함수를 지나는지 소스 핀으로 못박는다.
+const ALERT_PROSE_QUIET: bool = true;
+
+fn alert_prose_to<W: std::io::Write>(w: &mut W, line: &str, quiet: bool) {
+    if quiet {
+        return;
+    }
+    let _ = writeln!(w, "{line}");
+}
+
+fn alert_prose(line: &str) {
+    alert_prose_to(&mut std::io::stderr(), line, ALERT_PROSE_QUIET);
+}
+
+/// stdout 판 — `cys org status` 의 「⚠ 도달불가」 부서 행(부서장 판정 R1 §1-3). `--json` 경로는 이 함수를 지나지 않는다(error 필드 그대로).
+fn alert_prose_out(line: &str) {
+    alert_prose_to(&mut std::io::stdout(), line, ALERT_PROSE_QUIET);
+}
+
 /// ★B3 보조 — 큐 전환 직후 데몬이 pause 중이면 한 줄 경고한다.
 ///
 /// pause 중에는 큐 배달이 동결되므로(kill-switch 의미론 — 이 코드는 그 의미론을 **바꾸지
@@ -3281,9 +3306,9 @@ fn read_send_body(
 fn queue_durable_suffix(r: &serde_json::Value) -> &'static str {
     match r.get("durable").and_then(|v| v.as_bool()) {
         Some(false) => {
-            eprintln!(
+            alert_prose(
                 "[queue] 경고: 데몬이 큐 WAL 저장에 실패했다(durable=false) — 항목은 메모리 큐에 \
-                 있고 다음 틱이 재시도한다. 그 전에 데몬이 죽으면 이 메시지는 유실된다."
+                 있고 다음 틱이 재시도한다. 그 전에 데몬이 죽으면 이 메시지는 유실된다.",
             );
             " · durable=false"
         }
@@ -3294,7 +3319,7 @@ fn queue_durable_suffix(r: &serde_json::Value) -> &'static str {
 fn warn_if_daemon_paused() {
     if let Ok(r) = request("org.status", json!({})) {
         if r["paused"].as_bool() == Some(true) {
-            eprintln!("[queue] 데몬 pause 중 — 큐는 resume 후 배달됩니다");
+            alert_prose("[queue] 데몬 pause 중 — 큐는 resume 후 배달됩니다");
         }
     }
 }
@@ -5283,7 +5308,7 @@ fn run(command: Command) -> i32 {
                             );
                             // ★(0.14.43 · RQFIX I-8) 데몬이 유령 계수 처방을 붙여 거부했다면 그 처방을 안내 줄 바로 뒤에 한 줄 더(stderr 만 — stdout·종료 코드 무변경).
                             if let Some(line) = ghost_fallback_stderr_line("send", &e, sid) {
-                                eprintln!("{line}");
+                                alert_prose(&line); // ★TOAST: 사람 조치 처방 줄(유령 계수 Ctrl-U)은 경보 산문 — 끈다
                             }
                             // ★(0.14.41-fix1 · REVIEW1 F6) 모달(질문·선택 창)이 원인이면 관례적
                             //   `cys send-key Return` 이 더 이상 "빈 프롬프트의 무해한 Enter" 가 아니다 —
@@ -5380,7 +5405,7 @@ fn run(command: Command) -> i32 {
                                 );
                                 // ★(0.14.43 · RQFIX I-8) `cys send` 폴백과 같다 — 유령 처방이 붙은 거부면 안내 줄 뒤에 처방 한 줄(stderr).
                                 if let Some(line) = ghost_fallback_stderr_line("send-key", &e, sid) {
-                                    eprintln!("{line}");
+                                    alert_prose(&line); // ★TOAST
                                 }
                                 warn_if_daemon_paused();
                                 println!("QUEUED (depth {depth}){}", queue_durable_suffix(&r2));
@@ -5403,9 +5428,10 @@ fn run(command: Command) -> i32 {
                                 }
                                 // 구 데몬은 queued 파라미터를 모르고 즉시 주입한다 —
                                 // "QUEUED"로 오표시하지 않는다(skew의 결정론 신호).
-                                None => eprintln!(
+                                None => alert_prose(
+                                    // ★TOAST: 구데몬 버전 skew 경고는 경보 산문 — 끈다(주입 동작·종료 코드는 그대로)
                                     "[send-key] 경고: 데몬이 --queued를 지원하지 않아 \
-                                     직접 주입됨(구버전 cysd — 재기동으로 갱신하라)"
+                                     직접 주입됨(구버전 cysd — 재기동으로 갱신하라)",
                                 ),
                             }
                         }
@@ -5582,7 +5608,7 @@ fn run(command: Command) -> i32 {
                             }
                         }
                         for line in notices {
-                            eprintln!("{line}");
+                            alert_prose(&line);
                         }
                         0
                     })
@@ -20124,7 +20150,7 @@ fn run_fleet(as_json: bool) -> i32 {
     for d in &out {
         let disp = d["department"].as_str().unwrap_or("");
         if let Some(e) = d["error"].as_str() {
-            println!("\n■ {disp}  ⚠ 도달불가: {e}");
+            alert_prose_out(&format!("\n■ {disp}  ⚠ 도달불가: {e}"));
             continue;
         }
         let surfaces = d["surfaces"].as_array().cloned().unwrap_or_default();
@@ -42595,5 +42621,51 @@ mod usage_accounts_line_tests {
         let src = include_str!("cys.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 경계")];
         assert!(!prod.contains("본부 데몬 기준"), "옛 안내 문구가 프로덕션에 남아 있다(부서 좌석에서 실행하면 틀린 말)");
+    }
+}
+
+/// ★0.14.51 TOAST 축 — CLI 경보 산문 싱크(stderr 3 + stdout 1)가 꺼졌고, 끈 자리가 정확히 그 넷뿐임을 못박는다.
+/// 전수 분해표(print 매크로 전체의 5갈래 처분)는 `_evidence/dept5-TOAST-impl-20261015/print-census.tsv`(행 수 == 독립 계수 − 주석·문자열 출현).
+#[cfg(test)]
+mod toast_axis_tests {
+    use super::*;
+
+    #[test]
+    fn toast_axis_quiet_writes_zero_bytes_and_positive_control_writes() {
+        let mut quiet: Vec<u8> = Vec::new();
+        alert_prose_to(&mut quiet, "경보 산문", true);
+        assert!(quiet.is_empty(), "quiet 인데 {}바이트가 나갔다", quiet.len());
+        // 양성 대조 — 이 시험이 '쓰였는가'를 볼 수 있다는 증명(예외·빈 쓰기 대상으로 초록이 되지 않는다).
+        let mut loud: Vec<u8> = Vec::new();
+        alert_prose_to(&mut loud, "경보 산문", false);
+        assert_eq!(String::from_utf8(loud).unwrap(), "경보 산문\n");
+        assert!(ALERT_PROSE_QUIET, "출하 값은 quiet=true");
+    }
+
+    #[test]
+    fn toast_axis_call_sites_pass_through_alert_prose_and_json_path_untouched() {
+        let all = include_str!("cys.rs");
+        let prod = &all[..all.find(concat!("#[cfg(test)]\n", "mod toast_axis_tests")).unwrap()];
+        let code: String = prod
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 정의 1 + 호출 6(+핀 문자열 1)(큐 durable=false · pause 안내 · 막힌 좌석 안내 루프 · 유령 처방 2 · 구데몬 --queued 경고)
+        assert_eq!(code.matches(concat!("alert_prose", "(")).count(), 8); // 정의 1 + 호출 6 + 유령 처방 핀 시험의 문자열 1
+        // 정의 1 + 호출 1(org status 도달불가 행)
+        assert_eq!(code.matches(concat!("alert_prose_out", "(")).count(), 2);
+        assert!(code.contains(concat!("alert_prose_out(&format!(\"\\n■ {disp}  ", "⚠ 도달불가: {e}\"));")));
+        assert!(code.contains(concat!("alert_prose(\"[queue] 데몬 pause 중", " — 큐는 resume 후 배달됩니다\");")));
+        assert!(code.contains(concat!("alert_prose(&", "line);")));
+        // 끈 자리에 맨 출력 매크로가 남지 않았다.
+        assert!(!code.contains(concat!("println!(\"\\n■ {disp}  ", "⚠ 도달불가")));
+        assert!(!code.contains(concat!("eprintln!(\"[queue] 데몬 pause 중", "")));
+        // --json 경로(stdout 바이트 계약)는 그대로 println 이다.
+        assert!(code.contains(concat!("serde_json::to_string_pretty(&json!({ \"departments\"", ": out }))")));
+        // 문구를 만드는 3함수는 그대로 존재한다(호출부만 끈다).
+        for f in ["fn queue_blocked_notice_lines(", "fn queue_durable_suffix(", "fn warn_if_daemon_paused("] {
+            assert!(code.contains(f), "{f} 가 사라졌다");
+        }
     }
 }

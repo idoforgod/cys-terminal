@@ -193,6 +193,7 @@ import {
 } from "./usagebar"; // U1 사이드바 사용량 패널(순수 판정) + 0.14.43 별명·사용 중·숨기기·KPI 후보·전 좌석 폴백 집계
 import { buildAcctIndex, buildWsAccountGroups, type SeatAcctSig, type AcctIndex } from "./seatacct"; // ★0.14.45 부서 카드 노드별 계정 줄(순수 판정)
 import { planOfficeTab, repairOutcomeOf, type OfficeCtx } from "./officetab"; // 0.14.44 B5·B6 오피스 탭 안내(순수 판정)
+import { alertsQuiet } from "./alertquiet"; // 0.14.51 TOAST 축 — 데몬 이벤트 출처의 사람 싱크를 끄는 단일 판정(순수)
 import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
 import {
@@ -944,7 +945,7 @@ let ccFailStreak = 0;
 function updateCcStale() {
   const f = document.getElementById("cc-footer");
   if (!f) return;
-  if (ccFailStreak >= 3) {
+  if (ccFailStreak >= 3 && !alertsQuiet("ccFooter")) { // ★TOAST: 푸터 경고 문구는 끈다(ccFailStreak 계수·재시도는 그대로)
     f.textContent = "⚠ 데몬 응답 없음 — 표시 중인 값은 마지막 성공 시점 기준(자동 재시도 중)";
     f.classList.add("stale");
   } else {
@@ -955,6 +956,7 @@ function updateCcStale() {
 // E6 경보 — 헤더 배지(개수) + Live 뷰 상단 스트립. severity: warn(주황)/crit(빨강) · ★0.14.41 unknown(회색 '조회 불가').
 // 입력은 alertsTracker.step 이 낸 표시 값(판정은 probefail.ts) — 이 함수는 DOM 에 옮기기만 한다.
 function renderAlerts(v: AlertsView | null) {
+  if (alertsQuiet("renderAlerts")) return; // ★TOAST: 경보 배지·스트립은 그리지 않는다(데이터 AlertsView 는 그대로 흐른다 — 이 함수는 DOM 에 옮기기만 한다)
   if (!v) return; // 조회 실패가 아직 상한 미만 — 직전 표시 유지(0 으로 접지 않는다)
   const badge = document.getElementById("cc-alertbadge");
   if (badge) {
@@ -1832,14 +1834,16 @@ function renderTasks(fleet: any) {
       // ★0.14.41(U12 · 리뷰1 #2): '작업중' 계수도 행 판정과 같은 규칙 — 빈 자리·종료 좌석은 빼고, 자기보고는 신선할 때만.
       const tNow = Date.now();
       const working = surfaces.filter((s) => taskSeatIsWorking(s, taskSeatView(s, tNow, HOLLOW_GRACE_UI))).length;
-      const deadBadge = d.error
+      const deadBadge = d.error && !alertsQuiet("ccFailBadge")
         ? `<span class="cc-fail-badge crit">⚠ ${d.error === "timeout" ? "응답없음" : "도달불가"}</span>`
         : "";
       const head =
         `<div class="cc-tasks-dept-h"><span class="cc-tasks-dept-name">${ccEsc(d.display_name ?? d.name ?? "")}</span>` +
         `<span class="cc-tasks-dept-meta">노드 ${surfaces.length} · 작업중 ${working}</span>${deadBadge}</div>`;
       const rows = d.error
-        ? `<div class="cc-empty">${d.error === "timeout" ? "부서 데몬 응답 없음(2초 초과)" : "부서 데몬 연결 실패 — 다운/기동 중"}</div>`
+        ? alertsQuiet("ccTaskError") // ★TOAST: 부서 데몬 오류 안내 행은 그리지 않는다(d.error 데이터·재시도는 그대로)
+          ? ""
+          : `<div class="cc-empty">${d.error === "timeout" ? "부서 데몬 응답 없음(2초 초과)" : "부서 데몬 연결 실패 — 다운/기동 중"}</div>`
         : surfaces.length === 0
           ? `<div class="cc-empty">노드 없음</div>`
           : surfaces.map((s) => taskRow(s, deptKey)).join("");
@@ -5227,6 +5231,7 @@ function renderUsageBar(): void {
 
 // 승인 대기 건수 배지 — 상단 Control Center 버튼 + 편입된 '승인 Feed' 탭 둘 다 갱신.
 function updatePendingBadges(n: number) {
+  if (alertsQuiet("pendingBadges")) return; // ★TOAST: Control Center 버튼·Feed 탭의 승인 대기 건수 배지는 경보 표시라 끈다(카드·버튼 면은 남는다)
   for (const id of ["cc-pending-badge", "cc-feed-tabbadge"]) {
     const b = document.getElementById(id);
     if (!b) continue;
@@ -5336,7 +5341,7 @@ function buildTab(ws: Workspace): HTMLElement {
     tab.setAttribute("aria-busy", "true");
   }
   // 승인 대기 배지(B3): 중복 표시 방지 위해 활성 ws 행에만 1개 노출.
-  if (pendingApprovals > 0 && workspaces.indexOf(ws) === activeWs) {
+  if (pendingApprovals > 0 && workspaces.indexOf(ws) === activeWs && !alertsQuiet("sidebarBadge")) {
     const badge = document.createElement("span");
     badge.className = "ws-approve-badge";
     badge.textContent = `⚠${pendingApprovals}`;
@@ -5362,11 +5367,16 @@ function buildTab(ws: Workspace): HTMLElement {
     );
     const dot = document.createElement("span");
     dot.className = "ws-dot " + sum.dot;
-    sub.appendChild(dot);
-    if (sum.title) sub.title = sum.title;
+    // ★TOAST: 상태 점·사망/CTX/유휴 비트·심각도 색은 자발적 경보 표시라 끈다(판정 sum 은 그대로 계산 — 데이터는 흐른다). 탭에는 pane 수·대표 제목만 남는다.
+    const wsQuiet = alertsQuiet("wsDot");
+    if (!wsQuiet) sub.appendChild(dot);
+    if (sum.title && !wsQuiet) sub.title = sum.title;
     const txt = document.createElement("span");
-    txt.textContent = wsSubBits(sum, firstTitle).join(" · ");
-    if (sum.worst >= 80) txt.className = "sev-crit";
+    const subBits = wsSubBits(sum, firstTitle);
+    txt.textContent = (wsQuiet ? subBits.slice(0, firstTitle ? 2 : 1) : subBits).join(" · ");
+    if (wsQuiet) {
+      /* 심각도 색 없음 */
+    } else if (sum.worst >= 80) txt.className = "sev-crit";
     else if (sum.worst >= 60) txt.className = "sev-warn";
     sub.appendChild(txt);
   }
@@ -9458,6 +9468,29 @@ async function osBanner(title: string, body: string) {
   }
 }
 
+// ---------- ★TOAST 축(오너 2026-10-15 「전부 보이지 않게」): 데몬 이벤트가 밀어 올린 사람 싱크를 끈다 ----------
+// 판별자는 **출처**다(부서장 판정): 사용자가 아무것도 하지 않았는데 데몬 이벤트(`onDaemonEvent`)가 띄운 박스·배너·화면 전환만 끈다.
+// 사용자 행동의 응답(전송 실패·전출 실패·복사됨)과 업데이트 경로·앱 백엔드 알림(안전모드·번들 손상 등)은 toast/stickyToast/osBanner 를 **직접** 불러 그대로 남는다.
+// ⛔toast()/stickyToast()/osBanner() 첫 줄에 통짜 가드를 두지 않는다(출처를 구별할 수 없다). ⛔onDaemonEvent 에서 early return 하지 않는다(AT-10 — 비표시 부작용이 함께 죽는다).
+// 출처 = 호출 경로: onDaemonEvent 본문은 이 네 래퍼만 부르고 toast/stickyToast/osBanner/openFeed 를 직접 부르지 않는다(시험 daemonorigin 이 소스에서 센다).
+function daemonToast(...a: Parameters<typeof toast>): void {
+  if (alertsQuiet("toast")) return;
+  toast(...a);
+}
+function daemonStickyToast(...a: Parameters<typeof stickyToast>): void {
+  if (alertsQuiet("stickyToast")) return;
+  stickyToast(...a);
+}
+function daemonOsBanner(title: string, body: string): void {
+  if (alertsQuiet("osBanner")) return;
+  void osBanner(title, body);
+}
+/// 데몬 이벤트가 일으키는 승인 Feed 화면 전환(approval.stalled · 유예 후 pending 전환). 사용자가 직접 여는 길(명령 팔레트)은 openFeed 를 그대로 부른다.
+function daemonOpenFeed(): void {
+  if (alertsQuiet("feedSwitch")) return;
+  openFeed();
+}
+
 function onDaemonEvent(event: Record<string, unknown>) {
   const name = String(event.name ?? "");
   const category = String(event.category ?? "");
@@ -9466,8 +9499,8 @@ function onDaemonEvent(event: Record<string, unknown>) {
 
   // --- name-우선 전용 처리(B1) : name 매칭이 category 폴백보다 우선 ---
   if (name === "approval.request") {
-    toast("approval", "⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`);
-    osBanner("⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`); // B4 OS 배너(고우선)
+    daemonToast("approval", "⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`);
+    daemonOsBanner("⚠ 승인 대기", `${payload.role ?? ""} ${payload.surface_ref ?? ""} — ${String(payload.excerpt ?? "").slice(0, 100)}`); // B4 OS 배너(고우선)
     // 자동 화면전환 없음 — 페인 승인 프롬프트는 master 즉각 자동승인 관할.
     // 토스트·OS 배너·사이드바 배지로만 알린다(feed.item.created의 유예 경로와 정합).
     refreshFeed();
@@ -9477,26 +9510,26 @@ function onDaemonEvent(event: Record<string, unknown>) {
   if (name === "approval.stalled") {
     // master가 stall 임계(기본 5분) 내 처리하지 못한 승인 = 사람 개입 필요 신호 —
     // 이때만 화면을 전환한다(승인 UX 원칙: 알림과 포커스 강탈의 분리, escalation 짝).
-    toast("approval", "⚠ 승인 방치", `${payload.surface_ref ?? ""} ${String(payload.title ?? "").slice(0, 80)} — ${payload.age_secs}s 경과`);
-    osBanner("⚠ 승인 방치 — 사람 확인 필요", `${payload.surface_ref ?? ""} ${String(payload.title ?? "").slice(0, 80)}`);
-    openFeed();
+    daemonToast("approval", "⚠ 승인 방치", `${payload.surface_ref ?? ""} ${String(payload.title ?? "").slice(0, 80)} — ${payload.age_secs}s 경과`);
+    daemonOsBanner("⚠ 승인 방치 — 사람 확인 필요", `${payload.surface_ref ?? ""} ${String(payload.title ?? "").slice(0, 80)}`);
+    daemonOpenFeed();
     refreshFeed();
     refreshSidebarStatus();
     return;
   }
   if (name === "context.threshold") {
-    toast("threshold", `🔋 컨텍스트 ${payload.context_pct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`);
+    daemonToast("threshold", `🔋 컨텍스트 ${payload.context_pct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`);
     // ★WP6-2 — 결측을 0 으로 접지 않는다. 이 페이로드는 데몬 에지 게이트(handlers.rs maybe_fire_context_threshold)가
     //   임계 교차를 이미 판정한 **단일값**(+source)이라 usage/status 축이 없어 pickCtx 대상이 아니다.
     //   숫자가 아니면 배너를 안 띄운다(판정 불가 = 무발화 · "0%" 위장 없음). 80 임계는 불변.
     const evPct = payload.context_pct;
     if (typeof evPct === "number" && evPct >= 80)
-      osBanner(`🔋 컨텍스트 ${evPct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`); // B4 OS 배너(≥80만)
+      daemonOsBanner(`🔋 컨텍스트 ${evPct}%`, `${payload.role ?? ""} ${payload.surface_ref ?? ""} ≥ ${payload.threshold}% — ${payload.action ?? ""}`); // B4 OS 배너(≥80만)
     refreshSidebarStatus();
     return;
   }
   if (name === "pane.idle") {
-    toast("idle", "💤 노드 유휴", `surface:${sid} — ${payload.idle_seconds}s 무출력`);
+    daemonToast("idle", "💤 노드 유휴", `surface:${sid} — ${payload.idle_seconds}s 무출력`);
     refreshSidebarStatus();
     return;
   }
@@ -9513,7 +9546,7 @@ function onDaemonEvent(event: Record<string, unknown>) {
     //   ③ 알람 이력: stickyToast→recordAlarm(id) — 같은 id는 최신 1건으로 합쳐져
     //      이력 링버퍼를 잠식하지 않는다(pushAlarm coalesce).
     const role = String(payload.role ?? "master");
-    stickyToast(
+    daemonStickyToast(
       `master-idle:${event.socket_slug ?? ""}:${role}`,
       "idle",
       "💤 master 유휴",
@@ -9523,8 +9556,8 @@ function onDaemonEvent(event: Record<string, unknown>) {
     return;
   }
   if (name === "agent.exited") {
-    toast("alert", "❌ 에이전트 사망", `surface:${sid} ${payload.role ?? ""}`);
-    osBanner("❌ 에이전트 사망", `surface:${sid} ${payload.role ?? ""}`); // B4 OS 배너(고우선)
+    daemonToast("alert", "❌ 에이전트 사망", `surface:${sid} ${payload.role ?? ""}`);
+    daemonOsBanner("❌ 에이전트 사망", `surface:${sid} ${payload.role ?? ""}`); // B4 OS 배너(고우선)
     refreshSidebarStatus();
     // ★정합기 리셋 훅(스펙 D4 ②): 앱 즉사(SIGKILL — 복원 시퀀스 없음)로 유출·잔존한 트래킹을
     // 소등한다. 조준은 socket_slug **실해석 성공** pane 만(:5194 선례 — slug 부재·미해석 시
@@ -9552,8 +9585,8 @@ function onDaemonEvent(event: Record<string, unknown>) {
     // v2(G2)는 role·axis 등 additive 필드를 싣고, v1 은 {reason,idle_secs}뿐 — payload.role
     // 폴백이 양 버전을 모두 흡수한다(governance.rs). reason 은 verbatim 표시라 신규값
     // ("shell process dead"/"agent process dead" 등)도 자연 수용 — 핸들러 무변경(W3-B).
-    toast("alert", "🚨 master 무응답(deadman)", `surface:${sid} ${payload.role ?? ""} ${payload.reason ?? ""}`);
-    osBanner("🚨 master 무응답(deadman)", `surface:${sid} ${payload.reason ?? ""}`); // B4 OS 배너(고우선)
+    daemonToast("alert", "🚨 master 무응답(deadman)", `surface:${sid} ${payload.role ?? ""} ${payload.reason ?? ""}`);
+    daemonOsBanner("🚨 master 무응답(deadman)", `surface:${sid} ${payload.reason ?? ""}`); // B4 OS 배너(고우선)
     return;
   }
   if (name === "queue.starved") {
@@ -9574,25 +9607,25 @@ function onDaemonEvent(event: Record<string, unknown>) {
     return;
   }
   if (name === "osc.notify") {
-    toast("osc", `🔔 ${payload.title ?? "알림"}`, `surface:${sid} — ${String(payload.body ?? "").slice(0, 120)}`);
+    daemonToast("osc", `🔔 ${payload.title ?? "알림"}`, `surface:${sid} — ${String(payload.body ?? "").slice(0, 120)}`);
     return;
   }
 
   if (category === "health") {
-    toast("health", `⚠ ${name}`, `surface:${sid} rule=${payload.rule} — ${String(payload.line ?? "").slice(0, 120)}`);
+    daemonToast("health", `⚠ ${name}`, `surface:${sid} rule=${payload.rule} — ${String(payload.line ?? "").slice(0, 120)}`);
   } else if (category === "watchdog") {
     const detail =
       name === "watchdog.duplicate_procs"
         ? `중복 서버 ${payload.count}개: ${String(payload.cmdline ?? "").slice(0, 80)}`
         : JSON.stringify(payload).slice(0, 120);
-    toast("watchdog", `🐕 ${name}`, detail);
+    daemonToast("watchdog", `🐕 ${name}`, detail);
   } else if (category === "feed") {
     if (name === "feed.item.created") {
       // ★U16: 팀 만들기 제안은 확인 창을 자동으로 띄우지 않는다(포커스 탈취·취소 사고 · 반박 M6) — 안내만.
       // ★U10(0.14.41): 그 밖의 kind는 정보성(각성 훅·부트 실패·편성·CEO 알림 등)이면 'ℹ 알림', 아니면 '📥 승인 요청'.
       if (payload.kind === TEAM_CREATE_KIND)
-        toast("feed", "팀 만들기 제안 1건", `${String(payload.title ?? "")} — Control Center 의 '승인 Feed' 탭 카드에서 [확인 창 열기]를 누르세요.`);
-      else toast("feed", feedCreatedToastTitle(payload.kind), String(payload.title ?? ""));
+        daemonToast("feed", "팀 만들기 제안 1건", `${String(payload.title ?? "")} — Control Center 의 '승인 Feed' 탭 카드에서 [확인 창 열기]를 누르세요.`);
+      else daemonToast("feed", feedCreatedToastTitle(payload.kind), String(payload.title ?? ""));
       // ★R1F-UB(S4 B1): 편성 결과(formation-*) feed 는 팀원 부팅 안내를 건드리지 않는다 — 편성 도구(javis_formation.py _feed)는 소켓 지정 없이 `cys feed push` 를 불러 **본부 데몬**으로 가고,
       //   화면의 socketForSlug 에는 부서 소켓만 있어 그 이벤트의 socket_slug 를 새로 만든 부서 탭에 대응시킬 수 없다(종전 배선은 닿지 않았다). 팀원 안내의 완료 판정은
       //   3초 틱이 받는 그 팀 소켓의 좌석 목록(checkDeptFormationNotices)이다. 위의 일반 알림(ℹ 알림 · 부서 팀 편성 완결)은 종전 그대로다.
@@ -9600,7 +9633,7 @@ function onDaemonEvent(event: Record<string, unknown>) {
       // 사람 개입 필요로 보고 전환한다(자동 승인분은 무전환).
       // W3.4: auto_route 항목은 90초 기본 + CEO 활성 동적 연장, 비대상 wait 항목은 30초.
       const autoRoute = payload.auto_route === true;
-      if (payload.wait === true || autoRoute)
+      if ((payload.wait === true || autoRoute) && !alertsQuiet("feedSwitch")) // ★TOAST: 유예 후 자동 Feed 화면 전환 예약은 데몬 이벤트 출처 — 끈다(스케줄러 배선·위임 한 줄은 그대로)
         scheduleFeedSwitchIfStillPending(String(payload.request_id ?? ""), autoRoute);
     }
     refreshFeed();
@@ -9705,7 +9738,7 @@ async function start() {
   await new Promise<void>((resolve) => {
     listen("daemon-ready", () => resolve());
     listen("daemon-error", (e) => {
-      info.textContent = `daemon error: ${e.payload}`;
+      if (!alertsQuiet("daemonInfo")) info.textContent = `daemon error: ${e.payload}`; // ★TOAST
     });
     // ★신선 머신 부트 수리 짝(오너 2026-07-15): 백엔드 재시도 4회째 발화 — 상단바 텍스트는
     // 초보자가 놓치므로 sticky 토스트로 로그인 항목 승인 안내(데몬이 뜨면 daemon-ready가 진행).
@@ -11255,7 +11288,7 @@ window.addEventListener("keydown", (e) => {
 
 start()
   .catch((e) => {
-    document.getElementById("daemon-info")!.textContent = `startup failed: ${e}`;
+    if (!alertsQuiet("daemonInfo")) document.getElementById("daemon-info")!.textContent = `startup failed: ${e}`; // ★TOAST
     // ★복원이 예외로 죽어도 **화면은 떠야 하고 자가치유는 켜져야 한다**(2026-09-16 성찰 1회).
     // 종전에는 여기서 죽으면 start() 말미의 render() 와 `started = true` 에 도달하지 못해
     //   ① 탭이 하나도 그려지지 않고(백지)
@@ -11295,7 +11328,7 @@ start()
         "화면은 계속 쓰실 수 있습니다. 살아 있는 노드는 몇 초 안에 자동으로 다시 붙습니다.",
       );
     } catch (e2) {
-      document.getElementById("daemon-info")!.textContent = `startup failed: ${e} / recovery failed: ${e2}`;
+      if (!alertsQuiet("daemonInfo")) document.getElementById("daemon-info")!.textContent = `startup failed: ${e} / recovery failed: ${e2}`; // ★TOAST
     }
   })
   .finally(() => {

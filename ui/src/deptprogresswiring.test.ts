@@ -755,8 +755,8 @@ describe("onDaemonEvent feed.item.created 분기 — 실제 본문 실행(실제
       calls.push({ fn, args });
     };
     const js = new Bun.Transpiler({ loader: "ts" }).transformSync(branch);
-    const f = new Function("name", "event", "payload", "toast", "feedCreatedToastTitle", "TEAM_CREATE_KIND", "scheduleFeedSwitchIfStillPending", js);
-    f("feed.item.created", event, payload, rec("toast"), feedCreatedToastTitle, TEAM_CREATE_KIND, rec("scheduleFeedSwitchIfStillPending"));
+    const f = new Function("name", "event", "payload", "daemonToast", "feedCreatedToastTitle", "TEAM_CREATE_KIND", "scheduleFeedSwitchIfStillPending", "alertsQuiet", js);
+    f("feed.item.created", event, payload, rec("toast"), feedCreatedToastTitle, TEAM_CREATE_KIND, rec("scheduleFeedSwitchIfStillPending"), () => false);
     return calls;
   }
   /** 편성 도구(javis_formation.py _feed_for_state)가 실제로 내는 완결 feed — 본부 데몬 소속이다(소켓 지정 없는 `cys feed push`). */
