@@ -205,8 +205,11 @@ def run(cmd, timeout=RUN_TIMEOUT, stdin_text=None):
     """subprocess 러너 — (rc, stdout, stderr). 예외도 rc!=0 로 정규화(fail-soft)."""
     try:
         # 창 정책은 블록 밖 `_CAPTURE_SPAWN_KW`(파일별 정의 — autopilot=nt NOWIN · verifier=빈 dict).
+        # stdin 미지정 시 부모의 STD_INPUT_HANDLE 을 상속하는데, cysd 잡 스폰은 그 핸들이 무효라
+        # [WinError 6] → rc127 → kill_switch fail-closed 가 된다. input 이 없으면 DEVNULL 로 묶는다.
+        stdio = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, input=stdin_text, **_CAPTURE_SPAWN_KW)
+                           timeout=timeout, **stdio, **_CAPTURE_SPAWN_KW)
         return p.returncode, p.stdout or "", p.stderr or ""
     except Exception as e:  # noqa: BLE001 — 러너는 절대 예외를 올리지 않는다
         return 127, "", "runner error: %s" % e
@@ -482,8 +485,9 @@ def run_wakeup(cmd, timeout=RUN_TIMEOUT, stdin_text=None):
     주입 가능성(runner=…)은 그대로다.
     """
     try:
+        stdio = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, input=stdin_text, env=wakeup_env(),
+                           timeout=timeout, env=wakeup_env(), **stdio,
                            **_CAPTURE_SPAWN_KW)
         return p.returncode, p.stdout or "", p.stderr or ""
     except Exception as e:  # noqa: BLE001 — 러너는 절대 예외를 올리지 않는다
@@ -3013,7 +3017,7 @@ def cmd_self_test(args):
     sfr_m = resolve_save_files("master", norow("master", FHOME, 198), packdir="/PK")
     t.check("★[R2-A] master(cwd=홈) save-file = 홈 _round 정본",
             sfr_m["files"] == [os.path.join(FHOME, "_round", "SESSION_STATE.md"),
-                               "/PK/round/MASTER_TODO.md"], str(sfr_m["files"]))
+                               os.path.join("/PK", "round", "MASTER_TODO.md")], str(sfr_m["files"]))
     t.check("★[R2-A] 전역 PROJECT 에 결박되지 않음",
             os.path.join(PROJECT, "_round", "SESSION_STATE.md") not in sfr_m["files"],
             str(sfr_m["files"]))
@@ -3026,10 +3030,11 @@ def cmd_self_test(args):
             str(sfr_mp["files"]))
     sfr_w = resolve_save_files("worker", norow("worker", FPROJ), packdir="/PK")
     t.check("worker save-file 단독 WORKER_TODO.md(round_dir 무관)",
-            sfr_w["files"] == ["/PK/round/WORKER_TODO.md"], str(sfr_w["files"]))
+            sfr_w["files"] == [os.path.join("/PK", "round", "WORKER_TODO.md")], str(sfr_w["files"]))
     t.check("reviewer-codex → REVIEWER_CODEX_TODO.md",
             resolve_save_files("reviewer-codex", norow("reviewer-codex", FHOME),
-                               packdir="/PK")["files"] == ["/PK/round/REVIEWER_CODEX_TODO.md"])
+                               packdir="/PK")["files"]
+            == [os.path.join("/PK", "round", "REVIEWER_CODEX_TODO.md")])
 
     # 7-b2) ★[결재 7ⓐ·15] 미끼 `_round` 존재 회귀 — 이 버그가 오래 산 이유는 위 핀들이
     #   전부 '팩 round/ 부재' 픽스처였기 때문이다. 실기 형상을 그대로 재현한다: cwd(홈)에
@@ -3906,47 +3911,57 @@ def cmd_self_test(args):
 
     # 18-b) ★홍수 전제 핀: 실제 wakeup 은 배달 후 pending 과 그 멱등키를 함께 지운다.
     print("[18-b] 실제 wakeup 배달 후 멱등키 소멸 (cys 셸 스텁)")
-    wake_dir = os.path.join(tmpd, "wakeup-delivered-idempotency")
-    stub_bin = os.path.join(wake_dir, "bin")
-    wake_root = os.path.join(wake_dir, "root")
-    for dirname in (stub_bin, wake_root, os.path.join(wake_dir, "home"),
-                    os.path.join(wake_dir, "pack"), os.path.join(wake_dir, "state")):
-        os.makedirs(dirname)
-    stub_cys = os.path.join(stub_bin, "cys")
-    stub_log = os.path.join(wake_dir, "cys-stub.log")
-    with open(stub_cys, "w", encoding="utf-8") as f:
-        f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$CYS_STUB_LOG"\nexit 0\n')
-    os.chmod(stub_cys, 0o755)
-    wake_env = {"HOME": os.path.join(wake_dir, "home"),
-                "CYS_PACK_DIR": os.path.join(wake_dir, "pack"),
-                "CYS_STATE_DIR": os.path.join(wake_dir, "state"), "JAVIS_ROOT": wake_root,
-                "JAVIS_WAKEUP_LIVENESS": "alive", "CYS_AUTOPILOT_NO_SEND": "0",
-                "CYS_STUB_LOG": stub_log, "PYTHONDONTWRITEBYTECODE": "1",
-                # wakeup 은 argv 의 literal cys 를 실행한다 — PATH 선두도 스텁에 고정.
-                "PATH": stub_bin + os.pathsep + os.environ.get("PATH", "")}
-    deliveries, pending_removed = [], []
-    pending_path = os.path.join(wake_root, "_round", "wakeups", "pending",
-                                "master__autopilot-held-limit.json")
-    with patch.dict(globals(), {"CYS": stub_cys}), patch.dict(os.environ, wake_env):
-        for _ in range(2):
-            deliveries.append(escalate("동일 본문", task_key="autopilot-held-limit"))
-            pending_removed.append(not os.path.exists(pending_path))
-    stub_calls = []
-    if os.path.exists(stub_log):
-        with open(stub_log, encoding="utf-8") as f:
-            stub_calls = [line.split()[0] for line in f if line.strip()]
-    send_count, send_key_count = stub_calls.count("send"), stub_calls.count("send-key")
-    wake_records = []
-    wake_log = os.path.join(wake_root, "_round", "wakeups", "queue.jsonl")
-    if os.path.exists(wake_log):
-        with open(wake_log, encoding="utf-8") as f:
-            wake_records = [json.loads(line) for line in f if line.strip()]
-    t.check("동일 held-limit 본문 2회: 실제 wakeup 배달 뒤 멱등키 소멸 → send 2회",
-            send_count == 2 and deliveries == [(True, ""), (True, "")]
-            and pending_removed == [True, True]
-            and [r.get("event") for r in wake_records] == ["queued", "delivered", "queued", "delivered"],
-            "send=%d send-key=%d deliveries=%r pending_removed=%r" %
-            (send_count, send_key_count, deliveries, pending_removed))
+    if os.name == "nt":
+        # Windows CreateProcess 는 literal "cys" 에 .exe 만 붙여 찾으므로 무확장자 sh 스텁을 못 쓴다
+        #   (javis_wakeup.py 의 ["cys", "send", ...]) — 케이스 [1] fork SKIP 선례 동형. POSIX CI 가 확증.
+        print("  [SKIP] 18-b 는 PATH 상 무확장자 cys 셸 스텁 필요 — Windows 미지원(PASS 아님). "
+              "POSIX 에서 실행.")
+    else:
+        _ISOLATED_SOCK = os.path.join(tmpd, "no-such-cysd.sock")  # 존재하지 않는 소켓 — 실데몬 접속 불능
+        wake_dir = os.path.join(tmpd, "wakeup-delivered-idempotency")
+        stub_bin = os.path.join(wake_dir, "bin")
+        wake_root = os.path.join(wake_dir, "root")
+        for dirname in (stub_bin, wake_root, os.path.join(wake_dir, "home"),
+                        os.path.join(wake_dir, "pack"), os.path.join(wake_dir, "state")):
+            os.makedirs(dirname)
+        stub_cys = os.path.join(stub_bin, "cys")
+        stub_log = os.path.join(wake_dir, "cys-stub.log")
+        with open(stub_cys, "w", encoding="utf-8") as f:
+            f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$CYS_STUB_LOG"\nexit 0\n')
+        os.chmod(stub_cys, 0o755)
+        wake_env = {"HOME": os.path.join(wake_dir, "home"),
+                    "CYS_PACK_DIR": os.path.join(wake_dir, "pack"),
+                    "CYS_STATE_DIR": os.path.join(wake_dir, "state"), "JAVIS_ROOT": wake_root,
+                    "JAVIS_WAKEUP_LIVENESS": "alive", "CYS_AUTOPILOT_NO_SEND": "0",
+                    "CYS_STUB_LOG": stub_log, "PYTHONDONTWRITEBYTECODE": "1",
+                    # 실데몬 누출 차단: 스텁이 PATH 에서 안 잡히면 진짜 cys 가 실배달한다(실측 2026-10-14 —
+                    # Windows 에서 master 입력창에 4건 누출). CYS_SOCKET 이 AITERM_SOCKET 보다 우선이라 둘 다 고정.
+                    "CYS_SOCKET": _ISOLATED_SOCK, "AITERM_SOCKET": _ISOLATED_SOCK,
+                    # wakeup 은 argv 의 literal cys 를 실행한다 — PATH 선두도 스텁에 고정.
+                    "PATH": stub_bin + os.pathsep + os.environ.get("PATH", "")}
+        deliveries, pending_removed = [], []
+        pending_path = os.path.join(wake_root, "_round", "wakeups", "pending",
+                                    "master__autopilot-held-limit.json")
+        with patch.dict(globals(), {"CYS": stub_cys}), patch.dict(os.environ, wake_env):
+            for _ in range(2):
+                deliveries.append(escalate("동일 본문", task_key="autopilot-held-limit"))
+                pending_removed.append(not os.path.exists(pending_path))
+        stub_calls = []
+        if os.path.exists(stub_log):
+            with open(stub_log, encoding="utf-8") as f:
+                stub_calls = [line.split()[0] for line in f if line.strip()]
+        send_count, send_key_count = stub_calls.count("send"), stub_calls.count("send-key")
+        wake_records = []
+        wake_log = os.path.join(wake_root, "_round", "wakeups", "queue.jsonl")
+        if os.path.exists(wake_log):
+            with open(wake_log, encoding="utf-8") as f:
+                wake_records = [json.loads(line) for line in f if line.strip()]
+        t.check("동일 held-limit 본문 2회: 실제 wakeup 배달 뒤 멱등키 소멸 → send 2회",
+                send_count == 2 and deliveries == [(True, ""), (True, "")]
+                and pending_removed == [True, True]
+                and [r.get("event") for r in wake_records] == ["queued", "delivered", "queued", "delivered"],
+                "send=%d send-key=%d deliveries=%r pending_removed=%r" %
+                (send_count, send_key_count, deliveries, pending_removed))
 
     print("\n결과: PASS %d / FAIL %d" % (t.ok, len(t.fail)))
     if t.fail:

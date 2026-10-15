@@ -209,8 +209,11 @@ def run(cmd, timeout=RUN_TIMEOUT, stdin_text=None):
     """subprocess 러너 — (rc, stdout, stderr). 예외도 rc!=0 로 정규화(fail-soft)."""
     try:
         # 창 정책은 블록 밖 `_CAPTURE_SPAWN_KW`(파일별 정의 — autopilot=nt NOWIN · verifier=빈 dict).
+        # stdin 미지정 시 부모의 STD_INPUT_HANDLE 을 상속하는데, cysd 잡 스폰은 그 핸들이 무효라
+        # [WinError 6] → rc127 → kill_switch fail-closed 가 된다. input 이 없으면 DEVNULL 로 묶는다.
+        stdio = {"input": stdin_text} if stdin_text is not None else {"stdin": subprocess.DEVNULL}
         p = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout, input=stdin_text, **_CAPTURE_SPAWN_KW)
+                           timeout=timeout, **stdio, **_CAPTURE_SPAWN_KW)
         return p.returncode, p.stdout or "", p.stderr or ""
     except Exception as e:  # noqa: BLE001 — 러너는 절대 예외를 올리지 않는다
         return 127, "", "runner error: %s" % e

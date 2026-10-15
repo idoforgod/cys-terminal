@@ -60,10 +60,28 @@ def round_dir(arg):
 
 
 # ── DB 발견 (label 정규식 + 개행/손상 방어) ──────────────────────────────────────────
+def _db_candidates():
+    """(label, path) 후보. unix: ~/.local/state/<label>/analytics.db(평면).
+    Windows: 데몬 정본 %LOCALAPPDATA%/cys(state.rs state_dir/pipe_slug — javis_phoenix
+    _live_state_dir·javis_state_snapshot _win_state_dir_for_socket 와 동일 규약). 기본 데몬 DB 는
+    루트 직하 cys/analytics.db, 부서 DB 는 그 하위 cys/cys-dept-*/analytics.db(중첩)."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(
+            os.path.expanduser("~"), "AppData", "Local")
+        root = os.path.join(base, "cys")
+        out = [("cys", os.path.join(root, "analytics.db"))]
+        pattern = os.path.join(root, "*", "analytics.db")
+    else:
+        out = []
+        pattern = os.path.join(state_dir(), "*", "analytics.db")
+    for path in sorted(glob.glob(pattern)):
+        out.append((os.path.basename(os.path.dirname(path)), path))
+    return out
+
+
 def discover_dbs():
     found = []
-    for path in sorted(glob.glob(os.path.join(state_dir(), "*", "analytics.db"))):
-        label = os.path.basename(os.path.dirname(path))
+    for label, path in _db_candidates():
         if "\n" in label or "\r" in label:           # 개행 든 손상 dir 방어 skip
             continue
         if not LABEL_RE.match(label):                 # 무관 dir 배제
@@ -83,6 +101,7 @@ def read_db(path, cutoff_ts):
            "cost_all_time": None, "bash_count": 0}
     try:
         con = _ro_connect(path)
+        con.execute("SELECT count(*) FROM sqlite_master").fetchone()  # 손상 DB 를 0 합산 대신 skip 으로
     except sqlite3.Error as e:
         return {"error": "connect: %s" % e}
     try:
@@ -327,6 +346,8 @@ def render_digest(rep):
         len(rep["dbs_scanned"]), ", ".join(rep["dbs_scanned"][:6])
         + (" …" if len(rep["dbs_scanned"]) > 6 else ""),
         "  ⚠skip %d" % len(rep["dbs_skipped"]) if rep["dbs_skipped"] else ""))
+    if not rep["dbs_scanned"]:                        # 조용한 0 방지 — 아래 0은 측정값이 아니다
+        L.append("• ⚠ analytics.db 를 하나도 찾지 못함 — 아래 수치 0은 실측이 아님(경로 확인)")
     top = ", ".join("%s=%d" % (t["tool"], t["count"]) for t in f["tools"][:6])
     L.append("• 도구 채택(PRE_TOOL): %s" % (top or "없음"))
     if f["subagents"]:
