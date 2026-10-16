@@ -790,3 +790,49 @@ fn observation_changes_no_operational_field() {
     );
     assert_eq!(before, after);
 }
+
+/// repaint.rs production resize path (`apply_resize` → `set_parser_size`): a same-size resize is a new view.
+#[test]
+fn production_resize_path_bumps_the_view_even_at_the_same_size() {
+    let f = fx("apply-resize");
+    let s = seat(&f, "worker", Some("claude"));
+    let v0 = s.activity_view_rev.load(Ordering::SeqCst);
+    let (rows, cols) = s.parser.lock().unwrap().screen().size();
+    crate::repaint::apply_resize(&s, rows, cols).expect("same-size resize");
+    assert!(s.activity_view_rev.load(Ordering::SeqCst) > v0, "same-size resize must invalidate continuity");
+}
+
+/// U4-4 census pin: every production identity/view write site named in the census carries its display
+/// guard right at the site. Structural, anchored on exact source lines (each anchor must occur once).
+/// Behavioural bindings exist for set_meta, quiesce-on and resize; this pin binds the rest
+/// (unix re-observation, Windows staging, Windows second-sample commit, session capture, clear repin,
+/// reader parser replacement).
+#[test]
+fn u4_4_identity_census_every_named_production_site_is_guarded() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
+    // (file, anchor line (trimmed), guard token, lines before (+) or after (-) the anchor to search)
+    let census: &[(&str, &str, &str, i32)] = &[
+        ("handlers.rs", "*s.agent_meta.lock().unwrap() = Some((agent.clone(), bin.clone()));", "crate::activity::IdentityWrite::begin(&s)", 3),
+        ("handlers.rs", "*s.pending_agent_obs.lock().unwrap() = Some((agent, bin, crate::state::now_epoch()));", "crate::activity::IdentityWrite::begin(&s)", 2),
+        ("handlers.rs", "*surface.agent_meta.lock().unwrap() = Some((agent.clone(), agent_bin));", "crate::activity::IdentityWrite::begin(&surface)", 2),
+        ("handlers.rs", "*pin = Some(new_sid.clone());", "crate::activity::IdentityWrite::begin(&surface)", 2),
+        ("handlers.rs", "let at = crate::state::now_epoch();", "crate::activity::invalidate_identity(&surface)", 2),
+        ("governance.rs", "*s.agent_meta.lock().unwrap() = Some((agent.clone(), bin.clone()));", "crate::activity::IdentityWrite::begin(&s)", 2),
+        ("usage.rs", "*s.agent_session_id.lock().unwrap() = Some(sid);", "crate::activity::IdentityWrite::begin(s)", 2),
+        ("repaint.rs", "match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.set_size(rows, cols))) {", "crate::activity::bump_view(s)", 3),
+        ("state.rs", "process_chunk_isolated(&mut parser, chunk, dsr_count);", "crate::activity::bump_view(&surf)", -4),
+    ];
+    for (file, anchor, guard, span) in census {
+        let src = std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        let lines: Vec<&str> = src.lines().collect();
+        let hits: Vec<usize> = lines.iter().enumerate().filter(|(_, l)| l.trim() == *anchor).map(|(i, _)| i).collect();
+        assert_eq!(hits.len(), 1, "{file}: anchor must occur exactly once: {anchor}");
+        let i = hits[0];
+        let window: Vec<&str> = if *span > 0 {
+            lines[i.saturating_sub(*span as usize)..i].to_vec()
+        } else {
+            lines[i + 1..(i + 1 + (-*span) as usize).min(lines.len())].to_vec()
+        };
+        assert!(window.iter().any(|l| l.contains(guard)), "{file}:{}: `{anchor}` lacks `{guard}` within {span} lines", i + 1);
+    }
+}
