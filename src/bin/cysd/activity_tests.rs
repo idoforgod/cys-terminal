@@ -1262,13 +1262,27 @@ mod corpus_replay {
         Some((idle.start, resting, bound))
     }
 
+    /// A2: the frame ITSELF is incomplete — an open ?2026 block, or the family's own grammar returns NoMatch (raw
+    /// `Grammar::classify`, bypassing the classify_with / sample_frame mapping U4-1 governs) with no other family's
+    /// complete signature. A mutant of that mapping cannot hide these frames from the positive control.
+    fn frame_incomplete(frame: &Frame, fam: Family) -> bool {
+        if frame.sync {
+            return true;
+        }
+        let text = frame.text_rows();
+        let v = View { rows: &text, size: (frame.rows, frame.cols), cursor: frame.cursor, alt: frame.alt, title: &frame.title };
+        let complete = |g: &&&dyn Grammar| matches!(g.classify(&v), Verdict::Active { .. } | Verdict::Idle | Verdict::Decision(_));
+        let own_nomatch = grammars().iter().find(|g| g.family() == fam).is_some_and(|g| g.classify(&v) == Verdict::NoMatch);
+        own_nomatch && !grammars().iter().filter(|g| g.family() != fam).any(|g| complete(&g))
+    }
+
     /// (a) a sample after every read. Returns (report, sandwiches, held).
     fn per_read(cap: &Capture) -> (Value, u64, u64) {
         let no_cap = Params { static_n: u32::MAX, ..P };
         let mut parser = vt100::Parser::new(cap.rows, cap.cols, crate::state::SCROLLBACK_LINES);
         let mut frame = Frame::new();
         let mut red = Reducer::new(0.0);
-        let mut seq: Vec<(f64, Sample, Effective, Effective)> = Vec::with_capacity(cap.outputs.len());
+        let mut seq: Vec<(f64, Sample, Effective, Effective, bool)> = Vec::with_capacity(cap.outputs.len());
         let mut by_phase = serde_json::Map::new();
         let mut fidelity = Value::Null;
         for (t, b) in &cap.outputs {
@@ -1280,10 +1294,14 @@ mod corpus_replay {
                 }
             }
             parser.process(b);
-            let s = sample_at(&parser, &mut frame, cap.family);
+            let (s, raw_incomplete) = if copy_window(parser.screen(), &mut frame) {
+                (sample_frame(cap.family, &frame, grammars()).0, frame_incomplete(&frame, cap.family))
+            } else {
+                (Sample::Semantic(Semantic::UnsupportedGeometry), false)
+            };
             let before = red.effective;
             red.step(s, t / 1000.0, &no_cap);
-            seq.push((*t, s, before, red.effective));
+            seq.push((*t, s, before, red.effective, raw_incomplete));
             let phase = phase_at(&cap.gt, *t).map_or("(none)".to_string(), |g| g.phase.clone());
             let entry = by_phase.entry(phase).or_insert_with(|| json!({}));
             bump(entry.as_object_mut().expect("object"), &name(&s));
@@ -1294,9 +1312,13 @@ mod corpus_replay {
             }
         }
         let (mut sandwiches, mut held, mut run, mut max_run, mut active_reads, mut active_incomplete) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // A2 cross-check: frames the pipeline labelled Incomplete vs frames that ARE incomplete (equal on a correct tree).
+        let (mut verdict_incomplete_frames, mut raw_incomplete_frames) = (0u64, 0u64);
         let mut examples = Vec::new();
         for i in 0..seq.len() {
-            let (t, s, before, after) = seq[i];
+            let (t, s, before, after, raw) = seq[i];
+            verdict_incomplete_frames += u64::from(s == Sample::Transient(Transient::Incomplete));
+            raw_incomplete_frames += u64::from(raw);
             let in_active = cat_at(&cap.gt, t) == Cat::Active;
             let incomplete = s == Sample::Transient(Transient::Incomplete);
             if in_active {
@@ -1311,7 +1333,8 @@ mod corpus_replay {
             } else {
                 run = 0;
             }
-            if incomplete && in_active && i > 0 && i + 1 < seq.len() && before == Effective::Working {
+            // A2: candidates are frames that ARE incomplete; the pipeline's verdict on them is what is being judged.
+            if raw && in_active && i > 0 && i + 1 < seq.len() && before == Effective::Working {
                 let prev_active = matches!(seq[i - 1].1, Sample::Active { .. });
                 let next_active = matches!(seq[i + 1].1, Sample::Active { .. });
                 if prev_active && next_active {
@@ -1319,7 +1342,7 @@ mod corpus_replay {
                     if after == Effective::Working {
                         held += 1;
                     } else if examples.len() < 5 {
-                        examples.push(json!({"t_ms": t, "after": after.as_str()}));
+                        examples.push(json!({"t_ms": t, "after": after.as_str(), "sample": name(&s)}));
                     }
                 }
             }
@@ -1333,6 +1356,8 @@ mod corpus_replay {
                 "active_incomplete": active_incomplete,
                 "active_incomplete_rate": rate,
                 "max_consecutive_incomplete_in_active": max_run,
+                "frames_labelled_incomplete": verdict_incomplete_frames,
+                "frames_raw_incomplete": raw_incomplete_frames,
                 "split_repaint_sandwiches": sandwiches,
                 "sandwiches_working_held": held,
                 "sandwich_drop_examples": examples,
@@ -1506,6 +1531,9 @@ mod corpus_replay {
         for c in index["captures"].as_array().expect("captures array") {
             let Some((cap, prov)) = load(&base, c, &mut failures) else { continue };
             let (pr, sandwiches, held) = per_read(&cap);
+            if pr["frames_labelled_incomplete"] != pr["frames_raw_incomplete"] {
+                failures.push(format!("{}: A2 cross-check — {} frames labelled Incomplete but {} frames are incomplete", cap.id, pr["frames_labelled_incomplete"], pr["frames_raw_incomplete"]));
+            }
             let tot = fam_totals.entry(cap.family.as_str()).or_default();
             tot.0 += 1;
             tot.1 += sandwiches;
