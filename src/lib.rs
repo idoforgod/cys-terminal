@@ -3708,6 +3708,7 @@ mod tests {
             ("src/bin/cys.rs", 1),
             ("src/bin/cysd/boot_supervisor.rs", 1),
             ("src/bin/cysd/main.rs", 2),
+            ("src/bin/cysd/native_publication_transition_tests.rs", 1), // sealed isolated fixture supervisor
             ("src-tauri/src/main.rs", 4),
         ];
 
@@ -3748,6 +3749,7 @@ mod tests {
         for (rel, marker) in [
             ("src/bin/cysd/boot_supervisor.rs", "ENV_PY_NO_BYTECODE"),
             ("src/bin/cysd/main.rs", "ENV_PY_NO_BYTECODE"),
+            ("src/bin/cysd/native_publication_transition_tests.rs", "PYTHONDONTWRITEBYTECODE"),
             ("src-tauri/src/main.rs", "inject_runtime_path"),
         ] {
             let src = std::fs::read_to_string(root.join(rel)).unwrap();

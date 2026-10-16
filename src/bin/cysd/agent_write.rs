@@ -83,7 +83,17 @@ pub struct Plan {
     submit: Option<Submit>,
 }
 
+/// Exact private borrowed projection for durable codecs; no default serialization or Debug.
+/// It does not reconstruct an executable plan or authorize writes from recovered data.
+pub struct PlanView<'a> {
+    pub clear_first:bool,pub clear_settle_ms:u64,pub body:Option<&'a str>,pub fenced:bool,
+    pub control:Option<&'a [u8]>,pub submit:Option<Submit>,
+}
 impl Plan {
+    pub fn exact_view(&self)->PlanView<'_> {
+        PlanView { clear_first:self.clear_first,clear_settle_ms:self.clear_settle_ms,body:self.body.as_deref(),
+            fenced:self.fenced,control:self.control.as_deref(),submit:self.submit }
+    }
     fn empty() -> Plan {
         Plan { clear_first: false, clear_settle_ms: 0, body: None, fenced: false, control: None, submit: None }
     }
@@ -205,7 +215,7 @@ pub struct Request {
     pub created: Instant,
     cancelled: AtomicBool,
     status: Mutex<Status>,
-    /// The producer's settlement closure has returned (or there was none).
+    /// In-process completion ended, including a caught callback panic. Not durable source settlement.
     settled: AtomicBool,
     /// When the receiver proof was last lost (admission or recheck): the S4-1 resume window counts from here.
     lost_at: Mutex<Option<Instant>>,
@@ -227,7 +237,7 @@ impl Request {
             native: Mutex::new(NativeState::default()),
         })
     }
-    /// The terminal is recorded and the producer's settlement has run.
+    /// The terminal is recorded and in-process settlement ended; this is not a durable source receipt.
     pub fn is_settled(&self) -> bool {
         self.settled.load(Ordering::Acquire)
     }
@@ -287,20 +297,22 @@ struct NativeState {
     running: bool,
     resume: Option<Envelope>,
     final_outcome: bool,
+    completion_key: Option<Arc<()>>,
+    settling: bool,
 }
 
 impl Request {
     pub fn native_progress(&self) -> NativeProgress {
         self.native.lock().unwrap_or_else(|e| e.into_inner()).progress
     }
-    fn begin_run(&self, plan: &Plan, resume: Option<Envelope>) -> Result<(), NativeProgress> {
+    fn begin_run(&self, plan: &Plan, resume: Option<Envelope>) -> Result<Arc<()>, NativeProgress> {
         let mut state=self.native.lock().unwrap_or_else(|e| e.into_inner());
         let p=state.progress;
         let permitted=match resume {
             Some(env)=>state.resume==Some(env) && env==p.envelope,
             None=>state.resume.is_none() && p.proven_zero(),
         };
-        if state.running || state.final_outcome || p.outstanding || p.unknown || !permitted
+        if state.running || state.settling || state.final_outcome || p.outstanding || p.unknown || !permitted
             || state.plan.as_ref().is_some_and(|original|original!=plan) {
             return Err(p);
         }
@@ -308,14 +320,22 @@ impl Request {
         state.running=true;
         state.resume=None;
         state.progress.run_accepted=Accepted::default();
+        let key=Arc::new(());state.completion_key=Some(key.clone());
         self.settled.store(false, Ordering::Release);
-        Ok(())
+        Ok(key)
     }
-    fn end_run(&self, terminal: &Terminal) {
+    fn end_run(&self, key:&Arc<()>, terminal: &Terminal)->Option<NativeProgress> {
         let mut state=self.native.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.completion_key.as_ref().is_some_and(|current|Arc::ptr_eq(current,key)) { return None; }
         state.running=false;
         state.resume=match terminal { Terminal::PartialExact{envelope,..}=>Some(*envelope),_=>None };
         state.final_outcome=!matches!(terminal,Terminal::RefusedNoWrite{..}|Terminal::PartialExact{..});
+        Some(state.progress)
+    }
+    fn claim_completion(&self,key:&Arc<()>)->bool {
+        let mut state=self.native.lock().unwrap_or_else(|e|e.into_inner());
+        if state.running || state.settling || !state.completion_key.as_ref().is_some_and(|current|Arc::ptr_eq(current,key)) { return false; }
+        state.settling=true;true
     }
     fn native_call(&self, envelope: Envelope, accepted: Accepted, write: bool) -> NativeCall<'_> {
         let mut state=self.native.lock().unwrap_or_else(|e| e.into_inner());
@@ -368,6 +388,24 @@ pub trait Proof: Send + Sync {
 pub trait Journal: Send + Sync {
     fn writing(&self, req: &Request) -> std::io::Result<()>;
     fn terminal(&self, req: &Request, t: &Terminal, envelope: &Envelope) -> std::io::Result<()>;
+    /// Actual writer context, never a constructor-captured approximation of the job's plan.
+    fn writing_context(&self,ctx:&ProofContext<'_>)->std::io::Result<()> { self.writing(ctx.request) }
+    /// Only finish constructs this receipt after claiming the exact completed run.
+    fn terminal_receipt(&self,receipt:&WriterReceipt<'_>)->std::io::Result<()> {
+        self.terminal(receipt.request(),receipt.terminal(),&receipt.envelope())
+    }
+}
+
+/// Read-only actual completion facts. No public constructor, Clone or deserialization path.
+/// This is writer provenance, not proof of durable source/association settlement.
+pub struct WriterReceipt<'a> { completed:&'a CompletedRun }
+impl WriterReceipt<'_> {
+    pub fn request(&self)->&Request { &self.completed.request }
+    pub fn plan(&self)->&Plan { &self.completed.plan }
+    pub fn terminal(&self)->&Terminal { &self.completed.terminal }
+    pub fn envelope(&self)->Envelope { self.completed.envelope }
+    pub fn native_progress(&self)->NativeProgress { self.completed.native }
+    pub fn resumed(&self)->bool { self.completed.resumed }
 }
 
 pub type Settle = Box<dyn FnOnce(&Terminal) + Send>;
@@ -418,16 +456,36 @@ pub struct Executed {
     pub transport_broken: bool,
     /// A `writing` record was made durable, so a terminal record is owed.
     pub journaled: bool,
+    completed: Option<CompletedRun>,
+}
+struct CompletedRun {
+    request:Arc<Request>,key:Arc<()>,plan:Plan,terminal:Terminal,envelope:Envelope,
+    native:NativeProgress,resumed:bool,journaled:bool,journal:Option<Arc<dyn Journal>>,
+}
+struct Completing<'a> { request:&'a Request,key:&'a Arc<()> }
+impl Drop for Completing<'_> {
+    fn drop(&mut self) {
+        let mut state=self.request.native.lock().unwrap_or_else(|e|e.into_inner());
+        if state.completion_key.as_ref().is_some_and(|current|Arc::ptr_eq(current,self.key)) {
+            state.completion_key=None;state.settling=false;
+        }
+    }
 }
 
 impl Executed {
-    /// A panic inside a job: the amount is unknown (a lower bound, never zero by assumption).
-    pub fn panicked(job: &AgentJob) -> Executed {
+    fn unowned(progress:NativeProgress,reason:&str)->Self {
+        Self { terminal:Terminal::PartialUnknown { envelope:progress.envelope,accepted:Accepted::default(),reason:reason.into() },
+            envelope:progress.envelope,transport_broken:false,journaled:false,completed:None }
+    }
+    /// The key was captured BEFORE this run started; never recover another run's current key.
+    fn panicked(job: &AgentJob,key:Arc<()>) -> Executed {
         let progress=job.request.native_progress();
         let terminal=Terminal::PartialUnknown { envelope:progress.envelope,
             accepted:progress.run_accepted, reason:"writer_panic".into() };
-        job.request.end_run(&terminal);
-        Executed { terminal, envelope:progress.envelope, transport_broken:false, journaled:job.journal.is_some() }
+        let Some(native)=job.request.end_run(&key,&terminal) else { return Self::unowned(progress,"panic_owner_conflict"); };
+        Self { terminal:terminal.clone(),envelope:progress.envelope,transport_broken:false,journaled:job.journal.is_some(),
+            completed:Some(CompletedRun { request:job.request.clone(),key,plan:job.plan.clone(),terminal,
+                envelope:progress.envelope,native,resumed:job.resume.is_some(),journaled:job.journal.is_some(),journal:job.journal.clone() }) }
     }
     /// Body text accepted so far (lossy only at a short-write cut inside a character).
     pub fn accepted_body(&self, plan: &Plan) -> Option<String> {
@@ -474,7 +532,10 @@ fn calls_for(plan: &Plan, from: &Envelope) -> Vec<(Phase, Vec<u8>)> {
 
 /// One run's accounting.
 struct Run<'a> {
-    request: &'a Request,
+    request: &'a Arc<Request>,
+    plan: &'a Plan,
+    key: Arc<()>,
+    journal: Option<Arc<dyn Journal>>,
     env: Envelope,
     acc: Accepted,
     resumed: bool,
@@ -528,27 +589,35 @@ impl Run<'_> {
     }
 
     fn done(&self, terminal: Terminal, transport_broken: bool) -> Executed {
-        self.request.end_run(&terminal);
-        Executed { terminal, envelope: self.env, transport_broken, journaled: self.journaled }
+        let Some(native)=self.request.end_run(&self.key,&terminal) else { return Executed::unowned(self.request.native_progress(),"execution_owner_conflict"); };
+        Executed { terminal:terminal.clone(),envelope:self.env,transport_broken,journaled:self.journaled,
+            completed:Some(CompletedRun { request:self.request.clone(),key:self.key.clone(),plan:self.plan.clone(),
+                terminal,envelope:self.env,native,resumed:self.resumed,journaled:self.journaled,journal:self.journal.clone() }) }
     }
 }
 
 /// Execute one job against `writer`. Never retries a whole body; never writes cleanup bytes.
 pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) -> Executed {
-    let req = &job.request;
-    let start = job.resume.unwrap_or_default();
-    let mut run = Run { request:req, env: start, acc: Accepted::default(), resumed: job.resume.is_some(), journaled: false };
-    if let Err(progress)=req.begin_run(&job.plan, job.resume) {
-        return Executed { terminal: Terminal::PartialUnknown { envelope:progress.envelope,
-            accepted:Accepted::default(), reason:"native_progress_conflict".into() }, envelope:progress.envelope,
-            transport_broken:false, journaled:false };
+    let key=match job.request.begin_run(&job.plan,job.resume) {
+        Ok(key)=>key,Err(progress)=>return Executed::unowned(progress,"native_progress_conflict"),
+    };
+    // Catch with THIS run's private identity; a fallback reading the current request can steal
+    // another run's completion after a rejected/late execution.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||execute_started(writer,job,io,key.clone()))) {
+        Ok(executed)=>executed,Err(_)=>Executed::panicked(job,key),
     }
+}
+fn execute_started<W:Write>(writer:&mut W,job:&AgentJob,io:&mut WriterIo<'_>,key:Arc<()>)->Executed {
+    let req=&job.request;let start=job.resume.unwrap_or_default();
+    let mut run=Run { request:req,plan:&job.plan,key,journal:job.journal.clone(),env:start,acc:Accepted::default(),resumed:job.resume.is_some(),journaled:false };
+    let calls=calls_for(&job.plan,&start);
     if req.is_cancelled() {
         return run.done(run.stop("cancelled".into(), false), false);
     }
     // Journal barrier first (design 4.4 step 2); the fsync is a wait, so admission comes after it.
     if let Some(j) = &job.journal {
-        if let Err(e) = j.writing(req) {
+        if let Err(e) = j.writing_context(&ProofContext { request:req,plan:&job.plan,envelope:run.env,
+            accepted:run.acc,resumed:run.resumed,phase_offset:0,next_phase:calls.first().map(|(phase,_)|*phase) }) {
             // Hand this refusal to the settlement by claiming the guard first: a broken journal is
             // then held on backoff instead of being re-handed every tick. A lost claim stays the
             // handing-off caller's rollback.
@@ -563,7 +632,6 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
         return run.done(run.stop(GUARD_ABORTED.into(), true), false);
     }
     req.set(Status::Writing);
-    let calls=calls_for(&job.plan,&start);
     if let Err(loss) = job.proof.admit_context(&ProofContext { request:req, plan:&job.plan,
         envelope:run.env, accepted:run.acc, resumed:run.resumed, phase_offset:0, next_phase:calls.first().map(|(phase,_)|*phase) }) {
         req.mark_lost();
@@ -663,14 +731,26 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
 
 /// Record the terminal (journal first) and run the producer's settlement exactly once.
 pub fn finish(job: AgentJob, ex: &Executed) -> Terminal {
-    let mut terminal = ex.terminal.clone();
-    if ex.journaled {
-        if let Some(j) = &job.journal {
-            if let Err(e) = j.terminal(&job.request, &terminal, &ex.envelope) {
+    let Some(completed)=&ex.completed else { return Terminal::PartialUnknown { envelope:ex.envelope,
+        accepted:Accepted::default(),reason:"completion_owner_conflict".into() }; };
+    if !Arc::ptr_eq(&job.request,&completed.request) || job.plan!=completed.plan || job.resume.is_some()!=completed.resumed
+        || !job.request.claim_completion(&completed.key) {
+        return Terminal::PartialUnknown { envelope:job.request.native_progress().envelope,
+            accepted:Accepted::default(),reason:"completion_owner_conflict".into() };
+    }
+    let _completing=Completing { request:&job.request,key:&completed.key };
+    let mut terminal=completed.terminal.clone();
+    if completed.journaled {
+        if let Some(j) = &completed.journal {
+            let receipt=WriterReceipt { completed };
+            let persisted=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||j.terminal_receipt(&receipt)))
+                .unwrap_or_else(|_|Err(std::io::Error::other("terminal journal panicked")));
+            if let Err(e) = persisted {
                 // Terminal persistence failed after possible bytes: never report success (4.5).
-                if let Terminal::WrittenBody { accepted } | Terminal::WrittenSubmitted { accepted } = terminal {
+                if let Terminal::WrittenBody { accepted } | Terminal::WrittenSubmitted { accepted }
+                    | Terminal::PartialExact { accepted,.. } | Terminal::PartialUnknown { accepted,.. } = terminal {
                     terminal = Terminal::PartialUnknown {
-                        envelope: ex.envelope,
+                        envelope: completed.envelope,
                         accepted,
                         reason: format!("journal_terminal:{e}"),
                     };
@@ -678,7 +758,7 @@ pub fn finish(job: AgentJob, ex: &Executed) -> Terminal {
             }
         }
     }
-    job.request.end_run(&terminal);
+    job.request.end_run(&completed.key,&terminal);
     job.request.set(Status::Terminal(terminal.clone()));
     if let Some(settle) = job.settle {
         let t = terminal.clone();
@@ -1692,15 +1772,12 @@ mod tests {
     fn c8i_panic_preserves_known_prefix_and_marks_unknown_completion() {
         let j=job(Plan::raw("abcdef").with_submit(0,0),FakeProof::healthy());
         let mut w=NativeWatch{request:j.request.clone(),seen:Vec::new(),panic_at:Some(2),max:2};
-        let unwind=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||run_native_watch(&mut w,&j)));
-        let panic=match unwind { Err(p)=>p,Ok(_)=>panic!("premise: native write must unwind") };
-        let message=panic.downcast_ref::<&str>().copied().or_else(||panic.downcast_ref::<String>().map(String::as_str));
-        assert_eq!(message,Some("controlled native uncertainty"),"panic must originate in the intended native fixture");
+        let ex=run_native_watch(&mut w,&j);
+        assert!(matches!(&ex.terminal,Terminal::PartialUnknown { reason,.. } if reason=="writer_panic"),"controlled native panic must return through its actual execution owner");
         assert_eq!(w.seen.len(),2);
         let progress=j.request.native_progress();
         assert!(progress.unknown&&!progress.outstanding&&!progress.proven_zero(),"native unwind leaves sticky unknown completion, never exact zero");
         assert_eq!(progress.accepted_total,2,"known lower bound survives uncertain later completion");
-        let ex=Executed::panicked(&j);
         assert_eq!(ex.envelope.body_offset,2,"panic conversion preserves the last exact prefix");
         assert!(matches!(ex.terminal,Terminal::PartialUnknown{accepted:Accepted{payload:2,..},..}),"panic terminal retains this run's known accepted prefix");
     }
@@ -1742,8 +1819,8 @@ mod tests {
     fn c8i_first_native_panic_cannot_be_readmitted_as_zero() {
         let j=job(Plan::raw("x"),FakeProof::healthy());
         let mut w=NativeWatch{request:j.request.clone(),seen:Vec::new(),panic_at:Some(1),max:1};
-        let panic=match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||run_native_watch(&mut w,&j))) { Err(p)=>p,Ok(_)=>panic!("first native call must unwind") };
-        assert_eq!(panic.downcast_ref::<&str>().copied(),Some("controlled native uncertainty"));assert_eq!(w.seen.len(),1);
+        let ex=run_native_watch(&mut w,&j);
+        assert!(matches!(&ex.terminal,Terminal::PartialUnknown { reason,.. } if reason=="writer_panic"));assert_eq!(w.seen.len(),1);
         let p=j.request.native_progress();
         assert_eq!(p.accepted_total,0,"premise: no exact accepted lower bound");
         assert!(!p.outstanding,"premise: the call unwound");
@@ -1797,4 +1874,234 @@ mod tests {
         assert!(matches!(resumed.terminal,Terminal::PartialExact{reason,..} if reason.contains("submit_withheld")));
     }
 
+
+    struct BlockedAdmission { entered:std::sync::mpsc::Sender<()>,release:Mutex<std::sync::mpsc::Receiver<()>> }
+    impl Proof for BlockedAdmission {
+        fn admit(&self)->Result<(),ProofLoss> { self.entered.send(()).unwrap();self.release.lock().unwrap().recv().unwrap();Ok(()) }
+        fn recheck(&self,_:Phase)->Result<(),ProofLoss> { Ok(()) }
+    }
+    fn blocked_job(request:Arc<Request>)->(AgentJob,std::sync::mpsc::Receiver<()>,std::sync::mpsc::Sender<()>) {
+        let (entered,seen)=std::sync::mpsc::channel();let (release,wait)=std::sync::mpsc::channel();
+        let mut j=job(Plan::raw("owned"),FakeProof::healthy());j.request=request;
+        j.proof=Arc::new(BlockedAdmission { entered,release:Mutex::new(wait) });(j,seen,release)
+    }
+    #[test]
+    fn c8operation_rejected_execution_cannot_settle_an_active_run() {
+        let req=Request::new("same".into(),7,"test","digest".into());
+        let (running,seen,release)=blocked_job(req.clone());
+        let worker=std::thread::spawn(move||{let mut w=Rec::new();let ex=run_job(&mut w,&running);(running,ex,w.bytes())});
+        seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        let callbacks=Arc::new(std::sync::atomic::AtomicUsize::new(0));let counted=callbacks.clone();
+        let mut duplicate=job(Plan::raw("owned"),FakeProof::healthy());duplicate.request=req.clone();
+        duplicate.settle=Some(Box::new(move|_|{counted.fetch_add(1,Ordering::SeqCst);}));
+        let mut rejected_writer=Rec::new();let rejected=run_job(&mut rejected_writer,&duplicate);
+        let refused=matches!(rejected.terminal,Terminal::PartialUnknown{..});
+        finish(duplicate,&rejected);
+        let unchanged=matches!(req.status(),Status::Writing)&&!req.is_settled()&&req.native.lock().unwrap().running;
+        release.send(()).unwrap();let (running,completed,bytes)=worker.join().unwrap();finish(running,&completed);
+        assert!(refused&&rejected_writer.bytes().is_empty(),"premise: duplicate run never wrote");
+        assert!(unchanged&&callbacks.load(Ordering::SeqCst)==0,"rejected execution settled or ended another active run");
+        assert_eq!(bytes,b"owned");assert!(matches!(req.status(),Status::Terminal(Terminal::WrittenBody{..})));
+    }
+    #[test]
+    fn c8operation_late_completion_cannot_settle_a_newer_run() {
+        let mut old=job(Plan::raw("owned"),FakeProof::refusing(ProofLoss::Unknown("retry".into())));let req=old.request.clone();
+        let callbacks=Arc::new(std::sync::atomic::AtomicUsize::new(0));let counted=callbacks.clone();
+        old.settle=Some(Box::new(move|_|{counted.fetch_add(1,Ordering::SeqCst);}));
+        let first=run_job(&mut Rec::new(),&old);assert!(matches!(first.terminal,Terminal::RefusedNoWrite{..}));
+        let (running,seen,release)=blocked_job(req.clone());
+        let worker=std::thread::spawn(move||{let mut w=Rec::new();let ex=run_job(&mut w,&running);(running,ex,w.bytes())});
+        seen.recv_timeout(Duration::from_secs(5)).unwrap();finish(old,&first);
+        let unchanged=matches!(req.status(),Status::Writing)&&!req.is_settled()&&req.native.lock().unwrap().running;
+        release.send(()).unwrap();let (running,completed,bytes)=worker.join().unwrap();finish(running,&completed);
+        assert!(unchanged&&callbacks.load(Ordering::SeqCst)==0,"late completion settled or ended a newer run");
+        assert_eq!(bytes,b"owned");assert!(req.is_settled());
+    }
+
+    #[test]
+    fn c8operation_equal_request_ids_do_not_share_completion_authority() {
+        let owner=job(Plan::raw("owned"),FakeProof::healthy());let owner_request=owner.request.clone();
+        let ex=run_job(&mut Rec::new(),&owner);
+        let mut other=job(Plan::raw("owned"),FakeProof::healthy());let other_request=other.request.clone();
+        assert_eq!(owner_request.id,other_request.id);
+        let callbacks=Arc::new(std::sync::atomic::AtomicUsize::new(0));let counted=callbacks.clone();
+        other.settle=Some(Box::new(move|_|{counted.fetch_add(1,Ordering::SeqCst);}));
+        let rejected=finish(other,&ex);
+        assert!(matches!(rejected,Terminal::PartialUnknown{..}));
+        assert!(!other_request.is_settled()&&matches!(other_request.status(),Status::AcceptedPending)&&callbacks.load(Ordering::SeqCst)==0,
+            "equal request ID impersonated the original completion owner");
+        assert!(!owner_request.is_settled());
+        assert!(matches!(finish(owner,&ex),Terminal::WrittenBody{..}),"wrong-owner attempt consumed the real completion");
+    }
+
+    #[test]
+    fn c8operation_private_receipt_ignores_mutated_diagnostic_result_fields() {
+        let mut owner=job(Plan::raw("owned"),FakeProof::healthy());let req=owner.request.clone();
+        let journal=Arc::new(ActualContextJournal { request:req.clone(),plan:owner.plan.clone(),writes:Mutex::new(Vec::new()),outcomes:Mutex::new(Vec::new()),reject:false });
+        owner.journal=Some(journal.clone());
+        let mut ex=run_job(&mut Rec::new(),&owner);
+        ex.terminal=Terminal::WrittenSubmitted { accepted:Accepted::default() };ex.envelope.submitted=true;ex.journaled=false;
+        let actual=finish(owner,&ex);
+        assert!(matches!(actual,Terminal::WrittenBody { accepted:Accepted { payload:5,control:0,.. } }),
+            "mutable diagnostic fields manufactured a submitted writer receipt");
+        assert!(!req.native_progress().envelope.submitted);
+        let receipts=journal.outcomes.lock().unwrap();assert_eq!(receipts.len(),1);
+        assert!(!receipts[0].1.submitted,"mutable diagnostic envelope entered the authoritative receipt");drop(receipts);
+        let mut duplicate=job(Plan::raw("owned"),FakeProof::healthy());duplicate.request=req.clone();
+        let callbacks=Arc::new(std::sync::atomic::AtomicUsize::new(0));let counted=callbacks.clone();
+        duplicate.settle=Some(Box::new(move|_|{counted.fetch_add(1,Ordering::SeqCst);}));
+        assert!(matches!(finish(duplicate,&ex),Terminal::PartialUnknown{..}));
+        assert_eq!(callbacks.load(Ordering::SeqCst),0,"completed nonce was consumed twice");
+        assert!(matches!(req.status(),Status::Terminal(Terminal::WrittenBody{..})));
+    }
+
+    #[test]
+    fn c8operation_completion_owns_request_until_callback_returns() {
+        let mut first=job(Plan::raw("owned"),FakeProof::refusing(ProofLoss::Unknown("retry".into())));let req=first.request.clone();
+        let (entered,seen)=std::sync::mpsc::channel();let (release,wait)=std::sync::mpsc::channel();
+        first.settle=Some(Box::new(move|_|{entered.send(()).unwrap();wait.recv().unwrap();}));
+        let ex=run_job(&mut Rec::new(),&first);
+        let settling=std::thread::spawn(move||finish(first,&ex));seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut next=job(Plan::raw("owned"),FakeProof::healthy());next.request=req.clone();let mut writer=Rec::new();
+        let blocked=run_job(&mut writer,&next);let blocked_zero=writer.bytes().is_empty()&&matches!(blocked.terminal,Terminal::PartialUnknown{..});
+        finish(next,&blocked);let still_unsettled=!req.is_settled();release.send(()).unwrap();settling.join().unwrap();
+        assert!(blocked_zero&&still_unsettled,"a new run entered or settled while the prior completion owned its callback");
+        assert!(req.is_settled());
+        let mut retry=job(Plan::raw("owned"),FakeProof::healthy());retry.request=req;let mut writer=Rec::new();
+        let ex=run_job(&mut writer,&retry);assert!(matches!(finish(retry,&ex),Terminal::WrittenBody{..}));assert_eq!(writer.bytes(),b"owned");
+    }
+
+    #[derive(Clone,Debug,PartialEq,Eq)]
+    struct JournalContextRow { start:Envelope,resumed:bool,body:String,accepted:Accepted }
+    struct ActualContextJournal {
+        request:Arc<Request>,plan:Plan,writes:Mutex<Vec<JournalContextRow>>,
+        outcomes:Mutex<Vec<(Terminal,Envelope,NativeProgress,bool)>>,reject:bool,
+    }
+    impl Journal for ActualContextJournal {
+        fn writing(&self,_:&Request)->std::io::Result<()> { panic!("legacy writing hook must not be used") }
+        fn terminal(&self,_:&Request,_:&Terminal,_:&Envelope)->std::io::Result<()> { panic!("legacy terminal hook must not be used") }
+        fn writing_context(&self,c:&ProofContext<'_>)->std::io::Result<()> {
+            assert!(std::ptr::eq(c.request,self.request.as_ref()));assert_eq!(c.plan,&self.plan);
+            assert_eq!(c.phase_offset,0);assert_eq!(c.accepted,Accepted::default());
+            self.writes.lock().unwrap().push(JournalContextRow { start:c.envelope,resumed:c.resumed,body:c.plan.body().unwrap().into(),accepted:c.accepted });
+            if self.reject { Err(std::io::Error::other("fixture context refusal")) } else { Ok(()) }
+        }
+        fn terminal_receipt(&self,r:&WriterReceipt<'_>)->std::io::Result<()> {
+            assert!(std::ptr::eq(r.request(),self.request.as_ref()));assert_eq!(r.plan(),&self.plan);
+            self.outcomes.lock().unwrap().push((r.terminal().clone(),r.envelope(),r.native_progress(),r.resumed()));Ok(())
+        }
+    }
+    #[test]
+    fn c8operation_journal_receives_actual_plan_envelope_and_original_request_on_resume() {
+        let mut first=job(Plan::raw("abcdef").with_submit(0,0),FakeProof::failing_at(0,ProofLoss::Unknown("retry".into())));
+        let req=first.request.clone();let plan=first.plan.clone();
+        let journal=Arc::new(ActualContextJournal { request:req.clone(),plan:plan.clone(),writes:Mutex::new(Vec::new()),outcomes:Mutex::new(Vec::new()),reject:false });
+        first.journal=Some(journal.clone());let mut writer=Rec::new();writer.script=VecDeque::from([Step::Short(2)]);
+        let ex=run_job(&mut writer,&first);let partial=ex.envelope;assert!(matches!(finish(first,&ex),Terminal::PartialExact{..}));
+        let mut next=job(plan,FakeProof::healthy());next.request=req;next.journal=Some(journal.clone());next.resume=Some(partial);
+        let ex=run_job(&mut writer,&next);assert!(matches!(finish(next,&ex),Terminal::WrittenSubmitted{..}));
+        assert_eq!(writer.bytes(),b"abcdef\r");
+        let writes=journal.writes.lock().unwrap();assert_eq!(writes.len(),2);
+        assert_eq!(writes[0].start,Envelope::default());assert!(!writes[0].resumed);
+        assert_eq!(writes[1].start,partial);assert!(writes[1].resumed);
+        let outcomes=journal.outcomes.lock().unwrap();assert_eq!(outcomes.len(),2);
+        assert!(matches!(outcomes[0].0,Terminal::PartialExact{accepted:Accepted{payload:2,..},..}));
+        assert_eq!(outcomes[0].2.accepted_total,2);assert!(!outcomes[0].3);
+        assert!(matches!(outcomes[1].0,Terminal::WrittenSubmitted{accepted:Accepted{payload:4,control:1,..}}));
+        assert_eq!(outcomes[1].2.accepted_total,7);assert!(outcomes[1].3);
+        assert_eq!(outcomes[1].1,outcomes[1].2.envelope);
+    }
+    #[test]
+    fn c8operation_context_journal_refusal_is_before_any_native_byte() {
+        let mut j=job(Plan::paste("abc").with_clear(0).with_submit(0,0),FakeProof::healthy());
+        let journal=Arc::new(ActualContextJournal { request:j.request.clone(),plan:j.plan.clone(),writes:Mutex::new(Vec::new()),outcomes:Mutex::new(Vec::new()),reject:true });
+        j.journal=Some(journal.clone());let mut writer=Rec::new();let ex=run_job(&mut writer,&j);
+        let terminal=finish(j,&ex);
+        assert!(matches!(terminal,Terminal::RefusedNoWrite{reason} if reason.contains("fixture context refusal")));
+        assert_eq!(writer.attempts,0,"context barrier refusal wrote fence/control/body bytes");
+        assert_eq!(journal.writes.lock().unwrap().len(),1);assert!(journal.outcomes.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn c8operation_failed_partial_receipt_cannot_authorize_resume() {
+        let log=Arc::new(Mutex::new(Vec::new()));let mut j=job(Plan::raw("abcdef").with_submit(0,0),FakeProof::failing_at(0,ProofLoss::Unknown("retry".into())));
+        j.journal=Some(Arc::new(LogJournal { log,fail_writing:false,fail_terminal:true }));
+        let req=j.request.clone();let plan=j.plan.clone();let mut writer=Rec::new();writer.script=VecDeque::from([Step::Short(2)]);
+        let ex=run_job(&mut writer,&j);assert!(matches!(ex.terminal,Terminal::PartialExact{..}));let partial=ex.envelope;
+        let finished=finish(j,&ex);
+        assert!(matches!(finished,Terminal::PartialUnknown{..}),"failed partial receipt retained automatic resume authority");
+        let mut retry=job(plan,FakeProof::healthy());retry.request=req;retry.resume=Some(partial);let mut later=Rec::new();
+        let rejected=run_job(&mut later,&retry);assert!(matches!(rejected.terminal,Terminal::PartialUnknown{..}));assert!(later.bytes().is_empty());
+    }
+
+    #[test]
+    fn c8operation_completion_retains_its_original_owed_journal() {
+        for replace in [false,true] {
+            let mut j=job(Plan::raw("owned"),FakeProof::healthy());
+            let make=||Arc::new(ActualContextJournal { request:j.request.clone(),plan:j.plan.clone(),writes:Mutex::new(Vec::new()),outcomes:Mutex::new(Vec::new()),reject:false });
+            let original=make();let other=make();j.journal=Some(original.clone());
+            let ex=run_job(&mut Rec::new(),&j);
+            j.journal=if replace { Some(other.clone()) } else { None };
+            assert!(matches!(finish(j,&ex),Terminal::WrittenBody{..}));
+            assert_eq!(original.outcomes.lock().unwrap().len(),1,"the owed original terminal journal was lost or replaced");
+            assert!(other.outcomes.lock().unwrap().is_empty(),"a replacement journal received unowned writer completion");
+        }
+    }
+
+    #[test]
+    fn c8operation_late_idle_result_cannot_consume_a_newer_completion() {
+        let mut old=job(Plan::raw("owned"),FakeProof::refusing(ProofLoss::Unknown("old".into())));let req=old.request.clone();
+        let called=Arc::new(std::sync::atomic::AtomicUsize::new(0));let count=called.clone();
+        old.settle=Some(Box::new(move|_|{count.fetch_add(1,Ordering::SeqCst);}));
+        let previous=run_job(&mut Rec::new(),&old);
+        let mut current=job(Plan::raw("owned"),FakeProof::refusing(ProofLoss::Unknown("current".into())));current.request=req.clone();
+        let latest=run_job(&mut Rec::new(),&current);
+        assert!(!req.native.lock().unwrap().running,"premise: completed newer execution is idle");
+        let rejected=finish(old,&previous);
+        assert!(matches!(rejected,Terminal::PartialUnknown{..})&&called.load(Ordering::SeqCst)==0&&!req.is_settled(),
+            "older nonce consumed an idle newer completion");
+        assert!(matches!(finish(current,&latest),Terminal::RefusedNoWrite{reason} if reason.contains("current")));
+    }
+    #[test]
+    fn c8operation_same_completion_cannot_reenter_during_settlement() {
+        let mut first=job(Plan::raw("owned"),FakeProof::refusing(ProofLoss::Unknown("retry".into())));let req=first.request.clone();
+        let (entered,seen)=std::sync::mpsc::channel();let (release,wait)=std::sync::mpsc::channel();
+        first.settle=Some(Box::new(move|_|{entered.send(()).unwrap();wait.recv().unwrap();}));
+        let ex=Arc::new(run_job(&mut Rec::new(),&first));let run_ex=ex.clone();
+        let settling=std::thread::spawn(move||finish(first,&run_ex));seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        let called=Arc::new(std::sync::atomic::AtomicUsize::new(0));let count=called.clone();
+        let mut duplicate=job(Plan::raw("owned"),FakeProof::healthy());duplicate.request=req.clone();
+        duplicate.settle=Some(Box::new(move|_|{count.fetch_add(1,Ordering::SeqCst);}));
+        let rejected=finish(duplicate,&ex);let untouched=!req.is_settled()&&called.load(Ordering::SeqCst)==0;
+        release.send(()).unwrap();settling.join().unwrap();
+        assert!(matches!(rejected,Terminal::PartialUnknown{..})&&untouched,"same completion ran twice while its first settlement was active");
+    }
+    #[test]
+    fn c8operation_context_barrier_checks_the_job_plan_not_only_its_id() {
+        struct PlanJournal(Plan);
+        impl Journal for PlanJournal {
+            fn writing(&self,_:&Request)->std::io::Result<()>{Ok(())}
+            fn terminal(&self,_:&Request,_:&Terminal,_:&Envelope)->std::io::Result<()>{Ok(())}
+            fn writing_context(&self,c:&ProofContext<'_>)->std::io::Result<()> {
+                if c.plan!=&self.0 { Err(std::io::Error::other("actual plan differs")) } else { Ok(()) }
+            }
+        }
+        let mut j=job(Plan::raw("B").with_clear(0).with_submit(0,0),FakeProof::healthy());
+        j.journal=Some(Arc::new(PlanJournal(Plan::raw("A"))));let mut writer=Rec::new();let ex=run_job(&mut writer,&j);
+        assert!(matches!(finish(j,&ex),Terminal::RefusedNoWrite{reason} if reason.contains("actual plan differs"))&&writer.attempts==0,
+            "request-only journal bypassed the actual plan mismatch");
+    }
+    #[test]
+    fn c8operation_terminal_journal_panic_returns_unknown_and_releases_completion() {
+        struct PanicTerminal;
+        impl Journal for PanicTerminal {
+            fn writing(&self,_:&Request)->std::io::Result<()> { Ok(()) }
+            fn terminal(&self,_:&Request,_:&Terminal,_:&Envelope)->std::io::Result<()> { panic!("controlled terminal journal panic") }
+        }
+        let mut j=job(Plan::raw("owned"),FakeProof::healthy());let req=j.request.clone();j.journal=Some(Arc::new(PanicTerminal));
+        let ex=run_job(&mut Rec::new(),&j);
+        let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||finish(j,&ex)));
+        assert!(matches!(result,Ok(Terminal::PartialUnknown{accepted:Accepted{payload:5,..},..})),
+            "terminal journal panic escaped the writer or claimed successful completion");
+        assert!(req.is_settled());let native=req.native.lock().unwrap();assert!(!native.settling&&native.completion_key.is_none());
+    }
 }

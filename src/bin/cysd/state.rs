@@ -7810,10 +7810,8 @@ pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::Queu
                         on_first_byte: &mut on_first_byte,
                         on_body_written: &mut on_body_written,
                     };
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        crate::agent_write::execute(&mut writer, &job, &mut io)
-                    }))
-                    .unwrap_or_else(|_| crate::agent_write::Executed::panicked(&job))
+                    // execute catches a job panic with the identity of the run it actually began.
+                    crate::agent_write::execute(&mut writer, &job, &mut io)
                 };
                 if let (Some(t), true) = (&track, began) {
                     t.note_wrote();
