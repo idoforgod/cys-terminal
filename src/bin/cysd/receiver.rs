@@ -91,6 +91,32 @@ impl WeakRisk {
 pub struct Recipe {
     /// Base name of the configured binary (`agent_candidates_from_json` semantics).
     pub bin: String,
+    /// A declaration-derived constraint, never inferred from a matching process.
+    #[serde(default)]
+    pub declared_invocation: Option<DeclaredInvocation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeclaredInvocation {
+    pub argv: Vec<Vec<u8>>,
+    pub script_index: Option<usize>,
+    pub allowed_suffixes: Vec<Vec<DeclaredArgument>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeclaredArgument {
+    Literal(Vec<u8>),
+    SessionId { prefix: Vec<u8>, suffix: Vec<u8> },
+}
+
+impl DeclaredArgument {
+    fn matches(&self, actual: &[u8]) -> bool {
+        match self {
+            Self::Literal(value) => value == actual,
+            Self::SessionId { prefix, suffix } => actual.len() > prefix.len() + suffix.len()
+                && actual.starts_with(prefix) && actual.ends_with(suffix),
+        }
+    }
 }
 
 // Raw serialization is explicit private persistence, not the public receipt shape.
@@ -248,6 +274,73 @@ const SCRIPT_RUNTIMES: [&str; 3] = ["node", "nodejs", "bun"];
 /// Strict slot match: only the executable, argv0-in-versioned-install-dir, or the runtime's script
 /// position counts — never an arbitrary argument (a `tail` operand or help text naming the agent).
 pub fn match_slot(recipe: &Recipe, obs: &ProcessObservation) -> Option<Slot> {
+    obs.invocation.argv.first().filter(|arg| !arg.is_empty())?;
+    if let Some(declared) = &recipe.declared_invocation {
+        let expected0 = std::str::from_utf8(declared.argv.first()?).ok()?;
+        if !bin_eq(expected0, &recipe.bin) || declared.argv.first()?.is_empty() {
+            return None;
+        }
+        let slot = if let Some(index) = declared.script_index {
+            let exe = std::str::from_utf8(&obs.identity.executable).ok()?;
+            if !is_script_runtime(&recipe.bin) || !same_script_runtime(exe, &recipe.bin)
+                || runtime_script_slot(&declared.argv) != Some(index)
+                || runtime_script_slot(&obs.invocation.argv) != Some(index)
+            {
+                return None;
+            }
+            Slot::Script(index)
+        } else {
+            if generic_interpreter_recipe(&recipe.bin) { return None; }
+            match_unconstrained_slot(recipe, obs)?
+        };
+        // For a declared runtime, preserve runtime options AND the exact script argument.
+        // For native/npm agent programs, compare arguments after their actual invocation slot.
+        let actual = if declared.script_index.is_some() {
+            obs.invocation.argv.get(1..)?
+        } else {
+            adapter_args(obs, slot)
+        };
+        let expected = declared.argv.get(1..)?;
+        if !actual.starts_with(expected) { return None; }
+        let suffix = &actual[expected.len()..];
+        if !suffix.is_empty() && !declared.allowed_suffixes.iter().any(|pattern| {
+            pattern.len() == suffix.len() && pattern.iter().zip(suffix).all(|(p, a)| p.matches(a))
+        }) { return None; }
+        return Some(slot);
+    }
+    // Old/private data and direct constructors cannot revive an interpreter-as-agent recipe.
+    // This is a known-infrastructure guard; current custom declarations also retain their args.
+    if generic_interpreter_recipe(&recipe.bin) { return None; }
+    match_unconstrained_slot(recipe, obs)
+}
+
+pub(crate) fn is_script_runtime(bin: &str) -> bool {
+    let (name, _) = strip_exe(base_name(bin));
+    SCRIPT_RUNTIMES.iter().any(|runtime| name.eq_ignore_ascii_case(runtime))
+}
+
+fn same_script_runtime(a: &str, b: &str) -> bool {
+    let normalize = |name: &str| {
+        let (name, _) = strip_exe(base_name(name));
+        match name.to_ascii_lowercase().as_str() {
+            "node" | "nodejs" => Some("node"), "bun" => Some("bun"), _ => None,
+        }
+    };
+    matches!((normalize(a), normalize(b)), (Some(a), Some(b)) if a == b)
+}
+
+pub(crate) fn generic_interpreter_recipe(bin: &str) -> bool {
+    let (name, _) = strip_exe(base_name(bin));
+    let name = name.to_ascii_lowercase();
+    is_script_runtime(&name)
+        || matches!(name.as_str(), "sh" | "bash" | "zsh" | "dash" | "fish" | "ksh"
+            | "csh" | "tcsh" | "login" | "env" | "powershell" | "pwsh" | "cmd"
+            | "conhost" | "openconsole" | "winpty" | "conpty" | "py" | "pythonw")
+        || name.strip_prefix("python").is_some_and(|version| version.is_empty()
+            || version.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+fn match_unconstrained_slot(recipe: &Recipe, obs: &ProcessObservation) -> Option<Slot> {
     // Native executable identity does not turn a missing invocation entry into a supported CLI.
     obs.invocation
         .argv
@@ -301,7 +394,7 @@ pub fn match_slot(recipe: &Recipe, obs: &ProcessObservation) -> Option<Slot> {
 
 /// Enumerated runtime forms used by supported native/npm launches. Values belonging to options
 /// are skipped; eval/print and unrecognised runtime syntax cannot supply a script witness.
-fn runtime_script_slot(argv: &[Vec<u8>]) -> Option<usize> {
+pub(crate) fn runtime_script_slot(argv: &[Vec<u8>]) -> Option<usize> {
     let mut i = 1;
     while let Some(arg) = argv.get(i) {
         let arg = std::str::from_utf8(arg).ok()?;
@@ -1280,7 +1373,7 @@ mod tests {
     }
 
     fn recipe(bin: &str) -> Recipe {
-        Recipe { bin: bin.into() }
+        Recipe { bin: bin.into(), declared_invocation: None }
     }
 
     fn prepare_when_uncontended(

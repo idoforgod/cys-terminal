@@ -44,6 +44,8 @@ pub enum RecipeGap {
     MissingExecutable,
     AssignmentProvenance,
     LiteralPosixBackslash,
+    UnsupportedInterpreter,
+    MissingScript,
 }
 
 /// Recipe is optional in the native sense, never in the declaration/classification sense.
@@ -194,13 +196,13 @@ fn load_one(
         DeclarationSource::Disk => disk_candidates.get(adapter),
         DeclarationSource::Embedded => embedded_candidates.get(adapter),
     };
-    let recipe = native_recipe(&command, legacy_bin.map(String::as_str));
     let builtin = crate::receiver::BUILTIN_ADAPTERS.contains(&adapter);
+    let exact_shipped_command = shipped_command.as_deref() == Some(command.as_str());
+    let recipe = native_recipe(&command, builtin && exact_shipped_command, &effective_launch_spec);
     if builtin && shipped_command.is_none() {
         return Err(LoadError::MissingEmbeddedBuiltin { adapter: adapter.to_string() });
     }
     let mut notices = Vec::new();
-    let exact_shipped_command = shipped_command.as_deref() == Some(command.as_str());
     if builtin && !exact_shipped_command {
         let (legacy_class, _) = crate::receiver::classify_policy(
             adapter, legacy_bin.map(String::as_str).unwrap_or(""),
@@ -297,49 +299,79 @@ fn cli_agent_env_pairs(spec: &Value) -> Vec<(String, String)> {
     pairs
 }
 
-fn native_recipe(command: &str, legacy_bin: Option<&str>) -> NativeRecipe {
-    // The existing lexer is quote-aware, not an evaluator. Any such syntax keeps a weak
-    // declaration but requires a separate witness resolver; never join/execute these tokens.
+fn declaration_words(command: &str) -> Result<Vec<String>, RecipeGap> {
     if command.chars().any(|c| matches!(c, '$' | '`' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\n' | '\r')) {
-        return NativeRecipe::Unsupported(RecipeGap::ShellSyntax);
+        return Err(RecipeGap::ShellSyntax);
     }
-    // Decoded words lose whether '=' or the command word was quoted/escaped. Do not skip
-    // any assignment-looking token in such a declaration. Even genuine quoted-value
-    // assignments remain explicit unsupported-native here; the declaration is retained.
     if command.contains('=') && command.contains(['\'', '"', '\\']) {
-        return NativeRecipe::Unsupported(RecipeGap::AssignmentProvenance);
+        return Err(RecipeGap::AssignmentProvenance);
     }
     let needs_lexer = command.contains(['\'', '"']) || (!cfg!(windows) && command.contains('\\'));
-    if !needs_lexer {
-        // Preserve existing path spelling, notably unquoted Windows backslashes; do not pass
-        // them through a POSIX lexer that would remove the separators.
-        return legacy_bin.filter(|bin| !bin.is_empty()).map_or(
-            NativeRecipe::Unsupported(RecipeGap::MissingExecutable),
-            |bin| NativeRecipe::Supported(Recipe { bin: bin.to_string() }),
-        );
-    }
-    if cfg!(windows) || command.ends_with('\\') {
-        // The available lexer is POSIX-like. It cannot certify cmd/PowerShell quote semantics.
-        return NativeRecipe::Unsupported(RecipeGap::PlatformQuoting);
-    }
-    let Some(tokens) = cys::approval_tokenize(command) else {
-        return NativeRecipe::Unsupported(RecipeGap::UnclosedQuote);
-    };
-    // This branch has no '=' anywhere, so its first decoded word is not skipped as env.
-    let Some(executable) = tokens.first() else {
-        return NativeRecipe::Unsupported(RecipeGap::MissingExecutable);
-    };
-    // The native matcher treats backslash as a separator for Windows paths. On POSIX a
-    // decoded literal backslash is part of the filename; do not certify a different binary.
-    if executable.contains('\\') {
-        return NativeRecipe::Unsupported(RecipeGap::LiteralPosixBackslash);
-    }
-    let bin = executable.rsplit('/').next().unwrap_or(executable);
-    if bin.is_empty() {
-        NativeRecipe::Unsupported(RecipeGap::MissingExecutable)
+    let words = if needs_lexer {
+        if cfg!(windows) || command.ends_with('\\') { return Err(RecipeGap::PlatformQuoting); }
+        let words = cys::approval_tokenize(command).ok_or(RecipeGap::UnclosedQuote)?;
+        if words.first().is_some_and(|word| word.contains('\\')) {
+            return Err(RecipeGap::LiteralPosixBackslash);
+        }
+        // '=' plus quote/escape was refused above: no decoded token may be skipped as env.
+        words
     } else {
-        NativeRecipe::Supported(Recipe { bin: bin.to_string() })
-    }
+        let assignment = |word: &str| word.split_once('=').is_some_and(|(key, _)| {
+            !key.is_empty() && !key.as_bytes()[0].is_ascii_digit()
+                && key.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        });
+        command.split_whitespace().skip_while(|word| assignment(word)).map(str::to_owned).collect()
+    };
+    if words.first().is_none_or(|word| word.is_empty()) { return Err(RecipeGap::MissingExecutable); }
+    Ok(words)
+}
+
+fn resume_patterns(spec: &Value) -> Vec<Vec<crate::receiver::DeclaredArgument>> {
+    use crate::receiver::DeclaredArgument;
+    ["resume_arg", "resume_arg_fallback"].into_iter().filter_map(|key| {
+        let text = spec.get(key)?.as_str()?;
+        // These are comparison patterns only, never evaluated or sent as commands.
+        if text.chars().any(|c| matches!(c, '$' | '`' | ';' | '|' | '&' | '<' | '>' | '(' | ')' | '\n' | '\r')) { return None; }
+        if cfg!(windows) && text.contains(['\'', '"', '\\']) { return None; }
+        let words = cys::approval_tokenize(text)?;
+        if words.is_empty() { return None; }
+        words.into_iter().map(|word| {
+            if let Some((prefix, suffix)) = word.split_once("{session_id}") {
+                if suffix.contains("{session_id}") { return None; }
+                Some(DeclaredArgument::SessionId { prefix:prefix.as_bytes().to_vec(), suffix:suffix.as_bytes().to_vec() })
+            } else { Some(DeclaredArgument::Literal(word.into_bytes())) }
+        }).collect::<Option<Vec<_>>>()
+    }).collect()
+}
+
+fn native_recipe(command: &str, shipped_builtin: bool, spec: &Value) -> NativeRecipe {
+    use crate::receiver::{DeclaredInvocation, generic_interpreter_recipe, is_script_runtime, runtime_script_slot};
+    let words = match declaration_words(command) {
+        Ok(words) => words, Err(gap) => return NativeRecipe::Unsupported(gap),
+    };
+    let bin = words[0].rsplit(['/', '\\']).next().unwrap_or(&words[0]).to_string();
+    if bin.is_empty() { return NativeRecipe::Unsupported(RecipeGap::MissingExecutable); }
+    let argv: Vec<Vec<u8>> = words.into_iter().map(String::into_bytes).collect();
+    let declared_invocation = if is_script_runtime(&bin) {
+        let Some(index) = runtime_script_slot(&argv) else { return NativeRecipe::Unsupported(RecipeGap::MissingScript); };
+        let script = &argv[index];
+        if script.is_empty() { return NativeRecipe::Unsupported(RecipeGap::MissingScript); }
+        // Bun subcommands are not direct script paths. Do not infer a new grammar from a match.
+        if bin.trim_end_matches(".exe").eq_ignore_ascii_case("bun") {
+            let direct_path = script.contains(&b'/') || script.contains(&b'\\')
+                || [b".js".as_slice(),b".mjs",b".cjs",b".ts",b".mts",b".cts",b".tsx",b".jsx"]
+                    .iter().any(|suffix| script.ends_with(suffix));
+            if !direct_path { return NativeRecipe::Unsupported(RecipeGap::MissingScript); }
+        }
+        Some(DeclaredInvocation { argv,script_index:Some(index),allowed_suffixes:resume_patterns(spec) })
+    } else if generic_interpreter_recipe(&bin) {
+        return NativeRecipe::Unsupported(RecipeGap::UnsupportedInterpreter);
+    } else if !shipped_builtin {
+        // Even an unenumerated interpreter cannot discard an available declared script/argument.
+        // Flexible builtin/native/npm recipes remain unchanged; custom programs retain exact args.
+        Some(DeclaredInvocation { argv,script_index:None,allowed_suffixes:resume_patterns(spec) })
+    } else { None };
+    NativeRecipe::Supported(Recipe { bin,declared_invocation })
 }
 
 /// Canonicalization is JSON key ordering only, not shell/string normalization. Scalars use
@@ -561,5 +593,102 @@ mod tests {
             assert!(p.native_policy().is_none(), "literal POSIX backslash must not certify a different basename");
             assert!(!c.rejected().contains_key("custom"));
         }
+    }
+
+    fn invocation(executable: &str, argv: &[&str]) -> cys::process_observation::ProcessObservation {
+        cys::process_observation::ProcessObservation {
+            identity: cys::process_observation::Identity { pid:21,parent:20,process_group:21,
+                birth_seconds:10,birth_microseconds:2,pointer_width:8,executable:executable.as_bytes().to_vec() },
+            invocation:cys::process_observation::Invocation { launch_path:executable.as_bytes().to_vec(),
+                argv:argv.iter().map(|a|a.as_bytes().to_vec()).collect() },
+        }
+    }
+
+    #[test]
+    fn c8policy_declared_js_script_cannot_match_a_bare_or_different_interpreter() {
+        for runtime in ["node","nodejs","bun"] {
+            let command=format!("{runtime} --require /setup/init.js /agents/my-agent.js --mode assist");
+            let c=catalog(&json!({"custom":{"cmd":command}}),&json!({}));
+            let p=&c.get(Some("custom")).unwrap().policy;
+            assert_eq!(p.class,ProofClass::ObservedAgentWeak);
+            let native=p.native_policy().expect("enumerated JS script declaration must retain a positive native recipe");
+            let exe=format!("/usr/bin/{runtime}");
+            for args in [vec![runtime],vec![runtime,"/different/my-agent.js"],
+                vec![runtime,"--eval","/agents/my-agent.js"],
+                vec![runtime,"--require","/agents/my-agent.js","/other.js"],
+                vec![runtime,"--require","/setup/init.js","/other/my-agent.js","--mode","assist"],
+                vec![runtime,"--require","/wrong/init.js","/agents/my-agent.js","--mode","assist"],
+                vec![runtime,"--require","/setup/init.js","/agents/my-agent.js","--mode","other"],
+                vec![runtime,"--require","/setup/init.js","/agents/my-agent.js","--mode","assist","--extra"]] {
+                assert_eq!(crate::receiver::match_slot(&native.recipe,&invocation(&exe,&args)),None,
+                    "declared script absence or contradiction must not match the interpreter itself: {args:?}");
+            }
+            let actual=[runtime,"--require","/setup/init.js","/agents/my-agent.js","--mode","assist"];
+            assert!(matches!(crate::receiver::match_slot(&native.recipe,&invocation(&exe,&actual)),Some(crate::receiver::Slot::Script(3))),
+                "actual declared script must remain a positive witness");
+        }
+    }
+
+    #[test]
+    fn c8policy_unenumerated_interpreter_recipes_stay_declared_without_bare_native_alias() {
+        for command in ["python /agents/my-agent.py","python3 /agents/my-agent.py",
+            "bash -lc 'exec /agents/my-agent'","sh /agents/my-agent.sh","node","node --eval code"] {
+            let c=catalog(&json!({"custom":{"cmd":command}}),&json!({}));
+            let p=&c.get(Some("custom")).unwrap().policy;
+            assert_eq!(p.class,ProofClass::ObservedAgentWeak);
+            assert_eq!(p.declaration,command);
+            assert!(p.native_policy().is_none(),"unsupported declared interpreter cannot become a bare native recipe: {command}");
+            assert!(!c.rejected().contains_key("custom"));
+        }
+    }
+
+    #[test]
+    fn c8policy_constraints_preserve_declared_resume_suffixes_and_runtime_aliases() {
+        let c=catalog(&json!({"custom":{"cmd":"nodejs /agents/a.js --mode assist",
+            "resume_arg":"resume {session_id}","resume_arg_fallback":"resume --last"}}),&json!({}));
+        let p=c.get(Some("custom")).unwrap().policy.native_policy().unwrap();
+        for suffix in [vec![],vec!["resume","session-123"],vec!["resume","--last"]] {
+            let mut argv=vec!["nodejs","/agents/a.js","--mode","assist"];argv.extend(suffix);
+            assert_eq!(crate::receiver::match_slot(&p.recipe,&invocation("/usr/bin/node",&argv)),Some(crate::receiver::Slot::Script(1)),
+                "declared Node alias/fresh/resume invocation must remain supported");
+        }
+        for suffix in [vec!["resume",""],vec!["--continue"],vec!["resume","id","extra"]] {
+            let mut argv=vec!["nodejs","/agents/a.js","--mode","assist"];argv.extend(suffix);
+            assert_eq!(crate::receiver::match_slot(&p.recipe,&invocation("/usr/bin/node",&argv)),None,
+                "undeclared or empty resume suffix must not be guessed");
+        }
+        assert_eq!(crate::receiver::match_slot(&p.recipe,&invocation("/usr/bin/bun",&["bun","/agents/a.js","--mode","assist"])),None);
+        let encoded=serde_json::to_value(p.for_private_persistence()).unwrap();
+        let restored:ReceiverPolicy=serde_json::from_value(encoded).unwrap();
+        assert_eq!(restored,p,"private persistence must retain invocation and resume constraints");
+        assert!(!serde_json::to_string(&p.public_summary()).unwrap().contains("/agents/a.js"));
+    }
+
+    #[test]
+    fn c8policy_custom_program_arguments_are_not_discarded_for_unenumerated_runtimes() {
+        let c=catalog(&json!({"custom":{"cmd":"ruby /agents/a.rb --mode assist"}}),&json!({}));
+        let p=c.get(Some("custom")).unwrap().policy.native_policy().unwrap();
+        assert_eq!(p.class,ProofClass::ObservedAgentWeak);
+        for argv in [vec!["ruby"],vec!["ruby","/other/a.rb","--mode","assist"],
+            vec!["ruby","/agents/a.rb","--mode","other"]] {
+            assert_eq!(crate::receiver::match_slot(&p.recipe,&invocation("/usr/bin/ruby",&argv)),None,
+                "custom argument contradiction cannot be hidden by an unenumerated runtime name");
+        }
+        assert_eq!(crate::receiver::match_slot(&p.recipe,&invocation("/usr/bin/ruby",&["ruby","/agents/a.rb","--mode","assist"])),Some(crate::receiver::Slot::Native));
+    }
+
+    #[test]
+    fn c8policy_legacy_interpreter_recipe_and_malformed_constraint_cannot_bypass_loader() {
+        for bin in ["node","nodejs","bun","python","python3.12","bash","powershell.exe"] {
+            let recipe:Recipe=serde_json::from_value(json!({"bin":bin})).unwrap();
+            assert_eq!(crate::receiver::match_slot(&recipe,&invocation(bin,&[bin])),None,
+                "missing declaration constraint must not restore known interpreter equality");
+        }
+        let c=catalog(&json!({"custom":{"cmd":"node /agents/a.js"}}),&json!({}));
+        let mut recipe=c.get(Some("custom")).unwrap().policy.native_policy().unwrap().recipe;
+        recipe.declared_invocation.as_mut().unwrap().script_index=Some(0);
+        assert_eq!(crate::receiver::match_slot(&recipe,&invocation("node",&["node","/agents/a.js"])),None);
+        let recipe=c.get(Some("custom")).unwrap().policy.native_policy().unwrap().recipe;
+        assert_eq!(crate::receiver::match_slot(&recipe,&invocation("node",&["","/agents/a.js"])),None);
     }
 }

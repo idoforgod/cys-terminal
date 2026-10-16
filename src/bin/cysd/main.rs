@@ -47,6 +47,7 @@ mod handlers;
 mod hwmon;
 mod knobs;
 mod office_bridge;
+mod native_publication;
 mod pending_requests;
 mod policy_loader;
 mod recall;
