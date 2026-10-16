@@ -84,6 +84,10 @@ pub struct Screen {
     // cys 패치(0.14.52 · F-01): full resets (ESC c) seen so far — survives the reset itself so a
     // reader can tell "reset + repaint" from continuity when the final geometry/frame match.
     resets: u64,
+
+    // cys 패치(0.14.52 · F-01): DECSET ?2026 synchronized output is open (a frame is mid-update).
+    // Kept out of `modes` so no formatted/diff output or comparison changes.
+    sync_update: bool,
 }
 
 impl Screen {
@@ -113,6 +117,8 @@ impl Screen {
             errors: 0,
 
             resets: 0,
+
+            sync_update: false,
         }
     }
 
@@ -667,6 +673,13 @@ impl Screen {
     #[must_use]
     pub fn reset_count(&self) -> u64 {
         self.resets
+    }
+
+    /// cys 패치(0.14.52 · F-01): whether a DECSET ?2026 synchronized-output block is open, i.e. the
+    /// application has begun a frame update that it has not finished yet.
+    #[must_use]
+    pub fn synchronized_output(&self) -> bool {
+        self.sync_update
     }
 
     /// Returns whether the alternate screen is currently in use.
@@ -1276,6 +1289,8 @@ impl Screen {
                     self.enter_alternate_grid();
                 }
                 &[2004] => self.set_mode(MODE_BRACKETED_PASTE),
+                // cys 패치(0.14.52 · F-01): synchronized output begin.
+                &[2026] => self.sync_update = true,
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
                         let n = if ns.len() == 1 {
@@ -1335,6 +1350,8 @@ impl Screen {
                     self.decrc();
                 }
                 &[2004] => self.clear_mode(MODE_BRACKETED_PASTE),
+                // cys 패치(0.14.52 · F-01): synchronized output end.
+                &[2026] => self.sync_update = false,
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
                         let n = if ns.len() == 1 {

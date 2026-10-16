@@ -478,9 +478,16 @@ pub(crate) struct Frame {
     pub identity_rev: u64,
     pub row_index: Vec<u16>,
     pub cells: Vec<vt100::Cell>,
+    /// OSC 0/2 window title, copied under the lock into reserved capacity (truncated, never grown).
+    pub title: String,
+    /// a DECSET ?2026 synchronized-output block was open: the frame is mid-update (U4-1 incomplete).
+    pub sync: bool,
     /// monotonic hold time of the last parser acquisition (measurement only).
     pub lock_hold: Duration,
 }
+
+/// Title bytes kept per sample — enough for every observed family title; longer titles are truncated.
+pub(crate) const TITLE_CAP: usize = 256;
 
 impl Frame {
     pub(crate) fn new() -> Frame {
@@ -494,6 +501,8 @@ impl Frame {
             identity_rev: 0,
             row_index: Vec::with_capacity(MAX_ROWS),
             cells: Vec::with_capacity(MAX_CELLS),
+            title: String::with_capacity(TITLE_CAP),
+            sync: false,
             lock_hold: Duration::ZERO,
         }
     }
@@ -580,6 +589,14 @@ pub(crate) fn collect(s: &Surface, frame: &mut Frame) -> Collected {
     frame.alt = screen.alternate_screen();
     frame.reset_count = screen.reset_count();
     frame.view_rev = s.activity_view_rev.load(Ordering::Acquire);
+    frame.sync = screen.synchronized_output();
+    frame.title.clear();
+    for ch in screen.title().chars() {
+        if frame.title.len() + ch.len_utf8() > TITLE_CAP {
+            break;
+        }
+        frame.title.push(ch);
+    }
     frame.cells.clear();
     if rows == 0 || cols == 0 || cols > MAX_COLS || scrolled {
         frame.row_index.clear();
@@ -626,6 +643,8 @@ pub(crate) struct View<'a> {
     pub size: (u16, u16),
     pub cursor: (u16, u16),
     pub alt: bool,
+    /// OSC window title (not an editable region: a draft cannot change it).
+    pub title: &'a str,
 }
 
 /// One grammar's verdict on ITS OWN complete signatures.
@@ -852,15 +871,27 @@ pub(crate) fn observe_seat(
                         cols: frame.cols,
                         alt: frame.alt,
                     });
-                    let text = frame.text_rows();
-                    let view = View { rows: &text, size: (frame.rows, frame.cols), cursor: frame.cursor, alt: frame.alt };
-                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| classify_with(fam, &view, grammars)));
-                    match res {
-                        Ok((sample, rev)) => {
-                            grammar_rev = rev;
-                            sample
+                    if frame.sync {
+                        // U4-1: an open synchronized-output block is a frame mid-update — no complete
+                        // signature can be claimed and no contradiction shown.
+                        Sample::Transient(Transient::Incomplete)
+                    } else {
+                        let text = frame.text_rows();
+                        let view = View {
+                            rows: &text,
+                            size: (frame.rows, frame.cols),
+                            cursor: frame.cursor,
+                            alt: frame.alt,
+                            title: &frame.title,
+                        };
+                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| classify_with(fam, &view, grammars)));
+                        match res {
+                            Ok((sample, rev)) => {
+                                grammar_rev = rev;
+                                sample
+                            }
+                            Err(_) => Sample::Semantic(Semantic::AdapterPanic),
                         }
-                        Err(_) => Sample::Semantic(Semantic::AdapterPanic),
                     }
                 }
             },

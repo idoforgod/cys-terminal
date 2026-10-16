@@ -9,6 +9,7 @@
 | 1e758593 (2026-10-07) | 화면 파서 패닉 수리 — 폭 축소 뒤 짝 없는 넓은 글자 머리 · 범위 밖 짝 칸 · u16 언더플로 · 축소 뒤 DECRC | `grid.rs` · `row.rs` · `screen.rs` 의 `cys 패치` 주석 14곳 | `src/bin/cysd/state.rs` 의 `row89_sequence_no_longer_panics_and_screen_is_preserved` · `shrink_clears_orphan_wide_head_down_to_one_col` |
 | ffa95a52 (2026-10-07) | 벤더 `Cargo.toml` 의 상류 저자 이메일 제거 | `Cargo.toml` | — |
 | 0.14.52 (F-01) | **full-reset counter** — `Screen::reset_count()` counts `ESC c` and survives the reset itself, so a display observer can tell reset+repaint from continuity at equal geometry. Not part of any comparison or formatted output. | `screen.rs` (`resets` field · `ris` · `reset_count`) | `src/bin/cysd/activity_tests.rs` `vt100_reset_count_survives_the_reset_itself` · `reset_and_repaint_between_samples_is_not_continuity` |
+| 0.14.52 (F-01) | **synchronized-output flag** — `Screen::synchronized_output()` is true between DECSET `?2026h` and `?2026l` (a frame mid-update); a separate bool, not in `modes`, so no formatted/diff output changes; RIS clears it. | `screen.rs` (`sync_update` field · `decset`/`decrst` 2026 arms · accessor) | `src/bin/cysd/activity_tests.rs` `vt100_synchronized_output_flag_follows_decset_2026_and_reset` · `open_synchronized_output_block_is_an_incomplete_frame` |
 | 0.14.47 | **흐림(SGR 2) 비트** — SGR 2 를 칸에 기억하고 22·0 으로 내린다 · `Cell::dim()` 으로 읽는다 · **칸 비교와 다시 그리기 출력에는 넣지 않는다** | `attrs.rs`(비트 · `dim`/`set_dim` · 흐림을 가린 `PartialEq`) · `screen.rs`(SGR 2 · 22 팔) · `cell.rs`(`dim()`) | `src/bin/cysd/vt100_dim_tests.rs` 의 다섯 시험 |
 
 ## 흐림 패치의 결정 (0.14.47)

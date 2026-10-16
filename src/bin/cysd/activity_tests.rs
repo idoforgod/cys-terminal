@@ -279,7 +279,7 @@ fn view_of(lines: &[&str]) -> Vec<(u16, String)> {
 
 fn classify_lines(fam: Family, lines: &[&str]) -> Sample {
     let rows = view_of(lines);
-    let v = View { rows: &rows, size: (24, 80), cursor: (0, 0), alt: false };
+    let v = View { rows: &rows, size: (24, 80), cursor: (0, 0), alt: false, title: "" };
     classify_with(fam, &v, &grammars_t()).0
 }
 
@@ -428,7 +428,7 @@ fn published_only_admission_accepts_even_unequal_endpoints() {
         assert_ne!(s.output_gen.load(Ordering::Acquire), before, "endpoints differed");
         assert!(matches!(got, Collected::Frame), "tick {tick}: even/even unequal must be admitted");
         let text = frame.text_rows();
-        let v = View { rows: &text, size: (frame.rows, frame.cols), cursor: frame.cursor, alt: frame.alt };
+        let v = View { rows: &text, size: (frame.rows, frame.cols), cursor: frame.cursor, alt: frame.alt, title: &frame.title };
         let (sample, _) = classify_with(Family::Claude, &v, &grammars_t());
         // make each tick's frame distinct so U4-2 cannot interfere
         let sample = match sample {
@@ -835,4 +835,49 @@ fn u4_4_identity_census_every_named_production_site_is_guarded() {
         };
         assert!(window.iter().any(|l| l.contains(guard)), "{file}:{}: `{anchor}` lacks `{guard}` within {span} lines", i + 1);
     }
+}
+
+#[test]
+fn vt100_synchronized_output_flag_follows_decset_2026_and_reset() {
+    let mut p = vt100::Parser::new(5, 20, 0);
+    assert!(!p.screen().synchronized_output());
+    p.process(b"\x1b[?2026hpartial");
+    assert!(p.screen().synchronized_output());
+    p.process(b"\x1b[?2026l");
+    assert!(!p.screen().synchronized_output());
+    p.process(b"\x1b[?2026h\x1bc");
+    assert!(!p.screen().synchronized_output(), "a full reset ends any open block");
+}
+
+#[test]
+fn title_is_copied_into_reserved_capacity_and_truncated_not_grown() {
+    let f = fx("title");
+    let s = seat(&f, "worker", Some("claude"));
+    publish(&s, "\x1b]0;\u{25d0} Claude Code\x07".as_bytes());
+    let mut frame = Frame::new();
+    let cap = frame.title.capacity();
+    assert!(matches!(collect(&s, &mut frame), Collected::Frame));
+    assert_eq!(frame.title, "\u{25d0} Claude Code");
+    let long = format!("\x1b]0;{}\x07", "\u{25d0}".repeat(400)); // 1,200 bytes
+    publish(&s, long.as_bytes());
+    assert!(matches!(collect(&s, &mut frame), Collected::Frame));
+    assert!(frame.title.len() <= TITLE_CAP && frame.title.len() > TITLE_CAP - 4, "truncated at a char boundary");
+    assert_eq!(frame.title.capacity(), cap, "never grown under the parser lock");
+}
+
+/// U4-1: an open synchronized-output block is a frame mid-update → transient incomplete, Working retained.
+#[test]
+fn open_synchronized_output_block_is_an_incomplete_frame() {
+    let f = fx("sync-open");
+    let s = seat(&f, "worker", Some("claude"));
+    let mut frame = Frame::new();
+    drive_working(&f, &s, &mut frame);
+    publish(&s, b"\x1b[?2026h\x1b[1;1HSYN-CLAUDE-WORKING half");
+    observe(&f, &s, &mut frame, 3.5);
+    let w = wire_at(&f.daemon.activity, &s, 3.5, &P);
+    assert_eq!((w["state"].as_str(), w["reason"].as_str(), w["retained"].as_bool()), (Some("working"), Some("incomplete frame"), Some(true)), "{w}");
+    publish(&s, b" done\x1b[?2026l");
+    observe(&f, &s, &mut frame, 4.0);
+    let w = wire_at(&f.daemon.activity, &s, 4.0, &P);
+    assert_eq!((w["state"].as_str(), w["retained"].as_bool()), (Some("working"), Some(false)), "{w}");
 }
