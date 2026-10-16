@@ -270,6 +270,12 @@ pub struct AgentJob {
     /// it too, handing that refusal to the settlement). A lost claim is [`GUARD_ABORTED`] with zero
     /// bytes; the handing-off caller owns that rollback.
     pub guard: Option<Arc<crate::state::InjectGuard>>,
+    /// Record the written body as a machine body (`InjectTrack::note_body`): the queue's daemon-made
+    /// bodies always (without an owner, like the `Inject` arm); a direct send only with an owner grade
+    /// (the old direct path never recorded owner-token / GUI-grade text as a machine body).
+    pub note_body: bool,
+    /// The owner grade recorded with that body.
+    pub body_owner: Option<crate::governance::InputOwner>,
 }
 
 /// RefusedNoWrite reason when the hand-off guard was not claimed (the caller already rolled back).
@@ -284,6 +290,9 @@ pub struct WriterIo<'a> {
     pub last_program_write: &'a mut Option<Instant>,
     /// Called once, immediately before the first OS write of this run.
     pub on_first_byte: &'a mut dyn FnMut(),
+    /// Called once with the whole body when its last byte is accepted - before the closing fence,
+    /// control or Return - so a later phase's proof (the CR withhold probe) sees this body recorded.
+    pub on_body_written: &'a mut dyn FnMut(&str),
 }
 
 /// Result of [`execute`]: the terminal, where the request stands, and whether the PTY transport
@@ -487,6 +496,13 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
                 Ok(n) => {
                     run.account(phase, n, slice.len());
                     off += n;
+                    if phase == Phase::Body {
+                        if let Some(body) = job.plan.body.as_deref() {
+                            if run.env.body_offset == body.len() {
+                                (io.on_body_written)(body);
+                            }
+                        }
+                    }
                     if let Err(e) = writer.flush() {
                         return run.done(run.stop(format!("transport:{e}"), false), true);
                     }
@@ -897,6 +913,8 @@ mod tests {
             resume: None,
             settle: None,
             guard: None,
+            note_body: true,
+            body_owner: None,
         }
     }
 
@@ -907,7 +925,8 @@ mod tests {
 
     fn run_job_with(w: &mut Rec, j: &AgentJob, anchor: &mut Option<Instant>, sleep: &dyn Fn(Duration)) -> Executed {
         let mut first = || {};
-        let mut io = WriterIo { sleep, last_program_write: anchor, on_first_byte: &mut first };
+        let mut body_done = |_: &str| {};
+        let mut io = WriterIo { sleep, last_program_write: anchor, on_first_byte: &mut first, on_body_written: &mut body_done };
         execute(w, j, &mut io)
     }
 

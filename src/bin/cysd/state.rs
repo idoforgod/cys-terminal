@@ -1898,6 +1898,13 @@ pub struct Surface {
     /// ★(0.14.52 · S-a) Receiver proof for this seat's agent writes; `None` = pass-through until the
     /// receiver binding is wired. Leaf lock (cloned out before use).
     pub receiver_proof: Mutex<Option<Arc<dyn crate::agent_write::Proof>>>,
+    /// ★(0.14.52 · S-a C5b) Untokened legacy bodies held untyped until their caller's Return binds
+    /// them (S3-5 / S4-3, `submit_assoc`). Leaf lock; never held across a write or a bus publish.
+    pub submit_assoc: Mutex<crate::submit_assoc::AssociationTable>,
+    /// ★(0.14.52 · S-a C5b) Agent incarnation counter for that table's "same seat generation": bumped
+    /// when an agent is registered/observed, recovers or exits, so a body held for one agent never
+    /// binds to the next. C8 replaces it with the receiver binding epoch.
+    pub agent_epoch: AtomicU64,
     /// ★(0.14.31 · WP-5 폭주 완충) 이 surface 의 **마지막 큐 배달 시각** — 틱·overdue·강제·
     /// rehome 어느 경로든 `deliver_head_locked` 가 인계에 성공한 순간 찍는다(같은 시계). 호출부
     /// 게이트가 `governance::queue_min_interval_secs()`(기본 10s) 미만이면 배달을 보류한다.
@@ -2186,6 +2193,11 @@ impl Surface {
     /// 지금 인계 예약이 걸려 있는가(같은 좌석의 이중 인계 차단 · 배달 임계영역 전용).
     pub fn inject_reserved(&self) -> bool {
         self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// ★(0.14.52 · S-a C5b) A new agent incarnation on this seat (see [`Surface::agent_epoch`]).
+    pub fn bump_agent_epoch(&self) {
+        self.agent_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// ★(0.14.52 · S-a) The proof an agent write to this seat uses now (pass-through until bound).
@@ -6663,6 +6675,8 @@ impl Daemon {
             inject_reservation: Mutex::new(None),
             queue_hold: Mutex::new(None),
             receiver_proof: Mutex::new(None),
+            submit_assoc: Mutex::new(crate::submit_assoc::AssociationTable::default()),
+            agent_epoch: AtomicU64::new(0),
             last_queue_delivery_at: Mutex::new(None),
             pending_input_stale: Mutex::new(None),
             last_injected: Mutex::new(None),
@@ -7348,7 +7362,7 @@ impl Daemon {
 /// recv_timeout 폴링은 stop을 주기적으로 관측하기 위한 것 — 평시 동작·순서는 불변이다.
 /// clear_first 주입의 Ctrl-U 후 settle(ms) — TUI가 라인 정리를 반영할 짬. 기본 150
 /// (기존 cys.rs --clear-first의 클라측 sleep 값 계승). CYS_CLEAR_SETTLE_MS로 조정.
-fn clear_settle_ms() -> u64 {
+pub(crate) fn clear_settle_ms() -> u64 {
     std::env::var("CYS_CLEAR_SETTLE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -7540,6 +7554,7 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
             WriteReq::Agent(job) => {
                 let job = *job;
                 let mut began = false;
+                let mut body_noted = false;
                 let ex = {
                     let mut on_first_byte = || {
                         if let Some(t) = &track {
@@ -7547,10 +7562,20 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
                         }
                         began = true;
                     };
+                    // The whole body is recorded the moment its last byte is accepted - before the
+                    // Return phase, whose withhold probe reads this record (★(0.14.52 · S-a C5b)).
+                    let (note, owner) = (job.note_body, job.body_owner);
+                    let mut on_body_written = |body: &str| {
+                        if let (Some(t), true) = (&track, note) {
+                            t.note_body(body, owner);
+                        }
+                        body_noted = true;
+                    };
                     let mut io = crate::agent_write::WriterIo {
                         sleep: &std::thread::sleep,
                         last_program_write: &mut last_program_write,
                         on_first_byte: &mut on_first_byte,
+                        on_body_written: &mut on_body_written,
                     };
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         crate::agent_write::execute(&mut writer, &job, &mut io)
@@ -7558,8 +7583,10 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
                     .unwrap_or_else(|_| crate::agent_write::Executed::panicked(&job))
                 };
                 if let (Some(t), true) = (&track, began) {
-                    if let Some(body) = ex.accepted_body(&job.plan) {
-                        t.note_body(&body, None);
+                    if !body_noted && job.note_body {
+                        if let Some(body) = ex.accepted_body(&job.plan) {
+                            t.note_body(&body, job.body_owner);
+                        }
                     }
                     if ex.envelope.submitted {
                         t.submit_written();

@@ -200,7 +200,7 @@ fn settle_proof_on_pending_machine_body_awaiting_its_return() {
     let t = agent_pane(&fx, "worker-1", P + 10);
     let _x = pane(&fx, "worker-2", P + 11);
     let _y = pane(&fx, "worker-3", P + 12);
-    assert_eq!(direct(&fx, Some(P + 11), &t, "M|x|AAA")["ok"], json!(true));
+    x_body_left_in_composer(&fx, &t, P + 11, "M|x|AAA");
     let before = counts(&t);
     let y = direct(&fx, Some(P + 12), &t, "M|y|BBB");
     assert_eq!(y["ok"], json!(false), "{y}");
@@ -220,7 +220,7 @@ fn c5_settle_proof_denial_never_carries_the_ghost_prescription() {
     let t = agent_pane(&fx, "worker-1", P + 50);
     let _x = pane(&fx, "worker-2", P + 51);
     let _y = pane(&fx, "worker-3", P + 52);
-    assert_eq!(direct(&fx, Some(P + 51), &t, "M|x|AAA")["ok"], json!(true));
+    x_body_left_in_composer(&fx, &t, P + 51, "M|x|AAA");
     // 짝 Return 이 오기 전 — 계수는 남아 있다. 에코가 닿은 뒤 화면을 '빈 프롬프트' 로 칠하면 유령처럼 보이는 순간이다.
     // (PTY 에코가 화면에 닿을 때까지 유계로 기다린다 — 늦게 닿은 에코가 칠한 픽스처를 덮지 않게. 부하가 큰 전량 실행에서도 안정.)
     let echo_deadline = Instant::now() + Duration::from_secs(3);
@@ -346,6 +346,8 @@ fn clear_first_and_human_keys_are_not_held() {
 #[test]
 fn writer_marks_submit_cr_inflight_until_written() {
     let fx = fx("writer");
+    // C5b: this specimen observes the window between hand-off and the written CR - no synchronous settle wait.
+    crate::agent_write::set_test_sync_settle(false);
     let t = agent_pane(&fx, "worker-1", P + 70);
     let _x = pane(&fx, "worker-2", P + 71);
     let obs = || t.inject_track.submit_settle_obs(crate::state::settle_mono_ms(), 2000);
@@ -393,7 +395,7 @@ fn settle_proven_denial_events_are_rate_limited_per_sender() {
     let _x = pane(&fx, "worker-2", P + 81);
     let _y = pane(&fx, "worker-3", P + 82);
     let _z = pane(&fx, "worker-4", P + 83);
-    assert_eq!(direct(&fx, Some(P + 81), &t, "M|x|AAA")["ok"], json!(true)); // 짝 Return 을 기다리는 기계 본문
+    x_body_left_in_composer(&fx, &t, P + 81, "M|x|AAA"); // 짝 Return 을 기다리는 기계 본문
     let n0 = fx.daemon.bus.tail(400).iter().filter(|e| e["name"] == "queue.draft_gate_denied").count();
     for _ in 0..5 {
         let y = direct(&fx, Some(P + 82), &t, "M|y|BBB");
@@ -423,7 +425,7 @@ fn fv1_paused_daemon_gives_no_settle_proof_but_keeps_hold() {
     let t = agent_pane(&fx, "worker-1", P + 90);
     let _x = pane(&fx, "worker-2", P + 91);
     let _y = pane(&fx, "worker-3", P + 92);
-    assert_eq!(direct(&fx, Some(P + 91), &t, "M|x|AAA")["ok"], json!(true)); // 짝 Return 을 기다리는 기계 본문
+    x_body_left_in_composer(&fx, &t, P + 91, "M|x|AAA"); // 짝 Return 을 기다리는 기계 본문
     fx.daemon.paused.store(true, Ordering::SeqCst);
     let before = counts(&t);
     let yp = direct(&fx, Some(P + 92), &t, "M|y|BBB");
@@ -450,7 +452,7 @@ fn fv1_paused_daemon_gives_no_settle_proof_but_keeps_hold() {
     // resume 뒤 — 증명이 돌아온다(다음 짝 Return 대기 본문 위에서).
     fx.daemon.paused.store(false, Ordering::SeqCst);
     std::thread::sleep(Duration::from_millis(400)); // X 의 CR 이 쓰이고 분리 창이 지난다
-    assert_eq!(direct(&fx, Some(P + 91), &t, "M|x|CCC")["ok"], json!(true));
+    x_body_left_in_composer(&fx, &t, P + 91, "M|x|CCC");
     let yr = direct(&fx, Some(P + 92), &t, "M|y|BBB");
     assert!(settle_hint(&yr).is_some(), "resume 뒤에는 증명이 돌아온다(pause 영구화 0): {yr}");
 }
@@ -488,8 +490,10 @@ fn fv1_settle_retry_refused_while_paused_even_on_free_line() {
     // 대조: resume 뒤 같은 재시도는 쓰인다.
     fx.daemon.paused.store(false, Ordering::SeqCst);
     let r2 = retry(&t);
-    assert_eq!(r2["ok"], json!(true), "pause 가 아니면 재시도는 종전처럼 쓴다: {r2}");
-    assert_ne!(counts(&t), before, "쓰기 1");
+    assert_eq!(r2["ok"], json!(true), "pause 가 아니면 재시도는 종전처럼 통과한다: {r2}");
+    // C5b: an automatic body without its Return is now accepted and HELD (zero bytes until its Return binds it).
+    assert_eq!(r2["result"]["held"], json!("awaiting_submit"), "{r2}");
+    assert_eq!(counts(&t), before, "held: no byte written yet");
 }
 
 // ═══════════ ★(0.14.42 · 수정 2회차 F1) 제출 CR 보류 — 인계 뒤 뜬 질문·선택 창을 누르지 않는다 ═══════════
@@ -510,6 +514,48 @@ fn paint(s: &Arc<Surface>, lines: &[&str], row: u16, col: u16) {
         p.process(format!("\x1b[{};1H{}", i + 1, l).as_bytes());
     }
     p.process(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+}
+
+/// ★(0.14.52 · S-a C5b) An automatic body is now HELD until its Return binds it, then body + Return are ONE writer
+/// job. The screen these specimens painted between `send` and `Return` (the body's echo, or a dialog that rose
+/// after it) therefore exists only inside that job, between the body write and its Return: this seat proof paints
+/// it when the writer reaches the Return phase - after the body, before the CR withhold probe looks.
+struct PaintAtSubmit {
+    seat: std::sync::Weak<Surface>,
+    rows: Vec<String>,
+    row: u16,
+    col: u16,
+}
+
+impl crate::agent_write::Proof for PaintAtSubmit {
+    fn admit(&self) -> Result<(), crate::receiver::ProofLoss> {
+        Ok(())
+    }
+    fn recheck(&self, phase: crate::agent_write::Phase) -> Result<(), crate::receiver::ProofLoss> {
+        if phase == crate::agent_write::Phase::Submit {
+            if let Some(s) = self.seat.upgrade() {
+                let lines: Vec<&str> = self.rows.iter().map(|r| r.as_str()).collect();
+                paint(&s, &lines, self.row, self.col);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Install [`PaintAtSubmit`] on `t` (replaced by the next call; dropped with the seat).
+fn paint_at_submit(t: &Arc<Surface>, lines: &[&str], row: u16, col: u16) {
+    let p = PaintAtSubmit { seat: Arc::downgrade(t), rows: lines.iter().map(|l| l.to_string()).collect(), row, col };
+    *t.receiver_proof.lock().unwrap() = Some(Arc::new(p));
+}
+
+/// X's body typed and left in the composer with its owner (premise of the S21 count-axis specimens). Since C5b a
+/// direct body is held untyped, so this premise is built by the remaining production route: X's Return binds the
+/// body and the job stops before the Return ([`crate::direct_agent_tests::bind_with_return_lost`]).
+fn x_body_left_in_composer(fx: &Fx, t: &Arc<Surface>, pid: u32, body: &str) {
+    let r = direct(fx, Some(pid), t, body);
+    assert_eq!(r["result"]["held"], json!("awaiting_submit"), "{r}");
+    crate::direct_agent_tests::bind_with_return_lost(&fx.daemon, t.id, Some(pid), None);
+    assert!(counts(t).0 > 0, "premise: X's body is counted in the composer");
 }
 
 /// 가짜 에이전트·실 claude 권한 창 모양 — 커서는 `❯ 1. Yes` 행 끝.
@@ -547,9 +593,8 @@ fn f1_submit_cr_withheld_when_dialog_rose_after_own_body() {
     let fx = fx("f1-withhold");
     let t = agent_pane_settled(&fx, "worker-1", P + 110);
     let _x = pane(&fx, "worker-2", P + 111);
+    paint_at_submit(&t, &DIALOG, 1, 8); // C5b: the screen after the body, at its Return
     assert_eq!(direct(&fx, Some(P + 111), &t, "M|x|AAA")["ok"], json!(true));
-    std::thread::sleep(Duration::from_millis(60)); // 본문 PTY 에코가 파서에 닿은 뒤 화면을 덮는다
-    paint(&t, &DIALOG, 1, 8);
     let xr = pair_return(&fx, Some(P + 111), &t);
     assert_eq!(xr["result"]["sent"], json!(true), "Return 요청 응답은 종전 그대로(쓰기 결정은 writer 의 몫): {xr}");
     let o = wait_submit_consumed(&t);
@@ -572,9 +617,8 @@ fn f1_submit_cr_withheld_on_stale_empty_seat_before_first_agent_sighting() {
     t.seat_cache.store(crate::governance::SeatState::Empty.as_u8(), Ordering::Relaxed);
     t.agent_seen.store(false, Ordering::Relaxed);
     let _x = pane(&fx, "worker-2", P + 116);
+    paint_at_submit(&t, &DIALOG, 1, 8); // C5b: the screen after the body, at its Return
     assert_eq!(direct(&fx, Some(P + 116), &t, "M|x|AAA")["ok"], json!(true));
-    std::thread::sleep(Duration::from_millis(60));
-    paint(&t, &DIALOG, 1, 8);
     assert_eq!(pair_return(&fx, Some(P + 116), &t)["result"]["sent"], json!(true));
     let o = wait_submit_consumed(&t);
     assert!(!o.inflight, "writer 가 CR 요청을 소비했다: {o:?}");
@@ -591,9 +635,8 @@ fn named(fx: &Fx, name: &str) -> Vec<Value> {
 fn withheld_seat(fx: &Fx, pid: u32) -> Arc<Surface> {
     let t = agent_pane_settled(fx, "worker-1", pid);
     let _x = pane(fx, "worker-2", pid + 1);
+    paint_at_submit(&t, &DIALOG, 1, 8); // C5b: the dialog rises after the body, before its Return
     assert_eq!(direct(fx, Some(pid + 1), &t, "M|x|AAA")["ok"], json!(true));
-    std::thread::sleep(Duration::from_millis(60));
-    paint(&t, &DIALOG, 1, 8);
     assert_eq!(pair_return(fx, Some(pid + 1), &t)["result"]["sent"], json!(true));
     let o = wait_submit_consumed(&t);
     assert_eq!(o.since_written_ms, None, "전제: 창 위 제출 CR 은 보류된다: {o:?}");
@@ -685,9 +728,8 @@ fn f1_seat_empty_after_agent_was_seen_is_unchanged() {
     t.seat_cache.store(crate::governance::SeatState::Empty.as_u8(), Ordering::Relaxed);
     t.agent_seen.store(true, Ordering::Relaxed);
     let _x = pane(&fx, "worker-2", P + 118);
+    paint_at_submit(&t, &DIALOG, 1, 8); // C5b: the screen after the body, at its Return
     assert_eq!(direct(&fx, Some(P + 118), &t, "M|x|AAA")["ok"], json!(true));
-    std::thread::sleep(Duration::from_millis(60));
-    paint(&t, &DIALOG, 1, 8);
     assert_eq!(pair_return(&fx, Some(P + 118), &t)["result"]["sent"], json!(true));
     let o = wait_submit_consumed(&t);
     assert!(o.since_written_ms.is_some(), "사망 좌석(에이전트를 본 뒤 Empty)은 종전처럼 쓴다: {o:?}");
@@ -730,9 +772,8 @@ fn f1_composer_body_that_looks_like_a_choice_is_submitted() {
     let fx = fx("f1-quote");
     let t = agent_pane_settled(&fx, "worker-1", P + 140);
     let _x = pane(&fx, "worker-2", P + 141);
+    paint_at_submit(&t, &["────────", "❯ 1. Yes please", "────────"], 1, 15); // C5b: the screen after the body, at its Return
     assert_eq!(direct(&fx, Some(P + 141), &t, "1. Yes please")["ok"], json!(true));
-    std::thread::sleep(Duration::from_millis(60));
-    paint(&t, &["────────", "❯ 1. Yes please", "────────"], 1, 15);
     let r = pair_return(&fx, Some(P + 141), &t);
     assert_eq!(r["result"]["sent"], json!(true), "{r}");
     let o = wait_submit_consumed(&t);
@@ -746,9 +787,8 @@ fn f1_plain_composer_submit_is_written() {
     let fx = fx("f1-plain");
     let t = agent_pane_settled(&fx, "worker-1", P + 150);
     let _x = pane(&fx, "worker-2", P + 151);
+    paint_at_submit(&t, &["────────", "❯ M|x|AAA", "────────"], 1, 11); // C5b: the screen after the body, at its Return
     assert_eq!(direct(&fx, Some(P + 151), &t, "M|x|AAA")["ok"], json!(true));
-    std::thread::sleep(Duration::from_millis(60));
-    paint(&t, &["────────", "❯ M|x|AAA", "────────"], 1, 11);
     assert_eq!(pair_return(&fx, Some(P + 151), &t)["result"]["sent"], json!(true));
     let o = wait_submit_consumed(&t);
     assert!(o.since_written_ms.is_some(), "{o:?}");
@@ -762,9 +802,8 @@ fn f1_kill_switch_disables_submit_cr_withhold() {
     std::env::set_var("CYS_SEND_SETTLE", "0");
     let t = agent_pane_settled(&fx, "worker-1", P + 160);
     let _x = pane(&fx, "worker-2", P + 161);
+    paint_at_submit(&t, &DIALOG, 1, 8); // C5b: the screen after the body, at its Return
     assert_eq!(direct(&fx, Some(P + 161), &t, "M|x|AAA")["ok"], json!(true));
-    std::thread::sleep(Duration::from_millis(60));
-    paint(&t, &DIALOG, 1, 8);
     assert_eq!(pair_return(&fx, Some(P + 161), &t)["result"]["sent"], json!(true));
     let o = wait_submit_consumed(&t);
     assert!(o.since_written_ms.is_some(), "끔이면 종전처럼 쓴다: {o:?}");
@@ -874,10 +913,10 @@ const W1: &str = "1. W1BODY please review the following status report carefully 
 
 /// 발신 좌석의 본문 → (에코가 파서에 닿은 뒤) 화면 `sc` → 짝 Return. 반환 = CR 소비 뒤 관측.
 fn body_then_return(fx: &Fx, t: &Arc<Surface>, from: u32, body: &str, sc: &(Vec<String>, u16, u16)) -> crate::state::SubmitSettleObs {
+    let lines: Vec<&str> = sc.0.iter().map(|s| s.as_str()).collect();
+    paint_at_submit(t, &lines, sc.1, sc.2); // C5b: the screen after the body, at its Return
     let r = direct(fx, Some(from), t, body);
     assert_eq!(r["ok"], json!(true), "전제: 본문 직접 send 통과: {r}");
-    std::thread::sleep(Duration::from_millis(60));
-    paint_rows(t, sc);
     assert_eq!(pair_return(fx, Some(from), t)["result"]["sent"], json!(true));
     let o = wait_submit_consumed(t);
     assert!(!o.inflight, "writer 가 CR 요청을 소비했다: {o:?}");

@@ -201,6 +201,8 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_load(&daemon, &mut last_load_alert);
                 check_surfaces(&daemon, &sys, &mut last_dup_alert, &mut last_proc_alert);
                 check_idle(&daemon);
+                // ★(0.14.52 · S-a C5b) Held legacy bodies past their window or of a changed agent -> undelivered event.
+                crate::handlers::sweep_held_submits(&daemon);
                 // ★(0.14.42 · 수정 2회차 F1 · 재개) 보류한 제출 CR 의 재제출 — 큐 배달 **앞**(입력줄 잔여가 그 좌석 큐를
                 //   세우지 않게). pause 중에는 아무것도 하지 않는다(기록 유지).
                 resubmit_withheld_submits(&daemon);
@@ -844,6 +846,7 @@ fn check_agent_death_with_model(
                             // 의미론: 허위 DEAD 과도기 없이 사망감지 상태머신을 정직하게 무장.
                             s.agent_seen.store(true, Ordering::Relaxed);
                             s.agent_exit_notified.store(false, Ordering::Relaxed);
+                            s.bump_agent_epoch(); // ★(0.14.52 · S-a C5b) a new agent incarnation
                             *s.pending_agent_obs.lock().unwrap() = None;
                             let role = s.role.lock().unwrap().clone();
                             daemon.bus.publish(
@@ -919,6 +922,7 @@ fn check_agent_death_with_model(
         if alive {
             s.agent_seen.store(true, Ordering::Relaxed);
             if s.agent_exit_notified.swap(false, Ordering::Relaxed) {
+                s.bump_agent_epoch(); // ★(0.14.52 · S-a C5b) a recovered agent is a new incarnation
                 // 재기동 성공 — 카운터 유지(수명 내 상한 3회), 복귀 이벤트
                 daemon.bus.publish(
                     "agent.recovered",
@@ -935,6 +939,7 @@ fn check_agent_death_with_model(
         if s.agent_exit_notified.swap(true, Ordering::Relaxed) {
             continue; // 이미 통지
         }
+        s.bump_agent_epoch(); // ★(0.14.52 · S-a C5b) bodies held for the dead agent never bind to its successor
         // ★(R3SH-4) 에이전트가 죽었다 — 그 에이전트의 사이클 창 표지는 더 붙잡을 것이 없다(다음에 앉는 에이전트의 각성 지시를
         //   막지 않게 지금 푼다).
         release_quiescing(daemon, &s, "agent_exited");
@@ -10147,6 +10152,8 @@ pub(crate) fn deliver_head_locked(
             resume: None,
             settle: Some(queue_write_settle(daemon, s, f.clone(), d.clone(), receipt, request_id, forced, overdue)),
             guard: guard.clone(),
+            note_body: true,
+            body_owner: None,
         };
         if s.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
             // 인계 실패 — 메시지 보존, 다음 틱 재시도. Undo only the marks that are still mine.
@@ -18226,7 +18233,9 @@ mod tests {
         // (파일, set_pending_input, clear_pending_input, apply_pending_input) — 정의처(state.rs)는 `fn` 선언 1줄을 포함한다.
         let want: [(&str, usize, usize, usize); 5] = [
             ("governance", 4, 1, 1),
-            ("handlers", 0, 1, 2),
+            // ★(0.14.52 · S-a C5b) +1 clear, +1 apply: the direct agent write's settlement (`DirectSettle::run`) applies the
+            //   SAME clear-first reset / accepted-bytes step the handler applied at hand-off - moved to after the terminal.
+            ("handlers", 0, 2, 3),
             ("schedule", 1, 0, 0),
             ("state", 4, 1, 1),
             ("channels", 0, 0, 0),
@@ -29134,15 +29143,27 @@ pub(crate) fn h_send_outside(_pack: &HOutsidePack, daemon: &Arc<Daemon>, sid: u6
     for (k, v) in extra.as_object().expect("extra 는 객체") {
         params[k] = v.clone();
     }
+    let caller = Some(params.clone());
+    // ★(0.14.52 · S-a C5b) A real off-pane peer: the kernel always supplies one (the caller key of a held body
+    //   falls back to it when there is no `from`); this test process descends from no pane, as before.
+    let peer = Some(std::process::id());
     let reply = crate::handlers::dispatch(
         daemon,
         cys::Request { id: json!(1), method: "surface.send_text".into(), params },
-        None,
+        peer,
     );
     let crate::handlers::Reply::Single(v) = reply else {
         panic!("single reply 기대");
     };
     assert_eq!(v["ok"], json!(true), "전제: 좌석 밖 직접 send 가 통과해야 잔여가 남는다: {v}");
+    // ★(0.14.52 · S-a C5b) An automatic body without its Return is now HELD untyped (S3-5), so the residue these
+    //   specimens study arises by the remaining route: the same caller's Return binds it and the job stops before
+    //   the Return. That write is a daemon-written paste, so wait out its own-paste window (OWN_PASTE_SETTLE_MS) as
+    //   the old untracked direct write never needed to.
+    if v["result"]["held"] == json!("awaiting_submit") {
+        crate::direct_agent_tests::bind_with_return_lost(daemon, sid, peer, caller);
+        std::thread::sleep(std::time::Duration::from_millis(OWN_PASTE_SETTLE_MS + 100));
+    }
     v
 }
 
@@ -29811,6 +29832,10 @@ mod h_machine_hold_tests {
             "handlers::announce_seat_takeover",
             "handlers::npm_prefix_pane_notice_req",
             "handlers::send_text_write_req",
+            // ★(0.14.52 · S-a C5b) The direct send family's checked agent writes (send_text's owned-submit /
+            //   self-submitting / clear-first jobs and a Return bound to its held body): the same admission as
+            //   `send_text_write_req` (ACL, typing guard, D-12 draft gate, S21 settle hold) runs before the hand-off.
+            "handlers::hand_off_direct_job",
         ]
         .iter()
         .map(|s| s.to_string())

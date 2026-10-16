@@ -7792,3 +7792,5 @@ mod feed_sweep_tests;
 mod vt100_dim_tests;
 #[cfg(test)]
 mod agent_queue_tests;
+#[cfg(test)]
+mod direct_agent_tests;
