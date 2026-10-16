@@ -45,6 +45,7 @@ pub mod paste_fence;
 /// 시드(U-19)는 로그인 화면을 **지우므로** 판정이 시드보다 먼저 있어야 한다. 판정은 순수함수
 /// 하나(`profile_gate::classify`)가 소유하고, `auth_class` 8값 중 `unknown` 은 **통과가 아니다**.
 pub mod profile_gate;
+pub mod process_observation;
 /// ready 술어 단일화(U-13) — `ready = 입력활성 증거 ∧ 관문 문면 부재`. 판정은 순수함수 하나가
 /// 소유하고(`readiness::judge`), 부트 폴링과 `adapter_ready` 두 소비처가 같은 술어를 경유한다.
 /// 종전엔 네 자리가 각자 ready 를 선언해 "마커 축만 고치면 아무것도 안 바뀌는" 상태였다.
