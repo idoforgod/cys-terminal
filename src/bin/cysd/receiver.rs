@@ -93,7 +93,8 @@ pub struct Recipe {
     pub bin: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// Raw serialization is explicit private persistence, not the public receipt shape.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct ReceiverPolicy {
     pub policy_epoch: u64,
     /// Exact frozen declaration and its digest, never derived from a successful native match.
@@ -104,6 +105,65 @@ pub struct ReceiverPolicy {
     pub origin: RegistrationOrigin,
     pub class: ProofClass,
     pub weak_risk: Option<WeakRisk>,
+}
+
+/// Public event/status/receipt projection: no command, executable recipe or environment.
+#[derive(Clone, Debug, Serialize)]
+pub struct ReceiverPolicySummary<'a> {
+    pub policy_epoch: u64,
+    pub adapter: &'a str,
+    pub config_digest: &'a str,
+    pub origin: RegistrationOrigin,
+    pub class: ProofClass,
+    pub weak_risk: Option<WeakRisk>,
+}
+
+/// Explicit raw persistence view. No Debug and no public-field construction. Serialize this
+/// only to the private policy store; event/status callers use public_summary instead.
+#[derive(Serialize)]
+pub(crate) struct PrivateReceiverPolicy<'a> {
+    policy_epoch: u64,
+    declaration: &'a str,
+    config_digest: &'a str,
+    adapter: &'a str,
+    recipe: &'a Recipe,
+    origin: RegistrationOrigin,
+    class: ProofClass,
+    weak_risk: Option<WeakRisk>,
+}
+
+impl ReceiverPolicy {
+    pub fn public_summary(&self) -> ReceiverPolicySummary<'_> {
+        ReceiverPolicySummary {
+            policy_epoch: self.policy_epoch,
+            adapter: &self.adapter,
+            config_digest: &self.config_digest,
+            origin: self.origin,
+            class: self.class,
+            weak_risk: self.weak_risk,
+        }
+    }
+
+    pub(crate) fn for_private_persistence(&self) -> PrivateReceiverPolicy<'_> {
+        PrivateReceiverPolicy {
+            policy_epoch: self.policy_epoch,
+            declaration: &self.declaration,
+            config_digest: &self.config_digest,
+            adapter: &self.adapter,
+            recipe: &self.recipe,
+            origin: self.origin,
+            class: self.class,
+            weak_risk: self.weak_risk,
+        }
+    }
+}
+
+impl std::fmt::Debug for ReceiverPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceiverPolicy")
+            .field("summary", &self.public_summary())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Fix the proof class from the declaration alone (never from a discovery result).

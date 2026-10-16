@@ -7655,7 +7655,7 @@ pub(crate) fn prompt_boundary_verdict(
 /// agents.json 은 user-owned 이라 팩 갱신은 Keep + `.new` 로 병치된다. 따라서 읽기 병합기에서
 /// 메모리만 승격하고 디스크는 쓰지 않는다(W-B). 커서행의 composer 후보는 같은 관측 프레임에서
 /// 행 선두(공백 제외)에 맞는 후보 중 가장 긴 것을 택하고, 그 뒤의 글리프는 초안으로 보존한다.
-fn merged_prompt_marker(
+pub(crate) fn merged_prompt_marker(
     disk: &serde_json::Value,
     embed: &serde_json::Value,
     agent: &str,
@@ -12256,7 +12256,7 @@ fn load_adapter_defs() -> (serde_json::Value, serde_json::Value) {
 /// composer 에는 둘 다 없고 마커 뒤에 플레이스홀더가 있어, alt-screen 좌석이면 `BLOCKED_ALT_SCREEN`
 /// 영구 보류였다(WP-5 기아 계급 · 리뷰 R7 minor). 플레이스홀더는 **약한 증거**이므로 판정부가
 /// 출력 정적과 AND 한다(`readiness::composer_layout_static_ok`).
-fn merged_composer_placeholder(
+pub(crate) fn merged_composer_placeholder(
     disk: &serde_json::Value,
     embed: &serde_json::Value,
     agent: &str,

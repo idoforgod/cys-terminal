@@ -26852,6 +26852,72 @@ mod tests {
     //   (소스 핀 `env_mutexes_are_poison_tolerant_source_pin` 이 집행).
     pub(super) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[test]
+    fn policy_r2_actual_cli_effective_spec_and_env_precedence() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct FixturePack {
+            path: std::path::PathBuf,
+            previous: Option<std::ffi::OsString>,
+        }
+        impl Drop for FixturePack {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(value) => std::env::set_var(cys::pack::ENV_PACK_DIR, value),
+                    None => std::env::remove_var(cys::pack::ENV_PACK_DIR),
+                }
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("cys-policy-r2-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let fixture = FixturePack { path, previous: std::env::var_os(cys::pack::ENV_PACK_DIR) };
+        std::env::set_var(cys::pack::ENV_PACK_DIR, &fixture.path);
+        let embedded = embedded_agents_json().expect("embedded definitions");
+        let cmd = embedded["claude"]["cmd"].as_str().unwrap();
+        assert!(embedded["claude"]["env"].is_object(), "fixture needs vendor env to discriminate inheritance");
+        let write = |disk: &Value| std::fs::write(fixture.path.join("agents.json"), serde_json::to_vec(disk).unwrap()).unwrap();
+
+        assert!(load_agent_spec("claude").is_err(), "missing disk document must not synthesize embedded config");
+        write(&json!({}));
+        assert_eq!(load_agent_spec("claude").unwrap(), embedded["claude"]);
+        write(&Value::Null);
+        assert_eq!(load_agent_spec("claude").unwrap(), embedded["claude"], "parsed non-object has no adapter key");
+
+        write(&json!({"claude":{"cmd":cmd,"notes":"mine"}}));
+        let resolved = load_agent_spec("claude").unwrap();
+        assert_eq!(resolved["cmd"], json!(cmd));
+        assert!(resolved.get("env").is_none());
+        assert!(agent_env_pairs(&resolved).is_empty());
+        for absent in ["inject_delay_secs", "clear_cmd", "resume_arg"] {
+            assert!(resolved.get(absent).is_none(), "not a layered UI/hook field: {absent}");
+        }
+        for key in ["ready_marker", "approval_patterns", "first_run_gates", "prompt_marker", "composer_placeholder", "hooks_inject_directive"] {
+            assert_eq!(resolved.get(key), embedded["claude"].get(key));
+        }
+        assert_eq!(resolved["notes"], json!("mine"));
+
+        for record in [json!({}), json!({"cmd":null}), json!({"cmd":9}), Value::Null, json!("not-object")] {
+            write(&json!({"claude":record}));
+            let resolved = load_agent_spec("claude").unwrap();
+            assert!(resolved.get("cmd").and_then(Value::as_str).is_none(), "never inherit cmd inside existing adapter");
+        }
+        for env in [Value::Null, json!(7), json!("not-map"), json!([])] {
+            write(&json!({"claude":{"cmd":cmd,"env":env}}));
+            assert!(agent_env_pairs(&load_agent_spec("claude").unwrap()).is_empty());
+        }
+        write(&json!({"claude":{"cmd":cmd,"env":{"Z":"z","A":"a","BAD":false,"NUMBER":7}}}));
+        assert_eq!(agent_env_pairs(&load_agent_spec("claude").unwrap()), vec![("A".into(),"a".into()),("Z".into(),"z".into())]);
+
+        let mut explicit = json!({"cmd":cmd});
+        for key in ["ready_marker", "approval_patterns", "first_run_gates", "prompt_marker", "composer_placeholder", "hooks_inject_directive"] {
+            explicit[key] = Value::Null;
+        }
+        write(&json!({"claude":explicit}));
+        assert_eq!(load_agent_spec("claude").unwrap(), explicit, "explicit null must survive all six field layers");
+    }
+
+
     fn sha256_of(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(bytes))
