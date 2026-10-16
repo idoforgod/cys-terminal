@@ -711,6 +711,44 @@ jobs:
           cargo_filter_count --bin cys tests::f10_
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys tests::f10_ -- --test-threads=1
 
+      # ── 0.14.52 U (B-229 account mismatch · F-01 activity observer): first native Windows run of their daemon tests. BLOCKING
+      #   (no continue-on-error, no `if:`) — this code ships in the release, so a red here must stop the tag lane before a tag is spent.
+      #   · u229_: the account resolver's mismatch/sameness rules; on Windows `resolve_seat_folder` runs the native (case-insensitive,
+      #     backslash) normalisation that macOS only exercises through explicit windows=true fixtures.
+      #   · activity_tests::: the F-01 observer substrate (reducer, collector, identity guards incl. the Windows staging path, grammars on
+      #     transcribed frames). The corpus replay is #[ignore] (the corpus is evidence, not repo data) and does not run here.
+      #   macOS `--list` (2026-10-16, commit 35007027): u229_ = 4; activity_tests:: = 60 (59 run + the #[ignore] replay, which `--list`
+      #   also prints). The count guard only fails on 0.
+      # ★Position / limit: after the cysd full step built the `--bin cysd` test harness, so this step is execution only (seconds). The 3-minute
+      #   limit also covers a rebuild if that step was cut mid-build. Budget table (hwmon step header): realistic worst +0.2 min; theoretical
+      #   worst 50.3 + 3 = 53.3 min, inside the 55-minute job cap (the table already records that the theoretical worst exceeds the 45-minute
+      #   release gate). Placed after F10 for the same reason F10 sits after the non-blocking steps: a red here cannot skip their diagnostics.
+      - name: 'cargo test U cells (--bin cysd u229_ · --bin cysd activity_tests:: · Windows · blocking)'
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_filter_count() {
+            local list="${RUNNER_TEMP:-/tmp}/cargo-filter-list.txt" n rc
+            if CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$list" 2>&1; then rc=0; else rc=$?; fi
+            if [ "$rc" -ne 0 ]; then
+              cat "$list"
+              echo "::error::cargo test $* -- --list failed (rc=$rc) — a filter that cannot be counted gives no ground for the run (fail-closed)"
+              exit 1
+            fi
+            n=$(grep -c ': test$' "$list" || true)
+            if [ "${n:-0}" -lt 1 ]; then
+              tail -20 "$list"
+              echo "::error::cargo test $* matches 0 tests — the module path changed (no green that did not run)"
+              exit 1
+            fi
+            echo "[filter-count] cargo test $* → ${n}"
+          }
+          cargo_filter_count --bin cysd u229_
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd u229_ -- --test-threads=1
+          cargo_filter_count --bin cysd activity_tests::
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd activity_tests:: -- --test-threads=1
+
       # ★R2F-PK(성찰 2회차 · A4 m5): **화면 검체가 태그 전에 윈도우에서 한 번도 돌지 않는다** — 브랜치 ui-check 는 macOS 뿐이고(ci-branch 잡5), `release.yml` 의 `cd ui && bun test`(윈도우 레그 포함 · `if` 없음)가 첫
       #   윈도우 실행이라 이번 판이 더한 검체 파일(deptprogress · deptprogressseats · deptprogresswiring · sendfailwiring · starvednotice · updatenotice)과 크게 늘어난 기존 검체(usagebar · usagewiring · restartplan · toastttl)의
       #   윈도우 첫 실행이 **태그**다 — 거기서 붉으면 태그(불변 · 버전 소모)가 소모된다. 그래서 같은 명령을 이 잡에서 **차단**으로 먼저 돈다(윈도우 전용으로 깨질 구조는 정적으로 찾지 못했다 — 다른 레인 파일을 `import.meta.url` 로
