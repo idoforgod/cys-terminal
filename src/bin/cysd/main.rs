@@ -48,6 +48,7 @@ mod knobs;
 mod office_bridge;
 mod recall;
 mod reclaim;
+mod receiver;
 mod repaint;
 mod s5_escalation;
 mod schedule;
