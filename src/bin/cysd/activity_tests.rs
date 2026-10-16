@@ -319,9 +319,13 @@ fn family_comes_from_agent_name_aliases_only() {
 }
 
 #[test]
-fn production_registry_has_no_grammar_without_a_native_corpus() {
-    // Until a native corpus locks a grammar, every family is Unknown (no fabricated footer).
-    assert!(grammars().is_empty());
+fn production_registry_has_corpus_grammars_only_and_none_for_gemini() {
+    let fams: Vec<Family> = grammars().iter().map(|g| g.family()).collect();
+    assert_eq!(fams, vec![Family::Claude, Family::Codex]);
+    // gemini/agy: no captured working frame yet (live-seat observation only) → Unknown, never a fabricated grammar.
+    let rows = vec![(0u16, "> ".to_string())];
+    let v = View { rows: &rows, size: (24, 80), cursor: (0, 0), alt: false, title: "anything" };
+    assert_eq!(classify_with(Family::Gemini, &v, grammars()).0, Sample::Semantic(Semantic::UnsupportedFamily));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -880,4 +884,165 @@ fn open_synchronized_output_block_is_an_incomplete_frame() {
     observe(&f, &s, &mut frame, 4.0);
     let w = wire_at(&f.daemon.activity, &s, 4.0, &P);
     assert_eq!((w["state"].as_str(), w["retained"].as_bool()), (Some("working"), Some(false)), "{w}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Production grammars against frames transcribed from the native capture FINDINGS (rows, cursor, title)
+// ---------------------------------------------------------------------------------------------
+
+const RULE: &str = "────────────────────────────────────────────────────────────────────────────────";
+
+fn frame_of(rows: &[(u16, &str)], cursor: (u16, u16), title: &str) -> (Vec<(u16, String)>, (u16, u16), String) {
+    (rows.iter().map(|(i, l)| (*i, l.to_string())).collect(), cursor, title.to_string())
+}
+
+fn prod(fam: Family, f: &(Vec<(u16, String)>, (u16, u16), String), cols: u16) -> Sample {
+    let v = View { rows: &f.0, size: (24, cols), cursor: f.1, alt: fam == Family::Codex, title: &f.2 };
+    classify_with(fam, &v, grammars()).0
+}
+
+fn claude_idle(title: &str) -> (Vec<(u16, String)>, (u16, u16), String) {
+    frame_of(&[(5, RULE), (6, "❯"), (7, RULE), (8, "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents")], (6, 2), title)
+}
+
+#[test]
+fn claude_idle_empty_is_waiting() {
+    assert_eq!(prod(Family::Claude, &claude_idle("✳ Claude Code"), 80), Sample::Idle);
+}
+
+/// FINDINGS-claude §3: a multi-line draft quoting every busy token is still idle (title ✳). A token-only
+/// grammar (search for "esc to interrupt"/"Working") would turn this into Working — this pins it.
+#[test]
+fn claude_draft_with_quoted_busy_tokens_is_never_active() {
+    let f = frame_of(
+        &[
+            (5, RULE),
+            (6, "❯ echo \"esc to interrupt\" Working Thinking (esc to interrupt)"),
+            (7, "  second line Working"),
+            (8, "  ✻ Thinking… (12s · esc to interrupt)"),
+            (9, "  • Working (3s • esc to interrupt)"),
+            (10, RULE),
+            (11, "  ⏵⏵ bypass permissions on (shift+tab to cycle)"),
+        ],
+        (9, 35),
+        "✳ Claude Code",
+    );
+    assert_eq!(prod(Family::Claude, &f, 80), Sample::Idle);
+}
+
+#[test]
+fn claude_active_tool_and_streaming_and_narrow_width_are_active() {
+    let tool = frame_of(
+        &[
+            (10, "  ⎿  Running… (12s)"),
+            (12, "✶ Honking… (13s · ↓ 77 tokens)"),
+            (14, RULE),
+            (15, "❯"),
+            (16, RULE),
+            (17, "  ⏵⏵ bypass permissions on … · esc to interrupt · ← for ag…"),
+        ],
+        (15, 2),
+        "◐ Claude Code",
+    );
+    assert!(matches!(prod(Family::Claude, &tool, 80), Sample::Active { .. }));
+    // streaming: no spinner row at all; title alone carries the state
+    let stream = frame_of(
+        &[(11, "  juliet quebec, xray echo lima, sierra zulu golf, november uniform bravo."), (14, RULE), (15, "❯"), (16, RULE)],
+        (15, 2),
+        "◑ Claude Code",
+    );
+    assert!(matches!(prod(Family::Claude, &stream, 80), Sample::Active { .. }));
+    // 48 columns: the footer token is truncated away (`· e…`); still active by title
+    let narrow = frame_of(&[(14, "────────────────────────────────────────────────"), (15, "❯"), (16, "────────────────────────────────────────────────"), (17, "  ⏵⏵ bypass permissions on (shift+tab to  · e…")], (15, 2), "◐ Claude Code");
+    assert!(matches!(prod(Family::Claude, &narrow, 48), Sample::Active { .. }));
+}
+
+#[test]
+fn claude_permission_and_question_panels_are_waiting_for_input() {
+    let perm = frame_of(
+        &[(16, " Do you want to proceed?"), (17, " ❯ 1. Yes"), (18, "   2. Yes, and don’t ask again for: touch *"), (20, "   4. No"), (22, " Esc to cancel · Tab to amend")],
+        (17, 1),
+        "✳ Claude Code",
+    );
+    assert_eq!(prod(Family::Claude, &perm, 80), Sample::Decision(DecisionKind::Permission));
+    let q = frame_of(&[(11, "F01 which option?"), (13, "❯ 1. Alpha"), (15, "  2. Beta"), (21, "Enter to select · ↑/↓ to navigate · Esc to cancel")], (13, 0), "✳ Claude Code");
+    assert_eq!(prod(Family::Claude, &q, 80), Sample::Decision(DecisionKind::Question));
+}
+
+/// U4-1 on the real grammar: a working title over a frame whose composer is mid-redraw (rule row not yet
+/// painted) is an incomplete frame — transient, not a contradiction.
+#[test]
+fn claude_working_title_over_a_half_painted_composer_is_incomplete() {
+    let torn = frame_of(&[(14, RULE), (15, "❯"), (16, ""), (17, "  ⏵⏵ bypass permissions on (shift+tab to")], (15, 2), "◐ Claude Code");
+    assert_eq!(prod(Family::Claude, &torn, 80), Sample::Transient(Transient::Incomplete));
+}
+
+fn codex_frame(title: &str, extra: &[(u16, &str)]) -> (Vec<(u16, String)>, (u16, u16), String) {
+    let mut rows: Vec<(u16, &str)> = extra.to_vec();
+    rows.extend_from_slice(&[(20, "› Ask Codex to do anything"), (22, "  GPT-6.1-Sol default · ~/work"), (23, "  ? for shortcuts")]);
+    rows.sort_by_key(|r| r.0);
+    frame_of(&rows, (20, 2), title)
+}
+
+#[test]
+fn codex_idle_waiting_and_streaming_active_differ_only_by_title() {
+    assert_eq!(prod(Family::Codex, &codex_frame("work", &[]), 80), Sample::Idle);
+    // FINDINGS-codex §5: while streaming there is NO Working row and the bottom rows equal idle
+    assert!(matches!(prod(Family::Codex, &codex_frame("⠹ work", &[(17, "• lima sierra zulu, …")]), 80), Sample::Active { .. }));
+    assert!(matches!(prod(Family::Codex, &codex_frame("⠋ work", &[(17, "• Working (13s • esc to interrupt)")]), 80), Sample::Active { .. }));
+}
+
+#[test]
+fn codex_draft_with_quoted_busy_tokens_is_never_active() {
+    let f = frame_of(
+        &[
+            (17, "› echo \"esc to interrupt\" Working Thinking (esc to interrupt)"),
+            (18, "  second line Working"),
+            (19, "  ✻ Thinking… (12s · esc to interrupt)"),
+            (20, "  • Working (3s • esc to interrupt)"),
+        ],
+        (17, 60),
+        "work",
+    );
+    assert_eq!(prod(Family::Codex, &f, 80), Sample::Idle);
+}
+
+#[test]
+fn codex_action_required_panels_are_waiting_for_input() {
+    let perm = frame_of(&[(4, "  Would you like to run the following command?"), (17, "› 1. Yes, proceed (y)"), (23, "  Press enter to confirm or esc to cancel")], (23, 79), "[ ! ] Action Required | work");
+    assert_eq!(prod(Family::Codex, &perm, 80), Sample::Decision(DecisionKind::Permission));
+    let q = frame_of(&[(15, "  Question 1/1 (1 unanswered)"), (18, "  › 1. Alpha (Recommended)  first option"), (22, "  tab to add notes | enter to submit answer | esc to interrupt")], (23, 1), "[ . ] Action Required | work");
+    assert_eq!(prod(Family::Codex, &q, 80), Sample::Decision(DecisionKind::Question));
+}
+
+/// Cross-family: a claude seat whose transcript shows a codex-like `›` row (not the cursor row) stays claude-active;
+/// a codex frame is no claude signature and vice versa.
+#[test]
+fn families_do_not_cross_match() {
+    let mut claude_busy = frame_of(&[(12, "› Ask Codex to do anything"), (14, RULE), (15, "❯"), (16, RULE)], (15, 2), "◐ Claude Code");
+    assert!(matches!(prod(Family::Claude, &claude_busy, 80), Sample::Active { .. }));
+    claude_busy.2 = "✳ Claude Code".into();
+    assert_eq!(prod(Family::Claude, &claude_busy, 80), Sample::Idle);
+    assert_eq!(prod(Family::Claude, &codex_frame("⠹ work", &[]), 80), Sample::Semantic(Semantic::OtherFamily));
+    assert_eq!(prod(Family::Codex, &claude_idle("✳ Claude Code"), 80), Sample::Semantic(Semantic::OtherFamily));
+}
+
+/// U4-2 mask: the claude spinner/done glyph and the codex Working bullet are animation; timers are not.
+#[test]
+fn static_signature_masks_animation_glyphs_but_not_timers() {
+    let at = |glyph: &str, secs: u32| {
+        let row = format!("{glyph} Honking… ({secs}s · ↓ 77 tokens)");
+        let f = frame_of(&[(12, row.as_str()), (14, RULE), (15, "❯"), (16, RULE)], (15, 2), "◐ Claude Code");
+        match prod(Family::Claude, &f, 80) {
+            Sample::Active { sig } => sig,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(at("✶", 13), at("✻", 13), "spinner glyph is neutral");
+    assert_ne!(at("✶", 13), at("✶", 14), "the elapsed timer is progress");
+    let cx = |bullet: &str| match prod(Family::Codex, &codex_frame("⠋ work", &[(17, &format!("{bullet} Working (1s • esc to interrupt)"))]), 80) {
+        Sample::Active { sig } => sig,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(cx("•"), cx("◦"));
 }

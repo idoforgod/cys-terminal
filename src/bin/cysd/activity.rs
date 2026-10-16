@@ -668,9 +668,151 @@ pub(crate) trait Grammar: Sync {
     fn classify(&self, v: &View<'_>) -> Verdict;
 }
 
-/// Production grammar registry.
+/// Production grammar registry. Each grammar is derived from the native capture corpus
+/// (`_evidence/dept5-0.14.52-P3-impl/U/validation/f01/FINDINGS-<family>.md`, corpus/INDEX.json sha256 bec81de5…).
+/// gemini/agy has no grammar yet: its only route is read-only observation of a live seat (head ruling
+/// 2026-10-16) and no working frame has been observed, so that family stays Unknown (PROVISIONAL).
 pub(crate) fn grammars() -> &'static [&'static dyn Grammar] {
-    &[]
+    static ALL: [&dyn Grammar; 2] = [&CLAUDE_R1, &CODEX_R1];
+    &ALL
+}
+
+fn row_at<'a>(v: &'a View<'_>, r: u16) -> Option<&'a str> {
+    v.rows.iter().find(|(i, _)| *i == r).map(|(_, l)| l.as_str())
+}
+
+fn hash_rows(v: &View<'_>, mask: impl Fn(&str) -> String) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (i, l) in v.rows {
+        i.hash(&mut h);
+        mask(l).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Replaces the first non-space character of a row when it is one of `glyphs` (animation-only cells).
+fn mask_lead(line: &str, glyphs: &[char]) -> String {
+    let trimmed = line.trim_start();
+    match trimmed.chars().next() {
+        Some(c) if glyphs.contains(&c) => {
+            let lead = line.len() - trimmed.len();
+            format!("{}*{}", &line[..lead], &trimmed[c.len_utf8()..])
+        }
+        _ => line.to_string(),
+    }
+}
+
+/// claude 2.1.301 (FINDINGS-claude §2–§5): OSC title `◐|◑ Claude Code` while working (model wait, streaming,
+/// tool — 99.1–100 %), `✳ Claude Code` when idle AND in permission/question panels. The composer is a `❯` row
+/// framed by `─` rules with the (hidden) cursor parked in it; a frame without that structure is mid-redraw.
+pub(crate) struct ClaudeR1;
+pub(crate) static CLAUDE_R1: ClaudeR1 = ClaudeR1;
+const CLAUDE_SPINNER: [char; 6] = ['·', '✢', '✳', '✶', '✻', '✽'];
+
+impl ClaudeR1 {
+    fn is_rule(l: &str) -> bool {
+        l.trim_start().starts_with('─')
+    }
+    /// A `❯` row at or above the cursor row (scanning up through draft lines, stopping at a rule), with a rule
+    /// row directly above it and a rule row somewhere below the cursor row.
+    fn composer_intact(v: &View<'_>) -> bool {
+        let cur = v.cursor.0;
+        let mut r = cur;
+        loop {
+            match row_at(v, r) {
+                Some(l) if l.trim_start().starts_with('❯') => break,
+                Some(l) if Self::is_rule(l) => return false,
+                Some(_) => {}
+                None => return false,
+            }
+            if r == 0 {
+                return false;
+            }
+            r -= 1;
+        }
+        let above = r.checked_sub(1).and_then(|a| row_at(v, a)).is_some_and(Self::is_rule);
+        let below = v.rows.iter().any(|(i, l)| *i > cur && Self::is_rule(l));
+        above && below
+    }
+}
+
+impl Grammar for ClaudeR1 {
+    fn family(&self) -> Family {
+        Family::Claude
+    }
+    fn revision(&self) -> &'static str {
+        "claude-2.1.301-r1"
+    }
+    fn classify(&self, v: &View<'_>) -> Verdict {
+        let title = v.title.trim();
+        if !title.ends_with("Claude Code") {
+            return Verdict::NoMatch;
+        }
+        let glyph = title.chars().next();
+        let active = matches!(glyph, Some('◐' | '◑'));
+        let resting = glyph == Some('✳');
+        let trimmed = || v.rows.iter().map(|(_, l)| l.trim());
+        let permission = trimmed().any(|l| l.starts_with("Esc to cancel · Tab to amend") || l == "Do you want to proceed?");
+        let question = trimmed().any(|l| l.starts_with("Enter to select · ↑/↓ to navigate · Esc to cancel"));
+        if active && (permission || question) {
+            return Verdict::Conflict;
+        }
+        if resting && question {
+            return Verdict::Decision(DecisionKind::Question);
+        }
+        if resting && permission {
+            return Verdict::Decision(DecisionKind::Permission);
+        }
+        if !Self::composer_intact(v) {
+            return Verdict::NoMatch;
+        }
+        if active {
+            return Verdict::Active { sig: hash_rows(v, |l| mask_lead(l, &CLAUDE_SPINNER)) };
+        }
+        if resting {
+            return Verdict::Idle;
+        }
+        Verdict::NoMatch
+    }
+}
+
+/// codex-cli 0.162.1 (FINDINGS-codex §2–§6): alternate screen; OSC title = braille spinner + cwd while working
+/// (100 % of active phases), plain cwd when idle, `[ ! ]/[ . ] Action Required | cwd` in permission/question
+/// panels. The cursor sits on the `›` composer row after every frame.
+pub(crate) struct CodexR1;
+pub(crate) static CODEX_R1: CodexR1 = CodexR1;
+
+impl Grammar for CodexR1 {
+    fn family(&self) -> Family {
+        Family::Codex
+    }
+    fn revision(&self) -> &'static str {
+        "codex-0.162.1-r1"
+    }
+    fn classify(&self, v: &View<'_>) -> Verdict {
+        let title = v.title.trim();
+        if title.is_empty() {
+            return Verdict::NoMatch;
+        }
+        if title.starts_with("[ ! ] Action Required") || title.starts_with("[ . ] Action Required") {
+            let question = v
+                .rows
+                .iter()
+                .any(|(_, l)| l.contains("enter to submit answer") || l.trim_start().starts_with("Question "));
+            return Verdict::Decision(if question { DecisionKind::Question } else { DecisionKind::Permission });
+        }
+        let composer = row_at(v, v.cursor.0).is_some_and(|l| l.trim_start().starts_with('›'));
+        if !composer {
+            return Verdict::NoMatch;
+        }
+        let spinning = title.chars().next().is_some_and(|c| ('\u{2800}'..='\u{28FF}').contains(&c));
+        if spinning {
+            Verdict::Active { sig: hash_rows(v, |l| mask_lead(l, &['•', '◦'])) }
+        } else {
+            Verdict::Idle
+        }
+    }
 }
 
 /// Classifies a view for `family` against `grammars` (U4-1 precedence):
