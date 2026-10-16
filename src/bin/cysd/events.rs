@@ -5,6 +5,8 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::TryLockError;
 use tokio::sync::broadcast;
 
 const RING_CAPACITY: usize = 4096;
@@ -18,6 +20,7 @@ pub struct EventBus {
     /// 블록 예약(256)이라 그 아래 구간에는 **발행되지 않은 seq 가 섞여 있다** — 그것을 유실로
     /// 세면 재생 갭 보고가 허위가 된다. 이번 세대가 실제로 발행한 것은 전부 이 값 **초과**다.
     generation_floor: u64,
+    diagnostic_publications: DiagnosticPublicationCounters,
 }
 
 struct Inner {
@@ -34,6 +37,149 @@ fn now_epoch() -> f64 {
         .map(crate::state::epoch_secs_us)
         .unwrap_or(0.0)
 }
+
+const DIAGNOSTIC_PAYLOAD_MAX_BYTES: usize = 4_096;
+const DIAGNOSTIC_EVENT_MAX_BYTES: usize = 8_192;
+// Two JSON numeric fields are stamped after preparation. This conservative slack
+// is included in the serialized envelope bound, not claimed as heap-size accounting.
+const DIAGNOSTIC_STAMP_SLACK_BYTES: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiagnosticBuildError {
+    PayloadTooLarge,
+    InvalidJson,
+    PayloadNotObject,
+    EnvelopeTooLarge,
+}
+
+/// Both event copies are constructed before the event-bus lock is attempted.
+/// No public fields: only the fixed identity event constructor can create this.
+pub(crate) struct PreparedDiagnostic {
+    ring_event: Value,
+    live_event: Value,
+}
+
+impl PreparedDiagnostic {
+    pub(crate) fn identity_observation(
+        surface_id: Option<u64>,
+        payload_json: &[u8],
+    ) -> Result<Self, DiagnosticBuildError> {
+        if payload_json.len() > DIAGNOSTIC_PAYLOAD_MAX_BYTES {
+            return Err(DiagnosticBuildError::PayloadTooLarge);
+        }
+        let payload: Value = serde_json::from_slice(payload_json)
+            .map_err(|_| DiagnosticBuildError::InvalidJson)?;
+        if !payload.is_object() {
+            return Err(DiagnosticBuildError::PayloadNotObject);
+        }
+        let event = json!({
+            "type": "event",
+            "seq": 0_u64,
+            "name": "identity.observation",
+            "category": "identity",
+            "timestamp": 0.0_f64,
+            "surface_id": surface_id,
+            "payload": payload,
+        });
+        // Allocation and traversal are outside the lock and bounded by input size
+        // plus serde_json's ordinary nesting limit. Later S10 uses typed payloads.
+        let encoded = serde_json::to_vec(&event)
+            .map_err(|_| DiagnosticBuildError::InvalidJson)?;
+        if encoded.len().saturating_add(DIAGNOSTIC_STAMP_SLACK_BYTES)
+            > DIAGNOSTIC_EVENT_MAX_BYTES
+        {
+            return Err(DiagnosticBuildError::EnvelopeTooLarge);
+        }
+        Ok(Self { ring_event: event.clone(), live_event: event })
+    }
+
+    fn stamp(&mut self, seq: u64, timestamp: f64) {
+        // Shape is a private constructor invariant. Replacing existing scalar
+        // values does not clone payloads or introduce arbitrary event names.
+        self.ring_event["seq"] = json!(seq);
+        self.live_event["seq"] = json!(seq);
+        self.ring_event["timestamp"] = json!(timestamp);
+        self.live_event["timestamp"] = json!(timestamp);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub(crate) enum DiagnosticNotPublished {
+    LockBusy = 0,
+    LockPoisoned = 1,
+    ReservationUnavailable = 2,
+    SequenceExhausted = 3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DiagnosticPublishOutcome {
+    Published { seq: u64 },
+    NotPublished(DiagnosticNotPublished),
+}
+
+#[derive(Default)]
+struct DiagnosticPublicationCounters {
+    published: AtomicU64,
+    failed: [AtomicU64; 4],
+    saturated: AtomicBool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DiagnosticFailureCounts {
+    pub lock_busy: u64,
+    pub lock_poisoned: u64,
+    pub reservation_unavailable: u64,
+    pub sequence_exhausted: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct DiagnosticPublicationStats {
+    pub published_total: u64,
+    pub not_published_total: u64,
+    pub not_published_by_reason: DiagnosticFailureCounts,
+    pub counter_saturated: bool,
+}
+
+impl DiagnosticPublicationCounters {
+    fn increment(&self, counter: &AtomicU64) {
+        // Atomic update contention is not a publication retry or a waiting mutex.
+        // This is lock-free accounting, not a hard scheduler/runtime bound.
+        let before = counter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_add(1)))
+            .unwrap_or_else(|n| n);
+        if before == u64::MAX {
+            self.saturated.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn reject(&self, reason: DiagnosticNotPublished) -> DiagnosticPublishOutcome {
+        self.increment(&self.failed[reason as usize]);
+        DiagnosticPublishOutcome::NotPublished(reason)
+    }
+
+    fn snapshot(&self) -> DiagnosticPublicationStats {
+        let values: [u64; 4] = std::array::from_fn(|i| self.failed[i].load(Ordering::Relaxed));
+        let mut aggregate_saturated = false;
+        let total = values.iter().fold(0_u64, |sum, n| {
+            let (next, overflow) = sum.overflowing_add(*n);
+            aggregate_saturated |= overflow;
+            if overflow { u64::MAX } else { next }
+        });
+        DiagnosticPublicationStats {
+            published_total: self.published.load(Ordering::Relaxed),
+            not_published_total: total,
+            not_published_by_reason: DiagnosticFailureCounts {
+                lock_busy: values[0],
+                lock_poisoned: values[1],
+                reservation_unavailable: values[2],
+                sequence_exhausted: values[3],
+            },
+            counter_saturated: aggregate_saturated || self.saturated.load(Ordering::Relaxed),
+        }
+    }
+}
+
 
 impl EventBus {
     pub fn new(persist_path: Option<PathBuf>) -> Self {
@@ -52,6 +198,7 @@ impl EventBus {
             tx,
             persist_path,
             generation_floor: start_seq,
+            diagnostic_publications: DiagnosticPublicationCounters::default(),
         }
     }
 
@@ -147,6 +294,57 @@ pub fn event_matches(event: &Value, names: &[String], categories: &[String]) -> 
         }
     }
     true
+}
+
+impl EventBus {
+    pub(crate) fn diagnostic_publication_stats(&self) -> DiagnosticPublicationStats {
+        self.diagnostic_publications.snapshot()
+    }
+
+    pub(crate) fn try_publish_diagnostic(
+        &self,
+        mut prepared: PreparedDiagnostic,
+    ) -> DiagnosticPublishOutcome {
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::WouldBlock) => {
+                return self.diagnostic_publications.reject(DiagnosticNotPublished::LockBusy);
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                // Do not clear poison or recover/modify the legacy bus state.
+                drop(poisoned);
+                return self.diagnostic_publications.reject(DiagnosticNotPublished::LockPoisoned);
+            }
+        };
+        let Some(next_seq) = inner.seq.checked_add(1) else {
+            drop(inner);
+            return self.diagnostic_publications.reject(DiagnosticNotPublished::SequenceExhausted);
+        };
+        if self.persist_path.is_some() && next_seq > inner.persist_hwm {
+            drop(inner);
+            return self.diagnostic_publications.reject(DiagnosticNotPublished::ReservationUnavailable);
+        }
+
+        prepared.stamp(next_seq, now_epoch());
+        let evicted = if inner.ring.len() >= RING_CAPACITY {
+            inner.ring.pop_front()
+        } else {
+            None
+        };
+        inner.seq = next_seq;
+        inner.ring.push_back(prepared.ring_event);
+        // Keep sequence assignment and broadcast order serialized as publish does.
+        // Retain a no-subscriber SendError<Value> until after unlocking, too.
+        // LIMIT: Tokio 1.52.3 send itself takes blocking tail/slot locks and can
+        // destroy an old ordinary Value inside them. Outer try_lock is not a
+        // globally nonblocking publication guarantee.
+        let sent = self.tx.send(prepared.live_event);
+        drop(inner);
+        drop(evicted);
+        drop(sent);
+        self.diagnostic_publications.increment(&self.diagnostic_publications.published);
+        DiagnosticPublishOutcome::Published { seq: next_seq }
+    }
 }
 
 #[cfg(test)]
@@ -375,4 +573,188 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+
+    fn prepared_identity() -> PreparedDiagnostic {
+        PreparedDiagnostic::identity_observation(
+            Some(7), br#"{"reason":"unproven","request_sequence":9}"#,
+        ).expect("bounded fixture")
+    }
+
+    fn diagnostic_seq_path() -> std::path::PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "cys_diagnostic_api_{}_{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("event.seq")
+    }
+
+    #[test]
+    fn diagnostic_input_is_bounded_and_identity_only() {
+        assert!(matches!(
+            PreparedDiagnostic::identity_observation(None, &vec![b' '; DIAGNOSTIC_PAYLOAD_MAX_BYTES + 1]),
+            Err(DiagnosticBuildError::PayloadTooLarge)
+        ));
+        assert!(matches!(
+            PreparedDiagnostic::identity_observation(None, b"[]"),
+            Err(DiagnosticBuildError::PayloadNotObject)
+        ));
+        assert!(matches!(
+            PreparedDiagnostic::identity_observation(None, b"{"),
+            Err(DiagnosticBuildError::InvalidJson)
+        ));
+        let p = prepared_identity();
+        assert_eq!(p.ring_event, p.live_event);
+        assert_eq!(p.ring_event["name"], "identity.observation");
+        assert_eq!(p.ring_event["category"], "identity");
+        assert!(serde_json::to_vec(&p.ring_event).unwrap().len() + DIAGNOSTIC_STAMP_SLACK_BYTES
+            <= DIAGNOSTIC_EVENT_MAX_BYTES);
+    }
+
+    #[test]
+    fn diagnostic_cold_boundary_and_restart_refuse_without_seq_or_file_change() {
+        let path = diagnostic_seq_path();
+        let bus = EventBus::new(Some(path.clone()));
+        let rejected = DiagnosticPublishOutcome::NotPublished(DiagnosticNotPublished::ReservationUnavailable);
+        assert_eq!(bus.try_publish_diagnostic(prepared_identity()), rejected);
+        assert_eq!(bus.latest_seq(), 0);
+        assert!(bus.replay_after(0).is_empty());
+        assert!(!path.exists(), "diagnostic created a sequence reservation file");
+        assert_eq!(bus.diagnostic_publication_stats().not_published_by_reason.reservation_unavailable, 1);
+
+        // Existing ordinary API is the only reservation writer; no diagnostic fallback.
+        bus.publish("test.operational", "system", None, json!(null));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, b"256");
+        for expected in 2..=256 {
+            assert_eq!(bus.try_publish_diagnostic(prepared_identity()),
+                DiagnosticPublishOutcome::Published { seq: expected });
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let before = bus.replay_after(0);
+        assert_eq!(bus.try_publish_diagnostic(prepared_identity()), rejected);
+        assert_eq!(bus.latest_seq(), 256);
+        assert_eq!(bus.replay_after(0), before);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(bus.diagnostic_publication_stats().published_total, 255);
+        assert_eq!(bus.diagnostic_publication_stats().not_published_total, 2);
+
+        let restarted = EventBus::new(Some(path.clone()));
+        assert_eq!(restarted.generation_floor(), 256);
+        assert_eq!(restarted.try_publish_diagnostic(prepared_identity()), rejected);
+        assert_eq!(restarted.latest_seq(), 256);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        // An actual ordinary publish can restore capacity, without modifying that API.
+        restarted.publish("test.operational", "system", None, json!(null));
+        assert_eq!(restarted.try_publish_diagnostic(prepared_identity()),
+            DiagnosticPublishOutcome::Published { seq: 258 });
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_busy_returns_before_held_lock_is_released() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let bus = Arc::new(EventBus::new(None));
+        let held = bus.inner.lock().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let other = Arc::clone(&bus);
+        let worker = std::thread::spawn(move || {
+            let result = other.try_publish_diagnostic(prepared_identity());
+            tx.send(result).unwrap();
+        });
+        // Generous synchronization bound, not a product performance-budget assertion.
+        let before_release = rx.recv_timeout(Duration::from_secs(5));
+        // Release before any assert/join: a blocking-lock mutant must fail cleanly,
+        // not leave a permanently blocked test thread.
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(before_release.expect("diagnostic waited for the held bus lock"),
+            DiagnosticPublishOutcome::NotPublished(DiagnosticNotPublished::LockBusy));
+        assert_eq!(bus.latest_seq(), 0);
+        assert!(bus.replay_after(0).is_empty());
+        assert_eq!(bus.diagnostic_publication_stats().not_published_by_reason.lock_busy, 1);
+        // Subsequent ordinary publication progresses normally after external contention ends.
+        bus.publish("test.operational", "system", None, json!(null));
+        assert_eq!(bus.latest_seq(), 1);
+    }
+
+    #[test]
+    fn diagnostic_poison_is_counted_without_recovery_or_publication() {
+        let bus = EventBus::new(None);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = bus.inner.lock().unwrap();
+            panic!("fixture poison");
+        }));
+        assert_eq!(bus.try_publish_diagnostic(prepared_identity()),
+            DiagnosticPublishOutcome::NotPublished(DiagnosticNotPublished::LockPoisoned));
+        assert!(bus.inner.is_poisoned(), "diagnostic silently repaired legacy poison state");
+        assert_eq!(bus.diagnostic_publication_stats().not_published_by_reason.lock_poisoned, 1);
+        let state = match bus.inner.lock() {
+            Err(poisoned) => poisoned.into_inner(),
+            Ok(_) => panic!("expected poisoned bus"),
+        };
+        assert_eq!(state.seq, 0);
+        assert!(state.ring.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_success_is_one_ring_and_broadcast_event_with_matching_seq() {
+        let bus = EventBus::new(None);
+        let mut rx = bus.subscribe();
+        assert_eq!(bus.try_publish_diagnostic(prepared_identity()),
+            DiagnosticPublishOutcome::Published { seq: 1 });
+        let ring = bus.replay_after(0);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(rx.try_recv().unwrap(), ring[0]);
+        assert!(matches!(rx.try_recv(), Err(tokio::sync::broadcast::error::TryRecvError::Empty)));
+        assert_eq!(ring[0]["seq"], 1);
+        assert_eq!(ring[0]["surface_id"], 7);
+        assert_eq!(ring[0]["payload"]["request_sequence"], 9);
+        let stats = bus.diagnostic_publication_stats();
+        assert_eq!(stats.published_total, 1);
+        assert_eq!(stats.not_published_total, 0);
+    }
+
+    #[test]
+    fn diagnostic_without_subscriber_is_still_published_to_replay_ring() {
+        let bus = EventBus::new(None);
+        assert_eq!(bus.try_publish_diagnostic(prepared_identity()),
+            DiagnosticPublishOutcome::Published { seq: 1 });
+        assert_eq!(bus.replay_after(0).len(), 1);
+        assert_eq!(bus.diagnostic_publication_stats().not_published_total, 0);
+    }
+
+    #[test]
+    fn diagnostic_sequence_exhaustion_is_not_saturation_or_wraparound() {
+        let bus = EventBus::new(None);
+        {
+            let mut state = bus.inner.lock().unwrap();
+            state.seq = u64::MAX;
+            state.persist_hwm = u64::MAX;
+        }
+        assert_eq!(bus.try_publish_diagnostic(prepared_identity()),
+            DiagnosticPublishOutcome::NotPublished(DiagnosticNotPublished::SequenceExhausted));
+        assert_eq!(bus.latest_seq(), u64::MAX);
+        assert!(bus.replay_after(0).is_empty());
+        assert_eq!(bus.diagnostic_publication_stats().not_published_by_reason.sequence_exhausted, 1);
+    }
+
+    #[test]
+    fn diagnostic_reason_counters_saturate_and_disclose_loss() {
+        let bus = EventBus::new(None);
+        bus.diagnostic_publications.failed[DiagnosticNotPublished::LockBusy as usize]
+            .store(u64::MAX, Ordering::Relaxed);
+        let held = bus.inner.lock().unwrap();
+        assert_eq!(bus.try_publish_diagnostic(prepared_identity()),
+            DiagnosticPublishOutcome::NotPublished(DiagnosticNotPublished::LockBusy));
+        // Stats accessor does not acquire the bus lock.
+        let stats = bus.diagnostic_publication_stats();
+        drop(held);
+        assert_eq!(stats.not_published_total, u64::MAX);
+        assert_eq!(stats.not_published_by_reason.lock_busy, u64::MAX);
+        assert!(stats.counter_saturated);
+    }
+
 }

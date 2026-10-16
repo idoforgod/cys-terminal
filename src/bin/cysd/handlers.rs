@@ -9762,6 +9762,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                "protocol_version": cys::pack::PHOENIX_PROTOCOL_VERSION,
                                // (W4) 데몬 전체 파서 패닉 격리 누적 — health 신호.
                                "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed),
+                               "identity_diagnostic_publication": daemon.bus.diagnostic_publication_stats(),
                                // ★(0.14.43 · K1) ABI producer 자기검증 계측(이 프로세스의 누적) — 폴백한 프레임 수.
                                //   `abi_float_inexact_total` = 부동소수 표기 정밀도 차만으로 폴백(로그 없음 · 부동소수가 실리는 한 평시에도 늘어난다) ·
                                //   `abi_drift_total` = **진짜** 불일치(구조·키·문자열·정수·비객체)로 폴백 — 0 이 아니면 와이어 결함(로그는 60초 1줄).
@@ -18678,6 +18679,48 @@ mod tests {
                 .contains("npm_prefix_polluted_field(&cys::npm_config_prefix_verdict_from_exe())"),
             "org.status 가 실제 env 판정을 잃었다 — 필드가 상수로 굳으면 오염이 영영 안 보인다"
         );
+    }
+
+    #[test]
+    fn identity_diagnostic_loss_counter_is_exported_by_org_status() {
+        use crate::events::{DiagnosticNotPublished, DiagnosticPublishOutcome, PreparedDiagnostic};
+        let daemon = isolated_daemon();
+        let mut reached_capacity_refusal = false;
+        // A fresh persistent bus has no capacity; this bounded loop also tolerates
+        // setup having reserved one ordinary block before the test reaches the API.
+        for _ in 0..257 {
+            let prepared = PreparedDiagnostic::identity_observation(
+                None, br#"{"reason":"unproven","request_sequence":1}"#,
+            ).expect("bounded fixture");
+            match daemon.bus.try_publish_diagnostic(prepared) {
+                DiagnosticPublishOutcome::Published { .. } => {}
+                DiagnosticPublishOutcome::NotPublished(DiagnosticNotPublished::ReservationUnavailable) => {
+                    reached_capacity_refusal = true;
+                    break;
+                }
+                other => panic!("unexpected fixture publication result: {other:?}"),
+            }
+        }
+        assert!(reached_capacity_refusal, "fixture never exercised a real dropped diagnostic");
+        let expected = serde_json::to_value(daemon.bus.diagnostic_publication_stats()).unwrap();
+        assert_eq!(expected["not_published_by_reason"]["reservation_unavailable"], 1);
+        let Reply::Single(resp) = dispatch(
+            &daemon,
+            Request { id: json!(1), method: "org.status".into(), params: json!({}) },
+            None,
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], true);
+        let d = &resp["result"]["daemon"];
+        assert_eq!(d["identity_diagnostic_publication"], expected);
+        for k in [
+            "version", "started_at", "paused", "latest_seq", "build_id", "embedded_pack_hash",
+            "protocol_version", "parser_panics", "abi_float_inexact_total", "abi_drift_total",
+            "pending_input_model", "npm_prefix_polluted",
+        ] {
+            assert!(d.get(k).is_some(), "existing daemon key disappeared: {k}");
+        }
     }
 
     /// ★(0.14.43 · K1) `org.status.daemon` 가산 키 `abi_float_inexact_total`·`abi_drift_total`(둘 다 u64) — 기존 daemon 키는 불변.
