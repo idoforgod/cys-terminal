@@ -9365,8 +9365,35 @@ pub(crate) struct Delivered {
     pub remaining: usize,
     /// ★B1(0.14.30): 이 배달에 함께 실린 항목 id 전량(머리 포함 · 단건이면 1개).
     pub merged_ids: Vec<String>,
-    /// 실제로 주입된 본문(병합이면 다이제스트 · 단건이면 항목 원문과 동일).
+    /// Planned body (a digest when merged); its existence is not evidence it was written.
     pub body: String,
+}
+
+/// Transport acceptance is distinct from the writer's terminal result. Existing callers may
+/// inspect planned item fields, but must inspect this outcome before announcing delivery.
+#[derive(Debug)]
+pub(crate) struct QueueHandoff {
+    delivery: Delivered,
+    pub request_id: String,
+    status: crate::agent_write::Status,
+    guard_outcome: crate::state::InjectHandoff,
+}
+impl std::ops::Deref for QueueHandoff {
+    type Target=Delivered;
+    fn deref(&self)->&Delivered { &self.delivery }
+}
+impl QueueHandoff {
+    pub(crate) fn written_submitted(&self)->bool {
+        !matches!(self.guard_outcome,crate::state::InjectHandoff::InvalidState(_))
+            && matches!(&self.status,crate::agent_write::Status::Terminal(crate::agent_write::Terminal::WrittenSubmitted{..}))
+    }
+    pub(crate) fn written_state(&self)->&'static str {
+        if matches!(self.guard_outcome,crate::state::InjectHandoff::InvalidState(_)) { return "invalid_guard"; }
+        match &self.status {
+            crate::agent_write::Status::AcceptedPending | crate::agent_write::Status::Writing=>"pending",
+            crate::agent_write::Status::Terminal(terminal)=>terminal.kind(),
+        }
+    }
 }
 
 /// ★G1(W2-D): 배달 임계영역 **단일 헬퍼** — watchdog 틱(deliver_queued)과 queue.deliver
@@ -9514,7 +9541,7 @@ fn rollback_aborted_inject(
     f: &InflightInject,
     delivered: &Delivered,
 ) {
-    let (still_queued, disposed) = restore_inflight_marks(s, f);
+    let Some((still_queued, disposed)) = restore_inflight_marks(s, f) else { return };
     // ★(triage codex 보완) 사유·계수를 **관측 사실**로 적는다 — 종전 `restored` 는 재삽입 건수를
     //   말했고(그 재삽입 자체가 결함이었다) `why` 는 출력 세대 하나로 단정했다. 지금은 세 갈래를
     //   가른다: 화면이 흘렀나 · 처분자가 가져갔나 · 그 밖(승인 대기·마감).
@@ -9551,41 +9578,47 @@ fn rollback_aborted_inject(
 /// ★(0.14.52 · S-a) The state half of [`rollback_aborted_inject`], shared with the writer-terminal
 /// refusal path ([`settle_queue_write`]): release the reservation and restore the optimistic hand-off
 /// marks of `f` only where they are still mine. Returns (ids still queued, ids disposed meanwhile).
-fn restore_inflight_marks(s: &Arc<crate::state::Surface>, f: &InflightInject) -> (Vec<String>, Vec<String>) {
-    let (still_queued, disposed) = {
-        let q = s.pending_queue.lock().unwrap();
-        let _gate = s.input_gate.lock().unwrap();
-        // ★(triage codex 보완) 예약 해제도 **이 임계영역 안에서** — 종전에는 호출부가 먼저 풀고
-        //   그 뒤 여기서 표식을 되돌려, 그 사이 새 인계가 시작되면 롤백이 남의 상태를 되돌렸다.
-        *s.inject_reservation.lock().unwrap() = None;
-        // ★(리뷰 R1 · codex A2-iv) 되돌림은 **내가 쓴 값이 그대로일 때만** — 결판을 기다리는
-        //   동안 사람이 치거나 다른 주입이 있었다면 그 사실이 최신이고, 옛 값으로 덮으면 그것이
-        //   곧 새 오류다(입력줄 점유를 잘못 알면 큐 본문이 사람 문장과 합쳐진다).
-        if s.input_gen.load(Ordering::Acquire) == f.pending_gen
-            && s.pending_input_bytes.load(Ordering::Relaxed) == 0
-        {
-            s.set_pending_input(f.prev_pending);
-            // ★(R1F-IN ⓐ) 인계가 내린 잠정 Esc 면제 표식도 같은 조건(내가 쓴 값 그대로일 때만)에서 되살린다 — 쓰이지 않았으니 줄은 인계 전 그대로다(0 이면 무동작).
-            s.restore_esc_exempt(f.prev_esc_exempt_pgid);
-        }
-        let mut alive: Vec<String> = Vec::new();
-        let mut gone: Vec<String> = Vec::new();
-        for e in &f.entries {
-            if q.iter().any(|x| x.id == e.id) {
-                alive.push(e.id.clone());
-            } else {
-                gone.push(e.id.clone());
-            }
-        }
-        (alive, gone)
-    };
+/// Compare ownership under the same queue/input transaction used by admission. A stale callback
+/// changes no reservation, counter, hold or clock. The callback may update short leaf state only.
+fn with_owned_inflight_marks<T>(
+    s: &Arc<crate::state::Surface>,
+    f: &InflightInject,
+    update_hold: impl FnOnce(&[String], &[String]) -> T,
+) -> Option<T> {
+    let q = s.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
+    let _input = s.input_gate.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = s.inject_reservation.lock().unwrap_or_else(|e| e.into_inner());
+    if !inflight_owner_matches(slot.as_ref(), f.guard.as_ref()) { return None; }
+    if s.input_gen.load(Ordering::Acquire) == f.pending_gen
+        && s.pending_input_bytes.load(Ordering::Relaxed) == 0
     {
-        let mut t = s.last_queue_delivery_at.lock().unwrap();
-        if *t == f.set_delivery_at {
-            *t = f.prev_delivery_at;
-        }
+        s.set_pending_input(f.prev_pending);
+        s.restore_esc_exempt(f.prev_esc_exempt_pgid);
     }
-    (still_queued, disposed)
+    {
+        let mut at = s.last_queue_delivery_at.lock().unwrap_or_else(|e| e.into_inner());
+        if *at == f.set_delivery_at { *at = f.prev_delivery_at; }
+    }
+    let (live, disposed): (Vec<String>, Vec<String>) = f.entries.iter().map(|e| e.id.clone())
+        .partition(|id| q.iter().any(|e| &e.id == id));
+    let result = update_hold(&live, &disposed);
+    *slot = None; // the held disposition is installed before another handoff can enter
+    Some(result)
+}
+
+fn inflight_owner_matches(
+    current: Option<&crate::state::InjectReservation>,
+    expected: Option<&Arc<crate::state::InjectGuard>>,
+) -> bool {
+    match (current, expected) {
+        (Some(current), Some(expected)) => Arc::ptr_eq(&current.guard, expected),
+        (None, None) => true, // unchanged unguarded legacy/fixture transaction
+        _ => false,
+    }
+}
+
+fn restore_inflight_marks(s: &Arc<crate::state::Surface>, f: &InflightInject) -> Option<(Vec<String>, Vec<String>)> {
+    with_owned_inflight_marks(s, f, |live, disposed| (live.to_vec(), disposed.to_vec()))
 }
 
 /// ★(0.14.52 · S-a) The queue family's settlement consumer (design 4.5 table) as the job's settle
@@ -9620,16 +9653,19 @@ struct HandoffStamp {
     request: Arc<crate::agent_write::Request>,
     /// The original immutable receiver proof; partial bytes never borrow a successor's authority.
     proof: Arc<dyn crate::agent_write::Proof>,
+    /// The original reservation owner differs from a resumed run's fresh safety guard.
+    reservation_guard: Option<Arc<crate::state::InjectGuard>>,
     agent_epoch: u64,
     conversation_epoch: u64,
     human_at: Option<std::time::Instant>,
 }
 
 impl HandoffStamp {
-    fn of(s: &crate::state::Surface, request: Arc<crate::agent_write::Request>, proof: Arc<dyn crate::agent_write::Proof>) -> HandoffStamp {
+    fn of(s: &crate::state::Surface, request: Arc<crate::agent_write::Request>, proof: Arc<dyn crate::agent_write::Proof>, reservation_guard: Option<Arc<crate::state::InjectGuard>>) -> HandoffStamp {
         HandoffStamp {
             request,
             proof,
+            reservation_guard,
             agent_epoch: s.agent_epoch.load(Ordering::Acquire),
             conversation_epoch: s.conversation_epoch.load(Ordering::Acquire),
             human_at: *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()),
@@ -9704,19 +9740,29 @@ fn settle_queue_write(
 ) {
     use crate::agent_write::Terminal as T;
     match t {
-        T::RefusedNoWrite { reason } if reason == crate::agent_write::GUARD_ABORTED => {}
+        T::RefusedNoWrite { reason } if reason == crate::agent_write::GUARD_ABORTED
+            && f.guard.as_ref().is_none_or(|g| g.cleanup_owner() != Ok(crate::state::InjectCleanupOwner::Controller)) => {}
         T::WrittenSubmitted { .. } => {
             let mut remaining = d.remaining;
             if let Some(s) = &s {
                 {
                     let mut q = s.pending_queue.lock().unwrap();
                     let _gate = s.input_gate.lock().unwrap();
+                    let mut slot = s.inject_reservation.lock().unwrap_or_else(|e| e.into_inner());
+                    if !inflight_owner_matches(slot.as_ref(), stamp.reservation_guard.as_ref()) { return; }
                     // ★G1(W2-A)+B1: pop 판정은 방금 인계한 항목의 **id 집합** — 동일 텍스트 중복 항목 오삼킴 차단.
                     pop_delivered_ids(&mut q, &d.merged_ids);
                     remaining = q.len();
-                    *s.inject_reservation.lock().unwrap() = None;
+                    let mut hold = s.queue_hold.lock().unwrap_or_else(|e| e.into_inner());
+                    if hold.as_ref().is_some_and(|h| h.request_id == request_id ||
+                        (h.kind == crate::state::QueueHoldKind::Refused
+                         && h.entry_ids.iter().any(|id| d.merged_ids.contains(id))
+                         && h.entry_ids.iter().all(|id| !q.iter().any(|entry| &entry.id == id)))) {
+                        *hold = None;
+                    }
+                    *slot = None;
                 }
-                *s.queue_hold.lock().unwrap() = None;
+                s.queue_completion_pending.store(true, Ordering::Release);
             }
             // ★(0.14.52 · S-a C7a) A delivered item is no longer held (the file is rewritten only when it held something).
             let unheld = {
@@ -9766,28 +9812,26 @@ fn settle_queue_write(
                 T::RefusedNoWrite { reason } => reason.clone(),
                 _ => "cancelled".to_string(),
             };
-            let (still_queued, disposed) = restore_inflight_marks(s, f);
-            let first = {
-                let mut h = s.queue_hold.lock().unwrap();
+            let Some((still_queued, disposed, first)) = with_owned_inflight_marks(s, f, |live, disposed| {
+                let mut h = s.queue_hold.lock().unwrap_or_else(|e| e.into_inner());
+                if live.is_empty() {
+                    if h.as_ref().is_some_and(|old| old.request_id == request_id) { *h = None; }
+                    return (live.to_vec(), disposed.to_vec(), false);
+                }
                 let (since, attempts) = match h.as_ref() {
-                    Some(x) if x.kind == crate::state::QueueHoldKind::Refused => (x.since, x.attempts + 1),
+                    Some(x) if x.kind == crate::state::QueueHoldKind::Refused
+                        && x.entry_ids.iter().any(|id| live.contains(id)) => (x.since, x.attempts.saturating_add(1)),
                     _ => (std::time::Instant::now(), 1),
                 };
                 *h = Some(crate::state::QueueHold {
                     kind: crate::state::QueueHoldKind::Refused,
-                    reason: reason.clone(),
-                    request_id: request_id.to_string(),
-                    entry_ids: d.merged_ids.clone(),
-                    since,
-                    attempts,
+                    reason: reason.clone(), request_id: request_id.to_string(), entry_ids: live.to_vec(),
+                    since, attempts,
                     next_retry: Some(std::time::Instant::now() + crate::state::queue_hold_backoff(attempts)),
-                    envelope: None,
-                    notified: true,
-                    resume: None,
-                    resuming: false,
+                    envelope: None, notified: true, resume: None, resuming: false,
                 });
-                attempts == 1
-            };
+                (live.to_vec(), disposed.to_vec(), attempts == 1)
+            }) else { return };
             if first {
                 daemon.bus.publish(
                     "queue.inject_aborted",
@@ -10297,6 +10341,16 @@ pub(crate) fn partial_write_held(s: &crate::state::Surface) -> bool {
     )
 }
 
+/// Side-effect-free recheck inside queue admission; an earlier outer tick check may be stale.
+fn queue_write_admission_held(s: &crate::state::Surface, now: std::time::Instant) -> bool {
+    s.queue_hold.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|hold| {
+        match hold.kind {
+            crate::state::QueueHoldKind::Refused => hold.next_retry.is_some_and(|due| now < due),
+            crate::state::QueueHoldKind::PartialExact | crate::state::QueueHoldKind::PartialUnknown => true,
+        }
+    })
+}
+
 /// Minimum age of a partial hold before the composer-empty release may fire: the echo of the accepted prefix (or a restarted
 /// seat's first frames) must have had time to render, so an empty composer is a measurement, not a race.
 pub(crate) const PARTIAL_RELEASE_MIN_AGE_MS: u64 = 2_000;
@@ -10438,7 +10492,7 @@ pub(crate) fn deliver_head_locked(
     expect_pending: Option<u64>,
     expect_output_gen: Option<u64>,
     recheck: Option<&ScreenRecheck>,
-) -> Option<Delivered> {
+) -> Option<QueueHandoff> {
     let now = now_epoch();
     let default_ttl = crate::state::queue_ttl_default_secs();
     let base_min_interval = queue_min_interval_secs();
@@ -10462,7 +10516,7 @@ pub(crate) fn deliver_head_locked(
         //   하지 않는다. 항목이 결판까지 큐에 남아 있으므로(유실 창 봉인) 이 표식이 없으면 틱과
         //   RPC 강제 배달이 **같은 머리를 두 번** 인계할 수 있다. 검사·설정이 둘 다 이 임계영역
         //   안이라 창이 없다(배달 최소 간격 0 인 롤백 env 에서도 성립).
-        if s.inject_reserved() || partial_write_held(s) {
+        if s.inject_reserved() || queue_write_admission_held(s, std::time::Instant::now()) {
             break 'tx None;
         }
         if let Some(want) = expect_pending {
@@ -10700,7 +10754,7 @@ pub(crate) fn deliver_head_locked(
         let request_id = request.id.clone();
         let handle = request.clone();
         // ★(0.14.52 · S-a C7b) The epochs and last human keystroke this request is written under (S4-1 resume premises).
-        let stamp = HandoffStamp::of(s, request.clone(), s.agent_proof());
+        let stamp = HandoffStamp::of(s, request.clone(), s.agent_proof(), guard.clone());
         let job = crate::agent_write::AgentJob {
             request,
             plan: crate::agent_write::Plan::paste(&d.body).with_submit(400, 0),
@@ -10759,6 +10813,7 @@ pub(crate) fn deliver_head_locked(
         return None;
     }
     let delivered = delivered?;
+    let mut guard_outcome = crate::state::InjectHandoff::CallerClaimed;
     // ★(0.14.31 · 리뷰 R1 · codex blocking) 가드 결판 — 락을 전부 놓은 뒤 유계 대기.
     //   ABORTED = writer 가 **한 바이트도 쓰지 않았다** → 항목은 큐에 그대로 있고(리뷰 R2: 애초에
     //   빼지 않는다 = 유실 0 · §3-3) `queue.delivered`·영수증·에코 제외 창 어느 것도 만들지 않는다.
@@ -10768,23 +10823,29 @@ pub(crate) fn deliver_head_locked(
             //   각각 800ms 를 쓰면 한 틱이 80초가 되어 뒤따르는 사망 점검·자가치유가 밀린다.
             let wait = crate::state::INJECT_GUARD_WAIT_MS.min(tick_settle_budget_ms());
             let t0 = std::time::Instant::now();
-            let verdict = g.settle(wait);
+            guard_outcome = g.settle_handoff(wait);
             spend_tick_settle_budget(t0.elapsed());
-            if verdict == crate::state::INJECT_ABORTED {
-                // 예약 해제는 롤백 **안**에서 표식 되돌림과 같은 임계영역에 있다(triage codex 보완).
-                rollback_aborted_inject(daemon, s, &f, &delivered);
-                return None;
+            match guard_outcome {
+                crate::state::InjectHandoff::CallerAborted => {
+                    // 예약 해제는 롤백 **안**에서 표식 되돌림과 같은 임계영역에 있다(triage codex 보완).
+                    rollback_aborted_inject(daemon, s, &f, &delivered);
+                    return None;
+                }
+                crate::state::InjectHandoff::CallerClaimed => {},
+                crate::state::InjectHandoff::ControllerOwned => {}, // controller retains cleanup; no ACK/timeout abort
+                crate::state::InjectHandoff::InvalidState(_) => {}, // no inferred cancellation or successful write
             }
         }
         // ★(0.14.52 · S-a) CLAIMED = the writer owns the request. Nothing is popped, receipted or
         //   announced here: [`settle_queue_write`] does that on WrittenSubmitted only (design 4.5).
     }
-    // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다(the writer starts on the claimed request now).
-    *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
-    if let Some(r) = &handed {
-        crate::agent_write::test_wait_settled(r);
+    let request = handed?;
+    if guard_outcome == crate::state::InjectHandoff::CallerClaimed {
+        // Legacy writer claim only. Proof-pending ownership must not create an injection stamp.
+        *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+        crate::agent_write::test_wait_settled(&request);
     }
-    Some(delivered)
+    Some(QueueHandoff { delivery:delivered, request_id:request.id.clone(), status:request.status(), guard_outcome })
 }
 
 // ─── ★(0.14.31 · WP-5 M) 만료 회계 — 틱 스윕 · 만료 큐 이동 · 상한 축출 · 통지 ─────────────
@@ -12281,7 +12342,7 @@ pub(crate) fn force_deliver_entry(
     s: &Arc<crate::state::Surface>,
     entry_id: Option<&str>,
     allow_reorder: bool,
-) -> Result<Delivered, ForceDeliverDenied> {
+) -> Result<QueueHandoff, ForceDeliverDenied> {
     // 게이트 ③ empty_seat — watchdog 틱과 동일 판정(Unknown 은 통과 = 현행 동작 강등).
     if s.role.lock().unwrap().is_some()
         && SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty
@@ -12594,6 +12655,9 @@ fn deliver_queued(
         if s.exited.load(Ordering::Relaxed) {
             continue;
         }
+        if s.queue_completion_pending.swap(false, Ordering::AcqRel) {
+            starve_alerted.remove(&s.id); // terminal submission, never a mere handoff
+        }
         // ★G1(W2-D): 머리 스냅샷 — 빈 큐는 어느 분기에서도 할 일이 없다(depth 경보는
         // depth≥임계≥1, 기아 경보는 머리 존재가 전제 — 관측 동등·무회귀). 락은 순간 보유.
         // 스냅샷과 실제 배달(deliver_head_locked) 사이 머리가 바뀌는 창은 clear(drain·
@@ -12602,7 +12666,11 @@ fn deliver_queued(
             let q = s.pending_queue.lock().unwrap();
             match q.front().cloned() {
                 Some(h) => (h, q.len()),
-                None => continue,
+                None => {
+                    starve_alerted.remove(&s.id);
+                    *s.queue_blocked.lock().unwrap() = None;
+                    continue;
+                },
             }
         };
         // ★(0.14.31 · triage 2026-09-08 · #7) 결판 예산이 바닥났으면 **원장·writer 를 건드리기
@@ -12826,7 +12894,7 @@ fn deliver_queued(
         // ★G1(W2-D): 배달 임계영역은 단일 헬퍼(deliver_head_locked — RPC 강제 배달과 공유).
         // pop은 writer 채널 인계 성공 후에만 — 실패 시 메시지를 보존해 다음 틱에 재시도.
         // 블로킹 write·sleep은 surface 전용 writer 스레드가 수행하므로 watchdog은 멈추지 않는다.
-        if deliver_head_locked(
+        if let Some(handoff) = deliver_head_locked(
             daemon,
             &s,
             false,
@@ -12835,9 +12903,8 @@ fn deliver_queued(
             Some(pending_at_verdict),
             expect_gen,
             recheck.as_ref(),
-        )
-        .is_some()
-        {
+        ) {
+            if !handoff.written_submitted() { continue; }
             // 배달 성공 = 기아 해소 — 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보).
             starve_alerted.remove(&s.id);
             // ★B1: 막힘 사유도 사실이 아니게 됐다 — 지운다(낡은 사유가 남으면 오독한다).
@@ -13004,6 +13071,133 @@ impl Drop for ReapEnvGuard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c8pp_old_cleanup_cannot_change_a_new_reservation_or_its_marks() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("c8pp-old-cleanup");
+        let (daemon, s) = wp5_seat("c8pp-old-cleanup", "claude");
+        let old = std::sync::Arc::new(crate::state::InjectGuard::new(
+            None, s.output_gen.clone(), false, None));
+        let newer = std::sync::Arc::new(crate::state::InjectGuard::new(
+            None, s.output_gen.clone(), false, None));
+        *s.inject_reservation.lock().unwrap() = Some(crate::state::InjectReservation {
+            ids: vec!["new-item".into()], guard: newer.clone(),
+        });
+        s.set_pending_input(0);
+        let current_gen = s.input_gen.load(std::sync::atomic::Ordering::Acquire);
+        let at = Some(std::time::Instant::now());
+        *s.last_queue_delivery_at.lock().unwrap() = at;
+        let f = super::InflightInject {
+            guard: Some(old), prev_delivery_at: None, set_delivery_at: at,
+            prev_pending: 17, prev_esc_exempt_pgid: 0, pending_gen: current_gen, entries: vec![],
+        };
+        // Matching numerical marks are deliberate: only the reservation owner can discriminate this case.
+        let _ = super::restore_inflight_marks(&s, &f);
+        let same_owner = s.inject_reservation.lock().unwrap().as_ref()
+            .is_some_and(|r| std::sync::Arc::ptr_eq(&r.guard, &newer));
+        let pending = s.pending_input_bytes.load(std::sync::atomic::Ordering::Acquire);
+        let delivery = *s.last_queue_delivery_at.lock().unwrap();
+        // Tear down before asserting, including on the predicted RED path.
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+        assert!(same_owner, "old cleanup cleared a newer reservation");
+        assert_eq!(pending, 0, "old cleanup rewrote the newer input state");
+        assert_eq!(delivery, at, "old cleanup rewound the newer delivery clock");
+    }
+
+    #[test]
+    fn c8pp_matching_cleanup_still_restores_its_own_marks() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("c8pp-own-cleanup");
+        let (daemon, s) = wp5_seat("c8pp-own-cleanup", "claude");
+        let owner = std::sync::Arc::new(crate::state::InjectGuard::new(
+            None, s.output_gen.clone(), false, None));
+        *s.inject_reservation.lock().unwrap() = Some(crate::state::InjectReservation {
+            ids: vec!["own-item".into()], guard: owner.clone(),
+        });
+        s.set_pending_input(0);
+        let at = Some(std::time::Instant::now());
+        *s.last_queue_delivery_at.lock().unwrap() = at;
+        let f = super::InflightInject {
+            guard: Some(owner), prev_delivery_at: None, set_delivery_at: at,
+            prev_pending: 17, prev_esc_exempt_pgid: 0,
+            pending_gen: s.input_gen.load(std::sync::atomic::Ordering::Acquire), entries: vec![],
+        };
+        let _ = super::restore_inflight_marks(&s, &f);
+        let released = s.inject_reservation.lock().unwrap().is_none();
+        let pending = s.pending_input_bytes.load(std::sync::atomic::Ordering::Acquire);
+        let delivery = *s.last_queue_delivery_at.lock().unwrap();
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+        assert!(released);
+        assert_eq!(pending, 17);
+        assert_eq!(delivery, None);
+    }
+
+    #[test]
+    fn c8pp_stale_terminal_cannot_mutate_new_owner_or_hold() {
+        for submitted in [false,true] {
+            let _lock=QUEUE_ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+            let (_pack,_env)=wp5_env("c8pp-stale-terminal");
+            let (daemon,s)=wp5_seat("c8pp-stale-terminal","claude");
+            let old=Arc::new(crate::state::InjectGuard::new(None,s.output_gen.clone(),false,None));
+            let newer=Arc::new(crate::state::InjectGuard::new(None,s.output_gen.clone(),false,None));
+            let old_entry=daemon.next_queue_entry("old".into(),None,"test");
+            let new_entry=daemon.next_queue_entry("new".into(),None,"test");
+            s.pending_queue.lock().unwrap().push_back(new_entry.clone());
+            *s.inject_reservation.lock().unwrap()=Some(crate::state::InjectReservation{ids:vec![new_entry.id.clone()],guard:newer.clone()});
+            let since=std::time::Instant::now();
+            *s.queue_hold.lock().unwrap()=Some(crate::state::QueueHold{kind:crate::state::QueueHoldKind::Refused,
+                reason:"new hold".into(),request_id:"new-request".into(),entry_ids:vec![new_entry.id.clone()],since,attempts:1,
+                next_retry:Some(since+std::time::Duration::from_secs(3600)),envelope:None,notified:true,resume:None,resuming:false});
+            let at=Some(since);*s.last_queue_delivery_at.lock().unwrap()=at;
+            let flight=super::InflightInject{guard:Some(old.clone()),prev_delivery_at:None,set_delivery_at:at,
+                prev_pending:17,prev_esc_exempt_pgid:0,pending_gen:s.input_gen.load(AtomicOrdering::Acquire),entries:vec![old_entry.clone()]};
+            let delivery=super::Delivered{entry:old_entry.clone(),remaining:1,merged_ids:vec![old_entry.id],body:"old".into()};
+            let req=crate::agent_write::Request::new("old-request".into(),s.id,"queue","old-digest".into());
+            let stamp=super::HandoffStamp::of(&s,req,Arc::new(crate::agent_write::PassThrough),Some(old));
+            let terminal=if submitted {crate::agent_write::Terminal::WrittenSubmitted{accepted:crate::agent_write::Accepted::default()}}
+                else {crate::agent_write::Terminal::RefusedNoWrite{reason:"old refusal".into()}};
+            super::settle_queue_write(&daemon,Some(s.clone()),s.id,&flight,&delivery,
+                &(crate::state::now_epoch(),"old-digest".into(),None,serde_json::json!({})),"old-request",false,false,&stamp,&terminal);
+            let same=s.inject_reservation.lock().unwrap().as_ref().is_some_and(|r|Arc::ptr_eq(&r.guard,&newer));
+            let held=s.queue_hold.lock().unwrap().as_ref().map(|h|(h.request_id.clone(),h.since));
+            let pending=s.pending_input_bytes.load(AtomicOrdering::Acquire);
+            let clock=*s.last_queue_delivery_at.lock().unwrap();
+            let completion=s.queue_completion_pending.load(AtomicOrdering::Acquire);
+            let ids:Vec<String>=s.pending_queue.lock().unwrap().iter().map(|e|e.id.clone()).collect();
+            let _=close_surface(&daemon,s.id,CloseCause::OwnerClose);
+            assert!(same,"stale terminal must not clear a newer reservation (submitted={submitted})");
+            assert_eq!(held,Some(("new-request".into(),since)),"stale terminal must not replace the newer hold");
+            assert_eq!(pending,0);assert_eq!(clock,at);assert!(!completion);
+            assert_eq!(ids,vec![new_entry.id]);
+        }
+    }
+
+    #[test]
+    fn c8pp_terminal_notification_resets_starvation_on_the_existing_tick() {
+        for remaining in [false, true] {
+            let _lock=QUEUE_ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+            let (_pack,_env)=wp5_env("c8pp-completion-tick");let (daemon,s)=wp5_seat("c8pp-completion-tick","claude");
+            if remaining {
+                let next=daemon.next_queue_entry("next item remains blocked".into(),None,"test");
+                s.pending_queue.lock().unwrap().push_back(next);
+                *s.queue_paused_until.lock().unwrap()=Some(std::time::Instant::now()+std::time::Duration::from_secs(60));
+            }
+            s.queue_completion_pending.store(true,AtomicOrdering::Release);
+            *s.queue_blocked.lock().unwrap()=Some(("old hold".into(),crate::state::now_epoch()));
+            let mut starved=std::collections::HashMap::from([(s.id,crate::state::now_epoch())]);
+            super::deliver_queued(&daemon,&mut std::collections::HashMap::new(),&mut starved,&mut std::collections::HashMap::new());
+            let consumed=!s.queue_completion_pending.load(AtomicOrdering::Acquire);
+            let blocked=s.queue_blocked.lock().unwrap().clone();
+            let depth=s.pending_queue.lock().unwrap().len();
+            let _=close_surface(&daemon,s.id,CloseCause::OwnerClose);
+            assert!(consumed,"existing queue tick consumes the terminal notification");
+            assert!(!starved.contains_key(&s.id),"completed delivery ends the previous starvation episode even with a remaining head");
+            assert_eq!(depth,usize::from(remaining),"completion notification never admits the next blocked head");
+            if remaining { assert_eq!(blocked.unwrap().0,super::BLOCKED_QUEUE_PAUSED); }
+            else { assert!(blocked.is_none(),"an empty queue retains no obsolete block reason"); }
+        }
+    }
+
     use super::{
         approval_wakeup_suppressed, check_surfaces, collect_descendants, endpoint_key,
         is_node_owned, kill_pid, learn_stuck_candidates, merged_approval_patterns,
@@ -19329,11 +19523,14 @@ mod tests {
         let (daemon, s) = marker_seat("s-a-hold");
         paint_prompt(&s, "", "");
         *s.last_human_input.lock().unwrap() = None;
+        // The hold belongs to these queued work IDs, just as a real refused settlement does.
+        let held_ids: Vec<String> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+        assert!(!held_ids.is_empty());
         let hold = |kind, next_retry| crate::state::QueueHold {
             kind,
             reason: "unknown:agent:denied".into(),
             request_id: "w-test".into(),
-            entry_ids: vec![],
+            entry_ids: held_ids.clone(),
             since: std::time::Instant::now(),
             attempts: 1,
             next_retry,

@@ -11784,7 +11784,8 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) 
                 Ok(d) => Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "queue_entry_id": d.entry.id,
-                           "seq": d.entry.seq, "delivered": true, "forced": true,
+                           "seq": d.entry.seq, "accepted": true, "delivered": d.written_submitted(), "forced": true,
+                           "written": d.written_state(), "request_id": d.request_id,
                            "remaining": d.remaining}),
                 )),
                 Err(denied) => {

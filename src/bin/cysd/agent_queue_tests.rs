@@ -904,3 +904,87 @@ fn c8i_partial_resume_never_borrows_a_successor_proof() {
     assert!(events(&fx,"queue.delivered").is_empty());
     assert_eq!(s.queue_hold.lock().unwrap().as_ref().unwrap().since,since,"first partial hold age remains fixed");
 }
+
+/// A caller whose outer precheck was earlier must still observe newly installed refusal backoff.
+#[test]
+fn c8pp_refusal_backoff_is_rechecked_at_locked_handoff() {
+    let fx=fx("c8pp-backoff");let s=seat(&fx);
+    *s.receiver_proof.lock().unwrap()=Some(Scripted::new(1,ProofLoss::Unknown("once".into()),None));
+    enqueue(&fx,&s,"one retained obligation");assert!(hand_off(&fx,&s));
+    s.queue_hold.lock().unwrap().as_mut().unwrap().next_retry=Some(Instant::now()+Duration::from_secs(3600));
+    assert!(!hand_off(&fx,&s),"locked handoff must respect refusal installed after an outer precheck");
+    assert_eq!(queue_len(&s),1);assert!(events(&fx,"queue.delivered").is_empty());
+    s.queue_hold.lock().unwrap().as_mut().unwrap().next_retry=Some(Instant::now());
+    assert!(hand_off(&fx,&s),"expired refusal backoff must permit healthy retry");
+    assert_eq!(queue_len(&s),0);assert_eq!(events(&fx,"queue.delivered").len(),1);
+}
+
+fn c8pp_force_rpc(fx: &Fx, s: &Arc<Surface>) -> Value {
+    let req=cys::Request{id:Value::from(1),method:"queue.deliver".into(),params:serde_json::json!({"surface_id":s.id})};
+    match crate::handlers::dispatch(&fx.daemon,req,None) {
+        crate::handlers::Reply::Single(reply)=>{assert_eq!(reply["ok"],Value::from(true),"fixture admission: {reply}");reply["result"].clone()},
+        _=>panic!("single reply"),
+    }
+}
+fn c8pp_quiet_shell(s: &Arc<Surface>) {
+    std::thread::sleep(Duration::from_millis(700));
+    *s.last_output.lock().unwrap()=Instant::now()-Duration::from_secs(2);
+}
+
+#[test]
+fn c8pp_force_rpc_never_reports_refusal_as_delivered() {
+    let fx=fx("c8pp-rpc-refused");let s=seat(&fx);
+    *s.receiver_proof.lock().unwrap()=Some(Scripted::new(1,ProofLoss::Unknown("test-refused".into()),None));
+    enqueue(&fx,&s,"retained refusal");c8pp_quiet_shell(&s);
+    let reply=c8pp_force_rpc(&fx,&s);
+    assert_eq!(hold_kind(&s),Some(QueueHoldKind::Refused),"premise: terminal refusal settled");
+    assert!(!s.queue_completion_pending.load(Ordering::Acquire),"refusal is not a completed-delivery notification");
+    assert_eq!(reply["delivered"],Value::from(false),"queue RPC must not label a zero-byte refusal delivered");
+    assert_eq!(reply["written"],Value::from("refused_no_write"));
+    assert!(reply["request_id"].as_str().is_some_and(|id|!id.is_empty()));
+    assert_eq!(queue_len(&s),1);assert!(events(&fx,"queue.delivered").is_empty());
+}
+
+#[test]
+fn c8pp_force_rpc_reports_pending_while_receiver_proof_is_blocked() {
+    struct WaitingProof { entered:std::sync::mpsc::Sender<()>, release:Mutex<std::sync::mpsc::Receiver<()>> }
+    impl Proof for WaitingProof {
+        fn admit(&self)->Result<(),ProofLoss>{
+            self.entered.send(()).map_err(|_|ProofLoss::Unknown("fixture gone".into()))?;
+            self.release.lock().unwrap().recv().map_err(|_|ProofLoss::Unknown("fixture released".into()))?;Ok(())
+        }
+        fn recheck(&self,_:Phase)->Result<(),ProofLoss>{Ok(())}
+    }
+    let fx=fx("c8pp-rpc-pending");let s=seat(&fx);
+    let (entered,observed)=std::sync::mpsc::channel();let (release,wait)=std::sync::mpsc::channel();
+    *s.receiver_proof.lock().unwrap()=Some(Arc::new(WaitingProof{entered,release:Mutex::new(wait)}));
+    enqueue(&fx,&s,"pending then one submission");c8pp_quiet_shell(&s);
+    crate::agent_write::set_test_sync_settle(false);
+    let reply=c8pp_force_rpc(&fx,&s);
+    let entered=observed.recv_timeout(Duration::from_secs(2));
+    let before=events(&fx,"queue.delivered").len();
+    let premature_completion=s.queue_completion_pending.load(Ordering::Acquire);
+    release.send(()).unwrap(); // release the owned fixture before any discriminating assertion
+    wait_until("pending request and settlement completed",||queue_len(&s)==0 && events(&fx,"queue.delivered").len()==1 && s.write_tx.gate().pending()==0);
+    assert!(entered.is_ok(),"premise: receiver proof was held by the fixture barrier");
+    assert_eq!(before,0);assert_eq!(events(&fx,"queue.delivered").len(),1);
+    assert!(!premature_completion,"pending proof must not reset the starvation episode");
+    assert!(s.queue_completion_pending.load(Ordering::Acquire),"terminal submission notifies the existing queue tick");
+    assert_eq!(reply["delivered"],Value::from(false),"queue RPC acceptance is pending until the writer submits");
+    assert_eq!(reply["written"],Value::from("pending"));
+    assert!(reply["request_id"].as_str().is_some_and(|id|!id.is_empty()));
+}
+
+#[test]
+fn c8pp_resumed_success_releases_original_reservation_after_settlement() {
+    let fx=fx("c8pp-reservation-resume");let s=seat(&fx);
+    let since=hold_exact(&fx,&s,&"resume reservation body ".repeat(500),1);
+    let original=s.inject_reservation.lock().unwrap().as_ref().unwrap().guard.clone();
+    assert!(!original.abort_if_pending(),"premise: original prefix keeps disposal protection");
+    let _=crate::governance::queue_write_hold_block_at(&fx.daemon,&s,since+Duration::from_secs(1));
+    assert_eq!(events(&fx,"queue.write_resumed").len(),1,"premise: resumed run entered the writer");
+    wait_until("resumed writer and settlement finished",||s.write_tx.gate().pending()==0);
+    assert_eq!(queue_len(&s),0,"resumed success releases the original reservation owner");
+    assert!(!s.inject_reserved());assert!(hold_kind(&s).is_none());
+    assert_eq!(events(&fx,"queue.delivered").len(),1);
+}
