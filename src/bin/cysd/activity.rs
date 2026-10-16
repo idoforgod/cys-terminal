@@ -48,9 +48,11 @@ pub(crate) const TRANSIENT_K: u32 = 2;
 /// Lease from the last accepted positive active sample (strictly below this keeps Working).
 pub(crate) const LEASE_SECS: f64 = 6.0;
 /// U4-2 — N consecutive accepted active samples with byte-identical non-footer-neutral cells end in
-/// Unknown "static active frame". PROVISIONAL: the value and the footer-neutral mask are locked from the
-/// native capture corpus BEFORE any acceptance measurement (lock file under the U evidence root); the
-/// quiet-active control must pass under it.
+/// Unknown "static active frame". LOCKED (head ruling HEAD-RULING-REPLAY-1, lock file F01-LOCK-STATIC-N.md):
+/// the signature covers the copied window CELLS only — never the OSC title, because an animated spinner over
+/// a stalled CLI must not read as Working. Corpus quiet-active maximum 25 (codex tall window, censored by the
+/// turn length). Measured limit: a codex quiet phase longer than N s in a short-transcript tall window, where
+/// the status row sits above the copied window, ends in Unknown (safe direction, display only).
 pub(crate) const STATIC_ACTIVE_N: u32 = 120;
 
 /// Bounded copy window (R3-1): bottom rows + cursor row ± span, deduplicated and clipped.
@@ -562,6 +564,53 @@ pub(crate) enum Collected {
     Rejected(Sample),
 }
 
+/// Copies the bounded window of `screen` into `frame`. In production this is the ONLY work done under
+/// the parser lock (no formatting, allocation or grammar); the corpus replay calls the same function on
+/// its own parser so live and replay share one copy path. `false` = unsupported geometry.
+pub(crate) fn copy_window(screen: &vt100::Screen, frame: &mut Frame) -> bool {
+    let (rows, cols) = screen.size();
+    let cursor = screen.cursor_position();
+    let scrolled = screen.scrollback() != 0;
+    frame.rows = rows;
+    frame.cols = cols;
+    frame.cursor = cursor;
+    frame.alt = screen.alternate_screen();
+    frame.reset_count = screen.reset_count();
+    frame.sync = screen.synchronized_output();
+    frame.title.clear();
+    for ch in screen.title().chars() {
+        if frame.title.len() + ch.len_utf8() > TITLE_CAP {
+            break;
+        }
+        frame.title.push(ch);
+    }
+    frame.cells.clear();
+    if rows == 0 || cols == 0 || cols > MAX_COLS || scrolled {
+        frame.row_index.clear();
+        return false;
+    }
+    window_rows(rows, cursor.0, &mut frame.row_index);
+    for &r in &frame.row_index {
+        for c in 0..cols {
+            frame.cells.push(screen.cell(r, c).cloned().unwrap_or_default());
+        }
+    }
+    true
+}
+
+/// Classifies a collected frame for `family`; runs after the parser lock is released. Shared by the live
+/// observer and the corpus replay. An open synchronized-output block is a frame mid-update (U4-1): no
+/// complete signature can be claimed and no contradiction shown. A panicking adapter is caught here.
+pub(crate) fn sample_frame(family: Family, frame: &Frame, grammars: &[&dyn Grammar]) -> (Sample, Option<&'static str>) {
+    if frame.sync {
+        return (Sample::Transient(Transient::Incomplete), None);
+    }
+    let text = frame.text_rows();
+    let view = View { rows: &text, size: (frame.rows, frame.cols), cursor: frame.cursor, alt: frame.alt, title: &frame.title };
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| classify_with(family, &view, grammars)))
+        .unwrap_or((Sample::Semantic(Semantic::AdapterPanic), None))
+}
+
 /// Collects one bounded frame from `s` into `frame`. Never blocks on any lock.
 pub(crate) fn collect(s: &Surface, frame: &mut Frame) -> Collected {
     let pend0 = s.activity_pending.load(Ordering::SeqCst);
@@ -579,39 +628,13 @@ pub(crate) fn collect(s: &Surface, frame: &mut Frame) -> Collected {
         Err(TryLockError::Poisoned(_)) => return Collected::Rejected(Sample::Semantic(Semantic::ParserPoison)),
     };
     let t0 = Instant::now();
-    let screen = guard.screen();
-    let (rows, cols) = screen.size();
-    let cursor = screen.cursor_position();
-    let scrolled = screen.scrollback() != 0;
-    frame.rows = rows;
-    frame.cols = cols;
-    frame.cursor = cursor;
-    frame.alt = screen.alternate_screen();
-    frame.reset_count = screen.reset_count();
     frame.view_rev = s.activity_view_rev.load(Ordering::Acquire);
-    frame.sync = screen.synchronized_output();
-    frame.title.clear();
-    for ch in screen.title().chars() {
-        if frame.title.len() + ch.len_utf8() > TITLE_CAP {
-            break;
-        }
-        frame.title.push(ch);
-    }
-    frame.cells.clear();
-    if rows == 0 || cols == 0 || cols > MAX_COLS || scrolled {
-        frame.row_index.clear();
-        frame.lock_hold = t0.elapsed();
-        drop(guard);
-        return Collected::Rejected(Sample::Semantic(Semantic::UnsupportedGeometry));
-    }
-    window_rows(rows, cursor.0, &mut frame.row_index);
-    for &r in &frame.row_index {
-        for c in 0..cols {
-            frame.cells.push(screen.cell(r, c).cloned().unwrap_or_default());
-        }
-    }
+    let supported = copy_window(guard.screen(), frame);
     frame.lock_hold = t0.elapsed();
     drop(guard);
+    if !supported {
+        return Collected::Rejected(Sample::Semantic(Semantic::UnsupportedGeometry));
+    }
     // test-only seam: a deterministic interleaving between unlock and the second endpoint read.
     #[cfg(test)]
     AFTER_COPY.with(|h| {
@@ -1013,28 +1036,9 @@ pub(crate) fn observe_seat(
                         cols: frame.cols,
                         alt: frame.alt,
                     });
-                    if frame.sync {
-                        // U4-1: an open synchronized-output block is a frame mid-update — no complete
-                        // signature can be claimed and no contradiction shown.
-                        Sample::Transient(Transient::Incomplete)
-                    } else {
-                        let text = frame.text_rows();
-                        let view = View {
-                            rows: &text,
-                            size: (frame.rows, frame.cols),
-                            cursor: frame.cursor,
-                            alt: frame.alt,
-                            title: &frame.title,
-                        };
-                        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| classify_with(fam, &view, grammars)));
-                        match res {
-                            Ok((sample, rev)) => {
-                                grammar_rev = rev;
-                                sample
-                            }
-                            Err(_) => Sample::Semantic(Semantic::AdapterPanic),
-                        }
-                    }
+                    let (sample, rev) = sample_frame(fam, frame, grammars);
+                    grammar_rev = rev;
+                    sample
                 }
             },
         },

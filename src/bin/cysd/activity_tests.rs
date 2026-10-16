@@ -1046,3 +1046,509 @@ fn static_signature_masks_animation_glyphs_but_not_timers() {
     };
     assert_eq!(cx("•"), cx("◦"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// F-01 native corpus replay (ignored: the corpus is evidence, not repo data).
+//
+//   CYS_F01_CORPUS=<dir holding INDEX.json>  CYS_F01_REPORT=<report.json>  cargo test --bin cysd \
+//     activity_tests::corpus_replay -- --ignored
+//
+// Replays every capture's PTY output through a fresh vt100 parser of the capture's size and samples it
+// through the SAME `copy_window` + `sample_frame` path the live observer uses. Ground truth comes from
+// INDEX.json phase intervals (fake server / tool markers / harness actions — never screen text).
+//   (a) per-read: a sample after every PTY read (the densest split-repaint exposure). U4-1 positive
+//       control = an incomplete sample sandwiched between accepted active samples while Working; it must
+//       never end Working. The static cap is disabled here (read cadence is not the sample cadence).
+//   (b) 1 Hz: samples at offset + k·S for four offsets through the LOCKED reducer and the serializer's
+//       lease, judged against the ground-truth phases.
+// The report is written before any assertion so a red run still leaves its numbers.
+// ---------------------------------------------------------------------------------------------
+
+mod corpus_replay {
+    use super::*;
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+
+    /// A sample taken within one sample period after an idle/decision boundary may still see the active
+    /// frame (the CLI repaints after the ground-truth event). Fixed before the first replay run.
+    const BOUNDARY_GRACE_MS: f64 = 1000.0;
+    const OFFSETS_MS: [f64; 4] = [0.0, 250.0, 500.0, 750.0];
+    /// dwell (3 s) + two sample periods: an active turn at least this long must establish Working.
+    const ESTABLISH_MIN_TURN_MS: f64 = 5000.0;
+    /// after establishment, the share of 1 Hz samples inside the turn that must read Working.
+    const WORKING_FRAC_MIN: f64 = 0.95;
+    /// A1 hand-disposition (head ruling HEAD-RULING-REPLAY-1 D1, after the RED REPLAY-1): in these captures the
+    /// ground-truth "idle" that starts at the main stream's server close is a proxy error — the CLI's own screen kept
+    /// declaring work (title frozen at the working glyph, footer `esc to interrupt`, SIGTERM ignored; FINDINGS-claude
+    /// §7). Working there is tolerated only until the CLI's first resting title (`✳`) + BOUNDARY_GRACE_MS; any Working
+    /// after that bound still fails. The disposition covers exactly the idle interval that begins where an
+    /// `active:stream` interval ends.
+    const A1_DISPOSED: [&str; 2] = ["claude/heavy-stream-80x24", "claude/heavy-stream-longhold-80x24"];
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Cat {
+        Active,
+        Idle,
+        Decision,
+        Excluded,
+    }
+
+    fn cat(phase: &str) -> Cat {
+        if phase.starts_with("active:") {
+            Cat::Active
+        } else if phase.starts_with("idle") {
+            Cat::Idle
+        } else if phase == "permission" || phase == "question" {
+            Cat::Decision
+        } else {
+            Cat::Excluded
+        }
+    }
+
+    struct Gt {
+        phase: String,
+        start: f64,
+        end: f64,
+    }
+
+    fn phase_at(gt: &[Gt], t: f64) -> Option<&Gt> {
+        gt.iter().find(|g| t >= g.start && t < g.end)
+    }
+
+    fn cat_at(gt: &[Gt], t: f64) -> Cat {
+        phase_at(gt, t).map_or(Cat::Excluded, |g| cat(&g.phase))
+    }
+
+    fn name(s: &Sample) -> String {
+        match s {
+            Sample::Active { .. } => "active".into(),
+            Sample::Idle => "idle".into(),
+            Sample::Decision(DecisionKind::Permission) => "permission".into(),
+            Sample::Decision(DecisionKind::Question) => "question".into(),
+            Sample::Transient(t) => format!("transient:{}", t.as_str()),
+            Sample::Semantic(x) => format!("semantic:{}", x.as_str()),
+            Sample::Invalidated(i) => format!("invalid:{}", i.as_str()),
+        }
+    }
+
+    fn bump(m: &mut serde_json::Map<String, Value>, k: &str) {
+        let n = m.get(k).and_then(Value::as_u64).unwrap_or(0) + 1;
+        m.insert(k.to_string(), json!(n));
+    }
+
+    fn sample_at(parser: &vt100::Parser, frame: &mut Frame, fam: Family) -> Sample {
+        if copy_window(parser.screen(), frame) {
+            sample_frame(fam, frame, grammars()).0
+        } else {
+            Sample::Semantic(Semantic::UnsupportedGeometry)
+        }
+    }
+
+    struct Capture {
+        family: Family,
+        id: String,
+        rows: u16,
+        cols: u16,
+        gt: Vec<Gt>,
+        /// (ms since h:spawn, bytes) for every PTY output record, file order.
+        outputs: Vec<(f64, Vec<u8>)>,
+        end_ms: f64,
+        final_screen: Option<(f64, Vec<String>)>,
+    }
+
+    fn load(base: &Path, c: &Value, failures: &mut Vec<String>) -> Option<(Capture, Value)> {
+        let id = format!("{}/{}", c["family"].as_str().unwrap_or("?"), c["capture"].as_str().unwrap_or("?"));
+        let family = match c["family"].as_str() {
+            Some("claude") => Family::Claude,
+            Some("codex") => Family::Codex,
+            Some("gemini") | Some("agy") => Family::Gemini,
+            other => {
+                failures.push(format!("{id}: unknown family {other:?}"));
+                return None;
+            }
+        };
+        let path: PathBuf = base.join(c["file"].as_str().unwrap_or(""));
+        let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{id}: read {}: {e}", path.display()));
+        let sha = format!("{:x}", Sha256::digest(&raw));
+        let mut prov = json!({"file_sha256": sha, "index_sha256": c["sha256"], "sha_ok": c["sha256"].as_str() == Some(sha.as_str())});
+        if prov["sha_ok"] != json!(true) {
+            failures.push(format!("{id}: file sha256 {sha} != INDEX {}", c["sha256"]));
+        }
+        let text = if c["compressed"].as_str() == Some("gzip") {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(&raw[..]).read_to_end(&mut out).unwrap_or_else(|e| panic!("{id}: gunzip: {e}"));
+            let usha = format!("{:x}", Sha256::digest(&out));
+            let ok = c["uncompressed_sha256"].as_str() == Some(usha.as_str());
+            prov["uncompressed_sha_ok"] = json!(ok);
+            if !ok {
+                failures.push(format!("{id}: uncompressed sha256 {usha} != INDEX {}", c["uncompressed_sha256"]));
+            }
+            out
+        } else {
+            raw
+        };
+        let text = String::from_utf8(text).unwrap_or_else(|e| panic!("{id}: utf8: {e}"));
+        let mut spawn_t: Option<f64> = None;
+        let mut outputs = Vec::new();
+        let mut end_ms: f64 = 0.0;
+        let mut final_screen = None;
+        for (n, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let r: Value = serde_json::from_str(line).unwrap_or_else(|e| panic!("{id}: line {}: {e}", n + 1));
+            let Some(t) = r["t"].as_f64() else { continue };
+            if spawn_t.is_none() && r["s"] == "h" && r["ev"] == "spawn" {
+                spawn_t = Some(t);
+            }
+            let Some(t0) = spawn_t else { continue };
+            let ms = (t - t0) / 1e6;
+            end_ms = end_ms.max(ms);
+            match r["s"].as_str() {
+                Some("o") => {
+                    let b = base64::engine::general_purpose::STANDARD
+                        .decode(r["b64"].as_str().unwrap_or(""))
+                        .unwrap_or_else(|e| panic!("{id}: line {}: b64: {e}", n + 1));
+                    outputs.push((ms, b));
+                }
+                Some("h") if r["ev"] == "final_screen" => {
+                    let rows = r["rows"].as_array().map(|a| a.iter().map(|v| v.as_str().unwrap_or("").to_string()).collect());
+                    final_screen = rows.map(|rows| (ms, rows));
+                }
+                _ => {}
+            }
+        }
+        if spawn_t.is_none() {
+            failures.push(format!("{id}: no h:spawn record"));
+            return None;
+        }
+        let gt = c["ground_truth_intervals"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|g| Gt {
+                        phase: g["phase"].as_str().unwrap_or("").to_string(),
+                        start: g["start_ms"].as_f64().unwrap_or(0.0),
+                        end: g["end_ms"].as_f64().unwrap_or(0.0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let rows = c["rows"].as_u64().unwrap_or(0) as u16;
+        let cols = c["cols"].as_u64().unwrap_or(0) as u16;
+        Some((Capture { family, id, rows, cols, gt, outputs, end_ms, final_screen }, prov))
+    }
+
+    /// A1: (interval start, first resting-title output time, tolerated-until bound) for a disposed capture.
+    fn a1_window(cap: &Capture) -> Option<(f64, Option<f64>, f64)> {
+        if !A1_DISPOSED.contains(&cap.id.as_str()) {
+            return None;
+        }
+        let stream_end = cap.gt.iter().find(|g| g.phase == "active:stream")?.end;
+        let idle = cap.gt.iter().find(|g| g.phase == "idle" && (g.start - stream_end).abs() < 1.0)?;
+        let mut parser = vt100::Parser::new(cap.rows, cap.cols, crate::state::SCROLLBACK_LINES);
+        let mut resting = None;
+        for (t, b) in &cap.outputs {
+            parser.process(b);
+            if *t >= idle.start && parser.screen().title().trim_start().starts_with('✳') {
+                resting = Some(*t);
+                break;
+            }
+        }
+        // no resting title found → no tolerance at all (the bound collapses to the interval start).
+        let bound = resting.map_or(idle.start, |r| r + BOUNDARY_GRACE_MS);
+        Some((idle.start, resting, bound))
+    }
+
+    /// (a) a sample after every read. Returns (report, sandwiches, held).
+    fn per_read(cap: &Capture) -> (Value, u64, u64) {
+        let no_cap = Params { static_n: u32::MAX, ..P };
+        let mut parser = vt100::Parser::new(cap.rows, cap.cols, crate::state::SCROLLBACK_LINES);
+        let mut frame = Frame::new();
+        let mut red = Reducer::new(0.0);
+        let mut seq: Vec<(f64, Sample, Effective, Effective)> = Vec::with_capacity(cap.outputs.len());
+        let mut by_phase = serde_json::Map::new();
+        let mut fidelity = Value::Null;
+        for (t, b) in &cap.outputs {
+            if fidelity.is_null() {
+                if let Some((ft, want)) = &cap.final_screen {
+                    if t > ft {
+                        fidelity = compare_screen(&parser, want);
+                    }
+                }
+            }
+            parser.process(b);
+            let s = sample_at(&parser, &mut frame, cap.family);
+            let before = red.effective;
+            red.step(s, t / 1000.0, &no_cap);
+            seq.push((*t, s, before, red.effective));
+            let phase = phase_at(&cap.gt, *t).map_or("(none)".to_string(), |g| g.phase.clone());
+            let entry = by_phase.entry(phase).or_insert_with(|| json!({}));
+            bump(entry.as_object_mut().expect("object"), &name(&s));
+        }
+        if fidelity.is_null() {
+            if let Some((_, want)) = &cap.final_screen {
+                fidelity = compare_screen(&parser, want);
+            }
+        }
+        let (mut sandwiches, mut held, mut run, mut max_run, mut active_reads, mut active_incomplete) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        let mut examples = Vec::new();
+        for i in 0..seq.len() {
+            let (t, s, before, after) = seq[i];
+            let in_active = cat_at(&cap.gt, t) == Cat::Active;
+            let incomplete = s == Sample::Transient(Transient::Incomplete);
+            if in_active {
+                active_reads += 1;
+                if incomplete {
+                    active_incomplete += 1;
+                    run += 1;
+                    max_run = max_run.max(run);
+                } else {
+                    run = 0;
+                }
+            } else {
+                run = 0;
+            }
+            if incomplete && in_active && i > 0 && i + 1 < seq.len() && before == Effective::Working {
+                let prev_active = matches!(seq[i - 1].1, Sample::Active { .. });
+                let next_active = matches!(seq[i + 1].1, Sample::Active { .. });
+                if prev_active && next_active {
+                    sandwiches += 1;
+                    if after == Effective::Working {
+                        held += 1;
+                    } else if examples.len() < 5 {
+                        examples.push(json!({"t_ms": t, "after": after.as_str()}));
+                    }
+                }
+            }
+        }
+        let rate = if active_reads == 0 { 0.0 } else { active_incomplete as f64 / active_reads as f64 };
+        (
+            json!({
+                "reads": seq.len(),
+                "by_phase": by_phase,
+                "active_reads": active_reads,
+                "active_incomplete": active_incomplete,
+                "active_incomplete_rate": rate,
+                "max_consecutive_incomplete_in_active": max_run,
+                "split_repaint_sandwiches": sandwiches,
+                "sandwiches_working_held": held,
+                "sandwich_drop_examples": examples,
+                "final_screen_fidelity": fidelity,
+            }),
+            sandwiches,
+            held,
+        )
+    }
+
+    fn compare_screen(parser: &vt100::Parser, want: &[String]) -> Value {
+        let (rows, cols) = parser.screen().size();
+        let got: Vec<String> = parser.screen().rows(0, cols).take(usize::from(rows)).map(|l| l.trim_end().to_string()).collect();
+        let n = got.len().min(want.len());
+        let equal = (0..n).filter(|&i| got[i] == want[i].trim_end()).count();
+        json!({"rows_compared": n, "rows_equal": equal, "row_count_parser": got.len(), "row_count_harness": want.len()})
+    }
+
+    /// Merges contiguous active ground-truth intervals into turns [start, end).
+    fn turns(gt: &[Gt]) -> Vec<(f64, f64, Vec<String>)> {
+        let mut out: Vec<(f64, f64, Vec<String>)> = Vec::new();
+        for g in gt.iter().filter(|g| cat(&g.phase) == Cat::Active) {
+            match out.last_mut() {
+                Some(last) if (g.start - last.1).abs() < 1.0 => {
+                    last.1 = g.end;
+                    last.2.push(g.phase.clone());
+                }
+                _ => out.push((g.start, g.end, vec![g.phase.clone()])),
+            }
+        }
+        out
+    }
+
+    /// (b) 1 Hz through the locked reducer and the serializer's lease.
+    fn hz1(cap: &Capture, offset: f64, failures: &mut Vec<String>) -> Value {
+        let period_ms = SAMPLE_PERIOD.as_secs_f64() * 1000.0;
+        let mut parser = vt100::Parser::new(cap.rows, cap.cols, crate::state::SCROLLBACK_LINES);
+        let mut frame = Frame::new();
+        let mut red = Reducer::new(0.0);
+        let mut next = 0usize;
+        let mut samples: Vec<(f64, Sample, Effective)> = Vec::new();
+        // independent static-run measurement with the reducer's counting rule (U4-2): same-sig active +1,
+        // changed-sig active restarts at 1, idle/decision/semantic/invalidation reset, transient leaves it.
+        let (mut st_sig, mut st_run, mut st_max, mut st_max_at) = (None::<u64>, 0u32, 0u32, 0.0f64);
+        let mut st_max_rows: Vec<String> = Vec::new();
+        let mut t = offset;
+        while t <= cap.end_ms {
+            while next < cap.outputs.len() && cap.outputs[next].0 <= t {
+                parser.process(&cap.outputs[next].1);
+                next += 1;
+            }
+            let s = sample_at(&parser, &mut frame, cap.family);
+            red.step(s, t / 1000.0, &P);
+            let (eff, _) = red.effective_at(t / 1000.0, &P);
+            match s {
+                Sample::Active { sig } => {
+                    if st_sig == Some(sig) {
+                        st_run += 1;
+                    } else {
+                        st_sig = Some(sig);
+                        st_run = 1;
+                    }
+                    if st_run > st_max {
+                        st_max = st_run;
+                        st_max_at = t;
+                        st_max_rows = frame.text_rows().into_iter().map(|(r, l)| format!("{r:>3}|{}", l.trim_end())).collect();
+                        st_max_rows.insert(0, format!("title|{}", frame.title));
+                    }
+                }
+                Sample::Transient(_) => {}
+                _ => {
+                    st_sig = None;
+                    st_run = 0;
+                }
+            }
+            samples.push((t, s, eff));
+            t += period_ms;
+        }
+        let mut eff_by_cat = serde_json::Map::new();
+        let mut false_working = Vec::new();
+        let mut grace_working = 0u64;
+        let a1 = a1_window(cap);
+        let mut a1_working = 0u64;
+        for (t, _, eff) in &samples {
+            let c = cat_at(&cap.gt, *t);
+            let entry = eff_by_cat.entry(format!("{c:?}")).or_insert_with(|| json!({}));
+            bump(entry.as_object_mut().expect("object"), eff.as_str());
+            if *eff == Effective::Working && matches!(c, Cat::Idle | Cat::Decision) {
+                let g = phase_at(&cap.gt, *t).expect("categorised sample has a phase");
+                if t - g.start < BOUNDARY_GRACE_MS {
+                    grace_working += 1;
+                } else if a1.is_some_and(|(start, _, bound)| (g.start - start).abs() < 1e-9 && *t < bound) {
+                    a1_working += 1;
+                } else {
+                    false_working.push(json!({"t_ms": t, "phase": g.phase, "since_phase_start_ms": t - g.start}));
+                }
+            }
+        }
+        if !false_working.is_empty() {
+            failures.push(format!("{} offset {offset}: {} false Working sample(s) in idle/decision phases: {:?}", cap.id, false_working.len(), false_working.iter().take(3).collect::<Vec<_>>()));
+        }
+        let mut turn_rows = Vec::new();
+        for (s, e, phases) in turns(&cap.gt) {
+            let inside: Vec<&(f64, Sample, Effective)> = samples.iter().filter(|(t, _, _)| *t >= s && *t < e).collect();
+            let est = inside.iter().position(|(_, _, eff)| *eff == Effective::Working);
+            let (frac, est_ms) = match est {
+                Some(i) => {
+                    let after = &inside[i..];
+                    let w = after.iter().filter(|(_, _, eff)| *eff == Effective::Working).count();
+                    (Some(w as f64 / after.len() as f64), Some(inside[i].0 - s))
+                }
+                None => (None, None),
+            };
+            let long = e - s >= ESTABLISH_MIN_TURN_MS;
+            if long && est.is_none() {
+                failures.push(format!("{} offset {offset}: active turn {s:.0}..{e:.0} ms ({:?}) never established Working", cap.id, phases));
+            }
+            if let Some(f) = frac {
+                if f < WORKING_FRAC_MIN {
+                    failures.push(format!("{} offset {offset}: active turn {s:.0}..{e:.0} ms Working share {f:.3} < {WORKING_FRAC_MIN}", cap.id));
+                }
+            }
+            let reasons: Vec<String> = inside
+                .iter()
+                .skip(est.unwrap_or(inside.len()))
+                .filter(|(_, _, eff)| *eff != Effective::Working)
+                .map(|(t, smp, eff)| format!("{t:.0}:{}:{}", eff.as_str(), name(smp)))
+                .take(5)
+                .collect();
+            turn_rows.push(json!({
+                "start_ms": s, "end_ms": e, "phases": phases, "samples": inside.len(),
+                "established_after_ms": est_ms, "working_share_after_establishment": frac,
+                "non_working_after_establishment": reasons,
+            }));
+        }
+        let has_active = cap.gt.iter().any(|g| cat(&g.phase) == Cat::Active);
+        if has_active && st_max >= P.static_n {
+            failures.push(format!("{} offset {offset}: identical active run {st_max} >= STATIC_ACTIVE_N {}", cap.id, P.static_n));
+        }
+        json!({
+            "offset_ms": offset,
+            "samples": samples.len(),
+            "effective_by_category": eff_by_cat,
+            "false_working": false_working,
+            "working_within_boundary_grace": grace_working,
+            "a1_disposition": a1.map(|(start, resting, bound)| json!({
+                "interval_start_ms": start, "first_resting_title_ms": resting, "tolerated_until_ms": bound,
+                "working_samples_disposed": a1_working,
+            })),
+            "turns": turn_rows,
+            "max_identical_active_run": st_max,
+            "max_identical_active_run_at_ms": st_max_at,
+            "max_identical_active_run_phase": phase_at(&cap.gt, st_max_at).map(|g| g.phase.clone()),
+            "max_identical_active_run_window": st_max_rows,
+        })
+    }
+
+    #[test]
+    #[ignore = "needs the F-01 native capture corpus (CYS_F01_CORPUS) and a report path (CYS_F01_REPORT)"]
+    fn corpus_replay() {
+        let corpus = PathBuf::from(std::env::var("CYS_F01_CORPUS").expect("CYS_F01_CORPUS (dir holding INDEX.json) not set"));
+        let report_path = PathBuf::from(std::env::var("CYS_F01_REPORT").expect("CYS_F01_REPORT (report json path) not set"));
+        let index_raw = std::fs::read(corpus.join("INDEX.json")).expect("read INDEX.json");
+        let index_sha = format!("{:x}", Sha256::digest(&index_raw));
+        let index: Value = serde_json::from_slice(&index_raw).expect("parse INDEX.json");
+        // INDEX `file` entries are relative to the corpus directory's parent ("corpus/<family>/<capture>…").
+        let base = corpus.parent().expect("corpus dir has a parent").to_path_buf();
+        let mut failures: Vec<String> = Vec::new();
+        let mut caps = Vec::new();
+        let mut fam_totals: std::collections::BTreeMap<&'static str, (u64, u64, u64, u64)> = Default::default();
+        for c in index["captures"].as_array().expect("captures array") {
+            let Some((cap, prov)) = load(&base, c, &mut failures) else { continue };
+            let (pr, sandwiches, held) = per_read(&cap);
+            let tot = fam_totals.entry(cap.family.as_str()).or_default();
+            tot.0 += 1;
+            tot.1 += sandwiches;
+            tot.2 += held;
+            tot.3 += pr["active_incomplete"].as_u64().unwrap_or(0);
+            let hz: Vec<Value> = OFFSETS_MS.iter().map(|&o| hz1(&cap, o, &mut failures)).collect();
+            caps.push(json!({
+                "family": cap.family.as_str(), "capture": cap.id, "size": [cap.cols, cap.rows],
+                "provenance": prov, "outputs": cap.outputs.len(), "end_ms": cap.end_ms,
+                "per_read": pr, "hz1": hz,
+            }));
+        }
+        for fam in ["claude", "codex"] {
+            let (n, s, h, _) = fam_totals.get(fam).copied().unwrap_or_default();
+            if n == 0 {
+                failures.push(format!("{fam}: no captures replayed"));
+            } else if s == 0 {
+                failures.push(format!("{fam}: U4-1 positive control not exercised — no incomplete sample sandwiched between active samples while Working"));
+            } else if h != s {
+                failures.push(format!("{fam}: U4-1 positive control red — {} of {s} split-repaint incomplete samples ended Working", s - h));
+            }
+        }
+        let summary: serde_json::Map<String, Value> = fam_totals
+            .iter()
+            .map(|(f, (n, s, h, inc))| (f.to_string(), json!({"captures": n, "split_repaint_sandwiches": s, "held": h, "active_incomplete_reads": inc})))
+            .collect();
+        let report = json!({
+            "corpus_index_sha256": index_sha,
+            "grammars": grammars().iter().map(|g| g.revision()).collect::<Vec<_>>(),
+            "params": {"sample_period_s": SAMPLE_PERIOD.as_secs_f64(), "dwell_s": P.dwell_secs, "dwell_min_samples": P.dwell_min_samples,
+                        "max_gap_s": P.max_gap_secs, "k": P.k, "lease_s": P.lease_secs, "static_active_n": P.static_n},
+            "criteria": {"boundary_grace_ms": BOUNDARY_GRACE_MS, "offsets_ms": OFFSETS_MS, "establish_min_turn_ms": ESTABLISH_MIN_TURN_MS,
+                          "working_share_min": WORKING_FRAC_MIN,
+                          "a1_disposed": A1_DISPOSED, "a1_ruling": "HEAD-RULING-REPLAY-1.md D1 (REPLAY-1 RED on record)"},
+            "gemini": "no capture — family PROVISIONAL (live-seat read-only route, head ruling 2026-10-16)",
+            "summary": summary,
+            "failures": failures,
+            "captures": caps,
+        });
+        if let Some(dir) = report_path.parent() {
+            std::fs::create_dir_all(dir).expect("report dir");
+        }
+        std::fs::write(&report_path, serde_json::to_vec_pretty(&report).expect("serialize")).expect("write report");
+        assert!(failures.is_empty(), "{} replay failure(s) (report {}):\n{}", failures.len(), report_path.display(), failures.join("\n"));
+    }
+}
