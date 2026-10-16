@@ -29862,7 +29862,8 @@ mod h_machine_hold_tests {
             ("channels", include_str!("channels.rs"), "redeliver_unacked", "redelivered=redelivered+1", "inject_master_confirmed("),
             // H4 — CEO 자동결재: 하드축 판정이 원장 선기록·주입보다 앞.
             ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "record_audited("),
-            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "WriteReq::Inject"),
+            //   ★(0.14.52 · S-a C6c) the CEO route hands ONE checked agent request (`WriteReq::Agent`).
+            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "WriteReq::Agent"),
             // H5 — 부트 감독자 무스폰 통보: 하드축 판정이 원장 선기록·주입보다 앞(feed 는 그보다 앞 · 무조건).
             //   ★(R3SH-3) 판정은 `pane_notice_hold`(H0) · 쓰기는 `pane_notice_line`(원장 선기록 → 주입) — 즉시 경로와 미룬
             //   재시도 경로 모두 판정이 쓰기보다 앞이다.

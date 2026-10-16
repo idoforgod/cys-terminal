@@ -4650,7 +4650,9 @@ fn auto_route_idem_window_secs() -> f64 {
 }
 
 enum CeoDelivery {
-    Delivered,
+    /// ★(0.14.52 · S-a C6c) Handed to the CEO seat's writer as one checked request; its settlement ([`CeoSettle`]) publishes
+    /// `feed.auto_routed` after the written Return, or escalates when nothing (or only part) was written.
+    Handed,
     SeatEmpty,
     /// ★(0.14.42 · 설계 H4) 좌석은 있으나 하드축(모달·화면 초안·사이클·kill-switch)이 양성 관측됐다 — 사유를 싣고
     /// 즉시 escalation 한다(큐 미사용: 요청자 대기 120s 라 큐 보류는 곧 조용한 만료다).
@@ -4686,7 +4688,7 @@ fn route_auto_approval(daemon: &Arc<Daemon>, item: &crate::state::FeedItem, over
         return;
     }
     match deliver_to_ceo(daemon, item, over_pressure) {
-        CeoDelivery::Delivered => {}
+        CeoDelivery::Handed => {}
         CeoDelivery::SeatEmpty => escalate_no_ceo(daemon, item, "ceo_seat_empty"),
         CeoDelivery::Held(reason) => escalate_no_ceo(daemon, item, reason),
     }
@@ -4761,24 +4763,74 @@ fn deliver_to_ceo(
         crate::delivery::Origin::Feed,
         item.publisher_surface,
     );
-    let req = crate::state::WriteReq::Inject {
-        text,
-        cr_delay_ms: 500,
-        clear_first: false,
-        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
+    // ★(0.14.52 · S-a C6c) One checked agent request (body + its own Return, cr 500 as before); `last_injected` and
+    //   `feed.auto_routed` wait for the writer's terminal ([`CeoSettle`]).
+    let request = crate::agent_write::Request::new(
+        crate::agent_write::new_request_id((daemon.started_at * 1000.0) as u64),
+        sid,
+        "feed",
+        crate::delivery::digest_text(&text),
+    );
+    let handle = request.clone();
+    let settle = CeoSettle {
+        daemon: Arc::downgrade(daemon),
+        surface: Arc::downgrade(&surface),
+        sid,
+        item: item.clone(),
+        request_id: request.id.clone(),
     };
-    if surface.write_tx.try_send(req).is_err() {
+    let job = crate::agent_write::AgentJob {
+        request,
+        plan: crate::agent_write::Plan::paste(&text).with_submit(500, 0),
+        proof: surface.agent_proof(),
+        journal: Some(daemon.agent_journal()),
+        resume: None,
+        settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
+        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
+        note_body: true, // the old Inject arm recorded every routed body (owner None)
+        body_owner: None,
+    };
+    if surface.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
         return CeoDelivery::SeatEmpty; // writer 채널 불능 → escalation
     }
-    *surface.last_injected.lock().unwrap() = Some(std::time::Instant::now());
-    daemon.bus.publish(
-        "feed.auto_routed",
-        "feed",
-        Some(sid),
-        json!({"request_id": item.request_id, "risk_class": item.risk_class,
-               "publisher_surface": item.publisher_surface}),
-    );
-    CeoDelivery::Delivered
+    crate::agent_write::test_wait_settled(&handle);
+    CeoDelivery::Handed
+}
+
+/// ★(0.14.52 · S-a C6c) Settlement of one CEO auto-route after the writer's terminal (design 3.3 feed row: "consume the
+/// actual-write outcome and preserve the unresolved feed on refusal"). The feed item is never resolved here, so a refused or
+/// partial write leaves it pending and reaches the human through the same escalation as an empty CEO seat.
+struct CeoSettle {
+    daemon: std::sync::Weak<Daemon>,
+    surface: std::sync::Weak<crate::state::Surface>,
+    sid: u64,
+    item: crate::state::FeedItem,
+    request_id: String,
+}
+
+impl CeoSettle {
+    fn run(self, t: &crate::agent_write::Terminal) {
+        use crate::agent_write::Terminal as T;
+        let Some(daemon) = self.daemon.upgrade() else { return };
+        match t {
+            T::WrittenSubmitted { .. } => {
+                if let Some(s) = self.surface.upgrade() {
+                    *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+                }
+                daemon.bus.publish(
+                    "feed.auto_routed",
+                    "feed",
+                    Some(self.sid),
+                    json!({"request_id": self.item.request_id, "risk_class": self.item.risk_class,
+                           "publisher_surface": self.item.publisher_surface, "write_request_id": self.request_id}),
+                );
+            }
+            T::RefusedNoWrite { .. } | T::CancelledBeforeWrite => escalate_no_ceo(&daemon, &self.item, "ceo_write_refused"),
+            T::WrittenBody { .. } | T::PartialExact { .. } | T::PartialUnknown { .. } => {
+                escalate_no_ceo(&daemon, &self.item, "ceo_write_partial")
+            }
+        }
+    }
 }
 
 /// CEO 주입 텍스트(§W3.2 포맷): 헤더(cysd 신원보증 메타) + inert 격리 인용 본문 + 결재 안내.
@@ -27206,7 +27258,7 @@ mod tests {
             resolver_surface: None,
             resolver_pid: None,
         };
-        assert!(matches!(deliver_to_ceo(&daemon, &item, false), CeoDelivery::Delivered));
+        assert!(matches!(deliver_to_ceo(&daemon, &item, false), CeoDelivery::Handed));
         let _ = ceo.child.lock().unwrap().kill();
         let raw = build_ceo_injection(&item, false);
         let clean = cys::paste_fence::sanitize(&raw).into_owned();
@@ -27315,13 +27367,84 @@ mod tests {
         let _ = ceo.child.lock().unwrap().kill();
     }
 
+    // ── ★(0.14.52 · S-a C6c) the CEO auto-route settles on the writer's terminal (design 3.3 feed row) ──
+
+    /// Scripted CEO receiver proof: refuse every admission, or lose the proof right before the Return.
+    struct C6cProof {
+        refuse: bool,
+    }
+    impl crate::agent_write::Proof for C6cProof {
+        fn admit(&self) -> Result<(), crate::receiver::ProofLoss> {
+            if self.refuse {
+                return Err(crate::receiver::ProofLoss::Unknown("test_refuse".into()));
+            }
+            Ok(())
+        }
+        fn recheck(&self, phase: crate::agent_write::Phase) -> Result<(), crate::receiver::ProofLoss> {
+            if phase == crate::agent_write::Phase::Submit {
+                return Err(crate::receiver::ProofLoss::Unknown("test_no_return".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn c6c_stalled(d: &Arc<Daemon>, rid: &str) -> Vec<Value> {
+        h4_events(d, "approval.stalled").into_iter().filter(|e| e["payload"]["request_id"] == json!(rid)).collect()
+    }
+
+    /// T-c1: a refused CEO write wrote nothing; the feed item is escalated to the human (`ceo_write_refused`) and never
+    /// announced as routed.
+    #[test]
+    fn c6c_ceo_refused_write_escalates_and_is_never_routed() {
+        let (d, ceo) = h4_rig("c6c-refused", "sleep 30");
+        *ceo.receiver_proof.lock().unwrap() = Some(Arc::new(C6cProof { refuse: true }));
+        let item = h4_item("c6c-r", "RSI 학습 추천 c6c refused", "x");
+        route_auto_approval(&d, &item, false);
+        let st = c6c_stalled(&d, "c6c-r");
+        assert_eq!(st.len(), 1, "a refused CEO write was not escalated: {st:?}");
+        assert_eq!(st[0]["payload"]["reason"], json!("ceo_write_refused"));
+        assert!(h4_events(&d, "feed.auto_routed").is_empty(), "a refused write was announced as routed");
+        assert!(ceo.inject_track.last_body().is_none(), "a refused write was recorded as written");
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// T-c1b: a CEO write stopped before its Return is escalated (`ceo_write_partial`), never announced as routed.
+    #[test]
+    fn c6c_ceo_write_stopped_before_its_return_escalates() {
+        let (d, ceo) = h4_rig("c6c-partial", "sleep 30");
+        *ceo.receiver_proof.lock().unwrap() = Some(Arc::new(C6cProof { refuse: false }));
+        let item = h4_item("c6c-p", "RSI 학습 추천 c6c partial", "x");
+        route_auto_approval(&d, &item, false);
+        let st = c6c_stalled(&d, "c6c-p");
+        assert_eq!(st.len(), 1, "{st:?}");
+        assert_eq!(st[0]["payload"]["reason"], json!("ceo_write_partial"));
+        assert!(h4_events(&d, "feed.auto_routed").is_empty());
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// T-c2 (queue pair (b)): a healthy CEO route writes body + Return once; `feed.auto_routed` follows the write and carries
+    /// its write request id; no escalation.
+    #[test]
+    fn c6c_ceo_written_route_is_announced_after_its_return() {
+        let (d, ceo) = h4_rig("c6c-written", "sleep 30");
+        let item = h4_item("c6c-w", "RSI 학습 추천 c6c written", "x");
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Handed));
+        let routed = h4_events(&d, "feed.auto_routed");
+        assert_eq!(routed.len(), 1, "{routed:?}");
+        assert!(routed[0]["payload"]["write_request_id"].as_str().is_some_and(|r| !r.is_empty()));
+        assert_eq!(ceo.inject_track.last_body().map(|b| b.norm.contains("c6c-w")), Some(true), "body not written");
+        assert!(ceo.last_injected.lock().unwrap().is_some(), "last_injected not stamped after the write");
+        assert!(c6c_stalled(&d, "c6c-w").is_empty());
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
     /// [H4 핀] busy CEO 에는 종전대로 즉시 주입한다(턴 경계까지 미루면 120s 만료가 곧 escalation).
     #[test]
     fn h4_ceo_busy_injects() {
         let (d, ceo) = h4_rig("h4-busy", "sleep 30");
         crate::governance::h_paint(&ceo, "✻ Working… (esc to interrupt)\n────────────────────\n❯ ");
         let item = h4_item("h4-busy", "RSI 학습 추천 busy", "x");
-        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered));
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Handed));
         assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 1);
         assert_eq!(h4_events(&d, "feed.auto_routed").len(), 1);
         let _ = ceo.child.lock().unwrap().kill();
@@ -27452,7 +27575,7 @@ mod tests {
         let rec = dir.join("pty-in.bin");
         let (d, ceo) = h4_rig("h4-bnd", &format!("stty raw -echo; exec cat > '{}'", rec.display()));
         let item = h4_item("h4-bnd", "RSI 학습 추천 경계", "\x1b[201~\rEVIL");
-        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered));
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Handed));
         let t0 = std::time::Instant::now();
         let bytes = loop {
             let b = std::fs::read(&rec).unwrap_or_default();
@@ -27482,7 +27605,7 @@ mod tests {
         let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,channel,supervisor,takeover")]);
         crate::governance::h_paint(&ceo, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
         let item = h4_item("h4-knob", "RSI 학습 추천 knob", "x");
-        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered), "노브로 끈 CEO 가 보류했다");
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Handed), "노브로 끈 CEO 가 보류했다");
         let _ = ceo.child.lock().unwrap().kill();
     }
 
