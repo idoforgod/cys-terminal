@@ -614,6 +614,35 @@ pub(crate) mod bench {
     thread_local! {
         static SEAT_SLEPT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
         static TICK_SLEPT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        /// A2-1: fsync time / calls on THIS thread (only the harness delivery thread reads its own).
+        static FSYNC_SPAN: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static FSYNC_CALLS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// A2-1 fsync span guard: created right before each `sync_data`/`sync_all` reachable from `deliver_queued`
+    /// and dropped right after it (also on an early `?` return), adding the elapsed time and one call to this
+    /// thread's accumulator. Inert (no clock read, nothing recorded) unless the bench is enabled.
+    pub(crate) struct FsyncSpan(Option<Instant>);
+
+    impl FsyncSpan {
+        pub(crate) fn begin() -> FsyncSpan {
+            FsyncSpan(on().then(Instant::now))
+        }
+    }
+
+    impl Drop for FsyncSpan {
+        fn drop(&mut self) {
+            if let Some(t0) = self.0.take() {
+                let d = t0.elapsed();
+                FSYNC_SPAN.with(|c| c.set(c.get() + d));
+                FSYNC_CALLS.with(|c| c.set(c.get() + 1));
+            }
+        }
+    }
+
+    /// Returns and resets this thread's accumulated (fsync time, fsync calls).
+    pub(crate) fn fsync_take() -> (Duration, u64) {
+        (FSYNC_SPAN.with(|c| c.replace(Duration::ZERO)), FSYNC_CALLS.with(|c| c.replace(0)))
     }
 
     /// Installs an empty sink with pre-reserved capacity (no reallocation under load).

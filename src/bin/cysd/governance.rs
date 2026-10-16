@@ -3069,14 +3069,24 @@ pub(crate) fn write_json_atomic(dir: &std::path::Path, name: &str, content: &str
     let res = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(content.as_bytes())?;
+        // test-only U4-3 A2-1 fsync span (guard also closes on `?`). Spelled `cfg(all(test))` (≡ `cfg(test)`) because
+        // this file's source pins cut the production region at the first literal test-cfg attribute (cf. `expire_entries`).
+        #[cfg(all(test))]
+        let bench_fsync = crate::activity::bench::FsyncSpan::begin();
         f.sync_all()?;
+        #[cfg(all(test))]
+        drop(bench_fsync);
         std::fs::rename(&tmp, &target)?;
         Ok(())
     })();
     match res {
         Ok(()) => {
             if let Ok(d) = std::fs::File::open(dir) {
+                #[cfg(all(test))]
+                let bench_fsync = crate::activity::bench::FsyncSpan::begin();
                 let _ = d.sync_all();
+                #[cfg(all(test))]
+                drop(bench_fsync);
             }
             Ok(())
         }

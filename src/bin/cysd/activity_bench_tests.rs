@@ -19,6 +19,8 @@
 //! wrote (`--report`, generator side, independent of the daemon) and every daemon → PTY write is captured in full from
 //! seat creation until the seats are killed, so the analyzer can classify DSR replies vs other bytes; A1-2 — rounds are
 //! orchestrated by run-arms.sh (one arm per process). Diagnostic: each delivery tick records how many items it delivered.
+//! Amendment A2 (U43-LOCK-PLAN-A2.md): A2-1 — every fsync reachable from `deliver_queued` is timed into the delivery
+//! thread's own accumulator (`activity::bench::FsyncSpan`); each tick stores `fsync_ns` and `fsync_calls`.
 //!
 //! The JSON holds raw arrays per metric (no censoring); PASS/FAIL is computed by `u43/analyze.py`.
 
@@ -179,6 +181,9 @@ struct TickRec {
     start_epoch: f64,
     end_epoch: f64,
     in_window: bool,
+    /// A2-1: fsync time and calls made by this (delivery) thread inside the tick; 0 outside the window.
+    fsync: Duration,
+    fsync_calls: u64,
 }
 
 struct AttachRec {
@@ -397,12 +402,14 @@ fn u43_lock_cost_arm() {
                         }
                         drain += 1;
                     }
+                    let _ = bench::fsync_take(); // A2-1: this thread's accumulator starts at zero for the tick
                     let start_epoch = crate::state::now_epoch();
                     let start = Instant::now();
                     crate::governance::h_queue_tick(&daemon);
                     let end = Instant::now();
+                    let (fsync, fsync_calls) = bench::fsync_take();
                     let end_epoch = crate::state::now_epoch();
-                    ticks.push(TickRec { deadline, start, end, start_epoch, end_epoch, in_window });
+                    ticks.push(TickRec { deadline, start, end, start_epoch, end_epoch, in_window, fsync, fsync_calls });
                 }
             })
             .expect("spawn delivery")
@@ -601,6 +608,8 @@ fn u43_lock_cost_arm() {
         json!({
             "unit": "ns", "n": ts.len(),
             "delivered_items": ts.iter().map(|t| delivered_in(t)).collect::<Vec<_>>(),
+            "fsync_ns": ts.iter().map(|t| ns(t.fsync)).collect::<Vec<_>>(),
+            "fsync_calls": ts.iter().map(|t| t.fsync_calls).collect::<Vec<_>>(),
             "deadline_t_ns": ts.iter().map(|t| rel(t.deadline, w0)).collect::<Vec<_>>(),
             "exec_ns": ts.iter().map(|t| ns(t.end - t.start)).collect::<Vec<_>>(),
             "deadline_to_start_ns": ts.iter().map(|t| ns(t.start.saturating_duration_since(t.deadline))).collect::<Vec<_>>(),
