@@ -6281,8 +6281,16 @@ fn resubmit_withheld_one(
     {
         let _gate = s.input_gate.lock().unwrap();
         // 게이트 안 재확인(원자·leaf 판독뿐) — 관측과 인계 사이에 직접 send·사람 키가 끼었으면 이번 틱은 쓰지 않는다.
+        // ★(0.14.52 · S-a C7d · I10) The count is the one the withheld Return's settlement left (its body, byte-exact) at
+        //   that input generation - or 0 for a record whose Return was counted at hand-off (this path's own re-withhold).
+        let count_ok = match w.expect {
+            Some((count, gen)) => {
+                s.pending_input_bytes.load(Ordering::Relaxed) == count && s.input_gen.load(Ordering::Acquire) == gen
+            }
+            None => s.pending_input_bytes.load(Ordering::Relaxed) == 0,
+        };
         if s.inject_track.last_body().map(|b| b.at) != Some(w.body_at)
-            || s.pending_input_bytes.load(Ordering::Relaxed) != 0
+            || !count_ok
             || !s.inject_track.clear_withheld_if(at)
         {
             return "raced";
@@ -30341,7 +30349,7 @@ mod h_machine_hold_tests {
         assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["fake::sneaky_producer".to_string()]);
     }
 
-    /// ★(R2F-DM · 성찰 2회차 마스터 결정 D2) **윈도우에서 `ignored`(+사유)로 남기는 검체는 정확히 이 50건이다**(1차 결정 41 + 2차 3 + S-a C7b 6 — 아래 ★) — 컴파일에서 빼지 않고(`#[cfg(unix)]`·조기 return 금지) `cfg_attr(not(unix), ignore = "<사유>")` 속성으로 윈도우 보고서에
+    /// ★(R2F-DM · 성찰 2회차 마스터 결정 D2) **윈도우에서 `ignored`(+사유)로 남기는 검체는 정확히 이 52건이다**(1차 결정 41 + 2차 3 + S-a C7b 6 + C7d 2 — 아래 ★) — 컴파일에서 빼지 않고(`#[cfg(unix)]`·조기 return 금지) `cfg_attr(not(unix), ignore = "<사유>")` 속성으로 윈도우 보고서에
     /// 사유가 남게 한다(맥·리눅스에는 `ignore` 가 붙지 않는다). 1차의 세 부류: A) `send_settle_tests.rs` 의 윈도우에서 붉던 22건 — S21 제출 정착·창 위 CR 보류는 `cfg!(unix)` 한정(`send_settle_applies`) B) 윈도우 기본 H 마스크가 `draft` 축을 끄는데
     /// (`hold_axes_default(true)` — 순수 검체 `h0_axes_default_by_platform`·`h0_conpty_fixtures` 가 이미 그 값을 고정한다) 유닉스 기본(draft 축) 동작을 보는 17건(h0 4 · h4 3 · h2 9 · c8 1) C) 좌석 명령이 POSIX 셸 문법인 2건.
     /// 이 핀은 **집합이 늘지도 줄지도 않게** 한다 — 나머지 20건(`send_settle_tests.rs` 의 '셸 좌석·윈도우·끔 = 종전 바이트' 음성 대조)은 윈도우에서도 돌아야 하고, [추측]으로 남긴 검체(ConPTY 2 · mtime 2 · ⓐ 추정·연쇄)는 윈도우 재측정 전에
@@ -30352,14 +30360,18 @@ mod h_machine_hold_tests {
     /// ★(0.14.52 · S-a C7b) 44 → **50**: class C (POSIX seat command) +6 S4-1 resume specimens that record the receiver's bytes
     /// (`agent_queue_tests`) - the exact-bytes proof needs a raw `cat` receiver; the same behaviour minus the byte comparison
     /// runs on Windows in the sibling specimens. Test renamed `_of_44` -> `_of_50` (the CI comment in windows-health.yml too).
+    /// ★(0.14.52 · S-a C7d) 50 → **52**: class A (S21 withheld Return is Unix-only, `send_settle_applies`) +2 byte-exact
+    /// withheld-Return accounting specimens (`send_settle_tests::c7d_*`). Renamed `_of_52`.
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_50() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_52() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
         const REASON_D: &str = "윈도우 ConPTY 는 자식이 끝나도 출력 파이프를 닫지 않는다 — reader EOF 로 좌석 종료를 아는 경로는 유닉스 전제";
         let want: Vec<(&str, &str, char)> = vec![
             ("send_settle_tests", "c5_settle_proof_denial_never_carries_the_ghost_prescription", 'A'),
+            ("send_settle_tests", "c7d_withheld_return_counts_the_body_bytes_and_is_resubmitted_once", 'A'),
+            ("send_settle_tests", "c7d_withheld_return_is_not_resubmitted_after_a_foreign_count_write", 'A'),
             ("send_settle_tests", "f1_submit_cr_withheld_on_stale_empty_seat_before_first_agent_sighting", 'A'),
             ("send_settle_tests", "f1_submit_cr_withheld_when_dialog_rose_after_own_body", 'A'),
             ("send_settle_tests", "f1_withheld_submit_dropped_after_newer_machine_body", 'A'),
@@ -30413,7 +30425,7 @@ mod h_machine_hold_tests {
             ("agent_queue_tests", "s4_1_modal_waits_inside_the_window_then_resumes", 'C'),
             ("agent_queue_tests", "s4_1_resume_window_edges_are_exact", 'C'),
         ];
-        assert_eq!(want.len(), 50, "결정한 집합은 50건(22 + 17 + 8 + 3)");
+        assert_eq!(want.len(), 52, "결정한 집합은 52건(24 + 17 + 8 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -30440,8 +30452,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 50, "윈도우 `ignore` 가 {}건이다(결정 50건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 50건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 52, "윈도우 `ignore` 가 {}건이다(결정 52건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 52건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 

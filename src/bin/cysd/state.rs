@@ -1230,12 +1230,16 @@ pub(crate) struct WithheldSubmit {
     pub(crate) dialog_ms: u64,
     /// 직전 관측이 '창 열림'이었는가 — 보류 탐침 자체가 창 관측이라 생성 = true. 못 본 틱(사이클 창)은 false(사슬만 끊음).
     pub(crate) dialog_open: bool,
+    /// ★(0.14.52 · S-a C7d · I10) The input count and input generation the withheld Return's own settlement left (design 4.5
+    /// byte-exact: the body counted, the unwritten Return not) - the resubmission requires exactly these. `None` = a record
+    /// whose Return was counted when it was handed off (the resubmission's own re-withhold): the count must then be 0.
+    pub(crate) expect: Option<(u64, u64)>,
 }
 
 impl WithheldSubmit {
     /// 보류 탐침이 창을 본 순간의 기록 — 두 시계 0 · 창 열림.
     pub(crate) fn new(at: Instant, body_at: Instant, from: Option<u64>) -> Self {
-        Self { at, body_at, from, seen_at: at, live_ms: 0, dialog_ms: 0, dialog_open: true }
+        Self { at, body_at, from, seen_at: at, live_ms: 0, dialog_ms: 0, dialog_open: true, expect: None }
     }
 
     /// ★(R3C-1) 순수 — 틱 1회의 경과를 잰다: `seen_at` 을 `now` 로 옮기고, pause 가 아니면 `live_ms` 에 더한다.

@@ -3366,6 +3366,8 @@ struct DirectSettle {
     pair_key: Option<crate::state::PairKey>,
     /// This job counted itself into `inject_track.submit_pending` at hand-off (an owned Return).
     submit_handed: bool,
+    /// ★(0.14.52 · S-a C7d) When the job was handed to the writer: a withheld-Return record made after it is this job's.
+    handed_at: std::time::Instant,
     /// `surface.input_injected` payload (None = quiet caller).
     input_event: Option<Value>,
 }
@@ -3399,11 +3401,11 @@ impl DirectSettle {
         {
             let _gate = s.input_gate.lock().unwrap();
             if s.input_gen.load(Ordering::Acquire) == self.gen_at_handoff {
-                // A Return withheld by the existing CR withhold probe settles with the accounting the two-step always
-                // had - the Return counted at hand-off - so the existing withheld-CR resubmission (which expects the
-                // count at 0) and H0 residue attribution keep working (C5B-PLAN I10; C7 makes this byte-exact).
+                // ★(0.14.52 · S-a C7d · I10) Byte-exact (design 4.5), a withheld Return included: the body is counted, the
+                //   unwritten Return is not, so the composer's machine residue is owned by its sender. The withheld record
+                //   learns the count and generation this left; the resubmission requires exactly those (it required 0
+                //   while this settlement counted the unwritten Return).
                 let withheld = matches!(t, T::PartialExact { reason, .. } if reason.ends_with(SUBMIT_WITHHELD));
-                let accepted = if withheld { self.planned.len() } else { accepted };
                 let prefix = &self.planned[..accepted.min(self.planned.len())];
                 let rest = if self.clear_first && prefix.first() == Some(&0x15) {
                     s.clear_pending_input();
@@ -3415,6 +3417,12 @@ impl DirectSettle {
                 if self.origin == crate::governance::InputOrigin::Machine && next.count > 0 {
                     if let Some(o) = self.owner {
                         s.mark_pending_input_owner(o);
+                    }
+                }
+                if withheld {
+                    if let Some(w) = s.inject_track.withheld().filter(|w| w.at >= self.handed_at) {
+                        let expect = (s.pending_input_bytes.load(Ordering::Relaxed), s.input_gen.load(Ordering::Acquire));
+                        s.inject_track.update_withheld_if(w.at, |w| w.expect = Some(expect));
                     }
                 }
             }
@@ -3456,6 +3464,7 @@ fn hand_off_direct_job(
 ) -> Option<Value> {
     settle.gen_at_handoff = surface.input_gen.load(Ordering::Acquire);
     settle.planned = plan.planned_bytes();
+    settle.handed_at = std::time::Instant::now();
     let handed = settle.submit_handed;
     if handed {
         surface.inject_track.submit_handed();
@@ -3609,6 +3618,7 @@ fn bind_held_and_write(
         gen_at_handoff: 0,
         pair_key: request_pair_key(daemon, verified_from, params),
         submit_handed: true,
+        handed_at: std::time::Instant::now(),
         input_event: (!quiet).then(|| {
             let (from, from_verified) = match verified_from {
                 Some(v) => (json!(v), true),
@@ -6585,6 +6595,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         gen_at_handoff: 0,
                         pair_key: request_pair_key(daemon, verified_from, &params),
                         submit_handed: handed,
+                        handed_at: std::time::Instant::now(),
                         input_event: (!quiet).then(|| {
                             let (from, from_verified) = match verified_from {
                                 Some(v) => (json!(v), true),

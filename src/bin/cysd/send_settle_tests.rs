@@ -1360,3 +1360,40 @@ fn r3c_queue_ttl_bounds_post_close_wait_with_pause_credit() {
     );
     assert_eq!(named(&fx2, "queue.submit_resubmitted").len(), 1);
 }
+
+/// ★(0.14.52 · S-a C7d · I10) Byte-exact accounting for a withheld Return (design 4.5): while the Return is withheld the
+/// input count is the body's bytes (the Return was never written), owned by its sender; the resubmission accepts exactly
+/// that count at the same input generation, and its Return brings the count to 0 - once. Before C7d the settlement counted
+/// the unwritten Return (count 0) so that the resubmission's "count == 0" rule would hold.
+#[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
+fn c7d_withheld_return_counts_the_body_bytes_and_is_resubmitted_once() {
+    let fx = fx("c7d-exact");
+    let t = withheld_seat(&fx, P + 190);
+    let held = t.pending_input_bytes.load(Ordering::Relaxed);
+    assert!(held > 0, "a withheld Return was counted as written: the composer holds the body, the count says {held}");
+    assert!(t.pending_input_owner().is_some(), "the withheld body is its sender's machine residue (owner stamped)");
+    paint_own_composer(&t);
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    let o = wait_submit_consumed(&t);
+    assert!(o.since_written_ms.is_some(), "the withheld Return was not resubmitted after the dialog closed: {o:?}");
+    assert_eq!(named(&fx, "queue.submit_resubmitted").len(), 1);
+    assert_eq!(t.pending_input_bytes.load(Ordering::Relaxed), 0, "the resubmitted Return ends the line");
+}
+
+/// ★(0.14.52 · S-a C7d · I10) The resubmission's count check is generation-bound: a foreign input-count write after the
+/// withheld settlement - even one that leaves the same number - means the composer is no longer known to be exactly that
+/// body, so the Return is not resubmitted.
+#[test]
+#[cfg_attr(not(unix), ignore = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)")]
+fn c7d_withheld_return_is_not_resubmitted_after_a_foreign_count_write() {
+    let fx = fx("c7d-foreign");
+    let t = withheld_seat(&fx, P + 192);
+    let held = t.pending_input_bytes.load(Ordering::Relaxed);
+    t.set_pending_input(held); // same count, new generation
+    paint_own_composer(&t);
+    crate::governance::resubmit_withheld_submits(&fx.daemon);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(settle_obs(&t).since_written_ms, None, "resubmitted over a foreign count write");
+    assert!(named(&fx, "queue.submit_resubmitted").is_empty());
+}
