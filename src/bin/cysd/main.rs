@@ -56,6 +56,7 @@ mod schedule;
 mod severity;
 mod skillrun;
 mod state;
+mod submit_assoc;
 mod teamtoken;
 mod trash;
 mod undo;
