@@ -35,8 +35,48 @@ pub enum Failure {
         os_error: Option<i32>,
     },
     Malformed(&'static str),
+    /// A birth, executable, argv, parent or process-group mismatch. This is lost
+    /// continuity evidence, not established death; consumers must not infer Dead.
     Changed,
     UnsupportedPlatform,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn identity_query_result(n: i32, expected: i32, error: Option<i32>) -> Result<(), Failure> {
+    if n == expected {
+        return Ok(());
+    }
+    if n <= 0 && error == Some(libc::ESRCH) {
+        return Err(Failure::Dead);
+    }
+    Err(Failure::Unknown {
+        stage: "proc_pidinfo",
+        os_error: if n <= 0 { error } else { None },
+    })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn argument_query_result(
+    bytes: &[u8],
+    len: usize,
+    rc: i32,
+    error: Option<i32>,
+    width: usize,
+) -> Result<Invocation, Failure> {
+    if rc != 0 {
+        // EINVAL also means access/stack/task failure, not conclusive death.
+        return Err(Failure::Unknown {
+            stage: "KERN_PROCARGS2",
+            os_error: error,
+        });
+    }
+    if len >= bytes.len() {
+        return Err(Failure::Unknown {
+            stage: "saturated arguments",
+            os_error: None,
+        });
+    }
+    parse_darwin_invocation(&bytes[..len], width)
 }
 
 /// Read an intact Darwin KERN_PROCARGS2 response. Do not skip leading NULs:
@@ -154,16 +194,10 @@ mod darwin {
                 size,
             )
         };
-        if n != size {
-            let error = (n <= 0)
-                .then(|| std::io::Error::last_os_error().raw_os_error())
-                .flatten();
-            return Err(if n <= 0 && error == Some(libc::ESRCH) {
-                Failure::Dead
-            } else {
-                unknown("proc_pidinfo", error)
-            });
-        }
+        let error = (n <= 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        identity_query_result(n, size, error)?;
         if info.pbi_pid != pid || info.pbi_start_tvsec == 0 || info.pbi_start_tvusec >= 1_000_000 {
             return Err(unknown("native identity fields", None));
         }
@@ -233,17 +267,10 @@ mod darwin {
                 0,
             )
         };
-        if rc != 0 {
-            // EINVAL also means access/stack/task failure, not conclusive death.
-            return Err(unknown(
-                "KERN_PROCARGS2",
-                std::io::Error::last_os_error().raw_os_error(),
-            ));
-        }
-        if len >= bytes.len() {
-            return Err(unknown("saturated arguments", None));
-        }
-        parse_darwin_invocation(&bytes[..len], width)
+        let error = (rc != 0)
+            .then(|| std::io::Error::last_os_error().raw_os_error())
+            .flatten();
+        argument_query_result(&bytes, len, rc, error, width)
     }
 }
 
@@ -447,5 +474,64 @@ mod tests {
         for pid in [0, u32::MAX] {
             assert_eq!(observe(pid), Err(Failure::InvalidPid));
         }
+    }
+
+    #[test]
+    fn identity_query_distinguishes_absence_denial_and_short_read() {
+        assert_eq!(
+            identity_query_result(0, 136, Some(libc::ESRCH)),
+            Err(Failure::Dead)
+        );
+        assert_eq!(
+            identity_query_result(0, 136, Some(libc::EPERM)),
+            Err(Failure::Unknown {
+                stage: "proc_pidinfo",
+                os_error: Some(libc::EPERM)
+            })
+        );
+        // A short successful call must not use stale errno as evidence of death.
+        assert_eq!(
+            identity_query_result(64, 136, Some(libc::ESRCH)),
+            Err(Failure::Unknown {
+                stage: "proc_pidinfo",
+                os_error: None
+            })
+        );
+        assert_eq!(identity_query_result(136, 136, Some(libc::EPERM)), Ok(()));
+    }
+
+    #[test]
+    fn argument_query_refuses_saturation_denial_and_truncated_returned_length() {
+        let b = blob(b"x", &[b"a"], 8);
+        assert_eq!(
+            argument_query_result(&b, b.len(), 0, None, 8),
+            Err(Failure::Unknown {
+                stage: "saturated arguments",
+                os_error: None
+            })
+        );
+        assert_eq!(
+            argument_query_result(&b, b.len() + 1, 0, None, 8),
+            Err(Failure::Unknown {
+                stage: "saturated arguments",
+                os_error: None
+            })
+        );
+        for error in [libc::EINVAL, libc::EPERM, libc::ESRCH] {
+            assert_eq!(
+                argument_query_result(&b, 14, -1, Some(error), 8),
+                Err(Failure::Unknown {
+                    stage: "KERN_PROCARGS2",
+                    os_error: Some(error)
+                })
+            );
+        }
+        assert!(argument_query_result(&b, 13, 0, None, 8).is_err());
+        assert_eq!(
+            argument_query_result(&b, 14, 0, Some(libc::EPERM), 8)
+                .unwrap()
+                .argv,
+            [b"a".to_vec()]
+        );
     }
 }
