@@ -740,6 +740,31 @@ jobs:
           CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_phoenix_c6_due.py
           CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_reap_exited_matrix.py
 
+      # S2: shipped observer and Windows refusal mapping; native spawn evidence
+      # remains separate. Full cysd is nonblocking, so this cell must be blocking.
+      - name: A-ID S2 root registration (Windows blocking)
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          s2_dir="$PWD/target/u-tmp/s2-registration-ci"
+          mkdir -p "$s2_dir/pack" "$s2_dir/state"
+          export CYS_PACK_DIR="$s2_dir/pack" CYS_STATE_DIR="$s2_dir/state"
+          s2_list="$s2_dir/tests.list"
+          cargo_filter_count() {
+            local rc=0
+            cargo test "$@" -- --list > "$s2_list.raw" 2>&1 || rc=$?
+            cat "$s2_list.raw"
+            [ "$rc" -eq 0 ] || return "$rc"
+            tr -d '\r' < "$s2_list.raw" > "$s2_list"
+            grep -q ': test$' "$s2_list"
+          }
+          cargo_filter_count --bin cysd root_registration::
+          grep -Fqx 'root_registration::tests::windows_production_wait_result_preserves_unavailable: test' "$s2_list"
+          grep -Fqx 'root_registration::tests::observes_once_with_original_child_on_both_sides_and_binds_pid: test' "$s2_list"
+          grep -Fqx 'root_registration::tests::elapsed_limit_is_post_hoc_and_inclusive: test' "$s2_list"
+          cargo test --bin cysd root_registration:: -- --test-threads=1
+
       # Q9-b: actual vendor library tests; source-body model is separate evidence.
       # This adds a bounded 6-minute cell. The native run must establish actual
       # job timing; summed step maxima are not claimed to fit the release budget.

@@ -218,6 +218,8 @@ jobs:
           #   반드시 있어야 할 필터형 실행(인자 = FILTER_RUN_RE 가 뽑는 `--lib|--bin <크레이트> <필터>`)을 등재한다. 없으면 붉다.
           FILTERED_CARGO_REQUIRED = {
               "windows-health": {
+                  "--bin cysd root_registration::":
+                      "A-ID S2 registration and Windows unavailable-result mapping must run in a blocking named-test guarded cell; full cysd and private macOS evidence are insufficient.",
                   "--bin cys-app close_surface_tests::":
                       "A-ID S6 must execute the Tauri close confirmation and attachment tests on Windows; app compilation and Bun tests do not run this backend suite.",
                   "--manifest-path vendor/portable-pty/Cargo.toml --lib --locked":
@@ -241,6 +243,12 @@ jobs:
           }
 
           Q9B_VENDOR_ARGS = "--manifest-path vendor/portable-pty/Cargo.toml --lib --locked"
+          S2_CARGO_ARGS = "--bin cysd root_registration::"
+          S2_REQUIRED_NAMES = (
+              "root_registration::tests::windows_production_wait_result_preserves_unavailable",
+              "root_registration::tests::observes_once_with_original_child_on_both_sides_and_binds_pid",
+              "root_registration::tests::elapsed_limit_is_post_hoc_and_inclusive",
+          )
           Q9B_BLOCKING_ARGS = {Q9B_VENDOR_ARGS, "--bin cysd close_auth_tests::f_try_wait_error_is_unreadable"}
           Q9B_REQUIRED_NAMES = (
               "win::q9b_tests::real_current_process_handle_reports_running",
@@ -633,7 +641,7 @@ jobs:
                           cond_err.append(f"{lane}: {path}:{i + 1} `cargo test {args} -- …` 앞에 같은 스텝의 "
                                           f"`cargo_filter_count {args}` 가 없다 — cargo 필터는 0매치도 초록이라 "
                                           f"모듈 경로가 바뀌면 이 게이트는 조용한 초록이 된다(돌지 않는 초록 금지)")
-                      if args in Q9B_BLOCKING_ARGS or args == "--bin cys-app close_surface_tests::":
+                      if args in Q9B_BLOCKING_ARGS or args in ("--bin cys-app close_surface_tests::", S2_CARGO_ARGS):
                           if code[m.end():].strip() != "--test-threads=1":
                               cond_err.append(f"{lane}: required cargo command has an unreviewed suffix (skip/ignored/error masking forbidden): {args}")
                           if step_conditions(path, "cargo test " + args + " --"):
@@ -656,6 +664,11 @@ jobs:
                               expected = "grep -Fqx '" + name + ": test' \"$q9b_list\""
                               if not any(re.sub(r"#.*$", "", lines[j]).strip() == expected for j in range(start, i)):
                                   cond_err.append(f"{lane}: Q9-b named-test guard missing before vendor execution: {name}")
+                      if args == S2_CARGO_ARGS:
+                          for name in S2_REQUIRED_NAMES:
+                              expected = "grep -Fqx '" + name + ": test' \"$s2_list\""
+                              if not any(re.sub(r"#.*$", "", lines[j]).strip() == expected for j in range(start, i)):
+                                  cond_err.append(f"{lane}: S2 named-test guard missing before observer execution: {name}")
               if runs == 0:
                   cond_err.append(f"{lane}: {path} 에 필터형 `cargo test` 실행 줄이 0건 — 핀이 잴 대상이 없다"
                                   f"(정규식·파일 구조가 바뀐 신호 · fail-closed)")

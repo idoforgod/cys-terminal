@@ -51,6 +51,7 @@ mod office_bridge;
 mod recall;
 mod reclaim;
 mod repaint;
+mod root_registration;
 mod s5_escalation;
 mod schedule;
 mod severity;

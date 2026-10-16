@@ -1663,6 +1663,8 @@ pub struct Surface {
     pub cmd: String,
     pub cwd: String,
     pub pid: u32,
+    // A-ID S2: write once before publication; never persisted or backfilled.
+    root_registration: crate::root_registration::RootRegistration,
     pub created_at: f64,
     /// ★(0.14.31 · 독립 재유도 · codex major #10) 좌석 생성의 **단조 시각** — 경과는 이 값으로만
     /// 잰다(`created_at` 은 보고·영속 전용). `Daemon.started_instant` 가 이미 세운 규약과 같다.
@@ -2089,6 +2091,12 @@ pub enum EscRecount {
 }
 
 impl Surface {
+    /// Creation observation only; strict callers must still prove current lifetime.
+    #[allow(dead_code)] // Consumed by the later S3/S4 integration.
+    pub(crate) fn registration_start(&self) -> Option<u64> {
+        self.root_registration.start_for(self.pid)
+    }
+
     /// ★(0.14.31 · 리뷰 R2 · codex blocking) 결판 대기 중인 인계를 **취소**한다(처분자 전용).
     ///
     /// 반환 = **취소하지 못한** 항목 id 들(= writer 가 이미 쓰기로 확정 = 지금 배달 중). 호출부는
@@ -6434,7 +6442,7 @@ impl Daemon {
             }
         };
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(builder)
             .map_err(|e| format!("spawn failed: {e}"))?;
@@ -6443,6 +6451,10 @@ impl Daemon {
         #[cfg(windows)]
         winjob::assign_child(pid);
         drop(pair.slave);
+
+        // Observation failure only leaves R absent. The original child stays owned
+        // here and is transferred unchanged into Surface.child below.
+        let root_registration = crate::root_registration::observe(child.as_mut(), pid);
 
         let reader = pair
             .master
@@ -6481,6 +6493,7 @@ impl Daemon {
             cmd: cmd.unwrap_or_else(|| shell.clone()),
             cwd: cwd_str,
             pid,
+            root_registration,
             created_at: now_epoch(),
             // 경과 측정 전용(§Surface.created_instant) — 벽시계 보정과 절전/복귀에 면역이다.
             created_instant: std::time::Instant::now(),
