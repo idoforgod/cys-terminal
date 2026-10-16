@@ -10,7 +10,8 @@
 //   · 끝점 수명(lifetime)은 소유권과 **별개**다 — 로스터에서 빠지면 수명이 끝나고, 다시 들어오면 새 수명이다. 옛 수명의 응답은 투영·소비 모두 버린다.
 //   · 기본(undefined)과 같은 경로를 가리키는 명시 소켓은 읽기 전용 Tauri `resolve_list_endpoints`(기존 resolve_socket)의 **그 로스터 판의 결과**로
 //     한 끝점이 된다 — 문자열 Set 은 물리 동일성의 증거가 아니다. 판정은 로스터 판에 묶이고 비행 도중 다시 계산하지 않는다.
-//     해석이 실패하거나 표현할 수 없는 항목은 종전처럼 소켓 값 그대로 보내고 '미해석'으로 보고한다(unresolved()).
+//     An entry that cannot be resolved or represented keeps its own endpoint (`raw:<socket>`) and is sent with its socket value as before;
+//     it only loses alias merging. unresolved() lists such members for tests/diagnostics — nothing is shown or logged to the user.
 // 타이머·재시도·새 주기 RPC 0 — 호출 시점은 전부 기존 3초 틱(main.ts refreshPaneTitles)이 정한다.
 
 export interface ListArrival {
@@ -254,7 +255,7 @@ export class SurfaceListTransport {
     return this.endpoints.get(endpoint)?.lifetime;
   }
 
-  /** 해석하지 못한 구성원(별칭 중복을 증명하지 못한 소켓) — 수용 로스터에서 열거·보고할 대상. */
+  /** Members that could not be resolved (alias identity not proven) — an introspection accessor; no production caller reports them. */
   unresolved(): string[] {
     return [...this.binding].filter(([, b]) => !b.resolved).map(([m]) => m);
   }

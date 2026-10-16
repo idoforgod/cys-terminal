@@ -330,7 +330,11 @@ describe("main.ts 소스 핀 — 이벤트·점검 배선(새 setInterval 0 · �
     const rec = f.indexOf('seatRolesTick.set(sk ?? "", deptLiveRoles(r.surfaces));');
     expect(rpc).toBeGreaterThan(0);
     expect(rec).toBeGreaterThan(rpc); // 목록을 **받은 뒤에만** 적는다(받지 못하면 이 줄에 닿지 않는다)
-    expect(rec).toBeGreaterThan(f.indexOf("if (!claimFlight(flightKey)) continue;")); // 진행 중 요청으로 건너뛴 소켓도 기록 없음
+    // F-01 (R3-4): the list request is sent by the activity pass; this consumer skips an endpoint whose snapshot did not arrive
+    // (in flight, timed out, failed or already consumed) before recording. The anchor must exist — indexOf -1 would make this vacuous.
+    const skip = f.indexOf("if (!got) continue;");
+    expect(skip).toBeGreaterThan(rpc);
+    expect(rec).toBeGreaterThan(skip);
     expect(rec).toBeLessThan(f.indexOf("pruneHoleUntil();")); // 소켓 루프 안
     expect(f.split("seatRolesTick.set(").length - 1).toBe(1);
     expect((f.match(/invoke\("list_surfaces"/g) ?? []).length).toBe(1); // 새 RPC 0 — 종전 호출 하나가 어차피 받는 결과를 쓴다

@@ -216,7 +216,12 @@ describe("★F-01 style.css — 무조건 깜박임 제거", () => {
       const sel = CSS.slice(0, CSS.indexOf("@media (prefers-reduced-motion")).match(new RegExp(`\\.pane \\.pane-role-dot\\.${c}[^{]*\\{([^}]*)\\}`));
       expect({ c, found: sel !== null, blinks: sel?.[1].includes("animation") ?? null }).toEqual({ c, found: true, blinks: false });
     }
-    expect(rule(".pane .pane-role-dot.act-input")).toContain("box-shadow"); // 구별되는 고정 주의 표지
+    // input wait: a distinct steady attention SHAPE in the same role colour (design R3-5) — not a warn-coloured ring.
+    const input = rule(".pane .pane-role-dot.act-input");
+    expect(input).not.toContain("var(--warn");
+    expect(input).not.toContain("background"); // keeps the base rule's role-colour fill
+    expect(input).toContain("rotate(45deg)");
+    expect(input).toContain("border-radius: 1px");
   });
   it("reduced motion: Working stops animating but keeps a distinct static work marker", () => {
     const blocks = CSS.split("@media (prefers-reduced-motion: reduce)").slice(1);
