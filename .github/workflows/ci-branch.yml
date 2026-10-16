@@ -218,6 +218,10 @@ jobs:
           #   반드시 있어야 할 필터형 실행(인자 = FILTER_RUN_RE 가 뽑는 `--lib|--bin <크레이트> <필터>`)을 등재한다. 없으면 붉다.
           FILTERED_CARGO_REQUIRED = {
               "windows-health": {
+                  "--bin cysd governance::aid_s5_tests::":
+                      "A-ID S5 shared automatic due-reap, no-effect refusals, close gate and queue/role preservation must run in a blocking Windows cell; full cysd is nonblocking.",
+                  "--bin cys aid_s5_cli_tests::":
+                      "A-ID S5 explicit-target reap-due CLI and structured result validation require a blocking Windows cell.",
                   "--bin cysd hwmon::":
                       "윈도우 실기에서 hwmon 검체(특히 맥에서는 컴파일되지 않는 비 macOS 스텁 `e2_non_macos_stub_reports_platform`)가 도는 **유일하게 보증된** 자리 — cysd 전량 스텝은 비차단이고 "
                       "이름순 실행이 그 앞 검체에서 멈추거나(1회차 두 런) 실패가 쌓여(bd0a0ca3 런 195건) hwmon 에 닿는다고 말할 수 없다.",
@@ -930,7 +934,7 @@ jobs:
                    test_refl_inject_context_role_canon test_refl_round_lock_ownership \
                    test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
                    test_refl_wakeup_expiry_attribution \
-                   test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only \
+                   test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only test_phoenix_c6_due \
                    test_phoenix_r32_restore_budget test_phoenix_encoding_default \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \
@@ -1644,7 +1648,7 @@ jobs:
                    test_refl_inject_context_role_canon test_refl_round_lock_ownership \
                    test_refl_rsi_state_ownership test_refl_stagnation_budget_ledger \
                    test_refl_wakeup_expiry_attribution \
-                   test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only \
+                   test_phoenix_fresh_honest test_phoenix_f1_production_path test_phoenix_g2_ack_only test_phoenix_c6_due test_reap_exited_matrix \
                    test_phoenix_r32_restore_budget test_phoenix_encoding_default \
                    test_report_ctx_axis test_formation_tick_visibility \
                    test_resource_gate_boot_anchor test_ctx_divergence \

@@ -6871,7 +6871,30 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         json!({"surface_id": sid, "closed": true, "cause": format!("{cause:?}")}),
                     ))
                 }
-                Err(e) => Reply::Single(err_response(&id, "not_found", &e)),
+                Err(e) => {
+                    // A failed close can retain the target (e.g. a poisoned close
+                    // gate). Only actual absence permits caller-side UI cleanup.
+                    let code = if daemon.get_surface(sid).is_none() { "not_found" } else { "close_failed" };
+                    Reply::Single(err_response(&id, code, &e))
+                }
+            }
+        }
+
+        // Automatic due-only trigger, distinct from audited manual surface.reap.
+        "surface.reap_due" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing or invalid surface_id"));
+            };
+            if params.as_object().is_none_or(|p| p.keys().any(|key| key != "surface_id")) {
+                return Reply::Single(err_response(&id, "invalid_params", "surface.reap_due accepts only surface_id"));
+            }
+            match governance::reap_surface_due(daemon, sid) {
+                governance::ReapDue::Failed { reason } => Reply::Single(err_response(&id, "reap_failed", &reason)),
+                outcome => {
+                    let mut result = serde_json::to_value(outcome).expect("reap outcome is serializable");
+                    result["surface_id"] = json!(sid);
+                    Reply::Single(ok_response(&id, result))
+                }
             }
         }
 
@@ -7059,7 +7082,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         json!({"surface_id": sid, "reaped": true, "role": target_role}),
                     ))
                 }
-                Err(e) => Reply::Single(err_response(&id, "not_found", &e)),
+                Err(e) => {
+                    let code = if daemon.get_surface(sid).is_none() { "not_found" } else { "close_failed" };
+                    Reply::Single(err_response(&id, code, &e))
+                }
             }
         }
 

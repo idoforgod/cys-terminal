@@ -1698,6 +1698,9 @@ pub struct Surface {
     pub exited: AtomicBool,
     /// 자력종료(셸 EOF) 시각 — watchdog reap의 grace 측정 기준 (exited와 함께 stamp)
     pub exited_at: Mutex<Option<Instant>>,
+    /// Serializes close preparation through removal for this incarnation only.
+    /// Acquire before daemon/queue locks; EOF queue cleanup does not take this gate.
+    pub close_operation: Mutex<()>,
     /// PTY 쓰기는 전용 writer 스레드만 수행 — async 경로는 유한 채널 try_send.
     /// 정체된 pane의 블로킹 write가 tokio 워커·watchdog을 멈추는 경로를 원천 차단한다.
     pub write_tx: std::sync::mpsc::SyncSender<WriteReq>,
@@ -6523,6 +6526,7 @@ impl Daemon {
             seat_token,
             exited: AtomicBool::new(false),
             exited_at: Mutex::new(None),
+            close_operation: Mutex::new(()),
             write_tx,
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
