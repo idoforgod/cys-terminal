@@ -839,12 +839,15 @@ fn check_agent_death_with_model(
                         // Commit ⇒ current=Some(동일 에이전트) — 신선한 2표본째를 기록한다
                         // (bin 은 같은 후보표 파생이라 통상 동일 · 표 갱신 시 신선한 쪽이 진실).
                         if let Some((agent, bin)) = current {
+                            // F-01 (U4-4): the Windows second-sample commit is a fresh display epoch.
+                            let display_write = crate::activity::IdentityWrite::begin(&s);
                             *s.agent_meta.lock().unwrap() = Some((agent.clone(), bin.clone()));
                             // 실관측 파생 arming — unix 즉시 등록 경로(claim_role 핸들러)와 동일
                             // 의미론: 허위 DEAD 과도기 없이 사망감지 상태머신을 정직하게 무장.
                             s.agent_seen.store(true, Ordering::Relaxed);
                             s.agent_exit_notified.store(false, Ordering::Relaxed);
                             *s.pending_agent_obs.lock().unwrap() = None;
+                            drop(display_write);
                             let role = s.role.lock().unwrap().clone();
                             daemon.bus.publish(
                                 "agent.observed",

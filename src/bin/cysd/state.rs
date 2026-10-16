@@ -1952,6 +1952,16 @@ pub struct Surface {
     /// (W4) 이 surface의 reader 스레드가 vt100 파서 패닉을 격리·재초기화한 누적 횟수.
     /// process_chunk_isolated가 패닉을 잡을 때마다 증가 — status(org.status)에 노출한다.
     pub parser_panics: AtomicU64,
+    /// F-01 (0.14.52) display-only identity invalidation: number of ACCEPTED identity writes in progress
+    /// (`activity::IdentityWrite`). The observer and serializer require 0. No operational reader.
+    pub activity_pending: AtomicU64,
+    /// F-01 display-only identity revision — advanced by every accepted identity write (set_meta,
+    /// confirmed re-observation, session capture/repin, accepted quiesce-on). No operational reader.
+    pub activity_identity_rev: AtomicU64,
+    /// F-01 display-only parser view revision — advanced under the parser lock by every resize
+    /// (same-size included) and parser replacement. Ordinary output never touches it (output_gen
+    /// keeps its single writer).
+    pub activity_view_rev: AtomicU64,
     /// ★G5-④(W5-A) DSR(CPR) 응답이 write 채널 포화로 유계 대기(250ms) 후에도 송신되지 못하고
     /// 드롭된 누적 횟수 — 내부 관측 카운터(wire 비노출 · status 노출은 별도 결정). try_send
     /// 즉시 드롭은 '고부하에서만 ConPTY 스톨'이라는 최악 재현 조건을 만들므로 유계 블로킹으로
@@ -3725,6 +3735,8 @@ pub struct Daemon {
     /// (W4) 전 surface reader 스레드의 vt100 파서 패닉 격리 누적 횟수(데몬 health 신호).
     /// surface별 카운터(Surface::parser_panics)의 데몬 전체 합산 — status(org.status)에 노출한다.
     pub parser_panics_total: AtomicU64,
+    /// F-01 (0.14.52) display-only activity cache (observer thread writes, surface.list reads).
+    pub activity: crate::activity::ActivityStore,
     /// CC v2 WS-A: 계정 단위 rate limit 집계 상태(뷰·신원 캐시·영속 스로틀) — accounts.rs 전담.
     pub accounts: Mutex<crate::accounts::AccountsState>,
     /// ★0.14.43(B3 · R1F-US): 좌석 설정 폴더 **현재 신원**의 60초 하한 캐시(폴더 → (확인 시각, 신원 상태)) — 좌석 신원 표(`accounts::seat_identity_view`)가 쓴다.
@@ -5587,6 +5599,7 @@ impl Daemon {
             analytics: Mutex::new(analytics_conn),
             channels: Mutex::new(channels_conn),
             parser_panics_total: AtomicU64::new(0),
+            activity: crate::activity::ActivityStore::new(),
             accounts: Mutex::new(Default::default()),
             seat_ident_cache: Mutex::new(Default::default()),
             alert_stale_held: Mutex::new(Default::default()),
@@ -6596,6 +6609,9 @@ impl Daemon {
             caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),
             osc_carry: Mutex::new(Vec::new()),
             parser_panics: AtomicU64::new(0),
+            activity_pending: AtomicU64::new(0),
+            activity_identity_rev: AtomicU64::new(0),
+            activity_view_rev: AtomicU64::new(0),
             dsr_dropped: AtomicU64::new(0),
             last_parser_panic: Mutex::new(None),
             repaint: Mutex::new(crate::repaint::RepaintState::default()),
@@ -6744,6 +6760,8 @@ impl Daemon {
                             let (resp, panicked) =
                                 process_chunk_isolated(&mut parser, chunk, dsr_count);
                             if panicked {
+                                // F-01: a replaced parser is a new view even at the same size.
+                                crate::activity::bump_view(&surf);
                                 // 재발 관측: surface별·데몬 전체 카운터 + 마지막 발생 시각(status 노출).
                                 surf.parser_panics.fetch_add(1, Ordering::Relaxed);
                                 *surf.last_parser_panic.lock().unwrap() = Some(now_epoch());

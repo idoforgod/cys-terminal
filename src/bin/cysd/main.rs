@@ -24,6 +24,7 @@ macro_rules! eprint {
 }
 
 mod accounts;
+mod activity;
 mod alert_route;
 mod alerts;
 mod analytics;
@@ -1399,6 +1400,9 @@ async fn async_main() {
     alert_route::spawn(Arc::clone(&daemon));
     usage::spawn_usage_collector(Arc::clone(&daemon));
     usage::spawn_agy_collector(Arc::clone(&daemon));
+    // F-01 (0.14.52) display-only activity observer — its own OS thread; failure leaves dots Unknown.
+    //   Rollback / OFF arm: CYS_DISPLAY_ACTIVITY=0.
+    activity::spawn_observer(Arc::clone(&daemon));
     // CC v2 WS-A: 계정 발견(프로필 스캔)+스냅샷 예열 — 관측 전에도 전 계정이 CC에 보인다.
     // 전부 fail-open(파일 부재·파싱 실패=빈 뷰) — 부트체인 비치명.
     accounts::seed_known(&daemon);
@@ -7783,6 +7787,10 @@ mod approval_a_tests;
 // ★(0.14.44 · C1·C3) 승인 Feed 쓸기·파생 칸 시험 — 테스트 전용 모듈(프로덕션 코드 0 · 파일 끝 규약은 위와 같다).
 #[cfg(test)]
 mod feed_sweep_tests;
+
+// F-01 (0.14.52) display activity observer tests — test-only module (no production code · end-of-file rule as above).
+#[cfg(test)]
+mod activity_tests;
 
 // ★(0.14.47 · 계측·관측 보강) 벤더 vt100 사본의 흐림(SGR 2) 패치 지킴이 — 테스트 전용 모듈(프로덕션 코드 0 · 파일 끝 규약은 위와 같다).
 #[cfg(test)]

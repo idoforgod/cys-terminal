@@ -511,6 +511,9 @@ fn resize_pty(s: &Surface, rows: u16, cols: u16) -> Result<(), String> {
 /// `parser_panics`·`last_parser_panic` 에 남긴다 — 리뷰 지적 #2). 그 뒤 다시 그리기가 사본을 채운다. 패닉은 `Err` 가 된다.
 fn set_parser_size(s: &Surface, rows: u16, cols: u16) -> Result<(), String> {
     let mut p = s.parser.lock().unwrap_or_else(|e| e.into_inner());
+    // F-01: every resize — same size and resize-away-and-back included — is a new display view.
+    // Bumped under the parser lock so a display sample cannot straddle it.
+    crate::activity::bump_view(s);
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.set_size(rows, cols))) {
         Ok(()) => Ok(()),
         Err(_) => {

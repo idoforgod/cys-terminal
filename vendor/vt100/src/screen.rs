@@ -80,6 +80,10 @@ pub struct Screen {
     visual_bell_count: usize,
 
     errors: usize,
+
+    // cys 패치(0.14.52 · F-01): full resets (ESC c) seen so far — survives the reset itself so a
+    // reader can tell "reset + repaint" from continuity when the final geometry/frame match.
+    resets: u64,
 }
 
 impl Screen {
@@ -107,6 +111,8 @@ impl Screen {
             visual_bell_count: 0,
 
             errors: 0,
+
+            resets: 0,
         }
     }
 
@@ -657,6 +663,12 @@ impl Screen {
         self.errors
     }
 
+    /// cys 패치(0.14.52 · F-01): number of full resets (`ESC c`) processed by this screen.
+    #[must_use]
+    pub fn reset_count(&self) -> u64 {
+        self.resets
+    }
+
     /// Returns whether the alternate screen is currently in use.
     #[must_use]
     pub fn alternate_screen(&self) -> bool {
@@ -1097,6 +1109,8 @@ impl Screen {
         let audible_bell_count = self.audible_bell_count;
         let visual_bell_count = self.visual_bell_count;
         let errors = self.errors;
+        // cys 패치(0.14.52 · F-01): count the reset and keep the count across it.
+        let resets = self.resets.saturating_add(1);
 
         *self = Self::new(self.grid.size(), self.grid.scrollback_len());
 
@@ -1105,6 +1119,7 @@ impl Screen {
         self.audible_bell_count = audible_bell_count;
         self.visual_bell_count = visual_bell_count;
         self.errors = errors;
+        self.resets = resets;
     }
 
     // ESC g

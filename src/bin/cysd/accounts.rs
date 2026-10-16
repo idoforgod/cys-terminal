@@ -6223,6 +6223,33 @@ mod tests {
             }
         }
 
+        /// B-229 (design §5 Windows differences): explicit windows=true/false resolver fixtures — the same path
+        /// disagreement is a quiet Mismatch with a null account on BOTH normalizations, while each platform's own
+        /// equality rule (ASCII case-insensitive on Windows, case-sensitive on POSIX) still decides what agrees.
+        /// Parameterised fixtures on macOS are not Windows execution; the native Windows run stays a CI cell.
+        #[test]
+        fn u229_mismatch_is_quiet_under_windows_and_posix_normalisation() {
+            let known = FolderWho::Known("acct-known".into());
+            let cases: [(bool, &str, &str); 4] = [
+                (true, r"C:\Users\x\.cys\claude-a", r"C:\Users\x\.cys\claude-b\projects\p\s.jsonl"),
+                (true, r"C:\Users\x\.cys\claude-a", "C:/Users/x/.cys/claude-b/projects/p/s.jsonl"),
+                (false, "/home/x/.cys/claude-a", "/home/x/.cys/claude-b/projects/p/s.jsonl"),
+                (false, "/home/x/.cys/Claude-a", "/home/x/.cys/claude-a/projects/p/s.jsonl"),
+            ];
+            for (windows, recorded, session) in cases {
+                let folder = resolve_seat_folder_on(Some(recorded), true, session, windows);
+                assert!(matches!(folder, SeatFolder::Mismatch { .. }), "windows={windows} {recorded} vs {session}: {folder:?}");
+                assert_eq!(folder.display_folder(), None, "windows={windows}: no display identity source");
+                let j = seat_account_json(Some("claude"), &folder, Some(&known), None);
+                assert_eq!((j["state"].as_str(), j["account_id"].is_null()), (Some("mismatch"), true), "windows={windows}: {j}");
+            }
+            // positive controls: the platform's own sameness rule still verifies the recorded folder.
+            let win_same = resolve_seat_folder_on(Some(r"C:\Users\x\.cys\CLAUDE-A"), false, r"c:\users\x\.cys\claude-a\projects\p\s.jsonl", true);
+            assert!(matches!(win_same, SeatFolder::Verified(_)), "windows case-insensitive sameness: {win_same:?}");
+            let posix_same = resolve_seat_folder_on(Some("/home/x/.cys/claude-a"), false, "/home/x/.cys/claude-a/projects/p/s.jsonl", false);
+            assert!(matches!(posix_same, SeatFolder::Verified(_)), "{posix_same:?}");
+        }
+
         /// ★(성찰 2회차 C2) 에이전트 → provider 표는 **한 정의처**다 — 사용량 귀속(`fixed_resolution`)과 좌석 `account` 키(`seat_account_json`)가 같은 provider 를 말한다
         /// (모든 알려진 별칭 · 모르는 에이전트는 둘 다 없음 · claude 는 폴더 축이라 fixed 가 없다).
         #[test]
