@@ -788,6 +788,7 @@ jobs:
           python3 "$h" --fuzz 1024 --list-mismatch 20
           # Python 측 골든 회귀(계약 대장 해석·A2 자해 회귀 핀)도 같은 레인에서 건다.
           CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_todo_decl.py
+          CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_reap_exited_matrix.py
 
       # ★유령 todo·선언 소비자 회귀(test_report_ghost) + HUD 브리지 스큐(test_hud_bridge_skew).
       #   **이 스텝이 왜 존재하는가**: 07-26 유령 집계 사고의 수정과 그 위에 얹은 선언 모델(C1)의
