@@ -469,6 +469,30 @@ mod tests {
         assert_eq!(observe(child.id()), Err(Failure::Dead));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_empty_argv0_is_preserved_without_consuming_environment() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("/bin/cat")
+            .arg0("")
+            .env_clear()
+            .env("DUMMY_ENV", "not_an_argument")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let observed = observe(child.id());
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+        let got = observed.unwrap();
+        assert_eq!(got.identity.executable, b"/bin/cat");
+        // Parsing an empty argv0 is valid; a CLI invocation matcher must still
+        // reject it as evidence for a supported adapter invocation.
+        assert_eq!(got.invocation.argv, [Vec::<u8>::new()]);
+    }
+
     #[test]
     fn invalid_pid_is_not_a_native_query() {
         for pid in [0, u32::MAX] {
