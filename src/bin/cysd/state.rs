@@ -1838,7 +1838,7 @@ pub struct Surface {
     pub agent_fg_pgid: AtomicI32,
     /// ★(0.14.43 · R1F-IN ⓐ) **잠정 Esc 면제 표식의 원자 미러**(unix) — V3 로 면제한 **사람의 단독 Esc** 가 마지막 리셋 뒤에 있었다면 **면제 당시의 PTY 전경(에이전트) 그룹 번호**, 없으면 0.
     /// 진실은 leaf 상태 `PendingInputState::esc_exempt_pgid` 이고 이것은 틱이 락 없이 미리 보는 용도다 — 쓰는 곳은 모두 `pending_input` leaf 를 쥔 채다(`apply_pending_input` · `clear_pending_input` ·
-    /// `take_esc_exempt` · `restore_esc_exempt` · `recount_exempted_esc` · 스케줄 인계 계상 `schedule::inject_on`). 틱은 이 값이 0 이 아닌 좌석에서만 지금의 전경 그룹을 커널에 물어(`tcgetpgrp`) 면제 당시의
+    /// `take_esc_exempt` · `restore_esc_exempt` · `recount_exempted_esc` · 스케줄 push 정산 계상 `schedule::ScheduleSettle::reset_submitted_line` · S-a C6a). 틱은 이 값이 0 이 아닌 좌석에서만 지금의 전경 그룹을 커널에 물어(`tcgetpgrp`) 면제 당시의
     /// 그룹이 아니면 되돌린다(`governance::esc_recount_due`). 휘발.
     #[cfg(unix)]
     pub esc_exempt_pgid: AtomicI32,

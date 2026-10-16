@@ -7248,7 +7248,7 @@ pub(crate) struct PendingInputState {
     /// 같은 호출에서 모델 판정에 쓴 전경 값으로 바꿔 적는다(저장 상태에는 임시 값이 남지 않는다 · 전경을 모르는 비-unix 는 0).
     /// 서는 곳은 [`pending_input_step_model`] 의 V3 면제 갈래에서 `사람 출처 ∧ 단독 Esc` 일 때뿐이다(BS/DEL·기계 출처 Esc·V2 는 세우지 않는다 — V2 는 Esc 를 계수에 더한다).
     /// 내려가는 곳: 같은 함수의 리셋(봉투 밖 `\n`·`\r`(Meta-Enter 제외)·0x15·0x03 — 출처 무관) · `Surface::clear_pending_input`(Default — 큐 직접 send `clear_first`·stale 리셋) ·
-    /// 줄이 비었다/제출됐다고 계상하는 인계(`Surface::take_esc_exempt` — 큐 인계 · 스케줄 push 인계 `inject_on`; 롤백은 직전 값을 복원) · 틱의 되돌리기(`Surface::recount_exempted_esc`).
+    /// 줄이 비었다/제출됐다고 계상하는 인계(`Surface::take_esc_exempt` — 큐 인계 · 스케줄 push 정산 `ScheduleSettle::reset_submitted_line` (0.14.52 S-a C6a: after the written Return); 롤백은 직전 값을 복원) · 틱의 되돌리기(`Surface::recount_exempted_esc`).
     /// 왜 두나: 면제는 "에이전트 TUI 가 그 Esc 를 읽는다"는 전제 위에 있다 — 에이전트가 읽지 않은 채 전경에서 사라지면 셸 줄 편집기가 그 Esc 를 받아 다음 주입의 첫 글자가 먹힌다(적대 검증 M-1 ⓐ).
     /// 틱은 이 표식이 서 있는 좌석의 지금 전경 그룹이 면제 당시 그룹이 아닌 것을 커널에 물어 보면 계수를 1 로 되돌린다(감산이 아니라 가산 정정 · [`esc_recount_due`]).
     /// 원자 미러는 `Surface::esc_exempt_pgid`(unix · 진실은 이 필드).
@@ -18211,7 +18211,7 @@ mod tests {
     /// 핀 I20(리셋 경로 전수 · 소스 핀) — 입력줄 계수를 바꾸는 호출처가 **알려진 목록**과 정확히 같다: `set_pending_input(`·`clear_pending_input(`·`apply_pending_input(` 의 생산 코드 호출 수.
     /// 새 호출처가 생기면(= 줄을 비었다/제출됐다고 계상하는 새 경로) 이 핀이 적색이 되어 **면제 표식(`esc_exempt_pgid`)을 내릴지 정하게** 한다 — 한 곳이라도 빠지면 죽은 좌석에 헛 계수가 선다.
     /// 목록: ① `apply_pending_input` — 직접 send(`send_text`)·`send_key`·보류 CR 재제출(스텝의 리셋이 표식을 내린다) ② `clear_pending_input` — 큐 직접 send `clear_first`·stale 리셋(Default) ③ `set_pending_input` —
-    /// 큐 인계(`take_esc_exempt` 가 내린다)·롤백(`restore_esc_exempt`)·스케줄 push 인계(`inject_on` 이 leaf 에서 내린다) + 상태 내부(apply·clear·recount).
+    /// 큐 인계(`take_esc_exempt` 가 내린다)·롤백(`restore_esc_exempt`)·스케줄 push 정산(`ScheduleSettle::reset_submitted_line` 이 leaf 에서 내린다 · S-a C6a) + 상태 내부(apply·clear·recount).
     /// ★(0.14.52 · S-a) + 큐 인계의 writer 채널 실패 되돌림(`restore_esc_exempt`) · 부분 쓰기 보류의 접수 접두 계수(`restore_esc_exempt` — 줄이 제출되지 않았다).
     #[test]
     fn r1f_in_reset_path_census_source_pin() {
@@ -18236,7 +18236,10 @@ mod tests {
             // ★(0.14.52 · S-a C5b) +1 clear, +1 apply: the direct agent write's settlement (`DirectSettle::run`) applies the
             //   SAME clear-first reset / accepted-bytes step the handler applied at hand-off - moved to after the terminal.
             ("handlers", 0, 2, 3),
-            ("schedule", 1, 0, 0),
+            // ★(0.14.52 · S-a C6a) the set (count reset) moved into the push settlement after the written Return; +1 apply: a push
+            //   stopped before its Return counts its accepted prefix as machine input (`ScheduleSettle::count_prefix`) - the line was
+            //   NOT submitted, so the exempt marker is not lowered (same rule as the queue's partial-write prefix).
+            ("schedule", 1, 0, 1),
             ("state", 4, 1, 1),
             ("channels", 0, 0, 0),
         ];
@@ -18284,10 +18287,11 @@ mod tests {
         );
         assert!(gov.contains("s.restore_esc_exempt(f.prev_esc_exempt_pgid);"), "롤백이 표식을 되살린다");
         let sch = prod(include_str!("schedule.rs"));
-        let inject_on = &sch[sch.find("\nfn inject_on(").expect("inject_on")..];
-        let inject_on = &inject_on[..inject_on.find("\n}\n").expect("끝")];
-        assert!(inject_on.contains("st.esc_exempt_pgid = 0;"), "스케줄 push 인계가 leaf 에서 표식을 내린다");
-        assert!(inject_on.contains("surface.esc_exempt_pgid.store(0,"), "스케줄 push 인계가 미러도 내린다");
+        // ★(0.14.52 · S-a C6a) the schedule count reset (and its marker drop) runs in the push settlement after the written Return.
+        let inject_on = &sch[sch.find("\n    fn reset_submitted_line(").expect("reset_submitted_line")..];
+        let inject_on = &inject_on[..inject_on.find("\n    }\n").expect("끝")];
+        assert!(inject_on.contains("st.esc_exempt_pgid = 0;"), "스케줄 push 정산이 leaf 에서 표식을 내린다");
+        assert!(inject_on.contains("surface.esc_exempt_pgid.store(0,"), "스케줄 push 정산이 미러도 내린다");
         // stale 리셋·clear_first 는 `clear_pending_input`(Default)이다 — 그 함수가 표식 leaf·미러를 모두 내린다.
         let st = include_str!("state.rs");
         let clear = &st[st.find("pub fn clear_pending_input(").expect("clear")..];
@@ -29848,7 +29852,8 @@ mod h_machine_hold_tests {
         // 판정 → 주입 순서(설계 H2~H5 에서 켠다): (파일, 판정이 사는 함수, 판정 토큰, 주입 토큰).
         let order: Vec<(&str, &str, &str, &str, &str)> = vec![
             // H2 — 스케줄 직접 push: 하드축 판정이 직접 주입보다 앞.
-            ("schedule", include_str!("schedule.rs"), "deliver_push", "machine_direct_hold(", "inject_on(daemon, &surface, text)"),
+            //   ★(0.14.52 · S-a C6a) the push path is `deliver_push_with` (the fire task then waits for the writer's verdict).
+            ("schedule", include_str!("schedule.rs"), "deliver_push_with", "machine_direct_hold(", "inject_on(daemon, &surface, text, Some(origin))"),
             // H3 — 채널 inbox: 하드축 재확인(master_hold) → 기록 선행(UPDATE) → 주입.
             ("channels", include_str!("channels.rs"), "master_hold", "deliverable_master(daemon) != Some(sid)", "machine_direct_hold("),
             ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "master_hold(", "SET state='injected'"),
