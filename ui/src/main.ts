@@ -478,6 +478,8 @@ interface PaneRuntime {
   observer: ResizeObserver;
   // 바닥 고정 재적용 — 리사이즈(fitPane) 뒤 뷰포트가 바닥에서 밀려나면 복귀시킨다.
   snapToBottom: () => void;
+  // ★B-230(0.14.52 · U) 읽던 줄 보존 — fitPane 이 폭을 바꾸는 리플로우를 이 안에서 일으킨다(위를 읽는 중일 때만 작동).
+  keepReadingLine: (change: () => void) => void;
   // 마지막 PTY 출력 시각(ms) — 경로 주입의 스트리밍 가드(ftdrop.isStreaming)가 읽는다.
   lastOutputAt: () => number;
   // IME 조합 pending 여부 — 조합 중 주입의 순서 역전(자모 뒤섞임) 차단.
@@ -3387,6 +3389,24 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   const snapToBottom = () => {
     if (follow && !atBottom()) term.scrollToBottom();
   };
+  // ★B-230(0.14.52 · U · FT-6): 폭이 바뀌는 리플로우에서 xterm 은 화면 위치를 **절대 행 번호**(viewportY)로 남긴다 — 줄이 두 행으로 접히면
+  //   같은 행 번호가 훨씬 오래된 글을 가리킨다(실측: L0646 을 읽다 분할 한 번에 L0324 · 휠 없음). 위를 읽는 중(follow=false)이면 화면 맨 위
+  //   **논리 줄**(접힘을 푼 한 줄)의 첫 행에 마커를 꽂고, 리플로우 뒤 그 줄로 돌아간다 — 마커는 xterm 이 리플로우·잘림 때 함께 옮긴다(잘려
+  //   나가 폐기됐으면 손대지 않는다). 바닥 고정(follow=true)은 종전대로 fitPane 의 snapToBottom 몫이고, 대체 화면은 앱이 제 역사를 가지므로 건드리지 않는다.
+  const keepReadingLine = (change: () => void) => {
+    const b = term.buffer.active;
+    if (follow || b.type !== "normal") return change();
+    let top = b.viewportY;
+    while (top > 0 && b.getLine(top)?.isWrapped) top--;
+    const cols = term.cols;
+    const marker = term.registerMarker(top - (b.baseY + b.cursorY));
+    try {
+      change();
+    } finally {
+      if (term.cols !== cols && !marker.isDisposed && marker.line >= 0) term.scrollToLine(marker.line);
+      marker.dispose();
+    }
+  };
   termHost.addEventListener(
     "wheel",
     (e: WheelEvent) => {
@@ -3851,7 +3871,7 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
   // ★cancelSendFail 을 **맨 앞**에 둔다: destroyPaneRuntime 의 forEach 는 앞 항목이 던지면
   //  뒤를 실행하지 못하므로, 뒤에 두면 un1/un2 가 던졌을 때 예약된 토스트가 죽은 pane 이름으로
   //  최대 3초 뒤 떠버린다. 순서 외의 의미는 없다(세 훅은 서로 독립).
-  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [cancelSendFail, un1, un2], observer, snapToBottom, lastOutputAt: () => outStamp.t, imeBusy: () => imeState.pending !== "", trackFilter };
+  const rt: PaneRuntime = { sid, socket, el, termHost, roleEl, titleEl, usageEl, term, fit, unlisten: [cancelSendFail, un1, un2], observer, snapToBottom, keepReadingLine, lastOutputAt: () => outStamp.t, imeBusy: () => imeState.pending !== "", trackFilter };
   panes.set(paneKey(sid, socket), rt);
   return rt;
 }
@@ -3859,9 +3879,23 @@ async function makePane(sid: number, title: string, socket?: string): Promise<Pa
 /// Fit only when actually laid out — a detached/hidden pane must not shrink the PTY.
 function fitPane(rt: PaneRuntime) {
   if (rt.termHost.offsetWidth < 60 || rt.termHost.offsetHeight < 40) return;
-  rt.fit.fit();
+  rt.keepReadingLine(() => rt.fit.fit()); // ★B-230: 위를 읽던 사람은 폭 리플로우 뒤에도 읽던 줄에 남는다(keepReadingLine)
   rt.snapToBottom(); // 리사이즈 리플로우가 뷰포트를 바닥에서 밀어내는 경우 복귀
   invoke("resize_surface", { socket: rt.socket, surfaceId: rt.sid, rows: rt.term.rows, cols: rt.term.cols }).catch(() => {});
+}
+
+/// ★B-230(0.14.52 · U · H1): render() 는 보이는 pane 호스트를 전부 떼었다 다시 붙인다. WebKit 은 다시 붙인 `.xterm-viewport` 의 스크롤 위치를
+///   0 으로 되돌리는데 xterm 은 제 위치(viewportY)를 그대로 갖고, 자기 캐시 값이 바뀔 때만 DOM 을 다시 맞춘다(xterm 5.5.0 Viewport.syncScrollArea).
+///   그래서 크기가 같은 render 뒤에는 아무것도 고쳐지지 않았고, 다음 아래쪽 휠 한 칸(트랙패드 +1px 도)이 0 에서 계산돼 **첫 대화로 점프**했다
+///   (B230-REPRO-REPORT · P0·P1 5/5). 한 행 갔다 오는 스크롤은 xterm 이 **자기** 갱신을 돌리게 하는 공개 API 길이다 — 위치는 xterm 의 지금
+///   모델에서 다시 나오고(저장해 둔 옛 오프셋을 되살리지 않는다), 떠나 있던 동안 쌓인 출력도 그 모델에 이미 들어 있다. 한 태스크 안이라 중간
+///   화면은 그려지지 않는다. 스크롤백이 없으면(대체 화면 포함) 할 일이 없다.
+function resyncViewport(term: Terminal) {
+  const b = term.buffer.active;
+  if (b.baseY <= 0) return;
+  const step = b.viewportY > 0 ? -1 : 1;
+  term.scrollLines(step);
+  term.scrollLines(-step);
 }
 
 function destroyPaneRuntime(sid: number, socket?: string) {
@@ -4503,6 +4537,11 @@ function render() {
   else if (ws?.pending) root.appendChild(renderDeptPending(ws)); // WP-10: 부서 준비 중 빈 pane 스피너·안내(★0.14.43 GU: 경과·단계 문구)
   else if (ws) root.appendChild(renderIdleWorkspace(ws)); // pane 0개 — 백지 대신 안내+손잡이
   renderWsTabs();
+  // ★B-230(H1): 방금 다시 붙인 pane 의 뷰포트를 xterm 의 지금 위치에 다시 맞춘다(resyncViewport) — 크기가 같아 아래 fit 이 아무것도 안 할 때도.
+  for (const sid of collectSids(current()?.tree ?? null)) {
+    const rt = panes.get(paneKey(sid, current()?.socket));
+    if (rt?.el.isConnected) resyncViewport(rt.term);
+  }
   requestAnimationFrame(() => {
     for (const sid of collectSids(current()?.tree ?? null)) {
       const rt = panes.get(paneKey(sid, current()?.socket));
