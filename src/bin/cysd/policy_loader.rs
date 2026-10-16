@@ -115,6 +115,8 @@ pub struct FrozenContract {
 pub struct Catalog {
     entries: BTreeMap<String, FrozenContract>,
     rejected: BTreeMap<String, LoadError>,
+    disk_schema: Option<Value>,
+    embedded_schema: Option<Value>,
 }
 
 impl Catalog {
@@ -155,7 +157,8 @@ pub fn load_catalog(
     let names: BTreeSet<String> = disk.as_object().into_iter().flat_map(|o| o.keys())
         .chain(embedded.as_object().into_iter().flat_map(|o| o.keys()))
         .filter(|name| !name.starts_with('_')).cloned().collect();
-    let mut catalog = Catalog { entries: BTreeMap::new(), rejected: BTreeMap::new() };
+    let mut catalog = Catalog { entries: BTreeMap::new(), rejected: BTreeMap::new(),
+        disk_schema:disk.get("_schema").cloned(),embedded_schema:embedded.get("_schema").cloned() };
     for adapter in names {
         let loaded = load_one(
             &adapter, disk, embedded, &disk_candidates, &embedded_candidates,
@@ -408,6 +411,104 @@ fn raw_config_digest(value: &Value) -> String {
     // Despite its name, this helper performs RAW SHA-256 on supplied bytes; it does not normalize.
     // Do not replace with digest_text(), which collapses whitespace even inside JSON strings.
     cys::mission_gate::digest_normalized(&canonical)
+}
+
+// Explicit private serialization only. Catalog/FrozenContract/FrozenPolicy themselves do not
+// implement Serialize or Debug, so an ordinary event cannot accidentally expose their contents.
+#[derive(serde::Serialize)]
+struct PrivateRecipe<'a> {
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supported: Option<&'a Recipe>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unsupported: Option<&'static str>,
+}
+fn private_recipe(recipe:&NativeRecipe)->PrivateRecipe<'_> {
+    match recipe {
+        NativeRecipe::Supported(recipe)=>PrivateRecipe { kind:"supported",supported:Some(recipe),unsupported:None },
+        NativeRecipe::Unsupported(gap)=>PrivateRecipe { kind:"unsupported",supported:None,unsupported:Some(match gap {
+            RecipeGap::UnclosedQuote=>"unclosed_quote",RecipeGap::ShellSyntax=>"shell_syntax",
+            RecipeGap::PlatformQuoting=>"platform_quoting",RecipeGap::MissingExecutable=>"missing_executable",
+            RecipeGap::AssignmentProvenance=>"assignment_provenance",RecipeGap::LiteralPosixBackslash=>"literal_posix_backslash",
+            RecipeGap::UnsupportedInterpreter=>"unsupported_interpreter",RecipeGap::MissingScript=>"missing_script",
+        }) },
+    }
+}
+#[derive(serde::Serialize)]
+struct PrivatePolicy<'a> {
+    policy_epoch:u64,declaration:&'a str,config_digest:&'a str,adapter:&'a str,
+    recipe:PrivateRecipe<'a>,origin:RegistrationOrigin,class:ProofClass,weak_risk:Option<WeakRisk>,
+}
+#[derive(serde::Serialize)]
+struct PrivateContract<'a> {
+    policy:PrivatePolicy<'a>,declaration_source:&'static str,
+    launch_env_pairs:&'a [(String,String)],effective_launch_spec:&'a Value,
+    launch_prompt_markers:&'a [String],launch_composer_placeholder:Option<&'a str>,
+    receiver_prompt_markers:Option<&'a [String]>,receiver_composer_placeholder:Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_record:Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedded_record:Option<&'a Value>,
+    legacy_class_notices:Vec<ProofClass>,
+}
+#[derive(serde::Serialize)]
+struct PrivateRejection<'a> { adapter:&'a str,kind:&'static str,referred_adapter:Option<&'a str> }
+fn private_rejection<'a>(adapter:&'a str,error:&'a LoadError)->PrivateRejection<'a> {
+    let (kind,referred_adapter)=match error {
+        LoadError::MissingDiskDocument=>("missing_disk_document",None),
+        LoadError::MissingAdapter=>("missing_adapter",None),
+        LoadError::MissingDeclaration { adapter }=>("missing_declaration",Some(adapter.as_str())),
+        LoadError::MissingEmbeddedBuiltin { adapter }=>("missing_embedded_builtin",Some(adapter.as_str())),
+        LoadError::MissingEffectiveCommand { adapter }=>("missing_effective_command",Some(adapter.as_str())),
+    };
+    PrivateRejection { adapter,kind,referred_adapter }
+}
+#[derive(serde::Serialize)]
+struct PrivateCatalog<'a> {
+    schema:&'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disk_schema:Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    embedded_schema:Option<&'a Value>,
+    entries:Vec<PrivateContract<'a>>,rejected:Vec<PrivateRejection<'a>>,
+}
+#[derive(serde::Serialize)]
+struct PrivateIdentityEntry<'a> {
+    adapter:&'a str,config_digest:&'a str,declaration:&'a str,recipe:PrivateRecipe<'a>,
+    class:ProofClass,weak_risk:Option<WeakRisk>,
+}
+#[derive(serde::Serialize)]
+struct PrivateCatalogIdentity<'a> {
+    schema:&'static str,entries:Vec<PrivateIdentityEntry<'a>>,rejected:Vec<PrivateRejection<'a>>,
+}
+impl Catalog {
+    pub(crate) fn declaration_count(&self)->usize { self.entries.len().saturating_add(self.rejected.len()) }
+    /// Exact frozen private values, including Unsupported recipes. Use a bounded serializer
+    /// owned by the persistence layer. This data is never an executable recovered capability.
+    pub(crate) fn for_private_persistence(&self)->impl serde::Serialize + '_ {
+        PrivateCatalog { schema:"cys-receiver-catalog-v1",disk_schema:self.disk_schema.as_ref(),
+            embedded_schema:self.embedded_schema.as_ref(),entries:self.entries.values().map(|c| {
+                let p=&c.policy;
+                PrivateContract { policy:PrivatePolicy { policy_epoch:p.policy_epoch,declaration:&p.declaration,
+                    config_digest:&p.config_digest,adapter:&p.adapter,recipe:private_recipe(&p.recipe),
+                    origin:p.origin,class:p.class,weak_risk:p.weak_risk },
+                    declaration_source:match c.declaration_source { DeclarationSource::Disk=>"disk",DeclarationSource::Embedded=>"embedded" },
+                    launch_env_pairs:&c.launch_env_pairs,effective_launch_spec:&c.effective_launch_spec,
+                    launch_prompt_markers:&c.launch_prompt_markers,launch_composer_placeholder:c.launch_composer_placeholder.as_deref(),
+                    receiver_prompt_markers:c.receiver_prompt_markers.as_deref(),receiver_composer_placeholder:c.receiver_composer_placeholder.as_deref(),
+                    disk_record:c.disk_record.as_ref(),embedded_record:c.embedded_record.as_ref(),
+                    legacy_class_notices:c.notices.iter().map(|n| match n { DeclarationNotice::ChangedBuiltinCommand { legacy_class }=>*legacy_class }).collect() }
+            }).collect(),rejected:self.rejected.iter().map(|(a,e)|private_rejection(a,e)).collect() }
+    }
+    /// Private identity input for same-contract registration coalescing. Epoch and origin are
+    /// deliberately excluded, just as ReceiverCell::register_known preserves them on a no-op.
+    /// This view still contains private declaration/recipe values; hash it, never publish it.
+    pub(crate) fn private_contract_identity(&self)->impl serde::Serialize + '_ {
+        PrivateCatalogIdentity { schema:"cys-receiver-catalog-contract-v1",entries:self.entries.values().map(|c| {
+            let p=&c.policy;PrivateIdentityEntry { adapter:&p.adapter,config_digest:&p.config_digest,
+                declaration:&p.declaration,recipe:private_recipe(&p.recipe),class:p.class,weak_risk:p.weak_risk }
+        }).collect(),rejected:self.rejected.iter().map(|(a,e)|private_rejection(a,e)).collect() }
+    }
 }
 
 #[cfg(test)]
@@ -690,5 +791,86 @@ mod tests {
         assert_eq!(crate::receiver::match_slot(&recipe,&invocation("node",&["node","/agents/a.js"])),None);
         let recipe=c.get(Some("custom")).unwrap().policy.native_policy().unwrap().recipe;
         assert_eq!(crate::receiver::match_slot(&recipe,&invocation("node",&["","/agents/a.js"])),None);
+    }
+
+    #[test]
+    fn c8archive_private_image_reconstructs_eligible_contract_inputs() {
+        let disk=json!({"_schema":17,"custom":{"cmd":"python /agents/a.py",
+            "env":{"TOKEN":"SYNTHETIC_ARCHIVE_PRIVATE_VALUE"},"prompt_marker":null}});
+        let embedded=json!({"_schema":23,"claude":{"cmd":"claude --dangerously-skip-permissions","prompt_marker":"prompt"}});
+        let c=catalog(&disk,&embedded);
+        let image=serde_json::to_value(c.for_private_persistence()).unwrap();
+        assert_eq!(image["schema"],"cys-receiver-catalog-v1");
+        assert_eq!(image["entries"].as_array().unwrap().len(),c.entries().count(),
+            "private archive must retain unsupported declarations");
+        let mut restored_disk=json!({});let mut restored_embedded=json!({});
+        for (key,dest) in [("disk_schema",&mut restored_disk),("embedded_schema",&mut restored_embedded)] {
+            if let Some(value)=image.get(key) { dest["_schema"]=value.clone(); }
+        }
+        for entry in image["entries"].as_array().unwrap() {
+            let adapter=entry["policy"]["adapter"].as_str().unwrap();
+            if let Some(record)=entry.get("disk_record") { restored_disk[adapter]=record.clone(); }
+            if let Some(record)=entry.get("embedded_record") { restored_embedded[adapter]=record.clone(); }
+        }
+        let restored=catalog(&restored_disk,&restored_embedded);
+        for (adapter,entry) in c.entries() {
+            let other=restored.get(Some(adapter)).unwrap();
+            assert_eq!(other.policy.config_digest,entry.policy.config_digest,
+                "archive omitted an input needed to reconstruct the frozen contract");
+            assert_eq!(other.policy.declaration,entry.policy.declaration);
+            assert_eq!(other.launch_env_pairs,entry.launch_env_pairs);
+            assert!(!serde_json::to_string(&entry.policy.public_summary()).unwrap().contains("SYNTHETIC_ARCHIVE_PRIVATE_VALUE"));
+        }
+        let custom=image["entries"].as_array().unwrap().iter().find(|e|e["policy"]["adapter"]=="custom").unwrap();
+        assert_eq!(custom["policy"]["recipe"]["kind"],"unsupported");
+        assert_eq!(custom["policy"]["recipe"]["unsupported"],"unsupported_interpreter");
+        assert_eq!(custom["launch_env_pairs"][0][1],"SYNTHETIC_ARCHIVE_PRIVATE_VALUE");
+        assert!(c.get(Some("custom")).unwrap().policy.native_policy().is_none());
+    }
+
+    #[test]
+    fn c8archive_contract_identity_excludes_lifecycle_but_preserves_configuration_and_class() {
+        let disk=json!({"claude":{"cmd":"claude --dangerously-skip-permissions","env":{"A":"one"}}});
+        let embedded=embed();
+        let a=load_catalog(Some(&disk),&embedded,1,RegistrationOrigin::ClaimRole,true).unwrap();
+        let b=load_catalog(Some(&disk),&embedded,99,RegistrationOrigin::Reclaim,true).unwrap();
+        let identity=|c:&Catalog|serde_json::to_vec(&c.private_contract_identity()).unwrap();
+        assert_eq!(identity(&a),identity(&b),"same contract registration must not be changed by origin/epoch alone");
+        assert_ne!(serde_json::to_vec(&a.for_private_persistence()).unwrap(),serde_json::to_vec(&b.for_private_persistence()).unwrap(),
+            "the private image must still retain actual captured origin and epoch");
+        let mut changed=disk.clone();changed["claude"]["env"]["A"]=json!("two");
+        assert_ne!(identity(&a),identity(&catalog(&changed,&embedded)),"environment changes are part of contract identity");
+        let weak=load_catalog(Some(&disk),&embedded,1,RegistrationOrigin::ClaimRole,false).unwrap();
+        assert_ne!(identity(&a),identity(&weak),"proof class must remain in contract identity");
+    }
+
+    #[test]
+    fn c8archive_private_encoding_obeys_the_callers_byte_limit() {
+        struct Limited { used:usize,limit:usize }
+        impl std::io::Write for Limited {
+            fn write(&mut self,bytes:&[u8])->std::io::Result<usize> {
+                if bytes.len()>self.limit-self.used { return Err(std::io::Error::other("fixture archive cap")); }
+                self.used+=bytes.len();Ok(bytes.len())
+            }
+            fn flush(&mut self)->std::io::Result<()> { Ok(()) }
+        }
+        let disk=json!({"custom":{"cmd":"custom-agent","env":{"LARGE":"x".repeat(50000)}}});
+        let c=catalog(&disk,&json!({}));let mut out=Limited { used:0,limit:64 };
+        assert!(serde_json::to_writer(&mut out,&c.for_private_persistence()).is_err(),"oversized private catalog must not report successful bounded encoding");
+        assert!(out.used<=out.limit);
+    }
+
+    #[test]
+    fn c8archive_schema_absence_null_and_rejected_names_remain_distinct_data() {
+        let absent=catalog(&json!({}),&embed());
+        let null=catalog(&json!({"_schema":null}),&embed());
+        assert!(serde_json::to_value(absent.for_private_persistence()).unwrap().get("disk_schema").is_none());
+        assert_eq!(serde_json::to_value(null.for_private_persistence()).unwrap().get("disk_schema"),Some(&Value::Null));
+        let rejected=catalog(&json!({"bad":{"cmd":null}}),&json!({}));
+        assert_eq!(rejected.declaration_count(),1);
+        let image=serde_json::to_value(rejected.for_private_persistence()).unwrap();
+        assert_eq!(image["entries"],json!([]));
+        assert_eq!(image["rejected"][0]["adapter"],"bad");
+        assert_eq!(image["rejected"][0]["kind"],"missing_effective_command");
     }
 }
