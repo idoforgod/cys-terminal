@@ -3363,17 +3363,7 @@ fn surface_agent_in(rows: &[Value], sid: u64) -> Option<String> {
 
 /// 화면의 마지막 비공백 줄 `n` 개(진단 문안 전용). 보류 처방·에러 본문이 공유한다 — 이 계산을
 /// 호출부마다 다시 쓰면 "어떤 경로에서 보고된 꼬리인가"에 따라 길이·필터가 갈린다.
-fn screen_tail_lines(screen: &str, n: usize) -> String {
-    let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
-    lines
-        .iter()
-        .rev()
-        .take(n)
-        .rev()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n")
-}
+use cys::terminal_screen::screen_tail_lines;
 
 /// pane 의 현재 화면(vt100 그리드) 관측. `None` = **관측 실패**(RPC 실패·응답 스키마 스큐).
 ///
@@ -14051,23 +14041,7 @@ fn compose_directive(role: &str) -> Result<String, String> {
 /// 돌릴 수 있어야 한다. **OS 게이트는 호출부**(`screen_tail_is_shell_prompt_on`)에 있다:
 /// mac/Linux pane 의 워커가 Windows 안내문(`PS C:\Users\x>`)을 마지막 비공백 줄로 출력하면
 /// 건강한 pane 이 '죽은 셸' 로 오판돼 롤백 close 대상이 되기 때문이다(U-9 × 호출부 상호작용).
-fn windows_shell_prompt_shape(t: &str) -> bool {
-    let Some(body) = t.strip_suffix('>') else {
-        return false;
-    };
-    // ① PowerShell: `PS <위치>>` — 파일시스템/레지스트리/Env 공급자 공통, 축약 `PS>` 포함.
-    //    연속행 프롬프트 `PS C:\x>>` 도 body 가 `PS …>` 라 여기서 참이 된다(프롬프트 맞다).
-    if body == "PS" || body.starts_with("PS ") {
-        return true;
-    }
-    // ② cmd.exe: `<드라이브문자>:\<경로>>` — `C:\>` · `C:\Users\x>` · `D:\work\cys>`.
-    //    콜론+역슬래시까지 요구해 "3 > 2 이므로 a > b>" 류 산문을 배제한다.
-    let mut it = body.chars();
-    matches!(
-        (it.next(), it.next(), it.next()),
-        (Some(d), Some(':'), Some('\\')) if d.is_ascii_alphabetic()
-    )
-}
+use cys::terminal_screen::windows_shell_prompt_shape;
 
 /// 화면 마지막 비공백 줄이 셸 프롬프트로 끝나는지 판정 — marker 없는 에이전트의 시간 폴백
 /// 직전 검사다. TUI가 떴다면 끝줄이 셸 프롬프트일 수 없다; 셸 프롬프트가 남아 있으면
@@ -14090,23 +14064,7 @@ fn screen_tail_is_shell_prompt(text: &str) -> bool {
 /// 얼마든지 그릴 수 있다. 그래서 판정은 "형태 ∧ 실제 Windows" 로만 참이 된다.
 /// Unix 종결자 4종(`% $ # ❯`)은 게이트하지 않는다: Windows 콘솔에도 git-bash·WSL 프롬프트가
 /// 뜰 수 있어 가두면 그쪽에서 오부정(죽은 셸에 주입)이 생긴다 — 위험 방향이 반대다.
-fn screen_tail_is_shell_prompt_on(text: &str, windows: bool) -> bool {
-    let Some(last) = text.lines().rev().find(|l| !l.trim().is_empty()) else {
-        return false; // 화면 비어 있음 — 판단 보류(시간 폴백 유지)
-    };
-    let t = last.trim_end();
-    // zsh "...%" / bash·sh "...$" / root "#" / powerlevel10k·starship "❯" —
-    // 끝문자 기준(프롬프트 커스텀의 공통 꼬리). 오탐 효과는 '대기 후 명시 Err'(안전측).
-    // Windows(PowerShell `PS C:\…>` · cmd `C:\>`)는 `>` 로 끝나므로 형태 요건과 함께 추가한다
-    // (T-D4 / F4-cys-boot-launch-06 — 이게 빠져 Windows 에서 marker 없는 어댑터의 시간 폴백이
-    // 죽은 PowerShell 을 ready 로 선언하고 54KB 디렉티브를 셸 명령으로 제출했다).
-    // 판정 축은 그대로다 — '마지막 비공백 줄의 끝문자' 규칙을 유지한 채 종결자만 늘렸다.
-    t.ends_with('%')
-        || t.ends_with('$')
-        || t.ends_with('#')
-        || t.ends_with('❯')
-        || (windows && windows_shell_prompt_shape(t))
-}
+use cys::terminal_screen::screen_tail_is_shell_prompt_on;
 
 /// TUI 렌더 증거 문면 — **살아 있는 대화형 위젯**이 화면에 있음을 뜻하는 실측 문자열.
 ///
@@ -14134,7 +14092,7 @@ fn screen_tail_is_shell_prompt_on(text: &str, windows: bool) -> bool {
 /// ★관문 문면을 판정에 쓰는 자리는 이제 **관문 축 하나**(`readiness::gate_on_screen` ·
 ///   `first_run_gates` 코퍼스)다 — 같은 문자열이 '관문이다' 와 '살아있다' 를 동시에 뜻하던
 ///   모순을 없앤 것이 이 수리의 본체다.
-const TUI_RENDER_MARKS: &[&str] = &["for shortcuts"];
+use cys::terminal_screen::TUI_RENDER_MARKS;
 
 /// 프레임 **연속 길이** 하한(문자). 이 이상 이어져야 '프레임 자'로 인정한다.
 ///
@@ -14155,29 +14113,13 @@ const TUI_RENDER_MARKS: &[&str] = &["for shortcuts"];
 ///
 /// ★방향 확인: 이 축이 좁아지면 `screen_is_bare_shell_on` 은 **참이 더 자주** 되고 밸브는
 ///   **더 자주 닫힌다**. 즉 판정이 느슨해지는 방향이 아니라 조여지는 방향이다(주입 억제).
-const TUI_FRAME_RUN_MIN: usize = 8;
+use cys::terminal_screen::TUI_FRAME_RUN_MIN;
 
 /// 한 줄 안에 프레임 문자가 [`TUI_FRAME_RUN_MIN`] 이상 **연달아** 있는가.
 ///
 /// 줄 단위로 보는 이유: 프레임 자는 한 줄 안에서 이어진다. 화면 전량을 이어 붙여 세면
 /// 서로 다른 줄의 장식 문자가 합쳐져 없는 자를 만들어낸다.
-fn screen_has_frame_rule(text: &str) -> bool {
-    text.lines().any(|line| {
-        let mut run = 0usize;
-        for c in line.chars() {
-            // Box Drawing `U+2500..=U+257F` · Block Elements `U+2580..=U+259F`.
-            if matches!(c as u32, 0x2500..=0x259F) {
-                run += 1;
-                if run >= TUI_FRAME_RUN_MIN {
-                    return true;
-                }
-            } else {
-                run = 0;
-            }
-        }
-        false
-    })
-}
+use cys::terminal_screen::screen_has_frame_rule;
 
 /// 화면에 **TUI 가 렌더 중이라는 증거**가 있는가 — `screen_is_bare_shell_on` 의 AND 항.
 ///
@@ -14190,15 +14132,7 @@ fn screen_has_frame_rule(text: &str) -> bool {
 /// ★단서 하나가 화면에 **남아 있다**는 것과 TUI 가 **지금 그리고 있다**는 것은 다른 사실이다.
 ///   이 함수가 낼 수 있는 최선은 후자의 근사이고, 근사의 오차는 언제나 '주입하지 않는 쪽'
 ///   으로 접어야 한다 — 그래서 축은 넓히는 것이 아니라 **좁히는** 방향으로만 고친다.
-fn screen_has_tui_render_evidence(text: &str) -> bool {
-    if screen_has_frame_rule(text) {
-        return true;
-    }
-    let flat = cys::first_run_gates::flatten(text);
-    TUI_RENDER_MARKS
-        .iter()
-        .any(|m| flat.contains(&cys::first_run_gates::flatten(m)))
-}
+use cys::terminal_screen::screen_has_tui_render_evidence;
 
 /// ★(P3-0) **안전 밸브 전용** 술어 — 이 화면이 맨 셸인가.
 ///
@@ -14243,21 +14177,10 @@ fn screen_is_bare_shell(text: &str) -> bool {
 
 /// 사망 문면을 찾을 **꼬리 창**(비공백 줄 수). 화면 전량을 보면 50줄 전 잔상 하나가 살아있는
 /// TUI 를 맨 셸로 만든다 — 그 방향의 오판은 안전측(주입 안 함)이지만, 근거 없이 넓히지는 않는다.
-const BARE_SHELL_DEATH_TAIL_LINES: usize = 5;
+use cys::terminal_screen::BARE_SHELL_DEATH_TAIL_LINES;
 
 /// 위의 순수 본체 — `windows` 는 "이 pane 이 Windows 셸 위에서 도는가"(형제 술어와 같은 계약).
-fn screen_is_bare_shell_on(text: &str, windows: bool) -> bool {
-    if !screen_tail_is_shell_prompt_on(text, windows) {
-        return false;
-    }
-    // ★사망 문면(다중 방어 ②) — 꼬리에 `command not found` 류가 보이면 렌더 잔상과 무관하게
-    //   맨 셸이다. 판정 방향은 '주입 억제' 라 넓혀도 오살 위험이 없다.
-    let tail = screen_tail_lines(text, BARE_SHELL_DEATH_TAIL_LINES);
-    if screen_shows_launch_failure(&cys::first_run_gates::flatten(&tail)) {
-        return true;
-    }
-    !screen_has_tui_render_evidence(text)
-}
+use cys::terminal_screen::screen_is_bare_shell_on;
 
 // ★(U-13 · 핀 이사) readiness **안전 밸브**의 판정부는 `src/readiness.rs` 로 옮겼다.
 //
@@ -14280,16 +14203,7 @@ fn screen_is_bare_shell_on(text: &str, windows: bool) -> bool {
 /// readiness 폴링이 죽은 셸에 지침을 주입하는 것을 막는 사망 감지의 핵심 술어다.
 /// Unix sh/zsh/bash뿐 아니라 Windows PowerShell·cmd.exe의 표현까지 덮어
 /// 크로스플랫폼으로 동일하게 기동 실패를 잡는다(`hook_command` OS 대칭화와 짝).
-fn screen_shows_launch_failure(flat: &str) -> bool {
-    // Unix: sh/zsh/bash "command not found" / 직접 실행 시 "No such file or directory" / "not found in PATH"
-    flat.contains("commandnotfound")
-        || flat.contains("notfoundinPATH")
-        || flat.contains("Nosuchfileordirectory")
-        // Windows PowerShell: "... is not recognized as the name of a cmdlet, function, ..."
-        || flat.contains("isnotrecognizedasthenameofacmdlet")
-        // Windows cmd.exe: "... is not recognized as an internal or external command, ..."
-        || flat.contains("isnotrecognizedasaninternalorexternalcommand")
-}
+use cys::terminal_screen::screen_shows_launch_failure;
 
 /// 살아있는 surface 위에서: 에이전트 기동 → 준비 폴링 → 지침 주입 → 메타 등록.
 /// RC-3(B′): agents.json env 값의 셸 확장을 Rust에서 해소한다(Windows용 — unix는 셸이 직접 전개).

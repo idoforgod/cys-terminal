@@ -2377,14 +2377,10 @@ mod tests {
     /// `bare_shell` 이 실제로는 `false` → `true` 로 뒤집힌 뒤에도 검체·주석은 초록인 채
     /// 옛 산출을 서술하고 있었다(이 저장소가 반복해 당한 '낡은 사본' 클래스).
     ///
-    /// 【왜 술어를 직접 부르지 않는가】 `screen_is_bare_shell_on` 은 **바이너리 크레이트**
-    /// (`src/bin/cys.rs`)의 비공개 함수라 lib 검체에서 링크할 수 없다(bin → lib 는 되지만
-    /// 반대는 안 된다). 여기서 다시 구현하면 사본이 둘이 되고, 사본은 갈린다.
-    ///
-    /// 【그래서 무엇을 하는가】 **판정 축의 상수·코퍼스를 CLI 소스에서 읽어**(값을 여기 복사
-    /// 하지 않는다) 픽스처를 그 축으로 직접 잰다. 재는 것은 *픽스처의 성질*(한 줄 안 최대
-    /// 연속 프레임 런 · 위젯 문면 유무)이지 *판정*이 아니므로 술어의 사본이 아니다.
-    /// CLI 가 축을 다시 넓히면(예: 하한을 1 로 되돌리면) 이 핀이 먼저 적색이 난다.
+    /// C8 extraction: the CLI now imports the same callable predicate from terminal_screen.
+    /// Keep the independent fixture-property/constant derivation below, verify the CLI import,
+    /// and compare each derived result with the real shared predicate as well. The extraction
+    /// removes the former binary-crate visibility limitation; it does not remove this guard.
     ///
     /// 【★M6 판별력 보강 — 2026-08-24】 M6 이 `TUI_RENDER_MARKS` 를 `["for shortcuts"]` 로
     /// 줄이자 이 표에서 **축 ②(위젯 문면)를 태우는 픽스처가 `LIVE_TUI_AT_PROMPT` 하나**만
@@ -2400,14 +2396,17 @@ mod tests {
     #[test]
     fn hand_stamped_bare_shell_is_rederived_from_the_cli_predicate_source() {
         const CLI: &str = include_str!("bin/cys.rs");
+        const SHARED: &str = include_str!("terminal_screen.rs");
+        assert!(CLI.contains("use cys::terminal_screen::screen_is_bare_shell_on;"),
+            "CLI must use the same predicate measured here");
 
         // ── 축 ①: 프레임 **연속 길이** 하한을 CLI 소스에서 읽는다.
         let anchor = "const TUI_FRAME_RUN_MIN: usize = ";
-        let at = CLI
+        let at = SHARED
             .find(anchor)
             .expect("CLI 의 프레임 연속 길이 상수가 없다 — 축이 사라졌거나 이름이 바뀌었다")
             + anchor.len();
-        let run_min: usize = CLI[at..]
+        let run_min: usize = SHARED[at..]
             .split(';')
             .next()
             .and_then(|s| s.trim().parse().ok())
@@ -2415,8 +2414,8 @@ mod tests {
 
         // ── 축 ②: 대화형 위젯 문면 코퍼스도 CLI 소스에서 읽는다.
         let anchor = "const TUI_RENDER_MARKS: &[&str] = &[";
-        let at = CLI.find(anchor).expect("CLI 의 위젯 문면 코퍼스가 사라졌다") + anchor.len();
-        let body = &CLI[at..at + CLI[at..].find("];").expect("코퍼스 끝을 찾지 못했다")];
+        let at = SHARED.find(anchor).expect("CLI 의 위젯 문면 코퍼스가 사라졌다") + anchor.len();
+        let body = &SHARED[at..at + SHARED[at..].find("];").expect("코퍼스 끝을 찾지 못했다")];
         let marks: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
 
         // 다리가 조용히 끊기지 않도록 술어 자체의 실재도 함께 못 박는다.
@@ -2425,9 +2424,9 @@ mod tests {
             "축 재유도 실패: run_min={run_min} marks={marks:?}"
         );
         assert!(
-            CLI.contains("fn screen_is_bare_shell_on(")
-                && CLI.contains("fn screen_has_frame_rule(")
-                && CLI.contains("fn screen_has_tui_render_evidence("),
+            SHARED.contains("fn screen_is_bare_shell_on(")
+                && SHARED.contains("fn screen_has_frame_rule(")
+                && SHARED.contains("fn screen_has_tui_render_evidence("),
             "밸브 전용 술어가 사라졌다 — 이 핀이 재유도할 대상이 없다"
         );
 
@@ -2513,6 +2512,8 @@ mod tests {
                 .iter()
                 .any(|m| flat.contains(&first_run_gates::flatten(m)));
             let rederived = !(run >= run_min || marked);
+            assert_eq!(crate::terminal_screen::screen_is_bare_shell_on(screen, false), rederived,
+                "shared predicate disagrees with the independently measured fixture: {label}");
             assert_eq!(
                 rederived, stamped,
                 "{label}: 검체가 손으로 박은 bare_shell={stamped} 인데 CLI 축에서 재유도하면 \
