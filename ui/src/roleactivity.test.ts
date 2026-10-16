@@ -466,3 +466,65 @@ describe("★F-01 U-F05/U-F06 — 실제 refreshPaneTitles 본문: 활동 패스
     expect(h.rt(3, "/b.sock").roleEl.title).toContain("응답 만료");
   });
 });
+
+// ★U 게이트 R1 minor 11 — 데몬 wire ↔ UI 파서 **교차 핀**. 한쪽이 열쇠 이름이나 열거 값을 바꾸면 모든 점이 '형식 오류 → 빈 Unknown' 으로
+//   조용히 떨어지는데(실패 신호 없음), 그것을 이 검체가 적색으로 바꾼다. 데몬 쪽은 src/bin/cysd/activity.rs 의 wire_at·unknown_wire 의 json! 열쇠와
+//   Effective/Raw/Family 의 as_str 값을, UI 쪽은 이 파일이 시험하는 roleactivity.ts 의 parseDisplayActivity 가 읽는 열쇠와 STATES/RAWS/FAMILIES 를 소스에서 뽑는다.
+//   한계: 문자열 추출이다 — 데몬이 열쇠를 json! 밖에서(삽입 등) 더하면 보이지 않는다. 그런 변경은 이 검체의 추출 규칙도 함께 고쳐야 한다.
+describe("F-01 wire cross-pin — daemon display_activity keys and enums == UI parser", () => {
+  const RS = readFileSync(new URL("../../src/bin/cysd/activity.rs", import.meta.url), "utf-8");
+  const TS = readFileSync(new URL("./roleactivity.ts", import.meta.url), "utf-8");
+  const slice = (src: string, head: string): string => {
+    const a = src.indexOf(head);
+    expect({ head, found: a >= 0 }).toEqual({ head, found: true });
+    const b = src.indexOf("\n}\n", a);
+    expect({ head, end: b > a }).toEqual({ head, end: true });
+    return src.slice(a, b);
+  };
+  const jsonKeys = (body: string): string[] => {
+    const a = body.indexOf("json!({");
+    expect(a >= 0).toBe(true);
+    const seg = body.slice(a, body.indexOf("})", a));
+    return [...seg.matchAll(/"([a-z_]+)":/g)].map((m) => m[1]).sort();
+  };
+  const asStr = (enumName: string): string[] =>
+    [...slice(RS, `impl ${enumName} {`).matchAll(/=> "([a-z_ ]+)"/g)].map((m) => m[1]).sort();
+  const tsList = (name: string): string[] => {
+    const m = new RegExp(`const ${name}: readonly string\\[\\] = \\[([^\\]]*)\\]`).exec(TS);
+    expect({ name, found: m !== null }).toEqual({ name, found: true });
+    return [...(m as RegExpExecArray)[1].matchAll(/"([a-z_]+)"/g)].map((x) => x[1]).sort();
+  };
+  const parserKeys = (): string[] => {
+    const body = slice(TS, "export function parseDisplayActivity(");
+    const ks = new Set<string>();
+    for (const m of body.matchAll(/\bo\.([a-z_]+)/g)) ks.add(m[1]);
+    for (const m of body.matchAll(/"([a-z_]+)" in o/g)) ks.add(m[1]);
+    return [...ks].sort();
+  };
+
+  it("every key the daemon sends is read by the parser, and the parser reads no key the daemon does not send", () => {
+    const daemon = jsonKeys(slice(RS, "pub(crate) fn wire_at("));
+    expect(daemon.length).toBe(12);
+    expect(parserKeys()).toEqual(daemon);
+  });
+  it("the degenerate Unknown carries exactly the four keys the parser accepts without an identity", () => {
+    expect(jsonKeys(slice(RS, "fn unknown_wire("))).toEqual(["raw", "reason", "retained", "state"]);
+  });
+  it("state / raw / family values are the same sets on both sides", () => {
+    expect(asStr("Effective")).toEqual(tsList("STATES"));
+    expect(asStr("Raw")).toEqual(tsList("RAWS"));
+    expect(asStr("Family")).toEqual(tsList("FAMILIES"));
+  });
+  it("an object built from the daemon's key spelling parses as an observation (not malformed)", () => {
+    const vals: Record<string, unknown> = {
+      state: "working", raw: "active", reason: "", family: "claude", grammar_revision: "claude-r1",
+      observed_age_secs: 0.5, last_positive_age_secs: 0.5, stable_age_secs: 2, observation_seq: 7,
+      display_epoch: "e1", retained: false, consecutive_rejections: 0,
+    };
+    const daemon = jsonKeys(slice(RS, "pub(crate) fn wire_at("));
+    const obj = Object.fromEntries(daemon.map((k) => [k, vals[k]]));
+    expect(Object.values(obj).includes(undefined)).toBe(false);
+    const p = parseDisplayActivity(obj);
+    expect(p.kind).toBe("observation");
+  });
+});

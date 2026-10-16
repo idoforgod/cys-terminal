@@ -8,6 +8,8 @@
 //   ③ 폭이 바뀌는 리플로우: 위를 읽는 중(follow=false)이면 화면 맨 위 **논리 줄**의 첫 행 마커로 돌아간다(옛 절대 행 번호가 아니다) · follow=true 는
 //      종전대로 snapToBottom 몫(여기서는 손대지 않는다) · 대체 화면은 건드리지 않는다.
 // ★한계: 이 검체는 가짜 터미널 위의 배선·순서·산술이다. 실제 WebKit/xterm 에서 점프가 사라졌는지는 b230 네이티브 재현(FROZEN-TRACE-1..7 · s7 대조군)이 판정한다.
+// ★한계 2(U 게이트 R1 minor 10): render() 를 떼어 실행하므로 변형이 새 자유 이름을 쓰면 단언이 아니라 ReferenceError 로 떨어진다 — '저장해 둔 DOM 오프셋'(M2)이
+//   그렇다(구조적 사망 · 판별력 없음). M2 의 판별 검체는 네이티브 s7-away-output-return 이다(B230-REPAIR-REPORT · M2 RED, 첫 휠 59줄).
 import { describe, it, expect } from "bun:test";
 import { readFileSync } from "node:fs";
 

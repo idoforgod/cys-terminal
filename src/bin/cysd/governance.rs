@@ -3071,6 +3071,7 @@ pub(crate) fn write_json_atomic(dir: &std::path::Path, name: &str, content: &str
         f.write_all(content.as_bytes())?;
         // test-only U4-3 A2-1 fsync span (guard also closes on `?`). Spelled `cfg(all(test))` (≡ `cfg(test)`) because
         // this file's source pins cut the production region at the first literal test-cfg attribute (cf. `expire_entries`).
+        // Do NOT "simplify" it to the literal form: that would silently move the boundary of those pins (weakness noted, U gate R1 minor 10).
         #[cfg(all(test))]
         let bench_fsync = crate::activity::bench::FsyncSpan::begin();
         f.sync_all()?;
