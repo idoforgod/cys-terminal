@@ -47,6 +47,7 @@ mod handlers;
 mod hwmon;
 mod knobs;
 mod office_bridge;
+mod pending_requests;
 mod recall;
 mod reclaim;
 mod receiver;
