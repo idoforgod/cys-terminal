@@ -283,3 +283,102 @@ fn unavailable_journal_refuses_before_bytes_and_heals_on_the_next_retry() {
     assert_eq!(queue_len(&s), 0);
     assert_eq!(events(&fx, "queue.delivered").len(), 1);
 }
+
+/// ★(0.14.52 · S-a C7a · F3) A daemon restart never retypes a partially written queue item: the partial-write hold must
+/// survive the restart (or be rebuilt), so the restored entry is NOT handed off again onto the composer that already holds
+/// its prefix (the double-delivery direction).
+#[test]
+fn restart_with_a_held_partial_never_retypes_it() {
+    let fx = fx("restart-held");
+    let s = fx
+        .daemon
+        .create_surface(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80)
+        .expect("seat");
+    fx.daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+    fx.daemon.roles.lock().unwrap().insert("worker".into(), s.id);
+    let body = "a held directive ".repeat(400); // > 4,096 bytes: the loss lands mid-body
+    *s.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, Some((1, ProofLoss::Unknown("agent:denied".into())))));
+    let id = enqueue(&fx, &s, &body);
+    assert!(hand_off(&fx, &s), "premise: handed off");
+    assert_eq!(hold_kind(&s), Some(QueueHoldKind::PartialExact), "premise: held part-way");
+    fx.daemon.persist_queue_state();
+    // Restart: a new daemon on the same state directory, the same role on a new seat.
+    let d2 = Daemon::new(fx.dir.join("cysd.sock"));
+    let s2 = d2
+        .create_surface(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80)
+        .expect("seat after restart");
+    d2.surfaces.lock().unwrap().insert(s2.id, s2.clone());
+    d2.roles.lock().unwrap().insert("worker".into(), s2.id);
+    d2.rehome_restored_queue();
+    let restored: Vec<String> = s2.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+    let retyped = deliver_head_locked(&d2, &s2, true, false, None, None, None, None).is_some();
+    let typed = s2.inject_track.last_body().is_some();
+    let _ = s2.child.lock().unwrap().kill();
+    assert_eq!(restored, vec![id], "premise: the held entry survives the restart");
+    assert!(!retyped && !typed, "a restarted daemon handed the partially written item off again (retype)");
+}
+
+/// ★(0.14.52 · S-a C7a · head condition on Q2) The automatic, bounded exit of a held partial after a restart: while the new
+/// seat's composer shows a prefix the item stays held (no retype, no other hand-off, one notice); once the composer is
+/// measured empty at a prompt boundary (after PARTIAL_RELEASE_MIN_AGE_MS) the held item is released as undelivered and the
+/// NEXT item is delivered once.
+#[test]
+fn restarted_hold_releases_only_when_the_composer_is_measured_empty() {
+    let fx = fx("restart-release");
+    let s = fx
+        .daemon
+        .create_surface(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80)
+        .expect("seat");
+    fx.daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+    fx.daemon.roles.lock().unwrap().insert("worker".into(), s.id);
+    *s.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, Some((1, ProofLoss::Unknown("agent:denied".into())))));
+    let held = enqueue(&fx, &s, &"a held directive ".repeat(400));
+    assert!(hand_off(&fx, &s), "premise: handed off");
+    fx.daemon.persist_queue_state();
+    let d2 = Daemon::new(fx.dir.join("cysd.sock"));
+    let s2 = d2
+        .create_surface(None, Some("sleep 30".into()), None, Some("worker".into()), 24, 80)
+        .expect("seat after restart");
+    d2.surfaces.lock().unwrap().insert(s2.id, s2.clone());
+    d2.roles.lock().unwrap().insert("worker".into(), s2.id);
+    *s2.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+    d2.rehome_restored_queue();
+    let next = d2.next_queue_entry("the next item".into(), None, "test");
+    let next_id = next.id.clone();
+    s2.pending_queue.lock().unwrap().push_back(next);
+    let backdate = |s: &Arc<Surface>| {
+        let mut h = s.queue_hold.lock().unwrap();
+        let h = h.as_mut().expect("held");
+        if let Some(t) = Instant::now().checked_sub(Duration::from_millis(crate::governance::PARTIAL_RELEASE_MIN_AGE_MS + 100)) {
+            h.since = t;
+        }
+    };
+    let ev = |name: &str| d2.bus.tail(1000).into_iter().filter(|e| e["name"] == name).count();
+    // Right after adoption an empty-looking composer is not a measurement yet (minimum age): still held.
+    crate::governance::h_paint(&s2, crate::governance::H_IDLE_SCREEN);
+    assert_eq!(
+        crate::governance::queue_write_hold_block(&d2, &s2),
+        Some(crate::governance::BLOCKED_PARTIAL_WRITE),
+        "released before PARTIAL_RELEASE_MIN_AGE_MS (a race, not a measurement)"
+    );
+    // Prefix visible: held, nothing handed off, one notice.
+    crate::governance::h_paint(&s2, &crate::governance::h_residue_screen("a held directive a held directive"));
+    assert_eq!(crate::governance::queue_write_hold_block(&d2, &s2), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
+    backdate(&s2);
+    assert_eq!(crate::governance::queue_write_hold_block(&d2, &s2), Some(crate::governance::BLOCKED_PARTIAL_WRITE), "released with a prefix visible");
+    assert!(deliver_head_locked(&d2, &s2, true, false, None, None, None, None).is_none(), "handed off while held");
+    assert!(s2.inject_track.last_body().is_none(), "something was typed while held");
+    assert_eq!(ev("queue.write_held"), 1, "one coalesced notice");
+    assert_eq!(ev("queue.write_released"), 0);
+    // Composer measured empty: released, the held item leaves, the next item is delivered once.
+    crate::governance::h_paint(&s2, crate::governance::H_IDLE_SCREEN);
+    assert_eq!(crate::governance::queue_write_hold_block(&d2, &s2), None, "not released with an empty composer");
+    assert_eq!(ev("queue.write_released"), 1);
+    let ids: Vec<String> = s2.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+    assert_eq!(ids, vec![next_id], "the held item is still queued (or the next one was lost)");
+    assert!(!d2.write_holds.lock().unwrap().contains_key(&held), "the persisted hold outlived its release");
+    assert!(deliver_head_locked(&d2, &s2, true, false, None, None, None, None).is_some(), "the next item was not handed off");
+    let typed = s2.inject_track.last_body().map(|b| b.norm);
+    let _ = s2.child.lock().unwrap().kill();
+    assert!(typed.as_deref().is_some_and(|t| t.contains("the next item") && !t.contains("a held directive")), "{typed:?}");
+}

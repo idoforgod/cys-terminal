@@ -1064,6 +1064,37 @@ pub struct QueueHold {
 }
 
 /// Refused-hold retry backoff (design 4.6): 1, 2, 4, 8, then 30 seconds.
+/// ★(0.14.52 · S-a C7a) A partial-write hold as persisted across a daemon restart (`queue-write-holds.json`, keyed by
+/// every held queue entry id). Without it a restart restores the entries and hands them off again onto the composer that
+/// already holds their prefix (retype - the double-delivery direction). Never carries body text.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedWriteHold {
+    pub kind: String,
+    pub reason: String,
+    pub request_id: String,
+    pub entry_ids: Vec<String>,
+    pub body_offset: usize,
+    /// Wall-clock epoch seconds when the hold was set (the age survives the restart).
+    pub held_at: f64,
+}
+
+pub const WRITE_HOLDS_FILE: &str = "queue-write-holds.json";
+
+/// Load `queue-write-holds.json` (missing or unreadable -> empty: nothing to adopt).
+pub(crate) fn load_write_holds(dir: &std::path::Path) -> HashMap<String, PersistedWriteHold> {
+    let holds: Vec<PersistedWriteHold> = std::fs::read_to_string(dir.join(WRITE_HOLDS_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let mut map = HashMap::new();
+    for h in holds {
+        for id in &h.entry_ids {
+            map.insert(id.clone(), h.clone());
+        }
+    }
+    map
+}
+
 pub const QUEUE_HOLD_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 30];
 
 pub fn queue_hold_backoff(attempts: u32) -> std::time::Duration {
@@ -3714,6 +3745,9 @@ pub struct Daemon {
     ///   ③ rehome — rehome_restored_queue의 Value→QueueEntry 되살림(필드 관통)
     ///   ④ queue.list restored 노출 — handlers.rs "queue.list"의 restored 행(신규 열 결손 방지)
     pub restored_queue: Mutex<Vec<serde_json::Value>>,
+    /// ★(0.14.52 · S-a C7a) Partial-write holds by queue entry id, mirrored to `queue-write-holds.json` (see
+    /// [`PersistedWriteHold`]); loaded at start so a restored held entry is adopted as held, never handed off again.
+    pub write_holds: Mutex<HashMap<String, PersistedWriteHold>>,
     /// ★(0.14.31 · WP-5 M) **만료 복원분** — `queue-expired.json`(활성 WAL 과 **다른 파일**)에서
     /// 살아난 만료 항목(Value 통짜). 왜 파일을 가르는가: 만료 항목을 `queue-state.json` 에 함께
     /// 두면 **구 데몬(롤백)** 이 `expired_at` 을 모른 채 활성 큐로 rehome 해 배달한다(codex 설계
@@ -5644,6 +5678,7 @@ impl Daemon {
             operator_token,
             feed_persist_lock: Mutex::new(()),
             restored_queue: Mutex::new(restored_qentries),
+            write_holds: Mutex::new(load_write_holds(&dir)),
             restored_expired: Mutex::new(restored_expired),
             queue_seq: AtomicU64::new(queue_seq_seed),
             queue_persist_lock: Mutex::new(()),
@@ -5844,6 +5879,25 @@ impl Daemon {
     /// ★(0.14.52 · S-a) The writer request journal, opened on first use. While it cannot be opened
     /// every agent write is refused before its first byte (design 4.4 step 2) and the next write
     /// tries again, so a transient state-directory error heals without a restart.
+    /// ★(0.14.52 · S-a C7a) Mirror `write_holds` to `queue-write-holds.json` (atomic replace). A failure is an event; the
+    /// in-memory hold still blocks this run (only a restart would lose it).
+    pub fn persist_write_holds(&self) {
+        let holds: Vec<PersistedWriteHold> = {
+            let g = self.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen = std::collections::BTreeSet::new();
+            g.values().filter(|h| seen.insert(h.request_id.clone())).cloned().collect()
+        };
+        let body = serde_json::to_string(&holds).unwrap_or_else(|_| "[]".into());
+        if let Err(e) = crate::governance::write_json_atomic(&state_dir(&self.socket_path), WRITE_HOLDS_FILE, &body) {
+            self.bus.publish(
+                "queue.write_holds_persist_failed",
+                "queue",
+                None,
+                serde_json::json!({"error": e.to_string(), "holds": holds.len()}),
+            );
+        }
+    }
+
     pub fn agent_journal(&self) -> Arc<dyn crate::agent_write::Journal> {
         let mut slot = self.writer_journal.lock().unwrap_or_else(|e| e.into_inner());
         if slot.is_none() {

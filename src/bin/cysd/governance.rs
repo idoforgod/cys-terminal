@@ -9640,6 +9640,14 @@ fn settle_queue_write(
                 }
                 *s.queue_hold.lock().unwrap() = None;
             }
+            // ★(0.14.52 · S-a C7a) A delivered item is no longer held (the file is rewritten only when it held something).
+            let unheld = {
+                let mut w = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+                d.merged_ids.iter().filter(|id| w.remove(*id).is_some()).count()
+            };
+            if unheld > 0 {
+                daemon.persist_write_holds();
+            }
             let (recorded_at, body_sha, from_surface, extra) = receipt;
             // ★(0.14.31 · WP-5 L) 영수증 — 선기록 시각과 분리 · 별 줄 · 본문 sha 아님. ★(0.14.52 · S-a) delivered_at =
             //   the writer's written Return (now), no longer the hand-off.
@@ -9772,6 +9780,23 @@ fn hold_partial_write(
         envelope: Some(envelope),
         notified: unknown,
     });
+    // ★(0.14.52 · S-a C7a) The hold survives a restart: without it the restored entries are handed off again onto the
+    //   composer that already holds their prefix (retype).
+    {
+        let rec = crate::state::PersistedWriteHold {
+            kind: if unknown { "partial_unknown" } else { "partial_exact" }.to_string(),
+            reason: reason.to_string(),
+            request_id: request_id.to_string(),
+            entry_ids: d.merged_ids.clone(),
+            body_offset: envelope.body_offset,
+            held_at: now_epoch(),
+        };
+        let mut w = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+        for id in &d.merged_ids {
+            w.insert(id.clone(), rec.clone());
+        }
+    }
+    daemon.persist_write_holds();
     if unknown {
         publish_write_held(daemon, sid, kind, reason, request_id, &d.merged_ids, Some(envelope), 0);
     }
@@ -9821,7 +9846,9 @@ fn publish_write_held(
 /// fires the expired-window notice once).
 pub(crate) fn queue_write_hold_block(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> Option<&'static str> {
     use crate::state::QueueHoldKind as K;
+    adopt_persisted_write_hold(daemon, s);
     let mut notice = None;
+    let mut release = None;
     let why = {
         let mut h = s.queue_hold.lock().unwrap();
         let hold = h.as_mut()?;
@@ -9833,6 +9860,13 @@ pub(crate) fn queue_write_hold_block(daemon: &Arc<Daemon>, s: &Arc<crate::state:
                     hold.notified = true;
                     notice = Some((hold.kind, hold.reason.clone(), hold.request_id.clone(), hold.entry_ids.clone(), hold.envelope, hold.since.elapsed().as_secs()));
                 }
+                // ★(0.14.52 · S-a C7a · head condition on Q2) automatic, bounded exit: a hold that can no longer resume
+                //   (PartialUnknown, or PartialExact past its window) is released once the composer is measured empty.
+                let resumable = hold.kind == K::PartialExact && hold.since.elapsed() <= window;
+                let min_age = std::time::Duration::from_millis(PARTIAL_RELEASE_MIN_AGE_MS);
+                if !resumable && hold.since.elapsed() >= min_age {
+                    release = Some((hold.request_id.clone(), hold.entry_ids.clone(), hold.kind, hold.reason.clone(), hold.since.elapsed().as_secs()));
+                }
                 Some(BLOCKED_PARTIAL_WRITE)
             }
         }
@@ -9840,7 +9874,116 @@ pub(crate) fn queue_write_hold_block(daemon: &Arc<Daemon>, s: &Arc<crate::state:
     if let Some((kind, reason, request_id, ids, env, secs)) = notice {
         publish_write_held(daemon, s.id, kind, &reason, &request_id, &ids, env, secs);
     }
+    if let Some((request_id, ids, kind, reason, secs)) = release {
+        if composer_measured_empty(s) {
+            release_partial_write_hold(daemon, s, &request_id, &ids, kind, &reason, secs);
+            return None;
+        }
+    }
     why
+}
+
+/// ★(0.14.52 · S-a C7a) A partial-write hold blocks every hand-off of this seat's queue (tick and forced path alike; after a
+/// restart there is no reservation, only the adopted hold).
+pub(crate) fn partial_write_held(s: &crate::state::Surface) -> bool {
+    matches!(
+        s.queue_hold.lock().unwrap().as_ref().map(|h| h.kind),
+        Some(crate::state::QueueHoldKind::PartialExact | crate::state::QueueHoldKind::PartialUnknown)
+    )
+}
+
+/// Minimum age of a partial hold before the composer-empty release may fire: the echo of the accepted prefix (or a restarted
+/// seat's first frames) must have had time to render, so an empty composer is a measurement, not a race.
+pub(crate) const PARTIAL_RELEASE_MIN_AGE_MS: u64 = 2_000;
+
+/// ★(0.14.52 · S-a C7a) After a daemon restart the queue head may be an entry the previous daemon held part-way
+/// (`Daemon::write_holds`): adopt it as PartialUnknown (no resume across a restart - head Q2) instead of handing it off again.
+fn adopt_persisted_write_hold(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) {
+    if s.queue_hold.lock().unwrap().is_some() {
+        return;
+    }
+    let head = s.pending_queue.lock().unwrap().front().map(|e| e.id.clone());
+    let Some(head) = head else { return };
+    let Some(h) = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner()).get(&head).cloned() else { return };
+    let reason = format!("daemon_restart:{}", h.reason);
+    let envelope = crate::agent_write::Envelope { body_offset: h.body_offset, ..Default::default() };
+    {
+        let mut g = s.queue_hold.lock().unwrap();
+        if g.is_some() {
+            return;
+        }
+        *g = Some(crate::state::QueueHold {
+            kind: crate::state::QueueHoldKind::PartialUnknown,
+            reason: reason.clone(),
+            request_id: h.request_id.clone(),
+            entry_ids: h.entry_ids.clone(),
+            since: std::time::Instant::now(),
+            attempts: 0,
+            next_retry: None,
+            envelope: Some(envelope),
+            notified: true,
+        });
+    }
+    let held_secs = (now_epoch() - h.held_at).max(0.0) as u64;
+    publish_write_held(daemon, s.id, crate::state::QueueHoldKind::PartialUnknown, &reason, &h.request_id, &h.entry_ids, Some(envelope), held_secs);
+}
+
+/// The seat's composer measured EMPTY at a prompt boundary: adapter marker at the cursor row, nothing before the cursor, a
+/// consistent frame, no modal or selector. Unreadable or no adapter -> false (keep holding).
+fn composer_measured_empty(s: &Arc<crate::state::Surface>) -> bool {
+    let adapters = load_adapter_defs();
+    let Some((markers, _)) = surface_prompt_marker(s, &adapters) else { return false };
+    let obs = observe_prompt(s, &markers);
+    obs.frame_consistent()
+        && !obs.selector_row
+        && !obs_modal_foreground(&obs)
+        && matches!(&obs.line, Some((before, _)) if before.trim().is_empty())
+}
+
+/// ★(0.14.52 · S-a C7a · head condition on Q2) Release a partial-write hold whose composer was measured empty: the held
+/// entries leave the active queue as undelivered (tombstone + `queue.write_released`), the reservation and the hold end, the
+/// input count is cleared (the composer is empty), and the queue resumes with the NEXT item. The held body is never retyped.
+fn release_partial_write_hold(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    request_id: &str,
+    entry_ids: &[String],
+    kind: crate::state::QueueHoldKind,
+    reason: &str,
+    held_secs: u64,
+) {
+    let removed: Vec<crate::state::QueueEntry> = {
+        let mut q = s.pending_queue.lock().unwrap();
+        let _gate = s.input_gate.lock().unwrap();
+        let removed = q.iter().filter(|e| entry_ids.contains(&e.id)).cloned().collect();
+        pop_delivered_ids(&mut q, entry_ids);
+        *s.inject_reservation.lock().unwrap() = None;
+        s.clear_pending_input();
+        removed
+    };
+    *s.queue_hold.lock().unwrap() = None;
+    {
+        let mut w = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+        for id in entry_ids {
+            w.remove(id);
+        }
+    }
+    daemon.persist_write_holds();
+    crate::delivery::record_queue_tombstones(daemon, s.id, &removed, "partial_write_released", now_epoch());
+    daemon.persist_queue_state();
+    let kind = match kind {
+        crate::state::QueueHoldKind::PartialExact => "partial_exact",
+        crate::state::QueueHoldKind::PartialUnknown => "partial_unknown",
+        crate::state::QueueHoldKind::Refused => "refused",
+    };
+    daemon.bus.publish(
+        "queue.write_released",
+        "queue",
+        Some(s.id),
+        json!({"surface_ref": cys::surface_ref(s.id), "request_id": request_id, "entry_ids": entry_ids, "kind": kind,
+               "reason": reason, "held_secs": held_secs, "released": "composer_empty",
+               "note": "The seat's composer was measured empty, so the part-way item was released as undelivered (never retyped); the queue resumes with the next item."}),
+    );
 }
 
 /// `expect_pending`: 준비 판정이 **본** `pending_input_bytes` 값. `Some(v)` 이면 배달 직전
@@ -9901,6 +10044,8 @@ pub(crate) fn deliver_head_locked(
     let mut inflight: Option<InflightInject> = None;
     // ★(0.14.52 · S-a) The handed-off request (status reads; specimens' settlement wait).
     let mut handed: Option<Arc<crate::agent_write::Request>> = None;
+    // ★(0.14.52 · S-a C7a) A restored partially written head is adopted as held before any hand-off (outside the queue lock).
+    adopt_persisted_write_hold(daemon, s);
     let delivered = 'tx: {
         // 이 임계영역은 더 이상 큐를 **바꾸지 않는다**(인계 결판 전에는 빼지 않는다 · 리뷰 R2).
         let q = s.pending_queue.lock().unwrap();
@@ -9910,7 +10055,7 @@ pub(crate) fn deliver_head_locked(
         //   하지 않는다. 항목이 결판까지 큐에 남아 있으므로(유실 창 봉인) 이 표식이 없으면 틱과
         //   RPC 강제 배달이 **같은 머리를 두 번** 인계할 수 있다. 검사·설정이 둘 다 이 임계영역
         //   안이라 창이 없다(배달 최소 간격 0 인 롤백 env 에서도 성립).
-        if s.inject_reserved() {
+        if s.inject_reserved() || partial_write_held(s) {
             break 'tx None;
         }
         if let Some(want) = expect_pending {
@@ -18235,7 +18380,9 @@ mod tests {
         ];
         // (파일, set_pending_input, clear_pending_input, apply_pending_input) — 정의처(state.rs)는 `fn` 선언 1줄을 포함한다.
         let want: [(&str, usize, usize, usize); 5] = [
-            ("governance", 4, 1, 1),
+            // ★(0.14.52 · S-a C7a) +1 clear: `release_partial_write_hold` - the composer was measured EMPTY at a prompt
+            //   boundary, so the Default reset (count, human share and the exempt marker - leaf and mirror) is the truth.
+            ("governance", 4, 2, 1),
             // ★(0.14.52 · S-a C5b) +1 clear, +1 apply: the direct agent write's settlement (`DirectSettle::run`) applies the
             //   SAME clear-first reset / accepted-bytes step the handler applied at hand-off - moved to after the terminal.
             ("handlers", 0, 2, 3),
