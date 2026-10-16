@@ -3,7 +3,8 @@ use unicode_width::UnicodeWidthChar as _;
 const CODEPOINTS_IN_CELL: usize = 6;
 
 /// Represents a single terminal cell.
-#[derive(Clone, Debug, Default, Eq)]
+// cys patch (0.14.52 F-01): `Copy` (fixed-size fields only) so a row of cells copies as one memcpy.
+#[derive(Clone, Copy, Debug, Default, Eq)]
 pub struct Cell {
     contents: [char; CODEPOINTS_IN_CELL],
     len: u8,

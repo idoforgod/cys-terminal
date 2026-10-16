@@ -410,6 +410,104 @@ fn collect_copies_bounded_rows_without_growing_its_buffers() {
     assert!(text.iter().any(|(r, l)| *r == 0 && l.starts_with("top")), "cursor row ±3 copied");
 }
 
+/// U4-3 hold mitigation: the row-slice copy is byte-for-byte the old per-cell copy (`screen.cell(r, c)` for every cell, Debug
+/// form so the comparison-masked dim bit is compared too), and the byte-slice title equals the old char-by-char truncation.
+#[test]
+fn copy_window_row_slices_equal_the_per_cell_copy() {
+    fn per_cell(screen: &vt100::Screen, rows_idx: &[u16], cols: u16) -> Vec<String> {
+        let mut v = Vec::new();
+        for &r in rows_idx {
+            for c in 0..cols {
+                v.push(format!("{:?}", screen.cell(r, c).cloned().unwrap_or_default()));
+            }
+        }
+        v
+    }
+    fn title_by_chars(t: &str) -> String {
+        let mut s = String::new();
+        for ch in t.chars() {
+            if s.len() + ch.len_utf8() > TITLE_CAP {
+                break;
+            }
+            s.push(ch);
+        }
+        s
+    }
+    let mut numbered = String::new();
+    for i in 1..=300 {
+        numbered.push_str(&format!("\x1b[{}mline {i:04} 가나다 😀 \x1b[2mdim\x1b[0m\r\n", 31 + i % 7));
+    }
+    let long_title = format!("\x1b]0;{}\x07", "\u{25d0}a".repeat(150)); // 600 bytes, multibyte at the cut
+    let wide_edge = format!("{}가\r\n{}", "x".repeat(47), "\x1b[5;10Hcursor");
+    let cases: Vec<(u16, u16, String)> = vec![
+        (24, 80, format!("{numbered}\x1b[12;5H{long_title}")),
+        (40, 120, format!("\x1b[?1049h\x1b[2J{numbered}\x1b[40;1H› composer\x1b]0;\u{2819} work\x07")),
+        (30, 256, format!("{}\r\n{numbered}\x1b]0;\u{2733} Claude Code\x07", "w".repeat(700))),
+        (24, 48, format!("{numbered}{wide_edge}")),
+    ];
+    for (rows, cols, bytes) in cases {
+        let mut p = vt100::Parser::new(rows, cols, 1_000);
+        p.process(bytes.as_bytes());
+        // window rows whose LAST column is not blank (a dropped last cell must not hide behind default padding):
+        // a full-width bottom row and, above it, a row ending in a wide character exactly at the right edge.
+        let edge = format!("\x1b[{};1H{}가\x1b[{rows};1H{}", rows - 1, "y".repeat(usize::from(cols) - 2), "Z".repeat(usize::from(cols)));
+        p.process(edge.as_bytes());
+        let mut frame = Frame::new();
+        assert!(copy_window(p.screen(), &mut frame), "{rows}x{cols}: supported geometry");
+        let want = per_cell(p.screen(), &frame.row_index, cols);
+        let got: Vec<String> = frame.cells.iter().map(|c| format!("{c:?}")).collect();
+        assert_eq!(got.len(), want.len(), "{rows}x{cols}: cell count");
+        let first_diff = got.iter().zip(&want).position(|(a, b)| a != b);
+        assert_eq!(first_diff, None, "{rows}x{cols}: first differing cell index");
+        assert_eq!(frame.title, title_by_chars(p.screen().title()), "{rows}x{cols}: title");
+    }
+}
+
+/// U4-3 hold mitigation, information only (not a gate): no-contention timing of the old per-cell copy vs the row-slice
+/// `copy_window` on the same parser (10,000 lines of scrollback). `CYS_HOLD_BENCH_OUT=<json>` receives the numbers.
+#[test]
+#[ignore = "micro-benchmark; run with --release and CYS_HOLD_BENCH_OUT"]
+fn hold_copy_micro_benchmark() {
+    fn pct(v: &mut [u64], q: f64) -> u64 {
+        v.sort_unstable();
+        v[((v.len() as f64 * q).ceil() as usize).clamp(1, v.len()) - 1]
+    }
+    let mut out = serde_json::Map::new();
+    for (rows, cols) in [(24u16, 80u16), (40, 120), (60, 256)] {
+        let mut p = vt100::Parser::new(rows, cols, crate::state::SCROLLBACK_LINES);
+        for i in 0..12_000 {
+            p.process(format!("\x1b[3{}mline {i:05} {} 가나 😀\x1b[0m\r\n", i % 7, "w".repeat(usize::from(cols) / 2)).as_bytes());
+        }
+        p.process(b"\x1b]0;\xe2\x97\x90 Claude Code\x07");
+        let screen = p.screen();
+        let mut frame = Frame::new();
+        let mut reference: Vec<vt100::Cell> = Vec::with_capacity(MAX_CELLS);
+        let (mut old_ns, mut new_ns) = (Vec::with_capacity(20_000), Vec::with_capacity(20_000));
+        for _ in 0..20_000 {
+            let t = std::time::Instant::now();
+            assert!(copy_window(screen, &mut frame));
+            new_ns.push(t.elapsed().as_nanos() as u64);
+            let t = std::time::Instant::now();
+            reference.clear();
+            for &r in &frame.row_index {
+                for c in 0..cols {
+                    reference.push(screen.cell(r, c).cloned().unwrap_or_default());
+                }
+            }
+            old_ns.push(t.elapsed().as_nanos() as u64);
+            std::hint::black_box(&reference);
+        }
+        let key = format!("{rows}x{cols}");
+        let stats = |v: &mut Vec<u64>| json!({"p50_ns": pct(v, 0.50), "p99_ns": pct(v, 0.99), "max_ns": pct(v, 1.0)});
+        let (o, n) = (stats(&mut old_ns), stats(&mut new_ns));
+        eprintln!("{key}: per-cell {o} | row-slice {n} | cells {}", frame.cells.len());
+        out.insert(key, json!({"cells": frame.cells.len(), "per_cell_copy": o, "row_slice_copy_window": n}));
+    }
+    if let Ok(path) = std::env::var("CYS_HOLD_BENCH_OUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&Value::Object(out)).unwrap()).unwrap();
+    }
+}
+
 /// R3-1 deterministic interleaving: copy at an even generation, a whole publication completes before
 /// the second endpoint (both even, unequal) — published-only admission MUST accept. Equality-requiring
 /// collection would reject this and fail here.

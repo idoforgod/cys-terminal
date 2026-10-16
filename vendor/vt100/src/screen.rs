@@ -613,6 +613,13 @@ impl Screen {
         self.grid().visible_cell(crate::grid::Pos { row, col })
     }
 
+    /// cys patch (0.14.52 F-01): the visible row `row` as one contiguous slice of cells (the row is resolved once,
+    /// instead of once per cell as in [`Screen::cell`]). `None` when the row is outside the visible screen.
+    #[must_use]
+    pub fn visible_row_cells(&self, row: u16) -> Option<&[crate::cell::Cell]> {
+        self.grid().visible_row(row).map(crate::row::Row::cells_slice)
+    }
+
     /// Returns whether the text in row `row` should wrap to the next line.
     #[must_use]
     pub fn row_wrapped(&self, row: u16) -> bool {

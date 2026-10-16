@@ -749,23 +749,29 @@ pub(crate) fn copy_window(screen: &vt100::Screen, frame: &mut Frame) -> bool {
     frame.alt = screen.alternate_screen();
     frame.reset_count = screen.reset_count();
     frame.sync = screen.synchronized_output();
+    // one byte-slice copy cut at a char boundary into reserved capacity (U4-3 hold mitigation: no per-char loop).
     frame.title.clear();
-    for ch in screen.title().chars() {
-        if frame.title.len() + ch.len_utf8() > TITLE_CAP {
-            break;
-        }
-        frame.title.push(ch);
+    let title = screen.title();
+    let mut end = title.len().min(TITLE_CAP);
+    while !title.is_char_boundary(end) {
+        end -= 1;
     }
+    frame.title.push_str(&title[..end]);
     frame.cells.clear();
     if rows == 0 || cols == 0 || cols > MAX_COLS || scrolled {
         frame.row_index.clear();
         return false;
     }
     window_rows(rows, cursor.0, &mut frame.row_index);
+    // each window row is resolved once and copied as one contiguous slice (`Cell: Copy` → memcpy); before the
+    // U4-3 mitigation every cell re-resolved its row through the scrollback iterator. A row shorter than `cols`
+    // (not produced by the grid, kept for safety) is padded with default cells, as the per-cell copy did.
+    let width = usize::from(cols);
     for &r in &frame.row_index {
-        for c in 0..cols {
-            frame.cells.push(screen.cell(r, c).cloned().unwrap_or_default());
-        }
+        let row = screen.visible_row_cells(r).unwrap_or(&[]);
+        let n = row.len().min(width);
+        frame.cells.extend_from_slice(&row[..n]);
+        frame.cells.resize(frame.cells.len() + (width - n), vt100::Cell::default());
     }
     true
 }
