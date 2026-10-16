@@ -778,6 +778,31 @@ jobs:
           path: target/u-tmp/q9b-ci/
           if-no-files-found: warn
 
+      # S6: execute backend tests, not just compile the app or run Bun. Resource
+      # placeholders satisfy test-build inputs only; no packaged binary is tested.
+      # Cold Windows build cost remains unmeasured; the existing job budget stays.
+      - name: A-ID S6 Tauri close operation (Windows blocking)
+        shell: bash
+        working-directory: src-tauri
+        run: |
+          set -euo pipefail
+          mkdir -p ../ui/dist binaries resources runtime
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          touch "binaries/cys-$triple.exe" "binaries/cysd-$triple.exe" \
+            resources/pack.tar.gz resources/pack-manifest.json resources/runtime-manifest.json
+          s6_list="$(mktemp)"
+          cargo_filter_count() {
+            local rc=0
+            CYS_PACK_DIR="$(mktemp -d)" cargo test "$@" -- --list > "$s6_list.raw" 2>&1 || rc=$?
+            cat "$s6_list.raw"
+            [ "$rc" -eq 0 ] || return "$rc"
+            tr -d '\r' < "$s6_list.raw" > "$s6_list"
+            grep -q ': test$' "$s6_list"
+          }
+          cargo_filter_count --bin cys-app close_surface_tests::
+          grep -Fqx 'close_surface_tests::s6_close_denial_retains_actual_attachment: test' "$s6_list"
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys-app close_surface_tests:: -- --test-threads=1
+
       - name: Setup Bun (화면 검체용)
         uses: oven-sh/setup-bun@v2
 

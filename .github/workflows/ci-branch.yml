@@ -218,6 +218,8 @@ jobs:
           #   반드시 있어야 할 필터형 실행(인자 = FILTER_RUN_RE 가 뽑는 `--lib|--bin <크레이트> <필터>`)을 등재한다. 없으면 붉다.
           FILTERED_CARGO_REQUIRED = {
               "windows-health": {
+                  "--bin cys-app close_surface_tests::":
+                      "A-ID S6 must execute the Tauri close confirmation and attachment tests on Windows; app compilation and Bun tests do not run this backend suite.",
                   "--manifest-path vendor/portable-pty/Cargo.toml --lib --locked":
                       "Q9-b must compile and run the actual Windows vendor library tests and both named positive controls; product dependency compilation is insufficient.",
                   "--bin cysd close_auth_tests::f_try_wait_error_is_unreadable":
@@ -631,24 +633,24 @@ jobs:
                           cond_err.append(f"{lane}: {path}:{i + 1} `cargo test {args} -- …` 앞에 같은 스텝의 "
                                           f"`cargo_filter_count {args}` 가 없다 — cargo 필터는 0매치도 초록이라 "
                                           f"모듈 경로가 바뀌면 이 게이트는 조용한 초록이 된다(돌지 않는 초록 금지)")
-                      if args in Q9B_BLOCKING_ARGS:
+                      if args in Q9B_BLOCKING_ARGS or args == "--bin cys-app close_surface_tests::":
                           if code[m.end():].strip() != "--test-threads=1":
-                              cond_err.append(f"{lane}: Q9-b command has an unreviewed suffix (skip/ignored/error masking forbidden): {args}")
+                              cond_err.append(f"{lane}: required cargo command has an unreviewed suffix (skip/ignored/error masking forbidden): {args}")
                           if step_conditions(path, "cargo test " + args + " --"):
-                              cond_err.append(f"{lane}: Q9-b command must be unconditional at job and step level: {args}")
+                              cond_err.append(f"{lane}: required cargo command must be unconditional at job and step level: {args}")
                           steps_line = next((k for k in range(start, -1, -1)
                                              if re.match(r"^\s*steps:\s*(#.*)?$", lines[k])), None)
                           if steps_line is None:
-                              _struct_fail(path, start + 1, "Q9-b enclosing steps block is unavailable")
+                              _struct_fail(path, start + 1, "required cargo enclosing steps block is unavailable")
                           job_key_indent = len(lines[steps_line]) - len(lines[steps_line].lstrip())
                           masks = _job_conditions(lines, steps_line, job_key_indent, q9b_error_masking=True)
                           if any(re.sub(r"#.*$", "", value).strip() != "잡 수준 false" for value in masks):
-                              cond_err.append(f"{lane}: Q9-b enclosing job must remain blocking: {args}")
+                              cond_err.append(f"{lane}: required cargo enclosing job must remain blocking: {args}")
                           for j in range(start, end):
                               key = re.match(r"^\s{%d}-\s+continue-on-error:\s*(.+)$" % step_indent, lines[j]) or \
                                     re.match(r"^\s{%d}continue-on-error:\s*(.+)$" % key_indent, lines[j])
                               if key and re.sub(r"#.*$", "", key.group(1)).strip() != "false":
-                                  cond_err.append(f"{lane}: Q9-b command must remain blocking: {args}")
+                                  cond_err.append(f"{lane}: required cargo command must remain blocking: {args}")
                       if args == Q9B_VENDOR_ARGS:
                           for name in Q9B_REQUIRED_NAMES:
                               expected = "grep -Fqx '" + name + ": test' \"$q9b_list\""

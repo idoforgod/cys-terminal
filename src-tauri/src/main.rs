@@ -4797,13 +4797,65 @@ async fn close_surface(
     surface_id: u64,
 ) -> Result<(), String> {
     let sock = resolve_socket(&socket);
-    let key = (sock_slug(&sock), surface_id);
+    close_surface_with(&state, &sock, surface_id, read_operator_token_for,
+        |socket, params| async move { rpc_full(&socket, "surface.close", params).await }).await
+}
+
+// Close confirmation owns detachment. A rejected/uncertain request leaves the
+// current stream alone, including a stream replaced while the RPC was pending.
+async fn close_surface_with<ReadOwner, Call, Reply>(
+    state: &Attachments,
+    socket: &std::path::Path,
+    surface_id: u64,
+    read_owner: ReadOwner,
+    call: Call,
+) -> Result<(), String>
+where
+    ReadOwner: FnOnce(&std::path::Path) -> Option<String>,
+    Call: FnOnce(std::path::PathBuf, Value) -> Reply,
+    Reply: std::future::Future<Output = Result<Value, String>>,
+{
+    let mut params = json!({"surface_id": surface_id});
+    if let Some(token) = read_owner(socket).filter(|token| !token.trim().is_empty()) {
+        params["owner_token"] = json!(token);
+    }
+    let response = call(socket.to_path_buf(), params).await
+        .map_err(|error| error.chars().take(300).collect::<String>())?;
+    let confirmed = response["ok"].as_bool() == Some(true)
+        && response["result"]["closed"].as_bool() == Some(true)
+        && response["result"]["surface_id"].as_u64() == Some(surface_id);
+    let gone = response["ok"].as_bool() == Some(false)
+        && response["error"]["code"].as_str() == Some("not_found");
+    if !confirmed && !gone {
+        if response["ok"].as_bool() != Some(false) {
+            return Err(format!("surface.close returned an invalid confirmation for surface {surface_id}"));
+        }
+        let error = &response["error"];
+        if error["code"].as_str() == Some("close_denied")
+            && error["reason"].as_str() == Some("pane_ancestor_running")
+        {
+            return Err(close_pane_veto_message(std::env::consts::OS));
+        }
+        let code: String = error["code"].as_str().unwrap_or("close_failed").chars().take(64).collect();
+        let message: String = error["message"].as_str().unwrap_or("unknown error").chars().take(300).collect();
+        return Err(format!("{code}: {message}"));
+    }
+    // No map lock spans await. For this same target incarnation, confirmation
+    // closes whichever attachment is current, not a handle captured before RPC.
+    let key = (sock_slug(socket), surface_id);
     if let Some(handle) = state.0.lock().unwrap().remove(&key) {
         handle.abort();
     }
-    rpc_on(&sock, "surface.close", json!({"surface_id": surface_id}))
-        .await
-        .map(|_| ())
+    Ok(())
+}
+
+fn close_pane_veto_message(platform: &str) -> String {
+    let launcher = match platform {
+        "windows" => "Windows Explorer or the Start menu",
+        "macos" => "Finder",
+        _ => "your desktop launcher",
+    };
+    format!("Close refused because this app has a live pane ancestor in the selected daemon. Relaunch it from {launcher}, then try again.")
 }
 
 #[tauri::command]
@@ -8530,6 +8582,9 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running aiterm");
 }
+
+#[cfg(test)]
+mod close_surface_tests;
 
 #[cfg(test)]
 mod tests {
@@ -16518,6 +16573,8 @@ osascript 를 실행할 수 없어 건너뜁니다({e}) — macOS 가 아닌 환
         assert_eq!(
             callers,
             vec![
+                // S6 adds only owner_token to close; no operator exemption is granted.
+                "close_surface".to_string(),
                 "feed_reply".to_string(),
                 "send_input".to_string(),
                 "trash_delete".to_string(),

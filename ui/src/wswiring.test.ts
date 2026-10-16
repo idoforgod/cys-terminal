@@ -556,7 +556,7 @@ describe("부서 삭제 — 탭은 종료가 확인된 뒤에 지운다(F3)", ()
     const a = code.indexOf("let tombRecorded = false;");
     expect(a).toBeGreaterThan(0);
     const seg = code.slice(a, code.indexOf("return tab;", a));
-    const stop = seg.indexOf('rpcT(invoke("stop_dept_daemon_by_socket", { socket: ws.socket }), T_STOP)');
+    const stop = seg.indexOf('rpcT(invoke("stop_dept_daemon_by_socket", { socket }), T_STOP)');
     const verdict = seg.indexOf("deptCloseAfterStop({ stop: stopped, tombRecorded, error: stopErr })");
     const splice = seg.indexOf("workspaces.splice(i, 1);");
     expect(stop).toBeGreaterThan(0);
@@ -565,14 +565,14 @@ describe("부서 삭제 — 탭은 종료가 확인된 뒤에 지운다(F3)", ()
     expect((seg.match(/workspaces\.splice\(/g) ?? []).length).toBe(1); // 낙관적 splice 가 되살아나면 red
     expect(seg).toContain("if (!verdict.removeTab) {"); // 실패 → 탭 유지
     expect(seg).toContain("ws.tree = null;"); // 닫아 버린 pane 의 죽은 트리는 남기지 않는다
-    expect(seg).toContain("(w) => w !== ws && w.socket === ws.socket"); // 자기 자신은 아직 목록에 있다
+    expect(seg).toContain("(w) => w !== ws && w.socket === socket"); // 자기 자신은 아직 목록에 있다
   });
 
   it("★그룹 삭제도 같은 계약 — 실패한 부서만 탭을 남기고 사유는 모아서 1회", () => {
     const g = code.indexOf("async function confirmDeleteGroup(");
     expect(g).toBeGreaterThan(0);
     const seg = code.slice(g, code.indexOf("const UNTITLED", g));
-    const stop = seg.indexOf('rpcT(invoke("stop_dept_daemon_by_socket", { socket: ws.socket }), T_STOP)');
+    const stop = seg.indexOf('rpcT(invoke("stop_dept_daemon_by_socket", { socket }), T_STOP)');
     const splice = seg.indexOf("workspaces.splice(i, 1);");
     expect(stop).toBeGreaterThan(0);
     expect(splice).toBeGreaterThan(stop);
@@ -589,7 +589,7 @@ describe("부서 삭제 — 탭은 종료가 확인된 뒤에 지운다(F3)", ()
     expect(close).toBeGreaterThan(0);
     expect(grp).toBeGreaterThan(0);
     for (const seg of [code.slice(close, code.indexOf("return tab;", close)), code.slice(grp, code.indexOf("const UNTITLED", grp))]) {
-      expect(seg).toContain('rpcT(invoke("stop_dept_daemon_by_socket", { socket: ws.socket }), T_STOP)');
+      expect(seg).toContain('rpcT(invoke("stop_dept_daemon_by_socket", { socket }), T_STOP)');
       expect(seg).toContain("deptCloseAfterStop({");
     }
   });
@@ -725,10 +725,10 @@ describe("묘비 기록 — 소켓 파서가 아니라 해소된 이름을 넘�
     const a = code.indexOf("let tombRecorded = false;");
     expect(a).toBeGreaterThan(0);
     const seg = code.slice(a, code.indexOf("for (const sid of collectSids(ws.tree))", a));
-    expect(seg).toContain("resolveDeptLaunchName(ws.socket,");
-    expect(seg).toContain('invoke("dept_tombstone_by_socket", { socket: ws.socket, name: tombName.name })');
+    expect(seg).toContain("resolveDeptLaunchName(socket,");
+    expect(seg).toContain('invoke("dept_tombstone_by_socket", { socket, name: tombName.name })');
     // 해소 없이 소켓만 넘기는 옛 호출이 되살아나면 red.
-    expect(seg).not.toContain('invoke("dept_tombstone_by_socket", { socket: ws.socket })');
+    expect(seg).not.toContain('invoke("dept_tombstone_by_socket", { socket })');
   });
 
   it("★그룹 삭제: 등재 조회는 그룹당 1회이고 부서마다 deptLaunchName 으로 이름을 해소한다", () => {
@@ -736,8 +736,8 @@ describe("묘비 기록 — 소켓 파서가 아니라 해소된 이름을 넘�
     const seg = code.slice(g, code.indexOf("const stopFailed: string[] = []", g));
     expect(seg).toContain('rpcT(invoke("list_depts"), T_REG)');
     expect((seg.match(/invoke\("list_depts"\)/g) ?? []).length).toBe(1); // 부서마다 왕복하면 삭제가 N배 느려진다
-    expect(seg).toContain('invoke("dept_tombstone_by_socket", { socket: ws.socket, name: deptLaunchName(ws.socket, grpReg) })');
-    expect(seg).not.toContain('invoke("dept_tombstone_by_socket", { socket: ws.socket })');
+    expect(seg).toContain('invoke("dept_tombstone_by_socket", { socket, name: deptLaunchName(socket, grpReg) })');
+    expect(seg).not.toContain('invoke("dept_tombstone_by_socket", { socket })');
   });
 
   it("★Rust 기록자는 인자 이름을 우선하고, 없을 때만 소켓 파서로 폴백한다(계약 후퇴 없음)", () => {
@@ -1016,14 +1016,18 @@ describe("U2+U3 좌석 배치 배선 — 대표 1/3 · 역할 자리 기억(seat
   });
 
   it("★(F3·리뷰1 minor) 사용자·전출의 의도된 닫기는 exited 경합에도 보류(스피너)로 새지 않는다", () => {
-    // close_surface 를 부르는 8개 지점 전부 invoke 직전에 markClosing 을 부른다 — 하나라도 빠지면
-    // 그 경로만 레이스에 노출된다(RPC 응답을 기다리는 사이 daemon 의 exited 가 먼저 온다).
+    // S6: seven consumers share one guarded invoke; confirmed purge has no close RPC.
+    // Actual rejection/marker/partial-batch behavior runs in closecallbacks.test.ts.
     const closeCalls = [...code.matchAll(/invoke\("close_surface"/g)];
-    expect(closeCalls.length).toBe(8);
-    for (const m of closeCalls) {
-      const before = code.slice(Math.max(0, (m.index ?? 0) - 200), m.index);
-      expect(before).toContain("markClosing(");
-    }
+    expect(closeCalls.length).toBe(1);
+    expect((code.match(/await closePane\(sid, socket\)/g) ?? []).length).toBe(4);
+    expect((code.match(/await closePane\(sid, srcSock\)/g) ?? []).length).toBe(2);
+    expect((code.match(/await closePane\(newSid, destSock\)/g) ?? []).length).toBe(1);
+    const guarded = code.slice(code.indexOf("async function closePane("), code.indexOf("interface PaneRuntime"));
+    expect(guarded).toContain("const release = markClosing(sid, socket);");
+    expect(guarded.indexOf('await invoke("close_surface"')).toBeLessThan(guarded.indexOf("detachPane(sid, socket);"));
+    expect(guarded).toContain("finally {");
+    expect(guarded).toContain("release();");
     expect(code).toContain(
       'removeDeadPane(Number(sid), sock, name !== "surface.closed" && !isClosingSid(Number(sid), sock));',
     );
