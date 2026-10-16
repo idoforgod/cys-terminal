@@ -883,3 +883,24 @@ fn reconciliation_pages_100_rows_with_a_cursor() {
     assert_eq!(p["source"], "persisted");
     assert!(p["age_secs"].as_u64().unwrap() >= 59);
 }
+
+/// A partial request must retain its original proof even if the surface publishes a successor.
+#[test]
+fn c8i_partial_resume_never_borrows_a_successor_proof() {
+    let fx=fx("c8i-proof-stamp");let s=seat(&fx);
+    let original=Arc::new(LostForGood{admits:AtomicUsize::new(0),rechecks:AtomicUsize::new(0),fail_at:1});
+    *s.receiver_proof.lock().unwrap()=Some(original.clone());
+    enqueue(&fx,&s,&"original bound directive ".repeat(400));
+    assert!(hand_off(&fx,&s));
+    assert_eq!(hold_kind(&s),Some(QueueHoldKind::PartialExact));
+    let since=s.queue_hold.lock().unwrap().as_ref().unwrap().since;
+    let wrote=s.inject_track.wrote();
+    *s.receiver_proof.lock().unwrap()=Some(Arc::new(crate::agent_write::PassThrough));
+    let _=crate::governance::queue_write_hold_block_at(&fx.daemon,&s,since+Duration::from_secs(1));
+    wait_until("resume attempt settled",|| queue_len(&s)==0 || (original.admits.load(Ordering::Acquire)==2 && s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| !h.resuming)));
+    assert_eq!(original.admits.load(Ordering::Acquire),2,"partial resume must recheck its captured original proof");
+    assert_eq!(queue_len(&s),1,"successor proof cannot complete an old partial obligation");
+    assert_eq!(s.inject_track.wrote(),wrote,"no byte follows a successor proof");
+    assert!(events(&fx,"queue.delivered").is_empty());
+    assert_eq!(s.queue_hold.lock().unwrap().as_ref().unwrap().since,since,"first partial hold age remains fixed");
+}

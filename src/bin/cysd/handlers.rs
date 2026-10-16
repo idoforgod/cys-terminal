@@ -3331,6 +3331,21 @@ pub(crate) struct SubmitWithhold {
 const SUBMIT_WITHHELD: &str = "submit_withheld:modal";
 
 impl crate::agent_write::Proof for SubmitWithhold {
+    fn admit_context(&self, ctx: &crate::agent_write::ProofContext<'_>) -> Result<(), crate::receiver::ProofLoss> {
+        self.inner.admit_context(ctx)?;
+        // A resumed job can start at Return with no wait; that first call still needs the modal veto.
+        if ctx.next_phase == Some(crate::agent_write::Phase::Submit) && (self.probe)() {
+            return Err(crate::receiver::ProofLoss::Unknown(SUBMIT_WITHHELD.into()));
+        }
+        Ok(())
+    }
+    fn recheck_context(&self, phase: crate::agent_write::Phase, ctx: &crate::agent_write::ProofContext<'_>) -> Result<(), crate::receiver::ProofLoss> {
+        self.inner.recheck_context(phase, ctx)?;
+        if phase == crate::agent_write::Phase::Submit && (self.probe)() {
+            return Err(crate::receiver::ProofLoss::Unknown(SUBMIT_WITHHELD.into()));
+        }
+        Ok(())
+    }
     fn admit(&self) -> Result<(), crate::receiver::ProofLoss> {
         self.inner.admit()
     }

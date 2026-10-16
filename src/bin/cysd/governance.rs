@@ -9618,15 +9618,18 @@ fn queue_write_settle(
 #[derive(Clone)]
 struct HandoffStamp {
     request: Arc<crate::agent_write::Request>,
+    /// The original immutable receiver proof; partial bytes never borrow a successor's authority.
+    proof: Arc<dyn crate::agent_write::Proof>,
     agent_epoch: u64,
     conversation_epoch: u64,
     human_at: Option<std::time::Instant>,
 }
 
 impl HandoffStamp {
-    fn of(s: &crate::state::Surface, request: Arc<crate::agent_write::Request>) -> HandoffStamp {
+    fn of(s: &crate::state::Surface, request: Arc<crate::agent_write::Request>, proof: Arc<dyn crate::agent_write::Proof>) -> HandoffStamp {
         HandoffStamp {
             request,
+            proof,
             agent_epoch: s.agent_epoch.load(Ordering::Acquire),
             conversation_epoch: s.conversation_epoch.load(Ordering::Acquire),
             human_at: *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()),
@@ -10109,7 +10112,7 @@ fn try_resume_partial_write(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>
         let job = crate::agent_write::AgentJob {
             request: r.stamp.request.clone(),
             plan: crate::agent_write::Plan::paste(&r.d.body).with_submit(400, 0),
-            proof: s.agent_proof(),
+            proof: r.stamp.proof.clone(),
             journal: Some(journal),
             resume: Some(envelope),
             settle: Some(queue_write_settle(
@@ -10697,11 +10700,11 @@ pub(crate) fn deliver_head_locked(
         let request_id = request.id.clone();
         let handle = request.clone();
         // ★(0.14.52 · S-a C7b) The epochs and last human keystroke this request is written under (S4-1 resume premises).
-        let stamp = HandoffStamp::of(s, request.clone());
+        let stamp = HandoffStamp::of(s, request.clone(), s.agent_proof());
         let job = crate::agent_write::AgentJob {
             request,
             plan: crate::agent_write::Plan::paste(&d.body).with_submit(400, 0),
-            proof: s.agent_proof(),
+            proof: stamp.proof.clone(),
             journal: Some(journal),
             resume: None,
             settle: Some(queue_write_settle(daemon, s, f.clone(), d.clone(), receipt, request_id, forced, overdue, stamp)),

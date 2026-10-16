@@ -209,6 +209,7 @@ pub struct Request {
     settled: AtomicBool,
     /// When the receiver proof was last lost (admission or recheck): the S4-1 resume window counts from here.
     lost_at: Mutex<Option<Instant>>,
+    native: Mutex<NativeState>,
 }
 
 impl Request {
@@ -223,6 +224,7 @@ impl Request {
             status: Mutex::new(Status::AcceptedPending),
             settled: AtomicBool::new(false),
             lost_at: Mutex::new(None),
+            native: Mutex::new(NativeState::default()),
         })
     }
     /// The terminal is recorded and the producer's settlement has run.
@@ -251,11 +253,114 @@ impl Request {
     }
 }
 
+/// Exact writer-owned facts supplied to receiver proofs; no parser/last-body reconstruction.
+pub struct ProofContext<'a> {
+    pub request: &'a Request,
+    pub plan: &'a Plan,
+    pub envelope: Envelope,
+    pub accepted: Accepted,
+    pub resumed: bool,
+    pub phase_offset: usize,
+    pub next_phase: Option<Phase>,
+}
+
+/// Request-lifetime native progress. Unknown completion is sticky across later exact results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct NativeProgress {
+    pub accepted_total: u64,
+    pub outstanding: bool,
+    pub unknown: bool,
+    pub envelope: Envelope,
+    pub run_accepted: Accepted,
+}
+
+impl NativeProgress {
+    pub fn proven_zero(&self) -> bool {
+        self.accepted_total == 0 && self.envelope == Envelope::default() && !self.outstanding && !self.unknown
+    }
+}
+
+#[derive(Default)]
+struct NativeState {
+    progress: NativeProgress,
+    plan: Option<Plan>,
+    running: bool,
+    resume: Option<Envelope>,
+    final_outcome: bool,
+}
+
+impl Request {
+    pub fn native_progress(&self) -> NativeProgress {
+        self.native.lock().unwrap_or_else(|e| e.into_inner()).progress
+    }
+    fn begin_run(&self, plan: &Plan, resume: Option<Envelope>) -> Result<(), NativeProgress> {
+        let mut state=self.native.lock().unwrap_or_else(|e| e.into_inner());
+        let p=state.progress;
+        let permitted=match resume {
+            Some(env)=>state.resume==Some(env) && env==p.envelope,
+            None=>state.resume.is_none() && p.proven_zero(),
+        };
+        if state.running || state.final_outcome || p.outstanding || p.unknown || !permitted
+            || state.plan.as_ref().is_some_and(|original|original!=plan) {
+            return Err(p);
+        }
+        if state.plan.is_none() { state.plan=Some(plan.clone()); }
+        state.running=true;
+        state.resume=None;
+        state.progress.run_accepted=Accepted::default();
+        self.settled.store(false, Ordering::Release);
+        Ok(())
+    }
+    fn end_run(&self, terminal: &Terminal) {
+        let mut state=self.native.lock().unwrap_or_else(|e| e.into_inner());
+        state.running=false;
+        state.resume=match terminal { Terminal::PartialExact{envelope,..}=>Some(*envelope),_=>None };
+        state.final_outcome=!matches!(terminal,Terminal::RefusedNoWrite{..}|Terminal::PartialExact{..});
+    }
+    fn native_call(&self, envelope: Envelope, accepted: Accepted, write: bool) -> NativeCall<'_> {
+        let mut state=self.native.lock().unwrap_or_else(|e| e.into_inner());
+        let p=&mut state.progress;
+        p.outstanding=true;
+        p.envelope=envelope;
+        p.run_accepted=accepted;
+        if write { p.run_accepted.calls+=1; }
+        NativeCall { request:self, completed:false }
+    }
+}
+
+/// Never holds a mutex across native I/O. A panic leaves an unknown result, not an invented zero.
+struct NativeCall<'a> { request: &'a Request, completed: bool }
+impl NativeCall<'_> {
+    fn complete(mut self, n: usize, envelope: Envelope, accepted: Accepted) {
+        let mut state=self.request.native.lock().unwrap_or_else(|e| e.into_inner());
+        let p=&mut state.progress;
+        p.accepted_total=match p.accepted_total.checked_add(n as u64) {
+            Some(total)=>total,
+            None=>{p.unknown=true;u64::MAX}
+        };
+        p.envelope=envelope;
+        p.run_accepted=accepted;
+        p.outstanding=false;
+        self.completed=true;
+    }
+}
+impl Drop for NativeCall<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut state=self.request.native.lock().unwrap_or_else(|e| e.into_inner());
+            state.progress.unknown=true;
+            state.progress.outstanding=false;
+        }
+    }
+}
+
 /// The receiver proof the writer consults. `admit` runs once, after the journal barrier and before
 /// the first byte (binding + current input state); `recheck` runs before every later OS call.
 pub trait Proof: Send + Sync {
     fn admit(&self) -> Result<(), ProofLoss>;
     fn recheck(&self, phase: Phase) -> Result<(), ProofLoss>;
+    fn admit_context(&self, _ctx: &ProofContext<'_>) -> Result<(), ProofLoss> { self.admit() }
+    fn recheck_context(&self, phase: Phase, _ctx: &ProofContext<'_>) -> Result<(), ProofLoss> { self.recheck(phase) }
 }
 
 /// Durable request journal (design 4.4 step 2 / 4.5): `writing` must be durable before any byte;
@@ -318,16 +423,11 @@ pub struct Executed {
 impl Executed {
     /// A panic inside a job: the amount is unknown (a lower bound, never zero by assumption).
     pub fn panicked(job: &AgentJob) -> Executed {
-        Executed {
-            terminal: Terminal::PartialUnknown {
-                envelope: job.resume.unwrap_or_default(),
-                accepted: Accepted::default(),
-                reason: "writer_panic".into(),
-            },
-            envelope: job.resume.unwrap_or_default(),
-            transport_broken: false,
-            journaled: job.journal.is_some(),
-        }
+        let progress=job.request.native_progress();
+        let terminal=Terminal::PartialUnknown { envelope:progress.envelope,
+            accepted:progress.run_accepted, reason:"writer_panic".into() };
+        job.request.end_run(&terminal);
+        Executed { terminal, envelope:progress.envelope, transport_broken:false, journaled:job.journal.is_some() }
     }
     /// Body text accepted so far (lossy only at a short-write cut inside a character).
     pub fn accepted_body(&self, plan: &Plan) -> Option<String> {
@@ -373,14 +473,15 @@ fn calls_for(plan: &Plan, from: &Envelope) -> Vec<(Phase, Vec<u8>)> {
 }
 
 /// One run's accounting.
-struct Run {
+struct Run<'a> {
+    request: &'a Request,
     env: Envelope,
     acc: Accepted,
     resumed: bool,
     journaled: bool,
 }
 
-impl Run {
+impl Run<'_> {
     fn account(&mut self, phase: Phase, n: usize, offered: usize) {
         self.acc.calls += 1;
         let whole = n == offered;
@@ -416,7 +517,7 @@ impl Run {
     /// cancellation; a resumed request already owns composer bytes and is never "no write"; after
     /// bytes, only a resumable loss at a byte-exact point is PartialExact.
     fn stop(&self, reason: String, exact: bool) -> Terminal {
-        if self.acc.total() == 0 && !self.resumed {
+        if self.acc.total() == 0 && !self.resumed && self.request.native_progress().proven_zero() {
             return if reason == "cancelled" { Terminal::CancelledBeforeWrite } else { Terminal::RefusedNoWrite { reason } };
         }
         if exact {
@@ -427,6 +528,7 @@ impl Run {
     }
 
     fn done(&self, terminal: Terminal, transport_broken: bool) -> Executed {
+        self.request.end_run(&terminal);
         Executed { terminal, envelope: self.env, transport_broken, journaled: self.journaled }
     }
 }
@@ -435,7 +537,12 @@ impl Run {
 pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) -> Executed {
     let req = &job.request;
     let start = job.resume.unwrap_or_default();
-    let mut run = Run { env: start, acc: Accepted::default(), resumed: job.resume.is_some(), journaled: false };
+    let mut run = Run { request:req, env: start, acc: Accepted::default(), resumed: job.resume.is_some(), journaled: false };
+    if let Err(progress)=req.begin_run(&job.plan, job.resume) {
+        return Executed { terminal: Terminal::PartialUnknown { envelope:progress.envelope,
+            accepted:Accepted::default(), reason:"native_progress_conflict".into() }, envelope:progress.envelope,
+            transport_broken:false, journaled:false };
+    }
     if req.is_cancelled() {
         return run.done(run.stop("cancelled".into(), false), false);
     }
@@ -456,14 +563,16 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
         return run.done(run.stop(GUARD_ABORTED.into(), true), false);
     }
     req.set(Status::Writing);
-    if let Err(loss) = job.proof.admit() {
+    let calls=calls_for(&job.plan,&start);
+    if let Err(loss) = job.proof.admit_context(&ProofContext { request:req, plan:&job.plan,
+        envelope:run.env, accepted:run.acc, resumed:run.resumed, phase_offset:0, next_phase:calls.first().map(|(phase,_)|*phase) }) {
         req.mark_lost();
         return run.done(run.stop(loss.reason(), loss.resumable()), false);
     }
     let mut proven = true; // the admission just above proves the next call
     let mut first_byte = true;
     let mut prev: Option<Phase> = None;
-    for (phase, bytes) in calls_for(&job.plan, &start) {
+    for (phase, bytes) in calls {
         // Spacing that already exists in the transport is kept; every wait voids the proof.
         if prev == Some(Phase::Clear) && job.plan.clear_settle_ms > 0 {
             (io.sleep)(Duration::from_millis(job.plan.clear_settle_ms));
@@ -489,7 +598,8 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
                 return run.done(run.stop("cancelled".into(), false), false);
             }
             if !proven {
-                if let Err(loss) = job.proof.recheck(phase) {
+                if let Err(loss) = job.proof.recheck_context(phase, &ProofContext { request:req, plan:&job.plan,
+                    envelope:run.env, accepted:run.acc, resumed:run.resumed, phase_offset:off, next_phase:Some(phase) }) {
                     req.mark_lost();
                     // Byte-exact resume point: inside the body (its offset is exact) or before the
                     // first byte of a call. A half-written fence/control/Return is not resumable.
@@ -503,10 +613,15 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
             }
             proven = false;
             let slice = &bytes[off..];
+            let native=req.native_call(run.env,run.acc,true);
             match writer.write(slice) {
-                Ok(0) => return run.done(run.stop("transport:write_zero".into(), false), true),
+                Ok(0) => {
+                    run.acc.calls+=1; native.complete(0,run.env,run.acc);
+                    return run.done(run.stop("transport:write_zero".into(), false), true);
+                },
                 Ok(n) => {
                     run.account(phase, n, slice.len());
+                    native.complete(n,run.env,run.acc);
                     off += n;
                     if phase == Phase::Body {
                         if let Some(body) = job.plan.body.as_deref() {
@@ -515,12 +630,21 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
                             }
                         }
                     }
-                    if let Err(e) = writer.flush() {
+                    let flush=req.native_call(run.env,run.acc,false);
+                    let result=writer.flush();
+                    flush.complete(0,run.env,run.acc);
+                    if let Err(e) = result {
                         return run.done(run.stop(format!("transport:{e}"), false), true);
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => run.acc.calls += 1,
-                Err(e) => return run.done(run.stop(format!("transport:{e}"), false), true),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    run.acc.calls+=1; native.complete(0,run.env,run.acc);
+                },
+                Err(e) => {
+                    // Write::write's Err contract accepts no bytes; native panics use the RAII unknown path.
+                    run.acc.calls+=1; native.complete(0,run.env,run.acc);
+                    return run.done(run.stop(format!("transport:{e}"), false), true);
+                },
             }
         }
     }
@@ -554,6 +678,7 @@ pub fn finish(job: AgentJob, ex: &Executed) -> Terminal {
             }
         }
     }
+    job.request.end_run(&terminal);
     job.request.set(Status::Terminal(terminal.clone()));
     if let Some(settle) = job.settle {
         let t = terminal.clone();
@@ -1176,7 +1301,14 @@ mod tests {
     /// A resumed request already owns composer bytes: a failed admission is never RefusedNoWrite.
     #[test]
     fn resumed_request_whose_admission_fails_is_never_refused_no_write() {
-        let env = Envelope { opened: true, body_offset: 10, ..Envelope::default() };
+        // Construct the prefix through the writer, so the Request owns actual PartialExact authority.
+        let held = || {
+            let mut j=job(Plan::paste(&long_body()).with_submit(0,0),FakeProof::failing_at(1,ProofLoss::Unknown("initial".into())));
+            let mut w=Rec::new();w.script=VecDeque::from([Step::Short(usize::MAX),Step::Short(10)]);
+            let ex=run_job(&mut w,&j);assert!(matches!(ex.terminal,Terminal::PartialExact{..}));
+            assert_eq!(ex.envelope,Envelope { opened:true, body_offset:10, ..Envelope::default() });
+            j.resume=Some(ex.envelope);j
+        };
         let cases = [
             (ProofLoss::Unknown("u".into()), "partial_exact"),
             (ProofLoss::ContraryForeground, "partial_exact"),
@@ -1184,16 +1316,14 @@ mod tests {
             (ProofLoss::Changed, "partial_unknown"),
         ];
         for (loss, kind) in cases {
-            let mut j = job(Plan::paste(&long_body()).with_submit(0, 0), FakeProof::refusing(loss.clone()));
-            j.resume = Some(env);
+            let mut j=held();let env=j.resume.unwrap();j.proof=FakeProof::refusing(loss.clone());
             let mut w = Rec::new();
             let ex = run_job(&mut w, &j);
             assert_eq!(ex.terminal.kind(), kind, "{loss:?}");
             assert_eq!(ex.envelope, env);
             assert_eq!(w.attempts, 0);
         }
-        let mut j = job(Plan::paste("x").with_submit(0, 0), FakeProof::healthy());
-        j.resume = Some(env);
+        let j=held();
         j.request.cancel();
         assert_eq!(run_job(&mut Rec::new(), &j).terminal.kind(), "partial_unknown");
         // A fresh request refused at admission writes zero bytes.
@@ -1470,4 +1600,201 @@ mod tests {
         assert!(!text.contains("hello") && !text.contains("가나"), "journal must not carry body text");
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct ContextRow { admit: bool, phase: Option<Phase>, offset: usize, body: usize, control: u64, payload: u64, resumed: bool }
+    struct ContextProof { rows: Mutex<Vec<ContextRow>>, request: Arc<Request>, plan: Plan }
+    impl ContextProof {
+        fn record(&self, phase: Option<Phase>, ctx: &ProofContext<'_>) {
+            assert!(std::ptr::eq(ctx.request, self.request.as_ref()), "proof context must retain the original request object");
+            assert!(!ctx.request.is_settled(), "an active resumed run cannot remain marked settled from its prior run");
+            assert_eq!(ctx.plan, &self.plan, "proof context must retain every immutable plan field");
+            self.rows.lock().unwrap().push(ContextRow { admit: phase.is_none(), phase, offset: ctx.phase_offset,
+                body: ctx.envelope.body_offset, control: ctx.accepted.control, payload: ctx.accepted.payload, resumed: ctx.resumed });
+        }
+    }
+    impl Proof for ContextProof {
+        fn admit(&self) -> Result<(), ProofLoss> { Ok(()) }
+        fn recheck(&self, _: Phase) -> Result<(), ProofLoss> { Ok(()) }
+        fn admit_context(&self, ctx: &ProofContext<'_>) -> Result<(), ProofLoss> { self.record(None,ctx); Ok(()) }
+        fn recheck_context(&self, phase: Phase, ctx: &ProofContext<'_>) -> Result<(), ProofLoss> { self.record(Some(phase),ctx); Ok(()) }
+    }
+
+    #[test]
+    fn c8i_context_reaches_admission_short_retry_interrupted_retry_and_submit() {
+        let mut j=job(Plan::raw("abcdef").with_clear(1).with_submit(1,0),FakeProof::healthy());
+        let p=Arc::new(ContextProof{rows:Mutex::new(Vec::new()),request:j.request.clone(),plan:j.plan.clone()});j.proof=p.clone();
+        let mut w=Rec::new();w.script=VecDeque::from([Step::Short(1),Step::Short(2),Step::Intr,Step::Short(4),Step::Short(1)]);
+        let ex=run_job(&mut w,&j);assert!(matches!(ex.terminal,Terminal::WrittenSubmitted{..}));
+        let got=p.rows.lock().unwrap().clone();
+        let want=vec![
+            ContextRow{admit:true,phase:None,offset:0,body:0,control:0,payload:0,resumed:false},
+            ContextRow{admit:false,phase:Some(Phase::Body),offset:0,body:0,control:1,payload:0,resumed:false},
+            ContextRow{admit:false,phase:Some(Phase::Body),offset:2,body:2,control:1,payload:2,resumed:false},
+            ContextRow{admit:false,phase:Some(Phase::Body),offset:2,body:2,control:1,payload:2,resumed:false},
+            ContextRow{admit:false,phase:Some(Phase::Submit),offset:0,body:6,control:1,payload:6,resumed:false},
+        ];
+        assert_eq!(got,want,"each proof sees the exact writer-owned progress at its call boundary");
+    }
+
+    #[test]
+    fn c8i_resumed_admission_keeps_original_prefix_and_per_run_counts() {
+        let mut j=job(Plan::raw("abcdef").with_submit(0,0),FakeProof::healthy());
+        j.proof=FakeProof::failing_at(0,ProofLoss::Unknown("once".into()));
+        let mut first=Rec::new();first.script=VecDeque::from([Step::Short(2)]);
+        let first_ex=run_job(&mut first,&j);assert!(matches!(first_ex.terminal,Terminal::PartialExact{..}));
+        assert_eq!(first.bytes(),b"ab");
+        let request=j.request.clone();let plan=j.plan.clone();finish(j,&first_ex);
+        assert!(request.is_settled(),"premise: first run settled");
+        let mut j=job(plan,FakeProof::healthy());j.request=request;j.resume=Some(first_ex.envelope);
+        let p=Arc::new(ContextProof{rows:Mutex::new(Vec::new()),request:j.request.clone(),plan:j.plan.clone()});j.proof=p.clone();
+        let mut w=Rec::new();let ex=run_job(&mut w,&j);assert!(matches!(ex.terminal,Terminal::WrittenSubmitted{..}));
+        assert_eq!(w.bytes(),b"cdef\r");
+        assert_eq!(*p.rows.lock().unwrap(),vec![
+            ContextRow{admit:true,phase:None,offset:0,body:2,control:0,payload:0,resumed:true},
+            ContextRow{admit:false,phase:Some(Phase::Submit),offset:0,body:6,control:0,payload:4,resumed:true},
+        ],"resume proof sees cumulative prefix and only this run's accepted bytes");
+        let progress=j.request.native_progress();
+        assert_eq!(progress.accepted_total,7,"same-request resume preserves both runs' accepted bytes");
+        assert_eq!(progress.run_accepted.payload,4,"per-run accounting resets independently");
+        assert_eq!(progress.envelope,ex.envelope);
+    }
+
+    struct NativeWatch { request: Arc<Request>, seen: Vec<NativeProgress>, panic_at: Option<usize>, max: usize }
+    impl Write for NativeWatch {
+        fn write(&mut self, b:&[u8])->std::io::Result<usize> {
+            self.seen.push(self.request.native_progress());
+            if self.panic_at==Some(self.seen.len()) { panic!("controlled native uncertainty"); }
+            Ok(b.len().min(self.max))
+        }
+        fn flush(&mut self)->std::io::Result<()> { Ok(()) }
+    }
+    fn run_native_watch(w:&mut NativeWatch,j:&AgentJob)->Executed {
+        let mut last=None;let mut first=||{};let mut body=|_:&str|{};
+        let mut io=WriterIo{sleep:&|_|{},last_program_write:&mut last,on_first_byte:&mut first,on_body_written:&mut body};
+        execute(w,j,&mut io)
+    }
+
+    #[test]
+    fn c8i_native_progress_covers_fence_bytes_and_outstanding_call() {
+        let j=job(Plan::paste("x").with_submit(0,0),FakeProof::healthy());
+        let mut w=NativeWatch{request:j.request.clone(),seen:Vec::new(),panic_at:None,max:2};
+        let ex=run_native_watch(&mut w,&j);assert!(matches!(ex.terminal,Terminal::WrittenSubmitted{..}));
+        assert!(w.seen.iter().all(|p|p.outstanding&&!p.proven_zero()),"every issued native write is outstanding even before a body byte");
+        assert_eq!(w.seen[1].accepted_total,2,"partial opening fence contributes to the accepted lower bound");
+        assert_eq!(w.seen[1].envelope.body_offset,0);
+        let end=j.request.native_progress();
+        assert_eq!(end.accepted_total,j.plan.planned_bytes().len() as u64,"every accepted fence body and control byte stays accounted");
+        assert!(!end.outstanding&&!end.unknown&&!end.proven_zero());
+        assert_eq!(end.envelope,ex.envelope);
+    }
+
+    #[test]
+    fn c8i_panic_preserves_known_prefix_and_marks_unknown_completion() {
+        let j=job(Plan::raw("abcdef").with_submit(0,0),FakeProof::healthy());
+        let mut w=NativeWatch{request:j.request.clone(),seen:Vec::new(),panic_at:Some(2),max:2};
+        let unwind=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||run_native_watch(&mut w,&j)));
+        let panic=match unwind { Err(p)=>p,Ok(_)=>panic!("premise: native write must unwind") };
+        let message=panic.downcast_ref::<&str>().copied().or_else(||panic.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(message,Some("controlled native uncertainty"),"panic must originate in the intended native fixture");
+        assert_eq!(w.seen.len(),2);
+        let progress=j.request.native_progress();
+        assert!(progress.unknown&&!progress.outstanding&&!progress.proven_zero(),"native unwind leaves sticky unknown completion, never exact zero");
+        assert_eq!(progress.accepted_total,2,"known lower bound survives uncertain later completion");
+        let ex=Executed::panicked(&j);
+        assert_eq!(ex.envelope.body_offset,2,"panic conversion preserves the last exact prefix");
+        assert!(matches!(ex.terminal,Terminal::PartialUnknown{accepted:Accepted{payload:2,..},..}),"panic terminal retains this run's known accepted prefix");
+    }
+
+    #[test]
+    fn c8i_progress_is_visible_before_body_callback_and_flush() {
+        struct FlushWatch { request: Arc<Request>, flushes: usize }
+        impl Write for FlushWatch {
+            fn write(&mut self,b:&[u8])->std::io::Result<usize>{Ok(b.len())}
+            fn flush(&mut self)->std::io::Result<()>{self.flushes+=1;let p=self.request.native_progress();assert_eq!(p.accepted_total,3,"flush sees the accepted body lower bound");assert_eq!(p.envelope.body_offset,3);assert!(p.outstanding,"flush keeps the native call outstanding");Ok(())}
+        }
+        let j=job(Plan::raw("xyz"),FakeProof::healthy());let mut w=FlushWatch{request:j.request.clone(),flushes:0};let mut last=None;let mut first=||{};let mut callbacks=0;
+        let mut callback=|_:&str|{callbacks+=1;let p=j.request.native_progress();assert_eq!(p.accepted_total,3,"accepted bytes are published before body settlement callbacks");assert_eq!(p.envelope.body_offset,3);assert!(!p.outstanding);};
+        let mut io=WriterIo{sleep:&|_|{},last_program_write:&mut last,on_first_byte:&mut first,on_body_written:&mut callback};
+        let ex=execute(&mut w,&j,&mut io);assert!(matches!(ex.terminal,Terminal::WrittenBody{..}));
+        assert_eq!(callbacks,1,"the body callback is exercised");assert_eq!(w.flushes,1,"the flush observer is exercised");
+    }
+
+    #[test]
+    fn c8i_submit_wrapper_forwards_writer_context() {
+        let mut j=job(Plan::raw("abc").with_submit(0,0),FakeProof::healthy());
+        let p=Arc::new(ContextProof{rows:Mutex::new(Vec::new()),request:j.request.clone(),plan:j.plan.clone()});
+        j.proof=Arc::new(crate::handlers::SubmitWithhold{inner:p.clone(),probe:Arc::new(||false)});
+        let mut w=Rec::new();let ex=run_job(&mut w,&j);assert!(matches!(ex.terminal,Terminal::WrittenSubmitted{..}));
+        assert_eq!(*p.rows.lock().unwrap(),vec![
+            ContextRow{admit:true,phase:None,offset:0,body:0,control:0,payload:0,resumed:false},
+            ContextRow{admit:false,phase:Some(Phase::Submit),offset:0,body:3,control:0,payload:3,resumed:false},
+        ],"submit wrapper forwards exact admission and final Return context");
+        let mut held=job(Plan::raw("abc").with_submit(0,0),FakeProof::healthy());
+        let hp=Arc::new(ContextProof{rows:Mutex::new(Vec::new()),request:held.request.clone(),plan:held.plan.clone()});
+        held.proof=Arc::new(crate::handlers::SubmitWithhold{inner:hp.clone(),probe:Arc::new(||true)});
+        let mut hw=Rec::new();let hx=run_job(&mut hw,&held);
+        assert_eq!(hw.bytes(),b"abc","a modal withholds the dependent Return after context forwarding");
+        assert!(matches!(hx.terminal,Terminal::PartialExact{reason,..} if reason.contains("submit_withheld")),"wrapper retains its typed modal hold");
+        assert_eq!(hp.rows.lock().unwrap().len(),2,"modal path still checks the original receiver context");
+    }
+
+    #[test]
+    fn c8i_first_native_panic_cannot_be_readmitted_as_zero() {
+        let j=job(Plan::raw("x"),FakeProof::healthy());
+        let mut w=NativeWatch{request:j.request.clone(),seen:Vec::new(),panic_at:Some(1),max:1};
+        let panic=match std::panic::catch_unwind(std::panic::AssertUnwindSafe(||run_native_watch(&mut w,&j))) { Err(p)=>p,Ok(_)=>panic!("first native call must unwind") };
+        assert_eq!(panic.downcast_ref::<&str>().copied(),Some("controlled native uncertainty"));assert_eq!(w.seen.len(),1);
+        let p=j.request.native_progress();
+        assert_eq!(p.accepted_total,0,"premise: no exact accepted lower bound");
+        assert!(!p.outstanding,"premise: the call unwound");
+        assert!(p.unknown&&!p.proven_zero(),"zero lower bound after native uncertainty is not proven zero");
+        let mut next=NativeWatch{request:j.request.clone(),seen:Vec::new(),panic_at:None,max:1};
+        let result=run_native_watch(&mut next,&j);
+        assert!(next.seen.is_empty(),"unknown native completion forbids later readmission even at zero lower bound");
+        assert!(matches!(result.terminal,Terminal::PartialUnknown{..}));
+        assert!(j.request.native_progress().unknown,"new run initialization never erases unknown completion");
+    }
+
+    #[test]
+    fn c8i_partial_fence_never_becomes_a_resumable_default_envelope() {
+        let mut j=job(Plan::paste("abc").with_submit(0,0),FakeProof::failing_at(0,ProofLoss::Unknown("during-fence".into())));
+        let mut w=Rec::new();w.script=VecDeque::from([Step::Short(2)]);
+        let first=run_job(&mut w,&j);assert!(matches!(first.terminal,Terminal::PartialUnknown{..}));
+        assert_eq!(first.envelope,Envelope::default());assert_eq!(w.bytes().len(),2);
+        j.resume=Some(first.envelope);j.proof=FakeProof::healthy();let mut next=Rec::new();let result=run_job(&mut next,&j);
+        assert_eq!(next.attempts,0,"an exact native count inside a partial fence grants no resume authority");
+        assert!(matches!(result.terminal,Terminal::PartialUnknown{..}));
+    }
+
+    #[test]
+    fn c8i_resume_rejects_changed_clear_or_submit_plan() {
+        let mut j=job(Plan::raw("abcdef").with_submit(0,0),FakeProof::failing_at(0,ProofLoss::Unknown("once".into())));
+        let mut w=Rec::new();w.script=VecDeque::from([Step::Short(2)]);
+        let first=run_job(&mut w,&j);assert!(matches!(first.terminal,Terminal::PartialExact{..}));
+        j.resume=Some(first.envelope);j.proof=FakeProof::healthy();j.plan=j.plan.clone().with_clear(1);
+        let mut next=Rec::new();let result=run_job(&mut next,&j);
+        assert_eq!(next.attempts,0,"same body and offset do not authorize a changed clear/submit plan");
+        assert!(matches!(result.terminal,Terminal::PartialUnknown{..}));
+    }
+
+    #[test]
+    fn c8i_completed_request_cannot_report_a_second_submission() {
+        let mut j=job(Plan::raw("abc").with_submit(0,0),FakeProof::healthy());
+        let first=run_job(&mut Rec::new(),&j);assert!(matches!(first.terminal,Terminal::WrittenSubmitted{..}));
+        j.resume=Some(first.envelope);let mut next=Rec::new();let result=run_job(&mut next,&j);
+        assert_eq!(next.attempts,0);
+        assert!(matches!(result.terminal,Terminal::PartialUnknown{..}),"a completed request cannot create another terminal success via empty resume");
+    }
+
+    #[test]
+    fn c8i_resumed_return_checks_modal_without_a_spacing_wait() {
+        let mut j=job(Plan::raw("abc").with_submit(0,0),FakeProof::healthy());
+        j.proof=Arc::new(crate::handlers::SubmitWithhold{inner:FakeProof::healthy(),probe:Arc::new(||true)});
+        let mut first=Rec::new();let ex=run_job(&mut first,&j);
+        assert!(matches!(ex.terminal,Terminal::PartialExact{..}));assert_eq!(first.bytes(),b"abc");
+        j.resume=Some(ex.envelope);let mut second=Rec::new();let resumed=run_job(&mut second,&j);
+        assert_eq!(second.attempts,0,"resumed Return checks the modal even when no spacing wait invalidates admission");
+        assert!(matches!(resumed.terminal,Terminal::PartialExact{reason,..} if reason.contains("submit_withheld")));
+    }
+
 }
