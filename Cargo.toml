@@ -96,6 +96,9 @@ windows-sys = { version = "0.59", features = [
     # ★(0.14.31 · WP-4) LockFileEx/UnlockFile — phoenix restore.lease(msvcrt byte0 락)와
     #   **같은 바이트 범위**를 비차단으로 잡아 부활과 역할 재결합의 동시 진행을 막는다.
     "Win32_Storage_FileSystem",
+    # ★(0.14.52 · S-a) NtQueryInformationProcess — parent pid + command line of a retained agent
+    #   handle (src/process_observation.rs windows_backend) for per-write receiver identity.
+    "Wdk_System_Threading",
 ] }
 
 # Windows 전용(호스트 게이트): cys.exe·cysd.exe(순수 Rust CLI)에 PE 버전리소스·매니페스트·아이콘을
