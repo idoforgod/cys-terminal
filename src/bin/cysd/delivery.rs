@@ -308,6 +308,8 @@ impl Origin {
 /// 인계 시각)이 **분리**돼 있어 "기록됐으나 인계되지 못한" 배달(다음 틱 재시도)과 실제 인계를
 /// 원장만으로 가른다. 인계 뒤 이 줄을 쓰기 전에 데몬이 죽으면 그 배달은 '인계 불명' 으로 남는다
 /// (정직한 결손 — 사후 재구성하지 않는다).
+/// ★(0.14.52 · S-a) The queue now writes this line from the writer's settlement, only after the body and
+/// its Return were written (`governance::settle_queue_write`); `delivered_at` is that moment.
 ///
 /// 판독자 호환: `v`=1 · `surface`·`ts_epoch`·`sha256` 필수 키 보유(javis_mission 은 sha 로 색인하나
 /// 이 sha 는 어떤 프롬프트와도 일치하지 않는다) · origin `queue_receipt`(계수 분리).

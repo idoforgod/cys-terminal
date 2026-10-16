@@ -1032,6 +1032,48 @@ pub struct InjectReservation {
     pub guard: Arc<InjectGuard>,
 }
 
+/// ★(0.14.52 · S-a) Why this seat's queue is held after an agent-write terminal (design 4.5/4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueHoldKind {
+    /// Refused before any byte (receiver proof / journal): retried on backoff 1, 2, 4, 8, then 30 s.
+    Refused,
+    /// Stopped byte-exactly by a resumable loss: only the SAME request may continue (S4-1);
+    /// nothing else is typed into this seat meanwhile. The hand-off reservation is kept.
+    PartialExact,
+    /// Stopped at an unknown point: never retyped; reconciliation owns it. Reservation kept.
+    PartialUnknown,
+}
+
+/// ★(0.14.52 · S-a) One hold episode of a seat's queue. Leaf lock; one coalesced notice per episode.
+#[derive(Debug, Clone)]
+pub struct QueueHold {
+    pub kind: QueueHoldKind,
+    pub reason: String,
+    pub request_id: String,
+    pub entry_ids: Vec<String>,
+    /// Start of the episode (kept across same-kind retries).
+    pub since: Instant,
+    /// Refusals in this episode (Refused only).
+    pub attempts: u32,
+    /// Earliest tick retry (Refused only).
+    pub next_retry: Option<Instant>,
+    /// Where a partial request stopped.
+    pub envelope: Option<crate::agent_write::Envelope>,
+    /// The episode's single notice was published.
+    pub notified: bool,
+}
+
+/// Refused-hold retry backoff (design 4.6): 1, 2, 4, 8, then 30 seconds.
+pub const QUEUE_HOLD_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 30];
+
+pub fn queue_hold_backoff(attempts: u32) -> std::time::Duration {
+    let i = (attempts.max(1) as usize - 1).min(QUEUE_HOLD_BACKOFF_SECS.len() - 1);
+    std::time::Duration::from_secs(QUEUE_HOLD_BACKOFF_SECS[i])
+}
+
+/// ★(0.14.52 · S-a) Writer request journal file in the state directory.
+pub const WRITER_JOURNAL_FILE: &str = "writer-journal.jsonl";
+
 /// ★(0.14.42 · A2) 짝 Return 흡수 표의 종류 — 발급 사유가 곧 흡수 응답의 `absorb_kind` 다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReturnTicketKind {
@@ -1851,6 +1893,11 @@ pub struct Surface {
     /// 같은 좌석의 이중 인계도 이것이 막는다(`pending_queue` 락 안에서 검사·설정).
     /// 락 순서: `pending_queue` → (`input_gate`) → `inject_reservation`(leaf).
     pub inject_reservation: Mutex<Option<InjectReservation>>,
+    /// ★(0.14.52 · S-a) Queue hold after an agent-write terminal ([`QueueHold`]). Leaf lock.
+    pub queue_hold: Mutex<Option<QueueHold>>,
+    /// ★(0.14.52 · S-a) Receiver proof for this seat's agent writes; `None` = pass-through until the
+    /// receiver binding is wired. Leaf lock (cloned out before use).
+    pub receiver_proof: Mutex<Option<Arc<dyn crate::agent_write::Proof>>>,
     /// ★(0.14.31 · WP-5 폭주 완충) 이 surface 의 **마지막 큐 배달 시각** — 틱·overdue·강제·
     /// rehome 어느 경로든 `deliver_head_locked` 가 인계에 성공한 순간 찍는다(같은 시계). 호출부
     /// 게이트가 `governance::queue_min_interval_secs()`(기본 10s) 미만이면 배달을 보류한다.
@@ -2139,6 +2186,15 @@ impl Surface {
     /// 지금 인계 예약이 걸려 있는가(같은 좌석의 이중 인계 차단 · 배달 임계영역 전용).
     pub fn inject_reserved(&self) -> bool {
         self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// ★(0.14.52 · S-a) The proof an agent write to this seat uses now (pass-through until bound).
+    pub fn agent_proof(&self) -> Arc<dyn crate::agent_write::Proof> {
+        self.receiver_proof
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::agent_write::PassThrough))
     }
     /// ★(0.14.31 · WP-5 B-2②) `pending_input_bytes` 의 **유일한 쓰기 API** — 값을 쓰고 변이 세대
     /// (`input_gen`)를 올린다. 직접 `store` 하면 세대가 멈춰 stale 리셋이 ABA 를 놓친다(테스트 픽스처
@@ -3713,6 +3769,10 @@ pub struct Daemon {
     pub queue_wal_unpreserved: Mutex<std::collections::BTreeSet<&'static str>>,
     pub config: Config,
     pub socket_path: PathBuf,
+    /// ★(0.14.52 · S-a) Writer request journal ([`WRITER_JOURNAL_FILE`]), opened on first use.
+    pub writer_journal: Mutex<Option<Arc<crate::agent_write::FileJournal>>>,
+    /// Requests an earlier daemon run left `writing` without a terminal (restore as PartialUnknown).
+    pub writer_inconclusive: Mutex<Vec<crate::agent_write::Inconclusive>>,
     pub started_at: f64,
     /// ★(0.14.31 · 리뷰 R1 · codex major) **단조 기동 기준점**. `started_at`(epoch)은 벽시계라
     /// NTP 보정·수동 시각 변경에 앞뒤로 뛴다 — 경과시간 창(부트 유예·쿨다운·시간당 상한)을
@@ -5587,6 +5647,8 @@ impl Daemon {
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
+            writer_journal: Mutex::new(None),
+            writer_inconclusive: Mutex::new(Vec::new()),
             started_at: now_epoch(),
             started_instant: Instant::now(),
             consumption: Mutex::new(Consumption::default()),
@@ -5765,6 +5827,23 @@ impl Daemon {
                    "resolver_surface": snapshot.resolver_surface}),
         );
         Some(snapshot)
+    }
+
+    /// ★(0.14.52 · S-a) The writer request journal, opened on first use. While it cannot be opened
+    /// every agent write is refused before its first byte (design 4.4 step 2) and the next write
+    /// tries again, so a transient state-directory error heals without a restart.
+    pub fn agent_journal(&self) -> Arc<dyn crate::agent_write::Journal> {
+        let mut slot = self.writer_journal.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            match crate::agent_write::FileJournal::open(state_dir(&self.socket_path).join(WRITER_JOURNAL_FILE)) {
+                Ok((j, inconclusive)) => {
+                    self.writer_inconclusive.lock().unwrap_or_else(|e| e.into_inner()).extend(inconclusive);
+                    *slot = Some(Arc::new(j));
+                }
+                Err(e) => return Arc::new(crate::agent_write::UnavailableJournal(e.to_string())),
+            }
+        }
+        slot.clone().expect("journal opened above")
     }
 
     /// Feed 항목 스냅샷 한 줄을 JSONL에 append (영속화 — 데몬 재시작 복원용).
@@ -6582,6 +6661,8 @@ impl Daemon {
             // ★(0.14.31 · WP-5) 만료 큐·배달 간격 시계·stale 입력 관측 — 전부 빈 채로 출발.
             expired_queue: Mutex::new(std::collections::VecDeque::new()),
             inject_reservation: Mutex::new(None),
+            queue_hold: Mutex::new(None),
+            receiver_proof: Mutex::new(None),
             last_queue_delivery_at: Mutex::new(None),
             pending_input_stale: Mutex::new(None),
             last_injected: Mutex::new(None),

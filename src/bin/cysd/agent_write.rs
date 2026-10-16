@@ -205,6 +205,8 @@ pub struct Request {
     pub created: Instant,
     cancelled: AtomicBool,
     status: Mutex<Status>,
+    /// The producer's settlement closure has returned (or there was none).
+    settled: AtomicBool,
 }
 
 impl Request {
@@ -217,7 +219,12 @@ impl Request {
             created: Instant::now(),
             cancelled: AtomicBool::new(false),
             status: Mutex::new(Status::AcceptedPending),
+            settled: AtomicBool::new(false),
         })
+    }
+    /// The terminal is recorded and the producer's settlement has run.
+    pub fn is_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
     }
     /// Request cancellation: revokes LATER calls only; an issued call is never interrupted (S-a).
     pub fn cancel(&self) {
@@ -258,7 +265,15 @@ pub struct AgentJob {
     /// Resume an earlier PartialExact of the SAME request from this envelope (S4-1).
     pub resume: Option<Envelope>,
     pub settle: Option<Settle>,
+    /// The queue's hand-off guard (`state::InjectGuard`): claimed after the journal barrier and
+    /// before admission, so its safety probe stays next to the first byte (a failed barrier claims
+    /// it too, handing that refusal to the settlement). A lost claim is [`GUARD_ABORTED`] with zero
+    /// bytes; the handing-off caller owns that rollback.
+    pub guard: Option<Arc<crate::state::InjectGuard>>,
 }
+
+/// RefusedNoWrite reason when the hand-off guard was not claimed (the caller already rolled back).
+pub const GUARD_ABORTED: &str = "guard_aborted";
 
 /// Writer-thread state a job reads and updates.
 pub struct WriterIo<'a> {
@@ -408,9 +423,18 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
     // Journal barrier first (design 4.4 step 2); the fsync is a wait, so admission comes after it.
     if let Some(j) = &job.journal {
         if let Err(e) = j.writing(req) {
+            // Hand this refusal to the settlement by claiming the guard first: a broken journal is
+            // then held on backoff instead of being re-handed every tick. A lost claim stays the
+            // handing-off caller's rollback.
+            if job.guard.as_ref().is_some_and(|g| !g.claim_for_write()) {
+                return run.done(run.stop(GUARD_ABORTED.into(), true), false);
+            }
             return run.done(run.stop(format!("journal:{e}"), true), false);
         }
         run.journaled = true;
+    }
+    if job.guard.as_ref().is_some_and(|g| !g.claim_for_write()) {
+        return run.done(run.stop(GUARD_ABORTED.into(), true), false);
     }
     req.set(Status::Writing);
     if let Err(loss) = job.proof.admit() {
@@ -508,8 +532,65 @@ pub fn finish(job: AgentJob, ex: &Executed) -> Terminal {
         // A panicking settlement must not kill the writer thread.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || settle(&t)));
     }
+    job.request.settled.store(true, Ordering::Release);
     terminal
 }
+
+#[cfg(test)]
+thread_local! {
+    static SYNC_SETTLE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Tests only: specimens written against the former settle-at-claim timing see the settlement of
+/// the request they just handed off (bounded 10 s wait on the calling test thread). A specimen that
+/// observes the asynchronous window turns it off with [`set_test_sync_settle`]. No-op in the product.
+pub fn test_wait_settled(req: &Request) {
+    #[cfg(test)]
+    {
+        if SYNC_SETTLE.with(|c| c.get()) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !req.is_settled() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    #[cfg(not(test))]
+    let _ = req;
+}
+
+#[cfg(test)]
+pub fn set_test_sync_settle(on: bool) {
+    SYNC_SETTLE.with(|c| c.set(on));
+}
+
+/// Proof used while a seat has no receiver binding wired yet: every check passes (the caller's
+/// existing gates and hand-off guard remain the admission).
+pub struct PassThrough;
+
+impl Proof for PassThrough {
+    fn admit(&self) -> Result<(), ProofLoss> {
+        Ok(())
+    }
+    fn recheck(&self, _: Phase) -> Result<(), ProofLoss> {
+        Ok(())
+    }
+}
+
+/// The journal could not be opened: every barrier fails, so every write is refused before bytes.
+pub struct UnavailableJournal(pub String);
+
+impl Journal for UnavailableJournal {
+    fn writing(&self, _: &Request) -> std::io::Result<()> {
+        Err(std::io::Error::other(self.0.clone()))
+    }
+    fn terminal(&self, _: &Request, _: &Terminal, _: &Envelope) -> std::io::Result<()> {
+        Err(std::io::Error::other(self.0.clone()))
+    }
+}
+
+/// S4-1 PartialExact resume window, from proof loss (HEAD-RULINGS-W4-1 D3; locked in
+/// LOCK-W4-WINDOWS-AND-N-20261016.json before any measurement).
+pub const PARTIAL_EXACT_RESUME_WINDOW_MS: u64 = 30_000;
 
 /// File journal size that triggers compaction to the still-open requests.
 pub const JOURNAL_COMPACT_BYTES: u64 = 1 << 20;
@@ -815,6 +896,7 @@ mod tests {
             journal: None,
             resume: None,
             settle: None,
+            guard: None,
         }
     }
 
