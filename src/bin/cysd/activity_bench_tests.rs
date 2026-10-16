@@ -34,7 +34,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::activity::bench;
-use crate::state::{Daemon, Surface};
+use crate::state::{Daemon, HideConsole, Surface};
 
 const STREAM_PER_FAMILY: usize = 32;
 const READY_SEATS: usize = 4;
@@ -114,7 +114,7 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn cmd_out(prog: &str, args: &[&str]) -> Option<String> {
-    let o = std::process::Command::new(prog).args(args).stdin(std::process::Stdio::null()).output().ok()?;
+    let o = std::process::Command::new(prog).args(args).stdin(std::process::Stdio::null()).hide_console().output().ok()?;
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
@@ -211,6 +211,7 @@ fn children_of_self() -> Vec<String> {
     let me = std::process::id().to_string();
     let Ok(child) = std::process::Command::new("/bin/ps")
         .args(["-axo", "pid=,ppid=,stat=,command="])
+        .hide_console()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .spawn()
