@@ -43,6 +43,20 @@ impl WriterGate {
         Some(Transition(self.0.clone()))
     }
 
+    fn reserve_transition(&self, transition: &Transition) -> Option<Operation> {
+        if !Arc::ptr_eq(&self.0, &transition.0) {
+            return None;
+        }
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.transition || state.pending != 0 {
+            return None;
+        }
+        state.pending += 1;
+        // KEEP the transition closed until the sender has actually handed off this envelope.
+        // No gate mutex spans the channel operation; rejected envelopes may drop a lease safely.
+        Some(Operation(self.0.clone()))
+    }
+
     fn reserve(&self, wait: bool) -> Option<Operation> {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         while state.transition {
@@ -146,6 +160,38 @@ impl WriterSender {
         })
     }
 
+    /// Transfer an exclusive lifecycle reservation to one accounted writer request. Ordinary
+    /// admission stays closed through enqueue; after success the operation lease excludes adoption.
+    pub fn try_send_transition(
+        &self,
+        request: WriteReq,
+        transition: Transition,
+    ) -> Result<(), mpsc::TrySendError<WriteReq>> {
+        self.transition_handoff(request, transition, |queued| self.tx.try_send(queued))
+    }
+
+    fn transition_handoff(
+        &self,
+        request: WriteReq,
+        transition: Transition,
+        handoff: impl FnOnce(QueuedWrite) -> Result<(), mpsc::TrySendError<QueuedWrite>>,
+    ) -> Result<(), mpsc::TrySendError<WriteReq>> {
+        let Some(operation) = self.gate.reserve_transition(&transition) else {
+            return Err(mpsc::TrySendError::Full(request));
+        };
+        let result = handoff(QueuedWrite {
+            request,
+            operation: Some(operation),
+        });
+        drop(transition);
+        result.map_err(|error| match error {
+            mpsc::TrySendError::Full(queued) => mpsc::TrySendError::Full(queued.request),
+            mpsc::TrySendError::Disconnected(queued) => {
+                mpsc::TrySendError::Disconnected(queued.request)
+            }
+        })
+    }
+
     // Blocking send is used by fixtures. Production producers use try_send/bounded admission.
     pub fn send(&self, request: WriteReq) -> Result<(), mpsc::SendError<WriteReq>> {
         let operation = self
@@ -197,6 +243,79 @@ mod tests {
             | mpsc::TrySendError::Disconnected(WriteReq::Data(bytes)) => bytes,
             _ => panic!("must return original request"),
         }
+    }
+
+    #[test]
+    fn c8c_admission_stays_closed_until_transition_handoff_finishes() {
+        let (sender, receiver) = WriterSender::channel(1);
+        let gate = sender.gate();
+        let reservation = gate.try_transition().unwrap();
+        sender.transition_handoff(WriteReq::Data(b"launch".to_vec()), reservation, |envelope| {
+            assert_eq!(gate.pending(), 1, "launch is accounted before channel handoff");
+            assert!(gate.try_transition().is_none());
+            assert!(matches!(sender.try_send(WriteReq::Data(b"interloper".to_vec())), Err(mpsc::TrySendError::Full(_))),
+                "ordinary admission stays closed until the lifecycle envelope is handed off");
+            sender.tx.try_send(envelope)
+        }).unwrap();
+        assert_eq!(gate.pending(), 1);
+        drop(receiver);
+        assert_eq!(gate.pending(), 0);
+        assert!(gate.try_transition().is_some());
+    }
+
+    #[test]
+    fn c8c_transition_transfers_into_an_accounted_launch() {
+        let (sender, receiver) = WriterSender::channel(1);
+        let gate = sender.gate();
+        let reservation = gate.try_transition().unwrap();
+        assert!(sender.try_send_transition(WriteReq::Data(b"launch".to_vec()), reservation).is_ok(),
+            "the reserved lifecycle request must enter the writer without reopening admission first");
+        assert_eq!(
+            gate.pending(),
+            1,
+            "transferred lifecycle request owns an operation lease"
+        );
+        assert!(gate.try_transition().is_none());
+        let (request, lease) = receiver.recv().unwrap().into_parts();
+        assert!(matches!(request, WriteReq::Data(bytes) if bytes == b"launch"));
+        drop(lease);
+        assert!(gate.try_transition().is_some());
+    }
+
+    #[test]
+    fn c8c_transition_cannot_be_used_on_a_different_writer() {
+        let (first, _rx1) = WriterSender::channel(1);
+        let (second, rx2) = WriterSender::channel(1);
+        let reservation = first.gate().try_transition().unwrap();
+        let _second_reservation = second.gate().try_transition().unwrap();
+        assert!(
+            matches!(
+                second.try_send_transition(WriteReq::Data(b"wrong".to_vec()), reservation),
+                Err(mpsc::TrySendError::Full(_))
+            ),
+            "a transition belongs to exactly one writer gate"
+        );
+        assert!(matches!(rx2.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert_eq!(second.gate().pending(), 0);
+    }
+
+    #[test]
+    fn c8c_failed_transition_handoff_releases_both_owners() {
+        let (sender, receiver) = WriterSender::channel(0);
+        let gate = sender.gate();
+        let reservation = gate.try_transition().unwrap();
+        assert!(
+            matches!(sender.try_send_transition(WriteReq::Data(b"full".to_vec()), reservation), Err(mpsc::TrySendError::Full(WriteReq::Data(b))) if b == b"full")
+        );
+        assert_eq!(gate.pending(), 0);
+        let reservation = gate.try_transition().unwrap();
+        drop(receiver);
+        assert!(
+            matches!(sender.try_send_transition(WriteReq::Data(b"gone".to_vec()), reservation), Err(mpsc::TrySendError::Disconnected(WriteReq::Data(b))) if b == b"gone"),
+            "reserved handoff reaches the actual channel and preserves its disconnection result"
+        );
+        assert_eq!(gate.pending(), 0);
+        assert!(gate.try_transition().is_some());
     }
 
     #[test]

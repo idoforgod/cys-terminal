@@ -12,6 +12,7 @@
 //! after a passing check. Those are S-b containment topics.
 
 use cys::process_observation::{Failure, ProcessObservation, Retained};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -32,19 +33,22 @@ pub const DISCOVERY_WORKERS: usize = 2;
 /// Boot proof window after eligibility (design 4.6, fixed).
 pub const BOOT_PROOF_WINDOW_MS: u64 = 2_000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProofClass {
     FullRequired,
     ObservedAgentWeak,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RegistrationOrigin {
     LaunchAgent,
     ClaimRole,
     Reclaim,
     HandObserved,
     Restored,
+    DeclaredCustom,
 }
 
 impl RegistrationOrigin {
@@ -55,12 +59,14 @@ impl RegistrationOrigin {
             Self::Reclaim => "reclaim",
             Self::HandObserved => "hand-observed",
             Self::Restored => "restored",
+            Self::DeclaredCustom => "declared-custom",
         }
     }
 }
 
 /// The named residual risk carried by every weak receipt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WeakRisk {
     /// Built-in adapter id whose configured command is not the shipped declaration.
     CustomWrapperReceiverIdentity,
@@ -81,15 +87,18 @@ impl WeakRisk {
 }
 
 /// Which process slot carries the adapter: its own executable, or a script run by a runtime.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recipe {
     /// Base name of the configured binary (`agent_candidates_from_json` semantics).
     pub bin: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiverPolicy {
     pub policy_epoch: u64,
+    /// Exact frozen declaration and its digest, never derived from a successful native match.
+    pub declaration: String,
+    pub config_digest: String,
     pub adapter: String,
     pub recipe: Recipe,
     pub origin: RegistrationOrigin,
@@ -134,7 +143,10 @@ pub const fn native_backend_available() -> bool {
 
 fn strip_exe(name: &str) -> (&str, bool) {
     let lower_ends = |suf: &str| {
-        name.len() > suf.len() && name[name.len() - suf.len()..].eq_ignore_ascii_case(suf)
+        name.len() > suf.len()
+            && name
+                .get(name.len() - suf.len()..)
+                .is_some_and(|tail| tail.eq_ignore_ascii_case(suf))
     };
     for suf in [".exe", ".cmd", ".bat", ".ps1"] {
         if lower_ends(suf) {
@@ -176,6 +188,11 @@ const SCRIPT_RUNTIMES: [&str; 3] = ["node", "nodejs", "bun"];
 /// Strict slot match: only the executable, argv0-in-versioned-install-dir, or the runtime's script
 /// position counts — never an arbitrary argument (a `tail` operand or help text naming the agent).
 pub fn match_slot(recipe: &Recipe, obs: &ProcessObservation) -> Option<Slot> {
+    // Native executable identity does not turn a missing invocation entry into a supported CLI.
+    obs.invocation
+        .argv
+        .first()
+        .filter(|argv0| !argv0.is_empty())?;
     let exe = lossy(&obs.identity.executable);
     let exe_base = base_name(&exe);
     if bin_eq(exe_base, &recipe.bin) {
@@ -198,15 +215,9 @@ pub fn match_slot(recipe: &Recipe, obs: &ProcessObservation) -> Option<Slot> {
     }
     let (rt, _) = strip_exe(exe_base);
     if SCRIPT_RUNTIMES.iter().any(|r| rt.eq_ignore_ascii_case(r)) {
-        // First non-option argument after argv0 is the script slot.
-        let idx = obs
-            .invocation
-            .argv
-            .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, a)| !a.starts_with(b"-"))?
-            .0;
+        // Runtime options can own operands; an operand named after an agent is not a script.
+        // Unknown layouts have no supported recipe and cannot become a full-policy match.
+        let idx = runtime_script_slot(&obs.invocation.argv)?;
         let script = lossy(&obs.invocation.argv[idx]);
         let sbase = base_name(&script);
         let stem = sbase
@@ -214,15 +225,65 @@ pub fn match_slot(recipe: &Recipe, obs: &ProcessObservation) -> Option<Slot> {
             .or_else(|| sbase.strip_suffix(".mjs"))
             .or_else(|| sbase.strip_suffix(".cjs"))
             .unwrap_or(sbase);
-        let pkg_cli = format!("{}-cli", recipe.bin);
-        let pkg_code = format!("{}-code", recipe.bin);
-        let pkg_hit = sbase.ends_with(".js")
-            && script
-                .split(['/', '\\'])
-                .any(|seg| seg == pkg_cli || seg == pkg_code);
+        let canonical = script.replace('\\', "/");
+        let pkg_hit = match recipe.bin.as_str() {
+            "claude" => canonical.ends_with("/@anthropic-ai/claude-code/cli.js"),
+            "codex" => canonical.ends_with("/@openai/codex/bin/codex.js"),
+            "gemini" => canonical.ends_with("/@google/gemini-cli/dist/index.js"),
+            _ => false,
+        };
         if bin_eq(stem, &recipe.bin) || pkg_hit {
             return Some(Slot::Script(idx));
         }
+    }
+    None
+}
+
+/// Enumerated runtime forms used by supported native/npm launches. Values belonging to options
+/// are skipped; eval/print and unrecognised runtime syntax cannot supply a script witness.
+fn runtime_script_slot(argv: &[Vec<u8>]) -> Option<usize> {
+    let mut i = 1;
+    while let Some(arg) = argv.get(i) {
+        let arg = std::str::from_utf8(arg).ok()?;
+        if arg == "--" {
+            return argv.get(i + 1).map(|_| i + 1);
+        }
+        if !arg.starts_with('-') {
+            return Some(i);
+        }
+        let key = arg.split('=').next()?;
+        if [
+            "--require",
+            "-r",
+            "--import",
+            "--loader",
+            "--experimental-loader",
+            "--conditions",
+            "-C",
+        ]
+        .contains(&key)
+        {
+            if !arg.contains('=') {
+                argv.get(i + 1)?;
+                i += 1;
+            }
+        } else if [
+            "--no-warnings",
+            "--trace-warnings",
+            "--enable-source-maps",
+            "--no-deprecation",
+            "--inspect",
+            "--inspect-brk",
+            "--experimental-strip-types",
+        ]
+        .contains(&key)
+            || (key == "--max-old-space-size" && arg.contains('='))
+        {
+            // These forms either carry no operand or put it after '='.
+        } else {
+            return None;
+        }
+        i += 1;
     }
     None
 }
@@ -255,6 +316,8 @@ pub enum Unknown {
     ForegroundUnreadable,
     ContraryForeground,
     Unsupported,
+    AncestryChanged,
+    ValidationFailed(String),
 }
 
 impl Unknown {
@@ -270,6 +333,8 @@ impl Unknown {
             Self::ForegroundUnreadable => "foreground_unreadable".into(),
             Self::ContraryForeground => "contrary_foreground".into(),
             Self::Unsupported => "unsupported_platform".into(),
+            Self::AncestryChanged => "ancestry_changed".into(),
+            Self::ValidationFailed(s) => format!("validation:{s}"),
         }
     }
 }
@@ -317,8 +382,9 @@ pub fn descendants(nodes: &[Node], root: u32) -> Vec<(u32, u32)> {
 ///
 /// Rules (design 4.1): candidates are strict slot matches; on Unix only those in the PTY
 /// foreground group are plausible stdin receivers; matches that lie on ONE ancestor chain with
-/// identical adapter arguments are the same invocation and collapse to the innermost; anything
-/// else (incomparable matches, an unreadable matching process, no candidate) is Unknown.
+/// identical adapter arguments collapse ONLY for the supported Codex node-shim -> native recipe.
+/// Native/native and script/script pairs are distinct plausible receivers even with equal argv;
+/// incomparable matches, unreadable candidates and no candidate are Unknown.
 pub fn select_receiver(
     recipe: &Recipe,
     tree: &[(u32, u32)],
@@ -366,23 +432,20 @@ pub fn select_receiver(
         d
     };
     matches.sort_by_key(|(p, _)| depth(*p));
-    let is_ancestor = |anc: u32, mut p: u32| {
-        for _ in 0..4096 {
-            match parent.get(&p) {
-                Some(&q) if q == anc => return true,
-                Some(&q) => p = q,
-                None => return false,
-            }
-        }
-        false
-    };
     for w in matches.windows(2) {
         let (a, sa) = w[0];
         let (b, sb) = w[1];
-        let same_chain = is_ancestor(a, b);
         let oa = observed[&a].as_ref().unwrap();
         let ob = observed[&b].as_ref().unwrap();
-        if !same_chain || adapter_args(oa, sa) != adapter_args(ob, sb) {
+        let shim_exe = lossy(&oa.identity.executable);
+        let (runtime, _) = strip_exe(base_name(&shim_exe));
+        let supported_shim = bin_eq(&recipe.bin, "codex")
+            && matches!((sa, sb), (Slot::Script(_), Slot::Native))
+            && ["node", "nodejs"]
+                .iter()
+                .any(|r| runtime.eq_ignore_ascii_case(r))
+            && parent.get(&b) == Some(&a);
+        if !supported_shim || adapter_args(oa, sa) != adapter_args(ob, sb) {
             return Err(Unknown::Ambiguous(format!("{a},{b}")));
         }
     }
@@ -390,12 +453,120 @@ pub fn select_receiver(
 }
 
 /// Epochs that key a binding (design 4.1).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Epochs {
+    pub daemon_instance: u64,
+    pub surface_instance: u64,
     pub launch: u64,
     pub conversation: u64,
     pub policy: u64,
     pub binding: u64,
+}
+
+/// Identity of a single attempted publication. A worker returns this captured ticket, never a
+/// relative "current request" pointer; publication compares it with the live controller state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptTicket {
+    pub epochs: Epochs,
+    pub obligation_id: String,
+    pub request_id: String,
+    pub attempt_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationPhase {
+    Pending,
+    Published,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishRefusal {
+    Superseded,
+    NotPending,
+    Cancelled,
+    Expired,
+    PossibleWrite,
+    NativeInvalid,
+    InputHeld,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeWriteCompletion {
+    Exact(usize),
+    Unknown,
+}
+
+/// Kept under the per-obligation controller mutex; cancel/expiry/publication mutate THIS object.
+/// Explicit native-write facts are separate from Request::status (Writing precedes proof admission).
+pub struct PublicationGate {
+    pub ticket: AttemptTicket,
+    pub budget: StartBudget,
+    pub phase: PublicationPhase,
+    zero_native_write: bool,
+    native_write_outstanding: bool,
+}
+
+impl PublicationGate {
+    pub fn new(ticket: AttemptTicket) -> Self {
+        Self {
+            ticket,
+            budget: StartBudget::new(),
+            phase: PublicationPhase::Pending,
+            zero_native_write: true,
+            native_write_outstanding: false,
+        }
+    }
+    pub fn cancel(&mut self) {
+        self.phase = PublicationPhase::Cancelled;
+    }
+    pub fn native_write_started(&mut self) {
+        self.native_write_outstanding = true;
+    }
+    pub fn native_write_returned(&mut self, completion: NativeWriteCompletion) {
+        self.native_write_outstanding = false;
+        match completion {
+            NativeWriteCompletion::Exact(0) => {}
+            NativeWriteCompletion::Exact(_) | NativeWriteCompletion::Unknown => {
+                self.zero_native_write = false
+            }
+        }
+    }
+    pub fn publish(
+        &mut self,
+        returned: &AttemptTicket,
+        current_epochs: Epochs,
+        now: Instant,
+        native_valid: bool,
+        input_safe: bool,
+    ) -> Result<(), PublishRefusal> {
+        if returned != &self.ticket || current_epochs != self.ticket.epochs {
+            return Err(PublishRefusal::Superseded);
+        }
+        match self.phase {
+            PublicationPhase::Cancelled => return Err(PublishRefusal::Cancelled),
+            PublicationPhase::Expired => return Err(PublishRefusal::Expired),
+            PublicationPhase::Published => return Err(PublishRefusal::NotPending),
+            PublicationPhase::Pending => {}
+        }
+        if self.budget.expired(now) {
+            self.phase = PublicationPhase::Expired;
+            return Err(PublishRefusal::Expired);
+        }
+        if !self.zero_native_write || self.native_write_outstanding {
+            return Err(PublishRefusal::PossibleWrite);
+        }
+        if !native_valid {
+            return Err(PublishRefusal::NativeInvalid);
+        }
+        if !input_safe {
+            return Err(PublishRefusal::InputHeld);
+        }
+        self.phase = PublicationPhase::Published;
+        Ok(())
+    }
 }
 
 /// A daemon-owned native receiver binding.
@@ -404,6 +575,8 @@ pub struct Binding {
     pub class: ProofClass,
     pub root: Retained,
     pub agent: Retained,
+    /// Root-exclusive, agent-exclusive native ancestry; every node is rechecked per call.
+    pub ancestry: Vec<Retained>,
     /// Unix: the agent's process group, which must stay the PTY foreground group.
     pub agent_pgid: Option<u32>,
 }
@@ -463,6 +636,18 @@ impl Binding {
             Err(Failure::Changed) => return Err(ProofLoss::Changed),
             Err(f) => return Err(ProofLoss::Unknown(format!("root:{}", failure_reason(&f)))),
         }
+        for ancestor in &self.ancestry {
+            match ancestor.recheck() {
+                Ok(()) => {}
+                Err(Failure::Changed) => return Err(ProofLoss::Changed),
+                Err(f) => {
+                    return Err(ProofLoss::Unknown(format!(
+                        "ancestor:{}",
+                        failure_reason(&f)
+                    )))
+                }
+            }
+        }
         match self.agent.recheck() {
             Ok(()) => {}
             Err(Failure::Dead) => return Err(ProofLoss::AgentDead),
@@ -486,6 +671,55 @@ impl Binding {
     }
 }
 
+/// Ordered root-exclusive ancestry of the selected receiver. Native edge validation is mandatory
+/// before retaining/publishing a chain. Unrelated dead descendants are not ancestors.
+fn selected_chain(
+    root: u32,
+    selected: u32,
+    tree: &[(u32, u32)],
+    observed: &HashMap<u32, Result<ProcessObservation, Failure>>,
+) -> Result<Vec<u32>, Unknown> {
+    let parents: HashMap<u32, u32> = tree.iter().copied().collect();
+    let root_obs = observed
+        .get(&root)
+        .and_then(|r| r.as_ref().ok())
+        .ok_or(Unknown::AncestryChanged)?;
+    let birth = |o: &ProcessObservation| (o.identity.birth_seconds, o.identity.birth_microseconds);
+    if root_obs.identity.pid != root || birth(root_obs) == (0, 0) {
+        return Err(Unknown::AncestryChanged);
+    }
+    let mut chain = Vec::new();
+    let mut seen = HashSet::new();
+    let mut pid = selected;
+    while pid != root {
+        if !seen.insert(pid) {
+            return Err(Unknown::CandidateVanished);
+        }
+        let parent = *parents.get(&pid).ok_or(Unknown::AncestryChanged)?;
+        let native = observed
+            .get(&pid)
+            .and_then(|r| r.as_ref().ok())
+            .ok_or(Unknown::AncestryChanged)?;
+        let parent_obs = observed
+            .get(&parent)
+            .and_then(|r| r.as_ref().ok())
+            .ok_or(Unknown::AncestryChanged)?;
+        if native.identity.pid != pid
+            || native.identity.parent != parent
+            || parent_obs.identity.pid != parent
+            || birth(native) == (0, 0)
+            || birth(parent_obs) == (0, 0)
+            || birth(parent_obs) > birth(native)
+        {
+            return Err(Unknown::AncestryChanged);
+        }
+        chain.push(pid);
+        pid = parent;
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
 /// Inputs to one discovery attempt, all owned so it can run on an executor thread.
 pub struct DiscoveryInput {
     pub root_pid: u32,
@@ -500,9 +734,16 @@ pub struct DiscoveryInput {
     pub retain: Box<dyn Fn(u32) -> Result<Retained, Failure> + Send>,
 }
 
-/// Run one discovery: snapshot once, read only the root and its descendants, select, retain the
-/// selection, and RE-READ the root identity before publishing (design 4.1).
-pub fn discover(input: &DiscoveryInput) -> Result<Binding, Unknown> {
+/// One attempt's collection. Classification reads this same material before fixing a policy;
+/// binding then consumes it without a second topology refresh or initial observation pass.
+pub struct NativeCollection {
+    pub root: Retained,
+    pub tree: Vec<(u32, u32)>,
+    pub observed: HashMap<u32, Result<ProcessObservation, Failure>>,
+    pub foreground: Option<Option<u32>>,
+}
+
+pub fn collect(input: &DiscoveryInput) -> Result<NativeCollection, Unknown> {
     if !native_backend_available() {
         return Err(Unknown::Unsupported);
     }
@@ -511,22 +752,88 @@ pub fn discover(input: &DiscoveryInput) -> Result<Binding, Unknown> {
         f => Unknown::RootUnreadable(failure_reason(&f)),
     })?;
     let nodes = (input.snapshot)();
-    let tree = descendants(&nodes, input.root_pid);
+    let mut tree = vec![(input.root_pid, root.observation().identity.parent)];
+    tree.extend(descendants(&nodes, input.root_pid));
     let mut observed = HashMap::new();
-    for (pid, _) in &tree {
-        observed.insert(*pid, (input.observe)(*pid));
+    observed.insert(input.root_pid, Ok(root.observation().clone()));
+    for &(pid, _) in &tree[1..] {
+        observed.insert(pid, (input.observe)(pid));
     }
-    let fg = if cfg!(unix) {
+    let foreground = if cfg!(unix) {
         Some((input.foreground)())
     } else {
         None
     };
-    let pid = select_receiver(&input.recipe, &tree, &observed, fg)?;
+    Ok(NativeCollection {
+        root,
+        tree,
+        observed,
+        foreground,
+    })
+}
+
+/// Identify one declaration from a catalog frozen before this native attempt. A selected
+/// declaration retains its precomputed class even when later binding fails.
+pub fn classify_collected(
+    catalog: &[ReceiverPolicy],
+    collected: &NativeCollection,
+) -> Result<ReceiverPolicy, Unknown> {
+    let mut selected: Option<&ReceiverPolicy> = None;
+    for declaration in catalog {
+        match select_receiver(
+            &declaration.recipe,
+            &collected.tree,
+            &collected.observed,
+            collected.foreground,
+        ) {
+            Ok(pid) => {
+                // Classification fixes a declaration, so its candidate must already belong to
+                // this root by coherent native ancestry. This is not success-dependent downgrading.
+                selected_chain(
+                    collected.root.observation().identity.pid,
+                    pid,
+                    &collected.tree,
+                    &collected.observed,
+                )?;
+                if selected.is_some_and(|old| old != declaration) {
+                    return Err(Unknown::Ambiguous("multiple_declarations".into()));
+                }
+                selected = Some(declaration);
+            }
+            Err(Unknown::NoCandidate) => {}
+            Err(unknown) => return Err(unknown),
+        }
+    }
+    selected.cloned().ok_or(Unknown::NoCandidate)
+}
+
+/// Select and retain only after the declaration is fixed. Recheck the complete native chain and
+/// current foreground after all potentially slow queries, still inside the same executor attempt.
+pub fn bind_collected(
+    input: &DiscoveryInput,
+    collected: NativeCollection,
+) -> Result<Binding, Unknown> {
+    let NativeCollection {
+        root,
+        tree,
+        observed,
+        foreground,
+    } = collected;
+    let pid = select_receiver(&input.recipe, &tree, &observed, foreground)?;
+    let chain = selected_chain(input.root_pid, pid, &tree, &observed)?;
+    let mut ancestry = Vec::new();
+    for &ancestor_pid in chain.iter().filter(|&&p| p != pid) {
+        let retained = (input.retain)(ancestor_pid).map_err(|_| Unknown::AncestryChanged)?;
+        if Some(retained.observation()) != observed.get(&ancestor_pid).and_then(|r| r.as_ref().ok())
+        {
+            return Err(Unknown::AncestryChanged);
+        }
+        ancestry.push(retained);
+    }
     let agent = (input.retain)(pid).map_err(|f| match f {
         Failure::Dead => Unknown::CandidateVanished,
         f => Unknown::CandidateUnreadable(format!("{pid}:{}", failure_reason(&f))),
     })?;
-    // The retained object must be the process that was selected (no pid reuse in between).
     if Some(agent.observation()) != observed.get(&pid).and_then(|r| r.as_ref().ok()) {
         return Err(Unknown::CandidateVanished);
     }
@@ -537,19 +844,24 @@ pub fn discover(input: &DiscoveryInput) -> Result<Binding, Unknown> {
     {
         return Err(Unknown::Ambiguous("sealed_identity".into()));
     }
-    match root.recheck() {
-        Ok(()) => {}
-        Err(Failure::Dead) => return Err(Unknown::RootDead),
-        Err(_) => return Err(Unknown::RootChanged),
-    }
-    let agent_pgid = cfg!(unix).then_some(id.process_group);
-    Ok(Binding {
+    let bound = Binding {
         epochs: input.epochs,
         class: input.class,
         root,
         agent,
-        agent_pgid,
-    })
+        ancestry,
+        agent_pgid: cfg!(unix).then_some(id.process_group),
+    };
+    bound.check(&*input.foreground).map_err(|loss| match loss {
+        ProofLoss::RootDead => Unknown::RootDead,
+        ProofLoss::AgentDead => Unknown::CandidateVanished,
+        other => Unknown::ValidationFailed(other.reason()),
+    })?;
+    Ok(bound)
+}
+
+pub fn discover(input: &DiscoveryInput) -> Result<Binding, Unknown> {
+    bind_collected(input, collect(input)?)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -562,11 +874,17 @@ pub enum StartRefusal {
     Saturated,
     BudgetExhausted,
     TooSoon,
+    WindowExpired,
+    AdmissionBusy,
+    Closed,
 }
 
 #[derive(Default, Debug)]
 pub struct Counters {
     pub admissions: AtomicU64,
+    pub admitted: AtomicU64,
+    pub admission_busy: AtomicU64,
+    pub pre_start_refused: AtomicU64,
     pub started: AtomicU64,
     pub slot_busy: AtomicU64,
     pub saturated: AtomicU64,
@@ -575,7 +893,8 @@ pub struct Counters {
     pub late_after_window: AtomicU64,
 }
 
-type Job = Box<dyn FnOnce() + Send>;
+pub type Job = Box<dyn FnOnce() + Send>;
+pub type Preparation = Box<dyn FnOnce() -> Option<Job> + Send>;
 
 /// Fixed pool of `DISCOVERY_WORKERS` threads, one in-flight query per surface slot, fair FIFO.
 pub struct Executor {
@@ -589,10 +908,16 @@ struct ExecInner {
     capacity: usize,
 }
 
+struct Scheduled {
+    prepare: Preparation,
+    finished: Option<Job>,
+}
+
 struct ExecState {
-    queue: VecDeque<(u64, Job)>,
+    queue: VecDeque<(u64, Scheduled)>,
     busy: HashSet<u64>,
     running: usize,
+    closed: bool,
 }
 
 impl Executor {
@@ -602,6 +927,7 @@ impl Executor {
                 queue: VecDeque::new(),
                 busy: HashSet::new(),
                 running: 0,
+                closed: false,
             }),
             cv: Condvar::new(),
             counters: Counters::default(),
@@ -615,6 +941,9 @@ impl Executor {
                     let (slot, job) = {
                         let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
+                            if st.closed {
+                                return;
+                            }
                             if let Some(j) = st.queue.pop_front() {
                                 st.running += 1;
                                 break j;
@@ -622,11 +951,30 @@ impl Executor {
                             st = inner.cv.wait(st).unwrap_or_else(|e| e.into_inner());
                         }
                     };
-                    // A panicking job must not kill the worker or leak its slot.
-                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-                    let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                    st.running -= 1;
-                    st.busy.remove(&slot);
+                    // Revalidate deadline/budget/cancellation/generation BEFORE counting native work.
+                    // Classification and binding live in the returned one-shot job, sharing this slot.
+                    let Scheduled { prepare, finished } = job;
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare)) {
+                        Ok(Some(native)) => {
+                            inner.counters.started.fetch_add(1, Ordering::Relaxed);
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(native));
+                        }
+                        _ => {
+                            inner
+                                .counters
+                                .pre_start_refused
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    {
+                        let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                        st.running -= 1;
+                        st.busy.remove(&slot);
+                    }
+                    // A coalesced recovery wake may schedule the next attempt only after slot release.
+                    if let Some(finished) = finished {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(finished));
+                    }
                 })
                 .expect("spawn discovery worker");
         }
@@ -640,11 +988,36 @@ impl Executor {
     /// Admit a native query for `slot` (a surface instance). The slot stays occupied until the
     /// job RETURNS — a caller deadline never frees it and never starts a second query (S3-2).
     pub fn try_start(&self, slot: u64, job: Job) -> Result<(), StartRefusal> {
+        self.try_start_guarded(slot, Box::new(move || Some(job)), None)
+    }
+
+    /// `prepare` runs on the selected worker and returns native work only after its locked
+    /// obligation gate permits an actual start. A refusal/queued expiry consumes no native start.
+    /// `finished` runs after slot release, even when preparation or native observation panics.
+    pub fn try_start_guarded(
+        &self,
+        slot: u64,
+        prepare: Preparation,
+        finished: Option<Job>,
+    ) -> Result<(), StartRefusal> {
         self.inner
             .counters
             .admissions
             .fetch_add(1, Ordering::Relaxed);
-        let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = match self.inner.state.try_lock() {
+            Ok(st) => st,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.inner
+                    .counters
+                    .admission_busy
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(StartRefusal::AdmissionBusy);
+            }
+        };
+        if st.closed {
+            return Err(StartRefusal::Closed);
+        }
         if st.busy.contains(&slot) {
             self.inner
                 .counters
@@ -660,8 +1033,8 @@ impl Executor {
             return Err(StartRefusal::Saturated);
         }
         st.busy.insert(slot);
-        st.queue.push_back((slot, job));
-        self.inner.counters.started.fetch_add(1, Ordering::Relaxed);
+        st.queue.push_back((slot, Scheduled { prepare, finished }));
+        self.inner.counters.admitted.fetch_add(1, Ordering::Relaxed);
         drop(st);
         self.inner.cv.notify_one();
         Ok(())
@@ -674,6 +1047,24 @@ impl Executor {
             .unwrap_or_else(|e| e.into_inner())
             .busy
             .contains(&slot)
+    }
+}
+
+impl Drop for Executor {
+    fn drop(&mut self) {
+        let queued = {
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.closed = true;
+            let queued = std::mem::take(&mut st.queue);
+            for (slot, _) in &queued {
+                st.busy.remove(slot);
+            }
+            queued
+        };
+        self.inner.cv.notify_all();
+        // No mutex over captured-object destruction, and no join over possibly blocked native I/O.
+        // Running jobs keep their own slot/inner alive until return; idle workers exit immediately.
+        drop(queued);
     }
 }
 
@@ -707,11 +1098,14 @@ impl StartBudget {
     }
 
     pub fn may_start(&self, now: Instant) -> Result<(), StartRefusal> {
+        if self.expired(now) {
+            return Err(StartRefusal::WindowExpired);
+        }
         if self.starts >= MAX_STARTS_PER_OBLIGATION {
             return Err(StartRefusal::BudgetExhausted);
         }
         if let Some(t) = self.last_start {
-            if now.duration_since(t) < Duration::from_millis(MIN_START_SPACING_MS) {
+            if now.saturating_duration_since(t) < Duration::from_millis(MIN_START_SPACING_MS) {
                 return Err(StartRefusal::TooSoon);
             }
         }
@@ -722,8 +1116,14 @@ impl StartBudget {
         Ok(())
     }
 
-    /// Record an ACTUAL start (call only when the executor admitted the job).
-    pub fn note_started(&mut self, now: Instant) {
+    /// Record an ACTUAL start on the worker immediately before native observation, never at enqueue.
+    pub fn begin(&mut self, now: Instant) -> Result<(), StartRefusal> {
+        self.may_start(now)?;
+        self.note_started(now);
+        Ok(())
+    }
+
+    fn note_started(&mut self, now: Instant) {
         self.starts += 1;
         self.last_start = Some(now);
     }
@@ -764,6 +1164,831 @@ mod tests {
 
     fn recipe(bin: &str) -> Recipe {
         Recipe { bin: bin.into() }
+    }
+
+    fn prepare_when_uncontended(
+        ex: &Executor,
+        slot: u64,
+        mut make: impl FnMut() -> (Preparation, Option<Job>),
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (prepare, finished) = make();
+            match ex.try_start_guarded(slot, prepare, finished) {
+                Ok(()) => return,
+                Err(StartRefusal::AdmissionBusy) if Instant::now() < deadline => {
+                    std::thread::yield_now()
+                }
+                other => panic!("fixture guarded admission: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn c8e_native_match_requires_nonempty_argv_zero() {
+        for args in [vec![], vec![""]] {
+            assert_eq!(
+                match_slot(&recipe("claude"), &obs(10, 10, "/u/claude", &args)),
+                None,
+                "an executable name cannot stand in for a missing invocation entry"
+            );
+        }
+        assert_eq!(
+            match_slot(&recipe("claude"), &obs(10, 10, "/u/claude", &["claude"])),
+            Some(Slot::Native)
+        );
+    }
+
+    #[test]
+    fn c8e_codex_shim_collapse_rejects_unknown_intermediaries() {
+        let (tree, map) = table(vec![
+            (10, 1, obs(10, 10, "/u/node", &["node", "/u/codex", "--x"])),
+            (
+                11,
+                10,
+                obs(11, 10, "/u/unknown-wrapper", &["unknown-wrapper"]),
+            ),
+            (12, 11, obs(12, 10, "/u/codex", &["codex", "--x"])),
+        ]);
+        assert!(
+            matches!(
+                select_receiver(&recipe("codex"), &tree, &map, Some(Some(10))),
+                Err(Unknown::Ambiguous(_))
+            ),
+            "a supported shim cannot confer support on an unrecognized intermediary"
+        );
+    }
+
+    #[test]
+    fn c8e_codex_shim_collapse_requires_its_supported_runtime() {
+        let (tree, map) = table(vec![
+            (10, 1, obs(10, 10, "/u/bun", &["bun", "/u/codex", "--x"])),
+            (11, 10, obs(11, 10, "/u/codex", &["codex", "--x"])),
+        ]);
+        assert!(
+            matches!(
+                select_receiver(&recipe("codex"), &tree, &map, Some(Some(10))),
+                Err(Unknown::Ambiguous(_))
+            ),
+            "the measured node shim rule cannot silently authorize a different runtime"
+        );
+    }
+
+    #[test]
+    fn c8e_selected_chain_rejects_a_parent_born_after_its_child() {
+        for changed_parent in [1, 10] {
+            let (tree, mut map) = table(vec![
+                (1, 0, obs(1, 1, "/bin/sh", &["sh"])),
+                (10, 1, obs(10, 10, "/u/node", &["node", "/u/codex"])),
+                (11, 10, obs(11, 10, "/u/codex", &["codex"])),
+            ]);
+            assert_eq!(selected_chain(1, 11, &tree, &map), Ok(vec![10, 11]));
+            map.get_mut(&changed_parent)
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .identity
+                .birth_seconds = 9_999;
+            assert!(selected_chain(1, 11, &tree, &map).is_err(),
+                "matching parent PID is insufficient when its creation identity contradicts ancestry");
+        }
+    }
+
+    #[test]
+    fn c8e_missing_native_birth_is_not_full_identity() {
+        let (tree, mut map) = table(vec![(1, 0, obs(1, 1, "/u/claude", &["claude"]))]);
+        let id = &mut map.get_mut(&1).unwrap().as_mut().unwrap().identity;
+        id.birth_seconds = 0;
+        id.birth_microseconds = 0;
+        assert!(
+            selected_chain(1, 1, &tree, &map).is_err(),
+            "missing root creation identity cannot bind a full receiver"
+        );
+    }
+
+    #[test]
+    fn c8e_unknown_native_completion_permanently_taints_zero_write_proof() {
+        let at = Instant::now();
+        let mut gate = publication_fixture(at);
+        let key = gate.ticket.clone();
+        gate.native_write_started();
+        gate.native_write_returned(NativeWriteCompletion::Unknown);
+        gate.native_write_started();
+        gate.native_write_returned(NativeWriteCompletion::Exact(0));
+        assert!(
+            gate.publish(&key, key.epochs, at, true, true).is_err(),
+            "a later exact zero cannot erase an earlier unknown accepted-byte result"
+        );
+    }
+
+    #[test]
+    fn c8e_every_returned_epoch_must_match_while_live_epochs_stay_fixed() {
+        let at = Instant::now();
+        for axis in 0..6 {
+            let mut gate = publication_fixture(at);
+            let live = gate.ticket.epochs;
+            let mut key = gate.ticket.clone();
+            match axis {
+                0 => key.epochs.daemon_instance += 1,
+                1 => key.epochs.surface_instance += 1,
+                2 => key.epochs.launch += 1,
+                3 => key.epochs.conversation += 1,
+                4 => key.epochs.policy += 1,
+                5 => key.epochs.binding += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                gate.publish(&key, live, at, true, true).is_err(),
+                "returned ticket epoch axis {axis} must be checked independently"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c8e_real_same_pid_exec_invalidates_the_retained_invocation() {
+        use crate::state::HideConsole;
+        use std::io::{BufRead, Write};
+        use std::process::{Command, Stdio};
+        struct Owned {
+            child: std::process::Child,
+            reaped: bool,
+        }
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                if !self.reaped {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                }
+            }
+        }
+        let mut child = Owned {
+            child: Command::new("/bin/sh")
+                .hide_console()
+                .args([
+                    "-c",
+                    "printf 'READY\n'; IFS= read -r trigger; exec /bin/cat",
+                ])
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+            reaped: false,
+        };
+        let mut out = std::io::BufReader::new(child.child.stdout.take().unwrap());
+        let mut line = String::new();
+        out.read_line(&mut line).unwrap();
+        assert_eq!(line, "READY\n");
+        let original = Retained::open(child.child.id()).unwrap();
+        let birth = (
+            original.observation().identity.birth_seconds,
+            original.observation().identity.birth_microseconds,
+        );
+        assert_eq!(original.recheck(), Ok(()));
+        child
+            .child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(b"exec\n")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let changed = loop {
+            let observed = cys::process_observation::observe(child.child.id()).unwrap();
+            if observed.identity.executable.ends_with(b"/cat") {
+                break observed;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "owned shell must reach its actual exec"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        assert_eq!(
+            (
+                changed.identity.birth_seconds,
+                changed.identity.birth_microseconds
+            ),
+            birth
+        );
+        assert_eq!(
+            original.recheck(),
+            Err(Failure::Changed),
+            "same PID and birth do not preserve executable/invocation identity"
+        );
+        drop(child.child.stdin.take());
+        let status = child.child.wait().unwrap();
+        child.reaped = true;
+        assert!(status.success());
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn collection_fixture() -> (DiscoveryInput, ReceiverPolicy) {
+        let pid = std::process::id();
+        let observed = cys::process_observation::observe(pid).unwrap();
+        let executable = lossy(&observed.identity.executable);
+        let pgid = observed.identity.process_group;
+        // This is a mechanism fixture with a declared native recipe, not a shipped CLI compatibility claim.
+        let policy = ReceiverPolicy {
+            policy_epoch: 1,
+            declaration: "frozen test declaration".into(),
+            config_digest: "frozen-before-collection".into(),
+            adapter: "test-native".into(),
+            recipe: recipe(base_name(&executable)),
+            origin: RegistrationOrigin::HandObserved,
+            class: ProofClass::FullRequired,
+            weak_risk: None,
+        };
+        (
+            DiscoveryInput {
+                root_pid: pid,
+                recipe: policy.recipe.clone(),
+                class: policy.class,
+                epochs: Epochs::default(),
+                sealed: vec![],
+                snapshot: Box::new(Vec::new),
+                foreground: Box::new(move || Some(pgid)),
+                observe: Box::new(cys::process_observation::observe),
+                retain: Box::new(Retained::open),
+            },
+            policy,
+        )
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn c8f_classification_and_binding_share_one_collection() {
+        let (mut input, policy) = collection_fixture();
+        let snapshots = Arc::new(AtomicU64::new(0));
+        let observes = Arc::new(AtomicU64::new(0));
+        let (sp, ob, root) = (snapshots.clone(), observes.clone(), input.root_pid);
+        input.snapshot = Box::new(move || {
+            assert_eq!(
+                sp.fetch_add(1, Ordering::Relaxed),
+                0,
+                "classification and binding must not refresh topology twice"
+            );
+            vec![Node {
+                pid: u32::MAX,
+                parent: root,
+            }]
+        });
+        input.observe = Box::new(move |pid| {
+            assert_eq!(pid, u32::MAX);
+            ob.fetch_add(1, Ordering::Relaxed);
+            Err(Failure::Dead)
+        });
+        let collected = collect(&input).unwrap();
+        let chosen = classify_collected(&[policy.clone()], &collected)
+            .expect("a unique frozen declaration must classify");
+        assert_eq!(chosen, policy);
+        input.recipe = chosen.recipe.clone();
+        input.class = chosen.class;
+        let binding = bind_collected(&input, collected).unwrap();
+        assert_eq!(binding.agent_identity().0, root);
+        assert_eq!(snapshots.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            observes.load(Ordering::Relaxed),
+            1,
+            "one initial read per descendant in this attempt"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn c8f_ambiguous_catalog_never_picks_the_first_declaration() {
+        let (input, first) = collection_fixture();
+        let mut second = first.clone();
+        second.adapter = "other-declaration".into();
+        let c = collect(&input).unwrap();
+        assert!(
+            matches!(
+                classify_collected(&[first, second], &c),
+                Err(Unknown::Ambiguous(_))
+            ),
+            "multiple matching declarations are ambiguous, not a first-match policy"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn c8f_fixed_class_survives_a_later_binding_failure() {
+        let (mut input, policy) = collection_fixture();
+        let c = collect(&input).unwrap();
+        let chosen = classify_collected(&[policy], &c).unwrap();
+        input.retain = Box::new(|_| {
+            Err(Failure::Unknown {
+                stage: "injected-denial",
+                os_error: Some(13),
+            })
+        });
+        assert!(bind_collected(&input, c).is_err());
+        assert_eq!(
+            chosen.class,
+            ProofClass::FullRequired,
+            "denied binding does not change the already fixed class"
+        );
+        assert_eq!(chosen.weak_risk, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c8f_classification_uses_the_collected_foreground() {
+        let (mut input, policy) = collection_fixture();
+        let pg = cys::process_observation::observe(input.root_pid)
+            .unwrap()
+            .identity
+            .process_group;
+        input.foreground = Box::new(move || Some(pg.wrapping_add(1)));
+        let c = collect(&input).unwrap();
+        assert!(
+            classify_collected(&[policy], &c).is_err(),
+            "classification cannot ignore contrary collected foreground ownership"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c8f_foreground_is_revalidated_after_native_collection() {
+        let (mut input, _) = collection_fixture();
+        let pg = cys::process_observation::observe(input.root_pid)
+            .unwrap()
+            .identity
+            .process_group;
+        let reads = Arc::new(AtomicU64::new(0));
+        let r = reads.clone();
+        input.foreground = Box::new(move || {
+            Some(if r.fetch_add(1, Ordering::Relaxed) == 0 {
+                pg
+            } else {
+                pg.wrapping_add(1)
+            })
+        });
+        assert!(
+            discover(&input).is_err(),
+            "a contrary foreground after collection must stop publication"
+        );
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            2,
+            "one collected observation and one final targeted validation"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn c8g_classification_requires_native_ancestry_before_fixing_policy() {
+        // A controlled native-observation record: classification must validate its provenance
+        // even though later Retained::open would also refuse a non-existent/moved candidate.
+        for contradiction in ["parent", "birth"] {
+            let (input, mut policy) = collection_fixture();
+            let mut c = collect(&input).unwrap();
+            let root = c.root.observation();
+            let child_pid = i32::MAX as u32;
+            let mut child = obs(
+                child_pid,
+                root.identity.process_group,
+                "/fixture/child-cli",
+                &["child-cli"],
+            );
+            child.identity.parent = input.root_pid;
+            child.identity.birth_seconds = root.identity.birth_seconds + 1;
+            child.identity.birth_microseconds = root.identity.birth_microseconds;
+            c.tree.push((child_pid, input.root_pid));
+            c.observed.insert(child_pid, Ok(child));
+            policy.recipe = recipe("child-cli");
+            policy.adapter = "classified-child".into();
+            assert_eq!(
+                classify_collected(&[policy.clone()], &c).unwrap(),
+                policy,
+                "valid child provenance classifies its frozen declaration"
+            );
+            let child = c.observed.get_mut(&child_pid).unwrap().as_mut().unwrap();
+            if contradiction == "parent" {
+                child.identity.parent = input.root_pid.wrapping_add(1);
+            } else {
+                child.identity.birth_seconds = root.identity.birth_seconds.saturating_sub(1);
+            }
+            assert!(
+                classify_collected(&[policy], &c).is_err(),
+                "contradictory native {contradiction} must not become a fixed adapter policy"
+            );
+        }
+    }
+
+    fn publication_fixture(at: Instant) -> PublicationGate {
+        let mut gate = PublicationGate::new(AttemptTicket {
+            epochs: Epochs {
+                daemon_instance: 1,
+                surface_instance: 2,
+                launch: 3,
+                conversation: 4,
+                policy: 5,
+                binding: 6,
+            },
+            obligation_id: "obligation".into(),
+            request_id: "request".into(),
+            attempt_id: 7,
+        });
+        gate.budget.open_window(at, Duration::from_millis(2_000));
+        gate
+    }
+
+    #[test]
+    fn c8h_start_budget_rejects_fifth_without_mutation() {
+        let at = Instant::now();
+        let mut budget = StartBudget::new();
+        budget.open_window(at, Duration::from_millis(2_000));
+        for n in 0..4 {
+            budget.begin(at + Duration::from_millis(n * 250)).unwrap();
+        }
+        assert_eq!(budget.starts, 4);
+        assert_eq!(
+            budget.begin(at + Duration::from_millis(1_000)),
+            Err(StartRefusal::BudgetExhausted),
+            "fifth start must be refused after four properly spaced starts"
+        );
+        assert_eq!(budget.starts, 4, "refusal cannot consume another start");
+    }
+
+    #[test]
+    fn c8d_late_in_window_completion_publishes_only_once() {
+        let at = Instant::now();
+        for ms in [300, 1_500, 2_000] {
+            let mut gate = publication_fixture(at);
+            let key = gate.ticket.clone();
+            assert_eq!(
+                gate.publish(&key, key.epochs, at + Duration::from_millis(ms), true, true),
+                Ok(())
+            );
+            assert!(
+                gate.publish(&key, key.epochs, at + Duration::from_millis(ms), true, true)
+                    .is_err(),
+                "one native completion can publish only once"
+            );
+            assert_eq!(gate.phase, PublicationPhase::Published);
+        }
+    }
+
+    #[test]
+    fn c8d_publication_uses_time_after_native_validation() {
+        let at = Instant::now();
+        let mut gate = publication_fixture(at);
+        let key = gate.ticket.clone();
+        let validation_started = at + Duration::from_millis(1_999);
+        assert!(!gate.budget.expired(validation_started));
+        assert!(
+            gate.publish(
+                &key,
+                key.epochs,
+                at + Duration::from_millis(2_001),
+                true,
+                true
+            )
+            .is_err(),
+            "validation begun in-window cannot publish after the absolute deadline"
+        );
+        assert_eq!(
+            gate.budget.deadline,
+            Some(at + Duration::from_millis(2_000))
+        );
+    }
+
+    #[test]
+    fn c8d_every_instance_and_epoch_is_part_of_publication_identity() {
+        let at = Instant::now();
+        for axis in 0..6 {
+            let mut gate = publication_fixture(at);
+            let key = gate.ticket.clone();
+            let mut live = key.epochs;
+            match axis {
+                0 => live.daemon_instance += 1,
+                1 => live.surface_instance += 1,
+                2 => live.launch += 1,
+                3 => live.conversation += 1,
+                4 => live.policy += 1,
+                5 => live.binding += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                gate.publish(&key, live, at, true, true).is_err(),
+                "changed live identity axis {axis} must reject stale completion"
+            );
+        }
+        for axis in 0..3 {
+            let mut gate = publication_fixture(at);
+            let mut key = gate.ticket.clone();
+            let epochs = key.epochs;
+            match axis {
+                0 => key.obligation_id.push('x'),
+                1 => key.request_id.push('x'),
+                2 => key.attempt_id += 1,
+                _ => unreachable!(),
+            }
+            assert!(
+                gate.publish(&key, epochs, at, true, true).is_err(),
+                "changed ticket identity axis {axis} must reject stale completion"
+            );
+        }
+    }
+
+    #[test]
+    fn c8d_cancellation_and_native_or_input_failure_prevent_publication() {
+        let at = Instant::now();
+        for mode in 0..3 {
+            let mut gate = publication_fixture(at);
+            let key = gate.ticket.clone();
+            if mode == 0 {
+                gate.cancel();
+            }
+            assert!(gate.publish(&key, key.epochs, at, mode != 1, mode != 2).is_err(),
+                "cancelled, native-invalid or input-held completion cannot authorize a write (mode {mode})");
+        }
+    }
+
+    #[test]
+    fn c8d_zero_body_offset_does_not_prove_zero_native_writes() {
+        let at = Instant::now();
+        for accepted in [0, 1, 6] {
+            let mut gate = publication_fixture(at);
+            let key = gate.ticket.clone();
+            gate.native_write_started();
+            if accepted != 0 {
+                gate.native_write_returned(NativeWriteCompletion::Exact(accepted));
+            }
+            assert!(gate.publish(&key, key.epochs, at, true, true).is_err(),
+                "outstanding native call or accepted control/fence bytes forbids zero-write publication");
+        }
+    }
+
+    #[test]
+    fn c8c_prestart_refusal_consumes_no_native_query() {
+        let ex = Executor::new(1);
+        let (entered, reached) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Arc::new(Mutex::new(Some(wait)));
+        let (finished, done) = std::sync::mpsc::channel();
+        prepare_when_uncontended(&ex, 9, || {
+            let entered = entered.clone();
+            let wait = wait.clone();
+            let finished = finished.clone();
+            (
+                Box::new(move || {
+                    entered.send(()).unwrap();
+                    wait.lock()
+                        .unwrap()
+                        .take()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                    None // cancellation/expiry/generation check refused before the first native query
+                }),
+                Some(Box::new(move || finished.send(()).unwrap())),
+            )
+        });
+        reached.recv_timeout(Duration::from_secs(10)).unwrap();
+        let before = ex.counters().started.load(Ordering::Relaxed);
+        release.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(before, 0, "preparation is not an actual native query");
+        assert_eq!(
+            ex.counters().started.load(Ordering::Relaxed),
+            0,
+            "pre-start refusal consumes no native start"
+        );
+    }
+
+    #[test]
+    fn c8c_completion_callback_runs_after_surface_slot_release() {
+        let ex = Arc::new(Executor::new(1));
+        let weak = Arc::downgrade(&ex);
+        let (tx, rx) = std::sync::mpsc::channel();
+        prepare_when_uncontended(&ex, 3, || {
+            let weak = weak.clone();
+            let tx = tx.clone();
+            (
+                Box::new(|| Some(Box::new(|| {}))),
+                Some(Box::new(move || {
+                    tx.send(weak.upgrade().unwrap().slot_busy(3)).unwrap()
+                })),
+            )
+        });
+        assert!(
+            !rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            "recovery notification cannot run while its old slot is occupied"
+        );
+        assert_eq!(ex.counters().started.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn c8c_dropped_idle_executor_releases_its_workers() {
+        let ex = Executor::new(2);
+        let weak = Arc::downgrade(&ex.inner);
+        drop(ex);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while weak.strong_count() != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "dropping an idle discovery pool must not leave permanent worker threads"
+        );
+    }
+
+    #[test]
+    fn c8b_native_parent_must_agree_with_the_selected_snapshot_chain() {
+        let (tree, mut map) = table(vec![
+            (1, 0, obs(1, 1, "/bin/sh", &["sh"])),
+            (10, 1, obs(10, 10, "/u/node", &["node", "/u/codex"])),
+            (11, 10, obs(11, 10, "/u/codex", &["codex"])),
+        ]);
+        assert_eq!(selected_chain(1, 11, &tree, &map), Ok(vec![10, 11]));
+        map.get_mut(&10).unwrap().as_mut().unwrap().identity.parent = 99;
+        assert!(
+            selected_chain(1, 11, &tree, &map).is_err(),
+            "unchanged selected receiver cannot hide a reparented intermediary"
+        );
+    }
+
+    #[test]
+    fn c8b_vanished_intermediate_is_not_an_unrelated_dead_descendant() {
+        let (tree, mut map) = table(vec![
+            (1, 0, obs(1, 1, "/bin/sh", &["sh"])),
+            (10, 1, obs(10, 10, "/u/node", &["node", "/u/codex"])),
+            (11, 10, obs(11, 10, "/u/codex", &["codex"])),
+            (12, 1, obs(12, 12, "/u/tool", &["tool"])),
+        ]);
+        map.insert(12, Err(Failure::Dead));
+        assert_eq!(selected_chain(1, 11, &tree, &map), Ok(vec![10, 11]));
+        map.insert(10, Err(Failure::Dead));
+        assert!(
+            selected_chain(1, 11, &tree, &map).is_err(),
+            "a dead intermediary invalidates the selected ancestry"
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn c8b_native_surface_root_can_itself_be_the_receiver() {
+        let pid = std::process::id();
+        let root = cys::process_observation::observe(pid).unwrap();
+        let executable = String::from_utf8_lossy(&root.identity.executable).into_owned();
+        let pgid = root.identity.process_group;
+        let input = DiscoveryInput {
+            root_pid: pid,
+            recipe: recipe(base_name(&executable)),
+            class: ProofClass::FullRequired,
+            epochs: Epochs::default(),
+            sealed: vec![],
+            snapshot: Box::new(Vec::new),
+            foreground: Box::new(move || Some(pgid)),
+            observe: Box::new(cys::process_observation::observe),
+            retain: Box::new(Retained::open),
+        };
+        let bound = discover(&input)
+            .expect("strict root invocation is a receiver even without descendants");
+        assert_eq!(bound.agent_identity().0, pid);
+    }
+
+    #[test]
+    fn c8b_absolute_deadline_is_part_of_start_admission() {
+        let at = Instant::now();
+        let mut b = StartBudget::new();
+        b.open_window(at, Duration::from_millis(BOOT_PROOF_WINDOW_MS));
+        assert_eq!(
+            b.may_start(at + Duration::from_millis(BOOT_PROOF_WINDOW_MS)),
+            Ok(())
+        );
+        assert!(
+            b.may_start(at + Duration::from_millis(BOOT_PROOF_WINDOW_MS + 1))
+                .is_err(),
+            "expired proof window must refuse a native start even when budget remains"
+        );
+        assert_eq!(b.starts, 0);
+    }
+
+    #[test]
+    fn c8b_enqueued_work_is_not_an_actual_native_start() {
+        // No worker has entered this queue. Admission is real, but starting a query is not.
+        let ex = Executor {
+            inner: Arc::new(ExecInner {
+                state: Mutex::new(ExecState {
+                    queue: VecDeque::new(),
+                    busy: HashSet::new(),
+                    running: 0,
+                    closed: false,
+                }),
+                cv: Condvar::new(),
+                counters: Counters::default(),
+                capacity: 1,
+            }),
+        };
+        ex.try_start(10, Box::new(|| {})).unwrap();
+        assert!(ex.slot_busy(10));
+        assert_eq!(ex.counters().admissions.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            ex.counters().started.load(Ordering::Relaxed),
+            0,
+            "queued admission consumes no actual native start"
+        );
+    }
+
+    #[test]
+    fn c8b_executor_admission_does_not_wait_for_the_pool_mutex() {
+        let ex = Arc::new(Executor::new(1));
+        let lock = ex.inner.state.lock().unwrap();
+        let worker = ex.clone();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (done, completed) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            done.send(worker.try_start(7, Box::new(|| {}))).unwrap();
+        });
+        entering.recv_timeout(Duration::from_secs(10)).unwrap();
+        let result = completed.recv_timeout(Duration::from_secs(2));
+        // Always unblock and join before asserting; a defective blocking admission cannot leak a thread.
+        drop(lock);
+        thread.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "executor admission must refuse rather than wait for a held global mutex"
+        );
+        assert!(
+            result.unwrap().is_err(),
+            "contended admission cannot start a query"
+        );
+        assert_eq!(ex.counters().started.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn c8b_equal_argv_native_agents_are_still_ambiguous() {
+        let (tree, map) = table(vec![
+            (
+                10,
+                1,
+                obs(10, 10, "/v/claude", &["claude", "--resume", "x"]),
+            ),
+            (
+                11,
+                10,
+                obs(11, 10, "/v/claude", &["claude", "--resume", "x"]),
+            ),
+        ]);
+        assert!(
+            matches!(
+                select_receiver(&recipe("claude"), &tree, &map, Some(Some(10))),
+                Err(Unknown::Ambiguous(_))
+            ),
+            "equal argv and ancestry do not make two native agents one invocation"
+        );
+    }
+
+    #[test]
+    fn c8b_runtime_option_operands_are_not_script_slots() {
+        let o = obs(
+            10,
+            10,
+            "/u/bin/node",
+            &["node", "--require", "/u/bin/claude", "/u/unrelated.js"],
+        );
+        assert_eq!(
+            match_slot(&recipe("claude"), &o),
+            None,
+            "runtime option operand is not the entrypoint"
+        );
+    }
+
+    #[test]
+    fn c8b_package_helper_is_not_the_adapter_entrypoint() {
+        let o = obs(
+            10,
+            10,
+            "/u/bin/node",
+            &["node", "/u/@anthropic-ai/claude-code/helper.js"],
+        );
+        assert_eq!(
+            match_slot(&recipe("claude"), &o),
+            None,
+            "package membership alone is not an invocation recipe"
+        );
+    }
+
+    #[test]
+    fn c8b_custom_unicode_bin_matching_is_total() {
+        let o = obs(10, 10, "/u/도구", &["도구"]);
+        let matched = std::panic::catch_unwind(|| match_slot(&recipe("도구"), &o));
+        assert!(
+            matched.is_ok(),
+            "custom invocation matching must not panic on UTF-8"
+        );
+        assert_eq!(
+            matched.unwrap(),
+            Some(Slot::Native),
+            "custom declarations are UTF-8, not byte offsets"
+        );
     }
 
     #[test]
@@ -879,7 +2104,13 @@ mod tests {
         HashMap<u32, Result<ProcessObservation, Failure>>,
     ) {
         let tree = entries.iter().map(|(p, pp, _)| (*p, *pp)).collect();
-        let map = entries.into_iter().map(|(p, _, o)| (p, Ok(o))).collect();
+        let map = entries
+            .into_iter()
+            .map(|(p, parent, mut o)| {
+                o.identity.parent = parent;
+                (p, Ok(o))
+            })
+            .collect();
         (tree, map)
     }
 
@@ -1033,20 +2264,33 @@ mod tests {
         assert!(b.expired(eligible + Duration::from_millis(BOOT_PROOF_WINDOW_MS + 1)));
     }
 
+    // Admission is nonblocking; startup/worker bookkeeping may transiently own its mutex.
+    // Fixtures retry ONLY AdmissionBusy, without consuming a native start or changing a deadline.
+    fn start_when_uncontended(ex: &Executor, slot: u64, mut make: impl FnMut() -> Job) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match ex.try_start(slot, make()) {
+                Ok(()) => return,
+                Err(StartRefusal::AdmissionBusy) if Instant::now() < deadline => {
+                    std::thread::yield_now()
+                }
+                other => panic!("fixture admission did not become available: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn executor_slot_survives_caller_deadline_and_refusals_start_nothing() {
         let ex = Executor::new(2);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let release = Arc::new(Mutex::new(Some(rx)));
-        let r = release.clone();
-        ex.try_start(
-            7,
+        start_when_uncontended(&ex, 7, || {
+            let r = release.clone();
             Box::new(move || {
                 let rx = r.lock().unwrap().take().unwrap();
                 let _ = rx.recv_timeout(Duration::from_secs(5));
-            }),
-        )
-        .unwrap();
+            })
+        });
         // Past any caller deadline the slot is still held: a second query for the same surface is refused.
         std::thread::sleep(Duration::from_millis(
             DISCOVERY_CALLER_DEADLINE_PROVISIONAL_MS + 50,
@@ -1062,8 +2306,10 @@ mod tests {
         );
         // Another surface still gets the remaining worker (one bad surface cannot take all capacity).
         let (dtx, drx) = std::sync::mpsc::channel();
-        ex.try_start(8, Box::new(move || dtx.send(()).unwrap()))
-            .unwrap();
+        start_when_uncontended(&ex, 8, || {
+            let dtx = dtx.clone();
+            Box::new(move || dtx.send(()).unwrap())
+        });
         drx.recv_timeout(Duration::from_secs(5))
             .expect("other surface progressed");
         tx.send(()).unwrap();
@@ -1085,15 +2331,13 @@ mod tests {
         let ex = Executor::new(1);
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let rx = Arc::new(Mutex::new(Some(rx)));
-        let r = rx.clone();
-        ex.try_start(
-            1,
+        start_when_uncontended(&ex, 1, || {
+            let r = rx.clone();
             Box::new(move || {
                 let rx = r.lock().unwrap().take().unwrap();
                 let _ = rx.recv_timeout(Duration::from_secs(5));
-            }),
-        )
-        .unwrap();
+            })
+        });
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(
             ex.try_start(2, Box::new(|| {})),
