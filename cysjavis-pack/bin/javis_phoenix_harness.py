@@ -19,10 +19,11 @@ javis_phoenix_harness.py — 불사조(무손실 복원) Phase 1 격리 하네�
     → 격리 데몬 liveness 판정은 identify가 아니라 ping/list로 한다.
 
 자원 거버넌스(잔여 프로세스 0 절대 준수):
-  · 격리 데몬은 os.setsid로 자기 프로세스 그룹의 리더가 되게 띄운다 → 종료 시 killpg로 그룹 일괄 종료.
+  · 격리 데몬은 os.setsid로 자기 프로세스 그룹의 리더가 되게 띄운다. 크래시 주입은 killpg,
+    teardown은 기록한 시작 신원을 재확인한 개별 PID 종료를 사용한다.
   · atexit + SIGINT/SIGTERM 핸들러가 teardown()을 호출한다(외부 timeout이 이 파이썬을 죽여도 최대한 정리).
-  · teardown은 (1) 살아있으면 모든 격리 surface를 close-surface로 닫고 (2) 격리 dir에 bind한
-    모든 cysd를 lsof로 찾아 kill -9 (autostart 고아 청소) (3) 추적 데몬 그룹 killpg 순으로 동작한다.
+  · teardown은 격리 owner RPC로 surface를 닫고, 미리 기록한 프로세스 시작 신원과 자손을
+    대조해 정리한다. close 실패와 fallback 정리 성공은 별도 계수하며 잔류를 직접 확인한다.
 
 사용:
   javis_phoenix_harness.py up            # 격리 데몬 기동 + 라이브 무영향 불변식 실측
@@ -42,6 +43,7 @@ import os
 import re
 import select
 import signal
+import socket as _socket
 import subprocess
 import sys
 sys.dont_write_bytecode = True  # SEAL-1 층4: 호출자 env 와 무관하게 형제 import 의 __pycache__ 기록 차단(D-pyc 2026-09-21)
@@ -97,6 +99,276 @@ LEAKY_ENV = [
 ]
 
 _tracked_daemon = None  # subprocess.Popen of the isolated cysd we own
+
+# S7: harness-local credentials and cleanup evidence; never shared with public cys.
+_CLOSE_TIMEOUT = 3.0
+_CLEANUP_TIMEOUT = 10.0
+_RPC_MAX_BYTES = 1024 * 1024
+_cleanup_counts = {"close_success": 0, "close_failure": 0, "fallback_cleanup_success": 0,
+                   "inventory_failure": 0}
+_owned_processes = {}  # pid -> original kernel start identity (retained after parent exit)
+_captured_processes = set()  # (pid, start) whose descendant snapshot completed
+_ownership_errors = set()
+_last_close = {}
+
+
+class _HarnessError(Exception):
+    """Only fixed reason codes: exception text must never include request/token bytes."""
+
+
+def _remaining(deadline):
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise _HarnessError("timeout")
+    return left
+
+
+def _inside(path, root):
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def _windows_token_dir(pipe, local_app_data):
+    """Production state.rs::state_dir mapping, NOT its cfg(test) Unix shortcut."""
+    if not local_app_data:
+        raise _HarnessError("windows_state_outside_harness")
+    from javis_state_snapshot import _win_state_dir_for_socket
+    return _win_state_dir_for_socket(pipe, localappdata=local_app_data)
+
+
+def _harness_paths(endpoint=None):
+    """Strict close/cleanup boundary; legacy allow-live opt-in never authorizes this route."""
+    endpoint = HARN_SOCK if endpoint is None else endpoint
+    if endpoint != HARN_SOCK:
+        raise _HarnessError("foreign_endpoint")
+    root = os.path.realpath(HARN_DIR)
+    # Refuse aliases of the scratch ROOT too, including a symlink to another
+    # daemon's directory. Tests using /tmp aliases must pass the canonical root.
+    if os.path.normcase(os.path.abspath(HARN_DIR)) != os.path.normcase(root):
+        raise _HarnessError("aliased_harness_root")
+    for live in (LIVE_STATE, LIVE_LEDGER_ROOT):
+        live = os.path.realpath(live)
+        if _inside(root, live) or _inside(live, root):
+            raise _HarnessError("live_overlap")
+    if os.name == "nt":
+        # A pipe is not a filesystem child. Pin its exact name; contain its mapped state.
+        if not endpoint.startswith("\\\\.\\pipe\\") or endpoint == "\\\\.\\pipe\\cys":
+            raise _HarnessError("windows_isolated_pipe_required")
+        local = os.environ.get("LOCALAPPDATA")
+        if not local or not _inside(os.path.realpath(local), root):
+            raise _HarnessError("windows_state_outside_harness")
+        state = _windows_token_dir(endpoint, local)
+    else:
+        expected = os.path.join(root, "cys.sock")
+        if os.path.realpath(endpoint) != expected:
+            raise _HarnessError("socket_outside_harness")
+        state = os.path.dirname(endpoint)
+    token = os.path.join(state, "operator.token")
+    for path in (state, HARN_STATE, token):
+        if not _inside(os.path.realpath(path), root):
+            raise _HarnessError("path_outside_harness")
+    return endpoint, token
+
+
+def _harness_rpc(method, params=None, deadline=None):
+    """Bounded NDJSON to HARN_SOCK only; no autostart, env endpoint, or CLI fallback."""
+    endpoint, _ = _harness_paths()
+    if os.name == "nt":
+        # The surrounding lifecycle is Unix-only (setsid/pgrep/PTY). No blocking pipe
+        # file I/O or abandoned timeout thread masquerading as Windows support.
+        raise _HarnessError("windows_transport_unsupported")
+    if method not in ("surface.close", "surface.list", "system.ping"):
+        raise _HarnessError("unsupported_method")
+    deadline = deadline if deadline is not None else time.monotonic() + _CLOSE_TIMEOUT
+    request_id = "harness-" + str(time.monotonic_ns())
+    request = {"id": request_id, "method": method, "params": params or {}}
+    try:
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+    except OSError:
+        raise _HarnessError("transport_error") from None
+    try:
+        sock.settimeout(_remaining(deadline))
+        sock.connect(endpoint)
+        sock.settimeout(_remaining(deadline))
+        sock.sendall((json.dumps(request) + "\n").encode("utf-8"))
+        data = bytearray()
+        while b"\n" not in data:
+            sock.settimeout(_remaining(deadline))
+            chunk = sock.recv(min(65536, _RPC_MAX_BYTES + 1 - len(data)))
+            if not chunk:
+                raise _HarnessError("incomplete_reply")
+            data.extend(chunk)
+            if len(data) > _RPC_MAX_BYTES:
+                raise _HarnessError("reply_too_large")
+        try:
+            reply = json.loads(bytes(data).split(b"\n", 1)[0])
+        except (ValueError, UnicodeError):
+            raise _HarnessError("invalid_reply") from None
+        if not isinstance(reply, dict) or reply.get("id") != request_id:
+            raise _HarnessError("invalid_reply")
+        if reply.get("ok") is not True or "error" in reply:
+            raise _HarnessError("rpc_error")
+        if "result" not in reply:
+            raise _HarnessError("invalid_reply")
+        return reply["result"]
+    except (OSError, TimeoutError) as e:
+        # Do not expose arbitrary transport/server text (it can contain credentials).
+        raise _HarnessError("unavailable" if getattr(e, "errno", None) in (2, 61, 111)
+                            else "transport_error") from None
+    finally:
+        sock.close()
+
+
+def _surface_inventory(deadline=None):
+    result = _harness_rpc("surface.list", deadline=deadline)
+    if not isinstance(result, dict) or not isinstance(result.get("surfaces"), list):
+        raise _HarnessError("invalid_inventory")
+    rows = result["surfaces"]
+    if any(not isinstance(row, dict) or type(row.get("surface_id")) is not int
+           or row["surface_id"] < 0 for row in rows):
+        raise _HarnessError("invalid_inventory")
+    return rows
+
+
+def _process_info(pid):
+    """(start identity, ppid), None only for confirmed absence; uncertainty raises.
+
+    macOS uses the SDK proc_bsdinfo sec+usec fields (PROC_PIDTBSDINFO=3);
+    Linux uses /proc start ticks. No lstart display-string/PID-only identity.
+    """
+    try:
+        if sys.platform == "darwin":
+            import ctypes as ct
+            import errno
+            class BsdInfo(ct.Structure):
+                _fields_ = [("head", ct.c_uint32 * 12), ("comm", ct.c_char * 16),
+                            ("name", ct.c_char * 32), ("tail", ct.c_uint32 * 6),
+                            ("sec", ct.c_uint64), ("usec", ct.c_uint64)]
+            lib = ct.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            fn = lib.proc_pidinfo
+            fn.argtypes = [ct.c_int, ct.c_int, ct.c_uint64, ct.c_void_p, ct.c_int]
+            fn.restype = ct.c_int
+            info = BsdInfo()
+            n = fn(pid, 3, 0, ct.byref(info), ct.sizeof(info))
+            if n == ct.sizeof(info) and info.head[3] == pid:
+                return (info.sec, info.usec), info.head[4]
+            if n <= 0 and ct.get_errno() == errno.ESRCH:
+                return None
+        elif sys.platform.startswith("linux"):
+            try:
+                with open("/proc/%d/stat" % pid, encoding="utf-8") as f:
+                    fields = f.read().rsplit(")", 1)[1].split()
+                return (int(fields[19]),), int(fields[1])
+            except FileNotFoundError:
+                return None
+    except (OSError, ValueError, IndexError):
+        pass
+    raise _HarnessError("process_probe_unavailable")
+
+
+def _capture_owned(roots, deadline=None):
+    """Snapshot original identities and descendants BEFORE a close/parent kill.
+
+    Retained entries survive reparenting; a reused PID is never adopted by this
+    snapshot. roots must come from the isolated daemon inventory or owned Popen.
+    """
+    _harness_paths()
+    deadline = deadline if deadline is not None else time.monotonic() + _CLOSE_TIMEOUT
+    seeds = set(roots) | set(_owned_processes)
+    if not seeds:
+        return
+    try:
+        active = {}
+        for pid in seeds:
+            _remaining(deadline)
+            if type(pid) is not int or pid <= 1 or pid == os.getpid():
+                raise _HarnessError("unsafe_process_root")
+            info = _process_info(pid)
+            if info and (pid not in _owned_processes or _owned_processes[pid] == info[0]):
+                active[pid] = info
+                _owned_processes[pid] = info[0]
+            elif (pid, _owned_processes.get(pid)) not in _captured_processes:
+                # Discovery proved a root, but it vanished/was reused before its
+                # descendants were observed. Absence cannot prove zero leftovers.
+                _ownership_errors.add("original_identity_unobserved")
+        if not active:
+            return
+        r = subprocess.run(["ps", "-Ao", "pid=,ppid="], capture_output=True, text=True,
+                           timeout=_remaining(deadline))
+        if r.returncode:
+            raise _HarnessError("process_tree_unavailable")
+        parents = {}
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) != 2 or not all(p.isdigit() for p in parts):
+                raise _HarnessError("process_tree_unavailable")
+            parents[int(parts[0])] = int(parts[1])
+        pending = list(active)
+        while pending:
+            parent = pending.pop()
+            for pid, ppid in parents.items():
+                if ppid != parent or pid in active:
+                    continue
+                _remaining(deadline)
+                parent_now = _process_info(parent)
+                info = _process_info(pid)
+                if parent_now != active[parent] or not info or info[1] != parent:
+                    raise _HarnessError("process_tree_changed")
+                if pid == os.getpid() or pid <= 1:
+                    raise _HarnessError("unsafe_process_root")
+                if pid in _owned_processes and _owned_processes[pid] != info[0]:
+                    raise _HarnessError("process_tree_changed")
+                _owned_processes[pid] = info[0]
+                active[pid] = info
+                pending.append(pid)
+        _captured_processes.update((pid, info[0]) for pid, info in active.items())
+    except (OSError, subprocess.TimeoutExpired, _HarnessError):
+        # Unknown ownership cannot later turn into a clean result simply because
+        # the parent disappeared. Fixed reason only; retained across teardown calls.
+        _ownership_errors.add("ownership_capture_incomplete")
+
+
+def _close_surface(ref, deadline=None):
+    """One logical close: checked owner RPC AND target absence, counted once."""
+    global _last_close
+    deadline = deadline if deadline is not None else time.monotonic() + _CLOSE_TIMEOUT
+    outcome = {"surface": ref, "ok": False, "reason": "invalid_surface"}
+    try:
+        m = re.fullmatch(r"surface:(\d+)", str(ref))
+        if not m:
+            raise _HarnessError("invalid_surface")
+        sid = int(m.group(1))
+        _, token_path = _harness_paths()
+        if os.name == "nt":
+            raise _HarnessError("windows_transport_unsupported")
+        rows = _surface_inventory(deadline)
+        _capture_owned([r["pid"] for r in rows if type(r.get("pid")) is int], deadline)
+        try:
+            # Bounded regular-file read; do not block on a FIFO masquerading as token.
+            import stat
+            fd = os.open(token_path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+            with os.fdopen(fd, "rb") as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    raise _HarnessError("invalid_token_file")
+                token = f.read(4097).decode("utf-8").strip()
+            if not token or len(token) > 4096:
+                raise _HarnessError("invalid_token_file")
+        except (OSError, UnicodeError):
+            raise _HarnessError("token_unavailable") from None
+        result = _harness_rpc("surface.close", {"surface_id": sid, "owner_token": token}, deadline)
+        if (not isinstance(result, dict) or result.get("closed") is not True
+                or type(result.get("surface_id")) is not int or result["surface_id"] != sid):
+            raise _HarnessError("invalid_close_reply")
+        while any(row["surface_id"] == sid for row in _surface_inventory(deadline)):
+            time.sleep(min(0.05, _remaining(deadline)))
+        outcome.update(ok=True, reason="closed_and_absent")
+    except _HarnessError as e:
+        outcome["reason"] = str(e)
+    _cleanup_counts["close_success" if outcome["ok"] else "close_failure"] += 1
+    _last_close = outcome
+    return dict(outcome)
 
 
 # ------------------------------------------------------------------ 유틸
@@ -245,28 +517,41 @@ def live_surfaces():
     return [l for l in (r.stdout or "").splitlines() if l.startswith("surface:")]
 
 
-def harness_daemon_pids():
+def harness_daemon_pids(deadline=None):
     """격리 dir(state-harness)에 bind한 모든 cysd pid — lsof 실측(autostart 고아 포함).
     ★Phase11 ②: 판별을 **realpath 해소 경로 + bind 소켓 기반**으로 정밀화한다. 이전엔 lsof 출력에 대한
     'state-harness' 문자열 substring 폴백을 썼는데, 이는 심링크·이름 변형에 취약하고 무관 경로를 오적중할 수 있다.
     수리: (a) 격리 소켓(HARN_SOCK)의 realpath 를 lsof 출력에서 정확히 매칭(socket 기반 — 어떤 cysd 가 우리 소켓을
     bind 했는가), (b) 보조로 격리 dir realpath 접두 경로. 문자열 'state-harness' substring 폴백 제거."""
+    _harness_paths()
+    deadline = deadline if deadline is not None else time.monotonic() + _CLOSE_TIMEOUT
     pids = []
     harn_dir_rp = os.path.realpath(HARN_DIR)
     harn_sock_rp = os.path.realpath(HARN_SOCK)
     try:
-        out = subprocess.run(["pgrep", "-x", "cysd"], capture_output=True, text=True, timeout=10).stdout
-    except Exception:
-        return pids
+        r = subprocess.run(["pgrep", "-x", "cysd"], capture_output=True, text=True, timeout=_remaining(deadline))
+        if r.returncode not in (0, 1):
+            raise _HarnessError("daemon_discovery_unavailable")
+        out = r.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        raise _HarnessError("daemon_discovery_unavailable") from None
     for line in out.split():
         pid = line.strip()
         if not pid.isdigit():
             continue
         try:
+            before = _process_info(int(pid))
+            if before is None:
+                continue
             # lsof -Fn: NUL 없는 이름 필드만(파싱 안정) — 각 열린 파일 경로를 realpath 로 해소해 대조.
-            ls = subprocess.run(["lsof", "-p", pid, "-Fn"], capture_output=True, text=True, timeout=10).stdout
-        except Exception:
-            continue
+            r = subprocess.run(["lsof", "-p", pid, "-Fn"], capture_output=True, text=True, timeout=_remaining(deadline))
+            if r.returncode:
+                if _process_info(int(pid)) is None:
+                    continue
+                raise _HarnessError("daemon_discovery_unavailable")
+            ls = r.stdout
+        except (OSError, subprocess.TimeoutExpired):
+            raise _HarnessError("daemon_discovery_unavailable") from None
         matched = False
         for l in ls.splitlines():
             if not l.startswith("n"):
@@ -278,7 +563,16 @@ def harness_daemon_pids():
                 matched = True
                 break
         if matched:
-            pids.append(int(pid))
+            pid = int(pid)
+            after = _process_info(pid)
+            if (not after or after[0] != before[0]
+                    or (pid in _owned_processes and _owned_processes[pid] != before[0])):
+                _ownership_errors.add("daemon_identity_changed")
+                raise _HarnessError("daemon_identity_changed")
+            # Pin the identity proved by lsof BEFORE handing a bare PID to legacy
+            # callers. _capture_owned may not adopt a replacement at this PID.
+            _owned_processes[pid] = before[0]
+            pids.append(pid)
     return pids
 
 
@@ -312,6 +606,7 @@ def _annihilate():
     무관한 'sleep 600' 을 오적중할 수 있었다. 여기서는 데몬 pid 집합의 부모체인 전체를 pid 로 kill 한다 →
     stub surface 자식(sleep 3600)까지 정확히 적중하고 무관 프로세스는 절대 건드리지 않는다. victim pid 리스트 반환."""
     dpids = harness_daemon_pids()
+    _capture_owned(dpids)
     victims = set(dpids) | _descendants(dpids)
     for pid in sorted(victims):
         try:
@@ -326,12 +621,14 @@ def _annihilate():
 def start_daemon(wait=12.0):
     """격리 cysd를 자기 프로세스 그룹 리더로 기동하고 ping OK까지 대기."""
     global _tracked_daemon
+    _harness_paths()  # refuse an aliased/live scratch path before any spawn or write
     os.makedirs(HARN_DIR, exist_ok=True)
     lf = open(DAEMON_LOG, "ab")
     _tracked_daemon = subprocess.Popen(
         [CYSD], env=_daemon_env(), stdout=lf, stderr=lf,
         cwd=HARN_DIR, preexec_fn=os.setsid,   # ← 새 세션/프로세스그룹 → killpg 대상
     )
+    _capture_owned([_tracked_daemon.pid])
     t0 = time.time()
     while time.time() - t0 < wait:
         if harness_ping():
@@ -343,6 +640,7 @@ def start_daemon(wait=12.0):
 
 
 def _kill_pg(pid, sig):
+    _capture_owned([pid])  # original identity/descendants before deliberate parent death
     try:
         os.killpg(os.getpgid(pid), sig)
         return True
@@ -354,56 +652,111 @@ def _kill_pg(pid, sig):
             return False
 
 
-def close_all_surfaces():
-    """살아있는 격리 데몬의 모든 surface를 close-surface로 닫는다(자손 트리 강제 종료)."""
-    if not harness_ping():
+def close_all_surfaces(deadline=None):
+    """Return only confirmed closes; raw inventory never autostarts a daemon."""
+    deadline = deadline if deadline is not None else time.monotonic() + _CLOSE_TIMEOUT
+    try:
+        rows = _surface_inventory(deadline)
+        _capture_owned([r["pid"] for r in rows if type(r.get("pid")) is int], deadline)
+    except _HarnessError as e:
+        if str(e) != "unavailable":
+            _cleanup_counts["inventory_failure"] += 1
         return []
-    r = cys("list", timeout=10)
-    refs = []
-    for l in (r.stdout or "").splitlines():
-        m = re.match(r"(surface:\d+)", l)
-        if m:
-            refs.append(m.group(1))
     closed = []
-    for ref in refs:
-        cys("close-surface", ref, timeout=10)
-        closed.append(ref)
+    for row in rows:
+        ref = "surface:%d" % row["surface_id"]
+        if _close_surface(ref, deadline)["ok"]:
+            closed.append(ref)
     return closed
 
 
 def teardown(verbose=False):
-    """전면 정리 — 잔여 프로세스 0 보장. 어떤 종료 경로에서도 안전하게 재호출 가능."""
-    # 1) 살아있으면 surface부터 정상 종료
-    try:
-        close_all_surfaces()
-    except Exception:
-        pass
-    # 2) 격리 dir에 bind한 모든 cysd(우리 것 + autostart 고아) kill -9
-    for pid in harness_daemon_pids():
-        _kill_pg(pid, signal.SIGKILL)
-    # 3) 추적 데몬 그룹 killpg (2에서 안 잡힌 경우 대비)
+    """Bounded owned cleanup; the legacy return remains the residual DAEMON list.
+
+    Use residual_report/its clean field for the complete verdict. A signal being
+    sent is not termination. Original child identities survive parent/daemon exit.
+    """
     global _tracked_daemon
-    if _tracked_daemon is not None:
-        _kill_pg(_tracked_daemon.pid, signal.SIGKILL)
-        try:
-            _tracked_daemon.wait(timeout=3)
-        except Exception:
-            pass
-        _tracked_daemon = None
-    # 4) 확인
-    time.sleep(0.4)
-    remain = harness_daemon_pids()
+    deadline = time.monotonic() + _CLEANUP_TIMEOUT
+    attempted = False
+    try:
+        _harness_paths()
+        roots = harness_daemon_pids(deadline)
+        if _tracked_daemon is not None and _tracked_daemon.poll() is None:
+            roots.append(_tracked_daemon.pid)
+        _capture_owned(roots, deadline)
+        close_all_surfaces(min(deadline, time.monotonic() + _CLOSE_TIMEOUT))
+        _capture_owned([], deadline)  # discover children born during graceful close
+        for pid, identity in list(_owned_processes.items()):
+            _remaining(deadline)
+            info = _process_info(pid)
+            if info and info[0] == identity:
+                attempted = True
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        if _tracked_daemon is not None:
+            try:
+                _tracked_daemon.wait(timeout=min(1.0, _remaining(deadline)))
+                _tracked_daemon = None
+            except subprocess.TimeoutExpired:
+                pass
+    except (OSError, _HarnessError):
+        _ownership_errors.add("cleanup_incomplete")
+    report = _residual_snapshot(deadline)
+    while not report["clean"] and time.monotonic() < deadline:
+        # An unobservable identity must not be converted into a zero-residual result.
+        if report["unobserved_owned"]:
+            break
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        time.sleep(min(0.05, left))
+        report = _residual_snapshot(deadline)
+    if attempted and report["clean"]:
+        _cleanup_counts["fallback_cleanup_success"] += 1
     if verbose:
-        log("teardown 후 격리 dir bind cysd 잔여: %s" % (remain or "0(없음)"))
-    return remain
+        log("teardown 잔여 daemon=%s owned=%s unknown=%s" % (
+            report["harness_daemon_pids"], report["owned_process_pids"], report["unobserved_owned"]))
+    return report["harness_daemon_pids"]
+
+
+def _residual_snapshot(deadline):
+    errors = set(_ownership_errors)
+    daemons, owned, ping = [], [], None
+    try:
+        _harness_paths()
+        daemons = harness_daemon_pids(deadline)
+        for pid, identity in _owned_processes.items():
+            _remaining(deadline)
+            info = _process_info(pid)
+            if info and info[0] == identity:
+                owned.append(pid)
+        try:
+            if _harness_rpc("system.ping", deadline=deadline) != "pong":
+                raise _HarnessError("invalid_ping")
+            ping = True
+        except _HarnessError as e:
+            if str(e) == "unavailable":
+                ping = False
+            else:
+                errors.add("endpoint_unobserved")
+    except _HarnessError:
+        errors.add("residual_unobserved")
+    return {"harness_daemon_pids": daemons, "harness_ping": ping,
+            "owned_process_pids": sorted(owned), "unobserved_owned": sorted(errors),
+            "clean": not daemons and not owned and not errors and ping is False,
+            **_cleanup_counts}
 
 
 def residual_report():
-    """잔여 프로세스 실측 — 성공기준 ⑤용."""
-    return {
-        "harness_daemon_pids": harness_daemon_pids(),
-        "harness_ping": harness_ping(),
-    }
+    """Original daemon keys plus owned children/descendants, uncertainty and counters."""
+    return _residual_snapshot(time.monotonic() + _CLOSE_TIMEOUT)
+
+
+def _residual_zero():
+    return residual_report()["clean"]
 
 
 def _wipe_daemon_state():
@@ -424,6 +777,8 @@ def _fresh_harness():
     ★HARN_DIR(격리 스크래치)만 건드린다 — guard_isolation 이 라이브 상태와의 분리를 보장한다."""
     guard_isolation()
     teardown()
+    if not _residual_zero():
+        die("격리 정리 미확인 — 상태 삭제/새 데몬 기동 거부")
     _wipe_daemon_state()
     import shutil as _sh
     for d in ("phoenix", "dept-root"):
@@ -483,8 +838,10 @@ def cmd_up(args):
 def cmd_down(args):
     guard_isolation()
     remain = teardown(verbose=True)
-    ok = (not remain) and (not harness_ping())
-    res = {"residual_daemon_pids": remain, "harness_ping_after": harness_ping(), "clean": ok}
+    detail = residual_report()
+    ok = detail["clean"]
+    res = {"residual_daemon_pids": remain, "harness_ping_after": detail["harness_ping"], "clean": ok,
+           "cleanup": detail}
     print(json.dumps(res, ensure_ascii=False, indent=2))
     if not ok:
         die("teardown 후 잔여 존재 — 수동 확인 필요")
@@ -515,6 +872,7 @@ def cmd_crash_daemon(args):
     if not pids:
         die("격리 데몬이 없다 — 먼저 up")
     victim = pids[0]
+    _capture_owned(pids)  # keep descendants before intentional daemon-first death
     ev = {"before_pids": pids, "victim": victim}
     log("격리 데몬 kill -9 주입: pid=%s" % victim)
     _kill_pg(victim, signal.SIGKILL)
@@ -556,34 +914,36 @@ def cmd_crash_agent(args):
     ev = {"new_surface_ref": ref, "new_surface_raw": (r.stdout or "").strip()}
     if not ref:
         die("격리 surface 생성 실패: %s" % (r.stderr or r.stdout))
-    # surface의 PTY 자식 pid를 list에서 파싱
-    time.sleep(0.5)
-    lst = cys("list", timeout=10).stdout or ""
-    pid = None
-    for l in lst.splitlines():
-        if l.startswith(ref):
-            mm = re.search(r"pid=(\d+)", l)
-            if mm:
-                pid = int(mm.group(1))
-    ev["surface_pid"] = pid
-    log("격리 surface %s pid=%s 생성 → kill -9 주입" % (ref, pid))
-    if pid:
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except Exception as e:
-            ev["kill_error"] = str(e)
-    time.sleep(0.8)
-    # 데몬은 살아야 하고, surface는 죽은 것으로 관측되어야 함
-    ev["daemon_alive_after"] = harness_ping()
-    lst2 = cys("list", timeout=10).stdout or ""
-    still = [l for l in lst2.splitlines() if l.startswith(ref)]
-    ev["surface_line_after"] = still[0] if still else "(목록에서 사라짐)"
-    ev["surface_dead_observed"] = ("exited=true" in (still[0] if still else "")) or (not still)
-    ev["ok"] = ev["daemon_alive_after"] and ev["surface_dead_observed"]
-    log("결과: 데몬 생존=%s · surface 사망관측=%s" % (
-        ev["daemon_alive_after"], ev["surface_dead_observed"]))
-    # 청소: 남은 surface 닫기
-    cys("close-surface", ref, timeout=10)
+    try:
+        # surface의 PTY 자식 pid를 list에서 파싱
+        time.sleep(0.5)
+        lst = cys("list", timeout=10).stdout or ""
+        pid = None
+        for l in lst.splitlines():
+            if l.split()[:1] == [ref]:
+                mm = re.search(r"pid=(\d+)", l)
+                if mm:
+                    pid = int(mm.group(1))
+        ev["surface_pid"] = pid
+        if pid:
+            _capture_owned([pid])  # before intentional parent death
+        log("격리 surface %s pid=%s 생성 → kill -9 주입" % (ref, pid))
+        if pid:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception as e:
+                ev["kill_error"] = str(e)
+        time.sleep(0.8)
+        ev["daemon_alive_after"] = harness_ping()
+        lst2 = cys("list", timeout=10).stdout or ""
+        still = [l for l in lst2.splitlines() if l.split()[:1] == [ref]]
+        ev["surface_line_after"] = still[0] if still else "(목록에서 사라짐)"
+        ev["surface_dead_observed"] = ("exited=true" in (still[0] if still else "")) or (not still)
+        ev["ok"] = ev["daemon_alive_after"] and ev["surface_dead_observed"]
+        log("결과: 데몬 생존=%s · surface 사망관측=%s" % (
+            ev["daemon_alive_after"], ev["surface_dead_observed"]))
+    finally:
+        ev["cleanup_close"] = _close_surface(ref)
     print(json.dumps(ev, ensure_ascii=False, indent=2))
     return ev
 
@@ -811,17 +1171,19 @@ def _q_watch():
         box["rc"] = w.returncode
         box["out"] = (w.stdout or w.stderr or "").strip()[:200]
     th = threading.Thread(target=_run_watch, daemon=True)
-    th.start()
-    time.sleep(1.0)
-    cys("send", "--surface", ref, "echo %s" % marker, timeout=10)
-    cys("send-key", "--surface", ref, "Return", timeout=10)
-    th.join(timeout=14)
-    ev["watch_returned"] = not th.is_alive()
-    ev["watch_rc"] = box.get("rc")
-    ev["watch_out"] = box.get("out", "(미반환)")
-    ev["verdict"] = ("WORKS(마커 출력 시 블로킹 해제)" if ev["watch_returned"] and box.get("rc") == 0
-                     else "INCONCLUSIVE(타임아웃 내 미반환 — 원문 출력 참조)")
-    cys("close-surface", ref, timeout=10)
+    try:
+        th.start()
+        time.sleep(1.0)
+        cys("send", "--surface", ref, "echo %s" % marker, timeout=10)
+        cys("send-key", "--surface", ref, "Return", timeout=10)
+        th.join(timeout=14)
+        ev["watch_returned"] = not th.is_alive()
+        ev["watch_rc"] = box.get("rc")
+        ev["watch_out"] = box.get("out", "(미반환)")
+        ev["verdict"] = ("WORKS(마커 출력 시 블로킹 해제)" if ev["watch_returned"] and box.get("rc") == 0
+                         else "INCONCLUSIVE(타임아웃 내 미반환 — 원문 출력 참조)")
+    finally:
+        ev["cleanup_close"] = _close_surface(ref)
     return ev
 
 
@@ -890,7 +1252,7 @@ def cmd_drill(args):
         "cli_ready_marker": ev["record_cli"].get("startup_marker"),
         "cli_seed_has_marker": ev["record_cli"].get("seed_contains_ready_marker"),
         "qualify_verdicts": {k: v.get("verdict") for k, v in ev["qualify"].items()},
-        "residual_zero": not ev["residual_final"]["harness_daemon_pids"],
+        "residual_zero": ev["residual_final"]["clean"],
     }, ensure_ascii=False, indent=2))
     return ev
 
@@ -1093,9 +1455,9 @@ def cmd_phoenix_drill(args):
     # ── teardown + 잔여0 ──
     remain = teardown(verbose=True)
     live_after = len(live_surfaces())
-    ev["teardown_clean"] = (not remain) and (not harness_ping())
+    ev["teardown_clean"] = _residual_zero()
     ev["live_unchanged"] = live_before == live_after
-    ev["residual_zero"] = not remain
+    ev["residual_zero"] = _residual_zero()
     with open(os.path.join(HARN_DIR, "phoenix_drill_evidence.json"), "w") as f:
         json.dump(ev, f, ensure_ascii=False, indent=2)
 
@@ -1155,7 +1517,7 @@ def cmd_phoenix_p4_erosion(args):
         and ev["tombstone_excludes_cso"]
     )
     ev["live_unchanged"] = live_before == len(live_surfaces())
-    ev["residual_zero"] = not remain
+    ev["residual_zero"] = _residual_zero()
     print(json.dumps(ev, ensure_ascii=False, indent=2))
     return ev
 
@@ -1228,7 +1590,7 @@ def cmd_phoenix_p5_redelivery(args):
     subprocess.run(["pkill", "-9", "-f", "sleep 600"], capture_output=True)
     ev["redelivery_pass"] = ev["restored_present"] and ev["queue_empty_after"] and ev["delivered_to_new_worker"]
     ev["live_unchanged"] = live_before == len(live_surfaces())
-    ev["residual_zero"] = not remain
+    ev["residual_zero"] = _residual_zero()
     print(json.dumps(ev, ensure_ascii=False, indent=2))
     return ev
 
@@ -1316,7 +1678,7 @@ def cmd_phoenix_p6_bootepoch(args):
 
     remain = teardown(verbose=True)
     ev["live_unchanged"] = live_before == len(live_surfaces())
-    ev["residual_zero"] = not remain
+    ev["residual_zero"] = _residual_zero()
     ev["p6_pass"] = bool(
         ev["gen1_outcome"] == "VERIFIED"
         and ev["tagging_ok"]
@@ -1420,7 +1782,7 @@ def cmd_phoenix_p7_inherit(args):
     remain = teardown(verbose=True)
     subprocess.run(["pkill", "-9", "-f", "sleep 600"], capture_output=True)
     ev["live_unchanged"] = live_before == len(live_surfaces())
-    ev["residual_zero"] = not remain
+    ev["residual_zero"] = _residual_zero()
     ev["p7_pass"] = bool(
         ev["nodes_auto_registered"] and ev["depts_auto_registered"]
         and ev["snapshot_covers_alpha"] and ev["snapshot_covers_beta"]
@@ -2154,7 +2516,7 @@ def cmd_phoenix_p12_deploy(args):
         _sh.rmtree(ph, ignore_errors=True)
 
     ev["live_unchanged"] = live_before == len(live_surfaces())
-    ev["residual_zero"] = not harness_daemon_pids()
+    ev["residual_zero"] = _residual_zero()
     ev["p12_pass"] = bool(
         ev.get("plan_exit0") and ev.get("plan_no_side_effect") and ev.get("plan_stages")
         and ev.get("deploy_complete") and ev.get("restart_revived") and ev.get("restart_epoch_changed")
