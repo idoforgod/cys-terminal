@@ -1549,6 +1549,12 @@ pub enum WriteReq {
         /// 최소 간격 기준점(`last_program_write`)도 찍지 않는다 — 화면에 없는 바이트를 기준 삼지 않는다(B2′ 규율).
         withhold: Option<SafetyProbe>,
     },
+    /// ★(0.14.52 · S-a) Checked agent write: one logical machine request to an agent receiver
+    /// ([`crate::agent_write`]). Journal barrier, full admission proof, then every OS call capped at
+    /// 4,096 bytes and re-proven; the typed terminal is journaled before the producer's settlement
+    /// runs. Refused / cancelled / partial outcomes do not end the writer loop — only a broken
+    /// transport does (an exit would drop the writer, and Unix writer Drop types newline + VEOF).
+    Agent(Box<crate::agent_write::AgentJob>),
 }
 
 /// 청크 경계 상태: 미완성 ESC/UTF-8 꼬리·\r 덮어쓰기·진행 중 라인
@@ -7446,6 +7452,46 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
             // 그런데도 앵커를 찍으면 큐 배달 직후의 중복 Enter 만 최대 150ms 늦어진다 —
             // 종전에 없던 지연을 아무 이득 없이 새로 만드는 것이다(B2′ 에서 잘못 넣었다).
             // 기준점은 `Program` 본문과 `SubmitAfterGap` 이 쓴 CR 에만 찍힌다.
+            // ★(0.14.52 · S-a) Checked agent write. The track marks follow the Inject arm, but only around
+            //   bytes actually written: `begin` immediately before the first byte, `note_body` with the
+            //   accepted prefix (never the planned full body), `submit_written` only for a written Return.
+            //   A panic inside the job is contained as PartialUnknown so the writer thread survives.
+            WriteReq::Agent(job) => {
+                let job = *job;
+                let mut began = false;
+                let ex = {
+                    let mut on_first_byte = || {
+                        if let Some(t) = &track {
+                            t.begin();
+                        }
+                        began = true;
+                    };
+                    let mut io = crate::agent_write::WriterIo {
+                        sleep: &std::thread::sleep,
+                        last_program_write: &mut last_program_write,
+                        on_first_byte: &mut on_first_byte,
+                    };
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::agent_write::execute(&mut writer, &job, &mut io)
+                    }))
+                    .unwrap_or_else(|_| crate::agent_write::Executed::panicked(&job))
+                };
+                if let (Some(t), true) = (&track, began) {
+                    if let Some(body) = ex.accepted_body(&job.plan) {
+                        t.note_body(&body, None);
+                    }
+                    if ex.envelope.submitted {
+                        t.submit_written();
+                    }
+                    t.end();
+                }
+                let broken = ex.transport_broken;
+                crate::agent_write::finish(job, &ex);
+                if broken {
+                    break; // PTY closed: the same exit as the existing I/O-error path below
+                }
+                continue;
+            }
         };
         if res.is_err() {
             break; // PTY 닫힘 — 이후 send는 disconnected로 호출자에 드러난다

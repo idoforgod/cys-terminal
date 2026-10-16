@@ -436,6 +436,11 @@ impl ProofLoss {
     pub fn is_death(&self) -> bool {
         matches!(self, Self::AgentDead | Self::RootDead)
     }
+    /// May the SAME request resume after this loss (S4-1 PartialExact)? Only a transient loss of
+    /// proof of an unchanged binding: death, replacement (`Changed`) and an epoch move are not.
+    pub fn resumable(&self) -> bool {
+        matches!(self, Self::Unknown(_) | Self::ContraryForeground)
+    }
     pub fn reason(&self) -> String {
         match self {
             Self::AgentDead => "agent_dead".into(),
