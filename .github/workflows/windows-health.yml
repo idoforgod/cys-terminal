@@ -740,6 +740,44 @@ jobs:
           CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_phoenix_c6_due.py
           CYS_PACK_DIR="$(mktemp -d)" python cysjavis-pack/bin/tests/test_reap_exited_matrix.py
 
+      # Q9-b: actual vendor library tests; source-body model is separate evidence.
+      # This adds a bounded 6-minute cell. The native run must establish actual
+      # job timing; summed step maxima are not claimed to fit the release budget.
+      - name: A-ID Q9-b vendor clone error controls (Windows blocking)
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          q9b_dir="$PWD/target/u-tmp/q9b-ci"
+          mkdir -p "$q9b_dir/pack" "$q9b_dir/state"
+          export CYS_PACK_DIR="$q9b_dir/pack" CYS_STATE_DIR="$q9b_dir/state"
+          export CARGO_TARGET_DIR="$PWD/target"
+          q9b_list="$q9b_dir/tests.list"
+          cargo_filter_count() {
+            local rc=0
+            cargo test "$@" -- --list > "$q9b_list.raw" 2>&1 || rc=$?
+            cat "$q9b_list.raw"
+            [ "$rc" -eq 0 ] || return "$rc"
+            tr -d '\r' < "$q9b_list.raw" > "$q9b_list"
+            grep -q ': test$' "$q9b_list"
+          }
+          cargo_filter_count --manifest-path vendor/portable-pty/Cargo.toml --lib --locked
+          grep -Fqx 'win::q9b_tests::real_current_process_handle_reports_running: test' "$q9b_list"
+          grep -Fqx 'win::q9b_tests::owned_finite_terminal_child_reports_exit_code: test' "$q9b_list"
+          cp "$q9b_list.raw" "$q9b_dir/vendor-tests.list"
+          cp vendor/portable-pty/Cargo.lock "$q9b_dir/vendor-Cargo.lock"
+          cargo test --manifest-path vendor/portable-pty/Cargo.toml --lib --locked -- --test-threads=1
+          cargo_filter_count --bin cysd close_auth_tests::f_try_wait_error_is_unreadable
+          cargo test --bin cysd close_auth_tests::f_try_wait_error_is_unreadable -- --test-threads=1
+
+      - name: Q9-b vendor dependency and test-list evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: q9b-vendor-windows-evidence
+          path: target/u-tmp/q9b-ci/
+          if-no-files-found: warn
+
       - name: Setup Bun (화면 검체용)
         uses: oven-sh/setup-bun@v2
 

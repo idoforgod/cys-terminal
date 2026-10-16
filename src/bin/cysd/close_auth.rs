@@ -80,8 +80,9 @@ impl ChildProbe {
 ///
 /// Known Windows limit (head answer Q9, accepted): `WinChild::is_complete` returns `Ok(None)` when
 /// `GetExitCodeProcess` fails — that reads as `Running` (VETO, pane kept; the refusal names the probe
-/// result via `OwnerVerdict::describe`). Its `try_clone().unwrap()` panic is caught here (`Unreadable`).
-/// No vendor patch.
+/// result via `OwnerVerdict::describe`). Q9-b propagates `is_complete` clone failures as IO errors,
+/// mapped here to `Unreadable`; existing poison panics are still caught. Other vendor clone/wait paths
+/// and the `GetExitCodeProcess` failure result remain unchanged.
 pub(crate) fn probe_child(exited: &AtomicBool, child: &Mutex<Box<dyn Child + Send + Sync>>) -> ChildProbe {
     if exited.load(Ordering::Relaxed) {
         return ChildProbe::SurfaceExited;
