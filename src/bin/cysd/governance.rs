@@ -6482,6 +6482,9 @@ pub(crate) enum MachineInjector {
     Channel,
     Ceo,
     Supervisor,
+    /// ★(0.14.52 · S-a C6d) no producer any more (the takeover notice is event-only); the knob token `takeover` stays accepted so
+    /// existing `CYS_MACHINE_INJECT_HOLD` values keep their meaning.
+    #[allow(dead_code)]
     Takeover,
 }
 
@@ -29833,8 +29836,8 @@ mod h_machine_hold_tests {
             // ★(R3SH-3) 통보 줄 쓰기가 즉시·미룬 재시도 공용 `pane_notice_line` 으로 모였다 — 두 호출자가 모두 그 앞에서
             //   `pane_notice_hold`(H0) 를 판정한다(아래 순서 핀).
             "boot_supervisor::pane_notice_line",
-            "handlers::announce_seat_takeover",
-            "handlers::npm_prefix_pane_notice_req",
+            // ★(0.14.52 · S-a C6d) `handlers::announce_seat_takeover` and `handlers::npm_prefix_pane_notice_req` left the list: both
+            //   notices are events only (no pane write at all).
             "handlers::send_text_write_req",
             // ★(0.14.52 · S-a C5b) The direct send family's checked agent writes (send_text's owned-submit /
             //   self-submitting / clear-first jobs and a Return bound to its held body): the same admission as
