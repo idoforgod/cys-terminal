@@ -920,8 +920,97 @@ struct ExecState {
     closed: bool,
 }
 
+/// Only construction owns these handles. Before publication, no job can enter this pool.
+struct SpawnCleanup {
+    inner: Arc<ExecInner>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    armed: bool,
+}
+
+impl Drop for SpawnCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return; // Successful construction detaches the handles when the fields are dropped.
+        }
+        {
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.closed = true;
+        }
+        self.inner.cv.notify_all();
+        // Construction has not published an Executor: these workers can only be idle/startup.
+        // Do not hold state while joining, and do not reuse this join path from Executor::drop.
+        for worker in self.workers.drain(..) {
+            // Preserve the constructor's original error/unwind even if a worker also panicked.
+            let _ = worker.join();
+        }
+    }
+}
+
+// Same worker body as the observed Executor::new closure. No admission/lifecycle change here.
+fn run_discovery_worker(inner: Arc<ExecInner>) {
+    loop {
+        let (slot, job) = {
+            let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if st.closed {
+                    return;
+                }
+                if let Some(j) = st.queue.pop_front() {
+                    st.running += 1;
+                    break j;
+                }
+                st = inner.cv.wait(st).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let Scheduled { prepare, finished } = job;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare)) {
+            Ok(Some(native)) => {
+                inner.counters.started.fetch_add(1, Ordering::Relaxed);
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(native));
+            }
+            _ => {
+                inner
+                    .counters
+                    .pre_start_refused
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        {
+            let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.running -= 1;
+            st.busy.remove(&slot);
+        }
+        if let Some(finished) = finished {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(finished));
+        }
+    }
+}
+
 impl Executor {
+    /// Compatibility constructor. A spawn error still panics here, after partial-pool cleanup.
+    /// New runtime/controller wiring must use try_new and handle its error explicitly.
     pub fn new(workers: usize) -> Executor {
+        Self::try_new(workers).expect("spawn discovery worker")
+    }
+
+    /// Returns a usable full pool or an error after all successfully spawned idle workers exit.
+    /// Zero workers preserves the former empty/saturated-pool behavior; no new policy is added.
+    pub fn try_new(workers: usize) -> std::io::Result<Executor> {
+        Self::try_new_with_spawn(workers, |i, task| {
+            std::thread::Builder::new()
+                .name(format!("cysd-discovery-{i}"))
+                .spawn(task)
+        })
+    }
+
+    /// Private trusted test seam, not a caller-supplied runtime extension.
+    /// Factory contract: Err/panic means it retained/launched no supplied task; Ok returns the
+    /// sole handle for a worker that invokes the supplied task exactly once. The real factory
+    /// above delegates directly to Builder::spawn. Tests may wrap the task to observe exit.
+    fn try_new_with_spawn(
+        workers: usize,
+        mut spawn: impl FnMut(usize, Job) -> std::io::Result<std::thread::JoinHandle<()>>,
+    ) -> std::io::Result<Executor> {
         let inner = Arc::new(ExecInner {
             state: Mutex::new(ExecState {
                 queue: VecDeque::new(),
@@ -933,52 +1022,20 @@ impl Executor {
             counters: Counters::default(),
             capacity: workers,
         });
+        let mut cleanup = SpawnCleanup {
+            inner: inner.clone(),
+            // Reserve all handle storage before the first thread exists.
+            workers: Vec::with_capacity(workers),
+            armed: true,
+        };
         for i in 0..workers {
-            let inner = inner.clone();
-            std::thread::Builder::new()
-                .name(format!("cysd-discovery-{i}"))
-                .spawn(move || loop {
-                    let (slot, job) = {
-                        let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                        loop {
-                            if st.closed {
-                                return;
-                            }
-                            if let Some(j) = st.queue.pop_front() {
-                                st.running += 1;
-                                break j;
-                            }
-                            st = inner.cv.wait(st).unwrap_or_else(|e| e.into_inner());
-                        }
-                    };
-                    // Revalidate deadline/budget/cancellation/generation BEFORE counting native work.
-                    // Classification and binding live in the returned one-shot job, sharing this slot.
-                    let Scheduled { prepare, finished } = job;
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(prepare)) {
-                        Ok(Some(native)) => {
-                            inner.counters.started.fetch_add(1, Ordering::Relaxed);
-                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(native));
-                        }
-                        _ => {
-                            inner
-                                .counters
-                                .pre_start_refused
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    {
-                        let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
-                        st.running -= 1;
-                        st.busy.remove(&slot);
-                    }
-                    // A coalesced recovery wake may schedule the next attempt only after slot release.
-                    if let Some(finished) = finished {
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(finished));
-                    }
-                })
-                .expect("spawn discovery worker");
+            let worker_inner = inner.clone();
+            let handle = spawn(i, Box::new(move || run_discovery_worker(worker_inner)))?;
+            cleanup.workers.push(handle);
         }
-        Executor { inner }
+        // No fallible operation between disarming and publication. Handle Drop detaches only.
+        cleanup.armed = false;
+        Ok(Executor { inner })
     }
 
     pub fn counters(&self) -> &Counters {
@@ -2392,4 +2449,209 @@ mod tests {
             "{loss:?}"
         );
     }
+    #[test]
+    fn c8_executor_first_spawn_failure_returns_the_original_error() {
+        let mut attempted = Vec::new();
+        let result = Executor::try_new_with_spawn(2, |i, _task| {
+            attempted.push(i);
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "fixture spawn zero"))
+        });
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a failed spawn cannot publish an executor"),
+        };
+        assert_eq!(attempted, vec![0]);
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "fixture spawn zero");
+    }
+
+    #[test]
+    fn c8_executor_partial_spawn_failure_closes_and_joins_every_prior_worker() {
+        // Each prior worker is the independently held one in one case. Joining only
+        // the first OR only the last handle must return too early in one of these cases.
+        for held in 0..2 {
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (loop_done_tx, loop_done_rx) = std::sync::mpsc::channel();
+            let (result_tx, result_rx) = std::sync::mpsc::channel();
+            let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+            let exited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed_exited = exited.clone();
+            let mut releases = Vec::new();
+            let mut waits = Vec::new();
+            for _ in 0..2 {
+                let (tx, rx) = std::sync::mpsc::channel();
+                releases.push(tx);
+                waits.push(Some(rx));
+            }
+            let constructor = std::thread::spawn(move || {
+                let result = Executor::try_new_with_spawn(3, |i, task| {
+                    if i == 2 {
+                        let mut entered = vec![
+                            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                            entered_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+                        ];
+                        entered.sort_unstable();
+                        assert_eq!(entered, vec![0, 1]);
+                        return Err(std::io::Error::new(std::io::ErrorKind::Other, "fixture spawn two"));
+                    }
+                    let entered_tx = entered_tx.clone();
+                    let loop_done_tx = loop_done_tx.clone();
+                    let wait = waits[i].take().unwrap();
+                    let exited = exited.clone();
+                    let exit_tx = exit_tx.clone();
+                    std::thread::Builder::new().spawn(move || {
+                        entered_tx.send(i).unwrap();
+                        task();
+                        loop_done_tx.send(i).unwrap();
+                        wait.recv_timeout(Duration::from_secs(10)).unwrap();
+                        exited.fetch_add(1, Ordering::SeqCst);
+                        exit_tx.send(i).unwrap();
+                    })
+                });
+                let result = result.map(|_| ()).map_err(|e| (e.kind(), e.to_string()));
+                result_tx.send(result).unwrap();
+            });
+            let first = loop_done_rx.recv_timeout(Duration::from_secs(10));
+            let second = if first.is_ok() { loop_done_rx.recv_timeout(Duration::from_secs(10)) }
+                else { Err(std::sync::mpsc::RecvTimeoutError::Timeout) };
+            if first.is_err() || second.is_err() {
+                for release in &releases { let _ = release.send(()); }
+                // A broken-close mutant leaves fixture threads in this exact-test process.
+                // Do not join the intentionally stuck constructor; process exit terminates them.
+                panic!("constructor must close and wake every prior idle worker");
+            }
+            let mut done = vec![first.unwrap(), second.unwrap()];
+            done.sort_unstable();
+            assert_eq!(done, vec![0, 1]);
+            let other = 1 - held;
+            releases[other].send(()).unwrap();
+            assert_eq!(exit_rx.recv_timeout(Duration::from_secs(10)).unwrap(), other,
+                "the other worker actually exited while the selected worker remains held");
+            let early_result = result_rx.recv_timeout(Duration::from_secs(2));
+            // Release the selected worker before reporting a discriminating assertion failure.
+            releases[held].send(()).unwrap();
+            let result = match early_result {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                Err(other) => panic!("constructor disconnected before result: {other:?}"),
+            };
+            let returned_early = result.is_some();
+            let result = result.unwrap_or_else(|| result_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            constructor.join().unwrap();
+            assert_eq!(exit_rx.recv_timeout(Duration::from_secs(10)).unwrap(), held);
+            assert!(!returned_early,
+                "the constructor returned before its prior threads were released (held worker {held})");
+            assert_eq!(result, Err((std::io::ErrorKind::Other, "fixture spawn two".into())));
+            assert_eq!(observed_exited.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn c8_executor_factory_unwind_still_cleans_prior_idle_worker() {
+        let exited = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_exited = exited.clone();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = Executor::try_new_with_spawn(2, |i, task| {
+                if i == 1 {
+                    panic!("deliberate spawn factory panic");
+                }
+                let exited = exited.clone();
+                std::thread::Builder::new().spawn(move || {
+                    task();
+                    exited.fetch_add(1, Ordering::SeqCst);
+                })
+            });
+        }))
+        .expect_err("the exact injected factory panic must propagate");
+        assert_eq!(panic.downcast_ref::<&str>().copied(), Some("deliberate spawn factory panic"));
+        assert_eq!(observed_exited.load(Ordering::SeqCst), 1, "factory unwind must join its prior idle worker");
+    }
+
+    #[test]
+    fn c8_executor_idle_worker_exit_panic_does_not_replace_spawn_error() {
+        let caught = std::panic::catch_unwind(|| {
+            Executor::try_new_with_spawn(2, |i, task| {
+                if i == 1 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "original spawn failure"));
+                }
+                std::thread::Builder::new().spawn(move || {
+                    task();
+                    panic!("deliberate idle worker exit panic");
+                })
+            })
+        });
+        let result = match caught {
+            Ok(result) => result,
+            Err(_) => panic!("worker exit panic replaced the constructor's io::Error"),
+        };
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("failed constructor published a pool"),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "original spawn failure");
+    }
+
+    #[test]
+    fn c8_executor_success_disarms_cleanup_and_preserves_worker_names() {
+        let ex = Executor::try_new(2).expect("bounded real spawn fixture");
+        let (tx, rx) = std::sync::mpsc::channel();
+        start_when_uncontended(&ex, 61, || {
+            let tx = tx.clone();
+            Box::new(move || tx.send(std::thread::current().name().map(str::to_owned)).unwrap())
+        });
+        let name = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        assert!(name == "cysd-discovery-0" || name == "cysd-discovery-1");
+        assert_eq!(ex.counters().started.load(Ordering::Relaxed), 1);
+        let weak = Arc::downgrade(&ex.inner);
+        drop(ex);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while weak.strong_count() != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[test]
+    fn c8_executor_normal_drop_does_not_join_a_blocked_native_job() {
+        let ex = Executor::try_new(1).unwrap();
+        let weak = Arc::downgrade(&ex.inner);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release = Arc::new(Mutex::new(Some(release_rx)));
+        start_when_uncontended(&ex, 77, || {
+            let entered_tx = entered_tx.clone();
+            let release = release.clone();
+            Box::new(move || {
+                entered_tx.send(()).unwrap();
+                // Bounded fixture wait; this is a controlled blocked job, not native discovery.
+                release.lock().unwrap().take().unwrap().recv_timeout(Duration::from_secs(10)).unwrap();
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(ex);
+            dropped_tx.send(()).unwrap();
+        });
+        let returned_while_blocked = dropped_rx.recv_timeout(Duration::from_secs(2));
+        let retained_while_blocked = weak.strong_count() > 0;
+        // Always release before asserting, including a mutant that incorrectly joins on Drop.
+        release_tx.send(()).unwrap();
+        dropper.join().unwrap();
+        assert!(returned_while_blocked.is_ok(), "ordinary Drop waited for blocked work");
+        assert!(retained_while_blocked, "running worker lost its inner before return");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while weak.strong_count() != 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(weak.strong_count(), 0);
+    }
+
+    #[test]
+    fn c8_executor_zero_workers_preserves_empty_pool_behavior() {
+        let ex = Executor::try_new_with_spawn(0, |_, _| panic!("zero workers must not spawn")).unwrap();
+        assert_eq!(ex.try_start(1, Box::new(|| panic!("no worker"))), Err(StartRefusal::Saturated));
+    }
+
 }
