@@ -359,3 +359,51 @@ fn the_body_is_recorded_before_the_returns_withhold_probe_runs() {
     }
     let _ = Instant::now();
 }
+
+/// ★(0.14.52 · S-a C7e) A held body is recorded durably the moment it is held - ids, length and digest, never its text -
+/// and the record goes when the body is bound.
+#[test]
+fn a_held_body_is_recorded_durably_without_its_text_until_bound() {
+    let fx = fx("held-durable");
+    let s = seat(&fx, true);
+    let a = id_of(&send(&fx, &s, 900, "HELD-SECRET body"));
+    let read = || std::fs::read_to_string(fx.dir.join(crate::state::HELD_BODIES_FILE)).unwrap_or_default();
+    let file = read();
+    assert!(file.contains(&a), "the held body is not recorded: {file}");
+    assert!(!file.contains("HELD-SECRET"), "body text on disk: {file}");
+    let k = ret(&fx, &s, 900);
+    assert!(k["result"]["bound"].is_string(), "{k}");
+    assert!(!read().contains(&a), "a bound body is still recorded as held");
+    // The tick's sweep: an expired body leaves the record without any RPC (a second seat: the first one's typing guard
+    // follows the write that just happened).
+    let s2 = seat(&fx, true);
+    let b = id_of(&send(&fx, &s2, 901, "expires on the tick"));
+    assert!(read().contains(&b), "premise: recorded");
+    s2.submit_assoc.lock().unwrap().backdate(Duration::from_millis(crate::submit_assoc::LEGACY_ASSOCIATION_WINDOW_MS + 1));
+    crate::handlers::sweep_held_submits(&fx.daemon);
+    assert!(!read().contains(&b), "an expired body is still recorded as held after the tick's sweep");
+}
+
+/// ★(0.14.52 · S-a C7e) A restart never types a held body and never loses it silently: the next daemon disposes each
+/// recorded body explicitly, once (`surface.submit_undelivered` reason=daemon_restart), and keeps durable evidence.
+#[test]
+fn a_restart_disposes_held_bodies_explicitly_once() {
+    let fx = fx("held-restart");
+    let s = seat(&fx, true);
+    let a = id_of(&send(&fx, &s, 900, "held across a restart"));
+    let d2 = Daemon::new(fx.dir.join("cysd.sock"));
+    crate::handlers::sync_held_bodies(&d2);
+    let gone = |d: &Arc<Daemon>| -> Vec<Value> {
+        d.bus.tail(2000).into_iter().filter(|e| e["name"] == "surface.submit_undelivered").collect()
+    };
+    let ev = gone(&d2);
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(ev[0]["payload"]["request_id"], json!(a));
+    assert_eq!(ev[0]["payload"]["reason"], "daemon_restart");
+    let evidence = std::fs::read_to_string(fx.dir.join(crate::state::HELD_UNDELIVERED_LOG)).unwrap_or_default();
+    assert!(evidence.contains(&a) && evidence.contains("daemon_restart"), "no durable evidence: {evidence}");
+    let file = std::fs::read_to_string(fx.dir.join(crate::state::HELD_BODIES_FILE)).unwrap_or_default();
+    assert!(!file.contains(&a), "a disposed body is still recorded as held: {file}");
+    crate::handlers::sync_held_bodies(&d2);
+    assert_eq!(gone(&d2).len(), 1, "disposed twice");
+}

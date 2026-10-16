@@ -154,6 +154,11 @@ impl AssociationTable {
         }
     }
 
+    /// The held bodies (for the durable record of the held set, C7e).
+    pub fn records(&self) -> impl Iterator<Item = &HeldBody> {
+        self.held.iter()
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn ids(&self) -> Vec<String> {
         self.held.iter().map(|b| b.request_id.clone()).collect()

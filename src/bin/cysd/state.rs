@@ -1084,6 +1084,29 @@ pub struct PersistedWriteHold {
 
 pub const WRITE_HOLDS_FILE: &str = "queue-write-holds.json";
 
+/// ★(0.14.52 · S-a C7e) An untokened body held untyped awaiting its caller's Return (`submit_assoc`), as persisted across a
+/// daemon restart - ids, seat, age, length and digest only, never the text. The next daemon disposes each one explicitly
+/// (undelivered, never typed): caller keys and agent epochs do not survive a restart, so no Return can bind it again.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedHeldBody {
+    pub request_id: String,
+    pub surface_id: u64,
+    pub role: Option<String>,
+    /// Wall-clock epoch seconds when the body was received.
+    pub held_at: f64,
+    pub chars: usize,
+    pub text_sha256: String,
+}
+
+pub const HELD_BODIES_FILE: &str = "submit-held.json";
+/// Durable evidence of held bodies a restart disposed (one JSON line each; rotated to `.1` past 1 MiB).
+pub const HELD_UNDELIVERED_LOG: &str = "submit-held-undelivered.jsonl";
+
+/// Load `submit-held.json` (missing or unreadable -> nothing to dispose).
+pub(crate) fn load_held_bodies(dir: &std::path::Path) -> Vec<PersistedHeldBody> {
+    std::fs::read_to_string(dir.join(HELD_BODIES_FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
 /// Load `queue-write-holds.json` (missing or unreadable -> empty: nothing to adopt).
 pub(crate) fn load_write_holds(dir: &std::path::Path) -> HashMap<String, PersistedWriteHold> {
     let holds: Vec<PersistedWriteHold> = std::fs::read_to_string(dir.join(WRITE_HOLDS_FILE))
@@ -3780,6 +3803,11 @@ pub struct Daemon {
     /// ★(0.14.52 · S-a C7a) Partial-write holds by queue entry id, mirrored to `queue-write-holds.json` (see
     /// [`PersistedWriteHold`]); loaded at start so a restored held entry is adopted as held, never handed off again.
     pub write_holds: Mutex<HashMap<String, PersistedWriteHold>>,
+    /// ★(0.14.52 · S-a C7e) Held bodies an earlier daemon run left in `submit-held.json`, disposed once by the first
+    /// `handlers::sync_held_bodies` of this run.
+    pub held_bodies_restart: Mutex<Vec<PersistedHeldBody>>,
+    /// ★(0.14.52 · S-a C7e) The held request ids last written to `submit-held.json` (`None` = not written this run).
+    pub held_bodies_written: Mutex<Option<Vec<String>>>,
     /// ★(0.14.31 · WP-5 M) **만료 복원분** — `queue-expired.json`(활성 WAL 과 **다른 파일**)에서
     /// 살아난 만료 항목(Value 통짜). 왜 파일을 가르는가: 만료 항목을 `queue-state.json` 에 함께
     /// 두면 **구 데몬(롤백)** 이 `expired_at` 을 모른 채 활성 큐로 rehome 해 배달한다(codex 설계
@@ -5711,6 +5739,8 @@ impl Daemon {
             feed_persist_lock: Mutex::new(()),
             restored_queue: Mutex::new(restored_qentries),
             write_holds: Mutex::new(load_write_holds(&dir)),
+            held_bodies_restart: Mutex::new(load_held_bodies(&dir)),
+            held_bodies_written: Mutex::new(None),
             restored_expired: Mutex::new(restored_expired),
             queue_seq: AtomicU64::new(queue_seq_seed),
             queue_persist_lock: Mutex::new(()),

@@ -3235,12 +3235,89 @@ pub(crate) fn sweep_held_submits_on(daemon: &Daemon, s: &crate::state::Surface, 
 }
 
 /// Watchdog tick: sweep every seat that holds a body.
+/// ★(0.14.52 · S-a C7e) Keep `submit-held.json` equal to every seat's held untokened bodies (ids, seat, role, age, length,
+/// digest - never the text), rewriting only when the held set changed; and once per daemon run dispose what an earlier run
+/// left held - each body explicitly undelivered (`surface.submit_undelivered` reason=daemon_restart, never typed) with a
+/// durable evidence line (`submit-held-undelivered.jsonl`). Called after every send_text/send_key RPC and by the tick's
+/// held-body sweep.
+pub(crate) fn sync_held_bodies(daemon: &Daemon) {
+    let dir = crate::state::state_dir(&daemon.socket_path);
+    let restart = std::mem::take(&mut *daemon.held_bodies_restart.lock().unwrap_or_else(|e| e.into_inner()));
+    let wall = crate::state::now_epoch();
+    for b in &restart {
+        let payload = json!({
+            "surface_ref": Value::Null,
+            "previous_surface_id": b.surface_id,
+            "role": b.role,
+            "request_id": b.request_id,
+            "reason": "daemon_restart",
+            "superseded_by": Value::Null,
+            "held_ms": ((wall - b.held_at).max(0.0) * 1000.0) as u64,
+            "window_ms": crate::submit_assoc::LEGACY_ASSOCIATION_WINDOW_MS,
+            "chars": b.chars,
+            "text_sha256": b.text_sha256,
+            "note": "A body sent without its own Return was held untyped when the daemon restarted; it was not delivered and \
+                     nothing was typed. Send it again with its Return.",
+        });
+        append_held_undelivered(&dir, &payload);
+        daemon.bus.publish("surface.submit_undelivered", "surface", None, payload);
+    }
+    let surfaces: Vec<Arc<crate::state::Surface>> = daemon.surfaces.lock().unwrap().values().cloned().collect();
+    let now = std::time::Instant::now();
+    let mut held: Vec<crate::state::PersistedHeldBody> = Vec::new();
+    for s in &surfaces {
+        let role = s.role.lock().unwrap().clone();
+        let t = s.submit_assoc.lock().unwrap_or_else(|e| e.into_inner());
+        for b in t.records() {
+            held.push(crate::state::PersistedHeldBody {
+                request_id: b.request_id.clone(),
+                surface_id: s.id,
+                role: role.clone(),
+                held_at: wall - now.saturating_duration_since(b.received_at).as_secs_f64(),
+                chars: b.text.chars().count(),
+                text_sha256: crate::delivery::digest_text(&b.text),
+            });
+        }
+    }
+    held.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+    let ids: Vec<String> = held.iter().map(|b| b.request_id.clone()).collect();
+    let mut written = daemon.held_bodies_written.lock().unwrap_or_else(|e| e.into_inner());
+    if written.as_ref() == Some(&ids) && restart.is_empty() {
+        return;
+    }
+    let body = serde_json::to_string(&held).unwrap_or_else(|_| "[]".into());
+    match crate::governance::write_json_atomic(&dir, crate::state::HELD_BODIES_FILE, &body) {
+        Ok(()) => *written = Some(ids),
+        Err(e) => daemon.bus.publish(
+            "surface.held_bodies_persist_failed",
+            "surface",
+            None,
+            json!({"error": e.to_string(), "held": held.len()}),
+        ),
+    }
+}
+
+/// Append one disposed held body to the durable evidence log (rotated once past 1 MiB; a failure is not fatal - the event
+/// was published).
+fn append_held_undelivered(dir: &std::path::Path, payload: &Value) {
+    use std::io::Write;
+    let path = dir.join(crate::state::HELD_UNDELIVERED_LOG);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = std::fs::rename(&path, path.with_extension("jsonl.1"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{}", json!({"ts": crate::state::now_epoch(), "event": "surface.submit_undelivered", "payload": payload}));
+        let _ = f.sync_data();
+    }
+}
+
 pub(crate) fn sweep_held_submits(daemon: &Daemon) {
     let seats: Vec<Arc<crate::state::Surface>> = daemon.surfaces.lock().unwrap().values().cloned().collect();
     let now = std::time::Instant::now();
     for s in seats {
         sweep_held_submits_on(daemon, &s, now);
     }
+    sync_held_bodies(daemon); // ★(0.14.52 · S-a C7e) expiries and agent changes leave the durable record too
 }
 
 /// The bound body+Return job's proof (I8): the seat's proof, then the existing CR withhold probe right
@@ -5279,6 +5356,16 @@ fn quiet_secs_consistent(surface: &crate::state::Surface, gen_before: u64) -> f6
 }
 
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
+    // ★(0.14.52 · S-a C7e) The two RPCs that hold, bind or dispose untokened bodies keep their durable record current.
+    let held_may_change = matches!(req.method.as_str(), "surface.send_text" | "surface.send_key");
+    let reply = dispatch_method(daemon, req, caller_pid);
+    if held_may_change {
+        sync_held_bodies(daemon);
+    }
+    reply
+}
+
+fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
     let id = req.id.clone();
     let params = req.params;
     // C0 채널 계층: channel.* RPC는 channels 모듈이 전담(단일 위임 — dispatch match 비대화 방지).
