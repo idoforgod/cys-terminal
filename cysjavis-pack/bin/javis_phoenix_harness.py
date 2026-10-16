@@ -3,6 +3,10 @@
 """
 javis_phoenix_harness.py — 불사조(무손실 복원) Phase 1 격리 하네스
 
+Platform: Unix-only isolation drills (POSIX process/session and socket APIs).
+Windows: use the separate javis_phoenix_win_smoke.py validation tool; this
+entry point refuses before binary resolution and installs no cleanup hooks.
+
 설계 근거: _round/ZERO_LOSS_RESTORE_DESIGN.md §9.2 P3 · §9.4-1
 목적: 라이브 데몬·소켓·~/.local/state/cys/ 를 절대 건드리지 않고, 별도 소켓·별도
       상태 디렉터리(~/.cys/state-harness/)에서 격리된 테스트 데몬을 띄워
@@ -795,9 +799,10 @@ def _sig_handler(signum, frame):
 
 
 import atexit
-atexit.register(lambda: teardown())
-signal.signal(signal.SIGINT, _sig_handler)
-signal.signal(signal.SIGTERM, _sig_handler)
+if os.name != "nt":
+    atexit.register(lambda: teardown())
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
 
 
 # ------------------------------------------------------------------ 명령: up
@@ -2537,6 +2542,11 @@ def cmd_phoenix_p12_deploy(args):
 
 def main():
     global CYSD, CYS
+    if os.name == "nt":
+        print("Windows is unsupported by this Unix-only isolation harness; "
+              "use javis_phoenix_win_smoke.py for separate Windows validation.",
+              file=sys.stderr)
+        raise SystemExit(2)
     CYS = _resolve_cys()
     CYSD = _resolve_cysd()
     ap = argparse.ArgumentParser(description="불사조 무손실복원 격리 하네스(Phase1+2)")

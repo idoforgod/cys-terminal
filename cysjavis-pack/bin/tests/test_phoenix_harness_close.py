@@ -486,6 +486,38 @@ class HarnessCloseTests(unittest.TestCase):
         self.assertEqual(sum(r["method"] == "surface.close" for r in self.requests), 2)
 
 
+class WindowsExclusionTests(unittest.TestCase):
+    def load_windows(self):
+        spec = importlib.util.spec_from_file_location("s7_windows_harness", HARNESS)
+        h = importlib.util.module_from_spec(spec)
+        with patch("os.name", "nt"), patch("atexit.register") as register, patch("signal.signal") as signals:
+            spec.loader.exec_module(h)
+        return h, register.call_count, signals.call_count
+
+    def test_windows_import_installs_no_unix_exit_hooks(self):
+        _, registrations, signals = self.load_windows()
+        self.assertEqual((registrations, signals), (0, 0), "S7-WINDOWS: no Unix teardown hooks on Windows")
+
+    def test_windows_cli_excluded_before_binary_resolution(self):
+        h, _, _ = self.load_windows()
+        err = io.StringIO()
+        with patch("os.name", "nt"), patch.object(sys, "argv", ["harness", "down"]), \
+                patch.object(h, "_resolve_cys", return_value="inert-cys") as cys_resolver, \
+                patch.object(h, "_resolve_cysd", return_value="inert-cysd") as daemon_resolver, \
+                patch.object(h, "cmd_down", return_value={}) as down, contextlib.redirect_stderr(err):
+            code = None
+            try:
+                h.main()
+            except SystemExit as exc:
+                code = exc.code
+            self.assertEqual(code, 2, "S7-WINDOWS: explicit unsupported CLI result")
+            cys_resolver.assert_not_called()
+            daemon_resolver.assert_not_called()
+            down.assert_not_called()
+        self.assertIn("Windows", err.getvalue())
+        self.assertIn("javis_phoenix_win_smoke.py", err.getvalue())
+
+
 @unittest.skipUnless(os.environ.get("S7_NATIVE_DUMMY") == "1" and sys.platform == "darwin",
                      "macOS-only opt-in native tree; Linux orphan reaping and Windows are unmeasured")
 class NativeOwnedCleanupTests(unittest.TestCase):
