@@ -6476,6 +6476,9 @@ impl Daemon {
         let inject_track = Arc::new(InjectTrack::default());
         {
             let writer = writer;
+            // test-only U4-3 probe: every daemon → PTY write is reported to the bench sink (off by default).
+            #[cfg(test)]
+            let writer = crate::activity::bench::CountingWriter::new(writer, id);
             let stop = Arc::clone(&writer_stop);
             let track = Arc::clone(&inject_track);
             std::thread::spawn(move || run_writer_loop_tracked(writer, write_rx, stop, Some(track)));
@@ -6750,9 +6753,18 @@ impl Daemon {
                         // 같은 청크를 스냅샷과 live로 중복 수신한다. 락이 process↔send를 직렬화해야
                         // run_attach 주석의 불변식(중복 배달 창 봉쇄)이 실제로 성립한다.
                         // DSR 커서 위치도 같은 락 아래에서 읽어(재진입 락 회피) 일관성을 유지한다.
+                        // (test-only U4-3 timing: lock wait + critical section, recorded after the lock is released.)
+                        #[cfg(test)]
+                        let bench_t0 = std::time::Instant::now();
+                        #[cfg(test)]
+                        let mut bench_t = (bench_t0, bench_t0);
                         let dsr_resp = {
                             // poison된 락도 복구 — 단일 패닉이 데몬 전체를 마비시키지 않게 한다.
                             let mut parser = surf.parser.lock().unwrap_or_else(|e| e.into_inner());
+                            #[cfg(test)]
+                            {
+                                bench_t.0 = std::time::Instant::now();
+                            }
                             // (W4) vt100 0.15.2(row.rs:89 clear_wide 등) 내부 인덱스 패닉을 격리한다:
                             // 패닉 시 그 청크 파싱만 포기하고 파서를 fresh로 재초기화(rows/cols 보존)한다.
                             // reader 스레드는 죽지 않고, 아래 out_tx.send(원시 바이트 broadcast)와
@@ -6781,8 +6793,14 @@ impl Daemon {
                             // 원시 바이트 broadcast는 파서 반영·패닉 여부와 무관하게 항상 수행한다.
                             // (파서 락 임계영역 내 send — run_attach 구독/스냅샷과의 직렬화 불변식 유지.)
                             let _ = surf.out_tx.send(attach_payload);
+                            #[cfg(test)]
+                            {
+                                bench_t.1 = std::time::Instant::now();
+                            }
                             resp
                         };
+                        #[cfg(test)]
+                        crate::activity::bench::reader(surf.id, bench_t0, bench_t.0, bench_t.1);
                         if let Some(resp) = dsr_resp {
                             // ★G5-④ 락 범위 검증 완료(W5-A 확정 결정의 선행 조건): 이 송신은
                             // 위 parser 락 블록이 닫힌 '뒤'다 — 유계 대기(250ms)가 블록하는 것은

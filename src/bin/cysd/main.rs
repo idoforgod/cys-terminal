@@ -7792,6 +7792,10 @@ mod feed_sweep_tests;
 #[cfg(test)]
 mod activity_tests;
 
+// F-01 U4-3 lock-cost / operational-latency measurement harness — test-only module, one #[ignore] entry point (no production code).
+#[cfg(test)]
+mod activity_bench_tests;
+
 // ★(0.14.47 · 계측·관측 보강) 벤더 vt100 사본의 흐림(SGR 2) 패치 지킴이 — 테스트 전용 모듈(프로덕션 코드 0 · 파일 끝 규약은 위와 같다).
 #[cfg(test)]
 mod vt100_dim_tests;

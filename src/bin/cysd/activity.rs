@@ -559,6 +559,178 @@ thread_local! {
     pub(crate) static AFTER_COPY: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
 }
 
+/// Test-only measurement sink and knobs for the U4-3 lock-cost harness (`activity_bench_tests.rs`).
+/// Nothing records unless [`bench::ENABLED`] (timing probes) or [`bench::PTY_CAPTURE`] (daemon → PTY
+/// writes) is set; both are false by default and only that harness sets them, so other tests are
+/// unaffected. Compiled only under `cfg(test)`: the release binary contains none of it.
+#[cfg(test)]
+pub(crate) mod bench {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    /// observer hold / per-seat / per-tick and reader wait / critical-section samples record while set.
+    pub(crate) static ENABLED: AtomicBool = AtomicBool::new(false);
+    /// every daemon → PTY write (all seats) is captured while set.
+    pub(crate) static PTY_CAPTURE: AtomicBool = AtomicBool::new(false);
+    /// SLEEP arm: milliseconds slept after a seat's parser lock is released, before classification (0 = off).
+    pub(crate) static SLEEP_MS: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct Rec {
+        pub at: Instant,
+        pub sid: u64,
+        pub a: Duration,
+        pub b: Duration,
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct PtyWrite {
+        pub at: Instant,
+        pub sid: u64,
+        pub len: usize,
+        /// the written bytes, truncated to the first 4096 (classification: DSR reply vs other, A1-1).
+        pub head: Vec<u8>,
+    }
+
+    #[derive(Default, Debug)]
+    pub(crate) struct Sink {
+        /// a = observer parser-lock hold (every successful try_lock, before any later rejection).
+        pub hold: Vec<Rec>,
+        /// a = one `observe_seat` call minus slept time, b = slept time.
+        pub seat: Vec<Rec>,
+        /// sid = seats in the roster snapshot, a = whole `observe_tick` wall, b = slept within the tick.
+        pub tick: Vec<Rec>,
+        /// at = just before `surf.parser.lock()`, a = lock wait, b = critical section (chunk processing).
+        pub reader: Vec<Rec>,
+        pub pty: Vec<PtyWrite>,
+        /// sleeps performed by the SLEEP knob while ENABLED (= sleeping classifications).
+        pub sleeps: u64,
+    }
+
+    static SINK: Mutex<Option<Sink>> = Mutex::new(None);
+
+    thread_local! {
+        static SEAT_SLEPT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        static TICK_SLEPT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    /// Installs an empty sink with pre-reserved capacity (no reallocation under load).
+    pub(crate) fn install(reader: usize, observer: usize, ticks: usize, pty: usize) {
+        let s = Sink {
+            hold: Vec::with_capacity(observer),
+            seat: Vec::with_capacity(observer),
+            tick: Vec::with_capacity(ticks),
+            reader: Vec::with_capacity(reader),
+            pty: Vec::with_capacity(pty),
+            sleeps: 0,
+        };
+        *SINK.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+    }
+
+    pub(crate) fn take() -> Sink {
+        SINK.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default()
+    }
+
+    fn with(f: impl FnOnce(&mut Sink)) {
+        if let Some(s) = SINK.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            f(s);
+        }
+    }
+
+    fn on() -> bool {
+        ENABLED.load(Ordering::Acquire)
+    }
+
+    /// called after the parser guard is dropped (never inside the lock).
+    pub(crate) fn hold(sid: u64, at: Instant, d: Duration) {
+        if on() {
+            with(|s| s.hold.push(Rec { at, sid, a: d, b: Duration::ZERO }));
+        }
+    }
+
+    /// SLEEP knob — runs after unlock, before classification.
+    pub(crate) fn sleep_knob() {
+        let ms = SLEEP_MS.load(Ordering::Acquire);
+        if ms == 0 {
+            return;
+        }
+        let t = Instant::now();
+        std::thread::sleep(Duration::from_millis(ms));
+        let slept = t.elapsed();
+        SEAT_SLEPT.with(|c| c.set(c.get() + slept));
+        if on() {
+            with(|s| s.sleeps += 1);
+        }
+    }
+
+    pub(crate) fn seat_begin() -> Instant {
+        SEAT_SLEPT.with(|c| c.set(Duration::ZERO));
+        Instant::now()
+    }
+
+    pub(crate) fn seat_end(sid: u64, t0: Instant) {
+        let total = t0.elapsed();
+        let slept = SEAT_SLEPT.with(|c| c.replace(Duration::ZERO));
+        TICK_SLEPT.with(|c| c.set(c.get() + slept));
+        if on() {
+            with(|s| s.seat.push(Rec { at: t0, sid, a: total.saturating_sub(slept), b: slept }));
+        }
+    }
+
+    pub(crate) fn tick_begin() -> Instant {
+        TICK_SLEPT.with(|c| c.set(Duration::ZERO));
+        Instant::now()
+    }
+
+    pub(crate) fn tick_end(t0: Instant, seats: usize) {
+        let total = t0.elapsed();
+        let slept = TICK_SLEPT.with(|c| c.replace(Duration::ZERO));
+        if on() {
+            with(|s| s.tick.push(Rec { at: t0, sid: seats as u64, a: total, b: slept }));
+        }
+    }
+
+    /// reader: t0 = just before `surf.parser.lock()`, t1 = acquired, t2 = end of the critical section.
+    pub(crate) fn reader(sid: u64, t0: Instant, t1: Instant, t2: Instant) {
+        if on() {
+            with(|s| s.reader.push(Rec { at: t0, sid, a: t1.duration_since(t0), b: t2.duration_since(t1) }));
+        }
+    }
+
+    pub(crate) fn pty_write(sid: u64, bytes: &[u8]) {
+        if PTY_CAPTURE.load(Ordering::Acquire) {
+            let head = bytes[..bytes.len().min(4096)].to_vec();
+            with(|s| s.pty.push(PtyWrite { at: Instant::now(), sid, len: bytes.len(), head }));
+        }
+    }
+
+    /// Wraps a seat's PTY writer and reports every successful write to [`pty_write`].
+    pub(crate) struct CountingWriter<W: std::io::Write> {
+        inner: W,
+        sid: u64,
+    }
+
+    impl<W: std::io::Write> CountingWriter<W> {
+        pub(crate) fn new(inner: W, sid: u64) -> Self {
+            CountingWriter { inner, sid }
+        }
+    }
+
+    impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let n = self.inner.write(buf)?;
+            pty_write(self.sid, &buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+}
+
 pub(crate) enum Collected {
     Frame,
     Rejected(Sample),
@@ -632,6 +804,8 @@ pub(crate) fn collect(s: &Surface, frame: &mut Frame) -> Collected {
     let supported = copy_window(guard.screen(), frame);
     frame.lock_hold = t0.elapsed();
     drop(guard);
+    #[cfg(test)]
+    bench::hold(s.id, t0, frame.lock_hold);
     if !supported {
         return Collected::Rejected(Sample::Semantic(Semantic::UnsupportedGeometry));
     }
@@ -1036,6 +1210,8 @@ pub(crate) fn observe_seat(
                         cols: frame.cols,
                         alt: frame.alt,
                     });
+                    #[cfg(test)]
+                    bench::sleep_knob();
                     let (sample, rev) = sample_frame(fam, frame, grammars);
                     grammar_rev = rev;
                     sample
@@ -1151,6 +1327,8 @@ fn observer_loop(daemon: &Arc<Daemon>) {
 
 /// One observer tick over a short roster snapshot (the roster lock is released before any seat work).
 pub(crate) fn observe_tick(daemon: &Daemon, frame: &mut Frame) {
+    #[cfg(test)]
+    let bench_tick = bench::tick_begin();
     let seats: Vec<Arc<Surface>> = {
         let g = daemon.surfaces.lock().unwrap_or_else(|e| e.into_inner());
         g.values().cloned().collect()
@@ -1159,7 +1337,11 @@ pub(crate) fn observe_tick(daemon: &Daemon, frame: &mut Frame) {
     let now_epoch = crate::state::now_epoch();
     let mut stats = Stats::default();
     for s in &seats {
+        #[cfg(test)]
+        let bench_seat = bench::seat_begin();
         observe_seat(&daemon.activity, s, frame, grammars(), now, now_epoch, &mut stats);
+        #[cfg(test)]
+        bench::seat_end(s.id, bench_seat);
     }
     // bounded cleanup over seat churn: drop records of seats that left the roster.
     {
@@ -1179,6 +1361,8 @@ pub(crate) fn observe_tick(daemon: &Daemon, frame: &mut Frame) {
         }
         st.hold_us_max = st.hold_us_max.max(stats.hold_us_max);
     }
+    #[cfg(test)]
+    bench::tick_end(bench_tick, seats.len());
 }
 
 fn unknown_wire(reason: &str) -> Value {
