@@ -73,9 +73,20 @@ class C6DueTests(unittest.TestCase):
                 self.assertEqual(len(calls), 1)
 
     def test_restore_continues_and_keeps_c6_journal_and_early_results(self):
+        self.run_restore_cases(windows=False)
+
+    def test_windows_restore_state_stays_in_fixture(self):
+        self.run_restore_cases(windows=True)
+
+    def run_restore_cases(self, windows):
         for disposition in ("deferred", "failed", "tombstoned", "unknown", "corrupt"):
             with self.subTest(disposition=disposition), tempfile.TemporaryDirectory(prefix="s5-ph-") as td, contextlib.ExitStack() as stack:
                 sock = str(Path(td) / "d.sock")
+                stack.enter_context(mock.patch.object(P, "IS_WINDOWS", windows))
+                stack.enter_context(mock.patch.dict(P.os.environ, {"LOCALAPPDATA": str(Path(td) / "appdata")}))
+                state_dir = Path(P.state_dir_for(sock)).resolve()
+                self.assertTrue(state_dir.is_relative_to(Path(td).resolve()),
+                                "S5 fixture state must stay inside its temp root before any write")
                 live = {"worker-s5": [{"surface":"surface:9", "exited":True}]}
                 replies = SimpleNamespace(returncode=1, stdout="", stderr="transport error") if disposition == "failed" else SimpleNamespace(returncode=0, stdout=json.dumps({"surface_id":9,"outcome":"deferred","reason":"grace_not_elapsed"}), stderr="")
                 spawned = []
