@@ -91,6 +91,18 @@ pub(crate) struct AgentDead {
 #[derive(Debug)]
 pub(crate) enum DeathError { NoCurrent, Alive, Native(Failure), Superseded, Busy }
 
+// Private result classification; production supplies only the retained agent query above.
+// The test seam injects a FAILURE, not a fabricated successful native observation.
+fn finish_agent_death_probe(old:Arc<PublishedNative>,base:Epochs,result:Result<(),Failure>)
+    ->Result<AgentDead,DeathError>
+{
+    match result {
+        Err(Failure::Dead)=>Ok(AgentDead { identity:old.agent_id(),old,base,observed_at:Instant::now() }),
+        Ok(())=>Err(DeathError::Alive),
+        Err(other)=>Err(DeathError::Native(other)),
+    }
+}
+
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 enum Mode { Initial, Adopt, Change }
 #[derive(Clone)]
@@ -367,11 +379,8 @@ impl ReceiverCell {
             let core=self.core.try_lock().map_err(|_|DeathError::Busy)?;
             (core.current.clone().ok_or(DeathError::NoCurrent)?,core.epochs)
         };
-        let identity=old.agent_id();
-        match old.binding.agent.recheck() {
-            Err(Failure::Dead)=>Ok(AgentDead { old,base,identity,observed_at:Instant::now() }),
-            Ok(())=>Err(DeathError::Alive),Err(f)=>Err(DeathError::Native(f)),
-        }
+        let result=old.binding.agent.recheck(); // retained AGENT, never root/metadata
+        finish_agent_death_probe(old,base,result)
     }
     /// The fact stays owned by the caller until after the cell guard is dropped.
     pub fn accept_death(&self,fact:AgentDead)->Result<(),DeathError> {
@@ -1087,3 +1096,7 @@ mod tests {
         assert!(c.core.lock().unwrap().pending.as_ref().unwrap().work.same(&fresh));
     }
 }
+
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[path = "native_publication_transition_tests.rs"]
+mod native_transition_tests;
