@@ -273,6 +273,8 @@ import {
 // ★U6(0.14.41) 피드백 보내기 — 모달 층 판정(setFocus·드롭 가드)과 작성 창(의존성 주입 · 최상위 부수효과 0).
 import { armDeferredPaneFocus, modalLayerOpen, feedbackOverlayOpen } from "./modalguard";
 import { mountFeedbackButton, openFeedbackModal, type FeedbackFacts } from "./feedbackmodal";
+import { activityExpiryMs, applyDotPaint, HIDDEN_DOT, projectActivity, RoleActivityStore } from "./roleactivity"; // ★F-01 역할 점 활동 표시(순수 판정·바뀐 것만 칠하기)
+import { SurfaceListTransport, type ListArrival } from "./surfacelist"; // ★F-01 끝점별 소유 원 호출 · 응답별 독립 투영
 
 declare global {
   interface Window {
@@ -335,7 +337,14 @@ const START_BUDGET = winScaled(45_000);
 // 실측 스폰 구간 90s(rc124)에 cysd 재시도 60s·1회 재스폰 90s 를 더한 값을 덮는다. 넘기면 **화면에서만** 접는다.
 const ROLE_SLOT_GRACE = winScaled(ROLE_SLOT_GRACE_MS);
 
-const rpcT = <T,>(pr: Promise<T>, ms: number): Promise<T> => {
+// ★F-01: `own` = 원 호출(pr)을 끝날 때까지 붙잡을 호출자 훅(선택). 경주에서 진 원 호출은 취소되지 않으므로, 소유 가드는 그것의
+//   **실제 종료**를 봐야 한다(기동 list_surfaces → 첫 주기 디스패치 인계 · surfacelist.ts adoptStartup). 훅 실패는 호출을 막지 않는다.
+const rpcT = <T,>(pr: Promise<T>, ms: number, own?: (original: Promise<T>) => void): Promise<T> => {
+  try {
+    own?.(pr);
+  } catch {
+    /* 소유 기록 실패는 호출을 막지 않는다 */
+  }
   let t: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([
     pr,
@@ -460,7 +469,7 @@ interface PaneRuntime {
   socket?: string;
   el: HTMLElement;
   termHost: HTMLElement;
-  roleEl: HTMLElement; // 제목 앞 역할 신호 점(깜박임) — refreshPaneTitles가 role로 채색
+  roleEl: HTMLElement; // 제목 앞 역할 신호 점 — 역할색 + 활동 표지(★F-01: 작업 중으로 관측될 때만 깜박임 · paintRoleDot 단일 렌더러)
   titleEl: HTMLElement;
   usageEl: HTMLElement;
   term: Terminal;
@@ -2906,15 +2915,109 @@ const isAutoTitle = (t: string | null | undefined) => !t || /^surface \d+$/.test
 const paneTitle = (title: string | null | undefined, liveCwd?: string | null) =>
   isAutoTitle(title) ? liveCwd || "…" : (title as string);
 
-// pane 헤더 역할 점 — CC 깜박이 점(cc-blink)을 역할색으로 제목 앞에 표시(무역할 셸·종료 pane은 숨김).
-function setRoleDot(el: HTMLElement, role: string | null) {
+// ---------- ★F-01(0.14.52 · U) pane 헤더 역할 점 — 역할색 + 활동 표지 + 접근 문구를 **한 렌더러**가 칠한다 ----------
+// 종전: 모든 역할 점이 무조건 깜박였다(style.css) — 좌석 CLI 가 실제로 일하는지와 무관했다. 이제 깜박임은 데몬이 관측한 '작업 중'에만 붙는다.
+//   입력 = surface.list 각 줄의 display_activity(데몬이 자기 6초 리스를 직렬화 때 집행) · 판정 = roleactivity.ts(순수) · 운반 = surfacelist.ts.
+// ★쓰기 지점은 셋뿐이고 모두 paintRoleDot 하나를 지난다: 제목 갱신·입양(setRoleDot) · 응답 도착(projectListArrival) · 국소 만료 쓸기(sweepRoleDots).
+//   역할만 쓰는 옛 쓰기(배경색·title='역할: …')가 따로 남으면 3초마다 활동 표지·사유·나이를 덮는다(설계 §4 단일 렌더 경로).
+// ★바뀐 클래스·속성만 쓴다 — render()·호스트 교체·포커스·스크롤·SeatSig·알림과 무관하다. 무역할 셸·종료 pane 은 종전처럼 숨긴다.
+const T_ACTIVITY = activityExpiryMs(T_LIST); // T = 3P + 2D + E — 31 s(mac) / 47 s(Windows) · 요청 시작에 묶인 하드 만료
+const roleActivity = new RoleActivityStore(T_ACTIVITY); // 키 = paneKey(sid, socket) · 끝점 수명·표시 세대·순번으로 거부
+const dotRoles = new WeakMap<PaneRuntime, string | null>(); // 런타임 → 마지막으로 받은 역할(종료 = null)
+const listTransport = new SurfaceListTransport({
+  now: () => performance.now(),
+  deadlineMs: T_LIST,
+  resolve: (endpoints) => invoke("resolve_list_endpoints", { endpoints }),
+  onArrival: (a) => projectListArrival(a),
+});
+
+function setRoleDot(rt: PaneRuntime, role: string | null) {
+  dotRoles.set(rt, role);
+  paintRoleDot(rt, performance.now());
+}
+
+function paintRoleDot(rt: PaneRuntime, nowMs: number) {
+  const role = dotRoles.get(rt) ?? null;
   const color = roleDotColor(role);
-  el.style.display = color ? "" : "none";
-  if (color) {
-    el.style.background = color;
-    el.title = `역할: ${role}`;
+  if (!color) {
+    applyDotPaint(rt.roleEl, HIDDEN_DOT);
+    return;
+  }
+  const p = projectActivity(roleActivity.get(paneKey(rt.sid, rt.socket)), nowMs, T_ACTIVITY);
+  applyDotPaint(rt.roleEl, { visible: true, color, view: p.view, label: `역할: ${role} · ${p.text}` });
+}
+
+// 칠하기가 실패한 pane 은 안전하게 칠할 수 있으면 '모름'으로 둔다 — 그것도 실패하면 그대로(호스트·스크롤·포커스는 건드리지 않는다).
+function paintUnknownSafely(rt: PaneRuntime) {
+  try {
+    const role = dotRoles.get(rt) ?? null;
+    const color = roleDotColor(role);
+    if (color) applyDotPaint(rt.roleEl, { visible: true, color, view: "unknown", label: `역할: ${role} · 상태 모름 · 표시 오류` });
+  } catch {
+    /* 표시만 못 할 뿐이다 */
   }
 }
+
+// 국소 만료 쓸기(L = 기존 3초 틱) — 응답이 오지 않아도 U4-5(9 s)·T(31/47 s)가 화면에 닿게 한다. pane 마다 따로 가둔다.
+function sweepRoleDots(nowMs: number) {
+  for (const rt of panes.values()) {
+    try {
+      paintRoleDot(rt, nowMs);
+    } catch {
+      paintUnknownSafely(rt);
+    }
+  }
+}
+
+// 응답 하나의 독립 투영 — 다른 끝점을 기다리지 않는다. 한 줄의 실패(형식 오류 포함)는 그 줄에서 끝나고, 입양용 스냅샷은 건드리지 않는다.
+function projectListArrival(a: ListArrival) {
+  const rows = (a.value as { surfaces?: unknown } | null)?.surfaces;
+  if (!Array.isArray(rows)) return;
+  for (const member of a.members) {
+    const socket = member === "" ? undefined : member;
+    const seen = new Set<string>();
+    for (const row of rows) {
+      try {
+        const sid = (row as { surface_id?: unknown }).surface_id;
+        if (typeof sid !== "number") continue;
+        const key = paneKey(sid, socket);
+        seen.add(key);
+        roleActivity.accept(key, a.lifetime, a.startMs, a.receivedMs, (row as { display_activity?: unknown }).display_activity);
+        const rt = panes.get(key);
+        if (rt) paintRoleDot(rt, a.receivedMs);
+      } catch {
+        /* 그 줄만 건너뛴다 — 형제 줄의 점은 계속 갱신된다 */
+      }
+    }
+    const prefix = `${member}#`;
+    roleActivity.prune((k) => !k.startsWith(prefix) || seen.has(k)); // 사라진 좌석의 기록을 남기지 않는다(유계)
+  }
+}
+
+// 활동 패스 — refreshPaneTitles 가 **바쁨 가드 앞**, 자기 바깥 catch 안에서 부른다. 끝점마다 소유 원 호출 1개를 독립으로 보내고(launch 는
+// 호출부의 list_surfaces 한 줄), 로스터에서 빠진 소켓의 기록을 거둔 뒤, 디스패치가 던져도 국소 만료 쓸기는 반드시 돈다(finally).
+function pumpRoleActivity(launch: (socket: string | undefined) => Promise<unknown>) {
+  try {
+    const roster = workspaces.map((w) => w.socket);
+    listTransport.setRoster(roster);
+    listTransport.dispatch(launch);
+    const members = new Set(roster.map((x) => x ?? ""));
+    roleActivity.prune((k) => members.has(k.slice(0, k.lastIndexOf("#"))));
+  } finally {
+    sweepRoleDots(performance.now());
+  }
+}
+
+// 가려졌다 돌아올 때 — 옛 '작업 중'을 보이기 전에 만료를 동기로 먼저 판정한다(갱신·리스 연장 없음). 실패는 표시에서 끝난다.
+function onVisibilityReturn() {
+  if (document.visibilityState !== "visible") return;
+  try {
+    sweepRoleDots(performance.now());
+  } catch {
+    /* 다음 3초 틱이 다시 쓴다 */
+  }
+}
+document.addEventListener("visibilitychange", onVisibilityReturn);
 
 // 주기적으로 데몬에 물어 자동 제목 pane의 현재 디렉토리(cd 추적)를 갱신.
 // + 외부(CLI launch-agent·cys boot)에서 생성된 역할 노드 surface를 pane으로 자동 입양 —
@@ -2936,7 +3039,8 @@ let ghostStrike = new Map<string, number>();
 // ⚠반대 극단도 막는다: 영원히 끝나지 않는 데몬 때문에 그 소켓이 **영구 skip** 되면 자가치유가
 // 그 소켓에서만 죽는다(A③). 그래서 INFLIGHT_RETRY_MS 가 지나면 한 번 더 시도한다 —
 // 목적은 '재시도 금지'가 아니라 '재시도 간격을 3초에서 그 값으로 늦추는 것'이다.
-// 키 = `list:<socket>` / `org:<socket>` → 아직 끝나지 않은 요청을 보낸 시각(ms).
+// 키 = `org:<socket>` 등 → 아직 끝나지 않은 요청을 보낸 시각(ms). ★F-01: 3초 틱의 list 는 이 가드를 쓰지 않는다 — 나이로 대체·소유 확인 없는 삭제가
+//   없는 전용 소유 가드(surfacelist.ts SurfaceListTransport)로 옮겼다. 다른 손님(org·계정·프로브)의 정책은 그대로다.
 const inFlight = new Map<string, number>();
 const INFLIGHT_RETRY_MS = winScaled(60_000);
 function claimFlight(key: string): boolean {
@@ -2952,13 +3056,21 @@ function releaseFlightWhenSettled(key: string, p: Promise<unknown>): void {
 // ★(0.14.41 · U18) 좌석 작업 폴더 막힘 — 이미 알린 좌석(scope|role|path). 판정·문구는 folderaccess.ts.
 let cwdBlockedSeen: ReadonlySet<string> = new Set<string>();
 async function refreshPaneTitles() {
-  if (!started || refreshing) return; // 겹친 호출의 이중 입양 방지
-  refreshing = true;
-  let adoptedWs = false; // 이번 틱에서 워크스페이스/트리를 고쳤는가(render 필요 판정)
-  const blockedTick: CwdBlockedEntry[] = []; // 이번 틱에 모든 소켓에서 모은 cwd_blocked
   // ★0.14.43(R1F-UB · S4 B1): 이번 틱에 **받은** 소켓별 좌석 목록의 (종료 안 한) 역할 — 팀원 부팅 안내의 완료 판정이 쓴다. 새 RPC·새 타이머 0: 이 틱이 어차피 부르는 list_surfaces 의 결과다.
   //   목록을 못 받은 소켓(진행 중 요청·시간 초과·오류)은 키가 없다 → 그 소켓의 판정은 이번 틱에 건너뛴다(완료로도 상한 실패로도 치지 않는다).
   const seatRolesTick = new Map<string, string[] | null>();
+  if (!started) return; // start()의 세션 복원이 끝나기 전에는 보내지 않는다(기동 list 원 호출은 adoptStartup 이 끝점 소유로 이어받는다)
+  // ★F-01(R3-4): 활동 패스 — 디스패치와 국소 만료는 **바쁨 가드 앞**, 자기 바깥 catch 안. 앞 틱의 입양이 아직 돌아도 점은 갱신된다.
+  //   요청은 끝점마다 소유 원 호출 하나(이 줄의 list_surfaces 가 유일한 발송 지점) · 응답마다 독립 투영 · 아래 소비자는 그 응답을 한 번씩만 꺼낸다.
+  try {
+    pumpRoleActivity((ep) => invoke("list_surfaces", { socket: ep }));
+  } catch {
+    /* 활동 표시의 실패는 표시에서 끝난다 — 아래 제목·입양·cwd·편성 소비는 그대로 돈다 */
+  }
+  if (refreshing) return; // 겹친 호출의 이중 입양 방지(입양·제목 소비는 직렬 하나)
+  refreshing = true;
+  let adoptedWs = false; // 이번 틱에서 워크스페이스/트리를 고쳤는가(render 필요 판정)
+  const blockedTick: CwdBlockedEntry[] = []; // 이번 틱에 모든 소켓에서 모은 cwd_blocked
   let roleMemoChanged = false; // ★U2: 칸의 역할 기억만 바뀌었는가(render 없이 저장만)
   try {
     // 멀티마스터 F4: workspace별 소켓을 순회 — 각 데몬의 surface를 그 소켓 ws에만 귀속시킨다.
@@ -2974,13 +3086,15 @@ async function refreshPaneTitles() {
     const sockets = [...new Set(workspaces.map((w) => w.socket))];
     let adopted = false;
     for (const sk of sockets) {
-      // ★소켓별 격리: 미응답 데몬 하나가 뒤 순서 소켓들의 입양·제목 갱신을 매 틱 중단시키던 것을 끊는다
-      const flightKey = `list:${sk ?? ""}`;
-      if (!claimFlight(flightKey)) continue; // 직전 요청이 아직 안 끝났다 — 쌓지 않는다
+      // ★F-01(R3-4) 소비자: 요청은 위 활동 패스가 이미 보냈다(끝점당 소유 원 호출 1개 — 상한·나이로 풀리거나 대체되지 않는다).
+      //   여기서는 **이번 회차에 보낸** 그 원 호출이 끝나기를 상한(T_LIST)까지만 기다리고, 끝점별 최신 미소비 스냅샷을 한 번만 꺼낸다.
+      //   상한을 넘기면 이 소켓은 이번 회차 입양만 건너뛴다(원 호출은 취소하지 않는다). 직전 회차 원 호출이 아직이면 기다리지 않는다(쌓지 않는다).
       try {
-        const listCall = invoke("list_surfaces", { socket: sk });
-        releaseFlightWhenSettled(flightKey, listCall);
-        const r = (await rpcT(listCall, T_LIST)) as {
+        const listCall = listTransport.settledFor(sk);
+        await rpcT(listCall, T_LIST);
+        const got = listTransport.take(sk);
+        if (!got) continue; // 받지 못했다(진행 중·시간 초과·오류·이미 소비) — 이 소켓은 이번 틱을 건너뛴다
+        const r = got.value as {
           surfaces: {
             surface_id: number;
             title: string;
@@ -3039,7 +3153,7 @@ async function refreshPaneTitles() {
           const rt = panes.get(paneKey(s.surface_id, sk));
           if (!rt) continue;
           renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
-          setRoleDot(rt.roleEl, s.exited ? null : s.role); // 역할 점도 동일 주기 갱신
+          setRoleDot(rt, s.exited ? null : s.role); // 역할 점도 동일 주기 갱신(★F-01 단일 렌더러 — 활동 표지·사유·나이를 보존)
           if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
           rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
         }
@@ -3060,7 +3174,7 @@ async function refreshPaneTitles() {
             workspaces.filter((w) => !w.pending && !w.deleting && (w.socket ?? undefined) === (sk ?? undefined));
           const before = adoptable();
           if (!before.length || before.some((w) => collectSids(w.tree).includes(s.surface_id))) continue;
-          setRoleDot((await makePane(s.surface_id, s.title, sk)).roleEl, s.role); // 입양 즉시 역할 점 채색(다음 틱 대기 없이)
+          setRoleDot(await makePane(s.surface_id, s.title, sk), s.role); // 입양 즉시 역할 점 채색(다음 틱 대기 없이 · ★F-01 같은 렌더러 — 관측이 없으면 '모름')
           // 계획은 makePane 의 await **뒤에** 짠다 — 그 사이 다른 경로(종료 이벤트·사용자)가 트리를 바꿨어도 옛 트리로
           // 덮지 않게(종전 코드도 await 뒤의 ws.tree 에 붙였다). adoptSeat 는 전역 함수 — 어떤 실패도 종전 오른쪽 부착.
           const cands = adoptable();
@@ -10467,7 +10581,9 @@ async function start() {
   for (const sk of sockets) {
     if (Date.now() > restoreDeadline) break; // 예산 소진 — 나머지는 보류 상태 그대로 두고 화면을 먼저 세운다
     try {
-      const r = (await rpcT(invoke("list_surfaces", { socket: sk }), T_LIST)) as {
+      // ★F-01: 상한(T_LIST)이 이 원 호출을 포기해도 원 호출 자체는 계속 돈다 — 그 끝점의 소유를 3초 틱의 목록 운반에 넘겨, 첫 주기 디스패치가
+      //   같은 끝점에 둘째 원 호출을 얹지 않게 한다(실제로 끝날 때 그 자신의 소유만 풀린다). 이 응답의 데이터는 종전대로 복원만 쓴다.
+      const r = (await rpcT(invoke("list_surfaces", { socket: sk }), T_LIST, (original) => listTransport.adoptStartup(sk, original))) as {
         surfaces: { surface_id: number; title: string; role?: string | null; exited: boolean }[];
       };
       const liveList = r.surfaces.filter((s) => !s.exited);

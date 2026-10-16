@@ -242,6 +242,19 @@ async fn list_surfaces(socket: Option<String>) -> Result<Value, String> {
     rpc_on(&resolve_socket(&socket), "surface.list", json!({})).await
 }
 
+/// ★F-01(0.14.52 · U · R3-4) 주기 목록 운반의 끝점 정규화 — **읽기 전용**. 로스터(워크스페이스 socket 값들, None = 기본)의 항목마다
+/// 기존 `resolve_socket` 을 그대로 적용해 실제로 쓰일 명시 경로를 돌려준다. UI 는 이 결과를 그 로스터 판에 묶어 디스패치 인자로 쓰므로
+/// 기본(None)과 같은 경로의 명시 소켓이 한 끝점이 된다(문자열 Set 은 물리 동일성의 증거가 아니다). 데몬 RPC·연결·포트 탐색·프로세스 0 —
+/// 로스터가 바뀔 때 한 번 부르는 로컬 IPC 다. `default_socket` 은 환경을 읽으므로 이 결과는 로스터만의 함수가 아니다(그래서 판에 묶는다).
+/// UTF-8 로 표현할 수 없는 경로는 None — UI 는 그 항목을 종전처럼 소켓 값 그대로 보내고 '미해석'으로 보고한다(경로를 손실 변환해 엉뚱한 곳에 붙지 않는다).
+#[tauri::command]
+fn resolve_list_endpoints(endpoints: Vec<Option<String>>) -> Vec<Option<String>> {
+    endpoints
+        .iter()
+        .map(|e| resolve_socket(e).to_str().map(str::to_owned))
+        .collect()
+}
+
 /// org.status 브리지 — 사이드바 라이브 신호(B3)·command palette(07) 공유 소스.
 #[tauri::command]
 async fn org_status(socket: Option<String>) -> Result<Value, String> {
@@ -8240,6 +8253,7 @@ fn main() {
             approve_ceo_promotion,
             daemon_status,
             list_surfaces,
+            resolve_list_endpoints,
             org_status,
             org_fleet,
             ensure_dept_forwarders,
