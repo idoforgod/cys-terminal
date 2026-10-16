@@ -234,8 +234,9 @@ fn partial_unknown_write_keeps_reservation_and_items_and_never_hands_off_again()
     assert_eq!(in_delivery, vec![id], "disposers must not drop a partially written item");
 }
 
-/// S4-1 window at the queue: a byte-exact stop is held silently inside the 30,000 ms window and
-/// announced once after it (until the resume controller lands, nothing else is typed).
+/// S4-1 window at the queue: a byte-exact stop that cannot resume (foreign input reached the seat after the hold) is
+/// held silently inside the 30,000 ms window and announced once after it. ★(0.14.52 · S-a C7b) The window counts from
+/// the loss; both edges are pinned with an explicit clock (no latency in the assertion).
 #[test]
 fn partial_exact_write_is_held_and_announced_once_after_the_resume_window() {
     let fx = fx("partial-exact");
@@ -248,19 +249,20 @@ fn partial_exact_write_is_held_and_announced_once_after_the_resume_window() {
     assert_eq!(hold_kind(&s), Some(QueueHoldKind::PartialExact));
     assert!(s.inject_reserved());
     assert!(events(&fx, "queue.write_held").is_empty(), "inside the window the hold is silent");
+    // Foreign input after the hold: this request may never continue into that composer.
+    s.set_pending_input(s.pending_input_bytes.load(Ordering::Relaxed) + 1);
+    let since = s.queue_hold.lock().unwrap().as_ref().unwrap().since;
     let window = Duration::from_millis(crate::agent_write::PARTIAL_EXACT_RESUME_WINDOW_MS);
-    let Some(before) = Instant::now().checked_sub(window - Duration::from_millis(200)) else { return };
-    s.queue_hold.lock().unwrap().as_mut().unwrap().since = before;
-    assert_eq!(crate::governance::queue_write_hold_block(&fx.daemon, &s), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
-    assert!(events(&fx, "queue.write_held").is_empty(), "window - 200 ms: still silent");
-    let Some(after) = Instant::now().checked_sub(window + Duration::from_millis(1)) else { return };
-    s.queue_hold.lock().unwrap().as_mut().unwrap().since = after;
-    assert_eq!(crate::governance::queue_write_hold_block(&fx.daemon, &s), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
-    assert_eq!(crate::governance::queue_write_hold_block(&fx.daemon, &s), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
+    let at = |d: Duration| crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + d);
+    assert_eq!(at(window - Duration::from_millis(1)), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
+    assert!(events(&fx, "queue.write_held").is_empty(), "window - 1 ms: still silent");
+    assert_eq!(at(window + Duration::from_millis(1)), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
+    assert_eq!(at(window + Duration::from_millis(1)), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
     let held = events(&fx, "queue.write_held");
     assert_eq!(held.len(), 1, "exactly one notice after the window");
     assert_eq!(held[0]["payload"]["kind"], "partial_exact");
     assert!(held[0]["payload"]["body_offset"].as_u64().unwrap() >= 4000, "{held:?}");
+    assert!(events(&fx, "queue.write_resumed").is_empty() && events(&fx, "queue.delivered").is_empty(), "resumed after foreign input");
 }
 
 /// Design 4.4 step 2 with self-healing: while the journal cannot be opened every hand-off is refused
@@ -381,4 +383,402 @@ fn restarted_hold_releases_only_when_the_composer_is_measured_empty() {
     let typed = s2.inject_track.last_body().map(|b| b.norm);
     let _ = s2.child.lock().unwrap().kill();
     assert!(typed.as_deref().is_some_and(|t| t.contains("the next item") && !t.contains("a held directive")), "{typed:?}");
+}
+
+// ─── ★(0.14.52 · S-a C7b) S4-1 PartialExact resume controller ───────────────────────────────────────────────────────
+
+/// A seat whose receiver records every byte it is given (raw, no echo) - the bytes the request put on the wire, once.
+fn recorder_seat(fx: &Fx, tag: &str) -> (Arc<Surface>, std::path::PathBuf) {
+    let out = fx.dir.join(format!("rx-{tag}.bin"));
+    let cmd = format!("stty raw -echo; exec cat > '{}'", out.display());
+    let s = fx.daemon.create_surface(None, Some(cmd), None, None, 24, 200).expect("recorder seat");
+    fx.daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+    wait_until("recorder ready", || out.exists());
+    std::thread::sleep(Duration::from_millis(300)); // stty applied before the first byte
+    (s, out)
+}
+
+/// The exact bytes one queue hand-off of `body` writes (open fence, body, close fence, its own Return).
+fn queue_bytes(body: &str) -> Vec<u8> {
+    crate::agent_write::Plan::paste(body).with_submit(400, 0).planned_bytes()
+}
+
+/// The ~97,000-character directive of the S4-1 test.
+fn s4_1_body() -> String {
+    (0..5706).map(|i| format!("S4-1 part {i:05}; ")).collect()
+}
+
+/// ★S4-1 (HEAD-R3-RULING major 1, locked test): a ~97,000-character directive with ONE injected non-death Unknown
+/// mid-body on a healthy agent resumes from its byte-exact offset and submits once - the receiver gets every byte exactly
+/// once (no retyped prefix, one Return), the item is delivered once, and the hold stays silent (inside the window).
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn s4_1_mid_body_transient_loss_resumes_and_submits_once() {
+    let fx = fx("s4-1-resume");
+    let (s, out) = recorder_seat(&fx, "s4-1");
+    let body = s4_1_body();
+    assert!(body.chars().count() >= 97_000, "premise: ~97,000 characters");
+    // Calls: open fence (admitted) · body calls 1..12 (rechecks 0..11) · body call 13 (recheck 12 = transient Unknown).
+    *s.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, Some((12, ProofLoss::Unknown("agent:denied".into())))));
+    let id = enqueue(&fx, &s, &body);
+    assert!(hand_off(&fx, &s), "premise: handed off");
+    assert_eq!(hold_kind(&s), Some(QueueHoldKind::PartialExact), "premise: a byte-exact stop mid-body");
+    let off = s.queue_hold.lock().unwrap().as_ref().and_then(|h| h.envelope).map(|e| e.body_offset).unwrap();
+    assert_eq!(off, 12 * crate::agent_write::MAX_CALL_BYTES, "premise: stopped mid-body at a call boundary");
+    {
+        let h = s.queue_hold.lock().unwrap();
+        let h = h.as_ref().unwrap();
+        assert_eq!(Some(h.since), h.resume.as_ref().unwrap().lost_at(), "the window must count from the proof loss, not the settlement");
+    }
+    // The next tick inside the window: the SAME request continues from its offset; a second tick while it runs does not
+    // hand it off again.
+    assert_eq!(crate::governance::queue_write_hold_block(&fx.daemon, &s), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
+    let _ = crate::governance::queue_write_hold_block(&fx.daemon, &s);
+    wait_until("resumed request settled", || queue_len(&s) == 0);
+    let want = queue_bytes(&body);
+    wait_until("receiver got every byte", || std::fs::metadata(&out).map(|m| m.len() as usize).unwrap_or(0) >= want.len());
+    std::thread::sleep(Duration::from_millis(200)); // nothing more arrives (no retype, no second Return)
+    let got = std::fs::read(&out).unwrap();
+    let delivered = events(&fx, "queue.delivered");
+    assert_eq!(delivered.len(), 1, "delivered once");
+    assert_eq!(delivered[0]["payload"]["queue_entry_id"], Value::from(id));
+    assert!(events(&fx, "queue.write_held").is_empty(), "resumed inside the window: no notice");
+    assert!(hold_kind(&s).is_none() && !s.inject_reserved(), "hold and reservation end with the delivery");
+    assert_eq!(events(&fx, "queue.write_resumed").len(), 1, "one resumed run");
+    assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0, "the line was submitted");
+    assert!(got == want, "receiver bytes differ: got {} bytes, want {} (a retyped prefix or a lost tail)", got.len(), want.len());
+}
+
+/// Seat events of one surface only (several seats share a fixture).
+fn seat_events(fx: &Fx, s: &Arc<Surface>, name: &str) -> Vec<Value> {
+    let r = cys::surface_ref(s.id);
+    events(fx, name).into_iter().filter(|e| e["payload"]["surface_ref"] == Value::from(r.clone())).collect()
+}
+
+/// Hand off `body` on `s` and stop it byte-exactly before body call `at` (a transient Unknown); returns the hold's loss instant.
+fn hold_exact(fx: &Fx, s: &Arc<Surface>, body: &str, at: usize) -> Instant {
+    *s.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, Some((at, ProofLoss::Unknown("agent:denied".into())))));
+    enqueue(fx, s, body);
+    assert!(hand_off(fx, s), "premise: handed off");
+    let h = s.queue_hold.lock().unwrap();
+    let h = h.as_ref().expect("premise: held");
+    assert_eq!(h.kind, QueueHoldKind::PartialExact, "premise: a byte-exact stop");
+    assert!(h.resume.is_some(), "premise: resumable material");
+    h.since
+}
+
+fn file_len(p: &std::path::Path) -> usize {
+    std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0)
+}
+
+/// Wait until the recorder holds exactly the held prefix (open fence + accepted body bytes) and return its length.
+fn wait_prefix(s: &Arc<Surface>, out: &std::path::Path) -> usize {
+    let off = s.queue_hold.lock().unwrap().as_ref().and_then(|h| h.envelope).map(|e| e.body_offset).unwrap();
+    let want = cys::paste_fence::OPEN.len() + off;
+    wait_until("recorder holds the prefix", || file_len(out) == want);
+    want
+}
+
+/// ★S4-1 / D3: the resume window is exact - at window - 1 ms from the loss the SAME request continues; at window + 1 ms it
+/// does not (held, one notice), with the clock pinned by the specimen.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn s4_1_resume_window_edges_are_exact() {
+    let fx = fx("s4-1-edges");
+    // The value is locked (HEAD-RULINGS-W4-1 D3, LOCK-W4-WINDOWS-AND-N-20261016.json): 30,000 ms from proof loss.
+    assert_eq!(crate::agent_write::PARTIAL_EXACT_RESUME_WINDOW_MS, 30_000, "locked S4-1 window changed");
+    let window = Duration::from_millis(crate::agent_write::PARTIAL_EXACT_RESUME_WINDOW_MS);
+    let body = "an edge directive ".repeat(600); // > 4,096 bytes
+    // + 1 ms: not resumed.
+    let (late, late_out) = recorder_seat(&fx, "late");
+    let since = hold_exact(&fx, &late, &body, 1);
+    let prefix = wait_prefix(&late, &late_out);
+    assert_eq!(
+        crate::governance::queue_write_hold_block_at(&fx.daemon, &late, since + window + Duration::from_millis(1)),
+        Some(crate::governance::BLOCKED_PARTIAL_WRITE)
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(seat_events(&fx, &late, "queue.write_resumed").is_empty(), "resumed after the window");
+    assert_eq!(queue_len(&late), 1);
+    assert_eq!(file_len(&late_out), prefix, "bytes were typed after the window");
+    assert_eq!(seat_events(&fx, &late, "queue.write_held").len(), 1, "one notice at expiry");
+    // - 1 ms: resumed, delivered once, every byte once.
+    let (edge, edge_out) = recorder_seat(&fx, "edge");
+    let since = hold_exact(&fx, &edge, &body, 1);
+    assert_eq!(
+        crate::governance::queue_write_hold_block_at(&fx.daemon, &edge, since + window - Duration::from_millis(1)),
+        Some(crate::governance::BLOCKED_PARTIAL_WRITE)
+    );
+    wait_until("resumed at window - 1 ms", || queue_len(&edge) == 0);
+    let want = queue_bytes(&body);
+    wait_until("every byte", || file_len(&edge_out) >= want.len());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(std::fs::read(&edge_out).unwrap() == want, "receiver bytes differ at window - 1 ms");
+    assert_eq!(seat_events(&fx, &edge, "queue.delivered").len(), 1);
+}
+
+/// Receiver proof that admits the first hand-off, loses at recheck `fail_at`, and refuses every later admission (a
+/// resumed run that never gets its fresh full proof).
+struct LostForGood {
+    admits: AtomicUsize,
+    rechecks: AtomicUsize,
+    fail_at: usize,
+}
+
+impl Proof for LostForGood {
+    fn admit(&self) -> Result<(), ProofLoss> {
+        if self.admits.fetch_add(1, Ordering::AcqRel) == 0 {
+            Ok(())
+        } else {
+            Err(ProofLoss::Unknown("agent:denied".into()))
+        }
+    }
+    fn recheck(&self, _: Phase) -> Result<(), ProofLoss> {
+        if self.rechecks.fetch_add(1, Ordering::AcqRel) == self.fail_at {
+            Err(ProofLoss::Unknown("agent:denied".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// ★D3 "the window does not widen under load": repeated resume attempts that make no progress keep the FIRST loss
+/// instant (each failed admission is a new loss of the same request), back off 1, 2, 4, 8 s between attempts (so at most
+/// five attempts fit: the fifth backs off 30 s, past the window), never add a phantom byte to the held count, and stop at
+/// window + 1 ms with one notice.
+#[test]
+fn s4_1_window_does_not_widen_under_repeated_no_progress_resumes() {
+    let fx = fx("s4-1-widen");
+    let s = seat(&fx);
+    let proof = Arc::new(LostForGood { admits: AtomicUsize::new(0), rechecks: AtomicUsize::new(0), fail_at: 1 });
+    *s.receiver_proof.lock().unwrap() = Some(proof.clone());
+    enqueue(&fx, &s, &"a widening directive ".repeat(400));
+    assert!(hand_off(&fx, &s));
+    let (since, held_count) = {
+        let h = s.queue_hold.lock().unwrap();
+        (h.as_ref().unwrap().since, s.pending_input_bytes.load(Ordering::Relaxed))
+    };
+    let held_at = || fx.daemon.write_holds.lock().unwrap().values().next().map(|h| h.held_at);
+    let first_held_at = held_at();
+    let window = Duration::from_millis(crate::agent_write::PARTIAL_EXACT_RESUME_WINDOW_MS);
+    for k in 1..=5u32 {
+        let before = proof.admits.load(Ordering::Acquire);
+        let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(4 * k as u64));
+        let what = format!("resumed attempt {k} settled (admits {before}, hold {:?})", s.queue_hold.lock().unwrap().as_ref().map(|h| (h.attempts, h.resuming, h.resume.is_some(), h.next_retry.map(|t| t.saturating_duration_since(since)))));
+        wait_until(&what, || {
+            proof.admits.load(Ordering::Acquire) == before + 1 && s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| !h.resuming)
+        });
+        let h = s.queue_hold.lock().unwrap();
+        let h = h.as_ref().unwrap();
+        assert_eq!(h.kind, QueueHoldKind::PartialExact);
+        assert_eq!(h.since, since, "attempt {k}: the window start moved (widened)");
+        assert_eq!(h.attempts, k, "attempt {k}: no-progress attempts are counted");
+        assert!(h.next_retry.is_some(), "attempt {k}: a no-progress attempt backs off");
+        assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), held_count, "attempt {k}: the held count drifted");
+        drop(h);
+        assert_eq!(held_at(), first_held_at, "attempt {k}: the persisted hold age restarted");
+    }
+    // The backoff is real: right now and at 24 s (the fifth attempt backs off 30 s) no attempt is made.
+    let before = proof.admits.load(Ordering::Acquire);
+    let _ = crate::governance::queue_write_hold_block(&fx.daemon, &s);
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(24));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(proof.admits.load(Ordering::Acquire), before, "attempted inside the backoff");
+    // Past the window: no attempt, one notice.
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + window + Duration::from_millis(1));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(proof.admits.load(Ordering::Acquire), before, "attempted after the window");
+    assert_eq!(events(&fx, "queue.write_held").len(), 1, "one notice at expiry");
+    assert!(events(&fx, "queue.delivered").is_empty());
+}
+
+/// ★S4-1 premises: an agent epoch move, a conversation epoch move (e.g. `/clear`), a foreign writer write, foreign input
+/// accounting, or a human keystroke after the hand-off - each stops the resume (held, nothing typed, nothing announced as
+/// resumed).
+#[test]
+fn s4_1_no_resume_after_an_epoch_move_or_foreign_input() {
+    let fx = fx("s4-1-premises");
+    let body = "a premise directive ".repeat(400);
+    let cases: Vec<(&str, Box<dyn Fn(&Arc<Surface>)>)> = vec![
+        ("agent epoch", Box::new(|s: &Arc<Surface>| s.bump_agent_epoch())),
+        ("conversation epoch", Box::new(|s: &Arc<Surface>| s.bump_conversation_epoch())),
+        (
+            "foreign writer write",
+            Box::new(|s: &Arc<Surface>| {
+                let w = s.inject_track.wrote();
+                s.write_tx.send(crate::state::WriteReq::Data(b"x".to_vec())).unwrap();
+                wait_until("foreign write counted", || s.inject_track.wrote() > w);
+            }),
+        ),
+        ("foreign input accounting", Box::new(|s: &Arc<Surface>| s.set_pending_input(s.pending_input_bytes.load(Ordering::Relaxed) + 1))),
+        ("human keystroke", Box::new(|s: &Arc<Surface>| *s.last_human_input.lock().unwrap() = Some(Instant::now()))),
+    ];
+    for (what, apply) in cases {
+        let s = seat(&fx);
+        let since = hold_exact(&fx, &s, &body, 1);
+        apply(&s);
+        assert_eq!(
+            crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(1)),
+            Some(crate::governance::BLOCKED_PARTIAL_WRITE),
+            "{what}"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(seat_events(&fx, &s, "queue.write_resumed").is_empty(), "{what}: resumed");
+        assert_eq!(queue_len(&s), 1, "{what}");
+        assert!(s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| h.kind == QueueHoldKind::PartialExact && !h.resuming), "{what}");
+    }
+}
+
+/// ★S4-1 "no new modal": a modal on the seat's current frame makes the resume WAIT inside the window; once it is gone the
+/// SAME request continues and is delivered once.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn s4_1_modal_waits_inside_the_window_then_resumes() {
+    let fx = fx("s4-1-modal");
+    let (s, out) = recorder_seat(&fx, "modal");
+    *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+    let body = "a modal directive ".repeat(400);
+    let since = hold_exact(&fx, &s, &body, 1);
+    crate::governance::h_paint(&s, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(1));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(events(&fx, "queue.write_resumed").is_empty(), "resumed into a modal");
+    assert_eq!(queue_len(&s), 1);
+    crate::governance::h_paint(&s, crate::governance::H_IDLE_SCREEN);
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(2));
+    wait_until("resumed after the modal", || queue_len(&s) == 0);
+    let want = queue_bytes(&body);
+    wait_until("every byte", || file_len(&out) >= want.len());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(std::fs::read(&out).unwrap() == want, "receiver bytes differ after the modal");
+    assert_eq!(events(&fx, "queue.delivered").len(), 1);
+}
+
+/// ★S4-1 at the first byte: a foreign write already queued in the writer AHEAD of the resumed run (invisible to the tick's
+/// check) is caught by the resumed run's claim-time probe - not one byte of the remainder follows it, and the hold never
+/// resumes afterwards.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn s4_1_foreign_write_queued_ahead_of_the_resume_voids_it_at_the_first_byte() {
+    let fx = fx("s4-1-ahead");
+    let (s, out) = recorder_seat(&fx, "ahead");
+    let body = "an ahead directive ".repeat(400);
+    let since = hold_exact(&fx, &s, &body, 1);
+    let prefix = wait_prefix(&s, &out);
+    // The writer is busy with a foreign request that has not written yet when the tick checks.
+    s.write_tx.send(crate::state::WriteReq::DataAfter { bytes: b"X".to_vec(), delay_ms: 400 }).unwrap();
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(1));
+    assert_eq!(seat_events(&fx, &s, "queue.write_resumed").len(), 1, "premise: the tick handed the resumed run off");
+    // Settled = the hold is no longer resuming (or gone: the run completed - which the byte check below refuses).
+    wait_until("resumed run settled", || s.queue_hold.lock().unwrap().as_ref().is_none_or(|h| !h.resuming));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(file_len(&out), prefix + 1, "only the foreign byte follows the prefix (nothing of the remainder)");
+    let h = s.queue_hold.lock().unwrap().as_ref().map(|h| (h.kind, h.resume.is_some())).unwrap();
+    assert_eq!(h, (QueueHoldKind::PartialExact, false), "the voided hold must never resume");
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(2));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(seat_events(&fx, &s, "queue.write_resumed").len(), 1, "resumed after a void");
+    assert_eq!(queue_len(&s), 1);
+}
+
+/// ★S4-1 at the first byte: an epoch move AFTER the tick's check but before the resumed run's first byte (the writer was
+/// busy without writing a byte) voids the resume at claim time - nothing of the remainder is typed.
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn s4_1_epoch_move_between_the_check_and_the_first_byte_voids_the_resume() {
+    let fx = fx("s4-1-claim-epoch");
+    let (s, out) = recorder_seat(&fx, "claim-epoch");
+    let since = hold_exact(&fx, &s, &"a claim directive ".repeat(400), 1);
+    let prefix = wait_prefix(&s, &out);
+    let wrote = s.inject_track.wrote();
+    // The writer is busy with a withheld Return whose probe takes 800 ms: no byte, no write count.
+    let busy: crate::state::SafetyProbe = Arc::new(|| {
+        std::thread::sleep(Duration::from_millis(800));
+        true
+    });
+    s.write_tx.send(crate::state::WriteReq::SubmitAfterGap { bytes: b"\r".to_vec(), min_gap_ms: 0, withhold: Some(busy) }).unwrap();
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(1));
+    assert_eq!(seat_events(&fx, &s, "queue.write_resumed").len(), 1, "premise: the tick handed the resumed run off");
+    s.bump_agent_epoch(); // between the check and the claim
+    // Settled = the hold is no longer resuming (or gone: the run completed - which the byte check below refuses).
+    wait_until("resumed run settled", || s.queue_hold.lock().unwrap().as_ref().is_none_or(|h| !h.resuming));
+    std::thread::sleep(Duration::from_millis(200));
+    let now_wrote = s.inject_track.wrote();
+    assert_eq!(file_len(&out), prefix, "bytes were typed after an epoch move (writer count {wrote} -> {now_wrote})");
+    assert_eq!(now_wrote, wrote, "premise: the busy request wrote nothing");
+    let h = s.queue_hold.lock().unwrap().as_ref().map(|h| (h.kind, h.resume.is_some())).unwrap();
+    assert_eq!(h, (QueueHoldKind::PartialExact, false), "a voided hold must never resume");
+}
+
+/// Receiver proof that loses at recheck `fail_at` after a keystroke reached the seat's input accounting mid-write.
+struct InputDuringWrite {
+    s: std::sync::Weak<Surface>,
+    rechecks: AtomicUsize,
+    fail_at: usize,
+}
+
+impl Proof for InputDuringWrite {
+    fn admit(&self) -> Result<(), ProofLoss> {
+        Ok(())
+    }
+    fn recheck(&self, _: Phase) -> Result<(), ProofLoss> {
+        if self.rechecks.fetch_add(1, Ordering::AcqRel) == self.fail_at {
+            if let Some(s) = self.s.upgrade() {
+                s.set_pending_input(s.pending_input_bytes.load(Ordering::Relaxed) + 3);
+            }
+            return Err(ProofLoss::Unknown("agent:denied".into()));
+        }
+        Ok(())
+    }
+}
+
+/// ★S4-1 "no foreign input": input that reached the seat WHILE the original request was writing makes the byte-exact
+/// stop non-resumable from the start (held; the automatic exit owns it after the window).
+#[test]
+fn s4_1_input_during_the_original_write_is_never_resumed() {
+    let fx = fx("s4-1-input-during");
+    let s = seat(&fx);
+    *s.receiver_proof.lock().unwrap() = Some(Arc::new(InputDuringWrite { s: Arc::downgrade(&s), rechecks: AtomicUsize::new(0), fail_at: 1 }));
+    enqueue(&fx, &s, &"an input directive ".repeat(400));
+    assert!(hand_off(&fx, &s));
+    let since = {
+        let h = s.queue_hold.lock().unwrap();
+        let h = h.as_ref().unwrap();
+        assert_eq!(h.kind, QueueHoldKind::PartialExact, "premise: byte-exact stop");
+        assert!(h.resume.is_none(), "input during the write left the hold resumable");
+        h.since
+    };
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(1));
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(events(&fx, "queue.write_resumed").is_empty());
+    assert_eq!(queue_len(&s), 1);
+}
+
+/// While a resumed run is in the writer the hold neither announces nor releases - even a tick past the window that
+/// measures an empty composer (a release then would tombstone an item the writer is completing).
+#[test]
+#[cfg_attr(not(unix), ignore = "좌석 명령이 POSIX 셸 문법")]
+fn s4_1_a_resumed_run_in_flight_is_never_released_or_announced() {
+    let fx = fx("s4-1-inflight");
+    let (s, out) = recorder_seat(&fx, "inflight");
+    *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+    crate::governance::h_paint(&s, crate::governance::H_IDLE_SCREEN);
+    let body = "an inflight directive ".repeat(400);
+    let since = hold_exact(&fx, &s, &body, 1);
+    let window = Duration::from_millis(crate::agent_write::PARTIAL_EXACT_RESUME_WINDOW_MS);
+    let _ = crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + Duration::from_secs(1));
+    assert!(s.queue_hold.lock().unwrap().as_ref().is_some_and(|h| h.resuming), "premise: the resumed run is in flight (400 ms Return delay)");
+    // A tick past the window with the composer measured empty (idle frame) while the run is in flight.
+    assert_eq!(
+        crate::governance::queue_write_hold_block_at(&fx.daemon, &s, since + window + Duration::from_secs(5)),
+        Some(crate::governance::BLOCKED_PARTIAL_WRITE)
+    );
+    wait_until("delivered", || queue_len(&s) == 0);
+    let want = queue_bytes(&body);
+    wait_until("every byte", || file_len(&out) >= want.len());
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(std::fs::read(&out).unwrap() == want, "receiver bytes differ");
+    assert_eq!(events(&fx, "queue.delivered").len(), 1);
+    assert!(events(&fx, "queue.write_released").is_empty(), "released while the writer was completing it");
+    assert!(events(&fx, "queue.write_held").is_empty(), "announced while the writer was completing it");
 }

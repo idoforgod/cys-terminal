@@ -9666,6 +9666,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             }
                         };
                         if swapped {
+                            // ★(0.14.52 · S-a C7b) `/clear` started a new conversation: a partial write held for the old one
+                            //   never resumes into it (S4-1 "same conversation epoch").
+                            surface.bump_conversation_epoch();
                             // 역할 좌석만 topology 에 실린다 — 가드는 별도 문장(role 락을 쥔 채 persist 하면 자기 교착).
                             let has_role = surface.role.lock().unwrap().is_some();
                             if has_role {
@@ -21884,12 +21887,20 @@ mod tests {
         let daemon = isolated_daemon();
         let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_331);
         let mut rx = daemon.bus.subscribe();
+        // ★(0.14.52 · S-a C7b) Epochs: only an accepted re-pin is a new conversation (S4-1 resume premise).
+        let epochs = || {
+            let s = daemon.surfaces.lock().unwrap()[&own].clone();
+            (s.agent_epoch.load(Ordering::Acquire), s.conversation_epoch.load(Ordering::Acquire))
+        };
+        let (agent0, conv0) = epochs();
         crate::usage::clear_lineage_seam::set_hook(Some(false));
         let _ = usage_register_src(&daemon, own, &r3_1_path(R3_N), Some("clear"), Some(994_331));
         assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "도구 셸 직접 호출이 핀을 바꿨다");
+        assert_eq!(epochs(), (agent0, conv0), "a rejected re-pin moved an epoch");
         crate::usage::clear_lineage_seam::set_hook(None);
         let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_331));
         assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "직접 호출 뒤 좌석 자신의 /clear 가 끊겼다");
+        assert_eq!(epochs(), (agent0, conv0 + 1), "the seat's own /clear must start a new conversation epoch");
         assert_eq!(
             r3_1_repin_events(&mut rx),
             vec![

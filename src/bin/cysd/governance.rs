@@ -9593,14 +9593,80 @@ fn queue_write_settle(
     request_id: String,
     forced: bool,
     overdue: bool,
+    stamp: HandoffStamp,
 ) -> crate::agent_write::Settle {
     let (wd, ws) = (Arc::downgrade(daemon), Arc::downgrade(s));
     let sid = s.id;
     Box::new(move |t: &crate::agent_write::Terminal| {
         if let Some(daemon) = wd.upgrade() {
-            settle_queue_write(&daemon, ws.upgrade(), sid, &f, &d, &receipt, &request_id, forced, overdue, t);
+            settle_queue_write(&daemon, ws.upgrade(), sid, &f, &d, &receipt, &request_id, forced, overdue, &stamp, t);
         }
     })
+}
+
+/// ★(0.14.52 · S-a C7b) What one queue hand-off was written under (S4-1 "same binding epoch and conversation epoch"):
+/// the request itself and the seat's agent and conversation epochs and last human keystroke AT THE HAND-OFF. A resumed
+/// run carries the stamp of the original hand-off, never a new one.
+#[derive(Clone)]
+struct HandoffStamp {
+    request: Arc<crate::agent_write::Request>,
+    agent_epoch: u64,
+    conversation_epoch: u64,
+    human_at: Option<std::time::Instant>,
+}
+
+impl HandoffStamp {
+    fn of(s: &crate::state::Surface, request: Arc<crate::agent_write::Request>) -> HandoffStamp {
+        HandoffStamp {
+            request,
+            agent_epoch: s.agent_epoch.load(Ordering::Acquire),
+            conversation_epoch: s.conversation_epoch.load(Ordering::Acquire),
+            human_at: *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+    /// The seat is still on the hand-off's agent and conversation.
+    fn epochs_hold(&self, s: &crate::state::Surface) -> bool {
+        s.agent_epoch.load(Ordering::Acquire) == self.agent_epoch
+            && s.conversation_epoch.load(Ordering::Acquire) == self.conversation_epoch
+    }
+}
+
+/// ★(0.14.52 · S-a C7b) The resume material of a PartialExact queue hold (`QueueHold::resume`): what the SAME request
+/// needs to continue from its byte-exact offset through the same settlement, and the evidence its resume predicate
+/// compares (S4-1). The body is the stored hand-off digest (never recomputed from the queue); no second request id.
+pub(crate) struct QueueResume {
+    stamp: HandoffStamp,
+    d: Delivered,
+    receipt: (f64, String, Option<u64>, Value),
+    forced: bool,
+    overdue: bool,
+    entries: Vec<crate::state::QueueEntry>,
+    /// `input_gen` right after the hold's own count update: any later move is foreign input.
+    input_gen: u64,
+    /// The writer's write count at the hold ([`crate::state::InjectTrack::wrote`]): any later write is foreign.
+    wrote: u64,
+    /// A resumed run's claim-time probe found a premise broken (a foreign write or a moved epoch): the re-hold never resumes.
+    void: std::sync::atomic::AtomicBool,
+}
+
+impl QueueResume {
+    /// Specimens: the request's latest proof-loss instant. (`cfg_attr`, not a test-only `cfg`: this file's source pins cut
+    /// the production region at the first test `cfg` attribute - see `expire_entries`.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn lost_at(&self) -> Option<std::time::Instant> {
+        self.stamp.request.lost_at()
+    }
+}
+
+impl std::fmt::Debug for QueueResume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueResume")
+            .field("request_id", &self.stamp.request.id)
+            .field("entry_ids", &self.d.merged_ids)
+            .field("input_gen", &self.input_gen)
+            .field("wrote", &self.wrote)
+            .finish()
+    }
 }
 
 /// One queue terminal, per design 4.5:
@@ -9622,6 +9688,7 @@ fn settle_queue_write(
     request_id: &str,
     forced: bool,
     overdue: bool,
+    stamp: &HandoffStamp,
     t: &crate::agent_write::Terminal,
 ) {
     use crate::agent_write::Terminal as T;
@@ -9705,6 +9772,8 @@ fn settle_queue_write(
                     next_retry: Some(std::time::Instant::now() + crate::state::queue_hold_backoff(attempts)),
                     envelope: None,
                     notified: true,
+                    resume: None,
+                    resuming: false,
                 });
                 attempts == 1
             };
@@ -9728,15 +9797,18 @@ fn settle_queue_write(
             daemon.persist_queue_state();
         }
         T::PartialExact { envelope, accepted, reason } => {
-            hold_partial_write(daemon, s, sid, f, d, request_id, crate::state::QueueHoldKind::PartialExact, reason, *envelope, accepted.payload);
+            let k = crate::state::QueueHoldKind::PartialExact;
+            hold_partial_write(daemon, s, sid, f, d, request_id, k, reason, *envelope, accepted.payload, stamp, receipt, forced, overdue);
         }
         T::PartialUnknown { envelope, accepted, reason } => {
-            hold_partial_write(daemon, s, sid, f, d, request_id, crate::state::QueueHoldKind::PartialUnknown, reason, *envelope, accepted.payload);
+            let k = crate::state::QueueHoldKind::PartialUnknown;
+            hold_partial_write(daemon, s, sid, f, d, request_id, k, reason, *envelope, accepted.payload, stamp, receipt, forced, overdue);
         }
         // A queue plan always owns its Return, so a body-only terminal is not a delivery.
         T::WrittenBody { accepted } => {
             let env = crate::agent_write::Envelope { opened: true, closed: true, body_offset: d.body.len(), ..Default::default() };
-            hold_partial_write(daemon, s, sid, f, d, request_id, crate::state::QueueHoldKind::PartialUnknown, "written_body_without_submit", env, accepted.payload);
+            let (k, why) = (crate::state::QueueHoldKind::PartialUnknown, "written_body_without_submit");
+            hold_partial_write(daemon, s, sid, f, d, request_id, k, why, env, accepted.payload, stamp, receipt, forced, overdue);
         }
     }
 }
@@ -9745,6 +9817,10 @@ fn settle_queue_write(
 /// typed there (the reservation stays, so neither tick nor forced delivery hands off). The input
 /// counter is set to the accepted prefix where the hand-off's zero is still mine. PartialUnknown is
 /// announced at once; PartialExact only when its S4-1 window expires ([`queue_write_hold_block`]).
+/// ★(0.14.52 · S-a C7b) A PartialExact hold carries its resume material ([`QueueResume`]) unless foreign input reached the
+/// seat since the hand-off. The hold episode belongs to the REQUEST: a later stop of the same request (a resumed run) keeps
+/// the first loss instant (the window never widens), the notice state and the persisted age; a resumed run that made no
+/// progress backs off 1, 2, 4, 8 s before the next attempt.
 #[allow(clippy::too_many_arguments)]
 fn hold_partial_write(
     daemon: &Arc<Daemon>,
@@ -9757,47 +9833,90 @@ fn hold_partial_write(
     reason: &str,
     envelope: crate::agent_write::Envelope,
     payload: u64,
+    stamp: &HandoffStamp,
+    receipt: &(f64, String, Option<u64>, Value),
+    forced: bool,
+    overdue: bool,
 ) {
     let Some(s) = &s else { return };
-    {
+    let (mine, input_gen) = {
         let _q = s.pending_queue.lock().unwrap();
         let _gate = s.input_gate.lock().unwrap();
-        if s.input_gen.load(Ordering::Acquire) == f.pending_gen && s.pending_input_bytes.load(Ordering::Relaxed) == 0 {
-            s.set_pending_input(f.prev_pending + payload.max(1));
+        let mine = s.input_gen.load(Ordering::Acquire) == f.pending_gen && s.pending_input_bytes.load(Ordering::Relaxed) == 0;
+        if mine {
+            // The prefix written so far (a resumed run's hand-off zero restores the held count plus its own bytes).
+            s.set_pending_input((f.prev_pending + payload).max(1));
             // The line was NOT submitted: the hand-off's lowered Esc exemption is restored (rollback rule).
             s.restore_esc_exempt(f.prev_esc_exempt_pgid);
         }
-    }
+        (mine, s.input_gen.load(Ordering::Acquire))
+    };
     let unknown = kind == crate::state::QueueHoldKind::PartialUnknown;
-    *s.queue_hold.lock().unwrap() = Some(crate::state::QueueHold {
-        kind,
-        reason: reason.to_string(),
-        request_id: request_id.to_string(),
-        entry_ids: d.merged_ids.clone(),
-        since: std::time::Instant::now(),
-        attempts: 0,
-        next_retry: None,
-        envelope: Some(envelope),
-        notified: unknown,
-    });
+    let now = std::time::Instant::now();
+    let announce = {
+        let mut h = s.queue_hold.lock().unwrap();
+        let prev = h.as_ref().filter(|x| x.request_id == request_id && x.kind != crate::state::QueueHoldKind::Refused);
+        let void = prev.and_then(|x| x.resume.as_ref()).is_some_and(|r| r.void.load(Ordering::Acquire));
+        let resume = (kind == crate::state::QueueHoldKind::PartialExact && mine && !void).then(|| {
+            Arc::new(QueueResume {
+                stamp: stamp.clone(),
+                d: d.clone(),
+                receipt: receipt.clone(),
+                forced,
+                overdue,
+                entries: f.entries.clone(),
+                input_gen,
+                wrote: s.inject_track.wrote(),
+                void: std::sync::atomic::AtomicBool::new(false),
+            })
+        });
+        let since = prev.map(|x| x.since).or_else(|| stamp.request.lost_at()).unwrap_or(now);
+        let (attempts, next_retry) = match prev {
+            Some(x) if x.envelope == Some(envelope) => (x.attempts + 1, Some(now + crate::state::queue_hold_backoff(x.attempts + 1))),
+            Some(x) => (x.attempts, None),
+            None => (0, None),
+        };
+        let notified = prev.is_some_and(|x| x.notified);
+        *h = Some(crate::state::QueueHold {
+            kind,
+            reason: reason.to_string(),
+            request_id: request_id.to_string(),
+            entry_ids: d.merged_ids.clone(),
+            since,
+            attempts,
+            next_retry,
+            envelope: Some(envelope),
+            notified: notified || unknown,
+            resume,
+            resuming: false,
+        });
+        unknown && !notified
+    };
     // ★(0.14.52 · S-a C7a) The hold survives a restart: without it the restored entries are handed off again onto the
     //   composer that already holds their prefix (retype).
     {
+        let mut w = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+        let held_at = d
+            .merged_ids
+            .iter()
+            .find_map(|id| w.get(id))
+            .filter(|x| x.request_id == request_id)
+            .map(|x| x.held_at)
+            .unwrap_or_else(now_epoch);
         let rec = crate::state::PersistedWriteHold {
             kind: if unknown { "partial_unknown" } else { "partial_exact" }.to_string(),
             reason: reason.to_string(),
             request_id: request_id.to_string(),
             entry_ids: d.merged_ids.clone(),
             body_offset: envelope.body_offset,
-            held_at: now_epoch(),
+            held_at,
         };
-        let mut w = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner());
         for id in &d.merged_ids {
             w.insert(id.clone(), rec.clone());
         }
     }
     daemon.persist_write_holds();
-    if unknown {
+    if announce {
         publish_write_held(daemon, sid, kind, reason, request_id, &d.merged_ids, Some(envelope), 0);
     }
     daemon.persist_queue_state();
@@ -9843,29 +9962,45 @@ fn publish_write_held(
 
 /// The queue tick's hold check (design 4.6): a refused seat waits out its backoff; a partial-write
 /// seat stays held (its reservation already stops every hand-off - this gives the reason label and
-/// fires the expired-window notice once).
+/// fires the expired-window notice once). ★(0.14.52 · S-a C7b) Inside the S4-1 window a PartialExact hold resumes the
+/// SAME request ([`try_resume_partial_write`]); the seat stays held until that run's terminal.
 pub(crate) fn queue_write_hold_block(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> Option<&'static str> {
+    queue_write_hold_block_at(daemon, s, std::time::Instant::now())
+}
+
+/// [`queue_write_hold_block`] at an explicit `now`: specimens pin the window edges exactly (window - 1 ms / + 1 ms).
+pub(crate) fn queue_write_hold_block_at(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    now: std::time::Instant,
+) -> Option<&'static str> {
     use crate::state::QueueHoldKind as K;
     adopt_persisted_write_hold(daemon, s);
     let mut notice = None;
     let mut release = None;
+    let mut resume = false;
     let why = {
         let mut h = s.queue_hold.lock().unwrap();
         let hold = h.as_mut()?;
         match hold.kind {
-            K::Refused => hold.next_retry.filter(|t| std::time::Instant::now() < *t).map(|_| BLOCKED_RECEIVER_HELD),
+            K::Refused => hold.next_retry.filter(|t| now < *t).map(|_| BLOCKED_RECEIVER_HELD),
+            // A resumed run of this request is in the writer: its terminal settles the hold (no notice, no release).
+            K::PartialExact | K::PartialUnknown if hold.resuming => Some(BLOCKED_PARTIAL_WRITE),
             K::PartialExact | K::PartialUnknown => {
                 let window = std::time::Duration::from_millis(crate::agent_write::PARTIAL_EXACT_RESUME_WINDOW_MS);
-                if !hold.notified && hold.since.elapsed() > window {
+                // The window counts from the request's first proof loss (`since`) and never moves.
+                let age = now.saturating_duration_since(hold.since);
+                if !hold.notified && age > window {
                     hold.notified = true;
-                    notice = Some((hold.kind, hold.reason.clone(), hold.request_id.clone(), hold.entry_ids.clone(), hold.envelope, hold.since.elapsed().as_secs()));
+                    notice = Some((hold.kind, hold.reason.clone(), hold.request_id.clone(), hold.entry_ids.clone(), hold.envelope, age.as_secs()));
                 }
                 // ★(0.14.52 · S-a C7a · head condition on Q2) automatic, bounded exit: a hold that can no longer resume
                 //   (PartialUnknown, or PartialExact past its window) is released once the composer is measured empty.
-                let resumable = hold.kind == K::PartialExact && hold.since.elapsed() <= window;
+                let resumable = hold.kind == K::PartialExact && age <= window;
+                resume = resumable && hold.resume.is_some() && hold.next_retry.is_none_or(|t| now >= t);
                 let min_age = std::time::Duration::from_millis(PARTIAL_RELEASE_MIN_AGE_MS);
-                if !resumable && hold.since.elapsed() >= min_age {
-                    release = Some((hold.request_id.clone(), hold.entry_ids.clone(), hold.kind, hold.reason.clone(), hold.since.elapsed().as_secs()));
+                if !resumable && age >= min_age {
+                    release = Some((hold.request_id.clone(), hold.entry_ids.clone(), hold.kind, hold.reason.clone(), age.as_secs()));
                 }
                 Some(BLOCKED_PARTIAL_WRITE)
             }
@@ -9874,6 +10009,10 @@ pub(crate) fn queue_write_hold_block(daemon: &Arc<Daemon>, s: &Arc<crate::state:
     if let Some((kind, reason, request_id, ids, env, secs)) = notice {
         publish_write_held(daemon, s.id, kind, &reason, &request_id, &ids, env, secs);
     }
+    if resume {
+        // Held either way until the resumed run's terminal (or the next tick's attempt).
+        try_resume_partial_write(daemon, s, now);
+    }
     if let Some((request_id, ids, kind, reason, secs)) = release {
         if composer_measured_empty(s) {
             release_partial_write_hold(daemon, s, &request_id, &ids, kind, &reason, secs);
@@ -9881,6 +10020,163 @@ pub(crate) fn queue_write_hold_block(daemon: &Arc<Daemon>, s: &Arc<crate::state:
         }
     }
     why
+}
+
+/// ★(0.14.52 · S-a C7b · S4-1) Continue a PartialExact queue write: the SAME request (same id, same settlement) from its
+/// byte-exact offset - remaining body, closing fence, its own Return. Only inside the window from the loss, with the
+/// agent and conversation epochs of the hand-off, no foreign input since the hold (input count generation, last human
+/// keystroke, writer write count), and no pause / quiescing / shell / modal / per-seat queue pause / approval or gate
+/// pending. The writer's admission is the fresh full proof; the job's claim-time probe re-checks the premises next to
+/// its first byte ([`resume_safety_probe`]). Never a second writer, a new request id, an erase or a retype. Returns
+/// whether the resumed run was handed to the writer.
+fn try_resume_partial_write(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>, now: std::time::Instant) -> bool {
+    use crate::state::QueueHoldKind as K;
+    let window = std::time::Duration::from_millis(crate::agent_write::PARTIAL_EXACT_RESUME_WINDOW_MS);
+    let (r, envelope) = {
+        let h = s.queue_hold.lock().unwrap();
+        let Some(hold) = h.as_ref() else { return false };
+        if hold.kind != K::PartialExact || hold.resuming || now.saturating_duration_since(hold.since) > window {
+            return false;
+        }
+        let (Some(r), Some(env)) = (hold.resume.clone(), hold.envelope) else { return false };
+        (r, env)
+    };
+    let foreign = || {
+        s.input_gen.load(Ordering::Acquire) != r.input_gen
+            || s.inject_track.wrote() != r.wrote
+            || *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()) != r.stamp.human_at
+    };
+    if !r.stamp.epochs_hold(s) || foreign() {
+        return false;
+    }
+    if s.queue_paused_until.lock().unwrap().is_some_and(|t| t > std::time::Instant::now()) {
+        return false;
+    }
+    let axes = MachineHoldAxes { pause: true, quiescing: true, shell: true, modal: true, ..MachineHoldAxes::NONE };
+    if machine_direct_hold(daemon, s, axes).is_some() || approval_or_gate_pending(daemon, s.id) {
+        return false;
+    }
+    let journal = daemon.agent_journal(); // before any queue lock (its first use opens a file)
+    let marker = surface_prompt_marker(s, &load_adapter_defs()).map(|(m, _)| m);
+    let guard = Arc::new(crate::state::InjectGuard::new(
+        None,
+        s.output_gen.clone(),
+        false,
+        Some(resume_safety_probe(daemon, s, r.clone(), marker)),
+    ));
+    let request_id = r.stamp.request.id.clone();
+    let handed = {
+        let _q = s.pending_queue.lock().unwrap();
+        let _gate = s.input_gate.lock().unwrap();
+        // Again inside the gate: a handler send between the checks above and here is foreign input.
+        if foreign() {
+            return false;
+        }
+        {
+            let mut h = s.queue_hold.lock().unwrap();
+            match h.as_mut() {
+                Some(x) if x.request_id == request_id && x.kind == K::PartialExact && !x.resuming && x.resume.is_some() => {
+                    x.resuming = true;
+                }
+                _ => return false,
+            }
+        }
+        // The resumed run ends the line with its own Return: the count goes to zero like the original hand-off's, and a
+        // re-hold restores the held count plus the new prefix. The delivery interval clock is not touched (completion,
+        // not a new delivery) and the reservation keeps the original, claimed guard (disposers keep treating the ids as in
+        // delivery - their prefix is in the composer).
+        let prev_pending = s.pending_input_bytes.load(Ordering::Relaxed);
+        let prev_esc_exempt_pgid = s.take_esc_exempt();
+        s.set_pending_input(0);
+        let at = *s.last_queue_delivery_at.lock().unwrap();
+        let f = InflightInject {
+            guard: Some(guard.clone()),
+            prev_delivery_at: at,
+            set_delivery_at: at,
+            prev_pending,
+            prev_esc_exempt_pgid,
+            pending_gen: s.input_gen.load(Ordering::Acquire),
+            entries: r.entries.clone(),
+        };
+        let job = crate::agent_write::AgentJob {
+            request: r.stamp.request.clone(),
+            plan: crate::agent_write::Plan::paste(&r.d.body).with_submit(400, 0),
+            proof: s.agent_proof(),
+            journal: Some(journal),
+            resume: Some(envelope),
+            settle: Some(queue_write_settle(
+                daemon,
+                s,
+                f.clone(),
+                r.d.clone(),
+                r.receipt.clone(),
+                request_id.clone(),
+                r.forced,
+                r.overdue,
+                r.stamp.clone(),
+            )),
+            guard: Some(guard),
+            note_body: true,
+            body_owner: None,
+        };
+        if s.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
+            // Not handed: undo only the marks that are still mine; the hold keeps its material for the next tick.
+            if s.input_gen.load(Ordering::Acquire) == f.pending_gen && s.pending_input_bytes.load(Ordering::Relaxed) == 0 {
+                s.set_pending_input(prev_pending);
+                s.restore_esc_exempt(prev_esc_exempt_pgid);
+            }
+            if let Some(x) = s.queue_hold.lock().unwrap().as_mut() {
+                x.resuming = false;
+            }
+            false
+        } else {
+            true
+        }
+    };
+    if handed {
+        daemon.bus.publish(
+            "queue.write_resumed",
+            "queue",
+            Some(s.id),
+            json!({"surface_ref": cys::surface_ref(s.id), "request_id": request_id, "entry_ids": r.d.merged_ids,
+                   "body_offset": envelope.body_offset, "since_loss_ms": now.saturating_duration_since(
+                       s.queue_hold.lock().unwrap().as_ref().map(|h| h.since).unwrap_or(now)).as_millis() as u64,
+                   "note": "The same request continues from its byte-exact offset (S4-1): remaining body, closing fence, its own Return - never retyped."}),
+        );
+    }
+    handed
+}
+
+/// ★(0.14.52 · S-a C7b) The resumed run's claim-time probe (writer thread, next to its first byte): the S4-1 premises
+/// again - no writer request since the hold (a request queued ahead of this one has run by now) and the hand-off's
+/// epochs; a broken premise also voids the material, so the re-hold never resumes. Then pause, approval or gate pending,
+/// and a modal or selector on the current frame (those only wait). Not the queue's own probe: that one reads the composer
+/// as occupied, and it holds this request's own prefix by definition.
+fn resume_safety_probe(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    r: Arc<QueueResume>,
+    marker: Option<Vec<String>>,
+) -> crate::state::SafetyProbe {
+    let wd = Arc::downgrade(daemon);
+    let ws = Arc::downgrade(s);
+    std::sync::Arc::new(move || {
+        // Runs on the writer thread: a panic must not escape.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (Some(d), Some(s)) = (wd.upgrade(), ws.upgrade()) else {
+                return true;
+            };
+            if s.inject_track.wrote() != r.wrote || !r.stamp.epochs_hold(&s) {
+                r.void.store(true, Ordering::Release);
+                return true;
+            }
+            if queue_injection_paused(&d, &s) || approval_or_gate_pending(&d, s.id) {
+                return true;
+            }
+            marker.as_deref().is_some_and(|m| obs_modal_foreground(&observe_prompt(&s, m)))
+        }))
+        .unwrap_or(true)
+    })
 }
 
 /// ★(0.14.52 · S-a C7a) A partial-write hold blocks every hand-off of this seat's queue (tick and forced path alike; after a
@@ -9922,6 +10218,8 @@ fn adopt_persisted_write_hold(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surfac
             next_retry: None,
             envelope: Some(envelope),
             notified: true,
+            resume: None,
+            resuming: false,
         });
     }
     let held_secs = (now_epoch() - h.held_at).max(0.0) as u64;
@@ -10292,13 +10590,15 @@ pub(crate) fn deliver_head_locked(
         );
         let request_id = request.id.clone();
         let handle = request.clone();
+        // ★(0.14.52 · S-a C7b) The epochs and last human keystroke this request is written under (S4-1 resume premises).
+        let stamp = HandoffStamp::of(s, request.clone());
         let job = crate::agent_write::AgentJob {
             request,
             plan: crate::agent_write::Plan::paste(&d.body).with_submit(400, 0),
             proof: s.agent_proof(),
             journal: Some(journal),
             resume: None,
-            settle: Some(queue_write_settle(daemon, s, f.clone(), d.clone(), receipt, request_id, forced, overdue)),
+            settle: Some(queue_write_settle(daemon, s, f.clone(), d.clone(), receipt, request_id, forced, overdue, stamp)),
             guard: guard.clone(),
             note_body: true,
             body_owner: None,
@@ -18382,7 +18682,10 @@ mod tests {
         let want: [(&str, usize, usize, usize); 5] = [
             // ★(0.14.52 · S-a C7a) +1 clear: `release_partial_write_hold` - the composer was measured EMPTY at a prompt
             //   boundary, so the Default reset (count, human share and the exempt marker - leaf and mirror) is the truth.
-            ("governance", 4, 2, 1),
+            // ★(0.14.52 · S-a C7b) +2 set: `try_resume_partial_write` - the resumed run's hand-off counts the line as submitted
+            //   and LOWERS the exempt marker (`take_esc_exempt`, as `deliver_head_locked` does); its failed hand-off restores
+            //   count and marker together (`restore_esc_exempt`, the rollback rule). A re-hold restores both in `hold_partial_write`.
+            ("governance", 6, 2, 1),
             // ★(0.14.52 · S-a C5b) +1 clear, +1 apply: the direct agent write's settlement (`DirectSettle::run`) applies the
             //   SAME clear-first reset / accepted-bytes step the handler applied at hand-off - moved to after the terminal.
             ("handlers", 0, 2, 3),
@@ -18927,6 +19230,8 @@ mod tests {
             next_retry,
             envelope: None,
             notified: true,
+            resume: None,
+            resuming: false,
         };
         let soon = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
         *s.queue_hold.lock().unwrap() = Some(hold(crate::state::QueueHoldKind::Refused, soon));
@@ -30036,7 +30341,7 @@ mod h_machine_hold_tests {
         assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["fake::sneaky_producer".to_string()]);
     }
 
-    /// ★(R2F-DM · 성찰 2회차 마스터 결정 D2) **윈도우에서 `ignored`(+사유)로 남기는 검체는 정확히 이 44건이다**(1차 결정 41 + 2차 3 — 아래 ★) — 컴파일에서 빼지 않고(`#[cfg(unix)]`·조기 return 금지) `cfg_attr(not(unix), ignore = "<사유>")` 속성으로 윈도우 보고서에
+    /// ★(R2F-DM · 성찰 2회차 마스터 결정 D2) **윈도우에서 `ignored`(+사유)로 남기는 검체는 정확히 이 50건이다**(1차 결정 41 + 2차 3 + S-a C7b 6 — 아래 ★) — 컴파일에서 빼지 않고(`#[cfg(unix)]`·조기 return 금지) `cfg_attr(not(unix), ignore = "<사유>")` 속성으로 윈도우 보고서에
     /// 사유가 남게 한다(맥·리눅스에는 `ignore` 가 붙지 않는다). 1차의 세 부류: A) `send_settle_tests.rs` 의 윈도우에서 붉던 22건 — S21 제출 정착·창 위 CR 보류는 `cfg!(unix)` 한정(`send_settle_applies`) B) 윈도우 기본 H 마스크가 `draft` 축을 끄는데
     /// (`hold_axes_default(true)` — 순수 검체 `h0_axes_default_by_platform`·`h0_conpty_fixtures` 가 이미 그 값을 고정한다) 유닉스 기본(draft 축) 동작을 보는 17건(h0 4 · h4 3 · h2 9 · c8 1) C) 좌석 명령이 POSIX 셸 문법인 2건.
     /// 이 핀은 **집합이 늘지도 줄지도 않게** 한다 — 나머지 20건(`send_settle_tests.rs` 의 '셸 좌석·윈도우·끔 = 종전 바이트' 음성 대조)은 윈도우에서도 돌아야 하고, [추측]으로 남긴 검체(ConPTY 2 · mtime 2 · ⓐ 추정·연쇄)는 윈도우 재측정 전에
@@ -30044,8 +30349,11 @@ mod h_machine_hold_tests {
     /// ★(R2F-DM 2차 · 윈도우 재측정 뒤 마스터 결정 B3-a) 41 → **44**: D) 좌석 종료를 **reader EOF** 로 아는 경로를 재는 3건 — 윈도우 러너에서 좌석 프로세스가 끝나거나 죽어도 reader 가 EOF 를 보지 못했다
     /// (진단 잡 37201047193 원문 · 대기 10~15초 — 마스터 표로는 같은 커밋의 헬스 실행에서도 같았다). 위의 "[추측] ConPTY 2" 가운데 하나(`q7_process_exit_…`)가 여기로 왔고, 나머지 하나(`read_text_reports_quiet_secs_…`)와 "mtime 2" 는 `ignore` 가 아니라 검체를 결정론으로 고쳤다
     /// (조용한 관측 창 `state::test_until_no_pty_output` · mtime 명시 `Fixture::rewrite`) — 그래서 이 집합에 없다.
+    /// ★(0.14.52 · S-a C7b) 44 → **50**: class C (POSIX seat command) +6 S4-1 resume specimens that record the receiver's bytes
+    /// (`agent_queue_tests`) - the exact-bytes proof needs a raw `cat` receiver; the same behaviour minus the byte comparison
+    /// runs on Windows in the sibling specimens. Test renamed `_of_44` -> `_of_50` (the CI comment in windows-health.yml too).
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_44() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_50() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
@@ -30095,8 +30403,17 @@ mod h_machine_hold_tests {
             ("governance", "q7_process_exit_of_a_role_seat_parks_instead_of_dropping", 'D'),
             ("handlers", "reap_denies_queue_nonempty_then_queue_clear_exited_reclaim", 'D'),
             ("schedule", "c8_handoff_failure_leaves_the_count_untouched", 'D'),
+            // ★(0.14.52 · S-a C7b) class C +6: the S4-1 resume specimens compare the receiver's bytes through a recorder seat
+            //   (`stty raw -echo; exec cat > file`); their non-recorder siblings (window, widening, premises, input during
+            //   the write) still run on Windows.
+            ("agent_queue_tests", "s4_1_a_resumed_run_in_flight_is_never_released_or_announced", 'C'),
+            ("agent_queue_tests", "s4_1_epoch_move_between_the_check_and_the_first_byte_voids_the_resume", 'C'),
+            ("agent_queue_tests", "s4_1_foreign_write_queued_ahead_of_the_resume_voids_it_at_the_first_byte", 'C'),
+            ("agent_queue_tests", "s4_1_mid_body_transient_loss_resumes_and_submits_once", 'C'),
+            ("agent_queue_tests", "s4_1_modal_waits_inside_the_window_then_resumes", 'C'),
+            ("agent_queue_tests", "s4_1_resume_window_edges_are_exact", 'C'),
         ];
-        assert_eq!(want.len(), 44, "결정한 집합은 44건(22 + 17 + 2 + 3)");
+        assert_eq!(want.len(), 50, "결정한 집합은 50건(22 + 17 + 8 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -30123,8 +30440,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 44, "윈도우 `ignore` 가 {}건이다(결정 44건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 44건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 50, "윈도우 `ignore` 가 {}건이다(결정 50건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 50건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 

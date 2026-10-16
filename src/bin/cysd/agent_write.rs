@@ -207,6 +207,8 @@ pub struct Request {
     status: Mutex<Status>,
     /// The producer's settlement closure has returned (or there was none).
     settled: AtomicBool,
+    /// When the receiver proof was last lost (admission or recheck): the S4-1 resume window counts from here.
+    lost_at: Mutex<Option<Instant>>,
 }
 
 impl Request {
@@ -220,6 +222,7 @@ impl Request {
             cancelled: AtomicBool::new(false),
             status: Mutex::new(Status::AcceptedPending),
             settled: AtomicBool::new(false),
+            lost_at: Mutex::new(None),
         })
     }
     /// The terminal is recorded and the producer's settlement has run.
@@ -235,6 +238,13 @@ impl Request {
     }
     pub fn status(&self) -> Status {
         self.status.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    /// The instant of the latest receiver-proof loss of this request (`None` = never lost).
+    pub fn lost_at(&self) -> Option<Instant> {
+        *self.lost_at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn mark_lost(&self) {
+        *self.lost_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
     }
     fn set(&self, s: Status) {
         *self.status.lock().unwrap_or_else(|e| e.into_inner()) = s;
@@ -447,6 +457,7 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
     }
     req.set(Status::Writing);
     if let Err(loss) = job.proof.admit() {
+        req.mark_lost();
         return run.done(run.stop(loss.reason(), loss.resumable()), false);
     }
     let mut proven = true; // the admission just above proves the next call
@@ -479,6 +490,7 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
             }
             if !proven {
                 if let Err(loss) = job.proof.recheck(phase) {
+                    req.mark_lost();
                     // Byte-exact resume point: inside the body (its offset is exact) or before the
                     // first byte of a call. A half-written fence/control/Return is not resumable.
                     let exact = loss.resumable() && (phase == Phase::Body || off == 0);
@@ -641,6 +653,8 @@ impl FileJournal {
     pub fn open_with_limit(path: PathBuf, compact_at: u64) -> std::io::Result<(FileJournal, Vec<Inconclusive>)> {
         let mut open: HashMap<String, String> = HashMap::new();
         let mut order: Vec<String> = Vec::new();
+        // A resumed request (S4-1) writes a second `writing` record after its partial terminal: listed once.
+        let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Ok(text) = std::fs::read_to_string(&path) {
             // A torn last line (crash mid-append) does not parse and is ignored.
             for line in text.lines() {
@@ -648,7 +662,7 @@ impl FileJournal {
                 let Some(id) = v["id"].as_str() else { continue };
                 match v["rec"].as_str() {
                     Some("writing") => {
-                        if open.insert(id.to_string(), line.to_string()).is_none() {
+                        if open.insert(id.to_string(), line.to_string()).is_none() && listed.insert(id.to_string()) {
                             order.push(id.to_string());
                         }
                     }
@@ -1131,6 +1145,32 @@ mod tests {
         let t = run_job_with(&mut w, &j, &mut anchor, &move |_| req.cancel()).terminal;
         assert_eq!(w.bytes(), cys::paste_fence::wrap("short").as_bytes());
         assert!(matches!(t, Terminal::PartialUnknown { envelope, .. } if envelope.closed && !envelope.submitted));
+    }
+
+    /// ★(0.14.52 · S-a C7b) A resumed request writes a second `writing` record after its partial terminal; a crash during
+    /// the resumed run lists it ONCE as inconclusive (and a resumed request that completed is not listed).
+    #[test]
+    fn resumed_request_is_listed_once_by_the_journal() {
+        let dir = std::env::temp_dir().join(format!("cys-aw-journal-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("j.jsonl");
+        let (j, _) = FileJournal::open(path.clone()).unwrap();
+        let open_one = Request::new("r-open".into(), 7, "queue", "d1".into());
+        let done = Request::new("r-done".into(), 7, "queue", "d2".into());
+        let partial = Terminal::PartialExact { envelope: Envelope::default(), accepted: Accepted::default(), reason: "unknown:x".into() };
+        for r in [&open_one, &done] {
+            j.writing(r).unwrap();
+            j.terminal(r, &partial, &Envelope::default()).unwrap();
+            j.writing(r).unwrap(); // the resumed run
+        }
+        let submitted = Terminal::WrittenSubmitted { accepted: Accepted::default() };
+        j.terminal(&done, &submitted, &Envelope::default()).unwrap();
+        drop(j);
+        let (_, inconclusive) = FileJournal::open(path).unwrap();
+        let ids: Vec<&str> = inconclusive.iter().map(|i| i.id.as_str()).collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(ids, vec!["r-open"]);
     }
 
     /// A resumed request already owns composer bytes: a failed admission is never RefusedNoWrite.

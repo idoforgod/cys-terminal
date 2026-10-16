@@ -1061,9 +1061,13 @@ pub struct QueueHold {
     pub envelope: Option<crate::agent_write::Envelope>,
     /// The episode's single notice was published.
     pub notified: bool,
+    /// ★(0.14.52 · S-a C7b) PartialExact only: what the SAME request needs to continue (S4-1). Taken by the resume
+    /// hand-off; `None` after a restart (no resume across a restart) and for every other kind.
+    pub resume: Option<Arc<crate::governance::QueueResume>>,
+    /// ★(0.14.52 · S-a C7b) A resumed run of this request is in the writer: no second resume, no notice, no release.
+    pub resuming: bool,
 }
 
-/// Refused-hold retry backoff (design 4.6): 1, 2, 4, 8, then 30 seconds.
 /// ★(0.14.52 · S-a C7a) A partial-write hold as persisted across a daemon restart (`queue-write-holds.json`, keyed by
 /// every held queue entry id). Without it a restart restores the entries and hands them off again onto the composer that
 /// already holds their prefix (retype - the double-delivery direction). Never carries body text.
@@ -1095,6 +1099,7 @@ pub(crate) fn load_write_holds(dir: &std::path::Path) -> HashMap<String, Persist
     map
 }
 
+/// Refused-hold retry backoff (design 4.6): 1, 2, 4, 8, then 30 seconds.
 pub const QUEUE_HOLD_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 30];
 
 pub fn queue_hold_backoff(attempts: u32) -> std::time::Duration {
@@ -1196,6 +1201,9 @@ pub struct InjectTrack {
     /// ★(0.14.42 · 수정 2회차 F1 · 재개) 보류한 제출 CR — [`WithheldSubmit`]. 쓰기 = writer 의 보류 탐침(적중 시) · 소비·폐기 =
     /// watchdog 틱의 재제출(`governance::resubmit_withheld_submits`). leaf 락(다른 락을 쥔 채 잡지 않는다).
     withheld: Mutex<Option<WithheldSubmit>>,
+    /// ★(0.14.52 · S-a C7b) Writer requests that wrote at least one byte to this seat (any arm). A held partial write
+    /// resumes only while this is unchanged since its hold (S4-1 "no foreign input since the loss").
+    wrote: AtomicU64,
 }
 
 /// ★(0.14.42 · 수정 2회차 F1 · 재개) 쓰지 않은(보류한) 제출 CR 의 기록 — 보류는 **버림이 아니라 미룸**이다. 창이 닫히고
@@ -1414,6 +1422,16 @@ impl InjectTrack {
         let norm = normalize_input_text(text);
         *self.last_body.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(MachineBody { norm, owner, at: Instant::now() });
+    }
+
+    /// ★(0.14.52 · S-a C7b) writer only - this request put at least one byte on the PTY.
+    pub(crate) fn note_wrote(&self) {
+        self.wrote.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// ★(0.14.52 · S-a C7b) Writer requests that wrote at least one byte so far ([`InjectTrack::note_wrote`]).
+    pub(crate) fn wrote(&self) -> u64 {
+        self.wrote.load(Ordering::Acquire)
     }
 
     /// ★(R3SH-1) 마지막 기계 본문 기록(없으면 None).
@@ -1936,6 +1954,10 @@ pub struct Surface {
     /// when an agent is registered/observed, recovers or exits, so a body held for one agent never
     /// binds to the next. C8 replaces it with the receiver binding epoch.
     pub agent_epoch: AtomicU64,
+    /// ★(0.14.52 · S-a C7b) Conversation counter for S4-1 "same conversation epoch": bumped with every agent_epoch bump
+    /// and when the seat's agent session is re-pinned after `/clear` (`usage.session_repinned`). Only a claude `/clear`
+    /// re-pin is observed as a conversation change; C8's receiver binding replaces this proxy.
+    pub conversation_epoch: AtomicU64,
     /// ★(0.14.31 · WP-5 폭주 완충) 이 surface 의 **마지막 큐 배달 시각** — 틱·overdue·강제·
     /// rehome 어느 경로든 `deliver_head_locked` 가 인계에 성공한 순간 찍는다(같은 시계). 호출부
     /// 게이트가 `governance::queue_min_interval_secs()`(기본 10s) 미만이면 배달을 보류한다.
@@ -2229,6 +2251,12 @@ impl Surface {
     /// ★(0.14.52 · S-a C5b) A new agent incarnation on this seat (see [`Surface::agent_epoch`]).
     pub fn bump_agent_epoch(&self) {
         self.agent_epoch.fetch_add(1, Ordering::AcqRel);
+        self.bump_conversation_epoch(); // a new agent is a new conversation
+    }
+
+    /// ★(0.14.52 · S-a C7b) A new conversation on this seat (see [`Surface::conversation_epoch`]).
+    pub fn bump_conversation_epoch(&self) {
+        self.conversation_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
     /// ★(0.14.52 · S-a) The proof an agent write to this seat uses now (pass-through until bound).
@@ -6731,6 +6759,7 @@ impl Daemon {
             receiver_proof: Mutex::new(None),
             submit_assoc: Mutex::new(crate::submit_assoc::AssociationTable::default()),
             agent_epoch: AtomicU64::new(0),
+            conversation_epoch: AtomicU64::new(0),
             last_queue_delivery_at: Mutex::new(None),
             pending_input_stale: Mutex::new(None),
             last_injected: Mutex::new(None),
@@ -7637,6 +7666,7 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
                     .unwrap_or_else(|_| crate::agent_write::Executed::panicked(&job))
                 };
                 if let (Some(t), true) = (&track, began) {
+                    t.note_wrote();
                     if !body_noted && job.note_body {
                         if let Some(body) = ex.accepted_body(&job.plan) {
                             t.note_body(&body, job.body_owner);
@@ -7655,6 +7685,11 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
                 continue;
             }
         };
+        // ★(0.14.52 · S-a C7b) Every arm that reaches here attempted a write (a withheld Return and an unclaimed Inject
+        //   `continue` above without a byte): counted even when it failed, since a failed write may have put bytes.
+        if let Some(t) = &track {
+            t.note_wrote();
+        }
         if res.is_err() {
             break; // PTY 닫힘 — 이후 send는 disconnected로 호출자에 드러난다
         }
