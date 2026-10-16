@@ -665,7 +665,15 @@ fn u43_lock_cost_arm() {
             "observer_hold": rec_arrays(&sink.hold, w0, "v", None),
             "observer_tick": rec_arrays(&sink.tick, w0, "v", Some("slept_ns")),
             "observer_seat": rec_arrays(&sink.seat, w0, "v", Some("slept_ns")),
-            "reader": rec_arrays(&sink.reader, w0, "lock_wait_ns", Some("chunk_ns")),
+            // (parenthesised: inside json! a bare `{` would start a JSON object)
+            "reader": ({
+                let mut r = rec_arrays(&sink.reader, w0, "lock_wait_ns", Some("chunk_ns"));
+                // U4-3 R2 attribution: reader thread CPU time per chunk (null = no per-thread clock), index-aligned with chunk_ns.
+                if let Some(m) = r.as_object_mut() {
+                    m.insert("chunk_cpu_ns".into(), json!(sink.reader_cpu.iter().map(|c| c.map(ns)).collect::<Vec<_>>()));
+                }
+                r
+            }),
             "attach_snapshot": {
                 "unit": "ns", "n": attach_recs.len(),
                 "t_ns": attach_recs.iter().map(|r| rel(r.at, w0)).collect::<Vec<_>>(),

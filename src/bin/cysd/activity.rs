@@ -17,8 +17,11 @@
 //!   enforces the lease itself, so a stalled observer still expires Working.
 //!
 //! What this module must never do (four fatal risks, design §6): change a queue / delivery / clear /
-//! cycle / recovery decision, write to a PTY, send a message, block on a parser/roster/queue lock,
-//! hold any lock while classifying or sleeping, or persist Working across a restart. Unknown is not a
+//! cycle / recovery decision, write to a PTY, send a message, block on a parser or queue lock,
+//! hold any lock while classifying or sleeping, or persist Working across a restart. (The roster lock
+//! `daemon.surfaces` IS taken blocking, once per tick, only to clone the seat `Arc`s, and the record
+//! store is pruned with `retain` over the roster — O(records × seats); only the observer thread can wait
+//! there. Seat locks — parser, meta, observation, session, status — are `try_lock` and a busy one skips.) Unknown is not a
 //! failure signal and triggers nothing. Rollback / OFF arm: `CYS_DISPLAY_ACTIVITY=0` (the thread is not
 //! started and every seat serializes Unknown).
 
@@ -604,6 +607,9 @@ pub(crate) mod bench {
         pub tick: Vec<Rec>,
         /// at = just before `surf.parser.lock()`, a = lock wait, b = critical section (chunk processing).
         pub reader: Vec<Rec>,
+        /// U4-3 R2 attribution: the reader thread's CPU time inside the same critical section (index-aligned with `reader`;
+        /// None where the platform has no per-thread CPU clock).
+        pub reader_cpu: Vec<Option<Duration>>,
         pub pty: Vec<PtyWrite>,
         /// sleeps performed by the SLEEP knob while ENABLED (= sleeping classifications).
         pub sleeps: u64,
@@ -652,6 +658,7 @@ pub(crate) mod bench {
             seat: Vec::with_capacity(observer),
             tick: Vec::with_capacity(ticks),
             reader: Vec::with_capacity(reader),
+            reader_cpu: Vec::with_capacity(reader),
             pty: Vec::with_capacity(pty),
             sleeps: 0,
         };
@@ -721,10 +728,36 @@ pub(crate) mod bench {
         }
     }
 
-    /// reader: t0 = just before `surf.parser.lock()`, t1 = acquired, t2 = end of the critical section.
-    pub(crate) fn reader(sid: u64, t0: Instant, t1: Instant, t2: Instant) {
+    /// reader: t0 = just before `surf.parser.lock()`, t1 = acquired, t2 = end of the critical section;
+    /// cpu = this thread's CPU time between t1 and t2 (U4-3 R2 attribution: wall - cpu = time off-CPU while holding the lock).
+    pub(crate) fn reader(sid: u64, t0: Instant, t1: Instant, t2: Instant, cpu: Option<Duration>) {
         if on() {
-            with(|s| s.reader.push(Rec { at: t0, sid, a: t1.duration_since(t0), b: t2.duration_since(t1) }));
+            with(|s| {
+                s.reader.push(Rec { at: t0, sid, a: t1.duration_since(t0), b: t2.duration_since(t1) });
+                s.reader_cpu.push(cpu);
+            });
+        }
+    }
+
+    /// U4-3 R2: the calling thread's CPU time (unix `CLOCK_THREAD_CPUTIME_ID`) — only while the bench is enabled, so a
+    /// disabled bench adds no clock read. None on other platforms or on a clock error.
+    pub(crate) fn thread_cpu_if_on() -> Option<Duration> {
+        if !on() {
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            // SAFETY: `ts` is a valid, writable timespec; the clock id is a constant supported on macOS (10.12+) and Linux.
+            let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+            if rc == 0 && ts.tv_sec >= 0 && ts.tv_nsec >= 0 {
+                return Some(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32));
+            }
+            None
+        }
+        #[cfg(not(unix))]
+        {
+            None
         }
     }
 
@@ -813,7 +846,7 @@ pub(crate) fn sample_frame(family: Family, frame: &Frame, grammars: &[&dyn Gramm
         return (Sample::Transient(Transient::Incomplete), None);
     }
     let text = frame.text_rows();
-    let view = View { rows: &text, size: (frame.rows, frame.cols), cursor: frame.cursor, alt: frame.alt, title: &frame.title };
+    let view = View { rows: &text, cursor: frame.cursor, title: &frame.title };
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| classify_with(family, &view, grammars)))
         .unwrap_or((Sample::Semantic(Semantic::AdapterPanic), None))
 }
@@ -872,9 +905,7 @@ pub(crate) fn collect(s: &Surface, frame: &mut Frame) -> Collected {
 /// What a frame looks like to the bounded classifier — text rows (after unlock) plus geometry.
 pub(crate) struct View<'a> {
     pub rows: &'a [(u16, String)],
-    pub size: (u16, u16),
     pub cursor: (u16, u16),
-    pub alt: bool,
     /// OSC window title (not an editable region: a draft cannot change it).
     pub title: &'a str,
 }

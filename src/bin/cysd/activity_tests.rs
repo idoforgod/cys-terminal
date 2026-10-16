@@ -279,7 +279,7 @@ fn view_of(lines: &[&str]) -> Vec<(u16, String)> {
 
 fn classify_lines(fam: Family, lines: &[&str]) -> Sample {
     let rows = view_of(lines);
-    let v = View { rows: &rows, size: (24, 80), cursor: (0, 0), alt: false, title: "" };
+    let v = View { rows: &rows, cursor: (0, 0), title: "" };
     classify_with(fam, &v, &grammars_t()).0
 }
 
@@ -324,7 +324,7 @@ fn production_registry_has_corpus_grammars_only_and_none_for_gemini() {
     assert_eq!(fams, vec![Family::Claude, Family::Codex]);
     // gemini/agy: no captured working frame yet (live-seat observation only) → Unknown, never a fabricated grammar.
     let rows = vec![(0u16, "> ".to_string())];
-    let v = View { rows: &rows, size: (24, 80), cursor: (0, 0), alt: false, title: "anything" };
+    let v = View { rows: &rows, cursor: (0, 0), title: "anything" };
     assert_eq!(classify_with(Family::Gemini, &v, grammars()).0, Sample::Semantic(Semantic::UnsupportedFamily));
 }
 
@@ -530,7 +530,7 @@ fn published_only_admission_accepts_even_unequal_endpoints() {
         assert_ne!(s.output_gen.load(Ordering::Acquire), before, "endpoints differed");
         assert!(matches!(got, Collected::Frame), "tick {tick}: even/even unequal must be admitted");
         let text = frame.text_rows();
-        let v = View { rows: &text, size: (frame.rows, frame.cols), cursor: frame.cursor, alt: frame.alt, title: &frame.title };
+        let v = View { rows: &text, cursor: frame.cursor, title: &frame.title };
         let (sample, _) = classify_with(Family::Claude, &v, &grammars_t());
         // make each tick's frame distinct so U4-2 cannot interfere
         let sample = match sample {
@@ -909,6 +909,8 @@ fn production_resize_path_bumps_the_view_even_at_the_same_size() {
 /// Behavioural bindings exist for set_meta, quiesce-on and resize; this pin binds the rest
 /// (unix re-observation, Windows staging, Windows second-sample commit, session capture, clear repin,
 /// reader parser replacement).
+/// LIMIT (verification-device weakness, U gate R1 minor 10): the pin matches the NAMED lines only — a NEW identity writer
+/// added elsewhere is invisible to it (an independent grep at 4aa679db found no unguarded writer; a later one needs a census).
 #[test]
 fn u4_4_identity_census_every_named_production_site_is_guarded() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
@@ -994,8 +996,9 @@ fn frame_of(rows: &[(u16, &str)], cursor: (u16, u16), title: &str) -> (Vec<(u16,
     (rows.iter().map(|(i, l)| (*i, l.to_string())).collect(), cursor, title.to_string())
 }
 
-fn prod(fam: Family, f: &(Vec<(u16, String)>, (u16, u16), String), cols: u16) -> Sample {
-    let v = View { rows: &f.0, size: (24, cols), cursor: f.1, alt: fam == Family::Codex, title: &f.2 };
+fn prod(fam: Family, f: &(Vec<(u16, String)>, (u16, u16), String), _cols: u16) -> Sample {
+    // (`_cols`: the View no longer carries geometry — View.size/View.alt were never read by a grammar; R2 minor 11)
+    let v = View { rows: &f.0, cursor: f.1, title: &f.2 };
     classify_with(fam, &v, grammars()).0
 }
 
@@ -1368,7 +1371,7 @@ mod corpus_replay {
             return true;
         }
         let text = frame.text_rows();
-        let v = View { rows: &text, size: (frame.rows, frame.cols), cursor: frame.cursor, alt: frame.alt, title: &frame.title };
+        let v = View { rows: &text, cursor: frame.cursor, title: &frame.title };
         let complete = |g: &&&dyn Grammar| matches!(g.classify(&v), Verdict::Active { .. } | Verdict::Idle | Verdict::Decision(_));
         let own_nomatch = grammars().iter().find(|g| g.family() == fam).is_some_and(|g| g.classify(&v) == Verdict::NoMatch);
         own_nomatch && !grammars().iter().filter(|g| g.family() != fam).any(|g| complete(&g))
