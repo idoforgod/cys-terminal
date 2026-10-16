@@ -1824,7 +1824,7 @@ pub struct Surface {
     pub exited_at: Mutex<Option<Instant>>,
     /// PTY 쓰기는 전용 writer 스레드만 수행 — async 경로는 유한 채널 try_send.
     /// 정체된 pane의 블로킹 write가 tokio 워커·watchdog을 멈추는 경로를 원천 차단한다.
-    pub write_tx: std::sync::mpsc::SyncSender<WriteReq>,
+    pub write_tx: crate::writer_gate::WriterSender,
     pub master: Mutex<Box<dyn MasterPty + Send>>,
     pub child: Mutex<Box<dyn Child + Send + Sync>>,
     pub parser: Mutex<vt100::Parser>,
@@ -3140,8 +3140,8 @@ pub fn count_dsr_queries(tail: &[u8], chunk: &[u8]) -> (usize, Vec<u8>) {
 /// 의미를 구현한다. 반환 true=송신 성공 / false=deadline 소진 또는 수신자 소멸(드롭 — 호출자가
 /// 카운터·로그로 가시화할 책임). **유계 보증**: 최악에도 deadline + 슬라이스 1회분 안에 반환
 /// 한다 — reader 스레드의 '배수 절대 정지 금지' 계약을 깨지 않는다.
-pub fn send_write_req_bounded(
-    tx: &std::sync::mpsc::SyncSender<WriteReq>,
+pub(crate) fn send_write_req_bounded(
+    tx: &impl crate::writer_gate::WriteAdmission,
     req: WriteReq,
     deadline: std::time::Duration,
 ) -> bool {
@@ -3149,7 +3149,7 @@ pub fn send_write_req_bounded(
     let start = Instant::now();
     let mut req = req;
     loop {
-        match tx.try_send(req) {
+        match tx.admit(req) {
             Ok(()) => return true,
             // 수신자 소멸(writer 스레드 종료) — 재시도 무의미, 즉시 드롭.
             Err(TrySendError::Disconnected(_)) => return false,
@@ -6671,7 +6671,7 @@ impl Daemon {
         // 영구 잔존 → recv()가 영영 반환 않고 writer 스레드·PTY writer fd가 누수된다.
         // writer_stop을 reader 스레드(EOF)가 세우면 recv_timeout 루프가 이를 보고 종료해
         // 좀비 writer 스레드와 그 fd를 즉시 회수한다.
-        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<WriteReq>(128);
+        let (write_tx, write_rx) = crate::writer_gate::WriterSender::channel(128);
         let writer_stop = Arc::new(AtomicBool::new(false));
         let inject_track = Arc::new(InjectTrack::default());
         {
@@ -7560,9 +7560,9 @@ pub(crate) fn run_writer_loop<W: Write>(
 /// [`run_writer_loop`] 에 Inject arm 진행 표식([`InjectTrack`])을 붙인 판 — 프로덕션 좌석이 쓴다. 표식은 arm 의
 /// 첫 바이트 앞에서 세우고 마지막 바이트(CR) 뒤에 내린다(인계 가드가 포기한 요청은 세우지 않는다 = 한 바이트도 안 씀).
 /// 바이트·순서·지연은 [`run_writer_loop`] 와 같다(표식은 원자·leaf 락 쓰기뿐).
-pub(crate) fn run_writer_loop_tracked<W: Write>(
+pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::QueuedWrite>>(
     mut writer: W,
-    write_rx: std::sync::mpsc::Receiver<WriteReq>,
+    write_rx: std::sync::mpsc::Receiver<R>,
     stop: Arc<AtomicBool>,
     track: Option<Arc<InjectTrack>>,
 ) {
@@ -7579,6 +7579,8 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
             }
             Err(RecvTimeoutError::Disconnected) => break, // 모든 sender drop
         };
+        // The lease spans every arm, flush and Agent terminal settlement, including early exits.
+        let (req, _operation) = req.into().into_parts();
         let res = match req {
             WriteReq::Data(bytes) => writer.write_all(&bytes).and_then(|_| writer.flush()),
             // ★B2: 최소 간격 확보용 지연 쓰기. 단일 소비자라 이 sleep 동안 뒤 요청은 채널에
