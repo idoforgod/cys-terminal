@@ -782,3 +782,104 @@ fn s4_1_a_resumed_run_in_flight_is_never_released_or_announced() {
     assert!(events(&fx, "queue.write_released").is_empty(), "released while the writer was completing it");
     assert!(events(&fx, "queue.write_held").is_empty(), "announced while the writer was completing it");
 }
+
+// ─── ★(0.14.52 · S-a C7c) design 4.6 reconciliation listing (read-only RPC `queue.reconciliation`) ─────────────────────
+
+fn reconciliation(fx: &Fx, params: Value) -> Value {
+    let req = cys::Request { id: Value::from(1), method: "queue.reconciliation".into(), params };
+    match crate::handlers::dispatch(&fx.daemon, req, Some(std::process::id())) {
+        crate::handlers::Reply::Single(v) => {
+            assert_eq!(v["ok"], Value::from(true), "{v}");
+            v["result"].clone()
+        }
+        _ => panic!("single reply"),
+    }
+}
+
+/// ★Design 4.6: every partial write is listed with id, proof class, byte bounds, reason, age and action owner - and never
+/// its body text; a request held on a seat (and persisted for a restart) is one row, not two.
+#[test]
+fn reconciliation_lists_partial_writes_with_bounds_and_never_body_text() {
+    let fx = fx("recon-rows");
+    let exact = seat(&fx);
+    let since = hold_exact(&fx, &exact, &"SECRET-DIRECTIVE exact ".repeat(400), 1);
+    let unknown = seat(&fx);
+    *unknown.receiver_proof.lock().unwrap() = Some(Scripted::new(0, ProofLoss::AgentDead, Some((1, ProofLoss::AgentDead))));
+    let unknown_id = enqueue(&fx, &unknown, &"SECRET-DIRECTIVE unknown ".repeat(400));
+    assert!(hand_off(&fx, &unknown));
+    assert_eq!(hold_kind(&unknown), Some(QueueHoldKind::PartialUnknown), "premise");
+    assert!(fx.daemon.write_holds.lock().unwrap().len() >= 2, "premise: both holds are persisted too");
+    let r = reconciliation(&fx, serde_json::json!({}));
+    let text = r.to_string();
+    assert!(!text.contains("SECRET-DIRECTIVE"), "body text in the listing: {text}");
+    let rows = r["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "one row per request: {r}");
+    assert_eq!(r["total"], Value::from(2));
+    assert!(r["next_cursor"].is_null());
+    let by_kind = |k: &str| rows.iter().find(|x| x["kind"] == k).unwrap_or_else(|| panic!("no {k} row: {r}")).clone();
+    let e = by_kind("partial_exact");
+    assert_eq!(e["surface_ref"], Value::from(cys::surface_ref(exact.id)));
+    assert_eq!(e["source"], "seat_hold");
+    assert_eq!(e["bytes"]["body_offset"], Value::from(crate::agent_write::MAX_CALL_BYTES as u64));
+    assert!(e["bytes"]["body_bytes"].as_u64().unwrap() > 4096);
+    assert_eq!(e["bytes"]["submitted"], Value::from(false));
+    assert_eq!(e["proof_class"], "bound", "a seat with a receiver proof");
+    assert_eq!(e["action_owner"], "lane_master");
+    assert!(e["request_id"].as_str().is_some_and(|x| !x.is_empty()));
+    assert!(e["reason"].as_str().unwrap().starts_with("unknown:"));
+    assert!(e["age_secs"].as_u64().unwrap() <= since.elapsed().as_secs() + 1);
+    assert!(e["resolution"].as_str().is_some_and(|x| x.contains("composer")));
+    let u = by_kind("partial_unknown");
+    assert_eq!(u["entry_ids"], Value::from(vec![unknown_id]));
+    assert_eq!(u["resumable"], Value::from(false));
+    // The seat filter.
+    let one = reconciliation(&fx, serde_json::json!({"surface_id": exact.id}));
+    assert_eq!(one["rows"].as_array().unwrap().len(), 1);
+}
+
+/// ★Design 4.6: 100 rows per page with a cursor (a larger limit is clamped); pages are disjoint and cover every row,
+/// including persisted holds no seat has adopted and an earlier run's inconclusive journal record.
+#[test]
+fn reconciliation_pages_100_rows_with_a_cursor() {
+    let fx = fx("recon-pages");
+    {
+        let mut w = fx.daemon.write_holds.lock().unwrap();
+        for i in 0..150 {
+            let h = crate::state::PersistedWriteHold {
+                kind: "partial_unknown".into(),
+                reason: "daemon_restart:test".into(),
+                request_id: format!("req-{i:03}"),
+                entry_ids: vec![format!("W-{i:03}")],
+                body_offset: 7,
+                held_at: crate::state::now_epoch() - 60.0,
+            };
+            w.insert(format!("W-{i:03}"), h);
+        }
+    }
+    fx.daemon.writer_inconclusive.lock().unwrap().push(crate::agent_write::Inconclusive {
+        id: "req-journal".into(),
+        surface: 9_999,
+        origin: "queue".into(),
+        digest: "d".repeat(64),
+    });
+    let p1 = reconciliation(&fx, serde_json::json!({"limit": 1000}));
+    assert_eq!(p1["limit"], Value::from(100), "limit not clamped to 100");
+    assert_eq!(p1["total"], Value::from(151));
+    let rows1 = p1["rows"].as_array().unwrap().clone();
+    assert_eq!(rows1.len(), 100);
+    let cursor = p1["next_cursor"].as_str().expect("a next page").to_string();
+    let p2 = reconciliation(&fx, serde_json::json!({"cursor": cursor}));
+    let rows2 = p2["rows"].as_array().unwrap().clone();
+    assert_eq!(rows2.len(), 51);
+    assert!(p2["next_cursor"].is_null());
+    let mut ids: Vec<String> = rows1.iter().chain(rows2.iter()).map(|x| x["request_id"].as_str().unwrap().to_string()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 151, "pages overlap or miss rows");
+    let j = rows2.iter().chain(rows1.iter()).find(|x| x["request_id"] == "req-journal").expect("journal row");
+    assert_eq!(j["source"], "journal_inconclusive");
+    assert_eq!(j["kind"], "inconclusive");
+    let p = rows1.iter().chain(rows2.iter()).find(|x| x["request_id"] == "req-000").expect("persisted row");
+    assert_eq!(p["source"], "persisted");
+    assert!(p["age_secs"].as_u64().unwrap() >= 59);
+}

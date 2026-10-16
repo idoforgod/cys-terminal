@@ -10187,6 +10187,104 @@ fn resume_safety_probe(
     })
 }
 
+/// What happens to a listed partial write, and what the lane master can do (design 4.6 action owner; head condition on Q2).
+pub(crate) const RECONCILIATION_RESOLUTION: &str = "Automatic: a partial_exact write may resume inside 30 s of its proof loss; otherwise the item is \
+released as undelivered (never retyped) at the first queue tick (every 5 s) once the seat's composer is measured empty at a prompt \
+boundary. Lane master: clear or submit that seat's composer; the next tick then releases the item and the queue resumes with the next one.";
+
+/// ★(0.14.52 · S-a C7c · design 4.6) The reconciliation listing's rows, each `(page key, row)` sorted by key: every partial
+/// write the daemon knows of - a seat's held partial (`seat_hold`), a persisted hold no seat has adopted yet (`persisted`,
+/// after a restart), and a request an earlier daemon run left `writing` without a terminal (`journal_inconclusive`). One row
+/// per request. Ids, proof class, byte bounds, reason, age and action owner only - never body text. Read-only.
+pub(crate) fn reconciliation_rows(daemon: &Arc<Daemon>, filter_sid: Option<u64>) -> Vec<(String, Value)> {
+    use crate::state::QueueHoldKind as K;
+    // The journal is opened once so an earlier run's inconclusive records are known (its first use opens the file).
+    let _ = daemon.agent_journal();
+    let mut rows: Vec<(String, Value)> = Vec::new();
+    let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let key = |sid: u64, request_id: &str, source: &str| format!("{sid:020}|{request_id}|{source}");
+    let mut surfaces: Vec<Arc<crate::state::Surface>> = daemon.surfaces.lock().unwrap().values().cloned().collect();
+    surfaces.sort_by_key(|s| s.id);
+    for s in &surfaces {
+        let Some(h) = s.queue_hold.lock().unwrap().clone() else { continue };
+        let kind = match h.kind {
+            K::PartialExact => "partial_exact",
+            K::PartialUnknown => "partial_unknown",
+            K::Refused => continue,
+        };
+        listed.insert(h.request_id.clone());
+        if filter_sid.is_some_and(|f| f != s.id) {
+            continue;
+        }
+        let env = h.envelope.unwrap_or_default();
+        let proof_class = if s.receiver_proof.lock().unwrap().is_some() { "bound" } else { "unbound" };
+        rows.push((
+            key(s.id, &h.request_id, "seat_hold"),
+            json!({
+                "source": "seat_hold", "request_id": h.request_id, "surface_id": s.id, "surface_ref": cys::surface_ref(s.id),
+                "role": s.role.lock().unwrap().clone(), "kind": kind, "entry_ids": h.entry_ids, "proof_class": proof_class,
+                "bytes": {"body_offset": env.body_offset, "body_bytes": h.resume.as_ref().map(|r| r.d.body.len()),
+                          "fence_opened": env.opened, "fence_closed": env.closed, "submitted": env.submitted},
+                "reason": h.reason, "age_secs": h.since.elapsed().as_secs(), "resuming": h.resuming,
+                "resumable": h.kind == K::PartialExact && h.resume.is_some(),
+                "action_owner": "lane_master", "resolution": RECONCILIATION_RESOLUTION,
+            }),
+        ));
+    }
+    let persisted: Vec<crate::state::PersistedWriteHold> = {
+        let w = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<crate::state::PersistedWriteHold> = Vec::new();
+        for h in w.values() {
+            if !v.iter().any(|x| x.request_id == h.request_id) {
+                v.push(h.clone());
+            }
+        }
+        v
+    };
+    for p in persisted {
+        if !listed.insert(p.request_id.clone()) {
+            continue;
+        }
+        // Where its entries wait now: a live seat's queue, else the restored queue (not yet rehomed).
+        let at = surfaces
+            .iter()
+            .find(|s| s.pending_queue.lock().unwrap().iter().any(|e| p.entry_ids.contains(&e.id)))
+            .map(|s| s.id);
+        if filter_sid.is_some() && at != filter_sid {
+            continue;
+        }
+        rows.push((
+            key(at.unwrap_or(0), &p.request_id, "persisted"),
+            json!({
+                "source": "persisted", "request_id": p.request_id, "surface_id": at, "surface_ref": at.map(cys::surface_ref),
+                "kind": p.kind, "entry_ids": p.entry_ids, "proof_class": "unbound",
+                "bytes": {"body_offset": p.body_offset, "body_bytes": Value::Null},
+                "reason": p.reason, "age_secs": (now_epoch() - p.held_at).max(0.0) as u64, "resumable": false,
+                "action_owner": "lane_master", "resolution": RECONCILIATION_RESOLUTION,
+            }),
+        ));
+    }
+    let inconclusive = daemon.writer_inconclusive.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for i in inconclusive {
+        if !listed.insert(i.id.clone()) || filter_sid.is_some_and(|f| f != i.surface) {
+            continue;
+        }
+        rows.push((
+            key(i.surface, &i.id, "journal_inconclusive"),
+            json!({
+                "source": "journal_inconclusive", "request_id": i.id, "surface_id": i.surface,
+                "surface_ref": cys::surface_ref(i.surface), "kind": "inconclusive", "origin": i.origin, "digest": i.digest,
+                "proof_class": "unbound", "bytes": Value::Null,
+                "reason": "an earlier daemon run left this write without a terminal record (amount unknown, never replayed)",
+                "age_secs": Value::Null, "resumable": false, "action_owner": "lane_master",
+                "resolution": "Never replayed. Lane master: decide whether the work was completed, superseded or must be re-sent as a new request.",
+            }),
+        ));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
 /// ★(0.14.52 · S-a C7a) A partial-write hold blocks every hand-off of this seat's queue (tick and forced path alike; after a
 /// restart there is no reservation, only the adopted hold).
 pub(crate) fn partial_write_held(s: &crate::state::Surface) -> bool {

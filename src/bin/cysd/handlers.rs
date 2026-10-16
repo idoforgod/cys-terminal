@@ -11128,6 +11128,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             Reply::Single(ok_response(&id, status))
         }
 
+        // ─── ★(0.14.52 · S-a C7c · design 4.6) reconciliation listing — read-only, 100 rows per page with a cursor ───
+        // Rows: held partial writes, persisted holds not yet adopted, earlier-run inconclusive journal records
+        // (`governance::reconciliation_rows`). Ids, proof class, byte bounds, reason, age and action owner - never body text.
+        "queue.reconciliation" => {
+            let filter_sid = resolve_surface_id(&params);
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).clamp(1, 100) as usize;
+            let cursor = params.get("cursor").and_then(|v| v.as_str()).map(str::to_string);
+            let rows = crate::governance::reconciliation_rows(daemon, filter_sid);
+            let total = rows.len();
+            let mut page: Vec<(String, Value)> =
+                rows.into_iter().filter(|(k, _)| cursor.as_deref().is_none_or(|c| k.as_str() > c)).take(limit + 1).collect();
+            let more = page.len() > limit;
+            page.truncate(limit);
+            let next_cursor = if more { page.last().map(|(k, _)| k.clone()) } else { None };
+            let rows: Vec<Value> = page.into_iter().map(|(_, v)| v).collect();
+            Reply::Single(ok_response(&id, json!({"rows": rows, "next_cursor": next_cursor, "total": total, "limit": limit})))
+        }
+
         // ─── T4-15 짝 기능: 미배달 큐 검사·철회 ───
         "queue.list" => {
             let filter_sid = resolve_surface_id(&params);
