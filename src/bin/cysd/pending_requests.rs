@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError, Weak};
 use std::sync::atomic::{AtomicBool,Ordering};
 
-const SCHEMA: u32 = 4;
+const SCHEMA: u32 = 5;
+#[path = "pending_attempts.rs"]
+pub(crate) mod attempts;
 const DATA: &str = "pending-requests.json";
 const TEMP: &str = ".pending-requests.json.tmp";
 const LOCK: &str = ".pending-requests.lock";
@@ -182,7 +184,11 @@ impl fmt::Debug for SettlementReceipt {
 struct Settled { order:u64, receipt:SettlementReceipt }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Row { record:PendingRecord, terminal:Option<TerminalRecord>, settled:Option<Settled> }
+struct Row {
+    record:PendingRecord, terminal:Option<TerminalRecord>, settled:Option<Settled>,
+    #[serde(default,skip_serializing_if="Option::is_none")]
+    attempts:Option<attempts::AttemptLedger>,
+}
 /// Bounds are explicit at the registry-enabled opener, not inferred after admission.
 #[derive(Clone,Copy,Debug)]
 pub(crate) struct RegistryLimits {
@@ -461,7 +467,7 @@ impl PendingStore {
         }
         validate_record(&record)?;
         check_raw_record_size(&record,self.limits.max_record_bytes)?;
-        let row=Row { record,terminal:None,settled:None };
+        let row=Row { record,terminal:None,settled:None,attempts:None };
         checked_row_charge(&row,self.limits)?;
         let mut candidate=(*state.rows).clone();
         candidate.insert(id.clone(),row);
@@ -745,14 +751,21 @@ fn checked_row_charge(row:&Row,l:Limits)->Result<usize,StoreError> {
         validate_settlement_pair(terminal,&s.receipt)?;
         validate_settlement(&s.receipt,l)?;
     }
+    attempts::validate_ledger(row,l)?;
     let actual=encode_limited(row,l.max_record_bytes)?.len();
     if row.settled.is_some() { return Ok(actual); }
     #[derive(Serialize)]
-    struct Bare<'a> { record:&'a PendingRecord, terminal:Option<()>, settled:Option<()> }
-    let bare=encode_limited(&Bare { record:&row.record,terminal:None,settled:None },l.max_record_bytes)?.len();
+    struct Bare<'a> {
+        record:&'a PendingRecord, terminal:Option<()>, settled:Option<()>,
+        #[serde(skip_serializing_if="Option::is_none")]
+        attempts:Option<&'a attempts::AttemptLedger>,
+    }
+    let bare=encode_limited(&Bare { record:&row.record,terminal:None,settled:None,attempts:row.attempts.as_ref() },l.max_record_bytes)?.len();
     let selected=selection_charge(&row.record,l)?;
+    let attempt_extra=attempts::reserved_extra(row,l)?;
     let charged=bare.checked_sub(8).and_then(|n|n.checked_add(l.max_terminal_bytes))
         .and_then(|n|n.checked_add(l.max_settlement_bytes)).and_then(|n|n.checked_add(selected))
+        .and_then(|n|n.checked_add(attempt_extra))
         .ok_or(StoreError::Capacity("row reserve overflow"))?;
     if charged>l.max_record_bytes { return Err(StoreError::Capacity("reserved row bytes")); }
     if actual>charged { return Err(StoreError::Invalid("row exceeds reserved form")); }
@@ -833,7 +846,7 @@ fn load_image(path:&Path,l:Limits,registry_limits:Option<RegistryLimits>)->Resul
     if bytes.len()>l.max_file_bytes { return Err(StoreError::Capacity("disk bytes")); }
     let value:serde_json::Value=serde_json::from_slice(&bytes).map_err(|_|StoreError::Invalid("persisted JSON"))?;
     let snapshot=match value.get("schema").and_then(serde_json::Value::as_u64) {
-        Some(4)=>serde_json::from_value::<Snapshot>(value).map_err(|_|StoreError::Invalid("schema 4 shape"))?,
+        Some(version) if version==u64::from(SCHEMA)=>serde_json::from_value::<Snapshot>(value).map_err(|_|StoreError::Invalid("snapshot shape"))?,
         _=>return Err(StoreError::Invalid("schema")),
     };
     if snapshot.next_request_seq==0 || snapshot.next_settle_seq==0 { return Err(StoreError::Invalid("zero counter")); }
@@ -1182,7 +1195,7 @@ impl fmt::Debug for NewProtocolSpec {
 #[derive(Debug)]
 pub(crate) enum ProtocolError {
     Store(StoreError),Authority(String),RecoveredOnly,RevisionChanged,Conflict,
-    Missing,Inactive,Unsupported,NeedsExistingRequest,Lease(LeaseError),
+    Missing,Inactive,Unsupported,NeedsExistingRequest,SelectionRequired,AttemptOutstanding,Lease(LeaseError),
 }
 impl From<StoreError> for ProtocolError { fn from(e:StoreError)->Self { Self::Store(e) } }
 impl From<LeaseError> for ProtocolError { fn from(e:LeaseError)->Self { Self::Lease(e) } }
@@ -1430,7 +1443,7 @@ impl PendingStore {
             lineage:RecordLineage::Protocol { data:protocol },original_body_digest:spec.original_body_digest,
             received_epoch_ms:spec.received_epoch_ms,plan:exact };
         validate_record(&record)?;protocol_registry_reference(&record,&state.registry)?;
-        let row=Row { record,terminal:None,settled:None };checked_row_charge(&row,self.limits)?;
+        let row=Row { record,terminal:None,settled:None,attempts:None };checked_row_charge(&row,self.limits)?;
         let digest=row.record.original_body_digest.clone();let surface_id=row.record.target.surface_id;
         let mut rows=(*state.rows).clone();rows.insert(id.clone(),row);
         let mut registry=state.registry.clone();let ns=state.next_settle_seq;
@@ -1734,7 +1747,7 @@ mod tests {
     #[test]
     fn file_pressure_prunes_only_settled_history() {
         let scratch=Scratch::new("bytecap");let base=limits();
-        let row=Row { record:spec("same").into_record("wb-1".into()),terminal:None,settled:None };
+        let row=Row { attempts:None, record:spec("same").into_record("wb-1".into()),terminal:None,settled:None };
         let charged=checked_row_charge(&row,base).unwrap();
         let header=serde_json::to_vec(&Snapshot { schema:SCHEMA,next_request_seq:u64::MAX,next_settle_seq:u64::MAX,rows:vec![],registry:RegistryImage { next_registration_seq:u64::MAX,..RegistryImage::default() } }).unwrap().len();
         let l=Limits { max_record_bytes:charged,max_file_bytes:charged+header,
@@ -1850,7 +1863,7 @@ mod tests {
     #[test]
     fn duplicate_id_and_bad_counter_are_rejected_without_overwrite() {
         for mode in ["duplicate","counter"] {
-            let scratch=Scratch::new(mode);let row=Row { record:spec("x").into_record("wb-3".into()),terminal:None,settled:None };
+            let scratch=Scratch::new(mode);let row=Row { attempts:None, record:spec("x").into_record("wb-3".into()),terminal:None,settled:None };
             let rows=if mode=="duplicate" { vec![row.clone(),row] } else { vec![row] };
             let next=if mode=="duplicate" { 4 } else { 3 };
             let bytes=serde_json::to_vec(&Snapshot { schema:SCHEMA,next_request_seq:next,next_settle_seq:1,rows,registry:RegistryImage::default() }).unwrap();
@@ -1969,7 +1982,7 @@ mod tests {
             for valid in [false,true] {
                 let scratch=Scratch::new("load-settlement");
                 let kind=if valid { SettlementKind::ExplicitUndelivered } else { SettlementKind::ProducerSettled };
-                let row=Row { record:spec("loaded").into_record("wb-1".into()),
+                let row=Row { attempts:None, record:spec("loaded").into_record("wb-1".into()),
                     terminal:Some(terminal("wb-1",reason)),
                     settled:Some(Settled { order:1,receipt:settlement(kind,501) }) };
                 let bytes=serde_json::to_vec(&Snapshot { schema:SCHEMA,next_request_seq:2,next_settle_seq:2,rows:vec![row],registry:RegistryImage::default() }).unwrap();
@@ -2333,7 +2346,7 @@ mod tests {
 
 fn protocol_row_data() -> Row {
     let plan=Plan::paste("private body\n한글").with_clear(37).with_submit(421,159);
-    Row { record:PendingRecord {
+    Row { attempts:None, record:PendingRecord {
         request_id:"wb-1".into(),registration_id:Some("registration-fixture".into()),
         obligation_id:"logical-original".into(),source:SourceRef { kind:SourceKind::Direct,
             ids:vec!["source-z".into(),"source-a".into()] },
@@ -2684,4 +2697,341 @@ fn c8protocol_postinstall_error_cannot_mint_not_written_resolution() {
     assert!(matches!(store.current_revision(&current,1),Err(ProtocolError::Store(StoreError::UncertainCommit))));
     let disk:Snapshot=serde_json::from_slice(&fs::read(scratch.0.join(DATA)).unwrap()).unwrap();assert_eq!(protocol_data(&disk.rows[0]).revision,2);
 }
+
+// Real store + writer IO/receipt tests; caller/native authority is the explicitly
+// synthetic upstream fixture used by the preceding protocol controls.
+fn attempt_limits()->attempts::AttemptLimits { attempts::AttemptLimits { max_records:3,max_record_bytes:8192,diagnostic_preview_bytes:64 } }
+fn attempt_store_limits()->Limits { Limits { max_record_bytes:65536,max_file_bytes:1048576,max_recent_bytes:196608,..limits() } }
+fn attempt_current(store:&PendingStore,cap:&Arc<RegisteredCatalog>,plan:Plan)->Arc<CurrentRequest> {
+    let mut spec=denied_protocol_spec();spec.plan=plan;
+    spec.ingress.intent=if spec.plan.exact_view().control.is_some() {InputIntent::AgentControl}else{InputIntent::AgentText};
+    spec.ingress.submit=if spec.plan.owns_submit() { SubmitContract::OwnedAtAdmission }
+        else if spec.ingress.intent==InputIntent::AgentControl { SubmitContract::NotApplicable }
+        else { SubmitContract::SelfContainedInBody };
+    let grant=FixtureIngressGrant { facts:FixtureIngressFacts::of(&spec),registration:cap.clone() };
+    let current=store.accept_protocol(spec,cap,grant,ProtocolLimits { max_selected_lineage_bytes:2048 }).unwrap();
+    store.select_initial_lineage(&current,1,current.request().reserve_zero_write_edit().unwrap(),fixture_selection(store,&current,1)).unwrap();current
+}
+fn attempt_revision(store:&PendingStore,current:&Arc<CurrentRequest>)->u64 {
+    match store.inspect_exact_record(current.id()).unwrap().lineage { RecordLineage::Protocol { data }=>data.revision,_=>panic!("protocol") }
+}
+fn attempt_prepare(store:&Arc<PendingStore>,current:&Arc<CurrentRequest>,resume:Option<crate::agent_write::Envelope>)->attempts::PreparedAttempt {
+    let lease=current.request().reserve_attempt(current.plan(),resume).unwrap();
+    store.prepare_attempt(current,attempt_revision(store,current),lease,resume,attempt_limits()).unwrap()
+}
+fn attempt_execute<W:std::io::Write>(writer:&mut W,job:&crate::agent_write::AgentJob)->crate::agent_write::Executed {
+    let mut last=None;let mut first=||{};let mut body=|_:&str|{};
+    let mut io=crate::agent_write::WriterIo { sleep:&|_|{},last_program_write:&mut last,on_first_byte:&mut first,on_body_written:&mut body };
+    crate::agent_write::execute(writer,job,&mut io)
+}
+struct AttemptRefusal;
+impl crate::agent_write::Proof for AttemptRefusal {
+    fn admit(&self)->Result<(),crate::receiver::ProofLoss>{Err(crate::receiver::ProofLoss::Unknown("fixture retry".into()))}
+    fn recheck(&self,_:crate::agent_write::Phase)->Result<(),crate::receiver::ProofLoss>{self.admit()}
+}
+struct AttemptCut(std::sync::atomic::AtomicUsize);
+impl crate::agent_write::Proof for AttemptCut {
+    fn admit(&self)->Result<(),crate::receiver::ProofLoss>{self.0.store(0,Ordering::SeqCst);Ok(())}
+    fn recheck(&self,_:crate::agent_write::Phase)->Result<(),crate::receiver::ProofLoss>{
+        if self.0.fetch_add(1,Ordering::SeqCst)==0 { Err(crate::receiver::ProofLoss::Unknown("fixture exact cut".into())) } else { Ok(()) }
+    }
+}
+#[test]
+fn c8attempt_real_writer_commits_exact_start_and_outcome_before_source_closure() {
+    use crate::agent_write::{self,PassThrough,Terminal};
+    let scratch=Scratch::new("attempt-complete");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();
+    let current=attempt_current(&store,&cap,Plan::paste("body 한글").with_submit(0,0));let p=attempt_prepare(&store,&current,None);let journal=p.journal();
+    let rows=store.attempt_summaries(current.id()).unwrap();assert_eq!(rows.len(),1);assert_eq!(rows[0].phase,attempts::AttemptPhase::Prepared);
+    let job=p.into_job(Arc::new(PassThrough)).unwrap();let expected=job.plan.planned_bytes();let mut written=Vec::new();let ex=attempt_execute(&mut written,&job);
+    assert_eq!(store.attempt_summaries(current.id()).unwrap()[0].phase,attempts::AttemptPhase::Writing);
+    assert!(matches!(agent_write::finish(job,&ex),Terminal::WrittenSubmitted{..}));assert_eq!(written,expected);
+    let rows=store.attempt_summaries(current.id()).unwrap();assert_eq!(rows[0].outcome,Some(attempts::OutcomeKind::WrittenSubmitted));
+    assert!(rows[0].native.unwrap().envelope.submitted&&journal.has_stored_outcome());
+    assert!(store.inspect_settlement(current.id()).unwrap().is_none(),"writer completion is not durable source settlement");
+}
+#[test]
+fn c8attempt_wrong_plan_and_legacy_journal_entry_cannot_create_writing() {
+    use crate::agent_write::{self,PassThrough,Journal,Terminal,Envelope};
+    let scratch=Scratch::new("attempt-context");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned").with_submit(0,0));
+    let p=attempt_prepare(&store,&current,None);let journal=p.journal();assert!(journal.writing(current.request()).is_err());
+    assert!(journal.terminal(current.request(),&Terminal::WrittenSubmitted { accepted:Default::default() },&Envelope::default()).is_err());
+    let mut job=p.into_job(Arc::new(PassThrough)).unwrap();let original=job.plan.clone();job.plan=Plan::raw("different").with_submit(0,0);
+    let mut written=Vec::new();let ex=attempt_execute(&mut written,&job);assert!(matches!(ex.terminal,Terminal::PartialUnknown{..})&&written.is_empty());
+    assert_eq!(store.attempt_summaries(current.id()).unwrap()[0].phase,attempts::AttemptPhase::Prepared);
+    job.plan=original;let ex=attempt_execute(&mut written,&job);assert!(matches!(agent_write::finish(job,&ex),Terminal::WrittenSubmitted{..}));assert_eq!(written,b"owned\r");
+}
+#[test]
+fn c8attempt_partial_chain_preserves_first_anchor_and_reclaims_only_consumed_history() {
+    use crate::agent_write::{self,Terminal};
+    let scratch=Scratch::new("attempt-resume");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let body="x".repeat(10000);
+    let current=attempt_current(&store,&cap,Plan::raw(&body).with_submit(0,0));let proof=Arc::new(AttemptCut(std::sync::atomic::AtomicUsize::new(0)));
+    let mut written=Vec::new();let mut resume=None;let mut numbers=Vec::new();
+    for _ in 0..4 {
+        let p=attempt_prepare(&store,&current,resume);numbers.push(p.number());let job=p.into_job(proof.clone()).unwrap();
+        let ex=attempt_execute(&mut written,&job);let envelope=ex.envelope;let terminal=agent_write::finish(job,&ex);
+        match terminal { Terminal::PartialExact { .. }=>resume=Some(envelope),Terminal::WrittenSubmitted { .. }=>{resume=None;break},other=>panic!("unexpected {other:?}") }
+    }
+    assert!(resume.is_none());assert_eq!(numbers,vec![1,2,3,4]);assert_eq!(written,[body.as_bytes(),b"\r"].concat());
+    let summaries=store.attempt_summaries(current.id()).unwrap();assert_eq!(summaries.iter().map(|r|r.number).collect::<Vec<_>>(),vec![1,3,4]);
+    let disk:serde_json::Value=serde_json::from_slice(&fs::read(scratch.0.join(DATA)).unwrap()).unwrap();
+    assert_eq!(disk["rows"][0]["attempts"]["first_partial"],1);assert_eq!(disk["rows"][0]["attempts"]["next_number"],5);
+    assert_eq!(summaries.last().unwrap().native.unwrap().accepted_total,10001);
+}
+#[test]
+fn c8attempt_many_no_write_retries_keep_one_request_and_monotonic_attempt_ids() {
+    use crate::agent_write::{self,Terminal};
+    let scratch=Scratch::new("attempt-retries");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned").with_submit(0,0));let id=current.id().to_owned();
+    let mut written=Vec::new();for number in 1..=10 {
+        let p=attempt_prepare(&store,&current,None);assert_eq!(p.number(),number);let job=p.into_job(Arc::new(AttemptRefusal)).unwrap();
+        let ex=attempt_execute(&mut written,&job);assert!(matches!(agent_write::finish(job,&ex),Terminal::RefusedNoWrite{..}));
+    }
+    assert!(written.is_empty());assert_eq!(current.id(),id);assert_eq!(store.inventory().unwrap().len(),1);
+    assert_eq!(store.attempt_summaries(current.id()).unwrap().iter().map(|r|r.number).collect::<Vec<_>>(),vec![8,9,10]);
+}
+#[test]
+fn c8attempt_failed_writing_and_outcome_retry_never_reexecute_or_release_implicitly() {
+    use crate::agent_write::{self,PassThrough,Terminal,LeaseError};
+    let scratch=Scratch::new("attempt-io-refusal");let disk=Arc::new(SwitchDisk { fail:AtomicBool::new(false) });
+    let store=Arc::new(PendingStore::open_registry_with(&scratch.0,11,attempt_store_limits(),Some(registry_limits()),disk.clone()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned").with_submit(0,0));
+    let p=attempt_prepare(&store,&current,None);let journal=p.journal();let job=p.into_job(Arc::new(PassThrough)).unwrap();disk.fail.store(true,Ordering::Release);
+    let mut written=Vec::new();let ex=attempt_execute(&mut written,&job);assert!(matches!(agent_write::finish(job,&ex),Terminal::RefusedNoWrite{..}));
+    assert!(written.is_empty()&&!journal.has_stored_outcome());assert_eq!(store.attempt_summaries(current.id()).unwrap()[0].phase,attempts::AttemptPhase::Prepared);
+    disk.fail.store(false,Ordering::Release);journal.retry_outcome().unwrap();assert!(journal.has_stored_outcome());assert!(written.is_empty());
+    assert_eq!(store.attempt_summaries(current.id()).unwrap()[0].outcome,Some(attempts::OutcomeKind::RefusedNoWrite));
+    assert!(matches!(current.request().reserve_attempt(current.plan(),None),Err(LeaseError::Busy)),"receipt retry must not silently grant another execution");
+}
+#[test]
+fn c8attempt_completed_bytes_with_failed_receipt_are_retained_without_duplicate_body() {
+    use crate::agent_write::{self,PassThrough,Terminal};
+    struct FailAfterWrite { bytes:Vec<u8>,disk:Arc<SwitchDisk> }
+    impl std::io::Write for FailAfterWrite {
+        fn write(&mut self,b:&[u8])->io::Result<usize>{self.bytes.extend_from_slice(b);self.disk.fail.store(true,Ordering::Release);Ok(b.len())}
+        fn flush(&mut self)->io::Result<()>{Ok(())}
+    }
+    let scratch=Scratch::new("attempt-late-receipt");let disk=Arc::new(SwitchDisk { fail:AtomicBool::new(false) });
+    let store=Arc::new(PendingStore::open_registry_with(&scratch.0,11,attempt_store_limits(),Some(registry_limits()),disk.clone()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned").with_submit(0,0));
+    let p=attempt_prepare(&store,&current,None);let journal=p.journal();let job=p.into_job(Arc::new(PassThrough)).unwrap();let mut writer=FailAfterWrite { bytes:Vec::new(),disk:disk.clone() };
+    let ex=attempt_execute(&mut writer,&job);assert!(matches!(ex.terminal,Terminal::WrittenSubmitted{..}));
+    assert!(matches!(agent_write::finish(job,&ex),Terminal::PartialUnknown{..}));assert_eq!(writer.bytes,b"owned\r");
+    assert_eq!(store.attempt_summaries(current.id()).unwrap()[0].phase,attempts::AttemptPhase::Writing);
+    disk.fail.store(false,Ordering::Release);journal.retry_outcome().unwrap();journal.retry_outcome().unwrap();
+    assert_eq!(writer.bytes,b"owned\r");assert_eq!(store.attempt_summaries(current.id()).unwrap()[0].outcome,Some(attempts::OutcomeKind::WrittenSubmitted));
+    assert!(matches!(current.request().status(),agent_write::Status::Terminal(Terminal::PartialUnknown{..})),"storage retry cannot silently change the logical reconciliation disposition");
+}
+#[test]
+fn c8attempt_restart_restores_records_as_data_and_cannot_restore_the_old_journal() {
+    use crate::agent_write::{self,PassThrough};
+    let scratch=Scratch::new("attempt-reopen");let current;let journal;let bytes;
+    {
+        let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+        let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();current=attempt_current(&store,&cap,Plan::raw("owned").with_submit(0,0));
+        let p=attempt_prepare(&store,&current,None);journal=p.journal();let job=p.into_job(Arc::new(PassThrough)).unwrap();let mut writer=Vec::new();let ex=attempt_execute(&mut writer,&job);agent_write::finish(job,&ex);
+        bytes=fs::read(scratch.0.join(DATA)).unwrap();
+    }
+    assert!(journal.retry_outcome().is_err());
+    let reopened=PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap();
+    assert!(reopened.attempt_summaries(current.id()).unwrap()[0].recovered);assert!(reopened.try_mutation().unwrap().current_requests.is_empty());
+    assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),bytes);
+}
+#[test]
+fn c8attempt_completion_size_is_funded_before_prepare() {
+    let scratch=Scratch::new("attempt-funding");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned").with_submit(0,0));
+    let before=fs::read(scratch.0.join(DATA)).unwrap();let lease=current.request().reserve_attempt(current.plan(),None).unwrap();
+    let small=attempts::AttemptLimits { max_records:3,max_record_bytes:2048,diagnostic_preview_bytes:512 };
+    assert!(matches!(store.prepare_attempt(&current,2,lease,None,small),Err(ProtocolError::Store(StoreError::Capacity("unfunded attempt completion")))));
+    assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),before);assert!(store.attempt_summaries(current.id()).unwrap().is_empty());
+    assert!(current.request().native_progress().proven_zero());let valid=attempt_prepare(&store,&current,None);assert_eq!(valid.number(),1);
+}
+#[test]
+fn c8attempt_zero_byte_transport_error_retains_the_actual_call_count() {
+    use crate::agent_write::{self,PassThrough,Terminal};
+    struct Broken;
+    impl std::io::Write for Broken {fn write(&mut self,_:&[u8])->io::Result<usize>{Err(io::ErrorKind::BrokenPipe.into())}fn flush(&mut self)->io::Result<()>{Ok(())}}
+    let scratch=Scratch::new("attempt-zero-transport");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned").with_submit(0,0));
+    let p=attempt_prepare(&store,&current,None);let journal=p.journal();let job=p.into_job(Arc::new(PassThrough)).unwrap();let ex=attempt_execute(&mut Broken,&job);
+    assert!(matches!(agent_write::finish(job,&ex),Terminal::RefusedNoWrite{..}));let rows=store.attempt_summaries(current.id()).unwrap();
+    assert!(journal.has_stored_outcome());assert_eq!(rows[0].accepted.unwrap().calls,1);assert_eq!(rows[0].native.unwrap().accepted_total,0);
+}
+
+#[test]
+fn c8attempt_previous_prototype_schema_is_not_silently_migrated() {
+    let scratch=Scratch::new("attempt-schema4");
+    let old=serde_json::to_vec(&Snapshot { schema:4,next_request_seq:1,next_settle_seq:1,rows:vec![],registry:RegistryImage::default() }).unwrap();
+    write_private(&scratch.0.join(DATA),&old);
+    for _ in 0..2 {
+        assert!(matches!(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()),Err(StoreError::Invalid("schema"))));
+        assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),old);
+    }
+}
+fn attempt_byte_pressure_retries(label:&str,store_limits:Limits) {
+    use crate::agent_write::{self,Terminal};
+    let scratch=Scratch::new(label);let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,store_limits,registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned").with_submit(0,0));
+    let limits=attempts::AttemptLimits { max_records:64,..attempt_limits() };let mut written=Vec::new();
+    for number in 1..=64 {
+        let lease=current.request().reserve_attempt(current.plan(),None).unwrap();
+        let result=store.prepare_attempt(&current,attempt_revision(&store,&current),lease,None,limits);
+        let p=result.unwrap_or_else(|e|panic!("reclaimable consumed attempt blocked retry {number}: {e:?}"));
+        assert_eq!(p.number(),number);let job=p.into_job(Arc::new(AttemptRefusal)).unwrap();
+        let ex=attempt_execute(&mut written,&job);assert!(matches!(agent_write::finish(job,&ex),Terminal::RefusedNoWrite{..}));
+    }
+    assert!(written.is_empty());let rows=store.attempt_summaries(current.id()).unwrap();
+    assert!(rows.len()<64,"fixture must reach byte pressure before count pressure");assert_eq!(rows.last().unwrap().number,64);
+    assert_eq!(store.inventory().unwrap().len(),1);
+}
+#[test]
+fn c8attempt_row_bytes_reclaim_consumed_history_before_count_limit() {
+    attempt_byte_pressure_retries("attempt-row-pressure",Limits { max_record_bytes:20480,..attempt_store_limits() });
+}
+#[test]
+fn c8attempt_file_bytes_reclaim_consumed_history_before_count_limit() {
+    attempt_byte_pressure_retries("attempt-file-pressure",Limits { max_file_bytes:65536,..attempt_store_limits() });
+}
+#[test]
+fn c8attempt_revision_headroom_is_reserved_before_prepare_or_native_bytes() {
+    use crate::agent_write::{self,PassThrough,Terminal};
+    for (revision,allowed) in [(u64::MAX-2,false),(u64::MAX-3,true)] {
+        let scratch=Scratch::new("attempt-revision");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+        let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned").with_submit(0,0));
+        { let mut state=store.try_mutation().unwrap();let mut rows=(*state.rows).clone();
+          let RecordLineage::Protocol { data }=&mut rows.get_mut(current.id()).unwrap().record.lineage else {unreachable!()};data.revision=revision;
+          let mut registry=state.registry.clone();let nr=state.next_request_seq;let ns=state.next_settle_seq;
+          let bytes=prune_and_encode(&mut rows,nr,ns,store.limits,None,&mut registry,store.registry_limits).unwrap();
+          store.commit(&mut state,rows,nr,ns,registry,&bytes).unwrap(); }
+        let before=fs::read(scratch.0.join(DATA)).unwrap();let lease=current.request().reserve_attempt(current.plan(),None).unwrap();
+        let result=store.prepare_attempt(&current,revision,lease,None,attempt_limits());
+        if allowed {
+            let job=result.unwrap().into_job(Arc::new(PassThrough)).unwrap();let mut written=Vec::new();let ex=attempt_execute(&mut written,&job);
+            assert!(matches!(agent_write::finish(job,&ex),Terminal::WrittenSubmitted{..}));assert_eq!(written,b"owned\r");
+            assert_eq!(attempt_revision(&store,&current),u64::MAX);assert_eq!(store.attempt_summaries(current.id()).unwrap()[0].phase,attempts::AttemptPhase::Outcome);
+        } else {
+            assert!(matches!(result,Err(ProtocolError::Store(StoreError::Capacity("request revision exhausted")))),"Prepared admitted without Writing+Outcome revision headroom");
+            assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),before);assert!(current.request().native_progress().proven_zero());
+            assert!(current.request().reserve_attempt(current.plan(),None).is_ok());
+        }
+    }
+}
+
+#[test]
+fn c8attempt_byte_pressure_cannot_erase_latest_conclusive_result() {
+    use crate::agent_write::{self,Terminal};
+    let scratch=Scratch::new("attempt-protected-capacity");let limits=Limits { max_record_bytes:16384,..attempt_store_limits() };
+    let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,limits,registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned").with_submit(0,0));
+    let p=attempt_prepare(&store,&current,None);let job=p.into_job(Arc::new(AttemptRefusal)).unwrap();let mut written=Vec::new();let ex=attempt_execute(&mut written,&job);
+    assert!(matches!(agent_write::finish(job,&ex),Terminal::RefusedNoWrite{..}));let before=fs::read(scratch.0.join(DATA)).unwrap();
+    let lease=current.request().reserve_attempt(current.plan(),None).unwrap();let result=store.prepare_attempt(&current,attempt_revision(&store,&current),lease,None,attempt_limits());
+    assert!(matches!(result,Err(ProtocolError::Store(StoreError::Capacity(_)))),"capacity pressure erased the latest conclusive result");
+    assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),before);let rows=store.attempt_summaries(current.id()).unwrap();
+    assert_eq!(rows.len(),1);assert_eq!(rows[0].outcome,Some(attempts::OutcomeKind::RefusedNoWrite));assert!(!rows[0].consumed);
+    assert!(written.is_empty()&&current.request().native_progress().proven_zero());
+}
+#[test]
+fn c8attempt_persisted_progress_and_chain_are_checked_against_actual_plan() {
+    use crate::agent_write::{self,Terminal};
+    let scratch=Scratch::new("attempt-corruption-source");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw(&"x".repeat(10000)).with_submit(0,0));
+    let p=attempt_prepare(&store,&current,None);let job=p.into_job(Arc::new(AttemptCut(std::sync::atomic::AtomicUsize::new(0)))).unwrap();
+    let mut written=Vec::new();let ex=attempt_execute(&mut written,&job);let from=ex.envelope;assert!(matches!(agent_write::finish(job,&ex),Terminal::PartialExact{..}));
+    let _next=attempt_prepare(&store,&current,Some(from));let original:serde_json::Value=serde_json::from_slice(&fs::read(scratch.0.join(DATA)).unwrap()).unwrap();
+    let mut accepted=Vec::new();
+    for case in ["body-bound","unfinished-success","self-parent","parent-progress","missing-anchor","unconsumed-old","highwater-gap"] {
+        let mut image=original.clone();let ledger=&mut image["rows"][0]["attempts"];
+        // Test terminal projection independently of the live-parent cross-check.
+        if matches!(case,"body-bound"|"unfinished-success") {
+            ledger["entries"].as_object_mut().unwrap().remove("2");ledger["next_number"]=2.into();ledger["entries"]["1"]["consumed"]=false.into();
+        }
+        match case {
+            "body-bound"=>{ledger["entries"]["1"]["outcome"]["envelope"]["body_offset"]=10001.into();ledger["entries"]["1"]["outcome"]["native"]["envelope"]["body_offset"]=10001.into();},
+            "unfinished-success"=>{ledger["entries"]["1"]["outcome"]["kind"]="written_submitted".into();ledger["entries"]["1"]["outcome"]["envelope"]["submitted"]=true.into();ledger["entries"]["1"]["outcome"]["native"]["envelope"]["submitted"]=true.into();ledger["first_partial"]=serde_json::Value::Null;},
+            "self-parent"=>ledger["entries"]["2"]["resume_parent"]=2.into(),
+            "parent-progress"=>{ledger["entries"]["2"]["before"]["accepted_total"]=4095.into();ledger["entries"]["2"]["before"]["envelope"]["body_offset"]=4095.into();ledger["entries"]["2"]["before"]["run_accepted"]["payload"]=4095.into();ledger["entries"]["2"]["resume"]["body_offset"]=4095.into();},
+            "missing-anchor"=>ledger["first_partial"]=serde_json::Value::Null,
+            "unconsumed-old"=>ledger["entries"]["1"]["consumed"]=false.into(),
+            "highwater-gap"=>ledger["next_number"]=4.into(),
+            _=>unreachable!(),
+        }
+        let bad=Scratch::new(case);let bytes=serde_json::to_vec(&image).unwrap();write_private(&bad.0.join(DATA),&bytes);
+        for _ in 0..2 {
+            if !matches!(PendingStore::open_with_registry(&bad.0,11,attempt_store_limits(),registry_limits()),Err(StoreError::Invalid(_))) {accepted.push(case);}
+            assert_eq!(fs::read(bad.0.join(DATA)).unwrap(),bytes);
+        }
+    }
+    assert!(accepted.is_empty(),"persisted impossible progress accepted: {accepted:?}");
+}
+
+#[test]
+fn c8attempt_projection_accepts_all_legal_plan_shapes_and_partial_phases() {
+    use crate::agent_write::{self,PassThrough,Terminal};
+    for plan in [Plan::raw(""),Plan::raw("body"),Plan::paste(""),Plan::paste("한글").with_clear(0).with_submit(0,0),Plan::control(vec![]),Plan::control(vec![27,91,65])] {
+        let scratch=Scratch::new("attempt-plan-shape");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+        let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let expected=plan.planned_bytes();let submit=plan.owns_submit();let current=attempt_current(&store,&cap,plan);
+        let p=attempt_prepare(&store,&current,None);let journal=p.journal();let job=p.into_job(Arc::new(PassThrough)).unwrap();let mut written=Vec::new();let ex=attempt_execute(&mut written,&job);
+        let terminal=agent_write::finish(job,&ex);assert!(matches!(terminal,Terminal::WrittenBody{..}|Terminal::WrittenSubmitted{..}),"legal plan rejected: {terminal:?}");
+        assert_eq!(matches!(terminal,Terminal::WrittenSubmitted{..}),submit);assert_eq!(written,expected);assert!(journal.has_stored_outcome());
+    }
+    struct PartialPhase(Vec<u8>);
+    impl std::io::Write for PartialPhase {
+        fn write(&mut self,b:&[u8])->io::Result<usize>{if self.0.is_empty(){self.0.push(b[0]);Ok(1)}else{Err(io::ErrorKind::BrokenPipe.into())}}
+        fn flush(&mut self)->io::Result<()>{Ok(())}
+    }
+    for plan in [Plan::paste("body"),Plan::control(vec![27,91,65])] {
+        let scratch=Scratch::new("attempt-partial-phase");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+        let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,plan);
+        let p=attempt_prepare(&store,&current,None);let journal=p.journal();let job=p.into_job(Arc::new(PassThrough)).unwrap();let mut writer=PartialPhase(Vec::new());let ex=attempt_execute(&mut writer,&job);
+        assert!(matches!(agent_write::finish(job,&ex),Terminal::PartialUnknown{..}));assert_eq!(writer.0.len(),1);assert!(journal.has_stored_outcome(),"partial fence/control lower bound must remain recordable");
+        assert_eq!(store.attempt_summaries(current.id()).unwrap()[0].native.unwrap().accepted_total,1);
+    }
+}
+
+#[test]
+fn c8attempt_another_requests_start_receipt_cannot_advance_this_journal() {
+    use crate::agent_write::{self,PassThrough,Terminal};
+    let scratch=Scratch::new("attempt-foreign-start");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();
+    let a=attempt_current(&store,&cap,Plan::raw("same"));let b=attempt_current(&store,&cap,Plan::raw("same"));
+    let pa=attempt_prepare(&store,&a,None);let pb=attempt_prepare(&store,&b,None);let mut job=pa.into_job(Arc::new(PassThrough)).unwrap();job.journal=Some(pb.journal());
+    let mut written=Vec::new();let ex=attempt_execute(&mut written,&job);assert!(matches!(ex.terminal,Terminal::RefusedNoWrite{..}));
+    assert!(written.is_empty(),"another request's start authorized native bytes");
+    assert_eq!(store.attempt_summaries(b.id()).unwrap()[0].phase,attempts::AttemptPhase::Prepared,"foreign start advanced journal");
+    agent_write::finish(job,&ex);
+}
+#[test]
+fn c8attempt_another_requests_zero_byte_terminal_cannot_close_this_journal() {
+    use crate::agent_write::{self,PassThrough,Terminal};
+    let scratch=Scratch::new("attempt-foreign-outcome");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();
+    let a=attempt_current(&store,&cap,Plan::raw("same"));let b=attempt_current(&store,&cap,Plan::raw("same"));
+    let pa=attempt_prepare(&store,&a,None);let pb=attempt_prepare(&store,&b,None);let journal=pb.journal();let mut job=pa.into_job(Arc::new(PassThrough)).unwrap();job.journal=Some(journal.clone());
+    a.request().cancel();let mut written=Vec::new();let ex=attempt_execute(&mut written,&job);assert!(matches!(ex.terminal,Terminal::CancelledBeforeWrite));agent_write::finish(job,&ex);
+    assert!(written.is_empty());assert_eq!(store.attempt_summaries(b.id()).unwrap()[0].phase,attempts::AttemptPhase::Prepared,"foreign zero-byte completion closed another attempt");
+    assert!(!journal.has_stored_outcome());assert!(journal.retry_outcome().is_err(),"foreign receipt was retained as this journal's completion");
+}
+
+#[test]
+fn c8attempt_resumed_writing_failure_can_record_unchanged_prior_prefix() {
+    use crate::agent_write::{self,PassThrough,Terminal,LeaseError,Accepted};
+    let scratch=Scratch::new("attempt-resumed-io-refusal");let disk=Arc::new(SwitchDisk { fail:AtomicBool::new(false) });
+    let store=Arc::new(PendingStore::open_registry_with(&scratch.0,11,attempt_store_limits(),Some(registry_limits()),disk.clone()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("attempt")).unwrap();let current=attempt_current(&store,&cap,Plan::raw(&"x".repeat(10000)).with_submit(0,0));
+    let p=attempt_prepare(&store,&current,None);let job=p.into_job(Arc::new(AttemptCut(std::sync::atomic::AtomicUsize::new(0)))).unwrap();
+    let mut written=Vec::new();let first=attempt_execute(&mut written,&job);let prefix=first.envelope;assert!(matches!(agent_write::finish(job,&first),Terminal::PartialExact{..}));let before=written.clone();
+    let p=attempt_prepare(&store,&current,Some(prefix));let journal=p.journal();let job=p.into_job(Arc::new(PassThrough)).unwrap();disk.fail.store(true,Ordering::Release);
+    let ex=attempt_execute(&mut written,&job);assert!(matches!(ex.terminal,Terminal::PartialExact { accepted:Accepted { payload:0,fence:0,control:0,calls:0 },.. }));
+    assert!(matches!(agent_write::finish(job,&ex),Terminal::PartialUnknown{..}));assert_eq!(written,before);
+    disk.fail.store(false,Ordering::Release);let result=journal.retry_outcome();
+    assert!(result.is_ok(),"actual unchanged resumed prefix could not be durably recorded: {result:?}");
+    let rows=store.attempt_summaries(current.id()).unwrap();assert_eq!(rows.last().unwrap().outcome,Some(attempts::OutcomeKind::PartialExact));
+    assert_eq!(rows.last().unwrap().accepted,Some(Accepted::default()));assert_eq!(rows.last().unwrap().native.unwrap().envelope,prefix);assert_eq!(written,before);
+    assert!(matches!(current.request().reserve_attempt(current.plan(),Some(prefix)),Err(LeaseError::Busy)),"outcome retry must not release native execution authority");
+}
+
 }

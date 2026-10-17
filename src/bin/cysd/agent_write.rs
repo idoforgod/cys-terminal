@@ -138,7 +138,7 @@ impl Plan {
 }
 
 /// Where a request is, byte-exactly (S4-1 PartialExact). Cumulative over resumed runs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Envelope {
     pub cleared: bool,
     pub opened: bool,
@@ -151,7 +151,7 @@ pub struct Envelope {
 
 /// Accepted byte counts of ONE run, per column (payload / fence / control, design 4.4); `calls`
 /// counts OS write attempts including EINTR retries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Accepted {
     pub payload: u64,
     pub fence: u64,
@@ -293,7 +293,7 @@ pub struct ProofContext<'a> {
 }
 
 /// Request-lifetime native progress. Unknown completion is sticky across later exact results.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct NativeProgress {
     pub accepted_total: u64,
     pub outstanding: bool,
