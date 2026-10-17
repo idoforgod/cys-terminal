@@ -66,6 +66,10 @@ fn c8aftercare_committed_row_before_runtime_publication_is_not_superseded() {
     journal.test_commit_then_publish(||{
         assert_eq!(store.attempt_summaries(current.id()).unwrap().last().unwrap().phase,attempts::AttemptPhase::Outcome);
         assert!(!journal.has_stored_outcome(),"premise: runtime publication must still be pending");
+        // Here the committed-entry group is satisfied, so the stored check is the only guard.
+        assert!(matches!(journal.zero_write_receipt(),Err(ProtocolError::Missing)),
+            "zero-release receipt issued before this run published its own stored durability");
+        assert!(matches!(journal.resolve_stored_zero_write(),Err(ProtocolError::Missing)));
         assert!(matches!(journal.reconcile_completion(),Err(ProtocolError::Conflict)),
             "a committed-but-unpublished outcome was permanently retired");
         assert!(matches!(current.request().reserve_attempt(current.plan(),None),Err(LeaseError::Busy)));
@@ -92,6 +96,8 @@ fn c8aftercare_old_zero_journal_stays_inactive_after_drop_and_reopen() {
     assert!(matches!(journal.reconcile_completion(),Err(ProtocolError::Inactive)),
         "old zero journal stayed live after its store dropped");
     let reopened=PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap();
+    // Structure regression pin: the journal holds Weak<PendingStore> to the dropped allocation,
+    // so no reopen can be adopted by construction; these two asserts pin that type property.
     assert!(matches!(journal.zero_write_receipt(),Err(ProtocolError::Inactive)),
         "reopen substituted a new runtime for the old receipt owner");
     assert!(matches!(journal.reconcile_completion(),Err(ProtocolError::Inactive)),
@@ -100,6 +106,30 @@ fn c8aftercare_old_zero_journal_stays_inactive_after_drop_and_reopen() {
     assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),image);assert_eq!(current.request().native_progress(),native);
     assert!(matches!(current.request().reserve_attempt(current.plan(),None),Err(LeaseError::Busy)),
         "reopened data released old native exclusion");
+    assert!(bytes.is_empty());
+}
+
+#[test]
+fn c8aftercare_store_lost_after_release_reports_inactive_over_completed_release() {
+    use crate::agent_write::{self,PassThrough,Terminal,LeaseError};
+    let scratch=Scratch::new("aftercare-store-lost-after-release");let disk=Arc::new(SwitchDisk {fail:AtomicBool::new(false)});
+    let store=Arc::new(PendingStore::open_registry_with(&scratch.0,11,attempt_store_limits(),Some(registry_limits()),disk.clone()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("aftercare-batch2")).unwrap();
+    let current=attempt_current(&store,&cap,Plan::raw("held"));let p=attempt_prepare(&store,&current,None);
+    let journal=p.journal();let job=p.into_job(Arc::new(PassThrough)).unwrap();
+    disk.fail.store(true,Ordering::Release);let mut bytes=Vec::new();let ex=attempt_execute(&mut bytes,&job);
+    assert!(matches!(agent_write::finish(job,&ex),Terminal::RefusedNoWrite{..}));
+    disk.fail.store(false,Ordering::Release);
+    assert!(matches!(current.request().reserve_attempt(current.plan(),None),Err(LeaseError::Busy)),
+        "premise: failed persistence keeps the native exclusion held for this reconcile to release");
+    let mut owned=Some(store);let mut dropped=false;
+    let result=journal.test_reconcile_after_sequence(|| { drop(owned.take()); dropped=true; });
+    assert!(dropped,"premise: the store must be lost after the release sequence ran");
+    // Current decision, pinned: this reconcile DID release, yet the caller sees Inactive.
+    assert!(matches!(result,Err(ProtocolError::Inactive)),
+        "store lost after a completed release no longer reports Inactive: {result:?}");
+    drop(current.request().reserve_attempt(current.plan(),None)
+        .expect("premise: this reconcile really released the native exclusion"));
     assert!(bytes.is_empty());
 }
 

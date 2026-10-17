@@ -55,6 +55,7 @@ pub(crate) enum CompletionRecovery {
     StoredWithoutNativeRelease { kind:OutcomeKind },
     /// Stop retrying THIS journal's completion recovery. No request/source retirement,
     /// new-owner release, durable-success claim or execution permission is implied.
+    /// It is not "recovered": never match it together with the two variants above.
     SupersededAttempt { number:u64 },
 }
 
@@ -321,8 +322,14 @@ impl AttemptJournal {
     /// Native exclusion remains held after a failed writer finish until a separate typed
     /// resolution consumes the committed outcome; this method alone grants no retry permission.
     pub(super) fn retry_outcome(&self)->Result<(),ProtocolError> {
+        self.retry_outcome_core(|| {})
+    }
+    // Commit, then publish. Production supplies a no-op; the cfg(test) accessor observes
+    // the committed-but-unpublished interval of this same algorithm.
+    fn retry_outcome_core(&self, between:impl FnOnce())->Result<(),ProtocolError> {
         let actual={self.outcome.lock().unwrap_or_else(|e|e.into_inner()).actual.clone().ok_or(ProtocolError::Missing)?};
         let durability=self.persist_outcome(&actual)?;
+        between();
         self.outcome.lock().unwrap_or_else(|e|e.into_inner()).stored=Some(durability);Ok(())
     }
     pub(super) fn zero_write_receipt(&self)->Result<DurableZeroWriteOutcome,ProtocolError> {
@@ -357,11 +364,12 @@ impl AttemptJournal {
     /// Otherwise retained actual facts are persisted before typed native-zero release.
     /// Partial/unknown/success storage does not resolve native or source effects here.
     pub fn reconcile_completion(&self)->Result<CompletionRecovery,ProtocolError> {
-        self.reconcile_completion_core(|| {})
+        self.reconcile_completion_core(|| {},|| {})
     }
-    // One algorithm. Production supplies only a no-op; the cfg(test) accessor can
-    // place a real ownership transition at this exact boundary without a hook registry.
-    fn reconcile_completion_core(&self, after_entry:impl FnOnce())->Result<CompletionRecovery,ProtocolError> {
+    // One algorithm. Production supplies only no-ops; the cfg(test) accessors can place
+    // a real ownership or store transition at these exact boundaries without a hook registry.
+    fn reconcile_completion_core(&self, after_entry:impl FnOnce(), after_sequence:impl FnOnce())
+        ->Result<CompletionRecovery,ProtocolError> {
         let actual=self.outcome.lock().unwrap_or_else(|e|e.into_inner()).actual.clone()
             .ok_or(ProtocolError::Missing)?;
         if self.superseded()? { return Ok(CompletionRecovery::SupersededAttempt { number:self.number }); }
@@ -376,8 +384,10 @@ impl AttemptJournal {
                 Ok(CompletionRecovery::StoredWithoutNativeRelease { kind:actual.kind })
             }
         })();
+        after_sequence(); // No store/native/outcome mutex is held here either.
         // New ownership may have begun after the entry check. The nonce relation is
         // monotonic for this stamp; checking it does not touch either owner's state.
+        // A store lost here turns a completed release into Err (pinned by a specimen).
         match self.superseded() {
             Ok(true)=>Ok(CompletionRecovery::SupersededAttempt { number:self.number }),
             Ok(false)=>result,
@@ -497,17 +507,15 @@ impl PendingStore {
 #[cfg(test)]
 impl AttemptJournal {
     pub(super) fn test_reconcile_after_entry(&self, after_entry:impl FnOnce())->Result<CompletionRecovery,ProtocolError> {
-        self.reconcile_completion_core(after_entry)
+        self.reconcile_completion_core(after_entry,|| {})
     }
-    /// Actual disk commit with the runtime-publication interval made deterministic.
-    /// Only a test callback is inserted; no actual receipt or durability is fabricated.
+    pub(super) fn test_reconcile_after_sequence(&self, after_sequence:impl FnOnce())->Result<CompletionRecovery,ProtocolError> {
+        self.reconcile_completion_core(|| {},after_sequence)
+    }
+    /// The production retry_outcome algorithm with its commit-to-publication interval
+    /// observed. Only a test callback is inserted; no receipt or durability is fabricated.
     pub(super) fn test_commit_then_publish(&self, between:impl FnOnce())->Result<(),ProtocolError> {
-        let actual=self.outcome.lock().unwrap_or_else(|e|e.into_inner()).actual.clone()
-            .ok_or(ProtocolError::Missing)?;
-        let durability=self.persist_outcome(&actual)?;
-        between();
-        self.outcome.lock().unwrap_or_else(|e|e.into_inner()).stored=Some(durability);
-        Ok(())
+        self.retry_outcome_core(between)
     }
 }
 #[cfg(test)]
