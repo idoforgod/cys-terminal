@@ -464,6 +464,7 @@ mod tests {
 
     fn agent(settle: Option<crate::agent_write::Settle>) -> WriteReq {
         WriteReq::Agent(Box::new(AgentJob {
+            attempt: None,
             request: Request::new("c8a".into(), 1, "test", "digest".into()),
             plan: Plan::raw("agent").with_submit(0, 0),
             proof: Arc::new(PassThrough),

@@ -335,6 +335,7 @@ fn the_body_is_recorded_before_the_returns_withhold_probe_runs() {
     let request = crate::agent_write::Request::new("w-wh".into(), s.id, "test", "d".into());
     let handle = request.clone();
     let job = crate::agent_write::AgentJob {
+        attempt: None,
         request,
         plan: crate::agent_write::Plan::raw("withheld body").with_submit(0, 0),
         proof: s.agent_proof(),

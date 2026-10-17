@@ -1,3 +1,4 @@
+// EVIDENCE DRAFT / UNCOMPILED. Requires root managed-lease/PlanView APIs and real authority adapters.
 //! Bounded retention for pending agent requests. Storage only: no retries or replay.
 #![allow(dead_code)]
 //! Opaque terminal evidence is retained data, NOT validated writer success.
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, TryLockError, Weak};
 use std::sync::atomic::{AtomicBool,Ordering};
 
-const SCHEMA: u32 = 3;
+const SCHEMA: u32 = 4;
 const DATA: &str = "pending-requests.json";
 const TEMP: &str = ".pending-requests.json.tmp";
 const LOCK: &str = ".pending-requests.lock";
@@ -91,8 +92,7 @@ pub(crate) struct PendingRecord {
     pub obligation_id: String,
     pub source: SourceRef,
     pub target: Target,
-    pub epochs: EpochStamp,
-    pub policy_digest: String,
+    pub lineage: RecordLineage,
     pub original_body_digest: String,
     pub received_epoch_ms: u64,
     pub plan: ExactPlan,
@@ -104,7 +104,7 @@ impl fmt::Debug for PendingRecord {
             .field("request_id", &self.request_id)
             .field("source_kind", &self.source.kind)
             .field("source_id_count", &self.source.ids.len())
-            .field("epochs", &self.epochs)
+            .field("epochs", &self.visible_epochs())
             .field("plan", &self.plan)
             .finish()
     }
@@ -124,7 +124,7 @@ pub(crate) struct NewSpec {
 impl NewSpec {
     fn into_record(self, request_id: String) -> PendingRecord {
         PendingRecord { request_id, registration_id:None, obligation_id:self.obligation_id, source:self.source,
-            target:self.target, epochs:self.epochs, policy_digest:self.policy_digest,
+            target:self.target, lineage:RecordLineage::Legacy { epochs:self.epochs,policy_digest:self.policy_digest },
             original_body_digest:self.original_body_digest, received_epoch_ms:self.received_epoch_ms,
             plan:self.plan }
     }
@@ -285,7 +285,7 @@ pub(crate) enum Disposition {
 #[derive(Clone,Debug)]
 pub(crate) struct InventoryRow {
     pub request_id:String, pub obligation_id:String, pub source:SourceRef,
-    pub target:Target, pub epochs:EpochStamp, pub body_bytes:usize,
+    pub target:Target, pub epochs:Option<crate::receiver::Epochs>, pub body_bytes:usize,
     pub control_bytes:usize, pub recovered:bool, pub disposition:Disposition,
 }
 #[derive(Debug)]
@@ -297,6 +297,7 @@ struct State {
     // Fixed opener census: never extended by current-run registrations. Retirement of these
     // data-only pins is monotonic and cannot grant receiver or request execution authority.
     loaded_registrations:BTreeSet<String>,
+    current_requests:BTreeMap<String,Weak<CurrentRequest>>,
 }
 struct ReadSnapshot {
     rows:Arc<BTreeMap<String,Row>>, loaded:Arc<BTreeSet<String>>, uncertain:bool,
@@ -427,7 +428,7 @@ impl PendingStore {
         let rows=Arc::new(image.rows);let registry=Arc::new(image.registry);
         let loaded_registrations=registry.registrations.keys().cloned().collect();
         let published=Arc::new(ReadSnapshot { rows:rows.clone(),loaded:loaded.clone(),uncertain:false,registry:registry.clone(),runtime_registrations:BTreeMap::new() });
-        Ok(Self { root,instance,limits, mutation:Mutex::new(State { rows,loaded,registry,live_registrations:BTreeMap::new(),loaded_registrations,
+        Ok(Self { root,instance,limits, mutation:Mutex::new(State { rows,loaded,registry,live_registrations:BTreeMap::new(),loaded_registrations,current_requests:BTreeMap::new(),
             next_request_seq:image.next_request_seq,next_settle_seq:image.next_settle_seq,uncertain:false }),
             published:RwLock::new(published),disk,_process_lock:process_lock,registry_limits,
             identity:Arc::new(RuntimeIdentity { healthy:AtomicBool::new(true) }) })
@@ -455,9 +456,7 @@ impl PendingStore {
         if let Some(registration)=registration {
             self.validate_live_registration(&state,registration)?;
             let scope=registration.scope();
-            if record.epochs.daemon_instance!=scope.daemon_instance || record.epochs.surface_instance!=scope.surface_instance
-                || record.epochs.launch!=scope.launch || record.epochs.policy!=scope.policy
-                || record.target.surface_id!=scope.surface_id { return Err(StoreError::Conflict); }
+            if record.admission_scope()!=scope { return Err(StoreError::Conflict); }
             record.registration_id=Some(registration.id().to_owned());
         }
         validate_record(&record)?;
@@ -493,6 +492,9 @@ impl PendingStore {
         let mut state=self.try_mutation()?;
         if state.uncertain { return Err(StoreError::UncertainCommit); }
         let row=state.rows.get(id).ok_or(StoreError::Missing)?;
+        if matches!(row.record.lineage,RecordLineage::Protocol { .. }) {
+            return Err(StoreError::Invalid("typed protocol writer receipt required"));
+        }
         if let Some(old)=&row.terminal {
             return if old==&terminal { Ok(PersistResult::Identical) }
                 else { Err(StoreError::RetirementConflict) };
@@ -514,6 +516,9 @@ impl PendingStore {
         let mut state=self.try_mutation()?;
         if state.uncertain { return Err(StoreError::UncertainCommit); }
         let row=state.rows.get(id).ok_or(StoreError::Missing)?;
+        if matches!(row.record.lineage,RecordLineage::Protocol { .. }) {
+            return Err(StoreError::Invalid("typed protocol consumer settlement required"));
+        }
         if let Some(old)=&row.settled {
             return if old.receipt==receipt { Ok(PersistResult::Identical) }
                 else { Err(StoreError::SettlementConflict) };
@@ -552,6 +557,8 @@ impl PendingStore {
             Ok(level)=>{
                 boundary.state.rows=Arc::new(candidate);
                 boundary.state.registry=registry;
+                let retained_rows=&boundary.state.rows;
+                boundary.state.current_requests.retain(|id,owner|retained_rows.contains_key(id) && owner.strong_count()>0);
                 boundary.state.next_request_seq=next_request;
                 boundary.state.next_settle_seq=next_settle;
                 boundary.state.loaded=Arc::new(boundary.state.loaded.iter()
@@ -589,7 +596,7 @@ impl PendingStore {
                 _=>Disposition::PendingThisRun,
             };
             InventoryRow { request_id:r.request_id.clone(),obligation_id:r.obligation_id.clone(),
-                source:r.source.clone(),target:r.target.clone(),epochs:r.epochs,
+                source:r.source.clone(),target:r.target.clone(),epochs:r.visible_epochs(),
                 body_bytes:r.plan.body.as_ref().map_or(0,String::len),
                 control_bytes:r.plan.control.as_ref().map_or(0,Vec::len),
                 recovered:state.loaded.contains(&r.request_id),disposition }
@@ -638,9 +645,14 @@ fn validate_record(r: &PendingRecord) -> Result<(), StoreError> {
         || !r.request_id.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b)) {
         return Err(StoreError::Invalid("request ID"));
     }
-    if r.obligation_id.is_empty() || r.policy_digest.is_empty() || r.original_body_digest.is_empty()
-        || r.epochs.daemon_instance == 0 || r.epochs.surface_instance == 0 {
+    if r.obligation_id.is_empty() || r.original_body_digest.is_empty() {
         return Err(StoreError::Invalid("provenance"));
+    }
+    match &r.lineage {
+        RecordLineage::Legacy { epochs,policy_digest } if policy_digest.is_empty()
+            || epochs.daemon_instance==0 || epochs.surface_instance==0=>return Err(StoreError::Invalid("legacy provenance")),
+        RecordLineage::Legacy { .. }=>{},
+        RecordLineage::Protocol { data }=>protocol_shape(r,data)?,
     }
     if r.source.ids.is_empty() || r.source.ids.iter().any(String::is_empty) {
         return Err(StoreError::Invalid("source IDs"));
@@ -655,7 +667,7 @@ fn validate_record(r: &PendingRecord) -> Result<(), StoreError> {
 /// Encoded JSON is checked separately because escaping and control-byte arrays can expand it.
 fn check_raw_record_size(r: &PendingRecord, limit: usize) -> Result<(), StoreError> {
     let lengths = [
-        r.request_id.len(), r.obligation_id.len(), r.policy_digest.len(),
+        r.request_id.len(), r.obligation_id.len(), encode_limited(&r.lineage,limit)?.len(), r.registration_id.as_ref().map_or(0,String::len),
         r.original_body_digest.len(), r.target.role.as_ref().map_or(0, String::len),
         r.plan.body.as_ref().map_or(0, String::len), r.plan.control.as_ref().map_or(0, Vec::len),
     ];
@@ -738,8 +750,10 @@ fn checked_row_charge(row:&Row,l:Limits)->Result<usize,StoreError> {
     #[derive(Serialize)]
     struct Bare<'a> { record:&'a PendingRecord, terminal:Option<()>, settled:Option<()> }
     let bare=encode_limited(&Bare { record:&row.record,terminal:None,settled:None },l.max_record_bytes)?.len();
+    let selected=selection_charge(&row.record,l)?;
     let charged=bare.checked_sub(8).and_then(|n|n.checked_add(l.max_terminal_bytes))
-        .and_then(|n|n.checked_add(l.max_settlement_bytes)).ok_or(StoreError::Capacity("row reserve overflow"))?;
+        .and_then(|n|n.checked_add(l.max_settlement_bytes)).and_then(|n|n.checked_add(selected))
+        .ok_or(StoreError::Capacity("row reserve overflow"))?;
     if charged>l.max_record_bytes { return Err(StoreError::Capacity("reserved row bytes")); }
     if actual>charged { return Err(StoreError::Invalid("row exceeds reserved form")); }
     Ok(charged)
@@ -819,7 +833,7 @@ fn load_image(path:&Path,l:Limits,registry_limits:Option<RegistryLimits>)->Resul
     if bytes.len()>l.max_file_bytes { return Err(StoreError::Capacity("disk bytes")); }
     let value:serde_json::Value=serde_json::from_slice(&bytes).map_err(|_|StoreError::Invalid("persisted JSON"))?;
     let snapshot=match value.get("schema").and_then(serde_json::Value::as_u64) {
-        Some(3)=>serde_json::from_value::<Snapshot>(value).map_err(|_|StoreError::Invalid("schema 3 shape"))?,
+        Some(4)=>serde_json::from_value::<Snapshot>(value).map_err(|_|StoreError::Invalid("schema 4 shape"))?,
         _=>return Err(StoreError::Invalid("schema")),
     };
     if snapshot.next_request_seq==0 || snapshot.next_settle_seq==0 { return Err(StoreError::Invalid("zero counter")); }
@@ -865,7 +879,7 @@ impl PendingStore {
                 _=>Disposition::PendingThisRun,
             };
             InventoryRow { request_id:r.request_id.clone(),obligation_id:r.obligation_id.clone(),
-                source:r.source.clone(),target:r.target.clone(),epochs:r.epochs,
+                source:r.source.clone(),target:r.target.clone(),epochs:r.visible_epochs(),
                 body_bytes:r.plan.body.as_ref().map_or(0,String::len),
                 control_bytes:r.plan.control.as_ref().map_or(0,Vec::len),
                 recovered:state.loaded.contains(id),disposition }
@@ -948,12 +962,11 @@ fn validate_registry(registry:&RegistryImage,rows:&BTreeMap<String,Row>,limits:O
     for row in rows.values() {
         if let Some(id)=&row.record.registration_id {
             let registered=registry.registrations.get(id).ok_or(StoreError::Invalid("request registration reference"))?;
-            let s=registered.scope;let r=&row.record;
-            if r.epochs.daemon_instance!=s.daemon_instance || r.epochs.surface_instance!=s.surface_instance
-                || r.epochs.launch!=s.launch || r.epochs.policy!=s.policy || r.target.surface_id!=s.surface_id {
+            if row.record.admission_scope()!=registered.scope {
                 return Err(StoreError::Invalid("request registration scope"));
             }
         }
+        protocol_registry_reference(&row.record,registry)?;
     }
     Ok(())
 }
@@ -1071,6 +1084,480 @@ impl PendingStore {
         let state=self.snapshot();if state.uncertain { return Err(StoreError::UncertainCommit); }
         let record=state.registry.catalogs.get(id).ok_or(StoreError::Missing)?;
         serde_json::from_str(&record.image).map_err(|_|StoreError::Invalid("catalog JSON"))
+    }
+}
+
+// DRAFT / UNCOMPILED. Insert in pending_requests.rs before its test module.
+// This is durable ingress/INITIAL selection only: no scheduler, attempt state,
+// submit mutation, zero-write rebind or receipt/settlement implementation.
+use crate::agent_write::{EditStamp,LeaseError,Plan,Request,ZeroWriteEditLease};
+use crate::input_intent::{InputIntent,TargetKind};
+use crate::receiver::{Epochs,ProofClass,WeakRisk};
+use std::time::{Duration,Instant};
+
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(tag="kind",rename_all="snake_case")]
+pub(crate) enum CallerRecord {
+    Surface { id:u64 }, Claimed { id:u64 }, Process { parent_pid:u32,parent_birth_us:u64 },
+}
+impl From<&crate::submit_assoc::CallerKey> for CallerRecord {
+    fn from(c:&crate::submit_assoc::CallerKey)->Self { match c {
+        crate::submit_assoc::CallerKey::Surface(id)=>Self::Surface { id:*id },
+        crate::submit_assoc::CallerKey::Claimed(id)=>Self::Claimed { id:*id },
+        crate::submit_assoc::CallerKey::Process { parent_pid,parent_birth_us }=>Self::Process { parent_pid:*parent_pid,parent_birth_us:*parent_birth_us },
+    } }
+}
+#[derive(Clone,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IngressScope {
+    pub socket_path:PathBuf,pub daemon_instance:u64,pub surface_instance:u64,
+    pub launch:u64,pub conversation:u64,
+}
+impl fmt::Debug for IngressScope {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {
+        f.debug_struct("IngressScope").field("daemon_instance",&self.daemon_instance)
+            .field("surface_instance",&self.surface_instance).field("launch",&self.launch)
+            .field("conversation",&self.conversation).finish_non_exhaustive()
+    }
+}
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InitialCatalog {
+    pub registration_id:String,pub catalog_id:String,pub contract_key:String,pub policy_epoch:u64,
+}
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SelectedLineage {
+    pub catalog_id:String,pub adapter:String,pub config_digest:String,pub epochs:Epochs,
+    pub class:ProofClass,pub weak_risk:Option<WeakRisk>,pub publication_ref:String,
+}
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(tag="kind",rename_all="snake_case")]
+pub(crate) enum SubmitContract {
+    OwnedAtAdmission,SelfContainedInBody,AwaitingAssociation { window_ms:u64 },NotApplicable,
+    BoundToCompletedBody { body_request_id:String,body_lineage:SelectedLineage },
+}
+#[derive(Clone,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImmutableIngress {
+    pub intent:InputIntent,pub target_kind:TargetKind,pub scope:IngressScope,pub origin:String,
+    pub caller:Option<CallerRecord>,pub submit:SubmitContract,
+}
+impl fmt::Debug for ImmutableIngress {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {
+        f.debug_struct("ImmutableIngress").field("intent",&self.intent)
+            .field("target_kind",&self.target_kind).field("scope",&self.scope).finish_non_exhaustive()
+    }
+}
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProtocolData {
+    pub ingress:ImmutableIngress,pub initial:InitialCatalog,
+    pub selected:Option<SelectedLineage>,pub revision:u64,
+    /// Encoded selected-lineage allowance declared BEFORE durable admission.
+    pub selected_reserve:usize,
+}
+#[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
+#[serde(tag="kind",rename_all="snake_case")]
+pub(crate) enum RecordLineage {
+    Legacy { epochs:EpochStamp,policy_digest:String },
+    Protocol { data:ProtocolData },
+}
+
+#[derive(Clone,Copy,Debug)]
+pub(crate) struct ProtocolLimits { pub max_selected_lineage_bytes:usize }
+/// No caller-selected writer ID. Plan is the EXISTING executable Plan, already
+/// sanitized at its real ingress constructor; storage never re-sanitizes it.
+pub(crate) struct NewProtocolSpec {
+    pub obligation_id:String,pub source:SourceRef,pub target:Target,
+    pub ingress:ImmutableIngress,pub original_body_digest:String,
+    pub received_epoch_ms:u64,pub received_at:Instant,pub plan:Plan,pub origin:&'static str,
+}
+impl fmt::Debug for NewProtocolSpec {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {
+        f.debug_struct("NewProtocolSpec").field("source_kind",&self.source.kind)
+            .field("source_count",&self.source.ids.len()).field("ingress",&self.ingress).finish_non_exhaustive()
+    }
+}
+#[derive(Debug)]
+pub(crate) enum ProtocolError {
+    Store(StoreError),Authority(String),RecoveredOnly,RevisionChanged,Conflict,
+    Missing,Inactive,Unsupported,NeedsExistingRequest,Lease(LeaseError),
+}
+impl From<StoreError> for ProtocolError { fn from(e:StoreError)->Self { Self::Store(e) } }
+impl From<LeaseError> for ProtocolError { fn from(e:LeaseError)->Self { Self::Lease(e) } }
+
+/// REQUIRED REAL ingress seam. Implement only on a consumed capability minted by
+/// the actual authenticated ingress/classifier/control/lifecycle route. No
+/// implementation or public data-to-capability constructor is supplied here.
+/// It must bind exact Plan, intent, target/socket/scope, source IDs, caller and age.
+/// Human/protocol enums or a JSON `authorized` flag are not this capability.
+pub(crate) trait IngressAuthority {
+    fn validate_and_consume(self,spec:&NewProtocolSpec,registration:&RegisteredCatalog)->Result<(),ProtocolError>;
+}
+/// REQUIRED REAL controller seam. Only an actual published full/weak binding's
+/// factory may implement this. It must bind CurrentRequest, exact expected
+/// revision, initial catalog, actual selected contract/epochs and publication.
+/// It performs no new discovery here. Saved JSON/IDs cannot implement it.
+pub(crate) trait InitialSelectionAuthority {
+    fn validate_and_consume(self,request:&Arc<Request>,plan:&Plan,ingress:&ImmutableIngress,
+        initial:&InitialCatalog,expected_revision:u64)->Result<SelectedLineage,ProtocolError>;
+}
+/// These two non-Clone, non-deserializable receipts are minted ONLY by this
+/// module's actual selection CAS outcomes. EditStamp stays writer-owned/opaque.
+/// Consuming a receipt releases exclusion only; it does not authorize a write.
+pub(crate) struct DurableSelectionCommit {
+    owner:Weak<RuntimeIdentity>,current:Arc<CurrentRequest>,stamp:EditStamp,
+    before:u64,after:u64,durability:Durability,
+}
+pub(crate) struct DurableSelectionNotWritten {
+    owner:Weak<RuntimeIdentity>,current:Arc<CurrentRequest>,stamp:EditStamp,unchanged:u64,
+}
+fn check_resolution_owner(owner:&Weak<RuntimeIdentity>,current:&Arc<CurrentRequest>,
+    request:&Arc<Request>,plan:&Plan)->Result<(),ProtocolError>
+{
+    let owner=owner.upgrade().ok_or(ProtocolError::Inactive)?;
+    let admitted=current.owner.upgrade().ok_or(ProtocolError::Inactive)?;
+    if !Arc::ptr_eq(&owner,&admitted) || !owner.healthy.load(Ordering::Acquire)
+        || !Arc::ptr_eq(&current.request,request) || current.plan.as_ref()!=plan {
+        return Err(ProtocolError::Conflict);
+    }
+    Ok(())
+}
+impl DurableSelectionCommit {
+    pub fn durability(&self)->Durability { self.durability }
+    /// Called only by ZeroWriteEditLease::resolve_selection (crossmodule patch).
+    /// The actual lease additionally compares this opaque stamp's nonce/Plan.
+    pub fn consume(self,request:&Arc<Request>,plan:&Plan,expected:u64)
+        ->Result<(EditStamp,u64),ProtocolError>
+    {
+        check_resolution_owner(&self.owner,&self.current,request,plan)?;
+        if self.before!=expected || expected.checked_add(1)!=Some(self.after) {
+            return Err(ProtocolError::RevisionChanged);
+        }
+        Ok((self.stamp,self.after))
+    }
+}
+impl DurableSelectionNotWritten {
+    pub fn consume(self,request:&Arc<Request>,plan:&Plan,expected:u64)
+        ->Result<EditStamp,ProtocolError>
+    {
+        check_resolution_owner(&self.owner,&self.current,request,plan)?;
+        if self.unchanged!=expected { return Err(ProtocolError::RevisionChanged); }
+        Ok(self.stamp)
+    }
+}
+
+/// Runtime ownership, NOT execution/native/ingress authority. No Clone/Deserialize
+/// or public fields; only the successful durable admission path below constructs
+/// it. Arc clones are the same handle, never a second Request with the same ID.
+pub(crate) struct CurrentRequest {
+    owner:Weak<RuntimeIdentity>,request:Arc<Request>,plan:Arc<Plan>,
+    initial_registration:Arc<RegisteredCatalog>,association_deadline:Option<Instant>,
+}
+impl fmt::Debug for CurrentRequest {
+    fn fmt(&self,f:&mut fmt::Formatter<'_>)->fmt::Result {
+        f.debug_struct("CurrentRequest").field("id",&self.request.id).finish_non_exhaustive()
+    }
+}
+impl CurrentRequest {
+    pub fn id(&self)->&str { &self.request.id }
+    pub fn request(&self)->&Arc<Request> { &self.request }
+    pub fn plan(&self)->&Plan { &self.plan }
+    pub fn received_at(&self)->Instant { self.request.created }
+    /// Original association deadline; data only, never a grant to attach Return.
+    pub fn association_deadline(&self)->Option<Instant> { self.association_deadline }
+}
+/// Dependency: root's read-only Plan::exact_view() accessor. It borrows the exact private
+/// fields. planned_bytes cannot reconstruct spacing, empty options or ownership.
+fn retained_plan(plan:&Plan)->ExactPlan {
+    let view=plan.exact_view();
+    ExactPlan { clear_first:view.clear_first,clear_settle_ms:view.clear_settle_ms,
+        body:view.body.map(str::to_owned),fenced:view.fenced,control:view.control.map(|bytes|bytes.to_vec()),
+        submit:view.submit.map(|s|ExactSubmit { delay_ms:s.delay_ms,min_gap_ms:s.min_gap_ms }) }
+}
+
+fn plan_matches(exact:&ExactPlan,plan:&Plan)->bool {
+    let view=plan.exact_view();
+    exact.clear_first==view.clear_first && exact.clear_settle_ms==view.clear_settle_ms
+        && exact.body.as_deref()==view.body && exact.fenced==view.fenced
+        && exact.control.as_deref()==view.control && exact.submit.as_ref().map(|s|(s.delay_ms,s.min_gap_ms))
+            ==view.submit.map(|s|(s.delay_ms,s.min_gap_ms))
+}
+
+impl PendingRecord {
+    fn visible_epochs(&self)->Option<Epochs> { match &self.lineage {
+        RecordLineage::Legacy { epochs:e,.. }=>Some(Epochs { daemon_instance:e.daemon_instance,surface_instance:e.surface_instance,
+            launch:e.launch,conversation:e.conversation,policy:e.policy,binding:e.binding }),
+        RecordLineage::Protocol { data }=>data.selected.as_ref().map(|s|s.epochs),
+    } }
+    fn admission_scope(&self)->RegistrationScope { match &self.lineage {
+        RecordLineage::Legacy { epochs:e,.. }=>RegistrationScope { daemon_instance:e.daemon_instance,
+            surface_id:self.target.surface_id,surface_instance:e.surface_instance,launch:e.launch,policy:e.policy },
+        RecordLineage::Protocol { data }=>RegistrationScope { daemon_instance:data.ingress.scope.daemon_instance,
+            surface_id:self.target.surface_id,surface_instance:data.ingress.scope.surface_instance,
+            launch:data.ingress.scope.launch,policy:data.initial.policy_epoch },
+    } }
+}
+fn protocol_shape(r:&PendingRecord,p:&ProtocolData)->Result<(),StoreError> {
+    if p.revision==0 || p.selected_reserve<128 || p.ingress.scope.daemon_instance==0
+        || p.ingress.scope.surface_instance==0 || !p.ingress.scope.socket_path.is_absolute()
+        || p.initial.registration_id.is_empty() || p.initial.catalog_id.is_empty()
+        || p.ingress.origin.is_empty() || p.initial.contract_key.is_empty() || p.initial.policy_epoch==0
+        || r.registration_id.as_deref()!=Some(p.initial.registration_id.as_str()) {
+        return Err(StoreError::Invalid("protocol ingress identity"));
+    }
+    match (p.ingress.intent,p.ingress.target_kind) {
+        (InputIntent::AgentText|InputIntent::AgentSubmit|InputIntent::AgentControl,TargetKind::Agent)=>{},
+        (InputIntent::LifecycleLaunch,TargetKind::Shell)=>{},
+        _=>return Err(StoreError::Invalid("intent outside durable automatic ingress")),
+    }
+    if matches!(p.ingress.intent,InputIntent::AgentText|InputIntent::LifecycleLaunch)
+        && (r.plan.body.is_none() || r.plan.control.is_some()) {
+        return Err(StoreError::Invalid("automatic text/launch plan shape"));
+    }
+    if p.ingress.intent==InputIntent::AgentSubmit &&
+        (r.plan.body.is_some() || r.plan.control.is_some() || r.plan.submit.is_none() || r.plan.clear_first) {
+        return Err(StoreError::Invalid("submit plan shape"));
+    }
+    if p.ingress.intent==InputIntent::AgentControl && (r.plan.body.is_some() || r.plan.control.is_none() || r.plan.submit.is_some()) {
+        return Err(StoreError::Invalid("control plan shape"));
+    }
+    match &p.ingress.submit {
+        SubmitContract::OwnedAtAdmission if r.plan.submit.is_some()=>{},
+        SubmitContract::SelfContainedInBody if r.plan.body.is_some() && r.plan.submit.is_none()=>{},
+        SubmitContract::AwaitingAssociation { window_ms } if *window_ms>0 && p.ingress.intent==InputIntent::AgentText
+            && r.plan.body.is_some() && r.plan.submit.is_none() && p.ingress.caller.is_some()=>{},
+        SubmitContract::BoundToCompletedBody { body_request_id,body_lineage } if
+            p.ingress.intent==InputIntent::AgentSubmit && !body_request_id.is_empty()
+            && body_lineage.epochs.binding>0=>{},
+        SubmitContract::NotApplicable if p.ingress.intent==InputIntent::AgentControl=>{},
+        _=>return Err(StoreError::Invalid("submit contract does not match exact plan")),
+    }
+    if p.ingress.intent==InputIntent::AgentSubmit && !matches!(p.ingress.submit,SubmitContract::BoundToCompletedBody { .. }) {
+        return Err(StoreError::Invalid("standalone submit lacks original body lineage"));
+    }
+    if let Some(s)=&p.selected { selected_shape(r,p,s)?; }
+    Ok(())
+}
+fn selected_shape(r:&PendingRecord,p:&ProtocolData,s:&SelectedLineage)->Result<(),StoreError> {
+    if s.catalog_id!=p.initial.catalog_id || s.adapter.is_empty() || s.config_digest.is_empty()
+        || s.publication_ref.is_empty() || s.epochs.binding==0 || s.epochs.policy!=p.initial.policy_epoch
+        || s.epochs.daemon_instance!=p.ingress.scope.daemon_instance
+        || s.epochs.surface_instance!=p.ingress.scope.surface_instance
+        || s.epochs.launch!=p.ingress.scope.launch || s.epochs.conversation!=p.ingress.scope.conversation
+        || (s.class==ProofClass::FullRequired)!=s.weak_risk.is_none() {
+        return Err(StoreError::Invalid("initial selected lineage shape"));
+    }
+    let _=r; // addressing remains the immutable common record, not a role re-resolution
+    encode_limited(s,p.selected_reserve)?;
+    Ok(())
+}
+fn protocol_registry_reference(record:&PendingRecord,registry:&RegistryImage)->Result<(),StoreError> {
+    let RecordLineage::Protocol { data:p }=&record.lineage else { return Ok(()); };
+    let registered=registry.registrations.get(&p.initial.registration_id).ok_or(StoreError::Invalid("initial registration reference"))?;
+    if registered.catalog_id!=p.initial.catalog_id || registered.contract_key!=p.initial.contract_key
+        || registered.scope!=record.admission_scope() { return Err(StoreError::Invalid("initial catalog reference")); }
+    if let Some(selected)=&p.selected {
+        let image=&registry.catalogs.get(&p.initial.catalog_id).ok_or(StoreError::Invalid("initial catalog absent"))?.image;
+        let image:serde_json::Value=serde_json::from_str(image).map_err(|_|StoreError::Invalid("catalog JSON"))?;
+        let entries=image["entries"].as_array().ok_or(StoreError::Invalid("catalog entries"))?;
+        let entry=entries.iter().find(|e|e["policy"]["adapter"].as_str()==Some(selected.adapter.as_str()))
+            .ok_or(StoreError::Invalid("selected adapter outside initial catalog"))?;
+        if entry["policy"]["config_digest"].as_str()!=Some(selected.config_digest.as_str())
+            || entry["policy"]["class"]!=serde_json::to_value(selected.class).map_err(|_|StoreError::Invalid("class codec"))?
+            || entry["policy"]["weak_risk"]!=serde_json::to_value(selected.weak_risk).map_err(|_|StoreError::Invalid("risk codec"))? {
+            return Err(StoreError::Invalid("selected contract differs from initial catalog"));
+        }
+    }
+    Ok(())
+}
+fn selection_charge(record:&PendingRecord,l:Limits)->Result<usize,StoreError> {
+    let RecordLineage::Protocol { data:p }=&record.lineage else { return Ok(0); };
+    if p.selected_reserve>l.max_record_bytes { return Err(StoreError::Capacity("selected lineage reserve")); }
+    let used=encode_limited(&p.selected,p.selected_reserve)?.len();
+    let future=p.selected_reserve.checked_sub(used).ok_or(StoreError::Capacity("selected lineage bytes"))?;
+    let revision_extra=u64::MAX.to_string().len().checked_sub(p.revision.to_string().len()).ok_or(StoreError::Invalid("revision width"))?;
+    future.checked_add(revision_extra).ok_or(StoreError::Capacity("selected lineage reserve"))
+}
+
+impl PendingStore {
+    /// A durable CurrentRequest owner only, not a writer AttemptLease. Every
+    /// executable automatic producer must still use the managed writer protocol.
+    pub fn accept_protocol<A:IngressAuthority>(&self,spec:NewProtocolSpec,
+        registration:&Arc<RegisteredCatalog>,authority:A,bounds:ProtocolLimits)
+        ->Result<Arc<CurrentRequest>,ProtocolError>
+    {
+        if spec.ingress.intent==InputIntent::AgentSubmit { return Err(ProtocolError::NeedsExistingRequest); }
+        if bounds.max_selected_lineage_bytes<128 || bounds.max_selected_lineage_bytes>self.limits.max_record_bytes
+            || spec.origin!=spec.ingress.origin { return Err(ProtocolError::Conflict); }
+        // Capture the existing association policy at ORIGINAL receipt, never now.
+        // Reopened historical windows are data only; no live deadline is rebuilt.
+        let association_deadline=match &spec.ingress.submit {
+            SubmitContract::AwaitingAssociation { window_ms }=>{
+                if *window_ms!=crate::submit_assoc::LEGACY_ASSOCIATION_WINDOW_MS {
+                    return Err(ProtocolError::Conflict);
+                }
+                Some(spec.received_at.checked_add(Duration::from_millis(*window_ms))
+                    .ok_or(ProtocolError::Conflict)?)
+            }
+            _=>None,
+        };
+        // The real ingress factory runs OUTSIDE storage/native/input/queue locks.
+        authority.validate_and_consume(&spec,registration)?;
+        let view=spec.plan.exact_view();
+        let payload=view.body.map_or(0,str::len).checked_add(view.control.map_or(0,<[u8]>::len))
+            .ok_or(StoreError::Capacity("raw plan bytes"))?;
+        if payload>self.limits.max_record_bytes { return Err(StoreError::Capacity("raw plan bytes").into()); }
+        let exact=retained_plan(&spec.plan);
+        let mut state=self.try_mutation()?;
+        if state.uncertain { return Err(ProtocolError::Store(StoreError::UncertainCommit)); }
+        self.validate_live_registration(&state,registration)?;
+        let scope=registration.scope();let incoming=&spec.ingress.scope;
+        if incoming.daemon_instance!=self.instance || incoming.daemon_instance!=scope.daemon_instance
+            || incoming.surface_instance!=scope.surface_instance || incoming.launch!=scope.launch
+            || spec.target.surface_id!=scope.surface_id { return Err(ProtocolError::Conflict); }
+        let seq=state.next_request_seq;let next=seq.checked_add(1).ok_or(StoreError::Capacity("request sequence exhausted"))?;
+        if seq==0 { return Err(ProtocolError::Conflict); }
+        let id=format!("w{:x}-{seq}",self.instance);
+        if state.rows.contains_key(&id) || state.current_requests.contains_key(&id) { return Err(ProtocolError::Conflict); }
+        let protocol=ProtocolData { ingress:spec.ingress,initial:InitialCatalog {
+            registration_id:registration.id().to_owned(),catalog_id:registration.record.catalog_id.clone(),
+            contract_key:registration.record.contract_key.clone(),policy_epoch:scope.policy },
+            selected:None,revision:1,selected_reserve:bounds.max_selected_lineage_bytes };
+        let record=PendingRecord { request_id:id.clone(),registration_id:Some(registration.id().to_owned()),
+            obligation_id:spec.obligation_id,source:spec.source,target:spec.target,
+            lineage:RecordLineage::Protocol { data:protocol },original_body_digest:spec.original_body_digest,
+            received_epoch_ms:spec.received_epoch_ms,plan:exact };
+        validate_record(&record)?;protocol_registry_reference(&record,&state.registry)?;
+        let row=Row { record,terminal:None,settled:None };checked_row_charge(&row,self.limits)?;
+        let digest=row.record.original_body_digest.clone();let surface_id=row.record.target.surface_id;
+        let mut rows=(*state.rows).clone();rows.insert(id.clone(),row);
+        let mut registry=state.registry.clone();let ns=state.next_settle_seq;
+        let bytes=prune_and_encode(&mut rows,next,ns,self.limits,None,&mut registry,self.registry_limits)?;
+        self.commit(&mut state,rows,next,ns,registry,&bytes)?;
+
+        // Post-commit runtime installation is also fail-closed on unwind. A
+        // persistent row without a returned live owner remains protected data.
+        let ambiguous=Arc::new(ReadSnapshot { rows:state.rows.clone(),loaded:state.loaded.clone(),
+            uncertain:true,registry:state.registry.clone(),runtime_registrations:state.live_registrations.values()
+                .map(|r|(r.id().to_owned(),Arc::downgrade(r))).collect() });
+        let mut boundary=CommitBoundary { state:&mut state,published:&self.published,
+            ambiguous:Some(ambiguous),identity:&self.identity };
+        // REQUIRED root API; never substitute legacy Request::new. Managed writer
+        // requests cannot enter a job until root's actual AttemptLease exists.
+        let plan=Arc::new(spec.plan);
+        let request=Request::new_managed_at(id.clone(),surface_id,spec.origin,digest,spec.received_at,&plan);
+        let current=Arc::new(CurrentRequest { owner:Arc::downgrade(&self.identity),request,plan,
+            initial_registration:registration.clone(),association_deadline });
+        boundary.state.current_requests.insert(id,Arc::downgrade(&current));
+        self.publish(boundary.state);boundary.ambiguous=None;
+        Ok(current)
+    }
+
+    fn validate_current_locked<'a>(&self,state:&'a State,current:&Arc<CurrentRequest>,expected:u64)
+        ->Result<(&'a Row,&'a ProtocolData),ProtocolError>
+    {
+        if state.uncertain { return Err(ProtocolError::Store(StoreError::UncertainCommit)); }
+        let owner=current.owner.upgrade().ok_or(ProtocolError::Inactive)?;
+        if !Arc::ptr_eq(&owner,&self.identity) || !owner.healthy.load(Ordering::Acquire)
+            || !state.current_requests.get(current.id()).and_then(Weak::upgrade)
+                .is_some_and(|original|Arc::ptr_eq(&original,current)) {
+            return Err(ProtocolError::Inactive);
+        }
+        if state.loaded.contains(current.id()) { return Err(ProtocolError::RecoveredOnly); }
+        let row=state.rows.get(current.id()).ok_or(ProtocolError::Missing)?;
+        let RecordLineage::Protocol { data }=&row.record.lineage else { return Err(ProtocolError::Conflict); };
+        if data.revision!=expected { return Err(ProtocolError::RevisionChanged); }
+        if row.record.request_id!=current.request.id || row.record.target.surface_id!=current.request.surface_id
+            || row.record.original_body_digest!=current.request.digest || !plan_matches(&row.record.plan,&current.plan)
+            || data.ingress.origin!=current.request.origin || row.settled.is_some() {
+            return Err(ProtocolError::Conflict);
+        }
+        Ok((row,data))
+    }
+    /// Checks runtime ownership plus exact DURABLE revision; it grants no attempt,
+    /// proof or replacement authority and is not a recovered-row reconstruction.
+    pub fn current_revision(&self,current:&Arc<CurrentRequest>,expected:u64)->Result<ProtocolData,ProtocolError> {
+        let state=self.try_mutation()?;
+        let (_,data)=self.validate_current_locked(&state,current,expected)?;
+        Ok(data.clone())
+    }
+
+    /// INITIAL Agent selection only. Rebinding, process-specific control/Return
+    /// transfer and shell LifecycleLaunch proof are deliberately separate future
+    /// paths. They must not be smuggled through this initial-selection method.
+    pub fn select_initial_lineage<A:InitialSelectionAuthority>(&self,
+        current:&Arc<CurrentRequest>,expected:u64,mut edit:ZeroWriteEditLease,authority:A)->Result<u64,ProtocolError>
+    {
+        // The real root-owned reservation is held by value through this function.
+        // Its verifier must check queue/Prepared ownership, not only running.
+        edit.validate_reserved(&current.request,&current.plan)?;
+        let (ingress,initial,prior)={
+            let state=self.try_mutation()?;let (row,p)=self.validate_current_locked(&state,current,expected)?;
+            if row.terminal.is_some() || p.ingress.target_kind!=TargetKind::Agent
+                || p.ingress.intent==InputIntent::AgentSubmit || current.request.is_cancelled() {
+                return Err(ProtocolError::Unsupported);
+            }
+            (p.ingress.clone(),p.initial.clone(),p.selected.clone())
+        };
+        // Actual controller authority validation stays OUTSIDE the store mutex.
+        // A data-only selected lineage or archived JSON cannot implement it.
+        let selected=authority.validate_and_consume(&current.request,&current.plan,&ingress,&initial,expected)?;
+        edit.validate_held(&current.request,&current.plan)?;
+        let mut state=self.try_mutation()?;
+        let (row,p)=self.validate_current_locked(&state,current,expected)?;
+        if row.terminal.is_some() || p.ingress!=ingress || p.initial!=initial || p.selected!=prior
+            || current.request.is_cancelled() { return Err(ProtocolError::Conflict); }
+        // Initial registration may have been revoked during authority collection.
+        self.validate_live_registration(&state,&current.initial_registration)?;
+        selected_shape(&row.record,p,&selected)?;
+        if let Some(existing)=&p.selected {
+            return if existing==&selected { Ok(p.revision) } else { Err(ProtocolError::Conflict) };
+        }
+        let revision=p.revision.checked_add(1).ok_or(StoreError::Capacity("request revision exhausted"))?;
+        let mut rows=(*state.rows).clone();let updated=rows.get_mut(current.id()).expect("validated current row");
+        let RecordLineage::Protocol { data }=&mut updated.record.lineage else { unreachable!() };
+        data.selected=Some(selected);data.revision=revision;
+        protocol_registry_reference(&updated.record,&state.registry)?;
+        let mut registry=state.registry.clone();let nr=state.next_request_seq;let ns=state.next_settle_seq;
+        let bytes=prune_and_encode(&mut rows,nr,ns,self.limits,None,&mut registry,self.registry_limits)?;
+        // Only the existing Request.native exclusion is used. Its mutex is
+        // released by begin_persisting before disk IO; no native query occurs.
+        // Writer journaling must likewise call store methods AFTER releasing native.
+        let stamp=edit.begin_persisting(&current.plan)?;
+        let old_rows=state.rows.clone();
+        match self.commit(&mut state,rows,nr,ns,registry,&bytes) {
+            Ok(durability)=>{
+                let receipt=DurableSelectionCommit { owner:Arc::downgrade(&self.identity),
+                    current:current.clone(),stamp,before:expected,after:revision,durability };
+                drop(state);
+                // Actual crossmodule typed resolver, not caller-asserted success.
+                // A cancellation/conflict leaves Persisting held for reconciliation.
+                edit.resolve_selection(receipt,expected)?;
+                // Data revision only: actual native/controller/input authority must
+                // still be revalidated at handoff. The exact Plan never changed.
+                Ok(revision)
+            }
+            Err(error)=>{
+                // Private Disk/CommitBoundary proves the pre-install refusal. Both
+                // authoritative store state AND exact original row Arc/revision
+                // must remain unchanged before we release native exclusion.
+                let not_written=matches!(&error,StoreError::Io { installed:false,.. })
+                    && !state.uncertain && self.identity.healthy.load(Ordering::Acquire)
+                    && Arc::ptr_eq(&old_rows,&state.rows)
+                    && self.validate_current_locked(&state,current,expected).is_ok();
+                if not_written {
+                    let receipt=DurableSelectionNotWritten { owner:Arc::downgrade(&self.identity),
+                        current:current.clone(),stamp,unchanged:expected };
+                    drop(state);
+                    edit.resolve_selection_not_written(receipt,expected)?;
+                }
+                // Installed/uncertain errors leave the lease Persisting on Drop.
+                // This API never treats a generic IO error as evidence of rollback.
+                Err(error.into())
+            }
+        }
     }
 }
 
@@ -1839,4 +2326,362 @@ mod tests {
         store.close_registration(&cap).unwrap();let pins=store.registrations().unwrap();
         assert!(pins[0].closed&&!pins[0].usable_in_this_run); // pending request still protects the catalog
     }
+// Codec/shape/capacity and denial/reopen controls for the retained protocol.
+// Pure codec/shape/capacity and denial/reopen specimens. NO successful native,
+// ingress or edit capability is fabricated. Positive activation tests need the
+// real production adapters listed in INTEGRATION-TESTS.md.
+
+fn protocol_row_data() -> Row {
+    let plan=Plan::paste("private body\n한글").with_clear(37).with_submit(421,159);
+    Row { record:PendingRecord {
+        request_id:"wb-1".into(),registration_id:Some("registration-fixture".into()),
+        obligation_id:"logical-original".into(),source:SourceRef { kind:SourceKind::Direct,
+            ids:vec!["source-z".into(),"source-a".into()] },
+        target:Target { mode:TargetMode::Role,surface_id:7,role:Some("worker".into()) },
+        lineage:RecordLineage::Protocol { data:ProtocolData {
+            ingress:ImmutableIngress { intent:InputIntent::AgentText,target_kind:TargetKind::Agent,
+                scope:IngressScope { socket_path:PathBuf::from("/private/socket-fixture"),daemon_instance:11,
+                    surface_instance:12,launch:13,conversation:14 },origin:"protocol-fixture".into(),
+                caller:Some(CallerRecord::Surface { id:8 }),submit:SubmitContract::OwnedAtAdmission },
+            initial:InitialCatalog { registration_id:"registration-fixture".into(),catalog_id:"catalog-fixture".into(),
+                contract_key:"contract-fixture".into(),policy_epoch:15 },selected:None,revision:1,selected_reserve:2048 } },
+        original_body_digest:"original-body-digest".into(),received_epoch_ms:1790000000123,
+        plan:retained_plan(&plan),
+    },terminal:None,settled:None }
+}
+fn protocol_data(row:&Row)->&ProtocolData {
+    let RecordLineage::Protocol { data }=&row.record.lineage else { panic!("fixture branch") };data
+}
+fn protocol_data_mut(row:&mut Row)->&mut ProtocolData {
+    let RecordLineage::Protocol { data }=&mut row.record.lineage else { panic!("fixture branch") };data
+}
+fn selected_data()->SelectedLineage {
+    SelectedLineage { catalog_id:"catalog-fixture".into(),adapter:"claude".into(),config_digest:"config-fixture".into(),
+        epochs:Epochs { daemon_instance:11,surface_instance:12,launch:13,conversation:14,policy:15,binding:16 },
+        class:ProofClass::FullRequired,weak_risk:None,publication_ref:"publication-fixture".into() }
+}
+
+#[test]
+fn c8protocol_exact_plan_projection_preserves_modes_and_spacing() {
+    let plans=[Plan::raw(""),Plan::raw("x\n"),Plan::paste("a\u{1b}[201~b").with_clear(19).with_submit(27,31),
+        Plan::control(vec![0,27,255]),Plan::submit_only(77)];
+    for plan in plans {
+        let exact=retained_plan(&plan);
+        assert!(plan_matches(&exact,&plan));
+        let roundtrip:ExactPlan=serde_json::from_slice(&serde_json::to_vec(&exact).unwrap()).unwrap();
+        assert_eq!(roundtrip,exact);
+        let mut wrong=exact.clone();wrong.clear_settle_ms=wrong.clear_settle_ms.wrapping_add(1);
+        assert!(!plan_matches(&wrong,&plan),"timing is part of exact Plan even when output bytes match");
+    }
+    assert_ne!(retained_plan(&Plan::raw("")),retained_plan(&Plan::control(Vec::new())),
+        "empty body and empty control are distinct executable plans");
+}
+#[test]
+fn c8protocol_unselected_ingress_retains_catalog_without_a_fake_binding() {
+    let row=protocol_row_data();validate_record(&row.record).unwrap();
+    assert_eq!(row.record.visible_epochs(),None);
+    assert_eq!(row.record.admission_scope(),registry_scope());
+    let back:Row=serde_json::from_slice(&serde_json::to_vec(&row).unwrap()).unwrap();
+    assert_eq!(back,row);
+    assert_eq!(back.record.source.ids,vec!["source-z","source-a"]);
+    assert_eq!(back.record.target.role.as_deref(),Some("worker"));
+    assert_eq!(protocol_data(&back).ingress.scope.socket_path,PathBuf::from("/private/socket-fixture"));
+    assert!(!format!("{:?}",back.record).contains("socket-fixture"));
+    assert!(!format!("{:?}",back.record).contains("private body"));
+}
+#[test]
+fn c8protocol_shape_refuses_other_intents_without_claiming_ingress_authority() {
+    for intent in [InputIntent::HumanTerminal,InputIntent::UserPathInsertion,
+        InputIntent::TerminalProtocol,InputIntent::TerminalDisplayControl] {
+        let mut row=protocol_row_data();protocol_data_mut(&mut row).ingress.intent=intent;
+        assert!(matches!(validate_record(&row.record),Err(StoreError::Invalid("intent outside durable automatic ingress"))));
+    }
+    let mut row=protocol_row_data();protocol_data_mut(&mut row).ingress.target_kind=TargetKind::Shell;
+    assert!(validate_record(&row.record).is_err());
+    protocol_data_mut(&mut row).ingress.intent=InputIntent::LifecycleLaunch;
+    assert!(validate_record(&row.record).is_ok(),"valid retained lifecycle DATA is not an executable lifecycle grant");
+}
+#[test]
+fn c8protocol_selection_shape_checks_all_fixed_scope_axes() {
+    let row=protocol_row_data();let p=protocol_data(&row);let good=selected_data();
+    selected_shape(&row.record,p,&good).unwrap();
+    for axis in 0..8 {
+        let mut bad=good.clone();match axis {
+            0=>bad.epochs.daemon_instance+=1,1=>bad.epochs.surface_instance+=1,2=>bad.epochs.launch+=1,
+            3=>bad.epochs.conversation+=1,4=>bad.epochs.policy+=1,5=>bad.epochs.binding=0,
+            6=>bad.catalog_id.push('x'),7=>bad.publication_ref.clear(),_=>unreachable!() }
+        assert!(selected_shape(&row.record,p,&bad).is_err(),"mismatched axis {axis}");
+    }
+    let mut weak=good;weak.class=ProofClass::ObservedAgentWeak;
+    assert!(selected_shape(&row.record,p,&weak).is_err());
+    weak.weak_risk=Some(WeakRisk::DeclaredCustomInvocation);
+    assert!(selected_shape(&row.record,p,&weak).is_ok(),"weak population is retained, not globally rejected");
+}
+#[test]
+fn c8protocol_association_window_is_retained_with_original_ingress() {
+    let mut row=protocol_row_data();row.record.plan=retained_plan(&Plan::paste("await original Return"));
+    protocol_data_mut(&mut row).ingress.submit=SubmitContract::AwaitingAssociation {
+        window_ms:crate::submit_assoc::LEGACY_ASSOCIATION_WINDOW_MS };
+    validate_record(&row.record).unwrap();
+    let back:Row=serde_json::from_slice(&serde_json::to_vec(&row).unwrap()).unwrap();
+    assert_eq!(back,row);
+    protocol_data_mut(&mut row).ingress.caller=None;
+    assert!(matches!(validate_record(&row.record),Err(StoreError::Invalid("submit contract does not match exact plan"))));
+}
+#[test]
+fn c8protocol_selection_and_revision_growth_use_admission_headroom() {
+    let row=protocol_row_data();let charged=checked_row_charge(&row,limits()).unwrap();
+    let mut selected=row.clone();let p=protocol_data_mut(&mut selected);
+    p.selected=Some(selected_data());p.revision=u64::MAX;
+    assert_eq!(checked_row_charge(&selected,limits()).unwrap(),charged,
+        "selected data + widest revision spend reserved bytes, not new capacity");
+    let mut too_small=row.clone();protocol_data_mut(&mut too_small).selected_reserve=limits().max_record_bytes;
+    assert!(matches!(checked_row_charge(&too_small,limits()),Err(StoreError::Capacity(_))),
+        "unfundable future selected lineage is refused before admission");
+    let mut oversized=row;protocol_data_mut(&mut oversized).selected=Some(selected_data());
+    protocol_data_mut(&mut oversized).selected.as_mut().unwrap().publication_ref="x".repeat(4096);
+    assert!(matches!(checked_row_charge(&oversized,limits()),Err(StoreError::Capacity("encoded bytes"))));
+}
+#[test]
+fn c8protocol_schema3_rejects_without_overwrite_or_migration() {
+    let scratch=Scratch::new("protocol-schema3");
+    let bytes=serde_json::to_vec(&Snapshot { schema:3,next_request_seq:1,next_settle_seq:1,
+        rows:vec![],registry:RegistryImage::default() }).unwrap();
+    write_private(&scratch.0.join(DATA),&bytes);
+    assert!(matches!(PendingStore::open(&scratch.0,11,limits()),Err(StoreError::Invalid("schema"))));
+    assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),bytes);
+}
+
+// Stored JSON fixture only. It is deliberately created while the store is CLOSED
+// and then recovered. This must never produce CurrentRequest/native authority.
+#[test]
+fn c8protocol_reopen_preserves_exact_data_but_mints_no_current_request() {
+    let scratch=Scratch::new("protocol-recover");let mut row=protocol_row_data();let registry;
+    {
+        let store=PendingStore::open_with_registry(&scratch.0,11,limits(),registry_limits()).unwrap();
+        let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("protocol")).unwrap();
+        row.record.registration_id=Some(cap.id().into());
+        let p=protocol_data_mut(&mut row);p.initial.registration_id=cap.id().into();
+        p.initial.catalog_id=cap.record.catalog_id.clone();p.initial.contract_key=cap.record.contract_key.clone();
+        registry=store.try_mutation().unwrap().registry.as_ref().clone();
+    }
+    let bytes=serde_json::to_vec(&Snapshot { schema:SCHEMA,next_request_seq:2,next_settle_seq:1,
+        rows:vec![row.clone()],registry }).unwrap();
+    fs::write(scratch.0.join(DATA),&bytes).unwrap();
+    let store=PendingStore::open_with_registry(&scratch.0,11,limits(),registry_limits()).unwrap();
+    assert_eq!(store.inspect_exact_record(&row.record.request_id).unwrap(),row.record);
+    assert!(matches!(store.join_existing(&row.record),Ok(Admission::RecoveredOnly)));
+    assert!(store.try_mutation().unwrap().current_requests.is_empty());
+    let status=store.status(&row.record.request_id).unwrap().unwrap();
+    assert!(status.recovered);assert_eq!(status.epochs,None);
+    assert!(matches!(store.record_terminal(&row.record.request_id,terminal(&row.record.request_id,RetiredReason::WrittenSubmitted)),
+        Err(StoreError::Invalid("typed protocol writer receipt required"))));
+    assert!(matches!(store.mark_settled(&row.record.request_id,settlement(SettlementKind::ProducerSettled,1)),
+        Err(StoreError::Invalid("typed protocol consumer settlement required"))));
+    assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),bytes);
+}
+
+struct RefuseProtocolIngress;
+impl IngressAuthority for RefuseProtocolIngress {
+    fn validate_and_consume(self,_:&NewProtocolSpec,_:&RegisteredCatalog)->Result<(),ProtocolError> {
+        Err(ProtocolError::Authority("intentional denial fixture".into()))
+    }
+}
+fn denied_protocol_spec() -> NewProtocolSpec {
+    let row=protocol_row_data();let ingress=protocol_data(&row).ingress.clone();
+    NewProtocolSpec { obligation_id:row.record.obligation_id,source:row.record.source,target:row.record.target,
+        ingress,original_body_digest:row.record.original_body_digest,received_epoch_ms:row.record.received_epoch_ms,
+        received_at:Instant::now(),plan:Plan::paste("private body\n한글").with_clear(37).with_submit(421,159),
+        origin:"protocol-fixture" }
+}
+#[test]
+fn c8protocol_ingress_denial_does_not_advance_ids_or_publish_runtime_owner() {
+    let scratch=Scratch::new("protocol-denial");
+    let store=PendingStore::open_with_registry(&scratch.0,11,limits(),registry_limits()).unwrap();
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("protocol")).unwrap();
+    let before=fs::read(scratch.0.join(DATA)).unwrap();
+    let seq=store.try_mutation().unwrap().next_request_seq;
+    assert!(matches!(store.accept_protocol(denied_protocol_spec(),&cap,RefuseProtocolIngress,
+        ProtocolLimits { max_selected_lineage_bytes:2048 }),Err(ProtocolError::Authority(_))));
+    assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),before);
+    let state=store.try_mutation().unwrap();assert_eq!(state.next_request_seq,seq);
+    assert!(state.current_requests.is_empty());assert!(state.rows.is_empty());
+}
+#[test]
+fn c8protocol_submit_is_existing_operation_only_even_with_caller_data() {
+    let scratch=Scratch::new("protocol-submit");
+    let store=PendingStore::open_with_registry(&scratch.0,11,limits(),registry_limits()).unwrap();
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("protocol")).unwrap();
+    let before=fs::read(scratch.0.join(DATA)).unwrap();let mut spec=denied_protocol_spec();
+    spec.ingress.intent=InputIntent::AgentSubmit;spec.plan=Plan::submit_only(0);
+    spec.ingress.submit=SubmitContract::BoundToCompletedBody { body_request_id:"previous-body".into(),body_lineage:selected_data() };
+    assert!(matches!(store.accept_protocol(spec,&cap,RefuseProtocolIngress,
+        ProtocolLimits { max_selected_lineage_bytes:2048 }),Err(ProtocolError::NeedsExistingRequest)));
+    assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),before);
+}
+
+// Synthetic upstream authorization ASSUMPTIONS for storage/lease tests only. The grants
+// compare exact captured inputs; they are not real caller/native authority or production factories.
+#[derive(PartialEq,Eq)]
+struct FixtureIngressFacts {
+    obligation:String,source:SourceRef,target:Target,ingress:ImmutableIngress,digest:String,
+    at_ms:u64,at:Instant,plan:Plan,origin:&'static str,
+}
+impl FixtureIngressFacts {
+    fn of(s:&NewProtocolSpec)->Self { Self { obligation:s.obligation_id.clone(),source:s.source.clone(),target:s.target.clone(),
+        ingress:s.ingress.clone(),digest:s.original_body_digest.clone(),at_ms:s.received_epoch_ms,at:s.received_at,
+        plan:s.plan.clone(),origin:s.origin } }
+}
+struct FixtureIngressGrant { facts:FixtureIngressFacts,registration:Arc<RegisteredCatalog> }
+impl IngressAuthority for FixtureIngressGrant {
+    fn validate_and_consume(self,spec:&NewProtocolSpec,registration:&RegisteredCatalog)->Result<(),ProtocolError> {
+        if self.facts!=FixtureIngressFacts::of(spec) || !std::ptr::eq(self.registration.as_ref(),registration) {
+            return Err(ProtocolError::Authority("fixture ingress inputs changed".into()));
+        }
+        registration.check_live()?;Ok(())
+    }
+}
+struct FixtureSelectionGrant {
+    current:Arc<CurrentRequest>,data:ProtocolData,selected:SelectedLineage,calls:Arc<AtomicU64>,
+}
+impl InitialSelectionAuthority for FixtureSelectionGrant {
+    fn validate_and_consume(self,request:&Arc<Request>,plan:&Plan,ingress:&ImmutableIngress,
+        initial:&InitialCatalog,expected:u64)->Result<SelectedLineage,ProtocolError> {
+        self.calls.fetch_add(1,Ordering::SeqCst);
+        if !Arc::ptr_eq(request,self.current.request()) || plan!=self.current.plan() || ingress!=&self.data.ingress
+            || initial!=&self.data.initial || expected!=self.data.revision {
+            return Err(ProtocolError::Authority("fixture selection inputs changed".into()));
+        }
+        Ok(self.selected)
+    }
+}
+fn fixture_protocol_admit(store:&PendingStore,cap:&Arc<RegisteredCatalog>,at:Instant)->Arc<CurrentRequest> {
+    let mut spec=denied_protocol_spec();spec.received_at=at;
+    let grant=FixtureIngressGrant { facts:FixtureIngressFacts::of(&spec),registration:cap.clone() };
+    store.accept_protocol(spec,cap,grant,ProtocolLimits { max_selected_lineage_bytes:2048 }).unwrap()
+}
+fn fixture_selection(store:&PendingStore,current:&Arc<CurrentRequest>,revision:u64)->FixtureSelectionGrant {
+    let data=store.current_revision(current,revision).unwrap();
+    let contract=current.initial_registration.catalog().unwrap().get(Some("custom")).unwrap();let p=&contract.policy;
+    let selected=SelectedLineage { catalog_id:data.initial.catalog_id.clone(),adapter:p.adapter.clone(),config_digest:p.config_digest.clone(),
+        epochs:Epochs { daemon_instance:data.ingress.scope.daemon_instance,surface_instance:data.ingress.scope.surface_instance,
+            launch:data.ingress.scope.launch,conversation:data.ingress.scope.conversation,policy:data.initial.policy_epoch,binding:16 },
+        class:p.class,weak_risk:p.weak_risk,publication_ref:"SYNTHETIC_UPSTREAM_SELECTION".into() };
+    FixtureSelectionGrant { current:current.clone(),data,selected,calls:Arc::new(AtomicU64::new(0)) }
+}
+#[test]
+fn c8protocol_live_owner_selection_commits_same_request_plan_and_age() {
+    let scratch=Scratch::new("protocol-current");let store=PendingStore::open_with_registry(&scratch.0,11,limits(),registry_limits()).unwrap();
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("protocol")).unwrap();
+    let at=Instant::now()-Duration::from_secs(7);let current=fixture_protocol_admit(&store,&cap,at);let original=current.request().clone();let plan=current.plan().clone();
+    assert_eq!(original.created,at);assert!(store.current_revision(&current,1).unwrap().selected.is_none());
+    let before=store.inspect_exact_record(current.id()).unwrap();
+    let grant=fixture_selection(&store,&current,1);let selected=grant.selected.clone();let edit=original.reserve_zero_write_edit().unwrap();
+    assert_eq!(store.select_initial_lineage(&current,1,edit,grant).unwrap(),2);
+    assert!(Arc::ptr_eq(&original,current.request()));assert_eq!(current.plan(),&plan);assert_eq!(current.received_at(),at);
+    let after=store.inspect_exact_record(current.id()).unwrap();assert_eq!(after.plan,before.plan);assert_eq!(after.source,before.source);
+    assert_eq!(after.original_body_digest,before.original_body_digest);assert_eq!(after.received_epoch_ms,before.received_epoch_ms);
+    let image:Snapshot=serde_json::from_slice(&fs::read(scratch.0.join(DATA)).unwrap()).unwrap();
+    let stored=image.rows.iter().find(|r|r.record.request_id==current.id()).unwrap();
+    assert_eq!(protocol_data(stored).selected,Some(selected));assert_eq!(protocol_data(stored).revision,2);
+    assert!(matches!(store.current_revision(&current,1),Err(ProtocolError::RevisionChanged)));
+    assert!(original.reserve_attempt(&plan,None).is_ok(),"committed same-plan edit did not release its reservation");
+}
+#[test]
+fn c8protocol_idempotent_selection_requires_a_reserved_edit() {
+    let scratch=Scratch::new("protocol-idempotent");let store=PendingStore::open_with_registry(&scratch.0,11,limits(),registry_limits()).unwrap();
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("protocol")).unwrap();let current=fixture_protocol_admit(&store,&cap,Instant::now());
+    store.select_initial_lineage(&current,1,current.request().reserve_zero_write_edit().unwrap(),fixture_selection(&store,&current,1)).unwrap();
+    let before=fs::read(scratch.0.join(DATA)).unwrap();
+    assert_eq!(store.select_initial_lineage(&current,2,current.request().reserve_zero_write_edit().unwrap(),fixture_selection(&store,&current,2)).unwrap(),2);
+    let mut edit=current.request().reserve_zero_write_edit().unwrap();let _stamp=edit.begin_persisting(current.plan()).unwrap();
+    let grant=fixture_selection(&store,&current,2);let calls=grant.calls.clone();let result=store.select_initial_lineage(&current,2,edit,grant);
+    assert!(result.is_err()&&calls.load(Ordering::SeqCst)==0,"an unresolved Persisting edit reached authority or reported idempotent success");
+    assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),before);assert_eq!(store.current_revision(&current,2).unwrap().revision,2);
+    assert!(matches!(current.request().reserve_attempt(current.plan(),None),Err(crate::agent_write::LeaseError::Busy)),
+        "refusing a pre-Persisting edit released its unresolved exclusion");
+}
+#[test]
+fn c8protocol_proved_preinstall_failure_resolves_edit_without_changing_data() {
+    let scratch=Scratch::new("protocol-nochange");let disk=Arc::new(SwitchDisk { fail:AtomicBool::new(false) });
+    let store=PendingStore::open_registry_with(&scratch.0,11,limits(),Some(registry_limits()),disk.clone()).unwrap();
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("protocol")).unwrap();let current=fixture_protocol_admit(&store,&cap,Instant::now());
+    let before=fs::read(scratch.0.join(DATA)).unwrap();disk.fail.store(true,Ordering::Release);
+    let result=store.select_initial_lineage(&current,1,current.request().reserve_zero_write_edit().unwrap(),fixture_selection(&store,&current,1));
+    assert!(matches!(result,Err(ProtocolError::Store(StoreError::Io { installed:false,.. }))));
+    assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),before);assert!(store.current_revision(&current,1).unwrap().selected.is_none());
+    let lease=current.request().reserve_attempt(current.plan(),None).expect("proved pre-install no-change must resolve its own edit");drop(lease);
+    disk.fail.store(false,Ordering::Release);
+    assert_eq!(store.select_initial_lineage(&current,1,current.request().reserve_zero_write_edit().unwrap(),fixture_selection(&store,&current,1)).unwrap(),2);
+}
+#[test]
+fn c8protocol_uncertain_selection_keeps_edit_and_recovers_only_data() {
+    let scratch=Scratch::new("protocol-uncertain");let disk=Arc::new(PanicOnceAfterReplace(AtomicBool::new(false)));
+    let store=PendingStore::open_registry_with(&scratch.0,11,limits(),Some(registry_limits()),disk.clone()).unwrap();
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("protocol")).unwrap();let current=fixture_protocol_admit(&store,&cap,Instant::now());
+    let grant=fixture_selection(&store,&current,1);let edit=current.request().reserve_zero_write_edit().unwrap();disk.0.store(true,Ordering::Release);
+    let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||store.select_initial_lineage(&current,1,edit,grant)));
+    assert!(result.is_err());assert!(matches!(store.current_revision(&current,1),Err(ProtocolError::Store(StoreError::UncertainCommit))));
+    assert!(matches!(current.request().reserve_attempt(current.plan(),None),Err(crate::agent_write::LeaseError::Busy)),
+        "uncertain selected replacement released its native edit reservation");
+    let image:Snapshot=serde_json::from_slice(&fs::read(scratch.0.join(DATA)).unwrap()).unwrap();
+    assert_eq!(protocol_data(&image.rows[0]).revision,2,"premise: candidate really reached disk before unwind");
+    drop(store);let reopened=PendingStore::open_with_registry(&scratch.0,11,limits(),registry_limits()).unwrap();
+    assert!(reopened.try_mutation().unwrap().current_requests.is_empty());
+    assert!(matches!(reopened.current_revision(&current,2),Err(ProtocolError::Inactive)));
+    assert!(reopened.status(current.id()).unwrap().unwrap().recovered);
+}
+#[test]
+fn c8protocol_failed_admission_grants_no_current_request_or_new_highwater() {
+    let scratch=Scratch::new("protocol-admission-failure");let disk=Arc::new(SwitchDisk { fail:AtomicBool::new(false) });
+    let store=PendingStore::open_registry_with(&scratch.0,11,limits(),Some(registry_limits()),disk.clone()).unwrap();
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("protocol")).unwrap();let before=fs::read(scratch.0.join(DATA)).unwrap();
+    let at=Instant::now()-Duration::from_secs(9);let mut spec=denied_protocol_spec();spec.received_at=at;
+    let grant=FixtureIngressGrant { facts:FixtureIngressFacts::of(&spec),registration:cap.clone() };disk.fail.store(true,Ordering::Release);
+    assert!(matches!(store.accept_protocol(spec,&cap,grant,ProtocolLimits { max_selected_lineage_bytes:2048 }),Err(ProtocolError::Store(StoreError::Io { installed:false,.. }))));
+    assert_eq!(fs::read(scratch.0.join(DATA)).unwrap(),before);
+    { let state=store.try_mutation().unwrap();assert!(state.current_requests.is_empty());assert_eq!(state.next_request_seq,1); }
+    disk.fail.store(false,Ordering::Release);let current=fixture_protocol_admit(&store,&cap,at);
+    assert_eq!(current.id(),"wb-1");assert_eq!(current.request().created,at);
+}
+#[test]
+fn c8protocol_selection_fsync_holds_exclusion_without_native_mutex_or_early_data() {
+    let scratch=Scratch::new("protocol-select-fsync");let (entered,seen)=mpsc::channel();let (release,wait)=mpsc::channel();
+    let disk=Arc::new(BlockingDisk { entered,release:Mutex::new(wait),block_once:AtomicBool::new(false) });
+    let store=Arc::new(PendingStore::open_registry_with(&scratch.0,11,limits(),Some(registry_limits()),disk.clone()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("protocol")).unwrap();let current=fixture_protocol_admit(&store,&cap,Instant::now());
+    let grant=fixture_selection(&store,&current,1);let edit=current.request().reserve_zero_write_edit().unwrap();
+    disk.block_once.store(true,Ordering::Release);let writer_store=store.clone();let writer_current=current.clone();
+    let writer=std::thread::spawn(move||writer_store.select_initial_lineage(&writer_current,1,edit,grant));seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    let reader_store=store.clone();let reader_current=current.clone();let (sent,received)=mpsc::channel();
+    let reader=std::thread::spawn(move||sent.send((reader_store.status(reader_current.id()),reader_current.request().native_progress(),
+        matches!(reader_current.request().reserve_attempt(reader_current.plan(),None),Err(crate::agent_write::LeaseError::Busy)))).unwrap());
+    let observed=received.recv_timeout(Duration::from_millis(300));release.send(()).unwrap();let result=writer.join().unwrap();reader.join().unwrap();
+    assert!(observed.is_ok(),"selection fsync blocked status/native progress on a held native mutex");
+    let (status,progress,busy)=observed.unwrap();assert!(status.unwrap().unwrap().epochs.is_none()&&progress.proven_zero()&&busy,
+        "selection published early or released the actual request exclusion before fsync");
+    assert_eq!(result.unwrap(),2);assert!(current.request().reserve_attempt(current.plan(),None).is_ok());
+}
+
+#[test]
+fn c8protocol_postinstall_error_cannot_mint_not_written_resolution() {
+    struct InstalledError(AtomicBool);
+    impl Disk for InstalledError {
+        fn replace(&self,root:&Path,bytes:&[u8])->Result<Durability,CommitFailure> {
+            let level=RealDisk.replace(root,bytes)?;
+            if self.0.load(Ordering::Acquire) { Err(CommitFailure { stage:"fixture_after_install",installed:true,uncertain:true,
+                message:"controlled post-install error".into() }) } else { Ok(level) }
+        }
+    }
+    let scratch=Scratch::new("protocol-installed-error");let disk=Arc::new(InstalledError(AtomicBool::new(false)));
+    let store=PendingStore::open_registry_with(&scratch.0,11,limits(),Some(registry_limits()),disk.clone()).unwrap();
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("protocol")).unwrap();let current=fixture_protocol_admit(&store,&cap,Instant::now());
+    let grant=fixture_selection(&store,&current,1);let edit=current.request().reserve_zero_write_edit().unwrap();disk.0.store(true,Ordering::Release);
+    let result=store.select_initial_lineage(&current,1,edit,grant);
+    assert!(matches!(result,Err(ProtocolError::Store(StoreError::Io { installed:true,.. }))));
+    assert!(matches!(current.request().reserve_attempt(current.plan(),None),Err(crate::agent_write::LeaseError::Busy)),
+        "post-install error was treated as proved not-written and released its edit");
+    assert!(matches!(store.current_revision(&current,1),Err(ProtocolError::Store(StoreError::UncertainCommit))));
+    let disk:Snapshot=serde_json::from_slice(&fs::read(scratch.0.join(DATA)).unwrap()).unwrap();assert_eq!(protocol_data(&disk.rows[0]).revision,2);
+}
 }

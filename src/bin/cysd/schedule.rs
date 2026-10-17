@@ -2576,6 +2576,7 @@ fn inject_on(
         .then(|| surface.input_gate.lock().unwrap_or_else(|e| e.into_inner()));
     settle.gen_at_handoff = surface.input_gen.load(std::sync::atomic::Ordering::Acquire);
     let job = crate::agent_write::AgentJob {
+        attempt: None,
         request: Arc::clone(&request),
         plan,
         proof,

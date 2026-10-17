@@ -563,7 +563,7 @@ impl Write for PrefixThenError {
 fn actual_partial_request()->Arc<Request> {
     use crate::agent_write::{self,AgentJob,Plan,PassThrough,WriterIo,Terminal};
     let request=Request::new(format!("partial-{}",NEXT.fetch_add(1,Ordering::Relaxed)),7,"native-fixture","digest".into());
-    let job=AgentJob { request:request.clone(),plan:Plan::raw("abcdef").with_submit(0,0),proof:Arc::new(PassThrough),
+    let job=AgentJob { attempt:None,request:request.clone(),plan:Plan::raw("abcdef").with_submit(0,0),proof:Arc::new(PassThrough),
         journal:None,resume:None,settle:None,guard:None,note_body:false,body_owner:None };
     let mut writer=PrefixThenError { accepted:vec![],calls:0 };let mut anchor=None;let mut first=||{};let mut body=|_:&str|{};
     let mut io=WriterIo { sleep:&|_|{},last_program_write:&mut anchor,on_first_byte:&mut first,on_body_written:&mut body };

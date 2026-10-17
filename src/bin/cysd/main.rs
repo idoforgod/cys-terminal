@@ -25,6 +25,7 @@ macro_rules! eprint {
 
 mod accounts;
 mod agent_write;
+mod input_intent;
 mod alert_route;
 mod alerts;
 mod analytics;

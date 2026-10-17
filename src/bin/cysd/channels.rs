@@ -1683,6 +1683,7 @@ fn inject_master_confirmed(
         request_id: request_id.clone(),
     };
     let job = crate::agent_write::AgentJob {
+        attempt: None,
         request,
         plan: crate::agent_write::Plan::paste(envelope).with_submit(500, 0),
         proof,

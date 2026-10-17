@@ -220,21 +220,32 @@ pub struct Request {
     /// When the receiver proof was last lost (admission or recheck): the S4-1 resume window counts from here.
     lost_at: Mutex<Option<Instant>>,
     native: Mutex<NativeState>,
+    managed: bool,
 }
 
 impl Request {
     pub fn new(id: String, surface_id: u64, origin: &'static str, digest: String) -> Arc<Request> {
+        Self::new_mode(id, surface_id, origin, digest, Instant::now(), None)
+    }
+    pub(crate) fn new_managed(id: String, surface_id: u64, origin: &'static str, digest: String, plan: &Plan) -> Arc<Request> {
+        Self::new_managed_at(id, surface_id, origin, digest, Instant::now(), plan)
+    }
+    pub(crate) fn new_managed_at(id: String, surface_id: u64, origin: &'static str, digest: String, received_at: Instant, plan: &Plan) -> Arc<Request> {
+        Self::new_mode(id, surface_id, origin, digest, received_at, Some(plan))
+    }
+    fn new_mode(id: String, surface_id: u64, origin: &'static str, digest: String, received_at: Instant, admitted_plan: Option<&Plan>) -> Arc<Request> {
         Arc::new(Request {
             id,
             surface_id,
             origin,
             digest,
-            created: Instant::now(),
+            created: received_at,
             cancelled: AtomicBool::new(false),
             status: Mutex::new(Status::AcceptedPending),
             settled: AtomicBool::new(false),
             lost_at: Mutex::new(None),
-            native: Mutex::new(NativeState::default()),
+            native: Mutex::new(NativeState { plan: admitted_plan.cloned(), ..NativeState::default() }),
+            managed: admitted_plan.is_some(),
         })
     }
     /// The terminal is recorded and in-process settlement ended; this is not a durable source receipt.
@@ -243,7 +254,14 @@ impl Request {
     }
     /// Request cancellation: revokes LATER calls only; an issued call is never interrupted (S-a).
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        // Managed edit commit and cancellation have one linearization mutex.
+        // No native mutex is held across a disk operation, proof or native call.
+        if self.managed {
+            let _state = self.native.lock().unwrap_or_else(|e| e.into_inner());
+            self.cancelled.store(true, Ordering::Release);
+        } else {
+            self.cancelled.store(true, Ordering::Release);
+        }
     }
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Acquire)
@@ -299,28 +317,307 @@ struct NativeState {
     final_outcome: bool,
     completion_key: Option<Arc<()>>,
     settling: bool,
+    operation: Option<ManagedOperation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaseError {
+    Unmanaged, Cancelled, Busy, NativeConflict, WrongRequest, WrongLease,
+    AlreadyStarted, PlanChanged, ResumeChanged, EditNotPersisting, ResolutionMismatch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttemptPhase { Prepared, Started }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditPhase { Reserved, Persisting }
+
+enum ManagedOperation {
+    Attempt { key: Arc<()>, phase: AttemptPhase },
+    Edit { key: Arc<()>, phase: EditPhase },
+}
+
+/// Non-Clone capability carried by the actual queued job. No Request-id comparison.
+pub(crate) struct AttemptLease {
+    request: Arc<Request>, key: Arc<()>, plan: Plan, resume: Option<Envelope>,
+}
+
+/// Opaque in-memory association identity; not serializable and not a completion proof.
+/// A restarted daemon must reconstruct authority through its durable recovery protocol.
+#[derive(Clone)]
+pub(crate) struct AttemptStamp {
+    request: Arc<Request>, key: Arc<()>, plan: Plan, resume: Option<Envelope>,
+}
+
+/// Exclusive zero-byte edit ownership. No native mutex survives a public method.
+pub(crate) struct ZeroWriteEditLease {
+    request: Arc<Request>, key: Arc<()>, original_plan: Option<Plan>,
+}
+
+/// An edit's opaque identity and exact pre-edit plan. Possession alone never means
+/// the disk CAS committed, submit ownership exists, or lineage is authorized.
+#[derive(Clone)]
+pub(crate) struct EditStamp {
+    request: Arc<Request>, key: Arc<()>, original_plan: Option<Plan>,
+}
+
+/// No public constructor/Clone. Selection-specific issuance is bound to the actual
+/// pending store CAS by the typed bridge below; no generic public issuer exists.
+/// Tests may construct these module-private fields as explicit synthetic receipts.
+struct DurableEditCommit { stamp: EditStamp }
+struct DurableEditNoChange { stamp: EditStamp }
+enum DurableEditResolution {
+    Committed(DurableEditCommit),
+    NotWritten(DurableEditNoChange),
+}
+
+impl NativeState {
+    /// Existing begin_run rule shared by reservation and execution. This does not
+    /// calculate byte progress; NativeCall remains its only native-I/O producer.
+    fn permits_run(&self, plan: &Plan, resume: Option<Envelope>) -> bool {
+        let p = self.progress;
+        let permitted = match resume {
+            Some(env) => self.resume == Some(env) && env == p.envelope,
+            None => self.resume.is_none() && p.proven_zero(),
+        };
+        !self.running && !self.settling && !self.final_outcome
+            && !p.outstanding && !p.unknown && permitted
+            && self.plan.as_ref().is_none_or(|original| original == plan)
+    }
+
+    fn permits_zero_edit(&self) -> bool {
+        self.plan.is_some() && self.progress.proven_zero() && !self.running && !self.settling
+            && !self.final_outcome && self.resume.is_none() && self.completion_key.is_none()
+    }
+}
+
+impl Request {
+    /// Reserve BEFORE Prepared is published or the job is queued. The lease binds
+    /// the actual object, exact plan, and exact starting resume envelope.
+    pub(crate) fn reserve_attempt(
+        self: &Arc<Self>, plan: &Plan, resume: Option<Envelope>,
+    ) -> Result<AttemptLease, LeaseError> {
+        if !self.managed { return Err(LeaseError::Unmanaged); }
+        let mut state = self.native.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_cancelled() { return Err(LeaseError::Cancelled); }
+        if state.operation.is_some() { return Err(LeaseError::Busy); }
+        if !state.permits_run(plan, resume) { return Err(LeaseError::NativeConflict); }
+        let key = Arc::new(());
+        state.operation = Some(ManagedOperation::Attempt { key: key.clone(), phase: AttemptPhase::Prepared });
+        Ok(AttemptLease { request: self.clone(), key, plan: plan.clone(), resume })
+    }
+
+    pub(crate) fn reserve_zero_write_edit(self: &Arc<Self>) -> Result<ZeroWriteEditLease, LeaseError> {
+        if !self.managed { return Err(LeaseError::Unmanaged); }
+        let mut state = self.native.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_cancelled() { return Err(LeaseError::Cancelled); }
+        if state.operation.is_some() { return Err(LeaseError::Busy); }
+        if !state.permits_zero_edit() { return Err(LeaseError::NativeConflict); }
+        let key = Arc::new(());
+        let original_plan = state.plan.clone();
+        state.operation = Some(ManagedOperation::Edit { key: key.clone(), phase: EditPhase::Reserved });
+        Ok(ZeroWriteEditLease { request: self.clone(), key, original_plan })
+    }
+}
+
+impl AttemptLease {
+    /// Pure validation for the pending protocol's in-memory association. No disk
+    /// result and no authority for submit/lineage is inferred by returning a stamp.
+    pub(crate) fn validate_prepared(
+        &self, request: &Arc<Request>, plan: &Plan, resume: Option<Envelope>,
+    ) -> Result<AttemptStamp, LeaseError> {
+        if !Arc::ptr_eq(request, &self.request) { return Err(LeaseError::WrongRequest); }
+        if plan != &self.plan { return Err(LeaseError::PlanChanged); }
+        if resume != self.resume { return Err(LeaseError::ResumeChanged); }
+        let state = request.native.lock().unwrap_or_else(|e| e.into_inner());
+        if request.is_cancelled() { return Err(LeaseError::Cancelled); }
+        match &state.operation {
+            Some(ManagedOperation::Attempt { key, phase: AttemptPhase::Prepared })
+                if Arc::ptr_eq(key, &self.key) && state.permits_run(plan, resume) =>
+                    Ok(AttemptStamp { request: request.clone(), key: self.key.clone(), plan: self.plan.clone(), resume: self.resume }),
+            Some(ManagedOperation::Attempt { key, phase: AttemptPhase::Started })
+                if Arc::ptr_eq(key, &self.key) => Err(LeaseError::AlreadyStarted),
+            _ => Err(LeaseError::WrongLease),
+        }
+    }
+}
+
+impl Drop for AttemptLease {
+    fn drop(&mut self) {
+        let mut state = self.request.native.lock().unwrap_or_else(|e| e.into_inner());
+        let own_unstarted = matches!(&state.operation,
+            Some(ManagedOperation::Attempt { key, phase: AttemptPhase::Prepared })
+                if Arc::ptr_eq(key, &self.key));
+        if own_unstarted && !state.running && !state.settling
+            && !state.progress.outstanding && !state.progress.unknown {
+            state.operation = None;
+        }
+        // Started/uncertain ownership survives a dropped queue/job/handle. Only
+        // real finish or a future typed reconciliation protocol can resolve it.
+    }
+}
+
+impl ZeroWriteEditLease {
+    /// Read-only ownership check for a held pending-protocol adapter. Success is
+    /// only this native exclusion relation; it is not durable CAS authorization.
+    pub(crate) fn validate_held(&self, request: &Arc<Request>, plan: &Plan) -> Result<(), LeaseError> {
+        self.validate_phase(request,plan,None)
+    }
+    /// Initial metadata mutation cannot accept an already unresolved persistence operation.
+    pub(crate) fn validate_reserved(&self,request:&Arc<Request>,plan:&Plan)->Result<(),LeaseError> {
+        self.validate_phase(request,plan,Some(EditPhase::Reserved))
+    }
+    fn validate_phase(&self,request:&Arc<Request>,plan:&Plan,required:Option<EditPhase>)->Result<(),LeaseError> {
+        if !Arc::ptr_eq(request, &self.request) { return Err(LeaseError::WrongRequest); }
+        if self.original_plan.as_ref() != Some(plan) { return Err(LeaseError::PlanChanged); }
+        let state = request.native.lock().unwrap_or_else(|e| e.into_inner());
+        if request.is_cancelled() { return Err(LeaseError::Cancelled); }
+        if !state.permits_zero_edit() || state.plan != self.original_plan {
+            return Err(LeaseError::NativeConflict);
+        }
+        match &state.operation {
+            Some(ManagedOperation::Edit { key, phase }) if Arc::ptr_eq(key, &self.key)
+                && required.is_none_or(|wanted|wanted==*phase) => Ok(()),
+            _ => Err(LeaseError::WrongLease),
+        }
+    }
+
+    fn stamp(&self) -> EditStamp {
+        EditStamp { request: self.request.clone(), key: self.key.clone(), original_plan: self.original_plan.clone() }
+    }
+
+    /// Enter before starting disk/CAS work; this method returns with NO mutex held.
+    /// Once persistence may have started, Drop cannot assume rollback/no change.
+    pub(crate) fn begin_persisting(&mut self, plan: &Plan) -> Result<EditStamp, LeaseError> {
+        let mut state = self.request.native.lock().unwrap_or_else(|e| e.into_inner());
+        if self.request.is_cancelled() { return Err(LeaseError::Cancelled); }
+        if self.original_plan.as_ref() != Some(plan) { return Err(LeaseError::PlanChanged); }
+        if !state.permits_zero_edit() || state.plan != self.original_plan {
+            return Err(LeaseError::NativeConflict);
+        }
+        match &mut state.operation {
+            Some(ManagedOperation::Edit { key, phase })
+                if Arc::ptr_eq(key, &self.key) && *phase == EditPhase::Reserved => {
+                    *phase = EditPhase::Persisting;
+                    Ok(self.stamp())
+                }
+            _ => Err(LeaseError::WrongLease),
+        }
+    }
+
+    /// Commit/rollback ONLY from a non-forgeable durable-domain resolution. This
+    /// draft intentionally has no production issuer for that resolution type.
+    fn resolve(self, resolution: DurableEditResolution) -> Result<(), LeaseError> {
+        let (stamp, committed) = match resolution {
+            DurableEditResolution::Committed(receipt) => (receipt.stamp, true),
+            DurableEditResolution::NotWritten(receipt) => (receipt.stamp, false),
+        };
+        if !Arc::ptr_eq(&stamp.request, &self.request) || !Arc::ptr_eq(&stamp.key, &self.key)
+            || stamp.original_plan != self.original_plan {
+            return Err(LeaseError::ResolutionMismatch);
+        }
+        let mut state = self.request.native.lock().unwrap_or_else(|e| e.into_inner());
+        let own = matches!(&state.operation,
+            Some(ManagedOperation::Edit { key, phase: EditPhase::Persisting }) if Arc::ptr_eq(key, &self.key));
+        if !own { return Err(LeaseError::EditNotPersisting); }
+        if !state.permits_zero_edit() || state.plan != self.original_plan {
+            return Err(LeaseError::NativeConflict);
+        }
+        if committed && self.request.is_cancelled() {
+            // Disk may have committed while cancellation arrived. Keep the
+            // reservation for durable reconciliation; never revive this request.
+            return Err(LeaseError::Cancelled);
+        }
+        state.operation = None;
+        // This slice NEVER changes the admitted Plan. It only resolves an edit to
+        // durable association/lineage metadata under the separate domain token.
+        // No final_outcome, native counts, resume permission, cancellation, submit
+        // slot, binding/conversation epoch, body lineage or durable ID is reset.
+        Ok(())
+    }
+}
+
+impl Drop for ZeroWriteEditLease {
+    fn drop(&mut self) {
+        let mut state = self.request.native.lock().unwrap_or_else(|e| e.into_inner());
+        let own_reserved = matches!(&state.operation,
+            Some(ManagedOperation::Edit { key, phase: EditPhase::Reserved }) if Arc::ptr_eq(key, &self.key));
+        if own_reserved && state.permits_zero_edit() {
+            state.operation = None;
+        }
+        // Persisting is not rolled back by timeout/drop; disk outcome is unknown.
+    }
+}
+
+/// Writer-created only after an actual managed lease start. This is not a public
+/// ProofContext constructor or an assertion that a durable pending CAS succeeded.
+pub struct AttemptStartReceipt<'a> {
+    request: &'a Arc<Request>, key: &'a Arc<()>, plan: &'a Plan, resume: Option<Envelope>,
+}
+pub(crate) struct StartedAttempt<'r, 'c> { start: &'r AttemptStartReceipt<'c> }
+impl<'c> AttemptStartReceipt<'c> {
+    pub(crate) fn for_attempt<'r>(&'r self, stamp: &AttemptStamp) -> Result<StartedAttempt<'r, 'c>, LeaseError> {
+        if !self.request.managed || !Arc::ptr_eq(self.request, &stamp.request)
+            || !Arc::ptr_eq(self.key, &stamp.key) || self.plan != &stamp.plan || self.resume != stamp.resume {
+            return Err(LeaseError::WrongLease);
+        }
+        Ok(StartedAttempt { start: self })
+    }
+}
+impl StartedAttempt<'_, '_> {
+    pub(crate) fn request(&self) -> &Request { self.start.request }
+    pub(crate) fn plan(&self) -> &Plan { self.start.plan }
+    pub(crate) fn resume(&self) -> Option<Envelope> { self.start.resume }
+}
+
+/// A private completion tied to the exact Prepared association. It is still only
+/// writer provenance, not proof that the producer's durable transaction closed.
+pub(crate) struct AttemptReceipt<'r, 'c> { receipt: &'r WriterReceipt<'c> }
+impl<'c> WriterReceipt<'c> {
+    pub(crate) fn for_attempt<'r>(&'r self, stamp: &AttemptStamp) -> Result<AttemptReceipt<'r, 'c>, LeaseError> {
+        if !self.completed.request.managed || !Arc::ptr_eq(&stamp.request, &self.completed.request)
+            || !Arc::ptr_eq(&stamp.key, &self.completed.key) || stamp.plan != self.completed.plan
+            || stamp.resume.is_some() != self.completed.resumed {
+            return Err(LeaseError::WrongLease);
+        }
+        Ok(AttemptReceipt { receipt: self })
+    }
+}
+impl<'r, 'c> AttemptReceipt<'r, 'c> {
+    pub(crate) fn writer(&self) -> &WriterReceipt<'c> { self.receipt }
 }
 
 impl Request {
     pub fn native_progress(&self) -> NativeProgress {
         self.native.lock().unwrap_or_else(|e| e.into_inner()).progress
     }
-    fn begin_run(&self, plan: &Plan, resume: Option<Envelope>) -> Result<Arc<()>, NativeProgress> {
+    fn begin_run(
+        self: &Arc<Self>, plan: &Plan, resume: Option<Envelope>, attempt: Option<&AttemptLease>,
+    ) -> Result<Arc<()>, NativeProgress> {
         let mut state=self.native.lock().unwrap_or_else(|e| e.into_inner());
         let p=state.progress;
-        let permitted=match resume {
-            Some(env)=>state.resume==Some(env) && env==p.envelope,
-            None=>state.resume.is_none() && p.proven_zero(),
+        if !state.permits_run(plan,resume) { return Err(p); }
+        let key=if self.managed {
+            let Some(lease)=attempt else { return Err(p); };
+            if !Arc::ptr_eq(self,&lease.request) || &lease.plan!=plan || lease.resume!=resume {
+                return Err(p);
+            }
+            match &mut state.operation {
+                Some(ManagedOperation::Attempt { key, phase })
+                    if Arc::ptr_eq(key,&lease.key) && *phase==AttemptPhase::Prepared => {
+                        *phase=AttemptPhase::Started;
+                        key.clone() // reuse reservation identity as existing completion identity
+                    }
+                _=>return Err(p),
+            }
+        } else {
+            if attempt.is_some() || state.operation.is_some() { return Err(p); }
+            Arc::new(()) // legacy Request::new behavior remains unchanged
         };
-        if state.running || state.settling || state.final_outcome || p.outstanding || p.unknown || !permitted
-            || state.plan.as_ref().is_some_and(|original|original!=plan) {
-            return Err(p);
-        }
         if state.plan.is_none() { state.plan=Some(plan.clone()); }
         state.running=true;
         state.resume=None;
         state.progress.run_accepted=Accepted::default();
-        let key=Arc::new(());state.completion_key=Some(key.clone());
+        state.completion_key=Some(key.clone());
         self.settled.store(false, Ordering::Release);
         Ok(key)
     }
@@ -390,6 +687,11 @@ pub trait Journal: Send + Sync {
     fn terminal(&self, req: &Request, t: &Terminal, envelope: &Envelope) -> std::io::Result<()>;
     /// Actual writer context, never a constructor-captured approximation of the job's plan.
     fn writing_context(&self,ctx:&ProofContext<'_>)->std::io::Result<()> { self.writing(ctx.request) }
+    /// Default preserves legacy journals. Managed adapters must require/validate
+    /// the private start receipt against their Prepared AttemptStamp before CAS.
+    fn writing_attempt(&self,ctx:&ProofContext<'_>,_attempt:Option<&AttemptStartReceipt<'_>>)->std::io::Result<()> {
+        self.writing_context(ctx)
+    }
     /// Only finish constructs this receipt after claiming the exact completed run.
     fn terminal_receipt(&self,receipt:&WriterReceipt<'_>)->std::io::Result<()> {
         self.terminal(receipt.request(),receipt.terminal(),&receipt.envelope())
@@ -406,12 +708,18 @@ impl WriterReceipt<'_> {
     pub fn envelope(&self)->Envelope { self.completed.envelope }
     pub fn native_progress(&self)->NativeProgress { self.completed.native }
     pub fn resumed(&self)->bool { self.completed.resumed }
+    /// Writer-stage facts only. The actual durable store remains authoritative.
+    pub fn writing_confirmed(&self)->bool { self.completed.journaled }
+    pub fn writing_uncertain(&self)->bool { self.completed.journal_uncertain }
 }
 
 pub type Settle = Box<dyn FnOnce(&Terminal) + Send>;
 
 pub struct AgentJob {
     pub request: Arc<Request>,
+    /// Required for Request::new_managed; reserve before Prepared/queue admission.
+    /// All existing legacy AgentJob literals must add attempt: None on migration.
+    pub(crate) attempt: Option<AttemptLease>,
     pub plan: Plan,
     pub proof: Arc<dyn Proof>,
     pub journal: Option<Arc<dyn Journal>>,
@@ -460,14 +768,22 @@ pub struct Executed {
 }
 struct CompletedRun {
     request:Arc<Request>,key:Arc<()>,plan:Plan,terminal:Terminal,envelope:Envelope,
-    native:NativeProgress,resumed:bool,journaled:bool,journal:Option<Arc<dyn Journal>>,
+    native:NativeProgress,resumed:bool,journaled:bool,journal_uncertain:bool,terminal_owed:bool,journal:Option<Arc<dyn Journal>>,
 }
-struct Completing<'a> { request:&'a Request,key:&'a Arc<()> }
+struct Completing<'a> { request:&'a Request,key:&'a Arc<()>,release_attempt:bool }
 impl Drop for Completing<'_> {
     fn drop(&mut self) {
         let mut state=self.request.native.lock().unwrap_or_else(|e|e.into_inner());
         if state.completion_key.as_ref().is_some_and(|current|Arc::ptr_eq(current,self.key)) {
             state.completion_key=None;state.settling=false;
+            let own_attempt=matches!(&state.operation,
+                Some(ManagedOperation::Attempt { key, phase:AttemptPhase::Started })
+                    if Arc::ptr_eq(key,self.key));
+            if own_attempt && self.release_attempt && !state.progress.outstanding && !state.progress.unknown {
+                state.operation=None;
+            }
+            // Native uncertainty remains held for typed reconciliation even after
+            // a PartialUnknown terminal; dropping the AgentJob never frees it.
         }
     }
 }
@@ -483,9 +799,9 @@ impl Executed {
         let terminal=Terminal::PartialUnknown { envelope:progress.envelope,
             accepted:progress.run_accepted, reason:"writer_panic".into() };
         let Some(native)=job.request.end_run(&key,&terminal) else { return Self::unowned(progress,"panic_owner_conflict"); };
-        Self { terminal:terminal.clone(),envelope:progress.envelope,transport_broken:false,journaled:job.journal.is_some(),
+        Self { terminal:terminal.clone(),envelope:progress.envelope,transport_broken:false,journaled:false,
             completed:Some(CompletedRun { request:job.request.clone(),key,plan:job.plan.clone(),terminal,
-                envelope:progress.envelope,native,resumed:job.resume.is_some(),journaled:job.journal.is_some(),journal:job.journal.clone() }) }
+                envelope:progress.envelope,native,resumed:job.resume.is_some(),journaled:false,journal_uncertain:job.journal.is_some(),terminal_owed:job.journal.is_some(),journal:job.journal.clone() }) }
     }
     /// Body text accepted so far (lossy only at a short-write cut inside a character).
     pub fn accepted_body(&self, plan: &Plan) -> Option<String> {
@@ -540,6 +856,7 @@ struct Run<'a> {
     acc: Accepted,
     resumed: bool,
     journaled: bool,
+    journal_uncertain: bool,
 }
 
 impl Run<'_> {
@@ -592,13 +909,13 @@ impl Run<'_> {
         let Some(native)=self.request.end_run(&self.key,&terminal) else { return Executed::unowned(self.request.native_progress(),"execution_owner_conflict"); };
         Executed { terminal:terminal.clone(),envelope:self.env,transport_broken,journaled:self.journaled,
             completed:Some(CompletedRun { request:self.request.clone(),key:self.key.clone(),plan:self.plan.clone(),
-                terminal,envelope:self.env,native,resumed:self.resumed,journaled:self.journaled,journal:self.journal.clone() }) }
+                terminal,envelope:self.env,native,resumed:self.resumed,journaled:self.journaled,journal_uncertain:self.journal_uncertain,terminal_owed:self.journaled,journal:self.journal.clone() }) }
     }
 }
 
 /// Execute one job against `writer`. Never retries a whole body; never writes cleanup bytes.
 pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) -> Executed {
-    let key=match job.request.begin_run(&job.plan,job.resume) {
+    let key=match job.request.begin_run(&job.plan,job.resume,job.attempt.as_ref()) {
         Ok(key)=>key,Err(progress)=>return Executed::unowned(progress,"native_progress_conflict"),
     };
     // Catch with THIS run's private identity; a fallback reading the current request can steal
@@ -609,15 +926,19 @@ pub fn execute<W: Write>(writer: &mut W, job: &AgentJob, io: &mut WriterIo<'_>) 
 }
 fn execute_started<W:Write>(writer:&mut W,job:&AgentJob,io:&mut WriterIo<'_>,key:Arc<()>)->Executed {
     let req=&job.request;let start=job.resume.unwrap_or_default();
-    let mut run=Run { request:req,plan:&job.plan,key,journal:job.journal.clone(),env:start,acc:Accepted::default(),resumed:job.resume.is_some(),journaled:false };
+    let mut run=Run { request:req,plan:&job.plan,key,journal:job.journal.clone(),env:start,acc:Accepted::default(),resumed:job.resume.is_some(),journaled:false,journal_uncertain:false };
     let calls=calls_for(&job.plan,&start);
     if req.is_cancelled() {
         return run.done(run.stop("cancelled".into(), false), false);
     }
     // Journal barrier first (design 4.4 step 2); the fsync is a wait, so admission comes after it.
     if let Some(j) = &job.journal {
-        if let Err(e) = j.writing_context(&ProofContext { request:req,plan:&job.plan,envelope:run.env,
-            accepted:run.acc,resumed:run.resumed,phase_offset:0,next_phase:calls.first().map(|(phase,_)|*phase) }) {
+        let attempt = req.managed.then(|| AttemptStartReceipt {
+            request:req,key:&run.key,plan:&job.plan,resume:job.resume,
+        });
+        run.journal_uncertain=true; // an invoked barrier can fail after installing its record
+        if let Err(e) = j.writing_attempt(&ProofContext { request:req,plan:&job.plan,envelope:run.env,
+            accepted:run.acc,resumed:run.resumed,phase_offset:0,next_phase:calls.first().map(|(phase,_)|*phase) },attempt.as_ref()) {
             // Hand this refusal to the settlement by claiming the guard first: a broken journal is
             // then held on backoff instead of being re-handed every tick. A lost claim stays the
             // handing-off caller's rollback.
@@ -627,6 +948,7 @@ fn execute_started<W:Write>(writer:&mut W,job:&AgentJob,io:&mut WriterIo<'_>,key
             return run.done(run.stop(format!("journal:{e}"), true), false);
         }
         run.journaled = true;
+        run.journal_uncertain = false;
     }
     if job.guard.as_ref().is_some_and(|g| !g.claim_for_write()) {
         return run.done(run.stop(GUARD_ABORTED.into(), true), false);
@@ -733,19 +1055,30 @@ fn execute_started<W:Write>(writer:&mut W,job:&AgentJob,io:&mut WriterIo<'_>,key
 pub fn finish(job: AgentJob, ex: &Executed) -> Terminal {
     let Some(completed)=&ex.completed else { return Terminal::PartialUnknown { envelope:ex.envelope,
         accepted:Accepted::default(),reason:"completion_owner_conflict".into() }; };
+    let lease_matches = if completed.request.managed {
+        job.attempt.as_ref().is_some_and(|lease| Arc::ptr_eq(&lease.request,&completed.request)
+            && Arc::ptr_eq(&lease.key,&completed.key)
+            && lease.plan==completed.plan && lease.resume==job.resume)
+    } else { job.attempt.is_none() };
     if !Arc::ptr_eq(&job.request,&completed.request) || job.plan!=completed.plan || job.resume.is_some()!=completed.resumed
-        || !job.request.claim_completion(&completed.key) {
+        || !lease_matches || !job.request.claim_completion(&completed.key) {
         return Terminal::PartialUnknown { envelope:job.request.native_progress().envelope,
             accepted:Accepted::default(),reason:"completion_owner_conflict".into() };
     }
-    let _completing=Completing { request:&job.request,key:&completed.key };
+    let mut completing=Completing { request:&job.request,key:&completed.key,release_attempt:true };
     let mut terminal=completed.terminal.clone();
-    if completed.journaled {
+    // Managed Prepared needs an actual completion receipt even if cancellation or
+    // barrier refusal happened before confirmed Writing. Legacy ordinary refusal
+    // behavior is unchanged. A panic's journal presence is uncertainty, not proof.
+    if completed.terminal_owed || completed.request.managed {
         if let Some(j) = &completed.journal {
             let receipt=WriterReceipt { completed };
             let persisted=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||j.terminal_receipt(&receipt)))
                 .unwrap_or_else(|_|Err(std::io::Error::other("terminal journal panicked")));
             if let Err(e) = persisted {
+                // Physical zero does not prove a durable Prepared/Writing outcome. Keep the
+                // managed reservation for a typed retry/reconciliation of this receipt.
+                if completed.request.managed { completing.release_attempt=false; }
                 // Terminal persistence failed after possible bytes: never report success (4.5).
                 if let Terminal::WrittenBody { accepted } | Terminal::WrittenSubmitted { accepted }
                     | Terminal::PartialExact { accepted,.. } | Terminal::PartialUnknown { accepted,.. } = terminal {
@@ -1012,6 +1345,32 @@ impl Journal for FileJournal {
     }
 }
 
+// EVIDENCE DRAFT / UNCOMPILED. Append inside agent_write.rs after root lease core.
+// Requires that core's module-private DurableEditResolution and resolve method.
+// No public success constructor: pending_requests alone issues these tokens from
+// the real store CAS result. This bridge only discharges existing native exclusion.
+impl ZeroWriteEditLease {
+    pub(crate) fn resolve_selection(self,
+        receipt:crate::pending_requests::DurableSelectionCommit,expected:u64)
+        ->Result<u64,LeaseError>
+    {
+        let plan=self.original_plan.as_ref().ok_or(LeaseError::PlanChanged)?;
+        let (stamp,revision)=receipt.consume(&self.request,plan,expected)
+            .map_err(|_|LeaseError::ResolutionMismatch)?;
+        self.resolve(DurableEditResolution::Committed(DurableEditCommit { stamp }))?;
+        Ok(revision)
+    }
+    pub(crate) fn resolve_selection_not_written(self,
+        receipt:crate::pending_requests::DurableSelectionNotWritten,expected:u64)
+        ->Result<(),LeaseError>
+    {
+        let plan=self.original_plan.as_ref().ok_or(LeaseError::PlanChanged)?;
+        let stamp=receipt.consume(&self.request,plan,expected)
+            .map_err(|_|LeaseError::ResolutionMismatch)?;
+        self.resolve(DurableEditResolution::NotWritten(DurableEditNoChange { stamp }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,6 +1488,7 @@ mod tests {
             plan,
             proof,
             journal: None,
+            attempt: None,
             resume: None,
             settle: None,
             guard: None,
@@ -2103,5 +2463,322 @@ mod tests {
         assert!(matches!(result,Ok(Terminal::PartialUnknown{accepted:Accepted{payload:5,..},..})),
             "terminal journal panic escaped the writer or claimed successful completion");
         assert!(req.is_settled());let native=req.native.lock().unwrap();assert!(!native.settling&&native.completion_key.is_none());
+    }
+    // UNCOMPILED / UNRUN: insert into existing agent_write::tests.
+    // Synthetic durable edit tokens below are test-only fixtures, not authority issuers.
+    fn managed_job(plan:Plan,proof:Arc<FakeProof>)->AgentJob {
+        let request=Request::new_managed("managed".into(),7,"fixture","digest".into(),&plan);
+        let lease=request.reserve_attempt(&plan,None).unwrap();
+        let mut j=job(plan,proof);j.request=request;j.attempt=Some(lease);j
+    }
+
+    #[test]
+    fn lease_managed_request_keeps_original_monotonic_receipt_age() {
+        let received=Instant::now().checked_sub(Duration::from_secs(1)).expect("monotonic fixture prerequisite");
+        let req=Request::new_managed_at("age".into(),7,"fixture","digest".into(),received,&Plan::raw("age"));
+        assert_eq!(req.created,received,"construction after persistence must not reset request age");
+        assert!(matches!(req.reserve_attempt(&Plan::raw("different"),None),Err(LeaseError::NativeConflict)),
+            "managed admission must capture exact Plan before the first attempt or edit");
+        let lease=req.reserve_attempt(&Plan::raw("age"),None).unwrap();drop(lease);
+    }
+
+    struct ManagedStampJournal { stamp:AttemptStamp,starts:std::sync::atomic::AtomicUsize,finishes:std::sync::atomic::AtomicUsize }
+    impl Journal for ManagedStampJournal {
+        fn writing(&self,_:&Request)->std::io::Result<()> { Err(std::io::Error::other("managed start receipt required")) }
+        fn terminal(&self,_:&Request,_:&Terminal,_:&Envelope)->std::io::Result<()> { Err(std::io::Error::other("managed completion receipt required")) }
+        fn writing_attempt(&self,ctx:&ProofContext<'_>,receipt:Option<&AttemptStartReceipt<'_>>)->std::io::Result<()> {
+            let start=receipt.ok_or_else(||std::io::Error::other("missing start receipt"))?
+                .for_attempt(&self.stamp).map_err(|_|std::io::Error::other("wrong attempt"))?;
+            assert!(std::ptr::eq(start.request(),ctx.request));assert_eq!(start.plan(),ctx.plan);
+            assert_eq!(start.resume().unwrap_or_default(),ctx.envelope);
+            self.starts.fetch_add(1,Ordering::SeqCst);Ok(())
+        }
+        fn terminal_receipt(&self,receipt:&WriterReceipt<'_>)->std::io::Result<()> {
+            let verified=receipt.for_attempt(&self.stamp).map_err(|_|std::io::Error::other("wrong completed attempt"))?;
+            assert!(std::ptr::eq(verified.writer().request(),self.stamp.request.as_ref()));
+            self.finishes.fetch_add(1,Ordering::SeqCst);Ok(())
+        }
+    }
+
+    #[test]
+    fn lease_start_and_completion_receipts_match_only_the_reserved_object_nonce_and_plan() {
+        let mut j=managed_job(Plan::raw("owned"),FakeProof::healthy());
+        let stamp=j.attempt.as_ref().unwrap().validate_prepared(&j.request,&j.plan,j.resume).unwrap();
+        let journal=Arc::new(ManagedStampJournal{stamp,starts:std::sync::atomic::AtomicUsize::new(0),finishes:std::sync::atomic::AtomicUsize::new(0)});
+        j.journal=Some(journal.clone());let mut w=Rec::new();let ex=run_job(&mut w,&j);finish(j,&ex);
+        assert_eq!(w.bytes(),b"owned");assert_eq!(journal.starts.load(Ordering::SeqCst),1);assert_eq!(journal.finishes.load(Ordering::SeqCst),1);
+
+        let mut wrong=managed_job(Plan::raw("owned"),FakeProof::healthy());
+        let other=Request::new_managed(wrong.request.id.clone(),7,"fixture","digest".into(),&wrong.plan);
+        let other_lease=other.reserve_attempt(&wrong.plan,None).unwrap();
+        let stamp=other_lease.validate_prepared(&other,&wrong.plan,None).unwrap();
+        let journal=Arc::new(ManagedStampJournal{stamp,starts:std::sync::atomic::AtomicUsize::new(0),finishes:std::sync::atomic::AtomicUsize::new(0)});
+        wrong.journal=Some(journal.clone());let mut w=Rec::new();let ex=run_job(&mut w,&wrong);
+        assert!(matches!(finish(wrong,&ex),Terminal::RefusedNoWrite{..}));
+        assert!(w.bytes().is_empty());assert_eq!(journal.starts.load(Ordering::SeqCst),0);assert_eq!(journal.finishes.load(Ordering::SeqCst),0);
+    }
+
+    #[test]
+    fn lease_prepared_queue_reservation_excludes_edit_and_duplicate_attempt() {
+        let j=managed_job(Plan::raw("owned"),FakeProof::healthy());let req=j.request.clone();
+        let before=req.native_progress();let plan=j.plan.clone();
+        let (tx,rx)=std::sync::mpsc::channel();assert!(tx.send(j).is_ok());
+        assert!(matches!(req.reserve_zero_write_edit(),Err(LeaseError::Busy)));
+        assert!(matches!(req.reserve_attempt(&plan,None),Err(LeaseError::Busy)));
+        assert_eq!(req.native_progress(),before,"queued reservation cannot manufacture native progress");
+        drop(rx.recv_timeout(Duration::from_secs(1)).unwrap()); // never-started job drop
+        let edit=req.reserve_zero_write_edit().unwrap();drop(edit);
+        let next=req.reserve_attempt(&plan,None).unwrap();drop(next);
+    }
+
+    #[test]
+    fn lease_managed_job_without_lease_refuses_before_journal_and_native() {
+        let mut j=job(Plan::raw("owned"),FakeProof::healthy());
+        j.request=Request::new_managed("managed".into(),7,"fixture","digest".into(),&j.plan);
+        let log=Arc::new(Mutex::new(Vec::new()));
+        j.journal=Some(Arc::new(LogJournal{log:log.clone(),fail_writing:false,fail_terminal:false}));
+        let req=j.request.clone();let mut w=Rec::new();let ex=run_job(&mut w,&j);
+        assert!(matches!(ex.terminal,Terminal::PartialUnknown{..}));finish(j,&ex);
+        assert!(w.bytes().is_empty()&&log.lock().unwrap().is_empty());
+        assert_eq!(req.status(),Status::AcceptedPending);assert!(!req.is_settled());
+        assert!(req.reserve_zero_write_edit().is_ok());
+    }
+
+    #[test]
+    fn lease_same_id_different_request_cannot_borrow_attempt() {
+        let mut j=managed_job(Plan::raw("owned"),FakeProof::healthy());let actual=j.request.clone();
+        let impostor=Request::new_managed(actual.id.clone(),7,"fixture","digest".into(),&j.plan);
+        j.request=impostor.clone();let mut w=Rec::new();let ex=run_job(&mut w,&j);
+        assert!(matches!(ex.terminal,Terminal::PartialUnknown{..}));finish(j,&ex);
+        assert!(w.bytes().is_empty());assert!(actual.native_progress().proven_zero());assert!(impostor.native_progress().proven_zero());
+        assert!(actual.reserve_zero_write_edit().is_ok(),"dropping mismatched unstarted job may release only its actual reservation");
+        assert!(impostor.reserve_zero_write_edit().is_ok());
+    }
+
+    #[test]
+    fn lease_exact_reserved_plan_and_resume_are_not_mutable_queue_hints() {
+        let mut j=managed_job(Plan::raw("owned"),FakeProof::healthy());
+        let original=j.plan.clone();j.plan=j.plan.clone().with_clear(1);
+        let mut w=Rec::new();let wrong=run_job(&mut w,&j);
+        assert!(matches!(wrong.terminal,Terminal::PartialUnknown{..})&&w.attempts==0);
+        j.plan=original;j.resume=Some(Envelope::default());
+        let wrong=run_job(&mut w,&j);
+        assert!(matches!(wrong.terminal,Terminal::PartialUnknown{..})&&w.attempts==0);
+        j.resume=None;let correct=run_job(&mut w,&j);
+        assert_eq!(w.bytes(),b"owned");assert!(matches!(finish(j,&correct),Terminal::WrittenBody{..}));
+    }
+
+    #[test]
+    fn lease_attempt_starts_once_and_spans_execute_to_finish() {
+        let j=managed_job(Plan::raw("owned"),FakeProof::refusing(ProofLoss::Unknown("retry".into())));
+        let req=j.request.clone();let plan=j.plan.clone();
+        let ex=run_job(&mut Rec::new(),&j);assert!(matches!(ex.terminal,Terminal::RefusedNoWrite{..}));
+        assert!(matches!(req.reserve_attempt(&plan,None),Err(LeaseError::Busy)));
+        assert!(matches!(req.reserve_zero_write_edit(),Err(LeaseError::Busy)));
+        let mut duplicate=Rec::new();let twice=run_job(&mut duplicate,&j);
+        assert!(matches!(twice.terminal,Terminal::PartialUnknown{..})&&duplicate.attempts==0);
+        assert!(matches!(finish(j,&ex),Terminal::RefusedNoWrite{..}));
+        let lease=req.reserve_attempt(&plan,None).unwrap();drop(lease);
+    }
+
+    #[test]
+    fn lease_started_handle_drop_does_not_release_unsettled_completion() {
+        let j=managed_job(Plan::raw("owned"),FakeProof::refusing(ProofLoss::Unknown("retry".into())));
+        let req=j.request.clone();let plan=j.plan.clone();let ex=run_job(&mut Rec::new(),&j);
+        drop(j);drop(ex);
+        assert!(matches!(req.reserve_attempt(&plan,None),Err(LeaseError::Busy)));
+        assert!(matches!(req.reserve_zero_write_edit(),Err(LeaseError::Busy)));
+        assert!(!req.is_settled(),"dropped completion needs reconciliation, not a fabricated callback");
+    }
+
+    #[test]
+    fn lease_active_native_panic_and_later_drop_never_release_authority() {
+        struct BlockThenPanic { entered:std::sync::mpsc::Sender<()>,release:std::sync::mpsc::Receiver<()> }
+        impl Write for BlockThenPanic {
+            fn write(&mut self,_:&[u8])->std::io::Result<usize> {
+                self.entered.send(()).unwrap();self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                panic!("controlled active native uncertainty")
+            }
+            fn flush(&mut self)->std::io::Result<()> { Ok(()) }
+        }
+        let j=managed_job(Plan::raw("owned"),FakeProof::healthy());let req=j.request.clone();let plan=j.plan.clone();
+        let (entered,seen)=std::sync::mpsc::channel();let (release,wait)=std::sync::mpsc::channel();
+        let worker=std::thread::spawn(move||{
+            let mut writer=BlockThenPanic{entered,release:wait};let mut last=None;let mut first=||{};let mut body=|_:&str|{};
+            let mut io=WriterIo{sleep:&|_|{},last_program_write:&mut last,on_first_byte:&mut first,on_body_written:&mut body};
+            let ex=execute(&mut writer,&j,&mut io);(j,ex)
+        });
+        seen.recv_timeout(Duration::from_secs(5)).unwrap();assert!(req.native_progress().outstanding);
+        assert!(matches!(req.reserve_zero_write_edit(),Err(LeaseError::Busy)));
+        release.send(()).unwrap();let (j,ex)=worker.join().unwrap();
+        assert!(req.native_progress().unknown&&!req.native_progress().outstanding);
+        assert!(matches!(finish(j,&ex),Terminal::PartialUnknown{..}));drop(ex);
+        assert!(matches!(req.reserve_attempt(&plan,None),Err(LeaseError::Busy)),"unknown native completion must retain the managed reservation");
+        assert!(matches!(req.reserve_zero_write_edit(),Err(LeaseError::Busy)));
+    }
+
+    #[test]
+    fn lease_edit_releases_native_mutex_but_not_authority_during_disk_work() {
+        let req=Request::new_managed("edit".into(),7,"fixture","digest".into(),&Plan::raw("x"));
+        let mut edit=req.reserve_zero_write_edit().unwrap();
+        assert_eq!(edit.validate_held(&req,&Plan::raw("x")),Ok(()));
+        let other=Request::new_managed(req.id.clone(),7,"fixture","digest".into(),&Plan::raw("x"));
+        assert_eq!(edit.validate_held(&other,&Plan::raw("x")),Err(LeaseError::WrongRequest));
+        assert_eq!(edit.validate_held(&req,&Plan::raw("other")),Err(LeaseError::PlanChanged));
+        let _stamp=edit.begin_persisting(&Plan::raw("x")).unwrap();
+        assert_eq!(edit.validate_held(&req,&Plan::raw("x")),Ok(()));
+        assert!(req.native.try_lock().is_ok(),"edit must not hold a native mutex across disk work");
+        assert!(matches!(req.reserve_attempt(&Plan::raw("x"),None),Err(LeaseError::Busy)));
+        drop(edit); // simulated timeout after disk work may have started
+        assert!(matches!(req.reserve_zero_write_edit(),Err(LeaseError::Busy)),"drop is not proof that a durable edit rolled back");
+    }
+
+    #[test]
+    fn lease_edit_requires_opaque_matching_durable_resolution_and_preserves_progress() {
+        let first=managed_job(Plan::raw("old"),FakeProof::refusing(ProofLoss::Unknown("retry".into())));
+        let req=first.request.clone();let old=first.plan.clone();let ex=run_job(&mut Rec::new(),&first);finish(first,&ex);
+        let progress=req.native_progress();let mut edit=req.reserve_zero_write_edit().unwrap();
+        let changed=old.clone().with_submit(3,4);
+        assert!(matches!(edit.begin_persisting(&changed),Err(LeaseError::PlanChanged)));
+        let stamp=edit.begin_persisting(&old).unwrap();
+        // Explicit synthetic trusted-domain receipt. There is no production issuer yet.
+        edit.resolve(DurableEditResolution::Committed(DurableEditCommit{stamp})).unwrap();
+        assert_eq!(req.native_progress(),progress);assert!(!req.is_cancelled());
+        assert!(matches!(req.reserve_attempt(&changed,None),Err(LeaseError::NativeConflict)));
+        let lease=req.reserve_attempt(&old,None).unwrap();drop(lease);
+        let mut edit=req.reserve_zero_write_edit().unwrap();let stamp=edit.begin_persisting(&old).unwrap();
+        edit.resolve(DurableEditResolution::NotWritten(DurableEditNoChange{stamp})).unwrap();
+        let lease=req.reserve_attempt(&old,None).unwrap();drop(lease);
+    }
+
+    #[test]
+    fn lease_edit_same_id_wrong_object_and_cancelled_commit_do_not_mutate_plan() {
+        let a=Request::new_managed("same".into(),7,"fixture","digest".into(),&Plan::raw("original"));
+        let b=Request::new_managed("same".into(),7,"fixture","digest".into(),&Plan::raw("original"));
+        let mut ea=a.reserve_zero_write_edit().unwrap();let sa=ea.begin_persisting(&Plan::raw("original")).unwrap();
+        let mut eb=b.reserve_zero_write_edit().unwrap();let _sb=eb.begin_persisting(&Plan::raw("original")).unwrap();
+        let result=eb.resolve(DurableEditResolution::Committed(DurableEditCommit{stamp:sa}));
+        assert_eq!(result,Err(LeaseError::ResolutionMismatch));assert_eq!(b.native.lock().unwrap().plan,Some(Plan::raw("original")));
+        assert!(matches!(b.reserve_attempt(&Plan::raw("wrong"),None),Err(LeaseError::Busy)));
+        let c=Request::new_managed("cancelled".into(),7,"fixture","digest".into(),&Plan::raw("original"));
+        let mut ec=c.reserve_zero_write_edit().unwrap();let sc=ec.begin_persisting(&Plan::raw("original")).unwrap();c.cancel();
+        let result=ec.resolve(DurableEditResolution::Committed(DurableEditCommit{stamp:sc}));
+        assert_eq!(result,Err(LeaseError::Cancelled));assert_eq!(c.native.lock().unwrap().plan,Some(Plan::raw("original")));
+        assert!(c.is_cancelled());assert!(matches!(c.reserve_zero_write_edit(),Err(LeaseError::Cancelled)));
+    }
+
+    #[test]
+    fn lease_partial_exact_original_resume_survives_without_allowing_zero_edit() {
+        let first=managed_job(Plan::raw("abcdef").with_submit(0,0),FakeProof::failing_at(0,ProofLoss::Unknown("retry".into())));
+        let req=first.request.clone();let plan=first.plan.clone();let mut w=Rec::new();w.script=VecDeque::from([Step::Short(2)]);
+        let ex=run_job(&mut w,&first);let envelope=ex.envelope;assert!(matches!(finish(first,&ex),Terminal::PartialExact{..}));
+        assert!(matches!(req.reserve_zero_write_edit(),Err(LeaseError::NativeConflict)));
+        assert!(matches!(req.reserve_attempt(&plan.clone().with_clear(1),Some(envelope)),Err(LeaseError::NativeConflict)));
+        let lease=req.reserve_attempt(&plan,Some(envelope)).unwrap();
+        let mut resumed=job(plan,FakeProof::healthy());resumed.request=req.clone();resumed.resume=Some(envelope);resumed.attempt=Some(lease);
+        let ex=run_job(&mut w,&resumed);assert!(matches!(finish(resumed,&ex),Terminal::WrittenSubmitted{..}));
+        assert_eq!(w.bytes(),b"abcdef\r");assert_eq!(req.native_progress().accepted_total,7);
+    }
+
+    #[test]
+    fn lease_completed_body_submit_is_unsupported_until_same_request_bound_submit_hook() {
+        let j=managed_job(Plan::raw("body"),FakeProof::healthy());let req=j.request.clone();
+        let ex=run_job(&mut Rec::new(),&j);assert!(matches!(finish(j,&ex),Terminal::WrittenBody{..}));
+        assert!(matches!(req.reserve_attempt(&Plan::submit_only(0),None),Err(LeaseError::NativeConflict)));
+        assert!(matches!(req.reserve_zero_write_edit(),Err(LeaseError::NativeConflict)));
+        assert!(req.native.lock().unwrap().final_outcome);
+        // No second Request/body/work ID is proposed. Future BoundSubmitLease must
+        // authorize one submit slot on THIS Request from durable WrittenBody proof.
+    }
+
+    #[test]
+    fn lease_legacy_request_job_behavior_remains_unmanaged() {
+        let j=job(Plan::raw("legacy"),FakeProof::healthy());assert!(j.attempt.is_none());let req=j.request.clone();
+        assert!(matches!(req.reserve_attempt(&j.plan,None),Err(LeaseError::Unmanaged)));
+        let mut w=Rec::new();let ex=run_job(&mut w,&j);assert!(matches!(finish(j,&ex),Terminal::WrittenBody{..}));
+        assert_eq!(w.bytes(),b"legacy");
+    }
+
+    struct PreparedOutcomeJournal {
+        stamp:AttemptStamp,refuse_writing:bool,starts:std::sync::atomic::AtomicUsize,
+        outcomes:Mutex<Vec<(Terminal,bool,bool,NativeProgress)>>,
+    }
+    impl Journal for PreparedOutcomeJournal {
+        fn writing(&self,_:&Request)->std::io::Result<()> { Err(std::io::Error::other("context required")) }
+        fn terminal(&self,_:&Request,_:&Terminal,_:&Envelope)->std::io::Result<()> { Err(std::io::Error::other("receipt required")) }
+        fn writing_attempt(&self,_:&ProofContext<'_>,start:Option<&AttemptStartReceipt<'_>>)->std::io::Result<()> {
+            start.unwrap().for_attempt(&self.stamp).map_err(|_|std::io::Error::other("wrong attempt"))?;
+            self.starts.fetch_add(1,Ordering::SeqCst);
+            if self.refuse_writing { Err(std::io::Error::other("Prepared barrier refusal")) } else { Ok(()) }
+        }
+        fn terminal_receipt(&self,r:&WriterReceipt<'_>)->std::io::Result<()> {
+            r.for_attempt(&self.stamp).map_err(|_|std::io::Error::other("wrong completed attempt"))?;
+            self.outcomes.lock().unwrap().push((r.terminal().clone(),r.writing_confirmed(),r.writing_uncertain(),r.native_progress()));
+            Ok(()) // recorder only; not a claim of durable source/association closure
+        }
+    }
+    fn prepared_journal(j:&AgentJob,refuse_writing:bool)->Arc<PreparedOutcomeJournal> {
+        let stamp=j.attempt.as_ref().unwrap().validate_prepared(&j.request,&j.plan,j.resume).unwrap();
+        Arc::new(PreparedOutcomeJournal{stamp,refuse_writing,starts:std::sync::atomic::AtomicUsize::new(0),outcomes:Mutex::new(Vec::new())})
+    }
+
+    #[test]
+    fn lease_managed_queued_cancel_reaches_original_prepared_terminal_receipt() {
+        let mut j=managed_job(Plan::raw("queued"),FakeProof::healthy());let req=j.request.clone();
+        let journal=prepared_journal(&j,false);j.journal=Some(journal.clone());
+        let (tx,rx)=std::sync::mpsc::channel();assert!(tx.send(j).is_ok());req.cancel();
+        let j=rx.recv_timeout(Duration::from_secs(1)).unwrap();let mut w=Rec::new();let ex=run_job(&mut w,&j);
+        assert!(matches!(ex.terminal,Terminal::CancelledBeforeWrite));assert!(!ex.journaled);
+        assert!(matches!(finish(j,&ex),Terminal::CancelledBeforeWrite));
+        assert!(w.bytes().is_empty());assert_eq!(journal.starts.load(Ordering::SeqCst),0);
+        let rows=journal.outcomes.lock().unwrap();assert_eq!(rows.len(),1);
+        assert!(matches!(rows[0].0,Terminal::CancelledBeforeWrite));assert!(!rows[0].1&&!rows[0].2&&rows[0].3.proven_zero());
+    }
+
+    #[test]
+    fn lease_managed_writing_refusal_reaches_prepared_terminal_receipt_without_claiming_writing() {
+        let mut j=managed_job(Plan::raw("queued"),FakeProof::healthy());
+        let journal=prepared_journal(&j,true);j.journal=Some(journal.clone());let mut w=Rec::new();let ex=run_job(&mut w,&j);
+        assert!(!ex.journaled);assert!(matches!(finish(j,&ex),Terminal::RefusedNoWrite{..}));
+        assert!(w.bytes().is_empty());assert_eq!(journal.starts.load(Ordering::SeqCst),1);
+        let rows=journal.outcomes.lock().unwrap();assert_eq!(rows.len(),1);
+        assert!(matches!(rows[0].0,Terminal::RefusedNoWrite{..}));assert!(!rows[0].1&&rows[0].2&&rows[0].3.proven_zero(),"an invoked failed Writing barrier has unknown persistence, not proven no-change");
+    }
+
+
+    struct FailingManagedTerminal { barrier_refusal:bool,panic_terminal:bool }
+    impl Journal for FailingManagedTerminal {
+        fn writing(&self,_:&Request)->std::io::Result<()> {
+            if self.barrier_refusal { Err(std::io::Error::other("barrier result may be installed")) } else { Ok(()) }
+        }
+        fn terminal(&self,_:&Request,_:&Terminal,_:&Envelope)->std::io::Result<()> {
+            if self.panic_terminal { panic!("controlled managed terminal uncertainty"); }
+            Err(std::io::Error::other("terminal receipt not stored"))
+        }
+    }
+    #[test]
+    fn c8managed_failed_zero_write_receipt_keeps_attempt_exclusion() {
+        for barrier_refusal in [false,true] { for panic_terminal in [false,true] {
+            let mut j=managed_job(Plan::raw("owned"),FakeProof::refusing(ProofLoss::Unknown("retry".into())));
+            let req=j.request.clone();let plan=j.plan.clone();j.journal=Some(Arc::new(FailingManagedTerminal { barrier_refusal,panic_terminal }));
+            let mut writer=Rec::new();let ex=run_job(&mut writer,&j);let terminal=finish(j,&ex);
+            assert!(matches!(terminal,Terminal::RefusedNoWrite{..})&&req.native_progress().proven_zero()&&writer.bytes().is_empty());
+            assert!(matches!(req.reserve_attempt(&plan,None),Err(LeaseError::Busy))
+                &&matches!(req.reserve_zero_write_edit(),Err(LeaseError::Busy)),
+                "failed zero-write receipt released the managed attempt before durable reconciliation");
+        } }
+    }
+    #[test]
+    fn c8managed_failed_cancel_receipt_keeps_prepared_attempt_exclusion() {
+        for panic_terminal in [false,true] {
+            let mut j=managed_job(Plan::raw("owned"),FakeProof::healthy());let req=j.request.clone();
+            j.journal=Some(Arc::new(FailingManagedTerminal { barrier_refusal:false,panic_terminal }));req.cancel();
+            let mut writer=Rec::new();let ex=run_job(&mut writer,&j);assert!(matches!(finish(j,&ex),Terminal::CancelledBeforeWrite));
+            assert!(writer.bytes().is_empty()&&req.native_progress().proven_zero());
+            // Cancellation itself rejects new reservations. Inspect the original owned slot,
+            // so that unrelated final/cancelled gates cannot hide loss of the receipt owner.
+            assert!(matches!(&req.native.lock().unwrap().operation,Some(ManagedOperation::Attempt { phase:AttemptPhase::Started,.. })),
+                "cancelled Prepared outcome lost its unresolved managed receipt owner");
+        }
     }
 }

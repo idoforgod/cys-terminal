@@ -2060,6 +2060,7 @@ fn pane_notice_line(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>, text: 
     let handle = request.clone();
     let settle = NoticeSettle { daemon: Arc::downgrade(daemon), sid: s.id, ctx };
     let job = crate::agent_write::AgentJob {
+        attempt: None,
         request,
         plan: crate::agent_write::Plan::paste(&text).with_submit(120, 0),
         proof: s.agent_proof(),

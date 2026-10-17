@@ -10154,6 +10154,7 @@ fn try_resume_partial_write(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>
             entries: r.entries.clone(),
         };
         let job = crate::agent_write::AgentJob {
+            attempt: None,
             request: r.stamp.request.clone(),
             plan: crate::agent_write::Plan::paste(&r.d.body).with_submit(400, 0),
             proof: r.stamp.proof.clone(),
@@ -10756,6 +10757,7 @@ pub(crate) fn deliver_head_locked(
         // ★(0.14.52 · S-a C7b) The epochs and last human keystroke this request is written under (S4-1 resume premises).
         let stamp = HandoffStamp::of(s, request.clone(), s.agent_proof(), guard.clone());
         let job = crate::agent_write::AgentJob {
+            attempt: None,
             request,
             plan: crate::agent_write::Plan::paste(&d.body).with_submit(400, 0),
             proof: stamp.proof.clone(),

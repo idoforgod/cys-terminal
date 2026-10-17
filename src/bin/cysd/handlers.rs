@@ -3562,6 +3562,7 @@ fn hand_off_direct_job(
         surface.inject_track.submit_handed();
     }
     let job = crate::agent_write::AgentJob {
+        attempt: None,
         request,
         plan,
         proof,
@@ -4787,6 +4788,7 @@ fn deliver_to_ceo(
         request_id: request.id.clone(),
     };
     let job = crate::agent_write::AgentJob {
+        attempt: None,
         request,
         plan: crate::agent_write::Plan::paste(&text).with_submit(500, 0),
         proof: surface.agent_proof(),
