@@ -1581,18 +1581,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool,AtomicU64,Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
-    static NEXT_SCRATCH:AtomicU64=AtomicU64::new(1);
+    mod ci_inputs { include!("c8_test_inputs.rs"); }
     struct Scratch(PathBuf);
     impl Scratch {
         fn new(name:&str)->Self {
-            let base=PathBuf::from(std::env::var_os("C8_PENDING_TEST_ROOT")
-                .expect("set explicit isolated C8_PENDING_TEST_ROOT")).canonicalize().unwrap();
-            let path=base.join(format!("reclaim-{name}-{}-{}",std::process::id(),NEXT_SCRATCH.fetch_add(1,Ordering::Relaxed)));
-            let mut builder=fs::DirBuilder::new();
-            #[cfg(unix)] { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
-            builder.create(&path).unwrap();
-            assert!(path.canonicalize().unwrap().starts_with(&base));
-            Self(path)
+            Self(ci_inputs::private_root("C8_PENDING_TEST_ROOT", "p")
+                .unwrap_or_else(|error| panic!("C8 pending fixture {name} root provisioning failed: {error}")))
         }
     }
     impl Drop for Scratch { fn drop(&mut self) { let _=fs::remove_dir_all(&self.0); } }

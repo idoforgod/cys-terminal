@@ -3728,6 +3728,7 @@ pub struct PauseInfo {
 }
 
 pub struct Daemon {
+    pub(crate) receipt_registry: Arc<crate::rpc_receipt::ReceiptRegistry>,
     pub surfaces: Mutex<HashMap<u64, Arc<Surface>>>,
     pub next_id: AtomicU64,
     pub bus: EventBus,
@@ -5802,6 +5803,7 @@ impl Daemon {
         // C0: 채널 계층 DB(channels.db)도 move 전에 연다. 무결 필수 — open 실패 시 None(모듈 비활성).
         let channels_conn = crate::channels::open(&socket_path);
         let daemon = Arc::new(Daemon {
+            receipt_registry: Arc::new(crate::rpc_receipt::ReceiptRegistry::default()),
             surfaces: Mutex::new(HashMap::new()),
             // 영속 트랜스크립트(transcripts.db)의 최대 id 이후부터 발급 — 재시작 시
             // 무관 세션이 같은 surface_id로 recall에 합쳐지는 것을 차단

@@ -3189,6 +3189,276 @@ fn submit_caller_key(
     Some(CallerKey::Process { parent_pid: parent.identity.pid, parent_birth_us: birth_us })
 }
 
+/// One ACL check for one target at ingress. This is not a write proof or a token/body
+/// association: those consumers must still check the exact request, binding and window.
+/// In particular, an explicit-token caller may be ACL-permitted with no authenticated actor.
+/// Mint a fresh witness for each incoming call; retaining this object does not retain ACL permission.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct CheckedSubmitSender {
+    target: std::sync::Weak<crate::state::Surface>,
+    target_id_at_check: u64,
+    historical: Option<crate::submit_assoc::CallerKey>,
+    authenticated: Option<SubmitAuthenticatedActor>,
+}
+
+// These fields are runtime authority, never decoded from audit data or caller parameters.
+// Weak surface references avoid Surface -> association -> sender -> Surface ownership cycles.
+#[cfg_attr(not(test), allow(dead_code))]
+enum SubmitAuthenticatedActor {
+    VerifiedSurface {
+        surface: std::sync::Weak<crate::state::Surface>,
+        surface_id_at_check: u64,
+    },
+    KernelParent(SubmitParentIncarnation),
+}
+
+/// The parent process's own parent/group/executable are deliberately NOT identity fields.
+/// Reparenting the same live process must not turn a separate Return into a different actor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SubmitParentIncarnation {
+    pid: u32,
+    birth_us: u64,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl CheckedSubmitSender {
+    /// Scope check only; does not refresh ACL or authorize writing. Numeric surface IDs cannot
+    /// transfer an old check to a replacement object. A closed target also cannot retain it.
+    pub(crate) fn matches_target(&self, target: &Arc<crate::state::Surface>) -> bool {
+        self.target.upgrade().is_some_and(|checked| {
+            !checked.exited.load(Ordering::Acquire)
+                && !target.exited.load(Ordering::Acquire)
+                && Arc::ptr_eq(&checked, target)
+        })
+    }
+
+    /// Only the legacy, untokened association path needs this comparison. Explicit token
+    /// submission must NOT require equality with the body's original sender (head ruling).
+    pub(crate) fn same_authenticated_actor(&self, other: &Self) -> bool {
+        match (&self.authenticated, &other.authenticated) {
+            (
+                Some(SubmitAuthenticatedActor::VerifiedSurface { surface: a, .. }),
+                Some(SubmitAuthenticatedActor::VerifiedSurface { surface: b, .. }),
+            ) => match (a.upgrade(), b.upgrade()) {
+                (Some(a), Some(b)) => {
+                    !a.exited.load(Ordering::Acquire)
+                        && !b.exited.load(Ordering::Acquire)
+                        && Arc::ptr_eq(&a, &b)
+                }
+                _ => false,
+            },
+            (
+                Some(SubmitAuthenticatedActor::KernelParent(a)),
+                Some(SubmitAuthenticatedActor::KernelParent(b)),
+            ) => a == b,
+            _ => false,
+        }
+    }
+
+    /// Compatibility/diagnostic data only; Claimed and matching numbers do not authenticate.
+    pub(crate) fn historical_key(&self) -> Option<&crate::submit_assoc::CallerKey> {
+        self.historical.as_ref()
+    }
+
+    /// Captured ingress data, not a current-liveness assertion or a reconstructible capability.
+    /// No token, argv, executable path, request body or strong surface reference is projected.
+    pub(crate) fn audit(&self) -> Value {
+        use crate::submit_assoc::CallerKey;
+        let historical = match &self.historical {
+            Some(CallerKey::Surface(id)) => json!({"grade":"surface", "surface_id":id}),
+            Some(CallerKey::Claimed(id)) => json!({"grade":"claimed", "surface_id":id}),
+            Some(CallerKey::Process { parent_pid, parent_birth_us }) => {
+                json!({"grade":"process", "parent_pid":parent_pid, "parent_birth_us":parent_birth_us})
+            }
+            None => json!({"grade":"unresolved"}),
+        };
+        let authenticated = match &self.authenticated {
+            Some(SubmitAuthenticatedActor::VerifiedSurface { surface_id_at_check, .. }) => {
+                json!({"grade":"verified_surface", "surface_id_at_check":surface_id_at_check})
+            }
+            Some(SubmitAuthenticatedActor::KernelParent(p)) => {
+                json!({"grade":"kernel_parent", "parent_pid":p.pid, "parent_birth_us":p.birth_us})
+            }
+            None => json!({"grade":"unresolved"}),
+        };
+        json!({
+            "evidence_time":"dispatch_acl_native_observation",
+            "target_id_at_check":self.target_id_at_check,
+            "historical":historical,
+            "authenticated":authenticated,
+        })
+    }
+}
+
+// A private numeric projection of an OS observation, not a public witness constructor.
+// The runtime factory below obtains its input from process_observation::observe only.
+fn submit_parent_incarnation(
+    identity: &cys::process_observation::Identity,
+) -> Option<SubmitParentIncarnation> {
+    if identity.pid <= 1 || identity.birth_microseconds >= 1_000_000 {
+        return None;
+    }
+    let birth_us = identity.birth_seconds.checked_mul(1_000_000)?
+        .checked_add(identity.birth_microseconds)?;
+    if birth_us == 0 {
+        return None;
+    }
+    Some(SubmitParentIncarnation { pid: identity.pid, birth_us })
+}
+
+fn observe_submit_parent(caller_pid: Option<u32>) -> Option<SubmitParentIncarnation> {
+    observe_submit_parent_with(caller_pid, |pid| cys::process_observation::observe(pid).map(|p| p.identity))
+}
+
+// Private collection seam. Production supplies only the native observer above; synthetic
+// observations live in tests. Re-read the caller to close a reparent/reuse gap around parent capture.
+fn observe_submit_parent_with(
+    caller_pid: Option<u32>,
+    mut observe: impl FnMut(u32) -> Result<cys::process_observation::Identity, cys::process_observation::Failure>,
+) -> Option<SubmitParentIncarnation> {
+    let pid = caller_pid.filter(|p| *p > 1)?;
+    let caller = observe(pid).ok()?;
+    if caller.pid != pid || caller.parent <= 1 || caller.parent == pid { return None; }
+    let caller_incarnation = submit_parent_incarnation(&caller)?;
+    let parent = observe(caller.parent).ok()?;
+    if parent.pid != caller.parent { return None; }
+    let captured = submit_parent_incarnation(&parent)?;
+    let again = observe(pid).ok()?;
+    if submit_parent_incarnation(&again)? != caller_incarnation || again.parent != caller.parent {
+        return None;
+    }
+    Some(captured)
+}
+
+// A live owned child handle ties a current native PID observation to THIS Surface.
+// Do not reuse the general pid_alive or WinChild::try_wait semantics: both can treat
+// an unavailable query as alive. A busy/error query supplies no actor evidence.
+fn owned_submit_root_live(surface: &crate::state::Surface) -> bool {
+    if surface.exited.load(Ordering::Acquire) { return false; }
+    let mut child = match surface.child.try_lock() {
+        Ok(child) => child,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    if child.process_id() != Some(surface.pid) { return false; }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+        let Some(handle) = child.as_raw_handle() else { return false; };
+        // WinChild::try_wait conflates GetExitCodeProcess failure with STILL_ACTIVE.
+        // Only a successful unsignalled observation of the retained handle is positive.
+        unsafe { WaitForSingleObject(handle as _, 0) == WAIT_TIMEOUT }
+    }
+    #[cfg(not(windows))]
+    { matches!(child.try_wait(), Ok(None)) }
+}
+
+fn observe_submit_surface(daemon: &Daemon, caller_pid: Option<u32>) -> Option<Arc<crate::state::Surface>> {
+    observe_submit_surface_with(daemon, caller_pid,
+        |pid| cys::process_observation::observe(pid).map(|p| p.identity))
+}
+
+// A bounded CURRENT native chain. No ACL cache, claimed ID or delegated pid map can
+// manufacture a node. Every hop has a valid incarnation; rereads reject changed peer
+// birth/parent edges. The owned root is bracketed by positive child-handle observations.
+// This is sampled membership at ingress, not a guarantee about future process changes.
+fn observe_submit_surface_with(
+    daemon: &Daemon, caller_pid: Option<u32>,
+    mut observe: impl FnMut(u32) -> Result<cys::process_observation::Identity, cys::process_observation::Failure>,
+) -> Option<Arc<crate::state::Surface>> {
+    let mut pid = caller_pid.filter(|p| *p > 1)?;
+    let roots: Vec<_> = daemon.surfaces.lock().unwrap_or_else(|e|e.into_inner())
+        .values().filter(|s| !s.exited.load(Ordering::Acquire)).cloned().collect();
+    let mut chain: Vec<cys::process_observation::Identity> = Vec::new();
+    for _ in 0..32 {
+        if chain.iter().any(|prior| prior.pid == pid) { return None; }
+        let current = observe(pid).ok()?;
+        if current.pid != pid { return None; }
+        let incarnation = submit_parent_incarnation(&current)?;
+        if let Some(child) = chain.last() {
+            if incarnation.birth_us > submit_parent_incarnation(child)?.birth_us { return None; }
+        }
+        let mut candidates = roots.iter().filter(|s|s.pid == pid);
+        if let Some(surface) = candidates.next() {
+            if candidates.next().is_some() || !owned_submit_root_live(surface) { return None; }
+            let root_again = observe(pid).ok()?;
+            if submit_parent_incarnation(&root_again)? != incarnation { return None; }
+            if !owned_submit_root_live(surface) { return None; }
+            // A root's own parent is not part of its identity. All descendant edges are.
+            for before in chain.iter().rev() {
+                let after = observe(before.pid).ok()?;
+                if submit_parent_incarnation(&after)? != submit_parent_incarnation(before)?
+                    || after.parent != before.parent { return None; }
+            }
+            if surface.exited.load(Ordering::Acquire)
+                || !daemon.get_surface(surface.id).is_some_and(|live|Arc::ptr_eq(&live,surface)) {
+                return None;
+            }
+            return Some(surface.clone());
+        }
+        if current.parent <= 1 || current.parent == pid { return None; }
+        pid = current.parent;
+        chain.push(current);
+    }
+    None
+}
+
+/// The sole production constructor. `caller_pid` is the kernel peer PID supplied by dispatch,
+/// never `params["pid"]`/`from`. ACL permission and historical grade retain existing
+/// resolver semantics; a separate native chain owns fresh surface provenance and parent fallback. Caller data may remain Claimed for diagnostics while a real
+/// kernel parent independently authenticates the same request.
+///
+/// This patch intentionally adds no handler call sites. Native/ACL work stays in admitted
+/// blocking dispatch; the original full-frame timestamp/retention arrives separately from
+/// the framer. Token and legacy consumers choose their distinct association rule.
+#[cfg_attr(not(test), allow(dead_code))]
+fn checked_submit_sender(
+    daemon: &Daemon,
+    target: &Arc<crate::state::Surface>,
+    caller_pid: Option<u32>,
+    params: &Value,
+) -> Result<CheckedSubmitSender, String> {
+    let verified_from = check_send_acl(daemon, caller_pid, target, params)?;
+    // ACL permission/diagnostics retain existing resolver semantics. Association identity
+    // is collected independently now; a stale cached sid is never a fresh actor witness.
+    let verified_surface = observe_submit_surface(daemon, caller_pid);
+    let parent = if verified_surface.is_none() {
+        observe_submit_parent(caller_pid)
+    } else {
+        None
+    };
+    let authenticated = if let Some(surface) = verified_surface {
+        Some(SubmitAuthenticatedActor::VerifiedSurface {
+            surface: Arc::downgrade(&surface),
+            surface_id_at_check: surface.id,
+        })
+    } else {
+        parent.map(SubmitAuthenticatedActor::KernelParent)
+    };
+    // Preserve the historical grade/precedence without repeating native IO or inheriting the
+    // old helper's saturating timestamp arithmetic. A failed native observation stays None.
+    use crate::submit_assoc::CallerKey;
+    let historical = verified_from.map(CallerKey::Surface)
+        .or_else(|| {
+            if caller_is_owner(daemon, params, None) {
+                None
+            } else {
+                claimed_from_sid(params).map(CallerKey::Claimed)
+            }
+        })
+        .or_else(|| parent.map(|p| CallerKey::Process {
+            parent_pid: p.pid,
+            parent_birth_us: p.birth_us,
+        }));
+    Ok(CheckedSubmitSender {
+        target: Arc::downgrade(target),
+        target_id_at_check: target.id,
+        historical,
+        authenticated,
+    })
+}
+
 /// Explicit undelivered disposition of held bodies (never typed): one event each. Internal signal
 /// only (owner rule 2026-10-12: queue-block signals stay, owner-visible display does not).
 fn dispose_held_bodies(
@@ -3223,13 +3493,10 @@ fn dispose_held_bodies(
 /// Dispose this seat's held bodies whose window closed or whose agent changed.
 pub(crate) fn sweep_held_submits_on(daemon: &Daemon, s: &crate::state::Surface, now: std::time::Instant) {
     let epoch = s.agent_epoch.load(Ordering::Acquire);
-    let (stale, expired) = {
+    let (stale, expired) = daemon.receipt_registry.with_expiry_clock(now, |cutoff| {
         let mut t = s.submit_assoc.lock().unwrap_or_else(|e| e.into_inner());
-        if t.len() == 0 {
-            return;
-        }
-        (t.take_stale(epoch), t.expire(now))
-    };
+        (t.take_stale(epoch), t.expire(cutoff))
+    });
     dispose_held_bodies(daemon, s.id, stale, "agent_changed", None, now);
     dispose_held_bodies(daemon, s.id, expired, "expired", None, now);
 }
@@ -3390,6 +3657,7 @@ fn hold_direct_body(
     verified_from: Option<u64>,
     caller_pid: Option<u32>,
     params: &Value,
+    received_at: std::time::Instant,
 ) -> Value {
     let sid = surface.id;
     let Some(caller) = submit_caller_key(daemon, verified_from, caller_pid, params) else {
@@ -3408,7 +3676,7 @@ fn hold_direct_body(
         request_id.clone(),
         caller,
         epoch,
-        now,
+        received_at,
         text.to_string(),
         fence == DirectFence::Fenced,
     );
@@ -5372,17 +5640,78 @@ fn quiet_secs_consistent(surface: &crate::state::Surface, gen_before: u64) -> f6
     }
 }
 
+/// Immutable application receipt plus target-local residency; not ACL or write authority.
+/// Non-Clone: the actual admitted operation owns these guards until it finishes.
+pub(crate) struct ReceivedRpc {
+    at: std::time::Instant,
+    target: ReceivedTarget,
+    candidates: Option<crate::submit_assoc::HeldSubmitRetention>,
+    return_generation: Option<u64>,
+}
+enum ReceivedTarget {
+    Unscoped,
+    Missing,
+    Surface(std::sync::Weak<crate::state::Surface>),
+}
+impl ReceivedRpc {
+    /// Synchronous, before dispatch admission: bounded parameter/target/table reads only.
+    /// No caller resolver, ACL file, native query, screen parser, filesystem or await here.
+    pub(crate) fn from_frame(daemon: &Arc<Daemon>, req: &Request, frame: crate::rpc_receipt::PendingFrame) -> Self {
+        let scoped = matches!(req.method.as_str(), "surface.send_text" | "surface.send_key");
+        let surface = if scoped { resolve_surface_id(&req.params).and_then(|id| daemon.get_surface(id)) } else { None };
+        let target = if !scoped { ReceivedTarget::Unscoped }
+            else { surface.as_ref().map(|s| ReceivedTarget::Surface(Arc::downgrade(s))).unwrap_or(ReceivedTarget::Missing) };
+        let is_return = req.method == "surface.send_key" && req.params.get("key").and_then(Value::as_str)
+            .and_then(cys::key_to_bytes).is_some_and(|bytes| bytes.as_slice() == b"\r");
+        let token = req.params.get("request_id").and_then(Value::as_str);
+        // Surface map acquisition above is finished before registry -> table order begins.
+        let (at, (candidates, return_generation)) = frame.narrow(|at| {
+            if !is_return { return (None, None); }
+            let Some(surface) = surface.as_ref() else { return (None, None); };
+            let epoch = surface.agent_epoch.load(Ordering::Acquire);
+            (Some(surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner())
+                .retain_for_receipt(at, epoch, token)), Some(epoch))
+        }).into_parts();
+        daemon.receipt_registry.note_narrowed(&req.id, at);
+        Self { at, target, candidates, return_generation }
+    }
+    fn matches_surface(&self, surface: &Arc<crate::state::Surface>) -> bool {
+        match &self.target {
+            ReceivedTarget::Surface(weak) => weak.upgrade().is_some_and(|original| Arc::ptr_eq(&original, surface)),
+            ReceivedTarget::Missing | ReceivedTarget::Unscoped => false,
+        }
+    }
+    fn candidates_for(&self, surface: &Arc<crate::state::Surface>) -> Option<&crate::submit_assoc::HeldSubmitRetention> {
+        if self.matches_surface(surface)
+            && self.return_generation == Some(surface.agent_epoch.load(Ordering::Acquire))
+        { self.candidates.as_ref() } else { None }
+    }
+}
+
+/// Compatibility entry for already-parsed in-process callers/tests. This captures THAT call's
+/// receipt boundary; the network path supplies its earlier framer-created context separately.
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
+    let frame = daemon.receipt_registry.recognize(|| Some(())).expect("complete in-process RPC").1;
+    let received = ReceivedRpc::from_frame(daemon, &req, frame);
+    dispatch_received(daemon, req, caller_pid, received)
+}
+
+pub(crate) fn dispatch_received(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, received: ReceivedRpc) -> Reply {
+    let request_id = req.id.clone();
+    let at = received.at;
+    daemon.receipt_registry.note_dispatch_started(&request_id, at);
     // ★(0.14.52 · S-a C7e) The two RPCs that hold, bind or dispose untokened bodies keep their durable record current.
     let held_may_change = matches!(req.method.as_str(), "surface.send_text" | "surface.send_key");
-    let reply = dispatch_method(daemon, req, caller_pid);
+    let reply = dispatch_method(daemon, req, caller_pid, &received);
     if held_may_change {
         sync_held_bodies(daemon);
     }
+    drop(received); // only after handler and its bookkeeping really finish, including cancelled awaiters
+    daemon.receipt_registry.note_dispatch_finished(&request_id, at);
     reply
 }
 
-fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
+fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, received: &ReceivedRpc) -> Reply {
     let id = req.id.clone();
     let params = req.params;
     // C0 채널 계층: channel.* RPC는 channels 모듈이 전담(단일 위임 — dispatch match 비대화 방지).
@@ -6275,6 +6604,10 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) 
                     &format!("surface {sid} not found"),
                 ));
             };
+            if !received.matches_surface(&surface) {
+                return Reply::Single(err_response(&id, "target_changed",
+                    "the surface present at receipt is missing or replaced; nothing was typed"));
+            }
             if surface.exited.load(Ordering::Relaxed) {
                 return Reply::Single(err_response(
                     &id,
@@ -6650,7 +6983,7 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) 
                 direct_agent_intent(agent_seat, human, machine_origin, clear_first, submit_param, &written);
             if agent_intent == Some(DirectAgentIntent::Held) {
                 return Reply::Single(hold_direct_body(
-                    daemon, &surface, &id, &text, fence, verified_from, caller_pid, &params,
+                    daemon, &surface, &id, &text, fence, verified_from, caller_pid, &params, received.at,
                 ));
             }
             let quiet = params.get("quiet").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -6918,6 +7251,10 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) 
                     &format!("surface {sid} not found"),
                 ));
             };
+            if !received.matches_surface(&surface) {
+                return Reply::Single(err_response(&id, "target_changed",
+                    "the surface present at receipt is missing or replaced; nothing was typed"));
+            }
             if surface.exited.load(Ordering::Relaxed) {
                 return Reply::Single(err_response(
                     &id,
@@ -6934,14 +7271,16 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) 
             //   same caller and agent epoch inside 60,000 ms of receipt) - before the Return-absorb check, which would
             //   read the held (untyped) body's empty line as nothing to submit. No associable body = the paths below.
             if bytes.as_slice() == b"\r" && surface.agent_meta.lock().unwrap().is_some() {
-                let now = std::time::Instant::now();
-                sweep_held_submits_on(daemon, &surface, now);
+                let now = received.at;
+                sweep_held_submits_on(daemon, &surface, std::time::Instant::now());
                 let epoch = surface.agent_epoch.load(Ordering::Acquire);
+                let candidates = received.candidates_for(&surface);
                 let token = params.get("request_id").and_then(|v| v.as_str());
                 let any_held = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).len() > 0;
                 let bound = match token {
                     Some(t) => {
-                        let b = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).take_by_token(t, epoch, now);
+                        let b = candidates.and_then(|captured| surface.submit_assoc.lock()
+                            .unwrap_or_else(|e| e.into_inner()).take_received_token(captured, t, epoch, now));
                         let Some(b) = b else {
                             return Reply::Single(err_response(
                                 &id,
@@ -6953,7 +7292,8 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) 
                         Some((b, "token"))
                     }
                     None if any_held => submit_caller_key(daemon, verified_from, caller_pid, &params).and_then(|k| {
-                        match surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).take_for_return(&k, epoch, now) {
+                        let captured = candidates?;
+                        match surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).take_received_return(captured, &k, epoch, now) {
                             crate::submit_assoc::Associate::Bound(b) => Some((b, "legacy")),
                             crate::submit_assoc::Associate::NoBody => None,
                         }
@@ -12288,6 +12628,7 @@ mod tests {
     use super::*;
 
     include!("caller_matrix_tests.rs");
+    include!("checked_submit_sender_tests.rs");
 
     /// ★(0.14.42 · perf R3-6) live_cwd **단일 관측 · 단일 손잡이 핀**.
     /// ① surface.list · org.status · 좌석 회수 호출자 축은 `live_cwds` 를 경유한다 — 운영 구간(테스트

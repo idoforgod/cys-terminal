@@ -54,6 +54,7 @@ mod policy_loader;
 mod recall;
 mod reclaim;
 mod receiver;
+mod rpc_receipt;
 mod writer_gate;
 mod repaint;
 mod s5_escalation;
@@ -2943,33 +2944,79 @@ fn peer_pid(pipe: &tokio::net::windows::named_pipe::NamedPipeServer) -> Option<u
 }
 
 /// 개행 없는 무한 스트림이 데몬 메모리를 잠식하지 못하게 줄 길이 상한을 둔 line reader.
+/// Compatibility helper for direct reader tests. Network connections use the shared daemon
+/// registry below; this helper cannot claim an earlier network receipt for an already parsed RPC.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn next_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
     r: &mut R,
     cap: usize,
 ) -> std::io::Result<Option<String>> {
+    let registry = Arc::new(crate::rpc_receipt::ReceiptRegistry::default());
+    Ok(next_received_line_capped(r, cap, &registry).await?.map(|(line, frame)| {
+        drop(frame);
+        line
+    }))
+}
+
+enum ReceivedLineEnd { Newline(usize), Eof }
+
+/// Recognition and expiry have one order. Never hold the registry mutex across fill_buf/IO.
+/// Copy/UTF-8 conversion happen with PendingFrame alive, after its bounded recognition lock.
+async fn next_received_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
+    r: &mut R,
+    cap: usize,
+    registry: &Arc<crate::rpc_receipt::ReceiptRegistry>,
+) -> std::io::Result<Option<(String, crate::rpc_receipt::PendingFrame)>> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         let available = r.fill_buf().await?;
-        if available.is_empty() {
-            return Ok(if buf.is_empty() {
-                None
+        let complete = registry.recognize(|| {
+            if available.is_empty() {
+                (!buf.is_empty()).then_some(ReceivedLineEnd::Eof)
             } else {
-                Some(String::from_utf8_lossy(&buf).into_owned())
-            });
+                available.iter().position(|&b| b == b'\n').map(ReceivedLineEnd::Newline)
+            }
+        });
+        if let Some((end, frame)) = complete {
+            match end {
+                ReceivedLineEnd::Newline(pos) => {
+                    buf.extend_from_slice(&available[..pos]);
+                    r.consume(pos + 1);
+                }
+                ReceivedLineEnd::Eof => (),
+            }
+            return Ok(Some((String::from_utf8_lossy(&buf).into_owned(), frame)));
         }
-        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-            buf.extend_from_slice(&available[..pos]);
-            r.consume(pos + 1);
-            return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
-        }
+        if available.is_empty() { return Ok(None); }
         let n = available.len();
         buf.extend_from_slice(available);
         r.consume(n);
+        // Preserve the existing cap/check placement; this is not a separate framing change.
         if buf.len() > cap {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "request line too long",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "request line too long"));
+        }
+    }
+}
+
+enum ParsedReceivedLine {
+    Blank,
+    Invalid(serde_json::Value),
+    Request(Request, handlers::ReceivedRpc),
+}
+/// No await: the non-Send global guard is always dropped/narrowed inside this function.
+fn parse_received_line(
+    daemon: &Arc<Daemon>, line: String, frame: crate::rpc_receipt::PendingFrame,
+) -> ParsedReceivedLine {
+    let line = line.trim().to_string();
+    if line.is_empty() { drop(frame); return ParsedReceivedLine::Blank; }
+    match serde_json::from_str::<Request>(&line) {
+        Ok(req) => {
+            let received = handlers::ReceivedRpc::from_frame(daemon, &req, frame);
+            ParsedReceivedLine::Request(req, received)
+        }
+        Err(e) => {
+            drop(frame);
+            ParsedReceivedLine::Invalid(cys::err_response(&serde_json::Value::Null, "parse_error", &e.to_string()))
         }
     }
 }
@@ -3245,43 +3292,32 @@ async fn handle_connection_capped(
     loop {
         // 첫 줄만 시간 유계(위 상수 주석의 근거). 그 뒤 줄들은 종전대로 무계 — 영속 연결을
         // 쥔 정상 클라이언트를 유휴만으로 끊지 않는다.
-        let read = match (awaiting_first_line, first_line_deadline) {
-            (true, Some(at)) => {
-                match tokio::time::timeout_at(at, next_line_capped(&mut reader, MAX_REQUEST_LINE))
-                    .await
-                {
-                    Ok(r) => r,
-                    // 무언의 클라이언트 — 연결을 회수한다(조용히: 요청이 없었으므로 돌려줄
-                    // 응답 프레임도 없다. 상대는 소켓 EOF 로 알게 된다).
-                    Err(_) => return,
+        // This lexical block must end before any response/admission await: PendingFrame is !Send.
+        let parsed = {
+            let read = match (awaiting_first_line, first_line_deadline) {
+                (true, Some(at)) => {
+                    match tokio::time::timeout_at(at, next_received_line_capped(&mut reader, MAX_REQUEST_LINE, &daemon.receipt_registry)).await {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    }
                 }
-            }
-            _ => next_line_capped(&mut reader, MAX_REQUEST_LINE).await,
+                _ => next_received_line_capped(&mut reader, MAX_REQUEST_LINE, &daemon.receipt_registry).await,
+            };
+            let Ok(Some((line, frame))) = read else { return; };
+            parse_received_line(&daemon, line, frame)
         };
-        let Ok(Some(line)) = read else {
-            return; // 종전 `while let Ok(Some(line))` 과 동일 종료 조건(EOF·과대 줄·I/O 오류)
-        };
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            // ★P1-3(순서가 판정이다): **빈 줄은 첫 줄로 계상하지 않는다.**
-            //   종전에는 `awaiting_first_line = false` 가 이 검사보다 **앞**에 있어, 클라이언트가
-            //   개행 1바이트(`"\n"`)만 보내고 침묵하면 상한이 통째로 풀린 채 연결이 영구
-            //   잔존했다 — 1바이트로 무장 해제되는 상한은 없는 것과 같다. 빈 줄은 요청이
-            //   아니므로(파싱조차 하지 않는다) '첫 요청 줄이 도착했다'의 근거가 될 수 없다.
-            continue;
-        }
-        // 여기까지 온 줄만이 **요청**이다 — 이 시점에 상한을 놓는다.
-        awaiting_first_line = false;
-        let req: Request = match serde_json::from_str(&line) {
-            Ok(r) => r,
-            Err(e) => {
-                let resp =
-                    cys::err_response(&serde_json::Value::Null, "parse_error", &e.to_string());
+        let (req, received) = match parsed {
+            ParsedReceivedLine::Blank => continue, // blank frames do not reset the original first-line deadline
+            ParsedReceivedLine::Invalid(resp) => {
+                awaiting_first_line = false; // same existing malformed-nonblank behavior
                 if let Err(e) = write_reply_line(&mut write_half, resp, write_stall_cap).await {
-                    note_write_stall(&e);
-                    return;
+                    note_write_stall(&e); return;
                 }
                 continue;
+            }
+            ParsedReceivedLine::Request(req, received) => {
+                awaiting_first_line = false;
+                (req, received)
             }
         };
 
@@ -3297,7 +3333,7 @@ async fn handle_connection_capped(
             let req_id = req.id.clone();
             // ★FATAL-1: 입장 게이트 — 동시 실행 dispatch ≤ DISPATCH_INFLIGHT_MAX(초과분은 대기 · 거절 없음).
             let exempt = dispatch_admission_exempt(&req.method);
-            match run_admitted(&DISPATCH_GATE, exempt, move || handlers::dispatch(&d, req, caller_pid))
+            match run_admitted(&DISPATCH_GATE, exempt, move || handlers::dispatch_received(&d, req, caller_pid, received))
                 .await
             {
                 Ok(r) => r,
@@ -6254,7 +6290,9 @@ mod write_stall_tests {
     fn single_reply_sites_all_carry_the_write_stall() {
         let src = include_str!("main.rs");
         let body = fn_body(src, concat!("async fn handle_connection_", "capped("), "Reply::WaitFor {");
-        for arm in ["\"parse_error\"", "Reply::Single(resp)", "Reply::FeedWait {", "Reply::WaitFor {"] {
+        // Parsing now constructs the error in parse_received_line; the actual bounded
+        // write site is this Invalid arm. Keep all four reply sites and the unbounded-write veto.
+        for arm in ["ParsedReceivedLine::Invalid(resp)", "Reply::Single(resp)", "Reply::FeedWait {", "Reply::WaitFor {"] {
             assert!(body.contains(arm), "{arm} 가 본문에 없다 — 계측 무효");
         }
         assert_eq!(
@@ -7799,3 +7837,8 @@ mod vt100_dim_tests;
 mod agent_queue_tests;
 #[cfg(test)]
 mod direct_agent_tests;
+
+#[cfg(test)]
+mod receipt_framing_tests {
+    include!("receipt_framing_tests.rs");
+}
