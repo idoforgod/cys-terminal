@@ -1577,6 +1577,7 @@ impl PendingStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("pending_aftercare_tests.rs");
     use std::sync::atomic::{AtomicBool,AtomicU64,Ordering};
     use std::sync::mpsc;
     use std::time::Duration;

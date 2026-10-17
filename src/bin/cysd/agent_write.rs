@@ -792,6 +792,9 @@ impl Drop for Completing<'_> {
                 Some(ManagedOperation::Attempt { key, phase:AttemptPhase::Started })
                     if Arc::ptr_eq(key,self.key));
             if own_attempt && self.release_attempt && !state.progress.outstanding && !state.progress.unknown {
+                // Actual finish already released this exact zero-progress attempt. Its real
+                // stored-zero receipt may acknowledge that release until new ownership begins.
+                if state.progress.proven_zero() { state.last_zero_resolution=Some(self.key.clone()); }
                 state.operation=None;
             }
             // Native uncertainty remains held for typed reconciliation even after

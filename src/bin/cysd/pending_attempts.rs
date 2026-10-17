@@ -48,6 +48,13 @@ pub(crate) struct AttemptSummary {
     pub number:u64,pub phase:AttemptPhase,pub outcome:Option<OutcomeKind>,pub accepted:Option<Accepted>,
     pub native:Option<NativeProgress>,pub consumed:bool,pub recovered:bool,
 }
+/// Result of actual completion aftercare, not a native/write/source-settlement permit.
+#[derive(Debug,PartialEq,Eq)]
+pub(crate) enum CompletionRecovery {
+    ZeroWriteResolved,
+    StoredWithoutNativeRelease { kind:OutcomeKind },
+}
+
 fn epoch_ms()->u64 { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0,|v|u64::try_from(v.as_millis()).unwrap_or(u64::MAX)) }
 fn diagnostic(reason:&str,limit:usize)->Diagnostic {
     let mut n=reason.len().min(limit);while !reason.is_char_boundary(n) { n-=1; }
@@ -310,7 +317,7 @@ impl AttemptJournal {
     /// Retry storing retained ACTUAL completion facts; never execute a body/Return again.
     /// Native exclusion remains held after a failed writer finish until a separate typed
     /// resolution consumes the committed outcome; this method alone grants no retry permission.
-    pub fn retry_outcome(&self)->Result<(),ProtocolError> {
+    pub(super) fn retry_outcome(&self)->Result<(),ProtocolError> {
         let actual={self.outcome.lock().unwrap_or_else(|e|e.into_inner()).actual.clone().ok_or(ProtocolError::Missing)?};
         let durability=self.persist_outcome(&actual)?;
         self.outcome.lock().unwrap_or_else(|e|e.into_inner()).stored=Some(durability);Ok(())
@@ -333,8 +340,24 @@ impl AttemptJournal {
     }
     /// Explicit current-run resolution after storage retry. The writer checks the exact
     /// original Started operation; no status, cancellation, Plan or source state is reset.
-    pub fn resolve_stored_zero_write(&self)->Result<(),ProtocolError> {
+    pub(super) fn resolve_stored_zero_write(&self)->Result<(),ProtocolError> {
         self.current.request.resolve_durable_zero_write(self.zero_write_receipt()?)?;Ok(())
+    }
+    /// The producer-facing recovery operation. The component steps are private to
+    /// this store module: the real retained outcome is persisted BEFORE any typed
+    /// native-zero resolution. Partial/unknown/success data is stored but releases
+    /// no native ownership here. No branch executes or replays a byte.
+    pub fn reconcile_completion(&self)->Result<CompletionRecovery,ProtocolError> {
+        self.retry_outcome()?;
+        let actual=self.outcome.lock().unwrap_or_else(|e|e.into_inner()).actual.clone()
+            .ok_or(ProtocolError::Missing)?;
+        if matches!(actual.kind,OutcomeKind::RefusedNoWrite|OutcomeKind::CancelledBeforeWrite)
+            && actual.native.proven_zero() {
+            self.resolve_stored_zero_write()?;
+            Ok(CompletionRecovery::ZeroWriteResolved)
+        } else {
+            Ok(CompletionRecovery::StoredWithoutNativeRelease { kind:actual.kind })
+        }
     }
     pub fn has_stored_outcome(&self)->bool { self.stored_durability().is_some() }
     pub fn stored_durability(&self)->Option<Durability> { self.outcome.lock().unwrap_or_else(|e|e.into_inner()).stored }
