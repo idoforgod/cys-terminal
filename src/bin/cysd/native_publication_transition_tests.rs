@@ -138,7 +138,7 @@ struct OwnedRoot {
     child:Child, replies:mpsc::Receiver<serde_json::Value>,reader:Option<JoinHandle<()>>,
 }
 impl OwnedRoot {
-    fn spawn(scratch:&Scratch, python:&Path)->Self {
+    fn spawn(scratch:&Scratch, python:&Path, compiler_override:Option<&std::ffi::OsStr>)->Self {
         let a=scratch.path.join("np-agent-a");let b=scratch.path.join("np-agent-b");
         // Own minimal native programs: relocated Apple system binaries were observed exiting
         // with signal9 on this host. Do not alter signatures or live system executables.
@@ -157,9 +157,11 @@ int main(int argc, char **argv) {
     return ferror(stdin) ? 1 : 0;
 }
 "#).unwrap();
-        let compiler=std::env::var_os("C8_NATIVE_FIXTURE_CC").unwrap_or_else(||"/usr/bin/cc".into());
+        let compiler=compiler_override.map(std::ffi::OsStr::to_owned)
+            .unwrap_or_else(||std::env::var_os("C8_NATIVE_FIXTURE_CC").unwrap_or_else(||"/usr/bin/cc".into()));
         let built=Command::new(compiler).hide_console().arg("-std=c11").arg("-O0")
             .arg(&fixture_source).arg("-o").arg(&a).env_clear().env("PATH","/usr/bin:/bin")
+            .env("PYTHONDONTWRITEBYTECODE","1")
             .output().expect("fixture C compiler must be available");
         assert!(built.status.success(),"owned native fixture compilation failed: {}",String::from_utf8_lossy(&built.stderr));
         std::fs::copy(&a,&b).unwrap();
@@ -230,7 +232,7 @@ struct Rig {
 impl Rig {
     fn new(windows_rule:bool, test:&'static str)->Option<Self> {
         let python=fixture_python(test)?;
-        let scratch=Scratch::new();let root=OwnedRoot::spawn(&scratch,&python);
+        let scratch=Scratch::new();let root=OwnedRoot::spawn(&scratch,&python,None);
         let root_observation=process_observation::observe(root.child.id()).unwrap();
         let group=root_observation.identity.process_group;
         let (sender,receiver)=WriterSender::channel(2);
@@ -660,4 +662,24 @@ fn np_negative_unknown_result_cannot_mint_a_death_fact() {
         "an injected Unknown failure was promoted into a native-death fact");
     assert!(!old.sealed());assert!(rig.cell.core.lock().unwrap().dead.is_empty());
     assert_eq!(rig.cell.fixed_policy().unwrap().class,ProofClass::FullRequired);
+}
+
+#[test]
+fn np_compiler_child_preserves_bytecode_seal_after_env_clear() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(python)=fixture_python("native_publication::native_transition_tests::np_compiler_child_preserves_bytecode_seal_after_env_clear") else { return; };
+    let scratch=Scratch::new();let wrapper=scratch.path.join("seal-compiler");let observed=scratch.path.join("compiler-environment");
+    let compiler=std::env::var_os("C8_NATIVE_FIXTURE_CC").unwrap_or_else(||"/usr/bin/cc".into());
+    let quote=|value:&std::ffi::OsStr|format!("'{}'",value.to_str().expect("fixture compiler/path must be UTF-8").replace('\'',"'\\''"));
+    // Observe the environment at OwnedRoot's ACTUAL compiler call site, then
+    // repair the seal before the real compiler starts, so the removal mutant
+    // remains a safe observation. No global environment or installed file changes.
+    let script=format!("#!/bin/sh\nprintf '%s\\n' \"${{PYTHONDONTWRITEBYTECODE-unset}}\" > {}\nexport PYTHONDONTWRITEBYTECODE=1\nexec {} \"$@\"\n",
+        quote(observed.as_os_str()),quote(&compiler));
+    std::fs::write(&wrapper,script).unwrap();
+    std::fs::set_permissions(&wrapper,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root=OwnedRoot::spawn(&scratch,&python,Some(wrapper.as_os_str()));
+    assert_eq!(std::fs::read(&observed).unwrap(),b"1\n",
+        "actual fixture compiler call site lost PYTHONDONTWRITEBYTECODE after env_clear");
+    drop(root); // ordinary owned-supervisor cleanup, before Scratch destruction
 }

@@ -18197,9 +18197,56 @@ mod tests {
         let s = daemon
             .create_surface(None, Some("sh -c 'sleep 30 ; :' sh /tmp/rqfix2/claude/NOTES.md ; :".into()), None, None, 24, 80)
             .expect("create surface");
+        // Own root cleanup before any prerequisite or behavior assertion can panic.
+        // This does not claim process-tree reaping; the fixture sleeper is finite.
+        struct OwnedRoot(Arc<crate::state::Surface>);
+        impl Drop for OwnedRoot {
+            fn drop(&mut self) {
+                let mut child = self.0.child.lock().unwrap_or_else(|e| e.into_inner());
+                // Already-reaped children must not receive a signal by stale PID.
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => return,
+                    Ok(None) => {},
+                }
+                let _ = child.kill();
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < until {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+        let _owned_root = OwnedRoot(s.clone());
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         *s.agent_meta.lock().unwrap() = Some(("claude".to_string(), "claude".to_string()));
-        let sys = live_process_table(&[&s]);
+        // Wait for the fixture's raw process facts, not merely any startup
+        // descendant and not the liveness/tick result that this test measures.
+        let mut sys = sysinfo::System::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            let descendants = collect_descendants(&sys, s.pid);
+            let targets: Vec<sysinfo::Pid> = descendants.iter().map(|(pid, _)| sysinfo::Pid::from_u32(*pid)).collect();
+            let mut argv = sysinfo::System::new();
+            argv.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&targets),
+                false,
+                sysinfo::ProcessRefreshKind::nothing().with_cmd(sysinfo::UpdateKind::Always),
+            );
+            let ready = descendants.into_iter().any(|(pid, _)| {
+                let process = argv.process(sysinfo::Pid::from_u32(pid));
+                process.is_some_and(|p| {
+                    p.cmd().last().is_some_and(|arg| arg == "/tmp/rqfix2/claude/NOTES.md")
+                        && collect_descendants(&sys, pid).into_iter().any(|(child, _)| {
+                            sys.process(sysinfo::Pid::from_u32(child)).is_some_and(|p| p.name() == "sleep")
+                        })
+                })
+            });
+            if ready {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "rqfix2 prerequisite: NOTE-bearing sh with a sleep descendant did not appear");
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
         let cmds: Vec<String> = super::collect_descendants_with_cmd(&sys, s.pid).into_iter().map(|(_, c)| c).collect();
         assert_eq!(
             super::decide_agent_liveness(&cmds, "claude"),
@@ -18221,7 +18268,7 @@ mod tests {
         *s.agent_meta.lock().unwrap() = Some(("claude".to_string(), "sleep".to_string()));
         death_tick(&daemon, &sys, PendingInputModel::V3);
         assert!(s.lone_key_exempt.load(AtomicOrdering::Relaxed), "대조: 엄격 증거가 있으면 표식이 선다");
-        kill_pid(s.pid);
+
     }
 
     /// 핀 S7(진단 · 실 PTY) — 진단 `input_model` 은 **지금 이 순간** 적용되는 모델이다: 전경 작업 좌석에서 표식 참이면 `v3`, 작업이 끝나 전경이 셸로 돌아오면(틱 없이) `v2`.

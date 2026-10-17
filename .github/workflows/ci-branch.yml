@@ -299,6 +299,13 @@ jobs:
                   "한 줄이고 이번 티켓에서 고치지 않았다 · pack-release 는 데몬 검체를 돌리지 않는다) — 편입하면 잴 대상이 없는 근거 없는 목록이 된다. release 의 그 줄에 같은 판독을 얹는다면 그때 "
                   "이 검체의 대상과 이 항목의 레인 집합을 함께 넓힌다.",
               ),
+              "test_c8_ci_consumer": (
+                  {"ci-branch"},
+                  "Repository-only CI reader controls run in the branch macOS lane: they execute the actual "
+                  "branch/release/Windows reader bodies over isolated logs and verify release cargo exits. "
+                  "Release and windows-health execute those readers on their real logs; pack-release has "
+                  "no cysd execution leg. The separate Rust compiler-seal specimen runs with the native group.",
+              ),
                             "test_verify_win_crt": (
                   {"ci-branch", "release"},
                   "scripts/tests/ 스위트(팩 스위트 아님 · R1-repair 2026-08-29 편입 — 그 전에는 "
@@ -1311,6 +1318,24 @@ jobs:
           printf '%s\n' "::error title=cysd-mac 로그::$(tail -20 "$LOG" | esc)"
           exit "$rc"
 
+      - name: C8 UNMEASURED marker gate (branch macOS)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python
+          if command -v python3 >/dev/null 2>&1; then PY=python3; fi
+          PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/c8_native_measurement.py "${RUNNER_TEMP:-/tmp}/cysd-mac.log"
+
+      - name: C8 native test names (branch macOS full group)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python
+          if command -v python3 >/dev/null 2>&1; then PY=python3; fi
+          PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/c8_native_names.py "${RUNNER_TEMP:-/tmp}/cysd-mac.log"
+
       # ★R2F-PK 2차(성찰 2회차 · 2026-10-05): 위 데몬 검체 스텝의 **음성 대조**. 그 스텝의 `run:` 본문을 이 파일에서 그대로 떼어 가짜 `cargo`(PATH 맨 앞)로 돌려 잰다 — 성공(rc 0 · 덧붙는 줄 0 · 출력 그대로) ·
       #   테스트 실패(같은 rc · 이름이 든 판정 줄이 먼저 · 꼬리 한 줄) · 하네스 이상(요약 없음 / failed=0 / 로그 없음) · rc 0 인데 로그에 FAILED(통과) · 종료 코드가 그대로 나가는가(1·3·101·137·255) ·
       #   깨진 바이트·NUL·줄바꿈 없이 끝난 출력 · 낡은 로그 · 이름 목록을 못 읽은 경우 · 실행 인자 · `continue-on-error`·`if:` 부재.
@@ -1326,6 +1351,14 @@ jobs:
           [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
           echo "== test_ci_branch_cysd_step (mac) =="
           python3 "$f"
+
+      - name: C8 CI reader controls (isolated logs and fake cargo)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_c8_ci_consumer.py"
+          [ -f "$f" ] || { echo "Missing CI reader controls: $f" >&2; exit 1; }
+          PYTHONDONTWRITEBYTECODE=1 python3 "$f"
 
       # ★(0.14.43 성찰 R1F-PK · S3 minor 8) IOReport 강링크 **산출물** 게이트. E2 가 `hwmon.rs` 의 IOReport 강링크를 dlopen 지연
       #   로딩으로 바꿨다(그 dylib 이 없는 맥에서 데몬이 뜨지 못하던 문제). 소스 핀(lib `e2_cysd_hwmon_source_has_no_ioreport_strong_link`)은
