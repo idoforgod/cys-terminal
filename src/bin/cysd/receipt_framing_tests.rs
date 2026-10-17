@@ -336,4 +336,60 @@ mod unix_dispatch {
         rig.daemon.receipt_registry.test_clock(None);
         rig.close().expect("receipt fixture must reap every owned exec-cat root before success");
     }
+
+    // Each case uses the production shared connection/framer, then holds the actual
+    // dispatch gate until receipt narrowing has observed the old (or absent) target.
+    async fn check_return_target_does_not_inherit_another_object(replaced: bool) {
+        let _lock = crate::governance::PACK_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _state = crate::delivery::tests::isolate_state_dir("receipt-return-target");
+        let root = TempRoot::new(); let shell = root.0.join("fixture-shell");
+        std::fs::write(&shell, b"#!/bin/sh\nexec /bin/cat\n").unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(root.0.join("acl.json"), r#"{"default":"allow","rules":[]}"#).unwrap();
+        let _pack = EnvRestore::set(cys::pack::ENV_PACK_DIR, &root.0);
+        let _shell = EnvRestore::set("CYS_SHELL", &shell);
+        let mut rig = Rig { daemon: Daemon::new(root.0.join("cysd.sock")), owned: Vec::new(), tasks: Vec::new(), closed: false };
+        let original = rig.seat(&root.0); let replacement = rig.seat(&root.0);
+        let (tx, rx) = mpsc::channel(); rig.daemon.receipt_registry.test_observe(tx);
+        let at = Instant::now(); rig.daemon.receipt_registry.test_clock(Some(at));
+        let addressed = if replaced { original.id } else { original.id.max(replacement.id).checked_add(1000).unwrap() };
+        let request_id = if replaced { "return-replaced-target" } else { "return-missing-target" };
+        let permit = all_dispatch_permits().await;
+        let (mut client, _) = rig.connection();
+        send(&mut client, json!({"id":request_id,"method":"surface.send_key","params":{
+            "surface_id":addressed,"from":"surface:9001","key":"Return","queued":true}})).await;
+        assert_eq!(checkpoint(&rx, request_id, "narrowed"), at);
+        // Change only the daemon's lookup after actual synchronous receipt narrowing.
+        rig.daemon.surfaces.lock().unwrap().insert(addressed, replacement.clone());
+        drop(permit);
+        let answer = reply(&mut client).await;
+        assert_eq!(answer["error"]["code"], "target_changed",
+            "send_key Return inherited a missing/replaced receipt target: case={request_id} reply={answer}");
+        assert!(replacement.pending_queue.lock().unwrap().is_empty(), "refused Return enqueued on replacement");
+        assert!(original.pending_queue.lock().unwrap().is_empty());
+        assert_eq!(rig.daemon.bus.tail(100).iter().filter(|e| e["name"] == "queue.enqueued").count(), 0);
+        if replaced { rig.daemon.surfaces.lock().unwrap().insert(addressed, original.clone()); }
+        else { rig.daemon.surfaces.lock().unwrap().remove(&addressed); }
+
+        // Positive control: the same real send_key Return path accepts a stable target.
+        // True NoBody retains ordinary queued-control behavior; no new association policy.
+        send(&mut client, json!({"id":"return-stable-target","method":"surface.send_key","params":{
+            "surface_id":original.id,"from":"surface:9001","key":"Return","queued":true}})).await;
+        let stable = reply(&mut client).await;
+        assert_eq!(stable["ok"], true, "stable Return path unexpectedly refused: {stable}");
+        assert_eq!(original.pending_queue.lock().unwrap().len(), 1);
+        assert!(replacement.pending_queue.lock().unwrap().is_empty());
+        rig.daemon.receipt_registry.test_clock(None);
+        rig.close().expect("receipt Return target fixture must reap every owned exec-cat root before success");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn c8_actual_send_key_return_missing_at_receipt_cannot_inherit_later_target() {
+        check_return_target_does_not_inherit_another_object(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn c8_actual_send_key_return_replaced_after_receipt_cannot_inherit_target() {
+        check_return_target_does_not_inherit_another_object(true).await;
+    }
 }
