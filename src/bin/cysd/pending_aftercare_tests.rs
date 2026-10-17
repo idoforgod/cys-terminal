@@ -39,7 +39,11 @@ fn c8aftercare_automatic_zero_release_acknowledges_only_unchanged_ownership() {
         if !cancel {
             if next=="attempt" {drop(current.request().reserve_attempt(current.plan(),None).unwrap());}
             else {drop(current.request().reserve_zero_write_edit().unwrap());}
-            assert!(journal.reconcile_completion().is_err(),"old automatic acknowledgement survived new {next} ownership");
+            // Exercise the actual receipt resolver before the higher-level supersession result.
+            assert!(journal.resolve_stored_zero_write().is_err(),
+                "old actual acknowledgement survived new {next} ownership");
+            assert_eq!(journal.reconcile_completion().unwrap(),attempts::CompletionRecovery::SupersededAttempt { number:1 },
+                "old completion needs a terminal journal disposition after new {next} ownership");
         }
     }
 }
@@ -71,7 +75,11 @@ fn c8aftercare_resumed_prefix_roundtrip_and_corruption_negatives_never_release()
     assert!(prior.iter().all(|r|!r.recovered));
     let image:serde_json::Value=serde_json::from_slice(&fs::read(scratch.0.join(DATA)).unwrap()).unwrap();
     drop(store);
+    assert!(matches!(journal.reconcile_completion(),Err(ProtocolError::Inactive)),
+        "old nonzero journal stayed live after its store dropped");
     let reopened=PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap();
+    assert!(matches!(journal.reconcile_completion(),Err(ProtocolError::Inactive)),
+        "reopen revived the old nonzero journal");
     let reloaded=reopened.attempt_summaries(current.id()).unwrap();
     assert_eq!(aftercare_summary_facts(&reloaded),aftercare_summary_facts(&prior),"persisted original prefix did not round-trip");
     assert!(reloaded.iter().all(|r|r.recovered));

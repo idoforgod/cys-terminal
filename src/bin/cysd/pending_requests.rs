@@ -1578,6 +1578,7 @@ impl PendingStore {
 mod tests {
     use super::*;
     include!("pending_aftercare_tests.rs");
+    include!("pending_aftercare_batch2_tests.rs");
     use std::sync::atomic::{AtomicBool,AtomicU64,Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
