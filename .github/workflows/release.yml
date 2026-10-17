@@ -341,12 +341,36 @@ jobs:
           # Rust auto-restore 단위(재시도 seam·env 주입·B1·B3) + pack 소유권(B2).
           # ★--skip hwmon:: — hwmon 테스트는 실 GPU 전제(gpu.cores>0 단언)라 가상 러너에서 환경 FAIL
           #   (v0.12.21 release run 28792111282 실증 — phoenix 게이트와 무관한 host 하드웨어 의존).
-          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon::
+          CYSD_LOG="${RUNNER_TEMP:-/tmp}/c8-release-cysd.log"
+          rm -f "$CYSD_LOG"
+          set +e
+          CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --skip hwmon:: 2>&1 | tee "$CYSD_LOG"
+          cysd_rc="${PIPESTATUS[0]}"
+          set -e
+          if [ "$cysd_rc" -ne 0 ]; then exit "$cysd_rc"; fi
           CYS_PACK_DIR="$(mktemp -d)" cargo test --lib -- --test-threads=1
           # ★A10 승격(2026-08-16): ci-branch 리허설 1사이클 green 실증(feat/v4-repair 18dc9a6 run
           #   success — 115 passed/0 failed) 후 릴리스 레인 편입. 환경 의존 실패 발견 시 위
           #   --skip hwmon:: 선례 패턴으로 격리하라(테스트 삭제 금지).
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cys -- --test-threads=1
+
+      - name: C8 UNMEASURED marker gate (release native macOS)
+        if: always() && matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python
+          if command -v python3 >/dev/null 2>&1; then PY=python3; fi
+          PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/c8_native_measurement.py "${RUNNER_TEMP:-/tmp}/c8-release-cysd.log"
+
+      - name: C8 native test names (release macOS full group)
+        if: always() && matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python
+          if command -v python3 >/dev/null 2>&1; then PY=python3; fi
+          PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/c8_native_names.py "${RUNNER_TEMP:-/tmp}/c8-release-cysd.log"
 
       # ── ★todo 선언·유령집계 게이트(C-1 교정 · 2026-07-26) ──
       # **왜 여기 있어야 하는가**: 이 게이트 3종은 `ci-branch.yml` 에만 있었고 그 워크플로는

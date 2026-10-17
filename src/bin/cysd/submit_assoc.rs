@@ -11,6 +11,7 @@
 //! legacy Return never has two candidates to guess between. Expiry and supersession are explicit
 //! undelivered dispositions, never typing.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// S4-3 association window, from FULL receipt of the body. D3 locked 10,000 ms before any
@@ -34,8 +35,8 @@ pub enum CallerKey {
     Process { parent_pid: u32, parent_birth_us: u64 },
 }
 
-/// One untyped body awaiting its submit.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One untyped body awaiting its submit. Not Clone: moves/restores retain its residency identity.
+#[derive(Debug, PartialEq, Eq)]
 pub struct HeldBody {
     /// The request token returned at admission (a migrated caller attaches its Return by it).
     pub request_id: String,
@@ -48,12 +49,25 @@ pub struct HeldBody {
     pub text: String,
     /// The direct path's paste-fence decision made at admission (direct send bytes = fenced head).
     pub fenced: bool,
+    /// Private residency only; not caller, binding or writer authority.
+    retention: Arc<()>,
+}
+
+/// Kept with one actual received Return until its dispatch completes. The table
+/// remains the only body owner; these tokens cannot reconstruct a removed body.
+#[derive(Debug)]
+pub(crate) struct HeldSubmitRetention { _tokens: Vec<Arc<()>> }
+impl HeldSubmitRetention {
+    /// Original lookup eligibility only; no caller/native/write permission.
+    fn contains(&self, body: &HeldBody) -> bool {
+        self._tokens.iter().any(|token| Arc::ptr_eq(token, &body.retention))
+    }
 }
 
 impl HeldBody {
     pub fn new(request_id: String, caller: CallerKey, generation: u64, received_at: Instant, text: String, fenced: bool) -> HeldBody {
         let deadline = received_at + Duration::from_millis(LEGACY_ASSOCIATION_WINDOW_MS);
-        HeldBody { request_id, caller, generation, received_at, deadline, text, fenced }
+        HeldBody { request_id, caller, generation, received_at, deadline, text, fenced, retention: Arc::new(()) }
     }
 }
 
@@ -89,7 +103,7 @@ impl AssociationTable {
     /// Remove and return every body whose window has closed (`now > deadline`): each becomes an
     /// explicit undelivered disposition at the caller; none is ever typed.
     pub fn expire(&mut self, now: Instant) -> Vec<HeldBody> {
-        let (gone, keep): (Vec<HeldBody>, Vec<HeldBody>) = self.held.drain(..).partition(|b| now > b.deadline);
+        let (gone, keep): (Vec<HeldBody>, Vec<HeldBody>) = self.held.drain(..).partition(|b| now > b.deadline && Arc::strong_count(&b.retention) == 1);
         self.held = keep;
         gone
     }
@@ -124,7 +138,7 @@ impl AssociationTable {
     /// bind (they are left for [`Self::expire`]); a body of another caller or generation never binds.
     /// [`Self::hold`] keeps at most one body per caller and generation, so there is no candidate set.
     pub fn take_for_return(&mut self, caller: &CallerKey, generation: u64, now: Instant) -> Associate {
-        match self.held.iter().position(|b| b.caller == *caller && b.generation == generation && now <= b.deadline) {
+        match self.held.iter().position(|b| b.caller == *caller && b.generation == generation && b.received_at <= now && now <= b.deadline) {
             Some(i) => Associate::Bound(self.held.remove(i)),
             None => Associate::NoBody,
         }
@@ -136,7 +150,34 @@ impl AssociationTable {
         let i = self
             .held
             .iter()
-            .position(|b| b.request_id == request_id && b.generation == generation && now <= b.deadline)?;
+            .position(|b| b.request_id == request_id && b.generation == generation && b.received_at <= now && now <= b.deadline)?;
+        Some(self.held.remove(i))
+    }
+
+    /// Call only while the daemon's receipt registry still protects its unparsed
+    /// frame. This transfers residency to existing target-local entries before
+    /// the global guard is released. ACL/caller/token matching still runs later.
+    pub(crate) fn retain_for_receipt(&self, at: Instant, generation: u64, token: Option<&str>) -> HeldSubmitRetention {
+        let tokens = self.held.iter().filter(|b| b.generation == generation
+            && b.received_at <= at && at <= b.deadline
+            && token.is_none_or(|id| b.request_id == id))
+            .map(|b| b.retention.clone()).collect();
+        HeldSubmitRetention { _tokens: tokens }
+    }
+
+    pub(crate) fn take_received_return(&mut self, received: &HeldSubmitRetention, caller: &CallerKey,
+        generation: u64, at: Instant) -> Associate {
+        match self.held.iter().position(|b| received.contains(b) && b.caller == *caller
+            && b.generation == generation && b.received_at <= at && at <= b.deadline) {
+            Some(i) => Associate::Bound(self.held.remove(i)),
+            None => Associate::NoBody,
+        }
+    }
+
+    pub(crate) fn take_received_token(&mut self, received: &HeldSubmitRetention, token: &str,
+        generation: u64, at: Instant) -> Option<HeldBody> {
+        let i = self.held.iter().position(|b| received.contains(b) && b.request_id == token
+            && b.generation == generation && b.received_at <= at && at <= b.deadline)?;
         Some(self.held.remove(i))
     }
 
@@ -314,4 +355,69 @@ mod tests {
         assert_eq!(old.request_id, "h0");
         assert_eq!(t.len(), MAX_HELD_PER_SURFACE);
     }
+    #[test]
+    fn received_return_retains_only_eligible_original_bodies_until_dispatch_finishes() {
+        let now=Instant::now();let mut table=AssociationTable::default();
+        table.hold(body("a",CallerKey::Surface(1),1,now)).unwrap();
+        table.hold(body("b",CallerKey::Surface(2),1,now)).unwrap();
+        let retained=table.retain_for_receipt(now+W-MS,1,Some("a"));
+        assert_eq!(table.expire(now+W+MS).iter().map(|b|b.request_id.as_str()).collect::<Vec<_>>(),["b"]);
+        assert_eq!(table.ids(),["a"]);
+        drop(retained);
+        assert_eq!(table.expire(now+W+MS).iter().map(|b|b.request_id.as_str()).collect::<Vec<_>>(),["a"]);
+    }
+    #[test]
+    fn receipt_before_body_or_after_deadline_cannot_retain_or_associate() {
+        let now=Instant::now();let mut table=AssociationTable::default();let caller=CallerKey::Surface(1);
+        table.hold(body("a",caller.clone(),1,now+MS)).unwrap();
+        let early=table.retain_for_receipt(now,1,None);
+        assert!(matches!(table.take_for_return(&caller,1,now),Associate::NoBody));
+        assert!(table.take_by_token("a",1,now).is_none());
+        let late=table.retain_for_receipt(now+W+MS+MS,1,None);
+        assert_eq!(table.expire(now+W+MS+MS).len(),1);
+        drop((early,late));
+    }
+    #[test]
+    fn restore_keeps_pending_receipt_identity_and_never_renews_deadline() {
+        let now=Instant::now();let mut table=AssociationTable::default();let caller=CallerKey::Surface(1);
+        table.hold(body("a",caller.clone(),1,now)).unwrap();
+        let first=table.retain_for_receipt(now+W-MS,1,None);
+        let second=table.retain_for_receipt(now+W,1,None);
+        let Associate::Bound(b)=table.take_for_return(&caller,1,now+W-MS) else {panic!()};
+        assert_eq!(b.deadline,now+W);table.restore(b).unwrap();drop(first);
+        assert!(table.expire(now+W+MS).is_empty());
+        let Associate::Bound(b)=table.take_for_return(&caller,1,now+W) else {panic!()};
+        assert_eq!(b.deadline,now+W);drop((second,b));assert_eq!(table.len(),0);
+    }
+    #[test]
+    fn stale_superseded_and_drained_bodies_cannot_be_resurrected_by_receipt_guards() {
+        let now=Instant::now();let mut table=AssociationTable::default();let caller=CallerKey::Surface(1);
+        table.hold(body("a",caller.clone(),1,now)).unwrap();
+        let retained=table.retain_for_receipt(now,1,None);
+        assert_eq!(table.hold(body("b",caller.clone(),1,now+MS)).unwrap().unwrap().request_id,"a");
+        assert_eq!(table.take_stale(2).pop().unwrap().request_id,"b");
+        drop(retained);assert_eq!(table.len(),0);
+        table.hold(body("c",caller,2,now)).unwrap();let retained=table.retain_for_receipt(now,2,None);
+        assert_eq!(table.drain_all().len(),1);drop(retained);assert_eq!(table.len(),0);
+    }
+    #[test]
+    fn retained_bodies_still_occupy_the_existing_capacity() {
+        let now=Instant::now();let mut table=AssociationTable::default();
+        for n in 0..MAX_HELD_PER_SURFACE {table.hold(body(&format!("{n}"),CallerKey::Surface(n as u64),1,now)).unwrap();}
+        let retained=table.retain_for_receipt(now+W,1,None);
+        assert!(table.expire(now+W+MS).is_empty());
+        assert!(table.hold(body("overflow",CallerKey::Surface(999),1,now+W+MS)).is_err());
+        drop(retained);assert_eq!(table.expire(now+W+MS).len(),MAX_HELD_PER_SURFACE);
+    }
+
+    #[test]
+    fn an_empty_captured_set_cannot_float_to_a_later_admitted_body_with_earlier_receipt() {
+        let now=Instant::now();let mut table=AssociationTable::default();let caller=CallerKey::Surface(1);
+        let received=table.retain_for_receipt(now+MS,1,None);
+        table.hold(body("late-admission",caller.clone(),1,now)).unwrap();
+        assert!(matches!(table.take_received_return(&received,&caller,1,now+MS),Associate::NoBody));
+        assert!(table.take_received_token(&received,"late-admission",1,now+MS).is_none());
+        assert_eq!(table.len(),1);
+    }
+
 }

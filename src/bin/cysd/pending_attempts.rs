@@ -48,6 +48,16 @@ pub(crate) struct AttemptSummary {
     pub number:u64,pub phase:AttemptPhase,pub outcome:Option<OutcomeKind>,pub accepted:Option<Accepted>,
     pub native:Option<NativeProgress>,pub consumed:bool,pub recovered:bool,
 }
+/// Result of actual completion aftercare, not a native/write/source-settlement permit.
+#[derive(Debug,PartialEq,Eq)]
+pub(crate) enum CompletionRecovery {
+    ZeroWriteResolved,
+    StoredWithoutNativeRelease { kind:OutcomeKind },
+    /// Stop retrying THIS journal's completion recovery. No request/source retirement,
+    /// new-owner release, durable-success claim or execution permission is implied.
+    SupersededAttempt { number:u64 },
+}
+
 fn epoch_ms()->u64 { SystemTime::now().duration_since(UNIX_EPOCH).map_or(0,|v|u64::try_from(v.as_millis()).unwrap_or(u64::MAX)) }
 fn diagnostic(reason:&str,limit:usize)->Diagnostic {
     let mut n=reason.len().min(limit);while !reason.is_char_boundary(n) { n-=1; }
@@ -310,7 +320,7 @@ impl AttemptJournal {
     /// Retry storing retained ACTUAL completion facts; never execute a body/Return again.
     /// Native exclusion remains held after a failed writer finish until a separate typed
     /// resolution consumes the committed outcome; this method alone grants no retry permission.
-    pub fn retry_outcome(&self)->Result<(),ProtocolError> {
+    pub(super) fn retry_outcome(&self)->Result<(),ProtocolError> {
         let actual={self.outcome.lock().unwrap_or_else(|e|e.into_inner()).actual.clone().ok_or(ProtocolError::Missing)?};
         let durability=self.persist_outcome(&actual)?;
         self.outcome.lock().unwrap_or_else(|e|e.into_inner()).stored=Some(durability);Ok(())
@@ -333,8 +343,46 @@ impl AttemptJournal {
     }
     /// Explicit current-run resolution after storage retry. The writer checks the exact
     /// original Started operation; no status, cancellation, Plan or source state is reset.
-    pub fn resolve_stored_zero_write(&self)->Result<(),ProtocolError> {
+    pub(super) fn resolve_stored_zero_write(&self)->Result<(),ProtocolError> {
         self.current.request.resolve_durable_zero_write(self.zero_write_receipt()?)?;Ok(())
+    }
+    fn superseded(&self)->Result<bool,ProtocolError> {
+        // A reopened store never substitutes for this journal's original live owner.
+        let _store=self.live_store()?;
+        Ok(self.stamp.ownership(&self.current.request)?==crate::agent_write::AttemptOwnership::Superseded)
+    }
+    /// Producer-facing recovery. Component steps are visible to pending_requests and
+    /// its descendants, not to sibling handlers. A positive newer ownership nonce is
+    /// a terminal disposition for THIS journal only; no generic Conflict is permanent.
+    /// Otherwise retained actual facts are persisted before typed native-zero release.
+    /// Partial/unknown/success storage does not resolve native or source effects here.
+    pub fn reconcile_completion(&self)->Result<CompletionRecovery,ProtocolError> {
+        self.reconcile_completion_core(|| {})
+    }
+    // One algorithm. Production supplies only a no-op; the cfg(test) accessor can
+    // place a real ownership transition at this exact boundary without a hook registry.
+    fn reconcile_completion_core(&self, after_entry:impl FnOnce())->Result<CompletionRecovery,ProtocolError> {
+        let actual=self.outcome.lock().unwrap_or_else(|e|e.into_inner()).actual.clone()
+            .ok_or(ProtocolError::Missing)?;
+        if self.superseded()? { return Ok(CompletionRecovery::SupersededAttempt { number:self.number }); }
+        after_entry(); // No store/native/outcome mutex is held here.
+        let result:Result<CompletionRecovery,ProtocolError>=(|| {
+            self.retry_outcome()?;
+            if matches!(actual.kind,OutcomeKind::RefusedNoWrite|OutcomeKind::CancelledBeforeWrite)
+                && actual.native.proven_zero() {
+                self.resolve_stored_zero_write()?;
+                Ok(CompletionRecovery::ZeroWriteResolved)
+            } else {
+                Ok(CompletionRecovery::StoredWithoutNativeRelease { kind:actual.kind })
+            }
+        })();
+        // New ownership may have begun after the entry check. The nonce relation is
+        // monotonic for this stamp; checking it does not touch either owner's state.
+        match self.superseded() {
+            Ok(true)=>Ok(CompletionRecovery::SupersededAttempt { number:self.number }),
+            Ok(false)=>result,
+            Err(error)=>match result { Err(original)=>Err(original),Ok(_)=>Err(error) },
+        }
     }
     pub fn has_stored_outcome(&self)->bool { self.stored_durability().is_some() }
     pub fn stored_durability(&self)->Option<Durability> { self.outcome.lock().unwrap_or_else(|e|e.into_inner()).stored }
@@ -445,3 +493,23 @@ impl PendingStore {
             consumed:a.consumed,recovered:snapshot.loaded.contains(id) }).collect()).unwrap_or_default())
     }
 }
+
+#[cfg(test)]
+impl AttemptJournal {
+    pub(super) fn test_reconcile_after_entry(&self, after_entry:impl FnOnce())->Result<CompletionRecovery,ProtocolError> {
+        self.reconcile_completion_core(after_entry)
+    }
+    /// Actual disk commit with the runtime-publication interval made deterministic.
+    /// Only a test callback is inserted; no actual receipt or durability is fabricated.
+    pub(super) fn test_commit_then_publish(&self, between:impl FnOnce())->Result<(),ProtocolError> {
+        let actual=self.outcome.lock().unwrap_or_else(|e|e.into_inner()).actual.clone()
+            .ok_or(ProtocolError::Missing)?;
+        let durability=self.persist_outcome(&actual)?;
+        between();
+        self.outcome.lock().unwrap_or_else(|e|e.into_inner()).stored=Some(durability);
+        Ok(())
+    }
+}
+#[cfg(test)]
+#[path="pending_aftercare_envelope_tests.rs"]
+mod aftercare_envelope_tests;

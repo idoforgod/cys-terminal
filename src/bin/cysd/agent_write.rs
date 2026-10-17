@@ -328,6 +328,9 @@ struct NativeState {
     // Acknowledge only this actual zero-release again, until any new ownership.
     // Runtime identity only: never serialized or inferred from absence/zero bytes.
     last_zero_resolution: Option<Arc<()>>,
+    // Positive history of the newest issued managed owner, including after its lease
+    // is dropped/completed. One bounded nonce, never persisted or a release permit.
+    last_issued_owner: Option<Arc<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,6 +359,21 @@ pub(crate) struct AttemptLease {
 #[derive(Clone)]
 pub(crate) struct AttemptStamp {
     request: Arc<Request>, key: Arc<()>, plan: Plan, resume: Option<Envelope>,
+}
+
+/// Read-only relationship to the exact private stamp, never a native/store permit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttemptOwnership { Same, Superseded }
+impl AttemptStamp {
+    pub(crate) fn ownership(&self, request:&Arc<Request>)->Result<AttemptOwnership,LeaseError> {
+        if !request.managed || !Arc::ptr_eq(request,&self.request) {
+            return Err(LeaseError::WrongRequest);
+        }
+        let state=request.native.lock().unwrap_or_else(|e|e.into_inner());
+        let latest=state.last_issued_owner.as_ref().ok_or(LeaseError::WrongLease)?;
+        Ok(if Arc::ptr_eq(latest,&self.key) { AttemptOwnership::Same }
+            else { AttemptOwnership::Superseded })
+    }
 }
 
 /// Exclusive zero-byte edit ownership. No native mutex survives a public method.
@@ -413,6 +431,7 @@ impl Request {
         if !state.permits_run(plan, resume) { return Err(LeaseError::NativeConflict); }
         let key = Arc::new(());
         state.last_zero_resolution=None;
+        state.last_issued_owner=Some(key.clone());
         state.operation = Some(ManagedOperation::Attempt { key: key.clone(), phase: AttemptPhase::Prepared });
         Ok(AttemptLease { request: self.clone(), key, plan: plan.clone(), resume })
     }
@@ -426,6 +445,7 @@ impl Request {
         let key = Arc::new(());
         let original_plan = state.plan.clone();
         state.last_zero_resolution=None;
+        state.last_issued_owner=Some(key.clone());
         state.operation = Some(ManagedOperation::Edit { key: key.clone(), phase: EditPhase::Reserved });
         Ok(ZeroWriteEditLease { request: self.clone(), key, original_plan })
     }
@@ -792,6 +812,9 @@ impl Drop for Completing<'_> {
                 Some(ManagedOperation::Attempt { key, phase:AttemptPhase::Started })
                     if Arc::ptr_eq(key,self.key));
             if own_attempt && self.release_attempt && !state.progress.outstanding && !state.progress.unknown {
+                // Actual finish already released this exact zero-progress attempt. Its real
+                // stored-zero receipt may acknowledge that release until new ownership begins.
+                if state.progress.proven_zero() { state.last_zero_resolution=Some(self.key.clone()); }
                 state.operation=None;
             }
             // Native uncertainty remains held for typed reconciliation even after

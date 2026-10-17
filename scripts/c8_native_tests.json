@@ -1,0 +1,17 @@
+[
+  "native_publication::native_transition_tests::np_actual_partial_progress_cannot_be_retokenized_to_replacement",
+  "native_publication::native_transition_tests::np_actual_writer_operation_blocks_activation_after_prepare",
+  "native_publication::native_transition_tests::np_cancelled_real_candidate_never_publishes_or_replaces_pending_owner",
+  "native_publication::native_transition_tests::np_compiler_child_preserves_bytecode_seal_after_env_clear",
+  "native_publication::native_transition_tests::np_core_preserves_old_submit_identity_for_store_veto_without_exposing_token",
+  "native_publication::native_transition_tests::np_different_builtin_requires_authorizer_and_strict_whole_catalog",
+  "native_publication::native_transition_tests::np_expired_real_candidate_keeps_original_obligation_for_fresh_episode",
+  "native_publication::native_transition_tests::np_native_agent_death_with_root_alive_allows_distinct_same_policy_adoption",
+  "native_publication::native_transition_tests::np_native_same_pid_exec_is_changed_not_agent_death",
+  "native_publication::native_transition_tests::np_negative_unknown_result_cannot_mint_a_death_fact",
+  "native_publication::native_transition_tests::np_real_candidate_compares_all_epochs_and_rejects_supersession",
+  "native_publication::native_transition_tests::np_windows_duplicate_sample_identity_does_not_count_as_confirmation",
+  "native_publication::native_transition_tests::np_windows_first_sample_from_other_old_generation_is_discarded",
+  "native_publication::native_transition_tests::np_windows_real_candidate_change_restarts_sample_confirmation",
+  "native_publication::native_transition_tests::np_windows_rule_requires_two_distinct_actual_native_starts"
+]

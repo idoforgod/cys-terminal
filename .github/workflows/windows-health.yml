@@ -676,6 +676,15 @@ jobs:
           } >> "$SUM" 2>/dev/null
           exit 0
 
+      - name: C8 UNMEASURED marker gate (Windows full and hwmon)
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python
+          if command -v python3 >/dev/null 2>&1; then PY=python3; fi
+          PYTHONDONTWRITEBYTECODE=1 "$PY" scripts/c8_native_measurement.py "${RUNNER_TEMP:-/tmp}/cysd-win/cargo.log" "${RUNNER_TEMP:-/tmp}/hwmon-win/cargo.log"
+
       # ── 0.14.50 F10(훅 드리프트 보고): 윈도우 달라지는 코드(매니페스트 키의 역슬래시 · 폴더 중복 제거 ·
       #   읽기 상한)가 있는데 어느 윈도우 걸음도 그 Rust 시험을 돌리지 않았다. FIFO·심볼릭 링크 시험은
       #   `#[cfg(unix)]` 로 막혀 있어(지우지 않았다) 윈도우에서는 컴파일되지 않는다.

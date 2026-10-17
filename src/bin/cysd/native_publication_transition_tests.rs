@@ -88,29 +88,57 @@ finally:
 "###;
 
 static NEXT:AtomicU64=AtomicU64::new(1);
+mod ci_inputs { include!("c8_test_inputs.rs"); }
 struct Scratch { path:PathBuf }
 impl Scratch {
     fn new()->Self {
-        let base=PathBuf::from(std::env::var_os("C8_NATIVE_TEST_ROOT")
-            .expect("explicit isolated C8_NATIVE_TEST_ROOT required")).canonicalize().unwrap();
-        assert!(base.is_dir());
-        let path=base.join(format!("native-transition-{}-{}",std::process::id(),NEXT.fetch_add(1,Ordering::Relaxed)));
-        let mut builder=std::fs::DirBuilder::new();
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700).create(&path).unwrap();
-        assert!(path.canonicalize().unwrap().starts_with(&base));
-        Self { path }
+        Self { path:ci_inputs::private_root("C8_NATIVE_TEST_ROOT", "n")
+            .expect("C8 native fixture private root provisioning failed") }
     }
+}
+
+fn executable_python(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = path.canonicalize().ok()?;
+    let metadata = std::fs::metadata(&path).ok()?;
+    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0).then_some(path)
+}
+fn default_python() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).filter(|dir| dir.is_absolute())
+            .map(|dir| dir.join("python3")).collect()).unwrap_or_default();
+    candidates.extend(["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"]
+        .into_iter().map(PathBuf::from));
+    candidates.into_iter().find_map(|path| executable_python(&path))
+}
+fn fixture_python(test: &'static str) -> Option<PathBuf> {
+    // An explicit override is checked on EVERY resolution, before any cached default.
+    // Invalid explicit configuration is a test failure; it never silently falls back.
+    if let Some(value) = std::env::var_os("C8_NATIVE_FIXTURE_PYTHON") {
+        let path = PathBuf::from(value);
+        assert!(path.is_absolute(), "explicit C8_NATIVE_FIXTURE_PYTHON must be absolute");
+        return Some(executable_python(&path).expect("explicit C8_NATIVE_FIXTURE_PYTHON is not an executable file"));
+    }
+    static DEFAULT: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    if let Some(path) = DEFAULT.get_or_init(default_python) { return Some(path.clone()); }
+    // Stable libtest cannot dynamically ignore a test. Direct stderr Write bypasses
+    // successful-test println/eprintln capture; the evidence runner MUST classify this
+    // named marker as UNMEASURED even though libtest counts the returning test as `ok`.
+    let record = serde_json::json!({"state":"UNMEASURED", "group":"C8_NATIVE_TRANSITIONS",
+        "test":test, "reason":"python3_unavailable"});
+    let line = format!("\nC8_NATIVE_UNMEASURED_V1 {record}\n");
+    assert!(line.len() <= 512, "C8 UNMEASURED marker exceeded bounded output");
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(line.as_bytes()).expect("C8 UNMEASURED marker could not be written");
+    stderr.flush().expect("C8 UNMEASURED marker could not be flushed");
+    None
 }
 impl Drop for Scratch { fn drop(&mut self) { let _=std::fs::remove_dir_all(&self.path); } }
 struct OwnedRoot {
     child:Child, replies:mpsc::Receiver<serde_json::Value>,reader:Option<JoinHandle<()>>,
 }
 impl OwnedRoot {
-    fn spawn(scratch:&Scratch)->Self {
-        let python=PathBuf::from(std::env::var_os("C8_NATIVE_FIXTURE_PYTHON")
-            .expect("explicit absolute Python executable required"));
-        assert!(python.is_absolute() && python.is_file());
+    fn spawn(scratch:&Scratch, python:&Path, compiler_override:Option<&std::ffi::OsStr>)->Self {
         let a=scratch.path.join("np-agent-a");let b=scratch.path.join("np-agent-b");
         // Own minimal native programs: relocated Apple system binaries were observed exiting
         // with signal9 on this host. Do not alter signatures or live system executables.
@@ -129,14 +157,16 @@ int main(int argc, char **argv) {
     return ferror(stdin) ? 1 : 0;
 }
 "#).unwrap();
-        let compiler=std::env::var_os("C8_NATIVE_FIXTURE_CC").unwrap_or_else(||"/usr/bin/cc".into());
+        let compiler=compiler_override.map(std::ffi::OsStr::to_owned)
+            .unwrap_or_else(||std::env::var_os("C8_NATIVE_FIXTURE_CC").unwrap_or_else(||"/usr/bin/cc".into()));
         let built=Command::new(compiler).hide_console().arg("-std=c11").arg("-O0")
             .arg(&fixture_source).arg("-o").arg(&a).env_clear().env("PATH","/usr/bin:/bin")
+            .env("PYTHONDONTWRITEBYTECODE","1")
             .output().expect("fixture C compiler must be available");
         assert!(built.status.success(),"owned native fixture compilation failed: {}",String::from_utf8_lossy(&built.stderr));
         std::fs::copy(&a,&b).unwrap();
         let script=scratch.path.join("supervisor.py");std::fs::write(&script,SUPERVISOR).unwrap();
-        let mut child=Command::new(&python)
+        let mut child=Command::new(python)
             .hide_console()
             .arg("-u").arg(&script).arg(&a).arg(&b)
             .env_clear().env("PATH","/usr/bin:/bin").env("PYTHONDONTWRITEBYTECODE","1")
@@ -200,8 +230,9 @@ struct Rig {
     cell:Arc<ReceiverCell>,sender:WriterSender,receiver:mpsc::Receiver<QueuedWrite>,
 }
 impl Rig {
-    fn new(windows_rule:bool)->Self {
-        let scratch=Scratch::new();let root=OwnedRoot::spawn(&scratch);
+    fn new(windows_rule:bool, test:&'static str)->Option<Self> {
+        let python=fixture_python(test)?;
+        let scratch=Scratch::new();let root=OwnedRoot::spawn(&scratch,&python,None);
         let root_observation=process_observation::observe(root.child.id()).unwrap();
         let group=root_observation.identity.process_group;
         let (sender,receiver)=WriterSender::channel(2);
@@ -212,7 +243,7 @@ impl Rig {
             core:Mutex::new(Core { epochs:base_epochs(),root:None,catalog:vec![a.clone(),b].into(),
                 policy:PolicySlot::Fixed(Arc::new(a)),current:None,dead:HashSet::new(),pending:None,
                 next_attempt:1,next_episode:1 }) });
-        Self { root,_scratch:scratch,cell,sender,receiver }
+        Some(Self { root,_scratch:scratch,cell,sender,receiver })
     }
     fn work(&self,label:&str)->Work {
         Work { owner:DiscoveryOwner::Registration(RegistrationObligation::new(
@@ -321,7 +352,7 @@ fn change_work(rig:&Rig,auth:&Authorizer)->Work {
 
 #[test]
 fn np_native_agent_death_with_root_alive_allows_distinct_same_policy_adoption() {
-    let mut rig=Rig::new(false);let old=rig.initial();let before=rig.cell.epochs();
+    let Some(mut rig)=Rig::new(false, "native_publication::native_transition_tests::np_native_agent_death_with_root_alive_allows_distinct_same_policy_adoption") else { return; };let old=rig.initial();let before=rig.cell.epochs();
     rig.prove_old_dead(&old);
     let stale_fact=rig.cell.observe_agent_death().unwrap(); // second REAL native Dead observation
     let new_pid=rig.root.start("a");let work=rig.work("adopt");
@@ -339,7 +370,7 @@ fn np_native_agent_death_with_root_alive_allows_distinct_same_policy_adoption() 
 
 #[test]
 fn np_native_same_pid_exec_is_changed_not_agent_death() {
-    let mut rig=Rig::new(false);let old=rig.initial();let before=old.agent_id();
+    let Some(mut rig)=Rig::new(false, "native_publication::native_transition_tests::np_native_same_pid_exec_is_changed_not_agent_death") else { return; };let old=rig.initial();let before=old.agent_id();
     assert!(matches!(rig.cell.observe_agent_death(),Err(DeathError::Alive)));
     assert!(matches!(rig.cell.begin_adoption(rig.work("live-old-agent")),Err(CoreError::NotDead)),
         "a live old receiver must not enter the adoption transition");
@@ -363,7 +394,7 @@ fn np_native_same_pid_exec_is_changed_not_agent_death() {
 
 #[test]
 fn np_different_builtin_requires_authorizer_and_strict_whole_catalog() {
-    let mut rig=Rig::new(false);let old=rig.initial();rig.prove_old_dead(&old);
+    let Some(mut rig)=Rig::new(false, "native_publication::native_transition_tests::np_different_builtin_requires_authorizer_and_strict_whole_catalog") else { return; };let old=rig.initial();rig.prove_old_dead(&old);
     rig.root.start("a");rig.root.start("b"); // deliberately competing actual native declarations
     let denied=Authorizer::new(false);
     assert!(matches!(rig.cell.authorize_change("gemini",RegistrationOrigin::LaunchAgent,&denied),Err(CoreError::UnsupportedTransition)));
@@ -396,7 +427,7 @@ impl DurableActivationValidator for HoldingWriterStore {
 }
 #[test]
 fn np_actual_writer_operation_blocks_activation_after_prepare() {
-    let mut rig=Rig::new(false);let old=rig.initial();rig.prove_old_dead(&old);rig.root.start("a");
+    let Some(mut rig)=Rig::new(false, "native_publication::native_transition_tests::np_actual_writer_operation_blocks_activation_after_prepare") else { return; };let old=rig.initial();rig.prove_old_dead(&old);rig.root.start("a");
     let work=rig.work("idle");rig.cell.begin_adoption(work.clone()).unwrap();rig.cell.open_window(&work,Instant::now()).unwrap();
     let sender=rig.sender.clone();
     worker_step(&rig.cell,&work,move|c,result|{
@@ -416,7 +447,7 @@ fn np_actual_writer_operation_blocks_activation_after_prepare() {
 #[test]
 fn np_windows_rule_requires_two_distinct_actual_native_starts() {
     // Unix native observations + Windows STATE RULE, not native Windows evidence.
-    let mut rig=Rig::new(true);let old=rig.initial();rig.prove_old_dead(&old);rig.root.start("b");
+    let Some(mut rig)=Rig::new(true, "native_publication::native_transition_tests::np_windows_rule_requires_two_distinct_actual_native_starts") else { return; };let old=rig.initial();rig.prove_old_dead(&old);rig.root.start("b");
     let work=change_work(&rig,&Authorizer::new(true));let count=rig.cell.executor.counters().started.load(Ordering::Acquire);
     worker_step(&rig.cell,&work,|c,result|{
         assert!(matches!(c.prepare_publication(result?,&SafeFixtureInput)?,PreparedOutcome::WindowsFirstSample),
@@ -431,7 +462,7 @@ fn np_windows_rule_requires_two_distinct_actual_native_starts() {
 
 #[test]
 fn np_windows_real_candidate_change_restarts_sample_confirmation() {
-    let mut rig=Rig::new(true);let old=rig.initial();rig.prove_old_dead(&old);let first_pid=rig.root.start("b");
+    let Some(mut rig)=Rig::new(true, "native_publication::native_transition_tests::np_windows_real_candidate_change_restarts_sample_confirmation") else { return; };let old=rig.initial();rig.prove_old_dead(&old);let first_pid=rig.root.start("b");
     let work=change_work(&rig,&Authorizer::new(true));
     worker_step(&rig.cell,&work,|c,result|{
         assert!(matches!(c.prepare_publication(result?,&SafeFixtureInput)?,PreparedOutcome::WindowsFirstSample));Ok(())
@@ -450,7 +481,7 @@ fn np_windows_real_candidate_change_restarts_sample_confirmation() {
 
 #[test]
 fn np_windows_duplicate_sample_identity_does_not_count_as_confirmation() {
-    let mut rig=Rig::new(true);let old=rig.initial();rig.prove_old_dead(&old);rig.root.start("b");
+    let Some(mut rig)=Rig::new(true, "native_publication::native_transition_tests::np_windows_duplicate_sample_identity_does_not_count_as_confirmation") else { return; };let old=rig.initial();rig.prove_old_dead(&old);rig.root.start("b");
     let work=change_work(&rig,&Authorizer::new(true));
     worker_step(&rig.cell,&work,|c,r|{
         assert!(matches!(c.prepare_publication(r?,&SafeFixtureInput)?,PreparedOutcome::WindowsFirstSample));Ok(())
@@ -473,7 +504,7 @@ fn np_windows_duplicate_sample_identity_does_not_count_as_confirmation() {
 
 #[test]
 fn np_windows_first_sample_from_other_old_generation_is_discarded() {
-    let mut rig=Rig::new(true);let old=rig.initial();rig.prove_old_dead(&old);rig.root.start("b");
+    let Some(mut rig)=Rig::new(true, "native_publication::native_transition_tests::np_windows_first_sample_from_other_old_generation_is_discarded") else { return; };let old=rig.initial();rig.prove_old_dead(&old);rig.root.start("b");
     let work=change_work(&rig,&Authorizer::new(true));
     worker_step(&rig.cell,&work,|c,r|{
         assert!(matches!(c.prepare_publication(r?,&SafeFixtureInput)?,PreparedOutcome::WindowsFirstSample));Ok(())
@@ -490,7 +521,7 @@ fn np_windows_first_sample_from_other_old_generation_is_discarded() {
 
 #[test]
 fn np_cancelled_real_candidate_never_publishes_or_replaces_pending_owner() {
-    let mut rig=Rig::new(false);rig.root.start("a");let work=rig.work("cancel");
+    let Some(mut rig)=Rig::new(false, "native_publication::native_transition_tests::np_cancelled_real_candidate_never_publishes_or_replaces_pending_owner") else { return; };rig.root.start("a");let work=rig.work("cancel");
     rig.cell.begin_initial(work.clone()).unwrap();rig.cell.open_window(&work,Instant::now()).unwrap();
     let cancel=work.clone();
     worker_step(&rig.cell,&work,move|c,r|{
@@ -510,7 +541,7 @@ fn np_cancelled_real_candidate_never_publishes_or_replaces_pending_owner() {
 
 #[test]
 fn np_expired_real_candidate_keeps_original_obligation_for_fresh_episode() {
-    let mut rig=Rig::new(false);rig.root.start("a");let work=rig.work("expiry");
+    let Some(mut rig)=Rig::new(false, "native_publication::native_transition_tests::np_expired_real_candidate_keeps_original_obligation_for_fresh_episode") else { return; };rig.root.start("a");let work=rig.work("expiry");
     rig.cell.begin_initial(work.clone()).unwrap();rig.cell.open_window(&work,Instant::now()).unwrap();
     let original=work.clone();
     worker_step(&rig.cell,&work,move|c,r|{
@@ -532,7 +563,7 @@ fn np_expired_real_candidate_keeps_original_obligation_for_fresh_episode() {
 
 #[test]
 fn np_real_candidate_compares_all_epochs_and_rejects_supersession() {
-    let mut rig=Rig::new(false);rig.root.start("a");let work=rig.work("epochs");
+    let Some(mut rig)=Rig::new(false, "native_publication::native_transition_tests::np_real_candidate_compares_all_epochs_and_rejects_supersession") else { return; };rig.root.start("a");let work=rig.work("epochs");
     rig.cell.begin_initial(work.clone()).unwrap();rig.cell.open_window(&work,Instant::now()).unwrap();
     worker_step(&rig.cell,&work,|c,r|{
         let candidate=r?;
@@ -577,7 +608,7 @@ fn actual_partial_request()->Arc<Request> {
 }
 #[test]
 fn np_actual_partial_progress_cannot_be_retokenized_to_replacement() {
-    let mut rig=Rig::new(false);let old=rig.initial();let request=actual_partial_request();
+    let Some(mut rig)=Rig::new(false, "native_publication::native_transition_tests::np_actual_partial_progress_cannot_be_retokenized_to_replacement") else { return; };let old=rig.initial();let request=actual_partial_request();
     rig.prove_old_dead(&old);rig.root.start("a");
     let work=Work { owner:DiscoveryOwner::ExistingWrite(request.clone()),obligation_id:"old-partial".into(),
         target:Target::Surface,expected:rig.cell.epochs() };
@@ -605,7 +636,7 @@ impl DurableActivationValidator for RejectOldSubmit {
 }
 #[test]
 fn np_core_preserves_old_submit_identity_for_store_veto_without_exposing_token() {
-    let mut rig=Rig::new(false);let old=rig.initial();rig.prove_old_dead(&old);rig.root.start("a");
+    let Some(mut rig)=Rig::new(false, "native_publication::native_transition_tests::np_core_preserves_old_submit_identity_for_store_veto_without_exposing_token") else { return; };let old=rig.initial();rig.prove_old_dead(&old);rig.root.start("a");
     let request=Request::new(format!("old-return-{}",NEXT.fetch_add(1,Ordering::Relaxed)),7,"native-fixture","digest".into());
     let work=Work { owner:DiscoveryOwner::ExistingWrite(request.clone()),obligation_id:"old-submit".into(),
         target:Target::Surface,expected:rig.cell.epochs() };
@@ -623,7 +654,7 @@ fn np_core_preserves_old_submit_identity_for_store_veto_without_exposing_token()
 
 #[test]
 fn np_negative_unknown_result_cannot_mint_a_death_fact() {
-    let mut rig=Rig::new(false);let old=rig.initial();
+    let Some(mut rig)=Rig::new(false, "native_publication::native_transition_tests::np_negative_unknown_result_cannot_mint_a_death_fact") else { return; };let old=rig.initial();
     assert_eq!(old.binding.agent.recheck(),Ok(()),"owned native child must actually be alive");
     let failure=Failure::Unknown { stage:"negative-only-fixture",os_error:Some(libc::EPERM) };
     let result=finish_agent_death_probe(old.clone(),rig.cell.epochs(),Err(failure.clone()));
@@ -631,4 +662,24 @@ fn np_negative_unknown_result_cannot_mint_a_death_fact() {
         "an injected Unknown failure was promoted into a native-death fact");
     assert!(!old.sealed());assert!(rig.cell.core.lock().unwrap().dead.is_empty());
     assert_eq!(rig.cell.fixed_policy().unwrap().class,ProofClass::FullRequired);
+}
+
+#[test]
+fn np_compiler_child_preserves_bytecode_seal_after_env_clear() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(python)=fixture_python("native_publication::native_transition_tests::np_compiler_child_preserves_bytecode_seal_after_env_clear") else { return; };
+    let scratch=Scratch::new();let wrapper=scratch.path.join("seal-compiler");let observed=scratch.path.join("compiler-environment");
+    let compiler=std::env::var_os("C8_NATIVE_FIXTURE_CC").unwrap_or_else(||"/usr/bin/cc".into());
+    let quote=|value:&std::ffi::OsStr|format!("'{}'",value.to_str().expect("fixture compiler/path must be UTF-8").replace('\'',"'\\''"));
+    // Observe the environment at OwnedRoot's ACTUAL compiler call site, then
+    // repair the seal before the real compiler starts, so the removal mutant
+    // remains a safe observation. No global environment or installed file changes.
+    let script=format!("#!/bin/sh\nprintf '%s\\n' \"${{PYTHONDONTWRITEBYTECODE-unset}}\" > {}\nexport PYTHONDONTWRITEBYTECODE=1\nexec {} \"$@\"\n",
+        quote(observed.as_os_str()),quote(&compiler));
+    std::fs::write(&wrapper,script).unwrap();
+    std::fs::set_permissions(&wrapper,std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root=OwnedRoot::spawn(&scratch,&python,Some(wrapper.as_os_str()));
+    assert_eq!(std::fs::read(&observed).unwrap(),b"1\n",
+        "actual fixture compiler call site lost PYTHONDONTWRITEBYTECODE after env_clear");
+    drop(root); // ordinary owned-supervisor cleanup, before Scratch destruction
 }
