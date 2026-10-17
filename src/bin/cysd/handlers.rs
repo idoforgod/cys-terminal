@@ -5518,7 +5518,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                "claude_config_dir": s.claude_config_dir.lock().unwrap().clone()}),
                     ))
                 }
-                Err(e) => Reply::Single(err_response(&id, "spawn_failed", &e)),
+                Err(e) => surface_create_error(&daemon.bus, &id, &e),
             }
         }
 
@@ -11560,6 +11560,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         )),
     }
 }
+
+// D1: one failed create, one readable error and one event; no native retry.
+// The allocator guard has already been released (or never acquired) here.
+fn surface_create_error(bus: &crate::events::EventBus, id: &Value, message: &str) -> Reply {
+    if message == crate::state::PTY_ALLOCATOR_BUSY_MESSAGE {
+        bus.publish(
+            "surface.pty_allocator_busy", "system", None,
+            json!({"reason": "pty_allocator_busy", "wait_limit_ms": 5000}),
+        );
+        return Reply::Single(err_response(id, "pty_allocator_busy", message));
+    }
+    Reply::Single(err_response(id, "spawn_failed", message))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -31231,3 +31245,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "pty_allocator_busy_tests.rs"]
+mod pty_allocator_busy_tests;

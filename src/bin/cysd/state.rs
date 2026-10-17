@@ -16,6 +16,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::broadcast;
 
+pub(crate) const PTY_ALLOCATOR_BUSY_MESSAGE: &str = "pty allocator busy";
+
+pub(crate) fn map_pty_open_error(error: &(dyn std::error::Error + 'static)) -> String {
+    #[cfg(unix)]
+    if error.downcast_ref::<portable_pty::unix::PtyAllocatorBusy>().is_some() {
+        return PTY_ALLOCATOR_BUSY_MESSAGE.to_string();
+    }
+    format!("openpty failed: {error}")
+}
+
 pub(crate) const SCROLLBACK_LINES: usize = 10_000;
 pub const DEFAULT_ROWS: u16 = 35;
 pub const DEFAULT_COLS: u16 = 120;
@@ -6294,7 +6304,7 @@ impl Daemon {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| format!("openpty failed: {e}"))?;
+            .map_err(|e| map_pty_open_error(e.as_ref()))?;
 
         let shell = default_shell();
         let mut builder = CommandBuilder::new(&shell);
