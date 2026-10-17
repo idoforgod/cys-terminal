@@ -40,7 +40,7 @@ census 정의(CEO 승인 · 표는 전부 grep 실측값으로 고정 — 추정
        변수로 바꾸면(변조 M6 실증) ⓒ(iii) 탐지 규약("py"/"python" 이름 휴리스틱)과 src/lib.rs 핀이 **둘 다** 못 보고
        census 가 초록(`PYSEAL-CENSUS-OK`/exit 0)이었다 → 그 줄을 강제점으로 등재하고 ⓒ(v) 를 신설했다.
      (표가 세는 것은 줄 번호가 아니라 **비주석 줄의 개수**다 — 주석의 행번호는 2026-09-04 grep 재실측.)
-  ⓑ 참조 파일 집합 — `PYTHONDONTWRITEBYTECODE`/`ENV_PY_NO_BYTECODE` 를 언급하는 파일 **18개 목록** 고정
+  ⓑ 참조 파일 집합 — `PYTHONDONTWRITEBYTECODE`/`ENV_PY_NO_BYTECODE` 를 언급하는 파일 **38개 목록** 고정
      (2026-09-04 W-A A2: 17→18 · 훅 런처/본체 분할 검체 등재 — 등재 사유는 목록 주석 참조)
      (확장자 13종 · target/node_modules/_worktrees/.git 제외 · 이 파일 자신 제외 · grep -rl 동형).
      신규/소멸 → FAIL: 그 파일의 봉인을 점검한 뒤 목록을 갱신하라(갱신 = "봉인을 확인했다"는 선언).
@@ -56,7 +56,7 @@ census 정의(CEO 승인 · 표는 전부 grep 실측값으로 고정 — 추정
           FAIL · allowlist 항목의 소멸/봉인/python 미사용 = FAIL(묵은 allowlist 는 의도적으로 정리하라).
      (iii) Rust python 직스폰 지점 수 — src/lib.rs 핀의 탐지 규약(같은 줄에 `Command::new(` 가 닫히고
           인자에 "py" 또는 줄에 "python" · `//` 줄 제외 · vendor/target 제외 · ASCII 소문자화)을 **그대로
-          미러**해 {cys.rs 1 · boot_supervisor 1 · cysd/main 2 · tauri/main 4} 를 2언어로 핀 — cargo 를
+          미러**해 {cys.rs 1 · boot_supervisor 1 · cysd/main 2 · tauri/main 4 · native_publication_transition_tests 1} 를 2언어로 핀 — cargo 를
           안 도는 레인에서도 같은 값이 같은 순간에 깨진다.
      (iv) SEAL-1 층4 — bin/*.py 직속 파일의 첫 형제 import 앞에 `sys.dont_write_bytecode = True`
           필수. 외부 호출자의 환경과 무관하게 팩 내부 캐시 쓰기를 막는다(+ 소비 파일 하한 30).
@@ -229,7 +229,11 @@ def check_enforcement():
 REF_EXTS = (".rs", ".sh", ".py", ".ts", ".js", ".md", ".toml", ".yml", ".yaml", ".json", ".plist", ".bat", ".ps1")
 REF_SKIP_DIRS = frozenset(("target", "node_modules", "_worktrees", ".git"))
 REF_NEEDLES = (b"PYTHONDONTWRITEBYTECODE", b"ENV_PY_NO_BYTECODE")
+# 2026-10-17 at merged 3af6a34a: 38 files under REF_EXTS, REF_SKIP_DIRS, SELF_REL
+# and either REF_NEEDLES byte string (including comments); symlinks are not followed.
 REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와 동일) · 중복 없음
+    # 0.14.52 seal audit: New C8 marker/name readers and consumer control set the seal on each Python command.
+    ".github/workflows/ci-branch.yml",
     # ★2026-09-04 W-A 등재(IG-9 워크플로 생산자 쌍 `67e4849`/`9d452d9` 로 유입).
     #   **봉인 점검 결과(등재 = 이 선언)**: 이것은 **진짜 강제점**이다 — 주석·문서 언급이 아니라
     #   스텝 env 로 `PYTHONDONTWRITEBYTECODE: '1'` 을 실제로 건다(`:255`). 그 스텝이 Windows
@@ -244,6 +248,8 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   자기가 검사할 대상을 오염시켜 '추가 파일' 오탐을 만든다(SEAL-1 과 같은 계급).
     ".github/workflows/release.yml",
     ".github/workflows/windows-build.yml",
+    # 0.14.52 seal audit: New C8 marker reader sets the seal on its selected Python child.
+    ".github/workflows/windows-health.yml",
     # ★2026-09-22 통합(0.14.39 · WP-D-cli autopilot self-test) 등재. **봉인 점검 결과(등재 = 이 선언)**:
     #   새 python 진입점도 강제점도 **아니다**. 니들은 이 모듈의 자기검체(`--self-test`)가 쓰는 **밀폐
     #   env 한 줄**(`"PYTHONDONTWRITEBYTECODE": "1"`)이다 — javis_wakeup 배달 멱등키 전제를 셸 스텁
@@ -277,6 +283,8 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   tempfile 과 함께 사라지므로 봉인 관측 축은 아니다.
     "cysjavis-pack/bin/tests/test_lane_redirect.py",
     "cysjavis-pack/bin/tests/test_org_audit.py",
+    # 0.14.52 seal audit: Private child env seals Rust cys/cysd descendants; no direct Python child.
+    "cysjavis-pack/bin/tests/test_phoenix_c6_reap.py",
     # ★2026-10-09 0.14.48 A 등재 — phoenix 기본 인코딩 내성 검체. **봉인 점검 결과(등재 = 이 선언)**:
     #   강제점이 아니라 **자식 env 를 짜는 두 줄**이다 — `_bare_env()`(os.environ 사본에서 UTF-8 강제 변수만 벗기고
     #   `PYTHONDONTWRITEBYTECODE=1` 을 직접 싣는다 — 벗기지 않고 상속 방향으로 다시 건다)와 끝에서 끝 E 의 데몬 자식 env 한 줄.
@@ -323,6 +331,8 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     "scripts/deploy_gate.py",
     "scripts/installer-app/install-core.sh",
     "scripts/precompile-bundled-python.sh",
+    # 0.14.52 seal audit: All three subprocess sites receive sealed env; Python shims/direct child also use -B.
+    "scripts/tests/test_c8_ci_consumer.py",
     # ★2026-09-26 등재(0.14.42 · 11b8ddd9 FATAL-1 이 넣은 검체 — 그 뒤 이 census 가 5개 CI 팩 루프에서 적색이었다.
     #   6371f8bd 기준에서도 같은 FAIL 1건이므로 R3 가 만든 적색이 아니다). **봉인 점검 결과(등재 = 이 선언)**:
     #   새 python 진입점도 제품 강제점도 **아니다**. 이 검체가 띄우는 것은 샌드박스 cysd(Rust)·트립와이어 `cys`
@@ -330,12 +340,18 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   `os.environ` 복사본 위에 봉인을 **상속 방향으로** 다시 건다(cysd 가 팩 python 을 띄워도 캐시를 쓰지 않게 ·
     #   test_lane_redirect·test_role_authority_shell 과 같은 계급). 벗기는 줄은 0이다.
     "scripts/tests/test_cysd_dispatch_storm_e2e.py",
+    # 0.14.52 seal audit: Private sealed env reaches bash workflow bodies and their Python verifier children.
+    "scripts/tests/test_unix_pty_results.py",
     "scripts/verify-gatekeeper-user-path.sh",
     "src-tauri/src/main.rs",
     "src/app_bundle.rs",
     "src/bin/cys.rs",
     "src/bin/cysd/boot_supervisor.rs",
+    # 0.14.52 seal audit: Rig-held EnvGuard and pane spawn seal cover the shell-string Python child.
+    "src/bin/cysd/caller_matrix_tests.rs",
     "src/bin/cysd/main.rs",
+    # 0.14.52 seal audit: Python supervisor and compiler override both restore seal after env_clear; embedded children inherit it.
+    "src/bin/cysd/native_publication_transition_tests.rs",
     "src/bin/cysd/schedule.rs",
     "src/bin/cysd/state.rs",
     "src/lib.rs",
@@ -478,6 +494,7 @@ def check_bin():
 RUST_SPAWN_PIN = {  # Rust 핀 expected 와 동일 값(2026-08-26 실측 · 2026-09-03 파이썬 미러 재실측 일치)
     "src/bin/cys.rs": 1,                  # 테스트(tar escape 재현 · 호스트 python) · 층3 바닥
     "src/bin/cysd/boot_supervisor.rs": 1,  # run_ensure_team · .env 직봉인
+    "src/bin/cysd/native_publication_transition_tests.rs": 1,  # Existing Rust mirror: sealed supervisor.
     "src/bin/cysd/main.rs": 2,             # office-bridge(tokio 직봉인) + self-test 게이트
     "src-tauri/src/main.rs": 4,            # orchestra/resource-gate/boot/org · inject_runtime_path
 }
