@@ -303,7 +303,9 @@ describe("transferCrossDept wiring (source pin)", () => {
   const xfer = src.slice(a, m); // 전출 본체 — 목적지 기동부터 큐 적재까지
   const ack = src.slice(c, b); // 인수 확인 대기 → 원본 종료 결정
   const region = src.slice(a, b); // 둘 다 — "어디에도 없다" 를 재는 축
-  const CLOSE_ORIGIN = 'invoke("close_surface", { socket: srcSock, surfaceId: sid })';
+  // S6: the shared confirmed-close helper now owns invoke + socket-scoped cleanup.
+  // closecallbacks.test.ts executes both real source-close paths on rejection/retry.
+  const CLOSE_ORIGIN = 'closePane(sid, srcSock)';
   const count = (hay: string, needle: string) => hay.split(needle).length - 1;
   test("두 함수가 이 순서로 존재한다", () => {
     expect(a).toBeGreaterThan(0);

@@ -25,7 +25,7 @@ pub struct WinChild {
 impl WinChild {
     fn is_complete(&mut self) -> IoResult<Option<ExitStatus>> {
         let mut status: DWORD = 0;
-        let proc = self.proc.lock().unwrap().try_clone().unwrap();
+        let proc = self.proc.lock().unwrap().try_clone().map_err(IoError::other)?;
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
         if res != 0 {
             if status == STILL_ACTIVE {
@@ -147,3 +147,6 @@ impl std::future::Future for WinChild {
         }
     }
 }
+
+#[cfg(test)]
+mod q9b_tests;

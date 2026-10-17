@@ -95,13 +95,14 @@ describe("N7 핀 ③ transferCrossDept(부서 전출) — 바깥 catch 는 '전�
     expect(body.includes("${e}")).toBe(false);
     // 바깥 catch: 번역기를 직접 거친다 · 토스트 제목·꼬리 문구는 그대로
     expect(outer.includes("${restartInvokeFailureReason(e)} — 원본 pane은 보존됩니다")).toBe(true);
-    // 안쪽(보상 롤백) catch: 한 번 번역해 세 분기가 같은 값을 쓴다
+    // 안쪽(보상 롤백) catch: 한 번 번역해 네 분기가 같은 값을 쓴다(S6: 실패한 보상 회수도 사실대로 표시)
     const innerCatch = body.indexOf("} catch (e) {");
     expect(innerCatch).toBeGreaterThan(0);
     expect(innerCatch).toBeLessThan(outerCatch);
     const inner = body.slice(innerCatch, outerCatch);
     expect(inner.includes("const why = restartInvokeFailureReason(e);")).toBe(true);
-    expect(count(inner, "${why}")).toBe(3);
+    expect(count(inner, "${why}")).toBe(4);
+    expect(inner).toContain("rollbackError !== null");
     // 번역은 토스트 앞이다
     expect(inner.indexOf("const why = restartInvokeFailureReason(e);")).toBeLessThan(inner.indexOf('"전출 실패"'));
     // 분기 문구(원본 보존·런처 셸 안내)는 종전 그대로다 — 번역기만 끼웠다

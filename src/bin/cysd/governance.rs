@@ -4888,7 +4888,7 @@ fn reap_exited_surfaces(daemon: &Arc<Daemon>) {
     // (id, role) 수집은 surfaces Arc 클론으로 — surfaces 락을 짧게 잡고 즉시 놓는다
     // (check_agent_death와 동일 패턴). close_surface는 surfaces 락을 새로 잡으므로
     // 수집과 회수를 분리해 재진입을 피한다.
-    let mut to_reap: Vec<(u64, Option<String>)> = Vec::new();
+    let mut to_reap = Vec::new();
     {
         let surfaces: Vec<Arc<crate::state::Surface>> =
             daemon.surfaces.lock().unwrap().values().cloned().collect();
@@ -4901,21 +4901,85 @@ fn reap_exited_surfaces(daemon: &Arc<Daemon>) {
             };
             let role = s.role.lock().unwrap().clone();
             if exited_surface_due(role.is_some(), exited_at.elapsed().as_secs()) {
-                to_reap.push((s.id, role));
+                to_reap.push((s, Some(exited_at)));
             }
         }
     }
-    for (id, role) in to_reap {
-        // 경쟁(이미 닫힘)은 Err — 무시. 성공 시에만 reaped 이벤트.
-        if close_surface(daemon, id, CloseCause::Reap).is_ok() {
-            daemon.bus.publish(
-                "surface.reaped",
-                "surface",
-                Some(id),
-                json!({"surface_ref": cys::surface_ref(id),
-                       "reason": "exited_grace_elapsed", "role": role}),
-            );
+    for (surface, stamp) in to_reap {
+        let _ = reap_due_candidate(daemon, &surface, stamp);
+    }
+}
+
+/// Automatic lifecycle outcome; it grants no caller identity or manual-reap privilege.
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum ReapDue {
+    Reaped { role: Option<String> },
+    Deferred { reason: &'static str },
+    Gone,
+    Failed { reason: String },
+}
+
+/// One explicit target, no client-supplied lifecycle facts and no sweep/retry.
+pub(crate) fn reap_surface_due(daemon: &Arc<Daemon>, id: u64) -> ReapDue {
+    let Some(surface) = daemon.get_surface(id) else { return ReapDue::Gone };
+    let stamp = *surface.exited_at.lock().unwrap();
+    reap_due_candidate(daemon, &surface, stamp)
+}
+
+/// Both watchdog and RPC pass their observed incarnation/stamp here. The final
+/// check is the commit point BEFORE expiry I/O. All membership removers take
+/// close_operation; production IDs are unique and EOF writes exited/stamp once.
+/// Concurrent role/config values are decided here, never rejected after effects.
+fn reap_due_candidate(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
+    observed_stamp: Option<std::time::Instant>,
+) -> ReapDue {
+    use std::sync::TryLockError;
+    let guard = match surface.close_operation.try_lock() {
+        Ok(g) => g,
+        Err(TryLockError::WouldBlock) => {
+            return match daemon.get_surface(surface.id) {
+                None => ReapDue::Gone,
+                Some(now) if !Arc::ptr_eq(&now, surface) => ReapDue::Deferred { reason: "state_changed" },
+                Some(_) => ReapDue::Deferred { reason: "close_in_progress" },
+            };
         }
+        Err(TryLockError::Poisoned(_)) => return ReapDue::Failed { reason: "close_operation_poisoned".into() },
+    };
+    let role = {
+        let surfaces = daemon.surfaces.lock().unwrap();
+        let Some(current) = surfaces.get(&surface.id) else { return ReapDue::Gone };
+        if !Arc::ptr_eq(current, surface) {
+            return ReapDue::Deferred { reason: "state_changed" };
+        }
+        if !reap_exited_enabled() {
+            return ReapDue::Deferred { reason: "reaper_disabled" };
+        }
+        if !surface.exited.load(Ordering::Relaxed) {
+            return ReapDue::Deferred { reason: "active_surface" };
+        }
+        let stamp = *surface.exited_at.lock().unwrap();
+        if stamp != observed_stamp {
+            return ReapDue::Deferred { reason: "state_changed" };
+        }
+        let Some(stamp) = stamp else { return ReapDue::Deferred { reason: "missing_exit_stamp" } };
+        let role = surface.role.lock().unwrap().clone();
+        if !exited_surface_due(role.is_some(), stamp.elapsed().as_secs()) {
+            return ReapDue::Deferred { reason: "grace_not_elapsed" };
+        }
+        role
+    };
+    let operation = CloseOperation { surface, _guard: guard };
+    match close_surface_effect(daemon, operation, CloseCause::Reap) {
+        Ok(()) => {
+            daemon.bus.publish("surface.reaped", "surface", Some(surface.id),
+                json!({"surface_ref": cys::surface_ref(surface.id),
+                       "reason": "exited_grace_elapsed", "role": role}));
+            ReapDue::Reaped { role }
+        }
+        Err(reason) => ReapDue::Failed { reason },
     }
 }
 
@@ -5032,11 +5096,31 @@ pub enum CloseCause {
 /// Close a surface: kill the entire descendant process tree, then the shell itself.
 /// 고아 서버 누적(load 폭주의 원인)을 원천 차단하는 지점.
 pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result<(), String> {
+    let surface = daemon.get_surface(id).ok_or_else(|| format!("surface {id} not found"))?;
+    // No daemon/queue lock is held while waiting. Other targets remain independent.
+    let guard = surface.close_operation.lock().map_err(|_| "close_operation_poisoned".to_string())?;
+    let current = daemon.get_surface(id).ok_or_else(|| format!("surface {id} not found"))?;
+    if !Arc::ptr_eq(&current, &surface) {
+        return Err(format!("surface {id} incarnation changed"));
+    }
+    close_surface_effect(daemon, CloseOperation { surface: &surface, _guard: guard }, cause)
+}
+
+/// Constructed only with this exact Surface's operation guard. Keep the existing
+/// expiry-before-removal transaction; broad queue/map locks never span its I/O.
+struct CloseOperation<'a> {
+    surface: &'a Arc<crate::state::Surface>,
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
+fn close_surface_effect(daemon: &Arc<Daemon>, operation: CloseOperation<'_>, cause: CloseCause) -> Result<(), String> {
+    let id = operation.surface.id;
     // ★(0.14.31 · 리뷰 R1 · codex blocking) 만료 큐 처분은 **맵에서 빼기 전에** 한다.
     //   종전에는 제거 뒤에 묘비를 시도했고, 실패분은 분리된 Surface 안에만 남아 다음 스냅샷에서
     //   사라졌다(원장도 없고 항목도 없다 = 조용한 유실). 제거 전이면 그 사이의 persist 도 항목을
     //   본다. 묘비(원장 fsync) → 실패분을 데몬 보존소로 이관(목적지 먼저) 순서다.
-    if let Some(pre) = daemon.get_surface(id) {
+    {
+        let pre = operation.surface;
         discard_expired_queue(daemon, &pre, "expired");
         if park_expired_to_restored(daemon, &pre) > 0 {
             daemon.persist_queue_state();
@@ -5110,6 +5194,9 @@ pub fn close_surface(daemon: &Arc<Daemon>, id: u64, cause: CloseCause) -> Result
     if !parked_active.is_empty() {
         daemon.persist_queue_state();
     }
+    // Membership and role queue ownership have transferred; no later caller can
+    // enter preparation for this incarnation. Do not hold the gate across kill/wait.
+    drop(operation);
     // ★D7(BOOTSTRAP_HARDENING WP-3): 묘비를 kill 루프 **이전**에 선영속 — 아래 kill 구간에서
     // 데몬이 SIGKILL/크래시로 죽으면 in-memory 묘비가 디스크에 없어 다음 콜드부트 phoenix가
     // "의도 삭제된 역할"을 부활시켰다. surfaces 락 해제 직후라 persist_topology 재진입 안전
@@ -30645,3 +30732,7 @@ mod f3_screen_probe_tests {
         assert!(t.ends_with(&format!(" (이 좌석 화면 파서 패닉 2회 — 화면 판독이 순간 비었을 수 있다){REMEDY_LLM_SUFFIX}")), "{t}");
     }
 }
+
+#[cfg(test)]
+#[path = "reap_due_tests.rs"]
+mod aid_s5_tests;

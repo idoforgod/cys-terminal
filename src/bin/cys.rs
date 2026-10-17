@@ -333,6 +333,11 @@ enum Command {
     ReapSurface {
         surface: String,
     },
+    /// Request automatic cleanup of one exited surface if its daemon grace has elapsed.
+    /// Prints JSON: outcome=reaped, deferred (with reason), or gone. Errors exit 1.
+    ReapDue {
+        surface: String,
+    },
     /// ★W2/A-S3: 역할을 topology 묘비에 심는다(의도적 폐역). 데몬이 묘비 유일 작성자(단일 작성자 원칙).
     #[command(name = "tombstone")]
     Tombstone {
@@ -1806,6 +1811,35 @@ fn run_reap_surface(surface: &str) -> i32 {
             reap_surface_exit_code(&e)
         }
     }
+}
+
+fn run_reap_due(surface: &str) -> i32 {
+    let Some(sid) = parse_surface_ref(surface) else {
+        eprintln!("error: invalid surface ref: {surface}");
+        return 1;
+    };
+    match request("surface.reap_due", json!({"surface_id": sid})) {
+        Ok(result) => match reap_due_json(&result, sid) {
+            Ok(output) => { println!("{output}"); 0 }
+            Err(e) => { eprintln!("error: {e}"); 1 }
+        },
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+fn reap_due_json(result: &Value, sid: u64) -> Result<String, String> {
+    let valid_outcome = match result["outcome"].as_str() {
+        Some("reaped" | "gone") => true,
+        Some("deferred") => result["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        _ => false,
+    };
+    if result["surface_id"].as_u64() != Some(sid) || !valid_outcome {
+        return Err("invalid surface.reap_due response".into());
+    }
+    Ok(result.to_string())
 }
 
 /// ★G1(W2-B): `cys queue list` 텍스트 행 렌더 — 열 계약의 단일 소유자.
@@ -6131,6 +6165,7 @@ fn run(command: Command) -> i32 {
 
         // ★G4(W4-C): 수동 좌석 회수 — 게이트 거부는 exit 7(사유 stderr), 오류는 1.
         Command::ReapSurface { surface } => return run_reap_surface(&surface),
+        Command::ReapDue { surface } => return run_reap_due(&surface),
 
         Command::Tombstone { role, remove, dept } => {
             if dept {
@@ -42726,6 +42761,27 @@ mod toast_axis_tests {
         // 문구를 만드는 3함수는 그대로 존재한다(호출부만 끈다).
         for f in ["fn queue_blocked_notice_lines(", "fn queue_durable_suffix(", "fn warn_if_daemon_paused("] {
             assert!(code.contains(f), "{f} 가 사라졌다");
+        }
+    }
+}
+
+#[cfg(test)]
+mod aid_s5_cli_tests {
+    use super::*;
+    #[test]
+    fn aid_s5_reap_due_is_explicit_and_json_is_validated() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["cys", "reap-due"]).is_err());
+        assert!(Cli::try_parse_from(["cys", "reap-due", "surface:9", "--reap"]).is_err());
+        assert!(matches!(Cli::try_parse_from(["cys", "reap-due", "surface:9"]).unwrap().command, Command::ReapDue { .. }));
+        for outcome in ["reaped", "gone", "deferred"] {
+            let result = json!({"surface_id":9, "outcome":outcome, "reason":"grace_not_elapsed"});
+            assert_eq!(serde_json::from_str::<Value>(&reap_due_json(&result, 9).unwrap()).unwrap(), result);
+        }
+        for bad in [json!({"outcome":"reaped"}), json!({"surface_id":true,"outcome":"gone"}),
+                    json!({"surface_id":10,"outcome":"reaped"}), json!({"surface_id":9,"outcome":"bad"}),
+                    json!({"surface_id":9,"outcome":"deferred"})] {
+            assert!(reap_due_json(&bad, 9).is_err(), "S5-CLI-MALFORMED: {bad}");
         }
     }
 }

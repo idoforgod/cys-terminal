@@ -5524,7 +5524,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                "claude_config_dir": s.claude_config_dir.lock().unwrap().clone()}),
                     ))
                 }
-                Err(e) => Reply::Single(err_response(&id, "spawn_failed", &e)),
+                Err(e) => surface_create_error(&daemon.bus, &id, &e),
             }
         }
 
@@ -6880,7 +6880,30 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         json!({"surface_id": sid, "closed": true, "cause": format!("{cause:?}")}),
                     ))
                 }
-                Err(e) => Reply::Single(err_response(&id, "not_found", &e)),
+                Err(e) => {
+                    // A failed close can retain the target (e.g. a poisoned close
+                    // gate). Only actual absence permits caller-side UI cleanup.
+                    let code = if daemon.get_surface(sid).is_none() { "not_found" } else { "close_failed" };
+                    Reply::Single(err_response(&id, code, &e))
+                }
+            }
+        }
+
+        // Automatic due-only trigger, distinct from audited manual surface.reap.
+        "surface.reap_due" => {
+            let Some(sid) = resolve_surface_id(&params) else {
+                return Reply::Single(err_response(&id, "invalid_params", "missing or invalid surface_id"));
+            };
+            if params.as_object().is_none_or(|p| p.keys().any(|key| key != "surface_id")) {
+                return Reply::Single(err_response(&id, "invalid_params", "surface.reap_due accepts only surface_id"));
+            }
+            match governance::reap_surface_due(daemon, sid) {
+                governance::ReapDue::Failed { reason } => Reply::Single(err_response(&id, "reap_failed", &reason)),
+                outcome => {
+                    let mut result = serde_json::to_value(outcome).expect("reap outcome is serializable");
+                    result["surface_id"] = json!(sid);
+                    Reply::Single(ok_response(&id, result))
+                }
             }
         }
 
@@ -7068,7 +7091,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         json!({"surface_id": sid, "reaped": true, "role": target_role}),
                     ))
                 }
-                Err(e) => Reply::Single(err_response(&id, "not_found", &e)),
+                Err(e) => {
+                    let code = if daemon.get_surface(sid).is_none() { "not_found" } else { "close_failed" };
+                    Reply::Single(err_response(&id, code, &e))
+                }
             }
         }
 
@@ -9748,6 +9774,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                                "protocol_version": cys::pack::PHOENIX_PROTOCOL_VERSION,
                                // (W4) 데몬 전체 파서 패닉 격리 누적 — health 신호.
                                "parser_panics": daemon.parser_panics_total.load(Ordering::Relaxed),
+                               "identity_diagnostic_publication": daemon.bus.diagnostic_publication_stats(),
                                // ★(0.14.43 · K1) ABI producer 자기검증 계측(이 프로세스의 누적) — 폴백한 프레임 수.
                                //   `abi_float_inexact_total` = 부동소수 표기 정밀도 차만으로 폴백(로그 없음 · 부동소수가 실리는 한 평시에도 늘어난다) ·
                                //   `abi_drift_total` = **진짜** 불일치(구조·키·문자열·정수·비객체)로 폴백 — 0 이 아니면 와이어 결함(로그는 60초 1줄).
@@ -11555,6 +11582,20 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
         )),
     }
 }
+
+// D1: one failed create, one readable error and one event; no native retry.
+// The allocator guard has already been released (or never acquired) here.
+fn surface_create_error(bus: &crate::events::EventBus, id: &Value, message: &str) -> Reply {
+    if message == crate::state::PTY_ALLOCATOR_BUSY_MESSAGE {
+        bus.publish(
+            "surface.pty_allocator_busy", "system", None,
+            json!({"reason": "pty_allocator_busy", "wait_limit_ms": 5000}),
+        );
+        return Reply::Single(err_response(id, "pty_allocator_busy", message));
+    }
+    Reply::Single(err_response(id, "spawn_failed", message))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -18674,6 +18715,48 @@ mod tests {
                 .contains("npm_prefix_polluted_field(&cys::npm_config_prefix_verdict_from_exe())"),
             "org.status 가 실제 env 판정을 잃었다 — 필드가 상수로 굳으면 오염이 영영 안 보인다"
         );
+    }
+
+    #[test]
+    fn identity_diagnostic_loss_counter_is_exported_by_org_status() {
+        use crate::events::{DiagnosticNotPublished, DiagnosticPublishOutcome, PreparedDiagnostic};
+        let daemon = isolated_daemon();
+        let mut reached_capacity_refusal = false;
+        // A fresh persistent bus has no capacity; this bounded loop also tolerates
+        // setup having reserved one ordinary block before the test reaches the API.
+        for _ in 0..257 {
+            let prepared = PreparedDiagnostic::identity_observation(
+                None, br#"{"reason":"unproven","request_sequence":1}"#,
+            ).expect("bounded fixture");
+            match daemon.bus.try_publish_diagnostic(prepared) {
+                DiagnosticPublishOutcome::Published { .. } => {}
+                DiagnosticPublishOutcome::NotPublished(DiagnosticNotPublished::ReservationUnavailable) => {
+                    reached_capacity_refusal = true;
+                    break;
+                }
+                other => panic!("unexpected fixture publication result: {other:?}"),
+            }
+        }
+        assert!(reached_capacity_refusal, "fixture never exercised a real dropped diagnostic");
+        let expected = serde_json::to_value(daemon.bus.diagnostic_publication_stats()).unwrap();
+        assert_eq!(expected["not_published_by_reason"]["reservation_unavailable"], 1);
+        let Reply::Single(resp) = dispatch(
+            &daemon,
+            Request { id: json!(1), method: "org.status".into(), params: json!({}) },
+            None,
+        ) else {
+            panic!("expected single reply");
+        };
+        assert_eq!(resp["ok"], true);
+        let d = &resp["result"]["daemon"];
+        assert_eq!(d["identity_diagnostic_publication"], expected);
+        for k in [
+            "version", "started_at", "paused", "latest_seq", "build_id", "embedded_pack_hash",
+            "protocol_version", "parser_panics", "abi_float_inexact_total", "abi_drift_total",
+            "pending_input_model", "npm_prefix_polluted",
+        ] {
+            assert!(d.get(k).is_some(), "existing daemon key disappeared: {k}");
+        }
     }
 
     /// ★(0.14.43 · K1) `org.status.daemon` 가산 키 `abi_float_inexact_total`·`abi_drift_total`(둘 다 u64) — 기존 daemon 키는 불변.
@@ -31184,3 +31267,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "pty_allocator_busy_tests.rs"]
+mod pty_allocator_busy_tests;

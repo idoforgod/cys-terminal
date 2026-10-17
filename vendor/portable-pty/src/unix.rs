@@ -19,7 +19,82 @@ pub use std::os::unix::io::RawFd;
 #[derive(Default)]
 pub struct UnixPtySystem {}
 
+// One allocation critical section for every UnixPtySystem in this process.
+// It ends before the caller can spawn a child. This does not synchronize exec
+// from other threads or PTY allocators in other processes.
+static PTY_OPEN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+const PTY_OPEN_WAIT_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// This create attempt could not acquire the Unix allocator before its deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtyAllocatorBusy;
+impl std::fmt::Display for PtyAllocatorBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("pty allocator busy") }
+}
+impl std::error::Error for PtyAllocatorBusy {}
+
+fn acquire_pty_open_lock_until(deadline: std::time::Instant)
+    -> Result<std::sync::MutexGuard<'static, ()>, PtyAllocatorBusy>
+{
+    acquire_pty_open_lock_with(deadline, std::time::Instant::now, std::thread::sleep)
+}
+
+// The callbacks are synchronous clock/wait seams, never stored. Lock waiting
+// does not retry a native allocation. A holder is never interrupted.
+fn acquire_pty_open_lock_with(
+    deadline: std::time::Instant,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut sleep: impl FnMut(std::time::Duration),
+) -> Result<std::sync::MutexGuard<'static, ()>, PtyAllocatorBusy> {
+    #[cfg(feature = "test-support")]
+    let mut recorded_test_waiter = false;
+    loop {
+        if now() >= deadline { return Err(PtyAllocatorBusy); }
+        let guard = match PTY_OPEN_LOCK.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(feature = "test-support")]
+                if !recorded_test_waiter {
+                    test_support::record_waiter();
+                    recorded_test_waiter = true;
+                }
+                let remaining = deadline.saturating_duration_since(now());
+                if remaining.is_zero() { return Err(PtyAllocatorBusy); }
+                sleep(remaining.min(std::time::Duration::from_millis(1)));
+                continue;
+            }
+        };
+        // Scheduling can cross the deadline even on a successful try_lock.
+        // Do not enter libc after that deadline; dropping this guard releases it.
+        if now() >= deadline { drop(guard); return Err(PtyAllocatorBusy); }
+        return Ok(guard);
+    }
+}
+
+/// Opt-in dependency-test access to the same allocator used by `PtySystem::openpty`.
+/// This feature is absent from normal builds; it adds no RPC or runtime setting.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn hold_allocator() -> std::sync::MutexGuard<'static, ()> {
+        super::PTY_OPEN_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn waiter_count() -> usize { WAITERS.load(Ordering::Acquire) }
+
+    pub(super) fn record_waiter() { WAITERS.fetch_add(1, Ordering::Release); }
+}
+
 fn openpty(size: PtySize) -> anyhow::Result<(UnixMasterPty, UnixSlavePty)> {
+    // This unit mutex protects exclusion only, so unwind must not permanently
+    // disable later allocations. Keep the guard through both CLOEXEC operations.
+    let deadline = std::time::Instant::now() + PTY_OPEN_WAIT_LIMIT;
+    let _open_guard = acquire_pty_open_lock_until(deadline)?;
     let mut master: RawFd = -1;
     let mut slave: RawFd = -1;
 
@@ -412,3 +487,7 @@ impl Write for UnixMasterWriter {
         self.fd.flush()
     }
 }
+
+#[cfg(test)]
+#[path = "unix_pty_open_tests.rs"]
+mod pty_open_tests;

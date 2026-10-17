@@ -433,6 +433,99 @@ class CysdMacStep(unittest.TestCase):
             print("\n[⑭ 스텝 키] %s" % ", ".join(k for k in step if k != "run"), flush=True)
 
 
+class S2WindowsCell(unittest.TestCase):
+    """Run the actual S2 shell cell with fake Cargo; no Windows/native claim."""
+    NAME = "A-ID S2 root registration (Windows blocking)"
+    REQUIRED = [
+        "root_registration::tests::windows_production_wait_result_preserves_unavailable",
+        "root_registration::tests::observes_once_with_original_child_on_both_sides_and_binds_pid",
+        "root_registration::tests::elapsed_limit_is_post_hoc_and_inclusive",
+    ]
+
+    def setUp(self):
+        self.repo = os.path.normpath(os.path.join(HERE, "..", ".."))
+        self.windows = os.path.join(self.repo, ".github", "workflows", "windows-health.yml")
+        self.step = extract_step(self.windows, self.NAME)
+        self.tmp = tempfile.mkdtemp(prefix="aid-s2-cell-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def run_fake(self, names=None, list_rc=0, test_rc=0):
+        folder = tempfile.mkdtemp(dir=self.tmp)
+        binary = os.path.join(folder, "cargo")
+        with open(binary, "w") as stream:
+            stream.write("#!/bin/sh\ncase \" $* \" in\n*' --list '*) cat \"$S2_FAKE_LIST\"; exit \"$S2_LIST_RC\";;\n*) echo executed > \"$S2_RAN\"; exit \"$S2_TEST_RC\";;\nesac\n")
+        os.chmod(binary, 0o755)
+        listing = os.path.join(folder, "names")
+        with open(listing, "w") as stream:
+            stream.write("".join(name + ": test\r\n" for name in (self.REQUIRED if names is None else names)))
+        script = os.path.join(folder, "step.sh")
+        with open(script, "w") as stream:
+            stream.write(self.step["run"])
+        marker = os.path.join(folder, "executed")
+        env = dict(os.environ, PATH=folder + os.pathsep + "/usr/bin:/bin", S2_FAKE_LIST=listing,
+                   S2_LIST_RC=str(list_rc), S2_TEST_RC=str(test_rc), S2_RAN=marker)
+        run = subprocess.run([BASH, "--noprofile", "--norc", "-e", "-o", "pipefail", script],
+                             cwd=folder, env=env, capture_output=True, timeout=20)
+        return run.returncode, os.path.exists(marker)
+
+    def test_named_positive_reaches_actual_test_command(self):
+        self.assertEqual(self.run_fake(), (0, True))
+
+    def test_zero_or_missing_windows_name_blocks_execution(self):
+        for names in [[], self.REQUIRED[1:]]:
+            with self.subTest(names=names):
+                rc, ran = self.run_fake(names)
+                self.assertNotEqual(rc, 0)
+                self.assertFalse(ran)
+
+    def test_listing_and_test_failures_are_not_masked(self):
+        self.assertEqual(self.run_fake(list_rc=101), (101, False))
+        self.assertEqual(self.run_fake(test_rc=101), (101, True))
+
+    def test_cell_is_blocking_and_registered(self):
+        import ast
+        self.assertNotIn("if", self.step)
+        self.assertNotIn("continue-on-error", self.step)
+        self.assertEqual(self.step["shell"], "bash")
+        code = self.gate_code()
+        assignments = {node.targets[0].id: node.value for node in ast.parse(code).body
+                       if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)}
+        required = ast.literal_eval(assignments["FILTERED_CARGO_REQUIRED"])
+        self.assertIn("--bin cysd root_registration::", required["windows-health"])
+        self.assertEqual(list(ast.literal_eval(assignments["S2_REQUIRED_NAMES"])), self.REQUIRED)
+
+    def gate_code(self):
+        lines = read_text(WORKFLOW).splitlines()
+        begin = next(i for i, line in enumerate(lines) if line.strip() == "python3 - <<'PY'") + 1
+        end = next(i for i in range(begin, len(lines)) if lines[i].strip() == "PY")
+        return "\n".join(line[10:] for line in lines[begin:end])
+
+    def test_actual_lane_gate_rejects_missing_conditional_nonblocking_and_unguarded_cell(self):
+        destination = os.path.join(self.tmp, "gate")
+        shutil.copytree(os.path.join(self.repo, ".github"), os.path.join(destination, ".github"))
+        windows = os.path.join(destination, ".github", "workflows", "windows-health.yml")
+        original = read_text(windows)
+        start = original.index("      - name: " + self.NAME)
+        end = original.index("      # Q9-b:", start)
+        cell = original[start:end]
+        def run_gate(content):
+            with open(windows, "w") as stream:
+                stream.write(content)
+            return subprocess.run([sys.executable, "-c", self.gate_code()], cwd=self.repo,
+                                  env=dict(os.environ, LANE_GATE_ROOT=destination), capture_output=True, timeout=20)
+        baseline = run_gate(original)
+        self.assertEqual(baseline.returncode, 0, quoted(baseline.stdout + baseline.stderr))
+        guard = "          grep -Fqx '" + self.REQUIRED[0] + ": test' \"$s2_list\"\n"
+        variants = ["", cell.replace("        timeout-minutes:", "        if: false\n        timeout-minutes:", 1),
+                    cell.replace("        timeout-minutes:", "        continue-on-error: true\n        timeout-minutes:", 1),
+                    cell.replace(guard, ""),
+                    cell.replace("root_registration:: -- --test-threads=1", "root_registration:: -- --test-threads=1 --skip missing")]
+        for changed in variants:
+            with self.subTest(change=variants.index(changed)):
+                result = run_gate(original[:start] + changed + original[end:])
+                self.assertNotEqual(result.returncode, 0, "actual lane gate accepted a broken required S2 cell")
+
+
 if __name__ == "__main__":
     # 한글·깨진 바이트(U+FFFD)를 찍다가 러너의 출력 인코딩 때문에 검체가 죽지 않게 한다(찍는 것은 표시일 뿐 판정이 아니다).
     for stream in (sys.stdout, sys.stderr):
@@ -446,4 +539,7 @@ if __name__ == "__main__":
         except Exception as e:   # 표시용일 뿐이다 — 판정과 무관
             ver = "버전 조회 실패: %s" % e
         print("[대상] %s · 스텝 `%s`\n[셸] %s — %s" % (WORKFLOW, STEP_NAME, BASH, ver), flush=True)
+    # This already-wired CI entry also executes the Unix PTY result gate's
+    # negative controls; adding a scripts/tests file alone is not discovery.
+    from test_unix_pty_results import OutputControls, WorkflowControls
     unittest.main()

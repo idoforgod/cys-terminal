@@ -91,6 +91,7 @@ version = "2.0"
 
 [features]
 default = []
+test-support = []
 serde_support = [
     "serde",
     "serde_derive",

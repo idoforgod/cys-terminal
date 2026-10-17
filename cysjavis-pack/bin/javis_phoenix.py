@@ -2538,22 +2538,59 @@ def c6_detect_stale_surfaces(socket):
 
 
 def c6_reap_stale_surfaces(socket):
-    """★C6 S0 실 회수(W2 — P0-6 cause 활용): exited=true 잔재를 **Reap 사유로만** 회수한다
-    (`cys close-surface <ref> --reap` → CloseCause::Reap → 묘비 미생성·부활 대상 유지). 고정 OwnerClose 경로
-    (--reap 없는 close)는 절대 쓰지 않는다(P0-6 오묘비 함정). 라이브(exited=false)는 비대상. 반환:
-    {"detected":[...], "reaped":[refs], "reap_failed":[...]}. 회수 후에도 묘비 0이어야 함(호출측 게이트 검증)."""
+    """Request the daemon's due-only automatic cleanup, once per exited target.
+    Deferred/gone are distinct from reaped. Legacy Reap close is attempted once
+    only on explicit capability absence; a modern denial never enables fallback.
+    """
     detected = c6_detect_stale_surfaces(socket)
-    reaped, failed = [], []
+    reaped, deferred, gone, failed = [], [], [], []
     for item in detected:
         ref = item.get("surface")
         if not ref:
             continue
-        r = cys("close-surface", ref, "--reap", socket=socket, timeout=12)
-        if getattr(r, "returncode", 1) == 0:
-            reaped.append(ref)
-        else:
-            failed.append({"surface": ref, "err": (getattr(r, "stderr", "") or getattr(r, "stdout", ""))[:120]})
-    return {"detected": detected, "reaped": reaped, "reap_failed": failed}
+        r = cys("reap-due", ref, socket=socket, timeout=12)
+        rc = getattr(r, "returncode", 1)
+        err = getattr(r, "stderr", "") or ""
+        if ((rc == 1 and "method_not_found" in err)
+                or (rc == 2 and "unrecognized subcommand" in err)):
+            legacy = cys("close-surface", ref, "--reap", socket=socket, timeout=12)
+            if getattr(legacy, "returncode", 1) == 0:
+                reaped.append(ref)
+            else:
+                failed.append({"surface": ref, "err": (getattr(legacy, "stderr", "") or getattr(legacy, "stdout", "") or "legacy close failed")[:120]})
+            continue
+        if rc != 0:
+            failed.append({"surface": ref, "err": (err or getattr(r, "stdout", "") or "reap-due failed")[:120]})
+            continue
+        try:
+            result = json.loads(getattr(r, "stdout", "") or "")
+            if not isinstance(result, dict):
+                raise ValueError("reap-due response is not an object")
+            requested_id = int(ref.removeprefix("surface:"))
+            if type(result.get("surface_id")) is not int or result["surface_id"] != requested_id:
+                raise ValueError("reap-due response target mismatch")
+            outcome = result.get("outcome")
+            if outcome == "reaped":
+                reaped.append(ref)
+            elif outcome == "gone":
+                gone.append(ref)
+            elif outcome == "deferred" and isinstance(result.get("reason"), str) and result["reason"]:
+                deferred.append({"surface": ref, "reason": result["reason"]})
+            else:
+                raise ValueError("invalid reap-due outcome")
+        except (ValueError, TypeError) as exc:
+            failed.append({"surface": ref, "err": str(exc)[:120]})
+    return {"detected": detected, "reaped": reaped, "reap_deferred": deferred,
+            "gone": gone, "reap_failed": failed}
+
+
+def _c6_result_fields(c6):
+    """Shared final/early-return and structured journal observations."""
+    return {"c6_stale_surfaces": c6.get("detected", []),
+            "c6_reaped": c6.get("reaped", []),
+            "c6_reap_deferred": c6.get("reap_deferred", []),
+            "c6_reap_gone": c6.get("gone", []),
+            "c6_reap_failed": c6.get("reap_failed", [])}
 
 
 def _lease_held_out(print_result, which):
@@ -2646,17 +2683,16 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                               % (_kind, _rec.get("source")))
 
     j = load_journal(socket, ticket)
-    # ★C6 S0 실 회수(W2 — P0-6 cause): exited=true 잔재를 Reap 사유로만 회수(cys close-surface --reap →
-    #   CloseCause::Reap → 묘비 미생성). 라이브(exited=false)는 비대상. OwnerClose 경로는 절대 미사용(오묘비 함정).
+    # C6 does not wait for grace or alter restoration eligibility.
     c6 = c6_reap_stale_surfaces(socket)
     c6_stale = c6.get("detected", [])
+    j.update(_c6_result_fields(c6))
     if c6_stale:
-        jevent(j, "*", "s0_c6", "reaped",
-               "exited 잔재 %d개 탐지·%d개 Reap 회수(묘비 미생성): %s"
-               % (len(c6_stale), len(c6.get("reaped", [])), c6.get("reaped", [])))
-        log("★C6 S0: 죽은 surface 잔재 %d개 탐지 → %d개 Reap 회수(묘비 0·라이브 무접촉)."
-            % (len(c6_stale), len(c6.get("reaped", []))))
-        save_journal(socket, ticket, j)
+        counts = "reaped=%d deferred=%d gone=%d failed=%d" % tuple(
+            len(c6.get(key, [])) for key in ("reaped", "reap_deferred", "gone", "reap_failed"))
+        jevent(j, "*", "s0_c6", "observed", counts)
+        log("★C6 S0: exited 잔재 %d개 · %s" % (len(c6_stale), counts))
+    save_journal(socket, ticket, j)
     # ★Phase 4: 대상 판정 근거 = actual-state(topology)가 아니라 desired 로스터.
     # 관측을 조기·단조 영속해 topology 침식(부분 부활 후 미부활 역할 삭제)에 면역시킨다(§12).
     entries, _tombstones = observe_and_persist_roster(socket)
@@ -2720,6 +2756,7 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
         jevent(j, "*", "c5_unknown_liveness", "hold", "liveness 불신 — 부활 보류(대량 오스폰 방지)")
         save_journal(socket, ticket, j)
         out = {"phoenix_restore": "DEGRADED", "degraded_reason": "unknown_liveness",
+               **_c6_result_fields(c6),
                "note": ("liveness 소스(status --json/list) 불신 — 전원 사망 추정 금지, 부활 보류(fail-safe). "
                         "복귀: liveness 소스 회복.")}
         if print_result:
@@ -2736,6 +2773,7 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
         jevent(j, "*", "c2_degraded", "held_roles", "부활 보류 역할: %s" % target_roles)
         save_journal(socket, ticket, j)
         out = {"phoenix_restore": "DEGRADED", "degraded_reason": "c2_corrupt_fallback",
+               **_c6_result_fields(c6),
                "degraded": _c2_degraded, "held_roles": target_roles,
                "note": ("retention 파일 손상→폴백 복원(recovered_from 영속)으로 묘비 불확실 — 부활 보류(fail-safe). "
                         "복귀: 검증된-건강 topology replace 또는 `phoenix roster --rebase`.")}
@@ -2756,6 +2794,7 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
                 BREAKER_T, len(attempts), BREAKER_N))
             prop = rollback_proposal(socket)
             out = {"phoenix_restore": "BREAKER_OPEN", "attempts_in_window": len(attempts),
+                   **_c6_result_fields(c6),
                    "threshold": BREAKER_N, "window_secs": BREAKER_T,
                    "rollback_proposal": prop,
                    "alert": "정지 후 사람 승인 필요 — 자동 롤백/재부활을 실행하지 않는다."}
@@ -3169,9 +3208,7 @@ def _run_restore_locked(socket, ticket="default", stub=False, no_breaker=False, 
         "backend": "surrogate(stub)" if stub else "production(cys restore)",
         "target_roles": target_roles,
         "per_role_outcome": outcomes,
-        "c6_stale_surfaces": c6_stale,     # ★C6 S0: 탐지된 죽은 surface 잔재
-        "c6_reaped": c6.get("reaped", []), # ★C6 S0(W2): Reap 사유로 실제 회수한 잔재(묘비 미생성·라이브 무접촉)
-        "c6_reap_failed": c6.get("reap_failed", []),
+        **_c6_result_fields(c6),
         "cys_identity": _CYS_IDENTITY,     # ★gate2: 해석된 cys 의 3중 identity 검증 상태(verified|degraded-unverified|None)
         "journal": journal_path(socket, ticket),
         "honesty_note": honesty,

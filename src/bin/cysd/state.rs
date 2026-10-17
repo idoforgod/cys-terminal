@@ -16,6 +16,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::broadcast;
 
+pub(crate) const PTY_ALLOCATOR_BUSY_MESSAGE: &str = "pty allocator busy";
+
+pub(crate) fn map_pty_open_error(error: &(dyn std::error::Error + 'static)) -> String {
+    #[cfg(unix)]
+    if error.downcast_ref::<portable_pty::unix::PtyAllocatorBusy>().is_some() {
+        return PTY_ALLOCATOR_BUSY_MESSAGE.to_string();
+    }
+    format!("openpty failed: {error}")
+}
+
 pub(crate) const SCROLLBACK_LINES: usize = 10_000;
 pub const DEFAULT_ROWS: u16 = 35;
 pub const DEFAULT_COLS: u16 = 120;
@@ -1663,6 +1673,8 @@ pub struct Surface {
     pub cmd: String,
     pub cwd: String,
     pub pid: u32,
+    // A-ID S2: write once before publication; never persisted or backfilled.
+    root_registration: crate::root_registration::RootRegistration,
     pub created_at: f64,
     /// ★(0.14.31 · 독립 재유도 · codex major #10) 좌석 생성의 **단조 시각** — 경과는 이 값으로만
     /// 잰다(`created_at` 은 보고·영속 전용). `Daemon.started_instant` 가 이미 세운 규약과 같다.
@@ -1698,6 +1710,9 @@ pub struct Surface {
     pub exited: AtomicBool,
     /// 자력종료(셸 EOF) 시각 — watchdog reap의 grace 측정 기준 (exited와 함께 stamp)
     pub exited_at: Mutex<Option<Instant>>,
+    /// Serializes close preparation through removal for this incarnation only.
+    /// Acquire before daemon/queue locks; EOF queue cleanup does not take this gate.
+    pub close_operation: Mutex<()>,
     /// PTY 쓰기는 전용 writer 스레드만 수행 — async 경로는 유한 채널 try_send.
     /// 정체된 pane의 블로킹 write가 tokio 워커·watchdog을 멈추는 경로를 원천 차단한다.
     pub write_tx: std::sync::mpsc::SyncSender<WriteReq>,
@@ -2096,6 +2111,12 @@ pub enum EscRecount {
 }
 
 impl Surface {
+    /// Creation observation only; strict callers must still prove current lifetime.
+    #[allow(dead_code)] // Consumed by the later S3/S4 integration.
+    pub(crate) fn registration_start(&self) -> Option<u64> {
+        self.root_registration.start_for(self.pid)
+    }
+
     /// ★(0.14.31 · 리뷰 R2 · codex blocking) 결판 대기 중인 인계를 **취소**한다(처분자 전용).
     ///
     /// 반환 = **취소하지 못한** 항목 id 들(= writer 가 이미 쓰기로 확정 = 지금 배달 중). 호출부는
@@ -6296,7 +6317,7 @@ impl Daemon {
                 pixel_width: 0,
                 pixel_height: 0,
             })
-            .map_err(|e| format!("openpty failed: {e}"))?;
+            .map_err(|e| map_pty_open_error(e.as_ref()))?;
 
         let shell = default_shell();
         let mut builder = CommandBuilder::new(&shell);
@@ -6444,7 +6465,7 @@ impl Daemon {
             }
         };
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(builder)
             .map_err(|e| format!("spawn failed: {e}"))?;
@@ -6453,6 +6474,10 @@ impl Daemon {
         #[cfg(windows)]
         winjob::assign_child(pid);
         drop(pair.slave);
+
+        // Observation failure only leaves R absent. The original child stays owned
+        // here and is transferred unchanged into Surface.child below.
+        let root_registration = crate::root_registration::observe(child.as_mut(), pid);
 
         let reader = pair
             .master
@@ -6494,6 +6519,7 @@ impl Daemon {
             cmd: cmd.unwrap_or_else(|| shell.clone()),
             cwd: cwd_str,
             pid,
+            root_registration,
             created_at: now_epoch(),
             // 경과 측정 전용(§Surface.created_instant) — 벽시계 보정과 절전/복귀에 면역이다.
             created_instant: std::time::Instant::now(),
@@ -6539,6 +6565,7 @@ impl Daemon {
             seat_token,
             exited: AtomicBool::new(false),
             exited_at: Mutex::new(None),
+            close_operation: Mutex::new(()),
             write_tx,
             master: Mutex::new(pair.master),
             child: Mutex::new(child),
