@@ -56,10 +56,27 @@ LIBTEST_SWITCHES = {"--nocapture", "--no-capture", "--exact", "--ignored", "--in
                     "--show-output", "--test", "--bench", "--force-run-in-process", "--report-time", "--ensure-time",
                     "--shuffle", "--exclude-should-panic"}
 SHELL_PREFIX_WORDS = {"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until", "time"}
+# Subcommands that are not refused. Add only subcommands that cannot execute tests; one that can (llvm-cov, tarpaulin,
+# xtask, ...) must be classified in cargo_test_args instead, as test/t and nextest are (R-C8MIN-1 issue 5).
 KNOWN_CARGO_SUBCOMMANDS = {"test", "t", "nextest", "build", "b", "check", "c", "clean", "run", "r", "fmt", "clippy", "doc",
                            "d", "metadata", "fetch", "tree", "install", "update", "generate-lockfile", "pkgid",
                            "locate-project", "package", "publish", "rustc", "rustdoc", "bench", "fix", "vendor",
                            "version", "--version", "-V", "help"}
+
+# Second net (R-C8MIN-1 issue 2): a wrapper carries a whole command in one quoted word, which the cargo word search
+# never sees. A command naming a wrapper with a later word that contains a cargo word (cargo, cargo.exe, cargo-nextest,
+# $CARGO; not Cargo.toml) is refused. Quoted prose and data elsewhere are left alone: on 3339eea6, 14 quoted words outside
+# echo/printf commands mention cargo (Cargo.toml included), none runs, none is in a wrapper command.
+SHELL_WRAPPERS = {"sh", "bash", "zsh", "dash", "ksh", "eval", "pwsh", "powershell", "cmd"}
+CARGO_IN_TEXT = re.compile(r"(?i)(?<![A-Za-z0-9_.-])cargo(?:\.exe|-nextest)?(?![A-Za-z0-9_.-])")
+# uses: values in the workflows today (census 2026-10-17, version ignored). Add only an action that cannot run tests
+# (checkout, setup, cache, upload); tauri-apps/tauri-action builds the app and runs no test. Anything else - another
+# action, a local ./ action, a reusable workflow - is refused.
+ALLOWED_ACTIONS = {"actions/cache", "actions/checkout", "actions/setup-python", "actions/upload-artifact",
+                   "dtolnay/rust-toolchain", "oven-sh/setup-bun", "swatinem/rust-cache", "tauri-apps/tauri-action"}
+
+def basename_word(token):
+    return re.split(r"[\\/]", token)[-1].lower().removesuffix(".exe")
 
 def is_cargo_word(token):
     """cargo, cargo.exe, a path ending in either, or $CARGO / ${CARGO}."""
@@ -197,9 +214,16 @@ def cysd_test_runs(body):
                 runs.append((line.strip(), args))
     return runs
 
+# Limits of unread_cargo_routes (R-C8MIN-1 issues 1-2), printed with its assertion; the ci-branch registry text for
+# this test carries the same sentences.
+UNREAD_ROUTE_LIMITS = ("Not covered: cargo started by a script, heredoc or other program a run line calls; audit those "
+                       "by hand. Also unread: a cmd.exe ^ continuation (its first line reads as a test-name filter). "
+                       "Refused, not read: cargo inside an sh, bash, zsh, dash, ksh, eval, pwsh, powershell or cmd "
+                       "command, the cargo-nextest binary, and any action or reusable workflow not on ALLOWED_ACTIONS.")
+
 def unread_cargo_routes(root):
     """Routes the inventory cannot read, refused so that a new one is audited (R-C8INV-1 issue 2).
-    Not covered: cargo started by a script, a Python heredoc or any other program a run line calls."""
+    What it cannot see: UNREAD_ROUTE_LIMITS."""
     workflows = root / ".github/workflows"
     problems = ["workflow file not named *.yml: " + p.name for p in sorted(workflows.iterdir()) if p.is_file() and p.suffix != ".yml"]
     if (root / ".github/actions").exists():
@@ -209,11 +233,23 @@ def unread_cargo_routes(root):
             used = re.match(r"^\s*(?:-\s+)?uses:\s*['\"]?([^\s'\"]+)", line)
             if used and "cargo" in used.group(1).lower():
                 problems.append("%s uses a cargo action: %s" % (path.name, used.group(1)))
+            elif used and used.group(1).split("@")[0].lower() not in ALLOWED_ACTIONS:
+                problems.append("%s uses an action or reusable workflow not on the allow-list: %s" % (path.name, used.group(1)))
         for step, body in workflow_step_runs(path):
             for line in logical_lines(body):
                 for tokens in line_commands(line):
+                    if not tokens or tokens[0] in ("echo", "printf", ":"):
+                        continue
+                    wrapper = next((i for i, token in enumerate(tokens) if basename_word(token) in SHELL_WRAPPERS), None)
+                    if wrapper is not None and any(CARGO_IN_TEXT.search(token) for token in tokens[wrapper + 1:]):
+                        problems.append("%s step %r: cargo inside a wrapper command (%s) is not read: %s"
+                                        % (path.name, step, tokens[wrapper], line.strip()))
+                        continue
+                    if any(basename_word(token) == "cargo-nextest" for token in tokens):
+                        problems.append("%s step %r: the cargo-nextest binary is not read: %s" % (path.name, step, line.strip()))
+                        continue
                     cargo = next((i for i, token in enumerate(tokens) if is_cargo_word(token)), None)
-                    if cargo is None or tokens[0] in ("echo", "printf", ":"):
+                    if cargo is None:
                         continue
                     rest = tokens[cargo + 1:]
                     rest = rest[1:] if rest[:1] and rest[0].startswith("+") else rest
@@ -339,7 +375,8 @@ class C8WorkflowReaderTests(ReaderFixture):
                           if "C8_NATIVE_UNMEASURED" in p.read_text(encoding="utf-8", errors="replace"))
         self.assertEqual(emitters, ["src/bin/cysd/native_publication_transition_tests.rs"],
                          "a C8 marker emitter outside the native test submodule escapes the native-name proof")
-        self.assertEqual(unread_cargo_routes(ROOT), [], "a cargo route this inventory cannot read: audit it")
+        self.assertEqual(unread_cargo_routes(ROOT), [],
+                         "a cargo route this inventory cannot read: audit it. " + UNREAD_ROUTE_LIMITS)
         gated = {}
         for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
             for step, body in workflow_step_runs(path):
@@ -401,7 +438,19 @@ class C8WorkflowReaderTests(ReaderFixture):
         cases = [("a.yaml", "x: 1\n", "not named *.yml"),
                  ("b.yml", "jobs:\n  a:\n    steps:\n      - uses: actions-rs/cargo@v1\n", "uses a cargo action"),
                  ("c.yml", step % "cargo ${{ matrix.sub }} --bin cysd", "not classifiable"),
-                 ("d.yml", step % "cargo \"$T\" --bin cysd", "not classifiable")]
+                 ("d.yml", step % "cargo \"$T\" --bin cysd", "not classifiable"),
+                 ("e.yml", step % "sh -c 'cargo test --bin cysd'", "wrapper command"),
+                 ("f.yml", step % "bash -lc \"cd x && cargo test --bin cysd\"", "wrapper command"),
+                 ("g.yml", step % "eval \"$CARGO test --bin cysd\"", "wrapper command"),
+                 ("h.yml", step % "cargo-nextest nextest run --bin cysd", "cargo-nextest binary"),
+                 ("i.yml", "jobs:\n  a:\n    steps:\n      - uses: example/run-tests@v1\n", "not on the allow-list"),
+                 ("j.yml", "jobs:\n  a:\n    uses: ./.github/workflows/other.yml\n", "not on the allow-list"),
+                 ("k.yml", step % "C:/Windows/System32/cmd.exe /c \"cargo test --bin cysd\"", "wrapper command")]
+        (flows / "ok.yml").write_text("jobs:\n  a:\n    steps:\n      - uses: actions/checkout@v4\n"
+                                      "      - name: s\n        run: bash scripts/x.sh && sh -c 'grep version Cargo.toml'\n",
+                                      encoding="utf-8")
+        self.assertEqual(unread_cargo_routes(base), [], "a wrapper or an allowed action without cargo was refused")
+        (flows / "ok.yml").unlink()
         for name, text, needle in cases:
             with self.subTest(route=name):
                 (flows / name).write_text(text, encoding="utf-8")
