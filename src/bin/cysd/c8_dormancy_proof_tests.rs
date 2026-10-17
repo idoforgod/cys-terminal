@@ -111,8 +111,11 @@ fn c8_dormancy_production_surfaces_keep_pass_through_proof() {
 // or a mutating call on an existing read) changes a shape or adds one and turns this red without re-running the
 // census. Tokens come from c8_sampler_tokens (comments and literals skipped); items attributed #[cfg(test)] or
 // #[cfg(all(test, ..))] are cut by bracket balance; modules are followed from main.rs, and a production #[path] module
-// not in the table, a nested file module or an include! fails closed. Not covered: a field name built by a macro from
-// strings; code outside src/bin/cysd (the field is private to the daemon).
+// not in the table, a #[cfg_attr(.., path ..)] module, a file module in a non-main file or inside a block or inline
+// module, and an include! fail closed (R-C8DORM-2 #4). NAMED LIMITS (holes this pin has; also in its failure message):
+// a field name built by a macro from strings (concat_idents!/paste!-style) is not seen; code outside src/bin/cysd is
+// not scanned (the field is private to the daemon). Other cfg forms (cfg(any(test, ..)), cfg_attr) are scanned as
+// production - a false red, never a hidden writer.
 const C8_RECEIVER_PROOF_SHAPES: &[(&str, &str)] = &[
     ("governance.rs", ". lock ( ) . unwrap ( ) . is_some ( )"),
     ("state.rs", ". lock ( ) . unwrap_or_else ( | e | e . into_inner ( ) ) . clone ( ) . unwrap_or_else ( | | Arc : : new ( crate : : agent_write : : PassThrough ) )"),
@@ -121,14 +124,18 @@ const C8_RECEIVER_PROOF_SHAPES: &[(&str, &str)] = &[
 ];
 
 /// Tokens with every item attributed #[cfg(test)] / #[cfg(all(test, ..))] removed. An item ends at ';' or ',' at its
-/// own depth, before a '}' that closes the enclosing block, or after its own '{..}' block - never later, so a cut
-/// cannot swallow production code that follows it.
+/// own depth, before a ')', ']' or '}' that closes the enclosing list or block (a last argument, parameter or element
+/// without a trailing comma - R-C8DORM-2 #1), or after its own '{..}' block - never later, so a cut cannot swallow
+/// production code that follows it.
 fn c8_cut_test_items<'a>(tokens: &[&'a str]) -> Result<Vec<&'a str>, String> {
     let (mut out, mut i) = (Vec::new(), 0);
     while i < tokens.len() {
         let test_attr = tokens.get(i..i + 4) == Some(&["#", "[", "cfg", "("][..])
             && (tokens.get(i + 4..i + 6) == Some(&["test", ")"][..]) || tokens.get(i + 4..i + 7) == Some(&["all", "(", "test"][..]));
         if !test_attr { out.push(tokens[i]); i += 1; continue; }
+        if c8_in_angle_list(&out) {
+            return Err("a #[cfg(test)] generic parameter is not cut (no list end is visible inside <..>)".into());
+        }
         let mut j = i;
         while tokens.get(j) == Some(&"#") && tokens.get(j + 1) == Some(&"[") {
             let mut depth = 0usize;
@@ -147,6 +154,7 @@ fn c8_cut_test_items<'a>(tokens: &[&'a str]) -> Result<Vec<&'a str>, String> {
             match tokens.get(j) {
                 None => return Err("unterminated cfg(test) item".into()),
                 Some(&"(") | Some(&"[") => depth += 1,
+                Some(&")") | Some(&"]") if depth == 0 => break,
                 Some(&")") | Some(&"]") => depth -= 1,
                 Some(&";") | Some(&",") if depth == 0 => { j += 1; break; }
                 Some(&"}") if depth == 0 => break,
@@ -173,6 +181,24 @@ fn c8_cut_test_items<'a>(tokens: &[&'a str]) -> Result<Vec<&'a str>, String> {
     Ok(out)
 }
 
+/// Whether the scanned tokens end inside a generic list `<..>`: walk back over balanced (), [] and <> (a `>` of `->` or
+/// `=>` is not a closer) to the first unmatched opener; `{`, `}` and `;` end the walk (generic lists hold none of them).
+/// The cut fails closed there - inside `<..>` it cannot see where the item ends (R-C8DORM-2 reflection R1-1).
+fn c8_in_angle_list(out: &[&str]) -> bool {
+    let mut depth = 0usize;
+    for (n, t) in out.iter().enumerate().rev() {
+        match *t {
+            "{" | "}" | ";" => return false,
+            ")" | "]" => depth += 1,
+            "(" | "[" => { if depth == 0 { return false; } depth -= 1; }
+            ">" if n == 0 || !matches!(out[n - 1], "-" | "=") => depth += 1,
+            "<" => { if depth == 0 { return true; } depth -= 1; }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// (file, statement after the token) for every production receiver_proof token, following modules from main.rs.
 fn c8_receiver_proof_shapes(read: &dyn Fn(&str) -> Result<String, String>) -> Result<Vec<(String, String)>, String> {
     // Production #[path] modules present today: (parent file, module, file). Anything else fails closed.
@@ -183,12 +209,17 @@ fn c8_receiver_proof_shapes(read: &dyn Fn(&str) -> Result<String, String>) -> Re
         let source = read(&file)?;
         let all = c8_sampler_tokens(&source).map_err(|e| format!("{file}: {e}"))?;
         let tokens = c8_cut_test_items(&all).map_err(|e| format!("{file}: {e}"))?;
+        let mut braces = 0isize; // a file module inside a block or inline module resolves elsewhere (R-C8DORM-2 #4)
         for (k, t) in tokens.iter().enumerate() {
+            match *t { "{" => braces += 1, "}" => braces -= 1, _ => {} }
             if *t == "include" && tokens.get(k + 1) == Some(&"!") {
                 return Err(format!("{file}: a production include! is not scanned"));
             }
             if *t == "mod" && tokens.get(k + 2) == Some(&";") {
                 let name = tokens[k + 1];
+                if braces != 0 {
+                    return Err(format!("{file}: file module {name} inside a block or inline module is not scanned"));
+                }
                 // Walk back over the visibility (`pub`, or `pub(..)` with any path) and over EVERY outer attribute
                 // of this item: #[path] may stand before #[cfg(..)] or other attributes (reflection R1-1).
                 let mut b = k;
@@ -197,7 +228,7 @@ fn c8_receiver_proof_shapes(read: &dyn Fn(&str) -> Result<String, String>) -> Re
                     while a > 0 && tokens[a] != "(" { a -= 1; }
                     if a > 0 && tokens[a - 1] == "pub" { b = a - 1; }
                 } else if b > 0 && tokens[b - 1] == "pub" { b -= 1; }
-                let mut pathed = false;
+                let (mut pathed, mut cfg_attr_path) = (false, false);
                 while b > 0 && tokens[b - 1] == "]" {
                     let (mut a, mut depth) = (b, 0usize);
                     while a > 0 {
@@ -207,7 +238,11 @@ fn c8_receiver_proof_shapes(read: &dyn Fn(&str) -> Result<String, String>) -> Re
                     }
                     if depth != 0 || a == 0 || tokens[a - 1] != "#" { break; }
                     pathed |= tokens[a - 1..b] == ["#", "[", "path", "=", "]"];
+                    cfg_attr_path |= tokens[a + 1] == "cfg_attr" && tokens[a..b].contains(&"path");
                     b = a - 1;
+                }
+                if cfg_attr_path {
+                    return Err(format!("{file}: module {name} with #[cfg_attr(.., path ..)] is not scanned"));
                 }
                 if pathed {
                     match PATHED.iter().find(|(parent, m, _)| *parent == file && *m == name) {
@@ -243,12 +278,14 @@ fn c8_receiver_proof_shapes(read: &dyn Fn(&str) -> Result<String, String>) -> Re
 fn c8_dormancy_receiver_proof_has_only_the_known_production_shapes() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
     let read = |f: &str| std::fs::read_to_string(root.join(f)).map_err(|e| format!("{f}: {e}"));
-    let actual = c8_receiver_proof_shapes(&read).expect("receiver_proof lexical pin could not scan the production modules");
+    let actual = c8_receiver_proof_shapes(&read)
+        .expect("receiver_proof lexical pin could not scan the production modules (it fails closed on routes it cannot follow)");
     let mut expected: Vec<(String, String)> =
         C8_RECEIVER_PROOF_SHAPES.iter().map(|(f, s)| (f.to_string(), s.to_string())).collect();
     expected.sort();
     assert_eq!(actual, expected, "C8 dormancy: receiver_proof production shapes changed - a writer or a new read was added \
-        outside test code (re-run scripts/c8_dormancy_census.py and review before changing this list)");
+        outside test code (re-run scripts/c8_dormancy_census.py and review before changing this list). Named limits of \
+        this pin: macro-built field names and code outside src/bin/cysd are not seen");
 }
 
 #[test]
@@ -279,4 +316,19 @@ fn c8_dormancy_receiver_proof_pin_sees_added_writers_and_fails_closed() {
     // #[path] is found among all of the item's attributes and behind any visibility (R-C8DORM-1 reflection R1-1).
     assert_eq!([run("#[path = \"z.rs\"] #[cfg(unix)] mod a;", "").is_err(), run("#[path = \"z.rs\"] pub(in crate::q) mod a;", "").is_err()],
         [true, true], "unknown #[path] module accepted when another attribute or pub(in ..) stands between it and mod");
+    // R-C8DORM-2 #1: a test item on the last argument, parameter or element (no trailing comma) ends at the closing
+    // ) or ], so the writer after it is seen. #4: a #[cfg_attr(.., path ..)] module and a file module inside a block or
+    // inline module fail closed instead of being read as a top-level <name>.rs.
+    let one = |a: &'static str| run("mod a;", a).map(|v| v.len()) == Ok(1);
+    assert_eq!([one("fn f(s: &S) { call(a, #[cfg(test)] b); *s.receiver_proof.lock().unwrap() = Some(p); } fn g() { h(1, 2); }"),
+                one("fn f(#[cfg(test)] t: T) { *s.receiver_proof.lock().unwrap() = Some(p); } fn g() { h(1, 2); }"),
+                one("const A: [u8; 2] = [1, #[cfg(test)] 2]; fn f(s: &S) { *s.receiver_proof.lock().unwrap() = Some(p); } fn g() { h(1, 2); }"),
+                run("#[cfg_attr(unix, path = \"u.rs\")] mod a;", "").is_err(),
+                run("mod outer { mod a; }", "").is_err()],
+        [true; 5], "cut ran past a closing ) or ], or a cfg_attr path / inline-module file module was read as <name>.rs");
+    // Reflection R1-1 of R-C8DORM-2: no list end is visible to the cut inside <..>, so a cfg(test) generic parameter
+    // fails closed instead of letting the cut take the item's body as its block.
+    assert_eq!([run("mod a;", "fn f<#[cfg(test)] T>(s: &S) { *s.receiver_proof.lock().unwrap() = Some(p); }").is_err(),
+                run("mod a;", "fn f<A: X<u8>, #[cfg(test)] B>(s: &S) { *s.receiver_proof.lock().unwrap() = Some(p); }").is_err()],
+        [true, true], "cut accepted a cfg(test) generic parameter (the item's body would be hidden)");
 }
