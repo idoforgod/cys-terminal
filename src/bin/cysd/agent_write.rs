@@ -125,6 +125,13 @@ impl Plan {
         self.submit = Some(Submit { delay_ms, min_gap_ms });
         self
     }
+    /// Data-only append; the existing Request still requires an actual durable edit grant.
+    pub(crate) fn append_owned_submit(&self,submit:Submit)->Result<Plan,LeaseError> {
+        if self.submit.is_some() || self.body.is_none() || self.control.is_some() {
+            return Err(LeaseError::PlanChanged);
+        }
+        let mut next=self.clone();next.submit=Some(submit);Ok(next)
+    }
     pub fn body(&self) -> Option<&str> {
         self.body.as_deref()
     }
@@ -2834,4 +2841,29 @@ mod tests {
                 "cancelled Prepared outcome lost its unresolved managed receipt owner");
         }
     }
+    #[test]
+    fn c8owned_append_preserves_original_bytes_fences_clear_and_timing() {
+        for plan in [Plan::raw(""),Plan::raw("literal\r\nbody"),Plan::paste("한글\x1b[200~text"),Plan::paste("x").with_clear(17)] {
+            let original=plan.clone();let bytes=plan.planned_bytes();let before=plan.exact_view();
+            let next=plan.append_owned_submit(Submit { delay_ms:23,min_gap_ms:41 }).expect("an absent Submit must append without rebuilding the body");let after=next.exact_view();
+            assert_eq!(next.planned_bytes(),[bytes.as_slice(),b"\r"].concat());assert_eq!(plan,original);
+            assert_eq!((after.body,after.control,after.fenced,after.clear_first,after.clear_settle_ms),(before.body,before.control,before.fenced,before.clear_first,before.clear_settle_ms));
+            assert_eq!(after.submit,Some(Submit {delay_ms:23,min_gap_ms:41}));
+        }
+    }
+    #[test]
+    fn c8owned_append_cannot_replace_submit_or_turn_control_into_a_body() {
+        for plan in [Plan::control(vec![27]),Plan::submit_only(0),Plan::raw("x").with_submit(7,11)] {
+            let original=plan.clone();assert!(matches!(plan.append_owned_submit(Submit {delay_ms:23,min_gap_ms:41}),Err(LeaseError::PlanChanged)));assert_eq!(plan,original);
+        }
+    }
+    #[test]
+    fn c8owned_append_data_does_not_authorize_a_native_plan_change() {
+        let plan=Plan::raw("owned");let job=managed_job(plan.clone(),FakeProof::healthy());
+        let next=plan.append_owned_submit(Submit {delay_ms:0,min_gap_ms:0}).unwrap();
+        drop(job.attempt);
+        assert!(job.request.reserve_attempt(&next,None).is_err(),"data helper changed the actual admitted native Plan");
+        assert!(job.request.reserve_attempt(&plan,None).is_ok());
+    }
+
 }

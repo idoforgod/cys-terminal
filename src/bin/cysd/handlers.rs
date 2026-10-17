@@ -12287,6 +12287,8 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) 
 mod tests {
     use super::*;
 
+    include!("caller_matrix_tests.rs");
+
     /// ★(0.14.42 · perf R3-6) live_cwd **단일 관측 · 단일 손잡이 핀**.
     /// ① surface.list · org.status · 좌석 회수 호출자 축은 `live_cwds` 를 경유한다 — 운영 구간(테스트
     ///   모듈 앞)의 sysinfo cwd 조회(`.with_cwd(`)는 `live_cwds_legacy` 한 곳뿐이어야 한다. 둘 이상이면
