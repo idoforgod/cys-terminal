@@ -420,4 +420,40 @@ mod tests {
         assert_eq!(table.len(),1);
     }
 
+
+    #[test]
+    fn two_received_legacy_returns_sharing_one_body_bind_at_most_once() {
+        let now = Instant::now(); let mut table = AssociationTable::default();
+        let caller = CallerKey::Surface(71);
+        table.hold(body("once-legacy", caller.clone(), 9, now)).unwrap();
+        let first = table.retain_for_receipt(now + MS, 9, None);
+        let second = table.retain_for_receipt(now + MS + MS, 9, None);
+        let Associate::Bound(bound) = table.take_received_return(&first, &caller, 9, now + MS)
+            else { panic!("first retained legacy Return must bind its admitted body") };
+        assert_eq!(bound.request_id, "once-legacy");
+        assert_eq!(bound.text, "body once-legacy");
+        assert_eq!(bound.deadline, now + W);
+        // Keep both retention objects and the first owned result alive at the second take.
+        assert!(matches!(table.take_received_return(&second, &caller, 9, now + MS + MS), Associate::NoBody),
+            "second retained legacy Return rebound an already taken body");
+        assert_eq!(table.len(), 0);
+        drop((first, second, bound));
+    }
+
+    #[test]
+    fn two_received_token_returns_sharing_one_body_bind_at_most_once() {
+        let now = Instant::now(); let mut table = AssociationTable::default();
+        table.hold(body("once-token", CallerKey::Surface(72), 10, now)).unwrap();
+        let first = table.retain_for_receipt(now + MS, 10, Some("once-token"));
+        let second = table.retain_for_receipt(now + MS + MS, 10, Some("once-token"));
+        let bound = table.take_received_token(&first, "once-token", 10, now + MS)
+            .expect("first retained token Return must bind its admitted body");
+        assert_eq!(bound.request_id, "once-token");
+        assert_eq!(bound.text, "body once-token");
+        assert_eq!(bound.deadline, now + W);
+        assert!(table.take_received_token(&second, "once-token", 10, now + MS + MS).is_none(),
+            "second retained token Return rebound an already taken body");
+        assert_eq!(table.len(), 0);
+        drop((first, second, bound));
+    }
 }

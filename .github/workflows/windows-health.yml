@@ -676,6 +676,9 @@ jobs:
           } >> "$SUM" 2>/dev/null
           exit 0
 
+      # Tripwire only: the marker's sole emitter, the native_transition_tests submodule of native_publication,
+      #   is compiled for macOS/Linux tests only (native_publication itself is compiled on Windows), so no
+      #   Windows leg can emit the marker. A green step here carries NO Windows native measurement and no coverage.
       - name: C8 UNMEASURED marker gate (Windows full and hwmon)
         if: always()
         shell: bash

@@ -416,6 +416,14 @@ impl NativeState {
         self.plan.is_some() && self.progress.proven_zero() && !self.running && !self.settling
             && !self.final_outcome && self.resume.is_none() && self.completion_key.is_none()
     }
+
+    /// The only way a new managed owner is issued: it becomes the newest owner and the
+    /// previous run's zero-release acknowledgement ends, in the same native-mutex hold.
+    fn issue_owner(&mut self, key: &Arc<()>, operation: ManagedOperation) {
+        self.last_zero_resolution = None;
+        self.last_issued_owner = Some(key.clone());
+        self.operation = Some(operation);
+    }
 }
 
 impl Request {
@@ -430,9 +438,7 @@ impl Request {
         if state.operation.is_some() { return Err(LeaseError::Busy); }
         if !state.permits_run(plan, resume) { return Err(LeaseError::NativeConflict); }
         let key = Arc::new(());
-        state.last_zero_resolution=None;
-        state.last_issued_owner=Some(key.clone());
-        state.operation = Some(ManagedOperation::Attempt { key: key.clone(), phase: AttemptPhase::Prepared });
+        state.issue_owner(&key, ManagedOperation::Attempt { key: key.clone(), phase: AttemptPhase::Prepared });
         Ok(AttemptLease { request: self.clone(), key, plan: plan.clone(), resume })
     }
 
@@ -444,9 +450,7 @@ impl Request {
         if !state.permits_zero_edit() { return Err(LeaseError::NativeConflict); }
         let key = Arc::new(());
         let original_plan = state.plan.clone();
-        state.last_zero_resolution=None;
-        state.last_issued_owner=Some(key.clone());
-        state.operation = Some(ManagedOperation::Edit { key: key.clone(), phase: EditPhase::Reserved });
+        state.issue_owner(&key, ManagedOperation::Edit { key: key.clone(), phase: EditPhase::Reserved });
         Ok(ZeroWriteEditLease { request: self.clone(), key, original_plan })
     }
 }
@@ -1018,6 +1022,9 @@ fn execute_started<W:Write>(writer:&mut W,job:&AgentJob,io:&mut WriterIo<'_>,key
         }
         prev = Some(phase);
         let mut off = 0;
+        // An empty chunk (control Some(vec![])) never reaches run.account, so its envelope
+        // flag stays false. pending_aftercare_envelope_tests pins the validator for the flipped
+        // (forged) case; re-check that specimen if this loop ever accounts an empty chunk.
         while off < bytes.len() {
             if req.is_cancelled() {
                 return run.done(run.stop("cancelled".into(), false), false);

@@ -3195,10 +3195,11 @@ fn submit_caller_key(
     Some(CallerKey::Process { parent_pid: parent.identity.pid, parent_birth_us: birth_us })
 }
 
-/// One ACL check for one target at ingress. This is not a write proof or a token/body
-/// association: those consumers must still check the exact request, binding and window.
-/// In particular, an explicit-token caller may be ACL-permitted with no authenticated actor.
-/// Mint a fresh witness for each incoming call; retaining this object does not retain ACL permission.
+/// One ACL check and dispatch-time PID sample, compatibility grade; not bound to the accepted transport.
+/// Dormant in 0.14.52: this sampler is not original-caller identity or a write/token/body proof.
+/// A future consumer must still check the exact request, binding, window and current ACL.
+/// Explicit-token submission does not require the body's original caller identity.
+/// Retaining this object does not retain ACL permission; strict activation awaits B-278.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct CheckedSubmitSender {
     target: std::sync::Weak<crate::state::Surface>,
@@ -3207,7 +3208,7 @@ pub(crate) struct CheckedSubmitSender {
     authenticated: Option<SubmitAuthenticatedActor>,
 }
 
-// These fields are runtime authority, never decoded from audit data or caller parameters.
+// These fields are private dispatch-time samples, never decoded from audit data or caller parameters.
 // Weak surface references avoid Surface -> association -> sender -> Surface ownership cycles.
 #[cfg_attr(not(test), allow(dead_code))]
 enum SubmitAuthenticatedActor {
@@ -3266,7 +3267,7 @@ impl CheckedSubmitSender {
         self.historical.as_ref()
     }
 
-    /// Captured ingress data, not a current-liveness assertion or a reconstructible capability.
+    /// Captured dispatch-time sample data, not accepted-transport identity, current liveness or a capability.
     /// No token, argv, executable path, request body or strong surface reference is projected.
     pub(crate) fn audit(&self) -> Value {
         use crate::submit_assoc::CallerKey;
@@ -3368,7 +3369,7 @@ fn observe_submit_surface(daemon: &Daemon, caller_pid: Option<u32>) -> Option<Ar
 // A bounded CURRENT native chain. No ACL cache, claimed ID or delegated pid map can
 // manufacture a node. Every hop has a valid incarnation; rereads reject changed peer
 // birth/parent edges. The owned root is bracketed by positive child-handle observations.
-// This is sampled membership at ingress, not a guarantee about future process changes.
+// This is sampled membership at dispatch time, not accepted-transport identity or future liveness.
 fn observe_submit_surface_with(
     daemon: &Daemon, caller_pid: Option<u32>,
     mut observe: impl FnMut(u32) -> Result<cys::process_observation::Identity, cys::process_observation::Failure>,
@@ -3410,10 +3411,12 @@ fn observe_submit_surface_with(
     None
 }
 
-/// The sole production constructor. `caller_pid` is the kernel peer PID supplied by dispatch,
-/// never `params["pid"]`/`from`. ACL permission and historical grade retain existing
-/// resolver semantics; a separate native chain owns fresh surface provenance and parent fallback. Caller data may remain Claimed for diagnostics while a real
-/// kernel parent independently authenticates the same request.
+/// Dormant sampler: dispatch-time PID sample, compatibility grade; not bound to the accepted transport.
+/// `caller_pid` is the numeric kernel peer PID carried into dispatch, never `params["pid"]`/`from`.
+/// Sampling it now cannot prove continuity with the process at transport acceptance.
+/// ACL permission and historical grade retain existing resolver semantics. The separate native
+/// chain and parent fallback are dispatch-time observations; they do not authenticate the original caller.
+/// Strict pairing stays OFF throughout 0.14.52; accept-time capture belongs to B-278/0.14.53.
 ///
 /// This patch intentionally adds no handler call sites. Native/ACL work stays in admitted
 /// blocking dispatch; the original full-frame timestamp/retention arrives separately from
@@ -3426,8 +3429,8 @@ fn checked_submit_sender(
     params: &Value,
 ) -> Result<CheckedSubmitSender, String> {
     let verified_from = check_send_acl(daemon, caller_pid, target, params)?;
-    // ACL permission/diagnostics retain existing resolver semantics. Association identity
-    // is collected independently now; a stale cached sid is never a fresh actor witness.
+    // ACL permission/diagnostics retain existing resolver semantics. Actor data is sampled
+    // independently at dispatch; a stale cached sid is not fresh sampled evidence.
     let verified_surface = observe_submit_surface(daemon, caller_pid);
     let parent = if verified_surface.is_none() {
         observe_submit_parent(caller_pid)
@@ -12692,6 +12695,7 @@ mod tests {
 
     include!("caller_matrix_tests.rs");
     include!("checked_submit_sender_tests.rs");
+    include!("checked_submit_sender_dormancy_tests.rs");
 
     /// ★(0.14.42 · perf R3-6) live_cwd **단일 관측 · 단일 손잡이 핀**.
     /// ① surface.list · org.status · 좌석 회수 호출자 축은 `live_cwds` 를 경유한다 — 운영 구간(테스트

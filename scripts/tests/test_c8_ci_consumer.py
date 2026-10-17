@@ -43,6 +43,8 @@ GATED_CYSD_LEGS = {
     ("windows-health.yml", "cargo test --bin cysd 감독자 축 (Windows 실기 · IG-31 · 비차단 A10 1단계)"): "cysd-win/cargo.log",
     ("windows-health.yml", "cargo test --bin cysd hwmon 검체 (Windows 실기 · 비차단 · 위 전량 스텝과 별개)"): "hwmon-win/cargo.log",
 }
+# Fail-closed flag sets: a flag missing here makes a run count as able to select a native test.
+# Add only flags that cannot change WHICH tests run (never a filter-, target- or package-widening flag).
 CARGO_VALUE_FLAGS = {"--bin", "-p", "--package", "--manifest-path", "--target", "--target-dir", "--features", "-F",
                      "--profile", "-j", "--jobs", "--color", "--config", "-Z", "--message-format", "--exclude",
                      "--test", "--example", "--bench"}
@@ -54,6 +56,19 @@ LIBTEST_SWITCHES = {"--nocapture", "--no-capture", "--exact", "--ignored", "--in
                     "--show-output", "--test", "--bench", "--force-run-in-process", "--report-time", "--ensure-time",
                     "--shuffle", "--exclude-should-panic"}
 SHELL_PREFIX_WORDS = {"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until", "time"}
+KNOWN_CARGO_SUBCOMMANDS = {"test", "t", "nextest", "build", "b", "check", "c", "clean", "run", "r", "fmt", "clippy", "doc",
+                           "d", "metadata", "fetch", "tree", "install", "update", "generate-lockfile", "pkgid",
+                           "locate-project", "package", "publish", "rustc", "rustdoc", "bench", "fix", "vendor",
+                           "version", "--version", "-V", "help"}
+
+def is_cargo_word(token):
+    """cargo, cargo.exe, a path ending in either, or $CARGO / ${CARGO}."""
+    return re.fullmatch(r"\$?\{?cargo(\.exe)?\}?", re.split(r"[\\/]", token)[-1].lower()) is not None
+
+def native_test_functions(source):
+    """Test function names, also when other attribute lines sit between #[test] and fn (R-C8CI-1 issue 3)."""
+    return re.findall(r"(?m)^[ \t]*#\[(?:tokio::)?test(?:\([^)\n]*\))?\]\s*(?:#\[[^\n]*\]\s*)*"
+                      r"(?:async\s+)?fn\s+([A-Za-z0-9_]+)\s*\(", source)
 
 def workflow_step_runs(path):
     """(owning step name, run body) for every run: key; the step is found by indentation, block scalars skipped."""
@@ -130,9 +145,10 @@ def cargo_test_args(tokens):
     """Arguments after 'cargo [+toolchain] test|t' in one simple command, else None ('nextest run' -> ['--nextest'])."""
     while tokens and (tokens[0] in SHELL_PREFIX_WORDS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0])):
         tokens = tokens[1:]
-    if not tokens or tokens[0] in ("echo", "printf", ":") or "cargo" not in tokens:
+    cargo = next((i for i, token in enumerate(tokens) if is_cargo_word(token)), None)
+    if not tokens or tokens[0] in ("echo", "printf", ":") or cargo is None:
         return None
-    start = tokens.index("cargo") + 1
+    start = cargo + 1
     if start < len(tokens) and tokens[start].startswith("+"):
         start += 1
     if tokens[start:start + 2] == ["nextest", "run"]:
@@ -164,20 +180,47 @@ def selects_cysd(args):
         return False
     return True
 
+def line_commands(line):
+    try:
+        return simple_commands(line)
+    except ValueError:                        # unbalanced quoting: read words anyway rather than skip the line
+        text = re.sub(r"(^|\s)#.*$", "", line.replace("'", " ").replace('"', " "))
+        return [part.split() for part in re.split(r"[;&|()]", text)]
+
 def cysd_test_runs(body):
     """(logical line, cargo args) for every simple command in a run body that executes cysd tests."""
     runs = []
     for line in logical_lines(body):
-        try:
-            commands = simple_commands(line)
-        except ValueError:                    # unbalanced quoting: read words anyway rather than skip the line
-            text = re.sub(r"(^|\s)#.*$", "", line.replace("'", " ").replace('"', " "))
-            commands = [part.split() for part in re.split(r"[;&|()]", text)]
-        for tokens in commands:
+        for tokens in line_commands(line):
             args = cargo_test_args(tokens)
             if args is not None and selects_cysd(args):
                 runs.append((line.strip(), args))
     return runs
+
+def unread_cargo_routes(root):
+    """Routes the inventory cannot read, refused so that a new one is audited (R-C8INV-1 issue 2).
+    Not covered: cargo started by a script, a Python heredoc or any other program a run line calls."""
+    workflows = root / ".github/workflows"
+    problems = ["workflow file not named *.yml: " + p.name for p in sorted(workflows.iterdir()) if p.is_file() and p.suffix != ".yml"]
+    if (root / ".github/actions").exists():
+        problems.append(".github/actions exists: composite action steps are not read")
+    for path in sorted(workflows.glob("*.yml")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            used = re.match(r"^\s*(?:-\s+)?uses:\s*['\"]?([^\s'\"]+)", line)
+            if used and "cargo" in used.group(1).lower():
+                problems.append("%s uses a cargo action: %s" % (path.name, used.group(1)))
+        for step, body in workflow_step_runs(path):
+            for line in logical_lines(body):
+                for tokens in line_commands(line):
+                    cargo = next((i for i, token in enumerate(tokens) if is_cargo_word(token)), None)
+                    if cargo is None or tokens[0] in ("echo", "printf", ":"):
+                        continue
+                    rest = tokens[cargo + 1:]
+                    rest = rest[1:] if rest[:1] and rest[0].startswith("+") else rest
+                    if rest and rest[0] not in KNOWN_CARGO_SUBCOMMANDS:
+                        problems.append("%s step %r: cargo subcommand %r is not classifiable: %s"
+                                        % (path.name, step, rest[0], line.strip()))
+    return problems
 
 def invokes_cysd_tests(line):
     # Current workflows use direct cargo commands; this also recognizes an implicit
@@ -291,6 +334,12 @@ class C8MarkerCliTests(ReaderFixture):
 class C8WorkflowReaderTests(ReaderFixture):
     def test_actual_cysd_execution_inventory_and_implicit_full_routes(self):
         names = json.loads((ROOT / "scripts/c8_native_tests.json").read_text(encoding="utf-8"))
+        # The selection proof below rests on the only marker emitter living in the native test submodule.
+        emitters = sorted(str(p.relative_to(ROOT)) for p in (ROOT / "src").rglob("*.rs")
+                          if "C8_NATIVE_UNMEASURED" in p.read_text(encoding="utf-8", errors="replace"))
+        self.assertEqual(emitters, ["src/bin/cysd/native_publication_transition_tests.rs"],
+                         "a C8 marker emitter outside the native test submodule escapes the native-name proof")
+        self.assertEqual(unread_cargo_routes(ROOT), [], "a cargo route this inventory cannot read: audit it")
         gated = {}
         for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
             for step, body in workflow_step_runs(path):
@@ -340,6 +389,50 @@ class C8WorkflowReaderTests(ReaderFixture):
         found = [(step, args) for step, body in workflow_step_runs(workflow) for _, args in cysd_test_runs(body)]
         self.assertEqual(found, [("continued", ["--bin", "cysd"]), ("quoted ' name", ["--bin", "cysd"]),
                                  ("stripped", ["--bin", "cysd", "u229_"])])
+        for command in ["C:/rust/bin/cargo.exe test --bin cysd", "\"$CARGO\" test --bin cysd", "${CARGO} t --bin cysd"]:
+            self.assertTrue(invokes_cysd_tests(command), command)
+
+    def test_unread_cargo_routes_are_refused(self):
+        base = self.root / "routes"
+        flows = base / ".github/workflows"
+        flows.mkdir(parents=True)
+        self.assertEqual(unread_cargo_routes(base), [])
+        step = "jobs:\n  a:\n    steps:\n      - name: s\n        run: %s\n"
+        cases = [("a.yaml", "x: 1\n", "not named *.yml"),
+                 ("b.yml", "jobs:\n  a:\n    steps:\n      - uses: actions-rs/cargo@v1\n", "uses a cargo action"),
+                 ("c.yml", step % "cargo ${{ matrix.sub }} --bin cysd", "not classifiable"),
+                 ("d.yml", step % "cargo \"$T\" --bin cysd", "not classifiable")]
+        for name, text, needle in cases:
+            with self.subTest(route=name):
+                (flows / name).write_text(text, encoding="utf-8")
+                problems = unread_cargo_routes(base)
+                self.assertTrue(any(needle in p for p in problems), "unread route accepted: %s %s" % (name, problems))
+                (flows / name).unlink()
+        (base / ".github/actions/x").mkdir(parents=True)
+        self.assertTrue(any("composite action" in p for p in unread_cargo_routes(base)), "composite action route accepted")
+
+    def test_windows_producer_steps_write_the_logs_their_gate_reads(self):
+        # Behavioural link for the two Windows gated legs (R-C8INV-1 issue 3), as ci-branch and release have.
+        cargo = self.bin / "cargo"
+        cargo.write_text("#!/bin/sh\ncase \"$*\" in *--list*) echo 'hwmon::tests::fake: test'; exit 0;; esac\n"
+                         "printf '%s\\n' \"$FAKE_LOG\"\nexit 0\n", encoding="utf-8")
+        cargo.chmod(0o755)
+        bodies = dict(workflow_step_runs(ROOT / ".github/workflows/windows-health.yml"))
+        legs = [(step, log) for (workflow, step), log in GATED_CYSD_LEGS.items() if workflow == "windows-health.yml"]
+        for text, gate_rc in [("test result: ok. 1 passed; 0 failed; 0 ignored;", 0), (marker().strip(), 3)]:
+            for step, log in legs:
+                with self.subTest(step=step, gate_rc=gate_rc):
+                    script = self.root / "producer.sh"
+                    script.write_text(bodies[step], encoding="utf-8")
+                    env = dict(self.env, FAKE_LOG=text)
+                    ran = subprocess.run([BASH, "--noprofile", "--norc", str(script)], cwd=self.root, env=env,
+                                         capture_output=True, timeout=60)
+                    self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+                    self.assertTrue((self.rt / log).is_file(), "producer step no longer writes the log its gate reads: " + log)
+                    self.assertEqual((self.rt / log).read_text(encoding="utf-8"), text + "\n")
+            gate = next(name for workflow, name, _ in MARKER_STEPS if workflow == "windows-health.yml")
+            self.assertEqual(self.run_body("windows-health.yml", gate).returncode, gate_rc,
+                             "Windows gate verdict on the logs its producers actually wrote")
 
     def test_actual_marker_step_bodies_clean_marked_and_missing_logs(self):
         for workflow, name, logs in MARKER_STEPS:
@@ -414,7 +507,11 @@ class C8NativeNameTests(ReaderFixture):
 
     def test_frozen_names_match_actual_native_test_functions(self):
         source = (ROOT / "src/bin/cysd/native_publication_transition_tests.rs").read_text(encoding="utf-8")
-        found = re.findall(r"(?m)^#\[test\]\s*\nfn ([A-Za-z0-9_]+)\(", source)
+        found = native_test_functions(source)
+        self.assertEqual(len(re.findall(r"#\[(?:tokio::)?test\b", source)), len(self.expected()),
+                         "test attribute count differs from the manifest: a test the name pattern cannot see")
+        self.assertEqual(native_test_functions("#[test]\n#[cfg(unix)]\nfn np_a() {}\n#[tokio::test] async fn np_b() {}\n"),
+                         ["np_a", "np_b"], "an attribute line or tokio::test hid a native test from the manifest check")
         expected = ["native_publication::native_transition_tests::" + name for name in found]
         self.assertTrue(expected)
         self.assertEqual(sorted(self.expected()), sorted(expected), "native group manifest/source drift")
