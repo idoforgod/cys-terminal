@@ -1331,6 +1331,26 @@ jobs:
       #     실패한 검체가 터미널 바이트를 찍었다는 이유로 이름·꼬리가 사라지면 안 된다. 맥의 bash 3.2 도 UTF-8 로케일에서는 `$이름` 바로 뒤 한글의 첫 바이트를 변수 이름에 붙여 읽는데
       #     (unbound variable · 로컬 맥 실측) `LC_ALL=C` 뒤로는 그 함정도 없다 — 이 줄을 지우지 마라.
       #   · 한계: 러너가 스텝을 잘라 내면(취소·잡 타임아웃) 판독 코드는 돌지 않는다 — 그때 남는 것은 `tee` 가 흘린 러너 로그뿐이다(익명으로는 읽히지 않는다).
+      - name: Unix PTY allocator tests (macOS, blocking)
+        shell: bash
+        run: |
+          set -euo pipefail
+          LIST="${RUNNER_TEMP:-/tmp}/portable-pty-unix-list.txt"
+          cargo test --manifest-path vendor/portable-pty/Cargo.toml --lib --locked -- --list > "$LIST" 2>&1
+          for name in \
+            unix_allocation_guard_covers_native_open_and_both_cloexec_without_spawn_or_await \
+            allocation_lock_stays_behind_the_unix_module_boundary \
+            static_allocation_lock_excludes_a_second_thread \
+            unit_allocation_lock_is_reusable_after_unwind \
+            held_allocator_returns_busy_at_deadline_without_interrupting_holder \
+            acquired_after_deadline_is_released_without_granting_allocation \
+            expired_deadline_refuses_even_a_free_allocator_and_production_budget_is_five_seconds; do
+            grep -Fx "unix::pty_open_tests::$name: test" "$LIST" >/dev/null
+          done
+          # The module serializes its shared mutex controls in code. Default
+          # libtest concurrency here protects against a forgotten CLI flag.
+          cargo test --manifest-path vendor/portable-pty/Cargo.toml --lib --locked
+
       - name: cargo test --bin cysd (데몬 단위 검체 · 브랜치 레인 편입 · macOS)
         shell: bash
         run: |
@@ -1631,9 +1651,9 @@ jobs:
   #   고치지 않았다(그 문장은 태그 레인의 결과다 · 이 레인에서의 결과는 '태그 전 차단' 이고,
   #   그 차이를 말하는 자리가 이 주석이다). 동일성은 손이 아니라 기계가 지킨다 —
   #   `scripts/lane-parity-rehearsal.sh` 5단계가 두 토큰 집합의 **정확한 일치**를 잰다.
-  # ★범위(정직): 이 잡은 파이썬 루프만이다. `pack-artifacts` 의 2언어 파리티(rustc)·시크릿 스캔·
-  #   cargo 빌드·tar·서명은 여기서 돌지 않는다(그 표면은 이미 잡1·태그 레인이 잰다). 그래도
-  #   0.14.32 를 죽인 표면은 정확히 이 루프였다.
+  # Scope: the existing pack Python loop is followed by R-PTY-1 Unix vendor tests.
+  # Release parity (rustc), secret scans, product builds, tar and signing run elsewhere.
+  # The existing Python loop's tokens and execution body remain unchanged.
   # ★`if:` 없음 · `continue-on-error` 없음 — 돌지 않는 초록도, 붉어도 통과하는 초록도 금지.
   ubuntu-pack-suite:
     runs-on: ubuntu-latest
@@ -1720,6 +1740,29 @@ jobs:
               exit 1
             fi
           done
+
+      - name: Setup Rust for Unix PTY vendor tests
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Unix PTY allocator tests (Linux, blocking)
+        shell: bash
+        run: |
+          set -euo pipefail
+          LIST="${RUNNER_TEMP:-/tmp}/portable-pty-unix-list.txt"
+          cargo test --manifest-path vendor/portable-pty/Cargo.toml --lib --locked -- --list > "$LIST" 2>&1
+          for name in \
+            unix_allocation_guard_covers_native_open_and_both_cloexec_without_spawn_or_await \
+            allocation_lock_stays_behind_the_unix_module_boundary \
+            static_allocation_lock_excludes_a_second_thread \
+            unit_allocation_lock_is_reusable_after_unwind \
+            held_allocator_returns_busy_at_deadline_without_interrupting_holder \
+            acquired_after_deadline_is_released_without_granting_allocation \
+            expired_deadline_refuses_even_a_free_allocator_and_production_budget_is_five_seconds; do
+            grep -Fx "unix::pty_open_tests::$name: test" "$LIST" >/dev/null
+          done
+          # The module serializes its shared mutex controls in code. Default
+          # libtest concurrency here protects against a forgotten CLI flag.
+          cargo test --manifest-path vendor/portable-pty/Cargo.toml --lib --locked
 
   # ═══════════════════════════════════════════════════════════════════════════
   # 잡5 — UI 회귀 테스트 + 타입체크 (macos-latest · 0.14.41 U4 C4-⑧ · 2026-09-23)

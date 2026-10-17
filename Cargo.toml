@@ -74,6 +74,8 @@ diffy = "0.5.1"
 # 테스트 fixture 전용: minisign keypair 생성·서명(서명 roundtrip 테스트). 런타임 의존 아님.
 [dev-dependencies]
 minisign = "0.7"
+# Test binaries can hold the real Unix allocator; normal builds do not enable this seam.
+portable-pty = { path = "vendor/portable-pty", features = ["test-support"] }
 
 # 빌드타임 폐기 명단 형태 검증(DESIGN-pro-license §5 — 손상 revoked-licenses.json = 빌드 실패).
 [build-dependencies]

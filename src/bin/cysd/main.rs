@@ -7794,3 +7794,7 @@ mod vt100_dim_tests;
 // A-ID S1 (0.14.52) close authorization fixtures — test-only module (no production code; file-end convention as above).
 #[cfg(test)]
 mod close_auth_tests;
+
+// R-PTY-1: actual allocator/admission composition, isolated from other PTY tests.
+#[cfg(all(test, unix))]
+mod pty_admission_tests;

@@ -47,12 +47,19 @@ fn acquire_pty_open_lock_with(
     mut now: impl FnMut() -> std::time::Instant,
     mut sleep: impl FnMut(std::time::Duration),
 ) -> Result<std::sync::MutexGuard<'static, ()>, PtyAllocatorBusy> {
+    #[cfg(feature = "test-support")]
+    let mut recorded_test_waiter = false;
     loop {
         if now() >= deadline { return Err(PtyAllocatorBusy); }
         let guard = match PTY_OPEN_LOCK.try_lock() {
             Ok(guard) => guard,
             Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(feature = "test-support")]
+                if !recorded_test_waiter {
+                    test_support::record_waiter();
+                    recorded_test_waiter = true;
+                }
                 let remaining = deadline.saturating_duration_since(now());
                 if remaining.is_zero() { return Err(PtyAllocatorBusy); }
                 sleep(remaining.min(std::time::Duration::from_millis(1)));
@@ -64,6 +71,23 @@ fn acquire_pty_open_lock_with(
         if now() >= deadline { drop(guard); return Err(PtyAllocatorBusy); }
         return Ok(guard);
     }
+}
+
+/// Opt-in dependency-test access to the same allocator used by `PtySystem::openpty`.
+/// This feature is absent from normal builds; it adds no RPC or runtime setting.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+    pub fn hold_allocator() -> std::sync::MutexGuard<'static, ()> {
+        super::PTY_OPEN_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn waiter_count() -> usize { WAITERS.load(Ordering::Acquire) }
+
+    pub(super) fn record_waiter() { WAITERS.fetch_add(1, Ordering::Release); }
 }
 
 fn openpty(size: PtySize) -> anyhow::Result<(UnixMasterPty, UnixSlavePty)> {
