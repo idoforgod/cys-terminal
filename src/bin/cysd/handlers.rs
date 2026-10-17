@@ -12633,6 +12633,7 @@ mod tests {
     include!("caller_matrix_tests.rs");
     include!("checked_submit_sender_tests.rs");
     include!("checked_submit_sender_dormancy_tests.rs");
+    include!("c8_dormancy_proof_tests.rs");
 
     /// ★(0.14.42 · perf R3-6) live_cwd **단일 관측 · 단일 손잡이 핀**.
     /// ① surface.list · org.status · 좌석 회수 호출자 축은 `live_cwds` 를 경유한다 — 운영 구간(테스트
