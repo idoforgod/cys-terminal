@@ -318,6 +318,9 @@ struct NativeState {
     completion_key: Option<Arc<()>>,
     settling: bool,
     operation: Option<ManagedOperation>,
+    // Acknowledge only this actual zero-release again, until any new ownership.
+    // Runtime identity only: never serialized or inferred from absence/zero bytes.
+    last_zero_resolution: Option<Arc<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -402,6 +405,7 @@ impl Request {
         if state.operation.is_some() { return Err(LeaseError::Busy); }
         if !state.permits_run(plan, resume) { return Err(LeaseError::NativeConflict); }
         let key = Arc::new(());
+        state.last_zero_resolution=None;
         state.operation = Some(ManagedOperation::Attempt { key: key.clone(), phase: AttemptPhase::Prepared });
         Ok(AttemptLease { request: self.clone(), key, plan: plan.clone(), resume })
     }
@@ -414,6 +418,7 @@ impl Request {
         if !state.permits_zero_edit() { return Err(LeaseError::NativeConflict); }
         let key = Arc::new(());
         let original_plan = state.plan.clone();
+        state.last_zero_resolution=None;
         state.operation = Some(ManagedOperation::Edit { key: key.clone(), phase: EditPhase::Reserved });
         Ok(ZeroWriteEditLease { request: self.clone(), key, original_plan })
     }
@@ -452,7 +457,7 @@ impl Drop for AttemptLease {
             state.operation = None;
         }
         // Started/uncertain ownership survives a dropped queue/job/handle. Only
-        // real finish or a future typed reconciliation protocol can resolve it.
+        // real finish or an applicable typed reconciliation receipt can resolve it.
     }
 }
 
@@ -505,7 +510,7 @@ impl ZeroWriteEditLease {
     }
 
     /// Commit/rollback ONLY from a non-forgeable durable-domain resolution. This
-    /// draft intentionally has no production issuer for that resolution type.
+    /// resolution is issued by the actual pending-store selection transaction.
     fn resolve(self, resolution: DurableEditResolution) -> Result<(), LeaseError> {
         let (stamp, committed) = match resolution {
             DurableEditResolution::Committed(receipt) => (receipt.stamp, true),
@@ -1051,6 +1056,28 @@ fn execute_started<W:Write>(writer:&mut W,job:&AgentJob,io:&mut WriterIo<'_>,key
     run.done(t, false)
 }
 
+/// Explicit refusal for a managed job that never entered its dispatch channel.
+pub(crate) fn decline_unstarted(job:AgentJob,reason:&str)->Terminal {
+    if !job.request.managed {
+        return Terminal::PartialUnknown { envelope:job.request.native_progress().envelope,
+            accepted:Accepted::default(),reason:"unmanaged_dispatch_decline".into() };
+    }
+    let key=match job.request.begin_run(&job.plan,job.resume,job.attempt.as_ref()) {
+        Ok(key)=>key,Err(progress)=>return finish(job,&Executed::unowned(progress,"dispatch_decline_owner_conflict")),
+    };
+    // This path contains no native writer, proof collection, sleeps, cleanup byte or
+    // mark_lost call. The actual pre-existing prefix and its original loss time remain.
+    let ex={
+        let run=Run { request:&job.request,plan:&job.plan,key,journal:job.journal.clone(),
+            env:job.resume.unwrap_or_default(),acc:Accepted::default(),resumed:job.resume.is_some(),
+            journaled:false,journal_uncertain:false };
+        let cancelled=job.request.is_cancelled();
+        let reason=if cancelled {"cancelled".to_owned()}else{format!("dispatch:{reason}")};
+        run.done(run.stop(reason,!cancelled),false)
+    };
+    finish(job,&ex)
+}
+
 /// Record the terminal (journal first) and run the producer's settlement exactly once.
 pub fn finish(job: AgentJob, ex: &Executed) -> Terminal {
     let Some(completed)=&ex.completed else { return Terminal::PartialUnknown { envelope:ex.envelope,
@@ -1345,8 +1372,34 @@ impl Journal for FileJournal {
     }
 }
 
-// EVIDENCE DRAFT / UNCOMPILED. Append inside agent_write.rs after root lease core.
-// Requires that core's module-private DurableEditResolution and resolve method.
+// Pending-store receipts resolve only the original native exclusion.
+// These bridges cannot mint durable success or reset native progress.
+/// Resolve only a committed actual zero-write outcome of THIS managed attempt.
+impl Request {
+    pub(crate) fn resolve_durable_zero_write(self:&Arc<Self>,
+        receipt:crate::pending_requests::attempts::DurableZeroWriteOutcome)->Result<(),LeaseError> {
+        let (stamp,actual)=receipt.consume(self).map_err(|_|LeaseError::ResolutionMismatch)?;
+        if !self.managed || !Arc::ptr_eq(self,&stamp.request) || stamp.resume.is_some() {
+            return Err(LeaseError::WrongRequest);
+        }
+        let mut state=self.native.lock().unwrap_or_else(|e|e.into_inner());
+        if state.running || state.settling || state.completion_key.is_some()
+            || !state.progress.proven_zero() || state.progress!=actual || state.plan.as_ref()!=Some(&stamp.plan) {
+            return Err(LeaseError::NativeConflict);
+        }
+        if state.operation.is_none() && state.last_zero_resolution.as_ref().is_some_and(|key|Arc::ptr_eq(key,&stamp.key)) {
+            return Ok(()); // acknowledgement only; no new authority/state transition
+        }
+        if !matches!(&state.operation,Some(ManagedOperation::Attempt { key,phase:AttemptPhase::Started })
+            if Arc::ptr_eq(key,&stamp.key)) { return Err(LeaseError::WrongLease); }
+        state.last_zero_resolution=Some(stamp.key.clone());
+        state.operation=None;
+        // Leave cancellation, final_outcome, status, Plan, age and native facts intact.
+        // New execution still requires its own reservation and current full proof.
+        Ok(())
+    }
+}
+
 // No public success constructor: pending_requests alone issues these tokens from
 // the real store CAS result. This bridge only discharges existing native exclusion.
 impl ZeroWriteEditLease {
@@ -2464,7 +2517,7 @@ mod tests {
             "terminal journal panic escaped the writer or claimed successful completion");
         assert!(req.is_settled());let native=req.native.lock().unwrap();assert!(!native.settling&&native.completion_key.is_none());
     }
-    // UNCOMPILED / UNRUN: insert into existing agent_write::tests.
+    // Managed request and pending-store bridge regression controls.
     // Synthetic durable edit tokens below are test-only fixtures, not authority issuers.
     fn managed_job(plan:Plan,proof:Arc<FakeProof>)->AgentJob {
         let request=Request::new_managed("managed".into(),7,"fixture","digest".into(),&plan);
@@ -2641,7 +2694,7 @@ mod tests {
         let changed=old.clone().with_submit(3,4);
         assert!(matches!(edit.begin_persisting(&changed),Err(LeaseError::PlanChanged)));
         let stamp=edit.begin_persisting(&old).unwrap();
-        // Explicit synthetic trusted-domain receipt. There is no production issuer yet.
+        // Explicit synthetic receipt for this isolated writer-layer test; real issuance is store-owned.
         edit.resolve(DurableEditResolution::Committed(DurableEditCommit{stamp})).unwrap();
         assert_eq!(req.native_progress(),progress);assert!(!req.is_cancelled());
         assert!(matches!(req.reserve_attempt(&changed,None),Err(LeaseError::NativeConflict)));

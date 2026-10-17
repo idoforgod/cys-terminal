@@ -134,11 +134,11 @@ fn validate_outcome(plan:&ExactPlan,a:&AttemptRecord,o:&Outcome,limits:AttemptLi
     }
     if o.kind==OutcomeKind::WrittenSubmitted && !o.envelope.submitted { return Err(StoreError::Invalid("attempt absent submit")); }
     if o.writing_confirmed && a.writing.is_none() { return Err(StoreError::Invalid("attempt Writing receipt absent")); }
-    // A failed resumed Writing barrier can report the already accepted parent prefix.
+    // A failed Writing barrier or undispatched decline can retain the accepted parent prefix.
     // It owns no new native call/byte; storing that fact never releases the held lease.
     let unchanged_resume=a.resume==Some(o.envelope) && a.resume_parent.is_some()
         && o.native.accepted_total==a.before.accepted_total && o.accepted==Accepted::default()
-        && !o.writing_confirmed && o.writing_uncertain;
+        && !o.writing_confirmed;
     if a.writing.is_none() && (accepted_total(o.accepted)?>0 || matches!(o.kind,OutcomeKind::WrittenBody|OutcomeKind::WrittenSubmitted)
         || (o.kind==OutcomeKind::PartialExact&&!unchanged_resume)) {
         return Err(StoreError::Invalid("attempt bytes without Writing"));
@@ -254,6 +254,17 @@ impl PreparedAttempt {
             proof,journal:Some(self.journal),resume:self.resume,settle:None,guard:None,note_body:false,body_owner:None })
     }
 }
+/// Issued only from this run's retained real writer receipt AND its committed outcome.
+/// No public constructor/Clone/Deserialize; releasing this exclusion is not write authority.
+pub(crate) struct DurableZeroWriteOutcome {
+    owner:Weak<RuntimeIdentity>,current:Arc<CurrentRequest>,stamp:AttemptStamp,native:NativeProgress,
+}
+impl DurableZeroWriteOutcome {
+    pub(crate) fn consume(self,request:&Arc<Request>)->Result<(AttemptStamp,NativeProgress),ProtocolError> {
+        check_resolution_owner(&self.owner,&self.current,request,&self.current.plan)?;
+        Ok((self.stamp,self.native))
+    }
+}
 struct RuntimeOutcome { actual:Option<Outcome>,stored:Option<Durability> }
 /// Only actual started/completed writer receipts reach this journal. Legacy methods reject.
 /// Retain this Arc in the owning controller until the outcome and required source effects close.
@@ -303,6 +314,27 @@ impl AttemptJournal {
         let actual={self.outcome.lock().unwrap_or_else(|e|e.into_inner()).actual.clone().ok_or(ProtocolError::Missing)?};
         let durability=self.persist_outcome(&actual)?;
         self.outcome.lock().unwrap_or_else(|e|e.into_inner()).stored=Some(durability);Ok(())
+    }
+    pub(super) fn zero_write_receipt(&self)->Result<DurableZeroWriteOutcome,ProtocolError> {
+        let actual={
+            let retained=self.outcome.lock().unwrap_or_else(|e|e.into_inner());
+            retained.stored.ok_or(ProtocolError::Missing)?;
+            retained.actual.clone().ok_or(ProtocolError::Missing)?
+        };
+        if !matches!(actual.kind,OutcomeKind::RefusedNoWrite|OutcomeKind::CancelledBeforeWrite)
+            || !actual.native.proven_zero() { return Err(ProtocolError::Unsupported); }
+        let store=self.live_store()?;let state=store.try_mutation()?;let row=self.row(&store,&state)?;
+        let ledger=row.attempts.as_ref().ok_or(ProtocolError::Missing)?;
+        let entry=ledger.entries.get(&self.number).ok_or(ProtocolError::Missing)?;
+        if ledger.entries.keys().next_back()!=Some(&self.number) || entry.phase!=AttemptPhase::Outcome
+            || entry.outcome.as_ref()!=Some(&actual) { return Err(ProtocolError::Conflict); }
+        Ok(DurableZeroWriteOutcome { owner:Arc::downgrade(&store.identity),current:self.current.clone(),
+            stamp:self.stamp.clone(),native:actual.native })
+    }
+    /// Explicit current-run resolution after storage retry. The writer checks the exact
+    /// original Started operation; no status, cancellation, Plan or source state is reset.
+    pub fn resolve_stored_zero_write(&self)->Result<(),ProtocolError> {
+        self.current.request.resolve_durable_zero_write(self.zero_write_receipt()?)?;Ok(())
     }
     pub fn has_stored_outcome(&self)->bool { self.stored_durability().is_some() }
     pub fn stored_durability(&self)->Option<Durability> { self.outcome.lock().unwrap_or_else(|e|e.into_inner()).stored }

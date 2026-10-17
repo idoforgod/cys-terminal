@@ -1,4 +1,4 @@
-// EVIDENCE DRAFT / UNCOMPILED. Requires root managed-lease/PlanView APIs and real authority adapters.
+// Durable storage/current-run ownership. Native authority is supplied by actual external adapters.
 //! Bounded retention for pending agent requests. Storage only: no retries or replay.
 #![allow(dead_code)]
 //! Opaque terminal evidence is retained data, NOT validated writer success.
@@ -1100,9 +1100,9 @@ impl PendingStore {
     }
 }
 
-// DRAFT / UNCOMPILED. Insert in pending_requests.rs before its test module.
-// This is durable ingress/INITIAL selection only: no scheduler, attempt state,
-// submit mutation, zero-write rebind or receipt/settlement implementation.
+// Durable ingress/initial selection under actual store-issued current ownership.
+// Attempts live in pending_attempts.rs; submit/rebind/source settlement are separate
+// runtime integration steps and must not be inferred from stored data.
 use crate::agent_write::{EditStamp,LeaseError,Plan,Request,ZeroWriteEditLease};
 use crate::input_intent::{InputIntent,TargetKind};
 use crate::receiver::{Epochs,ProofClass,WeakRisk};
@@ -3032,6 +3032,156 @@ fn c8attempt_resumed_writing_failure_can_record_unchanged_prior_prefix() {
     let rows=store.attempt_summaries(current.id()).unwrap();assert_eq!(rows.last().unwrap().outcome,Some(attempts::OutcomeKind::PartialExact));
     assert_eq!(rows.last().unwrap().accepted,Some(Accepted::default()));assert_eq!(rows.last().unwrap().native.unwrap().envelope,prefix);assert_eq!(written,before);
     assert!(matches!(current.request().reserve_attempt(current.plan(),Some(prefix)),Err(LeaseError::Busy)),"outcome retry must not release native execution authority");
+}
+
+#[test]
+fn c8reconcile_stored_zero_outcome_releases_only_for_same_request_retry() {
+    use crate::agent_write::{self,PassThrough,Terminal,LeaseError};
+    let scratch=Scratch::new("reconcile-zero");let disk=Arc::new(SwitchDisk { fail:AtomicBool::new(false) });
+    let store=Arc::new(PendingStore::open_registry_with(&scratch.0,11,attempt_store_limits(),Some(registry_limits()),disk.clone()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("reconcile")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("original").with_submit(0,0));let id=current.id().to_owned();let created=current.received_at();
+    let p=attempt_prepare(&store,&current,None);let journal=p.journal();let job=p.into_job(Arc::new(PassThrough)).unwrap();disk.fail.store(true,Ordering::Release);let mut bytes=Vec::new();
+    let ex=attempt_execute(&mut bytes,&job);assert!(matches!(agent_write::finish(job,&ex),Terminal::RefusedNoWrite{..}));
+    assert!(journal.resolve_stored_zero_write().is_err());assert!(matches!(current.request().reserve_attempt(current.plan(),None),Err(LeaseError::Busy)));
+    disk.fail.store(false,Ordering::Release);journal.retry_outcome().unwrap();
+    assert!(matches!(current.request().reserve_attempt(current.plan(),None),Err(LeaseError::Busy)),"storage retry alone released native ownership");
+    let result=journal.resolve_stored_zero_write();assert!(result.is_ok(),"actual stored zero result failed to release its own reservation: {result:?}");
+    let p=attempt_prepare(&store,&current,None);assert_eq!(p.number(),2);let job=p.into_job(Arc::new(PassThrough)).unwrap();let ex=attempt_execute(&mut bytes,&job);
+    assert!(matches!(agent_write::finish(job,&ex),Terminal::WrittenSubmitted{..}));assert_eq!(bytes,b"original\r");assert_eq!(current.id(),id);assert_eq!(current.received_at(),created);assert_eq!(store.inventory().unwrap().len(),1);
+}
+struct NoDispatchProof;
+impl crate::agent_write::Proof for NoDispatchProof {
+    fn admit(&self)->Result<(),crate::receiver::ProofLoss>{panic!("undispatched refusal must not collect native proof")}
+    fn recheck(&self,_:crate::agent_write::Phase)->Result<(),crate::receiver::ProofLoss>{self.admit()}
+}
+#[test]
+fn c8reconcile_declined_prepared_attempt_is_recorded_without_native_io() {
+    use crate::agent_write::{self,PassThrough,Terminal};
+    let scratch=Scratch::new("reconcile-declined");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("reconcile")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("original").with_submit(0,0));
+    let p=attempt_prepare(&store,&current,None);let journal=p.journal();let job=p.into_job(Arc::new(NoDispatchProof)).unwrap();let terminal=agent_write::decline_unstarted(job,"queue_full");
+    assert!(matches!(terminal,Terminal::RefusedNoWrite{..}));assert!(current.request().native_progress().proven_zero());
+    assert_eq!(store.attempt_summaries(current.id()).unwrap()[0].phase,attempts::AttemptPhase::Outcome,"unstarted decline left a durable Prepared orphan");
+    assert!(journal.has_stored_outcome());let data:serde_json::Value=serde_json::from_slice(&fs::read(scratch.0.join(DATA)).unwrap()).unwrap();
+    assert!(data["rows"][0]["attempts"]["entries"]["1"]["writing"].is_null());assert_eq!(data["rows"][0]["attempts"]["entries"]["1"]["outcome"]["accepted"]["calls"],0);
+    let p=attempt_prepare(&store,&current,None);let job=p.into_job(Arc::new(PassThrough)).unwrap();let mut bytes=Vec::new();let ex=attempt_execute(&mut bytes,&job);
+    assert!(matches!(agent_write::finish(job,&ex),Terminal::WrittenSubmitted{..}));assert_eq!(bytes,b"original\r");
+}
+#[test]
+fn c8reconcile_declined_resume_preserves_prefix_and_first_loss_time() {
+    use crate::agent_write::{self,PassThrough,Terminal};
+    let scratch=Scratch::new("reconcile-declined-resume");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("reconcile")).unwrap();let body="x".repeat(10000);let current=attempt_current(&store,&cap,Plan::raw(&body).with_submit(0,0));
+    let p=attempt_prepare(&store,&current,None);let job=p.into_job(Arc::new(AttemptCut(std::sync::atomic::AtomicUsize::new(0)))).unwrap();let mut bytes=Vec::new();let first=attempt_execute(&mut bytes,&job);let prefix=first.envelope;
+    assert!(matches!(agent_write::finish(job,&first),Terminal::PartialExact{..}));let lost=current.request().lost_at();assert!(lost.is_some());let before=bytes.clone();
+    let p=attempt_prepare(&store,&current,Some(prefix));let journal=p.journal();let job=p.into_job(Arc::new(NoDispatchProof)).unwrap();let terminal=agent_write::decline_unstarted(job,"queue_full");
+    assert!(matches!(terminal,Terminal::PartialExact{..}),"decline did not retain the actual pre-existing exact prefix: {terminal:?}");
+    assert!(journal.has_stored_outcome());assert_eq!(current.request().lost_at(),lost);assert_eq!(bytes,before);assert_eq!(current.request().native_progress().run_accepted,Default::default());
+    let p=attempt_prepare(&store,&current,Some(prefix));let job=p.into_job(Arc::new(PassThrough)).unwrap();let ex=attempt_execute(&mut bytes,&job);
+    assert!(matches!(agent_write::finish(job,&ex),Terminal::WrittenSubmitted{..}));assert_eq!(bytes,[body.as_bytes(),b"\r"].concat());
+}
+
+fn reconcile_failed_zero_finish(store:&Arc<PendingStore>,current:&Arc<CurrentRequest>,disk:&Arc<SwitchDisk>)->Arc<attempts::AttemptJournal> {
+    use crate::agent_write::{self,Terminal};
+    let p=attempt_prepare(store,current,None);let journal=p.journal();let job=p.into_job(Arc::new(AttemptRefusal)).unwrap();let mut bytes=Vec::new();let ex=attempt_execute(&mut bytes,&job);
+    disk.fail.store(true,Ordering::Release);assert!(matches!(agent_write::finish(job,&ex),Terminal::RefusedNoWrite{..}));assert!(bytes.is_empty());
+    disk.fail.store(false,Ordering::Release);journal.retry_outcome().unwrap();journal
+}
+#[test]
+fn c8reconcile_old_receipt_cannot_release_a_new_started_attempt_or_another_request() {
+    use crate::agent_write::LeaseError;
+    let scratch=Scratch::new("reconcile-stale");let disk=Arc::new(SwitchDisk { fail:AtomicBool::new(false) });
+    let store=Arc::new(PendingStore::open_registry_with(&scratch.0,11,attempt_store_limits(),Some(registry_limits()),disk.clone()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("reconcile")).unwrap();let a=attempt_current(&store,&cap,Plan::raw("same"));let b=attempt_current(&store,&cap,Plan::raw("same"));
+    let first=reconcile_failed_zero_finish(&store,&a,&disk);let wrong=first.zero_write_receipt().unwrap();
+    assert!(b.request().resolve_durable_zero_write(wrong).is_err());
+    let stale=first.zero_write_receipt().unwrap();first.resolve_stored_zero_write().unwrap();let second=reconcile_failed_zero_finish(&store,&a,&disk);
+    assert!(a.request().resolve_durable_zero_write(stale).is_err(),"stale receipt released another Started attempt");
+    assert!(matches!(a.request().reserve_attempt(a.plan(),None),Err(LeaseError::Busy)));second.resolve_stored_zero_write().unwrap();
+    let third=attempt_prepare(&store,&a,None);assert_eq!(third.number(),3);
+    assert!(first.resolve_stored_zero_write().is_err());
+    assert!(matches!(a.request().reserve_attempt(a.plan(),None),Err(LeaseError::Busy)),"old journal released a newer Prepared attempt");
+}
+#[test]
+fn c8reconcile_cancelled_zero_resolution_preserves_cancellation() {
+    use crate::agent_write::{self,Terminal,LeaseError};
+    let scratch=Scratch::new("reconcile-cancelled-zero");let disk=Arc::new(SwitchDisk { fail:AtomicBool::new(false) });
+    let store=Arc::new(PendingStore::open_registry_with(&scratch.0,11,attempt_store_limits(),Some(registry_limits()),disk.clone()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("reconcile")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("original"));
+    let p=attempt_prepare(&store,&current,None);let journal=p.journal();let job=p.into_job(Arc::new(NoDispatchProof)).unwrap();current.request().cancel();disk.fail.store(true,Ordering::Release);
+    assert!(matches!(agent_write::decline_unstarted(job,"queue_full"),Terminal::CancelledBeforeWrite));disk.fail.store(false,Ordering::Release);journal.retry_outcome().unwrap();journal.resolve_stored_zero_write().unwrap();
+    assert!(current.request().is_cancelled());assert!(matches!(current.request().status(),agent_write::Status::Terminal(Terminal::CancelledBeforeWrite)));
+    assert!(matches!(current.request().reserve_attempt(current.plan(),None),Err(LeaseError::Cancelled)),"native cleanup revived a cancelled request");
+}
+#[test]
+fn c8reconcile_cancelled_resume_decline_is_not_advertised_as_resumable() {
+    use crate::agent_write::{self,Terminal};
+    let scratch=Scratch::new("reconcile-cancelled-resume");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("reconcile")).unwrap();let current=attempt_current(&store,&cap,Plan::raw(&"x".repeat(10000)).with_submit(0,0));
+    let p=attempt_prepare(&store,&current,None);let job=p.into_job(Arc::new(AttemptCut(std::sync::atomic::AtomicUsize::new(0)))).unwrap();let mut bytes=Vec::new();let ex=attempt_execute(&mut bytes,&job);let prefix=ex.envelope;
+    assert!(matches!(agent_write::finish(job,&ex),Terminal::PartialExact{..}));let before=bytes.clone();let p=attempt_prepare(&store,&current,Some(prefix));let journal=p.journal();let job=p.into_job(Arc::new(NoDispatchProof)).unwrap();current.request().cancel();
+    let terminal=agent_write::decline_unstarted(job,"queue_full");assert!(matches!(terminal,Terminal::PartialUnknown{..}),"cancelled partial was advertised as resumable: {terminal:?}");
+    assert!(journal.has_stored_outcome());assert!(journal.resolve_stored_zero_write().is_err());assert_eq!(bytes,before);
+}
+#[test]
+fn c8reconcile_success_partial_and_uncertain_receipts_never_mint_zero_release() {
+    use crate::agent_write::{self,PassThrough,Terminal};
+    struct Panics;
+    impl std::io::Write for Panics {fn write(&mut self,_:&[u8])->io::Result<usize>{panic!("controlled native write panic")}fn flush(&mut self)->io::Result<()>{Ok(())}}
+    for case in ["empty-success","partial","unknown"] {
+        let scratch=Scratch::new(case);let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+        let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("reconcile")).unwrap();let plan=if case=="empty-success"{Plan::raw("")}else{Plan::raw(&"x".repeat(10000))};let current=attempt_current(&store,&cap,plan);
+        let p=attempt_prepare(&store,&current,None);let journal=p.journal();let proof:Arc<dyn agent_write::Proof>=if case=="partial"{Arc::new(AttemptCut(std::sync::atomic::AtomicUsize::new(0)))}else{Arc::new(PassThrough)};let job=p.into_job(proof).unwrap();
+        let ex=if case=="unknown" {attempt_execute(&mut Panics,&job)}else{attempt_execute(&mut Vec::new(),&job)};let terminal=agent_write::finish(job,&ex);
+        match case {"empty-success"=>{assert!(matches!(terminal,Terminal::WrittenBody{..}));assert!(current.request().native_progress().proven_zero());},"partial"=>assert!(matches!(terminal,Terminal::PartialExact{..})),_=>assert!(matches!(terminal,Terminal::PartialUnknown{..}))}
+        assert!(journal.has_stored_outcome());assert!(journal.zero_write_receipt().is_err(),"non-refusal outcome minted zero-release authority: {case}");
+    }
+}
+#[test]
+fn c8reconcile_zero_release_waits_for_actual_finish_to_leave_its_settlement() {
+    use crate::agent_write::{self,Journal,Terminal};
+    struct ErrorAfterStore(Arc<attempts::AttemptJournal>);
+    impl Journal for ErrorAfterStore {
+        fn writing(&self,r:&agent_write::Request)->io::Result<()>{self.0.writing(r)}
+        fn terminal(&self,r:&agent_write::Request,t:&Terminal,e:&agent_write::Envelope)->io::Result<()>{self.0.terminal(r,t,e)}
+        fn writing_attempt(&self,c:&agent_write::ProofContext<'_>,r:Option<&agent_write::AttemptStartReceipt<'_>>)->io::Result<()>{self.0.writing_attempt(c,r)}
+        fn terminal_receipt(&self,r:&agent_write::WriterReceipt<'_>)->io::Result<()>{self.0.terminal_receipt(r)?;Err(io::Error::other("after actual store success"))}
+    }
+    let scratch=Scratch::new("reconcile-settling");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("reconcile")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned"));
+    let p=attempt_prepare(&store,&current,None);let journal=p.journal();let mut job=p.into_job(Arc::new(AttemptRefusal)).unwrap();job.journal=Some(Arc::new(ErrorAfterStore(journal.clone())));
+    let rejected=Arc::new(AtomicBool::new(false));let result=rejected.clone();let inside=journal.clone();job.settle=Some(Box::new(move |_|result.store(inside.resolve_stored_zero_write().is_err(),Ordering::Release)));
+    let ex=attempt_execute(&mut Vec::new(),&job);assert!(matches!(agent_write::finish(job,&ex),Terminal::RefusedNoWrite{..}));
+    assert!(rejected.load(Ordering::Acquire),"release overtook actual finish/settlement ownership");journal.resolve_stored_zero_write().unwrap();assert!(current.request().reserve_attempt(current.plan(),None).is_ok());
+}
+#[test]
+fn c8reconcile_decline_wrong_job_has_no_outcome_or_settlement_authority() {
+    use crate::agent_write::{self,Terminal};
+    let scratch=Scratch::new("reconcile-wrong-decline");let store=Arc::new(PendingStore::open_with_registry(&scratch.0,11,attempt_store_limits(),registry_limits()).unwrap());
+    let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("reconcile")).unwrap();let a=attempt_current(&store,&cap,Plan::raw("same"));let b=attempt_current(&store,&cap,Plan::raw("same"));
+    let p=attempt_prepare(&store,&a,None);let journal=p.journal();let mut job=p.into_job(Arc::new(NoDispatchProof)).unwrap();job.request=b.request().clone();
+    let settled=Arc::new(AtomicBool::new(false));let flag=settled.clone();job.settle=Some(Box::new(move |_|flag.store(true,Ordering::Release)));
+    assert!(matches!(agent_write::decline_unstarted(job,"queue_full"),Terminal::PartialUnknown{..}));
+    assert!(!settled.load(Ordering::Acquire)&&!journal.has_stored_outcome(),"wrong decline closed another request");
+    assert_eq!(store.attempt_summaries(a.id()).unwrap()[0].phase,attempts::AttemptPhase::Prepared);
+}
+
+#[test]
+fn c8reconcile_repeat_ack_is_idempotent_only_before_new_ownership() {
+    use crate::agent_write::{self,Terminal};
+    for next in ["attempt","edit"] {
+        let scratch=Scratch::new("reconcile-repeat-ack");let disk=Arc::new(SwitchDisk { fail:AtomicBool::new(false) });
+        let store=Arc::new(PendingStore::open_registry_with(&scratch.0,11,attempt_store_limits(),Some(registry_limits()),disk.clone()).unwrap());
+        let cap=store.register_catalog(registry_scope(),fresh_registry_catalog("reconcile")).unwrap();let current=attempt_current(&store,&cap,Plan::raw("owned"));
+        let journal=reconcile_failed_zero_finish(&store,&current,&disk);let stale=journal.zero_write_receipt().unwrap();journal.resolve_stored_zero_write().unwrap();
+        assert!(journal.resolve_stored_zero_write().is_ok(),"same completed resolution cannot acknowledge an unchanged retry");
+        if next=="attempt" {
+            let p=attempt_prepare(&store,&current,None);let job=p.into_job(Arc::new(NoDispatchProof)).unwrap();
+            assert!(matches!(agent_write::decline_unstarted(job,"queue_full"),Terminal::RefusedNoWrite{..}));
+        } else { drop(current.request().reserve_zero_write_edit().unwrap()); }
+        assert!(current.request().native_progress().proven_zero());
+        assert!(current.request().resolve_durable_zero_write(stale).is_err(),"old acknowledgement survived new {next} ownership");
+    }
 }
 
 }
