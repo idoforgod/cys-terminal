@@ -248,6 +248,9 @@ pub enum Origin {
     /// 외부 채널(inbox) 봉투 주입
     Channel,
     /// 빈 좌석 승계 고지(`# [cys] …` 주석 주입)
+    /// ★(0.14.52 · S-a C6d) no producer any more (the notice is event-only); kept in the origin vocabulary that ledger readers
+    /// (the mission-gate hook) know from older ledger lines.
+    #[allow(dead_code)]
     SeatTakeover,
     /// ★GUI 가 **프로그램적으로 만든** 주입(전출 지시·노드 재기동 명령·경로 삽입 등).
     /// 오퍼레이터 토큰이 붙어 있어도 **기록한다** — 사람이 앉은 세션이라는 사실과 사람이 친
@@ -268,6 +271,8 @@ pub enum Origin {
     ///
     /// `SeatTakeover` 와 같은 성격이다: 사용자에게 **보여 주려고** pane 에 밀어 넣는 기계
     /// 문장이므로 원장에 근거가 있어야 한다. 없으면 임무 게이트가 이 주석을 오너 임무로 읽는다.
+    /// ★(0.14.52 · S-a C6d) no producer any more (the npm advisory is event-only); kept in the origin vocabulary like `SeatTakeover`.
+    #[allow(dead_code)]
     EnvAdvisory,
     /// ★(0.14.31 · WP-5 L) 큐 배달 **영수증** — 선기록(`Queue`) 뒤 writer `try_send` 성공 시각을
     /// 남기는 **별도 줄**. `sha256` 은 본문 해시가 **아니라** `queue-receipt:<id>` 의 해시다:
@@ -308,6 +313,8 @@ impl Origin {
 /// 인계 시각)이 **분리**돼 있어 "기록됐으나 인계되지 못한" 배달(다음 틱 재시도)과 실제 인계를
 /// 원장만으로 가른다. 인계 뒤 이 줄을 쓰기 전에 데몬이 죽으면 그 배달은 '인계 불명' 으로 남는다
 /// (정직한 결손 — 사후 재구성하지 않는다).
+/// ★(0.14.52 · S-a) The queue now writes this line from the writer's settlement, only after the body and
+/// its Return were written (`governance::settle_queue_write`); `delivered_at` is that moment.
 ///
 /// 판독자 호환: `v`=1 · `surface`·`ts_epoch`·`sha256` 필수 키 보유(javis_mission 은 sha 로 색인하나
 /// 이 sha 는 어떤 프롬프트와도 일치하지 않는다) · origin `queue_receipt`(계수 분리).

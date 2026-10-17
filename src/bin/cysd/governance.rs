@@ -201,6 +201,8 @@ pub fn spawn_watchdog(daemon: Arc<Daemon>) {
                 check_load(&daemon, &mut last_load_alert);
                 check_surfaces(&daemon, &sys, &mut last_dup_alert, &mut last_proc_alert);
                 check_idle(&daemon);
+                // ★(0.14.52 · S-a C5b) Held legacy bodies past their window or of a changed agent -> undelivered event.
+                crate::handlers::sweep_held_submits(&daemon);
                 // ★(0.14.42 · 수정 2회차 F1 · 재개) 보류한 제출 CR 의 재제출 — 큐 배달 **앞**(입력줄 잔여가 그 좌석 큐를
                 //   세우지 않게). pause 중에는 아무것도 하지 않는다(기록 유지).
                 resubmit_withheld_submits(&daemon);
@@ -846,6 +848,7 @@ fn check_agent_death_with_model(
                             // 의미론: 허위 DEAD 과도기 없이 사망감지 상태머신을 정직하게 무장.
                             s.agent_seen.store(true, Ordering::Relaxed);
                             s.agent_exit_notified.store(false, Ordering::Relaxed);
+                            s.bump_agent_epoch(); // ★(0.14.52 · S-a C5b) a new agent incarnation
                             *s.pending_agent_obs.lock().unwrap() = None;
                             drop(display_write);
                             let role = s.role.lock().unwrap().clone();
@@ -922,6 +925,7 @@ fn check_agent_death_with_model(
         if alive {
             s.agent_seen.store(true, Ordering::Relaxed);
             if s.agent_exit_notified.swap(false, Ordering::Relaxed) {
+                s.bump_agent_epoch(); // ★(0.14.52 · S-a C5b) a recovered agent is a new incarnation
                 // 재기동 성공 — 카운터 유지(수명 내 상한 3회), 복귀 이벤트
                 daemon.bus.publish(
                     "agent.recovered",
@@ -938,6 +942,7 @@ fn check_agent_death_with_model(
         if s.agent_exit_notified.swap(true, Ordering::Relaxed) {
             continue; // 이미 통지
         }
+        s.bump_agent_epoch(); // ★(0.14.52 · S-a C5b) bodies held for the dead agent never bind to its successor
         // ★(R3SH-4) 에이전트가 죽었다 — 그 에이전트의 사이클 창 표지는 더 붙잡을 것이 없다(다음에 앉는 에이전트의 각성 지시를
         //   막지 않게 지금 푼다).
         release_quiescing(daemon, &s, "agent_exited");
@@ -6377,8 +6382,16 @@ fn resubmit_withheld_one(
     {
         let _gate = s.input_gate.lock().unwrap();
         // 게이트 안 재확인(원자·leaf 판독뿐) — 관측과 인계 사이에 직접 send·사람 키가 끼었으면 이번 틱은 쓰지 않는다.
+        // ★(0.14.52 · S-a C7d · I10) The count is the one the withheld Return's settlement left (its body, byte-exact) at
+        //   that input generation - or 0 for a record whose Return was counted at hand-off (this path's own re-withhold).
+        let count_ok = match w.expect {
+            Some((count, gen)) => {
+                s.pending_input_bytes.load(Ordering::Relaxed) == count && s.input_gen.load(Ordering::Acquire) == gen
+            }
+            None => s.pending_input_bytes.load(Ordering::Relaxed) == 0,
+        };
         if s.inject_track.last_body().map(|b| b.at) != Some(w.body_at)
-            || s.pending_input_bytes.load(Ordering::Relaxed) != 0
+            || !count_ok
             || !s.inject_track.clear_withheld_if(at)
         {
             return "raced";
@@ -6578,6 +6591,9 @@ pub(crate) enum MachineInjector {
     Channel,
     Ceo,
     Supervisor,
+    /// ★(0.14.52 · S-a C6d) no producer any more (the takeover notice is event-only); the knob token `takeover` stays accepted so
+    /// existing `CYS_MACHINE_INJECT_HOLD` values keep their meaning.
+    #[allow(dead_code)]
     Takeover,
 }
 
@@ -7344,7 +7360,7 @@ pub(crate) struct PendingInputState {
     /// 같은 호출에서 모델 판정에 쓴 전경 값으로 바꿔 적는다(저장 상태에는 임시 값이 남지 않는다 · 전경을 모르는 비-unix 는 0).
     /// 서는 곳은 [`pending_input_step_model`] 의 V3 면제 갈래에서 `사람 출처 ∧ 단독 Esc` 일 때뿐이다(BS/DEL·기계 출처 Esc·V2 는 세우지 않는다 — V2 는 Esc 를 계수에 더한다).
     /// 내려가는 곳: 같은 함수의 리셋(봉투 밖 `\n`·`\r`(Meta-Enter 제외)·0x15·0x03 — 출처 무관) · `Surface::clear_pending_input`(Default — 큐 직접 send `clear_first`·stale 리셋) ·
-    /// 줄이 비었다/제출됐다고 계상하는 인계(`Surface::take_esc_exempt` — 큐 인계 · 스케줄 push 인계 `inject_on`; 롤백은 직전 값을 복원) · 틱의 되돌리기(`Surface::recount_exempted_esc`).
+    /// 줄이 비었다/제출됐다고 계상하는 인계(`Surface::take_esc_exempt` — 큐 인계 · 스케줄 push 정산 `ScheduleSettle::reset_submitted_line` (0.14.52 S-a C6a: after the written Return); 롤백은 직전 값을 복원) · 틱의 되돌리기(`Surface::recount_exempted_esc`).
     /// 왜 두나: 면제는 "에이전트 TUI 가 그 Esc 를 읽는다"는 전제 위에 있다 — 에이전트가 읽지 않은 채 전경에서 사라지면 셸 줄 편집기가 그 Esc 를 받아 다음 주입의 첫 글자가 먹힌다(적대 검증 M-1 ⓐ).
     /// 틱은 이 표식이 서 있는 좌석의 지금 전경 그룹이 면제 당시 그룹이 아닌 것을 커널에 물어 보면 계수를 1 로 되돌린다(감산이 아니라 가산 정정 · [`esc_recount_due`]).
     /// 원자 미러는 `Surface::esc_exempt_pgid`(unix · 진실은 이 필드).
@@ -7740,7 +7756,7 @@ pub(crate) fn prompt_boundary_verdict(
 /// agents.json 은 user-owned 이라 팩 갱신은 Keep + `.new` 로 병치된다. 따라서 읽기 병합기에서
 /// 메모리만 승격하고 디스크는 쓰지 않는다(W-B). 커서행의 composer 후보는 같은 관측 프레임에서
 /// 행 선두(공백 제외)에 맞는 후보 중 가장 긴 것을 택하고, 그 뒤의 글리프는 초안으로 보존한다.
-fn merged_prompt_marker(
+pub(crate) fn merged_prompt_marker(
     disk: &serde_json::Value,
     embed: &serde_json::Value,
     agent: &str,
@@ -8021,6 +8037,12 @@ pub(crate) const BLOCKED_QUIESCING: &str = "quiescing(사이클 진행 중 · /c
 /// 원장 줄이 매 틱 쌓였다. 이 보류는 다음 틱에 스스로 풀린다(기아 집계 제외).
 pub(crate) const BLOCKED_SETTLE_BUDGET: &str =
     "settle_budget(이 틱의 인계 결판 예산 소진 — 다음 틱이 이 좌석부터 시작한다)";
+/// ★(0.14.52 · S-a) The writer refused this seat's last hand-off before any byte (receiver proof or
+/// journal) — retried on backoff 1, 2, 4, 8, then 30 s (design 4.6). Resolves by itself.
+pub(crate) const BLOCKED_RECEIVER_HELD: &str = "receiver_held(쓰기 전 수신자 증명·기록 실패 — 1·2·4·8·30초 간격 재시도)";
+/// ★(0.14.52 · S-a) An agent write stopped mid-request: never retyped, the composer is not erased;
+/// automatic delivery to this seat waits for that request's reconciliation (design 4.6 / S4-1).
+pub(crate) const BLOCKED_PARTIAL_WRITE: &str = "partial_write(요청 도중 멈춘 에이전트 쓰기 — 다시 치지 않고 보류 · 정리 대기)";
 
 pub(crate) fn prompt_gate_verdict(i: &PromptGateInput) -> PromptGate {
     // ★(0.14.31 · 리뷰 R5 · codex major) **발행 중 프레임은 어느 경로에서도 판정 재료가 아니다.**
@@ -8916,6 +8938,12 @@ pub(crate) fn queue_remedy(blocked_by: &str, d: &QueueBlockDiag) -> (&'static st
             code,
             format!("출력 중 표지가 보이지만 {q}초째 출력이 없다 — 표지가 낡은 화면 사본일 수 있다({}). 그래도 이어지면 그 창 화면을 확인", promise(d)),
         )
+    } else if blocked_by.starts_with("receiver_held") {
+        // ★(0.14.52 · S-a) calm: the daemon retries on its own backoff (no human action, no OS banner).
+        ("wait", "쓰기 전 수신자 증명·기록이 실패했다 — 한 바이트도 쓰지 않았고 항목은 큐에 있다 · 1·2·4·8·30초 간격으로 스스로 다시 시도한다".into())
+    } else if blocked_by.starts_with("partial_write") {
+        // ★(0.14.52 · S-a) calm for the owner: reconciliation belongs to the lane master (design 4.6), not to an owner key.
+        ("wait", "에이전트 쓰기가 요청 도중 멈췄다 — 데몬은 입력줄을 지우지도 더 치지도 않는다 · 그 요청이 정리될 때까지 이 좌석의 자동 배달을 보류한다(항목·W-id 보존 · 정리는 그 레인의 master 몫)".into())
     } else if REMEDY_WAIT_PREFIXES.iter().any(|p| blocked_by.starts_with(p)) {
         ("wait", "일시 보류 — 스스로 풀린다(오래 지속되면 그 창 화면을 확인)".into())
     } else {
@@ -9432,14 +9460,41 @@ pub(crate) fn render_queue_digest(from: Option<&str>, texts: &[String]) -> Strin
 
 /// ★G1(W2-D): 배달 성과 — deliver_head_locked 의 반환값. queue.deliver RPC(W2-E)가
 /// 응답({queue_entry_id, seq, remaining})을 조립하는 재료를 겸한다.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Delivered {
     pub entry: crate::state::QueueEntry,
     pub remaining: usize,
     /// ★B1(0.14.30): 이 배달에 함께 실린 항목 id 전량(머리 포함 · 단건이면 1개).
     pub merged_ids: Vec<String>,
-    /// 실제로 주입된 본문(병합이면 다이제스트 · 단건이면 항목 원문과 동일).
+    /// Planned body (a digest when merged); its existence is not evidence it was written.
     pub body: String,
+}
+
+/// Transport acceptance is distinct from the writer's terminal result. Existing callers may
+/// inspect planned item fields, but must inspect this outcome before announcing delivery.
+#[derive(Debug)]
+pub(crate) struct QueueHandoff {
+    delivery: Delivered,
+    pub request_id: String,
+    status: crate::agent_write::Status,
+    guard_outcome: crate::state::InjectHandoff,
+}
+impl std::ops::Deref for QueueHandoff {
+    type Target=Delivered;
+    fn deref(&self)->&Delivered { &self.delivery }
+}
+impl QueueHandoff {
+    pub(crate) fn written_submitted(&self)->bool {
+        !matches!(self.guard_outcome,crate::state::InjectHandoff::InvalidState(_))
+            && matches!(&self.status,crate::agent_write::Status::Terminal(crate::agent_write::Terminal::WrittenSubmitted{..}))
+    }
+    pub(crate) fn written_state(&self)->&'static str {
+        if matches!(self.guard_outcome,crate::state::InjectHandoff::InvalidState(_)) { return "invalid_guard"; }
+        match &self.status {
+            crate::agent_write::Status::AcceptedPending | crate::agent_write::Status::Writing=>"pending",
+            crate::agent_write::Status::Terminal(terminal)=>terminal.kind(),
+        }
+    }
 }
 
 /// ★G1(W2-D): 배달 임계영역 **단일 헬퍼** — watchdog 틱(deliver_queued)과 queue.deliver
@@ -9548,6 +9603,7 @@ fn handoff_gate_ok(
 /// ★(0.14.31 · 리뷰 R1 · codex blocking) 인계 가드가 걸린 배달의 **롤백 재료** — writer 가 쓰기를
 /// 포기했을 때(화면 세대가 흘렀다) 되돌릴 것들. 락 밖에서 결판을 기다려야 하므로(대기 중 큐 락을
 /// 쥐고 있으면 `queue.list`·enqueue·persist 가 막힌다) 임계영역에서 미리 떠 둔다.
+#[derive(Clone)]
 struct InflightInject {
     guard: Option<std::sync::Arc<crate::state::InjectGuard>>,
     /// 인계 직전의 `last_queue_delivery_at`(배달 최소 간격 시계).
@@ -9586,39 +9642,7 @@ fn rollback_aborted_inject(
     f: &InflightInject,
     delivered: &Delivered,
 ) {
-    let (still_queued, disposed) = {
-        let q = s.pending_queue.lock().unwrap();
-        let _gate = s.input_gate.lock().unwrap();
-        // ★(triage codex 보완) 예약 해제도 **이 임계영역 안에서** — 종전에는 호출부가 먼저 풀고
-        //   그 뒤 여기서 표식을 되돌려, 그 사이 새 인계가 시작되면 롤백이 남의 상태를 되돌렸다.
-        *s.inject_reservation.lock().unwrap() = None;
-        // ★(리뷰 R1 · codex A2-iv) 되돌림은 **내가 쓴 값이 그대로일 때만** — 결판을 기다리는
-        //   동안 사람이 치거나 다른 주입이 있었다면 그 사실이 최신이고, 옛 값으로 덮으면 그것이
-        //   곧 새 오류다(입력줄 점유를 잘못 알면 큐 본문이 사람 문장과 합쳐진다).
-        if s.input_gen.load(Ordering::Acquire) == f.pending_gen
-            && s.pending_input_bytes.load(Ordering::Relaxed) == 0
-        {
-            s.set_pending_input(f.prev_pending);
-            // ★(R1F-IN ⓐ) 인계가 내린 잠정 Esc 면제 표식도 같은 조건(내가 쓴 값 그대로일 때만)에서 되살린다 — 쓰이지 않았으니 줄은 인계 전 그대로다(0 이면 무동작).
-            s.restore_esc_exempt(f.prev_esc_exempt_pgid);
-        }
-        let mut alive: Vec<String> = Vec::new();
-        let mut gone: Vec<String> = Vec::new();
-        for e in &f.entries {
-            if q.iter().any(|x| x.id == e.id) {
-                alive.push(e.id.clone());
-            } else {
-                gone.push(e.id.clone());
-            }
-        }
-        (alive, gone)
-    };
-    {
-        let mut t = s.last_queue_delivery_at.lock().unwrap();
-        if *t == f.set_delivery_at {
-            *t = f.prev_delivery_at;
-        }
-    }
+    let Some((still_queued, disposed)) = restore_inflight_marks(s, f) else { return };
     // ★(triage codex 보완) 사유·계수를 **관측 사실**로 적는다 — 종전 `restored` 는 재삽입 건수를
     //   말했고(그 재삽입 자체가 결함이었다) `why` 는 출력 세대 하나로 단정했다. 지금은 세 갈래를
     //   가른다: 화면이 흘렀나 · 처분자가 가져갔나 · 그 밖(승인 대기·마감).
@@ -9650,6 +9674,879 @@ fn rollback_aborted_inject(
         }),
     );
     daemon.persist_queue_state();
+}
+
+/// ★(0.14.52 · S-a) The state half of [`rollback_aborted_inject`], shared with the writer-terminal
+/// refusal path ([`settle_queue_write`]): release the reservation and restore the optimistic hand-off
+/// marks of `f` only where they are still mine. Returns (ids still queued, ids disposed meanwhile).
+/// Compare ownership under the same queue/input transaction used by admission. A stale callback
+/// changes no reservation, counter, hold or clock. The callback may update short leaf state only.
+fn with_owned_inflight_marks<T>(
+    s: &Arc<crate::state::Surface>,
+    f: &InflightInject,
+    update_hold: impl FnOnce(&[String], &[String]) -> T,
+) -> Option<T> {
+    let q = s.pending_queue.lock().unwrap_or_else(|e| e.into_inner());
+    let _input = s.input_gate.lock().unwrap_or_else(|e| e.into_inner());
+    let mut slot = s.inject_reservation.lock().unwrap_or_else(|e| e.into_inner());
+    if !inflight_owner_matches(slot.as_ref(), f.guard.as_ref()) { return None; }
+    if s.input_gen.load(Ordering::Acquire) == f.pending_gen
+        && s.pending_input_bytes.load(Ordering::Relaxed) == 0
+    {
+        s.set_pending_input(f.prev_pending);
+        s.restore_esc_exempt(f.prev_esc_exempt_pgid);
+    }
+    {
+        let mut at = s.last_queue_delivery_at.lock().unwrap_or_else(|e| e.into_inner());
+        if *at == f.set_delivery_at { *at = f.prev_delivery_at; }
+    }
+    let (live, disposed): (Vec<String>, Vec<String>) = f.entries.iter().map(|e| e.id.clone())
+        .partition(|id| q.iter().any(|e| &e.id == id));
+    let result = update_hold(&live, &disposed);
+    *slot = None; // the held disposition is installed before another handoff can enter
+    Some(result)
+}
+
+fn inflight_owner_matches(
+    current: Option<&crate::state::InjectReservation>,
+    expected: Option<&Arc<crate::state::InjectGuard>>,
+) -> bool {
+    match (current, expected) {
+        (Some(current), Some(expected)) => Arc::ptr_eq(&current.guard, expected),
+        (None, None) => true, // unchanged unguarded legacy/fixture transaction
+        _ => false,
+    }
+}
+
+fn restore_inflight_marks(s: &Arc<crate::state::Surface>, f: &InflightInject) -> Option<(Vec<String>, Vec<String>)> {
+    with_owned_inflight_marks(s, f, |live, disposed| (live.to_vec(), disposed.to_vec()))
+}
+
+/// ★(0.14.52 · S-a) The queue family's settlement consumer (design 4.5 table) as the job's settle
+/// closure. It holds only weak references (a request in the writer channel never keeps its seat or
+/// the daemon alive) and runs on the seat's writer thread after the terminal is journaled.
+#[allow(clippy::too_many_arguments)]
+fn queue_write_settle(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    f: InflightInject,
+    d: Delivered,
+    receipt: (f64, String, Option<u64>, Value),
+    request_id: String,
+    forced: bool,
+    overdue: bool,
+    stamp: HandoffStamp,
+) -> crate::agent_write::Settle {
+    let (wd, ws) = (Arc::downgrade(daemon), Arc::downgrade(s));
+    let sid = s.id;
+    Box::new(move |t: &crate::agent_write::Terminal| {
+        if let Some(daemon) = wd.upgrade() {
+            settle_queue_write(&daemon, ws.upgrade(), sid, &f, &d, &receipt, &request_id, forced, overdue, &stamp, t);
+        }
+    })
+}
+
+/// ★(0.14.52 · S-a C7b) What one queue hand-off was written under (S4-1 "same binding epoch and conversation epoch"):
+/// the request itself and the seat's agent and conversation epochs and last human keystroke AT THE HAND-OFF. A resumed
+/// run carries the stamp of the original hand-off, never a new one.
+#[derive(Clone)]
+struct HandoffStamp {
+    request: Arc<crate::agent_write::Request>,
+    /// The original immutable receiver proof; partial bytes never borrow a successor's authority.
+    proof: Arc<dyn crate::agent_write::Proof>,
+    /// The original reservation owner differs from a resumed run's fresh safety guard.
+    reservation_guard: Option<Arc<crate::state::InjectGuard>>,
+    agent_epoch: u64,
+    conversation_epoch: u64,
+    human_at: Option<std::time::Instant>,
+}
+
+impl HandoffStamp {
+    fn of(s: &crate::state::Surface, request: Arc<crate::agent_write::Request>, proof: Arc<dyn crate::agent_write::Proof>, reservation_guard: Option<Arc<crate::state::InjectGuard>>) -> HandoffStamp {
+        HandoffStamp {
+            request,
+            proof,
+            reservation_guard,
+            agent_epoch: s.agent_epoch.load(Ordering::Acquire),
+            conversation_epoch: s.conversation_epoch.load(Ordering::Acquire),
+            human_at: *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()),
+        }
+    }
+    /// The seat is still on the hand-off's agent and conversation.
+    fn epochs_hold(&self, s: &crate::state::Surface) -> bool {
+        s.agent_epoch.load(Ordering::Acquire) == self.agent_epoch
+            && s.conversation_epoch.load(Ordering::Acquire) == self.conversation_epoch
+    }
+}
+
+/// ★(0.14.52 · S-a C7b) The resume material of a PartialExact queue hold (`QueueHold::resume`): what the SAME request
+/// needs to continue from its byte-exact offset through the same settlement, and the evidence its resume predicate
+/// compares (S4-1). The body is the stored hand-off digest (never recomputed from the queue); no second request id.
+pub(crate) struct QueueResume {
+    stamp: HandoffStamp,
+    d: Delivered,
+    receipt: (f64, String, Option<u64>, Value),
+    forced: bool,
+    overdue: bool,
+    entries: Vec<crate::state::QueueEntry>,
+    /// `input_gen` right after the hold's own count update: any later move is foreign input.
+    input_gen: u64,
+    /// The writer's write count at the hold ([`crate::state::InjectTrack::wrote`]): any later write is foreign.
+    wrote: u64,
+    /// A resumed run's claim-time probe found a premise broken (a foreign write or a moved epoch): the re-hold never resumes.
+    void: std::sync::atomic::AtomicBool,
+}
+
+impl QueueResume {
+    /// Specimens: the request's latest proof-loss instant. (`cfg_attr`, not a test-only `cfg`: this file's source pins cut
+    /// the production region at the first test `cfg` attribute - see `expire_entries`.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn lost_at(&self) -> Option<std::time::Instant> {
+        self.stamp.request.lost_at()
+    }
+}
+
+impl std::fmt::Debug for QueueResume {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueueResume")
+            .field("request_id", &self.stamp.request.id)
+            .field("entry_ids", &self.d.merged_ids)
+            .field("input_gen", &self.input_gen)
+            .field("wrote", &self.wrote)
+            .finish()
+    }
+}
+
+/// One queue terminal, per design 4.5:
+/// - WrittenSubmitted: pop the delivered ids, release the reservation, end any hold, then the
+///   receipt, `queue.delivered` (all W-ids) and the WAL - exactly once, and only now.
+/// - RefusedNoWrite / CancelledBeforeWrite (zero bytes): roll the hand-off marks back, keep the
+///   items queued and hold the seat on backoff 1, 2, 4, 8, 30 s; `queue.inject_aborted` once per
+///   hold episode (coalesced). A guard abort was already rolled back by the handing-off caller.
+/// - PartialExact / PartialUnknown: keep the reservation and the items (never retyped, never
+///   popped); the composer is not erased; the input counter reflects the accepted prefix.
+#[allow(clippy::too_many_arguments)]
+fn settle_queue_write(
+    daemon: &Arc<Daemon>,
+    s: Option<Arc<crate::state::Surface>>,
+    sid: u64,
+    f: &InflightInject,
+    d: &Delivered,
+    receipt: &(f64, String, Option<u64>, Value),
+    request_id: &str,
+    forced: bool,
+    overdue: bool,
+    stamp: &HandoffStamp,
+    t: &crate::agent_write::Terminal,
+) {
+    use crate::agent_write::Terminal as T;
+    match t {
+        T::RefusedNoWrite { reason } if reason == crate::agent_write::GUARD_ABORTED
+            && f.guard.as_ref().is_none_or(|g| g.cleanup_owner() != Ok(crate::state::InjectCleanupOwner::Controller)) => {}
+        T::WrittenSubmitted { .. } => {
+            let mut remaining = d.remaining;
+            if let Some(s) = &s {
+                {
+                    let mut q = s.pending_queue.lock().unwrap();
+                    let _gate = s.input_gate.lock().unwrap();
+                    let mut slot = s.inject_reservation.lock().unwrap_or_else(|e| e.into_inner());
+                    if !inflight_owner_matches(slot.as_ref(), stamp.reservation_guard.as_ref()) { return; }
+                    // ★G1(W2-A)+B1: pop 판정은 방금 인계한 항목의 **id 집합** — 동일 텍스트 중복 항목 오삼킴 차단.
+                    pop_delivered_ids(&mut q, &d.merged_ids);
+                    remaining = q.len();
+                    let mut hold = s.queue_hold.lock().unwrap_or_else(|e| e.into_inner());
+                    if hold.as_ref().is_some_and(|h| h.request_id == request_id ||
+                        (h.kind == crate::state::QueueHoldKind::Refused
+                         && h.entry_ids.iter().any(|id| d.merged_ids.contains(id))
+                         && h.entry_ids.iter().all(|id| !q.iter().any(|entry| &entry.id == id)))) {
+                        *hold = None;
+                    }
+                    *slot = None;
+                }
+                s.queue_completion_pending.store(true, Ordering::Release);
+            }
+            // ★(0.14.52 · S-a C7a) A delivered item is no longer held (the file is rewritten only when it held something).
+            let unheld = {
+                let mut w = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+                d.merged_ids.iter().filter(|id| w.remove(*id).is_some()).count()
+            };
+            if unheld > 0 {
+                daemon.persist_write_holds();
+            }
+            let (recorded_at, body_sha, from_surface, extra) = receipt;
+            // ★(0.14.31 · WP-5 L) 영수증 — 선기록 시각과 분리 · 별 줄 · 본문 sha 아님. ★(0.14.52 · S-a) delivered_at =
+            //   the writer's written Return (now), no longer the hand-off.
+            crate::delivery::record_queue_receipt(
+                daemon,
+                sid,
+                &d.entry.id,
+                d.entry.seq,
+                body_sha,
+                *recorded_at,
+                now_epoch(),
+                *from_surface,
+                extra,
+            );
+            // ★T-0147-2 §2 층3 A3′: 봉입 W-id 를 **배열**로 에코한다(병합분 전부 · 실제 주입 본문 스캔).
+            let entry_ids = wakeup_entry_ids(&d.body);
+            daemon.bus.publish(
+                "queue.delivered",
+                "queue",
+                Some(sid),
+                crate::state::queue_delivered_payload(
+                    &d.entry,
+                    remaining,
+                    &entry_ids,
+                    &cys::surface_ref(sid),
+                    now_epoch(),
+                    overdue,
+                    forced,
+                    &d.merged_ids,
+                ),
+            );
+            // P7 큐 WAL: 배달로 줄어든 큐를 디스크에 반영(스냅샷 최신화).
+            daemon.persist_queue_state();
+        }
+        T::RefusedNoWrite { .. } | T::CancelledBeforeWrite => {
+            let Some(s) = &s else { return };
+            let reason = match t {
+                T::RefusedNoWrite { reason } => reason.clone(),
+                _ => "cancelled".to_string(),
+            };
+            let Some((still_queued, disposed, first)) = with_owned_inflight_marks(s, f, |live, disposed| {
+                let mut h = s.queue_hold.lock().unwrap_or_else(|e| e.into_inner());
+                if live.is_empty() {
+                    if h.as_ref().is_some_and(|old| old.request_id == request_id) { *h = None; }
+                    return (live.to_vec(), disposed.to_vec(), false);
+                }
+                let (since, attempts) = match h.as_ref() {
+                    Some(x) if x.kind == crate::state::QueueHoldKind::Refused
+                        && x.entry_ids.iter().any(|id| live.contains(id)) => (x.since, x.attempts.saturating_add(1)),
+                    _ => (std::time::Instant::now(), 1),
+                };
+                *h = Some(crate::state::QueueHold {
+                    kind: crate::state::QueueHoldKind::Refused,
+                    reason: reason.clone(), request_id: request_id.to_string(), entry_ids: live.to_vec(),
+                    since, attempts,
+                    next_retry: Some(std::time::Instant::now() + crate::state::queue_hold_backoff(attempts)),
+                    envelope: None, notified: true, resume: None, resuming: false,
+                });
+                (live.to_vec(), disposed.to_vec(), attempts == 1)
+            }) else { return };
+            if first {
+                daemon.bus.publish(
+                    "queue.inject_aborted",
+                    "queue",
+                    Some(sid),
+                    json!({
+                        "surface_ref": cys::surface_ref(sid),
+                        "queue_entry_id": d.entry.id,
+                        "merged_ids": d.merged_ids,
+                        "still_queued": still_queued.len(),
+                        "disposed_ids": disposed,
+                        "why": format!("receiver_refused({reason})"),
+                        "request_id": request_id,
+                        "hint": "주입 0 · 항목은 큐에 그대로 있다 — 1·2·4·8·30초 간격으로 다시 시도한다(같은 사유의 재시도는 이 알림을 다시 내지 않는다)",
+                    }),
+                );
+            }
+            daemon.persist_queue_state();
+        }
+        T::PartialExact { envelope, accepted, reason } => {
+            let k = crate::state::QueueHoldKind::PartialExact;
+            hold_partial_write(daemon, s, sid, f, d, request_id, k, reason, *envelope, accepted.payload, stamp, receipt, forced, overdue);
+        }
+        T::PartialUnknown { envelope, accepted, reason } => {
+            let k = crate::state::QueueHoldKind::PartialUnknown;
+            hold_partial_write(daemon, s, sid, f, d, request_id, k, reason, *envelope, accepted.payload, stamp, receipt, forced, overdue);
+        }
+        // A queue plan always owns its Return, so a body-only terminal is not a delivery.
+        T::WrittenBody { accepted } => {
+            let env = crate::agent_write::Envelope { opened: true, closed: true, body_offset: d.body.len(), ..Default::default() };
+            let (k, why) = (crate::state::QueueHoldKind::PartialUnknown, "written_body_without_submit");
+            hold_partial_write(daemon, s, sid, f, d, request_id, k, why, env, accepted.payload, stamp, receipt, forced, overdue);
+        }
+    }
+}
+
+/// A partial queue write: the seat's composer holds an accepted prefix, so nothing else may be
+/// typed there (the reservation stays, so neither tick nor forced delivery hands off). The input
+/// counter is set to the accepted prefix where the hand-off's zero is still mine. PartialUnknown is
+/// announced at once; PartialExact only when its S4-1 window expires ([`queue_write_hold_block`]).
+/// ★(0.14.52 · S-a C7b) A PartialExact hold carries its resume material ([`QueueResume`]) unless foreign input reached the
+/// seat since the hand-off. The hold episode belongs to the REQUEST: a later stop of the same request (a resumed run) keeps
+/// the first loss instant (the window never widens), the notice state and the persisted age; a resumed run that made no
+/// progress backs off 1, 2, 4, 8 s before the next attempt.
+#[allow(clippy::too_many_arguments)]
+fn hold_partial_write(
+    daemon: &Arc<Daemon>,
+    s: Option<Arc<crate::state::Surface>>,
+    sid: u64,
+    f: &InflightInject,
+    d: &Delivered,
+    request_id: &str,
+    kind: crate::state::QueueHoldKind,
+    reason: &str,
+    envelope: crate::agent_write::Envelope,
+    payload: u64,
+    stamp: &HandoffStamp,
+    receipt: &(f64, String, Option<u64>, Value),
+    forced: bool,
+    overdue: bool,
+) {
+    let Some(s) = &s else { return };
+    let (mine, input_gen) = {
+        let _q = s.pending_queue.lock().unwrap();
+        let _gate = s.input_gate.lock().unwrap();
+        let mine = s.input_gen.load(Ordering::Acquire) == f.pending_gen && s.pending_input_bytes.load(Ordering::Relaxed) == 0;
+        if mine {
+            // The prefix written so far (a resumed run's hand-off zero restores the held count plus its own bytes).
+            s.set_pending_input((f.prev_pending + payload).max(1));
+            // The line was NOT submitted: the hand-off's lowered Esc exemption is restored (rollback rule).
+            s.restore_esc_exempt(f.prev_esc_exempt_pgid);
+        }
+        (mine, s.input_gen.load(Ordering::Acquire))
+    };
+    let unknown = kind == crate::state::QueueHoldKind::PartialUnknown;
+    let now = std::time::Instant::now();
+    let announce = {
+        let mut h = s.queue_hold.lock().unwrap();
+        let prev = h.as_ref().filter(|x| x.request_id == request_id && x.kind != crate::state::QueueHoldKind::Refused);
+        let void = prev.and_then(|x| x.resume.as_ref()).is_some_and(|r| r.void.load(Ordering::Acquire));
+        let resume = (kind == crate::state::QueueHoldKind::PartialExact && mine && !void).then(|| {
+            Arc::new(QueueResume {
+                stamp: stamp.clone(),
+                d: d.clone(),
+                receipt: receipt.clone(),
+                forced,
+                overdue,
+                entries: f.entries.clone(),
+                input_gen,
+                wrote: s.inject_track.wrote(),
+                void: std::sync::atomic::AtomicBool::new(false),
+            })
+        });
+        let since = prev.map(|x| x.since).or_else(|| stamp.request.lost_at()).unwrap_or(now);
+        let (attempts, next_retry) = match prev {
+            Some(x) if x.envelope == Some(envelope) => (x.attempts + 1, Some(now + crate::state::queue_hold_backoff(x.attempts + 1))),
+            Some(x) => (x.attempts, None),
+            None => (0, None),
+        };
+        let notified = prev.is_some_and(|x| x.notified);
+        *h = Some(crate::state::QueueHold {
+            kind,
+            reason: reason.to_string(),
+            request_id: request_id.to_string(),
+            entry_ids: d.merged_ids.clone(),
+            since,
+            attempts,
+            next_retry,
+            envelope: Some(envelope),
+            notified: notified || unknown,
+            resume,
+            resuming: false,
+        });
+        unknown && !notified
+    };
+    // ★(0.14.52 · S-a C7a) The hold survives a restart: without it the restored entries are handed off again onto the
+    //   composer that already holds their prefix (retype).
+    {
+        let mut w = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+        let held_at = d
+            .merged_ids
+            .iter()
+            .find_map(|id| w.get(id))
+            .filter(|x| x.request_id == request_id)
+            .map(|x| x.held_at)
+            .unwrap_or_else(now_epoch);
+        let rec = crate::state::PersistedWriteHold {
+            kind: if unknown { "partial_unknown" } else { "partial_exact" }.to_string(),
+            reason: reason.to_string(),
+            request_id: request_id.to_string(),
+            entry_ids: d.merged_ids.clone(),
+            body_offset: envelope.body_offset,
+            held_at,
+        };
+        for id in &d.merged_ids {
+            w.insert(id.clone(), rec.clone());
+        }
+    }
+    daemon.persist_write_holds();
+    if announce {
+        publish_write_held(daemon, sid, kind, reason, request_id, &d.merged_ids, Some(envelope), 0);
+    }
+    daemon.persist_queue_state();
+}
+
+/// The single coalesced notice of a partial-write hold episode (S4-1 / S4-8): an event for the lane
+/// master's subscription — not a queue message and not a pane write.
+fn publish_write_held(
+    daemon: &Arc<Daemon>,
+    sid: u64,
+    kind: crate::state::QueueHoldKind,
+    reason: &str,
+    request_id: &str,
+    entry_ids: &[String],
+    envelope: Option<crate::agent_write::Envelope>,
+    held_secs: u64,
+) {
+    let kind = match kind {
+        crate::state::QueueHoldKind::Refused => "refused",
+        crate::state::QueueHoldKind::PartialExact => "partial_exact",
+        crate::state::QueueHoldKind::PartialUnknown => "partial_unknown",
+    };
+    daemon.bus.publish(
+        "queue.write_held",
+        "queue",
+        Some(sid),
+        json!({
+            "surface_ref": cys::surface_ref(sid),
+            "kind": kind,
+            "reason": reason,
+            "request_id": request_id,
+            "entry_ids": entry_ids,
+            // Byte-exact stop point (design 4.6 listing: byte bounds, never the body text).
+            "body_offset": envelope.map(|e| e.body_offset),
+            "fence_opened": envelope.map(|e| e.opened),
+            "fence_closed": envelope.map(|e| e.closed),
+            "submitted": envelope.map(|e| e.submitted),
+            "held_secs": held_secs,
+            "hint": "에이전트 쓰기가 요청 도중 멈췄다 — 데몬은 입력줄을 지우지도 더 치지도 않는다. 이 좌석의 자동 배달은 그 요청이 정리될 때까지 보류된다(항목·W-id 보존)",
+        }),
+    );
+}
+
+/// The queue tick's hold check (design 4.6): a refused seat waits out its backoff; a partial-write
+/// seat stays held (its reservation already stops every hand-off - this gives the reason label and
+/// fires the expired-window notice once). ★(0.14.52 · S-a C7b) Inside the S4-1 window a PartialExact hold resumes the
+/// SAME request ([`try_resume_partial_write`]); the seat stays held until that run's terminal.
+pub(crate) fn queue_write_hold_block(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) -> Option<&'static str> {
+    queue_write_hold_block_at(daemon, s, std::time::Instant::now())
+}
+
+/// [`queue_write_hold_block`] at an explicit `now`: specimens pin the window edges exactly (window - 1 ms / + 1 ms).
+pub(crate) fn queue_write_hold_block_at(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    now: std::time::Instant,
+) -> Option<&'static str> {
+    use crate::state::QueueHoldKind as K;
+    adopt_persisted_write_hold(daemon, s);
+    let mut notice = None;
+    let mut release = None;
+    let mut resume = false;
+    let why = {
+        let mut h = s.queue_hold.lock().unwrap();
+        let hold = h.as_mut()?;
+        match hold.kind {
+            K::Refused => hold.next_retry.filter(|t| now < *t).map(|_| BLOCKED_RECEIVER_HELD),
+            // A resumed run of this request is in the writer: its terminal settles the hold (no notice, no release).
+            K::PartialExact | K::PartialUnknown if hold.resuming => Some(BLOCKED_PARTIAL_WRITE),
+            K::PartialExact | K::PartialUnknown => {
+                let window = std::time::Duration::from_millis(crate::agent_write::PARTIAL_EXACT_RESUME_WINDOW_MS);
+                // The window counts from the request's first proof loss (`since`) and never moves.
+                let age = now.saturating_duration_since(hold.since);
+                if !hold.notified && age > window {
+                    hold.notified = true;
+                    notice = Some((hold.kind, hold.reason.clone(), hold.request_id.clone(), hold.entry_ids.clone(), hold.envelope, age.as_secs()));
+                }
+                // ★(0.14.52 · S-a C7a · head condition on Q2) automatic, bounded exit: a hold that can no longer resume
+                //   (PartialUnknown, or PartialExact past its window) is released once the composer is measured empty.
+                let resumable = hold.kind == K::PartialExact && age <= window;
+                resume = resumable && hold.resume.is_some() && hold.next_retry.is_none_or(|t| now >= t);
+                let min_age = std::time::Duration::from_millis(PARTIAL_RELEASE_MIN_AGE_MS);
+                if !resumable && age >= min_age {
+                    release = Some((hold.request_id.clone(), hold.entry_ids.clone(), hold.kind, hold.reason.clone(), age.as_secs()));
+                }
+                Some(BLOCKED_PARTIAL_WRITE)
+            }
+        }
+    };
+    if let Some((kind, reason, request_id, ids, env, secs)) = notice {
+        publish_write_held(daemon, s.id, kind, &reason, &request_id, &ids, env, secs);
+    }
+    if resume {
+        // Held either way until the resumed run's terminal (or the next tick's attempt).
+        try_resume_partial_write(daemon, s, now);
+    }
+    if let Some((request_id, ids, kind, reason, secs)) = release {
+        if composer_measured_empty(s) {
+            release_partial_write_hold(daemon, s, &request_id, &ids, kind, &reason, secs);
+            return None;
+        }
+    }
+    why
+}
+
+/// ★(0.14.52 · S-a C7b · S4-1) Continue a PartialExact queue write: the SAME request (same id, same settlement) from its
+/// byte-exact offset - remaining body, closing fence, its own Return. Only inside the window from the loss, with the
+/// agent and conversation epochs of the hand-off, no foreign input since the hold (input count generation, last human
+/// keystroke, writer write count), and no pause / quiescing / shell / modal / per-seat queue pause / approval or gate
+/// pending. The writer's admission is the fresh full proof; the job's claim-time probe re-checks the premises next to
+/// its first byte ([`resume_safety_probe`]). Never a second writer, a new request id, an erase or a retype. Returns
+/// whether the resumed run was handed to the writer.
+fn try_resume_partial_write(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>, now: std::time::Instant) -> bool {
+    use crate::state::QueueHoldKind as K;
+    let window = std::time::Duration::from_millis(crate::agent_write::PARTIAL_EXACT_RESUME_WINDOW_MS);
+    let (r, envelope) = {
+        let h = s.queue_hold.lock().unwrap();
+        let Some(hold) = h.as_ref() else { return false };
+        if hold.kind != K::PartialExact || hold.resuming || now.saturating_duration_since(hold.since) > window {
+            return false;
+        }
+        let (Some(r), Some(env)) = (hold.resume.clone(), hold.envelope) else { return false };
+        (r, env)
+    };
+    let foreign = || {
+        s.input_gen.load(Ordering::Acquire) != r.input_gen
+            || s.inject_track.wrote() != r.wrote
+            || *s.last_human_input.lock().unwrap_or_else(|e| e.into_inner()) != r.stamp.human_at
+    };
+    if !r.stamp.epochs_hold(s) || foreign() {
+        return false;
+    }
+    if s.queue_paused_until.lock().unwrap().is_some_and(|t| t > std::time::Instant::now()) {
+        return false;
+    }
+    let axes = MachineHoldAxes { pause: true, quiescing: true, shell: true, modal: true, ..MachineHoldAxes::NONE };
+    if machine_direct_hold(daemon, s, axes).is_some() || approval_or_gate_pending(daemon, s.id) {
+        return false;
+    }
+    let journal = daemon.agent_journal(); // before any queue lock (its first use opens a file)
+    let marker = surface_prompt_marker(s, &load_adapter_defs()).map(|(m, _)| m);
+    let guard = Arc::new(crate::state::InjectGuard::new(
+        None,
+        s.output_gen.clone(),
+        false,
+        Some(resume_safety_probe(daemon, s, r.clone(), marker)),
+    ));
+    let request_id = r.stamp.request.id.clone();
+    let handed = {
+        let _q = s.pending_queue.lock().unwrap();
+        let _gate = s.input_gate.lock().unwrap();
+        // Again inside the gate: a handler send between the checks above and here is foreign input.
+        if foreign() {
+            return false;
+        }
+        {
+            let mut h = s.queue_hold.lock().unwrap();
+            match h.as_mut() {
+                Some(x) if x.request_id == request_id && x.kind == K::PartialExact && !x.resuming && x.resume.is_some() => {
+                    x.resuming = true;
+                }
+                _ => return false,
+            }
+        }
+        // The resumed run ends the line with its own Return: the count goes to zero like the original hand-off's, and a
+        // re-hold restores the held count plus the new prefix. The delivery interval clock is not touched (completion,
+        // not a new delivery) and the reservation keeps the original, claimed guard (disposers keep treating the ids as in
+        // delivery - their prefix is in the composer).
+        let prev_pending = s.pending_input_bytes.load(Ordering::Relaxed);
+        let prev_esc_exempt_pgid = s.take_esc_exempt();
+        s.set_pending_input(0);
+        let at = *s.last_queue_delivery_at.lock().unwrap();
+        let f = InflightInject {
+            guard: Some(guard.clone()),
+            prev_delivery_at: at,
+            set_delivery_at: at,
+            prev_pending,
+            prev_esc_exempt_pgid,
+            pending_gen: s.input_gen.load(Ordering::Acquire),
+            entries: r.entries.clone(),
+        };
+        let job = crate::agent_write::AgentJob {
+            attempt: None,
+            request: r.stamp.request.clone(),
+            plan: crate::agent_write::Plan::paste(&r.d.body).with_submit(400, 0),
+            proof: r.stamp.proof.clone(),
+            journal: Some(journal),
+            resume: Some(envelope),
+            settle: Some(queue_write_settle(
+                daemon,
+                s,
+                f.clone(),
+                r.d.clone(),
+                r.receipt.clone(),
+                request_id.clone(),
+                r.forced,
+                r.overdue,
+                r.stamp.clone(),
+            )),
+            guard: Some(guard),
+            note_body: true,
+            body_owner: None,
+        };
+        if s.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
+            // Not handed: undo only the marks that are still mine; the hold keeps its material for the next tick.
+            if s.input_gen.load(Ordering::Acquire) == f.pending_gen && s.pending_input_bytes.load(Ordering::Relaxed) == 0 {
+                s.set_pending_input(prev_pending);
+                s.restore_esc_exempt(prev_esc_exempt_pgid);
+            }
+            if let Some(x) = s.queue_hold.lock().unwrap().as_mut() {
+                x.resuming = false;
+            }
+            false
+        } else {
+            true
+        }
+    };
+    if handed {
+        daemon.bus.publish(
+            "queue.write_resumed",
+            "queue",
+            Some(s.id),
+            json!({"surface_ref": cys::surface_ref(s.id), "request_id": request_id, "entry_ids": r.d.merged_ids,
+                   "body_offset": envelope.body_offset, "since_loss_ms": now.saturating_duration_since(
+                       s.queue_hold.lock().unwrap().as_ref().map(|h| h.since).unwrap_or(now)).as_millis() as u64,
+                   "note": "The same request continues from its byte-exact offset (S4-1): remaining body, closing fence, its own Return - never retyped."}),
+        );
+    }
+    handed
+}
+
+/// ★(0.14.52 · S-a C7b) The resumed run's claim-time probe (writer thread, next to its first byte): the S4-1 premises
+/// again - no writer request since the hold (a request queued ahead of this one has run by now) and the hand-off's
+/// epochs; a broken premise also voids the material, so the re-hold never resumes. Then pause, approval or gate pending,
+/// and a modal or selector on the current frame (those only wait). Not the queue's own probe: that one reads the composer
+/// as occupied, and it holds this request's own prefix by definition.
+fn resume_safety_probe(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    r: Arc<QueueResume>,
+    marker: Option<Vec<String>>,
+) -> crate::state::SafetyProbe {
+    let wd = Arc::downgrade(daemon);
+    let ws = Arc::downgrade(s);
+    std::sync::Arc::new(move || {
+        // Runs on the writer thread: a panic must not escape.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (Some(d), Some(s)) = (wd.upgrade(), ws.upgrade()) else {
+                return true;
+            };
+            if s.inject_track.wrote() != r.wrote || !r.stamp.epochs_hold(&s) {
+                r.void.store(true, Ordering::Release);
+                return true;
+            }
+            if queue_injection_paused(&d, &s) || approval_or_gate_pending(&d, s.id) {
+                return true;
+            }
+            marker.as_deref().is_some_and(|m| obs_modal_foreground(&observe_prompt(&s, m)))
+        }))
+        .unwrap_or(true)
+    })
+}
+
+/// What happens to a listed partial write, and what the lane master can do (design 4.6 action owner; head condition on Q2).
+pub(crate) const RECONCILIATION_RESOLUTION: &str = "Automatic: a partial_exact write may resume inside 30 s of its proof loss; otherwise the item is \
+released as undelivered (never retyped) at the first queue tick (every 5 s) once the seat's composer is measured empty at a prompt \
+boundary. Lane master: clear or submit that seat's composer; the next tick then releases the item and the queue resumes with the next one.";
+
+/// ★(0.14.52 · S-a C7c · design 4.6) The reconciliation listing's rows, each `(page key, row)` sorted by key: every partial
+/// write the daemon knows of - a seat's held partial (`seat_hold`), a persisted hold no seat has adopted yet (`persisted`,
+/// after a restart), and a request an earlier daemon run left `writing` without a terminal (`journal_inconclusive`). One row
+/// per request. Ids, proof class, byte bounds, reason, age and action owner only - never body text. Read-only.
+pub(crate) fn reconciliation_rows(daemon: &Arc<Daemon>, filter_sid: Option<u64>) -> Vec<(String, Value)> {
+    use crate::state::QueueHoldKind as K;
+    // The journal is opened once so an earlier run's inconclusive records are known (its first use opens the file).
+    let _ = daemon.agent_journal();
+    let mut rows: Vec<(String, Value)> = Vec::new();
+    let mut listed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let key = |sid: u64, request_id: &str, source: &str| format!("{sid:020}|{request_id}|{source}");
+    let mut surfaces: Vec<Arc<crate::state::Surface>> = daemon.surfaces.lock().unwrap().values().cloned().collect();
+    surfaces.sort_by_key(|s| s.id);
+    for s in &surfaces {
+        let Some(h) = s.queue_hold.lock().unwrap().clone() else { continue };
+        let kind = match h.kind {
+            K::PartialExact => "partial_exact",
+            K::PartialUnknown => "partial_unknown",
+            K::Refused => continue,
+        };
+        listed.insert(h.request_id.clone());
+        if filter_sid.is_some_and(|f| f != s.id) {
+            continue;
+        }
+        let env = h.envelope.unwrap_or_default();
+        let proof_class = if s.receiver_proof.lock().unwrap().is_some() { "bound" } else { "unbound" };
+        rows.push((
+            key(s.id, &h.request_id, "seat_hold"),
+            json!({
+                "source": "seat_hold", "request_id": h.request_id, "surface_id": s.id, "surface_ref": cys::surface_ref(s.id),
+                "role": s.role.lock().unwrap().clone(), "kind": kind, "entry_ids": h.entry_ids, "proof_class": proof_class,
+                "bytes": {"body_offset": env.body_offset, "body_bytes": h.resume.as_ref().map(|r| r.d.body.len()),
+                          "fence_opened": env.opened, "fence_closed": env.closed, "submitted": env.submitted},
+                "reason": h.reason, "age_secs": h.since.elapsed().as_secs(), "resuming": h.resuming,
+                "resumable": h.kind == K::PartialExact && h.resume.is_some(),
+                "action_owner": "lane_master", "resolution": RECONCILIATION_RESOLUTION,
+            }),
+        ));
+    }
+    let persisted: Vec<crate::state::PersistedWriteHold> = {
+        let w = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+        let mut v: Vec<crate::state::PersistedWriteHold> = Vec::new();
+        for h in w.values() {
+            if !v.iter().any(|x| x.request_id == h.request_id) {
+                v.push(h.clone());
+            }
+        }
+        v
+    };
+    for p in persisted {
+        if !listed.insert(p.request_id.clone()) {
+            continue;
+        }
+        // Where its entries wait now: a live seat's queue, else the restored queue (not yet rehomed).
+        let at = surfaces
+            .iter()
+            .find(|s| s.pending_queue.lock().unwrap().iter().any(|e| p.entry_ids.contains(&e.id)))
+            .map(|s| s.id);
+        if filter_sid.is_some() && at != filter_sid {
+            continue;
+        }
+        rows.push((
+            key(at.unwrap_or(0), &p.request_id, "persisted"),
+            json!({
+                "source": "persisted", "request_id": p.request_id, "surface_id": at, "surface_ref": at.map(cys::surface_ref),
+                "kind": p.kind, "entry_ids": p.entry_ids, "proof_class": "unbound",
+                "bytes": {"body_offset": p.body_offset, "body_bytes": Value::Null},
+                "reason": p.reason, "age_secs": (now_epoch() - p.held_at).max(0.0) as u64, "resumable": false,
+                "action_owner": "lane_master", "resolution": RECONCILIATION_RESOLUTION,
+            }),
+        ));
+    }
+    let inconclusive = daemon.writer_inconclusive.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for i in inconclusive {
+        if !listed.insert(i.id.clone()) || filter_sid.is_some_and(|f| f != i.surface) {
+            continue;
+        }
+        rows.push((
+            key(i.surface, &i.id, "journal_inconclusive"),
+            json!({
+                "source": "journal_inconclusive", "request_id": i.id, "surface_id": i.surface,
+                "surface_ref": cys::surface_ref(i.surface), "kind": "inconclusive", "origin": i.origin, "digest": i.digest,
+                "proof_class": "unbound", "bytes": Value::Null,
+                "reason": "an earlier daemon run left this write without a terminal record (amount unknown, never replayed)",
+                "age_secs": Value::Null, "resumable": false, "action_owner": "lane_master",
+                "resolution": "Never replayed. Lane master: decide whether the work was completed, superseded or must be re-sent as a new request.",
+            }),
+        ));
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    rows
+}
+
+/// ★(0.14.52 · S-a C7a) A partial-write hold blocks every hand-off of this seat's queue (tick and forced path alike; after a
+/// restart there is no reservation, only the adopted hold).
+pub(crate) fn partial_write_held(s: &crate::state::Surface) -> bool {
+    matches!(
+        s.queue_hold.lock().unwrap().as_ref().map(|h| h.kind),
+        Some(crate::state::QueueHoldKind::PartialExact | crate::state::QueueHoldKind::PartialUnknown)
+    )
+}
+
+/// Side-effect-free recheck inside queue admission; an earlier outer tick check may be stale.
+fn queue_write_admission_held(s: &crate::state::Surface, now: std::time::Instant) -> bool {
+    s.queue_hold.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|hold| {
+        match hold.kind {
+            crate::state::QueueHoldKind::Refused => hold.next_retry.is_some_and(|due| now < due),
+            crate::state::QueueHoldKind::PartialExact | crate::state::QueueHoldKind::PartialUnknown => true,
+        }
+    })
+}
+
+/// Minimum age of a partial hold before the composer-empty release may fire: the echo of the accepted prefix (or a restarted
+/// seat's first frames) must have had time to render, so an empty composer is a measurement, not a race.
+pub(crate) const PARTIAL_RELEASE_MIN_AGE_MS: u64 = 2_000;
+
+/// ★(0.14.52 · S-a C7a) After a daemon restart the queue head may be an entry the previous daemon held part-way
+/// (`Daemon::write_holds`): adopt it as PartialUnknown (no resume across a restart - head Q2) instead of handing it off again.
+fn adopt_persisted_write_hold(daemon: &Arc<Daemon>, s: &Arc<crate::state::Surface>) {
+    if s.queue_hold.lock().unwrap().is_some() {
+        return;
+    }
+    let head = s.pending_queue.lock().unwrap().front().map(|e| e.id.clone());
+    let Some(head) = head else { return };
+    let Some(h) = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner()).get(&head).cloned() else { return };
+    let reason = format!("daemon_restart:{}", h.reason);
+    let envelope = crate::agent_write::Envelope { body_offset: h.body_offset, ..Default::default() };
+    {
+        let mut g = s.queue_hold.lock().unwrap();
+        if g.is_some() {
+            return;
+        }
+        *g = Some(crate::state::QueueHold {
+            kind: crate::state::QueueHoldKind::PartialUnknown,
+            reason: reason.clone(),
+            request_id: h.request_id.clone(),
+            entry_ids: h.entry_ids.clone(),
+            since: std::time::Instant::now(),
+            attempts: 0,
+            next_retry: None,
+            envelope: Some(envelope),
+            notified: true,
+            resume: None,
+            resuming: false,
+        });
+    }
+    let held_secs = (now_epoch() - h.held_at).max(0.0) as u64;
+    publish_write_held(daemon, s.id, crate::state::QueueHoldKind::PartialUnknown, &reason, &h.request_id, &h.entry_ids, Some(envelope), held_secs);
+}
+
+/// The seat's composer measured EMPTY at a prompt boundary: adapter marker at the cursor row, nothing before the cursor, a
+/// consistent frame, no modal or selector. Unreadable or no adapter -> false (keep holding).
+fn composer_measured_empty(s: &Arc<crate::state::Surface>) -> bool {
+    let adapters = load_adapter_defs();
+    let Some((markers, _)) = surface_prompt_marker(s, &adapters) else { return false };
+    let obs = observe_prompt(s, &markers);
+    obs.frame_consistent()
+        && !obs.selector_row
+        && !obs_modal_foreground(&obs)
+        && matches!(&obs.line, Some((before, _)) if before.trim().is_empty())
+}
+
+/// ★(0.14.52 · S-a C7a · head condition on Q2) Release a partial-write hold whose composer was measured empty: the held
+/// entries leave the active queue as undelivered (tombstone + `queue.write_released`), the reservation and the hold end, the
+/// input count is cleared (the composer is empty), and the queue resumes with the NEXT item. The held body is never retyped.
+fn release_partial_write_hold(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    request_id: &str,
+    entry_ids: &[String],
+    kind: crate::state::QueueHoldKind,
+    reason: &str,
+    held_secs: u64,
+) {
+    let removed: Vec<crate::state::QueueEntry> = {
+        let mut q = s.pending_queue.lock().unwrap();
+        let _gate = s.input_gate.lock().unwrap();
+        let removed = q.iter().filter(|e| entry_ids.contains(&e.id)).cloned().collect();
+        pop_delivered_ids(&mut q, entry_ids);
+        *s.inject_reservation.lock().unwrap() = None;
+        s.clear_pending_input();
+        removed
+    };
+    *s.queue_hold.lock().unwrap() = None;
+    {
+        let mut w = daemon.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+        for id in entry_ids {
+            w.remove(id);
+        }
+    }
+    daemon.persist_write_holds();
+    crate::delivery::record_queue_tombstones(daemon, s.id, &removed, "partial_write_released", now_epoch());
+    daemon.persist_queue_state();
+    let kind = match kind {
+        crate::state::QueueHoldKind::PartialExact => "partial_exact",
+        crate::state::QueueHoldKind::PartialUnknown => "partial_unknown",
+        crate::state::QueueHoldKind::Refused => "refused",
+    };
+    daemon.bus.publish(
+        "queue.write_released",
+        "queue",
+        Some(s.id),
+        json!({"surface_ref": cys::surface_ref(s.id), "request_id": request_id, "entry_ids": entry_ids, "kind": kind,
+               "reason": reason, "held_secs": held_secs, "released": "composer_empty",
+               "note": "The seat's composer was measured empty, so the part-way item was released as undelivered (never retyped); the queue resumes with the next item."}),
+    );
 }
 
 /// `expect_pending`: 준비 판정이 **본** `pending_input_bytes` 값. `Some(v)` 이면 배달 직전
@@ -9697,17 +10594,21 @@ pub(crate) fn deliver_head_locked(
     expect_pending: Option<u64>,
     expect_output_gen: Option<u64>,
     recheck: Option<&ScreenRecheck>,
-) -> Option<Delivered> {
+) -> Option<QueueHandoff> {
     let now = now_epoch();
     let default_ttl = crate::state::queue_ttl_default_secs();
     let base_min_interval = queue_min_interval_secs();
     let interval_max_wait = queue_max_wait_secs();
     // 배달 시점에 만료로 판정된 머리 — 락 밖에서 만료 큐 이동·통지 처리.
     let mut expired_head: Option<crate::state::QueueEntry> = None;
-    // (영수증 재료) 선기록 시각 · 본문 sha · 발신 surface — try_send 성공 뒤 락 밖에서 기록.
-    let mut receipt: Option<(f64, String, Option<u64>, Value)> = None;
+    // ★(0.14.52 · S-a) The writer journal is fetched before any queue lock (its first use opens a file).
+    let journal = daemon.agent_journal();
     // (인계 가드 재료) 결판 대기·롤백은 락 **밖**에서 한다(대기 중 queue.list·enqueue 가 막히면 안 된다).
     let mut inflight: Option<InflightInject> = None;
+    // ★(0.14.52 · S-a) The handed-off request (status reads; specimens' settlement wait).
+    let mut handed: Option<Arc<crate::agent_write::Request>> = None;
+    // ★(0.14.52 · S-a C7a) A restored partially written head is adopted as held before any hand-off (outside the queue lock).
+    adopt_persisted_write_hold(daemon, s);
     let delivered = 'tx: {
         // 이 임계영역은 더 이상 큐를 **바꾸지 않는다**(인계 결판 전에는 빼지 않는다 · 리뷰 R2).
         let q = s.pending_queue.lock().unwrap();
@@ -9717,7 +10618,7 @@ pub(crate) fn deliver_head_locked(
         //   하지 않는다. 항목이 결판까지 큐에 남아 있으므로(유실 창 봉인) 이 표식이 없으면 틱과
         //   RPC 강제 배달이 **같은 머리를 두 번** 인계할 수 있다. 검사·설정이 둘 다 이 임계영역
         //   안이라 창이 없다(배달 최소 간격 0 인 롤백 env 에서도 성립).
-        if s.inject_reserved() {
+        if s.inject_reserved() || queue_write_admission_held(s, std::time::Instant::now()) {
             break 'tx None;
         }
         if let Some(want) = expect_pending {
@@ -9901,32 +10802,23 @@ pub(crate) fn deliver_head_locked(
             approval_now,
             Some(safety_probe),
         )));
-        let req = crate::state::WriteReq::Inject {
-            text: body.clone(),
-            cr_delay_ms: 400,
-            clear_first: false, // queued 배달은 quiet 대기 후라 선정리 불필요(현행 동작 보존)
-            guard: guard.clone(),
-        };
-        if s.write_tx.try_send(req).is_err() {
-            break 'tx None; // 인계 실패 — 메시지 보존, 다음 틱 재시도
-        }
-        let delivered_at = now_epoch();
-        // ★(0.14.31 · 리뷰 R1) 가드가 중단을 결판내면 아래 두 표식을 **직전 값으로 되돌린다**
-        //   (쓰이지 않은 배달이 시계·계수를 움직여선 안 된다).
+        // ★(0.14.52 · S-a) The hand-off is ONE checked agent write (`agent_write`): same bytes as the
+        //   former Inject (one paste envelope + 400 ms + CR), but the writer's journaled TERMINAL - not
+        //   the guard claim - decides pop / receipt / `queue.delivered` ([`settle_queue_write`]).
+        //   The optimistic marks are taken before the hand-off (input_gate is held, so nobody sees them
+        //   early) and undone if the writer channel refuses it, so the settlement owns complete
+        //   rollback data from the first instant.
         let prev_delivery_at = *s.last_queue_delivery_at.lock().unwrap();
         let prev_pending = s.pending_input_bytes.load(Ordering::Relaxed);
         // ★(0.14.31 · WP-5) 같은 시계 — 어느 경로든 인계 성공 순간이 간격 시계의 기준이다.
         let set_delivery_at = Some(std::time::Instant::now());
         *s.last_queue_delivery_at.lock().unwrap() = set_delivery_at;
-        // ★B1(0.14.30): Inject 는 본문+CR 을 원자로 보내 줄을 제출한다 → 미제출 계수 0.
+        // ★B1(0.14.30): 본문+CR 을 한 요청으로 보내 줄을 제출한다 → 미제출 계수 0.
         // ★(0.14.31 · codex Q4) input_gate **안**에서 세대와 함께 갱신한다(락 밖 갱신 = lost update).
         // ★(0.14.43 · R1F-IN ⓐ) 줄이 제출됐다고 계상하면 잠정 Esc 면제 표식도 내린다(`pending_input` leaf 만 잡는다 · 직전 값은 롤백이 복원한다).
         let prev_esc_exempt_pgid = s.take_esc_exempt();
         s.set_pending_input(0);
-        // ★(0.14.31 · 리뷰 R1) 가드가 중단을 결판내면 위 두 표식을 **내가 쓴 값 그대로일 때만**
-        //   되돌린다(쓰이지 않은 배달이 시계·계수를 움직여선 안 되지만, 그 사이의 사실을 덮어서도
-        //   안 된다).
-        inflight = Some(InflightInject {
+        let f = InflightInject {
             guard: guard.clone(),
             prev_delivery_at,
             set_delivery_at,
@@ -9934,22 +10826,13 @@ pub(crate) fn deliver_head_locked(
             prev_esc_exempt_pgid,
             pending_gen: s.input_gen.load(Ordering::Acquire),
             entries: merged.clone(),
-        });
-        // ★(0.14.31 · 리뷰 R2 · codex blocking) **결판 전에는 큐에서 빼지 않는다.**
-        //   종전에는 여기서 pop 하고 락 밖에서 최대 800ms 결판을 기다렸다 — 그 창의 항목은
-        //   `InflightInject` 라는 **함수 지역변수**에만 있어 `persist_queue_state`·`close_surface`·
-        //   `queue.list` 어디에도 보이지 않았다(그 창의 크래시 = 주입도 안 됐는데 큐에도 없는 유실 ·
-        //   그 창의 close = 맵에서 분리된 Surface 에 롤백을 밀어 넣음). 지금은 항목을 큐에 **둔 채**
-        //   결판을 기다리고, `INJECT_CLAIMED` 로 수확한 뒤에 뺀다.
-        //   같은 surface 의 이중 인계와 **처분자와의 경합**(clear·close·TTL 스윕·drop)은
-        //   `inject_reservation` 이 조정한다: 처분자는 먼저 인계를 취소하고, 취소에 실패한 항목
-        //   (=writer 가 이미 쓰기로 확정)만 처분 대상에서 뺀다(`Surface::cancel_inject_reservation`).
-        *s.inject_reservation.lock().unwrap() = guard.as_ref().map(|g| {
-            crate::state::InjectReservation { ids: merged_ids.clone(), guard: g.clone() }
-        });
-        receipt = Some((
-            delivered_at,
-            crate::delivery::digest_text(&body),
+        };
+        let delivered_at = now_epoch();
+        let body_sha = crate::delivery::digest_text(&body);
+        // (recorded_at = this pre-record's time; the settlement stamps delivered_at at the written Return.)
+        let receipt = (
+            now,
+            body_sha.clone(),
             from_surface,
             json!({
                 "enqueued_at": entry.enqueued_at,
@@ -9961,9 +10844,53 @@ pub(crate) fn deliver_head_locked(
                 "forced": forced,
                 "overdue": overdue,
             }),
-        ));
-        // `remaining` 은 결판 뒤 실제 pop 값으로 갱신한다(여기서는 예측값).
-        Some(Delivered { entry, remaining: q.len().saturating_sub(merged.len()), merged_ids, body })
+        );
+        // `remaining` is a prediction here; the settlement reports the value after its pop.
+        let d = Delivered { entry, remaining: q.len().saturating_sub(merged.len()), merged_ids, body };
+        let request = crate::agent_write::Request::new(
+            crate::agent_write::new_request_id((daemon.started_at * 1000.0) as u64),
+            s.id,
+            "queue",
+            body_sha,
+        );
+        let request_id = request.id.clone();
+        let handle = request.clone();
+        // ★(0.14.52 · S-a C7b) The epochs and last human keystroke this request is written under (S4-1 resume premises).
+        let stamp = HandoffStamp::of(s, request.clone(), s.agent_proof(), guard.clone());
+        let job = crate::agent_write::AgentJob {
+            attempt: None,
+            request,
+            plan: crate::agent_write::Plan::paste(&d.body).with_submit(400, 0),
+            proof: stamp.proof.clone(),
+            journal: Some(journal),
+            resume: None,
+            settle: Some(queue_write_settle(daemon, s, f.clone(), d.clone(), receipt, request_id, forced, overdue, stamp)),
+            guard: guard.clone(),
+            note_body: true,
+            body_owner: None,
+        };
+        if s.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
+            // 인계 실패 — 메시지 보존, 다음 틱 재시도. Undo only the marks that are still mine.
+            if s.input_gen.load(Ordering::Acquire) == f.pending_gen && s.pending_input_bytes.load(Ordering::Relaxed) == 0 {
+                s.set_pending_input(prev_pending);
+                s.restore_esc_exempt(prev_esc_exempt_pgid);
+            }
+            let mut t = s.last_queue_delivery_at.lock().unwrap();
+            if *t == set_delivery_at {
+                *t = prev_delivery_at;
+            }
+            break 'tx None;
+        }
+        inflight = Some(f);
+        handed = Some(handle);
+        // ★(0.14.31 · 리뷰 R2 · codex blocking) **결판 전에는 큐에서 빼지 않는다.** ★(0.14.52 · S-a) and
+        //   now not at the guard claim either: the reservation stays until the writer's terminal, so the
+        //   tick and a forced delivery cannot hand the same head off twice, and disposers
+        //   (`Surface::cancel_inject_reservation`) treat these ids as in delivery once claimed.
+        *s.inject_reservation.lock().unwrap() = guard.as_ref().map(|g| {
+            crate::state::InjectReservation { ids: d.merged_ids.clone(), guard: g.clone() }
+        });
+        Some(d)
     };
     if let Some(e) = expired_head {
         // ★(0.14.31 · 리뷰 R1 · codex major) 이동은 **두 락을 동시에 쥔 한 임계영역**에서 끝낸다.
@@ -9988,7 +10915,8 @@ pub(crate) fn deliver_head_locked(
         daemon.persist_queue_state();
         return None;
     }
-    let mut delivered = delivered?;
+    let delivered = delivered?;
+    let mut guard_outcome = crate::state::InjectHandoff::CallerClaimed;
     // ★(0.14.31 · 리뷰 R1 · codex blocking) 가드 결판 — 락을 전부 놓은 뒤 유계 대기.
     //   ABORTED = writer 가 **한 바이트도 쓰지 않았다** → 항목은 큐에 그대로 있고(리뷰 R2: 애초에
     //   빼지 않는다 = 유실 0 · §3-3) `queue.delivered`·영수증·에코 제외 창 어느 것도 만들지 않는다.
@@ -9998,74 +10926,29 @@ pub(crate) fn deliver_head_locked(
             //   각각 800ms 를 쓰면 한 틱이 80초가 되어 뒤따르는 사망 점검·자가치유가 밀린다.
             let wait = crate::state::INJECT_GUARD_WAIT_MS.min(tick_settle_budget_ms());
             let t0 = std::time::Instant::now();
-            let verdict = g.settle(wait);
+            guard_outcome = g.settle_handoff(wait);
             spend_tick_settle_budget(t0.elapsed());
-            if verdict == crate::state::INJECT_ABORTED {
-                // 예약 해제는 롤백 **안**에서 표식 되돌림과 같은 임계영역에 있다(triage codex 보완).
-                rollback_aborted_inject(daemon, s, &f, &delivered);
-                return None;
+            match guard_outcome {
+                crate::state::InjectHandoff::CallerAborted => {
+                    // 예약 해제는 롤백 **안**에서 표식 되돌림과 같은 임계영역에 있다(triage codex 보완).
+                    rollback_aborted_inject(daemon, s, &f, &delivered);
+                    return None;
+                }
+                crate::state::InjectHandoff::CallerClaimed => {},
+                crate::state::InjectHandoff::ControllerOwned => {}, // controller retains cleanup; no ACK/timeout abort
+                crate::state::InjectHandoff::InvalidState(_) => {}, // no inferred cancellation or successful write
             }
         }
-        // 결판 = 쓴다(수확 완료 · writer 의 늦은 중단은 이 뒤로 성립하지 않는다) → 이제 뺀다.
-        // ★G1(W2-A)+B1: pop 판정은 방금 인계한 항목의 **id 집합** — 동일 텍스트 중복 항목
-        //   오삼킴을 차단하면서 병합분 전체를 한 번에 제거한다(단건이면 종전과 동일 동작).
-        {
-            let mut q = s.pending_queue.lock().unwrap();
-            let _gate = s.input_gate.lock().unwrap();
-            pop_delivered_ids(&mut q, &delivered.merged_ids);
-            delivered.remaining = q.len();
-            // 예약 해제도 **같은 임계영역**에서 — 해제와 pop 사이에 다른 배달이 끼면 그 배달이
-            // 아직 안 빠진 머리를 다시 집는다.
-            *s.inject_reservation.lock().unwrap() = None;
-        }
+        // ★(0.14.52 · S-a) CLAIMED = the writer owns the request. Nothing is popped, receipted or
+        //   announced here: [`settle_queue_write`] does that on WrittenSubmitted only (design 4.5).
     }
-    // T4-17 에코 제외 창 — 큐 배달도 원격 주입이다
-    *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
-    // ★(0.14.31 · WP-5 L) 영수증 — 인계 성공 시각(선기록 시각과 분리 · 별 줄 · 본문 sha 아님).
-    if let Some((delivered_at, body_sha, from_surface, extra)) = receipt {
-        crate::delivery::record_queue_receipt(
-            daemon,
-            s.id,
-            &delivered.entry.id,
-            delivered.entry.seq,
-            &body_sha,
-            now,
-            delivered_at,
-            from_surface,
-            &extra,
-        );
+    let request = handed?;
+    if guard_outcome == crate::state::InjectHandoff::CallerClaimed {
+        // Legacy writer claim only. Proof-pending ownership must not create an injection stamp.
+        *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+        crate::agent_write::test_wait_settled(&request);
     }
-    // ★T-0147-2 §2 층3 A3′(R2-C3): 배달 영수증에 봉입 W-id 를 **배열**로 에코한다.
-    // 배열인 이유 — javis_wakeup 의 digest 모드(층1 I6)가 같은 target 의 N건을 1회
-    // Inject 로 병합하므로, 병합된 **전** W-id 가 ack 돼야 critical-tier 가 disarm 된다.
-    // 하나라도 빠지면 그 사건은 seen-store 에 inflight 로 남아 TTL 마다 영구 재enqueue 된다
-    // (= wakeup 홍수 재발). 봉입 id 가 없는 일반 큐 배달은 빈 배열이다.
-    // surface_ref 는 python 게이트가 target 을 surface id 정수 재조립 없이 조인하도록 가산.
-    // (entry_ids = W-id 에코 계약 — 큐 항목 id(queue_entry_id)와 별개 체계·키명 불변.)
-    // ★G1(W2-B): payload는 공용 빌더 — 기존 4키 불변 + queue_entry_id/seq/enqueued_at/
-    // delivered_at/wait_secs additive. W-id 에코는 **원문 text 스캔** 그대로다.
-    // ★G1(W2-D): overdue/forced 는 이벤트 층 additive — 원장(delivery.rs)은 무변경.
-    // ★B1: W-id 스캔은 **실제 주입된 본문**에서 한다 — 병합분의 W-id 가 하나라도 빠지면
-    //   javis_wakeup 의 critical-tier 가 disarm 되지 못해 그 사건이 TTL 마다 영구 재enqueue 된다.
-    let entry_ids = wakeup_entry_ids(&delivered.body);
-    daemon.bus.publish(
-        "queue.delivered",
-        "queue",
-        Some(s.id),
-        crate::state::queue_delivered_payload(
-            &delivered.entry,
-            delivered.remaining,
-            &entry_ids,
-            &cys::surface_ref(s.id),
-            now_epoch(),
-            overdue,
-            forced,
-            &delivered.merged_ids,
-        ),
-    );
-    // P7 큐 WAL: 배달로 줄어든 큐를 디스크에 반영(스냅샷 최신화).
-    daemon.persist_queue_state();
-    Some(delivered)
+    Some(QueueHandoff { delivery:delivered, request_id:request.id.clone(), status:request.status(), guard_outcome })
 }
 
 // ─── ★(0.14.31 · WP-5 M) 만료 회계 — 틱 스윕 · 만료 큐 이동 · 상한 축출 · 통지 ─────────────
@@ -11476,7 +12359,7 @@ fn load_adapter_defs() -> (serde_json::Value, serde_json::Value) {
 /// composer 에는 둘 다 없고 마커 뒤에 플레이스홀더가 있어, alt-screen 좌석이면 `BLOCKED_ALT_SCREEN`
 /// 영구 보류였다(WP-5 기아 계급 · 리뷰 R7 minor). 플레이스홀더는 **약한 증거**이므로 판정부가
 /// 출력 정적과 AND 한다(`readiness::composer_layout_static_ok`).
-fn merged_composer_placeholder(
+pub(crate) fn merged_composer_placeholder(
     disk: &serde_json::Value,
     embed: &serde_json::Value,
     agent: &str,
@@ -11562,7 +12445,7 @@ pub(crate) fn force_deliver_entry(
     s: &Arc<crate::state::Surface>,
     entry_id: Option<&str>,
     allow_reorder: bool,
-) -> Result<Delivered, ForceDeliverDenied> {
+) -> Result<QueueHandoff, ForceDeliverDenied> {
     // 게이트 ③ empty_seat — watchdog 틱과 동일 판정(Unknown 은 통과 = 현행 동작 강등).
     if s.role.lock().unwrap().is_some()
         && SeatState::from_u8(s.seat_cache.load(Ordering::Relaxed)) == SeatState::Empty
@@ -11875,6 +12758,9 @@ fn deliver_queued(
         if s.exited.load(Ordering::Relaxed) {
             continue;
         }
+        if s.queue_completion_pending.swap(false, Ordering::AcqRel) {
+            starve_alerted.remove(&s.id); // terminal submission, never a mere handoff
+        }
         // ★G1(W2-D): 머리 스냅샷 — 빈 큐는 어느 분기에서도 할 일이 없다(depth 경보는
         // depth≥임계≥1, 기아 경보는 머리 존재가 전제 — 관측 동등·무회귀). 락은 순간 보유.
         // 스냅샷과 실제 배달(deliver_head_locked) 사이 머리가 바뀌는 창은 clear(drain·
@@ -11883,7 +12769,11 @@ fn deliver_queued(
             let q = s.pending_queue.lock().unwrap();
             match q.front().cloned() {
                 Some(h) => (h, q.len()),
-                None => continue,
+                None => {
+                    starve_alerted.remove(&s.id);
+                    *s.queue_blocked.lock().unwrap() = None;
+                    continue;
+                },
             }
         };
         // ★(0.14.31 · triage 2026-09-08 · #7) 결판 예산이 바닥났으면 **원장·writer 를 건드리기
@@ -11896,6 +12786,13 @@ fn deliver_queued(
             }
             mark_queue_blocked(&s, BLOCKED_SETTLE_BUDGET);
             alert_queue_depth_if_high(daemon, &s, depth_alerted, BLOCKED_SETTLE_BUDGET);
+            continue;
+        }
+        // ★(0.14.52 · S-a) Writer-terminal hold (design 4.6): a refused hand-off waits out its
+        //   backoff; a partial write keeps the seat held. Before any ledger line or writer hand-off.
+        if let Some(why) = queue_write_hold_block(daemon, &s) {
+            mark_queue_blocked(&s, why);
+            alert_queue_depth_if_high(daemon, &s, depth_alerted, why);
             continue;
         }
         // ★G1(W2-D BLOCKER): overdue·기아 자격의 대기 = uptime 클램프 측정(부트 직후
@@ -12100,7 +12997,7 @@ fn deliver_queued(
         // ★G1(W2-D): 배달 임계영역은 단일 헬퍼(deliver_head_locked — RPC 강제 배달과 공유).
         // pop은 writer 채널 인계 성공 후에만 — 실패 시 메시지를 보존해 다음 틱에 재시도.
         // 블로킹 write·sleep은 surface 전용 writer 스레드가 수행하므로 watchdog은 멈추지 않는다.
-        if deliver_head_locked(
+        if let Some(handoff) = deliver_head_locked(
             daemon,
             &s,
             false,
@@ -12109,9 +13006,8 @@ fn deliver_queued(
             Some(pending_at_verdict),
             expect_gen,
             recheck.as_ref(),
-        )
-        .is_some()
-        {
+        ) {
+            if !handoff.written_submitted() { continue; }
             // 배달 성공 = 기아 해소 — 쿨다운 리셋(다음 기아는 새 사건으로 다시 경보).
             starve_alerted.remove(&s.id);
             // ★B1: 막힘 사유도 사실이 아니게 됐다 — 지운다(낡은 사유가 남으면 오독한다).
@@ -12278,6 +13174,133 @@ impl Drop for ReapEnvGuard {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn c8pp_old_cleanup_cannot_change_a_new_reservation_or_its_marks() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("c8pp-old-cleanup");
+        let (daemon, s) = wp5_seat("c8pp-old-cleanup", "claude");
+        let old = std::sync::Arc::new(crate::state::InjectGuard::new(
+            None, s.output_gen.clone(), false, None));
+        let newer = std::sync::Arc::new(crate::state::InjectGuard::new(
+            None, s.output_gen.clone(), false, None));
+        *s.inject_reservation.lock().unwrap() = Some(crate::state::InjectReservation {
+            ids: vec!["new-item".into()], guard: newer.clone(),
+        });
+        s.set_pending_input(0);
+        let current_gen = s.input_gen.load(std::sync::atomic::Ordering::Acquire);
+        let at = Some(std::time::Instant::now());
+        *s.last_queue_delivery_at.lock().unwrap() = at;
+        let f = super::InflightInject {
+            guard: Some(old), prev_delivery_at: None, set_delivery_at: at,
+            prev_pending: 17, prev_esc_exempt_pgid: 0, pending_gen: current_gen, entries: vec![],
+        };
+        // Matching numerical marks are deliberate: only the reservation owner can discriminate this case.
+        let _ = super::restore_inflight_marks(&s, &f);
+        let same_owner = s.inject_reservation.lock().unwrap().as_ref()
+            .is_some_and(|r| std::sync::Arc::ptr_eq(&r.guard, &newer));
+        let pending = s.pending_input_bytes.load(std::sync::atomic::Ordering::Acquire);
+        let delivery = *s.last_queue_delivery_at.lock().unwrap();
+        // Tear down before asserting, including on the predicted RED path.
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+        assert!(same_owner, "old cleanup cleared a newer reservation");
+        assert_eq!(pending, 0, "old cleanup rewrote the newer input state");
+        assert_eq!(delivery, at, "old cleanup rewound the newer delivery clock");
+    }
+
+    #[test]
+    fn c8pp_matching_cleanup_still_restores_its_own_marks() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (_pack, _env) = wp5_env("c8pp-own-cleanup");
+        let (daemon, s) = wp5_seat("c8pp-own-cleanup", "claude");
+        let owner = std::sync::Arc::new(crate::state::InjectGuard::new(
+            None, s.output_gen.clone(), false, None));
+        *s.inject_reservation.lock().unwrap() = Some(crate::state::InjectReservation {
+            ids: vec!["own-item".into()], guard: owner.clone(),
+        });
+        s.set_pending_input(0);
+        let at = Some(std::time::Instant::now());
+        *s.last_queue_delivery_at.lock().unwrap() = at;
+        let f = super::InflightInject {
+            guard: Some(owner), prev_delivery_at: None, set_delivery_at: at,
+            prev_pending: 17, prev_esc_exempt_pgid: 0,
+            pending_gen: s.input_gen.load(std::sync::atomic::Ordering::Acquire), entries: vec![],
+        };
+        let _ = super::restore_inflight_marks(&s, &f);
+        let released = s.inject_reservation.lock().unwrap().is_none();
+        let pending = s.pending_input_bytes.load(std::sync::atomic::Ordering::Acquire);
+        let delivery = *s.last_queue_delivery_at.lock().unwrap();
+        let _ = close_surface(&daemon, s.id, CloseCause::OwnerClose);
+        assert!(released);
+        assert_eq!(pending, 17);
+        assert_eq!(delivery, None);
+    }
+
+    #[test]
+    fn c8pp_stale_terminal_cannot_mutate_new_owner_or_hold() {
+        for submitted in [false,true] {
+            let _lock=QUEUE_ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+            let (_pack,_env)=wp5_env("c8pp-stale-terminal");
+            let (daemon,s)=wp5_seat("c8pp-stale-terminal","claude");
+            let old=Arc::new(crate::state::InjectGuard::new(None,s.output_gen.clone(),false,None));
+            let newer=Arc::new(crate::state::InjectGuard::new(None,s.output_gen.clone(),false,None));
+            let old_entry=daemon.next_queue_entry("old".into(),None,"test");
+            let new_entry=daemon.next_queue_entry("new".into(),None,"test");
+            s.pending_queue.lock().unwrap().push_back(new_entry.clone());
+            *s.inject_reservation.lock().unwrap()=Some(crate::state::InjectReservation{ids:vec![new_entry.id.clone()],guard:newer.clone()});
+            let since=std::time::Instant::now();
+            *s.queue_hold.lock().unwrap()=Some(crate::state::QueueHold{kind:crate::state::QueueHoldKind::Refused,
+                reason:"new hold".into(),request_id:"new-request".into(),entry_ids:vec![new_entry.id.clone()],since,attempts:1,
+                next_retry:Some(since+std::time::Duration::from_secs(3600)),envelope:None,notified:true,resume:None,resuming:false});
+            let at=Some(since);*s.last_queue_delivery_at.lock().unwrap()=at;
+            let flight=super::InflightInject{guard:Some(old.clone()),prev_delivery_at:None,set_delivery_at:at,
+                prev_pending:17,prev_esc_exempt_pgid:0,pending_gen:s.input_gen.load(AtomicOrdering::Acquire),entries:vec![old_entry.clone()]};
+            let delivery=super::Delivered{entry:old_entry.clone(),remaining:1,merged_ids:vec![old_entry.id],body:"old".into()};
+            let req=crate::agent_write::Request::new("old-request".into(),s.id,"queue","old-digest".into());
+            let stamp=super::HandoffStamp::of(&s,req,Arc::new(crate::agent_write::PassThrough),Some(old));
+            let terminal=if submitted {crate::agent_write::Terminal::WrittenSubmitted{accepted:crate::agent_write::Accepted::default()}}
+                else {crate::agent_write::Terminal::RefusedNoWrite{reason:"old refusal".into()}};
+            super::settle_queue_write(&daemon,Some(s.clone()),s.id,&flight,&delivery,
+                &(crate::state::now_epoch(),"old-digest".into(),None,serde_json::json!({})),"old-request",false,false,&stamp,&terminal);
+            let same=s.inject_reservation.lock().unwrap().as_ref().is_some_and(|r|Arc::ptr_eq(&r.guard,&newer));
+            let held=s.queue_hold.lock().unwrap().as_ref().map(|h|(h.request_id.clone(),h.since));
+            let pending=s.pending_input_bytes.load(AtomicOrdering::Acquire);
+            let clock=*s.last_queue_delivery_at.lock().unwrap();
+            let completion=s.queue_completion_pending.load(AtomicOrdering::Acquire);
+            let ids:Vec<String>=s.pending_queue.lock().unwrap().iter().map(|e|e.id.clone()).collect();
+            let _=close_surface(&daemon,s.id,CloseCause::OwnerClose);
+            assert!(same,"stale terminal must not clear a newer reservation (submitted={submitted})");
+            assert_eq!(held,Some(("new-request".into(),since)),"stale terminal must not replace the newer hold");
+            assert_eq!(pending,0);assert_eq!(clock,at);assert!(!completion);
+            assert_eq!(ids,vec![new_entry.id]);
+        }
+    }
+
+    #[test]
+    fn c8pp_terminal_notification_resets_starvation_on_the_existing_tick() {
+        for remaining in [false, true] {
+            let _lock=QUEUE_ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+            let (_pack,_env)=wp5_env("c8pp-completion-tick");let (daemon,s)=wp5_seat("c8pp-completion-tick","claude");
+            if remaining {
+                let next=daemon.next_queue_entry("next item remains blocked".into(),None,"test");
+                s.pending_queue.lock().unwrap().push_back(next);
+                *s.queue_paused_until.lock().unwrap()=Some(std::time::Instant::now()+std::time::Duration::from_secs(60));
+            }
+            s.queue_completion_pending.store(true,AtomicOrdering::Release);
+            *s.queue_blocked.lock().unwrap()=Some(("old hold".into(),crate::state::now_epoch()));
+            let mut starved=std::collections::HashMap::from([(s.id,crate::state::now_epoch())]);
+            super::deliver_queued(&daemon,&mut std::collections::HashMap::new(),&mut starved,&mut std::collections::HashMap::new());
+            let consumed=!s.queue_completion_pending.load(AtomicOrdering::Acquire);
+            let blocked=s.queue_blocked.lock().unwrap().clone();
+            let depth=s.pending_queue.lock().unwrap().len();
+            let _=close_surface(&daemon,s.id,CloseCause::OwnerClose);
+            assert!(consumed,"existing queue tick consumes the terminal notification");
+            assert!(!starved.contains_key(&s.id),"completed delivery ends the previous starvation episode even with a remaining head");
+            assert_eq!(depth,usize::from(remaining),"completion notification never admits the next blocked head");
+            if remaining { assert_eq!(blocked.unwrap().0,super::BLOCKED_QUEUE_PAUSED); }
+            else { assert!(blocked.is_none(),"an empty queue retains no obsolete block reason"); }
+        }
+    }
+
     use super::{
         approval_wakeup_suppressed, check_surfaces, collect_descendants, endpoint_key,
         is_node_owned, kill_pid, learn_stuck_candidates, merged_approval_patterns,
@@ -18042,7 +19065,8 @@ mod tests {
     /// 핀 I20(리셋 경로 전수 · 소스 핀) — 입력줄 계수를 바꾸는 호출처가 **알려진 목록**과 정확히 같다: `set_pending_input(`·`clear_pending_input(`·`apply_pending_input(` 의 생산 코드 호출 수.
     /// 새 호출처가 생기면(= 줄을 비었다/제출됐다고 계상하는 새 경로) 이 핀이 적색이 되어 **면제 표식(`esc_exempt_pgid`)을 내릴지 정하게** 한다 — 한 곳이라도 빠지면 죽은 좌석에 헛 계수가 선다.
     /// 목록: ① `apply_pending_input` — 직접 send(`send_text`)·`send_key`·보류 CR 재제출(스텝의 리셋이 표식을 내린다) ② `clear_pending_input` — 큐 직접 send `clear_first`·stale 리셋(Default) ③ `set_pending_input` —
-    /// 큐 인계(`take_esc_exempt` 가 내린다)·롤백(`restore_esc_exempt`)·스케줄 push 인계(`inject_on` 이 leaf 에서 내린다) + 상태 내부(apply·clear·recount).
+    /// 큐 인계(`take_esc_exempt` 가 내린다)·롤백(`restore_esc_exempt`)·스케줄 push 정산(`ScheduleSettle::reset_submitted_line` 이 leaf 에서 내린다 · S-a C6a) + 상태 내부(apply·clear·recount).
+    /// ★(0.14.52 · S-a) + 큐 인계의 writer 채널 실패 되돌림(`restore_esc_exempt`) · 부분 쓰기 보류의 접수 접두 계수(`restore_esc_exempt` — 줄이 제출되지 않았다).
     #[test]
     fn r1f_in_reset_path_census_source_pin() {
         // 생산 구간 — governance 는 이 파일의 관례(첫 cfg 속성 앞)이고, 나머지는 `mod tests` 바로 앞이다(앞쪽에 작은 cfg 항목이 있어도 생산 코드를 자르지 않는다).
@@ -18062,9 +19086,19 @@ mod tests {
         ];
         // (파일, set_pending_input, clear_pending_input, apply_pending_input) — 정의처(state.rs)는 `fn` 선언 1줄을 포함한다.
         let want: [(&str, usize, usize, usize); 5] = [
-            ("governance", 2, 1, 1),
-            ("handlers", 0, 1, 2),
-            ("schedule", 1, 0, 0),
+            // ★(0.14.52 · S-a C7a) +1 clear: `release_partial_write_hold` - the composer was measured EMPTY at a prompt
+            //   boundary, so the Default reset (count, human share and the exempt marker - leaf and mirror) is the truth.
+            // ★(0.14.52 · S-a C7b) +2 set: `try_resume_partial_write` - the resumed run's hand-off counts the line as submitted
+            //   and LOWERS the exempt marker (`take_esc_exempt`, as `deliver_head_locked` does); its failed hand-off restores
+            //   count and marker together (`restore_esc_exempt`, the rollback rule). A re-hold restores both in `hold_partial_write`.
+            ("governance", 6, 2, 1),
+            // ★(0.14.52 · S-a C5b) +1 clear, +1 apply: the direct agent write's settlement (`DirectSettle::run`) applies the
+            //   SAME clear-first reset / accepted-bytes step the handler applied at hand-off - moved to after the terminal.
+            ("handlers", 0, 2, 3),
+            // ★(0.14.52 · S-a C6a) the set (count reset) moved into the push settlement after the written Return; +1 apply: a push
+            //   stopped before its Return counts its accepted prefix as machine input (`ScheduleSettle::count_prefix`) - the line was
+            //   NOT submitted, so the exempt marker is not lowered (same rule as the queue's partial-write prefix).
+            ("schedule", 1, 0, 1),
             ("state", 4, 1, 1),
             ("channels", 0, 0, 0),
         ];
@@ -18112,10 +19146,11 @@ mod tests {
         );
         assert!(gov.contains("s.restore_esc_exempt(f.prev_esc_exempt_pgid);"), "롤백이 표식을 되살린다");
         let sch = prod(include_str!("schedule.rs"));
-        let inject_on = &sch[sch.find("\nfn inject_on(").expect("inject_on")..];
-        let inject_on = &inject_on[..inject_on.find("\n}\n").expect("끝")];
-        assert!(inject_on.contains("st.esc_exempt_pgid = 0;"), "스케줄 push 인계가 leaf 에서 표식을 내린다");
-        assert!(inject_on.contains("surface.esc_exempt_pgid.store(0,"), "스케줄 push 인계가 미러도 내린다");
+        // ★(0.14.52 · S-a C6a) the schedule count reset (and its marker drop) runs in the push settlement after the written Return.
+        let inject_on = &sch[sch.find("\n    fn reset_submitted_line(").expect("reset_submitted_line")..];
+        let inject_on = &inject_on[..inject_on.find("\n    }\n").expect("끝")];
+        assert!(inject_on.contains("st.esc_exempt_pgid = 0;"), "스케줄 push 정산이 leaf 에서 표식을 내린다");
+        assert!(inject_on.contains("surface.esc_exempt_pgid.store(0,"), "스케줄 push 정산이 미러도 내린다");
         // stale 리셋·clear_first 는 `clear_pending_input`(Default)이다 — 그 함수가 표식 leaf·미러를 모두 내린다.
         let st = include_str!("state.rs");
         let clear = &st[st.find("pub fn clear_pending_input(").expect("clear")..];
@@ -18574,6 +19609,57 @@ mod tests {
             s.pending_queue.lock().unwrap().is_empty(),
             "프롬프트 박스가 열려 있으면 출력 중이라도 배달한다(기아 봉인의 본체)"
         );
+    }
+
+    /// ★(0.14.52 · S-a) The tick honours a writer-terminal hold before any gate, ledger line or
+    /// hand-off: a refused seat waits out its backoff (reason `receiver_held`), a partial-write seat
+    /// stays held (`partial_write`); after the backoff the same deliverable seat delivers once.
+    #[test]
+    fn s_a_tick_honours_writer_terminal_holds_then_delivers_after_backoff() {
+        let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let pack = empty_pack_dir("s-a-hold");
+        let _env = QueueEnvGuard::set(&[
+            ("CYS_PACK_DIR", pack.to_str().unwrap()),
+            ("CYS_QUEUE_MAX_WAIT_SECS", "0"),
+            ("CYS_QUEUE_STARVE_ALERT_SECS", "0"),
+        ]);
+        let (daemon, s) = marker_seat("s-a-hold");
+        paint_prompt(&s, "", "");
+        *s.last_human_input.lock().unwrap() = None;
+        // The hold belongs to these queued work IDs, just as a real refused settlement does.
+        let held_ids: Vec<String> = s.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
+        assert!(!held_ids.is_empty());
+        let hold = |kind, next_retry| crate::state::QueueHold {
+            kind,
+            reason: "unknown:agent:denied".into(),
+            request_id: "w-test".into(),
+            entry_ids: held_ids.clone(),
+            since: std::time::Instant::now(),
+            attempts: 1,
+            next_retry,
+            envelope: None,
+            notified: true,
+            resume: None,
+            resuming: false,
+        };
+        let soon = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        *s.queue_hold.lock().unwrap() = Some(hold(crate::state::QueueHoldKind::Refused, soon));
+        let (mut depth, mut starve) = (HashMap::new(), HashMap::new());
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "a refused seat must wait out its backoff");
+        assert_eq!(s.queue_blocked.lock().unwrap().as_ref().map(|b| b.0.clone()), Some(super::BLOCKED_RECEIVER_HELD.to_string()));
+        *s.queue_hold.lock().unwrap() = Some(hold(crate::state::QueueHoldKind::PartialUnknown, None));
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "a partial-write seat stays held");
+        assert_eq!(s.queue_blocked.lock().unwrap().as_ref().map(|b| b.0.clone()), Some(super::BLOCKED_PARTIAL_WRITE.to_string()));
+        // Backoff elapsed (a refused hold whose retry time has come): the seat delivers once.
+        *s.queue_hold.lock().unwrap() = Some(hold(crate::state::QueueHoldKind::Refused, Some(std::time::Instant::now())));
+        deliver_queued(&daemon, &mut depth, &mut starve, &mut HashMap::new());
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "after the backoff the item is delivered");
+        assert!(s.queue_hold.lock().unwrap().is_none(), "a written delivery ends the hold episode");
+        let delivered = daemon.bus.tail(200).iter().filter(|e| e["name"] == "queue.delivered").count();
+        assert_eq!(delivered, 1);
+        kill_pid(s.pid);
     }
 
     /// 입력줄에 사람이 친 미제출 텍스트가 있으면 배달 0 + 사유가 남는다(이어붙이기·오제출 차단).
@@ -25796,7 +26882,7 @@ mod tests {
         ks.paused = true;
         ks.kill_switch = true;
         // (상수 이름, 값, d0 에서의 code) — 소스의 `const BLOCKED_*` 선언과 **이름 집합이 같아야** 한다(아래 전수 가드).
-        let consts: [(&str, &str, &str); 12] = [
+        let consts: [(&str, &str, &str); 14] = [
             ("BLOCKED_APPROVAL", BLOCKED_APPROVAL, "approval"),
             ("BLOCKED_MODAL", BLOCKED_MODAL, "answer_modal"),
             ("BLOCKED_BUSY", BLOCKED_BUSY, "wait"),
@@ -25807,6 +26893,8 @@ mod tests {
             ("BLOCKED_INTERVAL", BLOCKED_INTERVAL, "wait"),
             ("BLOCKED_QUIESCING", super::BLOCKED_QUIESCING, "wait"),
             ("BLOCKED_SETTLE_BUDGET", super::BLOCKED_SETTLE_BUDGET, "wait"),
+            ("BLOCKED_RECEIVER_HELD", super::BLOCKED_RECEIVER_HELD, "wait"),
+            ("BLOCKED_PARTIAL_WRITE", super::BLOCKED_PARTIAL_WRITE, "wait"),
             ("BLOCKED_QUEUE_PAUSED", super::BLOCKED_QUEUE_PAUSED, "wait"), // 좌석 pause 가 진단 시점에 이미 만료(paused=false)
             ("BLOCKED_PAUSED_KILL_SWITCH", super::BLOCKED_PAUSED_KILL_SWITCH, "unknown"), // kill_switch=false 인 d0 에서는 미분류 — 실사용은 아래 ks(1행)
         ];
@@ -28923,15 +30011,27 @@ pub(crate) fn h_send_outside(_pack: &HOutsidePack, daemon: &Arc<Daemon>, sid: u6
     for (k, v) in extra.as_object().expect("extra 는 객체") {
         params[k] = v.clone();
     }
+    let caller = Some(params.clone());
+    // ★(0.14.52 · S-a C5b) A real off-pane peer: the kernel always supplies one (the caller key of a held body
+    //   falls back to it when there is no `from`); this test process descends from no pane, as before.
+    let peer = Some(std::process::id());
     let reply = crate::handlers::dispatch(
         daemon,
         cys::Request { id: json!(1), method: "surface.send_text".into(), params },
-        None,
+        peer,
     );
     let crate::handlers::Reply::Single(v) = reply else {
         panic!("single reply 기대");
     };
     assert_eq!(v["ok"], json!(true), "전제: 좌석 밖 직접 send 가 통과해야 잔여가 남는다: {v}");
+    // ★(0.14.52 · S-a C5b) An automatic body without its Return is now HELD untyped (S3-5), so the residue these
+    //   specimens study arises by the remaining route: the same caller's Return binds it and the job stops before
+    //   the Return. That write is a daemon-written paste, so wait out its own-paste window (OWN_PASTE_SETTLE_MS) as
+    //   the old untracked direct write never needed to.
+    if v["result"]["held"] == json!("awaiting_submit") {
+        crate::direct_agent_tests::bind_with_return_lost(daemon, sid, peer, caller);
+        std::thread::sleep(std::time::Duration::from_millis(OWN_PASTE_SETTLE_MS + 100));
+    }
     v
 }
 
@@ -29597,9 +30697,13 @@ mod h_machine_hold_tests {
             // ★(R3SH-3) 통보 줄 쓰기가 즉시·미룬 재시도 공용 `pane_notice_line` 으로 모였다 — 두 호출자가 모두 그 앞에서
             //   `pane_notice_hold`(H0) 를 판정한다(아래 순서 핀).
             "boot_supervisor::pane_notice_line",
-            "handlers::announce_seat_takeover",
-            "handlers::npm_prefix_pane_notice_req",
+            // ★(0.14.52 · S-a C6d) `handlers::announce_seat_takeover` and `handlers::npm_prefix_pane_notice_req` left the list: both
+            //   notices are events only (no pane write at all).
             "handlers::send_text_write_req",
+            // ★(0.14.52 · S-a C5b) The direct send family's checked agent writes (send_text's owned-submit /
+            //   self-submitting / clear-first jobs and a Return bound to its held body): the same admission as
+            //   `send_text_write_req` (ACL, typing guard, D-12 draft gate, S21 settle hold) runs before the hand-off.
+            "handlers::hand_off_direct_job",
         ]
         .iter()
         .map(|s| s.to_string())
@@ -29612,7 +30716,8 @@ mod h_machine_hold_tests {
         // 판정 → 주입 순서(설계 H2~H5 에서 켠다): (파일, 판정이 사는 함수, 판정 토큰, 주입 토큰).
         let order: Vec<(&str, &str, &str, &str, &str)> = vec![
             // H2 — 스케줄 직접 push: 하드축 판정이 직접 주입보다 앞.
-            ("schedule", include_str!("schedule.rs"), "deliver_push", "machine_direct_hold(", "inject_on(daemon, &surface, text)"),
+            //   ★(0.14.52 · S-a C6a) the push path is `deliver_push_with` (the fire task then waits for the writer's verdict).
+            ("schedule", include_str!("schedule.rs"), "deliver_push_with", "machine_direct_hold(", "inject_on(daemon, &surface, text, Some(origin))"),
             // H3 — 채널 inbox: 하드축 재확인(master_hold) → 기록 선행(UPDATE) → 주입.
             ("channels", include_str!("channels.rs"), "master_hold", "deliverable_master(daemon) != Some(sid)", "machine_direct_hold("),
             ("channels", include_str!("channels.rs"), "deliver_new_inbox_with", "master_hold(", "SET state='injected'"),
@@ -29621,7 +30726,8 @@ mod h_machine_hold_tests {
             ("channels", include_str!("channels.rs"), "redeliver_unacked", "redelivered=redelivered+1", "inject_master_confirmed("),
             // H4 — CEO 자동결재: 하드축 판정이 원장 선기록·주입보다 앞.
             ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "record_audited("),
-            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "WriteReq::Inject"),
+            //   ★(0.14.52 · S-a C6c) the CEO route hands ONE checked agent request (`WriteReq::Agent`).
+            ("handlers", include_str!("handlers.rs"), "deliver_to_ceo", "machine_direct_hold(", "WriteReq::Agent"),
             // H5 — 부트 감독자 무스폰 통보: 하드축 판정이 원장 선기록·주입보다 앞(feed 는 그보다 앞 · 무조건).
             //   ★(R3SH-3) 판정은 `pane_notice_hold`(H0) · 쓰기는 `pane_notice_line`(원장 선기록 → 주입) — 즉시 경로와 미룬
             //   재시도 경로 모두 판정이 쓰기보다 앞이다.
@@ -29644,7 +30750,7 @@ mod h_machine_hold_tests {
         assert_eq!(got.into_iter().collect::<Vec<_>>(), vec!["fake::sneaky_producer".to_string()]);
     }
 
-    /// ★(R2F-DM · 성찰 2회차 마스터 결정 D2) **윈도우에서 `ignored`(+사유)로 남기는 검체는 정확히 이 44건이다**(1차 결정 41 + 2차 3 — 아래 ★) — 컴파일에서 빼지 않고(`#[cfg(unix)]`·조기 return 금지) `cfg_attr(not(unix), ignore = "<사유>")` 속성으로 윈도우 보고서에
+    /// ★(R2F-DM · 성찰 2회차 마스터 결정 D2) **윈도우에서 `ignored`(+사유)로 남기는 검체는 정확히 이 52건이다**(1차 결정 41 + 2차 3 + S-a C7b 6 + C7d 2 — 아래 ★) — 컴파일에서 빼지 않고(`#[cfg(unix)]`·조기 return 금지) `cfg_attr(not(unix), ignore = "<사유>")` 속성으로 윈도우 보고서에
     /// 사유가 남게 한다(맥·리눅스에는 `ignore` 가 붙지 않는다). 1차의 세 부류: A) `send_settle_tests.rs` 의 윈도우에서 붉던 22건 — S21 제출 정착·창 위 CR 보류는 `cfg!(unix)` 한정(`send_settle_applies`) B) 윈도우 기본 H 마스크가 `draft` 축을 끄는데
     /// (`hold_axes_default(true)` — 순수 검체 `h0_axes_default_by_platform`·`h0_conpty_fixtures` 가 이미 그 값을 고정한다) 유닉스 기본(draft 축) 동작을 보는 17건(h0 4 · h4 3 · h2 9 · c8 1) C) 좌석 명령이 POSIX 셸 문법인 2건.
     /// 이 핀은 **집합이 늘지도 줄지도 않게** 한다 — 나머지 20건(`send_settle_tests.rs` 의 '셸 좌석·윈도우·끔 = 종전 바이트' 음성 대조)은 윈도우에서도 돌아야 하고, [추측]으로 남긴 검체(ConPTY 2 · mtime 2 · ⓐ 추정·연쇄)는 윈도우 재측정 전에
@@ -29652,14 +30758,21 @@ mod h_machine_hold_tests {
     /// ★(R2F-DM 2차 · 윈도우 재측정 뒤 마스터 결정 B3-a) 41 → **44**: D) 좌석 종료를 **reader EOF** 로 아는 경로를 재는 3건 — 윈도우 러너에서 좌석 프로세스가 끝나거나 죽어도 reader 가 EOF 를 보지 못했다
     /// (진단 잡 37201047193 원문 · 대기 10~15초 — 마스터 표로는 같은 커밋의 헬스 실행에서도 같았다). 위의 "[추측] ConPTY 2" 가운데 하나(`q7_process_exit_…`)가 여기로 왔고, 나머지 하나(`read_text_reports_quiet_secs_…`)와 "mtime 2" 는 `ignore` 가 아니라 검체를 결정론으로 고쳤다
     /// (조용한 관측 창 `state::test_until_no_pty_output` · mtime 명시 `Fixture::rewrite`) — 그래서 이 집합에 없다.
+    /// ★(0.14.52 · S-a C7b) 44 → **50**: class C (POSIX seat command) +6 S4-1 resume specimens that record the receiver's bytes
+    /// (`agent_queue_tests`) - the exact-bytes proof needs a raw `cat` receiver; the same behaviour minus the byte comparison
+    /// runs on Windows in the sibling specimens. Test renamed `_of_44` -> `_of_50` (the CI comment in windows-health.yml too).
+    /// ★(0.14.52 · S-a C7d) 50 → **52**: class A (S21 withheld Return is Unix-only, `send_settle_applies`) +2 byte-exact
+    /// withheld-Return accounting specimens (`send_settle_tests::c7d_*`). Renamed `_of_52`.
     #[test]
-    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_44() {
+    fn r2f_dm_windows_ignore_attributes_are_exactly_the_decided_set_of_52() {
         const REASON_A: &str = "S21 제출 정착·창 위 CR 보류는 유닉스 한정(send_settle_applies)";
         const REASON_B: &str = "윈도우 기본 H 마스크는 draft 축을 끈다(hold_axes_default(true)) — 이 검체는 유닉스 기본(draft 축) 동작을 본다";
         const REASON_C: &str = "좌석 명령이 POSIX 셸 문법";
         const REASON_D: &str = "윈도우 ConPTY 는 자식이 끝나도 출력 파이프를 닫지 않는다 — reader EOF 로 좌석 종료를 아는 경로는 유닉스 전제";
         let want: Vec<(&str, &str, char)> = vec![
             ("send_settle_tests", "c5_settle_proof_denial_never_carries_the_ghost_prescription", 'A'),
+            ("send_settle_tests", "c7d_withheld_return_counts_the_body_bytes_and_is_resubmitted_once", 'A'),
+            ("send_settle_tests", "c7d_withheld_return_is_not_resubmitted_after_a_foreign_count_write", 'A'),
             ("send_settle_tests", "f1_submit_cr_withheld_on_stale_empty_seat_before_first_agent_sighting", 'A'),
             ("send_settle_tests", "f1_submit_cr_withheld_when_dialog_rose_after_own_body", 'A'),
             ("send_settle_tests", "f1_withheld_submit_dropped_after_newer_machine_body", 'A'),
@@ -29703,8 +30816,17 @@ mod h_machine_hold_tests {
             ("governance", "q7_process_exit_of_a_role_seat_parks_instead_of_dropping", 'D'),
             ("handlers", "reap_denies_queue_nonempty_then_queue_clear_exited_reclaim", 'D'),
             ("schedule", "c8_handoff_failure_leaves_the_count_untouched", 'D'),
+            // ★(0.14.52 · S-a C7b) class C +6: the S4-1 resume specimens compare the receiver's bytes through a recorder seat
+            //   (`stty raw -echo; exec cat > file`); their non-recorder siblings (window, widening, premises, input during
+            //   the write) still run on Windows.
+            ("agent_queue_tests", "s4_1_a_resumed_run_in_flight_is_never_released_or_announced", 'C'),
+            ("agent_queue_tests", "s4_1_epoch_move_between_the_check_and_the_first_byte_voids_the_resume", 'C'),
+            ("agent_queue_tests", "s4_1_foreign_write_queued_ahead_of_the_resume_voids_it_at_the_first_byte", 'C'),
+            ("agent_queue_tests", "s4_1_mid_body_transient_loss_resumes_and_submits_once", 'C'),
+            ("agent_queue_tests", "s4_1_modal_waits_inside_the_window_then_resumes", 'C'),
+            ("agent_queue_tests", "s4_1_resume_window_edges_are_exact", 'C'),
         ];
-        assert_eq!(want.len(), 44, "결정한 집합은 44건(22 + 17 + 2 + 3)");
+        assert_eq!(want.len(), 52, "결정한 집합은 52건(24 + 17 + 8 + 3)");
         let needle = concat!("#[cfg_attr(not(unix), ", "ignore = \"");
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cysd");
         let mut got: Vec<(String, String, char)> = Vec::new();
@@ -29731,8 +30853,8 @@ mod h_machine_hold_tests {
         got.sort();
         let mut want_sorted: Vec<(String, String, char)> = want.iter().map(|(a, b, c)| (a.to_string(), b.to_string(), *c)).collect();
         want_sorted.sort();
-        assert_eq!(got.len(), 44, "윈도우 `ignore` 가 {}건이다(결정 44건) — 새로 더했거나 뺐다: {got:?}", got.len());
-        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 44건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
+        assert_eq!(got.len(), 52, "윈도우 `ignore` 가 {}건이다(결정 52건) — 새로 더했거나 뺐다: {got:?}", got.len());
+        assert_eq!(got, want_sorted, "윈도우 `ignore` 집합이 결정한 52건과 다르다 — 목록과 `ignore` 사유를 함께 고쳐라");
     }
 }
 

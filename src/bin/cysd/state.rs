@@ -786,6 +786,9 @@ pub struct InjectGuard {
     pub safety: Option<SafetyProbe>,
     /// 0 = pending · 1 = claimed · 2 = aborted · 3 = acked(호출부가 claimed 를 수확했다).
     pub state: AtomicU8,
+    /// Bounded wake only: cancellation cannot execute a settlement callback inline.
+    cancel_wake: std::sync::OnceLock<ControllerWake>,
+
 }
 
 impl std::fmt::Debug for InjectGuard {
@@ -819,6 +822,68 @@ pub const INJECT_CLAIMING: u8 = 4;
 /// (`governance::QUEUE_TICK_SETTLE_BUDGET_MS` · 리뷰 R2 codex major).
 pub const INJECT_GUARD_WAIT_MS: u64 = 800;
 
+const INJECT_CONTROLLER_OWNED: u8 = 0x80;
+pub const INJECT_PROOF_PENDING: u8 = INJECT_CONTROLLER_OWNED | INJECT_PENDING;
+// Legacy numeric API only: production callers must match settle_handoff exhaustively.
+pub const INJECT_INVALID: u8 = 0x7f;
+
+/// Coalesced notification only, never authority to write or to declare cleanup complete.
+/// The private sender guarantees a positive-capacity channel. Its consumer must scan ALL
+/// registered guards after a wake; a full channel means that such a scan is already pending.
+#[derive(Clone, Debug)]
+pub(crate) struct ControllerWake {
+    sender: std::sync::mpsc::SyncSender<()>,
+}
+
+pub(crate) fn controller_wake_channel() -> (ControllerWake, std::sync::mpsc::Receiver<()>) {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    (ControllerWake { sender }, receiver)
+}
+
+impl ControllerWake {
+    pub(crate) fn notify(&self) {
+        // Disconnection never proves cleanup. The persistent guard state remains authoritative.
+        let _ = self.sender.try_send(());
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InjectHandoff {
+    CallerClaimed,
+    CallerAborted,
+    // This is an ownership result, including an abort whose cleanup belongs to the controller.
+    // It is never proof that a byte was written or that native discovery is still running.
+    ControllerOwned,
+    InvalidState(u8), // neither accepted pending nor proven cancellation
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InjectCleanupOwner { Caller, Controller }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferGuardError {
+    MissingCancelWake,
+    AlreadyConfigured,
+    NotPending(u8),
+    InvalidState(u8),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuardRevalidationSnapshot {
+    pub raw_state: u8,
+    pub expected_output_gen: Option<u64>,
+    pub observed_output_gen: u64,
+    pub expected_approval: bool,
+    pub has_safety_probe: bool,
+}
+
+impl GuardRevalidationSnapshot {
+    pub fn output_is_stale(&self) -> bool {
+        self.expected_output_gen.is_some_and(|g| g != self.observed_output_gen)
+    }
+}
+
+
 impl InjectGuard {
     pub fn new(
         expect_gen: Option<u64>,
@@ -832,6 +897,136 @@ impl InjectGuard {
             expect_approval,
             safety,
             state: AtomicU8::new(INJECT_PENDING),
+            cancel_wake: std::sync::OnceLock::new(),
+        }
+    }
+
+    // The controller registers bounded capacity and the exact provisional job BEFORE deferral.
+    // Successful ownership CAS activates that record; failed CAS leaves cleanup with the caller.
+    // The installed wake only schedules a coalesced scan, never inline cleanup under queue locks.
+    fn decode_state(raw: u8) -> Option<(u8, u8)> {
+        let phase = raw & !INJECT_CONTROLLER_OWNED;
+        matches!(phase, INJECT_PENDING | INJECT_CLAIMING | INJECT_CLAIMED | INJECT_ACKED | INJECT_ABORTED)
+            .then_some((raw & INJECT_CONTROLLER_OWNED, phase))
+    }
+
+    pub fn defer_to_controller(
+        &self,
+        wake: ControllerWake,
+    ) -> Result<(), DeferGuardError> {
+        self.install_pending_wake(wake)?;
+        self.commit_controller_ownership()
+    }
+
+    fn install_pending_wake(
+        &self,
+        wake: ControllerWake,
+    ) -> Result<(), DeferGuardError> {
+        let raw = self.state.load(Ordering::Acquire);
+        Self::decode_state(raw).ok_or(DeferGuardError::InvalidState(raw))?;
+        if self.cancel_wake.get().is_some() {
+            return Err(DeferGuardError::AlreadyConfigured);
+        }
+        if raw != INJECT_PENDING {
+            return Err(DeferGuardError::NotPending(raw));
+        }
+        self.cancel_wake.set(wake).map_err(|_| DeferGuardError::AlreadyConfigured)
+    }
+
+    fn commit_controller_ownership(&self) -> Result<(), DeferGuardError> {
+        if self.cancel_wake.get().is_none() {
+            return Err(DeferGuardError::MissingCancelWake);
+        }
+        match self.state.compare_exchange(
+            INJECT_PENDING, INJECT_PROOF_PENDING, Ordering::AcqRel, Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(raw) if Self::decode_state(raw).is_none() => Err(DeferGuardError::InvalidState(raw)),
+            Err(raw) => Err(DeferGuardError::NotPending(raw)),
+        }
+    }
+
+    pub fn cleanup_owner(&self) -> Result<InjectCleanupOwner, u8> {
+        let raw = self.state.load(Ordering::Acquire);
+        match Self::decode_state(raw) {
+            Some((0, _)) => Ok(InjectCleanupOwner::Caller),
+            Some(_) => Ok(InjectCleanupOwner::Controller),
+            None => Err(raw),
+        }
+    }
+
+    pub fn revalidation_snapshot(&self) -> GuardRevalidationSnapshot {
+        GuardRevalidationSnapshot {
+            raw_state: self.state.load(Ordering::Acquire),
+            expected_output_gen: self.expect_gen,
+            observed_output_gen: self.output_gen.load(Ordering::Acquire),
+            expected_approval: self.expect_approval,
+            has_safety_probe: self.safety.is_some(),
+        }
+    }
+
+    fn wake_controller_after_abort(&self, aborted: u8) {
+        if aborted & INJECT_CONTROLLER_OWNED == 0 {
+            return;
+        }
+        if let Some(wake) = self.cancel_wake.get() {
+            // Full: a coalesced scan wake is already pending. The consumer MUST scan every
+            // registered pending guard. Disconnected: bytes remain forbidden, cleanup is not proven.
+            // Neither case may call cleanup inline or fall back to a blocking send.
+            wake.notify();
+        }
+    }
+
+    pub fn settle_handoff(&self, wait_ms: u64) -> InjectHandoff {
+        let deadline = Instant::now() + std::time::Duration::from_millis(wait_ms);
+        loop {
+            let raw = self.state.load(Ordering::Acquire);
+            let Some((owner, phase)) = Self::decode_state(raw) else {
+                return InjectHandoff::InvalidState(raw);
+            };
+            if owner != 0 {
+                return InjectHandoff::ControllerOwned;
+            }
+            match phase {
+                INJECT_PENDING | INJECT_CLAIMING => {}
+                INJECT_CLAIMED => {
+                    if self.state.compare_exchange(INJECT_CLAIMED, INJECT_ACKED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        return InjectHandoff::CallerClaimed;
+                    }
+                    continue;
+                }
+                INJECT_ACKED => return InjectHandoff::CallerClaimed,
+                INJECT_ABORTED => return InjectHandoff::CallerAborted,
+                _ => return InjectHandoff::InvalidState(raw),
+            }
+            if self.output_moved() || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        loop {
+            let raw = self.state.load(Ordering::Acquire);
+            let Some((owner, phase)) = Self::decode_state(raw) else {
+                return InjectHandoff::InvalidState(raw);
+            };
+            if owner != 0 {
+                return InjectHandoff::ControllerOwned;
+            }
+            match phase {
+                INJECT_PENDING | INJECT_CLAIMING => {
+                    if self.state.compare_exchange(raw, INJECT_ABORTED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        return InjectHandoff::CallerAborted;
+                    }
+                }
+                INJECT_CLAIMED => {
+                    if self.state.compare_exchange(INJECT_CLAIMED, INJECT_ACKED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        return InjectHandoff::CallerClaimed;
+                    }
+                }
+                INJECT_ACKED => return InjectHandoff::CallerClaimed,
+                INJECT_ABORTED => return InjectHandoff::CallerAborted,
+                _ => return InjectHandoff::InvalidState(raw),
+            }
         }
     }
     /// 출력 세대가 판정 시점과 달라졌는가(락 없는 원자 읽기 — 호출부 대기 루프가 쓴다).
@@ -871,54 +1066,37 @@ impl InjectGuard {
     }
     /// writer 쪽 결판 — 반환 true = **내가 쓴다**.
     pub fn claim_for_write(&self) -> bool {
-        // ★(0.14.31 · 성찰 Q1·Q2 · codex 설계 검토 #2) 값싼 축(락 없는 원자 읽기)만으로 먼저
-        //   거른다 — 이미 결판났거나 세대가 흘렀으면 무거운 안전 탐침(화면 복사·스캔 · 락 3개)을
-        //   돌 이유가 없다. 무거운 축은 아래 `CLAIMING` 구간에서 **한 번만** 돈다.
-        if self.output_moved() {
-            return match self.state.compare_exchange(
-                INJECT_PENDING,
-                INJECT_ABORTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => false, // 내가 중단시켰다 — 쓰지 않는다
-                // 호출부가 이미 결판냈다 — 그 결정을 따른다(수확된 CLAIMED 는 반드시 쓴다).
-                Err(cur) => cur == INJECT_CLAIMED || cur == INJECT_ACKED,
-            };
-        }
-        match self.state.compare_exchange(
-            INJECT_PENDING,
-            INJECT_CLAIMING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {
-                // ★소유권을 집은 **뒤** 마지막 재확인. 이 구간의 상태는 `CLAIMING` 이라 호출부가
-                //   수확할 수 없다 = 늦은 중단이 언제나 성립한다(triage codex blocking).
-                //   여기가 안전 탐침의 **유일한** 호출 지점이다(성찰 Q1·Q2).
-                if self.axes_moved() {
-                    // 중단 확정. 그 사이 처분자가 먼저 `ABORTED` 로 바꿨어도 결론은 같다.
-                    let _ = self.state.compare_exchange(
-                        INJECT_CLAIMING,
-                        INJECT_ABORTED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
+        loop {
+            let raw = self.state.load(Ordering::Acquire);
+            let Some((owner, phase)) = Self::decode_state(raw) else { return false };
+            match phase {
+                INJECT_CLAIMED | INJECT_ACKED => return true,
+                INJECT_PENDING => {}
+                _ => return false,
+            }
+            if self.output_moved() {
+                let aborted = owner | INJECT_ABORTED;
+                if self.state.compare_exchange(raw, aborted, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    self.wake_controller_after_abort(aborted);
                     return false;
                 }
-                // 재검사 통과 — 이제야 쓰기 확정을 **공개**한다. 그 사이 처분자·호출부가
-                // `ABORTED` 로 바꿨으면 그 결정을 따른다(주입 0 · 항목 보존).
-                self.state
-                    .compare_exchange(
-                        INJECT_CLAIMING,
-                        INJECT_CLAIMED,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
+                continue;
             }
-            // 이미 수확·확정된 배달은 반드시 쓴다(보고된 배달이 사라지지 않는다 — 기존 핀).
-            Err(cur) => cur == INJECT_CLAIMED || cur == INJECT_ACKED,
+            let claiming = owner | INJECT_CLAIMING;
+            if self.state.compare_exchange(raw, claiming, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                continue;
+            }
+            // Cancellation may win while this predicate runs. A caller cannot acknowledge Claiming.
+            if self.axes_moved() {
+                let aborted = owner | INJECT_ABORTED;
+                if self.state.compare_exchange(claiming, aborted, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    self.wake_controller_after_abort(aborted);
+                }
+                return false;
+            }
+            return self.state.compare_exchange(
+                claiming, owner | INJECT_CLAIMED, Ordering::AcqRel, Ordering::Acquire,
+            ).is_ok();
         }
     }
     /// ★(0.14.31 · 리뷰 R2 · codex blocking) **처분자의 취소** — 아직 아무도 결판내지 않았으면
@@ -926,36 +1104,24 @@ impl InjectGuard {
     /// 된다). false = writer 가 이미 쓰기로 확정했다 → 그 항목은 **배달 중**이므로 처분하지 않는다
     /// (폐기 통지 뒤 실제 주입 = 승인·빈 좌석 사고로 이어지는 방향이라 그쪽을 택하지 않는다).
     pub fn abort_if_pending(&self) -> bool {
-        // ★(triage 2026-09-08) `CLAIMING`(writer 가 재검사 중)도 취소 대상이다 — 그 상태의 writer 는
-        //   아직 확정을 공개하지 않았고, 여기서 이기면 writer 의 확정 CAS 가 실패해 한 바이트도
-        //   나가지 않는다. 취소 창이 넓어지는 방향이고(= 처분이 더 자주 성립) 귀결은 보류다.
-        for from in [INJECT_PENDING, INJECT_CLAIMING] {
-            match self.state.compare_exchange(
-                from,
-                INJECT_ABORTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(cur) if cur == INJECT_ABORTED => return true,
-                Err(_) => continue,
+        loop {
+            let raw = self.state.load(Ordering::Acquire);
+            let Some((owner, phase)) = Self::decode_state(raw) else { return false };
+            match phase {
+                INJECT_ABORTED => return true,
+                INJECT_PENDING | INJECT_CLAIMING => {
+                    let aborted = owner | INJECT_ABORTED;
+                    if self.state.compare_exchange(raw, aborted, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        self.wake_controller_after_abort(aborted);
+                        return true;
+                    }
+                }
+                _ => return false,
             }
         }
-        self.state.load(Ordering::Acquire) == INJECT_ABORTED
     }
-    /// `CLAIMED` 를 **수확**한다 — 성공하면 `INJECT_CLAIMED`, 그 사이 writer 가 늦게 중단했으면
-    /// 그 값(`INJECT_ABORTED`)을 돌려준다.
-    fn ack(&self) -> u8 {
-        match self.state.compare_exchange(
-            INJECT_CLAIMED,
-            INJECT_ACKED,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => INJECT_CLAIMED,
-            Err(cur) => cur,
-        }
-    }
+    /// Legacy-only timing contract below; production callers use the exhaustive settle_handoff result.
+    /// Managed/invalid states return explicit sentinels, never a legacy success inequality.
     /// 호출부의 결판 대기 — 반환값은 `INJECT_CLAIMED`(writer 가 쓴다) 또는 `INJECT_ABORTED`.
     ///
     /// 두 가지 방식으로 끝난다.
@@ -968,66 +1134,11 @@ impl InjectGuard {
     ///      바뀌어도 아무도 다시 보지 않는다(codex 리뷰의 정확한 반례). 항목은 큐에 남아 다음 틱에
     ///      **다시 판정**되므로 유실이 아니라 지연이다(§3-3).
     pub fn settle(&self, wait_ms: u64) -> u8 {
-        let deadline = Instant::now() + std::time::Duration::from_millis(wait_ms);
-        loop {
-            match self.state.load(Ordering::Acquire) {
-                INJECT_PENDING => {}
-                // ★(triage 2026-09-08) writer 가 재검사 중이다 — **아직 미결판**이므로 기다린다.
-                //   여기서 수확하면 늦은 중단이 무력화된다(그 결함의 자리다).
-                INJECT_CLAIMING => {}
-                INJECT_CLAIMED => return self.ack(),
-                // 이미 수확된 결판을 다시 물으면 같은 답을 준다(멱등 — 반환 계약은 두 값뿐이다).
-                INJECT_ACKED => return INJECT_CLAIMED,
-                other => return other,
-            }
-            if self.output_moved() {
-                break; // ① 판정이 본 프레임이 아니게 됐다 — 기다릴 이유가 없다
-            }
-            if Instant::now() >= deadline {
-                break; // ②
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        // ★반환 계약은 **두 값뿐**이다(`CLAIMED` 또는 `ABORTED`) — 호출부는 "ABORTED 가 아니면
-        //   배달됐다" 로 읽고 큐에서 뺀다(`governance::deliver_head_locked`). `CLAIMING` 을 그대로
-        //   돌려주면 쓰이지도 않은 항목이 큐에서 사라진다(유실). 그래서 미결판 상태는 여기서
-        //   **중단으로 확정**하고, 그 사이 writer 가 확정을 공개했으면 그것을 수확한다.
-        loop {
-            match self.state.load(Ordering::Acquire) {
-                INJECT_PENDING => {
-                    if self
-                        .state
-                        .compare_exchange(
-                            INJECT_PENDING,
-                            INJECT_ABORTED,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        return INJECT_ABORTED;
-                    }
-                }
-                INJECT_CLAIMING => {
-                    if self
-                        .state
-                        .compare_exchange(
-                            INJECT_CLAIMING,
-                            INJECT_ABORTED,
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                        )
-                        .is_ok()
-                    {
-                        return INJECT_ABORTED;
-                    }
-                }
-                INJECT_CLAIMED => return self.ack(),
-                INJECT_ACKED => return INJECT_CLAIMED,
-                INJECT_ABORTED => return INJECT_ABORTED,
-                // 미지 상태는 **보류 방향**으로 접는다(주입 0 · 항목 보존).
-                _ => return INJECT_ABORTED,
-            }
+        match self.settle_handoff(wait_ms) {
+            InjectHandoff::CallerClaimed => INJECT_CLAIMED,
+            InjectHandoff::CallerAborted => INJECT_ABORTED,
+            InjectHandoff::ControllerOwned => INJECT_PROOF_PENDING,
+            InjectHandoff::InvalidState(_) => INJECT_INVALID,
         }
     }
 }
@@ -1041,6 +1152,107 @@ pub struct InjectReservation {
     /// 그 인계의 가드 — 처분자가 이것으로 인계를 취소한다.
     pub guard: Arc<InjectGuard>,
 }
+
+/// ★(0.14.52 · S-a) Why this seat's queue is held after an agent-write terminal (design 4.5/4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueHoldKind {
+    /// Refused before any byte (receiver proof / journal): retried on backoff 1, 2, 4, 8, then 30 s.
+    Refused,
+    /// Stopped byte-exactly by a resumable loss: only the SAME request may continue (S4-1);
+    /// nothing else is typed into this seat meanwhile. The hand-off reservation is kept.
+    PartialExact,
+    /// Stopped at an unknown point: never retyped; reconciliation owns it. Reservation kept.
+    PartialUnknown,
+}
+
+/// ★(0.14.52 · S-a) One hold episode of a seat's queue. Leaf lock; one coalesced notice per episode.
+#[derive(Debug, Clone)]
+pub struct QueueHold {
+    pub kind: QueueHoldKind,
+    pub reason: String,
+    pub request_id: String,
+    pub entry_ids: Vec<String>,
+    /// Start of the episode (kept across same-kind retries).
+    pub since: Instant,
+    /// Refusals in this episode (Refused only).
+    pub attempts: u32,
+    /// Earliest tick retry (Refused only).
+    pub next_retry: Option<Instant>,
+    /// Where a partial request stopped.
+    pub envelope: Option<crate::agent_write::Envelope>,
+    /// The episode's single notice was published.
+    pub notified: bool,
+    /// ★(0.14.52 · S-a C7b) PartialExact only: what the SAME request needs to continue (S4-1). Taken by the resume
+    /// hand-off; `None` after a restart (no resume across a restart) and for every other kind.
+    pub resume: Option<Arc<crate::governance::QueueResume>>,
+    /// ★(0.14.52 · S-a C7b) A resumed run of this request is in the writer: no second resume, no notice, no release.
+    pub resuming: bool,
+}
+
+/// ★(0.14.52 · S-a C7a) A partial-write hold as persisted across a daemon restart (`queue-write-holds.json`, keyed by
+/// every held queue entry id). Without it a restart restores the entries and hands them off again onto the composer that
+/// already holds their prefix (retype - the double-delivery direction). Never carries body text.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedWriteHold {
+    pub kind: String,
+    pub reason: String,
+    pub request_id: String,
+    pub entry_ids: Vec<String>,
+    pub body_offset: usize,
+    /// Wall-clock epoch seconds when the hold was set (the age survives the restart).
+    pub held_at: f64,
+}
+
+pub const WRITE_HOLDS_FILE: &str = "queue-write-holds.json";
+
+/// ★(0.14.52 · S-a C7e) An untokened body held untyped awaiting its caller's Return (`submit_assoc`), as persisted across a
+/// daemon restart - ids, seat, age, length and digest only, never the text. The next daemon disposes each one explicitly
+/// (undelivered, never typed): caller keys and agent epochs do not survive a restart, so no Return can bind it again.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PersistedHeldBody {
+    pub request_id: String,
+    pub surface_id: u64,
+    pub role: Option<String>,
+    /// Wall-clock epoch seconds when the body was received.
+    pub held_at: f64,
+    pub chars: usize,
+    pub text_sha256: String,
+}
+
+pub const HELD_BODIES_FILE: &str = "submit-held.json";
+/// Durable evidence of held bodies a restart disposed (one JSON line each; rotated to `.1` past 1 MiB).
+pub const HELD_UNDELIVERED_LOG: &str = "submit-held-undelivered.jsonl";
+
+/// Load `submit-held.json` (missing or unreadable -> nothing to dispose).
+pub(crate) fn load_held_bodies(dir: &std::path::Path) -> Vec<PersistedHeldBody> {
+    std::fs::read_to_string(dir.join(HELD_BODIES_FILE)).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
+}
+
+/// Load `queue-write-holds.json` (missing or unreadable -> empty: nothing to adopt).
+pub(crate) fn load_write_holds(dir: &std::path::Path) -> HashMap<String, PersistedWriteHold> {
+    let holds: Vec<PersistedWriteHold> = std::fs::read_to_string(dir.join(WRITE_HOLDS_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    let mut map = HashMap::new();
+    for h in holds {
+        for id in &h.entry_ids {
+            map.insert(id.clone(), h.clone());
+        }
+    }
+    map
+}
+
+/// Refused-hold retry backoff (design 4.6): 1, 2, 4, 8, then 30 seconds.
+pub const QUEUE_HOLD_BACKOFF_SECS: [u64; 5] = [1, 2, 4, 8, 30];
+
+pub fn queue_hold_backoff(attempts: u32) -> std::time::Duration {
+    let i = (attempts.max(1) as usize - 1).min(QUEUE_HOLD_BACKOFF_SECS.len() - 1);
+    std::time::Duration::from_secs(QUEUE_HOLD_BACKOFF_SECS[i])
+}
+
+/// ★(0.14.52 · S-a) Writer request journal file in the state directory.
+pub const WRITER_JOURNAL_FILE: &str = "writer-journal.jsonl";
 
 /// ★(0.14.42 · A2) 짝 Return 흡수 표의 종류 — 발급 사유가 곧 흡수 응답의 `absorb_kind` 다.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1133,6 +1345,9 @@ pub struct InjectTrack {
     /// ★(0.14.42 · 수정 2회차 F1 · 재개) 보류한 제출 CR — [`WithheldSubmit`]. 쓰기 = writer 의 보류 탐침(적중 시) · 소비·폐기 =
     /// watchdog 틱의 재제출(`governance::resubmit_withheld_submits`). leaf 락(다른 락을 쥔 채 잡지 않는다).
     withheld: Mutex<Option<WithheldSubmit>>,
+    /// ★(0.14.52 · S-a C7b) Writer requests that wrote at least one byte to this seat (any arm). A held partial write
+    /// resumes only while this is unchanged since its hold (S4-1 "no foreign input since the loss").
+    wrote: AtomicU64,
 }
 
 /// ★(0.14.42 · 수정 2회차 F1 · 재개) 쓰지 않은(보류한) 제출 CR 의 기록 — 보류는 **버림이 아니라 미룸**이다. 창이 닫히고
@@ -1159,12 +1374,16 @@ pub(crate) struct WithheldSubmit {
     pub(crate) dialog_ms: u64,
     /// 직전 관측이 '창 열림'이었는가 — 보류 탐침 자체가 창 관측이라 생성 = true. 못 본 틱(사이클 창)은 false(사슬만 끊음).
     pub(crate) dialog_open: bool,
+    /// ★(0.14.52 · S-a C7d · I10) The input count and input generation the withheld Return's own settlement left (design 4.5
+    /// byte-exact: the body counted, the unwritten Return not) - the resubmission requires exactly these. `None` = a record
+    /// whose Return was counted when it was handed off (the resubmission's own re-withhold): the count must then be 0.
+    pub(crate) expect: Option<(u64, u64)>,
 }
 
 impl WithheldSubmit {
     /// 보류 탐침이 창을 본 순간의 기록 — 두 시계 0 · 창 열림.
     pub(crate) fn new(at: Instant, body_at: Instant, from: Option<u64>) -> Self {
-        Self { at, body_at, from, seen_at: at, live_ms: 0, dialog_ms: 0, dialog_open: true }
+        Self { at, body_at, from, seen_at: at, live_ms: 0, dialog_ms: 0, dialog_open: true, expect: None }
     }
 
     /// ★(R3C-1) 순수 — 틱 1회의 경과를 잰다: `seen_at` 을 `now` 로 옮기고, pause 가 아니면 `live_ms` 에 더한다.
@@ -1351,6 +1570,16 @@ impl InjectTrack {
         let norm = normalize_input_text(text);
         *self.last_body.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(MachineBody { norm, owner, at: Instant::now() });
+    }
+
+    /// ★(0.14.52 · S-a C7b) writer only - this request put at least one byte on the PTY.
+    pub(crate) fn note_wrote(&self) {
+        self.wrote.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// ★(0.14.52 · S-a C7b) Writer requests that wrote at least one byte so far ([`InjectTrack::note_wrote`]).
+    pub(crate) fn wrote(&self) -> u64 {
+        self.wrote.load(Ordering::Acquire)
     }
 
     /// ★(R3SH-1) 마지막 기계 본문 기록(없으면 None).
@@ -1559,6 +1788,12 @@ pub enum WriteReq {
         /// 최소 간격 기준점(`last_program_write`)도 찍지 않는다 — 화면에 없는 바이트를 기준 삼지 않는다(B2′ 규율).
         withhold: Option<SafetyProbe>,
     },
+    /// ★(0.14.52 · S-a) Checked agent write: one logical machine request to an agent receiver
+    /// ([`crate::agent_write`]). Journal barrier, full admission proof, then every OS call capped at
+    /// 4,096 bytes and re-proven; the typed terminal is journaled before the producer's settlement
+    /// runs. Refused / cancelled / partial outcomes do not end the writer loop — only a broken
+    /// transport does (an exit would drop the writer, and Unix writer Drop types newline + VEOF).
+    Agent(Box<crate::agent_write::AgentJob>),
 }
 
 /// 청크 경계 상태: 미완성 ESC/UTF-8 꼬리·\r 덮어쓰기·진행 중 라인
@@ -1715,7 +1950,7 @@ pub struct Surface {
     pub close_operation: Mutex<()>,
     /// PTY 쓰기는 전용 writer 스레드만 수행 — async 경로는 유한 채널 try_send.
     /// 정체된 pane의 블로킹 write가 tokio 워커·watchdog을 멈추는 경로를 원천 차단한다.
-    pub write_tx: std::sync::mpsc::SyncSender<WriteReq>,
+    pub write_tx: crate::writer_gate::WriterSender,
     pub master: Mutex<Box<dyn MasterPty + Send>>,
     pub child: Mutex<Box<dyn Child + Send + Sync>>,
     pub parser: Mutex<vt100::Parser>,
@@ -1805,7 +2040,7 @@ pub struct Surface {
     pub agent_fg_pgid: AtomicI32,
     /// ★(0.14.43 · R1F-IN ⓐ) **잠정 Esc 면제 표식의 원자 미러**(unix) — V3 로 면제한 **사람의 단독 Esc** 가 마지막 리셋 뒤에 있었다면 **면제 당시의 PTY 전경(에이전트) 그룹 번호**, 없으면 0.
     /// 진실은 leaf 상태 `PendingInputState::esc_exempt_pgid` 이고 이것은 틱이 락 없이 미리 보는 용도다 — 쓰는 곳은 모두 `pending_input` leaf 를 쥔 채다(`apply_pending_input` · `clear_pending_input` ·
-    /// `take_esc_exempt` · `restore_esc_exempt` · `recount_exempted_esc` · 스케줄 인계 계상 `schedule::inject_on`). 틱은 이 값이 0 이 아닌 좌석에서만 지금의 전경 그룹을 커널에 물어(`tcgetpgrp`) 면제 당시의
+    /// `take_esc_exempt` · `restore_esc_exempt` · `recount_exempted_esc` · 스케줄 push 정산 계상 `schedule::ScheduleSettle::reset_submitted_line` · S-a C6a). 틱은 이 값이 0 이 아닌 좌석에서만 지금의 전경 그룹을 커널에 물어(`tcgetpgrp`) 면제 당시의
     /// 그룹이 아니면 되돌린다(`governance::esc_recount_due`). 휘발.
     #[cfg(unix)]
     pub esc_exempt_pgid: AtomicI32,
@@ -1860,10 +2095,28 @@ pub struct Surface {
     /// 같은 좌석의 이중 인계도 이것이 막는다(`pending_queue` 락 안에서 검사·설정).
     /// 락 순서: `pending_queue` → (`input_gate`) → `inject_reservation`(leaf).
     pub inject_reservation: Mutex<Option<InjectReservation>>,
+    /// ★(0.14.52 · S-a) Queue hold after an agent-write terminal ([`QueueHold`]). Leaf lock.
+    pub queue_hold: Mutex<Option<QueueHold>>,
+    /// ★(0.14.52 · S-a) Receiver proof for this seat's agent writes; `None` = pass-through until the
+    /// receiver binding is wired. Leaf lock (cloned out before use).
+    pub receiver_proof: Mutex<Option<Arc<dyn crate::agent_write::Proof>>>,
+    /// ★(0.14.52 · S-a C5b) Untokened legacy bodies held untyped until their caller's Return binds
+    /// them (S3-5 / S4-3, `submit_assoc`). Leaf lock; never held across a write or a bus publish.
+    pub submit_assoc: Mutex<crate::submit_assoc::AssociationTable>,
+    /// ★(0.14.52 · S-a C5b) Agent incarnation counter for that table's "same seat generation": bumped
+    /// when an agent is registered/observed, recovers or exits, so a body held for one agent never
+    /// binds to the next. C8 replaces it with the receiver binding epoch.
+    pub agent_epoch: AtomicU64,
+    /// ★(0.14.52 · S-a C7b) Conversation counter for S4-1 "same conversation epoch": bumped with every agent_epoch bump
+    /// and when the seat's agent session is re-pinned after `/clear` (`usage.session_repinned`). Only a claude `/clear`
+    /// re-pin is observed as a conversation change; C8's receiver binding replaces this proxy.
+    pub conversation_epoch: AtomicU64,
     /// ★(0.14.31 · WP-5 폭주 완충) 이 surface 의 **마지막 큐 배달 시각** — 틱·overdue·강제·
     /// rehome 어느 경로든 `deliver_head_locked` 가 인계에 성공한 순간 찍는다(같은 시계). 호출부
     /// 게이트가 `governance::queue_min_interval_secs()`(기본 10s) 미만이면 배달을 보류한다.
     pub last_queue_delivery_at: Mutex<Option<Instant>>,
+    /// Coalesced notification for the existing queue tick's starvation cooldown; never write authority.
+    pub queue_completion_pending: AtomicBool,
     /// ★(0.14.31 · WP-5 B-2②) `pending_input_bytes` **stale 관측** — (그때 본 바이트 수, 그때의
     /// `input_gen`, 처음 모순을 본 시각). 화면은 커서행 빈 프롬프트·출력 정적·모달 없음인데 계수만
     /// >0 인 상태가 **같은 세대**로 임계 이상 지속되면 계수를 stale 로 보고 0 으로 리셋한다(dept-1
@@ -2164,6 +2417,26 @@ impl Surface {
     /// 지금 인계 예약이 걸려 있는가(같은 좌석의 이중 인계 차단 · 배달 임계영역 전용).
     pub fn inject_reserved(&self) -> bool {
         self.inject_reservation.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// ★(0.14.52 · S-a C5b) A new agent incarnation on this seat (see [`Surface::agent_epoch`]).
+    pub fn bump_agent_epoch(&self) {
+        self.agent_epoch.fetch_add(1, Ordering::AcqRel);
+        self.bump_conversation_epoch(); // a new agent is a new conversation
+    }
+
+    /// ★(0.14.52 · S-a C7b) A new conversation on this seat (see [`Surface::conversation_epoch`]).
+    pub fn bump_conversation_epoch(&self) {
+        self.conversation_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// ★(0.14.52 · S-a) The proof an agent write to this seat uses now (pass-through until bound).
+    pub fn agent_proof(&self) -> Arc<dyn crate::agent_write::Proof> {
+        self.receiver_proof
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::agent_write::PassThrough))
     }
     /// ★(0.14.31 · WP-5 B-2②) `pending_input_bytes` 의 **유일한 쓰기 API** — 값을 쓰고 변이 세대
     /// (`input_gen`)를 올린다. 직접 `store` 하면 세대가 멈춰 stale 리셋이 ABA 를 놓친다(테스트 픽스처
@@ -3011,8 +3284,8 @@ pub fn count_dsr_queries(tail: &[u8], chunk: &[u8]) -> (usize, Vec<u8>) {
 /// 의미를 구현한다. 반환 true=송신 성공 / false=deadline 소진 또는 수신자 소멸(드롭 — 호출자가
 /// 카운터·로그로 가시화할 책임). **유계 보증**: 최악에도 deadline + 슬라이스 1회분 안에 반환
 /// 한다 — reader 스레드의 '배수 절대 정지 금지' 계약을 깨지 않는다.
-pub fn send_write_req_bounded(
-    tx: &std::sync::mpsc::SyncSender<WriteReq>,
+pub(crate) fn send_write_req_bounded(
+    tx: &impl crate::writer_gate::WriteAdmission,
     req: WriteReq,
     deadline: std::time::Duration,
 ) -> bool {
@@ -3020,7 +3293,7 @@ pub fn send_write_req_bounded(
     let start = Instant::now();
     let mut req = req;
     loop {
-        match tx.try_send(req) {
+        match tx.admit(req) {
             Ok(()) => return true,
             // 수신자 소멸(writer 스레드 종료) — 재시도 무의미, 즉시 드롭.
             Err(TrySendError::Disconnected(_)) => return false,
@@ -3671,6 +3944,14 @@ pub struct Daemon {
     ///   ③ rehome — rehome_restored_queue의 Value→QueueEntry 되살림(필드 관통)
     ///   ④ queue.list restored 노출 — handlers.rs "queue.list"의 restored 행(신규 열 결손 방지)
     pub restored_queue: Mutex<Vec<serde_json::Value>>,
+    /// ★(0.14.52 · S-a C7a) Partial-write holds by queue entry id, mirrored to `queue-write-holds.json` (see
+    /// [`PersistedWriteHold`]); loaded at start so a restored held entry is adopted as held, never handed off again.
+    pub write_holds: Mutex<HashMap<String, PersistedWriteHold>>,
+    /// ★(0.14.52 · S-a C7e) Held bodies an earlier daemon run left in `submit-held.json`, disposed once by the first
+    /// `handlers::sync_held_bodies` of this run.
+    pub held_bodies_restart: Mutex<Vec<PersistedHeldBody>>,
+    /// ★(0.14.52 · S-a C7e) The held request ids last written to `submit-held.json` (`None` = not written this run).
+    pub held_bodies_written: Mutex<Option<Vec<String>>>,
     /// ★(0.14.31 · WP-5 M) **만료 복원분** — `queue-expired.json`(활성 WAL 과 **다른 파일**)에서
     /// 살아난 만료 항목(Value 통짜). 왜 파일을 가르는가: 만료 항목을 `queue-state.json` 에 함께
     /// 두면 **구 데몬(롤백)** 이 `expired_at` 을 모른 채 활성 큐로 rehome 해 배달한다(codex 설계
@@ -3738,6 +4019,10 @@ pub struct Daemon {
     pub queue_wal_unpreserved: Mutex<std::collections::BTreeSet<&'static str>>,
     pub config: Config,
     pub socket_path: PathBuf,
+    /// ★(0.14.52 · S-a) Writer request journal ([`WRITER_JOURNAL_FILE`]), opened on first use.
+    pub writer_journal: Mutex<Option<Arc<crate::agent_write::FileJournal>>>,
+    /// Requests an earlier daemon run left `writing` without a terminal (restore as PartialUnknown).
+    pub writer_inconclusive: Mutex<Vec<crate::agent_write::Inconclusive>>,
     pub started_at: f64,
     /// ★(0.14.31 · 리뷰 R1 · codex major) **단조 기동 기준점**. `started_at`(epoch)은 벽시계라
     /// NTP 보정·수동 시각 변경에 앞뒤로 뛴다 — 경과시간 창(부트 유예·쿨다운·시간당 상한)을
@@ -5599,6 +5884,9 @@ impl Daemon {
             operator_token,
             feed_persist_lock: Mutex::new(()),
             restored_queue: Mutex::new(restored_qentries),
+            write_holds: Mutex::new(load_write_holds(&dir)),
+            held_bodies_restart: Mutex::new(load_held_bodies(&dir)),
+            held_bodies_written: Mutex::new(None),
             restored_expired: Mutex::new(restored_expired),
             queue_seq: AtomicU64::new(queue_seq_seed),
             queue_persist_lock: Mutex::new(()),
@@ -5614,6 +5902,8 @@ impl Daemon {
             config: Config::from_env(),
             recall_tx: Mutex::new(crate::recall::spawn_writer(socket_path.clone())),
             socket_path,
+            writer_journal: Mutex::new(None),
+            writer_inconclusive: Mutex::new(Vec::new()),
             started_at: now_epoch(),
             started_instant: Instant::now(),
             consumption: Mutex::new(Consumption::default()),
@@ -5793,6 +6083,42 @@ impl Daemon {
                    "resolver_surface": snapshot.resolver_surface}),
         );
         Some(snapshot)
+    }
+
+    /// ★(0.14.52 · S-a) The writer request journal, opened on first use. While it cannot be opened
+    /// every agent write is refused before its first byte (design 4.4 step 2) and the next write
+    /// tries again, so a transient state-directory error heals without a restart.
+    /// ★(0.14.52 · S-a C7a) Mirror `write_holds` to `queue-write-holds.json` (atomic replace). A failure is an event; the
+    /// in-memory hold still blocks this run (only a restart would lose it).
+    pub fn persist_write_holds(&self) {
+        let holds: Vec<PersistedWriteHold> = {
+            let g = self.write_holds.lock().unwrap_or_else(|e| e.into_inner());
+            let mut seen = std::collections::BTreeSet::new();
+            g.values().filter(|h| seen.insert(h.request_id.clone())).cloned().collect()
+        };
+        let body = serde_json::to_string(&holds).unwrap_or_else(|_| "[]".into());
+        if let Err(e) = crate::governance::write_json_atomic(&state_dir(&self.socket_path), WRITE_HOLDS_FILE, &body) {
+            self.bus.publish(
+                "queue.write_holds_persist_failed",
+                "queue",
+                None,
+                serde_json::json!({"error": e.to_string(), "holds": holds.len()}),
+            );
+        }
+    }
+
+    pub fn agent_journal(&self) -> Arc<dyn crate::agent_write::Journal> {
+        let mut slot = self.writer_journal.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            match crate::agent_write::FileJournal::open(state_dir(&self.socket_path).join(WRITER_JOURNAL_FILE)) {
+                Ok((j, inconclusive)) => {
+                    self.writer_inconclusive.lock().unwrap_or_else(|e| e.into_inner()).extend(inconclusive);
+                    *slot = Some(Arc::new(j));
+                }
+                Err(e) => return Arc::new(crate::agent_write::UnavailableJournal(e.to_string())),
+            }
+        }
+        slot.clone().expect("journal opened above")
     }
 
     /// Feed 항목 스냅샷 한 줄을 JSONL에 append (영속화 — 데몬 재시작 복원용).
@@ -6496,7 +6822,7 @@ impl Daemon {
         // 영구 잔존 → recv()가 영영 반환 않고 writer 스레드·PTY writer fd가 누수된다.
         // writer_stop을 reader 스레드(EOF)가 세우면 recv_timeout 루프가 이를 보고 종료해
         // 좀비 writer 스레드와 그 fd를 즉시 회수한다.
-        let (write_tx, write_rx) = std::sync::mpsc::sync_channel::<WriteReq>(128);
+        let (write_tx, write_rx) = crate::writer_gate::WriterSender::channel(128);
         let writer_stop = Arc::new(AtomicBool::new(false));
         let inject_track = Arc::new(InjectTrack::default());
         {
@@ -6619,7 +6945,13 @@ impl Daemon {
             // ★(0.14.31 · WP-5) 만료 큐·배달 간격 시계·stale 입력 관측 — 전부 빈 채로 출발.
             expired_queue: Mutex::new(std::collections::VecDeque::new()),
             inject_reservation: Mutex::new(None),
+            queue_hold: Mutex::new(None),
+            receiver_proof: Mutex::new(None),
+            submit_assoc: Mutex::new(crate::submit_assoc::AssociationTable::default()),
+            agent_epoch: AtomicU64::new(0),
+            conversation_epoch: AtomicU64::new(0),
             last_queue_delivery_at: Mutex::new(None),
+            queue_completion_pending: AtomicBool::new(false),
             pending_input_stale: Mutex::new(None),
             last_injected: Mutex::new(None),
             inject_track,
@@ -7334,7 +7666,7 @@ impl Daemon {
 /// recv_timeout 폴링은 stop을 주기적으로 관측하기 위한 것 — 평시 동작·순서는 불변이다.
 /// clear_first 주입의 Ctrl-U 후 settle(ms) — TUI가 라인 정리를 반영할 짬. 기본 150
 /// (기존 cys.rs --clear-first의 클라측 sleep 값 계승). CYS_CLEAR_SETTLE_MS로 조정.
-fn clear_settle_ms() -> u64 {
+pub(crate) fn clear_settle_ms() -> u64 {
     std::env::var("CYS_CLEAR_SETTLE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -7415,9 +7747,9 @@ pub(crate) fn run_writer_loop<W: Write>(
 /// [`run_writer_loop`] 에 Inject arm 진행 표식([`InjectTrack`])을 붙인 판 — 프로덕션 좌석이 쓴다. 표식은 arm 의
 /// 첫 바이트 앞에서 세우고 마지막 바이트(CR) 뒤에 내린다(인계 가드가 포기한 요청은 세우지 않는다 = 한 바이트도 안 씀).
 /// 바이트·순서·지연은 [`run_writer_loop`] 와 같다(표식은 원자·leaf 락 쓰기뿐).
-pub(crate) fn run_writer_loop_tracked<W: Write>(
+pub(crate) fn run_writer_loop_tracked<W: Write, R: Into<crate::writer_gate::QueuedWrite>>(
     mut writer: W,
-    write_rx: std::sync::mpsc::Receiver<WriteReq>,
+    write_rx: std::sync::mpsc::Receiver<R>,
     stop: Arc<AtomicBool>,
     track: Option<Arc<InjectTrack>>,
 ) {
@@ -7434,6 +7766,8 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
             }
             Err(RecvTimeoutError::Disconnected) => break, // 모든 sender drop
         };
+        // The lease spans every arm, flush and Agent terminal settlement, including early exits.
+        let (req, _operation) = req.into().into_parts();
         let res = match req {
             WriteReq::Data(bytes) => writer.write_all(&bytes).and_then(|_| writer.flush()),
             // ★B2: 최소 간격 확보용 지연 쓰기. 단일 소비자라 이 sleep 동안 뒤 요청은 채널에
@@ -7519,7 +7853,64 @@ pub(crate) fn run_writer_loop_tracked<W: Write>(
             // 그런데도 앵커를 찍으면 큐 배달 직후의 중복 Enter 만 최대 150ms 늦어진다 —
             // 종전에 없던 지연을 아무 이득 없이 새로 만드는 것이다(B2′ 에서 잘못 넣었다).
             // 기준점은 `Program` 본문과 `SubmitAfterGap` 이 쓴 CR 에만 찍힌다.
+            // ★(0.14.52 · S-a) Checked agent write. The track marks follow the Inject arm, but only around
+            //   bytes actually written: `begin` immediately before the first byte, `note_body` with the
+            //   accepted prefix (never the planned full body), `submit_written` only for a written Return.
+            //   A panic inside the job is contained as PartialUnknown so the writer thread survives.
+            WriteReq::Agent(job) => {
+                let job = *job;
+                let mut began = false;
+                let mut body_noted = false;
+                let ex = {
+                    let mut on_first_byte = || {
+                        if let Some(t) = &track {
+                            t.begin();
+                        }
+                        began = true;
+                    };
+                    // The whole body is recorded the moment its last byte is accepted - before the
+                    // Return phase, whose withhold probe reads this record (★(0.14.52 · S-a C5b)).
+                    let (note, owner) = (job.note_body, job.body_owner);
+                    let mut on_body_written = |body: &str| {
+                        if let (Some(t), true) = (&track, note) {
+                            t.note_body(body, owner);
+                        }
+                        body_noted = true;
+                    };
+                    let mut io = crate::agent_write::WriterIo {
+                        sleep: &std::thread::sleep,
+                        last_program_write: &mut last_program_write,
+                        on_first_byte: &mut on_first_byte,
+                        on_body_written: &mut on_body_written,
+                    };
+                    // execute catches a job panic with the identity of the run it actually began.
+                    crate::agent_write::execute(&mut writer, &job, &mut io)
+                };
+                if let (Some(t), true) = (&track, began) {
+                    t.note_wrote();
+                    if !body_noted && job.note_body {
+                        if let Some(body) = ex.accepted_body(&job.plan) {
+                            t.note_body(&body, job.body_owner);
+                        }
+                    }
+                    if ex.envelope.submitted {
+                        t.submit_written();
+                    }
+                    t.end();
+                }
+                let broken = ex.transport_broken;
+                crate::agent_write::finish(job, &ex);
+                if broken {
+                    break; // PTY closed: the same exit as the existing I/O-error path below
+                }
+                continue;
+            }
         };
+        // ★(0.14.52 · S-a C7b) Every arm that reaches here attempted a write (a withheld Return and an unclaimed Inject
+        //   `continue` above without a byte): counted even when it failed, since a failed write may have put bytes.
+        if let Some(t) = &track {
+            t.note_wrote();
+        }
         if res.is_err() {
             break; // PTY 닫힘 — 이후 send는 disconnected로 호출자에 드러난다
         }
@@ -13859,5 +14250,234 @@ mod r2f_dm2_tests {
         assert_eq!((done, calls), (false, 4), "끝내 조용해지지 않으면 실패다(시도 상한)");
         let f = fn_src(include_str!("state.rs"), concat!("\npub(crate) fn test_done_or_no_pty", "_output(s: &Surface, attempt: impl FnMut() -> bool) -> bool {"));
         assert!(f.contains("cfg!(unix), 60, 25, attempt"), "`test_done_or_no_pty_output` 이 유닉스에서 한 번뿐이 아니다:\n{f}");
+    }
+}
+
+#[cfg(test)]
+mod c8_proof_pending_red {
+    use super::{InjectGuard, SafetyProbe, INJECT_ABORTED, INJECT_CLAIMED,
+        INJECT_CLAIMING, INJECT_PENDING};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock, Weak};
+
+    const OWNED: u8 = 0x80;
+
+    fn deferred(safety: Option<SafetyProbe>) -> InjectGuard {
+        let g = InjectGuard::new(Some(4), Arc::new(AtomicU64::new(4)), false, safety);
+        // Fixture state injection only. Production must use bounded admission + defer_to_controller.
+        g.state.store(OWNED | INJECT_PENDING, Ordering::Release);
+        g
+    }
+
+    #[test]
+    fn c8pp_disposer_can_cancel_proof_pending_without_losing_cleanup_owner() {
+        let g = deferred(None);
+        assert!(g.abort_if_pending(), "zero-byte proof-pending work must remain cancelable");
+        assert_eq!(g.state.load(Ordering::Acquire), OWNED | INJECT_ABORTED, "managed cancellation retains its cleanup owner");
+        assert!(!g.claim_for_write(), "canceled work must never regain first-byte authority");
+    }
+
+    #[test]
+    fn c8pp_writer_fresh_claims_a_healthy_deferred_guard() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let g = deferred(Some(Arc::new(move || {
+            observed.fetch_add(1, Ordering::AcqRel);
+            false
+        })));
+        assert!(g.claim_for_write(), "controller ownership is not a permanent refusal");
+        assert_eq!(calls.load(Ordering::Acquire), 1, "writer must actually run the safety probe");
+        assert_eq!(g.state.load(Ordering::Acquire), OWNED | INJECT_CLAIMED);
+        assert!(!g.abort_if_pending(), "already claimed work retains its in-delivery protection");
+    }
+
+    #[test]
+    fn c8pp_late_modal_is_checked_inside_controller_owned_claiming() {
+        let slot: Arc<OnceLock<Weak<InjectGuard>>> = Arc::new(OnceLock::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (s, c) = (slot.clone(), calls.clone());
+        let probe: SafetyProbe = Arc::new(move || {
+            c.fetch_add(1, Ordering::AcqRel);
+            let g = s.get().unwrap().upgrade().unwrap();
+            assert_eq!(g.state.load(Ordering::Acquire), OWNED | INJECT_CLAIMING);
+            // Caller observing a 0 ms budget must not steal rollback or ACK this check.
+            assert_eq!(g.settle(0), OWNED | INJECT_PENDING);
+            assert_eq!(g.state.load(Ordering::Acquire), OWNED | INJECT_CLAIMING);
+            true
+        });
+        let g = Arc::new(deferred(Some(probe)));
+        slot.set(Arc::downgrade(&g)).unwrap();
+        assert!(!g.claim_for_write());
+        assert_eq!(calls.load(Ordering::Acquire), 1, "an early refusal is not a tested late-modal veto");
+        assert_eq!(g.state.load(Ordering::Acquire), OWNED | INJECT_ABORTED);
+    }
+
+    #[test]
+    fn c8pp_caller_observation_never_takes_managed_cleanup_even_after_abort() {
+        for phase in [INJECT_PENDING, INJECT_CLAIMING, INJECT_CLAIMED, INJECT_ABORTED] {
+            let g = deferred(None);
+            g.state.store(OWNED | phase, Ordering::Release);
+            assert_eq!(g.settle(0), OWNED | INJECT_PENDING,
+                "managed phase {phase}: caller receives ownership, not a legacy rollback decision");
+            assert_eq!(g.state.load(Ordering::Acquire), OWNED | phase, "caller observation must not change controller-owned phase");
+        }
+    }
+
+    #[test]
+    fn c8pp_stale_generation_is_not_silently_rebased() {
+        let g = deferred(None);
+        g.output_gen.store(6, Ordering::Release);
+        assert!(!g.claim_for_write());
+        assert_eq!(g.expect_gen, Some(4));
+        assert_eq!(g.state.load(Ordering::Acquire), OWNED | INJECT_ABORTED,
+            "a stale managed attempt aborts without surrendering its cleanup owner");
+    }
+
+    #[test]
+    fn c8pp_disposer_wins_while_the_fresh_safety_probe_is_running() {
+        let slot: Arc<OnceLock<Weak<InjectGuard>>> = Arc::new(OnceLock::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (s, c) = (slot.clone(), calls.clone());
+        let g = Arc::new(deferred(Some(Arc::new(move || {
+            c.fetch_add(1, Ordering::AcqRel);
+            let g = s.get().unwrap().upgrade().unwrap();
+            assert!(g.abort_if_pending(), "claiming is still pre-write and cancelable");
+            false // safety itself passes; cancellation must independently defeat the final CAS
+        }))));
+        slot.set(Arc::downgrade(&g)).unwrap();
+        assert!(!g.claim_for_write());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(g.state.load(Ordering::Acquire), OWNED | INJECT_ABORTED);
+    }
+}
+
+#[cfg(test)]
+mod c8_proof_pending_v2_api_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn guard() -> Arc<InjectGuard> {
+        Arc::new(InjectGuard::new(None, Arc::new(AtomicU64::new(4)), false, None))
+    }
+
+    #[test]
+    fn c8pp_v2_shared_arc_installs_once_and_redefer_cannot_replace_the_wake() {
+        let g = guard();
+        let already_shared = g.clone();
+        let (first, first_rx) = controller_wake_channel();
+        let (second, second_rx) = controller_wake_channel();
+        g.defer_to_controller(first).unwrap();
+        assert_eq!(already_shared.defer_to_controller(second.clone()), Err(DeferGuardError::AlreadyConfigured), "redeferral cannot replace the installed wake");
+        assert_eq!(g.cleanup_owner(), Ok(InjectCleanupOwner::Controller));
+        assert_eq!(already_shared.settle_handoff(0), InjectHandoff::ControllerOwned);
+        assert!(already_shared.abort_if_pending());
+        assert_eq!(first_rx.try_recv(), Ok(()), "successful deferred cancellation wakes its registered controller");
+        assert!(matches!(second_rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "a rejected sender must not replace the installed one");
+    }
+
+    #[test]
+    fn c8pp_v2_cancel_between_wake_install_and_cas_keeps_legacy_cleanup() {
+        let g = guard();
+        let (wake, rx) = controller_wake_channel();
+        // These are the same private steps called sequentially by defer_to_controller.
+        // No callback/hook or timing assumption is needed to exercise the publication window.
+        g.install_pending_wake(wake).unwrap();
+        assert!(g.abort_if_pending());
+        assert_eq!(g.commit_controller_ownership(), Err(DeferGuardError::NotPending(INJECT_ABORTED)), "pre-CAS cancellation keeps cleanup with the caller");
+        assert_eq!(g.cleanup_owner(), Ok(InjectCleanupOwner::Caller));
+        assert_eq!(g.settle_handoff(0), InjectHandoff::CallerAborted);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "a configured wake does not confer cleanup ownership");
+        assert!(!g.claim_for_write());
+        let (retry, _retry_rx) = controller_wake_channel();
+        assert_eq!(g.defer_to_controller(retry), Err(DeferGuardError::AlreadyConfigured));
+    }
+
+    #[test]
+    fn c8pp_v2_configured_but_uncommitted_guard_rejects_a_second_installer() {
+        let g = guard();
+        let (winner, winner_rx) = controller_wake_channel();
+        let (loser, loser_rx) = controller_wake_channel();
+        g.install_pending_wake(winner).unwrap();
+        assert_eq!(g.defer_to_controller(loser.clone()), Err(DeferGuardError::AlreadyConfigured));
+        assert_eq!(g.state.load(Ordering::Acquire), INJECT_PENDING);
+        g.commit_controller_ownership().unwrap();
+        assert!(g.abort_if_pending());
+        assert_eq!(winner_rx.try_recv(), Ok(()));
+        assert!(matches!(loser_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn c8pp_v2_unknown_raw_phase_has_no_inferred_owner_or_write_authority() {
+        for raw in [5u8, 0x7f, 0x85, 0xff] {
+            let g = guard();
+            g.state.store(raw, Ordering::Release);
+            assert_eq!(g.settle_handoff(0), InjectHandoff::InvalidState(raw), "invalid phase must not become controller-owned pending");
+            assert_eq!(g.settle(0), INJECT_INVALID);
+            assert_eq!(g.cleanup_owner(), Err(raw));
+            assert!(!g.claim_for_write());
+            assert!(!g.abort_if_pending());
+            let (wake, _rx) = controller_wake_channel();
+            assert_eq!(g.defer_to_controller(wake), Err(DeferGuardError::InvalidState(raw)));
+            assert!(g.cancel_wake.get().is_none());
+            assert_eq!(g.state.load(Ordering::Acquire), raw, "invalid state must remain reportable, not normalized into success/cancellation");
+        }
+    }
+
+    #[test]
+    fn c8pp_v2_unknown_phase_after_wake_install_does_not_complete_ownership() {
+        let g = guard();
+        let (wake, rx) = controller_wake_channel();
+        g.install_pending_wake(wake).unwrap();
+        g.state.store(0x85, Ordering::Release);
+        assert_eq!(g.commit_controller_ownership(), Err(DeferGuardError::InvalidState(0x85)));
+        assert_eq!(g.cleanup_owner(), Err(0x85));
+        assert_eq!(g.settle_handoff(0), InjectHandoff::InvalidState(0x85));
+        assert!(!g.claim_for_write());
+        assert!(!g.abort_if_pending());
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn c8pp_v2_cancel_wake_never_waits_for_a_receiver() {
+        let (wake, notifications) = controller_wake_channel();
+        wake.notify(); // fill the one slot; a blocking-send mutant must wait for the receiver
+        let g = guard();
+        g.defer_to_controller(wake).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let actor = std::thread::spawn(move || tx.send(g.abort_if_pending()).unwrap());
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        drop(notifications); // releases a blocking-send mutant before assertions
+        actor.join().unwrap();
+        assert_eq!(result.ok(), Some(true), "cancel notification must not block on a receiver");
+    }
+
+    #[test]
+    fn c8pp_v2_coalesced_wake_and_repeated_abort_keep_persistent_facts() {
+        let (wake, rx) = controller_wake_channel();
+        let a = guard(); let b = guard();
+        a.defer_to_controller(wake.clone()).unwrap(); b.defer_to_controller(wake).unwrap();
+        assert!(a.abort_if_pending()); assert!(b.abort_if_pending());
+        assert_eq!(rx.try_recv(), Ok(()));
+        for g in [&a, &b] {
+            assert_eq!(g.cleanup_owner(), Ok(InjectCleanupOwner::Controller));
+            assert_eq!(g.state.load(Ordering::Acquire), INJECT_CONTROLLER_OWNED | INJECT_ABORTED);
+            assert!(g.abort_if_pending());
+            assert_eq!(g.settle_handoff(0), InjectHandoff::ControllerOwned);
+        }
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)), "duplicate aborts never enqueue another wake");
+    }
+
+    #[test]
+    fn c8pp_v2_stale_output_remains_stale_after_wake_installation() {
+        let g = Arc::new(InjectGuard::new(Some(4), Arc::new(AtomicU64::new(4)), false, Some(Arc::new(|| false))));
+        let (wake, _rx) = controller_wake_channel();
+        g.defer_to_controller(wake).unwrap();
+        g.output_gen.store(6, Ordering::Release);
+        let snapshot = g.revalidation_snapshot();
+        assert!(snapshot.output_is_stale());
+        assert_eq!(g.expect_gen, Some(4));
+        assert!(!g.claim_for_write());
+        assert_eq!(g.cleanup_owner(), Ok(InjectCleanupOwner::Controller));
     }
 }

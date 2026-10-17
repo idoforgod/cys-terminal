@@ -1239,6 +1239,13 @@ fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Val
     let action = if res.delivered.contains(&inbox_id) { "delivered" } else { "queued" };
     let evt = if action == "delivered" { "channel.message" } else { "channel.message.queued" };
     let mut payload = json!({"channel": channel, "inbox_id": inbox_id, "sender_id": sender_id});
+    // ★(0.14.52 · S-a C6b) `delivered` keeps its wire meaning (handed to the master's writer) for external bridges; the
+    //   writer's verdict follows as `channel.message.written` / `.write_refused` / `.write_partial` with this request id.
+    let request_id = res.requests.iter().find(|(i, _)| *i == inbox_id).map(|(_, r)| r.clone());
+    if let (Some(r), Some(obj)) = (&request_id, payload.as_object_mut()) {
+        obj.insert("written".into(), json!("pending"));
+        obj.insert("request_id".into(), json!(r));
+    }
     // ★(0.14.42 · 설계 H3) 보류 사유(가산 키) — 모달·초안·사람 입력·셸 단독·master 부재 등.
     if action == "queued" {
         if let (Some(h), Some(obj)) = (res.hold, payload.as_object_mut()) {
@@ -1246,7 +1253,12 @@ fn inbound(daemon: &Arc<Daemon>, conn: &mut Connection, params: &Value, id: &Val
         }
     }
     daemon.bus.publish(evt, "channel", None, payload);
-    ok_response(id, json!({"action": action, "inbox_id": inbox_id}))
+    let mut reply = json!({"action": action, "inbox_id": inbox_id});
+    if let (Some(r), Some(obj)) = (request_id, reply.as_object_mut()) {
+        obj.insert("written".into(), json!("pending"));
+        obj.insert("request_id".into(), json!(r));
+    }
+    ok_response(id, reply)
 }
 
 // ── V4/V7 원격 승인 브루트·상한 원장 헬퍼(§5) ────────────────────────────────
@@ -1630,8 +1642,19 @@ fn master_hold(daemon: &Arc<Daemon>, sid: u64) -> Result<Arc<crate::state::Surfa
 
 /// master stdin에 봉투를 주입(bracketed paste + Return). schedule.rs inject와 동형.
 /// ★(0.14.42 · 설계 H3) 판정([`master_hold`])과 상태 기록은 호출부가 **먼저** 끝낸 뒤 부른다 — 이 함수는
-/// 원장 선기록(delivery.rs 불변식 ①)과 writer 인계만 한다. 반환 = 인계 성공.
-fn inject_master_confirmed(daemon: &Arc<Daemon>, surface: &Arc<crate::state::Surface>, envelope: &str) -> bool {
+/// 원장 선기록(delivery.rs 불변식 ①)과 writer 인계만 한다. 반환 = 인계 성공(그 요청 id).
+/// ★(0.14.52 · S-a C6b) The envelope is ONE checked agent request (body + its own Return); its settlement
+/// ([`ChannelSettle`], writer thread) decides what the hand-off only promised: written -> `channel.message.written`;
+/// zero bytes -> the hand-off mark is undone (the writer's `end()` never ran, so a stale mark would pace every later row and
+/// then report the master's writer busy) and the row goes back to exactly the state it had before this hand-off, so the next
+/// sweep retries it; stopped part-way -> the row stays `injected` (never re-typed), `channel.message.write_partial`.
+fn inject_master_confirmed(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
+    envelope: &str,
+    inbox_id: i64,
+    handoff: InboxHandoff,
+) -> Option<String> {
     // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 외부 채널 봉투도 기계 유래다.
     crate::delivery::record_audited(
         daemon,
@@ -1642,20 +1665,147 @@ fn inject_master_confirmed(daemon: &Arc<Daemon>, surface: &Arc<crate::state::Sur
     );
     // ★(0.14.42 · H3 간격 경쟁) 인계 표식 — `try_send` **앞**(writer 가 집어 끝내기 전에 반드시 서 있어야 한다 ·
     //   InjectTrack::note_handoff doc). 다음 배달 루프는 writer 가 이 행을 끝낸 뒤 + 간격까지 다음 행을 판정하지 않는다.
+    let request = crate::agent_write::Request::new(
+        crate::agent_write::new_request_id((daemon.started_at * 1000.0) as u64),
+        surface.id,
+        "channel",
+        crate::delivery::digest_text(envelope),
+    );
+    let request_id = request.id.clone();
+    let (proof, journal) = (surface.agent_proof(), daemon.agent_journal());
     let mark = surface.inject_track.note_handoff();
-    let ok = surface
-        .write_tx
-        .try_send(crate::state::WriteReq::Inject {
-            text: envelope.to_string(),
-            cr_delay_ms: 500,
-            clear_first: false,
-            guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작 · 판정은 master_hold 가 앞에서 했다)
-        })
-        .is_ok();
+    let settle = ChannelSettle {
+        daemon: Arc::downgrade(daemon),
+        surface: Arc::downgrade(surface),
+        inbox_id,
+        handoff,
+        mark,
+        request_id: request_id.clone(),
+    };
+    let job = crate::agent_write::AgentJob {
+        attempt: None,
+        request,
+        plan: crate::agent_write::Plan::paste(envelope).with_submit(500, 0),
+        proof,
+        journal: Some(journal),
+        resume: None,
+        settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
+        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작 · 판정은 master_hold 가 앞에서 했다)
+        note_body: true, // the old Inject arm recorded every envelope (owner None)
+        body_owner: None,
+    };
+    let ok = surface.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_ok();
     if !ok {
         surface.inject_track.undo_handoff(mark);
     }
-    ok
+    ok.then_some(request_id)
+}
+
+/// ★(0.14.52 · S-a C6b) The row state a channel hand-off changed, so a zero-byte terminal can put it back exactly.
+#[derive(Clone, Copy, Debug)]
+enum InboxHandoff {
+    /// `new` -> `injected` (deliver_new_inbox_with).
+    New,
+    /// A redelivery of an `injected` row: its previous `injected_ts` and `redelivered` (redeliver_unacked).
+    Redeliver { prev_injected_ts: f64, prev_redelivered: i64 },
+}
+
+/// ★(0.14.52 · S-a C6b) Settlement of one inbox envelope after the writer's terminal (design 4.5; runs on the master seat's
+/// writer thread). Lock note: it takes `daemon.channels` for one UPDATE; holders of that lock never wait for a writer (they
+/// only `try_send`), so no cycle.
+struct ChannelSettle {
+    daemon: std::sync::Weak<Daemon>,
+    surface: std::sync::Weak<crate::state::Surface>,
+    inbox_id: i64,
+    handoff: InboxHandoff,
+    mark: crate::state::HandoffMark,
+    request_id: String,
+}
+
+impl ChannelSettle {
+    fn run(self, t: &crate::agent_write::Terminal) {
+        use crate::agent_write::Terminal as T;
+        let Some(daemon) = self.daemon.upgrade() else { return };
+        let sid = self.surface.upgrade().map(|s| s.id);
+        match t {
+            T::WrittenSubmitted { .. } => {
+                daemon.bus.publish(
+                    "channel.message.written",
+                    "channel",
+                    sid,
+                    json!({"inbox_id": self.inbox_id, "request_id": self.request_id}),
+                );
+            }
+            T::RefusedNoWrite { .. } | T::CancelledBeforeWrite => {
+                if let Some(s) = self.surface.upgrade() {
+                    s.inject_track.undo_handoff(self.mark);
+                }
+                let rolled_back = rollback_inbox_handoff(&daemon, self.inbox_id, self.handoff);
+                if first_write_refusal(&daemon, self.inbox_id) {
+                    let reason = match t {
+                        T::RefusedNoWrite { reason } => reason.clone(),
+                        _ => "cancelled".to_string(),
+                    };
+                    daemon.bus.publish(
+                        "channel.message.write_refused",
+                        "channel",
+                        sid,
+                        json!({"inbox_id": self.inbox_id, "request_id": self.request_id, "reason": reason,
+                               "rolled_back": rolled_back,
+                               "note": "Zero bytes were written to the master for this inbox row; the row is back to its state before \
+                                        the hand-off and the next sweep retries it (this event is published once per row)."}),
+                    );
+                }
+            }
+            T::WrittenBody { .. } | T::PartialExact { .. } | T::PartialUnknown { .. } => {
+                let (reason, offset) = match t {
+                    T::PartialExact { reason, envelope, .. } | T::PartialUnknown { reason, envelope, .. } => {
+                        (reason.clone(), Some(envelope.body_offset))
+                    }
+                    _ => ("return_not_written".to_string(), None),
+                };
+                daemon.bus.publish(
+                    "channel.message.write_partial",
+                    "channel",
+                    sid,
+                    json!({"inbox_id": self.inbox_id, "request_id": self.request_id, "kind": t.kind(), "reason": reason,
+                           "body_offset": offset,
+                           "note": "The envelope stopped part-way; the row stays injected and is never re-typed; the daemon neither \
+                                    erases nor types more."}),
+                );
+            }
+        }
+    }
+}
+
+/// Put an inbox row back to its state before a hand-off that wrote nothing (same statements as the hand-off failure
+/// branches). `true` = exactly one row changed.
+fn rollback_inbox_handoff(daemon: &Arc<Daemon>, inbox_id: i64, handoff: InboxHandoff) -> bool {
+    let mut g = daemon.channels.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(conn) = g.as_mut() else { return false };
+    let r = match handoff {
+        InboxHandoff::New => conn.execute(
+            "UPDATE inbox SET state='new', injected_ts=NULL WHERE id=?1 AND state='injected'",
+            [inbox_id],
+        ),
+        InboxHandoff::Redeliver { prev_injected_ts, prev_redelivered } => conn.execute(
+            "UPDATE inbox SET injected_ts=?2, redelivered=?3 WHERE id=?1 AND state='injected'",
+            params![inbox_id, prev_injected_ts, prev_redelivered],
+        ),
+    };
+    matches!(r, Ok(1))
+}
+
+/// `true` the first time a row's write is refused (per daemon socket; bounded at 256 remembered rows).
+fn first_write_refusal(daemon: &Arc<Daemon>, inbox_id: i64) -> bool {
+    static SEEN: OnceLock<std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, std::collections::HashSet<i64>>>> =
+        OnceLock::new();
+    let mut g = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    let set = g.entry(daemon.socket_path.clone()).or_default();
+    if set.len() >= 256 {
+        set.clear();
+    }
+    set.insert(inbox_id)
 }
 
 /// ★(0.14.42 · 설계 H3) 상태 기록 실패 통지 — 데몬(소켓)별 쿨다운 [`INBOX_WRITE_FAILED_COOLDOWN_SECS`].
@@ -1691,6 +1841,9 @@ fn inbox_stalled_due(age_secs: f64, sweep_interval_secs: f64) -> bool {
 #[derive(Default)]
 struct InboxDelivery {
     delivered: Vec<i64>,
+    /// ★(0.14.52 · S-a C6b) The writer request of each handed-off row (`delivered` = handed to the master's writer; the
+    /// settlement publishes what was written).
+    requests: Vec<(i64, String)>,
     hold: Option<InboxHold>,
 }
 
@@ -1771,8 +1924,9 @@ fn deliver_new_inbox_with(daemon: &Arc<Daemon>, conn: &Connection) -> InboxDeliv
         }
         let env = envelope_at(&channel, &sender_id, created_ts, inbox_id, false, &text, lag_on.then_some(now));
         // ③ 주입.
-        if inject_master_confirmed(daemon, &surface, &env) {
+        if let Some(request_id) = inject_master_confirmed(daemon, &surface, &env, inbox_id, InboxHandoff::New) {
             out.delivered.push(inbox_id);
+            out.requests.push((inbox_id, request_id));
         } else {
             // 인계 실패(채널 정체) — 기록을 되돌린다(최선노력). 되돌림까지 실패하는 이중 결함이면 그 행은
             // injected 로 남는다(재배달 기본 0 이라 재주입되지 않는다 · 잔여 · 원장에 선기록은 남는다).
@@ -1848,7 +2002,8 @@ fn redeliver_unacked(daemon: &Arc<Daemon>, conn: &Connection) -> usize {
             }
         }
         let env = envelope_at(&channel, &sender_id, created_ts, inbox_id, true, &text, lag_on.then_some(now));
-        if inject_master_confirmed(daemon, &surface, &env) {
+        let handoff = InboxHandoff::Redeliver { prev_injected_ts: injected_ts, prev_redelivered: redelivered };
+        if inject_master_confirmed(daemon, &surface, &env, inbox_id, handoff).is_some() {
             n += 1;
         } else {
             let _ = conn.execute(
@@ -3414,7 +3569,7 @@ mod tests {
         // 비-quiescing(agent_status None) → 주입 가능.
         assert_eq!(deliverable_master(&d), Some(sid), "비-quiescing master는 배달 가능");
         let s1 = master_hold(&d, sid).expect("비-quiescing master 는 주입 직전 재확인 통과");
-        assert!(inject_master_confirmed(&d, &s1, "[test] hi"), "비-quiescing master엔 주입 성공");
+        assert!(inject_master_confirmed(&d, &s1, "[test] hi", 0, InboxHandoff::New).is_some(), "비-quiescing master엔 주입 성공");
         // 루프 중 quiescing set(cycle-agent가 /clear 진입 직전) → 주입 직전 재확인이 false 반환.
         *surface.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
             state: "quiescing".into(),
@@ -4602,6 +4757,108 @@ mod tests {
         let want = envelope("slack", "U1", created, late, false, "늦은 HEAD");
         let led = std::fs::read_to_string(crate::delivery::ledger_path(&d.socket_path)).unwrap();
         assert!(led.contains(&crate::delivery::digest_text(&want)), "노브 0 봉투가 HEAD 와 다르다");
+        h3_done(&m);
+    }
+
+    // ── ★(0.14.52 · S-a C6b) inbox envelopes settle on the writer's terminal (DESIGN-S-FROZEN-R3 §3.3 channel row, §4.5) ──
+
+    /// Refuses every admission: zero bytes.
+    struct C6bRefuse;
+    impl crate::agent_write::Proof for C6bRefuse {
+        fn admit(&self) -> Result<(), crate::receiver::ProofLoss> {
+            Err(crate::receiver::ProofLoss::Unknown("test_refuse".into()))
+        }
+        fn recheck(&self, _: crate::agent_write::Phase) -> Result<(), crate::receiver::ProofLoss> {
+            Ok(())
+        }
+    }
+
+    fn c6b_wait(what: &str, cond: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "not within 10 s: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn c6b_events(d: &Arc<Daemon>, name: &str, id: i64) -> usize {
+        d.bus.tail(2000).into_iter().filter(|e| e["name"] == name && e["payload"]["inbox_id"] == json!(id)).count()
+    }
+
+    /// T-b1: a refused envelope wrote nothing; its row goes back to `new`, the hand-off mark is undone (the writer's `end()`
+    /// never ran, so a stale mark would pace every later row and then read as a busy writer), the next pass hands it off again
+    /// (not `Paced`), and the refusal event is published once per row.
+    #[cfg(unix)]
+    #[test]
+    fn c6b_refused_envelope_rolls_the_row_back_and_leaves_no_handoff_mark() {
+        let (d, m) = h3_rig("c6b-refused");
+        *m.receiver_proof.lock().unwrap() = Some(Arc::new(C6bRefuse));
+        let id = h3_seed(&d, "refused envelope", now());
+        let pass = |d: &Arc<Daemon>| {
+            let mut g = d.channels.lock().unwrap();
+            deliver_new_inbox_with(d, g.as_mut().unwrap())
+        };
+        let r = pass(&d);
+        assert_eq!(r.delivered, vec![id], "premise: handed off");
+        assert!(r.requests.iter().any(|(i, _)| *i == id), "the hand-off carries its request id");
+        c6b_wait("row rolled back to new", || h3_state(&d, id) == "new");
+        c6b_wait("refusal event", || c6b_events(&d, "channel.message.write_refused", id) == 1);
+        assert!(m.inject_track.handoff_pending().is_none(), "a zero-byte terminal left the hand-off mark set");
+        assert!(m.inject_track.last_body().is_none(), "a refused envelope was recorded as written");
+        let r = pass(&d);
+        assert_eq!(r.delivered, vec![id], "the next pass did not retry the rolled-back row (hold {:?})", r.hold);
+        c6b_wait("row rolled back again", || h3_state(&d, id) == "new");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(c6b_events(&d, "channel.message.write_refused", id), 1, "the refusal event was not coalesced per row");
+        assert_eq!(c6b_events(&d, "channel.message.written", id), 0);
+        h3_done(&m);
+    }
+
+    /// T-b2 (queue pair (b)): a healthy envelope is written with its Return once; the row stays `injected` and
+    /// `channel.message.written` follows the write.
+    #[cfg(unix)]
+    #[test]
+    fn c6b_written_envelope_is_announced_after_its_return() {
+        let (d, m) = h3_rig("c6b-written");
+        let id = h3_seed(&d, "written envelope", now());
+        {
+            let mut g = d.channels.lock().unwrap();
+            assert_eq!(deliver_new_inbox_with(&d, g.as_mut().unwrap()).delivered, vec![id], "premise: handed off");
+        }
+        c6b_wait("written event", || c6b_events(&d, "channel.message.written", id) == 1);
+        assert_eq!(h3_state(&d, id), "injected", "a written row was rolled back");
+        assert_eq!(m.inject_track.last_body().map(|b| b.norm.contains("written envelope")), Some(true));
+        assert_eq!(c6b_events(&d, "channel.message.write_refused", id), 0);
+        h3_done(&m);
+    }
+
+    /// T-b3: a refused REDELIVERY restores the row's previous `injected_ts` and `redelivered` (not `new`).
+    #[cfg(unix)]
+    #[test]
+    fn c6b_refused_redelivery_restores_the_previous_stamp_and_count() {
+        let (d, m) = h3_rig("c6b-redeliver");
+        *m.receiver_proof.lock().unwrap() = Some(Arc::new(C6bRefuse));
+        let id = h3_seed(&d, "redelivered envelope", now());
+        {
+            // As redeliver_unacked leaves it right before its hand-off: injected, stamp moved, count +1.
+            let g = d.channels.lock().unwrap();
+            g.as_ref()
+                .unwrap()
+                .execute("UPDATE inbox SET state='injected', injected_ts=?2, redelivered=2 WHERE id=?1", params![id, now()])
+                .unwrap();
+        }
+        let handoff = InboxHandoff::Redeliver { prev_injected_ts: 1000.5, prev_redelivered: 1 };
+        assert!(inject_master_confirmed(&d, &m, "redelivered envelope", id, handoff).is_some(), "premise: handed off");
+        let read = || -> (String, f64, i64) {
+            let g = d.channels.lock().unwrap();
+            g.as_ref()
+                .unwrap()
+                .query_row("SELECT state, injected_ts, redelivered FROM inbox WHERE id=?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })
+                .unwrap()
+        };
+        c6b_wait("redelivery rolled back", || read() == ("injected".to_string(), 1000.5, 1));
         h3_done(&m);
     }
 }

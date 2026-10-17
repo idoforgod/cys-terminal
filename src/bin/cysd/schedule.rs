@@ -1945,7 +1945,13 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
         //   멀티스레드 런타임에서 회수가 배달을 **앞지를 수 있었다**(SeatGone·"surface gone").
         //   결과를 손에 쥔 채 등록하면 두 성질을 함께 얻는다: 순서(배달 시도가 먼저)와
         //   무조건성(성공·실패 어느 반환 경로에서도 회수가 걸린다).
-        let delivered = deliver_push(daemon, job, sid, text, None);
+        // ★(0.14.52 · S-a C6a) The verdict is the writer's (bounded wait). A refused push diverted to the queue reads
+        //   `queued(refused)` and keeps the old reap time, like `queued(modal)` below (resource bound ①).
+        let mut handed = None;
+        let delivered = match deliver_push_with(daemon, job, sid, text, None, &mut handed) {
+            Ok(how) => push_verdict(how, handed).await,
+            Err(e) => Err(e),
+        };
         if let Some(ttl) = effective_close_ttl(job) {
             let d = Arc::clone(daemon);
             // ★(triage X9) 적재 성공(`"queued"`)은 **배달이 아니다**. 회수는 그 항목의 처분
@@ -2010,7 +2016,9 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
     }
     let sid = sid.ok_or_else(|| format!("role '{to}' absent"))?;
     let guard = from_role_map.then(|| crate::alert_route::RoleGuard::Exact(to));
-    let how = deliver_push(daemon, job, sid, text, guard)?;
+    let mut handed = None;
+    let how = deliver_push_with(daemon, job, sid, text, guard, &mut handed)?;
+    let how = push_verdict(how, handed).await?;
     Ok(format!("{how} to {to} (surface:{sid})"))
 }
 
@@ -2029,12 +2037,26 @@ async fn fire_push(daemon: &Arc<Daemon>, job: &Job) -> Result<String, String> {
 /// `claim_role` 인계가 끝나면 정기 점검이 **버려진 셸**로 들어간다. 갓 띄운 좌석(`fresh`·
 /// `if_absent:launch`)은 sid 자체가 대상이므로 가드를 걸지 않는다(걸면 launch 직후의
 /// 등록 지연이 곧 실패가 된다).
+/// Specimens' entry: the push without the fire task's verdict wait (the test-only synchronous settle still applies).
+#[cfg(test)]
 fn deliver_push(
     daemon: &Arc<Daemon>,
     job: &Job,
     sid: u64,
     text: &str,
     role_guard: Option<crate::alert_route::RoleGuard<'_>>,
+) -> Result<&'static str, String> {
+    deliver_push_with(daemon, job, sid, text, role_guard, &mut None)
+}
+
+/// `handed` receives the push's request when it went to the writer (`"pushed"`), for [`push_verdict`].
+fn deliver_push_with(
+    daemon: &Arc<Daemon>,
+    job: &Job,
+    sid: u64,
+    text: &str,
+    role_guard: Option<crate::alert_route::RoleGuard<'_>>,
+    handed: &mut Option<PushHandle>,
 ) -> Result<&'static str, String> {
     if !job.uses_queue() {
         // ★(0.14.31 · 리뷰 R2 · claude minor) 직접 주입 분기도 **같은 역할 가드**를 받는다.
@@ -2104,11 +2126,16 @@ fn deliver_push(
             return enqueue_schedule_push(daemon, job, sid, text, role_guard, SCHEDULE_QUEUE_CAP, None)
                 .map(|_| "queued(modal)");
         }
-        // ★(0.14.43 · C8) 인계에 성공하면 `inject_on` 이 입력줄 계수를 "제출됨(0)" 으로 계상한다 — 계수가 실제로 0 이 아닌 값에서 내려갔을 때만 관측 이벤트 1건
-        //   (보류·전환 판정은 위 H0 가 이미 끝냈다 · 이 계상은 어떤 게이트도 바꾸지 않는다).
-        if let Some(cleared) = inject_on(daemon, &surface, text)? {
-            note_push_cleared_pending(daemon, &surface, job, cleared);
-        }
+        // ★(0.14.52 · S-a C6a) One checked agent request; its settlement counts the submitted line (0.14.43 C8 rule) or keeps a
+        //   refused push in the seat queue (보류·전환 판정은 위 H0 가 이미 끝냈다 · 이 계상은 어떤 게이트도 바꾸지 않는다).
+        let origin = PushOrigin {
+            job: job.clone(),
+            role: role_guard.map(|g| match g {
+                crate::alert_route::RoleGuard::Exact(r) => (r.to_string(), false),
+                crate::alert_route::RoleGuard::Prefix(p) => (p.to_string(), true),
+            }),
+        };
+        *handed = Some(inject_on(daemon, &surface, text, Some(origin))?);
         return Ok("pushed");
     }
     enqueue_schedule_push(daemon, job, sid, text, role_guard, SCHEDULE_QUEUE_CAP, None).map(|_| "queued")
@@ -2481,30 +2508,33 @@ fn resolve_push_target(
 }
 
 /// 살아있는 세션의 stdin에 과업을 주입 (bracketed paste + Return).
-/// 전체 시퀀스가 writer 스레드의 단일 Inject 항목으로 직렬화돼
+/// 전체 시퀀스가 writer 스레드의 단일 요청으로 직렬화돼
 /// 동시 발화·동시 배달과 섞이지 않는다 (메시지 병합·오염 차단).
 /// 확정된 좌석에 주입한다(조회를 다시 하지 않는다 — 확정과 주입 사이에 좌석이 바뀌지 않게).
 ///
-/// ★(0.14.43 · C8) **인계에 성공하면 그 좌석의 미제출 입력 계수를 0 으로 계상한다** — 큐 배달 인계(`governance::deliver_head_locked`)와 같은 규약이다.
-/// Inject 는 본문+CR 을 원자로 보내 **줄을 제출**한다 — 인계된 Inject 가 쓰이면 줄이 제출된다고 계상한다(인계 시점에는 아직 쓰기 전이고 CR 이 삼켜져 본문이 남을 수도 있다 — 아래 계상 주석).
-/// 종전에는 이 경로만 계수를 건드리지 않아, 유령 계수(윈도우·
-/// `CYS_PENDING_INPUT_MODEL=v2` 좌석의 단독 Esc · 글자를 치고 전부 지운 줄)가 있는 좌석에 하트비트가 들어가도 계수가 남아 그 좌석의 큐 배달이
-/// 계속 `input_pending` 으로 막혔다(실측: push 뒤 `pending=1·human=1` 잔존). **게이트(보류·전환 판정)는 이 함수 앞 `deliver_push` 의 H0 이고 무변경이다** —
-/// 여기서는 이미 통과한 주입의 사실만 계상한다. 노브 `CYS_SCHEDULE_PUSH_COUNTS_SUBMIT=0` 이면 종전(계수·게이트 무접촉)이다.
+/// ★(0.14.52 · S-a C6a) The push is ONE checked agent request (body + its own Return), and what used to happen at the hand-off
+/// now waits for the writer's terminal ([`ScheduleSettle`], design 4.5):
+/// - written with its Return: the input-line count is reset to "submitted (0)" - the 0.14.43 C8 rule (a ghost count left by a
+///   lone Esc or an erased line kept blocking queue delivery with `input_pending`), now applied only when the line really was
+///   submitted, and only while the input generation is still the one captured at the hand-off (a newer direct send or human
+///   key is never erased);
+/// - zero bytes: nothing is counted and the job's text is diverted once to the seat queue (its own receiver proof and hold),
+///   so a refused heartbeat/wakeup is kept, not reported as pushed;
+/// - stopped part-way: the accepted prefix is counted as machine input; nothing is retyped or erased (C7 owns the resume).
+/// The knob `CYS_SCHEDULE_PUSH_COUNTS_SUBMIT=0` still turns the count reset off. **게이트(보류·전환 판정)는 이 함수 앞
+/// `deliver_push_with` 의 H0 이고 무변경이다.**
 ///
-/// 【임계영역】 인계(`try_send`)와 계상을 **한 `input_gate` 안**에서 한다 — 큐 인계 지점과 같다. 갈라서 게이트 밖에서 계상하면 그 사이에 끼어든 직접 send
-/// (`send_text`: 게이트 안에서 쓰고 계수를 올린다)의 계수를 0 으로 덮어 과소 계수(= 초안 위 오주입 방향)를 만든다.
-/// 재진입·교착 없음(호출 사슬을 코드로 확인): `fire`(tick·`run_now` 가 띄운 태스크) → `fire_push` → `deliver_push` → 여기 — 이 파일에서 `input_gate` 를 잡는 곳은 여기 하나뿐이고
-/// 게이트를 쥔 호출자도 없다. 락 순서 `pending_queue → input_gate` 는 `pending_queue` 를 잡지 않으므로 지킨다. 게이트 안은 `try_send`(비차단) · 원자 판독/쓰기 ·
-/// `pending_input`(leaf) 뿐이다 — 원장 append(디스크 I/O)는 게이트 **앞**, 이벤트 발행은 게이트 **뒤**(호출자)다.
-/// `try_send` 실패(채널 가득·writer 종료)는 쓰이지 않았으므로 계수를 건드리지 않는다. 인계 뒤 좌석이 종료돼도 0 은 무해하다(종료 좌석의 계수는 판정에 쓰이지 않는다 — 틱은 `exited` 좌석을 건너뛴다).
-///
-/// 반환 `Some` = 계수가 **0 이 아닌 값에서** 0 으로 내려갔다(관측 이벤트 대상). `None` = 0→0 이거나 노브가 꺼졌다.
+/// 【임계영역】 The hand-off (`try_send`) and the capture of the input generation happen inside ONE `input_gate`: a direct send
+/// that raises the count inside the gate lands either before the capture (it is then submitted with this push's Return and
+/// counted as such, as before) or after it (the generation moved, so the settlement leaves it alone). No ledger I/O, journal
+/// open or event inside the gate. The settlement takes the gate again on the writer thread; nobody who holds the gate waits
+/// for a writer. `try_send` failure (channel full / writer gone) wrote nothing and changes nothing.
 fn inject_on(
     daemon: &Arc<Daemon>,
     surface: &Arc<crate::state::Surface>,
     text: &str,
-) -> Result<Option<PushClearedPending>, String> {
+    origin: Option<PushOrigin>,
+) -> Result<PushHandle, String> {
     let sid = surface.id;
     // ★(0.14.42 · 설계 C D3) 잡 문안은 사용자 입력이다 — 원장 선기록 앞에서 살균해 원장과 주입 본문을 맞춘다
     //   (writer 백스톱과 같은 값 · 표지 없는 문안은 할당 0 · 바이트 동일).
@@ -2519,48 +2549,234 @@ fn inject_on(
         crate::delivery::Origin::Schedule,
         None,
     );
-    // ★(0.14.43 · C8) 게이트는 원장 선기록 **뒤** · 인계 **앞**에서 잡는다(디스크 I/O 를 게이트 안에 넣지 않는다). 노브가 꺼졌으면 잡지 않는다(종전 byte-identical).
-    let gate = schedule_push_counts_submit()
-        .then(|| surface.input_gate.lock().unwrap_or_else(|e| e.into_inner()));
-    surface
-        .write_tx
-        .try_send(crate::state::WriteReq::Inject {
-            text: text.into_owned(),
-            cr_delay_ms: 500,
-            clear_first: false, // 스케줄 발화는 현행 동작 보존
-            guard: None,        // 스케줄 push 는 큐를 우회한다(§8) — 가드 대상 아님
-        })
-        .map_err(|e| match e {
-            std::sync::mpsc::TrySendError::Full(_) => {
-                "surface write channel full (pane stalled)".to_string()
-            }
-            std::sync::mpsc::TrySendError::Disconnected(_) => "surface writer closed".to_string(),
-        })?;
-    // 인계 성공 — 노브가 꺼졌으면(게이트를 잡지 않았다) 종전 그대로 끝낸다(계수 무접촉).
-    if gate.is_none() {
-        return Ok(None);
-    }
-    // ★큐 인계 지점(`deliver_head_locked`)과 같은 계상 — 줄을 제출했으니 미제출 계수 0: `set_pending_input(0)` = 미러 0 · 세대 `input_gen` +1(owner 각인은 세대로 자동 무효).
-    //   `set_pending_input` 은 `PendingInputState.human` 을 건드리지 않는다(큐 인계는 계수 0 인 줄에서만 일어나 사람 몫도 이미 0 이다). 여기서는 0 이 아닌 줄을 0 으로 내리므로
-    //   사람 몫도 함께 0 으로 접는다 — 남기면 raw `human` 을 읽는 `draft_machine_owned`·`draft_divert_step` 이, 이 push 의 CR 이 삼켜져 남은 잔여를 사람 초안으로 오인한다.
-    let prev_bytes = surface.pending_input_bytes.load(std::sync::atomic::Ordering::Relaxed);
-    let prev_human_bytes = {
-        let mut st = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner());
-        let human = st.human.min(prev_bytes);
-        st.human = 0;
-        // ★(0.14.43 · R1F-IN ⓐ) 줄을 제출했다고 계상하면 잠정 Esc 면제 표식(`esc_exempt_pgid`)도 내린다 — 같은 leaf 임계영역에서 미러까지(큐 인계 `take_esc_exempt` 와 같은 규약).
-        //   남기면 이미 제출된 줄 뒤에 에이전트가 전경에서 사라졌을 때 틱의 되돌리기가 헛 계수 1 을 세운다.
-        st.esc_exempt_pgid = 0;
-        #[cfg(unix)]
-        surface.esc_exempt_pgid.store(0, std::sync::atomic::Ordering::Relaxed);
-        human
+    let text = text.into_owned();
+    let request = crate::agent_write::Request::new(
+        crate::agent_write::new_request_id((daemon.started_at * 1000.0) as u64),
+        sid,
+        "schedule",
+        crate::delivery::digest_text(&text),
+    );
+    let outcome = Arc::new(std::sync::Mutex::new(None));
+    let plan = crate::agent_write::Plan::paste(&text).with_submit(500, 0);
+    let mut settle = ScheduleSettle {
+        daemon: Arc::downgrade(daemon),
+        surface: Arc::downgrade(surface),
+        request_id: request.id.clone(),
+        planned: plan.planned_bytes(),
+        counts_submit: schedule_push_counts_submit(),
+        gen_at_handoff: 0,
+        text,
+        origin,
+        outcome: Arc::clone(&outcome),
     };
-    surface.set_pending_input(0);
+    let (proof, journal) = (surface.agent_proof(), daemon.agent_journal());
+    // ★(0.14.43 · C8) 게이트는 원장 선기록 **뒤** · 인계 **앞**에서 잡는다(디스크 I/O 를 게이트 안에 넣지 않는다). 노브가 꺼졌으면 잡지 않는다.
+    let gate = settle
+        .counts_submit
+        .then(|| surface.input_gate.lock().unwrap_or_else(|e| e.into_inner()));
+    settle.gen_at_handoff = surface.input_gen.load(std::sync::atomic::Ordering::Acquire);
+    let job = crate::agent_write::AgentJob {
+        attempt: None,
+        request: Arc::clone(&request),
+        plan,
+        proof,
+        journal: Some(journal),
+        resume: None,
+        settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
+        guard: None,      // 스케줄 push 는 큐를 우회한다(§8) — 가드 대상 아님
+        note_body: true,  // the old Inject arm recorded every pushed body (owner None)
+        body_owner: None,
+    };
+    let sent = surface.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job)));
     drop(gate);
-    Ok((prev_bytes != 0).then_some(PushClearedPending { prev_bytes, prev_human_bytes }))
+    sent.map_err(|e| match e {
+        std::sync::mpsc::TrySendError::Full(_) => "surface write channel full (pane stalled)".to_string(),
+        std::sync::mpsc::TrySendError::Disconnected(_) => "surface writer closed".to_string(),
+    })?;
+    crate::agent_write::test_wait_settled(&request);
+    Ok(PushHandle { request, outcome })
 }
 
-/// ★(0.14.43 · C8) 직접 push 인계가 입력줄 미제출 계수를 **0 이 아닌 값에서** 0 으로 내렸다는 사실 — [`inject_on`] 이 돌려주고 [`note_push_cleared_pending`] 이 이벤트로 만든다.
+/// ★(0.14.52 · S-a C6a) What a refused push needs to keep its obligation: the job (its per-job queue divert, TTL and job result)
+/// and the role guard the push was resolved under (re-checked by the queue at enqueue).
+struct PushOrigin {
+    job: Job,
+    /// `(role, prefix)` of the [`crate::alert_route::RoleGuard`] used at resolution.
+    role: Option<(String, bool)>,
+}
+
+/// The writer's verdict on one push, read by [`push_verdict`] for the job result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PushOutcome {
+    /// Body and its Return written.
+    Written,
+    /// Zero bytes; the text is in the seat queue (diverted now, or already there from this job).
+    Diverted,
+    /// Zero bytes, and the text could not be kept in the queue.
+    Refused(String),
+    /// Stopped part-way (never retyped).
+    Partial(String),
+}
+
+/// A handed-off push: its request (status reads) and the settlement's verdict.
+struct PushHandle {
+    request: Arc<crate::agent_write::Request>,
+    outcome: Arc<std::sync::Mutex<Option<PushOutcome>>>,
+}
+
+/// ★(0.14.52 · S-a C6a) Settlement of one push after the writer's terminal (design 4.5). Runs on the seat's writer thread.
+struct ScheduleSettle {
+    daemon: std::sync::Weak<Daemon>,
+    surface: std::sync::Weak<crate::state::Surface>,
+    request_id: String,
+    /// The exact bytes the plan writes (fence, body, Return) - the accepted prefix is a prefix of these.
+    planned: Vec<u8>,
+    /// `CYS_SCHEDULE_PUSH_COUNTS_SUBMIT` at the hand-off.
+    counts_submit: bool,
+    /// `input_gen` captured inside `input_gate` at the hand-off.
+    gen_at_handoff: u64,
+    text: String,
+    origin: Option<PushOrigin>,
+    outcome: Arc<std::sync::Mutex<Option<PushOutcome>>>,
+}
+
+impl ScheduleSettle {
+    fn run(self, t: &crate::agent_write::Terminal) {
+        use crate::agent_write::Terminal as T;
+        let (Some(daemon), Some(s)) = (self.daemon.upgrade(), self.surface.upgrade()) else { return };
+        let job_id = self.origin.as_ref().map_or("-", |o| o.job.id.as_str()).to_string();
+        let outcome = match t {
+            T::WrittenSubmitted { .. } => {
+                if let Some(cleared) = self.reset_submitted_line(&s) {
+                    note_push_cleared_pending(&daemon, &s, &job_id, cleared);
+                }
+                PushOutcome::Written
+            }
+            T::RefusedNoWrite { .. } | T::CancelledBeforeWrite => {
+                let reason = match t {
+                    T::RefusedNoWrite { reason } => reason.clone(),
+                    _ => "cancelled".to_string(),
+                };
+                let kept = match &self.origin {
+                    Some(o) => {
+                        let guard = o.role.as_ref().map(|(r, prefix)| {
+                            if *prefix {
+                                crate::alert_route::RoleGuard::Prefix(r)
+                            } else {
+                                crate::alert_route::RoleGuard::Exact(r)
+                            }
+                        });
+                        enqueue_schedule_divert(
+                            &daemon,
+                            &o.job,
+                            s.id,
+                            &self.text,
+                            guard,
+                            SCHEDULE_FALLBACK_HEADROOM,
+                            schedule_divert_ttl_secs(&o.job),
+                        )
+                    }
+                    None => Err("no job to divert".to_string()),
+                };
+                daemon.bus.publish(
+                    "schedule.push_refused",
+                    "schedule",
+                    Some(s.id),
+                    json!({"surface_ref": cys::surface_ref(s.id), "job": job_id, "request_id": self.request_id,
+                           "reason": reason, "diverted": kept.is_ok(), "divert_error": kept.as_ref().err(),
+                           "note": "Zero bytes were written for this push; nothing was counted. The text was diverted to the seat queue (delivered under the queue's own receiver proof) unless divert_error is set."}),
+                );
+                match kept {
+                    Ok(_) => PushOutcome::Diverted,
+                    Err(e) => PushOutcome::Refused(format!("{reason}; not queued: {e}")),
+                }
+            }
+            T::WrittenBody { accepted } | T::PartialExact { accepted, .. } | T::PartialUnknown { accepted, .. } => {
+                self.count_prefix(&s, accepted.total() as usize);
+                let (reason, offset) = match t {
+                    T::PartialExact { reason, envelope, .. } | T::PartialUnknown { reason, envelope, .. } => {
+                        (reason.clone(), Some(envelope.body_offset))
+                    }
+                    _ => ("return_not_written".to_string(), None),
+                };
+                daemon.bus.publish(
+                    "schedule.push_partial",
+                    "schedule",
+                    Some(s.id),
+                    json!({"surface_ref": cys::surface_ref(s.id), "job": job_id, "request_id": self.request_id,
+                           "kind": t.kind(), "reason": reason, "body_offset": offset,
+                           "note": "The push stopped part-way; the daemon neither erases nor retypes the input line."}),
+                );
+                PushOutcome::Partial(format!("{} {reason}", t.kind()))
+            }
+        };
+        *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+    }
+
+    /// The written Return submitted the line: reset its count to 0 (the 0.14.43 C8 rule), only while the input generation is the
+    /// hand-off's. Returns the cleared count when it was non-zero.
+    fn reset_submitted_line(&self, surface: &crate::state::Surface) -> Option<PushClearedPending> {
+        if !self.counts_submit {
+            return None;
+        }
+        let _gate = surface.input_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if surface.input_gen.load(std::sync::atomic::Ordering::Acquire) != self.gen_at_handoff {
+            return None; // a newer direct send / human key owns the line now: never erase it
+        }
+        // ★큐 인계 지점(`deliver_head_locked`)과 같은 계상 — 줄을 제출했으니 미제출 계수 0: `set_pending_input(0)` = 미러 0 · 세대 `input_gen` +1(owner 각인은 세대로 자동 무효).
+        //   여기서는 0 이 아닌 줄을 0 으로 내리므로 사람 몫도 함께 0 으로 접는다 — 남기면 raw `human` 을 읽는 `draft_machine_owned`·`draft_divert_step` 이 잔여를 사람 초안으로 오인한다.
+        let prev_bytes = surface.pending_input_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        let prev_human_bytes = {
+            let mut st = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner());
+            let human = st.human.min(prev_bytes);
+            st.human = 0;
+            // ★(0.14.43 · R1F-IN ⓐ) 줄을 제출했다고 계상하면 잠정 Esc 면제 표식(`esc_exempt_pgid`)도 내린다(큐 인계 `take_esc_exempt` 와 같은 규약).
+            st.esc_exempt_pgid = 0;
+            #[cfg(unix)]
+            surface.esc_exempt_pgid.store(0, std::sync::atomic::Ordering::Relaxed);
+            human
+        };
+        surface.set_pending_input(0);
+        (prev_bytes != 0).then_some(PushClearedPending { prev_bytes, prev_human_bytes })
+    }
+
+    /// A push that stopped part-way left its accepted prefix in the composer: count it as machine input (same generation rule).
+    fn count_prefix(&self, surface: &crate::state::Surface, accepted: usize) {
+        if accepted == 0 {
+            return;
+        }
+        let _gate = surface.input_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if surface.input_gen.load(std::sync::atomic::Ordering::Acquire) == self.gen_at_handoff {
+            surface.apply_pending_input(
+                &self.planned[..accepted.min(self.planned.len())],
+                crate::governance::InputOrigin::Machine,
+            );
+        }
+    }
+}
+
+/// ★(0.14.52 · S-a C6a) Bounded wait for the writer's verdict on a push: design 4.5's 2,000 ms initial completion budget, then
+/// `pushed(pending)` (never "pushed" by assumption). Only the job's own fire task waits; the tick does not.
+const PUSH_SETTLE_BUDGET_MS: u64 = 2_000;
+
+async fn push_verdict(how: &'static str, handed: Option<PushHandle>) -> Result<&'static str, String> {
+    let Some(h) = handed else { return Ok(how) };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(PUSH_SETTLE_BUDGET_MS);
+    while !h.request.is_settled() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let verdict = h.outcome.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match verdict {
+        Some(PushOutcome::Written) => Ok("pushed"),
+        Some(PushOutcome::Diverted) => Ok("queued(refused)"),
+        Some(PushOutcome::Refused(why)) => Err(format!("push refused (zero bytes): {why}")),
+        Some(PushOutcome::Partial(why)) => Err(format!("push stopped part-way: {why}")),
+        None => Ok("pushed(pending)"),
+    }
+}
+
+/// ★(0.14.43 · C8) 직접 push 가 입력줄 미제출 계수를 **0 이 아닌 값에서** 0 으로 내렸다는 사실 — ★(0.14.52 · S-a C6a) the settlement ([`ScheduleSettle`]) produces it after the
+/// written Return and [`note_push_cleared_pending`] turns it into the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PushClearedPending {
     /// 계상 전 `pending_input_bytes`(전체 미제출 계수).
@@ -2583,12 +2799,13 @@ fn schedule_push_counts_submit() -> bool {
     )
 }
 
-/// ★(0.14.43 · C8) 직접 push 가 입력줄 계수를 0 으로 되돌렸다는 **관측용** 이벤트 1건 — 계수가 0 이 아닌 값에서 바뀐 경우에만 부른다([`inject_on`] 이 `None` 이면 호출되지 않는다).
+/// ★(0.14.43 · C8) 직접 push 가 입력줄 계수를 0 으로 되돌렸다는 **관측용** 이벤트 1건 — 계수가 0 이 아닌 값에서 바뀐 경우에만 부른다(★(0.14.52 · S-a C6a) from the
+/// settlement, after the push's Return was written).
 /// 이름이 `alert.` 접두도 `alert_route::routable` 허용 목록도 아니어서 라우팅되지 않는다(경보가 아니다 · 검체로 핀 · `queue.input_pending_reset` 과 다른 이름).
 fn note_push_cleared_pending(
     daemon: &Arc<Daemon>,
     surface: &Arc<crate::state::Surface>,
-    job: &Job,
+    job_id: &str,
     cleared: PushClearedPending,
 ) {
     daemon.bus.publish(
@@ -2598,8 +2815,8 @@ fn note_push_cleared_pending(
         json!({"surface_ref": cys::surface_ref(surface.id),
                "prev_bytes": cleared.prev_bytes,
                "prev_human_bytes": cleared.prev_human_bytes,
-               "job": job.id,
-               "note": "직접 push 가 본문+CR 로 입력줄을 제출했다 — 미제출 입력 계수를 0 으로 계상했다(유령 계수 해소 · 큐 배달 인계와 같은 규약)"}),
+               "job": job_id,
+               "note": "직접 push 의 본문+Return 이 쓰인 뒤(writer 결판) 미제출 입력 계수를 0 으로 계상했다(유령 계수 해소 · 큐 배달과 같은 규약)"}),
     );
 }
 
@@ -2959,7 +3176,7 @@ mod tests {
             .expect("surface");
         daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         let raw = "[wakeup] 착수\x1b[201~\n탈출 명령";
-        inject_on(&daemon, &s, raw).expect("주입 인계");
+        inject_on(&daemon, &s, raw, None).expect("주입 인계");
         let _ = s.child.lock().unwrap().kill();
         let clean = cys::paste_fence::sanitize(raw).into_owned();
         assert_ne!(clean, raw, "전제: 원문에 표지가 있다");
@@ -4163,8 +4380,9 @@ mod tests {
             .map(|e| at + e)
             .expect("deliver_push 소실");
         let body = &src[at..end];
+        // ★(0.14.52 · S-a C6a) both paths call `deliver_push_with` (the fire task then waits for the writer's verdict).
         assert_eq!(
-            body.matches("deliver_push(daemon, job, sid, text,").count(),
+            body.matches("deliver_push_with(daemon, job, sid, text,").count(),
             2,
             "fresh 경로와 일반 경로 **양쪽**이 같은 배달 선택을 타야 한다"
         );
@@ -4183,13 +4401,13 @@ mod tests {
         // 회수가 걸려야 갓 띄운 좌석이 누수되지 않는다. 그래서 배달 결과를 손에 쥔 채
         // (`let delivered = deliver_push(...);`) 등록하고 그 뒤에 `?` 로 전파한다.
         let ttl_at = body.find("effective_close_ttl(job)").expect("fresh TTL 회수 배선이 사라졌다");
-        let deliver_at = body.find("deliver_push(daemon, job, sid, text,").expect("배달 호출 소실");
+        let deliver_at = body.find("deliver_push_with(daemon, job, sid, text,").expect("배달 호출 소실");
         assert!(
             deliver_at < ttl_at,
             "TTL 회수 등록이 배달 시도보다 앞이다 — close_after_secs:0 에서 회수가 배달을 앞지른다"
         );
         assert!(
-            body.contains("let delivered = deliver_push(daemon, job, sid, text, None);")
+            body.contains("let delivered = match deliver_push_with(daemon, job, sid, text, None, &mut handed) {")
                 && body.contains("let how = delivered?;"),
             "배달 결과를 보류한 채 회수를 등록하는 구조가 아니다 — 실패 경로에서 좌석이 누수된다"
         );
@@ -6113,7 +6331,7 @@ mod c8_push_counts_submit_tests {
         let pusher = std::thread::spawn(move || {
             // 원장 선기록은 스레드 로컬 격리 상태 디렉터리를 쓴다 — 이 스레드도 새 격리를 쥔다.
             crate::delivery::tests::isolate_state_dir_for_thread("c8-gate-wait-pusher");
-            inject_on(&d2, &s2, "[heartbeat] 게이트 대기")
+            inject_on(&d2, &s2, "[heartbeat] 게이트 대기", None)
         });
         std::thread::sleep(std::time::Duration::from_millis(400));
         assert!(!pusher.is_finished(), "게이트를 쥔 동안 push 가 지나갔다 — 인계·계상이 임계영역 밖이다");
@@ -6123,58 +6341,77 @@ mod c8_push_counts_submit_tests {
         assert!(s.inject_track.last_body().is_none(), "게이트를 쥔 동안 인계가 나갔다 — 인계가 게이트 밖이다");
         drop(gate);
         let got = pusher.join().expect("push 스레드").expect("인계");
-        assert_eq!(got, Some(PushClearedPending { prev_bytes: 3, prev_human_bytes: 0 }), "직접 send 의 계수까지 제출로 계상한다");
+        // ★(0.14.52 · S-a C6a) The count is settled after the written Return (test-only synchronous settle on the pusher thread).
+        assert!(got.request.is_settled(), "settlement did not run");
+        let evs = events(&d, "schedule.push_cleared_pending");
+        assert_eq!(evs.len(), 1, "{evs:?}");
+        assert_eq!(evs[0]["payload"]["prev_bytes"], json!(3), "직접 send 의 계수까지 제출로 계상한다");
+        assert_eq!(evs[0]["payload"]["prev_human_bytes"], json!(0));
         assert_eq!(counts(&s), (0, 0));
         assert!(s.input_gen.load(Ordering::Acquire) > gen0);
         done(&s);
     }
 
-    /// [C8 소스 핀] 인계(`try_send`)와 계상(`set_pending_input(0)`)이 **한 `input_gate` 임계영역** 안이다 — 순서: 원장 선기록 → 노브 → 게이트 → 인계 → 계상 → 해제.
-    /// 게이트 안은 `pending_input`(leaf) 외 락 · 원장 append · 이벤트 발행 금지(락 계약 · 디스크 I/O 를 게이트 안에 넣지 않는다). 이 파일에서 `input_gate` 를 잡는 곳은 `inject_on` 하나뿐
-    /// (호출 사슬이 게이트를 쥐지 않는다는 재진입 없음 증명의 전제). 계상을 게이트 밖으로 내리면(M5) 그 사이의 직접 send 계수를 덮어쓴다.
+    /// [C8 소스 핀 · ★(0.14.52 · S-a C6a) rewritten] The hand-off (`try_send`) and the capture of the input generation share ONE
+    /// `input_gate` critical section in `inject_on` (order: ledger pre-record -> knob -> gate -> generation -> hand-off -> release);
+    /// the count reset (`set_pending_input(0)`) moved to the settlement after the written Return, behind the generation compare.
+    /// Inside every gate: no ledger I/O, no journal/proof lookup, no event, no other lock than the leaf `pending_input`.
+    /// The file now takes `input_gate` in three places: `inject_on` (caller side) and the two settlement helpers, which run on the
+    /// seat's writer thread - nobody holding the gate waits for that writer (`try_send` only), so no re-entrancy or cycle.
     #[test]
     fn c8_inject_on_handoff_and_accounting_share_one_input_gate_source_pin() {
         let src = include_str!("schedule.rs");
         let prod = &src[..src.find("\n#[cfg(test)]\nmod tests {").expect("테스트 모듈 앵커 소실")];
-        let at = prod.find("\nfn inject_on(").expect("inject_on 소실");
-        let body = &prod[at..at + prod[at..].find("\n}\n").expect("함수 끝")];
-        let code: String = body.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+        let strip = |body: &str| -> String {
+            body.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+        };
+        let func = |name: &str| -> String {
+            let at = prod.find(name).unwrap_or_else(|| panic!("{name} 소실"));
+            let end = if name.starts_with("    ") { "\n    }\n" } else { "\n}\n" };
+            strip(&prod[at..at + prod[at..].find(end).expect("함수 끝")])
+        };
+        let code = func("\nfn inject_on(");
         let ledger = code.find("record_audited(").expect("원장 선기록");
         let knob = code.find("schedule_push_counts_submit()").expect("노브");
         let gate = code.find("input_gate.lock()").expect("게이트");
+        let gen = code.find("input_gen.load(").expect("세대 포착");
         let send = code.find(".try_send(").expect("인계");
-        let account = code.find("set_pending_input(0)").expect("계상");
         let release = code.find("drop(gate)").expect("게이트 해제");
         assert!(
-            ledger < knob && knob < gate && gate < send && send < account && account < release,
-            "순서가 깨졌다: 원장 {ledger} · 노브 {knob} · 게이트 {gate} · 인계 {send} · 계상 {account} · 해제 {release}"
+            ledger < knob && knob < gate && gate < gen && gen < send && send < release,
+            "순서가 깨졌다: 원장 {ledger} · 노브 {knob} · 게이트 {gate} · 세대 {gen} · 인계 {send} · 해제 {release}"
         );
         let inside = &code[gate..release];
         for banned in [
             "record_audited(", "bus.publish", "pending_queue", "surfaces.lock", "roles.lock", "parser.lock", "agent_meta.lock",
-            "last_human_input", "queue_blocked",
+            "last_human_input", "queue_blocked", "agent_journal(", "agent_proof(", "set_pending_input",
         ] {
             assert!(!inside.contains(banned), "게이트 안에서 `{banned}` 를 쓴다(락 계약 위반)");
         }
-        assert_eq!(
-            inside.matches(".lock()").count(),
-            2,
-            "게이트 안의 락은 input_gate 자신과 pending_input(leaf) 둘뿐이다: {inside}"
+        assert_eq!(inside.matches(".lock()").count(), 1, "인계 게이트 안의 락은 input_gate 자신뿐이다: {inside}");
+        // The reset: only in the settlement, after the gate and the generation compare.
+        let reset = func("    fn reset_submitted_line(");
+        let (g, cmp, zero) = (
+            reset.find("input_gate.lock()").expect("정산 게이트"),
+            reset.find("!= self.gen_at_handoff").expect("세대 대조"),
+            reset.find("set_pending_input(0)").expect("계상"),
         );
-        assert!(inside.contains("pending_input.lock()"), "사람 몫 정규화(leaf)가 게이트 안에 있다");
-        assert_eq!(
-            prod.matches("input_gate.lock()").count(),
-            1,
-            "이 파일에서 input_gate 를 잡는 곳은 inject_on 하나뿐이어야 한다(호출 사슬 재진입 없음의 전제)"
-        );
-        // 호출부: 계상 결과를 이벤트로만 쓴다 — 판정(H0) 뒤 · 게이트 판정은 그대로.
-        let dp = &prod[prod.find("\nfn deliver_push(").expect("deliver_push")..];
-        let dp = &dp[..dp.find("\n}\n").expect("끝")];
+        assert!(g < cmp && cmp < zero, "정산 계상이 게이트·세대 대조 앞에 있다");
+        for banned in ["record_audited(", "bus.publish", "pending_queue", "surfaces.lock", "roles.lock"] {
+            assert!(!reset.contains(banned), "정산 게이트 안에서 `{banned}` 를 쓴다");
+        }
+        assert_eq!(reset.matches(".lock()").count(), 2, "정산 게이트 안의 락은 input_gate 와 pending_input(leaf) 둘뿐이다");
+        let prod_code = strip(prod);
+        assert_eq!(prod_code.matches("set_pending_input(0)").count(), 1, "계수 0 계상은 정산 한 곳뿐이다(인계 시점 계상 금지)");
+        assert_eq!(prod_code.matches("input_gate.lock()").count(), 3, "input_gate: inject_on + 정산 둘(writer 스레드)");
+        // 호출부: 판정(H0) 뒤에 인계 · 이벤트는 정산이 낸다.
+        let dp = func("\nfn deliver_push_with(");
         assert!(
-            dp.find("machine_direct_hold(").expect("H0 판정") < dp.find("inject_on(daemon, &surface, text)?").expect("인계 호출"),
+            dp.find("machine_direct_hold(").expect("H0 판정") < dp.find("inject_on(daemon, &surface, text, Some(origin))?").expect("인계 호출"),
             "판정이 인계 뒤로 갔다"
         );
-        assert!(dp.contains("note_push_cleared_pending(daemon, &surface, job, cleared)"), "이벤트 배선 소실");
+        assert!(!dp.contains("note_push_cleared_pending("), "계상 이벤트가 인계 시점에 다시 났다");
+        assert!(prod.contains("note_push_cleared_pending(&daemon, &s, &job_id, cleared)"), "정산의 이벤트 배선 소실");
     }
 }
 
@@ -7211,5 +7448,189 @@ mod b_textcmd_retired_gate {
         let matches: Vec<_> = jobs.iter().filter(|job| job["id"].as_str() == Some(id.as_str())).collect();
         assert_eq!(matches.len(), 1, "'{id}' 중복 생성 금지");
         assert_eq!(serde_json::to_vec(matches[0]).expect("반영 뒤 잡 바이트"), before, "'{id}' 편집 보존");
+    }
+}
+
+/// ★(0.14.52 · S-a C6a) A schedule push settles on the writer's terminal (DESIGN-S-FROZEN-R3 §3.3 schedule row, §4.5): a refused
+/// push writes and counts nothing and keeps its text in the seat queue; a written push counts its line submitted only after its
+/// Return; input that arrives after the hand-off is never erased by the settlement. Real PTY seat (`sleep 30`) and writer
+/// thread; the receiver proof is scripted through `Surface::receiver_proof`.
+#[cfg(test)]
+mod s_a_push_tests {
+    use super::*;
+    use crate::governance::{h_paint, InputOrigin, H_IDLE_SCREEN};
+    use crate::receiver::ProofLoss;
+    use serde_json::json;
+    use std::sync::atomic::Ordering;
+
+    fn rig(tag: &str) -> (Arc<Daemon>, Arc<crate::state::Surface>) {
+        crate::delivery::tests::isolate_state_dir_for_thread(tag);
+        crate::agent_write::set_test_sync_settle(true);
+        let daemon = super::tests::test_daemon();
+        let s = daemon
+            .create_surface(None, Some("sleep 30".into()), None, Some("master".into()), 24, 80)
+            .expect("seat");
+        daemon.roles.lock().unwrap().insert("master".into(), s.id);
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
+        *s.agent_meta.lock().unwrap() = Some(("claude".into(), "/usr/local/bin/claude".into()));
+        std::thread::sleep(Duration::from_millis(300));
+        h_paint(&s, H_IDLE_SCREEN);
+        (daemon, s)
+    }
+
+    fn job(id: &str) -> Job {
+        serde_json::from_value(json!({"id": id, "every_minutes": 5, "action": "push", "to": "master", "text": "x"})).expect("job")
+    }
+
+    fn events(d: &Arc<Daemon>, name: &str) -> Vec<serde_json::Value> {
+        d.bus.tail(5000).into_iter().filter(|e| e["name"] == name).collect()
+    }
+
+    fn counts(s: &Arc<crate::state::Surface>) -> (u64, u64) {
+        (s.pending_input_bytes.load(Ordering::Relaxed), s.pending_input.lock().unwrap().human)
+    }
+
+    fn done(s: &Arc<crate::state::Surface>) {
+        let _ = s.child.lock().unwrap().kill();
+    }
+
+    /// Refuses every admission: zero bytes.
+    struct Refuse;
+    impl crate::agent_write::Proof for Refuse {
+        fn admit(&self) -> Result<(), ProofLoss> {
+            Err(ProofLoss::Unknown("test_refuse".into()))
+        }
+        fn recheck(&self, _: crate::agent_write::Phase) -> Result<(), ProofLoss> {
+            Ok(())
+        }
+    }
+
+    /// Holds the admission until the specimen releases it (the writer thread waits; bounded 10 s).
+    struct Gated(std::sync::Mutex<std::sync::mpsc::Receiver<()>>);
+    impl crate::agent_write::Proof for Gated {
+        fn admit(&self) -> Result<(), ProofLoss> {
+            let _ = self.0.lock().unwrap().recv_timeout(Duration::from_secs(10));
+            Ok(())
+        }
+        fn recheck(&self, _: crate::agent_write::Phase) -> Result<(), ProofLoss> {
+            Ok(())
+        }
+    }
+
+    /// Admits, then loses the proof right before the Return: the body is written, its Return is not (PartialExact).
+    struct NoReturn;
+    impl crate::agent_write::Proof for NoReturn {
+        fn admit(&self) -> Result<(), ProofLoss> {
+            Ok(())
+        }
+        fn recheck(&self, phase: crate::agent_write::Phase) -> Result<(), ProofLoss> {
+            if phase == crate::agent_write::Phase::Submit {
+                return Err(ProofLoss::Unknown("test_no_return".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn verdict(h: Option<PushHandle>) -> Result<&'static str, String> {
+        tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(push_verdict("pushed", h))
+    }
+
+    /// T-a1: zero bytes -> the ghost count stays, nothing is recorded as written, the text sits ONCE in the seat queue (per-job
+    /// dedup on a second refusal), one refusal event per push, and the fire task reads `queued(refused)` (job result Queued).
+    #[test]
+    fn c6a_refused_push_writes_and_counts_nothing_and_keeps_the_text_in_the_queue() {
+        let (d, s) = rig("c6a-refused");
+        s.apply_pending_input(b"\x1b", InputOrigin::Human);
+        let ghost = counts(&s);
+        assert_ne!(ghost.0, 0, "premise: a ghost count");
+        *s.receiver_proof.lock().unwrap() = Some(Arc::new(Refuse));
+        let mut handed = None;
+        let how = deliver_push_with(&d, &job("hb-r"), s.id, "[heartbeat] refused", None, &mut handed).expect("hand-off");
+        assert_eq!(how, "pushed", "the hand-off label");
+        assert_eq!(counts(&s), ghost, "a refused push changed the input count (counted at hand-off?)");
+        assert!(s.inject_track.last_body().is_none(), "a body was recorded as written");
+        let q: Vec<_> = s.pending_queue.lock().unwrap().iter().cloned().collect();
+        assert_eq!(q.len(), 1, "the refused text was not kept in the seat queue: {q:?}");
+        assert_eq!(q[0].from.as_deref(), Some("schedule:hb-r"));
+        assert_eq!(q[0].text, "[heartbeat] refused");
+        let refused = events(&d, "schedule.push_refused");
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert_eq!(refused[0]["payload"]["diverted"], json!(true));
+        assert!(events(&d, "schedule.push_cleared_pending").is_empty(), "a refused push announced a submitted line");
+        let v = verdict(handed);
+        assert_eq!(v, Ok("queued(refused)"));
+        assert!(matches!(classify_fire_result(&v.map(|l| format!("{l} to master (surface:{})", s.id))), JobResultKind::Queued));
+        // A second refusal of the same job: still one queued item (dedup), one more event.
+        deliver_push_with(&d, &job("hb-r"), s.id, "[heartbeat] refused", None, &mut None).expect("hand-off 2");
+        assert_eq!(s.pending_queue.lock().unwrap().len(), 1, "a second refusal queued the job twice");
+        assert_eq!(events(&d, "schedule.push_refused").len(), 2);
+        done(&s);
+    }
+
+    /// T-a2 (queue pair (b)): a healthy push writes body + Return once and only then counts the line submitted (ghost cleared).
+    #[test]
+    fn c6a_written_push_counts_the_line_submitted_after_its_return() {
+        let (d, s) = rig("c6a-written");
+        s.apply_pending_input(b"\x1b", InputOrigin::Human);
+        let ghost = counts(&s);
+        let mut handed = None;
+        deliver_push_with(&d, &job("hb-w"), s.id, "[heartbeat] written", None, &mut handed).expect("hand-off");
+        assert_eq!(counts(&s), (0, 0), "the written push did not count its line submitted");
+        assert_eq!(s.inject_track.last_body().map(|b| b.norm.contains("written")), Some(true), "body not recorded as written");
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "a written push was also queued");
+        let ev = events(&d, "schedule.push_cleared_pending");
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0]["payload"]["prev_bytes"], json!(ghost.0));
+        assert_eq!(verdict(handed), Ok("pushed"));
+        assert!(events(&d, "schedule.push_refused").is_empty());
+        done(&s);
+    }
+
+    /// T-a4: a push stopped before its Return leaves its prefix in the composer: counted as machine input, never queued again,
+    /// one partial event, and the fire task reports an error (not "pushed").
+    #[test]
+    fn c6a_push_stopped_before_its_return_counts_the_prefix_and_is_not_retyped() {
+        let (d, s) = rig("c6a-partial");
+        *s.receiver_proof.lock().unwrap() = Some(Arc::new(NoReturn));
+        let mut handed = None;
+        deliver_push_with(&d, &job("hb-p"), s.id, "[heartbeat] partial", None, &mut handed).expect("hand-off");
+        assert!(counts(&s).0 > 0, "the written prefix was not counted as pending input");
+        assert!(s.pending_queue.lock().unwrap().is_empty(), "a partial push was queued for a retype");
+        let ev = events(&d, "schedule.push_partial");
+        assert_eq!(ev.len(), 1, "{ev:?}");
+        assert_eq!(ev[0]["payload"]["kind"], json!("partial_exact"));
+        assert!(events(&d, "schedule.push_cleared_pending").is_empty());
+        let v = verdict(handed);
+        assert!(v.as_ref().is_err_and(|e| e.starts_with("push stopped part-way")), "{v:?}");
+        done(&s);
+    }
+
+    /// T-a3: a human key that lands after the hand-off (while the writer still waits on admission) moves the input generation;
+    /// the settlement then leaves that newer count alone instead of resetting it to 0.
+    #[test]
+    fn c6a_input_after_the_handoff_is_not_erased_by_the_settlement() {
+        let (d, s) = rig("c6a-newer");
+        let (tx, rx) = std::sync::mpsc::channel();
+        *s.receiver_proof.lock().unwrap() = Some(Arc::new(Gated(std::sync::Mutex::new(rx))));
+        crate::agent_write::set_test_sync_settle(false);
+        let mut handed = None;
+        deliver_push_with(&d, &job("hb-n"), s.id, "[heartbeat] newer", None, &mut handed).expect("hand-off");
+        let h = handed.expect("handed");
+        {
+            let _g = s.input_gate.lock().unwrap();
+            s.apply_pending_input(b"abc", InputOrigin::Human);
+        }
+        let newer = counts(&s);
+        assert_ne!(newer.0, 0, "premise: a newer human count");
+        tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !h.request.is_settled() {
+            assert!(std::time::Instant::now() < deadline, "push not settled in 10 s");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(counts(&s), newer, "the settlement erased input that arrived after the hand-off");
+        assert!(events(&d, "schedule.push_cleared_pending").is_empty());
+        crate::agent_write::set_test_sync_settle(true);
+        done(&s);
     }
 }

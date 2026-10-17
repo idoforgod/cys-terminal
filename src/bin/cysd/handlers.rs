@@ -562,79 +562,29 @@ fn migrate_seat_queue(
 /// ★SEAT 승계 고지 — **무음 승계 금지**.
 /// 빈 좌석의 특권 role 을 다른 surface 가 승계할 때, 구 좌석 사용자가 그 사실을 모르면 "내 pane 이
 /// 조용히 강등됐다"는 온보딩 불신을 낳는다(부트 체인이 사용자가 쓰려던 좌석을 가져가는 경우).
-/// 채널 2개: ①`role.takeover` 이벤트(GUI·구독자·저널) ②구 좌석 화면의 **셸 주석 1줄**.
 ///
-/// 주석을 쓰는 이유: 좌석은 셸이므로 텍스트 주입은 곧 '입력'이다 — 평문을 넣으면 프롬프트에
-/// 미제출 잔재가 남고 사용자의 다음 Return 이 그걸 명령으로 실행한다(오히려 위험). 주석 접두는
-/// 실행돼도 no-op 이고 scrollback 에 남아 눈에 보인다.
-///
-/// ★종전엔 여기가 `cfg!(unix)` 였다("cmd.exe 는 `#` 를 오류로 뱉는다") — 그래서 **Windows pane 은
-/// 승계 고지를 한 줄도 받지 못했고**, 사용자는 자기 좌석이 조용히 강등된 것을 영영 몰랐다
-/// (이 함수가 막으려던 "내 pane 이 조용히 강등됐다"는 온보딩 불신 그 자체다). 근거였던 전제가
-/// 틀렸다: Windows pane 의 기본 셸은 `powershell.exe`(`state.rs` `default_shell`)이고 거기서 `#`
-/// 는 정상 주석이다 — 위험한 것은 OS 가 아니라 **cmd.exe 하나**였다. 접두를 셸별로 고르면
-/// (`cys::shell_comment_prefix`) 안전과 가시성을 둘 다 지킨다(codex R2 #2 와 **같은 결함**이며
-/// npm 축을 고칠 때 형제로 보고해 master 가 범위에 넣었다).
-/// 큐 배달과 달리 좌석은 seat_claimable 이 이미 '자손 0·사람 입력 없음'을 보장한 상태다.
+/// ★(0.14.52 · S-a C6d · DESIGN-S-FROZEN-R3 §3.3 takeover row, §4.3) **Event only.** The old seat is a shell: the notice used to
+/// be typed into it as a shell-comment line (`#`/`rem` prefix per shell, pending-input skip under the H6 knob). A generated line
+/// typed into a shell is exactly the machine-to-shell write the design closes - it grants no blanket exception for it - so the
+/// notice now travels on the existing display/event path only: `role.takeover` carries the notice text (`notice`) and
+/// `pane_notice: "event_only"`. Zero bytes reach the shell (whatever its pending input or OS) and nothing is recorded in the
+/// delivery ledger (nothing is injected). 큐 배달과 달리 좌석은 seat_claimable 이 이미 '자손 0·사람 입력 없음'을 보장한 상태다.
 fn announce_seat_takeover(daemon: &Arc<Daemon>, prev_sid: u64, role: &str, path: &str) {
-    let surface = daemon.get_surface(prev_sid);
-    // ★(0.14.42 · 설계 H6) 구 좌석에 **미제출 입력**이 있으면 pane 줄(원장 + 주입)을 생략한다 — 이벤트는 유지.
-    //   `seat_claimable` 은 사람 입력 30s 만 보고 계수는 보지 않는다. 30s 넘게 방치된 셸 초안 뒤에 `# …` 가 붙고
-    //   CR 이 들어가면 **초안이 실행된다**(단어 중간의 `#` 은 주석이 아니다 — 아래 '실행돼도 no-op' 전제의 반례).
-    //   문안·접두·cr 120·cfg 는 무변경이다. 노브에서 takeover 를 빼면 종전 동작(이벤트 키도 종전 그대로).
-    let hold_on = crate::governance::machine_hold_enabled(crate::governance::MachineInjector::Takeover);
-    let pending = surface
-        .as_ref()
-        .map(|s| s.pending_input_bytes.load(Ordering::Relaxed))
-        .unwrap_or(0);
-    let skip_pane = hold_on && pending > 0;
-    let mut payload = json!({"role": role, "prev_surface": prev_sid, "path": path,
-                             "reason": "empty seat (no descendant process, no agent meta, no recent input)"});
-    if hold_on {
-        payload["pane_notice"] = json!(match (&surface, skip_pane) {
-            (None, _) => "skipped_surface_gone",
-            (Some(_), true) => "skipped_pending_input",
-            (Some(_), false) => "sent",
-        });
-    }
-    daemon.bus.publish("role.takeover", "system", Some(prev_sid), payload);
-    let Some(s) = surface else {
-        return;
-    };
-    if skip_pane {
-        return;
-    }
-    // 렌더 입력은 **그 좌석이 실제로 돌리는 셸**(`Surface::cmd`)이다 — `CYS_SHELL` 로 어느 OS
-    // 에서든 바뀌므로 `cfg!` 로 가르면 틀린다(npm 축과 같은 규율).
-    let text = seat_takeover_notice(role, &s.cmd);
-    // ★R1 배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 좌석 승계 고지도 기계 유래다.
-    // 원장에는 **주입할 그 문자열**을 남긴다(접두가 갈리면 층1 대조가 이 고지를 못 알아보고,
-    // 라벨도 없으므로 임무 게이트가 기계 고지를 오너 임무로 읽는다).
-    crate::delivery::record_audited(
-        daemon,
-        prev_sid,
-        &text,
-        crate::delivery::Origin::SeatTakeover,
-        None,
+    daemon.bus.publish(
+        "role.takeover",
+        "system",
+        Some(prev_sid),
+        json!({"role": role, "prev_surface": prev_sid, "path": path,
+               "reason": "empty seat (no descendant process, no agent meta, no recent input)",
+               "pane_notice": "event_only", "notice": seat_takeover_notice(role)}),
     );
-    // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고, 실패가 승계(가용성 회복)를
-    // 막아선 안 된다. 이벤트 채널이 이미 사실을 남긴다.
-    let _ = s.write_tx.try_send(crate::state::WriteReq::Inject {
-        text,
-        cr_delay_ms: 120,
-        clear_first: false,
-        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
-    });
 }
 
-/// 좌석 승계 고지 1줄 — **순수**(셸별 주석 접두 · 개행 없음).
-///
-/// 개행이 없어야 하는 이유는 접두와 같다: 좌석은 셸이고 **개행은 곧 Enter** 다.
-fn seat_takeover_notice(role: &str, shell: &str) -> String {
+/// 좌석 승계 고지 1줄 — **순수**(개행 없음). ★(0.14.52 · S-a C6d) no shell-comment prefix any more: it is never typed into a shell.
+fn seat_takeover_notice(role: &str) -> String {
     format!(
-        "{}[cys] 이 좌석이 쥐고 있던 '{role}' 역할을 부활 절차가 다른 pane 으로 재연결했습니다 \
-         (좌석이 비어 있었음). 이 셸은 그대로 사용할 수 있습니다.",
-        cys::shell_comment_prefix(shell)
+        "[cys] 이 좌석이 쥐고 있던 '{role}' 역할을 부활 절차가 다른 pane 으로 재연결했습니다 \
+         (좌석이 비어 있었음). 이 셸은 그대로 사용할 수 있습니다."
     )
 }
 
@@ -804,6 +754,7 @@ fn finalize_agent_meta_after_role_change(
                 *s.agent_meta.lock().unwrap() = Some((agent.clone(), bin.clone()));
                 s.agent_seen.store(true, Ordering::Relaxed);
                 s.agent_exit_notified.store(false, Ordering::Relaxed);
+                s.bump_agent_epoch(); // ★(0.14.52 · S-a C5b) a new agent incarnation
                 if dead_reobserve && prev_agent.as_deref() != Some(agent.as_str()) {
                     *s.agent_session_id.lock().unwrap() = None;
                 }
@@ -1404,10 +1355,10 @@ fn no_bind_reply(
 /// — 생산 소비자가 0이면 사용자는 자기 npm 전역 설치가 설치본 서명을 깨뜨리는 중이라는 사실을
 /// **다음 실행이 차단되고 나서야** 안다(그때는 이미 봉인이 깨져 있다).
 ///
-/// 채널 2개는 [`announce_seat_takeover`] 와 **같은 규율**이다:
-///   ①`env.advisory` 이벤트(GUI·구독자·저널) ②새 pane 화면의 **셸 주석 1줄**.
-/// `#` 접두·unix 한정·배달 원장 **선기록**의 근거는 전부 그 함수의 주석과 동일하다
-/// (특히 선기록: 이 주석도 기계 유래이므로 원장에 근거가 없으면 임무 게이트가 오너 임무로 읽는다).
+/// ★(0.14.52 · S-a C6d · DESIGN-S-FROZEN-R3 §3.3 npm row, §4.3) **Event only**, like [`announce_seat_takeover`]: the notice was
+/// also typed into the new pane as a shell-comment line; a generated line typed into a shell is the machine-to-shell write the
+/// design closes, so the advisory now lives on `env.advisory` (it already carried the whole text) and nothing reaches the pane
+/// or the delivery ledger.
 ///
 /// 세 번째 소비자는 여기가 아니라 `org.status` 의 `daemon.npm_prefix_polluted` 다 — 그쪽은
 /// preflight·doctor 가 **폴링**으로 읽는 진단 축이고, 이쪽은 사람이 pane 에서 보는 고지다.
@@ -1435,38 +1386,6 @@ fn announce_npm_prefix_pollution_with(
         Some(sid),
         json!({"kind": "npm_prefix_bundle_polluted", "surface": sid, "text": line}),
     );
-    // ★codex R2 #2(blocking): 종전엔 여기가 `cfg!(unix)` 였고 **Windows pane 은 고지를 한 줄도
-    //   받지 못했다**. 근거는 "cmd.exe 가 `#` 를 오류로 뱉는다" 였지만 Windows pane 의 기본 셸은
-    //   `powershell.exe`(state.rs `default_shell`)이고 거기서 `#` 는 정상 주석이다 — 즉 위험한
-    //   것은 OS 가 아니라 cmd.exe 하나였다. 접두를 **셸별로** 고르면 두 가지를 다 지킨다
-    //   ([`cys::shell_comment_prefix`]). 정작 봉인이 깨지는 사고는 Windows 에서 더 잦다.
-    let Some(s) = daemon.get_surface(sid) else {
-        return;
-    };
-    // 실제 pane 셸(`Surface::cmd`)로 렌더한다 — 프로세스 env 나 `cfg!` 가 아니라 **이 좌석이
-    // 실제로 돌리는 셸**이 판정 입력이다(`CYS_SHELL` 로 어느 OS 에서든 바뀐다).
-    let Some(req) = npm_prefix_pane_notice_req(verdict, &s.cmd) else {
-        return;
-    };
-    // ★배달 원장 — 주입보다 앞(delivery.rs 불변식 ①). 원장에는 **실제로 주입할 문자열**을
-    //   남긴다(정본 `#` 표기를 남기면 해시가 갈려 층1 대조가 이 고지를 못 알아본다).
-    // ★원장에 남기는 문자열은 **주입할 그 문자열이어야 한다**. 정본(`#`) 표기를 남기면
-    //   `cmd.exe` pane 에서 해시가 갈려 층1 대조가 이 고지를 못 알아보고, 라벨도 없으므로
-    //   임무 게이트가 **기계 고지를 오너 임무로 읽는다**(사고 재발 경로). 그래서 값을 따로
-    //   만들지 않고 **보낼 req 에서 그대로 꺼낸다** — 둘이 갈릴 자리를 없앤다.
-    let crate::state::WriteReq::Inject { text: injected, .. } = &req else {
-        unreachable!("npm_prefix_pane_notice_req 는 Inject 만 만든다");
-    };
-    crate::delivery::record_audited(
-        daemon,
-        sid,
-        injected,
-        crate::delivery::Origin::EnvAdvisory,
-        None,
-    );
-    // try_send: 채널 포화면 조용히 포기 — 고지는 best-effort 이고 실패가 pane 생성을
-    // 막아선 안 된다. 이벤트 채널과 status 축이 이미 사실을 남긴다.
-    let _ = s.write_tx.try_send(req);
 }
 
 /// `hook.machine_origin` 의 판정 본체 — 원장을 **읽고**(IO) 판정은 `mission_gate` 에 맡긴다.
@@ -1544,19 +1463,6 @@ fn hook_machine_origin_verdict(daemon: &Arc<Daemon>, sid: u64, norm: &str) -> se
         "ledger_status": read.status.as_str(),
         "anomalies": anomalies,
     })
-}
-
-/// pane 에 넣을 고지 `WriteReq` — **순수**(채널도 데몬도 만지지 않는다).
-///
-/// 집행(`try_send`)에서 분리한 이유는 codex R2 #2 의 "Inject 수신 단언" 때문이다: 실제 채널로
-/// 보내는 경로를 검체가 재려면 그 앞 단계가 값으로 잡혀야 하고, 그래야 **양 OS 의 셸 분기를
-/// mac CI 에서 전수로** 밟을 수 있다(`npm_config_prefix_default_for(os, …)` 와 같은 규율).
-fn npm_prefix_pane_notice_req(
-    verdict: &cys::NpmPrefixVerdict,
-    shell: &str,
-) -> Option<crate::state::WriteReq> {
-    let text = cys::npm_prefix_pollution_notice_for(verdict, shell)?;
-    Some(crate::state::WriteReq::Inject { text, cr_delay_ms: 120, clear_first: false, guard: None })
 }
 
 /// `org.status` 의 `daemon.npm_prefix_polluted` 필드 — **판정 주입판**(codex R2 #8).
@@ -3219,6 +3125,634 @@ fn send_text_write_req(
     }
 }
 
+// ─── ★(0.14.52 · S-a C5b) direct agent writes: held legacy bodies and owned submits ─────────────
+// DESIGN-S-FROZEN-R3 §4.3 intent table and §4.5; HEAD-R3-RULING S4-3 (window amended to 60,000 ms by
+// HEAD-RULINGS-W4-2); C5B-PLAN.md (interpretations I6-I9).
+
+/// How a non-queued `surface.send_text` to an agent seat is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectAgentIntent {
+    /// Ctrl-U + paste + its own Return (the old clear_first Inject bytes and timing).
+    OwnedClear,
+    /// The written bytes end with CR/LF: the body carries its own submit (old bytes, one job).
+    SelfSubmitting,
+    /// `submit:true`: the body and this request's own Return as ONE request.
+    OwnedSubmit,
+    /// An automatic body with no submit: held untyped until its caller's Return binds it (S3-5/S4-3).
+    Held,
+}
+
+/// Pure classification; `None` keeps today's write path: a shell seat, HumanTerminal (I6: self-declared
+/// `human` without `machine_origin` - the GUI attaches its token only when it can read it, and the
+/// owner's own keystrokes must never be held), and GUI-assembled text that neither clears nor submits
+/// (path insertion; C11 labels it explicitly).
+fn direct_agent_intent(
+    agent_seat: bool,
+    human: bool,
+    machine_origin: bool,
+    clear_first: bool,
+    submit: bool,
+    written: &[u8],
+) -> Option<DirectAgentIntent> {
+    if !agent_seat || (human && !machine_origin) {
+        return None;
+    }
+    let self_submits = written.last().is_some_and(|b| matches!(b, b'\r' | b'\n'));
+    if clear_first {
+        Some(DirectAgentIntent::OwnedClear)
+    } else if self_submits {
+        Some(DirectAgentIntent::SelfSubmitting)
+    } else if human {
+        None
+    } else if submit {
+        Some(DirectAgentIntent::OwnedSubmit)
+    } else {
+        Some(DirectAgentIntent::Held)
+    }
+}
+
+/// The caller a held body belongs to (C5B-PLAN I9): the verified caller seat; else the self-declared
+/// `from` seat (not for owner-token callers, as for the Return-absorb tickets); else the kernel peer's
+/// parent process with its native birth (a reused pid is another caller). `None` = unresolved.
+fn submit_caller_key(
+    daemon: &Daemon,
+    verified_from: Option<u64>,
+    caller_pid: Option<u32>,
+    params: &Value,
+) -> Option<crate::submit_assoc::CallerKey> {
+    use crate::submit_assoc::CallerKey;
+    if let Some(v) = verified_from {
+        return Some(CallerKey::Surface(v));
+    }
+    if !caller_is_owner(daemon, params, None) {
+        if let Some(n) = claimed_from_sid(params) {
+            return Some(CallerKey::Claimed(n));
+        }
+    }
+    let me = cys::process_observation::observe(caller_pid?).ok()?;
+    let parent = cys::process_observation::observe(me.identity.parent).ok()?;
+    let birth_us = parent.identity.birth_seconds.saturating_mul(1_000_000) + parent.identity.birth_microseconds;
+    Some(CallerKey::Process { parent_pid: parent.identity.pid, parent_birth_us: birth_us })
+}
+
+/// Explicit undelivered disposition of held bodies (never typed): one event each. Internal signal
+/// only (owner rule 2026-10-12: queue-block signals stay, owner-visible display does not).
+fn dispose_held_bodies(
+    daemon: &Daemon,
+    sid: u64,
+    bodies: Vec<crate::submit_assoc::HeldBody>,
+    reason: &str,
+    superseded_by: Option<&str>,
+    now: std::time::Instant,
+) {
+    for b in bodies {
+        daemon.bus.publish(
+            "surface.submit_undelivered",
+            "surface",
+            Some(sid),
+            json!({
+                "surface_ref": cys::surface_ref(sid),
+                "request_id": b.request_id,
+                "reason": reason,
+                "superseded_by": superseded_by,
+                "held_ms": now.saturating_duration_since(b.received_at).as_millis() as u64,
+                "window_ms": crate::submit_assoc::LEGACY_ASSOCIATION_WINDOW_MS,
+                "chars": b.text.chars().count(),
+                "text_sha256": crate::delivery::digest_text(&b.text),
+                "note": "A body sent without its own Return was held untyped and was not delivered; nothing was typed. \
+                         Send it again with its Return (cys send then cys send-key Return within the window, or --queued).",
+            }),
+        );
+    }
+}
+
+/// Dispose this seat's held bodies whose window closed or whose agent changed.
+pub(crate) fn sweep_held_submits_on(daemon: &Daemon, s: &crate::state::Surface, now: std::time::Instant) {
+    let epoch = s.agent_epoch.load(Ordering::Acquire);
+    let (stale, expired) = {
+        let mut t = s.submit_assoc.lock().unwrap_or_else(|e| e.into_inner());
+        if t.len() == 0 {
+            return;
+        }
+        (t.take_stale(epoch), t.expire(now))
+    };
+    dispose_held_bodies(daemon, s.id, stale, "agent_changed", None, now);
+    dispose_held_bodies(daemon, s.id, expired, "expired", None, now);
+}
+
+/// Watchdog tick: sweep every seat that holds a body.
+/// ★(0.14.52 · S-a C7e) Keep `submit-held.json` equal to every seat's held untokened bodies (ids, seat, role, age, length,
+/// digest - never the text), rewriting only when the held set changed; and once per daemon run dispose what an earlier run
+/// left held - each body explicitly undelivered (`surface.submit_undelivered` reason=daemon_restart, never typed) with a
+/// durable evidence line (`submit-held-undelivered.jsonl`). Called after every send_text/send_key RPC and by the tick's
+/// held-body sweep.
+pub(crate) fn sync_held_bodies(daemon: &Daemon) {
+    let dir = crate::state::state_dir(&daemon.socket_path);
+    let restart = std::mem::take(&mut *daemon.held_bodies_restart.lock().unwrap_or_else(|e| e.into_inner()));
+    let wall = crate::state::now_epoch();
+    for b in &restart {
+        let payload = json!({
+            "surface_ref": Value::Null,
+            "previous_surface_id": b.surface_id,
+            "role": b.role,
+            "request_id": b.request_id,
+            "reason": "daemon_restart",
+            "superseded_by": Value::Null,
+            "held_ms": ((wall - b.held_at).max(0.0) * 1000.0) as u64,
+            "window_ms": crate::submit_assoc::LEGACY_ASSOCIATION_WINDOW_MS,
+            "chars": b.chars,
+            "text_sha256": b.text_sha256,
+            "note": "A body sent without its own Return was held untyped when the daemon restarted; it was not delivered and \
+                     nothing was typed. Send it again with its Return.",
+        });
+        append_held_undelivered(&dir, &payload);
+        daemon.bus.publish("surface.submit_undelivered", "surface", None, payload);
+    }
+    let surfaces: Vec<Arc<crate::state::Surface>> = daemon.surfaces.lock().unwrap().values().cloned().collect();
+    let now = std::time::Instant::now();
+    let mut held: Vec<crate::state::PersistedHeldBody> = Vec::new();
+    for s in &surfaces {
+        let role = s.role.lock().unwrap().clone();
+        let t = s.submit_assoc.lock().unwrap_or_else(|e| e.into_inner());
+        for b in t.records() {
+            held.push(crate::state::PersistedHeldBody {
+                request_id: b.request_id.clone(),
+                surface_id: s.id,
+                role: role.clone(),
+                held_at: wall - now.saturating_duration_since(b.received_at).as_secs_f64(),
+                chars: b.text.chars().count(),
+                text_sha256: crate::delivery::digest_text(&b.text),
+            });
+        }
+    }
+    held.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+    let ids: Vec<String> = held.iter().map(|b| b.request_id.clone()).collect();
+    let mut written = daemon.held_bodies_written.lock().unwrap_or_else(|e| e.into_inner());
+    if written.as_ref() == Some(&ids) && restart.is_empty() {
+        return;
+    }
+    let body = serde_json::to_string(&held).unwrap_or_else(|_| "[]".into());
+    match crate::governance::write_json_atomic(&dir, crate::state::HELD_BODIES_FILE, &body) {
+        Ok(()) => *written = Some(ids),
+        Err(e) => daemon.bus.publish(
+            "surface.held_bodies_persist_failed",
+            "surface",
+            None,
+            json!({"error": e.to_string(), "held": held.len()}),
+        ),
+    }
+}
+
+/// Append one disposed held body to the durable evidence log (rotated once past 1 MiB; a failure is not fatal - the event
+/// was published).
+fn append_held_undelivered(dir: &std::path::Path, payload: &Value) {
+    use std::io::Write;
+    let path = dir.join(crate::state::HELD_UNDELIVERED_LOG);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = std::fs::rename(&path, path.with_extension("jsonl.1"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{}", json!({"ts": crate::state::now_epoch(), "event": "surface.submit_undelivered", "payload": payload}));
+        let _ = f.sync_data();
+    }
+}
+
+pub(crate) fn sweep_held_submits(daemon: &Daemon) {
+    let seats: Vec<Arc<crate::state::Surface>> = daemon.surfaces.lock().unwrap().values().cloned().collect();
+    let now = std::time::Instant::now();
+    for s in seats {
+        sweep_held_submits_on(daemon, &s, now);
+    }
+    sync_held_bodies(daemon); // ★(0.14.52 · S-a C7e) expiries and agent changes leave the durable record too
+}
+
+/// The bound body+Return job's proof (I8): the seat's proof, then the existing CR withhold probe right
+/// before the Return - a question/selection window that appeared after the body is never answered by it.
+pub(crate) struct SubmitWithhold {
+    pub(crate) inner: Arc<dyn crate::agent_write::Proof>,
+    pub(crate) probe: crate::state::SafetyProbe,
+}
+
+/// ProofLoss reason of a withheld Return (the probe already published `queue.submit_withheld`).
+const SUBMIT_WITHHELD: &str = "submit_withheld:modal";
+
+impl crate::agent_write::Proof for SubmitWithhold {
+    fn admit_context(&self, ctx: &crate::agent_write::ProofContext<'_>) -> Result<(), crate::receiver::ProofLoss> {
+        self.inner.admit_context(ctx)?;
+        // A resumed job can start at Return with no wait; that first call still needs the modal veto.
+        if ctx.next_phase == Some(crate::agent_write::Phase::Submit) && (self.probe)() {
+            return Err(crate::receiver::ProofLoss::Unknown(SUBMIT_WITHHELD.into()));
+        }
+        Ok(())
+    }
+    fn recheck_context(&self, phase: crate::agent_write::Phase, ctx: &crate::agent_write::ProofContext<'_>) -> Result<(), crate::receiver::ProofLoss> {
+        self.inner.recheck_context(phase, ctx)?;
+        if phase == crate::agent_write::Phase::Submit && (self.probe)() {
+            return Err(crate::receiver::ProofLoss::Unknown(SUBMIT_WITHHELD.into()));
+        }
+        Ok(())
+    }
+    fn admit(&self) -> Result<(), crate::receiver::ProofLoss> {
+        self.inner.admit()
+    }
+    fn recheck(&self, phase: crate::agent_write::Phase) -> Result<(), crate::receiver::ProofLoss> {
+        self.inner.recheck(phase)?;
+        if phase == crate::agent_write::Phase::Submit && (self.probe)() {
+            return Err(crate::receiver::ProofLoss::Unknown(SUBMIT_WITHHELD.into()));
+        }
+        Ok(())
+    }
+}
+
+/// The proof of a direct job that owns its Return after a body: the seat's proof plus the CR withhold
+/// probe, armed under the same conditions as a standalone Return on this seat (input_gate NOT held:
+/// it reads the adapter and the parser).
+fn submit_owning_proof(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
+    verified_from: Option<u64>,
+) -> Arc<dyn crate::agent_write::Proof> {
+    let proof = surface.agent_proof();
+    if cfg!(unix)
+        && governance::submit_guard_scope(surface) != governance::SubmitGuardScope::Off
+        && !send_settle_disabled(daemon)
+    {
+        if let Some(ctx) = governance::submit_cr_guard_context(surface) {
+            let probe = governance::submit_cr_withhold_probe(daemon, surface, ctx.markers, "machine_body", verified_from);
+            return Arc::new(SubmitWithhold { inner: proof, probe });
+        }
+    }
+    proof
+}
+
+/// Hold an untokened legacy body untyped (S3-5): zero bytes; the reply carries the request token.
+#[allow(clippy::too_many_arguments)]
+fn hold_direct_body(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
+    id: &Value,
+    text: &str,
+    fence: DirectFence,
+    verified_from: Option<u64>,
+    caller_pid: Option<u32>,
+    params: &Value,
+) -> Value {
+    let sid = surface.id;
+    let Some(caller) = submit_caller_key(daemon, verified_from, caller_pid, params) else {
+        return err_response(
+            id,
+            "submit_caller_unresolved",
+            "this caller could not be resolved, so no later Return can be bound to the body; nothing was typed - \
+             send the body with its own Return (--queued)",
+        );
+    };
+    let now = std::time::Instant::now();
+    sweep_held_submits_on(daemon, surface, now);
+    let request_id = crate::agent_write::new_request_id((daemon.started_at * 1000.0) as u64);
+    let epoch = surface.agent_epoch.load(Ordering::Acquire);
+    let body = crate::submit_assoc::HeldBody::new(
+        request_id.clone(),
+        caller,
+        epoch,
+        now,
+        text.to_string(),
+        fence == DirectFence::Fenced,
+    );
+    let held = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).hold(body);
+    match held {
+        Ok(Some(old)) => dispose_held_bodies(daemon, sid, vec![old], "superseded", Some(&request_id), now),
+        Ok(None) => {}
+        Err(_) => {
+            return err_response(
+                id,
+                "submit_hold_full",
+                "this seat already holds the maximum number of bodies awaiting their Return; nothing was typed",
+            )
+        }
+    }
+    // A direct send ends this caller's pair-Return ticket (as before); its Return now binds the held body.
+    if let Some(x) = request_pair_key(daemon, verified_from, params) {
+        surface.clear_return_ticket(x);
+    }
+    daemon.bus.publish(
+        "surface.submit_held",
+        "surface",
+        Some(sid),
+        json!({"surface_ref": cys::surface_ref(sid), "request_id": request_id, "chars": text.chars().count(),
+               "window_ms": crate::submit_assoc::LEGACY_ASSOCIATION_WINDOW_MS}),
+    );
+    *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch());
+    ok_response(
+        id,
+        json!({"surface_id": sid, "sent": true, "request_id": request_id, "held": "awaiting_submit",
+               "window_ms": crate::submit_assoc::LEGACY_ASSOCIATION_WINDOW_MS}),
+    )
+}
+
+/// Settlement of one direct agent write (design 4.5): bookkeeping only after the writer's terminal.
+struct DirectSettle {
+    daemon: std::sync::Weak<Daemon>,
+    surface: std::sync::Weak<crate::state::Surface>,
+    sid: u64,
+    request_id: String,
+    planned: Vec<u8>,
+    clear_first: bool,
+    origin: crate::governance::InputOrigin,
+    owner: Option<crate::governance::InputOwner>,
+    /// `input_gen` at hand-off: counters change only while nothing newer touched the input line.
+    gen_at_handoff: u64,
+    pair_key: Option<crate::state::PairKey>,
+    /// This job counted itself into `inject_track.submit_pending` at hand-off (an owned Return).
+    submit_handed: bool,
+    /// ★(0.14.52 · S-a C7d) When the job was handed to the writer: a withheld-Return record made after it is this job's.
+    handed_at: std::time::Instant,
+    /// `surface.input_injected` payload (None = quiet caller).
+    input_event: Option<Value>,
+}
+
+impl DirectSettle {
+    fn run(self, t: &crate::agent_write::Terminal) {
+        use crate::agent_write::Terminal as T;
+        let (Some(daemon), Some(s)) = (self.daemon.upgrade(), self.surface.upgrade()) else { return };
+        if self.submit_handed {
+            s.inject_track.submit_hand_failed(); // releases the hand-off count; the written stamp is the writer's
+        }
+        let accepted = match t {
+            T::WrittenBody { accepted } | T::WrittenSubmitted { accepted } => accepted.total(),
+            T::PartialExact { accepted, .. } | T::PartialUnknown { accepted, .. } => accepted.total(),
+            T::RefusedNoWrite { .. } | T::CancelledBeforeWrite => 0,
+        } as usize;
+        if t.wrote_nothing() {
+            let reason = match t {
+                T::RefusedNoWrite { reason } => reason.clone(),
+                _ => "cancelled".into(),
+            };
+            daemon.bus.publish(
+                "surface.write_refused",
+                "surface",
+                Some(self.sid),
+                json!({"surface_ref": cys::surface_ref(self.sid), "request_id": self.request_id, "reason": reason,
+                       "note": "Zero bytes were written for this direct send; nothing was typed or counted."}),
+            );
+            return;
+        }
+        {
+            let _gate = s.input_gate.lock().unwrap();
+            if s.input_gen.load(Ordering::Acquire) == self.gen_at_handoff {
+                // ★(0.14.52 · S-a C7d · I10) Byte-exact (design 4.5), a withheld Return included: the body is counted, the
+                //   unwritten Return is not, so the composer's machine residue is owned by its sender. The withheld record
+                //   learns the count and generation this left; the resubmission requires exactly those (it required 0
+                //   while this settlement counted the unwritten Return).
+                let withheld = matches!(t, T::PartialExact { reason, .. } if reason.ends_with(SUBMIT_WITHHELD));
+                let prefix = &self.planned[..accepted.min(self.planned.len())];
+                let rest = if self.clear_first && prefix.first() == Some(&0x15) {
+                    s.clear_pending_input();
+                    &prefix[1..]
+                } else {
+                    prefix
+                };
+                let next = s.apply_pending_input(rest, self.origin);
+                if self.origin == crate::governance::InputOrigin::Machine && next.count > 0 {
+                    if let Some(o) = self.owner {
+                        s.mark_pending_input_owner(o);
+                    }
+                }
+                if withheld {
+                    if let Some(w) = s.inject_track.withheld().filter(|w| w.at >= self.handed_at) {
+                        let expect = (s.pending_input_bytes.load(Ordering::Relaxed), s.input_gen.load(Ordering::Acquire));
+                        s.inject_track.update_withheld_if(w.at, |w| w.expect = Some(expect));
+                    }
+                }
+            }
+        }
+        if let Some(x) = self.pair_key {
+            s.clear_return_ticket(x);
+        }
+        *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+        if let Some(p) = self.input_event {
+            daemon.bus.publish("surface.input_injected", "surface", Some(self.sid), p);
+        }
+        if let T::PartialExact { envelope, reason, .. } | T::PartialUnknown { envelope, reason, .. } = t {
+            if !reason.ends_with(SUBMIT_WITHHELD) {
+                daemon.bus.publish(
+                    "surface.write_partial",
+                    "surface",
+                    Some(self.sid),
+                    json!({"surface_ref": cys::surface_ref(self.sid), "request_id": self.request_id, "kind": t.kind(),
+                           "reason": reason, "body_offset": envelope.body_offset, "submitted": envelope.submitted,
+                           "note": "The direct write stopped part-way; the daemon neither erases nor retypes the input line."}),
+                );
+            }
+        }
+    }
+}
+
+/// Hand one direct agent job to the seat's writer (inside `input_gate`; the caller holds it). The
+/// settlement's generation is captured here. Error = the old `try_write` reply, zero bytes.
+#[allow(clippy::too_many_arguments)]
+fn hand_off_direct_job(
+    surface: &Arc<crate::state::Surface>,
+    id: &Value,
+    request: Arc<crate::agent_write::Request>,
+    plan: crate::agent_write::Plan,
+    proof: Arc<dyn crate::agent_write::Proof>,
+    journal: Arc<dyn crate::agent_write::Journal>,
+    body_owner: Option<crate::governance::InputOwner>,
+    mut settle: DirectSettle,
+) -> Option<Value> {
+    settle.gen_at_handoff = surface.input_gen.load(Ordering::Acquire);
+    settle.planned = plan.planned_bytes();
+    settle.handed_at = std::time::Instant::now();
+    let handed = settle.submit_handed;
+    if handed {
+        surface.inject_track.submit_handed();
+    }
+    let job = crate::agent_write::AgentJob {
+        attempt: None,
+        request,
+        plan,
+        proof,
+        journal: Some(journal),
+        resume: None,
+        settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
+        guard: None,
+        note_body: body_owner.is_some(),
+        body_owner,
+    };
+    let err = try_write(surface, crate::state::WriteReq::Agent(Box::new(job)), id);
+    if err.is_some() && handed {
+        surface.inject_track.submit_hand_failed();
+    }
+    err
+}
+
+/// Put a body back after a refused bind (its receipt deadline, never widened). If its caller has held a
+/// newer body meanwhile (or the table filled), the older one is disposed as superseded instead.
+fn restore_held_body(daemon: &Daemon, surface: &crate::state::Surface, body: crate::submit_assoc::HeldBody) {
+    let back = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).restore(body);
+    if let Err(b) = back {
+        dispose_held_bodies(daemon, surface.id, vec![b], "superseded", None, std::time::Instant::now());
+    }
+}
+
+/// A queued Return bound to its held body: the body becomes ONE queue entry, which the queue writes with
+/// its own Return when the seat is ready (C4) - the old split "typed body + queued empty Return" without
+/// the orphan.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_bound_body(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
+    id: &Value,
+    key: &str,
+    body: crate::submit_assoc::HeldBody,
+    how: &'static str,
+    verified_from: Option<u64>,
+    params: &Value,
+) -> Value {
+    let sid = surface.id;
+    let entry_from = verified_from
+        .map(cys::surface_ref)
+        .or_else(|| params.get("from").and_then(|v| v.as_str()).map(str::to_string));
+    let pushed = {
+        let mut q = surface.pending_queue.lock().unwrap();
+        if q.len() >= 100 {
+            None
+        } else {
+            let entry = daemon.next_queue_entry(body.text.clone(), entry_from, "send");
+            q.push_back(entry.clone());
+            Some((entry, q.len()))
+        }
+    };
+    let Some((entry, depth)) = pushed else {
+        restore_held_body(daemon, surface, body);
+        return err_response(id, "queue_full", "pending queue cap (100) reached");
+    };
+    daemon.bus.publish(
+        "queue.enqueued",
+        "queue",
+        Some(sid),
+        crate::state::queue_enqueued_payload(&entry, depth, params.get("from").cloned().unwrap_or(Value::Null), None),
+    );
+    daemon.persist_queue_state();
+    ok_response(
+        id,
+        json!({"surface_id": sid, "key": key, "queued": true, "depth": depth, "queue_entry_id": entry.id,
+               "durable": daemon.queue_wal_durable(), "request_id": body.request_id, "bound": how}),
+    )
+}
+
+/// A legacy Return bound to its held body (S4-3): the body is admitted as a body again (it has not been
+/// typed), then body + its own Return go out as ONE request. A refusal puts the body back with its
+/// receipt deadline (never widened) and returns the same denial the old body path gave.
+#[allow(clippy::too_many_arguments)]
+fn bind_held_and_write(
+    daemon: &Arc<Daemon>,
+    surface: &Arc<crate::state::Surface>,
+    id: &Value,
+    key: &str,
+    body: crate::submit_assoc::HeldBody,
+    how: &'static str,
+    verified_from: Option<u64>,
+    caller_pid: Option<u32>,
+    params: &Value,
+) -> Value {
+    let sid = surface.id;
+    let restore = |b: crate::submit_assoc::HeldBody| restore_held_body(daemon, surface, b);
+    let authoritative = params.get("authoritative").and_then(|v| v.as_bool()).unwrap_or(false);
+    let exempt = authoritative && authoritative_caller_ok(daemon, verified_from, caller_pid);
+    if !exempt {
+        let guard = typing_guard_secs();
+        if guard > 0
+            && surface.last_human_input.lock().unwrap().map(|t| t.elapsed().as_secs() < guard).unwrap_or(false)
+        {
+            restore(body);
+            return err_response(id, cys::ERR_TYPING_GUARD, cys::MSG_TYPING_GUARD);
+        }
+    }
+    let fence = if body.fenced { DirectFence::Fenced } else { DirectFence::Raw };
+    let written = direct_fence_bytes(&body.text, fence).into_owned();
+    let text_submits = body.text.bytes().any(|b| matches!(b, b'\r' | b'\n'));
+    let text_cancels = body.text.bytes().any(|b| matches!(b, 0x15 | 0x03));
+    let gate_kind = governance::direct_send_text_gate_kind(false, false, false, text_submits, text_cancels, exempt);
+    let settle_on = send_settle_applies(daemon, surface, gate_kind);
+    if let Some(kind) = gate_kind {
+        if let Some(why) = governance::draft_gate(daemon, surface, kind) {
+            restore(body);
+            let settle = settle_on.then(|| submit_settle_proof_now(surface, why)).flatten();
+            return draft_gate_denied_response(daemon, surface, id, kind, why, verified_from, None, settle);
+        }
+        if settle_on {
+            if let Some(ms) = submit_settle_hold(submit_settle_obs_now(surface), SEND_SETTLE_MS, cr_min_gap_ms()) {
+                restore(body);
+                return draft_gate_denied_response(
+                    daemon, surface, id, kind, DraftGateDenied::SubmitSettling, verified_from, None, Some(ms),
+                );
+            }
+        }
+    }
+    let Ok(written) = String::from_utf8(written) else {
+        restore(body);
+        return err_response(id, "invalid_params", "held body is not UTF-8");
+    };
+    let proof = submit_owning_proof(daemon, surface, verified_from);
+    let owner = residue_owner(verified_from, false, false, || caller_is_owner(daemon, params, None), || claimed_from_sid(params));
+    let journal = daemon.agent_journal();
+    let request = crate::agent_write::Request::new(
+        body.request_id.clone(),
+        sid,
+        "send_bound",
+        crate::delivery::digest_text(&body.text),
+    );
+    let handle = request.clone();
+    let quiet = params.get("quiet").and_then(|v| v.as_bool()).unwrap_or(false);
+    let settle = DirectSettle {
+        daemon: Arc::downgrade(daemon),
+        surface: Arc::downgrade(surface),
+        sid,
+        request_id: body.request_id.clone(),
+        planned: Vec::new(),
+        clear_first: false,
+        origin: crate::governance::InputOrigin::Machine,
+        owner,
+        gen_at_handoff: 0,
+        pair_key: request_pair_key(daemon, verified_from, params),
+        submit_handed: true,
+        handed_at: std::time::Instant::now(),
+        input_event: (!quiet).then(|| {
+            let (from, from_verified) = match verified_from {
+                Some(v) => (json!(v), true),
+                None => (params.get("from").cloned().unwrap_or(Value::Null), false),
+            };
+            json!({"bytes": body.text.len(), "from": from, "from_verified": from_verified, "request_id": body.request_id})
+        }),
+    };
+    let plan = crate::agent_write::Plan::raw(&written).with_submit(cr_min_gap_ms(), 0);
+    {
+        let _gate = surface.input_gate.lock().unwrap();
+        if let Some(kind) = gate_kind {
+            let pending = surface.pending_input_bytes.load(Ordering::Relaxed);
+            let human = surface.pending_input.lock().unwrap_or_else(|e| e.into_inner()).human;
+            if let Some(why) = governance::draft_gate_verdict(kind, pending, human.min(pending), None, false, false) {
+                drop(_gate);
+                restore(body);
+                let settle = settle_on.then(|| submit_settle_proof_now(surface, why)).flatten();
+                return draft_gate_denied_response(daemon, surface, id, kind, why, verified_from, None, settle);
+            }
+        }
+        if let Some(err) = hand_off_direct_job(surface, id, request, plan, proof, journal, owner, settle) {
+            drop(_gate);
+            restore(body);
+            return err;
+        }
+    }
+    crate::agent_write::test_wait_settled(&handle);
+    *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch());
+    ok_response(
+        id,
+        json!({"surface_id": sid, "key": key, "sent": true, "request_id": body.request_id, "bound": how}),
+    )
+}
+
 /// authoritative(타이핑 가드 면제) restore-root 분기 — caller_pid 의 32-hop 조상 중 restore_roots 에
 /// 등록된 pid 가 있고 그 pid 의 현재 start_time 이 등록값과 일치할 때만 true. resolve_caller_surface·
 /// caller_cache 와 완전 독립이다(별도 sysinfo 새로고침·캐시 미사용 — 공유 자료구조 오염 0). start_time
@@ -4130,7 +4664,9 @@ fn auto_route_idem_window_secs() -> f64 {
 }
 
 enum CeoDelivery {
-    Delivered,
+    /// ★(0.14.52 · S-a C6c) Handed to the CEO seat's writer as one checked request; its settlement ([`CeoSettle`]) publishes
+    /// `feed.auto_routed` after the written Return, or escalates when nothing (or only part) was written.
+    Handed,
     SeatEmpty,
     /// ★(0.14.42 · 설계 H4) 좌석은 있으나 하드축(모달·화면 초안·사이클·kill-switch)이 양성 관측됐다 — 사유를 싣고
     /// 즉시 escalation 한다(큐 미사용: 요청자 대기 120s 라 큐 보류는 곧 조용한 만료다).
@@ -4166,7 +4702,7 @@ fn route_auto_approval(daemon: &Arc<Daemon>, item: &crate::state::FeedItem, over
         return;
     }
     match deliver_to_ceo(daemon, item, over_pressure) {
-        CeoDelivery::Delivered => {}
+        CeoDelivery::Handed => {}
         CeoDelivery::SeatEmpty => escalate_no_ceo(daemon, item, "ceo_seat_empty"),
         CeoDelivery::Held(reason) => escalate_no_ceo(daemon, item, reason),
     }
@@ -4241,24 +4777,75 @@ fn deliver_to_ceo(
         crate::delivery::Origin::Feed,
         item.publisher_surface,
     );
-    let req = crate::state::WriteReq::Inject {
-        text,
-        cr_delay_ms: 500,
-        clear_first: false,
-        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
+    // ★(0.14.52 · S-a C6c) One checked agent request (body + its own Return, cr 500 as before); `last_injected` and
+    //   `feed.auto_routed` wait for the writer's terminal ([`CeoSettle`]).
+    let request = crate::agent_write::Request::new(
+        crate::agent_write::new_request_id((daemon.started_at * 1000.0) as u64),
+        sid,
+        "feed",
+        crate::delivery::digest_text(&text),
+    );
+    let handle = request.clone();
+    let settle = CeoSettle {
+        daemon: Arc::downgrade(daemon),
+        surface: Arc::downgrade(&surface),
+        sid,
+        item: item.clone(),
+        request_id: request.id.clone(),
     };
-    if surface.write_tx.try_send(req).is_err() {
+    let job = crate::agent_write::AgentJob {
+        attempt: None,
+        request,
+        plan: crate::agent_write::Plan::paste(&text).with_submit(500, 0),
+        proof: surface.agent_proof(),
+        journal: Some(daemon.agent_journal()),
+        resume: None,
+        settle: Some(Box::new(move |t: &crate::agent_write::Terminal| settle.run(t))),
+        guard: None, // 큐 배달 아님 — 인계 가드 없음(종전 동작)
+        note_body: true, // the old Inject arm recorded every routed body (owner None)
+        body_owner: None,
+    };
+    if surface.write_tx.try_send(crate::state::WriteReq::Agent(Box::new(job))).is_err() {
         return CeoDelivery::SeatEmpty; // writer 채널 불능 → escalation
     }
-    *surface.last_injected.lock().unwrap() = Some(std::time::Instant::now());
-    daemon.bus.publish(
-        "feed.auto_routed",
-        "feed",
-        Some(sid),
-        json!({"request_id": item.request_id, "risk_class": item.risk_class,
-               "publisher_surface": item.publisher_surface}),
-    );
-    CeoDelivery::Delivered
+    crate::agent_write::test_wait_settled(&handle);
+    CeoDelivery::Handed
+}
+
+/// ★(0.14.52 · S-a C6c) Settlement of one CEO auto-route after the writer's terminal (design 3.3 feed row: "consume the
+/// actual-write outcome and preserve the unresolved feed on refusal"). The feed item is never resolved here, so a refused or
+/// partial write leaves it pending and reaches the human through the same escalation as an empty CEO seat.
+struct CeoSettle {
+    daemon: std::sync::Weak<Daemon>,
+    surface: std::sync::Weak<crate::state::Surface>,
+    sid: u64,
+    item: crate::state::FeedItem,
+    request_id: String,
+}
+
+impl CeoSettle {
+    fn run(self, t: &crate::agent_write::Terminal) {
+        use crate::agent_write::Terminal as T;
+        let Some(daemon) = self.daemon.upgrade() else { return };
+        match t {
+            T::WrittenSubmitted { .. } => {
+                if let Some(s) = self.surface.upgrade() {
+                    *s.last_injected.lock().unwrap() = Some(std::time::Instant::now());
+                }
+                daemon.bus.publish(
+                    "feed.auto_routed",
+                    "feed",
+                    Some(self.sid),
+                    json!({"request_id": self.item.request_id, "risk_class": self.item.risk_class,
+                           "publisher_surface": self.item.publisher_surface, "write_request_id": self.request_id}),
+                );
+            }
+            T::RefusedNoWrite { .. } | T::CancelledBeforeWrite => escalate_no_ceo(&daemon, &self.item, "ceo_write_refused"),
+            T::WrittenBody { .. } | T::PartialExact { .. } | T::PartialUnknown { .. } => {
+                escalate_no_ceo(&daemon, &self.item, "ceo_write_partial")
+            }
+        }
+    }
 }
 
 /// CEO 주입 텍스트(§W3.2 포맷): 헤더(cysd 신원보증 메타) + inert 격리 인용 본문 + 결재 안내.
@@ -4792,6 +5379,16 @@ fn quiet_secs_consistent(surface: &crate::state::Surface, gen_before: u64) -> f6
 }
 
 pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
+    // ★(0.14.52 · S-a C7e) The two RPCs that hold, bind or dispose untokened bodies keep their durable record current.
+    let held_may_change = matches!(req.method.as_str(), "surface.send_text" | "surface.send_key");
+    let reply = dispatch_method(daemon, req, caller_pid);
+    if held_may_change {
+        sync_held_bodies(daemon);
+    }
+    reply
+}
+
+fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> Reply {
     let id = req.id.clone();
     let params = req.params;
     // C0 채널 계층: channel.* RPC는 channels 모듈이 전담(단일 위임 — dispatch match 비대화 방지).
@@ -6052,6 +6649,80 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 || caller_is_owner(daemon, &params, None),
                 || claimed_from_sid(&params),
             );
+            // ★(0.14.52 · S-a C5b) Agent seat: ONE checked writer request whose bookkeeping waits for its terminal,
+            //   or an untokened legacy body held untyped (S3-5/S4-3). Shell seats, human keys and GUI insertion keep
+            //   the path below byte for byte (C5B-PLAN).
+            let agent_seat = surface.agent_meta.lock().unwrap().is_some();
+            let submit_param = params.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
+            let written = direct_fence_bytes(&text, fence).into_owned();
+            let agent_intent =
+                direct_agent_intent(agent_seat, human, machine_origin, clear_first, submit_param, &written);
+            if agent_intent == Some(DirectAgentIntent::Held) {
+                return Reply::Single(hold_direct_body(
+                    daemon, &surface, &id, &text, fence, verified_from, caller_pid, &params,
+                ));
+            }
+            let quiet = params.get("quiet").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mut direct_job = match agent_intent {
+                Some(intent) => {
+                    let Ok(written) = String::from_utf8(written) else {
+                        return Reply::Single(err_response(&id, "invalid_params", "text is not UTF-8"));
+                    };
+                    let (plan, proof, handed) = match intent {
+                        DirectAgentIntent::OwnedClear => (
+                            crate::agent_write::Plan::paste(&text)
+                                .with_clear(crate::state::clear_settle_ms())
+                                .with_submit(400, 0),
+                            surface.agent_proof(),
+                            false,
+                        ),
+                        DirectAgentIntent::SelfSubmitting => {
+                            (crate::agent_write::Plan::raw(&written), surface.agent_proof(), false)
+                        }
+                        _ => (
+                            crate::agent_write::Plan::raw(&written).with_submit(cr_min_gap_ms(), 0),
+                            submit_owning_proof(daemon, &surface, verified_from),
+                            true,
+                        ),
+                    };
+                    let request = crate::agent_write::Request::new(
+                        crate::agent_write::new_request_id((daemon.started_at * 1000.0) as u64),
+                        sid,
+                        "send",
+                        crate::delivery::digest_text(&text),
+                    );
+                    let origin = if human && !machine_origin {
+                        crate::governance::InputOrigin::Human
+                    } else {
+                        crate::governance::InputOrigin::Machine
+                    };
+                    let settle = DirectSettle {
+                        daemon: Arc::downgrade(daemon),
+                        surface: Arc::downgrade(&surface),
+                        sid,
+                        request_id: request.id.clone(),
+                        planned: Vec::new(),
+                        clear_first,
+                        origin,
+                        owner: owner_if_residue,
+                        gen_at_handoff: 0,
+                        pair_key: request_pair_key(daemon, verified_from, &params),
+                        submit_handed: handed,
+                        handed_at: std::time::Instant::now(),
+                        input_event: (!quiet).then(|| {
+                            let (from, from_verified) = match verified_from {
+                                Some(v) => (json!(v), true),
+                                None => (params.get("from").cloned().unwrap_or(Value::Null), false),
+                            };
+                            json!({"bytes": text.len(), "from": from, "from_verified": from_verified,
+                                   "request_id": request.id})
+                        }),
+                    };
+                    Some((request, plan, proof, daemon.agent_journal(), settle))
+                }
+                None => None,
+            };
+            let agent_handle = direct_job.as_ref().map(|(r, ..)| r.clone());
             // ★R1-blocking-2(codex 감사): writer 인계와 pending 갱신을 **한 임계영역**으로 묶는다.
             //   종전엔 인계 뒤에 pending 을 기록해, 그 창에서 watchdog 이 pending=0 을 보고 큐
             //   Inject 를 넣으면 두 본문이 한 제출로 합쳐졌다(delivery_concatenated 이상징후).
@@ -6112,14 +6783,21 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     }
                 }
             }
-            if let Some(err) = try_write(&surface, write_req, &id) {
+            if let Some((request, plan, proof, journal, settle)) = direct_job.take() {
+                if let Some(err) =
+                    hand_off_direct_job(&surface, &id, request, plan, proof, journal, owner_if_residue, settle)
+                {
+                    return Reply::Single(err);
+                }
+            } else if let Some(err) = try_write(&surface, write_req, &id) {
                 return Reply::Single(err);
             }
             // ★B1(0.14.30): 미제출 입력 계수 — 큐 배달의 '입력줄 점유' 1차 축(화면 무의존).
             //   clear_first 주입은 Ctrl-U 선정리 + 본문 + CR 을 원자로 보내 **줄을 비우고 제출**
             //   하므로 계수는 0 이다. 그 외 본문(사람 키·프로그램 미제출 본문)은 누적한다 —
             //   제출 CR 이 별도 send_key 로 오기 전까지 그 줄은 점유 상태다.
-            {
+            // ★(0.14.52 · S-a C5b) An agent job's counters are applied by its settlement, after the terminal.
+            if agent_handle.is_none() {
                 // ★(0.14.31 · WP-5) 세대 동반 쓰기 — stale 리셋(governance)이 세대로 ABA 를 가른다.
                 if clear_first {
                     surface.clear_pending_input();
@@ -6153,21 +6831,26 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             //   Return 은 이 새 본문을 제출해야 한다(clear_first 포함). 표 락은 단독 leaf(게이트 밖).
             //   ★(B) 키는 발급과 같은 규칙(`request_pair_key`) — Claimed 발신자의 직접 성공도 자기 표만 지운다
             //   (Verified(n) 과 Claimed(n) 은 서로를 지우지 않는다).
-            if let Some(x) = request_pair_key(daemon, verified_from, &params) {
+            // ★(0.14.52 · S-a C5b) A clear-first write erases the line every held body would have been typed into
+            //   under the old two-step: those bodies are disposed (undelivered, never typed).
+            if agent_intent == Some(DirectAgentIntent::OwnedClear) {
+                let gone = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).drain_all();
+                dispose_held_bodies(daemon, sid, gone, "cleared", None, std::time::Instant::now());
+            }
+            if let Some(h) = &agent_handle {
+                // Ticket, echo window and `surface.input_injected` are the settlement's (after the terminal).
+                crate::agent_write::test_wait_settled(h);
+            } else if let Some(x) = request_pair_key(daemon, verified_from, &params) {
                 surface.clear_return_ticket(x);
             }
-            if !human_verified {
+            if !human_verified && agent_handle.is_none() {
                 // T4-17 에코 제외 창 갱신 — 주입 직후 에코 라인이 헬스룰을 오발시키지 않게.
                 // ★R4: 여기도 자기신고 `human` 이 아니라 검증된 사실을 쓴다. 방향은 안전한 쪽이다
                 //   — 위조 human 이 에코 제외 창을 건너뛰어 헬스룰을 오발시키던 경로가 닫힌다.
                 *surface.last_injected.lock().unwrap() = Some(std::time::Instant::now());
             }
             // quiet=true: interactive keystrokes (UI) — skip event publish to avoid spam.
-            let quiet = params
-                .get("quiet")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if !quiet {
+            if !quiet && agent_handle.is_none() {
                 // T1-3: 발신자 신원이 해석되면 클라이언트 자기신고(from)를 덮어쓴다
                 let (from, from_verified) = match verified_from {
                     Some(v) => (json!(v), true),
@@ -6216,7 +6899,11 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             }
             // T5-2: 명령 성공 ack 시각 스탬프 — surface_crashed 술어의 "ack 후 후행 실패" 기준.
             *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch());
-            Reply::Single(ok_response(&id, json!({"surface_id": sid, "sent": true})))
+            let mut result = json!({"surface_id": sid, "sent": true});
+            if let Some(h) = &agent_handle {
+                result["request_id"] = json!(h.id);
+            }
+            Reply::Single(ok_response(&id, result))
         }
 
         "surface.send_key" => {
@@ -6252,6 +6939,45 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Ok(v) => v,
                 Err(e) => return Reply::Single(err_response(&id, "acl_denied", &e)),
             };
+            // ★(0.14.52 · S-a C5b) A Return to an agent seat first binds its caller's held body (S4-3; token, else the
+            //   same caller and agent epoch inside 60,000 ms of receipt) - before the Return-absorb check, which would
+            //   read the held (untyped) body's empty line as nothing to submit. No associable body = the paths below.
+            if bytes.as_slice() == b"\r" && surface.agent_meta.lock().unwrap().is_some() {
+                let now = std::time::Instant::now();
+                sweep_held_submits_on(daemon, &surface, now);
+                let epoch = surface.agent_epoch.load(Ordering::Acquire);
+                let token = params.get("request_id").and_then(|v| v.as_str());
+                let any_held = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).len() > 0;
+                let bound = match token {
+                    Some(t) => {
+                        let b = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).take_by_token(t, epoch, now);
+                        let Some(b) = b else {
+                            return Reply::Single(err_response(
+                                &id,
+                                "submit_unbound",
+                                "no body awaits this request_id on this seat (expired, superseded, submitted or another agent); \
+                                 nothing was typed",
+                            ));
+                        };
+                        Some((b, "token"))
+                    }
+                    None if any_held => submit_caller_key(daemon, verified_from, caller_pid, &params).and_then(|k| {
+                        match surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).take_for_return(&k, epoch, now) {
+                            crate::submit_assoc::Associate::Bound(b) => Some((b, "legacy")),
+                            crate::submit_assoc::Associate::NoBody => None,
+                        }
+                    }),
+                    None => None,
+                };
+                if let Some((body, how)) = bound {
+                    let queued = params.get("queued").and_then(|v| v.as_bool()).unwrap_or(false);
+                    return Reply::Single(if queued {
+                        enqueue_bound_body(daemon, &surface, &id, &key, body, how, verified_from, &params)
+                    } else {
+                        bind_held_and_write(daemon, &surface, &id, &key, body, how, verified_from, caller_pid, &params)
+                    });
+                }
+            }
             // ★(0.14.42 · A2 D3) 짝 Return 흡수 판정 — ACL 뒤(발신자는 자기 짝 Return 만 억제할 수
             //   있다) · queued 팔·타이핑 가드·D-12 **앞**. 흡수는 쓰기 1회를 억제만 한다(새 쓰기·적재 0).
             //   `pair_return` 은 신 CLI 의 단일 `send-key Return|Enter` 만 싣는다 — inject_text·cycle
@@ -9093,6 +9819,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                             }
                         };
                         if swapped {
+                            // ★(0.14.52 · S-a C7b) `/clear` started a new conversation: a partial write held for the old one
+                            //   never resumes into it (S4-1 "same conversation epoch").
+                            surface.bump_conversation_epoch();
                             // 역할 좌석만 topology 에 실린다 — 가드는 별도 문장(role 락을 쥔 채 persist 하면 자기 교착).
                             let has_role = surface.role.lock().unwrap().is_some();
                             if has_role {
@@ -10160,6 +10889,7 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             *surface.agent_meta.lock().unwrap() = Some((agent.clone(), agent_bin));
             surface.agent_seen.store(false, Ordering::Relaxed);
             surface.agent_exit_notified.store(false, Ordering::Relaxed);
+            surface.bump_agent_epoch(); // ★(0.14.52 · S-a C5b) a new agent incarnation
             drop(display_write);
             // ★(R3SH-4) 새 에이전트가 이 좌석에 앉는다 — 앞 에이전트의 사이클 창 표지(quiescing)는 이 에이전트의 것이 아니다.
             //   남겨 두면 H1 이 새 에이전트의 각성 지시(`send --queued`)까지 최대 600s 막는다(injected_unverified → '계속 실패').
@@ -10549,6 +11279,24 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
             let mut status = info.map(|p| json!(p)).unwrap_or_else(|| json!({"since": null}));
             status["paused"] = json!(paused);
             Reply::Single(ok_response(&id, status))
+        }
+
+        // ─── ★(0.14.52 · S-a C7c · design 4.6) reconciliation listing — read-only, 100 rows per page with a cursor ───
+        // Rows: held partial writes, persisted holds not yet adopted, earlier-run inconclusive journal records
+        // (`governance::reconciliation_rows`). Ids, proof class, byte bounds, reason, age and action owner - never body text.
+        "queue.reconciliation" => {
+            let filter_sid = resolve_surface_id(&params);
+            let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(100).clamp(1, 100) as usize;
+            let cursor = params.get("cursor").and_then(|v| v.as_str()).map(str::to_string);
+            let rows = crate::governance::reconciliation_rows(daemon, filter_sid);
+            let total = rows.len();
+            let mut page: Vec<(String, Value)> =
+                rows.into_iter().filter(|(k, _)| cursor.as_deref().is_none_or(|c| k.as_str() > c)).take(limit + 1).collect();
+            let more = page.len() > limit;
+            page.truncate(limit);
+            let next_cursor = if more { page.last().map(|(k, _)| k.clone()) } else { None };
+            let rows: Vec<Value> = page.into_iter().map(|(_, v)| v).collect();
+            Reply::Single(ok_response(&id, json!({"rows": rows, "next_cursor": next_cursor, "total": total, "limit": limit})))
         }
 
         // ─── T4-15 짝 기능: 미배달 큐 검사·철회 ───
@@ -11087,7 +11835,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                 Ok(d) => Reply::Single(ok_response(
                     &id,
                     json!({"surface_id": sid, "queue_entry_id": d.entry.id,
-                           "seq": d.entry.seq, "delivered": true, "forced": true,
+                           "seq": d.entry.seq, "accepted": true, "delivered": d.written_submitted(), "forced": true,
+                           "written": d.written_state(), "request_id": d.request_id,
                            "remaining": d.remaining}),
                 )),
                 Err(denied) => {
@@ -11600,6 +12349,8 @@ fn surface_create_error(bus: &crate::events::EventBus, id: &Value, message: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    include!("caller_matrix_tests.rs");
 
     /// ★(0.14.42 · perf R3-6) live_cwd **단일 관측 · 단일 손잡이 핀**.
     /// ① surface.list · org.status · 좌석 회수 호출자 축은 `live_cwds` 를 경유한다 — 운영 구간(테스트
@@ -15983,6 +16734,11 @@ mod tests {
                 p[k] = v.clone();
             }
             let resp = d12_rpc(&daemon, pid, "surface.send_text", p);
+            // ★(0.14.52 · S-a C5b) A body without its Return is held untyped; bind it with a job that stops before its
+            //   Return so the captured bytes are exactly the body's (the fence decision under test), as before.
+            if resp["result"]["held"] == json!("awaiting_submit") {
+                crate::direct_agent_tests::bind_with_return_lost(&daemon, t.id, Some(pid), None);
+            }
             // 쓰기가 멈출 때까지(최대 3 s) 기다린다.
             let mut last = off;
             let mut stable = 0;
@@ -17280,6 +18036,11 @@ mod tests {
             let resp = d12_rpc(&daemon, pid, "surface.send_text", json!({
                 "surface_id": target.id, "text": "hello", "human": false, "queued": false, "quiet": true,
             }));
+            // ★(0.14.52 · S-a C5b) An admitted body is held until its Return; bind it with a job that stops before its
+            //   Return so the control still observes the typed, counted body.
+            if resp["result"]["held"] == json!("awaiting_submit") {
+                crate::direct_agent_tests::bind_with_return_lost(&daemon, target.id, Some(pid), None);
+            }
             observations.push((resp, before, d12_input_counts(&target)));
         }
         d12_cleanup(&daemon, &dir);
@@ -18153,6 +18914,9 @@ mod tests {
             "surface_id": machine_target.id, "text": "hello", "human": false,
             "queued": false, "quiet": true,
         }));
+        // ★(0.14.52 · S-a C5b) The machine residue arises by the remaining route: its Return binds it and the job stops
+        //   before the Return.
+        crate::direct_agent_tests::bind_with_return_lost(&daemon, machine_target.id, Some(pid), None);
         let machine_before = d12_input_counts(&machine_target);
         let machine_clear = d12_rpc(&daemon, pid + 1, "surface.send_text", json!({
             "surface_id": machine_target.id, "text": "replace", "clear_first": true,
@@ -18577,7 +19341,7 @@ mod tests {
         s.id
     }
 
-    /// ★H-NPM-4(codex R1 #2 · blocking): **번들 오염 경고에 실제 소비자가 있다 — pane 채널.**
+    /// ★H-NPM-4(codex R1 #2 · blocking): **번들 오염 경고에 실제 소비자가 있다 — event 채널** (★0.14.52 S-a C6d: event only).
     ///
     /// 종전 결함: `WarnBundlePolluted` 는 env 주입만 멈추고 아무 데도 말하지 않았다(생산
     /// 소비자 0). T2-4 는 "덮지 말고 경고만"이지 "무음"이 아니다 — 소비자가 없으면 사용자는
@@ -18585,10 +19349,10 @@ mod tests {
     ///
     /// 이 검체가 재는 것 셋(하나라도 없으면 FAIL):
     ///   ① `env.advisory` 이벤트에 경고 문안이 실린다(GUI·구독자·저널 채널)
-    ///   ② 배달 원장에 **주입보다 먼저** 기록된다(없으면 임무 게이트가 이 주석을 오너 임무로 읽는다)
+    ///   ② ★(0.14.52 · S-a C6d) pane 에 아무것도 치지 않고 배달 원장에도 기록하지 않는다(주입이 없다)
     ///   ③ 오염이 아닌 판정에서는 **아무것도** 나가지 않는다(과잉 고지 차단 · 음성 대조)
     #[test]
-    fn npm_prefix_pollution_is_announced_to_pane_channel_and_ledger() {
+    fn npm_prefix_pollution_is_announced_on_the_event_channel_only() {
         let daemon = isolated_daemon();
         let sid = make_surface(&daemon, None);
         let mut rx = daemon.bus.subscribe();
@@ -18618,20 +19382,10 @@ mod tests {
             "env.advisory 이벤트에 경고가 없다 — T2-4 '경고만' 정책이 무음으로 방치된다"
         );
 
-        // ② 배달 원장 선기록(unix 주입 경로 한정 — 주입이 없는 곳엔 기록할 유래도 없다).
-        if cfg!(unix) {
-            let led = crate::delivery::ledger_path(&daemon.socket_path);
-            let raw = std::fs::read_to_string(&led).unwrap_or_default();
-            assert!(
-                raw.contains("env_advisory"),
-                "고지가 배달 원장에 없다({}) — 임무 게이트가 이 주석을 **오너 임무**로 읽는다",
-                led.display()
-            );
-            assert!(
-                raw.contains("npm_config_prefix"),
-                "원장 레코드가 이 고지의 것이 아니다: {raw}"
-            );
-        }
+        // ② ★(0.14.52 · S-a C6d) event only: nothing typed into the pane, so no delivery-ledger record either.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(daemon.get_surface(sid).unwrap().inject_track.last_body().is_none(), "the advisory was typed into the pane");
+        assert_eq!(crate::governance::h_ledger_count(&daemon, "env_advisory"), 0, "a ledger record without an injection");
 
         // ③ 음성 대조 — 오염이 아니면 이벤트도 원장도 늘지 않는다.
         let daemon2 = isolated_daemon();
@@ -18900,232 +19654,77 @@ mod tests {
         assert_eq!(v["ledger_status"], "unreadable", "{v}");
     }
 
-    /// ★H-NPM-7(codex R2 #2 · blocking): **고지가 Windows pane 에도 실제로 주입된다.**
-    ///
-    /// 종전 결함: 주입이 `cfg!(unix)` 안에 있어 Windows pane 은 한 줄도 못 받았다. 근거는
-    /// "cmd.exe 가 `#` 를 오류로 뱉는다" 였지만 Windows pane 의 기본 셸은 `powershell.exe`
-    /// (`state.rs` `default_shell`)이고 거기서 `#` 는 정상 주석이다 — 위험한 것은 OS 가 아니라
-    /// **cmd.exe 하나**였다. 그 하나 때문에 정작 봉인 사고가 잦은 플랫폼 전체가 무음이 됐다.
-    ///
-    /// 이 검체가 재는 것 넷:
-    ///   ① 셸별 주석 접두가 맞다(powershell·pwsh·zsh·bash → `# ` / cmd → `rem `)
-    ///   ② 경로·대소문자·확장자가 섞여도 같은 판정(`C:\WINDOWS\SYSTEM32\CMD.EXE`)
-    ///   ③ **실제 `write_tx` 로 `Inject` 가 도착한다** — 양 셸 모두. mac CI 가 Windows 분기를
-    ///      실제로 밟는다(`npm_config_prefix_default_for(os, …)` 와 같은 규율).
-    ///   ④ 문안은 한 글자도 안 버린다(접두만 다르고 본문은 정본과 동일)
+    /// ★(0.14.52 · S-a C6d) Replaces H-NPM-7 (it pinned the advisory's pane write on Windows shells): the npm-prefix advisory is
+    /// an EVENT only on every seat - zero bytes to the pane, no ledger record, the whole text on `env.advisory` - and the
+    /// function holds no pane-write path at all (source pin, comments stripped).
     #[test]
-    fn npm_prefix_notice_reaches_the_pane_on_windows_shells_too() {
-        use crate::state::WriteReq;
-
-        // ① 셸별 접두.
-        for (shell, want) in [
-            ("powershell.exe", "# "),
-            ("pwsh", "# "),
-            ("/bin/zsh", "# "),
-            ("/bin/bash", "# "),
-            ("cmd.exe", "rem "),
-            // ② 경로·대소문자·확장자 정규화.
-            ("C:\\WINDOWS\\SYSTEM32\\CMD.EXE", "rem "),
-            ("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "# "),
-        ] {
-            assert_eq!(
-                cys::shell_comment_prefix(shell),
-                want,
-                "셸 {shell:?} 의 주석 접두가 틀렸다 — 고지가 곧 명령이 되거나 무음이 된다"
-            );
-        }
-
+    fn c6d_npm_prefix_advisory_is_event_only() {
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, None);
+        let mut rx = daemon.bus.subscribe();
         let verdict = cys::NpmPrefixVerdict::WarnBundlePolluted {
             user_value: "C:\\Program Files\\cys\\runtime\\npm".to_string(),
             scope_root: std::path::PathBuf::from("C:\\Program Files\\cys"),
         };
-
-        // ③ 실제 채널 수신 — 양 셸 모두 `Inject` 가 도착한다.
-        for (shell, want_prefix) in [("powershell.exe", "# "), ("cmd.exe", "rem ")] {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<WriteReq>(4);
-            let req = npm_prefix_pane_notice_req(&verdict, shell)
-                .unwrap_or_else(|| panic!("셸 {shell:?} 에서 고지가 만들어지지 않았다"));
-            tx.try_send(req).expect("채널 전송 실패");
-            match rx.try_recv().expect("pane 이 고지를 못 받았다 — Windows 무음 회귀") {
-                WriteReq::Inject { text, cr_delay_ms, clear_first, .. } => {
-                    assert!(
-                        text.starts_with(want_prefix),
-                        "셸 {shell:?} 에 안전하지 않은 접두로 주입됐다: {text:?}"
-                    );
-                    assert_eq!(cr_delay_ms, 120, "주입 규약(CR 지연)이 바뀌었다");
-                    assert!(!clear_first, "고지가 화면을 지웠다 — 사용자 작업 파괴");
-                    // ④ 본문은 정본과 동일(접두만 다르다 · 요약 금지).
-                    let canon = cys::npm_prefix_pollution_notice(&verdict).expect("정본 문안 부재");
-                    assert_eq!(
-                        text.trim_start_matches(want_prefix),
-                        canon.trim_start_matches("# "),
-                        "셸별 렌더가 문안을 바꿨다 — 사용자가 셸마다 다른 처방을 받는다"
-                    );
-                    assert!(!text.contains('\n'), "고지에 개행이 남았다 — 개행은 곧 Enter 다");
-                }
-                other => panic!("Inject 가 아니다 ({})", write_req_name(&other)),
+        announce_npm_prefix_pollution_with(&daemon, sid, &verdict);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(daemon.get_surface(sid).unwrap().inject_track.last_body().is_none(), "the advisory was typed into the pane");
+        assert_eq!(crate::governance::h_ledger_count(&daemon, "env_advisory"), 0);
+        let mut text = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev["name"] == "env.advisory" {
+                text = ev["payload"]["text"].as_str().map(str::to_string);
             }
         }
-
-        // 음성 대조 — 오염이 아니면 어떤 셸에서도 아무것도 만들지 않는다.
-        for clean in [cys::NpmPrefixVerdict::KeepUser, cys::NpmPrefixVerdict::NoDefault] {
-            for shell in ["powershell.exe", "cmd.exe", "/bin/zsh"] {
-                assert!(
-                    npm_prefix_pane_notice_req(&clean, shell).is_none(),
-                    "오염이 아닌데 고지가 만들어졌다({shell}) — 과잉 경고는 진짜 경고를 묻는다"
-                );
-            }
-        }
-
-        // 배선 소실 방지 — 주입이 다시 `cfg!(unix)` 뒤로 숨으면 위 검체는 초록인 채로
-        // 실사용에서만 무음이 된다(H-NPM-6 와 같은 관례).
+        assert_eq!(text, cys::npm_prefix_pollution_notice(&verdict), "the event lost the notice text");
         let src = include_str!("handlers.rs");
-        let start = src
-            .find("fn announce_npm_prefix_pollution_with(")
-            .expect("고지 함수 소실");
-        let end = start
-            + src[start..]
-                .find("\nfn npm_prefix_pane_notice_req(")
-                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
-        // 주석은 걷어내고 **실제 코드**만 본다 — 이 결함의 내력을 설명하는 주석 자체가
-        // `cfg!(unix)` 를 인용하므로, 문자열만 찾으면 자기 설명에 걸려 영구 적색이 된다.
-        let code_only: String = src[start..end]
+        let a = src.find("\nfn announce_npm_prefix_pollution_with(").expect("announce fn");
+        let body: String = src[a..a + src[a..].find("\n}\n").expect("end")]
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(
-            !code_only.contains("cfg!(unix)"),
-            "고지 주입이 다시 unix 한정으로 접혔다 — Windows pane 이 또 무음이 된다"
-        );
+        for banned in ["write_tx", "WriteReq", "record_audited("] {
+            assert!(!body.contains(banned), "the npm advisory regained a pane write path: `{banned}`");
+        }
     }
 
-    /// ★H-SEAT-WIN-1(codex R2 #2 의 **형제 결함** · master 범위 판정 2026-09-04):
-    /// 좌석 승계 고지도 Windows pane 에 실제로 주입된다.
-    ///
-    /// npm 축을 고치며 발견해 보고한 같은 결함이다 — 주입이 `cfg!(unix)` 안에 있어 Windows
-    /// pane 은 승계 고지를 한 줄도 못 받았다. 이 함수가 막으려던 것이 "내 pane 이 조용히
-    /// 강등됐다"는 온보딩 불신인데, **정작 Windows 사용자에게는 조용히 강등되고 있었다.**
-    ///
-    /// 재는 것 넷: ①셸별 접두 ②실제 `write_tx` **Inject 수신**(powershell·cmd 양 셸)
-    /// ③개행 부재(개행은 곧 Enter) ④`cfg!(unix)` 회귀 소스핀(주석 제외 후 검사).
+    /// ★(0.14.52 · S-a C6d) Replaces H-SEAT-WIN-1 and H6 (they pinned the takeover pane line and its pending-input skip): the
+    /// seat-takeover notice is an EVENT only - zero bytes to the old shell with or without pending input, no ledger record,
+    /// `role.takeover` carries `notice` and `pane_notice: "event_only"` - and the function holds no pane-write path.
     #[test]
-    fn seat_takeover_notice_reaches_the_pane_on_windows_shells_too() {
-        use crate::state::WriteReq;
-
-        // ① 셸별 접두 — 문안 본문은 접두만 빼면 동일해야 한다(요약·분기 금지).
-        let ps = seat_takeover_notice("master", "powershell.exe");
-        let cmd = seat_takeover_notice("master", "cmd.exe");
-        assert!(ps.starts_with("# "), "powershell pane 에 잘못된 접두: {ps:?}");
-        assert!(cmd.starts_with("rem "), "cmd.exe pane 에 안전하지 않은 접두: {cmd:?}");
-        assert_eq!(
-            ps.trim_start_matches("# "),
-            cmd.trim_start_matches("rem "),
-            "셸별 렌더가 문안을 바꿨다 — 사용자가 셸마다 다른 고지를 받는다"
-        );
-        assert!(ps.contains("master"), "역할명이 고지에서 빠졌다: {ps:?}");
-
-        // ③ 개행 부재 — 좌석은 셸이고 개행은 곧 Enter 다.
-        for (shell, line) in [("powershell.exe", &ps), ("cmd.exe", &cmd)] {
-            assert!(!line.contains('\n'), "고지에 개행이 남았다({shell}) — 미제출 잔재가 실행된다");
-        }
-
-        // ② 실제 채널 수신 — 양 셸 모두.
-        for (shell, want) in [("powershell.exe", "# "), ("cmd.exe", "rem ")] {
-            let (tx, rx) = std::sync::mpsc::sync_channel::<WriteReq>(4);
-            tx.try_send(WriteReq::Inject {
-                text: seat_takeover_notice("worker", shell),
-                cr_delay_ms: 120,
-                clear_first: false,
-                guard: None,
-            })
-            .expect("채널 전송 실패");
-            match rx.try_recv().expect("pane 이 승계 고지를 못 받았다 — Windows 무음 회귀") {
-                WriteReq::Inject { text, cr_delay_ms, clear_first, .. } => {
-                    assert!(text.starts_with(want), "셸 {shell:?} 접두 오류: {text:?}");
-                    assert_eq!(cr_delay_ms, 120, "주입 규약(CR 지연)이 바뀌었다");
-                    assert!(!clear_first, "승계 고지가 화면을 지웠다 — 사용자 작업 파괴");
-                }
-                other => panic!("Inject 가 아니다 ({})", write_req_name(&other)),
-            }
-        }
-
-        // ④ 회귀 소스핀 — 주입이 다시 unix 뒤로 숨으면 위 검체는 초록인 채 실사용만 무음이 된다.
-        //    주석은 걷어내고 **실제 코드**만 본다(이 결함의 내력을 적은 주석이 cfg!(unix) 를 인용한다).
-        let src = include_str!("handlers.rs");
-        let start = src.find("fn announce_seat_takeover(").expect("승계 고지 함수 소실");
-        let end = start
-            + src[start..]
-                .find("\nfn seat_takeover_notice(")
-                .expect("배선 변형 — 소스핀 앵커 갱신 필요");
-        let code_only: String = src[start..end]
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            !code_only.contains("cfg!(unix)"),
-            "승계 고지 주입이 다시 unix 한정으로 접혔다 — Windows pane 이 또 무음이 된다"
-        );
-
-        // ⑤ **종단 확인** — 순수 함수만 재면 `announce_seat_takeover` 가 그 산출을 주입 직전에
-        //    변형하는 결함(예: 접두 strip)을 못 잡는다. mutation S-M3 이 그 사각을 드러냈다.
-        //    실제 함수를 돌려 **배달 원장에 실제로 남은 문자열**을 본다(원장은 주입과 같은 값을
-        //    받으므로, 여기서 접두가 살아 있으면 pane 에 들어간 것도 안전하다).
+    fn c6d_seat_takeover_notice_is_event_only() {
         let daemon = isolated_daemon();
-        let sid = make_surface(&daemon, None);
-        announce_seat_takeover(&daemon, sid, "master", "/tmp/lane");
-        let led = crate::delivery::ledger_path(&daemon.socket_path);
-        let raw = std::fs::read_to_string(&led).unwrap_or_default();
-        assert!(
-            raw.contains("seat_takeover"),
-            "승계 고지가 배달 원장에 없다({}) — 임무 게이트가 이 주석을 **오너 임무**로 읽는다",
-            led.display()
-        );
-        // 원장 레코드의 preview 는 정규화된 본문이다. 접두가 살아 있어야 셸이 이 줄을 주석으로
-        // 읽는다 — strip 되면 그대로 **명령**이 된다.
-        let prefix = cys::shell_comment_prefix(
-            &daemon.get_surface(sid).expect("surface").cmd,
-        );
-        assert!(
-            raw.contains(prefix.trim_end()),
-            "원장에 남은 승계 고지에 주석 접두가 없다 — pane 에 들어간 줄도 명령이 된다: {raw}"
-        );
-    }
-
-    /// ★(0.14.42 · 설계 H6) 승계 고지 1줄 보강 — 구 좌석에 미제출 입력(`pending_input_bytes>0`)이 있으면 pane 줄
-    /// (원장 + 주입)을 생략하고 `role.takeover{pane_notice}` 로 사실만 남긴다. `seat_claimable` 은 사람 입력 30s 만 보고
-    /// 계수는 보지 않아서, 30s 넘게 방치된 셸 초안 뒤에 `# …` 가 붙고 CR 이 들어가면 **초안이 실행된다**(단어 중간의 `#`
-    /// 은 주석이 아니다). RED(HEAD): 주입(원장 1).
-    #[test]
-    fn h6_takeover_notice_skipped_on_pending_input() {
-        let daemon = isolated_daemon();
-        let takeover_ev = |d: &Arc<Daemon>, sid: u64| -> Value {
-            d.bus
-                .tail(100)
+        for pending in [0u64, 5] {
+            let sid = make_surface(&daemon, None);
+            let s = daemon.get_surface(sid).unwrap();
+            s.pending_input_bytes.store(pending, Ordering::Relaxed);
+            announce_seat_takeover(&daemon, sid, "master", "claim_role");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert!(s.inject_track.last_body().is_none(), "the takeover notice was typed into the shell (pending {pending})");
+            let ev = daemon
+                .bus
+                .tail(200)
                 .into_iter()
                 .rev()
                 .find(|e| e["name"] == json!("role.takeover") && e["payload"]["prev_surface"] == json!(sid))
-                .expect("role.takeover 이벤트 부재")
-        };
-        // ① 미제출 입력 5바이트 — pane 줄 생략 · 이벤트는 유지.
-        let sid = make_surface(&daemon, None);
-        daemon.get_surface(sid).unwrap().pending_input_bytes.store(5, Ordering::Relaxed);
-        announce_seat_takeover(&daemon, sid, "master", "claim_role");
-        assert_eq!(crate::governance::h_ledger_count(&daemon, "seat_takeover"), 0, "초안 위에 승계 고지를 주입했다");
-        assert_eq!(takeover_ev(&daemon, sid)["payload"]["pane_notice"], json!("skipped_pending_input"));
-        // ② 계수 0 — 종전 그대로 고지(문안·cr 120 무변경은 seat_takeover_notice_reaches_… 가 잰다).
-        let sid2 = make_surface(&daemon, None);
-        announce_seat_takeover(&daemon, sid2, "master", "claim_role");
-        assert_eq!(crate::governance::h_ledger_count(&daemon, "seat_takeover"), 1);
-        assert_eq!(takeover_ev(&daemon, sid2)["payload"]["pane_notice"], json!("sent"));
-        // ③ 노브에서 takeover 를 빼면 HEAD 동작(계수와 무관하게 주입 · pane_notice 키 없음).
-        let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,channel,ceo,supervisor")]);
-        let sid3 = make_surface(&daemon, None);
-        daemon.get_surface(sid3).unwrap().pending_input_bytes.store(5, Ordering::Relaxed);
-        announce_seat_takeover(&daemon, sid3, "master", "claim_role");
-        assert_eq!(crate::governance::h_ledger_count(&daemon, "seat_takeover"), 2);
-        assert!(takeover_ev(&daemon, sid3)["payload"].get("pane_notice").is_none(), "HEAD 이벤트에 키가 붙었다");
+                .expect("role.takeover");
+            assert_eq!(ev["payload"]["pane_notice"], json!("event_only"));
+            assert_eq!(ev["payload"]["notice"], json!(seat_takeover_notice("master")));
+        }
+        assert_eq!(crate::governance::h_ledger_count(&daemon, "seat_takeover"), 0, "a ledger record without an injection");
+        let n = seat_takeover_notice("master");
+        assert!(n.contains("'master'") && !n.contains('\n'), "{n:?}");
+        let src = include_str!("handlers.rs");
+        let a = src.find("\nfn announce_seat_takeover(").expect("announce fn");
+        let body: String = src[a..a + src[a..].find("\n}\n").expect("end")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for banned in ["write_tx", "WriteReq", "record_audited("] {
+            assert!(!body.contains(banned), "the takeover notice regained a pane write path: `{banned}`");
+        }
     }
 
     /// (테스트 보조) WriteReq 변형 이름 — 실패 메시지에 "무엇이 나왔는지"를 남긴다.
@@ -19136,6 +19735,7 @@ mod tests {
             crate::state::WriteReq::DataAfter { .. } => "DataAfter",
             crate::state::WriteReq::SubmitAfterGap { .. } => "SubmitAfterGap",
             crate::state::WriteReq::Inject { .. } => "Inject",
+            crate::state::WriteReq::Agent(_) => "Agent",
         }
     }
 
@@ -21528,12 +22128,20 @@ mod tests {
         let daemon = isolated_daemon();
         let own = r3_1_seat(&daemon, "worker-1", R3_A, 994_331);
         let mut rx = daemon.bus.subscribe();
+        // ★(0.14.52 · S-a C7b) Epochs: only an accepted re-pin is a new conversation (S4-1 resume premise).
+        let epochs = || {
+            let s = daemon.surfaces.lock().unwrap()[&own].clone();
+            (s.agent_epoch.load(Ordering::Acquire), s.conversation_epoch.load(Ordering::Acquire))
+        };
+        let (agent0, conv0) = epochs();
         crate::usage::clear_lineage_seam::set_hook(Some(false));
         let _ = usage_register_src(&daemon, own, &r3_1_path(R3_N), Some("clear"), Some(994_331));
         assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_A), "도구 셸 직접 호출이 핀을 바꿨다");
+        assert_eq!(epochs(), (agent0, conv0), "a rejected re-pin moved an epoch");
         crate::usage::clear_lineage_seam::set_hook(None);
         let _ = usage_register_src(&daemon, own, &r3_1_path(R3_B), Some("clear"), Some(994_331));
         assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "직접 호출 뒤 좌석 자신의 /clear 가 끊겼다");
+        assert_eq!(epochs(), (agent0, conv0 + 1), "the seat's own /clear must start a new conversation epoch");
         assert_eq!(
             r3_1_repin_events(&mut rx),
             vec![
@@ -26642,7 +27250,7 @@ mod tests {
             resolver_surface: None,
             resolver_pid: None,
         };
-        assert!(matches!(deliver_to_ceo(&daemon, &item, false), CeoDelivery::Delivered));
+        assert!(matches!(deliver_to_ceo(&daemon, &item, false), CeoDelivery::Handed));
         let _ = ceo.child.lock().unwrap().kill();
         let raw = build_ceo_injection(&item, false);
         let clean = cys::paste_fence::sanitize(&raw).into_owned();
@@ -26751,13 +27359,84 @@ mod tests {
         let _ = ceo.child.lock().unwrap().kill();
     }
 
+    // ── ★(0.14.52 · S-a C6c) the CEO auto-route settles on the writer's terminal (design 3.3 feed row) ──
+
+    /// Scripted CEO receiver proof: refuse every admission, or lose the proof right before the Return.
+    struct C6cProof {
+        refuse: bool,
+    }
+    impl crate::agent_write::Proof for C6cProof {
+        fn admit(&self) -> Result<(), crate::receiver::ProofLoss> {
+            if self.refuse {
+                return Err(crate::receiver::ProofLoss::Unknown("test_refuse".into()));
+            }
+            Ok(())
+        }
+        fn recheck(&self, phase: crate::agent_write::Phase) -> Result<(), crate::receiver::ProofLoss> {
+            if phase == crate::agent_write::Phase::Submit {
+                return Err(crate::receiver::ProofLoss::Unknown("test_no_return".into()));
+            }
+            Ok(())
+        }
+    }
+
+    fn c6c_stalled(d: &Arc<Daemon>, rid: &str) -> Vec<Value> {
+        h4_events(d, "approval.stalled").into_iter().filter(|e| e["payload"]["request_id"] == json!(rid)).collect()
+    }
+
+    /// T-c1: a refused CEO write wrote nothing; the feed item is escalated to the human (`ceo_write_refused`) and never
+    /// announced as routed.
+    #[test]
+    fn c6c_ceo_refused_write_escalates_and_is_never_routed() {
+        let (d, ceo) = h4_rig("c6c-refused", "sleep 30");
+        *ceo.receiver_proof.lock().unwrap() = Some(Arc::new(C6cProof { refuse: true }));
+        let item = h4_item("c6c-r", "RSI 학습 추천 c6c refused", "x");
+        route_auto_approval(&d, &item, false);
+        let st = c6c_stalled(&d, "c6c-r");
+        assert_eq!(st.len(), 1, "a refused CEO write was not escalated: {st:?}");
+        assert_eq!(st[0]["payload"]["reason"], json!("ceo_write_refused"));
+        assert!(h4_events(&d, "feed.auto_routed").is_empty(), "a refused write was announced as routed");
+        assert!(ceo.inject_track.last_body().is_none(), "a refused write was recorded as written");
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// T-c1b: a CEO write stopped before its Return is escalated (`ceo_write_partial`), never announced as routed.
+    #[test]
+    fn c6c_ceo_write_stopped_before_its_return_escalates() {
+        let (d, ceo) = h4_rig("c6c-partial", "sleep 30");
+        *ceo.receiver_proof.lock().unwrap() = Some(Arc::new(C6cProof { refuse: false }));
+        let item = h4_item("c6c-p", "RSI 학습 추천 c6c partial", "x");
+        route_auto_approval(&d, &item, false);
+        let st = c6c_stalled(&d, "c6c-p");
+        assert_eq!(st.len(), 1, "{st:?}");
+        assert_eq!(st[0]["payload"]["reason"], json!("ceo_write_partial"));
+        assert!(h4_events(&d, "feed.auto_routed").is_empty());
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
+    /// T-c2 (queue pair (b)): a healthy CEO route writes body + Return once; `feed.auto_routed` follows the write and carries
+    /// its write request id; no escalation.
+    #[test]
+    fn c6c_ceo_written_route_is_announced_after_its_return() {
+        let (d, ceo) = h4_rig("c6c-written", "sleep 30");
+        let item = h4_item("c6c-w", "RSI 학습 추천 c6c written", "x");
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Handed));
+        let routed = h4_events(&d, "feed.auto_routed");
+        assert_eq!(routed.len(), 1, "{routed:?}");
+        assert!(routed[0]["payload"]["write_request_id"].as_str().is_some_and(|r| !r.is_empty()));
+        assert_eq!(ceo.inject_track.last_body().map(|b| b.norm.contains("c6c-w")), Some(true), "body not written");
+        assert!(ceo.last_injected.lock().unwrap().is_some(), "last_injected not stamped after the write");
+        assert!(c6c_stalled(&d, "c6c-w").is_empty());
+        let _ = ceo.child.lock().unwrap().kill();
+    }
+
     /// [H4 핀] busy CEO 에는 종전대로 즉시 주입한다(턴 경계까지 미루면 120s 만료가 곧 escalation).
     #[test]
     fn h4_ceo_busy_injects() {
         let (d, ceo) = h4_rig("h4-busy", "sleep 30");
         crate::governance::h_paint(&ceo, "✻ Working… (esc to interrupt)\n────────────────────\n❯ ");
         let item = h4_item("h4-busy", "RSI 학습 추천 busy", "x");
-        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered));
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Handed));
         assert_eq!(crate::governance::h_ledger_count(&d, "feed"), 1);
         assert_eq!(h4_events(&d, "feed.auto_routed").len(), 1);
         let _ = ceo.child.lock().unwrap().kill();
@@ -26888,7 +27567,7 @@ mod tests {
         let rec = dir.join("pty-in.bin");
         let (d, ceo) = h4_rig("h4-bnd", &format!("stty raw -echo; exec cat > '{}'", rec.display()));
         let item = h4_item("h4-bnd", "RSI 학습 추천 경계", "\x1b[201~\rEVIL");
-        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered));
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Handed));
         let t0 = std::time::Instant::now();
         let bytes = loop {
             let b = std::fs::read(&rec).unwrap_or_default();
@@ -26918,7 +27597,7 @@ mod tests {
         let _k = crate::governance::HKnobGuard::set(&[("CYS_MACHINE_INJECT_HOLD", "schedule,channel,supervisor,takeover")]);
         crate::governance::h_paint(&ceo, cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT);
         let item = h4_item("h4-knob", "RSI 학습 추천 knob", "x");
-        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Delivered), "노브로 끈 CEO 가 보류했다");
+        assert!(matches!(deliver_to_ceo(&d, &item, false), CeoDelivery::Handed), "노브로 끈 CEO 가 보류했다");
         let _ = ceo.child.lock().unwrap().kill();
     }
 

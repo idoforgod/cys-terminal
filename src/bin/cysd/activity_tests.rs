@@ -826,6 +826,65 @@ fn set_meta_accepted_invalidates_rejected_does_not() {
     assert_eq!(s.activity_pending.load(Ordering::SeqCst), 0);
 }
 
+/// Head-ruled U/S merge invariant through the actual set_meta handler.
+#[test]
+fn set_meta_publishes_epochs_before_identity_revision() {
+    // Head's dry-run resolution: the epoch mutation stays inside IdentityWrite.
+    // Pin the production ordering as well, so the reversed tiny window is a
+    // deterministic red even when a concurrent sampler misses that interleaving.
+    let source = include_str!("handlers.rs");
+    let arm = source.split_once("\"surface.set_meta\" => {").unwrap().1;
+    let begin = arm.find("let display_write = crate::activity::IdentityWrite::begin(&surface);").unwrap();
+    let bump = arm.find("surface.bump_agent_epoch();").unwrap();
+    let end = arm.find("drop(display_write);").unwrap();
+    assert!(begin < bump && bump < end, "epoch update must precede identity publication");
+
+    let f = fx("integ-meta-order");
+    let s = seat(&f, "worker", Some("claude"));
+    let rev0 = s.activity_identity_rev.load(Ordering::SeqCst);
+    let agent0 = s.agent_epoch.load(Ordering::Acquire);
+    let conversation0 = s.conversation_epoch.load(Ordering::Acquire);
+    let pending0 = s.activity_pending.load(Ordering::SeqCst);
+    let sample = || {
+        let rev = s.activity_identity_rev.load(Ordering::SeqCst);
+        let agent = s.agent_epoch.load(Ordering::Acquire);
+        let conversation = s.conversation_epoch.load(Ordering::Acquire);
+        if rev > rev0 {
+            assert!(agent > agent0 && conversation > conversation0,
+                    "new identity revision with old epochs: {rev}/{agent}/{conversation}");
+        }
+        rev
+    };
+    assert_eq!(sample(), rev0);
+    // Hold the actual handler at its metadata write after IdentityWrite begins.
+    let metadata = s.agent_meta.lock().unwrap();
+    let daemon = Arc::clone(&f.daemon);
+    let sid = s.id;
+    let writer = std::thread::spawn(move || {
+        crate::delivery::tests::isolate_state_dir_for_thread("integ-meta-writer");
+        dispatch(&daemon, Request { id: json!(1), method: "surface.set_meta".into(),
+            params: json!({"surface_id": sid, "agent": "claude", "agent_bin": "claude"}) }, None)
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while s.activity_pending.load(Ordering::SeqCst) == pending0 {
+        assert!(std::time::Instant::now() < deadline, "writer did not enter identity window");
+        std::thread::yield_now();
+    }
+    assert_eq!(sample(), rev0, "metadata lock holds the writer before epoch changes");
+    drop(metadata);
+    while !writer.is_finished() {
+        sample();
+        assert!(std::time::Instant::now() < deadline, "set_meta did not complete");
+        std::thread::yield_now();
+    }
+    let Reply::Single(reply) = writer.join().unwrap() else { panic!("single reply required") };
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(sample(), rev0 + 1);
+    assert_eq!(s.agent_epoch.load(Ordering::Acquire), agent0 + 1);
+    assert_eq!(s.conversation_epoch.load(Ordering::Acquire), conversation0 + 1);
+    assert_eq!(s.activity_pending.load(Ordering::SeqCst), pending0);
+}
+
 /// handlers.rs `surface.quiesce`: accepted on invalidates before the mutation; off does not.
 #[test]
 fn quiesce_on_invalidates_off_does_not() {

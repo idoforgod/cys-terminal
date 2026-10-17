@@ -25,6 +25,8 @@ macro_rules! eprint {
 
 mod accounts;
 mod activity;
+mod agent_write;
+mod input_intent;
 mod alert_route;
 mod alerts;
 mod analytics;
@@ -49,8 +51,13 @@ mod handlers;
 mod hwmon;
 mod knobs;
 mod office_bridge;
+mod native_publication;
+mod pending_requests;
+mod policy_loader;
 mod recall;
 mod reclaim;
+mod receiver;
+mod writer_gate;
 mod repaint;
 mod root_registration;
 mod s5_escalation;
@@ -58,6 +65,7 @@ mod schedule;
 mod severity;
 mod skillrun;
 mod state;
+mod submit_assoc;
 mod teamtoken;
 mod trash;
 mod undo;
@@ -7810,3 +7818,7 @@ mod close_auth_tests;
 // R-PTY-1: actual allocator/admission composition, isolated from other PTY tests.
 #[cfg(all(test, unix))]
 mod pty_admission_tests;
+#[cfg(test)]
+mod agent_queue_tests;
+#[cfg(test)]
+mod direct_agent_tests;
