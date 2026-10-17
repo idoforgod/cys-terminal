@@ -1513,6 +1513,9 @@ fn collect_for(
     // 한번 잡으면 고정 — mtime 흔들림·동일 cwd 동시세션의 오핀을 방어한다.
     if s.agent_session_id.lock().unwrap().is_none() {
         if let Some(sid) = extract_session_id(agent, &path) {
+            // F-01 (U4-4): None→Some starts a new display observation epoch (one-shot capture,
+            //   not a continuous session stream).
+            let _display_write = crate::activity::IdentityWrite::begin(s);
             *s.agent_session_id.lock().unwrap() = Some(sid);
         }
     }

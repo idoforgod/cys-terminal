@@ -393,8 +393,19 @@ body.ws-reordering { cursor: grabbing; -webkit-user-select: none; user-select: n
   white-space: nowrap;
 }
 .pane .pane-title-text { overflow: hidden; text-overflow: ellipsis; }
-/* 역할 신호 점(제목 앞): Control Center cc-dot의 깜박임(cc-blink) 재사용 — 역할색은 JS(setRoleDot)가 채운다 */
-.pane .pane-role-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; animation: cc-blink 1.4s infinite; }
+/* 역할 신호 점(제목 앞) — ★F-01(0.14.52): 깜박임은 좌석 CLI 가 **작업 중으로 관측될 때만**(act-working). 종전엔 모든 점이 무조건 깜박였다.
+   역할색은 그대로다 — JS 렌더러(paintRoleDot)가 `--role-color` 로만 싣는다(인라인 background 금지: 빈 원 상태가 이겨야 한다).
+   대기 = 고정 실색 · 입력 대기 = 구별되는 고정 주의 테두리 · 상태 확인 지연(U4-5)·모름 = 고정 빈 원 · 움직임 줄임에서도 작업 중은 정적 이중 고리로 구별된다. */
+.pane .pane-role-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--role-color, #64748b); }
+.pane .pane-role-dot.act-working { animation: cc-blink 1.4s infinite; }
+.pane .pane-role-dot.act-waiting { box-shadow: none; }
+/* input wait (permission/question): a steady attention shape in the SAME role colour (design R3-5) — a solid diamond, distinct from the
+   blinking circle (working), solid circle (waiting), hollow circle (unknown/stale) and the reduced-motion double ring. Never the warn colour. */
+.pane .pane-role-dot.act-input { border-radius: 1px; transform: rotate(45deg) scale(0.8); box-shadow: none; }
+.pane .pane-role-dot.act-unknown, .pane .pane-role-dot.act-stale { background: transparent; box-shadow: inset 0 0 0 1.5px var(--role-color, #64748b); }
+@media (prefers-reduced-motion: reduce) {
+  .pane .pane-role-dot.act-working { animation: none; box-shadow: 0 0 0 1.5px var(--bar), 0 0 0 3px var(--role-color, #64748b); }
+}
 /* T5 사용량 관측 배지: CTX(컨텍스트%)·rate limit 윈도우 — 데몬 관측치(usage.rs) 표시 */
 .pane .pane-usage { display: flex; gap: 4px; color: #6e7681; font-variant-numeric: tabular-nums; }
 .pane .pane-usage .warn { color: #d29922; }

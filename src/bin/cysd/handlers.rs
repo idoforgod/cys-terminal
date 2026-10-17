@@ -798,12 +798,16 @@ fn finalize_agent_meta_after_role_change(
         let dead_reobserve = prev_agent.is_some() && s.agent_exit_notified.load(Ordering::Relaxed);
         if prev_agent.is_none() || dead_reobserve {
             if let Some((agent, bin)) = crate::governance::observe_agent_on_surface(&s) {
+                // F-01 (U4-4): an accepted (re-)observation invalidates the display record, an
+                // identical pair included — sameness is never inferred from pair equality.
+                let display_write = crate::activity::IdentityWrite::begin(&s);
                 *s.agent_meta.lock().unwrap() = Some((agent.clone(), bin.clone()));
                 s.agent_seen.store(true, Ordering::Relaxed);
                 s.agent_exit_notified.store(false, Ordering::Relaxed);
                 if dead_reobserve && prev_agent.as_deref() != Some(agent.as_str()) {
                     *s.agent_session_id.lock().unwrap() = None;
                 }
+                drop(display_write);
                 daemon.bus.publish(
                     "agent.observed",
                     "system",
@@ -822,6 +826,8 @@ fn finalize_agent_meta_after_role_change(
         let Some(s) = daemon.get_surface(sid) else { return };
         if s.agent_meta.lock().unwrap().is_none() {
             if let Some((agent, bin)) = crate::governance::observe_agent_on_surface(&s) {
+                // F-01 (U4-4): a staged wrapper observation is Unknown and cannot borrow a former adapter.
+                let _display_write = crate::activity::IdentityWrite::begin(&s);
                 *s.pending_agent_obs.lock().unwrap() = Some((agent, bin, crate::state::now_epoch()));
             }
         }
@@ -5656,6 +5662,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         }),
                         // ★0.14.45 좌석별 계정 — org.status 와 같은 키·같은 의미(표시 전용 가산 · null = 에이전트 아님·종료·수집 실패).
                         "account": seat_accounts.get(&s.id).cloned().unwrap_or(Value::Null),
+                        // F-01 (0.14.52) display-only CLI activity behind the tab dot — the cached observer
+                        //   record, re-validated and lease-checked here. Drives nothing operational.
+                        "display_activity": crate::activity::wire(daemon, s),
                     })
                 })
                 .collect();
@@ -9048,6 +9057,9 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                         let swapped = {
                             let mut pin = surface.agent_session_id.lock().unwrap();
                             if *pin == current {
+                                // F-01 (U4-4): a successful repin is a new session — invalidate the display
+                                //   record; a raced/rejected compare (else arm) claims nothing.
+                                let _display_write = crate::activity::IdentityWrite::begin(&surface);
                                 *pin = Some(new_sid.clone());
                                 true
                             } else {
@@ -9765,6 +9777,8 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     "alert_route": alert_route,
                     // ★(0.14.42 · clear 가드 수정 6회차 V42R-1) 비동기 사이클(`cys cycle-agent --detach`) — 동시 상한·진행·대기·최근 결과.
                     "cycle_jobs": crate::cycle_jobs::status_json(daemon),
+                    // F-01 (0.14.52) display activity observer counters — diagnostics/measurement only.
+                    "display_activity_observer": crate::activity::stats_wire(daemon),
                 }),
             ))
         }
@@ -10113,9 +10127,13 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     ));
                 }
             }
+            // F-01 (U4-4): accepted registration (identical pair included) invalidates the display
+            //   record; a rejected one (above) does not. Atomics only — no lock, no wait, no PTY write.
+            let display_write = crate::activity::IdentityWrite::begin(&surface);
             *surface.agent_meta.lock().unwrap() = Some((agent.clone(), agent_bin));
             surface.agent_seen.store(false, Ordering::Relaxed);
             surface.agent_exit_notified.store(false, Ordering::Relaxed);
+            drop(display_write);
             // ★(R3SH-4) 새 에이전트가 이 좌석에 앉는다 — 앞 에이전트의 사이클 창 표지(quiescing)는 이 에이전트의 것이 아니다.
             //   남겨 두면 H1 이 새 에이전트의 각성 지시(`send --queued`)까지 최대 600s 막는다(injected_unverified → '계속 실패').
             crate::governance::release_quiescing(daemon, &surface, "agent_relaunched");
@@ -10155,6 +10173,10 @@ pub fn dispatch(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>) -> 
                     .map(|s| (s.context_pct, s.task.clone()))
                     .unwrap_or((None, None));
                 if on {
+                    // F-01 (U4-4 / R3-2): accepted quiesce-on begins display invalidation BEFORE the
+                    //   mutation; reset-pending then suppresses Working until off/expiry/release.
+                    //   Display-only atomics — the operational status, cycle guard and events are unchanged.
+                    crate::activity::invalidate_identity(&surface);
                     let at = crate::state::now_epoch();
                     *cur = Some(crate::state::AgentStatus {
                         state: "quiescing".into(),

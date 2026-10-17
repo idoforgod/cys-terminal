@@ -1952,6 +1952,16 @@ pub struct Surface {
     /// (W4) 이 surface의 reader 스레드가 vt100 파서 패닉을 격리·재초기화한 누적 횟수.
     /// process_chunk_isolated가 패닉을 잡을 때마다 증가 — status(org.status)에 노출한다.
     pub parser_panics: AtomicU64,
+    /// F-01 (0.14.52) display-only identity invalidation: number of ACCEPTED identity writes in progress
+    /// (`activity::IdentityWrite`). The observer and serializer require 0. No operational reader.
+    pub activity_pending: AtomicU64,
+    /// F-01 display-only identity revision — advanced by every accepted identity write (set_meta,
+    /// confirmed re-observation, session capture/repin, accepted quiesce-on). No operational reader.
+    pub activity_identity_rev: AtomicU64,
+    /// F-01 display-only parser view revision — advanced under the parser lock by every resize
+    /// (same-size included) and parser replacement. Ordinary output never touches it (output_gen
+    /// keeps its single writer).
+    pub activity_view_rev: AtomicU64,
     /// ★G5-④(W5-A) DSR(CPR) 응답이 write 채널 포화로 유계 대기(250ms) 후에도 송신되지 못하고
     /// 드롭된 누적 횟수 — 내부 관측 카운터(wire 비노출 · status 노출은 별도 결정). try_send
     /// 즉시 드롭은 '고부하에서만 ConPTY 스톨'이라는 최악 재현 조건을 만들므로 유계 블로킹으로
@@ -3725,6 +3735,8 @@ pub struct Daemon {
     /// (W4) 전 surface reader 스레드의 vt100 파서 패닉 격리 누적 횟수(데몬 health 신호).
     /// surface별 카운터(Surface::parser_panics)의 데몬 전체 합산 — status(org.status)에 노출한다.
     pub parser_panics_total: AtomicU64,
+    /// F-01 (0.14.52) display-only activity cache (observer thread writes, surface.list reads).
+    pub activity: crate::activity::ActivityStore,
     /// CC v2 WS-A: 계정 단위 rate limit 집계 상태(뷰·신원 캐시·영속 스로틀) — accounts.rs 전담.
     pub accounts: Mutex<crate::accounts::AccountsState>,
     /// ★0.14.43(B3 · R1F-US): 좌석 설정 폴더 **현재 신원**의 60초 하한 캐시(폴더 → (확인 시각, 신원 상태)) — 좌석 신원 표(`accounts::seat_identity_view`)가 쓴다.
@@ -5587,6 +5599,7 @@ impl Daemon {
             analytics: Mutex::new(analytics_conn),
             channels: Mutex::new(channels_conn),
             parser_panics_total: AtomicU64::new(0),
+            activity: crate::activity::ActivityStore::new(),
             accounts: Mutex::new(Default::default()),
             seat_ident_cache: Mutex::new(Default::default()),
             alert_stale_held: Mutex::new(Default::default()),
@@ -6463,6 +6476,9 @@ impl Daemon {
         let inject_track = Arc::new(InjectTrack::default());
         {
             let writer = writer;
+            // test-only U4-3 probe: every daemon → PTY write is reported to the bench sink (off by default).
+            #[cfg(test)]
+            let writer = crate::activity::bench::CountingWriter::new(writer, id);
             let stop = Arc::clone(&writer_stop);
             let track = Arc::clone(&inject_track);
             std::thread::spawn(move || run_writer_loop_tracked(writer, write_rx, stop, Some(track)));
@@ -6596,6 +6612,9 @@ impl Daemon {
             caps: Mutex::new(crate::caps::Caps::for_role(role.as_deref())),
             osc_carry: Mutex::new(Vec::new()),
             parser_panics: AtomicU64::new(0),
+            activity_pending: AtomicU64::new(0),
+            activity_identity_rev: AtomicU64::new(0),
+            activity_view_rev: AtomicU64::new(0),
             dsr_dropped: AtomicU64::new(0),
             last_parser_panic: Mutex::new(None),
             repaint: Mutex::new(crate::repaint::RepaintState::default()),
@@ -6734,9 +6753,21 @@ impl Daemon {
                         // 같은 청크를 스냅샷과 live로 중복 수신한다. 락이 process↔send를 직렬화해야
                         // run_attach 주석의 불변식(중복 배달 창 봉쇄)이 실제로 성립한다.
                         // DSR 커서 위치도 같은 락 아래에서 읽어(재진입 락 회피) 일관성을 유지한다.
+                        // (test-only U4-3 timing: lock wait + critical section, recorded after the lock is released.)
+                        #[cfg(test)]
+                        let bench_t0 = std::time::Instant::now();
+                        #[cfg(test)]
+                        let mut bench_t = (bench_t0, bench_t0);
+                        #[cfg(test)]
+                        let mut bench_c: (Option<std::time::Duration>, Option<std::time::Duration>) = (None, None);
                         let dsr_resp = {
                             // poison된 락도 복구 — 단일 패닉이 데몬 전체를 마비시키지 않게 한다.
                             let mut parser = surf.parser.lock().unwrap_or_else(|e| e.into_inner());
+                            #[cfg(test)]
+                            {
+                                bench_t.0 = std::time::Instant::now();
+                                bench_c.0 = crate::activity::bench::thread_cpu_if_on();
+                            }
                             // (W4) vt100 0.15.2(row.rs:89 clear_wide 등) 내부 인덱스 패닉을 격리한다:
                             // 패닉 시 그 청크 파싱만 포기하고 파서를 fresh로 재초기화(rows/cols 보존)한다.
                             // reader 스레드는 죽지 않고, 아래 out_tx.send(원시 바이트 broadcast)와
@@ -6744,6 +6775,8 @@ impl Daemon {
                             let (resp, panicked) =
                                 process_chunk_isolated(&mut parser, chunk, dsr_count);
                             if panicked {
+                                // F-01: a replaced parser is a new view even at the same size.
+                                crate::activity::bump_view(&surf);
                                 // 재발 관측: surface별·데몬 전체 카운터 + 마지막 발생 시각(status 노출).
                                 surf.parser_panics.fetch_add(1, Ordering::Relaxed);
                                 *surf.last_parser_panic.lock().unwrap() = Some(now_epoch());
@@ -6763,8 +6796,21 @@ impl Daemon {
                             // 원시 바이트 broadcast는 파서 반영·패닉 여부와 무관하게 항상 수행한다.
                             // (파서 락 임계영역 내 send — run_attach 구독/스냅샷과의 직렬화 불변식 유지.)
                             let _ = surf.out_tx.send(attach_payload);
+                            #[cfg(test)]
+                            {
+                                bench_c.1 = crate::activity::bench::thread_cpu_if_on();
+                                bench_t.1 = std::time::Instant::now();
+                            }
                             resp
                         };
+                        #[cfg(test)]
+                        crate::activity::bench::reader(
+                            surf.id,
+                            bench_t0,
+                            bench_t.0,
+                            bench_t.1,
+                            bench_c.0.zip(bench_c.1).map(|(c0, c1)| c1.saturating_sub(c0)),
+                        );
                         if let Some(resp) = dsr_resp {
                             // ★G5-④ 락 범위 검증 완료(W5-A 확정 결정의 선행 조건): 이 송신은
                             // 위 parser 락 블록이 닫힌 '뒤'다 — 유계 대기(250ms)가 블록하는 것은

@@ -44,6 +44,9 @@ import { feedCreatedToastTitle } from "./feedclass";
 import { TEAM_CREATE_KIND } from "./teamproposal";
 // ★R1F-UB: 자리 판정 도우미(deptLiveRoles · deptFormationVerdict)는 네임스페이스로 받는다 — 이름이 모듈에 없으면 그 검체만 개별로 적색이 된다(import 연결 오류로 파일 전체가 죽지 않는다).
 import * as DP from "./deptprogress";
+// ★F-01: 실제 3초 틱 본문이 바쁨 가드 앞에서 부르는 활동 패스(끝점 운반 + 활동 저장소) — 아래 S4 B1 실제 본문 검체의 의존성.
+import { SurfaceListTransport } from "./surfacelist";
+import { RoleActivityStore } from "./roleactivity";
 
 // bun 변환기(테스트 전용) — main.ts 의 함수 본문에서 타입 표기를 벗겨 실행 가능한 JS 로 만든다. 타입 게이트(tsc)가 이 이름을 알도록 선언한다.
 declare const Bun: { Transpiler: new (o: { loader: "ts" }) => { transformSync(code: string): string } };
@@ -327,7 +330,11 @@ describe("main.ts 소스 핀 — 이벤트·점검 배선(새 setInterval 0 · �
     const rec = f.indexOf('seatRolesTick.set(sk ?? "", deptLiveRoles(r.surfaces));');
     expect(rpc).toBeGreaterThan(0);
     expect(rec).toBeGreaterThan(rpc); // 목록을 **받은 뒤에만** 적는다(받지 못하면 이 줄에 닿지 않는다)
-    expect(rec).toBeGreaterThan(f.indexOf("if (!claimFlight(flightKey)) continue;")); // 진행 중 요청으로 건너뛴 소켓도 기록 없음
+    // F-01 (R3-4): the list request is sent by the activity pass; this consumer skips an endpoint whose snapshot did not arrive
+    // (in flight, timed out, failed or already consumed) before recording. The anchor must exist — indexOf -1 would make this vacuous.
+    const skip = f.indexOf("if (!got) continue;");
+    expect(skip).toBeGreaterThan(rpc);
+    expect(rec).toBeGreaterThan(skip);
     expect(rec).toBeLessThan(f.indexOf("pruneHoleUntil();")); // 소켓 루프 안
     expect(f.split("seatRolesTick.set(").length - 1).toBe(1);
     expect((f.match(/invoke\("list_surfaces"/g) ?? []).length).toBe(1); // 새 RPC 0 — 종전 호출 하나가 어차피 받는 결과를 쓴다
@@ -2117,8 +2124,13 @@ describe("★S4 B1 — 실제 3초 틱(refreshPaneTitles 실제 본문)으로: �
       deptFormationVerdict: DP.deptFormationVerdict,
       deptLiveRoles: DP.deptLiveRoles,
       formationTrack: new WeakMap<object, unknown>(), // ★R2F-UI: 그 팀 좌석 목록을 마지막으로 받은 때의 기록(모듈 수준 WeakMap 의 대역)
+      // ── ★F-01 활동 패스(실제 pumpRoleActivity) — 요청은 바쁨 가드 앞에서 끝점마다 소유 원 호출 1개로 나가고, 위 본문은 그 응답을 소비한다.
+      //   해석기 대역은 항등(기본 데몬 null 은 미해석 → 종전 인자 그대로 undefined) · 점 칠하기는 이 검체의 대상이 아니다(sweepRoleDots 무동작).
+      listTransport: new SurfaceListTransport({ now: () => clock.now, deadlineMs: 8000, resolve: (eps) => Promise.resolve(eps), onArrival: nothing }),
+      roleActivity: new RoleActivityStore(31_000),
+      sweepRoleDots: nothing,
     };
-    const { fns, scope } = loadWith(["collectSids", "showDeptFormation", "checkDeptFormationNotices", "noteToastClosedByUser", "refreshPaneTitles"], deps);
+    const { fns, scope } = loadWith(["collectSids", "showDeptFormation", "checkDeptFormationNotices", "noteToastClosedByUser", "pumpRoleActivity", "refreshPaneTitles"], deps);
     // 첫 안내(addDeptWorkspace 성공 직후 한 번)
     fns.showDeptFormation(wsDept, "booting");
     return { clock, toasts, stickyToasts, lists, invokes, wsDept, wsBase, fns, scope };
@@ -2282,18 +2294,24 @@ describe("★S4 B1 — 실제 3초 틱(refreshPaneTitles 실제 본문)으로: �
     await fns.refreshPaneTitles();
     expect(toasts[toasts.length - 1].name).toBe("팀원 켜기 — 자리가 더 붙지 않습니다");
   });
-  it("새 RPC 없음 — 한 틱의 호출은 소켓마다 list_surfaces 한 번뿐(본부 + 새 팀 = 2회)이고, 이전 틱이 진행 중(refreshing)이면 점검도 건너뛴다(종전 계약)", async () => {
-    const { clock, lists, invokes, fns, scope, toasts } = setup();
+  // ★F-01(R3-4): 종전 「진행 중(refreshing)이면 list 발송 0」 계약은 설계가 바꿨다 — 활동 디스패치는 바쁨 가드 **앞**에서 끝점마다 독립으로 나가고,
+  //   입양·편성 소비는 여전히 직렬 하나다(겹쳐 돌지 않는다). 편성 결과 판정은 종전 그대로.
+  it("새 RPC 없음 — 한 틱의 호출은 소켓마다 list_surfaces 한 번뿐(본부 + 새 팀 = 2회) · 이전 틱이 진행 중(refreshing)이어도 활동 디스패치는 독립으로 나가지만 입양·편성 소비(점검)는 겹쳐 돌지 않는다", async () => {
+    const { clock, lists, invokes, fns, scope, toasts, wsDept } = setup();
     lists[SOCK] = seatsOf(5);
     clock.now = T0 + 100_000;
     scope.refreshing = true;
     await fns.refreshPaneTitles();
-    expect(invokes).toEqual([]);
-    expect(names(toasts)).toEqual(["팀원을 켜는 중"]); // 점검도 안 돌았다 — 완료 안내 없음
+    await new Promise<void>((r) => setTimeout(r, 0)); // 로스터 해석 → 디스패치 → 응답 정산까지
+    expect(invokes).toEqual(["list_surfaces:undefined", `list_surfaces:${SOCK}`]); // 활동 디스패치 — 소켓마다 1회, 바쁨 가드 앞
+    expect(names(toasts)).toEqual(["팀원을 켜는 중"]); // 소비(점검)는 돌지 않았다 — 완료 안내 없음
+    expect(wsDept.formationDone).toBeUndefined();
+    expect(scope.refreshing).toBe(true); // 진행 중인 소비자를 건드리지 않았다
     scope.refreshing = false;
     await fns.refreshPaneTitles();
-    expect(invokes).toEqual(["list_surfaces:undefined", `list_surfaces:${SOCK}`]);
+    expect(invokes).toEqual(["list_surfaces:undefined", `list_surfaces:${SOCK}`, "list_surfaces:undefined", `list_surfaces:${SOCK}`]); // 앞 원 호출이 끝났으니 끝점당 새 원 호출 1개
     expect(toasts[toasts.length - 1].name).toBe("팀 자리가 모두 붙었습니다");
+    expect(wsDept.formationDone).toBe(true);
   });
 });
 

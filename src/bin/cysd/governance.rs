@@ -839,12 +839,15 @@ fn check_agent_death_with_model(
                         // Commit ⇒ current=Some(동일 에이전트) — 신선한 2표본째를 기록한다
                         // (bin 은 같은 후보표 파생이라 통상 동일 · 표 갱신 시 신선한 쪽이 진실).
                         if let Some((agent, bin)) = current {
+                            // F-01 (U4-4): the Windows second-sample commit is a fresh display epoch.
+                            let display_write = crate::activity::IdentityWrite::begin(&s);
                             *s.agent_meta.lock().unwrap() = Some((agent.clone(), bin.clone()));
                             // 실관측 파생 arming — unix 즉시 등록 경로(claim_role 핸들러)와 동일
                             // 의미론: 허위 DEAD 과도기 없이 사망감지 상태머신을 정직하게 무장.
                             s.agent_seen.store(true, Ordering::Relaxed);
                             s.agent_exit_notified.store(false, Ordering::Relaxed);
                             *s.pending_agent_obs.lock().unwrap() = None;
+                            drop(display_write);
                             let role = s.role.lock().unwrap().clone();
                             daemon.bus.publish(
                                 "agent.observed",
@@ -3066,14 +3069,25 @@ pub(crate) fn write_json_atomic(dir: &std::path::Path, name: &str, content: &str
     let res = (|| -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(content.as_bytes())?;
+        // test-only U4-3 A2-1 fsync span (guard also closes on `?`). Spelled `cfg(all(test))` (≡ `cfg(test)`) because
+        // this file's source pins cut the production region at the first literal test-cfg attribute (cf. `expire_entries`).
+        // Do NOT "simplify" it to the literal form: that would silently move the boundary of those pins (weakness noted, U gate R1 minor 10).
+        #[cfg(all(test))]
+        let bench_fsync = crate::activity::bench::FsyncSpan::begin();
         f.sync_all()?;
+        #[cfg(all(test))]
+        drop(bench_fsync);
         std::fs::rename(&tmp, &target)?;
         Ok(())
     })();
     match res {
         Ok(()) => {
             if let Ok(d) = std::fs::File::open(dir) {
+                #[cfg(all(test))]
+                let bench_fsync = crate::activity::bench::FsyncSpan::begin();
                 let _ = d.sync_all();
+                #[cfg(all(test))]
+                drop(bench_fsync);
             }
             Ok(())
         }

@@ -33,6 +33,11 @@ impl Row {
         self.cells.iter()
     }
 
+    /// cys patch (0.14.52 F-01): the row's cells as one contiguous slice.
+    pub fn cells_slice(&self) -> &[crate::cell::Cell] {
+        &self.cells
+    }
+
     pub fn get(&self, col: u16) -> Option<&crate::cell::Cell> {
         self.cells.get(usize::from(col))
     }

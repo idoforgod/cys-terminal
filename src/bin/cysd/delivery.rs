@@ -664,9 +664,12 @@ pub(crate) mod dir_sync_probe {
 /// '실패했을 때 무엇을 하는가' 축은 종전과 같다.
 #[cfg(unix)]
 fn fsync_dir_handle(f: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(test)]
+    let bench_fsync = crate::activity::bench::FsyncSpan::begin();
     let real = f.sync_all();
     #[cfg(test)]
     {
+        drop(bench_fsync);
         dir_sync_probe::note_call(real.is_err());
         if dir_sync_probe::fault_armed() {
             return Err(std::io::Error::other("주입: 디렉터리 fsync 실패"));
@@ -972,9 +975,14 @@ fn append_lines_opt(p: &Path, recs: &[Value], durable: bool) -> Outcome {
         return Outcome::Failed(format!("원장 write 실패: {e}"));
     }
     if durable {
+        // (test-only U4-3 A2-1: fsync span of the delivering thread; the guard also closes on the error return.)
+        #[cfg(test)]
+        let bench_fsync = crate::activity::bench::FsyncSpan::begin();
         if let Err(e) = f.sync_data() {
             return Outcome::Failed(format!("원장 sync 실패: {e}"));
         }
+        #[cfg(test)]
+        drop(bench_fsync);
     }
     Outcome::Recorded
 }

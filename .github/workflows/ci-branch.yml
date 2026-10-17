@@ -227,6 +227,12 @@ jobs:
                   "--lib claude_tui::":
                       "Windows 기본 classic 화면 모드 설정(0.14.45)의 윈도우 전용 검체 둘(개인 프로필 비교의 대소문자·verbatim 접두 · 8.3 짧은 이름 철자)이 "
                       "도는 유일한 자리 — 빠지면 개인 프로필 보호가 윈도우에서 실측 없이 맥 초록으로만 대변된다.",
+                  "--bin cysd u229_":
+                      "0.14.52 B-229: the only BLOCKING native Windows run of the account resolver's mismatch/sameness tests (the cysd full step is "
+                      "non-blocking) — without it Windows path normalisation is vouched for only by macOS windows=true fixtures.",
+                  "--bin cysd activity_tests::":
+                      "0.14.52 F-01: the only BLOCKING native Windows run of the activity observer tests (Windows identity staging path included) — "
+                      "without it the observer ships with Windows behaviour vouched for only by macOS.",
               },
           }
 

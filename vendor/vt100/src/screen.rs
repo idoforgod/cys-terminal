@@ -80,6 +80,14 @@ pub struct Screen {
     visual_bell_count: usize,
 
     errors: usize,
+
+    // cys 패치(0.14.52 · F-01): full resets (ESC c) seen so far — survives the reset itself so a
+    // reader can tell "reset + repaint" from continuity when the final geometry/frame match.
+    resets: u64,
+
+    // cys 패치(0.14.52 · F-01): DECSET ?2026 synchronized output is open (a frame is mid-update).
+    // Kept out of `modes` so no formatted/diff output or comparison changes.
+    sync_update: bool,
 }
 
 impl Screen {
@@ -107,6 +115,10 @@ impl Screen {
             visual_bell_count: 0,
 
             errors: 0,
+
+            resets: 0,
+
+            sync_update: false,
         }
     }
 
@@ -601,6 +613,13 @@ impl Screen {
         self.grid().visible_cell(crate::grid::Pos { row, col })
     }
 
+    /// cys patch (0.14.52 F-01): the visible row `row` as one contiguous slice of cells (the row is resolved once,
+    /// instead of once per cell as in [`Screen::cell`]). `None` when the row is outside the visible screen.
+    #[must_use]
+    pub fn visible_row_cells(&self, row: u16) -> Option<&[crate::cell::Cell]> {
+        self.grid().visible_row(row).map(crate::row::Row::cells_slice)
+    }
+
     /// Returns whether the text in row `row` should wrap to the next line.
     #[must_use]
     pub fn row_wrapped(&self, row: u16) -> bool {
@@ -655,6 +674,19 @@ impl Screen {
     #[must_use]
     pub fn errors(&self) -> usize {
         self.errors
+    }
+
+    /// cys 패치(0.14.52 · F-01): number of full resets (`ESC c`) processed by this screen.
+    #[must_use]
+    pub fn reset_count(&self) -> u64 {
+        self.resets
+    }
+
+    /// cys 패치(0.14.52 · F-01): whether a DECSET ?2026 synchronized-output block is open, i.e. the
+    /// application has begun a frame update that it has not finished yet.
+    #[must_use]
+    pub fn synchronized_output(&self) -> bool {
+        self.sync_update
     }
 
     /// Returns whether the alternate screen is currently in use.
@@ -1097,6 +1129,8 @@ impl Screen {
         let audible_bell_count = self.audible_bell_count;
         let visual_bell_count = self.visual_bell_count;
         let errors = self.errors;
+        // cys 패치(0.14.52 · F-01): count the reset and keep the count across it.
+        let resets = self.resets.saturating_add(1);
 
         *self = Self::new(self.grid.size(), self.grid.scrollback_len());
 
@@ -1105,6 +1139,7 @@ impl Screen {
         self.audible_bell_count = audible_bell_count;
         self.visual_bell_count = visual_bell_count;
         self.errors = errors;
+        self.resets = resets;
     }
 
     // ESC g
@@ -1261,6 +1296,8 @@ impl Screen {
                     self.enter_alternate_grid();
                 }
                 &[2004] => self.set_mode(MODE_BRACKETED_PASTE),
+                // cys 패치(0.14.52 · F-01): synchronized output begin.
+                &[2026] => self.sync_update = true,
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
                         let n = if ns.len() == 1 {
@@ -1320,6 +1357,8 @@ impl Screen {
                     self.decrc();
                 }
                 &[2004] => self.clear_mode(MODE_BRACKETED_PASTE),
+                // cys 패치(0.14.52 · F-01): synchronized output end.
+                &[2026] => self.sync_update = false,
                 ns => {
                     if log::log_enabled!(log::Level::Debug) {
                         let n = if ns.len() == 1 {
