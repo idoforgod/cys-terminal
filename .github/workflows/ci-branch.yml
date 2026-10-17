@@ -304,7 +304,11 @@ jobs:
                   "Repository-only CI reader controls run in the branch macOS lane: they execute the actual "
                   "branch/release/Windows reader bodies over isolated logs and verify release cargo exits. "
                   "Release and windows-health execute those readers on their real logs; pack-release has "
-                  "no cysd execution leg. The separate Rust compiler-seal specimen runs with the native group.",
+                  "no cysd execution leg. The separate Rust compiler-seal specimen runs with the native group. "
+                  "Not covered: cargo started by a script, heredoc or other program a run line calls; audit those "
+                  "by hand. Also unread: a cmd.exe ^ continuation (its first line reads as a test-name filter). "
+                  "Refused, not read: cargo inside an sh, bash, zsh, dash, ksh, eval, pwsh, powershell or cmd "
+                  "command, the cargo-nextest binary, and any action or reusable workflow not on its allow-list.",
               ),
                             "test_verify_win_crt": (
                   {"ci-branch", "release"},
