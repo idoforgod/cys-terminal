@@ -1,6 +1,7 @@
 // Source pin for the currently private sampler in this single handlers module.
 // This lexer is intentionally not a Rust parser or macro-expansion/whole-program proof.
-// It ignores comments/literals, checks the terminal cfg(test) module boundary, and
+// It ignores comments/literals, checks the cfg(test) tests module boundary (only further
+// cfg(test) modules may follow it), and
 // fails closed if production submodules/include! would move callers outside its scan.
 fn c8_sampler_tokens(source: &str) -> Result<Vec<&str>, String> {
     let b = source.as_bytes(); let mut i = 0; let mut tokens = Vec::new();
@@ -90,7 +91,8 @@ fn c8_sampler_dormancy(source: &str) -> Result<(), String> {
             if depth == 0 { close = Some(i); break; }
         }
     }
-    if close != Some(tokens.len() - 1) { return Err("tests module must be terminal; unscanned suffix".into()); }
+    let close = close.ok_or("unbalanced tests module")?;
+    c8_sampler_test_suffix(&tokens[close + 1..])?;
     let production = &tokens[..start];
     if production.iter().any(|token| *token == "mod")
         || production.windows(2).any(|row| row == ["include", "!"]) {
@@ -109,6 +111,53 @@ fn c8_sampler_dormancy(source: &str) -> Result<(), String> {
     // follow another item ('}' / ';'). pub, pub(crate), async/unsafe/extern widen/change it.
     if !matches!(production[name - 2], "]" | "}" | ";") {
         return Err("sampler must remain a private ordinary function in the scanned module".into());
+    }
+    Ok(())
+}
+
+// Items after the tests module may only be further #[cfg(test)] modules (`mod m;` or `mod m { .. }`, other attributes
+// such as #[path] after the cfg) - e.g. A-ID's pty_allocator_busy_tests (R-C8DORM-1 batch, integration merge c00575b6).
+// Anything else there would be unscanned production code and fails closed.
+fn c8_sampler_test_suffix(tokens: &[&str]) -> Result<(), String> {
+    const CFG_TEST: [&str; 7] = ["#", "[", "cfg", "(", "test", ")", "]"];
+    let refuse = || Err::<(), String>("only #[cfg(test)] modules may follow the tests module; unscanned suffix".into());
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens.get(i..i + CFG_TEST.len()) != Some(&CFG_TEST[..]) { return refuse(); }
+        i += CFG_TEST.len();
+        while tokens.get(i) == Some(&"#") && tokens.get(i + 1) == Some(&"[") {
+            let mut depth = 0usize;
+            loop {
+                match tokens.get(i) {
+                    Some(&"[") => depth += 1,
+                    Some(&"]") => { depth -= 1; if depth == 0 { break; } }
+                    None => return refuse(),
+                    _ => {}
+                }
+                i += 1;
+            }
+            i += 1;
+        }
+        let named = matches!(tokens.get(i + 1), Some(t) if t.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_'));
+        if tokens.get(i) != Some(&"mod") || !named { return refuse(); }
+        i += 2;
+        match tokens.get(i) {
+            Some(&";") => i += 1,
+            Some(&"{") => {
+                let mut depth = 0usize;
+                loop {
+                    match tokens.get(i) {
+                        Some(&"{") => depth += 1,
+                        Some(&"}") => { depth -= 1; if depth == 0 { break; } }
+                        None => return refuse(),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ => return refuse(),
+        }
     }
     Ok(())
 }
@@ -146,4 +195,19 @@ fn c8_sampler_dormancy_pin_distinguishes_code_from_literals_and_tests() {
     assert!(c8_sampler_dormancy(&public).is_err(), "pin allowed private sampler to widen beyond scanned module");
     let suffix = format!("{allowed}\nfn after_tests() {{ checked_submit_sender(); }}");
     assert!(c8_sampler_dormancy(&suffix).is_err(), "pin missed production suffix after tests module");
+    // Further #[cfg(test)] modules may follow the tests module (A-ID's pty_allocator_busy_tests shape); any other
+    // item after them, or a non-module / other-cfg item there, still fails closed.
+    for trailing in ["#[cfg(test)]\n#[path = \"pty_allocator_busy_tests.rs\"]\nmod pty_allocator_busy_tests;",
+                     "#[cfg(test)] mod more { fn t() { checked_submit_sender(); } }\n#[cfg(test)] mod last;"] {
+        assert!(c8_sampler_dormancy(&format!("{allowed}\n{trailing}")).is_ok(), "pin refused a trailing test module: {trailing}");
+    }
+    for trailing in ["#[cfg(test)] #[path = \"x.rs\"] mod x;\nfn after() {}",
+                     "#[cfg(test)] mod x;\nfn after() { checked_submit_sender(); }",
+                     "#[cfg(test)] fn helper() {}",
+                     "#[cfg(not(test))] mod z;",
+                     "#[cfg(test)] mod open {"] {
+        assert_eq!(c8_sampler_dormancy(&format!("{allowed}\n{trailing}")),
+            Err("only #[cfg(test)] modules may follow the tests module; unscanned suffix".to_string()),
+            "pin accepted a non-test suffix item: {trailing}");
+    }
 }

@@ -1010,8 +1010,13 @@ mod tests {
         let w=registration_work(&c);c.begin_initial(w.clone()).unwrap();
         // Registration prefetch fixture, not a two-second startup timing measurement.
         c.open_window(&w,Instant::now()+Duration::from_secs(20)).unwrap();
-        let executor=c.executor.clone();let (tx,rx)=mpsc::channel();let task_cell=c.clone();
-        c.schedule(w,move|result|{
+        let executor=c.executor.clone();let (tx,rx)=mpsc::channel();
+        // Admission is nonblocking (R-C8DORM-1 #6): retry ONLY Busy/AdmissionBusy until a deadline, as the receiver and
+        // transition fixtures do; a refused admission starts nothing, so `started` below still counts exactly one start.
+        let deadline=Instant::now()+Duration::from_secs(10);
+        loop {
+        let (tx,task_cell)=(tx.clone(),c.clone());
+        let scheduled=c.schedule(w.clone(),move|result|{
             // Preserve worker assertion failures instead of letting the executor turn them into
             // a channel timeout, which would not prove the intended mutation discriminator.
             let outcome=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||->Result<(),CoreError>{
@@ -1033,7 +1038,15 @@ mod tests {
                 Ok(())
             }));
             tx.send(outcome).unwrap();
-        }).unwrap();
+        });
+        match scheduled {
+            Ok(())=>break,
+            Err(CoreError::Busy)|Err(CoreError::Start(StartRefusal::AdmissionBusy)) if Instant::now()<deadline=>
+                std::thread::sleep(Duration::from_millis(2)),
+            Err(e)=>panic!("native fixture admission did not become available: {e:?}"),
+        }
+        }
+        drop(tx); // as before the retry: a job dropped without sending disconnects the receiver at once
         match rx.recv_timeout(Duration::from_secs(10)).expect("native fixture completion") {
             Ok(result)=>result.unwrap(),
             Err(panic)=>std::panic::resume_unwind(panic),
