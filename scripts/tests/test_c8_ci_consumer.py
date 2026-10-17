@@ -35,42 +35,113 @@ def marker():
     return "C8_NATIVE_UNMEASURED_V1 " + json.dumps({"state":"UNMEASURED", "group":"C8_NATIVE_TRANSITIONS",
         "test":"native_publication::native_transition_tests::np_fixture", "reason":"python3_unavailable"}) + "\n"
 
-def workflow_run_bodies(path):
+# Producer steps whose cargo log a blocking C8 marker gate reads: (workflow, step name) -> log under RUNNER_TEMP.
+# Any other cysd test run must use filters that cannot select a C8 native test (native_selection below).
+GATED_CYSD_LEGS = {
+    ("ci-branch.yml", "cargo test --bin cysd (데몬 단위 검체 · 브랜치 레인 편입 · macOS)"): "cysd-mac.log",
+    ("release.yml", "phoenix host-level 로직 게이트 (macOS 네이티브)"): "c8-release-cysd.log",
+    ("windows-health.yml", "cargo test --bin cysd 감독자 축 (Windows 실기 · IG-31 · 비차단 A10 1단계)"): "cysd-win/cargo.log",
+    ("windows-health.yml", "cargo test --bin cysd hwmon 검체 (Windows 실기 · 비차단 · 위 전량 스텝과 별개)"): "hwmon-win/cargo.log",
+}
+CARGO_VALUE_FLAGS = {"--bin", "-p", "--package", "--manifest-path", "--target", "--target-dir", "--features", "-F",
+                     "--profile", "-j", "--jobs", "--color", "--config", "-Z", "--message-format", "--exclude",
+                     "--test", "--example", "--bench"}
+CARGO_SWITCHES = {"--offline", "--locked", "--frozen", "--release", "--no-fail-fast", "--all-features",
+                  "--no-default-features", "--workspace", "--all", "-q", "--quiet", "-v", "-vv", "--verbose", "--bins",
+                  "--lib", "--tests", "--all-targets", "--doc", "--examples", "--benches", "--ignore-rust-version"}
+LIBTEST_VALUE_FLAGS = {"--skip", "--test-threads", "--format", "--logfile", "--color", "-Z", "--shuffle-seed"}
+LIBTEST_SWITCHES = {"--nocapture", "--no-capture", "--exact", "--ignored", "--include-ignored", "-q", "--quiet",
+                    "--show-output", "--test", "--bench", "--force-run-in-process", "--report-time", "--ensure-time",
+                    "--shuffle", "--exclude-should-panic"}
+SHELL_PREFIX_WORDS = {"!", "{", "}", "if", "then", "elif", "else", "do", "while", "until", "time"}
+
+def workflow_step_runs(path):
+    """(owning step name, run body) for every run: key; the step is found by indentation, block scalars skipped."""
     lines = path.read_text(encoding="utf-8").splitlines()
-    result = []
-    for i, line in enumerate(lines):
-        match = re.match(r"^( *)(?:run):\s*(.*)$", line)
+    indent = lambda text: len(text) - len(text.lstrip(" "))
+    unquote = lambda v: v[1:-1].replace("''", "'") if len(v) > 1 and v[0] == v[-1] and v[0] in "'\"" else v
+    items, result, i = [], [], 0          # items: [dash column, key column, step name] of open sequence entries
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = re.match(r"^( *)(- +)?([A-Za-z0-9_-]+):(?:\s+(.*?))?\s*$", line)
         if not match:
             continue
-        value = match.group(2)
-        if value in ("|", ">"):
-            indent = len(match.group(1))
+        column = indent(line)
+        items = [item for item in items if item[0] < column]
+        key_column = column + len(match.group(2) or "")
+        if match.group(2):
+            items.append([column, key_column, None])
+        key, value = match.group(3), (match.group(4) or "")
+        owner = next((item for item in reversed(items) if item[1] == key_column), None)
+        if re.fullmatch(r"[|>][0-9+-]*(\s+#.*)?", value):
             body = []
-            for following in lines[i + 1:]:
-                if following.strip() and len(following) - len(following.lstrip(" ")) <= indent:
-                    break
-                body.append(following.strip())
-            result.append("\n".join(body))
+            while i < len(lines) and (not lines[i].strip() or indent(lines[i]) > key_column):
+                body.append(lines[i].strip())
+                i += 1
+            value = (" " if value.startswith(">") else "\n").join(body)
         else:
-            result.append(value)
+            value = unquote(value)
+        if key == "name" and owner is not None:
+            owner[2] = value
+        elif key == "run":
+            result.append((owner[2] if owner else None, value))
     return result
 
+def logical_lines(body):
+    """Shell lines with backslash-newline continuations joined."""
+    result, pending = [], ""
+    for line in body.splitlines():
+        stripped = line.rstrip()
+        if (len(stripped) - len(stripped.rstrip("\\"))) % 2:
+            pending += stripped[:-1] + " "
+            continue
+        result.append(pending + line)
+        pending = ""
+    if pending:
+        result.append(pending)
+    return result
 
-def invokes_cysd_tests(line):
-    # Current workflows use direct cargo commands; this also recognizes an implicit
-    # all-target/default-package test route rather than demanding '--bin cysd'.
-    try:
-        tokens = shlex.split(line, comments=True)
-    except ValueError:
-        return False
-    if not tokens or tokens[0] in ("echo", "printf") or "cargo" not in tokens:
-        return False
+def simple_commands(line):
+    """Token lists of the simple commands in one shell line: split on ; & | ( ), redirections removed."""
+    lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = "#"
+    commands, current, tokens = [], [], list(lexer)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        if token and set(token) <= set(";&|()"):
+            commands.append(current)
+            current = []
+        elif token and set(token) <= set("<>&|") and ("<" in token or ">" in token):
+            if current and current[-1].isdigit():
+                current.pop()                 # the file descriptor of '2>&1'
+            index += 1                        # the redirection target
+        else:
+            current.append(token)
+    commands.append(current)
+    return [command for command in commands if command]
+
+def cargo_test_args(tokens):
+    """Arguments after 'cargo [+toolchain] test|t' in one simple command, else None ('nextest run' -> ['--nextest'])."""
+    while tokens and (tokens[0] in SHELL_PREFIX_WORDS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0])):
+        tokens = tokens[1:]
+    if not tokens or tokens[0] in ("echo", "printf", ":") or "cargo" not in tokens:
+        return None
     start = tokens.index("cargo") + 1
     if start < len(tokens) and tokens[start].startswith("+"):
         start += 1
-    if start >= len(tokens) or tokens[start] != "test":
-        return False
-    args = tokens[start + 1:]
+    if tokens[start:start + 2] == ["nextest", "run"]:
+        return ["--nextest"] + tokens[start + 2:]
+    if start >= len(tokens) or tokens[start] not in ("test", "t"):
+        return None
+    return tokens[start + 1:]
+
+def selects_cysd(args):
     if "--list" in args or "--no-run" in args:
         return False
     selectors = args[:args.index("--")] if "--" in args else args
@@ -82,7 +153,7 @@ def invokes_cysd_tests(line):
             expanded.append(token)
     selectors = expanded
     for flag in ("-p", "--package"):
-        if flag in selectors and selectors[selectors.index(flag) + 1] == "cys-app":
+        if flag in selectors[:-1] and selectors[selectors.index(flag) + 1] == "cys-app":
             return False
     if any(flag in selectors for flag in ("--bins", "--all-targets", "--tests")):
         return True
@@ -92,6 +163,58 @@ def invokes_cysd_tests(line):
     if any(flag in selectors for flag in ("--lib", "--test", "--example", "--doc")):
         return False
     return True
+
+def cysd_test_runs(body):
+    """(logical line, cargo args) for every simple command in a run body that executes cysd tests."""
+    runs = []
+    for line in logical_lines(body):
+        try:
+            commands = simple_commands(line)
+        except ValueError:                    # unbalanced quoting: read words anyway rather than skip the line
+            text = re.sub(r"(^|\s)#.*$", "", line.replace("'", " ").replace('"', " "))
+            commands = [part.split() for part in re.split(r"[;&|()]", text)]
+        for tokens in commands:
+            args = cargo_test_args(tokens)
+            if args is not None and selects_cysd(args):
+                runs.append((line.strip(), args))
+    return runs
+
+def invokes_cysd_tests(line):
+    # Current workflows use direct cargo commands; this also recognizes an implicit
+    # all-target/default-package test route rather than demanding '--bin cysd'.
+    return bool(cysd_test_runs(line))
+
+def native_selection(args, names):
+    """(True, why) when a cysd test run can select a C8 native test, else (False, why). Unknown syntax can select."""
+    if args[:1] == ["--nextest"]:
+        return True, "cargo nextest filters are not libtest filters"
+    split = args.index("--") if "--" in args else len(args)
+    filters, exact = [], False
+    for part, values, switches in ((args[:split], CARGO_VALUE_FLAGS, CARGO_SWITCHES),
+                                   (args[split + 1:], LIBTEST_VALUE_FLAGS, LIBTEST_SWITCHES)):
+        tokens = iter(part)
+        for token in tokens:
+            if not token.startswith("-") or token == "-":
+                filters.append(token)
+                continue
+            flag = token.split("=", 1)[0]
+            if flag in values:
+                if "=" not in token and next(tokens, None) is None:
+                    return True, "flag %s has no value" % flag
+            elif flag in switches and "=" not in token:
+                exact = exact or (switches is LIBTEST_SWITCHES and flag == "--exact")
+            else:
+                return True, "unclassified flag %s" % token
+    if not filters:
+        return True, "no test-name filter: the whole suite runs"
+    for name_filter in filters:
+        if re.search(r"[$`*?\[{~\\]", name_filter):
+            return True, "filter %r is not a literal" % name_filter
+        hits = [name for name in names if (name_filter == name if exact else name_filter in name)]
+        if hits:
+            return True, "filter %r selects %s" % (name_filter, hits[0])
+    return False, "%s filter(s) %s select none of the %d C8 native tests" % ("exact" if exact else "substring",
+                                                                             filters, len(names))
 
 
 class ReaderFixture(unittest.TestCase):
@@ -167,17 +290,56 @@ class C8MarkerCliTests(ReaderFixture):
 
 class C8WorkflowReaderTests(ReaderFixture):
     def test_actual_cysd_execution_inventory_and_implicit_full_routes(self):
-        counts = {}
-        for path in (ROOT / ".github/workflows").glob("*.yml"):
-            commands = [line for body in workflow_run_bodies(path) for line in body.splitlines() if invokes_cysd_tests(line)]
-            if commands:
-                counts[path.name] = len(commands)
-        self.assertEqual(counts, {"ci-branch.yml": 1, "release.yml": 1, "windows-health.yml": 2},
-                         "cysd execution inventory changed: audit and wire every actual leg")
-        for command in ["cargo test", "cargo test --workspace", "cargo test --all-targets", "cargo +stable test --bins"]:
+        names = json.loads((ROOT / "scripts/c8_native_tests.json").read_text(encoding="utf-8"))
+        gated = {}
+        for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+            for step, body in workflow_step_runs(path):
+                for line, args in cysd_test_runs(body):
+                    if (path.name, step) in GATED_CYSD_LEGS:
+                        gated.setdefault((path.name, step), []).append(line)
+                        continue
+                    can_select, why = native_selection(args, names)
+                    self.assertFalse(can_select, "%s step %r runs cysd tests that can emit the C8 marker but no blocking "
+                                     "marker gate reads its log (%s): %s" % (path.name, step, why, line))
+        self.assertEqual({leg: len(lines) for leg, lines in gated.items()}, dict.fromkeys(GATED_CYSD_LEGS, 1),
+                         "gated cysd leg inventory changed: audit and wire every actual leg")
+        gate_logs = {workflow: logs for workflow, _, logs in MARKER_STEPS}
+        for (workflow, step), log in GATED_CYSD_LEGS.items():
+            self.assertIn(log, gate_logs[workflow], "gated leg log is not read by its workflow's marker gate")
+            body = dict(workflow_step_runs(ROOT / ".github/workflows" / workflow))[step]
+            for part in log.split("/"):
+                self.assertIn(part, body, "gated leg %r no longer writes the log its gate reads" % step)
+        for command in ["cargo test", "cargo test --workspace", "cargo test --all-targets", "cargo +stable test --bins",
+                        "echo start; cargo test --bin cysd", "(cd x && cargo test --bin cysd)", "cargo t --bin cysd",
+                        "if cargo test --bin cysd; then :; fi", "X=1 cargo test --bin=cysd 2>&1 | tee log",
+                        "cargo nextest run --bin cysd", "cargo test --bin cysd 'unbalanced"]:
             self.assertTrue(invokes_cysd_tests(command), command)
-        for command in ["# cargo test", "echo cargo test", "cargo test --lib", "cargo test --bin cys", "cargo test -p cys-app --bins", "cargo test --bin cysd -- --list"]:
+        for command in ["# cargo test", "echo cargo test", "cargo test --lib", "cargo test --bin cys", "cargo test -p cys-app --bins",
+                        "cargo test --bin cysd -- --list", "printf '%s' 'cargo test --bin cysd'", "n=$(cargo test --bin cysd -- --list)"]:
             self.assertFalse(invokes_cysd_tests(command), command)
+
+    def test_native_selection_and_run_extraction_forms(self):
+        names = json.loads((ROOT / "scripts/c8_native_tests.json").read_text(encoding="utf-8"))
+        args = lambda command: cysd_test_runs(command)[0][1]
+        for command in ["cargo test --bin cysd u229_ -- --test-threads=1",
+                        "cargo test --bin cysd hwmon:: -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections",
+                        "cargo test --offline --bin cysd -- --test-threads 1 root_registration::",
+                        "cargo test --bin cysd u229_ -- --test-threads=1 2>&1 | tee \"$LOG\"",
+                        "cargo test --bin cysd -- --exact native_publication"]:
+            self.assertFalse(native_selection(args(command), names)[0], command)
+        for command in ["cargo test --bin cysd -- --test-threads=1 --skip hwmon::", "cargo test --bin cysd -- --test-threads=1 2>&1",
+                        "cargo test --bin cysd native_transition", "cargo test --bin cysd -- np_", "cargo test --bin cysd \"$FILTER\"",
+                        "cargo test --bin cysd --frobnicate hwmon::", "cargo test --bin cysd -- --exact " + names[0],
+                        "cargo test --bin cysd -- --skip", "cargo nextest run --bin cysd hwmon::"]:
+            self.assertTrue(native_selection(args(command), names)[0], command)
+        workflow = self.root / "forms.yml"
+        workflow.write_text("jobs:\n  a:\n    steps:\n      - name: continued\n        run: |\n          cargo test \\\n"
+                            "            --bin cysd\n      - if: always()\n        name: 'quoted '' name'\n"
+                            "        run: \"cargo test --bin cysd\"\n      - name: stripped\n        run: |-\n"
+                            "          echo x; cargo test --bin cysd u229_\n", encoding="utf-8")
+        found = [(step, args) for step, body in workflow_step_runs(workflow) for _, args in cysd_test_runs(body)]
+        self.assertEqual(found, [("continued", ["--bin", "cysd"]), ("quoted ' name", ["--bin", "cysd"]),
+                                 ("stripped", ["--bin", "cysd", "u229_"])])
 
     def test_actual_marker_step_bodies_clean_marked_and_missing_logs(self):
         for workflow, name, logs in MARKER_STEPS:
