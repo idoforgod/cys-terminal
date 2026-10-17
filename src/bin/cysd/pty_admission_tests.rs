@@ -2,6 +2,8 @@
 //! A child test process owns the global allocator hold, so other daemon tests
 //! creating PTYs cannot race with this deliberate stall. No daemon/listener or
 //! shell child is created; successful pairs are dropped in their worker closure.
+//! The additional daemon factory timeout uses only a private state directory and
+//! an absent executable path, so even an unexpected allocator success cannot run a shell.
 use super::{dispatch_admission_exempt, run_admitted};
 use crate::state::HideConsole;
 use portable_pty::unix::test_support;
@@ -12,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Semaphore};
 
 const CHILD_ENV: &str = "CYS_TEST_PTY_ADMISSION_CHILD";
+const ROOT_ENV: &str = "CYS_TEST_PTY_ADMISSION_ROOT";
 const CHILD_TEST: &str = "pty_admission_tests::isolated_real_allocator_admission_child";
 const MARKER: &str = "@@PTY_ADMISSION ";
 
@@ -162,6 +165,41 @@ async fn isolated_real_allocator_admission_child() {
     after_timeout.await.expect("recovered task joined").expect("recovered closure joined");
     joined_tasks += 1;
 
+    // R-PTY-2 F1: reach the actual state.rs factory mapping expression rather
+    // than invoking map_pty_open_error directly. The original anyhow controls
+    // above remain independent. All environment was fixed by the parent before
+    // this test process/runtime started; no process-global environment mutation.
+    let root = std::path::PathBuf::from(std::env::var_os(ROOT_ENV).expect("isolated root"));
+    assert!(root.is_absolute() && root.is_dir());
+    let absent_shell = root.join("never-created-shell");
+    assert!(!absent_shell.exists());
+    assert_eq!(std::env::var_os("CYS_SHELL"), Some(absent_shell.into_os_string()));
+    let daemon = crate::state::Daemon::new(root.join("state/cys.sock"));
+    let factory_holder = Holder::start();
+    let factory_waiters = test_support::waiter_count();
+    let factory_daemon = daemon.clone();
+    let factory_root = root.clone();
+    let factory_start = Instant::now();
+    let mut factory = tokio::task::spawn_blocking(move || {
+        factory_daemon.create_surface_with_env(
+            Some(factory_root.join("cwd").to_string_lossy().into_owned()),
+            None, None, None, 24, 80, &[], None,
+        )
+    });
+    let factory_waited = waiter_seen(factory_waiters + 1).await;
+    let received = tokio::time::timeout(Duration::from_secs(15), &mut factory).await;
+    let factory_returned_while_held = received.is_ok() && factory_holder.held();
+    let factory_elapsed = factory_start.elapsed();
+    drop(factory_holder);
+    let factory_result = match received {
+        Ok(result) => result,
+        Err(_) => factory.await,
+    }.expect("factory blocking task joined");
+    joined_tasks += 1;
+    let factory_error = factory_result.err();
+    let no_published_surface = daemon.surfaces.lock().unwrap().is_empty();
+    drop(daemon); // Disconnect the private recall writer; parent reaps this process.
+
     let record = serde_json::json!({
         "model_permits": 2, "first_waited": first_waited, "second_waited": second_waited,
         "permits_with_one": permits_with_one, "permits_saturated": permits_saturated,
@@ -177,7 +215,12 @@ async fn isolated_real_allocator_admission_child() {
         "context_control_mapping": timed.context_mapped,
         "final_timeout_permits": timeout_gate.available_permits(),
         "ordinary_calls": calls.load(Ordering::SeqCst), "joined_tasks": joined_tasks,
-        "native_scope": "two open/drop pairs after release; one real allocator timeout before native open; no shell child or daemon listener"
+        "factory_waited": factory_waited,
+        "factory_returned_while_held": factory_returned_while_held,
+        "factory_error": factory_error,
+        "factory_elapsed_ns": factory_elapsed.as_nanos().to_string(),
+        "factory_no_published_surface": no_published_surface,
+        "native_scope": "two open/drop pairs after release; two real allocator timeouts before native open (public API and actual daemon factory); private recall writer; no shell child or daemon listener"
     });
     println!("{MARKER}{record}");
     assert!(first_waited && second_waited && timeout_waited, "actual WouldBlock observations missing: {record}");
@@ -191,12 +234,20 @@ async fn isolated_real_allocator_admission_child() {
     assert!(timed.elapsed >= Duration::from_secs(5), "timeout returned before the production deadline");
     assert_eq!(timeout_gate.available_permits(), 1);
     assert_eq!(calls.load(Ordering::SeqCst), 4);
-    assert_eq!(joined_tasks, 7);
+    assert_eq!(joined_tasks, 8);
+    assert!(factory_waited && factory_returned_while_held, "factory timeout did not return while allocator remained held: {record}");
+    assert_eq!(factory_error.as_deref(), Some(crate::state::PTY_ALLOCATOR_BUSY_MESSAGE), "actual daemon create call-site lost typed timeout mapping: {record}");
+    assert!(no_published_surface && factory_elapsed >= Duration::from_secs(5), "factory timeout published a surface or returned before deadline: {record}");
 }
 
 #[test]
 fn real_allocator_mixed_admission_progress_saturation_ping_recovery_and_timeout() {
     assert!(std::env::var_os(CHILD_ENV).is_none(), "parent must not recurse");
+    let root = std::env::temp_dir().join(format!("pty-admission-{}-{}", std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    std::fs::create_dir(&root).expect("exclusive test root");
+    let root = root.canonicalize().expect("canonical test root");
+    for name in ["state", "pack", "accounts", "config", "cwd"] { std::fs::create_dir(root.join(name)).expect("private fixture directory"); }
     let mut command = Command::new(std::env::current_exe().expect("test executable"));
     command.hide_console();
     command.args(["--exact", CHILD_TEST, "--ignored", "--nocapture", "--test-threads=1"])
@@ -207,7 +258,12 @@ fn real_allocator_mixed_admission_progress_saturation_ping_recovery_and_timeout(
             command.env_remove(key);
         }
     }
-    command.env(CHILD_ENV, "1");
+    command.env(CHILD_ENV, "1").env(ROOT_ENV, &root)
+        .env("CYS_STATE_DIR", root.join("state"))
+        .env("CYS_PACK_DIR", root.join("pack"))
+        .env("CYS_ACCOUNT_DIR", root.join("accounts"))
+        .env("CLAUDE_CONFIG_DIR", root.join("config"))
+        .env("CYS_SHELL", root.join("never-created-shell"));
     let mut child = command.spawn().expect("isolated child test");
     let deadline = Instant::now() + Duration::from_secs(60);
     let completed = loop {
@@ -219,6 +275,9 @@ fn real_allocator_mixed_admission_progress_saturation_ping_recovery_and_timeout(
     };
     if !completed { let _ = child.kill(); }
     let output = child.wait_with_output().expect("reap original test child");
+    // Keep failed-run files available for diagnosis; remove only our successful
+    // child-only tree after the original process and all its descriptors exited.
+    if completed && output.status.success() { std::fs::remove_dir_all(&root).expect("owned scratch cleanup"); }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(completed && output.status.success(), "child failed or exceeded containment deadline: {:?}\n{stdout}\n{stderr}", output.status.code());
@@ -226,7 +285,10 @@ fn real_allocator_mixed_admission_progress_saturation_ping_recovery_and_timeout(
     let raw = stdout.lines().find_map(|line| line.find(MARKER).map(|at| &line[at + MARKER.len()..]))
         .expect("child evidence missing");
     let record: serde_json::Value = serde_json::from_str(raw).expect("child evidence JSON");
-    assert_eq!(record["joined_tasks"], 7);
+    assert_eq!(record["joined_tasks"], 8);
     assert_eq!(record["actual_anyhow_marker"], true);
+    assert_eq!(record["factory_error"], crate::state::PTY_ALLOCATOR_BUSY_MESSAGE);
+    assert_eq!(record["factory_returned_while_held"], true);
+    assert_eq!(record["factory_no_published_surface"], true);
     println!("{MARKER}{record}");
 }

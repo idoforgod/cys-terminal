@@ -539,4 +539,7 @@ if __name__ == "__main__":
         except Exception as e:   # 표시용일 뿐이다 — 판정과 무관
             ver = "버전 조회 실패: %s" % e
         print("[대상] %s · 스텝 `%s`\n[셸] %s — %s" % (WORKFLOW, STEP_NAME, BASH, ver), flush=True)
+    # This already-wired CI entry also executes the Unix PTY result gate's
+    # negative controls; adding a scripts/tests file alone is not discovery.
+    from test_unix_pty_results import OutputControls, WorkflowControls
     unittest.main()

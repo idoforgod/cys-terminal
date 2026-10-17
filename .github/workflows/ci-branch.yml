@@ -1347,9 +1347,20 @@ jobs:
             expired_deadline_refuses_even_a_free_allocator_and_production_budget_is_five_seconds; do
             grep -Fx "unix::pty_open_tests::$name: test" "$LIST" >/dev/null
           done
-          # The module serializes its shared mutex controls in code. Default
-          # libtest concurrency here protects against a forgotten CLI flag.
-          cargo test --manifest-path vendor/portable-pty/Cargo.toml --lib --locked
+          # The module serializes its shared mutex controls in code. Keep default
+          # libtest concurrency; require actual terminal results, not just --list.
+          LOG="${RUNNER_TEMP:-/tmp}/portable-pty-unix-run.log"
+          rm -f "$LOG"
+          set +e
+          cargo test --manifest-path vendor/portable-pty/Cargo.toml --lib --locked -- --format pretty --color never 2>&1 | tee "$LOG"
+          pipeline_status=("${PIPESTATUS[@]}")
+          python3 scripts/verify_unix_pty_results.py "$LOG"
+          gate_status=$?
+          set -e
+          # Capture PIPESTATUS before any command; preserve Cargo failure first.
+          if [ "${pipeline_status[0]}" -ne 0 ]; then exit "${pipeline_status[0]}"; fi
+          if [ "${pipeline_status[1]}" -ne 0 ]; then exit "${pipeline_status[1]}"; fi
+          exit "$gate_status"
 
       - name: cargo test --bin cysd (데몬 단위 검체 · 브랜치 레인 편입 · macOS)
         shell: bash
@@ -1760,9 +1771,20 @@ jobs:
             expired_deadline_refuses_even_a_free_allocator_and_production_budget_is_five_seconds; do
             grep -Fx "unix::pty_open_tests::$name: test" "$LIST" >/dev/null
           done
-          # The module serializes its shared mutex controls in code. Default
-          # libtest concurrency here protects against a forgotten CLI flag.
-          cargo test --manifest-path vendor/portable-pty/Cargo.toml --lib --locked
+          # The module serializes its shared mutex controls in code. Keep default
+          # libtest concurrency; require actual terminal results, not just --list.
+          LOG="${RUNNER_TEMP:-/tmp}/portable-pty-unix-run.log"
+          rm -f "$LOG"
+          set +e
+          cargo test --manifest-path vendor/portable-pty/Cargo.toml --lib --locked -- --format pretty --color never 2>&1 | tee "$LOG"
+          pipeline_status=("${PIPESTATUS[@]}")
+          python3 scripts/verify_unix_pty_results.py "$LOG"
+          gate_status=$?
+          set -e
+          # Capture PIPESTATUS before any command; preserve Cargo failure first.
+          if [ "${pipeline_status[0]}" -ne 0 ]; then exit "${pipeline_status[0]}"; fi
+          if [ "${pipeline_status[1]}" -ne 0 ]; then exit "${pipeline_status[1]}"; fi
+          exit "$gate_status"
 
   # ═══════════════════════════════════════════════════════════════════════════
   # 잡5 — UI 회귀 테스트 + 타입체크 (macos-latest · 0.14.41 U4 C4-⑧ · 2026-09-23)
