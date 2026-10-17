@@ -1014,6 +1014,15 @@ mod tests {
         // Admission is nonblocking (R-C8DORM-1 #6): retry ONLY Busy/AdmissionBusy until a deadline, as the receiver and
         // transition fixtures do; a refused admission starts nothing, so `started` below still counts exactly one start.
         let deadline=Instant::now()+Duration::from_secs(10);
+        // R-C8DORM-2 #5: run the retry arm on every run - a holder thread owns the core during the first attempt, so
+        // schedule refuses with Busy, the arm sleeps and retries, and an attempt after the release is admitted.
+        // (AdmissionBusy takes the same arm; the executor lock that produces it is private to receiver.rs.)
+        let (held,holding)=mpsc::channel();let owner=c.clone();
+        let holder=std::thread::spawn(move||{
+            let core=owner.core.lock().unwrap();held.send(()).unwrap();std::thread::sleep(Duration::from_millis(50));drop(core);
+        });
+        holding.recv_timeout(Duration::from_secs(10)).expect("core holder started");
+        let mut retries=0u32;
         loop {
         let (tx,task_cell)=(tx.clone(),c.clone());
         let scheduled=c.schedule(w.clone(),move|result|{
@@ -1042,10 +1051,12 @@ mod tests {
         match scheduled {
             Ok(())=>break,
             Err(CoreError::Busy)|Err(CoreError::Start(StartRefusal::AdmissionBusy)) if Instant::now()<deadline=>
-                std::thread::sleep(Duration::from_millis(2)),
+                { retries+=1;std::thread::sleep(Duration::from_millis(2)) }
             Err(e)=>panic!("native fixture admission did not become available: {e:?}"),
         }
         }
+        holder.join().unwrap();
+        assert!(retries>=1,"the Busy/AdmissionBusy retry arm did not run (the core holder did not make the first attempt Busy)");
         drop(tx); // as before the retry: a job dropped without sending disconnects the receiver at once
         match rx.recv_timeout(Duration::from_secs(10)).expect("native fixture completion") {
             Ok(result)=>result.unwrap(),

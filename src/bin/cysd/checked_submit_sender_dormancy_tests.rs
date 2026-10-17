@@ -203,6 +203,7 @@ fn c8_sampler_dormancy_pin_distinguishes_code_from_literals_and_tests() {
     }
     for trailing in ["#[cfg(test)] #[path = \"x.rs\"] mod x;\nfn after() {}",
                      "#[cfg(test)] mod x;\nfn after() { checked_submit_sender(); }",
+                     "#[cfg(test)] mod a;\nfn hidden() { checked_submit_sender(); }\n#[cfg(test)] mod b;", // R-C8DORM-2 #2
                      "#[cfg(test)] fn helper() {}",
                      "#[cfg(not(test))] mod z;",
                      "#[cfg(test)] mod open {"] {
