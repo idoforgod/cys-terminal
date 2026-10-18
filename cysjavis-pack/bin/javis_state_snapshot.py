@@ -30,6 +30,7 @@
 #   javis_state_snapshot.py self-test              # 원자성/중단내성 실증(격리 임시폴더)
 
 import argparse
+import errno
 import glob as _glob
 import hashlib
 import json
@@ -399,12 +400,35 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None)
             os._exit(137)  # SIGKILL 유사 — atexit/flush 없이 즉사
 
         # 2) 최종 이름으로 디렉터리 원자 승격(os.rename). 동일 초 충돌 시 카운터 부여.
+        #    ★exists() 선검사는 **이름 선택**에만 쓴다 — 충돌의 **판정은 rename 자신의 오류**다.
+        #    gen_root(GEN_ROOT) 는 HOME 한 곳을 전 부서가 공유하고 phoenix-snapshot-6h 는 부서마다
+        #    등록돼 있다 — 같은 초에 다른 프로세스가 같은 이름을 승격할 수 있고, 그때 선검사 결과는
+        #    rename 시점에 이미 낡았다(검사와 행위 사이의 창). 선검사만 믿으면 그 창에서
+        #    ENOTEMPTY 로 **세대가 통째로 유실**된다(2026-10-17 11:52:22Z 실측 · Errno 66).
+        #    ★물러난 이름에도 선검사를 적용한다. ⛔초기 이름만 선검사하면, 경합으로 물러난
+        #    `<stamp>-k` 가 **비어 있는** 채 이미 존재할 때 POSIX rename 이 **성공하면서 그것을 삼킨다**
+        #    (rename 은 빈 디렉터리 대상만 조용히 대체한다) ⇒ 선검사를 거쳤을 때와 결과가 달라지는
+        #    **조용한 행동 변경**이다. 독립 검증(reviewer-gemini · INFRA-PH1 F1)이 live 파일에서 실증했다.
         final_dir = os.path.join(gen_root, stamp)
         counter = 1
-        while os.path.exists(final_dir):
-            final_dir = os.path.join(gen_root, f"{stamp}-{counter}")
-            counter += 1
-        os.rename(tmp_dir, final_dir)  # POSIX: 동일 FS 내 원자적
+        while True:
+            while os.path.exists(final_dir):
+                if counter > 9999:
+                    raise OSError(errno.ENOTEMPTY,
+                                  "generation name space exhausted after 9999 candidates", final_dir)
+                final_dir = os.path.join(gen_root, f"{stamp}-{counter}")
+                counter += 1
+            try:
+                os.rename(tmp_dir, final_dir)  # POSIX: 동일 FS 내 원자적
+                break
+            except OSError as exc:
+                # 경합자가 창 안에서 그 이름을 차지한 경우에만 다음 이름으로 물러난다.
+                # ⛔다른 오류는 삼키지 않는다(원인 은폐 금지) · ⛔남의 세대를 덮어쓰지 않는다
+                #   (비어 있지 않은 대상은 POSIX rename 이 거부하고, 그 거부가 여기서 신호다).
+                if exc.errno not in (errno.ENOTEMPTY, errno.EEXIST) or counter > 9999:
+                    raise
+                final_dir = os.path.join(gen_root, f"{stamp}-{counter}")
+                counter += 1
         tmp_dir = None
         _fsync_path(gen_root)
     finally:
@@ -673,6 +697,65 @@ def do_self_test():
         assert any("cys-dept-dept-B" in s for s in stored_srcs), "T6: 스냅샷에 부서 선언상태 미포함"
         assert do_verify(gen_root=gen6_root) == 0, "T6: 부서 포함 세대 무결성 실패"
         print("  [PASS] T6 부서 자동 커버리지: stale-registry 밖 부서까지 glob 발견·스냅샷 포함·대형 .db 제외·무결성 OK")
+
+        # T7: ★경합 승격 — 선검사와 rename 사이의 창에서 다른 프로세스가 같은 이름을 차지한 경우.
+        #     GEN_ROOT 는 HOME 한 곳을 전 부서가 공유하고 phoenix-snapshot-6h 는 부서마다 등록돼 있어
+        #     같은 초 경합이 상시 가능하다. 2026-10-17 11:52:22Z 에 실제로 ENOTEMPTY(Errno 66)로
+        #     세대 1건이 유실됐다. 창의 재현은 선검사를 낡게 만들면 된다 — exists() 가 False 를 답하는
+        #     그 순간 그 이름을 **비어 있지 않게** 만든다.
+        #     ⛔실프로세스 8개 동시 승격은 이 결함을 놓친다(창이 너무 좁다) — **재현되지 않은 경합은
+        #       부재의 증거가 아니다**. 그래서 판정자는 주입이고 실경합은 보강일 뿐이다.
+        #     ★주입은 **두 자리**를 뺏고 **끝까지 거짓말한다**(독립 검증 INFRA-PH1 F2-C):
+        #       한 번만 거짓말하면 ⒜선검사를 두 번 하는 코드와 ⒝루프 없는 단발 재시도가 통과한다.
+        #     ★그리고 승격 결과를 **반환 문자열이 아니라 디스크에서** 확인한다(F2-A·F2-B):
+        #       경합자 세대의 **내용**까지 보고, 승격된 세대가 **실재하고 verify 를 통과**하는지 본다.
+        #       ⛔반환값만 보는 어서션은, 세대를 통째로 잃고 이름만 돌려주는 구현을 통과시킨다.
+        gen7_root = os.path.join(workdir, "gen7")
+        os.makedirs(gen7_root)
+        _real_exists = os.path.exists
+        _racers = {}
+        _marker = '{"generator":"the racer that got there first"}'
+
+        def _stale_exists(path):
+            p = str(path)
+            b = os.path.basename(p)
+            if os.path.dirname(p) != gen7_root or b.startswith(TMP_PREFIX) or not b.endswith("Z"):
+                # <stamp>-k 는 basename 이 "Z" 로 끝나지 않으므로 여기서 걸러진다 → 아래 사전 조회로 처리
+                if p in _racers:
+                    return False        # ← 끝까지 낡은 답(한 번만 거짓말하면 재검사가 통과한다)
+                return _real_exists(path)
+            if not _racers:
+                for name in (b, b + "-1"):      # 두 자리를 뺏는다 → 단발 재시도는 두 번째에서 죽는다
+                    d = os.path.join(gen7_root, name)
+                    os.makedirs(d, exist_ok=True)
+                    with open(os.path.join(d, "manifest.json"), "w", encoding="utf-8") as rf:
+                        rf.write(_marker)
+                    _racers[d] = name
+            return False if p in _racers else _real_exists(path)
+
+        promote_err = None
+        gen7 = None
+        try:
+            os.path.exists = _stale_exists
+            gen7 = do_snapshot(sources=sources, gen_root=gen7_root)
+        except OSError as exc:
+            promote_err = exc
+        finally:
+            os.path.exists = _real_exists
+        assert _racers, "T7: 주입 미발화 — 아무것도 검증되지 않았다(검사기 어휘만 증명한 꼴)"
+        assert promote_err is None, (
+            "T7: 경합 승격이 errno=%s 로 실패 — 세대 유실(%s)" % (getattr(promote_err, "errno", None), promote_err))
+        for _vd, _vn in _racers.items():
+            _vm = os.path.join(_vd, "manifest.json")
+            assert os.path.isfile(_vm), "T7: 경합자 세대 %s 를 덮어썼다" % _vn
+            with open(_vm, encoding="utf-8") as rf:
+                assert rf.read() == _marker, "T7: 경합자 세대 %s 의 내용이 바뀌었다(덮어쓰기)" % _vn
+        assert gen7 and gen7 not in _racers.values(), "T7: 경합자 이름으로 승격 %r" % gen7
+        assert os.path.isdir(os.path.join(gen7_root, gen7)), (
+            "T7: %r 를 반환했지만 디스크에 없다 — 이름만 돌려주고 세대를 잃었다" % gen7)
+        assert do_verify(gen_root=gen7_root, gen=gen7) == 0, "T7: 승격된 세대 %s 가 verify 실패" % gen7
+        print("  [PASS] T7 경합 승격: 자리 2개를 뺏겨도 세대 유실 없음(%s · 디스크 실재 · verify OK) · 경합자 %d건 불파괴"
+              % (gen7, len(_racers)))
 
         print("=== self-test 전체 PASS ===")
         return 0
