@@ -214,6 +214,11 @@ describe("★R2F-UI(A3 m1) 데몬 어휘 핀 — 접두 목록은 데몬 소스�
       BLOCKED_SETTLE_BUDGET: false, // wait(settle — 다음 틱에 스스로 풀린다)
       BLOCKED_PAUSED_KILL_SWITCH: false, // paused
       BLOCKED_QUEUE_PAUSED: false, // wait(queue_paused)
+      // TABLE = reading of a CODE-LESS (pre-0.14.45) payload. true does not mean a held receiver needs a human; it means a code-less
+      // receiver_held cannot be told apart from one that does (not a calm prefix). Live daemons send remedy_code wait (governance.rs:8941-8943)
+      // and are calm. See B-306.
+      BLOCKED_RECEIVER_HELD: true,
+      BLOCKED_PARTIAL_WRITE: true, // alert: the stopped request does not resolve itself (reconciliation is the lane master's); current daemons send remedy_code wait (governance.rs:8944-8946)
     };
     const found = Array.from(rs.matchAll(/pub\(crate\) const (BLOCKED_[A-Z_]+): &str =\s*"([^"]*)";/g), (x) => [x[1], x[2]] as [string, string]);
     expect(found.length).toBeGreaterThanOrEqual(12);

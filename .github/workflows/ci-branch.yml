@@ -341,6 +341,15 @@ jobs:
                   "Refused, not read: cargo inside an sh, bash, zsh, dash, ksh, eval, pwsh, powershell or cmd "
                   "command, the cargo-nextest binary, and any action or reusable workflow not on its allow-list.",
               ),
+              "test_unix_pty_results": (
+                  {"ci-branch"},
+                  "scripts/tests/ suite (not a pack suite; 0.14.52). Controls for scripts/verify_unix_pty_results.py: they run the "
+                  "two 'Unix PTY allocator tests' step bodies of this file (macOS and Linux jobs) with fake cargo and check the "
+                  "reader's verdicts. Those bodies and that reader exist only in ci-branch.yml; release and pack-release do not "
+                  "run the vendor portable-pty tests (windows-health runs them in its own filtered cell without this reader), "
+                  "so a release or pack-release entry would have nothing to measure. Also run by import from "
+                  "test_ci_branch_cysd_step.py.",
+              ),
                             "test_verify_win_crt": (
                   {"ci-branch", "release"},
                   "scripts/tests/ 스위트(팩 스위트 아님 · R1-repair 2026-08-29 편입 — 그 전에는 "
@@ -1448,6 +1457,17 @@ jobs:
           [ -f "$f" ] || { echo "테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
           echo "== test_ci_branch_cysd_step (mac) =="
           python3 "$f"
+
+      # ★(0.14.52 · CI-RED-FIX-PREP) Unix PTY result-gate controls, registered by name. The file came in 5b264d36 and ran only by
+      #   import from test_ci_branch_cysd_step.py, which the D3 reverse axis (file -> registration) cannot see, so that gate was red.
+      #   Branch lane only: ALLOWED("test_unix_pty_results") in the lane-parity gate above gives the reason. ★No `if:`.
+      - name: Unix PTY result-gate controls (fake cargo · both Unix step bodies · macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_unix_pty_results.py"
+          [ -f "$f" ] || { echo "Missing Unix PTY result-gate controls: $f" >&2; exit 1; }
+          PYTHONDONTWRITEBYTECODE=1 python3 "$f"
 
       - name: C8 CI reader controls (isolated logs and fake cargo)
         shell: bash

@@ -296,6 +296,70 @@ def native_selection(args, names):
                                                                              filters, len(names))
 
 
+# Exact lines of the real windows-health job log on 345b996d (2026-10-19, evidence windows-health-job.log; its line numbers),
+# GitHub's timestamp prefix removed. The runner showed `test X ... ` and the panic header as two lines 36 microseconds
+# apart; the step's tee writes the raw stream, so the INLINE part joins two real lines.
+WIN_LOG_STEP9 = [
+    # 2298-2306: a helper thread's expected panic inside a passing test
+    'test accounts::tests::b3_units::b3_account_in_use_table ... ok',
+    'test accounts::tests::b3_units::b3_alert_eligible_table ... ok',
+    'test accounts::tests::b3_units::b3_alert_rows_carry_age_in_use_reset_and_held ... ok',
+    'test accounts::tests::b3_units::b3_fired_alert_detail_carries_observation_meta ... ok',
+    'test accounts::tests::b3_units::b3_local_json_rows_carry_in_use_rate_observed_at_and_alert_eligible ... ',
+    "thread '<unnamed>' (8324) panicked at src\\bin\\cysd\\accounts.rs:4126:17:",
+    'surfaces 락 오염(검체)',
+    'note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace',
+    'ok',
+    # 2389-2395: a failing test, header on its own line (as the runner showed it)
+    'test activity_tests::exited_seat_serializes_unknown ... ',
+    "thread 'activity_tests::exited_seat_serializes_unknown' (12296) panicked at src\\bin\\cysd\\activity_tests.rs:658:5:",
+    'assertion `left == right` failed: precondition: {"consecutive_rejections":0,"display_epoch":"81171d9d1779e730","family":"claude","grammar_revision":null,"last_positive_age_secs":null,"observation_seq":4,"observed_age_secs":0.0,"raw":"unknown","reason":"odd output generation","retained":false,"stable_age_secs":3.0,"state":"unknown"}',
+    '  left: String("unknown")',
+    ' right: "working"',
+    'FAILED',
+    'test activity_tests::families_do_not_cross_match ... ok',
+    # 2397-2401: an ignored-with-reason line, then an expected panic in a passing test
+    'test activity_tests::hold_copy_micro_benchmark ... ignored, micro-benchmark; run with --release and CYS_HOLD_BENCH_OUT',
+    'test activity_tests::identity_guard_overlapping_writers_and_unwinding_writer ... ',
+    "thread 'activity_tests::identity_guard_overlapping_writers_and_unwinding_writer' (12952) panicked at src\\bin\\cysd\\activity_tests.rs:635:9:",
+    'writer unwinds mid-mutation',
+    'ok',
+    # 2406+2407 joined, then 2408-2411: the INLINE form, header on the `test X ... ` line
+    "test activity_tests::live_quiescing_window_is_reset_pending ... thread 'activity_tests::live_quiescing_window_is_reset_pending' (13464) panicked at src\\bin\\cysd\\activity_tests.rs:658:5:",
+    'assertion `left == right` failed: precondition: {"consecutive_rejections":0,"display_epoch":"a230a40c851eebb3","family":"claude","grammar_revision":"synthetic-test-1","last_positive_age_secs":null,"observation_seq":4,"observed_age_secs":0.0,"raw":"unknown","reason":"odd output generation","retained":false,"stable_age_secs":3.0,"state":"unknown"}',
+    '  left: String("unknown")',
+    ' right: "working"',
+    'FAILED',
+    # 5309-5313, 5375-5376: libtest's names list (two of 63) and its real summary
+    'failures:',
+    '',
+    'failures:',
+    '    activity_tests::exited_seat_serializes_unknown',
+    '    activity_tests::live_quiescing_window_is_reset_pending',
+    '',
+    'test result: FAILED. 2428 passed; 63 failed; 59 ignored; 0 measured; 2 filtered out; finished in 1044.27s',
+]
+# 7107-7123: captured-output blocks (a later cargo invocation in the same job, without --nocapture)
+WIN_LOG_BLOCKS = [
+    'failures:',
+    '',
+    '---- activity_tests::collect_copies_bounded_rows_without_growing_its_buffers stdout ----',
+    '',
+    "thread 'activity_tests::collect_copies_bounded_rows_without_growing_its_buffers' (16616) panicked at src\\bin\\cysd\\activity_tests.rs:404:5:",
+    'assertion failed: matches!(collect(&s, &mut frame), Collected::Frame)',
+    'note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace',
+    '',
+    '---- activity_tests::epoch_changes_with_identity_and_sequence_is_monotonic_within_it stdout ----',
+    '',
+    "thread 'activity_tests::epoch_changes_with_identity_and_sequence_is_monotonic_within_it' (27696) panicked at src\\bin\\cysd\\activity_tests.rs:658:5:",
+    'assertion `left == right` failed: precondition: {"consecutive_rejections":0,"display_epoch":"c65a509e9d52f58c","family":"claude","grammar_revision":"synthetic-test-1","last_positive_age_secs":null,"observation_seq":4,"observed_age_secs":0.0,"raw":"unknown","reason":"odd output generation","retained":false,"stable_age_secs":3.0,"state":"unknown"}',
+    '  left: String("unknown")',
+    ' right: "working"',
+    '',
+    '---- activity_tests::exited_seat_serializes_unknown stdout ----',
+    '',
+]
+
 class ReaderFixture(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="c8-ci-reader-")
@@ -578,6 +642,64 @@ class C8NativeNameTests(ReaderFixture):
                 with self.subTest(workflow=workflow, case=label):
                     self.log(log, body)
                     self.assertEqual(self.run_body(workflow, step).returncode, rc)
+
+class CysdWinFailureListTests(ReaderFixture):
+    """windows-health step 9 writes win-cysd-failures.json from cargo.log; run its actual body over real log lines."""
+    STEP = "cargo test --bin cysd 감독자 축 (Windows 실기 · IG-31 · 비차단 A10 1단계)"
+    EXITED = "activity_tests::exited_seat_serializes_unknown"
+    INLINE = "activity_tests::live_quiescing_window_is_reset_pending"
+
+    def produce(self, text, rc):
+        (self.root / "fake.log").write_text(text, encoding="utf-8")
+        cargo = self.bin / "cargo"
+        cargo.write_text("#!/bin/sh\ncat \"$FAKE_LOG_FILE\"\nexit %d\n" % rc, encoding="utf-8")
+        cargo.chmod(0o755)
+        script = self.root / "producer.sh"
+        # extract_step keeps the block's relative indentation (YAML `|` semantics); workflow_step_runs strips every
+        # line, which is fine for shell but breaks the Python heredoc this step writes.
+        script.write_text(extract_step(str(ROOT / ".github/workflows/windows-health.yml"), self.STEP)["run"], encoding="utf-8")
+        env = dict(self.env, FAKE_LOG_FILE=str(self.root / "fake.log"))
+        env.pop("GITHUB_WORKSPACE", None)
+        ran = subprocess.run([BASH, "--noprofile", "--norc", str(script)], cwd=self.root, env=env, capture_output=True, timeout=60)
+        self.assertEqual(ran.returncode, rc, "the failure list must not change cargo's exit code: %r" % ran.stderr[-400:])
+        self.assertEqual((self.rt / "cysd-win/cargo.log").read_text(encoding="utf-8"), text, "the raw log must stay byte-identical")
+        return json.loads((self.root / "win-cysd-failures.json").read_text(encoding="utf-8"))
+
+    def test_real_windows_panic_headers_with_thread_ids_are_read(self):
+        doc = self.produce("\n".join(WIN_LOG_STEP9) + "\n", 101)
+        self.assertEqual((doc["panic_headers_seen"], doc["panic_headers_parsed"], doc["panic_headers_unparsed"]), (4, 4, []),
+                         "a real header form is not read")
+        by = {p["thread"]: p for p in doc["panics"]}
+        exited, inline, helper = by[self.EXITED], by[self.INLINE], by["<unnamed>"]
+        self.assertEqual((exited["thread_id"], exited["location"]), ("12296", "src\\bin\\cysd\\activity_tests.rs:658:5"))
+        self.assertTrue(exited["message"].startswith("assertion `left == right` failed: precondition: {"))
+        self.assertTrue(exited["message"].endswith('  left: String("unknown")\n right: "working"'), exited["message"][-80:])
+        self.assertEqual((inline["thread_id"], inline["location"]), ("13464", "src\\bin\\cysd\\activity_tests.rs:658:5"))
+        self.assertTrue(inline["message"].endswith(' right: "working"'), inline["message"][-80:])
+        self.assertEqual((helper["thread_id"], helper["location"], helper["message"]),
+                         ("8324", "src\\bin\\cysd\\accounts.rs:4126:17", "surfaces 락 오염(검체)"))
+        self.assertEqual(by["activity_tests::identity_guard_overlapping_writers_and_unwinding_writer"]["message"],
+                         "writer unwinds mid-mutation")
+        self.assertEqual(doc["failed_tests"], [self.EXITED, self.INLINE])
+        self.assertEqual((doc["failed_tests_without_panic"], doc["panic_detail_complete"]), ([], True))
+        # Names and detail are separate questions: this excerpt keeps libtest's real summary (63 failed) and 2 names.
+        self.assertEqual((doc["failed_in_summary"], doc["names_complete"]), (63, False))
+
+    def test_real_captured_output_blocks_end_each_panic_message(self):
+        doc = self.produce("\n".join(WIN_LOG_BLOCKS) + "\n", 101)
+        self.assertEqual((doc["panic_headers_seen"], doc["panic_headers_parsed"]), (2, 2))
+        first, second = doc["panics"]
+        self.assertEqual((first["thread_id"], first["message"]),
+                         ("16616", "assertion failed: matches!(collect(&s, &mut frame), Collected::Frame)"))
+        self.assertEqual(second["thread_id"], "27696")
+        self.assertTrue(second["message"].endswith('  left: String("unknown")\n right: "working"'), second["message"][-80:])
+
+    def test_an_unread_header_form_is_reported_not_dropped(self):
+        line = "thread 'x::y' [id 5] panicked at src\\a.rs:1:2:"
+        doc = self.produce("test x::y ... \n" + line + "\nboom\nFAILED\n", 101)
+        self.assertEqual((doc["panic_headers_seen"], doc["panic_headers_parsed"], doc["panic_headers_unparsed"]), (1, 0, [line]))
+        self.assertEqual((doc["panic_detail_complete"], doc["failed_tests_without_panic"]), (False, ["x::y"]))
+
 
 if __name__ == "__main__":
     unittest.main()

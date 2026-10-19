@@ -367,6 +367,107 @@ jobs:
           mkdir -p "$CYSD_DIR"
           date +%s > "$CYSD_DIR/start"
           LOG="$CYSD_DIR/cargo.log"
+          # ★(0.14.52 · CI-RED-FIX-PREP · CEO) The FULL failure list goes into the uploaded artifact (win-health-json →
+          #   win-cysd-failures.json): every failed test name and every panic's location and message, not only the 20-line tail
+          #   below. The parser is written to the step folder first, so the reader step can run it when a timeout cuts this
+          #   step (the trap below did not fire on a real cut). It never changes this step's exit code.
+          FAILS_JSON="${GITHUB_WORKSPACE:-$PWD}/win-cysd-failures.json"
+          rm -f "$FAILS_JSON"
+          cat > "$CYSD_DIR/failures.py" <<'PY'
+          import json, re, sys
+          log, status, out = sys.argv[1], sys.argv[2], sys.argv[3]
+          try:
+              with open(log, encoding="utf-8", errors="replace") as f:
+                  text = f.read()
+              readable = True
+          except OSError:
+              text, readable = "", False
+          TEST = re.compile(r"^test (\S+) \.\.\. ?(.*)$")
+          # --nocapture: a panic header often follows `test X ... ` on the same line, so it is searched, not anchored.
+          # Current toolchains put the numeric thread id after the name (real windows-health log, 2026-10-19:
+          # `thread 'activity_tests::exited_seat_serializes_unknown' (12296) panicked at src\bin\cysd\activity_tests.rs:658:5:`);
+          # older ones do not, and the oldest put the message on the header line. All three are read.
+          PANIC = re.compile(r"thread '([^']*)'(?: \((\d+)\))? panicked at (.+:\d+:\d+):$")
+          PANIC_OLD = re.compile(r"thread '([^']*)'(?: \((\d+)\))? panicked at '(.*)', (.+:\d+:\d+)$")
+          # Coverage is measured against a looser header test, so a header form none of the above reads shows up as unparsed.
+          SEEN = re.compile(r"thread '[^']*'.*? panicked at ")
+          NAME = re.compile(r"^    ([A-Za-z_][A-Za-z0-9_:]*)$")
+          summary, verdict, section, panics, seen, unparsed = None, [], [], [], 0, []
+          current, in_section, panic = None, False, None
+          for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+              if panic is not None:
+                  # a message may hold blank lines (screen dumps), so a blank line does not end it
+                  ends = (line.startswith(("note: ", "stack backtrace:", "test result:")) or line in ("failures:", "FAILED", "ok")
+                          or (line.startswith("---- ") and line.endswith(" ----"))   # next captured-output block
+                          or TEST.match(line) or SEEN.search(line))
+                  if not ends:
+                      panic["message"].append(line)
+                      continue
+                  panic["message"] = "\n".join(panic["message"]).rstrip("\n")
+                  panics.append(panic)
+                  panic = None
+              t = TEST.match(line)
+              if t:
+                  current, rest = t.group(1), t.group(2).rstrip()
+              if SEEN.search(line):
+                  seen += 1
+                  m = PANIC.search(line)
+                  if m:
+                      panic = {"thread": m.group(1), "thread_id": m.group(2), "location": m.group(3), "message": []}
+                      continue
+                  m = PANIC_OLD.search(line)
+                  if m:
+                      panics.append({"thread": m.group(1), "thread_id": m.group(2), "location": m.group(4), "message": m.group(3)})
+                      continue
+                  unparsed.append(line)
+              if line.startswith("test result:"):
+                  summary, in_section = line.strip(), False
+                  continue
+              if line == "failures:":
+                  in_section, section = True, []   # libtest's last failures: block holds the names
+                  continue
+              if in_section:
+                  m = NAME.match(line)
+                  if m:
+                      section.append(m.group(1))
+                  continue
+              if t:
+                  if rest.endswith("FAILED"):
+                      verdict.append(current)
+                      current = None
+                  elif rest.endswith(("ok", "ignored")):
+                      current = None
+                  continue
+              if current is not None and line.rstrip().endswith("FAILED"):   # --nocapture: verdict after the test's output
+                  verdict.append(current)
+                  current = None
+          if panic is not None:
+              panic["message"] = "\n".join(panic["message"]).rstrip("\n")
+              panics.append(panic)
+          m = re.search(r"(\d+) failed", summary or "")
+          failed_in_summary = int(m.group(1)) if m else None
+          # a finished run: libtest's own failures: list; a cut run: the FAILED verdicts seen before the cut
+          failed = sorted(set(section) if summary is not None else set(verdict))
+          threads = {p["thread"] for p in panics}
+          # Two separate questions: are the NAMES complete (libtest's list matches its own count), and is the panic DETAIL
+          # complete (every header line was read; which failed tests have no panic record - a test can also fail without one).
+          doc = {"schema": "cysd-win-failures/2", "log": log, "log_readable": readable, "status": status,
+                 "cut": status == "cut", "summary": summary, "failed_in_summary": failed_in_summary,
+                 "names_complete": failed_in_summary is not None and failed_in_summary == len(set(section)),
+                 "failed_tests": failed, "failures_section": section, "failed_verdict_lines": list(dict.fromkeys(verdict)),
+                 "panic_headers_seen": seen, "panic_headers_parsed": len(panics), "panic_headers_unparsed": unparsed,
+                 "panic_detail_complete": seen == len(panics),
+                 "failed_tests_without_panic": [n for n in failed if n not in threads],
+                 "panics": panics}
+          with open(out, "w", encoding="utf-8") as f:
+              json.dump(doc, f, ensure_ascii=False, indent=1)
+          PY
+          write_failures() {
+            local py=python
+            if command -v python3 >/dev/null 2>&1; then py=python3; fi
+            PYTHONDONTWRITEBYTECODE=1 "$py" "$CYSD_DIR/failures.py" "$LOG" "$1" "$FAILS_JSON" \
+              || echo "::warning title=cysd-win 실패 목록::win-cysd-failures.json 을 쓰지 못했다 — 실패 목록은 cargo.log 원문에만 있다"
+          }
           # ★절단 대비 트랩 — ★★실측으로 **발동하지 않았다**(run 33944971633 · 30.1분 절단 ·
           #   주석은 GitHub 자체 "timed out after 30 minutes" 한 줄뿐 · 아래 on_cut 산출 0건).
           #   기전 추정: GitHub 의 타임아웃은 프로세스(그룹)를 강하게 죽이고, bash 트랩은 **명령
@@ -381,6 +482,7 @@ jobs:
           on_cut() {
             echo "::error title=cysd-win 절단::타임아웃으로 잘렸다 — 아래가 로그 마지막 25줄이다(멈춘 검체명이 여기 있다)"
             tail -25 "$LOG" 2>/dev/null | sed 's/^/::error title=cysd-win 꼬리::/'
+            write_failures cut
             exit 124
           }
           trap on_cut TERM INT
@@ -419,6 +521,7 @@ jobs:
           CYS_PACK_DIR="$(mktemp -d)" cargo test --bin cysd -- --test-threads=1 --nocapture --skip hwmon::tests::snapshot_has_all_sections --skip attach_race_tests::process_and_send_are_atomic_under_parser_lock_no_dup_delivery 2>&1 | tee "$LOG"
           rc="${PIPESTATUS[0]}"
           echo "$rc" > "$CYSD_DIR/rc"
+          write_failures "$rc"
           [ "$rc" -eq 0 ] && exit 0
           echo "::error title=cysd-win 실패::rc=$rc — 아래 꼬리 20줄이 원문이다"
           tail -20 "$LOG" | sed 's/^/::error title=cysd-win 로그::/'
@@ -471,6 +574,15 @@ jobs:
           outcome="${CYSD_OUTCOME:-unknown}"
           start="$(cat "$D/start" 2>/dev/null)"
           rc="$(cat "$D/rc" 2>/dev/null)"
+          # ★(0.14.52 · CI-RED-FIX-PREP) A timeout cut ends the cysd step before it writes the full failure list; write it here
+          #   from the partial log with status "cut", using the parser that step left in its folder (absent = step never ran).
+          FAILS_JSON="${GITHUB_WORKSPACE:-$PWD}/win-cysd-failures.json"
+          if [ ! -f "$FAILS_JSON" ] && [ -f "$D/failures.py" ]; then
+            py=python
+            if command -v python3 >/dev/null 2>&1; then py=python3; fi
+            PYTHONDONTWRITEBYTECODE=1 "$py" "$D/failures.py" "$LOG" "${rc:-cut}" "$FAILS_JSON" \
+              || echo "::warning title=cysd-win 실패 목록::win-cysd-failures.json 을 쓰지 못했다 — 실패 목록은 cargo.log 원문에만 있다"
+          fi
           if [ -n "$start" ]; then
             el_s=$(( $(date +%s) - start ))
             el="$(( el_s / 60 ))분 $(( el_s % 60 ))초"
@@ -893,7 +1005,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: win-health-json
-          path: win-health.json
+          # win-cysd-failures.json: the full cysd-win failure list (every failed test, every panic location and message)
+          path: |
+            win-health.json
+            win-cysd-failures.json
           if-no-files-found: warn
 
       # ── 0.14.50 T-50-P2 Unit C(측정 전용 · 고치지 않는다): `queue list --help` 시험이 윈도우에서 스택을 넘겼다. 시험 하네스

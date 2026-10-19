@@ -6468,7 +6468,8 @@ def h_auth_selfloop():
          앞이면 좌석 승계·멱등 재사용까지 막혀 살아 있는 좌석의 부활이 잠기고, 뒤면 PTY 가
          이미 태어나 관문 화면이 킬체인의 첫 칸이 된다.
       ⓒ **합류 1지점.** PTY 스폰 함수의 호출부가 `state.rs`(정의·테스트 래퍼)와 `handlers.rs`
-         밖으로 새면 이 게이트는 조용히 무력화된다.
+         밖으로 새면 이 게이트는 조용히 무력화된다. (0.14.52) Counted in production code only;
+         test fixtures are left out, and negative controls show a second production caller is seen.
       ⓓ **거부의 귀결은 close 가 아니다.** 거부 경로에 좌석을 죽이는 어휘가 없어야 한다(재난④).
       ⓔ **오살 방어.** `config_only` 증거·귀속 실패·낡음·config 변경은 전부 통과다. V-g 실측에서
          api_key 로 인증된 프로필과 미인증 프로필의 `.claude.json` 은 **동일**했다 — config 만
@@ -6509,17 +6510,87 @@ def h_auth_selfloop():
     notes.append("자리: 예약<특권<멱등<한도<인증<스폰")
 
     # ── ⓒ PTY 스폰 합류 1지점 ────────────────────────────────────────────────
+    #   ★(0.14.52 · CI-RED-FIX-PREP) Production code only. Test fixtures that need a real surface
+    #   call the spawn function too (pty_admission_tests.rs, checked_submit_sender_tests.rs,
+    #   receipt_framing_tests.rs, c8_dormancy_proof_tests.rs); they are not seat paths, and a scan
+    #   that counts them only goes red on every new fixture. The production pins are as strict as
+    #   before and one is added: exactly one call outside the definition file (handlers.rs,
+    #   surface.create), the state.rs wrapper `create_surface(` called by no production code, and
+    #   no `*_tests.rs` file declared from production code (that would put a "test" file's calls
+    #   into production unseen).
     cysd_dir = os.path.join(REPO_DIR, "src", "bin", "cysd")
-    spawners = sorted(f for f in os.listdir(cysd_dir)
-                      if f.endswith(".rs")
-                      and "create_surface_with_env(" in _read(os.path.join(cysd_dir, f)))
-    need(spawners == ["handlers.rs", "state.rs"],
-         "★PTY 스폰 함수의 소비 파일이 늘었다(%s) — 좌석 생성 다섯 경로가 `surface.create` 로 "
-         "합류한다는 전제가 깨지면 이 인증 게이트는 조용히 새고, 미인증 프로필이 그 새 경로로 "
-         "좌석을 얻는다" % spawners)
+    sources = {f: _read(os.path.join(cysd_dir, f))
+               for f in sorted(os.listdir(cysd_dir)) if f.endswith(".rs")}
+    nested = sorted(os.path.relpath(os.path.join(r, f), cysd_dir) for r, _d, fs in os.walk(cysd_dir)
+                    if r != cysd_dir for f in fs if f.endswith(".rs"))
+    need(not nested, "src/bin/cysd 아래 하위 폴더의 Rust 파일은 이 스캔이 읽지 않는다(%s) — 스캔을 넓혀라" % nested)
+
+    def _breaches(v):
+        out = []
+        if v["test_files_in_production"]:
+            out.append("production code declares test files %s — their calls are production calls"
+                       % v["test_files_in_production"])
+        if v["spawner_files"] != ["handlers.rs", "state.rs"]:
+            out.append("★PTY 스폰 함수의 소비 파일이 늘었다(%s) — 좌석 생성 다섯 경로가 `surface.create` 로 "
+                       "합류한다는 전제가 깨지면 이 인증 게이트는 조용히 새고, 미인증 프로필이 그 새 경로로 "
+                       "좌석을 얻는다" % v["spawner_files"])
+        if v["calls"] != {"handlers.rs": 1, "state.rs": 1}:
+            out.append("production spawn calls %s, expected handlers.rs 1 (surface.create) + state.rs 1 "
+                       "(the create_surface wrapper) — a second production caller bypasses the gate"
+                       % v["calls"])
+        if v["wrapper_calls"]:
+            out.append("production code calls the create_surface wrapper %s — a spawn path outside "
+                       "surface.create" % v["wrapper_calls"])
+        return out
+
+    sites = _cysd_spawn_sites(sources)
+    need(len(sites["test_files"]) >= 4 and sites["items_cut"] >= 10,
+         "계측 무효: test code was not recognised (%d *_tests.rs, %d cfg(test) items cut)"
+         % (len(sites["test_files"]), sites["items_cut"]))
+    breaches = _breaches(sites)
+    need(not breaches, " · ".join(breaches))
     need(hnd_prod.count(".create_surface_with_env(") == 1,
          "handlers.rs 프로덕션 영역의 PTY 스폰 호출이 1건이 아니다(게이트 우회 경로 발생)")
-    notes.append("스폰 합류 1지점(state.rs 정의 + handlers.rs 호출 1건)")
+    # Negative controls on the real sources: each second production caller must be seen, and
+    # test-only callers must not. A scan that leaves out test code is otherwise free to leave out
+    # production code too, and these are the shapes that would hide it.
+    probe = "\nfn __probe(d: &std::sync::Arc<DaemonState>) {\n    let _ = d.create_surface_with_env(None, None, None, None, 24, 80, &[], None);\n}\n"
+    cases = (
+        ("second caller in a new production file", {"seat_bypass.rs": probe}, True),
+        ("second caller in handlers.rs after its test modules",
+         {"handlers.rs": sources["handlers.rs"] + probe}, True),
+        ("second caller after a string and a comment holding `{` and `#[cfg(test)]`",
+         {"seat_bypass.rs": 'const S: &str = "} #[cfg(test)] {"; // }\n/* #[cfg(test)] { */' + probe}, True),
+        ("second caller in the match arm after a cfg(test) arm",
+         {"seat_bypass.rs": "\nfn __m(d: &std::sync::Arc<DaemonState>, x: u8) { match x {\n    #[cfg(test)]\n"
+                            "    0 => (),\n    _ => { let _ = d.create_surface_with_env(None, None, None, None, "
+                            "24, 80, &[], None); }\n} }\n"}, True),
+        ("production call to the create_surface wrapper",
+         {"seat_bypass.rs": "\nfn __w(d: &std::sync::Arc<DaemonState>) { let _ = d.create_surface(None, None, None, None, 24, 80); }\n"}, True),
+        ("a *_tests.rs file declared from production code",
+         {"main.rs": sources["main.rs"] + "\nmod seat_bypass_tests;\n", "seat_bypass_tests.rs": probe}, True),
+        ("a *_tests.rs file declared from production through #[path]",
+         {"main.rs": sources["main.rs"] + "\n#[path = \"seat_bypass_tests.rs\"]\nmod helpers;\n", "seat_bypass_tests.rs": probe}, True),
+        ("second production use in handlers.rs as a method value (no call parentheses)",
+         {"handlers.rs": sources["handlers.rs"] + "\nfn __v() { let _f = DaemonState::create_surface_with_env; }\n"}, True),
+        ("not a call: the names in a production comment and a string",
+         {"seat_bypass.rs": "\n// d.create_surface_with_env(None, ..) and create_surface(\n"
+                            "const M: &str = \"d.create_surface(None)\";\n"}, False),
+        ("test-only caller: cfg(test) fn in a production file",
+         {"seat_bypass.rs": "\n#[cfg(test)]" + probe}, False),
+        ("test-only caller: cfg(all(test, unix)) module",
+         {"seat_bypass.rs": "\n#[cfg(all(test, unix))]\nmod t {" + probe + "}\n"}, False),
+        ("test-only caller: *_tests.rs declared only from test code",
+         {"main.rs": sources["main.rs"] + "\n#[cfg(test)]\nmod seat_bypass_tests;\n", "seat_bypass_tests.rs": probe}, False),
+    )
+    for label, change, must_fail in cases:
+        got = bool(_breaches(_cysd_spawn_sites(dict(sources, **change))))
+        need(got == must_fail,
+             "계측 타당성 실패(H-AUTH-SELFLOOP ⓒ): %s → %s, expected %s"
+             % (label, "red" if got else "green", "red" if must_fail else "green"))
+    notes.append("스폰 합류 1지점(state.rs 정의 + 래퍼 1 · handlers.rs 호출 1건 · 프로덕션 코드만 · "
+                 "test 파일 %d · cfg(test) 항목 %d 제외 · 음성 대조 %d종)"
+                 % (len(sites["test_files"]), sites["items_cut"], len(cases)))
 
     # ── ⓐ 자기 발화 루프 0 ───────────────────────────────────────────────────
     # 생산 룰 정규식을 state.rs 본문에서 뽑는다(사본 정규식이면 검체가 사문화된다).
@@ -7080,7 +7151,15 @@ def h_pred_8():
              "판정부에 개수 비교 구현 흔적(%s) — 이사한 자리에서 금지가 풀렸다" % banned)
     notes.append("개수 비교 구현 0(배선·판정부)")
     # ⓔ 잔존 ❯ 시나리오 순수 판정: 꼬리가 셸 프롬프트면 폴백이 발화하지 않는다
-    need("t.ends_with('❯')" in src, "셸 프롬프트 가드가 ❯ 를 인식하지 않는다")
+    #   ★(0.14.52) The guard body lives in src/terminal_screen.rs since 0e92e1b1; cys.rs only calls it.
+    #   Pin both halves: the ❯ terminator where the body is, and the call that makes cys.rs use it.
+    screen = _slice_between(_scan_source("terminal_screen"), "pub fn screen_tail_is_shell_prompt_on(",
+                            "\n}\n", "H-PRED-8 셸 프롬프트 술어 본체")
+    need("t.ends_with('❯')" in screen, "셸 프롬프트 가드가 ❯ 를 인식하지 않는다")
+    wrapper = _slice_between(src, "fn screen_tail_is_shell_prompt(text: &str) -> bool {", "\n}\n",
+                             "H-PRED-8 cys.rs 셸 프롬프트 가드")
+    need("screen_tail_is_shell_prompt_on(text, cfg!(windows))" in wrapper,
+         "cys.rs 의 셸 프롬프트 가드가 terminal_screen 의 본체를 부르지 않는다 — ❯ 핀이 쓰이지 않는 사본을 잰다")
     # ⓕ line_count 가 surface.list 에 노출됨(커서 원천)
     hnd = _repo_file(os.path.join("src", "bin", "cysd", "handlers.rs"))
     need(hnd.count('"line_count"') >= 2, "surface.list 에 line_count 커서가 노출되지 않는다")
@@ -7885,6 +7964,11 @@ SCAN_TARGETS = {
     #   등재하는 이유: 이 경로를 검체가 직접 들면 파일이 이사할 때 그 핀만 조용히 죽는다.
     #   B3-3 이 fence·progress 상수를 더 넣을 자리이므로 독자가 늘기 전에 소유를 여기로 모은다.
     "boot_supervisor": (os.path.join("src", "bin", "cysd", "boot_supervisor.rs"),),
+    # ★(0.14.52 · CI-RED-FIX-PREP) Current-screen shell predicates. 0e92e1b1 moved the body of
+    #   `screen_tail_is_shell_prompt` out of cys.rs into this file; cys.rs keeps only the call.
+    #   A name of its own, not a third part of `readiness`: H-READY-13 ⓓ needs readiness.rs to stay
+    #   the last part of that join (see the `inject_guard` note above).
+    "terminal_screen": (os.path.join("src", "terminal_screen.rs"),),
 }
 
 # 레지스트리를 소비한다고 **선언**한 검체 → 논리 이름. H-META-PIN 이 실제 배선과 대조한다.
@@ -7973,6 +8057,208 @@ def _slice_between(src, start, end, where):
     need(_SCAN_JOIN not in seg,
          "%s: 슬라이스가 SCAN_TARGETS 파일 경계를 넘었다 — 핀 대상이 뒤섞인다" % where)
     return seg
+
+
+# ★(0.14.52 · CI-RED-FIX-PREP) Lexical cut of Rust test code, for scans that must see production
+#   code only (H-AUTH-SELFLOOP). Every error it can make must be a false RED, never a hidden
+#   production line: it cuts only an item that a `#[cfg(test)]` or `#[cfg(all(.., test, ..))]`
+#   attribute puts in item or statement position (after `;`, `{`, `}` or the file start), and the
+#   cut ends no later than the item's own end. Comments, strings and char literals are skipped
+#   whole, so a `{` or `#[cfg(test)]` inside them changes nothing.
+_RUST_RAW_STR = re.compile(r'b?r(#*)"')
+_RUST_LEAD_WORD = re.compile(r"(?:\s|#\[[^\]]*\]|//[^\n]*\n)*([A-Za-z_][A-Za-z0-9_]*)")
+# Items led by these words end only at `;` or at the end of their block; a `,` at depth 0 in them
+# (`Result<A, B>`) is inside `<..>`, which the cut does not track. Arms and fields end at `,` too.
+_RUST_ITEM_WORDS = frozenset((
+    "pub", "fn", "mod", "struct", "enum", "union", "impl", "use", "const", "static", "type",
+    "trait", "macro_rules", "extern", "unsafe", "async", "let", "if", "match", "for", "while",
+    "loop", "return"))
+
+
+def _rust_literal_end(src, i):
+    """If a comment, string or char literal starts at `i`, the index after it; else None."""
+    n = len(src)
+    if src.startswith("//", i):
+        j = src.find("\n", i)
+        return n if j < 0 else j
+    if src.startswith("/*", i):
+        depth, j = 0, i
+        while j < n:
+            if src.startswith("/*", j):
+                depth, j = depth + 1, j + 2
+            elif src.startswith("*/", j):
+                depth, j = depth - 1, j + 2
+                if depth == 0:
+                    return j
+            else:
+                j += 1
+        return n
+    word_before = i > 0 and (src[i - 1].isalnum() or src[i - 1] == "_")
+    m = _RUST_RAW_STR.match(src, i)
+    if m and not word_before:
+        close = '"' + m.group(1)
+        j = src.find(close, m.end())
+        return n if j < 0 else j + len(close)
+    if src[i] == '"' or (src.startswith('b"', i) and not word_before):
+        j = i + (2 if src[i] == "b" else 1)
+        while j < n:
+            if src[j] == "\\":
+                j += 2
+            elif src[j] == '"':
+                return j + 1
+            else:
+                j += 1
+        return n
+    if src[i] == "'":
+        if src.startswith("\\", i + 1):
+            j = src.find("'", i + 2)
+            return n if j < 0 else j + 1
+        if i + 2 < n and src[i + 2] == "'":
+            return i + 3
+    return None   # code, or a lifetime ('a)
+
+
+def _rust_cfg_is_test_only(attr):
+    """`attr` is the text inside `#[..]`. True only for cfg(test) and cfg(all(.., test, ..))."""
+    a = re.sub(r"\s+", "", attr)
+    if a == "cfg(test)":
+        return True
+    m = re.fullmatch(r"cfg\(all\((.*)\)\)", a)
+    if not m:
+        return False   # cfg(any(test, ..)), cfg(not(test)), cfg_attr(..): production, not cut
+    parts, depth, cur = [], 0, ""
+    for ch in m.group(1):
+        depth += (ch == "(") - (ch == ")")
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    return "test" in parts + [cur]
+
+
+def _rust_strip_cfg_test(src):
+    """`src` without its test-only items, and the number of items cut. A file whose inner
+    attribute is `#![cfg(test)]` is test code as a whole."""
+    if re.match(r"(?:\s|//[^\n]*\n|/\*.*?\*/)*#!\[\s*cfg\(\s*test\s*\)\s*\]", src, re.S):
+        return "", 1
+    n, i, out, last, cut = len(src), 0, [], ";", 0
+    while i < n:
+        j = _rust_literal_end(src, i)
+        if j is not None:
+            out.append(src[i:j])
+            i = j
+            continue
+        if not src.startswith("#[", i):
+            out.append(src[i])
+            if not src[i].isspace():
+                last = src[i]
+            i += 1
+            continue
+        k, depth = i + 1, 0
+        while k < n:
+            jj = _rust_literal_end(src, k)
+            if jj is not None:
+                k = jj
+                continue
+            depth += (src[k] == "[") - (src[k] == "]")
+            if depth == 0:
+                break
+            k += 1
+        if not (_rust_cfg_is_test_only(src[i + 2:k]) and last in ";{}"):
+            out.append(src[i:k + 1])   # any other attribute is kept and does not move `last`
+            i = k + 1
+            continue
+        lead = _RUST_LEAD_WORD.match(src, k + 1)
+        item_word = bool(lead) and lead.group(1) in _RUST_ITEM_WORDS
+        p, d, end = k + 1, 0, n
+        while p < n:
+            jj = _rust_literal_end(src, p)
+            if jj is not None:
+                p = jj
+                continue
+            ch = src[p]
+            if ch in "([{":
+                d += 1
+            elif ch in ")]}":
+                if d == 0:
+                    end = p        # the enclosing list or block ends here: not part of the item
+                    break
+                d -= 1
+                if d == 0 and ch == "}":
+                    end = p + 1
+                    break
+            elif d == 0 and (ch == ";" or (ch == "," and not item_word)):
+                end = p + 1
+                break
+            p += 1
+        cut += 1
+        i, last = end, ";"
+    return "".join(out), cut
+
+
+def _rust_code_only(src, keep_strings=False):
+    """`src` with comments blanked, and string/char contents blanked unless `keep_strings`, so a
+    name in a comment or a message is not read as a call."""
+    out, i, n = [], 0, len(src)
+    while i < n:
+        j = _rust_literal_end(src, i)
+        if j is None:
+            out.append(src[i])
+            i += 1
+            continue
+        if src.startswith("//", i) or src.startswith("/*", i):
+            out.append(" ")
+        elif keep_strings or src[i] == "'":
+            out.append(src[i:j] if keep_strings else "' '")
+        else:
+            out.append('""')
+        i = j
+    return "".join(out)
+
+
+_SPAWN_VIEW_CACHE = {}
+
+
+def _cysd_spawn_sites(sources):
+    """PTY spawn sites in the production code of src/bin/cysd. `sources` maps file name -> text.
+
+    Test code is left out in two ways: a `*_tests.rs` file (pinned below to be declared only from
+    test code), and `#[cfg(test)]` items inside any other file (`_rust_strip_cfg_test`). Calls are
+    counted in code only: a name in a comment or a string is not a call (`_rust_code_only`).
+    Returns the production view the H-AUTH-SELFLOOP pins read:
+      spawner_files  - files whose production code names `create_surface_with_env`
+      calls          - file -> number of mentions outside its `fn` definition (call or method value)
+      wrapper_calls  - file -> calls to the `create_surface(` wrapper (state.rs), which spawns too
+      test_files_in_production - `*_tests.rs` files that production code declares (mod or include!)
+    """
+    prod, decl_view, cuts = {}, {}, 0
+    for name, text in sources.items():
+        if not name.endswith("_tests.rs"):
+            key = (name, text)
+            if key not in _SPAWN_VIEW_CACHE:   # the negative controls change one file at a time
+                stripped, k = _rust_strip_cfg_test(text)
+                _SPAWN_VIEW_CACHE[key] = (_rust_code_only(stripped), k,
+                                          _rust_code_only(stripped, keep_strings=True))  # include!("..") needs its string
+            prod[name], k, decl_view[name] = _SPAWN_VIEW_CACHE[key]
+            cuts += k
+    declared = []
+    for name in sorted(f for f in sources if f.endswith("_tests.rs")):
+        # `mod x_tests;`, or any production string naming the file: `include!("x_tests.rs")`, `#[path = "x_tests.rs"]`
+        rx = re.compile(r"\bmod\s+%s\s*[;{]|\"(?:[^\"\n]*[/\\\\])?%s\"" % (re.escape(name[:-3]), re.escape(name)))
+        declared += ["%s (in %s)" % (name, f) for f, text in sorted(decl_view.items()) if rx.search(text)]
+    calls, wrapper = {}, {}
+    for name, text in sorted(prod.items()):
+        c = len(re.findall(r"(?<!fn )\bcreate_surface_with_env\b", text))   # a mention: call or method value
+        w = len(re.findall(r"(?<!fn )\bcreate_surface\b", text))
+        if c:
+            calls[name] = c
+        if w:
+            wrapper[name] = w
+    spawners = sorted(f for f, text in prod.items() if re.search(r"\bcreate_surface_with_env\b", text))
+    return {"spawner_files": spawners, "calls": calls, "wrapper_calls": wrapper,
+            "test_files_in_production": declared, "items_cut": cuts,
+            "test_files": sorted(f for f in sources if f.endswith("_tests.rs"))}
 
 
 def _no_wait_for_owner(text, where):
