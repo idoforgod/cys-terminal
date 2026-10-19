@@ -5487,15 +5487,55 @@ async fn start_surface_stream(
     Ok(())
 }
 
-/// 데몬 소켓이 준비될 때까지 connect를 폴링(수동 spawn 없음). `attempts`×100ms.
-async fn wait_for_connect(attempts: u32) -> bool {
-    for _ in 0..attempts {
-        if connect().await.is_ok() {
+/// ★C (0.14.52 update repair, design rev9 section 0): the deadline of one readiness probe.
+const DAEMON_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Why one `system.identify` probe did not answer. Only `TimedOut` is the hung shape (the socket accepts, the
+/// daemon never replies); a refused connect, a missing socket or an error reply is `Failed`.
+#[derive(Debug, PartialEq)]
+enum IdentifyMiss {
+    TimedOut,
+    Failed,
+}
+
+/// ★C: one `system.identify` on a private single-use connection (`rpc_oneshot`, never the pooled one) within
+/// `deadline`. On timeout the future is dropped and its connection closes with it, so the shared pool (conn_cell)
+/// is not desynchronized. This function and the two below only judge: "no answer" leads only to the caller's
+/// existing not-ready path (CEO ruling 5, absolute condition; `c_probe_and_a2_never_stop_a_process_source_pin`).
+async fn identify_within(
+    socket: &std::path::Path,
+    deadline: std::time::Duration,
+) -> Result<Value, IdentifyMiss> {
+    match tokio::time::timeout(deadline, rpc_oneshot(socket, "system.identify", json!({}))).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err(IdentifyMiss::Failed),
+        Err(_) => Err(IdentifyMiss::TimedOut),
+    }
+}
+
+/// ★C (row 3): does the daemon ANSWER (not: does the socket accept). Only the REPLY-HEALTH rows of the design table
+/// (3, 4, 5; CLI row 7) use this; row 2 (launchd autoregister `running`) and CLI rows 6 and 10 keep connect().
+async fn daemon_answers(socket: &std::path::Path) -> bool {
+    identify_within(socket, DAEMON_ANSWER_DEADLINE).await.is_ok()
+}
+
+/// ★C (rows 4, 5): poll until the daemon answers (no spawn here). The total budget is `attempts` x 100 ms, the same
+/// budget the removed `wait_for_connect` had; each try is one identify bounded by the smaller of the time left and
+/// 2 s, so a hung daemon also ends in `false` inside the budget. Design row 1: the old helper served only rows 4
+/// and 5, so the call sites changed and the presence helper was removed rather than given a new meaning.
+async fn wait_for_answer(socket: &std::path::Path, attempts: u32) -> bool {
+    let budget = std::time::Duration::from_millis(100 * u64::from(attempts));
+    let started = std::time::Instant::now();
+    loop {
+        let left = budget.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return false;
+        }
+        if identify_within(socket, left.min(DAEMON_ANSWER_DEADLINE)).await.is_ok() {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    false
 }
 
 /// 앱 첫 실행 시 cysd를 launchd에 자동등록(RunAtLoad·KeepAlive) — 재부팅 후에도 데몬 생존.
@@ -5698,7 +5738,9 @@ fn inject_runtime_path(cmd: &mut std::process::Command) {
 
 /// Ensure aitermd is running: try to connect, otherwise spawn the bundled/sibling binary.
 async fn ensure_daemon() -> Result<(), String> {
-    if connect().await.is_ok() {
+    // ★C (row 3): ready = answers identify within 2 s, not "the socket accepts". A hung holder now falls through to
+    // the spawn path below; a spawned cysd yields to a holder with a fresh heartbeat (design rev9 section 0).
+    if daemon_answers(&default_socket()).await {
         return Ok(());
     }
     // ★A3(성찰 확정): 완전 초기화 진행 중에는 데몬을 스폰하지 않는다 — 이 경로가 리셋 도중
@@ -5761,7 +5803,8 @@ async fn ensure_daemon() -> Result<(), String> {
     command
         .spawn()
         .map_err(|e| format!("failed to start cysd ({}): {e}", program.display()))?;
-    if wait_for_connect(40).await {
+    // ★C (row 4): GUI readiness after a spawn = the daemon answers (same 4 s budget as before).
+    if wait_for_answer(&default_socket(), 40).await {
         Ok(())
     } else {
         Err("cysd did not come up within 4s".into())
@@ -7697,17 +7740,34 @@ async fn live_session_count() -> Result<u64, String> {
     Ok(n)
 }
 
+/// ★A1 (0.14.52 update repair, design rev9 section 0): the session guard of `install_update`. With `force` true the
+/// count is not asked at all: its only use was `sessions > 0 && !force`, so with force true the value was discarded,
+/// and on a hung daemon that rpc (pooled, no deadline) stopped the whole update. With `force` false the behaviour is
+/// the base behaviour byte for byte: a live session refuses with `live_sessions:N`, a failed count folds to 0, and a
+/// hung daemon still blocks here (bounding it would change the force:false contract; not approved, backlog).
+async fn update_session_guard<F, Fut>(force: bool, count: F) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<u64, String>>,
+{
+    if force {
+        return Ok(());
+    }
+    let sessions = count().await.unwrap_or(0);
+    if sessions > 0 {
+        return Err(format!("live_sessions:{sessions}"));
+    }
+    Ok(())
+}
+
 /// 업데이트 다운로드·설치 후 데몬 핸드오프 + 재시작.
 /// force=false: 살아있는 세션이 있으면 설치 전에 거부(UI가 확인 후 force=true로 재호출).
 /// ★재배선(오너 2026-07-15): 본체 패치(인앱) 설치 경로 재활성화 — UI promptBinaryPatch가 호출한다
 ///   (구 T5 홈페이지 전용 정책의 실험적 개정 · 실기기 검증 대상). 아래 app.restart() 레이스 경고 참조.
 #[tauri::command]
 async fn install_update(app: AppHandle, force: bool) -> Result<(), String> {
-    // 1) 세션 가드 (오너 정책: 없으면 자동·있으면 확인)
-    let sessions = live_session_count().await.unwrap_or(0);
-    if sessions > 0 && !force {
-        return Err(format!("live_sessions:{sessions}"));
-    }
+    // 1) 세션 가드 (오너 정책: 없으면 자동·있으면 확인) — ★A1: force=true 면 묻지 않는다(update_session_guard).
+    update_session_guard(force, live_session_count).await?;
     // 2) 업데이트 받아 설치 (.app 번들 교체 — 새 cysd/cys 동봉)
     let updater = build_updater(&app)?;
     let update = updater
@@ -8235,8 +8295,64 @@ fn scoped_pids_from_ledger_list(resp: &Value) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// ★A2 (0.14.52 update repair, design rev9 section 0): whether to stop the old daemon. It only judges; the stop
+/// itself stays where it was (the `Some(pid)` branch of `stop_running_daemon`, the normal update path).
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, PartialEq)]
+enum DaemonStopPlan {
+    /// identify answered within 2 s and named `daemon_pid`: the old path, unchanged.
+    Stop(u64),
+    /// Do not stop. `timed_out` = identify did not answer within 2 s (hung). `lock_pid` = the pid written in the
+    /// lock file at that moment, recorded for the log only: a lock-file pid is not an identity, so it is never a target.
+    Skip { timed_out: bool, lock_pid: Option<u32> },
+}
+
+/// ★A2: identify within 2 s on a private connection (`identify_within`), then decide. Mac and Linux only (the caller
+/// is `#[cfg(unix)]`); there is no fallback that acts on the lock-file pid.
+#[cfg_attr(not(unix), allow(dead_code))]
+async fn plan_daemon_stop(socket: &std::path::Path) -> DaemonStopPlan {
+    match identify_within(socket, DAEMON_ANSWER_DEADLINE).await {
+        Ok(r) => match r["daemon_pid"].as_u64() {
+            Some(pid) => DaemonStopPlan::Stop(pid),
+            None => DaemonStopPlan::Skip { timed_out: false, lock_pid: None },
+        },
+        Err(IdentifyMiss::TimedOut) => DaemonStopPlan::Skip { timed_out: true, lock_pid: lock_file_pid(socket) },
+        Err(IdentifyMiss::Failed) => DaemonStopPlan::Skip { timed_out: false, lock_pid: None },
+    }
+}
+
+/// The pid written in the lock file derived from `socket` (cysd: `socket_path.with_extension("lock")`, default
+/// cys.lock). Read only, for the log. None when absent, unreadable, unparsable or 0 (Windows writes no lock file).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn lock_file_pid(socket: &std::path::Path) -> Option<u32> {
+    std::fs::read_to_string(socket.with_extension("lock"))
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .filter(|p| *p != 0)
+}
+
 /// 구 데몬 정상 종료: system.identify로 pid를 받아 SIGTERM(unix)/taskkill(win).
+/// ★A2 (Mac/Linux): identify now has a 2 s deadline. With no answer the old daemon is left running, the lock-file
+/// pid goes to the log only, and `install_update` goes on to `app.restart()` (before: the pooled rpc had no deadline,
+/// so a hung daemon left the new bundle on disk and the app never restarted into it). The Windows branch is the base
+/// code unchanged (design rev9: A2 is Mac/Linux only; the default checked-launch route exits before this helper).
 async fn stop_running_daemon() {
+    #[cfg(unix)]
+    let pid = match plan_daemon_stop(&default_socket()).await {
+        DaemonStopPlan::Stop(pid) => Some(pid),
+        DaemonStopPlan::Skip { timed_out, lock_pid } => {
+            if timed_out {
+                eprintln!(
+                    "[cys-app] update handoff: cysd did not answer system.identify within {}s; old daemon left running, stop skipped (lock-file pid {lock_pid:?}, recorded for the log only)",
+                    DAEMON_ANSWER_DEADLINE.as_secs()
+                );
+            }
+            None
+        }
+    };
+    #[cfg(not(unix))]
     let pid = rpc("system.identify", json!({}))
         .await
         .ok()
@@ -8482,7 +8598,8 @@ fn main() {
                 // 15초 간격 백그라운드 재시도(최대 20회 ≈ 5분 — 승인 지연·느린 첫 기동 흡수)
                 // ③4회째부터 로그인 항목 안내 이벤트(daemon-retry-hint) — 생초보 가이드.
                 let mut result = if launchd_owns {
-                    if wait_for_connect(50).await {
+                    // ★C (row 5): the launchd-owned daemon is ready when it answers (same 5 s budget as before).
+                    if wait_for_answer(&default_socket(), 50).await {
                         Ok(())
                     } else {
                         eprintln!("[cys-app] launchd-owned cysd not ready in 5s — 형제 spawn 폴백");
@@ -12051,6 +12168,442 @@ exit 0
             assert!(hung.is_err(), "무응답 소켓은 timeout(Elapsed)이어야 한다");
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ───────── ★0.14.52 update repair A1 / A2 / C (design rev9 section 0) — rig daemons, never the live one ─────────
+
+    /// The shape of a rig daemon. `Responsive` answers like cysd (`system.identify` result fields as in handlers.rs;
+    /// `pid: None` leaves `daemon_pid` out; `live` = surfaces that block rotation in `surface.list`). `Hung` accepts and
+    /// reads, never answers (the design's HUNG shape). `DeadAbsent` = no socket file; `DeadStale` = a socket file
+    /// nobody listens on (connect refused).
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum RigMode {
+        Responsive { pid: Option<u64>, live: usize },
+        Hung,
+        DeadAbsent,
+        DeadStale,
+    }
+
+    /// A rig daemon on its own temp socket. `accepts` counts connections it accepted; `client_closed` counts
+    /// connections the client closed (EOF), which shows a timed-out probe dropped its private connection.
+    #[cfg(unix)]
+    struct RigDaemon {
+        dir: std::path::PathBuf,
+        sock: std::path::PathBuf,
+        accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        client_closed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[cfg(unix)]
+    fn rig_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("cys-ur-{}-{name}", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    impl RigDaemon {
+        /// Call inside `tauri::async_runtime::block_on` (the listener needs the runtime).
+        fn start(name: &str, mode: RigMode) -> RigDaemon {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use std::sync::Arc;
+            use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+            let dir = rig_dir(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let sock = dir.join("d.sock");
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let client_closed = Arc::new(AtomicUsize::new(0));
+            match mode {
+                RigMode::DeadAbsent => {}
+                RigMode::DeadStale => drop(std::os::unix::net::UnixListener::bind(&sock).unwrap()),
+                RigMode::Hung | RigMode::Responsive { .. } => {
+                    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+                    let (accepts, closed) = (accepts.clone(), client_closed.clone());
+                    tauri::async_runtime::spawn(async move {
+                        while let Ok((stream, _)) = listener.accept().await {
+                            accepts.fetch_add(1, Ordering::SeqCst);
+                            let closed = closed.clone();
+                            tauri::async_runtime::spawn(async move {
+                                let (r, mut w) = tokio::io::split(stream);
+                                let mut reader = BufReader::new(r);
+                                loop {
+                                    let mut line = String::new();
+                                    match reader.read_line(&mut line).await {
+                                        Ok(0) | Err(_) => {
+                                            closed.fetch_add(1, Ordering::SeqCst);
+                                            return;
+                                        }
+                                        Ok(_) => {}
+                                    }
+                                    // Hung: read the request, never answer.
+                                    let RigMode::Responsive { pid, live } = mode else { continue };
+                                    let req: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                                    let result = match req["method"].as_str() {
+                                        Some("system.identify") => {
+                                            let mut r = json!({"socket_path": "rig", "version": "0.0.0-rig", "started_at": 0,
+                                                               "latest_seq": 0, "surface_count": live, "caller": req["params"]["caller"].clone()});
+                                            if let Some(p) = pid {
+                                                r["daemon_pid"] = json!(p);
+                                            }
+                                            r
+                                        }
+                                        Some("surface.list") => json!({"surfaces": (0..live)
+                                            .map(|i| json!({"id": i + 1, "exited": false, "role": format!("worker-{i}")}))
+                                            .collect::<Vec<_>>()}),
+                                        _ => json!({}),
+                                    };
+                                    let mut out = serde_json::to_vec(&json!({"id": req["id"].clone(), "ok": true, "result": result})).unwrap();
+                                    out.push(b'\n');
+                                    if w.write_all(&out).await.is_err() {
+                                        return;
+                                    }
+                                    let _ = w.flush().await;
+                                }
+                            });
+                        }
+                    });
+                }
+            }
+            RigDaemon { dir, sock, accepts, client_closed }
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// ★R2-15: a hung-shape specimen must FAIL, not hang, when the deadline under test is gone. Every await that a
+    /// missing deadline would leave blocked runs under this 10 s watchdog (5x the 2 s deadline, 2.5x the 4 s budget).
+    #[cfg(unix)]
+    async fn must_end<T>(what: &str, f: impl std::future::Future<Output = T>) -> T {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), f).await {
+            Ok(v) => v,
+            Err(_) => panic!("{what} did not end within 10 s: the deadline it relies on is missing"),
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for RigDaemon {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// ★C purpose test (design rev9 sections 0 and 4, three daemon shapes): one identify probe answers a responsive rig at
+    /// once, fails fast on both dead shapes, and gives up on a hung rig at the 2 s deadline, closing its own private
+    /// connection (the shared rpc pool never gets a cell for that socket).
+    #[cfg(unix)]
+    #[test]
+    fn c_identify_probe_against_responsive_dead_and_hung_rigs() {
+        use std::time::{Duration, Instant};
+        tauri::async_runtime::block_on(async {
+            let ok = RigDaemon::start("c-ok", RigMode::Responsive { pid: Some(4242), live: 0 });
+            let absent = RigDaemon::start("c-absent", RigMode::DeadAbsent);
+            let stale = RigDaemon::start("c-stale", RigMode::DeadStale);
+            let hung = RigDaemon::start("c-hung", RigMode::Hung);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let t = Instant::now();
+            let r = identify_within(&ok.sock, DAEMON_ANSWER_DEADLINE).await;
+            assert_eq!(r.as_ref().map(|v| v["daemon_pid"].as_u64()), Ok(Some(4242)), "responsive rig: {r:?}");
+            assert!(daemon_answers(&ok.sock).await, "responsive rig must count as ready");
+            assert!(t.elapsed() < Duration::from_millis(1900), "responsive took {:?}", t.elapsed());
+
+            for d in [&absent, &stale] {
+                let t = Instant::now();
+                assert_eq!(identify_within(&d.sock, DAEMON_ANSWER_DEADLINE).await, Err(IdentifyMiss::Failed));
+                assert!(!daemon_answers(&d.sock).await, "a dead rig is not ready");
+                assert!(t.elapsed() < Duration::from_millis(1900), "dead rig {} took {:?}", d.sock.display(), t.elapsed());
+            }
+
+            let t = Instant::now();
+            assert_eq!(must_end("identify on a hung rig", identify_within(&hung.sock, DAEMON_ANSWER_DEADLINE)).await, Err(IdentifyMiss::TimedOut));
+            let took = t.elapsed();
+            assert!(
+                took >= Duration::from_millis(1900) && took < Duration::from_millis(3000),
+                "hung probe took {took:?}; the deadline is 2 s"
+            );
+            assert_eq!(hung.accepted(), 1, "the hung rig saw the probe connect");
+            let t = Instant::now();
+            while hung.client_closed.load(std::sync::atomic::Ordering::SeqCst) < 1 && t.elapsed() < Duration::from_millis(1900) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                hung.client_closed.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "the timed-out probe left its connection open"
+            );
+            let pooled = RPC_POOL.get().map(|p| p.lock().unwrap().contains_key(&hung.sock)).unwrap_or(false);
+            assert!(!pooled, "the probe must not use the shared rpc pool");
+            assert!(!must_end("daemon_answers on a hung rig", daemon_answers(&hung.sock)).await, "a hung rig is not ready");
+        });
+    }
+
+    /// ★C rows 4 and 5: `wait_for_answer` keeps the removed `wait_for_connect` budget (`attempts` x 100 ms) on every shape:
+    /// responsive at once, a daemon that binds late is still found, dead and hung end in `false` inside the budget
+    /// (hung at the production row-4 value 40 = 4 s: one 2 s try, then one 2 s try on the time left).
+    #[cfg(unix)]
+    #[test]
+    fn c_wait_for_answer_keeps_the_old_budget_on_every_daemon_shape() {
+        use std::time::{Duration, Instant};
+        tauri::async_runtime::block_on(async {
+            let ok = RigDaemon::start("w-ok", RigMode::Responsive { pid: Some(7), live: 0 });
+            let absent = RigDaemon::start("w-absent", RigMode::DeadAbsent);
+            let hung = RigDaemon::start("w-hung", RigMode::Hung);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let t = Instant::now();
+            assert!(wait_for_answer(&ok.sock, 40).await);
+            assert!(t.elapsed() < Duration::from_millis(1900), "responsive took {:?}", t.elapsed());
+
+            let t = Instant::now();
+            assert!(!wait_for_answer(&absent.sock, 10).await);
+            let took = t.elapsed();
+            assert!(took >= Duration::from_millis(950) && took < Duration::from_millis(2000), "dead, budget 1 s: {took:?}");
+
+            let t = Instant::now();
+            assert!(!must_end("wait_for_answer on a hung rig", wait_for_answer(&hung.sock, 40)).await);
+            let took = t.elapsed();
+            assert!(took >= Duration::from_millis(3900) && took < Duration::from_millis(5000), "hung, budget 4 s: {took:?}");
+
+            // A daemon that binds 300 ms after the wait starts (the post-spawn case of row 4).
+            let late_sock = rig_dir("w-late").join("d.sock");
+            let _ = std::fs::remove_dir_all(rig_dir("w-late"));
+            let late = tauri::async_runtime::spawn(async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                RigDaemon::start("w-late", RigMode::Responsive { pid: Some(8), live: 0 })
+            });
+            let t = Instant::now();
+            assert!(wait_for_answer(&late_sock, 20).await, "a daemon that binds late inside the budget is found");
+            assert!(t.elapsed() >= Duration::from_millis(300));
+            let _late = late.await.unwrap();
+        });
+    }
+
+    /// ★A1 purpose test: with force true the guard asks nothing, so no connection reaches any rig and a hung daemon cannot
+    /// block it. With force false it is the base guard on every shape, including the base's block on a hung daemon
+    /// (UNCHANGED-BLOCKS: bounding it would change the force:false contract; not approved, head 2026-10-19).
+    /// The counter is `dept_live_session_count` on the rig socket: the same rule as `live_session_count` (which is
+    /// pinned to the default socket), so a rig, never the live daemon, answers.
+    #[cfg(unix)]
+    #[test]
+    fn a1_session_guard_force_true_asks_nothing_and_force_false_is_the_base_guard() {
+        use std::time::{Duration, Instant};
+        tauri::async_runtime::block_on(async {
+            let busy = RigDaemon::start("a1-busy", RigMode::Responsive { pid: Some(11), live: 2 });
+            let idle = RigDaemon::start("a1-idle", RigMode::Responsive { pid: Some(12), live: 0 });
+            let absent = RigDaemon::start("a1-absent", RigMode::DeadAbsent);
+            let hung = RigDaemon::start("a1-hung", RigMode::Hung);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            for rig in [&busy, &idle, &absent, &hung] {
+                let t = Instant::now();
+                assert_eq!(must_end("force=true guard", update_session_guard(true, || dept_live_session_count(&rig.sock))).await, Ok(()));
+                assert!(t.elapsed() < Duration::from_millis(1900), "force=true took {:?}", t.elapsed());
+                assert_eq!(rig.accepted(), 0, "force=true must not ask the daemon at all ({})", rig.sock.display());
+            }
+
+            assert_eq!(
+                update_session_guard(false, || dept_live_session_count(&busy.sock)).await,
+                Err("live_sessions:2".to_string())
+            );
+            assert_eq!(update_session_guard(false, || dept_live_session_count(&idle.sock)).await, Ok(()));
+            assert_eq!(
+                update_session_guard(false, || dept_live_session_count(&absent.sock)).await,
+                Ok(()),
+                "base: a failed count folds to 0"
+            );
+            let blocked = tokio::time::timeout(
+                Duration::from_secs(3),
+                update_session_guard(false, || dept_live_session_count(&hung.sock)),
+            )
+            .await;
+            assert!(blocked.is_err(), "force=false on a hung daemon still blocks, as in the base: {blocked:?}");
+            assert_eq!(hung.accepted(), 1);
+        });
+    }
+
+    /// ★A2 purpose test: the stop plan names a pid only when identify answered with one; a dead daemon is skipped at
+    /// once (as in the base); a hung daemon is skipped at the 2 s deadline with the lock-file pid recorded for the log
+    /// and nothing else. `lock_file_pid` reads `<socket>.lock` (cysd: socket_path.with_extension("lock")).
+    #[cfg(unix)]
+    #[test]
+    fn a2_plan_daemon_stop_against_responsive_dead_and_hung_rigs() {
+        use std::time::{Duration, Instant};
+        tauri::async_runtime::block_on(async {
+            let ok = RigDaemon::start("a2-ok", RigMode::Responsive { pid: Some(4242), live: 0 });
+            let nopid = RigDaemon::start("a2-nopid", RigMode::Responsive { pid: None, live: 0 });
+            let absent = RigDaemon::start("a2-absent", RigMode::DeadAbsent);
+            let stale = RigDaemon::start("a2-stale", RigMode::DeadStale);
+            let hung = RigDaemon::start("a2-hung", RigMode::Hung);
+            let hung_nolock = RigDaemon::start("a2-hung-nolock", RigMode::Hung);
+            for d in [&absent, &stale, &hung] {
+                std::fs::write(d.sock.with_extension("lock"), "777").unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let t = Instant::now();
+            assert_eq!(plan_daemon_stop(&ok.sock).await, DaemonStopPlan::Stop(4242));
+            assert_eq!(plan_daemon_stop(&nopid.sock).await, DaemonStopPlan::Skip { timed_out: false, lock_pid: None });
+            for d in [&absent, &stale] {
+                assert_eq!(
+                    plan_daemon_stop(&d.sock).await,
+                    DaemonStopPlan::Skip { timed_out: false, lock_pid: None },
+                    "dead: skip, nothing recorded (base: nothing happened)"
+                );
+            }
+            assert!(t.elapsed() < Duration::from_millis(1900), "answered and dead plans took {:?}", t.elapsed());
+
+            let t = Instant::now();
+            assert_eq!(
+                must_end("plan on a hung rig", plan_daemon_stop(&hung.sock)).await,
+                DaemonStopPlan::Skip { timed_out: true, lock_pid: Some(777) }
+            );
+            let took = t.elapsed();
+            assert!(took >= Duration::from_millis(1900) && took < Duration::from_millis(3000), "hung plan took {took:?}");
+            assert_eq!(
+                must_end("plan on a hung rig", plan_daemon_stop(&hung_nolock.sock)).await,
+                DaemonStopPlan::Skip { timed_out: true, lock_pid: None }
+            );
+
+            // The lock-file reader: decimal pid with whitespace; 0, garbage, empty and absent are None.
+            let lock = hung_nolock.sock.with_extension("lock");
+            for (content, want) in [(" 123 \n", Some(123)), ("0", None), ("abc", None), ("", None), ("-5", None)] {
+                std::fs::write(&lock, content).unwrap();
+                assert_eq!(lock_file_pid(&hung_nolock.sock), want, "lock content {content:?}");
+            }
+            std::fs::remove_file(&lock).unwrap();
+            assert_eq!(lock_file_pid(&hung_nolock.sock), None);
+        });
+    }
+
+    /// ★Purpose test (design rev9 section 4: "a later binary update must still download, verify and install, with a
+    /// responsive, a dead and a hung daemon") for the daemon-touching steps of `install_update` in their production
+    /// order on Mac/Linux: the session guard, then the stop plan. drain is a sidecar with its own 12 s hard watchdog
+    /// (cys.rs `Command::Drain`); download and install touch no daemon. force=true is what both UI callers pass;
+    /// force=false is run on the shapes where the base did not block (the hung force=false cell is the A1 test's
+    /// UNCHANGED-BLOCKS). Base on a hung daemon: blocked forever at the first rpc (force=true included).
+    #[cfg(unix)]
+    #[test]
+    fn a1_a2_install_update_daemon_steps_end_on_every_daemon_shape() {
+        use std::time::{Duration, Instant};
+        tauri::async_runtime::block_on(async {
+            for force in [true, false] {
+                let tag = if force { "t" } else { "f" };
+                let ok = RigDaemon::start(&format!("p-{tag}-ok"), RigMode::Responsive { pid: Some(31), live: 0 });
+                let absent = RigDaemon::start(&format!("p-{tag}-absent"), RigMode::DeadAbsent);
+                let hung = RigDaemon::start(&format!("p-{tag}-hung"), RigMode::Hung);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut cells: Vec<(&RigDaemon, DaemonStopPlan, Duration)> = vec![
+                    (&ok, DaemonStopPlan::Stop(31), Duration::from_millis(1900)),
+                    (&absent, DaemonStopPlan::Skip { timed_out: false, lock_pid: None }, Duration::from_millis(1900)),
+                ];
+                if force {
+                    cells.push((&hung, DaemonStopPlan::Skip { timed_out: true, lock_pid: None }, Duration::from_secs(3)));
+                }
+                for (rig, want, bound) in cells {
+                    let t = Instant::now();
+                    assert_eq!(must_end("session guard", update_session_guard(force, || dept_live_session_count(&rig.sock))).await, Ok(()));
+                    assert_eq!(must_end("stop plan", plan_daemon_stop(&rig.sock)).await, want, "force={force} {}", rig.sock.display());
+                    assert!(t.elapsed() < bound, "force={force} {}: {:?} >= {bound:?}", rig.sock.display(), t.elapsed());
+                }
+            }
+        });
+    }
+
+    /// What a function can do to a process, counted in its production text (whole-line comments dropped): kill and
+    /// signal words (case-insensitive), process launch and exit, raw OS calls, launchctl and osascript, every rpc / request
+    /// form, and rpc method families that act on seats or the daemon. ★R1-1 (reflection 1): kill-words alone missed
+    /// stops that carry none (`surface.close` / `surface.reap` close seats, `launchctl bootout` ends a daemon).
+    fn capability_census(code: &str) -> Vec<(&'static str, usize)> {
+        const KILL_WORDS: &[&str] =
+            &["kill", "sigterm", "sigkill", "sigint", "sighup", "sigquit", "sigstop", "signal", "terminate", "raise("];
+        const CAPS: &[&str] = &[
+            "Command::new", ".spawn(", "process::exit", "libc::", "nix::", "launchctl", "osascript",
+            "rpc_oneshot(", "rpc_on(", " rpc(", "rpc_full", "conn_cell", "request(", "request_on(", "request_on_timeout(",
+            "\"surface.", "\"ledger.", "\"system.", "\"daemon.", "\"channel.",
+        ];
+        let low = code.to_lowercase();
+        let mut out = vec![("killwords", KILL_WORDS.iter().map(|t| low.matches(t).count()).sum())];
+        out.extend(CAPS.iter().map(|t| (*t, code.matches(t).count())).filter(|(_, n)| *n > 0));
+        out
+    }
+
+    /// ★0.14.52 update repair, CEO ruling 5 absolute condition: neither the C probe nor A2 may stop or signal any process.
+    /// Source pin over the production text (`wu_prod`; whole-line comments dropped by `wu_code`): (1) every function on
+    /// the probe / A2 / update path has exactly its measured capability census (new functions: only the one
+    /// `system.identify` call; existing ones: equal to base 4ed79fdd, e.g. `stop_running_daemon` keeps its 8 kill-words =
+    /// the Unix SIGTERM of the answered pid + the Windows ledger.kill / taskkill block); (2) the Unix plan arm of
+    /// `stop_running_daemon` holds no capability, a Skip plan maps to no pid, and the SIGTERM stays inside
+    /// `if let Some(pid) = pid`; (3) the wiring is the design table's (rows 1-5) and A1's. A stop or signal re-added
+    /// anywhere on these paths, by kill, by rpc or by launchctl, turns this red.
+    #[test]
+    fn c_probe_and_a2_never_stop_a_process_source_pin() {
+        let expected: &[(&str, &[(&str, usize)])] = &[
+            ("async fn identify_within(", &[("killwords", 0), ("rpc_oneshot(", 1), ("\"system.", 1)]),
+            ("async fn daemon_answers(", &[("killwords", 0)]),
+            ("async fn wait_for_answer(", &[("killwords", 0)]),
+            ("async fn plan_daemon_stop(", &[("killwords", 0)]),
+            ("fn lock_file_pid(", &[("killwords", 0)]),
+            ("async fn update_session_guard<", &[("killwords", 0)]),
+            ("enum DaemonStopPlan", &[("killwords", 0)]),
+            ("enum IdentifyMiss", &[("killwords", 0)]),
+            // Existing functions on the path: equal to base 4ed79fdd (measured with tools/capability_census.py).
+            ("async fn ensure_daemon(", &[("killwords", 0), ("Command::new", 1), (".spawn(", 1)]),
+            ("async fn rpc_oneshot(", &[("killwords", 0), ("rpc_oneshot(", 1)]),
+            ("async fn install_update(", &[("killwords", 0)]),
+            (
+                "async fn stop_running_daemon(",
+                &[("killwords", 8), ("Command::new", 1), ("libc::", 2), (" rpc(", 3), ("\"ledger.", 2), ("\"system.", 1)],
+            ),
+        ];
+        for (sig, want) in expected {
+            let code = wu_code(wu_seg(sig));
+            assert_eq!(
+                capability_census(&code),
+                want.to_vec(),
+                "`{sig}`: capability census changed; the probe / A2 path must never stop or signal a process:\n{code}"
+            );
+        }
+        let probe = wu_code(wu_seg("async fn identify_within("));
+        assert!(probe.contains("rpc_oneshot(socket, \"system.identify\", json!({}))"), "the probe is one identify on a private connection");
+
+        let stop = wu_code(wu_seg("async fn stop_running_daemon("));
+        let arm_at = stop
+            .find("    #[cfg(unix)]\n    let pid = match plan_daemon_stop(&default_socket()).await {")
+            .expect("the Unix plan arm is gone or changed shape");
+        let arm = &stop[arm_at..arm_at + stop[arm_at..].find("\n    };\n").expect("end of the Unix plan arm")];
+        assert_eq!(capability_census(arm), vec![("killwords", 0)], "the Unix plan arm holds a capability:\n{arm}");
+        assert!(arm.contains("DaemonStopPlan::Stop(pid) => Some(pid),"), "only an answered identify names the pid");
+        let skip = &arm[arm.find("DaemonStopPlan::Skip").expect("the Skip arm")..];
+        assert!(
+            skip.trim_end().ends_with("None\n        }") && !skip.contains("Some(") && skip.matches("lock_pid").count() == 2,
+            "a Skip plan must map to no pid; lock_pid only in the binding and the log line (no fallback onto it):\n{skip}"
+        );
+        let guard_at = stop.find("    if let Some(pid) = pid {").expect("the stop branch");
+        assert_eq!(stop.matches("libc::kill(").count(), 1, "one Unix SIGTERM, as in the base");
+        assert!(arm_at < guard_at && guard_at < stop.find("libc::kill(").unwrap(), "the Unix SIGTERM must stay inside `if let Some(pid) = pid`");
+
+        let prod = wu_code(wu_prod());
+        assert_eq!(prod.matches("wait_for_connect(").count(), 0, "design row 1: the presence helper served only rows 4 and 5");
+        assert_eq!(prod.matches("connect().await.is_ok()").count(), 1, "only row 2 keeps the presence check");
+        assert!(
+            wu_code(wu_seg("async fn maybe_autoregister_launchd(")).contains("let running = connect().await.is_ok();"),
+            "row 2 (launchd autoregister `running`) stays PRESENCE"
+        );
+        let ensure = wu_code(wu_seg("async fn ensure_daemon("));
+        assert!(ensure.contains("if daemon_answers(&default_socket()).await {\n        return Ok(());"), "row 3 is REPLY-HEALTH");
+        assert!(ensure.contains("if wait_for_answer(&default_socket(), 40).await {"), "row 4 is REPLY-HEALTH");
+        assert_eq!(prod.matches("if wait_for_answer(&default_socket(), 50).await {").count(), 1, "row 5 is REPLY-HEALTH");
+        let install = wu_code(wu_seg("async fn install_update("));
+        assert!(install.contains("update_session_guard(force, live_session_count).await?;"), "A1: the guard with the real counter");
+        assert_eq!(install.matches("live_session_count").count(), 1, "install_update asks the count only through the guard");
+        assert!(
+            install.find("update_session_guard(").unwrap() < install.find("build_updater(&app)?").unwrap(),
+            "the guard runs before the download, as the base guard did"
+        );
+        let guard = wu_code(wu_seg("async fn update_session_guard<"));
+        assert!(guard.contains("    if force {\n        return Ok(());\n    }\n    let sessions = count().await.unwrap_or(0);"), "A1 shape");
     }
 
     // ── 0.14.42 사용량 계정 병합·fan-out 재현 검체(수정 전 적색) ──────────────
