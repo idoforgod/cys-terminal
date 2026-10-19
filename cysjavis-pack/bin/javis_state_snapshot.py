@@ -18,6 +18,9 @@
 #   반파 세대를 절대 보지 않는다. --self-test 가 SIGKILL 중단으로 이를 실증한다.
 #
 # GC 정책: 최근 48세대 + 일별 대표 14일 보관, 그 외 삭제(state-generations/ 내부만).
+#   ★B-321: 레인별 풀 — 한 세대는 자기가 담은 모든 레인의 풀에 들고, 정책은 풀마다 적용·합집합 보관한다.
+#   depts.json 에서 빠진 부서 레인은 최신 1세대만(최종 상태 보관 · 이력 미보관). compute_gc 참조.
+# B-317: 적재 = 전 레인 round(카드·노드 TODO·법 묶음) + 레인별 정본 카드(capture_lanes) · DB/WAL/SHM/.bak 제외.
 # D-07: TODO glob 0건도 필수 누락으로 기록하고, autopilot.json 선택부재는 별도 계수한다.
 # D-07: dry-run 은 디렉터리 생성·임시 세대 청소 없이 보관 대상만 표시한다.
 # D-07: .tmp-* 는 살아 있는 pid 를 보호하고, 죽은 pid 는 60초·pid 불명은 3600초 후 청소한다.
@@ -27,10 +30,12 @@
 #   javis_state_snapshot.py list                   # 세대 목록
 #   javis_state_snapshot.py verify [--gen <이름>]  # manifest 해시 무결성 검증
 #   javis_state_snapshot.py gc [--dry-run]         # 보관정책 적용(삭제 대상 산출/실행)
+#   javis_state_snapshot.py card [--gen <이름>] [--lane base|<부서>]  # 레인별 정본 카드 위치(읽기 전용 복원 경로)
 #   javis_state_snapshot.py self-test              # 원자성/중단내성 실증(격리 임시폴더)
 
 import argparse
 import errno
+import fnmatch
 import glob as _glob
 import hashlib
 import json
@@ -135,8 +140,15 @@ def project_round_dir(env=None, cwd=None):
          (키 순서·'첫 값이 이긴다' 계약은 PACK_DIR_ENV_KEYS 정본과 동일 — 뒤 키를 더 보지 않는다)
       ②' ★[결재 15] 팩 env 키가 **하나도 없으면** `<HOME>/.cys/pack/round` 가 디렉터리로 실재할 때 그것
          (팩 스크립트 기본값 `~/.cys/pack` 과 동일). 종전엔 여기서 곧장 ③으로 떨어져 cwd 가 홈이면
-         복원 정본이 없는 **미끼 `~/_round`**(save-state.sh 가 .state_log 만 쌓는 자리)를, cwd 가 `/` 면
-         `/_round` 를 골라 round 소스 0건이 됐다(실측 2026-09-19: env 有 round 7건 / 無 0건).
+         `~/_round` 를, cwd 가 `/` 면 `/_round` 를 골라 노드 TODO 0건이 됐다(실측 2026-09-19: env 有 round 7건 / 無 0건).
+         ★정정(B-317 결정 7 · 2026-10-20): 종전 문면은 `~/_round` 를 「복원 정본이 없는 미끼」라 불렀으나 **틀렸다** —
+         그 자리는 save-state.sh 의 .state_log 자리이면서 **본부(base) 레인의 라이브 카드 `~/_round/SESSION_STATE.md`**
+         가 사는 곳이다(부트 inject-context.sh 가 cwd 상향 탐색으로 주입 · 실측 220,061 B vs `~/.cys/pack/round` 사본
+         716,061 B · 10-16 정지). 이 함수가 그 디렉터리를 고르지 않는 이유는 카드가 없어서가 아니라 **노드 TODO 를 담는
+         레인 round 가 아니기 때문**이다(README-NO-TODO-FILES-HERE). 본부 카드는 default_sources() 가 capture_lanes()
+         로 따로 선언한다. ⛔범위: 이 정정은 **본부 레인 한정**이다 — 팩 키가 설정된 부서 레인의 라이브 카드는
+         `<pack>/round/SESSION_STATE.md` 그 자체이고 정본이다(HEAD 범위 정정 2026-10-20).
+         ⛔이 함수의 **단일 레인 해소 계약은 바꾸지 않는다**(호출자·bin/tests/test_state_snapshot_root.py A 계열 의존).
          ★팩 키가 **설정돼 있는데** round/ 가 없을 때는 이 폴백을 타지 않는다 — 명시된 (부서)팩 대신
          본부 팩을 담으면 레인 교차 오염이다(②의 '첫 값이 이긴다' 계약 보존).
       ③ 그 밖 → `<cwd>/_round`  (종전 폴백 그대로 — 사람이 프로젝트 루트에서 손으로 부르는 경우)
@@ -161,7 +173,98 @@ def project_round_dir(env=None, cwd=None):
     return os.path.join(cwd or os.getcwd(), "_round")
 
 
-def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, localappdata=None):
+# ★B-317(CEO 결정 1·2 · 2026-10-20): 적재 대상은 **세대를 띄운 데몬의 팩에 의존하지 않는다** — 전 레인 합집합.
+#   종전 default_sources() 는 project_round_dir() 를 한 번 불러 **발화 레인 하나**의 round 만 담았다
+#   (phoenix-snapshot-6h 는 데몬마다 자기 CYS_PACK_DIR 로 돈다 ⇒ 모든 세대가 단일 레인 · 실측 60세대 중 본부 6).
+#   각 세대가 자기 레인에 대해서만 완전했으므로 「누락 0건」이 참이면서 다른 레인은 선언조차 되지 않았다.
+ROUND_CARD = "SESSION_STATE.md"
+ROUND_TODO_GLOB = "*_TODO.md"
+# 법 묶음: 무번호 첫 권(CSO_STANDING_RULES.md)까지 — `CSO_STANDING_RULES_*.md` 는 첫 권을 놓친다(B-317 AMEND-3).
+LAW_CORPUS_GLOB = "CSO_STANDING_RULES*.md"
+# B-317-AMEND 결박: DB·WAL·SHM 은 B-318(정지 장벽) 전까지 절대 담지 않는다 · 백업 사본(.bak/.bak-*)도 제외.
+#   basename 끝 일치(fnmatch)다 — `wall-time_TODO.md` 처럼 이름 **안**의 '-wal' 은 제외하지 않는다(AMEND-4).
+CAPTURE_EXCLUDE_GLOBS = ("*.db", "*.sqlite", "*-wal", "*-shm", "*.bak", "*.bak-*")
+BASE_LANE = "base"
+FIRING_LANE = "firing"
+
+
+def _capture_excluded(path):
+    b = os.path.basename(path)
+    return any(fnmatch.fnmatchcase(b, g) for g in CAPTURE_EXCLUDE_GLOBS)
+
+
+def _registry_pack_dirs(depts_json):
+    """depts.json 의 부서별 pack_dir → [(부서명, pack_dir)] (이름순). ★판독 실패는 [] —
+    ⛔레지스트리 실패가 본부·발화 레인 적재를 죽이지 않는다(그 레인들은 레지스트리 없이도 선언된다)."""
+    try:
+        with open(depts_json, encoding="utf-8-sig") as f:
+            reg = json.load(f)
+        out = []
+        for name, meta in sorted((reg.get("depts") or {}).items()):
+            pd = (meta or {}).get("pack_dir")
+            if isinstance(pd, str) and pd:
+                out.append((name, pd))
+        return out
+    except Exception:
+        return []
+
+
+def capture_lanes(home=HOME, env=None, depts_json=None):
+    """[(레인, round 디렉터리, 그 레인의 정본 카드 경로)] — 세대가 담아야 하는 레인 전부.
+      · 본부(base): `<home>/.cys/pack` 이 실재하면. round = `<home>/.cys/pack/round`,
+        ★정본 카드 = `<home>/_round/SESSION_STATE.md`(결정 7 · 부트가 주입하는 라이브 카드 — 본부 레인 한정).
+      · 부서: depts.json 의 pack_dir 마다. round = `<pack>/round`, 정본 카드 = `<pack>/round/SESSION_STATE.md`.
+      · 발화 레인: project_round_dir(env) — 위 둘에 이미 있으면 생략(실경로 비교). 레지스트리 밖 팩·JAVIS_ROOT
+        프로젝트도 종전처럼 담긴다(종전 단일 레인 계약을 합집합 안에 보존).
+    ★fail-closed: 선언된 레인의 round·카드가 없으면 default_sources 가 그 경로를 그대로 남겨 manifest `missing`
+      에 뜬다 — 선언하지 않아 「완전해 보이는」 종전 실패 방향을 뒤집는다."""
+    lanes, seen = [], set()
+
+    def _add(lane, rd, card):
+        k = os.path.realpath(rd)
+        if k not in seen:
+            seen.add(k)
+            lanes.append((lane, rd, card))
+
+    base_pack = os.path.join(home, ".cys", "pack")
+    if os.path.isdir(base_pack):
+        # ★본부 카드 자리 `~/_round` 는 이 배치(본부 master 가 홈에서 돈다 → 부트가 홈의 _round 를 찾는다)의 사실이다.
+        #   그 디렉터리가 없는 설치에서는 선언하지 않는다(매 세대 거짓 「누락」 금지 · R2). 디렉터리가 있는데 카드가 없으면
+        #   선언된 채 누락으로 뜬다(fail-closed).
+        bcard = os.path.join(home, "_round", ROUND_CARD) if os.path.isdir(os.path.join(home, "_round")) else None
+        _add(BASE_LANE, os.path.join(base_pack, "round"), bcard)
+    for name, pack in _registry_pack_dirs(depts_json or os.path.join(home, ".cys", "depts.json")):
+        rd = os.path.join(pack, "round")
+        _add(name, rd, os.path.join(rd, ROUND_CARD))
+    rd = project_round_dir(env=env)
+    _add(FIRING_LANE, rd, os.path.join(rd, ROUND_CARD))
+    return lanes
+
+
+def canonical_cards(home=HOME, env=None, depts_json=None):
+    """{레인: 정본 카드 경로} — 세대 manifest 의 `canonical_cards` 로 기록되어 복원 경로가 이름으로 고른다."""
+    return {lane: card for lane, _rd, card in capture_lanes(home=home, env=env, depts_json=depts_json) if card}
+
+
+def select_card(manifest, lane=BASE_LANE):
+    """세대 manifest 에서 그 레인의 정본 카드 항목을 고른다(없으면 None).
+    ★결정 7(CEO 2026-10-20) + HEAD 범위 정정: 본부(base) 레인의 정본 = `~/_round/SESSION_STATE.md` ·
+      ★부서 레인의 정본 = `<pack>/round/SESSION_STATE.md` 그 자체 — 부서 카드는 주석·은퇴·강등·건너뛰기 대상이 아니다.
+      `~/.cys/pack/round/SESSION_STATE.md`(본부 팩 round 의 사본 · 716,061 B · 10-16 정지)는 세대에 담기지만 **본부
+      정본으로 고르지 않는다** — 은퇴 표기는 본부 레인이 자기 파일에 쓴다(이 도구는 라이브 팩에 아무것도 쓰지 않는다).
+    ⛔basename(SESSION_STATE.md)으로 고르지 않는다 — 세대 안에 카드가 레인 수만큼 있다(경로 sha 접두로 구분).
+    ⛔이름으로 기록된 정본이 없으면(이 필드가 생기기 전 세대 · 카드 누락 세대) 다른 카드로 **대체하지 않는다** —
+      종전 세대의 유일한 SESSION_STATE.md 는 다른 계보의 카드였다(복원하면 묵은 카드가 라이브를 덮는다)."""
+    want = (manifest.get("canonical_cards") or {}).get(lane)
+    if not want:
+        return None
+    for entry in manifest.get("files", []):
+        if entry.get("source") == want:
+            return entry
+    return None
+
+
+def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, localappdata=None, env=None):
     """세대 보관 소스를 동적 산출한다(정적 목록 대체). 메인 선언상태 + 루트 레지스트리 +
     ★발견되는 모든 부서의 선언상태를 자동 포함 = '태어날 때부터 보호'(손 배선 0).
     ★Windows(권고#1): 메인 상태=%LOCALAPPDATA%\\cys, 부서=그 하위 cys-dept-*(state.rs 레이아웃). unix 는 종전대로
@@ -184,13 +287,32 @@ def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, l
     #   SESSION_STATE.md 는 재부팅 복원의 단일 진실인데 세대 보관 대상에서 빠져 있었다.
     #   개인경로 하드코딩 금지(pack scan gate): 프로젝트는 $JAVIS_ROOT(env 또는 CWD),
     #   장기기억은 HOME glob 파생만(javis_wakeup.py 등과 동일 관례).
-    # ★PREP #3: 해소는 project_round_dir() 한 곳 — 데몬 잡(cwd `/`·JAVIS_ROOT 없음)에서 `/_round`
-    #   로 떨어져 5세대+ 누락되던 경로를 `<pack>/round` 폴백으로 닫는다(사유·순서는 그 docstring).
-    proj_round = project_round_dir()
-    srcs.append(os.path.join(proj_round, "SESSION_STATE.md"))
-    # D-07: 종전엔 glob 0건이 조용한 0이라 phoenix 세대에서 노드 TODO 누락이 보이지 않았다.
-    todo_pattern = os.path.join(proj_round, "*_TODO.md")
-    srcs.extend(sorted(_glob.glob(todo_pattern)) or [todo_pattern])
+    # ★PREP #3: 발화 레인 해소는 project_round_dir() 한 곳(사유·순서는 그 docstring).
+    # ★B-317(결정 1·2·7): 그 위에 **전 레인** round(카드·노드 TODO·법 묶음) + 레인별 정본 카드를 합집합으로 선언한다
+    #   (capture_lanes). 같은 **경로 문자열**은 한 번만 — 같은 basename 은 do_snapshot 이 경로 sha 접두로 구분한다.
+    #   ⛔실경로로 접지 않는다: `~/_round` 가 심링크면 정본 카드 경로가 소스에서 사라져 select_card 가 이름으로
+    #   찾지 못한다(R1 G9). 같은 바이트가 두 이름으로 담기는 쪽이 정본을 잃는 쪽보다 낫다.
+    seen = set()
+
+    def _add_src(p):
+        k = os.path.normpath(p)
+        if k not in seen:
+            seen.add(k)
+            srcs.append(p)
+
+    for _lane, proj_round, card in capture_lanes(home=home, env=env, depts_json=depts_json):
+        _add_src(os.path.join(proj_round, ROUND_CARD))
+        # D-07: 종전엔 glob 0건이 조용한 0이라 phoenix 세대에서 노드 TODO 누락이 보이지 않았다.
+        todo_pattern = os.path.join(proj_round, ROUND_TODO_GLOB)
+        todos = [p for p in sorted(_glob.glob(todo_pattern)) if not _capture_excluded(p)]
+        for p in todos or [todo_pattern]:
+            _add_src(p)
+        # 법 묶음은 레인마다 있을 수도 없을 수도 있다(현재 본부만) — 0건은 누락이 아니다(패턴을 남기지 않는다).
+        for p in sorted(_glob.glob(os.path.join(proj_round, LAW_CORPUS_GLOB))):
+            if not _capture_excluded(p):
+                _add_src(p)
+        if card:
+            _add_src(card)   # 부서 레인은 round 카드와 같은 경로(중복 제거) · 본부는 `~/_round/SESSION_STATE.md`
     srcs.extend(sorted(_glob.glob(os.path.join(
         home, ".claude*", "projects", "*", "memory", "*.md"))))
     return srcs
@@ -320,9 +442,14 @@ def _cleanup_tmp(gen_root):
     return removed
 
 
-def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None):
-    """상태 파일 세대 1건을 원자적으로 생성한다. 생성된 세대 이름 반환(dry_run이면 None)."""
-    sources = sources if sources is not None else default_sources()
+def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None, cards=None):
+    """상태 파일 세대 1건을 원자적으로 생성한다. 생성된 세대 이름 반환(dry_run이면 None).
+    ★B-317 결정 7: 기본 소스(sources=None)면 레인별 정본 카드 지도(canonical_cards)를 manifest 에 기록한다 —
+    복원은 select_card() 가 이 지도의 **경로 이름**으로 고른다. 명시 소스 호출은 cards 를 줄 때만 기록한다."""
+    if sources is None:
+        sources = default_sources()
+        if cards is None:
+            cards = canonical_cards()
     present, missing, optional_absent = [], [], []
     for s in sources:
         if os.path.isfile(s):
@@ -340,6 +467,10 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None)
             print(f"  - (없음) {s}")
         for s in optional_absent:
             print(f"  - (선택·없음) {s}")
+        if cards:
+            print(f"[dry-run] 레인별 정본 카드 {len(cards)}건:")
+            for lane in sorted(cards):
+                print(f"  * {lane} -> {cards[lane]}  ({'있음' if os.path.isfile(cards[lane]) else '없음'})")
         return None
 
     os.makedirs(gen_root, exist_ok=True)
@@ -364,6 +495,8 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None)
         "missing": sorted(missing),
         "optional_absent": sorted(optional_absent),
     }
+    if cards:
+        manifest["canonical_cards"] = dict(cards)
     try:
         for src in present:
             digest = _sha256(src)
@@ -450,7 +583,13 @@ def _parse_stamp(name):
     m = GEN_NAME_RE.match(name)
     if not m:
         return None
-    return datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    dt = datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    # ★B-320: 충돌 접미(-k)를 버리지 않는다. 종전엔 `<stamp>` 와 `<stamp>-1` 이 같은 시각으로 파싱돼 정렬 동률을
+    #   **입력 순서**가 깼다(정책 아님 · 동시 발화한 두 레인 중 하나가 그날 유일 세대를 잃는다). k 마이크로초를 더해
+    #   승격 순서(k 증가)대로 구별한다 — k ≤ 9999 < 1초이므로 초·날짜 귀속은 바뀌지 않는다.
+    if m.group(2):
+        dt += timedelta(microseconds=int(m.group(2)))
+    return dt
 
 
 def _gen_effective_dt(gen_root, name):
@@ -467,46 +606,149 @@ def _gen_effective_dt(gen_root, name):
     return max(cands) if cands else None
 
 
-def compute_gc(generations, now=None, dt_of=None, dt_eff=None):
+ABSENT_LANE_KEEP = 1     # 레지스트리에서 빠진(삭제된) 부서 레인 풀의 규칙 A 상한
+
+
+def compute_gc(generations, now=None, dt_of=None, dt_eff=None, key_of=None, cap_of=None):
     """보관/삭제 결정. (keep_set, delete_list) 반환. 순수함수(테스트 가능).
     ★E3(P2-5 + gemini W6): 명목 시각(dt_of=이름)과 실효 시각(dt_eff=mtime 병행)을 **둘 다 보호**한다(union).
     - 명목-recent(이름 최신) KEEP_RECENT 는 항상 보존 → cp/touch 로 과거 세대 mtime 이 오염돼도 **진짜 최근 세대를
       밀어내지 못한다**(gemini 오염 왜곡 차단).
     - 실효-recent(mtime 최신) KEEP_RECENT 도 보존 → 시계 역행으로 이름이 작아진 실 최근 세대가 보존된다(P2-5).
     dt_eff 미주입 시 dt_of 와 동일(하위호환·명목만). 오염 세대가 실효 집합에 추가로 잔존할 수 있으나(무해·상한
-    2×KEEP_RECENT), 진짜 최근 세대의 오삭제는 발생하지 않는다."""
+    2×KEEP_RECENT), 진짜 최근 세대의 오삭제는 발생하지 않는다.
+    ★B-321/결정 3(레인별 풀 · HEAD 형식 결재 2026-10-20): key_of(n) 은 그 세대가 담은 레인 키들의 반복자다 —
+      한 세대는 자기가 담은 **모든** 레인의 풀에 든다(분할이 아니다). 규칙 A·B 는 풀 안에서 적용하고 keep 은 풀별
+      keep 의 합집합이다. 단일 레인 세대가 섞인 저장소에서 한 레인의 세대가 다른 레인 세대 48개에 밀려 사라지던
+      것(실측 8→6)을 막는다. ⛔CEO 문면의 「커버리지 집합 키로 분할」을 그대로 하지 않은 이유: 대체된 집합 키는 새
+      구성원을 영영 얻지 못해 최신 48개가 **영구 보관**된다(모형: 30일 뒤 단일 레인 세대 60개 전부 잔존 · 부서 신설마다
+      ~48세대 동결). 레인별 풀이면 전 레인 세대가 쌓이는 대로 옛 세대가 모든 풀에서 밀려나 정상 노화한다.
+      key_of 미주입 = 단일 풀("") = 종전과 동일한 판정. 키 0개를 돌려준 세대도 단일 풀에 넣는다(⛔어느 풀에도
+      없어 삭제되는 길 차단).
+    cap_of(key) = 그 풀의 규칙 A 상한(미주입 = 전 풀 KEEP_RECENT). 상한 정책은 do_gc 의 _lane_caps 참조."""
     now = now or _now_utc()
     _E0 = datetime.min.replace(tzinfo=timezone.utc)
     dt_of = dt_of or _parse_stamp        # 명목(이름)
     dt_eff = dt_eff or dt_of             # 실효(mtime 병행) — 미주입 시 명목과 동일
+    key_of = key_of or (lambda n: ("",))
+    cap_of = cap_of or (lambda k: KEEP_RECENT)
+    pools = {}
+    for n in generations:
+        for k in (tuple(key_of(n)) or ("",)):
+            pools.setdefault(k, []).append(n)
     keep = set()
-
-    # 규칙 A: 최근 KEEP_RECENT — 명목 기준 ∪ 실효 기준(union → 명목-recent 절대 evict 안 됨·실효-recent 도 보존)
-    for keyfn in (dt_of, dt_eff):
-        ordered = sorted(generations, key=lambda n: (keyfn(n) or _E0), reverse=True)
-        for name in ordered[:KEEP_RECENT]:
-            keep.add(name)
-
-    # 규칙 B: 최근 14일, 하루당 대표 1건 — 명목 시각 기준(날짜 귀속은 이름이 정직·오염 mtime 미의존)
     cutoff = now - timedelta(days=KEEP_DAILY_DAYS)
-    day_rep = {}
-    for name in sorted(generations, key=lambda n: (dt_of(n) or _E0), reverse=True):
-        dt = dt_of(name)
-        if dt is None or dt < cutoff:
-            continue
-        day = dt.strftime("%Y%m%d")
-        if day not in day_rep:
-            day_rep[day] = name
-            keep.add(name)
+    for k, pool in pools.items():
+        cap = cap_of(k)
+        # 규칙 A: 최근 cap — 명목 기준 ∪ 실효 기준(union → 명목-recent 절대 evict 안 됨·실효-recent 도 보존)
+        for keyfn in (dt_of, dt_eff):
+            ordered = sorted(pool, key=lambda n: (keyfn(n) or _E0), reverse=True)
+            for name in ordered[:cap]:
+                keep.add(name)
+        if cap < KEEP_RECENT:
+            continue   # 상한 축소 풀(삭제된 부서)은 일별 대표도 두지 않는다 — 최신 1건이 그 레인의 최종 상태다
+        # 규칙 B: 최근 14일, 하루당 대표 1건 — 명목 시각 기준(날짜 귀속은 이름이 정직·오염 mtime 미의존)
+        day_rep = {}
+        for name in sorted(pool, key=lambda n: (dt_of(n) or _E0), reverse=True):
+            dt = dt_of(name)
+            if dt is None or dt < cutoff:
+                continue
+            day = dt.strftime("%Y%m%d")
+            if day not in day_rep:
+                day_rep[day] = name
+                keep.add(name)
 
     delete = [n for n in generations if n not in keep]
     return keep, sorted(delete)
 
 
-def do_gc(gen_root=GEN_ROOT, dry_run=False):
+def _is_lane_file(source):
+    """레인 파일 = round/_round 디렉터리 바로 아래의 카드·노드 TODO·법 묶음. ⛔이름 패턴만으로 판정하지 않는다 —
+    기억 저장소의 `x_TODO.md` 가 가짜 레인 풀(레지스트리 밖 = 상한 1)을 만들면 그 세대들이 지워진다(R1 H8)."""
+    b = os.path.basename(source)
+    if os.path.basename(os.path.dirname(source)) not in ("round", "_round"):
+        return False
+    return (b == ROUND_CARD or fnmatch.fnmatchcase(b, ROUND_TODO_GLOB)
+            or fnmatch.fnmatchcase(b, LAW_CORPUS_GLOB))
+
+
+def _coverage_keys(gen_root, name):
+    """그 세대가 담은 레인 키 = 레인 파일(카드·노드 TODO·법 묶음) 소스의 디렉터리 집합(정렬 튜플).
+    이 판독은 이 패치 전 세대(단일 레인 · canonical_cards 없음)에도 같은 규칙으로 통한다.
+    · 레인 파일이 하나도 없는 세대 → ("",) = 종전 단일 풀(하네스·격리 세대).
+    · manifest 판독 실패 → ("?",) 전용 풀 — ⛔측정 불능을 정상 레인 키에 접지 않는다."""
+    mp = os.path.join(gen_root, name, "manifest.json")
+    manifest = None
+    for enc in ("utf-8", None):   # do_verify 와 같은 두 해석(옛 기본 인코딩 manifest)
+        try:
+            with open(mp, encoding=enc) as f:
+                manifest = json.load(f)
+            break
+        except (OSError, ValueError):
+            continue
+    try:
+        dirs = {os.path.dirname(e["source"]) for e in manifest.get("files", []) if _is_lane_file(e["source"])}
+    except (AttributeError, KeyError, TypeError):
+        return ("?",)
+    return tuple(sorted(dirs)) or ("",)
+
+
+def _lane_caps(home=HOME, depts_json=None):
+    """풀 키 → 규칙 A 상한. ★CEO 비준(2026-10-20) 잔여 상한:
+      · 레인 키가 depts.json 의 어느 부서(pack_dir/round)에도 없으면 = 삭제된 부서 → 상한 ABSENT_LANE_KEEP(1),
+        그 레인을 담은 나머지 세대는 자기가 속한 다른 풀에서 노화한다.
+        ★이유: **삭제된 부서의 최종 상태는 보관하고, 그 이력은 보관하지 않는다.**
+      · 본부(base) 레인(`~/.cys/pack/round`·`~/_round`)은 부서 항목이 아니므로 **결코 부재가 아니다**(상한 48).
+      · 레지스트리 판독 실패(파일 없음·읽기 불가·파싱 불가·꼴 불일치 — pack_dir 이 문자열이 아닌 항목 포함)는
+        「부재」가 아니다: 측정 불능은 판정이 아니므로 **전 레인 48** 을 유지한다(조용히 이력을 지우지 않는다).
+      · 레인이 아닌 풀("" 단일 풀 · "?" 판독 불능)은 48.
+    ★부재 판정은 HOME 절대경로가 아니라 **구조**로 한다(R2): 부재가 될 수 있는 것은 `<팩>/round` 꼴이면서 본부 팩
+      (`.../pack`)이 아닌 키뿐이고, 레지스트리 pack_dir 과 실경로 **또는 팩 이름**이 같으면 현존이다 — HOME 이 옮겨진
+      뒤 옛 세대의 키(다른 접두)에서도 본부가 부재로 판정되어 이력이 지워지는 길을 닫는다. `_round` 레인(본부 카드
+      자리·JAVIS_ROOT 프로젝트)은 부서 항목이 아니므로 부재가 아니다."""
+    dj = depts_json or os.path.join(home, ".cys", "depts.json")
+    registered = None
+    try:
+        with open(dj, encoding="utf-8-sig") as f:
+            depts = json.load(f)["depts"]
+        if not isinstance(depts, dict):
+            raise TypeError("depts is not a mapping")
+        rounds, names = set(), set()
+        for meta in depts.values():
+            pd = meta.get("pack_dir") if isinstance(meta, dict) else None
+            if not (isinstance(pd, str) and pd):
+                raise TypeError("dept entry without a pack_dir")
+            rounds.add(os.path.realpath(os.path.join(pd, "round")))
+            names.add(os.path.basename(os.path.normpath(pd)))
+        registered = rounds
+    except Exception:
+        registered = None
+    base_pack = os.path.realpath(os.path.join(home, ".cys", "pack"))
+
+    def cap_of(key):
+        if registered is None or key in ("", "?"):
+            return KEEP_RECENT
+        if os.path.basename(key) != "round":
+            return KEEP_RECENT          # `_round` 레인 · 그 밖 꼴 = 부서 항목이 아니다
+        pack = os.path.dirname(key)
+        if os.path.basename(pack) == "pack" or os.path.realpath(pack) == base_pack:
+            return KEEP_RECENT          # 본부 팩 — 부서 항목이 아니므로 결코 부재가 아니다
+        if os.path.realpath(key) in registered or os.path.basename(pack) in names:
+            return KEEP_RECENT
+        return ABSENT_LANE_KEEP
+
+    return cap_of, registered is not None
+
+
+def do_gc(gen_root=GEN_ROOT, dry_run=False, home=HOME, depts_json=None):
     gens = list_generations(gen_root)
+    cov = {n: _coverage_keys(gen_root, n) for n in gens}
+    cap_of, registry_ok = _lane_caps(home=home, depts_json=depts_json)
     keep, delete = compute_gc(gens, dt_of=_parse_stamp,
-                              dt_eff=lambda n: _gen_effective_dt(gen_root, n))
+                              dt_eff=lambda n: _gen_effective_dt(gen_root, n),
+                              key_of=lambda n: cov[n], cap_of=cap_of)
+    if not registry_ok and any(k not in ("", "?") for ks in cov.values() for k in ks):
+        print("[gc] depts.json 판독 불가 — 레인 부재를 판정하지 않음(전 레인 보관 상한 %d)" % KEEP_RECENT)
     if dry_run:
         print(f"[gc dry-run] 총 {len(gens)}세대 → 보관 {len(keep)} / 삭제 {len(delete)}")
         for n in delete:
@@ -577,6 +819,37 @@ def do_verify(gen_root=GEN_ROOT, gen=None):
         else:
             all_ok = False
     return 0 if all_ok else 1
+
+
+def do_card(gen_root=GEN_ROOT, gen=None, lane=BASE_LANE):
+    """★결정 7 복원 경로(읽기 전용): 세대에서 그 레인의 정본 카드를 manifest `canonical_cards` 의 **경로 이름**으로
+    찾아 `저장파일<TAB>sha256<TAB>원경로` 한 줄을 출력한다(select_card · 범위: 본부=~/_round, 부서=<pack>/round).
+    ⛔쓰지 않는다 — 이 도구는 state-generations/ 밖에 쓰지 않는다. 사람이 출력된 저장 파일을 원 경로로 복사한다.
+    gen 미지정 = 이름상 최신 세대. rc 0=찾음·해시 일치 / 1=세대 없음·정본 기록 없음·저장 파일 없음·해시 불일치."""
+    gens = list_generations(gen_root)
+    name = gen or (gens[-1] if gens else None)
+    if not name:
+        print("[card] 세대 없음", file=sys.stderr)
+        return 1
+    gdir = os.path.join(gen_root, name)
+    try:
+        with open(os.path.join(gdir, "manifest.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"[card] {name}: manifest 판독 실패 {e}", file=sys.stderr)
+        return 1
+    entry = select_card(manifest, lane)
+    if entry is None:
+        lanes = sorted((manifest.get("canonical_cards") or {}).keys())
+        print(f"[card] {name}: 레인 {lane!r} 의 정본 카드가 이 세대에 없다(기록된 레인 {lanes}) — "
+              "다른 카드로 대체하지 않는다. --gen 으로 다른 세대를 지정하라", file=sys.stderr)
+        return 1
+    stored = os.path.join(gdir, entry["stored_as"])
+    if not os.path.isfile(stored) or _sha256(stored) != entry["sha256"]:
+        print(f"[card] {name}: 저장 카드 {entry['stored_as']} 없음 또는 해시 불일치", file=sys.stderr)
+        return 1
+    print(f"{stored}\t{entry['sha256']}\t{entry['source']}")
+    return 0
 
 
 def do_self_test():
@@ -757,6 +1030,36 @@ def do_self_test():
         print("  [PASS] T7 경합 승격: 자리 2개를 뺏겨도 세대 유실 없음(%s · 디스크 실재 · verify OK) · 경합자 %d건 불파괴"
               % (gen7, len(_racers)))
 
+        # T8: ★B-320 — 충돌 접미가 시각에 남는다(같은 스탬프 두 세대가 같은 시각으로 접히지 않는다).
+        a8 = _parse_stamp("20261018T235340Z")
+        b8 = _parse_stamp("20261018T235340Z-1")
+        assert b8 > a8 and b8.strftime("%Y%m%d%H%M%S") == a8.strftime("%Y%m%d%H%M%S"), "T8: 접미 무시 %r %r" % (a8, b8)
+        print("  [PASS] T8 B-320 충돌 접미 보존(-1 이 더 나중 · 초·날짜 귀속 불변)")
+
+        # T9: ★B-321 레인별 풀 — 오래된 본부 세대 6개 + 최신 단일 레인 세대 54개(같은 날)에서 본부 6개 전부 보관,
+        #     레지스트리에서 빠진 레인은 최신 1건만.
+        base9 = datetime(2026, 10, 19, 0, 0, tzinfo=timezone.utc)
+        names9 = [_gen_stamp(base9 + timedelta(minutes=10 * i)) for i in range(60)]
+        cov9 = {n: (("base",) if i < 6 else ("dept-%d" % (i % 7 + 1),)) for i, n in enumerate(names9)}
+        keep9, _ = compute_gc(names9, now=base9 + timedelta(hours=10), key_of=lambda n: cov9[n])
+        assert all(n in keep9 for n in names9[:6]), "T9: 레인별 풀인데 본부 세대가 밀려났다"
+        keep9b, _ = compute_gc(names9, now=base9 + timedelta(hours=10), key_of=lambda n: cov9[n],
+                               cap_of=lambda k: ABSENT_LANE_KEEP if k == "dept-7" else KEEP_RECENT)
+        d7 = [n for n in names9 if cov9[n] == ("dept-7",)]
+        assert [n for n in d7 if n in keep9b] == [d7[-1]], "T9: 부재 레인 상한 1(최신 보관) 위반"
+        print("  [PASS] T9 B-321 레인별 풀: 본부 6/6 보관 · 부재 레인은 최신 1건만")
+
+        # T10: ★결정 7 — 정본 카드는 레인별 경로 이름으로 고른다(본부=~/_round, 부서=<pack>/round · basename 대체 없음).
+        m10 = {"canonical_cards": {"base": "/h/_round/SESSION_STATE.md",
+                                   "dept-1": "/h/.cys/pack-dept-dept-1/round/SESSION_STATE.md"},
+               "files": [{"source": "/h/.cys/pack/round/SESSION_STATE.md", "stored_as": "aa__SESSION_STATE.md"},
+                         {"source": "/h/_round/SESSION_STATE.md", "stored_as": "bb__SESSION_STATE.md"},
+                         {"source": "/h/.cys/pack-dept-dept-1/round/SESSION_STATE.md", "stored_as": "cc__SESSION_STATE.md"}]}
+        assert (select_card(m10, "base") or {}).get("stored_as") == "bb__SESSION_STATE.md", "T10: 본부 정본 오선택"
+        assert (select_card(m10, "dept-1") or {}).get("stored_as") == "cc__SESSION_STATE.md", "T10: 부서 정본 오선택"
+        assert select_card({"files": m10["files"]}, "base") is None, "T10: 기록 없는 세대에서 basename 대체"
+        print("  [PASS] T10 결정 7 레인별 정본 카드 선택(본부 ~/_round · 부서 <pack>/round · 대체 없음)")
+
         print("=== self-test 전체 PASS ===")
         return 0
     except AssertionError as e:
@@ -783,6 +1086,10 @@ def main():
     p_ver = sub.add_parser("verify", help="manifest 해시 무결성 검증")
     p_ver.add_argument("--gen", default=None)
 
+    p_card = sub.add_parser("card", help="세대에서 레인별 정본 카드 찾기(읽기 전용 복원 경로)")
+    p_card.add_argument("--gen", default=None)
+    p_card.add_argument("--lane", default=BASE_LANE)
+
     sub.add_parser("self-test", help="원자성/중단내성 실증(격리)")
 
     args = ap.parse_args()
@@ -804,6 +1111,8 @@ def main():
         return 0
     if cmd == "verify":
         return do_verify(gen=getattr(args, "gen", None))
+    if cmd == "card":
+        return do_card(gen=args.gen, lane=args.lane)
     if cmd == "self-test":
         return do_self_test()
     ap.print_help()

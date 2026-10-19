@@ -340,6 +340,338 @@ try:
               os.path.isdir(fresh_tmp), "removed=%r" % removed)
         check("E16-D07-TMP-REMOVED 반환 목록에는 죽은 pid 의 오래된 b 만 포함",
               removed == [old_name], repr(removed))
+
+    # ── F. ★B-317(CEO 결정 1·2) 전 레인 적재 — 선언 집합 경로 전량 출력 · 법 묶음 · 제외 · 여집합 ─────────
+    #   밀폐 함대: 본부 팩 round(은퇴될 사본 카드·노드 TODO·법 묶음 2권·제외 미끼) + `~/_round` 라이브 카드 +
+    #   등록 부서 2개(dept-1 실재 · dept-2 는 레지스트리에만 있고 팩 없음 = fail-closed 누락).
+    def _w(path, text):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def build_fleet(tag):
+        h = tempfile.mkdtemp(prefix="snap-%s-" % tag, dir=root)
+        c = os.path.join(h, ".cys")
+        brd = os.path.join(c, "pack", "round")
+        _w(os.path.join(brd, "SESSION_STATE.md"), "# base pack/round copy (retired lineage)\n")
+        _w(os.path.join(brd, "MASTER_TODO.md"), "- [ ] base master\n")
+        _w(os.path.join(brd, "wall-time_TODO.md"), "- [ ] '-wal' inside a name is not a WAL file\n")
+        _w(os.path.join(brd, "CSO_STANDING_RULES.md"), "law vol 1 (unnumbered first member)\n")
+        _w(os.path.join(brd, "CSO_STANDING_RULES_2.md"), "law vol 2\n")
+        for bait in ("OLD.bak-1_TODO.md", "state.db", "state.db-wal", "state.db-shm", "x.sqlite"):
+            _w(os.path.join(brd, bait), "bait\n")
+        _w(os.path.join(h, "_round", "SESSION_STATE.md"), "# LIVE base card (canonical, base lane)\n")
+        _w(os.path.join(h, "_round", "README-NO-TODO-FILES-HERE.md"), "no todo here\n")
+        d1 = os.path.join(c, "pack-dept-dept-1")
+        _w(os.path.join(d1, "round", "SESSION_STATE.md"), "# dept-1 LIVE card (canonical, dept lane)\n")
+        _w(os.path.join(d1, "round", "WORKER_TODO.md"), "- [ ] dept-1 worker\n")
+        d2 = os.path.join(c, "pack-dept-dept-2")          # registered, never created
+        _w(os.path.join(c, "depts.json"), json.dumps({"depts": {
+            "dept-1": {"pack_dir": d1, "socket": os.path.join(h, ".local", "state", "cys-dept-dept-1", "cys.sock")},
+            "dept-2": {"pack_dir": d2, "socket": os.path.join(h, ".local", "state", "cys-dept-dept-2", "cys.sock")}}}))
+        _w(os.path.join(h, ".local", "state", "cys", "topology.json"), "{}\n")
+        return h, brd, d1, d2
+
+    def fleet_env(h, pack):
+        return {"HOME": h, "USERPROFILE": h, "LOCALAPPDATA": os.path.join(h, "AppData", "Local"),
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": os.environ.get("LANG", "C.UTF-8"),
+                "CYS_PACK_DIR": pack}
+
+    def run_tool(h, pack, *args):
+        return subprocess.run([PY, MOD] + list(args), capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", env=fleet_env(h, pack), cwd="/", timeout=120)
+
+    fh, fbrd, fd1, fd2 = build_fleet("fleet")
+    live_card = os.path.join(fh, "_round", "SESSION_STATE.md")
+    rdry = run_tool(fh, os.path.join(fh, ".cys", "pack"), "snapshot", "--dry-run")
+    plus = [l.strip()[2:].rsplit("  (", 1)[0] for l in rdry.stdout.splitlines() if l.strip().startswith("+ ")]
+    absent = [l.split("(없음) ", 1)[1] for l in rdry.stdout.splitlines() if "(없음) " in l]
+    print("  F dry-run declared-present paths (printed, not counted):")
+    for p in plus:
+        print("    + " + p)
+    for p in absent:
+        print("    - " + p)
+    want_present = [os.path.join(fbrd, n) for n in ("SESSION_STATE.md", "MASTER_TODO.md", "wall-time_TODO.md",
+                                                   "CSO_STANDING_RULES.md", "CSO_STANDING_RULES_2.md")]
+    want_present += [live_card, os.path.join(fd1, "round", "SESSION_STATE.md"),
+                     os.path.join(fd1, "round", "WORKER_TODO.md")]
+    check("F1 ★dry-run: 전 레인 round(본부·dept-1)·본부 라이브 카드·법 묶음 2권(무번호 첫 권 포함)이 선언·실재로 출력",
+          rdry.returncode == 0 and all(p in plus for p in want_present),
+          "missing from output: %r" % [p for p in want_present if p not in plus])
+    check("F2 ★fail-closed: 등록됐으나 팩이 없는 dept-2 의 카드·TODO 패턴이 (없음) 으로 출력(선언이 적재를 뜻한다)",
+          os.path.join(fd2, "round", "SESSION_STATE.md") in absent
+          and os.path.join(fd2, "round", "*_TODO.md") in absent, repr(absent))
+    check("F3 dry-run 이 레인별 정본 카드 지도를 출력(본부 -> ~/_round · dept-1 -> <pack>/round)",
+          ("* base -> %s" % live_card) in rdry.stdout
+          and ("* dept-1 -> %s" % os.path.join(fd1, "round", "SESSION_STATE.md")) in rdry.stdout, rdry.stdout[-600:])
+    bad = [p for p in plus if ss._capture_excluded(p)]
+    check("F4 ★B-317-AMEND 결박: 선언 집합에 .db/.sqlite/-wal/-shm/.bak 0건 · '-wal' 을 이름 안에 가진 TODO 는 적재",
+          not bad and os.path.join(fbrd, "OLD.bak-1_TODO.md") not in plus
+          and os.path.join(fbrd, "wall-time_TODO.md") in plus, repr(bad))
+    check("F5 제외 판정 단위: 끝 일치만 제외(a.db a.sqlite a-wal a-shm a.bak a.md.bak-1 제외 · wall-time_TODO.md 비제외)",
+          all(ss._capture_excluded(n) for n in ("a.db", "a.sqlite", "a-wal", "a-shm", "a.bak", "a.md.bak-1"))
+          and not ss._capture_excluded("wall-time_TODO.md"))
+    comp = sorted(n for n in os.listdir(fbrd) if os.path.join(fbrd, n) not in plus)
+    print("  F complement of the base round (present, not declared): %r" % comp)
+    check("F6 ★여집합(AMEND-3 방법): 본부 round 에서 선언 밖 파일 = 미끼 5종 정확히(이름으로 대조)",
+          comp == sorted(["OLD.bak-1_TODO.md", "state.db", "state.db-wal", "state.db-shm", "x.sqlite"]), repr(comp))
+    # F8 (R2): 본부 카드 자리(~/_round)는 이 기계 배치의 사실이다 — 그 디렉터리가 없는 설치(본부 master 가 홈이 아닌
+    #     곳에서 도는 사용자)에서 매 세대 거짓 「누락」을 만들지 않는다. 디렉터리가 있는데 카드가 없으면 누락(fail-closed).
+    nh, _nb, _n1, _n2 = build_fleet("noround")
+    shutil.rmtree(os.path.join(nh, "_round"))
+    rno = run_tool(nh, os.path.join(nh, ".cys", "pack"), "snapshot", "--dry-run")
+    check("F8a (R2) ~/_round 디렉터리가 없으면 본부 카드를 선언하지 않는다(거짓 누락 0 · 카드 지도에 base 없음)",
+          rno.returncode == 0 and os.path.join(nh, "_round", "SESSION_STATE.md") not in rno.stdout
+          and "* base -> " not in rno.stdout, rno.stdout[-400:])
+    os.makedirs(os.path.join(nh, "_round"))
+    rno2 = run_tool(nh, os.path.join(nh, ".cys", "pack"), "snapshot", "--dry-run")
+    check("F8b (R2) ~/_round 가 있는데 카드가 없으면 (없음) 으로 선언(fail-closed)",
+          ("(없음) %s" % os.path.join(nh, "_round", "SESSION_STATE.md")) in rno2.stdout, rno2.stdout[-400:])
+    check("F7 ~/_round 는 레인 round 가 아니다 — 카드만 선언(TODO 패턴 누락을 영구히 만들지 않는다)",
+          os.path.join(fh, "_round", "*_TODO.md") not in absent and os.path.join(fh, "_round", "*_TODO.md") not in plus,
+          repr(absent))
+
+    # ── G. ★결정 7 복원 시뮬레이션 — 복원된 카드 sha == 원본 정본 카드(본부·부서 레인) ─────────────────
+    def _sha(p):
+        import hashlib
+        with open(p, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def newest_manifest(h):
+        gr = os.path.join(h, ".cys", "state-generations")
+        gens = sorted(g for g in os.listdir(gr) if not g.startswith(".tmp-")) if os.path.isdir(gr) else []
+        if not gens:
+            return None, None
+        with open(os.path.join(gr, gens[-1], "manifest.json"), encoding="utf-8") as f:
+            return gens[-1], json.load(f)
+
+    rb = run_tool(fh, os.path.join(fh, ".cys", "pack"), "snapshot")      # 본부 데몬 잡 형상
+    gname, man = newest_manifest(fh)
+    srcs_base = sorted(e["source"] for e in (man or {}).get("files", []))
+    check("G0 본부 발화 세대 생성(rc 0)", rb.returncode == 0 and gname is not None, (rb.stdout + rb.stderr)[-300:])
+    live_entry = [e for e in (man or {}).get("files", []) if e.get("source") == live_card]
+    check("G1 ★세대에 본부 라이브 카드(~/_round/SESSION_STATE.md)가 담겼다(종전: 담기지 않음 = 복원 정본 부재)",
+          len(live_entry) == 1, "sources=%r" % srcs_base)
+    restore_dir = tempfile.mkdtemp(prefix="snap-restore-", dir=root)
+    rc_card = run_tool(fh, os.path.join(fh, ".cys", "pack"), "card", "--lane", "base")
+    restored_sha = None
+    if rc_card.returncode == 0 and rc_card.stdout.strip():
+        stored, _dg, src = rc_card.stdout.strip().split("\t")
+        dst = os.path.join(restore_dir, "SESSION_STATE.md")
+        shutil.copyfile(stored, dst)                      # 복원 = 사람이 출력된 저장 파일을 복사
+        restored_sha = _sha(dst)
+    check("G2 ★복원 시뮬: card --lane base 로 복원한 카드 sha == 원본 본부 정본 카드 sha(≠ 본부 팩 round 사본)",
+          restored_sha == _sha(live_card) and restored_sha != _sha(os.path.join(fbrd, "SESSION_STATE.md")),
+          "rc=%s out=%r err=%r" % (rc_card.returncode, rc_card.stdout[-200:], rc_card.stderr[-300:]))
+    rc_d1 = run_tool(fh, os.path.join(fh, ".cys", "pack"), "card", "--lane", "dept-1")
+    d1_card = os.path.join(fd1, "round", "SESSION_STATE.md")
+    d1_ok = False
+    if rc_d1.returncode == 0 and rc_d1.stdout.strip():
+        stored, _dg, src = rc_d1.stdout.strip().split("\t")
+        dst = os.path.join(restore_dir, "dept-1-SESSION_STATE.md")
+        shutil.copyfile(stored, dst)
+        d1_ok = (src == d1_card and _sha(dst) == _sha(d1_card))
+    check("G3 ★HEAD 범위: 부서 레인 복원은 <pack>/round/SESSION_STATE.md 를 고른다(부서 카드는 그대로 정본)",
+          d1_ok, "rc=%s out=%r err=%r" % (rc_d1.returncode, rc_d1.stdout[-200:], rc_d1.stderr[-300:]))
+    check("G4 fail-closed 기록: 팩 없는 dept-2 의 카드·TODO 패턴이 manifest missing 에(세대는 불완전으로 표시)",
+          os.path.join(fd2, "round", "SESSION_STATE.md") in (man or {}).get("missing", [])
+          and os.path.join(fd2, "round", "*_TODO.md") in (man or {}).get("missing", []), repr((man or {}).get("missing")))
+    rd1 = run_tool(fh, fd1, "snapshot")                                  # 부서 데몬 잡 형상(같은 함대)
+    _g2, man2 = newest_manifest(fh)
+    srcs_dept = sorted(e["source"] for e in (man2 or {}).get("files", []))
+    check("G5 ★적재가 발화 레인에 의존하지 않는다: 본부 발화 세대 소스 집합 == 부서 발화 세대 소스 집합",
+          rd1.returncode == 0 and srcs_base == srcs_dept and srcs_base,
+          "only-base=%r only-dept=%r" % (sorted(set(srcs_base) - set(srcs_dept)), sorted(set(srcs_dept) - set(srcs_base))))
+    # 종전 형상 세대(canonical_cards 없음 · SESSION_STATE.md 1건) — 복원 경로는 basename 으로 대체하지 않는다.
+    gr_f = os.path.join(fh, ".cys", "state-generations")
+    old = os.path.join(gr_f, "20200101T000000Z")
+    os.makedirs(old)
+    _w(os.path.join(old, "SESSION_STATE.md"), "# old lineage card\n")
+    _w(os.path.join(old, "manifest.json"), json.dumps({"files": [{
+        "source": os.path.join(fbrd, "SESSION_STATE.md"), "stored_as": "SESSION_STATE.md",
+        "sha256": _sha(os.path.join(old, "SESSION_STATE.md")), "size": 19}]}))
+    rc_old = run_tool(fh, os.path.join(fh, ".cys", "pack"), "card", "--gen", "20200101T000000Z")
+    check("G6 ★정본 기록 없는 세대에서 card 는 rc 1·출력 0(유일한 SESSION_STATE.md 로 대체하지 않는다)",
+          rc_old.returncode == 1 and rc_old.stdout.strip() == "", "rc=%s out=%r" % (rc_old.returncode, rc_old.stdout))
+    rc_unk = run_tool(fh, os.path.join(fh, ".cys", "pack"), "card", "--gen", gname, "--lane", "dept-9")
+    check("G7 등록되지 않은 레인 이름은 rc 1(추측 대체 없음)", rc_unk.returncode == 1 and not rc_unk.stdout.strip())
+    # G9 (R1): `~/_round` 가 본부 팩 round 를 가리키는 심링크여도 본부 정본 카드는 이름으로 고를 수 있어야 한다
+    #     (실경로로 중복 제거하면 카드 경로 자체가 소스에서 빠져 card 가 rc 1 이 된다).
+    if os.name != "nt":
+        sh, sbrd, _sd1, _sd2 = build_fleet("symlink")
+        shutil.rmtree(os.path.join(sh, "_round"))
+        os.symlink(sbrd, os.path.join(sh, "_round"))
+        rs = run_tool(sh, os.path.join(sh, ".cys", "pack"), "snapshot")
+        rcs = run_tool(sh, os.path.join(sh, ".cys", "pack"), "card", "--lane", "base")
+        check("G9 (R1) ~/_round 심링크 형상에서도 card --lane base 가 rc 0 · 원 경로 = ~/_round/SESSION_STATE.md",
+              rs.returncode == 0 and rcs.returncode == 0
+              and rcs.stdout.strip().split("\t")[-1] == os.path.join(sh, "_round", "SESSION_STATE.md"),
+              "rc=%s/%s out=%r err=%r" % (rs.returncode, rcs.returncode, rcs.stdout[-200:], rcs.stderr[-200:]))
+    if live_entry:
+        tampered = os.path.join(gr_f, gname, live_entry[0]["stored_as"])
+        with open(tampered, "ab") as f:
+            f.write(b"x")
+        rc_t = run_tool(fh, os.path.join(fh, ".cys", "pack"), "card", "--gen", gname, "--lane", "base")
+        check("G8 저장 카드가 변조되면 card 는 rc 1(해시 불일치 · 복원 금지)",
+              rc_t.returncode == 1 and not rc_t.stdout.strip(), "rc=%s" % rc_t.returncode)
+
+    # ── H. ★B-321 레인별 풀 GC(HEAD 형식 결재 · CEO 잔여 상한) + B-320 접미 ───────────────────────────
+    from datetime import datetime as _dtm, timedelta as _td, timezone as _tz
+    LANES8 = ("base",) + tuple("dept-%d" % i for i in range(1, 8))
+    t0 = _dtm(2026, 10, 19, 0, 0, tzinfo=_tz.utc)
+
+    def stamp(t):
+        return t.strftime("%Y%m%dT%H%M%SZ")
+
+    # H1 전이: 같은 날 10분 간격 60세대, 가장 오래된 6개가 본부(나머지 54개는 부서 단일 레인)
+    n60 = [stamp(t0 + _td(minutes=10 * i)) for i in range(60)]
+    cov60 = {n: (("base",) if i < 6 else ("dept-%d" % (i % 7 + 1),)) for i, n in enumerate(n60)}
+    now60 = t0 + _td(hours=10)
+    k_lane, _ = ss.compute_gc(n60, now=now60, key_of=lambda n: cov60[n])
+    k_one, _ = ss.compute_gc(n60, now=now60)
+    check("H1 ★전이: 단일 레인 54개 사이 본부 6개 → 레인별 풀이면 6/6 보관",
+          all(n in k_lane for n in n60[:6]), "base kept %d/6" % sum(n in k_lane for n in n60[:6]))
+    check("H1c 대조(구별력): 단일 풀(종전 판정)이면 같은 입력에서 본부 세대가 밀려난다",
+          not all(n in k_one for n in n60[:6]), "base kept %d/6" % sum(n in k_one for n in n60[:6]))
+
+    def roll(store, cov, newer, newcov, cap_of=None):
+        """newer 를 하나씩 추가하며 매번 GC(스냅샷마다 GC 하는 실제 순서) → 마지막 store."""
+        store, cov = list(store), dict(cov)
+        for t, n in newer:
+            store.append(n)
+            cov[n] = newcov
+            keep, _ = ss.compute_gc(store, now=t, key_of=lambda x: cov[x], cap_of=cap_of)
+            store = [x for x in store if x in keep]
+        return store
+
+    old60 = [stamp(t0 + _td(hours=i)) for i in range(60)]
+    covold = {n: ((LANES8[(i % 8)]),) for i, n in enumerate(old60)}
+    newer120 = [(t0 + _td(days=3, hours=6 * j), stamp(t0 + _td(days=3, hours=6 * j))) for j in range(120)]
+    st2 = roll(old60, covold, newer120, LANES8)
+    check("H2 ★노화: 단일 레인 60세대 뒤 전 레인 120세대(30일) → 옛 단일 레인 세대 0개 잔존",
+          not any(n in st2 for n in old60), "old left %d, store %d" % (sum(n in st2 for n in old60), len(st2)))
+    all8 = [stamp(t0 + _td(hours=6 * i)) for i in range(60)]
+    cov8 = {n: LANES8 for n in all8}
+    newer9 = [(t0 + _td(days=15, hours=6 * j), stamp(t0 + _td(days=15, hours=6 * j))) for j in range(120)]
+    st3 = roll(all8, cov8, newer9, LANES8 + ("dept-8",))
+    check("H3 ★새 레인 등장: 8레인 세대 뒤 9레인 세대 120개 → 8레인 세대 동결 블록 0개",
+          not any(n in st3 for n in all8), "8-lane gens left %d" % sum(n in st3 for n in all8))
+
+    # H4 삭제(부재) 레인: dept-X 를 담은 세대 30개(2시간 간격) → 그 뒤 120세대는 dept-X 미포함 · 레지스트리에 dept-X 없음.
+    #     (뒤 세대는 앞 세대가 끝난 뒤에 시작한다 — 이름이 겹치면 검체가 자기 입력을 덮는다)
+    gx = [stamp(t0 + _td(hours=2 * i)) for i in range(30)]
+    later = [(t0 + _td(days=3, hours=2 * j), stamp(t0 + _td(days=3, hours=2 * j))) for j in range(120)]
+    cap_absent = lambda k: ss.ABSENT_LANE_KEEP if k == "dept-X" else ss.KEEP_RECENT
+    st4 = roll(gx, {n: ("dept-X",) for n in gx}, later, ("base",), cap_of=cap_absent)
+    check("H4 ★부재 레인 잔여 상한 1: dept-X 만 담은 세대는 최신 1건만 남는다(최종 상태 보관 · 이력 미보관)",
+          [n for n in st4 if n in gx] == [gx[-1]], "kept %r" % [n for n in st4 if n in gx])
+    # (ii) 부재 레인을 담은 나머지 세대는 **자기가 속한 다른 풀**의 정책으로만 남는다:
+    #      공유 세대(base+dept-X)에서 보관 = (base 풀만으로 보관될 것) ∪ {dept-X 최신 1건}.
+    st4s = roll(gx, {n: ("base", "dept-X") for n in gx}, later, ("base",), cap_of=cap_absent)
+    st4b = roll(gx, {n: ("base",) for n in gx}, later, ("base",))
+    want4 = sorted(set(n for n in st4b if n in gx) | {gx[-1]})
+    check("H4b ★공유 세대: 보관 = base 풀 자체 보관분 ∪ dept-X 최신 1건(나머지는 다른 풀에서 노화)",
+          sorted(n for n in st4s if n in gx) == want4,
+          "kept %r want %r" % (sorted(n for n in st4s if n in gx), want4))
+    st4p = roll(gx, {n: ("dept-X",) for n in gx}, later, ("base",))
+    check("H4c 대조: 상한 48(현존 레인)이면 dept-X 세대 30/30 보관",
+          sum(n in st4p for n in gx) == 30, "kept %d" % sum(n in st4p for n in gx))
+
+    # H5 레지스트리 판독 → 풀 상한(_lane_caps · 라이브 depts.json 무접촉 — 밀폐 사본만)
+    regh = tempfile.mkdtemp(prefix="snap-reg-", dir=root)
+    pk_present = os.path.join(regh, ".cys", "pack-dept-dept-1")
+    pk_absent = os.path.join(regh, ".cys", "pack-dept-dept-9")
+    dj = os.path.join(regh, ".cys", "depts.json")
+    base_rd = os.path.join(regh, ".cys", "pack", "round")
+    _w(dj, json.dumps({"depts": {"dept-1": {"pack_dir": pk_present}}}))
+    cap, ok = ss._lane_caps(home=regh, depts_json=dj)
+    check("H5a 현존 레인(레지스트리 pack_dir/round) 상한 48", ok and cap(os.path.join(pk_present, "round")) == 48)
+    check("H5b 부재 레인(레지스트리에 없는 팩 round) 상한 1", cap(os.path.join(pk_absent, "round")) == 1)
+    check("H5c ★본부는 결코 부재가 아니다(부서 항목이 아님): ~/.cys/pack/round·~/_round 상한 48",
+          cap(base_rd) == 48 and cap(os.path.join(regh, "_round")) == 48)
+    _w(dj, json.dumps({"depts": {}}))
+    cap_e, ok_e = ss._lane_caps(home=regh, depts_json=dj)
+    check("H5d 빈 레지스트리(읽힘)에서도 본부는 48 · 부서 팩 round 는 1",
+          ok_e and cap_e(base_rd) == 48 and cap_e(os.path.join(pk_present, "round")) == 1)
+    bad_regs = {"missing": None, "unparsable": "{not json", "depts-not-a-map": json.dumps({"depts": []}),
+                "no-depts-key": json.dumps({"x": 1}), "entry-without-pack_dir": json.dumps({"depts": {"d": {"socket": "s"}}})}
+    for label, body in sorted(bad_regs.items()):
+        if body is None:
+            if os.path.exists(dj):
+                os.remove(dj)
+        else:
+            _w(dj, body)
+        cap_b, ok_b = ss._lane_caps(home=regh, depts_json=dj)
+        check("H5e ★레지스트리 판독 실패(%s)는 부재가 아니다 — 전 레인 48" % label,
+              (not ok_b) and cap_b(os.path.join(pk_absent, "round")) == 48 and cap_b(base_rd) == 48)
+    check("H5f 레인이 아닌 풀('' · '?')은 48", cap("") == 48 and cap("?") == 48)
+    # H9 (R2): 부재 판정은 HOME 절대경로가 아니라 구조로 한다 — HOME 이 옮겨진 뒤 옛 세대의 키(다른 접두)에서도
+    #     본부는 결코 부재가 아니고, 등록된 부서는 팩 이름으로 현존이며, `_round` 레인(프로젝트)은 부서가 아니다.
+    _w(dj, json.dumps({"depts": {"dept-1": {"pack_dir": pk_present}}}))
+    cap9, _ok9 = ss._lane_caps(home=regh, depts_json=dj)
+    oldh = os.path.join(root, "old-home-before-move")
+    check("H9a (R2) HOME 이동 뒤 옛 접두의 본부 키(.cys/pack/round)도 48 — 본부는 결코 부재가 아니다",
+          cap9(os.path.join(oldh, ".cys", "pack", "round")) == 48)
+    check("H9b (R2) HOME 이동 뒤 옛 접두의 등록 부서 키는 팩 이름으로 현존(48) · 미등록 부서 팩은 1",
+          cap9(os.path.join(oldh, ".cys", "pack-dept-dept-1", "round")) == 48
+          and cap9(os.path.join(oldh, ".cys", "pack-dept-dept-9", "round")) == 1)
+    check("H9c (R2) `_round` 레인(본부 카드 자리·JAVIS_ROOT 프로젝트)은 부서가 아니다 — 48",
+          cap9(os.path.join(oldh, "_round")) == 48 and cap9(os.path.join(root, "proj", "_round")) == 48)
+
+    # H6 B-320 같은 스탬프 충돌쌍 — 판정이 입력 순서가 아니라 정책(승격 순서)으로 정해진다.
+    a = "20261015T120000Z"
+    a1 = a + "-1"
+    newer48 = [stamp(_dtm(2026, 10, 16, tzinfo=_tz.utc) + _td(minutes=i)) for i in range(48)]
+    now6 = _dtm(2026, 10, 18, tzinfo=_tz.utc)
+    k_ab, _ = ss.compute_gc([a, a1] + newer48, now=now6)
+    k_ba, _ = ss.compute_gc([a1, a] + newer48, now=now6)
+    check("H6 ★B-320: 같은 스탬프 쌍의 일별 대표가 입력 순서와 무관(-1 = 나중 승격 쪽)",
+          k_ab == k_ba and a1 in k_ab and a not in k_ab, "ab=%r ba=%r" % (a1 in k_ab, a1 in k_ba))
+    check("H6b _parse_stamp(<s>-1) > _parse_stamp(<s>) · 같은 초",
+          ss._parse_stamp(a1) > ss._parse_stamp(a)
+          and ss._parse_stamp(a1).replace(microsecond=0) == ss._parse_stamp(a))
+
+    # H7 do_gc 배선 — 실제 manifest 판독(_coverage_keys)·레지스트리(_lane_caps) 경유(밀폐 gen_root·사본 레지스트리)
+    wh = tempfile.mkdtemp(prefix="snap-wire-", dir=root)
+    wgr = os.path.join(wh, "gen")
+    wpk = {ln: (os.path.join(wh, ".cys", "pack") if ln == "base" else os.path.join(wh, ".cys", "pack-dept-" + ln))
+           for ln in LANES8}
+    _w(os.path.join(wh, ".cys", "depts.json"), json.dumps({"depts": {
+        ln: {"pack_dir": wpk[ln]} for ln in LANES8 if ln != "base"}}))
+    for i, n in enumerate(n60):
+        lane = cov60[n][0]
+        src = os.path.join(wpk[lane], "round", "SESSION_STATE.md")
+        _w(os.path.join(wgr, n, "manifest.json"), json.dumps({"files": [
+            {"source": src, "stored_as": "SESSION_STATE.md", "sha256": "0", "size": 0}]}))
+    wkeep, wdel = ss.do_gc(gen_root=wgr, dry_run=True, home=wh, depts_json=os.path.join(wh, ".cys", "depts.json"))
+    check("H7 ★do_gc 배선: 실제 manifest 에서 레인을 읽어 본부 6/6 보관(삭제 목록에 본부 0)",
+          not any(n in wdel for n in n60[:6]), "deleted base %r" % [n for n in n60[:6] if n in wdel])
+    # 같은 저장소에 레지스트리 밖 레인(dept-9) 세대 3개 → do_gc 가 최신 1개만 남긴다
+    x9 = [stamp(t0 + _td(minutes=1 + 10 * i)) for i in range(3)]
+    for n in x9:
+        _w(os.path.join(wgr, n, "manifest.json"), json.dumps({"files": [{
+            "source": os.path.join(wh, ".cys", "pack-dept-dept-9", "round", "WORKER_TODO.md"),
+            "stored_as": "WORKER_TODO.md", "sha256": "0", "size": 0}]}))
+    wkeep2, wdel2 = ss.do_gc(gen_root=wgr, dry_run=True, home=wh, depts_json=os.path.join(wh, ".cys", "depts.json"))
+    check("H7b ★do_gc 배선: 레지스트리 밖 레인 세대는 최신 1건만 보관",
+          [n for n in x9 if n in wkeep2] == [x9[-1]], "kept %r" % [n for n in x9 if n in wkeep2])
+    os.remove(os.path.join(wh, ".cys", "depts.json"))
+    wkeep3, wdel3 = ss.do_gc(gen_root=wgr, dry_run=True, home=wh, depts_json=os.path.join(wh, ".cys", "depts.json"))
+    check("H7c ★do_gc 배선: 레지스트리 판독 불가면 그 세대 3건 모두 보관(부재 판정 안 함)",
+          all(n in wkeep3 for n in x9), "kept %r" % [n for n in x9 if n in wkeep3])
+    # H8 (R1): 레인 패턴 이름이라도 round/_round 밖(예: 기억 저장소의 x_TODO.md)은 레인이 아니다 —
+    #     가짜 레인 풀이 부재 상한 1 을 받아 그 세대들을 지우면 안 된다.
+    mh = tempfile.mkdtemp(prefix="snap-mem-", dir=root)
+    mgr = os.path.join(mh, "gen")
+    _w(os.path.join(mh, ".cys", "depts.json"), json.dumps({"depts": {}}))
+    m3 = [stamp(t0 + _td(minutes=i)) for i in range(3)]
+    for n in m3:
+        _w(os.path.join(mgr, n, "manifest.json"), json.dumps({"files": [{
+            "source": os.path.join(mh, ".claude", "projects", "p", "memory", "notes_TODO.md"),
+            "stored_as": "notes_TODO.md", "sha256": "0", "size": 0}]}))
+    mkeep, _ = ss.do_gc(gen_root=mgr, dry_run=True, home=mh, depts_json=os.path.join(mh, ".cys", "depts.json"))
+    check("H8 (R1) round 밖의 레인 패턴 파일은 레인 키가 아니다(기억 x_TODO.md 세대 3건 모두 보관)",
+          all(n in mkeep for n in m3), "kept %r" % [n for n in m3 if n in mkeep])
 finally:
     shutil.rmtree(root, ignore_errors=True)
 
