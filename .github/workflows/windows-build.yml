@@ -987,11 +987,24 @@ jobs:
           $expVer = $verHit.Matches[0].Groups[1].Value
           function ShaOf($p) { (Get-FileHash -Algorithm SHA256 -LiteralPath $p).Hash }
           # ① 사전 정돈 + 구버전 스탠드인 2종 배치(cmd 사본 = 다른 VERSIONINFO → 오라클 notfresh)
-          Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Start-Sleep 1
-          Get-ChildItem (Join-Path $dir '*') -File -Include 'cys.prev*.exe','cysd.prev*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-          Copy-Item "$env:SystemRoot\System32\cmd.exe" $cys -Force
-          Copy-Item "$env:SystemRoot\System32\cmd.exe" $cysd -Force
+          # ★(0.14.52 · 실발생: 2026-10-08 런 37770475283 · 2026-10-19 런 39238822987) 종전에는 `Stop-Process` 뒤 1초만 쉬고
+          #   `Copy-Item` 을 한 번 시도해, 그 사이에 `cys.exe` 를 쥔 프로세스가 남아 있으면 "being used by another process" 로
+          #   단언 전에 스텝이 붉었다. T4-14 의 스탠드인 배치와 같이 준비 단계만 유한 재시도한다(최대 10회 · 매번 다시 끝내고 1초 쉼) —
+          #   아래 ②~의 핸들·업그레이드·단언은 그대로다. 10회 안에 못 놓으면 사유를 밝혀 실패한다(준비 실패를 통과로 접지 않는다).
+          $placed = $false
+          for ($attempt = 1; $attempt -le 10 -and -not $placed; $attempt++) {
+            Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 1
+            Get-ChildItem (Join-Path $dir '*') -File -Include 'cys.prev*.exe','cysd.prev*.exe' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+            try {
+              Copy-Item "$env:SystemRoot\System32\cmd.exe" $cys -Force -ErrorAction Stop
+              Copy-Item "$env:SystemRoot\System32\cmd.exe" $cysd -Force -ErrorAction Stop
+              $placed = $true
+            } catch {
+              Write-Host ("스탠드인 배치 재시도 {0}/10: {1}" -f $attempt, $_.Exception.Message)
+            }
+          }
+          if (-not $placed) { Die "T4-15: 스탠드인 배치 실패 — cys.exe·cysd.exe 를 쥔 프로세스가 10회 재시도 동안 남아 있었다(준비 단계)" }
           $oldSha = ShaOf "$env:SystemRoot\System32\cmd.exe"
           $lock = Start-Process -FilePath $cys -ArgumentList '/c ping -n 900 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
           Start-Sleep 2
