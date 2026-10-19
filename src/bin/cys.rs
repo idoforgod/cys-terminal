@@ -18276,9 +18276,13 @@ fn run_launch_agent_opts(
 // plist 포맷·경로·LABEL은 `cys::launchd`(앱 자동등록과 단일 소스) 위임 — 드리프트 방지.
 
 /// ★C (0.14.52 update repair, design rev9 section 0, table row 7, report only): after `launchctl load`, "daemon up"
-/// means the daemon answers `system.identify`, not that its socket accepts. Each try is one private connection
-/// (`request_on_timeout`: no-progress deadline = the smaller of the time left and 2 s) after the old 100 ms pause;
-/// the total is `budget`. It only judges (`false` prints "unconfirmed"); rows 6 and 10 keep `connect_raw()`.
+/// means the daemon answers `system.identify`, not that its socket accepts. Each try: the old 100 ms pause, then one
+/// private connection with `request_on_timeout(.., per_try)`, per_try = the smaller of the time left and 2 s. What is
+/// bounded, precisely: the connect is NOT (Unix blocking connect; Windows busy-pipe retry, as before); `per_try` is a
+/// NO-PROGRESS (idle) limit on each read and write (`RpcDeadline`), not a whole-request deadline, so a reply that keeps
+/// trickling bytes can run past it; `budget` decides only whether another try STARTS. The per-try cap matters when a
+/// first try hangs and a later one would answer (`c_row7_first_try_unanswered_then_a_later_one_answers`). It only judges
+/// (`false` prints "unconfirmed"); rows 6 and 10 keep `connect_raw()`.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn daemon_answers_within(socket: &std::path::Path, budget: std::time::Duration) -> bool {
     let started = std::time::Instant::now();
@@ -42843,6 +42847,58 @@ mod update_repair_c_row7 {
             });
         }
         (dir, sock)
+    }
+
+    /// A rig whose FIRST accepted connection is read and never answered, and whose later connections are answered (the
+    /// shape that tells a per-try cap from none: codex R1 minor 1 on e18372bb, B7).
+    #[cfg(unix)]
+    fn rig_first_silent(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::io::{BufRead, Write};
+        let dir = std::env::temp_dir().join(format!("cys-ur7-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("d.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut w = stream.try_clone().unwrap();
+                    let mut r = std::io::BufReader::new(stream);
+                    let mut line = String::new();
+                    while r.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                        if i > 0 {
+                            let _ = w.write_all(b"{\"id\":1,\"ok\":true,\"result\":{\"daemon_pid\":4242,\"version\":\"0.0.0-rig\"}}\n");
+                            let _ = w.flush();
+                        }
+                        line.clear();
+                    }
+                });
+            }
+        });
+        (dir, sock)
+    }
+
+    /// ★codex R1 minor 1 (e18372bb, B7): the first try hangs, a later one answers. With the 2 s per-try cap the first try
+    /// is cut at 2 s and the second finds the answer inside the 4 s budget (up, after about 2.2 s); without the cap the
+    /// first try takes the whole budget and the result is "not up". The total-silence specimen above stays as it is.
+    #[cfg(unix)]
+    #[test]
+    fn c_row7_first_try_unanswered_then_a_later_one_answers() {
+        use std::time::{Duration, Instant};
+        let (dir, sock) = rig_first_silent("first-silent");
+        let t = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(super::daemon_answers_within(&sock, Duration::from_secs(4)));
+        });
+        let up = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("daemon_answers_within on a first-silent rig did not end within 10 s");
+        let took = t.elapsed();
+        assert!(up, "the first try is cut at the 2 s per-try cap and a later try finds the answer inside the 4 s budget");
+        assert!(took >= Duration::from_millis(2000) && took < Duration::from_millis(3500), "first try cut at 2 s, second answered: {took:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// ★C row 7 purpose test: "up" on a responsive rig at the first try; `false` inside the budget on a dead rig and on

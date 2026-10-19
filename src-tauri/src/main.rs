@@ -5499,8 +5499,8 @@ enum IdentifyMiss {
     Failed,
 }
 
-/// ★A2: one `system.identify` on a private single-use connection (`rpc_oneshot`, never the pooled one) within
-/// `deadline`, the connect included. On timeout the future is dropped and its connection closes with it, so the shared
+/// ★A2: one `system.identify` on a private single-use connection (`rpc_oneshot`, never the pooled one) under ONE hard
+/// elapsed limit `deadline` over the whole call: connect, write and read together. On timeout the future is dropped and its connection closes with it, so the shared
 /// pool (conn_cell) is not desynchronized. It only judges (CEO ruling 5, absolute condition;
 /// `c_probe_and_a2_never_stop_a_process_source_pin`). The readiness rows use `probe_readiness` instead (C-LOUD).
 #[cfg_attr(not(unix), allow(dead_code))]
@@ -5528,10 +5528,12 @@ enum Readiness {
     Unreachable,
 }
 
-/// ★C-LOUD: one readiness probe on a private single-use connection (never the pooled one). The connect is the base
-/// presence check, unchanged and without a new deadline, so the spawn decision stays the base one; only the
-/// `system.identify` exchange on that same connection runs under `deadline`. Dropping the timed-out future closes the
-/// connection. It only judges (CEO ruling 5, absolute condition; `c_probe_and_a2_never_stop_a_process_source_pin`).
+/// ★C-LOUD: one readiness probe on a private single-use connection (never the pooled one). Two phases, bounded
+/// differently: (1) the connect is the base presence check, unchanged and NOT bounded here (Unix: returns at once,
+/// accepted or refused; Windows: `connect_to` retries a busy pipe for up to `cys::PIPE_BUSY_RETRY_DEADLINE`, 5 s), so the
+/// spawn decision stays the base one; (2) the exchange on that connection (write the `system.identify` request, read one
+/// reply line) runs under `deadline` as one hard elapsed limit. Dropping the timed-out future closes the connection. It
+/// only judges (CEO ruling 5, absolute condition; `c_probe_and_a2_never_stop_a_process_source_pin`).
 async fn probe_readiness(socket: &std::path::Path, deadline: std::time::Duration) -> Readiness {
     let Ok(stream) = connect_to(socket).await else {
         return Readiness::Unreachable;
@@ -5540,7 +5542,7 @@ async fn probe_readiness(socket: &std::path::Path, deadline: std::time::Duration
     let mut line = serde_json::to_vec(&json!({"id": 1, "method": "system.identify", "params": {}})).unwrap_or_default();
     line.push(b'\n');
     match tokio::time::timeout(deadline, rpc_once(socket, &mut conn, &line)).await {
-        Err(_) => Readiness::NotAnswering(format!("확인 요청(system.identify)에 {} ms 안에 답이 없음", deadline.as_millis())),
+        Err(_) => Readiness::NotAnswering("확인 요청(system.identify)에 답이 없음".into()),
         Ok(Err(RpcErr::BeforeSend(e) | RpcErr::AfterSend(e))) => {
             Readiness::NotAnswering(format!("확인 요청(system.identify) 뒤 답 없이 실패: {e}"))
         }
@@ -5555,12 +5557,18 @@ async fn probe_readiness(socket: &std::path::Path, deadline: std::time::Duration
     }
 }
 
-/// ★C (rows 4, 5): poll until the daemon answers (no spawn here) and return what the LAST try saw. The total budget is
-/// `attempts` x 100 ms, the budget of the removed `wait_for_connect`; each try's exchange is bounded by the smaller of
-/// the time left and 2 s, so a hung daemon also ends inside the budget (as `NotAnswering`). Design row 1: the old
-/// helper served only rows 4 and 5, so the call sites changed and the presence helper was removed.
+/// ★C (rows 4, 5): poll until the daemon answers (no spawn here). `attempts` x 100 ms (the budget of the removed
+/// `wait_for_connect`) bounds when a try may START, not the wall time: before each try the time left is computed; the
+/// try's connect is not bounded (see `probe_readiness`), its exchange is bounded by the smaller of the time left and 2 s,
+/// and a 100 ms pause follows a try that got no answer. So the call returns within the budget + the last try's connect
+/// time + 100 ms (on Unix the connect returns at once; on Windows a busy pipe can hold it for up to 5 s).
+/// Result: `Answers` as soon as a try answers; otherwise `NotAnswering` if ANY try was accepted but not answered
+/// (★C-LOUD-STICKY: a later failed connect does not replace it, because the same daemon's backlog fills with unaccepted
+/// connections and then refuses them - measured on Darwin - so a refusal after an accept is not "no daemon");
+/// `Unreachable` only if no try ever connected. Design row 1: the old helper served only rows 4 and 5, so the call sites
+/// changed and the presence helper was removed.
 async fn wait_for_readiness(socket: &std::path::Path, attempts: u32) -> Readiness {
-    let budget = std::time::Duration::from_millis(100 * u64::from(attempts));
+    let budget = readiness_budget(attempts);
     let started = std::time::Instant::now();
     let mut last = Readiness::Unreachable;
     loop {
@@ -5568,26 +5576,39 @@ async fn wait_for_readiness(socket: &std::path::Path, attempts: u32) -> Readines
         if left.is_zero() {
             return last;
         }
-        last = probe_readiness(socket, left.min(DAEMON_ANSWER_DEADLINE)).await;
-        if last == Readiness::Answers {
-            return last;
+        match probe_readiness(socket, left.min(DAEMON_ANSWER_DEADLINE)).await {
+            Readiness::Answers => return Readiness::Answers,
+            // ★C-LOUD-STICKY: accepted-but-unanswered evidence is never downgraded to "no daemon".
+            Readiness::Unreachable if matches!(last, Readiness::NotAnswering(_)) => {}
+            seen => last = seen,
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
+/// The wait budget of `wait_for_readiness(.., attempts)` (the removed `wait_for_connect`'s `attempts` x 100 ms).
+fn readiness_budget(attempts: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(100 * u64::from(attempts))
+}
+
+/// ★C (row 4): the post-spawn wait, 40 x 100 ms = 4 s, as before. ★C (row 5): the launchd-owned boot wait, 5 s.
+const ROW4_ATTEMPTS: u32 = 40;
+const ROW5_ATTEMPTS: u32 = 50;
+
 /// ★C-LOUD: the head of every "accepts but does not answer" error. The boot keys on it (`is_not_answering`).
 const DAEMON_NOT_ANSWERING: &str = "cysd 가 연결은 받지만 응답하지 않습니다";
 
-/// ★C-LOUD: the specific error of rows 3, 4 and 5 for a daemon that accepts but does not answer. `spawned` = row 4
-/// (this call started a cysd before waiting).
-fn not_answering_error(why: &str, spawned: bool) -> String {
+/// ★C-LOUD: the specific error of rows 3, 4 and 5 for a daemon that accepts but does not answer. `waited` = the whole
+/// check window this decision gave the daemon (row 3: one 2 s probe; rows 4/5: the 4 s / 5 s wait), so the user reads
+/// the wait that matters, not the slice the last try happened to have left (gemini R1 minor 1 on e18372bb).
+/// `spawned` = row 4 (this call started a cysd before waiting).
+fn not_answering_error(why: &str, waited: std::time::Duration, spawned: bool) -> String {
     let what = if spawned {
         "cysd 를 띄운 뒤에도 답이 없었습니다"
     } else {
         "새 cysd 를 띄우지 않았고, 떠 있는 cysd 를 멈추지도 않았습니다"
     };
-    format!("{DAEMON_NOT_ANSWERING} ({why}) — {what}")
+    format!("{DAEMON_NOT_ANSWERING} ({why}, 확인 시간 {}초) — {what}", waited.as_secs())
 }
 
 fn is_not_answering(e: &str) -> bool {
@@ -5615,9 +5636,9 @@ async fn boot_first_daemon_step(
 ) -> Result<(), String> {
     let result = if launchd_owns {
         // ★C (row 5): the launchd-owned daemon is ready when it answers (same 5 s budget as before).
-        match wait_for_readiness(socket, 50).await {
+        match wait_for_readiness(socket, ROW5_ATTEMPTS).await {
             Readiness::Answers => Ok(()),
-            Readiness::NotAnswering(why) => Err(not_answering_error(&why, false)),
+            Readiness::NotAnswering(why) => Err(not_answering_error(&why, readiness_budget(ROW5_ATTEMPTS), false)),
             Readiness::Unreachable => {
                 eprintln!("[cys-app] launchd-owned cysd not ready in 5s — 형제 spawn 폴백");
                 ensure_daemon_on(socket, reset_in_progress, spawn).await
@@ -5850,7 +5871,7 @@ async fn ensure_daemon_on(
     // no second cysd, so cysd's own reclaim of a holder stays out of the GUI's reach.
     match probe_readiness(socket, DAEMON_ANSWER_DEADLINE).await {
         Readiness::Answers => return Ok(()),
-        Readiness::NotAnswering(why) => return Err(not_answering_error(&why, false)),
+        Readiness::NotAnswering(why) => return Err(not_answering_error(&why, DAEMON_ANSWER_DEADLINE, false)),
         Readiness::Unreachable => {}
     }
     // ★A3(성찰 확정): 완전 초기화 진행 중에는 데몬을 스폰하지 않는다 — 이 경로가 리셋 도중
@@ -5861,9 +5882,9 @@ async fn ensure_daemon_on(
     }
     spawn()?;
     // ★C (row 4): GUI readiness after a spawn = the daemon answers (same 4 s budget as before).
-    match wait_for_readiness(socket, 40).await {
+    match wait_for_readiness(socket, ROW4_ATTEMPTS).await {
         Readiness::Answers => Ok(()),
-        Readiness::NotAnswering(why) => Err(not_answering_error(&why, true)),
+        Readiness::NotAnswering(why) => Err(not_answering_error(&why, readiness_budget(ROW4_ATTEMPTS), true)),
         Readiness::Unreachable => Err("cysd did not come up within 4s".into()),
     }
 }
@@ -12312,6 +12333,12 @@ exit 0
         Hung,
         DeadAbsent,
         DeadStale,
+        /// ★C-LOUD-STICKY: a listener that never accepts, its backlog cut to 1 (`listen(fd, 1)` again; measured on Darwin
+        /// 27.0.0 to take effect). The first connect lands in the backlog and gets no answer; a never-accepted connection
+        /// keeps its slot after the client closes it (measured), so the next connects are refused: the "hung, then
+        /// refused" sequence of a wedged accept loop, produced by the probes' own connections. Used by a macOS-only test.
+        #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+        Wedged,
     }
 
     /// A rig daemon on its own temp socket. `accepts` counts connections it accepted; `client_closed` counts
@@ -12322,6 +12349,7 @@ exit 0
         sock: std::path::PathBuf,
         accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         client_closed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        _wedged: Option<std::os::unix::net::UnixListener>,
     }
 
     #[cfg(unix)]
@@ -12342,9 +12370,16 @@ exit 0
             let sock = dir.join("d.sock");
             let accepts = Arc::new(AtomicUsize::new(0));
             let client_closed = Arc::new(AtomicUsize::new(0));
+            let mut wedged = None;
             match mode {
                 RigMode::DeadAbsent => {}
                 RigMode::DeadStale => drop(std::os::unix::net::UnixListener::bind(&sock).unwrap()),
+                RigMode::Wedged => {
+                    use std::os::unix::io::AsRawFd as _;
+                    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+                    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0, "listen(fd, 1)");
+                    wedged = Some(listener);
+                }
                 RigMode::Hung | RigMode::Responsive { .. } => {
                     let listener = tokio::net::UnixListener::bind(&sock).unwrap();
                     let (accepts, closed) = (accepts.clone(), client_closed.clone());
@@ -12393,7 +12428,7 @@ exit 0
                     });
                 }
             }
-            RigDaemon { dir, sock, accepts, client_closed }
+            RigDaemon { dir, sock, accepts, client_closed, _wedged: wedged }
         }
 
         fn accepted(&self) -> usize {
@@ -12465,7 +12500,7 @@ exit 0
             let t = Instant::now();
             let r = must_end("probe_readiness on a hung rig", probe_readiness(&hung.sock, DAEMON_ANSWER_DEADLINE)).await;
             let took = t.elapsed();
-            assert_eq!(r, Readiness::NotAnswering("확인 요청(system.identify)에 2000 ms 안에 답이 없음".into()), "a hung rig accepts and does not answer");
+            assert_eq!(r, Readiness::NotAnswering("확인 요청(system.identify)에 답이 없음".into()), "a hung rig accepts and does not answer");
             assert!(took >= Duration::from_millis(1900) && took < Duration::from_millis(3000), "hung readiness probe took {took:?}");
             assert_eq!(hung.accepted(), 2, "the readiness probe connected once");
             let t = Instant::now();
@@ -12503,7 +12538,7 @@ exit 0
 
             let t = Instant::now();
             let r = must_end("wait_for_readiness on a hung rig", wait_for_readiness(&hung.sock, 40)).await;
-            assert!(matches!(&r, Readiness::NotAnswering(why) if why.starts_with("확인 요청(system.identify)에 ")), "hung: {r:?}");
+            assert_eq!(r, Readiness::NotAnswering("확인 요청(system.identify)에 답이 없음".into()), "hung");
             let took = t.elapsed();
             assert!(took >= Duration::from_millis(3900) && took < Duration::from_millis(5000), "hung, budget 4 s: {took:?}");
 
@@ -12622,8 +12657,8 @@ exit 0
 
             assert_eq!(
                 h.0,
-                Err(not_answering_error("확인 요청(system.identify)에 2000 ms 안에 답이 없음", false)),
-                "hung: the specific not-answering error"
+                Err("cysd 가 연결은 받지만 응답하지 않습니다 (확인 요청(system.identify)에 답이 없음, 확인 시간 2초) — 새 cysd 를 띄우지 않았고, 떠 있는 cysd 를 멈추지도 않았습니다".to_string()),
+                "hung: the specific not-answering error, exactly as the user reads it"
             );
             assert_eq!((h.1, h.2), (0, 0), "hung: the spawner must never be called (and the reset check is not reached)");
             assert!(h.3 >= Duration::from_millis(1900) && h.3 < Duration::from_millis(3000), "hung took {:?}", h.3);
@@ -12639,10 +12674,10 @@ exit 0
                 "dead + reset in progress: the base refusal, no spawn"
             );
             assert_eq!(reset.accepted(), 0);
-            assert!(
-                matches!(&sh.0, Err(e) if e.starts_with(DAEMON_NOT_ANSWERING) && e.ends_with("cysd 를 띄운 뒤에도 답이 없었습니다")),
-                "dead, then the spawned stand-in accepts and does not answer: row 4 says so: {:?}",
-                sh.0
+            assert_eq!(
+                sh.0,
+                Err("cysd 가 연결은 받지만 응답하지 않습니다 (확인 요청(system.identify)에 답이 없음, 확인 시간 4초) — cysd 를 띄운 뒤에도 답이 없었습니다".to_string()),
+                "dead, then the spawned stand-in accepts and does not answer: row 4 says so"
             );
             assert_eq!(sh.1, 1, "row 4: exactly the one spawn of the dead path");
             holder
@@ -12707,18 +12742,13 @@ exit 0
             assert_eq!(hl.0, Ok(()), "hung, launchd-owned: the boot goes on (daemon-ready next), not the retry loop");
             assert_eq!(hl.1, 0, "hung, launchd-owned: no sibling spawn");
             assert_eq!(hl.2.len(), 1, "hung, launchd-owned: exactly one daemon-error: {:?}", hl.2);
-            assert!(
-                hl.2[0].starts_with(&format!("{DAEMON_NOT_ANSWERING} (확인 요청(system.identify)에 "))
-                    && hl.2[0].ends_with("— 새 cysd 를 띄우지 않았고, 떠 있는 cysd 를 멈추지도 않았습니다"),
-                "hung, launchd-owned: the specific text: {:?}",
-                hl.2[0]
-            );
+            assert_eq!(hl.2[0], "cysd 가 연결은 받지만 응답하지 않습니다 (확인 요청(system.identify)에 답이 없음, 확인 시간 5초) — 새 cysd 를 띄우지 않았고, 떠 있는 cysd 를 멈추지도 않았습니다", "hung, launchd-owned: the whole 5 s wait, not the last slice");
             assert!(hl.3 >= Duration::from_millis(4900) && hl.3 < Duration::from_millis(6500), "hung, launchd took {:?}", hl.3);
 
             assert_eq!((hn.0.clone(), hn.1), (Ok(()), 0), "hung, not launchd-owned: goes on, no spawn");
             assert_eq!(
                 hn.2,
-                vec![not_answering_error("확인 요청(system.identify)에 2000 ms 안에 답이 없음", false)],
+                vec!["cysd 가 연결은 받지만 응답하지 않습니다 (확인 요청(system.identify)에 답이 없음, 확인 시간 2초) — 새 cysd 를 띄우지 않았고, 떠 있는 cysd 를 멈추지도 않았습니다".to_string()],
                 "hung, not launchd-owned: exactly one daemon-error with the specific text"
             );
             assert!(hn.3 >= Duration::from_millis(1900) && hn.3 < Duration::from_millis(3000), "hung took {:?}", hn.3);
@@ -12736,6 +12766,81 @@ exit 0
         for (h, what) in holders.into_iter().zip(["hung, launchd-owned", "hung"]) {
             assert_ended_by_itself(h, what);
         }
+    }
+
+    /// ★C-LOUD-STICKY (codex early warning on e18372bb, head 2026-10-19): a wedged accept loop is first "accepts but does
+    /// not answer" and then, once its backlog holds the probe's own unaccepted connection, "connect refused". Once a
+    /// decision has seen accept-but-no-answer it must keep it: no downgrade to Unreachable, so no spawn. On the `Wedged`
+    /// rig: (0) the rig really gives that sequence; (1) row 5: the launchd-owned boot step never spawns, announces once,
+    /// goes on, does not reach the reset check, and the lock-file holder is not signalled; (2) row 4: a dead daemon is
+    /// spawned once, and when the stand-in is wedged the wait reports not-answering (spawned) instead of "did not come
+    /// up" (which would send the boot into the retry loop and its spawns); (3) `wait_for_readiness` itself keeps it.
+    /// macOS only: the rig's "refused after the first connect" rests on Darwin backlog behaviour, measured on Darwin
+    /// 27.0.0; the same sequence on Linux was not measured, and the full cys-app suite runs in CI on macOS only
+    /// (ci-branch.yml). The fix itself is checked
+    /// on every platform by the source pin (`c_probe_and_a2_never_stop_a_process_source_pin`, the kept-evidence arm).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn c_loud_mixed_state_hung_then_refused_never_downgrades_to_spawn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let holder = tauri::async_runtime::block_on(async {
+            // (0) the rig: the first connect is taken into the backlog and not answered, the next one is refused.
+            let probe_rig = RigDaemon::start("m-rig", RigMode::Wedged);
+            let first = must_end("first probe on a wedged rig", probe_readiness(&probe_rig.sock, DAEMON_ANSWER_DEADLINE)).await;
+            assert!(matches!(first, Readiness::NotAnswering(_)), "rig: the first connect is accepted and not answered: {first:?}");
+            let second = must_end("second probe on a wedged rig", probe_readiness(&probe_rig.sock, DAEMON_ANSWER_DEADLINE)).await;
+            assert_eq!(second, Readiness::Unreachable, "rig: the next connect is refused (the first one still holds the slot)");
+
+            // (1) row 5 on a wedged launchd-owned daemon.
+            let boot_rig = RigDaemon::start("m-boot", RigMode::Wedged);
+            let holder = lock_holder(&boot_rig, 8);
+            let (log, resets) = (SpawnLog::default(), AtomicUsize::new(0));
+            let emitted = std::sync::Mutex::new(Vec::<String>::new());
+            let r = must_end(
+                "boot step on a wedged rig",
+                boot_first_daemon_step(
+                    &boot_rig.sock,
+                    true,
+                    || resets.fetch_add(1, Ordering::SeqCst) > usize::MAX,
+                    log.spawner("m-boot", None),
+                    |m| emitted.lock().unwrap().push(m),
+                ),
+            )
+            .await;
+            let emitted = emitted.into_inner().unwrap();
+            assert_eq!(log.calls(), 0, "mixed state (row 5): the spawner must never be called");
+            assert_eq!(resets.load(Ordering::SeqCst), 0, "mixed state (row 5): the spawn path (reset check) is not reached");
+            assert_eq!(r, Ok(()), "mixed state (row 5): the boot goes on");
+            assert_eq!(emitted.len(), 1, "mixed state (row 5): exactly one daemon-error: {emitted:?}");
+            assert_eq!(emitted[0], "cysd 가 연결은 받지만 응답하지 않습니다 (확인 요청(system.identify)에 답이 없음, 확인 시간 5초) — 새 cysd 를 띄우지 않았고, 떠 있는 cysd 를 멈추지도 않았습니다", "mixed state (row 5): the whole 5 s wait");
+
+            // (2) row 4: dead first, then the spawned stand-in is wedged.
+            let _dead = RigDaemon::start("m-row4", RigMode::DeadAbsent);
+            let log4 = SpawnLog::default();
+            let r4 = must_end(
+                "row 4 on a wedged stand-in",
+                ensure_daemon_on(&rig_dir("m-row4").join("d.sock"), || false, log4.spawner("m-row4", Some(RigMode::Wedged))),
+            )
+            .await;
+            let _stand_in = std::mem::take(&mut *log4.rigs.lock().unwrap());
+            assert_eq!(log4.calls(), 1, "row 4: only the dead path's one spawn");
+            assert_eq!(
+                r4,
+                Err("cysd 가 연결은 받지만 응답하지 않습니다 (확인 요청(system.identify)에 답이 없음, 확인 시간 4초) — cysd 를 띄운 뒤에도 답이 없었습니다".to_string()),
+                "row 4 keeps not-answering, not 'did not come up' (that would send the boot into the retry loop)"
+            );
+
+            // (3) the wait itself keeps what it saw, inside the same budget.
+            let wait_rig = RigDaemon::start("m-wait", RigMode::Wedged);
+            let t = Instant::now();
+            let r = must_end("wait_for_readiness on a wedged rig", wait_for_readiness(&wait_rig.sock, 50)).await;
+            let took = t.elapsed();
+            assert_eq!(r, Readiness::NotAnswering("확인 요청(system.identify)에 답이 없음".into()), "never downgraded");
+            assert!(took >= Duration::from_millis(4900) && took < Duration::from_millis(6500), "the budget is kept: {took:?}");
+            holder
+        });
+        assert_ended_by_itself(holder, "wedged rig");
     }
 
     /// ★A1 purpose test: with force true the guard asks nothing, so no connection reaches any rig and a hung daemon cannot
@@ -12902,6 +13007,7 @@ exit 0
             ("async fn probe_readiness(", &[("killwords", 0), ("rpc_once(", 1), ("\"system.", 1)]),
             ("async fn wait_for_readiness(", &[("killwords", 0)]),
             ("fn not_answering_error(", &[("killwords", 0)]),
+            ("fn readiness_budget(", &[("killwords", 0)]),
             ("fn is_not_answering(", &[("killwords", 0)]),
             ("fn announce_not_answering(", &[("killwords", 0)]),
             ("async fn boot_first_daemon_step(", &[("killwords", 0)]),
@@ -12966,19 +13072,26 @@ exit 0
         );
         let on = wu_code(wu_seg("async fn ensure_daemon_on("));
         let row3 = on
-            .find("    match probe_readiness(socket, DAEMON_ANSWER_DEADLINE).await {\n        Readiness::Answers => return Ok(()),\n        Readiness::NotAnswering(why) => return Err(not_answering_error(&why, false)),\n        Readiness::Unreachable => {}\n    }")
+            .find("    match probe_readiness(socket, DAEMON_ANSWER_DEADLINE).await {\n        Readiness::Answers => return Ok(()),\n        Readiness::NotAnswering(why) => return Err(not_answering_error(&why, DAEMON_ANSWER_DEADLINE, false)),\n        Readiness::Unreachable => {}\n    }")
             .expect("row 3: an answer returns Ok, accepts-but-no-answer returns the loud error, only Unreachable goes on");
         let reset = on.find("    if reset_in_progress() {").expect("the reset check");
         let spawn = on.find("    spawn()?;").expect("the spawn");
         assert_eq!(on.matches("spawn()").count(), 1, "ensure_daemon_on spawns at one place");
         assert!(row3 < reset && reset < spawn, "probe -> reset check -> spawn (the base order)");
         assert!(
-            on.contains("    match wait_for_readiness(socket, 40).await {\n        Readiness::Answers => Ok(()),\n        Readiness::NotAnswering(why) => Err(not_answering_error(&why, true)),\n        Readiness::Unreachable => Err(\"cysd did not come up within 4s\".into()),"),
+            on.contains("    match wait_for_readiness(socket, ROW4_ATTEMPTS).await {\n        Readiness::Answers => Ok(()),\n        Readiness::NotAnswering(why) => Err(not_answering_error(&why, readiness_budget(ROW4_ATTEMPTS), true)),\n        Readiness::Unreachable => Err(\"cysd did not come up within 4s\".into()),"),
             "row 4 is REPLY-HEALTH and says which way it failed"
+        );
+        // ★C-LOUD-STICKY: rows 4 and 5 read `wait_for_readiness`, which must never let a later failed connect replace an
+        // accepted-but-unanswered try (that downgrade is what opened the spawn path on a wedged daemon in e18372bb).
+        let wait = wu_code(wu_seg("async fn wait_for_readiness("));
+        assert!(
+            wait.contains("        match probe_readiness(socket, left.min(DAEMON_ANSWER_DEADLINE)).await {\n            Readiness::Answers => return Readiness::Answers,\n            Readiness::Unreachable if matches!(last, Readiness::NotAnswering(_)) => {}\n            seen => last = seen,\n        }"),
+            "accepted-but-unanswered evidence is kept against a later refused connect:\n{wait}"
         );
         let boot = wu_code(wu_seg("async fn boot_first_daemon_step("));
         let row5 = boot
-            .find("        match wait_for_readiness(socket, 50).await {\n            Readiness::Answers => Ok(()),\n            Readiness::NotAnswering(why) => Err(not_answering_error(&why, false)),\n            Readiness::Unreachable => {")
+            .find("        match wait_for_readiness(socket, ROW5_ATTEMPTS).await {\n            Readiness::Answers => Ok(()),\n            Readiness::NotAnswering(why) => Err(not_answering_error(&why, readiness_budget(ROW5_ATTEMPTS), false)),\n            Readiness::Unreachable => {")
             .expect("row 5: accepts-but-no-answer is reported, not replaced");
         assert_eq!(boot.matches("ensure_daemon_on(").count(), 2, "row 5's fallback and the not-launchd-owned path");
         assert!(
