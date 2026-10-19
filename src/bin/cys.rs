@@ -18275,6 +18275,26 @@ fn run_launch_agent_opts(
 // ---------- 온보딩③: 상시 가동 등록 (launchd / Task Scheduler) ----------
 // plist 포맷·경로·LABEL은 `cys::launchd`(앱 자동등록과 단일 소스) 위임 — 드리프트 방지.
 
+/// ★C (0.14.52 update repair, design rev9 section 0, table row 7, report only): after `launchctl load`, "daemon up"
+/// means the daemon answers `system.identify`, not that its socket accepts. Each try is one private connection
+/// (`request_on_timeout`: no-progress deadline = the smaller of the time left and 2 s) after the old 100 ms pause;
+/// the total is `budget`. It only judges (`false` prints "unconfirmed"); rows 6 and 10 keep `connect_raw()`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn daemon_answers_within(socket: &std::path::Path, budget: std::time::Duration) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let left = budget.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return false;
+        }
+        let per_try = left.min(std::time::Duration::from_secs(2));
+        if request_on_timeout(socket, "system.identify", json!({}), per_try).is_ok() {
+            return true;
+        }
+    }
+}
+
 fn run_daemon_cmd(action: DaemonAction) -> i32 {
     let result: Result<(), String> = (|| {
         #[cfg(target_os = "macos")]
@@ -18355,15 +18375,8 @@ fn run_daemon_cmd(action: DaemonAction) -> i32 {
                             String::from_utf8_lossy(&out.stderr).trim()
                         ));
                     }
-                    // 기동 확인
-                    let mut up = false;
-                    for _ in 0..40 {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        if connect_raw().is_ok() {
-                            up = true;
-                            break;
-                        }
-                    }
+                    // 기동 확인 — ★C (row 7, report only): up = the daemon answers identify, same 4 s budget.
+                    let up = daemon_answers_within(&socket_path(), std::time::Duration::from_secs(4));
                     println!(
                         "launchd 등록 완료: {} (로그인 자동 기동 + 사망 시 자동 재기동)",
                         path.display()
@@ -42763,5 +42776,143 @@ mod aid_s5_cli_tests {
                     json!({"surface_id":9,"outcome":"deferred"})] {
             assert!(reap_due_json(&bad, 9).is_err(), "S5-CLI-MALFORMED: {bad}");
         }
+    }
+}
+
+/// ★0.14.52 update repair C, design rev9 table row 7 (`cys daemon install` post-load "up", report only), and the CEO
+/// ruling 5 absolute condition (the probe never stops or signals a process). Rigs are fake daemons on temp sockets,
+/// never the live one.
+#[cfg(test)]
+mod update_repair_c_row7 {
+    /// The body of a top-level item from `anchor` to the next top-level item (whole-line `//` comments dropped).
+    fn item_code(src: &str, anchor: &str) -> String {
+        let start = src.find(anchor).unwrap_or_else(|| panic!("`{anchor}` is gone"));
+        let rest = &src[start..];
+        let end = ["\nfn ", "\n#[", "\n///", "\nconst ", "\nstruct ", "\nimpl", "\nmod "]
+            .iter()
+            .filter_map(|b| rest[1..].find(b).map(|i| i + 1))
+            .min()
+            .unwrap_or(rest.len());
+        rest[..end].lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n")
+    }
+
+    /// The same capability census as the app pin (src-tauri main.rs `capability_census`): kill and signal words
+    /// (case-insensitive), process launch and exit, raw OS calls, launchctl and osascript, every rpc / request form, and
+    /// rpc method families that act on seats or the daemon. ★R1-1: kill-words alone missed `surface.close` and friends.
+    fn capability_census(code: &str) -> Vec<(&'static str, usize)> {
+        const KILL_WORDS: &[&str] =
+            &["kill", "sigterm", "sigkill", "sigint", "sighup", "sigquit", "sigstop", "signal", "terminate", "raise("];
+        const CAPS: &[&str] = &[
+            "Command::new", ".spawn(", "process::exit", "libc::", "nix::", "launchctl", "osascript",
+            "rpc_oneshot(", "rpc_on(", " rpc(", "rpc_full", "conn_cell", "request(", "request_on(", "request_on_timeout(",
+            "\"surface.", "\"ledger.", "\"system.", "\"daemon.", "\"channel.",
+        ];
+        let low = code.to_lowercase();
+        let mut out = vec![("killwords", KILL_WORDS.iter().map(|t| low.matches(t).count()).sum())];
+        out.extend(CAPS.iter().map(|t| (*t, code.matches(t).count())).filter(|(_, n)| *n > 0));
+        out
+    }
+
+    /// A rig daemon: `Some(true)` answers every request line, `Some(false)` accepts and reads but never answers (hung),
+    /// `None` = nothing at the path (dead).
+    #[cfg(unix)]
+    fn rig(name: &str, answers: Option<bool>) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::io::{BufRead, Write};
+        let dir = std::env::temp_dir().join(format!("cys-ur7-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("d.sock");
+        if let Some(answer) = answers {
+            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { return };
+                    std::thread::spawn(move || {
+                        let mut w = stream.try_clone().unwrap();
+                        let mut r = std::io::BufReader::new(stream);
+                        let mut line = String::new();
+                        while r.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                            if answer {
+                                let _ = w.write_all(b"{\"id\":1,\"ok\":true,\"result\":{\"daemon_pid\":4242,\"version\":\"0.0.0-rig\"}}\n");
+                                let _ = w.flush();
+                            }
+                            line.clear();
+                        }
+                    });
+                }
+            });
+        }
+        (dir, sock)
+    }
+
+    /// ★C row 7 purpose test: "up" on a responsive rig at the first try; `false` inside the budget on a dead rig and on
+    /// a hung rig (the old connect-only loop reported a hung daemon as "확인됨").
+    #[cfg(unix)]
+    #[test]
+    fn c_row7_daemon_answers_within_against_responsive_dead_and_hung_rigs() {
+        use std::time::{Duration, Instant};
+        let (d1, ok) = rig("ok", Some(true));
+        let (d2, dead) = rig("dead", None);
+        let (d3, hung) = rig("hung", Some(false));
+
+        let t = Instant::now();
+        assert!(super::daemon_answers_within(&ok, Duration::from_secs(4)), "a responsive rig is up");
+        assert!(t.elapsed() < Duration::from_millis(2000), "responsive took {:?}", t.elapsed());
+
+        let t = Instant::now();
+        assert!(!super::daemon_answers_within(&dead, Duration::from_secs(1)), "a dead rig is not up");
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(950) && took < Duration::from_millis(2000), "dead, budget 1 s: {took:?}");
+
+        // The connect-only predicate this replaces says "up" here; the reply predicate does not.
+        assert!(std::os::unix::net::UnixStream::connect(&hung).is_ok(), "the hung rig accepts");
+        // ★R2-15: run on another thread under a 10 s watchdog, so a missing deadline fails this specimen instead of hanging it.
+        let t = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let hung2 = hung.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(super::daemon_answers_within(&hung2, Duration::from_secs(4)));
+        });
+        let up = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("daemon_answers_within on a hung rig did not end within 10 s: the deadline it relies on is missing");
+        assert!(!up, "a hung rig is not up");
+        let took = t.elapsed();
+        assert!(took >= Duration::from_millis(3900) && took < Duration::from_millis(5500), "hung, budget 4 s: {took:?}");
+        for d in [d1, d2, d3] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Source pin (CEO ruling 5): the row-7 probe's capability census is only its one `system.identify` request;
+    /// `run_daemon_cmd` keeps exactly its base census (4ed79fdd: 2 kill-words = the row-6 takeover's `kill -TERM` /
+    /// `pkill` fallback, 10 `Command::new`, 7 launchctl, 1 `request(` for that takeover's identify), so a stop or signal
+    /// added on the row-7 path, by kill, by request or by launchctl, turns this red. Wiring: row 7 uses the probe;
+    /// rows 6, 8, 9 and the CLI transport (rows 10, 11) keep `connect_raw()` as the design table says.
+    #[test]
+    fn c_row7_probe_never_stops_a_process_and_rows_6_8_9_10_11_keep_presence() {
+        let src = include_str!("cys.rs");
+        let probe = item_code(src, "fn daemon_answers_within(");
+        assert_eq!(
+            capability_census(&probe),
+            vec![("killwords", 0), ("request_on_timeout(", 1), ("\"system.", 1)],
+            "the row-7 probe's capability census changed:\n{probe}"
+        );
+        assert!(
+            probe.contains("request_on_timeout(socket, \"system.identify\", json!({}), per_try)"),
+            "the row-7 probe is one identify on a private connection with a deadline"
+        );
+        let cmd = item_code(src, "fn run_daemon_cmd(");
+        assert_eq!(
+            capability_census(&cmd),
+            vec![("killwords", 2), ("Command::new", 10), ("launchctl", 7), ("request(", 1), ("\"system.", 1)],
+            "run_daemon_cmd capability census changed from base 4ed79fdd"
+        );
+        assert!(cmd.contains("let up = daemon_answers_within(&socket_path(), std::time::Duration::from_secs(4));"), "row 7");
+        assert!(cmd.contains("let running = connect_raw().is_ok();"), "row 6 stays OWNERSHIP");
+        assert_eq!(cmd.matches("let alive = connect_raw().is_ok();").count(), 2, "rows 8 and 9 stay presence");
+        assert_eq!(cmd.matches("connect_raw().is_ok()").count(), 3, "only rows 6, 8, 9 keep the presence check here");
+        assert!(item_code(src, "fn connect() -> Result<ConnStream, String> {").contains("match connect_raw() {"), "row 10");
+        assert!(item_code(src, "fn poll_socket_ready(").contains("if let Ok(s) = connect_raw() {"), "row 11");
     }
 }
