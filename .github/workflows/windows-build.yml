@@ -992,6 +992,7 @@ jobs:
           #   단언 전에 스텝이 붉었다. T4-14 의 스탠드인 배치와 같이 준비 단계만 유한 재시도한다(최대 10회 · 매번 다시 끝내고 1초 쉼) —
           #   아래 ②~의 핸들·업그레이드·단언은 그대로다. 10회 안에 못 놓으면 사유를 밝혀 실패한다(준비 실패를 통과로 접지 않는다).
           $placed = $false
+          $lastErr = ''
           for ($attempt = 1; $attempt -le 10 -and -not $placed; $attempt++) {
             Get-Process cys,cysd -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep 1
@@ -1001,10 +1002,12 @@ jobs:
               Copy-Item "$env:SystemRoot\System32\cmd.exe" $cysd -Force -ErrorAction Stop
               $placed = $true
             } catch {
+              $lastErr = $_.Exception.Message
               Write-Host ("스탠드인 배치 재시도 {0}/10: {1}" -f $attempt, $_.Exception.Message)
             }
           }
-          if (-not $placed) { Die "T4-15: 스탠드인 배치 실패 — cys.exe·cysd.exe 를 쥔 프로세스가 10회 재시도 동안 남아 있었다(준비 단계)" }
+          # 원인은 단정하지 않는다 — catch 는 모든 복사 오류(공유 위반·원본 부재·권한·저장 오류)를 받는다. 증명된 것(10회 배치 실패)과 마지막 오류만 적는다.
+          if (-not $placed) { Die ("T4-15: 스탠드인 배치 실패 — 10회 시도 모두 cys.exe·cysd.exe 를 놓지 못했다(준비 단계 · 시도별 오류는 위의 '스탠드인 배치 재시도' 줄) · 마지막 오류: " + (Esc $lastErr)) }
           $oldSha = ShaOf "$env:SystemRoot\System32\cmd.exe"
           $lock = Start-Process -FilePath $cys -ArgumentList '/c ping -n 900 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
           Start-Sleep 2
