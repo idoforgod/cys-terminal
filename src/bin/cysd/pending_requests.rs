@@ -2349,7 +2349,7 @@ fn protocol_row_data() -> Row {
         target:Target { mode:TargetMode::Role,surface_id:7,role:Some("worker".into()) },
         lineage:RecordLineage::Protocol { data:ProtocolData {
             ingress:ImmutableIngress { intent:InputIntent::AgentText,target_kind:TargetKind::Agent,
-                scope:IngressScope { socket_path:PathBuf::from("/private/socket-fixture"),daemon_instance:11,
+                scope:IngressScope { socket_path:std::env::temp_dir().join("socket-fixture"),daemon_instance:11,
                     surface_instance:12,launch:13,conversation:14 },origin:"protocol-fixture".into(),
                 caller:Some(CallerRecord::Surface { id:8 }),submit:SubmitContract::OwnedAtAdmission },
             initial:InitialCatalog { registration_id:"registration-fixture".into(),catalog_id:"catalog-fixture".into(),
@@ -2394,9 +2394,23 @@ fn c8protocol_unselected_ingress_retains_catalog_without_a_fake_binding() {
     assert_eq!(back,row);
     assert_eq!(back.record.source.ids,vec!["source-z","source-a"]);
     assert_eq!(back.record.target.role.as_deref(),Some("worker"));
-    assert_eq!(protocol_data(&back).ingress.scope.socket_path,PathBuf::from("/private/socket-fixture"));
+    assert_eq!(protocol_data(&back).ingress.scope.socket_path,std::env::temp_dir().join("socket-fixture"));
     assert!(!format!("{:?}",back.record).contains("socket-fixture"));
     assert!(!format!("{:?}",back.record).contains("private body"));
+}
+#[test]
+fn c8protocol_production_socket_paths_satisfy_ingress_shape() {
+    for socket_path in [cys::default_socket_path(),cys::dept_socket_path("dept-5")] {
+        assert!(socket_path.is_absolute(),"production socket path must be absolute: {socket_path:?}");
+        let mut row=protocol_row_data();
+        protocol_data_mut(&mut row).ingress.scope.socket_path=socket_path;
+        protocol_shape(&row.record,protocol_data(&row)).unwrap();
+        validate_record(&row.record).unwrap();
+    }
+    let mut relative=protocol_row_data();
+    protocol_data_mut(&mut relative).ingress.scope.socket_path=PathBuf::from("relative/socket-fixture");
+    assert!(matches!(protocol_shape(&relative.record,protocol_data(&relative)),
+        Err(StoreError::Invalid("protocol ingress identity"))));
 }
 #[test]
 fn c8protocol_shape_refuses_other_intents_without_claiming_ingress_authority() {
