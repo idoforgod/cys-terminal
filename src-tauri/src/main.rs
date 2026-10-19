@@ -5490,18 +5490,20 @@ async fn start_surface_stream(
 /// ★C (0.14.52 update repair, design rev9 section 0): the deadline of one readiness probe.
 const DAEMON_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Why one `system.identify` probe did not answer. Only `TimedOut` is the hung shape (the socket accepts, the
-/// daemon never replies); a refused connect, a missing socket or an error reply is `Failed`.
+/// Why one `system.identify` probe did not answer (A2's stop plan). Only `TimedOut` is the hung shape (the socket
+/// accepts, the daemon never replies); a refused connect, a missing socket or an error reply is `Failed`.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, PartialEq)]
 enum IdentifyMiss {
     TimedOut,
     Failed,
 }
 
-/// ★C: one `system.identify` on a private single-use connection (`rpc_oneshot`, never the pooled one) within
-/// `deadline`. On timeout the future is dropped and its connection closes with it, so the shared pool (conn_cell)
-/// is not desynchronized. This function and the two below only judge: "no answer" leads only to the caller's
-/// existing not-ready path (CEO ruling 5, absolute condition; `c_probe_and_a2_never_stop_a_process_source_pin`).
+/// ★A2: one `system.identify` on a private single-use connection (`rpc_oneshot`, never the pooled one) within
+/// `deadline`, the connect included. On timeout the future is dropped and its connection closes with it, so the shared
+/// pool (conn_cell) is not desynchronized. It only judges (CEO ruling 5, absolute condition;
+/// `c_probe_and_a2_never_stop_a_process_source_pin`). The readiness rows use `probe_readiness` instead (C-LOUD).
+#[cfg_attr(not(unix), allow(dead_code))]
 async fn identify_within(
     socket: &std::path::Path,
     deadline: std::time::Duration,
@@ -5513,28 +5515,123 @@ async fn identify_within(
     }
 }
 
-/// ★C (row 3): does the daemon ANSWER (not: does the socket accept). Only the REPLY-HEALTH rows of the design table
-/// (3, 4, 5; CLI row 7) use this; row 2 (launchd autoregister `running`) and CLI rows 6 and 10 keep connect().
-async fn daemon_answers(socket: &std::path::Path) -> bool {
-    identify_within(socket, DAEMON_ANSWER_DEADLINE).await.is_ok()
+/// ★C-LOUD (0.14.52 update repair, CEO ruling 2026-10-19 option B: C is loud only): what one readiness probe saw.
+#[derive(Debug, PartialEq)]
+enum Readiness {
+    /// `system.identify` answered `ok` within the deadline.
+    Answers,
+    /// The socket accepted the connection, but no `ok` answer came within the deadline (`why`: no reply, an error reply,
+    /// or a close without a reply). A process holds the socket, so this is never a reason to start a cysd.
+    NotAnswering(String),
+    /// The connect itself failed (no socket file, nobody listening): the base "no daemon". The only shape after which
+    /// rows 3 and 5 may start one.
+    Unreachable,
 }
 
-/// ★C (rows 4, 5): poll until the daemon answers (no spawn here). The total budget is `attempts` x 100 ms, the same
-/// budget the removed `wait_for_connect` had; each try is one identify bounded by the smaller of the time left and
-/// 2 s, so a hung daemon also ends in `false` inside the budget. Design row 1: the old helper served only rows 4
-/// and 5, so the call sites changed and the presence helper was removed rather than given a new meaning.
-async fn wait_for_answer(socket: &std::path::Path, attempts: u32) -> bool {
+/// ★C-LOUD: one readiness probe on a private single-use connection (never the pooled one). The connect is the base
+/// presence check, unchanged and without a new deadline, so the spawn decision stays the base one; only the
+/// `system.identify` exchange on that same connection runs under `deadline`. Dropping the timed-out future closes the
+/// connection. It only judges (CEO ruling 5, absolute condition; `c_probe_and_a2_never_stop_a_process_source_pin`).
+async fn probe_readiness(socket: &std::path::Path, deadline: std::time::Duration) -> Readiness {
+    let Ok(stream) = connect_to(socket).await else {
+        return Readiness::Unreachable;
+    };
+    let mut conn = Some(BufReader::new(stream));
+    let mut line = serde_json::to_vec(&json!({"id": 1, "method": "system.identify", "params": {}})).unwrap_or_default();
+    line.push(b'\n');
+    match tokio::time::timeout(deadline, rpc_once(socket, &mut conn, &line)).await {
+        Err(_) => Readiness::NotAnswering(format!("확인 요청(system.identify)에 {} ms 안에 답이 없음", deadline.as_millis())),
+        Ok(Err(RpcErr::BeforeSend(e) | RpcErr::AfterSend(e))) => {
+            Readiness::NotAnswering(format!("확인 요청(system.identify) 뒤 답 없이 실패: {e}"))
+        }
+        Ok(Ok(resp)) => match serde_json::from_str::<Value>(resp.trim()) {
+            Ok(v) if v["ok"].as_bool() == Some(true) => Readiness::Answers,
+            Ok(v) => Readiness::NotAnswering(format!(
+                "확인 요청(system.identify)에 오류 응답: {}",
+                v["error"]["message"].as_str().unwrap_or("unknown error")
+            )),
+            Err(e) => Readiness::NotAnswering(format!("확인 요청(system.identify)의 응답을 읽을 수 없음: {e}")),
+        },
+    }
+}
+
+/// ★C (rows 4, 5): poll until the daemon answers (no spawn here) and return what the LAST try saw. The total budget is
+/// `attempts` x 100 ms, the budget of the removed `wait_for_connect`; each try's exchange is bounded by the smaller of
+/// the time left and 2 s, so a hung daemon also ends inside the budget (as `NotAnswering`). Design row 1: the old
+/// helper served only rows 4 and 5, so the call sites changed and the presence helper was removed.
+async fn wait_for_readiness(socket: &std::path::Path, attempts: u32) -> Readiness {
     let budget = std::time::Duration::from_millis(100 * u64::from(attempts));
     let started = std::time::Instant::now();
+    let mut last = Readiness::Unreachable;
     loop {
         let left = budget.saturating_sub(started.elapsed());
         if left.is_zero() {
-            return false;
+            return last;
         }
-        if identify_within(socket, left.min(DAEMON_ANSWER_DEADLINE)).await.is_ok() {
-            return true;
+        last = probe_readiness(socket, left.min(DAEMON_ANSWER_DEADLINE)).await;
+        if last == Readiness::Answers {
+            return last;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// ★C-LOUD: the head of every "accepts but does not answer" error. The boot keys on it (`is_not_answering`).
+const DAEMON_NOT_ANSWERING: &str = "cysd 가 연결은 받지만 응답하지 않습니다";
+
+/// ★C-LOUD: the specific error of rows 3, 4 and 5 for a daemon that accepts but does not answer. `spawned` = row 4
+/// (this call started a cysd before waiting).
+fn not_answering_error(why: &str, spawned: bool) -> String {
+    let what = if spawned {
+        "cysd 를 띄운 뒤에도 답이 없었습니다"
+    } else {
+        "새 cysd 를 띄우지 않았고, 떠 있는 cysd 를 멈추지도 않았습니다"
+    };
+    format!("{DAEMON_NOT_ANSWERING} ({why}) — {what}")
+}
+
+fn is_not_answering(e: &str) -> bool {
+    e.starts_with(DAEMON_NOT_ANSWERING)
+}
+
+/// ★C-LOUD (option ii, head 2026-10-19): at boot a daemon that accepts but does not answer is announced, not waited
+/// for: one stderr line and the `daemon-error` text (`emit`), after which the caller goes on as base did (`daemon-ready`,
+/// event forwarder, the UI's degraded mode for a daemon that accepts and does not answer). It starts and stops nothing.
+fn announce_not_answering(e: String, emit: impl FnOnce(String)) {
+    eprintln!("[cys-app] {e}");
+    emit(e);
+}
+
+/// ★C-LOUD (rows 5 and 3): the boot's first daemon step. launchd-owned: wait up to 5 s for an answer; only a failed
+/// connect falls back to starting a sibling (`ensure_daemon_on`); a daemon that accepts but does not answer is
+/// reported, not replaced. Not launchd-owned: `ensure_daemon_on`. A not-answering result is announced and the boot
+/// goes on (`Ok`); any other result is returned as before (the retry loop handles an `Err`).
+async fn boot_first_daemon_step(
+    socket: &std::path::Path,
+    launchd_owns: bool,
+    reset_in_progress: impl FnOnce() -> bool,
+    spawn: impl FnOnce() -> Result<(), String>,
+    emit_error: impl FnOnce(String),
+) -> Result<(), String> {
+    let result = if launchd_owns {
+        // ★C (row 5): the launchd-owned daemon is ready when it answers (same 5 s budget as before).
+        match wait_for_readiness(socket, 50).await {
+            Readiness::Answers => Ok(()),
+            Readiness::NotAnswering(why) => Err(not_answering_error(&why, false)),
+            Readiness::Unreachable => {
+                eprintln!("[cys-app] launchd-owned cysd not ready in 5s — 형제 spawn 폴백");
+                ensure_daemon_on(socket, reset_in_progress, spawn).await
+            }
+        }
+    } else {
+        ensure_daemon_on(socket, reset_in_progress, spawn).await
+    };
+    match result {
+        Err(e) if is_not_answering(&e) => {
+            announce_not_answering(e, emit_error);
+            Ok(())
+        }
+        other => other,
     }
 }
 
@@ -5738,17 +5835,41 @@ fn inject_runtime_path(cmd: &mut std::process::Command) {
 
 /// Ensure aitermd is running: try to connect, otherwise spawn the bundled/sibling binary.
 async fn ensure_daemon() -> Result<(), String> {
-    // ★C (row 3): ready = answers identify within 2 s, not "the socket accepts". A hung holder now falls through to
-    // the spawn path below; a spawned cysd yields to a holder with a fresh heartbeat (design rev9 section 0).
-    if daemon_answers(&default_socket()).await {
-        return Ok(());
+    ensure_daemon_on(&default_socket(), cys::factory_reset::reset_in_progress, spawn_bundled_cysd).await
+}
+
+/// ★C-LOUD: `ensure_daemon` with its socket and its two outside effects passed in, so rig tests drive the real decision
+/// without the live reset sentinel (its check deletes a stale one) and without starting a real cysd.
+async fn ensure_daemon_on(
+    socket: &std::path::Path,
+    reset_in_progress: impl FnOnce() -> bool,
+    spawn: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    // ★C-LOUD (row 3, CEO ruling 2026-10-19 option B): ready = answers identify within 2 s. Only a failed connect (the
+    // base predicate) leads to the spawn below. A daemon that accepts but does not answer is reported and left alone:
+    // no second cysd, so cysd's own reclaim of a holder stays out of the GUI's reach.
+    match probe_readiness(socket, DAEMON_ANSWER_DEADLINE).await {
+        Readiness::Answers => return Ok(()),
+        Readiness::NotAnswering(why) => return Err(not_answering_error(&why, false)),
+        Readiness::Unreachable => {}
     }
     // ★A3(성찰 확정): 완전 초기화 진행 중에는 데몬을 스폰하지 않는다 — 이 경로가 리셋 도중
     // cysd 를 되살리는 주 통로였다(부트 재시도 루프·재시작·drain 사이드카가 모두 여기로 온다).
     // fail-open 판정(TTL·pid 생존)이라 리셋이 비정상 종료해도 다음 기동은 정상이다.
-    if cys::factory_reset::reset_in_progress() {
+    if reset_in_progress() {
         return Err("완전 초기화가 진행 중 — 데몬 기동을 보류한다(완료 후 앱을 다시 실행하라)".into());
     }
+    spawn()?;
+    // ★C (row 4): GUI readiness after a spawn = the daemon answers (same 4 s budget as before).
+    match wait_for_readiness(socket, 40).await {
+        Readiness::Answers => Ok(()),
+        Readiness::NotAnswering(why) => Err(not_answering_error(&why, true)),
+        Readiness::Unreachable => Err("cysd did not come up within 4s".into()),
+    }
+}
+
+/// Start the bundled/sibling cysd: the spawn half of `ensure_daemon`, moved unchanged (C-LOUD); no readiness wait here.
+fn spawn_bundled_cysd() -> Result<(), String> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()));
@@ -5803,12 +5924,7 @@ async fn ensure_daemon() -> Result<(), String> {
     command
         .spawn()
         .map_err(|e| format!("failed to start cysd ({}): {e}", program.display()))?;
-    // ★C (row 4): GUI readiness after a spawn = the daemon answers (same 4 s budget as before).
-    if wait_for_answer(&default_socket(), 40).await {
-        Ok(())
-    } else {
-        Err("cysd did not come up within 4s".into())
-    }
+    Ok(())
 }
 
 /// Background: 한 데몬의 push 이벤트 스트림을 구독해 webview로 전달.
@@ -8597,17 +8713,19 @@ fn main() {
                 // spawn은 cysd 시동 잠금(healthy-holder 거부)이 단일 인스턴스 보장) ②그래도 실패면
                 // 15초 간격 백그라운드 재시도(최대 20회 ≈ 5분 — 승인 지연·느린 첫 기동 흡수)
                 // ③4회째부터 로그인 항목 안내 이벤트(daemon-retry-hint) — 생초보 가이드.
-                let mut result = if launchd_owns {
-                    // ★C (row 5): the launchd-owned daemon is ready when it answers (same 5 s budget as before).
-                    if wait_for_answer(&default_socket(), 50).await {
-                        Ok(())
-                    } else {
-                        eprintln!("[cys-app] launchd-owned cysd not ready in 5s — 형제 spawn 폴백");
-                        ensure_daemon().await
-                    }
-                } else {
-                    ensure_daemon().await
-                };
+                // ★C-LOUD (option ii, head 2026-10-19): rows 5/3 in one step. A daemon that accepts but does not answer
+                // is announced (daemon-error + one stderr line) and the boot goes on as base did: no spawn, no retry
+                // loop, daemon-ready below, then the UI's degraded mode (ui/src/main.ts "handler 가 먹통" block).
+                let mut result = boot_first_daemon_step(
+                    &default_socket(),
+                    launchd_owns,
+                    cys::factory_reset::reset_in_progress,
+                    spawn_bundled_cysd,
+                    |m| {
+                        let _ = handle.emit("daemon-error", m);
+                    },
+                )
+                .await;
                 if result.is_err() {
                     for attempt in 1..=20u32 {
                         // ★P1-3: 완전 초기화가 진행 중이면 데몬은 **일부러** 없는 것이다.
@@ -8630,9 +8748,20 @@ fn main() {
                             let _ = handle.emit("daemon-retry-hint", ());
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-                        if ensure_daemon().await.is_ok() {
-                            result = Ok(());
-                            break;
+                        match ensure_daemon().await {
+                            Ok(()) => {
+                                result = Ok(());
+                                break;
+                            }
+                            // ★C-LOUD (option ii): accepts but does not answer -> announce and go on, as base did.
+                            Err(e) if is_not_answering(&e) => {
+                                announce_not_answering(e, |m| {
+                                    let _ = handle.emit("daemon-error", m);
+                                });
+                                result = Ok(());
+                                break;
+                            }
+                            Err(_) => {}
                         }
                     }
                 }
@@ -12289,12 +12418,15 @@ exit 0
         }
     }
 
-    /// ★C purpose test (design rev9 sections 0 and 4, three daemon shapes): one identify probe answers a responsive rig at
-    /// once, fails fast on both dead shapes, and gives up on a hung rig at the 2 s deadline, closing its own private
-    /// connection (the shared rpc pool never gets a cell for that socket).
+    /// ★C purpose test (design rev9 sections 0 and 4, three daemon shapes) for both probes. A2's `identify_within`
+    /// answers a responsive rig at once, fails fast on both dead shapes, and gives up on a hung rig at the 2 s deadline.
+    /// C-LOUD's `probe_readiness` says `Answers` / `Unreachable` (both dead shapes, fast) / `NotAnswering` (hung, at the
+    /// 2 s deadline). Each timed-out probe closes its own private connection (the rig sees EOF) and the shared rpc pool
+    /// never gets a cell for that socket.
     #[cfg(unix)]
     #[test]
     fn c_identify_probe_against_responsive_dead_and_hung_rigs() {
+        use std::sync::atomic::Ordering;
         use std::time::{Duration, Instant};
         tauri::async_runtime::block_on(async {
             let ok = RigDaemon::start("c-ok", RigMode::Responsive { pid: Some(4242), live: 0 });
@@ -12306,13 +12438,13 @@ exit 0
             let t = Instant::now();
             let r = identify_within(&ok.sock, DAEMON_ANSWER_DEADLINE).await;
             assert_eq!(r.as_ref().map(|v| v["daemon_pid"].as_u64()), Ok(Some(4242)), "responsive rig: {r:?}");
-            assert!(daemon_answers(&ok.sock).await, "responsive rig must count as ready");
+            assert_eq!(probe_readiness(&ok.sock, DAEMON_ANSWER_DEADLINE).await, Readiness::Answers, "responsive rig must count as ready");
             assert!(t.elapsed() < Duration::from_millis(1900), "responsive took {:?}", t.elapsed());
 
             for d in [&absent, &stale] {
                 let t = Instant::now();
                 assert_eq!(identify_within(&d.sock, DAEMON_ANSWER_DEADLINE).await, Err(IdentifyMiss::Failed));
-                assert!(!daemon_answers(&d.sock).await, "a dead rig is not ready");
+                assert_eq!(probe_readiness(&d.sock, DAEMON_ANSWER_DEADLINE).await, Readiness::Unreachable, "a dead rig is unreachable");
                 assert!(t.elapsed() < Duration::from_millis(1900), "dead rig {} took {:?}", d.sock.display(), t.elapsed());
             }
 
@@ -12325,26 +12457,34 @@ exit 0
             );
             assert_eq!(hung.accepted(), 1, "the hung rig saw the probe connect");
             let t = Instant::now();
-            while hung.client_closed.load(std::sync::atomic::Ordering::SeqCst) < 1 && t.elapsed() < Duration::from_millis(1900) {
+            while hung.client_closed.load(Ordering::SeqCst) < 1 && t.elapsed() < Duration::from_millis(1900) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            assert_eq!(
-                hung.client_closed.load(std::sync::atomic::Ordering::SeqCst),
-                1,
-                "the timed-out probe left its connection open"
-            );
+            assert_eq!(hung.client_closed.load(Ordering::SeqCst), 1, "the timed-out probe left its connection open");
+
+            let t = Instant::now();
+            let r = must_end("probe_readiness on a hung rig", probe_readiness(&hung.sock, DAEMON_ANSWER_DEADLINE)).await;
+            let took = t.elapsed();
+            assert_eq!(r, Readiness::NotAnswering("확인 요청(system.identify)에 2000 ms 안에 답이 없음".into()), "a hung rig accepts and does not answer");
+            assert!(took >= Duration::from_millis(1900) && took < Duration::from_millis(3000), "hung readiness probe took {took:?}");
+            assert_eq!(hung.accepted(), 2, "the readiness probe connected once");
+            let t = Instant::now();
+            while hung.client_closed.load(Ordering::SeqCst) < 2 && t.elapsed() < Duration::from_millis(1900) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(hung.client_closed.load(Ordering::SeqCst), 2, "the timed-out readiness probe left its connection open");
             let pooled = RPC_POOL.get().map(|p| p.lock().unwrap().contains_key(&hung.sock)).unwrap_or(false);
-            assert!(!pooled, "the probe must not use the shared rpc pool");
-            assert!(!must_end("daemon_answers on a hung rig", daemon_answers(&hung.sock)).await, "a hung rig is not ready");
+            assert!(!pooled, "the probes must not use the shared rpc pool");
         });
     }
 
-    /// ★C rows 4 and 5: `wait_for_answer` keeps the removed `wait_for_connect` budget (`attempts` x 100 ms) on every shape:
-    /// responsive at once, a daemon that binds late is still found, dead and hung end in `false` inside the budget
-    /// (hung at the production row-4 value 40 = 4 s: one 2 s try, then one 2 s try on the time left).
+    /// ★C rows 4 and 5: `wait_for_readiness` keeps the removed `wait_for_connect` budget (`attempts` x 100 ms) on every
+    /// shape and returns what the last try saw: responsive `Answers` at once, a daemon that binds late is still found,
+    /// dead ends `Unreachable` and hung ends `NotAnswering` inside the budget (hung at the production row-4 value 40 =
+    /// 4 s: one 2 s try, then one try on the time left).
     #[cfg(unix)]
     #[test]
-    fn c_wait_for_answer_keeps_the_old_budget_on_every_daemon_shape() {
+    fn c_wait_for_readiness_keeps_the_old_budget_on_every_daemon_shape() {
         use std::time::{Duration, Instant};
         tauri::async_runtime::block_on(async {
             let ok = RigDaemon::start("w-ok", RigMode::Responsive { pid: Some(7), live: 0 });
@@ -12353,16 +12493,17 @@ exit 0
             tokio::time::sleep(Duration::from_millis(50)).await;
 
             let t = Instant::now();
-            assert!(wait_for_answer(&ok.sock, 40).await);
+            assert_eq!(wait_for_readiness(&ok.sock, 40).await, Readiness::Answers);
             assert!(t.elapsed() < Duration::from_millis(1900), "responsive took {:?}", t.elapsed());
 
             let t = Instant::now();
-            assert!(!wait_for_answer(&absent.sock, 10).await);
+            assert_eq!(wait_for_readiness(&absent.sock, 10).await, Readiness::Unreachable);
             let took = t.elapsed();
             assert!(took >= Duration::from_millis(950) && took < Duration::from_millis(2000), "dead, budget 1 s: {took:?}");
 
             let t = Instant::now();
-            assert!(!must_end("wait_for_answer on a hung rig", wait_for_answer(&hung.sock, 40)).await);
+            let r = must_end("wait_for_readiness on a hung rig", wait_for_readiness(&hung.sock, 40)).await;
+            assert!(matches!(&r, Readiness::NotAnswering(why) if why.starts_with("확인 요청(system.identify)에 ")), "hung: {r:?}");
             let took = t.elapsed();
             assert!(took >= Duration::from_millis(3900) && took < Duration::from_millis(5000), "hung, budget 4 s: {took:?}");
 
@@ -12374,10 +12515,227 @@ exit 0
                 RigDaemon::start("w-late", RigMode::Responsive { pid: Some(8), live: 0 })
             });
             let t = Instant::now();
-            assert!(wait_for_answer(&late_sock, 20).await, "a daemon that binds late inside the budget is found");
+            assert_eq!(wait_for_readiness(&late_sock, 20).await, Readiness::Answers, "a daemon that binds late inside the budget is found");
             assert!(t.elapsed() >= Duration::from_millis(300));
             let _late = late.await.unwrap();
         });
+    }
+
+    /// ★C-LOUD test spawner: counts its calls and, when `brings` is Some, brings a rig up on the socket path of rig `name`
+    /// (the stand-in for the cysd a real spawn starts; kept alive here). It starts no process.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct SpawnLog {
+        calls: std::sync::atomic::AtomicUsize,
+        rigs: std::sync::Mutex<Vec<RigDaemon>>,
+    }
+
+    #[cfg(unix)]
+    impl SpawnLog {
+        fn spawner<'a>(&'a self, name: &'a str, brings: Option<RigMode>) -> impl FnOnce() -> Result<(), String> + 'a {
+            move || {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(mode) = brings {
+                    self.rigs.lock().unwrap().push(RigDaemon::start(name, mode));
+                }
+                Ok(())
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// ★C-LOUD "no signal" specimen: a real process whose pid is written where cysd keeps its own (`<socket>.lock`, the
+    /// file A2 reads), so a stop or signal aimed at the lock-file pid by the path under test would end it early. It ends by
+    /// itself after `secs`; `assert_ended_by_itself` then checks exit status 0 and no signal. Nothing here stops a process.
+    #[cfg(unix)]
+    fn lock_holder(rig: &RigDaemon, secs: u32) -> std::process::Child {
+        let child = std::process::Command::new("sleep").arg(secs.to_string()).spawn().expect("start sleep");
+        std::fs::write(rig.sock.with_extension("lock"), child.id().to_string()).unwrap();
+        child
+    }
+
+    #[cfg(unix)]
+    fn assert_ended_by_itself(mut child: std::process::Child, what: &str) {
+        use std::os::unix::process::ExitStatusExt as _;
+        let status = child.wait().expect("wait for the lock-file holder");
+        assert!(
+            status.success() && status.signal().is_none(),
+            "{what}: the lock-file holder was stopped or signalled: {status:?}"
+        );
+    }
+
+    /// ★C-LOUD purpose test (CEO ruling 2026-10-19 option B; rows 3 and 4), `ensure_daemon_on` with a counting spawner and
+    /// a counting reset check (never the live ones): responsive -> Ok, nothing asked. HUNG -> the specific not-answering
+    /// error at the 2 s probe, the spawner NEVER called, the reset check not reached, and the lock-file holder ends by
+    /// itself (no signal). Dead (absent / stale socket file) -> the base spawn path: one spawner call, then Ok when the
+    /// stand-in daemon answers, or the base "did not come up within 4s" when nothing comes up. Dead + reset in progress
+    /// -> the base refusal, no spawn. Dead + the stand-in accepts but does not answer -> the row-4 not-answering error.
+    #[cfg(unix)]
+    #[test]
+    fn c_loud_ensure_daemon_spawns_only_when_connect_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let holder = tauri::async_runtime::block_on(async {
+            let ok = RigDaemon::start("e-ok", RigMode::Responsive { pid: Some(1), live: 0 });
+            let hung = RigDaemon::start("e-hung", RigMode::Hung);
+            let _absent = RigDaemon::start("e-absent", RigMode::DeadAbsent);
+            let _stale = RigDaemon::start("e-stale", RigMode::DeadStale);
+            let reset = RigDaemon::start("e-reset", RigMode::DeadAbsent);
+            let _spawned_hung = RigDaemon::start("e-spawned-hung", RigMode::DeadAbsent);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let holder = lock_holder(&hung, 4);
+            let hung_responsive = RigMode::Responsive { pid: Some(9), live: 0 };
+
+            let (log, resets) = (SpawnLog::default(), AtomicUsize::new(0));
+            let r = ensure_daemon_on(&ok.sock, || resets.fetch_add(1, Ordering::SeqCst) > usize::MAX, log.spawner("e-ok", None)).await;
+            assert_eq!((r, log.calls(), resets.load(Ordering::SeqCst)), (Ok(()), 0, 0), "responsive");
+
+            let cell = |name: &'static str, brings: Option<RigMode>, reset_now: bool| async move {
+                let (log, resets) = (SpawnLog::default(), AtomicUsize::new(0));
+                let t = Instant::now();
+                let r = must_end(
+                    name,
+                    ensure_daemon_on(
+                        &rig_dir(name).join("d.sock"),
+                        || {
+                            resets.fetch_add(1, Ordering::SeqCst);
+                            reset_now
+                        },
+                        log.spawner(name, brings),
+                    ),
+                )
+                .await;
+                let took = t.elapsed();
+                let rigs = std::mem::take(&mut *log.rigs.lock().unwrap());
+                (r, log.calls(), resets.load(Ordering::SeqCst), took, rigs)
+            };
+            let (h, a, st, rs, sh) = tokio::join!(
+                cell("e-hung", Some(hung_responsive), false),
+                cell("e-absent", Some(RigMode::Responsive { pid: Some(2), live: 0 }), false),
+                cell("e-stale", None, false),
+                cell("e-reset", Some(RigMode::Responsive { pid: Some(3), live: 0 }), true),
+                cell("e-spawned-hung", Some(RigMode::Hung), false),
+            );
+
+            assert_eq!(
+                h.0,
+                Err(not_answering_error("확인 요청(system.identify)에 2000 ms 안에 답이 없음", false)),
+                "hung: the specific not-answering error"
+            );
+            assert_eq!((h.1, h.2), (0, 0), "hung: the spawner must never be called (and the reset check is not reached)");
+            assert!(h.3 >= Duration::from_millis(1900) && h.3 < Duration::from_millis(3000), "hung took {:?}", h.3);
+            assert_eq!(hung.accepted(), 1, "hung: one probe connection, no second daemon in front of it");
+
+            assert_eq!((a.0.clone(), a.1, a.2), (Ok(()), 1, 1), "dead (absent): the base spawn path, then the stand-in answers");
+            assert!(a.3 < Duration::from_millis(1900), "dead (absent) took {:?}", a.3);
+            assert_eq!((st.0.clone(), st.1, st.2), (Err("cysd did not come up within 4s".to_string()), 1, 1), "dead (stale): base");
+            assert!(st.3 >= Duration::from_millis(3900) && st.3 < Duration::from_millis(5000), "dead (stale) took {:?}", st.3);
+            assert_eq!(
+                (rs.0.clone(), rs.1, rs.2),
+                (Err("완전 초기화가 진행 중 — 데몬 기동을 보류한다(완료 후 앱을 다시 실행하라)".to_string()), 0, 1),
+                "dead + reset in progress: the base refusal, no spawn"
+            );
+            assert_eq!(reset.accepted(), 0);
+            assert!(
+                matches!(&sh.0, Err(e) if e.starts_with(DAEMON_NOT_ANSWERING) && e.ends_with("cysd 를 띄운 뒤에도 답이 없었습니다")),
+                "dead, then the spawned stand-in accepts and does not answer: row 4 says so: {:?}",
+                sh.0
+            );
+            assert_eq!(sh.1, 1, "row 4: exactly the one spawn of the dead path");
+            holder
+        });
+        assert_ended_by_itself(holder, "hung rig");
+    }
+
+    /// ★C-LOUD purpose test of the boot's first daemon step (option ii, head 2026-10-19; rows 5 and 3), with a counting
+    /// spawner and an emit collector standing in for `handle.emit("daemon-error", ..)`: HUNG (launchd-owned or not) ->
+    /// exactly one daemon-error, the specific not-answering text, then `Ok` (the boot goes on to daemon-ready as base did),
+    /// the spawner never called, and the lock-file holder ends by itself (no signal). Dead -> the base path: launchd-owned
+    /// falls back to a spawn after 5 s (Ok when the stand-in answers); not launchd-owned and nothing comes up -> the base
+    /// `Err`, which the retry loop takes, with nothing emitted here. Responsive -> Ok, nothing emitted or spawned.
+    #[cfg(unix)]
+    #[test]
+    fn c_loud_boot_first_step_announces_and_proceeds_on_hung_and_spawns_only_on_dead() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let holders = tauri::async_runtime::block_on(async {
+            let _ok = RigDaemon::start("b-ok", RigMode::Responsive { pid: Some(1), live: 0 });
+            let hung_l = RigDaemon::start("b-hung-l", RigMode::Hung);
+            let hung_n = RigDaemon::start("b-hung-n", RigMode::Hung);
+            let _absent_l = RigDaemon::start("b-absent-l", RigMode::DeadAbsent);
+            let _stale_n = RigDaemon::start("b-stale-n", RigMode::DeadStale);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let holders = vec![lock_holder(&hung_l, 7), lock_holder(&hung_n, 4)];
+
+            let cell = |name: &'static str, launchd: bool, brings: Option<RigMode>| async move {
+                let (log, resets) = (SpawnLog::default(), AtomicUsize::new(0));
+                let emitted = std::sync::Mutex::new(Vec::<String>::new());
+                let t = Instant::now();
+                let r = must_end(
+                    name,
+                    boot_first_daemon_step(
+                        &rig_dir(name).join("d.sock"),
+                        launchd,
+                        || resets.fetch_add(1, Ordering::SeqCst) > usize::MAX,
+                        log.spawner(name, brings),
+                        |m| emitted.lock().unwrap().push(m),
+                    ),
+                )
+                .await;
+                let took = t.elapsed();
+                let rigs = std::mem::take(&mut *log.rigs.lock().unwrap());
+                (r, log.calls(), emitted.into_inner().unwrap(), took, rigs)
+            };
+            let responsive = Some(RigMode::Responsive { pid: Some(5), live: 0 });
+            let (ok_l, ok_n, hl, hn, al, sn) = tokio::join!(
+                cell("b-ok", true, responsive),
+                cell("b-ok", false, responsive),
+                cell("b-hung-l", true, responsive),
+                cell("b-hung-n", false, responsive),
+                cell("b-absent-l", true, responsive),
+                cell("b-stale-n", false, None),
+            );
+
+            for (what, c) in [("responsive, launchd", &ok_l), ("responsive", &ok_n)] {
+                assert_eq!((c.0.clone(), c.1, c.2.len()), (Ok(()), 0, 0), "{what}");
+                assert!(c.3 < Duration::from_millis(1900), "{what} took {:?}", c.3);
+            }
+
+            assert_eq!(hl.0, Ok(()), "hung, launchd-owned: the boot goes on (daemon-ready next), not the retry loop");
+            assert_eq!(hl.1, 0, "hung, launchd-owned: no sibling spawn");
+            assert_eq!(hl.2.len(), 1, "hung, launchd-owned: exactly one daemon-error: {:?}", hl.2);
+            assert!(
+                hl.2[0].starts_with(&format!("{DAEMON_NOT_ANSWERING} (확인 요청(system.identify)에 "))
+                    && hl.2[0].ends_with("— 새 cysd 를 띄우지 않았고, 떠 있는 cysd 를 멈추지도 않았습니다"),
+                "hung, launchd-owned: the specific text: {:?}",
+                hl.2[0]
+            );
+            assert!(hl.3 >= Duration::from_millis(4900) && hl.3 < Duration::from_millis(6500), "hung, launchd took {:?}", hl.3);
+
+            assert_eq!((hn.0.clone(), hn.1), (Ok(()), 0), "hung, not launchd-owned: goes on, no spawn");
+            assert_eq!(
+                hn.2,
+                vec![not_answering_error("확인 요청(system.identify)에 2000 ms 안에 답이 없음", false)],
+                "hung, not launchd-owned: exactly one daemon-error with the specific text"
+            );
+            assert!(hn.3 >= Duration::from_millis(1900) && hn.3 < Duration::from_millis(3000), "hung took {:?}", hn.3);
+            assert_eq!((hung_l.accepted() >= 2, hung_n.accepted()), (true, 1), "probes only; no second daemon in front");
+
+            assert_eq!((al.0.clone(), al.1, al.2.len()), (Ok(()), 1, 0), "dead, launchd-owned: the base sibling-spawn fallback");
+            assert!(al.3 >= Duration::from_millis(4900) && al.3 < Duration::from_millis(6500), "dead, launchd took {:?}", al.3);
+            assert_eq!(
+                (sn.0.clone(), sn.1, sn.2.len()),
+                (Err("cysd did not come up within 4s".to_string()), 1, 0),
+                "dead, nothing comes up: the base Err for the retry loop, nothing emitted"
+            );
+            holders
+        });
+        for (h, what) in holders.into_iter().zip(["hung, launchd-owned", "hung"]) {
+            assert_ended_by_itself(h, what);
+        }
     }
 
     /// ★A1 purpose test: with force true the guard asks nothing, so no connection reaches any rig and a hung daemon cannot
@@ -12520,8 +12878,8 @@ exit 0
             &["kill", "sigterm", "sigkill", "sigint", "sighup", "sigquit", "sigstop", "signal", "terminate", "raise("];
         const CAPS: &[&str] = &[
             "Command::new", ".spawn(", "process::exit", "libc::", "nix::", "launchctl", "osascript",
-            "rpc_oneshot(", "rpc_on(", " rpc(", "rpc_full", "conn_cell", "request(", "request_on(", "request_on_timeout(",
-            "\"surface.", "\"ledger.", "\"system.", "\"daemon.", "\"channel.",
+            "rpc_oneshot(", "rpc_on(", "rpc_once(", " rpc(", "rpc_full", "conn_cell", "request(", "request_on(",
+            "request_on_timeout(", "\"surface.", "\"ledger.", "\"system.", "\"daemon.", "\"channel.",
         ];
         let low = code.to_lowercase();
         let mut out = vec![("killwords", KILL_WORDS.iter().map(|t| low.matches(t).count()).sum())];
@@ -12541,15 +12899,23 @@ exit 0
     fn c_probe_and_a2_never_stop_a_process_source_pin() {
         let expected: &[(&str, &[(&str, usize)])] = &[
             ("async fn identify_within(", &[("killwords", 0), ("rpc_oneshot(", 1), ("\"system.", 1)]),
-            ("async fn daemon_answers(", &[("killwords", 0)]),
-            ("async fn wait_for_answer(", &[("killwords", 0)]),
+            ("async fn probe_readiness(", &[("killwords", 0), ("rpc_once(", 1), ("\"system.", 1)]),
+            ("async fn wait_for_readiness(", &[("killwords", 0)]),
+            ("fn not_answering_error(", &[("killwords", 0)]),
+            ("fn is_not_answering(", &[("killwords", 0)]),
+            ("fn announce_not_answering(", &[("killwords", 0)]),
+            ("async fn boot_first_daemon_step(", &[("killwords", 0)]),
+            ("async fn ensure_daemon_on(", &[("killwords", 0)]),
+            ("enum Readiness", &[("killwords", 0)]),
             ("async fn plan_daemon_stop(", &[("killwords", 0)]),
             ("fn lock_file_pid(", &[("killwords", 0)]),
             ("async fn update_session_guard<", &[("killwords", 0)]),
             ("enum DaemonStopPlan", &[("killwords", 0)]),
             ("enum IdentifyMiss", &[("killwords", 0)]),
             // Existing functions on the path: equal to base 4ed79fdd (measured with tools/capability_census.py).
-            ("async fn ensure_daemon(", &[("killwords", 0), ("Command::new", 1), (".spawn(", 1)]),
+            // C-LOUD moved the spawn half of ensure_daemon, unchanged, into spawn_bundled_cysd: the base census moved with it.
+            ("async fn ensure_daemon(", &[("killwords", 0)]),
+            ("fn spawn_bundled_cysd(", &[("killwords", 0), ("Command::new", 1), (".spawn(", 1)]),
             ("async fn rpc_oneshot(", &[("killwords", 0), ("rpc_oneshot(", 1)]),
             ("async fn install_update(", &[("killwords", 0)]),
             (
@@ -12591,10 +12957,50 @@ exit 0
             wu_code(wu_seg("async fn maybe_autoregister_launchd(")).contains("let running = connect().await.is_ok();"),
             "row 2 (launchd autoregister `running`) stays PRESENCE"
         );
-        let ensure = wu_code(wu_seg("async fn ensure_daemon("));
-        assert!(ensure.contains("if daemon_answers(&default_socket()).await {\n        return Ok(());"), "row 3 is REPLY-HEALTH");
-        assert!(ensure.contains("if wait_for_answer(&default_socket(), 40).await {"), "row 4 is REPLY-HEALTH");
-        assert_eq!(prod.matches("if wait_for_answer(&default_socket(), 50).await {").count(), 1, "row 5 is REPLY-HEALTH");
+        // ★C-LOUD (CEO ruling 2026-10-19 option B; head option ii): only a failed connect reaches a spawn, and a daemon
+        // that accepts but does not answer is announced at boot, which then goes on as base did.
+        assert_eq!(
+            wu_code(wu_seg("async fn ensure_daemon(")),
+            "async fn ensure_daemon() -> Result<(), String> {\n    ensure_daemon_on(&default_socket(), cys::factory_reset::reset_in_progress, spawn_bundled_cysd).await",
+            "ensure_daemon = ensure_daemon_on with the live socket, the live reset check and the real spawner"
+        );
+        let on = wu_code(wu_seg("async fn ensure_daemon_on("));
+        let row3 = on
+            .find("    match probe_readiness(socket, DAEMON_ANSWER_DEADLINE).await {\n        Readiness::Answers => return Ok(()),\n        Readiness::NotAnswering(why) => return Err(not_answering_error(&why, false)),\n        Readiness::Unreachable => {}\n    }")
+            .expect("row 3: an answer returns Ok, accepts-but-no-answer returns the loud error, only Unreachable goes on");
+        let reset = on.find("    if reset_in_progress() {").expect("the reset check");
+        let spawn = on.find("    spawn()?;").expect("the spawn");
+        assert_eq!(on.matches("spawn()").count(), 1, "ensure_daemon_on spawns at one place");
+        assert!(row3 < reset && reset < spawn, "probe -> reset check -> spawn (the base order)");
+        assert!(
+            on.contains("    match wait_for_readiness(socket, 40).await {\n        Readiness::Answers => Ok(()),\n        Readiness::NotAnswering(why) => Err(not_answering_error(&why, true)),\n        Readiness::Unreachable => Err(\"cysd did not come up within 4s\".into()),"),
+            "row 4 is REPLY-HEALTH and says which way it failed"
+        );
+        let boot = wu_code(wu_seg("async fn boot_first_daemon_step("));
+        let row5 = boot
+            .find("        match wait_for_readiness(socket, 50).await {\n            Readiness::Answers => Ok(()),\n            Readiness::NotAnswering(why) => Err(not_answering_error(&why, false)),\n            Readiness::Unreachable => {")
+            .expect("row 5: accepts-but-no-answer is reported, not replaced");
+        assert_eq!(boot.matches("ensure_daemon_on(").count(), 2, "row 5's fallback and the not-launchd-owned path");
+        assert!(
+            row5 < boot.find("ensure_daemon_on(").unwrap(),
+            "row 5's sibling-spawn fallback sits only in the Unreachable arm"
+        );
+        assert!(
+            boot.contains("    match result {\n        Err(e) if is_not_answering(&e) => {\n            announce_not_answering(e, emit_error);\n            Ok(())\n        }\n        other => other,\n    }"),
+            "option ii: a not-answering daemon is announced and the boot goes on"
+        );
+        let main_fn = wu_code(wu_seg("fn main() {"));
+        let first = main_fn
+            .find("let mut result = boot_first_daemon_step(\n                    &default_socket(),\n                    launchd_owns,\n                    cys::factory_reset::reset_in_progress,\n                    spawn_bundled_cysd,\n                    |m| {\n                        let _ = handle.emit(\"daemon-error\", m);")
+            .expect("the boot's first daemon step, emitting into daemon-error");
+        let retry = main_fn.find("                if result.is_err() {").expect("the retry loop");
+        let retry_arm = main_fn
+            .find("                            Err(e) if is_not_answering(&e) => {\n                                announce_not_answering(e, |m| {\n                                    let _ = handle.emit(\"daemon-error\", m);\n                                });\n                                result = Ok(());\n                                break;")
+            .expect("retry loop: accepts-but-no-answer is announced and the boot goes on");
+        let ready = main_fn.find("let _ = handle.emit(\"daemon-ready\", ());").expect("daemon-ready");
+        assert!(first < retry && retry < retry_arm && retry_arm < ready, "first step -> retry loop -> daemon-ready");
+        assert_eq!(main_fn.matches("boot_first_daemon_step(").count(), 1);
+        assert_eq!(prod.matches("spawn_bundled_cysd").count(), 3, "the spawner: its definition, ensure_daemon and the boot step");
         let install = wu_code(wu_seg("async fn install_update("));
         assert!(install.contains("update_session_guard(force, live_session_count).await?;"), "A1: the guard with the real counter");
         assert_eq!(install.matches("live_session_count").count(), 1, "install_update asks the count only through the guard");
