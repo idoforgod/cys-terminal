@@ -124,7 +124,16 @@ impl Proof for Scripted {
 }
 
 fn hand_off(fx: &Fx, s: &Arc<Surface>) -> bool {
-    deliver_head_locked(&fx.daemon, s, true, false, None, None, None, None).is_some()
+    hand_off_on(&fx.daemon, s)
+}
+
+/// One forced hand-off, re-run only when the seat's own PTY output fell inside the attempt. The hand-off gate refuses
+/// while the reader publishes a chunk (odd `output_gen`): a Unix `sleep 30` seat never prints, a Windows seat prints
+/// right after it starts (ConPTY start-up output; windows-health run 39207028554). `state::test_done_or_no_pty_output`
+/// returns at once on a hand-off, keeps a refusal only from a quiet window and never re-runs on Unix, so an expected
+/// refusal is still a measured one and an unexpected hand-off is never retried away.
+fn hand_off_on(daemon: &Arc<Daemon>, s: &Arc<Surface>) -> bool {
+    crate::state::test_done_or_no_pty_output(s, || deliver_head_locked(daemon, s, true, false, None, None, None, None).is_some())
 }
 
 /// S-T08 positive arm: the item is popped, receipted and announced exactly once — and only after
@@ -313,7 +322,7 @@ fn restart_with_a_held_partial_never_retypes_it() {
     d2.roles.lock().unwrap().insert("worker".into(), s2.id);
     d2.rehome_restored_queue();
     let restored: Vec<String> = s2.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
-    let retyped = deliver_head_locked(&d2, &s2, true, false, None, None, None, None).is_some();
+    let retyped = hand_off_on(&d2, &s2);
     let typed = s2.inject_track.last_body().is_some();
     let _ = s2.child.lock().unwrap().kill();
     assert_eq!(restored, vec![id], "premise: the held entry survives the restart");
@@ -367,19 +376,28 @@ fn restarted_hold_releases_only_when_the_composer_is_measured_empty() {
     crate::governance::h_paint(&s2, &crate::governance::h_residue_screen("a held directive a held directive"));
     assert_eq!(crate::governance::queue_write_hold_block(&d2, &s2), Some(crate::governance::BLOCKED_PARTIAL_WRITE));
     backdate(&s2);
-    assert_eq!(crate::governance::queue_write_hold_block(&d2, &s2), Some(crate::governance::BLOCKED_PARTIAL_WRITE), "released with a prefix visible");
-    assert!(deliver_head_locked(&d2, &s2, true, false, None, None, None, None).is_none(), "handed off while held");
+    // Past the minimum age the release depends on the screen measurement, which reads nothing while the seat's reader
+    // publishes (see `hand_off_on`): keep only a verdict from a quiet window. The two checks above are held by age alone.
+    let held_with_prefix = crate::state::test_until_no_pty_output(&s2, "prefix-visible hold", || {
+        crate::governance::h_paint(&s2, &crate::governance::h_residue_screen("a held directive a held directive"));
+        crate::governance::queue_write_hold_block(&d2, &s2)
+    });
+    assert_eq!(held_with_prefix, Some(crate::governance::BLOCKED_PARTIAL_WRITE), "released with a prefix visible");
+    assert!(!hand_off_on(&d2, &s2), "handed off while held");
     assert!(s2.inject_track.last_body().is_none(), "something was typed while held");
     assert_eq!(ev("queue.write_held"), 1, "one coalesced notice");
     assert_eq!(ev("queue.write_released"), 0);
     // Composer measured empty: released, the held item leaves, the next item is delivered once.
-    crate::governance::h_paint(&s2, crate::governance::H_IDLE_SCREEN);
-    assert_eq!(crate::governance::queue_write_hold_block(&d2, &s2), None, "not released with an empty composer");
+    let released = crate::state::test_until_no_pty_output(&s2, "empty-composer release", || {
+        crate::governance::h_paint(&s2, crate::governance::H_IDLE_SCREEN);
+        crate::governance::queue_write_hold_block(&d2, &s2)
+    });
+    assert_eq!(released, None, "not released with an empty composer");
     assert_eq!(ev("queue.write_released"), 1);
     let ids: Vec<String> = s2.pending_queue.lock().unwrap().iter().map(|e| e.id.clone()).collect();
     assert_eq!(ids, vec![next_id], "the held item is still queued (or the next one was lost)");
     assert!(!d2.write_holds.lock().unwrap().contains_key(&held), "the persisted hold outlived its release");
-    assert!(deliver_head_locked(&d2, &s2, true, false, None, None, None, None).is_some(), "the next item was not handed off");
+    assert!(hand_off_on(&d2, &s2), "the next item was not handed off");
     let typed = s2.inject_track.last_body().map(|b| b.norm);
     let _ = s2.child.lock().unwrap().kill();
     assert!(typed.as_deref().is_some_and(|t| t.contains("the next item") && !t.contains("a held directive")), "{typed:?}");
@@ -920,11 +938,19 @@ fn c8pp_refusal_backoff_is_rechecked_at_locked_handoff() {
 }
 
 fn c8pp_force_rpc(fx: &Fx, s: &Arc<Surface>) -> Value {
-    let req=cys::Request{id:Value::from(1),method:"queue.deliver".into(),params:serde_json::json!({"surface_id":s.id})};
-    match crate::handlers::dispatch(&fx.daemon,req,None) {
-        crate::handlers::Reply::Single(reply)=>{assert_eq!(reply["ok"],Value::from(true),"fixture admission: {reply}");reply["result"].clone()},
-        _=>panic!("single reply"),
-    }
+    // The forced delivery refuses ("delivery raced") while the seat's reader publishes, like `hand_off_on`: retried only
+    // for a disturbed attempt, each attempt re-stamping c8pp_quiet_shell's quiet output (a seat chunk stamps it anew).
+    let mut reply=Value::Null;
+    let admitted=crate::state::test_done_or_no_pty_output(s,|| {
+        *s.last_output.lock().unwrap()=Instant::now()-Duration::from_secs(2);
+        let req=cys::Request{id:Value::from(1),method:"queue.deliver".into(),params:serde_json::json!({"surface_id":s.id})};
+        match crate::handlers::dispatch(&fx.daemon,req,None) {
+            crate::handlers::Reply::Single(r)=>{reply=r;reply["ok"]==Value::from(true)},
+            _=>panic!("single reply"),
+        }
+    });
+    assert!(admitted,"fixture admission: {reply}");
+    reply["result"].clone()
 }
 fn c8pp_quiet_shell(s: &Arc<Surface>) {
     std::thread::sleep(Duration::from_millis(700));

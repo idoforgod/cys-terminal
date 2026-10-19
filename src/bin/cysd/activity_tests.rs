@@ -368,6 +368,8 @@ fn fx(tag: &str) -> Fx {
     std::fs::write(dir.join("acl.json"), r#"{"default":"allow","rules":[]}"#).unwrap();
     std::env::set_var(cys::pack::ENV_PACK_DIR, &dir);
     let daemon = Daemon::new(dir.join("cysd.sock"));
+    // Seat ids restart at 1 per daemon: a new fixture starts the own-bump ledger empty (see `OWN_GEN`).
+    OWN_GEN.with(|m| m.borrow_mut().clear());
     Fx { daemon, _dir: dir, _g: g }
 }
 
@@ -385,23 +387,80 @@ fn seat(fx: &Fx, role: &str, agent: Option<&str>) -> Arc<Surface> {
 
 /// Writes bytes into the seat's parser as one complete publication (odd → even, like the reader).
 fn publish(s: &Surface, bytes: &[u8]) {
-    s.output_gen.fetch_add(1, Ordering::AcqRel);
+    bump_gen(s.id, &s.output_gen, 1);
     s.parser.lock().unwrap().process(bytes);
-    s.output_gen.fetch_add(1, Ordering::AcqRel);
+    bump_gen(s.id, &s.output_gen, 1);
 }
 
 fn set_after_copy(f: Option<Box<dyn FnMut()>>) {
     AFTER_COPY.with(|h| *h.borrow_mut() = f);
 }
 
+// Windows seat output (windows-health run 39207028554). `seat()` is a real PTY seat running `sleep 30`: on Unix it prints
+// nothing; on Windows it prints right after it starts (ConPTY start-up output), and its reader thread publishes those
+// chunks into the same parser and `output_gen` these tests write (state.rs reader: odd, parser lock, even). A step that
+// runs during such a chunk meets a held parser lock or an odd endpoint, which the observer rightly rejects, and then
+// measures the seat instead of the observer. Those steps run in `quiet`: an attempt counts only if the seat's reader
+// published nothing during it. That is the proof of `state::test_until_no_pty_output` (its core, 60 tries, 25 ms step)
+// with one difference: the generation read leaves out this test's own bumps, because `publish()` moves `output_gen` by 2
+// per frame by design and a window with a publication in it would otherwise never be quiet.
+
+thread_local! {
+    /// `output_gen` bumps made by this test thread, per seat id (`publish()` and the endpoint hooks). Cleared by `fx()`: seat
+    /// ids restart per daemon, so an entry from an earlier fixture on this thread (libtest gives each test its own thread,
+    /// and a panic mid-`publish` ends its test) can never be read against a later seat with the same id.
+    static OWN_GEN: std::cell::RefCell<std::collections::HashMap<u64, u64>> = Default::default();
+}
+
+/// Moves a seat's output generation as this test, not as the seat's reader.
+fn bump_gen(sid: u64, gen: &std::sync::atomic::AtomicU64, n: u64) {
+    gen.fetch_add(n, Ordering::AcqRel);
+    OWN_GEN.with(|m| *m.borrow_mut().entry(sid).or_insert(0) += n);
+}
+
+/// The seat's output generation without this test's bumps: only the seat's reader moves it.
+fn reader_gen(s: &Surface) -> u64 {
+    let own = OWN_GEN.with(|m| m.borrow().get(&s.id).copied().unwrap_or(0));
+    s.output_gen.load(Ordering::Acquire) - own
+}
+
+/// Runs `attempt` until one run saw no publication by the seat's reader and returns that run's value. Assertions go on
+/// the returned value, never inside `attempt` (a disturbed run's values are dropped). A silent (Unix) seat keeps the
+/// first run. A run that moves `output_gen` by itself other than through `bump_gen` never counts, so it panics here.
+fn quiet<T>(s: &Surface, what: &str, attempt: impl FnMut() -> T) -> T {
+    match crate::state::test_until_quiet_window(|| reader_gen(s), 60, 25, attempt) {
+        Ok(v) => v,
+        Err(tries) => panic!(
+            "{what}: premise not met - output_gen moved outside this test's bump_gen in all {tries} attempts \
+             (the seat keeps printing, or the code under test moved it)"
+        ),
+    }
+}
+
+/// `quiet` for runs that feed the seat's reducer. A retried run first writes the identity, so it starts on a new epoch
+/// with a fresh reducer (`observe_seat`) and a disturbed run's rejected samples are not carried into it. The first run
+/// is untouched.
+fn quiet_run<T>(s: &Surface, what: &str, mut run: impl FnMut() -> T) -> T {
+    let mut retried = false;
+    quiet(s, what, || {
+        if std::mem::replace(&mut retried, true) {
+            invalidate_identity(s);
+        }
+        run()
+    })
+}
+
 #[test]
 fn collect_copies_bounded_rows_without_growing_its_buffers() {
     let f = fx("collect-bounds");
     let s = seat(&f, "worker", Some("claude"));
-    publish(&s, b"\x1b[2J\x1b[24;1Hbottom line\x1b[1;1Htop");
     let mut frame = Frame::new();
     let (cap_cells, cap_rows) = (frame.cells.capacity(), frame.row_index.capacity());
-    assert!(matches!(collect(&s, &mut frame), Collected::Frame));
+    let got = quiet(&s, "collect bounds", || {
+        publish(&s, b"\x1b[2J\x1b[24;1Hbottom line\x1b[1;1Htop");
+        matches!(collect(&s, &mut frame), Collected::Frame)
+    });
+    assert!(got);
     assert_eq!(frame.cells.len(), frame.row_index.len() * 80);
     assert!(frame.row_index.len() <= MAX_ROWS && frame.cells.len() <= MAX_CELLS);
     assert_eq!((frame.cells.capacity(), frame.row_index.capacity()), (cap_cells, cap_rows), "no reallocation");
@@ -515,20 +574,25 @@ fn hold_copy_micro_benchmark() {
 fn published_only_admission_accepts_even_unequal_endpoints() {
     let f = fx("even-unequal");
     let s = seat(&f, "worker", Some("claude"));
-    publish(&s, b"SYN-CLAUDE-WORKING frame");
     let gen = Arc::clone(&s.output_gen);
+    let sid = s.id;
     let mut frame = Frame::new();
     let mut r = Reducer::new(0.0);
     for tick in 0..4u64 {
-        let g2 = Arc::clone(&gen);
-        set_after_copy(Some(Box::new(move || {
-            g2.fetch_add(2, Ordering::AcqRel); // a complete reader publication between the endpoints
-        })));
-        let before = s.output_gen.load(Ordering::Acquire);
-        let got = collect(&s, &mut frame);
-        set_after_copy(None);
-        assert_ne!(s.output_gen.load(Ordering::Acquire), before, "endpoints differed");
-        assert!(matches!(got, Collected::Frame), "tick {tick}: even/even unequal must be admitted");
+        // the frame is published inside each tick's quiet run, so no seat chunk can repaint it between ticks
+        let (before, after, got) = quiet(&s, "even/even unequal", || {
+            publish(&s, b"\x1b[1;1HSYN-CLAUDE-WORKING frame");
+            let g2 = Arc::clone(&gen);
+            set_after_copy(Some(Box::new(move || {
+                bump_gen(sid, &g2, 2); // a complete reader publication between the endpoints
+            })));
+            let before = s.output_gen.load(Ordering::Acquire);
+            let got = matches!(collect(&s, &mut frame), Collected::Frame);
+            set_after_copy(None);
+            (before, s.output_gen.load(Ordering::Acquire), got)
+        });
+        assert_ne!(after, before, "endpoints differed");
+        assert!(got, "tick {tick}: even/even unequal must be admitted");
         let text = frame.text_rows();
         let v = View { rows: &text, cursor: frame.cursor, title: &frame.title };
         let (sample, _) = classify_with(Family::Claude, &v, &grammars_t());
@@ -546,17 +610,26 @@ fn published_only_admission_accepts_even_unequal_endpoints() {
 fn odd_endpoint_is_a_transient_rejection() {
     let f = fx("odd");
     let s = seat(&f, "worker", Some("claude"));
+    let sid = s.id;
     let mut frame = Frame::new();
-    s.output_gen.fetch_add(1, Ordering::AcqRel); // publication in progress at the first endpoint
-    assert!(matches!(collect(&s, &mut frame), Collected::Rejected(Sample::Transient(Transient::OddEndpoint))));
-    s.output_gen.fetch_add(1, Ordering::AcqRel);
-    let g2 = Arc::clone(&s.output_gen);
-    set_after_copy(Some(Box::new(move || {
-        g2.fetch_add(1, Ordering::AcqRel); // second endpoint odd
-    })));
-    let got = collect(&s, &mut frame);
-    set_after_copy(None);
-    assert!(matches!(got, Collected::Rejected(Sample::Transient(Transient::OddEndpoint))));
+    let first = quiet(&s, "odd first endpoint", || {
+        bump_gen(sid, &s.output_gen, 1); // publication in progress at the first endpoint
+        let got = matches!(collect(&s, &mut frame), Collected::Rejected(Sample::Transient(Transient::OddEndpoint)));
+        bump_gen(sid, &s.output_gen, 1);
+        got
+    });
+    assert!(first);
+    let second = quiet(&s, "odd second endpoint", || {
+        let g2 = Arc::clone(&s.output_gen);
+        set_after_copy(Some(Box::new(move || {
+            bump_gen(sid, &g2, 1); // second endpoint odd
+        })));
+        let got = matches!(collect(&s, &mut frame), Collected::Rejected(Sample::Transient(Transient::OddEndpoint)));
+        set_after_copy(None);
+        bump_gen(sid, &s.output_gen, 1); // even again, so a retried run starts from an even first endpoint
+        got
+    });
+    assert!(second);
 }
 
 #[test]
@@ -583,7 +656,10 @@ fn poisoned_parser_is_a_positive_contradiction_never_recovered() {
     })
     .join();
     let mut frame = Frame::new();
-    assert!(matches!(collect(&s, &mut frame), Collected::Rejected(Sample::Semantic(Semantic::ParserPoison))));
+    let got = quiet(&s, "poisoned parser", || {
+        matches!(collect(&s, &mut frame), Collected::Rejected(Sample::Semantic(Semantic::ParserPoison)))
+    });
+    assert!(got);
     assert!(s.parser.is_poisoned(), "the display collector does not clear poison");
 }
 
@@ -593,7 +669,10 @@ fn over_256_columns_is_unsupported_geometry() {
     let s = seat(&f, "worker", Some("claude"));
     s.parser.lock().unwrap().set_size(24, 300);
     let mut frame = Frame::new();
-    assert!(matches!(collect(&s, &mut frame), Collected::Rejected(Sample::Semantic(Semantic::UnsupportedGeometry))));
+    let got = quiet(&s, "wide geometry", || {
+        matches!(collect(&s, &mut frame), Collected::Rejected(Sample::Semantic(Semantic::UnsupportedGeometry)))
+    });
+    assert!(got);
     assert!(frame.cells.is_empty());
 }
 
@@ -601,13 +680,16 @@ fn over_256_columns_is_unsupported_geometry() {
 fn identity_write_between_endpoints_invalidates_the_sample() {
     let f = fx("ident-between");
     let s = seat(&f, "worker", Some("claude"));
-    let s2 = Arc::clone(&s);
-    set_after_copy(Some(Box::new(move || invalidate_identity(&s2))));
     let mut frame = Frame::new();
-    let got = collect(&s, &mut frame);
-    set_after_copy(None);
-    assert!(matches!(got, Collected::Rejected(Sample::Invalidated(Invalid::Identity))));
-    // a writer still in progress also rejects
+    let got = quiet(&s, "identity write between endpoints", || {
+        let s2 = Arc::clone(&s);
+        set_after_copy(Some(Box::new(move || invalidate_identity(&s2))));
+        let got = matches!(collect(&s, &mut frame), Collected::Rejected(Sample::Invalidated(Invalid::Identity)));
+        set_after_copy(None);
+        got
+    });
+    assert!(got);
+    // a writer still in progress also rejects (before any endpoint read: no seat output can change this one)
     let _w = IdentityWrite::begin(&s);
     assert!(matches!(collect(&s, &mut frame), Collected::Rejected(Sample::Invalidated(Invalid::Identity))));
 }
@@ -648,14 +730,20 @@ fn observe(f: &Fx, s: &Surface, frame: &mut Frame, now: f64) {
     observe_seat(&f.daemon.activity, s, frame, &grammars_t(), now, crate::state::now_epoch(), &mut st);
 }
 
-/// Drives a seat to Working with four distinct active frames at t=0..3.
+/// Drives a seat to Working with four distinct active frames at t=0..3 (the four steps are one `quiet_run`).
 fn drive_working(f: &Fx, s: &Surface, frame: &mut Frame) {
+    let w = quiet_run(s, "drive_working", || drive(f, s, frame));
+    assert_eq!(w["state"], "working", "precondition: {w}");
+}
+
+/// The four steps of `drive_working` and the wire at t=3, unchecked — for `quiet_run`s that continue after the dwell
+/// (the caller asserts the precondition on the returned wire).
+fn drive(f: &Fx, s: &Surface, frame: &mut Frame) -> Value {
     for t in 0..4 {
         publish(s, format!("\x1b[1;1HSYN-CLAUDE-WORKING tick {t}   ").as_bytes());
         observe(f, s, frame, t as f64);
     }
-    let w = wire_at(&f.daemon.activity, s, 3.0, &P);
-    assert_eq!(w["state"], "working", "precondition: {w}");
+    wire_at(&f.daemon.activity, s, 3.0, &P)
 }
 
 #[test]
@@ -688,16 +776,20 @@ fn same_size_resize_invalidates_continuity() {
     let f = fx("resize-same");
     let s = seat(&f, "worker", Some("claude"));
     let mut frame = Frame::new();
-    drive_working(&f, &s, &mut frame);
-    {
-        let mut p = s.parser.lock().unwrap();
-        bump_view(&s); // what repaint::set_parser_size does under the lock
-        p.set_size(24, 80);
-    }
-    assert_eq!(wire_at(&f.daemon.activity, &s, 3.5, &P)["reason"], "view changed", "serializer sees it at once");
-    publish(&s, b"\x1b[1;1HSYN-CLAUDE-WORKING after resize");
-    observe(&f, &s, &mut frame, 4.0);
-    let w = wire_at(&f.daemon.activity, &s, 4.0, &P);
+    let (pre, at_once, w) = quiet_run(&s, "same-size resize", || {
+        let pre = drive(&f, &s, &mut frame);
+        {
+            let mut p = s.parser.lock().unwrap();
+            bump_view(&s); // what repaint::set_parser_size does under the lock
+            p.set_size(24, 80);
+        }
+        let at_once = wire_at(&f.daemon.activity, &s, 3.5, &P)["reason"].clone();
+        publish(&s, b"\x1b[1;1HSYN-CLAUDE-WORKING after resize");
+        observe(&f, &s, &mut frame, 4.0);
+        (pre, at_once, wire_at(&f.daemon.activity, &s, 4.0, &P))
+    });
+    assert_eq!(pre["state"], "working", "precondition: {pre}");
+    assert_eq!(at_once, "view changed", "serializer sees it at once");
     assert_eq!((w["state"].as_str(), w["reason"].as_str()), (Some("unknown"), Some("view changed")), "{w}");
 }
 
@@ -706,12 +798,18 @@ fn reset_and_repaint_between_samples_is_not_continuity() {
     let f = fx("ris");
     let s = seat(&f, "worker", Some("claude"));
     let mut frame = Frame::new();
-    drive_working(&f, &s, &mut frame);
-    // ESC c then an identical repaint: geometry and final frame match, but it is a new view.
-    publish(&s, b"\x1bc\x1b[1;1HSYN-CLAUDE-WORKING tick 3   ");
-    assert_eq!(s.parser.lock().unwrap().screen().reset_count(), 1);
-    observe(&f, &s, &mut frame, 4.0);
-    let w = wire_at(&f.daemon.activity, &s, 4.0, &P);
+    let (pre, resets, w) = quiet_run(&s, "reset + repaint", || {
+        let pre = drive(&f, &s, &mut frame);
+        let r0 = s.parser.lock().unwrap().screen().reset_count();
+        // ESC c then an identical repaint: geometry and final frame match, but it is a new view.
+        publish(&s, b"\x1bc\x1b[1;1HSYN-CLAUDE-WORKING tick 3   ");
+        let resets = s.parser.lock().unwrap().screen().reset_count() - r0;
+        observe(&f, &s, &mut frame, 4.0);
+        (pre, resets, wire_at(&f.daemon.activity, &s, 4.0, &P))
+    });
+    assert_eq!(pre["state"], "working", "precondition: {pre}");
+    // counted per run (a fresh seat starts at 0, so the first run reads 1 as before; a retried run adds its own reset)
+    assert_eq!(resets, 1);
     assert_eq!(w["reason"], "view changed", "{w}");
 }
 
@@ -777,21 +875,27 @@ fn live_quiescing_window_is_reset_pending() {
     let f = fx("quiescing");
     let s = seat(&f, "worker", Some("claude"));
     let mut frame = Frame::new();
-    drive_working(&f, &s, &mut frame);
-    *s.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
-        state: "quiescing".into(),
-        context_pct: None,
-        task: None,
-        updated_at: crate::state::now_epoch(),
+    let (pre, during, after) = quiet_run(&s, "quiescing window", || {
+        *s.agent_status.lock().unwrap() = None; // the seat as created (a retried run starts here again)
+        let pre = drive(&f, &s, &mut frame);
+        *s.agent_status.lock().unwrap() = Some(crate::state::AgentStatus {
+            state: "quiescing".into(),
+            context_pct: None,
+            task: None,
+            updated_at: crate::state::now_epoch(),
+        });
+        publish(&s, b"\x1b[1;1HSYN-CLAUDE-WORKING during clear");
+        observe(&f, &s, &mut frame, 4.0);
+        let during = wire_at(&f.daemon.activity, &s, 4.0, &P)["reason"].clone();
+        // an orphaned window older than the default hold no longer suppresses
+        s.agent_status.lock().unwrap().as_mut().unwrap().updated_at = crate::state::now_epoch() - 601.0;
+        publish(&s, b"\x1b[1;1HSYN-CLAUDE-WORKING after window");
+        observe(&f, &s, &mut frame, 5.0);
+        (pre, during, wire_at(&f.daemon.activity, &s, 5.0, &P)["reason"].clone())
     });
-    publish(&s, b"\x1b[1;1HSYN-CLAUDE-WORKING during clear");
-    observe(&f, &s, &mut frame, 4.0);
-    assert_eq!(wire_at(&f.daemon.activity, &s, 4.0, &P)["reason"], "reset pending");
-    // an orphaned window older than the default hold no longer suppresses
-    s.agent_status.lock().unwrap().as_mut().unwrap().updated_at = crate::state::now_epoch() - 601.0;
-    publish(&s, b"\x1b[1;1HSYN-CLAUDE-WORKING after window");
-    observe(&f, &s, &mut frame, 5.0);
-    assert_eq!(wire_at(&f.daemon.activity, &s, 5.0, &P)["reason"], "active candidate");
+    assert_eq!(pre["state"], "working", "precondition: {pre}");
+    assert_eq!(during, "reset pending");
+    assert_eq!(after, "active candidate");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -905,16 +1009,19 @@ fn epoch_changes_with_identity_and_sequence_is_monotonic_within_it() {
     let f = fx("epoch");
     let s = seat(&f, "worker", Some("claude"));
     let mut frame = Frame::new();
-    drive_working(&f, &s, &mut frame);
-    let w1 = wire_at(&f.daemon.activity, &s, 3.0, &P);
-    publish(&s, b"\x1b[1;1HSYN-CLAUDE-WORKING more");
-    observe(&f, &s, &mut frame, 4.0);
-    let w2 = wire_at(&f.daemon.activity, &s, 4.0, &P);
+    let (pre, w1, w2, w3) = quiet_run(&s, "epoch", || {
+        let pre = drive(&f, &s, &mut frame);
+        let w1 = wire_at(&f.daemon.activity, &s, 3.0, &P);
+        publish(&s, b"\x1b[1;1HSYN-CLAUDE-WORKING more");
+        observe(&f, &s, &mut frame, 4.0);
+        let w2 = wire_at(&f.daemon.activity, &s, 4.0, &P);
+        invalidate_identity(&s);
+        observe(&f, &s, &mut frame, 5.0);
+        (pre, w1, w2, wire_at(&f.daemon.activity, &s, 5.0, &P))
+    });
+    assert_eq!(pre["state"], "working", "precondition: {pre}");
     assert_eq!(w1["display_epoch"], w2["display_epoch"]);
     assert!(w2["observation_seq"].as_u64() > w1["observation_seq"].as_u64());
-    invalidate_identity(&s);
-    observe(&f, &s, &mut frame, 5.0);
-    let w3 = wire_at(&f.daemon.activity, &s, 5.0, &P);
     assert_ne!(w3["display_epoch"], w2["display_epoch"], "new epoch after an identity write");
     assert_eq!(w3["observation_seq"], 1);
 }
@@ -931,25 +1038,90 @@ fn observation_changes_no_operational_field() {
         task: Some("t".into()),
         updated_at: 1.0,
     });
-    let before = (
-        s.agent_status.lock().unwrap().as_ref().map(|a| (a.state.clone(), a.context_pct, a.task.clone(), a.updated_at)),
-        s.pending_queue.lock().unwrap().len(),
-        s.input_gen.load(Ordering::Acquire),
-        s.pending_input_bytes.load(Ordering::Relaxed),
-        s.output_gen.load(Ordering::Acquire),
-    );
+    let fields = || {
+        (
+            s.agent_status.lock().unwrap().as_ref().map(|a| (a.state.clone(), a.context_pct, a.task.clone(), a.updated_at)),
+            s.pending_queue.lock().unwrap().len(),
+            s.input_gen.load(Ordering::Acquire),
+            s.pending_input_bytes.load(Ordering::Relaxed),
+        )
+    };
+    // `output_gen` has one other writer here: the seat's reader (a Windows seat prints at start), which bumps it twice per
+    // chunk and sends every chunk on `out_tx` inside that bracket. So the eight observations run once, against one
+    // baseline, with no retry, and the reader's chunks are counted on `out_tx`: any other move of `output_gen` is the
+    // observer's (a Unix `sleep 30` seat sends 0 chunks).
+    let mut chunks = s.out_tx.subscribe();
+    let (gen0, _, settled0) = settled_gen(&s, &mut chunks);
+    assert!(settled0, "premise: the seat's reader never paused for 5 s");
+    let before = fields();
     let mut frame = Frame::new();
     for t in 0..8 {
         observe(&f, &s, &mut frame, t as f64);
     }
-    let after = (
-        s.agent_status.lock().unwrap().as_ref().map(|a| (a.state.clone(), a.context_pct, a.task.clone(), a.updated_at)),
-        s.pending_queue.lock().unwrap().len(),
-        s.input_gen.load(Ordering::Acquire),
-        s.pending_input_bytes.load(Ordering::Relaxed),
-        s.output_gen.load(Ordering::Acquire),
+    let after = fields();
+    let (gen1, reader_chunks, settled1) = settled_gen(&s, &mut chunks);
+    let foreign = gen1 as i128 - gen0 as i128 - 2 * reader_chunks as i128;
+    assert_eq!(
+        (before, 0),
+        (after, foreign),
+        "output_gen {gen0} -> {gen1}: {reader_chunks} reader chunk(s) explain {} of it (settled: {settled1})",
+        2 * reader_chunks
     );
-    assert_eq!(before, after);
+}
+
+/// Every chunk the seat's reader sent on `out_tx` since the last call (a lagged receiver reports how many it skipped).
+fn drain_chunks(rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>) -> u64 {
+    use tokio::sync::broadcast::error::TryRecvError;
+    let mut n = 0;
+    loop {
+        match rx.try_recv() {
+            Ok(_) => n += 1,
+            Err(TryRecvError::Lagged(k)) => n += k,
+            Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => return n,
+        }
+    }
+}
+
+/// Reads `output_gen` where no reader chunk is in flight and returns it with the chunks drained on the way.
+///
+/// The reader bumps `output_gen` (odd), sends the chunk on `out_tx`, then bumps it again (even). A read that is even, with
+/// no chunk sent between the drains around it, therefore has every drained chunk's two bumps in it and none of a later
+/// chunk's. Successive calls thus split the reader's bumps exactly at the reads: 2 per chunk drained between them.
+/// An odd read is accepted only once the reader is idle across it — no chunk and no change over three 10 ms looks — so
+/// an odd bump by someone else is counted exactly instead of being waited out (a reader stalled between its odd bump and
+/// its send for 30 ms would show as a foreign bump: a red, never a green). Gives up after 5 s (`settled` false).
+fn settled_gen(s: &Surface, rx: &mut tokio::sync::broadcast::Receiver<Vec<u8>>) -> (u64, u64, bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut drained = 0;
+    loop {
+        drained += drain_chunks(rx);
+        let gen = s.output_gen.load(Ordering::Acquire);
+        let late = drain_chunks(rx);
+        drained += late;
+        if late == 0 && gen % 2 == 0 {
+            return (gen, drained, true);
+        }
+        if late == 0 {
+            let mut idle = true;
+            for _ in 0..3 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                // every chunk drained here is counted: a dropped one would be charged to the observer
+                let n = drain_chunks(rx);
+                drained += n;
+                if n != 0 || s.output_gen.load(Ordering::Acquire) != gen {
+                    idle = false;
+                    break;
+                }
+            }
+            if idle {
+                return (gen, drained, true);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return (gen, drained, false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 /// repaint.rs production resize path (`apply_resize` → `set_parser_size`): a same-size resize is a new view.
@@ -1016,14 +1188,21 @@ fn vt100_synchronized_output_flag_follows_decset_2026_and_reset() {
 fn title_is_copied_into_reserved_capacity_and_truncated_not_grown() {
     let f = fx("title");
     let s = seat(&f, "worker", Some("claude"));
-    publish(&s, "\x1b]0;\u{25d0} Claude Code\x07".as_bytes());
     let mut frame = Frame::new();
     let cap = frame.title.capacity();
-    assert!(matches!(collect(&s, &mut frame), Collected::Frame));
+    // each title is published inside its quiet run: a Windows seat also sets the title (OSC) when it starts
+    let got = quiet(&s, "title copy", || {
+        publish(&s, "\x1b]0;\u{25d0} Claude Code\x07".as_bytes());
+        matches!(collect(&s, &mut frame), Collected::Frame)
+    });
+    assert!(got);
     assert_eq!(frame.title, "\u{25d0} Claude Code");
     let long = format!("\x1b]0;{}\x07", "\u{25d0}".repeat(400)); // 1,200 bytes
-    publish(&s, long.as_bytes());
-    assert!(matches!(collect(&s, &mut frame), Collected::Frame));
+    let got = quiet(&s, "long title copy", || {
+        publish(&s, long.as_bytes());
+        matches!(collect(&s, &mut frame), Collected::Frame)
+    });
+    assert!(got);
     assert!(frame.title.len() <= TITLE_CAP && frame.title.len() > TITLE_CAP - 4, "truncated at a char boundary");
     assert_eq!(frame.title.capacity(), cap, "never grown under the parser lock");
 }
@@ -1034,14 +1213,19 @@ fn open_synchronized_output_block_is_an_incomplete_frame() {
     let f = fx("sync-open");
     let s = seat(&f, "worker", Some("claude"));
     let mut frame = Frame::new();
-    drive_working(&f, &s, &mut frame);
-    publish(&s, b"\x1b[?2026h\x1b[1;1HSYN-CLAUDE-WORKING half");
-    observe(&f, &s, &mut frame, 3.5);
-    let w = wire_at(&f.daemon.activity, &s, 3.5, &P);
+    let (pre, half, done) = quiet_run(&s, "open sync block", || {
+        let pre = drive(&f, &s, &mut frame);
+        publish(&s, b"\x1b[?2026h\x1b[1;1HSYN-CLAUDE-WORKING half");
+        observe(&f, &s, &mut frame, 3.5);
+        let half = wire_at(&f.daemon.activity, &s, 3.5, &P);
+        publish(&s, b" done\x1b[?2026l");
+        observe(&f, &s, &mut frame, 4.0);
+        (pre, half, wire_at(&f.daemon.activity, &s, 4.0, &P))
+    });
+    assert_eq!(pre["state"], "working", "precondition: {pre}");
+    let w = half;
     assert_eq!((w["state"].as_str(), w["reason"].as_str(), w["retained"].as_bool()), (Some("working"), Some("incomplete frame"), Some(true)), "{w}");
-    publish(&s, b" done\x1b[?2026l");
-    observe(&f, &s, &mut frame, 4.0);
-    let w = wire_at(&f.daemon.activity, &s, 4.0, &P);
+    let w = done;
     assert_eq!((w["state"].as_str(), w["retained"].as_bool()), (Some("working"), Some(false)), "{w}");
 }
 

@@ -18573,6 +18573,13 @@ mod tests {
         t
     }
 
+    /// Back to the counts of `c5_agent_seat(.., 0)` — for quiet-window re-runs only (clears what a disturbed run let through).
+    fn c5_zero_counts(t: &Arc<crate::state::Surface>) {
+        t.pending_input_bytes.store(0, Ordering::Relaxed);
+        *t.pending_input.lock().unwrap() = Default::default();
+        *t.last_human_input.lock().unwrap() = None;
+    }
+
     /// 마지막 `queue.draft_gate_denied` 이벤트 payload.
     fn c5_last_denied_payload(daemon: &Arc<Daemon>) -> Value {
         daemon
@@ -18600,16 +18607,23 @@ mod tests {
         let legacy_text = |reason: &str| format!("{} [{}:{reason}]", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG);
 
         // ⓐ 유령 — 사람 계수 3 · 빈 입력줄(커서 뒤 고스트) → 문구 끝에 처방 · 이벤트에 draft_visible=false · remedy_code.
+        // ★(windows-health run 39207028554) Every step below that reads the prompt line paints it and takes the denial in one
+        //   attempt, kept only from a quiet window (`state::test_until_no_pty_output`) — the proof
+        //   `c5_ghost_suffix_keeps_cli_fallback_and_settle_parsers_working` already uses. On Windows the seat's ConPTY
+        //   start-up output can land between the paint and the gate's screen read; the line then reads as unobservable and
+        //   the product rightly answers without the suffix (step ⓐ′ was red there). A denial writes nothing, so a re-run
+        //   starts from the same seat; ⓓ and ⓔ never read the line and stay as they were.
         let ghost = c5_agent_seat(&daemon, "worker-1", pid + 1, 3);
-        c5_paint_prompt(&ghost, "", "버그 수정 착수한다. 브랜치는");
         let before = d12_input_counts(&ghost);
-        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&ghost));
+        let (resp, ev) = crate::state::test_until_no_pty_output(&ghost, "c5 ghost denial", || {
+            c5_paint_prompt(&ghost, "", "버그 수정 착수한다. 브랜치는");
+            (d12_rpc(&daemon, pid, "surface.send_text", text_params(&ghost)), c5_last_denied_payload(&daemon))
+        });
         d12_assert_denied(&resp, "pending_input");
         let m = resp["error"]["message"].as_str().unwrap().to_string();
         assert_eq!(m, format!("{}{suffix}", legacy_text("pending_input")), "접두·태그는 그대로 · 처방은 맨 끝");
         assert!(m.contains(cys::MSG_TYPING_GUARD) && m.starts_with(cys::MSG_TYPING_GUARD), "구 CLI 폴백 접두: {m}");
         assert_eq!(d12_input_counts(&ghost), before, "거부는 쓰기 0(계수 불변)");
-        let ev = c5_last_denied_payload(&daemon);
         assert_eq!(ev["draft_visible"], json!(false), "{ev}");
         // ★(RQFIX2 m-4) 커서 뒤에 글자(회색 제안인지 직접 쓴 글인지 사람이 가린다)가 있으면 큐 쪽 표(7행)와 같은 어휘 `after_cursor_text` — 응답 문구(조건문 접미)는 위에서 그대로임을 확인했다.
         assert_eq!(ev["remedy_code"], json!("after_cursor_text"), "{ev}");
@@ -18618,15 +18632,16 @@ mod tests {
 
         // ⓐ′ 커서 뒤 글자가 **없는** 유령(빈 프롬프트 한 줄) — 같은 문구 · 이벤트 code 는 `phantom_count`(큐 쪽 표 8행과 같은 어휘).
         let blank = c5_agent_seat(&daemon, "worker-5", pid + 5, 3);
-        c5_paint_prompt(&blank, "", "");
-        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&blank));
+        let (resp, ev) = crate::state::test_until_no_pty_output(&blank, "c5 blank ghost denial", || {
+            c5_paint_prompt(&blank, "", "");
+            (d12_rpc(&daemon, pid, "surface.send_text", text_params(&blank)), c5_last_denied_payload(&daemon))
+        });
         d12_assert_denied(&resp, "pending_input");
         assert_eq!(
             resp["error"]["message"].as_str().unwrap(),
             format!("{}{suffix}", legacy_text("pending_input")),
             "문구는 커서 뒤 글자와 무관하게 같다(조건문 접미)"
         );
-        let ev = c5_last_denied_payload(&daemon);
         assert_eq!((ev["draft_visible"].as_bool(), ev["remedy_code"].as_str()), (Some(false), Some("phantom_count")), "{ev}");
 
         // ⓑ 같은 유령에 send-key Return(SubmitKey · human_draft) · C-u(CancelKey · 전용 문구) — 접두·태그 뒤 맨 끝에 같은 처방.
@@ -18643,15 +18658,21 @@ mod tests {
                 ),
             ),
         ] {
-            let r = d12_rpc(&daemon, pid, "surface.send_key", json!({"surface_id": ghost.id, "key": key, "queued": false}));
+            let r = crate::state::test_until_no_pty_output(&ghost, "c5 ghost key denial", || {
+                c5_paint_prompt(&ghost, "", "버그 수정 착수한다. 브랜치는");
+                d12_rpc(&daemon, pid, "surface.send_key", json!({"surface_id": ghost.id, "key": key, "queued": false}))
+            });
             assert_eq!(r["ok"], json!(false), "key={key}: {r}");
             assert_eq!(r["error"]["code"], json!(cys::ERR_TYPING_GUARD));
             assert_eq!(r["error"]["message"].as_str().unwrap(), expected, "key={key}");
         }
         // clear_first(원자 주입)도 같은 규칙.
-        let r = d12_rpc(&daemon, pid, "surface.send_text", json!({
-            "surface_id": ghost.id, "text": "replace", "clear_first": true, "human": false, "queued": false, "quiet": true,
-        }));
+        let r = crate::state::test_until_no_pty_output(&ghost, "c5 ghost clear_first denial", || {
+            c5_paint_prompt(&ghost, "", "버그 수정 착수한다. 브랜치는");
+            d12_rpc(&daemon, pid, "surface.send_text", json!({
+                "surface_id": ghost.id, "text": "replace", "clear_first": true, "human": false, "queued": false, "quiet": true,
+            }))
+        });
         assert_eq!(
             r["error"]["message"].as_str().unwrap(),
             format!("{} [{}:human_draft]{suffix}", cys::MSG_TYPING_GUARD, cys::DRAFT_GATE_TAG)
@@ -18659,11 +18680,12 @@ mod tests {
 
         // ⓒ 초안이 보인다(Some(true)) — 종전 문구와 바이트 동일 · 이벤트에 draft_visible=true · remedy_code null.
         let visible = c5_agent_seat(&daemon, "worker-2", pid + 2, 3);
-        c5_paint_prompt(&visible, "aaa", "");
-        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&visible));
+        let (resp, ev) = crate::state::test_until_no_pty_output(&visible, "c5 visible draft denial", || {
+            c5_paint_prompt(&visible, "aaa", "");
+            (d12_rpc(&daemon, pid, "surface.send_text", text_params(&visible)), c5_last_denied_payload(&daemon))
+        });
         d12_assert_denied(&resp, "pending_input");
         assert_eq!(resp["error"]["message"].as_str().unwrap(), legacy_text("pending_input"), "초안이 보이면 종전 문구 그대로");
-        let ev = c5_last_denied_payload(&daemon);
         assert_eq!(ev["draft_visible"], json!(true), "{ev}");
         assert!(ev["remedy_code"].is_null(), "{ev}");
 
@@ -18686,21 +18708,28 @@ mod tests {
         assert!(c5_last_denied_payload(&daemon)["draft_visible"].is_null());
 
         // ⓕ 계수 계열이 아닌 거부(화면 점유 · 모달)는 입력줄이 비었든 아니든 관측하지 않는다 — 처방 없음 · 두 키 null.
+        //   With no count these two are denied by the screen alone: a disturbed read can let the send through and type it,
+        //   so each attempt first restores the seat's zero count (the fixture's own precondition) before it paints.
         let screen_occ = c5_agent_seat(&daemon, "worker-5", pid + 5, 0);
-        c5_paint_prompt(&screen_occ, "owner draft", "");
-        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&screen_occ));
+        let (resp, ev) = crate::state::test_until_no_pty_output(&screen_occ, "c5 screen-occupied denial", || {
+            c5_zero_counts(&screen_occ);
+            c5_paint_prompt(&screen_occ, "owner draft", "");
+            (d12_rpc(&daemon, pid, "surface.send_text", text_params(&screen_occ)), c5_last_denied_payload(&daemon))
+        });
         d12_assert_denied(&resp, "screen_occupied");
         assert_eq!(resp["error"]["message"].as_str().unwrap(), legacy_text("screen_occupied"));
-        let ev = c5_last_denied_payload(&daemon);
         assert!(ev["draft_visible"].is_null() && ev["remedy_code"].is_null(), "{ev}");
         let modal_seat = c5_agent_seat(&daemon, "worker-6", pid + 6, 0);
-        {
+        let resp = crate::state::test_until_no_pty_output(&modal_seat, "c5 modal denial", || {
+            c5_zero_counts(&modal_seat);
             let modal = cys::first_run_gates::fixtures::LIVE_PERMISSION_PROMPT.replace('\n', "\r\n");
-            let mut parser = modal_seat.parser.lock().unwrap();
-            parser.process(b"\x1b[2J\x1b[H");
-            parser.process(modal.as_bytes());
-        }
-        let resp = d12_rpc(&daemon, pid, "surface.send_text", text_params(&modal_seat));
+            {
+                let mut parser = modal_seat.parser.lock().unwrap();
+                parser.process(b"\x1b[2J\x1b[H");
+                parser.process(modal.as_bytes());
+            }
+            d12_rpc(&daemon, pid, "surface.send_text", text_params(&modal_seat))
+        });
         d12_assert_denied(&resp, "modal");
         assert_eq!(resp["error"]["message"].as_str().unwrap(), legacy_text("modal"));
         d12_cleanup(&daemon, &dir);
@@ -18968,12 +18997,16 @@ mod tests {
         let blocked = c5_agent_seat(&daemon, "worker-1", pid, 3);
         let free = c5_agent_seat(&daemon, "worker-2", pid + 1, 0);
         let stale = c5_agent_seat(&daemon, "worker-3", pid + 2, 0);
-        c5_paint_prompt(&blocked, "", "고스트");
         let e = daemon.next_queue_entry("[보고] org".into(), None, "send");
         blocked.pending_queue.lock().unwrap().push_back(e);
         *blocked.queue_blocked.lock().unwrap() = Some((crate::governance::BLOCKED_INPUT_PENDING.to_string(), 777.25));
         *stale.queue_blocked.lock().unwrap() = Some((crate::governance::BLOCKED_BUSY.to_string(), 5.0)); // 큐 비어 있음
-        let resp = d12_rpc(&daemon, pid, "org.status", json!({}));
+        // The remedy code reads the blocked seat's prompt line: paint and read in one quiet attempt (see the c5 denial
+        // test above; `org.status` changes nothing, so a re-run starts from the same state).
+        let resp = crate::state::test_until_no_pty_output(&blocked, "c5 org.status remedy", || {
+            c5_paint_prompt(&blocked, "", "고스트");
+            d12_rpc(&daemon, pid, "org.status", json!({}))
+        });
         assert_eq!(resp["ok"], json!(true), "{resp}");
         let result = resp["result"].clone();
         d12_cleanup(&daemon, &dir);
