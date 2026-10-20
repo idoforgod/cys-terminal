@@ -17,7 +17,13 @@
  ⇒ 그래서 이 대장은 **계수기가 아니라 지불 검사기**다. 체크박스를 세지 않는다.
 
 【결정론 계약 — exit code 가 사실이다】
-  0  PAID      접수된 항목 전부가 지불됐다(증거 또는 선언된 보류). 완료 보고 가능.
+  0  PAID      ★뜻이 서브커맨드마다 다르다 — 완료 보고 자격은 `status`·`audit` 의 0 뿐이다.
+               · status : 판정한 대장(--id 하나 · 생략 시 이 좌석의 대장 · --all 은 팩 전체)의 항목 전부가 지불됐다
+                          (증거 또는 선언된 보류). 완료 보고 가능.
+               · audit  : 모든 루트의 모든 대장이 위와 같다.
+               · pay·defer : 그 항목 하나가 지불·보류됐다(다른 항목은 열려 있을 수 있다).
+               · add-item·stamp·selftest : 명령이 성공했다(add-item 은 열린 항목을 하나 늘린다).
+               · open 은 0 을 내지 않는다 — 새 항목은 열려 있으므로 1, 항목이 없으면 2 다.
   1  OPEN      지불되지 않은 항목이 있다. 그 id 를 **전부** 출력한다. ⇒ 완료 보고 금지.
   2  NO_DENOM  지시는 기록됐는데 **항목 목록이 없다**(분모 부재). ★이것은 통과가 아니다 —
                「검사되지 않음」이 아니라 「검사 불가능」이다. 0 과 반드시 구별된다.
@@ -30,6 +36,8 @@
  항목이 닫히는 길은 둘뿐이다.
   · done  : `evidence` 텍스트가 MIN_EVIDENCE_CHARS 이상 **그리고** `artifacts` 중 최소 1건이
             **디스크에 실존**해야 한다(경로를 적는 것으로는 지불이 아니다 — 기계가 stat 한다).
+            ★지불 시점에 **정규 파일의 지문**을 얻은 artifact 만 지불을 싣는다(디렉터리·읽기 불가·FIFO·
+            부재는 싣지 않는다). 지문 없이 실존만 보는 면제는 지문 칸 이전의 맨 문자열 기록뿐이다.
   · defer : `defer_reason` 이 MIN_REASON_CHARS 이상 **그리고** `release_condition` 이 비어 있지
             않아야 한다. ★「무엇이 이것을 막고 있는가」를 항목마다 적게 만든다(법 ⒝).
  그 밖의 모든 상태는 OPEN 이다. ⛔체크박스·true/false 플래그만으로는 어떤 항목도 닫히지 않는다.
@@ -195,9 +203,15 @@ def _fp(path):
     없으므로 ★「변경되지 않았다」와 「변경을 판정할 수 없다」를 **구별할 수 없었다.**
     (`javis_task.py` 는 `sha256_8`·`size`·`mtime` 을 적는다 — 같은 팩 안에서 갈렸다.)
     ⇒ 지금은 지불 시점에 지문을 박고 `status` 가 매번 재계산해 대조한다. ⛔덧붙임도 변경이다.
+
+    ★정규 파일이 아니면 열지 않고 (None, None) 이다(2026-10-20 · B-328 #8 리뷰 R1) — FIFO 는 열면 쓰는 쪽이 올
+    때까지 막히고 장치 파일은 끝없이 읽힌다. 확인과 열기 사이에 바뀌는 경로는 막지 못한다(어휘·시점의 한계).
     """
     try:
-        b = open(path, "rb").read()
+        if not os.path.isfile(path):
+            return None, None
+        with open(path, "rb") as fh:
+            b = fh.read()
     except Exception:
         return None, None
     return hashlib.sha256(b).hexdigest()[:16], len(b)
@@ -216,14 +230,33 @@ def _ephemeral(path, os_name=None, env=None):
     다른 OS 에서 Windows 판정을 재기 위한 주입구이고, 운영 호출은 둘 다 생략한다.
     """
     if (os_name or os.name) == "nt":
-        pp = ntpath.normcase(ntpath.abspath(path)) + "\\"
+        pp = _nt_norm(path) + "\\"
         return any(pp.startswith(r) for r in _win_temp_roots(os.environ if env is None else env))
     pp = os.path.abspath(path)
     return any(pp.startswith(r) for r in _EPHEMERAL_ROOTS)
 
 
+_NT_DRIVE_RE = re.compile(r"^[A-Za-z]:(\\|$)")
+
+
+def _nt_norm(p):
+    """Windows 경로의 비교 형태 — 절대·소문자·역슬래시. ★DOS 장치 경로 접두를 먼저 벗긴다(2026-10-20 · B-328 #8
+    리뷰 R1): `\\\\?\\X:\\`·`\\\\.\\X:\\` 는 `X:\\` 로, `\\\\?\\UNC\\`·`\\\\.\\UNC\\` 는 `\\\\` 로 — 같은 파일의 다른 이름이라
+    벗기지 않으면 어휘 비교가 빗나가 %TEMP% 파일이 내구로 읽힌다. 벗긴 뒤 abspath 하므로 `..` 처리가 파이썬 판마다
+    같다(3.9 의 normpath 는 장치 경로를 손대지 않는다). ⛔드라이브·UNC 가 아닌 장치 이름(`\\\\?\\Volume{…}\\` 등)은
+    어휘로 풀 수 없어 벗기지 않는다 — 그 형태의 임시 파일은 여전히 내구로 읽힌다(밝혀 둔 한계)."""
+    s = p.replace("/", "\\")
+    if s[:4] in ("\\\\?\\", "\\\\.\\"):
+        rest = s[4:]
+        if rest[:4].upper() == "UNC\\":
+            s = "\\\\" + rest[4:]
+        elif _NT_DRIVE_RE.match(rest):
+            s = rest
+    return ntpath.normcase(ntpath.abspath(s))
+
+
 def _win_temp_roots(env):
-    """Windows 임시 루트 접두 — 값이 있는 TMPDIR·TEMP·TMP 와 LOCALAPPDATA\\Temp 를 정규화(소문자·역슬래시)하고
+    """Windows 임시 루트 접두 — 값이 있는 TMPDIR·TEMP·TMP 와 LOCALAPPDATA\\Temp 를 `_nt_norm` 으로 정규화하고
     끝에 구분자 하나를 붙인다(`C:\\Temp` 가 `C:\\Temp2` 를 덮지 않게)."""
     roots = [env.get(k) for k in _WIN_TEMP_ENV]
     if env.get("LOCALAPPDATA"):
@@ -231,19 +264,20 @@ def _win_temp_roots(env):
     out = []
     for r in roots:
         if r:
-            r = ntpath.normcase(ntpath.abspath(r))
+            r = _nt_norm(r)
             out.append(r if r.endswith("\\") else r + "\\")
     return out
 
 
 def _arts(it):
-    """artifacts 를 (path, 기록된 sha16|None, 기록된 size|None) 목록으로 정규화. 구형=맨 문자열."""
+    """artifacts 를 (path, 기록된 sha16|None, 기록된 size|None, legacy) 목록으로 정규화.
+    legacy=True 는 지문 칸이 생기기 전의 기록(맨 문자열)뿐이다 — dict 기록은 지문 칸 이후의 것이다."""
     out = []
     for a in (it.get("artifacts") or []):
         if isinstance(a, dict):
-            out.append((a.get("path"), a.get("sha256_16"), a.get("size")))
+            out.append((a.get("path"), a.get("sha256_16"), a.get("size"), False))
         elif a:
-            out.append((a, None, None))
+            out.append((a, None, None, True))
     return out
 
 
@@ -255,11 +289,16 @@ def _item_state(it, root_for_rel=None):
         if len(ev) < MIN_EVIDENCE_CHARS:
             return "OPEN", "evidence %d자 < 최소 %d자" % (len(ev), MIN_EVIDENCE_CHARS)
         arts = _arts(it)
-        alive = [a for a in arts if a[0] and os.path.exists(a[0])]
+        present = [a for a in arts if a[0] and os.path.exists(a[0])]
+        # ★지문 없는 새 기록은 지불을 싣지 않는다(2026-10-20 · B-328 #8 리뷰 R1). 종전은 지문을 얻지 못한 dict 기록
+        #   (디렉터리·읽기 불가·지불 시점 부재)이 맨 문자열 면제로 떨어져 실존만으로 PAID 였다 — 거부된 부재 경로에
+        #   뒤늦게 파일이 생겨도 재지불 없이 PAID 가 됐다. 면제는 지문 칸 이전의 맨 문자열 기록(legacy)에만 준다.
+        unproven = [a for a in present if not a[3] and not a[1]]
+        alive = [a for a in present if a[3] or a[1]]
         durable = [a for a in alive if not _ephemeral(a[0])]
         # ★지문 대조 — 기록된 지문이 있는 artifact 는 매번 재계산해 맞춘다.
         drifted, unfingerprinted = [], []
-        for path, rec_sha, rec_size in alive:
+        for path, rec_sha, rec_size, _legacy in alive:
             if not rec_sha:
                 unfingerprinted.append(path)
                 continue
@@ -277,10 +316,16 @@ def _item_state(it, root_for_rel=None):
         if not alive:
             if not arts:
                 return "OPEN", "artifacts 0건 — 경로를 적는 것으로는 지불이 아니다"
+            if unproven:
+                return "OPEN", ("artifacts %d건이 지불 시점에 지문을 얻지 못했다(%s) — 디렉터리·읽기 불가·FIFO·"
+                                "부재였던 경로는 지불이 아니다. 정규 파일로 재지불하라"
+                                % (len(unproven), str(unproven[0][0])[:48]))
             return "OPEN", "artifacts %d건 전부 디스크 부재(%s)" % (len(arts), str(arts[0][0])[:60])
         tag = "지문 %d/%d 대조" % (len(alive) - len(unfingerprinted), len(alive))
         if unfingerprinted:
             tag += " · ⚠지문 없음 %d(소급 검증 불가)" % len(unfingerprinted)
+        if unproven:
+            tag += " · 지문 못 얻은 %d 제외" % len(unproven)
         return "PAID", "evidence %d자 + artifact 실존 %d/%d(내구 %d) · %s" % (
             len(ev), len(alive), len(arts), len(durable), tag)
     if st == "defer":

@@ -4,21 +4,25 @@
 
 ## 무엇을 못박는가
 이 도구의 사실은 exit code 다(도구 머리말 【결정론 계약】). 실제 CLI 를 서브프로세스로 돌려 각 갈래를 한 번씩 낸다.
-  E0 PAID      open → pay(내구 artifact + 증거 40자) → status = 0 · 정당한 defer = 0
+  E0 PAID      open → pay(내구 artifact + 증거 40자) → status = 0 · 정당한 defer = 0 · audit 은 모든 대장이 지불일 때만 0
   E1 OPEN      항목이 열려 있으면 1 · 짧은 증거·부재 artifact·임시 경로만인 pay·조건 없는 defer 는 REFUSED = 1
                · 지불 뒤 증거 바이트가 바뀌면(덧붙임 포함) 다시 1 · 지불된 대장에 add-item 하면 다시 1
+               · 정규 파일의 지문을 얻지 못한 새 지불(디렉터리·읽기 불가·FIFO·지불 시점 부재)은 REFUSED = 1 이고
+                 그 자리에 뒤늦게 파일이 생겨도 1 — 지문 면제는 지문 칸 이전의 맨 문자열 기록뿐이다(그쪽은 0 유지)
   E2 NO_DENOM  항목 0건 대장 = 2 — ★통과(0)가 아니다
   E3 NO_LEDGER 빈 팩·없는 --id·대상 부재 pay/add-item·빈 루트 audit·다른 좌석의 대장만 있음 = 3
                · 좌석 권위(스텁 cys · POSIX): identify 가 env 를 이긴다 · 재번호된 같은 역할은 자기 대장(0)
   E4 DRIFT     기록된 지시 원문을 사후 변조 = 4 · 판독 불가 대장 = 4
   E5 USAGE     사용법 오류는 argparse 기본 2 가 아니라 5 — 2(NO_DENOM)와 같은 숫자가 두 사실을 뜻하지 않는다
-  E7 UNATTRIB  좌석 귀속이 없는 대장은 좌석 범위 status 에서 판정하지 않는다 = 7
+  E7 UNATTRIB  좌석 귀속이 없는 대장은 좌석 범위 status 에서 판정하지 않는다 = 7 · stamp 의 0 은 명령 성공일 뿐(그 뒤 status 1)
   S  selftest  = 0 · 자기 재기동 argv 에 -I 와 함께 -B (번들 python 이 캐시를 번들 안에 쓰지 않게)
-  W  Windows   임시 루트(TMPDIR·TEMP·TMP·LOCALAPPDATA\\Temp · 대소문자 무시) — 도구 모듈의 os 를 대역으로
-               바꿔 이 Mac 에서도 Windows 판정을 잰다(%TEMP% 만인 artifact 는 지불이 아니다)
+  W  Windows   임시 루트(TMPDIR·TEMP·TMP·LOCALAPPDATA\\Temp · 대소문자 무시 · DOS 장치 경로 \\\\?\\ \\\\.\\ 접두 벗김)
+               — 도구 모듈의 os 를 대역으로 바꿔 이 Mac 에서도 Windows 판정을 잰다(%TEMP% 만인 artifact 는 지불이 아니다)
 
 ## 밀폐
 - 팩·HOME·cwd 는 케이스마다 새 임시 디렉터리다. 라이브 팩(~/.cys/pack*)은 읽지도 쓰지도 않는다.
+- 체크아웃에는 쓰지 않는다(읽기 전용 체크아웃에서도 돈다). 내구 artifact 가 필요한 갈래는 DurableRig 가 리그 안의
+  work/ 를 쓰고, 자식 안에서만 임시 루트를 리그의 eph/ 로 바꿔 work/ 를 내구 자리로 읽게 한다.
 - 자식 PATH 는 빈 디렉터리다 ⇒ 도구의 `cys identify`·`cys status --json` 호출은 실행 파일을 못 찾고(도구가
   예외를 삼킨다) **라이브 데몬에 닿지 않는다**. 좌석 귀속은 env(CYS_ROLE·CYS_SURFACE_ID — 도구의 비권위
   폴백 경로)로 준다. 부모의 CLAUDE_CONFIG_DIR·CYS_* 는 자식에 넘기지 않는다.
@@ -131,6 +135,15 @@ class E0Paid(Rig):
                                          "--release-condition", "헤드 판정 도착"), "defer")
         self.rc(EXIT_PAID, self.run_tool("status", "--id", "D0"), "status --id")
 
+    def test_audit_is_0_only_when_every_ledger_is_paid(self):
+        # audit 의 0 = 모든 루트의 모든 대장이 지불됐다(머리말 exit 계약) — 열린 대장이 하나라도 있으면 1.
+        self.open_ledger("A0", ["항목"])
+        self.rc(EXIT_PAID, self.run_tool("pay", "--id", "A0", "--item-no", "1", "--evidence", EVIDENCE,
+                                         "--artifact", DURABLE), "pay")
+        self.rc(EXIT_PAID, self.run_tool("audit", "--roots", self.pack), "audit(전부 지불)")
+        self.open_ledger("A1", ["열린 항목"])
+        self.rc(EXIT_OPEN, self.run_tool("audit", "--roots", self.pack), "audit(열린 대장 1)")
+
 
 class E1Open(Rig):
     def test_open_item_is_open_and_listed(self):
@@ -176,24 +189,6 @@ class E1Open(Rig):
         self.rc(EXIT_OPEN, r, "pay(임시 경로만)")
         self.assertIn("임시 경로", r.stderr)
 
-    def test_changed_artifact_reopens(self):
-        # 지불 뒤 증거 바이트가 바뀌면(덧붙임 포함) 다시 열린다 — 지문 대조. 내구 자리가 체크아웃뿐이라
-        # 테스트 폴더에 점 접두 임시 파일을 만들고 지운다(점 접두 = build.rs 가 임베드에서 제외).
-        fd, art = tempfile.mkstemp(prefix=".intake-fp-", suffix=".log", dir=TESTS_DIR)
-        os.close(fd)
-        self.addCleanup(os.unlink, art)
-        with open(art, "w", encoding="utf-8") as fh:
-            fh.write("검증 로그 원본\n")
-        self.open_ledger("L1g", ["항목"])
-        self.rc(EXIT_PAID, self.run_tool("pay", "--id", "L1g", "--item-no", "1", "--evidence", EVIDENCE,
-                                         "--artifact", art), "pay")
-        self.rc(EXIT_PAID, self.run_tool("status", "--id", "L1g"), "status(변경 전)")
-        with open(art, "a", encoding="utf-8") as fh:
-            fh.write("덧붙인 줄\n")
-        r = self.run_tool("status", "--id", "L1g")
-        self.rc(EXIT_OPEN, r, "status(증거 덧붙임 뒤)")
-        self.assertIn("증거 바이트가 변경됐다", r.stdout)
-
     def test_add_item_reopens_a_paid_ledger(self):
         self.open_ledger("L1h", ["항목"])
         self.rc(EXIT_PAID, self.run_tool("pay", "--id", "L1h", "--item-no", "1", "--evidence", EVIDENCE,
@@ -209,6 +204,141 @@ class E1Open(Rig):
                           "--release-condition", "")
         self.rc(EXIT_OPEN, r, "defer(조건 공백)")
         self.assertIn("release_condition", r.stderr)
+
+
+# 임시 루트 주입 실행기 — 자식 안에서 도구를 읽어 _EPHEMERAL_ROOTS 만 argv[2] 로 바꾸고 main 을 돈다(-B: 체크아웃에 캐시 없음).
+LAUNCH = ("import importlib.util,sys;"
+          "s=importlib.util.spec_from_file_location('javis_intake',sys.argv[1]);"
+          "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+          "m._EPHEMERAL_ROOTS=(sys.argv[2],);"
+          "sys.exit(m.main(sys.argv[3:]))")
+
+
+class DurableRig(Rig):
+    """리그 폴더 안의 work/ 를 내구 자리로 읽게 임시 루트를 주입한다 — 내구 artifact 갈래를 체크아웃에 쓰지 않고 잰다
+    (읽기 전용 체크아웃에서도 돈다). 주입은 자식 안에서만 일어나고 분류 함수(_ephemeral)는 진짜다: POSIX 는 도구의
+    _EPHEMERAL_ROOTS 를, Windows 는 임시 루트 env 를 리그 안의 eph/ 로 바꾼다. eph/ 가 여전히 임시로 읽히는지는
+    test_injected_root_is_still_ephemeral 이 잰다(주입이 검사를 끄지 않았다는 양성 통제)."""
+
+    def setUp(self):
+        super().setUp()
+        self.eph = os.path.join(self.tmp, "eph")
+        self.work = os.path.join(self.tmp, "work")
+        os.makedirs(self.eph)
+        os.makedirs(self.work)
+
+    def env(self, seat):
+        e = super().env(seat)
+        if os.name == "nt":
+            e.update({"TMPDIR": self.eph, "TEMP": self.eph, "TMP": self.eph,
+                      "LOCALAPPDATA": os.path.join(self.tmp, "lad")})
+        return e
+
+    def run_tool(self, *argv, seat=SEAT_A, timeout=60):
+        return subprocess.run([sys.executable, "-I", "-B", "-c", LAUNCH, TOOL, self.eph + os.sep] + list(argv),
+                              cwd=self.tmp, env=self.env(seat), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout)
+
+    def put(self, name, text="검증 로그 원본\n"):
+        p = os.path.join(self.work, name)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return p
+
+    def pay(self, lid, *arts, timeout=60):
+        argv = ["pay", "--id", lid, "--item-no", "1", "--evidence", EVIDENCE]
+        for a in arts:
+            argv += ["--artifact", a]
+        return self.run_tool(*argv, timeout=timeout)
+
+    def test_injected_root_is_still_ephemeral(self):
+        art = os.path.join(self.eph, "proof.log")
+        with open(art, "w", encoding="utf-8") as fh:
+            fh.write("x\n")
+        self.open_ledger("R0", ["항목"])
+        r = self.pay("R0", art)
+        self.rc(EXIT_OPEN, r, "pay(주입한 임시 루트 안)")
+        self.assertIn("임시 경로", r.stderr)
+
+    def test_regular_file_in_work_is_paid(self):
+        self.open_ledger("R1", ["항목"])
+        self.rc(EXIT_PAID, self.pay("R1", self.put("proof.log")), "pay(work 의 정규 파일)")
+        self.rc(EXIT_PAID, self.run_tool("status", "--id", "R1"), "status")
+
+    def test_changed_artifact_reopens(self):
+        # 지불 뒤 증거 바이트가 바뀌면(덧붙임 포함) 다시 열린다 — 지문 대조.
+        art = self.put("proof.log")
+        self.open_ledger("L1g", ["항목"])
+        self.rc(EXIT_PAID, self.pay("L1g", art), "pay")
+        self.rc(EXIT_PAID, self.run_tool("status", "--id", "L1g"), "status(변경 전)")
+        with open(art, "a", encoding="utf-8") as fh:
+            fh.write("덧붙인 줄\n")
+        r = self.run_tool("status", "--id", "L1g")
+        self.rc(EXIT_OPEN, r, "status(증거 덧붙임 뒤)")
+        self.assertIn("증거 바이트가 변경됐다", r.stdout)
+
+    # ★지문 없는 새 지불은 지불이 아니다 — 지문 칸이 생긴 뒤의 기록(dict)이 정규 파일의 지문을 얻지 못했으면(디렉터리·
+    #   읽기 불가·FIFO·지불 시점 부재) 그 artifact 는 지불을 싣지 않는다. 지문 면제는 그 전의 맨 문자열 기록뿐이다.
+    def test_new_payment_with_directory_artifact_is_refused(self):
+        d = os.path.join(self.work, "a-directory")
+        os.makedirs(d)
+        self.open_ledger("F1", ["항목"])
+        r = self.pay("F1", d)
+        self.rc(EXIT_OPEN, r, "pay(디렉터리)")
+        self.assertIn("지문을 얻지 못했다", r.stderr)
+        self.rc(EXIT_OPEN, self.run_tool("status", "--id", "F1"), "status(디렉터리 지불 뒤)")
+
+    @unittest.skipIf(os.name == "nt", "chmod 000 은 Windows 에서 읽기를 막지 않는다")
+    def test_new_payment_with_unreadable_file_is_refused(self):
+        art = self.put("locked.log")
+        os.chmod(art, 0)
+        self.addCleanup(os.chmod, art, 0o600)
+        if os.access(art, os.R_OK):
+            self.skipTest("이 계정은 권한 000 파일을 읽는다(root 등) — 읽기 불가를 만들 수 없다")
+        self.open_ledger("F2", ["항목"])
+        r = self.pay("F2", art)
+        self.rc(EXIT_OPEN, r, "pay(읽기 불가 파일)")
+        self.assertIn("지문을 얻지 못했다", r.stderr)
+
+    @unittest.skipIf(not hasattr(os, "mkfifo"), "FIFO 가 없는 OS")
+    def test_new_payment_with_fifo_is_refused_without_blocking(self):
+        # 정규 파일이 아니면 열지 않는다 — FIFO 를 열면 쓰는 쪽이 올 때까지 막힌다(수리 전 바이트는 여기서 시간 초과).
+        fifo = os.path.join(self.work, "a-fifo")
+        os.mkfifo(fifo)
+        self.open_ledger("F3", ["항목"])
+        r = self.pay("F3", fifo, timeout=20)
+        self.rc(EXIT_OPEN, r, "pay(FIFO)")
+        self.assertIn("지문을 얻지 못했다", r.stderr)
+
+    def test_refused_absent_artifact_stays_open_when_it_appears(self):
+        # 지불 시점에 없던 경로는 지문이 없다 — 거부된 뒤 그 자리에 파일이 생겨도 재지불 없이 PAID 가 되지 않는다.
+        later = os.path.join(self.work, "later.log")
+        self.open_ledger("F4", ["항목"])
+        self.rc(EXIT_OPEN, self.pay("F4", later), "pay(부재)")
+        self.put("later.log")
+        r = self.run_tool("status", "--id", "F4")
+        self.rc(EXIT_OPEN, r, "status(부재였던 경로가 생긴 뒤)")
+        self.assertIn("지문을 얻지 못했다", r.stdout)
+
+    def test_fingerprinted_file_beside_a_directory_is_paid(self):
+        # 지불은 지문을 얻은 내구 정규 파일 1건이면 성립한다 — 같이 적힌 디렉터리는 지불을 싣지 않을 뿐 막지 않는다.
+        d = os.path.join(self.work, "a-directory")
+        os.makedirs(d)
+        self.open_ledger("F5", ["항목"])
+        self.rc(EXIT_PAID, self.pay("F5", d, self.put("proof.log")), "pay(디렉터리 + 정규 파일)")
+        self.rc(EXIT_PAID, self.run_tool("status", "--id", "F5"), "status")
+
+    def test_legacy_bare_string_record_keeps_its_allowance(self):
+        # 지문 칸이 생기기 전의 기록(맨 문자열)은 지문 없이 실존·내구로 지불이 유지된다(소급 검증 불가 표시와 함께).
+        art = self.put("legacy.log")
+        self.open_ledger("F6", ["항목"])
+        led = self.load_ledger("F6")
+        led["items"][0].update({"state": "done", "evidence": EVIDENCE, "artifacts": [art]})
+        with open(self.ledger_path("F6"), "w", encoding="utf-8") as fh:
+            json.dump(led, fh, ensure_ascii=False)
+        r = self.run_tool("status", "--id", "F6")
+        self.rc(EXIT_PAID, r, "status(맨 문자열 기록)")
+        self.assertIn("지문 없음", r.stdout)
 
 
 class E2NoDenominator(Rig):
@@ -283,6 +413,12 @@ class E7Unattributed(Rig):
         r = self.run_tool("status", seat=SEAT_A)
         self.rc(EXIT_UNATTRIB, r, "status(귀속 없는 대장)")
         self.assertIn("UNATTRIBUTED", r.stdout)
+
+    def test_stamp_is_command_success_not_completion(self):
+        # stamp 의 0 = 귀속을 기입했다는 뜻뿐이다 — 그 뒤 좌석 범위 status 는 그 대장을 판정하고 열린 항목으로 1.
+        self.open_ledger("L7s", ["항목"], seat={})
+        self.rc(EXIT_PAID, self.run_tool("stamp", "--id", "L7s", seat=SEAT_A), "stamp")
+        self.rc(EXIT_OPEN, self.run_tool("status", seat=SEAT_A), "status(stamp 뒤)")
 
 
 STUB_CYS = """#!/bin/sh
@@ -409,6 +545,14 @@ class WindowsTempRoots(unittest.TestCase):
         self.assertEqual(st, "OPEN", why)
         self.assertIn("임시 경로", why)
 
+    def test_extended_length_temp_artifact_is_not_a_payment(self):
+        # \\?\ 를 붙인 같은 %TEMP% 파일 — 접두를 벗기지 않으면 어휘 비교가 빗나가 거짓 PAID 다.
+        art = "\\\\?\\" + WIN_TEMP + r"\proof.log"
+        with self.as_windows({"TEMP": WIN_TEMP}, [art]):
+            st, why = self.m._item_state({"state": "done", "evidence": EVIDENCE, "artifacts": [art]})
+        self.assertEqual(st, "OPEN", why)
+        self.assertIn("임시 경로", why)
+
     def test_durable_artifact_is_still_a_payment(self):
         art = r"C:\Users\x\Documents\proof.log"
         with self.as_windows({"TEMP": WIN_TEMP}, [art]):
@@ -427,6 +571,16 @@ class WindowsTempRoots(unittest.TestCase):
             ({"TEMP": r"C:\Temp"}, r"C:\Temp2\a.log", False),                           # 접두 함정
             ({"TEMP": WIN_TEMP}, r"C:\Users\x\Documents\a.log", False),
             ({}, WIN_TEMP + r"\a.log", False),                                          # 루트를 대는 env 없음
+            # DOS 장치 경로 — 같은 파일의 다른 이름(\\?\X:\ · \\?\UNC\ · \\.\ 도 같다). 접두를 벗기고 비교한다.
+            ({"TEMP": r"C:\Temp"}, r"\\?\C:\Temp\a.log", True),
+            ({"TEMP": r"\\server\share\temp"}, r"\\?\UNC\server\share\temp\a.log", True),
+            ({"TEMP": r"\\server\share\temp"}, r"\\?\unc\SERVER\share\Temp\a.log", True),   # UNC 낱말 대소문자
+            ({"TEMP": r"C:\Temp"}, "//?/C:/Temp/a.log", True),                          # 슬래시 형태
+            ({"TEMP": r"C:\Temp"}, r"\\.\C:\Temp\a.log", True),
+            ({"TEMP": r"\\server\share\temp"}, r"\\.\UNC\server\share\temp\a.log", True),
+            ({"TEMP": r"\\?\C:\Temp"}, r"C:\Temp\a.log", True),                         # 루트 쪽이 장치 경로
+            ({"TEMP": r"C:\Temp"}, r"\\?\C:\Temp2\a.log", False),                       # 접두 함정은 벗긴 뒤에도
+            ({"TEMP": r"\\server\share\temp"}, r"\\server\share\temp2\a.log", False),
         ]
         for env, path, want in cases:
             with self.subTest(env=env, path=path):
