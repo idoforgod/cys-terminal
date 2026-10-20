@@ -13,23 +13,35 @@
   U2 판정불가    .claude.json 판독 실패 = 2(--fix 여도 쓰지 않는다) · `cys list` 실패 = 2 · PATH 에 cys 없음 = 2
   C  호출 범위   도구가 띄우는 외부 명령은 `cys list` 하나뿐이다(스텁 호출 기록으로 잰다 — 프로세스 제어·
                  mcp__computer-use 호출 없음)
+  D1 base lane   Run from a dept-like env (the caller's socket variable names the dept daemon - CYS_SOCKET, or only a
+                 legacy JAVIS_SOCKET / AITERM_SOCKET, or an empty CYS_SOCKET beside a legacy one), the base lane still
+                 asks the DEFAULT socket and --fix writes no dept cwd into the base .claude.json (PROMOTE-6-D1FIX).
+  P0 producer    The stub is not a hand copy of `cys list`: its rows, the seat title and its socket-resolution order are
+                 DERIVED at test time from the producer source (src/bin/cys.rs Command::List println and workflow_title,
+                 src/lib.rs surface_ref and env_compat). When the producer moves, the derived rows move with it and the
+                 tool is exercised against the moved format; an unreadable producer is a failure, never a skip. The
+                 tool's socket-key tuple must equal javis_role.SOCKET_ENV_KEYS and the env_compat order.
 
 ## 밀폐
 - HOME·cwd 는 케이스마다 새 임시 디렉터리다. 라이브 설정(~/.cys/claude*)·라이브 팩·데몬은 읽지도 쓰지도 않는다.
 - 자식 PATH 는 스텁 cys(임시 폴더의 sh 스크립트 · 정해 둔 `cys list` 행만 출력) + /usr/bin:/bin 이다.
-  부모의 CLAUDE_CONFIG_DIR·CYS_*·타사 프로바이더 env 는 자식에 넘기지 않는다.
+  부모의 CLAUDE_CONFIG_DIR·CYS_*·타사 프로바이더 env 는 자식에 넘기지 않는다. The D1 cases set a socket variable
+  on purpose, and it names a path inside the temp dir; only the stub cys ever sees it.
 - 체크아웃에는 쓰지 않는다.
 
 ## 한계
 - 스텁 cys 가 sh 스크립트라 Windows 에서는 전부 건너뛴다(사유가 찍힌다). 이 테스트는 비-Windows 레인에만 등록된다.
-- `cys list` 의 열 모양은 src/bin/cys.rs Command::List 의 println 형식을 스텁이 흉내 낸 것이다 — 실제 데몬 출력은 재지 않는다.
+- The rows follow the producer's SOURCE (format string and argument order), not a running daemon: a value rendered
+  differently at run time (e.g. serde_json printing of pid/exited) is assumed, not measured.
 - 살아 있는 노드 프로세스의 실제 적재 여부는 도구도 이 테스트도 재지 않는다(도구 머리말 "계측의 유효 범위").
 
 실행: CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_computer_use_audit.py
 """
+import ast
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -39,24 +51,111 @@ import unittest
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.dirname(TESTS_DIR)
+ROOT = os.path.dirname(os.path.dirname(BIN))
 TOOL = os.path.join(BIN, "javis_computer_use.py")
+ROLE = os.path.join(BIN, "javis_role.py")
+CYS_RS = os.path.join(ROOT, "src", "bin", "cys.rs")
+LIB_RS = os.path.join(ROOT, "src", "lib.rs")
 SRV = "computer-use"
 DEPT = "7"
 
-STUB = r"""#!/bin/sh
-# 스텁 cys — 호출을 기록하고 정해 둔 `cys list` 행만 낸다. 소켓 env 로 레인을 고른다.
-printf '%s|%s\n' "${CYS_SOCKET:-base}" "$*" >> "$RIG_LOG"
-if [ -n "$CYS_SOCKET" ]; then key="$CYS_SOCKET"; else key="$RIG_DIR/base"; fi
+
+class ProducerMoved(AssertionError):
+    pass
+
+
+def _read(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as e:
+        raise ProducerMoved("producer source unreadable: %s (%s) - the stub cannot be derived" % (path, e))
+
+
+def _rust_str(lit):
+    """Decode the few escapes a Rust format literal here may hold; anything else means the producer moved."""
+    out, i = [], 0
+    while i < len(lit):
+        ch = lit[i]
+        if ch == "\\":
+            nxt = lit[i + 1:i + 2]
+            if nxt not in ("t", "n", "\\", '"'):
+                raise ProducerMoved("unexpected escape \\%s in a producer format literal" % nxt)
+            out.append({"t": "\t", "n": "\n", "\\": "\\", '"': '"'}[nxt])
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def producer():
+    """What the real producer prints, read from its source: the `cys list` row template and argument keys, the seat
+    title format, the surface ref format, and the socket names cys reads (in order, and whether empty is skipped)."""
+    cys, lib = _read(CYS_RS), _read(LIB_RS)
+    m = re.search(r'Command::List\s*=>\s*request\("surface\.list".*?println!\(\s*"((?:[^"\\]|\\.)*)",(.*?)\);',
+                  cys, re.S)
+    if not m:
+        raise ProducerMoved("src/bin/cys.rs: Command::List println not found")
+    row_fmt, keys = _rust_str(m.group(1)), re.findall(r's\["(\w+)"\]', m.group(2))
+    if row_fmt.count("{}") != len(keys):
+        raise ProducerMoved("src/bin/cys.rs: Command::List has %d placeholders for %d fields" % (row_fmt.count("{}"), len(keys)))
+    m = re.search(r'fn workflow_title\(.*?\.map\(\|folder\| format!\("([^"]*)"\)\)', cys, re.S)
+    if not m:
+        raise ProducerMoved("src/bin/cys.rs: workflow_title format not found")
+    title_fmt = _rust_str(m.group(1))
+    m = re.search(r'pub fn surface_ref\(id: u64\) -> String \{\s*format!\("([^"]*)"\)', lib)
+    if not m:
+        raise ProducerMoved("src/lib.rs: surface_ref format not found")
+    ref_fmt = _rust_str(m.group(1))
+    m = re.search(r'pub fn env_compat\(primary: &str\) -> Option<String> \{(.*?)\n\}', lib, re.S)
+    p = re.search(r'pub const ENV_SOCKET: &str = "(\w+)";', lib)
+    if not (m and p):
+        raise ProducerMoved("src/lib.rs: env_compat or ENV_SOCKET not found")
+    body, primary = m.group(1), p.group(1)
+    alias = {v: primary.replace(a, b, 1)
+             for v, a, b in re.findall(r'let (\w+) = primary\.replacen\("(\w+)", "(\w+)", 1\);', body)}
+    a = re.search(r'\[primary((?:, \w+\.as_str\(\))*)\]', body)
+    if not a:
+        raise ProducerMoved("src/lib.rs: env_compat lookup order not found")
+    order = [primary] + [alias[v] for v in re.findall(r'(\w+)\.as_str\(\)', a.group(1))]
+    if "!v.is_empty()" not in body:
+        raise ProducerMoved("src/lib.rs: env_compat no longer skips empty values - the stub's resolution would be wrong")
+    return {"row_fmt": row_fmt, "keys": keys, "title_fmt": title_fmt, "ref_fmt": ref_fmt, "socket_keys": order}
+
+
+def stub_script(socket_keys):
+    """Stub cys: logs `<resolved socket or base>|<argv>` and prints the rows the rig wrote for that socket. It resolves
+    the socket the way src/lib.rs env_compat does - the first NON-EMPTY of the derived names."""
+    names = " ".join(socket_keys)
+    return r"""#!/bin/sh
+key=""
+for k in %s; do
+  eval "v=\${$k:-}"
+  if [ -n "$v" ]; then key="$v"; break; fi
+done
+printf '%%s|%%s\n' "${key:-base}" "$*" >> "$RIG_LOG"
+[ -n "$key" ] || key="$RIG_DIR/base"
 [ "$1" = "list" ] || exit 64
 [ -e "$key.fail" ] && exit 1
 [ -f "$key.list" ] && cat "$key.list"
 exit 0
-"""
+""" % names
 
 
 def sha(path):
     with open(path, "rb") as fh:
         return hashlib.sha256(fh.read()).hexdigest()
+
+
+def tuple_in(path, name):
+    """A module-level tuple of string constants, read with ast (no import)."""
+    with open(path, encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return tuple(ast.literal_eval(node.value))
+    return None
 
 
 @unittest.skipIf(os.name == "nt", "Windows: 스텁 cys 가 sh 스크립트라 건너뛴다(비-Windows 레인 전용)")
@@ -65,6 +164,7 @@ class Rig(unittest.TestCase):
 
     def setUp(self):
         self.assertTrue(os.path.isfile(TOOL), "도구 부재: %s" % TOOL)
+        self.prod = producer()
         self.tmp = os.path.realpath(tempfile.mkdtemp(prefix="cu-audit-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = os.path.join(self.tmp, "home")
@@ -77,10 +177,10 @@ class Rig(unittest.TestCase):
         self.dept_cfg = os.path.join(self.home, ".cys", "claude-default-dept-%s" % DEPT, ".claude.json")
         self.dept_sock = os.path.join(self.home, ".local", "state", "cys-dept-dept-%s" % DEPT, "cys.sock")
         os.makedirs(os.path.dirname(self.dept_sock))
-        stub = os.path.join(self.stubbin, "cys")
-        with open(stub, "w", encoding="utf-8") as fh:
-            fh.write(STUB)
-        os.chmod(stub, 0o755)
+        self.stub = os.path.join(self.stubbin, "cys")
+        with open(self.stub, "w", encoding="utf-8") as fh:
+            fh.write(stub_script(self.prod["socket_keys"]))
+        os.chmod(self.stub, 0o755)
         # 기본: 두 레인 모두 좌석 없음, 설정은 탑재 항목 없이 판독 가능.
         self.write_cfg(self.base_cfg, {})
         self.write_cfg(self.dept_cfg, {})
@@ -95,28 +195,40 @@ class Rig(unittest.TestCase):
             json.dump(cfg, fh, ensure_ascii=False, indent=2)
         os.chmod(path, 0o644)
 
+    def row(self, sid, role, agent, cwd):
+        """One `cys list` row built from the producer's own templates (see producer())."""
+        folder = cwd.rstrip("/").rsplit("/", 1)[-1]
+        vals = {"surface_ref": self.prod["ref_fmt"].format(id=sid), "role": role, "pid": str(4000 + sid),
+                "exited": "false", "title": self.prod["title_fmt"].format(role=role, agent=agent, folder=folder),
+                "cwd": cwd}
+        unknown = [k for k in self.prod["keys"] if k not in vals]
+        if unknown:
+            raise ProducerMoved("src/bin/cys.rs: Command::List prints field(s) %s the stub cannot fill" % unknown)
+        parts = self.prod["row_fmt"].split("{}")
+        return "".join(p + vals[k] for p, k in zip(parts, self.prod["keys"])) + parts[-1]
+
     def seats(self, lane, rows):
-        """rows = [(sid, title, cwd)] — src/bin/cys.rs Command::List 형식(탭 6열)."""
+        """rows = [(sid, role, agent, cwd)] — written in the producer's row format."""
         key = os.path.join(self.rigdir, "base") if lane == "base" else self.dept_sock
         with open(key + ".list", "w", encoding="utf-8") as fh:
-            for sid, title, cwd in rows:
-                fh.write("surface:%d\trole=%s\tpid=%d\texited=false\t%s\t%s\n"
-                         % (sid, title.split("-")[0], 4000 + sid, title, cwd))
+            for sid, role, agent, cwd in rows:
+                fh.write(self.row(sid, role, agent, cwd) + "\n")
 
     def fail_list(self, lane):
         key = os.path.join(self.rigdir, "base") if lane == "base" else self.dept_sock
         open(key + ".fail", "w").close()
 
-    def env(self, path=None):
+    def env(self, path=None, extra=None):
         e = {k: v for k, v in os.environ.items()
-             if not k.startswith(("CYS_", "CLAUDE_", "ANTHROPIC_"))}
+             if not k.startswith(("CYS_", "CLAUDE_", "ANTHROPIC_", "JAVIS_", "AITERM_"))}
         e.update({"HOME": self.home, "PATH": path or (self.stubbin + os.pathsep + "/usr/bin:/bin"),
                   "PYTHONUTF8": "1", "RIG_LOG": self.log, "RIG_DIR": self.rigdir})
+        e.update(extra or {})
         return e
 
-    def run_tool(self, *argv, path=None):
+    def run_tool(self, *argv, path=None, extra=None):
         return subprocess.run([sys.executable, "-I", "-B", TOOL] + list(argv), cwd=self.tmp,
-                              env=self.env(path), capture_output=True, text=True,
+                              env=self.env(path, extra), capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=60)
 
     def rc(self, want, r, what):
@@ -139,8 +251,8 @@ class A0Ok(Rig):
     def test_all_mounted_is_0(self):
         self.write_cfg(self.base_cfg, {"/w/base": {"enabledMcpServers": [SRV]}})
         self.write_cfg(self.dept_cfg, {"/w/d7": {"enabledMcpServers": ["other", SRV]}})
-        self.seats("base", [(1, "worker-claude · base", "/w/base")])
-        self.seats("dept", [(2, "master-claude · d7", "/w/d7"), (3, "worker-claude · d7", "/w/d7")])
+        self.seats("base", [(1, "worker", "claude", "/w/base")])
+        self.seats("dept", [(2, "master", "claude", "/w/d7"), (3, "worker", "claude", "/w/d7")])
         r = self.run_tool()
         self.rc(0, r, "전부 탑재")
         self.assertIn("cwd 2개 전부 탑재", r.stdout)
@@ -151,7 +263,7 @@ class A0Ok(Rig):
         self.assertEqual(r.stdout.count("좌석없음"), 2, r.stdout)
 
     def test_non_claude_seats_are_not_judged(self):
-        self.seats("base", [(4, "worker-codex · x", "/w/codex"), (5, "reviewer-gemini · y", "/w/gem")])
+        self.seats("base", [(4, "worker", "codex", "/w/codex"), (5, "reviewer", "gemini", "/w/gem")])
         r = self.run_tool()
         self.rc(0, r, "Claude 아닌 좌석만")
         self.assertNotIn("/w/codex", r.stdout)
@@ -160,7 +272,7 @@ class A0Ok(Rig):
 class A1Gap(Rig):
     def test_gap_is_1_and_audit_writes_nothing(self):
         self.write_cfg(self.base_cfg, {"/w/base": {"enabledMcpServers": ["other"]}})
-        self.seats("base", [(1, "worker-claude · base", "/w/base")])
+        self.seats("base", [(1, "worker", "claude", "/w/base")])
         before = (sha(self.base_cfg), sha(self.dept_cfg))
         r = self.run_tool()
         self.rc(1, r, "미탑재 1")
@@ -169,7 +281,7 @@ class A1Gap(Rig):
         self.assertEqual((sha(self.base_cfg), sha(self.dept_cfg)), before, "감사(무 --fix)가 설정을 썼다")
 
     def test_dept_lane_asks_its_own_socket(self):
-        self.seats("dept", [(9, "worker-claude · d7", "/w/d7")])
+        self.seats("dept", [(9, "worker", "claude", "/w/d7")])
         r = self.run_tool()
         self.rc(1, r, "부서 레인 미탑재")
         self.assertIn("dept-%s" % DEPT, r.stdout)
@@ -177,7 +289,7 @@ class A1Gap(Rig):
 
     def test_missing_projects_entry_is_a_gap(self):
         self.write_cfg(self.base_cfg, {"/elsewhere": {"enabledMcpServers": [SRV]}})
-        self.seats("base", [(1, "worker-claude · new", "/w/new")])
+        self.seats("base", [(1, "worker", "claude", "/w/new")])
         self.rc(1, self.run_tool(), "새 작업 폴더")
 
 
@@ -185,8 +297,8 @@ class FFix(Rig):
     def test_fix_fills_gap_and_preserves(self):
         self.write_cfg(self.base_cfg, {"/w/base": {"enabledMcpServers": ["other"], "allowedTools": ["x"]}},
                        extra={"keep": {"a": 1}})
-        self.seats("base", [(1, "worker-claude · base", "/w/base")])
-        self.seats("dept", [(2, "worker-claude · d7", "/w/d7")])
+        self.seats("base", [(1, "worker", "claude", "/w/base")])
+        self.seats("dept", [(2, "worker", "claude", "/w/d7")])
         r = self.run_tool("--fix")
         self.rc(0, r, "--fix 뒤")
         self.assertEqual(self.enabled(self.base_cfg, "/w/base"), ["other", SRV])
@@ -204,8 +316,8 @@ class FFix(Rig):
 
     def test_fix_leaves_mounted_lane_and_non_claude_cwd_untouched(self):
         self.write_cfg(self.base_cfg, {"/w/base": {"enabledMcpServers": [SRV]}})
-        self.seats("base", [(1, "worker-claude · base", "/w/base")])
-        self.seats("dept", [(2, "worker-claude · d7", "/w/d7"), (3, "worker-codex · c", "/w/codex")])
+        self.seats("base", [(1, "worker", "claude", "/w/base")])
+        self.seats("dept", [(2, "worker", "claude", "/w/d7"), (3, "worker", "codex", "/w/codex")])
         base_before = sha(self.base_cfg)
         self.rc(0, self.run_tool("--fix"), "--fix")
         self.assertEqual(sha(self.base_cfg), base_before, "이미 탑재된 레인을 다시 썼다")
@@ -216,7 +328,7 @@ class U2Unreadable(Rig):
     def test_unreadable_config_is_2_even_with_fix(self):
         with open(self.base_cfg, "w", encoding="utf-8") as fh:
             fh.write("{not json")
-        self.seats("base", [(1, "worker-claude · base", "/w/base")])
+        self.seats("base", [(1, "worker", "claude", "/w/base")])
         before = sha(self.base_cfg)
         r = self.run_tool("--fix")
         self.rc(2, r, "판독 불가 설정")
@@ -236,11 +348,75 @@ class U2Unreadable(Rig):
 
 class CCalls(Rig):
     def test_only_cys_list_is_spawned(self):
-        self.seats("base", [(1, "worker-claude · base", "/w/base")])
-        self.seats("dept", [(2, "worker-claude · d7", "/w/d7")])
+        self.seats("base", [(1, "worker", "claude", "/w/base")])
+        self.seats("dept", [(2, "worker", "claude", "/w/d7")])
         self.run_tool("--fix")
         got = self.calls()
         self.assertEqual(sorted(got), sorted(["base|list", "%s|list" % self.dept_sock]), got)
+
+
+class D1BaseLaneIgnoresTheCallersSocket(Rig):
+    """D1: from a dept seat the caller's env names the dept daemon. The base lane must still ask the default socket,
+    so the dept's Claude seat is judged (and fixed) only against the dept config."""
+
+    def dept_like_envs(self):
+        legacy = [k for k in self.prod["socket_keys"] if k != "CYS_SOCKET"]
+        cases = [("CYS_SOCKET", {"CYS_SOCKET": self.dept_sock})]
+        cases += [(k + " only", {k: self.dept_sock}) for k in legacy]
+        cases += [("empty CYS_SOCKET + " + k, {"CYS_SOCKET": "", k: self.dept_sock}) for k in legacy]
+        return cases
+
+    def test_fix_from_a_dept_like_env_writes_no_dept_cwd_into_the_base_config(self):
+        self.assertEqual(shutil.which("cys", path=self.stubbin + os.pathsep + "/usr/bin:/bin"), self.stub,
+                         "the stub must be the cys the tool finds")
+        for what, extra in self.dept_like_envs():
+            with self.subTest(env=what):
+                self.write_cfg(self.base_cfg, {"/w/base": {"enabledMcpServers": [SRV]}})
+                self.write_cfg(self.dept_cfg, {})
+                self.seats("base", [(1, "worker", "claude", "/w/base")])
+                self.seats("dept", [(2, "worker", "claude", "/w/d7")])
+                if os.path.exists(self.log):
+                    os.unlink(self.log)
+                base_before = sha(self.base_cfg)
+                r = self.run_tool("--fix", extra=extra)
+                self.rc(0, r, "--fix from %s" % what)
+                self.assertIsNone(self.enabled(self.base_cfg, "/w/d7"),
+                                  "%s: the dept cwd was written into the BASE config\n%s" % (what, r.stdout))
+                self.assertEqual(sha(self.base_cfg), base_before, "%s: the base config changed" % what)
+                self.assertEqual(self.enabled(self.dept_cfg, "/w/d7"), [SRV], "%s: dept lane not fixed" % what)
+                self.assertEqual(sorted(self.calls()), sorted(["base|list", "%s|list" % self.dept_sock]),
+                                 "%s: the base lane did not ask the default socket" % what)
+
+    def test_audit_from_a_dept_like_env_reports_no_dept_seat_under_base(self):
+        self.write_cfg(self.base_cfg, {"/w/base": {"enabledMcpServers": [SRV]}})
+        self.write_cfg(self.dept_cfg, {"/w/d7": {"enabledMcpServers": [SRV]}})
+        self.seats("base", [(1, "worker", "claude", "/w/base")])
+        self.seats("dept", [(2, "worker", "claude", "/w/d7")])
+        for what, extra in self.dept_like_envs():
+            with self.subTest(env=what):
+                r = self.run_tool(extra=extra)
+                self.rc(0, r, "audit from %s" % what)
+                base_rows = [ln for ln in r.stdout.splitlines() if ln.split()[1:2] == ["base"]]
+                self.assertTrue(base_rows and all("/w/d7" not in ln for ln in base_rows),
+                                "%s: base lane rows %r" % (what, base_rows))
+
+
+@unittest.skipIf(os.name == "nt", "Windows: 비-Windows 레인 전용(같은 테스트 파일)")
+class P0ProducerCoupling(unittest.TestCase):
+    """The tool's socket names, the pack's convention and the producer's lookup order are one list."""
+
+    def test_socket_key_tuple_matches_the_pack_and_the_producer(self):
+        prod = producer()
+        tool = tuple_in(TOOL, "SOCKET_ENV_KEYS")
+        role = tuple_in(ROLE, "SOCKET_ENV_KEYS")
+        self.assertIsNotNone(tool, "javis_computer_use.SOCKET_ENV_KEYS missing")
+        self.assertEqual(tool, role, "tool tuple != javis_role.SOCKET_ENV_KEYS")
+        self.assertEqual(list(tool), prod["socket_keys"], "tool tuple != src/lib.rs env_compat order")
+
+    def test_derived_rows_parse_as_the_tool_expects(self):
+        prod = producer()
+        self.assertIn("cwd", prod["keys"], "src/bin/cys.rs: Command::List no longer prints cwd")
+        self.assertIn("title", prod["keys"], "src/bin/cys.rs: Command::List no longer prints the title")
 
 
 if __name__ == "__main__":
