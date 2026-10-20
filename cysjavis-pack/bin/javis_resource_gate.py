@@ -151,7 +151,50 @@ NODE_PATTERNS = [r"claude(\s|$)", r"\bagy\b", r"\bcodex\b", r"\bgemini\b"]
 NODE_OWNERS = frozenset(("claude", "agy", "codex", "gemini"))  # cysd·serena 는 함대지만 노드는 아니다.
 # ★2026-07-11 CSO(CEO B승인): codex 노드 1개 = node wrapper + darwin-arm64 vendor native 2프로세스가
 # 둘 다 \bcodex\b 매칭 → 이중계수. vendor native를 제외해 codex는 wrapper 1개만 계수(계수 인플레이션 차단).
-NODE_EXCLUDE_PATTERNS = [r"codex-darwin-arm64"]
+# ★2026-10-17 CEO — bg 클래스 패턴의 **정본 1벌**. 이 리스트가 제외(nodes)와 계수(bg_procs)의
+#   공동 출처다. 같은 패턴을 두 곳에 따로 적으면 한쪽만 고쳐져 '제외는 되는데 아무도 세지 않는'
+#   상태가 다시 생긴다 — 그것이 바로 아래 제외항이 들어간 직후 15분 만에 실측된 기제다(CSO
+#   RATE DATUM 2026-10-17 21:14: 총계가 pair/분으로 늘어나는 동안 nodes 는 45 로 고정 →
+#   성장이 게이트의 유일한 계기에서 사라졌다). 제외는 옳았고, 빠진 것은 **대체 계기**였다.
+#   ★2026-10-17 CEO(CSO 스펙 v1 §1.2-b) — 쌍의 두 쪽을 **이름 있는 하위 집합**으로 가른다.
+#   분해 축이 호스트/spare 선택자를 다시 타이핑하면 제외·계수·분해가 세 벌이 되어 한쪽만 고쳐진다
+#   — 그 드리프트가 바로 이 축이 생긴 이유다. 평평한 리스트는 두 집합의 **연결**이므로 패턴
+#   문자열과 순서는 종전과 한 글자도 다르지 않다(제외 동작 불변).
+BG_HOST_PATTERNS = [
+    r"(^|/)claude\s+bg-pty-host\b",
+]
+BG_SPARE_PATTERNS = [
+    r"(^|/)claude\s+bg-spare\b",
+    #   pty-host 의 exec 대상 형상(버전 바이너리 + `--bg-spare`)이 독립 프로세스로 표면화할 경우의
+    #   대비. 버전 경로 토큰 **직후**의 `--bg-spare` 만 집으므로 프롬프트 언급으로는 걸리지 않는다.
+    r"/claude/versions/[^ ]+\s+--bg-spare\b",
+]
+BG_CLASS_PATTERNS = [*BG_HOST_PATTERNS, *BG_SPARE_PATTERNS]
+
+NODE_EXCLUDE_PATTERNS = [
+    r"codex-darwin-arm64",
+    # ★2026-10-17 CSO 작성 · CEO 가 argv0 앵커로 조여 적용(선례: :577 의 2026-07-06 노트, 같은 종류의
+    #   nodes hard_block 오탐). Claude Code 백그라운드 잡은 살아 있는 잡 1개당 정확히 **2프로세스**를
+    #   계상시킨다 — `claude bg-pty-host …` 와 그 자식 `claude bg-spare …` — 둘 다 좌석의 transient
+    #   데몬에 매달린 것이고 새 좌석이 아니다. 실측 2026-10-17: 총계가 6분 만에 58 → 60 → 64 → 72 로
+    #   움직이는 동안 좌석만 세면 45 로 고정(네 순간·두 좌석 교차확인). :151 의 법(데몬은 함대지만
+    #   노드는 아니다)과 위 codex-darwin-arm64 항(논리 노드 1개의 계수 인플레이션)과 같은 법이다.
+    # ★CSO 원안은 `\bbg-pty-host\b`·`\bbg-spare\b` 부분문자열이었고 "spare 자식 argv0 가 버전
+    #   바이너리라 argv0 앵커로는 둘을 못 덮는다"를 근거로 삼았다. 라이브 ps 실측에서 그 전제가
+    #   깨졌다: spare 자식 13개 전부 argv0 가 `claude` + 서브커맨드 `bg-spare` 이고, 버전 바이너리
+    #   경로는 pty-host **자신의 argv 안 exec 대상**으로만 나타난다. 부분문자열 형태는 명령줄에 그
+    #   문자열이 **언급되기만** 한 실 좌석을 조용히 떨어뜨렸다(실측 반례: `claude -p fix the
+    #   bg-pty-host leak` → 0). 그래서 argv0 에 앵커한다 — 같은 라이브 45 를 재현하면서
+    #   '언급만으로 좌석이 사라지는' 구멍을 닫는다.
+    #   ★bg 3항은 BG_CLASS_PATTERNS 가 정본이다(위) — 여기서 펼쳐 쓰므로 계수와 영원히 같은 집합.
+    *BG_CLASS_PATTERNS,
+    #   `claude daemon run --origin transient --spawned-by {…}` — bg 잡을 호스팅하는 좌석별 transient
+    #   데몬. bg 작업을 돌리는 좌석마다 1개이고, 그 자체가 좌석은 아니다.
+    r"(^|/)claude\s+daemon\s+run\b",
+    #   오너 데스크톱 codex app-server 데몬(~/.codex/packages/…). argv0 가 .app 번들 안이 아니라
+    #   기존 앱 번들 제외가 닿지 않는다.
+    r"/\.codex/packages/app-server-daemon/",
+]
 
 # ★WP-7 N(0.14.31 · 버그리포트 B2 "편성 stuck") — **함대 소유 CPU 축**.
 #   실측 2026-09-06 07:07: macOS `mediaanalysisd` 가 79% 를 태워 load1=59 → `load_ratio` hard →
@@ -776,6 +819,32 @@ def _node_procs(lines):
 
 def _count_nodes(lines):
     return len(_node_procs(lines))
+
+
+def _bg_class_procs(lines):
+    """bg 클래스 (pid, cmd) 목록 — `nodes` 에서 제외되는 **바로 그 집합**(BG_CLASS_PATTERNS 공유).
+
+    좌석이 아니므로 nodes 에 계상하지 않는 것이 맞다. 그러나 **세지 않는 것**은 맞지 않다 —
+    이 집합은 살아 있는 잡 1개당 2프로세스로 늘고 각 pty-host 가 **실제 PTY 1개**를 쥔다
+    (실측 2026-10-17: fd 6/8/9 → /dev/ptmx, fd 7 → /dev/ttysNNN · 커널 상한
+    kern.tty.ptmx_max=511). 그래서 보고 전용 계기로 되살린다.
+    """
+    regs = [re.compile(p, re.IGNORECASE) for p in BG_CLASS_PATTERNS]
+    out = []
+    for line in lines:
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2 or not parts[0].isdigit():
+            continue
+        pid, cmd = int(parts[0]), parts[1]
+        if "javis_resource_gate" in cmd:
+            continue
+        if any(r.search(cmd) for r in regs):
+            out.append((pid, cmd))
+    return out
+
+
+def _count_bg_class(lines):
+    return len(_bg_class_procs(lines))
 
 
 # ── ★WP-7 N: 함대 CPU 측정(별 ps 스폰 · 기존 `_ps_lines` 오류 경로 무접촉) ──
@@ -2110,6 +2179,12 @@ def measure(a):
     else:
         nodes = _count_nodes(lines)
 
+    # ★2026-10-17 CEO — bg 클래스는 **보고 전용**이다(임계·차단 없음). `evaluate` 의 add(...) 에
+    #   넣지 않는 것이 그 집행이다. 이유는 :184 의 mediaanalysisd 선례와 같은 법 — Claude Code 가
+    #   자기 spare 풀을 회수하지 않아 생긴 증가로 우리 조직 기동을 거부하면, 못 고치는 원인으로
+    #   자가치유를 막는 그 사고를 되풀이한다. 보이게 하는 것과 막는 것은 다른 결정이다.
+    bg_procs = None if lines is None else _count_bg_class(lines)
+
     if a.load_override is not None:
         load1 = a.load_override
     else:
@@ -2219,6 +2294,8 @@ def measure(a):
         nodes_hard_effective = max(NODES_HARD_DEFAULT, NODES_HARD_BASE + roster["seats"])
 
     return {"servers": servers, "nodes": nodes,
+            "bg_procs": bg_procs,                    # 보고 전용 — 게이트 입력 아님
+
             "load1": round(load1, 2) if load1 is not None else None,
             "ncpu": ncpu,
             "load_ratio": round(load1 / ncpu, 3) if load1 is not None else None,
@@ -2471,6 +2548,14 @@ def cmd_check(a):
                else "max(%d, %d+Σ좌석)" % (NODES_HARD_DEFAULT, NODES_HARD_BASE))
         print(f"  depts: active={m['active_depts']} seats={m['dept_seats']}"
               f" [{dept_list or '-'}] → nodes hard {m['nodes_hard_effective']} ({how})")
+        # ★2026-10-17: bg 클래스는 nodes 에서 빠지므로 이 줄이 유일한 가시화다. 0 일 때는 줄을
+        #   내지 않는다 — 계기가 봤다는 증명 없이 '0' 을 발표하지 않기 위해서다(없는 줄은 0 주장이
+        #   아니다). 수치가 있으면 PTY 벽 여유는 `pty-headroom` 으로 따로 잰다.
+        if m.get("bg_procs"):
+            print("  bg_procs: %s (Claude Code bg 클래스 · nodes 제외분 · 보고 전용/임계 없음"
+                  " — 잡 1개당 2프로세스 + pty-host 1개당 실제 PTY 1개. 벽 여유:"
+                  " `pty-headroom` · 부모별 분해·age: `bg-parents`)"
+                  % m["bg_procs"])
         if m["measure_errors"]:
             print("measure_error: 자원 측정 실패(ps/load/부서 데몬 dept(<이름>)) — 조용한 allow 금지, "
                   "최소 soft로 격상. 측정 환경 확인 후 재시도(dept(…)=그 부서 데몬 무응답·stale 소켓).")
@@ -2517,6 +2602,9 @@ def cmd_classify(a):
     result = {
         "servers": len(_server_procs(lines, collapse=False)),
         "nodes": _count_nodes(lines),
+        #   ★2026-10-17: nodes 에서 제외한 bg 클래스를 같은 출력에 되살린다. CSO 가 성장을 못 본
+        #   계기가 바로 이 `classify` 였다 — 제외항과 계수항은 같은 화면에 함께 있어야 한다.
+        "bg_procs": _count_bg_class(lines),
     }
     print(json.dumps(result, ensure_ascii=False))
     return EXIT_ALLOW
@@ -3123,6 +3211,334 @@ def cmd_product_cpu(a):
     return EXIT_ALLOW
 
 
+# ══ ★2026-10-17 CEO — `pty-headroom`: PTY 하드월 여유, REPORT-ONLY ═══════════════
+#   왜 별 서브커맨드인가: 측정이 `lsof` 를 쓴다(수백 ms~초). `check` 는 기동 경로의 모든 호출에
+#   실려 있어 비용을 올릴 수 없고, 이 축은 **임계가 없다** — `product-cpu`(F5)와 같은 설계다.
+#   왜 필요한가: bg 클래스는 pair/분으로 늘고 pty-host 1개가 **실제 PTY 1개**를 쥔다. 상한은
+#   커널이 정하며 그 위는 고칠 수 없는 벽이다 — 벽까지의 거리는 '위생'이 아니라 **시한**이다.
+#   (CSO 는 sysctl 이 자기 prefix 밖이라 이 상한을 못 읽어 '미측정'으로 남겼다. 그래서 여기에
+#    계기를 둔다 — 다음 좌석이 같은 벽을 다시 미측정으로 남기지 않도록.)
+#
+#   ★계기의 한계를 라벨에 싣는다: /dev/ptmx 는 open() 1회가 PTY 1개를 할당하지만 fd 는 dup 되므로
+#     **열린 fd 수 ≠ 할당 수**다(실측 2026-10-17: ptmx fd 528개 > 상한 511 — fd 만 세면 이미 벽을
+#     넘은 것처럼 보인다. 실제로는 한 호스트가 같은 장치를 fd 6/8/9 로 세 번 쥔다). 그래서
+#     (major,minor) **고유 장치**를 센다. 읽지 못하면 0 이 아니라 None 이다(조용한 '건강' 금지).
+PTMX_SYSCTL = "kern.tty.ptmx_max"
+_DEVNO_RE = re.compile(r"^\d+,\d+$")
+
+
+def _ptmx_ceiling():
+    """커널 PTY 상한 -> (값|None, 사유|None)."""
+    try:
+        out = subprocess.run(["sysctl", "-n", PTMX_SYSCTL],
+                             capture_output=True, text=True, timeout=5)
+        if out.returncode == 0 and out.stdout.strip().isdigit():
+            return int(out.stdout.strip()), None
+    except (subprocess.SubprocessError, OSError):
+        pass
+    try:                                        # Linux 대응 경로
+        with open("/proc/sys/kernel/pty/max", encoding="utf-8") as fh:
+            v = fh.read().strip()
+        if v.isdigit():
+            return int(v), None
+    except OSError:
+        pass
+    return None, "ceiling_unreadable(%s · /proc/sys/kernel/pty/max)" % PTMX_SYSCTL
+
+
+def _ptmx_devices(bg_pids=frozenset(), run=None):
+    """/dev/ptmx 의 **고유 장치** 수 -> (전체|None, bg분|None, 사유|None). run 은 테스트 주입구."""
+    try:
+        out = (run or (lambda: subprocess.run(
+            ["lsof", "-n", "-P", "/dev/ptmx"], capture_output=True, text=True,
+            timeout=20).stdout))()
+    except (subprocess.SubprocessError, OSError) as e:
+        return None, None, "lsof_failed(%s)" % type(e).__name__
+    all_dev, bg_dev = set(), set()
+    for line in (out or "").splitlines()[1:]:
+        toks = line.split()
+        dev = next((t for t in toks if _DEVNO_RE.match(t)), None)
+        if dev is None:                         # 헤더·잡음 줄
+            continue
+        all_dev.add(dev)
+        if len(toks) > 1 and toks[1].isdigit() and int(toks[1]) in bg_pids:
+            bg_dev.add(dev)
+    if not all_dev:
+        return None, None, "lsof_no_rows(권한·플랫폼 — 0 으로 위장하지 않는다)"
+    return len(all_dev), len(bg_dev), None
+
+
+def _pty_headroom_collect(read_ps=None, devices=None, ceiling=None):
+    """`pty-headroom` 블록(dict). 모든 의존은 테스트 주입 가능."""
+    ceil_v, c_reason = (ceiling or _ptmx_ceiling)()
+    lines = (read_ps or _ps_lines)()
+    bg = _bg_class_procs(lines) if lines is not None else None
+    bg_pids = frozenset(p for p, _ in (bg or ()))
+    used, bg_used, u_reason = (devices or _ptmx_devices)(bg_pids)
+    head = (ceil_v - used) if (ceil_v is not None and used is not None) else None
+    return {
+        "ceiling": ceil_v, "used": used, "headroom": head,
+        "bg_procs": (len(bg) if bg is not None else None), "bg_ptys": bg_used,
+        "selector": "lsof -n -P /dev/ptmx · 고유 (major,minor) · fd 수 아님",
+        "state": "measured" if head is not None else "not_measured",
+        "reasons": [r for r in (c_reason, u_reason,
+                                (None if lines is not None else "ps_failed")) if r],
+    }
+
+
+def _pty_headroom_line(b, rate=None):
+    if b.get("state") != "measured":
+        return "pty_headroom: not_measured — %s" % ("; ".join(b.get("reasons") or [])
+                                                    or "사유 미기록")
+    txt = ("pty_headroom: used=%s/%s · 여유 %s (bg 클래스 %s프로세스가 PTY %s개) · 선택자: %s"
+           % (b["used"], b["ceiling"], b["headroom"], b["bg_procs"], b["bg_ptys"],
+              b["selector"]))
+    if rate:
+        txt += ("\n  ↳ 관측 속도 %s PTY/분을 그대로 연장하면 여유 소진까지 %.1f분 — 이것은"
+                " **산술이고 예보가 아니다**(속도가 유지된다는 가정은 측정하지 않았다)."
+                % (rate, b["headroom"] / float(rate)))
+    return txt
+
+
+def cmd_pty_headroom(a):
+    """`pty-headroom [--json] [--rate N]` — 항상 exit 0(보고 전용 · 게이트 입력 아님)."""
+    try:
+        b = _pty_headroom_collect()
+    except Exception as e:                      # noqa: BLE001 - 실패는 필드이지 종료코드가 아니다
+        b = {"state": "not_measured", "ceiling": None, "used": None, "headroom": None,
+             "bg_procs": None, "bg_ptys": None, "selector": None,
+             "reasons": ["internal: %s: %s" % (type(e).__name__, e)]}
+    print(json.dumps(dict(b, rate=a.rate), ensure_ascii=False) if a.json
+          else _pty_headroom_line(b, a.rate))
+    return EXIT_ALLOW
+
+
+# ══ ★2026-10-17 CEO — `bg-parents`: bg 클래스의 **부모별 분해**, REPORT-ONLY ═════════════
+#   CSO 스펙 v1 §1.2-b 의 이행. ⛔임계 없음 · ⛔floor 없음 · ⛔FLAGGED 줄 없음 — v1 은 보고 전용으로
+#   나가고 일주일 치 데이터가 쌓이기 전에는 어떤 수도 선을 긋지 않는다. `PAIRS_FLOOR` 는 **배선하지
+#   않은** 보류 후보다(스펙 v1 §1.3 강등): 한 좌석의 하루에 맞춘 floor 는 법의 권위를 걸친 숫자일
+#   뿐이다. 그래서 이 블록에는 그 이름의 상수가 **없다** — self-test 가 그 부재를 핀으로 잡는다.
+#
+#   ★왜 분해가 **필수 출력**인가: 스칼라 1개는 「멈춘 pane 1개」와 「함대 부하」를 구별하지 못한다.
+#   실측 2026-10-17: 이 집합은 18:24부터 21:1x까지 한 pane 의 산물로 서술됐고, 실제 부모는 최소
+#   3개였다(17 under 86861 · 1 under 68578 · 1 under 3649 — CSO 의 21:16:53 표본도 22 중 21 이
+#   86861 이라 소수파를 이미 담고 있었다). 부모 수가 1이면 좌석 위생이고, 여럿이면 함대 행동이다.
+#
+#   ⛔`check --json` 에는 넣지 않는다: 분해는 ppid 를 요구하고 그것은 게이트 임계경로(완료검증
+#   10s · 편성 30/15s · 부트 30s)에 **두 번째 ps 스폰**을 뜻한다 — F5 가 그은 선을 그대로 지킨다.
+#   텍스트 `check` 는 기존 `bg_procs` 줄에 **포인터 1절**만 얻는다(새 자식 프로세스 없음).
+#
+#   ★계수와 분해는 **한 번의 ps 읽기**에서 나온다. `_ps_lines`(pid,command) 의 계수에 별도 ppid
+#   조회를 붙이면, 한 계기의 계수를 다른 계기의 계수와 섞는 2026-10-17 21:07 의 그 사고를 축
+#   안에서 재생산한다 — 그래서 이 축은 자기 ps 를 pid·ppid·command 로 한 번 읽는다.
+BG_PARENTS_PS_TIMEOUT_S = 1.5
+BG_PARENTS_LABEL = "보고 전용 · 게이트 입력 아님 · 임계 없음 · floor 없음"
+BG_PARENTS_HEAD = "bg_parents: "
+BG_PARENTS_SELECTOR = "argv0 앵커 · BG_HOST_PATTERNS/BG_SPARE_PATTERNS(=BG_CLASS_PATTERNS)"
+BG_PARENTS_POPULATION = ("ps -axo pid=,ppid=,etime=,command= · 한 번의 읽기"
+                         "(계수·분해·age 동일 바이트)")
+#   ★2026-10-17 21:3x CSO 승인 — **age 판별자**. 스칼라 계수는 「churn(떴다 죽는다)」과 「누적
+#   (떠서 안 죽는다)」을 구별하지 못하고, 그 구별을 손으로 재려던 것이 CSO 의 역방향 판독을 만든
+#   원인이다. 그래서 부모별 **최고·최신 age** 와 `--json` 의 **per-id 행**을 같은 ps 바이트에서
+#   낸다 — 외부 표본기가 샘플 간 EVER-DIED 를 계산하는 입력이고, 두 번째 계기가 필요 없다.
+#   ⛔age 는 임계를 **획득하지 않는다**: 이 축은 v1 그대로 보고 전용이다(self-test 가 핀으로 잡는다).
+BG_AGE_UNKNOWN = "?"
+#   호스트 `<id>.pty.sock` 과 그 spare `<id>.claim.sock` 이 **같은 id** 를 들고 있다 — 쌍의 정체.
+BG_ID_RE = re.compile(r"/([^/\s]+)\.(?:pty|claim)\.sock\b")
+BG_ETIME_RE = re.compile(r"^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)$")
+
+
+def _bg_parse_etime(tok):
+    """`[[dd-]hh:]mm:ss` -> 초. 순수.
+
+    ⛔판독 실패는 **0 이 아니라 None** 이다. 0 은 「막 떴다」라는 거짓 측정이고, 그 거짓이
+    최고·최신 age 를 아래로 끌어내려 누적을 churn 처럼 보이게 한다 — 2026-10-17 의
+    padded-column 0 과 같은 종류의 사고다. 못 읽은 것은 못 읽었다고 센다(아래 hosts_age_unknown).
+    """
+    m = BG_ETIME_RE.match((tok or "").strip())
+    if not m:
+        return None
+    d, h, mi, s = (int(x) if x else 0 for x in m.groups())
+    return d * 86400 + h * 3600 + mi * 60 + s
+
+
+def _bg_host_id(cmd):
+    """argv 의 소켓 경로에서 **쌍의 id** 를 집는다. 순수. 없으면 None(추측하지 않는다).
+
+    CSO 21:31:42 실측 형상: host 는 `--bg-pty-host …/spare/<id>.pty.sock`, 그 spare 는
+    `--bg-spare …/spare/<id>.claim.sock` — 같은 id 가 두 쪽에 있다.
+    """
+    m = BG_ID_RE.search(cmd or "")
+    return m.group(1) if m else None
+
+
+def _bg_fmt_age(s):
+    """초 -> 사람이 읽는 짧은 형(1d02h·3h12m·2m05s·41s). None 은 '?' — ⛔0 으로 쓰지 않는다."""
+    if s is None:
+        return BG_AGE_UNKNOWN
+    if s >= 86400:
+        return "%dd%02dh" % (s // 86400, (s % 86400) // 3600)
+    if s >= 3600:
+        return "%dh%02dm" % (s // 3600, (s % 3600) // 60)
+    if s >= 60:
+        return "%dm%02ds" % (s // 60, s % 60)
+    return "%ds" % s
+
+
+def _bg_parse_ps_rows(text):
+    """`ps -axo pid=,ppid=,etime=,command=` stdout -> [(pid, ppid, age_secs|None, cmd)]. 순수."""
+    out = []
+    for ln in (text or "").splitlines():
+        f = ln.split(None, 3)
+        if len(f) < 4 or not f[0].isdigit() or not f[1].isdigit():
+            continue
+        out.append((int(f[0]), int(f[1]), _bg_parse_etime(f[2]), f[3]))
+    return out
+
+
+def _bg_parents_ps():
+    """이 축 **자신의 ps 읽기 1회** -> (rows|None, state|None, reason|None)."""
+    try:
+        p = subprocess.run(["ps", "-axo", "pid=,ppid=,etime=,command="], capture_output=True,
+                           text=True, errors="replace", timeout=BG_PARENTS_PS_TIMEOUT_S)
+    except FileNotFoundError:
+        return None, "unavailable", "ps 가 이 플랫폼에 없다"
+    except subprocess.TimeoutExpired:
+        return None, "not_measured", "ps timeout %.1f s" % BG_PARENTS_PS_TIMEOUT_S
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        return None, "not_measured", "ps 실패: %s" % type(e).__name__
+    if p.returncode != 0:
+        return None, "not_measured", "ps 실패(rc %s)" % p.returncode
+    rows = _bg_parse_ps_rows(p.stdout)
+    if not rows:
+        return None, "not_measured", "ps 가 쓸 수 있는 줄을 내지 않았다"
+    return rows, None, None
+
+
+def _bg_parents_empty(state, reason):
+    """측정 못 한 블록 — 계수는 **0 이 아니라 None** 이다(조용한 '건강' 위장 금지)."""
+    out = {"state": state, "reason": reason, "label": BG_PARENTS_LABEL,
+           "selector": None, "population": None, "parents": None, "ids": None}
+    for k in ("procs", "hosts", "spares", "spares_paired", "spares_orphan",
+              "parents_count", "hosts_age_unknown", "rows_seen"):
+        out[k] = None
+    return out
+
+
+def _bg_parents_group(rows, self_marker="javis_resource_gate"):
+    """순수 — rows -> 분해 필드 dict. ⛔판정·임계 없음.
+
+    부모 = **호스트의 ppid**(좌석별 transient 데몬 또는 벤더 부모). spare 는 자기 호스트를 통해
+    그 부모에 귀속시키고, 호스트가 ps 에 없는 spare 는 `spares_orphan` 으로 **따로** 센다 —
+    임의의 부모에 몰아 넣으면 분해가 조용히 틀린다(귀속 불가를 귀속으로 위장 금지).
+    ★`spares`·`hosts` 를 뺄셈해 「쌍」을 만들지 않는다: 호스트 1개에 spare 가 1개라는 것은
+    실측 형상이지 보장이 아니라, 뺄셈은 그 가정을 수치에 몰래 싣는다.
+    ★age 는 부모별로 **최고(가장 오래 산)·최신(가장 어린)** 두 수만 낸다 — 평균은 churn 과
+    누적을 같은 수로 만들고, 차(최고-최신)는 두 계기 뺄셈과 같은 종류의 거짓이다. 두 수를
+    그대로 두면 사람이 읽는 데서 판정이 일어난다(⛔이 함수는 판정하지 않는다).
+    """
+    hosts_re = [re.compile(p, re.IGNORECASE) for p in BG_HOST_PATTERNS]
+    spares_re = [re.compile(p, re.IGNORECASE) for p in BG_SPARE_PATTERNS]
+    cmd_by_pid, hosts, spares = {}, [], []
+    for pid, ppid, age, cmd in rows:
+        cmd_by_pid[pid] = cmd
+        if self_marker in cmd:
+            continue
+        if any(r.search(cmd) for r in hosts_re):
+            hosts.append((pid, ppid, age, cmd))
+        elif any(r.search(cmd) for r in spares_re):
+            spares.append((pid, ppid, age, cmd))
+    host_parent = {pid: ppid for pid, ppid, _a, _c in hosts}
+    per = {}
+    for _pid, ppid, age, _cmd in hosts:
+        cell = per.setdefault(ppid, {"ppid": ppid, "hosts": 0, "spares_paired": 0,
+                                     "hosts_age_unknown": 0,
+                                     "oldest_host_age_s": None, "newest_host_age_s": None})
+        cell["hosts"] += 1
+        if age is None:                 # 못 읽은 것을 0 초로 섞으면 최신이 거짓으로 내려간다
+            cell["hosts_age_unknown"] += 1
+            continue
+        old, new = cell["oldest_host_age_s"], cell["newest_host_age_s"]
+        cell["oldest_host_age_s"] = age if old is None else max(old, age)
+        cell["newest_host_age_s"] = age if new is None else min(new, age)
+    orphan = 0
+    for _pid, ppid, _age, _cmd in spares:
+        parent = host_parent.get(ppid)
+        if parent is None:
+            orphan += 1
+        else:
+            per[parent]["spares_paired"] += 1
+    for ppid, cell in per.items():
+        head = cmd_by_pid.get(ppid)
+        cell["parent_present"] = head is not None
+        cell["parent_cmd"] = head[:70] if head is not None else None
+    parents = sorted(per.values(), key=lambda c: (-c["hosts"], c["ppid"]))
+    # per-id 행 — 호스트 1개당 1행. 고령 우선, age 미판독은 맨 뒤(0 으로 끼어들지 않는다).
+    ids = [{"id": _bg_host_id(cmd), "pid": pid, "ppid": ppid, "age_secs": age}
+           for pid, ppid, age, cmd in hosts]
+    ids.sort(key=lambda r: (r["age_secs"] is None, -(r["age_secs"] or 0), r["pid"]))
+    return {"procs": len(hosts) + len(spares), "hosts": len(hosts), "spares": len(spares),
+            "spares_paired": sum(c["spares_paired"] for c in parents),
+            "spares_orphan": orphan, "parents_count": len(parents), "parents": parents,
+            "hosts_age_unknown": sum(1 for _p, _q, a, _c in hosts if a is None), "ids": ids}
+
+
+def _bg_parents_collect(read_ps=None, windows=None):
+    """`bg-parents` 블록(dict). 모든 의존은 테스트 주입 가능. 측정 문제로 예외를 던지지 않는다."""
+    t0 = time.monotonic()
+    windows = _is_windows_host() if windows is None else windows
+    if windows:
+        return _bg_parents_empty("unavailable", "Windows 호스트 — ps 읽기 없음(함대 축과 동일)")
+    rows, st, why = (read_ps or _bg_parents_ps)()
+    if rows is None:
+        return _bg_parents_empty(st or "not_measured", why)
+    out = {"state": "measured", "reason": None, "label": BG_PARENTS_LABEL,
+           "selector": BG_PARENTS_SELECTOR, "population": BG_PARENTS_POPULATION}
+    out.update(_bg_parents_group(rows))
+    out["rows_seen"] = len(rows)
+    out["elapsed_s"] = round(time.monotonic() - t0, 3)
+    return out
+
+
+def _bg_parents_lines(b):
+    """블록 -> 사람이 읽는 줄들. ⛔판정 문구·FLAGGED 줄 없음(스펙 v1)."""
+    if b.get("state") != "measured":
+        return [BG_PARENTS_HEAD + "%s — %s" % (
+            (b.get("state") or "not_measured").replace("_", " "),
+            b.get("reason") or "사유 미기록")]
+    out = [BG_PARENTS_HEAD + ("%s프로세스 = 호스트 %s + spare %s(부모 귀속 %s · 고아 %s)"
+                              " · 부모 %s개 · %s"
+                              % (b["procs"], b["hosts"], b["spares"], b["spares_paired"],
+                                 b["spares_orphan"], b["parents_count"], b["label"]))]
+    for c in b["parents"]:
+        who = c["parent_cmd"] if c["parent_present"] else "(부모가 ps 에 없다 — 재부모화·종료)"
+        unk = "" if not c["hosts_age_unknown"] else " age미판독 %s" % c["hosts_age_unknown"]
+        out.append("  ppid %-7s 호스트 %-3s spare %-3s  age 최고 %-7s 최신 %-7s%s  %s"
+                   % (c["ppid"], c["hosts"], c["spares_paired"],
+                      _bg_fmt_age(c["oldest_host_age_s"]),
+                      _bg_fmt_age(c["newest_host_age_s"]), unk, who))
+    if b["hosts_age_unknown"]:
+        out.append("  age 미판독 호스트 %s개 — 최고·최신에서 제외했다(⛔0 으로 쓰지 않는다)"
+                   % b["hosts_age_unknown"])
+    out.append("  age: 최고=그 부모 아래 가장 오래 산 호스트 · 최신=가장 어린 호스트. 둘이 함께"
+               " 올라가면 누적, 최신만 작게 유지되면 churn — 판정은 사람이 한다(⛔임계 없음)")
+    out.append("  per-id 행(id·pid·ppid·age_secs)은 --json 에만 — 외부 표본기가 샘플 간"
+               " EVER-DIED 를 계산하는 입력이다(이 축 자신은 샘플 간 비교를 하지 않는다)")
+    out.append("  선택자: %s" % b["selector"])
+    out.append("  모집단: %s (줄 %s개)" % (b["population"], b["rows_seen"]))
+    return out
+
+
+def cmd_bg_parents(a):
+    """`bg-parents [--json]` — 항상 exit 0(보고 전용 · 게이트 입력 아님 · 임계 없음)."""
+    try:
+        b = _bg_parents_collect()
+    except Exception as e:                      # noqa: BLE001 - 실패는 필드이지 종료코드가 아니다
+        b = _bg_parents_empty("not_measured", "internal: %s: %s" % (type(e).__name__, e))
+    print(json.dumps(b, ensure_ascii=False) if a.json else "\n".join(_bg_parents_lines(b)))
+    return EXIT_ALLOW
+
+
 def _pc_text_check_argv(argv):
     """Is this invocation TEXT `check`? Conservative: any token starting `--j` (argparse accepts
     the abbreviations `--j`/`--js`/`--jso` of `--json`) counts as JSON - erring toward 'no tail'
@@ -3290,6 +3706,19 @@ def main(argv=None):
     c.add_argument("--json", action="store_true")
     c.set_defaults(fn=cmd_product_cpu)
 
+    # ★2026-10-17: report-only, read-only, always exit 0 — product-cpu 와 같은 등급.
+    c = sub.add_parser("pty-headroom")
+    c.add_argument("--json", action="store_true")
+    c.add_argument("--rate", type=float, default=None,
+                   help="관측된 PTY/분 — 주면 소진까지의 산술만 덧붙인다(예보 아님)")
+    c.set_defaults(fn=cmd_pty_headroom)
+
+    # ★2026-10-17(CSO 스펙 v1 §1.2-b): report-only, read-only, 항상 exit 0 — 위 두 축과 같은 등급.
+    #   ⛔임계·floor 인자를 **의도적으로 받지 않는다**: 인자가 없으면 임계를 켤 수단이 없다.
+    c = sub.add_parser("bg-parents")
+    c.add_argument("--json", action="store_true")
+    c.set_defaults(fn=cmd_bg_parents)
+
     c = sub.add_parser("enforce")
     c.add_argument("--servers-hard", type=int, default=3)
     c.add_argument("--kill", action="store_true",
@@ -3356,6 +3785,191 @@ def _self_test_body(fails):
         "D-11: 버전 경로 claude 가 노드에서 누락됨")
     chk(_count_nodes(["3 claude javis_resource_gate check"]) == 0,
         "D-11: 노드의 명령줄 자기제외 회귀")
+    # ★2026-10-17: bg 잡 기계장치는 좌석이 아니다 (제외 방향)
+    chk(_count_nodes(["4 claude bg-pty-host --bg-pty-host /tmp/cc-daemon-501/x/y.pty.sock 200 50 "
+                      "-- /Users/x/.local/share/claude/versions/2.1.302 --bg-spare /tmp/x.claim.sock"]) == 0,
+        "bg: bg-pty-host 가 노드에 계상됨")
+    chk(_count_nodes(["5 claude bg-spare --bg-spare /tmp/cc-daemon-501/x/y.claim.sock"]) == 0,
+        "bg: bg-spare 자식(라이브 형상)이 노드에 계상됨")
+    chk(_count_nodes(["6 /Users/x/.local/share/claude/versions/2.1.302 --bg-spare /tmp/x.claim.sock"]) == 0,
+        "bg: bg-spare exec 형상(버전 바이너리)이 노드에 계상됨")
+    chk(_count_nodes(['7 /Users/x/.local/bin/claude daemon run --origin transient '
+                      '--spawned-by {"label":"claude","cwd":"/Users/x","pid":7833}']) == 0,
+        "bg: transient daemon 이 노드에 계상됨")
+    chk(_count_nodes(["8 /Users/x/.codex/packages/app-server-daemon/releases/0.163.0-aarch64-apple-darwin"
+                      "/bin/codex app-server --listen unix:// --managed-daemon"]) == 0,
+        "bg: 데스크톱 codex app-server-daemon 이 노드에 계상됨")
+    # ★음성대조 — 좌석은 **여전히** 계상돼야 한다(이 변경이 깨뜨리면 안 되는 핀)
+    chk(_count_nodes(["9 /Users/x/.local/share/claude/versions/2.1.302 --session-id abc"]) == 1,
+        "bg: 버전 경로 세션 좌석이 누락됨(과다 제외)")
+    chk(_count_nodes(["10 claude"]) == 1, "bg: 평문 claude 좌석이 누락됨(과다 제외)")
+    chk(_count_nodes(["11 /Users/x/.local/bin/agy"]) == 1, "bg: agy 좌석이 누락됨(과다 제외)")
+    chk(_count_nodes(["12 /Users/x/.local/lib/node_modules/@openai/codex/bin/codex.js"]) == 1,
+        "bg: codex 래퍼 좌석이 누락됨(과다 제외)")
+    # ★★앵커 회귀핀 — 명령줄에 그 문자열이 **언급되기만** 한 좌석은 계상돼야 한다.
+    #   CSO 원안의 부분문자열 형태는 아래 두 핀에서 실측으로 실패했다(좌석이 조용히 사라짐).
+    chk(_count_nodes(["13 claude -p fix the bg-pty-host leak"]) == 1,
+        "bg: 프롬프트에 bg-pty-host 를 언급한 좌석이 조용히 제외됨")
+    chk(_count_nodes(["14 /Users/x/.local/share/claude/versions/2.1.302 --session-id s "
+                      "-p bg-spare accumulation"]) == 1,
+        "bg: 프롬프트에 bg-spare 를 언급한 좌석이 조용히 제외됨")
+    chk(_count_nodes(["15 claude -p investigate claude daemon run growth"]) == 1,
+        "bg: 프롬프트에 claude daemon run 을 언급한 좌석이 조용히 제외됨")
+    # ★CEO 가 실측한 라이브 대조 — bg 쌍을 더해도 좌석 계수는 움직이지 않는다
+    _seats = ["16 claude", "17 /Users/x/.local/bin/agy",
+              "18 /Users/x/.local/share/claude/versions/2.1.302 --session-id s"]
+    _pair = ["19 claude bg-pty-host --bg-pty-host /tmp/a.pty.sock 200 50 -- "
+             "/Users/x/.local/share/claude/versions/2.1.302 --bg-spare /tmp/a.claim.sock",
+             "20 claude bg-spare --bg-spare /tmp/a.claim.sock"]
+    chk(_count_nodes(_seats) == 3, "bg: 좌석 3 기준선이 3 이 아님")
+    chk(_count_nodes(_seats + _pair) == 3, "bg: bg 쌍 추가가 좌석 계수를 움직임(모집단 불일치 회귀)")
+    chk(_count_nodes(_seats + _pair + _pair) == 3, "bg: bg 쌍 2배 추가가 좌석 계수를 움직임")
+    # ★2026-10-17 CEO — 제외와 계수는 **같은 집합**이어야 한다. 제외만 있고 계수가 없던 15분이
+    #   성장을 게이트에서 지웠다(CSO RATE DATUM). 이 핀들이 그 조합을 다시 막는다.
+    chk(all(p in NODE_EXCLUDE_PATTERNS for p in BG_CLASS_PATTERNS),
+        "bg: BG_CLASS_PATTERNS 가 NODE_EXCLUDE_PATTERNS 에 안 실림 — 제외·계수 출처 분기(드리프트)")
+    chk(_count_bg_class(_seats) == 0, "bg: 좌석만 있는 모집단에서 bg_procs 가 0 아님")
+    chk(_count_bg_class(_pair) == 2, "bg: bg 쌍이 2프로세스로 세어지지 않음(쌍=2 실측 형상)")
+    chk(_count_bg_class(_seats + _pair + _pair) == 4,
+        "bg: bg 쌍 2배가 bg_procs 에 반영 안 됨 — 성장이 계기에서 다시 사라진다")
+    #   제외와 똑같이, **프롬프트 언급**은 bg 로 세지 않는다(argv0 앵커가 계수에도 걸리는지).
+    chk(_count_bg_class(["13 claude -p fix the bg-pty-host leak",
+                         "14 claude -p bg-spare accumulation"]) == 0,
+        "bg: 프롬프트에 bg 문자열을 언급한 좌석이 bg_procs 로 오계수됨")
+    #   nodes + bg_procs 가 모집단을 설명한다 — 둘의 합이 투입 줄 수를 넘지 않는다(이중계수 금지).
+    chk(_count_nodes(_seats + _pair) + _count_bg_class(_seats + _pair) == 5,
+        "bg: nodes+bg_procs 가 모집단(좌석3+쌍2=5)과 불일치 — 이중계수·누락")
+    # ★pty-headroom: 읽지 못하면 0 이 아니라 not_measured 여야 한다(조용한 '건강' 금지).
+    _ph = _pty_headroom_collect(read_ps=lambda: ["1 claude bg-pty-host --bg-pty-host /t/a 200 50"],
+                                devices=lambda pids: (None, None, "lsof_no_rows(test)"),
+                                ceiling=lambda: (511, None))
+    chk(_ph["state"] == "not_measured" and _ph["used"] is None and _ph["headroom"] is None,
+        "pty: 장치 측정 실패가 not_measured 가 아님(0=건강 위장 위험): %r" % (_ph,))
+    chk("lsof_no_rows(test)" in _ph["reasons"], "pty: 실패 사유가 블록에 남지 않음")
+    _ph2 = _pty_headroom_collect(read_ps=lambda: ["1 claude bg-pty-host --bg-pty-host /t/a 200 50"],
+                                 devices=lambda pids: (117, 20, None),
+                                 ceiling=lambda: (511, None))
+    chk(_ph2["state"] == "measured" and _ph2["headroom"] == 394 and _ph2["bg_procs"] == 1,
+        "pty: 여유 산술(511-117=394)·bg 계수가 어긋남: %r" % (_ph2,))
+    chk("예보가 아니다" in _pty_headroom_line(_ph2, rate=1.0),
+        "pty: --rate 산술에 '예보 아님' 라벨이 빠짐(산술을 예보로 읽히게 함)")
+    _ph3 = _pty_headroom_collect(read_ps=lambda: None,
+                                 devices=lambda pids: (117, 0, None),
+                                 ceiling=lambda: (None, "ceiling_unreadable(test)"))
+    chk(_ph3["state"] == "not_measured" and _ph3["bg_procs"] is None
+        and "ps_failed" in _ph3["reasons"],
+        "pty: 상한 미독·ps 실패가 조용히 통과됨: %r" % (_ph3,))
+    # ★2026-10-17 CSO 스펙 v1 §1.2-b — 부모별 분해. 순수: rows 주입 · ps 읽기 없음 · 자식 없음.
+    #   픽스처는 CSO 가 실측한 형상 그대로다(17 under 86861 · 1 under 68578 · 1 under 3649).
+    #   ★age 주입: 86861 아래 17개는 100..260초(최고 260·최신 100), 68578 아래 1개는 **판독
+    #   불가(None)**, 3649 아래 1개는 90000초. 경로는 CSO 21:31:42 실측 형상(쌍이 같은 id).
+    _bgp_rows = []
+    for _i in range(17):
+        _bgp_rows.append((1000 + _i, 86861, 100 + _i * 10,
+                          "claude bg-pty-host --bg-pty-host "
+                          "/tmp/cc-daemon-501/f/spare/id%02d.pty.sock 200 50" % _i))
+        _bgp_rows.append((2000 + _i, 1000 + _i, 50 + _i,
+                          "claude bg-spare --bg-spare "
+                          "/tmp/cc-daemon-501/f/spare/id%02d.claim.sock" % _i))
+    _bgp_rows += [
+        (1100, 68578, None, "claude bg-pty-host --bg-pty-host /tmp/x.pty.sock 200 50"),
+        (1101, 3649, 90000, "claude bg-pty-host --bg-pty-host /tmp/y.pty.sock 200 50"),
+        (86861, 1, 120000, "claude daemon run --origin transient --spawned-by {a}"),
+        (68578, 1, 120000, "claude daemon run --origin transient --spawned-by {b}"),
+        (16, 1, 130000, "claude"),
+        (13, 1, 60, "claude -p fix the bg-pty-host leak"),
+        (2999, 31337, 10, "claude bg-spare --bg-spare /tmp/orphan.claim.sock"),
+    ]
+    _bgp = _bg_parents_collect(read_ps=lambda: (list(_bgp_rows), None, None), windows=False)
+    chk(_bgp["state"] == "measured" and _bgp["hosts"] == 19 and _bgp["spares"] == 18
+        and _bgp["spares_paired"] == 17 and _bgp["spares_orphan"] == 1 and _bgp["procs"] == 37,
+        "bg-parents: CSO 실측 형상(호스트 19·spare 18·고아 1)이 재현되지 않음: %r" % (_bgp,))
+    chk([c["hosts"] for c in _bgp["parents"]] == [17, 1, 1] and _bgp["parents_count"] == 3,
+        "bg-parents: 부모별 분해가 17/1/1·부모 3 으로 나오지 않음 — '한 pane' 오독이 되살아난다")
+    chk(_bgp["parents"][0]["ppid"] == 86861 and _bgp["parents"][0]["parent_present"] is True
+        and "daemon run" in (_bgp["parents"][0]["parent_cmd"] or ""),
+        "bg-parents: 최다 부모의 식별·명령 표기가 어긋남(어느 부모인지 사람이 못 읽는다)")
+    _bgp_3649 = [c for c in _bgp["parents"] if c["ppid"] == 3649][0]
+    chk(_bgp_3649["parent_present"] is False and _bgp_3649["parent_cmd"] is None,
+        "bg-parents: ps 에 없는 부모가 present 로 보고됨(모르는 것을 아는 것으로 위장)")
+    #   ★두 축이 **같은 모집단에서 같은 수**를 내야 한다 — 분해가 계수와 갈라지면 선택자 분기다.
+    chk(_count_bg_class(["%d %s" % (p, c) for p, _q, _a, c in _bgp_rows]) == _bgp["procs"],
+        "bg-parents: 분해 축과 계수 축이 같은 모집단에서 다른 수를 낸다(선택자 분기)")
+    #   ★음성대조 2종이 분해 축에도 걸린다: 프롬프트 언급(13)은 호스트가 아니고(19, ⛔20 아님),
+    #   bg 를 더해도 좌석 계수는 안 움직인다(두 축 설계의 불변식).
+    chk(_count_nodes(["%d %s" % (p, c) for p, _q, _a, c in _bgp_rows]) == 2,
+        "bg-parents: 픽스처의 좌석 계수가 2(좌석1+언급1)가 아니다 — bg 가 좌석으로 샜다")
+    #   ★2026-10-17 21:3x CSO 승인 — age 판별자. 환산이 먼저다(틀린 환산은 두 수를 조용히 뒤집는다).
+    chk(_bg_parse_etime("10-12:43:34") == 909814 and _bg_parse_etime("09:03:41") == 32621
+        and _bg_parse_etime("45:12") == 2712 and _bg_parse_etime("00:00") == 0,
+        "bg-parents: etime 환산이 [[dd-]hh:]mm:ss 를 못 읽는다")
+    chk(_bg_parse_etime("") is None and _bg_parse_etime("12m") is None
+        and _bg_parse_etime(None) is None and _bg_parse_etime("1:2:3:4") is None,
+        "bg-parents: 판독 불가 etime 이 0 으로 떨어진다 — 0 은 '막 떴다'라는 거짓 측정이다")
+    chk(_bg_parse_ps_rows("  123   45 01:02:03 claude bg-pty-host /t/a.pty.sock 200 50\n"
+                          "bogus line\n  9 8 nope claude bg-spare --bg-spare /t/a.claim.sock\n")
+        == [(123, 45, 3723, "claude bg-pty-host /t/a.pty.sock 200 50"),
+            (9, 8, None, "claude bg-spare --bg-spare /t/a.claim.sock")],
+        "bg-parents: 4필드 ps 파서가 age 를 잃거나 쓸 수 없는 줄을 흘린다")
+    chk(_bg_host_id("claude bg-pty-host --bg-pty-host /tmp/cc-daemon-501/faea40b8/spare/"
+                    "0d3cf622.pty.sock 200 50") == "0d3cf622"
+        and _bg_host_id("/Users/x/.local/share/claude/versions/2.1.302 --bg-spare "
+                        "/tmp/cc-daemon-501/faea40b8/spare/0d3cf622.claim.sock") == "0d3cf622"
+        and _bg_host_id("claude bg-pty-host --bg-pty-host /tmp/nosock 200 50") is None,
+        "bg-parents: 쌍의 id 가 CSO 21:31:42 실측 argv 에서 재현되지 않는다(host·spare 동일 id)")
+    chk(_bg_fmt_age(None) == "?" and _bg_fmt_age(0) == "0s" and _bg_fmt_age(2712) == "45m12s"
+        and _bg_fmt_age(32621) == "9h03m" and _bg_fmt_age(909814) == "10d12h",
+        "bg-parents: age 사람 표기가 어긋남(None 이 0 처럼 보이면 안 된다)")
+    _p0 = _bgp["parents"][0]
+    chk(_p0["oldest_host_age_s"] == 260 and _p0["newest_host_age_s"] == 100
+        and _p0["hosts_age_unknown"] == 0,
+        "bg-parents: 부모별 age 최고·최신이 어긋남 — churn↔누적을 가르는 그 두 수다: %r" % (_p0,))
+    _p_unk = [c for c in _bgp["parents"] if c["ppid"] == 68578][0]
+    chk(_p_unk["hosts_age_unknown"] == 1 and _p_unk["oldest_host_age_s"] is None
+        and _p_unk["newest_host_age_s"] is None and _bgp["hosts_age_unknown"] == 1,
+        "bg-parents: age 미판독 호스트가 0 초로 섞여 최고·최신을 끌어내린다: %r" % (_p_unk,))
+    chk(len(_bgp["ids"]) == _bgp["hosts"]
+        and all(set(r) == {"id", "pid", "ppid", "age_secs"} for r in _bgp["ids"])
+        and _bgp["ids"][0]["pid"] == 1101 and _bgp["ids"][0]["age_secs"] == 90000
+        and _bgp["ids"][-1]["pid"] == 1100 and _bgp["ids"][-1]["age_secs"] is None,
+        "bg-parents: per-id 행이 호스트 1:1·고령 우선·미판독 후순이 아니다")
+    chk([r["id"] for r in _bgp["ids"]].count("id00") == 1
+        and [r["id"] for r in _bgp["ids"] if r["pid"] == 1000][0] == "id00",
+        "bg-parents: per-id 행의 id 가 소켓 경로에서 오지 않는다(샘플 간 EVER-DIED 의 키다)")
+    _bgp_txt = _bg_parents_lines(_bgp)
+    chk(any("age 최고" in ln and "최신" in ln for ln in _bgp_txt)
+        and any("age 미판독 호스트 1개" in ln for ln in _bgp_txt)
+        and any("EVER-DIED" in ln for ln in _bgp_txt),
+        "bg-parents: 텍스트에 age 두 수·미판독 고지·per-id 포인터 중 빠진 것이 있다")
+    #   ★측정 실패는 0 이 아니라 None 이고, 분해는 **빈 리스트가 아니라 None** 이다.
+    _bgp_f = _bg_parents_collect(read_ps=lambda: (None, "not_measured", "ps timeout 1.5 s"),
+                                 windows=False)
+    chk(_bgp_f["state"] == "not_measured" and _bgp_f["hosts"] is None
+        and _bgp_f["parents"] is None and "timeout" in (_bgp_f["reason"] or ""),
+        "bg-parents: 측정 실패가 0·빈 분해로 위장됨: %r" % (_bgp_f,))
+    chk(_bg_parents_collect(windows=True)["state"] == "unavailable",
+        "bg-parents: Windows 호스트가 unavailable 이 아님")
+    #   ★스펙 v1 집행 핀 — 보고 전용 축에 판정·임계 필드가 **생기지 않는다**.
+    chk(not any(k in _bgp for k in ("verdict", "level", "trip", "trips", "flagged",
+                                    "floor", "threshold", "soft", "hard",
+                                    "age_floor", "age_soft", "age_hard", "age_threshold",
+                                    "max_age", "min_age", "stale", "stale_hosts")),
+        "bg-parents: 보고 전용 축에 판정·임계 필드가 생겼다(스펙 v1 위반): %r" % (sorted(_bgp),))
+    #   ★age 는 **인자로도** 임계를 못 얻는다 — 받을 플래그가 없으면 켤 수단이 없다.
+    with contextlib.redirect_stderr(io.StringIO()):
+        _rc_age = main(["bg-parents", "--max-age", "1"])
+    chk(_rc_age == EXIT_USAGE,
+        "bg-parents: age 임계 인자가 받아들여졌다 — 스펙 v1 은 age 에 임계를 금지한다(rc=%r)"
+        % (_rc_age,))
+    chk("PAIRS_FLOOR" not in globals(),
+        "bg-parents: PAIRS_FLOOR 가 배선됐다 — 스펙 v1 은 **미배선 보류 후보**로 못박았다")
+    chk(not any("FLAGGED" in ln or "flagged" in ln for ln in _bg_parents_lines(_bgp)),
+        "bg-parents: 출력에 FLAGGED 줄이 생겼다(스펙 v1 은 FLAGGED 없음)")
+    #   ★제외·계수·분해가 **한 출처**임을 핀으로 잡는다(세 벌 드리프트 차단).
+    chk(BG_CLASS_PATTERNS == [*BG_HOST_PATTERNS, *BG_SPARE_PATTERNS]
+        and all(p in NODE_EXCLUDE_PATTERNS for p in BG_HOST_PATTERNS + BG_SPARE_PATTERNS),
+        "bg-parents: 호스트/spare 하위집합이 제외·계수 출처와 갈라졌다")
+
     # ★A3: 모든 check 호출에 고정 로스터를 주입 — 이 머신의 라이브 부서 소켓(dept-1 등)이 판정에
     #   스며들면 self-test 가 비결정론이 된다(nodes hard 가 좌석 수에 따라 18·21·30… 으로 움직임).
     # ★WP-7 N 동형 밀폐: 신설 CPU 축·부트 유예도 라이브(이 기계의 ps·boot-epoch mtime)를 읽으면
