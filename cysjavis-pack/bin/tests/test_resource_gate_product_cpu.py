@@ -1089,8 +1089,43 @@ class T15NoTimeoutLengthened(unittest.TestCase):
                     a = txt.index("# ══ ★F5 (0.14.50")
                     b = txt.index("class _GateArgumentParser")
                     txt = txt[:a] + txt[b:]
-                return sorted(ln.strip() for ln in txt.splitlines()
-                              if re.search(r"timeout|TIMEOUT", ln) and not ln.strip().startswith("#"))
+                # A line counts when its CODE names a timeout: an identifier (assignment target, keyword
+                # argument, call, attribute, parameter, reference, import) or an identifier-shaped string
+                # that names a parameter (dict key, subscript key, call argument). The bare word inside a
+                # comment, a message or fixture text is not a timeout (PROMOTE-1: the self-test's
+                # "ps timeout 1.5 s" fixture turned the bare-word census red).
+                word = re.compile(r"timeout|TIMEOUT")
+                tree = ast.parse(txt)
+                keys = set()
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.Dict):
+                        keys.update(id(k) for k in node.keys if k is not None)
+                    elif isinstance(node, ast.Subscript):
+                        keys.add(id(node.slice))
+                    elif isinstance(node, ast.Call):
+                        keys.update(id(v) for v in node.args + [k.value for k in node.keywords])
+                rows = set()
+                for node in ast.walk(tree):
+                    names, row = (), getattr(node, "lineno", None)
+                    if isinstance(node, ast.Name):
+                        names = (node.id,)
+                    elif isinstance(node, ast.Attribute):
+                        names, row = (node.attr,), node.end_lineno
+                    elif isinstance(node, (ast.keyword, ast.arg)):
+                        names = (node.arg or "",)
+                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        names = (node.name,)
+                    elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                        names = tuple(a.asname or a.name for a in node.names)
+                    elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                        names = tuple(node.names)
+                    elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) in keys \
+                            and node.value.isidentifier():
+                        names = (node.value,)
+                    if any(word.search(n) for n in names):
+                        rows.add(row)
+                lines = txt.splitlines()
+                return sorted(lines[r - 1].strip() for r in rows)
             self.assertEqual(timeout_lines(GATE, True), timeout_lines(tag_gate, False))
         finally:
             shutil.rmtree(td, ignore_errors=True)
