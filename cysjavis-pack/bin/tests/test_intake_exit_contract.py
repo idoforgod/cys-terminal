@@ -13,7 +13,9 @@
   E4 DRIFT     기록된 지시 원문을 사후 변조 = 4 · 판독 불가 대장 = 4
   E5 USAGE     사용법 오류는 argparse 기본 2 가 아니라 5 — 2(NO_DENOM)와 같은 숫자가 두 사실을 뜻하지 않는다
   E7 UNATTRIB  좌석 귀속이 없는 대장은 좌석 범위 status 에서 판정하지 않는다 = 7
-  S  selftest  = 0 (POSIX 한정 — 아래 한계)
+  S  selftest  = 0 · 자기 재기동 argv 에 -I 와 함께 -B (번들 python 이 캐시를 번들 안에 쓰지 않게)
+  W  Windows   임시 루트(TMPDIR·TEMP·TMP·LOCALAPPDATA\\Temp · 대소문자 무시) — 도구 모듈의 os 를 대역으로
+               바꿔 이 Mac 에서도 Windows 판정을 잰다(%TEMP% 만인 artifact 는 지불이 아니다)
 
 ## 밀폐
 - 팩·HOME·cwd 는 케이스마다 새 임시 디렉터리다. 라이브 팩(~/.cys/pack*)은 읽지도 쓰지도 않는다.
@@ -25,19 +27,24 @@
   spawn_env_pairs)을 그대로 따른다.
 
 ## 한계
-- Windows: 도구의 임시 경로 판정(`_EPHEMERAL_ROOTS`)은 POSIX 루트만 담는다. 소스로 읽으면 %TEMP% 의 artifact 가
-  내구로 읽히고 selftest ⒡' 가 실패(exit 6)한다 — Windows 실측은 없다. 그래서 그 두 케이스는 os.name == "nt"
-  에서 건너뛰고, 건너뜀은 사유와 함께 러너 출력에 찍힌다. 스텁 cys(sh 스크립트) 갈래도 Windows 에서 건너뛴다.
+- Windows 실측은 없다. W 는 대역 os 로 Windows 판정 논리를 재지만 Windows 위에서 돈 적은 없다.
+  스텁 cys(sh 스크립트) 갈래와 POSIX 규칙 고정 케이스는 Windows 에서 건너뛰고, 건너뜀은 사유와 함께 찍힌다.
+- W·S 의 일부는 도구를 같은 프로세스로 읽는다 — 그때 캐시(.pyc)를 체크아웃에 남기지 않는다(load_tool).
 
 실행: CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_intake_exit_contract.py
 """
+import contextlib
+import importlib.util
+import io
 import json
+import ntpath
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 BIN = os.path.dirname(TESTS_DIR)
@@ -49,8 +56,6 @@ EVIDENCE = "검증 로그를 디스크에 남겼고 기대값과 실측값이 �
 REASON = "상위 결정(헤드 판정)이 아직 내려지지 않아 착수할 수 없다"
 SEAT_A = {"CYS_ROLE": "worker-a", "CYS_SURFACE_ID": "901"}
 SEAT_B = {"CYS_ROLE": "worker-b", "CYS_SURFACE_ID": "902"}
-NT_SKIP = ("Windows: _EPHEMERAL_ROOTS 가 POSIX 루트만 담아 %TEMP% 를 임시 경로로 보지 않는다"
-           " (소스 판독 · Windows 미측정)")
 
 EXIT_PAID, EXIT_OPEN, EXIT_NO_DENOM, EXIT_NO_LEDGER, EXIT_DRIFT, EXIT_USAGE = 0, 1, 2, 3, 4, 5
 EXIT_UNATTRIB = 7
@@ -161,7 +166,6 @@ class E1Open(Rig):
         self.rc(EXIT_OPEN, r, "pay(부재)")
         self.assertIn("디스크 부재", r.stderr)
 
-    @unittest.skipIf(os.name == "nt", NT_SKIP)
     def test_ephemeral_only_artifact_is_refused(self):
         self.open_ledger("L1e", ["항목"])
         fd, tmpart = tempfile.mkstemp(prefix="intake-eph-", dir=tempfile.gettempdir())
@@ -342,11 +346,120 @@ class E3SeatAuthority(Rig):
 
 
 class SelfTest(Rig):
-    @unittest.skipIf(os.name == "nt", NT_SKIP)
     def test_selftest_passes(self):
         r = self.run_tool("selftest")
         self.rc(EXIT_PAID, r, "selftest")
         self.assertIn("SELFTEST OK", r.stdout)
+
+
+def load_tool():
+    """도구를 같은 프로세스로 읽는다 — 캐시(.pyc)를 체크아웃에 남기지 않는다."""
+    spec = importlib.util.spec_from_file_location("javis_intake_under_test", TOOL)
+    mod = importlib.util.module_from_spec(spec)
+    prev = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = prev
+    return mod
+
+
+class _NtPath:
+    """ntpath 에 '존재' 판정만 대역으로 얹는다 — 이 Mac 에 없는 Windows 경로를 실존으로 본다."""
+
+    def __init__(self, existing):
+        self._existing = {ntpath.normcase(p) for p in existing}
+
+    def exists(self, p):
+        return ntpath.normcase(p) in self._existing
+
+    def __getattr__(self, name):
+        return getattr(ntpath, name)
+
+
+class _NtOs:
+    """도구 모듈의 os 대역 — name·path·environ 만 Windows 처럼 바꾸고 나머지는 진짜 os 로 넘긴다."""
+
+    def __init__(self, env, existing=()):
+        self.name, self.path, self.environ = "nt", _NtPath(existing), env
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
+WIN_TEMP = r"C:\Users\x\AppData\Local\Temp"
+
+
+class WindowsTempRoots(unittest.TestCase):
+    """대역 os 로 운영 경로(`os.name`·`os.environ`·`os.path.exists`)를 그대로 태운다 — 그래서 수리 전 바이트에도
+    같은 검체가 돌고, 수리 전에는 첫 케이스가 거짓 PAID 로 붉다."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_tool()
+
+    def as_windows(self, env, existing=()):
+        return mock.patch.object(self.m, "os", _NtOs(env, existing))
+
+    def test_temp_only_artifact_is_not_a_payment(self):
+        art = WIN_TEMP + r"\proof.log"
+        with self.as_windows({"TEMP": WIN_TEMP}, [art]):
+            st, why = self.m._item_state({"state": "done", "evidence": EVIDENCE, "artifacts": [art]})
+        self.assertEqual(st, "OPEN", why)
+        self.assertIn("임시 경로", why)
+
+    def test_durable_artifact_is_still_a_payment(self):
+        art = r"C:\Users\x\Documents\proof.log"
+        with self.as_windows({"TEMP": WIN_TEMP}, [art]):
+            st, why = self.m._item_state({"state": "done", "evidence": EVIDENCE, "artifacts": [art]})
+        self.assertEqual(st, "PAID", why)
+
+    def test_root_resolution(self):
+        cases = [  # (env, 경로, 임시인가)
+            ({"TEMP": WIN_TEMP}, r"c:\users\X\appdata\local\temp\a.log", True),        # 대소문자
+            ({"TEMP": WIN_TEMP}, "C:/Users/x/AppData/Local/Temp/sub/a.log", True),      # 슬래시
+            ({"TMP": r"D:\Scratch"}, r"d:\scratch\a.log", True),
+            ({"TMPDIR": r"E:\t"}, r"E:\T\a.log", True),
+            ({"LOCALAPPDATA": r"C:\Users\x\AppData\Local"}, WIN_TEMP + r"\a.log", True),
+            # 8.3 짧은 이름 TEMP + 긴 이름 경로 — LOCALAPPDATA\Temp 가 긴 이름 형태를 덮는다
+            ({"TEMP": r"D:\SHORTD~1\Temp", "LOCALAPPDATA": r"D:\ShortDirLong"}, r"D:\ShortDirLong\Temp\a.log", True),
+            ({"TEMP": r"C:\Temp"}, r"C:\Temp2\a.log", False),                           # 접두 함정
+            ({"TEMP": WIN_TEMP}, r"C:\Users\x\Documents\a.log", False),
+            ({}, WIN_TEMP + r"\a.log", False),                                          # 루트를 대는 env 없음
+        ]
+        for env, path, want in cases:
+            with self.subTest(env=env, path=path):
+                with self.as_windows(env):
+                    self.assertEqual(self.m._ephemeral(path), want)
+
+    @unittest.skipIf(os.name == "nt", "POSIX 규칙은 POSIX 호스트에서만 성립한다(Windows abspath 는 드라이브 문자가 붙는다)")
+    def test_posix_rule_unchanged(self):
+        self.assertTrue(self.m._ephemeral("/tmp/a.log", os_name="posix"))
+        self.assertTrue(self.m._ephemeral("/var/folders/x/a.log", os_name="posix"))
+        self.assertFalse(self.m._ephemeral(DURABLE, os_name="posix"))
+
+
+class SelftestRelaunch(unittest.TestCase):
+    """selftest 의 자기 재기동은 -I 와 함께 -B 를 단다 — -I 는 환경변수의 캐시 금지 봉인을 무시하므로 번들 python 이면
+    자식이 .pyc 를 번들 안에 쓸 수 있다. 재기동을 가로채 argv 를 본다(자식은 실제로 뜨지 않는다)."""
+
+    def test_relaunch_carries_dash_b(self):
+        m = load_tool()
+        seen = []
+
+        def fake_run(argv, *a, **k):
+            seen.append(list(argv))
+            return subprocess.CompletedProcess(argv, EXIT_USAGE, b"", b"")
+
+        with mock.patch("subprocess.run", fake_run), contextlib.redirect_stdout(io.StringIO()):
+            rc = m.cmd_selftest(None)
+        relaunch = [a for a in seen if a and a[0] == sys.executable]
+        self.assertGreaterEqual(len(relaunch), 2, seen)
+        for a in relaunch:
+            self.assertIn("-I", a)
+            self.assertIn("-B", a)
+        self.assertEqual(rc, EXIT_PAID)
 
 
 if __name__ == "__main__":

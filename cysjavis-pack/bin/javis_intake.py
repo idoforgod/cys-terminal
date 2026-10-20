@@ -46,6 +46,7 @@
 import argparse
 import hashlib
 import json
+import ntpath
 import os
 import re
 import sys
@@ -179,6 +180,11 @@ def _load(path):
 
 _EPHEMERAL_ROOTS = ("/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/folders/",
                     "/var/folders/")
+# ★Windows 임시 루트(2026-10-20 수리 · B-328 #8 제품 승격 리뷰). 위 목록은 POSIX 경로뿐이라 Windows 에서는
+#   %TEMP% 의 artifact 가 내구로 읽혀 **거짓 PAID** 가 났고 selftest ⒡' 가 6 을 냈다. 값은 env 에서 해소한다 —
+#   TMPDIR·TEMP·TMP 는 파이썬 tempfile 이 같은 순서로 보는 이름이고, LOCALAPPDATA\Temp 는 TEMP 가 8.3 짧은
+#   이름(RUNNER~1)일 때의 긴 이름 형태다. ⛔env 가 비었을 때 tempfile 이 쓰는 고정 폴백(c:\temp 등)은 담지 않았다.
+_WIN_TEMP_ENV = ("TMPDIR", "TEMP", "TMP")
 
 
 def _fp(path):
@@ -197,16 +203,37 @@ def _fp(path):
     return hashlib.sha256(b).hexdigest()[:16], len(b)
 
 
-def _ephemeral(path):
+def _ephemeral(path, os_name=None, env=None):
     """★임시 경로인가 — 지불이 ★사라질 수 있는 자리.
 
     2026-10-15 측정: CEO 자신이 전파문 사본을 스크래치패드 경로로 지불 증거에 걸었다. 내구 경로가
     함께 있어 살아남았지만, ★임시 경로**만**으로 지불된 항목은 그 디렉터리가 청소되면 조용히 다시
     열린다 — dept-1 이 실측한 「이동은 지불을 푼다」와 같은 기제이고 이쪽은 **아무도 옮기지 않아도**
     일어난다. ⇒ 임시 경로만인 지불은 **지불로 세지 않는다**(내구 1건이라도 있으면 지불이다).
+
+    ★Windows(os.name == "nt")는 `_win_temp_roots` 와 대소문자 무시로 대조한다 — POSIX 목록은 Windows 의
+    abspath(드라이브 문자가 붙는다)와 맞을 수 없어 그 OS 에서는 원래 죽은 검사였다. `os_name`·`env` 는
+    다른 OS 에서 Windows 판정을 재기 위한 주입구이고, 운영 호출은 둘 다 생략한다.
     """
+    if (os_name or os.name) == "nt":
+        pp = ntpath.normcase(ntpath.abspath(path)) + "\\"
+        return any(pp.startswith(r) for r in _win_temp_roots(os.environ if env is None else env))
     pp = os.path.abspath(path)
     return any(pp.startswith(r) for r in _EPHEMERAL_ROOTS)
+
+
+def _win_temp_roots(env):
+    """Windows 임시 루트 접두 — 값이 있는 TMPDIR·TEMP·TMP 와 LOCALAPPDATA\\Temp 를 정규화(소문자·역슬래시)하고
+    끝에 구분자 하나를 붙인다(`C:\\Temp` 가 `C:\\Temp2` 를 덮지 않게)."""
+    roots = [env.get(k) for k in _WIN_TEMP_ENV]
+    if env.get("LOCALAPPDATA"):
+        roots.append(ntpath.join(env["LOCALAPPDATA"], "Temp"))
+    out = []
+    for r in roots:
+        if r:
+            r = ntpath.normcase(ntpath.abspath(r))
+            out.append(r if r.endswith("\\") else r + "\\")
+    return out
 
 
 def _arts(it):
@@ -542,6 +569,12 @@ def cmd_selftest(_a):
         chk(st == "OPEN", "임시 경로만인 지불이 PAID 로 읽혔다(%s)" % why)
     finally:
         os.unlink(_tmp)
+    # ⒡'' ★Windows 임시 루트(2026-10-20 수리) — 주입한 env 로 어느 OS 에서나 잰다(대소문자·슬래시 무시)
+    _wenv = {"TEMP": r"C:\Users\x\AppData\Local\Temp"}
+    chk(_ephemeral("c:/users/X/appdata/local/temp/a.log", os_name="nt", env=_wenv),
+        "Windows %TEMP% 아래 artifact 가 임시 경로로 읽히지 않았다")
+    chk(not _ephemeral(r"C:\Users\x\Documents\a.log", os_name="nt", env=_wenv),
+        "Windows 내구 경로가 임시 경로로 읽혔다")
 
     # ⒢ 보류는 release_condition 없이 성립하지 않는다 (★C52 — 항목마다 블로커를 대라)
     st, _ = _item_state({"state": "defer", "defer_reason": "나" * MIN_REASON_CHARS, "release_condition": ""})
@@ -557,12 +590,14 @@ def cmd_selftest(_a):
     chk(any("미지불" in l for l in lines), "열린 항목의 id/본문이 출력되지 않았다")
     # ⒤' ★exit 코드 충돌 — 사용법 오류는 측정 코드와 섞이지 않는다(dept-5 발견)
     import subprocess
-    _r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "audit"],
+    # -B: -I 는 환경변수의 캐시 금지 봉인을 무시하므로, 번들 python 이면 이 자식이 .pyc 를 번들 안에 쓸 수 있다
+    #     (2026-10-20 수리 · 오너 규칙 — 번들 python 은 번들 안에 캐시를 쓰지 않는다).
+    _r = subprocess.run([sys.executable, "-I", "-B", os.path.abspath(__file__), "audit"],
                         capture_output=True)
     chk(_r.returncode == EXIT_USAGE,
         "audit --roots 누락이 %d 를 냈다 — USAGE(%d) 여야 하고 NO_DENOM(%d) 과 겹치면 안 된다"
         % (_r.returncode, EXIT_USAGE, EXIT_NO_DENOM))
-    _r2 = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "nosuchcmd"],
+    _r2 = subprocess.run([sys.executable, "-I", "-B", os.path.abspath(__file__), "nosuchcmd"],
                          capture_output=True)
     chk(_r2.returncode == EXIT_USAGE, "미지 서브커맨드가 USAGE 가 아니다(rc=%d)" % _r2.returncode)
 
@@ -572,7 +607,7 @@ def cmd_selftest(_a):
         for f in fails:
             print("SELFTEST FAIL  " + f, file=sys.stderr)
         return EXIT_SELFTEST
-    print("SELFTEST OK  11군 · 지불 검사기 · 분모 부재는 통과가 아니다 · 체크박스는 닫지 못한다")
+    print("SELFTEST OK  12군 · 지불 검사기 · 분모 부재는 통과가 아니다 · 체크박스는 닫지 못한다")
     return EXIT_PAID
 
 
