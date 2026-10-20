@@ -352,11 +352,25 @@ class T03CheckUnchanged(unittest.TestCase):
     def tearDownClass(cls):
         cls.h.close()
 
-    def _cmp_json(self, ref_runner, ref_gate):
+    def _cmp_json(self, ref_runner, ref_gate, ref_lacks_bg_procs=False):
         for name in CHECK_FIXTURES:
             args = ["check", "--json"] + fixture_args(name)
             r_rc, r_out, _e, _ = ref_runner(ref_gate, args)
             n_rc, n_out, n_err, _ = self.h.run(GATE, args)
+            if ref_lacks_bg_procs:
+                # PIN for measured.bg_procs (report-only, not a gate input; the tag predates it): PRESENT
+                # exactly once and NULL (NoneType). Null because every fixture here overrides servers AND
+                # nodes, so measure() reads no ps lines (need_ps False -> lines None -> bg_procs None).
+                # Only that one line is dropped; every other byte stays compared to the tag.
+                # ALLOWED to change this pin: a change to the bg-class count itself (measure()'s bg_procs
+                # line, BG_CLASS_PATTERNS, _count_bg_class) or a fixture that stops overriding servers or
+                # nodes (bg_procs then becomes an int) - that commit updates this pin. Moving TAG_REF to a
+                # revision that already reports bg_procs turns this red until the drop is removed.
+                bg_line = b'\n  "bg_procs": null,'
+                self.assertEqual(n_out.count(b'"bg_procs"'), 1, "%s: bg_procs not present exactly once" % name)
+                self.assertEqual(n_out.count(bg_line), 1, "%s: measured.bg_procs is not null" % name)
+                self.assertIsNone(json.loads(n_out)["measured"]["bg_procs"], name)
+                n_out = n_out.replace(bg_line, b"", 1)
             self.assertEqual(n_out, r_out, "%s: check --json bytes differ" % name)
             self.assertEqual(n_rc, r_rc, "%s: exit code differs" % name)
             self.assertNotIn(b"product", n_out, "%s: product block leaked into check --json" % name)
@@ -375,7 +389,8 @@ class T03CheckUnchanged(unittest.TestCase):
 
     def test_3a_check_json_vs_tag_file(self):
         need_tag(self, self.tag_gate)
-        self._cmp_json(self.h.run, self.tag_gate)
+        # measured.bg_procs: pinned present, null, NoneType (declared in _cmp_json); all other bytes vs the tag
+        self._cmp_json(self.h.run, self.tag_gate, ref_lacks_bg_procs=True)
 
     def test_3b_text_check_vs_tag_file(self):
         need_tag(self, self.tag_gate)

@@ -702,7 +702,9 @@ class TestD11NodeAndServerAxes(unittest.TestCase):
                                  "classify"], input="\n".join(D11_F2_LINES + self._server_lines()),
                                 text=True, capture_output=True, env=env, timeout=15)
         self.assertEqual(cp.returncode, 0, cp.stderr)
-        self.assertEqual(json.loads(cp.stdout), {"servers": 1, "nodes": 10},
+        # bg_procs is fixture-derived: cmd_classify counts only the stdin lines against the module's
+        # BG_CLASS_PATTERNS (no ps, no env, no file), and none of these fixture lines is a bg-class process.
+        self.assertEqual(json.loads(cp.stdout), {"servers": 1, "nodes": 10, "bg_procs": 0},
                          "D11: classify 소비 경로도 앱 번들을 제외해야 한다")
 
     def test_D11_measure_uses_new_nodes(self):
