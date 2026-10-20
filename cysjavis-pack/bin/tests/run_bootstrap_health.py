@@ -69,7 +69,11 @@
 stdlib만 사용. 네트워크 0. 어떤 검체도 사용자 HOME·실 데몬을 건드리지 않는다(전부 격리 tmp).
 """
 import argparse
+import base64
+import codecs
+import hashlib
 import json
+import locale
 import math
 import os
 import re
@@ -185,6 +189,10 @@ _READ_OBSERVED = {}
 LANDED_WAVES = ("W0", "W1a", "W1b", "W2", "W3", "W4", "W5", "W6")
 
 _REG = []          # [(id, wave, title, defects, fn|None)]
+
+# B-344 R4: evidence a specimen stores for its own row (sid -> dict). main() pops it into row["evidence"] after the
+# specimen returns or raises, so a capture stored before a later exception still reaches the row.
+_SPECIMEN_EVIDENCE = {}
 
 
 def specimen(sid, wave, title, defects):
@@ -4210,17 +4218,1317 @@ def h_win_11():
                    "(windows-latest·python 셋업·러너 H-WIN+H-CONC-1/3+H-DETECT-10 실기·무조건 실행)"
                    % (rel, sys.platform))
     # ── 실기(Windows 러너) ──
+    # B-344 (DESIGN-v4 s4): the child writes to files under one finite deadline (wait, kill, capture); only a child
+    # that really measured green passes, and its bounded capture is stored for this row right after it is taken,
+    # before parsing (R4), so the row carries it on PASS, FAIL and crash alike.
     ids = ["H-WIN-%d" % i for i in range(1, 11)] + ["H-CONC-1", "H-CONC-3", "H-DETECT-10"]
-    r = _run([PY, os.path.abspath(__file__), "--json", "--only", ",".join(ids)], timeout=900)
+    ok, msg = _hw11_judge([PY, os.path.abspath(__file__), "--json", "--only", ",".join(ids)], ids, _HWin11Cfg(),
+                          lambda ev: _SPECIMEN_EVIDENCE.__setitem__("H-WIN-11", ev))
+    need(ok, msg)
+    return msg
+
+
+# ── H-WIN-11 child capture and verdict (B-344 DESIGN-v4 s4) ──────────────────────────────────────────────────────
+# Ported from the design model tools/v4/model_hwin11_v4.py. Bounds accepted by the dept head (DESIGN-v4 s15): head 8 KiB
+# and tail 56 KiB per stream, RAW_MAX 64 MiB, parse 4 MiB, reason 2 KiB, code-page views 32 KiB each, EVIDENCE_MAX
+# 3 MiB, cleanup 60 s = taskkill 15 s + post-kill wait 30 s, settle 0.5 s.
+_HW11_HEAD = 8 * 1024
+_HW11_TAIL = 56 * 1024
+_HW11_BUDGET = {                      # UTF-8 bytes of the field's text (the inline cut marker adds <= 120 B)
+    "alt": 32 * 1024,                 # each code-page legibility view (the lossless view is the primary text)
+    "reason": 2048,                   # each lifted child failing reason
+    "id": 128,                        # each child id / unknown id
+    "verdict": 64,                    # summary.verdict when it is not one of the three verdicts
+    "error": 512,                     # an OSError / exception text
+    "message": 1024,                  # each DENY cause message
+    "section": 512,                   # each category's section of the row reason (no category can push out another)
+}
+_HW11_IDS_SHOWN = 10                  # ids named in one cause message (the rest are counted)
+_HW11_FAIL_ROWS_MAX = 20              # failing child rows recorded (the rest are counted)
+_HW11_UNKNOWN_MAX = 50                # unknown ids recorded (the rest are counted)
+_HW11_CAUSES_MAX = 12                 # DENY causes recorded (the rest are counted)
+_HW11_RAW_MAX = 64 * 1024 * 1024      # per stream on disk; above it the child tree is killed (overflow DENY)
+_HW11_PARSE_MAX = 4 * 1024 * 1024     # stdout bytes handed to json.loads; above it no parse (DENY)
+_HW11_EVIDENCE_MAX = 3 * 1024 * 1024  # serialized evidence.child hard cap (computed worst case 2,295,224 B, s4.3)
+_HW11_VERDICTS = ("GREEN", "RED", "UNMEASURED")
+_HW11_STATUSES = ("pass", "fail", "skip", "disabled", "pending")   # also the summary counts main() writes
+_HW11_KINDS = {"fail": "PRODUCT", "crash": "HARNESS", "unimplemented": "HARNESS"}   # main() fail_kind -> category
+_HW11_TAG = {"PRODUCT": "[PRODUCT 제품 결함]", "HARNESS": "[HARNESS 계측 결함 · 무측정]"}
+_HW11_SCHEMA = "hwin11-child/3"
+
+
+def _hw11_codecs():
+    """Code pages for the legibility views of a stream that is not valid UTF-8 (s4.3 item 3): on Windows
+    cp<GetOEMCP()>, then locale.getencoding() - de-duplicated, UTF-8 skipped."""
+    names = []
+    if os.name == "nt":
+        try:
+            import ctypes
+            names.append("cp%d" % ctypes.windll.kernel32.GetOEMCP())
+        except Exception:         # noqa: BLE001 - a missing view never blocks the capture
+            pass
     try:
-        d = json.loads(r.stdout)
-    except ValueError:
-        raise Fail("실기 재실행 결과 파싱 실패: %s" % (r.stdout[-400:] + r.stderr[-400:]))
-    s = d["summary"]
-    bad = [x["id"] for x in d["specimens"] if x["status"] == "fail"]
-    need(not bad, "Windows 실기 실패 검체: %s" % bad)
-    need(s["pass"] > 0, "Windows 실기 PASS 0건 — 전부 skip 이면 실기 목적이 무력화된다")
-    return "실기 %d PASS / %d SKIP (Windows 러너) · 잡 계약 충족" % (s["pass"], s["skip"])
+        names.append(locale.getencoding())       # 3.11+: the ANSI code page, also under PYTHONUTF8=1
+    except AttributeError:
+        names.append(locale.getpreferredencoding(False))
+    out, seen = [], set()
+    for name in names:
+        try:
+            canon = codecs.lookup(name).name
+        except (LookupError, TypeError):
+            continue
+        if canon != "utf-8" and canon not in seen:
+            seen.add(canon)
+            out.append(name)
+    return tuple(out)
+
+
+class _HWin11Cfg(object):
+    """Limits of H-WIN-11's child phase (s4.2). The class attributes are the production values; a test changes them
+    on the class and every result records the values used (evidence.child.cfg)."""
+    child_timeout = 900.0             # unchanged from the pinned call
+    poll = 1.0                        # wait-loop tick: overflow check interval
+    clean_budget = 60.0               # kill + post-kill wait + capture after a timeout or an overflow
+    kill_timeout = 15.0               # taskkill itself
+    postkill_wait = 30.0              # wait for the child after the kill
+    capture_budget = 60.0             # capture after a normal exit
+    settle = 0.5                      # re-stat interval that detects a writer outliving the child
+    raw_max = _HW11_RAW_MAX
+    is_windows = None                 # None -> os.name == "nt" when constructed
+    kill_cmd = None                   # None -> ["taskkill", "/PID", pid, "/T", "/F"]
+    codecs = None                     # None -> _hw11_codecs() when constructed
+
+    def __init__(self):
+        if self.is_windows is None:
+            self.is_windows = os.name == "nt"
+        if self.codecs is None:
+            self.codecs = _hw11_codecs()
+
+    def as_dict(self):
+        return {k: getattr(self, k) for k in ("child_timeout", "poll", "clean_budget", "kill_timeout",
+                                              "postkill_wait", "capture_budget", "settle", "raw_max",
+                                              "is_windows")}
+
+
+def _hw11_clean(s):
+    """Any str from the child -> a str that always encodes as UTF-8 (lone surrogates become \\udXXX text)."""
+    return s.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _hw11_fit(text, budget_key, field, trunc):
+    """Cut on a character boundary so the UTF-8 form is <= _HW11_BUDGET[budget_key]; record what was dropped (CEO j)."""
+    text = _hw11_clean(text)
+    b = text.encode("utf-8")
+    cap = _HW11_BUDGET[budget_key]
+    if len(b) <= cap:
+        return text
+    kept = b[:cap].decode("utf-8", "ignore")              # b is valid UTF-8: only a split trailing char is dropped
+    k = len(kept.encode("utf-8"))
+    trunc.append({"field": field, "unit": "utf-8 bytes of this field", "total_bytes": len(b), "kept_bytes": k,
+                  "dropped_bytes": len(b) - k, "dropped_range": [k, len(b)]})
+    return kept + " [… %d bytes dropped: bytes %d..%d of %s …]" % (len(b) - k, k, len(b), field)
+
+
+def _hw11_norm(t):
+    return t.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _hw11_render(raw, field, cfg, trunc):
+    try:
+        raw.decode("utf-8")
+        valid = True
+    except UnicodeDecodeError:
+        valid = False
+    out = {"utf8_valid": valid, "crlf": raw.count(b"\r\n"), "lone_cr": raw.count(b"\r") - raw.count(b"\r\n"),
+           # lossless primary view: an invalid byte becomes \xNN (<= 4 chars and 4 UTF-8 bytes per input byte)
+           "text": _hw11_norm(raw.decode("utf-8", "backslashreplace"))}
+    if not valid:
+        alt = {}
+        for codec in cfg.codecs[:2]:
+            try:
+                t = raw.decode(codec, "replace")          # legibility view: <= 1 char per input byte
+            except LookupError:
+                continue
+            alt[codec] = _hw11_fit(_hw11_norm(t), "alt", "%s.alt.%s" % (field, codec), trunc)
+        out["alt"] = alt
+    return out
+
+
+def _hw11_capture(path, name, deadline, cfg, trunc, want_body=False):
+    """Read a FIXED snapshot [0, S) of a capture file: head, tail, sha256 and (stdout only) the parse body.
+    Nothing past S is read, hashed or rendered, so a writer that outlives the child cannot extend the read (s4.3)."""
+    rec = {"name": name}
+    body = None
+    try:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            whole = size <= _HW11_HEAD + _HW11_TAIL
+            head = f.read(size if whole else _HW11_HEAD)
+            tail = b""
+            if not whole:
+                f.seek(size - _HW11_TAIL)
+                tail = f.read(_HW11_TAIL)
+            if want_body and size <= _HW11_PARSE_MAX:
+                f.seek(0)
+                body = f.read(size)
+            h = hashlib.sha256()
+            f.seek(0)
+            left, complete = size, True
+            while left > 0:
+                if time.monotonic() > deadline:
+                    complete = False
+                    break
+                chunk = f.read(min(1 << 20, left))
+                if not chunk:                              # the file shrank under us
+                    complete = False
+                    break
+                h.update(chunk)
+                left -= len(chunk)
+            s1 = os.fstat(f.fileno()).st_size
+            time.sleep(max(0.0, min(cfg.settle, deadline - time.monotonic())))
+            s2 = os.fstat(f.fileno()).st_size
+    except OSError as e:
+        rec.update({"error": _hw11_fit("%s: %s" % (type(e).__name__, e), "error", name + ".error", trunc),
+                    "hash_complete": False, "stable": False})
+        return rec, None
+    rec.update({"bytes": size, "sha256": h.hexdigest() if complete else None, "hash_complete": complete,
+                "hashed_bytes": size - left, "size_after": s2, "stable": s1 == size and s2 == size,
+                "truncated": not whole})
+    if not whole:
+        dropped = size - _HW11_HEAD - _HW11_TAIL
+        rec["dropped_bytes"] = dropped
+        rec["dropped_range"] = [_HW11_HEAD, size - _HW11_TAIL]
+        rec["marker"] = ("[… %d bytes dropped: %s bytes %d..%d (kept 0..%d and %d..%d) …]"
+                         % (dropped, name, _HW11_HEAD, size - _HW11_TAIL, _HW11_HEAD, size - _HW11_TAIL, size))
+        trunc.append({"field": name, "unit": "child stream bytes", "total_bytes": size,
+                      "kept_bytes": _HW11_HEAD + _HW11_TAIL, "dropped_bytes": dropped,
+                      "dropped_range": [_HW11_HEAD, size - _HW11_TAIL]})
+    rec["head"] = _hw11_render(head, name + ".head", cfg, trunc)
+    if not whole:
+        rec["tail"] = _hw11_render(tail, name + ".tail", cfg, trunc)
+    return rec, body
+
+
+def _hw11_kill_tree(p, cfg, ev, remaining):
+    if cfg.is_windows or cfg.kill_cmd is not None:
+        cmd = cfg.kill_cmd or ["taskkill", "/PID", str(p.pid), "/T", "/F"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=max(0.1, min(cfg.kill_timeout, remaining())))
+            ev["kill"] = {"method": "tree", "rc": r.returncode, "timed_out": False}
+        except subprocess.TimeoutExpired:
+            ev["kill"] = {"method": "tree", "rc": None, "timed_out": True}
+        except OSError as e:
+            ev["kill"] = {"method": "tree", "rc": None, "timed_out": False, "error": "%s: %s" % (type(e).__name__, e)}
+        if ev["kill"]["rc"] != 0:                          # taskkill failed or timed out: TerminateProcess the child
+            try:
+                p.kill()
+                ev["kill"]["fallback"] = "process"
+            except OSError as e:
+                ev["kill"]["fallback_error"] = "%s: %s" % (type(e).__name__, e)
+    else:
+        p.kill()
+        ev["kill"] = {"method": "process", "rc": None, "timed_out": False}
+
+
+def _hw11_tempdir():
+    """Capture directory whose cleanup never raises (s4.1: Windows cannot delete a file a grandchild still holds).
+    ignore_cleanup_errors exists from Python 3.10 (CI runs 3.12); older Pythons get the plain form."""
+    try:
+        return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    except TypeError:
+        return tempfile.TemporaryDirectory()
+
+
+def _hw11_run_child(cmd, cfg, trunc):
+    """Run the child on files (stdin closed) with one finite deadline for wait, kill and capture (s4.1, s4.2)."""
+    ev = {"argv": cmd, "rc": None, "timed_out": False, "overflow": False, "kill_failed": False,
+          "spawn_error": None, "cfg": cfg.as_dict()}
+    t0 = time.monotonic()
+    raw_out = None
+    with _hw11_tempdir() as d:
+        po, pe = os.path.join(d, "out"), os.path.join(d, "err")
+        with open(po, "wb") as fo, open(pe, "wb") as fe:
+            try:
+                p = subprocess.Popen(cmd, stdout=fo, stderr=fe, stdin=subprocess.DEVNULL)
+            except OSError as e:
+                ev["spawn_error"] = _hw11_fit("%s: %s" % (type(e).__name__, e), "error", "spawn_error", trunc)
+                p = None
+            if p is not None:
+                end = t0 + cfg.child_timeout
+                while True:
+                    try:
+                        ev["rc"] = p.wait(timeout=max(0.0, min(cfg.poll, end - time.monotonic())))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if max(os.fstat(fo.fileno()).st_size, os.fstat(fe.fileno()).st_size) > cfg.raw_max:
+                            ev["overflow"] = True
+                        elif time.monotonic() < end:
+                            continue
+                        else:
+                            ev["timed_out"] = True
+                        clean_end = time.monotonic() + cfg.clean_budget
+
+                        def remaining():
+                            return max(0.0, clean_end - time.monotonic())
+                        _hw11_kill_tree(p, cfg, ev, remaining)
+                        try:
+                            ev["rc"] = p.wait(timeout=max(0.0, min(cfg.postkill_wait, remaining())))
+                        except subprocess.TimeoutExpired:      # never let it escape: kill_failed is a HARNESS red
+                            ev["kill_failed"] = True
+                        break
+        cap_end = (clean_end if (ev["timed_out"] or ev["overflow"]) else time.monotonic() + cfg.capture_budget) \
+            if p is not None else time.monotonic() + cfg.capture_budget
+        ev["stdout"], raw_out = _hw11_capture(po, "stdout", cap_end, cfg, trunc, want_body=True)
+        ev["stderr"], _ = _hw11_capture(pe, "stderr", cap_end, cfg, trunc)
+    ev["elapsed_s"] = round(time.monotonic() - t0, 3)
+    return ev, raw_out
+
+
+def _hw11_kind_category(row):
+    k = row.get("fail_kind")
+    return _HW11_KINDS.get(k) if isinstance(k, str) else None   # a non-string kind (list, dict, null) is no kind
+
+
+def _hw11_short(text, n, where):
+    """Display cut for a summary string; says how much was cut and where the bounded copy is (CEO j)."""
+    text = _hw11_clean(text)
+    if len(text) <= n:
+        return text
+    return text[:n] + "…(+%d자 · 전문: %s)" % (len(text) - n, where)
+
+
+def _hw11_ids_shown(ids):
+    """A bounded id list for a message: the first _HW11_IDS_SHOWN ids, then how many more (CEO j)."""
+    shown = [_hw11_fit(str(i), "id", "msg.id", []) for i in ids[:_HW11_IDS_SHOWN]]
+    return "%s%s" % (shown, (" 외 %d건" % (len(ids) - _HW11_IDS_SHOWN)) if len(ids) > _HW11_IDS_SHOWN else "")
+
+
+def _hw11_is_count(v):
+    return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+def _hw11_check_report(doc, requested, trunc):
+    """Schema and consistency of the child report (s4.4 items 4-5). Returns (problems, fails, summary_record).
+    The counts come from the rows, never from the summary: every stated count must equal its derived count."""
+    problems = []
+    if not isinstance(doc, dict):
+        return ["report is %s, not an object" % type(doc).__name__], [], {}
+    s = doc.get("summary")
+    specs = doc.get("specimens")
+    rec = {}
+    if not isinstance(s, dict):
+        problems.append("summary missing or not an object")
+        s = {}
+    v = s.get("verdict")
+    if isinstance(v, str) and v in _HW11_VERDICTS:
+        rec["verdict"] = v
+    else:
+        rec["verdict"] = (_hw11_fit(v, "verdict", "summary.verdict", trunc) if isinstance(v, str)
+                          else repr(type(v).__name__))
+        problems.append("summary.verdict is not one of %s" % "/".join(_HW11_VERDICTS))
+    for k in _HW11_STATUSES:
+        if _hw11_is_count(s.get(k)):
+            rec[k] = s[k]
+        else:
+            rec[k] = None
+            problems.append("summary.%s missing or not a non-negative int (%s)" % (k, type(s.get(k)).__name__))
+    u = s.get("unknown_ids", "<missing>")
+    if not isinstance(u, list) or not all(isinstance(x, str) for x in u):
+        rec["unknown_ids"] = None
+        problems.append("summary.unknown_ids missing, null or not a list of strings (%s)"
+                        % ("missing" if u == "<missing>" else type(u).__name__))
+    else:
+        rec["unknown_ids"] = [_hw11_fit(x, "id", "summary.unknown_ids[%d]" % i, trunc)
+                              for i, x in enumerate(u[:_HW11_UNKNOWN_MAX])]
+        rec["unknown_ids_total"] = len(u)
+        rec["unknown_ids_omitted"] = max(0, len(u) - _HW11_UNKNOWN_MAX)
+    fails = []
+    if not isinstance(specs, list) or not all(isinstance(x, dict) for x in specs):
+        problems.append("specimens missing or not a list of objects")
+        specs = []
+    seen = {}
+    derived = dict((k, 0) for k in _HW11_STATUSES)
+    uncounted = 0
+    kind_on_nonfail = 0
+    for x in specs:
+        i, st = x.get("id"), x.get("status")
+        if not isinstance(i, str) or st not in _HW11_STATUSES:
+            problems.append("a specimen row has no string id or an unknown status")
+            continue
+        seen[i] = seen.get(i, 0) + 1
+        c = x.get("counted", True)                         # main() marks a not-effective row counted=False
+        if not isinstance(c, bool):
+            problems.append("row %s: counted is %s, not a bool" % (_hw11_fit(i, "id", "msg.id", []), type(c).__name__))
+        elif c:
+            derived[st] += 1
+        else:
+            uncounted += 1
+        if "fail_kind" in x and st != "fail":              # only a fail row may carry fail_kind
+            kind_on_nonfail += 1
+        if st == "fail":
+            fails.append(x)
+    if kind_on_nonfail:
+        problems.append("%d non-fail rows carry fail_kind (only a fail row may)" % kind_on_nonfail)
+    missing = [i for i in requested if seen.get(i, 0) == 0]
+    dup = [i for i in requested if seen.get(i, 0) > 1]
+    extra = [i for i in seen if i not in requested]
+    if missing or dup or extra:
+        problems.append("rows vs requested ids: missing %d %s · duplicated %d · unrequested %d"
+                        % (len(missing), missing[:5], len(dup), len(extra)))
+    for k in _HW11_STATUSES:
+        if rec.get(k) is not None and rec[k] != derived[k]:
+            problems.append("summary.%s=%s but %d counted %s rows (a stale or carried count is not a measurement)"
+                            % (k, rec[k], derived[k], k))
+    rec["derived"] = dict(derived, uncounted=uncounted)
+    rec["rows_total"] = len(specs)
+    return problems, fails, rec
+
+
+class _HW11DuplicateKey(ValueError):
+    pass
+
+
+def _hw11_pairs(pairs):
+    """object_pairs_hook: a JSON object with a repeated key is refused, never resolved to its last value (s4.4 item 3)."""
+    seen = set()
+    for k, _ in pairs:
+        if k in seen:
+            raise _HW11DuplicateKey("duplicate key %r" % k[:40])
+        seen.add(k)
+    return dict(pairs)
+
+
+def _hw11_judge(cmd, requested, cfg, store):
+    """Run H-WIN-11's child and judge it (s4.2-s4.6). `store` receives {"child": evidence} right after the capture,
+    before parsing (R4), and again if the evidence has to be replaced. Returns (passed, row text)."""
+    trunc = []
+    ev, raw_out = _hw11_run_child(cmd, cfg, trunc)
+    store({"child": ev})
+    return _hw11_decide(ev, raw_out, requested, cfg, trunc, store)
+
+
+def _hw11_decide(ev, raw_out, requested, cfg, trunc, store):
+    """The DENY rule of s4.4: the pass is a positive conjunction (`proof`); a report in which no cause was found but
+    `proof` is not shown is still red (H14). Every cause carries one category (s4.5); the row text keeps one section
+    per category (s4.6). Mutates `ev` into the stored evidence."""
+    causes = []                                     # {category, code, message}
+
+    def cause(cat, code, msg):
+        causes.append({"category": cat, "code": code,
+                       "message": _hw11_fit(msg, "message", "causes[%d].message" % len(causes), trunc)})
+
+    finished = ev["spawn_error"] is None and not ev["timed_out"] and not ev["overflow"] and not ev["kill_failed"]
+    if ev["spawn_error"] is not None:
+        cause("HARNESS", "H1-spawn", "자식 실행 실패: %s" % ev["spawn_error"])
+    if ev["timed_out"]:
+        cause("HARNESS", "H2-timeout", "실기 재실행 시간 초과(%ss) · kill=%s — 자식 출력은 evidence.child"
+              % (cfg.child_timeout, ev.get("kill")))
+    if ev["overflow"]:
+        cause("HARNESS", "H6-overflow", "자식 출력이 %d B 를 넘어 트리를 종료했다 · kill=%s" % (cfg.raw_max, ev.get("kill")))
+    if ev["kill_failed"]:
+        cause("HARNESS", "H3-kill-failed", "종료 뒤 %ss 안에 자식이 끝나지 않았다(kill_failed) — 더 기다리지 않는다"
+              % cfg.postkill_wait)
+    for sname in ("stdout", "stderr"):
+        r = ev.get(sname, {})
+        if r.get("error") or not r.get("hash_complete", False):
+            cause("HARNESS", "H4-capture-incomplete", "%s 캡처 미완(%s · hashed %s/%s B)"
+                  % (sname, r.get("error") or "deadline", r.get("hashed_bytes"), r.get("bytes")))
+        elif not r.get("stable"):
+            cause("HARNESS", "H5-capture-unstable", "%s 가 스냅숏(%s B) 뒤에도 자랐다(%s B) — 자식이 끝난 뒤에도 쓰는 "
+                  "프로세스가 있다" % (sname, r.get("bytes"), r.get("size_after")))
+    fails, srec = [], {}
+    proof = False                                   # set True only where every pass condition is shown
+    if finished:
+        sz = ev["stdout"].get("bytes")
+        if raw_out is None:
+            cause("HARNESS", "H7-parse-bound", "자식 보고(stdout %s B)가 파싱 상한 %d B 를 넘는다" % (sz, _HW11_PARSE_MAX))
+        else:
+            try:
+                doc = json.loads(raw_out.decode("utf-8", "replace"),       # PARSE decode = the pinned decoding
+                                 object_pairs_hook=_hw11_pairs)                # no last-value-wins (R3-c)
+            except _HW11DuplicateKey as e:
+                doc = None
+                cause("HARNESS", "H9-schema", "자식 보고 형식 결함: %s — 같은 키가 두 번 있으면 어느 값이 측정인지 정할 수 "
+                      "없다" % e)
+            except ValueError as e:
+                doc = None
+                cause("HARNESS", "H8-unparsable", "자식 보고 파싱 실패(rc=%s · %s) — 자식 출력은 evidence.child"
+                      % (ev["rc"], type(e).__name__))
+            if doc is not None:
+                problems, fails, srec = _hw11_check_report(doc, requested, trunc)
+                for pr in problems:
+                    cause("HARNESS", "H9-schema", "자식 보고 형식 결함: " + pr)
+                prod = [x for x in fails if _hw11_kind_category(x) == "PRODUCT"]
+                harn = [x for x in fails if _hw11_kind_category(x) != "PRODUCT"]
+                if prod:
+                    msg = "Windows 실기 실패 검체: %s" % _hw11_ids_shown([x["id"] for x in prod])
+                    msg += " · " + " · ".join(
+                        "%s: %s" % (x["id"], _hw11_short(str(x.get("reason") or x.get("detail") or ""), 300,
+                                                         "evidence.child.failing[%d].reason" % fails.index(x)))
+                        for x in prod[:3])
+                    cause("PRODUCT", "P1-specimen-fail", msg)
+                if harn:
+                    cause("HARNESS", "H11-child-crash", "자식 검체 측정 실패(fail_kind=%s): %s"
+                          % (sorted(set(str(x.get("fail_kind")) for x in harn))[:5],
+                             _hw11_ids_shown([x["id"] for x in harn])))
+                if not fails and srec.get("verdict") in ("RED", "UNMEASURED"):
+                    cause("HARNESS", "H10-not-green", "실패 행 없이 verdict=%s" % srec["verdict"])
+                if srec.get("unknown_ids"):
+                    cause("HARNESS", "H10-unknown-ids", "알 수 없는 id %d 건: %s"
+                          % (srec["unknown_ids_total"], srec["unknown_ids"][:5]))
+                dv = srec.get("derived") or {}
+                if dv.get("disabled"):                     # main() itself never calls a run with a disabled row GREEN
+                    cause("HARNESS", "H10-disabled", "사람이 끈 미측정 행 %d 건(행에서 센 값) — 통과가 아니다" % dv["disabled"])
+                rc = ev["rc"]
+                rc_int = type(rc) is int                    # an int: not a bool, not text, not None
+                if not rc_int:
+                    cause("HARNESS", "H12-rc", "자식 rc=%s 가 정수가 아니다(%s) — 판정 불가"
+                          % (_hw11_short(repr(rc), 40, "evidence.child.rc"), type(rc).__name__))
+                elif rc != 0 and not fails:
+                    cause("HARNESS", "H12-rc", "자식 rc=%s 인데 실패 행이 없다 — 무측정은 통과가 아니다" % rc)
+                elif rc == 0 and fails:
+                    cause("HARNESS", "H12-rc", "실패 행 %d 건인데 자식 rc=0 — 보고가 자기모순이다" % len(fails))
+                if dv.get("pass", 0) == 0:                 # counted from THIS child's rows, not from its summary
+                    cause("HARNESS", "H13-pass0", "Windows 실기 PASS 0건(행에서 센 값 · 실제로 돈 행 %d 건) — 전부 skip "
+                          "이면 실기 목적이 무력화된다" % (dv.get("pass", 0) + dv.get("fail", 0)))
+                proof = (not problems and rc_int and rc == 0 and srec.get("verdict") == "GREEN" and not fails
+                         and srec.get("unknown_ids") == [] and dv.get("pass", 0) > 0
+                         and dv.get("pass", 0) + dv.get("fail", 0) > 0 and dv.get("disabled", 1) == 0
+                         and all(ev[n].get("hash_complete") is True and ev[n].get("stable") is True
+                                 for n in ("stdout", "stderr")))
+    if not causes and not proof:                    # no cause found is not a proof of every condition
+        cause("HARNESS", "H14-no-proof", "통과 조건 전부를 증명하지 못했다(finished=%s · rc=%s) — 원인 미분류는 통과가 "
+              "아니다" % (finished, _hw11_short(repr(ev.get("rc")), 40, "evidence.child.rc")))
+    ev["summary"] = srec
+    ev["failing"] = [{"id": _hw11_fit(str(x.get("id")), "id", "failing[%d].id" % n, trunc),
+                      "fail_kind": _hw11_fit(str(x.get("fail_kind")), "id", "failing[%d].fail_kind" % n, trunc),
+                      "reason": _hw11_fit(str(x.get("reason") or x.get("detail") or ""), "reason",
+                                          "failing[%d].reason" % n, trunc)}
+                     for n, x in enumerate(fails[:_HW11_FAIL_ROWS_MAX])]
+    ev["failing_total"] = len(fails)
+    ev["failing_omitted"] = max(0, len(fails) - _HW11_FAIL_ROWS_MAX)
+    ev["causes_total"] = len(causes)
+    ev["causes"] = causes[:_HW11_CAUSES_MAX]
+    ev["categories"] = sorted(set(c["category"] for c in causes))
+    ok = not causes and proof
+    if ok:
+        msg = "실기 %d PASS / %d SKIP (Windows 러너) · 잡 계약 충족" % (srec["derived"]["pass"], srec["derived"]["skip"])
+    else:
+        msg = " ‖ ".join(_hw11_fit("%s %s" % (_HW11_TAG[cat], " · ".join(c["message"] for c in causes
+                                                                         if c["category"] == cat)),
+                                   "section", "row.reason.%s" % cat, trunc)
+                         for cat in ("PRODUCT", "HARNESS") if cat in ev["categories"])
+    ev["truncations"] = trunc
+    ev["schema"] = _HW11_SCHEMA
+    blob = json.dumps(ev, ensure_ascii=False).encode("utf-8")
+    if len(blob) > _HW11_EVIDENCE_MAX:              # cannot happen by the s4.3 arithmetic; fail closed if it does
+        store({"child": {"schema": _HW11_SCHEMA, "over_budget_bytes": len(blob), "causes": causes[:_HW11_CAUSES_MAX],
+                         "categories": sorted(set(["HARNESS"] + ev["categories"]))}})
+        ok = False
+        msg = _HW11_TAG["HARNESS"] + " evidence.child 가 상한 %d B 를 넘었다(%d B) — 계측기 결함" % (_HW11_EVIDENCE_MAX,
+                                                                                         len(blob))
+    return ok, msg
+
+
+# ── B-344 T1: H-WIN-11's Windows branch, simulated on any OS through the REAL main() (DESIGN-v4 s8) ───────────────
+# The design's 52 cases (tools/v4/fake_child_v4.py) and checks (tools/v4/acceptance_v4.py, acceptance_reader_v4.py),
+# ported. Each case runs a driver in its own process: it imports this file, makes the module's `os.name` read "nt"
+# (every other attribute is the real os), points `__file__` - the path H-WIN-11 hands its child - at a fake child, sets
+# the injected limits on _HWin11Cfg, and calls main(["--json", "--only", "H-WIN-11"]). The fake child takes its case
+# from constants written above its body (never from the environment).
+_HW11_FAKE_CHILD = r'''
+import json
+import os
+import subprocess
+import sys
+import time
+
+out, err = sys.stdout.buffer, sys.stderr.buffer
+with open(PIDFILE, "w") as f:
+    f.write(str(os.getpid()))
+
+KO_CP949 = "한글 cp949 진단".encode("cp949")          # NOT valid UTF-8
+TOOL_LINE = "SessionStart 에 cys 훅 미등록".encode("utf-8")
+IDS = ["H-WIN-%d" % i for i in range(1, 11)] + ["H-CONC-1", "H-CONC-3", "H-DETECT-10"]
+
+
+def summary(verdict, p, f, s=0, unknown=(), **extra):
+    d = {"verdict": verdict, "pass": p, "fail": f, "skip": s, "disabled": 0, "pending": 0,
+         "total": p + f + s, "unknown_ids": list(unknown), "off_switches_engaged": []}
+    d.update(extra)
+    return d
+
+
+def rows(fails=None, ids=IDS):
+    fails = fails or {}
+    r = []
+    for i in ids:
+        if i in fails:
+            reason, kind = fails[i]
+            r.append({"id": i, "status": "fail", "reason": reason, "fail_kind": kind})
+        else:
+            r.append({"id": i, "status": "pass", "detail": "ok"})
+    return r
+
+
+def emit(doc, rc):
+    out.write(json.dumps(doc, ensure_ascii=False).encode("utf-8"))
+    out.flush()
+    sys.exit(rc)
+
+
+GREEN = {"summary": summary("GREEN", 13, 0), "specimens": rows()}
+case = CASE
+if case == "fail_crlf_cp949":
+    err.write(b"[child] progress line 1\r\n[child] " + TOOL_LINE + b"\r\n[child] native tool says: " + KO_CP949
+              + b"\r\n[child] invalid bytes: \xff\xfe end\r\nlast line without newline")
+    emit({"summary": summary("RED", 12, 1),
+          "specimens": rows({"H-CONC-3": ("lost update 3/72 (writer javis_preflight) 한글 사유", "fail")})}, 1)
+elif case == "unmeasured_rc2":
+    err.write(b"\xe2\x98\x85--only \xec\x97\x90 unknown id 1: H-WIN-3\n")
+    emit({"summary": summary("UNMEASURED", 12, 0, unknown=["H-WIN-3"]),
+          "specimens": [x for x in rows() if x["id"] != "H-WIN-3"]}, 2)
+elif case == "crash_big":
+    err.write(b"HEAD-MARKER first stderr line\n" + (b"x" * 99 + b"\n") * 50000 + b"TAIL-MARKER last stderr line\n")
+    out.write(b"Traceback (most recent call last):\n  File \"run_bootstrap_health.py\", line 1\nValueError: boom\n")
+    sys.exit(1)
+elif case == "timeout":
+    out.write(b"partial-stdout-marker\n"); out.flush()
+    err.write(b"partial-stderr-marker " + TOOL_LINE + b"\n"); err.flush()
+    time.sleep(30)
+    sys.exit(0)
+elif case == "cp949_in_json":
+    reason = b"\"reason\": \"" + KO_CP949 + b" lost update\", \"fail_kind\": \"fail\""
+    rest = b"".join(b", " + json.dumps(x).encode("utf-8") for x in rows() if x["id"] != "H-CONC-3")
+    body = (b"{\"summary\": " + json.dumps(summary("RED", 12, 1)).encode("utf-8") + b", \"specimens\": ["
+            b"{\"id\": \"H-CONC-3\", \"status\": \"fail\", " + reason + b"}" + rest + b"]}")
+    out.write(body)
+    sys.exit(1)
+elif case == "pass_with_tool_line":
+    err.write(b"[child] " + TOOL_LINE + b"\n")
+    emit(GREEN, 0)
+elif case == "green_control":
+    emit(GREEN, 0)
+elif case == "huge_reason":
+    emit({"summary": summary("RED", 12, 1),
+          "specimens": rows({"H-CONC-3": ("R" * (1 << 20) + "REASON-END", "fail")})}, 1)
+elif case == "huge_verdict":
+    emit({"summary": summary("G" * (1 << 20), 13, 0), "specimens": rows()}, 0)
+elif case == "summary_extra_1mib":
+    emit({"summary": summary("GREEN", 13, 0, noise="N" * (1 << 20)), "specimens": rows()}, 0)
+elif case == "many_unknown":
+    emit({"summary": summary("UNMEASURED", 13, 0, unknown=["U%05d" % i + "u" * 394 for i in range(2000)]),
+          "specimens": rows()}, 2)
+elif case == "many_fail_rows":
+    extra = [{"id": "X-%05d" % i, "status": "fail", "reason": "r" * 100, "fail_kind": "fail"} for i in range(5000)]
+    emit({"summary": summary("RED", 13, 5000), "specimens": rows() + extra}, 1)
+elif case == "huge_stdout_over_parse":
+    doc = dict(GREEN)
+    doc["pad"] = "P" * (5 << 20)
+    emit(doc, 0)
+elif case == "invalid_cp949_64k":
+    err.write(b"\x80" * 65536)
+    emit(GREEN, 0)
+elif case == "control_bytes_1mib":
+    err.write(b"\x01" * (1 << 20))
+    emit(GREEN, 0)
+elif case == "stdout_only_crash":
+    out.write(b"STDOUT-ONLY-MARKER Traceback (most recent call last):\n  File \"x.py\", line 9\n"
+              b"ValueError: stdout only cause \xec\x9b\x90\xec\x9d\xb8\n")
+    sys.exit(1)
+elif case in ("unknown_missing", "unknown_null", "unknown_emptystr", "unknown_dict"):
+    s = summary("GREEN", 13, 0)
+    if case == "unknown_missing":
+        del s["unknown_ids"]
+    else:
+        s["unknown_ids"] = {"unknown_null": None, "unknown_emptystr": "", "unknown_dict": {}}[case]
+    emit({"summary": s, "specimens": rows()}, 0)
+elif case == "surviving_writer":
+    code = ("import os,sys,time\nend=time.time()+4\nwhile time.time()<end:\n"
+            "    os.write(2, b'grandchild still writing\\n'); time.sleep(0.01)\n")
+    subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.DEVNULL, start_new_session=True)
+    emit(GREEN, 0)
+elif case == "overflow":
+    chunk = b"o" * (1 << 20)
+    while True:
+        err.write(chunk); err.flush()
+        time.sleep(0.01)
+elif case == "rc0_with_fail_row":
+    emit({"summary": summary("RED", 12, 1), "specimens": rows({"H-CONC-3": ("lost update 1/72", "fail")})}, 0)
+elif case == "crash_row":
+    emit({"summary": summary("RED", 12, 1),
+          "specimens": rows({"H-CONC-3": ("검체 크래시 KeyError: 'x'", "crash")})}, 1)
+elif case == "missing_requested_id":
+    emit({"summary": summary("GREEN", 12, 0), "specimens": [x for x in rows() if x["id"] != "H-DETECT-10"]}, 0)
+elif case == "bool_pass":
+    s = summary("GREEN", 13, 0)
+    s["pass"] = True
+    emit({"summary": s, "specimens": rows()}, 0)
+elif case == "fail_count_mismatch":
+    emit({"summary": summary("RED", 12, 3), "specimens": rows({"H-CONC-3": ("lost update 2/72", "fail")})}, 1)
+elif case == "colon_lines":
+    err.write(b"::error::INJECTED-FROM-CHILD-STDERR\n::add-mask::secretish\n::group::hijack\n")
+    out.write(b"::error::INJECTED-FROM-CHILD-STDOUT\nnot json\n")
+    sys.exit(1)
+elif case == "multiline_reason":
+    emit({"summary": summary("RED", 12, 1),
+          "specimens": rows({"H-CONC-3": ("line one 100%\r\nline two\n::error::not-a-command", "fail")})}, 1)
+elif case == "adversarial_streams":
+    blob = b"\x80" + b"\x01" * (2 << 20) + b"\x80"
+    out.write(blob); out.flush()
+    err.write(blob); err.flush()
+    sys.exit(1)
+elif case == "adversarial_fields":
+    c0 = "\x01"
+    extra = [{"id": c0 * 200 + "%02d" % i, "status": "fail", "reason": c0 * 4096, "fail_kind": "fail"}
+             for i in range(25)]
+    s = summary(c0 * 200, 13, 25, unknown=[c0 * 200 + "%02d" % i for i in range(60)])
+    emit({"summary": s, "specimens": rows() + extra}, 1)
+elif case == "all_skip_stale_pass":
+    emit({"summary": summary("GREEN", 1, 0, s=12), "specimens": [dict(x, status="skip", reason="s") for x in rows()]}, 0)
+elif case == "all_skip_consistent":
+    emit({"summary": summary("GREEN", 0, 0, s=13), "specimens": [dict(x, status="skip", reason="s") for x in rows()]}, 0)
+elif case == "pass_count_inflated":
+    r = rows()
+    r[-1] = dict(r[-1], status="skip", reason="s")
+    emit({"summary": summary("GREEN", 13, 0), "specimens": r}, 0)
+elif case == "skip_count_mismatch":
+    emit({"summary": summary("GREEN", 13, 0, s=3), "specimens": rows()}, 0)
+elif case == "green_with_skips":
+    r = rows()
+    for k in (0, 1, 2):
+        r[k] = dict(r[k], status="skip", reason="s")
+    emit({"summary": summary("GREEN", 10, 0, s=3), "specimens": r}, 0)
+elif case == "green_with_pending":
+    r = rows()
+    r[-1] = dict(r[-1], status="pending", reason="p")
+    emit({"summary": summary("GREEN", 12, 0, pending=1), "specimens": r}, 0)
+elif case == "uncounted_stale_pass":
+    emit({"summary": summary("GREEN", 13, 0), "specimens": [dict(x, counted=False) for x in rows()]}, 0)
+elif case == "counted_not_bool":
+    r = rows()
+    r[0] = dict(r[0], counted="yes")
+    emit({"summary": summary("GREEN", 13, 0), "specimens": r}, 0)
+elif case == "disabled_row_hidden":
+    r = rows()
+    r[-1] = dict(r[-1], status="disabled", reason="off")
+    emit({"summary": summary("GREEN", 12, 0), "specimens": r}, 0)
+elif case == "disabled_row_consistent":
+    r = rows()
+    r[-1] = dict(r[-1], status="disabled", reason="off")
+    emit({"summary": summary("GREEN", 12, 0, disabled=1), "specimens": r}, 0)
+elif case == "summary_disabled_missing":
+    s = summary("GREEN", 13, 0)
+    del s["disabled"]
+    emit({"summary": s, "specimens": rows()}, 0)
+elif case == "pass_row_with_fail_kind":
+    r = rows()
+    r[4] = dict(r[4], fail_kind="fail")
+    emit({"summary": summary("GREEN", 13, 0), "specimens": r}, 0)
+elif case == "dup_row_status":
+    rest = [json.dumps(x) for x in rows() if x["id"] != "H-CONC-3"]
+    out.write(("{\"summary\": %s, \"specimens\": [{\"id\": \"H-CONC-3\", \"status\": \"fail\", \"reason\": \"lost update 1/72\", "
+               "\"status\": \"pass\"}, %s]}" % (json.dumps(summary("GREEN", 13, 0)), ", ".join(rest))).encode("utf-8"))
+    sys.exit(0)
+elif case == "dup_summary_verdict":
+    s = json.dumps(summary("GREEN", 13, 0))
+    out.write(("{\"summary\": {\"verdict\": \"UNMEASURED\", %s, \"specimens\": %s}"
+               % (s[1:], json.dumps(rows()))).encode("utf-8"))
+    sys.exit(0)
+elif case == "nul_in_report":
+    body = json.dumps(GREEN).encode("utf-8").replace(b"\"detail\": \"ok\"", b"\"detail\": \"o\x00k\"", 1)
+    out.write(body)
+    sys.exit(0)
+elif case == "invalid_utf8_status":
+    body = json.dumps(GREEN).encode("utf-8").replace(b"\"status\": \"pass\"", b"\"status\": \"pa\xffss\"", 1)
+    out.write(body)
+    sys.exit(0)
+elif case == "replay":
+    with open(REPLAY, "rb") as f:
+        out.write(f.read())
+    sys.exit(REPLAY_RC)
+else:
+    sys.exit("unknown case %s" % case)
+'''
+
+_HW11_T1_DRIVER = r'''
+import importlib.util
+import json
+import os
+import sys
+
+target, opts = sys.argv[1], json.loads(sys.argv[2])
+spec = importlib.util.spec_from_file_location("rbh_hw11_t1", target)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+real_os = os
+
+
+class OsProxy(object):
+    name = "nt"
+
+    def __getattr__(self, attr):
+        return getattr(real_os, attr)
+
+
+m.os = OsProxy()
+m.__file__ = opts["child"]
+if opts.get("argv0"):
+    m.PY = opts["argv0"]
+stub = {"hang": [sys.executable, "-c", "import time; time.sleep(60)"], "noop": [sys.executable, "-c", "pass"]}
+for k, v in opts["cfg"].items():
+    setattr(m._HWin11Cfg, k, stub[v] if k == "kill_cmd" else v)
+sid = "H-WIN-11"
+if opts.get("probe") == "crash_after_capture":
+    def boom(*a, **k):
+        raise RuntimeError("injected after the capture")
+    m._hw11_decide = boom
+elif opts.get("probe") == "unimplemented":
+    sid = "H-ZZ-UNIMPL-1"
+    m._REG.append((sid, "W6", "probe: a landed wave without a specimen", [], None))
+sys.exit(m.main(["--json", "--only", sid]))
+'''
+
+# The macOS rig child's own stdout recorded by the design (raw/sim1-realchild/stdout.json, 4,206 B, sha256 below):
+# 13 ids, each once, unknown_ids [] - written before fail_kind existed, so its fail row has none (H11 by design, s4.4).
+_HW11_REPLAY_SHA256 = "ad2fa4742d65c00fdf81eb5417d5e418bc3a5093776c7f4ea798c279b73d5fde"
+_HW11_REPLAY_B64 = """
+ewogInN1bW1hcnkiOiB7CiAgInZlcmRpY3QiOiAiUkVEIiwKICAibGFuZGVkX3dhdmVzIjogWwogICAiVzAiLAogICAiVzFhIiwKICAgIlcxYiIs
+CiAgICJXMiIsCiAgICJXMyIsCiAgICJXNCIsCiAgICJXNSIsCiAgICJXNiIKICBdLAogICJwYXNzIjogOSwKICAiZmFpbCI6IDEsCiAgInNraXAi
+OiAzLAogICJkaXNhYmxlZCI6IDAsCiAgInBlbmRpbmciOiAwLAogICJ0b3RhbCI6IDEzLAogICJvZmZfc3dpdGNoZXNfZW5nYWdlZCI6IFtdLAog
+ICJ1bmtub3duX2lkcyI6IFtdLAogICJlbGFwc2VkX3NlY3MiOiA2LjIsCiAgImNhbGlicmF0aW9uX3JlZiI6ICJhOTZkOGIxIgogfSwKICJzcGVj
+aW1lbnMiOiBbCiAgewogICAiaWQiOiAiSC1ERVRFQ1QtMTAiLAogICAid2F2ZSI6ICJXMWEiLAogICAidGl0bGUiOiAicHJlLWV4ZWMg7IKs66ed
+IOuqqSDihpIgJ+uwnO2ZlCDsi6TtjKgnIOyDge2DnO2MjOyDnSDrs7Tqs6Ao7ZeI7JyEICfrsJztmZTrkKgnIOq4iOyngCkiLAogICAiZGVmZWN0
+cyI6IFsKICAgICJBNiIKICAgXSwKICAgInN0YXR1cyI6ICJwYXNzIiwKICAgImRldGFpbCI6ICLrsJztmZQg7Iuk7YyoIOuztOqzoMK366Gc6re4
+IOqyveuhnCDrj5nrtIkgwrcg6rOE7Lih6rKA7KadPXNraXAobm8tZ2l0KSIsCiAgICJzZWNzIjogMS4zNAogIH0sCiAgewogICAiaWQiOiAiSC1D
+T05DLTEiLAogICAid2F2ZSI6ICJXMWEiLAogICAidGl0bGUiOiAi64+Z7IucIDIr67Cc7ZmUIOKGkiDsoJXtmZXtnoggMSDsi6TtlokoZmxvY2sv
+bXN2Y3J0IO2XrO2NvCDslpEg67aE6riwKSIsCiAgICJkZWZlY3RzIjogWwogICAgIkE4IiwKICAgICJBOHB5IiwKICAgICJHMTciCiAgIF0sCiAg
+ICJzdGF0dXMiOiAicGFzcyIsCiAgICJkZXRhaWwiOiAicmFjZTogMSBhY3F1aXJlZCAvIDQgYnVzeSAoYmFja2VuZD1mY250bCkgwrcgYm9vdHN0
+cmFwOiAy67KI7Ke4IO2YuOy2nCBuby1vcCDtmZXsnbgiLAogICAic2VjcyI6IDAuMTUKICB9LAogIHsKICAgImlkIjogIkgtQ09OQy0zIiwKICAg
+IndhdmUiOiAiVzMiLAogICAidGl0bGUiOiAic2V0dGluZ3MuanNvbiDri6TspJEgd3JpdGVyIOqyve2VqSDigJQg66y07YyM7IaQwrfrrLQgbG9z
+dC11cGRhdGUo6rO17JqpIOudvStta3N0ZW1wKSIsCiAgICJkZWZlY3RzIjogWwogICAgIkcxNiIsCiAgICAiQTgiCiAgIF0sCiAgICJzdGF0dXMi
+OiAic2tpcCIsCiAgICJyZWFzb24iOiAi66CI7Y+sIO2MjOydvCDrtoDsnqwo67Cw7Y+sIO2MqSDsi6TtlokpOiBzcmMvcGFjay5ycyIsCiAgICJz
+ZWNzIjogMC4yMQogIH0sCiAgewogICAiaWQiOiAiSC1XSU4tMSIsCiAgICJ3YXZlIjogIlcxYSIsCiAgICJ0aXRsZSI6ICLrsLHsiqzrnpjsi5wg
+ZmlsZV9wYXRoIOuhnCDtl4zrspXtjIzsnbwg7JOw6riwIOKGkiDssKjri6goZ3VhcmQg7KCV6rec7ZmUKSIsCiAgICJkZWZlY3RzIjogWwogICAg
+IkcxOCIKICAgXSwKICAgInN0YXR1cyI6ICJwYXNzIiwKICAgImRldGFpbCI6ICLssKjri6ggNCAvIO2GteqzvCAxIChXcml0ZStCYXNoIOyWkSDq
+sr3roZwpIMK3IOqzhOy4oeqygOymnT1za2lwKG5vLWdpdCkiLAogICAic2VjcyI6IDAuNDcKICB9LAogIHsKICAgImlkIjogIkgtV0lOLTIiLAog
+ICAid2F2ZSI6ICJXMWEiLAogICAidGl0bGUiOiAi65Oc65287J2067iMIGN3ZChDOlxcwrdDOi8pIOKGkiDsg4HtlqXtg5Dsg4kg7ISx6rO1KGN3
+ZCDqsozsnbTtirggNO2bhSkiLAogICAiZGVmZWN0cyI6IFsKICAgICJHMTkiCiAgIF0sCiAgICJzdGF0dXMiOiAicGFzcyIsCiAgICJkZXRhaWwi
+OiAi7KCV7KCBOiA07ZuFIOyghOyImCBjeXNfaXNfYWJzIMK3IOq4sOuKpTogNO2bhSDDlyAy7ZGc6riwKEM6L8K3QzpcXCkg7ZW07IaMIO2Zleyd
+uCIsCiAgICJzZWNzIjogMC45MgogIH0sCiAgewogICAiaWQiOiAiSC1XSU4tMyIsCiAgICJ3YXZlIjogIlcxYSIsCiAgICJ0aXRsZSI6ICLrqoXr
+qoUg67aA7IScICsgbmFtZWQgcGlwZSDshozsvJMg4oaSIERFUFRfQ1RYIO2MkOyglShweXRob24g7Iig7Ja0IOydvOy5mCkiLAogICAiZGVmZWN0
+cyI6IFsKICAgICJHMjAiLAogICAgIkc0IgogICBdLAogICAic3RhdHVzIjogInBhc3MiLAogICAiZGV0YWlsIjogIuuqheuqhSDrtoDshJzCt25h
+bWVkIHBpcGUg7J247IudICsg7IW44oaUcHl0aG9uIOyIoOyWtCDsnbzsuZggwrcg6rOE7Lih6rKA7KadPXNraXAobm8tZ2l0KSIsCiAgICJzZWNz
+IjogMC40OQogIH0sCiAgewogICAiaWQiOiAiSC1XSU4tNCIsCiAgICJ3YXZlIjogIlcxYSIsCiAgICJ0aXRsZSI6ICJ0YXNra2lsbCDqsJDsp4Ag
+KyByYz0yIOyduO2UhOudvC/tjJDsoJUg67aE66asKGZhaWwtb3BlbiDsoJXssYUg67O17JuQKSIsCiAgICJkZWZlY3RzIjogWwogICAgIkcyMSIK
+ICAgXSwKICAgInN0YXR1cyI6ICJwYXNzIiwKICAgImRldGFpbCI6ICJ0YXNra2lsbCDssKjri6jCt3JjMi9yYzMg7ZiV7IOBIOu2hOumrMK3UE9T
+SVgg7ZqM6reAIDAgwrcg6rOE7Lih6rKA7KadPXNraXAobm8tZ2l0KSIsCiAgICJzZWNzIjogMC4zMwogIH0sCiAgewogICAiaWQiOiAiSC1XSU4t
+NSIsCiAgICJ3YXZlIjogIlcxYSIsCiAgICJ0aXRsZSI6ICJweXRob24zIOqyveyEsSDssLjsobAg7KCE7IiYIOyGjOupuCArIENZU19QWSDtj7Tr
+sLEg7Iuk64+Z7J6RIiwKICAgImRlZmVjdHMiOiBbCiAgICAiRzIyIgogICBdLAogICAic3RhdHVzIjogImZhaWwiLAogICAicmVhc29uIjogIuq1
+rCDsnbjrsqTthqDrpqwg7IKw7LacIOyLpO2MqCgwKSDigJQg64yA7KGwIOu2iOqwgCIsCiAgICJzZWNzIjogMC4wNAogIH0sCiAgewogICAiaWQi
+OiAiSC1XSU4tNiIsCiAgICJ3YXZlIjogIlcxYSIsCiAgICJ0aXRsZSI6ICJwYWNrLWd1YXJkIOuwseyKrOuemOyLnCDsoJHrkZAg66ek7LmtKHZl
+bmRvciDqsr3qs6Ag66y07J2MIO2VtOyGjCkiLAogICAiZGVmZWN0cyI6IFsKICAgICJHMjMiCiAgIF0sCiAgICJzdGF0dXMiOiAicGFzcyIsCiAg
+ICJkZXRhaWwiOiAi67Cx7Iqs656Y7IucIO2MqSDsoJHrkZAg66ek7LmtICsg7YypIOuwliDrrLTrj5nsnpEiLAogICAic2VjcyI6IDAuODkKICB9
+LAogIHsKICAgImlkIjogIkgtV0lOLTciLAogICAid2F2ZSI6ICJXMWEiLAogICAidGl0bGUiOiAi67aA7Yq4IOu4jOumrOyngCDslYjrgrQg66y4
+7J6Q7Je0IGN5Z3BhdGjCt+yduOyaqSDsoIHsmqkiLAogICAiZGVmZWN0cyI6IFsKICAgICJHOCIKICAgXSwKICAgInN0YXR1cyI6ICJwYXNzIiwK
+ICAgImRldGFpbCI6ICJjeWdwYXRoIOuzgO2ZmMK37J247JqpIOyZleuztSDqsoDspp0gwrcgdW5peCDrrLTrs4Dqsr0iLAogICAic2VjcyI6IDEu
+MzEKICB9LAogIHsKICAgImlkIjogIkgtV0lOLTgiLAogICAid2F2ZSI6ICJXMWEiLAogICAidGl0bGUiOiAic3Bhd25fZW52X3BhaXJzIOqzteya
+qSDshozruYQocGFuZcK3c2NoZWR1bGUgMuqyveuhnCDCtyBHVUk9VzQpIiwKICAgImRlZmVjdHMiOiBbCiAgICAiQTE3IgogICBdLAogICAic3Rh
+dHVzIjogInNraXAiLAogICAicmVhc29uIjogIuugiO2PrCDtjIzsnbwg67aA7J6sKOuwsO2PrCDtjKkg4oCUIFJ1c3Qg7IaM7IqkIOu2gOyerCk6
+IHNyYy9saWIucnMiLAogICAic2VjcyI6IDAuMAogIH0sCiAgewogICAiaWQiOiAiSC1XSU4tOSIsCiAgICJ3YXZlIjogIlc0IiwKICAgInRpdGxl
+IjogIuyWtOuMke2EsCBPUyDtm4Trs7Qg7ZW07IaMKGFneS9jb2RleCBXaW5kb3dzIOqyveuhnCkg4oCUIOuLqOydvCDsmKTrnbztgbQg7JWI7JeQ
+7IScIiwKICAgImRlZmVjdHMiOiBbCiAgICAiQjgiCiAgIF0sCiAgICJzdGF0dXMiOiAic2tpcCIsCiAgICJyZWFzb24iOiAi66CI7Y+sIO2MjOyd
+vCDrtoDsnqwo67Cw7Y+sIO2MqSDigJQgUnVzdCDshozsiqQg67aA7J6sKTogc3JjL2Jpbi9jeXMucnMiLAogICAic2VjcyI6IDAuMAogIH0sCiAg
+ewogICAiaWQiOiAiSC1XSU4tMTAiLAogICAid2F2ZSI6ICJXNCIsCiAgICJ0aXRsZSI6ICJXaW5kb3dzIDHssKgg7KKF66OMIOuLqOqzhCDsnKDt
+mqjshLEo66y07ZqoIOuqheyLnCDroZzqt7gg7ZuEIOqwleygnCDsp4HtlokpIiwKICAgImRlZmVjdHMiOiBbCiAgICAiRzI0IgogICBdLAogICAi
+c3RhdHVzIjogInBhc3MiLAogICAiZGV0YWlsIjogIm50PeustO2aqOyEoOyWuCsvRuynge2WiSDCtyBwb3NpeD1URVJN4oaSS0lMTCDrs7TsobQg
+wrcg7IKs7JygIOuqheyLnCDCtyDrtoTquLAg67Cw7ISgIMK3IOqzhOy4oeqygOymnT1za2lwKG5vLWdpdCkiLAogICAic2VjcyI6IDAuMDcKICB9
+CiBdCn0K
+"""
+
+# (case, fake child case or None = same name, injected limits / options) - DESIGN-v4 tools/v4/run_all_v4.py CASES.
+# kill_failed runs first: its child is left alive on purpose (a no-op kill) and sleeps 30 s, so it ends by itself while
+# the other cases run; the specimen checks at the end that no fake child is still alive.
+_HW11_T1_CASES = [
+    ("kill_failed", "timeout", {"cfg": {"child_timeout": 2.0, "kill_cmd": "noop", "postkill_wait": 2.0,
+                                        "clean_budget": 10.0}}),
+    ("fail_crlf_cp949", None, {}), ("unmeasured_rc2", None, {}), ("crash_big", None, {}),
+    ("timeout", "timeout", {"cfg": {"child_timeout": 3.0}}),
+    ("cp949_in_json", None, {}), ("pass_with_tool_line", None, {}), ("green_control", None, {}),
+    ("huge_reason", None, {}), ("huge_verdict", None, {}), ("summary_extra_1mib", None, {}),
+    ("many_unknown", None, {}), ("many_fail_rows", None, {}), ("huge_stdout_over_parse", None, {}),
+    ("invalid_cp949_64k", None, {}), ("control_bytes_1mib", None, {}), ("stdout_only_crash", None, {}),
+    ("unknown_missing", None, {}), ("unknown_null", None, {}), ("unknown_emptystr", None, {}),
+    ("unknown_dict", None, {}), ("surviving_writer", None, {}),
+    ("overflow", "overflow", {"cfg": {"raw_max": 16 << 20, "poll": 0.2, "child_timeout": 60.0}}),
+    ("rc0_with_fail_row", None, {}), ("crash_row", None, {}), ("missing_requested_id", None, {}),
+    ("bool_pass", None, {}), ("fail_count_mismatch", None, {}), ("colon_lines", None, {}),
+    ("multiline_reason", None, {}), ("replay_real_macos", "replay", {}),
+    ("spawn_fail", "green_control", {"argv0": "/nonexistent/python3"}),
+    ("taskkill_timeout", "timeout", {"cfg": {"child_timeout": 2.0, "kill_cmd": "hang", "kill_timeout": 2.0,
+                                             "postkill_wait": 5.0, "clean_budget": 10.0}}),
+    ("capture_deadline", "huge_stdout_over_parse", {"cfg": {"capture_budget": 0.0}}),
+    ("adversarial_streams", None, {}), ("adversarial_fields", None, {}),
+    ("all_skip_stale_pass", None, {}), ("all_skip_consistent", None, {}), ("pass_count_inflated", None, {}),
+    ("skip_count_mismatch", None, {}), ("green_with_skips", None, {}), ("green_with_pending", None, {}),
+    ("uncounted_stale_pass", None, {}), ("counted_not_bool", None, {}), ("disabled_row_hidden", None, {}),
+    ("disabled_row_consistent", None, {}), ("summary_disabled_missing", None, {}), ("pass_row_with_fail_kind", None, {}),
+    ("dup_row_status", None, {}), ("dup_summary_verdict", None, {}), ("nul_in_report", None, {}),
+    ("invalid_utf8_status", None, {}),
+]
+
+# expected verdict and DENY categories per case (acceptance_v4.py EXP)
+_HW11_T1_EXP = {
+    "fail_crlf_cp949": ("fail", {"PRODUCT"}), "unmeasured_rc2": ("fail", {"HARNESS"}),
+    "crash_big": ("fail", {"HARNESS"}), "timeout": ("fail", {"HARNESS"}), "cp949_in_json": ("fail", {"PRODUCT"}),
+    "pass_with_tool_line": ("pass", set()), "green_control": ("pass", set()), "huge_reason": ("fail", {"PRODUCT"}),
+    "huge_verdict": ("fail", {"HARNESS"}), "summary_extra_1mib": ("pass", set()),
+    "many_unknown": ("fail", {"HARNESS"}), "many_fail_rows": ("fail", {"PRODUCT", "HARNESS"}),
+    "huge_stdout_over_parse": ("fail", {"HARNESS"}), "invalid_cp949_64k": ("pass", set()),
+    "control_bytes_1mib": ("pass", set()), "stdout_only_crash": ("fail", {"HARNESS"}),
+    "unknown_missing": ("fail", {"HARNESS"}), "unknown_null": ("fail", {"HARNESS"}),
+    "unknown_emptystr": ("fail", {"HARNESS"}), "unknown_dict": ("fail", {"HARNESS"}),
+    "surviving_writer": ("fail", {"HARNESS"}), "overflow": ("fail", {"HARNESS"}),
+    "rc0_with_fail_row": ("fail", {"PRODUCT", "HARNESS"}), "crash_row": ("fail", {"HARNESS"}),
+    "missing_requested_id": ("fail", {"HARNESS"}), "bool_pass": ("fail", {"HARNESS"}),
+    "fail_count_mismatch": ("fail", {"PRODUCT", "HARNESS"}), "colon_lines": ("fail", {"HARNESS"}),
+    "multiline_reason": ("fail", {"PRODUCT"}), "replay_real_macos": ("fail", {"HARNESS"}),
+    "spawn_fail": ("fail", {"HARNESS"}), "taskkill_timeout": ("fail", {"HARNESS"}),
+    "kill_failed": ("fail", {"HARNESS"}), "capture_deadline": ("fail", {"HARNESS"}),
+    "adversarial_streams": ("fail", {"HARNESS"}), "adversarial_fields": ("fail", {"PRODUCT", "HARNESS"}),
+    "all_skip_stale_pass": ("fail", {"HARNESS"}), "all_skip_consistent": ("fail", {"HARNESS"}),
+    "pass_count_inflated": ("fail", {"HARNESS"}), "skip_count_mismatch": ("fail", {"HARNESS"}),
+    "green_with_skips": ("pass", set()), "green_with_pending": ("pass", set()),
+    "uncounted_stale_pass": ("fail", {"HARNESS"}), "counted_not_bool": ("fail", {"HARNESS"}),
+    "disabled_row_hidden": ("fail", {"HARNESS"}), "disabled_row_consistent": ("fail", {"HARNESS"}),
+    "summary_disabled_missing": ("fail", {"HARNESS"}), "pass_row_with_fail_kind": ("fail", {"HARNESS"}),
+    "dup_row_status": ("fail", {"HARNESS"}), "dup_summary_verdict": ("fail", {"HARNESS"}),
+    "nul_in_report": ("fail", {"HARNESS"}), "invalid_utf8_status": ("fail", {"HARNESS"}),
+}
+_HW11_T1_WORST = 2295224              # computed worst case of evidence.child (DESIGN-v4 s4.3)
+
+
+def _hw11_t1_accept(case, row, wall):
+    """The checks of DESIGN-v4 tools/v4/acceptance_v4.py on one H-WIN-11 row -> [(label, ok)]. Kept importable so the
+    same checks can be applied to rows the pinned runner produced (RED-first evidence)."""
+    checks = []
+
+    def chk(label, ok):
+        checks.append((label, bool(ok)))
+
+    want_status, want_cats = _HW11_T1_EXP[case]
+    text = row.get("reason") or row.get("detail") or ""
+    ev = (row.get("evidence") or {}).get("child") or {}
+    chk("DENY: status is %s (got %s)" % (want_status, row.get("status")), row.get("status") == want_status)
+    chk("NO-ESCAPE: no exception escaped the specimen", "escaped" not in row and not text.startswith("검체 크래시"))
+    got_cats = set(ev.get("categories") or [])
+    chk("CATEGORY(k): categories == %s (got %s)" % (sorted(want_cats), sorted(got_cats)), got_cats == want_cats)
+    if want_status == "fail":
+        first = [c for c in ("PRODUCT", "HARNESS") if c in want_cats]
+        chk("CATEGORY(k): reason starts with the first category tag",
+            bool(first) and text.startswith(_HW11_TAG[first[0]]))
+        chk("CATEGORY(k): every expected tag in reason, no other",
+            all((_HW11_TAG[c] in text) == (c in want_cats) for c in _HW11_TAG))
+    try:
+        blob = json.dumps(row, ensure_ascii=False).encode("utf-8")
+        chk("ENC: row re-encodes as utf-8 (no lone surrogates)", True)
+    except UnicodeError:
+        blob = b""
+        chk("ENC: row re-encodes as utf-8 (no lone surrogates)", False)
+    chk("BOUND: serialized row <= 3 MiB + 4 KiB (got %d B)" % len(blob), len(blob) <= 3 * 1024 * 1024 + 4096)
+    chk("BOUND: row reason <= 2 x (512 + 120) + 5 UTF-8 bytes (got %d)" % len(text.encode("utf-8")),
+        len(text.encode("utf-8")) <= 2 * (512 + 120) + 5)
+    mark = 120
+    over = []
+    for i, f in enumerate(ev.get("failing") or [] if isinstance(ev.get("failing"), list) else []):
+        for k, cap in (("reason", 2048), ("id", 128), ("fail_kind", 128)):
+            n = len(str(f.get(k, "")).encode("utf-8"))
+            if n > cap + mark:
+                over.append("failing[%d].%s %d B" % (i, k, n))
+    chk("FIELD: failing rows <= 20 (got %d)" % len(ev.get("failing") or []), len(ev.get("failing") or []) <= 20)
+    summ = ev.get("summary") or {}
+    uk = summ.get("unknown_ids") or []
+    chk("FIELD: unknown_ids recorded <= 50 (got %d)" % (len(uk) if isinstance(uk, list) else -1),
+        isinstance(uk, list) and len(uk) <= 50)
+    for i, u in enumerate(uk if isinstance(uk, list) else []):
+        if len(str(u).encode("utf-8")) > 128 + mark:
+            over.append("unknown_ids[%d] %d B" % (i, len(str(u).encode("utf-8"))))
+    if isinstance(summ, dict):
+        allowed = {"verdict", "pass", "fail", "skip", "disabled", "pending", "derived", "unknown_ids",
+                   "unknown_ids_total", "unknown_ids_omitted", "rows_total"}
+        extra = set(summ) - allowed
+        if extra:
+            over.append("summary keys outside the whitelist: %s" % sorted(extra)[:5])
+        if len(str(summ.get("verdict", "")).encode("utf-8")) > 64 + mark:
+            over.append("summary.verdict %d B" % len(str(summ.get("verdict")).encode("utf-8")))
+    for c in ev.get("causes") or []:
+        if len(str(c.get("message", "")).encode("utf-8")) > 1024 + mark:
+            over.append("cause message %d B" % len(str(c.get("message")).encode("utf-8")))
+    chk("FIELD: causes recorded <= 12 (got %d)" % len(ev.get("causes") or []), len(ev.get("causes") or []) <= 12)
+    for sname in ("stdout", "stderr"):
+        st = ev.get(sname) or {}
+        for part, kept in (("head", 8192 if st.get("truncated") else None), ("tail", 57344)):
+            r = st.get(part) or {}
+            if not r:
+                continue
+            k = kept if kept else st.get("bytes", 0)
+            if len(r.get("text", "").encode("utf-8")) > 4 * k:
+                over.append("%s.%s.text %d B > 4 x %d" % (sname, part, len(r["text"].encode("utf-8")), k))
+            for codec, t in (r.get("alt") or {}).items():
+                if len(t.encode("utf-8")) > 32768 + mark:
+                    over.append("%s.%s.alt.%s %d B" % (sname, part, codec, len(t.encode("utf-8"))))
+    chk("FIELD: every child-derived field within its budget (%s)" % ("; ".join(over[:4]) or "none over"), not over)
+    chk("SCHEMA: evidence.child schema hwin11-child/3", ev.get("schema") == "hwin11-child/3")
+    evb = len(json.dumps(ev, ensure_ascii=False).encode("utf-8"))
+    chk("BOUND(codex-1): serialized evidence.child %d B <= computed worst case %d B" % (evb, _HW11_T1_WORST),
+        evb <= _HW11_T1_WORST)
+    trunc = ev.get("truncations") or []
+    tfield = {"crash_big": "stderr", "huge_reason": "failing[0].reason", "many_unknown": "summary.unknown_ids[0]",
+              "invalid_cp949_64k": "stderr.head.alt.cp949", "control_bytes_1mib": "stderr",
+              "huge_stdout_over_parse": "stdout", "overflow": "stderr", "huge_verdict": "summary.verdict"}
+    if case in tfield:
+        t = [x for x in trunc if x.get("field") == tfield[case]]
+        chk("TRUNC(j): a cut record for %s with dropped_bytes>0 and dropped_range" % tfield[case],
+            bool(t) and t[0].get("dropped_bytes", 0) > 0 and len(t[0].get("dropped_range") or []) == 2)
+        chk("TRUNC(j): an inline 'bytes dropped' marker in the artifact", "bytes dropped" in json.dumps(ev, ensure_ascii=False))
+    if case == "many_fail_rows":
+        chk("TRUNC(j): failing_omitted counted (5,000 fail rows - 20 recorded = 4,980; got %s)" % ev.get("failing_omitted"),
+            ev.get("failing_omitted") == 4980)
+    if case == "many_unknown":
+        chk("TRUNC(j): unknown_ids_omitted counted (got %s)" % summ.get("unknown_ids_omitted"),
+            summ.get("unknown_ids_omitted") == 1950)
+    evtext = json.dumps(ev, ensure_ascii=False)
+    if case == "fail_crlf_cp949":
+        chk("REASON: child failure text in reason[:600]", "lost update 3/72" in text[:600])
+        chk("REASON: pinned text kept", "Windows 실기 실패 검체: ['H-CONC-3']" in text)
+        for mk in ("progress line 1", "SessionStart 에 cys 훅 미등록", "last line without newline", "\\\\xff\\\\xfe"):
+            chk("STDERR: %r captured" % mk, mk in evtext)
+        chk("STDERR: cp949 bytes legible in a labelled rendering", "한글 cp949 진단" in evtext)
+    if case == "huge_reason":
+        chk("PROBE codex-1: row with a 1 MiB reason <= 200 KiB (got %d B; v1 measured 1,114,812)" % len(blob),
+            len(blob) <= 200 * 1024)
+        r0 = ((ev.get("failing") or [{}])[0] or {}).get("reason", "")
+        chk("REASON: failing[0].reason cut at 2 KiB with a drop marker (REASON-END not in the field)",
+            "REASON-END" not in r0 and "bytes dropped" in r0 and len(r0.encode("utf-8")) <= 2048 + 120)
+    if case == "invalid_cp949_64k":
+        alt = (((ev.get("stderr") or {}).get("head") or {}).get("alt") or {}).get("cp949", "")
+        nchars = len(alt.split(" [… ")[0])
+        chk("PROBE codex-3: cp949 view of 65,536 invalid bytes <= 65,536 chars (got %d)" % nchars, 0 < nchars <= 65536)
+    if case == "stdout_only_crash":
+        chk("STDOUT(codex-3): stdout marker in the artifact", "STDOUT-ONLY-MARKER" in evtext)
+    if case in ("unknown_missing", "unknown_null", "unknown_emptystr", "unknown_dict"):
+        chk("PROBE codex-4: H9 schema cause names unknown_ids",
+            any("unknown_ids" in c.get("message", "") for c in ev.get("causes") or []))
+    if case == "surviving_writer":
+        st = ev.get("stderr") or {}
+        chk("SNAPSHOT(codex-2): stderr marked unstable", st.get("stable") is False)
+        chk("SNAPSHOT(codex-2): hashed exactly the snapshot (hashed_bytes == bytes)",
+            st.get("hashed_bytes") == st.get("bytes") and st.get("bytes") is not None)
+        chk("DEADLINE(codex-2): capture did not chase EOF (elapsed %s s <= 3)" % ev.get("elapsed_s"),
+            ev.get("elapsed_s") is not None and ev["elapsed_s"] <= 3.0)
+    if case in ("taskkill_timeout", "kill_failed", "timeout"):
+        chk("DEADLINE(codex-2): timed_out recorded", ev.get("timed_out") is True)
+        if wall is not None:
+            cfg = ev.get("cfg") or {}
+            chk("DEADLINE(codex-2): wall %.1f s <= child_timeout + clean budget + 3 s" % wall,
+                wall <= cfg.get("child_timeout", 0) + cfg.get("clean_budget", 0) + 3)
+    if case == "taskkill_timeout":
+        k = ev.get("kill") or {}
+        chk("KILL(codex-2): taskkill timeout recorded and process fallback used",
+            k.get("timed_out") is True and k.get("fallback") == "process")
+    if case == "kill_failed":
+        chk("KILL(gemini-1): kill_failed recorded, capture still attached",
+            ev.get("kill_failed") is True and "partial-stdout-marker" in evtext)
+    if case == "timeout":
+        for mk in ("partial-stdout-marker", "partial-stderr-marker"):
+            chk("TIMEOUT: %r kept" % mk, mk in evtext)
+    if case == "crash_big":
+        for mk in ("HEAD-MARKER", "TAIL-MARKER", "ValueError: boom", "bytes dropped"):
+            chk("BOUND: %r kept" % mk, mk in evtext)
+    if case == "overflow":
+        chk("OVERFLOW: overflow recorded", ev.get("overflow") is True)
+    if case == "capture_deadline":
+        chk("DEADLINE(codex-2): stdout hash incomplete recorded", (ev.get("stdout") or {}).get("hash_complete") is False)
+    if row.get("status") == "pass":
+        dv = summ.get("derived") or {}
+        chk("COUNTS-FIELD(R2-1): pass row has derived pass > 0 and a counted row that ran (got %s)" % dv,
+            dv.get("pass", 0) > 0 and dv.get("pass", 0) + dv.get("fail", 0) > 0 and dv.get("disabled", 1) == 0)
+        chk("COUNTS-FIELD(R2-1): every stated count == its derived count",
+            all(summ.get(k) == dv.get(k) for k in _HW11_STATUSES))
+        chk("RC(R2-2): pass row has rc an int == 0 (got %r)" % (ev.get("rc"),), type(ev.get("rc")) is int and ev["rc"] == 0)
+    codes = [c.get("code") for c in ev.get("causes") or []]
+    msgs = " ".join(str(c.get("message", "")) for c in ev.get("causes") or [])
+    if case in ("all_skip_stale_pass", "pass_count_inflated", "uncounted_stale_pass"):
+        chk("COUNTS(R2-1): an H9 cause names the stale summary.pass", "H9-schema" in codes and "summary.pass=" in msgs)
+    if case in ("all_skip_stale_pass", "all_skip_consistent", "uncounted_stale_pass"):
+        chk("COUNTS(R2-1): H13 from the rows (derived pass 0)", "H13-pass0" in codes and "행에서 센 값" in msgs)
+    if case == "skip_count_mismatch":
+        chk("COUNTS(R2-1): an H9 cause names summary.skip", "summary.skip=" in msgs)
+    if case in ("disabled_row_hidden", "summary_disabled_missing"):
+        chk("COUNTS(R2-1): an H9 cause names summary.disabled", "summary.disabled" in msgs)
+    if case in ("disabled_row_hidden", "disabled_row_consistent"):
+        chk("COUNTS(R2-1): H10-disabled from the rows", "H10-disabled" in codes)
+    if case == "counted_not_bool":
+        chk("COUNTS(R2-1): an H9 cause names counted", "counted is" in msgs)
+    if case == "pass_row_with_fail_kind":
+        chk("KIND(R2-2): an H9 cause names fail_kind on a non-fail row", "carry fail_kind" in msgs)
+    if case == "green_with_skips":
+        chk("COUNTS(R2-1): the pass detail states the derived 10 PASS / 3 SKIP", "실기 10 PASS / 3 SKIP" in text)
+    if case in ("dup_row_status", "dup_summary_verdict"):
+        chk("DUPKEY(R3-c): an H9 cause names the duplicate key", "H9-schema" in codes and "duplicate key" in msgs)
+    if case == "nul_in_report":
+        chk("NUL(R3): the report with a NUL is not parsed (H8)", "H8-unparsable" in codes)
+    if case == "invalid_utf8_status":
+        chk("UTF8(R3): a status made of invalid bytes is an unknown status (H9)", "H9-schema" in codes)
+    if case == "pass_with_tool_line":
+        chk("CORRELATE: tool line captured on PASS too", "SessionStart 에 cys 훅 미등록" in evtext)
+    # B-344 4.7: fail_kind on fail rows only, and the evidence on every row (R4)
+    chk("KIND(4.7): fail_kind == 'fail' on a fail row, absent on a pass row (got %r)" % (row.get("fail_kind"),),
+        row.get("fail_kind") == ("fail" if row.get("status") == "fail" else None))
+    chk("R4: the row carries evidence.child", bool(ev))
+    return checks
+
+
+def _hw11_reader_code(wf_text):
+    """The step-5 reader heredoc of windows-health.yml, dedented as YAML `|` keeps it (relative indentation kept)."""
+    lines = wf_text.split("\n")
+    starts = [i for i, ln in enumerate(lines) if ln.strip() == "python - \"$rc\" \"$BH_DIR\" <<'PY' || vrc=$?"]
+    need(len(starts) == 1, "step-5 reader heredoc start found %d times (expected 1)" % len(starts))
+    b = starts[0] + 1
+    ends = [i for i in range(b, len(lines)) if lines[i].strip() == "PY"]
+    need(ends, "step-5 reader heredoc has no PY terminator")
+    ind = len(lines[starts[0]]) - len(lines[starts[0]].lstrip(" "))
+    body = lines[b:ends[0]]
+    need(all(not ln.strip() or ln[:ind] == " " * ind for ln in body),
+         "a step-5 reader line is indented less than its heredoc start (cannot dedent faithfully)")
+    return "\n".join(ln[ind:] for ln in body) + "\n"
+
+
+def _hw11_t1_reader_accept(case, raw_out, rrc, marker_dir, row):
+    """The checks of DESIGN-v4 tools/v4/acceptance_reader_v4.py on the reader's output for one runner row."""
+    checks = []
+
+    def chk(label, ok):
+        checks.append((label, bool(ok)))
+
+    out = raw_out.decode("utf-8", "backslashreplace")
+    lines = out.split("\n")
+    ev = (row.get("evidence") or {}).get("child") or {}
+    want_fail = row.get("status") == "fail"
+    chk("EXIT: reader rc %s (got %d)" % ("1" if want_fail else "0", rrc), rrc == (1 if want_fail else 0))
+    tok, inside, rogue = None, False, []
+    for ln in lines:
+        if not inside:
+            m = re.match(r"^::stop-commands::([0-9a-f]{32})$", ln)
+            if m:
+                tok, inside = m.group(1), True
+                continue
+            if ln.startswith("::") and not re.match(r"^::(group::|endgroup::$|error( title=[^:]*)?::)", ln):
+                rogue.append(ln[:60])
+            if ln.startswith("::error") and "INJECTED" in ln:
+                rogue.append(ln[:60])
+        elif ln == "::%s::" % tok:
+            inside = False
+    chk("STOP(5.2): no child-derived '::' command line outside a stop-commands region (%s)" % (rogue[:2] or "none"),
+        not rogue and not inside)
+    chk("STOP(5.2): a stop-commands region exists", tok is not None)
+    chk("GROUP: a log group for the H-WIN-11 child", "::group::H-WIN-11 child" in out)
+    chk("STDOUT(codex-3): an explicit stdout block in the log", "--- stdout:" in out)
+    chk("STDERR: an explicit stderr block in the log", "--- stderr:" in out)
+    errs = [ln for ln in lines if ln.startswith("::error")]
+    chk("ANN: <= 10 error annotations in the step (got %d)" % len(errs), len(errs) <= 10)
+    chk("ANN: every message <= 600 chars", all(len(ln.split("::", 2)[2]) <= 600 for ln in errs))
+    chk("ANN(gemini-2): no split %XX escape in any message",
+        not any(re.search(r"%(?![0-9A-F]{2})", ln.split("::", 2)[2]) for ln in errs))
+    chk("ANN: no raw CR in any annotation", not any("\r" in ln for ln in errs))
+    cats = set(ev.get("categories") or [])
+    for c in ("PRODUCT", "HARNESS"):
+        has = any(ln.startswith("::error title=H-WIN-11 %s::" % c) for ln in errs)
+        chk("ANN(k): a separate H-WIN-11 %s annotation iff that category (%s)" % (c, c in cats), has == (c in cats))
+    chk("ANN(k): no annotation carries both categories",
+        not any("[PRODUCT 제품 결함]" in ln and "[HARNESS 계측 결함" in ln for ln in errs))
+    mk = os.path.join(marker_dir, "category")
+    got = open(mk, "rb").read() if os.path.exists(mk) else None
+    want = ",".join(sorted(cats)) if want_fail else "NONE"
+    chk("MARKER(k): category marker bytes == %r (got %r)" % (want.encode(), got), got == want.encode())
+    st = ev.get("stderr") or {}
+    if st.get("truncated"):
+        chk("TRUNC(j): the stream drop marker with range is in the log", (st.get("marker") or "@@") in out)
+    cap = 16 * 1024
+    blocks, cur = {}, None
+    for bl in raw_out.split(b"\n"):
+        if bl.startswith(b"--- stdout: ") or bl.startswith(b"--- stderr: "):
+            cur = bl[4:10].decode()
+            blocks[cur] = 0
+        elif cur is not None and (bl.startswith(b"::") and bl.endswith(b"::") and len(bl) == 36):
+            cur = None
+        if cur is not None:
+            blocks[cur] += len(bl) + 1
+    for sname in ("stdout", "stderr"):
+        if sname in blocks:
+            chk("LOGCAP(R2-3): %s block %d B <= %d" % (sname, blocks[sname], cap), blocks[sname] <= cap)
+        st = ev.get(sname) or {}
+        disp = (len(((st.get("head") or {}).get("text") or "").encode())
+                + len(((st.get("tail") or {}).get("text") or "").encode()) + len((st.get("marker") or "").encode())
+                + sum(len(t.encode()) for part in ("head", "tail") for t in ((st.get(part) or {}).get("alt") or {}).values()))
+        seg = out.split("--- %s: " % sname, 1)[1] if ("--- %s: " % sname) in out else ""
+        seg = seg.split("--- stderr: ", 1)[0] if sname == "stdout" else seg
+        if disp > cap:
+            chk("TRUNC(j): %s display text %d B > cap -> a log-copy drop line" % (sname, disp),
+                "bytes of the log copy dropped here" in seg)
+        elif disp <= cap - 2048:
+            chk("TRUNC(j): %s display text %d B fits -> no log-copy drop line" % (sname, disp),
+                "bytes of the log copy dropped here" not in seg)
+    if case == "stdout_only_crash":
+        chk("STDOUT(codex-3): stdout marker in the run's own log", "STDOUT-ONLY-MARKER" in out)
+    if case == "fail_crlf_cp949":
+        chk("LEGIBLE(l): Korean cp949 text legible in the log", "한글 cp949 진단" in out)
+        chk("LEGIBLE(l): Korean utf-8 tool line legible in the log", "SessionStart 에 cys 훅 미등록" in out)
+    if case == "colon_lines":
+        chk("STOP(5.2): injected child lines are present as data", "INJECTED-FROM-CHILD-STDERR" in out)
+    return checks
+
+
+def _hw11_t1_probe_p1():
+    """P1 (DESIGN-v4 s8 T5): the real _hw11_decide with captured data - values a real Popen never returns but the rule
+    must refuse (rc False, 0.0, "0", None after a normal exit), codex's all-skip report with a stale summary.pass, its
+    consistent control and a green control. Returns [(label, ok)]."""
+    ids = ["H-WIN-%d" % i for i in range(1, 11)] + ["H-CONC-1", "H-CONC-3", "H-DETECT-10"]
+
+    def report(rows, **over):
+        s = {"verdict": "GREEN", "pass": sum(r["status"] == "pass" for r in rows), "fail": 0,
+             "skip": sum(r["status"] == "skip" for r in rows), "disabled": 0, "pending": 0, "total": len(rows),
+             "unknown_ids": []}
+        s.update(over)
+        return json.dumps({"summary": s, "specimens": rows}).encode()
+
+    green = [{"id": i, "status": "pass", "detail": "ok"} for i in ids]
+    skips = [{"id": i, "status": "skip", "reason": "s"} for i in ids]
+    cases = [("control: green report, rc 0", 0, report(green), True, None),
+             ("codex: 13 rows skip, summary pass 1 / skip 12", 0, report(skips, **{"pass": 1, "skip": 12}), False,
+              "H13-pass0"),
+             ("13 rows skip, counts consistent (pass 0)", 0, report(skips), False, "H13-pass0"),
+             ("green report, rc False", False, report(green), False, "H12-rc"),
+             ("green report, rc 0.0", 0.0, report(green), False, "H12-rc"),
+             ('green report, rc "0"', "0", report(green), False, "H12-rc"),
+             ("green report, rc None after a normal exit", None, report(green), False, "H12-rc")]
+    out = []
+    for label, rc, body, want_ok, want_code in cases:
+        st = {"bytes": len(body), "sha256": "0" * 64, "hash_complete": True, "hashed_bytes": len(body),
+              "size_after": len(body), "stable": True, "truncated": False, "head": {"utf8_valid": True, "text": ""}}
+        ev = {"argv": ["child"], "rc": rc, "timed_out": False, "overflow": False, "kill_failed": False,
+              "spawn_error": None, "cfg": {}, "stdout": dict(st), "stderr": dict(st, bytes=0, hashed_bytes=0, size_after=0),
+              "elapsed_s": 0.1}
+        stored = []
+        ok, _msg = _hw11_decide(ev, body, ids, _HWin11Cfg(), [], stored.append)
+        codes = [c["code"] for c in ev.get("causes") or []]
+        out.append(("P1 %s -> %s %s" % (label, "pass" if ok else "fail", codes),
+                    ok == want_ok and (want_code is None or want_code in codes)))
+    return out
+
+
+@specimen("H-WIN11-CAP-1", "W6",
+          "★B-344 H-WIN-11 child capture and verdict on the real code — an unmeasured, unfinished or malformed child "
+          "is red, categorised, bounded and published (52 design cases · reader · probes)", ["B-344"])
+def h_win11_cap_1():
+    """B-344 (DESIGN-v4 s0): an unmeasured child made H-WIN-11 PASS and the run GREEN (the pinned code read neither
+    the child's exit code nor summary.verdict), and the child's failure text never reached the run. This specimen is
+    the design's test T1 (with T4's runner-output stage and the T5 probes P1 and R4) on the REAL code: every case runs
+    main() in its own process with H-WIN-11's Windows branch forced and the child replaced by a fake child, then the
+    row goes through the step-5 reader taken from windows-health.yml. RED-first: on the pinned bytes the same checks
+    found 24 false greens (DESIGN-v4 s2.3); the implementation must give none."""
+    wf = os.path.join(REPO_DIR, ".github", "workflows", "windows-health.yml")
+    if not os.path.isfile(wf):
+        raise Skip("windows-health.yml 이 없다(레포 체크아웃이 아님) — H-WIN-11 잡 계약과 판독 본문이 없어 시뮬레이션할 대상이 없다")
+    reader = _hw11_reader_code(_read(wf))
+    replay = base64.b64decode("".join(_HW11_REPLAY_B64.split()))
+    need(hashlib.sha256(replay).hexdigest() == _HW11_REPLAY_SHA256, "recorded child report bytes changed (sha256)")
+    me = os.path.abspath(__file__)
+    bad, nchk, nrchk, pids = [], 0, 0, []
+    t0 = time.monotonic()
+    with _hw11_tempdir() as d:
+        rpath = os.path.join(d, "reader.py")
+        with open(rpath, "w", encoding="utf-8") as f:
+            f.write(reader)
+        replay_path = os.path.join(d, "replay.json")
+        with open(replay_path, "wb") as f:
+            f.write(replay)
+        runs = [(name, child or name, o) for name, child, o in _HW11_T1_CASES]
+        runs += [("probe:crash_after_capture", "green_control", {"probe": "crash_after_capture"}),
+                 ("probe:unimplemented", "green_control", {"probe": "unimplemented"})]
+        for n, (name, child, o) in enumerate(runs):
+            w = os.path.join(d, "c%02d" % n)
+            os.makedirs(w)
+            pidfile = os.path.join(w, "child.pid")
+            pids.append(pidfile)
+            fake = os.path.join(w, "fake_child.py")
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write("CASE = %r\nPIDFILE = %r\nREPLAY = %r\nREPLAY_RC = 1\n" % (child, pidfile, replay_path)
+                        + _HW11_FAKE_CHILD)
+            cfg = {"codecs": ["cp949"], "is_windows": os.name == "nt"}
+            cfg.update(o.get("cfg", {}))
+            opts = {"child": fake, "cfg": cfg, "argv0": o.get("argv0"), "probe": o.get("probe")}
+            s = time.monotonic()
+            try:
+                r = subprocess.run([PY, "-c", _HW11_T1_DRIVER, me, json.dumps(opts)], capture_output=True, timeout=150)
+                so = r.stdout
+            except subprocess.TimeoutExpired as e:
+                so = e.stdout or b""
+            wall = time.monotonic() - s
+            try:
+                rows = json.loads(so.decode("utf-8"))["specimens"]
+                row = rows[0]
+            except Exception as e:      # noqa: BLE001 - an unreadable runner output is a red, named
+                bad.append("%s: runner output unreadable (%s)" % (name, type(e).__name__))
+                continue
+            if name == "probe:crash_after_capture":
+                ok = (row.get("status") == "fail" and row.get("fail_kind") == "crash"
+                      and str(row.get("reason", "")).startswith("검체 크래시 RuntimeError")
+                      and (((row.get("evidence") or {}).get("child") or {}).get("stdout") or {}).get("bytes", 0) > 0)
+                nchk += 1
+                if not ok:
+                    bad.append("%s: R4 - a crash after the capture must keep the capture on the row (got %s)"
+                               % (name, sorted(row)))
+                continue
+            if name == "probe:unimplemented":
+                nchk += 1
+                if not (row.get("status") == "fail" and row.get("fail_kind") == "unimplemented"):
+                    bad.append("%s: fail_kind 'unimplemented' (got %r)" % (name, row.get("fail_kind")))
+                continue
+            checks = _hw11_t1_accept(name, row, wall)
+            nchk += len(checks)
+            bad += ["%s: %s" % (name, label) for label, ok in checks if not ok]
+            # T4 runner-output stage: the step-5 reader of windows-health.yml on this row inside a 25-row document
+            fail = row.get("status") == "fail"
+            others = [{"id": "H-WIN-%d" % i, "status": "pass", "detail": "ok"} for i in range(1, 25)]
+            doc = {"summary": {"verdict": "RED" if fail else "GREEN", "pass": 24 + (not fail), "fail": int(fail),
+                               "skip": 0, "disabled": 0, "pending": 0, "total": 25}, "specimens": others + [row]}
+            cwd, marker = os.path.join(w, "cwd"), os.path.join(w, "marker")
+            os.makedirs(cwd)
+            os.makedirs(marker)
+            with open(os.path.join(cwd, "win-health.json"), "w", encoding="utf-8") as f:
+                f.write(json.dumps(doc, ensure_ascii=False, indent=1))
+            rr = subprocess.run([PY, rpath, "1" if fail else "0", marker], cwd=cwd, capture_output=True, timeout=60)
+            rchecks = _hw11_t1_reader_accept(name, rr.stdout + rr.stderr, rr.returncode, marker, row)
+            nrchk += len(rchecks)
+            bad += ["%s reader: %s" % (name, label) for label, ok in rchecks if not ok]
+        p1 = _hw11_t1_probe_p1()
+        nchk += len(p1)
+        bad += [label for label, ok in p1 if not ok]
+        alive = []
+        if os.name != "nt":
+            for pf in pids:
+                try:
+                    with open(pf) as f:
+                        pid = int(f.read())
+                    os.kill(pid, 0)
+                    alive.append(pid)
+                except (OSError, ValueError):
+                    pass
+    need(not bad, "%d/%d checks failed: %s" % (len(bad), nchk + nrchk, " | ".join(bad[:6])))
+    need(not alive, "fake child processes still alive after the cases: %s" % alive)
+    return ("%d cases · %d checks + %d reader checks · P1 7 · R4 crash · unimplemented · no fake child left · %.1fs"
+            % (len(_HW11_T1_CASES), nchk, nrchk, time.monotonic() - t0))
 
 
 @specimen("H-WIN-12", "W5", "System32 timeout 함정 하 save-state → BOOT_SNAPSHOT 생성(마스터 게이트)",
@@ -15144,6 +16452,7 @@ def main(argv=None):
                 if wave in LANDED_WAVES and not fn:
                     row["status"] = "fail"
                     row["reason"] = "발효 웨이브인데 검체 미구현 — 측정 실패는 hard fail"
+                    row["fail_kind"] = "unimplemented"     # B-344 4.7: additive key, fail rows only
                 if not (args.include_pending and fn):
                     rows.append(row)
                     continue
@@ -15163,9 +16472,15 @@ def main(argv=None):
             except Fail as e:
                 row["status"] = "fail"
                 row["reason"] = str(e)
+                row["fail_kind"] = "fail"
             except Exception as e:  # 검체 자체 크래시도 fail(측정 실패=hard fail)
                 row["status"] = "fail"
                 row["reason"] = "검체 크래시 %s: %s" % (type(e).__name__, e)
+                row["fail_kind"] = "crash"
+            # B-344 R4: what the specimen stored for its row arrives on every branch above, the crash one included.
+            ev = _SPECIMEN_EVIDENCE.pop(sid, None)
+            if ev is not None:
+                row["evidence"] = ev
             row["secs"] = round(time.time() - s, 2)
             if not effective:
                 row["counted"] = False

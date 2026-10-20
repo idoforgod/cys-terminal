@@ -91,11 +91,21 @@ jobs:
           echo "OSTYPE=${OSTYPE:-?} · which bash=$(command -v bash)"
 
       # ★H-WIN 검체 실기. `--json` 으로 기계 판독 결과를 남기고(회귀 시 원 결함 ID 역추적),
-      #   러너 exit 를 그대로 잡 판정으로 쓴다(발효 검체의 fail 은 hard fail).
+      #   발효 검체의 fail 은 hard fail 이다.
+      # ★B-344 (DESIGN-v4 s6): this step is `continue-on-error` so its red no longer skips the later Windows steps that do not
+      #   depend on it. It writes the reader's exit code to $RUNNER_TEMP/bootstrap-health/rc and the reader writes the category
+      #   (NONE / PRODUCT / HARNESS / HARNESS,PRODUCT) to .../category; the blocking step `부트스트랩 건강성 판정 결박` below
+      #   re-asserts the verdict fail-closed. Reading trap: on a red this step's REST conclusion is `success` by design - the
+      #   red is carried by that verdict step, the job and run conclusion, and this step's annotations.
       - name: 부트스트랩 건강성 — H-WIN 검체 실기 (windows-latest)
+        id: bootstrap_health
+        continue-on-error: true
+        timeout-minutes: 20
         shell: bash
         run: |
           set -euo pipefail
+          BH_DIR="${RUNNER_TEMP:-/tmp}/bootstrap-health"
+          rm -rf "$BH_DIR"; mkdir -p "$BH_DIR"
           R="cysjavis-pack/bin/tests/run_bootstrap_health.py"
           [ -f "$R" ] || { echo "건강성 러너 누락: $R (git add 누락 의심)" >&2; exit 1; }
           # 플랫폼 검체 목록의 단일 출처(이 한 줄). H-WIN-11 은 잡 계약 자기검증 + 실기 재실행.
@@ -145,42 +155,303 @@ jobs:
           #   ci-branch 가 이미 쓰는 검증된 형식(`--json > 파일 || rc=$?` → 판독 블록)으로 맞춘다.
           rc=0
           python "$R" --only "$WIN_SPECIMENS" --json > win-health.json || rc=$?
-          python - "$rc" <<'PY'
-          import json, sys
-          rc = int(sys.argv[1])
+          vrc=0
+          python - "$rc" "$BH_DIR" <<'PY' || vrc=$?
+          # B-344 step-5 reader (DESIGN-v4 s5): a positive green rule with counts derived from the rows, the H-WIN-11 child's
+          #   capture in a log group (stop-commands, 16 KiB per stream incl. notices), one annotation per category, and the
+          #   category marker written atomically. Exits 0 only when every green condition is shown.
+          import json
+          import os
+          import re
+          import secrets
+          import sys
+
+          TAG = {"PRODUCT": "[PRODUCT 제품 결함]", "HARNESS": "[HARNESS 계측 결함 · 무측정]"}
+          KINDS = {"fail": "PRODUCT", "crash": "HARNESS", "unimplemented": "HARNESS"}
+          STATUSES = ("pass", "fail", "skip", "disabled", "pending")     # the producer's summary counts (:15182-15188)
+          LOG_STREAM_MAX = 16 * 1024            # accepted (head decision 1): ALL bytes printed for one stream, notices included
+          ALT_VIEWS_MAX = 2                     # code-page views printed per stream (the model makes at most 2)
+          LINE_MAX = 1024                       # header / view-header lines are clipped to this many UTF-8 bytes
+          ANN_MAX = 600
+          ROW_ANN_CAP = 9                       # error annotations from rows (GitHub keeps 10 per step)
+          CHILD_ANN_CAP = 5
+          RC_RE = re.compile(r"0|[1-9][0-9]{0,2}")      # [0-9] is ASCII only in re (unlike \d)
+          ANN_SUFFIX = "…(+%d자 · 전문은 로그 그룹·아티팩트)"
+          LOG_NOTICE = ("[… %d bytes of the log copy dropped here: display bytes %d..%d of %s (%d B); the artifact "
+                        "win-health.json keeps the bounded copy …]")
+
+          rc_arg = sys.argv[1] if len(sys.argv) > 1 else ""
+          marker_dir = sys.argv[2] if len(sys.argv) > 2 else ""
+          rc = int(rc_arg) if RC_RE.fullmatch(rc_arg) and int(rc_arg) <= 255 else None
+          token = secrets.token_hex(16)
+          cats = set()
+          own = []                              # the reader's own fail-closed reasons (HARNESS) -> ONE ::error at the end
+          emitted = [0]
+          not_emitted = [0]
+
+
+          def nb(s):
+              """UTF-8 bytes print() writes for this line, its newline included."""
+              return len(s.encode("utf-8")) + 1
+
+
+          def clip(s, n):
+              b = s.encode("utf-8")
+              return s if len(b) <= n else b[:n - 3].decode("utf-8", "ignore") + "…"
+
+
+          def write_category():
+              """Atomic (temp file renamed over the marker): the verdict step sees the whole value or no file. Returns an
+              error text, or None when written."""
+              if not marker_dir:
+                  return "marker directory argument missing"
+              val = ",".join(sorted(cats)) if cats else "NONE"
+              p = os.path.join(marker_dir, "category")
+              try:
+                  with open(p + ".tmp", "w", encoding="ascii") as f:
+                      f.write(val)
+                  os.replace(p + ".tmp", p)
+              except OSError as e:
+                  return "%s: %s" % (type(e).__name__, e)
+              return None
+
+
+          def finish(code):
+              """Write the category (a failed write turns any result red), print the reader's own reasons once, exit."""
+              if own:
+                  cats.add("HARNESS")
+              err = write_category()
+              if err is not None:
+                  own.append("결함 분류 표지를 쓰지 못했다(%s) — 판정 단계가 통과로 읽을 근거가 없다" % err)
+                  code = 1
+              if own:
+                  print("::error::%s %s (fail-closed)" % (TAG["HARNESS"], cut_ann(esc_data(" · ".join(own)))), file=sys.stderr)
+                  code = 1
+              sys.exit(code)
+
+
+          def esc_data(s):
+              return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+          def esc_prop(s):
+              return esc_data(s).replace(":", "%3A").replace(",", "%2C")
+
+
+          def cut_ann(s):
+              """Cut an ESCAPED message to <= ANN_MAX chars, never inside a %XX escape (gemini-2), saying what was cut.
+              v3 (R2-3): the suffix is reserved with len(s) as N - the real N is never larger, so never wider."""
+              if len(s) <= ANN_MAX:
+                  return s
+              room = ANN_MAX - len(ANN_SUFFIX % len(s))
+              c = s[:room]
+              i = c.rfind("%", max(0, len(c) - 2))                  # a '%' in the last two chars starts a split escape
+              if i != -1:
+                  c = c[:i]
+              return c + ANN_SUFFIX % (len(s) - len(c))
+
+
+          def annotate(title, msg):
+              if emitted[0] >= ROW_ANN_CAP:
+                  not_emitted[0] += 1
+                  return
+              emitted[0] += 1
+              print("::error title=%s::%s" % (esc_prop(title), cut_ann(esc_data(msg))))
+
+
+          def _part(text, where, cap):
+              """<= cap UTF-8 bytes INCLUDING the drop notice and its two newlines (v3, R2-3). The notice is sized with the
+              widest numbers it can carry (every number in it is <= len(b)) and reserved before the text is cut; then the first
+              quarter and the last three quarters of what is left are kept, and the notice carries the real offsets."""
+              b = text.encode("utf-8")
+              if len(b) <= cap:
+                  return text
+              w = 10 ** len(str(len(b))) - 1
+              room = cap - len(("\n" + LOG_NOTICE % (w, w, w, where, w) + "\n").encode("utf-8"))
+              if room < 4:                                          # unreachable with these constants (T4 asserts the sizes)
+                  return (LOG_NOTICE % (len(b), 0, len(b), where, len(b))).encode("utf-8")[:max(cap, 0)].decode("utf-8", "ignore")
+              hb = room // 4
+              h = b[:hb].decode("utf-8", "ignore")
+              t = b[len(b) - (room - hb):].decode("utf-8", "ignore")   # explicit start offset: never b[-0:] (= the whole text)
+              a, z = len(h.encode("utf-8")), len(b) - len(t.encode("utf-8"))
+              out = h + "\n" + LOG_NOTICE % (z - a, a, z, where, len(b)) + "\n" + t
+              assert len(out.encode("utf-8")) <= cap, (len(out.encode("utf-8")), cap)   # fail-closed: a crash is a HARNESS red
+              return out
+
+
+          def stream_block(name, rec):
+              """Every line printed for one stream; their UTF-8 bytes, each line's newline included, are <= LOG_STREAM_MAX."""
+              if not rec:
+                  return ["--- %s: not captured ---" % name]
+              head_line = clip("--- %s: %s B · sha256 %s · hash_complete=%s · stable=%s%s ---"
+                               % (name, rec.get("bytes"), str(rec.get("sha256") or "-")[:16], rec.get("hash_complete"),
+                                  rec.get("stable"), (" · truncated: %s" % rec.get("marker")) if rec.get("truncated") else ""),
+                               LINE_MAX)
+              head = rec.get("head") or {}
+              text = str(head.get("text", ""))
+              if rec.get("truncated"):
+                  text += "\n" + str(rec.get("marker", "")) + "\n" + str((rec.get("tail") or {}).get("text", ""))
+              alts = {}
+              for part in ("head", "tail"):
+                  for codec, t in ((rec.get(part) or {}).get("alt") or {}).items():
+                      alts.setdefault(str(codec), []).append(str(t))
+              if alts:                                              # not valid UTF-8: the budget is shared with the code-page views
+                  shown = list(alts)[:ALT_VIEWS_MAX]
+                  vh = [clip("--- %s as %s (legibility view; undecodable bytes as U+FFFD) ---" % (name, c), LINE_MAX // 4)
+                        for c in shown]
+                  extra = ["--- %s: %d more code-page views are in win-health.json only ---" % (name, len(alts) - len(shown))] \
+                      if len(alts) > len(shown) else []
+                  room = LOG_STREAM_MAX - nb(head_line) - sum(nb(x) for x in vh + extra) - (1 + len(shown))
+                  lines = [head_line, _part(text, name + " (utf-8 view, invalid bytes as \\xNN)", room // 2)]
+                  share = (room - room // 2) // len(shown)
+                  for c, h in zip(shown, vh):
+                      lines += [h, _part("\n".join(alts[c]), "%s as %s" % (name, c), share)]
+                  lines += extra
+              else:
+                  lines = [head_line, _part(text, name, LOG_STREAM_MAX - nb(head_line) - 1)]
+              assert sum(nb(x) for x in lines) <= LOG_STREAM_MAX, sum(nb(x) for x in lines)
+              return lines
+
+
+          def one_line(s, n=160):
+              s = str(s).replace("\r", " ").replace("\n", " ⏎ ")
+              return s if len(s) <= n else s[:n] + "…(+%d자)" % (len(s) - n)
+
+
+          def is_count(v):
+              return isinstance(v, int) and not isinstance(v, bool) and v >= 0
+
+
+          def no_dup(pairs):
+              """object_pairs_hook: a repeated key is refused, not resolved to its last value (v4, R3-c)."""
+              seen = set()
+              for k, _ in pairs:
+                  if k in seen:
+                      raise ValueError("duplicate key %r" % k[:40])
+                  seen.add(k)
+              return dict(pairs)
+
+
+          if rc is None:
+              own.append("러너 rc 인자 %s 가 0..255 의 정수가 아니다 — 판정 불가" % one_line(repr(rc_arg), 40))
           try:
-              d = json.load(open("win-health.json", encoding="utf-8"))
-          except Exception as e:                      # noqa: BLE001 — 파싱 실패도 관측 실패다
-              print("::error::건강성 결과 JSON 을 읽지 못했다(%s) — 러너가 중도 사망했을 수 있다. "
-                    "이 상태의 '문제 없음' 은 근거가 아니다(fail-closed)." % e, file=sys.stderr)
-              sys.exit(1)
-          s = d["summary"]
-          print("[win-health] verdict=%s pass=%s fail=%s skip=%s pending=%s"
-                % (s["verdict"], s["pass"], s["fail"], s["skip"], s["pending"]))
-          for r in d["specimens"]:
-              print("  %-6s %-12s %s" % (r["status"].upper(), r["id"], r.get("reason", r.get("detail", ""))[:160]))
-          # ★실패 검체는 annotation 채널로 올린다(2026-09-04). 이 저장소의 CI 로그는 토큰 없이
-          #   읽을 수 없어(익명 403) print 는 원인 추적에 쓸 수 없다 — check-runs 의 annotations
-          #   만이 익명으로 읽힌다. ci-branch 가 이미 쓰는 형식을 그대로 따른다(검증됨:
-          #   그 형식 덕에 H-CONC-3 을 로그 없이 특정했다).
-          for r in d["specimens"]:
-              if r["status"] == "fail":
-                  print("::error title=%s::%s"
-                        % (r["id"], (r.get("reason") or r.get("detail") or "")[:600]))
-          # 측정 실패는 조용한 통과가 아니다 — 실기 목적이 skip 무더기로 무력화되면 잡을 세운다.
-          if s["fail"]:
-              sys.exit(1)
-          if s["pass"] == 0:
-              print("::error::Windows 실기에서 PASS 0건 — 검체가 전부 skip/pending 이면 이 잡은 "
-                    "무검증 베이스라인을 재생산한다(fail-closed).", file=sys.stderr)
-              sys.exit(1)
-          # 러너가 0 이 아닌 rc 로 끝났는데 위 갈래가 아무것도 잡지 못했다면, 우리가 모르는
-          # 이유로 죽은 것이다 — 그 상태의 초록은 근거가 아니다(rc 포획의 존재 이유).
-          if rc != 0:
-              print("::error::건강성 러너가 rc=%d 로 끝났는데 실패 검체는 0건이다 — 판정 불가(fail-closed)."
-                    % rc, file=sys.stderr)
-              sys.exit(1)
+              d = json.load(open("win-health.json", encoding="utf-8"), object_pairs_hook=no_dup)
+              s = d["summary"]
+              rows = d["specimens"]
+              if not isinstance(s, dict) or not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                  raise ValueError("summary is not an object or specimens is not a list of objects")
+          except Exception as e:                                   # noqa: BLE001 - a parse failure is an observation failure
+              own.append("건강성 결과 JSON 을 읽지 못했다(%s) — 러너가 중도 사망했을 수 있다. 이 상태의 '문제 없음' 은 근거가 "
+                         "아니다" % str(e)[:200])
+              finish(1)
+
+          print("[win-health] verdict=%s pass=%s fail=%s skip=%s disabled=%s pending=%s"
+                % tuple(one_line(s.get(k), 40) for k in ("verdict", "pass", "fail", "skip", "disabled", "pending")))
+          print("::stop-commands::%s" % token)
+          for r in rows:
+              print("  %-6s %-12s %s" % (one_line(r.get("status"), 12).upper(), one_line(r.get("id"), 40),
+                                         one_line(r.get("reason", r.get("detail", "")))))
+          print("::%s::" % token)
+
+          for r in rows:
+              ch = (r.get("evidence") or {}).get("child")
+              if not ch:
+                  continue
+              print("::group::%s child (rc=%s · categories=%s · timed_out=%s · stdout %s B · stderr %s B)"
+                    % (one_line(r.get("id"), 40), one_line(ch.get("rc"), 40), one_line(",".join(ch.get("categories") or []), 40)
+                       or "none", ch.get("timed_out"), (ch.get("stdout") or {}).get("bytes"), (ch.get("stderr") or {}).get("bytes")))
+              print("::stop-commands::%s" % token)
+              for c in ch.get("causes") or []:
+                  print("[cause] %s %s %s" % (c.get("category"), c.get("code"), c.get("message")))
+              if (ch.get("causes_total") or 0) > len(ch.get("causes") or []):
+                  print("[cause] … %d more causes in the artifact" % (ch["causes_total"] - len(ch["causes"])))
+              for f in ch.get("failing") or []:
+                  print("[failing] %s (%s): %s" % (f.get("id"), f.get("fail_kind"), f.get("reason")))
+              if ch.get("failing_omitted"):
+                  print("[failing] … %d more failing rows not recorded (failing_total=%s)" % (ch["failing_omitted"],
+                                                                                             ch.get("failing_total")))
+              for t in ch.get("truncations") or []:
+                  print("[cut] %s: %s %s dropped (%s..%s of %s)" % (t.get("field"), t.get("dropped_bytes"), t.get("unit"),
+                                                                   (t.get("dropped_range") or ["?", "?"])[0],
+                                                                   (t.get("dropped_range") or ["?", "?"])[1],
+                                                                   t.get("total_bytes")))
+              for sname in ("stdout", "stderr"):
+                  for ln in stream_block(sname, ch.get(sname)):
+                      print(ln)
+              print("::%s::" % token)
+              print("::endgroup::")
+
+          # v3 (R2-1, R2-2): counts derived from the rows; every green condition stated positively
+          derived = dict((k, 0) for k in STATUSES)
+          bad_shape = kind_on_nonfail = cat_on_nonfail = bad_counted = 0
+          for r in rows:
+              st, c = r.get("status"), r.get("counted", True)
+              if not isinstance(r.get("id"), str) or st not in STATUSES:
+                  bad_shape += 1
+                  continue
+              if not isinstance(c, bool):
+                  bad_counted += 1
+              elif c:
+                  derived[st] += 1
+              if st != "fail" and "fail_kind" in r:
+                  kind_on_nonfail += 1
+              if st != "fail" and ((r.get("evidence") or {}).get("child") or {}).get("categories"):
+                  cat_on_nonfail += 1
+          if bad_shape:
+              own.append("행 %d 건에 문자열 id 또는 알려진 status 가 없다" % bad_shape)
+          if bad_counted:
+              own.append("행 %d 건의 counted 가 bool 이 아니다" % bad_counted)
+          if kind_on_nonfail:
+              own.append("실패가 아닌 행 %d 건이 fail_kind 를 가진다 — 보고가 자기모순이다" % kind_on_nonfail)
+          if cat_on_nonfail:
+              own.append("실패가 아닌 행 %d 건의 evidence.child 가 결함 분류를 가진다 — 보고가 자기모순이다" % cat_on_nonfail)
+          for k in STATUSES:
+              if not is_count(s.get(k)):
+                  own.append("summary.%s 가 없거나 음이 아닌 정수가 아니다(%s)" % (k, type(s.get(k)).__name__))
+              elif s[k] != derived[k]:
+                  own.append("summary.%s=%d 인데 행에서 센 값은 %d — 이월·낡은 수는 측정이 아니다" % (k, s[k], derived[k]))
+
+          fail_rows = [r for r in rows if r.get("status") == "fail"]
+          for r in fail_rows:
+              ch = (r.get("evidence") or {}).get("child")
+              if ch is not None:
+                  for cat in ("PRODUCT", "HARNESS"):
+                      if cat in (ch.get("categories") or []):
+                          cats.add(cat)
+                          annotate("%s %s" % (r.get("id"), cat), "%s %s" % (TAG[cat], " · ".join(
+                              str(c.get("message", "")) for c in ch.get("causes") or [] if c.get("category") == cat)))
+                  for f in (ch.get("failing") or [])[:CHILD_ANN_CAP]:
+                      annotate("%s child %s" % (r.get("id"), f.get("id")), "[%s] %s" % (f.get("fail_kind"), f.get("reason")))
+                  if not ch.get("categories"):
+                      cats.add("HARNESS")
+                      annotate(str(r.get("id")), "%s %s" % (TAG["HARNESS"], r.get("reason") or r.get("detail") or ""))
+              else:
+                  cat = KINDS.get(r.get("fail_kind")) if isinstance(r.get("fail_kind"), str) else None
+                  cat = cat or "HARNESS"
+                  cats.add(cat)
+                  annotate(str(r.get("id")), "%s %s" % (TAG[cat], r.get("reason") or r.get("detail") or ""))
+          if not_emitted[0]:
+              print("[win-health] annotation cap: %d more failing items were not annotated (GitHub keeps 10 error annotations "
+                    "per step) - they are in the log above and in win-health.json" % not_emitted[0])
+          if derived["pass"] == 0:
+              own.append("Windows 실기에서 PASS 0건(행에서 센 값 · 실제로 돈 행 %d 건) — 검체가 전부 skip/pending 이면 이 잡은 "
+                         "무검증 베이스라인을 재생산한다" % (derived["pass"] + derived["fail"]))
+          if derived["disabled"]:
+              own.append("사람이 끈 미측정 행 %d 건 — 통과가 아니다" % derived["disabled"])
+          if not fail_rows and s.get("verdict") != "GREEN":
+              own.append("실패 행 없이 verdict=%s — 통과가 아니다" % one_line(s.get("verdict"), 40))
+          if rc is not None and rc != 0 and not fail_rows:
+              own.append("건강성 러너가 rc=%d 로 끝났는데 실패 검체는 0건이다 — 판정 불가" % rc)
+          if rc == 0 and fail_rows:
+              own.append("실패 행 %d 건인데 러너 rc=0 — 보고가 자기모순이다" % len(fail_rows))
+          green = (rc == 0 and s.get("verdict") == "GREEN" and not fail_rows and not own and not cats
+                   and derived["pass"] > 0 and derived["pass"] + derived["fail"] > 0 and derived["disabled"] == 0)
+          if not green and not own and not cats:                   # a red that no rule above named is still a red
+              own.append("통과 조건 전부를 증명하지 못했다 — 원인 미분류는 통과가 아니다")
+          finish(0 if green else 1)
           PY
+          echo "$vrc" > "$BH_DIR/rc"
+          exit "$vrc"
 
       # ★P1-4(완전 초기화 시뮬레이션 확정 2026-08-16): `src/factory_reset.rs` 의 Windows 계약
       #   (%LOCALAPPDATA% 상태 루트·`cysd.prev*.exe` 세대 잔재 판정·`bash "C:/…"` 훅 문자열·
@@ -650,6 +921,11 @@ jobs:
       #       (실측 2초 · 하네스가 없는 예외까지 덮는 상한 6분) + UI 스텝(setup-bun 약 0.3분 + 상한 3분) → **(0.14.50 T-50-P2 이전) 이론 최악 35.0 + 6 + 0.3 + 3 = 44.3분 < 45분**(여유 0.7분 · 잡 상한 55분에는 10.7분) · 실측에 기댄 현실적 최악은
       #       35.0 + 0.1 + 0.5 ≈ 36분(두 한도에 각 19분·9분 여유). 어느 쪽이든 release 게이트의 45분 안이다. 한도를 건드리는 변경(스텝·상한 추가)은 이 표를 다시 계산하라.
       #   ★0.14.50 T-50-P2 재계산: F10 스텝(빌드 재사용 — 실측 전 1분 안팎[추정])과 맨 뒤 측정 스텝(상한 5분)이 더해졌다. 이론 최악(전량 스텝이 30분 상한까지 돌 때) 44.3 + 1 + 5 ≈ 50.3분은 45분 release 게이트를 넘는다 — 이 이론값은 더 이상 45분 안이라고 주장하지 않는다(잡 상한 55분 안). 현실 최악은 35.0 + 0.1 + 0.5 + 1 + 측정 수 분 ≈ 40분 안팎[추정 — 이번 런이 첫 실측]. 필수 검사는 모두 측정 스텝 앞에 있다.
+      #   ★B-344 recomputation: step 5 now has its own 20-minute cap (H-WIN-11's child phase is bounded at 961 s, DESIGN-v4 s4.2) and a 2-minute verdict
+      #     step follows the upload, and a bootstrap-health red no longer skips the later steps - so a red run now lasts a full job. The theoretical worst
+      #     (step 5 at its 20-minute cap instead of the measured 1.4 minutes, the full step at its 30-minute cap, the verdict step at its cap) is about
+      #     50.3 + 18.6 + 2 ≈ 71 minutes, over the 55-minute job cap: a job cancelled there is red, never green. The realistic worst stays about 40 minutes
+      #     (step 5 measured 1 min 57 s on the bootstrap-red run 39403066924). The duration of a full run after a bootstrap red is UNMEASURED (first run).
       #   · 뒤에 두면: 위 스텝이 `--bin cysd` 테스트 하네스를 이미 빌드해 둔 상태라 이 스텝은 거의 **실행만**(실측 2초 · 5건)이다.
       #   · 앞에 두면: 이 스텝이 테스트 빌드를 먹어 제한시간이 빌드를 덮어야 한다(예 12분) — 위 스텝은 빌드 시간을 되찾아도 어차피 상한까지 돌므로 합이 그만큼 늘고, 같은 최악 가정이면
       #     4.8 + 12 + 30.1 ≈ 47분 > 45분이다(release 게이트가 '측정 불능'으로 적색).
@@ -1071,6 +1347,93 @@ jobs:
             win-health.json
             win-cysd-failures.json
           if-no-files-found: warn
+
+      # B-344: bootstrap-health verdict, fail-closed. Step 5 is continue-on-error so its red does not skip the
+      #   independent Windows steps; this step re-asserts it. Pass only if outcome == success AND the rc marker is exactly 0 AND the category marker is exactly NONE, both read byte-exact (DESIGN-v4 s6.1).
+      - name: 부트스트랩 건강성 판정 결박 (H-WIN · 차단 · fail-closed)
+        if: always()
+        timeout-minutes: 2
+        shell: bash
+        env:
+          BH_OUTCOME: ${{ steps.bootstrap_health.outcome }}
+        run: |
+          set +e
+          d="${RUNNER_TEMP:-/tmp}/bootstrap-health"
+          T="부트스트랩 건강성(H-WIN) 판정"
+          H="[HARNESS 계측 결함 · 무측정]"
+          P="[PRODUCT 제품 결함]"
+          # B-344 v4 (R3): a marker is read BYTE-EXACT. Its bytes never become shell text - a shell variable cannot hold NUL, so v3's
+          #   "$(cat file)" read the bytes 30 00 0a as "0" (codex R3). od turns the whole file into lowercase hex (2 chars per byte) and
+          #   every decision below is made on that hex text. MS = ok | absent | unreadable | oversize ; MH = the hex of every byte.
+          readm() {
+            MS=ok; MH=""
+            if [ ! -e "$1" ]; then MS=absent; return; fi
+            if [ ! -f "$1" ] || [ ! -r "$1" ]; then MS=unreadable; return; fi
+            MH="$(od -An -v -tx1 -N 33 "$1" 2>/dev/null)" || { MS=unreadable; MH=""; return; }
+            MH="${MH//$'\n'/}"; MH="${MH// /}"; MH="${MH//$'\t'/}"
+            case "$MH" in *[!0123456789abcdef]*) MS=unreadable; MH=""; return;; esac
+            if [ $(( ${#MH} % 2 )) -ne 0 ]; then MS=unreadable; MH=""; return; fi
+            if [ "${#MH}" -gt 64 ]; then MS=oversize; return; fi
+          }
+          # display only (after the decision): a value can never add a line or a workflow command
+          show() { printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9,_-' '?' | head -c 32; }
+          OC="${BH_OUTCOME:-}"
+          o="$(show "$OC")"
+          readm "$d/rc"; RS="$MS"; RH="$MH"
+          readm "$d/category"; CS="$MS"; CH="$MH"
+          # the only framing allowed in either marker: the value's bytes, then at most ONE LF byte (0a); hex is byte-aligned, so a
+          # trailing "0a" is exactly the last byte
+          rcok=0; RV=""
+          if [ "$RS" = ok ]; then
+            v="$RH"; case "$v" in *0a) v="${v%0a}";; esac
+            case "$v" in
+              30|3[123456789]|3[123456789]3[0123456789]|3[123456789]3[0123456789]3[0123456789])
+                rcok=1; i=1
+                while [ "$i" -lt "${#v}" ]; do RV="$RV${v:$i:1}"; i=$((i+2)); done;;
+            esac
+          fi
+          catok=0; CV=""
+          if [ "$CS" = ok ]; then
+            v="$CH"; case "$v" in *0a) v="${v%0a}";; esac
+            case "$v" in
+              4e4f4e45) catok=1; CV=NONE;;
+              50524f44554354) catok=1; CV=PRODUCT;;
+              4841524e455353) catok=1; CV=HARNESS;;
+              4841524e4553532c50524f44554354) catok=1; CV="HARNESS,PRODUCT";;
+            esac
+          fi
+          # GREEN only for the positive conjunction - outcome success AND rc exactly 0 AND category exactly NONE (all byte-exact)
+          if [ "$OC" = "success" ] && [ "$rcok" = 1 ] && [ "$RV" = "0" ] && [ "$catok" = 1 ] && [ "$CV" = "NONE" ]; then
+            echo "[bootstrap-health] GREEN (outcome=success rc=0 category=NONE)"; exit 0
+          fi
+          prod=0; hr=""
+          add() { hr="${hr:+$hr · }$1"; }
+          if [ "$OC" = "skipped" ] || [ -z "$OC" ]; then
+            add "부트스트랩 건강성 스텝이 돌지 않았다(outcome=${o:-없음}) — 이 런의 H-WIN 검체는 무측정이다(통과 아님)"
+          fi
+          if [ "$RS" = absent ]; then
+            add "판정 표지가 없다(outcome=$o) — 스텝이 20분 상한에 잘렸거나 표지를 쓰기 전에 죽었다 · 이 런의 H-WIN 검체는 무측정이다(통과 아님)"
+          elif [ "$rcok" != 1 ]; then
+            add "rc 표지를 판독할 수 없다($RS · hex ${RH:-없음}) — 정수 하나와 LF 하나가 아니면 통과로 읽지 않는다"
+          fi
+          if [ "$catok" != 1 ]; then
+            add "결함 분류 표지가 없거나 판독 불가($CS · hex ${CH:-없음}) — 통과로 읽지 마라"
+          else
+            case "$CV" in *PRODUCT*) prod=1;; esac
+            case "$CV" in *HARNESS*) add "부트스트랩 건강성 판정 불가(분류 표지 HARNESS) — 사유는 그 스텝의 annotation 과 win-health.json";; esac
+          fi
+          if [ "$rcok" = 1 ]; then
+            if [ "$OC" = "success" ] && [ "$RV" != "0" ]; then add "outcome=success 인데 rc=$RV — 스텝 구조가 바뀌었거나 표지 쓰기가 실패했다"; fi
+            if [ "$OC" != "success" ] && [ "$RV" = "0" ]; then add "outcome=$o 인데 rc=0 — 스텝 구조가 바뀌었거나 표지 쓰기가 실패했다"; fi
+            if [ "$catok" = 1 ] && [ "$RV" = "0" ] && [ "$CV" != "NONE" ]; then add "rc=0 인데 분류 표지=$CV — 보고가 자기모순이다"; fi
+            if [ "$catok" = 1 ] && [ "$RV" != "0" ] && [ "$CV" = "NONE" ]; then add "rc=$RV 인데 분류 표지=NONE — 보고가 자기모순이다"; fi
+          fi
+          if [ "$prod" = 1 ]; then
+            echo "::error title=$T PRODUCT::$P 부트스트랩 건강성 RED — outcome=$o rc=${RV:-판독 불가} · 사유는 그 스텝의 annotation 과 win-health.json"
+          fi
+          if [ -z "$hr" ] && [ "$prod" != 1 ]; then add "판정 불가(미분류) — 통과로 읽지 마라"; fi
+          if [ -n "$hr" ]; then echo "::error title=$T HARNESS::$H $hr"; fi
+          exit 1
 
       # ── 0.14.50 T-50-P2 Unit C(측정 전용 · 고치지 않는다): `queue list --help` 시험이 윈도우에서 스택을 넘겼다. 시험 하네스
       #   스레드 문제인지 제품(cys.exe) 문제인지 모른다. 이 스텝은 판정을 하지 않고 종료 코드만 찍는다.
