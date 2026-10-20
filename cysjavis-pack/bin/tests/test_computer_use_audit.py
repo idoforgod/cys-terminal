@@ -21,6 +21,15 @@
                  src/lib.rs surface_ref and env_compat). When the producer moves, the derived rows move with it and the
                  tool is exercised against the moved format; an unreadable producer is a failure, never a skip. The
                  tool's socket-key tuple must equal javis_role.SOCKET_ENV_KEYS and the env_compat order.
+                 Rendering is derived too, in both stages: the daemon's surface.list value for each printed key
+                 (src/bin/cysd/handlers.rs, typed by the Surface struct in src/bin/cysd/state.rs) and the CLI's println
+                 argument (`s["k"].as_str().unwrap_or("d")` = the raw string, `s["k"]` = serde_json display). Any other
+                 expression in either stage is rejected as a moved producer (PROMOTE-6 R1).
+  Registered coupling (not derivable from source, not faked): a seat's title can be changed at run time by the
+                 surface.rename RPC (src/bin/cysd/handlers.rs "surface.rename"), and the tool reads the agent from the
+                 title's "<role>-<agent>" prefix. Blast radius: a renamed Claude seat is judged non-Claude (its cwd is
+                 never audited or fixed - a silent miss); a non-Claude seat renamed "<x>-claude · y" is judged Claude
+                 (--fix would enable computer-use for its cwd). The rows here assume the launch title (workflow_title).
 
 ## 밀폐
 - HOME·cwd 는 케이스마다 새 임시 디렉터리다. 라이브 설정(~/.cys/claude*)·라이브 팩·데몬은 읽지도 쓰지도 않는다.
@@ -31,8 +40,8 @@
 
 ## 한계
 - 스텁 cys 가 sh 스크립트라 Windows 에서는 전부 건너뛴다(사유가 찍힌다). 이 테스트는 비-Windows 레인에만 등록된다.
-- The rows follow the producer's SOURCE (format string and argument order), not a running daemon: a value rendered
-  differently at run time (e.g. serde_json printing of pid/exited) is assumed, not measured.
+- The rows follow the producer's SOURCE, not a running daemon. Assumed, not measured: serde_json's compact display of a
+  value equals json.dumps(ensure_ascii=False, separators=(",", ":")) for the plain values used here.
 - 살아 있는 노드 프로세스의 실제 적재 여부는 도구도 이 테스트도 재지 않는다(도구 머리말 "계측의 유효 범위").
 
 실행: CYS_PACK_DIR="$(mktemp -d)" python3 cysjavis-pack/bin/tests/test_computer_use_audit.py
@@ -56,6 +65,8 @@ TOOL = os.path.join(BIN, "javis_computer_use.py")
 ROLE = os.path.join(BIN, "javis_role.py")
 CYS_RS = os.path.join(ROOT, "src", "bin", "cys.rs")
 LIB_RS = os.path.join(ROOT, "src", "lib.rs")
+HANDLERS_RS = os.path.join(ROOT, "src", "bin", "cysd", "handlers.rs")
+STATE_RS = os.path.join(ROOT, "src", "bin", "cysd", "state.rs")
 SRV = "computer-use"
 DEPT = "7"
 
@@ -89,21 +100,108 @@ def _rust_str(lit):
     return "".join(out)
 
 
+def _split_args(text):
+    """Top-level comma split of a Rust argument list (quotes and brackets respected); a trailing comma is allowed."""
+    out, depth, cur, i, q = [], 0, [], 0, False
+    while i < len(text):
+        ch = text[i]
+        if q:
+            cur.append(ch)
+            if ch == "\\":
+                cur.append(text[i + 1]); i += 1
+            elif ch == '"':
+                q = False
+        elif ch == '"':
+            q = True; cur.append(ch)
+        elif ch in "([{":
+            depth += 1; cur.append(ch)
+        elif ch in ")]}":
+            depth -= 1; cur.append(ch)
+        elif ch == "," and depth == 0:
+            out.append("".join(cur).strip()); cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    if "".join(cur).strip():
+        out.append("".join(cur).strip())
+    return out
+
+
+# How the CLI renders a printed argument: the raw string, or serde_json's display of the value. Nothing else is accepted.
+_ARG_STR = re.compile(r's\["(\w+)"\]\.as_str\(\)\.unwrap_or\("((?:[^"\\]|\\.)*)"\)')
+_ARG_JSON = re.compile(r's\["(\w+)"\]')
+# How the daemon makes each printed value in surface.list: a recognised expression over one Surface field (typed by the
+# struct) or the surface_ref() call. Any other expression is a moved producer.
+_DAEMON_EXPR = re.compile(r'(?:cys::)?surface_ref\(s\.id\)|s\.(\w+)(?:\.lock\(\)\.unwrap\(\)\.clone\(\)|\.load\(Ordering::Relaxed\))?')
+_RUST_KIND = {"String": "str", "Mutex<String>": "str", "Option<String>": "str|null", "Mutex<Option<String>>": "str|null",
+              "u32": "int", "u64": "int", "AtomicBool": "bool"}
+
+
+def _daemon_kinds(keys):
+    """JSON kind of each printed key as the daemon builds it in the surface.list arm (handlers.rs + Surface in state.rs)."""
+    h, st = _read(HANDLERS_RS), _read(STATE_RS)
+    i = h.find('"surface.list" => {')
+    j = h.find("json!({", i) if i >= 0 else -1
+    if j < 0:
+        raise ProducerMoved("src/bin/cysd/handlers.rs: surface.list payload not found")
+    body = h[j:h.find("})", j)]
+    m = re.search(r"pub struct Surface \{(.*?)\n\}", st, re.S)
+    if not m:
+        raise ProducerMoved("src/bin/cysd/state.rs: struct Surface not found")
+    ftype = dict(re.findall(r"pub (\w+): ([^,\n]+),", m.group(1)))
+    kinds = {}
+    for k in keys:
+        e = re.search(r'"%s": ([^,\n]+),' % re.escape(k), body)
+        if not e:
+            raise ProducerMoved("src/bin/cysd/handlers.rs: surface.list has no %r value" % k)
+        expr = e.group(1).strip()
+        d = _DAEMON_EXPR.fullmatch(expr)
+        if not d:
+            raise ProducerMoved("src/bin/cysd/handlers.rs: surface.list %r is made by an unrecognised expression %r" % (k, expr))
+        if d.group(1) is None:
+            if k != "surface_ref":
+                raise ProducerMoved("src/bin/cysd/handlers.rs: surface.list %r is made by surface_ref()" % k)
+            kinds[k] = "str"                                  # surface_ref(id) -> String (src/lib.rs)
+        else:
+            if d.group(1) != k:                               # the printed key must be that Surface field, not another
+                raise ProducerMoved("src/bin/cysd/handlers.rs: surface.list %r is read from Surface.%s" % (k, d.group(1)))
+            t = ftype.get(d.group(1), "").strip()
+            if t not in _RUST_KIND:
+                raise ProducerMoved("src/bin/cysd/state.rs: Surface.%s has type %r - its JSON form is not derived" % (d.group(1), t))
+            kinds[k] = _RUST_KIND[t]
+    return kinds
+
+
+_PRODUCER = None
+
+
 def producer():
     """What the real producer prints, read from its source: the `cys list` row template and argument keys, the seat
     title format, the surface ref format, and the socket names cys reads (in order, and whether empty is skipped)."""
+    global _PRODUCER
+    if _PRODUCER is not None:
+        return _PRODUCER
     cys, lib = _read(CYS_RS), _read(LIB_RS)
     m = re.search(r'Command::List\s*=>\s*request\("surface\.list".*?println!\(\s*"((?:[^"\\]|\\.)*)",(.*?)\);',
                   cys, re.S)
     if not m:
         raise ProducerMoved("src/bin/cys.rs: Command::List println not found")
-    row_fmt, keys = _rust_str(m.group(1)), re.findall(r's\["(\w+)"\]', m.group(2))
-    if row_fmt.count("{}") != len(keys):
-        raise ProducerMoved("src/bin/cys.rs: Command::List has %d placeholders for %d fields" % (row_fmt.count("{}"), len(keys)))
-    m = re.search(r'fn workflow_title\(.*?\.map\(\|folder\| format!\("([^"]*)"\)\)', cys, re.S)
+    row_fmt, keys, render = _rust_str(m.group(1)), [], []
+    for arg in _split_args(m.group(2)):
+        a, b = _ARG_STR.fullmatch(arg), _ARG_JSON.fullmatch(arg)
+        if a:
+            keys.append(a.group(1)); render.append(("str", _rust_str(a.group(2))))
+        elif b:
+            keys.append(b.group(1)); render.append(("json", None))
+        else:
+            raise ProducerMoved("src/bin/cys.rs: Command::List renders an argument by an unrecognised expression %r" % arg)
+    if row_fmt.count("{}") != len(keys) or re.search(r"\{[^}]", row_fmt.replace("{}", "")):
+        raise ProducerMoved("src/bin/cys.rs: Command::List format %r does not take exactly %d plain {} fields" % (row_fmt, len(keys)))
+    m = re.search(r'fn workflow_title\(.*?\.map\(\|folder\| format!\("([^"]*)"\)\)\s*'
+                  r'\.unwrap_or_else\(\|\| format!\("([^"]*)"\)\)', cys, re.S)
     if not m:
-        raise ProducerMoved("src/bin/cys.rs: workflow_title format not found")
-    title_fmt = _rust_str(m.group(1))
+        raise ProducerMoved("src/bin/cys.rs: workflow_title formats (with folder / without) not found")
+    title_fmt, title_bare_fmt = _rust_str(m.group(1)), _rust_str(m.group(2))
     m = re.search(r'pub fn surface_ref\(id: u64\) -> String \{\s*format!\("([^"]*)"\)', lib)
     if not m:
         raise ProducerMoved("src/lib.rs: surface_ref format not found")
@@ -121,7 +219,9 @@ def producer():
     order = [primary] + [alias[v] for v in re.findall(r'(\w+)\.as_str\(\)', a.group(1))]
     if "!v.is_empty()" not in body:
         raise ProducerMoved("src/lib.rs: env_compat no longer skips empty values - the stub's resolution would be wrong")
-    return {"row_fmt": row_fmt, "keys": keys, "title_fmt": title_fmt, "ref_fmt": ref_fmt, "socket_keys": order}
+    _PRODUCER = {"row_fmt": row_fmt, "keys": keys, "render": render, "kinds": _daemon_kinds(keys),
+                 "title_fmt": title_fmt, "title_bare_fmt": title_bare_fmt, "ref_fmt": ref_fmt, "socket_keys": order}
+    return _PRODUCER
 
 
 def stub_script(socket_keys):
@@ -196,16 +296,29 @@ class Rig(unittest.TestCase):
         os.chmod(path, 0o644)
 
     def row(self, sid, role, agent, cwd):
-        """One `cys list` row built from the producer's own templates (see producer())."""
-        folder = cwd.rstrip("/").rsplit("/", 1)[-1]
-        vals = {"surface_ref": self.prod["ref_fmt"].format(id=sid), "role": role, "pid": str(4000 + sid),
-                "exited": "false", "title": self.prod["title_fmt"].format(role=role, agent=agent, folder=folder),
-                "cwd": cwd}
-        unknown = [k for k in self.prod["keys"] if k not in vals]
-        if unknown:
-            raise ProducerMoved("src/bin/cys.rs: Command::List prints field(s) %s the stub cannot fill" % unknown)
+        """One `cys list` row built from the producer's own templates and rendering (see producer())."""
+        # workflow_title: the last path segment, or the bare "<role>-<agent>" form when there is none (a root cwd)
+        folder = cwd.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
+        if folder and not (len(folder) == 2 and folder[1] == ":" and folder[0].isalpha()):
+            title = self.prod["title_fmt"].format(role=role, agent=agent, folder=folder)
+        else:
+            title = self.prod["title_bare_fmt"].format(role=role, agent=agent)
+        vals = {"surface_ref": self.prod["ref_fmt"].format(id=sid), "role": role, "pid": 4000 + sid, "exited": False,
+                "title": title, "cwd": cwd}
+        kind_of = {str: "str", int: "int", bool: "bool"}
+        out = []
+        for k, (how, default) in zip(self.prod["keys"], self.prod["render"]):
+            if k not in vals:
+                raise ProducerMoved("src/bin/cys.rs: Command::List prints field %r the stub cannot fill" % k)
+            v = vals[k]
+            if kind_of[type(v)] not in self.prod["kinds"][k].split("|"):
+                raise ProducerMoved("daemon makes %r as %s, the stub has %s" % (k, self.prod["kinds"][k], kind_of[type(v)]))
+            if how == "str":
+                out.append(v if isinstance(v, str) else default)
+            else:                                   # serde_json display of a Value: compact JSON
+                out.append(json.dumps(v, ensure_ascii=False, separators=(",", ":")))
         parts = self.prod["row_fmt"].split("{}")
-        return "".join(p + vals[k] for p, k in zip(parts, self.prod["keys"])) + parts[-1]
+        return "".join(p + x for p, x in zip(parts, out)) + parts[-1]
 
     def seats(self, lane, rows):
         """rows = [(sid, role, agent, cwd)] — written in the producer's row format."""
@@ -286,6 +399,13 @@ class A1Gap(Rig):
         self.rc(1, r, "부서 레인 미탑재")
         self.assertIn("dept-%s" % DEPT, r.stdout)
         self.assertIn("%s|list" % self.dept_sock, self.calls())
+
+    def test_seat_whose_title_has_no_folder_is_still_claude(self):
+        # a root cwd gives workflow_title's bare "<role>-<agent>" form - the agent must still be read from it
+        self.seats("base", [(1, "worker", "claude", "/")])
+        r = self.run_tool()
+        self.rc(1, r, "bare-title Claude seat")
+        self.assertTrue(any(ln.split()[:3] == ["미탑재", "base", "/"] for ln in r.stdout.splitlines()), r.stdout)
 
     def test_missing_projects_entry_is_a_gap(self):
         self.write_cfg(self.base_cfg, {"/elsewhere": {"enabledMcpServers": [SRV]}})
