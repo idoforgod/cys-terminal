@@ -1862,8 +1862,20 @@ def _persist_anomalies(ledger_status=None):
     """★관측된 이상징후를 **대장에 영속**한다 — 판정 필드는 한 글자도 바꾸지 않는다.
 
     ## 왜 필요한가 (R5 — 흔적이 실제로 남는지 확인하지 않으면 감사 층은 자기위안이다)
-    훅(`hooks/role-bootstrap.sh:191`)은 `javis_mission.py record` 를 **`2>&1 >/dev/null`** 로
-    부른다 — 즉 **stderr 를 버린다**. 그래서 프롬프트를 기계로 접은 경로(대장 무변경)에서
+    ★**정정 2026-10-13 (CEO 실측 · 종전 문면은 세 가지가 틀렸다 — 파일명·서브커맨드·리다이렉션
+    형태. 아래가 측정된 사실이다)**: 등록된 UserPromptSubmit 훅은 `hooks/role-bootstrap.sh` 인데
+    그 파일의 `javis_mission` 참조는 **0건**이다 — 그것은 **래퍼**이고 :408-409 에서
+    `hooks/role-bootstrap-legacy.sh` 로 위임한다. 본체의 **live 경로는 `legacy:586` 의
+    `hook-triage` 를 `2>/dev/null`** 로 부르는 것이고(stderr 만 버린다), `legacy:605` 의
+    `record ... >/dev/null 2>&1` 는 **구팩 폴백**(hook-triage 부재·rc=64)이다.
+    ⚠**`2>&1 >/dev/null` 는 두 경로 어디에도 없다** — 그 형태는 애초에 stderr 를 버리지도
+    않는다(stderr 를 **그 시점의** stdout 에 붙이므로, UserPromptSubmit 훅의 stdout 은 세션에
+    주입되니 코드가 **감춰지는 대신 컨텍스트로 들어간다**). ★순서가 결론을 뒤집는다.
+    ⇒ **이 함수가 필요한 이유는 그대로 유효하다**(live 경로가 `2>/dev/null` 로 stderr 를 버리므로
+    프롬프트 유래 이상은 관측 시점에 붙잡지 않으면 영영 없다) — 틀렸던 것은 **근거 문면**이다.
+    ★이 정정의 계기: 한 워커가 이 독스트링을 **파일을 읽은 것처럼 인용**해 보고했고(세 특정 모두
+    이 문장에서 나왔다), CEO 가 그 세 가지를 직접 재서 반증했다. **주석은 측정이 아니라 주장이며,
+    자기가 설명하는 대상 안에 앉아 있기 때문에 그 대상의 권위를 물려받는다.** 그래서 프롬프트를 기계로 접은 경로(대장 무변경)에서
     발행한 `delivery_out_of_window`·`delivery_concatenated`·`delivery_substring` 은
     **그 자리에서 사라졌다**(다음 `status` 는 그 프롬프트를 다시 보지 않으므로 재관측도 안 된다).
     원장 회전·손상 같은 '상태 유래' 이상은 매 판독마다 재관측되지만, **프롬프트 유래** 이상은
@@ -2259,6 +2271,15 @@ def cmd_machine_origin(argv):
     _ = argv
     rc, token = _machine_origin_step(_read_hook_stdin())
     print("machine-origin: %s" % token)
+    # ★MISSION-ANOMALY-EMIT(2026-10-13): 수집한 이상징후를 **이 명령에서도** 드러낸다.
+    #   종전: `_push_anomaly` 가 `_ANOMALY_SINK` 에 쌓기만 하고 이 서브커맨드는 토큰 1줄만
+    #   인쇄했다 — 실측으로 machine-origin 3회 실행에 코드 0건, 같은 원장에서 status 1회에
+    #   stderr 47건(ledger_rotated 25 · delivery_substring 22)이었다. **수집하고 발행하지
+    #   않는 도구가 결함**이고, 보고 의무는 그래서 충족 불가능했다.
+    #   ★판정 경로 무접촉: rc 와 stdout 토큰은 위에서 이미 확정됐고 이 호출은 stderr 에만
+    #   쓴다(`_stderr_anomalies` 자신의 규약 — 「판정은 바꾸지 않는다」). 발행 형식도 status
+    #   와 **같은 한 곳**을 쓰므로 소비자는 파서를 하나만 갖는다.
+    _stderr_anomalies()
     return rc
 
 
@@ -4315,6 +4336,10 @@ _USAGE = """usage: javis_mission.py [record|status|set <임무>|clear|path|deliv
 """
 
 
+# ★stdin 을 읽는 서브커맨드 — 이 셋만 `--help` 에서 멈출 수 있었다(위 main 의 분기 참조).
+_STDIN_COMMANDS = ("record", "machine-origin", "hook-triage")
+
+
 def main(argv):
     if "--self-test" in argv:
         return cmd_self_test()
@@ -4327,6 +4352,16 @@ def main(argv):
     if fn is None:
         sys.stderr.write(_USAGE)
         return 64                                # EX_USAGE — 미지 서브커맨드 거부(fail-closed)
+    # ★MISSION-ANOMALY-EMIT(2026-10-13): stdin 을 읽는 서브커맨드의 `--help` 는 **읽기 전에**
+    #   답한다. 종전: `machine-origin --help` 는 도움말을 인쇄하지 않고 `_read_hook_stdin()`
+    #   에서 stdin 을 기다려 **멈췄다**(실측 — 120초 도구 시한에서 죽여야 했다). 인터페이스를
+    #   알아보려는 호출자가 걸리는 함정이었다.
+    #   ★판정 경로 무접촉: 도움말 요청에는 판정이 없고, 분기는 **stdin 을 읽는 세 명령**과
+    #   **rest 의 첫 토큰**으로만 좁혔다 — `set` 처럼 자유 텍스트를 argv 로 받는 명령의 인자를
+    #   삼키지 않기 위해서다(그 명령들은 stdin 을 읽지 않으므로 멈추지도 않는다).
+    if cmd in _STDIN_COMMANDS and rest[:1] and rest[0] in ("--help", "-h"):
+        sys.stdout.write(_USAGE)
+        return 0
     return fn(rest)
 
 
