@@ -4297,6 +4297,8 @@ class _HWin11Cfg(object):
     is_windows = None                 # None -> os.name == "nt" when constructed
     kill_cmd = None                   # None -> ["taskkill", "/PID", pid, "/T", "/F"]
     codecs = None                     # None -> _hw11_codecs() when constructed
+    before_capture = None             # test-only seam (T1 R2-F): f(stdout_path, stderr_path) run after the exit checks and
+                                      # before the capture, to add bytes no earlier check saw; None in production
 
     def __init__(self):
         if self.is_windows is None:
@@ -4483,9 +4485,18 @@ def _hw11_run_child(cmd, cfg, trunc):
                         except subprocess.TimeoutExpired:      # never let it escape: kill_failed is a HARNESS red
                             ev["kill_failed"] = True
                         break
+        if cfg.before_capture is not None:  # test-only seam (see _HWin11Cfg); no production caller sets it
+            cfg.before_capture(po, pe)
         cap_end = clean_end if clean_end is not None else time.monotonic() + cfg.capture_budget
         ev["stdout"], raw_out = _hw11_capture(po, "stdout", cap_end, cfg, trunc, want_body=True)
         ev["stderr"], _ = _hw11_capture(pe, "stderr", cap_end, cfg, trunc)
+    # B-344 R2-F (head ruling on the item-5 residue): the captured snapshot is the last size measured, on every path. Over
+    # raw_max there is an overflow even when the tick and after-exit checks saw nothing - a writer that outlived the exit
+    # check and stopped before the capture. The earlier checks stay: they act before the capture (and can stop the tree).
+    snap = [n for n in ("stdout", "stderr") if type(ev[n].get("bytes")) is int and ev[n]["bytes"] > cfg.raw_max]
+    if snap and not ev["overflow"]:
+        ev["overflow"] = True
+        ev["overflow_snapshot"] = snap
     ev["elapsed_s"] = round(time.monotonic() - t0, 3)
     return ev, raw_out
 
@@ -4632,6 +4643,9 @@ def _hw11_decide(ev, raw_out, requested, cfg, trunc, store):
     if ev["overflow"] and ev.get("overflow_after_exit"):
         cause("HARNESS", "H6-overflow", "자식 출력이 %d B 를 넘었다 — 자식이 이미 스스로 끝나 종료할 트리가 없다(종료 뒤 크기 측정)"
               % cfg.raw_max)
+    elif ev["overflow"] and ev.get("overflow_snapshot"):
+        cause("HARNESS", "H6-overflow", "캡처 스냅숏(%s)이 %d B 를 넘었다 — 종료 뒤 검사가 본 뒤에도 쓴 프로세스가 있었다(앞선 검사는 못 봤다)"
+              % (", ".join(ev["overflow_snapshot"]), cfg.raw_max))
     elif ev["overflow"]:
         cause("HARNESS", "H6-overflow", "자식 출력이 %d B 를 넘어 트리를 종료했다 · kill=%s" % (cfg.raw_max, ev.get("kill")))
     if ev["kill_failed"]:
@@ -4741,8 +4755,8 @@ def _hw11_decide(ev, raw_out, requested, cfg, trunc, store):
 
 # ── B-344 T1: H-WIN-11's Windows branch, simulated on any OS through the REAL main() (DESIGN-v4 s8) ───────────────
 # The design's 52 cases (tools/v4/fake_child_v4.py) and checks (tools/v4/acceptance_v4.py, acceptance_reader_v4.py),
-# ported, plus three R2 cases (B-344 R2, codex R1: a stream over raw_max at a normal exit). Each case runs a driver
-# in its own process: it imports this file, makes the module's `os.name` read "nt"
+# ported, plus five R2 cases (B-344 R2: a stream over raw_max at a normal exit, or only in the captured snapshot). Each
+# case runs a driver in its own process: it imports this file, makes the module's `os.name` read "nt"
 # (every other attribute is the real os), points `__file__` - the path H-WIN-11 hands its child - at a fake child, sets
 # the injected limits on _HWin11Cfg, and calls main(["--json", "--only", "H-WIN-11"]). The fake child takes its case
 # from constants written above its body (never from the environment).
@@ -4995,8 +5009,19 @@ m.__file__ = opts["child"]
 if opts.get("argv0"):
     m.PY = opts["argv0"]
 stub = {"hang": [sys.executable, "-c", "import time; time.sleep(60)"], "noop": [sys.executable, "-c", "pass"]}
+
+
+def grow(n):
+    """before_capture hook: n more stderr bytes after the exit checks - a writer that outlived them and then stopped."""
+    def hook(out_path, err_path):
+        with open(err_path, "ab") as f:
+            f.write(b"g" * n)
+    return staticmethod(hook)
+
+
+hooks = {"grow_stderr_64k": grow(64 << 10), "grow_stderr_16k": grow(16 << 10)}
 for k, v in opts["cfg"].items():
-    setattr(m._HWin11Cfg, k, stub[v] if k == "kill_cmd" else v)
+    setattr(m._HWin11Cfg, k, stub[v] if k == "kill_cmd" else hooks[v] if k == "before_capture" else v)
 sid = "H-WIN-11"
 if opts.get("probe") == "crash_after_capture":
     def boom(*a, **k):
@@ -5085,6 +5110,12 @@ _HW11_T1_CASES = [
     ("overflow_exit_stderr", None, {"cfg": {"raw_max": 64 << 10, "poll": 30.0, "child_timeout": 60.0}}),
     ("overflow_exit_stdout", None, {"cfg": {"raw_max": 64 << 10, "poll": 30.0, "child_timeout": 60.0}}),
     ("exit_below_limit", None, {"cfg": {"raw_max": 64 << 10, "poll": 30.0, "child_timeout": 60.0}}),
+    # B-344 R2-F (the item-5 residue): the same 32 KiB child, then the before_capture seam adds stderr bytes after the exit
+    # checks and stops before the capture - the after-exit check sees 32 KiB, only the captured snapshot shows the rest.
+    ("snapshot_over", "exit_below_limit", {"cfg": {"raw_max": 64 << 10, "poll": 30.0, "child_timeout": 60.0,
+                                                   "before_capture": "grow_stderr_64k"}}),
+    ("snapshot_below", "exit_below_limit", {"cfg": {"raw_max": 64 << 10, "poll": 30.0, "child_timeout": 60.0,
+                                                    "before_capture": "grow_stderr_16k"}}),
     ("rc0_with_fail_row", None, {}), ("crash_row", None, {}), ("missing_requested_id", None, {}),
     ("bool_pass", None, {}), ("fail_count_mismatch", None, {}), ("colon_lines", None, {}),
     ("multiline_reason", None, {}), ("replay_real_macos", "replay", {}),
@@ -5114,7 +5145,7 @@ _HW11_T1_EXP = {
     "unknown_emptystr": ("fail", {"HARNESS"}), "unknown_dict": ("fail", {"HARNESS"}),
     "surviving_writer": ("fail", {"HARNESS"}), "overflow": ("fail", {"HARNESS"}),
     "overflow_exit_stderr": ("fail", {"HARNESS"}), "overflow_exit_stdout": ("fail", {"HARNESS"}),
-    "exit_below_limit": ("pass", set()),
+    "exit_below_limit": ("pass", set()), "snapshot_over": ("fail", {"HARNESS"}), "snapshot_below": ("pass", set()),
     "rc0_with_fail_row": ("fail", {"PRODUCT", "HARNESS"}), "crash_row": ("fail", {"HARNESS"}),
     "missing_requested_id": ("fail", {"HARNESS"}), "bool_pass": ("fail", {"HARNESS"}),
     "fail_count_mismatch": ("fail", {"PRODUCT", "HARNESS"}), "colon_lines": ("fail", {"HARNESS"}),
@@ -5212,7 +5243,7 @@ def _hw11_t1_accept(case, row, wall):
     tfield = {"crash_big": "stderr", "huge_reason": "failing[0].reason", "many_unknown": "summary.unknown_ids[0]",
               "invalid_cp949_64k": "stderr.head.alt.cp949", "control_bytes_1mib": "stderr",
               "huge_stdout_over_parse": "stdout", "overflow": "stderr", "huge_verdict": "summary.verdict",
-              "overflow_exit_stderr": "stderr", "overflow_exit_stdout": "stdout"}
+              "overflow_exit_stderr": "stderr", "overflow_exit_stdout": "stdout", "snapshot_over": "stderr"}
     if case in tfield:
         t = [x for x in trunc if x.get("field") == tfield[case]]
         chk("TRUNC(j): a cut record for %s with dropped_bytes>0 and dropped_range" % tfield[case],
@@ -5313,8 +5344,8 @@ def _hw11_t1_accept(case, row, wall):
     if case in ("overflow_exit_stderr", "overflow_exit_stdout"):     # B-344 R2 (codex R1 on 81cd24d8)
         sname, cfg = case.rsplit("_", 1)[1], ev.get("cfg") or {}
         st = ev.get(sname) or {}
-        chk("OVERFLOW-EXIT(R2): overflow recorded after a normal exit",
-            ev.get("overflow") is True and ev.get("overflow_after_exit") is True)
+        chk("OVERFLOW-EXIT(R2): overflow recorded (by the after-exit check, or the snapshot check that backs it)",
+            ev.get("overflow") is True and (ev.get("overflow_after_exit") is True or bool(ev.get("overflow_snapshot"))))
         chk("OVERFLOW-EXIT(R2): an H6-overflow cause", "H6-overflow" in codes)
         chk("OVERFLOW-EXIT(R2): the child ended by itself - rc 0 kept, not timed out, no kill attempted",
             ev.get("rc") == 0 and ev.get("timed_out") is False and "kill" not in ev)
@@ -5323,6 +5354,21 @@ def _hw11_t1_accept(case, row, wall):
     if case == "exit_below_limit":
         chk("OVERFLOW-EXIT(R2): below raw_max after a normal exit - no overflow",
             ev.get("overflow") is False and not ev.get("overflow_after_exit"))
+    if case == "snapshot_over":                                      # B-344 R2-F
+        st, cfg = ev.get("stderr") or {}, ev.get("cfg") or {}
+        chk("OVERFLOW-SNAPSHOT(R2-F): the after-exit check saw no overflow (32 KiB at the exit)", not ev.get("overflow_after_exit"))
+        chk("OVERFLOW-SNAPSHOT(R2-F): overflow recorded from the captured snapshot of stderr",
+            ev.get("overflow") is True and ev.get("overflow_snapshot") == ["stderr"])
+        chk("OVERFLOW-SNAPSHOT(R2-F): an H6-overflow cause that names the snapshot",
+            any(c.get("code") == "H6-overflow" and "스냅숏" in str(c.get("message", "")) for c in ev.get("causes") or []))
+        chk("OVERFLOW-SNAPSHOT(R2-F): the capture is stable - H5 cannot catch this shape", st.get("stable") is True)
+        chk("OVERFLOW-SNAPSHOT(R2-F): stderr bytes %s > raw_max %s" % (st.get("bytes"), cfg.get("raw_max")),
+            type(st.get("bytes")) is int and type(cfg.get("raw_max")) is int and st["bytes"] > cfg["raw_max"])
+        chk("OVERFLOW-SNAPSHOT(R2-F): rc 0 kept, not timed out, no kill attempted",
+            ev.get("rc") == 0 and ev.get("timed_out") is False and "kill" not in ev)
+    if case == "snapshot_below":
+        chk("OVERFLOW-SNAPSHOT(R2-F): the same growth below raw_max - no overflow",
+            ev.get("overflow") is False and not ev.get("overflow_snapshot"))
     if case == "pass_with_tool_line":
         chk("CORRELATE: tool line captured on PASS too", "SessionStart 에 cys 훅 미등록" in evtext)
     # B-344 4.7: fail_kind on fail rows only, and the evidence on every row (R4)
@@ -5472,7 +5518,7 @@ def _hw11_t1_probe_p1():
 
 @specimen("H-WIN11-CAP-1", "W6",
           "★B-344 H-WIN-11 child capture and verdict on the real code — an unmeasured, unfinished or malformed child "
-          "is red, categorised, bounded and published (52 design cases + 3 R2 cases · reader · probes)", ["B-344"])
+          "is red, categorised, bounded and published (52 design cases + 5 R2 cases · reader · probes)", ["B-344"])
 def h_win11_cap_1():
     """B-344 (DESIGN-v4 s0): an unmeasured child made H-WIN-11 PASS and the run GREEN (the pinned code read neither
     the child's exit code nor summary.verdict), and the child's failure text never reached the run. This specimen is
