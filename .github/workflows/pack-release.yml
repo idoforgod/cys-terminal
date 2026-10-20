@@ -310,7 +310,7 @@ jobs:
                    test_teamtoken test_teamtoken_hook test_dept_team_token \
                    test_dept_create_progress \
                    test_capgate_surrogate_deny test_hud_bridge_0144_bootjs \
-                   test_hud_bridge_0144_specimen test_hud_bridge_0144_unit test_intake_exit_contract; do
+                   test_hud_bridge_0144_specimen test_hud_bridge_0144_unit test_intake_exit_contract test_mission_anomaly_emit; do
             f="cysjavis-pack/bin/tests/$t.py"
             [ -f "$f" ] || { echo "선언·유령집계 테스트 파일 누락: $f (git add 누락 의심)" >&2; exit 1; }
             echo "== [pack-only] declared-state test: $t =="
