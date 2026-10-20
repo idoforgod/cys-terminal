@@ -1084,10 +1084,13 @@ class T15NoTimeoutLengthened(unittest.TestCase):
         "cysjavis-pack/bin/javis_budget.py": ['"RPC_SLACK_S": 10,'],
     }
     # Timeout lines the gate has and the tag does not - all in report-only subcommands, none a gate input.
-    # Pinned by exact line text (the census counts lines), grouped by the subcommand that owns them. ONLY a
-    # change to that report subcommand may change one of these lines, and that commit updates this pin. Any
-    # other new or changed timeout line anywhere in the gate turns test 15 red: there is no exemption by
-    # position (PROMOTE-1: the old F5 cut also exempted the 2026-10-17 code later placed inside it).
+    # Pinned by exact line text, grouped by the subcommand that owns them. ONLY a change to that report
+    # subcommand may change one of these lines, and that commit updates this pin.
+    # What test 15 proves: the census is every non-comment gate line holding the word timeout/TIMEOUT, minus the
+    # lines pinned in NON_TIMEOUT_LINES. So adding, removing or editing any such line anywhere in the gate turns it
+    # red unless that exact line is pinned here or there - there is no exemption by position. Not seen: a timeout
+    # written without the word on its line (p.wait(5), time.sleep(60), a positional select timeout), lines that
+    # start with '#', and a line moved unchanged to another place.
     NEW_REPORT_ONLY_TIMEOUTS = {
         "product-cpu (F5, 0.14.50): _pc_read_ps ps 1.5 s, _pc_run_child": [
             "PRODUCT_CPU_PS_TIMEOUT_S = 1.5        # the separate invocation's own ps timeout (F5-A1 rule 4)",
@@ -1102,6 +1105,14 @@ class T15NoTimeoutLengthened(unittest.TestCase):
             'BG_PARENTS_PS_TIMEOUT_S = 1.5',
             'text=True, errors="replace", timeout=BG_PARENTS_PS_TIMEOUT_S)',
             'return None, "not_measured", "ps timeout %.1f s" % BG_PARENTS_PS_TIMEOUT_S'],
+    }
+    # Gate lines that hold the word but set no timeout. Each is pinned by exact text, must occur exactly once,
+    # and needs a reason; nothing else is ever dropped from the census.
+    NON_TIMEOUT_LINES = {
+        '_bgp_f = _bg_parents_collect(read_ps=lambda: (None, "not_measured", "ps timeout 1.5 s"),':
+            "self-test fixture: the injected reason string of a simulated ps failure (bg-parents)",
+        'and _bgp_f["parents"] is None and "timeout" in (_bgp_f["reason"] or ""),':
+            "self-test check: a substring test on that injected reason",
     }
 
     def test_15_literals(self):
@@ -1120,50 +1131,17 @@ class T15NoTimeoutLengthened(unittest.TestCase):
             def timeout_lines(path):
                 with open(path, encoding="utf-8") as f:
                     txt = f.read()
-                # A line counts when its CODE names a timeout: an identifier (assignment target, keyword
-                # argument, call, attribute, parameter, reference, import) or a whitespace-free string in a
-                # parameter or argv position (dict key, subscript key, call argument, element of a list /
-                # tuple / set passed to a call - so "--timeout" flags and a ["timeout", "5", ...] wrapper
-                # count). The bare word inside a comment, a message or fixture text is not a timeout
-                # (PROMOTE-1: the self-test's "ps timeout 1.5 s" fixture turned the bare-word census red).
-                word = re.compile(r"timeout|TIMEOUT")
-                tree = ast.parse(txt)
-                keys = set()
-                for node in ast.walk(tree):
-                    if isinstance(node, ast.Dict):
-                        keys.update(id(k) for k in node.keys if k is not None)
-                    elif isinstance(node, ast.Subscript):
-                        keys.add(id(node.slice))
-                    elif isinstance(node, ast.Call):
-                        for v in node.args + [k.value for k in node.keywords]:
-                            keys.add(id(v))
-                            if isinstance(v, (ast.List, ast.Tuple, ast.Set)):
-                                keys.update(id(e) for e in v.elts)
-                rows = set()
-                for node in ast.walk(tree):
-                    names, row = (), getattr(node, "lineno", None)
-                    if isinstance(node, ast.Name):
-                        names = (node.id,)
-                    elif isinstance(node, ast.Attribute):
-                        names, row = (node.attr,), node.end_lineno
-                    elif isinstance(node, (ast.keyword, ast.arg)):
-                        names = (node.arg or "",)
-                    elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        names = (node.name,)
-                    elif isinstance(node, (ast.Import, ast.ImportFrom)):
-                        names = tuple(a.asname or a.name for a in node.names)
-                    elif isinstance(node, (ast.Global, ast.Nonlocal)):
-                        names = tuple(node.names)
-                    elif id(node) in keys and isinstance(node, (ast.Constant, ast.JoinedStr)):
-                        parts = [node] if isinstance(node, ast.Constant) else node.values
-                        names = tuple(p.value for p in parts if isinstance(p, ast.Constant)
-                                      and isinstance(p.value, str) and not any(c.isspace() for c in p.value))
-                    if any(word.search(n) for n in names):
-                        rows.add(row)
-                lines = txt.splitlines()
-                return sorted(lines[r - 1].strip() for r in rows)
+                # Every non-comment line holding the word - the original census. Nothing is dropped here; the only
+                # lines taken out are the exact NON_TIMEOUT_LINES below, so this census newly misses no line the
+                # bare-word census counts (PROMOTE-1 R1: an AST census missed assigned argv and aliased imports).
+                return sorted(ln.strip() for ln in txt.splitlines()
+                              if re.search(r"timeout|TIMEOUT", ln) and not ln.strip().startswith("#"))
+            got = timeout_lines(GATE)
+            for ln, why in self.NON_TIMEOUT_LINES.items():
+                self.assertEqual(got.count(ln), 1, "pinned non-timeout line (%s) must occur exactly once: %r" % (why, ln))
+                got.remove(ln)
             pinned = [ln for group in self.NEW_REPORT_ONLY_TIMEOUTS.values() for ln in group]
-            self.assertEqual(timeout_lines(GATE), sorted(timeout_lines(tag_gate) + pinned))
+            self.assertEqual(got, sorted(timeout_lines(tag_gate) + pinned))
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
