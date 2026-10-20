@@ -750,6 +750,9 @@ gh release create v0.2.0 --draft --title "cys 0.2.0" --notes-file docs/RELEASE_N
       초록이어도 Windows 에서 전 검체가 통과했다는 뜻이 아니다(실패·절단도 conclusion 은 success 로 찍힌다). 발행 전에 바로 뒤의 판독
       스텝(annotation · STEP_SUMMARY)에서 실패 검체 이름 목록을 읽고 원인을 분류한다: 제품 결함 / 검체의 유닉스 가정 / 러너 환경.
       제품 결함이 하나라도 있으면 릴리스 노트의 알려진 한계에 적고, 직전 런에 없던 새 실패가 생겼는지 대조한다.
+      ★B-344: the bootstrap-health step (`부트스트랩 건강성 — H-WIN 검체 실기`) is `continue-on-error: true` as well, by design, so on a
+      bootstrap-health red its REST conclusion also reads `success`. That red is carried by the blocking step
+      `부트스트랩 건강성 판정 결박 (H-WIN · 차단 · fail-closed)`, the job and run conclusion, and the bootstrap-health step's annotations.
       **0.14.43 의 경과**(릴리스 노트 §14): 이 단계는 이번 판 이전부터 한 검체에서 멈춘 채 30분 상한에 끊겼고, 그 검체를 건너뛰자 처음
       완주해 1680 통과 · 196 실패 · 3 무시였다(진단 실행 `37188821194` · 건강성 잡은 1681 · 195 · 3). 196건 분류: 상태 폴더 공유 154 ·
       경로 구분자 3 · `HOME` 전제 2 · 유닉스 전제 35 · 제품 결함 2건(원인 1 — 승인 서명 · 고침). 수리 뒤(커밋 `2bf75a12`) 같은 명령의
