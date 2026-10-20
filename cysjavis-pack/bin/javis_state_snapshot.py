@@ -20,6 +20,7 @@
 # GC 정책: 최근 48세대 + 일별 대표 14일 보관, 그 외 삭제(state-generations/ 내부만).
 #   ★B-321: 레인별 풀 — 한 세대는 자기가 담은 모든 레인의 풀에 들고, 정책은 풀마다 적용·합집합 보관한다.
 #   depts.json 에서 빠진 부서 레인은 최신 1세대만(최종 상태 보관 · 이력 미보관). compute_gc 참조.
+#   ★B317-R1: 부모(d478d97f) 판정을 바닥으로 합집합 — 이 판은 부모가 보관하던 세대를 지우지 않는다(위 예외만).
 # B-317: 적재 = 전 레인 round(카드·노드 TODO·법 묶음) + 레인별 정본 카드(capture_lanes) · DB/WAL/SHM/.bak 제외.
 # D-07: TODO glob 0건도 필수 누락으로 기록하고, autopilot.json 선택부재는 별도 계수한다.
 # D-07: dry-run 은 디렉터리 생성·임시 세대 청소 없이 보관 대상만 표시한다.
@@ -108,8 +109,10 @@ def _dept_state_dirs(state_root, depts_json=None, windows=None, localappdata=Non
         try:
             reg = json.load(open(dj, encoding="utf-8-sig"))
             for _name, meta in (reg.get("depts") or {}).items():
-                sock = (meta or {}).get("socket")
-                if sock:
+                # ★B317-R1(R1-b): 항목별 관용 — 깨진 항목 하나(객체 아님·소켓이 문자열 아님)가 뒤 항목의 상태 자리를 버리지
+                #   않는다. 같은 레지스트리 문제는 capture_lanes 가 세대 missing 에 올린다(_registry_pack_dirs).
+                sock = meta.get("socket") if isinstance(meta, dict) else None
+                if isinstance(sock, str) and sock:
                     if win:
                         dirs.add(os.path.realpath(_win_state_dir_for_socket(sock, localappdata=localappdata)))
                     else:
@@ -194,22 +197,40 @@ def _capture_excluded(path):
 
 
 def _registry_pack_dirs(depts_json):
-    """depts.json 의 부서별 pack_dir → [(부서명, pack_dir)] (이름순). ★판독 실패는 [] —
-    ⛔레지스트리 실패가 본부·발화 레인 적재를 죽이지 않는다(그 레인들은 레지스트리 없이도 선언된다)."""
+    """depts.json 의 부서별 pack_dir → ([(부서명, pack_dir)] 이름순, [레지스트리 문제 기술]).
+    ⛔레지스트리 실패가 본부·발화 레인 적재를 죽이지 않는다(그 레인들은 레지스트리 없이도 선언된다).
+    ★B317-R1 M3(codex) + HEAD/CEO fail-closed: 판독 실패를 「부서 0개」로 접지 않는다 — 문제는 do_snapshot 이
+      manifest `missing` 에 올려 세대를 INCOMPLETE 로 표시한다(읽지 못한 입력은 출력을 짧게가 아니라 크게 만든다).
+      · 파일 부재 = 빈 등재(cys-dept 계약 「depts.json 부재는 정상 빈 등재」) — 문제 아님. 부재 파일 자체는
+        default_sources 가 소스로 선언하므로 종전대로 missing 에 뜬다. `depts` 키 부재도 빈 등재(같은 계약의 .get).
+      · 판독·디코딩·파싱 실패, 최상위·`depts` 꼴 불일치 = 레지스트리 문제 1건(부서 레인을 하나도 알 수 없다).
+      · 항목 꼴 불일치(객체 아님 · pack_dir 이 비어 있거나 문자열 아님) = 그 항목 문제 1건 — ⛔유효한 다른 항목은 버리지 않는다.
+    GC 쪽(_lane_caps)은 별도 판정이다 — 같은 문제에서 부재를 판정하지 않고 전 레인 48 을 유지한다."""
     try:
         with open(depts_json, encoding="utf-8-sig") as f:
             reg = json.load(f)
-        out = []
-        for name, meta in sorted((reg.get("depts") or {}).items()):
-            pd = (meta or {}).get("pack_dir")
-            if isinstance(pd, str) and pd:
-                out.append((name, pd))
-        return out
-    except Exception:
-        return []
+    except FileNotFoundError:
+        return [], []
+    except Exception as e:
+        why = ("%s: %s" % (type(e).__name__, e)).replace("\n", " ")[:160]
+        return [], ["%s [registry unreadable: %s]" % (depts_json, why)]
+    if not isinstance(reg, dict):
+        return [], ["%s [registry shape: top level is not an object]" % depts_json]
+    depts = reg.get("depts", {})
+    if not isinstance(depts, dict):
+        return [], ["%s [registry shape: depts is not an object]" % depts_json]
+    out, faults = [], []
+    for name, meta in sorted(depts.items()):
+        pd = meta.get("pack_dir") if isinstance(meta, dict) else None
+        if isinstance(pd, str) and pd:
+            out.append((name, pd))
+        else:
+            faults.append("%s#depts/%s [registry entry: %s]" % (
+                depts_json, name, "not an object" if not isinstance(meta, dict) else "no usable pack_dir"))
+    return out, faults
 
 
-def capture_lanes(home=HOME, env=None, depts_json=None):
+def capture_lanes(home=HOME, env=None, depts_json=None, faults=None):
     """[(레인, round 디렉터리, 그 레인의 정본 카드 경로)] — 세대가 담아야 하는 레인 전부.
       · 본부(base): `<home>/.cys/pack` 이 실재하면. round = `<home>/.cys/pack/round`,
         ★정본 카드 = `<home>/_round/SESSION_STATE.md`(결정 7 · 부트가 주입하는 라이브 카드 — 본부 레인 한정).
@@ -217,7 +238,9 @@ def capture_lanes(home=HOME, env=None, depts_json=None):
       · 발화 레인: project_round_dir(env) — 위 둘에 이미 있으면 생략(실경로 비교). 레지스트리 밖 팩·JAVIS_ROOT
         프로젝트도 종전처럼 담긴다(종전 단일 레인 계약을 합집합 안에 보존).
     ★fail-closed: 선언된 레인의 round·카드가 없으면 default_sources 가 그 경로를 그대로 남겨 manifest `missing`
-      에 뜬다 — 선언하지 않아 「완전해 보이는」 종전 실패 방향을 뒤집는다."""
+      에 뜬다 — 선언하지 않아 「완전해 보이는」 종전 실패 방향을 뒤집는다.
+    ★B317-R1 M3: 레지스트리 문제(판독 불가·꼴 불일치·깨진 항목)는 faults(리스트) 에 덧붙는다 — 레인을 알 수 없는 부서도
+      조용히 사라지지 않게 do_snapshot 이 그것을 missing 에 올린다. faults=None 이면 종전처럼 버린다(조회 전용 호출)."""
     lanes, seen = [], set()
 
     def _add(lane, rd, card):
@@ -233,7 +256,10 @@ def capture_lanes(home=HOME, env=None, depts_json=None):
         #   선언된 채 누락으로 뜬다(fail-closed).
         bcard = os.path.join(home, "_round", ROUND_CARD) if os.path.isdir(os.path.join(home, "_round")) else None
         _add(BASE_LANE, os.path.join(base_pack, "round"), bcard)
-    for name, pack in _registry_pack_dirs(depts_json or os.path.join(home, ".cys", "depts.json")):
+    entries, errs = _registry_pack_dirs(depts_json or os.path.join(home, ".cys", "depts.json"))
+    if faults is not None:
+        faults.extend(errs)
+    for name, pack in entries:
         rd = os.path.join(pack, "round")
         _add(name, rd, os.path.join(rd, ROUND_CARD))
     rd = project_round_dir(env=env)
@@ -241,9 +267,12 @@ def capture_lanes(home=HOME, env=None, depts_json=None):
     return lanes
 
 
-def canonical_cards(home=HOME, env=None, depts_json=None):
-    """{레인: 정본 카드 경로} — 세대 manifest 의 `canonical_cards` 로 기록되어 복원 경로가 이름으로 고른다."""
-    return {lane: card for lane, _rd, card in capture_lanes(home=home, env=env, depts_json=depts_json) if card}
+def canonical_cards(home=HOME, env=None, depts_json=None, lanes=None):
+    """{레인: 정본 카드 경로} — 세대 manifest 의 `canonical_cards` 로 기록되어 복원 경로가 이름으로 고른다.
+    lanes = 이미 해소한 capture_lanes() 결과(do_snapshot 이 소스와 같은 해소를 넘긴다 · 미주입 = 여기서 해소)."""
+    if lanes is None:
+        lanes = capture_lanes(home=home, env=env, depts_json=depts_json)
+    return {lane: card for lane, _rd, card in lanes if card}
 
 
 def select_card(manifest, lane=BASE_LANE):
@@ -264,11 +293,13 @@ def select_card(manifest, lane=BASE_LANE):
     return None
 
 
-def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, localappdata=None, env=None):
+def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, localappdata=None, env=None,
+                    lanes=None):
     """세대 보관 소스를 동적 산출한다(정적 목록 대체). 메인 선언상태 + 루트 레지스트리 +
     ★발견되는 모든 부서의 선언상태를 자동 포함 = '태어날 때부터 보호'(손 배선 0).
     ★Windows(권고#1): 메인 상태=%LOCALAPPDATA%\\cys, 부서=그 하위 cys-dept-*(state.rs 레이아웃). unix 는 종전대로
-    <state_root>/cys + <state_root>/cys-dept-*. windows/localappdata 주입으로 mac 에서도 win 분기 단위검증 가능."""
+    <state_root>/cys + <state_root>/cys-dept-*. windows/localappdata 주입으로 mac 에서도 win 분기 단위검증 가능.
+    lanes = 이미 해소한 capture_lanes() 결과(B317-R1 · gemini minor: 스냅샷당 레인 해소 1회 — 미주입 = 여기서 해소)."""
     win = IS_WINDOWS if windows is None else windows
     if win:
         base = localappdata or os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
@@ -300,7 +331,9 @@ def default_sources(home=HOME, state_root=None, depts_json=None, windows=None, l
             seen.add(k)
             srcs.append(p)
 
-    for _lane, proj_round, card in capture_lanes(home=home, env=env, depts_json=depts_json):
+    if lanes is None:
+        lanes = capture_lanes(home=home, env=env, depts_json=depts_json)
+    for _lane, proj_round, card in lanes:
         _add_src(os.path.join(proj_round, ROUND_CARD))
         # D-07: 종전엔 glob 0건이 조용한 0이라 phoenix 세대에서 노드 TODO 누락이 보이지 않았다.
         todo_pattern = os.path.join(proj_round, ROUND_TODO_GLOB)
@@ -445,11 +478,17 @@ def _cleanup_tmp(gen_root):
 def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None, cards=None):
     """상태 파일 세대 1건을 원자적으로 생성한다. 생성된 세대 이름 반환(dry_run이면 None).
     ★B-317 결정 7: 기본 소스(sources=None)면 레인별 정본 카드 지도(canonical_cards)를 manifest 에 기록한다 —
-    복원은 select_card() 가 이 지도의 **경로 이름**으로 고른다. 명시 소스 호출은 cards 를 줄 때만 기록한다."""
+    복원은 select_card() 가 이 지도의 **경로 이름**으로 고른다. 명시 소스 호출은 cards 를 줄 때만 기록한다.
+    ★B317-R1(gemini minor · HEAD 편입): 레인은 스냅샷당 **한 번** 해소해 소스와 카드 지도에 같이 넘긴다 — 두 번 해소하면
+      그 사이 레지스트리가 바뀔 때 카드 지도가 이 세대에 없는 경로를 가리킨다.
+    ★B317-R1 M3 + HEAD/CEO: 레지스트리 문제(registry_faults)는 manifest `missing` 에 올라 세대가 INCOMPLETE 로 표시되고,
+      요약 줄(phoenix-snapshot-6h 가 `| tail -3` 으로 master 에 push 하는 본문)에 INCOMPLETE 가 찍힌다. rc 는 종전대로 0."""
+    registry_faults = []
     if sources is None:
-        sources = default_sources()
+        lanes = capture_lanes(faults=registry_faults)
+        sources = default_sources(lanes=lanes)
         if cards is None:
-            cards = canonical_cards()
+            cards = canonical_cards(lanes=lanes)
     present, missing, optional_absent = [], [], []
     for s in sources:
         if os.path.isfile(s):
@@ -458,6 +497,14 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
             optional_absent.append(s)
         else:
             missing.append(s)
+    for f in registry_faults:
+        print(f"[snapshot] ⚠ 부서 레지스트리 문제 — 그 부서 round 를 담지 못했을 수 있다: {f}", file=sys.stderr)
+    n_missing = len(missing) + len(registry_faults)
+    incomplete = ""
+    if n_missing:
+        incomplete = " — INCOMPLETE: 누락 %d건" % n_missing
+        if registry_faults:
+            incomplete += " (그중 depts.json registry 문제 %d건)" % len(registry_faults)
 
     if dry_run:
         print(f"[dry-run] 세대 보관 대상 {len(present)}건:")
@@ -465,12 +512,16 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
             print(f"  + {s}  ({os.path.getsize(s)}B)")
         for s in missing:
             print(f"  - (없음) {s}")
+        for s in registry_faults:
+            print(f"  - (registry 문제) {s}")
         for s in optional_absent:
             print(f"  - (선택·없음) {s}")
         if cards:
             print(f"[dry-run] 레인별 정본 카드 {len(cards)}건:")
             for lane in sorted(cards):
                 print(f"  * {lane} -> {cards[lane]}  ({'있음' if os.path.isfile(cards[lane]) else '없음'})")
+        if incomplete:
+            print(f"[dry-run]{incomplete}")
         return None
 
     os.makedirs(gen_root, exist_ok=True)
@@ -492,7 +543,7 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
         "created_at_iso": dt.isoformat(),
         "generator": "javis_state_snapshot.py",
         "files": [],
-        "missing": sorted(missing),
+        "missing": sorted(missing + registry_faults),
         "optional_absent": sorted(optional_absent),
     }
     if cards:
@@ -569,8 +620,8 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
     gen_name = os.path.basename(final_dir)
-    print("[snapshot] 세대 생성: %s  (파일 %d건, 누락 %d건, 선택부재 %d건)" %
-          (gen_name, len(present), len(missing), len(optional_absent)))
+    print("[snapshot] 세대 생성: %s  (파일 %d건, 누락 %d건, 선택부재 %d건)%s" %
+          (gen_name, len(present), n_missing, len(optional_absent), incomplete))
 
     # 3) GC
     kept, deleted = do_gc(gen_root=gen_root, dry_run=False)
@@ -579,24 +630,40 @@ def do_snapshot(sources=None, gen_root=GEN_ROOT, dry_run=False, crash_hook=None,
     return gen_name
 
 
-def _parse_stamp(name):
+def _stamp_second(name):
+    """이름의 초 단위 시각(접미 무시) = 부모(d478d97f)의 _parse_stamp. ⛔순서 규칙이 아니다 — compute_gc 의
+    부모 바닥(_parent_floor)만 쓴다(B317-R1 M1). 세대의 순서는 언제나 _parse_stamp 하나다."""
     m = GEN_NAME_RE.match(name)
     if not m:
         return None
-    dt = datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+    return datetime.strptime(m.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+
+
+def _parse_stamp(name):
+    """★세대 순서 규칙 하나(B-320 + B317-R1 M2 · HEAD/CEO): 이름 시각, 그다음 **숫자** 충돌 접미.
+    GC 정렬(compute_gc·_gen_effective_dt)과 card 의 기본 세대 선택(do_card)이 모두 이 함수로 순서를 정한다 —
+    `<s>-10` 은 `<s>-9` 보다 나중이고(문자열 순서와 반대) `<s>-1` 은 `<s>` 보다 나중이다."""
+    dt = _stamp_second(name)
+    if dt is None:
+        return None
     # ★B-320: 충돌 접미(-k)를 버리지 않는다. 종전엔 `<stamp>` 와 `<stamp>-1` 이 같은 시각으로 파싱돼 정렬 동률을
     #   **입력 순서**가 깼다(정책 아님 · 동시 발화한 두 레인 중 하나가 그날 유일 세대를 잃는다). k 마이크로초를 더해
     #   승격 순서(k 증가)대로 구별한다 — k ≤ 9999 < 1초이므로 초·날짜 귀속은 바뀌지 않는다.
-    if m.group(2):
-        dt += timedelta(microseconds=int(m.group(2)))
+    #   ★B317-R1(R1-a): 접미는 999999µs 에서 멈춘다 — do_snapshot 은 9999 를 넘는 접미를 만들지 않지만 손으로 만든 이름의
+    #   거대 접미가 다음 초·다음 날로 넘거나(일별 대표 귀속이 바뀐다) timedelta OverflowError 로 GC·card 를 죽이지 않게 한다.
+    #   1e6 이상끼리는 같은 시각이 되고, 그 동률은 호출자의 문자열 정렬이 깬다(생산자가 만들지 않는 이름이다).
+    sfx = GEN_NAME_RE.match(name).group(2)
+    if sfx:
+        dt += timedelta(microseconds=min(int(sfx), 999999))
     return dt
 
 
-def _gen_effective_dt(gen_root, name):
+def _gen_effective_dt(gen_root, name, nominal_of=_parse_stamp):
     """★E3(P2-5) 세대 실효 시각 — 이름의 명목 타임스탬프와 디렉터리 mtime 중 **더 나중**을 취한다.
     시계 역행 시 실제로 더 최근에 만든 세대가 이름은 lexically 작아지는데, mtime 이 이를 바로잡아 '최근'으로
-    인식되게 한다(lexical 오선택·GC 오삭제 방어). 둘 다 없으면 None."""
-    nominal = _parse_stamp(name)
+    인식되게 한다(lexical 오선택·GC 오삭제 방어). 둘 다 없으면 None.
+    nominal_of = 명목 시각 함수(기본 = 순서 규칙 _parse_stamp · 부모 바닥은 _stamp_second 로 부모 판정을 재현한다)."""
+    nominal = nominal_of(name)
     mt = None
     try:
         mt = datetime.fromtimestamp(os.path.getmtime(os.path.join(gen_root, name)), tz=timezone.utc)
@@ -609,7 +676,30 @@ def _gen_effective_dt(gen_root, name):
 ABSENT_LANE_KEEP = 1     # 레지스트리에서 빠진(삭제된) 부서 레인 풀의 규칙 A 상한
 
 
-def compute_gc(generations, now=None, dt_of=None, dt_eff=None, key_of=None, cap_of=None):
+def _parent_floor(generations, now, dt_eff):
+    """부모(d478d97f) compute_gc 의 보관 집합 — 단일 풀 · 상한 KEEP_RECENT · 명목 = _stamp_second(접미 무시).
+    입력은 list_generations 와 같은 문자열 정렬로 받는다(부모 do_gc 의 입력) — 같은 초의 동률은 부모처럼
+    그 정렬 순서가 깬다. dt_eff = 부모의 실효 시각(max(_stamp_second, mtime) · 미주입 시 명목).
+    ⛔정책의 순서 규칙이 아니다: 부모가 보관하던 것을 이 판이 지우지 않게 하는 **바닥**이다(B317-R1 M1)."""
+    _E0 = datetime.min.replace(tzinfo=timezone.utc)
+    keep = set()
+    for keyfn in (_stamp_second, dt_eff):
+        for name in sorted(generations, key=lambda n: (keyfn(n) or _E0), reverse=True)[:KEEP_RECENT]:
+            keep.add(name)
+    cutoff = now - timedelta(days=KEEP_DAILY_DAYS)
+    days = set()
+    for name in sorted(generations, key=lambda n: (_stamp_second(n) or _E0), reverse=True):
+        dt = _stamp_second(name)
+        if dt is None or dt < cutoff:
+            continue
+        day = dt.strftime("%Y%m%d")
+        if day not in days:
+            days.add(day)
+            keep.add(name)
+    return keep
+
+
+def compute_gc(generations, now=None, dt_of=None, dt_eff=None, key_of=None, cap_of=None, floor_eff=None):
     """보관/삭제 결정. (keep_set, delete_list) 반환. 순수함수(테스트 가능).
     ★E3(P2-5 + gemini W6): 명목 시각(dt_of=이름)과 실효 시각(dt_eff=mtime 병행)을 **둘 다 보호**한다(union).
     - 명목-recent(이름 최신) KEEP_RECENT 는 항상 보존 → cp/touch 로 과거 세대 mtime 이 오염돼도 **진짜 최근 세대를
@@ -625,16 +715,24 @@ def compute_gc(generations, now=None, dt_of=None, dt_eff=None, key_of=None, cap_
       ~48세대 동결). 레인별 풀이면 전 레인 세대가 쌓이는 대로 옛 세대가 모든 풀에서 밀려나 정상 노화한다.
       key_of 미주입 = 단일 풀("") = 종전과 동일한 판정. 키 0개를 돌려준 세대도 단일 풀에 넣는다(⛔어느 풀에도
       없어 삭제되는 길 차단).
-    cap_of(key) = 그 풀의 규칙 A 상한(미주입 = 전 풀 KEEP_RECENT). 상한 정책은 do_gc 의 _lane_caps 참조."""
+    cap_of(key) = 그 풀의 규칙 A 상한(미주입 = 전 풀 KEEP_RECENT). 상한 정책은 do_gc 의 _lane_caps 참조.
+    ★B317-R1 M1(codex · 잠근 기준 「상한 변경은 삭제된 부서 레인만」): B-320 순서(접미 µs)는 같은 초 쌍의 승자를 바꾼다 —
+      부모는 문자열 정렬상 앞(무접미)을, 이 판은 나중 승격(-1)을 대표로 고른다. 그대로면 부모가 보관하던 세대가 지워진다
+      (반례: 어제 같은 초 쌍 + 오늘 48세대 → 부모 보관 무접미가 rmtree). 그래서 keep 에 **부모 판정(_parent_floor)을
+      바닥으로 합집합**한다 — 전 레인 현존이면 keep ⊇ 부모 keep 이 구성상 성립한다. 유일한 예외는 위임된 것 하나:
+      담은 레인이 **전부** 상한 축소 풀(삭제된 부서)인 세대는 바닥이 되살리지 않는다(최종 상태만 · 이력 미보관).
+      floor_eff = 부모의 실효 시각(do_gc 가 max(_stamp_second, mtime) 을 넘긴다 · 미주입 = 명목만 — dt_eff 를 주입하는
+      다른 호출자는 바닥의 실효 절반을 갖지 않는다)."""
     now = now or _now_utc()
     _E0 = datetime.min.replace(tzinfo=timezone.utc)
     dt_of = dt_of or _parse_stamp        # 명목(이름)
     dt_eff = dt_eff or dt_of             # 실효(mtime 병행) — 미주입 시 명목과 동일
     key_of = key_of or (lambda n: ("",))
     cap_of = cap_of or (lambda k: KEEP_RECENT)
+    keys = {n: (tuple(key_of(n)) or ("",)) for n in generations}
     pools = {}
     for n in generations:
-        for k in (tuple(key_of(n)) or ("",)):
+        for k in keys[n]:
             pools.setdefault(k, []).append(n)
     keep = set()
     cutoff = now - timedelta(days=KEEP_DAILY_DAYS)
@@ -657,6 +755,10 @@ def compute_gc(generations, now=None, dt_of=None, dt_eff=None, key_of=None, cap_
             if day not in day_rep:
                 day_rep[day] = name
                 keep.add(name)
+
+    for name in _parent_floor(sorted(generations), now, floor_eff or _stamp_second):
+        if any(cap_of(k) >= KEEP_RECENT for k in keys[name]):
+            keep.add(name)
 
     delete = [n for n in generations if n not in keep]
     return keep, sorted(delete)
@@ -746,7 +848,8 @@ def do_gc(gen_root=GEN_ROOT, dry_run=False, home=HOME, depts_json=None):
     cap_of, registry_ok = _lane_caps(home=home, depts_json=depts_json)
     keep, delete = compute_gc(gens, dt_of=_parse_stamp,
                               dt_eff=lambda n: _gen_effective_dt(gen_root, n),
-                              key_of=lambda n: cov[n], cap_of=cap_of)
+                              key_of=lambda n: cov[n], cap_of=cap_of,
+                              floor_eff=lambda n: _gen_effective_dt(gen_root, n, nominal_of=_stamp_second))
     if not registry_ok and any(k not in ("", "?") for ks in cov.values() for k in ks):
         print("[gc] depts.json 판독 불가 — 레인 부재를 판정하지 않음(전 레인 보관 상한 %d)" % KEEP_RECENT)
     if dry_run:
@@ -825,9 +928,11 @@ def do_card(gen_root=GEN_ROOT, gen=None, lane=BASE_LANE):
     """★결정 7 복원 경로(읽기 전용): 세대에서 그 레인의 정본 카드를 manifest `canonical_cards` 의 **경로 이름**으로
     찾아 `저장파일<TAB>sha256<TAB>원경로` 한 줄을 출력한다(select_card · 범위: 본부=~/_round, 부서=<pack>/round).
     ⛔쓰지 않는다 — 이 도구는 state-generations/ 밖에 쓰지 않는다. 사람이 출력된 저장 파일을 원 경로로 복사한다.
-    gen 미지정 = 이름상 최신 세대. rc 0=찾음·해시 일치 / 1=세대 없음·정본 기록 없음·저장 파일 없음·해시 불일치."""
+    gen 미지정 = 순서 규칙(_parse_stamp — GC 와 같은 규칙)상 최신 세대. ⛔문자열 최신(gens[-1])이 아니다: 같은 초의
+    `-10` 은 문자열로 `-9` 앞에 서므로 그것을 고르면 더 묵은 카드를 복원하게 된다(B317-R1 M2).
+    rc 0=찾음·해시 일치 / 1=세대 없음·정본 기록 없음·저장 파일 없음·해시 불일치."""
     gens = list_generations(gen_root)
-    name = gen or (gens[-1] if gens else None)
+    name = gen or (max(gens, key=_parse_stamp) if gens else None)
     if not name:
         print("[card] 세대 없음", file=sys.stderr)
         return 1
