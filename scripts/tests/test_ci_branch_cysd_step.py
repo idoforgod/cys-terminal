@@ -13,6 +13,7 @@ stdout/stderr 에 **바이트 그대로** 내고 정해진 종료 코드로 끝�
 
     python3 scripts/tests/test_ci_branch_cysd_step.py
 """
+import json
 import os
 import re
 import shutil
@@ -83,6 +84,19 @@ def extract_step(path, name):
             raise StepShapeError("%s:%d 키 `%s` 가 두 번 나온다" % (path, j + 1, k))
         j += 1
         if k != "run":
+            if v == "" and k in ("env", "with"):
+                # B-344: one nested mapping level (`env:` / `with:`) -> {key: value}; anything deeper is a shape error.
+                sub = {}
+                while j < len(lines) and (not lines[j].strip() or indent(lines[j]) > key_ind):
+                    s2 = lines[j].strip()
+                    if s2 and not s2.startswith("#"):
+                        m2 = re.match(r"^([A-Za-z0-9_-]+):\s+(.*)$", s2)
+                        if indent(lines[j]) != key_ind + 2 or not m2:
+                            raise StepShapeError("%s:%d `%s:` 아래 한 단계 키로 읽히지 않는 줄이다: %r" % (path, j + 1, k, lines[j]))
+                        sub[m2.group(1)] = m2.group(2)
+                    j += 1
+                keys[k] = sub
+                continue
             keys[k] = v
             continue
         if v != "|":
@@ -524,6 +538,502 @@ class S2WindowsCell(unittest.TestCase):
             with self.subTest(change=variants.index(changed)):
                 result = run_gate(original[:start] + changed + original[end:])
                 self.assertNotEqual(result.returncode, 0, "actual lane gate accepted a broken required S2 cell")
+
+
+# ── B-344 (DESIGN-v4 s6, s8 T2-T5): windows-health bootstrap-health step 5, its reader and its verdict step ─────────
+# The actual step bodies are taken out of windows-health.yml and run under bash with a fake `python` (step 5) or with
+# marker files written as exact bytes (verdict step); the reader heredoc runs on synthetic runner documents. Mutation and
+# RED-first runs point WINDOWS_HEALTH_YML_UNDER_TEST at another copy of the workflow.
+WINDOWS_HEALTH = os.environ.get("WINDOWS_HEALTH_YML_UNDER_TEST") or os.path.normpath(os.path.join(HERE, "..", "..", ".github", "workflows", "windows-health.yml"))
+BH_STEP = "부트스트랩 건강성 — H-WIN 검체 실기 (windows-latest)"
+BH_VERDICT = "부트스트랩 건강성 판정 결박 (H-WIN · 차단 · fail-closed)"
+BH_STATUSES = ("pass", "fail", "skip", "disabled", "pending")
+BH_CAP = 16 * 1024
+BH_DIR_ENTRY = object()          # a verdict cell whose rc marker path is a directory
+
+
+def bh_read_bytes(path):
+    """The file's exact bytes, or None when there is no regular file."""
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as stream:
+        return stream.read()
+
+
+def bh_reader_code(step_run):
+    """The step-5 reader heredoc out of the step's run text (extract_step already removed the run block's indentation)."""
+    lines = step_run.split("\n")
+    starts = [i for i, line in enumerate(lines) if line.startswith('python - "$rc"') and "<<'PY'" in line]
+    if len(starts) != 1:
+        raise StepShapeError("step 5 has %d reader heredocs (expected 1)" % len(starts))
+    end = next((i for i in range(starts[0] + 1, len(lines)) if lines[i] == "PY"), None)
+    if end is None:
+        raise StepShapeError("the step-5 reader heredoc has no PY terminator")
+    return "\n".join(lines[starts[0] + 1:end]) + "\n"
+
+
+def bh_reader_funcs(code, names):
+    """Exec only the imports, the upper-case constants and the named functions of the reader (it runs its main code at
+    import), so the cut functions can be probed directly."""
+    import ast
+    tree = ast.parse(code)
+    keep = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))
+            or (isinstance(n, ast.Assign) and all(isinstance(t, ast.Name) and t.id.isupper() for t in n.targets))
+            or (isinstance(n, ast.FunctionDef) and n.name in names)]
+    found = {n.name for n in keep if isinstance(n, ast.FunctionDef)}
+    if found != set(names):
+        raise AssertionError("reader functions missing: %s" % sorted(set(names) - found))
+    ns = {}
+    exec(compile(ast.Module(body=keep, type_ignores=[]), "<step-5 reader>", "exec"), ns)
+    return ns
+
+
+def bh_doc(rows, verdict=None, **override):
+    """The full summary the runner writes, counts derived from the rows unless overridden (a stale count)."""
+    s = dict((k, sum(1 for r in rows if r.get("status") == k)) for k in BH_STATUSES)
+    s["verdict"] = verdict or ("RED" if s["fail"] else "GREEN")
+    s["total"] = len(rows)
+    s.update(override)
+    return {"summary": s, "specimens": rows}
+
+
+def bh_rows(n, status="pass"):
+    return [{"id": "H-WIN-%d" % i, "status": status, "detail" if status == "pass" else "reason": "ok"} for i in range(1, n + 1)]
+
+
+def bh_hw(cats, msgs=None, status=None, child_extra=None):
+    msgs = msgs or {}
+    causes = [{"category": c, "code": "X", "message": msgs.get(c, "%s cause" % c)} for c in cats]
+    ch = {"categories": list(cats), "causes": causes, "failing": [], "stdout": {"bytes": 0}, "stderr": {"bytes": 0}}
+    ch.update(child_extra or {})
+    return {"id": "H-WIN-11", "status": status or ("fail" if cats else "pass"), "reason": "r", "evidence": {"child": ch}}
+
+
+def bh_blocks(raw):
+    """Bytes printed per stream block: from a '--- <stream>: ' header to the next one or the end of the stop region."""
+    out, cur = {}, None
+    for line in raw.split(b"\n"):
+        if line.startswith(b"--- stdout: ") or line.startswith(b"--- stderr: "):
+            cur = line[4:10].decode()
+            out[cur] = 0
+        elif cur is not None and line.startswith(b"::") and line.endswith(b"::") and len(line) == 36:
+            cur = None
+        if cur is not None:
+            out[cur] += len(line) + 1
+    return out
+
+
+class BootstrapHealthStructure(unittest.TestCase):
+    """T3: step 5 is severable (id, continue-on-error, own timeout); the verdict step is unconditional, blocking and after
+    every blocking step; the cells the lane gate pins stay unconditional and blocking."""
+
+    def test_step5_is_severable_and_bounded(self):
+        step = extract_step(WINDOWS_HEALTH, BH_STEP)
+        self.assertEqual(step.get("id"), "bootstrap_health")
+        self.assertEqual(step.get("continue-on-error"), "true")
+        self.assertEqual(step.get("timeout-minutes"), "20")
+        self.assertNotIn("if", step)
+        self.assertEqual(step.get("shell"), "bash")
+        self.assertIn('echo "$vrc" > "$BH_DIR/rc"', step["run"], "the rc marker is written from the reader's exit code")
+        self.assertIn('exit "$vrc"', step["run"], "the step still fails exactly as before (outcome failure)")
+
+    def test_verdict_step_is_unconditional_blocking_and_after_every_blocking_step(self):
+        step = extract_step(WINDOWS_HEALTH, BH_VERDICT)
+        self.assertEqual(step.get("if"), "always()")
+        self.assertNotIn("continue-on-error", step)
+        self.assertEqual(step.get("timeout-minutes"), "2")
+        self.assertEqual(step.get("shell"), "bash")
+        self.assertEqual(step.get("env"), {"BH_OUTCOME": "${{ steps.bootstrap_health.outcome }}"})
+        self.assertIn('readm "$d/rc"', step["run"])
+        self.assertIn('readm "$d/category"', step["run"])
+        names = [line.strip()[len("- name: "):] for line in read_text(WINDOWS_HEALTH).split("\n")
+                 if line.startswith("      - name: ")]
+        at = names.index(BH_VERDICT)
+        self.assertLess(names.index("결과 업로드 (기계 판독 JSON)"), at, "the verdict step comes after the artifact upload")
+        for later in names[at + 1:]:
+            self.assertEqual(extract_step(WINDOWS_HEALTH, later).get("continue-on-error"), "true",
+                             "a blocking step after the verdict step: %s" % later)
+
+    def test_lane_gate_cells_stay_unconditional_and_blocking(self):
+        for name in ("A-ID S2 root registration (Windows blocking)", "A-ID Q9-b vendor clone error controls (Windows blocking)",
+                     "A-ID S6 Tauri close operation (Windows blocking)"):
+            with self.subTest(cell=name):
+                step = extract_step(WINDOWS_HEALTH, name)
+                self.assertNotIn("if", step)
+                self.assertNotIn("continue-on-error", step)
+
+
+class BootstrapHealthStepBodies(unittest.TestCase):
+    """T2: the step-5 body with a fake `python` (14 scenarios, byte-exact marker oracle) and the verdict body on 49 marker
+    cells written as exact bytes (codex's 30 00 0a first among the R3 cells), plus the byte sweep of both markers."""
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.step5 = extract_step(WINDOWS_HEALTH, BH_STEP)["run"]
+        cls.verdict = extract_step(WINDOWS_HEALTH, BH_VERDICT)["run"]
+        cls.tmp = tempfile.mkdtemp(prefix="bh-steps-")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def run_step5(self, text, runner_rc):
+        w = tempfile.mkdtemp(dir=self.tmp)
+        os.makedirs(os.path.join(w, "bin"))
+        os.makedirs(os.path.join(w, "cysjavis-pack", "bin", "tests"))
+        with open(os.path.join(w, "cysjavis-pack", "bin", "tests", "run_bootstrap_health.py"), "w") as stream:
+            stream.write("# placeholder\n")
+        fake = os.path.join(w, "bin", "python")
+        with open(fake, "w") as stream:
+            stream.write('#!/bin/bash\nif [ "$1" = "-" ]; then exec "%s" "$@"; fi\ncat "$FAKE_JSON"; exit "$FAKE_RC"\n' % sys.executable)
+        os.chmod(fake, 0o755)
+        canned = os.path.join(w, "canned.json")
+        with open(canned, "wb") as stream:
+            stream.write(text if isinstance(text, bytes) else text.encode("utf-8"))
+        script = os.path.join(w, "step5.sh")
+        with open(script, "w", encoding="utf-8") as stream:
+            stream.write(self.step5)
+        rt = os.path.join(w, "rt")
+        os.makedirs(rt)
+        env = {"PATH": os.path.join(w, "bin") + ":/usr/bin:/bin", "HOME": w, "RUNNER_TEMP": rt, "FAKE_JSON": canned,
+               "FAKE_RC": str(runner_rc), "PYTHONUTF8": "1", "LANG": "en_US.UTF-8"}
+        r = subprocess.run([BASH, "--noprofile", "--norc", "-e", "-o", "pipefail", script], cwd=w, env=env,
+                           capture_output=True, timeout=60)
+        markers = {}
+        for k in ("rc", "category"):
+            p = os.path.join(rt, "bootstrap-health", k)
+            markers[k] = bh_read_bytes(p)      # byte-exact oracle, never stripped
+        return r, markers
+
+    def test_step5_scenarios(self):
+        def dup_row_status():
+            rows = [json.dumps(r, ensure_ascii=False) for r in bh_rows(24)]
+            rows.append('{"id": "H-WIN-25", "status": "fail", "reason": "x", "status": "pass"}')
+            s = json.dumps(bh_doc(bh_rows(25))["summary"], ensure_ascii=False)
+            return '{"summary": %s, "specimens": [%s]}' % (s, ", ".join(rows))
+
+        def dup_summary_verdict():
+            s = json.dumps(bh_doc(bh_rows(25))["summary"], ensure_ascii=False)
+            return '{"summary": {"verdict": "UNMEASURED", %s, "specimens": %s}' % (s[1:], json.dumps(bh_rows(25), ensure_ascii=False))
+
+        scen = [   # (label, runner document (dict or raw text) or None = not JSON, runner rc, step rc, category marker)
+            ("green", bh_doc(bh_rows(25)), 0, 0, "NONE"),
+            ("red PRODUCT", bh_doc(bh_rows(24) + [bh_hw(["PRODUCT"])]), 1, 1, "PRODUCT"),
+            ("red HARNESS", bh_doc(bh_rows(24) + [bh_hw(["HARNESS"])]), 1, 1, "HARNESS"),
+            ("red both", bh_doc(bh_rows(24) + [bh_hw(["PRODUCT", "HARNESS"])]), 1, 1, "HARNESS,PRODUCT"),
+            ("runner rc2 no fail", bh_doc(bh_rows(25), verdict="UNMEASURED"), 2, 1, "HARNESS"),
+            ("unparsable json", None, 1, 1, "HARNESS"),
+            ("other specimen fail", bh_doc(bh_rows(24) + [{"id": "H-WIN-25", "status": "fail", "reason": "x", "fail_kind": "fail"}]),
+             1, 1, "PRODUCT"),
+            ("other specimen crash", bh_doc(bh_rows(24) + [{"id": "H-WIN-25", "status": "fail", "reason": "검체 크래시 E: x",
+                                                            "fail_kind": "crash"}]), 1, 1, "HARNESS"),
+            ("pass 0", bh_doc(bh_rows(1, "skip")), 0, 1, "HARNESS"),
+            ("R2 stale parent pass", bh_doc(bh_rows(25, "skip"), verdict="GREEN", **{"pass": 1, "skip": 24}), 0, 1, "HARNESS"),
+            ("R2 rc0 verdict UNMEASURED", bh_doc(bh_rows(25), verdict="UNMEASURED"), 0, 1, "HARNESS"),
+            ("R2 POSITIVE green with skips", bh_doc(bh_rows(20) + [{"id": "S-%d" % i, "status": "skip", "reason": "s"}
+                                                                  for i in range(5)]), 0, 0, "NONE"),
+            ("R3 duplicate row status (fail, then pass)", dup_row_status(), 0, 1, "HARNESS"),
+            ("R3 duplicate summary verdict (UNMEASURED, then GREEN)", dup_summary_verdict(), 0, 1, "HARNESS"),
+        ]
+        for label, d, runner_rc, want_rc, want_cat in scen:
+            with self.subTest(scenario=label):
+                text = d if isinstance(d, str) else (json.dumps(d, ensure_ascii=False) if d else "Traceback: boom")
+                r, m = self.run_step5(text, runner_rc)
+                got = (r.returncode, m["rc"], m["category"])
+                self.assertEqual(got, (want_rc, b"%d\n" % want_rc, want_cat.encode()), quoted(r.stdout + r.stderr))
+
+    def run_verdict(self, outcome, rc_marker, category_marker):
+        w = tempfile.mkdtemp(dir=self.tmp)
+        d = os.path.join(w, "bootstrap-health")
+        os.makedirs(d)
+        if rc_marker is BH_DIR_ENTRY:
+            os.makedirs(os.path.join(d, "rc"))
+        elif rc_marker is not None:
+            with open(os.path.join(d, "rc"), "wb") as stream:
+                stream.write(rc_marker)
+        if category_marker is not None:
+            with open(os.path.join(d, "category"), "wb") as stream:
+                stream.write(category_marker)
+        script = os.path.join(w, "verdict.sh")
+        with open(script, "w", encoding="utf-8") as stream:
+            stream.write(self.verdict)
+        env = {"PATH": "/usr/bin:/bin", "RUNNER_TEMP": w, "BH_OUTCOME": outcome, "LANG": "en_US.UTF-8"}
+        return subprocess.run([BASH, "--noprofile", "--norc", "-e", "-o", "pipefail", script], cwd=w, env=env,
+                              capture_output=True, timeout=30)
+
+    def test_verdict_cells(self):
+        cells = [  # (outcome, rc marker bytes / None / BH_DIR_ENTRY, category marker bytes / None, exit, titles, label)
+            ("success", b"0\n", b"NONE", 0, set(), "green"),
+            ("failure", b"1\n", b"PRODUCT", 1, {"PRODUCT"}, "red PRODUCT"),
+            ("failure", b"1\n", b"HARNESS", 1, {"HARNESS"}, "red HARNESS"),
+            ("failure", b"1\n", b"HARNESS,PRODUCT", 1, {"PRODUCT", "HARNESS"}, "red both"),
+            ("success", None, None, 1, {"HARNESS"}, "no markers"),
+            ("success", b"1\n", b"PRODUCT", 1, {"PRODUCT", "HARNESS"}, "success with rc 1"),
+            ("", b"0\n", b"NONE", 1, {"HARNESS"}, "empty outcome"),
+            ("skipped", None, None, 1, {"HARNESS"}, "skipped"),
+            ("cancelled", None, None, 1, {"HARNESS"}, "cancelled"),
+            ("failure", b"0\n", b"NONE", 1, {"HARNESS"}, "failure with rc 0"),
+            ("failure", b"1\n", None, 1, {"HARNESS"}, "no category"),
+            ("failure", b"1\n", b"PRODUCTX\n::warning::Y%", 1, {"HARNESS"}, "injected category"),
+            ("success", b"0\n", None, 1, {"HARNESS"}, "R2 codex missing category"),
+            ("success", b"0\n", b"PRODUCT", 1, {"PRODUCT", "HARNESS"}, "R2 codex PRODUCT category with rc 0"),
+            ("success", b"error0garbage\n", b"NONE", 1, {"HARNESS"}, "R2 codex malformed rc"),
+            ("success", b" 0\n", b"NONE", 1, {"HARNESS"}, "R2 rc with a leading space"),
+            ("success", b"0\n\n", b"NONE", 1, {"HARNESS"}, "R2 rc with two LF"),
+            ("success", b"00\n", b"NONE", 1, {"HARNESS"}, "R2 rc 00"),
+            ("success", b"0\r\n", b"NONE", 1, {"HARNESS"}, "R2 rc with CR LF"),
+            ("success", u"٠\n".encode("utf-8"), b"NONE", 1, {"HARNESS"}, "R2 rc U+0660"),
+            ("success", b"0" + b" " * 40 + b"\n", b"NONE", 1, {"HARNESS"}, "R2 rc marker over 32 B"),
+            ("success", BH_DIR_ENTRY, b"NONE", 1, {"HARNESS"}, "R2 rc marker is a directory"),
+            ("success", b"0\n", b"NONEX", 1, {"HARNESS"}, "R2 category NONEX"),
+            ("success", b"0\n", b"", 1, {"HARNESS"}, "R2 category empty file"),
+            ("success", b"0\n", b"NONE\r\n", 1, {"HARNESS"}, "R2 category with CR LF"),
+            ("success", b"0\n", b"HARNESS,PRODUCT", 1, {"PRODUCT", "HARNESS"}, "R2 both categories with rc 0"),
+            ("failure", b"1\n", b"PRODUCT,HARNESS", 1, {"HARNESS"}, "R2 categories in the wrong order"),
+            ("failure", b"1\n", b"NONE", 1, {"HARNESS"}, "R2 rc 1 with category NONE"),
+            ("success", b"0", b"NONE", 0, set(), "R2 POSITIVE rc marker without LF"),
+            ("success", b"0\n", b"NONE\n", 0, set(), "R2 POSITIVE category with one LF"),
+            ("success", b"0\x00\n", b"NONE", 1, {"HARNESS"}, "R3 codex rc 30 00 0a"),
+            ("success", b"\x000\n", b"NONE", 1, {"HARNESS"}, "R3 rc NUL before the digit"),
+            ("success", b"0\n\x00", b"NONE", 1, {"HARNESS"}, "R3 rc NUL after the LF"),
+            ("success", b"0" + b"\x00" * 31, b"NONE", 1, {"HARNESS"}, "R3 rc 0 + 31 NUL (32 B)"),
+            ("success", b"\x00" * 33, b"NONE", 1, {"HARNESS"}, "R3 rc 33 NUL (over 32 B)"),
+            ("success", b"\x00", b"NONE", 1, {"HARNESS"}, "R3 rc a single NUL"),
+            ("success", b"0\n", b"NONE\x00", 1, {"HARNESS"}, "R3 category NONE + NUL"),
+            ("success", b"0\n", b"NO\x00NE", 1, {"HARNESS"}, "R3 category NUL inside"),
+            ("success", b"0\n", b"\x00NONE\n", 1, {"HARNESS"}, "R3 category NUL first"),
+            ("success", b"\xef\xbb\xbf0\n", b"NONE", 1, {"HARNESS"}, "R3 rc with a UTF-8 BOM"),
+            ("success", b"0\n", b"\xef\xbb\xbfNONE", 1, {"HARNESS"}, "R3 category with a UTF-8 BOM"),
+            ("success", b"0 \n", b"NONE", 1, {"HARNESS"}, "R3 rc with a trailing space"),
+            ("success", b"0\n", b"NONE \n", 1, {"HARNESS"}, "R3 category with a trailing space"),
+            ("success", b"0\n0\n", b"NONE", 1, {"HARNESS"}, "R3 rc on two lines"),
+            ("success", b"0\n", b"NONE\nNONE", 1, {"HARNESS"}, "R3 category on two lines"),
+            ("success", b"0\r", b"NONE", 1, {"HARNESS"}, "R3 rc with CR alone"),
+            ("success", b"0\n", b"none", 1, {"HARNESS"}, "R3 category lower case"),
+            ("failure", b"255\n", b"HARNESS", 1, {"HARNESS"}, "R3 POSITIVE rc 255 parses (HARNESS red)"),
+            ("failure", b"137\n", b"PRODUCT", 1, {"PRODUCT"}, "R3 POSITIVE rc 137 with PRODUCT"),
+        ]
+        self.assertEqual(len(cells), 49)
+        for outcome, rc_marker, category_marker, want, want_titles, label in cells:
+            with self.subTest(cell=label):
+                r = self.run_verdict(outcome, rc_marker, category_marker)
+                out = r.stdout.decode("utf-8", "backslashreplace")
+                errs = [line for line in out.split("\n") if line.startswith("::error")]
+                titles = [line.split("::", 2)[1].rsplit(" ", 1)[-1] for line in errs]
+                rogue = [line for line in out.split("\n") if line.startswith("::") and not line.startswith("::error title=")]
+                self.assertEqual(r.returncode, want, quoted(r.stdout + r.stderr))
+                self.assertEqual(set(titles), want_titles, quoted(r.stdout))
+                self.assertEqual(len(titles), len(set(titles)), "at most one annotation per category\n" + quoted(r.stdout))
+                self.assertTrue(all((("[PRODUCT" in line) + ("[HARNESS" in line)) == 1 for line in errs),
+                                "one category per annotation\n" + quoted(r.stdout))
+                self.assertTrue(all(len(line.split("::", 2)[2]) <= 600 for line in errs), quoted(r.stdout))
+                self.assertEqual(rogue, [], "no other workflow command line\n" + quoted(r.stdout))
+                if label == "R3 codex rc 30 00 0a":
+                    self.assertIn("hex 30000a", out, "an unreadable marker is shown as its hex")
+
+    def test_verdict_byte_sweep(self):
+        """Every byte 0x00-0xff inserted at every position of a green marker and every byte replaced by every other value,
+        the other marker held green, outcome success: exit 0 only for an allowed green form (rc 0 / 0 LF, NONE / NONE LF)."""
+        green = {"rc": {b"0", b"0\n"}, "category": {b"NONE", b"NONE\n"}}
+        base = {"rc": b"0\n", "category": b"NONE"}
+        w = tempfile.mkdtemp(dir=self.tmp)
+        d = os.path.join(w, "bootstrap-health")
+        os.makedirs(d)
+        script = os.path.join(w, "verdict.sh")
+        with open(script, "w", encoding="utf-8") as stream:
+            stream.write(self.verdict)
+        env = {"PATH": "/usr/bin:/bin", "RUNNER_TEMP": w, "BH_OUTCOME": "success", "LANG": "en_US.UTF-8"}
+        runs, greens, bad_green, bad_red = 0, 0, [], []
+        for which in ("rc", "category"):
+            other = "category" if which == "rc" else "rc"
+            b0 = base[which]
+            muts = [b0[:pos] + bytes([b]) + b0[pos:] for pos in range(len(b0) + 1) for b in range(256)]
+            muts += [b0[:pos] + bytes([b]) + b0[pos + 1:] for pos in range(len(b0)) for b in range(256) if b != b0[pos]]
+            for val in muts:
+                with open(os.path.join(d, which), "wb") as stream:
+                    stream.write(val)
+                with open(os.path.join(d, other), "wb") as stream:
+                    stream.write(base[other])
+                r = subprocess.run([BASH, "--noprofile", "--norc", "-e", "-o", "pipefail", script], cwd=w, env=env,
+                                   capture_output=True, timeout=30)
+                runs += 1
+                greens += r.returncode == 0
+                if r.returncode == 0 and val not in green[which]:
+                    bad_green.append((which, val))
+                if val in green[which] and r.returncode != 0:
+                    bad_red.append((which, val))
+        self.assertEqual(runs, 3578)
+        self.assertEqual(bad_green, [], "a non-allowed marker form went green")
+        self.assertEqual(bad_red, [], "an allowed green form went red")
+        self.assertEqual(greens, 1, "exactly one mutation is an allowed green form (NONE followed by one LF)")
+
+
+class BootstrapHealthReader(unittest.TestCase):
+    """T4: the step-5 reader on 89 synthetic runner documents (v2 F1-F7, R2 G1-G15, R3 H1-H6) with a byte-exact category
+    marker oracle, and T5 probes P2-P4 on its cut functions."""
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.code = bh_reader_code(extract_step(WINDOWS_HEALTH, BH_STEP)["run"])
+        cls.tmp = tempfile.mkdtemp(prefix="bh-reader-")
+        cls.reader = os.path.join(cls.tmp, "reader.py")
+        with open(cls.reader, "w", encoding="utf-8") as stream:
+            stream.write(cls.code)
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @staticmethod
+    def stream(text, utf8=True, alts=None, truncated=False):
+        rec = {"bytes": len(text.encode("utf-8")), "sha256": "0" * 64, "hash_complete": True, "stable": True,
+               "truncated": truncated, "head": {"utf8_valid": utf8, "text": text}}
+        if alts:
+            rec["head"]["alt"] = dict(alts)
+        if truncated:
+            rec["marker"] = "[… 123456 bytes dropped: stderr bytes 8192..131648 (kept 0..8192 and 131648..189000) …]"
+            rec["tail"] = {"utf8_valid": utf8, "text": text, "alt": dict(alts or {})}
+        return rec
+
+    def fixtures(self):
+        fix = []   # (name, document (dict / str / bytes) or None = not JSON, rc argument, reader rc, category marker or None)
+        for o in range(560, 621):
+            fix.append(("F1-pct-%d" % o, bh_doc(bh_rows(24) + [bh_hw(["PRODUCT"], {"PRODUCT": "a" * o + "%" * 40})]), "1", 1, "PRODUCT"))
+        fix.append(("F2-flood", bh_doc(bh_rows(5) + [{"id": "F-%02d" % i, "status": "fail", "reason": "x" * 50, "fail_kind": "fail"}
+                                                     for i in range(30)]), "1", 1, "PRODUCT"))
+        fix.append(("F3-both", bh_doc(bh_rows(24) + [bh_hw(["PRODUCT", "HARNESS"])]), "1", 1, "HARNESS,PRODUCT"))
+        fix.append(("F4-crash-row", bh_doc(bh_rows(23) + [bh_hw([]), {"id": "H-WIN-5", "status": "fail",
+                                                                     "reason": "검체 크래시 KeyError: 'k'", "fail_kind": "crash"}]),
+                    "1", 1, "HARNESS"))
+        fix.append(("F5-pass0", bh_doc(bh_rows(1, "skip")), "1", 1, "HARNESS"))
+        fix.append(("F6-unreadable", None, "1", 1, "HARNESS"))
+        fix.append(("F7-multiline", bh_doc(bh_rows(24) + [{"id": "H-WIN-9", "status": "fail", "fail_kind": "fail",
+                                                           "reason": "first\r\n::error::INJECTED-ROW\nthird 50%"}]), "1", 1, "PRODUCT"))
+        fix.append(("G1-stale-parent-pass", bh_doc(bh_rows(25, "skip"), verdict="GREEN", **{"pass": 1, "skip": 24}), "0", 1, "HARNESS"))
+        fix.append(("G2-consistent-skips", bh_doc(bh_rows(20) + [dict(x, id="S-%d" % n) for n, x in enumerate(bh_rows(5, "skip"))]),
+                    "0", 0, "NONE"))
+        fix.append(("G3-disabled-hidden", bh_doc(bh_rows(24) + [{"id": "H-WIN-24", "status": "disabled", "reason": "off"}],
+                                                 **{"disabled": 0}), "0", 1, "HARNESS"))
+        fix.append(("G4-rc-garbage", bh_doc(bh_rows(25)), "error0garbage", 1, "HARNESS"))
+        for tag, arg in (("space", " 0"), ("plus", "+0"), ("zero-zero", "00"), ("arabic-indic", u"٠")):
+            fix.append(("G5-rc-%s" % tag, bh_doc(bh_rows(25)), arg, 1, "HARNESS"))
+        fix.append(("G6-rc0-unmeasured", bh_doc(bh_rows(25), verdict="UNMEASURED"), "0", 1, "HARNESS"))
+        fix.append(("G7-fail-kind-on-pass", bh_doc(bh_rows(24) + [{"id": "H-WIN-25", "status": "pass", "detail": "ok",
+                                                                   "fail_kind": "fail"}]), "0", 1, "HARNESS"))
+        fix.append(("G8-pass-row-child-category", bh_doc(bh_rows(24) + [bh_hw(["PRODUCT"], status="pass")]), "0", 1, "HARNESS"))
+        fix.append(("G9-category-unwritable", bh_doc(bh_rows(25)), "0", 1, None))
+        fix.append(("G11-log-20000", bh_doc(bh_rows(24) + [bh_hw(["HARNESS"], child_extra={"stdout": self.stream("A" * 20000)})]),
+                    "1", 1, "HARNESS"))
+        fix.append(("G12-log-hangul", bh_doc(bh_rows(24) + [bh_hw(["HARNESS"], child_extra={"stderr": self.stream(u"한" * 10000)})]),
+                    "1", 1, "HARNESS"))
+        fix.append(("G13-log-two-views", bh_doc(bh_rows(24) + [bh_hw(["HARNESS"], child_extra={"stderr": self.stream(
+            "\\x80" * 10000, utf8=False, alts={"cp949": u"가" * 13653, "cp1252": u"€" * 13653}, truncated=True)})]), "1", 1, "HARNESS"))
+        fix.append(("G15-ann-7-digit-N", bh_doc(bh_rows(24) + [{"id": "H-WIN-9", "status": "fail", "fail_kind": "fail",
+                                                                "reason": "a" * 1100000}]), "1", 1, "PRODUCT"))
+        p24 = ", ".join(json.dumps(r, ensure_ascii=False) for r in bh_rows(24))
+        s25 = json.dumps(bh_doc(bh_rows(25))["summary"], ensure_ascii=False)
+        fix.append(("H1-dup-row-status", '{"summary": %s, "specimens": [%s, {"id": "H-WIN-25", "status": "fail", "reason": "x", '
+                    '"status": "pass"}]}' % (s25, p24), "0", 1, "HARNESS"))
+        fix.append(("H2-dup-summary-verdict", '{"summary": {"verdict": "UNMEASURED", %s, "specimens": %s}'
+                    % (s25[1:], json.dumps(bh_rows(25))), "0", 1, "HARNESS"))
+        fix.append(("H3-dup-summary-pass", '{"summary": {"pass": 0, %s, "specimens": %s}' % (s25[1:], json.dumps(bh_rows(25))),
+                    "0", 1, "HARNESS"))
+        fix.append(("H4-nul-in-string", json.dumps(bh_doc(bh_rows(25))).replace('"detail": "ok"', '"detail": "o\\u0000k"', 1)
+                    .encode().replace(b"\\u0000", b"\x00", 1), "0", 1, "HARNESS"))
+        fix.append(("H5-utf8-bom", b"\xef\xbb\xbf" + json.dumps(bh_doc(bh_rows(25))).encode(), "0", 1, "HARNESS"))
+        fix.append(("H6-invalid-utf8", json.dumps(bh_doc(bh_rows(25))).encode().replace(b'"detail": "ok"', b'"detail": "o\xffk"', 1),
+                    "0", 1, "HARNESS"))
+        return fix
+
+    def test_fixtures(self):
+        fix = self.fixtures()
+        self.assertEqual(len(fix), 89)
+        for name, d, rc_arg, want_rc, want_cat in fix:
+            with self.subTest(fixture=name):
+                w = tempfile.mkdtemp(dir=self.tmp)
+                cwd, marker = os.path.join(w, "cwd"), os.path.join(w, "marker")
+                os.makedirs(cwd)
+                if name == "G9-category-unwritable":
+                    with open(marker, "w") as stream:
+                        stream.write("a regular file where the marker directory should be\n")
+                else:
+                    os.makedirs(marker)
+                data = d if isinstance(d, bytes) else (d if isinstance(d, str) else (json.dumps(d, ensure_ascii=False)
+                                                                                     if d is not None else "{not json")).encode("utf-8")
+                with open(os.path.join(cwd, "win-health.json"), "wb") as stream:
+                    stream.write(data)
+                r = subprocess.run([sys.executable, self.reader, rc_arg, marker], cwd=cwd, capture_output=True, timeout=60)
+                raw = r.stdout + r.stderr
+                out = raw.decode("utf-8", "backslashreplace")
+                lines = out.split("\n")
+                errs = [line for line in lines if line.startswith("::error")]
+                msgs = [line.split("::", 2)[2] if line.count("::") >= 2 else "" for line in errs]
+                mk = os.path.join(marker, "category")
+                cat = bh_read_bytes(mk)
+                blocks = bh_blocks(r.stdout)
+                self.assertEqual(r.returncode, want_rc, quoted(raw))
+                self.assertLessEqual(len(errs), 10)
+                self.assertTrue(all(len(m) <= 600 for m in msgs), "an annotation over 600 characters")
+                self.assertFalse(any(re.search(r"%(?![0-9A-F]{2})", m) for m in msgs), "a split %XX escape")
+                self.assertEqual(cat, None if want_cat is None else want_cat.encode("utf-8"), "category marker (bytes)")
+                self.assertFalse(any("[PRODUCT" in m and "[HARNESS" in m for m in msgs), "an annotation with both categories")
+                self.assertTrue(all(v <= BH_CAP for v in blocks.values()), "a stream block over 16 KiB: %s" % blocks)
+                if name.startswith("F1"):
+                    self.assertTrue(all("…(+" in m for m in msgs if "aaaa" in m), "the cut says how much was cut")
+                if name == "F2-flood":
+                    self.assertIn("annotation cap: 21 more", out)
+                if name == "F3-both":
+                    self.assertEqual(sum(line.startswith("::error title=H-WIN-11 PRODUCT::") for line in errs), 1)
+                    self.assertEqual(sum(line.startswith("::error title=H-WIN-11 HARNESS::") for line in errs), 1)
+                if name == "F7-multiline":
+                    self.assertFalse(any(line.startswith("::error::INJECTED") for line in lines))
+                if name.startswith(("G1-", "G3-", "G4-", "G5-", "G6-", "G7-", "G8-", "G9-", "H")):
+                    self.assertTrue(any(m.startswith("[HARNESS") for m in msgs), "a [HARNESS ...] fail-closed error from the reader itself")
+                if name in ("G11-log-20000", "G12-log-hangul", "G13-log-two-views"):
+                    self.assertIn("bytes of the log copy dropped here", out)
+                    self.assertNotIn(u"�", raw.decode("utf-8", "replace"), "the cut introduced U+FFFD")
+
+    def test_probe_p2_log_copy_cut_holds_its_cap_with_the_notice(self):
+        part = bh_reader_funcs(self.code, ["_part"])["_part"]
+        out = part("A" * 20000, "stdout", 16384)
+        self.assertLessEqual(len(out.encode("utf-8")), 16384)
+        self.assertIn("bytes of the log copy dropped here", out)
+        over, n = [], 0
+        for cap in (16384, 8192, 4096, 4000, 1024):
+            for unit in ("A", u"한", u"a한€"):
+                for size in list(range(cap - 8, cap + 300)) + [cap * 2, cap * 10, 1 << 20]:
+                    t = (unit * (size // len(unit.encode("utf-8")) + 1)).encode("utf-8")[:size].decode("utf-8", "ignore")
+                    b = len(part(t, "stderr as cp949", cap).encode("utf-8"))
+                    n += 1
+                    if b > cap:
+                        over.append((cap, unit, size, b))
+        self.assertEqual(n, 4665)
+        self.assertEqual(over, [])
+
+    def test_probe_p3_whole_stream_block_holds_16_kib(self):
+        ns = bh_reader_funcs(self.code, ["_part", "stream_block", "nb", "clip"])
+        worst, n = 0, 0
+        for size in list(range(15500, 17500, 7)) + [65536, 1 << 20]:
+            for alts in (None, ("cp949",), ("cp949", "cp1252"), ("a", "b", "c")):
+                rec = {"bytes": size, "sha256": "f" * 64, "hash_complete": True, "stable": True, "truncated": True,
+                       "marker": "[… %d bytes dropped: stderr bytes 8192..%d (kept 0..8192 and %d..%d) …]" % (size, size, size, size),
+                       "head": {"text": u"한" * (size // 3)}, "tail": {"text": "x" * size}}
+                if alts:
+                    rec["head"]["alt"] = dict((k, u"가" * (size // 3)) for k in alts)
+                    rec["tail"]["alt"] = dict((k, u"€" * (size // 3)) for k in alts)
+                worst = max(worst, sum(ns["nb"](x) for x in ns["stream_block"]("stderr", rec)))
+                n += 1
+        self.assertEqual(n, 1152)
+        self.assertLessEqual(worst, ns["LOG_STREAM_MAX"])
+        self.assertEqual(ns["LOG_STREAM_MAX"], BH_CAP)
+
+    def test_probe_p4_annotation_cut_never_exceeds_600(self):
+        cut = bh_reader_funcs(self.code, ["cut_ann"])["cut_ann"]
+        for n in (10 ** 5, 999990, 10 ** 6 - 1, 10 ** 6, 10 ** 6 + 1, 3 * 10 ** 6):
+            with self.subTest(n=n):
+                self.assertLessEqual(len(cut("a" * n)), 600)
 
 
 if __name__ == "__main__":
