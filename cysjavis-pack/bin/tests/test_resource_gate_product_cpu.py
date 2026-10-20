@@ -1083,6 +1083,26 @@ class T15NoTimeoutLengthened(unittest.TestCase):
         "cysjavis-pack/bin/javis_bootstrap.py": ['timeout=_budget_leaf("RPC_SLACK_S", 10) * 3)'],
         "cysjavis-pack/bin/javis_budget.py": ['"RPC_SLACK_S": 10,'],
     }
+    # Timeout lines the gate has and the tag does not - all in report-only subcommands, none a gate input.
+    # Pinned by exact line text (the census counts lines), grouped by the subcommand that owns them. ONLY a
+    # change to that report subcommand may change one of these lines, and that commit updates this pin. Any
+    # other new or changed timeout line anywhere in the gate turns test 15 red: there is no exemption by
+    # position (PROMOTE-1: the old F5 cut also exempted the 2026-10-17 code later placed inside it).
+    NEW_REPORT_ONLY_TIMEOUTS = {
+        "product-cpu (F5, 0.14.50): _pc_read_ps ps 1.5 s, _pc_run_child": [
+            "PRODUCT_CPU_PS_TIMEOUT_S = 1.5        # the separate invocation's own ps timeout (F5-A1 rule 4)",
+            'text=True, errors="replace", timeout=PRODUCT_CPU_PS_TIMEOUT_S)',
+            'return None, "not_measured", "ps timeout %.1f s" % PRODUCT_CPU_PS_TIMEOUT_S',
+            'out, _ = p.communicate(timeout=PRODUCT_CPU_CHILD_DEADLINE_S)',
+            'p.communicate(timeout=2.0)          # reap: no child left behind (test 9)'],
+        "pty-headroom (2026-10-17): _ptmx_ceiling sysctl 5 s, _ptmx_devices lsof 20 s": [
+            'capture_output=True, text=True, timeout=5)',
+            'timeout=20).stdout))()'],
+        "bg-parents (2026-10-17): _bg_parents_ps ps 1.5 s": [
+            'BG_PARENTS_PS_TIMEOUT_S = 1.5',
+            'text=True, errors="replace", timeout=BG_PARENTS_PS_TIMEOUT_S)',
+            'return None, "not_measured", "ps timeout %.1f s" % BG_PARENTS_PS_TIMEOUT_S'],
+    }
 
     def test_15_literals(self):
         for rel, needles in self.LITERALS.items():
@@ -1091,24 +1111,21 @@ class T15NoTimeoutLengthened(unittest.TestCase):
             for n in needles:
                 self.assertIn(n, txt, "%s: %r" % (rel, n))
 
-    def test_15_gate_timeouts_equal_the_tag_outside_the_new_block(self):
+    def test_15_gate_timeouts_equal_the_tag_plus_the_pinned_report_only_lines(self):
         td = tempfile.mkdtemp(prefix="f5-t15-")
         try:
             tag_gate = tag_bin_dir(td)
             need_tag(self, tag_gate)
 
-            def timeout_lines(path, cut_block):
+            def timeout_lines(path):
                 with open(path, encoding="utf-8") as f:
                     txt = f.read()
-                if cut_block:
-                    a = txt.index("# ══ ★F5 (0.14.50")
-                    b = txt.index("class _GateArgumentParser")
-                    txt = txt[:a] + txt[b:]
                 # A line counts when its CODE names a timeout: an identifier (assignment target, keyword
-                # argument, call, attribute, parameter, reference, import) or an identifier-shaped string
-                # that names a parameter (dict key, subscript key, call argument). The bare word inside a
-                # comment, a message or fixture text is not a timeout (PROMOTE-1: the self-test's
-                # "ps timeout 1.5 s" fixture turned the bare-word census red).
+                # argument, call, attribute, parameter, reference, import) or a whitespace-free string in a
+                # parameter or argv position (dict key, subscript key, call argument, element of a list /
+                # tuple / set passed to a call - so "--timeout" flags and a ["timeout", "5", ...] wrapper
+                # count). The bare word inside a comment, a message or fixture text is not a timeout
+                # (PROMOTE-1: the self-test's "ps timeout 1.5 s" fixture turned the bare-word census red).
                 word = re.compile(r"timeout|TIMEOUT")
                 tree = ast.parse(txt)
                 keys = set()
@@ -1118,7 +1135,10 @@ class T15NoTimeoutLengthened(unittest.TestCase):
                     elif isinstance(node, ast.Subscript):
                         keys.add(id(node.slice))
                     elif isinstance(node, ast.Call):
-                        keys.update(id(v) for v in node.args + [k.value for k in node.keywords])
+                        for v in node.args + [k.value for k in node.keywords]:
+                            keys.add(id(v))
+                            if isinstance(v, (ast.List, ast.Tuple, ast.Set)):
+                                keys.update(id(e) for e in v.elts)
                 rows = set()
                 for node in ast.walk(tree):
                     names, row = (), getattr(node, "lineno", None)
@@ -1134,14 +1154,16 @@ class T15NoTimeoutLengthened(unittest.TestCase):
                         names = tuple(a.asname or a.name for a in node.names)
                     elif isinstance(node, (ast.Global, ast.Nonlocal)):
                         names = tuple(node.names)
-                    elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) in keys \
-                            and node.value.isidentifier():
-                        names = (node.value,)
+                    elif id(node) in keys and isinstance(node, (ast.Constant, ast.JoinedStr)):
+                        parts = [node] if isinstance(node, ast.Constant) else node.values
+                        names = tuple(p.value for p in parts if isinstance(p, ast.Constant)
+                                      and isinstance(p.value, str) and not any(c.isspace() for c in p.value))
                     if any(word.search(n) for n in names):
                         rows.add(row)
                 lines = txt.splitlines()
                 return sorted(lines[r - 1].strip() for r in rows)
-            self.assertEqual(timeout_lines(GATE, True), timeout_lines(tag_gate, False))
+            pinned = [ln for group in self.NEW_REPORT_ONLY_TIMEOUTS.values() for ln in group]
+            self.assertEqual(timeout_lines(GATE), sorted(timeout_lines(tag_gate) + pinned))
         finally:
             shutil.rmtree(td, ignore_errors=True)
 
