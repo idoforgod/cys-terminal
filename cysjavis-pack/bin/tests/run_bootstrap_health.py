@@ -5341,6 +5341,10 @@ def _hw11_t1_accept(case, row, wall):
     if case == "overflow":
         chk("OVERFLOW: the running writer was killed (kill recorded; not an after-exit overflow)",
             bool(ev.get("kill")) and not ev.get("overflow_after_exit"))
+        # B-344 R2-F: since the snapshot check also records an overflow, only this pins the tick check's own effect - it stops
+        # a running writer before the timeout (the disk bound "RAW_MAX + one tick", DESIGN-v4 s4.2 item 1).
+        chk("OVERFLOW: stopped by the tick check while running - not by the timeout, not seen first in the snapshot",
+            ev.get("timed_out") is False and not ev.get("overflow_snapshot"))
     if case in ("overflow_exit_stderr", "overflow_exit_stdout"):     # B-344 R2 (codex R1 on 81cd24d8)
         sname, cfg = case.rsplit("_", 1)[1], ev.get("cfg") or {}
         st = ev.get(sname) or {}
