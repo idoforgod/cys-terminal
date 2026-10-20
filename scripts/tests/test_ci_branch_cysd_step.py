@@ -870,7 +870,7 @@ class BootstrapHealthStepBodies(unittest.TestCase):
 
 
 class BootstrapHealthReader(unittest.TestCase):
-    """T4: the step-5 reader on 89 synthetic runner documents (v2 F1-F7, R2 G1-G15, R3 H1-H6) with a byte-exact category
+    """T4: the step-5 reader on 90 synthetic runner documents (v2 F1-F7, R2 G1-G15, R3 H1-H6, IMPL G16) with a byte-exact category
     marker oracle, and T5 probes P2-P4 on its cut functions."""
     maxDiff = None
 
@@ -932,6 +932,9 @@ class BootstrapHealthReader(unittest.TestCase):
             "\\x80" * 10000, utf8=False, alts={"cp949": u"가" * 13653, "cp1252": u"€" * 13653}, truncated=True)})]), "1", 1, "HARNESS"))
         fix.append(("G15-ann-7-digit-N", bh_doc(bh_rows(24) + [{"id": "H-WIN-9", "status": "fail", "fail_kind": "fail",
                                                                 "reason": "a" * 1100000}]), "1", 1, "PRODUCT"))
+        # G16 (B-344 IMPL, mutation RD2 survived the 89 design fixtures): every other green condition holds - 25 pass rows,
+        # verdict GREEN, rc 0 - and only a stated count disagrees with the rows, so only the count reconciliation can make it red.
+        fix.append(("G16-stale-parent-skip-count", bh_doc(bh_rows(25), **{"skip": 3}), "0", 1, "HARNESS"))
         p24 = ", ".join(json.dumps(r, ensure_ascii=False) for r in bh_rows(24))
         s25 = json.dumps(bh_doc(bh_rows(25))["summary"], ensure_ascii=False)
         fix.append(("H1-dup-row-status", '{"summary": %s, "specimens": [%s, {"id": "H-WIN-25", "status": "fail", "reason": "x", '
@@ -949,7 +952,7 @@ class BootstrapHealthReader(unittest.TestCase):
 
     def test_fixtures(self):
         fix = self.fixtures()
-        self.assertEqual(len(fix), 89)
+        self.assertEqual(len(fix), 90)
         for name, d, rc_arg, want_rc, want_cat in fix:
             with self.subTest(fixture=name):
                 w = tempfile.mkdtemp(dir=self.tmp)
@@ -989,7 +992,7 @@ class BootstrapHealthReader(unittest.TestCase):
                     self.assertEqual(sum(line.startswith("::error title=H-WIN-11 HARNESS::") for line in errs), 1)
                 if name == "F7-multiline":
                     self.assertFalse(any(line.startswith("::error::INJECTED") for line in lines))
-                if name.startswith(("G1-", "G3-", "G4-", "G5-", "G6-", "G7-", "G8-", "G9-", "H")):
+                if name.startswith(("G1-", "G3-", "G4-", "G5-", "G6-", "G7-", "G8-", "G9-", "G16-", "H")):
                     self.assertTrue(any(m.startswith("[HARNESS") for m in msgs), "a [HARNESS ...] fail-closed error from the reader itself")
                 if name in ("G11-log-20000", "G12-log-hangul", "G13-log-two-views"):
                     self.assertIn("bytes of the log copy dropped here", out)

@@ -168,7 +168,7 @@ jobs:
 
           TAG = {"PRODUCT": "[PRODUCT 제품 결함]", "HARNESS": "[HARNESS 계측 결함 · 무측정]"}
           KINDS = {"fail": "PRODUCT", "crash": "HARNESS", "unimplemented": "HARNESS"}
-          STATUSES = ("pass", "fail", "skip", "disabled", "pending")     # the producer's summary counts (:15182-15188)
+          STATUSES = ("pass", "fail", "skip", "disabled", "pending")     # the producer's summary counts (main()'s counted lists)
           LOG_STREAM_MAX = 16 * 1024            # accepted (head decision 1): ALL bytes printed for one stream, notices included
           ALT_VIEWS_MAX = 2                     # code-page views printed per stream (the model makes at most 2)
           LINE_MAX = 1024                       # header / view-header lines are clipped to this many UTF-8 bytes
