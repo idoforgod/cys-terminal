@@ -1085,6 +1085,135 @@ fn exit_for_error(e: &str) -> i32 {
     }
 }
 
+/// ★(B-360 R2 revise · which write) Prefix put on a REFUSED / UNKNOWN error of a LAUNCH-command write of
+/// `boot_agent_on_surface` (the launch text, its Return, the folder-trust confirm) — i.e. NOT the directive. The code
+/// text survives (both predicates are substring tests), so every 90/91 decision is unchanged; callers read it only to
+/// say which write it was (an unknown launch write may mean no agent was ever started: the pane may be a bare shell).
+const LAUNCH_WRITE_TAG: &str = "[launch-write]";
+
+/// Tags a REFUSED / UNKNOWN launch-command write (pure; idempotent; other errors unchanged).
+fn tag_launch_write(e: String) -> String {
+    if (is_write_outcome_unknown(&e) || is_journal_refusal(&e)) && !e.contains(LAUNCH_WRITE_TAG) {
+        format!("{LAUNCH_WRITE_TAG} {e}")
+    } else {
+        e
+    }
+}
+
+/// Was this REFUSED / UNKNOWN error a launch-command write (not the directive)?
+fn is_launch_write_err(e: &str) -> bool {
+    e.contains(LAUNCH_WRITE_TAG)
+}
+
+/// ★(B-360 R2 revise · head decision) Which write a kept pane's REFUSED / UNKNOWN came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // `Adoption` (boot adopt) and `Recover` (node-recover) are recorded by the area-B commit
+enum KeptWrite {
+    Launch,
+    Directive,
+    Adoption,
+    Recover,
+}
+
+impl KeptWrite {
+    fn as_str(self) -> &'static str {
+        match self {
+            KeptWrite::Launch => "launch",
+            KeptWrite::Directive => "directive",
+            KeptWrite::Adoption => "adoption",
+            KeptWrite::Recover => "recover",
+        }
+    }
+
+    /// The launch write if `e` carries the launch tag, else `other`.
+    fn of(e: &str, other: KeptWrite) -> KeptWrite {
+        if is_launch_write_err(e) {
+            KeptWrite::Launch
+        } else {
+            other
+        }
+    }
+}
+
+/// The append-only kept-pane record file (JSON lines) next to `.pack-reinject-pending.json`.
+fn kept_pane_records_path(base: &std::path::Path) -> std::path::PathBuf {
+    base.join(".kept-pane-records.jsonl")
+}
+
+/// ★(B-360 R2 revise) The command run that kept panes belong to: the OUTERMOST command (boot / restore / launch-agent /
+/// node-recover) opens it; an in-process launch or recovery inside it records under the outer command's name. Thread-
+/// local, so in-process specimens on different test threads never share it.
+struct KeptPaneRun {
+    command: &'static str,
+    records: Vec<Value>,
+}
+
+thread_local! {
+    static KEPT_PANE_RUN: std::cell::RefCell<Option<KeptPaneRun>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Scope of one command run's kept-pane records; `owner` = this scope opened the run (the outermost command).
+struct KeptPaneScope {
+    owner: bool,
+}
+
+impl KeptPaneScope {
+    /// Opens the run for `command` unless an outer command already did.
+    fn open(command: &'static str) -> Self {
+        let owner = KEPT_PANE_RUN.with(|r| {
+            let mut r = r.borrow_mut();
+            if r.is_some() {
+                false
+            } else {
+                *r = Some(KeptPaneRun { command, records: Vec::new() });
+                true
+            }
+        });
+        Self { owner }
+    }
+}
+
+impl Drop for KeptPaneScope {
+    fn drop(&mut self) {
+        if self.owner {
+            KEPT_PANE_RUN.with(|r| *r.borrow_mut() = None);
+        }
+    }
+}
+
+/// ★(B-360 R2 revise · head decision) Appends ONE kept-pane record — a pane kept after a REFUSED (zero bytes) or
+/// UNKNOWN (may still land) write: `{at, command, surface_id, role, agent, outcome: refused|unknown, write:
+/// launch|directive|adoption|recover, request_id|null}` to `<pack state base>/.kept-pane-records.jsonl`. Record only:
+/// nothing in this patch reads it (no ping, no re-adopt, no reconcile). Best-effort; a write failure is said on stderr.
+/// This is the single carrier point for kept panes (an extra carrier is one call here).
+fn record_kept_pane(sid: u64, role: &str, agent: &str, e: &str, write: KeptWrite) {
+    let command = KEPT_PANE_RUN.with(|r| r.borrow().as_ref().map(|run| run.command)).unwrap_or("cys");
+    let rec = json!({
+        "at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        "command": command,
+        "surface_id": sid,
+        "role": role,
+        "agent": agent,
+        "outcome": if is_write_outcome_unknown(e) { "unknown" } else { "refused" },
+        "write": write.as_str(),
+        "request_id": request_id_from_unknown(e),
+    });
+    let path = kept_pane_records_path(&pack_state_base());
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{rec}"));
+    if let Err(w) = appended {
+        eprintln!("[kept-pane] ⚠ record not written ({}): {w} — {rec}", path.display());
+    }
+    KEPT_PANE_RUN.with(|r| {
+        if let Some(run) = r.borrow_mut().as_mut() {
+            run.records.push(rec);
+        }
+    });
+}
+
 /// ★(B-360) launch-agent: the agent started but its directive was refused at the writer journal (zero bytes). The
 /// pane is KEPT (closing it would destroy a running agent and a relaunch would be refused the same way); the
 /// boot tooling re-injects later (`javis_boot_node` VERIFY goes `--queued`). Not 0 (the directive did not land),
@@ -15144,14 +15273,17 @@ fn boot_agent_on_surface(
         .unwrap_or(0);
     // ★(0.14.42 · 통합 minor 정리) node-recover 의 기존 좌석(에이전트 등록 유지)에 비권위 호출자가 기동 명령을 넣으면 제출
     //   정착 게이트를 지난다 — 정착 증명 거부는 `cys send` 와 같은 예산 안에서 다시 보낸다(권위 면제면 첫 요청 그대로).
+    // ★(B-360 R2 revise · which write) a REFUSED / UNKNOWN of these two launch writes is tagged as the launch write
     authoritative_paste_settled(
         |p| request("surface.send_text", p),
         json!({"surface_id": sid, "text": send, "quiet": true, "authoritative": true}),
-    )?;
+    )
+    .map_err(tag_launch_write)?;
     request(
         "surface.send_key",
         json!({"surface_id": sid, "key": "Return", "authoritative": true}),
-    )?;
+    )
+    .map_err(tag_launch_write)?;
     // ★Phase 5 ①a: agent_meta를 기동 직후(readiness 폴링 前)에 등록한다. 등록이 폴링 뒤(step 5)에만
     // 있으면 readiness 미확인·restore 중 stall 시 meta=None으로 남아 → 사망감지 스킵(governance.rs)
     // → agent_seen 영원히 false → status 허위 DEAD → task-prompt 생존게이트가 '미기동' 오판(DRILL_LIVE_1).
@@ -15378,7 +15510,8 @@ fn boot_agent_on_surface(
                 request(
                     "surface.send_key",
                     json!({"surface_id": sid, "key": "Return", "authoritative": true}),
-                )?;
+                )
+                .map_err(tag_launch_write)?; // ★(B-360 R2 revise) the folder-trust confirm is a launch write too
                 trust_sends += 1;
                 trust_seen_at = Some(delta_cursor);
                 std::thread::sleep(std::time::Duration::from_secs(BUDGET_TRUST_SETTLE_SECS));
@@ -18204,6 +18337,8 @@ fn run_launch_agent_opts(
     //   (javis_boot_node → boot-reviewers 경로)를 GUI/훅 `cys boot` 와 직렬화한다.
     //   run_boot 이 이미 쥐고 있으면 None(재진입 방어). Drop 에서 flock 자동 해제.
     let _launch_lock = acquire_launch_lock();
+    // ★(B-360 R2 revise) kept-pane records of this launch go under the outermost command's name
+    let _kept_scope = KeptPaneScope::open(if restore { "restore" } else { "launch-agent" });
     // 절대지침(앵커1-b): 워커는 워크플로우 폴더에서 산다 — cwd 미지정이면 호출 폴더가
     // 워크플로우 폴더다 (데몬 기본값 home에 맡기지 않는다. 명시 --cwd는 그대로 우선).
     // 빈 문자열은 None으로 정규화 — 구버전 topology의 "cwd": "" 가 PTY 생성을 깨거나
@@ -18323,11 +18458,21 @@ fn run_launch_agent_opts(
         Err(e) if created.is_some() && is_journal_refusal(&e) => {
             let sid = created.expect("guarded above");
             eprintln!("error: {e}");
-            eprintln!(
-                "[launch-agent] {} kept: the agent is running WITHOUT its directive (writer journal refused it) — \
-                 make the journal writable, then re-inject (cys reinject --role {role})",
-                surface_ref(sid)
-            );
+            if is_launch_write_err(&e) {
+                // ★(B-360 R2 revise · which write) zero bytes of the LAUNCH command: no agent was started
+                eprintln!(
+                    "[launch-agent] {} kept: the writer journal refused the launch command (zero bytes) — no agent was \
+                     started, the pane is an empty shell; make the journal writable, then `cys restore` / relaunch",
+                    surface_ref(sid)
+                );
+            } else {
+                eprintln!(
+                    "[launch-agent] {} kept: the agent is running WITHOUT its directive (writer journal refused it) — \
+                     make the journal writable, then re-inject (cys reinject --role {role})",
+                    surface_ref(sid)
+                );
+            }
+            record_kept_pane(sid, role, agent, &e, KeptWrite::of(&e, KeptWrite::Directive));
             println!("{}", surface_ref(sid));
             EXIT_DIRECTIVE_REFUSED
         }
@@ -18335,12 +18480,26 @@ fn run_launch_agent_opts(
         Err(e) if created.is_some() && is_write_outcome_unknown(&e) => {
             let sid = created.expect("guarded above");
             eprintln!("error: {e}");
-            eprintln!(
-                "[launch-agent] {} kept: the directive's outcome is unknown (it may still land) — do NOT re-inject yet; \
-                 check the seat first (cys read-screen --surface {})",
-                surface_ref(sid),
-                surface_ref(sid)
-            );
+            if is_launch_write_err(&e) {
+                // ★(B-360 R2 revise · which write) the LAUNCH command's write is unknown (before the agent meta was set):
+                //   the agent may still start, or the pane may stay an empty shell — nothing was typed after it
+                eprintln!(
+                    "[launch-agent] {} kept: the launch command's write outcome is unknown (it may still be typed — the agent \
+                     may or may not start; no directive was sent) — do NOT relaunch or re-send; check the seat first \
+                     (cys read-screen --surface {}): an agent at its prompt needs `cys reinject --role {role}`, an empty \
+                     shell needs `cys restore`",
+                    surface_ref(sid),
+                    surface_ref(sid)
+                );
+            } else {
+                eprintln!(
+                    "[launch-agent] {} kept: the directive's outcome is unknown (it may still land) — do NOT re-inject yet; \
+                     check the seat first (cys read-screen --surface {}), then `cys reinject --role {role} --check`",
+                    surface_ref(sid),
+                    surface_ref(sid)
+                );
+            }
+            record_kept_pane(sid, role, agent, &e, KeptWrite::of(&e, KeptWrite::Directive));
             println!("{}", surface_ref(sid));
             EXIT_WRITE_OUTCOME_UNKNOWN
         }
@@ -21919,7 +22078,9 @@ fn recover_directive() -> &'static str {
 /// T2-6 조직 복원: 토폴로지 스냅샷 기준으로 죽은 역할 일괄 재기동 (작업 재개는 master 판단)
 fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i32 {
     // ★(B-360 R2) in-seat seats kept after a REFUSED (90) / UNKNOWN (91) write — never a fresh fallback
+    // ★(B-360 R2 revise) and fresh launches that came back 90 / 91 (pane kept by launch-agent) — counted the same way
     let (mut refused, mut unknown) = (0usize, 0usize);
+    let _kept_scope = KeptPaneScope::open("restore");
     let result = (|| -> Result<(usize, usize, usize), String> {
         let topo = request("system.topology", json!({}))?;
         // ★SEAT(2026-07-17 실사고 수리): '역할이 등록됨'과 '그 좌석에 누가 앉아 있음'을 구분한다.
@@ -22087,14 +22248,19 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                              surface:{sid} kept, no fresh launch. If the agent runs WITHOUT its directive, make the journal \
                              writable and `cys reinject --role {role}`; if the seat is still an empty shell, `cys restore` again: {e}"
                         );
+                        record_kept_pane(sid, role, agent, &e, KeptWrite::of(&e, KeptWrite::Directive));
                         continue;
                     }
                     Err(e) if is_write_outcome_unknown(&e) => {
                         unknown += 1;
+                        // ★(B-360 R2 revise · minor) name the recovery: inspect first, re-inject only if it did not land
                         println!(
                             "· {role}: 좌석 내 재연결 — a write's outcome is unknown (it may still land) — seat surface:{sid} \
-                             kept, no fresh launch, nothing re-sent: check the seat (`cys read-screen --surface surface:{sid}`): {e}"
+                             kept, no fresh launch, nothing re-sent: check the seat first (`cys read-screen --surface \
+                             surface:{sid}`); only if the directive did not land, `cys reinject --role {role}` (or \
+                             `cys reinject --role {role} --check`): {e}"
                         );
+                        record_kept_pane(sid, role, agent, &e, KeptWrite::of(&e, KeptWrite::Directive));
                         continue;
                     }
                     Err(e) => {
@@ -22132,6 +22298,22 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                         //   rc 0 = 그 한 제출까지 성공(주입 Err 는 rc 1 → else 팔 실패 계상 · 보류는 78 → 위 보류 계상).
                     }
                 }
+            } else if rc == EXIT_DIRECTIVE_REFUSED {
+                // ★(B-360 R2 revise · S62) launch-agent kept the pane (and recorded it): zero bytes of a write were typed.
+                //   No marker (the directive was not typed), not a failed launch.
+                refused += 1;
+                println!(
+                    "· {role}: 재기동 — the writer journal refused a write (zero bytes) — pane kept, no marker; make the \
+                     journal writable, then `cys reinject --role {role}` (an empty shell: `cys restore` again)"
+                );
+            } else if rc == EXIT_WRITE_OUTCOME_UNKNOWN {
+                // ★(B-360 R2 revise · S62) a write may still land: pane kept (recorded by launch-agent), nothing re-sent,
+                //   no marker seeded (that would say "delivered"), no pack-update entry (kept panes are record-only)
+                unknown += 1;
+                println!(
+                    "· {role}: 재기동 — a write's outcome is unknown (it may still land) — pane kept, nothing re-sent, no \
+                     marker: check the seat first; only if the directive did not land, `cys reinject --role {role} --check`"
+                );
             } else {
                 fail += 1;
                 println!("· {role}: 기동 실패 — 나머지 역할 계속 진행");
@@ -22142,26 +22324,33 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
     match result {
         Ok((ok, fail, gated)) => {
             println!(
-                "restore 완료: 재기동 {ok} · 실패 {fail} · 관문 보류 {gated} · 현황 `cys status`"
+                "restore 완료: 재기동 {ok} · 실패 {fail} · 관문 보류 {gated} · journal refused {refused} · outcome unknown \
+                 {unknown} · 현황 `cys status`"
             );
             if refused > 0 || unknown > 0 {
                 println!("restore: 좌석 보존 — journal refused {refused} · outcome unknown {unknown} (fresh 폴백 0)");
             }
-            // ★(B-360 R2) 91 outranks 90 (a blind re-run may type twice); both outrank the generic 1
-            if unknown > 0 {
-                EXIT_WRITE_OUTCOME_UNKNOWN
-            } else if refused > 0 {
-                EXIT_DIRECTIVE_REFUSED
-            } else if fail > 0 || gated > 0 {
-                1
-            } else {
-                0
-            }
+            restore_exit_code(fail, gated, unknown, refused)
         }
         Err(e) => {
             eprintln!("error: {e}");
             1
         }
+    }
+}
+
+/// ★(B-360 R2 revise · aggregate precedence) `cys restore`'s exit: an existing real failure first (1: a failed launch or
+/// a gate-held seat — they demand action, and a re-run is safe because every unknown pane is kept and recorded), then
+/// 91 (any unknown), then 90 (any refused), then 0. Pure.
+fn restore_exit_code(fail: usize, gated: usize, unknown: usize, refused: usize) -> i32 {
+    if fail > 0 || gated > 0 {
+        1
+    } else if unknown > 0 {
+        EXIT_WRITE_OUTCOME_UNKNOWN
+    } else if refused > 0 {
+        EXIT_DIRECTIVE_REFUSED
+    } else {
+        0
     }
 }
 
