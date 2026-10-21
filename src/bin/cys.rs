@@ -1038,16 +1038,36 @@ fn is_recover_refusal(e: &str) -> bool {
 /// authoritative_caller_ok = master/cso pane 자손 ∨ restore-root 자손)는 분리 호출자(setsid 부트의
 /// `cys boot` · GUI start_master 체인 · watchdog 자식 node-recover)에서 거짓이라 이 접기가 호출자
 /// 무관한 1선 방어다.
+///
+/// ★(B-360) A writer-journal refusal (zero bytes) is folded the same way: killing and relaunching the seat cannot
+/// heal the journal, and the relaunch's own directive would be refused again — rc 79, nothing reclaimed.
 fn recover_refusal_from_input_guard(e: String) -> String {
     if is_typing_guard_err(&e) && !is_recover_refusal(&e) {
         format!(
             "{RECOVER_REFUSED_TOKEN} 좌석 입력줄에 사람 활동(초안·타이핑) 관측 — 선정리·재기동 보류 \
              (회수·파괴 0 · 사람이 그 pane 에서 줄을 비운 뒤(Ctrl-U) 재부트): {e}"
         )
+    } else if is_journal_refusal(&e) && !is_recover_refusal(&e) {
+        format!(
+            "{RECOVER_REFUSED_TOKEN} writer journal refused the recovery write (zero bytes) — no reclaim, no kill; \
+             make the daemon's writer journal writable, then boot again: {e}"
+        )
     } else {
         e
     }
 }
+
+/// ★(B-360) Did the daemon refuse this direct write at the writer journal (zero bytes typed)? Pure; the code is
+/// `cys::ERR_JOURNAL_UNAVAILABLE` as `rpc_roundtrip` renders it (`<code>: <message>`).
+fn is_journal_refusal(e: &str) -> bool {
+    e.contains(&format!("{}: ", cys::ERR_JOURNAL_UNAVAILABLE))
+}
+
+/// ★(B-360) launch-agent: the agent started but its directive was refused at the writer journal (zero bytes). The
+/// pane is KEPT (closing it would destroy a running agent and a relaunch would be refused the same way); the
+/// boot tooling re-injects later (`javis_boot_node` VERIFY goes `--queued`). Not 0 (the directive did not land),
+/// not 1 (1 means "rolled back, pane closed"), not 78 (no first-run gate is involved). Free: 0·1·2·7·75·78·79·80-89.
+const EXIT_DIRECTIVE_REFUSED: i32 = 90;
 
 /// [결재 7ⓑ] `cycle-agent` 의 clear 는 **송신(행위)과 실효(결과)가 다르다.**
 ///
@@ -13492,13 +13512,13 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                     //   (0.14.39) 거부원이 둘로 늘었다 — 사람 활동 관측(recover_refusal_from_input_guard)도 같은 코드
                     if rc == EXIT_RECOVER_REFUSED {
                         println!(
-                            "· {agent}: 역할 '{role}' node-recover 안전 거부(재관측에서 에이전트 생존 · 또는 좌석 입력줄의 사람 활동) \
+                            "· {agent}: 역할 '{role}' node-recover 안전 거부(재관측에서 에이전트 생존 · 또는 좌석 입력줄의 사람 활동 · 또는 writer journal 거부) \
                              — 회수·파괴·스폰 0(원인은 위 'node-recover 안전 거부:' 줄)"
                         );
                         outcomes.push(json!({"role": role, "agent": agent,
                                              "outcome": "skipped_unconfirmed", "mandatory": mandatory,
                                              "surface_ref": sref, "liveness": "recover_refused",
-                                             "reason": "node-recover 전처리 안전 거부 — agent_alive 재관측 또는 좌석 입력줄의 사람 활동(타이핑 가드·초안 게이트)",
+                                             "reason": "node-recover 전처리 안전 거부 — agent_alive 재관측 또는 좌석 입력줄의 사람 활동(타이핑 가드·초안 게이트) 또는 writer journal 거부(B-360)",
                                              "hint": "파괴·중복 스폰 금지 — 되살아난 좌석이면 다음 부트가 재관측 · 사람 초안이면 그 pane 에서 줄을 비운 뒤(Ctrl-U) 재부트"}));
                         continue;
                     }
@@ -18242,6 +18262,19 @@ fn run_launch_agent_opts(
                 print_gate_pending_prescription(sid, role, agent, &gate, &tail);
             }
             cys::EXIT_GATE_PENDING
+        }
+        // ★(B-360) The directive was refused at the writer journal: zero bytes typed, the agent is running. Keep the
+        //   pane (no close · no role release) and say so; stdout keeps its contract (last line = surface ref).
+        Err(e) if created.is_some() && is_journal_refusal(&e) => {
+            let sid = created.expect("guarded above");
+            eprintln!("error: {e}");
+            eprintln!(
+                "[launch-agent] {} kept: the agent is running WITHOUT its directive (writer journal refused it) — \
+                 make the journal writable, then re-inject (cys reinject --role {role})",
+                surface_ref(sid)
+            );
+            println!("{}", surface_ref(sid));
+            EXIT_DIRECTIVE_REFUSED
         }
         // ★(U-11) `LaunchFailed` 는 종전의 `Err`(데몬 왕복 실패 등 절차 미완)와 **완전히 같은
         //   귀결**이다 — or-패턴으로 합류시켜 롤백 close 블록을 한 벌로 유지한다. 두 벌이 되면
@@ -42970,5 +43003,54 @@ mod update_repair_c_row7 {
         assert_eq!(cmd.matches("connect_raw().is_ok()").count(), 3, "only rows 6, 8, 9 keep the presence check here");
         assert!(item_code(src, "fn connect() -> Result<ConnStream, String> {").contains("match connect_raw() {"), "row 10");
         assert!(item_code(src, "fn poll_socket_ready(").contains("if let Ok(s) = connect_raw() {"), "row 11");
+    }
+}
+
+/// ★(B-360) A writer-journal refusal must not become seat destruction downstream.
+#[cfg(test)]
+mod b360_tests {
+    use super::*;
+
+    /// As `rpc_roundtrip` renders the daemon's error reply (`<code>: <message>`).
+    fn journal_err() -> String {
+        format!(
+            "{}: zero bytes written: the writer journal refused this write (journal:Is a directory (os error 21)); \
+             nothing was typed - send it again once the journal is writable",
+            cys::ERR_JOURNAL_UNAVAILABLE
+        )
+    }
+
+    #[test]
+    fn b360_a_journal_refusal_is_recognised_and_is_not_a_typing_guard() {
+        let e = journal_err();
+        assert!(is_journal_refusal(&e));
+        assert!(!is_typing_guard_err(&e), "must not divert to --queued");
+        assert!(!cys::inject_guard::is_hold_error(&e), "not a first-run gate hold");
+        assert!(!is_journal_refusal(&format!("{}: {}", cys::ERR_TYPING_GUARD, cys::MSG_TYPING_GUARD)));
+        assert!(!is_journal_refusal("rpc_timeout: no reply"));
+    }
+
+    /// node-recover: a journal refusal exits 79 (run_boot does not reclaim/kill); other errors are unchanged.
+    #[test]
+    fn b360_node_recover_folds_a_journal_refusal_into_the_non_destructive_code() {
+        let folded = recover_refusal_from_input_guard(journal_err());
+        assert!(is_recover_refusal(&folded), "{folded}");
+        assert!(folded.contains("journal:Is a directory"), "the reason survives the fold: {folded}");
+        assert_eq!(recover_refusal_from_input_guard(folded.clone()), folded, "idempotent");
+        assert_eq!(recover_refusal_from_input_guard("process_exited: gone".into()), "process_exited: gone");
+    }
+
+    /// launch-agent: the journal-refusal arm sits BEFORE the closing arm (match order decides) and does not close.
+    #[test]
+    fn b360_launch_agent_keeps_the_pane_on_a_journal_refusal_source_pin() {
+        let src = include_str!("cys.rs");
+        let arm = src.find("Err(e) if created.is_some() && is_journal_refusal(&e) => {").expect("journal arm");
+        let close = src.find("Ok(BootVerdict::LaunchFailed { evidence: e }) | Err(e) => {").expect("closing arm");
+        assert!(arm < close, "the journal arm must come first");
+        let body = &src[arm..close];
+        assert!(body.contains("EXIT_DIRECTIVE_REFUSED") && !body.contains("surface.close"), "{body}");
+        for used in [0, 1, 2, 7, 75, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89] {
+            assert_ne!(EXIT_DIRECTIVE_REFUSED, used);
+        }
     }
 }

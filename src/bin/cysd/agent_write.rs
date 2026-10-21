@@ -1166,6 +1166,43 @@ pub fn finish(job: AgentJob, ex: &Executed) -> Terminal {
     terminal
 }
 
+/// What a direct-send handler can tell its caller about the writer journal (B-360).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JournalBarrier {
+    /// The writer passed the journal barrier (`Writing` is set only after it), or the request ended for a reason
+    /// that is not the barrier — those keep their existing reporting.
+    Passed,
+    /// The journal barrier refused the request: zero bytes. The writer's reason (`journal:<os error>`).
+    Refused(String),
+    /// The budget ended before the seat's writer reached the request (it is queued behind earlier writes).
+    Pending,
+}
+
+/// Same budget as the schedule push's wait for its writer verdict (`schedule::PUSH_SETTLE_BUDGET_MS`).
+pub const JOURNAL_BARRIER_BUDGET_MS: u64 = 2_000;
+
+/// Wait, bounded, until the writer has passed or failed the journal barrier for `req` (B-360). The barrier is the
+/// writer's first step after a cancel check (`execute_started`), so this does not wait for the plan's gaps or bytes:
+/// on an idle seat it costs the journal's own fsync. Open-time and append-time journal failures look the same here
+/// (`journal:` is produced only by the barrier). Call it with no lock held that the settlement takes (`input_gate`).
+pub fn await_journal_barrier(req: &Request, budget: Duration) -> JournalBarrier {
+    let deadline = Instant::now() + budget;
+    loop {
+        match req.status() {
+            Status::Writing => return JournalBarrier::Passed,
+            Status::Terminal(Terminal::RefusedNoWrite { reason }) if reason.starts_with("journal:") => {
+                return JournalBarrier::Refused(reason)
+            }
+            Status::Terminal(_) => return JournalBarrier::Passed,
+            Status::AcceptedPending => {}
+        }
+        if Instant::now() >= deadline {
+            return JournalBarrier::Pending;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static SYNC_SETTLE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
@@ -1898,6 +1935,48 @@ mod tests {
         let l = log.clone();
         j.settle = Some(Box::new(move |t: &Terminal| l.lock().unwrap().push(format!("settle:{}", t.kind()))));
         j
+    }
+
+    /// B-360: the handler's bounded wait sees an APPEND-time journal failure (an opened journal whose `writing`
+    /// fails — the disk-full / read-only route), not only an open failure; it waits for a writer that reaches the job
+    /// later; a non-journal zero-byte refusal and a written request are `Passed`; an unreached job is `Pending`.
+    #[test]
+    fn b360_await_journal_barrier_reports_the_barrier_verdict() {
+        let budget = Duration::from_millis(JOURNAL_BARRIER_BUDGET_MS);
+        // append-time refusal, reached by the writer 30 ms after the wait starts
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let j = journaled_job(&log, true, false);
+        let req = j.request.clone();
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let mut w = Rec::new();
+            let ex = run_job(&mut w, &j);
+            finish(j, &ex);
+            w.attempts
+        });
+        assert_eq!(await_journal_barrier(&req, budget), JournalBarrier::Refused("journal:disk".into()));
+        assert_eq!(t.join().unwrap(), 0, "zero bytes");
+        // healthy journal: written
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let j = journaled_job(&log, false, false);
+        let req = j.request.clone();
+        let mut w = Rec::new();
+        let ex = run_job(&mut w, &j);
+        finish(j, &ex);
+        assert_eq!(await_journal_barrier(&req, budget), JournalBarrier::Passed);
+        // a receiver-proof refusal is not this mechanism's question: Passed (its existing reporting stands)
+        let j = job(Plan::paste("x").with_submit(0, 0), FakeProof::refusing(ProofLoss::AgentDead));
+        let req = j.request.clone();
+        let mut w = Rec::new();
+        let ex = run_job(&mut w, &j);
+        finish(j, &ex);
+        assert!(matches!(req.status(), Status::Terminal(Terminal::RefusedNoWrite { .. })));
+        assert_eq!(await_journal_barrier(&req, budget), JournalBarrier::Passed);
+        // never reached by a writer: Pending once the budget ends
+        let j = journaled_job(&Arc::new(Mutex::new(Vec::new())), true, false);
+        let t0 = Instant::now();
+        assert_eq!(await_journal_barrier(&j.request, Duration::from_millis(40)), JournalBarrier::Pending);
+        assert!(t0.elapsed() >= Duration::from_millis(40));
     }
 
     /// Design 4.4 step 2 / 4.5: the durable `writing` record precedes admission and the first byte;

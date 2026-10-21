@@ -4017,11 +4017,37 @@ fn bind_held_and_write(
         }
     }
     crate::agent_write::test_wait_settled(&handle);
+    // ★(B-360) The journal verdict is the writer's first step: a refusal there is an error reply, not `sent:true`.
+    let barrier = match journal_barrier_verdict(id, &handle) {
+        Ok(b) => b,
+        Err(refused) => return refused,
+    };
     *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch());
     ok_response(
         id,
-        json!({"surface_id": sid, "key": key, "sent": true, "request_id": body.request_id, "bound": how}),
+        json!({"surface_id": sid, "key": key, "sent": true, "request_id": body.request_id, "bound": how,
+               "journal_barrier": barrier}),
     )
+}
+
+/// ★(B-360) Wait (bounded) for the writer's journal barrier on a handed-off direct agent job, after `input_gate` is
+/// released. `Err` is the error reply for a journal refusal (zero bytes were written, nothing is retained — the caller
+/// sends again); `Ok` is the reply field: `"passed"`, or `"pending"` when the seat's writer did not reach the job
+/// within the budget (reported as before: the write may still happen).
+fn journal_barrier_verdict(id: &Value, handle: &crate::agent_write::Request) -> Result<&'static str, Value> {
+    let budget = std::time::Duration::from_millis(crate::agent_write::JOURNAL_BARRIER_BUDGET_MS);
+    match crate::agent_write::await_journal_barrier(handle, budget) {
+        crate::agent_write::JournalBarrier::Passed => Ok("passed"),
+        crate::agent_write::JournalBarrier::Pending => Ok("pending"),
+        crate::agent_write::JournalBarrier::Refused(reason) => Err(err_response(
+            id,
+            cys::ERR_JOURNAL_UNAVAILABLE,
+            &format!(
+                "zero bytes written: the writer journal refused this write ({reason}); nothing was typed - \
+                 send it again once the journal is writable"
+            ),
+        )),
+    }
 }
 
 /// authoritative(타이핑 가드 면제) restore-root 분기 — caller_pid 의 32-hop 조상 중 restore_roots 에
@@ -7173,9 +7199,15 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 let gone = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).drain_all();
                 dispose_held_bodies(daemon, sid, gone, "cleared", None, std::time::Instant::now());
             }
+            let mut barrier = None;
             if let Some(h) = &agent_handle {
                 // Ticket, echo window and `surface.input_injected` are the settlement's (after the terminal).
                 crate::agent_write::test_wait_settled(h);
+                // ★(B-360) A journal refusal is an error reply, not `sent:true` (all agent intents of send_text).
+                match journal_barrier_verdict(&id, h) {
+                    Ok(b) => barrier = Some(b),
+                    Err(refused) => return Reply::Single(refused),
+                }
             } else if let Some(x) = request_pair_key(daemon, verified_from, &params) {
                 surface.clear_return_ticket(x);
             }
@@ -7238,6 +7270,9 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             let mut result = json!({"surface_id": sid, "sent": true});
             if let Some(h) = &agent_handle {
                 result["request_id"] = json!(h.id);
+            }
+            if let Some(b) = barrier {
+                result["journal_barrier"] = json!(b);
             }
             Reply::Single(ok_response(&id, result))
         }

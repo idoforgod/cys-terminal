@@ -659,6 +659,11 @@ pub fn wait_named_pipe(path: &Path, timeout: std::time::Duration) -> bool {
 /// 조용히 죽는다(RC1 문자열 계약 드리프트). 그래서 상수로 못박고 양쪽이 이것만 쓴다.
 pub const ERR_TYPING_GUARD: &str = "typing_guard";
 pub const MSG_TYPING_GUARD: &str = "human is typing in this pane; retry later or use --queued";
+/// ★(B-360) Error code of a direct agent write the writer journal refused (zero bytes). Producer = cysd handlers
+/// (`journal_barrier_verdict`), consumers = the `cys` launch-agent / node-recover dispositions, which must keep the
+/// seat instead of closing or reclaiming it. Must never contain the typing-guard strings above (that would turn it
+/// into a `--queued` fallback).
+pub const ERR_JOURNAL_UNAVAILABLE: &str = "journal_unavailable";
 /// 직접 send 초안 거부의 사유 태그 — 기존 타이핑 가드 메시지 접두 뒤에 붙인다.
 pub const DRAFT_GATE_TAG: &str = "draft_gate";
 /// ★(0.14.43 · C5 · RQFIX I-8) 유령 계수 처방 — 데몬이 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙이고(앞 문구·접두·태그의 위치·바이트는 불변),
