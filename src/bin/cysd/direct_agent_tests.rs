@@ -496,14 +496,141 @@ fn b360_control_a_healthy_journal_keeps_the_success_reply() {
     assert_eq!(written_ids(&fx).len(), 2);
 }
 
-/// A write the journal accepted says so in its reply (`journal_barrier`), for the bind and the send_text agent tail.
+/// R2: a write the journal accepted is `sent:true` and carries NO `journal_barrier` field (the field had no consumer at
+/// the caller and was removed; the uncertainty is carried by the error code and the CLI exit code instead).
 #[test]
-fn b360_a_journal_accepted_write_reports_its_barrier_passed() {
+fn b360_r2_a_passed_write_is_sent_true_and_carries_no_barrier_field() {
     let fx = fx("b360-field");
     let s = seat(&fx, true);
     send(&fx, &s, 900, "report one");
     let k = ret(&fx, &s, 900);
-    assert_eq!(k["result"]["journal_barrier"], "passed", "{k}");
+    assert_eq!(k["result"]["sent"], true, "{k}");
+    assert!(k["result"].get("journal_barrier").is_none(), "{k}");
     let c = rpc(&fx, "surface.send_text", json!({"surface_id": s.id, "text": "/clear", "clear_first": true, "authoritative": true}));
-    assert_eq!(c["result"]["journal_barrier"], "passed", "{c}");
+    assert_eq!(c["result"]["sent"], true, "{c}");
+    assert!(c["result"].get("journal_barrier").is_none(), "{c}");
+}
+
+// ── B-360 R2: a PENDING barrier (the seat's writer did not reach the write within the budget) is not `sent:true` ──────
+// Deterministic PENDING, no timing luck: a first bind gets a receiver proof whose admission blocks on a latch. It passes
+// its journal barrier and then holds the seat's single writer thread, so the next bind on that seat waits behind it for
+// the whole budget. This specimen's RED on eadce029 (it receives `sent:true`) IS the positive control that it can see the
+// defect.
+
+struct BlockAdmit(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+impl crate::agent_write::Proof for BlockAdmit {
+    fn admit(&self) -> Result<(), crate::receiver::ProofLoss> {
+        let (m, c) = &*self.0;
+        let deadline = Instant::now() + Duration::from_secs(20); // never hang a test run
+        let mut open = m.lock().unwrap_or_else(|e| e.into_inner());
+        while !*open {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            open = c.wait_timeout(open, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        Ok(())
+    }
+    fn recheck(&self, _: crate::agent_write::Phase) -> Result<(), crate::receiver::ProofLoss> {
+        Ok(())
+    }
+}
+
+fn release(latch: &Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>) {
+    let (m, c) = &**latch;
+    *m.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    c.notify_all();
+}
+
+/// Journal records for one body text: (writing records, written_submitted terminals) among requests with its digest.
+fn writes_of(fx: &Fx, text: &str) -> (usize, usize) {
+    let digest = crate::delivery::digest_text(text);
+    let recs: Vec<Value> = journal(fx).lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect();
+    let ids: Vec<String> = recs
+        .iter()
+        .filter(|v| v["rec"] == "writing" && v["digest"] == json!(digest))
+        .map(|v| v["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    let done = recs
+        .iter()
+        .filter(|v| v["rec"] == "terminal" && v["kind"] == "written_submitted" && ids.iter().any(|i| v["id"] == json!(i)))
+        .count();
+    (ids.len(), done)
+}
+
+/// "Written exactly once": one durable `writing` record and one `written_submitted` terminal for that text.
+fn assert_written_exactly_once(fx: &Fx, text: &str) {
+    assert_eq!(writes_of(fx, text), (1, 1), "{text:?} must be written exactly once (writing records, terminals)");
+}
+
+/// Holds the seat's writer with a first bind, then sends `text` as a second bind from another caller; returns the
+/// second bind's reply and how long it took. The caller releases the latch.
+fn pending_bind(fx: &Fx, s: &Arc<Surface>, text: &str) -> (Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>, Value, Duration) {
+    crate::agent_write::set_test_sync_settle(false); // the handler must answer from the barrier, not wait for settlement
+    // The send-settle gate (unix only, handlers `send_settle_applies`) refuses a second direct send while a submit is in
+    // flight; it is a different gate from the one under test, so it is switched off for this daemon by its own sentinel
+    // (as `send_settle_tests` does). Without it - and on Windows, where it never applies - a direct bind queues behind
+    // the busy writer: the PENDING case.
+    std::fs::write(fx.dir.join("send-settle-off"), b"").unwrap();
+    let latch = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let prev = s.receiver_proof.lock().unwrap().replace(Arc::new(BlockAdmit(latch.clone())));
+    let hs = send(fx, s, 900, "holder body");
+    assert_eq!(hs["result"]["held"], "awaiting_submit", "premise: the holder body is held: {hs}");
+    let h = ret(fx, s, 900);
+    *s.receiver_proof.lock().unwrap() = prev; // the next job gets the seat's normal proof
+    assert_eq!(h["ok"], true, "premise: the holder passed its barrier: {h}");
+    let ps = send(fx, s, 901, text);
+    assert_eq!(ps["result"]["held"], "awaiting_submit", "premise: the second body is held: {ps}");
+    let t0 = Instant::now();
+    let k = ret(fx, s, 901);
+    // premise: the Return bound the held body (eadce029 shape: `bound`; fixed shape: the unknown-outcome error)
+    assert!(k["result"]["bound"].is_string() || k["error"]["code"] == "write_outcome_unknown", "premise: {k}");
+    (latch, k, t0.elapsed())
+}
+
+fn wait_written(fx: &Fx, text: &str, n: usize) {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while writes_of(fx, text).1 < n && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// R2 gate: the caller of a PENDING write is not told `sent:true`; it is told the outcome is unknown, not to retry, and
+/// where to look - and the queued write still lands exactly once (the reply was the truth).
+#[test]
+fn b360_r2_a_pending_barrier_is_not_sent_and_the_write_still_lands_exactly_once() {
+    let fx = fx("b360-pending");
+    let s = seat(&fx, true);
+    let (latch, k, waited) = pending_bind(&fx, &s, "pending body");
+    release(&latch);
+    wait_written(&fx, "pending body", 1);
+    assert!(waited >= Duration::from_millis(1_900), "premise: the reply waited out the budget ({waited:?}): {k}");
+    assert_ne!(k["ok"], true, "a PENDING barrier must not be reported as success: {k}");
+    assert_eq!(k["error"]["code"], "write_outcome_unknown", "{k}");
+    let msg = k["error"]["message"].as_str().unwrap_or_default();
+    for must in ["may still be typed", "Do NOT send it again", "read-screen", "surface.write_refused", "queue.reconciliation"] {
+        assert!(msg.contains(must), "the PENDING reply must say {must:?}: {msg}");
+    }
+    assert_written_exactly_once(&fx, "pending body");
+    crate::agent_write::set_test_sync_settle(true);
+}
+
+/// Control for the exactly-once pin (its own red): a caller that RETRIES after PENDING gets the body typed twice. The
+/// same assertion used above fails on that history - so the pin can see a duplicate, and this is why PENDING says
+/// "do not retry".
+#[test]
+fn b360_r2_control_a_retry_after_pending_types_the_body_twice() {
+    let fx = fx("b360-retry");
+    let s = seat(&fx, true);
+    let (latch, _first, _) = pending_bind(&fx, &s, "retried body");
+    let rs = send(&fx, &s, 901, "retried body"); // the forbidden retry
+    assert_eq!(rs["result"]["held"], "awaiting_submit", "premise: the retry is held: {rs}");
+    let again = ret(&fx, &s, 901);
+    release(&latch);
+    wait_written(&fx, "retried body", 2);
+    assert_eq!(writes_of(&fx, "retried body"), (2, 2), "the retry was typed as well: {again}");
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| assert_written_exactly_once(&fx, "retried body")));
+    assert!(caught.is_err(), "the exactly-once pin must FAIL on a duplicated history");
+    crate::agent_write::set_test_sync_settle(true);
 }

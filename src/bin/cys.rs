@@ -43053,4 +43053,124 @@ mod b360_tests {
             assert_ne!(EXIT_DIRECTIVE_REFUSED, used);
         }
     }
+
+    // ── B-360 R2: three outcomes the CALLER can tell apart (exit code + error name), never a field nobody reads ──────
+    // Literals ("write_outcome_unknown", 91) on purpose: these specimens compile on eadce029 so their RED is measurable.
+
+    fn pending_err() -> String {
+        "write_outcome_unknown: outcome unknown: the seat's writer had not reached this write (request w1-2) within \
+         2000 ms; it is still queued and may still be typed. Do NOT send it again - a retry can type it twice."
+            .to_string()
+    }
+
+    /// A fake daemon that answers `surface.send_key` with `reply` (a whole response minus `id`) and anything else with
+    /// ok; records every method it was asked.
+    #[cfg(unix)]
+    fn send_key_daemon(reply: Value) -> (std::path::PathBuf, std::sync::Arc<std::sync::Mutex<Vec<String>>>, impl FnOnce()) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let sock = std::path::Path::new("/tmp").join(format!(".b360-{}-{}.sock", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("fake socket bind");
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec = Arc::clone(&calls);
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { break };
+                let mut reader = BufReader::new(match stream.try_clone() { Ok(s) => s, Err(_) => break });
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                let method = req["method"].as_str().unwrap_or("").to_string();
+                if method == "__stop" {
+                    break;
+                }
+                rec.lock().unwrap_or_else(|e| e.into_inner()).push(method.clone());
+                let mut resp = match method.as_str() {
+                    "surface.send_key" => reply.clone(),
+                    "surface.list" => json!({"ok": true, "result": {"surfaces": [{"surface_id": 7, "surface_ref": "surface:7", "exited": false}]}}),
+                    _ => json!({"ok": true, "result": {}}),
+                };
+                resp["id"] = req["id"].clone();
+                let mut w = stream;
+                let _ = writeln!(w, "{resp}");
+            }
+        });
+        let stop_sock = sock.clone();
+        let stop = move || {
+            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&stop_sock) {
+                use std::io::Write;
+                let _ = writeln!(s, "{}", json!({"id": 1, "method": "__stop", "params": {}}));
+            }
+            let _ = server.join();
+            let _ = std::fs::remove_file(&stop_sock);
+        };
+        (sock, calls, stop)
+    }
+
+    /// `cys send-key --surface surface:7 Return` against a fake daemon reply: the exit code the CALLER gets, and how
+    /// many `surface.send_key` requests were made (no automatic retry or queue fallback may follow an unknown outcome).
+    #[cfg(unix)]
+    fn caller_gets(reply: Value) -> (i32, usize) {
+        let _guard = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var_os(cys::ENV_SOCKET);
+        let (sock, calls, stop) = send_key_daemon(reply);
+        std::env::set_var(cys::ENV_SOCKET, &sock);
+        let rc = run(Command::SendKey { surface: Some("surface:7".into()), to: None, queued: false, keys: vec!["Return".into()] });
+        stop();
+        match &saved {
+            Some(v) => std::env::set_var(cys::ENV_SOCKET, v),
+            None => std::env::remove_var(cys::ENV_SOCKET),
+        }
+        let n = calls.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|m| *m == "surface.send_key").count();
+        (rc, n)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2_the_caller_tells_passed_refused_and_unknown_apart_by_exit_code() {
+        let passed = caller_gets(json!({"ok": true, "result": {"surface_id": 7, "key": "Return", "sent": true}}));
+        assert_eq!(passed, (0, 1), "PASSED -> 0");
+        let refused = caller_gets(json!({"ok": false, "error": {"code": cys::ERR_JOURNAL_UNAVAILABLE,
+            "message": "zero bytes written: the writer journal refused this write (journal:Is a directory (os error 21)); nothing was typed"}}));
+        assert_eq!(refused, (1, 1), "REFUSED (zero bytes, safe to retry) -> 1");
+        let (code, msg) = pending_err().split_once(": ").map(|(c, m)| (c.to_string(), m.to_string())).unwrap();
+        let unknown = caller_gets(json!({"ok": false, "error": {"code": code, "message": msg}}));
+        assert_eq!(unknown, (91, 1), "UNKNOWN (may still be typed, NOT safe to retry) -> 91, one request, no retry");
+    }
+
+    /// Record (not a gate): the eadce029 daemon answered a pending barrier with ok + `sent:true` + a field; a caller
+    /// sees 0 for that, because nothing at the caller ever read the field. The gate is the daemon specimen
+    /// `b360_r2_a_pending_barrier_is_not_sent_and_the_write_still_lands_exactly_once`, which makes that reply impossible.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2_record_the_eadce029_pending_reply_reads_as_success_at_the_caller() {
+        let old = caller_gets(json!({"ok": true, "result": {"surface_id": 7, "key": "Return", "sent": true, "journal_barrier": "pending"}}));
+        assert_eq!(old, (0, 1));
+    }
+
+    #[test]
+    fn b360_r2_unknown_outcome_dispositions_never_destroy_and_never_retry() {
+        // node-recover: run_boot kills on any rc but 0/78/79 -> UNKNOWN folds into the non-destructive 79 token
+        let folded = recover_refusal_from_input_guard(pending_err());
+        assert!(is_recover_refusal(&folded), "{folded}");
+        assert!(folded.contains("may still be typed"), "the reason survives the fold: {folded}");
+        // cycle-agent: the save request's outcome is unknown -> 91, the cycle stops before /clear
+        assert_eq!(cycle_agent_exit(&Err(pending_err())), 91);
+        // not a typing guard (no --queued fallback) and not a gate hold
+        assert!(!is_typing_guard_err(&pending_err()));
+        assert!(!cys::inject_guard::is_hold_error(&pending_err()));
+        // launch-agent: an UNKNOWN arm comes before the closing arm and keeps the pane (source pin; behaviour measured
+        // in the test place)
+        let src = include_str!("cys.rs");
+        // the needle is assembled so this test's own source does not contain it (the pin must not find itself)
+        let needle = format!("Err(e) if created.is_some() && {}(&e) => {{", "is_write_outcome_unknown");
+        let arm = src.find(&needle).expect("unknown arm");
+        let close = src.find("Ok(BootVerdict::LaunchFailed { evidence: e }) | Err(e) => {").expect("closing arm");
+        assert!(arm < close && !src[arm..close].contains("surface.close"));
+    }
 }
