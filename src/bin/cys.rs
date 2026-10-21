@@ -45937,4 +45937,226 @@ mod b360_tests {
             (EXIT_WRITE_OUTCOME_UNKNOWN, 1, 0)
         );
     }
+
+    // ── ★(B-360 R2 revise) area R · `cys restore` fresh path: 90/91 distinct, panes kept, record-only ─────────────────
+    // FIX-SPEC-R2-REVISE area R (census S62 22014-22061, B26-B28) with the dept head's decisions: kept panes are RECORD
+    // ONLY (an append-only `<base>/.kept-pane-records.jsonl` line; no pack-update unknown entry, no marker, no ping), the
+    // launch-command write is told apart from the directive write, and the exit precedence is real failure > 91 > 90 > 0.
+
+    /// How a restored role comes back in the fixture.
+    #[cfg(unix)]
+    #[derive(Clone)]
+    enum R2rMode {
+        /// its empty seat (`sid`) exists: in-seat relaunch; `launch` answers the launch paste, `directive` the directive
+        InSeat { sid: u64, launch: Value, directive: Value },
+        /// no seat: a fresh surface (`sid`) is created; same two replies
+        Fresh { sid: u64, launch: Value, directive: Value },
+        /// no seat and `surface.create` fails: a real launch failure (rc 1)
+        FreshCreateFails,
+    }
+
+    /// `cys restore` (child, no resume) of `roles` (role, mode) with the fake agent `b360agent`. Returns (exit, stdout,
+    /// stderr, requests, kept-pane records).
+    #[cfg(unix)]
+    fn r2r_restore(roles: Vec<(&'static str, R2rMode)>) -> (i32, String, String, Vec<(String, Value)>, Vec<Value>) {
+        let pack = R2cPack::new();
+        std::fs::write(pack.dir.join("pack/directives/CSO_DIRECTIVE.md"), "C").unwrap();
+        let cwd = pack.dir.clone();
+        let live: Vec<Value> = roles
+            .iter()
+            .filter_map(|(r, m)| match m {
+                R2rMode::InSeat { sid, .. } => Some(json!({"role": r, "seat": "empty", "surface_id": sid, "env_injected": true})),
+                _ => None,
+            })
+            .collect();
+        let saved: Vec<Value> = roles.iter().map(|(r, _)| json!({"role": r, "agent": "b360agent", "cwd": cwd})).collect();
+        let modes: std::collections::HashMap<u64, (Value, Value)> = roles
+            .iter()
+            .filter_map(|(_, m)| match m {
+                R2rMode::InSeat { sid, launch, directive } | R2rMode::Fresh { sid, launch, directive } => {
+                    Some((*sid, (launch.clone(), directive.clone())))
+                }
+                R2rMode::FreshCreateFails => None,
+            })
+            .collect();
+        let create: std::collections::HashMap<&'static str, Option<u64>> = roles
+            .iter()
+            .filter_map(|(r, m)| match m {
+                R2rMode::Fresh { sid, .. } => Some((*r, Some(*sid))),
+                R2rMode::FreshCreateFails => Some((*r, None)),
+                R2rMode::InSeat { .. } => None,
+            })
+            .collect();
+        let mut pastes: std::collections::HashMap<u64, usize> = Default::default();
+        let mut acked: std::collections::HashSet<u64> = Default::default();
+        let sids: Vec<u64> = modes.keys().copied().collect();
+        let daemon = R2cDaemon::start(move |method, p| {
+            let sid = p["surface_id"].as_u64().unwrap_or(0);
+            match method {
+                "system.topology" => r2c_ok(json!({"live": live, "saved": saved, "tombstones": []})),
+                "surface.create" => match create.get(p["role"].as_str().unwrap_or("")) {
+                    Some(Some(new)) => r2c_ok(json!({"surface_id": new})),
+                    _ => r2c_reply("b360_no_spawn: this fake daemon makes no new surface for this role"),
+                },
+                "surface.list" => {
+                    let rows: Vec<Value> = sids
+                        .iter()
+                        .map(|s| {
+                            let mut row = json!({"surface_id": s, "surface_ref": format!("surface:{s}"), "exited": false,
+                                                 "agent_alive": true, "line_count": 40});
+                            if acked.contains(s) {
+                                row["awakened_at"] = json!(1.0);
+                            }
+                            row
+                        })
+                        .collect();
+                    r2c_ok(json!({"surfaces": rows}))
+                }
+                "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                     "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+                "surface.send_text" => {
+                    let n = pastes.entry(sid).or_insert(0);
+                    *n += 1;
+                    let Some((launch, directive)) = modes.get(&sid) else { return r2c_ok(json!({})) };
+                    if *n == 1 {
+                        launch.clone()
+                    } else {
+                        if directive["ok"] == true {
+                            acked.insert(sid);
+                        }
+                        directive.clone()
+                    }
+                }
+                _ => r2c_ok(json!({})),
+            }
+        });
+        let (rc, out, err) = r2c_child("restore", &daemon, &pack.envs());
+        let records: Vec<Value> = std::fs::read_to_string(pack.dir.join(".kept-pane-records.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        (rc, out, err, daemon.calls(), records)
+    }
+
+    /// Checks one kept-pane record against the head's fields.
+    #[cfg(unix)]
+    fn r2r_record_ok(rec: &Value, command: &str, sid: u64, role: &str, outcome: &str, write: &str) -> bool {
+        rec["command"] == command
+            && rec["surface_id"] == sid
+            && rec["role"] == role
+            && rec["agent"] == "b360agent"
+            && rec["outcome"] == outcome
+            && rec["write"] == write
+            && rec["at"].as_u64().is_some_and(|t| t > 0)
+            && rec.get("request_id").is_some()
+    }
+
+    /// Area R · S62/B26/B27: a fresh restore whose directive is REFUSED (rc 90) / UNKNOWN (rc 91): the pane is kept (no
+    /// close), no marker is seeded, no pack-update unknown entry is written (record-only), the exit is 90 / 91, and one
+    /// kept-pane record names the directive write. RED on f45017d7: both are a generic launch failure → exit 1, no record.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_r1_fresh_restore_refused_and_unknown_keep_the_pane_exit_90_91_and_record_it() {
+        let mut failures = Vec::new();
+        for (name, reply, want, outcome) in [
+            ("REFUSED", r2c_reply(&journal_err()), EXIT_DIRECTIVE_REFUSED, "refused"),
+            ("UNKNOWN", r2c_reply(&pending_err()), EXIT_WRITE_OUTCOME_UNKNOWN, "unknown"),
+        ] {
+            let (rc, out, _err, calls, records) =
+                r2r_restore(vec![("worker", R2rMode::Fresh { sid: 9, launch: r2c_ok(json!({})), directive: reply })]);
+            if rc != want {
+                failures.push(format!("{name}: exit {rc}, want {want}\n{out}"));
+            }
+            for m in ["surface.close", "reinject.mark"] {
+                if r2c_count(&calls, m) != 0 {
+                    failures.push(format!("{name}: {m} was called"));
+                }
+            }
+            if records.len() != 1 || !r2r_record_ok(&records[0], "restore", 9, "worker", outcome, "directive") {
+                failures.push(format!("{name}: kept-pane records {records:?}"));
+            }
+            if !out.contains(&format!("cys reinject --role worker")) {
+                failures.push(format!("{name}: the restore line does not name `cys reinject --role worker`:\n{out}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area R · co-occurrence (landing condition 3): (a) a real failure (a fresh launch whose surface cannot be created)
+    /// with an UNKNOWN (in-seat) → exit 1 (real failure first) and the summary line carries both counts; (b) an UNKNOWN
+    /// with a REFUSED (both fresh) → 91. RED on f45017d7: (a) exits 91 (91 outranked 1) and (b) exits 1 (fresh 90/91 were
+    /// generic failures).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_r2_restore_precedence_holds_where_two_outcomes_meet() {
+        let mut failures = Vec::new();
+        let (rc, out, _, _, _) = r2r_restore(vec![
+            ("worker", R2rMode::InSeat { sid: 7, launch: r2c_ok(json!({})), directive: r2c_reply(&pending_err()) }),
+            ("cso", R2rMode::FreshCreateFails),
+        ]);
+        let summary = out.lines().find(|l| l.contains("restore 완료")).unwrap_or_default();
+        if rc != 1 {
+            failures.push(format!("(a) real failure + unknown: exit {rc}, want 1\n{out}"));
+        }
+        if !(summary.contains("실패 1") && summary.contains("unknown 1")) {
+            failures.push(format!("(a) the summary line does not carry both counts: {summary:?}"));
+        }
+        let (rc, out, _, _, records) = r2r_restore(vec![
+            ("worker", R2rMode::Fresh { sid: 9, launch: r2c_ok(json!({})), directive: r2c_reply(&pending_err()) }),
+            ("cso", R2rMode::Fresh { sid: 10, launch: r2c_ok(json!({})), directive: r2c_reply(&journal_err()) }),
+        ]);
+        let summary = out.lines().find(|l| l.contains("restore 완료")).unwrap_or_default();
+        if rc != EXIT_WRITE_OUTCOME_UNKNOWN {
+            failures.push(format!("(b) unknown + refused: exit {rc}, want 91\n{out}"));
+        }
+        if !(summary.contains("refused 1") && summary.contains("unknown 1")) || records.len() != 2 {
+            failures.push(format!("(b) summary {summary:?} · records {records:?}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area R · minor: the in-seat UNKNOWN message names `cys reinject --role <role>` (inspect first, re-inject only if
+    /// the directive did not land), and the in-seat kept pane gets its record. RED on f45017d7: the message names only
+    /// `cys read-screen`, and there is no record.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_r3_restore_in_seat_unknown_names_cys_reinject_and_is_recorded() {
+        let (rc, out, _, _, records) = r2r_restore(vec![(
+            "worker",
+            R2rMode::InSeat { sid: 7, launch: r2c_ok(json!({})), directive: r2c_reply(&pending_err()) },
+        )]);
+        let line = out.lines().find(|l| l.contains("좌석 내 재연결 —")).unwrap_or_default();
+        assert_eq!(rc, EXIT_WRITE_OUTCOME_UNKNOWN, "{out}");
+        assert!(line.contains("cys reinject --role worker"), "{line}");
+        assert!(
+            records.len() == 1 && r2r_record_ok(&records[0], "restore", 7, "worker", "unknown", "directive"),
+            "{records:?}"
+        );
+    }
+
+    /// Area R · which write (head): rc 91 because the LAUNCH command's write is UNKNOWN (before the agent meta is set)
+    /// says the launch command — not "the directive's outcome is unknown" — names the right check, and records
+    /// write=launch. RED on f45017d7: the message blames the directive and there is no record.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_r4_an_unknown_launch_write_is_named_as_the_launch_not_the_directive() {
+        let (rc, out, err, calls, records) =
+            r2r_restore(vec![("worker", R2rMode::Fresh { sid: 9, launch: r2c_reply(&pending_err()), directive: r2c_ok(json!({})) })]);
+        let mut failures = Vec::new();
+        if rc != EXIT_WRITE_OUTCOME_UNKNOWN {
+            failures.push(format!("exit {rc}, want 91\n{out}"));
+        }
+        let kept = err.lines().find(|l| l.contains("[launch-agent]") && l.contains("kept")).unwrap_or_default();
+        if !(kept.contains("launch command") && !kept.contains("the directive's outcome is unknown")) {
+            failures.push(format!("the kept-pane line blames the wrong write: {kept:?}\n{err}"));
+        }
+        if r2c_count(&calls, "surface.send_text") != 1 {
+            failures.push("something was typed after the unknown launch write".into());
+        }
+        if records.len() != 1 || !r2r_record_ok(&records[0], "restore", 9, "worker", "unknown", "launch") {
+            failures.push(format!("records {records:?}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 }
