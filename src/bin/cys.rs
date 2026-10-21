@@ -12357,11 +12357,18 @@ mod seat_latch_negation_tests {
         );
         // ★(리뷰 R3 · codex major) 표식 해제는 주입 절반의 **맨 앞이 아니라 제출 성공 뒤**다 —
         //   해제와 제출 사이의 중단·비보류 에러가 데몬의 복원 연속 지시를 지우던 창을 없앤다.
+        // ★(B-360 R2 revise · S29) two clear points now, BOTH after the submit: right after a PASSED submit (as before),
+        //   and after the ack proves that an UNKNOWN submit landed (an UNKNOWN is not a success, so it is not cleared at
+        //   submit time). The contract — never clear before the submit — is what this pin keeps.
         let inj = fn_body("inject_directive_after_ready");
-        let clear_at = inj.find("\n    clear_gate_pending(sid);").expect("주입 절반의 표식 해제");
         let inject_at = inj.find("inject_text(sid, &directive)").expect("제출 지점");
-        assert!(clear_at > inject_at, "표식 해제가 제출보다 앞이다 — 중단 시 [RESTORE] 가 소실된다");
-        assert_eq!(inj.matches("\n    clear_gate_pending(sid);").count(), 1, "표식 해제 지점이 1곳이 아니다");
+        let clears: Vec<usize> = inj.match_indices("clear_gate_pending(sid);").map(|(i, _)| i).collect();
+        assert_eq!(clears.len(), 2, "표식 해제 지점이 2곳(PASSED 직후 · UNKNOWN 의 ack 확인 뒤)이 아니다");
+        assert!(clears.iter().all(|&c| c > inject_at), "표식 해제가 제출보다 앞이다 — 중단 시 [RESTORE] 가 소실된다");
+        assert!(
+            inj.contains("if write_unknown.is_none() {\n        clear_gate_pending(sid);"),
+            "PASSED 제출 직후의 해제가 사라졌다"
+        );
         // 세 발신자가 지시를 넘긴다: restore in-seat · node-recover · restore 경유 launch-agent.
         assert!(fn_body("run_restore").contains("Some(restore_directive(role)),"), "restore in-seat 가 지시를 넘기지 않는다");
         assert!(fn_body("run_node_recover").contains("Some(recover_directive()),"), "node-recover 가 지시를 넘기지 않는다");
@@ -15798,7 +15805,22 @@ fn inject_directive_after_ready(
     //   `?` 로 흘리면 호출부 3곳이 그것을 close·kill·좌석증식으로 번역한다 — 정확히 U-11 이
     //   막으려던 경로다. 위 typed 사전 판정과 붙여넣기 사이의 경합(가드 ②가 뒤늦게 발화)도
     //   같은 보류로 접는다.
-    if let Err(e) = inject_text(sid, &directive) {
+    // ★(B-360 R2 revise · S29) an UNKNOWN directive write may still land: the ACK wait below still runs — the ack
+    //   latch is affirmative evidence (continue as PASSED); without it the UNKNOWN is returned (91) after recording
+    //   `directive.verify` as not verified with the reason.
+    let mut write_unknown: Option<String> = None;
+    if let Err(e) = inject_text(sid, &directive).or_else(|e| {
+        if is_write_outcome_unknown(&e) {
+            eprintln!(
+                "[launch-agent] directive write outcome unknown (it may still land — not re-sent) — waiting for the ack \
+                 latch ({BUDGET_ACK_WAIT_SECS}s) before deciding: {e}"
+            );
+            write_unknown = Some(e);
+            Ok(())
+        } else {
+            Err(e)
+        }
+    }) {
         if !cys::inject_guard::is_hold_error(&e) {
             return Err(e);
         }
@@ -15819,7 +15841,10 @@ fn inject_directive_after_ready(
         ));
     }
     // ★제출이 성공한 지금이 표식 해제 지점이다(위 doc — 해제와 제출 사이에 창을 두지 않는다).
-    clear_gate_pending(sid);
+    // ★(B-360 R2 revise) an UNKNOWN submission is not a success: the marker is cleared only once the ack proves it landed
+    if write_unknown.is_none() {
+        clear_gate_pending(sid);
+    }
 
     // ── 4) 주입 확인 — ★(W2 · B14/CS-3⑤) **신호의 질을 화면 문자열 → ack 계약으로 교체** ──
     //
@@ -15873,14 +15898,33 @@ fn inject_directive_after_ready(
             "ack 미확인({BUDGET_ACK_WAIT_SECS}s 창) · 화면 에코(신규 출현분)={}",
             if echoed { "관측" } else { "미관측" }
         );
-        eprintln!(
-            "[launch-agent] directive 주입 검증 미확인 — {verify_reason}. \
-             부트는 계속한다(치명 아님). 상태를 directive_verified=false 로 기록: \
-             `cys status --json` 또는 `cys read-screen --surface {}` 로 확인, \
-             필요하면 javis_boot_node.py --role <role> --agent <agent> 로 재각성하라",
-            surface_ref(sid)
-        );
+        if write_unknown.is_some() {
+            // ★(B-360 R2 revise · S29/B34) the bool cannot say "unknown"; the reason can (no daemon change needed)
+            verify_reason = format!(
+                "{}: the directive write's outcome is unknown and no ack came — it may still land (not re-sent) · {verify_reason}",
+                cys::ERR_WRITE_OUTCOME_UNKNOWN
+            );
+            eprintln!(
+                "[launch-agent] directive write outcome unknown and not acknowledged — {verify_reason} · check the seat \
+                 (`cys read-screen --surface {}`), then `cys reinject --role <role> --check`",
+                surface_ref(sid)
+            );
+        } else {
+            eprintln!(
+                "[launch-agent] directive 주입 검증 미확인 — {verify_reason}. \
+                 부트는 계속한다(치명 아님). 상태를 directive_verified=false 로 기록: \
+                 `cys status --json` 또는 `cys read-screen --surface {}` 로 확인, \
+                 필요하면 javis_boot_node.py --role <role> --agent <agent> 로 재각성하라",
+                surface_ref(sid)
+            );
+        }
     } else {
+        if write_unknown.is_some() {
+            // ★(B-360 R2 revise · S29) affirmative evidence: the UNKNOWN write landed — continue as PASSED
+            eprintln!("[launch-agent] the directive write's outcome was unknown, but the ack proves it landed — continuing");
+            verify_reason.push_str(" · write outcome was unknown, landed (ack)");
+            clear_gate_pending(sid);
+        }
         eprintln!(
             "[launch-agent] directive 주입 검증 확정 — {verify_reason} ({} bytes)",
             directive.len()
@@ -15897,6 +15941,10 @@ fn inject_directive_after_ready(
         json!({"surface_id": sid, "verified": verified, "reason": verify_reason}),
     ) {
         eprintln!("[launch-agent] directive_verified 상태 기록 실패(구 데몬?): {e}");
+    }
+    // ★(B-360 R2 revise · S29) no evidence: the existing UNKNOWN (91 / directive_unknown upstream), recorded above
+    if let (Some(e), false) = (write_unknown, verified) {
+        return Err(e);
     }
 
     // 5) T2-5 에이전트 메타 등록은 ★Phase 5 ①a로 기동 직후(위)로 이동했다 — readiness 폴링/주입
@@ -21567,7 +21615,15 @@ fn run_cycle_agent(
         // 1) 저장 지시
         eprintln!("[cycle 1/7] 저장 지시 주입 → surface:{sid} ({role_name})");
         // ★A′: 고정 산문 대신 감시 목록(files) 실경로 열거 — 지시 경로↔게이트 경로 정합.
-        inject_text(sid, &cycle_save_directive(&role_name, &files))?;
+        // ★(B-360 R2 revise · S48) an UNKNOWN save instruction may still land: the save-file gate below still decides
+        let save_unknown = match inject_text(sid, &cycle_save_directive(&role_name, &files)) {
+            Ok(()) => None,
+            Err(e) if is_write_outcome_unknown(&e) => {
+                eprintln!("[cycle 1/7] save instruction outcome unknown (it may still be typed — not re-sent) — the save-file gate decides: {e}");
+                Some(e)
+            }
+            Err(e) => return Err(e),
+        };
 
         // 2) 파일 변화 게이트 (화면 마커는 참고 신호일 뿐 — reward-hack·stale 마커 차단)
         match cycle_verify_plan(force_no_verify, baseline.len()) {
@@ -21584,11 +21640,25 @@ fn run_cycle_agent(
                     }
                 }
                 if !verified {
+                    if let Some(e) = &save_unknown {
+                        return Err(format!(
+                            "save instruction outcome unknown (it may still be typed — not re-sent) and the save files did \
+                             not change within {wait_secs}s — cycle stopped before /clear (clear 미실행): {e}"
+                        ));
+                    }
                     return Err(format!(
                         "저장 검증 실패 — {wait_secs}s 내 파일 갱신 없음. cycle 중단 (clear 미실행)"
                     ));
                 }
                 eprintln!("[cycle] 저장 검증 통과");
+            }
+            CycleVerifyPlan::SkipForced | CycleVerifyPlan::SkipNoFiles if save_unknown.is_some() => {
+                // no save-file check = no affirmative evidence that the UNKNOWN instruction landed: the existing 91
+                return Err(format!(
+                    "save instruction outcome unknown and no save-file check this run — no evidence it landed; cycle stopped \
+                     before /clear (clear 미실행): {}",
+                    save_unknown.unwrap_or_default()
+                ));
             }
             CycleVerifyPlan::SkipForced => {
                 eprintln!(
@@ -21628,7 +21698,15 @@ fn run_cycle_agent(
             let deadline = budget.stage(timeout);
             // ★(수정 6회차 V42R-1) 검증자 좌석 주입 직렬화 — 붙여넣기~Return 을 좌석당 하나씩(동시 비동기 사이클의 요청 합체 차단).
             let vlock = InjectLock::acquire(vsid, deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(20)));
-            inject_text(vsid, &format!("[CYCLE-VERIFY] role '{role_name}'(surface:{sid})의 컨텍스트 순환 전 저장 검증 요청. SESSION_STATE/TODO 파일이 방금 갱신되었는지 확인하고 `cys feed reply {req_id} allow` 또는 `cys feed reply {req_id} deny`로 판정하라."))?;
+            // ★(B-360 R2 revise · S49) an UNKNOWN request may still be typed: the receipt poll below still decides
+            let verifier_unknown = match inject_text(vsid, &format!("[CYCLE-VERIFY] role '{role_name}'(surface:{sid})의 컨텍스트 순환 전 저장 검증 요청. SESSION_STATE/TODO 파일이 방금 갱신되었는지 확인하고 `cys feed reply {req_id} allow` 또는 `cys feed reply {req_id} deny`로 판정하라.")) {
+                Ok(()) => None,
+                Err(e) if is_write_outcome_unknown(&e) => {
+                    eprintln!("[cycle 3/7] verifier request outcome unknown (it may still be typed — not re-sent) — the receipt poll decides: {e}");
+                    Some(e)
+                }
+                Err(e) => return Err(e),
+            };
             drop(vlock);
             // ★W4-B(결함 7): 해소 항목을 발견해도 decision 문자열로 즉석 판정하지 않고 영수증
             // 검증(cycle_receipt_ok — resolver==지정 검증자 대조)에 넘긴다. Err 는 전부 clear
@@ -21667,7 +21745,16 @@ fn run_cycle_agent(
                     return Err(e);
                 }
                 // ★U10: 가드가 drop 에서 자기 요청을 cycle-timeout 으로 닫는다(반환 문구 무변경).
-                None => return Err("검증자 응답 없음 (timeout) — clear 중단".into()),
+                // ★(B-360 R2 revise · S49) no receipt after an UNKNOWN request: the existing 91, not the generic timeout
+                None => {
+                    if let Some(e) = verifier_unknown {
+                        return Err(format!(
+                            "verifier request outcome unknown (it may still be typed — not re-sent) and no receipt in the \
+                             window — clear 중단: {e}"
+                        ));
+                    }
+                    return Err("검증자 응답 없음 (timeout) — clear 중단".into());
+                }
             }
         } else {
             eprintln!("[cycle 3/7] (검증자 미지정 — handshake 생략)");
@@ -22780,12 +22867,25 @@ fn run_reinject(
                 ["latest_cursor"]
                 .as_u64()
                 .unwrap_or(0);
-            inject_text(sid, &reinject_ping_text(&nonce))?;
+            // ★(B-360 R2 revise · S63) an UNKNOWN ping may still land: the ACK wait and the transcript read still run —
+            //   ACK → alive (0); anything else → the existing 91, never a re-inject (the ping itself is unresolved)
+            let ping_unknown = match inject_text(sid, &reinject_ping_text(&nonce)) {
+                Ok(()) => None,
+                Err(e) if is_write_outcome_unknown(&e) => {
+                    eprintln!("[reinject] presence ping outcome unknown (it may still land — not re-sent) — waiting for the ACK: {e}");
+                    Some(e)
+                }
+                Err(e) => return Err(e),
+            };
             let r = request(
                 "surface.wait_for",
                 json!({"surface_id": sid, "pattern": marker,
                        "timeout_secs": timeout, "since_line": cursor}),
-            )?;
+            )
+            .map_err(|we| match &ping_unknown {
+                Some(e) => format!("{e} · ACK wait failed: {we}"),
+                None => we,
+            })?;
             if r["matched"].as_bool() == Some(true) {
                 println!("디렉티브 생존 확인 (ACK 수신) — 재주입 불필요");
                 return Ok(());
@@ -22809,6 +22909,11 @@ fn run_reinject(
                 Err(e) => e.clone(),
             };
             eprintln!("[reinject] ACK 없음 ({timeout}s) — 핑 배달 판정(세션 기록): {fate_label}");
+            if let Some(e) = ping_unknown {
+                // ★(B-360 R2 revise · S63) no ACK after an UNKNOWN ping: not re-injected (no claim consumed) — 91
+                eprintln!("[reinject] the ping's outcome is unknown and no ACK came — nothing re-injected (surface:{sid})");
+                return Err(e);
+            }
             match action {
                 ReinjectCheckAction::AckInTranscript => unreachable!("위에서 반환"),
                 ReinjectCheckAction::Busy => {
@@ -38576,8 +38681,10 @@ mod tests {
         let pre = body
             .find("verifier_precheck(caller_env.as_deref(), sid, v, &vsid)?;")
             .expect("run_cycle_agent 에 사전검사 배선 없음");
+        // ★(B-360 R2 revise · S48) the save write is no longer `?`-propagated (an UNKNOWN goes on to the save-file gate),
+        //   so the anchor is the call itself; the order contract (precheck before the first write) is unchanged.
         let save = body
-            .find("inject_text(sid, &cycle_save_directive(&role_name, &files))?;")
+            .find("inject_text(sid, &cycle_save_directive(&role_name, &files))")
             .expect("저장 지시 주입 소실");
         assert!(pre < save, "사전검사가 저장 지시 뒤에 있다 — 쓰기 후 거부");
     }
