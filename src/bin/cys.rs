@@ -44075,6 +44075,8 @@ mod b360_tests {
             "boot" => run_boot(None, true),
             // ★(B-360 R2 revise · area P) no `--from`: the command stops after its pending pass (exit 1)
             "pack-update" => run_pack_update(None, None, false),
+            // ★(B-360 R2 revise · area D) the real `cys drain --verify` (exit computed by run_drain_verify)
+            "drain-verify" => run(Command::Drain { verify: true, timeout: 2 }),
             other => panic!("unknown child caller {other}"),
         };
         let _ = std::io::stdout().flush();
@@ -45563,5 +45565,253 @@ mod b360_tests {
             failures.push(format!("run_pack_update passes a non-new unknown count to the exit: {calls:?}"));
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    // ── ★(B-360 R2 revise) area D · `cys drain --verify`: every write's outcome is tracked; UNKNOWN is a typed outcome ──
+    // FIX-SPEC-R2-REVISE area D (census S39 19724, S40 19769, S41 19838, S42 20104; boundaries B10-B16). Compiled on
+    // 11717c44: outcomes are compared through `VerifyOutcome::as_str()` (the `Unknown` variant does not exist there).
+
+    /// A scripted drain-verify node. `inject` answers the save instruction (and, with `land`, the node writes its nonce
+    /// 300 ms later anyway); `wedge`: the instruction text stays in the composer (`> …`) on every screen read;
+    /// `ret` answers the corrective Return (counted in `returns`); `slow_ms` delays the inject (fan-out cap specimen);
+    /// `slow_screen_ms` delays every screen read.
+    struct R2dIo {
+        inject: Result<(), String>,
+        land: Option<std::path::PathBuf>,
+        wedge: bool,
+        ret: Result<(), String>,
+        slow_ms: u64,
+        slow_screen_ms: u64,
+        typed: std::sync::Mutex<String>,
+        returns: std::sync::atomic::AtomicUsize,
+    }
+
+    impl R2dIo {
+        fn new(inject: Result<(), String>, wedge: bool, ret: Result<(), String>) -> Self {
+            Self {
+                inject,
+                land: None,
+                wedge,
+                ret,
+                slow_ms: 0,
+                slow_screen_ms: 0,
+                typed: Default::default(),
+                returns: Default::default(),
+            }
+        }
+    }
+
+    impl VerifyIo for R2dIo {
+        fn inject(&self, _: &std::path::Path, _: u64, text: &str, _: std::time::Duration) -> Result<(), String> {
+            std::thread::sleep(std::time::Duration::from_millis(self.slow_ms));
+            *self.typed.lock().unwrap_or_else(|e| e.into_inner()) = text.to_string();
+            if let Some(file) = self.land.clone() {
+                let at = text.find("<!-- cys-checkpoint:").expect("the instruction carries its marker");
+                let marker = text[at..at + text[at..].find("-->").expect("marker end") + 3].to_string();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = std::fs::write(&file, format!("# 상태\n{marker}\n"));
+                });
+            }
+            self.inject.clone()
+        }
+        fn read_screen(&self, _: &std::path::Path, _: u64, _: u64, _: std::time::Duration) -> Result<String, String> {
+            std::thread::sleep(std::time::Duration::from_millis(self.slow_screen_ms));
+            if self.wedge {
+                Ok(format!("✻ Working…\n> {}", self.typed.lock().unwrap_or_else(|e| e.into_inner())))
+            } else {
+                Ok("✻ Working…\n> ".into())
+            }
+        }
+        fn send_return(&self, _: &std::path::Path, _: u64, _: std::time::Duration) -> Result<(), String> {
+            self.returns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.ret.clone()
+        }
+    }
+
+    /// A drain-verify target (surface:`sid`) with its own checkpoint dir; returns (target, checkpoint file, dir).
+    fn r2d_target(sid: u64) -> (VerifyTarget, std::path::PathBuf, std::path::PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let td = std::env::temp_dir()
+            .join(format!("b360r-dv-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(td.join("_round")).unwrap();
+        let file = td.join("_round/SESSION_STATE.md");
+        std::fs::write(&file, "# 상태\n").unwrap();
+        let t = VerifyTarget {
+            socket: td.join("cys.sock"),
+            dept: "dept-x".into(),
+            display: "dept-x".into(),
+            surface_id: sid,
+            surface_ref: format!("surface:{sid}"),
+            role: "worker".into(),
+            live_cwd: Some(td.to_string_lossy().into_owned()),
+            pending_undelivered: 0,
+        };
+        (t, file, td)
+    }
+
+    /// One node through `verify_one_node`: (outcome string, detail, corrective Returns sent).
+    fn r2d_verify(mut io: R2dIo, lands: bool, secs: u64) -> (String, String, usize) {
+        let (t, file, td) = r2d_target(7);
+        if lands {
+            io.land = Some(file);
+        }
+        let (o, d) = verify_one_node(&io, &t, "r2d", std::time::Duration::from_secs(secs), 100);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let _ = std::fs::remove_dir_all(&td);
+        (o.as_str().to_string(), d, io.returns.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Area D · S39/B11: the save instruction is UNKNOWN and the composer shows a persistent wedge. The bound Return may
+    /// still be pending, so NO corrective Return is sent, and without the nonce the node is `unknown` (91 class), not
+    /// `delivery_failed`. RED on 11717c44: a corrective Return is sent and the wedge selects DeliveryFailed (no code).
+    #[test]
+    fn b360_r2r_d1_unknown_inject_with_a_wedge_sends_no_corrective_return_and_is_unknown() {
+        let (o, d, returns) = r2d_verify(R2dIo::new(Err(pending_err()), true, Ok(())), false, 1);
+        assert_eq!((o.as_str(), returns), ("unknown", 0), "detail: {d}");
+    }
+
+    /// Area D · S40/B12: the save instruction PASSED but stays in the composer (an unsubmitted body), the corrective
+    /// Return comes back UNKNOWN, the nonce never appears → `unknown`. RED on 11717c44: the Return's result is discarded
+    /// and the wedge gives DeliveryFailed.
+    #[test]
+    fn b360_r2r_d2_passed_inject_wedge_and_unknown_corrective_return_is_unknown() {
+        let (o, d, returns) = r2d_verify(R2dIo::new(Ok(()), true, Err(pending_err())), false, 1);
+        assert_eq!((o.as_str(), returns), ("unknown", 1), "detail: {d}");
+    }
+
+    /// Area D · UNKNOWN inject, a visible wedge, and the nonce appears later (the pending write completed): saved, and
+    /// still no corrective Return. RED on 11717c44: it is saved there too, but only after a corrective Return.
+    #[test]
+    fn b360_r2r_d3_unknown_inject_then_the_nonce_appears_is_saved_without_a_corrective_return() {
+        let (o, d, returns) = r2d_verify(R2dIo::new(Err(pending_err()), true, Ok(())), true, 3);
+        assert_eq!((o.as_str(), returns), ("saved", 0), "detail: {d}");
+    }
+
+    /// Area D · the corrective Return is REFUSED by the writer journal (zero bytes): the existing failure, now naming the
+    /// journal. RED on 11717c44: the fixed wedge text ("Return 재전송에도 저장 미검출") claims a re-send that never happened.
+    #[test]
+    fn b360_r2r_d4_a_refused_corrective_return_is_a_journal_named_failure() {
+        let (o, d, returns) = r2d_verify(R2dIo::new(Ok(()), true, Err(journal_err())), false, 1);
+        assert_eq!((o.as_str(), returns), ("delivery_failed", 1), "detail: {d}");
+        assert!(r2c_own(&d).contains("journal") && r2c_own(&d).contains("zero bytes"), "the failure must name the journal: {d}");
+    }
+
+    /// Area D · S41/B13: the fan-out cap fires while a node's save instruction is still in flight (no definite outcome)
+    /// → that node is `unknown`; a node whose instruction PASSED and whose check was cut keeps today's `timeout`
+    /// (positive control). RED on 11717c44: both become the code-less `timeout`.
+    #[test]
+    fn b360_r2r_d5_the_fan_out_cap_makes_an_in_flight_write_unknown_and_keeps_timeout_after_a_pass() {
+        let (t1, _f1, d1) = r2d_target(7);
+        let (t2, _f2, d2) = r2d_target(8);
+        struct Two(R2dIo, R2dIo);
+        impl VerifyIo for Two {
+            fn inject(&self, s: &std::path::Path, sid: u64, text: &str, to: std::time::Duration) -> Result<(), String> {
+                if sid == 7 { self.0.inject(s, sid, text, to) } else { self.1.inject(s, sid, text, to) }
+            }
+            fn read_screen(&self, s: &std::path::Path, sid: u64, n: u64, to: std::time::Duration) -> Result<String, String> {
+                if sid == 7 { self.0.read_screen(s, sid, n, to) } else { self.1.read_screen(s, sid, n, to) }
+            }
+            fn send_return(&self, s: &std::path::Path, sid: u64, to: std::time::Duration) -> Result<(), String> {
+                if sid == 7 { self.0.send_return(s, sid, to) } else { self.1.send_return(s, sid, to) }
+            }
+        }
+        let mut in_flight = R2dIo::new(Ok(()), false, Ok(()));
+        in_flight.slow_ms = 8_000;
+        let mut passed = R2dIo::new(Ok(()), false, Ok(()));
+        passed.slow_screen_ms = 8_000;
+        let io: std::sync::Arc<dyn VerifyIo + Send + Sync> = std::sync::Arc::new(Two(in_flight, passed));
+        let report = drain_verify_fanout(io, vec![t1, t2], std::time::Duration::from_secs(1), 100);
+        let _ = (std::fs::remove_dir_all(&d1), std::fs::remove_dir_all(&d2));
+        let outcomes: Vec<String> =
+            report["nodes"].as_array().unwrap().iter().map(|n| n["outcome"].as_str().unwrap_or("").to_string()).collect();
+        assert_eq!(outcomes, vec!["unknown".to_string(), "timeout".to_string()], "{report}");
+    }
+
+    /// `cys drain --verify --timeout 2` in a child against a fake department daemon (the real `RealVerifyIo` path): two
+    /// worker nodes. surface:7's save paste gets `paste7`, its later screens show the pasted text left in the composer
+    /// (a wedge); surface:8 pastes fine and writes its nonce. Returns (exit, report JSON, requests).
+    #[cfg(unix)]
+    fn r2d_drain_verify(paste7: Value) -> (i32, Value, Vec<(String, Value)>) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir()
+            .join(format!("b360r-dvc-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&root);
+        for sid in [7, 8] {
+            std::fs::create_dir_all(root.join(format!("n{sid}/_round"))).unwrap();
+            std::fs::write(root.join(format!("n{sid}/_round/SESSION_STATE.md")), "# 상태\n").unwrap();
+        }
+        let r = root.clone();
+        let mut typed7 = String::new();
+        let daemon = R2cDaemon::start(move |method, p| {
+            let sid = p["surface_id"].as_u64().unwrap_or(0);
+            match method {
+                "org.status" => {
+                    let rows: Vec<Value> = [7u64, 8].iter().map(|s| json!({
+                        "surface_id": s, "surface_ref": format!("surface:{s}"), "role": format!("worker-{s}"), "agent": "claude",
+                        "exited": false, "live_cwd": r.join(format!("n{s}")).to_string_lossy()})).collect();
+                    r2c_ok(json!({"surfaces": rows}))
+                }
+                "surface.list" => {
+                    let rows: Vec<Value> = [7u64, 8].iter().map(|s| json!({
+                        "surface_id": s, "surface_ref": format!("surface:{s}"), "agent": "claude", "exited": false,
+                        "awakened_at": 1.0})).collect();
+                    r2c_ok(json!({"surfaces": rows}))
+                }
+                "surface.send_text" if sid == 7 => {
+                    typed7 = p["text"].as_str().unwrap_or("").to_string();
+                    paste7.clone()
+                }
+                "surface.send_text" => {
+                    let text = p["text"].as_str().unwrap_or("");
+                    if let Some(at) = text.find("<!-- cys-checkpoint:") {
+                        let marker = &text[at..at + text[at..].find("-->").map(|e| e + 3).unwrap_or(0)];
+                        let _ = std::fs::write(r.join("n8/_round/SESSION_STATE.md"), format!("# 상태\n{marker}\n"));
+                    }
+                    r2c_ok(json!({}))
+                }
+                "surface.read_text" if sid == 7 => r2c_ok(json!({"text": format!("✻ Working…\n> {typed7}")})),
+                "surface.read_text" => r2c_ok(json!({"text": "✻ Working…\n> "})),
+                _ => r2c_ok(json!({})),
+            }
+        });
+        let reg = root.join("no-depts.json");
+        let (rc, out, err) = r2c_child("drain-verify", &daemon, &[("CYS_DEPTS_JSON", reg.into_os_string())]);
+        let at = out.find("{\n").unwrap_or_else(|| panic!("no drain --verify JSON:\n{out}\n{err}"));
+        let report = serde_json::Deserializer::from_str(&out[at..]).into_iter::<Value>().next().expect("json").expect("json");
+        let _ = std::fs::remove_dir_all(&root);
+        (rc, report, daemon.calls())
+    }
+
+    /// Area D · S42/B15/B16 through the real command: mixed nodes — surface:8 saved, surface:7's save paste UNKNOWN with
+    /// a persistent wedge — exit 91, both in the JSON (`saved`, `unknown`, summary `unknown: 1`), and no corrective
+    /// Return to surface:7 (only surface:8's own submission Return was sent).
+    /// RED on 11717c44: surface:7 becomes the code-less `delivery_failed` (wedge first) → exit 1, plus a corrective Return.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_d6_mixed_saved_and_unknown_nodes_exit_91_with_both_in_the_json() {
+        let (rc, report, calls) = r2d_drain_verify(r2c_reply(&pending_err()));
+        let outcome = |sid: u64| {
+            report["nodes"].as_array().unwrap().iter().find(|n| n["surface"] == format!("surface:{sid}").as_str())
+                .map(|n| n["outcome"].as_str().unwrap_or("").to_string()).unwrap_or_default()
+        };
+        let returns7 = calls.iter().filter(|(m, p)| m == "surface.send_key" && p["surface_id"] == 7).count();
+        let mut failures = Vec::new();
+        if rc != EXIT_WRITE_OUTCOME_UNKNOWN {
+            failures.push(format!("exit {rc}, want 91"));
+        }
+        if (outcome(7).as_str(), outcome(8).as_str()) != ("unknown", "saved") {
+            failures.push(format!("outcomes 7={} 8={}", outcome(7), outcome(8)));
+        }
+        if report["summary"]["unknown"] != 1 {
+            failures.push(format!("summary has no unknown count: {}", report["summary"]));
+        }
+        if returns7 != 0 {
+            failures.push(format!("{returns7} Return(s) sent to surface:7 after its UNKNOWN save paste"));
+        }
+        assert!(failures.is_empty(), "{}\n{report}", failures.join("\n"));
     }
 }
