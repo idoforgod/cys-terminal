@@ -43621,6 +43621,8 @@ mod b360_tests {
             "cycle" => run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true, None),
             "restore" => run_restore(None, false, true),
             "boot" => run_boot(None, true),
+            // ★(B-360 R2 revise · area P) no `--from`: the command stops after its pending pass (exit 1)
+            "pack-update" => run_pack_update(None, None, false),
             other => panic!("unknown child caller {other}"),
         };
         let _ = std::io::stdout().flush();
@@ -44217,24 +44219,50 @@ mod b360_tests {
         calls.iter().filter(|(m, _)| m == method).count()
     }
 
-    /// Row 9 · `cys pack-update` node loop (census row 23, cys.rs:23291): two consecutive pack-update decisions for one
-    /// idle seat whose first inject got UNKNOWN. RED on d27e1066: no `reinject.mark` after the unknown inject, so the
-    /// second pack-update types the same directive again (2 pastes: a duplicate if the first one landed).
+    /// Row 9 · `cys pack-update` node loop (census S65, cys.rs:23459@11717c44): two consecutive node loops for one idle
+    /// seat whose first inject got UNKNOWN.
+    /// ★(B-360 R2 revise) CHANGED from `b360_r2c_9_pack_update_unknown_is_marked_and_the_next_run_does_not_reinject`,
+    /// which pinned the wrong contract: `(injected, failed, skipped) == (1, 0, 1)` and one `reinject.mark` (UNKNOWN counted
+    /// as delivered and marked, so every later pack-update skipped the node: a permanent silent skip). Now: UNKNOWN is
+    /// never counted injected, never marked, and is persisted as an unknown entry in `.pack-reinject-pending.json`; the
+    /// second loop does not type it again (the entry's hash equals the directive it would inject).
+    /// RED on 11717c44: one mark, `injected` 1, no unknown entry.
     #[cfg(unix)]
     #[test]
-    fn b360_r2c_9_pack_update_unknown_is_marked_and_the_next_run_does_not_reinject() {
+    fn b360_r2r_p1_pack_update_unknown_is_not_injected_not_marked_and_is_pending_as_unknown() {
         let pack = R2cPack::new();
         let daemon = r2c_pack_daemon(r2c_reply(&pending_err()));
-        let (first, second) = r2c_in_env(&daemon, &pack, || (run_pack_reinject("9.9.9"), run_pack_reinject("9.9.9")));
+        let (first, second, hash) = r2c_in_env(&daemon, &pack, || {
+            let first = run_pack_reinject("9.9.9");
+            let second = run_pack_reinject("9.9.9");
+            (first, second, sha256_hex(&compose_directive("worker").expect("directive")))
+        });
         let (first, second) = (first.expect("first pack-update"), second.expect("second pack-update"));
         let calls = daemon.calls();
-        assert_eq!(
-            (r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark")),
-            (1, 1),
-            "pastes/marks over two pack-updates (first: injected {} failed {} · second: injected {} skipped {})",
-            first.injected, first.failed, second.injected, second.skipped
-        );
-        assert_eq!((first.injected, first.failed, second.skipped), (1, 0, 1), "an unknown inject counts as delivered");
+        let mut failures = Vec::new();
+        let (pastes, marks) = (r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark"));
+        if (pastes, marks) != (1, 0) {
+            failures.push(format!("pastes/marks over two loops = ({pastes}, {marks}), want (1, 0): UNKNOWN is never marked"));
+        }
+        if (first.injected, first.failed, second.injected, second.skipped) != (0, 0, 0, 0) {
+            failures.push(format!("UNKNOWN counted as injected/failed/skipped: first {first:?} · second {second:?}"));
+        }
+        for (name, rep) in [("first", format!("{first:?}")), ("second", format!("{second:?}"))] {
+            if !rep.contains("unknown: 1") {
+                failures.push(format!("the {name} report does not count the node unknown: {rep}"));
+            }
+        }
+        let unknown = r2p_unknown_entries(&pack.dir);
+        let entry_ok = unknown.len() == 1
+            && unknown[0]["surface_id"] == 7
+            && unknown[0]["role"] == "worker"
+            && unknown[0]["directive_hash"] == hash.as_str()
+            && unknown[0]["request_id"] == "w1-2"
+            && unknown[0]["at"].as_u64().is_some_and(|t| t > 0);
+        if !entry_ok {
+            failures.push(format!("pending file has no unknown entry {{7, worker, hash, w1-2, at}}: {unknown:?}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Row 9 control (REFUSED, unchanged): zero bytes, no mark, the second pack-update re-injects (the safe retry).
@@ -44249,12 +44277,17 @@ mod b360_tests {
         assert_eq!(first.expect("first pack-update").failed, 1);
     }
 
-    /// Row 10 · `cys pack-update` pending pass (census row 24, cys.rs:23433): a pending node whose inject got UNKNOWN, then
-    /// the next pack-update's pending pass. RED on d27e1066: the error is dropped, the node stays pending with no mark,
-    /// and the next pending pass types the directive again (2 pastes).
+    /// Row 10 · `cys pack-update` pending pass (census S66, cys.rs:23540@11717c44): a deferred node whose inject got
+    /// UNKNOWN, then the next pending pass.
+    /// ★(B-360 R2 revise) CHANGED from `b360_r2c_10_pending_unknown_is_marked_and_the_next_pack_update_does_not_reinject`,
+    /// which pinned the wrong contract: one `reinject.mark`, the pending file removed, and `Ok((1, 0))` (UNKNOWN counted as
+    /// resolved). Now: no mark, the node moves from `deferred` to `unknown` (not retryable, not resolved), the pass counts it
+    /// unknown, and the next pass checks it with a presence ping instead of typing it again (here the seat is a bare
+    /// shell, so no ping is typed: undetermined, still unknown).
+    /// RED on 11717c44: one mark, the file is removed, the pass returns `(1, 0)`.
     #[cfg(unix)]
     #[test]
-    fn b360_r2c_10_pending_unknown_is_marked_and_the_next_pack_update_does_not_reinject() {
+    fn b360_r2r_p2_pending_unknown_moves_to_the_unknown_list_and_is_never_marked_or_resolved() {
         let pack = R2cPack::new();
         let base = pack.dir.join("state");
         std::fs::create_dir_all(&base).unwrap();
@@ -44262,14 +44295,24 @@ mod b360_tests {
         let daemon = r2c_pack_daemon(r2c_reply(&pending_err()));
         let (first, second) =
             r2c_in_env(&daemon, &pack, || (consume_reinject_pending(&base), consume_reinject_pending(&base)));
+        let (first, second) = (format!("{first:?}"), format!("{second:?}"));
         let calls = daemon.calls();
-        assert_eq!(
-            (r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark")),
-            (1, 1),
-            "pastes/marks over two pending passes (first {first:?} · second {second:?})"
-        );
-        assert!(!reinject_pending_path(&base).exists(), "the unknown node is still pending");
-        assert_eq!(first, Ok((1, 0)));
+        let mut failures = Vec::new();
+        let (pastes, marks) = (r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark"));
+        if (pastes, marks) != (1, 0) {
+            failures.push(format!("pastes/marks over two passes = ({pastes}, {marks}), want (1, 0)"));
+        }
+        if !(first.contains("resolved: 0") && first.contains("unknown: 1")) || !second.contains("unknown: 1") {
+            failures.push(format!("UNKNOWN is not counted unknown (and not resolved): first {first} · second {second}"));
+        }
+        let unknown = r2p_unknown_entries(&base);
+        if unknown.len() != 1 || unknown[0]["surface_id"] != 7 || unknown[0]["request_id"] != "w1-2" {
+            failures.push(format!("the node is not pending as unknown: {unknown:?}"));
+        }
+        if !r2p_deferred_entries(&base).is_empty() {
+            failures.push("the unknown node is still an ordinary (retryable) deferred entry".to_string());
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Row 10 control (REFUSED, unchanged): zero bytes, the node stays pending and the next pass retries it (safe).
@@ -44287,5 +44330,383 @@ mod b360_tests {
         assert_eq!((r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark")), (2, 0));
         assert!(reinject_pending_path(&base).exists(), "a refused node stays pending");
         assert_eq!(first, Ok((0, 1)));
+    }
+
+    // ── ★(B-360 R2 revise) area P · pack-update: UNKNOWN is its own persistent state, checked by a presence ping ──────
+    // FIX-SPEC-R2-REVISE area P (census S65/S66/S69/S70, boundaries B01-B08). These specimens compile on 11717c44: they
+    // read the report through its existing fields or its Debug text (a count with no field on 11717c44 is read as
+    // "unknown: N"), the RPCs the fake daemon records, the pending file, and the CLI's own stdout.
+
+    /// The entries of one list of `.pack-reinject-pending.json` under `base` (empty when the file or the list is absent).
+    #[cfg(unix)]
+    fn r2p_list(base: &std::path::Path, list: &str) -> Vec<Value> {
+        std::fs::read_to_string(reinject_pending_path(base))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|d| d[list].as_array().cloned())
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn r2p_unknown_entries(base: &std::path::Path) -> Vec<Value> {
+        r2p_list(base, "unknown")
+    }
+
+    #[cfg(unix)]
+    fn r2p_deferred_entries(base: &std::path::Path) -> Vec<Value> {
+        r2p_list(base, "deferred")
+    }
+
+    /// How the next presence ping goes: the agent ACKs on screen, reads it and answers without the ACK (affirmative
+    /// absence: `ReceivedNoAck`), or leaves no trace (undetermined).
+    #[cfg(unix)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum R2pPing {
+        Ack,
+        NoAck,
+        NoTrace,
+    }
+
+    /// The seat's scripted behaviour; the test changes it between runs.
+    #[cfg(unix)]
+    struct R2pSeat {
+        directive: Value,
+        ping: R2pPing,
+        mark_ok: bool,
+    }
+
+    #[cfg(unix)]
+    type R2pCtl = std::sync::Arc<std::sync::Mutex<R2pSeat>>;
+
+    #[cfg(unix)]
+    fn r2p_ctl(directive: Value, ping: R2pPing, mark_ok: bool) -> R2pCtl {
+        std::sync::Arc::new(std::sync::Mutex::new(R2pSeat { directive, ping, mark_ok }))
+    }
+
+    #[cfg(unix)]
+    fn r2p_set(ctl: &R2pCtl, directive: Value, ping: R2pPing, mark_ok: bool) {
+        *ctl.lock().unwrap_or_else(|e| e.into_inner()) = R2pSeat { directive, ping, mark_ok };
+    }
+
+    /// One idle, live claude seat (surface:7 · worker) whose Claude transcript is `session`. A directive paste is answered
+    /// with `ctl.directive`; a presence ping (text carrying `REINJECT_PING_HEAD`) is answered ok and then: `Ack` matches
+    /// `surface.wait_for`, `NoAck` writes the ping as a user prompt plus an answer without the ACK into the transcript,
+    /// `NoTrace` writes nothing. `reinject.mark` is kept in topology as the daemon persists it (or refused, `mark_ok`).
+    #[cfg(unix)]
+    fn r2p_daemon(ctl: R2pCtl, session: std::path::PathBuf) -> R2cDaemon {
+        let mut marker = Value::Null;
+        R2cDaemon::start(move |method, p| {
+            let seat = ctl.lock().unwrap_or_else(|e| e.into_inner());
+            match method {
+                "system.topology" => {
+                    let mut row = json!({"role": "worker"});
+                    if !marker.is_null() {
+                        row["pack_reinject"] = marker.clone();
+                    }
+                    r2c_ok(json!({"saved": [row]}))
+                }
+                "control.dashboard" => r2c_ok(json!({"fleet": [
+                    {"surface_id": 7, "role": "worker", "state": "idle", "idle_secs": 60, "agent_status": "idle"}]})),
+                "surface.list" => r2c_ok(json!({"surfaces": [{
+                    "surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude", "exited": false,
+                    "agent_alive": true, "awakened_at": 1.0,
+                    "usage": {"source": "transcript", "session_file": session.to_string_lossy()}}]})),
+                "surface.read_text" => r2c_ok(json!({"text": "", "latest_cursor": 40, "line_count": 40})),
+                "surface.send_text" => {
+                    let text = p["text"].as_str().unwrap_or("");
+                    if !text.contains(REINJECT_PING_HEAD) {
+                        return seat.directive.clone();
+                    }
+                    if seat.ping == R2pPing::NoAck {
+                        use std::io::Write;
+                        let user = json!({"type": "user", "message": {"content": text}});
+                        let answer = json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}});
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&session) {
+                            let _ = writeln!(f, "{user}\n{answer}");
+                        }
+                    }
+                    r2c_ok(json!({}))
+                }
+                "surface.wait_for" => r2c_ok(json!({"matched": seat.ping == R2pPing::Ack})),
+                "reinject.mark" if seat.mark_ok => {
+                    marker = json!({"pack_version": p["pack_version"], "directive_hash": p["directive_hash"]});
+                    r2c_ok(json!({}))
+                }
+                "reinject.mark" => r2c_reply("rpc_failed: the marker store refused the write"),
+                _ => r2c_ok(json!({})),
+            }
+        })
+    }
+
+    /// (directive pastes, presence pings) among `calls`.
+    #[cfg(unix)]
+    fn r2p_pastes(calls: &[(String, Value)]) -> (usize, usize) {
+        let sends: Vec<&Value> = calls.iter().filter(|(m, _)| m == "surface.send_text").map(|(_, p)| p).collect();
+        let pings = sends.iter().filter(|p| p["text"].as_str().is_some_and(|t| t.contains(REINJECT_PING_HEAD))).count();
+        (sends.len() - pings, pings)
+    }
+
+    /// Where the first UNKNOWN came from: the node loop (`run_pack_reinject`) or the pending pass of a deferred node.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum R2pOrigin {
+        NodeLoop,
+        PendingPass,
+    }
+
+    /// Run 1 for `origin`: the directive paste gets UNKNOWN. Returns the Debug text of that run's report.
+    #[cfg(unix)]
+    fn r2p_first_run(origin: R2pOrigin, pack: &R2cPack) -> String {
+        match origin {
+            R2pOrigin::NodeLoop => format!("{:?}", run_pack_reinject("9.9.9")),
+            R2pOrigin::PendingPass => {
+                persist_reinject_pending(&pack.dir, "9.9.9", &[(7, "worker".to_string())]).unwrap();
+                format!("{:?}", consume_reinject_pending(&pack.dir))
+            }
+        }
+    }
+
+    /// Scratch transcript for one specimen (removed by the caller's pack dir drop: it lives inside it).
+    #[cfg(unix)]
+    fn r2p_session(pack: &R2cPack) -> std::path::PathBuf {
+        let s = pack.dir.join("session.jsonl");
+        std::fs::write(&s, "").unwrap();
+        s
+    }
+
+    /// Area P · after an UNKNOWN (from either origin), the next pending pass's presence ping gets the ACK: the directive is
+    /// in context. Mark once, type nothing, drop the entry; a third run (same version) decides SkipUnchanged.
+    /// RED on 11717c44: the first run already marked (no entry), so the next pass pings nothing.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p3_unknown_then_ack_marks_once_types_nothing_and_never_types_twice() {
+        let mut failures = Vec::new();
+        for origin in [R2pOrigin::NodeLoop, R2pOrigin::PendingPass] {
+            let pack = R2cPack::new();
+            let ctl = r2p_ctl(r2c_reply(&pending_err()), R2pPing::Ack, true);
+            let daemon = r2p_daemon(ctl.clone(), r2p_session(&pack));
+            let (marks_after_first, second, third) = r2c_in_env(&daemon, &pack, || {
+                r2p_first_run(origin, &pack);
+                let marks = r2c_count(&daemon.calls(), "reinject.mark");
+                r2p_set(&ctl, r2c_ok(json!({})), R2pPing::Ack, true);
+                let second = format!("{:?}", consume_reinject_pending(&pack.dir));
+                let third = run_pack_reinject("9.9.9");
+                (marks, second, third)
+            });
+            let calls = daemon.calls();
+            let (directives, pings) = r2p_pastes(&calls);
+            let marks = r2c_count(&calls, "reinject.mark");
+            if (directives, pings, marks_after_first, marks) != (1, 1, 0, 1) {
+                failures.push(format!(
+                    "{origin:?}: directives {directives} pings {pings} marks after run 1 {marks_after_first} total {marks} \
+                     (want 1 directive ever, 1 ping, no mark on UNKNOWN, 1 mark after the ACK) · pass 2 {second}"
+                ));
+            }
+            if !r2p_unknown_entries(&pack.dir).is_empty() {
+                failures.push(format!("{origin:?}: the verified entry is still pending"));
+            }
+            match third {
+                Ok(rep) if rep.injected == 0 && rep.skipped == 1 => {}
+                other => failures.push(format!("{origin:?}: the run after the ACK did not skip the node: {other:?}")),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area P · late refusal: the first write was UNKNOWN (later refused by the writer: zero bytes), and the next pass's
+    /// presence ping says `ReceivedNoAck` (the agent read the ping and holds no directive) — the one authorised retry:
+    /// the directive is typed exactly once, then marked. RED on 11717c44: no ping, no second directive (marked in run 1).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p4_unknown_then_absent_types_the_directive_exactly_once() {
+        let mut failures = Vec::new();
+        for origin in [R2pOrigin::NodeLoop, R2pOrigin::PendingPass] {
+            let pack = R2cPack::new();
+            let ctl = r2p_ctl(r2c_reply(&pending_err()), R2pPing::NoAck, true);
+            let daemon = r2p_daemon(ctl.clone(), r2p_session(&pack));
+            let third = r2c_in_env(&daemon, &pack, || {
+                r2p_first_run(origin, &pack);
+                r2p_set(&ctl, r2c_ok(json!({})), R2pPing::NoAck, true);
+                let _ = consume_reinject_pending(&pack.dir);
+                run_pack_reinject("9.9.9")
+            });
+            let calls = daemon.calls();
+            let (directives, pings) = r2p_pastes(&calls);
+            let marks = r2c_count(&calls, "reinject.mark");
+            if (directives, pings, marks) != (2, 1, 1) {
+                failures.push(format!(
+                    "{origin:?}: directives {directives} pings {pings} marks {marks} (want the UNKNOWN one + exactly one \
+                     re-inject after ReceivedNoAck, one ping, one mark)"
+                ));
+            }
+            if !r2p_unknown_entries(&pack.dir).is_empty() {
+                failures.push(format!("{origin:?}: the re-injected entry is still pending"));
+            }
+            if !matches!(&third, Ok(rep) if rep.injected == 0) {
+                failures.push(format!("{origin:?}: a third run typed it again: {third:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area P · the next pass's presence ping is undetermined (no ACK on screen, no trace in the transcript): nothing is
+    /// typed, the entry stays, the pass and a following node loop both count it unknown and type nothing.
+    /// RED on 11717c44: no entry, no ping, and the node loop of the same version decides by the (UNKNOWN-seeded) marker.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p5_unknown_then_undetermined_types_nothing_and_stays_unknown() {
+        let mut failures = Vec::new();
+        for origin in [R2pOrigin::NodeLoop, R2pOrigin::PendingPass] {
+            let pack = R2cPack::new();
+            let ctl = r2p_ctl(r2c_reply(&pending_err()), R2pPing::NoTrace, true);
+            let daemon = r2p_daemon(ctl.clone(), r2p_session(&pack));
+            let (second, third) = r2c_in_env(&daemon, &pack, || {
+                r2p_first_run(origin, &pack);
+                r2p_set(&ctl, r2c_ok(json!({})), R2pPing::NoTrace, true);
+                (format!("{:?}", consume_reinject_pending(&pack.dir)), format!("{:?}", run_pack_reinject("9.9.9")))
+            });
+            let calls = daemon.calls();
+            let (directives, pings) = r2p_pastes(&calls);
+            let marks = r2c_count(&calls, "reinject.mark");
+            if (directives, pings, marks) != (1, 1, 0) {
+                failures.push(format!("{origin:?}: directives {directives} pings {pings} marks {marks} (want 1, 1, 0)"));
+            }
+            if !second.contains("unknown: 1") || !third.contains("unknown: 1") || third.contains("injected: 1") {
+                failures.push(format!("{origin:?}: not counted unknown after an undetermined ping: pass {second} · loop {third}"));
+            }
+            if r2p_unknown_entries(&pack.dir).len() != 1 {
+                failures.push(format!("{origin:?}: the entry was not kept"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area P · the ping says Present but `reinject.mark` fails: the entry stays UNKNOWN (never an ordinary deferred entry,
+    /// which would be retried = a duplicate), and nothing is typed on this run or the next.
+    /// RED on 11717c44: the first run marks, nothing is pending, no ping.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p6_mark_failure_after_present_keeps_it_unknown_and_types_nothing() {
+        let mut failures = Vec::new();
+        for origin in [R2pOrigin::NodeLoop, R2pOrigin::PendingPass] {
+            let pack = R2cPack::new();
+            let ctl = r2p_ctl(r2c_reply(&pending_err()), R2pPing::Ack, true);
+            let daemon = r2p_daemon(ctl.clone(), r2p_session(&pack));
+            let (after_two, deferred_after_two) = r2c_in_env(&daemon, &pack, || {
+                r2p_first_run(origin, &pack);
+                r2p_set(&ctl, r2c_ok(json!({})), R2pPing::Ack, false);
+                let _ = consume_reinject_pending(&pack.dir);
+                let state = (r2p_unknown_entries(&pack.dir).len(), r2p_deferred_entries(&pack.dir).len());
+                let _ = consume_reinject_pending(&pack.dir);
+                state
+            });
+            let calls = daemon.calls();
+            let (directives, pings) = r2p_pastes(&calls);
+            if directives != 1 || pings != 2 {
+                failures.push(format!("{origin:?}: directives {directives} pings {pings} (want 1 ever, one ping per later pass)"));
+            }
+            if (after_two, deferred_after_two) != (1, 0) {
+                failures.push(format!(
+                    "{origin:?}: after a failed mark: unknown {after_two} deferred {deferred_after_two} (want 1, 0)"
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area P · a restart between runs: the unknown entry is a file, so a fresh daemon (no marker in its topology) and a
+    /// fresh command still reconcile it — the ACK marks it once and nothing is typed.
+    /// RED on 11717c44: nothing is written to the file, so the second daemon's pass has nothing to check.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p7_the_unknown_entry_survives_a_restart() {
+        let pack = R2cPack::new();
+        let session = r2p_session(&pack);
+        {
+            let first = r2p_daemon(r2p_ctl(r2c_reply(&pending_err()), R2pPing::Ack, true), session.clone());
+            r2c_in_env(&first, &pack, || run_pack_reinject("9.9.9").map(|_| ()).expect("first run"));
+        }
+        let on_disk = r2p_unknown_entries(&pack.dir);
+        let second = r2p_daemon(r2p_ctl(r2c_ok(json!({})), R2pPing::Ack, true), session);
+        let _ = r2c_in_env(&second, &pack, || consume_reinject_pending(&pack.dir));
+        let calls = second.calls();
+        let (directives, pings) = r2p_pastes(&calls);
+        let marks = r2c_count(&calls, "reinject.mark");
+        assert!(
+            on_disk.len() == 1 && (directives, pings, marks) == (0, 1, 1),
+            "entry on disk between runs {on_disk:?}; after restart: directives {directives} pings {pings} marks {marks}"
+        );
+    }
+
+    /// Area P · the pending file: every writer carries the other list forward, and the file is removed only when BOTH
+    /// lists are empty. RED on 11717c44 (a and b): `persist_reinject_pending` writes `deferred` only, so it removes or
+    /// overwrites a file that still holds an unknown entry. (c) is the positive control: an old file without "unknown"
+    /// reads as before (passes on 11717c44 too).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p8_the_pending_file_carries_the_unknown_list_through_every_writer() {
+        let pack = R2cPack::new();
+        let base = pack.dir.clone();
+        let entry = json!({"surface_id": 7, "role": "worker", "directive_hash": "H", "request_id": "w1-2", "at": 1});
+        let path = reinject_pending_path(&base);
+        std::fs::write(&path, json!({"pack_version": "9.9.9", "deferred": [], "unknown": [entry]}).to_string()).unwrap();
+        let mut failures = Vec::new();
+        persist_reinject_pending(&base, "9.9.9", &[]).unwrap();
+        if r2p_unknown_entries(&base) != vec![entry.clone()] {
+            failures.push(format!("(a) an empty deferred write dropped the unknown list: exists={}", path.exists()));
+        }
+        persist_reinject_pending(&base, "9.9.9", &[(8, "cso".to_string())]).unwrap();
+        if r2p_unknown_entries(&base) != vec![entry.clone()] || r2p_deferred_entries(&base).len() != 1 {
+            failures.push(format!("(b) a deferred write overwrote the unknown list: {:?}", std::fs::read_to_string(&path)));
+        }
+        std::fs::write(&path, json!({"pack_version": "9.9.9", "deferred": [{"surface_id": 9, "role": "cso"}]}).to_string())
+            .unwrap();
+        match read_reinject_pending(&base) {
+            Ok(Some((ver, nodes))) if ver == "9.9.9" && nodes == vec![(9, "cso".to_string())] => {}
+            other => failures.push(format!("(c) an old file without \"unknown\" no longer reads as before: {other:?}")),
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area P · S69 through the real command: `cys pack-update` (child; no `--from`, so it stops after the pending pass with
+    /// exit 1) prints the pending pass line with an unknown count, and a warning naming the node, the pending path and
+    /// `cys reinject --role worker --check`. RED on 11717c44: the line says "1 해소" (the UNKNOWN node printed as resolved).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p9_the_pending_pass_line_of_the_real_command_counts_the_unknown() {
+        let pack = R2cPack::new();
+        persist_reinject_pending(&pack.dir, "9.9.9", &[(7, "worker".to_string())]).unwrap();
+        let daemon = r2c_pack_daemon(r2c_reply(&pending_err()));
+        let (_rc, out, err) = r2c_child("pack-update", &daemon, &pack.envs());
+        let line = out.lines().find(|l| l.contains("pending reinject 소비")).unwrap_or_default().to_string();
+        let mut failures = Vec::new();
+        if !(line.contains("0 해소") && line.contains("1 미확인")) {
+            failures.push(format!("pending pass line: {line:?}\n{out}"));
+        }
+        let warn = err.lines().find(|l| l.contains("cys reinject --role worker --check")).unwrap_or_default();
+        if !(warn.contains("surface 7") || warn.contains("surface:7")) || !warn.contains(".pack-reinject-pending.json") {
+            failures.push(format!("no warning naming the node, the pending path and the check: {err}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area P · an unknown entry whose hash differs from the directive composed now is dropped and the node is decided
+    /// normally (a different directive is meant to be injected anyway). RED on 11717c44: the entry is never read, so it is
+    /// never dropped (the injection itself happens on both).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p10_a_changed_directive_drops_the_stale_unknown_entry_and_decides_normally() {
+        let pack = R2cPack::new();
+        let entry = json!({"surface_id": 7, "role": "worker", "directive_hash": "OLD", "request_id": null, "at": 1});
+        std::fs::write(
+            reinject_pending_path(&pack.dir),
+            json!({"pack_version": "9.9.8", "deferred": [], "unknown": [entry]}).to_string(),
+        )
+        .unwrap();
+        let daemon = r2c_pack_daemon(r2c_ok(json!({})));
+        let rep = r2c_in_env(&daemon, &pack, || run_pack_reinject("9.9.9")).expect("node loop");
+        let calls = daemon.calls();
+        assert_eq!((r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark"), rep.injected), (1, 1, 1));
+        assert!(r2p_unknown_entries(&pack.dir).is_empty(), "the stale unknown entry was kept: {:?}", r2p_unknown_entries(&pack.dir));
     }
 }

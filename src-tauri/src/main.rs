@@ -11867,6 +11867,35 @@ exit 0
         );
     }
 
+    /// ★(B-360 R2 revise · area P) `cys pack-update` now prints `unknown=U` (nodes whose reinject outcome is unknown: the
+    /// directive may still land, it is not re-sent, the next pack-update checks it). The reader must carry it, not ignore
+    /// it: an ignored token reads an unknown node as success. Read through Debug so this compiles on 11717c44, whose
+    /// `Measured` has no `unknown` field. RED on 11717c44: the token is dropped. The old line without `unknown=` keeps
+    /// parsing as before (positive control, also green on 11717c44).
+    #[test]
+    fn parse_reinject_result_reads_the_unknown_count_and_old_lines_still_parse() {
+        let r = parse_reinject_result(
+            "PACK_UPDATE_RESULT pack_version=2.0.0 injected=0 skipped=0 deferred=0 failed=0 unknown=2",
+        );
+        assert!(format!("{r:?}").contains("unknown: 2"), "unknown= not read: {r:?}");
+        assert_eq!(
+            parse_reinject_counts("PACK_UPDATE_RESULT pack_version=2.0.0 injected=2 skipped=1 deferred=3 failed=4"),
+            (4, 3),
+            "a line without unknown= must parse as before"
+        );
+    }
+
+    /// ★(B-360 R2 revise · area P) source pin (the function needs a live AppHandle): `install_pack_update` warns when
+    /// `unknown > 0` with the "도달 여부 미확인" message and carries `reinject_unknown` in both events. RED on 11717c44.
+    #[test]
+    fn install_pack_update_warns_on_reinject_unknown_source_pin() {
+        let src = include_str!("main.rs");
+        let at = src.find("async fn install_pack_update(").expect("install_pack_update");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("fn end")];
+        assert!(body.contains("도달 여부 미확인 — 다음 pack-update 에서 확인"), "no unknown warning text");
+        assert!(body.matches("\"reinject_unknown\"").count() >= 2, "reinject_unknown not in both events");
+    }
+
     /// ★U4-B2③ 소스 핀: 스킵이면 `update-warning` 을 띄우고 `pack-updated` 에 `reinject_skipped` 를
     /// 실어 완료 토스트가 '재주입 완료'로 단정하지 않게 한다. 종료코드 판정(degraded/실패)은 무변경.
     ///
