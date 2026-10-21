@@ -664,6 +664,12 @@ pub const MSG_TYPING_GUARD: &str = "human is typing in this pane; retry later or
 /// seat instead of closing or reclaiming it. Must never contain the typing-guard strings above (that would turn it
 /// into a `--queued` fallback).
 pub const ERR_JOURNAL_UNAVAILABLE: &str = "journal_unavailable";
+/// ★(B-360 R2) Error code of a direct agent write whose OUTCOME IS UNKNOWN: the seat's writer had not reached it within
+/// the barrier budget, so it is still queued and may yet be typed (or still be refused). NOT safe to retry - a retry can
+/// type it twice. Producer = cysd handlers (`journal_barrier_verdict`); consumers = `cys` `exit_for_error` (the exit code
+/// of `run()` and `run_reinject`), the launch-agent arm (pane kept), node-recover's fold (non-destructive rc 79) and
+/// `cycle_agent_exit`. Like the code above, it must never contain the typing-guard strings.
+pub const ERR_WRITE_OUTCOME_UNKNOWN: &str = "write_outcome_unknown";
 /// 직접 send 초안 거부의 사유 태그 — 기존 타이핑 가드 메시지 접두 뒤에 붙인다.
 pub const DRAFT_GATE_TAG: &str = "draft_gate";
 /// ★(0.14.43 · C5 · RQFIX I-8) 유령 계수 처방 — 데몬이 직접 send 거부 응답·강제 배달 거부 문구의 **맨 끝**에 덧붙이고(앞 문구·접두·태그의 위치·바이트는 불변),

@@ -1052,6 +1052,12 @@ fn recover_refusal_from_input_guard(e: String) -> String {
             "{RECOVER_REFUSED_TOKEN} writer journal refused the recovery write (zero bytes) — no reclaim, no kill; \
              make the daemon's writer journal writable, then boot again: {e}"
         )
+    } else if is_write_outcome_unknown(&e) && !is_recover_refusal(&e) {
+        // ★(B-360 R2) the recovery write may still land: killing the seat or sending again is the wrong direction
+        format!(
+            "{RECOVER_REFUSED_TOKEN} the recovery write's outcome is unknown (still queued, it may still land) — no \
+             reclaim, no kill, no re-send; check the seat, then boot again: {e}"
+        )
     } else {
         e
     }
@@ -1063,11 +1069,35 @@ fn is_journal_refusal(e: &str) -> bool {
     e.contains(&format!("{}: ", cys::ERR_JOURNAL_UNAVAILABLE))
 }
 
+/// ★(B-360 R2) Is this the daemon's UNKNOWN outcome for a direct write (`cys::ERR_WRITE_OUTCOME_UNKNOWN`): still queued,
+/// may still be typed, not safe to retry? Pure; matches the code as `rpc_roundtrip` renders it (`<code>: <message>`).
+fn is_write_outcome_unknown(e: &str) -> bool {
+    e.contains(&format!("{}: ", cys::ERR_WRITE_OUTCOME_UNKNOWN))
+}
+
+/// ★(B-360 R2) The process exit code for an error that reached the top of a command: 91 for an UNKNOWN write outcome,
+/// 1 otherwise (refused-with-zero-bytes stays 1: it is safe to retry). Used by `run()` and `run_reinject`.
+fn exit_for_error(e: &str) -> i32 {
+    if is_write_outcome_unknown(e) {
+        EXIT_WRITE_OUTCOME_UNKNOWN
+    } else {
+        1
+    }
+}
+
 /// ★(B-360) launch-agent: the agent started but its directive was refused at the writer journal (zero bytes). The
 /// pane is KEPT (closing it would destroy a running agent and a relaunch would be refused the same way); the
 /// boot tooling re-injects later (`javis_boot_node` VERIFY goes `--queued`). Not 0 (the directive did not land),
 /// not 1 (1 means "rolled back, pane closed"), not 78 (no first-run gate is involved). Free: 0·1·2·7·75·78·79·80-89.
 const EXIT_DIRECTIVE_REFUSED: i32 = 90;
+
+/// ★(B-360 R2) Exit code of any command whose direct write has an UNKNOWN outcome (`cys::ERR_WRITE_OUTCOME_UNKNOWN`):
+/// the write is still queued and may still be typed - do NOT retry, a retry can type it twice.
+/// Family: the direct-write OUTCOME codes of B-360 - 90 (`EXIT_DIRECTIVE_REFUSED`, launch-agent: zero bytes, pane kept)
+/// and 91 (any command: outcome unknown); passed = 0 and refused = 1 elsewhere. It sits right after 90 because it is the
+/// third outcome of the same write path. Neighbours for a reader scanning 80..91: 80-81 clear verification, 82-83
+/// verifier, 84-89 cycle-agent, then this family. 92-99 unassigned. Outside sysexits 64-78.
+const EXIT_WRITE_OUTCOME_UNKNOWN: i32 = 91;
 
 /// [결재 7ⓑ] `cycle-agent` 의 clear 는 **송신(행위)과 실효(결과)가 다르다.**
 ///
@@ -1642,6 +1672,8 @@ fn cycle_agent_exit(result: &Result<(), String>) -> i32 {
         Err(e) if e.starts_with(CYCLE_BUSY_TOKEN) => EXIT_CYCLE_BUSY,
         Err(e) if e.starts_with(VERIFIER_COLLISION_TOKEN) => EXIT_VERIFIER_COLLISION,
         Err(e) if e.starts_with(VERIFIER_UNRESOLVED_TOKEN) => EXIT_VERIFIER_UNRESOLVED,
+        // ★(B-360 R2) a write of the cycle has an unknown outcome (it may still land): stop, and do not let it read as 1
+        Err(e) if is_write_outcome_unknown(e) => EXIT_WRITE_OUTCOME_UNKNOWN,
         Err(_) => 1,
     }
 }
@@ -6314,7 +6346,7 @@ fn run(command: Command) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("error: {e}");
-            1
+            exit_for_error(&e) // ★(B-360 R2) 91 for an unknown write outcome, else 1
         }
     }
 }
@@ -18276,6 +18308,19 @@ fn run_launch_agent_opts(
             println!("{}", surface_ref(sid));
             EXIT_DIRECTIVE_REFUSED
         }
+        // ★(B-360 R2) The directive's outcome is unknown: still queued, it may still land. Keep the pane, do not re-inject.
+        Err(e) if created.is_some() && is_write_outcome_unknown(&e) => {
+            let sid = created.expect("guarded above");
+            eprintln!("error: {e}");
+            eprintln!(
+                "[launch-agent] {} kept: the directive's outcome is unknown (it may still land) — do NOT re-inject yet; \
+                 check the seat first (cys read-screen --surface {})",
+                surface_ref(sid),
+                surface_ref(sid)
+            );
+            println!("{}", surface_ref(sid));
+            EXIT_WRITE_OUTCOME_UNKNOWN
+        }
         // ★(U-11) `LaunchFailed` 는 종전의 `Err`(데몬 왕복 실패 등 절차 미완)와 **완전히 같은
         //   귀결**이다 — or-패턴으로 합류시켜 롤백 close 블록을 한 벌로 유지한다. 두 벌이 되면
         //   한쪽만 고쳐지는 날 '실패했는데 좌석이 남는' 또는 '보류인데 닫히는' 비대칭이 생긴다.
@@ -22334,7 +22379,7 @@ fn run_reinject(
         Ok(()) => 0,
         Err(e) => {
             eprintln!("error: {e}");
-            1
+            exit_for_error(&e) // ★(B-360 R2) 91 for an unknown write outcome, else 1
         }
     }
 }

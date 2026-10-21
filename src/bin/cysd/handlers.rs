@@ -4017,36 +4017,61 @@ fn bind_held_and_write(
         }
     }
     crate::agent_write::test_wait_settled(&handle);
-    // ★(B-360) The journal verdict is the writer's first step: a refusal there is an error reply, not `sent:true`.
-    let barrier = match journal_barrier_verdict(id, &handle) {
-        Ok(b) => b,
-        Err(refused) => return refused,
-    };
+    // ★(B-360) `sent:true` only when the journal wrote the record; a refusal and an unknown outcome are errors.
+    match journal_barrier_verdict(id, &handle, sid) {
+        Ok(()) => {}
+        Err(BarrierReply::Refused(reply)) => return reply,
+        Err(BarrierReply::Unknown(reply)) => {
+            *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch()); // accepted into the writer queue
+            return reply;
+        }
+    }
     *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch());
     ok_response(
         id,
-        json!({"surface_id": sid, "key": key, "sent": true, "request_id": body.request_id, "bound": how,
-               "journal_barrier": barrier}),
+        json!({"surface_id": sid, "key": key, "sent": true, "request_id": body.request_id, "bound": how}),
     )
 }
 
-/// ★(B-360) Wait (bounded) for the writer's journal barrier on a handed-off direct agent job, after `input_gate` is
-/// released. `Err` is the error reply for a journal refusal (zero bytes were written, nothing is retained — the caller
-/// sends again); `Ok` is the reply field: `"passed"`, or `"pending"` when the seat's writer did not reach the job
-/// within the budget (reported as before: the write may still happen).
-fn journal_barrier_verdict(id: &Value, handle: &crate::agent_write::Request) -> Result<&'static str, Value> {
-    let budget = std::time::Duration::from_millis(crate::agent_write::JOURNAL_BARRIER_BUDGET_MS);
-    match crate::agent_write::await_journal_barrier(handle, budget) {
-        crate::agent_write::JournalBarrier::Passed => Ok("passed"),
-        crate::agent_write::JournalBarrier::Pending => Ok("pending"),
-        crate::agent_write::JournalBarrier::Refused(reason) => Err(err_response(
+/// ★(B-360) What the caller of a handed-off direct agent job is told, after a bounded wait for the writer's journal
+/// barrier (taken after `input_gate` is released). Three outcomes, never merged:
+/// `Ok(())` = PASSED, the journal wrote the record - the only outcome that may be reported as `sent:true`;
+/// `Err(Refused)` = zero bytes were written and nothing is retained - safe to send again;
+/// `Err(Unknown)` = the seat's writer did not reach the job within the budget - it is still queued and may still be typed,
+/// so it must NOT be sent again (a retry can type it twice). The write itself proceeds unchanged in every case.
+enum BarrierReply {
+    Refused(Value),
+    Unknown(Value),
+}
+
+fn journal_barrier_verdict(id: &Value, handle: &crate::agent_write::Request, sid: u64) -> Result<(), BarrierReply> {
+    let budget_ms = crate::agent_write::JOURNAL_BARRIER_BUDGET_MS;
+    match crate::agent_write::await_journal_barrier(handle, std::time::Duration::from_millis(budget_ms)) {
+        crate::agent_write::JournalBarrier::Passed => Ok(()),
+        crate::agent_write::JournalBarrier::Refused(reason) => Err(BarrierReply::Refused(err_response(
             id,
             cys::ERR_JOURNAL_UNAVAILABLE,
             &format!(
-                "zero bytes written: the writer journal refused this write ({reason}); nothing was typed - \
-                 send it again once the journal is writable"
+                "zero bytes written: the writer journal refused this write ({reason}); nothing was typed - it is safe \
+                 to send it again once the journal is writable"
             ),
-        )),
+        ))),
+        crate::agent_write::JournalBarrier::Pending => {
+            let rid = &handle.id;
+            Err(BarrierReply::Unknown(err_response(
+                id,
+                cys::ERR_WRITE_OUTCOME_UNKNOWN,
+                &format!(
+                    "outcome unknown: the seat's writer had not reached this write (request {rid}) within {budget_ms} ms; \
+                     it is still queued and may still be typed. Do NOT send it again - a retry can type it twice. To \
+                     find out whether it landed: read the seat (cys read-screen --surface surface:{sid}); a later \
+                     surface.write_refused event for request {rid} (cys events) means it was not typed and is safe to \
+                     send again; if the daemon restarts first, a write that had started is listed by the \
+                     queue.reconciliation RPC as journal_inconclusive (no CLI command reads it) and one that had not \
+                     started was not typed"
+                ),
+            )))
+        }
     }
 }
 
@@ -7199,14 +7224,17 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                 let gone = surface.submit_assoc.lock().unwrap_or_else(|e| e.into_inner()).drain_all();
                 dispose_held_bodies(daemon, sid, gone, "cleared", None, std::time::Instant::now());
             }
-            let mut barrier = None;
             if let Some(h) = &agent_handle {
                 // Ticket, echo window and `surface.input_injected` are the settlement's (after the terminal).
                 crate::agent_write::test_wait_settled(h);
-                // ★(B-360) A journal refusal is an error reply, not `sent:true` (all agent intents of send_text).
-                match journal_barrier_verdict(&id, h) {
-                    Ok(b) => barrier = Some(b),
-                    Err(refused) => return Reply::Single(refused),
+                // ★(B-360) `sent:true` only when the journal wrote the record (all agent intents of send_text).
+                match journal_barrier_verdict(&id, h, sid) {
+                    Ok(()) => {}
+                    Err(BarrierReply::Refused(reply)) => return Reply::Single(reply),
+                    Err(BarrierReply::Unknown(reply)) => {
+                        *surface.last_cmd_ack.lock().unwrap() = Some(crate::state::now_epoch()); // accepted, queued
+                        return Reply::Single(reply);
+                    }
                 }
             } else if let Some(x) = request_pair_key(daemon, verified_from, &params) {
                 surface.clear_return_ticket(x);
@@ -7270,9 +7298,6 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             let mut result = json!({"surface_id": sid, "sent": true});
             if let Some(h) = &agent_handle {
                 result["request_id"] = json!(h.id);
-            }
-            if let Some(b) = barrier {
-                result["journal_barrier"] = json!(b);
             }
             Reply::Single(ok_response(&id, result))
         }
