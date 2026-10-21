@@ -44709,4 +44709,278 @@ mod b360_tests {
         assert_eq!((r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark"), rep.injected), (1, 1, 1));
         assert!(r2p_unknown_entries(&pack.dir).is_empty(), "the stale unknown entry was kept: {:?}", r2p_unknown_entries(&pack.dir));
     }
+
+    /// Area P · head condition (a): a bare-shell seat — the agent record is there but no live agent (`agent_alive` false)
+    /// or the pane exited, i.e. `reinject_check_should_skip_bare_shell` would skip it — holding an unknown entry of the
+    /// SAME directive is never pinged and never injected, and the entry stays unknown.
+    /// RED on 11717c44: the pending pass reads deferred entries only and removes the file, so the entry is lost.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p13_a_bare_shell_seat_is_never_pinged_or_injected_and_stays_unknown() {
+        let mut failures = Vec::new();
+        for (name, alive, exited) in [("agent_alive=false", false, false), ("exited", true, true)] {
+            let pack = R2cPack::new();
+            let daemon = R2cDaemon::start(move |method, _| match method {
+                "system.topology" => r2c_ok(json!({"saved": [{"role": "worker"}]})),
+                "control.dashboard" => r2c_ok(json!({"fleet": [
+                    {"surface_id": 7, "role": "worker", "state": "idle", "idle_secs": 60, "agent_status": "idle"}]})),
+                "surface.list" => r2c_ok(json!({"surfaces": [{"surface_id": 7, "surface_ref": "surface:7", "role": "worker",
+                    "agent": "claude", "agent_alive": alive, "exited": exited, "awakened_at": 1.0}]})),
+                "surface.read_text" => r2c_ok(json!({"text": "", "latest_cursor": 40})),
+                "surface.wait_for" => r2c_ok(json!({"matched": true})),
+                _ => r2c_ok(json!({})),
+            });
+            let base = pack.dir.clone();
+            let after = r2c_in_env(&daemon, &pack, || {
+                let hash = sha256_hex(&compose_directive("worker").expect("directive"));
+                let entry = json!({"surface_id": 7, "role": "worker", "directive_hash": hash, "request_id": "w1-2", "at": 1});
+                std::fs::write(
+                    reinject_pending_path(&base),
+                    json!({"pack_version": "9.9.9", "deferred": [], "unknown": [entry]}).to_string(),
+                )
+                .unwrap();
+                let _ = consume_reinject_pending(&base);
+                r2p_unknown_entries(&base)
+            });
+            let calls = daemon.calls();
+            let typed = r2c_count(&calls, "surface.send_text") + r2c_count(&calls, "surface.send_key");
+            if typed != 0 || r2c_count(&calls, "reinject.mark") != 0 {
+                failures.push(format!("{name}: {typed} writes / marks to a bare shell (want none)"));
+            }
+            if after.len() != 1 || after[0]["request_id"] != "w1-2" {
+                failures.push(format!("{name}: the entry did not stay unknown: {after:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The production text of this file with every comment, string, raw string, byte string and char literal blanked
+    /// (newlines and byte offsets kept), and the spans of every `#[cfg(test)]` item (brace-balanced on that text).
+    fn r2r_lex_production(src: &str) -> (Vec<u8>, Vec<(usize, usize)>) {
+        let b = src.as_bytes();
+        let mut out = b.to_vec();
+        let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+            for c in out.iter_mut().take(to).skip(from) {
+                if *c != b'\n' {
+                    *c = b' ';
+                }
+            }
+        };
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'/' && b.get(i + 1) == Some(&b'/') {
+                let end = src[i..].find('\n').map(|n| i + n).unwrap_or(b.len());
+                blank(&mut out, i, end);
+                i = end;
+            } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                let (mut depth, mut j) = (1, i + 2);
+                while j < b.len() && depth > 0 {
+                    if b[j] == b'/' && b.get(j + 1) == Some(&b'*') {
+                        depth += 1;
+                        j += 2;
+                    } else if b[j] == b'*' && b.get(j + 1) == Some(&b'/') {
+                        depth -= 1;
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                blank(&mut out, i, j);
+                i = j;
+            } else if (c == b'r' || (c == b'b' && b.get(i + 1) == Some(&b'r')))
+                && (i == 0 || !is_ident(b[i - 1]))
+                && {
+                    let k = if c == b'b' { i + 2 } else { i + 1 };
+                    let mut h = k;
+                    while b.get(h) == Some(&b'#') {
+                        h += 1;
+                    }
+                    b.get(h) == Some(&b'"')
+                }
+            {
+                let k = if c == b'b' { i + 2 } else { i + 1 };
+                let mut h = k;
+                while b[h] == b'#' {
+                    h += 1;
+                }
+                let close = format!("\"{}", "#".repeat(h - k));
+                let end = src[h + 1..].find(&close).map(|n| h + 1 + n + close.len()).unwrap_or(b.len());
+                blank(&mut out, i, end);
+                i = end;
+            } else if c == b'"' {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b'"' {
+                    j += if b[j] == b'\\' { 2 } else { 1 };
+                }
+                blank(&mut out, i, j + 1);
+                i = j + 1;
+            } else if c == b'\'' {
+                // char literal ('x', '\n', '\u{..}', multi-byte 'é') vs lifetime ('a)
+                let end = if b.get(i + 1) == Some(&b'\\') {
+                    src[i + 2..].find('\'').map(|n| i + 2 + n + 1)
+                } else {
+                    let ch_len = src[i + 1..].chars().next().map(char::len_utf8).unwrap_or(1);
+                    (b.get(i + 1 + ch_len) == Some(&b'\'')).then_some(i + 2 + ch_len)
+                };
+                match end {
+                    Some(e) => {
+                        blank(&mut out, i, e);
+                        i = e;
+                    }
+                    None => i += 1,
+                }
+            } else {
+                i += 1;
+            }
+        }
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let mut tests = Vec::new();
+        let mut from = 0;
+        while let Some(n) = text[from..].find("#[cfg(test)]") {
+            let at = from + n;
+            let rest = &text[at..];
+            let semi = rest.find(';');
+            let brace = rest.find('{');
+            let end = match (brace, semi) {
+                (Some(br), Some(se)) if se < br => at + se + 1,
+                (Some(br), _) => {
+                    let mut depth = 0usize;
+                    let mut e = at + br;
+                    for (k, ch) in text[at + br..].char_indices() {
+                        if ch == '{' {
+                            depth += 1;
+                        } else if ch == '}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                e = at + br + k + 1;
+                                break;
+                            }
+                        }
+                    }
+                    e
+                }
+                (None, Some(se)) => at + se + 1,
+                (None, None) => text.len(),
+            };
+            tests.push((at, end));
+            from = end.max(at + 1);
+        }
+        (out, tests)
+    }
+
+    /// Every production fn of the lexed text: (name, start, end-of-body).
+    fn r2r_fn_spans(text: &str, tests: &[(usize, usize)]) -> Vec<(String, usize, usize)> {
+        let in_tests = |p: usize| tests.iter().any(|&(a, e)| a <= p && p < e);
+        let mut fns = Vec::new();
+        let mut from = 0;
+        while let Some(n) = text[from..].find("fn ") {
+            let at = from + n;
+            from = at + 3;
+            if at > 0 && (text.as_bytes()[at - 1].is_ascii_alphanumeric() || text.as_bytes()[at - 1] == b'_') {
+                continue;
+            }
+            if in_tests(at) {
+                continue;
+            }
+            let name: String = text[at + 3..].chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if name.is_empty() {
+                continue;
+            }
+            let (Some(br), semi) = (text[at..].find('{'), text[at..].find(';')) else { continue };
+            if semi.is_some_and(|s| s < br) {
+                continue; // a declaration without a body
+            }
+            let mut depth = 0usize;
+            let mut end = at + br;
+            for (k, ch) in text[at + br..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                } else if ch == '}' {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = at + br + k + 1;
+                        break;
+                    }
+                }
+            }
+            fns.push((name, at, end));
+        }
+        fns
+    }
+
+    /// The innermost production fns that mention the identifier `name` (definition excluded).
+    fn r2r_callers(text: &str, fns: &[(String, usize, usize)], tests: &[(usize, usize)], name: &str) -> Vec<String> {
+        let b = text.as_bytes();
+        let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(n) = text[from..].find(name) {
+            let at = from + n;
+            from = at + name.len();
+            if (at > 0 && is_ident(b[at - 1])) || b.get(at + name.len()).is_some_and(|c| is_ident(*c)) {
+                continue;
+            }
+            if at >= 3 && &text[at - 3..at] == "fn " {
+                continue;
+            }
+            if tests.iter().any(|&(a, e)| a <= at && at < e) {
+                continue;
+            }
+            let inner = fns.iter().filter(|(_, a, e)| *a <= at && at < *e).min_by_key(|(_, a, e)| e - a);
+            if let Some((f, _, _)) = inner {
+                if !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Area P · head condition (b): the pending pass's reconciliation (`consume_reinject_pending`, its core, and the
+    /// presence ping `directive_presence`) is NOT reachable from boot, restore, launch-agent or node-recover: kept panes are
+    /// record-only. A call-graph pin over the production region (comments/strings blanked, `#[cfg(test)]` items cut): the
+    /// transitive callers of the three, stopping at the `run` dispatch, contain none of `run_boot`, `run_restore`,
+    /// `run_launch_agent_opts`, `run_launch_agent`, `run_node_recover`.
+    /// Positive controls: the scanner finds the edges it must (run_pack_update → consume_reinject_pending →
+    /// directive_presence, and run_restore → run_launch_agent_opts — a root edge, so it would see a forbidden one).
+    /// RED on 11717c44: `directive_presence` does not exist there (its edge control fails); the exclusion itself holds.
+    #[test]
+    fn b360_r2r_p14_the_reconciliation_is_not_reachable_from_boot_restore_launch_or_node_recover() {
+        let src = include_str!("cys.rs");
+        let (lexed, tests) = r2r_lex_production(src);
+        let text = String::from_utf8_lossy(&lexed).into_owned();
+        let fns = r2r_fn_spans(&text, &tests);
+        let callers = |n: &str| r2r_callers(&text, &fns, &tests, n);
+        let mut failures = Vec::new();
+        if !callers("consume_reinject_pending").contains(&"run_pack_update".to_string()) {
+            failures.push(format!("control: run_pack_update → consume_reinject_pending not found: {:?}", callers("consume_reinject_pending")));
+        }
+        if !callers("directive_presence").contains(&"consume_reinject_pending".to_string()) {
+            failures.push(format!("control: consume_reinject_pending → directive_presence not found: {:?}", callers("directive_presence")));
+        }
+        if !callers("run_launch_agent_opts").contains(&"run_restore".to_string()) {
+            failures.push("control: run_restore → run_launch_agent_opts not found (the scanner cannot see root edges)".into());
+        }
+        let roots = ["run_boot", "run_restore", "run_launch_agent_opts", "run_launch_agent", "run_node_recover"];
+        let mut seen: Vec<String> = Vec::new();
+        let mut queue: Vec<String> =
+            ["consume_reinject_pending", "consume_reinject_pending_core", "directive_presence"].map(String::from).to_vec();
+        while let Some(f) = queue.pop() {
+            for c in callers(&f) {
+                if c == "run" || seen.contains(&c) {
+                    continue; // `run` is the dispatch (each arm is its own command)
+                }
+                seen.push(c.clone());
+                queue.push(c);
+            }
+        }
+        for r in roots {
+            if seen.iter().any(|s| s == r) {
+                failures.push(format!("{r} reaches the reconciliation (transitive callers: {seen:?})"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
 }
