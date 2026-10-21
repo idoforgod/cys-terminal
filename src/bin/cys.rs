@@ -47135,4 +47135,207 @@ mod b360_tests {
         let close = src.find("Ok(BootVerdict::LaunchFailed { evidence: e }) | Err(e) => {").expect("closing arm");
         assert!(arm < close && !src[arm..close].contains("surface.close"));
     }
+
+    // ── ★(B-360 R2 revise) carrier (A): one queued `[kept-pane]` notice to master per outermost command run ─────────────
+    // The head's approved extra carrier for codex issue 3 (the JSON field and the record file have no automated reader):
+    // a durable QUEUED notice to the `master` role (the queued send path `cys send --queued --to master` uses), text
+    // `[kept-pane] key=#<16 hex> …` — the key derived like cysd's opaque identifiers (FNV-1a 64 over the raw identity,
+    // `#{:016x}`; here the identity is the record file's absolute path) — with the count of THIS run's records, the command,
+    // the roles, the record file path and the check hints. Flood bound: one notice per outermost run (nested launches send
+    // none); skipped when master's queue already holds a pending item with the same `key=#`. Best effort: the exit code and
+    // stdout are identical whether the notice is sent or not; only a stderr line says why not.
+
+    /// FNV-1a 64 → `#{:016x}` — the derivation of cysd's `opaque_label` (alert_route.rs), recomputed here so this
+    /// compiles on ab8afa64.
+    fn r2n_key(raw: &str) -> String {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in raw.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        format!("#{h:016x}")
+    }
+
+    /// How the fake daemon treats the notice.
+    #[cfg(unix)]
+    #[derive(Clone)]
+    enum R2nMaster {
+        /// master is surface:1, its queue is empty, the queued send is accepted
+        Ok,
+        /// master resolves, but the queued send gets this reply
+        SendFails(Value),
+        /// `system.resolve_role` for master fails
+        Unresolvable,
+        /// master's queue already holds a pending notice carrying this run's key
+        AlreadyPending,
+    }
+
+    /// `cys restore` (child) of `roles` with the master behaviour `master`. Returns (exit, stdout with the pack path
+    /// normalised, stderr, requests, the record path the child used).
+    #[cfg(unix)]
+    fn r2n_restore(roles: Vec<(&'static str, R2rMode)>, master: R2nMaster) -> (i32, String, String, Vec<(String, Value)>, String) {
+        let pack = R2cPack::new();
+        std::fs::write(pack.dir.join("pack/directives/CSO_DIRECTIVE.md"), "C").unwrap();
+        let record_path = pack.dir.join(".kept-pane-records.jsonl").to_string_lossy().into_owned();
+        let key = r2n_key(&record_path);
+        let cwd = pack.dir.clone();
+        let live: Vec<Value> = roles
+            .iter()
+            .filter_map(|(r, m)| match m {
+                R2rMode::InSeat { sid, .. } => Some(json!({"role": r, "seat": "empty", "surface_id": sid, "env_injected": true})),
+                _ => None,
+            })
+            .collect();
+        let saved: Vec<Value> = roles.iter().map(|(r, _)| json!({"role": r, "agent": "b360agent", "cwd": cwd})).collect();
+        let modes: std::collections::HashMap<u64, (Value, Value)> = roles
+            .iter()
+            .filter_map(|(_, m)| match m {
+                R2rMode::InSeat { sid, launch, directive } | R2rMode::Fresh { sid, launch, directive } => {
+                    Some((*sid, (launch.clone(), directive.clone())))
+                }
+                R2rMode::FreshCreateFails => None,
+            })
+            .collect();
+        let create: std::collections::HashMap<&'static str, Option<u64>> = roles
+            .iter()
+            .filter_map(|(r, m)| match m {
+                R2rMode::Fresh { sid, .. } => Some((*r, Some(*sid))),
+                R2rMode::FreshCreateFails => Some((*r, None)),
+                R2rMode::InSeat { .. } => None,
+            })
+            .collect();
+        let mut pastes: std::collections::HashMap<u64, usize> = Default::default();
+        let sids: Vec<u64> = modes.keys().copied().collect();
+        let daemon = R2cDaemon::start(move |method, p| {
+            let sid = p["surface_id"].as_u64().unwrap_or(0);
+            match method {
+                "system.topology" => r2c_ok(json!({"live": live, "saved": saved, "tombstones": []})),
+                "system.resolve_role" if p["role"] == "master" => match &master {
+                    R2nMaster::Unresolvable => r2c_reply("role_not_found: no live seat holds role master"),
+                    _ => r2c_ok(json!({"surface_id": 1})),
+                },
+                "queue.list" if sid == 1 => match &master {
+                    R2nMaster::AlreadyPending => r2c_ok(json!({"entries": [
+                        {"index": 0, "preview": format!("[kept-pane] key={key} 1 pane(s) kept"), "text": format!("[kept-pane] key={key} 1 pane(s) kept by an earlier run")}]})),
+                    _ => r2c_ok(json!({"entries": []})),
+                },
+                "surface.send_text" if sid == 1 => match &master {
+                    R2nMaster::SendFails(reply) => reply.clone(),
+                    _ => r2c_ok(json!({"queued": true})),
+                },
+                "surface.create" => match create.get(p["role"].as_str().unwrap_or("")) {
+                    Some(Some(new)) => r2c_ok(json!({"surface_id": new})),
+                    _ => r2c_reply("b360_no_spawn: this fake daemon makes no new surface for this role"),
+                },
+                "surface.list" => {
+                    let rows: Vec<Value> = sids
+                        .iter()
+                        .map(|s| json!({"surface_id": s, "surface_ref": format!("surface:{s}"), "exited": false,
+                                        "agent_alive": true, "line_count": 40}))
+                        .collect();
+                    r2c_ok(json!({"surfaces": rows}))
+                }
+                "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                     "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+                "surface.send_text" => {
+                    let n = pastes.entry(sid).or_insert(0);
+                    *n += 1;
+                    let Some((launch, directive)) = modes.get(&sid) else { return r2c_ok(json!({})) };
+                    if *n == 1 { launch.clone() } else { directive.clone() }
+                }
+                _ => r2c_ok(json!({})),
+            }
+        });
+        let (rc, out, err) = r2c_child("restore", &daemon, &pack.envs());
+        let out = out.replace(&pack.dir.to_string_lossy().into_owned(), "<pack>");
+        (rc, out, err, daemon.calls(), record_path)
+    }
+
+    /// The queued notices sent to master (surface:1).
+    #[cfg(unix)]
+    fn r2n_notices(calls: &[(String, Value)]) -> Vec<Value> {
+        calls.iter().filter(|(m, p)| m == "surface.send_text" && p["surface_id"] == 1).map(|(_, p)| p.clone()).collect()
+    }
+
+    /// Carrier (A) · success and the N-pane bound: one kept pane → exactly one QUEUED notice to master with the
+    /// `[kept-pane] key=#…` token (the key of this run's record path), the count, the command, the role, the record path
+    /// and the check hints; two kept panes (two nested fresh launches inside one restore) → still ONE notice, count 2.
+    /// RED on ab8afa64: no notice at all.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_c1_one_queued_kept_pane_notice_per_run_with_the_count_and_the_record_path() {
+        let mut failures = Vec::new();
+        for (name, roles, count) in [
+            ("one pane", vec![("worker", R2rMode::InSeat { sid: 7, launch: r2c_ok(json!({})), directive: r2c_reply(&pending_err()) })], 1),
+            ("two panes", vec![
+                ("worker", R2rMode::Fresh { sid: 9, launch: r2c_ok(json!({})), directive: r2c_reply(&pending_err()) }),
+                ("cso", R2rMode::Fresh { sid: 10, launch: r2c_ok(json!({})), directive: r2c_reply(&journal_err()) }),
+            ], 2),
+        ] {
+            let (_rc, _out, err, calls, record_path) = r2n_restore(roles, R2nMaster::Ok);
+            let notices = r2n_notices(&calls);
+            if notices.len() != 1 {
+                failures.push(format!("{name}: {} notices to master, want exactly 1\n{err}", notices.len()));
+                continue;
+            }
+            let n = &notices[0];
+            let text = n["text"].as_str().unwrap_or("");
+            let head = format!("[kept-pane] key={} {count} ", r2n_key(&record_path));
+            if n["queued"] != true || !text.starts_with(&head) {
+                failures.push(format!("{name}: not a queued `{head}…` notice: {n}"));
+            }
+            for must in [record_path.as_str(), "restore", "worker", "cys read-screen --surface", "cys reinject --role worker --check"] {
+                if !text.contains(must) {
+                    failures.push(format!("{name}: the notice does not carry {must:?}: {text}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Carrier (A) · best effort, pinned: the send fails (daemon unavailable), the queue refuses (blocked), master is not
+    /// resolvable, or master already has a pending notice with this key (skip) — each: the SAME exit and the SAME stdout as
+    /// the successful run, nothing sent (or the one failed attempt), and one stderr line naming why the notice was not sent.
+    /// RED on ab8afa64: no stderr line (there is no notice to fail).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_c2_a_failed_or_skipped_notice_changes_neither_the_exit_nor_stdout_and_says_why() {
+        let roles = || vec![("worker", R2rMode::InSeat { sid: 7, launch: r2c_ok(json!({})), directive: r2c_reply(&pending_err()) })];
+        let (base_rc, base_out, _, base_calls, _) = r2n_restore(roles(), R2nMaster::Ok);
+        let mut failures = Vec::new();
+        if r2n_notices(&base_calls).len() != 1 {
+            failures.push("baseline: the successful run sent no notice".to_string());
+        }
+        for (name, master, why, attempts) in [
+            ("send unavailable", R2nMaster::SendFails(r2c_reply("rpc_unavailable: the daemon did not answer the queued send")), "rpc_unavailable", 1),
+            ("queue blocked", R2nMaster::SendFails(r2c_reply("queue_full: the master queue is blocked")), "queue_full", 1),
+            ("master unresolvable", R2nMaster::Unresolvable, "role_not_found", 0),
+            ("already pending", R2nMaster::AlreadyPending, "already pending", 0),
+        ] {
+            let (rc, out, err, calls, _) = r2n_restore(roles(), master);
+            if rc != base_rc || out != base_out {
+                failures.push(format!("{name}: exit {rc} vs {base_rc}, stdout differs: {}", out != base_out));
+            }
+            if r2n_notices(&calls).len() != attempts {
+                failures.push(format!("{name}: {} send attempts, want {attempts}", r2n_notices(&calls).len()));
+            }
+            let line = err.lines().find(|l| l.starts_with("[kept-pane]") && l.contains("not sent")).unwrap_or_default();
+            if !line.contains(why) {
+                failures.push(format!("{name}: no stderr line naming why ({why}): {line:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Carrier (A) · no kept-pane record in the run → no notice, and master is not even looked up (passes on ab8afa64 too:
+    /// the fixture's restore reaches a clean end).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_c3_no_kept_pane_record_means_no_notice_and_no_master_lookup() {
+        let (rc, out, _err, calls, _) =
+            r2n_restore(vec![("worker", R2rMode::InSeat { sid: 7, launch: r2c_ok(json!({})), directive: r2c_ok(json!({})) })], R2nMaster::Ok);
+        assert_eq!(rc, 0, "{out}");
+        assert!(r2n_notices(&calls).is_empty());
+        assert!(!calls.iter().any(|(m, p)| m == "system.resolve_role" && p["role"] == "master"), "master looked up without a record");
+    }
 }
