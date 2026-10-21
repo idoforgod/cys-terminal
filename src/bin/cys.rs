@@ -48087,4 +48087,336 @@ mod b360_tests {
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
+
+    /// Area R · worker-7's ruling on the decision point (spec §10): when the caller could NOT remove the stale ready
+    /// marker (`ready_withheld.remove_error` set), the notice must not claim it is withheld — it says `READY MARKER COULD
+    /// NOT BE REMOVED: <marker> (<error>)` and never `READY MARKER WITHHELD`, still under the withheld key, still one
+    /// notice with the count and the record path. RED on af41d65c: the subcommand does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k9_kept_pane_notice_says_could_not_be_removed_when_the_marker_unlink_failed() {
+        let input = json!({"command": "bootstrap",
+                           "records": [{"surface_id": 7, "role": "worker", "write": "adoption", "outcome": "unknown"}],
+                           "ready_withheld": {"marker": R3_MARKER, "lane": "base", "consequences": ["c-one"],
+                                              "remove_error": "Permission denied (os error 13)"}})
+        .to_string();
+        let n = r3_notice(&input, false, |_| vec![], true);
+        let notices = r3_notices(&n.calls);
+        let head = format!("[kept-pane] key={} 1 pane(s) kept by `cys bootstrap`", r3_withheld_key(&n.record_path));
+        let said = format!("READY MARKER COULD NOT BE REMOVED: {R3_MARKER} (Permission denied (os error 13))");
+        assert!(
+            n.rc == 0
+                && notices.len() == 1
+                && notices[0].starts_with(&head)
+                && notices[0].contains(&said)
+                && notices[0].contains("c-one")
+                && !notices[0].contains("READY MARKER WITHHELD"),
+            "exit {} notices {notices:?} (want one starting {head:?} saying {said:?}, never WITHHELD)\n{}",
+            n.rc,
+            n.err
+        );
+    }
+
+    // ── ★(B-360 R3 · option 2 · A6) the R2 unknown entries of `.pack-reinject-pending.json` are keyed ──────────────────
+    // FIX-SPEC-option2-v2 §8 A6 (+ FINDING-pending-file-shared-surface-number-attribution.md): the file is shared by every
+    // lane (`pack_state_base()` = the parent of the pack dir) and surface numbers are per daemon, so an unknown entry is
+    // identified by {owner.socket (lane), owner.daemon_started_at, surface_id}; role and directive hash are GUARDS. These
+    // specimens compile on af41d65c: they seed the file as JSON and read the fake daemon's RPC log and the file.
+
+    /// The scripted seat of [`r3p_daemon`]; the test changes it between runs.
+    #[cfg(unix)]
+    struct R3pSeat {
+        directive: Value,
+        ping: R2pPing,
+        /// `org.status` → `daemon.started_at` (None: the key is absent, as from an older daemon)
+        started_at: Option<f64>,
+        /// the role `control.dashboard` reports for surface:7
+        role: &'static str,
+    }
+
+    #[cfg(unix)]
+    type R3pCtl = std::sync::Arc<std::sync::Mutex<R3pSeat>>;
+
+    #[cfg(unix)]
+    fn r3p_ctl(directive: Value, ping: R2pPing, started_at: Option<f64>, role: &'static str) -> R3pCtl {
+        std::sync::Arc::new(std::sync::Mutex::new(R3pSeat { directive, ping, started_at, role }))
+    }
+
+    /// [`r2p_daemon`] plus `org.status` (daemon instance `ctl.started_at`) and a scripted fleet role for surface:7.
+    #[cfg(unix)]
+    fn r3p_daemon(ctl: R3pCtl, session: std::path::PathBuf) -> R2cDaemon {
+        let mut marker = Value::Null;
+        R2cDaemon::start(move |method, p| {
+            let seat = ctl.lock().unwrap_or_else(|e| e.into_inner());
+            match method {
+                "org.status" => {
+                    let mut daemon = json!({"version": "9.9.9"});
+                    if let Some(t) = seat.started_at {
+                        daemon["started_at"] = json!(t);
+                    }
+                    r2c_ok(json!({"daemon": daemon, "surfaces": [
+                        {"surface_id": 7, "role": seat.role, "registered_session_id": null, "created_at": 50.0, "exited": false}]}))
+                }
+                "system.topology" => {
+                    let mut row = json!({"role": seat.role});
+                    if !marker.is_null() {
+                        row["pack_reinject"] = marker.clone();
+                    }
+                    r2c_ok(json!({"saved": [row]}))
+                }
+                "control.dashboard" => r2c_ok(json!({"fleet": [
+                    {"surface_id": 7, "role": seat.role, "state": "idle", "idle_secs": 60, "agent_status": "idle"}]})),
+                "surface.list" => r2c_ok(json!({"surfaces": [{
+                    "surface_id": 7, "surface_ref": "surface:7", "role": seat.role, "agent": "claude", "exited": false,
+                    "agent_alive": true, "awakened_at": 1.0,
+                    "usage": {"source": "transcript", "session_file": session.to_string_lossy()}}]})),
+                "surface.read_text" => r2c_ok(json!({"text": "", "latest_cursor": 40, "line_count": 40})),
+                "surface.send_text" => {
+                    let text = p["text"].as_str().unwrap_or("");
+                    if !text.contains(REINJECT_PING_HEAD) {
+                        return seat.directive.clone();
+                    }
+                    if seat.ping == R2pPing::NoAck {
+                        use std::io::Write;
+                        let user = json!({"type": "user", "message": {"content": text}});
+                        let answer = json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}});
+                        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&session) {
+                            let _ = writeln!(f, "{user}\n{answer}");
+                        }
+                    }
+                    r2c_ok(json!({}))
+                }
+                "surface.wait_for" => r2c_ok(json!({"matched": seat.ping == R2pPing::Ack})),
+                "reinject.mark" => {
+                    marker = json!({"pack_version": p["pack_version"], "directive_hash": p["directive_hash"]});
+                    r2c_ok(json!({}))
+                }
+                _ => r2c_ok(json!({})),
+            }
+        })
+    }
+
+    /// Another lane's socket (a dept lane: `cys-dept-` component), as an owner field would carry it.
+    #[cfg(unix)]
+    const R3P_FOREIGN_SOCK: &str = "/x/.local/state/cys-dept-zz/cys.sock";
+
+    /// An unknown entry as the wire carries it; `owner` = None writes a legacy (R2, ownerless) entry.
+    #[cfg(unix)]
+    fn r3p_entry(role: &str, hash: &str, at: u64, owner: Option<(&str, f64)>) -> Value {
+        let mut e = json!({"surface_id": 7, "role": role, "directive_hash": hash, "request_id": "w1-2", "at": at});
+        if let Some((sock, started)) = owner {
+            e["owner"] = json!({"writer": "cys", "pid": 4242, "socket": sock, "daemon_started_at": started});
+            e["session_id"] = Value::Null;
+        }
+        e
+    }
+
+    /// Seeds the pending file with `unknown` (and no deferred node), in the layout `write_reinject_pending` writes.
+    #[cfg(unix)]
+    fn r3p_seed(base: &std::path::Path, unknown: Vec<Value>) -> String {
+        let doc = json!({"pack_version": "9.9.9", "deferred": [], "unknown": unknown});
+        let text = serde_json::to_string_pretty(&doc).unwrap();
+        std::fs::write(reinject_pending_path(base), &text).unwrap();
+        text
+    }
+
+    /// The pending pass over `entry` (seeded alone) against `ctl`: returns (pass report as Debug text, requests, the file's
+    /// unknown list after, the file text after, the file text seeded).
+    #[cfg(unix)]
+    fn r3p_consume(pack: &R2cPack, ctl: R3pCtl, entry: impl FnOnce() -> Value) -> (String, Vec<(String, Value)>, Vec<Value>, String, String) {
+        let daemon = r3p_daemon(ctl, r2p_session(pack));
+        let (rep, seeded) = r2c_in_env(&daemon, pack, || {
+            let seeded = r3p_seed(&pack.dir, vec![entry()]);
+            (format!("{:?}", consume_reinject_pending(&pack.dir)), seeded)
+        });
+        let after = std::fs::read_to_string(reinject_pending_path(&pack.dir)).unwrap_or_default();
+        (rep, daemon.calls(), r2p_unknown_entries(&pack.dir), after, seeded)
+    }
+
+    /// The worker directive's hash in `pack` (as the fix and today's code compute it).
+    #[cfg(unix)]
+    fn r3p_hash(role: &str) -> String {
+        sha256_hex(&compose_directive(role).expect("directive"))
+    }
+
+    /// A6 consume rule 1 · LANE: another lane's entry (owner.socket of a dept lane) is left UNTOUCHED — nothing pinged,
+    /// typed or marked, and its bytes in the file are identical after the pass (same instance, same number, same role,
+    /// same hash, and the seat would ACK: only the lane differs). RED on af41d65c: the pass pings, marks and drops it.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_x1_another_lanes_unknown_entry_is_left_untouched() {
+        let pack = R2cPack::new();
+        let ctl = r3p_ctl(r2c_ok(json!({})), R2pPing::Ack, Some(500.0), "worker");
+        let mut seeded_entry = Value::Null;
+        let (rep, calls, after, after_text, seeded_text) = r3p_consume(&pack, ctl, || {
+            seeded_entry = r3p_entry("worker", &r3p_hash("worker"), 1_000, Some((R3P_FOREIGN_SOCK, 500.0)));
+            seeded_entry.clone()
+        });
+        let mut failures = Vec::new();
+        let (directives, pings) = r2p_pastes(&calls);
+        if (directives, pings, r2c_count(&calls, "reinject.mark")) != (0, 0, 0) {
+            failures.push(format!("touched another lane's entry: directives {directives} pings {pings} marks {}", r2c_count(&calls, "reinject.mark")));
+        }
+        if after != vec![seeded_entry.clone()] || after_text != seeded_text {
+            failures.push(format!("the entry's bytes changed:\nseeded {seeded_text}\nafter  {after_text}"));
+        }
+        assert!(failures.is_empty(), "{}\n{rep}", failures.join("\n"));
+    }
+
+    /// A6 consume rule 2 · DAEMON INSTANCE: this lane's entry written under daemon instance 100, the daemon is now 200 →
+    /// the pane is gone: resolved (dropped), nothing pinged / typed / marked. RED on af41d65c: the pass pings the number.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_x2_a_new_daemon_instance_resolves_the_entry_without_a_ping() {
+        let pack = R2cPack::new();
+        let ctl = r3p_ctl(r2c_ok(json!({})), R2pPing::NoAck, Some(200.0), "worker");
+        let sock_slot: std::sync::Arc<std::sync::Mutex<String>> = Default::default();
+        let sock = std::sync::Arc::clone(&sock_slot);
+        let (rep, calls, after, _, _) = r3p_consume(&pack, ctl, move || {
+            let s = std::env::var(cys::ENV_SOCKET).unwrap_or_default();
+            *sock.lock().unwrap() = s.clone();
+            r3p_entry("worker", &r3p_hash("worker"), 1_000, Some((&s, 100.0)))
+        });
+        let (directives, pings) = r2p_pastes(&calls);
+        assert!(
+            (directives, pings, r2c_count(&calls, "reinject.mark")) == (0, 0, 0) && after.is_empty() && rep.contains("resolved: 1"),
+            "directives {directives} pings {pings} marks {} · unknown after {after:?} · {rep}",
+            r2c_count(&calls, "reinject.mark")
+        );
+    }
+
+    /// A6 consume rule 4 · ROLE GUARD: same lane, same instance, the number is present but the seat holds `worker` while
+    /// the entry is `cso` → REFUSED: nothing pinged, typed or marked; the entry stays UNKNOWN (in the file, counted). The
+    /// seat would answer the ping without the ACK, so without the guard the cso directive is typed into the worker seat
+    /// (fatal risk 3). RED on af41d65c: the pass pings and types the cso directive.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_x3_a_role_mismatch_is_refused_nothing_typed_still_unknown() {
+        let pack = R2cPack::new();
+        std::fs::write(pack.dir.join("pack/directives/CSO_DIRECTIVE.md"), "C").unwrap();
+        let ctl = r3p_ctl(r2c_ok(json!({})), R2pPing::NoAck, Some(500.0), "worker");
+        let (rep, calls, after, _, _) = r3p_consume(&pack, ctl, || {
+            let s = std::env::var(cys::ENV_SOCKET).unwrap_or_default();
+            r3p_entry("cso", &r3p_hash("cso"), 1_000, Some((&s, 500.0)))
+        });
+        let sends = r2c_count(&calls, "surface.send_text");
+        assert!(
+            sends == 0 && r2c_count(&calls, "reinject.mark") == 0 && after.len() == 1 && after[0]["role"] == "cso" && rep.contains("unknown: 1"),
+            "sends {sends} marks {} · unknown after {after:?} · {rep}",
+            r2c_count(&calls, "reinject.mark")
+        );
+    }
+
+    /// A6 consume rule 5 · DIRECTIVE-HASH GUARD: same lane, same instance, same role, but the entry's `directive_hash`
+    /// differs from the directive that would be injected → NEVER injected from the unknown loop (the accepted choice: it
+    /// stays UNKNOWN; nothing pinged, typed or marked). RED on af41d65c: the stale path (as_deferred → deferred loop →
+    /// Inject, src/bin/cys.rs:24465-24569@af41d65c) types the directive.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_x4_a_hash_mismatch_is_never_injected_from_the_unknown_loop() {
+        let pack = R2cPack::new();
+        let ctl = r3p_ctl(r2c_ok(json!({})), R2pPing::NoAck, Some(500.0), "worker");
+        let (rep, calls, after, _, _) = r3p_consume(&pack, ctl, || {
+            let s = std::env::var(cys::ENV_SOCKET).unwrap_or_default();
+            r3p_entry("worker", "0000-a-directive-that-changed-since", 1_000, Some((&s, 500.0)))
+        });
+        let (directives, pings) = r2p_pastes(&calls);
+        assert!(
+            (directives, pings, r2c_count(&calls, "reinject.mark")) == (0, 0, 0) && after.len() == 1 && rep.contains("unknown: 1"),
+            "directives {directives} pings {pings} marks {} · unknown after {after:?} · {rep}",
+            r2c_count(&calls, "reinject.mark")
+        );
+    }
+
+    /// A6 CONTROL (passes on af41d65c too): same lane, same instance, same role, same hash, the seat answers without the
+    /// ACK (`ReceivedNoAck`) → injected ONCE and marked; the entry is resolved (today's behaviour).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_x5_control_same_lane_instance_role_and_hash_with_no_ack_is_injected_once() {
+        let pack = R2cPack::new();
+        let ctl = r3p_ctl(r2c_ok(json!({})), R2pPing::NoAck, Some(500.0), "worker");
+        let (rep, calls, after, _, _) = r3p_consume(&pack, ctl, || {
+            let s = std::env::var(cys::ENV_SOCKET).unwrap_or_default();
+            r3p_entry("worker", &r3p_hash("worker"), 1_000, Some((&s, 500.0)))
+        });
+        let (directives, pings) = r2p_pastes(&calls);
+        assert!(
+            (directives, pings, r2c_count(&calls, "reinject.mark")) == (1, 1, 1) && after.is_empty(),
+            "directives {directives} pings {pings} marks {} · unknown after {after:?} · {rep}",
+            r2c_count(&calls, "reinject.mark")
+        );
+    }
+
+    /// A6 legacy entry (written by R2, no owner): the `at` rule — (a) the daemon started after the entry (`started_at >
+    /// at + 1`) → gone, resolved, nothing pinged; (b) the daemon is older than the entry → same instance: today's ping →
+    /// ACK → marked (control half, passes on af41d65c too). RED on af41d65c: (a) pings.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_x6_a_legacy_entry_without_owner_uses_the_at_rule() {
+        let mut failures = Vec::new();
+        for (name, at, started_at, want) in [("daemon newer than the entry", 100u64, 200.0, (0, 0, 0)),
+                                            ("daemon older than the entry", 1_000, 100.0, (0, 1, 1))] {
+            let pack = R2cPack::new();
+            let ctl = r3p_ctl(r2c_ok(json!({})), R2pPing::Ack, Some(started_at), "worker");
+            let (rep, calls, after, _, _) = r3p_consume(&pack, ctl, || r3p_entry("worker", &r3p_hash("worker"), at, None));
+            let (directives, pings) = r2p_pastes(&calls);
+            let got = (directives, pings, r2c_count(&calls, "reinject.mark"));
+            if got != want || !after.is_empty() {
+                failures.push(format!("{name}: (directives, pings, marks) {got:?} want {want:?} · unknown after {after:?} · {rep}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A6 · `run_pack_reinject` (codex-1 row 9) and its writer `record_reinject_unknown`: another lane's entry for the SAME
+    /// surface number neither blocks nor is dropped by this lane's node loop — (a) a foreign entry with this directive's
+    /// hash does not suppress this lane's inject (today: `open` skips it); (b) a foreign entry with another hash survives
+    /// this lane's normal decision (today: `drop_reinject_unknown` by number); (c) this lane's inject comes back UNKNOWN →
+    /// the file holds BOTH the foreign entry (bytes unchanged) and this lane's new entry (today: the same-number replace
+    /// drops the foreign one). RED on af41d65c: all three.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_x7_the_node_loop_neither_obeys_nor_drops_another_lanes_entry() {
+        let mut failures = Vec::new();
+        for (name, foreign_hash_is_current, reply, want_directives, want_unknown) in [
+            ("(a) foreign entry, current hash", true, r2c_ok(json!({})), 1usize, 1usize),
+            ("(b) foreign entry, other hash", false, r2c_ok(json!({})), 1, 1),
+            ("(c) foreign entry + this lane UNKNOWN", false, r2c_reply(&pending_err()), 1, 2),
+        ] {
+            let pack = R2cPack::new();
+            let ctl = r3p_ctl(reply, R2pPing::Ack, Some(500.0), "worker");
+            let daemon = r3p_daemon(ctl, r2p_session(&pack));
+            let (foreign, rep) = r2c_in_env(&daemon, &pack, || {
+                let hash = if foreign_hash_is_current { r3p_hash("worker") } else { "0000-other".to_string() };
+                let foreign = r3p_entry("worker", &hash, 1_000, Some((R3P_FOREIGN_SOCK, 500.0)));
+                r3p_seed(&pack.dir, vec![foreign.clone()]);
+                (foreign, format!("{:?}", run_pack_reinject("9.9.9")))
+            });
+            let calls = daemon.calls();
+            let (directives, _pings) = r2p_pastes(&calls);
+            let after = r2p_unknown_entries(&pack.dir);
+            if directives != want_directives {
+                failures.push(format!("{name}: {directives} directive paste(s), want {want_directives} · {rep}"));
+            }
+            if after.len() != want_unknown || !after.contains(&foreign) {
+                failures.push(format!("{name}: the foreign entry did not survive unchanged (want {want_unknown} entries): {after:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// A6 · the deferred-list writer `persist_reinject_pending` (unchanged) carries the unknown list forward; an entry it
+    /// does not own must come back with EVERY key it had (owner, session_id, and any key a newer binary added) — no
+    /// field is dropped by a round trip through this lane's types. RED on af41d65c: `to_json` re-emits five keys only.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_x8_an_entry_round_trips_through_every_writer_with_all_its_keys() {
+        let pack = R2cPack::new();
+        let mut foreign = r3p_entry("worker", "H", 1_000, Some((R3P_FOREIGN_SOCK, 500.0)));
+        foreign["future_key"] = json!({"added": "by a newer binary"});
+        r3p_seed(&pack.dir, vec![foreign.clone()]);
+        persist_reinject_pending(&pack.dir, "9.9.9", &[(8, "cso".to_string())]).unwrap();
+        let after = r2p_unknown_entries(&pack.dir);
+        assert_eq!(after, vec![foreign], "the deferred-list writer changed an entry it carries");
+    }
 }
