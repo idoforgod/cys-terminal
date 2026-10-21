@@ -48452,6 +48452,52 @@ mod b360_tests {
         assert_eq!(after, vec![foreign], "the deferred-list writer changed an entry it carries");
     }
 
+    /// A6 · measurement failure is not a pass: when `org.status` cannot be read, nothing proves that surface:7 is still
+    /// the pane the entry was written for (the daemon instance is unknown), so the pass pings, types and marks NOTHING
+    /// for this lane's unknown entry and keeps it UNKNOWN — even though the seat would ACK. RED on af41d65c: the pass
+    /// never asks org.status; it pings the number, the ACK marks it and the entry is dropped.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_x11_an_unreadable_daemon_instance_types_nothing_and_keeps_the_entry_unknown() {
+        let pack = R2cPack::new();
+        let session = r2p_session(&pack);
+        let daemon = R2cDaemon::start(move |method, _p| match method {
+            "org.status" => r2c_reply("rpc_failed: the fake daemon refuses org.status"),
+            "system.topology" => r2c_ok(json!({"saved": [{"role": "worker"}]})),
+            "control.dashboard" => r2c_ok(json!({"fleet": [
+                {"surface_id": 7, "role": "worker", "state": "idle", "idle_secs": 60, "agent_status": "idle"}]})),
+            "surface.list" => r2c_ok(json!({"surfaces": [{
+                "surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude", "exited": false,
+                "agent_alive": true, "awakened_at": 1.0,
+                "usage": {"source": "transcript", "session_file": session.to_string_lossy()}}]})),
+            "surface.read_text" => r2c_ok(json!({"text": "", "latest_cursor": 40, "line_count": 40})),
+            "surface.wait_for" => r2c_ok(json!({"matched": true})),
+            _ => r2c_ok(json!({})),
+        });
+        let base = pack.dir.clone();
+        let (rep, after) = r2c_in_env(&daemon, &pack, || {
+            let hash = sha256_hex(&compose_directive("worker").expect("directive"));
+            let entry = json!({"surface_id": 7, "role": "worker", "directive_hash": hash, "request_id": "w1-2",
+                               "at": 1});
+            std::fs::write(
+                reinject_pending_path(&base),
+                json!({"pack_version": "9.9.9", "deferred": [], "unknown": [entry]}).to_string(),
+            )
+            .unwrap();
+            (format!("{:?}", consume_reinject_pending(&base)), r2p_unknown_entries(&base))
+        });
+        let calls = daemon.calls();
+        assert!(
+            r2c_count(&calls, "surface.send_text") == 0
+                && r2c_count(&calls, "reinject.mark") == 0
+                && after.len() == 1
+                && rep.contains("unknown: 1"),
+            "sends {} marks {} · unknown after {after:?} · {rep}",
+            r2c_count(&calls, "surface.send_text"),
+            r2c_count(&calls, "reinject.mark")
+        );
+    }
+
     // ── ★(B-360 R3 · option 2 · §2c + A5) the Python readiness tables and the Rust vocabulary are ONE set ─────────────
     // Python has no compile-time exhaustiveness, so the analogue of E0004 is this RUNTIME read of the Python source: a
     // new boot outcome (BOOT_SUMMARY_BUCKETS) or a new kept_pane label (boot_launch_kept_pane) is a red `cargo test`
