@@ -44293,27 +44293,6 @@ mod b360_tests {
         assert_eq!(old, (0, 1));
     }
 
-    #[test]
-    fn b360_r2_unknown_outcome_dispositions_never_destroy_and_never_retry() {
-        // node-recover: run_boot kills on any rc but 0/78/79 -> UNKNOWN folds into the non-destructive 79 token
-        let folded = recover_refusal_from_input_guard(pending_err());
-        assert!(is_recover_refusal(&folded), "{folded}");
-        assert!(folded.contains("may still be typed"), "the reason survives the fold: {folded}");
-        // cycle-agent: the save request's outcome is unknown -> 91, the cycle stops before /clear
-        assert_eq!(cycle_agent_exit(&Err(pending_err())), 91);
-        // not a typing guard (no --queued fallback) and not a gate hold
-        assert!(!is_typing_guard_err(&pending_err()));
-        assert!(!cys::inject_guard::is_hold_error(&pending_err()));
-        // launch-agent: an UNKNOWN arm comes before the closing arm and keeps the pane (source pin; behaviour measured
-        // in the test place)
-        let src = include_str!("cys.rs");
-        // the needle is assembled so this test's own source does not contain it (the pin must not find itself)
-        let needle = format!("Err(e) if created.is_some() && {}(&e) => {{", "is_write_outcome_unknown");
-        let arm = src.find(&needle).expect("unknown arm");
-        let close = src.find("Ok(BootVerdict::LaunchFailed { evidence: e }) | Err(e) => {").expect("closing arm");
-        assert!(arm < close && !src[arm..close].contains("surface.close"));
-    }
-
     // ── ★(B-360 R2) the ten callers of FIX-SPEC-R2-callers.md, driven through their real code ───────────────────────
     // Each specimen answers the caller's direct write with the daemon's REFUSED (`journal_unavailable`, zero bytes) or
     // UNKNOWN (`write_outcome_unknown`, may still be typed) reply. Where a caller's stderr or exit code must be read, or the
@@ -44652,33 +44631,6 @@ mod b360_tests {
             .as_array()
             .and_then(|a| a.iter().find(|r| r["role"] == role))
             .unwrap_or_else(|| panic!("no {role} in {boot}"))
-    }
-
-    /// Row 2 · `cys boot` adopting a gate-pending seat (census row 4, cys.rs:13363): the adoption paste gets UNKNOWN.
-    /// RED on d27e1066: the marker is kept, so the second boot adopts again and types the whole payload a second time;
-    /// and the first boot reports a mandatory `gate_pending` (counted fatal) instead of an unknown directive outcome.
-    #[cfg(unix)]
-    #[test]
-    fn b360_r2c_2_boot_adopt_unknown_clears_the_marker_and_the_next_boot_does_not_reinject() {
-        let (boots, calls) = r2c_boot_twice(r2c_reply(&pending_err()));
-        let pastes = calls.iter().filter(|(m, _)| m == "surface.send_text").count();
-        let cleared = calls.iter().any(|(m, p)| m == "surface.gate_pending" && p["clear"] == true);
-        let first = r2c_role(&boots[0], "worker");
-        let mut failures = Vec::new();
-        if pastes != 1 {
-            failures.push(format!("the adoption payload was typed {pastes} times over two boots (want 1: no duplicate)"));
-        }
-        if !cleared {
-            failures.push("the gate-pending marker was not cleared after the unknown adopt".to_string());
-        }
-        if first["outcome"] != "directive_unknown" || !first["reason"].as_str().unwrap_or("").contains("cys reinject") {
-            failures.push(format!("the first boot does not report an unknown directive outcome: {first}"));
-        }
-        let summary = &boots[0]["summary"];
-        if summary["fatal_failed"] != 0 || summary["fatal_gate_pending"] != 0 {
-            failures.push(format!("counted as fatal: {summary}"));
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     /// Row 2 control (REFUSED, unchanged path): zero bytes, the marker stays and the next boot's re-adopt is the safe
@@ -46803,6 +46755,8 @@ mod b360_tests {
                                                  "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
             "surface.send_text" if p["surface_id"] == 7 => launch.clone(),
             "surface.create" => r2c_reply("b360_no_spawn: this fake daemon makes no new surface"),
+            // node-recover resolves its seat by role (without this it stops at resolution with a generic rc 1)
+            "system.resolve_role" => r2c_ok(json!({"surface_id": 7})),
             _ => r2c_ok(json!({})),
         });
         let mut envs = pack.envs();
@@ -46863,5 +46817,244 @@ mod b360_tests {
         let generic = r2c_reply("rpc_failed: the fake daemon fails this write generically");
         let (_rc, _report, text, _calls, _records) = r2b_boot_recover(generic, &[(R2B_RECOVER_RC, "1")]);
         assert!(text.contains("reclaim 에스컬레이션"), "rc 1 did not escalate:\n{text}");
+    }
+    /// `cys boot --json` twice (children) against a gate-pending worker seat (surface:7) that re-observation adopts;
+    /// `reply` answers the adoption paste. Unlike `r2c_boot_twice`, it KEEPS each boot's exit code (the old helper dropped
+    /// it, census §10). Returns (exits, reports, requests, kept-pane records).
+    #[cfg(unix)]
+    fn r2b_boot_adopt_twice(reply: Value) -> (Vec<i32>, Vec<Value>, Vec<(String, Value)>, Vec<Value>) {
+        let pack = R2cPack::new();
+        let mut marked = true;
+        let daemon = R2cDaemon::start(move |method, p| match method {
+            "surface.list" => {
+                let awake = |sid: u64, role: &str, agent: &str| {
+                    json!({"surface_id": sid, "surface_ref": format!("surface:{sid}"), "role": role, "agent": agent,
+                           "exited": false, "awakened_at": 1.0, "agent_alive": true, "seat": "occupied"})
+                };
+                let mut worker = json!({"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude",
+                                        "exited": false, "agent_alive": true, "seat": "occupied", "line_count": 40});
+                if marked {
+                    worker["gate_pending"] = json!({"gate": GATE_ID_UNIDENTIFIED, "followup": null});
+                }
+                r2c_ok(json!({"surfaces": [awake(3, "cso", "claude"), worker, awake(4, "reviewer-gemini", "gemini"),
+                                           awake(5, "reviewer-codex", "codex"), awake(6, "reviewer-grok", "grok")]}))
+            }
+            "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                 "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+            "surface.gate_pending" if p["clear"] == true && p["surface_id"] == 7 => {
+                marked = false;
+                r2c_ok(json!({}))
+            }
+            "surface.send_text" => reply.clone(),
+            "surface.create" => r2c_reply("b360_no_spawn: this fake daemon makes no new surface"),
+            _ => r2c_ok(json!({})),
+        });
+        let mut envs = pack.envs();
+        let mut path = std::ffi::OsString::from(pack.dir.join("bin"));
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        envs.push(("PATH", path));
+        let mut exits = Vec::new();
+        let mut reports = Vec::new();
+        for _ in 0..2 {
+            let (rc, out, err) = r2c_child("boot", &daemon, &envs);
+            exits.push(rc);
+            reports.push(r2b_report(&out, &err));
+        }
+        (exits, reports, daemon.calls(), r2b_records(&pack))
+    }
+
+    /// Row 2 · `cys boot` adopting a gate-pending seat (census S21): the adoption paste gets UNKNOWN.
+    /// ★(B-360 R2 revise) CHANGED from `b360_r2c_2_boot_adopt_unknown_clears_the_marker_and_the_next_boot_does_not_reinject`,
+    /// which asserted the marker cleared and BOTH fatal counters 0 while its helper DROPPED the boot's exit code (census
+    /// §10: the exit 0 was never inspected). Now, under the head's option (a): the ACTUAL exit of each boot is 0 (boot
+    /// keeps its exit class), the first boot's JSON says `directive_unknown` with the check hint
+    /// (`cys reinject --role worker --check`), exactly one kept-pane record (command boot, write adoption, outcome
+    /// unknown) is written, and the payload is typed once over two boots (no re-adopt; marker cleared as today).
+    /// RED on b5b044af: no record, and the hint lacks the `--check` step.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_b1_boot_adopt_unknown_exits_0_reports_directive_unknown_records_it_and_never_re_adopts() {
+        let (exits, reports, calls, records) = r2b_boot_adopt_twice(r2c_reply(&pending_err()));
+        let first = r2c_role(&reports[0], "worker");
+        let pastes = calls.iter().filter(|(m, _)| m == "surface.send_text").count();
+        let cleared = calls.iter().any(|(m, p)| m == "surface.gate_pending" && p["clear"] == true);
+        let mut failures = Vec::new();
+        if exits != vec![0, 0] {
+            failures.push(format!("boot exits {exits:?}, want [0, 0] (the exit class is unchanged)"));
+        }
+        let hint = format!("{}{}", first["hint"].as_str().unwrap_or(""), first["reason"].as_str().unwrap_or(""));
+        if first["outcome"] != "directive_unknown" || !hint.contains("cys reinject --role worker --check") {
+            failures.push(format!("first boot JSON: {first}"));
+        }
+        if records.len() != 1
+            || !(records[0]["command"] == "boot"
+                && records[0]["surface_id"] == 7
+                && records[0]["role"] == "worker"
+                && records[0]["agent"] == "claude"
+                && records[0]["outcome"] == "unknown"
+                && records[0]["write"] == "adoption"
+                && records[0]["request_id"] == "w1-2")
+        {
+            failures.push(format!("kept-pane records: {records:?}"));
+        }
+        if pastes != 1 || !cleared {
+            failures.push(format!("payload typed {pastes} times over two boots (want 1), marker cleared: {cleared}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// `cys boot --json` (child) where cso is awake and the worker role has NO seat, so boot launches it (fresh surface
+    /// :9 · fake agent `b360agent` registered as claude's binary). `launch` answers the launch paste, `directive` the
+    /// directive paste. Returns (exit, report, stderr, requests, records).
+    #[cfg(unix)]
+    fn r2b_boot_launch(launch: Value, directive: Value) -> (i32, Value, String, Vec<(String, Value)>, Vec<Value>) {
+        let pack = R2cPack::new();
+        let mut agents: Value =
+            serde_json::from_str(&std::fs::read_to_string(pack.dir.join("pack/agents.json")).unwrap()).unwrap();
+        agents["claude"] = agents["b360agent"].clone(); // boot plans claude; the fake keeps the launch harmless
+        std::fs::write(pack.dir.join("pack/agents.json"), agents.to_string()).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let stub = pack.dir.join("bin/b360-agent");
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(pack.dir.join("pack/directives/CSO_DIRECTIVE.md"), "C").unwrap();
+        let mut pastes = 0usize;
+        let mut created = false;
+        let daemon = R2cDaemon::start(move |method, p| match method {
+            "surface.list" => {
+                let mut rows = vec![json!({"surface_id": 3, "surface_ref": "surface:3", "role": "cso", "agent": "claude",
+                                           "exited": false, "awakened_at": 1.0, "agent_alive": true, "seat": "occupied"})];
+                if created {
+                    rows.push(json!({"surface_id": 9, "surface_ref": "surface:9", "exited": false, "agent_alive": true,
+                                     "line_count": 40}));
+                }
+                r2c_ok(json!({"surfaces": rows}))
+            }
+            "surface.create" => {
+                created = true;
+                r2c_ok(json!({"surface_id": 9}))
+            }
+            "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                 "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+            "surface.send_text" if p["surface_id"] == 9 => {
+                pastes += 1;
+                if pastes == 1 { launch.clone() } else { directive.clone() }
+            }
+            _ => r2c_ok(json!({})),
+        });
+        let mut envs = pack.envs();
+        let mut path = std::ffi::OsString::from(pack.dir.join("bin"));
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        envs.push(("PATH", path));
+        let (rc, out, err) = r2c_child("boot", &daemon, &envs);
+        let report = r2b_report(&out, &err);
+        (rc, report, err, daemon.calls(), r2b_records(&pack))
+    }
+
+    /// Area B · S23 launch rc 90 / 91 for the MANDATORY worker: boot's exit is what it is today (1: a mandatory launch
+    /// that did not come up stays in the fatal counter), the outcome keeps the fatal value `failed` that
+    /// javis_bootstrap's `_boot_fatal_verdict` reads (a renamed outcome would flip its step 4 to non-fatal while the exit
+    /// stays 1), and the kept pane is labelled in a typed field: `kept_pane` = directive_refused / directive_unknown /
+    /// launch_unknown, with the right `hint` instead of the install hint, and one kept-pane record (command boot).
+    /// RED on b5b044af: no `kept_pane`, an install hint, no record.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_b2_boot_launch_90_91_keep_the_exit_and_fatal_value_label_the_kept_pane_and_record_it() {
+        let mut failures = Vec::new();
+        for (name, launch, directive, label, write, hint) in [
+            ("directive REFUSED", r2c_ok(json!({})), r2c_reply(&journal_err()), "directive_refused", "directive",
+             "make the journal writable, then cys reinject --role worker"),
+            ("directive UNKNOWN", r2c_ok(json!({})), r2c_reply(&pending_err()), "directive_unknown", "directive",
+             "cys reinject --role worker --check"),
+            ("launch UNKNOWN", r2c_reply(&pending_err()), r2c_ok(json!({})), "launch_unknown", "launch",
+             "cys read-screen --surface surface:9"),
+        ] {
+            let (rc, report, err, calls, records) = r2b_boot_launch(launch, directive);
+            let worker = r2c_role(&report, "worker");
+            if rc != 1 {
+                failures.push(format!("{name}: exit {rc}, want 1 (as today)"));
+            }
+            if worker["outcome"] != "failed" || report["summary"]["fatal_failed"] != 1 {
+                failures.push(format!("{name}: the fatal value changed: {worker} · {}", report["summary"]));
+            }
+            if worker["kept_pane"] != label || !worker["hint"].as_str().unwrap_or("").contains(hint) || worker.get("install_hint").is_some() {
+                failures.push(format!("{name}: kept pane not labelled / wrong hint: {worker}"));
+            }
+            if r2c_count(&calls, "surface.close") != 0 {
+                failures.push(format!("{name}: the kept pane was closed"));
+            }
+            if records.len() != 1 || records[0]["command"] != "boot" || records[0]["write"] != write || records[0]["surface_id"] != 9 {
+                failures.push(format!("{name}: records {records:?}\n{err}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area B · S60 + S22 (same commit, fatal risk 4): node-recover's write is UNKNOWN → node-recover exits 91 (distinct
+    /// from 79) and run_boot records `recover_unknown`: NO escalate_reclaim (its lines "reclaim 에스컬레이션" / "reclaim
+    /// 헬퍼" never appear), no spawn (`surface.create` never asked), boot's exit class unchanged (0: counted like today's
+    /// `skipped_unconfirmed`), one kept-pane record (write recover).
+    /// RED on b5b044af: the UNKNOWN is folded into the 79 token → `skipped_unconfirmed`, no record.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_b3_node_recover_unknown_is_recover_unknown_never_reclaimed_and_keeps_the_exit_class() {
+        let (rc, report, text, calls, records) = r2b_boot_recover(r2c_reply(&pending_err()), &[]);
+        let worker = r2c_role(&report, "worker");
+        let mut failures = Vec::new();
+        if worker["outcome"] != "recover_unknown" {
+            failures.push(format!("worker outcome: {worker}"));
+        }
+        if text.contains("reclaim 에스컬레이션") || text.contains("reclaim 헬퍼") || text.contains("[boot] reclaim(") {
+            failures.push("an UNKNOWN node-recover reached escalate_reclaim (fatal risk 4)".to_string());
+        }
+        if r2c_count(&calls, "surface.create") != 0 {
+            failures.push("a new surface was asked for after an UNKNOWN recovery".to_string());
+        }
+        if rc != 0 || report["summary"]["fatal_failed"] != 0 {
+            failures.push(format!("boot exit {rc} / summary {} (the exit class must not change)", report["summary"]));
+        }
+        if records.len() != 1 || records[0]["write"] != "recover" || records[0]["outcome"] != "unknown" || records[0]["command"] != "boot" {
+            failures.push(format!("records {records:?}"));
+        }
+        if !text.contains("cys reinject --role worker") {
+            failures.push("node-recover's UNKNOWN message does not name `cys reinject --role worker` (minor)".to_string());
+        }
+        assert!(failures.is_empty(), "{}\n{text}", failures.join("\n"));
+    }
+
+    /// Area B · S60 control (passes on b5b044af too): a REFUSED recovery write keeps folding into the non-destructive 79
+    /// (skipped_unconfirmed, no reclaim) — the fixture reaches node-recover's launch write.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_b3_control_node_recover_refused_stays_79_and_is_not_reclaimed() {
+        let (_rc, report, text, _calls, _records) = r2b_boot_recover(r2c_reply(&journal_err()), &[]);
+        assert_eq!(r2c_role(&report, "worker")["outcome"], "skipped_unconfirmed", "{text}");
+        assert!(!text.contains("reclaim 에스컬레이션"), "{text}");
+    }
+
+    /// ★(B-360 R2 revise) CHANGED from `b360_r2_unknown_outcome_dispositions_never_destroy_and_never_retry`, which pinned
+    /// UNKNOWN folded into node-recover's 79 refusal token (census S60/B23: non-destructive but not distinct — 79 is
+    /// shared with REFUSED, a human draft and agent-alive). Now: UNKNOWN is NOT folded (node-recover exits 91); run_boot's
+    /// inverted consumer (B-406) maps 91 to the non-destructive `recover_unknown`; UNKNOWN is still never a typing guard
+    /// or a hold, cycle-agent still exits 91 on it, and launch-agent's UNKNOWN arm still comes before the closing arm.
+    /// RED on b5b044af: the fold.
+    #[test]
+    fn b360_r2r_b4_unknown_outcome_dispositions_never_destroy_never_retry_and_stay_distinct_from_79() {
+        assert_eq!(recover_refusal_from_input_guard(pending_err()), pending_err(), "UNKNOWN must not fold into the 79 token");
+        assert!(!is_recover_refusal(&recover_refusal_from_input_guard(pending_err())));
+        assert_eq!(boot_recover_disposition(EXIT_WRITE_OUTCOME_UNKNOWN), RecoverDisposition::Unknown);
+        assert_eq!(cycle_agent_exit(&Err(pending_err())), 91);
+        assert!(!is_typing_guard_err(&pending_err()));
+        assert!(!cys::inject_guard::is_hold_error(&pending_err()));
+        let src = include_str!("cys.rs");
+        // the needle is assembled so this test's own source does not contain it (the pin must not find itself)
+        let needle = format!("Err(e) if created.is_some() && {}(&e) => {{", "is_write_outcome_unknown");
+        let arm = src.find(&needle).expect("unknown arm");
+        let close = src.find("Ok(BootVerdict::LaunchFailed { evidence: e }) | Err(e) => {").expect("closing arm");
+        assert!(arm < close && !src[arm..close].contains("surface.close"));
     }
 }
