@@ -47338,4 +47338,161 @@ mod b360_tests {
         assert!(r2n_notices(&calls).is_empty());
         assert!(!calls.iter().any(|(m, p)| m == "system.resolve_role" && p["role"] == "master"), "master looked up without a record");
     }
+
+    /// `cys restore` (child) of one in-seat worker whose directive is UNKNOWN (one kept pane), master = surface:1.
+    /// `gone`: the daemon's socket path disappears while master is being resolved (rename), so every later connection
+    /// fails — the daemon is unreachable for the rest of the notice. The socket is put back before the daemon is dropped.
+    /// Returns (exit, stdout with the pack path normalised, stderr, requests).
+    #[cfg(unix)]
+    fn r2n_restore_min(gone: bool) -> (i32, String, String, Vec<(String, Value)>) {
+        let pack = R2cPack::new();
+        let cwd = pack.dir.clone();
+        let slot: std::sync::Arc<std::sync::Mutex<std::path::PathBuf>> = Default::default();
+        let sock_of = std::sync::Arc::clone(&slot);
+        let mut pastes = 0usize;
+        let daemon = R2cDaemon::start(move |method, p| {
+            let sid = p["surface_id"].as_u64().unwrap_or(0);
+            match method {
+                "system.topology" => r2c_ok(json!({
+                    "live": [{"role": "worker", "seat": "empty", "surface_id": 7, "env_injected": true}],
+                    "saved": [{"role": "worker", "agent": "b360agent", "cwd": cwd}], "tombstones": []})),
+                "system.resolve_role" if p["role"] == "master" => {
+                    if gone {
+                        let sock = sock_of.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        let _ = std::fs::rename(&sock, sock.with_extension("gone"));
+                    }
+                    r2c_ok(json!({"surface_id": 1}))
+                }
+                "queue.list" => r2c_ok(json!({"entries": []})),
+                "surface.send_text" if sid == 1 => r2c_ok(json!({"queued": true})),
+                "surface.list" => r2c_ok(json!({"surfaces": [{"surface_id": 7, "surface_ref": "surface:7", "exited": false,
+                                                               "agent_alive": true, "line_count": 40}]})),
+                "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                     "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+                "surface.send_text" => {
+                    pastes += 1;
+                    if pastes == 1 { r2c_ok(json!({})) } else { r2c_reply(&pending_err()) }
+                }
+                "surface.create" => r2c_reply("b360_no_spawn: this fake daemon makes no new surface"),
+                _ => r2c_ok(json!({})),
+            }
+        });
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = daemon.sock.clone();
+        let (rc, out, err) = r2c_child("restore", &daemon, &pack.envs());
+        let _ = std::fs::rename(daemon.sock.with_extension("gone"), &daemon.sock);
+        let out = out.replace(&pack.dir.to_string_lossy().into_owned(), "<pack>");
+        (rc, out, err, daemon.calls())
+    }
+
+    /// Carrier (A) · coordinator hazard (best effort under a dead daemon): the daemon becomes unreachable while the notice
+    /// is being sent. The command's exit code and stdout are the same as the successful run; one stderr line says the
+    /// notice was not sent and why. RED on 95a597e0: there is no notice (no line).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_c4_the_daemon_gone_at_notice_time_changes_neither_exit_nor_stdout_and_says_why() {
+        let (base_rc, base_out, _, base_calls) = r2n_restore_min(false);
+        let (rc, out, err, _calls) = r2n_restore_min(true);
+        let mut failures = Vec::new();
+        if r2n_notices(&base_calls).len() != 1 {
+            failures.push("baseline: no notice".to_string());
+        }
+        if (rc, &out) != (base_rc, &base_out) {
+            failures.push(format!("exit {rc} vs {base_rc}; stdout equal: {}", out == base_out));
+        }
+        let line = err.lines().find(|l| l.starts_with("[kept-pane]") && l.contains("not sent")).unwrap_or_default();
+        if !line.contains("connect") {
+            failures.push(format!("no stderr line naming the unreachable daemon: {line:?}\n{err}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Carrier (A) · coordinator hazard (an exit path inside the outermost command): the only `process::exit` reachable
+    /// inside boot / restore / launch-agent / node-recover / pack-update is `connect()`'s autostart refusal on the first
+    /// failed connection (here forced by a `pack-dept-zz` pack whose socket lacks `cys-dept-zz`, so nothing is spawned).
+    /// KeptPaneScope's Drop does not run there, so no notice is sent — and none could be: the daemon is unreachable at
+    /// that moment. What must hold: every kept-pane record written before the exit is on disk (record_kept_pane appends
+    /// at the kept-pane exit), and nothing is attempted against master. Here: worker's in-seat directive is UNKNOWN
+    /// (recorded), then the socket disappears and cso's fresh launch hits the refusal → exit 2.
+    /// Cannot be red on 95a597e0: records already exist there (area R) and there is no notice to lose; it pins the
+    /// exit-path contract for the notice added on top.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_c5_an_exit_inside_the_command_keeps_the_records_and_attempts_no_notice() {
+        let pack = R2cPack::new();
+        std::fs::write(pack.dir.join("pack/directives/CSO_DIRECTIVE.md"), "C").unwrap();
+        let dept_pack = pack.dir.join("pack-dept-zz");
+        std::fs::rename(pack.dir.join("pack"), &dept_pack).unwrap();
+        let cwd = pack.dir.clone();
+        let slot: std::sync::Arc<std::sync::Mutex<std::path::PathBuf>> = Default::default();
+        let sock_of = std::sync::Arc::clone(&slot);
+        let mut pastes = 0usize;
+        let daemon = R2cDaemon::start(move |method, p| {
+            let sid = p["surface_id"].as_u64().unwrap_or(0);
+            match method {
+                "system.topology" => r2c_ok(json!({
+                    "live": [{"role": "worker", "seat": "empty", "surface_id": 7, "env_injected": true}],
+                    "saved": [{"role": "worker", "agent": "b360agent", "cwd": cwd}, {"role": "cso", "agent": "b360agent", "cwd": cwd}],
+                    "tombstones": []})),
+                "directive.verify" => {
+                    // the worker's UNKNOWN directive is about to be recorded; after this the daemon is unreachable
+                    let sock = sock_of.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let _ = std::fs::rename(&sock, sock.with_extension("gone"));
+                    r2c_ok(json!({}))
+                }
+                "surface.list" => r2c_ok(json!({"surfaces": [{"surface_id": 7, "surface_ref": "surface:7", "exited": false,
+                                                               "agent_alive": true, "line_count": 40}]})),
+                "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                     "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+                "surface.send_text" if sid == 7 => {
+                    pastes += 1;
+                    if pastes == 1 { r2c_ok(json!({})) } else { r2c_reply(&pending_err()) }
+                }
+                _ => r2c_ok(json!({})),
+            }
+        });
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = daemon.sock.clone();
+        let mut envs = pack.envs();
+        envs.retain(|(k, _)| *k != "CYS_PACK_DIR");
+        envs.push(("CYS_PACK_DIR", dept_pack.clone().into_os_string()));
+        envs.push(("CYS_NO_AUTOSTART", "0".into()));
+        let (rc, out, err) = r2c_child("restore", &daemon, &envs);
+        let _ = std::fs::rename(daemon.sock.with_extension("gone"), &daemon.sock);
+        let records: Vec<Value> = std::fs::read_to_string(pack.dir.join(".kept-pane-records.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        let calls = daemon.calls();
+        let mut failures = Vec::new();
+        if rc != EXIT_AUTOSTART_REFUSED || !err.contains("autostart 거부") {
+            failures.push(format!("exit {rc} (want the autostart refusal {EXIT_AUTOSTART_REFUSED})\n{out}\n{err}"));
+        }
+        if records.len() != 1 || records[0]["role"] != "worker" || records[0]["outcome"] != "unknown" {
+            failures.push(format!("the record written before the exit is not on disk: {records:?}"));
+        }
+        if calls.iter().any(|(m, p)| (m == "system.resolve_role" && p["role"] == "master") || m == "queue.list") {
+            failures.push("a notice was attempted".to_string());
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Carrier (A) · coordinator hazards, source pin: the notice never goes through `request()` (whose `connect()` can
+    /// autostart a daemon or `process::exit`) — only through `request_on_timeout` (direct connect, bounded deadline); and
+    /// the owner scope's Drop skips the notice while unwinding a panic (`std::thread::panicking()`) and contains any panic
+    /// of the send (`catch_unwind`), so a notice can neither block an unwind nor turn a panic into an abort.
+    /// RED on 95a597e0: `kept_pane_notify_master` does not exist.
+    #[test]
+    fn b360_r2r_c7_the_notice_uses_the_bounded_transport_and_is_panic_safe_source_pin() {
+        let src = include_str!("cys.rs");
+        let body = |head: &str| {
+            let at = src.find(head).unwrap_or_else(|| panic!("{head} not found"));
+            src[at..at + src[at..].find("\n}\n").expect("end")].to_string()
+        };
+        let notify = body(&format!("\nfn {}(", "kept_pane_notify_master"));
+        let plain_request = notify.match_indices("request(").filter(|(i, _)| !notify[..*i].ends_with("_on_timeout") && !notify[..*i].ends_with('_')).count();
+        assert_eq!(plain_request, 0, "the notice calls request() (autostart / process::exit possible):\n{notify}");
+        assert!(notify.matches("request_on_timeout(").count() >= 3, "{notify}");
+        let drop = body("impl Drop for KeptPaneScope {");
+        assert!(drop.contains("std::thread::panicking()") && drop.contains("catch_unwind"), "{drop}");
+    }
 }
