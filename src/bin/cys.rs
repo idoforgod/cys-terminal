@@ -48419,4 +48419,112 @@ mod b360_tests {
         let after = r2p_unknown_entries(&pack.dir);
         assert_eq!(after, vec![foreign], "the deferred-list writer changed an entry it carries");
     }
+
+    // ── ★(B-360 R3 · option 2 · §2c + A5) the Python readiness tables and the Rust vocabulary are ONE set ─────────────
+    // Python has no compile-time exhaustiveness, so the analogue of E0004 is this RUNTIME read of the Python source: a
+    // new boot outcome (BOOT_SUMMARY_BUCKETS) or a new kept_pane label (boot_launch_kept_pane) is a red `cargo test`
+    // until javis_bootstrap.py's table names it. Anchored on CONTENT between two fixed comment markers; comments are
+    // stripped first; key SETS are compared (no line numbers, no line counts).
+
+    const R3X_BEGIN: &str = "# ── BEGIN B-360 R3 READINESS TABLES";
+    const R3X_END: &str = "# ── END B-360 R3 READINESS TABLES";
+    const R3X_DIRECTION: &str = "this test reads cysjavis-pack/bin/javis_bootstrap.py at RUNTIME; red after an edit to either \
+        file means the Python readiness table and BOOT_SUMMARY_BUCKETS / the kept_pane labels drifted. Add the new value to \
+        the Python table (unknown → withhold); do not weaken this pin.";
+
+    /// `text` with every `#` comment removed (a `#` inside a double-quoted string is kept).
+    fn r3x_strip_comments(text: &str) -> String {
+        let mut out = String::new();
+        for line in text.lines() {
+            let mut quoted = false;
+            let mut kept = String::new();
+            for c in line.chars() {
+                if c == '"' {
+                    quoted = !quoted;
+                } else if c == '#' && !quoted {
+                    break;
+                }
+                kept.push(c);
+            }
+            out.push_str(&kept);
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The keys of the Python dict literal `<name> = { "k": "v", … }` in `block` (comments already stripped).
+    fn r3x_dict_keys(block: &str, name: &str) -> Option<std::collections::BTreeSet<String>> {
+        let at = block.find(&format!("{name} = {{"))?;
+        let body = &block[at + name.len() + 4..];
+        let body = &body[..body.find('}')?];
+        let mut keys = std::collections::BTreeSet::new();
+        let mut rest = body;
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let close = after.find('"')?;
+            let word = &after[..close];
+            let tail = after[close + 1..].trim_start();
+            if tail.starts_with(':') {
+                keys.insert(word.to_string());
+            }
+            rest = &after[close + 1..];
+        }
+        Some(keys)
+    }
+
+    /// The Python table block of `src` (between the markers), comments stripped.
+    fn r3x_block(src: &str) -> String {
+        let begin = src.find(R3X_BEGIN).unwrap_or_else(|| panic!("no `{R3X_BEGIN}` marker — {R3X_DIRECTION}"));
+        let end = src[begin..].find(R3X_END).unwrap_or_else(|| panic!("no `{R3X_END}` marker — {R3X_DIRECTION}"));
+        r3x_strip_comments(&src[begin..begin + end])
+    }
+
+    /// Every `kept_pane` label `boot_launch_kept_pane` can emit — by CALLING it for each write a run's last record can
+    /// carry (launch / directive / adoption / recover / none) and both kept exit codes (90, 91). The run is set directly
+    /// on this thread (no KeptPaneScope: its Drop would try a notice) and cleared after.
+    fn r3x_kept_pane_labels() -> std::collections::BTreeSet<String> {
+        let mut labels = std::collections::BTreeSet::new();
+        for write in [Some("launch"), Some("directive"), Some("adoption"), Some("recover"), None] {
+            for rc in [EXIT_DIRECTIVE_REFUSED, EXIT_WRITE_OUTCOME_UNKNOWN] {
+                let records = write.map(|w| vec![json!({"role": "r3x", "write": w, "surface_id": 9})]).unwrap_or_default();
+                KEPT_PANE_RUN.with(|r| *r.borrow_mut() = Some(KeptPaneRun { command: "boot", records }));
+                let row = boot_launch_kept_pane("r3x", "claude", false, rc);
+                KEPT_PANE_RUN.with(|r| *r.borrow_mut() = None);
+                labels.insert(row["kept_pane"].as_str().expect("kept_pane label").to_string());
+            }
+        }
+        labels
+    }
+
+    /// §2c / A5 cross-language pin: the key set of javis_bootstrap.py's `_BOOT_OUTCOME_READINESS` == BOOT_SUMMARY_BUCKETS,
+    /// and the key set of `_BOOT_KEPT_PANE_READINESS` == every label `boot_launch_kept_pane` can emit.
+    /// RED on af41d65c: the Python tables (and their markers) do not exist.
+    #[test]
+    fn b360_r3_x9_the_python_readiness_tables_cover_every_boot_bucket_and_kept_pane_label() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/cysjavis-pack/bin/javis_bootstrap.py");
+        let src = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e} — {R3X_DIRECTION}"));
+        let block = r3x_block(&src);
+        let buckets: std::collections::BTreeSet<String> = BOOT_SUMMARY_BUCKETS.iter().map(|s| s.to_string()).collect();
+        let outcomes = r3x_dict_keys(&block, "_BOOT_OUTCOME_READINESS")
+            .unwrap_or_else(|| panic!("no `_BOOT_OUTCOME_READINESS = {{…}}` between the markers — {R3X_DIRECTION}"));
+        assert_eq!(outcomes, buckets, "_BOOT_OUTCOME_READINESS keys ≠ BOOT_SUMMARY_BUCKETS — {R3X_DIRECTION}");
+        let kept = r3x_dict_keys(&block, "_BOOT_KEPT_PANE_READINESS")
+            .unwrap_or_else(|| panic!("no `_BOOT_KEPT_PANE_READINESS = {{…}}` between the markers — {R3X_DIRECTION}"));
+        let labels = r3x_kept_pane_labels();
+        assert_eq!(kept, labels, "_BOOT_KEPT_PANE_READINESS keys ≠ boot_launch_kept_pane labels — {R3X_DIRECTION}");
+    }
+
+    /// A5 comment-only edit control: comments inside the table block (a whole commented-out entry, a trailing comment
+    /// after a value) change nothing the pin reads; and the label enumeration really calls the function (4 labels).
+    /// Passes wherever the parser works (no tree dependence).
+    #[test]
+    fn b360_r3_x9_control_the_pin_tolerates_comment_only_edits() {
+        let block = format!(
+            "{R3X_BEGIN} ──\n_BOOT_OUTCOME_READINESS = {{\n    \"launched\": \"ready\",   # a trailing comment\n    \
+             # \"commented_out\": \"withhold\",\n    \"failed\": \"by_kept_pane\",\n}}\n{R3X_END} ──\n"
+        );
+        let keys = r3x_dict_keys(&r3x_block(&block), "_BOOT_OUTCOME_READINESS").expect("parsed");
+        assert_eq!(keys.into_iter().collect::<Vec<_>>(), vec!["failed".to_string(), "launched".to_string()]);
+        assert_eq!(r3x_kept_pane_labels().len(), 4, "{:?}", r3x_kept_pane_labels());
+    }
 }
