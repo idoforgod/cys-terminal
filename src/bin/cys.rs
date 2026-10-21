@@ -19481,6 +19481,10 @@ enum VerifyOutcome {
     DeliveryFailed,
     Unverifiable,
     SkippedRestoring,
+    /// ★(B-360 R2 revise) a write of the check (the save instruction or the corrective Return) has an UNKNOWN outcome and
+    /// the nonce was not seen: it may still land — nothing was re-sent. A distinct value at the type (census B10: it used
+    /// to survive only as prose in `detail`), counted in the summary and mapped to exit 91 by `drain_verify_exit_code`.
+    Unknown,
 }
 impl VerifyOutcome {
     fn as_str(&self) -> &'static str {
@@ -19490,9 +19494,16 @@ impl VerifyOutcome {
             VerifyOutcome::DeliveryFailed => "delivery_failed",
             VerifyOutcome::Unverifiable => "unverifiable",
             VerifyOutcome::SkippedRestoring => "skipped_restoring",
+            VerifyOutcome::Unknown => "unknown",
         }
     }
 }
+
+/// ★(B-360 R2 revise · census S41) Where a node's check stands, for the fan-out cap: a write in flight or with an UNKNOWN
+/// outcome (`VERIFY_WRITE_PENDING`) vs every write settled with a definite outcome (`VERIFY_WRITE_SETTLED`). If the cap
+/// fires while it is pending, the node is `Unknown`; if only the nonce poll was cut, it keeps today's `Timeout`.
+const VERIFY_WRITE_PENDING: u8 = 0;
+const VERIFY_WRITE_SETTLED: u8 = 1;
 
 /// verify 대상 1노드 — 소켓별 org.status에서 추출(surface_id는 데몬별 네임스페이스라 socket과 쌍으로 보유).
 #[derive(Clone)]
@@ -19679,6 +19690,9 @@ impl VerifyIo for RealVerifyIo {
 
 /// 1노드 검증: 복원 가드 → canonical 경로 → 저장 지시 주입 → 전달확정 게이트 → nonce 파일 폴링.
 /// 반환=(결과, 상세). 소켓 hung은 timeout(파일 폴링은 로컬 FS라 소켓 무관)·미제출 wedge는 delivery_failed로 구분.
+/// ★(B-360 R2 revise) production goes through `verify_one_node_tracked` (the fan-out passes its progress cell); this
+///   untracked form is what the node-level specimens call.
+#[cfg(test)]
 fn verify_one_node(
     io: &dyn VerifyIo,
     t: &VerifyTarget,
@@ -19686,13 +19700,35 @@ fn verify_one_node(
     timeout: std::time::Duration,
     now: u64,
 ) -> (VerifyOutcome, String) {
+    let progress = std::sync::atomic::AtomicU8::new(VERIFY_WRITE_PENDING);
+    verify_one_node_tracked(io, t, nonce_prefix, timeout, now, &progress)
+}
+
+/// `verify_one_node` that publishes where its writes stand (`VERIFY_WRITE_*`) for the fan-out cap.
+/// ★(B-360 R2 revise · census S39/S40) The outcome of EVERY write is tracked, including the corrective Return:
+///   - save instruction UNKNOWN → NO corrective Return (the bound Return may still be pending: a second one could submit
+///     twice); the nonce poll still runs — seen → `Saved`, else `Unknown`, even with a wedge visible. An unsubmitted
+///     body (a PASSED instruction whose text stays in the composer) is the only case a corrective Return is for.
+///   - corrective Return UNKNOWN → `Unknown` unless the nonce is seen; REFUSED → `DeliveryFailed` naming the journal.
+fn verify_one_node_tracked(
+    io: &dyn VerifyIo,
+    t: &VerifyTarget,
+    nonce_prefix: &str,
+    timeout: std::time::Duration,
+    now: u64,
+    progress: &std::sync::atomic::AtomicU8,
+) -> (VerifyOutcome, String) {
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
+    let settled = || progress.store(VERIFY_WRITE_SETTLED, Ordering::SeqCst);
     // 1) 복원 중 가드 — 각성 파손 방지(디렉티브 재주입과 "작업 중단"의 교차 차단). 사유를 JSON에 전달.
     if let Some(reason) = restore_guard_reason(&t.socket, &t.role) {
+        settled();
         return (VerifyOutcome::SkippedRestoring, reason);
     }
     // 2) canonical 경로 — live_cwd 미제공(구버전 부서 데몬)이면 검증불가(무음 cwd 폴백 금지)[A1-F6]
     let Some(cwd) = t.live_cwd.as_deref() else {
+        settled();
         return (
             VerifyOutcome::Unverifiable,
             "live_cwd 미제공(구버전 데몬) — 검증불가(무음 폴백 금지)".into(),
@@ -19711,6 +19747,7 @@ fn verify_one_node(
     let marker = checkpoint_marker(&nonce, now);
     // 이미 이 nonce가 있으면 즉시 통과(프로세스 내 재호출 idempotent)
     if file_has_checkpoint_nonce(&file, &nonce) {
+        settled();
         return (
             VerifyOutcome::Saved,
             format!("nonce 마커 확인: {}", file.display()),
@@ -19721,7 +19758,11 @@ fn verify_one_node(
     let io_to = std::cmp::min(timeout, Duration::from_secs(8));
     // ★(B-360 R2) set when the instruction's outcome is unknown: it may still be typed, so the checks below still run
     let mut unknown: Option<String> = None;
-    if let Err(e) = io.inject(&t.socket, t.surface_id, &instr, io_to) {
+    let injected = io.inject(&t.socket, t.surface_id, &instr, io_to);
+    if !injected.as_ref().is_err_and(|e| is_write_outcome_unknown(e)) {
+        settled(); // PASSED or a definite failure (an UNKNOWN keeps the node pending for the fan-out cap)
+    }
+    if let Err(e) = injected {
         // ★(U-14) 관문 보류는 소켓 hung 이 **아니다** — 소켓은 멀쩡했고 우리가 스스로 안 보냈다.
         //   둘을 같은 `timeout` 으로 접으면 사람이 소켓·데몬을 뒤지게 된다(진단이 거짓 방향을
         //   가리킨다). 안전 방향은 같다: 어느 쪽이든 Saved 가 아니므로 `all_saved` 가 거짓이 되고
@@ -19765,8 +19806,20 @@ fn verify_one_node(
         .read_screen(&t.socket, t.surface_id, 24, io_to)
         .map(|s| delivery_wedged(&s, &nonce))
         .unwrap_or(false);
-    if wedged {
-        let _ = io.send_return(&t.socket, t.surface_id, io_to);
+    // ★(B-360 R2 revise) the corrective Return's own outcome (UNKNOWN / REFUSED) — no longer discarded
+    let mut return_unknown: Option<String> = None;
+    let mut return_refused: Option<String> = None;
+    if wedged && unknown.is_none() {
+        // an unsubmitted body after a PASSED instruction: one corrective Return, its outcome tracked
+        progress.store(VERIFY_WRITE_PENDING, Ordering::SeqCst);
+        match io.send_return(&t.socket, t.surface_id, io_to) {
+            Err(e) if is_write_outcome_unknown(&e) => return_unknown = Some(e),
+            Err(e) if is_journal_refusal(&e) => {
+                return_refused = Some(e);
+                settled();
+            }
+            _ => settled(),
+        }
         std::thread::sleep(Duration::from_millis(800));
         wedged = io
             .read_screen(&t.socket, t.surface_id, 24, io_to)
@@ -19784,20 +19837,40 @@ fn verify_one_node(
         }
         std::thread::sleep(Duration::from_millis(400));
     }
-    if wedged {
+    // ★(B-360 R2 revise) UNKNOWN is examined BEFORE the wedge (census B11): a visible wedge does not settle a write
+    //   that may still be pending
+    if let Some(e) = unknown {
         (
-            VerifyOutcome::DeliveryFailed,
-            "입력 미제출(wedge) — Return 재전송에도 저장 미검출".into(),
-        )
-    } else if let Some(e) = unknown {
-        // ★(B-360 R2) keep the daemon's code in the detail: the command exits 91 on it
-        (
-            VerifyOutcome::Timeout,
+            VerifyOutcome::Unknown,
             format!(
-                "save instruction outcome unknown (may still be typed — not re-sent) · nonce not seen within {}s: {} ({e})",
+                "save instruction outcome unknown (may still be typed — not re-sent, no corrective Return: a bound Return may \
+                 still be pending; wedge visible: {}) · nonce not seen within {}s: {} ({e})",
+                if wedged { "yes" } else { "no" },
                 timeout.as_secs(),
                 file.display()
             ),
+        )
+    } else if let Some(e) = return_unknown {
+        (
+            VerifyOutcome::Unknown,
+            format!(
+                "corrective Return outcome unknown (it may still submit — not re-sent) · nonce not seen within {}s: {} ({e})",
+                timeout.as_secs(),
+                file.display()
+            ),
+        )
+    } else if let Some(e) = return_refused {
+        (
+            VerifyOutcome::DeliveryFailed,
+            format!(
+                "입력 미제출(wedge) — the writer journal refused the corrective Return (zero bytes, nothing typed — a re-send is \
+                 safe once the journal is writable); 저장 미검출: {e}"
+            ),
+        )
+    } else if wedged {
+        (
+            VerifyOutcome::DeliveryFailed,
+            "입력 미제출(wedge) — Return 재전송에도 저장 미검출".into(),
         )
     } else {
         (
@@ -19825,6 +19898,10 @@ fn drain_verify_fanout(
     let nonce_prefix = format!("{now}-{}", std::process::id());
     let (tx, rx) = std::sync::mpsc::channel::<(usize, VerifyOutcome, String)>();
     let total = targets.len();
+    // ★(B-360 R2 revise · S41) per node: is a write still in flight / of unknown outcome when the cap fires?
+    let progress: Vec<std::sync::Arc<std::sync::atomic::AtomicU8>> = (0..total)
+        .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicU8::new(VERIFY_WRITE_PENDING)))
+        .collect();
     // surface_id는 데몬별 네임스페이스라 소켓 간 충돌 가능 → 인덱스로 키잉(nonce도 [F1] 소켓 구별자로 정합).
     let mut meta: HashMap<usize, VerifyTarget> = HashMap::new();
     for (idx, t) in targets.iter().enumerate() {
@@ -19834,8 +19911,9 @@ fn drain_verify_fanout(
         let tx = tx.clone();
         let io = io.clone();
         let np = nonce_prefix.clone();
+        let pr = std::sync::Arc::clone(&progress[idx]);
         std::thread::spawn(move || {
-            let (o, d) = verify_one_node(io.as_ref(), &t, &np, timeout, now);
+            let (o, d) = verify_one_node_tracked(io.as_ref(), &t, &np, timeout, now, &pr);
             let _ = tx.send((idx, o, d));
         });
     }
@@ -19857,20 +19935,28 @@ fn drain_verify_fanout(
     // 결과 JSON(원래 순서 안정) — 미도착 노드는 전역 캡 초과 timeout.
     let mut nodes: Vec<Value> = Vec::new();
     let mut pending_loss: Vec<Value> = Vec::new();
-    let (mut c_saved, mut c_timeout, mut c_deliv, mut c_unver, mut c_skip) = (0, 0, 0, 0, 0);
+    let (mut c_saved, mut c_timeout, mut c_deliv, mut c_unver, mut c_skip, mut c_unknown) = (0, 0, 0, 0, 0, 0);
     let mut all_saved = true;
     for idx in 0..total {
         let t = &meta[&idx];
-        let (outcome, detail) = results.get(&idx).cloned().unwrap_or((
-            VerifyOutcome::Timeout,
-            "전역 하드캡 초과 — 결과 미도착(timeout)".into(),
-        ));
+        let (outcome, detail) = results.get(&idx).cloned().unwrap_or_else(|| {
+            if progress[idx].load(std::sync::atomic::Ordering::SeqCst) == VERIFY_WRITE_PENDING {
+                // ★(B-360 R2 revise · S41) the cap fired before this node's write returned a definite outcome
+                (
+                    VerifyOutcome::Unknown,
+                    "전역 하드캡 초과 — 저장 지시 쓰기의 결과 미확정(write outcome unknown: it may still land — not re-sent)".into(),
+                )
+            } else {
+                (VerifyOutcome::Timeout, "전역 하드캡 초과 — 결과 미도착(timeout)".into())
+            }
+        });
         match outcome {
             VerifyOutcome::Saved => c_saved += 1,
             VerifyOutcome::Timeout => c_timeout += 1,
             VerifyOutcome::DeliveryFailed => c_deliv += 1,
             VerifyOutcome::Unverifiable => c_unver += 1,
             VerifyOutcome::SkippedRestoring => c_skip += 1,
+            VerifyOutcome::Unknown => c_unknown += 1,
         }
         if outcome != VerifyOutcome::Saved {
             all_saved = false;
@@ -19901,7 +19987,7 @@ fn drain_verify_fanout(
         "nodes": nodes,
         "summary": {
             "saved": c_saved, "timeout": c_timeout, "delivery_failed": c_deliv,
-            "unverifiable": c_unver, "skipped_restoring": c_skip,
+            "unverifiable": c_unver, "skipped_restoring": c_skip, "unknown": c_unknown,
         },
         // ★재시작 창 큐 보존[A3-F3]: 인메모리 pending_queue는 데몬 재시작에 소실된다(handlers.rs). 디스크
         // flush는 데몬 RPC가 필요해(handlers 무접촉 목표) 대신 유실 예정분을 정직하게 가시화한다(무음 유실 금지).
@@ -20105,10 +20191,17 @@ fn run_drain_verify(timeout: u64) -> i32 {
     drain_verify_merge_unreachable(&mut report, &unreachable);
     let all_saved = report["all_saved"].as_bool() == Some(true);
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
-    // ★(B-360 R2) an unsaved node whose save instruction's outcome is unknown: 91 (it may still land — no blind re-run)
-    let unknown = report["nodes"].as_array().is_some_and(|nodes| {
-        nodes.iter().any(|n| n["outcome"] != "saved" && n["detail"].as_str().is_some_and(is_write_outcome_unknown))
-    });
+    drain_verify_exit_code(all_saved, &report)
+}
+
+/// ★(B-360 R2 revise · census S42/B15) `cys drain --verify`'s exit from the TYPED per-node outcome — never from the free
+/// text of `detail` (a code dropped from the prose must not change the exit): all saved → 0; any `unknown` node → 91
+/// (it may still land — no blind re-run: drain keeps no persistent unknown state, so 91 outranks the generic 1, as at
+/// 11717c44); otherwise 1.
+fn drain_verify_exit_code(all_saved: bool, report: &Value) -> i32 {
+    let unknown = report["nodes"]
+        .as_array()
+        .is_some_and(|nodes| nodes.iter().any(|n| n["outcome"] == VerifyOutcome::Unknown.as_str()));
     if all_saved {
         0
     } else if unknown {
@@ -44309,18 +44402,29 @@ mod b360_tests {
     }
 
     /// Row 3, the command's exit: a node whose save instruction's outcome is unknown and that was not seen saved makes
-    /// `cys drain --verify` exit 91. Source pin, not behaviour: `run_drain_verify` discovers every department socket on
-    /// the machine and arms a hard exit, so it is not run here; the detail it reads is pinned by the specimen above.
-    /// RED on d27e1066: the exit is `if all_saved { 0 } else { 1 }`.
+    /// `cys drain --verify` exit 91.
+    /// ★(B-360 R2 revise) CHANGED from `b360_r2c_3_drain_verify_exits_91_for_an_unknown_unsaved_node_source_pin`, which
+    /// required `run_drain_verify` to contain `is_write_outcome_unknown` — i.e. it pinned the free-text scan of `detail`
+    /// (census S42/B15: every path that dropped the code from the prose exited 1). Now: the exit comes from the typed
+    /// outcome through `drain_verify_exit_code`, which reads `nodes[].outcome` and never the detail text. Behaviour is
+    /// pinned by `b360_r2r_d6…` (the real command) and `b360_r2r_d7…` (no text scanning).
     #[test]
-    fn b360_r2c_3_drain_verify_exits_91_for_an_unknown_unsaved_node_source_pin() {
+    fn b360_r2c_3_drain_verify_exits_91_from_the_typed_outcome_not_the_detail_text_source_pin() {
         let src = include_str!("cys.rs");
-        let head = format!("\nfn {}(", "run_drain_verify");
-        let at = src.find(&head).expect("run_drain_verify");
-        let body = &src[at..at + src[at..].find("\n}\n").expect("end of run_drain_verify")];
+        let body = |name: &str| {
+            let head = format!("\nfn {name}(");
+            let at = src.find(&head).unwrap_or_else(|| panic!("{name}"));
+            src[at..at + src[at..].find("\n}\n").expect("end")].to_string()
+        };
+        let run = body("run_drain_verify");
+        let exit = body("drain_verify_exit_code");
+        assert!(run.contains("drain_verify_exit_code(all_saved, &report)"), "run_drain_verify does not use the typed exit:\n{run}");
         assert!(
-            body.contains("EXIT_WRITE_OUTCOME_UNKNOWN") && body.contains("is_write_outcome_unknown"),
-            "drain --verify does not exit 91 for an unknown, unsaved node:\n{body}"
+            exit.contains("EXIT_WRITE_OUTCOME_UNKNOWN")
+                && exit.contains("n[\"outcome\"]")
+                && !exit.contains(&format!("{}(", "is_write_outcome_unknown"))
+                && !exit.contains("[\"detail\"]"),
+            "the exit must come from the typed outcome only:\n{exit}"
         );
     }
 
@@ -45813,5 +45917,24 @@ mod b360_tests {
             failures.push(format!("{returns7} Return(s) sent to surface:7 after its UNKNOWN save paste"));
         }
         assert!(failures.is_empty(), "{}\n{report}", failures.join("\n"));
+    }
+
+    /// Area D · S42: the exit is computed without text scanning — an `unknown` node whose detail lost the daemon's code
+    /// still exits 91, and a `timeout` node whose detail happens to carry the code exits 1. Cannot be red on 11717c44
+    /// (`drain_verify_exit_code` does not exist there; its inline exit scanned the detail). Positive control: all saved → 0.
+    #[test]
+    fn b360_r2r_d7_the_drain_verify_exit_reads_the_typed_outcome_not_the_detail_text() {
+        let node = |outcome: &str, detail: &str| json!({"outcome": outcome, "detail": detail});
+        let unknown_no_code = json!({"all_saved": false, "nodes": [node("saved", ""), node("unknown", "no code here")]});
+        let timeout_with_code = json!({"all_saved": false, "nodes": [node("timeout", &pending_err())]});
+        let all_saved = json!({"all_saved": true, "nodes": [node("saved", "")]});
+        assert_eq!(
+            (
+                drain_verify_exit_code(false, &unknown_no_code),
+                drain_verify_exit_code(false, &timeout_with_code),
+                drain_verify_exit_code(true, &all_saved),
+            ),
+            (EXIT_WRITE_OUTCOME_UNKNOWN, 1, 0)
+        );
     }
 }
