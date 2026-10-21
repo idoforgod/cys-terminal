@@ -43218,4 +43218,897 @@ mod b360_tests {
         let close = src.find("Ok(BootVerdict::LaunchFailed { evidence: e }) | Err(e) => {").expect("closing arm");
         assert!(arm < close && !src[arm..close].contains("surface.close"));
     }
+
+    // ── ★(B-360 R2) the ten callers of FIX-SPEC-R2-callers.md, driven through their real code ───────────────────────
+    // Each specimen answers the caller's direct write with the daemon's REFUSED (`journal_unavailable`, zero bytes) or
+    // UNKNOWN (`write_outcome_unknown`, may still be typed) reply. Where a caller's stderr or exit code must be read, or the
+    // caller arms a process-wide hard exit (`cys drain`: 12 s), it runs in a child process: the ignored `b360_r2c_child`
+    // of this same binary. A `_control` specimen passes on d27e1066 too: it shows the fixture reaches the caller's write,
+    // so its sibling's red is not vacuous. Row numbers are the spec's; census rows and lines are at d27e1066.
+
+    #[cfg(unix)]
+    fn r2c_reply(rendered: &str) -> Value {
+        let (code, message) = rendered.split_once(": ").expect("<code>: <message>");
+        json!({"ok": false, "error": {"code": code, "message": message}})
+    }
+
+    #[cfg(unix)]
+    fn r2c_ok(result: Value) -> Value {
+        json!({"ok": true, "result": result})
+    }
+
+    /// What the CLI itself says: the part of a line before the daemon's echoed error text (`<code>: <message>`).
+    fn r2c_own(line: &str) -> &str {
+        let cut = [cys::ERR_JOURNAL_UNAVAILABLE, cys::ERR_WRITE_OUTCOME_UNKNOWN]
+            .iter()
+            .filter_map(|c| line.find(&format!("{c}: ")))
+            .min()
+            .unwrap_or(line.len());
+        &line[..cut]
+    }
+
+    #[cfg(unix)]
+    type R2cCalls = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
+    /// A scripted NDJSON fake daemon: `answer(method, params)` is the whole reply minus `id`; every request is recorded.
+    /// The socket sits in its own fresh directory, so the boot lock next to it (`boot_lock_path`) is private too.
+    #[cfg(unix)]
+    struct R2cDaemon {
+        dir: std::path::PathBuf,
+        sock: std::path::PathBuf,
+        calls: R2cCalls,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(unix)]
+    impl R2cDaemon {
+        fn start(mut answer: impl FnMut(&str, &Value) -> Value + Send + 'static) -> Self {
+            use std::io::{BufRead, BufReader, Write};
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::path::Path::new("/tmp")
+                .join(format!(".b360c-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("fake daemon dir");
+            let sock = dir.join("d.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&sock).expect("fake socket bind");
+            let calls: R2cCalls = Default::default();
+            let rec = std::sync::Arc::clone(&calls);
+            let server = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                    let mut line = String::new();
+                    if BufReader::new(&mut stream).read_line(&mut line).is_err() || line.trim().is_empty() {
+                        continue;
+                    }
+                    let req: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+                    let method = req["method"].as_str().unwrap_or("").to_string();
+                    if method == "__stop" {
+                        break;
+                    }
+                    rec.lock().unwrap_or_else(|e| e.into_inner()).push((method.clone(), req["params"].clone()));
+                    let mut resp = answer(&method, &req["params"]);
+                    resp["id"] = req["id"].clone();
+                    let _ = writeln!(stream, "{resp}");
+                }
+            });
+            Self { dir, sock, calls, server: Some(server) }
+        }
+
+        fn calls(&self) -> Vec<(String, Value)> {
+            self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for R2cDaemon {
+        fn drop(&mut self) {
+            use std::io::Write;
+            if let Ok(mut s) = std::os::unix::net::UnixStream::connect(&self.sock) {
+                let _ = writeln!(s, "{}", json!({"id": 1, "method": "__stop", "params": {}}));
+            }
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A throwaway pack/config/local tree: the embedded agents.json plus `b360agent` (claude's spec, command
+    /// `b360-agent`, no env), a one-letter role directive, a `bin/claude` stub (so `cys boot` finds the CLI), and NO
+    /// SessionStart hook (so a cycle types directive + RESUME itself - the path of rows 5-7). Removed on drop.
+    #[cfg(unix)]
+    struct R2cPack {
+        dir: std::path::PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl R2cPack {
+        fn new() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir()
+                .join(format!("b360c-pack-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+            let _ = std::fs::remove_dir_all(&dir);
+            for d in ["pack/directives", "pack/round", "config", "local", "bin", "_round"] {
+                std::fs::create_dir_all(dir.join(d)).expect("fixture dir");
+            }
+            let embedded = cys::pack::PACK_ALL.iter().find(|(p, _)| *p == "agents.json").map(|(_, b)| *b).expect("embedded agents.json");
+            let mut agents: Value = serde_json::from_str(embedded).expect("agents.json");
+            let mut fake = agents["claude"].clone();
+            fake["cmd"] = json!("b360-agent");
+            fake["inject_delay_secs"] = json!(1);
+            if let Some(o) = fake.as_object_mut() {
+                o.remove("env");
+            }
+            agents["b360agent"] = fake;
+            std::fs::write(dir.join("pack/agents.json"), agents.to_string()).unwrap();
+            std::fs::write(dir.join("pack/directives/WORKER_DIRECTIVE.md"), "W").unwrap();
+            std::fs::write(dir.join("pack/directives/RSI_LEARNING_DIRECTIVE.md"), "R").unwrap();
+            let stub = dir.join("bin/claude");
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            Self { dir }
+        }
+
+        fn envs(&self) -> Vec<(&'static str, std::ffi::OsString)> {
+            vec![
+                ("CYS_PACK_DIR", self.dir.join("pack").into_os_string()),
+                ("CYS_CONFIG_DIR", self.dir.join("config").into_os_string()),
+                ("CYS_LOCAL_DIR", self.dir.join("local").into_os_string()),
+            ]
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for R2cPack {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Sets env vars for an in-process specimen (hold `ENV_LOCK`); restores them on drop, also after a RED panic.
+    #[cfg(unix)]
+    struct R2cEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    #[cfg(unix)]
+    impl R2cEnv {
+        fn set(pairs: Vec<(&'static str, std::ffi::OsString)>) -> Self {
+            let saved = pairs.iter().map(|(k, _)| (*k, std::env::var_os(k))).collect();
+            for (k, v) in &pairs {
+                std::env::set_var(k, v);
+            }
+            Self(saved)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for R2cEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// Runs `body` in-process with `daemon`'s socket and `pack` in the environment, under `ENV_LOCK`.
+    #[cfg(unix)]
+    fn r2c_in_env<T>(daemon: &R2cDaemon, pack: &R2cPack, body: impl FnOnce() -> T) -> T {
+        let _guard = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pairs = pack.envs();
+        pairs.push((cys::ENV_SOCKET, daemon.sock.clone().into_os_string()));
+        pairs.push(("CYS_NO_AUTOSTART", "1".into()));
+        let _env = R2cEnv::set(pairs);
+        body()
+    }
+
+    /// Arms the child specimen and names the caller it runs; unset = the child does nothing.
+    #[cfg(unix)]
+    const R2C_CHILD: &str = "CYS_B360_R2C_CHILD";
+
+    /// Runs the ignored `b360_r2c_child` of THIS test binary as a child process (caller `what`, `daemon`'s socket, plus
+    /// `envs`) and returns (exit code, stdout, stderr). Holds `ENV_LOCK`, so the child inherits a settled environment.
+    #[cfg(unix)]
+    fn r2c_child(what: &str, daemon: &R2cDaemon, envs: &[(&'static str, std::ffi::OsString)]) -> (i32, String, String) {
+        let _guard = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["b360_tests::b360_r2c_child", "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env(R2C_CHILD, what)
+            .env(cys::ENV_SOCKET, &daemon.sock)
+            .env("CYS_NO_AUTOSTART", "1")
+            .envs(envs.iter().map(|(k, v)| (*k, v)))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("spawn the child specimen");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(stdout.contains("running 1 test"), "the child specimen did not run:\n{stdout}\n{stderr}");
+        (out.status.code().unwrap_or(-1), stdout, stderr)
+    }
+
+    /// The child half of the child-process specimens: runs the caller its parent names, then exits with its code.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "child process of the b360_r2c specimens; a no-op unless one of them starts it"]
+    fn b360_r2c_child() {
+        use std::io::Write;
+        let Ok(what) = std::env::var(R2C_CHILD) else { return };
+        CLEAR_VERIFY_SECS_OVERRIDE.store(2, std::sync::atomic::Ordering::Relaxed);
+        let rc = match what.as_str() {
+            "drain" => run(Command::Drain { verify: false, timeout: 20 }),
+            "cycle" => run_cycle_agent(None, Some("7".into()), None, vec![], None, None, 3, true, None),
+            "restore" => run_restore(None, false, true),
+            "boot" => run_boot(None, true),
+            other => panic!("unknown child caller {other}"),
+        };
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        std::process::exit(rc);
+    }
+
+    // ── row 1 · `cys drain` save signal ──
+
+    /// Row 1 · `cys drain` save signal (census row 3, cys.rs:5610): the worker's signal gets UNKNOWN, the CSO's REFUSED.
+    /// RED on d27e1066: both lines say "저장 신호 미전달" (not delivered). For UNKNOWN that is false (it may still be typed);
+    /// for REFUSED the CLI's own words do not name the journal (only the echoed daemon text does).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_1_drain_names_an_unknown_and_a_refused_save_signal() {
+        let daemon = R2cDaemon::start(|method, p| match method {
+            "system.topology" => r2c_ok(json!({"live": [{"role": "worker"}, {"role": "cso"}]})),
+            "system.resolve_role" => r2c_ok(json!({"surface_id": if p["role"] == "worker" { 7 } else { 8 }})),
+            "surface.list" => r2c_ok(json!({"surfaces": [
+                {"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "exited": false},
+                {"surface_id": 8, "surface_ref": "surface:8", "role": "cso", "exited": false}]})),
+            "surface.send_text" if p["surface_id"] == 7 => r2c_reply(&pending_err()),
+            "surface.send_text" => r2c_reply(&journal_err()),
+            _ => r2c_ok(json!({})),
+        });
+        let (rc, _out, err) = r2c_child("drain", &daemon, &[]);
+        let line = |who: &str| {
+            err.lines()
+                .find(|l| l.starts_with(&format!("[drain] {who} ")))
+                .unwrap_or_else(|| panic!("no [drain] {who} line:\n{err}"))
+                .to_string()
+        };
+        let (unknown, refused) = (line("worker"), line("cso"));
+        let mut failures = Vec::new();
+        let own = r2c_own(&unknown);
+        if !(own.contains("outcome unknown") && own.contains("not re-sent")) || own.contains("미전달") {
+            failures.push(format!("UNKNOWN save signal is not reported as unknown + not re-sent: {unknown}"));
+        }
+        if !r2c_own(&refused).contains("journal") {
+            failures.push(format!("REFUSED save signal: the CLI's own words do not name the journal: {refused}"));
+        }
+        assert_eq!(rc, 0, "drain stays best-effort:\n{err}");
+        let sends = daemon.calls().iter().filter(|(m, _)| m == "surface.send_text").count();
+        assert_eq!(sends, 2, "one signal per node, nothing re-sent");
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    // ── row 2 · `cys boot` adopting a gate-pending seat ──
+
+    /// `cys boot --json` twice (children) against a gate-pending worker seat (surface:7) that re-observation adopts;
+    /// `reply` answers the adoption paste. The other roster seats are awake (skipped). Returns both reports + requests.
+    #[cfg(unix)]
+    fn r2c_boot_twice(reply: Value) -> (Vec<Value>, Vec<(String, Value)>) {
+        let pack = R2cPack::new();
+        let mut marked = true;
+        let daemon = R2cDaemon::start(move |method, p| match method {
+            "surface.list" => {
+                let awake = |sid: u64, role: &str, agent: &str| {
+                    json!({"surface_id": sid, "surface_ref": format!("surface:{sid}"), "role": role, "agent": agent,
+                           "exited": false, "awakened_at": 1.0, "agent_alive": true, "seat": "occupied"})
+                };
+                let mut worker = json!({"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude",
+                                        "exited": false, "agent_alive": true, "seat": "occupied", "line_count": 40});
+                if marked {
+                    worker["gate_pending"] = json!({"gate": GATE_ID_UNIDENTIFIED, "followup": null});
+                }
+                r2c_ok(json!({"surfaces": [awake(3, "cso", "claude"), worker, awake(4, "reviewer-gemini", "gemini"),
+                                           awake(5, "reviewer-codex", "codex"), awake(6, "reviewer-grok", "grok")]}))
+            }
+            "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                 "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+            "surface.gate_pending" if p["clear"] == true && p["surface_id"] == 7 => {
+                marked = false;
+                r2c_ok(json!({}))
+            }
+            "surface.send_text" => reply.clone(),
+            "surface.create" => r2c_reply("b360_no_spawn: this fake daemon makes no new surface"),
+            _ => r2c_ok(json!({})),
+        });
+        let mut envs = pack.envs();
+        let mut path = std::ffi::OsString::from(pack.dir.join("bin"));
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        envs.push(("PATH", path));
+        let boots = (0..2)
+            .map(|_| {
+                let (_rc, out, err) = r2c_child("boot", &daemon, &envs);
+                let line = out
+                    .lines()
+                    .find(|l| l.starts_with("{\"roles\""))
+                    .unwrap_or_else(|| panic!("no boot --json report:\n{out}\n{err}"));
+                serde_json::from_str::<Value>(line).expect("boot --json")
+            })
+            .collect();
+        (boots, daemon.calls())
+    }
+
+    #[cfg(unix)]
+    fn r2c_role<'a>(boot: &'a Value, role: &str) -> &'a Value {
+        boot["roles"]
+            .as_array()
+            .and_then(|a| a.iter().find(|r| r["role"] == role))
+            .unwrap_or_else(|| panic!("no {role} in {boot}"))
+    }
+
+    /// Row 2 · `cys boot` adopting a gate-pending seat (census row 4, cys.rs:13363): the adoption paste gets UNKNOWN.
+    /// RED on d27e1066: the marker is kept, so the second boot adopts again and types the whole payload a second time;
+    /// and the first boot reports a mandatory `gate_pending` (counted fatal) instead of an unknown directive outcome.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_2_boot_adopt_unknown_clears_the_marker_and_the_next_boot_does_not_reinject() {
+        let (boots, calls) = r2c_boot_twice(r2c_reply(&pending_err()));
+        let pastes = calls.iter().filter(|(m, _)| m == "surface.send_text").count();
+        let cleared = calls.iter().any(|(m, p)| m == "surface.gate_pending" && p["clear"] == true);
+        let first = r2c_role(&boots[0], "worker");
+        let mut failures = Vec::new();
+        if pastes != 1 {
+            failures.push(format!("the adoption payload was typed {pastes} times over two boots (want 1: no duplicate)"));
+        }
+        if !cleared {
+            failures.push("the gate-pending marker was not cleared after the unknown adopt".to_string());
+        }
+        if first["outcome"] != "directive_unknown" || !first["reason"].as_str().unwrap_or("").contains("cys reinject") {
+            failures.push(format!("the first boot does not report an unknown directive outcome: {first}"));
+        }
+        let summary = &boots[0]["summary"];
+        if summary["fatal_failed"] != 0 || summary["fatal_gate_pending"] != 0 {
+            failures.push(format!("counted as fatal: {summary}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Row 2 control (REFUSED, unchanged path): zero bytes, the marker stays and the next boot's re-adopt is the safe
+    /// retry. Passes on d27e1066 as well: the fixture reaches the adoption paste.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_2_control_boot_adopt_refused_keeps_the_marker_and_the_next_boot_retries() {
+        let (boots, calls) = r2c_boot_twice(r2c_reply(&journal_err()));
+        let pastes = calls.iter().filter(|(m, _)| m == "surface.send_text").count();
+        assert_eq!(pastes, 2, "REFUSED wrote zero bytes: the next boot re-adopts (safe retry)");
+        assert!(!calls.iter().any(|(m, p)| m == "surface.gate_pending" && p["clear"] == true), "marker kept");
+        assert_eq!(r2c_role(&boots[0], "worker")["outcome"], "gate_pending");
+    }
+
+    // ── row 3 · `cys drain --verify` ──
+
+    /// Answers the save instruction with `err`. With `land`, the instruction is typed late anyway and the node writes its
+    /// nonce marker into `land` 300 ms later, i.e. during the nonce poll.
+    struct R2cVerifyIo {
+        err: String,
+        land: Option<std::path::PathBuf>,
+        screens: std::sync::atomic::AtomicUsize,
+    }
+
+    impl VerifyIo for R2cVerifyIo {
+        fn inject(&self, _: &std::path::Path, _: u64, text: &str, _: std::time::Duration) -> Result<(), String> {
+            if let Some(file) = self.land.clone() {
+                let at = text.find("<!-- cys-checkpoint:").expect("the instruction carries its marker");
+                let marker = text[at..at + text[at..].find("-->").expect("marker end") + 3].to_string();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = std::fs::write(&file, format!("# 상태\n{marker}\n"));
+                });
+            }
+            Err(self.err.clone())
+        }
+        fn read_screen(&self, _: &std::path::Path, _: u64, _: u64, _: std::time::Duration) -> Result<String, String> {
+            self.screens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok("✻ Working…\n> ".into())
+        }
+        fn send_return(&self, _: &std::path::Path, _: u64, _: std::time::Duration) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// One `drain --verify` node (surface:7) whose save instruction gets `err`; returns (outcome, detail, screens read).
+    fn r2c_verify(err: String, lands: bool, secs: u64) -> (VerifyOutcome, String, usize) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let td = std::env::temp_dir()
+            .join(format!("b360c-dv-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+        let _ = std::fs::remove_dir_all(&td);
+        std::fs::create_dir_all(td.join("_round")).unwrap();
+        let file = td.join("_round/SESSION_STATE.md");
+        std::fs::write(&file, "# 상태\n").unwrap();
+        let io = R2cVerifyIo { err, land: lands.then(|| file.clone()), screens: Default::default() };
+        let t = VerifyTarget {
+            socket: td.join("cys.sock"),
+            dept: "dept-x".into(),
+            display: "dept-x".into(),
+            surface_id: 7,
+            surface_ref: "surface:7".into(),
+            role: "worker".into(),
+            live_cwd: Some(td.to_string_lossy().into_owned()),
+            pending_undelivered: 0,
+        };
+        let (o, d) = verify_one_node(&io, &t, "r2c", std::time::Duration::from_secs(secs), 100);
+        std::thread::sleep(std::time::Duration::from_millis(400)); // let a late writer finish before the dir goes
+        let _ = std::fs::remove_dir_all(&td);
+        (o, d, io.screens.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Row 3 · `cys drain --verify` (census row 7, cys.rs:19699), REFUSED. RED on d27e1066: classified as a hung socket
+    /// ("소켓 hung", `timeout`) although the daemon answered and wrote zero bytes.
+    #[test]
+    fn b360_r2c_3_drain_verify_refused_is_a_journal_refusal_not_a_hung_socket() {
+        let (o, d, _) = r2c_verify(journal_err(), false, 1);
+        assert!(o != VerifyOutcome::Saved && o != VerifyOutcome::Timeout && !d.contains("소켓 hung"), "{o:?}: {d}");
+        let own = r2c_own(&d);
+        assert!(own.contains("journal") && own.contains("zero bytes"), "the classification must name the journal refusal: {d}");
+    }
+
+    /// Row 3, UNKNOWN, and the instruction lands late. RED on d27e1066: it returns "소켓 hung" before the wedge gate and the
+    /// nonce poll, so the save that lands during the poll is never seen (false `timeout`).
+    #[test]
+    fn b360_r2c_3_drain_verify_unknown_still_runs_the_poll_and_sees_a_landed_save() {
+        let (o, d, reads) = r2c_verify(pending_err(), true, 3);
+        assert_eq!(o, VerifyOutcome::Saved, "a save that landed during the poll was not seen: {d}");
+        assert!(reads > 0, "the wedge gate did not run");
+    }
+
+    /// Row 3, UNKNOWN, nothing lands. RED on d27e1066: "소켓 hung", and the detail drops the daemon's code, so the command
+    /// cannot tell an unknown outcome (91) from a plain failure.
+    #[test]
+    fn b360_r2c_3_drain_verify_unknown_not_seen_is_not_a_hung_socket_and_keeps_the_code() {
+        let (o, d, reads) = r2c_verify(pending_err(), false, 1);
+        assert!(o != VerifyOutcome::Saved && !d.contains("소켓 hung"), "{o:?}: {d}");
+        assert!(is_write_outcome_unknown(&d) && r2c_own(&d).contains("unknown"), "say unknown and keep the code: {d}");
+        assert!(reads > 0, "the wedge gate did not run");
+    }
+
+    /// Row 3, the command's exit: a node whose save instruction's outcome is unknown and that was not seen saved makes
+    /// `cys drain --verify` exit 91. Source pin, not behaviour: `run_drain_verify` discovers every department socket on
+    /// the machine and arms a hard exit, so it is not run here; the detail it reads is pinned by the specimen above.
+    /// RED on d27e1066: the exit is `if all_saved { 0 } else { 1 }`.
+    #[test]
+    fn b360_r2c_3_drain_verify_exits_91_for_an_unknown_unsaved_node_source_pin() {
+        let src = include_str!("cys.rs");
+        let head = format!("\nfn {}(", "run_drain_verify");
+        let at = src.find(&head).expect("run_drain_verify");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("end of run_drain_verify")];
+        assert!(
+            body.contains("EXIT_WRITE_OUTCOME_UNKNOWN") && body.contains("is_write_outcome_unknown"),
+            "drain --verify does not exit 91 for an unknown, unsaved node:\n{body}"
+        );
+    }
+
+    // ── rows 4-7 · `cys cycle-agent` ──
+
+    /// The cycle seat surface:7 (worker · claude). `clear` answers the atomic /clear, `reinject` every authoritative paste
+    /// after it. `swap`: the statusline session_file changes once the /clear was asked (it landed). `usage`: the seat
+    /// reports a statusline at all (false = unmeasurable). `busy_after_clear`: the new session never idles (held).
+    #[cfg(unix)]
+    struct R2cSeat {
+        clear: Value,
+        reinject: Value,
+        swap: bool,
+        usage: bool,
+        busy_after_clear: bool,
+    }
+
+    /// `cys cycle-agent --surface surface:7` in a child against `seat`: (exit code, last `error: ` line, requests).
+    #[cfg(unix)]
+    fn r2c_cycle(seat: R2cSeat) -> (i32, String, Vec<(String, Value)>) {
+        let pack = R2cPack::new();
+        let cwd = pack.dir.clone();
+        let mut cleared = false;
+        let daemon = R2cDaemon::start(move |method, p| match method {
+            "surface.list" => {
+                let mut row = json!({"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude",
+                                     "exited": false, "awakened_at": 1.0, "cwd": cwd, "live_cwd": cwd});
+                if seat.usage {
+                    let file = if cleared && seat.swap { "S2" } else { "S1" };
+                    row["usage"] = json!({"source": "statusline", "session_file": file});
+                }
+                r2c_ok(json!({"surfaces": [row]}))
+            }
+            "surface.read_text" => {
+                let quiet = if cleared && seat.busy_after_clear { 0.0 } else { 5.0 };
+                r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT, "quiet_secs": quiet, "line_count": 40}))
+            }
+            "surface.send_text" if p["clear_first"] == true => {
+                cleared = true;
+                seat.clear.clone()
+            }
+            "surface.send_text" if cleared => seat.reinject.clone(),
+            _ => r2c_ok(json!({})),
+        });
+        let (rc, _out, err) = r2c_child("cycle", &daemon, &pack.envs());
+        let error = err.lines().filter(|l| l.starts_with("error: ")).last().unwrap_or_default().to_string();
+        (rc, error, daemon.calls())
+    }
+
+    /// How many authoritative pastes followed the atomic /clear (the reinject writes: directive + RESUME, RESUME alone).
+    #[cfg(unix)]
+    fn r2c_pastes_after_clear(calls: &[(String, Value)]) -> usize {
+        let Some(at) = calls.iter().position(|(m, p)| m == "surface.send_text" && p["clear_first"] == true) else {
+            return 0;
+        };
+        calls[at + 1..].iter().filter(|(m, p)| m == "surface.send_text" && p["authoritative"] == true).count()
+    }
+
+    /// The outcome the cycle handed the daemon's clear guard when it turned quiescing off.
+    #[cfg(unix)]
+    fn r2c_quiesce_outcome(calls: &[(String, Value)]) -> Option<String> {
+        calls
+            .iter()
+            .rev()
+            .find(|(m, p)| m == "surface.quiesce" && p["on"] == false)
+            .and_then(|(_, p)| p["outcome"].as_str().map(String::from))
+    }
+
+    /// Row 4 · cycle-agent atomic `/clear` (census row 11, cys.rs:21390), REFUSED. RED on d27e1066: the daemon's clear
+    /// guard is told `unknown` for a clear that was never typed (zero bytes); it must hear `not_cleared`.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_4_cycle_clear_refused_tells_the_daemon_not_cleared() {
+        let (rc, error, calls) = r2c_cycle(R2cSeat {
+            clear: r2c_reply(&journal_err()),
+            reinject: r2c_ok(json!({})),
+            swap: false,
+            usage: true,
+            busy_after_clear: false,
+        });
+        assert_eq!(r2c_quiesce_outcome(&calls).as_deref(), Some("not_cleared"), "{error}");
+        assert_eq!(rc, 1, "a refused clear stays a plain failure: {error}");
+        assert_eq!(r2c_pastes_after_clear(&calls), 0, "nothing typed after a refused clear");
+    }
+
+    /// Row 4, UNKNOWN, and the /clear lands: its session_file swap is observed. RED on d27e1066: the cycle returns 91 at
+    /// the clear, before the effect check, so the seat is cleared and never gets directive + RESUME (silent loss).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_4_cycle_clear_unknown_then_swap_observed_reinjects() {
+        let (rc, error, calls) = r2c_cycle(R2cSeat {
+            clear: r2c_reply(&pending_err()),
+            reinject: r2c_ok(json!({})),
+            swap: true,
+            usage: true,
+            busy_after_clear: false,
+        });
+        assert_eq!((rc, r2c_pastes_after_clear(&calls)), (0, 1), "a landed clear must be followed by its reinject: {error}");
+        assert_eq!(r2c_quiesce_outcome(&calls).as_deref(), Some("cleared"));
+    }
+
+    /// Row 4, UNKNOWN, no swap in the window. RED on d27e1066: exit 91 straight from the clear without running the effect
+    /// check, and the message is the bare daemon text: it names neither the seat nor `cys reinject`.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_4_cycle_clear_unknown_swap_not_observed_exits_91_naming_the_seat() {
+        let (rc, error, calls) = r2c_cycle(R2cSeat {
+            clear: r2c_reply(&pending_err()),
+            reinject: r2c_ok(json!({})),
+            swap: false,
+            usage: true,
+            busy_after_clear: false,
+        });
+        let clear_at = calls
+            .iter()
+            .position(|(m, p)| m == "surface.send_text" && p["clear_first"] == true)
+            .expect("the clear was sent");
+        let polled = calls[clear_at + 1..].iter().filter(|(m, _)| m == "surface.list").count();
+        let own = r2c_own(&error);
+        let mut failures = Vec::new();
+        if rc != EXIT_WRITE_OUTCOME_UNKNOWN {
+            failures.push(format!("exit {rc}, want 91"));
+        }
+        if polled == 0 {
+            failures.push("the session_file effect check did not run after the unknown clear".to_string());
+        }
+        if !(own.contains("surface:7") && own.contains("cys reinject --role worker")) {
+            failures.push(format!("the 91 message names neither the seat nor the restore: {error}"));
+        }
+        if r2c_pastes_after_clear(&calls) != 0 {
+            failures.push("reinjected without an observed clear".to_string());
+        }
+        if r2c_quiesce_outcome(&calls).as_deref() != Some("unknown") {
+            failures.push(format!("clear guard outcome {:?}, want unknown", r2c_quiesce_outcome(&calls)));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Row 5 · cycle-agent reinject after a VERIFIED clear (census row 15, cys.rs:21485), REFUSED. RED on d27e1066: exit 1
+    /// (generic) although the seat is cleared and holds no directive; it must be 86 (cleared, reinject held) and say the
+    /// journal refused it.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_5_cycle_reinject_refused_after_a_verified_clear_exits_86_naming_the_journal() {
+        let (rc, error, calls) = r2c_cycle(R2cSeat {
+            clear: r2c_ok(json!({})),
+            reinject: r2c_reply(&journal_err()),
+            swap: true,
+            usage: true,
+            busy_after_clear: false,
+        });
+        assert_eq!(rc, EXIT_CYCLE_REINJECT_HELD, "{error}");
+        assert!(r2c_own(&error).contains("journal"), "{error}");
+        assert_eq!(r2c_pastes_after_clear(&calls), 1, "nothing re-sent");
+        assert_eq!(r2c_quiesce_outcome(&calls).as_deref(), Some("cleared"));
+    }
+
+    /// Row 5, UNKNOWN. Exit 91 already on d27e1066; RED there: the message is the bare daemon text. It does not say the
+    /// reinject may still land, that it must not be re-sent, or which seat to check.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_5_cycle_reinject_unknown_after_a_verified_clear_says_it_may_still_land() {
+        let (rc, error, calls) = r2c_cycle(R2cSeat {
+            clear: r2c_ok(json!({})),
+            reinject: r2c_reply(&pending_err()),
+            swap: true,
+            usage: true,
+            busy_after_clear: false,
+        });
+        assert_eq!(rc, EXIT_WRITE_OUTCOME_UNKNOWN, "{error}");
+        let own = r2c_own(&error);
+        assert!(
+            own.contains("may still land") && own.contains("do not re-send") && own.contains("surface:7"),
+            "the 91 message must say it may still land, not to re-send, and which seat: {error}"
+        );
+        assert_eq!(r2c_pastes_after_clear(&calls), 1, "nothing re-sent");
+    }
+
+    /// Row 6 · cycle-agent held reinject (census row 16, cys.rs:21493): verified clear, the new session never idles, the
+    /// one submission gets UNKNOWN. RED on d27e1066: RESUME is typed again on its own (2 pastes: a duplicate RESUME and a
+    /// second submission) and the exit is 86, not 91.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_6_cycle_held_reinject_unknown_sends_no_second_resume_and_exits_91() {
+        let (rc, error, calls) = r2c_cycle(R2cSeat {
+            clear: r2c_ok(json!({})),
+            reinject: r2c_reply(&pending_err()),
+            swap: true,
+            usage: true,
+            busy_after_clear: true,
+        });
+        assert_eq!((rc, r2c_pastes_after_clear(&calls)), (EXIT_WRITE_OUTCOME_UNKNOWN, 1), "{error}");
+    }
+
+    /// Row 6 control: the same held path with an ok submission exits 86 with one paste, on d27e1066 too.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_6_control_cycle_held_reinject_ok_is_86_with_one_paste() {
+        let (rc, error, calls) = r2c_cycle(R2cSeat {
+            clear: r2c_ok(json!({})),
+            reinject: r2c_ok(json!({})),
+            swap: true,
+            usage: true,
+            busy_after_clear: true,
+        });
+        assert_eq!((rc, r2c_pastes_after_clear(&calls)), (EXIT_CYCLE_REINJECT_HELD, 1), "{error}");
+    }
+
+    /// Row 7 · cycle-agent unmeasurable reinject (census row 17, cys.rs:21528): no statusline (unmeasurable), the one
+    /// submission gets UNKNOWN. RED on d27e1066: RESUME is typed again on its own (2 pastes) and the exit is 81, not 91.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_7_cycle_unmeasurable_reinject_unknown_sends_no_second_resume_and_exits_91() {
+        let (rc, error, calls) = r2c_cycle(R2cSeat {
+            clear: r2c_ok(json!({})),
+            reinject: r2c_reply(&pending_err()),
+            swap: false,
+            usage: false,
+            busy_after_clear: false,
+        });
+        assert_eq!((rc, r2c_pastes_after_clear(&calls)), (EXIT_WRITE_OUTCOME_UNKNOWN, 1), "{error}");
+    }
+
+    /// Row 7 control: the same unmeasurable path with an ok submission exits 81 with one paste, on d27e1066 too.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_7_control_cycle_unmeasurable_reinject_ok_is_81_with_one_paste() {
+        let (rc, error, calls) = r2c_cycle(R2cSeat {
+            clear: r2c_ok(json!({})),
+            reinject: r2c_ok(json!({})),
+            swap: false,
+            usage: false,
+            busy_after_clear: false,
+        });
+        assert_eq!((rc, r2c_pastes_after_clear(&calls)), (EXIT_CLEAR_UNMEASURABLE, 1), "{error}");
+    }
+
+    // ── row 8 · `cys restore` in-seat ──
+
+    /// `cys restore` (no resume) in a child: role worker, whose seat surface:7 is an empty shell, is relaunched in-seat
+    /// with the fake agent `b360agent`. Paste 1 is the launch command (ok); `directive` answers paste 2, the directive.
+    #[cfg(unix)]
+    fn r2c_restore(directive: Value) -> (i32, String, Vec<(String, Value)>) {
+        let pack = R2cPack::new();
+        let cwd = pack.dir.clone();
+        let (mut pastes, mut acked) = (0, false);
+        let daemon = R2cDaemon::start(move |method, _| match method {
+            "system.topology" => r2c_ok(json!({
+                "live": [{"role": "worker", "seat": "empty", "surface_id": 7, "env_injected": true}],
+                "saved": [{"role": "worker", "agent": "b360agent", "cwd": cwd}],
+                "tombstones": []})),
+            "surface.list" => {
+                let mut row = json!({"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "exited": false,
+                                     "agent_alive": true, "line_count": 40});
+                if acked {
+                    row["awakened_at"] = json!(1.0);
+                }
+                r2c_ok(json!({"surfaces": [row]}))
+            }
+            "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                 "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+            "surface.send_text" => {
+                pastes += 1;
+                if pastes == 1 {
+                    r2c_ok(json!({}))
+                } else {
+                    acked = directive["ok"] == true;
+                    directive.clone()
+                }
+            }
+            "surface.create" => r2c_reply("b360_no_spawn: this fake daemon makes no new surface"),
+            _ => r2c_ok(json!({})),
+        });
+        let (rc, out, _err) = r2c_child("restore", &daemon, &pack.envs());
+        (rc, out, daemon.calls())
+    }
+
+    /// Row 8 · `cys restore` in-seat reconnect (census row 20, cys.rs:21809): the in-seat relaunch's directive is REFUSED,
+    /// then (second run) UNKNOWN. Both must keep the seat and exit 90 / 91. RED on d27e1066: both take the fresh-launch
+    /// fallback (`surface.create`), i.e. a second agent for a role whose in-seat agent is already running.
+    /// If this ever fires, check the role for a second agent (two seats for one role) and the seat for a duplicate
+    /// directive (the fresh seat types it again while the in-seat one may still land).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_8_restore_in_seat_never_falls_back_to_a_fresh_launch() {
+        let mut failures = Vec::new();
+        for (name, reply, want) in [
+            ("REFUSED", r2c_reply(&journal_err()), EXIT_DIRECTIVE_REFUSED),
+            ("UNKNOWN", r2c_reply(&pending_err()), EXIT_WRITE_OUTCOME_UNKNOWN),
+        ] {
+            let (rc, out, calls) = r2c_restore(reply);
+            let fresh = calls.iter().filter(|(m, _)| m == "surface.create").count();
+            let pastes = calls.iter().filter(|(m, _)| m == "surface.send_text").count();
+            if fresh != 0 {
+                failures.push(format!("{name}: took the fresh-launch fallback ({fresh}x surface.create) - a second agent on one role"));
+            }
+            if pastes != 2 {
+                failures.push(format!("{name}: {pastes} pastes (launch command + directive = 2; more = a duplicate directive)"));
+            }
+            if calls.iter().any(|(m, _)| m == "surface.close") {
+                failures.push(format!("{name}: the seat was closed"));
+            }
+            if rc != want {
+                failures.push(format!("{name}: exit {rc}, want {want}\n{out}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Row 8 control: an ok directive makes the in-seat relaunch Ready: exit 0, no fresh launch (on d27e1066 too).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_8_control_restore_in_seat_ready_makes_no_fresh_launch() {
+        let (rc, out, calls) = r2c_restore(r2c_ok(json!({})));
+        assert_eq!(rc, 0, "{out}");
+        assert_eq!(calls.iter().filter(|(m, _)| m == "surface.create").count(), 0);
+        assert_eq!(calls.iter().filter(|(m, _)| m == "surface.send_text").count(), 2);
+    }
+
+    // ── rows 9-10 · `cys pack-update` ──
+
+    /// One idle worker seat (surface:7) for pack-update. `reply` answers its directive paste; `reinject.mark` is kept in
+    /// topology as the daemon persists it, so the NEXT pack-update's decision reads it.
+    #[cfg(unix)]
+    fn r2c_pack_daemon(reply: Value) -> R2cDaemon {
+        let mut marker = Value::Null;
+        R2cDaemon::start(move |method, p| match method {
+            "system.topology" => {
+                let mut row = json!({"role": "worker"});
+                if !marker.is_null() {
+                    row["pack_reinject"] = marker.clone();
+                }
+                r2c_ok(json!({"saved": [row]}))
+            }
+            "control.dashboard" => r2c_ok(json!({"fleet": [
+                {"surface_id": 7, "role": "worker", "state": "idle", "idle_secs": 60, "agent_status": "idle"}]})),
+            "surface.list" => r2c_ok(json!({"surfaces": [{"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "exited": false}]})),
+            "surface.read_text" => r2c_ok(json!({"text": ""})),
+            "surface.send_text" => reply.clone(),
+            "reinject.mark" => {
+                marker = json!({"pack_version": p["pack_version"], "directive_hash": p["directive_hash"]});
+                r2c_ok(json!({}))
+            }
+            _ => r2c_ok(json!({})),
+        })
+    }
+
+    #[cfg(unix)]
+    fn r2c_count(calls: &[(String, Value)], method: &str) -> usize {
+        calls.iter().filter(|(m, _)| m == method).count()
+    }
+
+    /// Row 9 · `cys pack-update` node loop (census row 23, cys.rs:23291): two consecutive pack-update decisions for one
+    /// idle seat whose first inject got UNKNOWN. RED on d27e1066: no `reinject.mark` after the unknown inject, so the
+    /// second pack-update types the same directive again (2 pastes: a duplicate if the first one landed).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_9_pack_update_unknown_is_marked_and_the_next_run_does_not_reinject() {
+        let pack = R2cPack::new();
+        let daemon = r2c_pack_daemon(r2c_reply(&pending_err()));
+        let (first, second) = r2c_in_env(&daemon, &pack, || (run_pack_reinject("9.9.9"), run_pack_reinject("9.9.9")));
+        let (first, second) = (first.expect("first pack-update"), second.expect("second pack-update"));
+        let calls = daemon.calls();
+        assert_eq!(
+            (r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark")),
+            (1, 1),
+            "pastes/marks over two pack-updates (first: injected {} failed {} · second: injected {} skipped {})",
+            first.injected, first.failed, second.injected, second.skipped
+        );
+        assert_eq!((first.injected, first.failed, second.skipped), (1, 0, 1), "an unknown inject counts as delivered");
+    }
+
+    /// Row 9 control (REFUSED, unchanged): zero bytes, no mark, the second pack-update re-injects (the safe retry).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_9_control_pack_update_refused_is_not_marked_and_the_next_run_retries() {
+        let pack = R2cPack::new();
+        let daemon = r2c_pack_daemon(r2c_reply(&journal_err()));
+        let (first, _second) = r2c_in_env(&daemon, &pack, || (run_pack_reinject("9.9.9"), run_pack_reinject("9.9.9")));
+        let calls = daemon.calls();
+        assert_eq!((r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark")), (2, 0));
+        assert_eq!(first.expect("first pack-update").failed, 1);
+    }
+
+    /// Row 10 · `cys pack-update` pending pass (census row 24, cys.rs:23433): a pending node whose inject got UNKNOWN, then
+    /// the next pack-update's pending pass. RED on d27e1066: the error is dropped, the node stays pending with no mark,
+    /// and the next pending pass types the directive again (2 pastes).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_10_pending_unknown_is_marked_and_the_next_pack_update_does_not_reinject() {
+        let pack = R2cPack::new();
+        let base = pack.dir.join("state");
+        std::fs::create_dir_all(&base).unwrap();
+        persist_reinject_pending(&base, "9.9.9", &[(7, "worker".to_string())]).unwrap();
+        let daemon = r2c_pack_daemon(r2c_reply(&pending_err()));
+        let (first, second) =
+            r2c_in_env(&daemon, &pack, || (consume_reinject_pending(&base), consume_reinject_pending(&base)));
+        let calls = daemon.calls();
+        assert_eq!(
+            (r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark")),
+            (1, 1),
+            "pastes/marks over two pending passes (first {first:?} · second {second:?})"
+        );
+        assert!(!reinject_pending_path(&base).exists(), "the unknown node is still pending");
+        assert_eq!(first, Ok((1, 0)));
+    }
+
+    /// Row 10 control (REFUSED, unchanged): zero bytes, the node stays pending and the next pass retries it (safe).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2c_10_control_pending_refused_stays_pending_and_is_retried() {
+        let pack = R2cPack::new();
+        let base = pack.dir.join("state");
+        std::fs::create_dir_all(&base).unwrap();
+        persist_reinject_pending(&base, "9.9.9", &[(7, "worker".to_string())]).unwrap();
+        let daemon = r2c_pack_daemon(r2c_reply(&journal_err()));
+        let (first, _second) =
+            r2c_in_env(&daemon, &pack, || (consume_reinject_pending(&base), consume_reinject_pending(&base)));
+        let calls = daemon.calls();
+        assert_eq!((r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark")), (2, 0));
+        assert!(reinject_pending_path(&base).exists(), "a refused node stays pending");
+        assert_eq!(first, Ok((0, 1)));
+    }
 }
