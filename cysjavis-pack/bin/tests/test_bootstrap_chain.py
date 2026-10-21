@@ -1165,6 +1165,14 @@ def r3_s5():
                 check("17-S5 %s (i) %s(0, so+se) is the same on this tree and on %s" % (name, fn, R3_OLD),
                       getattr(new, fn)(0, so + se) == getattr(old, fn)(0, so + se))
         check("17-S5 %s (ii) ★marker ABSENT (the reader parses STDOUT only)" % name, not r["marker"], r3_brief(r))
+        # ★(B-360 R3) mutant M2 (parse the merged text) survived the line above once ruling (b) made an unreadable JSON
+        #   withhold too ("readiness unmeasured"): the absence alone does not prove the reader READ stdout. It did iff
+        #   the withheld row is the boot row itself — directive_unknown, basis "unknown" — and nothing is "unmeasured".
+        rows = (r["sidecar"] or {}).get("rows") or []
+        check("17-S5 %s (ii) ★the withheld row is the boot row (directive_unknown, basis unknown) — stdout was READ"
+              % name, len(rows) == 1 and rows[0].get("outcome") == "directive_unknown"
+              and rows[0].get("basis") == "unknown" and (r["sidecar"] or {}).get("bases") == ["unknown"],
+              json.dumps(rows, ensure_ascii=False)[:300])
 
 
 # ── 18. S6 — P2' durable, NO-DEFICIT run (`cys boot` not called): a v2 record whose pane is still live (same daemon
