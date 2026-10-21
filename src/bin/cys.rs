@@ -31345,10 +31345,12 @@ mod tests {
         //   한 제출로 넣고(`adoption_payload`), 그 한 제출의 보류·실패 사유는 부트 판정(GatePending 처방 ·
         //   in-seat Err 폴백 문안 · fresh rc 1 '기동 실패')으로 밖에 나간다(아래 이사 핀). 남은 셋 = [DRAIN]
         //   브로드캐스트 · 부트 주입 직후 · 팩 업데이트 재주입.
+        // ★(B-360 R2 revise · area P) 동결값 3 → 4: `directive_presence` 의 존재 확인 핑이 네 번째 지점이다 — 그 Err 는
+        //   버려지지 않고 `Presence::Undetermined("presence ping not delivered: {e}")` 로 호출부 문안에 실린다(침묵 0).
         assert_eq!(
             prod.matches("if let Err(e) = inject_text(").count(),
-            3,
-            "주입 사유를 남기는 지점 수가 동결값(3)을 벗어났다 — 줄었다면 침묵이 되살아난 것이다"
+            4,
+            "주입 사유를 남기는 지점 수가 동결값(4)을 벗어났다 — 줄었다면 침묵이 되살아난 것이다"
         );
         assert!(prod.contains("저장 신호 미전달(계속 진행)"), "Hold 사유 문안이 사라졌다: [DRAIN]");
         // 이사 핀 — restore 의 [RESTORE] 한 제출 결과가 사유를 달고 밖으로 나간다(침묵 0).
