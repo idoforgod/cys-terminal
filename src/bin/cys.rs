@@ -44361,6 +44361,12 @@ mod b360_tests {
             "pack-update" => run_pack_update(None, None, false),
             // ★(B-360 R2 revise · area D) the real `cys drain --verify` (exit computed by run_drain_verify)
             "drain-verify" => run(Command::Drain { verify: true, timeout: 2 }),
+            // ★(B-360 R2 revise · area E) the save-file gate (S48) and the verifier handshake (S49), not forced
+            "cycle-save" => {
+                let file = std::env::var("CYS_B360_SAVE_FILE").expect("CYS_B360_SAVE_FILE");
+                run_cycle_agent(None, Some("7".into()), None, vec![file], None, None, 8, false, None)
+            }
+            "cycle-verify" => run_cycle_agent(None, Some("7".into()), Some("cso".into()), vec![], None, None, 8, true, None),
             other => panic!("unknown child caller {other}"),
         };
         let _ = std::io::stdout().flush();
@@ -46349,5 +46355,227 @@ mod b360_tests {
             failures.push(format!("records {records:?}"));
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    // ── ★(B-360 R2 revise) area E · the effect check after an UNKNOWN write still runs ─────────────────────────────────
+    // FIX-SPEC-R2-REVISE area E (census §8: S29 15668, S48 21318, S49 21379, S63 22446 @11717c44; boundary B34). On
+    // UNKNOWN the check that follows the write still runs: affirmative evidence → continue as PASSED; none → the
+    // existing 91. Each row: evidence present (continues) and absent (91).
+
+    /// S29 fixture: `cys restore` (child) relaunches worker in-seat (surface:7); the launch paste is ok, the directive
+    /// paste gets `directive`; with `acks`, the seat's ack latch (`awakened_at`) appears after it anyway (it landed).
+    #[cfg(unix)]
+    fn r2e_restore(directive: Value, acks: bool) -> (i32, String, Vec<(String, Value)>) {
+        let pack = R2cPack::new();
+        let cwd = pack.dir.clone();
+        let (mut pastes, mut acked) = (0, false);
+        let daemon = R2cDaemon::start(move |method, _| match method {
+            "system.topology" => r2c_ok(json!({
+                "live": [{"role": "worker", "seat": "empty", "surface_id": 7, "env_injected": true}],
+                "saved": [{"role": "worker", "agent": "b360agent", "cwd": cwd}],
+                "tombstones": []})),
+            "surface.list" => {
+                let mut row = json!({"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "exited": false,
+                                     "agent_alive": true, "line_count": 40});
+                if acked {
+                    row["awakened_at"] = json!(1.0);
+                }
+                r2c_ok(json!({"surfaces": [row]}))
+            }
+            "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                 "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+            "surface.send_text" => {
+                pastes += 1;
+                if pastes == 1 {
+                    r2c_ok(json!({}))
+                } else {
+                    acked = acks || directive["ok"] == true;
+                    directive.clone()
+                }
+            }
+            "surface.create" => r2c_reply("b360_no_spawn: this fake daemon makes no new surface"),
+            _ => r2c_ok(json!({})),
+        });
+        let (rc, out, _err) = r2c_child("restore", &daemon, &pack.envs());
+        (rc, out, daemon.calls())
+    }
+
+    /// Area E · S29 (`inject_directive_after_ready`): the directive paste is UNKNOWN but the ack latch appears → the
+    /// directive landed: the relaunch continues as Ready (restore exit 0, `directive.verify` verified). RED on f789cfc2:
+    /// 91 at the paste, the ACK wait never runs.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_e1_directive_unknown_but_acked_continues_as_ready() {
+        let (rc, out, calls) = r2e_restore(r2c_reply(&pending_err()), true);
+        let verify = calls.iter().find(|(m, _)| m == "directive.verify").map(|(_, p)| p.clone());
+        assert_eq!(rc, 0, "{out}");
+        assert_eq!(verify.as_ref().map(|p| p["verified"].clone()), Some(json!(true)), "{verify:?}");
+    }
+
+    /// Area E · S29, no ack within the window → the existing 91, and the verification is recorded as not verified with a
+    /// reason carrying `write_outcome_unknown` (B34: the bool cannot say unknown; the reason can, without a daemon change).
+    /// RED on f789cfc2: 91, but `directive.verify` is never called for an UNKNOWN.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_e2_directive_unknown_not_acked_is_91_and_recorded_as_not_verified() {
+        let (rc, out, calls) = r2e_restore(r2c_reply(&pending_err()), false);
+        let verify = calls.iter().find(|(m, _)| m == "directive.verify").map(|(_, p)| p.clone());
+        assert_eq!(rc, EXIT_WRITE_OUTCOME_UNKNOWN, "{out}");
+        let v = verify.unwrap_or_else(|| panic!("directive.verify not called after the UNKNOWN directive"));
+        assert!(
+            v["verified"] == false && v["reason"].as_str().is_some_and(|r| r.contains(cys::ERR_WRITE_OUTCOME_UNKNOWN)),
+            "{v}"
+        );
+    }
+
+    /// S48/S49 fixture: `cys cycle-agent` (child) on surface:7 (worker · claude, statusline swaps on /clear).
+    /// `save` answers the save instruction (and with `save_lands` the watched file changes 300 ms later);
+    /// `verifier`: Some(reply) runs the 2-phase handshake with verifier cso (surface:8): its paste gets `reply`, and
+    /// `receipt` says whether the verifier's allow receipt shows up in `feed.list`.
+    #[cfg(unix)]
+    fn r2e_cycle(save: Value, save_lands: bool, verifier: Option<Value>, receipt: bool) -> (i32, String, Vec<(String, Value)>) {
+        let pack = R2cPack::new();
+        let cwd = pack.dir.clone();
+        let save_file = pack.dir.join("save.md");
+        std::fs::write(&save_file, "# before\n").unwrap();
+        let sf = save_file.clone();
+        let mut cleared = false;
+        let what = if verifier.is_some() { "cycle-verify" } else { "cycle-save" };
+        let daemon = R2cDaemon::start(move |method, p| {
+            let sid = p["surface_id"].as_u64().unwrap_or(0);
+            match method {
+                "surface.list" => {
+                    let file = if cleared { "S2" } else { "S1" };
+                    r2c_ok(json!({"surfaces": [
+                        {"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude", "exited": false,
+                         "awakened_at": 1.0, "cwd": cwd, "live_cwd": cwd, "usage": {"source": "statusline", "session_file": file}},
+                        {"surface_id": 8, "surface_ref": "surface:8", "role": "cso", "agent": "claude", "exited": false,
+                         "awakened_at": 1.0}]}))
+                }
+                "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                     "quiet_secs": 5.0, "line_count": 40})),
+                "system.resolve_role" => r2c_ok(json!({"surface_id": 8})),
+                "feed.push" => r2c_ok(json!({"request_id": "r1"})),
+                "feed.list" if receipt => r2c_ok(json!({"items": [
+                    {"request_id": "r1", "status": "resolved", "decision": "allow", "resolver_surface": 8}]})),
+                "feed.list" => r2c_ok(json!({"items": []})),
+                "surface.send_text" if sid == 8 => verifier.clone().unwrap_or_else(|| r2c_ok(json!({}))),
+                "surface.send_text" if p["clear_first"] == true => {
+                    cleared = true;
+                    r2c_ok(json!({}))
+                }
+                "surface.send_text" if !cleared => {
+                    if save_lands {
+                        let f = sf.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(std::time::Duration::from_millis(300));
+                            let _ = std::fs::write(&f, "# saved\n");
+                        });
+                    }
+                    save.clone()
+                }
+                _ => r2c_ok(json!({})),
+            }
+        });
+        let mut envs = pack.envs();
+        envs.push(("CYS_B360_SAVE_FILE", save_file.into_os_string()));
+        let (rc, _out, err) = r2c_child(what, &daemon, &envs);
+        let error = err.lines().filter(|l| l.starts_with("error: ")).last().unwrap_or_default().to_string();
+        (rc, error, daemon.calls())
+    }
+
+    /// Area E · S48 (cycle save instruction): UNKNOWN, and the watched save file changes → the save landed; the cycle
+    /// continues (clear + reinject) and exits 0. RED on f789cfc2: 91 at the paste, before the save-file gate.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_e3_cycle_save_unknown_but_the_file_changed_continues() {
+        let (rc, error, calls) = r2e_cycle(r2c_reply(&pending_err()), true, None, false);
+        let cleared = calls.iter().any(|(m, p)| m == "surface.send_text" && p["clear_first"] == true);
+        assert_eq!((rc, cleared), (0, true), "{error}");
+    }
+
+    /// Area E · S48, the save file does not change in the window → 91, and the message says the save check ran (no
+    /// clear). RED on f789cfc2: 91 straight from the paste, the bare daemon text, no gate.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_e4_cycle_save_unknown_and_no_file_change_is_91_after_the_gate() {
+        let (rc, error, calls) = r2e_cycle(r2c_reply(&pending_err()), false, None, false);
+        let cleared = calls.iter().any(|(m, p)| m == "surface.send_text" && p["clear_first"] == true);
+        assert_eq!((rc, cleared), (EXIT_WRITE_OUTCOME_UNKNOWN, false), "{error}");
+        assert!(r2c_own(&error).contains("did not change"), "the 91 must say the save check ran: {error}");
+    }
+
+    /// Area E · S49 (cycle verifier request): the verifier's paste is UNKNOWN, but its allow receipt arrives → the
+    /// cycle continues and exits 0. RED on f789cfc2: 91 at the paste, before the receipt poll.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_e5_cycle_verifier_paste_unknown_but_receipt_arrives_continues() {
+        let (rc, error, calls) = r2e_cycle(r2c_ok(json!({})), false, Some(r2c_reply(&pending_err())), true);
+        let cleared = calls.iter().any(|(m, p)| m == "surface.send_text" && p["clear_first"] == true);
+        assert_eq!((rc, cleared), (0, true), "{error}");
+    }
+
+    /// Area E · S49, no receipt in the window → 91 after the poll ran (no clear). RED on f789cfc2: 91 at the paste and
+    /// `feed.list` is never polled.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_e6_cycle_verifier_paste_unknown_and_no_receipt_is_91_after_the_poll() {
+        let (rc, error, calls) = r2e_cycle(r2c_ok(json!({})), false, Some(r2c_reply(&pending_err())), false);
+        let polled = r2c_count(&calls, "feed.list");
+        let cleared = calls.iter().any(|(m, p)| m == "surface.send_text" && p["clear_first"] == true);
+        assert_eq!((rc, cleared), (EXIT_WRITE_OUTCOME_UNKNOWN, false), "{error}");
+        assert!(polled > 0, "the receipt poll did not run after the UNKNOWN verifier paste");
+    }
+
+    /// S63 fixture: `cys reinject --role worker --check --timeout 1` in-process; the ping paste gets UNKNOWN; `ack`:
+    /// whether the ACK shows on screen. Returns (exit, requests).
+    #[cfg(unix)]
+    fn r2e_reinject_check(ack: bool) -> (i32, Vec<(String, Value)>) {
+        let pack = R2cPack::new();
+        let session = pack.dir.join("session.jsonl");
+        std::fs::write(&session, "").unwrap();
+        let daemon = R2cDaemon::start(move |method, _| match method {
+            "system.resolve_role" => r2c_ok(json!({"surface_id": 7})),
+            "surface.list" => r2c_ok(json!({"surfaces": [{"surface_id": 7, "surface_ref": "surface:7", "role": "worker",
+                "agent": "claude", "exited": false, "agent_alive": true, "awakened_at": 1.0,
+                "usage": {"source": "transcript", "session_file": session.to_string_lossy()}}]})),
+            "surface.read_text" => r2c_ok(json!({"text": "", "latest_cursor": 40})),
+            "surface.send_text" => r2c_reply(&pending_err()),
+            "surface.wait_for" => r2c_ok(json!({"matched": ack})),
+            _ => r2c_ok(json!({})),
+        });
+        let rc = r2c_in_env(&daemon, &pack, || run_reinject(Some("worker".into()), None, true, 1, false));
+        (rc, daemon.calls())
+    }
+
+    /// Area E · S63 (`reinject --check` ping): the ping is UNKNOWN, but the ACK shows → the directive is alive: exit 0,
+    /// nothing re-injected. RED on f789cfc2: 91 at the ping, the ACK wait never runs.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_e7_reinject_check_ping_unknown_but_acked_is_alive() {
+        let (rc, calls) = r2e_reinject_check(true);
+        assert_eq!((rc, r2c_count(&calls, "surface.send_text")), (0, 1));
+    }
+
+    /// Area E · S63, no ACK → 91 after the wait ran, and no reinject (one paste: the ping). RED on f789cfc2: 91 without
+    /// waiting (`surface.wait_for` never asked).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_e8_reinject_check_ping_unknown_not_acked_is_91_after_the_wait_and_no_reinject() {
+        let (rc, calls) = r2e_reinject_check(false);
+        assert_eq!((rc, r2c_count(&calls, "surface.send_text")), (EXIT_WRITE_OUTCOME_UNKNOWN, 1));
+        assert!(r2c_count(&calls, "surface.wait_for") > 0, "the ACK wait did not run after the UNKNOWN ping");
+    }
+
+    /// Area E · S48/S49 controls (pass on f789cfc2 too): with PASSED writes the same fixture reaches the clear and exits 0
+    /// — so e3/e5's red is the UNKNOWN handling, not the fixture.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_e3_e5_control_cycle_with_passed_writes_reaches_the_clear_and_exits_0() {
+        for (name, verifier, receipt) in [("save gate", None, false), ("verifier", Some(r2c_ok(json!({}))), true)] {
+            let (rc, error, calls) = r2e_cycle(r2c_ok(json!({})), true, verifier, receipt);
+            let cleared = calls.iter().any(|(m, p)| m == "surface.send_text" && p["clear_first"] == true);
+            assert_eq!((rc, cleared), (0, true), "{name}: {error}");
+        }
     }
 }
