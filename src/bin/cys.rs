@@ -44723,6 +44723,20 @@ mod b360_tests {
                 run_cycle_agent(None, Some("7".into()), None, vec![file], None, None, 8, false, None)
             }
             "cycle-verify" => run_cycle_agent(None, Some("7".into()), Some("cso".into()), vec![], None, None, 8, true, None),
+            // ★(B-360 R3 · option 2) any CLI line, parsed by clap exactly as `main` parses it (`CYS_B360_CLI_ARGS` = the
+            //   argv as a JSON array). A subcommand this binary does not have is clap's usage error (exit 2) — so a
+            //   specimen of a NEW subcommand compiles on the tree before it and is RED there, not uncompilable.
+            "cli" => {
+                let argv: Vec<String> =
+                    serde_json::from_str(&std::env::var("CYS_B360_CLI_ARGS").expect("CYS_B360_CLI_ARGS")).expect("argv JSON");
+                match <Cli as clap::Parser>::try_parse_from(&argv) {
+                    Ok(cli) => run(cli.command),
+                    Err(e) => {
+                        eprint!("{e}");
+                        2
+                    }
+                }
+            }
             other => panic!("unknown child caller {other}"),
         };
         let _ = std::io::stdout().flush();
@@ -47623,5 +47637,454 @@ mod b360_tests {
     fn b360_r2r_c6_the_notice_key_matches_cysd_opaque_label_on_a_fixed_input() {
         assert_eq!(kept_pane_notice_key("cpu_high"), "#ce4c6bff0d4d933a");
         assert_eq!(r2n_key("cpu_high"), "#ce4c6bff0d4d933a");
+    }
+
+    // ── ★(B-360 R3 · option 2) area R: kept-pane record schema v2, the deferral pair, `cys kept-pane-notice` ─────────
+    // FIX-SPEC-option2-v2 §1, §7 A1/A2, and worker-7's veto of §1e (a records OUT FILE named by
+    // `CYS_KEPT_PANE_RECORDS_OUT`, not a boot-JSON key: the boot JSON is untouched). These specimens compile on af41d65c:
+    // they read the record file, the out file, the child's stderr, the RPCs the fake daemon records and a CLI line parsed
+    // by clap (`cli` child) — never a symbol the fix adds. The pure-function pins of the fix are in the fix commit.
+
+    /// The fake daemon's `org.status` (FIX-SPEC F5 shape): daemon instance 1234.5; surface:7 with session `sess-7`,
+    /// created 1000.25; master surface:1.
+    #[cfg(unix)]
+    fn r3_status() -> Value {
+        r2c_ok(json!({"daemon": {"started_at": 1234.5},
+                      "surfaces": [
+                          {"surface_id": 1, "role": "master", "registered_session_id": "sess-m", "created_at": 900.0, "exited": false},
+                          {"surface_id": 7, "role": "worker", "registered_session_id": "sess-7", "created_at": 1000.25, "exited": false}]}))
+    }
+
+    /// One `cys boot --json` child of [`r3_boot_adopt`].
+    #[cfg(unix)]
+    struct R3Run {
+        rc: i32,
+        err: String,
+        calls: Vec<(String, Value)>,
+        records: Vec<Value>,
+        /// the fake daemon's socket (= the child's `CYS_SOCKET`)
+        sock: String,
+        pack: R2cPack,
+    }
+
+    /// The requests the kept-pane notice makes to master: resolve master, scan its queue, send to surface:1.
+    #[cfg(unix)]
+    fn r3_master_calls(calls: &[(String, Value)]) -> usize {
+        calls
+            .iter()
+            .filter(|(m, p)| {
+                (m == "system.resolve_role" && p["role"] == "master")
+                    || m == "queue.list"
+                    || (m == "surface.send_text" && p["surface_id"] == 1)
+            })
+            .count()
+    }
+
+    /// `cys boot --json` (child) adopting the gate-pending worker seat surface:7 (cso and the reviewers awake): `reply`
+    /// answers the adoption paste, `status` answers `org.status`, master is surface:1 with an empty queue whose queued send
+    /// is accepted. `knobs` are extra env vars for the child; `{pack}` in a value is replaced by the fixture's dir.
+    #[cfg(unix)]
+    fn r3_boot_adopt(reply: Value, status: Value, knobs: &[(&'static str, &str)]) -> R3Run {
+        let pack = R2cPack::new();
+        let daemon = R2cDaemon::start(move |method, p| match method {
+            "surface.list" => {
+                let awake = |sid: u64, role: &str, agent: &str| {
+                    json!({"surface_id": sid, "surface_ref": format!("surface:{sid}"), "role": role, "agent": agent,
+                           "exited": false, "awakened_at": 1.0, "agent_alive": true, "seat": "occupied"})
+                };
+                let worker = json!({"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude",
+                                    "exited": false, "agent_alive": true, "seat": "occupied", "line_count": 40,
+                                    "gate_pending": {"gate": GATE_ID_UNIDENTIFIED, "followup": null}});
+                r2c_ok(json!({"surfaces": [awake(3, "cso", "claude"), worker, awake(4, "reviewer-gemini", "gemini"),
+                                           awake(5, "reviewer-codex", "codex"), awake(6, "reviewer-grok", "grok")]}))
+            }
+            "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                 "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+            "org.status" => status.clone(),
+            "system.resolve_role" if p["role"] == "master" => r2c_ok(json!({"surface_id": 1})),
+            "queue.list" => r2c_ok(json!({"entries": []})),
+            "surface.send_text" if p["surface_id"] == 1 => r2c_ok(json!({"queued": true})),
+            "surface.send_text" => reply.clone(),
+            "surface.create" => r2c_reply("b360_no_spawn: this fake daemon makes no new surface"),
+            _ => r2c_ok(json!({})),
+        });
+        let mut envs = pack.envs();
+        let mut path = std::ffi::OsString::from(pack.dir.join("bin"));
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        envs.push(("PATH", path));
+        let dir = pack.dir.to_string_lossy().into_owned();
+        envs.extend(knobs.iter().map(|(k, v)| (*k, std::ffi::OsString::from(v.replace("{pack}", &dir)))));
+        let (rc, _out, err) = r2c_child("boot", &daemon, &envs);
+        let records = r2b_records(&pack);
+        R3Run { rc, err, calls: daemon.calls(), records, sock: daemon.sock.to_string_lossy().into_owned(), pack }
+    }
+
+    /// Area R · §1c record schema v2 (+ A1): the kept-pane record `cys boot` writes for an adoption UNKNOWN on surface:7
+    /// carries `schema: 2`, `withholds_ready: true`, the seat identity from `org.status` (`session_id` = the surface's
+    /// `registered_session_id`, `surface_created_at` = its `created_at`), `identity_unmeasured: false`, and `owner: {writer:
+    /// "cys", pid, socket: this command's socket, daemon_started_at}`; every R2 field is unchanged. The pid is attribution
+    /// only (A1). Source half: the identity lookup never calls `request()` (autostart / process::exit) — only the bounded
+    /// `request_on_timeout`. RED on af41d65c: none of the v2 fields exist, nor the identity helper.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k1_a_kept_pane_record_carries_schema_2_identity_owner_and_withholds_ready() {
+        let run = r3_boot_adopt(r2c_reply(&pending_err()), r3_status(), &[]);
+        let mut failures = Vec::new();
+        if run.rc != 0 || run.records.len() != 1 {
+            failures.push(format!("boot exit {} with {} record(s) (want 0 and 1)\n{}", run.rc, run.records.len(), run.err));
+        }
+        let r = run.records.first().cloned().unwrap_or(Value::Null);
+        for (k, want) in [("command", json!("boot")), ("surface_id", json!(7)), ("role", json!("worker")),
+                          ("agent", json!("claude")), ("outcome", json!("unknown")), ("write", json!("adoption")),
+                          ("request_id", json!("w1-2"))] {
+            if r[k] != want {
+                failures.push(format!("R2 field {k} = {} (want {want})", r[k]));
+            }
+        }
+        for (k, want) in [("schema", json!(2)), ("withholds_ready", json!(true)), ("session_id", json!("sess-7")),
+                          ("surface_created_at", json!(1000.25)), ("identity_unmeasured", json!(false))] {
+            if r[k] != want {
+                failures.push(format!("v2 field {k} = {} (want {want})", r[k]));
+            }
+        }
+        let o = &r["owner"];
+        if o["writer"] != "cys" || o["pid"].as_u64().is_none() || o["socket"] != run.sock.as_str() || o["daemon_started_at"] != 1234.5 {
+            failures.push(format!("owner {o} (want writer cys, a pid, socket {}, daemon_started_at 1234.5)", run.sock));
+        }
+        if r2c_count(&run.calls, "org.status") == 0 {
+            failures.push("the identity was not looked up through org.status".to_string());
+        }
+        let src = include_str!("cys.rs");
+        let head = format!("\nfn {}(", "kept_pane_seat_identity");
+        match src.find(&head) {
+            None => failures.push("no identity helper `kept_pane_seat_identity`".to_string()),
+            Some(at) => {
+                let body = &src[at..at + src[at..].find("\n}\n").expect("end")];
+                let plain = body.match_indices("request(").filter(|(i, _)| !body[..*i].ends_with('_')).count();
+                if plain != 0 || !body.contains("request_on_timeout(") {
+                    failures.push(format!("the identity lookup is not bounded-only:\n{body}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}\nrecord: {r}", failures.join("\n"));
+    }
+
+    /// Area R · §1c lookup failure: `org.status` answers an error → the record is STILL written, with `session_id`,
+    /// `surface_created_at` and `owner.daemon_started_at` null and `identity_unmeasured: true` (owner.writer / socket /
+    /// pid are known without the daemon). The time bound of the lookup is pinned on the helper in the fix commit (a
+    /// listener that never answers; it cannot compile here). RED on af41d65c: no such fields.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k2_an_unreadable_identity_still_records_with_nulls_and_identity_unmeasured() {
+        let run = r3_boot_adopt(r2c_reply(&pending_err()), r2c_reply("rpc_failed: the fake daemon refuses org.status"), &[]);
+        let r = run.records.first().cloned().unwrap_or(Value::Null);
+        let ok = run.records.len() == 1
+            && r["schema"] == 2
+            && r["withholds_ready"] == true
+            && r["identity_unmeasured"] == true
+            && r["session_id"].is_null()
+            && r["surface_created_at"].is_null()
+            && r.get("session_id").is_some()
+            && r.get("surface_created_at").is_some()
+            && r["owner"]["daemon_started_at"].is_null()
+            && r["owner"].get("daemon_started_at").is_some()
+            && r["owner"]["writer"] == "cys"
+            && r["owner"]["socket"] == run.sock.as_str();
+        assert!(ok, "records {:?}\n{}", run.records, run.err);
+    }
+
+    /// Area R · §1b durable readiness through the REAL writers: every UNKNOWN / unrecognised record says
+    /// `withholds_ready: true`, every REFUSED (zero bytes) record says `false` — boot adoption UNKNOWN; boot's launch-agent
+    /// directive REFUSED / UNKNOWN and launch REFUSED / UNKNOWN; node-recover UNKNOWN / REFUSED; node-recover unrecognised
+    /// (57). The full write × outcome table is pinned on the pure function in the fix commit.
+    /// RED on af41d65c: no record carries `withholds_ready`, and the unrecognised recovery writes no record.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k3_withholds_ready_is_true_for_every_unknown_and_unrecognised_and_false_for_refused() {
+        let generic = r2c_reply("rpc_failed: the fake daemon fails this write generically");
+        let mut cases: Vec<(&str, Vec<Value>, &str, &str, bool)> = Vec::new();
+        cases.push(("boot adoption UNKNOWN", r3_boot_adopt(r2c_reply(&pending_err()), r3_status(), &[]).records, "adoption", "unknown", true));
+        for (name, launch, directive, write, outcome, want) in [
+            ("launch-agent directive REFUSED", r2c_ok(json!({})), r2c_reply(&journal_err()), "directive", "refused", false),
+            ("launch-agent directive UNKNOWN", r2c_ok(json!({})), r2c_reply(&pending_err()), "directive", "unknown", true),
+            ("launch-agent launch REFUSED", r2c_reply(&journal_err()), r2c_ok(json!({})), "launch", "refused", false),
+            ("launch-agent launch UNKNOWN", r2c_reply(&pending_err()), r2c_ok(json!({})), "launch", "unknown", true),
+        ] {
+            cases.push((name, r2b_boot_launch(launch, directive).4, write, outcome, want));
+        }
+        cases.push(("node-recover UNKNOWN", r2b_boot_recover(r2c_reply(&pending_err()), &[]).4, "recover", "unknown", true));
+        cases.push(("node-recover REFUSED", r2b_boot_recover(r2c_reply(&journal_err()), &[]).4, "recover", "refused", false));
+        cases.push(("node-recover unrecognised 57", r2b_boot_recover(generic, &[(R2B_RECOVER_RC, "57")]).4, "recover", "unrecognised", true));
+        let mut failures = Vec::new();
+        for (name, records, write, outcome, want) in cases {
+            let ok = records.len() == 1
+                && records[0]["write"] == write
+                && records[0]["outcome"] == outcome
+                && records[0]["withholds_ready"] == want;
+            if !ok {
+                failures.push(format!("{name}: want one record {{write {write}, outcome {outcome}, withholds_ready {want}}}: {records:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area R · §1d: node-recover returning a code run_boot does not know (57) → outcome `recover_unrecognised` AND one
+    /// kept-pane record {command boot, surface 7, role worker, write recover, outcome unrecognised, withholds_ready true}:
+    /// the durable form of the 4th unknown-class variant (FIX-SPEC F6). No reclaim, no spawn (unchanged).
+    /// RED on af41d65c: the arm writes no record.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k4_an_unrecognised_recover_code_writes_one_unrecognised_record() {
+        let generic = r2c_reply("rpc_failed: the fake daemon fails this write generically");
+        let (rc, report, text, calls, records) = r2b_boot_recover(generic, &[(R2B_RECOVER_RC, "57")]);
+        let mut failures = Vec::new();
+        if r2c_role(&report, "worker")["outcome"] != "recover_unrecognised" || rc != 0 {
+            failures.push(format!("prerequisite: worker {} exit {rc}", r2c_role(&report, "worker")));
+        }
+        if text.contains("reclaim 에스컬레이션") || r2c_count(&calls, "surface.create") != 0 {
+            failures.push("prerequisite: an unrecognised code reached reclaim / a spawn".to_string());
+        }
+        let ok = records.len() == 1
+            && records[0]["command"] == "boot"
+            && records[0]["surface_id"] == 7
+            && records[0]["role"] == "worker"
+            && records[0]["write"] == "recover"
+            && records[0]["outcome"] == "unrecognised"
+            && records[0]["withholds_ready"] == true;
+        if !ok {
+            failures.push(format!("records {records:?}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The deferral pair (worker-7's veto of §1e/§1f).
+    #[cfg(unix)]
+    const R3_NOTICE_ENV: &str = "CYS_KEPT_PANE_NOTICE";
+    #[cfg(unix)]
+    const R3_OUT_ENV: &str = "CYS_KEPT_PANE_RECORDS_OUT";
+
+    /// Area R · deferral: with `CYS_KEPT_PANE_NOTICE=caller` AND `CYS_KEPT_PANE_RECORDS_OUT=<abs path>`, the outermost
+    /// command sends NOTHING to master (no resolve, no queue scan, no send), writes this run's records to the path as one
+    /// JSON array, and says so in one stderr line `[kept-pane] notice deferred to the caller (1 record(s) written to
+    /// <path>)`; a run with no kept pane writes `[]` (0 record(s)). Control: without the knob the notice is sent (today).
+    /// RED on af41d65c: the knob is ignored — the notice is sent and no file is written.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k5_the_deferral_pair_writes_the_records_out_file_and_sends_nothing() {
+        let mut failures = Vec::new();
+        for (name, reply, count) in [("one kept pane", r2c_reply(&pending_err()), 1usize), ("no kept pane", r2c_ok(json!({})), 0)] {
+            let run = r3_boot_adopt(reply, r3_status(), &[(R3_NOTICE_ENV, "caller"), (R3_OUT_ENV, "{pack}/kp-out.json")]);
+            let out = run.pack.dir.join("kp-out.json");
+            if r3_master_calls(&run.calls) != 0 {
+                failures.push(format!("{name}: {} request(s) toward master although the caller deferred", r3_master_calls(&run.calls)));
+            }
+            let line = format!("[kept-pane] notice deferred to the caller ({count} record(s) written to {})", out.display());
+            if !run.err.lines().any(|l| l == line) {
+                failures.push(format!("{name}: no stderr line {line:?}\n{}", run.err));
+            }
+            match std::fs::read_to_string(&out).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+                Some(Value::Array(a)) if a.len() == count && (count == 0 || a[0] == run.records[0]) => {}
+                other => failures.push(format!("{name}: out file {other:?} (want an array of this run's {count} record(s))")),
+            }
+        }
+        let control = r3_boot_adopt(r2c_reply(&pending_err()), r3_status(), &[]);
+        if control.calls.iter().filter(|(m, p)| m == "surface.send_text" && p["surface_id"] == 1).count() != 1 {
+            failures.push(format!("control: no notice sent without the knob\n{}", control.err));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area R · deferral, half-configured: only ONE of the two vars set → today's behaviour (the notice IS sent; no out
+    /// file) plus one stderr line naming the missing var — never a silently dropped notice.
+    /// RED on af41d65c: the notice is sent, but no line names the missing var.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k6_only_one_deferral_var_falls_back_to_sending_and_names_the_missing_var() {
+        let mut failures = Vec::new();
+        for (name, knobs, missing) in [
+            ("notice only", vec![(R3_NOTICE_ENV, "caller")], R3_OUT_ENV),
+            ("out only", vec![(R3_OUT_ENV, "{pack}/kp-out.json")], R3_NOTICE_ENV),
+        ] {
+            let run = r3_boot_adopt(r2c_reply(&pending_err()), r3_status(), &knobs);
+            if run.calls.iter().filter(|(m, p)| m == "surface.send_text" && p["surface_id"] == 1).count() != 1 {
+                failures.push(format!("{name}: the notice was not sent\n{}", run.err));
+            }
+            if run.pack.dir.join("kp-out.json").exists() {
+                failures.push(format!("{name}: an out file was written although the deferral is half-configured"));
+            }
+            if !run.err.lines().any(|l| l.starts_with("[kept-pane]") && l.contains(missing)) {
+                failures.push(format!("{name}: no [kept-pane] stderr line names {missing}\n{}", run.err));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The result of one `cys kept-pane-notice` child.
+    #[cfg(unix)]
+    struct R3Notice {
+        rc: i32,
+        err: String,
+        calls: Vec<(String, Value)>,
+        record_path: String,
+    }
+
+    /// The queued notices to master (surface:1) among `calls`.
+    #[cfg(unix)]
+    fn r3_notices(calls: &[(String, Value)]) -> Vec<String> {
+        calls
+            .iter()
+            .filter(|(m, p)| m == "surface.send_text" && p["surface_id"] == 1)
+            .map(|(_, p)| p["text"].as_str().unwrap_or("").to_string())
+            .collect()
+    }
+
+    /// Runs `cys kept-pane-notice --input <file|->` as a child of THIS test binary (argv parsed by clap like `main`):
+    /// `input` is the JSON text (written to a file in the fixture, or piped to stdin when `stdin`), `pending` = the texts
+    /// already pending in master's queue (built from the fixture's record path), `master` = master resolves to surface:1
+    /// (else role_not_found).
+    #[cfg(unix)]
+    fn r3_notice(input: &str, stdin: bool, pending: impl FnOnce(&str) -> Vec<String>, master: bool) -> R3Notice {
+        use std::io::Write as _;
+        let pack = R2cPack::new();
+        let record_path = pack.dir.join(".kept-pane-records.jsonl").to_string_lossy().into_owned();
+        let pending = pending(&record_path);
+        let daemon = R2cDaemon::start(move |method, p| match method {
+            "system.resolve_role" if p["role"] == "master" => {
+                if master {
+                    r2c_ok(json!({"surface_id": 1}))
+                } else {
+                    r2c_reply("role_not_found: no live seat holds role master")
+                }
+            }
+            "queue.list" if p["surface_id"] == 1 => {
+                let entries: Vec<Value> =
+                    pending.iter().enumerate().map(|(i, t)| json!({"index": i, "preview": t, "text": t})).collect();
+                r2c_ok(json!({"entries": entries}))
+            }
+            "surface.send_text" if p["surface_id"] == 1 => r2c_ok(json!({"queued": true})),
+            _ => r2c_ok(json!({})),
+        });
+        let file = pack.dir.join("notice-in.json");
+        std::fs::write(&file, input).unwrap();
+        let arg = if stdin { "-".to_string() } else { file.to_string_lossy().into_owned() };
+        let argv = json!(["cys", "kept-pane-notice", "--input", arg]).to_string();
+        let _guard = super::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["b360_tests::b360_r2c_child", "--exact", "--ignored", "--nocapture", "--test-threads=1"])
+            .env(R2C_CHILD, "cli")
+            .env("CYS_B360_CLI_ARGS", argv)
+            .env(cys::ENV_SOCKET, &daemon.sock)
+            .env("CYS_NO_AUTOSTART", "1")
+            .envs(pack.envs().into_iter())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the child specimen");
+        {
+            let mut w = child.stdin.take().expect("stdin");
+            if stdin {
+                let _ = w.write_all(input.as_bytes());
+            }
+        }
+        let out = child.wait_with_output().expect("child output");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(stdout.contains("running 1 test"), "the child specimen did not run:\n{stdout}");
+        R3Notice {
+            rc: out.status.code().unwrap_or(-1),
+            err: String::from_utf8_lossy(&out.stderr).into_owned(),
+            calls: daemon.calls(),
+            record_path,
+        }
+    }
+
+    /// The marker and consequences the specimens' withheld inputs name.
+    #[cfg(unix)]
+    const R3_MARKER: &str = "/h/.cys/.master-bootstrapped";
+
+    /// A `kept-pane-notice` input: one UNKNOWN adoption record of surface:7, and the withheld clause when `withheld`.
+    #[cfg(unix)]
+    fn r3_notice_input(withheld: bool) -> String {
+        let rw = if withheld {
+            json!({"marker": R3_MARKER, "lane": "base", "consequences": ["c-one", "c-two"]})
+        } else {
+            Value::Null
+        };
+        json!({"command": "bootstrap",
+               "records": [{"surface_id": 7, "role": "worker", "write": "adoption", "outcome": "unknown"}],
+               "ready_withheld": rw})
+        .to_string()
+    }
+
+    /// The withheld notice's key (§1g): `#` + FNV-1a 64 over `<record path>|ready-withheld|<marker>`.
+    #[cfg(unix)]
+    fn r3_withheld_key(record_path: &str) -> String {
+        r2n_key(&format!("{record_path}|ready-withheld|{R3_MARKER}"))
+    }
+
+    /// Area R · §1g `cys kept-pane-notice --input <file|->`, the single sender for a caller that deferred: ONE queued
+    /// notice to master whose text is today's `[kept-pane] key=… N pane(s) …` (command, count, record path) plus, when
+    /// `ready_withheld` is set, ` — READY MARKER WITHHELD: <marker> — while it is absent: <c1>; <c2>`, under the SECOND key
+    /// (`<record path>|ready-withheld|<marker>`); a plain input keeps the plain key and has no clause; stdin (`-`) works;
+    /// exit 0. Bad input → exit 2 with nothing asked of the daemon; master unresolvable → exit 3.
+    /// RED on af41d65c: the subcommand does not exist (clap usage error, exit 2, nothing sent).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k7_kept_pane_notice_sends_one_notice_with_the_withheld_clause_under_the_second_key() {
+        let mut failures = Vec::new();
+        let w = r3_notice(&r3_notice_input(true), false, |_| vec![], true);
+        let notices = r3_notices(&w.calls);
+        let head = format!("[kept-pane] key={} 1 pane(s) kept by `cys bootstrap`", r3_withheld_key(&w.record_path));
+        let clause = format!(" — READY MARKER WITHHELD: {R3_MARKER} — while it is absent: c-one; c-two");
+        if w.rc != 0 || notices.len() != 1 || !notices[0].starts_with(&head) || !notices[0].contains(&clause)
+            || !notices[0].contains(&w.record_path)
+        {
+            failures.push(format!("withheld: exit {} notices {notices:?} (want one starting {head:?} with {clause:?})\n{}", w.rc, w.err));
+        }
+        let p = r3_notice(&r3_notice_input(false), true, |_| vec![], true);
+        let notices = r3_notices(&p.calls);
+        let head = format!("[kept-pane] key={} 1 pane(s) kept by `cys bootstrap`", r2n_key(&p.record_path));
+        if p.rc != 0 || notices.len() != 1 || !notices[0].starts_with(&head) || notices[0].contains("READY MARKER WITHHELD") {
+            failures.push(format!("plain via stdin: exit {} notices {notices:?} (want one starting {head:?}, no clause)\n{}", p.rc, p.err));
+        }
+        for (name, input) in [("not JSON", "not json".to_string()), ("no records", json!({"command": "bootstrap"}).to_string())] {
+            let b = r3_notice(&input, false, |_| vec![], true);
+            if b.rc != 2 || !b.calls.is_empty() {
+                failures.push(format!("bad input ({name}): exit {} with {} request(s) (want 2 and none)", b.rc, b.calls.len()));
+            }
+        }
+        let m = r3_notice(&r3_notice_input(true), false, |_| vec![], false);
+        if m.rc != 3 || !r3_notices(&m.calls).is_empty() || !m.err.lines().any(|l| l.starts_with("[kept-pane]") && l.contains("not sent")) {
+            failures.push(format!("no master: exit {} (want 3, nothing sent, a reason on stderr)\n{}", m.rc, m.err));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area R · §1g coalescing is per EXACT key (bound: at most one plain + one withheld notice pending per marker): a
+    /// pending PLAIN notice does not swallow a withheld one (sent, exit 0); a pending WITHHELD notice with the same key
+    /// coalesces it (exit 3, nothing sent, "coalesced" on stderr); a plain input with a pending plain notice coalesces.
+    /// RED on af41d65c: the subcommand does not exist.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k8_kept_pane_notice_coalesces_per_exact_key() {
+        let mut failures = Vec::new();
+        for (name, withheld, pending_withheld, want_rc, want_sent) in [
+            ("withheld vs pending plain", true, false, 0, 1usize),
+            ("withheld vs pending withheld", true, true, 3, 0),
+            ("plain vs pending plain", false, false, 3, 0),
+        ] {
+            let pending = move |record_path: &str| {
+                let key = if pending_withheld { r3_withheld_key(record_path) } else { r2n_key(record_path) };
+                vec![format!("[kept-pane] key={key} 1 pane(s) kept by an earlier run")]
+            };
+            let n = r3_notice(&r3_notice_input(withheld), false, pending, true);
+            let sent = r3_notices(&n.calls).len();
+            let coalesced = n.err.lines().any(|l| l.starts_with("[kept-pane]") && l.contains("coalesced"));
+            if n.rc != want_rc || sent != want_sent || (want_rc == 3 && !coalesced) {
+                failures.push(format!("{name}: exit {} sent {sent} coalesced-line {coalesced} (want {want_rc}, {want_sent})\n{}", n.rc, n.err));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
