@@ -1052,13 +1052,10 @@ fn recover_refusal_from_input_guard(e: String) -> String {
             "{RECOVER_REFUSED_TOKEN} writer journal refused the recovery write (zero bytes) — no reclaim, no kill; \
              make the daemon's writer journal writable, then boot again: {e}"
         )
-    } else if is_write_outcome_unknown(&e) && !is_recover_refusal(&e) {
-        // ★(B-360 R2) the recovery write may still land: killing the seat or sending again is the wrong direction
-        format!(
-            "{RECOVER_REFUSED_TOKEN} the recovery write's outcome is unknown (still queued, it may still land) — no \
-             reclaim, no kill, no re-send; check the seat, then boot again: {e}"
-        )
     } else {
+        // ★(B-360 R2 revise · S60) an UNKNOWN is NOT folded into the 79 token any more: node-recover exits 91 for it
+        //   (distinct from REFUSED / a human draft / agent-alive), and run_boot's inverted consumer (B-406) maps 91 to
+        //   the non-destructive `recover_unknown` — no reclaim, no kill, no re-send.
         e
     }
 }
@@ -1107,7 +1104,6 @@ fn is_launch_write_err(e: &str) -> bool {
 
 /// ★(B-360 R2 revise · head decision) Which write a kept pane's REFUSED / UNKNOWN came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // `Adoption` (boot adopt) and `Recover` (node-recover) are recorded by the area-B commit
 enum KeptWrite {
     Launch,
     Directive,
@@ -13305,6 +13301,8 @@ fn run_agent_detect(as_json: bool) -> i32 {
 }
 
 fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
+    // ★(B-360 R2 revise) every kept pane of this boot (adoption, launch, recovery) is recorded under command "boot"
+    let _kept_scope = KeptPaneScope::open("boot");
     // ★이중 boot 직렬화(오너 2026-07-15 적대검증 D-7 + 아키텍트 성찰): 마스터 팀 스폰 트리거가
     // 겹칠 수 있다(고전 경로=UserPromptSubmit 훅이 javis_bootstrap.py ④ boot 발화 · 버튼 경로=GUI
     // spawn_orchestra_boot · 마스터 LLM이 스스로 boot). 두 boot가 겹치면 각자 "역할 미가동" 스냅샷을
@@ -13532,17 +13530,25 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                     }
                     // ★(B-360 R2) UNKNOWN: the adoption payload may still land. A kept marker makes the next boot adopt
                     //   and type it all again, so clear it as a successful adopt does; report the outcome (not fatal).
+                    // ★(B-360 R2 revise · option a) exit stays 0 (not fatal); the UNKNOWN is carried by the JSON outcome
+                    //   and one kept-pane record (write adoption) — one helper, so an extra carrier is one call there.
                     Err(e) if is_write_outcome_unknown(&e) => {
                         clear_gate_pending(sid);
                         println!(
                             "· {agent}: 역할 '{role}' directive outcome unknown (may still be typed — not re-sent) — \
-                             check the seat (`cys read-screen --surface {sref}`), `cys reinject --role {role}` if it did not land"
+                             check the seat (`cys read-screen --surface {sref}`); `cys reinject --role {role} --check`"
                         );
-                        outcomes.push(json!({"role": role, "agent": agent, "outcome": "directive_unknown",
-                                             "mandatory": mandatory, "surface_ref": sref,
-                                             "reason": format!("directive outcome unknown — check the seat, `cys reinject --role {role}` \
-                                                                if it did not land (gate marker cleared: the next boot does not \
-                                                                re-adopt): {e}")}));
+                        boot_kept_pane(
+                            &mut outcomes,
+                            json!({"role": role, "agent": agent, "outcome": "directive_unknown",
+                                   "mandatory": mandatory, "surface_ref": sref,
+                                   "hint": format!("check the seat (`cys read-screen --surface {sref}`); `cys reinject --role {role} --check`"),
+                                   "reason": format!("directive outcome unknown — it may still land; not re-sent (gate marker \
+                                                      cleared: the next boot does not re-adopt): {e}")}),
+                            (sid, role, agent),
+                            &e,
+                            KeptWrite::Adoption,
+                        );
                         continue;
                     }
                     Err(e) => {
@@ -13783,6 +13789,12 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
         if launch_rc == 0 {
             outcomes.push(json!({"role": role, "agent": agent, "outcome": "launched",
                                  "mandatory": mandatory}));
+        } else if launch_rc == EXIT_DIRECTIVE_REFUSED || launch_rc == EXIT_WRITE_OUTCOME_UNKNOWN {
+            // ★(B-360 R2 revise · S23 · option a) launch-agent KEPT the pane (and recorded it). The outcome keeps the fatal
+            //   value `failed` (same fatal accounting in both channels: boot's exit AND javis_bootstrap's JSON verdict,
+            //   which reads only failed|missing); the kept pane is labelled in `kept_pane` with the right hint.
+            println!("· {agent}: 기동 — pane kept after a REFUSED / UNKNOWN write (not a broken install) — 나머지 노드는 계속 진행");
+            outcomes.push(boot_launch_kept_pane(role, agent, *mandatory, launch_rc));
         } else {
             println!("· {agent}: 기동 실패 — 나머지 노드는 계속 진행");
             outcomes.push(json!({"role": role, "agent": agent, "outcome": "failed",
@@ -13830,6 +13842,46 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
     //   존재(= `javis_bootstrap._boot_fatal_verdict` 의 판정). 두 채널이 갈리면 fail-open 이 생긴다
     //   (Rust 테스트 `boot_exit_matches_json_fatal_verdict` 가 이 동등성을 박제).
     boot_exit_code(fatal_failed as usize, fatal_gate_pending as usize, false)
+}
+
+/// ★(B-360 R2 revise · option a) A kept pane's boot record: the JSON outcome AND the kept-pane record in one call
+/// (the single carrier point for boot's kept panes — an extra carrier is one call here).
+fn boot_kept_pane(
+    outcomes: &mut Vec<Value>,
+    record: Value,
+    (sid, role, agent): (u64, &str, &str),
+    e: &str,
+    write: KeptWrite,
+) {
+    record_kept_pane(sid, role, agent, e, write);
+    outcomes.push(record);
+}
+
+/// ★(B-360 R2 revise · S23 · option a) The boot record of a launch whose pane launch-agent KEPT (rc 90 / 91): outcome
+/// `failed` (unchanged fatal value), `kept_pane` = directive_refused | directive_unknown | launch_refused | launch_unknown
+/// (which write, from the kept-pane record launch-agent just wrote in this run), the matching `hint` (no install hint).
+fn boot_launch_kept_pane(role: &str, agent: &str, mandatory: bool, rc: i32) -> Value {
+    let last = KEPT_PANE_RUN.with(|r| {
+        r.borrow().as_ref().and_then(|run| run.records.iter().rev().find(|x| x["role"] == role).cloned())
+    });
+    let write = last.as_ref().and_then(|x| x["write"].as_str()).unwrap_or("directive");
+    let sref = last
+        .as_ref()
+        .and_then(|x| x["surface_id"].as_u64())
+        .map(surface_ref)
+        .unwrap_or_else(|| "the new pane".to_string());
+    let unknown = rc == EXIT_WRITE_OUTCOME_UNKNOWN;
+    let (label, hint) = match (write, unknown) {
+        ("launch", true) => (
+            "launch_unknown",
+            format!("check the seat (`cys read-screen --surface {sref}`): an agent at its prompt needs `cys reinject --role {role}`, an empty shell needs `cys restore`"),
+        ),
+        ("launch", false) => ("launch_refused", "make the journal writable, then `cys restore` (the pane is an empty shell)".to_string()),
+        (_, true) => ("directive_unknown", format!("check the seat (`cys read-screen --surface {sref}`); `cys reinject --role {role} --check`")),
+        (_, false) => ("directive_refused", format!("make the journal writable, then cys reinject --role {role}")),
+    };
+    json!({"role": role, "agent": agent, "outcome": "failed", "mandatory": mandatory,
+           "kept_pane": label, "surface_ref": sref, "launch_rc": rc, "hint": hint})
 }
 
 /// `cys boot` bare exit 판정의 **순수 함수**(W4 · ★M3 에서 78 추가) — 0/1/75/78 네 의미의 단일
@@ -22108,6 +22160,9 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
     //   겨눈 두 node-recover(또는 node-recover ∥ restore in-seat)가 각자 `C-u` + 기동 커맨드를
     //   같은 pane 에 보내면 화면 파괴·이중 기동이다.
     let _recover_lock = acquire_launch_lock();
+    // ★(B-360 R2 revise) kept-pane records of this recovery go under the outermost command's name
+    let _kept_scope = KeptPaneScope::open("node-recover");
+    let mut seat: Option<(u64, String, String)> = None; // (sid, role, agent) once known — for the kept-pane record
     let result = (|| -> Result<BootVerdict, String> {
         let sid = resolve_role_or_surface(&role, &surface)?;
         let entry = surface_entry(sid)?;
@@ -22142,6 +22197,7 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
             ));
         }
         let role_name = entry["role"].as_str().unwrap_or("worker").to_string();
+        seat = Some((sid, role_name.clone(), agent.clone()));
         let spec = load_agent_spec(&agent)?;
         eprintln!("[node-recover] surface:{sid} 위에 {agent} 재기동 (role={role_name})");
         // 셸 입력 잔재 정리 후 기동 (resume 플래그로 대화 기억 복원 시도)
@@ -22209,7 +22265,29 @@ fn run_node_recover(surface: Option<String>, role: Option<String>) -> i32 {
         // ★(0.14.31 · 성찰 C4ⓑ) 전처리 안전 거부는 **비파괴 전용 코드**로 나간다.
         Err(e) if is_recover_refusal(&e) => {
             eprintln!("node-recover 안전 거부: {e}");
+            // ★(B-360 R2 revise) a writer-journal refusal keeps the pane (zero bytes): one kept-pane record
+            if let (true, Some((sid, role, agent))) = (is_journal_refusal(&e), &seat) {
+                record_kept_pane(*sid, role, agent, &e, KeptWrite::Recover);
+            }
             EXIT_RECOVER_REFUSED
+        }
+        // ★(B-360 R2 revise · S60) the recovery write's outcome is unknown (it may still land): exit 91 — distinct from 79.
+        //   Nothing is reclaimed, killed or re-sent (run_boot's consumer maps 91 to `recover_unknown`, B-406).
+        Err(e) if is_write_outcome_unknown(&e) => {
+            eprintln!("error: {e}");
+            let (sref, role_name) = seat
+                .as_ref()
+                .map(|(sid, r, _)| (surface_ref(*sid), r.clone()))
+                .unwrap_or_else(|| ("?".into(), "<role>".into()));
+            eprintln!(
+                "node-recover: the recovery write's outcome is unknown (still queued, it may still land) — no reclaim, no \
+                 kill, no re-send; check the seat first (`cys read-screen --surface {sref}`); only if the directive did not \
+                 land, `cys reinject --role {role_name}` (or `cys reinject --role {role_name} --check`)"
+            );
+            if let Some((sid, role, agent)) = &seat {
+                record_kept_pane(*sid, role, agent, &e, KeptWrite::Recover);
+            }
+            EXIT_WRITE_OUTCOME_UNKNOWN
         }
         Err(e) => {
             eprintln!("error: {e}");
