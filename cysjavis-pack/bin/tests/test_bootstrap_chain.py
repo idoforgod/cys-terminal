@@ -36,7 +36,7 @@ def check(name, cond, detail=""):
 def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
              check_fail_times=0, check_final=0, socket="", check_needs_reviewers=False,
              br_exit=0, pack_dept=None, boot_stdout="", boot_stderr="", status_json=None,
-             records_lines=None, boot_records_out=None, notice_exit=0):
+             records_lines=None, boot_records_out=None, notice_exit=0, boot_json_unsupported=False):
     """임시 HOME + 가짜 팩 + 스텁 생성 → 환경 dict 반환.
     pack_dept=<부서명>: 팩을 ~/.cys/pack-dept-<부서명>에 만들고 CYS_PACK_DIR로 지정
     (증분1 레인↔팩 정합 가드 — 부서 소켓 레인은 같은 부서 팩 페어링 필수·불일치=exit 8).
@@ -45,8 +45,9 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
       status_json = what the stub `cys status --json` prints (None = nothing, as before);
       records_lines = pre-seeded lines of ~/.cys/.kept-pane-records.jsonl (the pack state base);
       boot_records_out = the JSON text the stub `cys boot` writes to $CYS_KEPT_PANE_RECORDS_OUT (if set);
-      notice_exit = the stub `cys kept-pane-notice` exit. The stub logs each boot's deferral env to
-      boot-env.log and each notice's stdin to notice-in.<n>.json."""
+      notice_exit = the stub `cys kept-pane-notice` exit; boot_json_unsupported = the stub `cys boot --json` fails
+      like an old binary's clap (exit 2, "unexpected argument") and only bare `cys boot` works. The stub logs each
+      boot's deferral env to boot-env.log and each notice's stdin to notice-in.<n>.json."""
     home = os.path.join(tmp, "home")
     pack = os.path.join(home, ".cys",
                         "pack-dept-%s" % pack_dept if pack_dept else "pack")
@@ -80,6 +81,9 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
         "  ping) exit %(ping)d;;\n"
         "  claim-role) [ %(claim)d -ne 0 ] && echo 'claim_denied: privileged role held by live surface' >&2; exit %(claim)d;;\n"
         "  boot)\n"
+        "    if [ %(nojson)d -eq 1 ] && [ \"$2\" = '--json' ]; then\n"
+        "      echo \"error: unexpected argument '--json' found\" >&2; exit 2\n"
+        "    fi\n"
         "    echo \"notice=${CYS_KEPT_PANE_NOTICE-unset} out=${CYS_KEPT_PANE_RECORDS_OUT-unset}\" >> \"$T/boot-env.log\"\n"
         "    [ -f \"$T/boot.stdout\" ] && cat \"$T/boot.stdout\"\n"
         "    [ -f \"$T/boot.stderr\" ] && cat \"$T/boot.stderr\" >&2\n"
@@ -94,7 +98,7 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
         "    exit %(notice)d;;\n"
         "  --version) echo 'cys 0.0.0-stub'; exit 0;;\n"
         "esac\nexit 0\n") % {"t": tmp, "ping": ping_exit, "claim": claim_exit, "boot": boot_exit,
-                              "notice": notice_exit})
+                              "notice": notice_exit, "nojson": 1 if boot_json_unsupported else 0})
     # 스텁 preflight
     w(os.path.join(pack, "bin", "javis_preflight.py"),
       "import sys; sys.exit(%d)\n" % preflight_exit, 0o644)
@@ -1436,6 +1440,44 @@ for _name, _fn in (("13-S1", r3_s1), ("14-S2", r3_s2), ("15-S3", r3_s3), ("16-S4
                    ("23-S11", r3_s11), ("24-S12", r3_s12), ("25-S13", r3_s13), ("26-S14", r3_s14),
                    ("27-S15", r3_s15), ("28-S16/17", r3_s16_s17), ("29-S18", r3_s18), ("30-A3a", r3_a3a),
                    ("31-F4", r3_f4)):
+    if os.environ.get("BOOT_R3_ONLY") and _name not in os.environ["BOOT_R3_ONLY"].split(","):
+        continue
+    r3_section(_name, _fn)
+
+
+# ── 32. worker-7's busy ruling (narrowed): a REAL busy report (summary.lock=="busy" AND every role "busy", the literal
+#    of src/bin/cys.rs:13451@af41d65c) is the busy column — not withheld; a lock=busy JSON with ONE non-busy row is
+#    classified normally (directive_unknown → withheld) ──
+def r3_busy():
+    busy_rows = [r3_row(role, "busy", True, reason="boot 락 보유자 존재(중복 스폰 방지)") for role in ("cso", "worker")]
+    real = json.dumps({"roles": busy_rows, "summary": {"busy": 2, "lock": "busy", "fatal_failed": 0}}) + "\n"
+    r = r3_run(boot_exit=75, boot_stdout="cys boot — 다른 boot 진행 중(락 보유)\n" + real)
+    check("32-busy control: a real busy boot (exit 75) → marker WRITTEN (busy column, nothing adopted by this run)",
+          r["code"] == 0 and r["marker"] and not r["sidecars"], r3_brief(r))
+    mixed = json.dumps({"roles": [busy_rows[0], r3_row("worker", "directive_unknown", True)],
+                        "summary": {"busy": 1, "lock": "busy", "fatal_failed": 0}}) + "\n"
+    r = r3_run(boot_exit=75, boot_stdout=mixed)
+    check("32-busy ★lock=busy with one directive_unknown row → classified → marker ABSENT", not r["marker"], r3_brief(r))
+
+
+# ── 33. worker-7's no-JSON ruling (split): (b) `cys boot --json` exit 0 with NO parseable JSON on stdout (prose only)
+#    → WITHHELD, "readiness unmeasured: boot --json stdout unreadable"; (a) the BOOT_SKEW bare fallback (old binary:
+#    no JSON by design, cannot emit the unknown signals) → no rows → written (control) ──
+def r3_nojson():
+    r = r3_run(boot_stdout="boot 완료: 신규 기동 0 · (no json line)\n")
+    rows = r["summary"].get("ready_withheld") or (r["sidecar"] or {}).get("rows") or []
+    check("33-(b) prerequisite exit 0", r["code"] == 0, r3_brief(r))
+    check("33-(b) ★exit 0 + no parseable JSON → marker ABSENT with the 'readiness unmeasured' reason",
+          not r["marker"] and any("readiness unmeasured: boot --json stdout unreadable" in str(x.get("why", ""))
+                                  for x in rows if isinstance(x, dict)),
+          "%s rows=%s" % (r3_brief(r), json.dumps(rows, ensure_ascii=False)[:300]))
+    r = r3_run(boot_json_unsupported=True)
+    skew = [s for s in r["steps"] if s.get("step") == "④boot-skew"]
+    check("33-(a) control: the BOOT_SKEW bare fallback ran · exit 0 · marker WRITTEN (no rows)",
+          skew and r["code"] == 0 and r["marker"], r3_brief(r))
+
+
+for _name, _fn in (("32-busy", r3_busy), ("33-nojson", r3_nojson)):
     if os.environ.get("BOOT_R3_ONLY") and _name not in os.environ["BOOT_R3_ONLY"].split(","):
         continue
     r3_section(_name, _fn)
