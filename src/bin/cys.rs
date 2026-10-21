@@ -13669,7 +13669,7 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                 }
                 Ok(()) => {
                     println!("· {agent}: 역할 '{role}' 좌석 죽음 **확정**({why}) — node-recover 시도(비파괴)");
-                    let rc = run_node_recover(Some(sref.clone()), Some((*role).to_string()));
+                    let rc = boot_node_recover(&sref, role);
                     if rc == 0 {
                         outcomes.push(json!({"role": role, "agent": agent, "outcome": "recovered",
                                              "mandatory": mandatory, "surface_ref": sref,
@@ -13709,6 +13709,42 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                                              "reason": "node-recover 전처리 안전 거부 — agent_alive 재관측 또는 좌석 입력줄의 사람 활동(타이핑 가드·초안 게이트) 또는 writer journal 거부(B-360)",
                                              "hint": "파괴·중복 스폰 금지 — 되살아난 좌석이면 다음 부트가 재관측 · 사람 초안이면 그 pane 에서 줄을 비운 뒤(Ctrl-U) 재부트"}));
                         continue;
+                    }
+                    // ★(B-360 R2 revise · B-406) the guard is INVERTED: only rc 1 (a real launch failure) falls through to
+                    //   escalate_reclaim below. Every other code fails toward "do nothing" — 91 (the recovery write's
+                    //   outcome is unknown: it may still land) and ANY code this consumer does not know. No reclaim, no
+                    //   spawn; counted like skipped_unconfirmed (boot's exit class is unchanged).
+                    match boot_recover_disposition(rc) {
+                        RecoverDisposition::Escalate => {}
+                        RecoverDisposition::Unknown => {
+                            println!(
+                                "· {agent}: 역할 '{role}' node-recover write outcome unknown (it may still land) — no reclaim, \
+                                 no spawn, nothing re-sent; check the seat (`cys read-screen --surface {sref}`), then \
+                                 `cys reinject --role {role} --check`"
+                            );
+                            outcomes.push(json!({"role": role, "agent": agent,
+                                                 "outcome": "recover_unknown", "mandatory": mandatory,
+                                                 "surface_ref": sref,
+                                                 "reason": "node-recover write outcome unknown (exit 91) — it may still land; no reclaim, no spawn",
+                                                 "hint": format!("check the seat (`cys read-screen --surface {sref}`), then `cys reinject --role {role} --check`")}));
+                            continue;
+                        }
+                        RecoverDisposition::Recovered
+                        | RecoverDisposition::GatePending
+                        | RecoverDisposition::Refused
+                        | RecoverDisposition::Unrecognised(_) => {
+                            // (0/78/79 returned above; this arm is every code nobody taught this consumer)
+                            println!(
+                                "· {agent}: 역할 '{role}' node-recover returned an unrecognised code {rc} — no reclaim, no spawn \
+                                 (only rc 1 escalates); check the seat (`cys read-screen --surface {sref}`)"
+                            );
+                            outcomes.push(json!({"role": role, "agent": agent,
+                                                 "outcome": "recover_unrecognised", "mandatory": mandatory,
+                                                 "surface_ref": sref,
+                                                 "reason": format!("node-recover exit {rc} (unrecognised) — no reclaim, no spawn"),
+                                                 "hint": format!("check the seat (`cys read-screen --surface {sref}`)")}));
+                            continue;
+                        }
                     }
                     println!("· {agent}: node-recover 실패 — reclaim 에스컬레이션(파괴·hold-first 판정 내장)");
                     escalate_reclaim(role);
@@ -13852,6 +13888,9 @@ fn boot_summary_buckets(roles: &[Value]) -> serde_json::Map<String, Value> {
             "skipped_unconfirmed" => "skipped_unconfirmed",
             // ★(B-360 R2) adopt paste outcome unknown — seat kept, marker cleared, not fatal
             "directive_unknown" => "directive_unknown",
+            // ★(B-360 R2 revise · B-406) node-recover 91 / an unrecognised code — no reclaim, no spawn, not fatal
+            "recover_unknown" => "recover_unknown",
+            "recover_unrecognised" => "recover_unrecognised",
             "missing" => "missing",
             "failed" => "failed",
             _ => "unbucketed",
@@ -13893,6 +13932,8 @@ const BOOT_SUMMARY_BUCKETS: &[&str] = &[
     "gate_pending",
     "skipped_unconfirmed",
     "directive_unknown",
+    "recover_unknown",
+    "recover_unrecognised",
     "missing",
     "failed",
     "unbucketed",
@@ -13910,6 +13951,40 @@ fn boot_exit_code(fatal_failed: usize, fatal_gate_pending: usize, busy: bool) ->
     }
 }
 
+
+/// ★(B-360 R2 revise · B-406) What run_boot does with node-recover's exit code — the guard INVERTED: `Escalate`
+/// (escalate_reclaim = kill + fresh launch) is reached ONLY by rc 1 (a real launch failure / generic error). Every
+/// other code, including any code this list does not know, maps to a non-destructive disposition. Pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoverDisposition {
+    Recovered,
+    GatePending,
+    Refused,
+    Unknown,
+    Unrecognised(i32),
+    Escalate,
+}
+
+fn boot_recover_disposition(rc: i32) -> RecoverDisposition {
+    match rc {
+        0 => RecoverDisposition::Recovered,
+        cys::EXIT_GATE_PENDING => RecoverDisposition::GatePending,
+        EXIT_RECOVER_REFUSED => RecoverDisposition::Refused,
+        EXIT_WRITE_OUTCOME_UNKNOWN => RecoverDisposition::Unknown,
+        1 => RecoverDisposition::Escalate,
+        other => RecoverDisposition::Unrecognised(other),
+    }
+}
+
+/// run_boot's in-process node-recover (one call site). Test builds only: `CYS_B360_TEST_NODE_RECOVER_RC` stands in a
+/// return code, so the consumer's handling of codes node-recover cannot produce today (e.g. 57) is measurable.
+fn boot_node_recover(sref: &str, role: &str) -> i32 {
+    #[cfg(test)]
+    if let Some(rc) = std::env::var("CYS_B360_TEST_NODE_RECOVER_RC").ok().and_then(|v| v.parse::<i32>().ok()) {
+        return rc;
+    }
+    run_node_recover(Some(sref.to_string()), Some(role.to_string()))
+}
 
 /// 죽음 확정 좌석의 reclaim 에스컬레이션 — 팩 헬퍼(`javis_boot_node.py --reclaim`)에 위임한다.
 /// ★왜 위임인가: reclaim 은 kill 을 포함한 **파괴 행위**이고, 그 안전 판정(`_reclaim_verdict` 의
