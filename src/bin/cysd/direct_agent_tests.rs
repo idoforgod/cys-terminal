@@ -408,3 +408,102 @@ fn a_restart_disposes_held_bodies_explicitly_once() {
     crate::handlers::sync_held_bodies(&d2);
     assert_eq!(gone(&d2).len(), 1, "disposed twice");
 }
+
+// ── B-360: a writer-journal refusal is an error reply on the direct path, never `sent:true` ─────────────────────────
+// The journal is made unopenable (a directory where the file must go) BEFORE the daemon's first open: a successful
+// open is cached for the daemon's life (`Daemon::agent_journal`). The write-time route (an opened journal that then
+// fails at append) is pinned at the helper in `agent_write::tests` and measured end to end in the test place.
+
+fn break_journal(fx: &Fx) {
+    std::fs::create_dir_all(fx.dir.join(crate::state::WRITER_JOURNAL_FILE)).unwrap();
+}
+
+fn assert_journal_refused(fx: &Fx, resp: &Value, what: &str) {
+    assert_eq!(resp["ok"], false, "{what}: a journal refusal must not be reported as success: {resp}");
+    assert_eq!(resp["error"]["code"], "journal_unavailable", "{what}: {resp}");
+    let msg = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(msg.contains("journal:"), "{what}: the reason line names the journal: {resp}");
+    let refused = events(fx, "surface.write_refused");
+    assert_eq!(refused.len(), 1, "{what}: the refusal event still fires once: {refused:?}");
+    assert!(refused[0]["payload"]["reason"].as_str().unwrap_or_default().starts_with("journal:"), "{refused:?}");
+}
+
+/// Path 1 of the ticket: legacy `cys send` + `cys send-key Return` to an agent seat.
+#[test]
+fn b360_a_legacy_return_refused_by_the_journal_is_an_error_not_sent() {
+    let fx = fx("b360-legacy");
+    let s = seat(&fx, true);
+    break_journal(&fx);
+    let r = send(&fx, &s, 900, "report one");
+    assert_eq!(r["result"]["held"], "awaiting_submit", "premise: step 1 holds the body, no writer job yet: {r}");
+    let k = ret(&fx, &s, 900);
+    assert_journal_refused(&fx, &k, "legacy send + Return");
+    assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0, "zero bytes typed");
+}
+
+/// Path 2 of the ticket: `cys send --clear-first "/clear"` (the cycle's clear has the same shape, quiet).
+#[test]
+fn b360_a_clear_first_refused_by_the_journal_is_an_error_not_sent() {
+    let fx = fx("b360-clear");
+    let s = seat(&fx, true);
+    break_journal(&fx);
+    let c = rpc(&fx, "surface.send_text", json!({"surface_id": s.id, "text": "/clear", "clear_first": true, "authoritative": true, "quiet": true}));
+    assert_journal_refused(&fx, &c, "--clear-first /clear");
+}
+
+/// Paths 3 and 4 of the ticket: launch-agent directive injection and the cycle save request both go through
+/// `inject_text` — a fenced, quiet, authoritative body (held) and then its Return. The `from` on the Return is this
+/// fixture's way to name the caller (fake peer pid); the product's inject_text Return carries none.
+#[test]
+fn b360_an_inject_text_shaped_write_refused_by_the_journal_is_an_error_at_its_return() {
+    let fx = fx("b360-inject");
+    let s = seat(&fx, true);
+    break_journal(&fx);
+    let wrapped = cys::paste_fence::wrap("# DIRECTIVE\nbody line");
+    let r = rpc(&fx, "surface.send_text", json!({"surface_id": s.id, "text": wrapped, "quiet": true, "authoritative": true, "from": "surface:900"}));
+    assert_eq!(r["result"]["held"], "awaiting_submit", "premise: {r}");
+    let k = rpc(&fx, "surface.send_key", json!({"surface_id": s.id, "key": "Return", "authoritative": true, "from": "surface:900"}));
+    assert_journal_refused(&fx, &k, "inject_text shape");
+}
+
+/// After the journal heals, the next direct write goes through (nothing stuck in the daemon by the refusal).
+#[test]
+fn b360_after_the_journal_heals_the_next_direct_write_is_written_once() {
+    let fx = fx("b360-heal");
+    let s = seat(&fx, true);
+    break_journal(&fx);
+    send(&fx, &s, 900, "first try");
+    assert_journal_refused(&fx, &ret(&fx, &s, 900), "before heal");
+    std::fs::remove_dir_all(fx.dir.join(crate::state::WRITER_JOURNAL_FILE)).unwrap();
+    let a = id_of(&send(&fx, &s, 900, "second try"));
+    let k = ret(&fx, &s, 900);
+    assert_eq!(k["ok"], true, "{k}");
+    assert_eq!(written_ids(&fx), [a], "written once, only the re-sent body");
+}
+
+/// Control (passes before and after the fix): a healthy journal keeps today's success reply and writes once.
+#[test]
+fn b360_control_a_healthy_journal_keeps_the_success_reply() {
+    let fx = fx("b360-ok");
+    let s = seat(&fx, true);
+    let a = id_of(&send(&fx, &s, 900, "report one"));
+    let k = ret(&fx, &s, 900);
+    assert_eq!(k["ok"], true, "{k}");
+    assert_eq!(k["result"]["sent"], true, "{k}");
+    assert_eq!(written_ids(&fx), [a.clone()]);
+    let c = rpc(&fx, "surface.send_text", json!({"surface_id": s.id, "text": "/clear", "clear_first": true, "authoritative": true}));
+    assert_eq!(c["ok"], true, "{c}");
+    assert_eq!(written_ids(&fx).len(), 2);
+}
+
+/// A write the journal accepted says so in its reply (`journal_barrier`), for the bind and the send_text agent tail.
+#[test]
+fn b360_a_journal_accepted_write_reports_its_barrier_passed() {
+    let fx = fx("b360-field");
+    let s = seat(&fx, true);
+    send(&fx, &s, 900, "report one");
+    let k = ret(&fx, &s, 900);
+    assert_eq!(k["result"]["journal_barrier"], "passed", "{k}");
+    let c = rpc(&fx, "surface.send_text", json!({"surface_id": s.id, "text": "/clear", "clear_first": true, "authoritative": true}));
+    assert_eq!(c["result"]["journal_barrier"], "passed", "{c}");
+}
