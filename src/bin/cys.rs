@@ -22337,6 +22337,61 @@ fn reinject_check_action(fate: &Result<PingFate, String>, ack_only: bool) -> Rei
     }
 }
 
+/// ★(B-360 R2 revise) Is the role directive in the seat agent's context? The answer of a presence ping.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Presence {
+    /// The agent printed the ACK (on screen or in its transcript): the directive is in context.
+    Present,
+    /// The agent received the ping as a prompt and answered WITHOUT the ACK (`ReceivedNoAck`): affirmative absence —
+    /// the only evidence that authorises typing the directive (again).
+    Absent,
+    /// No evidence either way (busy, no trace, unreadable transcript, bare shell, the ping's own write failed — including
+    /// its REFUSED or UNKNOWN). Callers keep their unknown state and type nothing.
+    Undetermined(String),
+}
+
+/// Bound of one presence ping (s) — phoenix's `reinject --check` window, so a pass over several unknown seats stays short.
+const PRESENCE_PING_TIMEOUT_SECS: u64 = 6;
+
+/// ★(B-360 R2 revise) The presence check of `cys reinject --check`, as a value: nonce ping (`reinject_ping_nonce` /
+/// `reinject_ping_text`) → `surface.wait_for` the ACK since the cursor → the ping's fate in the transcript
+/// (`ping_fate_from_entry`) → `reinject_check_action(fate, false)`. It never injects the directive (callers decide) and
+/// does not consume the `reinject_check_claim` key (the callers' own persistent state bounds their attempts).
+/// A bare shell (no live agent: `reinject_check_should_skip_bare_shell`) gets no ping at all.
+fn directive_presence(sid: u64, timeout: u64) -> Presence {
+    let entry = match surface_entry(sid) {
+        Ok(e) => e,
+        Err(e) => return Presence::Undetermined(format!("seat unreadable: {e}")),
+    };
+    if reinject_check_should_skip_bare_shell(&entry) {
+        return Presence::Undetermined("bare shell (no live agent) — no ping typed".into());
+    }
+    let nonce = reinject_ping_nonce();
+    let cursor = match request("surface.read_text", json!({"surface_id": sid})) {
+        Ok(r) => r["latest_cursor"].as_u64().unwrap_or(0),
+        Err(e) => return Presence::Undetermined(format!("screen cursor unreadable: {e}")),
+    };
+    if let Err(e) = inject_text(sid, &reinject_ping_text(&nonce)) {
+        return Presence::Undetermined(format!("presence ping not delivered: {e}"));
+    }
+    match request(
+        "surface.wait_for",
+        json!({"surface_id": sid, "pattern": format!("DIRECTIVE-ACK-{nonce}"),
+               "timeout_secs": timeout, "since_line": cursor}),
+    ) {
+        Ok(r) if r["matched"].as_bool() == Some(true) => return Presence::Present,
+        Ok(_) => {}
+        Err(e) => eprintln!("[presence] surface:{sid} ACK wait failed ({e}) — reading the transcript"),
+    }
+    let fate = surface_entry(sid).and_then(|e| ping_fate_from_entry(&e, &nonce)).map(|(f, _)| f);
+    match reinject_check_action(&fate, false) {
+        ReinjectCheckAction::AckInTranscript => Presence::Present,
+        ReinjectCheckAction::Reinject => Presence::Absent,
+        ReinjectCheckAction::Busy => Presence::Undetermined("ping delivered, the agent is busy".into()),
+        ReinjectCheckAction::Undetermined(why) | ReinjectCheckAction::AckOnlyMiss(why) => Presence::Undetermined(why),
+    }
+}
+
 /// ★(U8 P0-M2) check 재주입 **좌석·세션당 1회** 멱등 키(원자 생성 · `create_new`).
 /// `Ok(true)` = 이번이 첫 재주입(키 확보) · `Ok(false)` = 이 좌석·세션에 이미 1회 소진 · `Err` = 기록 불가
 /// (멱등을 보장할 수 없으면 재주입하지 않는다 — 호출부가 판정 불가로 접는다).
@@ -22607,14 +22662,92 @@ enum ReinjectDecision {
 
 /// run_pack_reinject 집계 보고. injected/skipped/deferred/failed 카운트에 더해, busy로 보류된
 /// 노드(surface_id, role) 목록을 함께 실어 pending 영속(다음 pack-update 재시도 가시화)에 쓴다.
+/// ★(B-360 R2 revise) `unknown` = nodes of this run whose directive write has an UNKNOWN outcome (it may still land):
+///   never counted in `injected`, never marked, persisted as unknown entries of the pending file (`unknown_entries`).
+///   `unknown_new` = those created by THIS run's injects (the rest were carried over, still unresolved); only new ones
+///   reach the exit class (head's exit rule: no permanent non-zero from an entry nobody can resolve).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ReinjectReport {
     injected: usize,
     skipped: usize,
     deferred: usize,
     failed: usize,
+    unknown: usize,
+    unknown_new: usize,
     /// Defer로 판정된 라이브 노드들 — pending 파일에 (surface_id, role)로 영속한다.
     deferred_nodes: Vec<(u64, String)>,
+    /// ★(B-360 R2 revise) the unknown entries counted in `unknown` (as persisted in the pending file's `unknown` list).
+    unknown_entries: Vec<ReinjectUnknownEntry>,
+}
+
+/// ★(B-360 R2 revise) One node whose directive write came back UNKNOWN (`write_outcome_unknown`): the text may still be
+/// typed. A distinct persistent state, separate from BOTH the delivered marker (`reinject.mark`) and the ordinary
+/// retryable `deferred` list: it is never re-sent blindly and never marked delivered without affirmative evidence.
+/// The next `cys pack-update` reconciles it with a presence ping (`directive_presence`): ACK → marked delivered;
+/// `ReceivedNoAck` (affirmative absence) → injected once; anything else → still unknown.
+/// Only pack-update's own writes create these (kept panes of launch/boot/restore/node-recover are record-only).
+/// Wire: `{"surface_id", "role", "directive_hash", "request_id" | null, "at"}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReinjectUnknownEntry {
+    surface_id: u64,
+    role: String,
+    /// sha256 of the directive text whose write is unknown (`sha256_hex(compose_directive(role))` at write time).
+    directive_hash: String,
+    /// the daemon's request id from the error text (`request <id>`), when it carries one.
+    request_id: Option<String>,
+    /// epoch seconds of the UNKNOWN reply.
+    at: u64,
+}
+
+impl ReinjectUnknownEntry {
+    fn to_json(&self) -> Value {
+        json!({"surface_id": self.surface_id, "role": self.role, "directive_hash": self.directive_hash,
+               "request_id": self.request_id, "at": self.at})
+    }
+
+    fn from_json(v: &Value) -> Option<Self> {
+        Some(Self {
+            surface_id: v["surface_id"].as_u64()?,
+            role: v["role"].as_str()?.to_string(),
+            directive_hash: v["directive_hash"].as_str().unwrap_or_default().to_string(),
+            request_id: v["request_id"].as_str().map(String::from),
+            at: v["at"].as_u64().unwrap_or(0),
+        })
+    }
+
+    /// An UNKNOWN reply `e` for `directive` typed into `sid` (role `role`), now.
+    fn from_unknown_write(sid: u64, role: &str, directive: &str, e: &str) -> Self {
+        Self {
+            surface_id: sid,
+            role: role.to_string(),
+            directive_hash: sha256_hex(directive),
+            request_id: request_id_from_unknown(e),
+            at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        }
+    }
+}
+
+/// ★(B-360 R2 revise) The daemon's request id inside a `write_outcome_unknown` text (`… (request w1-2) …`). Pure.
+fn request_id_from_unknown(e: &str) -> Option<String> {
+    let at = e.find("request ")? + "request ".len();
+    let id: String = e[at..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'))
+        .collect();
+    let id = id.trim_end_matches(['.', ':']).to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+/// ★(B-360 R2 revise) The whole pending file: `{"pack_version", "deferred": [...], "unknown": [...]}`. A file without
+/// `"unknown"` (written by a binary older than this fix) reads as an empty unknown list.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct ReinjectPending {
+    pack_version: String,
+    deferred: Vec<(u64, String)>,
+    unknown: Vec<ReinjectUnknownEntry>,
 }
 
 /// deferred reinject 대상 영속 경로 — pack_state_base(=~/.cys) 아래 .pack-reinject-pending.json.
@@ -22622,62 +22755,117 @@ fn reinject_pending_path(base: &std::path::Path) -> std::path::PathBuf {
     base.join(".pack-reinject-pending.json")
 }
 
-/// deferred(busy) 노드를 pending 파일에 영속하거나(>0), 더 이상 없으면 stale pending을 제거한다(0).
-/// {pack_version, deferred:[{surface_id, role}]} 형식. 디스크 반영·reinject 성공 여부와 독립한
-/// 가시화/재시도 힌트라 best-effort(critical 아님)다. 다음 pack-update는 토폴로지 마커를 새로 읽어
-/// deferred 노드를 자연히 재평가(재주입)하므로, 이 파일은 외부 재시도·관측용 SOT다.
-fn persist_reinject_pending(
-    base: &std::path::Path,
-    pack_version: &str,
-    deferred_nodes: &[(u64, String)],
-) -> std::io::Result<()> {
-    let path = reinject_pending_path(base);
-    if deferred_nodes.is_empty() {
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
-    } else {
-        let nodes: Vec<serde_json::Value> = deferred_nodes
-            .iter()
-            .map(|(sid, role)| json!({"surface_id": sid, "role": role}))
-            .collect();
-        let doc = json!({"pack_version": pack_version, "deferred": nodes});
-        std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap_or_default())
-    }
-}
-
-/// pending 파일(.pack-reinject-pending.json)을 읽어 (pack_version, [(surface_id, role)])로 파싱한다.
-/// 파일 부재 → Ok(None). 손상(JSON 파싱 불가·pack_version 부재) → Ok(None)(best-effort: 손상 pending은
-/// 무시하고 다음 pack-update가 새로 기록). LOW#1 능동 소비 경로의 reader (persist_reinject_pending의 역).
-fn read_reinject_pending(
-    base: &std::path::Path,
-) -> std::io::Result<Option<(String, Vec<(u64, String)>)>> {
-    let path = reinject_pending_path(base);
-    let raw = match std::fs::read_to_string(&path) {
+/// ★(B-360 R2 revise) Reads the whole pending file. Missing → `Ok(None)`; damaged / no `pack_version` → `Ok(None)` (as
+/// `read_reinject_pending`); a missing `"unknown"` key → an empty unknown list.
+fn read_reinject_pending_doc(base: &std::path::Path) -> std::io::Result<Option<ReinjectPending>> {
+    let raw = match std::fs::read_to_string(reinject_pending_path(base)) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     let Ok(doc) = serde_json::from_str::<serde_json::Value>(&raw) else { return Ok(None) };
-    let ver = doc["pack_version"].as_str().unwrap_or_default().to_string();
-    if ver.is_empty() {
+    let pack_version = doc["pack_version"].as_str().unwrap_or_default().to_string();
+    if pack_version.is_empty() {
         return Ok(None);
     }
-    let nodes = doc["deferred"]
+    let deferred = doc["deferred"]
         .as_array()
         .map(|arr| {
             arr.iter()
-                .filter_map(|n| {
-                    let sid = n["surface_id"].as_u64()?;
-                    let role = n["role"].as_str()?.to_string();
-                    Some((sid, role))
-                })
+                .filter_map(|n| Some((n["surface_id"].as_u64()?, n["role"].as_str()?.to_string())))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Ok(Some((ver, nodes)))
+    let unknown = doc["unknown"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(ReinjectUnknownEntry::from_json).collect::<Vec<_>>())
+        .unwrap_or_default();
+    Ok(Some(ReinjectPending { pack_version, deferred, unknown }))
+}
+
+/// ★(B-360 R2 revise) Writes the whole pending file; removes it only when BOTH lists are empty.
+fn write_reinject_pending(base: &std::path::Path, doc: &ReinjectPending) -> std::io::Result<()> {
+    let path = reinject_pending_path(base);
+    if doc.deferred.is_empty() && doc.unknown.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        };
+    }
+    let deferred: Vec<Value> =
+        doc.deferred.iter().map(|(sid, role)| json!({"surface_id": sid, "role": role})).collect();
+    let unknown: Vec<Value> = doc.unknown.iter().map(ReinjectUnknownEntry::to_json).collect();
+    let v = json!({"pack_version": doc.pack_version, "deferred": deferred, "unknown": unknown});
+    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default())
+}
+
+/// ★(B-360 R2 revise) Read-modify-write of the pending file. `pack_version` is used only when no file exists yet.
+fn update_reinject_pending(
+    base: &std::path::Path,
+    pack_version: &str,
+    f: impl FnOnce(&mut ReinjectPending),
+) -> std::io::Result<()> {
+    let mut doc = read_reinject_pending_doc(base)?
+        .unwrap_or_else(|| ReinjectPending { pack_version: pack_version.to_string(), ..Default::default() });
+    f(&mut doc);
+    write_reinject_pending(base, &doc)
+}
+
+/// ★(B-360 R2 revise) Persists an UNKNOWN write as an unknown entry at once (durable before anything else happens), replacing
+/// an older entry for the same seat, and taking the seat off the `deferred` list. A failure is loud: the caller says so.
+fn record_reinject_unknown(
+    base: &std::path::Path,
+    pack_version: &str,
+    entry: &ReinjectUnknownEntry,
+) -> std::io::Result<()> {
+    update_reinject_pending(base, pack_version, |doc| {
+        doc.unknown.retain(|u| u.surface_id != entry.surface_id);
+        doc.deferred.retain(|(sid, _)| *sid != entry.surface_id);
+        doc.unknown.push(entry.clone());
+    })
+}
+
+/// ★(B-360 R2 revise) Drops the unknown entries `drop` selects (a resolved or stale entry); no file → nothing to do.
+fn drop_reinject_unknown(
+    base: &std::path::Path,
+    pack_version: &str,
+    mut drop: impl FnMut(&ReinjectUnknownEntry) -> bool,
+) -> std::io::Result<()> {
+    if read_reinject_pending_doc(base)?.is_none() {
+        return Ok(());
+    }
+    update_reinject_pending(base, pack_version, |doc| doc.unknown.retain(|u| !drop(u)))
+}
+
+/// deferred(busy) 노드를 pending 파일에 영속하거나(>0), 더 이상 없으면 stale pending을 제거한다(0).
+/// {pack_version, deferred:[{surface_id, role}]} 형식. 디스크 반영·reinject 성공 여부와 독립한
+/// 가시화/재시도 힌트라 best-effort(critical 아님)다. 다음 pack-update는 토폴로지 마커를 새로 읽어
+/// deferred 노드를 자연히 재평가(재주입)하므로, 이 파일은 외부 재시도·관측용 SOT다.
+/// ★(B-360 R2 revise) It writes the `deferred` list only and carries the file's `unknown` list forward unchanged; the
+///   file is removed only when both are empty (an unknown entry must never vanish with a deferred rewrite).
+fn persist_reinject_pending(
+    base: &std::path::Path,
+    pack_version: &str,
+    deferred_nodes: &[(u64, String)],
+) -> std::io::Result<()> {
+    let unknown = read_reinject_pending_doc(base)?.map(|d| d.unknown).unwrap_or_default();
+    write_reinject_pending(
+        base,
+        &ReinjectPending { pack_version: pack_version.to_string(), deferred: deferred_nodes.to_vec(), unknown },
+    )
+}
+
+/// pending 파일(.pack-reinject-pending.json)을 읽어 (pack_version, [(surface_id, role)])로 파싱한다.
+/// 파일 부재 → Ok(None). 손상(JSON 파싱 불가·pack_version 부재) → Ok(None)(best-effort: 손상 pending은
+/// 무시하고 다음 pack-update가 새로 기록). LOW#1 능동 소비 경로의 reader (persist_reinject_pending의 역).
+/// ★(B-360 R2 revise) the deferred-only view of `read_reinject_pending_doc` (the production reader now); kept for the
+///   specimens that pin the old file format.
+#[cfg(test)]
+fn read_reinject_pending(
+    base: &std::path::Path,
+) -> std::io::Result<Option<(String, Vec<(u64, String)>)>> {
+    Ok(read_reinject_pending_doc(base)?.map(|d| (d.pack_version, d.deferred)))
 }
 
 /// ★U4-B2③ reinject 스킵 사유 토큰 — 공백 없는 고정 키(브리지가 공백으로 자른다 · 외부 문자열 금지).
@@ -22697,8 +22885,14 @@ fn pack_update_reinject_skipped_line(pack_version: &str, reason: &str) -> String
 
 /// reinject 집계 → pack-update 종료코드. failed>0이면 EXIT_REINJECT_DEGRADED(디스크는 반영됐으나
 /// 라이브 일부 미각성 — 성공 침묵 포장 금지), 아니면 0(deferred만 있어도 디스크 반영은 성공이라 0).
-fn reinject_exit_code(failed: usize) -> i32 {
-    if failed > 0 {
+/// ★(B-360 R2 revise · DESIGN §M1.5 + head's exit rule) `new_unknown` = UNKNOWN outcomes created by THIS run's writes
+///   (node loop or a pending-pass re-inject): degraded too (3, not 91: the disk pack WAS updated, and the app reads any
+///   other non-zero as a failed update). Carried-over unknown entries that stay undetermined are REPORTED (pending-pass
+///   line, `PACK_UPDATE_RESULT unknown=`) but are not passed here, so an entry nobody can resolve never makes every later
+///   run non-zero. This is the ONE place pack-update's exit class is decided: carrying UNKNOWN only in the result line
+///   instead would be the one-line change `if failed > 0 {` here.
+fn reinject_exit_code(failed: usize, new_unknown: usize) -> i32 {
+    if failed > 0 || new_unknown > 0 {
         cys::pack::EXIT_REINJECT_DEGRADED
     } else {
         0
@@ -23398,10 +23592,14 @@ fn adapter_ready(agent: &Option<String>, idle: bool, idle_secs: u64, scrollback_
 }
 
 /// ★(B-360 R2) The visible note for a pack-update reinject whose outcome is unknown (rows 9 and 10 share it).
-fn reinject_unknown_note(sid: u64, role: &str, e: &str) -> String {
+/// ★(B-360 R2 revise) It is NOT marked delivered any more: it is kept as an unknown entry that the next pack-update
+///   checks with a presence ping (never typed twice, never silently skipped).
+fn reinject_unknown_note(sid: u64, role: &str, e: &str, pending: &std::path::Path) -> String {
     format!(
-        "reinject outcome unknown (surface {sid}, role {role}) — it may still land, not re-sent; marked as delivered so the \
-         next pack-update does not re-inject — verify the seat; `cys reinject --role {role}` if it did not land: {e}"
+        "reinject outcome unknown (surface {sid}, role {role}) — it may still land, not re-sent, NOT marked delivered; kept \
+         as an unknown entry in {} that the next pack-update checks (presence ping) — check now: `cys reinject --role \
+         {role} --check`: {e}",
+        pending.display()
     )
 }
 
@@ -23431,6 +23629,17 @@ fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
     let fleet = dash["fleet"].as_array().cloned().unwrap_or_default();
     let (mut injected, mut skipped, mut deferred, mut failed) = (0usize, 0usize, 0usize, 0usize);
     let mut deferred_nodes: Vec<(u64, String)> = Vec::new();
+    // ★(B-360 R2 revise) unknown entries left by the pending pass (checked there just now) or by another writer
+    let base = pack_state_base();
+    let pending_unknown = match read_reinject_pending_doc(&base) {
+        Ok(doc) => doc.map(|d| d.unknown).unwrap_or_default(),
+        Err(e) => {
+            // unreadable = cannot prove a seat has no unresolved write: refuse to inject anywhere rather than guess
+            return Err(format!("pending file unreadable ({}): {e}", reinject_pending_path(&base).display()));
+        }
+    };
+    let mut unknown_entries: Vec<ReinjectUnknownEntry> = Vec::new();
+    let mut unknown_new = 0usize;
     for node in &fleet {
         let Some(sid) = node["surface_id"].as_u64() else { continue };
         let Some(role) = node["role"].as_str() else { continue };
@@ -23452,6 +23661,23 @@ fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
             .and_then(|r| r["text"].as_str().map(|s| s.to_string()))
             .unwrap_or_default();
         let ready = adapter_ready(&agent, idle, idle_secs, &tail);
+        // ★(B-360 R2 revise) a seat with an unresolved unknown write of THIS directive is not typed into: it could land twice
+        let mine: Vec<&ReinjectUnknownEntry> = pending_unknown.iter().filter(|u| u.surface_id == sid).collect();
+        if let Some(open) = mine.iter().find(|u| u.directive_hash == new_hash) {
+            eprintln!(
+                "[pack-update] ⚠ surface {sid} ({role}): an earlier write of this directive has an unknown outcome — not \
+                 re-injected (it may land); the next pack-update checks it — check now: `cys reinject --role {role} --check`"
+            );
+            unknown_entries.push((*open).clone());
+            continue;
+        }
+        if !mine.is_empty() {
+            // an entry for a different directive: a different text is meant to be injected anyway (the duplicate risk
+            // concerns the same text twice) — drop it and decide normally
+            if let Err(e) = drop_reinject_unknown(&base, new_version, |u| u.surface_id == sid) {
+                return Err(format!("pending file write failed ({}): {e}", reinject_pending_path(&base).display()));
+            }
+        }
         match reinject_decision(markers.get(role), new_version, &new_hash, idle, self_idle, ready) {
             ReinjectDecision::Inject => {
                 // per-node 에러 격리(Fix3): 한 노드의 transient 실패가 나머지 건강 노드의 reinject를
@@ -23462,9 +23688,21 @@ fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
                         failed += 1;
                         continue;
                     }
-                    // ★(B-360 R2) UNKNOWN: it may still land — mark it as delivered so the next pack-update does not
-                    //   type it twice, and say how to check
-                    eprintln!("[pack-update] ⚠ {}", reinject_unknown_note(sid, role, &e));
+                    // ★(B-360 R2 revise) UNKNOWN: it may still land. Not marked (a marker = delivered: a permanent silent
+                    //   skip if it never lands) and not retryable (a retry can type it twice) — an unknown entry, written
+                    //   at once so it survives this process; the next pack-update checks it with a presence ping.
+                    let entry = ReinjectUnknownEntry::from_unknown_write(sid, role, &directive, &e);
+                    unknown_new += 1;
+                    eprintln!("[pack-update] ⚠ {}", reinject_unknown_note(sid, role, &e, &reinject_pending_path(&base)));
+                    if let Err(w) = record_reinject_unknown(&base, new_version, &entry) {
+                        eprintln!(
+                            "[pack-update] ⚠ the unknown entry could not be written ({}): {w} — surface {sid} ({role}) is NOT \
+                             tracked: check it by hand (`cys reinject --role {role} --check`) before any re-inject",
+                            reinject_pending_path(&base).display()
+                        );
+                    }
+                    unknown_entries.push(entry);
+                    continue;
                 }
                 // 주입 성공 후에만 마커 기록(P3 단일 write path). 마커 기록 실패는 '이미 주입됨'을
                 // 의미하므로 다음 pack-update에서 같은 버전이 재주입(중복 주입)될 수 있다 — 그 창을
@@ -23488,7 +23726,23 @@ fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
             }
         }
     }
-    Ok(ReinjectReport { injected, skipped, deferred, failed, deferred_nodes })
+    let unknown = unknown_entries.len();
+    Ok(ReinjectReport { injected, skipped, deferred, failed, unknown, unknown_new, deferred_nodes, unknown_entries })
+}
+
+/// ★(B-360 R2 revise) What one pending pass did — a struct, not the old `(resolved, kept)` tuple, which had no slot for
+/// UNKNOWN (census B04: an unknown node was counted `resolved`). `unknown` = unknown entries this pass checked and kept
+/// (or created): their directive may still land, nothing is re-sent until a presence ping proves absence.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PendingConsumeReport {
+    resolved: usize,
+    kept: usize,
+    unknown: usize,
+    /// of `unknown`, the ones THIS pass created (a re-inject or a deferred inject that came back UNKNOWN) — the only
+    /// ones that reach the exit class; the rest were carried over and stay reported.
+    unknown_new: usize,
+    /// (surface_id, role) of every node counted in `unknown` — the warning names them.
+    unknown_nodes: Vec<(u64, String)>,
 }
 
 /// LOW#1 pending 소비 핵심 — 라이브 토폴로지(markers)·플릿(fleet)·주입을 인자/클로저로 받아
@@ -23497,27 +23751,36 @@ fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
 /// 노드 부재(닫힘)·합성 실패(비표준 역할)→해소(무한 잔존 방지) / Defer(여전히 busy)·주입·마크
 /// 실패→pending 잔존. 잔존 0이면 파일 삭제, 아니면 잔존 노드로 재기록(pack_version 보존).
 /// pending_ver를 새 버전으로 쓰므로(현재 디스크 팩 == 보류 당시 버전), version gate와 독립이다.
-/// 반환=(resolved, kept).
+/// ★(B-360 R2 revise · DESIGN §M1.3) The unknown entries (pack-update's own) are reconciled FIRST, each at most one
+///   presence ping: node gone / directive not composable → dropped; a different directive hash → treated as an ordinary
+///   deferred node (a different text is meant to be injected anyway); not idle·self-idle·ready → kept, unknown; ACK →
+///   marked delivered, dropped, "verified landed" (a failed mark keeps it UNKNOWN — never an ordinary deferred entry);
+///   `ReceivedNoAck` → typed once (PASSED → marked; REFUSED → an ordinary deferred retry, zero bytes were typed;
+///   UNKNOWN → a new unknown entry); undetermined → kept, unknown. A deferred node whose inject comes back UNKNOWN
+///   becomes an unknown entry (no mark, not resolved, not retryable). No deferred inject goes to a seat that still has an
+///   unknown entry, and nothing this reconciliation decides is typed into a bare shell (`live_agent`).
 #[allow(clippy::too_many_arguments)]
 fn consume_reinject_pending_core(
     base: &std::path::Path,
     pending_ver: &str,
     pending_nodes: &[(u64, String)],
+    pending_unknown: &[ReinjectUnknownEntry],
     markers: &std::collections::HashMap<String, ReinjectMarker>,
     fleet: &[serde_json::Value],
     compose: impl Fn(&str) -> Result<String, String>,
     read_tail: impl Fn(u64) -> String,
     inject: impl Fn(u64, &str) -> Result<(), String>,
     mark: impl Fn(u64, &str, &str) -> Result<(), String>,
-) -> std::io::Result<(usize, usize)> {
+    presence: impl Fn(u64) -> Presence,
+    // ★(B-360 R2 revise) a live agent on the seat (not a bare shell: `reinject_check_should_skip_bare_shell`) — checked
+    //   again right before any inject that this reconciliation decides (pack-update's own node loop has no such gate)
+    live_agent: impl Fn(u64) -> bool,
+) -> std::io::Result<PendingConsumeReport> {
+    let mut rep = PendingConsumeReport::default();
     let mut kept: Vec<(u64, String)> = Vec::new();
-    let mut resolved = 0usize;
-    for (sid, role) in pending_nodes {
-        // 라이브 플릿에서 해당 surface 조회 — 부재(닫힘)면 재시도 대상 자체가 없으므로 해소 처리.
-        let Some(node) = fleet.iter().find(|n| n["surface_id"].as_u64() == Some(*sid)) else {
-            resolved += 1;
-            continue;
-        };
+    let mut unknown_out: Vec<ReinjectUnknownEntry> = Vec::new();
+    // idle·self-idle·ready of a live node (the 3-signal gate of `reinject_decision`)
+    let gate = |node: &Value, sid: u64| {
         let agent = node["agent"].as_str().map(|s| s.to_string());
         let idle = node["state"].as_str() == Some("idle");
         let idle_secs = node["idle_secs"].as_u64().unwrap_or(0);
@@ -23526,13 +23789,122 @@ fn consume_reinject_pending_core(
             Some(st) => st != "working",
             None => false,
         };
-        // 디렉티브 합성 실패(비표준 역할)는 영영 주입 불가 → 해소(stale 잔존 방지).
+        let ready = adapter_ready(&agent, idle, idle_secs, &read_tail(sid));
+        (idle, self_idle, ready)
+    };
+    // ── unknown entries first ──
+    let mut as_deferred: Vec<(u64, String)> = Vec::new();
+    for u in pending_unknown {
+        let (sid, role) = (u.surface_id, u.role.as_str());
+        let Some(node) = fleet.iter().find(|n| n["surface_id"].as_u64() == Some(sid)) else {
+            rep.resolved += 1; // the node is gone: nothing can land or be re-sent
+            continue;
+        };
         let Ok(directive) = compose(role) else {
-            resolved += 1;
+            rep.resolved += 1;
             continue;
         };
         let new_hash = sha256_hex(&directive);
-        let ready = adapter_ready(&agent, idle, idle_secs, &read_tail(*sid));
+        if new_hash != u.directive_hash {
+            // stale: decided normally below — but never typed into a bare shell (kept as an ordinary deferred retry)
+            if live_agent(sid) {
+                as_deferred.push((sid, role.to_string()));
+            } else {
+                kept.push((sid, role.to_string()));
+            }
+            continue;
+        }
+        let keep_unknown = |rep: &mut PendingConsumeReport, out: &mut Vec<ReinjectUnknownEntry>, e: ReinjectUnknownEntry| {
+            rep.unknown += 1;
+            rep.unknown_nodes.push((e.surface_id, e.role.clone()));
+            out.push(e);
+        };
+        let (idle, self_idle, ready) = gate(node, sid);
+        if !(idle && self_idle && ready) {
+            keep_unknown(&mut rep, &mut unknown_out, u.clone());
+            continue;
+        }
+        match presence(sid) {
+            Presence::Present => match mark(sid, pending_ver, &new_hash) {
+                Ok(()) => {
+                    println!(
+                        "[pack-update] pending unknown surface {sid} ({role}): verified landed (ACK) — marked delivered, \
+                         nothing typed"
+                    );
+                    rep.resolved += 1;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[pack-update] ⚠ surface {sid} ({role}): verified landed (ACK) but reinject.mark failed ({e}) — kept \
+                         UNKNOWN (never an ordinary retry: that would type it twice)"
+                    );
+                    keep_unknown(&mut rep, &mut unknown_out, u.clone());
+                }
+            },
+            Presence::Absent if !live_agent(sid) => {
+                eprintln!(
+                    "[pack-update] surface {sid} ({role}): absent, but the seat is now a bare shell — nothing typed, still UNKNOWN"
+                );
+                keep_unknown(&mut rep, &mut unknown_out, u.clone());
+            }
+            Presence::Absent => match inject(sid, &directive) {
+                Ok(()) => match mark(sid, pending_ver, &new_hash) {
+                    Ok(()) => {
+                        println!(
+                            "[pack-update] pending unknown surface {sid} ({role}): not in context (ReceivedNoAck) — \
+                             re-injected once, marked"
+                        );
+                        rep.resolved += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[pack-update] ⚠ surface {sid} ({role}): re-injected but reinject.mark failed ({e}) — kept \
+                             UNKNOWN so the next pass checks it (no blind second copy)"
+                        );
+                        keep_unknown(&mut rep, &mut unknown_out, u.clone());
+                    }
+                },
+                Err(e) if is_write_outcome_unknown(&e) => {
+                    eprintln!("[pack-update] ⚠ pending {}", reinject_unknown_note(sid, role, &e, &reinject_pending_path(base)));
+                    let entry = ReinjectUnknownEntry::from_unknown_write(sid, role, &directive, &e);
+                    let _ = record_reinject_unknown(base, pending_ver, &entry);
+                    rep.unknown_new += 1;
+                    keep_unknown(&mut rep, &mut unknown_out, entry);
+                }
+                Err(e) => {
+                    // REFUSED (zero bytes) or another definite failure: an ordinary retry is safe
+                    eprintln!("[pack-update] pending re-inject failed (surface {sid}, role {role}): {e} — kept for retry");
+                    kept.push((sid, role.to_string()));
+                }
+            },
+            Presence::Undetermined(why) => {
+                eprintln!(
+                    "[pack-update] surface {sid} ({role}): directive presence undetermined ({why}) — still UNKNOWN, nothing typed"
+                );
+                keep_unknown(&mut rep, &mut unknown_out, u.clone());
+            }
+        }
+    }
+    // ── ordinary deferred nodes (today's behaviour), plus stale unknown entries decided normally ──
+    let open_seats: std::collections::HashSet<u64> = unknown_out.iter().map(|u| u.surface_id).collect();
+    for (sid, role) in pending_nodes.iter().chain(as_deferred.iter()) {
+        // 라이브 플릿에서 해당 surface 조회 — 부재(닫힘)면 재시도 대상 자체가 없으므로 해소 처리.
+        let Some(node) = fleet.iter().find(|n| n["surface_id"].as_u64() == Some(*sid)) else {
+            rep.resolved += 1;
+            continue;
+        };
+        if open_seats.contains(sid) {
+            // an unresolved unknown write on this seat: never type into it before that is settled
+            kept.push((*sid, role.clone()));
+            continue;
+        }
+        // 디렉티브 합성 실패(비표준 역할)는 영영 주입 불가 → 해소(stale 잔존 방지).
+        let Ok(directive) = compose(role) else {
+            rep.resolved += 1;
+            continue;
+        };
+        let new_hash = sha256_hex(&directive);
+        let (idle, self_idle, ready) = gate(node, *sid);
         match reinject_decision(markers.get(role.as_str()), pending_ver, &new_hash, idle, self_idle, ready)
         {
             ReinjectDecision::Inject => {
@@ -23542,34 +23914,48 @@ fn consume_reinject_pending_core(
                         kept.push((*sid, role.clone()));
                         continue;
                     }
-                    // ★(B-360 R2) UNKNOWN: not kept pending (the next pack-update would type it twice) — marked as delivered
-                    eprintln!("[pack-update] ⚠ pending {}", reinject_unknown_note(*sid, role, &e));
+                    // ★(B-360 R2 revise) UNKNOWN: not marked (that would be a permanent skip if it never lands), not
+                    //   kept as an ordinary retry (that would type it twice) — an unknown entry, written at once
+                    eprintln!("[pack-update] ⚠ pending {}", reinject_unknown_note(*sid, role, &e, &reinject_pending_path(base)));
+                    let entry = ReinjectUnknownEntry::from_unknown_write(*sid, role, &directive, &e);
+                    let _ = record_reinject_unknown(base, pending_ver, &entry);
+                    rep.unknown += 1;
+                    rep.unknown_new += 1;
+                    rep.unknown_nodes.push((*sid, role.clone()));
+                    unknown_out.push(entry);
+                    continue;
                 }
                 if mark(*sid, pending_ver, &new_hash).is_err() {
                     kept.push((*sid, role.clone()));
                     continue;
                 }
-                resolved += 1;
+                rep.resolved += 1;
             }
-            ReinjectDecision::SkipUnchanged | ReinjectDecision::SkipDedup => resolved += 1,
+            ReinjectDecision::SkipUnchanged | ReinjectDecision::SkipDedup => rep.resolved += 1,
             ReinjectDecision::Defer => kept.push((*sid, role.clone())),
         }
     }
-    persist_reinject_pending(base, pending_ver, &kept)?;
-    Ok((resolved, kept.len()))
+    rep.kept = kept.len();
+    write_reinject_pending(
+        base,
+        &ReinjectPending { pack_version: pending_ver.to_string(), deferred: kept, unknown: unknown_out },
+    )?;
+    Ok(rep)
 }
 
 /// LOW#1 능동 소비 진입점 — run_pack_update 착수 시 1회 호출. 디스크 pending이 있으면 지금 idle인
 /// 보류 노드에 reinject를 재시도한다(write-only였던 pending을 능동 소비). pending 부재/빈 목록 →
 /// no-op(데몬 접속 없이 즉시 반환). 데몬 미가동 → Err(호출자가 로깅·계속, pending 보존 = graceful).
-fn consume_reinject_pending(base: &std::path::Path) -> Result<(usize, usize), String> {
-    let Some((ver, nodes)) = read_reinject_pending(base).map_err(|e| e.to_string())? else {
-        return Ok((0, 0));
+/// ★(B-360 R2 revise) Returns a `PendingConsumeReport` (resolved / kept / unknown), not a tuple without an unknown slot.
+fn consume_reinject_pending(base: &std::path::Path) -> Result<PendingConsumeReport, String> {
+    let Some(doc) = read_reinject_pending_doc(base).map_err(|e| e.to_string())? else {
+        return Ok(PendingConsumeReport::default());
     };
-    if nodes.is_empty() {
+    let (ver, nodes, unknown) = (doc.pack_version, doc.deferred, doc.unknown);
+    if nodes.is_empty() && unknown.is_empty() {
         // 빈 deferred만 남은 stale 파일 → 정리(데몬 접속 불요).
         let _ = std::fs::remove_file(reinject_pending_path(base));
-        return Ok((0, 0));
+        return Ok(PendingConsumeReport::default());
     }
     // 라이브 토폴로지(마커)·플릿(상태) — 데몬 필요. 미가동이면 ?로 Err 전파(graceful 스킵·pending 보존).
     let topo = request("system.topology", json!({}))?;
@@ -23598,6 +23984,7 @@ fn consume_reinject_pending(base: &std::path::Path) -> Result<(usize, usize), St
         base,
         &ver,
         &nodes,
+        &unknown,
         &markers,
         &fleet,
         compose_directive,
@@ -23615,6 +24002,8 @@ fn consume_reinject_pending(base: &std::path::Path) -> Result<(usize, usize), St
             )
             .map(|_| ())
         },
+        |sid| directive_presence(sid, PRESENCE_PING_TIMEOUT_SECS),
+        |sid| surface_entry(sid).is_ok_and(|e| !reinject_check_should_skip_bare_shell(&e)),
     )
     .map_err(|e| e.to_string())
 }
@@ -25556,6 +25945,36 @@ fn skillscan_warn(skill_dir: &std::path::Path) {
     }
 }
 
+/// ★(B-360 R2 revise) The structured result line the app parses (`PACK_UPDATE_RESULT … failed=W unknown_new=N unknown=U`:
+/// `unknown` = all nodes whose reinject outcome is unknown, `unknown_new` = those created by this run — the other key
+/// does not start with `unknown=`, so readers of `unknown=` are unaffected). Pure.
+fn pack_update_result_line(pack_version: &str, rep: &ReinjectReport) -> String {
+    format!(
+        "{} pack_version={pack_version} injected={} skipped={} deferred={} failed={} unknown_new={} unknown={}",
+        cys::pack::REINJECT_RESULT_PREFIX,
+        rep.injected,
+        rep.skipped,
+        rep.deferred,
+        rep.failed,
+        rep.unknown_new,
+        rep.unknown
+    )
+}
+
+/// ★(B-360 R2 revise) The warning for unknown nodes: who, where the state is kept, and how to check now. Pure.
+fn pack_update_unknown_warning(base: &std::path::Path, nodes: &[(u64, String)]) -> String {
+    let who: Vec<String> = nodes.iter().map(|(sid, role)| format!("surface {sid} ({role})")).collect();
+    let check: Vec<String> = nodes.iter().map(|(_, role)| format!("`cys reinject --role {role} --check`")).collect();
+    format!(
+        "{} node(s) with a directive write of UNKNOWN outcome: {} — it may still land; nothing re-sent, nothing marked; kept \
+         in {} (the next pack-update checks it with a presence ping) — check now: {}",
+        nodes.len(),
+        who.join(", "),
+        reinject_pending_path(base).display(),
+        check.join(" · ")
+    )
+}
+
 fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: bool) -> i32 {
     // 성공 경로는 종료코드(i32)를 싣는다: 0=완전 성공, EXIT_REINJECT_DEGRADED=디스크는 반영됐으나
     // 라이브 노드 reinject 실패(성공 침묵 포장 금지). 에러 경로(Err)는 외부에서 1로 매핑.
@@ -25574,12 +25993,21 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
         // version gate 판정 전·독립(디스크 팩이 이미 그 버전이라 UpToDate여도 동작): 보류 당시 busy였던
         // 노드가 지금 idle이면 reinject를 완료하고 pending에서 제거한다. dry-run은 부작용 없음 계약이라
         // 생략. 데몬 미가동이면 graceful 스킵(Err 로깅·pending 보존).
+        // ★(B-360 R2 revise) the pass's unknown nodes are reported on every path; only the ones it CREATED
+        //   (`consumed_unknown_new`) reach the exit class (reinject_exit_code) — carried ones do not
+        let (mut consumed_unknown, mut consumed_unknown_new) = (0usize, 0usize);
         if !dry_run {
             match consume_reinject_pending(&base) {
-                Ok((resolved, kept)) if resolved > 0 || kept > 0 => {
+                Ok(c) if c.resolved > 0 || c.kept > 0 || c.unknown > 0 => {
                     println!(
-                        "[pack-update] pending reinject 소비: {resolved} 해소, {kept} 잔존."
+                        "[pack-update] pending reinject 소비: {} 해소, {} 잔존, {} 미확인(이번 실행 신규 {}).",
+                        c.resolved, c.kept, c.unknown, c.unknown_new
                     );
+                    if c.unknown > 0 {
+                        eprintln!("[pack-update] ⚠ {}", pack_update_unknown_warning(&base, &c.unknown_nodes));
+                    }
+                    consumed_unknown = c.unknown;
+                    consumed_unknown_new = c.unknown_new;
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -25616,6 +26044,16 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                     outcome.pack_version
                 );
                 println!("{}", cys::pack::pack_update_uptodate_line(&outcome.pack_version));
+                if consumed_unknown > 0 {
+                    // ★(B-360 R2 revise) no reinject ran, but the pending pass left nodes unknown: the app reads this
+                    //   count (only the measured one — no unmeasured injected/failed are printed as 0)
+                    println!(
+                        "{} pack_version={} unknown_new={consumed_unknown_new} unknown={consumed_unknown}",
+                        cys::pack::REINJECT_RESULT_PREFIX,
+                        outcome.pack_version
+                    );
+                    return Ok(reinject_exit_code(0, consumed_unknown_new));
+                }
                 return Ok(0);
             }
             VersionGate::BinaryTooOld => {
@@ -25652,19 +26090,17 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
         match run_pack_reinject(&outcome.pack_version) {
             Ok(rep) => {
                 println!(
-                    "[pack-update] reinject: {} injected, {} skipped, {} deferred, {} failed.",
-                    rep.injected, rep.skipped, rep.deferred, rep.failed
+                    "[pack-update] reinject: {} injected, {} skipped, {} deferred, {} failed, {} unknown.",
+                    rep.injected, rep.skipped, rep.deferred, rep.failed, rep.unknown
                 );
                 // 구조화 출력(Tauri 브리지가 failed/deferred를 파싱해 update-warning emit).
-                println!(
-                    "{} pack_version={} injected={} skipped={} deferred={} failed={}",
-                    cys::pack::REINJECT_RESULT_PREFIX,
-                    outcome.pack_version,
-                    rep.injected,
-                    rep.skipped,
-                    rep.deferred,
-                    rep.failed
-                );
+                // ★(B-360 R2 revise) + `unknown=` — `injected` never includes an unknown outcome.
+                println!("{}", pack_update_result_line(&outcome.pack_version, &rep));
+                if rep.unknown > 0 {
+                    let nodes: Vec<(u64, String)> =
+                        rep.unknown_entries.iter().map(|u| (u.surface_id, u.role.clone())).collect();
+                    eprintln!("[pack-update] ⚠ {}", pack_update_unknown_warning(&base, &nodes));
+                }
                 // deferred(busy) 노드 pending 영속 / 없으면 stale 제거(가시화·재시도 SOT).
                 if let Err(e) =
                     persist_reinject_pending(&base, &outcome.pack_version, &rep.deferred_nodes)
@@ -25690,7 +26126,8 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                 if accepted_degraded {
                     return Ok(cys::pack::EXIT_ACCEPTED_DEGRADED);
                 }
-                Ok(reinject_exit_code(rep.failed))
+                // new unknowns of this run only: the node loop's + the pending pass's re-injects (head's exit rule)
+                Ok(reinject_exit_code(rep.failed, rep.unknown_new + consumed_unknown_new))
             }
             // 데몬 미가동 등으로 reinject 자체를 못 함 — 디스크 반영은 성공(무중단 정책상 0).
             Err(e) => {
@@ -25702,6 +26139,10 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                 );
                 if accepted_degraded {
                     return Ok(cys::pack::EXIT_ACCEPTED_DEGRADED);
+                }
+                if consumed_unknown_new > 0 {
+                    // ★(B-360 R2 revise) the pending pass created unknown outcomes this run: not a clean 0
+                    return Ok(reinject_exit_code(0, consumed_unknown_new));
                 }
                 Ok(0)
             }
@@ -27989,13 +28430,13 @@ mod tests {
     /// failed==0이면 0(deferred만 있어도 디스크 반영은 성공이라 0). #3 핵심 신호 계약.
     #[test]
     fn reinject_failed_signals_degraded_exit() {
-        assert_eq!(reinject_exit_code(0), 0, "실패 0 → 성공(0)");
+        assert_eq!(reinject_exit_code(0, 0), 0, "실패 0 → 성공(0)");
         assert_eq!(
-            reinject_exit_code(1),
+            reinject_exit_code(1, 0),
             cys::pack::EXIT_REINJECT_DEGRADED,
             "실패>0 → degraded 종료코드(성공으로 침묵 포장 금지)"
         );
-        assert_eq!(reinject_exit_code(5), cys::pack::EXIT_REINJECT_DEGRADED);
+        assert_eq!(reinject_exit_code(5, 0), cys::pack::EXIT_REINJECT_DEGRADED);
         // 0(완전 성공)·1(일반 실패)과 구분되는 신호여야 호출자가 디스크 반영+미각성을 분간한다.
         assert_ne!(cys::pack::EXIT_REINJECT_DEGRADED, 0);
         assert_ne!(cys::pack::EXIT_REINJECT_DEGRADED, 1);
@@ -28064,10 +28505,12 @@ mod tests {
 
         let injected = std::cell::Cell::new(0u32);
         let marked = std::cell::Cell::new(0u32);
-        let (resolved, kept) = consume_reinject_pending_core(
+        // ★(B-360 R2 revise) the result is a struct now (+ the unknown list and the presence check, unused here)
+        let r = consume_reinject_pending_core(
             &base,
             &ver,
             &nodes,
+            &[],
             &markers,
             &fleet,
             |_role| Ok("DIRECTIVE-BODY".to_string()),
@@ -28080,8 +28523,12 @@ mod tests {
                 marked.set(marked.get() + 1);
                 Ok(())
             },
+            |_sid| Presence::Undetermined("no unknown entries in this case".into()),
+            |_sid| true,
         )
         .unwrap();
+        let (resolved, kept) = (r.resolved, r.kept);
+        assert_eq!(r.unknown, 0);
 
         assert_eq!(resolved, 1, "idle 노드 1개 해소");
         assert_eq!(kept, 1, "busy 노드 1개 잔존");
@@ -28113,18 +28560,23 @@ mod tests {
             json!({"surface_id":7, "role":"worker", "state":"idle", "idle_secs":30, "agent_status":"idle"}),
         ];
         let markers = std::collections::HashMap::new();
-        let (resolved, kept) = consume_reinject_pending_core(
+        // ★(B-360 R2 revise) the result is a struct now (+ the unknown list and the presence check, unused here)
+        let r = consume_reinject_pending_core(
             &base,
             &ver,
             &nodes,
+            &[],
             &markers,
             &fleet,
             |_role| Ok("DIRECTIVE-BODY".to_string()),
             |_sid| String::new(),
             |_sid, _t| Ok(()),
             |_sid, _v, _h| Ok(()),
+            |_sid| Presence::Undetermined("no unknown entries in this case".into()),
+            |_sid| true,
         )
         .unwrap();
+        let (resolved, kept) = (r.resolved, r.kept);
         assert_eq!(resolved, 1);
         assert_eq!(kept, 0);
         assert!(!path.exists(), "전부 해소 → pending 삭제");
@@ -28141,7 +28593,7 @@ mod tests {
         assert!(!reinject_pending_path(&base).exists());
         // 데몬 접속 없이 즉시 반환(요청 함수 호출 없음).
         let r = consume_reinject_pending(&base).unwrap();
-        assert_eq!(r, (0, 0));
+        assert_eq!(r, PendingConsumeReport::default()); // ★(B-360 R2 revise) a struct, was the (0, 0) tuple
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -44329,7 +44781,8 @@ mod b360_tests {
         let calls = daemon.calls();
         assert_eq!((r2c_count(&calls, "surface.send_text"), r2c_count(&calls, "reinject.mark")), (2, 0));
         assert!(reinject_pending_path(&base).exists(), "a refused node stays pending");
-        assert_eq!(first, Ok((0, 1)));
+        // ★(B-360 R2 revise) the pass result is a struct now (was the tuple `Ok((0, 1))`); same contract + unknown 0
+        assert_eq!(first.map(|r| (r.resolved, r.kept, r.unknown)), Ok((0, 1, 0)));
     }
 
     // ── ★(B-360 R2 revise) area P · pack-update: UNKNOWN is its own persistent state, checked by a presence ping ──────
@@ -44710,6 +45163,94 @@ mod b360_tests {
         assert!(r2p_unknown_entries(&pack.dir).is_empty(), "the stale unknown entry was kept: {:?}", r2p_unknown_entries(&pack.dir));
     }
 
+    /// Area P · S70 / B07 / B08: the structured line and the exit class carry UNKNOWN, including the co-occurrence of a
+    /// REFUSED node (failed) and an UNKNOWN node in one run. Cannot be red on 11717c44: `pack_update_result_line` and the
+    /// two-argument `reinject_exit_code` do not exist there (the line was built inline in `run_pack_update`, whose reinject
+    /// phase a test cannot reach — the pack must be signed by the embedded release key). Positive control: a report with
+    /// one PASSED node renders `injected=1 … unknown=0` and exits 0.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p11_pack_update_result_line_and_exit_carry_unknown_with_failed() {
+        let pack = R2cPack::new();
+        let mut marker = Value::Null;
+        let daemon = R2cDaemon::start(move |method, p| match method {
+            "system.topology" => r2c_ok(json!({"saved": [{"role": "worker", "pack_reinject": marker.clone()}]})),
+            "control.dashboard" => r2c_ok(json!({"fleet": [
+                {"surface_id": 7, "role": "worker", "state": "idle", "idle_secs": 60, "agent_status": "idle"},
+                {"surface_id": 8, "role": "cso", "state": "idle", "idle_secs": 60, "agent_status": "idle"}]})),
+            "surface.list" => r2c_ok(json!({"surfaces": [
+                {"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "exited": false},
+                {"surface_id": 8, "surface_ref": "surface:8", "role": "cso", "exited": false}]})),
+            "surface.read_text" => r2c_ok(json!({"text": ""})),
+            "surface.send_text" if p["surface_id"] == 7 => r2c_reply(&pending_err()),
+            "surface.send_text" => r2c_reply(&journal_err()),
+            "reinject.mark" => {
+                marker = json!({"pack_version": p["pack_version"], "directive_hash": p["directive_hash"]});
+                r2c_ok(json!({}))
+            }
+            _ => r2c_ok(json!({})),
+        });
+        std::fs::write(pack.dir.join("pack/directives/CSO_DIRECTIVE.md"), "C").unwrap();
+        let rep = r2c_in_env(&daemon, &pack, || run_pack_reinject("9.9.9")).expect("node loop");
+        let line = pack_update_result_line("9.9.9", &rep);
+        let mut failures = Vec::new();
+        if (rep.injected, rep.failed, rep.unknown) != (0, 1, 1) {
+            failures.push(format!("one REFUSED + one UNKNOWN node: {rep:?}"));
+        }
+        if !(line.contains("injected=0") && line.contains("failed=1") && line.ends_with("unknown=1")) {
+            failures.push(format!("structured line: {line}"));
+        }
+        if reinject_exit_code(rep.failed, rep.unknown) != cys::pack::EXIT_REINJECT_DEGRADED {
+            failures.push(format!("exit {} for failed+unknown, want 3", reinject_exit_code(rep.failed, rep.unknown)));
+        }
+        if reinject_exit_code(0, 1) != cys::pack::EXIT_REINJECT_DEGRADED {
+            failures.push("unknown alone does not reach the degraded exit".into());
+        }
+        let ok = ReinjectReport { injected: 1, ..Default::default() };
+        let ok_line = pack_update_result_line("9.9.9", &ok);
+        if !(ok_line.contains("injected=1") && ok_line.ends_with("unknown=0")) || reinject_exit_code(ok.failed, ok.unknown) != 0 {
+            failures.push(format!("positive control: {ok_line}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area P · coordinator finding: no presence ping and no re-inject of this reconciliation reaches a bare shell (an
+    /// exited or agent-less pane: `reinject_check_should_skip_bare_shell`). An unknown entry whose directive changed
+    /// (stale) would be "decided normally" = injected; on a bare shell it is kept as an ordinary deferred retry instead.
+    /// Cannot be red on 11717c44: that code never reads unknown entries at all (so nothing is typed there either).
+    /// Positive control: the same stale entry on a LIVE claude seat is re-decided and typed exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p12_the_reconciliation_never_types_into_a_bare_shell() {
+        let mut failures = Vec::new();
+        for live in [false, true] {
+            let pack = R2cPack::new();
+            let entry = json!({"surface_id": 7, "role": "worker", "directive_hash": "OLD", "request_id": null, "at": 1});
+            std::fs::write(
+                reinject_pending_path(&pack.dir),
+                json!({"pack_version": "9.9.9", "deferred": [], "unknown": [entry]}).to_string(),
+            )
+            .unwrap();
+            let session = r2p_session(&pack);
+            let daemon = if live {
+                r2p_daemon(r2p_ctl(r2c_ok(json!({})), R2pPing::NoAck, true), session)
+            } else {
+                r2c_pack_daemon(r2c_ok(json!({}))) // surface.list row without agent meta = a bare shell
+            };
+            let _ = r2c_in_env(&daemon, &pack, || consume_reinject_pending(&pack.dir));
+            let calls = daemon.calls();
+            let (directives, pings) = r2p_pastes(&calls);
+            let want = if live { (1, 0) } else { (0, 0) };
+            if (directives, pings) != want {
+                failures.push(format!("live={live}: directives {directives} pings {pings}, want {want:?}"));
+            }
+            if !live && r2p_deferred_entries(&pack.dir).len() != 1 {
+                failures.push("bare shell: the stale entry is not kept as an ordinary deferred retry".to_string());
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
     /// Area P · head condition (a): a bare-shell seat — the agent record is there but no live agent (`agent_alive` false)
     /// or the pane exited, i.e. `reinject_check_should_skip_bare_shell` would skip it — holding an unknown entry of the
     /// SAME directive is never pinged and never injected, and the entry stays unknown.
@@ -44980,6 +45521,46 @@ mod b360_tests {
             if seen.iter().any(|s| s == r) {
                 failures.push(format!("{r} reaches the reconciliation (transitive callers: {seen:?})"));
             }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area P · the head's exit rule: exit 3 reflects THIS run's write outcomes only. A run whose only unknown is CARRIED
+    /// (an entry from an earlier run) and stays undetermined after the check exits 0 and still reports the count; a pass
+    /// whose re-inject itself comes back UNKNOWN created a new unknown and exits 3. The source half pins that every exit
+    /// decision of `run_pack_update` passes only the `_new` counts to `reinject_exit_code`.
+    /// Cannot be red on 11717c44: there UNKNOWN never reaches any count (`unknown_new` and the two-argument
+    /// `reinject_exit_code` do not exist). Positive control: the re-inject-UNKNOWN pass (exit 3).
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_p15_only_this_runs_new_unknowns_reach_the_exit_carried_ones_are_reported() {
+        let mut failures = Vec::new();
+        for (name, ping, reinject, want_new, want_exit) in [
+            ("carried + undetermined", R2pPing::NoTrace, r2c_ok(json!({})), 0, 0),
+            ("carried + absent + re-inject UNKNOWN", R2pPing::NoAck, r2c_reply(&pending_err()), 1, cys::pack::EXIT_REINJECT_DEGRADED),
+        ] {
+            let pack = R2cPack::new();
+            let ctl = r2p_ctl(r2c_reply(&pending_err()), R2pPing::NoTrace, true);
+            let daemon = r2p_daemon(ctl.clone(), r2p_session(&pack));
+            let pass = r2c_in_env(&daemon, &pack, || {
+                run_pack_reinject("9.9.9").expect("run 1");
+                r2p_set(&ctl, reinject.clone(), ping, true);
+                consume_reinject_pending(&pack.dir).expect("run 2 pending pass")
+            });
+            if (pass.unknown, pass.unknown_new) != (1, want_new) {
+                failures.push(format!("{name}: unknown/new = ({}, {}), want (1, {want_new})", pass.unknown, pass.unknown_new));
+            }
+            if reinject_exit_code(0, pass.unknown_new) != want_exit {
+                failures.push(format!("{name}: exit {} want {want_exit}", reinject_exit_code(0, pass.unknown_new)));
+            }
+        }
+        let src = include_str!("cys.rs");
+        let head = format!("\nfn {}(", "run_pack_update");
+        let at = src.find(&head).expect("run_pack_update");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("end")];
+        let calls: Vec<&str> = body.split("reinject_exit_code(").skip(1).map(|c| &c[..c.find(')').unwrap_or(c.len())]).collect();
+        if calls.len() < 3 || calls.iter().any(|args| !args.split(',').nth(1).is_some_and(|a| a.contains("_new"))) {
+            failures.push(format!("run_pack_update passes a non-new unknown count to the exit: {calls:?}"));
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }

@@ -8209,6 +8209,13 @@ async fn install_pack_update(
         .map_err(|e| format!("cys pack-update 실행 실패 ({}): {e}", cys.display()))?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    // ★(B-360 R2 revise) the user-facing words for `unknown > 0` (one definition, both warning sites use it)
+    let reinject_unknown_message = |pack_version: &str, unknown: u64| {
+        format!(
+            "팩 {pack_version}: 노드 {unknown}개는 지침 주입의 도달 여부 미확인 — 다음 pack-update 에서 확인합니다\
+             (중복 주입 없음 · 지금 확인하려면 `cys reinject --role <역할> --check`)."
+        )
+    };
     // 종료코드 구분: EXIT_REINJECT_DEGRADED = 디스크 팩은 반영됐으나 라이브 노드 reinject 실패
     // (일부 미각성) — 디스크는 성공이므로 pack-updated를 emit하되 update-warning을 함께 띄운다.
     // 그 외 비0 = 실제 실패(디스크 미반영) → 구 캐시 유지가 안전하므로 update-error만.
@@ -8227,6 +8234,21 @@ async fn install_pack_update(
     //   '이미 적용됨', 아니면 '상태 불명'으로 보낸다. 토큰이 없으면(구 사이드카) 종전 경로 그대로.
     if let Some(tok) = parse_pack_update_outcome(&stdout) {
         if tok.gate == "up-to-date" {
+            // ★(B-360 R2 revise) no reinject ran, but the pending pass may have left nodes whose directive delivery is
+            //   unknown (exit 3 + `PACK_UPDATE_RESULT … unknown=U`): say so instead of a clean "already applied".
+            if let ReinjectResult::Measured { unknown, .. } = parse_reinject_result(&stdout) {
+                if unknown > 0 {
+                    let _ = app.emit(
+                        "update-warning",
+                        json!({
+                            "phase": "pack-update",
+                            "pack_version": tok.disk,
+                            "reinject_unknown": unknown,
+                            "message": reinject_unknown_message(&tok.disk, unknown),
+                        }),
+                    );
+                }
+            }
             let confirmed = uptodate_confirmed(&tok);
             let _ = app.emit(
                 "pack-uptodate",
@@ -8247,9 +8269,10 @@ async fn install_pack_update(
     // 사이드카 구조화 출력에서 reinject failed/deferred 집계 — 라이브 미각성을 사용자에게 경고.
     // ★U4-B2③ 3상 판독: 재주입 자체를 못 한 스킵을 (0,0)=완전 성공으로 읽지 않는다.
     let reinject = parse_reinject_result(&stdout);
-    let (failed, deferred) = match &reinject {
-        ReinjectResult::Measured { failed, deferred } => (*failed, *deferred),
-        ReinjectResult::Skipped { .. } | ReinjectResult::Absent => (0, 0),
+    // ★(B-360 R2 revise) + `unknown` (directive may still land — not re-sent; the next pack-update checks it)
+    let (failed, deferred, unknown) = match &reinject {
+        ReinjectResult::Measured { failed, deferred, unknown } => (*failed, *deferred, *unknown),
+        ReinjectResult::Skipped { .. } | ReinjectResult::Absent => (0, 0, 0),
     };
     let reinject_skipped = matches!(reinject, ReinjectResult::Skipped { .. });
     if let ReinjectResult::Skipped { reason } = &reinject {
@@ -8272,9 +8295,16 @@ async fn install_pack_update(
                 ),
             }),
         );
-    } else if failed > 0 || deferred > 0 {
+    } else if failed > 0 || deferred > 0 || unknown > 0 {
         // ★성공으로만 포장 금지 — 디스크는 갱신됐으나 라이브 노드 일부 미각성/보류를 경고한다.
         //   (app.restart는 여전히 미호출 — 무중단 불변식 유지.)
+        let mut message = format!(
+            "디스크 팩은 {pack_version} 로 갱신됐으나 reinject {failed} 실패·{deferred} 보류 — \
+             일부 노드 미각성(라이브 무중단 유지, 재시작 안 함). 다음 pack-update에서 재시도됩니다."
+        );
+        if unknown > 0 {
+            message = format!("{message} {}", reinject_unknown_message(&pack_version, unknown));
+        }
         let _ = app.emit(
             "update-warning",
             json!({
@@ -8282,10 +8312,8 @@ async fn install_pack_update(
                 "pack_version": pack_version,
                 "reinject_failed": failed,
                 "reinject_deferred": deferred,
-                "message": format!(
-                    "디스크 팩은 {pack_version} 로 갱신됐으나 reinject {failed} 실패·{deferred} 보류 — \
-                     일부 노드 미각성(라이브 무중단 유지, 재시작 안 함). 다음 pack-update에서 재시도됩니다."
-                ),
+                "reinject_unknown": unknown,
+                "message": message,
             }),
         );
     }
@@ -8295,6 +8323,7 @@ async fn install_pack_update(
             "pack_version": pack_version,
             "reinject_failed": failed,
             "reinject_deferred": deferred,
+            "reinject_unknown": unknown,
             "reinject_skipped": reinject_skipped,
         }),
     );
@@ -8358,12 +8387,15 @@ fn uptodate_confirmed(t: &PackUpdateOutcomeToken) -> bool {
 /// 두고 있었지만, WP-B2(review1 m9 FIX)가 이미 이 함수를 3상 `ReinjectResult` 로 승격하고 프로덕션
 /// 호출부(6732행대)를 옮겼다 — 그 판을 그대로 쓴다. 구 시그니처를 부르는 회귀 핀은 6683행대의
 /// `#[cfg(test)] fn parse_reinject_counts`(B2 신설, `parse_reinject_result` 위임)가 대신한다.
+/// ★(B-360 R2 revise) `Measured.unknown` = nodes whose reinject outcome is unknown (`unknown=`; the directive may still
+/// land, it is not re-sent, the next pack-update checks it). A line from an older CLI without the token reads 0.
 #[derive(Debug, PartialEq)]
 enum ReinjectResult {
-    Measured { failed: u64, deferred: u64 },
+    Measured { failed: u64, deferred: u64, unknown: u64 },
     Skipped { reason: String },
     Absent,
 }
+
 
 /// 사람용 메시지와 독립한 안정 토큰(REINJECT_RESULT_PREFIX)만 신뢰한다. `reinject=skipped` 가
 /// 있으면 수치와 무관하게 스킵이다(구 CLI 는 이 키를 찍지 않으므로 종전 판독과 충돌하지 않는다).
@@ -8372,7 +8404,7 @@ fn parse_reinject_result(stdout: &str) -> ReinjectResult {
     for line in stdout.lines() {
         let line = line.trim();
         if let Some(rest) = line.strip_prefix(cys::pack::REINJECT_RESULT_PREFIX) {
-            let (mut failed, mut deferred) = (0u64, 0u64);
+            let (mut failed, mut deferred, mut unknown) = (0u64, 0u64, 0u64);
             let mut skipped = false;
             let mut reason = String::from("unknown");
             for tok in rest.split_whitespace() {
@@ -8380,6 +8412,8 @@ fn parse_reinject_result(stdout: &str) -> ReinjectResult {
                     failed = v.parse().unwrap_or(0);
                 } else if let Some(v) = tok.strip_prefix("deferred=") {
                     deferred = v.parse().unwrap_or(0);
+                } else if let Some(v) = tok.strip_prefix("unknown=") {
+                    unknown = v.parse().unwrap_or(0);
                 } else if tok == "reinject=skipped" {
                     skipped = true;
                 } else if let Some(v) = tok.strip_prefix("reason=") {
@@ -8392,7 +8426,7 @@ fn parse_reinject_result(stdout: &str) -> ReinjectResult {
             if skipped {
                 return ReinjectResult::Skipped { reason };
             }
-            return ReinjectResult::Measured { failed, deferred };
+            return ReinjectResult::Measured { failed, deferred, unknown };
         }
     }
     ReinjectResult::Absent
@@ -8409,7 +8443,7 @@ fn parse_reinject_result(stdout: &str) -> ReinjectResult {
 #[cfg(test)]
 fn parse_reinject_counts(stdout: &str) -> (u64, u64) {
     match parse_reinject_result(stdout) {
-        ReinjectResult::Measured { failed, deferred } => (failed, deferred),
+        ReinjectResult::Measured { failed, deferred, .. } => (failed, deferred),
         ReinjectResult::Skipped { .. } | ReinjectResult::Absent => (0, 0),
     }
 }
@@ -11850,7 +11884,7 @@ exit 0
         );
         assert_eq!(
             parse_reinject_result("PACK_UPDATE_RESULT pack_version=2.0.0 injected=2 skipped=1 deferred=3 failed=4"),
-            ReinjectResult::Measured { failed: 4, deferred: 3 },
+            ReinjectResult::Measured { failed: 4, deferred: 3, unknown: 0 },
             "노드 카운트 skipped=N 을 재주입 스킵으로 오독하면 안 된다"
         );
         assert_eq!(parse_reinject_result("[pack-update] 이미 최신 — 반영 0. no-op.\n"), ReinjectResult::Absent);
