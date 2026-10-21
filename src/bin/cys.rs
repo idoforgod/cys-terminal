@@ -1172,8 +1172,125 @@ impl KeptPaneScope {
 impl Drop for KeptPaneScope {
     fn drop(&mut self) {
         if self.owner {
-            KEPT_PANE_RUN.with(|r| *r.borrow_mut() = None);
+            let run = KEPT_PANE_RUN.with(|r| r.borrow_mut().take());
+            // ★(B-360 R2 revise · carrier A) the OUTERMOST command, at its end, sends at most one notice for its records.
+            //   While a panic unwinds, nothing is sent (no blocking, no second panic → never an abort); any panic of the
+            //   send itself is contained. The records are already on disk either way.
+            if let Some(run) = run.filter(|run| !run.records.is_empty()) {
+                if std::thread::panicking() {
+                    eprintln!(
+                        "[kept-pane] notice to master not sent: the command is unwinding a panic ({} record(s) on disk)",
+                        run.records.len()
+                    );
+                } else if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    kept_pane_notify_master(run.command, &run.records)
+                }))
+                .is_err()
+                {
+                    eprintln!("[kept-pane] notice to master not sent: the send panicked (contained; records on disk)");
+                }
+            }
         }
+    }
+}
+
+/// ★(B-360 R2 revise · carrier A) The dedup key of the kept-pane notice: `#` + FNV-1a 64 as 16 hex over the record file's
+/// absolute path. A RE-IMPLEMENTATION in cys.rs of cysd's `opaque_label` / `fnv1a64` (src/bin/cysd/alert_route.rs — the
+/// producer of the `key=#…` / `rule=#…` tokens in queued notice bodies): that module lives in the cysd binary and is not
+/// reachable from cys; specimen `b360_r2r_c6…` pins both to the value cysd's own test pins (`rule=#ce4c6bff0d4d933a`
+/// for "cpu_high"). Same machine + same record file → same key, so master's queue holds at most one.
+fn kept_pane_notice_key(record_path: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in record_path.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("#{h:016x}")
+}
+
+/// The notice text (pure): `[kept-pane] key=#… N pane(s) kept by `cys <command>` …`, the roles with their seats, the
+/// record file path and the check hints.
+fn kept_pane_notice_text(command: &str, records: &[Value], record_path: &str) -> String {
+    let panes: Vec<String> = records
+        .iter()
+        .map(|r| {
+            let sref = r["surface_id"].as_u64().map(surface_ref).unwrap_or_else(|| "?".into());
+            format!(
+                "{} ({sref}: {} write {}; check `cys read-screen --surface {sref}`, then `cys reinject --role {} --check`)",
+                r["role"].as_str().unwrap_or("?"),
+                r["write"].as_str().unwrap_or("?"),
+                r["outcome"].as_str().unwrap_or("?"),
+                r["role"].as_str().unwrap_or("?")
+            )
+        })
+        .collect();
+    format!(
+        "[kept-pane] key={} {} pane(s) kept by `cys {command}` after a REFUSED (zero bytes) or UNKNOWN (may still land) \
+         write — nothing destroyed, nothing re-sent: {} — records: {record_path}",
+        kept_pane_notice_key(record_path),
+        records.len(),
+        panes.join("; ")
+    )
+}
+
+/// Bound of each RPC of the kept-pane notice (s).
+const KEPT_PANE_NOTICE_RPC_SECS: u64 = 3;
+
+/// ★(B-360 R2 revise · carrier A, best effort) One QUEUED notice to the `master` role for this run's kept-pane records:
+/// resolve master → skip when its pending queue already carries this key (cross-run coalescing; the record file still has
+/// the new lines) → queued `surface.send_text` (the method and params `cys send --queued --to master` uses; never a
+/// direct write). Transport: `request_on_timeout` on the command's socket — a direct connect with a bounded deadline,
+/// NOT `request()`, whose `connect()` can autostart a daemon or `process::exit` on a dead socket. Every failure is one
+/// stderr line naming why; the command's exit code and stdout never depend on it.
+fn kept_pane_notify_master(command: &str, records: &[Value]) {
+    let socket = socket_path();
+    let rpc = |method: &str, params: Value| {
+        request_on_timeout(&socket, method, params, std::time::Duration::from_secs(KEPT_PANE_NOTICE_RPC_SECS))
+    };
+    let record_path = kept_pane_records_path(&pack_state_base()).to_string_lossy().into_owned();
+    let key = kept_pane_notice_key(&record_path);
+    let not_sent = |why: String| eprintln!("[kept-pane] notice to master not sent ({} record(s) in {record_path}): {why}", records.len());
+    let sid = match request_on_timeout(
+        &socket,
+        "system.resolve_role",
+        json!({"role": "master"}),
+        std::time::Duration::from_secs(KEPT_PANE_NOTICE_RPC_SECS),
+    ) {
+        Ok(r) => match r["surface_id"].as_u64() {
+            Some(sid) => sid,
+            None => return not_sent("role_not_found: master resolved to no surface".into()),
+        },
+        Err(e) => return not_sent(e),
+    };
+    match request_on_timeout(
+        &socket,
+        "queue.list",
+        json!({"surface_id": sid, "full": true}),
+        std::time::Duration::from_secs(KEPT_PANE_NOTICE_RPC_SECS),
+    ) {
+        Ok(r) => {
+            let token = format!("key={key}");
+            let pending = r["entries"].as_array().is_some_and(|entries| {
+                entries.iter().any(|e| {
+                    e["text"].as_str().is_some_and(|t| t.contains(&token))
+                        || e["preview"].as_str().is_some_and(|t| t.contains(&token))
+                })
+            });
+            if pending {
+                return not_sent(format!("a notice with {token} is already pending for master (coalesced)"));
+            }
+        }
+        // without the queue we cannot bound the flood: do not add a possible duplicate
+        Err(e) => return not_sent(format!("master's queue unreadable, cannot coalesce: {e}")),
+    }
+    let from = send_from_param(
+        cys::env_compat(ENV_SURFACE_ID).and_then(|s| parse_surface_ref(&s)),
+        Some("kept-pane"),
+    );
+    let text = kept_pane_notice_text(command, records, &record_path);
+    match rpc("surface.send_text", json!({"surface_id": sid, "text": text, "from": from, "queued": true})) {
+        Ok(_) => eprintln!("[kept-pane] notice queued for master ({} record(s), key={key})", records.len()),
+        Err(e) => not_sent(e),
     }
 }
 
@@ -47494,5 +47611,17 @@ mod b360_tests {
         assert!(notify.matches("request_on_timeout(").count() >= 3, "{notify}");
         let drop = body("impl Drop for KeptPaneScope {");
         assert!(drop.contains("std::thread::panicking()") && drop.contains("catch_unwind"), "{drop}");
+    }
+
+    /// Carrier (A) · the key derivation is a re-implementation of cysd's `opaque_label` (FNV-1a 64, `#{:016x}`,
+    /// src/bin/cysd/alert_route.rs) — that function lives in the cysd binary and is not reachable from a cys test, so both
+    /// are pinned to the same fixed value: cysd's own specimen pins `rule=#ce4c6bff0d4d933a` for "cpu_high"
+    /// (alert_route.rs, `("health.alert", json!({"rule": "cpu_high"}), "rule=#ce4c6bff0d4d933a")`).
+    /// Cannot be red on a4c234ac: `kept_pane_notice_key` does not exist there. Positive control: the test-local
+    /// recomputation `r2n_key` gives the same value.
+    #[test]
+    fn b360_r2r_c6_the_notice_key_matches_cysd_opaque_label_on_a_fixed_input() {
+        assert_eq!(kept_pane_notice_key("cpu_high"), "#ce4c6bff0d4d933a");
+        assert_eq!(r2n_key("cpu_high"), "#ce4c6bff0d4d933a");
     }
 }
