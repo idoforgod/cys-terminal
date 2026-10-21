@@ -5608,10 +5608,15 @@ fn run(command: Command) -> i32 {
                             //   여기서 통째로 버려지던 것은 관문 Hold 처방 전문이고, 이 신호를
                             //   못 받은 노드는 업데이트 재시작 전에 상태를 저장하지 못한다.
                             if let Err(e) = inject_text(sid, "[DRAIN] 업데이트 재시작이 임박했다. 승인 프롬프트 대기 중이면 이 메시지는 무시하라. 아니면 지금 _round/SESSION_STATE.md와 자기 TODO를 저장하고 작업을 멈춰라. 작업 재개는 복원 후 master 지시를 기다린다.") {
-                                eprintln!(
-                                    "[drain] {role} {} 저장 신호 미전달(계속 진행) — {e}",
-                                    surface_ref(sid)
-                                );
+                                // ★(B-360 R2) name the outcome: UNKNOWN may still be typed (never re-sent here), REFUSED typed nothing
+                                let what = if is_write_outcome_unknown(&e) {
+                                    "save signal outcome unknown (may still be typed — not re-sent)"
+                                } else if is_journal_refusal(&e) {
+                                    "save signal refused by the writer journal (zero bytes, nothing typed)"
+                                } else {
+                                    "저장 신호 미전달(계속 진행)"
+                                };
+                                eprintln!("[drain] {role} {} {what} — {e}", surface_ref(sid));
                             }
                             n += 1;
                         }
@@ -13389,6 +13394,21 @@ fn run_boot(cwd: Option<String>, as_json: bool) -> i32 {
                             "[boot] role={role} 재관측 채택 중 {why} — 보류 유지({other:?})"
                         );
                     }
+                    // ★(B-360 R2) UNKNOWN: the adoption payload may still land. A kept marker makes the next boot adopt
+                    //   and type it all again, so clear it as a successful adopt does; report the outcome (not fatal).
+                    Err(e) if is_write_outcome_unknown(&e) => {
+                        clear_gate_pending(sid);
+                        println!(
+                            "· {agent}: 역할 '{role}' directive outcome unknown (may still be typed — not re-sent) — \
+                             check the seat (`cys read-screen --surface {sref}`), `cys reinject --role {role}` if it did not land"
+                        );
+                        outcomes.push(json!({"role": role, "agent": agent, "outcome": "directive_unknown",
+                                             "mandatory": mandatory, "surface_ref": sref,
+                                             "reason": format!("directive outcome unknown — check the seat, `cys reinject --role {role}` \
+                                                                if it did not land (gate marker cleared: the next boot does not \
+                                                                re-adopt): {e}")}));
+                        continue;
+                    }
                     Err(e) => {
                         eprintln!("[boot] role={role} 재관측 채택 실패 — 보류 유지(파괴 0): {e}");
                     }
@@ -13694,6 +13714,8 @@ fn boot_summary_buckets(roles: &[Value]) -> serde_json::Map<String, Value> {
             "recovered" => "recovered",
             "gate_pending" => "gate_pending",
             "skipped_unconfirmed" => "skipped_unconfirmed",
+            // ★(B-360 R2) adopt paste outcome unknown — seat kept, marker cleared, not fatal
+            "directive_unknown" => "directive_unknown",
             "missing" => "missing",
             "failed" => "failed",
             _ => "unbucketed",
@@ -13734,6 +13756,7 @@ const BOOT_SUMMARY_BUCKETS: &[&str] = &[
     "recovered",
     "gate_pending",
     "skipped_unconfirmed",
+    "directive_unknown",
     "missing",
     "failed",
     "unbucketed",
@@ -19696,6 +19719,8 @@ fn verify_one_node(
     // 3) 저장 지시 주입 — nonce 마커 기입 + 작업 중단.
     let instr = drain_verify_instruction(&marker);
     let io_to = std::cmp::min(timeout, Duration::from_secs(8));
+    // ★(B-360 R2) set when the instruction's outcome is unknown: it may still be typed, so the checks below still run
+    let mut unknown: Option<String> = None;
     if let Err(e) = io.inject(&t.socket, t.surface_id, &instr, io_to) {
         // ★(U-14) 관문 보류는 소켓 hung 이 **아니다** — 소켓은 멀쩡했고 우리가 스스로 안 보냈다.
         //   둘을 같은 `timeout` 으로 접으면 사람이 소켓·데몬을 뒤지게 된다(진단이 거짓 방향을
@@ -19715,11 +19740,23 @@ fn verify_one_node(
                 format!("입력줄 점유 — 데몬이 저장 지시 직접 주입을 거부(D-12 · 쓰기 0 · Return 0발): {e}"),
             );
         }
-        // 소켓 hung(RPC 타임아웃) — delivery_failed(노드 wedge)와 구분해 timeout으로 분류
-        return (
-            VerifyOutcome::Timeout,
-            "소켓 hung — 저장 지시 RPC 타임아웃(전역 캡 내)".into(),
-        );
+        // ★(B-360 R2) the daemon answered: REFUSED wrote zero bytes (a re-send is safe) — not a hung socket
+        if is_journal_refusal(&e) {
+            return (
+                VerifyOutcome::DeliveryFailed,
+                format!("writer journal refused the save instruction (zero bytes, nothing typed — a re-send is safe): {e}"),
+            );
+        }
+        if is_write_outcome_unknown(&e) {
+            // ★(B-360 R2) UNKNOWN is not a hung socket either; never re-sent — the wedge gate and the poll below decide
+            unknown = Some(e);
+        } else {
+            // 소켓 hung(RPC 타임아웃) — delivery_failed(노드 wedge)와 구분해 timeout으로 분류
+            return (
+                VerifyOutcome::Timeout,
+                "소켓 hung — 저장 지시 RPC 타임아웃(전역 캡 내)".into(),
+            );
+        }
     }
     // 4) 전달확정 게이트 — 빈 프롬프트+스피너 확인, wedge(하단 입력창 잔류)면 Return 재전송
     std::thread::sleep(Duration::from_millis(600));
@@ -19751,6 +19788,16 @@ fn verify_one_node(
         (
             VerifyOutcome::DeliveryFailed,
             "입력 미제출(wedge) — Return 재전송에도 저장 미검출".into(),
+        )
+    } else if let Some(e) = unknown {
+        // ★(B-360 R2) keep the daemon's code in the detail: the command exits 91 on it
+        (
+            VerifyOutcome::Timeout,
+            format!(
+                "save instruction outcome unknown (may still be typed — not re-sent) · nonce not seen within {}s: {} ({e})",
+                timeout.as_secs(),
+                file.display()
+            ),
         )
     } else {
         (
@@ -20058,8 +20105,14 @@ fn run_drain_verify(timeout: u64) -> i32 {
     drain_verify_merge_unreachable(&mut report, &unreachable);
     let all_saved = report["all_saved"].as_bool() == Some(true);
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
+    // ★(B-360 R2) an unsaved node whose save instruction's outcome is unknown: 91 (it may still land — no blind re-run)
+    let unknown = report["nodes"].as_array().is_some_and(|nodes| {
+        nodes.iter().any(|n| n["outcome"] != "saved" && n["detail"].as_str().is_some_and(is_write_outcome_unknown))
+    });
     if all_saved {
         0
+    } else if unknown {
+        EXIT_WRITE_OUTCOME_UNKNOWN
     } else {
         1
     }
@@ -20882,6 +20935,10 @@ fn cycle_best_effort_reinject(
     let directive = match cycle_reinject_payload(false, resume, compose) {
         Ok(payload) => match inject(&payload) {
             Ok(()) => return "디렉티브+RESUME 한 제출 1건 송신".to_string(),
+            // ★(B-360 R2) UNKNOWN: the one submission may still be typed — RESUME alone again would type it twice
+            Err(e) if is_write_outcome_unknown(&e) => {
+                return format!("디렉티브+RESUME 한 제출 outcome unknown (may still be typed — RESUME not re-sent: {e})");
+            }
             Err(e) => format!("디렉티브+RESUME 한 제출 실패(부분 송신 가능: {e})"),
         },
         Err(e) => format!("디렉티브 0건(합성 실패: {e})"),
@@ -20907,6 +20964,13 @@ fn cycle_reinject_held(
     } else {
         cycle_best_effort_reinject(hooks_inject, resume, compose, inject)
     };
+    // ★(B-360 R2) a reinject write's outcome is unknown: not the 86 token — 91 (it may still land; nothing re-sent)
+    if is_write_outcome_unknown(&sent) {
+        return format!(
+            "clear 는 실효 확인됨(session_file 교체) · 재주입 보류 사유: {reason} · the reinject's outcome is unknown — it \
+             may still land: do not re-send; check the seat (`cys status --json` awakened_at, the screen): {sent}"
+        );
+    }
     format!(
         "{CYCLE_REINJECT_HELD_TOKEN} clear 는 실효 확인됨(session_file 교체) · 재주입 보류 사유: {reason} · \
          실제 송신 내역(재주입): {sent}. 손으로 다시 clear 하지 마라 — ★(REVIEW1 F4) [RESUME] 은 이제 \
@@ -20914,6 +20978,27 @@ fn cycle_reinject_held(
          화면 재주입 여부는 `cys status --json` 의 이 좌석 `awakened_at`/세션 파일 교체로 확인하고, \
          그것으로 이미 나간 재주입이 확인되면 다시 재주입하지 마라(중복 재주입 방지)"
     )
+}
+
+/// ★(B-360 R2) The reinject after a VERIFIED clear failed: the seat is cleared, so say so. REFUSED (zero bytes) → the 86
+/// token (cleared, reinject held — a resend is safe); UNKNOWN → a 91 message (it may still land — never re-sent).
+/// Any other error is returned unchanged (rc 1, as before).
+fn cycle_cleared_reinject_err(e: String, sid: u64, role: &str) -> String {
+    if is_journal_refusal(&e) {
+        format!(
+            "{CYCLE_REINJECT_HELD_TOKEN} clear 는 실효 확인됨(session_file 교체) · the writer journal refused the reinject \
+             (zero bytes, nothing typed): surface:{sid} ({role}) is cleared WITHOUT its directive — a resend is safe once \
+             the journal is writable: `cys reinject --role {role}`. 손으로 다시 clear 하지 마라: {e}"
+        )
+    } else if is_write_outcome_unknown(&e) {
+        format!(
+            "clear 는 실효 확인됨(session_file 교체) · the reinject's outcome is unknown — it may still land: do not \
+             re-send; check the seat (`cys read-screen --surface surface:{sid}`), then `cys reinject --role {role}` only if \
+             it did not land: {e}"
+        )
+    } else {
+        e
+    }
 }
 
 /// 저장 지시 → 저장 검증 → handshake → 턴 종료·빈 composer 확인 → clear → 실효 관측 → 재주입.
@@ -21380,6 +21465,8 @@ fn run_cycle_agent(
         //   데몬 가드는 not_cleared 를 사이클 끝으로 보지 않는다(발화를 풀지 않고 수준을 다시 재지 않는다).
         let mut outcome = CycleOutcome::Unknown;
         let clear_result = (|| -> Result<(), String> {
+            // ★(B-360 R2) set when the atomic clear's outcome is unknown (it may still be typed): the effect check decides
+            let mut clear_unknown: Option<String> = None;
             // 5) 입력 버퍼 정리 + clear를 한 writer arm에서 원자 송신한다.
             // 종전 3분할은 본문 뒤 사람 입력이 끼어 Return만 거부되면 clear와 초안이 섞였다.
             // ClearFirst 게이트 1회 → Ctrl-U·settle·paste·CR 순서를 데몬에 맡긴다(state.rs Inject).
@@ -21433,11 +21520,21 @@ fn run_cycle_agent(
                     })?;
                 }
                 Err(e) => {
-                    return Err(if is_typing_guard_err(&e) {
-                        format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 원자 송신 거부(송신 0건 · composer 무변경): 데몬이 사람 초안을 감지했다 — 초안을 제출·삭제한 뒤 해당 단계만 재시도 ({e})")
+                    if is_write_outcome_unknown(&e) {
+                        // ★(B-360 R2) never re-sent; the session_file check below sees a late landing
+                        eprintln!("[cycle 5/7] '{clear}' outcome unknown (may still be typed — not re-sent) — the effect check decides");
+                        clear_unknown = Some(e);
                     } else {
-                        e
-                    });
+                        // ★(B-360 R2) zero bytes at the writer journal: the clear was never typed — the guard hears not_cleared
+                        if is_journal_refusal(&e) {
+                            outcome = CycleOutcome::NotCleared;
+                        }
+                        return Err(if is_typing_guard_err(&e) {
+                            format!("{CYCLE_HUMAN_DRAFT_TOKEN} clear 원자 송신 거부(송신 0건 · composer 무변경): 데몬이 사람 초안을 감지했다 — 초안을 제출·삭제한 뒤 해당 단계만 재시도 ({e})")
+                        } else {
+                            e
+                        });
+                    }
                 }
             }
 
@@ -21461,6 +21558,24 @@ fn run_cycle_agent(
                     }
                 }
             };
+            // ★(B-360 R2) an unknown clear shows its landing only as the swap: seen → reinject as for any verified clear;
+            //   not seen in the window → stop with 91, visibly (if it lands later the seat is left without its directive).
+            if let Some(e) = clear_unknown.as_ref() {
+                if effect == ClearEffect::Verified {
+                    eprintln!("[cycle 6/7] the unknown '{clear}' landed (session_file swap observed) — reinjecting");
+                } else {
+                    let seen = if effect == ClearEffect::Unmeasurable {
+                        "cannot be observed (no statusline session_file)".to_string()
+                    } else {
+                        format!("was not observed within {clear_verify_window}s")
+                    };
+                    return Err(format!(
+                        "the /clear's outcome is unknown and its session_file swap {seen}; if it lands later \
+                         surface:{sid} ({role_name}) is cleared WITHOUT its directive — check the seat \
+                         (`cys read-screen --surface surface:{sid}`) and `cys reinject --role {role_name}`: {e}"
+                    ));
+                }
+            }
             match effect {
                 ClearEffect::Verified => {
                     outcome = CycleOutcome::Cleared;
@@ -21482,8 +21597,12 @@ fn run_cycle_agent(
                             // ★(0.14.41 · U8 P0-M1) 디렉티브 뒤 RESUME 을 **한 제출**로 — 두 번째 제출이
                             //   Claude 큐 선두에 끼어 감독자 지시를 막던 경로(반박 M1)를 닫는다.
                             //   합성 실패는 종전대로 `?` 로 올린다(판정·보고 계약 불변).
-                            inject_text(sid, &cycle_reinject_payload(hooks_inject, &resume_text, &mut || compose_directive(&role_name))?)?;
-                            Ok(())
+                            let reinject = (|| -> Result<(), String> {
+                                inject_text(sid, &cycle_reinject_payload(hooks_inject, &resume_text, &mut || compose_directive(&role_name))?)?;
+                                Ok(())
+                            })();
+                            // ★(B-360 R2) the seat IS cleared: REFUSED → 86 with the journal named · UNKNOWN → 91, never re-sent
+                            reinject.map_err(|e| cycle_cleared_reinject_err(e, sid, &role_name))
                         }
                         Err(e) => Err(cycle_reinject_held(
                             &e,
@@ -21506,6 +21625,8 @@ fn run_cycle_agent(
                     ))
                 }
                 ClearEffect::Unmeasurable => {
+                    // ★(B-360 R2) set when the reinject's outcome is unknown: 91, not 81 (RESUME was not re-sent)
+                    let mut reinject_unknown: Option<String> = None;
                     // statusline 미보고 어댑터는 화면 유휴로 부트 체인을 복원하되 rc81을 유지한다.
                     match wait_cycle_target_idle(
                         sid,
@@ -21528,14 +21649,23 @@ fn run_cycle_agent(
                                 &mut |text| inject_text(sid, text),
                             );
                             eprintln!("[cycle] 측정 불능 — 화면 유휴 관측 후 재주입(실효 미확인): {sent}");
+                            if is_write_outcome_unknown(&sent) {
+                                reinject_unknown = Some(sent);
+                            }
                         }
                         Err(e) => eprintln!("[cycle] 측정 불능 + 재주입 보류: {e}"),
                     }
-                    Err(format!(
-                        "{CLEAR_UNMEASURABLE_TOKEN} clear 를 송신했으나 실효 측정 불능 — clear 직전 \
-                         statusline session_file 이 없다(statusline 미보고 에이전트 · usage 부재). \
-                         측정 불능은 통과가 아니다"
-                    ))
+                    match reinject_unknown {
+                        Some(sent) => Err(format!(
+                            "clear 를 송신했으나 실효 측정 불능 · the reinject's outcome is unknown — it may still land: do \
+                             not re-send; check the seat (`cys read-screen --surface surface:{sid}`): {sent}"
+                        )),
+                        None => Err(format!(
+                            "{CLEAR_UNMEASURABLE_TOKEN} clear 를 송신했으나 실효 측정 불능 — clear 직전 \
+                             statusline session_file 이 없다(statusline 미보고 에이전트 · usage 부재). \
+                             측정 불능은 통과가 아니다"
+                        )),
+                    }
                 }
             }
         })();
@@ -21695,6 +21825,8 @@ fn recover_directive() -> &'static str {
 
 /// T2-6 조직 복원: 토폴로지 스냅샷 기준으로 죽은 역할 일괄 재기동 (작업 재개는 master 판단)
 fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i32 {
+    // ★(B-360 R2) in-seat seats kept after a REFUSED (90) / UNKNOWN (91) write — never a fresh fallback
+    let (mut refused, mut unknown) = (0usize, 0usize);
     let result = (|| -> Result<(usize, usize, usize), String> {
         let topo = request("system.topology", json!({}))?;
         // ★SEAT(2026-07-17 실사고 수리): '역할이 등록됨'과 '그 좌석에 누가 앉아 있음'을 구분한다.
@@ -21852,6 +21984,26 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
                         // in-seat 실패는 치명이 아니다 — fresh 폴백이 가용성을 지킨다(정직히 알린다).
                         println!("· {role}: 좌석 내 재연결 실패({evidence}) — fresh 기동으로 폴백");
                     }
+                    // ★(B-360 R2) a write of the in-seat relaunch was REFUSED or has an UNKNOWN outcome: the in-seat agent
+                    //   may be running, so a fresh fallback would put a second agent on the role (and, for UNKNOWN, a
+                    //   second directive). Keep the seat, like launch-agent's 90/91.
+                    Err(e) if is_journal_refusal(&e) => {
+                        refused += 1;
+                        println!(
+                            "· {role}: 좌석 내 재연결 — the writer journal refused a write (zero bytes, nothing typed) — seat \
+                             surface:{sid} kept, no fresh launch. If the agent runs WITHOUT its directive, make the journal \
+                             writable and `cys reinject --role {role}`; if the seat is still an empty shell, `cys restore` again: {e}"
+                        );
+                        continue;
+                    }
+                    Err(e) if is_write_outcome_unknown(&e) => {
+                        unknown += 1;
+                        println!(
+                            "· {role}: 좌석 내 재연결 — a write's outcome is unknown (it may still land) — seat surface:{sid} \
+                             kept, no fresh launch, nothing re-sent: check the seat (`cys read-screen --surface surface:{sid}`): {e}"
+                        );
+                        continue;
+                    }
                     Err(e) => {
                         // in-seat 실패는 치명이 아니다 — fresh 폴백이 가용성을 지킨다(정직히 알린다).
                         println!("· {role}: 좌석 내 재연결 실패({e}) — fresh 기동으로 폴백");
@@ -21899,7 +22051,15 @@ fn run_restore(cwd: Option<String>, include_master: bool, no_resume: bool) -> i3
             println!(
                 "restore 완료: 재기동 {ok} · 실패 {fail} · 관문 보류 {gated} · 현황 `cys status`"
             );
-            if fail > 0 || gated > 0 {
+            if refused > 0 || unknown > 0 {
+                println!("restore: 좌석 보존 — journal refused {refused} · outcome unknown {unknown} (fresh 폴백 0)");
+            }
+            // ★(B-360 R2) 91 outranks 90 (a blind re-run may type twice); both outrank the generic 1
+            if unknown > 0 {
+                EXIT_WRITE_OUTCOME_UNKNOWN
+            } else if refused > 0 {
+                EXIT_DIRECTIVE_REFUSED
+            } else if fail > 0 || gated > 0 {
                 1
             } else {
                 0
@@ -23237,6 +23397,14 @@ fn adapter_ready(agent: &Option<String>, idle: bool, idle_secs: u64, scrollback_
     cys::readiness::judge(&obs).is_ready()
 }
 
+/// ★(B-360 R2) The visible note for a pack-update reinject whose outcome is unknown (rows 9 and 10 share it).
+fn reinject_unknown_note(sid: u64, role: &str, e: &str) -> String {
+    format!(
+        "reinject outcome unknown (surface {sid}, role {role}) — it may still land, not re-sent; marked as delivered so the \
+         next pack-update does not re-inject — verify the seat; `cys reinject --role {role}` if it did not land: {e}"
+    )
+}
+
 /// 살아있는 노드에 무중단 reinject(§7-②) — control.dashboard(state)·system.topology(마커)를 읽어
 /// reinject_decision으로 판정, Inject만 디렉티브 주입 후 reinject.mark RPC로 기록(P3).
 /// ★라이브 데몬 필요 — 실주입 검증은 P7. 여기선 결정 로직 배선만(베스트에포트).
@@ -23289,9 +23457,14 @@ fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
                 // per-node 에러 격리(Fix3): 한 노드의 transient 실패가 나머지 건강 노드의 reinject를
                 // 중단시키지 않게 `?` 전파 대신 count+continue 한다.
                 if let Err(e) = inject_text(sid, &directive) {
-                    eprintln!("[pack-update] reinject 주입 실패(surface {sid}, role {role}): {e} — 다음 노드로 계속");
-                    failed += 1;
-                    continue;
+                    if !is_write_outcome_unknown(&e) {
+                        eprintln!("[pack-update] reinject 주입 실패(surface {sid}, role {role}): {e} — 다음 노드로 계속");
+                        failed += 1;
+                        continue;
+                    }
+                    // ★(B-360 R2) UNKNOWN: it may still land — mark it as delivered so the next pack-update does not
+                    //   type it twice, and say how to check
+                    eprintln!("[pack-update] ⚠ {}", reinject_unknown_note(sid, role, &e));
                 }
                 // 주입 성공 후에만 마커 기록(P3 단일 write path). 마커 기록 실패는 '이미 주입됨'을
                 // 의미하므로 다음 pack-update에서 같은 버전이 재주입(중복 주입)될 수 있다 — 그 창을
@@ -23364,9 +23537,13 @@ fn consume_reinject_pending_core(
         {
             ReinjectDecision::Inject => {
                 // per-node 에러 격리 — 한 노드의 실패가 나머지 재시도를 막지 않게 잔존 처리 후 계속.
-                if inject(*sid, &directive).is_err() {
-                    kept.push((*sid, role.clone()));
-                    continue;
+                if let Err(e) = inject(*sid, &directive) {
+                    if !is_write_outcome_unknown(&e) {
+                        kept.push((*sid, role.clone()));
+                        continue;
+                    }
+                    // ★(B-360 R2) UNKNOWN: not kept pending (the next pack-update would type it twice) — marked as delivered
+                    eprintln!("[pack-update] ⚠ pending {}", reinject_unknown_note(*sid, role, &e));
                 }
                 if mark(*sid, pending_ver, &new_hash).is_err() {
                     kept.push((*sid, role.clone()));
