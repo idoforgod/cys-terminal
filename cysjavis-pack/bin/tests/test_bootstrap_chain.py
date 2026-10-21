@@ -1483,5 +1483,53 @@ for _name, _fn in (("32-busy", r3_busy), ("33-nojson", r3_nojson)):
     r3_section(_name, _fn)
 
 
+# ── 34. the head's note: READINESS UNMEASURED is not a value. Every withheld row and the sidecar carry a `basis` —
+#    "unknown" (an UNKNOWN-class signal: a boot row or a durable record) or "unmeasured" (an unreadable boot JSON,
+#    status or record line) — and the sidecar lists the bases present. Plus worker-7's exit-124 ruling: a `--json` boot
+#    that exits non-zero (not 75/78) with no parseable JSON is unmeasured, so the decision point removes a stale marker
+#    there too; the fatal column is unchanged (exit 4). The control proves the removal comes from "unmeasured", not
+#    from "fatal": exit 1 WITH a parseable JSON and no unknown row leaves the stale marker in place. ──
+def r3_basis():
+    r = r3_run(boot_stdout=r3_boot_stdout(r3_row("worker", "directive_unknown", True, surface_ref="surface:7")))
+    sc = r["sidecar"] or {}
+    rows = sc.get("rows") or []
+    check("34 ★an UNKNOWN-class row → basis 'unknown' (sidecar rows + ⑧ ready_withheld) · sidecar bases ['unknown']",
+          bool(rows) and all(x.get("basis") == "unknown" for x in rows) and sc.get("bases") == ["unknown"]
+          and all(x.get("basis") == "unknown" for x in (r["summary"].get("ready_withheld") or [{}])),
+          json.dumps(sc, ensure_ascii=False)[:400])
+    r = r3_run(boot_stdout="boot 완료: (no json line)\n")
+    sc = r["sidecar"] or {}
+    rows = sc.get("rows") or []
+    rw = (r["notices"][0] if r["notices"] else {}).get("ready_withheld") or {}
+    check("34 ★(b) unreadable boot JSON → basis 'unmeasured' · bases ['unmeasured'] · the notice names it unmeasured",
+          bool(rows) and all(x.get("basis") == "unmeasured" for x in rows) and sc.get("bases") == ["unmeasured"]
+          and any("boot --json stdout unreadable" in u for u in (rw.get("unmeasured") or [])),
+          "%s · notice %s" % (json.dumps(sc, ensure_ascii=False)[:300], json.dumps(rw, ensure_ascii=False)[:300]))
+    m6 = [x for x in r["steps"] if x.get("step") == "⑥marker"]
+    check("34 (b) the ⑥ step says 'readiness unmeasured (…)', never 'not ready' / 'UNKNOWN'",
+          bool(m6) and "readiness unmeasured (" in m6[-1].get("detail", "")
+          and "not ready" not in m6[-1].get("detail", "") and "UNKNOWN" not in m6[-1].get("detail", ""),
+          "%r" % [x.get("detail", "")[:200] for x in m6])
+    r = r3_run(pre=r3_stale, boot_exit=124)                     # killed: no stdout at all
+    sc = r["sidecar"] or {}
+    rw = (r["notices"][0] if r["notices"] else {}).get("ready_withheld") or {}
+    check("34 exit 124 without JSON: prerequisite bootstrap exit 4 (fatal by the old contract)", r["code"] == 4,
+          r3_brief(r))
+    check("34 ★exit 124 without JSON → stale marker ABSENT · sidecar withheld · basis unmeasured naming exit 124 · ONE notice",
+          not r["marker"] and sc.get("state") == "withheld" and sc.get("bases") == ["unmeasured"]
+          and any("exit 124" in str(x.get("why", "")) for x in (sc.get("rows") or []))
+          and len(r["notices"]) == 1 and any("exit 124" in u for u in (rw.get("unmeasured") or [])),
+          "%s · sidecar %s" % (r3_brief(r), json.dumps(sc, ensure_ascii=False)[:300]))
+    r = r3_run(pre=r3_stale, boot_exit=1, boot_stdout=r3_boot_stdout(r3_row("cso", "failed", True)))
+    check("34 control: exit 1 WITH a parseable JSON and no unknown row → exit 4 · the stale marker is STILL PRESENT",
+          r["code"] == 4 and r["marker"] and not r["sidecars"], r3_brief(r))
+
+
+for _name, _fn in (("34-basis", r3_basis),):
+    if os.environ.get("BOOT_R3_ONLY") and _name not in os.environ["BOOT_R3_ONLY"].split(","):
+        continue
+    r3_section(_name, _fn)
+
+
 print("\n%d FAIL" % len(fails) if fails else "\nALL PASS")
 sys.exit(1 if fails else 0)

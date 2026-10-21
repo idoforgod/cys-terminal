@@ -48117,6 +48117,38 @@ mod b360_tests {
         );
     }
 
+    /// Area R · the head's note (unmeasured is not a value): a caller whose withhold rests on READINESS UNMEASURED (an
+    /// unreadable boot JSON, status or record line — `ready_withheld.unmeasured`) gets a clause that says `readiness
+    /// unmeasured (<why>)`; with no kept pane in the run the notice says `0 pane(s)` and never calls anything UNKNOWN or
+    /// "not ready". Still one notice under the withheld key, with the record path. RED on af41d65c: no subcommand.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k10_kept_pane_notice_names_readiness_unmeasured_and_calls_nothing_unknown() {
+        let input = json!({"command": "bootstrap", "records": [],
+                           "ready_withheld": {"marker": R3_MARKER, "lane": "base", "consequences": ["c-one"],
+                                              "unmeasured": ["boot --json stdout unreadable (exit 124)"]}})
+        .to_string();
+        let n = r3_notice(&input, false, |_| vec![], true);
+        let notices = r3_notices(&n.calls);
+        let head = format!("[kept-pane] key={} 0 pane(s) kept by `cys bootstrap`", r3_withheld_key(&n.record_path));
+        let said = format!(
+            "READY MARKER WITHHELD: {R3_MARKER} — readiness unmeasured (boot --json stdout unreadable (exit 124)) — while it \
+             is absent: c-one"
+        );
+        assert!(
+            n.rc == 0
+                && notices.len() == 1
+                && notices[0].starts_with(&head)
+                && notices[0].contains(&said)
+                && notices[0].contains(&n.record_path)
+                && !notices[0].contains("UNKNOWN")
+                && !notices[0].to_lowercase().contains("not ready"),
+            "exit {} notices {notices:?} (want one starting {head:?} saying {said:?}, nothing UNKNOWN / not ready)\n{}",
+            n.rc,
+            n.err
+        );
+    }
+
     // ── ★(B-360 R3 · option 2 · A6) the R2 unknown entries of `.pack-reinject-pending.json` are keyed ──────────────────
     // FIX-SPEC-option2-v2 §8 A6 (+ FINDING-pending-file-shared-surface-number-attribution.md): the file is shared by every
     // lane (`pack_state_base()` = the parent of the pack dir) and surface numbers are per daemon, so an unknown entry is
