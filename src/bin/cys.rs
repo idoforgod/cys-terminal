@@ -46685,4 +46685,108 @@ mod b360_tests {
             assert_eq!((rc, cleared), (0, true), "{name}: {error}");
         }
     }
+
+    // ── ★(B-360 R2 revise) area B · `cys boot` under the head's option (a) ──────────────────────────────────────────
+    // `cys boot` keeps its exit class (0/1/75/78 as at 11717c44: javis_bootstrap step 4 exempts only 75/78). Kept panes
+    // are carried by the JSON and a kept-pane record (no ping, no re-adopt, no next-boot reconcile). node-recover's
+    // UNKNOWN exits 91 and run_boot maps it to `recover_unknown` — never escalate_reclaim, never a spawn.
+
+    /// The kept-pane records under a fixture's pack state base.
+    #[cfg(unix)]
+    fn r2b_records(pack: &R2cPack) -> Vec<Value> {
+        std::fs::read_to_string(pack.dir.join(".kept-pane-records.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    }
+
+    /// The `cys boot --json` report in a child's stdout.
+    #[cfg(unix)]
+    fn r2b_report(out: &str, err: &str) -> Value {
+        let line = out
+            .lines()
+            .find_map(|l| l.find("{\"roles\"").map(|at| &l[at..]))
+            .unwrap_or_else(|| panic!("no boot --json report:\n{out}\n{err}"));
+        serde_json::from_str::<Value>(line).expect("boot --json")
+    }
+
+    /// `cys boot --json` (child) where the worker seat (surface:7) is death-confirmed (empty seat, agent_alive false,
+    /// old), so boot runs node-recover on it; `launch` answers the recovery's launch paste. Returns (exit, report,
+    /// stdout+stderr, requests, records).
+    #[cfg(unix)]
+    fn r2b_boot_recover(launch: Value, extra: &[(&'static str, &str)]) -> (i32, Value, String, Vec<(String, Value)>, Vec<Value>) {
+        let pack = R2cPack::new();
+        let old = (chrono::Local::now().timestamp() - 3600) as f64;
+        let daemon = R2cDaemon::start(move |method, p| match method {
+            "surface.list" => r2c_ok(json!({"surfaces": [
+                {"surface_id": 3, "surface_ref": "surface:3", "role": "cso", "agent": "claude", "exited": false,
+                 "awakened_at": 1.0, "agent_alive": true, "seat": "occupied"},
+                {"surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude", "exited": false,
+                 "agent_alive": false, "seat": "empty", "created_at": old, "line_count": 40}]})),
+            "surface.read_text" => r2c_ok(json!({"text": cys::first_run_gates::fixtures::LIVE_TUI_AT_PROMPT,
+                                                 "quiet_secs": 5.0, "line_count": 40, "next_cursor": 40})),
+            "surface.send_text" if p["surface_id"] == 7 => launch.clone(),
+            "surface.create" => r2c_reply("b360_no_spawn: this fake daemon makes no new surface"),
+            _ => r2c_ok(json!({})),
+        });
+        let mut envs = pack.envs();
+        let mut path = std::ffi::OsString::from(pack.dir.join("bin"));
+        path.push(":");
+        path.push(std::env::var_os("PATH").unwrap_or_default());
+        envs.push(("PATH", path));
+        envs.extend(extra.iter().map(|(k, v)| (*k, std::ffi::OsString::from(v))));
+        let (rc, out, err) = r2c_child("boot", &daemon, &envs);
+        let report = r2b_report(&out, &err);
+        (rc, report, format!("{out}\n{err}"), daemon.calls(), r2b_records(&pack))
+    }
+
+    /// The env seam of `boot_node_recover` (test builds only): run_boot's in-process node-recover returns this code.
+    #[cfg(unix)]
+    const R2B_RECOVER_RC: &str = "CYS_B360_TEST_NODE_RECOVER_RC";
+
+    /// Area B · B-406 (the head's blocking constraint): run_boot's node-recover consumer escalates to escalate_reclaim
+    /// (kill + fresh launch) ONLY for rc 1. Any other code fails toward "do nothing": 91 → `recover_unknown`, an
+    /// unrecognised code (57) → a non-destructive outcome naming the code — neither reaches escalate_reclaim (its lines
+    /// "reclaim 에스컬레이션" / "reclaim 헬퍼" never appear) nor a fresh spawn (`surface.create` never asked); boot's exit
+    /// class is unchanged (0 here). Positive control: rc 1 DOES escalate (the guard still kills a real launch failure).
+    /// The code is stood in through `boot_node_recover`'s test-build seam (`CYS_B360_TEST_NODE_RECOVER_RC`).
+    /// RED on 02351e55: the seam does not exist there, so the real node-recover runs; the fixture's recovery write fails
+    /// generically (rc 1) and the guard escalates — the specimen sees escalate_reclaim. (11717c44's node-recover can only
+    /// return 0/1/78/79, so 57 is not observable there by any other route.) The guard itself is proven by the mutants in
+    /// the GREEN log (guard back to "spare only 0/78/79").
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_bi_boot_escalates_only_on_rc_1_and_an_unknown_or_unrecognised_recover_code_does_nothing() {
+        let generic = r2c_reply("rpc_failed: the fake daemon fails this write generically");
+        let mut failures = Vec::new();
+        for (code, want_outcome, want_text) in [("91", "recover_unknown", ""), ("57", "recover_unrecognised", "57")] {
+            let (rc, report, text, calls, _records) = r2b_boot_recover(generic.clone(), &[(R2B_RECOVER_RC, code)]);
+            let worker = r2c_role(&report, "worker");
+            let escalated = text.contains("reclaim 에스컬레이션") || text.contains("reclaim 헬퍼") || text.contains("[boot] reclaim(");
+            if escalated {
+                failures.push(format!("rc {code}: reached escalate_reclaim"));
+            }
+            if r2c_count(&calls, "surface.create") != 0 {
+                failures.push(format!("rc {code}: a fresh surface was asked for"));
+            }
+            if worker["outcome"] != want_outcome || !worker["reason"].as_str().unwrap_or("").contains(want_text) {
+                failures.push(format!("rc {code}: worker {worker}"));
+            }
+            if rc != 0 || report["summary"]["fatal_failed"] != 0 {
+                failures.push(format!("rc {code}: boot exit {rc} / summary {}", report["summary"]));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Area B · B-406 positive control (passes on 02351e55 too): rc 1 (a real launch failure of the recovery) still
+    /// escalates — so the specimen above can see escalate_reclaim when it happens.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r2r_bi_control_rc_1_still_escalates() {
+        let generic = r2c_reply("rpc_failed: the fake daemon fails this write generically");
+        let (_rc, _report, text, _calls, _records) = r2b_boot_recover(generic, &[(R2B_RECOVER_RC, "1")]);
+        assert!(text.contains("reclaim 에스컬레이션"), "rc 1 did not escalate:\n{text}");
+    }
 }
