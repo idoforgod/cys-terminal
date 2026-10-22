@@ -194,7 +194,7 @@ import {
 import { buildAcctIndex, buildWsAccountGroups, type SeatAcctSig, type AcctIndex } from "./seatacct"; // ★0.14.45 부서 카드 노드별 계정 줄(순수 판정)
 import { planOfficeTab, repairOutcomeOf, type OfficeCtx } from "./officetab"; // 0.14.44 B5·B6 오피스 탭 안내(순수 판정)
 import { alertsQuiet } from "./alertquiet"; // 0.14.51 TOAST 축 — 데몬 이벤트 출처의 사람 싱크를 끄는 단일 판정(순수)
-import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
+import { installerLaunchFailure, INSTALLER_LAUNCH_FAILED_TOAST_ID, packUpdatedToast, type PackUpdatedPayload, planUpdateAttemptReport, sacPreflightText, UPDATE_FAILED_TOAST_ID } from "./updatenotice"; // 0.14.43 J2 업데이트 미설치 알림(순수 문구·판정 해석·토스트 id)·설치 전 스마트 앱 컨트롤 고지 · WU 설치 파일 실행 차단 알림
 import { buildDeptCreatePlan, predictLegacyDeptName, type DeptCatalog, type DeptRegistry } from "./deptcreate"; // U17
 import {
   deptPendingText,
@@ -10089,41 +10089,16 @@ async function start() {
     // ★통합 0.14.41(A4↔B2): A4 가 구 전역(updateAvailable·packUpdateAvailable)을 단일 updState 로
     // 대체하면서 `packUpdateAvailable = null;` 대입은 없앴다(그 변수 자체가 더 이상 없다) — B2 가
     // 추가한 `reinject_skipped` 필드만 타입에 살린다(아래에서 실사용 — '완료' 오판 방지).
-    const p = (e.payload ?? {}) as {
-      pack_version?: string;
-      reinject_failed?: number;
-      reinject_deferred?: number;
-      reinject_skipped?: boolean; // ★U4-B2③ 재주입 자체를 못 함 — '완료' 단정 금지
-    };
+    // ★(B-360 R3 · W1) 페이로드 타입은 updatenotice.ts 의 PackUpdatedPayload — `reinject_unknown` 포함.
+    const p = (e.payload ?? {}) as PackUpdatedPayload;
     dismissToast("upd-pack"); // 진행 토스트를 내리고 아래 완료 토스트로 교대.
     // ★U9: 배지를 직접 만지지 않는다 — 상태만 바꾸고 보기에서 다시 그린다(본체 업데이트가 남아 있으면 '!').
     updState = { ...updState, pack: packAfterInstalled(p.pack_version ?? "", Date.now()) };
     renderUpdateAll();
-    // degraded(reinject 일부 실패/보류)면 '완료' 단정 회피 — 상세는 update-warning이 띄운다(모순 차단).
-    const failed = p.reinject_failed ?? 0;
-    const deferred = p.reinject_deferred ?? 0;
-    if (p.reinject_skipped === true) {
-      // ★review1 m2 FIX: "다음 폴링에서 재시도"는 스킵 팔에는 거짓이다 — 재주입 RPC 자체가 실패한
-      // 경우 pending 을 영속하지 않아(run_pack_update Err 팔) 자동 재시도가 없다. 실제 회복은
-      // 데몬 점검·재기동 또는 각 노드의 다음 /clear 때 새 지침이 적용되는 것뿐이다.
-      toast(
-        "watchdog",
-        "✅ 팩 디스크 반영 완료",
-        `팩 ${p.pack_version ?? ""} 적용 — 세션 유지(재시작 없음). 라이브 노드 재주입은 못 했습니다(데몬 응답 없음) — 데몬 점검 후 재기동하거나, 각 노드가 다음 /clear 때 새 지침을 받습니다.`,
-      );
-    } else if (failed > 0 || deferred > 0) {
-      toast(
-        "watchdog",
-        "✅ 팩 디스크 반영 완료",
-        `팩 ${p.pack_version ?? ""} 적용 — 세션 유지(재시작 없음). 일부 노드 reinject 보류/실패는 다음 폴링에서 재시도.`,
-      );
-    } else {
-      toast(
-        "watchdog",
-        "✅ 팩 업데이트 완료",
-        `팩 ${p.pack_version ?? ""} 적용 — 세션 유지·노드 reinject 완료(재시작 없음).`,
-      );
-    }
+    // degraded(reinject 일부 실패/보류/도달 미확인)면 '완료' 단정 회피 — 상세는 update-warning이 띄운다(모순 차단).
+    // ★(B-360 R3 · W1) 문구 판정은 packUpdatedToast(updatenotice.ts · 순수) 하나 — 페이로드를 통째로 넘긴다.
+    const done = packUpdatedToast(p);
+    toast("watchdog", done.title, done.body);
   });
   // ★U9(R5): CLI 가 반영 없이 끝남(no-op) — "완료"라고 말하지 않는다. 브리지가 확인한 경우(disk_parse=ok ∧
   // disk ≥ remote)만 '이미 적용돼 있음', 아니면 '팩 상태 불명'(디스크 판독 실패도 CLI 는 no-op 로 끝난다).

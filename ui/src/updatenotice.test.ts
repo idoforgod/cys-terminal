@@ -24,6 +24,7 @@ import {
   UPDATE_ATTEMPT_WAIT_MAX_SECS,
   installerLaunchFailure,
   INSTALLER_LAUNCH_FAILED_TOAST_ID,
+  packUpdatedToast,
 } from "./updatenotice";
 import { toastTtl, needsExpiryBanner, GUIDE_TTL_MS } from "./toastttl";
 
@@ -336,6 +337,62 @@ describe("신뢰할 수 없는 응답 — 결정론 난수 500판(던지지 않�
         expect(p.delayMs > 0 && p.delayMs <= 305_000 && Number.isInteger(p.delayMs)).toBe(true);
       }
     }
+  });
+});
+
+describe("packUpdatedToast — pack-updated 결과 토스트(B-360 R3 · W1: 도달 미확인은 완료가 아니다)", () => {
+  // 종전 리스너(main.ts)의 세 갈래 문구 — 실패·보류만 있을 때와 모두 0 일 때는 바이트 그대로 남아야 한다.
+  const OLD_DONE_TITLE = "✅ 팩 업데이트 완료";
+  const OLD_DONE_BODY = (v: string) => `팩 ${v} 적용 — 세션 유지·노드 reinject 완료(재시작 없음).`;
+  const OLD_DEGRADED_BODY = (v: string) => `팩 ${v} 적용 — 세션 유지(재시작 없음). 일부 노드 reinject 보류/실패는 다음 폴링에서 재시도.`;
+  const OLD_SKIPPED_BODY = (v: string) =>
+    `팩 ${v} 적용 — 세션 유지(재시작 없음). 라이브 노드 재주입은 못 했습니다(데몬 응답 없음) — 데몬 점검 후 재기동하거나, 각 노드가 다음 /clear 때 새 지침을 받습니다.`;
+
+  it("★미확인만 있는 실행(실패 0 · 보류 0 · 미확인 2) — '업데이트 완료'·'reinject 완료'라고 말하지 않고 미확인 수를 적는다 · 재시도한다고 말하지 않는다", () => {
+    const t = packUpdatedToast({ pack_version: "0.14.52", reinject_failed: 0, reinject_deferred: 0, reinject_unknown: 2 });
+    expect({ title: t.title, completion_claim: t.body.includes("reinject 완료") }).toEqual({ title: "✅ 팩 디스크 반영 완료", completion_claim: false });
+    expect(t.body).toContain("노드 2개는 지침 주입의 도달 여부 미확인");
+    expect(t.body).toContain("다시 보내지 않고");
+    expect(t.body.includes("재시도")).toBe(false);
+  });
+
+  it("대조: 모두 0 이면 종전 완료 문구 그대로(바이트 동일)", () => {
+    expect(packUpdatedToast({ pack_version: "0.14.52", reinject_failed: 0, reinject_deferred: 0, reinject_unknown: 0 })).toEqual({
+      title: OLD_DONE_TITLE,
+      body: OLD_DONE_BODY("0.14.52"),
+    });
+  });
+
+  it("대조: 실패만 · 보류만 → 종전 degraded 문구 그대로(바이트 동일 · 미확인 문장 없음)", () => {
+    for (const p of [{ reinject_failed: 1 }, { reinject_deferred: 3 }, { reinject_failed: 1, reinject_deferred: 1, reinject_unknown: 0 }])
+      expect(packUpdatedToast({ pack_version: "v", ...p })).toEqual({ title: "✅ 팩 디스크 반영 완료", body: OLD_DEGRADED_BODY("v") });
+  });
+
+  it("실패·보류와 미확인이 함께 오면 두 문장을 모두 적는다(어느 쪽도 완료라고 말하지 않는다)", () => {
+    const t = packUpdatedToast({ pack_version: "v", reinject_failed: 1, reinject_unknown: 4 });
+    expect(t.title).toBe("✅ 팩 디스크 반영 완료");
+    expect(t.body).toBe(`${OLD_DEGRADED_BODY("v")} 노드 4개는 지침 주입의 도달 여부 미확인 — 다시 보내지 않고 다음 pack-update 에서 확인합니다.`);
+  });
+
+  it("재주입 자체를 못 했으면(skipped) 종전 스킵 문구 그대로 — 다른 수와 무관하게 이긴다", () => {
+    for (const extra of [{}, { reinject_failed: 2 }, { reinject_unknown: 1 }])
+      expect(packUpdatedToast({ pack_version: "v", reinject_skipped: true, ...extra })).toEqual({ title: "✅ 팩 디스크 반영 완료", body: OLD_SKIPPED_BODY("v") });
+  });
+
+  it("필드가 없으면 수는 0 으로 읽는다(종전 리스너와 같다) — 빈 페이로드는 완료 문구 · 버전은 모른다고(\"?\") 말한다(R1-W1-1)", () => {
+    expect(packUpdatedToast({})).toEqual({ title: OLD_DONE_TITLE, body: OLD_DONE_BODY("?") });
+  });
+
+  it("★(R1-W1-1) 버전은 이 모듈의 신뢰할 수 없는 문자열 규칙을 따른다 — 제어·양방향·제로폭 문자를 걷고 · 문자열이 아니면 \"?\" · 정상 버전은 그대로", () => {
+    const dirty = packUpdatedToast({ pack_version: "0.14.52\n\u202e\u200bevil", reinject_unknown: 1 });
+    expect({ invisible: /[\u0000-\u001f\u202e\u200b]/.test(dirty.body) }).toEqual({ invisible: false });
+    expect(dirty.body.startsWith("팩 0.14.52 evil 적용")).toBe(true);
+    expect(packUpdatedToast({ pack_version: 42 as unknown as string }).body).toBe(OLD_DONE_BODY("?"));
+    expect(packUpdatedToast({ pack_version: "0.14.52" }).body).toBe(OLD_DONE_BODY("0.14.52"));
+  });
+
+  it("돌려주는 객체의 키는 정확히 title·body", () => {
+    expect(Object.keys(packUpdatedToast({ reinject_unknown: 1 })).sort()).toEqual(["body", "title"]);
   });
 });
 

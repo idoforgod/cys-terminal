@@ -1,4 +1,6 @@
 // ui/src/updatenotice.ts — 업데이트가 '설치되지 않았을 때' 사람이 읽는 안내 문구와 재시작 뒤 판정의 해석(0.14.43 · J2).
+// ★(B-360 R3 · W1 · R2-W1-1) 팩 무중단 업데이트(`pack-updated`)의 결과 토스트 문구 `packUpdatedToast` 도 여기 있다 — 지침 주입의
+//   도달 여부를 확인하지 못한 노드(`reinject_unknown`)를 '완료'라고 말하지 않게 main.ts 리스너에서 옮겨 와 순수 함수로 시험한다.
 //
 // 왜 필요한가: Windows 의 '스마트 앱 컨트롤'이 코드 서명도 평판도 없는 설치 파일을 막아도 인앱 업데이트는 아무 말이 없었다. 업데이터 플러그인이
 // 설치기를 띄운 뒤 반환값을 보지 않고 곧바로 앱을 끝내므로(tauri-plugin-updater 2.10.1) 실패를 알릴 코드가 실행되지 않고, 사용자가
@@ -235,4 +237,54 @@ export function installerLaunchFailure(err: string, current: string, target: str
         kept,
       ]);
   }
+}
+
+/**
+ * `pack-updated` 이벤트의 페이로드 — 백엔드(src-tauri `install_pack_update`)가 보내는 키 그대로다(가산 호환: 모르는 키는 무시).
+ *  · `reinject_unknown` ★(B-360 R3 · W1): 지침 주입의 **도달 여부를 확인하지 못한** 노드 수. 그 쓰기는 다시 보내지 않는다(중복 주입 방지) —
+ *    다음 pack-update 가 확인한다. 실패도 보류도 아니고 **완료도 아니다**.
+ */
+export interface PackUpdatedPayload {
+  pack_version?: string;
+  reinject_failed?: number;
+  reinject_deferred?: number;
+  reinject_unknown?: number;
+  reinject_skipped?: boolean; // ★U4-B2③ 재주입 자체를 못 함 — '완료' 단정 금지
+}
+
+/**
+ * 팩 디스크 반영 뒤 사람에게 보이는 결과 토스트의 제목·본문(문구만 — 띄우는 일은 main.ts 의 `pack-updated` 리스너가 한다).
+ *  · 재주입을 못 했으면(skipped) · 일부가 실패·보류·**도달 미확인**이면 "업데이트 완료"·"reinject 완료"라고 말하지 않는다 —
+ *    같은 순간 update-warning 이 상세 경고를 띄우므로 두 토스트가 서로 모순되면 안 된다.
+ *  · ★(B-360 R3 · W1) 종전 리스너는 `reinject_unknown` 을 읽지 않아, 미확인만 있는 실행(실패 0 · 보류 0)에서 경고 바로 뒤에
+ *    "노드 reinject 완료"를 띄웠다. 미확인 노드 수는 본문에 숫자로 적고, 재시도한다고 말하지 않는다(그 쓰기는 다시 보내지 않는다).
+ *  · 실패·보류만 있는 경우와 모두 0 인 경우의 문구는 종전과 바이트 그대로다(정상 버전 문자열일 때).
+ *  · ★(R1-W1-1) 버전은 이 모듈의 `version()` 으로 다듬는다 — 제어·양방향·제로폭 문자를 걷고 40자로 자르며, 없거나 문자열이 아니면 "?" 다
+ *    (종전 리스너는 빈 문자열을 그대로 넣었다 — 이 모듈 머리의 '신뢰할 수 없는 데이터' 규칙을 이 함수에도 적용한다).
+ */
+export function packUpdatedToast(p: PackUpdatedPayload): { title: string; body: string } {
+  const v = version(p.pack_version); // ★(R1-W1-1) 모듈 규칙 — 백엔드 문자열은 다듬어 올린다(정상 버전은 그대로 · 없으면 "?")
+  const failed = p.reinject_failed ?? 0;
+  const deferred = p.reinject_deferred ?? 0;
+  const unknown = p.reinject_unknown ?? 0;
+  if (p.reinject_skipped === true) {
+    // ★review1 m2 FIX: "다음 폴링에서 재시도"는 스킵 팔에는 거짓이다 — 재주입 RPC 자체가 실패한
+    // 경우 pending 을 영속하지 않아(run_pack_update Err 팔) 자동 재시도가 없다. 실제 회복은
+    // 데몬 점검·재기동 또는 각 노드의 다음 /clear 때 새 지침이 적용되는 것뿐이다.
+    return {
+      title: "✅ 팩 디스크 반영 완료",
+      body: `팩 ${v} 적용 — 세션 유지(재시작 없음). 라이브 노드 재주입은 못 했습니다(데몬 응답 없음) — 데몬 점검 후 재기동하거나, 각 노드가 다음 /clear 때 새 지침을 받습니다.`,
+    };
+  }
+  if (failed > 0 || deferred > 0 || unknown > 0) {
+    let body = `팩 ${v} 적용 — 세션 유지(재시작 없음).`;
+    if (failed > 0 || deferred > 0) body += " 일부 노드 reinject 보류/실패는 다음 폴링에서 재시도.";
+    if (unknown > 0)
+      body += ` 노드 ${unknown}개는 지침 주입의 도달 여부 미확인 — 다시 보내지 않고 다음 pack-update 에서 확인합니다.`;
+    return { title: "✅ 팩 디스크 반영 완료", body };
+  }
+  return {
+    title: "✅ 팩 업데이트 완료",
+    body: `팩 ${v} 적용 — 세션 유지·노드 reinject 완료(재시작 없음).`,
+  };
 }

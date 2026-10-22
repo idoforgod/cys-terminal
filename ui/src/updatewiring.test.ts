@@ -105,6 +105,29 @@ describe("업데이트 배지 배선 — 단일 상태 · 단일 보기", () => 
     expect(seg).toContain("packAfterInstalled(");
   });
 
+  it("★(B-360 R3 · W1) pack-updated 리스너는 페이로드를 통째로 packUpdatedToast 에 넘기고 그 제목·본문을 띄운다 — 리스너 안에 완료 문구 사본이 없다", () => {
+    const a = code.indexOf('listen("pack-updated"');
+    expect(a).toBeGreaterThan(0);
+    const seg = code.slice(a, code.indexOf("});", a));
+    // 종전 결함: 리스너가 reinject_unknown 을 읽지 않아 미확인만 있는 실행에서 경고 바로 뒤에 "노드 reinject 완료"를 띄웠다.
+    expect(seg).toContain("as PackUpdatedPayload");
+    expect(seg).toContain("packUpdatedToast(p)");
+    expect(seg).toContain("toast(\"watchdog\", done.title, done.body)");
+    expect({ 리스너_안_완료문구: seg.includes("reinject 완료") }).toEqual({ 리스너_안_완료문구: false });
+  });
+
+  it("★(B-360 R3 · W1) 백엔드의 pack-updated 이벤트는 UI 가 읽는 다섯 키(reinject_unknown 포함)를 실제로 보낸다 — 같은 철자(언어 간 계약)", () => {
+    const rs = readFileSync(new URL("../../src-tauri/src/main.rs", import.meta.url), "utf-8");
+    // 코드 꼴(`"pack-updated",` 바로 뒤 `json!({`)으로 찾는다 — 같은 낱말이 doc 주석(`app.emit("pack-updated", …)`)에도 있다.
+    const emits = rs.match(/"pack-updated",\s*json!\(\{[\s\S]*?\}\),/g) ?? [];
+    expect({ pack_updated_emit_sites: emits.length }).toEqual({ pack_updated_emit_sites: 1 });
+    // ★(R1-W1-2) UI 가 기대는 것은 **키**다 — Rust 지역 변수 이름까지 핀하면 변수 이름 바꾸기가 거짓 적색이 된다.
+    // ★(R2-W1-2) PackUpdatedPayload 의 다섯 키 전부 — 한쪽에서 이름이 바뀌면 UI 는 0 으로 읽고 '완료'를 말한다(W1 과 같은 결함의 다른 입구).
+    const emit = emits[0] ?? "";
+    for (const key of ["pack_version", "reinject_failed", "reinject_deferred", "reinject_unknown", "reinject_skipped"])
+      expect({ key, in_emit: emit.includes(`"${key}":`) }).toEqual({ key, in_emit: true });
+  });
+
   it("창 제목 색은 isLatest 일 때만 ok — 미확인·확인 중을 최신과 같은 초록으로 그리지 않는다(리뷰1 F3)", () => {
     const b = fnBody("renderUpdatePanel");
     // v.badge.tone 을 그대로 클래스에 쓰면(중립 '…' 상태의 tone 이 "ok") '확인 중…'이 초록으로
