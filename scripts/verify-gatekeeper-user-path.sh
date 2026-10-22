@@ -130,87 +130,143 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/gk-user-path.XXXXXX")" || exit 2
 WORK="$(cd "$WORK" && pwd -P)"
 MOUNTS=()
 BOUNDED_PID=""
+OWNED_PGID=""
+OWNED_TREE=()
+OWNED_SEEN=" "
+IN_CRITICAL_CLEANUP=0
+PENDING_SIGNAL_EXIT=0
 
-# $1 = 루트 자식 PID(set -m 으로 자체 PGID=$1 에서 기동됨).
-# 부모만 먼저 TERM 으로 죽이면 TERM 무시(trap '' TERM) 자손이 PID 1(launchd)로 입양되어
-# PPID 기반 pkill -P 에서 누락되므로(codex R1 major 실증):
-#   1) 호출자 자신의 PGID 와 다른지 확인한 뒤, 프로세스 그룹(-g $root) 및 재귀 PPID(-P) 트리를
-#      SIGSTOP 으로 얼리면서 빠짐없이 수집하고(호출자 프로세스 그룹에는 절대 시그널을 보내지 않음),
-#   2) TERM(+CONT) 전파 후 0.2초 유예 뒤 추가 자손을 재수집하여 전체 목록과 격리 그룹에 KILL(+CONT)을 보내며,
-#   3) 루트 wait 및 수집된 모든 자손 PID 가 커널에서 완전히 소멸(kill -0 실패)할 때까지 확인한다.
-kill_owned_tree() {
-  local root="${1:-}"
-  [ -n "$root" ] || return 0
-  local caller_pgid
-  caller_pgid="$(/bin/ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
-  local use_pgid=0
-  if [ -n "$caller_pgid" ] && [ "$root" != "$caller_pgid" ] && [ "$root" != "$$" ]; then
-    use_pgid=1
+reset_owned_state() {
+  BOUNDED_PID=""
+  OWNED_PGID=""
+  OWNED_TREE=()
+  OWNED_SEEN=" "
+}
+
+on_signal() {
+  local code="$1"
+  PENDING_SIGNAL_EXIT="$code"
+  if [ "${IN_CRITICAL_CLEANUP:-0}" -eq 1 ]; then
+    return 0
   fi
-  local -a tree=()
-  local -a queue=("$root")
-  local seen=" "
+  exit "$code"
+}
+
+collect_owned_descendants() {
+  local root="$1"
+  local pgid="$2"
+  local use_pgid="$3"
+  local stop_mode="$4"
+  local -a queue=()
+  local visited=" "
   local p c
-  if [ "$use_pgid" -eq 1 ]; then
+  [ -n "$root" ] && queue+=("$root")
+  if [ "${#OWNED_TREE[@]}" -gt 0 ]; then
+    for p in "${OWNED_TREE[@]}"; do
+      [ -n "$p" ] && queue+=("$p")
+    done
+  fi
+  if [ "$use_pgid" -eq 1 ] && [ -n "$pgid" ]; then
     while IFS= read -r c; do
       [ -n "$c" ] && queue+=("$c")
-    done < <(/usr/bin/pgrep -g "$root" 2>/dev/null || true)
+    done < <(/usr/bin/pgrep -g "$pgid" 2>/dev/null || true)
   fi
   while [ "${#queue[@]}" -gt 0 ]; do
     p="${queue[0]}"
     queue=("${queue[@]:1}")
     [ -n "$p" ] || continue
-    case "$seen" in *" $p "*) continue ;; esac
-    seen="$seen$p "
-    kill -STOP "$p" 2>/dev/null || true
-    tree+=("$p")
+    case "$visited" in *" $p "*) continue ;; esac
+    visited="$visited$p "
+    if [ "$stop_mode" -eq 1 ]; then
+      kill -STOP "$p" 2>/dev/null || true
+    fi
+    case "$OWNED_SEEN" in
+      *" $p "*) ;;
+      *)
+        OWNED_SEEN="$OWNED_SEEN$p "
+        OWNED_TREE+=("$p")
+        ;;
+    esac
     while IFS= read -r c; do
       [ -n "$c" ] && queue+=("$c")
     done < <(/usr/bin/pgrep -P "$p" 2>/dev/null || true)
   done
-  [ "${#tree[@]}" -gt 0 ] || return 0
-  if [ "$use_pgid" -eq 1 ]; then
-    kill -TERM -- "-$root" 2>/dev/null || true
-    kill -CONT -- "-$root" 2>/dev/null || true
+}
+
+# $1 = 루트 자식 PID(set -m 으로 자체 PGID=$1 에서 기동됨).
+# 부모만 먼저 TERM 으로 죽이면 TERM 무시(trap '' TERM) 자손이 PID 1(launchd)로 입양되어
+# PPID 기반 pkill -P 에서 누락되므로(codex R1 major 실증), 그리고 정리 유예 구간(sleep 0.2) 도중
+# 외부 INT/TERM 이 들어올 때 소유 상태를 먼저 지우거나 즉시 exit 하면 트리가 남으므로(codex R2 major 실증):
+#   1) 정리 구간 동안 IN_CRITICAL_CLEANUP=1 로 외부 INT/TERM 에 의한 조기 중단(exit)을 유예하고,
+#      소유 상태(BOUNDED_PID · OWNED_PGID · OWNED_TREE)를 모든 프로세스 소멸 확인 전까지 유지하며,
+#   2) 호출자 자신의 PGID 와 다른지 확인한 뒤, 프로세스 그룹(-g) 및 재귀 PPID(-P) 트리를
+#      SIGSTOP 으로 얼리면서 전역 OWNED_TREE 에 누적 수집하고(호출자 프로세스 그룹에는 시그널 금지),
+#   3) TERM(+CONT) 전파 후 0.2초 유예 뒤 추가 자손을 재수집하여 전체 목록과 격리 그룹에 KILL(+CONT)을 보내며,
+#   4) 루트 wait 및 수집된 모든 자손 PID 가 커널에서 완전히 소멸(kill -0 실패)할 때까지 확인한 뒤에만
+#      소유 상태를 비운다.
+kill_owned_tree() {
+  local root="${1:-${BOUNDED_PID:-}}"
+  local pgid="${OWNED_PGID:-$root}"
+  if [ -z "$root" ] && [ "${#OWNED_TREE[@]}" -eq 0 ]; then
+    return 0
   fi
-  kill -TERM "${tree[@]}" 2>/dev/null || true
-  kill -CONT "${tree[@]}" 2>/dev/null || true
+  local prev_crit="${IN_CRITICAL_CLEANUP:-0}"
+  IN_CRITICAL_CLEANUP=1
+  local caller_pgid
+  caller_pgid="$(/bin/ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
+  local use_pgid=0
+  if [ -n "$pgid" ] && [ -n "$caller_pgid" ] && [ "$pgid" != "$caller_pgid" ] && [ "$pgid" != "$$" ]; then
+    use_pgid=1
+  fi
+  collect_owned_descendants "$root" "$pgid" "$use_pgid" 1
+  if [ "${#OWNED_TREE[@]}" -eq 0 ]; then
+    reset_owned_state
+    IN_CRITICAL_CLEANUP="$prev_crit"
+    return 0
+  fi
+  if [ "$use_pgid" -eq 1 ]; then
+    kill -TERM -- "-$pgid" 2>/dev/null || true
+    kill -CONT -- "-$pgid" 2>/dev/null || true
+  fi
+  kill -TERM "${OWNED_TREE[@]}" 2>/dev/null || true
+  kill -CONT "${OWNED_TREE[@]}" 2>/dev/null || true
   sleep 0.2 2>/dev/null || sleep 1
+  collect_owned_descendants "$root" "$pgid" "$use_pgid" 0
   if [ "$use_pgid" -eq 1 ]; then
-    while IFS= read -r c; do
-      if [ -n "$c" ]; then
-        case "$seen" in *" $c "*) ;; *) seen="$seen$c "; tree+=("$c") ;; esac
-      fi
-    done < <(/usr/bin/pgrep -g "$root" 2>/dev/null || true)
+    kill -KILL -- "-$pgid" 2>/dev/null || true
+    kill -CONT -- "-$pgid" 2>/dev/null || true
   fi
-  for p in "${tree[@]}"; do
-    while IFS= read -r c; do
-      if [ -n "$c" ]; then
-        case "$seen" in *" $c "*) ;; *) seen="$seen$c "; tree+=("$c") ;; esac
-      fi
-    done < <(/usr/bin/pgrep -P "$p" 2>/dev/null || true)
-  done
-  if [ "$use_pgid" -eq 1 ]; then
-    kill -KILL -- "-$root" 2>/dev/null || true
-    kill -CONT -- "-$root" 2>/dev/null || true
-  fi
-  kill -KILL "${tree[@]}" 2>/dev/null || true
-  kill -CONT "${tree[@]}" 2>/dev/null || true
-  wait "$root" 2>/dev/null || true
-  local tries=0
-  for p in "${tree[@]}"; do
+  kill -KILL "${OWNED_TREE[@]}" 2>/dev/null || true
+  kill -CONT "${OWNED_TREE[@]}" 2>/dev/null || true
+  [ -n "$root" ] && { wait "$root" 2>/dev/null || true; }
+  local -a remaining=()
+  local p tries
+  for p in "${OWNED_TREE[@]}"; do
+    tries=0
     while kill -0 "$p" 2>/dev/null && [ "$tries" -lt 40 ]; do
+      kill -KILL "$p" 2>/dev/null || true
+      kill -CONT "$p" 2>/dev/null || true
       sleep 0.05 2>/dev/null || sleep 1
       tries=$((tries + 1))
     done
+    if kill -0 "$p" 2>/dev/null; then
+      remaining+=("$p")
+    fi
   done
+  if [ "${#remaining[@]}" -eq 0 ]; then
+    reset_owned_state
+    IN_CRITICAL_CLEANUP="$prev_crit"
+    return 0
+  fi
+  OWNED_TREE=("${remaining[@]}")
+  IN_CRITICAL_CLEANUP="$prev_crit"
+  return 1
 }
 
 cleanup() {
-  if [ -n "${BOUNDED_PID:-}" ]; then
-    local pid="$BOUNDED_PID"
-    BOUNDED_PID=""
-    kill_owned_tree "$pid"
+  IN_CRITICAL_CLEANUP=1
+  if [ -n "${BOUNDED_PID:-}" ] || [ "${#OWNED_TREE[@]}" -gt 0 ]; then
+    kill_owned_tree "${BOUNDED_PID:-}" || true
   fi
   local m
   for m in "${MOUNTS[@]:-}"; do
@@ -224,8 +280,8 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 PASS_N=0
 FAIL_N=0
@@ -249,18 +305,28 @@ BOUNDED_TIMED_OUT=0
 run_bounded_py() { # $1=로그파일, 나머지=명령(env/해석기/인자)
   local log="$1"; shift
   BOUNDED_TIMED_OUT=0
+  IN_CRITICAL_CLEANUP=1
   set -m
   "$@" >"$log" 2>&1 &
   local pid=$!
   set +m
   BOUNDED_PID="$pid"
+  OWNED_PGID="$pid"
+  OWNED_TREE=("$pid")
+  OWNED_SEEN=" $pid "
+  IN_CRITICAL_CLEANUP=0
+  if [ "$PENDING_SIGNAL_EXIT" -ne 0 ]; then
+    exit "$PENDING_SIGNAL_EXIT"
+  fi
   local max_ticks=$((PROBE_EXEC_TIMEOUT_SECS * 5))
   local ticks=0
   while kill -0 "$pid" 2>/dev/null || /usr/bin/pgrep -g "$pid" >/dev/null 2>&1; do
     if [ "$ticks" -ge "$max_ticks" ]; then
-      BOUNDED_PID=""
-      kill_owned_tree "$pid"
       BOUNDED_TIMED_OUT=1
+      kill_owned_tree "$pid" || true
+      if [ "$PENDING_SIGNAL_EXIT" -ne 0 ]; then
+        exit "$PENDING_SIGNAL_EXIT"
+      fi
       return 124
     fi
     if sleep 0.2 2>/dev/null; then
@@ -272,7 +338,10 @@ run_bounded_py() { # $1=로그파일, 나머지=명령(env/해석기/인자)
   done
   wait "$pid"
   local rc=$?
-  BOUNDED_PID=""
+  reset_owned_state
+  if [ "$PENDING_SIGNAL_EXIT" -ne 0 ]; then
+    exit "$PENDING_SIGNAL_EXIT"
+  fi
   return "$rc"
 }
 

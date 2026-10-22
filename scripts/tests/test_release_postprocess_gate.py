@@ -1141,6 +1141,178 @@ echo "00000000-0000-0000-0000-000000000000"
             sentinel.kill()
             sentinel.wait()
 
+    def test_37_term_during_cleanup_grace_retains_ownership_and_kills_whole_tree(self):
+        """G1/G4 tightened (BAR-R3-AMEND-2 · codex r2 major):
+        kill_owned_tree 의 TERM→KILL 유예 구간(sleep 0.2) 한가운데에서 게이트가 외부 SIGTERM/SIGINT(반복 포함)를
+        받더라도 소유 상태(BOUNDED_PID · OWNED_PGID · OWNED_TREE)를 잃지 않고 정리 도중 조기 중단되지 않으며:
+          (a) 타임아웃 정리 유예 구간(6번째 sleep 0.2) 도중 외부 SIGTERM(2회 연속) 주입 시 루트·자식·손자·재입양 손자
+              PID 가 단 하나도 살아남지 않고 게이트는 fail-closed(rc≠0)로 종료하며 호출자 PGID 파수꾼은 무사하다.
+          (b) 일반 실행 중 외부 SIGTERM 으로 진입한 EXIT cleanup 의 유예 구간(sleep 0.2) 도중 추가 SIGTERM+SIGINT 가
+              주입되더라도 자손 트리가 전부 소멸하고 호출자 PGID 파수꾼은 무사하다."""
+        import time as _time
+        sleep_stub = os.path.join(self.bin_dir, "sleep")
+        sleep_count_f = os.path.join(self.root, "sleep02.count")
+        injected_a_f = os.path.join(self.root, "injected-a.rec")
+        arm_b_f = os.path.join(self.root, "arm-b.flag")
+        injected_b_f = os.path.join(self.root, "injected-b.rec")
+
+        self._write_exec(
+            sleep_stub,
+            "#!/usr/bin/env bash\n"
+            "if [ \"${1:-}\" = \"0.2\" ]; then\n"
+            "  c=0\n"
+            "  if [ -f \"${FAKE_SLEEP_COUNT_FILE:-}\" ]; then\n"
+            "    c=$(cat \"$FAKE_SLEEP_COUNT_FILE\" 2>/dev/null || echo 0)\n"
+            "  fi\n"
+            "  c=$((c + 1))\n"
+            "  if [ -n \"${FAKE_SLEEP_COUNT_FILE:-}\" ]; then\n"
+            "    echo \"$c\" > \"$FAKE_SLEEP_COUNT_FILE\"\n"
+            "  fi\n"
+            "  if [ \"${FAKE_SLEEP_MODE:-}\" = \"expiry_grace\" ] && [ \"$c\" -eq 6 ]; then\n"
+            "    echo \"$c\" > \"${FAKE_SLEEP_INJECTED_FILE:-/dev/null}\"\n"
+            "    kill -TERM \"$PPID\" 2>/dev/null || true\n"
+            "    kill -TERM \"$PPID\" 2>/dev/null || true\n"
+            "  elif [ \"${FAKE_SLEEP_MODE:-}\" = \"trap_grace\" ] && [ -f \"${FAKE_SLEEP_ARM_FILE:-}\" ] && [ ! -f \"${FAKE_SLEEP_INJECTED_FILE:-}\" ]; then\n"
+            "    echo \"$c\" > \"${FAKE_SLEEP_INJECTED_FILE:-/dev/null}\"\n"
+            "    kill -TERM \"$PPID\" 2>/dev/null || true\n"
+            "    kill -INT \"$PPID\" 2>/dev/null || true\n"
+            "  fi\n"
+            "fi\n"
+            "exec /bin/sleep \"$@\"\n",
+        )
+
+        sentinel = subprocess.Popen(["/bin/sleep", "30"])
+        try:
+            # (a) 타임아웃 kill_owned_tree 유예 구간(6번째 sleep 0.2) 도중 반복 SIGTERM 주입
+            a_root_f = os.path.join(self.root, "a-root.pid")
+            a_child_f = os.path.join(self.root, "a-child.pid")
+            a_grand_f = os.path.join(self.root, "a-grand.pid")
+            a_early_f = os.path.join(self.root, "a-early-reparent.pid")
+            a_term_reparent_f = os.path.join(self.root, "a-term-reparent.pid")
+
+            a_py_body = (
+                "#!/usr/bin/env bash\n"
+                "trap \"\" TERM\n"
+                "echo $$ > \"%s\"\n"
+                "# 1) 타임아웃 전 이미 PPID=1 로 입양된 TERM-무시 손자\n"
+                "bash -c 'trap \"\" TERM; (trap \"\" TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 & echo $! > \"%s\"'\n"
+                "# 2) 첫 TERM 에 죽는 중간 부모 아래에서 유예 구간 도중 PPID=1 로 입양되는 TERM-무시 손자\n"
+                "bash -c '(trap \"\" TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 & echo $! > \"%s\"; exec /bin/sleep 30' </dev/null >/dev/null 2>&1 &\n"
+                "# 3) TERM-무시 자식 + 그 아래 TERM-무시 손자\n"
+                "bash -c 'trap \"\" TERM; (trap \"\" TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 & echo $! > \"%s\"; exec /bin/sleep 30' </dev/null >/dev/null 2>&1 &\n"
+                "echo $! > \"%s\"\n"
+                "exec /bin/sleep 30\n"
+            ) % (a_root_f, a_early_f, a_term_reparent_f, a_grand_f, a_child_f)
+
+            py_tmpl_a = os.path.join(self.root, "fake-python3-r3a.sh")
+            self._write_exec(py_tmpl_a, a_py_body)
+            env_a = dict(os.environ)
+            env_a["PATH"] = self.bin_dir + ":" + env_a.get("PATH", "/usr/bin:/bin")
+            env_a["FAKE_PY_TEMPLATE"] = py_tmpl_a
+            env_a["FAKE_MNT_RECORD"] = os.path.join(self.root, "mnt-r3a.rec")
+            env_a["FAKE_XATTR_FILE"] = os.path.join(self.root, "xattr-r3a.val")
+            env_a["CYS_GATE_PROBE_EXEC_TIMEOUT_SECS"] = "1"
+            env_a["FAKE_SLEEP_COUNT_FILE"] = sleep_count_f
+            env_a["FAKE_SLEEP_MODE"] = "expiry_grace"
+            env_a["FAKE_SLEEP_INJECTED_FILE"] = injected_a_f
+
+            p_a = subprocess.run(
+                ["bash", _USER_PATH_SH, "--quarantine-flags", "0081", self.dmg],
+                capture_output=True, text=True, env=env_a, timeout=10,
+            )
+            out_a = p_a.stdout + p_a.stderr
+            self.assertTrue(os.path.exists(injected_a_f), "유예 구간(6번째 sleep 0.2) SIGTERM 주입이 실행되지 않았다: %s" % out_a)
+            self.assertNotEqual(p_a.returncode, 0, "유예 구간 SIGTERM 주입 후 게이트가 0 으로 종료했다: %s" % out_a)
+            self.assertIn(p_a.returncode, (2, 143), "예상 밖 종료 코드(rc=%d): %s" % (p_a.returncode, out_a))
+            for label, pf in (
+                ("a-root", a_root_f),
+                ("a-child", a_child_f),
+                ("a-grandchild", a_grand_f),
+                ("a-early-reparented", a_early_f),
+                ("a-term-reparented", a_term_reparent_f),
+            ):
+                self.assertTrue(os.path.exists(pf), "%s pid 기록 누락" % label)
+                with open(pf, encoding="utf-8") as fh:
+                    pid = int(fh.read().strip())
+                with self.assertRaises(
+                    ProcessLookupError,
+                    msg="타임아웃 유예 구간 SIGTERM 주입 후 %s(pid=%d)가 살아남았다" % (label, pid),
+                ):
+                    os.kill(pid, 0)
+            self.assertIsNone(sentinel.poll(), "타임아웃 유예 구간 SIGTERM 후 호출자 PGID 파수꾼이 죽었다")
+
+            # (b) 일반 실행 중 외부 SIGTERM -> EXIT cleanup 의 kill_owned_tree 유예 구간 도중 추가 SIGTERM+SIGINT 주입
+            b_root_f = os.path.join(self.root, "b-root.pid")
+            b_child_f = os.path.join(self.root, "b-child.pid")
+            b_grand_f = os.path.join(self.root, "b-grand.pid")
+            b_py_body = (
+                "#!/usr/bin/env bash\n"
+                "trap \"\" TERM\n"
+                "echo $$ > \"%s\"\n"
+                "bash -c 'trap \"\" TERM; (trap \"\" TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 & echo $! > \"%s\"; exec /bin/sleep 30' </dev/null >/dev/null 2>&1 &\n"
+                "echo $! > \"%s\"\n"
+                "exec /bin/sleep 30\n"
+            ) % (b_root_f, b_grand_f, b_child_f)
+            py_tmpl_b = os.path.join(self.root, "fake-python3-r3b.sh")
+            self._write_exec(py_tmpl_b, b_py_body)
+            env_b = dict(os.environ)
+            env_b["PATH"] = self.bin_dir + ":" + env_b.get("PATH", "/usr/bin:/bin")
+            env_b["FAKE_PY_TEMPLATE"] = py_tmpl_b
+            env_b["FAKE_MNT_RECORD"] = os.path.join(self.root, "mnt-r3b.rec")
+            env_b["FAKE_XATTR_FILE"] = os.path.join(self.root, "xattr-r3b.val")
+            env_b["CYS_GATE_PROBE_EXEC_TIMEOUT_SECS"] = "30"
+            env_b["FAKE_SLEEP_COUNT_FILE"] = os.path.join(self.root, "sleep02-b.count")
+            env_b["FAKE_SLEEP_MODE"] = "trap_grace"
+            env_b["FAKE_SLEEP_ARM_FILE"] = arm_b_f
+            env_b["FAKE_SLEEP_INJECTED_FILE"] = injected_b_f
+
+            gate_b = subprocess.Popen(
+                ["bash", _USER_PATH_SH, "--quarantine-flags", "0081", self.dmg],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env_b,
+            )
+            deadline = _time.monotonic() + 5.0
+            while _time.monotonic() < deadline:
+                if all(os.path.exists(f) and os.path.getsize(f) > 0 for f in (b_root_f, b_child_f, b_grand_f)):
+                    break
+                _time.sleep(0.05)
+            self.assertTrue(os.path.exists(b_grand_f), "b-grandchild 스폰 대기 초과")
+            with open(arm_b_f, "w", encoding="utf-8") as fh:
+                fh.write("armed\n")
+            gate_b.terminate()
+            out_b_stdout, out_b_stderr = gate_b.communicate(timeout=8)
+            out_b = (out_b_stdout or "") + (out_b_stderr or "")
+            self.assertTrue(os.path.exists(injected_b_f), "EXIT cleanup 유예 구간 중 추가 SIGTERM+SIGINT 주입이 실행되지 않았다: %s" % out_b)
+            self.assertNotEqual(gate_b.returncode, 0, "EXIT cleanup 중 추가 시그널 후 0 으로 종료했다: %s" % out_b)
+            for label, pf in (
+                ("b-root", b_root_f),
+                ("b-child", b_child_f),
+                ("b-grandchild", b_grand_f),
+            ):
+                with open(pf, encoding="utf-8") as fh:
+                    pid = int(fh.read().strip())
+                with self.assertRaises(
+                    ProcessLookupError,
+                    msg="EXIT cleanup 유예 구간 중 추가 시그널 후 %s(pid=%d)가 살아남았다" % (label, pid),
+                ):
+                    os.kill(pid, 0)
+            self.assertIsNone(sentinel.poll(), "EXIT cleanup 유예 구간 시그널 후 호출자 PGID 파수꾼이 죽었다")
+        finally:
+            if os.path.exists(sleep_stub):
+                os.remove(sleep_stub)
+            for pf_name in (
+                "a-root.pid", "a-child.pid", "a-grand.pid", "a-early-reparent.pid", "a-term-reparent.pid",
+                "b-root.pid", "b-child.pid", "b-grand.pid",
+            ):
+                pf = os.path.join(self.root, pf_name)
+                if os.path.exists(pf):
+                    try:
+                        with open(pf, encoding="utf-8") as fh:
+                            os.kill(int(fh.read().strip()), 9)
+                    except Exception:
+                        pass
+            sentinel.kill()
+            sentinel.wait()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
