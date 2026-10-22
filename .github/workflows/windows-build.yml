@@ -140,6 +140,52 @@ jobs:
           fi
           echo "OK: NSIS 빌드 로그 가드 통과 (훅 컴파일 가드 문자열 0건)"
 
+      # W-GATE pre-tag dry run (0.14.52 · CEO ruling 2026-10-22): the SAME step name and a byte-identical run body as the
+      #   blocking release.yml step of that name (Windows leg, between the VERSIONINFO gate and tauri-action). It runs the
+      #   sidecar this build just packed, at the default stack, before the artifact upload below. This job builds without
+      #   --target, so it is a SEPARATE build instance and does not replace the release step; it is how a pwsh or runner
+      #   quirk shows up before any tag (scripts/pre-tag-ci-check.py requires this workflow green on the tag SHA).
+      #   No if, no continue-on-error. scripts/tests/test_release_windows_help_gate.py pins both bodies equal.
+      - name: Packaged cys.exe --help gate (default stack · blocking · before upload)
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          Remove-Item Env:RUST_MIN_STACK -ErrorAction SilentlyContinue
+          try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { Write-Host "[help-gate] console encoding unchanged (display only): $_" }
+          $exe = 'src-tauri/binaries/cys-x86_64-pc-windows-msvc.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            Write-Host "::error title=packaged cys.exe help gate::$exe is missing - the installer's sidecar was not built at this path"
+            exit 1
+          }
+          $full = (Resolve-Path -LiteralPath $exe).Path
+          Write-Host "[help-gate] $exe sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $full).Hash)"
+          $failed = @()
+          foreach ($argv in @(@('--help'), @('queue', '--help'), @('queue', 'list', '--help'))) {
+            $label = $argv -join ' '
+            $global:LASTEXITCODE = $null
+            $ErrorActionPreference = 'Continue'
+            try { $out = & $full @argv 2>&1 } catch { $out = @("launch error: $_") }
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+            if ($null -eq $code) {
+              Write-Host "[help-gate] cys.exe $label native-exit=UNMEASURED (no exit code)"
+              $failed += "${label}: UNMEASURED"
+              continue
+            }
+            $hex = '0x{0:X8}' -f $code
+            Write-Host "[help-gate] cys.exe $label native-exit=$hex"
+            @($out) | Select-Object -First 3 | ForEach-Object { Write-Host "[help-gate]   | $_" }
+            if ($code -ne 0) { $failed += "${label}: $hex" }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Host "::error title=packaged cys.exe help gate::non-zero native exit at the default stack: $($failed -join '; ') - this build must not be uploaded"
+            exit 1
+          }
+          Write-Host "[help-gate] all three exited 0x00000000 at the default stack"
+          exit 0
+
       - name: Upload NSIS installer artifact
         if: always()
         uses: actions/upload-artifact@v4

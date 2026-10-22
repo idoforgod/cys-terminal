@@ -350,6 +350,17 @@ jobs:
                   "so a release or pack-release entry would have nothing to measure. Also run by import from "
                   "test_ci_branch_cysd_step.py.",
               ),
+              "test_release_windows_help_gate": (
+                  {"ci-branch"},
+                  "scripts/tests/ suite (not a pack suite; 0.14.52 W-GATE). It reads workflow TEXT only: the Windows packaged "
+                  "cys.exe --help gate step in release.yml (Windows leg, before every upload) and the same-named pre-tag dry-run "
+                  "step in windows-build.yml, and pins presence, order, no continue-on-error, the exact path/argv/exit handling "
+                  "and byte-identical run bodies. Branch lane only: the pre-tag procedure (docs/RELEASE.md 0-C item 3, "
+                  "scripts/pre-tag-ci-check.py) requires ci-branch green on the tag SHA, so a tag tree that lost or weakened "
+                  "either step is not tagged under that procedure. A release entry would "
+                  "re-read text the tag already passed (master decision D-4, ci-branch only); pack-release has no Windows leg "
+                  "and nothing to measure.",
+              ),
                             "test_verify_win_crt": (
                   {"ci-branch", "release"},
                   "scripts/tests/ 스위트(팩 스위트 아님 · R1-repair 2026-08-29 편입 — 그 전에는 "
@@ -1475,6 +1486,17 @@ jobs:
           set -euo pipefail
           f="scripts/tests/test_c8_ci_consumer.py"
           [ -f "$f" ] || { echo "Missing CI reader controls: $f" >&2; exit 1; }
+          PYTHONDONTWRITEBYTECODE=1 python3 "$f"
+
+      # ★(0.14.52 · W-GATE) Windows packaged cys.exe --help gate pin, registered by name. It reads the gate step of release.yml
+      #   (Windows leg, before every upload) and of windows-build.yml (pre-tag dry run, same body) as text and checks them.
+      #   Branch lane only: ALLOWED("test_release_windows_help_gate") in the lane-parity gate above gives the reason. ★No `if:`.
+      - name: Windows --help gate step pin (release.yml + windows-build.yml)
+        shell: bash
+        run: |
+          set -euo pipefail
+          f="scripts/tests/test_release_windows_help_gate.py"
+          [ -f "$f" ] || { echo "Missing Windows --help gate step pin: $f" >&2; exit 1; }
           PYTHONDONTWRITEBYTECODE=1 python3 "$f"
 
       # ★(0.14.43 성찰 R1F-PK · S3 minor 8) IOReport 강링크 **산출물** 게이트. E2 가 `hwmon.rs` 의 IOReport 강링크를 dlopen 지연
