@@ -415,6 +415,7 @@ $JARVIS_DIR/directives/*_DIRECTIVE.md 와 $JARVIS_DIR/soul.md 에 전부 적혀 
 (프로세스 원장) · \`cys pause\`(큐 배달·스케줄 동결) · 훅 자체를 끄려면 ~/.claude/settings.json 에서
 $JARVIS_DIR/hooks/ 항목을 지운다.
 · "기동 완료"는 이 스크립트의 최종 JSON을 근거로 말하라(그 밖의 관찰은 자유롭게 보고해도 된다).
+· 최종 JSON이 ready:false(레디 마커 보류)면 "기동 완료"가 아니다 — "준비 완료"를 선언하지 말고 보류 사유(ready_withheld·marker)를 그대로 보고하라.
 · exit 7 = 다른 세션이 이미 master다 — 등록을 멈추고 그 사실을 알리고 기존 master에 인계하라.
 · exit 10 = 세션 컨텍스트 오류(거부가 아님 — CYS_SURFACE_ID 부재·데몬 미응답). '남이 master'로
   보고하지 마라. · exit 11 = 다른 런이 이미 부트 중(정상 skip·실패 아님).
