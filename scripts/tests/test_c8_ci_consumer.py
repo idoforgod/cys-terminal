@@ -359,6 +359,17 @@ WIN_LOG_BLOCKS = [
     '---- activity_tests::exited_seat_serializes_unknown stdout ----',
     '',
 ]
+# Exact lines 7338-7341 of the real release job log of run 39772179832 attempt 2 (macOS aarch64 job 119817491380), GitHub's
+# timestamp prefix removed; attempt 1 (job 119802177291) printed the same four lines at 7334-7337. An uncaptured `[queue]`
+# stderr line landed after `test X ... `, so libtest's `ok` for X came alone on the next line.
+RELEASE_SPLIT_OUTCOME = [
+    'test handlers::tests::wp5_queue_revive_refuses_when_active_queue_full ... ok',
+    'test native_publication::native_transition_tests::np_actual_partial_progress_cannot_be_retokenized_to_replacement ... [queue] 영속 중단(expired-first) — queue-expired.json 원자 치환 실패: No such file or directory (os error 2) · 원본 보존(다음 틱 재시도)',
+    'ok',
+    'test native_publication::native_transition_tests::np_actual_writer_operation_blocks_activation_after_prepare ... ok',
+]
+# 8404 of the same log: the cysd run's real summary
+RELEASE_CYSD_SUMMARY = 'test result: ok. 2811 passed; 0 failed; 13 ignored; 0 measured; 16 filtered out; finished in 806.79s'
 
 class ReaderFixture(unittest.TestCase):
     def setUp(self):
@@ -642,6 +653,93 @@ class C8NativeNameTests(ReaderFixture):
                 with self.subTest(workflow=workflow, case=label):
                     self.log(log, body)
                     self.assertEqual(self.run_body(workflow, step).returncode, rc)
+
+    def rows(self, names):
+        return ["test " + name + " ... ok" for name in names]
+
+    def name_gate(self, lines):
+        """Both actual name steps over the same log: they must agree; returns (rc, the JSON they print)."""
+        seen = []
+        for workflow, step, log in NAME_STEPS:
+            self.log(log, "\n".join(lines) + "\n")
+            ran = self.run_body(workflow, step)
+            seen.append((ran.returncode, json.loads(ran.stdout)))
+        self.assertEqual(seen[0], seen[1], "branch and release name gates read the same log differently")
+        return seen[0]
+
+    def test_real_release_split_outcome_is_read_from_the_following_line(self):
+        names = self.expected()
+        self.assertEqual(RELEASE_SPLIT_OUTCOME[1].split()[1], names[0])
+        self.assertEqual(RELEASE_SPLIT_OUTCOME[3].split()[1], names[1])
+        before, split, outcome, after = RELEASE_SPLIT_OUTCOME
+        stray = split.split(" ... ", 1)[1]
+        for label, lines in [("real lines", RELEASE_SPLIT_OUTCOME + self.rows(names[2:])),
+                             ("coloured outcome", [before, split, "\x1b[32mok\x1b[0m", after] + self.rows(names[2:])),
+                             ("more stderr lines first", [before, split, stray, stray, outcome, after] + self.rows(names[2:]))]:
+            with self.subTest(case=label):
+                rc, doc = self.name_gate(lines)
+                self.assertEqual((rc, doc["native_group_state"], doc["observed_rows"], doc["missing"], doc["nonpassing"]),
+                                 (0, "COMPLETE", 15, [], []))
+
+    def test_split_outcome_fails_closed(self):
+        names = self.expected()
+        before, split, outcome, after = RELEASE_SPLIT_OUTCOME
+        rest, others = self.rows(names[2:]), self.rows(names[1:])
+        missing = {"missing": [names[0]], "nonpassing": [], "observed_rows": 14}
+        stray = split.split(" ... ", 1)[1]
+        for label, lines, want in [
+                ("another test starts before the outcome", [before, split, after, outcome] + rest, missing),
+                ("the summary comes before the outcome", others + [split, RELEASE_CYSD_SUMMARY, outcome], missing),
+                ("stray text starting with 'test ' comes before the outcome", [before, split, "test " + stray, outcome, after]
+                 + rest, missing),
+                ("no outcome line before EOF", others + [split], missing),
+                ("two outcome lines", [before, split, "ok", "FAILED", after] + rest, missing),
+                ("outcome only glued to other text", [before, split + "ok", after] + rest, missing),
+                ("outcome glued to a later stderr line", [before, split, "[queue] 재시도 ok", after] + rest, missing),
+                ("split FAILED", [before, split, "FAILED", after] + rest,
+                 {"missing": [], "nonpassing": [{"test": names[0], "status": "FAILED"}], "observed_rows": 15}),
+                ("split ignored", [before, split, "ignored", after] + rest,
+                 {"missing": [], "nonpassing": [{"test": names[0], "status": "ignored"}], "observed_rows": 15}),
+                ("split ignored with a reason", [before, split, "ignored, slow", after] + rest,
+                 {"missing": [], "nonpassing": [{"test": names[0], "status": "ignored"}], "observed_rows": 15}),
+                ("a split row duplicates a same-line row", RELEASE_SPLIT_OUTCOME + rest + ["test " + names[0] + " ... ok"],
+                 {"missing": [], "duplicates": [names[0]], "observed_rows": 16}),
+                ("a split row of a native name outside the manifest", RELEASE_SPLIT_OUTCOME + rest
+                 + [split.replace(names[0], names[0] + "_extra"), outcome],
+                 {"missing": [], "unexpected": [names[0] + "_extra"], "observed_rows": 16})]:
+            with self.subTest(case=label):
+                rc, doc = self.name_gate(lines)
+                self.assertEqual((rc, doc["native_group_state"]), (4, "INCOMPLETE"))
+                self.assertEqual({key: doc[key] for key in want}, want)
+
+    def test_same_line_outcomes_never_read_the_following_line(self):
+        names = self.expected()
+        first = "test " + names[0] + " ... "
+        for label, lines, status in [("ok, then a lone FAILED", [first + "ok", "FAILED"], "ok"),
+                                     ("FAILED, then a lone ok", [first + "FAILED", "ok"], "FAILED"),
+                                     ("ignored with a reason", [first + "ignored, slow"], "ignored"),
+                                     ("CRLF", [first + "ok\r"], "ok")]:
+            with self.subTest(case=label):
+                rc, doc = self.name_gate(lines + self.rows(names[1:]))
+                self.assertEqual((doc["observed_rows"], doc["missing"]), (15, []))
+                self.assertEqual(doc["nonpassing"], [] if status == "ok" else [{"test": names[0], "status": status}])
+                self.assertEqual(rc, 0 if status == "ok" else 4)
+
+    def test_unmeasured_marker_split_is_ok_here_and_still_blocks_the_marker_gate(self):
+        # The fixture writes its marker as "\nC8_NATIVE_UNMEASURED_V1 {...}\n", so a skipped test has the split shape. The name
+        # gate counts libtest's ok (it does not read markers); the separate marker gate on the same log keeps the leg red.
+        names = self.expected()
+        record = json.dumps({"state": "UNMEASURED", "group": "C8_NATIVE_TRANSITIONS", "test": names[0],
+                             "reason": "python3_unavailable"}, separators=(",", ":"))
+        written = "test " + names[0] + " ... " + "\nC8_NATIVE_UNMEASURED_V1 " + record + "\n" + "ok"
+        rc, doc = self.name_gate(written.split("\n") + self.rows(names[1:]))
+        self.assertEqual((rc, doc["native_group_state"], doc["observed_rows"]), (0, "COMPLETE", 15))
+        name_logs = [log for _, _, log in NAME_STEPS]
+        marker_steps = [(workflow, step) for workflow, step, logs in MARKER_STEPS if logs[0] in name_logs]
+        self.assertEqual(len(marker_steps), len(NAME_STEPS), "every name-gate log has a marker gate")
+        for workflow, step in marker_steps:
+            with self.subTest(workflow=workflow):
+                self.assertEqual(self.run_body(workflow, step).returncode, 3, "marker gate must still block this log")
 
 class CysdWinFailureListTests(ReaderFixture):
     """windows-health step 9 writes win-cysd-failures.json from cargo.log; run its actual body over real log lines."""

@@ -14,7 +14,29 @@ def reconcile_native_names(text, expected):
     if any(not isinstance(name, str) or not name.startswith(TEST_PREFIX) for name in expected):
         raise ValueError("unexpected native test name")
     text = re.sub(r"\x1b\[[0-9;]*m", "", text)
-    rows = re.findall(r"^test (" + re.escape(TEST_PREFIX) + r"[A-Za-z0-9_:]+) \.\.\. (ok|FAILED|ignored)\b[^\r\n]*", text, re.M)
+    test = r"test (" + re.escape(TEST_PREFIX) + r"[A-Za-z0-9_:]+) \.\.\."
+    same_line, started = re.compile(test + r" (ok|FAILED|ignored)\b"), re.compile(test + r"(?: |$)")
+    outcome_alone = re.compile(r"ok|FAILED|ignored|ignored, .+")
+    lines = text.split("\n")
+    rows = []
+    for at, line in enumerate(lines):
+        row = same_line.match(line)
+        if row:
+            rows.append(row.groups())
+            continue
+        start = started.match(line)
+        if not start:
+            continue
+        # Output libtest did not capture ended the `test X ... ` line, so X's outcome came alone on a later line. Read it
+        # only before the next `test ` line (a new test or the summary) and only if exactly one is there; else X is missing.
+        outcomes = []
+        for later in lines[at + 1:]:
+            if later.startswith("test "):
+                break
+            if outcome_alone.fullmatch(later.rstrip()):
+                outcomes.append(later.rstrip().split(",")[0])
+        if len(outcomes) == 1:
+            rows.append((start.group(1), outcomes[0]))
     counts = Counter(name for name, _ in rows)
     expected_set = set(expected)
     missing = sorted(expected_set - counts.keys())
