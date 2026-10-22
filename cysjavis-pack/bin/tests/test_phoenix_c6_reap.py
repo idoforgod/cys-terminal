@@ -43,7 +43,9 @@ def main():
         print('SKIP: Darwin-only S5 fixture; Windows native remains unrun')
         return 0
     assert CYS.is_file() and CYSD.is_file(), 'S5 requires exact built worktree binaries'
-    base = (REPO / 'target/u-tmp').resolve()
+    base = REPO / 'target/u-tmp'
+    base.mkdir(parents=True, exist_ok=True)  # a fresh CI runner has no target/u-tmp (release run 39747056302)
+    base = base.resolve()
     with tempfile.TemporaryDirectory(prefix='s5n-', dir=base) as temp:
         root = Path(temp).resolve()
         endpoint = root / 'd.sock'

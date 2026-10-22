@@ -26,7 +26,9 @@ class HarnessCloseTests(unittest.TestCase):
     def setUp(self):
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
-        self.tmp = self.stack.enter_context(tempfile.TemporaryDirectory(prefix="ph-close-"))
+        # Canonical path: on macOS the temp dir is reached through a symlink (/tmp, /var), and an unresolved path would make
+        # _harness_paths() refuse with aliased_harness_root before the check a test targets (release run 39747056302).
+        self.tmp = os.path.realpath(self.stack.enter_context(tempfile.TemporaryDirectory(prefix="ph-close-")))
         spec = importlib.util.spec_from_file_location("s7_harness", HARNESS)
         self.h = importlib.util.module_from_spec(spec)
         with patch("atexit.register"), patch("signal.signal"):
