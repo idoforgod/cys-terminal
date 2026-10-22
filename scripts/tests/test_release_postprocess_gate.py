@@ -816,7 +816,12 @@ class UserPathProbeExecBoundTests(unittest.TestCase):
 
     def tearDown(self):
         import signal
-        for name in ("child-a.pid", "child-b.pid"):
+        for name in (
+            "child-a.pid", "child-b.pid",
+            "parent.pid", "child.pid", "grandchild.pid", "reparented.pid",
+            "trap-parent.pid", "trap-child.pid", "trap-grandchild.pid",
+            "caller-sentinel.pid",
+        ):
             p = os.path.join(self.root, name)
             if os.path.exists(p):
                 try:
@@ -974,6 +979,167 @@ echo "00000000-0000-0000-0000-000000000000"
         for bad_val in ("0", "-5", "abc"):
             rc, out = self._run_user_path("#!/usr/bin/env bash\nexit 0\n", timeout_secs=bad_val)
             self.assertEqual(rc, 2, "bad_val=%r should exit 2: %s" % (bad_val, out))
+
+    def test_35_g6_ambient_pythondontwritebytecode_scrubbed_on_6a_deliberate_verdict_change(self):
+        """G6(BAR-R2-AMEND-1): 호출자 환경에 PYTHONDONTWRITEBYTECODE=1 이 상속돼 있어도
+        ⑥-A 는 이를 제거(env -u PYTHONDONTWRITEBYTECODE)한 plain env 로 측정한다(의도된 판정 변경).
+        PYTHONDONTWRITEBYTECODE=1 일 때만 0(성공)이고 아니면 7(실패)을 돌려주는 가짜 인터프리터를
+        호출자 PYTHONDONTWRITEBYTECODE=1 아래에서 돌리면:
+          · 신판: ⑥-A 는 FAIL(rc=7), ⑥-B 는 명시적 PYTHONDONTWRITEBYTECODE=1 로 PASS → 전체 rc=1(FAIL).
+          · 구판(f0ac3b0c 상속 동작): 호출자의 PYTHONDONTWRITEBYTECODE=1 이 ⑥-A 에도 새어 들어가
+            ⑥-A·⑥-B 모두 PASS → 전체 rc=0(거짓 PASS)."""
+        py_body = (
+            "#!/usr/bin/env bash\n"
+            "if [ \"${PYTHONDONTWRITEBYTECODE:-}\" = \"1\" ]; then\n"
+            "  exit 0\n"
+            "fi\n"
+            "echo 'plain-env unmitigated failure' >&2\n"
+            "exit 7\n"
+        )
+        rc_new, out_new = self._run_user_path(
+            py_body, timeout_secs="5", extra_env={"PYTHONDONTWRITEBYTECODE": "1"}
+        )
+        self.assertEqual(rc_new, 1, out_new)
+        self.assertIn("FAIL ⑥-A ★봉인 자기파괴 재현 | 동봉 python 실행 실패(rc=7)", out_new)
+        self.assertIn("PASS ⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1) | .pyc 0→0 · 봉인 유지", out_new)
+        self.assertIn("═══ 8 PASS / 1 FAIL ═══", out_new)
+        self.assertIn("판정: FAIL — 이 빌드는 실사용자 경로에서 차단될 수 있다. 배포 금지.", out_new)
+
+        # 대조(구판 f0ac3b0c 의 상속 동작): ⑥-A 에서 env -u PYTHONDONTWRITEBYTECODE 를 빼면 같은 호출자 환경에서 거짓 PASS(rc=0)가 난다
+        with open(_USER_PATH_SH, encoding="utf-8") as fh:
+            cur_src = fh.read()
+        self.assertIn('env -u PYTHONDONTWRITEBYTECODE "$PY"', cur_src)
+        inherited_sh = os.path.join(self.root, "verify-inherited-env.sh")
+        self._write_exec(
+            inherited_sh,
+            cur_src.replace('env -u PYTHONDONTWRITEBYTECODE "$PY"', '"$PY"', 1),
+        )
+        py_tmpl = os.path.join(self.root, "fake-python3.sh")
+        self._write_exec(py_tmpl, py_body)
+        env = dict(os.environ)
+        env["PATH"] = self.bin_dir + ":" + env.get("PATH", "/usr/bin:/bin")
+        env["FAKE_PY_TEMPLATE"] = py_tmpl
+        env["FAKE_MNT_RECORD"] = os.path.join(self.root, "mnt.rec")
+        env["FAKE_XATTR_FILE"] = os.path.join(self.root, "xattr.val")
+        env["CYS_GATE_PROBE_EXEC_TIMEOUT_SECS"] = "5"
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        p_old = subprocess.run(
+            ["bash", inherited_sh, "--quarantine-flags", "0081", self.dmg],
+            capture_output=True, text=True, env=env, timeout=8,
+        )
+        out_old = p_old.stdout + p_old.stderr
+        self.assertEqual(p_old.returncode, 0, out_old)
+        self.assertIn("PASS ⑥-A ★봉인 자기파괴 재현", out_old)
+        self.assertIn("PASS ⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)", out_old)
+        self.assertIn("판정: PASS", out_old)
+
+        # 리터럴 부모 커밋(f0ac3b0c) 스크립트가 git 객체에 존재하면 그 원문으로도 동일하게 PASS(rc=0) 대조
+        git_show = subprocess.run(
+            ["git", "-C", _HERE, "show", "f0ac3b0c:scripts/verify-gatekeeper-user-path.sh"],
+            capture_output=True, text=True,
+        )
+        if git_show.returncode == 0 and git_show.stdout:
+            parent_sh = os.path.join(self.root, "verify-parent-f0ac3b0c.sh")
+            self._write_exec(parent_sh, git_show.stdout)
+            p_parent = subprocess.run(
+                ["bash", parent_sh, "--quarantine-flags", "0081", self.dmg],
+                capture_output=True, text=True, env=env, timeout=8,
+            )
+            out_parent = p_parent.stdout + p_parent.stderr
+            self.assertEqual(p_parent.returncode, 0, out_parent)
+            self.assertIn("PASS ⑥-A ★봉인 자기파괴 재현", out_parent)
+            self.assertIn("판정: PASS", out_parent)
+
+    def test_36_term_ignoring_descendant_tree_killed_on_expiry_and_trap_without_signalling_caller_pgid(self):
+        """G1/G4 tightened (BAR-R2-AMEND-1 · codex r1 major):
+        가짜 인터프리터가 TERM 을 무시(trap '' TERM)하는 자식·손자 및 중간 부모 종료로 조기 재입양(PPID=1)된
+        손자까지 스폰한 뒤 멈췄을 때:
+          (a) 타임아웃(exit 2) 후 부모·자식·손자·조기 재입양 손자 PID 가 단 하나도 살아남지 않고,
+              호출자 프로세스 그룹의 파수꾼(sentinel)은 시그널을 받지 않는다.
+          (b) 게이트 실행 도중 외부 SIGTERM(trap cleanup)을 보냈을 때도 동일하게 자손 트리가 전부 소멸한다."""
+        import time as _time
+        parent_pid_f = os.path.join(self.root, "parent.pid")
+        child_pid_f = os.path.join(self.root, "child.pid")
+        grand_pid_f = os.path.join(self.root, "grandchild.pid")
+        reparent_pid_f = os.path.join(self.root, "reparented.pid")
+
+        # 호출자 프로세스 그룹에 속한 파수꾼(sentinel) 프로세스 — 호출자 PGID 에 시그널이 잘못 전파되면 죽는다
+        sentinel = subprocess.Popen(["sleep", "30"])
+        with open(os.path.join(self.root, "caller-sentinel.pid"), "w", encoding="utf-8") as fh:
+            fh.write(str(sentinel.pid))
+        try:
+            py_body = (
+                "#!/usr/bin/env bash\n"
+                "echo $$ > \"%s\"\n"
+                "# 1) 중간 셸이 즉시 죽어 타임아웃 전에 이미 PPID=1 로 재입양되는 TERM-무시 손자\n"
+                "bash -c 'trap \"\" TERM; (trap \"\" TERM; exec sleep 30) </dev/null >/dev/null 2>&1 & echo $! > \"%s\"'\n"
+                "# 2) 부모 아래 살아있는 TERM-무시 자식 + 그 아래 TERM-무시 손자\n"
+                "bash -c 'trap \"\" TERM; (trap \"\" TERM; exec sleep 30) </dev/null >/dev/null 2>&1 & echo $! > \"%s\"; exec sleep 30' </dev/null >/dev/null 2>&1 &\n"
+                "echo $! > \"%s\"\n"
+                "exec sleep 30\n"
+            ) % (parent_pid_f, reparent_pid_f, grand_pid_f, child_pid_f)
+
+            rc, out = self._run_user_path(py_body, timeout_secs="1", proc_timeout=8)
+            self.assertEqual(rc, 2, out)
+            self.assertIn("UNMEASURED ⑥-A ★봉인 자기파괴 재현", out, out)
+            for label, pf in (
+                ("parent", parent_pid_f),
+                ("TERM-ignoring child", child_pid_f),
+                ("TERM-ignoring grandchild", grand_pid_f),
+                ("early-reparented TERM-ignoring grandchild", reparent_pid_f),
+            ):
+                self.assertTrue(os.path.exists(pf), "%s pid 기록 누락" % label)
+                with open(pf, encoding="utf-8") as fh:
+                    pid = int(fh.read().strip())
+                with self.assertRaises(ProcessLookupError, msg="타임아웃 후 %s(pid=%d)가 살아 있다" % (label, pid)):
+                    os.kill(pid, 0)
+
+            self.assertIsNone(sentinel.poll(), "호출자 프로세스 그룹의 파수꾼이 시그널로 죽었다(rc=%r)" % sentinel.returncode)
+
+            # (b) 외부 SIGTERM(trap cleanup) 경로 검증
+            t_parent_f = os.path.join(self.root, "trap-parent.pid")
+            t_child_f = os.path.join(self.root, "trap-child.pid")
+            t_grand_f = os.path.join(self.root, "trap-grandchild.pid")
+            trap_py_body = (
+                "#!/usr/bin/env bash\n"
+                "echo $$ > \"%s\"\n"
+                "bash -c 'trap \"\" TERM; (trap \"\" TERM; exec sleep 30) </dev/null >/dev/null 2>&1 & echo $! > \"%s\"; exec sleep 30' </dev/null >/dev/null 2>&1 &\n"
+                "echo $! > \"%s\"\n"
+                "exec sleep 30\n"
+            ) % (t_parent_f, t_grand_f, t_child_f)
+            py_tmpl = os.path.join(self.root, "fake-python3-trap.sh")
+            self._write_exec(py_tmpl, trap_py_body)
+            env = dict(os.environ)
+            env["PATH"] = self.bin_dir + ":" + env.get("PATH", "/usr/bin:/bin")
+            env["FAKE_PY_TEMPLATE"] = py_tmpl
+            env["FAKE_MNT_RECORD"] = os.path.join(self.root, "mnt-trap.rec")
+            env["FAKE_XATTR_FILE"] = os.path.join(self.root, "xattr-trap.val")
+            env["CYS_GATE_PROBE_EXEC_TIMEOUT_SECS"] = "30"
+            gate_proc = subprocess.Popen(
+                ["bash", _USER_PATH_SH, "--quarantine-flags", "0081", self.dmg],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            )
+            deadline = _time.monotonic() + 5.0
+            while _time.monotonic() < deadline:
+                if all(os.path.exists(f) and os.path.getsize(f) > 0 for f in (t_parent_f, t_child_f, t_grand_f)):
+                    break
+                _time.sleep(0.05)
+            self.assertTrue(os.path.exists(t_grand_f), "trap 검체 손자 스폰 전 대기 시간 초과")
+            gate_proc.terminate()
+            gate_proc.communicate(timeout=6)
+            for label, pf in (
+                ("trap-parent", t_parent_f),
+                ("trap TERM-ignoring child", t_child_f),
+                ("trap TERM-ignoring grandchild", t_grand_f),
+            ):
+                with open(pf, encoding="utf-8") as fh:
+                    pid = int(fh.read().strip())
+                with self.assertRaises(ProcessLookupError, msg="외부 SIGTERM trap 후 %s(pid=%d)가 살아 있다" % (label, pid)):
+                    os.kill(pid, 0)
+            self.assertIsNone(sentinel.poll(), "외부 SIGTERM trap 후 호출자 PGID 파수꾼이 죽었다")
+        finally:
+            sentinel.kill()
+            sentinel.wait()
 
 
 if __name__ == "__main__":
