@@ -51,11 +51,17 @@
 #   bash scripts/verify-gatekeeper-user-path.sh https://www.cysinsight.com/downloads/cys_0.14.9_aarch64.dmg
 #   bash scripts/verify-gatekeeper-user-path.sh --version 0.14.9 [--arch aarch64|x64]
 #   옵션: --keep(작업 폴더 보존) · --quarantine-flags <4자리hex>(기본 = ~/Downloads 실측값)
+#   환경변수: CYS_GATE_PROBE_EXEC_TIMEOUT_SECS — ⑥-A·⑥-B 동봉 python 스폰 대기 상한(초, 양의 정수,
+#             기본 60). macOS 에서 격리된 비번들(NOT_A_BUNDLE) probe python 실행 시 syspolicyd/
+#             CoreServicesUIAgent 가 GUI 프롬프트를 띄운 채 _dyld_start 에서 무기한 멈추는 현상
+#             (2026-10-22 B-437 실측)을 차단한다. 상한 초과 시 자식을 종료하고 해당 축을
+#             UNMEASURED("Gatekeeper GUI prompt pending or exec held (no result within N s)")로
+#             기록한 뒤 전체 판정을 exit 2(판정 불가)로 닫는다(결코 PASS 가 되지 않는다).
 #
 # 종료 코드
 #   0 = 전 단계 PASS (실사용자 경로 안전)
 #   1 = 하나 이상 FAIL (배포 금지)
-#   2 = 사용법 오류 · 도구 부재 · 자산 획득 실패 (**판정 불가 — 통과가 아니다**)
+#   2 = 사용법 오류 · 도구 부재 · 자산 획득 실패 · ⑥ 동봉 python 대기 상한 초과 (**판정 불가 — 통과가 아니다**)
 #
 # 전제·비용 (실측 v0.14.9)
 #   · macOS 에서만 의미가 있다(hdiutil·spctl·codesign·xattr·xcrun). Xcode CLT 필요.
@@ -116,7 +122,15 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/gk-user-path.XXXXXX")" || exit 2
 #   (b) 출력에서 임시경로를 지우는 치환이 절반만 먹는다(실측).
 WORK="$(cd "$WORK" && pwd -P)"
 MOUNTS=()
+BOUNDED_PID=""
 cleanup() {
+  if [ -n "${BOUNDED_PID:-}" ]; then
+    pkill -TERM -P "$BOUNDED_PID" 2>/dev/null || true
+    kill -TERM "$BOUNDED_PID" 2>/dev/null || true
+    pkill -KILL -P "$BOUNDED_PID" 2>/dev/null || true
+    kill -KILL "$BOUNDED_PID" 2>/dev/null || true
+    BOUNDED_PID=""
+  fi
   local m
   for m in "${MOUNTS[@]:-}"; do
     [ -n "$m" ] || continue
@@ -132,9 +146,50 @@ trap cleanup EXIT INT TERM
 
 PASS_N=0
 FAIL_N=0
-ok()   { PASS_N=$((PASS_N+1)); printf 'PASS %s%s\n' "$1" "${2:+ | $2}"; }
-bad()  { FAIL_N=$((FAIL_N+1)); printf 'FAIL %s%s\n' "$1" "${2:+ | $2}"; }
-info() { printf '     %s\n' "$1"; }
+UNMEASURED_N=0
+PROBE_EXEC_TIMEOUT_SECS="${CYS_GATE_PROBE_EXEC_TIMEOUT_SECS:-60}"
+case "$PROBE_EXEC_TIMEOUT_SECS" in
+  ''|*[!0-9]*|0*)
+    echo "✗ CYS_GATE_PROBE_EXEC_TIMEOUT_SECS 는 양의 정수(초)여야 한다: '$PROBE_EXEC_TIMEOUT_SECS'" >&2
+    exit 2
+    ;;
+esac
+ok()         { PASS_N=$((PASS_N+1)); printf 'PASS %s%s\n' "$1" "${2:+ | $2}"; }
+bad()        { FAIL_N=$((FAIL_N+1)); printf 'FAIL %s%s\n' "$1" "${2:+ | $2}"; }
+unmeasured() { UNMEASURED_N=$((UNMEASURED_N+1)); printf 'UNMEASURED %s%s\n' "$1" "${2:+ | $2}"; }
+info()       { printf '     %s\n' "$1"; }
+
+# macOS 기본 환경에는 GNU timeout 이 없다(coreutils 미의존). 동봉 python 스폰을 백그라운드로 띄우고
+# PROBE_EXEC_TIMEOUT_SECS 초까지만 기다린 뒤, 아직 살아 있으면 종료(TERM→KILL)하고
+# BOUNDED_TIMED_OUT=1 및 종료 코드 124 를 돌려준다(자식이 스스로 124 로 죽은 경우와 구분).
+BOUNDED_TIMED_OUT=0
+run_bounded_py() { # $1=로그파일, 나머지=명령(env/해석기/인자)
+  local log="$1"; shift
+  BOUNDED_TIMED_OUT=0
+  "$@" >"$log" 2>&1 &
+  local pid=$!
+  BOUNDED_PID="$pid"
+  local elapsed=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$elapsed" -ge "$PROBE_EXEC_TIMEOUT_SECS" ]; then
+      pkill -TERM -P "$pid" 2>/dev/null || true
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 0.2 2>/dev/null || sleep 1
+      pkill -KILL -P "$pid" 2>/dev/null || true
+      kill -KILL "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+      BOUNDED_PID=""
+      BOUNDED_TIMED_OUT=1
+      return 124
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  wait "$pid"
+  local rc=$?
+  BOUNDED_PID=""
+  return "$rc"
+}
 
 echo "═══ Gatekeeper 실사용자 경로 검증 ═══"
 echo "대상: $DMG_SRC"
@@ -301,10 +356,14 @@ else
 
     # ⑥-A ★본 검사(무오염 사본): env 완화를 못 타는 경로에서도 번들이 안 깨져야 한다
     #      = 패키징 층위 불변식. 사고의 정확한 재현 검사다.
-    "$PY" -c "import argparse,tempfile,uuid" >"$WORK/pyA.log" 2>&1
+    #      상위 셸 환경에 PYTHONDONTWRITEBYTECODE 가 설정돼 있어도 ⑥-A 는 plain env 계약을 잰다.
+    run_bounded_py "$WORK/pyA.log" env -u PYTHONDONTWRITEBYTECODE "$PY" -c "import argparse,tempfile,uuid"
     PY_RC=$?
+    PYA_TIMED_OUT="$BOUNDED_TIMED_OUT"
     PYC_A=$(find "$PROBE_A" -name '*.pyc' 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$PY_RC" -ne 0 ]; then
+    if [ "$PYA_TIMED_OUT" -eq 1 ]; then
+      unmeasured "⑥-A ★봉인 자기파괴 재현" "Gatekeeper GUI prompt pending or exec held (no result within ${PROBE_EXEC_TIMEOUT_SECS} s)"
+    elif [ "$PY_RC" -ne 0 ]; then
       bad "⑥-A ★봉인 자기파괴 재현" "동봉 python 실행 실패(rc=$PY_RC) — 검사 불성립: $(tail -2 "$WORK/pyA.log" | tr '\n' ' ')"
     else
       # --verbose=2 라야 "file added: …/__pycache__/*.pyc" 개별 줄까지 나온다(요약만으로는
@@ -325,31 +384,45 @@ else
     fi
 
     # ⑥-B (새 사본): SEAL-1 완화(앱이 python 스폰 시 얹는 env)가 실제로 쓰기를 막는지.
-    PROBE_B="$(make_probe b || true)"
-    if [ -z "$PROBE_B" ] || [ ! -d "$PROBE_B" ]; then
-      bad "⑥-B SEAL-1 완화 확인" "probe 사본 생성 실패: $(tail -2 "$WORK/probe.b.log" 2>/dev/null | tr '\n' ' ')"
+    # ⑥-A 가 Gatekeeper GUI 프롬프트(대기 상한 초과)로 막혔다면 ⑥-B 의 동일 바이너리도 같은 프롬프트를
+    # 한 번 더 띄우므로 재스폰하지 않고 같은 UNMEASURED 사유로 기록한다.
+    if [ "$PYA_TIMED_OUT" -eq 1 ]; then
+      unmeasured "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" "Gatekeeper GUI prompt pending or exec held (no result within ${PROBE_EXEC_TIMEOUT_SECS} s)"
     else
-      PYB="$(find_py "$PROBE_B")"
-      PYCB0=$(find "$PROBE_B" -name '*.pyc' 2>/dev/null | wc -l | tr -d ' ')
-      PYTHONDONTWRITEBYTECODE=1 "$PYB" -c "import argparse,tempfile,uuid" >"$WORK/pyB.log" 2>&1
-      PYB_RC=$?
-      PYC_B=$(find "$PROBE_B" -name '*.pyc' 2>/dev/null | wc -l | tr -d ' ')
-      # ★rc 하드페일 — ⑥-A(PY_RC) 와 동일한 계약. python 이 아예 못 돌면 "완화가 쓰기를 막았다"가
-      #   아니라 **아무 일도 일어나지 않은 것**인데, 그때도 `.pyc 개수 불변`과 `codesign 통과`는
-      #   저절로 참이 되어 PASS 가 새어 나간다(측정 불능 ≠ 통과). 아래 두 술어는 그대로 두고
-      #   rc 조건만 앞에 얹는다 — 통과 조건이 좁아지기만 하고 넓어지지 않는다.
-      if [ "$PYB_RC" -ne 0 ]; then
-        bad "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" "동봉 python 실행 실패(rc=$PYB_RC) — 검사 불성립(측정 불능은 통과가 아니다) · .pyc ${PYCB0}→$PYC_B: $(tail -2 "$WORK/pyB.log" 2>/dev/null | tr '\n' ' ')"
-      elif codesign --verify --deep --strict --verbose=2 "$PROBE_B" >"$WORK/csB.log" 2>&1 && [ "$PYC_B" = "$PYCB0" ]; then
-        ok "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" ".pyc ${PYCB0}→$PYC_B · 봉인 유지"
+      PROBE_B="$(make_probe b || true)"
+      if [ -z "$PROBE_B" ] || [ ! -d "$PROBE_B" ]; then
+        bad "⑥-B SEAL-1 완화 확인" "probe 사본 생성 실패: $(tail -2 "$WORK/probe.b.log" 2>/dev/null | tr '\n' ' ')"
       else
-        bad "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" "완화가 무효다 · .pyc ${PYCB0}→$PYC_B · $(grep -Ei 'sealed|file (added|modified)' "$WORK/csB.log" | head -2 | tr '\n' ' ' | sed "s|$PROBE_B|<probe>|g")"
+        PYB="$(find_py "$PROBE_B")"
+        PYCB0=$(find "$PROBE_B" -name '*.pyc' 2>/dev/null | wc -l | tr -d ' ')
+        run_bounded_py "$WORK/pyB.log" env PYTHONDONTWRITEBYTECODE=1 "$PYB" -c "import argparse,tempfile,uuid"
+        PYB_RC=$?
+        PYB_TIMED_OUT="$BOUNDED_TIMED_OUT"
+        PYC_B=$(find "$PROBE_B" -name '*.pyc' 2>/dev/null | wc -l | tr -d ' ')
+        # ★rc 하드페일 — ⑥-A(PY_RC) 와 동일한 계약. python 이 아예 못 돌면 "완화가 쓰기를 막았다"가
+        #   아니라 **아무 일도 일어나지 않은 것**인데, 그때도 `.pyc 개수 불변`과 `codesign 통과`는
+        #   저절로 참이 되어 PASS 가 새어 나간다(측정 불능 ≠ 통과). 아래 두 술어는 그대로 두고
+        #   rc 조건만 앞에 얹는다 — 통과 조건이 좁아지기만 하고 넓어지지 않는다.
+        if [ "$PYB_TIMED_OUT" -eq 1 ]; then
+          unmeasured "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" "Gatekeeper GUI prompt pending or exec held (no result within ${PROBE_EXEC_TIMEOUT_SECS} s)"
+        elif [ "$PYB_RC" -ne 0 ]; then
+          bad "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" "동봉 python 실행 실패(rc=$PYB_RC) — 검사 불성립(측정 불능은 통과가 아니다) · .pyc ${PYCB0}→$PYC_B: $(tail -2 "$WORK/pyB.log" 2>/dev/null | tr '\n' ' ')"
+        elif codesign --verify --deep --strict --verbose=2 "$PROBE_B" >"$WORK/csB.log" 2>&1 && [ "$PYC_B" = "$PYCB0" ]; then
+          ok "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" ".pyc ${PYCB0}→$PYC_B · 봉인 유지"
+        else
+          bad "⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1)" "완화가 무효다 · .pyc ${PYCB0}→$PYC_B · $(grep -Ei 'sealed|file (added|modified)' "$WORK/csB.log" | head -2 | tr '\n' ' ' | sed "s|$PROBE_B|<probe>|g")"
+        fi
       fi
     fi
   fi
 fi
 
 echo
+if [ "$UNMEASURED_N" -gt 0 ]; then
+  echo "═══ $PASS_N PASS / $FAIL_N FAIL / $UNMEASURED_N UNMEASURED ═══"
+  echo "판정: UNMEASURED(판정 불가) — Gatekeeper GUI prompt pending or exec held (no result within ${PROBE_EXEC_TIMEOUT_SECS} s). 통과가 아니다(배포 금지)."
+  exit 2
+fi
 echo "═══ $PASS_N PASS / $FAIL_N FAIL ═══"
 if [ "$FAIL_N" -eq 0 ]; then
   echo "판정: PASS — 브라우저 다운로드 → 드래그 설치 → 첫 실행 경로가 안전하다."

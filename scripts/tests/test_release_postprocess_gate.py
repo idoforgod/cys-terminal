@@ -146,6 +146,63 @@ class GatekeeperGateHookTests(unittest.TestCase):
         rc, _ = self.run_gate(gate_rc=0, user_rc=1)
         self.assertEqual(rc, 1)
 
+    def test_06b_user_path_exit2_blocks_and_surfaces_cause(self):
+        """상위판(verify-gatekeeper-user-path.sh)이 rc=2(판정 불가 · 예: Gatekeeper GUI 프롬프트 대기 상한 초과)를
+        돌려주면 --apply 를 거부(rc=2 반환)하고 게이트 마지막 줄의 사유를 콘솔 오류에 함께 싣는다(B-437)."""
+        from unittest import mock
+        user_sh = os.path.join(self.root, "userpath-rc2.sh")
+        reason = "UNMEASURED ⑥-A ★봉인 자기파괴 재현 | Gatekeeper GUI prompt pending or exec held (no result within 2 s)"
+        verdict = "판정: UNMEASURED(판정 불가) — Gatekeeper GUI prompt pending or exec held (no result within 2 s). 통과가 아니다(배포 금지)."
+        with open(user_sh, "w", encoding="utf-8") as fh:
+            fh.write('#!/bin/sh\necho "%s"\necho "═══ 7 PASS / 0 FAIL / 2 UNMEASURED ═══"\necho "%s"\nexit 2\n'
+                     % (reason, verdict))
+        os.chmod(user_sh, 0o755)
+        gate_sh = self.fake_gate("gate.sh", 0)
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            rc = rp.gatekeeper_gate(self.root, V,
+                                    gate_script=gate_sh,
+                                    user_path_script=user_sh,
+                                    sys_platform="darwin",
+                                    machine="arm64")
+        self.assertEqual(rc, 2)
+        err_txt = err.getvalue()
+        self.assertIn("::error::Gatekeeper 게이트 차단 rc=2", err_txt)
+        self.assertIn("Gatekeeper GUI prompt pending or exec held (no result within 2 s)", err_txt)
+
+        # main(["release-postprocess.py", "v...", "--apply"]) 도 동일하게 rc=2 로 즉시 중단하고 업로드(urlopen)를 단 1건도 호출하지 않는다
+        tag = "v" + V
+        assets_dir = os.path.join(self.root, tag + "-assets")
+        os.makedirs(assets_dir, exist_ok=True)
+        asset_names = [
+            "cys_%s_aarch64.dmg" % V,
+            "cys_%s_x64.dmg" % V,
+            "cys_%s_x64-setup.exe" % V,
+            "cys_%s_x64-setup.zip" % V,
+        ]
+        fake_assets = []
+        for idx, name in enumerate(asset_names, start=1):
+            p = os.path.join(assets_dir, name)
+            with open(p, "wb") as fh:
+                fh.write(b"stub-" + name.encode("ascii"))
+            fake_assets.append({"id": idx, "name": name, "size": os.path.getsize(p), "url": "https://example.invalid/" + name})
+        uploads = []
+        err_main = io.StringIO()
+        orig_gate = rp.gatekeeper_gate
+        with mock.patch.object(rp, "BACKUP_ROOT", self.root), \
+             mock.patch.object(rp, "gatekeeper_gate", side_effect=lambda outdir, ver, unsafe_skip=False: orig_gate(
+                 outdir, ver, unsafe_skip=unsafe_skip,
+                 gate_script=gate_sh, user_path_script=user_sh,
+                 sys_platform="darwin", machine="arm64")), \
+             mock.patch.object(rp, "token", return_value="fake-tok"), \
+             mock.patch.object(rp, "api", return_value={"tag_name": tag, "draft": True, "assets": fake_assets, "upload_url": "https://example.invalid/up{?name}"}), \
+             mock.patch.object(rp.urllib.request, "urlopen", side_effect=lambda *a, **k: uploads.append(a)), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err_main):
+            rc_main = rp.main(["release-postprocess.py", tag, "--apply"])
+        self.assertEqual(rc_main, 2)
+        self.assertEqual(uploads, [], "--apply 가 exit 2 에서 차단되지 않고 업로드를 호출했다")
+        self.assertIn("Gatekeeper GUI prompt pending or exec held (no result within 2 s)", err_main.getvalue())
+
     def test_07_non_macos_is_fail_closed_not_skip(self):
         """macOS 밖 무음 skip = 무검증 발행. 판정 불가(비영)로 죽고, 게이트를 돌린
         척(호출 기록)도 남기면 안 된다."""
@@ -733,6 +790,190 @@ class RuntimeManifestAxisTests(unittest.TestCase):
             with open(path, encoding="utf-8") as fh:
                 self.assertNotIn("--runtime-manifest-only", fh.read(),
                                  "발행 경로가 진단 전용 플래그를 실었다: %s" % path)
+
+
+_USER_PATH_SH = os.path.join(_HERE, "..", "verify-gatekeeper-user-path.sh")
+
+
+class UserPathProbeExecBoundTests(unittest.TestCase):
+    """B-437 (WP3-GKPROMPT-0.14.53) — verify-gatekeeper-user-path.sh 의 ⑥-A·⑥-B probe python
+    스폰 대기 상한(CYS_GATE_PROBE_EXEC_TIMEOUT_SECS · 기본 60초)을 밀폐 픽스처로 박제한다.
+
+    실제 DMG · 실제 hdiutil/spctl/codesign 을 전혀 부르지 않는다(데스크톱 Gatekeeper GUI 프롬프트
+    유발 금지). PATH 선두에 가짜 hdiutil·spctl·codesign·xattr·ditto·uuidgen·xcrun 스텁을 두고,
+    마운트 지점 안의 cys.app/Contents/Resources/runtime/python/bin/python3 에 가짜 인터프리터를
+    심어 `verify-gatekeeper-user-path.sh` 본체를 그대로 실행한다."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.bin_dir = os.path.join(self.root, "fake-bin")
+        os.makedirs(self.bin_dir)
+        self.dmg = os.path.join(self.root, "fake.dmg")
+        with open(self.dmg, "wb") as fh:
+            fh.write(b"fake-dmg-bytes")
+        self._install_fake_macos_tools()
+
+    def tearDown(self):
+        import signal
+        for name in ("child-a.pid", "child-b.pid"):
+            p = os.path.join(self.root, name)
+            if os.path.exists(p):
+                try:
+                    with open(p, encoding="utf-8") as fh:
+                        os.kill(int(fh.read().strip()), signal.SIGKILL)
+                except Exception:
+                    pass
+        self._tmp.cleanup()
+
+    def _write_exec(self, path, body):
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(path, 0o755)
+
+    def _install_fake_macos_tools(self):
+        # fake hdiutil: attach 시 mountpoint 에 합성 cys.app 생성 + FAKE_MNT_PATH 기록
+        self._write_exec(os.path.join(self.bin_dir, "hdiutil"), """#!/usr/bin/env bash
+if [ "${1:-}" = "attach" ]; then
+  mp=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-mountpoint" ]; then mp="$2"; shift 2; else shift; fi
+  done
+  mkdir -p "$mp/cys.app/Contents/Resources/runtime/python/bin"
+  cp "$FAKE_PY_TEMPLATE" "$mp/cys.app/Contents/Resources/runtime/python/bin/python3"
+  chmod 755 "$mp/cys.app/Contents/Resources/runtime/python/bin/python3"
+  printf '%s' "$mp" > "$FAKE_MNT_RECORD"
+  exit 0
+fi
+exit 0
+""")
+        self._write_exec(os.path.join(self.bin_dir, "mount"), """#!/usr/bin/env bash
+if [ -f "${FAKE_MNT_RECORD:-}" ]; then
+  printf '/dev/disk99s1 on %s (hfs, local, read-only, quarantine)\\n' "$(cat "$FAKE_MNT_RECORD")"
+fi
+""")
+        self._write_exec(os.path.join(self.bin_dir, "xattr"), """#!/usr/bin/env bash
+if [ "${1:-}" = "-w" ]; then
+  printf '%s' "$3" > "$FAKE_XATTR_FILE"
+  exit 0
+elif [ "${1:-}" = "-p" ]; then
+  [ -f "$FAKE_XATTR_FILE" ] && cat "$FAKE_XATTR_FILE" && exit 0
+  exit 1
+fi
+exit 0
+""")
+        self._write_exec(os.path.join(self.bin_dir, "ditto"), """#!/usr/bin/env bash
+cp -R "$1" "$2"
+""")
+        self._write_exec(os.path.join(self.bin_dir, "spctl"), """#!/usr/bin/env bash
+echo "$*: accepted source=Notarized Developer ID"
+exit 0
+""")
+        self._write_exec(os.path.join(self.bin_dir, "codesign"), """#!/usr/bin/env bash
+exit "${FAKE_CODESIGN_RC:-0}"
+""")
+        self._write_exec(os.path.join(self.bin_dir, "xcrun"), """#!/usr/bin/env bash
+echo "The validate action worked!"
+exit 0
+""")
+        self._write_exec(os.path.join(self.bin_dir, "uuidgen"), """#!/usr/bin/env bash
+echo "00000000-0000-0000-0000-000000000000"
+""")
+
+    def _run_user_path(self, py_body, timeout_secs="2", extra_env=None, proc_timeout=8):
+        py_tmpl = os.path.join(self.root, "fake-python3.sh")
+        self._write_exec(py_tmpl, py_body)
+        env = dict(os.environ)
+        env["PATH"] = self.bin_dir + ":" + env.get("PATH", "/usr/bin:/bin")
+        env["FAKE_PY_TEMPLATE"] = py_tmpl
+        env["FAKE_MNT_RECORD"] = os.path.join(self.root, "mnt.rec")
+        env["FAKE_XATTR_FILE"] = os.path.join(self.root, "xattr.val")
+        if timeout_secs is not None:
+            env["CYS_GATE_PROBE_EXEC_TIMEOUT_SECS"] = str(timeout_secs)
+        if extra_env:
+            env.update(extra_env)
+        p = subprocess.run(["bash", _USER_PATH_SH, "--quarantine-flags", "0081", self.dmg],
+                           capture_output=True, text=True, env=env, timeout=proc_timeout)
+        return p.returncode, p.stdout + p.stderr
+
+    def test_31_6a_hang_is_bounded_exits2_unmeasured_and_kills_child(self):
+        """G1/G4: ⑥-A probe python 이 상한(2초)보다 오래 멈추면 상한+여유 안에 종료되고,
+        UNMEASURED 사유를 찍으며, exit 2(판정 불가)로 끝나고 자식 프로세스를 남기지 않는다."""
+        import time as _time
+        pid_file = os.path.join(self.root, "child-a.pid")
+        py_body = (
+            "#!/usr/bin/env bash\n"
+            "echo $$ > \"%s\"\n"
+            "exec sleep 30\n"
+        ) % pid_file
+        t0 = _time.monotonic()
+        rc, out = self._run_user_path(py_body, timeout_secs="2", proc_timeout=8)
+        elapsed = _time.monotonic() - t0
+        self.assertEqual(rc, 2, out)
+        self.assertLess(elapsed, 6.0, "대기 상한(2s) 안에 끊기지 않았다: %.2fs\n%s" % (elapsed, out))
+        self.assertIn(
+            "UNMEASURED ⑥-A ★봉인 자기파괴 재현 | Gatekeeper GUI prompt pending or exec held (no result within 2 s)",
+            out, out)
+        self.assertIn("═══ 7 PASS / 0 FAIL / 2 UNMEASURED ═══", out, out)
+        self.assertNotIn("판정: PASS", out, out)
+        self.assertTrue(os.path.exists(pid_file), "가짜 python 이 스폰되지 않았다")
+        with open(pid_file, encoding="utf-8") as fh:
+            child_pid = int(fh.read().strip())
+        with self.assertRaises(ProcessLookupError, msg="타임아웃 후 자식(pid=%d)이 살아 있다" % child_pid):
+            os.kill(child_pid, 0)
+
+    def test_32_6b_hang_is_bounded_exits2_unmeasured_and_kills_child(self):
+        """G1: ⑥-A 는 즉시 통과하고 ⑥-B(PYTHONDONTWRITEBYTECODE=1) 에서만 멈출 때도
+        동일하게 상한 안에 종료되고 UNMEASURED + exit 2 + 자식 정리까지 성립한다."""
+        pid_file = os.path.join(self.root, "child-b.pid")
+        py_body = (
+            "#!/usr/bin/env bash\n"
+            "if [ \"${PYTHONDONTWRITEBYTECODE:-}\" = \"1\" ]; then\n"
+            "  echo $$ > \"%s\"\n"
+            "  exec sleep 30\n"
+            "fi\n"
+            "exit 0\n"
+        ) % pid_file
+        rc, out = self._run_user_path(py_body, timeout_secs="2", proc_timeout=8)
+        self.assertEqual(rc, 2, out)
+        self.assertIn("PASS ⑥-A ★봉인 자기파괴 재현", out, out)
+        self.assertIn(
+            "UNMEASURED ⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1) | Gatekeeper GUI prompt pending or exec held (no result within 2 s)",
+            out, out)
+        self.assertIn("═══ 8 PASS / 0 FAIL / 1 UNMEASURED ═══", out, out)
+        self.assertNotIn("판정: PASS", out, out)
+        with open(pid_file, encoding="utf-8") as fh:
+            child_pid = int(fh.read().strip())
+        with self.assertRaises(ProcessLookupError, msg="⑥-B 타임아웃 후 자식(pid=%d)이 살아 있다" % child_pid):
+            os.kill(child_pid, 0)
+
+    def test_33_control_fast_return_preserves_pass_and_fail_verdicts(self):
+        """G2 대조군: 상한 안에 반환되면 기존 PASS(exit 0) 및 FAIL(exit 1) 출력 줄·종료 코드가 그대로 유지된다."""
+        rc_ok, out_ok = self._run_user_path("#!/usr/bin/env bash\nexit 0\n", timeout_secs="5")
+        self.assertEqual(rc_ok, 0, out_ok)
+        self.assertIn("PASS ⑥-A ★봉인 자기파괴 재현 | .pyc 0→0 · 실행 후에도 봉인 유지", out_ok)
+        self.assertIn("PASS ⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1) | .pyc 0→0 · 봉인 유지", out_ok)
+        self.assertIn("═══ 9 PASS / 0 FAIL ═══", out_ok)
+        self.assertIn("판정: PASS — 브라우저 다운로드 → 드래그 설치 → 첫 실행 경로가 안전하다.", out_ok)
+
+        rc_fail, out_fail = self._run_user_path("#!/usr/bin/env bash\necho boom >&2\nexit 7\n", timeout_secs="5")
+        self.assertEqual(rc_fail, 1, out_fail)
+        self.assertIn("FAIL ⑥-A ★봉인 자기파괴 재현 | 동봉 python 실행 실패(rc=7)", out_fail)
+        self.assertIn("FAIL ⑥-B SEAL-1 완화(PYTHONDONTWRITEBYTECODE=1) | 동봉 python 실행 실패(rc=7)", out_fail)
+        self.assertIn("═══ 7 PASS / 2 FAIL ═══", out_fail)
+        self.assertIn("판정: FAIL — 이 빌드는 실사용자 경로에서 차단될 수 있다. 배포 금지.", out_fail)
+
+        # 자식이 상한 안에 우연히 종료 코드 124 로 즉시 죽은 경우에도 UNMEASURED(exit 2)로 오인하지 않고 FAIL(exit 1) 유지
+        rc_124, out_124 = self._run_user_path("#!/usr/bin/env bash\necho err124 >&2\nexit 124\n", timeout_secs="5")
+        self.assertEqual(rc_124, 1, out_124)
+        self.assertIn("FAIL ⑥-A ★봉인 자기파괴 재현 | 동봉 python 실행 실패(rc=124)", out_124)
+        self.assertNotIn("UNMEASURED", out_124)
+
+    def test_34_invalid_timeout_env_rejected_exit2(self):
+        """음수·0·비정수 CYS_GATE_PROBE_EXEC_TIMEOUT_SECS 는 판정 불가(exit 2)로 즉시 거부된다."""
+        for bad_val in ("0", "-5", "abc"):
+            rc, out = self._run_user_path("#!/usr/bin/env bash\nexit 0\n", timeout_secs=bad_val)
+            self.assertEqual(rc, 2, "bad_val=%r should exit 2: %s" % (bad_val, out))
 
 
 if __name__ == "__main__":
