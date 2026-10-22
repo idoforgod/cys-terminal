@@ -41,6 +41,13 @@
 #   A = 그 env 를 못 타는 경로(셸·훅·pane 에서 도는 python)에서도 번들이 안 깨지는지
 #       = **패키징 층위 불변식**. 서명 전 `compileall` 로 stdlib .pyc 를 봉인에 넣거나
 #       런타임을 봉인 밖으로 빼야 A 가 통과한다. A 는 완화가 아니라 구조로만 닫힌다.
+#   ★⑥-A 환경 격리 — 의도된 판정 변경(2026-10-23 B-437 / G6):
+#     구판(f0ac3b0c)은 호출자 환경에 `PYTHONDONTWRITEBYTECODE=1` 이 설정돼 있으면 ⑥-A 가 이를 그대로
+#     상속받아 실제로는 완화 경로(⑥-B)를 중복 측정했고, 패키징 불변식이 깨진 번들도 ⑥-A PASS(전체 exit 0)로
+#     통과시키는 거짓 양성(false-PASS) 구멍이 있었다. 신판은 ⑥-A 실행 시 `env -u PYTHONDONTWRITEBYTECODE` 로
+#     해당 변수를 명시적으로 제거해 언제나 plain env 계약을 강제한다(호출자 환경에 `PYTHONDONTWRITEBYTECODE=1` 이
+#     있을 때 완화에만 의존하는 번들은 구판 PASS[0] → 신판 ⑥-A FAIL[1] 로 판정이 좁아지는 fail-closed 변경).
+#     ⑥-B 는 종전과 같이 `env PYTHONDONTWRITEBYTECODE=1` 을 명시적으로 부여한다.
 #   ★A·B 모두 **동봉 python 의 종료코드(rc)≠0 이면 그 자리에서 FAIL** 한다(2026-08-01 추가).
 #     실행이 죽으면 ".pyc 개수 불변 + codesign 통과"가 저절로 성립해 버리므로, rc 를 보지 않는
 #     검사는 **측정 불능을 통과로 세는 구멍**이 된다(실측 사례: 격리된 미공증 사본의 nested
@@ -123,13 +130,87 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/gk-user-path.XXXXXX")" || exit 2
 WORK="$(cd "$WORK" && pwd -P)"
 MOUNTS=()
 BOUNDED_PID=""
+
+# $1 = 루트 자식 PID(set -m 으로 자체 PGID=$1 에서 기동됨).
+# 부모만 먼저 TERM 으로 죽이면 TERM 무시(trap '' TERM) 자손이 PID 1(launchd)로 입양되어
+# PPID 기반 pkill -P 에서 누락되므로(codex R1 major 실증):
+#   1) 호출자 자신의 PGID 와 다른지 확인한 뒤, 프로세스 그룹(-g $root) 및 재귀 PPID(-P) 트리를
+#      SIGSTOP 으로 얼리면서 빠짐없이 수집하고(호출자 프로세스 그룹에는 절대 시그널을 보내지 않음),
+#   2) TERM(+CONT) 전파 후 0.2초 유예 뒤 추가 자손을 재수집하여 전체 목록과 격리 그룹에 KILL(+CONT)을 보내며,
+#   3) 루트 wait 및 수집된 모든 자손 PID 가 커널에서 완전히 소멸(kill -0 실패)할 때까지 확인한다.
+kill_owned_tree() {
+  local root="${1:-}"
+  [ -n "$root" ] || return 0
+  local caller_pgid
+  caller_pgid="$(/bin/ps -o pgid= -p $$ 2>/dev/null | tr -d ' ' || true)"
+  local use_pgid=0
+  if [ -n "$caller_pgid" ] && [ "$root" != "$caller_pgid" ] && [ "$root" != "$$" ]; then
+    use_pgid=1
+  fi
+  local -a tree=()
+  local -a queue=("$root")
+  local seen=" "
+  local p c
+  if [ "$use_pgid" -eq 1 ]; then
+    while IFS= read -r c; do
+      [ -n "$c" ] && queue+=("$c")
+    done < <(/usr/bin/pgrep -g "$root" 2>/dev/null || true)
+  fi
+  while [ "${#queue[@]}" -gt 0 ]; do
+    p="${queue[0]}"
+    queue=("${queue[@]:1}")
+    [ -n "$p" ] || continue
+    case "$seen" in *" $p "*) continue ;; esac
+    seen="$seen$p "
+    kill -STOP "$p" 2>/dev/null || true
+    tree+=("$p")
+    while IFS= read -r c; do
+      [ -n "$c" ] && queue+=("$c")
+    done < <(/usr/bin/pgrep -P "$p" 2>/dev/null || true)
+  done
+  [ "${#tree[@]}" -gt 0 ] || return 0
+  if [ "$use_pgid" -eq 1 ]; then
+    kill -TERM -- "-$root" 2>/dev/null || true
+    kill -CONT -- "-$root" 2>/dev/null || true
+  fi
+  kill -TERM "${tree[@]}" 2>/dev/null || true
+  kill -CONT "${tree[@]}" 2>/dev/null || true
+  sleep 0.2 2>/dev/null || sleep 1
+  if [ "$use_pgid" -eq 1 ]; then
+    while IFS= read -r c; do
+      if [ -n "$c" ]; then
+        case "$seen" in *" $c "*) ;; *) seen="$seen$c "; tree+=("$c") ;; esac
+      fi
+    done < <(/usr/bin/pgrep -g "$root" 2>/dev/null || true)
+  fi
+  for p in "${tree[@]}"; do
+    while IFS= read -r c; do
+      if [ -n "$c" ]; then
+        case "$seen" in *" $c "*) ;; *) seen="$seen$c "; tree+=("$c") ;; esac
+      fi
+    done < <(/usr/bin/pgrep -P "$p" 2>/dev/null || true)
+  done
+  if [ "$use_pgid" -eq 1 ]; then
+    kill -KILL -- "-$root" 2>/dev/null || true
+    kill -CONT -- "-$root" 2>/dev/null || true
+  fi
+  kill -KILL "${tree[@]}" 2>/dev/null || true
+  kill -CONT "${tree[@]}" 2>/dev/null || true
+  wait "$root" 2>/dev/null || true
+  local tries=0
+  for p in "${tree[@]}"; do
+    while kill -0 "$p" 2>/dev/null && [ "$tries" -lt 40 ]; do
+      sleep 0.05 2>/dev/null || sleep 1
+      tries=$((tries + 1))
+    done
+  done
+}
+
 cleanup() {
   if [ -n "${BOUNDED_PID:-}" ]; then
-    pkill -TERM -P "$BOUNDED_PID" 2>/dev/null || true
-    kill -TERM "$BOUNDED_PID" 2>/dev/null || true
-    pkill -KILL -P "$BOUNDED_PID" 2>/dev/null || true
-    kill -KILL "$BOUNDED_PID" 2>/dev/null || true
+    local pid="$BOUNDED_PID"
     BOUNDED_PID=""
+    kill_owned_tree "$pid"
   fi
   local m
   for m in "${MOUNTS[@]:-}"; do
@@ -142,7 +223,9 @@ cleanup() {
     rm -rf "$WORK"
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 PASS_N=0
 FAIL_N=0
@@ -159,31 +242,33 @@ bad()        { FAIL_N=$((FAIL_N+1)); printf 'FAIL %s%s\n' "$1" "${2:+ | $2}"; }
 unmeasured() { UNMEASURED_N=$((UNMEASURED_N+1)); printf 'UNMEASURED %s%s\n' "$1" "${2:+ | $2}"; }
 info()       { printf '     %s\n' "$1"; }
 
-# macOS 기본 환경에는 GNU timeout 이 없다(coreutils 미의존). 동봉 python 스폰을 백그라운드로 띄우고
-# PROBE_EXEC_TIMEOUT_SECS 초까지만 기다린 뒤, 아직 살아 있으면 종료(TERM→KILL)하고
-# BOUNDED_TIMED_OUT=1 및 종료 코드 124 를 돌려준다(자식이 스스로 124 로 죽은 경우와 구분).
+# macOS 기본 환경에는 GNU timeout 이 없다(coreutils 미의존). 동봉 python 스폰을 자체 프로세스 그룹(set -m)
+# 백그라운드로 띄우고 PROBE_EXEC_TIMEOUT_SECS 초까지만 기다린 뒤, 아직 살아 있으면 kill_owned_tree 로
+# 자손 트리 전체를 종료(TERM→KILL)·회수하고 BOUNDED_TIMED_OUT=1 및 종료 코드 124 를 돌려준다.
 BOUNDED_TIMED_OUT=0
 run_bounded_py() { # $1=로그파일, 나머지=명령(env/해석기/인자)
   local log="$1"; shift
   BOUNDED_TIMED_OUT=0
+  set -m
   "$@" >"$log" 2>&1 &
   local pid=$!
+  set +m
   BOUNDED_PID="$pid"
-  local elapsed=0
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ "$elapsed" -ge "$PROBE_EXEC_TIMEOUT_SECS" ]; then
-      pkill -TERM -P "$pid" 2>/dev/null || true
-      kill -TERM "$pid" 2>/dev/null || true
-      sleep 0.2 2>/dev/null || sleep 1
-      pkill -KILL -P "$pid" 2>/dev/null || true
-      kill -KILL "$pid" 2>/dev/null || true
-      wait "$pid" 2>/dev/null || true
+  local max_ticks=$((PROBE_EXEC_TIMEOUT_SECS * 5))
+  local ticks=0
+  while kill -0 "$pid" 2>/dev/null || /usr/bin/pgrep -g "$pid" >/dev/null 2>&1; do
+    if [ "$ticks" -ge "$max_ticks" ]; then
       BOUNDED_PID=""
+      kill_owned_tree "$pid"
       BOUNDED_TIMED_OUT=1
       return 124
     fi
-    sleep 1
-    elapsed=$((elapsed + 1))
+    if sleep 0.2 2>/dev/null; then
+      ticks=$((ticks + 1))
+    else
+      sleep 1
+      ticks=$((ticks + 5))
+    fi
   done
   wait "$pid"
   local rc=$?
