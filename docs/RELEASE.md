@@ -407,6 +407,12 @@ bash scripts/release-gate-gatekeeper.sh <DMG | .app>
   rc≠0(1·2 모두)이면 postprocess 전체가 비영 종료해 `--apply` 가 거부된다(fail-closed ·
   측정 불능≠통과 · macOS 밖에서는 판정 불가로 fail-closed). 비상 탈출구
   `--unsafe-skip-gatekeeper`(LOUD 경고 2줄 · 평시 금지).
+  · **기본 실행 레인은 CI 워크플로(`release-postprocess.yml` — 태그 커밋 SHA 에
+    `chore/postprocess-vX.Y.Z` 브랜치를 생성해 발화 · v0.14.51·v0.14.52 관행)다.** 로컬 맥에서
+    돌리면 ⑥ 의 격리된 비번들(`NOT_A_BUNDLE`) probe python 첫 실행에 Gatekeeper GUI 확인창이
+    떠 멈출 수 있으며, 이제 `verify-gatekeeper-user-path.sh` 가 대기 상한(기본 60초 ·
+    `CYS_GATE_PROBE_EXEC_TIMEOUT_SECS`) 초과 시 해당 축을 `UNMEASURED` 사유와 함께
+    **exit 2(판정 불가)** 로 닫는다(B-437).
 
 > 인증서가 없을 때(개발용): env 없이 `bun x @tauri-apps/cli build` → ad-hoc 빌드. 이 빌드는
 > **다른 맥 전송 시 "손상됨"**이 뜨므로, 받은 맥에서 `xattr -dr com.apple.quarantine

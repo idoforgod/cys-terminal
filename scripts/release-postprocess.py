@@ -144,11 +144,24 @@ def gatekeeper_gate(outdir, version, unsafe_skip=False,
             cmds.append(["bash", user_path_script, dmg])
         for cmd in cmds:
             print("  → %s %s" % (os.path.basename(cmd[1]), os.path.basename(dmg)), flush=True)
-            rc = run(cmd).returncode
+            try:
+                res = run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            except TypeError:
+                res = run(cmd)
+            out = getattr(res, "stdout", None) or ""
+            if out:
+                sys.stdout.write(out)
+                sys.stdout.flush()
+            rc = res.returncode
             if rc != 0:
+                cause = ""
+                if rc == 2 and cmd[1] == user_path_script and out:
+                    tail = [ln.strip() for ln in out.splitlines() if ln.strip()][-3:]
+                    if tail:
+                        cause = " · 사유: %s" % " / ".join(tail)
                 print("::error::Gatekeeper 게이트 차단 rc=%d (%s · %s) — 1=FAIL·2=판정 불가, "
-                      "둘 다 발행 금지(--apply 거부)"
-                      % (rc, os.path.basename(cmd[1]), os.path.basename(dmg)), file=sys.stderr)
+                      "둘 다 발행 금지(--apply 거부)%s"
+                      % (rc, os.path.basename(cmd[1]), os.path.basename(dmg), cause), file=sys.stderr)
                 return rc
     print("  ✓ Gatekeeper 게이트 통과 — DMG 2종(네이티브 %s 는 사용자 경로 재현 ⑥ 포함)" % native_arch)
     return 0
