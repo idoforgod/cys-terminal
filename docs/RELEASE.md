@@ -176,6 +176,7 @@ pack_version은 빌드 시점 `CARGO_PKG_VERSION`에 용접돼 있어(`cys.rs bu
      이 **모두 success** 여야 한다(0.14.43 부터 `windows-health` 포함 — 태그 레인의 `windows-health-gate` 가 같은 SHA 의
      windows-health 완주 런을 요구하므로, 이 워크플로를 안 보면 4종이 rc=0 이어도 태그 레인이 죽는다).
      진행 중·런 없음·실패·취소는 전부 rc=1(태그 금지), 네트워크·API 한도는 rc=2(판정 불가 — 통과 아님).
+   - (0.14.52 · W-GATE) `windows-build` now runs the packaged `cys.exe --help` dry run (step `Packaged cys.exe --help gate (default stack · blocking · before upload)`) with the SAME run body as the blocking `release.yml` Windows step, so this check makes it a tag condition; it is a SEPARATE build instance (built without `--target`) and does NOT replace the in-release step (CEO ruling 2026-10-22).
    - **gh 불필요**: 공개 저장소의 Actions 런·잡 목록은 인증 없이 조회된다(익명 한도 시간당 60회).
      `--wait N` 은 진행 중인 런을 60초 간격으로 최대 N분 기다리고, 실패한 런은 잡·스텝·annotation 을 보여 준다.
      `ci-branch` 의 macOS 데몬 시험 단계가 붉으면 annotation 첫 줄이 `failed=N — <실패한 시험 이름…>` 이다(이름순 최대 20개 ·

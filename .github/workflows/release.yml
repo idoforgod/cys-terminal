@@ -1023,6 +1023,55 @@ jobs:
           }
           Write-Host "VERSIONINFO 게이트 통과: 3종 전부 수치 버전 == $expected"
 
+      # W-GATE (0.14.52 · CEO ruling 2026-10-22, release condition 2): run the EXACT sidecar file the NSIS installer packed in
+      #   the build step above (scripts/bundle-prep.sh copies the release cys.exe to this path; tauri-action below only
+      #   collects and uploads, tauriScript 'true') with three parser-heavy --help calls at the DEFAULT stack. Any non-zero
+      #   native exit fails this leg BEFORE any upload (0xC00000FD = stack overflow; the debug build does that on this
+      #   runner - windows-health "스택 넘침 측정"). BLOCKING on purpose: no continue-on-error. RUST_MIN_STACK is removed
+      #   (it only sizes spawned threads, but nothing should pretend to help). The native exit comes from $LASTEXITCODE,
+      #   never from Git bash (which folds 0xC00000FD to 127). windows-build.yml runs the SAME body as the pre-tag dry run;
+      #   scripts/tests/test_release_windows_help_gate.py pins both.
+      - name: Packaged cys.exe --help gate (default stack · blocking · before upload)
+        if: matrix.platform == 'windows-latest'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          Remove-Item Env:RUST_MIN_STACK -ErrorAction SilentlyContinue
+          try { [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false) } catch { Write-Host "[help-gate] console encoding unchanged (display only): $_" }
+          $exe = 'src-tauri/binaries/cys-x86_64-pc-windows-msvc.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            Write-Host "::error title=packaged cys.exe help gate::$exe is missing - the installer's sidecar was not built at this path"
+            exit 1
+          }
+          $full = (Resolve-Path -LiteralPath $exe).Path
+          Write-Host "[help-gate] $exe sha256=$((Get-FileHash -Algorithm SHA256 -LiteralPath $full).Hash)"
+          $failed = @()
+          foreach ($argv in @(@('--help'), @('queue', '--help'), @('queue', 'list', '--help'))) {
+            $label = $argv -join ' '
+            $global:LASTEXITCODE = $null
+            $ErrorActionPreference = 'Continue'
+            try { $out = & $full @argv 2>&1 } catch { $out = @("launch error: $_") }
+            $code = $LASTEXITCODE
+            $ErrorActionPreference = 'Stop'
+            if ($null -eq $code) {
+              Write-Host "[help-gate] cys.exe $label native-exit=UNMEASURED (no exit code)"
+              $failed += "${label}: UNMEASURED"
+              continue
+            }
+            $hex = '0x{0:X8}' -f $code
+            Write-Host "[help-gate] cys.exe $label native-exit=$hex"
+            @($out) | Select-Object -First 3 | ForEach-Object { Write-Host "[help-gate]   | $_" }
+            if ($code -ne 0) { $failed += "${label}: $hex" }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Host "::error title=packaged cys.exe help gate::non-zero native exit at the default stack: $($failed -join '; ') - this build must not be uploaded"
+            exit 1
+          }
+          Write-Host "[help-gate] all three exited 0x00000000 at the default stack"
+          exit 0
+
       # tauri build → beforeBuildCommand(bundle-prep.sh)가 UI 번들 + cys/cysd 릴리스 빌드 + externalBin
       # 배치 → 번들(dmg/app) → createUpdaterArtifacts(.app.tar.gz + .sig + latest.json) → 비공개 repo 릴리스 업로드.
       # Windows: NSIS setup.exe + .sig — tauri-action이 같은 릴리스의 latest.json에 platforms.windows-x86_64를 병합.
