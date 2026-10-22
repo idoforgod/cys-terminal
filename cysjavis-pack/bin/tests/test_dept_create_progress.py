@@ -1686,5 +1686,76 @@ class Census(unittest.TestCase):
         self.assertIn('dept_reserve_grace 2>/dev/null', seg, "예약 유예는 reap 에서 한 번 계산하고 경고는 버린다")
 
 
+
+class DeptCapDefaultUnlimited(unittest.TestCase):
+    """B1(0.14.53 · 오너 2026-10-22 「부서 만들기 무한으로 하고, 제약을 해제해」): 살아 있는 팀 수 상한은 **기본 무제한**이다.
+    두 자리(allocate 의 번호 예약 · create 의 카탈로그 NEW 예약)가 같은 규칙이다 — CYS_DEPT_CAP 미설정·빈 값·0 이면 살아 있는 팀이 몇이든 거부하지
+    않고, 0보다 큰 N 을 주면 살아 있는 팀이 N 이상일 때 exit 8(등재·스폰 0). 살아 있는 팀 = 소켓 파일이 있는 등록(목 ping 이 생존으로 본다)."""
+
+    VERBS = (("allocate",), ("create", "k1"))
+    LIVE = 8   # 종전 기본 상한(8)과 같은 수 — 종전 코드는 여기서 9번째 팀을 거부했다
+
+    def sandbox(self, **env):
+        sb = Sandbox(STUB_PING_OK_FROM=UP_AT_PING, **env)
+        self.addCleanup(sb.cleanup)
+        depts = {}
+        for i in range(1, self.LIVE + 1):
+            name = "dept-%d" % i
+            os.makedirs(sb.logdir(name), exist_ok=True)
+            open(sb.sock(name), "w").close()
+            depts[name] = {"socket": sb.sock(name), "pack_dir": os.path.join(sb.home, ".cys", "pack-dept-%s" % name),
+                           "role": "dept-master", "mission_key": "other-%d" % i, "cwd": sb.home,
+                           "account_dir": os.path.join(sb.home, "acct"), "reserved_at": time.time() - 3600}
+        sb.write_reg(depts)
+        sb.seed_catalog("k1", "m1")   # create 는 mission_key m1 이 등재에 없으니 NEW 갈래(cap 검사 자리)로 간다
+        return sb
+
+    def assert_not_refused(self, sb, args, rc, out, err):
+        self.assertNotIn("live 부서 수", err, "%s: 살아 있는 팀 수로 거부했다" % args[0])
+        self.assertEqual(rc, 0, "%s: rc=%s err=%s" % (args[0], rc, err[-800:]))
+        self.assertEqual(last_line(out), "dept-9", "%s: 9번째 팀 이름이 아니다" % args[0])
+        self.assertIn("dept-9", sb.read_reg(), "%s: 9번째 팀 등재가 없다" % args[0])
+
+    def test_unset_cap_never_refuses_on_live_count(self):
+        for args in self.VERBS:
+            with self.subTest(args[0]):
+                sb = self.sandbox()
+                self.assertNotIn("CYS_DEPT_CAP", sb.env)
+                self.assert_not_refused(sb, args, *sb.run(*args))
+
+    def test_empty_and_zero_cap_mean_unlimited(self):
+        for cap in ("", "0"):
+            for args in self.VERBS:
+                with self.subTest(verb=args[0], CYS_DEPT_CAP=cap):
+                    sb = self.sandbox(CYS_DEPT_CAP=cap)
+                    self.assert_not_refused(sb, args, *sb.run(*args))
+
+    def test_positive_cap_refuses_at_live_ge_n_with_exit_8(self):
+        word = {"allocate": "allocate 거부", "create": "create NEW 거부"}
+        for args in self.VERBS:
+            with self.subTest(args[0]):
+                sb = self.sandbox(CYS_DEPT_CAP=str(self.LIVE))
+                before = sb.read_reg()
+                rc, out, err = sb.run(*args)
+                self.assertEqual(rc, 8, "%s: rc=%s err=%s" % (args[0], rc, err[-800:]))
+                self.assertIn("[cys-dept] %s: live 부서 수 %d ≥ CYS_DEPT_CAP=%d" % (word[args[0]], self.LIVE, self.LIVE), err)
+                self.assertEqual(sb.read_reg(), before, "%s: 거부했는데 등재가 바뀌었다" % args[0])
+                self.assertFalse(sb.spawned("dept-9"), "%s: 거부했는데 데몬을 띄웠다" % args[0])
+                self.assertEqual(last_line(out), "", "%s: 거부했는데 stdout 에 이름이 나왔다" % args[0])
+
+    def test_positive_cap_above_live_count_still_creates(self):
+        for args in self.VERBS:
+            with self.subTest(args[0]):
+                sb = self.sandbox(CYS_DEPT_CAP=str(self.LIVE + 1))
+                self.assert_not_refused(sb, args, *sb.run(*args))
+
+    def test_both_sites_carry_the_same_rule(self):
+        src = _read(DEPT)
+        reads = re.findall(r'^    CAP=int\(os\.environ\.get\("CYS_DEPT_CAP","0"\) or 0\)', src, re.M)
+        guards = re.findall(r"^    if CAP>0 and live>=CAP:$", src, re.M)
+        self.assertEqual((len(reads), len(guards)), (2, 2), "두 자리(allocate·create)가 같은 규칙이 아니다")
+        self.assertNotIn('get("CYS_DEPT_CAP","8")', src, "종전 기본 8 이 남아 있다")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

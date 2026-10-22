@@ -93,7 +93,13 @@ describe("buildTeamConfirm — 확인 창 문구(오너가 본 내용 = 만들�
 
 describe("teamCreateErrorText — 생성 실패 사유(무음 실패 금지)", () => {
   test("상한(8)·형식(2)·계정(5)·그 외", () => {
-    expect(teamCreateErrorText("dept-create:8:[cys-dept] allocate 거부")).toContain("8");
+    // ★오너 2026-10-22: 상한은 기본 무제한 — exit 8 문구는 고정 숫자 8 이 아니라 CYS_DEPT_CAP 을 말하고, 실제 수는 cys-dept stderr(detail)가 보인다.
+    const capped = teamCreateErrorText(
+      "dept-create:8:[cys-dept] allocate 거부: live 부서 수 3 ≥ CYS_DEPT_CAP=3 (hard cap·죽은등록 제외)",
+    );
+    expect(capped).toContain("팀 수 상한(CYS_DEPT_CAP)");
+    expect(capped).not.toContain("상한(8)");
+    expect(capped).toContain("live 부서 수 3 ≥ CYS_DEPT_CAP=3");
     expect(teamCreateErrorText("dept-create:2:bad")).toContain("형식");
     expect(teamCreateErrorText("dept-create:5:acct")).toContain("로그인 폴더");
     expect(teamCreateErrorText("some other error")).toContain("some other error");

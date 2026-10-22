@@ -15,7 +15,8 @@
   T6 같은 토큰 재실행 → 데몬 token_consumed + inspect(같은 좌석·created) → **새 팀 0** · 같은 이름 · exit 0
   T7 재실행인데 settle 이 빠진 상태(consumed) → 멱등 보고 + settle created 재시도
   T8 재실행인데 다른 좌석(same_seat=false) → exit 7(보고도 하지 않는다)
-  T9 생성 실패(cap 초과 exit 8) → exit 8 그대로 + settle failed --code 8 · 등재 0
+  T9 생성 실패(cap 초과 exit 8 — CYS_DEPT_CAP=1 · 살아 있는 팀 1개) → exit 8 그대로 + settle failed --code 8 · 새 등재 0
+  T9b 상한 기본 무제한(오너 2026-10-22) — CYS_DEPT_CAP 미설정·0 이면 살아 있는 팀 8개여도 거부 없이 생성(dept-9)
   T10 데몬 통과 응답의 명세가 제안 id 와 어긋남 → 만들지 않음(exit 7) + settle failed
   T11 인자 과다 → exit 2 · 데몬에 묻기 전(소비 0)
   T12 env 주입 — 외부에서 export 한 `_CYS_TT_*` 는 관문 통과로 읽히지 않는다(위조 토큰 · 카탈로그 create 둘 다)
@@ -292,17 +293,55 @@ class T8RerunOtherSeat(Base):
         self.assertIn("token_consumed", err2)
 
 
+def seed_live_depts(home, env, n):
+    """살아 있는 팀 n개를 등재한다(dept-1..n) — 소켓 파일이 있으면 목 `cys ping` 이 생존으로 본다(cap 은 살아 있는 데몬만 센다)."""
+    depts = {}
+    for i in range(1, n + 1):
+        name = "dept-%d" % i
+        sk = os.path.join(home, ".local", "state", "cys-dept-%s" % name, "cys.sock")
+        os.makedirs(os.path.dirname(sk), exist_ok=True)
+        open(sk, "w").close()
+        depts[name] = {"socket": sk, "pack_dir": os.path.join(home, ".cys", "pack-dept-%s" % name), "role": "dept-master"}
+    with open(env["CYS_DEPTS_JSON"], "w", encoding="utf-8") as f:
+        json.dump({"depts": depts}, f, ensure_ascii=False)
+    return depts
+
+
 class T9CreateFails(Base):
     def test_create_failure_passes_rc_and_settles_failed(self):
+        # ★오너 2026-10-22: CYS_DEPT_CAP=0 은 이제 '무제한'이다 — cap 경로는 오너가 준 양수 상한으로 잰다(1 · 살아 있는 팀 1개).
+        seeded = seed_live_depts(self.home, self.env, 1)
         rc, out, err = self.run_dept("create", "--team-token", TOKEN, TT_CONSUME_OUT=consume_ok(), TT_CONSUME_RC=0,
-                                     CYS_DEPT_CAP=0)
+                                     CYS_DEPT_CAP=1)
         self.assertEqual(rc, 8, "cap 초과 rc 가 전파되지 않았다: rc=%s err=%s" % (rc, err[-800:]))
-        self.assertEqual(read_reg(self.env), {}, "실패했는데 등재가 남았다")
+        self.assertIn("live 부서 수 1 ≥ CYS_DEPT_CAP=1", err, "cap 거부 사유가 아니다")
+        self.assertEqual(sorted(read_reg(self.env)), sorted(seeded), "실패했는데 새 등재가 남았다")
         settles = self.tt_calls("settle")
         self.assertEqual(len(settles), 1, settles)
         self.assertIn("--outcome failed", settles[0])
         self.assertIn("--code 8", settles[0])
         self.assertIn("제안은 그대로 남아 있습니다", err, "§10 생성 실패 문구 꼬리가 없다")
+
+
+class T9bCapDefaultUnlimited(Base):
+    """B1: 상한 기본 무제한 — CYS_DEPT_CAP 미설정·0 이면 살아 있는 팀 수로 거부하지 않는다(종전 기본 8 이 막던 9번째 팀)."""
+
+    def _create_ninth(self, **extra):
+        seed_live_depts(self.home, self.env, 8)
+        rc, out, err = self.run_dept("create", "--team-token", TOKEN, TT_CONSUME_OUT=consume_ok(), TT_CONSUME_RC=0, **extra)
+        self.assertNotIn("live 부서 수", err, "살아 있는 팀 수로 거부했다")
+        self.assertEqual(rc, 0, "9번째 팀 생성 실패: rc=%s err=%s" % (rc, err[-1200:]))
+        self.assert_created_once(out, name="dept-9")
+        settles = self.tt_calls("settle")
+        self.assertEqual(len(settles), 1, settles)
+        self.assertIn("--outcome created", settles[0])
+
+    def test_unset_cap_does_not_refuse_at_8_live(self):
+        self.assertNotIn("CYS_DEPT_CAP", self.env)
+        self._create_ninth()
+
+    def test_zero_cap_means_unlimited(self):
+        self._create_ninth(CYS_DEPT_CAP=0)
 
 
 class T10Inconsistent(Base):

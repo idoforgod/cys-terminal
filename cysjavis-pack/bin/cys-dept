@@ -2354,9 +2354,9 @@ try:
         try: return subprocess.run([os.environ.get("CYS_BIN","cys"),"ping"], env={**os.environ,"CYS_SOCKET":sk},
                                    capture_output=True, timeout=3).returncode==0
         except Exception: return False
-    CAP=int(os.environ.get("CYS_DEPT_CAP","8"))
+    CAP=int(os.environ.get("CYS_DEPT_CAP","0") or 0)  # ★오너 2026-10-22: 부서 수 무제한 — 오너가 CYS_DEPT_CAP 를 직접 줄 때만 상한
     live=sum(1 for e in depts.values() if _alive_sk(e.get('socket','')))
-    if live>=CAP:
+    if CAP>0 and live>=CAP:
         sys.stderr.write("[cys-dept] allocate 거부: live 부서 수 %d ≥ CYS_DEPT_CAP=%d (hard cap·죽은등록 제외)\n"%(live,CAP)); sys.exit(8)
     used={int(m.group(1)) for k in depts if (m:=re.match(r'^dept-(\d+)$',k))}
     def _dept_sk(n):  # RC-6: OS별 부서 소켓(dept_sock 규약 미러) — Windows named pipe·unix .sock
@@ -2710,9 +2710,9 @@ try:
         print("REUSE_DEAD "+n); sys.exit(0)
     # ★[2] hard cap(NEW 분기만·reserve flock 안 — 동시성·원자성 유지): REUSE는 면제, 죽은(미reap) 등록은
     #   빼고 ★살아있는 데몬만 카운트(상단 alive_sock 재사용) — 신규 예약 전 live 수 ≥ cap 거부(exit 8).
-    CAP=int(os.environ.get("CYS_DEPT_CAP","8"))
+    CAP=int(os.environ.get("CYS_DEPT_CAP","0") or 0)  # ★오너 2026-10-22: 부서 수 무제한 — 오너가 CYS_DEPT_CAP 를 직접 줄 때만 상한
     live=sum(1 for e in depts.values() if alive_sock(e.get('socket','')))
-    if live>=CAP:
+    if CAP>0 and live>=CAP:
         sys.stderr.write("[cys-dept] create NEW 거부: live 부서 수 %d ≥ CYS_DEPT_CAP=%d (hard cap·죽은등록 제외)\n"%(live,CAP)); sys.exit(8)
     # 신규 예약(lowest-unused·소켓 점유 번호 skip) — mission_key+reserved_at+메타 즉시 원자기록
     used={int(m.group(1)) for k in depts if (m:=re.match(r'^dept-(\d+)$',k))}

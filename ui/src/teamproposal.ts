@@ -111,7 +111,8 @@ export function teamCreateErrorText(e: unknown): string {
   if (!m) return msg.slice(0, 400);
   const code = parseInt(m[1], 10);
   const detail = m[2].trim().slice(0, 300);
-  if (code === 8) return `팀 수 상한(8)에 도달했습니다 — 쓰지 않는 팀을 정리한 뒤 다시 시도하세요. (${detail})`;
+  // ★오너 2026-10-22: 팀 수 상한은 기본 무제한이다 — exit 8 은 오너가 CYS_DEPT_CAP(0보다 큰 값)을 준 경우뿐이라 고정 숫자를 말하지 않는다(실제 수는 detail).
+  if (code === 8) return `팀 수 상한(CYS_DEPT_CAP)에 도달했습니다 — 쓰지 않는 팀을 정리하거나 상한을 올린 뒤 다시 시도하세요. (${detail})`;
   if (code === 2) return `제안 형식 오류이거나 제안이 이미 처리·변경됐습니다 — 카드를 다시 확인하세요. (${detail})`;
   if (code === 5) return `팀 전용 로그인 폴더를 준비하지 못했습니다(계정 격리 불가). (${detail})`;
   return `(${code}) ${detail}`;

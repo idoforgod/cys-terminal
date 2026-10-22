@@ -1330,7 +1330,7 @@ class _Log:
                                     "재선언하세요. 새 부서가 목적이면 대표에게 말로 부탁해 "
                                     "`cys team-propose` 로 제안하거나, 오너가 GUI '전문가용 › 팀 직접 "
                                     "만들기'·`cys-dept allocate` 를 쓰세요.",
-                STEP.DEPT_FB_ALLOC: "부서 자동 생성 실패 — 부서 상한(CYS_DEPT_CAP 기본 8)·~/.cys/depts.json 을 확인하세요.",
+                STEP.DEPT_FB_ALLOC: "부서 자동 생성 실패 — 부서 상한(CYS_DEPT_CAP · 기본 무제한 — 오너가 0보다 큰 값을 줄 때만 상한)·~/.cys/depts.json 을 확인하세요.",
                 STEP.DEPT_FB_MASTER: "부서는 생성됐지만 부서장 기동 실패 — 그 부서 pane에서 claude 실행 후 '너는 마스터다' 선언(훅 자동 부트) 또는 부서 pane 안에서 cys launch-agent --role master --agent claude 로 재시도하세요.",
                 STEP.BOOT: "팀(CSO·워커·리뷰어) 기동 실패 — claude CLI 설치를 확인하세요.",
                 STEP.CHECK: "팀 노드가 제 시간에 안 떴습니다 — cys list로 확인하고 필요시 재선언하세요.",
@@ -1754,7 +1754,7 @@ def _await_dept_ticket(dept, budget_s=None, interval_s=None, sleeper=None, clock
 # ★폭주 봉인(ABSOLUTE ANCHOR ①): 이 폴백에 도달하려면 이미 ⓐ훅 allowlist(master|미claim pane 만
 #   발화) ⓑmachine-origin 게이트(오너 타이핑 판정 — 기계 배달 선언은 스폰 자체가 없다) ⓒ레인
 #   싱글플라이트 락을 전부 통과한 상태다. 여기에 ⓓsurface별 멱등 맵(재선언=기존 부서 재사용)
-#   ⓔcys-dept allocate 의 live-count 상한(CYS_DEPT_CAP 기본 8) ⓕunix 한정(Windows 는 안내만 —
+#   ⓔcys-dept allocate 의 live-count 상한(CYS_DEPT_CAP · 기본 무제한 — 오너가 0보다 큰 값을 줄 때만 상한) ⓕunix 한정(Windows 는 안내만 —
 #   설치파일 신중 앵커)을 얹는다. 에이전트끼리 선언 문구를 주고받아 부서가 증식하는 경로는
 #   ⓑ가 원천 차단한다(배달 원장 해시·라벨 기반 — 원장 밖 동일 UID 위조는 기존 잔여위험과 동일).
 #
@@ -1967,7 +1967,7 @@ def _dept_fallback(log, claim_out):
             #   공유 boot-last 를 덮으면 다음 세션의 §0 이 '최신 완주 런 실패'로 읽고 재부트를
             #   churn 한다. 성공 경로의 ok=None 과 대칭으로 실패도 귀속 상태만 남긴다.
             return log.fail(STEP.DEPT_FB_ALLOC, code or 1,
-                            "부서 생성 실패(allocate exit %s · name=%r). 상한(CYS_DEPT_CAP 기본 8) 도달"
+                            "부서 생성 실패(allocate exit %s · name=%r). 상한(CYS_DEPT_CAP · 기본 무제한 — 오너가 0보다 큰 값을 줄 때만 상한) 도달"
                             " 여부·레지스트리(~/.cys/depts.json)를 확인하라.\n%s%s" % (code, name, out[-800:], err[-800:]),
                             EXIT_BOOT, ok=None, state="dept_fallback_failed")
 
@@ -2348,10 +2348,29 @@ def _live_node_count():
     return n
 
 
+def _nodes_only_hard(gate_json):
+    """순수: 자원 게이트의 hard 트립이 **하나 이상이고 전부** nodes(노드 '개수' 대리지표)인가 — 참이면 팀 기동을 막지 않는다.
+
+    ★오너 직접 지시 2026-10-22 「부서 만들기 무한으로 하고, 제약을 해제해. 내가 자원보고 조절할 것이다.」
+      실자원 축(servers·fleet_cpu_ratio·context_pct·formation_budget)이 하나라도 hard 면 거짓(종전대로 차단).
+      오너가 CYS_FORMATION_NODES_HARD=1 을 주면 거짓(종전대로 nodes 로도 차단).
+    ★javis_formation._nodes_only_hard 와 **같은 판정**이다. 사본이 둘인 까닭: 이 파일이 javis_formation 을
+      import 하면 그 모듈의 import 시 부수효과(sys.path.insert(0, bin) · stdout 재구성)가 부트 프로세스로
+      번진다(위 형제 import 가드는 append 만 쓴다). 두 사본은 tests/test_bootstrap_resource_recheck.py (o) 가
+      같은 판정표로 묶는다. 이 함수는 출력하지 않는다 — 가청 한 줄은 호출부(_run_resource_gate)가 낸다."""
+    if os.environ.get("CYS_FORMATION_NODES_HARD") == "1":
+        return False
+    if not isinstance(gate_json, dict):
+        return False
+    hard = [t for t in (gate_json.get("trips") or []) if isinstance(t, dict) and t.get("level") == "hard"]
+    return bool(hard) and all(t.get("metric") == "nodes" for t in hard)
+
+
 def _resource_gate_decision(gate_exit, gate_json, live_node_count):
     """순수 판정: 자원 게이트 exit·json·라이브 노드 수 → (verdict, 사유).
-    verdict ∈ allow|soft|hard-overcount|hard-block|usage-error|unknown-exit.
-      exit 0=allow · 1=soft · 2=hard(단, nodes-only hard이고 라이브 노드<유효임계면 과계수→overcount로 무효화).
+    verdict ∈ allow|soft|hard-overcount|nodes-only|hard-block|usage-error|unknown-exit.
+      exit 0=allow · 1=soft · 2=hard(단, nodes-only hard이고 라이브 노드<유효임계면 과계수→overcount로 무효화 ·
+      그 밖의 nodes-only hard 는 nodes-only=가청 진행(오너 2026-10-22 · CYS_FORMATION_NODES_HARD=1 이면 종전 hard-block)).
 
     ★A13(W2 · 하드 제약 8) — 미지 exit 의 fail-open 제거:
       종전 반환은 **모든** 미지 exit 를 'allow(보수적 진행)'로 접었다. 그 결과 게이트가
@@ -2383,6 +2402,11 @@ def _resource_gate_decision(gate_exit, gate_json, live_node_count):
                 return "hard-overcount", (
                     "nodes hard(ps=%s)이나 라이브 노드 %d < 유효임계 %s — ps 과계수 결함으로 판단, "
                     "1회 경고 후 진행" % (nodes_hard[0].get("value"), live_node_count, eff))
+        if _nodes_only_hard(gate_json):
+            return "nodes-only", (
+                "자원 게이트 hard 원인 = nodes %s/%s 하나뿐 — 오너 2026-10-22 지시로 팀 기동 진행"
+                "(실자원 축은 그대로 차단 · 되돌리려면 CYS_FORMATION_NODES_HARD=1)"
+                % (nodes_hard[0].get("value"), nodes_hard[0].get("hard")))
         detail = ", ".join("%s=%s" % (t.get("metric"), t.get("value")) for t in hard) or "미상"
         return "hard-block", "자원 hard_block(트립: %s) — 팀 기동 거부" % detail
     return "unknown-exit", (
@@ -3188,6 +3212,11 @@ def _run_resource_gate(py, log):
     if verdict == "hard-overcount":
         _progress("⚠ 자원 nodes hard(과계수 결함으로 판단) — cys list 교차확인 후 1회 경고·진행: " + why)
         _notify_loud("자원 게이트 nodes 과계수 경고", why)
+    elif verdict == "nodes-only":
+        # ★오너 2026-10-22: nodes(개수) 단독 hard 는 팀 기동을 막지 않는다 — 가청 한 줄 후 진행(javis_formation 과 같은 규칙).
+        #   _notify_loud 는 쓰지 않는다: 그 채널은 실패용(feed kind bootstrap-fail · 폴백 문면 「[부트 중단]」)이라 진행을
+        #   중단으로 잘못 알린다. 판정·사유는 위 RESOURCE_GATE 단계 기록(boot-last)에도 남는다.
+        _progress("⚠ " + why)
     elif verdict == "soft":
         # 매번 경고 후 진행(디바운스 없음) — 결손 0이면 게이트 자체를 생략하므로
         # 이 경고는 실팀기동 시에만 발생한다: 소음 아니라 신호(설계 v0.3 판정).
@@ -4331,12 +4360,25 @@ def cmd_self_test():
                       "measured": {"nodes_hard_effective": 18}}
         assert _resource_gate_decision(2, nodes_hard, 5)[0] == "hard-overcount", \
             "nodes 과계수(라이브 5<18) 미무효화"
-        # nodes hard인데 라이브 노드가 임계 이상 → genuine block(과계수 아님)
-        assert _resource_gate_decision(2, nodes_hard, 20)[0] == "hard-block", \
-            "라이브 노드 20>=18인데 과계수로 오무효화"
-        # 라이브 노드 측정 불가(None) → 교차확인 불가 → genuine block(보수)
-        assert _resource_gate_decision(2, nodes_hard, None)[0] == "hard-block", \
-            "라이브 측정 불가 시 보수적 block 아님"
+        # ★오너 2026-10-22 「제약을 해제해」: 과계수가 아닌 nodes 단독 hard 는 nodes-only(가청 진행)다 —
+        #   라이브 노드가 임계 이상이어도(20>=18) · 라이브 측정 불가(None)여도. CYS_FORMATION_NODES_HARD=1 이면 종전 block.
+        _prev_nh = os.environ.pop("CYS_FORMATION_NODES_HARD", None)
+        try:
+            assert _resource_gate_decision(2, nodes_hard, 20)[0] == "nodes-only", \
+                "nodes 단독 hard(라이브 20>=18)가 진행(nodes-only)이 아님 — 오너 2026-10-22 지시 회귀"
+            assert _resource_gate_decision(2, nodes_hard, None)[0] == "nodes-only", \
+                "nodes 단독 hard(라이브 측정 불가)가 진행(nodes-only)이 아님"
+            os.environ["CYS_FORMATION_NODES_HARD"] = "1"
+            assert _resource_gate_decision(2, nodes_hard, 20)[0] == "hard-block", \
+                "CYS_FORMATION_NODES_HARD=1 인데 nodes hard(라이브 20>=18)가 차단되지 않음"
+            assert _resource_gate_decision(2, nodes_hard, None)[0] == "hard-block", \
+                "CYS_FORMATION_NODES_HARD=1 인데 라이브 측정 불가 시 보수적 block 아님"
+            assert _resource_gate_decision(2, nodes_hard, 5)[0] == "hard-overcount", \
+                "CYS_FORMATION_NODES_HARD=1 에서 과계수 무효화(라이브 5<18)가 사라짐"
+        finally:
+            os.environ.pop("CYS_FORMATION_NODES_HARD", None)
+            if _prev_nh is not None:
+                os.environ["CYS_FORMATION_NODES_HARD"] = _prev_nh
         # nodes+servers 복합 hard → nodes 과계수 무효화 불가(servers는 실자원) → block
         mixed = {"trips": [{"metric": "nodes", "level": "hard", "value": 22},
                            {"metric": "servers", "level": "hard", "value": 5}],

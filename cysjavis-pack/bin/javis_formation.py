@@ -534,6 +534,24 @@ def _gate_json(out):
     return obj if isinstance(obj, dict) else None
 
 
+def _nodes_only_hard(gate_json):
+    """★오너 직접 지시 2026-10-22 「부서 만들기 무한으로 하고, 제약을 해제해. 내가 자원보고 조절할 것이다.」
+    부서 편성은 노드 '개수' 대리지표로 막지 않는다 — hard 원인이 nodes 하나뿐이면 가청(loud) 진행한다.
+    실자원 축(servers·fleet_cpu_ratio·context_pct·formation_budget)이 hard 면 종전대로 막는다.
+    오너가 CYS_FORMATION_NODES_HARD=1 을 주면 종전대로 nodes 로도 막는다."""
+    if os.environ.get("CYS_FORMATION_NODES_HARD") == "1":
+        return False
+    if not isinstance(gate_json, dict):
+        return False
+    hard = [t for t in (gate_json.get("trips") or []) if isinstance(t, dict) and t.get("level") == "hard"]
+    if not hard or any(t.get("metric") != "nodes" for t in hard):
+        return False
+    sys.stderr.write("[formation] 자원 게이트 hard 원인 = nodes %s/%s 하나뿐 — 오너 2026-10-22 지시로 편성 진행"
+                     "(실자원 축은 그대로 차단 · 되돌리려면 CYS_FORMATION_NODES_HARD=1)\n"
+                     % (hard[0].get("value"), hard[0].get("hard")))
+    return True
+
+
 def _resource_verdict(socket):
     """javis_resource_gate.py check → (ok, gate). ok=False 는 pending-resource(hard) · gate 는 그 판정을
     낸 호출의 stdout JSON dict(파싱 불가·게이트 부재·실행 실패면 None).
@@ -577,7 +595,10 @@ def _resource_verdict(socket):
         [py, gate, "check", "--json", "--formation-size", str(len(REQUIRED_ROLES))], **kw)
     branch = _resource_branch(code)
     if branch == "block":
-        return False, _gate_json(out)
+        gj = _gate_json(out)
+        if _nodes_only_hard(gj):
+            return True, gj
+        return False, gj
     if branch == "retry":
         sys.stderr.write("[formation] 자원 게이트 측정 실패(exit %s — 스큐/내부오류) — "
                          "무플래그 1회 재시도\n" % code)
@@ -587,7 +608,10 @@ def _resource_verdict(socket):
             kw2["env"] = dict(os.environ, CYS_GATE_LANE_SOCKET=str(socket))
         code2, o2, _e2 = _run([py, gate, "check", "--json"], **kw2)
         if code2 == 2:
-            return False, _gate_json(o2)
+            gj2 = _gate_json(o2)
+            if _nodes_only_hard(gj2):
+                return True, gj2
+            return False, gj2
         if code2 not in (0, 1):
             sys.stderr.write("[formation] 재시도도 측정 실패(exit %s) — loud 진행"
                              "(측정불능≠통과 원칙의 문서화된 절충: 게이트 결함이 편성을 "
@@ -1905,9 +1929,9 @@ def self_test():
         ck(_resource_ok(None) is True and len(calls) == 1, "soft(1) 진행 회귀")
         # ── ★A2(SURVEY B2) 게이트 JSON 보존 — _resource_verdict 는 판정은 그대로, stdout 만 살린다 ──
         gate_json = json.dumps({"verdict": "hard_block",
-                                "trips": [{"metric": "nodes", "value": 44, "soft": 15,
-                                           "hard": 42, "level": "hard"}],
-                                "warnings": [], "measured": {"nodes": 44}})
+                                "trips": [{"metric": "servers", "value": 4, "soft": 2,
+                                           "hard": 3, "level": "hard"}],
+                                "warnings": [], "measured": {"servers": 4}})
         calls = []
         g["_run"] = lambda argv, timeout=30, **_kw: (calls.append((list(argv), timeout, _kw)) or (2, gate_json, ""))
         ok2, gate2 = _resource_verdict(None)
@@ -1923,6 +1947,32 @@ def self_test():
            and (_resource_gate_last("/x/a.sock") or {}).get("verdict") == "hard_block",
            "_resource_ok 슬롯이 게이트 JSON 을 나르지 않음")
         ck(_resource_gate_last("/x/a.sock") is None, "슬롯이 읽고 비워지지 않음(stale 라벨 위험)")
+        # ★오너 2026-10-22 「부서 만들기 무한으로 하고, 제약을 해제해」: hard 원인이 nodes(개수) 하나뿐이면 편성 진행 ·
+        #   CYS_FORMATION_NODES_HARD=1 이면 종전대로 차단 · nodes+실자원 축 혼합 hard 는 여전히 차단.
+        nodes_json = json.dumps({"verdict": "hard_block",
+                                 "trips": [{"metric": "nodes", "value": 68, "soft": 12, "hard": 62, "level": "hard"}],
+                                 "warnings": [], "measured": {"nodes": 68}})
+        g["_run"] = lambda argv, timeout=30, **_kw: (2, nodes_json, "")
+        _prev_nh = os.environ.pop("CYS_FORMATION_NODES_HARD", None)
+        try:
+            with _ctx.redirect_stderr(_io.StringIO()):
+                okn, gn = _resource_verdict(None)
+            ck(okn is True and isinstance(gn, dict), "nodes 단독 hard 가 진행(True)이 아님 — 오너 2026-10-22 지시 회귀")
+            os.environ["CYS_FORMATION_NODES_HARD"] = "1"
+            okn2, _gn2 = _resource_verdict(None)
+            ck(okn2 is False, "CYS_FORMATION_NODES_HARD=1 인데 nodes hard 가 차단되지 않음")
+            os.environ.pop("CYS_FORMATION_NODES_HARD", None)
+            mixed = json.dumps({"verdict": "hard_block", "trips": [
+                {"metric": "nodes", "value": 68, "soft": 12, "hard": 62, "level": "hard"},
+                {"metric": "servers", "value": 4, "soft": 2, "hard": 3, "level": "hard"}],
+                "warnings": [], "measured": {}})
+            g["_run"] = lambda argv, timeout=30, **_kw: (2, mixed, "")
+            okm, _gm = _resource_verdict(None)
+            ck(okm is False, "nodes+실자원 혼합 hard 인데 차단되지 않음")
+        finally:
+            os.environ.pop("CYS_FORMATION_NODES_HARD", None)
+            if _prev_nh is not None:
+                os.environ["CYS_FORMATION_NODES_HARD"] = _prev_nh
         # ── ★R2(리뷰 major) 레인 전달 — 게이트의 부트 유예·보류 래치는 레인 종속이다 ──
         calls = []
         g["_run"] = lambda argv, timeout=30, **_kw: (calls.append((list(argv), timeout, _kw))

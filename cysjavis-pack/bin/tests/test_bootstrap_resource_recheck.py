@@ -77,6 +77,22 @@ def servers_hard():
         "warnings": ["context_unmeasured"]}}
 
 
+def nodes_hard(value=68, hard=62):
+    """nodes 단독 hard — 실 게이트 형상(유효임계 = hard · 라이브 노드가 그 이상이면 과계수 밸브가 열리지 않는다)."""
+    return {"exit": 2, "json": {
+        "verdict": "hard_block",
+        "trips": [{"metric": "nodes", "level": "hard", "value": value, "soft": 12, "hard": hard}],
+        "measured": {"nodes": value, "nodes_hard_effective": hard, "fleet_cpu_reason": "ok",
+                     "fleet_cpu_ratio": 0.1, "measure_errors": []},
+        "warnings": ["context_unmeasured"]}}
+
+
+def nodes_and_servers_hard():
+    r = nodes_hard()
+    r["json"]["trips"].append({"metric": "servers", "level": "hard", "value": 5, "soft": 2, "hard": 4})
+    return r
+
+
 def fleet_and_servers_hard():
     r = fleet_hard()
     r["json"]["trips"].append({"metric": "servers", "level": "hard", "value": 5})
@@ -461,6 +477,59 @@ check("k6 master 판독 불가 → 진행(종전 동작 · rc 0)", rig.rc == 0 a
       "rc=%s" % rig.rc)
 rig.cleanup()
 
+# ── (n) ★0.14.53 오너 2026-10-22 「제약을 해제해. 내가 자원보고 조절할 것이다」 — nodes(개수) 단독 hard 는 팀 기동을 막지 않는다 ──
+#   라이브 노드 70 ≥ 유효임계 62 라 과계수 밸브(hard-overcount)는 열리지 않는다 — 진행은 오너 규칙 nodes-only 로만 설명된다.
+#   실자원 축(servers)이 함께 hard 면 종전대로 exit 9 · CYS_FORMATION_NODES_HARD=1 이면 nodes 단독도 종전대로 exit 9(정확히 "1" 만).
+LIVE70 = "".join("s%d\trole=worker-%d\tclaude\tfalse\n" % (i, i) for i in range(1, 71))
+
+
+def _nodes_rig(responses, status_after=None, **env_extra):
+    r = Rig(responses, status_after=status_after, env_extra=env_extra or None)
+    with open(r.list_file, "w", encoding="utf-8") as f:
+        f.write(LIVE70)
+    return r.run()
+
+
+def _gate_step_text(rig):
+    return " ".join(str(st.get("detail", "")) + " " + str(st.get("why", "")) + " " + json.dumps(st, ensure_ascii=False)
+                    for st in (rig.data or {}).get("steps", []) if "resource" in str(st.get("step", "")))
+
+
+rig = _nodes_rig([nodes_hard()])
+check("n1 nodes 단독 hard(라이브 70 ≥ 62) → 팀 기동 진행(rc 0)", rig.rc == 0, "rc=%s stderr=%r" % (rig.rc, rig.stderr[-600:]))
+check("n2 가청 한 줄(stderr) — 원인 축과 되돌리는 스위치를 말한다",
+      "[bootstrap] ⚠ 자원 게이트 hard 원인 = nodes 68/62 하나뿐" in rig.stderr and "CYS_FORMATION_NODES_HARD=1" in rig.stderr,
+      rig.stderr[-600:])
+check("n3 판정 nodes-only 가 boot-last 의 게이트 단계에 남는다", "verdict=nodes-only" in _gate_step_text(rig),
+      _gate_step_text(rig)[:400])
+check("n4 실패 채널(feed bootstrap-fail · 「[부트 중단]」)로 알리지 않는다", _feed_bodies(rig) == [] and
+      not any("[부트 중단]" in l for l in rig.cys_calls()), "feed=%r" % _feed_bodies(rig))
+check("n5 팀 기동 진입(cys boot)", rig.count("boot") >= 1, "cys=%r" % rig.cys_calls()[-6:])
+check("n6 재확인 대기 없음(게이트 1회)", len(rig.gate_calls()) == 1, "calls=%d" % len(rig.gate_calls()))
+rig.cleanup()
+
+rig = _nodes_rig([nodes_hard()], CYS_FORMATION_NODES_HARD="1")
+check("n7 CYS_FORMATION_NODES_HARD=1 → nodes 단독 hard 도 종전대로 exit 9", rig.rc == 9, "rc=%s" % rig.rc)
+check("n8 CYS_FORMATION_NODES_HARD=1 → 팀 기동 0", rig.count("boot") == 0, "cys=%r" % rig.cys_calls()[-6:])
+rig.cleanup()
+
+rig = _nodes_rig([nodes_hard()], CYS_FORMATION_NODES_HARD="0")
+check("n9 스위치는 정확히 \"1\" 만 — \"0\" 은 기본(진행 rc 0)", rig.rc == 0, "rc=%s" % rig.rc)
+rig.cleanup()
+
+rig = _nodes_rig([nodes_and_servers_hard()])
+check("n10 nodes+servers 혼합 hard → 종전대로 exit 9(실자원 축은 그대로 차단)", rig.rc == 9 and rig.count("boot") == 0,
+      "rc=%s" % rig.rc)
+rig.cleanup()
+
+# 부하(fleet) 재확인 대기 중에 원인이 nodes 단독으로 바뀌면 — 대기를 끝내고(재확인 축 아님) 같은 규칙으로 가청 진행
+rig = _nodes_rig([fleet_hard(), nodes_hard()], status_after=LIVE_MASTER)
+check("n11 fleet hard → (재확인) nodes 단독 hard → 대기 끝·가청 한 줄·진행(rc 0 · 게이트 2회)",
+      rig.rc == 0 and len(rig.gate_calls()) == 2 and rig.count("boot") >= 1
+      and "[bootstrap] ⚠ 자원 게이트 hard 원인 = nodes 68/62 하나뿐" in rig.stderr,
+      "rc=%s calls=%d stderr=%r" % (rig.rc, len(rig.gate_calls()), rig.stderr[-500:]))
+rig.cleanup()
+
 # ── (i) 순수 판정 + 윈도우 가드 (모듈 직접 import — 부작용 없는 최상위) ───────────────
 sys.path.insert(0, BIN)
 try:
@@ -514,6 +583,112 @@ if imported:
             check("i12 윈도우 호스트 판정이 게이트 `_is_windows_host` 와 일치(env 5조합)", agree)
         except Exception as e:           # noqa: BLE001
             check("i12 게이트 모듈 대조", False, repr(e))
+
+# ── (o) 두 사본 한 판정 — javis_bootstrap._nodes_only_hard ≡ javis_formation._nodes_only_hard (같은 판정표) ──
+#   사본이 둘인 까닭은 javis_bootstrap._nodes_only_hard 독스트링(import 시 부수효과). 판정표 = (게이트 JSON, 기대값) ·
+#   기대값은 CYS_FORMATION_NODES_HARD 미설정·"0"·"" 일 때다 — "1" 이면 모든 행이 False 다.
+#   + javis_formation._resource_verdict 의 **두 호출 자리**(본 호출 rc 2 · 64 뒤 무플래그 재시도 rc 2)가 이 판정을 쓴다.
+def _t(metric, level="hard", value=1):
+    return {"metric": metric, "level": level, "value": value, "soft": 0, "hard": 0}
+
+
+NODES_ONLY_TABLE = [
+    ("json 없음(None)", None, False),
+    ("dict 아님", "hard_block", False),
+    ("빈 dict", {}, False),
+    ("trips None", {"trips": None}, False),
+    ("trips 빈 목록", {"trips": []}, False),
+    ("trips 가 dict", {"trips": {"nodes": 1}}, False),
+    ("nodes hard 하나", {"trips": [_t("nodes")]}, True),
+    ("nodes hard 둘", {"trips": [_t("nodes"), _t("nodes", value=2)]}, True),
+    ("nodes hard + nodes soft", {"trips": [_t("nodes"), _t("nodes", level="soft")]}, True),
+    ("nodes hard + 비dict 항목", {"trips": [_t("nodes"), "x"]}, True),
+    ("nodes soft 뿐", {"trips": [_t("nodes", level="soft")]}, False),
+    ("servers hard", {"trips": [_t("servers")]}, False),
+    ("nodes + servers hard", {"trips": [_t("nodes"), _t("servers")]}, False),
+    ("nodes + fleet_cpu_ratio hard", {"trips": [_t("nodes"), _t("fleet_cpu_ratio")]}, False),
+    ("nodes + context_pct hard", {"trips": [_t("nodes"), _t("context_pct")]}, False),
+    ("nodes + formation_budget hard", {"trips": [_t("nodes"), _t("formation_budget")]}, False),
+    ("metric 없는 hard + nodes hard", {"trips": [_t("nodes"), {"level": "hard", "value": 3}]}, False),
+    ("servers soft + nodes hard", {"trips": [_t("servers", level="soft"), _t("nodes")]}, True),
+]
+
+if imported:
+    import contextlib as _ctx
+    import io as _io
+    try:
+        import javis_formation as F      # noqa: E402
+        f_ok = True
+    except Exception as e:               # noqa: BLE001
+        f_ok = False
+        check("o0 javis_formation import", False, repr(e))
+    bp, fp = getattr(B, "_nodes_only_hard", None), getattr(F, "_nodes_only_hard", None) if f_ok else None
+    check("o1 두 사본이 실재(bootstrap·formation)", callable(bp) and callable(fp))
+    if callable(bp) and callable(fp):
+        saved_nh = os.environ.pop("CYS_FORMATION_NODES_HARD", None)
+        try:
+            for env_v in (None, "0", "", "1", "true"):
+                if env_v is None:
+                    os.environ.pop("CYS_FORMATION_NODES_HARD", None)
+                else:
+                    os.environ["CYS_FORMATION_NODES_HARD"] = env_v
+                bad = []
+                for label, g, want in NODES_ONLY_TABLE:
+                    want_v = want and env_v != "1"
+                    with _ctx.redirect_stderr(_io.StringIO()):
+                        got_b, got_f = bp(g), fp(g)
+                    if not (got_b is want_v and got_f is want_v):
+                        bad.append("%s: bootstrap=%r formation=%r 기대=%r" % (label, got_b, got_f, want_v))
+                check("o2 판정표 %d행 — env=%r 에서 두 사본이 같은 답(기대값과 일치)" % (len(NODES_ONLY_TABLE), env_v), not bad,
+                      "; ".join(bad))
+            os.environ.pop("CYS_FORMATION_NODES_HARD", None)
+            # 순수 판정 → bootstrap verdict 연결(라이브 노드는 넉넉히 — 과계수 밸브 밖)
+            bad = []
+            for label, g, want in NODES_ONLY_TABLE:
+                tr = g.get("trips") if isinstance(g, dict) else None
+                if not (isinstance(tr, list) and all(isinstance(t, dict) for t in tr)):
+                    continue   # 비dict 항목은 bootstrap 의 종전 분류식이 다루지 않는 형상이다(게이트 계약 밖 · 이 판의 변경 대상 아님)
+                v = B._resource_gate_decision(2, g, 10 ** 6)[0]
+                if v != ("nodes-only" if want else "hard-block"):
+                    bad.append("%s: %s" % (label, v))
+            check("o3 bootstrap 판정: 표의 True 행 → nodes-only · False 행 → hard-block", not bad, "; ".join(bad))
+            # formation 의 두 호출 자리(본 호출 · 64 뒤 무플래그 재시도)
+            nodes_j, mixed_j = json.dumps({"trips": [_t("nodes", value=68)]}), json.dumps({"trips": [_t("nodes"), _t("servers")]})
+            saved_run, saved_gp = F._run, F._gate_path
+            try:
+                F._gate_path = lambda: "/fake/javis_resource_gate.py"
+                seq = []
+
+                def _fake_run(argv, timeout=30, **_kw):
+                    return seq.pop(0)
+
+                F._run = _fake_run
+                for site, script, env_v, want in (
+                        ("본 호출", [(2, nodes_j, "")], None, True),
+                        ("본 호출", [(2, nodes_j, "")], "1", False),
+                        ("본 호출", [(2, mixed_j, "")], None, False),
+                        ("재시도", [(64, "", ""), (2, nodes_j, "")], None, True),
+                        ("재시도", [(64, "", ""), (2, nodes_j, "")], "1", False),
+                        ("재시도", [(64, "", ""), (2, mixed_j, "")], None, False)):
+                    seq[:] = list(script)
+                    if env_v is None:
+                        os.environ.pop("CYS_FORMATION_NODES_HARD", None)
+                    else:
+                        os.environ["CYS_FORMATION_NODES_HARD"] = env_v
+                    err = _io.StringIO()
+                    with _ctx.redirect_stderr(err):
+                        ok, gj = F._resource_verdict(None)
+                    loud = "자원 게이트 hard 원인 = nodes" in err.getvalue()
+                    check("o4 formation %s(%s · env=%r) → %s%s" % (site, "nodes 단독" if script[-1][1] == nodes_j else "nodes+servers",
+                                                                  env_v, "진행" if want else "차단", " + 가청 한 줄" if want else ""),
+                          ok is want and isinstance(gj, dict) and loud is want and not seq,
+                          "ok=%r loud=%r left=%d stderr=%r" % (ok, loud, len(seq), err.getvalue()[-200:]))
+            finally:
+                F._run, F._gate_path = saved_run, saved_gp
+        finally:
+            os.environ.pop("CYS_FORMATION_NODES_HARD", None)
+            if saved_nh is not None:
+                os.environ["CYS_FORMATION_NODES_HARD"] = saved_nh
 
 # ── (j) env 는 줄이기만 — 오너 상한(180s·30s)을 넘길 수 없다 ──────────────────────────
 def _consts(env_over):
