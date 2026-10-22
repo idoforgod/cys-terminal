@@ -1049,6 +1049,16 @@ def r3_collect(tmp, home, code, out, err):
             "boot_called": called(tmp, "cys boot"), "home": home}
 
 
+def r3_rows(r):
+    """The withheld rows the run's sidecar names (the identity of a withhold)."""
+    return (r["sidecar"] or {}).get("rows") or []
+
+
+def r3_is_row(x, source, basis, **want):
+    return (isinstance(x, dict) and x.get("source") == source and x.get("basis") == basis
+            and all(x.get(k) == v for k, v in want.items()))
+
+
 def r3_brief(r):
     return "exit=%s marker=%s sidecar=%s notices=%d boot=%s err=%s" % (
         r["code"], r["marker"], (r["sidecar"] or {}).get("state"), len(r["notices"]), r["boot_called"],
@@ -1100,6 +1110,11 @@ def r3_s1():
         check("13-S1 %s: prerequisite exit 0 · ⑤check called · ⑦ called" % name,
               r["code"] == 0 and r["check_called"] and r["promote_called"], r3_brief(r))
         check("13-S1 %s: ★marker ABSENT" % name, not r["marker"], r3_brief(r))
+        # ★identity (ruling (b) widened the safe side: an unreadable JSON withholds too) — it is THIS boot row
+        check("13-S1 %s: ★the one withheld row is this boot row (source boot, basis unknown)" % name,
+              len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "boot", "unknown", outcome=row["outcome"],
+                                                 kept_pane=row.get("kept_pane")),
+              json.dumps(r3_rows(r), ensure_ascii=False)[:300])
         check("13-S1 %s: summary ready:false" % name, r["summary"].get("ready") is False,
               json.dumps(r["summary"], ensure_ascii=False)[:300])
         check("13-S1 %s: sidecar state=withheld (A3a)" % name, (r["sidecar"] or {}).get("state") == "withheld",
@@ -1127,9 +1142,16 @@ def r3_s3():
                                           r3_row("worker", "brand_new_state", True)))
     check("15-S3 prerequisite exit 0", r["code"] == 0, r3_brief(r))
     check("15-S3 ★unknown outcome 'brand_new_state' → marker ABSENT", not r["marker"], r3_brief(r))
+    check("15-S3 ★identity: the withheld row is the brand_new_state boot row (basis unknown)",
+          len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "boot", "unknown", outcome="brand_new_state"),
+          json.dumps(r3_rows(r), ensure_ascii=False)[:300])
     r = r3_run(boot_stdout=r3_boot_stdout(r3_row("cso", "already_alive", True),
                                           r3_row("reviewer-codex", "failed", False, kept_pane="brand_new_label")))
     check("15-S3 ★unknown kept_pane label → marker ABSENT", not r["marker"], r3_brief(r))
+    check("15-S3 ★identity: the withheld row is the failed row with kept_pane brand_new_label (basis unknown)",
+          len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "boot", "unknown", outcome="failed",
+                                             kept_pane="brand_new_label"),
+          json.dumps(r3_rows(r), ensure_ascii=False)[:300])
 
 
 # ── 16. S4 — a stale marker from an earlier run is REMOVED on the signal (RED) ──
@@ -1182,6 +1204,9 @@ def r3_s6():
     check("18-S6 prerequisite: no deficit → cys boot NOT called · exit 0 · ⑤ called",
           not r["boot_called"] and r["code"] == 0 and r["check_called"], r3_brief(r))
     check("18-S6 ★durable live record → marker ABSENT", not r["marker"], r3_brief(r))
+    check("18-S6 ★identity: the withheld row is the durable record of surface:7 (source record, basis unknown)",
+          len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "record", "unknown", surface_id=7),
+          json.dumps(r3_rows(r), ensure_ascii=False)[:300])
     check("18-S6 sidecar withheld + one notice carrying ready_withheld",
           (r["sidecar"] or {}).get("state") == "withheld" and len(r["notices"]) == 1
           and isinstance(r["notices"][0].get("ready_withheld"), dict), r3_brief(r))
@@ -1213,6 +1238,10 @@ def r3_s8():
               r3_brief(r))
         check("20-S8 %s: ★marker %s" % (name, "WRITTEN (gone)" if want_marker else "ABSENT (live)"),
               r["marker"] is want_marker, r3_brief(r))
+        if not want_marker:
+            check("20-S8 %s: ★identity: the withheld row is the durable record (source record, basis unknown)" % name,
+                  len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "record", "unknown", surface_id=7),
+                  json.dumps(r3_rows(r), ensure_ascii=False)[:300])
 
 
 # ── 21. S9 — P2' lane filter: another lane's record is skipped; a record with no owner is KEPT (safe side) ──
@@ -1224,6 +1253,9 @@ def r3_s9():
     r = r3_run(status_json=r3_status(), records_lines=[legacy])
     check("21-S9 ★an R2 record with no owner (and no withholds_ready) → kept → marker ABSENT",
           not r["marker"] and not r["boot_called"], r3_brief(r))
+    check("21-S9 ★identity: the R2 record withholds as UNMEASURED (no withholds_ready), source record",
+          len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "record", "unmeasured", surface_id=7),
+          json.dumps(r3_rows(r), ensure_ascii=False)[:300])
     # the bootstrap's own lane-key resolver on the three socket forms (unix base · unix dept · Windows pipe)
     b = r3_module(SCRIPT, "javis_bootstrap_r3_lane")
     rows = (("", R3_BASE_SOCK, False), ("", R3_FOREIGN_SOCK, True), ("", r"\\.\pipe\cys", False),
@@ -1245,6 +1277,10 @@ def r3_s10():
     check("22-S10 prerequisite: status unreadable → boot runs (deficit assumed) · exit 0",
           r["boot_called"] and r["code"] == 0, r3_brief(r))
     check("22-S10 ★status unreadable + candidate → marker ABSENT", not r["marker"], r3_brief(r))
+    check("22-S10 ★identity: the withheld row is the record, basis UNMEASURED (liveness unmeasured)",
+          len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "record", "unmeasured", surface_id=7)
+          and "liveness" in str(r3_rows(r)[0].get("why", "")),
+          json.dumps(r3_rows(r), ensure_ascii=False)[:300])
 
 
 # ── 23. S11 — loudness (head condition 4): ONE notice per run, naming the base marker and the guard skip; the boot
@@ -1267,6 +1303,8 @@ def r3_s11():
           rw.get("marker") == marker_path(r["home"]) and rw.get("lane") == "base"
           and rw.get("consequences") == R3_BASE_CONSEQUENCES and rw.get("remove_error") is None,
           json.dumps(n, ensure_ascii=False)[:500])
+    check("23-S11 ★identity: an UNKNOWN-only withhold names nothing as unmeasured (ready_withheld.unmeasured == [])",
+          rw.get("unmeasured") == [], json.dumps(rw, ensure_ascii=False)[:300])
     check("23-S11 the notice carries THIS run's records (from the out file) · command bootstrap",
           n.get("command") == "bootstrap" and R3_ADOPT_REC in (n.get("records") or []),
           json.dumps(n, ensure_ascii=False)[:500])
@@ -1292,6 +1330,9 @@ def r3_s12():
         lane_marker = [n for n in os.listdir(os.path.join(home, ".cys")) if n.startswith(".master-bootstrapped-")]
         check("24-S12 prerequisite: dept team path ran boot · exit 0", r["boot_called"] and code == 0, r3_brief(r))
         check("24-S12 ★the dept lane marker is ABSENT", not lane_marker, "%r" % lane_marker)
+        check("24-S12 ★identity: the withheld row is the directive_unknown boot row (basis unknown)",
+              len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "boot", "unknown", outcome="directive_unknown"),
+              json.dumps(r3_rows(r), ensure_ascii=False)[:300])
         check("24-S12 the base marker is byte-identical", open(marker_path(home), "rb").read() == base_bytes)
         rw = (r["notices"][0] if r["notices"] else {}).get("ready_withheld") or {}
         check("24-S12 consequences = the dept list · lane dept · marker = this lane's path",
@@ -1370,6 +1411,10 @@ def r3_s16_s17():
         r = r3_run(pre=r3_stale, **kw)
         check("28-S16/17 %s: prerequisite exit %d" % (name, want), r["code"] == want, r3_brief(r))
         check("28-S16/17 %s: ★stale marker ABSENT" % name, not r["marker"], r3_brief(r))
+        check("28-S16/17 %s: ★identity: the withheld row is the directive_unknown boot row (basis unknown)" % name,
+              any(r3_is_row(x, "boot", "unknown", outcome="directive_unknown") for x in r3_rows(r))
+              and all(x.get("basis") == "unknown" for x in r3_rows(r)),
+              json.dumps(r3_rows(r), ensure_ascii=False)[:300])
         rw = (r["notices"][0] if r["notices"] else {}).get("ready_withheld") or {}
         check("28-S16/17 %s: sidecar withheld + the notice's withheld clause (no remove_error)" % name,
               (r["sidecar"] or {}).get("state") == "withheld" and rw.get("marker") == marker_path(r["home"])
@@ -1385,6 +1430,9 @@ def r3_s18():
     check("29-S18 prerequisite: exit 0 · the marker path still exists (unlink failed)",
           r["code"] == 0 and r["marker"], r3_brief(r))
     rw = (r["notices"][0] if r["notices"] else {}).get("ready_withheld") or {}
+    check("29-S18 ★identity: the withheld row is the directive_unknown boot row (basis unknown)",
+          len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "boot", "unknown", outcome="directive_unknown"),
+          json.dumps(r3_rows(r), ensure_ascii=False)[:300])
     check("29-S18 ★the notice carries remove_error (Rust then says COULD NOT BE REMOVED, never WITHHELD)",
           len(r["notices"]) == 1 and isinstance(rw.get("remove_error"), str) and rw["remove_error"],
           json.dumps(r["notices"], ensure_ascii=False)[:400])
@@ -1466,6 +1514,9 @@ def r3_busy():
                         "summary": {"busy": 1, "lock": "busy", "fatal_failed": 0}}) + "\n"
     r = r3_run(boot_exit=75, boot_stdout=mixed)
     check("32-busy ★lock=busy with one directive_unknown row → classified → marker ABSENT", not r["marker"], r3_brief(r))
+    check("32-busy ★identity: the withheld row is that directive_unknown row (basis unknown) — the busy row is not",
+          len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "boot", "unknown", outcome="directive_unknown"),
+          json.dumps(r3_rows(r), ensure_ascii=False)[:300])
 
 
 # ── 33. worker-7's no-JSON ruling (split): (b) `cys boot --json` exit 0 with NO parseable JSON on stdout (prose only)
@@ -1534,6 +1585,80 @@ def r3_basis():
 
 
 for _name, _fn in (("34-basis", r3_basis),):
+    if os.environ.get("BOOT_R3_ONLY") and _name not in os.environ["BOOT_R3_ONLY"].split(","):
+        continue
+    r3_section(_name, _fn)
+
+
+# ── 35. REFLECTION-1 fixes (R1-P-1, R1-P-2, R1-P3-1, R1-P-3) ──
+def r3_r1():
+    # R1-P-1 · pack skew: an OLDER javis_lane.py (af41d65c's — no `ready_withheld` kind) beside this bootstrap must not
+    #   crash the chain (the bootstrap tolerates that module's skew). Cannot be red on af41d65c (that bootstrap never asks
+    #   for the kind): it pins the R3 code itself; its evidence is the revert check.
+    old_lane = None
+    try:
+        p = subprocess.run(["git", "-C", R3_REPO, "show", "%s:cysjavis-pack/bin/javis_lane.py" % R3_OLD],
+                           capture_output=True, timeout=30)
+        old_lane = p.stdout if p.returncode == 0 and p.stdout else None
+    except Exception:
+        old_lane = None
+    if old_lane is None:
+        print("  SKIP 35-R1-P-1: git history not reachable — measurement unavailable (not a pass)")
+    else:
+        binc = os.path.join(tempfile.mkdtemp(prefix="boot-r3-skew-"), "bin")
+        try:
+            shutil.copytree(os.path.dirname(SCRIPT), binc, ignore=shutil.ignore_patterns("tests", "__pycache__"))
+            with open(os.path.join(binc, "javis_lane.py"), "wb") as f:
+                f.write(old_lane)
+            for name, kw, want_marker in (
+                    ("a signal run", {"boot_stdout": r3_boot_stdout(r3_row("worker", "directive_unknown", True))}, False),
+                    ("a normal run", {}, True)):
+                tmp = tempfile.mkdtemp(prefix="boot-r3-skewrun-")
+                try:
+                    env, home = make_env(tmp, **kw)
+                    rr = subprocess.run([PY, os.path.join(binc, "javis_bootstrap.py")], capture_output=True, text=True,
+                                        encoding="utf-8", env=env, timeout=120)
+                    res = r3_collect(tmp, home, rr.returncode, rr.stdout, rr.stderr)
+                    check("35-R1-P-1 older javis_lane (no ready_withheld kind), %s: ★the chain completes (exit 0), marker %s"
+                          % (name, "written" if want_marker else "withheld (sidecar at the derived name)"),
+                          rr.returncode == 0 and res["marker"] is want_marker
+                          and (want_marker or res["sidecars"] == ["ready-withheld.json"]), r3_brief(res))
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+        finally:
+            shutil.rmtree(os.path.dirname(binc), ignore_errors=True)
+    # R1-P-2 · a readable status WITHOUT a surfaces list says nothing about any pane: unreadable → the live record
+    #   withholds (basis unmeasured), never "every pane is gone" (a false ready)
+    r = r3_run(status_json=json.dumps({"daemon": {"started_at": R3_DAEMON}}), records_lines=[r3_record()],
+               boot_stdout=r3_boot_stdout(r3_row("cso", "already_alive", True), r3_row("worker", "already_alive", True)))
+    rows = (r["sidecar"] or {}).get("rows") or []
+    check("35-R1-P-2 prerequisite: exit 0 (no surfaces → deficit → boot ran)", r["code"] == 0 and r["boot_called"],
+          r3_brief(r))
+    check("35-R1-P-2 ★a status without a surfaces list is UNREADABLE → marker ABSENT, the record row is basis unmeasured",
+          not r["marker"] and any(x.get("source") == "record" and x.get("basis") == "unmeasured"
+                                  and "no surfaces list" in str(x.get("why", "")) for x in rows),
+          "%s rows=%s" % (r3_brief(r), json.dumps(rows, ensure_ascii=False)[:300]))
+    # R1-P3-1 · ⑧ names the basis (unmeasured is not a value)
+    r = r3_run(boot_stdout="boot 완료: (no json line)\n")
+    m = r["summary"].get("marker") or ""
+    check("35-R1-P3-1 ★⑧ unmeasured: ready_bases ['unmeasured'] · the marker note says 'readiness unmeasured (' and "
+          "neither 'not ready' nor 'UNKNOWN'",
+          r["summary"].get("ready_bases") == ["unmeasured"] and "readiness unmeasured (" in m
+          and "not ready" not in m and "UNKNOWN" not in m, json.dumps(r["summary"], ensure_ascii=False)[:300])
+    r = r3_run(boot_stdout=r3_boot_stdout(r3_row("worker", "directive_unknown", True, surface_ref="surface:7")))
+    m = r["summary"].get("marker") or ""
+    check("35-R1-P3-1 ⑧ UNKNOWN-class: ready_bases ['unknown'] · the marker note names the pane",
+          r["summary"].get("ready_bases") == ["unknown"] and "UNKNOWN" in m and "surface:7" in m,
+          json.dumps(r["summary"], ensure_ascii=False)[:300])
+    # R1-P-3 · a notice that is not sent (exit 3: coalesced / no master) is not a failed step
+    r = r3_run(boot_stdout=r3_boot_stdout(r3_row("worker", "directive_unknown", True)), notice_exit=3)
+    st = [x for x in r["steps"] if x.get("step") == "④boot-ready"]
+    check("35-R1-P-3 ★a not-sent notice (exit 3): the ④boot-ready step has exit 0 and its detail names the rc",
+          len(st) == 1 and st[0].get("exit") == 0 and "kept-pane notice exit 3" in st[0].get("detail", ""),
+          "%r" % [(x.get("step"), x.get("exit"), x.get("detail", "")[:120]) for x in st])
+
+
+for _name, _fn in (("35-R1", r3_r1),):
     if os.environ.get("BOOT_R3_ONLY") and _name not in os.environ["BOOT_R3_ONLY"].split(","):
         continue
     r3_section(_name, _fn)

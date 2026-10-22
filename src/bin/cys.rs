@@ -48498,6 +48498,31 @@ mod b360_tests {
         );
     }
 
+    /// REFLECTION-1 R1-R-1: a half-configured deferral (`CYS_KEPT_PANE_NOTICE=caller` without the out path) in a run that
+    /// kept NO pane: one `[kept-pane]` stderr line names the missing var and says there is NO deferral — it must not claim
+    /// a notice was sent (nothing is sent: there is no record). RED on af41d65c: no such line at all.
+    #[cfg(unix)]
+    #[test]
+    fn b360_r3_k14_a_half_configured_deferral_without_a_kept_pane_claims_no_send() {
+        let run = r3_boot_adopt(r2c_ok(json!({})), r3_status(), &[(R3_NOTICE_ENV, "caller")]);
+        let line = run
+            .err
+            .lines()
+            .find(|l| l.starts_with("[kept-pane]") && l.contains(R3_OUT_ENV))
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            run.records.is_empty()
+                && r3_master_calls(&run.calls) == 0
+                && line.contains("no deferral")
+                && !line.contains("is sent to master"),
+            "records {:?} · master calls {} · line {line:?}\n{}",
+            run.records,
+            r3_master_calls(&run.calls),
+            run.err
+        );
+    }
+
     // ── ★(B-360 R3 · option 2 · §2c + A5) the Python readiness tables and the Rust vocabulary are ONE set ─────────────
     // Python has no compile-time exhaustiveness, so the analogue of E0004 is this RUNTIME read of the Python source: a
     // new boot outcome (BOOT_SUMMARY_BUCKETS) or a new kept_pane label (boot_launch_kept_pane) is a red `cargo test`
