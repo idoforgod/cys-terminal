@@ -1145,7 +1145,18 @@ jobs:
       #   (같은 명령이 0.14.42 통합 빌드에서는 rc 0). ≤0.14.41 바이너리는 지시대로 실행하면 죽는다 —
       #   특히 대화 승인 팀 생성 ①·④ 단계(기능 의존 — RELEASE.md 불변 규칙). pack-release.yml
       #   PACK_MIN_BINARY_OVERRIDE · docs/RELEASE.md §0-A 2단계 리터럴과 같은 커밋에서 동시 상향(두 값 동일 계약).
-      PACK_MIN_BINARY: '0.14.42'
+      # ★0.14.52 상향(2026-10-22 · B-360 R3 option 2 · head ruling R2-P-8 option (a)). 이 세대 팩이
+      #   **0.14.52 에 처음 생긴 CLI 표면의 실행을 직접 지시**한다 — javis_bootstrap.py:2919 의
+      #   `cys kept-pane-notice --input -`(레디 마커 보류를 알리는 실행당 1통 알림의 유일한 송신자 · 숨은 서브커맨드) ·
+      #   javis_bootstrap.py:3882-3883 이 ④ `cys boot --json` 에 거는 지연 쌍 env `CYS_KEPT_PANE_NOTICE=caller` +
+      #   `CYS_KEPT_PANE_RECORDS_OUT=<절대경로>`. 부재 실측(2026-10-22 · v0.14.51=15578fc2 대조):
+      #   `git show 15578fc2:src/bin/cys.rs | grep -cE 'KeptPaneNotice|kept-pane-notice|CYS_KEPT_PANE_NOTICE|CYS_KEPT_PANE_RECORDS_OUT'`
+      #   → 0. 설치본 `cys --version` = cys 0.14.51 에 `--help` 만 써서(상태 변경 0 · HOME 샌드박스 · CYS_NO_AUTOSTART=1):
+      #   `kept-pane-notice --help` → rc 2 "unrecognized subcommand". ≤0.14.51 본체에서는 부트 체인이 죽지는 않지만
+      #   (알림 rc 2 를 단계 detail 에만 적는다) **보류 사실을 master 에게 알리는 통로가 통째로 사라진다** — B-360 이
+      #   막으려는 바로 그 손실이다(기능 의존 — RELEASE.md 불변 규칙 :75-77). pack-release.yml
+      #   PACK_MIN_BINARY_OVERRIDE · docs/RELEASE.md §0-A 2단계 리터럴과 같은 커밋에서 동시 상향(두 값 동일 계약).
+      PACK_MIN_BINARY: '0.14.52'
     steps:
       - uses: actions/checkout@v4
 

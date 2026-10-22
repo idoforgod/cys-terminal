@@ -89,7 +89,15 @@ jobs:
       #   v0.14.41(cecf4c57)에는 없다(부재 실측: `TeamToken|team_token|team-token` grep -c → 0, 릴리스
       #   0.14.41 바이너리 사본에 `--help` 만 써서 세 명령 모두 rc 2 확인). 두 값 동일 계약이므로
       #   release.yml PACK_MIN_BINARY 와 같은 커밋에서 함께 올린다.
-      PACK_MIN_BINARY_OVERRIDE: '0.14.42'
+      # ★0.14.52 상향(2026-10-22 · B-360 R3 option 2) — 근거는 release.yml PACK_MIN_BINARY 주석과 같다: 이 세대 팩이
+      #   `cys kept-pane-notice --input -`(javis_bootstrap.py:2919 · 레디 마커 보류 알림의 유일한 송신자)와
+      #   ④ `cys boot --json` 의 지연 쌍 env `CYS_KEPT_PANE_NOTICE=caller` + `CYS_KEPT_PANE_RECORDS_OUT`
+      #   (javis_bootstrap.py:3882-3883)를 직접 지시하는데 둘 다 v0.14.51(15578fc2)에는 없다(부재 실측:
+      #   `KeptPaneNotice|kept-pane-notice|CYS_KEPT_PANE_NOTICE|CYS_KEPT_PANE_RECORDS_OUT` grep -c → 0, 설치본
+      #   cys 0.14.51 에 `--help` 만 써서 `kept-pane-notice` rc 2 확인). ⚠ 아래 하한 검증기(해법②)는 태그
+      #   `v0.14.52` 소스를 빌드하므로 이 레인의 다음 팩-only 발행은 v0.14.52 본체 태그 뒤에만 가능하다.
+      #   두 값 동일 계약이므로 release.yml PACK_MIN_BINARY 와 같은 커밋에서 함께 올린다.
+      PACK_MIN_BINARY_OVERRIDE: '0.14.52'
     steps:
       - uses: actions/checkout@v4
 
