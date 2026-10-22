@@ -16,14 +16,19 @@ LLM(master)의 역할은 이 스크립트 실행·출력 인용·이후 지휘�
   CYS_BOOT_CHECK_RETRIES·CYS_BOOT_CHECK_INTERVAL_S로만 덮인다 — 테스트 하네스 전용.
   ★exit 2 는 `cys ping` 1회 재확인으로 '데몬 소실'(즉시 이탈)과 '일시 실패/팩 결손 가능성'
   (창 내 계속·별도 상한)을 실측 분리한다 — W-A3)
-                                                          ⑥ 완료 마커 write
+                                                          ⑥ 완료 마커 write (★B-360 R3: only when ready is not withheld)
   ⑦ cys-dept promote-if-pending --request-only (비대기 — 부트와 승격 동의의 분리.
   ★T10: 부서 레인도 **신호만** 발사한다 — base 팩 cys-dept 를 CYS_NO_AUTOSTART=1 +
   CYS_SOCKET·CYS_PACK_DIR·CYS_ACCOUNT_DIR 스크럽 env 로 호출. 집행은 base 스케줄 틱)
   ⑧ 기계 요약 JSON 출력 (master는 이것을 인용해 보고한다)
 
 완료 마커 ~/.cys/.master-bootstrapped 는 base 데몬 전용 단일-writer 마커다:
-  - writer = 이 스크립트의 성공 경로(⑤ exit 0 후 ⑥) 유일. 삭제 주체 없음(버전 필드로 stale 판정).
+  - writer = 이 스크립트의 성공 경로(⑤ exit 0 후 ⑥) 유일(버전 필드로 stale 판정).
+  - ★(B-360 R3 · option 2) the ONE readiness decision right after ④ (`_ready_decision`, both branches) can WITHHOLD the
+    marker (an unknown-class boot row, or a live durable kept-pane record): it then DELETES this lane's marker at that
+    point, writes the withheld sidecar (`lane_state_path("ready_withheld")`) and sends one notice; ⑥ does not write.
+    So exit 0 no longer implies a marker — the ⑧ JSON's `ready` says which. Deleters: that decision point and
+    factory reset (a quarantine move).
   - ★소켓 격리: CYS_SOCKET이 base가 아니면(부서 pane 부트) write하지 않는다 — 부서장 부트가
     base 마커를 오염시키면 CEO 승격 게이트(cys-dept)가 오개방된다.
 
@@ -112,6 +117,7 @@ exit(`run` 체인 — 코드 상수 EXIT_* 와 대조 유지 · 진실원천은 
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 sys.dont_write_bytecode = True  # SEAL-1 층4: 호출자 env 와 무관하게 형제 import 의 __pycache__ 기록 차단(D-pyc 2026-09-21)
@@ -738,15 +744,18 @@ def _run(cmd, timeout=120, env=None):
         return 124, "timeout(%ss): %s" % (timeout, " ".join(cmd))
 
 
-def _run_split(cmd, timeout=120):
+def _run_split(cmd, timeout=120, env=None, input_text=None):
     """서브프로세스 실행 — (exit, stdout, stderr)를 **분리** 반환. `_run`(병합)의 additive 형제.
 
     ★왜 분리판이 필요한가(A13): 기계 계약(JSON)이 stdout 이고 진단이 stderr 인 도구를 병합 텍스트로
       파싱하면, 진단 한 줄이 계약을 파괴한다 — '판정 실패'가 '판정 결과'로 위장되는 경로다.
-      `_run` 은 종전 소비처(산문 진단 목적)가 많아 계약을 바꾸지 않고 그대로 둔다(무접촉)."""
+      `_run` 은 종전 소비처(산문 진단 목적)가 많아 계약을 바꾸지 않고 그대로 둔다(무접촉).
+    ★(B-360 R3) additive `env` (mirrors `_run`: None = inherit) and `input_text` (stdin; None = no stdin, as before).
+      `so + se` is byte-identical to `_run`'s merged text, including the 127 / 124 strings (both put them after an
+      empty stdout)."""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           encoding="utf-8", errors="replace")
+                           encoding="utf-8", errors="replace", env=env, input=input_text)
         return r.returncode, (r.stdout or ""), (r.stderr or "")
     except FileNotFoundError:
         return 127, "", "명령 없음: %s" % cmd[0]
@@ -1464,6 +1473,9 @@ _LEGACY_LANE_STATE_KINDS = {
     #     원장이 **조용히** 무력화되므로 양쪽에 교차 테스트를 둔다.
     "delivery": (_STATE, "delivery", ".jsonl"),
     "delivery_epoch": (_STATE, "delivery", ".epoch.json"),
+    # ★(B-360 R3 · A3a) the ready marker's WITHHELD state (sidecar) — next to boot_last, same suffix rule; its name
+    #   never starts with `.master-bootstrapped` (every marker reader matches that prefix).
+    "ready_withheld": (_STATE, "ready-withheld", ".json"),
 }
 
 # 항상 레인 접미가 붙는 종류(base 예외 없음) — 위 주석의 규약을 코드로 고정한다.
@@ -1473,7 +1485,7 @@ _LEGACY_ALWAYS_LANE_SUFFIXED = ("skip", "lock", "delivery", "delivery_epoch")
 def _legacy_lane_state_path(kind, sock=None):
     """★U-24 **레거시 폴백 전용**(정본은 `javis_lane.lane_state_path`).
     레인 스코프 상태 파일 경로.
-    kind ∈ marker|boot_last|skip|lock|mission|delivery|delivery_epoch.
+    kind ∈ marker|boot_last|skip|lock|mission|delivery|delivery_epoch|ready_withheld.
     base 레인: 역사적 경로(마커=`~/.cys/.master-bootstrapped` · `boot-last.json`).
     비-base 레인: `-<lane>` 접미(`.master-bootstrapped-<lane>` · `boot-last-<lane>.json`).
     ※ skip·lock·delivery* 는 **항상** 레인별이다 — 규약을 이 함수 하나로 모은다(사본 금지)."""
@@ -2514,6 +2526,422 @@ def _fatal_detail(bad, out):
     return "의무(Fatal) 역할 기동 실패: %s\n%s" % (detail, out)
 
 
+# ══ ★(B-360 R3 · option 2) the ready marker is WITHHELD on an unknown-class signal ══════════════════════════════════
+# FIX-SPEC-option2-v2 §2 + §7 A1-A5, worker-7's rulings (records OUT file instead of a boot-JSON key; the withhold is
+# APPLIED at the decision point right after ④ — spec §10; busy narrowed to its literal and no-JSON split — spec §11)
+# and the head's note that READINESS UNMEASURED is not a value (every withheld row carries `basis`).
+#
+#  · "not ready" and "fatal" stay two columns: nothing here reads or changes BOOT_FATAL_OUTCOMES, _boot_fatal_verdict,
+#    _boot_was_busy, _boot_gate_pending_verdict, an exit code, log.result or a state= literal. The boot still exits as
+#    today and every pane stays up; only the ready marker is absent (the census found every marker reader SAFE on
+#    absence — CENSUS-ready-marker-readers.md).
+#  · Two signals, one decision computed ONCE per run (`_ready_decision`): this run's boot rows (STDOUT only — Y2) and the
+#    durable kept-pane records whose pane is still alive (P2' — a later successful run never erases an unresolved write).
+#  · Python has no compile-time exhaustiveness: the analogue of E0004 is the Rust pin
+#    `b360_r3_x9_the_python_readiness_tables_cover_every_boot_bucket_and_kept_pane_label` (cargo test --bin cys), which
+#    reads the block between the two markers below at RUNTIME and compares its key SETS with BOOT_SUMMARY_BUCKETS and
+#    every label boot_launch_kept_pane can emit. Unknown values withhold (the catch-all is on the safe side).
+
+# ── BEGIN B-360 R3 READINESS TABLES (read at runtime by cys.rs b360_r3_x9 — keys == BOOT_SUMMARY_BUCKETS / kept_pane labels) ──
+_BOOT_OUTCOME_READINESS = {
+    "launched": "ready",
+    "already_alive": "ready",
+    "recovered": "ready",
+    "directive_unknown": "withhold",
+    "recover_unknown": "withhold",
+    "recover_unrecognised": "withhold",
+    "unbucketed": "withhold",
+    "gate_pending": "other_column",          # the ⑤ / gate column (unchanged)
+    "skipped_unconfirmed": "other_column",   # the ⑤ column (unchanged)
+    "missing": "other_column",               # the fatal / degrade column (unchanged)
+    "failed": "by_kept_pane",                # decided by `kept_pane` below (absent → the fatal / degrade column)
+}
+_BOOT_KEPT_PANE_READINESS = {
+    "directive_unknown": "withhold",
+    "launch_unknown": "withhold",
+    "directive_refused": "other_column",     # REFUSED = zero bytes, a KNOWN outcome (fatal / degrade column)
+    "launch_refused": "other_column",
+}
+# ── END B-360 R3 READINESS TABLES ──
+
+# The literal busy report of `cys boot --json` (src/bin/cys.rs:13451@af41d65c: every role `"outcome": "busy"`, and
+# `summary.lock == "busy"`). Only that exact shape is the busy column; anything else is classified row by row.
+_BOOT_BUSY_OUTCOME = "busy"
+
+READINESS_BASIS_UNKNOWN = "unknown"         # an UNKNOWN-class signal (a boot row or a durable record)
+READINESS_BASIS_UNMEASURED = "unmeasured"   # readiness could not be measured (unreadable boot JSON / status / record)
+
+KEPT_PANE_NOTICE_TIMEOUT_S = 30             # 3 bounded RPCs of ≤3 s each inside `cys kept-pane-notice`, plus margin
+_MARKER_UNLINK_TRIES = 5                    # Windows sharing violations are transient: 5 × 0.1 s, then say so loudly
+_MARKER_UNLINK_PAUSE_S = 0.1
+
+
+def _ready_withheld_path():
+    """The withheld sidecar of THIS lane (`lane_state_path("ready_withheld")`). ★(B-360 R3 · R1-P-1) Pack-skew tolerant: an
+    OLDER `javis_lane.py` beside this bootstrap has no `ready_withheld` kind and raises — the bootstrap explicitly
+    tolerates that module's skew (`_lane_mod` fallback), so the same name is derived here (boot_last's suffix rule)
+    instead of crashing the chain at the decision point, at ⑥ and in `status`."""
+    try:
+        return lane_state_path("ready_withheld")
+    except (ValueError, KeyError):
+        key = lane_key()
+        return os.path.join(state_dir(), "ready-withheld.json" if key == "base"
+                            else "ready-withheld-%s.json" % key)
+
+
+def _unmeasured_row(why, source):
+    return {"basis": READINESS_BASIS_UNMEASURED, "source": source, "unmeasured": why,
+            "why": "readiness unmeasured: %s" % why}
+
+
+def _boot_rows_withheld(stdout, code=0, skew_ran=False):
+    """The rows of THIS run's `cys boot --json` that withhold the ready marker — parsed from STDOUT ONLY (Y2: `_run`
+    merges stderr after the JSON, and every boot that launches a pane writes such a line). `mandatory` is not consulted.
+
+    · skew_ran: the BOOT_SKEW bare `cys boot` ran (an old binary: no JSON by design, and it cannot emit the unknown
+      signals) → no rows (the decision step names it).
+    · no parseable JSON from `cys boot --json`: exit 75 / 78 → their existing columns; any other exit → ONE row of basis
+      "unmeasured" (readiness unmeasured — not a value, never "not ready"/"unknown").
+    · the literal busy report → the busy column (no rows); the lock holder's kept panes reach the durable reader.
+    · otherwise every row through the tables; a value no table knows → withheld (basis "unknown")."""
+    if skew_ran:
+        return []
+    v = _parse_boot_json(stdout)
+    if v is None or not isinstance(v.get("roles"), list):
+        if code in (CYS_BOOT_EXIT_BUSY, CYS_BOOT_EXIT_GATE_PENDING):
+            return []
+        return [_unmeasured_row("boot --json stdout unreadable (exit %s)" % code, "boot")]
+    roles = v["roles"]
+    summary = v.get("summary") if isinstance(v.get("summary"), dict) else {}
+    if (summary.get("lock") == _BOOT_BUSY_OUTCOME and roles
+            and all(isinstance(r, dict) and r.get("outcome") == _BOOT_BUSY_OUTCOME for r in roles)):
+        return []
+    out = []
+    for r in roles:
+        if not isinstance(r, dict):
+            out.append(_unmeasured_row("boot --json role row unreadable: %r" % (r,), "boot"))
+            continue
+        outcome = r.get("outcome")
+        col = _BOOT_OUTCOME_READINESS.get(outcome, "withhold") if isinstance(outcome, str) else "withhold"
+        kp = r.get("kept_pane")
+        if col == "by_kept_pane":
+            col = ("other_column" if kp is None
+                   else _BOOT_KEPT_PANE_READINESS.get(kp, "withhold") if isinstance(kp, str) else "withhold")
+        if col != "withhold":
+            continue
+        out.append({"basis": READINESS_BASIS_UNKNOWN, "source": "boot", "role": r.get("role"),
+                    "outcome": outcome, "kept_pane": kp, "surface_ref": r.get("surface_ref"),
+                    "why": "boot row %s%s" % (outcome, (" kept_pane=%s" % kp) if kp is not None else "")})
+    return out
+
+
+def _pack_state_base():
+    """The parent of the pack dir — Rust `pack_state_base()` (src/bin/cys.rs): `pack_dir().parent()`, where Path::parent
+    ignores a trailing separator. Every lane's pack shares it (FIX-SPEC F4), so the record file is shared by all lanes."""
+    p = PACK.rstrip("/\\") or PACK
+    return os.path.dirname(p)
+
+
+def _kept_pane_records_path():
+    """`<pack state base>/.kept-pane-records.jsonl` — Rust `kept_pane_records_path(&pack_state_base())`."""
+    return os.path.join(_pack_state_base(), ".kept-pane-records.jsonl")
+
+
+def _kept_record_is_foreign_lane(row, here_sock=None):
+    """Another lane's record: `owner.socket` is present AND its lane key (this bootstrap's own resolver) differs from this
+    lane's. A row without an owner (or without a socket) is never foreign — kept, on the safe side."""
+    owner = row.get("owner") if isinstance(row, dict) else None
+    sock = owner.get("socket") if isinstance(owner, dict) else None
+    if not isinstance(sock, str) or not sock:
+        return False
+    here = os.environ.get("CYS_SOCKET", "") if here_sock is None else here_sock
+    return lane_key(sock) != lane_key(here)
+
+
+def _num(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _kept_record_live(row, status):
+    """(live, why) of a candidate record's pane — FIX-SPEC §7 A2, ONE lifetime for every seat kind: the daemon instance
+    is always part of the key, the session id only an additional disambiguator, the pid never (A1).
+      · gone: `owner.daemon_started_at` present and ≠ the current `daemon.started_at` (a new daemon = the pane is gone,
+        for claude, codex and gemini alike); or, without it, the daemon started after the record (`started_at > at+1`);
+      · otherwise LIVE iff a non-exited surface with that `surface_id` exists AND (`surface_created_at` absent or equal)
+        AND NOT (both session ids non-null and different). Within one daemon instance surface ids are never reused
+        (cysd's allocator `next_id.fetch_add`, src/bin/cysd/state.rs)."""
+    daemon = status.get("daemon") if isinstance(status.get("daemon"), dict) else {}
+    cur = daemon.get("started_at")
+    owner = row.get("owner") if isinstance(row.get("owner"), dict) else {}
+    then = owner.get("daemon_started_at")
+    if _num(then):
+        if _num(cur) and then != cur:
+            return False, "daemon instance %s → %s (the pane is gone)" % (then, cur)
+    else:
+        at = row.get("at")
+        if _num(cur) and _num(at) and cur > at + 1:
+            return False, "the daemon (started %s) is newer than the record (at %s)" % (cur, at)
+    sid = row.get("surface_id")
+    if not _num(sid):
+        return True, "unattributable record (no surface_id) — kept"
+    seat = None
+    for s in status.get("surfaces") or []:
+        if isinstance(s, dict) and s.get("surface_id") == sid and s.get("exited") is not True:
+            seat = s
+            break
+    if seat is None:
+        return False, "surface:%s is gone" % sid
+    created = row.get("surface_created_at")
+    if created is not None and seat.get("created_at") != created:
+        return False, "surface:%s was re-created (created_at %s ≠ %s)" % (sid, seat.get("created_at"), created)
+    rs, ss = row.get("session_id"), seat.get("registered_session_id")
+    if rs and ss and rs != ss:
+        return False, "surface:%s holds another session (%s ≠ %s)" % (sid, ss, rs)
+    if not _num(then) or created is None:
+        return True, "surface:%s still alive (unattributable identity — kept)" % sid
+    return True, "surface:%s still alive (same daemon instance%s)" % (sid, ", same session" if rs and ss else "")
+
+
+def _kept_pane_records_withheld(status):
+    """P2' — the durable reader: the live rows of `.kept-pane-records.jsonl` that withhold the ready marker.
+    Candidates: `withholds_ready is not False` (missing / non-bool = a candidate, basis "unmeasured"); an unparseable
+    line is a candidate named `unreadable line N`. Another lane's record is skipped (`_kept_record_is_foreign_lane`).
+    `status` None (unreadable) → every candidate is LIVE ("liveness unmeasured"). Deduplicated by the pane identity;
+    each row carries `why`, `basis` and its `record`."""
+    path = _kept_pane_records_path()
+    # ★(B-360 R3 · R1-P-2) a status that is not an object with a `surfaces` list says nothing about any pane: it is
+    #   UNREADABLE (every candidate LIVE, basis unmeasured), never "every pane is gone" (that would be a false ready).
+    status_why = "cys status --json unreadable"
+    if status is not None and not (isinstance(status, dict) and isinstance(status.get("surfaces"), list)):
+        status, status_why = None, "cys status --json has no surfaces list"
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError as e:
+        return [_unmeasured_row("kept-pane record file unreadable (%s: %s)" % (path, e), "record")]
+    out, seen = [], set()
+    for n, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            row = None
+        if not isinstance(row, dict):
+            if ("line", n) not in seen:
+                seen.add(("line", n))
+                out.append(_unmeasured_row("unreadable line %d of %s" % (n, path), "record"))
+            continue
+        wr = row.get("withholds_ready")
+        if wr is False:
+            continue
+        if _kept_record_is_foreign_lane(row):
+            continue
+        if status is None:
+            live, why = True, "liveness unmeasured: %s" % status_why
+        else:
+            live, why = _kept_record_live(row, status)
+        if not live:
+            continue
+        owner = row.get("owner") if isinstance(row.get("owner"), dict) else {}
+        key = (("session", row.get("session_id")) if row.get("session_id")
+               else ("pane", owner.get("daemon_started_at"), row.get("surface_id"), row.get("surface_created_at")))
+        if key in seen:
+            continue
+        seen.add(key)
+        if status is None:
+            entry = _unmeasured_row("liveness of surface:%s unmeasured (%s)"
+                                    % (row.get("surface_id"), status_why), "record")
+        elif wr is True:
+            entry = {"basis": READINESS_BASIS_UNKNOWN, "source": "record", "why": "kept-pane record: %s" % why}
+        else:
+            entry = _unmeasured_row("kept-pane record without withholds_ready (R2): %s" % why, "record")
+        entry.update({"role": row.get("role"), "surface_id": row.get("surface_id"), "write": row.get("write"),
+                      "outcome": row.get("outcome"), "record": row})
+        out.append(entry)
+    return out
+
+
+def _withheld_marker_consequences(is_base):
+    """What is off while the ready marker is absent (the head's loudness condition 4). The base list depends on the
+    completion guard reading the BASE marker by default (`javis_completion_guard._boot_marker_path`) — pinned by
+    test_bootstrap_chain S14; if the guard's source moves, revisit this list."""
+    if is_base:
+        return ["completion-guard Stop verification is SKIPPED (SKIPPED_GRACE) on every pane armed with "
+                "CYS_COMPLETION_GUARD=1, in every lane (the guard reads the base marker)",
+                "CEO promotion is held on a never-promoted base",
+                "javis_bootstrap.py assert-ready refuses (exit 5)"]
+    return ["javis_bootstrap.py assert-ready refuses (exit 5) for this lane",
+            "the base marker and the completion guard are not affected"]
+
+
+def _unlink_with_retry(path):
+    """("removed" | "absent" | "failed", error-or-None) — bounded retry for a Windows sharing violation."""
+    last = None
+    for i in range(_MARKER_UNLINK_TRIES):
+        try:
+            os.unlink(path)
+            return "removed", None
+        except FileNotFoundError:
+            return "absent", None
+        except OSError as e:
+            last = e
+            if i + 1 < _MARKER_UNLINK_TRIES:
+                time.sleep(_MARKER_UNLINK_PAUSE_S)
+    return "failed", "%s: %s" % (type(last).__name__, last)
+
+
+def _new_records_out():
+    """A fresh, absolute out-file path for this run's `cys boot` (CYS_KEPT_PANE_RECORDS_OUT) in a private temp dir."""
+    try:
+        d = tempfile.mkdtemp(prefix="cys-kept-pane-")
+    except OSError as e:
+        return None, "no temp dir for the records out file (%s)" % e
+    return os.path.join(d, "records.json"), None
+
+
+def _split_records_out_lines(se, records_out):
+    """(stderr without this run's deferral lines, those lines). ★(B-360 R3 · REFLECTION-2 R2-P-1) Under the deferral
+    pair the outermost `cys boot` ALWAYS ends its stderr with one `[kept-pane] notice deferred to the caller …` line
+    naming the out file (also with 0 records), which a boot run without the pair never wrote. The old consumers parse
+    the merged text (`_parse_boot_json` takes the last "\\n{" to the END), so that line alone made the JSON of a boot
+    that launched nothing unreadable to them — same verdicts (code-driven fallbacks), but the fatal / gate-pending
+    diagnostics fell back to "--json 계약 소비 불가". The lines are matched by THIS run's fresh out-file path (never by
+    wording), removed from what the old consumers read, and kept by the caller in the ④boot-ready detail."""
+    if not records_out or records_out not in (se or ""):
+        return se, []
+    keep, taken = [], []
+    for line in se.splitlines(True):
+        (taken if records_out in line else keep).append(line)
+    return "".join(keep), [t.strip() for t in taken]
+
+
+def _take_records_out(path):
+    """(records, note) from the out file the outermost `cys boot` wrote (a JSON array), then remove it and its dir.
+    Absent (an old binary, a crash) → [] with a note: the durable record file stays the source of truth."""
+    if not path:
+        return [], "no records out file"
+    note = ""
+    records = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            v = json.load(f)
+        if isinstance(v, list):
+            records = [r for r in v if isinstance(r, dict)]
+            note = "%d record(s) from cys boot" % len(records)
+        else:
+            note = "records out file is not a JSON array — ignored"
+    except FileNotFoundError:
+        note = "cys boot wrote no records out file (an old binary or an early exit)"
+    except (OSError, ValueError) as e:
+        note = "records out file unreadable (%s) — ignored" % e
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+    return records, note
+
+
+def _withheld_text(rows):
+    """Rows as the step / summary text says them: UNKNOWN rows by role/seat/why; unmeasured rows as
+    `readiness unmeasured (<why>)` — never "not ready" / "UNKNOWN" for those."""
+    unknown = [r for r in rows if r.get("basis") == READINESS_BASIS_UNKNOWN]
+    unmeasured = [r for r in rows if r.get("basis") != READINESS_BASIS_UNKNOWN]
+    parts = []
+    if unknown:
+        parts.append("%d pane(s) UNKNOWN: %s" % (len(unknown), "; ".join(
+            "%s@%s (%s)" % (r.get("role") or "?", r.get("surface_ref") or
+                            ("surface:%s" % r["surface_id"] if r.get("surface_id") is not None else "?"),
+                            r.get("why")) for r in unknown)))
+    if unmeasured:
+        parts.append("readiness unmeasured (%s)" % "; ".join(r.get("unmeasured") or r.get("why", "")
+                                                             for r in unmeasured))
+    return " · ".join(parts)
+
+
+def _ready_decision(log, step, boot_so, boot_code, skew_ran, this_run_records, records_note):
+    """★The ONE readiness decision of this run (spec §10: APPLIED here, right after ④, on every branch; `boot_so` None =
+    no `cys boot` ran in this run — the no-deficit branch): (i) a stale lane
+    marker is removed, (ii) the withheld sidecar is written, (iii) then the run's ONE kept-pane notice is sent. Step ⑥
+    only reads the returned decision (it is never recomputed: a pane dying meanwhile only makes it conservative).
+    Never fatal: every failure here is said in the step detail."""
+    try:
+        rows = [] if boot_so is None else _boot_rows_withheld(boot_so, boot_code, skew_ran)
+    except Exception as e:      # noqa: BLE001 — a reader crash must withhold, not crash the boot
+        rows = [_unmeasured_row("boot row reader failed (%s: %s)" % (type(e).__name__, e), "boot")]
+    try:
+        durable = _kept_pane_records_withheld(_cys_status_json())
+    except Exception as e:      # noqa: BLE001
+        durable = [_unmeasured_row("kept-pane record reader failed (%s: %s)" % (type(e).__name__, e), "record")]
+    withheld = rows + durable
+    is_base = _is_base_socket()
+    marker = lane_state_path("marker")
+    decision = {"withheld": withheld, "marker": marker, "stale_marker_remains": False, "remove_error": None,
+                "notice_rc": None, "sidecar": _ready_withheld_path()}
+    parts = []
+    if withheld:
+        state, err = _unlink_with_retry(marker)                                  # (i)
+        if state == "failed":
+            decision["stale_marker_remains"] = True
+            decision["remove_error"] = err
+            parts.append("stale marker COULD NOT BE REMOVED: %s (%s)" % (marker, err))
+        else:
+            parts.append("stale marker %s" % ("removed" if state == "removed" else "absent"))
+        bases = sorted({r.get("basis") for r in withheld})
+        sidecar = {"state": "withheld",
+                   "reason": _withheld_text(withheld),
+                   "bases": bases, "ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "pack_version": _pack_version(),
+                   "lane": lane_key(), "marker": marker, "rows": withheld, "notice_rc": None,
+                   "stale_marker_remains": decision["stale_marker_remains"], "remove_error": decision["remove_error"]}
+        try:
+            _atomic_write_json(decision["sidecar"], sidecar)                       # (ii)
+            parts.append("sidecar %s" % decision["sidecar"])
+        except OSError as e:
+            sidecar = None
+            parts.append("sidecar NOT written (%s): %s" % (decision["sidecar"], e))
+    else:
+        sidecar = None
+    records = list(this_run_records)
+    seen = {json.dumps(r, sort_keys=True) for r in records}
+    for r in durable:
+        rec = r.get("record")
+        if isinstance(rec, dict) and json.dumps(rec, sort_keys=True) not in seen:
+            seen.add(json.dumps(rec, sort_keys=True))
+            records.append(rec)
+    if records or withheld:                                                      # (iii)
+        payload = {"command": "bootstrap", "records": records, "ready_withheld": None}
+        if withheld:
+            payload["ready_withheld"] = {
+                "marker": marker, "lane": "base" if is_base else "dept",
+                "consequences": _withheld_marker_consequences(is_base),
+                "remove_error": decision["remove_error"],
+                "unmeasured": [r.get("unmeasured") or r.get("why", "") for r in withheld
+                               if r.get("basis") != READINESS_BASIS_UNKNOWN]}
+        rc, so, se = _run_split(["cys", "kept-pane-notice", "--input", "-"], timeout=KEPT_PANE_NOTICE_TIMEOUT_S,
+                                input_text=json.dumps(payload, ensure_ascii=False))
+        decision["notice_rc"] = rc
+        parts.append("kept-pane notice exit %s (%d record(s))%s" % (rc, len(records),
+                                                                    (": " + (so + se).strip()[-400:]) if (so + se).strip() else ""))
+        if sidecar is not None:
+            sidecar["notice_rc"] = rc
+            try:
+                _atomic_write_json(decision["sidecar"], sidecar)
+            except OSError:
+                pass            # the first write already holds the withheld state; only the rc is missing
+    else:
+        parts.append("no kept-pane notice (no record, nothing withheld)")
+    head = ("ready WITHHELD — %s" % _withheld_text(withheld)) if withheld else "ready not withheld"
+    detail = "%s · %s · records out: %s%s" % (head, " · ".join(parts), records_note,
+                                              " · BOOT_SKEW bare boot: no rows (old binary)" if skew_ran else "")
+    # ★(B-360 R3 · R1-P-3) the step itself never fails: the notice's rc is in the DETAIL (FIX-SPEC §2e), so a
+    #   coalesced / master-less notice (exit 3) does not read as a failed step in boot-last `steps`.
+    log.step(step, 0, detail, suffix="-ready")
+    if withheld:
+        _progress("⚠ ready marker %s — %s (not fatal; notice exit %s)"
+                  % ("COULD NOT BE REMOVED: %s" % decision["remove_error"] if decision["stale_marker_remains"]
+                     else "withheld", _withheld_text(withheld), decision["notice_rc"]))
+    return decision
+
+
 def _recheck_windows_host():
     """이 부트가 **Windows 호스트** 위인가 — `javis_resource_gate._is_windows_host` 와 같은 규칙.
 
@@ -3424,6 +3852,10 @@ def _cmd_run_chain(log):
     # 결손 0(재선언·의무 좌석 전원 생존) → 게이트와 ④ cys boot 호출 자체를 생략("결손 0=스폰 없음").
     orchestra = os.path.join(PACK, "bin", "javis_orchestra.py")
     has_deficit, deficit_why = _team_has_deficit()
+    # ★(B-360 R3 · option 2) this run's `cys boot` STDOUT (the readiness rows parse it ONLY — Y2) and the run's ONE
+    #   readiness decision, computed right after ④ on both branches and only READ at ⑥ (never recomputed).
+    boot_so = ""
+    ready = None
     if has_deficit:
         gate_rc = _run_resource_gate(py, log)
         if gate_rc is not None:
@@ -3434,7 +3866,25 @@ def _cmd_run_chain(log):
         # ④ 4종 의무 노드 기동 — 결손>0에서만 호출(결손 0=스폰 경로 미진입)
         boot_budget = _budget_derived("cys_boot_outer_s", 300)
         _progress("④ 4종 의무 노드 기동 중(최대 %ds — 예산 파생)…" % boot_budget)
-        code, out = _run(["cys", "boot", "--json"], timeout=boot_budget)
+        # ★(B-360 R3 · Y2) stdout and stderr SEPARATELY: the readiness rows parse STDOUT only (a pane launch writes a
+        #   stderr line after the JSON, which breaks a merged parse). `out = boot_so + boot_se` is byte-identical to the
+        #   old `_run` text, so every old consumer below (fatal / busy / gate verdicts, the ④ step, BOOT_SKEW) is unchanged.
+        #   The boot defers its one kept-pane notice to this run (worker-7's veto of FIX-SPEC §1e): its records come back
+        #   through a fresh out file, read on EVERY exit path of the call and removed after reading.
+        #   ★(REFLECTION-2 R2-P-1) "unchanged" holds end to end only without the deferral's own stderr line (printed on
+        #   every deferred run, also with 0 records — a run without the pair never wrote it): those lines are taken out
+        #   of `boot_se` BEFORE `out` is formed, matched by this run's out-file path, and kept in the ④boot-ready detail.
+        records_out, out_err = _new_records_out()
+        boot_env = dict(os.environ)
+        boot_env.pop("CYS_KEPT_PANE_NOTICE", None)
+        boot_env.pop("CYS_KEPT_PANE_RECORDS_OUT", None)
+        if records_out:
+            boot_env["CYS_KEPT_PANE_NOTICE"] = "caller"
+            boot_env["CYS_KEPT_PANE_RECORDS_OUT"] = records_out
+        code, boot_so, boot_se = _run_split(["cys", "boot", "--json"], timeout=boot_budget, env=boot_env)
+        boot_se, deferral_lines = _split_records_out_lines(boot_se, records_out)
+        out = boot_so + boot_se
+        skew_ran = False
         # ★★팩↔바이너리 스큐 방어(온보딩 치명 위험 차단): 구 `cys` 바이너리는 `--json` 을 모르므로
         #   clap 이 **사용오류(exit 2)** 로 즉사한다 — 그대로 두면 아래 `_boot_fatal_verdict` 가
         #   '비0=Fatal' 보수 폴백을 적용해 **모든 부트가 exit 4 로 실패**한다(팩만 먼저 갱신된
@@ -3445,8 +3895,20 @@ def _cmd_run_chain(log):
                      "`cys boot --json` 미지원(구 바이너리) — bare `cys boot` 로 1회 폴백. "
                      "팩↔바이너리 버전 스큐를 해소하라(`cys --version` 확인).")
             _progress("⚠ ④ `--json` 미지원 바이너리 — 구계약(bare cys boot)으로 폴백")
-            code, out = _run(["cys", "boot"], timeout=boot_budget)
+            code, boot_so, boot_se = _run_split(["cys", "boot"], timeout=boot_budget, env=boot_env)
+            boot_se, skew_deferral = _split_records_out_lines(boot_se, records_out)
+            deferral_lines = deferral_lines + skew_deferral
+            out = boot_so + boot_se
+            skew_ran = True
+        this_run_records, records_note = _take_records_out(records_out)
+        if out_err:
+            records_note = "%s (%s)" % (records_note, out_err)
+        if deferral_lines:
+            records_note = "%s · cys boot said: %s" % (records_note, " / ".join(deferral_lines))
         log.step(STEP.BOOT, code, out)
+        # ★(B-360 R3 · spec §10) the readiness decision is APPLIED here — before the fatal return below — so the notice's
+        #   clause is true on every exit path (0, 4, 6, exceptions); ⑥ only skips writing the marker.
+        ready = _ready_decision(log, STEP.BOOT, boot_so, code, skew_ran, this_run_records, records_note)
         # ★B1 PLAN 정책 열 소비 — exit 4(부트 실패)는 **Fatal 실패에서만** 낸다.
         #   종전엔 `cys boot` 의 어떤 비0 도 exit 4 로 승격돼, 리뷰어 1종 고장(Degrade)이 팀 전체
         #   기동 실패로 번지는 영구 데드엔드였다(B1). 판정은 --json 의 role 별 outcome·mandatory 를
@@ -3507,6 +3969,9 @@ def _cmd_run_chain(log):
         # 않는다(향후 실 기동에 재사용). ⑤ check는 유지(생존 재확인).
         log.step(STEP.BOOT_SKIP, 0, "결손 0(구성 충족) — cys boot·④-b 생략(스폰 없음·티켓 미소비)")
         _progress("④ 결손 0(전 구성 생존) — 팀 기동 생략, ⑤ 생존 재확인으로 진행")
+        # ★(B-360 R3 · P2') no boot ran, so no rows — but a durable record whose pane is still alive withholds (a later
+        #   run's success never erases an unresolved write: the head's P1-costume case).
+        ready = _ready_decision(log, STEP.BOOT_SKIP, None, 0, False, [], "no cys boot in this run")
 
     # ⑤ orchestra check — bounded retry(노드 ready는 비동기·check는 스냅샷)
     _progress("⑤ 노드 생존 결정론 확인(check · 최대 %d회×%.0fs 재시도 = %ds 창)…"
@@ -3638,15 +4103,37 @@ def _cmd_run_chain(log):
     if ack_pending:
         _marker_payload["orchestra_check_ack_pending"] = True
     _marker_path = lane_state_path("marker")
-    _atomic_write_json(_marker_path, _marker_payload)
-    if _is_base_socket():
-        log.step(STEP.MARKER, 0, _marker_path)
-        marker_note = "base 마커 기록"
+    ready = ready or {}
+    withheld = ready.get("withheld") or []
+    if withheld:
+        # ★(B-360 R3 · option 2) the withhold was APPLIED at ④ (stale marker removed, sidecar written, notice sent):
+        #   ⑥ only does not write. Not fatal: ⑦ and ⑧ run as today, exit stays EXIT_OK.
+        if ready.get("stale_marker_remains"):
+            log.step(STEP.MARKER, 0,
+                     "ready marker could not be removed: %s (%s) — %s (not fatal; notice: %s)"
+                     % (_marker_path, ready.get("remove_error"), _withheld_text(withheld), ready.get("notice_rc")))
+            _progress("⚠ ⑥ ready marker could not be removed (%s) — it still reads as ready" % ready.get("remove_error"))
+            marker_note = "ready marker could not be removed (stale marker remains) — %s" % _withheld_text(withheld)
+        else:
+            log.step(STEP.MARKER, 0, "marker withheld — %s (not fatal; notice: %s)"
+                     % (_withheld_text(withheld), ready.get("notice_rc")))
+            _progress("⚠ ⑥ ready marker withheld — %s" % _withheld_text(withheld))
+            marker_note = "ready marker withheld — %s" % _withheld_text(withheld)
     else:
-        log.step(STEP.MARKER, 0,
-                 "레인 마커 기록: %s (base 마커 %s 무접촉 — CEO 게이트 불가침)"
-                 % (_marker_path, MARKER))
-        marker_note = "부서 레인 마커 기록 — base 마커 무접촉"
+        _atomic_write_json(_marker_path, _marker_payload)
+        # ★(A3a) marker = ready · sidecar = withheld · neither = never written: a written marker clears the sidecar
+        _sc_state, _sc_err = _unlink_with_retry(_ready_withheld_path())
+        _sc_note = ("" if _sc_state == "absent" else
+                    " · withheld sidecar removed" if _sc_state == "removed" else
+                    " · ⚠ withheld sidecar NOT removed (%s)" % _sc_err)
+        if _is_base_socket():
+            log.step(STEP.MARKER, 0, _marker_path + _sc_note)
+            marker_note = "base 마커 기록"
+        else:
+            log.step(STEP.MARKER, 0,
+                     "레인 마커 기록: %s (base 마커 %s 무접촉 — CEO 게이트 불가침)%s"
+                     % (_marker_path, MARKER, _sc_note))
+            marker_note = "부서 레인 마커 기록 — base 마커 무접촉"
 
     # ⑦ 승격 pending 해소 요청(비대기) — 동의·실제 승격은 부트 밖(배지/feed·차기 lifecycle)
     if _is_base_socket():
@@ -3691,6 +4178,16 @@ def _cmd_run_chain(log):
     summary = {"ok": True, "marker": marker_note, "hooks_effective": _hooks_effective(PACK),
                "steps": [(s["step"], s["exit"]) for s in log.data["steps"]],
                "lane": log.lane, "boot_last": log.path}
+    # ★(B-360 R3) additive keys: `ready` (false = the marker was withheld) and, when withheld, the rows (each with its
+    #   `basis`); `stale_marker_remains` when the stale marker could not be removed. `ok` / EXIT_OK are unchanged.
+    summary["ready"] = not withheld
+    if withheld:
+        summary["ready_withheld"] = withheld
+        # ★(B-360 R3 · R1-P3-1) unmeasured is not a value: ⑧ names the bases, so `ready: false` is never read as
+        #   "measured not ready" when readiness was unmeasured
+        summary["ready_bases"] = sorted({r.get("basis") for r in withheld})
+    if ready.get("stale_marker_remains"):
+        summary["stale_marker_remains"] = True
     # ★A7 채널 보존: 완주는 stdout 최종 JSON(구 산문 계약의 유일한 인용 근거)이다.
     log.result(ok=True, state="completed", exit=EXIT_OK)
     print(json.dumps(summary, ensure_ascii=False))
@@ -3708,6 +4205,9 @@ def cmd_status():
                       "base_marker": _read_json(MARKER), "base_marker_path": MARKER,
                       "boot_last": _read_json(bl_path), "boot_last_path": bl_path,
                       "skip_record": _read_json(lane_state_path("skip")),
+                      # ★(B-360 R3 · A3a) the withheld state, distinguishable from "never written" (additive)
+                      "ready_withheld": _read_json(_ready_withheld_path()),
+                      "ready_withheld_path": _ready_withheld_path(),
                       "base_socket": _is_base_socket()}, ensure_ascii=False, indent=1))
     return 0
 

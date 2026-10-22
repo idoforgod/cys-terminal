@@ -150,6 +150,10 @@ LANE_STATE_KINDS = {
     #     원장이 **조용히** 무력화되므로 양쪽에 교차 테스트를 둔다.
     "delivery": (_STATE, "delivery", ".jsonl"),
     "delivery_epoch": (_STATE, "delivery", ".epoch.json"),
+    # ★(B-360 R3 · A3a) 레디 마커의 **보류(withheld)** 상태 사이드카 — javis_bootstrap 이 쓰고 `status` 가 낸다.
+    #   boot_last 와 같은 접미 규약(base=무접미). 이름이 `.master-bootstrapped` 로 시작하지 않는다(마커 판독자 전부가
+    #   그 접두를 본다 — 보류가 '준비 완료'로 오독되면 안 된다).
+    "ready_withheld": (_STATE, "ready-withheld", ".json"),
 }
 
 # 항상 레인 접미가 붙는 종류(base 예외 없음) — 위 주석의 규약을 코드로 고정한다.
@@ -158,7 +162,7 @@ ALWAYS_LANE_SUFFIXED = ("skip", "lock", "delivery", "delivery_epoch")
 
 def lane_state_path(kind, sock=None):
     """레인 스코프 상태 파일 경로.
-    kind ∈ marker|boot_last|skip|lock|mission|delivery|delivery_epoch.
+    kind ∈ marker|boot_last|skip|lock|mission|delivery|delivery_epoch|ready_withheld.
     base 레인: 역사적 경로(마커=`~/.cys/.master-bootstrapped` · `boot-last.json`).
     비-base 레인: `-<lane>` 접미(`.master-bootstrapped-<lane>` · `boot-last-<lane>.json`).
     ※ skip·lock·delivery* 는 **항상** 레인별이다 — 규약을 이 함수 하나로 모은다(사본 금지)."""

@@ -384,11 +384,17 @@ def _mock_cys(bindir, tmp, extra_case=""):
       frontdoor leg 를 재려는 검체가 어느 leg 를 재는지 불명해진다. frontdoor leg 는 신설 검체
       (H-BOOT-INTENT-1)가 자기 arm 을 extra_case 로 주입해 전담한다 — extra_case 의 분기가
       먼저 매치되므로 이 기본값을 이긴다."""
+    # ★(B-360 R3 · worker-7 approved — fixture realism) a real `cys boot --json` that exits 0 ALWAYS prints its JSON
+    #   line (src/bin/cys.rs run_boot has exactly two exits, both print under `if as_json`); a silent exit 0 now
+    #   withholds the ready marker as "readiness unmeasured". The default arm prints the minimal real report AFTER
+    #   `{extra}`, so a specimen's own `boot` arm still wins; on af41d65c this JSON gives the same verdicts as silence.
     _w(os.path.join(bindir, "cys"),
        "#!/bin/sh\n"
        'printf "%s\\n" "cys $*" >> "{log}"\n'
        "{extra}\n"
        "case \"$1\" in boot-intent) echo \"error: unrecognized subcommand 'boot-intent'\" >&2; exit 2;; esac\n"
+       "case \"$1\" in boot) [ \"$2\" = --json ] && "
+       "echo '{{\"roles\": [], \"summary\": {{\"lock\": \"acquired\", \"fatal_failed\": 0}}}}'; exit 0;; esac\n"
        "exit 0\n".format(log=os.path.join(tmp, "calls.log"), extra=extra_case))
 
 
@@ -3237,8 +3243,37 @@ def h_safe_1():
     ok_at = arm.find("Ok(()) =>")
     err_at = arm.find("Err(hold) =>")
     need(0 <= err_at < ok_at, "미확정(Err) 분기가 확정(Ok) 분기보다 뒤에 있다(구조 취약)")
-    need("run_node_recover" in arm[ok_at:], "확정 분기에 node-recover 가 없다")
-    need("run_node_recover" not in arm[err_at:ok_at],
+    # ★(B-360 R3 · area H · worker-7: FALSE RED repaired on CONTENT) B-360 R2 (b5b044af) put node-recover behind a
+    #   test seam: the arm now calls `boot_node_recover(`, whose body ends in `run_node_recover(` and only a
+    #   `#[cfg(test)]` block can short-circuit it. The literal "run_node_recover" in the arm window went red although
+    #   node-recover still runs. The pin now reads the CALL in the arm AND the delegation in the wrapper's NON-test body
+    #   (comments and `#[cfg(test)]` blocks stripped — neither calls anything in production).
+    _ok_arm = _rs_prod_lines(arm[ok_at:])
+    if "run_node_recover(" not in _ok_arm:
+        # prerequisite: the arm calls the wrapper
+        need("boot_node_recover(" in _ok_arm,
+             "확정 분기에 node-recover 가 없다 — the death-confirmed arm calls neither run_node_recover( nor "
+             "boot_node_recover( (prerequisite)")
+        # DISCRIMINATING: the wrapper's non-test body delegates to run_node_recover
+        _deleg, _deleg_why = _rs_fn_nontest_calls(src, "boot_node_recover", "run_node_recover(")
+        need(_deleg,
+             "확정 분기의 boot_node_recover 가 run_node_recover 에 위임하지 않는다 (DELEGATION: %s) — the "
+             "death-confirmed arm must reach run_node_recover; red after an edit means the wrapper lost the "
+             "delegation: restore it; do not weaken this pin." % _deleg_why)
+        notes.append("확정 분기=boot_node_recover → run_node_recover(비테스트 본문 위임)")
+    else:
+        notes.append("확정 분기=run_node_recover 직접")
+    # the pin's own measurement validity (comment-only control): a delegation that exists only in a comment or only
+    # inside a #[cfg(test)] block is NOT a delegation; comments around a real one change nothing
+    _syn = ("\nfn boot_node_recover(sref: &str, role: &str) -> i32 {\n    #[cfg(test)]\n    if let Some(rc) = seam() {\n"
+            "        return run_node_recover(None, None);\n    }\n    // run_node_recover(Some(x), Some(y)) — prose only\n"
+            "    0\n}\n")
+    need(not _rs_fn_nontest_calls(_syn, "boot_node_recover", "run_node_recover(")[0],
+         "계측 타당성 실패: a delegation only in a comment / a #[cfg(test)] block was read as a real one")
+    _syn_ok = _syn.replace("    0\n}\n", "    // a comment-only edit\n    run_node_recover(Some(sref.to_string()), Some(role.to_string()))\n}\n")
+    need(_rs_fn_nontest_calls(_syn_ok, "boot_node_recover", "run_node_recover(")[0],
+         "계측 타당성 실패: a real delegation next to comment-only edits was not read")
+    need("run_node_recover" not in arm[err_at:ok_at] and "boot_node_recover(" not in arm[err_at:ok_at],
          "미확정 분기에서 node-recover 를 호출한다(살아있는 pane 주입 — ④ 재발)")
     need("escalate_reclaim" not in arm[err_at:ok_at],
          "미확정 분기에서 reclaim(kill)을 호출한다(오살 — ④ 재발)")
@@ -11738,8 +11773,33 @@ def h_obs_2():
     ai = body.find("let ack_deadline")
     need(ai > 0, "ack 창을 못 찾았다")
     ack_seg = body[ai:body.find("// 5) T2-5", ai) if body.find("// 5) T2-5", ai) > 0 else ai + 3000]
-    need("return Err(" not in ack_seg,
-         "주입 검증 미확인이 Err 로 승격됐다(금지 방향 ③ 위반 — 위경고 모드 회귀)")
+    # ★(B-360 R3 · area H · NARROWED by the head's ruling) ⓓ's intent: an unconfirmed VERIFICATION must not kill the
+    #   boot. B-360 R2 (02351e55, S29) added ONE legitimate Err in the window — an UNKNOWN write (the directive may still
+    #   land) with no evidence returns the existing UNKNOWN (exit 91): the write's outcome, not "verification failed".
+    #   Exempted by the NAMED GUARD (content, never position): the guard tuple must be exactly
+    #   `if let (Some(e), false) = (write_unknown, verified)` and its block exactly `return Err(e);`. Any other
+    #   `return Err(` — in that arm or anywhere in the window — stays red (comments stripped first).
+    #   New failure direction of this pin: it fails toward permitting a future Err written into the exempted arm,
+    #   which the exact-block match below exists to stop.
+    _guarded = re.compile(r"if let \(Some\(e\), false\) = \(write_unknown, verified\) \{\s*return Err\(e\);\s*\}")
+    def _ack_window_errs(seg):
+        return _guarded.sub("", _rs_prod_lines(seg)).count("return Err(")
+    need(_ack_window_errs(ack_seg) == 0,
+         "주입 검증 미확인이 Err 로 승격됐다(금지 방향 ③ 위반 — 위경고 모드 회귀) — the only Err allowed in the ack "
+         "window is the S29 arm `if let (Some(e), false) = (write_unknown, verified) { return Err(e); }` (an UNKNOWN "
+         "write without evidence), guard and block exactly that. Red after an edit means another path turns an "
+         "unconfirmed injection into a failure (or the guard was weakened): remove it; do not widen this pin.")
+    notes.append("ⓓ 축소: Err 는 S29 명명 가드(정확 일치) 하나만")
+    # measurement validity: the exact arm is exempt; a weakened guard, an extra Err inside the arm, and an unguarded
+    # Err beside it are all still read
+    _arm = "if let (Some(e), false) = (write_unknown, verified) {\n        return Err(e);\n    }\n"
+    need(_ack_window_errs(_arm) == 0, "계측 타당성 실패: the exact S29 arm was not exempted")
+    need(_ack_window_errs(_arm.replace("(Some(e), false)", "(Some(e), _)")) == 1,
+         "계측 타당성 실패: a weakened guard `(Some(e), _)` was exempted")
+    need(_ack_window_errs(_arm.replace("        return Err(e);", "        if x { return Err(y); }\n        return Err(e);")) >= 1,
+         "계측 타당성 실패: an extra Err inside the exempted arm was not read")
+    need(_ack_window_errs(_arm + "    if !verified { return Err(x); }\n") == 1,
+         "계측 타당성 실패: an unguarded Err beside the S29 arm was not read")
     need("부트는 계속한다(치명 아님)" in ack_seg, "치명 아님 계약이 코드에 명문화되지 않음")
     # ⓔ **전문 디렉티브 재주입 0** — 그 경로는 boot_node(짧은 각성문)의 몫이다
     need("inject_text(sid, &directive)" in body, "주입 지점을 못 찾았다")
@@ -15257,6 +15317,40 @@ def _rs_prod(src):
     if i > 0:
         src = src[:i]
     return "\n".join(l.split("//")[0] for l in src.splitlines())
+
+
+def _rs_fn_nontest_calls(src, name, callee):
+    """(bool, why) — does the body of `fn <name>(` call `callee` OUTSIDE `#[cfg(test)]`? `//` comments are stripped
+    and every `#[cfg(test)]`-attributed statement/block inside the body is cut (brace-balanced to its end, or to the
+    next `;` when it has no block). ★(B-360 R3 · area H) Added for H-SAFE-1's content-anchored repair."""
+    head = "\nfn %s(" % name
+    at = (src or "").find(head)
+    if at < 0:
+        return False, "no `fn %s(`" % name
+    end = src.find("\n}\n", at)
+    body = _rs_prod_lines(src[at:end if end > 0 else len(src)])
+    while True:
+        i = body.find("#[cfg(test)]")
+        if i < 0:
+            break
+        j = i + len("#[cfg(test)]")
+        brace, semi = body.find("{", j), body.find(";", j)
+        if brace < 0 or (0 <= semi < brace):
+            body = body[:i] + body[(semi + 1) if semi >= 0 else len(body):]
+            continue
+        depth, k = 0, brace
+        while k < len(body):
+            if body[k] == "{":
+                depth += 1
+            elif body[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        body = body[:i] + body[k + 1:]
+    if callee in body:
+        return True, "`fn %s` delegates to %s outside #[cfg(test)]" % (name, callee)
+    return False, "`fn %s` does NOT call %s outside #[cfg(test)]" % (name, callee)
 
 
 def _rs_const_usize(src, name):

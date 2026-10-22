@@ -36,7 +36,8 @@ def check(name, cond, detail=""):
 def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
              check_fail_times=0, check_final=0, socket="", check_needs_reviewers=False,
              br_exit=0, pack_dept=None, boot_stdout="", boot_stderr="", status_json=None,
-             records_lines=None, boot_records_out=None, notice_exit=0, boot_json_unsupported=False):
+             records_lines=None, boot_records_out=None, notice_exit=0, boot_json_unsupported=False,
+             boot_deferral_line=False):
     """임시 HOME + 가짜 팩 + 스텁 생성 → 환경 dict 반환.
     pack_dept=<부서명>: 팩을 ~/.cys/pack-dept-<부서명>에 만들고 CYS_PACK_DIR로 지정
     (증분1 레인↔팩 정합 가드 — 부서 소켓 레인은 같은 부서 팩 페어링 필수·불일치=exit 8).
@@ -47,7 +48,10 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
       boot_records_out = the JSON text the stub `cys boot` writes to $CYS_KEPT_PANE_RECORDS_OUT (if set);
       notice_exit = the stub `cys kept-pane-notice` exit; boot_json_unsupported = the stub `cys boot --json` fails
       like an old binary's clap (exit 2, "unexpected argument") and only bare `cys boot` works. The stub logs each
-      boot's deferral env to boot-env.log and each notice's stdin to notice-in.<n>.json."""
+      boot's deferral env to boot-env.log and each notice's stdin to notice-in.<n>.json.
+      ★(REFLECTION-2 R2-P-1) boot_deferral_line = the stub `cys boot` behaves like the real binary under the deferral
+      pair: it writes the out file (`[]` unless boot_records_out) and ends stderr with the one line the real Drop prints,
+      `[kept-pane] notice deferred to the caller (N record(s) written to <out>)`. Off by default (the old stub)."""
     home = os.path.join(tmp, "home")
     pack = os.path.join(home, ".cys",
                         "pack-dept-%s" % pack_dept if pack_dept else "pack")
@@ -63,6 +67,12 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
     # 스텁 cys — 서브커맨드별 exit·호출 기록(calls.log)
     # ★(B-360 R3) boot/status/kept-pane-notice read their payloads from files in tmp (no shell quoting of JSON);
     #   an absent file means "print nothing", which is the old stub's behaviour.
+    # ★(B-360 R3 · worker-7's no-JSON ruling (b)) a real `cys boot --json` that exits 0 ALWAYS prints its JSON line
+    #   (cys.rs run_boot); exit 0 with an unreadable stdout now withholds the ready marker as "readiness unmeasured". So
+    #   the stub's default for an exit-0 boot is the minimal real report (no roles), not silence — on af41d65c that is
+    #   the same verdict as silence (not fatal, marker written), which keeps sections 1-12 meaning what they meant.
+    if not boot_stdout and boot_exit == 0:
+        boot_stdout = json.dumps({"roles": [], "summary": {"lock": "acquired", "fatal_failed": 0}}) + "\n"
     for name, body in (("boot.stdout", boot_stdout), ("boot.stderr", boot_stderr),
                        ("status.json", status_json), ("boot.records", boot_records_out)):
         if body:
@@ -90,6 +100,10 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
         "    if [ -n \"${CYS_KEPT_PANE_RECORDS_OUT:-}\" ] && [ -f \"$T/boot.records\" ]; then\n"
         "      cp \"$T/boot.records\" \"$CYS_KEPT_PANE_RECORDS_OUT\"\n"
         "    fi\n"
+        "    if [ %(deferral)d -eq 1 ] && [ \"${CYS_KEPT_PANE_NOTICE:-}\" = caller ] && [ -n \"${CYS_KEPT_PANE_RECORDS_OUT:-}\" ]; then\n"
+        "      [ -f \"$CYS_KEPT_PANE_RECORDS_OUT\" ] || printf '[]' > \"$CYS_KEPT_PANE_RECORDS_OUT\"\n"
+        "      echo \"[kept-pane] notice deferred to the caller (0 record(s) written to $CYS_KEPT_PANE_RECORDS_OUT)\" >&2\n"
+        "    fi\n"
         "    exit %(boot)d;;\n"
         "  status) [ -f \"$T/status.json\" ] && cat \"$T/status.json\"; exit 0;;\n"
         "  kept-pane-notice)\n"
@@ -98,7 +112,8 @@ def make_env(tmp, *, claim_exit=0, ping_exit=0, boot_exit=0, preflight_exit=0,
         "    exit %(notice)d;;\n"
         "  --version) echo 'cys 0.0.0-stub'; exit 0;;\n"
         "esac\nexit 0\n") % {"t": tmp, "ping": ping_exit, "claim": claim_exit, "boot": boot_exit,
-                              "notice": notice_exit, "nojson": 1 if boot_json_unsupported else 0})
+                              "notice": notice_exit, "nojson": 1 if boot_json_unsupported else 0,
+                              "deferral": 1 if boot_deferral_line else 0})
     # 스텁 preflight
     w(os.path.join(pack, "bin", "javis_preflight.py"),
       "import sys; sys.exit(%d)\n" % preflight_exit, 0o644)
@@ -860,6 +875,8 @@ with open(_cys_stub, "w", encoding="utf-8", newline="\n") as f:
             "    n=$((n+1)); printf %%s \"$n\" > \"%(t)s/ping.count\"\n"
             "    [ \"$n\" -le 2 ] && exit 1\n"
             "    exit 0;;\n"
+            # ★(B-360 R3) fixture realism (worker-7 approved): a real `cys boot --json` exit 0 prints its JSON line
+            "  boot) echo '{\"roles\": [], \"summary\": {\"lock\": \"acquired\", \"fatal_failed\": 0}}'; exit 0;;\n"
             "  --version) echo 'cys 0.0.0-stub'; exit 0;;\n"
             "esac\nexit 0\n" % {"t": tmp})
 os.chmod(_cys_stub, 0o755)
@@ -1514,8 +1531,13 @@ def r3_busy():
                         "summary": {"busy": 1, "lock": "busy", "fatal_failed": 0}}) + "\n"
     r = r3_run(boot_exit=75, boot_stdout=mixed)
     check("32-busy ★lock=busy with one directive_unknown row → classified → marker ABSENT", not r["marker"], r3_brief(r))
-    check("32-busy ★identity: the withheld row is that directive_unknown row (basis unknown) — the busy row is not",
-          len(r3_rows(r)) == 1 and r3_is_row(r3_rows(r)[0], "boot", "unknown", outcome="directive_unknown"),
+    # (corrected after 08981f1f: per worker-7's busy ruling a mixed report is classified row by row, so its "busy" row is
+    #  a value no table knows and withholds through the catch-all too — two rows, both basis unknown)
+    check("32-busy ★identity: the directive_unknown row withholds (basis unknown) and the mixed report's busy row is "
+          "classified by the tables (catch-all → withheld, basis unknown)",
+          len(r3_rows(r)) == 2
+          and any(r3_is_row(x, "boot", "unknown", outcome="directive_unknown") for x in r3_rows(r))
+          and any(r3_is_row(x, "boot", "unknown", outcome="busy") for x in r3_rows(r)),
           json.dumps(r3_rows(r), ensure_ascii=False)[:300])
 
 
@@ -1659,6 +1681,54 @@ def r3_r1():
 
 
 for _name, _fn in (("35-R1", r3_r1),):
+    if os.environ.get("BOOT_R3_ONLY") and _name not in os.environ["BOOT_R3_ONLY"].split(","):
+        continue
+    r3_section(_name, _fn)
+
+
+# ── 36. REFLECTION-2 fix R2-P-1: the deferral's own stderr line never reaches the OLD consumers ──
+#    The real `cys boot` under the deferral pair ALWAYS ends stderr with `[kept-pane] notice deferred to the caller (N
+#    record(s) written to <out>)` — also with 0 records; a boot run without the pair never printed it. The old consumers
+#    (`_boot_fatal_verdict` / `_boot_was_busy` / `_boot_gate_pending_verdict` / the ④boot step) parse the merged text up to
+#    its END, so that line alone made a no-launch boot's JSON unreadable to them: same verdicts, but the fatal reason fell
+#    back to "--json 계약 소비 불가" and a gate-pending boot lost its role list. The stub prints the real line only with
+#    `boot_deferral_line=True`; each "control" row runs the same boot without it (it passes before and after the fix).
+def r3_r2():
+    missing = r3_row("worker", "missing", True, install_hint="install the worker CLI (stub hint)")
+    for name, kw in (("with the real deferral line", {"boot_deferral_line": True}),
+                     ("control: no deferral line", {})):
+        r = r3_run(boot_exit=1, boot_stdout=r3_boot_stdout(missing), **kw)
+        check("36-R2-P-1 %s: prerequisite: mandatory missing, boot exit 1 → bootstrap exit 4 (verdict)" % name,
+              r["code"] == 4, r3_brief(r))
+        check("36-R2-P-1 %s: ★the fatal reason is the structured one (worker=missing [hint]), never the '--json 계약 "
+              "소비 불가' fallback" % name,
+              "의무(Fatal) 역할 기동 실패: worker=missing [install the worker CLI (stub hint)]" in r["err"]
+              and "--json 계약 소비 불가" not in r["err"], r["err"][-400:].replace("\n", " | "))
+    gated = r3_row("worker", "gate_pending", True, reason="first-run gate (stub)")
+    for name, kw in (("with the real deferral line", {"boot_deferral_line": True}),
+                     ("control: no deferral line", {})):
+        r = r3_run(boot_exit=78, boot_stdout=r3_boot_stdout(gated), **kw)
+        st = [x for x in r["steps"] if x.get("step") == "④boot-gate-pending"]
+        check("36-R2-P-1 %s: ★a gate-pending boot (exit 78) names its role in the ④boot-gate-pending step, never "
+              "'(--json 소비 불가'" % name,
+              len(st) == 1 and "worker=gate_pending" in st[0].get("detail", "")
+              and "(--json 소비 불가" not in st[0].get("detail", ""),
+              "%r" % [(x.get("step"), x.get("detail", "")[:160]) for x in st])
+    so = r3_boot_stdout(r3_row("cso", "already_alive", True), r3_row("worker", "already_alive", True))
+    r = r3_run(boot_stdout=so, boot_deferral_line=True)
+    st = [x for x in r["steps"] if x.get("step") == "④boot"]
+    check("36-R2-P-1 ★a clean no-launch boot: the ④boot detail an OLD consumer gets is the boot's text WITHOUT the "
+          "deferral line (== so.strip()[-2000:])",
+          len(st) == 1 and st[0].get("detail") == so.strip()[-2000:], "%r" % [x.get("detail", "")[-200:] for x in st])
+    rd = [x for x in r["steps"] if x.get("step") == "④boot-ready"]
+    check("36-R2-P-1 ★the deferral line is not dropped: the ④boot-ready detail says what cys boot said",
+          len(rd) == 1 and "cys boot said: [kept-pane] notice deferred to the caller (0 record(s) written to "
+          in rd[0].get("detail", ""), "%r" % [x.get("detail", "")[-300:] for x in rd])
+    check("36-R2-P-1 prerequisite: that clean run completes (exit 0) with the marker written", r["code"] == 0
+          and r["marker"], r3_brief(r))
+
+
+for _name, _fn in (("36-R2", r3_r2),):
     if os.environ.get("BOOT_R3_ONLY") and _name not in os.environ["BOOT_R3_ONLY"].split(","):
         continue
     r3_section(_name, _fn)
