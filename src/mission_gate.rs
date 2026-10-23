@@ -2838,6 +2838,16 @@ mod tests {
         assert_eq!(k["DELIVERY_CAPPED_FOLD_S"].as_f64(), Some(DELIVERY_CAPPED_FOLD_S));
         assert_eq!(k["DELIVERY_SCAN_LINES"].as_u64(), Some(DELIVERY_SCAN_LINES as u64));
         assert_eq!(k["LEDGER_MAX_READ_BYTES"].as_u64(), Some(LEDGER_MAX_READ_BYTES));
+        // ── 봉투 표지 — 사본이 **조용히** 갈리는 유일한 자리다(R2-1) ──
+        //   python 은 `javis_mission.FENCE_OPEN/CLOSE` 라는 **사본**을 들고 있고, 사본은 그냥 두면
+        //   `paste_fence::OPEN` 이 바뀐 날 Rust 만 맞고 python 만 틀리는데 아무 검체도 적색이 되지
+        //   않는다(층1 ⓐ′ 가 한쪽에서 조용히 죽는다). 그래서 코퍼스를 가운데 두고 **양쪽이 각자
+        //   자기 값과** 대조한다: 여기서 코퍼스 == `paste_fence`, python self-test 에서 코퍼스 ==
+        //   `FENCE_*` ⇒ 둘이 함께 통과할 때만 `python == paste_fence` 가 성립한다.
+        //   ★`crate::paste_fence` 를 직접 읽는 것이 핵심이다 — 여기서 문자열 리터럴을 다시 적으면
+        //   그것이 **세 번째 사본**이 되어 이 검체가 재려던 것을 그 자리에서 잃는다.
+        assert_eq!(k["FENCE_OPEN"].as_str(), Some(crate::paste_fence::OPEN));
+        assert_eq!(k["FENCE_CLOSE"].as_str(), Some(crate::paste_fence::CLOSE));
         assert_eq!(k["DELIVERY_WINDOW_S_DEFAULT"].as_i64(), Some(DELIVERY_WINDOW_S_DEFAULT));
         // 창 경계는 코퍼스에 없다(env 가드 전용) — 값이 뒤집히지 않았는지만 잠근다.
         assert!(DELIVERY_WINDOW_MIN_S < DELIVERY_WINDOW_S_DEFAULT);
