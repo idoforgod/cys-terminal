@@ -2064,6 +2064,70 @@ pub fn path_entries(path: &str, sep: char) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Windows 에서 **완전 수식(fully qualified)** 경로인가 — 호스트 OS 와 무관한 순수 판정.
+///
+/// ★(0.14.53 WP8 · R2-FIX B2) 왜 `Path::is_absolute` 가 아닌가: 그것은 **호스트** 규약으로 답한다.
+/// mac 에서 `C:\Users\x` 는 `is_absolute()==false` 이고 `/var/folders/…` 는 `true` 다 — 이 자리에서
+/// 필요한 답의 정확히 반대다. 이 판정은 Windows 규약을 **mac·linux 에서도 그대로** 내려야 한다:
+/// 감지 게이트는 `#[cfg(windows)]` 안에 있지만 그 회귀 핀은 mac CI 에서 돌아야 하기 때문이다
+/// (Windows 레그만 이 규칙을 밟으면 아무도 안 보는 날이 온다 — `windows_miss_places` 와 같은 이유).
+///
+/// 규칙은 .NET `Path.IsPathFullyQualified` 의 문서화된 규칙과 같다(learn.microsoft.com ·
+/// System.IO.Path.IsPathFullyQualified — "paths that are not fixed to a specific drive or UNC path"):
+/// · `C:\x`·`C:/x` → 참(드라이브 + 루트)
+/// · `\\server\share\x`·`//server/share/x` → 참(UNC)
+/// · `\\?\C:\x`·`\\.\C:\x` → 참(DOS 디바이스 접두 — `X:\`·`\\server\share` 와 **같은 파일**을 가리킨다)
+/// · `C:x` → **거짓**(드라이브 상대 — 그 드라이브의 cwd 기준이다)
+/// · `\x` → **거짓**(현재 드라이브의 루트 상대)
+/// · `x`·`.\x`·`..\x`·빈 문자열 → 거짓
+pub fn windows_path_is_fully_qualified(p: &str) -> bool {
+    let b = p.as_bytes();
+    let sep = |c: u8| c == b'\\' || c == b'/';
+    if b.len() < 2 {
+        return false;
+    }
+    if sep(b[0]) {
+        // `\\…`(UNC) 와 `\?…`(디바이스) 만 완전 수식이다. `\x` 는 **현재 드라이브** 상대다.
+        return sep(b[1]) || b[1] == b'?';
+    }
+    b.len() >= 3 && b[1] == b':' && sep(b[2]) && b[0].is_ascii_alphabetic()
+}
+
+/// 후보 폴더 목록에서 **완전 수식이 아닌 항목을 버린다**(순수 · 순서 보존).
+///
+/// ★(0.14.53 WP8 · R2-FIX B2) 이것이 막는 결함: 신선 레지스트리 PATH 든 env 로 만든 설치 폴더
+/// 목록이든 항목이 상대경로(`tools`·`C:tools`·`\tools`)일 수 있다. 상대 항목에 `join` 하면 후보가
+/// **감지 프로세스의 cwd 기준**으로 해소되는데, 실제로 CLI 를 띄우는 pane 은 **다른 cwd** 의
+/// PowerShell 이다 ⇒ 게이트는 "설치됨"을 내고 pane 은 같은 이름을 해소하지 못한다. 이 슬라이스가
+/// 고치려던 결함(게이트와 pane 이 서로 다른 목록을 본다)이 **좌표 하나 안에서** 재현된 꼴이다.
+/// 종전 판은 **빈** 항목만 버렸다 — 규칙이 자기 범위의 한쪽에만 내려앉아 있었다(r1 codex B2).
+///
+/// 여기서는 버리는 쪽(fail-closed)이 맞다: 상대 항목을 버려서 잃는 것은 "감지 프로세스의 cwd 에
+/// 우연히 있던 실행 파일"이고 그것은 **애초에 pane 이 찾지 못하는 것**이다 — 게이트가 그걸 받아들이면
+/// 좌석만 뜨고 CLI 는 시작되지 않는다(INV-1 이 닫으려는 바로 그 양방향 결함).
+pub fn windows_fully_qualified_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    dirs.iter()
+        // `to_str` 이 아니라 `to_string_lossy`: 非UTF-8 꼬리를 가진 **진짜 절대경로**를 잃지 않는다.
+        // 드라이브·UNC 접두는 ASCII 라 lossy 변환에서도 선두 바이트 위치가 보존된다.
+        .filter(|p| windows_path_is_fully_qualified(&p.to_string_lossy()))
+        .cloned()
+        .collect()
+}
+
+/// [`find_agent_in_dirs`] 에 **완전 수식 필터를 선행**한 판 — 감지 게이트가 쓰는 유일한 스캐너.
+///
+/// ★(0.14.53 WP8 · R2-FIX B2) 필터를 `find_agent_in_dirs` **안**에 넣지 않은 이유: 그 함수의 음성
+/// 대조 검체는 **실제 파일시스템**(mac tempdir `/var/folders/…`)으로 "폴더를 실행 파일로 고르지
+/// 않는다"를 재는데, Windows 완전 수식 규칙은 그 경로를 거짓으로 판정한다 ⇒ 그 검체가 아무것도
+/// 재지 못하게 된다. 스캐너는 좌표 의미론을 모르는 채 두고 **Windows 의미론은 이 얇은 한 겹**이 담는다.
+pub fn find_agent_in_windows_dirs(
+    dirs: &[PathBuf],
+    stem: &str,
+    is_exec: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    find_agent_in_dirs(&windows_fully_qualified_dirs(dirs), stem, is_exec)
+}
+
 /// pane PATH 최종 합성(순서·dedup 규칙 · **Windows 전용 의미론** · OS 무관 컴파일). 순서:
 /// `[prefixes: exe_dir + 번들 runtime bins]` ; `process_path 전체(현행 순서 그대로 보존)` ;
 /// `fresh_base(신선 레지스트리 머신;유저) 중 신규분만 append` ; `user_bins 중 신규분만 append`.
@@ -4376,36 +4440,53 @@ mod tests {
         let with = windows_user_bin_dirs(home, Some(&appdata), None);
         let got: Vec<String> = with.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         // 경로 구분자는 호스트 OS 규약이라 컴포넌트 존재로 검증(mac 에서도 무결).
-        // ★(0.14.53 WP8) 길이가 2→3 으로 늘었다 — 레거시 `.claude\local` 이 **무조건** 말미에 붙는다.
+        // ★(0.14.53 WP8 · R1-3 뒤 R2-FIX B1 으로 정정) 길이가 2→**4** 로 늘었다 — 레거시 npm 로컬
+        //   트리가 **무조건** 말미에 둘 붙는다(`.claude\local` 과 그 아래 `node_modules\.bin`).
+        //   R1-3 이 둘째 항목을 더했는데 이 단언들은 3/2/7/3 그대로였고, 이어진 측정이 `wp8`
+        //   필터였던 탓에 이 검체가 돌지 않아 **빨갛지 않았다**(r1 두 리뷰어 공통 지적).
         //   항목 0..1 의 철자·순서는 종전과 동일하다(이미 도는 기계가 고르는 본 불변).
-        assert_eq!(got.len(), 3, "local/bin · appdata/npm · .claude/local: {got:?}");
+        assert_eq!(got.len(), 4, "local/bin · appdata/npm · .claude/local{{,/node_modules/.bin}}: {got:?}");
         assert!(got[0].contains(".local") && got[0].ends_with("bin"), "local/bin: {got:?}");
         assert!(got[1].ends_with("npm"), "appdata/npm: {got:?}");
         assert!(got[2].contains(".claude") && got[2].ends_with("local"), ".claude/local 말미: {got:?}");
-        // APPDATA 부재 시 .local/bin + 레거시 둘.
+        // ★(R2-FIX B1) 둘째 레거시 항목 — npm 로컬 설치는 실행 파일을 `<dir>\node_modules\.bin` 에
+        //   둔다(공식 제거 명령이 `-Recurse` 인 것이 그 단서다 · DESIGN L6).
+        assert!(
+            got[3].contains("node_modules") && got[3].ends_with(".bin"),
+            ".claude/local/node_modules/.bin 말미: {got:?}"
+        );
+        // APPDATA 부재 시 .local/bin + 레거시 **둘**(= 3).
         let none = windows_user_bin_dirs(home, None, None);
-        assert_eq!(none.len(), 2, "APPDATA 부재: local/bin · .claude/local: {none:?}");
+        assert_eq!(none.len(), 3, "APPDATA 부재: local/bin · 레거시 2종: {none:?}");
 
         // ★B7(H-NPM-2 일부): %LOCALAPPDATA% 가 있으면 우리 기본 prefix 의 `bin` 과 루트가
         //   **둘 다** 후보로 붙는다(npm 구현에 따라 `prefix\` 직하 또는 `prefix\bin`).
         //   주입(⑥)만 하고 발견(PATH)을 빠뜨리면 `npm i -g` 산출물이 영원히 안 보인다.
         let full = windows_user_bin_dirs(home, Some(&appdata), Some(&localappdata));
         let fg: Vec<String> = full.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        // ★(0.14.53 WP8) 4→7. **항목 0..3 의 상대 순서는 바이트 그대로** 보존했으므로 아래 두
-        //   기존 단언(fg[2]·fg[3])이 그대로 유효하다 — 그게 "도는 기계의 선택을 바꾸지 않았다"의 증거다.
+        // ★(0.14.53 WP8 · R2-FIX B1 으로 정정) 4→**8**. **항목 0..3 의 상대 순서는 바이트 그대로**
+        //   보존했으므로 아래 두 기존 단언(fg[2]·fg[3])이 그대로 유효하다 — 그게 "도는 기계의 선택을
+        //   바꾸지 않았다"의 증거다.
         assert_eq!(
             fg.len(),
-            7,
-            "후보 7종(.local/bin · appdata/npm · cys-npm/bin · cys-npm · localappdata/npm · WinGet/Links · .claude/local): {fg:?}"
+            8,
+            "후보 8종(.local/bin · appdata/npm · cys-npm/bin · cys-npm · localappdata/npm · WinGet/Links · .claude/local · 그 아래 node_modules/.bin): {fg:?}"
         );
         assert!(
             fg[2].contains(NPM_PREFIX_WIN_SUBDIR) && fg[2].ends_with("bin"),
             "cys-npm/bin 누락: {fg:?}"
         );
         assert!(fg[3].ends_with(NPM_PREFIX_WIN_SUBDIR), "cys-npm 루트 누락: {fg:?}");
+        // ★(R2-FIX B1) 말미 두 항목은 **레거시 둘**이고 순서는 `.claude\local` → 그 아래
+        //   `node_modules\.bin` 이다(선호 순서상 맨 마지막 — native 설치본이 있으면 그쪽이 먼저 잡힌다).
+        assert!(fg[6].contains(".claude") && fg[6].ends_with("local"), ".claude/local 위치: {fg:?}");
+        assert!(
+            fg[7].contains("node_modules") && fg[7].ends_with(".bin"),
+            "node_modules/.bin 말미: {fg:?}"
+        );
         // 음성 대조 — 빈 %LOCALAPPDATA% 는 좌표가 아니다(빈 경로 후보를 PATH 에 흘리지 않는다).
         let empty = windows_user_bin_dirs(home, Some(&appdata), Some(Path::new("")));
-        assert_eq!(empty.len(), 3, "빈 LOCALAPPDATA 가 후보를 만들었다: {empty:?}");
+        assert_eq!(empty.len(), 4, "빈 LOCALAPPDATA 가 후보를 만들었다: {empty:?}");
         assert!(
             empty.iter().all(|p| !p.as_os_str().is_empty()),
             "빈 경로 후보가 섞였다: {empty:?}"
@@ -4681,7 +4762,9 @@ mod tests {
 
     /// ★WP8 — `path_entries`: 신선 레지스트리 PATH 를 폴더 목록으로 바꾸는 순수 변환.
     /// 빈 항목(`;;`·말미 `;`)은 버린다 — 빈 폴더에 join 하면 **상대경로 후보**가 생겨
-    /// cwd 안의 `claude.exe` 를 주워 올 수 있다(그게 이 필터의 존재 이유다).
+    /// cwd 안의 `claude.exe` 를 주워 올 수 있다.
+    /// ★(R2-FIX B2) 다만 이 필터는 **빈 항목까지만** 막는다. 비지 않은 상대 항목은
+    /// [`windows_fully_qualified_dirs`] 가 막는다(종전 주석은 이 필터가 상대경로 전체를 막는 것처럼 적었다).
     #[test]
     fn path_entries_drops_empty_and_keeps_order_wp8() {
         let got = path_entries(r"C:\a;;C:\b; C:\c ;", ';');
@@ -4691,7 +4774,122 @@ mod tests {
             "빈 항목 제거·순서 보존·공백 trim: {got:?}"
         );
         assert!(path_entries("", ';').is_empty());
-        assert!(path_entries(";;;", ';').is_empty(), "빈 항목만이면 후보 0 — 상대경로 후보 금지");
+        assert!(
+            path_entries(";;;", ';').is_empty(),
+            "빈 항목만이면 후보 0 — 빈 폴더에 join 하면 **상대경로** 후보가 생긴다"
+        );
+        // ★(R2-FIX B2 · F1) 이 필터가 막는 것은 **빈 항목뿐**이다. 비어 있지 않은 상대 항목
+        //   (`tools`)은 여기서 그대로 통과한다 — 그것을 막는 자리는
+        //   [`windows_fully_qualified_dirs`] 이고 검체는 `a_relative_candidate_dir_is_not_accepted_wp8` 다.
+        //   종전 주석은 "그게 이 필터의 존재 이유다"라고 적어 **범위의 한쪽을 전체로 주장**했다.
+        assert_eq!(path_entries("tools", ';'), vec![PathBuf::from("tools")], "여기는 상대 항목을 거르지 않는다");
+    }
+
+    /// ★WP8 R2-FIX B2 — **완전 수식 판정 표**. 호스트 OS 와 무관하게 Windows 규약으로 답한다
+    /// (.NET `Path.IsPathFullyQualified` 와 같은 규칙 · 근거는 함수 독스트링).
+    #[test]
+    fn windows_path_is_fully_qualified_table_wp8() {
+        // 참 — 드라이브+루트 · UNC · DOS 디바이스 접두 · 정구분자(`/`) 변형.
+        for q in [
+            r"C:\",
+            r"C:\Users\x",
+            r"c:/users/x",
+            r"Z:\a\b",
+            r"\\server\share",
+            r"\\server\share\bin",
+            r"//server/share/bin",
+            r"\\?\C:\bin",
+            r"\\.\C:\bin",
+            r"\\?\UNC\server\share\bin",
+        ] {
+            assert!(windows_path_is_fully_qualified(q), "완전 수식인데 거짓: {q:?}");
+        }
+        // 거짓 — 상대 · **드라이브 상대**(`C:x`) · **현재 드라이브 루트 상대**(`\x`) · 너무 짧음 ·
+        //        드라이브 문자가 아닌 것(`1:\x`).
+        for r in [
+            "", "x", "tools", r".\tools", r"..\tools", "tools/bin", r"C:tools", "C:", "C", r"\tools",
+            r"\", "/", r"1:\x",
+        ] {
+            assert!(!windows_path_is_fully_qualified(r), "완전 수식이 아닌데 참: {r:?}");
+        }
+        // ★유닉스 절대경로는 **Windows 완전 수식이 아니다.** 이 한 줄이 이 판정을
+        //   `find_agent_in_dirs` 안에 넣을 수 없었던 이유다(아래 음성 대조 검체 ⑥).
+        assert!(!windows_path_is_fully_qualified("/var/folders/t/x"));
+        assert!(!windows_path_is_fully_qualified("/usr/local/bin"));
+    }
+
+    /// ★WP8 R2-FIX B2 — **상대 후보 폴더는 받아들이지 않는다**(r1 codex 지적 · blocking).
+    ///
+    /// 왜 결함인가: 감지 게이트가 `tools\claude.cmd` 를 받아들이면 그 해소는 **감지 프로세스의
+    /// cwd** 기준이고, CLI 를 실제로 띄우는 pane 은 **다른 cwd** 의 PowerShell 이다 ⇒ 게이트는
+    /// "설치됨", pane 은 "command not found". 이 슬라이스가 고치려는 결함이 좌표 하나 안에서
+    /// 재현된 꼴이다. 종전 필터는 **빈** 항목만 버려 자기 범위의 한쪽에만 내려앉아 있었다.
+    ///
+    /// 귀속: `is_exec` 가 **무엇에든 참**이라 Some/None 을 가르는 것은 **필터 하나**다. 변이
+    /// (필터 제거 = `find_agent_in_dirs` 직접 위임)에서 ①이 빨개진다 — ③이 그 대조다.
+    #[test]
+    fn a_relative_candidate_dir_is_not_accepted_wp8() {
+        let yes = |_: &Path| true;
+
+        // ① 음성 — 상대·드라이브상대·루트상대 항목은 후보를 만들지 못한다.
+        for rel in ["tools", r".\tools", r"..\tools", "C:tools", r"\tools", "", "C:"] {
+            let dirs = vec![PathBuf::from(rel)];
+            assert_eq!(
+                find_agent_in_windows_dirs(&dirs, "claude", &yes),
+                None,
+                "상대 항목이 후보가 됐다(감지 cwd 기준 해소 — pane 은 못 찾는다): {rel:?}"
+            );
+        }
+
+        // ② 양성 대조 — 같은 호출이 완전 수식 항목에서는 **찾는다**(필터가 전부를 버리는 게 아님).
+        let abs = PathBuf::from(r"C:\Users\x\.local\bin");
+        assert_eq!(
+            find_agent_in_windows_dirs(&[abs.clone()], "claude", &yes),
+            Some(abs.join("claude.cmd")),
+            "양성 대조 실패 — 필터가 완전 수식 좌표까지 버렸다"
+        );
+
+        // ③ 귀속 대조 — **필터 없는** 스캐너는 여전히 상대 항목을 받아들인다(= f0ac3b0c·966170ad 거동).
+        //    이 줄이 거짓이 되면 ①은 아무것도 재지 않는다.
+        assert!(
+            find_agent_in_dirs(&[PathBuf::from("tools")], "claude", &yes).is_some(),
+            "대조 불성립 — 필터 없는 스캐너가 이미 상대 항목을 거부하면 ①은 측정이 아니다"
+        );
+
+        // ④ 섞인 목록 — 상대 항목을 **건너뛰고** 뒤의 완전 수식 항목을 찾는다(한 개가 전체를 못 날린다).
+        let mixed = vec![PathBuf::from("tools"), abs.clone()];
+        assert_eq!(
+            find_agent_in_windows_dirs(&mixed, "claude", &yes),
+            Some(abs.join("claude.cmd")),
+            "상대 항목 하나가 뒤의 정상 후보까지 날렸다"
+        );
+
+        // ⑤ 순서 보존 — 완전 수식 항목끼리의 **선호 순서**는 필터를 지나도 그대로다.
+        let d1 = PathBuf::from(r"C:\one");
+        let d2 = PathBuf::from(r"C:\two");
+        let only2 = |p: &Path| p == d2.join("claude.exe");
+        assert_eq!(
+            find_agent_in_windows_dirs(&[d1, d2.clone()], "claude", &only2),
+            Some(d2.join("claude.exe")),
+            "필터가 순서를 흔들었다"
+        );
+
+        // ⑥ 유닉스 절대경로도 Windows 완전 수식이 아니라 버려진다 — 이 함수는 **Windows 전용
+        //    의미론**이고, 그래서 호스트 파일시스템으로 재는 음성 대조 검체
+        //    (`a_directory_named_like_the_binary_is_not_picked_wp8`)는 필터 없는 쪽을 계속 쓴다.
+        assert_eq!(
+            find_agent_in_windows_dirs(&[PathBuf::from("/var/folders/t/x")], "claude", &yes),
+            None
+        );
+
+        // ⑦ 목록 필터 자체 — 순서 보존 + 완전 수식만 남긴다.
+        let got = windows_fully_qualified_dirs(&[
+            PathBuf::from("tools"),
+            PathBuf::from(r"C:\a"),
+            PathBuf::from(r"C:b"),
+            PathBuf::from(r"\\srv\share"),
+        ]);
+        assert_eq!(got, vec![PathBuf::from(r"C:\a"), PathBuf::from(r"\\srv\share")], "{got:?}");
     }
 
     /// ★H-NPM-1(B7 · 명세 §2-10): `npm_config_prefix` 는 **키가 부재할 때만** 얹는다.

@@ -13504,6 +13504,13 @@ struct AgentDetection {
     /// agents.json cmd 에서 env-prefix 를 건너뛴 바이너리 토큰(extract_bin 단일 진실).
     bin: String,
     /// 해소된 실경로(경로형=틸드 확장 후 / PATH형=which·where 첫 줄). 미해소 시 None.
+    ///
+    /// ★(0.14.53 WP8 · R2-2) **발견한 자리**를 적는 칸이고, **실행될 문자열이 아니다.** 좌석 기동은
+    ///   어댑터의 `cmd` 를 그대로 타이핑하고(`render_launch` · Windows 는 맨 이름 그대로) pane 의
+    ///   PowerShell 이 그 이름을 **자기 PATH 로 다시 해소**한다 — 이 필드는 그 경로에 끼지 않는다
+    ///   (기동 소비자 0건: 2026-10-23 추적 `.rs` 전량 census). Windows 에서는 신선 레지스트리 PATH
+    ///   항목이나 문서화된 설치 폴더에서 **찾은 좌표**가 여기 적힐 수 있는데, 그때도 실제로 실행되는
+    ///   것은 맨 이름이다. ⇒ 이 값을 "기동에 쓰일 경로"로 읽으면 안 된다(판정 근거·사람용 문면 전용).
     resolved: Option<std::path::PathBuf>,
     /// 사람용 판정 근거 한 줄 (python detect_reviewer 의 reason 과 동형 문면).
     reason: String,
@@ -13585,11 +13592,16 @@ fn which_in_path(bin: &str) -> (bool, Option<std::path::PathBuf>) {
 /// 새로 도달 가능한 결과는 "없던 것을 찾음"과 "더 정확한 메시지" 둘뿐이다.
 #[cfg(windows)]
 fn windows_agent_search_dirs() -> Vec<std::path::PathBuf> {
-    cys::windows_user_bin_dirs(
+    // ★(R2-FIX B2) 목록을 **완전 수식만**으로 낳는다. 스캐너 안에도 같은 필터가 있는데 왜 여기에도
+    //   두는가 — 둘은 **서로 다른 고장을 잡는다**. 스캐너의 필터는 '받아들이면 안 되는 좌표를
+    //   받아들이는 것'을 막고, 이 필터는 '안내 문면(`windows_miss_places`)이 스캔하지 않은 폴더를
+    //   찾아보았다고 말하는 것'을 막는다(바 W2). 시끄러운 고장과 조용한 고장은 검사를 나눈다.
+    //   정상 기계에서는 8종을 하나도 빼지 않는다(모두 `C:\…` 꼴) ⇒ 건강한 기계의 거동 변화 0.
+    cys::windows_fully_qualified_dirs(&cys::windows_user_bin_dirs(
         &cys::home_dir(),
         std::env::var_os("APPDATA").map(std::path::PathBuf::from).as_deref(),
         std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).as_deref(),
-    )
+    ))
 }
 
 /// 전탐색이 빈손일 때 사용자에게 **찾아본 곳을 그대로** 보여주는 문면(순수 입력 → 문자열).
@@ -13639,7 +13651,7 @@ fn windows_agent_candidates(bin: &str, dirs: &[std::path::PathBuf]) -> Option<st
     // ② 신선 레지스트리 PATH 스캔 — 새로 연 PowerShell 창이 보는 PATH(①의 프로세스 스냅샷이 낡은
     //    경우를 덮는다). pane 합성이 이미 쓰는 재합성을 감지도 쓰게 한 것뿐이다(새 기제 아님).
     if let Some(fresh) = cys::windows_registry_path() {
-        if let Some(p) = cys::find_agent_in_dirs(
+        if let Some(p) = cys::find_agent_in_windows_dirs(
             &cys::path_entries(&fresh, ';'),
             &stem,
             &(is_executable_file as fn(&std::path::Path) -> bool),
@@ -13649,7 +13661,7 @@ fn windows_agent_candidates(bin: &str, dirs: &[std::path::PathBuf]) -> Option<st
     }
     // ③ 문서화된 설치 폴더 — pane PATH 와 **같은 목록**(INV-1). 종전 ②(`%APPDATA%\npm`·
     //    `%LOCALAPPDATA%\npm`)는 이 목록의 **진부분집합**이라 여기에 흡수된다(기능 축소 0).
-    cys::find_agent_in_dirs(dirs, &stem, &(is_executable_file as fn(&std::path::Path) -> bool))
+    cys::find_agent_in_windows_dirs(dirs, &stem, &(is_executable_file as fn(&std::path::Path) -> bool))
 }
 
 /// B8 후보 순회는 **Windows 한정** — 다른 OS 빌드에서는 항등(cfg 분기를 함수 두 벌로 갈라
@@ -29303,19 +29315,32 @@ mod tests {
             !code.contains("windows_agent_search_dirs()"),
             "게이트가 목록을 **자기가** 만든다 — 문면과 다른 목록을 스캔할 수 있다: {code}"
         );
-        // ★(R2-11) 존재가 아니라 **인자**를 핀한다. 종전 단언은 "본문에 find_agent_in_dirs 가 있다"
+        // ★(R2-11) 존재가 아니라 **인자**를 핀한다. 종전 단언은 "본문에 스캐너 호출이 있다"
         //   였고, 단계 ②(신선 레지스트리 스캔)도 같은 헬퍼를 부르므로 **단계 ③을 통째로 지운 변이가
         //   살아남았다**(M5 · 4 passed / 0 failed). 공유 목록을 스캔하는 호출은 **그 목록(dirs)** 을
         //   인자로 받는 호출 하나다 — 그것을 직접 단언하고, 호출 수로 두 단계를 가른다.
-        let scan_shared = format!("find_agent_in_{}(dirs,", "dirs");
+        // ★(R2-FIX B2) 스캐너 이름이 `find_agent_in_windows_dirs` 로 바뀌었다 — **완전 수식 필터를
+        //   선행하는** 판이다. 이름이 바뀐 것이 핵심이 아니라, 아래 ⑥이 "필터 없는 판으로 되돌아간
+        //   변이"를 빨갛게 만든다는 것이 핵심이다(게이트는 `#[cfg(windows)]` 안이라 mac 에서 거동으로
+        //   잴 수 없고, 이 소스 핀이 그 변이의 유일한 탐지기다 — 거동 쪽 변이는 lib.rs 검체가 잡는다).
+        let scan_shared = format!("find_agent_in_windows_{}(dirs,", "dirs");
         assert!(
             code.contains(scan_shared.as_str()),
             "게이트가 **공유 목록(dirs)** 으로 스캔하지 않는다 — 단계 ③ 소실: {code}"
         );
         assert_eq!(
-            code.matches("find_agent_in_dirs").count(),
+            code.matches("find_agent_in_windows_dirs").count(),
             2,
             "스캐너 호출이 2회(② 신선 레지스트리 · ③ 공유 목록)가 아니다 — 한 단계가 사라졌거나 늘었다: {code}"
+        );
+        // ⑥ ★(R2-FIX B2) **필터 없는 스캐너로 되돌아가지 않았다.** `find_agent_in_windows_dirs(` 는
+        //    `find_agent_in_dirs(` 를 부분문자열로 포함하지 않으므로 이 단언은 두 이름을 가른다
+        //    (형제 토큰이 서로를 포함하면 수가 겹친다 — 여기서는 겹치지 않음을 확인했다).
+        //    되돌아가면 상대 PATH 항목이 다시 후보가 되고, 게이트는 pane 이 해소하지 못하는 좌표를
+        //    "설치됨"으로 받아들인다(r1 codex B2).
+        assert!(
+            !code.contains("find_agent_in_dirs("),
+            "게이트가 완전 수식 필터 없는 스캐너를 부른다 — 상대 PATH 항목이 다시 후보가 된다: {code}"
         );
         // ② 신선 레지스트리 PATH 를 본다(호출자 PATH 스냅샷이 낡은 경우를 덮는 단계).
         assert!(
@@ -29331,7 +29356,7 @@ mod tests {
         let ext_at = code
             .find(r#"for ext in ["cmd", "exe", "bat", "ps1"]"#)
             .expect("기존 where 확장자 단계가 사라졌다 — 지금 잡히는 기계가 바뀐다");
-        let shared_at = code.rfind("find_agent_in_dirs").expect("②");
+        let shared_at = code.rfind("find_agent_in_windows_dirs").expect("②");
         assert!(ext_at < shared_at, "새 단계가 기존 PATH 조회보다 앞선다(무회귀 깨짐)");
 
         // ★(R1-2) 호출자는 목록을 **한 번** 만들어 스캔과 문면에 **같은 값**을 넘긴다.
@@ -29380,6 +29405,13 @@ mod tests {
         assert!(
             src[dirs_fn_at..dirs_end].contains("windows_user_bin_dirs"),
             "폴더 목록이 pane PATH 합성과 다른 출처에서 온다(INV-1 위반)"
+        );
+        // ★(R2-FIX B2) 공유 목록은 **완전 수식만**으로 태어난다 — 그래야 안내 문면이
+        //   스캔하지 않은 폴더를 "찾아보았다"고 말하지 않는다(바 W2). 스캐너 쪽 필터(⑥)와
+        //   **다른 고장**을 잡으므로 둘을 하나로 합치지 않는다.
+        assert!(
+            src[dirs_fn_at..dirs_end].contains("windows_fully_qualified_dirs"),
+            "공유 목록에 완전 수식 필터가 없다 — 문면이 스캔하지 않은 폴더를 적을 수 있다"
         );
     }
 
