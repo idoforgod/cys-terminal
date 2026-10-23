@@ -7,7 +7,8 @@
   "확장 규칙: 새 케이스는 여기 먼저 넣는다. 기대값은 **판정 함수를 실제로 돌려 뽑은 값**이지 손으로 쓴 값이 아니다. 한국어 진단 산문은 계약면에 넣지 않는다(문구를 다듬는 순간 계측기가 거짓말을 시작한다 — parity_todo_decl.py:17-20). 층1 의 ⓐ전문 일치와 층2 라벨은 둘 다 이상징후를 발행하지 않으므로, 두 축(machine·label)과 ledger_status·anomalies 네 필드의 조합으로 구별된다 — 케이스를 추가할 때 이 구별이 유지되는지 확인하라.",
   "digest_vectors(2026-09-04 R2 적대검증 MAJOR 반영): 정규화·해시 골든 벡터 10건. **왜 필요한가** — 층1 케이스의 원장 레코드는 전부 소비자 자신의 정규화·digest 로 만들어지므로, python↔Rust 가 **같은 방향으로 함께 틀린**(대칭) 이탈은 그 케이스들로 탐지되지 않는다. 명세 §2-3 이 층1 파리티의 핵심으로 지목한 것이 바로 `해시 = digest_normalized(delivery.rs:709 재사용)` 다. 종전에는 이 앵커가 python self-test **인라인 리터럴**에만 있어 include_str! 로 Rust 에 전달되지 않았고, B1 은 사본을 다시 쓸 수밖에 없었다(이 fixture 가 없애려던 바로 그것). `normalized`·`sha256` 은 실측값이다.",
   "mission_extract(2026-09-04 · B1-5 대장 writer 파리티): `extract_mission` 골든 10건. **왜 필요한가** — 층0/층0-c/층1/층2 는 전부 대장의 **reader**(무엇을 기계유래로 볼 것인가)를 재고, 대장에 무엇이 **쓰이는가**(writer)는 어느 축도 재지 않았다. 임무 문자열이 갈리면 reader 가 아무리 정확해도 자율 착수 게이트가 다른 값을 본다. 기대값은 python `extract_mission` 실측이며(impl/W-B/evidence/b15-python-parity.txt 와 10/10 일치) Rust 측이 include_str! 로 **같은 값을** 소비한다. `expect.mission` 은 문자열·null 또는 {repeat:{unit,times}} 이며, **사유(reason) 산문은 계약면에 넣지 않는다** — 한국어 진단 문구를 다듬는 순간 계측기가 거짓말을 시작한다(위 확장 규칙과 같은 근거).",
-  "$constants 의 FENCE_OPEN·FENCE_CLOSE: 괄호 붙여넣기 봉투 표지이며 **정의처는 src/paste_fence.rs** 다. 두 소비자가 각자 자기 값과 이 값을 대조하므로(Rust=crate::paste_fence::{OPEN,CLOSE} · python=javis_mission.FENCE_*) 둘이 함께 통과할 때만 사본 분화가 없다 — 수치 상수들과 같은 기제다(R2-1)."
+  "$constants 의 FENCE_OPEN·FENCE_CLOSE: 괄호 붙여넣기 봉투 표지이며 **정의처는 src/paste_fence.rs** 다. 두 소비자가 각자 자기 값과 이 값을 대조하므로(Rust=crate::paste_fence::{OPEN,CLOSE} · python=javis_mission.FENCE_*) 둘이 함께 통과할 때만 사본 분화가 없다 — 수치 상수들과 같은 기제다(R2-1).",
+  "layer1 레코드의 `preview_mode`(2026-10-23 R2 codex F1 · major): `omit` 은 `preview` 키를 쓰지 않고 `null` 은 JSON null 을 싣는다 — **값 사본이 아니라 모양 지정**이다(sha256·chars·preview 값 사본 금지 규약은 그대로). 왜 필요한가: `preview` 는 선택 필드이고 판독자는 그 부재를 스키마 이탈로 보지 않는데(`ledger_schema_skew` 는 `v` 불일치에서만 발행), 종전 `framed_match` 는 봉투 preview 의 존재를 선행 조건으로 삼아 preview 없는 봉투 행을 통째로 못 보고 층1 을 미스로 떨어뜨렸다. 그 모양을 검체가 직접 실을 수 없으면 이 누락은 두 구현에서 영원히 초록이다. 미지 값은 양쪽 소비자가 **소리내어 실패**한다(python ValueError · Rust panic) — fixture 오타가 '유도' 로 조용히 떨어지면 계약이 아무것도 재지 않는다"
  ],
  "$constants": {
   "SCHEMA_VERSION": 1,
@@ -1016,6 +1017,87 @@
     "anomalies": []
    },
    "why": "★음성 대조(ⓐ′ 짝) — 봉투로 시작하는 행이 원장에 있어도, 봉투 복원 후보 네 개 중 어느 것도 아닌 문장은 접히지 않는다. 이 케이스가 죽으면 봉투 수리가 오너 임무 경로를 삼켰다는 뜻이다"
+  },
+  {
+   "name": "L1-cli-inject-framed-row-without-preview-folds",
+   "my_surface": "23",
+   "now_epoch": 1792713271.5,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "23",
+      "ts_offset_s": -1.3,
+      "body": "\u001b[200~지침 각성 확인 핑: 너의 절대지침(디렉티브)이 컨텍스트에 살아있다면, 다음 두 토큰을 공백 없이 이어붙인 한 줄을 plain으로 출력하라: 'DIRECTIVE-ACK-' 그리고 '25494152'\u001b[201~",
+      "origin": "send",
+      "units": 1,
+      "preview_mode": "omit"
+     }
+    ]
+   },
+   "prompt": "지침 각성 확인 핑: 너의 절대지침(디렉티브)이 컨텍스트에 살아있다면, 다음 두 토큰을 공백 없이 이어붙인 한 줄을 plain으로 출력하라: 'DIRECTIVE-ACK-' 그리고 '25494152'",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "★R2 codex F1(major) 회귀 — 같은 봉투 행인데 선택 필드 `preview` 가 **아예 없는 행**다. 판독자는 스키마를 `v` 하나로 판정하므로(`ledger_schema_skew` 는 `v` 불일치에서만) 이 행은 good 으로 세어지고 상태는 ok 다. 그런데 종전 `framed_match` 는 '봉투로 시작하는 preview 가 하나라도 있는가' 를 선행 조건으로 두어 **봉투 해시가 원장에 있는데도** 층1 을 미스로 떨어뜨렸다 — 핑은 `[` 로 시작하지 않아 층2 도 통과하므로 결과는 다시 '오너 임무로 인정' 이고 이상징후도 남지 않는다. 생산 경로의 증인: 큐 묘비 행(`src/bin/cysd/delivery.rs::queue_tombstone_row`)은 preview 키를 아예 쓰지 않는다"
+  },
+  {
+   "name": "L1-cli-inject-framed-row-null-preview-folds",
+   "my_surface": "23",
+   "now_epoch": 1792713271.5,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "23",
+      "ts_offset_s": -1.3,
+      "body": "\u001b[200~지침 각성 확인 핑: 너의 절대지침(디렉티브)이 컨텍스트에 살아있다면, 다음 두 토큰을 공백 없이 이어붙인 한 줄을 plain으로 출력하라: 'DIRECTIVE-ACK-' 그리고 '25494152'\u001b[201~",
+      "origin": "send",
+      "units": 1,
+      "preview_mode": "null"
+     }
+    ]
+   },
+   "prompt": "지침 각성 확인 핑: 너의 절대지침(디렉티브)이 컨텍스트에 살아있다면, 다음 두 토큰을 공백 없이 이어붙인 한 줄을 plain으로 출력하라: 'DIRECTIVE-ACK-' 그리고 '25494152'",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": true,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "★R2 codex F1(major) 회귀 — 같은 봉투 행인데 선택 필드 `preview` 가 **JSON null 인 행**다. 판독자는 스키마를 `v` 하나로 판정하므로(`ledger_schema_skew` 는 `v` 불일치에서만) 이 행은 good 으로 세어지고 상태는 ok 다. 그런데 종전 `framed_match` 는 '봉투로 시작하는 preview 가 하나라도 있는가' 를 선행 조건으로 두어 **봉투 해시가 원장에 있는데도** 층1 을 미스로 떨어뜨렸다 — 핑은 `[` 로 시작하지 않아 층2 도 통과하므로 결과는 다시 '오너 임무로 인정' 이고 이상징후도 남지 않는다. 생산 경로의 증인: 큐 묘비 행(`src/bin/cysd/delivery.rs::queue_tombstone_row`)은 preview 키를 아예 쓰지 않는다"
+  },
+  {
+   "name": "L1-cli-inject-framed-no-preview-owner-line-not-folded",
+   "my_surface": "23",
+   "now_epoch": 1792713271.5,
+   "ledger": {
+    "present": true,
+    "records": [
+     {
+      "gen": 0,
+      "surface": "23",
+      "ts_offset_s": -1.3,
+      "body": "\u001b[200~지침 각성 확인 핑: 너의 절대지침(디렉티브)이 컨텍스트에 살아있다면, 다음 두 토큰을 공백 없이 이어붙인 한 줄을 plain으로 출력하라: 'DIRECTIVE-ACK-' 그리고 '25494152'\u001b[201~",
+      "origin": "send",
+      "units": 1,
+      "preview_mode": "omit"
+     }
+    ]
+   },
+   "prompt": "오너가 직접 친 지시문이다",
+   "expect": {
+    "ledger_status": "ok",
+    "machine": false,
+    "label": false,
+    "anomalies": []
+   },
+   "why": "★F1 수리의 음성 대조 — preview 선행 조건을 떼었어도 접기는 **해시 동등**만으로 일어난다. preview 가 없는 봉투 행이 원장에 있어도 후보 네 개 중 어느 것도 아닌 오너 문장은 접히지 않는다. 이 케이스가 죽으면 F1 수리가 오너 임무 경로를 삼켰다는 뜻이다"
   }
  ],
  "layer2": [
