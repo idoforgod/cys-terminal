@@ -23832,8 +23832,19 @@ impl ReinjectUnknownEntry {
 
     /// An UNKNOWN reply `e` for `directive` typed into `sid` (role `role`), now, by this lane (`here`).
     fn from_unknown_write(sid: u64, role: &str, directive: &str, e: &str, here: &PendingHere) -> Self {
+        Self::written_now(sid, role, directive, request_id_from_unknown(e), here)
+    }
+
+    /// ★(B-428) The durable, non-retryable INTENT to type `directive` into `sid`, recorded BEFORE the write whose outcome
+    /// can be UNKNOWN: the entry an UNKNOWN reply leaves, without the daemon's request id (there is no reply yet). Once it
+    /// is on disk, every later pass treats the seat as UNKNOWN (a presence ping, never a blind re-type) even when this
+    /// process can write nothing more after the write; the caller removes it when the outcome is known (PASSED, REFUSED).
+    fn intent(sid: u64, role: &str, directive: &str, here: &PendingHere) -> Self {
+        Self::written_now(sid, role, directive, None, here)
+    }
+
+    fn written_now(sid: u64, role: &str, directive: &str, request_id: Option<String>, here: &PendingHere) -> Self {
         let directive_hash = sha256_hex(directive);
-        let request_id = request_id_from_unknown(e);
         let at = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -23990,6 +24001,10 @@ fn read_reinject_pending_doc(base: &std::path::Path) -> std::io::Result<Option<R
 }
 
 /// ★(B-360 R2 revise) Writes the whole pending file; removes it only when BOTH lists are empty.
+/// ★(B-428) Durably and atomically (`cys::pack::write_atomic`: a temp file in the same directory, fsync, rename, then a
+///   best-effort directory fsync): an intent written before an UNKNOWN-capable write must survive a crash, and a write
+///   that dies half-way must leave the previous file, never a truncated one (the reader takes an unparsable file for
+///   "no record").
 fn write_reinject_pending(base: &std::path::Path, doc: &ReinjectPending) -> std::io::Result<()> {
     let path = reinject_pending_path(base);
     if doc.deferred.is_empty() && doc.unknown.is_empty() {
@@ -24003,7 +24018,7 @@ fn write_reinject_pending(base: &std::path::Path, doc: &ReinjectPending) -> std:
         doc.deferred.iter().map(|(sid, role)| json!({"surface_id": sid, "role": role})).collect();
     let unknown: Vec<Value> = doc.unknown.iter().map(ReinjectUnknownEntry::to_json).collect();
     let v = json!({"pack_version": doc.pack_version, "deferred": deferred, "unknown": unknown});
-    std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap_or_default())
+    cys::pack::write_atomic(&path, serde_json::to_string_pretty(&v).unwrap_or_default().as_bytes())
 }
 
 /// ★(B-360 R2 revise) Read-modify-write of the pending file. `pack_version` is used only when no file exists yet.
@@ -24048,6 +24063,17 @@ fn drop_reinject_unknown(
         return Ok(());
     }
     update_reinject_pending(base, pack_version, |doc| doc.unknown.retain(|u| !drop(u)))
+}
+
+/// ★(B-428) Removes THIS run's intent once its write's outcome is known (PASSED or REFUSED) — that exact entry (its whole
+/// wire), so an entry another writer put there since is never dropped. A failure leaves the intent on disk: the next
+/// pending pass checks the seat with a presence ping instead of typing (safe), so the caller reports it, not more.
+fn drop_reinject_intent(
+    base: &std::path::Path,
+    pack_version: &str,
+    intent: &ReinjectUnknownEntry,
+) -> std::io::Result<()> {
+    drop_reinject_unknown(base, pack_version, |u| u.wire == intent.wire)
 }
 
 /// deferred(busy) 노드를 pending 파일에 영속하거나(>0), 더 이상 없으면 stale pending을 제거한다(0).
@@ -24109,6 +24135,14 @@ fn reinject_exit_code(failed: usize, new_unknown: usize) -> i32 {
     } else {
         0
     }
+}
+
+/// ★(B-428) The exit class of a pack-update whose node loop did not run (UpToDate, or the reinject skipped): what its
+/// pending pass did. Its NEW unknown writes and its refused injects (nothing typed: the durable intent could not be
+/// written) are degraded, never 0 — also when the pass's final rewrite failed, because that failure travels inside the
+/// report (`persist_error`) instead of discarding it. Decided by [`reinject_exit_code`] (the one place). Pure.
+fn pending_pass_exit_code(c: &PendingConsumeReport) -> i32 {
+    reinject_exit_code(c.intent_refused, c.unknown_new)
 }
 
 /// reinject 결정(§7-② 순서 고정): ⓐ해시 선검사(SkipUnchanged) → ⓒ버전 dedup(SkipDedup) →
@@ -24891,30 +24925,64 @@ fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
         if !mine.is_empty() {
             // an entry for a different directive: a different text is meant to be injected anyway (the duplicate risk
             // concerns the same text twice) — drop it and decide normally
+            // ★(B-428) a failed rewrite no longer ends the whole loop with Err: that discarded this run's report, so an
+            //   UNKNOWN write made earlier in the loop never reached the exit code (exit 0). This seat is refused (the
+            //   file cannot take its intent either) and the loop goes on.
             if let Err(e) = drop_reinject_unknown(&base, new_version, |u| u.surface_id == sid && !u.is_foreign_to(&lane)) {
-                return Err(format!("pending file write failed ({}): {e}", reinject_pending_path(&base).display()));
+                eprintln!(
+                    "[pack-update] ⚠ surface {sid} ({role}): reinject REFUSED, nothing typed — its stale unknown entry could \
+                     not be dropped ({}): {e}",
+                    reinject_pending_path(&base).display()
+                );
+                failed += 1;
+                continue;
             }
         }
         match reinject_decision(markers.get(role), new_version, &new_hash, idle, self_idle, ready) {
             ReinjectDecision::Inject => {
+                // ★(B-428) the durable, non-retryable intent BEFORE the write whose outcome can be UNKNOWN; if it cannot
+                //   be written, nothing is typed (the inject is refused, not attempted): an UNKNOWN reply after it could
+                //   not be recorded, and a later pass would type the same text again.
+                let intent = ReinjectUnknownEntry::intent(sid, role, &directive, &here);
+                if let Err(w) = record_reinject_unknown(&base, new_version, &intent) {
+                    eprintln!(
+                        "[pack-update] ⚠ surface {sid} ({role}): reinject REFUSED, nothing typed — the intent could not be \
+                         written before the write ({}): {w}",
+                        reinject_pending_path(&base).display()
+                    );
+                    failed += 1;
+                    continue;
+                }
+                // the outcome is known (PASSED or REFUSED): this run's intent goes (a leftover is checked, never retyped)
+                let drop_intent = || {
+                    if let Err(w) = drop_reinject_intent(&base, new_version, &intent) {
+                        eprintln!(
+                            "[pack-update] ⚠ surface {sid} ({role}): the intent could not be removed ({}): {w} — the next \
+                             pack-update checks the seat with a presence ping (it does not type it blindly)",
+                            reinject_pending_path(&base).display()
+                        );
+                    }
+                };
                 // per-node 에러 격리(Fix3): 한 노드의 transient 실패가 나머지 건강 노드의 reinject를
                 // 중단시키지 않게 `?` 전파 대신 count+continue 한다.
                 if let Err(e) = inject_text(sid, &directive) {
                     if !is_write_outcome_unknown(&e) {
                         eprintln!("[pack-update] reinject 주입 실패(surface {sid}, role {role}): {e} — 다음 노드로 계속");
+                        drop_intent();
                         failed += 1;
                         continue;
                     }
                     // ★(B-360 R2 revise) UNKNOWN: it may still land. Not marked (a marker = delivered: a permanent silent
                     //   skip if it never lands) and not retryable (a retry can type it twice) — an unknown entry, written
                     //   at once so it survives this process; the next pack-update checks it with a presence ping.
+                    // ★(B-428) it replaces the intent (adding the request id); the intent is already on disk if it fails.
                     let entry = ReinjectUnknownEntry::from_unknown_write(sid, role, &directive, &e, &here);
                     unknown_new += 1;
                     eprintln!("[pack-update] ⚠ {}", reinject_unknown_note(sid, role, &e, &reinject_pending_path(&base)));
                     if let Err(w) = record_reinject_unknown(&base, new_version, &entry) {
                         eprintln!(
-                            "[pack-update] ⚠ the unknown entry could not be written ({}): {w} — surface {sid} ({role}) is NOT \
-                             tracked: check it by hand (`cys reinject --role {role} --check`) before any re-inject",
+                            "[pack-update] ⚠ the unknown entry could not be updated with its request id ({}): {w} — surface \
+                             {sid} ({role}) stays tracked by the intent written before the write",
                             reinject_pending_path(&base).display()
                         );
                     }
@@ -24931,9 +24999,11 @@ fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
                 ) {
                     eprintln!("[pack-update] ⚠ reinject.mark 기록 실패(surface {sid}, role {role}): {e} — \
                                주입은 됐으나 마커 미기록 → 다음 pack-update에서 중복 주입 가능");
+                    drop_intent();
                     failed += 1;
                     continue;
                 }
+                drop_intent();
                 injected += 1;
             }
             ReinjectDecision::SkipUnchanged | ReinjectDecision::SkipDedup => skipped += 1,
@@ -24960,6 +25030,15 @@ struct PendingConsumeReport {
     unknown_new: usize,
     /// (surface_id, role) of every node counted in `unknown` — the warning names them.
     unknown_nodes: Vec<(u64, String)>,
+    /// ★(B-428) injects this pass did NOT attempt because their durable intent could not be written first (nothing
+    /// typed; the node stays where it was: an ordinary deferred retry, or still UNKNOWN). They reach the exit class.
+    intent_refused: usize,
+    /// (surface_id, role) of every node counted in `intent_refused`.
+    intent_refused_nodes: Vec<(u64, String)>,
+    /// ★(B-428) the pass's final rewrite of the pending file failed (path: error). The report still stands — it is not
+    /// discarded with the error any more, so its unknown nodes are named and reach the exit code; every UNKNOWN write
+    /// of this pass had its intent on disk before it was typed.
+    persist_error: Option<String>,
 }
 
 /// LOW#1 pending 소비 핵심 — 라이브 토폴로지(markers)·플릿(fleet)·주입을 인자/클로저로 받아
@@ -24977,6 +25056,10 @@ struct PendingConsumeReport {
 ///   UNKNOWN → a new unknown entry); undetermined → kept, unknown. A deferred node whose inject comes back UNKNOWN
 ///   becomes an unknown entry (no mark, not resolved, not retryable). No deferred inject goes to a seat that still has an
 ///   unknown entry, and nothing this reconciliation decides is typed into a bare shell (`live_agent`).
+/// ★(B-428) Every inject here is preceded by a durable, non-retryable record of it: a deferred node's intent (an unknown
+///   entry without a request id, which also takes the seat off `deferred`), or — for an unknown entry's one re-inject —
+///   that entry written again. If it cannot be written the inject is refused, not attempted (`intent_refused`). A failed
+///   final rewrite no longer discards the report (`persist_error`): the result is always `Ok`.
 #[allow(clippy::too_many_arguments)]
 fn consume_reinject_pending_core(
     base: &std::path::Path,
@@ -25110,36 +25193,58 @@ fn consume_reinject_pending_core(
                 );
                 keep_unknown(&mut rep, &mut unknown_out, u.clone());
             }
-            Presence::Absent => match inject(sid, &directive) {
-                Ok(()) => match mark(sid, pending_ver, &new_hash) {
-                    Ok(()) => {
-                        println!(
-                            "[pack-update] pending unknown surface {sid} ({role}): not in context (ReceivedNoAck) — \
-                             re-injected once, marked"
-                        );
-                        rep.resolved += 1;
+            Presence::Absent => {
+                // ★(B-428) the entry is the durable, non-retryable record of this one re-inject: written again (as it
+                //   is) before typing, so the re-inject is refused, not attempted, when the file cannot take it now
+                if let Err(w) = record_reinject_unknown(base, pending_ver, u) {
+                    eprintln!(
+                        "[pack-update] ⚠ surface {sid} ({role}): absent, but its unknown entry could not be written again \
+                         before typing ({}): {w} — re-inject REFUSED, nothing typed, still UNKNOWN",
+                        reinject_pending_path(base).display()
+                    );
+                    rep.intent_refused += 1;
+                    rep.intent_refused_nodes.push((sid, role.to_string()));
+                    keep_unknown(&mut rep, &mut unknown_out, u.clone());
+                    continue;
+                }
+                match inject(sid, &directive) {
+                    Ok(()) => match mark(sid, pending_ver, &new_hash) {
+                        Ok(()) => {
+                            println!(
+                                "[pack-update] pending unknown surface {sid} ({role}): not in context (ReceivedNoAck) — \
+                                 re-injected once, marked"
+                            );
+                            rep.resolved += 1;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[pack-update] ⚠ surface {sid} ({role}): re-injected but reinject.mark failed ({e}) — kept \
+                                 UNKNOWN so the next pass checks it (no blind second copy)"
+                            );
+                            keep_unknown(&mut rep, &mut unknown_out, u.clone());
+                        }
+                    },
+                    Err(e) if is_write_outcome_unknown(&e) => {
+                        eprintln!("[pack-update] ⚠ pending {}", reinject_unknown_note(sid, role, &e, &reinject_pending_path(base)));
+                        let entry = ReinjectUnknownEntry::from_unknown_write(sid, role, &directive, &e, here);
+                        // ★(B-428) the entry written just before typing still stands if this update fails
+                        if let Err(w) = record_reinject_unknown(base, pending_ver, &entry) {
+                            eprintln!(
+                                "[pack-update] ⚠ the unknown entry could not be updated with its request id ({}): {w} \
+                                 — surface {sid} ({role}) stays tracked by the entry written before typing",
+                                reinject_pending_path(base).display()
+                            );
+                        }
+                        rep.unknown_new += 1;
+                        keep_unknown(&mut rep, &mut unknown_out, entry);
                     }
                     Err(e) => {
-                        eprintln!(
-                            "[pack-update] ⚠ surface {sid} ({role}): re-injected but reinject.mark failed ({e}) — kept \
-                             UNKNOWN so the next pass checks it (no blind second copy)"
-                        );
-                        keep_unknown(&mut rep, &mut unknown_out, u.clone());
+                        // REFUSED (zero bytes) or another definite failure: an ordinary retry is safe
+                        eprintln!("[pack-update] pending re-inject failed (surface {sid}, role {role}): {e} — kept for retry");
+                        kept.push((sid, role.to_string()));
                     }
-                },
-                Err(e) if is_write_outcome_unknown(&e) => {
-                    eprintln!("[pack-update] ⚠ pending {}", reinject_unknown_note(sid, role, &e, &reinject_pending_path(base)));
-                    let entry = ReinjectUnknownEntry::from_unknown_write(sid, role, &directive, &e, here);
-                    let _ = record_reinject_unknown(base, pending_ver, &entry);
-                    rep.unknown_new += 1;
-                    keep_unknown(&mut rep, &mut unknown_out, entry);
                 }
-                Err(e) => {
-                    // REFUSED (zero bytes) or another definite failure: an ordinary retry is safe
-                    eprintln!("[pack-update] pending re-inject failed (surface {sid}, role {role}): {e} — kept for retry");
-                    kept.push((sid, role.to_string()));
-                }
-            },
+            }
             Presence::Undetermined(why) => {
                 eprintln!(
                     "[pack-update] surface {sid} ({role}): directive presence undetermined ({why}) — still UNKNOWN, nothing typed"
@@ -25173,6 +25278,21 @@ fn consume_reinject_pending_core(
         match reinject_decision(markers.get(role.as_str()), pending_ver, &new_hash, idle, self_idle, ready)
         {
             ReinjectDecision::Inject => {
+                // ★(B-428) the durable, non-retryable intent BEFORE the write (it also takes the seat off `deferred` on
+                //   disk); if it cannot be written, nothing is typed: the node stays an ordinary deferred retry. Once the
+                //   outcome is known (PASSED, REFUSED), the final rewrite below leaves it out; an UNKNOWN keeps it.
+                let intent = ReinjectUnknownEntry::intent(*sid, role, &directive, here);
+                if let Err(w) = record_reinject_unknown(base, pending_ver, &intent) {
+                    eprintln!(
+                        "[pack-update] ⚠ pending surface {sid} ({role}): re-inject REFUSED, nothing typed — the intent could \
+                         not be written before the write ({}): {w}",
+                        reinject_pending_path(base).display()
+                    );
+                    rep.intent_refused += 1;
+                    rep.intent_refused_nodes.push((*sid, role.clone()));
+                    kept.push((*sid, role.clone()));
+                    continue;
+                }
                 // per-node 에러 격리 — 한 노드의 실패가 나머지 재시도를 막지 않게 잔존 처리 후 계속.
                 if let Err(e) = inject(*sid, &directive) {
                     if !is_write_outcome_unknown(&e) {
@@ -25183,7 +25303,14 @@ fn consume_reinject_pending_core(
                     //   kept as an ordinary retry (that would type it twice) — an unknown entry, written at once
                     eprintln!("[pack-update] ⚠ pending {}", reinject_unknown_note(*sid, role, &e, &reinject_pending_path(base)));
                     let entry = ReinjectUnknownEntry::from_unknown_write(*sid, role, &directive, &e, here);
-                    let _ = record_reinject_unknown(base, pending_ver, &entry);
+                    // ★(B-428) it replaces the intent (adding the request id); the intent stands if this fails
+                    if let Err(w) = record_reinject_unknown(base, pending_ver, &entry) {
+                        eprintln!(
+                            "[pack-update] ⚠ the unknown entry could not be updated with its request id ({}): {w} — \
+                             surface {sid} ({role}) stays tracked by the intent written before the write",
+                            reinject_pending_path(base).display()
+                        );
+                    }
                     rep.unknown += 1;
                     rep.unknown_new += 1;
                     rep.unknown_nodes.push((*sid, role.clone()));
@@ -25201,10 +25328,15 @@ fn consume_reinject_pending_core(
         }
     }
     rep.kept = kept.len();
-    write_reinject_pending(
+    // ★(B-428) a failed rewrite is part of the report, not a reason to discard it (`?` here dropped every count of the
+    //   pass, so an UNKNOWN write made by it reached no exit code); the file keeps its last good content and each UNKNOWN
+    //   write of this pass already has its record there (written before typing)
+    if let Err(e) = write_reinject_pending(
         base,
         &ReinjectPending { pack_version: pending_ver.to_string(), deferred: kept, unknown: unknown_out },
-    )?;
+    ) {
+        rep.persist_error = Some(format!("{}: {e}", reinject_pending_path(base).display()));
+    }
     Ok(rep)
 }
 
@@ -27242,6 +27374,30 @@ fn pack_update_unknown_warning(base: &std::path::Path, nodes: &[(u64, String)]) 
     )
 }
 
+/// ★(B-428) The warning for injects a pending pass refused because their durable intent could not be written: who, and
+/// that nothing was typed. Pure.
+fn pending_intent_refused_warning(base: &std::path::Path, nodes: &[(u64, String)]) -> String {
+    let who: Vec<String> = nodes.iter().map(|(sid, role)| format!("surface {sid} ({role})")).collect();
+    format!(
+        "{} reinject(s) REFUSED, nothing typed: {} — the intent could not be written to {} before the write (the next \
+         pack-update tries again once it is writable)",
+        nodes.len(),
+        who.join(", "),
+        reinject_pending_path(base).display()
+    )
+}
+
+/// ★(B-428) The warning for a pending pass whose final rewrite failed: the pass's report above stands and reaches the
+/// exit code; every node whose re-injection outcome is unknown is named (each had its record on disk before it was
+/// typed, so no later pass types it blindly). Pure.
+fn pending_persist_failure_warning(err: &str, unknown_nodes: &[(u64, String)]) -> String {
+    let who: Vec<String> = unknown_nodes.iter().map(|(sid, role)| format!("surface {sid} ({role})")).collect();
+    format!(
+        "the pending file could not be rewritten ({err}) — this pass's report stands; re-injection outcome UNKNOWN for {}",
+        if who.is_empty() { "no node".to_string() } else { who.join(", ") }
+    )
+}
+
 fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: bool) -> i32 {
     // 성공 경로는 종료코드(i32)를 싣는다: 0=완전 성공, EXIT_REINJECT_DEGRADED=디스크는 반영됐으나
     // 라이브 노드 reinject 실패(성공 침묵 포장 금지). 에러 경로(Err)는 외부에서 1로 매핑.
@@ -27261,11 +27417,13 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
         // 노드가 지금 idle이면 reinject를 완료하고 pending에서 제거한다. dry-run은 부작용 없음 계약이라
         // 생략. 데몬 미가동이면 graceful 스킵(Err 로깅·pending 보존).
         // ★(B-360 R2 revise) the pass's unknown nodes are reported on every path; only the ones it CREATED
-        //   (`consumed_unknown_new`) reach the exit class (reinject_exit_code) — carried ones do not
-        let (mut consumed_unknown, mut consumed_unknown_new) = (0usize, 0usize);
+        //   (`consumed.unknown_new`) reach the exit class (reinject_exit_code) — carried ones do not
+        // ★(B-428) … and so do its refused injects (`consumed.intent_refused`); a failed final rewrite of the pass
+        //   (`persist_error`) no longer loses its report, so none of this can be dropped on the way to the exit code
+        let mut consumed = PendingConsumeReport::default();
         if !dry_run {
             match consume_reinject_pending(&base) {
-                Ok(c) if c.resolved > 0 || c.kept > 0 || c.unknown > 0 => {
+                Ok(c) if c.resolved > 0 || c.kept > 0 || c.unknown > 0 || c.persist_error.is_some() => {
                     println!(
                         "[pack-update] pending reinject 소비: {} 해소, {} 잔존, {} 미확인(이번 실행 신규 {}).",
                         c.resolved, c.kept, c.unknown, c.unknown_new
@@ -27273,8 +27431,13 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                     if c.unknown > 0 {
                         eprintln!("[pack-update] ⚠ {}", pack_update_unknown_warning(&base, &c.unknown_nodes));
                     }
-                    consumed_unknown = c.unknown;
-                    consumed_unknown_new = c.unknown_new;
+                    if c.intent_refused > 0 {
+                        eprintln!("[pack-update] ⚠ {}", pending_intent_refused_warning(&base, &c.intent_refused_nodes));
+                    }
+                    if let Some(e) = &c.persist_error {
+                        eprintln!("[pack-update] ⚠ {}", pending_persist_failure_warning(e, &c.unknown_nodes));
+                    }
+                    consumed = c;
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -27311,17 +27474,19 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                     outcome.pack_version
                 );
                 println!("{}", cys::pack::pack_update_uptodate_line(&outcome.pack_version));
-                if consumed_unknown > 0 {
+                if consumed.unknown > 0 {
                     // ★(B-360 R2 revise) no reinject ran, but the pending pass left nodes unknown: the app reads this
                     //   count (only the measured one — no unmeasured injected/failed are printed as 0)
                     println!(
-                        "{} pack_version={} unknown_new={consumed_unknown_new} unknown={consumed_unknown}",
+                        "{} pack_version={} unknown_new={} unknown={}",
                         cys::pack::REINJECT_RESULT_PREFIX,
-                        outcome.pack_version
+                        outcome.pack_version,
+                        consumed.unknown_new,
+                        consumed.unknown
                     );
-                    return Ok(reinject_exit_code(0, consumed_unknown_new));
                 }
-                return Ok(0);
+                // ★(B-428) never 0 while the pending pass made an UNKNOWN write or refused one
+                return Ok(pending_pass_exit_code(&consumed));
             }
             VersionGate::BinaryTooOld => {
                 eprintln!(
@@ -27394,7 +27559,8 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                     return Ok(cys::pack::EXIT_ACCEPTED_DEGRADED);
                 }
                 // new unknowns of this run only: the node loop's + the pending pass's re-injects (head's exit rule)
-                Ok(reinject_exit_code(rep.failed, rep.unknown_new + consumed_unknown_new))
+                // ★(B-428) + the pending pass's refused injects (nothing typed: no durable intent)
+                Ok(reinject_exit_code(rep.failed + consumed.intent_refused, rep.unknown_new + consumed.unknown_new))
             }
             // 데몬 미가동 등으로 reinject 자체를 못 함 — 디스크 반영은 성공(무중단 정책상 0).
             Err(e) => {
@@ -27407,9 +27573,10 @@ fn run_pack_update(from: Option<String>, manifest_url: Option<String>, dry_run: 
                 if accepted_degraded {
                     return Ok(cys::pack::EXIT_ACCEPTED_DEGRADED);
                 }
-                if consumed_unknown_new > 0 {
+                if pending_pass_exit_code(&consumed) != 0 {
                     // ★(B-360 R2 revise) the pending pass created unknown outcomes this run: not a clean 0
-                    return Ok(reinject_exit_code(0, consumed_unknown_new));
+                    // ★(B-428) … or refused an inject (nothing typed: no durable intent)
+                    return Ok(pending_pass_exit_code(&consumed));
                 }
                 Ok(0)
             }
@@ -47112,6 +47279,9 @@ mod b360_tests {
     /// (an entry from an earlier run) and stays undetermined after the check exits 0 and still reports the count; a pass
     /// whose re-inject itself comes back UNKNOWN created a new unknown and exits 3. The source half pins that every exit
     /// decision of `run_pack_update` passes only the `_new` counts to `reinject_exit_code`.
+    /// ★(B-428) Pinned EXACTLY since B-428 routed two of the three decisions through `pending_pass_exit_code`: the Apply
+    /// arm's one call, three `pending_pass_exit_code(&consumed)` calls and that function's one call. The contract was
+    /// re-proven on behaviour first (b428_p5, which drives these exit functions); a new exit path or argument updates this.
     /// Cannot be red on 11717c44: there UNKNOWN never reaches any count (`unknown_new` and the two-argument
     /// `reinject_exit_code` do not exist). Positive control: the re-inject-UNKNOWN pass (exit 3).
     #[cfg(unix)]
@@ -47138,12 +47308,23 @@ mod b360_tests {
             }
         }
         let src = include_str!("cys.rs");
-        let head = format!("\nfn {}(", "run_pack_update");
-        let at = src.find(&head).expect("run_pack_update");
-        let body = &src[at..at + src[at..].find("\n}\n").expect("end")];
-        let calls: Vec<&str> = body.split("reinject_exit_code(").skip(1).map(|c| &c[..c.find(')').unwrap_or(c.len())]).collect();
-        if calls.len() < 3 || calls.iter().any(|args| !args.split(',').nth(1).is_some_and(|a| a.contains("_new"))) {
-            failures.push(format!("run_pack_update passes a non-new unknown count to the exit: {calls:?}"));
+        let body_of = |name: &str| {
+            let at = src.find(&format!("\nfn {name}(")).expect(name);
+            &src[at..at + src[at..].find("\n}\n").expect("end")]
+        };
+        let args = |body: &str, callee: &str| -> Vec<String> {
+            body.split(callee).skip(1).map(|c| c[..c.find(')').unwrap_or(c.len())].to_string()).collect()
+        };
+        let update = body_of("run_pack_update");
+        let pinned = [
+            (args(update, "reinject_exit_code("), vec!["rep.failed + consumed.intent_refused, rep.unknown_new + consumed.unknown_new"]),
+            (args(update, "pending_pass_exit_code("), vec!["&consumed"; 3]),
+            (args(body_of("pending_pass_exit_code"), "reinject_exit_code("), vec!["c.intent_refused, c.unknown_new"]),
+        ];
+        for (got, want) in pinned {
+            if got != want {
+                failures.push(format!("an exit decision of run_pack_update changed (carried counts must not reach it): {got:?}, want {want:?}"));
+            }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
@@ -49780,5 +49961,539 @@ mod b360_tests {
         let keys = r3x_dict_keys(&r3x_block(&block), "_BOOT_OUTCOME_READINESS").expect("parsed");
         assert_eq!(keys.into_iter().collect::<Vec<_>>(), vec!["failed".to_string(), "launched".to_string()]);
         assert_eq!(r3x_kept_pane_labels().len(), 4, "{:?}", r3x_kept_pane_labels());
+    }
+
+    // ── ★(B-428 · WP6-B428-0.14.53) an UNKNOWN-capable write is preceded by a durable intent; a persistence failure keeps
+    //    the report, reaches the exit code and names the node; no later pass types the same directive blindly ─────────
+    // The codex R3 scenario (verdict 8e6f7057, cys.rs:25088/25106/27182/27226 @d13a21f3): a readable but unwritable
+    // pending file plus a `write_outcome_unknown` inject left the UNKNOWN write unrecorded, the pass's report discarded by
+    // the final rewrite's `?`, `UpToDate` returning 0, and the ordinary deferred entry alive for a second inject.
+    // p1-p4 compile on f0ac3b0c (they read the new report fields through its Debug text) so their RED is measurable there;
+    // the exit and wiring specimens after the `B428-POST-FIX-ONLY` marker name items the fix adds.
+
+    /// The scripted seat of [`b428_daemon`]: `directive` answers a directive paste; `lock_dir` (taken once) is made
+    /// read-only at that paste, before the reply — the directory (0555) AND the pending file in it (0444, when it exists),
+    /// so no writer can write it (in place or by rename): the write was issued, then persistence fails.
+    #[cfg(unix)]
+    struct B428Seat {
+        directive: Value,
+        lock_dir: Option<std::path::PathBuf>,
+    }
+
+    #[cfg(unix)]
+    type B428Ctl = std::sync::Arc<std::sync::Mutex<B428Seat>>;
+
+    #[cfg(unix)]
+    fn b428_ctl(directive: Value, lock_dir: Option<std::path::PathBuf>) -> B428Ctl {
+        std::sync::Arc::new(std::sync::Mutex::new(B428Seat { directive, lock_dir }))
+    }
+
+    /// One idle claude seat (surface:7 · worker, daemon instance 500.0, `session` as its transcript). A presence ping is
+    /// answered ok and leaves no trace (`wait_for` unmatched, nothing in the transcript): undetermined, so a later pass
+    /// may only keep the seat UNKNOWN — any directive paste after the first one is a blind re-type.
+    #[cfg(unix)]
+    fn b428_daemon(ctl: B428Ctl, session: std::path::PathBuf) -> R2cDaemon {
+        let mut marker = Value::Null;
+        R2cDaemon::start(move |method, p| {
+            let mut seat = ctl.lock().unwrap_or_else(|e| e.into_inner());
+            match method {
+                "org.status" => r2c_ok(json!({"daemon": {"version": "9.9.9", "started_at": 500.0}, "surfaces": [
+                    {"surface_id": 7, "role": "worker", "registered_session_id": null, "created_at": 50.0, "exited": false}]})),
+                "system.topology" => {
+                    let mut row = json!({"role": "worker"});
+                    if !marker.is_null() {
+                        row["pack_reinject"] = marker.clone();
+                    }
+                    r2c_ok(json!({"saved": [row]}))
+                }
+                "control.dashboard" => r2c_ok(json!({"fleet": [
+                    {"surface_id": 7, "role": "worker", "state": "idle", "idle_secs": 60, "agent_status": "idle"}]})),
+                "surface.list" => r2c_ok(json!({"surfaces": [{
+                    "surface_id": 7, "surface_ref": "surface:7", "role": "worker", "agent": "claude", "exited": false,
+                    "agent_alive": true, "awakened_at": 1.0,
+                    "usage": {"source": "transcript", "session_file": session.to_string_lossy()}}]})),
+                "surface.read_text" => r2c_ok(json!({"text": "", "latest_cursor": 40, "line_count": 40})),
+                "surface.send_text" => {
+                    if p["text"].as_str().unwrap_or("").contains(REINJECT_PING_HEAD) {
+                        return r2c_ok(json!({}));
+                    }
+                    if let Some(dir) = seat.lock_dir.take() {
+                        use std::os::unix::fs::PermissionsExt;
+                        let file = reinject_pending_path(&dir);
+                        if file.exists() {
+                            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o444)).expect("lock the file");
+                        }
+                        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("lock the dir");
+                    }
+                    seat.directive.clone()
+                }
+                "surface.wait_for" => r2c_ok(json!({"matched": false})),
+                "reinject.mark" => {
+                    marker = json!({"pack_version": p["pack_version"], "directive_hash": p["directive_hash"]});
+                    r2c_ok(json!({}))
+                }
+                _ => r2c_ok(json!({})),
+            }
+        })
+    }
+
+    /// Makes `path` writable again on drop (also after a RED panic), so the pack dir can be removed. Declare it AFTER the
+    /// pack (locals drop in reverse order).
+    #[cfg(unix)]
+    struct B428Unlock(std::path::PathBuf, u32);
+
+    #[cfg(unix)]
+    impl Drop for B428Unlock {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    /// Sets `path` to `mode` and proves the result refuses a write (a file: open for write; a directory: create a file in
+    /// it) — a run with privileges that ignore modes (root) cannot measure these specimens and must not pass them.
+    #[cfg(unix)]
+    fn b428_make_unwritable(path: &std::path::Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        let refused = if path.is_dir() {
+            let probe = path.join(".b428-probe");
+            let r = std::fs::write(&probe, b"x").is_err();
+            let _ = std::fs::remove_file(&probe);
+            r
+        } else {
+            std::fs::OpenOptions::new().write(true).open(path).is_err()
+        };
+        assert!(refused, "precondition: mode {mode:o} on {} does not refuse writes here (root?) — UNMEASURED, not a pass", path.display());
+    }
+
+    /// A field of the pass report read from its Debug text (`name: N`): None when the field does not exist (f0ac3b0c has no
+    /// `intent_refused` / `persist_error`), so a specimen that needs it is RED there instead of failing to compile.
+    #[cfg(unix)]
+    fn b428_count(debug: &str, name: &str) -> Option<usize> {
+        let at = debug.find(&format!("{name}: "))? + name.len() + 2;
+        debug[at..].split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    }
+
+    /// Where the UNKNOWN write happens: the pending pass of a deferred node, or pack-update's node loop.
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum B428Origin {
+        PendingPass,
+        NodeLoop,
+    }
+
+    /// What a B-428 run left: the first pass's report (Debug text) and its report value (pending pass only), the requests
+    /// of all passes, the file's unknown and deferred lists after pass 1, and after the later passes.
+    #[cfg(unix)]
+    struct B428Run {
+        first: String,
+        first_pending: Option<Result<PendingConsumeReport, String>>,
+        calls: Vec<(String, Value)>,
+        unknown_after_first: Vec<Value>,
+        deferred_after_first: Vec<Value>,
+        unknown_after_all: Vec<Value>,
+        /// the worker directive's hash in the run's pack
+        hash: String,
+    }
+
+    /// Pass 1 from `origin` with the directive paste answered `reply` (the dir and the pending file made read-only at that
+    /// paste when `lock_at_paste`, or before pass 1 when `lock_before`; only the pending FILE made read-only before pass 1 when
+    /// `file_read_only`); then, everything writable again and the paste answered ok, pass 2 = a pending pass and pass 3 = a
+    /// node loop (the two later passes that could type the directive again).
+    #[cfg(unix)]
+    fn b428_run(origin: B428Origin, reply: Value, lock_at_paste: bool, lock_before: bool, file_read_only: bool) -> B428Run {
+        let pack = R2cPack::new();
+        let _unlock_dir = B428Unlock(pack.dir.clone(), 0o755);
+        let _unlock_file = B428Unlock(reinject_pending_path(&pack.dir), 0o644);
+        let ctl = b428_ctl(reply, lock_at_paste.then(|| pack.dir.clone()));
+        let daemon = b428_daemon(ctl.clone(), r2p_session(&pack));
+        let (first, first_pending, hash) = r2c_in_env(&daemon, &pack, || {
+            if origin == B428Origin::PendingPass {
+                persist_reinject_pending(&pack.dir, "9.9.9", &[(7, "worker".to_string())]).unwrap();
+            }
+            if file_read_only {
+                b428_make_unwritable(&reinject_pending_path(&pack.dir), 0o444);
+            }
+            if lock_before {
+                // no writer can establish anything: the file (if any) refuses in-place writes, the directory a rename
+                if reinject_pending_path(&pack.dir).exists() {
+                    b428_make_unwritable(&reinject_pending_path(&pack.dir), 0o444);
+                }
+                b428_make_unwritable(&pack.dir, 0o555);
+            }
+            let hash = r3p_hash("worker");
+            match origin {
+                B428Origin::PendingPass => {
+                    let r = consume_reinject_pending(&pack.dir);
+                    (format!("{r:?}"), Some(r), hash)
+                }
+                B428Origin::NodeLoop => (format!("{:?}", run_pack_reinject("9.9.9")), None, hash),
+            }
+        });
+        drop(_unlock_dir);
+        drop(_unlock_file);
+        let (unknown_after_first, deferred_after_first) = (r2p_unknown_entries(&pack.dir), r2p_deferred_entries(&pack.dir));
+        ctl.lock().unwrap_or_else(|e| e.into_inner()).directive = r2c_ok(json!({}));
+        r2c_in_env(&daemon, &pack, || {
+            let _ = consume_reinject_pending(&pack.dir);
+            let _ = run_pack_reinject("9.9.9");
+        });
+        B428Run {
+            first,
+            first_pending,
+            calls: daemon.calls(),
+            unknown_after_first,
+            deferred_after_first,
+            unknown_after_all: r2p_unknown_entries(&pack.dir),
+            hash,
+        }
+    }
+
+    /// D1 + D3 · the exact codex scenario: a readable pending file that cannot be written in place (0444) holds the worker
+    /// as an ordinary deferred node; the pending pass's inject comes back `write_outcome_unknown`. The pass's report stands
+    /// (`Ok`, unknown 1, new 1, the node named), the file holds the node as UNKNOWN and no longer as deferred, and neither
+    /// later pass (a pending pass, a node loop) types the directive again. (The durable writer replaces the file by a
+    /// rename, which needs only the directory: the in-place-unwritable file no longer loses the record.)
+    /// RED on f0ac3b0c: the record and the final rewrite fail on the 0444 file, the pass returns `Err` (its report gone),
+    /// the deferred entry survives, and the next pass types the directive again.
+    #[cfg(unix)]
+    #[test]
+    fn b428_p1_codex_scenario_unknown_with_an_unwritable_pending_file_is_kept_named_and_never_retyped() {
+        let run = b428_run(B428Origin::PendingPass, r2c_reply(&pending_err()), false, false, true);
+        let mut failures = Vec::new();
+        if !run.first.starts_with("Ok(") {
+            failures.push(format!("pass 1 lost its report: {}", run.first));
+        }
+        if (b428_count(&run.first, "unknown"), b428_count(&run.first, "unknown_new")) != (Some(1), Some(1)) {
+            failures.push(format!("pass 1 does not count one NEW unknown: {}", run.first));
+        }
+        if !run.first.contains("unknown_nodes: [(7, \"worker\")]") {
+            failures.push(format!("pass 1 does not name surface 7 (worker): {}", run.first));
+        }
+        let warn = pack_update_unknown_warning(std::path::Path::new("/b"), &[(7, "worker".to_string())]);
+        if !warn.contains("surface 7 (worker)") {
+            failures.push(format!("the warning does not name the node: {warn}"));
+        }
+        let (directives, _pings) = r2p_pastes(&run.calls);
+        if directives != 1 {
+            failures.push(format!("directive pastes over three passes = {directives}, want 1 (no blind re-type)"));
+        }
+        if run.unknown_after_first.len() != 1 || run.unknown_after_first[0]["surface_id"] != 7 {
+            failures.push(format!("the UNKNOWN write is not on disk after pass 1: {:?}", run.unknown_after_first));
+        }
+        if run.deferred_after_first.iter().any(|d| d["surface_id"] == 7) {
+            failures.push(format!("the node is still an ordinary (retryable) deferred entry: {:?}", run.deferred_after_first));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// D2 + D3 · the write was issued, then the file stops taking writes (directory and file turn read-only at the paste) and
+    /// the reply is UNKNOWN — from either origin. The intent written BEFORE the paste is on disk (the seat is UNKNOWN, not
+    /// deferred); the pending pass's report survives its failed final rewrite (`persist_error`, unknown 1, new 1, named);
+    /// the node loop's report counts it; neither later pass types the directive again.
+    /// RED on f0ac3b0c: nothing is recorded before the paste, so the record after it and (pending pass) the final rewrite
+    /// fail: the pass returns `Err`, the deferred entry survives, and a later pass types the directive again.
+    #[cfg(unix)]
+    #[test]
+    fn b428_p2_persistence_lost_after_the_write_keeps_the_report_and_the_intent_and_never_retypes() {
+        let mut failures = Vec::new();
+        for origin in [B428Origin::PendingPass, B428Origin::NodeLoop] {
+            let run = b428_run(origin, r2c_reply(&pending_err()), true, false, false);
+            if !run.first.starts_with("Ok(") {
+                failures.push(format!("{origin:?}: pass 1 lost its report: {}", run.first));
+            }
+            if (b428_count(&run.first, "unknown"), b428_count(&run.first, "unknown_new")) != (Some(1), Some(1)) {
+                failures.push(format!("{origin:?}: pass 1 does not count one NEW unknown: {}", run.first));
+            }
+            if origin == B428Origin::PendingPass {
+                if !run.first.contains("unknown_nodes: [(7, \"worker\")]") {
+                    failures.push(format!("{origin:?}: pass 1 does not name surface 7 (worker): {}", run.first));
+                }
+                if !run.first.contains("persist_error: Some(") {
+                    failures.push(format!("{origin:?}: the failed final rewrite is not in the report: {}", run.first));
+                }
+            }
+            let intent_ok = run.unknown_after_first.len() == 1
+                && run.unknown_after_first[0]["surface_id"] == 7
+                && run.unknown_after_first[0]["directive_hash"] == run.hash.as_str();
+            if !intent_ok {
+                failures.push(format!("{origin:?}: no durable record of the write on disk after pass 1: {:?}", run.unknown_after_first));
+            }
+            if run.deferred_after_first.iter().any(|d| d["surface_id"] == 7) {
+                failures.push(format!("{origin:?}: the node is still a retryable deferred entry: {:?}", run.deferred_after_first));
+            }
+            let (directives, _pings) = r2p_pastes(&run.calls);
+            if directives != 1 {
+                failures.push(format!("{origin:?}: directive pastes over three passes = {directives}, want 1 (no blind re-type)"));
+            }
+            if run.unknown_after_all.len() != 1 {
+                failures.push(format!("{origin:?}: the unknown record did not survive the later passes: {:?}", run.unknown_after_all));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// D2 · the intent cannot be established (directory and file refuse writes BEFORE the pass): the inject is refused, not
+    /// attempted — zero directive pastes in pass 1 — from either origin; the pending pass counts it (`intent_refused 1`,
+    /// the node kept as it was: still an ordinary deferred entry on disk), the node loop counts it failed.
+    /// RED on f0ac3b0c: the directive is pasted (pass 1 types it with no record possible).
+    #[cfg(unix)]
+    #[test]
+    fn b428_p3_an_unwritable_intent_refuses_the_inject_without_typing() {
+        let mut failures = Vec::new();
+        for origin in [B428Origin::PendingPass, B428Origin::NodeLoop] {
+            let run = b428_run(origin, r2c_reply(&pending_err()), false, true, false);
+            let first_pass_directives = b428_first_pass_directives(&run.calls);
+            if first_pass_directives != 0 {
+                failures.push(format!("{origin:?}: pass 1 typed the directive {first_pass_directives} time(s) with no intent on disk"));
+            }
+            match origin {
+                B428Origin::PendingPass => {
+                    if b428_count(&run.first, "intent_refused") != Some(1) || b428_count(&run.first, "kept") != Some(1) {
+                        failures.push(format!("{origin:?}: pass 1 does not count the refusal (kept 1, intent_refused 1): {}", run.first));
+                    }
+                    if !run.deferred_after_first.iter().any(|d| d["surface_id"] == 7) || !run.unknown_after_first.is_empty() {
+                        failures.push(format!(
+                            "{origin:?}: the file changed although nothing was typed: deferred {:?} unknown {:?}",
+                            run.deferred_after_first, run.unknown_after_first
+                        ));
+                    }
+                }
+                B428Origin::NodeLoop => {
+                    if (b428_count(&run.first, "failed"), b428_count(&run.first, "unknown_new")) != (Some(1), Some(0)) {
+                        failures.push(format!("{origin:?}: pass 1 does not count the refusal failed (failed 1, unknown_new 0): {}", run.first));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// Directive pastes made by pass 1 of a [`b428_run`]: each pass that talks to the daemon starts with one
+    /// `system.topology` request (a pending pass with no file asks nothing), so pass 1 ends at the second one.
+    #[cfg(unix)]
+    fn b428_first_pass_directives(calls: &[(String, Value)]) -> usize {
+        let mut topologies = 0;
+        let mut directives = 0;
+        for (m, p) in calls {
+            if m == "system.topology" {
+                topologies += 1;
+                if topologies == 2 {
+                    break;
+                }
+            }
+            if m == "surface.send_text" && !p["text"].as_str().unwrap_or("").contains(REINJECT_PING_HEAD) {
+                directives += 1;
+            }
+        }
+        directives
+    }
+
+    /// D4 · CONTROL, the normal path (everything writable): a deferred node's inject PASSES → resolved, marked once, the
+    /// file removed (no intent left behind); the node loop's inject PASSES → injected, no file; a REFUSED (journal, zero
+    /// bytes) inject → the pending node stays an ordinary deferred retry and the node loop counts it failed, with no
+    /// unknown entry left. Passes on f0ac3b0c and after the fix (same counts, same file).
+    #[cfg(unix)]
+    #[test]
+    fn b428_p4_control_the_normal_path_is_unchanged() {
+        let mut failures = Vec::new();
+        for (origin, reply, want) in [
+            (B428Origin::PendingPass, r2c_ok(json!({})), "resolved: 1, kept: 0, unknown: 0, unknown_new: 0"),
+            (B428Origin::NodeLoop, r2c_ok(json!({})), "injected: 1, skipped: 0, deferred: 0, failed: 0, unknown: 0, unknown_new: 0"),
+            (B428Origin::PendingPass, r2c_reply(&journal_err()), "resolved: 0, kept: 1, unknown: 0, unknown_new: 0"),
+            (B428Origin::NodeLoop, r2c_reply(&journal_err()), "injected: 0, skipped: 0, deferred: 0, failed: 1, unknown: 0, unknown_new: 0"),
+        ] {
+            let pack = R2cPack::new();
+            let ctl = b428_ctl(reply.clone(), None);
+            let daemon = b428_daemon(ctl, r2p_session(&pack));
+            let first = r2c_in_env(&daemon, &pack, || match origin {
+                B428Origin::PendingPass => {
+                    persist_reinject_pending(&pack.dir, "9.9.9", &[(7, "worker".to_string())]).unwrap();
+                    format!("{:?}", consume_reinject_pending(&pack.dir))
+                }
+                B428Origin::NodeLoop => format!("{:?}", run_pack_reinject("9.9.9")),
+            });
+            let refused = reply != r2c_ok(json!({}));
+            let calls = daemon.calls();
+            let (directives, pings) = r2p_pastes(&calls);
+            let marks = r2c_count(&calls, "reinject.mark");
+            let tag = format!("{origin:?}/{}", if refused { "REFUSED" } else { "PASSED" });
+            if !first.contains(want) {
+                failures.push(format!("{tag}: report {first} lacks `{want}`"));
+            }
+            if (directives, pings, marks) != (1, 0, usize::from(!refused)) {
+                failures.push(format!("{tag}: directives {directives} pings {pings} marks {marks}"));
+            }
+            let (unknown, deferred) = (r2p_unknown_entries(&pack.dir), r2p_deferred_entries(&pack.dir));
+            let file = reinject_pending_path(&pack.dir).exists();
+            let want_file = refused && origin == B428Origin::PendingPass;
+            if !unknown.is_empty() || file != want_file || (want_file && deferred.len() != 1) {
+                failures.push(format!("{tag}: file exists {file} (want {want_file}) unknown {unknown:?} deferred {deferred:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    // ── B428-POST-FIX-ONLY: the specimens below name items the fix adds (they do not compile on f0ac3b0c) ──────────────
+
+    /// D1 · the exit class of a pack-update whose node loop did not run (UpToDate, reinject skipped) is the pending pass's:
+    /// the codex scenario's report (p1) and the persistence-lost report (p2) are DEGRADED (3), never 0, and a refused
+    /// inject (p3) too; CONTROLS: an empty pass, and a pass that only CARRIES an old unknown entry (head's exit rule: no
+    /// permanent non-zero from an entry nobody can resolve), stay 0. The persistence warning names the node.
+    #[cfg(unix)]
+    #[test]
+    fn b428_d1_the_pending_pass_exit_is_degraded_for_an_unknown_write_or_a_refusal_never_0() {
+        let mut failures = Vec::new();
+        for (name, lock_at_paste, lock_before, file_ro) in
+            [("codex scenario", false, false, true), ("lost after the write", true, false, false), ("intent refused", false, true, false)]
+        {
+            let run = b428_run(B428Origin::PendingPass, r2c_reply(&pending_err()), lock_at_paste, lock_before, file_ro);
+            let Some(Ok(rep)) = run.first_pending else {
+                failures.push(format!("{name}: no pass report: {}", run.first));
+                continue;
+            };
+            let code = pending_pass_exit_code(&rep);
+            if code != cys::pack::EXIT_REINJECT_DEGRADED {
+                failures.push(format!("{name}: exit {code}, want {} (never 0): {rep:?}", cys::pack::EXIT_REINJECT_DEGRADED));
+            }
+            if let Some(e) = &rep.persist_error {
+                let warn = pending_persist_failure_warning(e, &rep.unknown_nodes);
+                let unnamed: Vec<String> = rep
+                    .unknown_nodes
+                    .iter()
+                    .map(|(sid, role)| format!("surface {sid} ({role})"))
+                    .filter(|n| !warn.contains(n.as_str()))
+                    .collect();
+                if !unnamed.is_empty() || !warn.contains(".pack-reinject-pending.json") {
+                    failures.push(format!("{name}: the persistence warning does not name {unnamed:?} and the file: {warn}"));
+                }
+            }
+            if rep.intent_refused > 0 {
+                let warn = pending_intent_refused_warning(std::path::Path::new("/b"), &rep.intent_refused_nodes);
+                if !warn.contains("surface 7 (worker)") || !warn.contains("nothing typed") {
+                    failures.push(format!("{name}: the refusal warning does not name the node: {warn}"));
+                }
+            }
+        }
+        let carried = PendingConsumeReport { unknown: 1, unknown_nodes: vec![(7, "worker".into())], ..Default::default() };
+        for (name, rep) in [("empty pass", PendingConsumeReport::default()), ("carried unknown only", carried)] {
+            if pending_pass_exit_code(&rep) != 0 {
+                failures.push(format!("control {name}: exit {} (want 0)", pending_pass_exit_code(&rep)));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// D1 wiring pin (the exit above is only reached if `run_pack_update` routes through it; its UpToDate arm cannot be
+    /// driven by a test — the source must verify against the embedded keyring): in `run_pack_update`, the pending pass's
+    /// report is kept whole (also with only a `persist_error`), the UpToDate arm returns `pending_pass_exit_code(&consumed)`
+    /// and no bare `Ok(0)`, the reinject-skipped arm consults it, and the Apply arm adds the pass's refusals and new
+    /// unknowns to its own.
+    #[test]
+    fn b428_d1_run_pack_update_routes_every_pending_only_exit_through_the_pass_report_source_pin() {
+        let src = include_str!("cys.rs");
+        let head = src.find("\nfn run_pack_update(").expect("run_pack_update");
+        let body = &src[head..head + 1 + src[head + 1..].find("\nfn ").expect("next fn")];
+        let mut failures = Vec::new();
+        for needle in [
+            "c.persist_error.is_some() =>",
+            "consumed = c;",
+            "return Ok(pending_pass_exit_code(&consumed));",
+            "if pending_pass_exit_code(&consumed) != 0 {",
+            "Ok(reinject_exit_code(rep.failed + consumed.intent_refused, rep.unknown_new + consumed.unknown_new))",
+        ] {
+            if !body.contains(needle) {
+                failures.push(format!("run_pack_update lacks `{needle}`"));
+            }
+        }
+        let up = body.find("VersionGate::UpToDate =>").expect("UpToDate arm");
+        let arm = &body[up..up + body[up..].find("VersionGate::BinaryTooOld").expect("next arm")];
+        if arm.contains("return Ok(0)") {
+            failures.push(format!("the UpToDate arm can still return a bare 0:\n{arm}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// The B-360 exit rule (b360_r2r_p15) through the B-428 exit, on BEHAVIOUR: only THIS run's new unknowns, and this run's
+    /// refused injects, reach the exit; a carried unknown is reported, never passed. Run 1 leaves an UNKNOWN entry (carried
+    /// into run 2); run 2 = the real pending pass, then the real node loop. The exit comes from `pending_pass_exit_code`
+    /// (UpToDate and reinject-skipped arms) and from the Apply arm's expression, copied here; the exact source pin of
+    /// b360_r2r_p15 binds that copy to `run_pack_update`. Rows: carried + undetermined → exit 0, reported (unknown 1, node
+    /// named); carried + absent + re-inject UNKNOWN → new 1, exit 3; carried + absent + the entry cannot be written again →
+    /// refused 1, nothing typed, exit 3.
+    #[cfg(unix)]
+    #[test]
+    fn b428_p5_carried_unknowns_exit_0_and_are_reported_new_unknowns_and_refusals_are_degraded() {
+        let degraded = cys::pack::EXIT_REINJECT_DEGRADED;
+        let mut failures = Vec::new();
+        for (name, ping, reinject, lock, want) in [
+            ("carried + undetermined", R2pPing::NoTrace, r2c_ok(json!({})), false, (1, 0, 0, 0, 0)),
+            ("carried + absent + re-inject UNKNOWN", R2pPing::NoAck, r2c_reply(&pending_err()), false, (1, 1, 0, 1, degraded)),
+            ("carried + absent + entry not writable", R2pPing::NoAck, r2c_ok(json!({})), true, (1, 0, 1, 0, degraded)),
+        ] {
+            let pack = R2cPack::new();
+            let _unlock_dir = B428Unlock(pack.dir.clone(), 0o755);
+            let _unlock_file = B428Unlock(reinject_pending_path(&pack.dir), 0o644);
+            let ctl = r2p_ctl(r2c_reply(&pending_err()), R2pPing::NoTrace, true);
+            let daemon = r2p_daemon(ctl.clone(), r2p_session(&pack));
+            let (pass, node_loop, directives) = r2c_in_env(&daemon, &pack, || {
+                run_pack_reinject("9.9.9").expect("run 1");
+                r2p_set(&ctl, reinject.clone(), ping, true);
+                if lock {
+                    b428_make_unwritable(&reinject_pending_path(&pack.dir), 0o444);
+                    b428_make_unwritable(&pack.dir, 0o555);
+                }
+                let before = daemon.calls().len();
+                let pass = consume_reinject_pending(&pack.dir).expect("run 2 pending pass");
+                let directives = r2p_pastes(&daemon.calls()[before..]).0;
+                (pass, run_pack_reinject("9.9.9").expect("run 2 node loop"), directives)
+            });
+            let pending_exit = pending_pass_exit_code(&pass);
+            let apply_exit =
+                reinject_exit_code(node_loop.failed + pass.intent_refused, node_loop.unknown_new + pass.unknown_new);
+            let got = (pass.unknown, pass.unknown_new, pass.intent_refused, directives, pending_exit);
+            if got != (want.0, want.1, want.2, want.3, want.4) || apply_exit != want.4 {
+                failures.push(format!(
+                    "{name}: unknown/new/refused/directives/exit = {got:?}, Apply-arm exit {apply_exit}; want {want:?} · {pass:?}"
+                ));
+            }
+            let warn = pack_update_unknown_warning(&pack.dir, &pass.unknown_nodes);
+            if pass.unknown_nodes != vec![(7, "worker".to_string())] || !warn.contains("surface 7 (worker)") {
+                failures.push(format!("{name}: the unknown node is not reported: {:?} · {warn}", pass.unknown_nodes));
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// D3 · a pending file that lists the seat BOTH as an ordinary deferred node and as UNKNOWN (no writer of this lane
+    /// leaves that state - `record_reinject_unknown` takes the seat off `deferred` - but an older writer or a hand-edited
+    /// file can): the pending pass keeps it UNKNOWN and types nothing, also through its deferred list (the open-seat guard).
+    /// Passes on f0ac3b0c too (the guard predates B-428); it kills the mutant that turns the guard off alone (M3b2).
+    #[cfg(unix)]
+    #[test]
+    fn b428_p6_a_seat_both_deferred_and_unknown_is_never_typed_into_by_the_pending_pass() {
+        let pack = R2cPack::new();
+        let ctl = r2p_ctl(r2c_reply(&pending_err()), R2pPing::NoTrace, true);
+        let daemon = r2p_daemon(ctl.clone(), r2p_session(&pack));
+        let (pass, directives) = r2c_in_env(&daemon, &pack, || {
+            run_pack_reinject("9.9.9").expect("run 1");
+            let path = reinject_pending_path(&pack.dir);
+            let mut doc: Value = serde_json::from_str(&std::fs::read_to_string(&path).expect("pending file")).expect("json");
+            doc["deferred"] = json!([{"surface_id": 7, "role": "worker"}]);
+            std::fs::write(&path, doc.to_string()).expect("both lists");
+            r2p_set(&ctl, r2c_ok(json!({})), R2pPing::NoTrace, true);
+            let before = daemon.calls().len();
+            let pass = consume_reinject_pending(&pack.dir).expect("pending pass");
+            (pass, r2p_pastes(&daemon.calls()[before..]).0)
+        });
+        let mut failures = Vec::new();
+        if directives != 0 {
+            failures.push(format!("the pending pass typed the directive {directives} time(s) into a seat that is UNKNOWN"));
+        }
+        if (pass.unknown, pass.unknown_new, pass.kept) != (1, 0, 1) {
+            failures.push(format!("the seat is not kept UNKNOWN and deferred as it was: {pass:?}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 }
