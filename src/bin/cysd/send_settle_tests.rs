@@ -38,11 +38,7 @@ struct Fx {
 
 impl Drop for Fx {
     fn drop(&mut self) {
-        for s in self.daemon.surfaces.lock().unwrap().values() {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        crate::state::test_stop_daemon(&self.daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         std::env::remove_var("CYS_SEND_SETTLE");
         let _ = std::fs::remove_dir_all(&self.dir);

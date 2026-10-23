@@ -5017,6 +5017,7 @@ mod drills {
     /// `persist_queue_state()` 는 실패를 반환하지 않으므로 경보가 **양쪽에서** 사라졌다.
     #[test]
     fn drill_admission_is_retained_until_the_queue_write_is_durable() {
+        let _quiet = crate::state::test_quiet_expected_persist_fail();
         let daemon = drill_daemon("handoff");
         let cso = seat(&daemon, "cso");
         let now = after_grace(&daemon);
@@ -5057,6 +5058,7 @@ mod drills {
     /// 않는다 — 그 판별자가 `admit_durable` 한 비트다.
     #[test]
     fn drill_restart_readmits_only_the_admission_that_never_reached_disk() {
+        let _quiet = crate::state::test_quiet_expected_persist_fail();
         let dir = std::env::temp_dir().join(format!(
             "cys-alertdrill-handoff2-{}-{}",
             std::process::id(),

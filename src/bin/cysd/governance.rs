@@ -22848,6 +22848,7 @@ mod tests {
         drop(old_children);
         drop(old_target);
         drop(old_sender);
+        crate::state::test_stop_daemon(&old);
         drop(old);
         for (name, rows) in [
             ("queue-state.json", &active_rows),
@@ -23277,6 +23278,7 @@ mod tests {
     #[test]
     fn wp5_r1_failed_queue_persist_is_retried_by_the_tick_without_new_mutations() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _quiet = crate::state::test_quiet_expected_persist_fail();
         let (_pack, _env) = wp5_env("persist-retry");
         let (daemon, s) = wp5_seat("wp5-persist-retry", "claude");
         let dir = crate::state::state_dir(&daemon.socket_path);
@@ -23329,6 +23331,7 @@ mod tests {
     #[test]
     fn wp5_r1_expired_notice_is_persisted_before_the_flag_and_retried_idempotently() {
         let _g = QUEUE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _quiet = crate::state::test_quiet_expected_persist_fail();
         let (_pack, _env) = wp5_env("notice-durable");
         let (daemon, target) = wp5_seat("wp5-notice-durable", "claude");
         let sender = daemon

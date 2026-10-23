@@ -3312,12 +3312,40 @@ pub(crate) fn send_write_req_bounded(
 thread_local! {
     /// 시험 전용: true 면 다음 `process_chunk_isolated` 한 번이 파서 반영 전에 패닉한다(한 번 쓰고 꺼진다).
     static FORCE_PARSER_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// 시험 전용: 의도적 WAL 디렉터리 실패 주입 검체가 현재 시험 스레드의 예상된 `영속 중단` stderr 만 억제한다(배경 스레드에는 상속되지 않는다).
+    static QUIET_EXPECTED_PERSIST_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// 시험 전용: 이 스레드의 다음 청크 처리 한 번에 파서 패닉을 주입한다.
 #[cfg(test)]
 pub(crate) fn force_parser_panic_once() {
     FORCE_PARSER_PANIC.with(|f| f.set(true));
+}
+
+#[cfg(test)]
+pub(crate) struct QuietExpectedPersistFailGuard;
+
+#[cfg(test)]
+impl Drop for QuietExpectedPersistFailGuard {
+    fn drop(&mut self) {
+        QUIET_EXPECTED_PERSIST_FAIL.with(|f| f.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_quiet_expected_persist_fail() -> QuietExpectedPersistFailGuard {
+    QUIET_EXPECTED_PERSIST_FAIL.with(|f| f.set(true));
+    QuietExpectedPersistFailGuard
+}
+
+#[cfg(test)]
+fn should_quiet_expected_persist_fail() -> bool {
+    QUIET_EXPECTED_PERSIST_FAIL.with(|f| f.get())
+}
+
+#[cfg(not(test))]
+fn should_quiet_expected_persist_fail() -> bool {
+    false
 }
 
 /// (W4) PTY 청크를 vt100 파서에 반영하되, 파서 내부 인덱스 패닉을 격리한다.
@@ -5318,6 +5346,154 @@ pub(crate) fn test_done_or_quiet_window(
     false
 }
 
+/// ★(0.14.53 · WP2 · B-433) **검체 끝정리 전용** — 상태 디렉터리를 지우기 전에 데몬이 소유한 배경 스레드
+/// (좌석 PTY reader 스레드 — EOF 후 `park_active_to_restored`/`park_expired_to_restored` → `persist_queue_state`
+/// 수행 후 `surface.exited` 발행 및 `Arc<Daemon>` 반납 — 와 `recall::spawn_writer` 스레드)를 멈추고 종료를
+/// 결정론적으로 확인한다.
+///
+/// 【불변식】
+/// 1. 모든 생성된 좌석(`surface.created`)의 자식을 종료·회수하고, 각 reader 스레드가 EOF 후처리(`persist_queue_state`)의
+///    마지막 문장인 `surface.exited` 를 버스에 발행하고 클로저를 빠져나가 `Arc<Daemon>` 강한 참조를 놓을 때까지 기다린다.
+/// 2. `recall_tx` 를 새 채널 송신단으로 교체해 `recall::spawn_writer` 의 수신 루프를 즉시 끊는다.
+/// 3. 비패닉 문맥에서는 ① 상태 디렉터리가 정리 전에 미리 삭제되지 않았음(`dir_existed_at_entry && sdir.exists()`)
+///    ② 모든 생성 좌석의 `surface.exited` 발행 및 `s.exited` 도달 ③ 배경 스레드의 `Arc<Daemon>` 반납
+///    ④ (실패 주입 검체가 아닌 한) `queue.persist_failed` 0건 및 `queue_wal_durable()` 참을 단언한다.
+#[cfg(test)]
+pub(crate) fn test_stop_daemon(daemon: &Arc<Daemon>) {
+    let sdir = state_dir(&daemon.socket_path);
+    let intact_at_entry = sdir.exists() && sdir.join("operator.token").exists();
+    let fault_injected = sdir.join("queue-expired.json").is_dir()
+        || sdir.join("queue-state.json").is_dir()
+        || crate::delivery::ledger_path(&daemon.socket_path).is_dir();
+
+    let surfaces: Vec<Arc<Surface>> = daemon
+        .surfaces
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    let created: Vec<(u64, u32)> = daemon
+        .bus
+        .replay_after(0)
+        .into_iter()
+        .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("surface.created"))
+        .filter_map(|e| {
+            let sid = e.get("surface_id").and_then(|v| v.as_u64())?;
+            let pid = e
+                .get("payload")
+                .and_then(|p| p.get("pid"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+            Some((sid, pid))
+        })
+        .collect();
+
+    for s in &surfaces {
+        #[cfg(unix)]
+        if s.pid > 1 && s.pid != std::process::id() {
+            unsafe {
+                let pgid = libc::getpgid(s.pid as libc::pid_t);
+                if pgid == s.pid as libc::pid_t {
+                    let _ = libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
+        let mut child = s.child.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    #[cfg(unix)]
+    for &(sid, pid) in &created {
+        if !surfaces.iter().any(|s| s.id == sid) && pid > 1 && pid != std::process::id() {
+            unsafe {
+                let pgid = libc::getpgid(pid as libc::pid_t);
+                if pgid == pid as libc::pid_t {
+                    let _ = libc::kill(-pgid, libc::SIGKILL);
+                } else {
+                    let _ = libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let exited_ids: std::collections::HashSet<u64> = daemon
+            .bus
+            .replay_after(0)
+            .into_iter()
+            .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("surface.exited"))
+            .filter_map(|e| e.get("surface_id").and_then(|v| v.as_u64()))
+            .collect();
+        let all_bus_exited = created.iter().all(|(sid, _)| exited_ids.contains(sid));
+        let all_surf_exited = surfaces.iter().all(|s| s.exited.load(Ordering::Acquire));
+        if all_bus_exited && all_surf_exited && Arc::strong_count(daemon) == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    if intact_at_entry {
+        let db_deadline = Instant::now() + std::time::Duration::from_millis(100);
+        while Instant::now() < db_deadline && !sdir.join("transcripts.db").exists() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+    *daemon.recall_tx.lock().unwrap_or_else(|e| e.into_inner()) = std::sync::mpsc::channel().0;
+
+    if std::thread::panicking() {
+        return;
+    }
+
+    let exited_ids: std::collections::HashSet<u64> = daemon
+        .bus
+        .replay_after(0)
+        .into_iter()
+        .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("surface.exited"))
+        .filter_map(|e| e.get("surface_id").and_then(|v| v.as_u64()))
+        .collect();
+    for (sid, _) in &created {
+        assert!(
+            exited_ids.contains(sid),
+            "test_stop_daemon: surface {sid} reader 스레드가 surface.exited 를 발행하기 전에 시한을 넘겼다"
+        );
+    }
+    for s in &surfaces {
+        assert!(
+            s.exited.load(Ordering::Acquire),
+            "test_stop_daemon: surface {} exited 표식이 서지 않았다",
+            s.id
+        );
+    }
+    assert_eq!(
+        Arc::strong_count(daemon),
+        1,
+        "test_stop_daemon: 데몬 Arc 강한 참조가 1 이 아니다 — 배경 스레드가 아직 살아 있다"
+    );
+    let persist_failures: Vec<Value> = daemon
+        .bus
+        .replay_after(0)
+        .into_iter()
+        .filter(|e| e.get("name").and_then(|v| v.as_str()) == Some("queue.persist_failed"))
+        .collect();
+    let intact_at_exit = sdir.exists() && sdir.join("operator.token").exists();
+    assert!(
+        intact_at_entry && intact_at_exit,
+        "test_stop_daemon: 배경 스레드를 멈추기 전에 상태 디렉터리({})를 먼저 지웠다(intact_entry={}, intact_exit={}, persist_failed={})",
+        sdir.display(),
+        intact_at_entry,
+        intact_at_exit,
+        persist_failures.len()
+    );
+    if !fault_injected {
+        assert!(
+            persist_failures.is_empty() && daemon.queue_wal_durable(),
+            "test_stop_daemon: 배경 스레드 정리 중 큐 영속 실패가 발생했다: {persist_failures:?}"
+        );
+    }
+}
+
 /// 영속 상태 디렉터리 — 소켓과 같은 곳 (unix). Windows는 LOCALAPPDATA 하위.
 /// RC-13: Windows에서 부서 데몬마다 pipe명 슬러그로 **고유 디렉토리**를 파생해 transcripts.db·feed.jsonl
 /// 격리를 보장한다(구: 모든 부서가 단일 %LOCALAPPDATA%\cys 공유 → SQLite 락 경합·부서간 오염).
@@ -6338,7 +6514,9 @@ impl Daemon {
             // ★(0.14.31 · 리뷰 R1) 재시도 표식 — 다음 틱이 큐 변경 없이도 다시 쓴다(위 필드 doc).
             self.queue_persist_dirty.store(true, Ordering::Release);
             // 침묵 금지 — 어느 단계에서 멈췄는지가 곧 "디스크에 무엇이 남아 있는가" 다.
-            eprintln!("[queue] 영속 중단({stage}) — {why} · 원본 보존(다음 틱 재시도)");
+            if !should_quiet_expected_persist_fail() {
+                eprintln!("[queue] 영속 중단({stage}) — {why} · 원본 보존(다음 틱 재시도)");
+            }
             self.bus.publish(
                 "queue.persist_failed",
                 "queue",
@@ -8930,6 +9108,7 @@ mod tests {
         assert!(panicked, "전제: 파서 패닉 격리 발동");
         mirror_screen_modes(&s, q.screen());
         assert!(!s.bracketed_paste.load(Ordering::Relaxed), "재초기화 → false → 원문(종전) 폴백");
+        super::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -10777,6 +10956,7 @@ mod tests {
         }
         crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::OwnerClose)
             .expect("surface 종료 및 자식 프로세스 회수");
+        super::test_stop_daemon(&daemon);
         // ★(R2F-DM 2차 · B3-b) 끝정리 — 유닉스는 종전처럼 엄격(실패 = 패닉) · 윈도우는 공유 위반(os error 32)을 잠깐 다시 시도한 뒤 무시한다(이 검체는 데몬을 쥔 채 지운다).
         test_rm_rf(sock.parent().unwrap());
     }
@@ -11285,12 +11465,8 @@ mod tests {
             .expect("미소비 restored 항목 보존");
         assert_eq!(restored["seq"].as_u64(), Some(7));
         assert_eq!(restored["enqueued_at"].as_f64(), Some(1234.5));
-        // 정리 — 스폰 자식 회수 + 임시 dir 제거
-        {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        // 정리 — 스폰 자식 회수·배경 스레드 종료 후 임시 dir 제거
+        super::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11318,11 +11494,7 @@ mod tests {
         assert_eq!(e.text, "레거시 복원");
         assert_eq!(e.origin, "wal-legacy", "레거시 origin 표기");
         drop(q);
-        {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        super::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11434,11 +11606,7 @@ mod tests {
             !echo.iter().any(|v| v == "qold.1" || v == "qold.2"),
             "entry_ids 키명 재사용 금지(성찰 BLOCKER) — 큐 항목 id 가 W-id 에코 키에 실렸다"
         );
-        {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        super::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -11474,11 +11642,7 @@ mod tests {
             .expect("queue.rehomed 발행");
         assert_eq!(ev["payload"]["reordered"], json!(false), "밀린 기존 항목 없음");
         assert_eq!(ev["payload"]["queue_entry_ids"], json!(["qe.1", "qe.2"]));
-        {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        super::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -12008,11 +12172,8 @@ mod tests {
         daemon_b.rehome_restored_queue();
         let active = b.pending_queue.lock().unwrap().clone();
         let expired = b.expired_queue.lock().unwrap().clone();
-        for s in [&a, &b] {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        super::test_stop_daemon(&daemon_a);
+        super::test_stop_daemon(&daemon_b);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             active.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
@@ -12119,11 +12280,8 @@ mod tests {
         daemon_b.rehome_restored_queue();
         let q = b.pending_queue.lock().unwrap().clone();
         let x = b.expired_queue.lock().unwrap().clone();
-        for s in [&a, &b] {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        super::test_stop_daemon(&daemon_a);
+        super::test_stop_daemon(&daemon_b);
         let got = q.iter().find(|e| e.id == active.id).expect("활성 항목이 사라졌다");
         assert_eq!(got.enqueued_at, active.enqueued_at, "원 발신 시각은 보존된다");
         assert_eq!(got.ttl_secs, None, "구 왕복에서 개별 TTL 은 기본으로 돌아온다(문서화된 잔여)");
@@ -12735,6 +12893,7 @@ mod tests {
     /// 치환(rename)을 실패시킨다(POSIX·Windows 공통으로 실패한다).
     #[test]
     fn r6_failed_destination_write_never_deletes_the_source_copy() {
+        let _quiet = super::test_quiet_expected_persist_fail();
         let _ledger = crate::delivery::tests::isolate_state_dir("r6-persist-fail-wal");
         let dir = queue_wal_dir("r6-persist-fail");
         let e = w2c_entry("r6-persist-fail-entry", 93, now_epoch());
@@ -13017,7 +13176,10 @@ mod tests {
         }
         stop2.store(true, std::sync::atomic::Ordering::Relaxed);
         t2.join().expect("rehome 스레드");
-        let _ = seat.child.lock().unwrap().kill(); // 검체 좌석 정리(래퍼 프로세스 회수)
+        super::test_stop_daemon(&daemon);
+        super::test_stop_daemon(&d2);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     /// ★WP-5: 만료 행을 활성 WAL에 섞으면 롤백한 구 데몬이 폐기 대기 본문을 다시 배달한다.
@@ -13090,11 +13252,8 @@ mod tests {
         restored.rehome_restored_queue();
         let q = target.pending_queue.lock().unwrap().clone();
         let x = target.expired_queue.lock().unwrap().clone();
-        for surface in [&s, &target] {
-            let mut child = surface.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        super::test_stop_daemon(&daemon);
+        super::test_stop_daemon(&restored);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(q.is_empty(), "만료 복원분의 활성 큐 재진입 금지");
         assert_eq!(x.len(), 1, "만료 큐에 정확히 1건 이관");
@@ -13143,11 +13302,7 @@ mod tests {
         s.pending_queue.lock().unwrap().push_back(c);
         daemon.rehome_restored_queue();
         let q = s.pending_queue.lock().unwrap().clone();
-        {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        super::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             q.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
@@ -13412,6 +13567,7 @@ mod reflect_queue_tests {
             "되살린 항목이 배달 경로에 오지 못했다"
         );
         let _ = crate::governance::close_surface(&daemon, s.id, crate::governance::CloseCause::OwnerClose);
+        super::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

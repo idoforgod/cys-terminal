@@ -13654,11 +13654,14 @@ mod tests {
         // 격리가 없으면 `pack_state_dir()` 이 실 HOME 으로 해소돼 라이브 원장이 더러워진다.
         // 하네스에서 일괄로 접는다(개별 테스트가 잊어도 새지 않게 — delivery.rs tests 머리말 참조).
         crate::delivery::tests::isolate_state_dir_for_thread(tag);
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "cys-acl-{}-{}-{}",
+            "cys-acl-{}-{}-{}-{}",
             tag,
             std::process::id(),
-            crate::state::now_epoch() as u64
+            crate::state::now_epoch() as u64,
+            n
         ));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("acl.json"), acl_json).unwrap();
@@ -15167,6 +15170,7 @@ mod tests {
             panic!("single reply");
         };
         assert!(r.get("error").is_none(), "drop 의 현행 인가가 함께 바뀌었다: {r}");
+        crate::state::test_stop_daemon(&daemon);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -16900,11 +16904,7 @@ mod tests {
 
     /// 의도된 RED 단언 전에 정리해 실패가 다음 검체의 pack 환경·자식 프로세스에 새지 않게 한다.
     fn d12_cleanup(daemon: &Arc<Daemon>, dir: &std::path::Path) {
-        for s in daemon.surfaces.lock().unwrap().values() {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        crate::state::test_stop_daemon(daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -19748,10 +19748,13 @@ mod tests {
     /// 락 없는 임시 데몬 + 발신 pane 신원 주입 헬퍼 (claim_role 신원 검증 테스트용).
     /// caller_cache에 synthetic pid→sid를 심어 프로세스 트리 워크 없이 발신자를 확정한다.
     fn claim_daemon() -> Arc<Daemon> {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "cys-claim-{}-{}",
+            "cys-claim-{}-{}-{}",
             std::process::id(),
-            crate::state::now_epoch() as u64
+            crate::state::now_epoch() as u64,
+            n
         ));
         let _ = std::fs::create_dir_all(&dir);
         Daemon::new(dir.join("cysd.sock"))
@@ -25912,9 +25915,10 @@ mod tests {
             resp["ok"], json!(false),
             "reviewer→worker deny 인데 강제 배달이 통과했다 (응답: {resp})"
         );
-        assert_eq!(resp["error"]["code"], json!("acl_denied"));
+        assert_eq!( resp["error"]["code"], json!("acl_denied"));
         assert_eq!(worker.pending_queue.lock().unwrap().len(), 1, "거부 시 배달 0건");
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -25984,6 +25988,7 @@ mod tests {
             assert_eq!(q.front().map(|e| e.id.clone()), Some(e2.id.clone()), "잔여 순서 보존");
         }
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -26260,6 +26265,7 @@ mod tests {
                 assert_eq!(row.get(key), Some(&Value::Null), "restored 행 {key}는 명시적 null");
             }
         }
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -26329,6 +26335,7 @@ mod tests {
         );
         // ⓒ full=false 를 명시해도 기본과 같다(플래그 해석이 뒤집히지 않았음).
         assert!(ask(json!({"full": false})).get("text").is_none());
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29415,11 +29422,7 @@ mod tests {
                 assert_eq!(row["ttl_secs"], json!(10), "만료 행 TTL 노출");
             }
         }
-        {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
     }
 
@@ -29484,11 +29487,7 @@ mod tests {
             .into_iter()
             .filter(|ev| ev["name"] == "queue.revived" && ev["payload"]["queue_entry_id"] == e.id)
             .collect();
-        {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
         assert!(empty_expired, "revive 후 만료 큐에서 제거");
         assert_eq!(
@@ -29550,11 +29549,7 @@ mod tests {
         };
         let q = s.pending_queue.lock().unwrap().clone();
         let x = s.expired_queue.lock().unwrap().clone();
-        {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
         assert_eq!(resp["ok"], json!(false), "상한 revive는 오류 응답");
         assert_eq!(
@@ -29657,11 +29652,7 @@ mod tests {
             .into_iter()
             .filter(|ev| ev["name"] == "queue.dropped")
             .collect();
-        {
-            let mut child = s.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
         assert_eq!(
             resp["ok"],
@@ -29792,12 +29783,7 @@ mod tests {
             .into_iter()
             .filter(|ev| ev["name"] == "queue.dropped")
             .collect();
-        for sid in [cso, worker, other] {
-            let surface = daemon.get_surface(sid).expect("정리 대상 조회");
-            let mut child = surface.child.lock().unwrap();
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
         assert_eq!(
             active_ids,
@@ -29843,6 +29829,7 @@ mod tests {
         ) else {
             panic!("queue.revive는 단일 응답");
         };
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(daemon.socket_path.parent().expect("임시 dir"));
         assert_eq!(
             resp["ok"],
@@ -29861,6 +29848,83 @@ mod tests {
                 .iter()
                 .any(|ev| ev["name"] == "queue.revived"),
             "없는 항목에 revive 이벤트 금지"
+        );
+    }
+
+    /// ★(0.14.53 · WP2 · B-433) `test_stop_daemon` 결정론적 증명 + 역순(디렉터리 선삭제) 거부 대조군:
+    /// ① 정상 순서(`test_stop_daemon` → `remove_dir_all`)에서는 PTY reader 가 EOF 후 `park_active_to_restored`
+    ///    → `persist_queue_state` 및 `surface.exited` 발행을 마치고 `Arc<Daemon>` 강한 참조를 놓은(strong_count == 1)
+    ///    뒤에야 반환하며 `queue.persist_failed` 가 0건이고 `queue_wal_durable()` 이 참이다.
+    /// ② 역순 대조군(배경 스레드 정지 전에 상태 디렉터리를 먼저 지운 경우)에서는 `test_stop_daemon` 이
+    ///    반드시 패닉해 순서 위반/경합을 붉게 잡는다.
+    #[test]
+    fn wp5_queue_stop_daemon_proves_threads_exited_and_rejects_dir_removal_before_stop() {
+        let _ledger = crate::delivery::tests::isolate_state_dir("wp5-stop-daemon-probe");
+        // ① 정상 순서: reader 스레드 종료 + WAL 영속 완료 후 디렉터리 제거.
+        let daemon = isolated_daemon();
+        let sid = make_surface(&daemon, Some("worker"));
+        let s = daemon.get_surface(sid).expect("surface 조회");
+        s.pending_queue
+            .lock()
+            .unwrap()
+            .push_back(daemon.next_queue_entry("정상 순서 보존".into(), None, "send"));
+        assert!(
+            Arc::strong_count(&daemon) >= 2,
+            "전제: 살아있는 좌석의 PTY reader 스레드가 Arc<Daemon> 을 쥐고 있어야 한다"
+        );
+        crate::state::test_stop_daemon(&daemon);
+        assert_eq!(
+            Arc::strong_count(&daemon),
+            1,
+            "test_stop_daemon 반환 시점에 모든 배경 reader 스레드가 종료되어 Arc<Daemon> 강한 참조가 1 이어야 한다"
+        );
+        assert!(
+            daemon.queue_wal_durable(),
+            "reader EOF park_active_to_restored 의 persist_queue_state 가 디렉터리 삭제 전에 성공해야 한다"
+        );
+        let dir = daemon.socket_path.parent().expect("임시 dir");
+        assert!(
+            dir.join("queue-state.json").exists(),
+            "디렉터리 제거 전에는 reader 가 영속화한 queue-state.json 이 디스크에 존재해야 한다"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+
+        // ② 역순 대조군(control 1): 배경 스레드 정지 전에 상태 디렉터리를 먼저 지운 뒤 test_stop_daemon 을 부르면 반드시 패닉해야 한다.
+        let bad_daemon = isolated_daemon();
+        let bad_sid = make_surface(&bad_daemon, None);
+        let bad_s = bad_daemon.get_surface(bad_sid).expect("surface 조회");
+        {
+            let mut child = bad_s.child.lock().unwrap();
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let bad_dir = bad_daemon.socket_path.parent().expect("임시 dir").to_path_buf();
+        let _ = std::fs::remove_dir_all(&bad_dir);
+        let caught_dir = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::state::test_stop_daemon(&bad_daemon);
+        }));
+        let _ = std::fs::remove_dir_all(&bad_dir);
+        assert!(
+            caught_dir.is_err(),
+            "대조군 1 실패: 배경 스레드 종료 전에 상태 디렉터리를 먼저 지웠는데 test_stop_daemon 이 통과했다"
+        );
+
+        // ③ 영속 실패 대조군(control 2): 배경 스레드가 queue.persist_failed 를 기록한 경우 test_stop_daemon 이 반드시 패닉해야 한다.
+        let fail_daemon = isolated_daemon();
+        let fail_dir = fail_daemon.socket_path.parent().expect("임시 dir").to_path_buf();
+        fail_daemon.bus.publish(
+            "queue.persist_failed",
+            "queue",
+            None,
+            json!({"stage": "expired-first", "error": "control probe"}),
+        );
+        let caught_persist = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::state::test_stop_daemon(&fail_daemon);
+        }));
+        let _ = std::fs::remove_dir_all(&fail_dir);
+        assert!(
+            caught_persist.is_err(),
+            "대조군 2 실패: queue.persist_failed 가 발생했는데 test_stop_daemon 이 통과했다"
         );
     }
 
