@@ -3328,6 +3328,14 @@ pub fn handle_event(daemon: &Arc<Daemon>, event: &Value, now: Now) {
     let Some(item) = summarize(event) else {
         return;
     };
+    // ★(0.14.53 · B-439) A CSO seat's OWN context.threshold goes to the master seat, not into the drop below: the CSO
+    //   cannot clear itself (self-clear is refused) and master is the only seat that may cycle it, while a Claude Code
+    //   master seat does not read `cys events`. It returns here, so it never reaches route_once/decide (no CSO inbox).
+    //   Every other CSO-own event stays excluded exactly as before.
+    if is_cso_self_threshold(daemon, event, &item) {
+        route_cso_self_threshold(daemon, event, &item, now);
+        return;
+    }
     // ★출처가 CSO 자신인 생애 이벤트(`surface.exited{role:"cso*"}`)는 좌석 생존 여부와 무관하게
     //   제외한다 — 발행 시점에 이미 exited=true 라 좌석 집합만으로는 잡히지 않는다.
     if payload_role_is_cso(event) {
@@ -3335,6 +3343,109 @@ pub fn handle_event(daemon: &Arc<Daemon>, event: &Value, now: Now) {
         return;
     }
     route_once(daemon, &item, now);
+}
+
+/// The seat role that receives a CSO's own context.threshold (B-439). Exact match: `master-2` is not the master seat.
+pub const CSO_SELF_THRESHOLD_TARGET_ROLE: &str = "master";
+
+/// Is this a CSO seat's own `context.threshold`? Both CSO-own tests of the routing path count: the payload role (the
+/// drop in [`handle_event`]) and the seat being bound to a cso* role (the drop in [`route_once`]).
+fn is_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem) -> bool {
+    item.key.name == "context.threshold"
+        && (payload_role_is_cso(event)
+            || item.key.surface.is_some_and(|s| cso_seats_detail(daemon).0.contains(&s)))
+}
+
+/// Text for the master seat: the same `[alert] …` line the CSO gets for other seats, plus one sentence on the same line
+/// (no newline inside a queued text) saying whose threshold it is and the command that clears it.
+pub fn cso_self_threshold_text(item: &AlertItem, role: &str, fire: Option<&str>) -> String {
+    let fire_arg = fire.map_or_else(String::new, |f| format!(" --fire {f}"));
+    format!(
+        "{} | this is the CSO's OWN context threshold ({role}); the CSO cannot clear itself - master clears it: cys cycle-agent --role {role}{fire_arg}",
+        render_text(item, 1)
+    )
+}
+
+/// Deliver a CSO's own `context.threshold` to the master seat queue (B-439). When it cannot be delivered (no master
+/// seat, an empty master seat, a frozen or full queue) the fact goes to the existing overflow ledger
+/// ([`REFUSED_FILE`] via [`append_refused`], the same record the became-CSO path writes) and an event says so — it is
+/// never dropped silently. Thresholds, fire/resolved bookkeeping and the pending set are not touched.
+fn route_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem, now: Now) {
+    let payload = event.get("payload").unwrap_or(&Value::Null);
+    // The hint must name the seat's CSO role: a cso-bound seat can publish with another payload role, and
+    // `--role <that role>` would cycle a different seat (R1-1).
+    let role: String = match payload.get("role").and_then(Value::as_str).filter(|r| !r.is_empty()) {
+        Some(r) if r.starts_with(CSO_ROLE_PREFIX) => r.to_string(),
+        _ => item
+            .key
+            .surface
+            .and_then(|sid| {
+                let roles = daemon.roles.lock().unwrap();
+                roles.iter().find(|(r, s)| **s == sid && is_cso_role(r)).map(|(r, _)| r.clone())
+            })
+            .unwrap_or_else(|| CSO_ROLE_PREFIX.to_string()),
+    };
+    let fire = payload.get("fire_id").and_then(Value::as_str).filter(|f| !f.is_empty());
+    let text = cso_self_threshold_text(item, &role, fire);
+    // The roles guard is released at the end of this statement - enqueue_into_seat takes surfaces, then roles.
+    let master = daemon.roles.lock().unwrap().get(CSO_SELF_THRESHOLD_TARGET_ROLE).copied();
+    let result = match master {
+        None => Err("no_master"),
+        Some(sid) => enqueue_into_seat(
+            daemon,
+            sid,
+            text,
+            Some(ALERT_FROM.to_string()),
+            ALERT_ORIGIN,
+            CSO_QUEUE_HEADROOM,
+            Some(RoleGuard::Exact(CSO_SELF_THRESHOLD_TARGET_ROLE)),
+            FreezeGuard::DaemonAndSeat,
+            None,
+        )
+        .map(|(entry_id, depth)| (sid, entry_id, depth))
+        .map_err(|e| match e {
+            EnqueueErr::SeatGone | EnqueueErr::RoleChanged => "no_master",
+            EnqueueErr::EmptySeat => "empty_master_seat",
+            EnqueueErr::QueueFull => "master_queue_full",
+            EnqueueErr::Frozen => "paused",
+        }),
+    };
+    match result {
+        Ok((sid, entry_id, depth)) => publish_route(
+            daemon,
+            "alert_route.cso_self_to_master",
+            json!({"name": item.key.name, "surface_id": item.key.surface, "detail": item.key.detail,
+                   "role": role, "fire_id": fire, "master_surface": sid,
+                   "queue_entry_id": entry_id, "depth": depth}),
+        ),
+        Err(cause) => {
+            let kind = format!("cso_self_threshold_{cause}");
+            let p = PendingAlert {
+                first_seen: now.epoch,
+                last_seen: now.epoch,
+                first_mono: now.mono,
+                count: 1,
+                summary: item.summary.clone(),
+                reason: "cso_self_threshold",
+                admitted_as: None,
+                admit_durable: false,
+            };
+            let archived = append_refused(daemon, &[refused_row(&kind, &item.key, &p, now)]);
+            publish_route(
+                daemon,
+                "alert_route.cso_self_undelivered",
+                json!({"name": item.key.name, "surface_id": item.key.surface, "detail": item.key.detail,
+                       "role": role, "fire_id": fire, "cause": cause, "summary": item.summary,
+                       "archived_to": if archived.is_ok() { json!(REFUSED_FILE) } else { Value::Null },
+                       "archive_error": match &archived { Err(e) => json!(e.to_string()), Ok(()) => Value::Null },
+                       "note": if archived.is_ok() {
+                           "the CSO's own threshold could not reach the master seat - kept in the overflow ledger; master must cycle the CSO"
+                       } else {
+                           "LOST: could not reach the master seat and could not be written to the overflow ledger - this event is the last copy"
+                       }}),
+            );
+        }
+    }
 }
 
 /// ★공동 디스패처 — 보류분과 신규 도착이 **한 대기열**에서 나이순(first_mono)으로 예산을 받는다.
@@ -4076,6 +4187,140 @@ mod drills {
         }
         assert_eq!(depth(&daemon, cso), 0, "자기 좌석 이벤트는 적재하지 않는다");
         assert_eq!(pending_len(&daemon), 0, "보류에도 남기지 않는다(무한 보관 금지)");
+    }
+
+    fn queue_texts(daemon: &Arc<Daemon>, sid: u64) -> Vec<String> {
+        daemon.get_surface(sid).unwrap().pending_queue.lock().unwrap().iter().map(|e| e.text.clone()).collect()
+    }
+
+    /// ★(0.14.53 · B-439) A CSO seat's OWN context.threshold reaches the master seat queue exactly once, through the
+    /// alert enqueue (origin/from), and nothing enters the CSO inbox or the pending set. It used to be dropped as
+    /// CsoOwnSurface, so nobody was told to cycle the CSO (CSO self-clear is refused; master does not read `cys events`).
+    #[test]
+    fn drill_cso_own_context_threshold_goes_to_master_once() {
+        let daemon = drill_daemon("csoselfm");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        handle_event(
+            &daemon,
+            &ev("context.threshold", Some(cso),
+                json!({"role": "cso", "context_pct": 63, "threshold": 60, "fire_id": "1792000000:49:3"})),
+            now,
+        );
+        assert_eq!(depth(&daemon, master), 1, "master gets exactly one notice");
+        assert_eq!(depth(&daemon, cso), 0, "the CSO inbox gets nothing");
+        assert_eq!(pending_len(&daemon), 0, "not parked in the pending set");
+        let e = daemon.get_surface(master).unwrap().pending_queue.lock().unwrap()[0].clone();
+        assert_eq!(e.origin, ALERT_ORIGIN);
+        assert_eq!(e.from.as_deref(), Some(ALERT_FROM));
+        assert!(e.text.starts_with(&format!("[alert] context.threshold surface:{cso} ")), "{}", e.text);
+        assert!(e.text.contains("context=63%") && e.text.contains("fire=1792000000:49:3"), "names the fire: {}", e.text);
+        assert!(e.text.contains("cys cycle-agent --role cso --fire 1792000000:49:3"), "{}", e.text);
+        assert!(!e.text.contains('\n'), "one line: {}", e.text);
+        // A seat bound to a cso* role whose payload role is not cso (the route_once drop) is the CSO's own threshold too.
+        let cso2 = seat(&daemon, "cso-2");
+        handle_event(
+            &daemon,
+            &ev("context.threshold", Some(cso2), json!({"role": "worker", "context_pct": 61, "threshold": 60})),
+            now,
+        );
+        assert_eq!(depth(&daemon, master), 2, "a cso-bound seat's own threshold also reaches master");
+        let t = queue_texts(&daemon, master).remove(1);
+        assert!(t.contains("cys cycle-agent --role cso-2") && !t.contains("--role worker"), "the hint names the seat's CSO role: {t}");
+        assert_eq!((depth(&daemon, cso), depth(&daemon, cso2), pending_len(&daemon)), (0, 0, 0));
+    }
+
+    /// (B-439 · R1-2) A frozen master queue (kill-switch pause) is a recorded non-delivery, not a queue entry or a drop.
+    #[test]
+    fn drill_cso_own_context_threshold_while_paused_is_recorded_not_queued() {
+        let daemon = drill_daemon("csoselfp");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        daemon.paused.store(true, Ordering::Relaxed);
+        handle_event(
+            &daemon,
+            &ev("context.threshold", Some(cso), json!({"role": "cso", "context_pct": 66, "threshold": 60, "fire_id": "f-p"})),
+            now,
+        );
+        daemon.paused.store(false, Ordering::Relaxed);
+        assert_eq!((depth(&daemon, master), depth(&daemon, cso), pending_len(&daemon)), (0, 0, 0));
+        let rows: Vec<Value> = read_refused_rows(&daemon).expect("overflow ledger readable").into_iter()
+            .filter(|r| r["name"] == "context.threshold").collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["kind"], "cso_self_threshold_paused");
+    }
+
+    /// Control (B-439): every other CSO-own event stays excluded exactly as before, with a live master present.
+    #[test]
+    fn drill_cso_own_non_threshold_events_stay_excluded_with_a_master_seat() {
+        let daemon = drill_daemon("csoselfx");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        for name in ["queue.depth_high", "queue.starved", "health.alert"] {
+            handle_event(&daemon, &ev(name, Some(cso), json!({"role": "cso", "depth": 60})), now);
+            handle_event(&daemon, &ev(name, Some(cso), json!({"depth": 60})), now);
+        }
+        handle_event(&daemon, &ev("surface.exited", Some(cso), json!({"role": "cso"})), now);
+        assert_eq!(depth(&daemon, master), 0, "master gets nothing for non-threshold CSO-own events");
+        assert_eq!(depth(&daemon, cso), 0, "the CSO inbox gets nothing");
+        assert_eq!(pending_len(&daemon), 0, "nothing parked");
+    }
+
+    /// Control (B-439): context.threshold for a non-CSO seat still goes to the CSO inbox only.
+    #[test]
+    fn drill_non_cso_context_threshold_still_goes_to_the_cso_only() {
+        let daemon = drill_daemon("csoselfw");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let worker = seat(&daemon, "worker");
+        let now = after_grace(&daemon);
+        handle_event(
+            &daemon,
+            &ev("context.threshold", Some(worker), json!({"role": "worker", "context_pct": 62, "threshold": 60, "fire_id": "f-w"})),
+            now,
+        );
+        assert_eq!(depth(&daemon, cso), 1, "the CSO inbox gets the worker's threshold");
+        assert_eq!(depth(&daemon, master), 0, "master gets nothing");
+        let t = queue_texts(&daemon, cso).remove(0);
+        assert!(t.starts_with(&format!("[alert] context.threshold surface:{worker} ")) && !t.contains("OWN context threshold"), "{t}");
+    }
+
+    /// (B-439) No live master: the CSO's own threshold is recorded in the existing overflow ledger with the cause and the
+    /// fire - never dropped silently, never put in the CSO inbox. (a) no seat holds `master`; (b) an empty master seat.
+    #[test]
+    fn drill_cso_own_context_threshold_without_a_live_master_is_recorded_not_dropped() {
+        let daemon = drill_daemon("csoselfn");
+        let cso = seat(&daemon, "cso");
+        let now = after_grace(&daemon);
+        let mine = |d: &Arc<Daemon>| -> Vec<Value> {
+            read_refused_rows(d).expect("overflow ledger readable").into_iter()
+                .filter(|r| r["name"] == "context.threshold" && r["surface_id"] == json!(cso)).collect()
+        };
+        assert!(mine(&daemon).is_empty(), "no row before the event");
+        handle_event(
+            &daemon,
+            &ev("context.threshold", Some(cso), json!({"role": "cso", "context_pct": 64, "threshold": 60, "fire_id": "f-n"})),
+            now,
+        );
+        assert_eq!((depth(&daemon, cso), pending_len(&daemon)), (0, 0));
+        let rows = mine(&daemon);
+        assert_eq!(rows.len(), 1, "recorded once: {rows:?}");
+        assert_eq!(rows[0]["kind"], "cso_self_threshold_no_master");
+        assert!(rows[0]["summary"].as_str().unwrap_or("").contains("fire=f-n"), "{rows:?}");
+        let empty_master = bare_seat(&daemon, "master");
+        handle_event(
+            &daemon,
+            &ev("context.threshold", Some(cso), json!({"role": "cso", "context_pct": 65, "threshold": 60, "fire_id": "f-e"})),
+            now,
+        );
+        assert_eq!(depth(&daemon, empty_master), 0, "an empty seat is not a reader");
+        let rows = mine(&daemon);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[1]["kind"], "cso_self_threshold_empty_master_seat");
+        assert_eq!((depth(&daemon, cso), pending_len(&daemon)), (0, 0));
     }
 
     /// ★CSO 좌석이 둘일 때(cso·cso-2) **양쪽 다** 자기제외 대상이다 — 아니면 A 의 적체를 B 에게,
