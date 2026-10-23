@@ -1944,6 +1944,21 @@ pub fn expand_windows_env(s: &str, lookup: impl Fn(&str) -> Option<String>) -> S
 
 /// Windows 사용자 bin 후보(belt-and-braces) — claude native 설치 위치 `%USERPROFILE%\.local\bin`,
 /// npm 전역 `%APPDATA%\npm`, 그리고 ★B7 이 추가한 우리 기본 prefix `%LOCALAPPDATA%\cys-npm\bin`.
+///
+/// ★★소비처가 **둘**이다(INV-1 · 0.14.53 WP8). 이 목록은 (a) pane·자식 PATH 합성
+/// ([`runtime_prefixed_path`] → [`compose_pane_path`])과 (b) **claude CLI 설치 감지 게이트**
+/// (`cys.rs` `windows_agent_candidates`)가 **같이** 쓴다. 두 소비처를 한 목록으로 묶은 이유:
+/// 종전에는 게이트가 자기 목록(`%APPDATA%\npm`·`%LOCALAPPDATA%\npm` 둘뿐)을 따로 들고 있어
+/// 두 집합이 **양방향으로** 어긋났고, 그 어긋남이 그대로 사용자 결함이 됐다 —
+///   · 게이트에만 없던 `%USERPROFILE%\.local\bin`(= **권장** native 설치 위치)·`cys-npm`:
+///     pane 은 실행할 수 있는데 게이트가 '미설치'로 판정해 **좌석을 아예 만들지 않았다**.
+///   · pane 에만 없던 `%LOCALAPPDATA%\npm`: 게이트는 통과시키는데 pane PATH 에 그 폴더가 없어
+///     **좌석은 뜨고 claude 는 시작되지 않았다**.
+/// ⇒ 불변식: **게이트가 받아들이는 폴더는 모두 pane PATH 에 실린다.** 한쪽에만 폴더를 더하면
+/// 그 결함이 되살아나므로, 이 함수에 항목을 더하는 것이 **두 소비처에 동시에 더하는** 유일한 방법이다
+/// (핀: `windows_gate_dirs_are_a_subset_of_pane_path_dirs`).
+/// ★순서는 **선호 순서**다 — native 설치본이 먼저, 레거시(`.claude\local`)가 마지막. 항목 0..3 의
+/// 상대 순서는 종전과 바이트 동일하게 유지한다(이미 도는 기계가 고르는 본을 바꾸지 않는다).
 /// 설치기가 레지스트리 등록을 빠뜨려도 잡히게 is_dir 게이트 없이 무조건 포함
 /// (셸은 없는 PATH 항목을 무시·claude 설치 직후 재시작 없이 발견). OS 무관 컴파일(순수·테스트 가능).
 ///
@@ -1968,8 +1983,85 @@ pub fn windows_user_bin_dirs(
         let root = l.join(NPM_PREFIX_WIN_SUBDIR);
         v.push(root.join("bin"));
         v.push(root);
+        // ★(0.14.53 WP8) `%LOCALAPPDATA%\npm` — 종전에는 **감지 게이트에만** 있고 pane PATH 에는
+        //   없었다(`cys.rs` 구 B8 ②). 그래서 claude 가 여기 있으면 게이트는 '설치됨'을 내는데 pane 이
+        //   맨 이름 `claude` 를 해소하지 못해 좌석만 뜨고 CLI 는 시작되지 않았다. INV-1 의 역방향 구멍.
+        v.push(l.join("npm"));
+        // ★(0.14.53 WP8) WinGet 명령 별칭 폴더 — `winget install Anthropic.ClaudeCode` 는 Anthropic
+        //   공식 설치 경로 하나다(code.claude.com/docs/en/setup). WinGet 이 보통 이 폴더를 PATH 에
+        //   넣지만, 넣기 **전**(설치 직후·앱 기동 뒤 등록) 창에서는 아무도 못 찾았다.
+        //   ⚠이 폴더 경로 자체는 Microsoft 1차 문서로 확인하지 못했다(REPORT UNMEASURED-2) —
+        //   틀렸을 때의 대가는 '영원히 안 맞는 후보 1개'이고(게이트는 is_file 을 요구하고 셸은 없는
+        //   PATH 항목을 무시한다) 오탐은 만들지 않으므로, 단정하지 않고 후보로만 싣는다.
+        v.push(l.join("Microsoft").join("WinGet").join("Links"));
     }
+    // ★(0.14.53 WP8) 레거시 로컬 npm 설치 위치 — 공식 문서가 "the legacy local npm install created by
+    //   older versions of Claude Code" 로 명시하고 제거 명령까지 싣는다
+    //   (code.claude.com/docs/en/troubleshoot-install · Check for conflicting installations).
+    //   **선호 순서상 맨 마지막**이다: 여기만 있는 사용자는 구제하되, native 설치본이 함께 있으면
+    //   그쪽이 먼저 잡혀야 한다(문서도 native 를 권장본으로 지목한다).
+    v.push(home.join(".claude").join("local"));
+    // ★(0.14.53 WP8 · R1-3) 레거시 트리는 **bin 폴더가 아니라 npm 로컬 설치 트리**다 — 공식 문서의
+    //   제거 명령이 `-Recurse` 인 것이 그 단서다. npm 로컬 설치는 실행 파일을
+    //   `<dir>\node_modules\.bin\<name>` 에 둔다. 바로 위 한 줄만으로는 `.claude\local\claude.exe` 를
+    //   찾게 되는데 그 레이아웃은 그런 파일을 만들지 않는다 ⇒ **있으나 맞지 않는 후보**였다
+    //   (이 티켓이 고치려는 결함과 같은 꼴이다). 두 자리를 모두 후보로 둔다.
+    //   ⚠둘 중 어느 것이 실제로 맞는지는 Windows 실기 미확인이다(REPORT UNMEASURED-6) —
+    //   "후보를 추가했다"만 주장하고 "L6 를 닫았다"고는 주장하지 않는다.
+    v.push(home.join(".claude").join("local").join("node_modules").join(".bin"));
     v
+}
+
+/// Windows 에서 에이전트 실행 파일이 가질 수 있는 이름 변형 — **해소 순서**다(순수 · OS 무관 컴파일).
+/// `.cmd` 가 먼저인 이유: `npm i -g` 는 Windows 에서 `<prefix>\<name>.cmd` 셸 래퍼를 깐다. 다음이
+/// `.exe`(native 설치기 산출물), 그 뒤 `.bat`·`.ps1`, 마지막이 확장자 없는 파일이다.
+/// 구 B8 ②의 이름 목록과 **같은 순서**를 유지한다(이미 잡히는 기계가 고르는 파일을 바꾸지 않는다).
+pub fn windows_agent_exe_names(stem: &str) -> Vec<String> {
+    vec![
+        format!("{stem}.cmd"),
+        format!("{stem}.exe"),
+        format!("{stem}.bat"),
+        format!("{stem}.ps1"),
+        stem.to_string(),
+    ]
+}
+
+/// `dirs` 를 순서대로 훑어 `stem` 의 실행 가능한 변형을 처음 찾은 것 하나를 돌려준다
+/// (0.14.53 WP8 · claude CLI 설치 감지 게이트의 디렉터리 스캔).
+///
+/// 실행 가능 판정은 **주입**받는다(`is_exec`) — 그래야 해소 **순서**가 Windows 기계 없이 검증된다
+/// (호스트의 `is_executable_file` 은 unix 에서 X_OK, Windows 에서 `is_file` 이라 의미가 다르다).
+/// 디렉터리 실재는 확인하지 않는다: 없는 폴더는 `is_exec` 가 어차피 거짓이고, 실재 확인을 넣으면
+/// 호출 1회당 stat 이 늘기만 한다. **빈 후보를 만들지 않는다** — `stem` 이 비면 즉시 None.
+pub fn find_agent_in_dirs(
+    dirs: &[PathBuf],
+    stem: &str,
+    is_exec: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if stem.is_empty() {
+        return None;
+    }
+    let names = windows_agent_exe_names(stem);
+    for d in dirs {
+        for n in &names {
+            let cand = d.join(n);
+            if is_exec(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    None
+}
+
+/// PATH 문자열이 지목하는 디렉터리들(순수) — 빈 항목은 버린다. 감지 게이트가 **신선 레지스트리 PATH**
+/// ([`windows_registry_path`])를 디렉터리 목록으로 바꿔 스캔하는 데 쓴다. 따옴표는 벗기지 않는다:
+/// Windows PATH 항목은 셸 인용 규약이 아니라 `;` 구분 평문이고, `compose_pane_path` 도 평문으로 싣는다.
+pub fn path_entries(path: &str, sep: char) -> Vec<PathBuf> {
+    path.split(sep)
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// pane PATH 최종 합성(순서·dedup 규칙 · **Windows 전용 의미론** · OS 무관 컴파일). 순서:
@@ -4284,19 +4376,28 @@ mod tests {
         let with = windows_user_bin_dirs(home, Some(&appdata), None);
         let got: Vec<String> = with.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         // 경로 구분자는 호스트 OS 규약이라 컴포넌트 존재로 검증(mac 에서도 무결).
-        assert_eq!(got.len(), 2);
+        // ★(0.14.53 WP8) 길이가 2→3 으로 늘었다 — 레거시 `.claude\local` 이 **무조건** 말미에 붙는다.
+        //   항목 0..1 의 철자·순서는 종전과 동일하다(이미 도는 기계가 고르는 본 불변).
+        assert_eq!(got.len(), 3, "local/bin · appdata/npm · .claude/local: {got:?}");
         assert!(got[0].contains(".local") && got[0].ends_with("bin"), "local/bin: {got:?}");
         assert!(got[1].ends_with("npm"), "appdata/npm: {got:?}");
-        // APPDATA 부재 시 .local/bin 만.
+        assert!(got[2].contains(".claude") && got[2].ends_with("local"), ".claude/local 말미: {got:?}");
+        // APPDATA 부재 시 .local/bin + 레거시 둘.
         let none = windows_user_bin_dirs(home, None, None);
-        assert_eq!(none.len(), 1);
+        assert_eq!(none.len(), 2, "APPDATA 부재: local/bin · .claude/local: {none:?}");
 
         // ★B7(H-NPM-2 일부): %LOCALAPPDATA% 가 있으면 우리 기본 prefix 의 `bin` 과 루트가
         //   **둘 다** 후보로 붙는다(npm 구현에 따라 `prefix\` 직하 또는 `prefix\bin`).
         //   주입(⑥)만 하고 발견(PATH)을 빠뜨리면 `npm i -g` 산출물이 영원히 안 보인다.
         let full = windows_user_bin_dirs(home, Some(&appdata), Some(&localappdata));
         let fg: Vec<String> = full.iter().map(|p| p.to_string_lossy().into_owned()).collect();
-        assert_eq!(fg.len(), 4, "후보 4종(.local/bin · appdata/npm · cys-npm/bin · cys-npm): {fg:?}");
+        // ★(0.14.53 WP8) 4→7. **항목 0..3 의 상대 순서는 바이트 그대로** 보존했으므로 아래 두
+        //   기존 단언(fg[2]·fg[3])이 그대로 유효하다 — 그게 "도는 기계의 선택을 바꾸지 않았다"의 증거다.
+        assert_eq!(
+            fg.len(),
+            7,
+            "후보 7종(.local/bin · appdata/npm · cys-npm/bin · cys-npm · localappdata/npm · WinGet/Links · .claude/local): {fg:?}"
+        );
         assert!(
             fg[2].contains(NPM_PREFIX_WIN_SUBDIR) && fg[2].ends_with("bin"),
             "cys-npm/bin 누락: {fg:?}"
@@ -4304,7 +4405,293 @@ mod tests {
         assert!(fg[3].ends_with(NPM_PREFIX_WIN_SUBDIR), "cys-npm 루트 누락: {fg:?}");
         // 음성 대조 — 빈 %LOCALAPPDATA% 는 좌표가 아니다(빈 경로 후보를 PATH 에 흘리지 않는다).
         let empty = windows_user_bin_dirs(home, Some(&appdata), Some(Path::new("")));
-        assert_eq!(empty.len(), 2, "빈 LOCALAPPDATA 가 후보를 만들었다: {empty:?}");
+        assert_eq!(empty.len(), 3, "빈 LOCALAPPDATA 가 후보를 만들었다: {empty:?}");
+        assert!(
+            empty.iter().all(|p| !p.as_os_str().is_empty()),
+            "빈 경로 후보가 섞였다: {empty:?}"
+        );
+    }
+
+    /// ★WP8 L4(FM-B) — `%LOCALAPPDATA%\npm` 은 **pane PATH 목록에 있어야 한다.**
+    ///
+    /// RED on f0ac3b0c: 그 판에서 이 폴더는 **감지 게이트에만** 있었다(`cys.rs` 구 B8 ②의
+    /// `for var in ["APPDATA","LOCALAPPDATA"] { base.join("npm") }`). pane PATH 목록
+    /// (이 함수)에는 없었으므로, claude 가 여기 설치된 사용자는 게이트를 통과해 좌석이 뜨고도
+    /// 맨 이름 `claude` 가 해소되지 않아 **CLI 가 시작되지 않았다**. 이 단언은 그 판에서 거짓이다.
+    #[test]
+    fn localappdata_npm_is_on_the_pane_path_too_wp8() {
+        let home = Path::new(r"C:\Users\x");
+        let appdata = PathBuf::from(r"C:\Users\x\AppData\Roaming");
+        let localappdata = PathBuf::from(r"C:\Users\x\AppData\Local");
+        let got = windows_user_bin_dirs(home, Some(&appdata), Some(&localappdata));
+        // ★철자로 판정한다(components() 금지): 호스트가 mac 이면 `C:\...\AppData\Local` 은 역슬래시를
+        //   쪼개지 않아 **한 컴포넌트**다 — `components()` 로는 `Local` 을 영원히 못 본다. 기존
+        //   `windows_user_bin_dirs_composition` 이 철자 검증을 쓰는 이유가 그것이다(내 첫 술어가
+        //   정확히 이 함정에 빠져 코드가 맞는데도 빨갛게 나왔다 — 그 적색은 검체 결함이었다).
+        let shown: Vec<String> =
+            got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        // 마지막 조각은 `join` 으로 붙였으니 `file_name()` 이 OS 무관하게 정확하다 — 앞쪽 역슬래시
+        // 구간만 철자로 본다. `ends_with("npm")` 은 `cys-npm` 까지 걸리므로 쓰지 않는다
+        // (내가 처음 그렇게 세어 기대값 2 를 적었고 실측은 3 이었다 — 재지 않고 적은 수였다).
+        let npm_leaf: Vec<&String> = got
+            .iter()
+            .zip(shown.iter())
+            .filter(|(p, _)| p.file_name().map(|f| f == "npm").unwrap_or(false))
+            .map(|(_, sh)| sh)
+            .collect();
+        assert!(
+            npm_leaf.iter().any(|p| p.contains("Local")),
+            "%LOCALAPPDATA%\\npm 이 pane PATH 후보에 없다 — 게이트만 아는 폴더다: {shown:?}"
+        );
+        // 음성 대조 — `%APPDATA%\npm`(Roaming)과 **다른** 항목이어야 한다(둘을 혼동하면 아무것도 안 잰다).
+        assert!(
+            npm_leaf.iter().any(|p| p.contains("Roaming")),
+            "Roaming/npm 이 사라졌다(종전 후보 소실): {shown:?}"
+        );
+        assert_eq!(npm_leaf.len(), 2, "leaf 가 정확히 npm 인 후보는 Roaming·Local 둘: {shown:?}");
+    }
+
+    /// ★WP8 L5 — WinGet 명령 별칭 폴더. `winget install Anthropic.ClaudeCode` 는 Anthropic 공식
+    /// 설치 경로 하나다(code.claude.com/docs/en/setup). RED on f0ac3b0c: 두 목록 어디에도 없었다.
+    /// ⚠폴더 경로 자체는 Microsoft 1차 문서 미확인(REPORT UNMEASURED-2) — 그래서 이 테스트는
+    /// "그 후보가 목록에 있다"만 단언하고 "그 경로가 맞다"는 단언하지 않는다.
+    #[test]
+    fn winget_links_dir_is_a_candidate_wp8() {
+        let home = Path::new(r"C:\Users\x");
+        let localappdata = PathBuf::from(r"C:\Users\x\AppData\Local");
+        let got = windows_user_bin_dirs(home, None, Some(&localappdata));
+        let hit = got.iter().any(|p| {
+            let c: Vec<String> =
+                p.components().map(|x| x.as_os_str().to_string_lossy().into_owned()).collect();
+            c.iter().any(|x| x == "WinGet") && c.last().map(|x| x == "Links").unwrap_or(false)
+        });
+        assert!(hit, "WinGet\\Links 후보 부재: {got:?}");
+    }
+
+    /// ★WP8 L6 — 레거시 로컬 npm 설치 위치(`%USERPROFILE%\.claude\local`). 공식 문서가 그 위치를
+    /// "the legacy local npm install created by older versions of Claude Code" 로 명시한다
+    /// (code.claude.com/docs/en/troubleshoot-install). RED on f0ac3b0c: 두 목록 어디에도 없었다.
+    /// **선호 순서상 마지막**이어야 한다 — native 설치본이 함께 있으면 그쪽이 먼저 잡혀야 한다.
+    #[test]
+    fn legacy_claude_local_is_last_candidate_wp8() {
+        let home = Path::new(r"C:\Users\x");
+        let appdata = PathBuf::from(r"C:\Users\x\AppData\Roaming");
+        let localappdata = PathBuf::from(r"C:\Users\x\AppData\Local");
+        for lad in [None, Some(&localappdata)] {
+            let got = windows_user_bin_dirs(home, Some(&appdata), lad.map(|p| p.as_path()));
+            // ★(R1-3) 레거시는 **두 자리**다: 트리 자체와 그 아래 npm 로컬 bin 레이아웃
+            //   (`node_modules\.bin`). 둘 다 **말미 두 칸**을 차지해야 한다 — 그 둘보다 뒤에 무언가
+            //   오면 레거시가 더 선호된다는 뜻이고, 그건 공식 문서의 권장(native 우선)과 어긋난다.
+            let shown: Vec<String> =
+                got.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+            let n = shown.len();
+            assert!(n >= 2, "후보가 너무 적다: {shown:?}");
+            let tail = &shown[n - 2..];
+            assert!(
+                tail.iter().all(|p| p.contains(".claude")),
+                "레거시 두 칸이 말미가 아니다(lad={:?}): {shown:?}", lad.is_some()
+            );
+            assert!(
+                tail[1].contains("node_modules") && tail[1].ends_with(".bin"),
+                "npm 로컬 bin 레이아웃이 레거시 트리 **뒤**가 아니다: {shown:?}"
+            );
+            assert!(
+                !tail[0].contains("node_modules"),
+                "레거시 트리 자체가 빠졌다(한 자리만 있다): {shown:?}"
+            );
+            // native 설치본이 레거시보다 **먼저** 와야 한다(문서가 native 를 권장본으로 지목한다).
+            let native = got.iter().position(|p| {
+                p.file_name().map(|f| f == "bin").unwrap_or(false)
+                    && p.components().any(|x| x.as_os_str() == ".local")
+            }).expect("native 후보 부재");
+            assert_eq!(native, 0, "native(.local/bin)이 선두가 아니다: {got:?}");
+        }
+    }
+
+    /// ★WP8 — 해소 **순서**와 음성 대조. `find_agent_in_dirs` 는 실행가능 판정을 주입받으므로
+    /// Windows 기계 없이 순서를 잴 수 있다(호스트의 `is_executable_file` 은 OS 마다 의미가 다르다).
+    #[test]
+    fn find_agent_in_dirs_order_and_negative_controls_wp8() {
+        let d1 = PathBuf::from(r"C:\one");
+        let d2 = PathBuf::from(r"C:\two");
+        let dirs = vec![d1.clone(), d2.clone()];
+
+        // ① 이름 순서: 같은 폴더에 .exe 와 .cmd 가 둘 다 있으면 **.cmd 가 먼저**(구 B8 과 동일 순서).
+        let both = |p: &Path| p == d1.join("claude.cmd") || p == d1.join("claude.exe");
+        assert_eq!(find_agent_in_dirs(&dirs, "claude", &both), Some(d1.join("claude.cmd")));
+
+        // ② 폴더 순서: 뒤 폴더에만 있으면 그것, 앞 폴더가 이기는 경우는 앞 것.
+        let only2 = |p: &Path| p == d2.join("claude.exe");
+        assert_eq!(find_agent_in_dirs(&dirs, "claude", &only2), Some(d2.join("claude.exe")));
+        let in_both = |p: &Path| p == d1.join("claude.exe") || p == d2.join("claude.exe");
+        assert_eq!(
+            find_agent_in_dirs(&dirs, "claude", &in_both),
+            Some(d1.join("claude.exe")),
+            "앞 폴더 우선(선호 순서)"
+        );
+
+        // ③ **음성 대조 — 아무것도 없으면 None.** 그럴듯한 첫 후보를 돌려주는 분기는 없다.
+        let never = |_: &Path| false;
+        assert_eq!(find_agent_in_dirs(&dirs, "claude", &never), None, "빈손인데 무언가를 골랐다");
+
+        // ④ **음성 대조 — 빈 stem 은 후보를 만들지 않는다**(폴더 그 자체를 반환하면 재앙이다).
+        let always = |_: &Path| true;
+        assert_eq!(find_agent_in_dirs(&dirs, "", &always), None, "빈 stem 이 후보를 만들었다");
+
+        // ⑤ 확장자 없는 파일도 **마지막** 후보로 인정된다(npm 구현 차이).
+        let bare = |p: &Path| p == d1.join("claude");
+        assert_eq!(find_agent_in_dirs(&dirs, "claude", &bare), Some(d1.join("claude")));
+
+        // ⑥ 후보 집합이 정확히 5종·순서 고정(이름 변형 목록의 회귀 핀).
+        assert_eq!(
+            windows_agent_exe_names("claude"),
+            vec!["claude.cmd", "claude.exe", "claude.bat", "claude.ps1", "claude"],
+            "이름 변형 순서가 바뀌면 다중 설치 기계가 고르는 파일이 바뀐다"
+        );
+    }
+
+    /// ★WP8 — **음성 대조: 폴더를 실행 파일로 고르지 않는다.** 실제 파일시스템으로 잰다
+    /// (주입 술어가 아니라 호스트의 `is_file` 의미를 쓰는 유일한 자리).
+    #[test]
+    fn a_directory_named_like_the_binary_is_not_picked_wp8() {
+        let td = std::env::temp_dir().join(format!("cys-wp8-negctl-{}", std::process::id()));
+        let dir = td.join("bin");
+        std::fs::create_dir_all(dir.join("claude.exe")).expect("폴더 생성");
+        let dirs = vec![dir.clone()];
+        let is_file_only = |p: &Path| p.is_file();
+        assert_eq!(
+            find_agent_in_dirs(&dirs, "claude", &is_file_only),
+            None,
+            "claude.exe 라는 **폴더**를 실행 파일로 채택했다"
+        );
+        // 양성 대조 — 같은 자리에 진짜 파일을 두면 잡힌다(술어가 늘 거짓인 게 아님을 증명).
+        std::fs::write(dir.join("claude.cmd"), b"@echo off\n").expect("파일 생성");
+        assert_eq!(
+            find_agent_in_dirs(&dirs, "claude", &is_file_only),
+            Some(dir.join("claude.cmd")),
+            "양성 대조 실패 — 술어가 늘 거짓이면 위 음성 대조는 아무것도 재지 않는다"
+        );
+        let _ = std::fs::remove_dir_all(&td);
+    }
+
+    /// ★WP8 INV-1 — **게이트가 받아들이는 폴더는 모두 pane PATH 에 실린다.**
+    /// 이 불변식이 "게이트가 설치됨이라 했다" ⇒ "pane 이 실제로 실행할 수 있다" 를 성립시킨다.
+    /// 양방향 결함(좌석 미생성 / 좌석만 뜨고 CLI 미시작)이 **둘 다** 이 한 줄에서 닫힌다.
+    #[test]
+    fn windows_gate_dirs_are_a_subset_of_pane_path_dirs_wp8() {
+        let home = Path::new(r"C:\Users\x");
+        let appdata = PathBuf::from(r"C:\Users\x\AppData\Roaming");
+        let localappdata = PathBuf::from(r"C:\Users\x\AppData\Local");
+        // 게이트가 스캔하는 목록 = pane 합성이 싣는 목록 = 이 함수(단일 SOT).
+        let gate = windows_user_bin_dirs(home, Some(&appdata), Some(&localappdata));
+        let user_bins: Vec<String> =
+            gate.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let composed = compose_pane_path(
+            &[r"C:\app\bin".to_string()],
+            None,
+            &user_bins,
+            r"C:\Windows\System32",
+            ';',
+        );
+        let parts: Vec<&str> = composed.split(';').collect();
+        for d in &gate {
+            let want = d.to_string_lossy().into_owned();
+            assert!(
+                parts.iter().any(|p| *p == want.as_str()),
+                "게이트가 받아들이는 폴더가 pane PATH 에 없다(INV-1 위반): {want} / {composed}"
+            );
+        }
+        // 각 폴더는 정확히 1회(env 블록 32767B 한계 — 중복 누적은 pane 미기동 꼬리위험이다).
+        for d in &gate {
+            let want = d.to_string_lossy().into_owned();
+            assert_eq!(
+                parts.iter().filter(|p| **p == want.as_str()).count(),
+                1,
+                "중복 적재: {want}"
+            );
+        }
+    }
+
+    /// ★WP8 R1-1 — **배선 핀.** 위 INV-1 부분집합 검체는 게이트 목록을 제가 직접
+    /// `compose_pane_path` 에 먹여 넣으므로, 그 함수가 항목을 **버리지 않는다**는 것만 증명한다.
+    /// `runtime_prefixed_path` 의 Windows 가지가 실제로 `windows_user_bin_dirs(...)` 를 넘기는지는
+    /// 재지 못한다 — 그 인자를 지워도 부분집합 검체는 **초록인 채** 모든 pane 이 폴더를 잃는다.
+    /// 설계 전체가 그 한 줄에 걸려 있으므로 그 줄을 따로 박제한다(R1-1 · mutant M11 로 확인).
+    #[test]
+    fn runtime_prefixed_path_feeds_the_shared_dir_list_into_the_pane_path_wp8() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"),
+        )
+        .expect("자기 소스 판독");
+        // 앵커는 런타임 조립(이 테스트 본문이 같은 파일에 있다) + 유일성 단언.
+        let fn_anchor = format!("pub fn runtime_prefixed_{}(", "path");
+        match src.matches(fn_anchor.as_str()).count() {
+            1 => {}
+            0 => panic!("runtime_prefixed_path 가 없다"),
+            n => panic!("앵커가 {n}회 — 어느 범위를 재는지 알 수 없다"),
+        }
+        let start = src.find(fn_anchor.as_str()).expect("함수 소실");
+        let end = src[start..].find("\n}\n").map(|o| start + o).expect("본문 끝");
+        let code: String = src[start..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let list_call = format!("windows_user_bin_{}(", "dirs");
+        assert!(
+            code.contains(list_call.as_str()),
+            "pane PATH 합성이 공유 폴더 목록을 호출하지 않는다 — 게이트만 그 폴더를 알게 된다: {code}"
+        );
+        let compose = format!("compose_pane_{}(", "path");
+        let list_at = code.find(list_call.as_str()).expect("목록 호출");
+        let comp_at = code.find(compose.as_str()).expect("합성 호출");
+        assert!(list_at < comp_at, "목록을 합성보다 뒤에서 만든다(인자로 안 들어간다): {code}");
+        assert!(
+            code.contains("user_bins"),
+            "합성에 user_bins 인자가 없다 — 목록이 PATH 에 실리지 않는다: {code}"
+        );
+    }
+
+    /// ★WP8 W3-a(인용) — **공백이 든 폴더는 따옴표 없이 원문 그대로** pane PATH 에 실려야 한다.
+    /// Windows PATH 항목은 셸 인용 규약이 아니라 `;` 구분 평문이다. 따옴표를 붙이면 그 항목이
+    /// 죽고(그 폴더의 claude 를 영원히 못 찾는다), 쪼개면 두 개의 쓰레기 항목이 된다.
+    /// 그리고 두 번 합성해도 늘지 않아야 한다(env 블록 한계 · 멱등).
+    #[test]
+    fn spacey_dirs_survive_verbatim_and_compose_is_idempotent_wp8() {
+        let home = Path::new(r"C:\Users\user with space");
+        let lad = PathBuf::from(r"C:\Users\user with space\AppData\Local");
+        let dirs = windows_user_bin_dirs(home, None, Some(&lad));
+        let user_bins: Vec<String> =
+            dirs.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let process = r"C:\Windows\System32";
+        let once = compose_pane_path(&[], None, &user_bins, process, ';');
+        for d in &user_bins {
+            assert!(d.contains(' '), "픽스처에 공백이 없으면 이 테스트는 아무것도 재지 않는다: {d}");
+            assert!(once.split(';').any(|p| p == d.as_str()), "공백 폴더가 원문대로 없다: {once}");
+            assert!(!once.contains(&format!("\"{d}\"")), "PATH 항목에 따옴표가 붙었다: {once}");
+        }
+        // 멱등 — 이미 합성된 PATH 를 다시 합성해도 항목 수가 같다.
+        let twice = compose_pane_path(&[], None, &user_bins, &once, ';');
+        assert_eq!(
+            twice.split(';').count(),
+            once.split(';').count(),
+            "재합성이 항목을 늘렸다(32767B env 블록 꼬리위험): {twice}"
+        );
+    }
+
+    /// ★WP8 — `path_entries`: 신선 레지스트리 PATH 를 폴더 목록으로 바꾸는 순수 변환.
+    /// 빈 항목(`;;`·말미 `;`)은 버린다 — 빈 폴더에 join 하면 **상대경로 후보**가 생겨
+    /// cwd 안의 `claude.exe` 를 주워 올 수 있다(그게 이 필터의 존재 이유다).
+    #[test]
+    fn path_entries_drops_empty_and_keeps_order_wp8() {
+        let got = path_entries(r"C:\a;;C:\b; C:\c ;", ';');
+        assert_eq!(
+            got,
+            vec![PathBuf::from(r"C:\a"), PathBuf::from(r"C:\b"), PathBuf::from(r"C:\c")],
+            "빈 항목 제거·순서 보존·공백 trim: {got:?}"
+        );
+        assert!(path_entries("", ';').is_empty());
+        assert!(path_entries(";;;", ';').is_empty(), "빈 항목만이면 후보 0 — 상대경로 후보 금지");
     }
 
     /// ★H-NPM-1(B7 · 명세 §2-10): `npm_config_prefix` 는 **키가 부재할 때만** 얹는다.

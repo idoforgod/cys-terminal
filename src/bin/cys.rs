@@ -13559,13 +13559,62 @@ fn which_in_path(bin: &str) -> (bool, Option<std::path::PathBuf>) {
 }
 
 /// B8: Windows 후보 순회 — 선언 경로·PATH 가 빈손일 때 확장자 변형(.cmd/.exe/.bat/.ps1)과
-/// npm 전역 설치 표준 위치(`%APPDATA%\npm`·`%LOCALAPPDATA%\npm`)를 훑는다.
+/// 문서화된 설치 위치들을 훑는다.
 /// (npm -g 는 Windows 에서 `<prefix>\<name>.cmd` 셸 래퍼를 깔고, prefix 기본값이 `%APPDATA%\npm`
 ///  이다. 일부 설정·설치기는 `%LOCALAPPDATA%` 하위를 prefix 로 쓰므로 함께 본다.)
 /// 선언이 unix 경로형(`~/.local/bin/agy`)이어도 Windows 에선 그 경로가 없으므로 **바이너리 이름만**
 /// 취해 순회한다 — "OS 별 후보 목록" 미해소로 Windows 부트가 전멸하던 구멍을 메운다.
+///
+/// ★(0.14.53 WP8 · 오너 지시 2026-10-23 「클로드 cli를 설치했지만, 경로를 찾지못해서 클로드 런칭을
+/// 하지 못하는 것」) 종전 이 함수는 **자기 후보 목록**(`%APPDATA%\npm`·`%LOCALAPPDATA%\npm` 둘)을
+/// 들고 있었고, 그 목록이 pane PATH 합성 목록([`cys::windows_user_bin_dirs`])과 양방향으로 어긋나
+/// 두 가지 사용자 결함을 만들었다 — 자세한 기제·실측은 그 함수의 INV-1 주석이 정본이다. 요지:
+/// **권장 native 설치 위치 `%USERPROFILE%\.local\bin` 이 이 목록에 없었다.** 설치기는 그 폴더를
+/// PATH 에 넣지 않으므로(공식 문서 명시), PATH 조회도 후보 순회도 빈손이 되어 의무 노드 claude 가
+/// `missing` 으로 건너뛰어졌다 = 좌석이 아예 생기지 않았다.
+///
+/// 해소 순서(**기존 ①②는 바이트 그대로 먼저** — 지금 잡히는 기계가 고르는 경로를 바꾸지 않는다):
+///   ① `where <stem>.{{cmd,exe,bat,ps1}}` — 호출 프로세스 PATH(종전과 동일).
+///   ② **신선 레지스트리 PATH**(HKLM;HKCU `Environment\Path`) 디렉터리 스캔 — 새로 연 PowerShell
+///      창이 보는 PATH 다. ①이 빈손인 큰 이유 하나가 "사용자가 PATH 를 고쳤지만 이 프로세스는 그
+///      전에 떴다" 이고(공식 문서: "a window that was already open keeps its old PATH"), pane 쪽은
+///      이미 이 재합성을 쓴다([`cys::windows_registry_path`] · `compose_pane_path`). 감지만 못 쓰고
+///      있었다 — 그래서 **같은 기계가 호출자에 따라 다른 답**을 냈다(앱 카드 vs 부트).
+///   ③ 문서화된 설치 폴더 스캔 — pane PATH 와 **같은 목록**([`cys::windows_user_bin_dirs`], INV-1).
+/// 어느 단계도 앞 단계가 빈손일 때만 돌므로 **fail-open** 이다: 지금 성공하는 해소는 그대로 성공하고,
+/// 새로 도달 가능한 결과는 "없던 것을 찾음"과 "더 정확한 메시지" 둘뿐이다.
 #[cfg(windows)]
-fn windows_agent_candidates(bin: &str) -> Option<std::path::PathBuf> {
+fn windows_agent_search_dirs() -> Vec<std::path::PathBuf> {
+    cys::windows_user_bin_dirs(
+        &cys::home_dir(),
+        std::env::var_os("APPDATA").map(std::path::PathBuf::from).as_deref(),
+        std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from).as_deref(),
+    )
+}
+
+/// 전탐색이 빈손일 때 사용자에게 **찾아본 곳을 그대로** 보여주는 문면(순수 입력 → 문자열).
+/// ★이 문장은 스캔에 쓴 목록 **그 자체**에서 만든다 — 손으로 적은 사본을 두면 목록이 바뀔 때
+/// 메시지가 거짓말을 한다(종전 문면은 `%APPDATA%\npm`·`%LOCALAPPDATA%\npm` 둘만 적고 있었다).
+///
+/// OS 무관 컴파일이다(`full_miss_hint` 와 같은 이유 · MF-1 핀): 회귀 핀이 mac·linux CI 에서도
+/// 이 문면을 실제로 밟아야 한다 — Windows 레그만 이 문장을 검증하면 아무도 안 보는 날이 온다.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_miss_places(dirs: &[std::path::PathBuf]) -> String {
+    let mut parts: Vec<String> = vec![
+        "PATH(where <bin> / .cmd·.exe·.bat·.ps1)".to_string(),
+        "레지스트리 신선 PATH(HKLM+HKCU Environment\\Path)".to_string(),
+    ];
+    parts.extend(dirs.iter().map(|p| p.display().to_string()));
+    parts.join(" · ")
+}
+
+/// ★(R1-2) 폴더 목록을 **인자로 받는다.** 종전 초안은 스캔과 안내 문면이 각자
+/// `windows_agent_search_dirs()` 를 호출했는데, 그 함수는 호출 시점의 env(`APPDATA`·`LOCALAPPDATA`·홈)를
+/// 읽으므로 **두 번의 평가가 다른 목록일 수 있었다** — 그러면 "찾아본 곳을 적는다"(바 W2)가 거짓이 된다.
+/// 목록은 호출자가 한 번 만들고 스캔과 문면이 **같은 값**을 쓴다. 겸사 효과로 게이트가 주입 가능해져
+/// 합성 폴더로 스캔 거동을 잴 수 있다.
+#[cfg(windows)]
+fn windows_agent_candidates(bin: &str, dirs: &[std::path::PathBuf]) -> Option<std::path::PathBuf> {
     let raw = std::path::Path::new(bin)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -13587,26 +13636,20 @@ fn windows_agent_candidates(bin: &str) -> Option<std::path::PathBuf> {
             return Some(path.unwrap_or_else(|| std::path::PathBuf::from(cand)));
         }
     }
-    // ② npm 전역 prefix 후보 직접 탐색(PATH 미갱신 셸 — Windows 설치 직후 흔한 상태).
-    for var in ["APPDATA", "LOCALAPPDATA"] {
-        let Some(base) = std::env::var_os(var) else {
-            continue;
-        };
-        let npm = std::path::PathBuf::from(base).join("npm");
-        for name in [
-            format!("{stem}.cmd"),
-            format!("{stem}.exe"),
-            format!("{stem}.bat"),
-            format!("{stem}.ps1"),
-            stem.clone(),
-        ] {
-            let cand = npm.join(&name);
-            if is_executable_file(&cand) {
-                return Some(cand);
-            }
+    // ② 신선 레지스트리 PATH 스캔 — 새로 연 PowerShell 창이 보는 PATH(①의 프로세스 스냅샷이 낡은
+    //    경우를 덮는다). pane 합성이 이미 쓰는 재합성을 감지도 쓰게 한 것뿐이다(새 기제 아님).
+    if let Some(fresh) = cys::windows_registry_path() {
+        if let Some(p) = cys::find_agent_in_dirs(
+            &cys::path_entries(&fresh, ';'),
+            &stem,
+            &(is_executable_file as fn(&std::path::Path) -> bool),
+        ) {
+            return Some(p);
         }
     }
-    None
+    // ③ 문서화된 설치 폴더 — pane PATH 와 **같은 목록**(INV-1). 종전 ②(`%APPDATA%\npm`·
+    //    `%LOCALAPPDATA%\npm`)는 이 목록의 **진부분집합**이라 여기에 흡수된다(기능 축소 0).
+    cys::find_agent_in_dirs(dirs, &stem, &(is_executable_file as fn(&std::path::Path) -> bool))
 }
 
 /// B8 후보 순회는 **Windows 한정** — 다른 OS 빌드에서는 항등(cfg 분기를 함수 두 벌로 갈라
@@ -13621,16 +13664,26 @@ fn apply_windows_agent_fallback(agent: &str, mut d: AgentDetection) -> AgentDete
     if d.installed {
         return d;
     }
-    match windows_agent_candidates(&d.bin) {
+    // ★(R1-2) 목록을 **여기서 한 번** 만들어 스캔과 안내 문면에 같은 값을 넘긴다.
+    let dirs = windows_agent_search_dirs();
+    match windows_agent_candidates(&d.bin, &dirs) {
         Some(p) => {
             d.reason = format!("{} → Windows 후보 발견 {}", d.reason, p.display());
             d.resolved = Some(p);
             d.installed = true;
         }
         None => {
+            // ★(0.14.53 WP8) 찾아본 곳을 **스캔에 쓴 목록에서** 만들어 전부 적는다(손 사본 금지).
+            //   이미 설치한 사용자에게 필요한 처방(실경로 확인 → 사용자 PATH 등록 → 자비스 재시작)을
+            //   설치 명령보다 **먼저** 둔다 — 종전에는 설치 명령 하나만 나가서, 이미 설치한 사람에게
+            //   "다시 설치하라"고 답하고 있었다(이 티켓의 오너 지시가 지목한 그 사람들이다).
             d.reason = format!(
-                "{} → Windows 후보(.cmd/.exe/.bat/.ps1 · %APPDATA%\\npm · %LOCALAPPDATA%\\npm) 전부 미발견",
-                d.reason
+                "{} → Windows 후보 전부 미발견 — 찾아본 곳: {}. 이미 설치했다면 `where.exe {}` 로 \
+실경로를 확인한 뒤 그 폴더를 사용자 PATH 에 추가하고 자비스를 재시작하십시오(설치기는 PATH 를 \
+바꾸지 않습니다). 미설치라면:",
+                d.reason,
+                windows_miss_places(&dirs),
+                d.bin
             );
             // ★hint 치환은 `full_miss_hint` 단일 판정 — claude 는 install_hint 유지(MF-1).
             d.hint = full_miss_hint(agent, std::env::consts::OS).to_string();
@@ -29198,6 +29251,211 @@ mod tests {
     /// 카드 본문이 네이티브 설치 명령 대신 agents.json 경로수정 안내가 됐다(브리프 P4-4
     /// '문구 SOT=install_hint' 위반). 순수형(os 인자) 핀이라 비 Windows CI 에서도 Windows
     /// 분기를 실제로 밟는다(lib.rs `bundled_git_bash_path_for` 와 동일 규약).
+    /// ★WP8(0.14.53) — **게이트는 자기 폴더 목록을 들고 있지 않다.** pane PATH 합성과 같은
+    /// 단일 SOT(`cys::windows_user_bin_dirs`)를 스캔해야 INV-1 이 성립한다.
+    ///
+    /// RED on f0ac3b0c: 그 판의 `windows_agent_candidates` 는 자기 목록을 인라인으로 들고 있었다
+    /// (`for var in ["APPDATA", "LOCALAPPDATA"] { … .join("npm") … }`)。 그래서 **권장 native 설치
+    /// 위치 `%USERPROFILE%\.local\bin` 이 게이트에서 빠져** 이미 설치한 사용자가 '미설치'로
+    /// 판정됐다(오너 지시 2026-10-23 의 그 사람들). 이 단언 셋은 그 판에서 전부 거짓이다.
+    ///
+    /// ★주석은 **빼고** 센다(`//` 로 시작하는 줄 제거). 이 파일의 주석과 바로 위 문단이 옛 패턴
+    /// 문자열을 **설명하려고** 싣고 있어서, 주석을 포함해 세면 '없음' 단언이 자기 문서에 걸려
+    /// 영원히 빨갛다(자기 문서에 걸리는 census 의 전형).
+    #[test]
+    fn windows_gate_scans_the_shared_dir_list_not_its_own_wp8() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cys.rs"),
+        )
+        .expect("자기 소스 판독");
+        // ★앵커는 **런타임에 조립**한다 — 이 테스트의 소스 자체가 같은 파일에 있으므로, 앵커를
+        //   리터럴로 적으면 `find` 가 **자기 테스트 본문**을 집을 수 있다. base 리그에서 실제로
+        //   그 일이 났다(프로덕션 문자열이 없는 판에서 두 번째 핀이 자기 단언문을 읽었다).
+        //   그리고 **유일성을 단언**한다: 나중에 누가 같은 문자열을 하나 더 넣으면 조용히 엉뚱한
+        //   범위를 재는 대신 이 줄이 빨개진다.
+        let gate_anchor = format!("fn windows_agent_{}(", "candidates");
+        // 0 과 2+ 를 **가른다**: 0=프로덕션 부재(그 자체가 결함) · 2+=어느 범위를 재는지 모름.
+        match src.matches(gate_anchor.as_str()).count() {
+            1 => {}
+            0 => panic!("게이트 함수가 없다({gate_anchor})"),
+            n => panic!("게이트 앵커가 {n}회 — 어느 범위를 재는지 알 수 없다"),
+        }
+        let start = src
+            .find(gate_anchor.as_str())
+            .expect("게이트 함수 소실 — 이름이 바뀌었으면 이 핀도 함께 고쳐라");
+        // 함수 본문 끝 = 다음 최상위 `\n}\n`.
+        let end = src[start..].find("\n}\n").map(|o| start + o).expect("본문 끝 미발견");
+        let body_raw = &src[start..end];
+        let code: String = body_raw
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // ① 공유 목록을 스캔한다.
+        // ★(R1-2 뒤) 게이트는 목록을 **인자로 받는다** — 자기가 만들지 않는다. 그래야 스캔과
+        //   안내 문면이 같은 값을 쓴다(두 번 평가하면 문면이 스캔하지 않은 목록을 말한다).
+        assert!(
+            code.contains("dirs: &[std::path::PathBuf]"),
+            "게이트가 폴더 목록을 인자로 받지 않는다 — 두 번 평가로 되돌아갔다: {code}"
+        );
+        assert!(
+            !code.contains("windows_agent_search_dirs()"),
+            "게이트가 목록을 **자기가** 만든다 — 문면과 다른 목록을 스캔할 수 있다: {code}"
+        );
+        assert!(
+            code.contains("find_agent_in_dirs"),
+            "게이트가 공유 스캐너를 쓰지 않는다: {code}"
+        );
+        // ② 신선 레지스트리 PATH 를 본다(호출자 PATH 스냅샷이 낡은 경우를 덮는 단계).
+        assert!(
+            code.contains("windows_registry_path"),
+            "게이트가 신선 레지스트리 PATH 를 보지 않는다 — 같은 기계가 호출자에 따라 다른 답을 낸다: {code}"
+        );
+        // ③ 자기 인라인 목록이 **없다**(주석 제외 코드에서).
+        assert!(
+            !code.contains(r#"for var in ["APPDATA""#),
+            "게이트가 아직 자기 폴더 목록을 들고 있다(INV-1 재붕괴): {code}"
+        );
+        // ④ 종전 ①(where 확장자 변형)은 **그대로 먼저** 남아 있다 — fail-open 의 근거다.
+        let ext_at = code
+            .find(r#"for ext in ["cmd", "exe", "bat", "ps1"]"#)
+            .expect("기존 where 확장자 단계가 사라졌다 — 지금 잡히는 기계가 바뀐다");
+        let shared_at = code.rfind("find_agent_in_dirs").expect("②");
+        assert!(ext_at < shared_at, "새 단계가 기존 PATH 조회보다 앞선다(무회귀 깨짐)");
+
+        // ★(R1-2) 호출자는 목록을 **한 번** 만들어 스캔과 문면에 **같은 값**을 넘긴다.
+        let caller_anchor = format!("fn apply_windows_agent_{}(agent: &str, mut d: AgentDetection)", "fallback");
+        match src.matches(caller_anchor.as_str()).count() {
+            1 => {}
+            0 => panic!("폴백 호출자가 없다"),
+            n => panic!("호출자 앵커가 {n}회"),
+        }
+        let c_at = src.find(caller_anchor.as_str()).expect("호출자");
+        let c_end = src[c_at..].find("\n}\n").map(|o| c_at + o).expect("호출자 끝");
+        let caller: String = src[c_at..c_end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mk = format!("let dirs = windows_agent_search_{}();", "dirs");
+        assert_eq!(
+            caller.matches(mk.as_str()).count(),
+            1,
+            "호출자가 목록을 한 번 만들지 않는다(0=안 만듦 · 2+=두 번 평가): {caller}"
+        );
+        assert!(
+            caller.contains("windows_agent_candidates(&d.bin, &dirs)"),
+            "스캔에 그 목록을 넘기지 않는다: {caller}"
+        );
+        assert!(
+            caller.contains("windows_miss_places(&dirs)"),
+            "안내 문면이 **같은** 목록에서 나오지 않는다: {caller}"
+        );
+        assert_eq!(
+            caller.matches("windows_agent_search_dirs()").count(),
+            1,
+            "목록 평가가 1회가 아니다 — 문면이 스캔하지 않은 목록을 말할 수 있다: {caller}"
+        );
+
+        // ⑤ 공유 목록이 **곧** pane PATH 목록이다(철자로 확인 — 사본을 만들면 다시 갈라진다).
+        let dirs_fn_anchor = format!("fn windows_agent_search_{}()", "dirs");
+        match src.matches(dirs_fn_anchor.as_str()).count() {
+            1 => {}
+            0 => panic!("폴더 목록 래퍼가 없다({dirs_fn_anchor}) — 게이트가 공유 목록을 쓰지 않는다"),
+            n => panic!("폴더 목록 래퍼 앵커가 {n}회 — 범위 불명"),
+        }
+        let dirs_fn_at = src.find(dirs_fn_anchor.as_str()).expect("폴더 목록 래퍼 소실");
+        let dirs_end = src[dirs_fn_at..].find("\n}\n").map(|o| dirs_fn_at + o).expect("래퍼 끝");
+        assert!(
+            src[dirs_fn_at..dirs_end].contains("windows_user_bin_dirs"),
+            "폴더 목록이 pane PATH 합성과 다른 출처에서 온다(INV-1 위반)"
+        );
+    }
+
+    /// ★WP8 W2 — 못 찾았을 때의 문면. **찾아본 곳을 전부 적고**, 이미 설치한 사용자용 처방을
+    /// 설치 명령보다 **먼저** 둔다. RED on f0ac3b0c: 그 판 문면은
+    /// `.cmd/.exe/.bat/.ps1 · %APPDATA%\npm · %LOCALAPPDATA%\npm` 셋만 적고, 처방은
+    /// 설치 명령(`irm … install.ps1`) 하나였다 — **이미 설치한 사람에게 다시 설치하라**는 답이었다.
+    #[test]
+    fn windows_miss_text_names_every_place_searched_wp8() {
+        let home = std::path::Path::new(r"C:\Users\x");
+        let appdata = std::path::PathBuf::from(r"C:\Users\x\AppData\Roaming");
+        let localappdata = std::path::PathBuf::from(r"C:\Users\x\AppData\Local");
+        let dirs = cys::windows_user_bin_dirs(home, Some(&appdata), Some(&localappdata));
+        let txt = windows_miss_places(&dirs);
+
+        // ① 스캔한 **모든** 폴더가 문면에 있다 — 목록에서 파생했으므로 구조적으로 참이고,
+        //    이 단언은 그 파생이 끊기는 순간(손 사본 재도입) 빨개진다.
+        for d in &dirs {
+            let want = d.display().to_string();
+            assert!(txt.contains(&want), "찾아본 곳 누락: {want} / {txt}");
+        }
+        // ② 두 PATH 축도 적는다(프로세스 PATH · 신선 레지스트리).
+        assert!(txt.contains("PATH"), "PATH 조회를 안 적었다: {txt}");
+        assert!(txt.contains("Environment"), "레지스트리 축을 안 적었다: {txt}");
+        // ③ 음성 대조 — 찾지 **않은** 곳을 적지 않는다(scoop 은 이번 범위 밖이다).
+        assert!(!txt.to_lowercase().contains("scoop"), "찾지 않은 곳을 적었다: {txt}");
+        // ④ 폴더 수가 늘면 문면도 함께 는다(정적 사본이면 이 등식이 깨진다).
+        assert_eq!(
+            dirs.iter().filter(|d| txt.contains(&d.display().to_string())).count(),
+            dirs.len(),
+            "문면이 목록을 전부 싣지 않는다: {txt}"
+        );
+    }
+
+    /// ★WP8 W2 — 처방 **순서**: 이미 설치한 사용자의 조치가 설치 명령보다 앞이어야 한다.
+    /// 문면 조립이 `#[cfg(windows)]` 분기 안이라 mac 에서 그 문자열을 만들 수 없으므로,
+    /// 조립 **템플릿**을 소스에서 읽어 순서를 센다(그 분기가 실제로 그 순서로 쓰도록 박제).
+    #[test]
+    fn windows_miss_reason_puts_the_already_installed_fix_first_wp8() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/cys.rs"),
+        )
+        .expect("자기 소스 판독");
+        // ★런타임 조립 + 유일성 단언(위 핀과 같은 이유 — base 리그에서 이 핀이 자기 본문을 읽었다).
+        let anchor = format!("Windows 후보 {} 미발견", "전부");
+        match src.matches(anchor.as_str()).count() {
+            1 => {}
+            0 => panic!("미발견 문면이 없다({anchor}) — 찾아본 곳을 적는 문면이 부재한다"),
+            n => panic!("미발견 문면 앵커가 {n}회 — 프로덕션이 아니라 테스트를 읽을 수 있다"),
+        }
+        let at = src.find(anchor.as_str()).expect("미발견 문면 소실");
+        // ★바이트 슬라이스 금지 — 이 문면은 한국어라 `&src[at..at+600]` 이 글자 중간을 잘라
+        //   패닉한다(실제로 그렇게 터졌다). 문자 단위로 가져온다.
+        let tmpl: String = src[at..].chars().take(600).collect();
+        let tmpl = tmpl.as_str();
+        let fix = tmpl.find("이미 설치했다면").expect("이미 설치한 사용자용 처방 부재");
+        let install = tmpl.find("미설치라면").expect("미설치 안내 부재");
+        assert!(fix < install, "설치 명령이 이미-설치 처방보다 앞이다: {tmpl}");
+        assert!(tmpl.contains("where.exe"), "실경로 확인 명령이 없다: {tmpl}");
+        assert!(tmpl.contains("찾아본 곳"), "찾아본 곳을 적는 자리가 없다: {tmpl}");
+        let derived = format!("windows_miss_places(&{})", "dirs");
+        assert!(
+            tmpl.contains(derived.as_str()),
+            "문면이 스캔 목록에서 파생되지 않는다(손 사본): {tmpl}"
+        );
+    }
+
+    /// ★WP8 W3-b — **인자 보존.** 이 변경은 `render_launch` 를 건드리지 않았다. Windows 는 어댑터
+    /// `cmd` 를 **바이트 그대로** pane 에 싣고, 그 안의 인자 문자열이 claude 에 그대로 간다.
+    /// `.cmd` 셈 실행은 pane 의 PowerShell 이 PATHEXT/자기 명령 탐색으로 처리한다 — 우리 코드에는
+    /// 셈을 CreateProcess 로 띄우는 자리가 없다(`AgentDetection.resolved` 소비처 0 · DESIGN §1.3).
+    #[test]
+    fn render_launch_windows_passes_arguments_through_unchanged_wp8() {
+        let cmd = "claude --dangerously-skip-permissions --model opus";
+        let env = vec![("CLAUDE_CONFIG_DIR".to_string(), "/tmp/x".to_string())];
+        let (send, _inject) = render_launch(cmd, &env);
+        #[cfg(windows)]
+        assert_eq!(send, cmd, "Windows send 문자열이 어댑터 cmd 와 다르다(인자 변조)");
+        #[cfg(not(windows))]
+        assert!(send.ends_with(cmd), "unix 는 env 접두 + 동일 cmd 말미: {send}");
+        // 어느 OS 에서도 인자 토큰은 사라지지 않는다.
+        for tok in ["--dangerously-skip-permissions", "--model", "opus"] {
+            assert!(send.contains(tok), "인자 토큰 소실 {tok}: {send}");
+        }
+    }
+
     #[test]
     fn full_miss_hint_keeps_claude_installer_on_windows() {
         // ⓐ 의무 CLI claude: 치환 금지 — install_hint 그대로(네이티브 설치 명령 포함).
