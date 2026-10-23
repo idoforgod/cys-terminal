@@ -15,6 +15,9 @@
   E4 DRIFT     기록된 지시 원문을 사후 변조 = 4 · 판독 불가 대장 = 4
   E5 USAGE     사용법 오류는 argparse 기본 2 가 아니라 5 — 2(NO_DENOM)와 같은 숫자가 두 사실을 뜻하지 않는다
   E7 UNATTRIB  좌석 귀속이 없는 대장은 좌석 범위 status 에서 판정하지 않는다 = 7 · stamp 의 0 은 명령 성공일 뿐(그 뒤 status 1)
+  E8 UNREADABLE ★있는데 읽히지 않는 artifact(권한 000 · 실측 기제는 macOS dataless)는 「바뀌었다」가 아니다 = 8 —
+               errno 와 (darwin 이면) st_flags 를 찍고 「지불은 무효가 아니다」를 말하며 ⛔재지불 처방을 찍지 않는다.
+               크기 일치는 정황일 뿐 신원이 아니다(읽을 수 있는 sha 가 필요하다). 열린 항목 1건은 판독 불가 전부를 이긴다(1 > 8).
   S  selftest  = 0 · 자기 재기동 argv 에 -I 와 함께 -B (번들 python 이 캐시를 번들 안에 쓰지 않게)
   W  Windows   임시 루트(TMPDIR·TEMP·TMP·LOCALAPPDATA\\Temp · 대소문자 무시 · DOS 장치 경로 \\\\?\\ \\\\.\\ 접두 벗김)
                — 도구 모듈의 os 를 대역으로 바꿔 이 Mac 에서도 Windows 판정을 잰다(%TEMP% 만인 artifact 는 지불이 아니다)
@@ -63,6 +66,7 @@ SEAT_B = {"CYS_ROLE": "worker-b", "CYS_SURFACE_ID": "902"}
 
 EXIT_PAID, EXIT_OPEN, EXIT_NO_DENOM, EXIT_NO_LEDGER, EXIT_DRIFT, EXIT_USAGE = 0, 1, 2, 3, 4, 5
 EXIT_UNATTRIB = 7
+EXIT_UNREADABLE = 8
 
 
 class Rig(unittest.TestCase):
@@ -614,6 +618,191 @@ class SelftestRelaunch(unittest.TestCase):
             self.assertIn("-I", a)
             self.assertIn("-B", a)
         self.assertEqual(rc, EXIT_PAID)
+
+
+# ─── E8 UNREADABLE — 「읽지 못했다」는 「바뀌었다」가 아니다 (CEO 지시 2026-10-23 · WP10) ────────────────
+#   CEO 실측: 기록된 크기 그대로 present 인 파일의 모든 읽기가 OSError errno 11(EDEADLK) 로 막혔고(macOS
+#   dataless/compressed) 이 도구는 그것을 「증거 바이트가 변경됐다 … 그 절만 떠낸 새 파일로 재지불하라」로 찍었다 —
+#   ⛔읽을 수 없는 증거 대신 **새 증거를 지어내라**는 지시다. 아래 검체는 그 구별을 못박는다.
+SF_DATALESS = 0x40000000      # macOS sys/stat.h — 내용이 클라우드로 비워졌다
+UF_COMPRESSED = 0x20          # macOS — 압축 저장
+
+
+def _raises(no):
+    """읽기만 막는 대역 opener — iCloud 도, 그런 파일도 필요하지 않다(U4: 검체는 재현 가능해야 한다)."""
+    def _op(*_a, **_k):
+        raise OSError(no, os.strerror(no))
+    return _op
+
+
+class _FakeStat:
+    """os.stat 의 대역 결과 — 정규 파일 · 크기 · st_flags. 이 Mac 에 dataless 파일을 만들지 않고 그 갈래를 잰다."""
+
+    def __init__(self, size, flags, mode=0o100644):
+        self.st_mode, self.st_size, self.st_flags = mode, size, flags
+
+
+class _DatalessOs:
+    """도구 모듈의 os 대역 — 지정한 한 경로의 stat 만 가로채고 나머지는 진짜 os 로 넘긴다(기존 _NtOs 와 같은 수법)."""
+
+    def __init__(self, path, size, flags):
+        self._p, self._st = os.path.realpath(path), _FakeStat(size, flags)
+
+    def stat(self, p, *a, **k):
+        if os.path.realpath(p) == self._p:
+            return self._st
+        return os.stat(p, *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(os, name)
+
+
+class UnreadableIsNotChanged(unittest.TestCase):
+    """도구를 같은 프로세스로 읽고 운영 경로(_item_state·_evaluate)를 그대로 태운다. 대역은 `create=True` 로 심는다 —
+    ★그래서 수리 전 바이트에서도 이 검체가 돌고, 거기서는 붉다(대역을 쓰지 않는 옛 _fp 가 파일을 읽어 PAID 를 낸다)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_tool()
+
+    def item(self, sha, size, path=DURABLE):
+        return {"state": "done", "evidence": EVIDENCE,
+                "artifacts": [{"path": path, "sha256_16": sha, "size": size}]}
+
+    def test_unreadable_artifact_is_not_a_change(self):
+        sha, size = self.m._fp(DURABLE)
+        with mock.patch.object(self.m, "_OPEN", _raises(11), create=True):
+            st, why = self.m._item_state(self.item(sha, size))
+        self.assertEqual(st, "UNREADABLE", why)
+        self.assertIn("11", why, why)
+        self.assertNotIn("재지불", why)          # ⛔증거를 지어내라는 처방이 없어야 한다(blocking 조항)
+        self.assertNotIn("변경됐다", why)
+        self.assertIn("무효가 아니다", why)
+        self.assertIn("정황", why)                # 크기 일치는 정황이지 신원이 아니다
+
+    def test_real_change_is_still_changed_with_its_remedy(self):
+        # ★음성 대조 — 읽히는 파일의 진짜 지문 불일치는 종전대로 OPEN + 재지불이다(판독 불가가 그것을 삼키지 않았다).
+        st, why = self.m._item_state(self.item("0" * 16, 1))
+        self.assertEqual(st, "OPEN", why)
+        self.assertIn("변경됐다", why)
+        self.assertIn("재지불", why)
+
+    def test_absent_artifact_is_absent_not_changed(self):
+        gone = os.path.join(TESTS_DIR, "no-such-artifact-unreadable.log")
+        self.assertFalse(os.path.exists(gone))
+        st, why = self.m._item_state(self.item("0" * 16, 1, path=gone))
+        self.assertEqual(st, "OPEN", why)
+        self.assertIn("부재", why)
+        self.assertNotIn("변경됐다", why)
+
+    def test_dataless_line_names_errno_and_the_flag(self):
+        sha, size = self.m._fp(DURABLE)
+        with mock.patch.object(self.m, "os", _DatalessOs(DURABLE, size, SF_DATALESS | UF_COMPRESSED)), \
+             mock.patch.object(self.m, "_OPEN", _raises(11), create=True):
+            st, why = self.m._item_state(self.item(sha, size))
+        self.assertEqual(st, "UNREADABLE", why)
+        self.assertIn("errno 11", why)
+        self.assertIn("st_flags=0x", why)
+
+    def test_flag_names_are_darwin_only(self):
+        # U5: 다른 OS 에서도 errno 로 분류는 되고, darwin 전용 비트 해석만 꺼진다.
+        self.assertIn("dataless", self.m._flags_note(SF_DATALESS, plat="darwin"))
+        self.assertNotIn("dataless", self.m._flags_note(SF_DATALESS, plat="win32"))
+        self.assertIn("0x", self.m._flags_note(SF_DATALESS, plat="win32"))
+        self.assertEqual(self.m._flags_note(None), "")
+
+    def test_size_mismatch_under_unreadable_is_said_plainly(self):
+        # 읽지 못했으면 변경을 **확정하지 못한다** — 크기 차이는 정황으로 찍고 재지불은 요구하지 않는다(판정은 사람 몫).
+        sha, size = self.m._fp(DURABLE)
+        with mock.patch.object(self.m, "os", _DatalessOs(DURABLE, size + 7, 0)), \
+             mock.patch.object(self.m, "_OPEN", _raises(11), create=True):
+            st, why = self.m._item_state(self.item(sha, size))
+        self.assertEqual(st, "UNREADABLE", why)
+        self.assertIn("다르다", why)
+        self.assertNotIn("재지불", why)
+
+    def test_unreadable_only_ledger_is_exit_8(self):
+        sha, size = self.m._fp(DURABLE)
+        led = {"id": "t", "instruction": {"text": "x", "sha256": self.m._digest(b"x")},
+               "items": [self.item(sha, size)]}
+        with mock.patch.object(self.m, "_OPEN", _raises(11), create=True):
+            rc, lines = self.m._evaluate(led)
+        self.assertEqual(rc, EXIT_UNREADABLE, lines)
+        self.assertTrue(any("판독 불가" in l for l in lines), lines)
+
+    def test_an_open_item_outranks_unreadable(self):
+        # ★심각도는 숫자 크기가 아니다(_SEVERITY) — 8 이 1 을 가리면 열린 항목이 집계에서 사라진다.
+        sha, size = self.m._fp(DURABLE)
+        led = {"id": "t", "instruction": {"text": "x", "sha256": self.m._digest(b"x")},
+               "items": [self.item(sha, size), {"state": "open", "text": "미지불"}]}
+        with mock.patch.object(self.m, "_OPEN", _raises(11), create=True):
+            rc, lines = self.m._evaluate(led)
+        self.assertEqual(rc, EXIT_OPEN, lines)
+        self.assertTrue(any("미지불" in l for l in lines), lines)
+        self.assertEqual(self.m._worse(EXIT_UNREADABLE, EXIT_OPEN), EXIT_OPEN)
+        self.assertEqual(self.m._worse(EXIT_PAID, EXIT_UNREADABLE), EXIT_UNREADABLE)
+        self.assertEqual(self.m._worse(EXIT_OPEN, EXIT_DRIFT), EXIT_DRIFT)
+
+    def test_a_non_oserror_read_failure_does_not_kill_the_judgement(self):
+        # ★R1: `_probe` 는 OSError 만 분류한다 — 거대 artifact 의 MemoryError 같은 예외가 `_item_state` 밖으로
+        #   터지면 대장 하나가 status·audit **전체**를 죽인다(수리 직후 바이트의 실측 결함). 종전 결말로 떨어뜨린다.
+        def _boom(*_a, **_k):
+            raise MemoryError("artifact too large to read into memory")
+        sha, size = self.m._fp(DURABLE)
+        with mock.patch.object(self.m, "_OPEN", _boom, create=True):
+            st, why = self.m._item_state(self.item(sha, size))
+        self.assertEqual(st, "OPEN", why)
+        self.assertIn("변경됐다", why)
+
+    def test_pay_time_unreadable_is_still_refused(self):
+        # 지불 **시점**에 읽히지 않는 artifact 는 지문이 없다 ⇒ 종전대로 지불이 아니다(이 수리가 그 문을 열지 않았다).
+        with mock.patch.object(self.m, "_OPEN", _raises(13), create=True):
+            sha, size = self.m._fp(DURABLE)
+        self.assertIsNone(sha)
+        st, why = self.m._item_state({"state": "done", "evidence": EVIDENCE,
+                                      "artifacts": [{"path": DURABLE, "sha256_16": None, "size": None}]})
+        self.assertEqual(st, "OPEN", why)
+        self.assertIn("지문을 얻지 못했다", why)
+
+
+class E8UnreadableExit(DurableRig):
+    """CLI 의 exit 계약 — 진짜 파일을 권한 000 으로 막아 잰다(iCloud 무접촉 · POSIX 권한만). 수리 전에는 1 + 재지불 처방이다."""
+
+    def _make_unreadable(self, art):
+        os.chmod(art, 0)
+        self.addCleanup(os.chmod, art, 0o600)
+        if os.access(art, os.R_OK):
+            self.skipTest("이 계정은 권한 000 파일을 읽는다(root 등) — 읽기 불가를 만들 수 없다")
+
+    @unittest.skipIf(os.name == "nt", "chmod 000 은 Windows 에서 읽기를 막지 않는다")
+    def test_status_and_audit_report_unreadable_without_a_repay_remedy(self):
+        art = self.put("evicted.log")
+        self.open_ledger("U8", ["항목"])
+        self.rc(EXIT_PAID, self.pay("U8", art), "pay(읽을 수 있을 때)")
+        self.rc(EXIT_PAID, self.run_tool("status", "--id", "U8"), "status(읽을 수 있을 때)")
+        self._make_unreadable(art)
+        r = self.run_tool("status", "--id", "U8")
+        self.rc(EXIT_UNREADABLE, r, "status(읽기 불가)")
+        self.assertIn("판독 불가", r.stdout)
+        self.assertIn("무효가 아니다", r.stdout)
+        self.assertNotIn("재지불", r.stdout)
+        self.assertNotIn("증거 바이트가 변경됐다", r.stdout)
+        ra = self.run_tool("audit", "--roots", self.pack)
+        self.rc(EXIT_UNREADABLE, ra, "audit(읽기 불가)")
+        self.assertIn("UNREADABLE", ra.stdout)
+        self.assertIn("판독 불가", ra.stdout)
+        self.assertNotIn("재지불", ra.stdout)
+
+    @unittest.skipIf(os.name == "nt", "chmod 000 은 Windows 에서 읽기를 막지 않는다")
+    def test_an_open_item_still_wins_over_unreadable_in_audit(self):
+        art = self.put("evicted2.log")
+        self.open_ledger("U9", ["항목"])
+        self.rc(EXIT_PAID, self.pay("U9", art), "pay")
+        self.rc(EXIT_PAID, self.run_tool("add-item", "--id", "U9", "--item", "뒤늦게 받은 항목"), "add-item")
+        self._make_unreadable(art)
+        r = self.run_tool("audit", "--roots", self.pack)
+        self.rc(EXIT_OPEN, r, "audit(열림 1 + 판독 불가 1)")
+        self.assertIn("뒤늦게 받은 항목", r.stdout)
 
 
 if __name__ == "__main__":
