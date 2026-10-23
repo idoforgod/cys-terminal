@@ -29303,9 +29303,19 @@ mod tests {
             !code.contains("windows_agent_search_dirs()"),
             "게이트가 목록을 **자기가** 만든다 — 문면과 다른 목록을 스캔할 수 있다: {code}"
         );
+        // ★(R2-11) 존재가 아니라 **인자**를 핀한다. 종전 단언은 "본문에 find_agent_in_dirs 가 있다"
+        //   였고, 단계 ②(신선 레지스트리 스캔)도 같은 헬퍼를 부르므로 **단계 ③을 통째로 지운 변이가
+        //   살아남았다**(M5 · 4 passed / 0 failed). 공유 목록을 스캔하는 호출은 **그 목록(dirs)** 을
+        //   인자로 받는 호출 하나다 — 그것을 직접 단언하고, 호출 수로 두 단계를 가른다.
+        let scan_shared = format!("find_agent_in_{}(dirs,", "dirs");
         assert!(
-            code.contains("find_agent_in_dirs"),
-            "게이트가 공유 스캐너를 쓰지 않는다: {code}"
+            code.contains(scan_shared.as_str()),
+            "게이트가 **공유 목록(dirs)** 으로 스캔하지 않는다 — 단계 ③ 소실: {code}"
+        );
+        assert_eq!(
+            code.matches("find_agent_in_dirs").count(),
+            2,
+            "스캐너 호출이 2회(② 신선 레지스트리 · ③ 공유 목록)가 아니다 — 한 단계가 사라졌거나 늘었다: {code}"
         );
         // ② 신선 레지스트리 PATH 를 본다(호출자 PATH 스냅샷이 낡은 경우를 덮는 단계).
         assert!(
