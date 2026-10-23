@@ -22,6 +22,7 @@ impl Drop for Fixture {
             s.close_operation.clear_poison();
             let _ = close_surface(&self.d, s.id, CloseCause::Reap);
         }
+        crate::state::test_stop_daemon(&self.d);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
