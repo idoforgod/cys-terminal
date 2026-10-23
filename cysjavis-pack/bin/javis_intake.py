@@ -31,6 +31,13 @@
   4  DRIFT     기록된 지시 원문의 다이제스트가 재계산과 다르다(지시가 사후 변조·드리프트).
   5  USAGE     사용법 오류.
   6  SELFTEST  self-test 실패.
+  8  UNREADABLE★artifact 가 **있는데 읽히지 않는다**(open/read 가 OSError). ★CHANGED(1) 와 다른 사실이다 —
+               읽지 못한 것은 바뀐 것이 아니고 지불의 무효도 아니다. 이 코드는 **열린 항목이 없고** 판독 불가만
+               남은 대장에서만 나온다(열림이 하나라도 있으면 1 이다 — 심각도는 숫자 크기가 아니라 `_SEVERITY` 다).
+               ★완주 자격(0)은 아니다. 그러면 좌석은 무엇을 하는가 — **정당한 경로는 `defer`(사유 +
+               release_condition)** 다: 「무엇이 이것을 막고 있는가」를 적어 항목을 닫는다(법 ⒝). ⛔읽히지 않는
+               파일을 대신할 증거를 **지어내는 것**은 경로가 아니다(그 지시가 이 코드를 만든 이유다). 파일을
+               내려받아 되살리는 것도 이 도구의 일이 아니다 — 오너 규칙이 실체화·복사를 금한다.
 
 【지불의 정의 — 비어 있으면 거부한다】
  항목이 닫히는 길은 둘뿐이다.
@@ -52,11 +59,13 @@
   intake selftest
 """
 import argparse
+import errno
 import hashlib
 import json
 import ntpath
 import os
 import re
+import stat
 import sys
 import time
 
@@ -72,6 +81,34 @@ EXIT_PAID, EXIT_OPEN, EXIT_NO_DENOM, EXIT_NO_LEDGER, EXIT_DRIFT, EXIT_USAGE, EXI
 #   자격으로 쓰므로 이것은 구멍이다. 귀속이 없는 대장은 ★판정하지 않는다 — 7 로 거부한다.
 #   (dept-5 의 법과 같은 뼈: 합계가 맞는 것은 각 항목이 지불됐다는 주장이 아니다.)
 EXIT_UNATTRIB = 7
+# ★8 UNREADABLE — artifact 가 **있는데 읽히지 않는다**(CEO 지시 2026-10-23 · WP10).
+#   CEO 실측: 기록된 크기 그대로 present 인데 모든 읽기가 OSError errno 11(EDEADLK) 로 막혔다(macOS 의
+#   dataless·compressed 플래그 — 내용이 클라우드로 비워진 파일이다. 901 참조 중 24건, 데스크톱 트리의 14.7%).
+#   ⛔종전: 지문 재계산이 실패를 (None, None) 으로 삼켰고 재확인은 그것을 「★증거 바이트가 변경됐다 … 그 절만
+#   떠낸 새 파일로 재지불하라」로 찍었다 ⇒ **읽을 수 없는 증거 대신 새 증거를 지어내라**는 지시였다.
+#   ⇒ 판독 불가는 변경이 아니다. 지불은 무효가 아니다. 신원 재확인이 **불가능**할 뿐이고, 크기 일치는 정황이지
+#   신원이 아니다(읽을 수 있는 sha 가 있어야 신원이다).
+EXIT_UNREADABLE = 8
+
+_TAG = {EXIT_PAID: "PAID", EXIT_OPEN: "OPEN", EXIT_NO_DENOM: "NO_DENOM", EXIT_NO_LEDGER: "NO_LEDGER",
+        EXIT_DRIFT: "DRIFT", EXIT_USAGE: "USAGE", EXIT_SELFTEST: "SELFTEST",
+        EXIT_UNATTRIB: "UNATTRIBUTED", EXIT_UNREADABLE: "UNREADABLE"}
+# ★심각도 순서 — 숫자 크기가 아니다. 종전 `max(worst, rc)` 는 0<1<2<3<4<7 이 뜻의 순서와 우연히 같아서
+#   맞았지만, 8 을 그 자리에 넣으면 ★판독 불가 한 건이 **열린 항목**(1)을 가린다(여러 대장을 합산할 때).
+#   ⇒ 뜻의 순서를 명시한다: PAID < UNREADABLE < OPEN < NO_DENOM < NO_LEDGER < DRIFT < UNATTRIBUTED.
+#   기존 코드쌍의 판정은 하나도 바뀌지 않는다(그 여섯의 상대 순서가 그대로다).
+_SEVERITY = {EXIT_PAID: 0, EXIT_UNREADABLE: 1, EXIT_OPEN: 2, EXIT_NO_DENOM: 3,
+             EXIT_NO_LEDGER: 4, EXIT_DRIFT: 5, EXIT_UNATTRIB: 6}
+
+
+def _tag(rc):
+    """exit code 의 이름. ★종전은 `[...][min(rc, 4)]` 였다 — 그 꼬리표는 7 도, 8 도 「DRIFT」로 찍는다."""
+    return _TAG.get(rc, "rc=%d" % rc)
+
+
+def _worse(a, b):
+    """더 나쁜 쪽 — `_SEVERITY` 의 뜻 순서로 고른다(숫자 비교가 아니다)."""
+    return b if _SEVERITY.get(b, 99) > _SEVERITY.get(a, 99) else a
 
 
 def _root(explicit=None):
@@ -195,6 +232,78 @@ _EPHEMERAL_ROOTS = ("/tmp/", "/private/tmp/", "/var/tmp/", "/private/var/folders
 _WIN_TEMP_ENV = ("TMPDIR", "TEMP", "TMP")
 
 
+_OPEN = open
+# ★`_OPEN` 은 검체 주입구다 — 판독 불가 갈래를 iCloud 도, 그런 파일도 없이 재기 위해 테스트가 이 이름만 대역으로
+#   바꾼다(운영 경로는 그대로 builtin open 이다). 같은 수법을 Windows 경로 판정에서 `os` 대역으로 이미 쓴다.
+#   ⛔이 도구는 파일을 **내려받거나 실체화하거나 옮기지 않는다**(오너 규칙) — stat 과 read 만 한다.
+
+SF_DATALESS = 0x40000000      # macOS sys/stat.h — 내용이 클라우드로 비워졌다(stat 는 되고 read 는 막힌다)
+UF_COMPRESSED = 0x20          # macOS — 압축 저장(APFS/HFS+ 압축)
+
+PROBE_OK, PROBE_ABSENT, PROBE_UNREADABLE, PROBE_NOT_REGULAR = "OK", "ABSENT", "UNREADABLE", "NOT_REGULAR"
+
+
+def _flags_note(flags, plat=None):
+    """st_flags 를 사람 말로 — ★비트의 **뜻**은 darwin 에서만 붙인다.
+
+    다른 OS 에서 `st_flags` 가 있어도 그 비트는 같은 뜻이 아니다 ⇒ 숫자만 찍는다(U5: 그 OS 는 errno 로 분류한다).
+    `plat` 은 다른 OS 에서 darwin 판정을 재기 위한 주입구이고, 운영 호출은 생략한다.
+    """
+    if flags is None:
+        return ""
+    if (plat or sys.platform) != "darwin":
+        return " · st_flags=0x%x" % flags
+    names = [n for bit, n in ((SF_DATALESS, "dataless"), (UF_COMPRESSED, "compressed")) if flags & bit]
+    return " · st_flags=0x%x(%s)" % (flags, ",".join(names) if names else "dataless 아님")
+
+
+def _probe(path):
+    """(kind, sha256_16, size, errno, st_flags) — 읽기 재확인의 **네 갈래**.
+
+    ★왜 네 갈래인가(CEO 실측 2026-10-23): 종전 `_fp` 는 어떤 실패든 (None, None) 으로 삼켰고 재확인은 그것을
+    「지문 불일치 = 변경」으로 읽었다 ⇒ ★**읽지 못한 것**과 **바뀐 것**이 같은 출력·같은 처방을 받았다. 둘은 다른
+    사실이고 다른 처방을 부른다(변경 → 재지불 · 부재 → 재지불/보류 · 판독 불가 → ⛔재지불 금지).
+      OK          : 열고 끝까지 읽었다 — 지문이 있다(신원을 말할 수 있는 유일한 갈래).
+      ABSENT      : 경로가 없다.
+      NOT_REGULAR : 있으나 정규 파일이 아니다(디렉터리·FIFO·장치) — 열지 않는다(FIFO 는 쓰는 쪽을 기다려 막힌다).
+      UNREADABLE  : 정규 파일인데 open/read 가 OSError 다 — errno 와 (있으면) st_flags 를 싣는다. 크기는 stat 에서
+                    얻는다(★stat 는 dataless 파일에서도 **논리 크기**를 준다 — 그래서 크기 대조는 정황이 된다).
+    ⛔OSError 가 아닌 예외(경로가 문자열이 아닌 기록 등)는 여기서 분류하지 않는다 — 호출자가 종전처럼 지문 없음으로 본다.
+    """
+    try:
+        stt = os.stat(path)
+    except FileNotFoundError:
+        return PROBE_ABSENT, None, None, None, None
+    except OSError as e:
+        # stat 자체가 막혔다 — 크기조차 모르는 판독 불가다.
+        return PROBE_UNREADABLE, None, None, e.errno, None
+    flags = getattr(stt, "st_flags", None)
+    if not stat.S_ISREG(stt.st_mode):
+        return PROBE_NOT_REGULAR, None, None, None, flags
+    try:
+        with _OPEN(path, "rb") as fh:
+            b = fh.read()
+    except OSError as e:
+        return PROBE_UNREADABLE, None, stt.st_size, e.errno, flags
+    return PROBE_OK, hashlib.sha256(b).hexdigest()[:16], len(b), None, flags
+
+
+def _unreadable_note(eno, cur_size, rec_size, flags):
+    """판독 불가 한 건을 사람 말로 — errno(이름) · st_flags · 크기 대조. ★크기 일치는 **정황**이고 신원이 아니다."""
+    name = errno.errorcode.get(eno, "?") if eno is not None else "?"
+    out = "errno %s(%s)%s" % (eno, name, _flags_note(flags))
+    if cur_size is None:
+        out += " · 현재 크기 미측정(stat 도 막혔다)"
+    elif rec_size is None:
+        out += " · 현재 크기 %sB(기록된 크기가 없다)" % cur_size
+    elif int(cur_size) == int(rec_size):
+        out += " · 현재 크기 %sB = 기록과 일치(내용이 온전할 정황)" % cur_size
+    else:
+        out += " · 현재 크기 %sB 가 기록 %sB 와 ★다르다(변경 정황 — 읽지 못했으므로 sha 로 확정하지 못했다)" % (
+            cur_size, rec_size)
+    return out
+
+
 def _fp(path):
     """(sha256_16, size) — 지불 시점의 지문. ★dept-6 이 2026-10-15 에 찾은 결함의 수리.
 
@@ -206,15 +315,18 @@ def _fp(path):
 
     ★정규 파일이 아니면 열지 않고 (None, None) 이다(2026-10-20 · B-328 #8 리뷰 R1) — FIFO 는 열면 쓰는 쪽이 올
     때까지 막히고 장치 파일은 끝없이 읽힌다. 확인과 열기 사이에 바뀌는 경로는 막지 못한다(어휘·시점의 한계).
+
+    ★2026-10-23(WP10): 몸통을 `_probe` 에 위임한다 — 읽기 경로가 **하나**여야 지불 시점과 재확인이 같은
+    사실을 본다. 계약은 그대로다: OK 가 아니면 (None, None) 이고, 그래서 **지불 시점에** 읽히지 않는 artifact 는
+    종전처럼 지불을 싣지 못한다(그 문을 이 수리가 열지 않는다 — 열린 것은 재확인 쪽의 **구별**뿐이다).
     """
     try:
-        if not os.path.isfile(path):
-            return None, None
-        with open(path, "rb") as fh:
-            b = fh.read()
+        kind, sha, size, _eno, _flags = _probe(path)
     except Exception:
         return None, None
-    return hashlib.sha256(b).hexdigest()[:16], len(b)
+    if kind != PROBE_OK:
+        return None, None
+    return sha, size
 
 
 def _ephemeral(path, os_name=None, env=None):
@@ -297,19 +409,40 @@ def _item_state(it, root_for_rel=None):
         alive = [a for a in present if a[3] or a[1]]
         durable = [a for a in alive if not _ephemeral(a[0])]
         # ★지문 대조 — 기록된 지문이 있는 artifact 는 매번 재계산해 맞춘다.
-        drifted, unfingerprinted = [], []
+        #   ★세 결말을 가른다(WP10 · CEO 지시 2026-10-23): 읽혔는데 지문이 다르면 CHANGED, 경로가 사라졌으면
+        #   ABSENT, 있는데 읽히지 않으면 UNREADABLE. 종전은 뒤의 둘이 첫째로 접혀 재지불 처방을 받았다.
+        drifted, unfingerprinted, unreadable, vanished = [], [], [], []
         for path, rec_sha, rec_size, _legacy in alive:
             if not rec_sha:
                 unfingerprinted.append(path)
                 continue
-            cur_sha, cur_size = _fp(path)
-            if cur_sha != rec_sha:
+            try:
+                kind, cur_sha, cur_size, eno, flags = _probe(path)
+            except Exception:
+                # ★R1 수리: `_probe` 는 OSError 만 분류한다. 그 밖의 예외(거대 artifact 의 MemoryError 등)는
+                #   종전 `_fp` 의 `except Exception` 이 삼켜 「지문 불일치 = 변경」이 됐다 — 실측(R1-02 로그):
+                #   수리 직후 바이트에서는 그 예외가 `_item_state` 밖으로 터져 ★대장 하나가 status·audit 전체를
+                #   죽였다. 한 항목의 판독 실패가 다른 대장의 판정을 삼키게 두지 않는다(종전 결말로 되돌린다).
+                kind, cur_sha, cur_size, eno, flags = PROBE_NOT_REGULAR, None, None, None, None
+            if kind == PROBE_UNREADABLE:
+                unreadable.append((path, rec_sha, rec_size, cur_size, eno, flags))
+            elif kind == PROBE_ABSENT:
+                vanished.append((path, rec_sha, rec_size))
+            elif cur_sha != rec_sha:
+                # OK 이면서 지문이 다르다 = 진짜 변경. NOT_REGULAR·분류 불가도 여기로 떨어진다(종전과 같은 결말).
                 drifted.append((path, rec_sha, cur_sha, rec_size, cur_size))
         if drifted:
             p0, rs, cs, rz, cz = drifted[0]
             return "OPEN", ("★증거 바이트가 변경됐다(%d건) — %s: 기록 %s/%sB → 현재 %s/%sB. "
-                            "⛔덧붙임도 변경이다 — 그 절만 떠낸 새 파일로 재지불하라"
-                            % (len(drifted), os.path.basename(p0), rs, rz, cs, cz))
+                            "⛔덧붙임도 변경이다 — 그 절만 떠낸 새 파일로 재지불하라%s"
+                            % (len(drifted), os.path.basename(p0), rs, rz, cs, cz,
+                               (" · (그 밖에 판독 불가 %d건 — 그쪽은 재지불 대상이 아니다)" % len(unreadable))
+                               if unreadable else ""))
+        if vanished:
+            p0, rs, rz = vanished[0]
+            return "OPEN", ("★지불 뒤 artifact 가 사라졌다(%d건) — %s: 기록 %s/%sB 였던 경로가 지금 부재다. "
+                            "재지불하거나 보류 사유를 대라(⛔변경이 아니다 — 경로 부재다)"
+                            % (len(vanished), os.path.basename(p0), rs, rz))
         if alive and not durable:
             return "OPEN", ("artifacts %d건이 전부 ★임시 경로다(%s) — 그 디렉터리가 청소되면 지불이 "
                             "사라진다. 내구 경로 1건 이상을 대라" % (len(alive), str(alive[0][0])[:48]))
@@ -321,11 +454,20 @@ def _item_state(it, root_for_rel=None):
                                 "부재였던 경로는 지불이 아니다. 정규 파일로 재지불하라"
                                 % (len(unproven), str(unproven[0][0])[:48]))
             return "OPEN", "artifacts %d건 전부 디스크 부재(%s)" % (len(arts), str(arts[0][0])[:60])
-        tag = "지문 %d/%d 대조" % (len(alive) - len(unfingerprinted), len(alive))
+        tag = "지문 %d/%d 대조" % (len(alive) - len(unfingerprinted) - len(unreadable), len(alive))
         if unfingerprinted:
             tag += " · ⚠지문 없음 %d(소급 검증 불가)" % len(unfingerprinted)
         if unproven:
             tag += " · 지문 못 얻은 %d 제외" % len(unproven)
+        if unreadable:
+            # ★지불은 무효가 아니다 — 신원 재확인이 불가능할 뿐이다. ⛔재지불 처방을 찍지 않는다(그것은 증거를
+            #   지어내라는 지시다). 크기 일치는 정황으로만 말한다.
+            p0, rs, rz, cz, eno, flags = unreadable[0]
+            return "UNREADABLE", ("★판독 불가 %d건 — %s: %s. 기록 지문 %s. ⛔지불은 무효가 아니다 — 읽을 수 "
+                                  "있는 sha 없이는 신원이 증명되지 않을 뿐이고, 새 증거를 지어내 메울 일이 "
+                                  "아니다(이 줄은 어떤 처방도 요구하지 않는다). · %s"
+                                  % (len(unreadable), os.path.basename(p0),
+                                     _unreadable_note(eno, cz, rz, flags), rs, tag))
         return "PAID", "evidence %d자 + artifact 실존 %d/%d(내구 %d) · %s" % (
             len(ev), len(alive), len(arts), len(durable), tag)
     if st == "defer":
@@ -355,16 +497,24 @@ def _evaluate(led):
     if not items:
         return EXIT_NO_DENOM, ["NO_DENOM  지시는 기록됐으나 항목 목록이 0건 — 분모가 없다"
                                " (★통과가 아니다: 검사 불가능이다)"]
-    paid, open_ = [], []
+    paid, open_, unread = [], [], []
     for i, it in enumerate(items, 1):
         state, why = _item_state(it)
         row = "  %-5s #%-3d %s  [%s]" % (state, i, (it.get("text") or "")[:72], why)
-        (paid if state == "PAID" else open_).append(row)
-    lines.append("접수 %d · 지불 %d · 열림 %d  (대장 %s · 지시 sha %s)"
-                 % (len(items), len(paid), len(open_), led.get("id"), actual[:16]))
+        (open_ if state == "OPEN" else unread if state == "UNREADABLE" else paid).append(row)
+    # ★판독 불가 항목은 **지불에 센다**(지불은 무효가 아니다) — 숨기지 않고 그 수를 따로 말한다.
+    lines.append("접수 %d · 지불 %d · 열림 %d%s  (대장 %s · 지시 sha %s)"
+                 % (len(items), len(paid) + len(unread), len(open_),
+                    (" · ★판독 불가 %d(지불 유효 · 신원 재확인 불가)" % len(unread)) if unread else "",
+                    led.get("id"), actual[:16]))
     lines.extend(open_)
+    lines.extend(unread)
     lines.extend(paid)
-    return (EXIT_PAID if not open_ else EXIT_OPEN), lines
+    if open_:
+        return EXIT_OPEN, lines
+    if unread:
+        return EXIT_UNREADABLE, lines
+    return EXIT_PAID, lines
 
 
 def cmd_open(a):
@@ -397,7 +547,7 @@ def cmd_open(a):
     }
     _write_atomic(p, led)
     rc, lines = _evaluate(led)
-    print("OPENED %s  항목 %d건  →  %s" % (p, len(led["items"]), ["PAID", "OPEN", "NO_DENOM"][min(rc, 2)]))
+    print("OPENED %s  항목 %d건  →  %s" % (p, len(led["items"]), _tag(rc)))
     for l in lines:
         print(l)
     return rc
@@ -441,7 +591,9 @@ def cmd_pay(a):
         recs.append({"path": path, "sha256_16": sha, "size": size})
     it.update({"state": "done", "evidence": a.evidence, "artifacts": recs, "paid_at": _now()})
     state, why = _item_state(it)
-    if state != "PAID":
+    # ★거부는 OPEN 에만 (WP10): 지불 직후 그 파일이 읽히지 않게 되는 창에서 UNREADABLE 이 나올 수 있고, 그것은
+    #   「지불되지 않았다」가 아니다. 지불 시점에 읽히지 않았던 artifact 는 지문이 없어 종전처럼 OPEN 이다.
+    if state == "OPEN":
         print("REFUSED  #%d 는 지불되지 않았다 — %s" % (a.item_no, why), file=sys.stderr)
         _write_atomic(p, led)   # 기록은 남긴다(거부도 사실이다)
         return EXIT_OPEN
@@ -459,7 +611,7 @@ def cmd_defer(a):
                "release_condition": a.release_condition, "deferred_at": _now()})
     state, why = _item_state(it)
     _write_atomic(p, led)
-    if state != "PAID":
+    if state == "OPEN":
         print("REFUSED  #%d 보류가 성립하지 않았다 — %s" % (a.item_no, why), file=sys.stderr)
         return EXIT_OPEN
     print("DEFERRED  #%d  %s" % (a.item_no, why))
@@ -511,14 +663,14 @@ def cmd_status(a):
             led = _load(p)
         except Exception as e:
             out.append("DRIFT  %s 판독 불가: %s" % (p, e))
-            worst = max(worst, EXIT_DRIFT)
+            worst = _worse(worst, EXIT_DRIFT)
             continue
         mine = _mine(led)
         if not a.id and not a.all:
             if mine is None:
                 out.append("UNATTRIBUTED  %s — 좌석 성분 없음. `stamp --id %s` 로 귀속을 기입하라"
                            % (p, led.get("id")))
-                worst = max(worst, EXIT_UNATTRIB)
+                worst = _worse(worst, EXIT_UNATTRIB)
                 continue
             if mine is False:
                 ob = led.get("opened_by") or {}
@@ -527,9 +679,9 @@ def cmd_status(a):
                 continue
         rc, lines = _evaluate(led)
         judged += 1
-        out.append("[%s] %s" % (["PAID", "OPEN", "NO_DENOM", "NO_LEDGER", "DRIFT"][min(rc, 4)], p))
+        out.append("[%s] %s" % (_tag(rc), p))
         out.extend("  " + l for l in lines)
-        worst = max(worst, rc)
+        worst = _worse(worst, rc)
     if not a.id and not a.all and judged == 0 and worst == EXIT_PAID:
         out.append("NO_LEDGER  이 좌석에 귀속된 대장이 0건이다 — ★다른 좌석의 지불로 통과하지 않는다")
         worst = EXIT_NO_LEDGER
@@ -553,23 +705,25 @@ def cmd_audit(a):
         paths = _ledgers(r)
         if not paths:
             rows.append("  NO_LEDGER   %-34s 접수 기록 0건" % os.path.basename(r))
-            worst = max(worst, EXIT_NO_LEDGER)
+            worst = _worse(worst, EXIT_NO_LEDGER)
             continue
         for p in paths:
             try:
                 led = _load(p)
             except Exception as e:
                 rows.append("  DRIFT       %-34s %s" % (os.path.basename(r), e))
-                worst = max(worst, EXIT_DRIFT)
+                worst = _worse(worst, EXIT_DRIFT)
                 continue
             rc, lines = _evaluate(led)
-            tag = ["PAID", "OPEN", "NO_DENOM", "NO_LEDGER", "DRIFT"][min(rc, 4)]
+            tag = _tag(rc)
             rows.append("  %-11s %-34s %s" % (tag, os.path.basename(r), lines[0]))
             if rc != EXIT_PAID:
-                rows.extend("      " + l.strip() for l in lines[1:] if l.strip().startswith("OPEN"))
-            worst = max(worst, rc)
+                # ★판독 불가 줄도 떠낸다 — CEO 가 읽는 칸이 audit 이고, 그 줄이 errno·플래그·크기 대조를 싣는다.
+                rows.extend("      " + l.strip() for l in lines[1:]
+                            if l.strip().startswith(("OPEN", "UNREADABLE")))
+            worst = _worse(worst, rc)
     print("[intake audit] 루트 %d · 최악 exit %d (%s)"
-          % (len(roots), worst, ["PAID", "OPEN", "NO_DENOM", "NO_LEDGER", "DRIFT"][min(worst, 4)]))
+          % (len(roots), worst, _tag(worst)))
     print("\n".join(rows))
     return worst
 
@@ -648,11 +802,68 @@ def cmd_selftest(_a):
 
     # ⒤ 네 종결 상태가 서로 다른 코드다 (★양성 통제 — 갈래마다 한 번은 돌려 본다)
     chk(len({EXIT_PAID, EXIT_OPEN, EXIT_NO_DENOM, EXIT_NO_LEDGER, EXIT_DRIFT}) == 5, "exit 코드 충돌")
+
+    # ⒥ ★판독 불가는 변경이 아니다 (CEO 지시 2026-10-23 · WP10). 상태마다 검체 하나 — iCloud 도, dataless 파일도
+    #   필요하지 않다: `_OPEN` 대역이 OSError 를 던지고(=실측 기제와 같은 갈래), 나머지는 운영 경로 그대로다.
+    def _oserr_open(no):
+        def _op(*_a, **_k):
+            raise OSError(no, os.strerror(no))
+        return _op
+
+    _rsha, _rsize = _fp(real)
+    _rec = {"path": real, "sha256_16": _rsha, "size": _rsize}
+    _saved = _OPEN
+    try:
+        globals()["_OPEN"] = _oserr_open(errno.EDEADLK)
+        _st_u, _why_u = _item_state({"state": "done", "evidence": "가" * MIN_EVIDENCE_CHARS,
+                                     "artifacts": [dict(_rec)]})
+        _rc_u, _lines_u = _evaluate({"id": "t", "instruction": {"text": "x", "sha256": _digest(b"x")},
+                                     "items": [{"state": "done", "evidence": "가" * MIN_EVIDENCE_CHARS,
+                                                "artifacts": [dict(_rec)]}]})
+        _rc_mix, _ = _evaluate({"id": "t", "instruction": {"text": "x", "sha256": _digest(b"x")},
+                                "items": [{"state": "done", "evidence": "가" * MIN_EVIDENCE_CHARS,
+                                           "artifacts": [dict(_rec)]},
+                                          {"state": "open", "text": "미지불"}]})
+        _pay_sha, _pay_size = _fp(real)
+    finally:
+        globals()["_OPEN"] = _saved
+    chk(_st_u == "UNREADABLE", "판독 불가 artifact 가 UNREADABLE 이 아니다(%s · %s)" % (_st_u, _why_u))
+    chk("재지불" not in _why_u, "판독 불가인데 재지불 처방을 찍었다 — ⛔증거를 지어내라는 지시다(%s)" % _why_u)
+    chk("변경됐다" not in _why_u, "판독 불가를 「변경됐다」로 찍었다(%s)" % _why_u)
+    chk("무효가 아니다" in _why_u, "지불이 무효가 아니라는 말이 없다(%s)" % _why_u)
+    chk("errno" in _why_u, "errno 를 찍지 않았다(%s)" % _why_u)
+    chk("정황" in _why_u, "크기 일치를 정황으로만 말하지 않았다(%s)" % _why_u)
+    chk(_rc_u == EXIT_UNREADABLE, "판독 불가만 남은 대장이 %d 다 — %d 여야 한다" % (_rc_u, EXIT_UNREADABLE))
+    chk(_rc_mix == EXIT_OPEN, "열린 항목 1건이 판독 불가에 가려졌다(rc=%d) — 열림이 이긴다" % _rc_mix)
+    chk((_pay_sha, _pay_size) == (None, None), "지불 시점에 읽히지 않는 artifact 가 지문을 얻었다")
+    # ⒥' 음성 대조 — 읽히는 파일의 진짜 지문 불일치는 종전대로 CHANGED(OPEN) + 재지불이다.
+    _st_c, _why_c = _item_state({"state": "done", "evidence": "가" * MIN_EVIDENCE_CHARS,
+                                 "artifacts": [{"path": real, "sha256_16": "0" * 16, "size": 1}]})
+    chk(_st_c == "OPEN" and "재지불" in _why_c, "진짜 변경이 CHANGED(OPEN·재지불)로 읽히지 않았다(%s · %s)"
+        % (_st_c, _why_c))
+    # ⒦ 부재는 또 다른 사실이다 — 변경도, 판독 불가도 아니다.
+    _st_a, _why_a = _item_state({"state": "done", "evidence": "가" * MIN_EVIDENCE_CHARS,
+                                 "artifacts": [{"path": real + ".no-such", "sha256_16": "0" * 16, "size": 1}]})
+    chk(_st_a == "OPEN" and "부재" in _why_a, "부재 artifact 가 부재로 읽히지 않았다(%s · %s)" % (_st_a, _why_a))
+    chk(_probe(real + ".no-such")[0] == PROBE_ABSENT, "없는 경로가 ABSENT 가 아니다")
+    chk(_probe(os.path.dirname(real))[0] == PROBE_NOT_REGULAR, "디렉터리가 NOT_REGULAR 가 아니다")
+    chk(_probe(real)[0] == PROBE_OK, "읽히는 정규 파일이 OK 가 아니다")
+    # ⒧ darwin 전용 비트 해석 — 다른 OS 는 숫자만(U5: 그 OS 는 errno 로 분류한다).
+    chk("dataless" in _flags_note(SF_DATALESS, plat="darwin"), "darwin 에서 dataless 이름이 없다")
+    chk("dataless" not in _flags_note(SF_DATALESS, plat="win32"), "darwin 아닌 OS 에서 비트를 해석했다")
+    chk(_flags_note(None) == "", "st_flags 없음이 빈 말이 아니다")
+    chk(len({EXIT_PAID, EXIT_OPEN, EXIT_NO_DENOM, EXIT_NO_LEDGER, EXIT_DRIFT, EXIT_UNATTRIB,
+             EXIT_UNREADABLE}) == 7, "exit 코드 충돌(UNREADABLE 포함)")
+    chk(_worse(EXIT_UNREADABLE, EXIT_OPEN) == EXIT_OPEN, "열림이 판독 불가를 이기지 못했다")
+    chk(_worse(EXIT_PAID, EXIT_UNREADABLE) == EXIT_UNREADABLE, "판독 불가가 지불에 묻혔다")
+    chk(_worse(EXIT_OPEN, EXIT_DRIFT) == EXIT_DRIFT, "기존 심각도 순서가 바뀌었다(OPEN < DRIFT)")
+
     if fails:
         for f in fails:
             print("SELFTEST FAIL  " + f, file=sys.stderr)
         return EXIT_SELFTEST
-    print("SELFTEST OK  12군 · 지불 검사기 · 분모 부재는 통과가 아니다 · 체크박스는 닫지 못한다")
+    print("SELFTEST OK  15군 · 지불 검사기 · 분모 부재는 통과가 아니다 · 체크박스는 닫지 못한다 · "
+          "판독 불가는 변경이 아니다")
     return EXIT_PAID
 
 
