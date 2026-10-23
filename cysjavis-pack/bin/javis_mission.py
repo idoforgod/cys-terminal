@@ -1441,13 +1441,75 @@ def _capped_recent(delivery):
             % (best[1], best[2], best[0][:12]))
 
 
+# 괄호 붙여넣기 봉투 표지 — 정의처는 `src/paste_fence.rs`(OPEN·CLOSE)이고 여기는 그 **사본**이다.
+# 7비트 형만 둔다: 주입기(`cys.rs::inject_text` → `paste_fence::wrap`)가 쓰는 것이 이 둘이다.
+_FENCE_OPEN = "\x1b[200~"
+_FENCE_CLOSE = "\x1b[201~"
+
+
+def _framed_candidates(norm):
+    """봉투 복원 후보 4종(흔한 것부터). 입력은 **이미 정규화된** 프롬프트다.
+
+    공백 변형이 넷인 이유: `_normalize_delivery` 는 앞뒤 공백을 버리지만 봉투 안에서는 표지가
+    양옆을 잡아 같은 공백이 **한 칸으로 접힌다**. (앞 0|1) × (뒤 0|1) = 4 가 전수다.
+    """
+    return (
+        _FENCE_OPEN + norm + _FENCE_CLOSE,
+        _FENCE_OPEN + norm + " " + _FENCE_CLOSE,
+        _FENCE_OPEN + " " + norm + _FENCE_CLOSE,
+        _FENCE_OPEN + " " + norm + " " + _FENCE_CLOSE,
+    )
+
+
+def _framed_match(norm, delivery):
+    """(sha, meta) — 주입기가 씌운 봉투를 되씌워 원장 키를 복원한다. 미일치면 (None, None).
+
+    ## 왜 필요한가 (B-443 실측 · 자기인가 경로)
+    훅이 보는 프롬프트는 봉투 **안쪽**이고(TUI 가 봉투를 벗겨 붙여넣기로 소비한다), 원장에 남은
+    본문은 **봉투째**다 — CLI 주입 경로가 `paste_fence::wrap` 으로 감싼 뒤 `surface.send_text` 를
+    부르고 데몬은 **받은 그 바이트**를 주입 전에 선기록하기 때문이다. 그래서 ⓐ전문 해시가
+    구조적으로 어긋난다. 2026-10-23 06:54:30 +0700 dept-6 실측(원장 19593번째 줄):
+      · 행 surface=23 chars=122 units=1 from_label=cli:inject
+        sha256=1abe408f75d167b833b88ae86251f699cb8f446aca7c1e6869dcea77059e1049
+        = _digest_norm(_normalize_delivery(OPEN + 각성핑 + CLOSE))
+      · 훅이 계산하는 delivery_digest(각성핑) = 503dccea… 는 원장에 **없다**(차 12자 = 표지 2개)
+      · 1.3초 뒤 그 기계 핑이 「잔여문 110자 — 오너 임무로 인정」으로 임무 대장에 적혔다
+    멀티라인 주입이 이 결함을 안 드러낸 이유: 봉투는 첫·마지막 **조각에만** 붙어 가운데 조각이
+    평문이라 ⓒ부분 포함이 잡는다. 드러나는 모집단은 **봉투가 곧 전부인 배달**(단일 제출 단위)이다.
+
+    ## 증거 등급은 내려가지 않는다
+    문안 추정이 아니라 **해시 동등**이다 — ⓐ와 같은 등급으로 "데몬이 이 pane 에 주입한 바로 그
+    바이트"를 증명한다. 원장 본문이 `OPEN + sanitize(body) + CLOSE` 이고 TUI 가 받는 것이 그
+    `sanitize(body)` 이므로(살균은 멱등) 되씌움은 표지 두 개를 붙이는 것으로 끝난다.
+
+    ## 비용
+    봉투로 시작하는 preview 가 하나도 없으면 **해시를 한 번도 계산하지 않는다**(평시 0회).
+    """
+    framed = False
+    for meta in (delivery or {}).values():
+        prev = meta.get("preview") if isinstance(meta, dict) else None
+        if isinstance(prev, str) and prev.startswith(_FENCE_OPEN):
+            framed = True
+            break
+    if not framed:
+        return None, None
+    for cand in _framed_candidates(norm):
+        sha = _digest_norm(cand)
+        hit = delivery.get(sha)
+        if hit is not None:
+            return sha, (hit if isinstance(hit, dict) else {})
+    return None, None
+
+
 def machine_origin(prompt, delivery=None, ledger_status=None):
     """(bool, 사유) — 이 프롬프트가 **기계 채널**(wake 예약·노드 push·훅 알림)로 왔는가.
 
     판별은 2층이며 **층1이 정답**이다:
       층1 배달 원장 대조 — 데몬이 주입 직전 남긴 해시와 일치하면 기계 유래가 **확정**된다.
                           라벨 유무·문안 규약과 무관하므로 **문안 규약을 우회하는 push** 도 잡는다.
-                          ⓐ 전문 일치 ⓑ 창 밖 전문 일치(R5 ①) ⓒ 조각 연접·부분 포함(R5 ③)
+                          ⓐ 전문 일치 ⓐ′ **주입기 봉투 복원 일치**(`_framed_match` — 원장
+                            본문은 봉투째인데 제출된 것은 봉투 안쪽인 경로 · B-443)
+                          ⓑ 창 밖 전문 일치(R5 ①) ⓒ 조각 연접·부분 포함(R5 ③)
                           ⓓ **제출 단위 조각과의 전문 일치**(R6 ① — 멀티라인 push 가 행 단위로
                             쪼개져 제출되는 경로. 데몬이 조각을 따로 기록하므로 여기서는 ⓐ 와
                             같은 규칙으로 잡힌다) ⓔ 역포함(구 데몬 스큐 한정 · 평문 근거)
@@ -1475,6 +1537,16 @@ def machine_origin(prompt, delivery=None, ledger_status=None):
         norm = _normalize_delivery(prompt)
         sha = _digest_norm(norm)
         hit = delivery.get(sha)
+        framing = ""
+        if hit is None:
+            # ⓐ 미스 → ⓐ′ **주입기 봉투 복원**(`_framed_match` · B-443). 같은 증거 등급(해시
+            # 동등)이라 아래 두 분기(창 안·창 밖)를 그대로 공유한다 — 분기를 복제하면 한쪽만
+            # 고쳐지는 날이 온다.
+            f_sha, f_meta = _framed_match(norm, delivery)
+            if f_sha is not None:
+                sha, hit = f_sha, f_meta
+                framing = (" ★주입기 봉투(ESC[200~…ESC[201~)를 되씌워 복원한 키다 — 원장 본문은 "
+                           "봉투째이고 이 pane 이 제출한 것은 봉투 안쪽이다(해시 동등 · B-443)")
         if hit is not None:
             meta = hit if isinstance(hit, dict) else {}
             if meta.get("stale"):
@@ -1489,10 +1561,10 @@ def machine_origin(prompt, delivery=None, ledger_status=None):
                                  meta.get("age") or 0.0, (meta.get("age") or 0.0) / 3600.0,
                                  sha[:12]))
                 return True, ("배달 원장 일치(**창 밖** · 지연 %.1fh · sha256=%s…) — 창을 넘겼어도 "
-                              "해시가 같으면 데몬이 이 pane 에 주입한 그 문장이다"
-                              % ((meta.get("age") or 0.0) / 3600.0, sha[:12]))
+                              "해시가 같으면 데몬이 이 pane 에 주입한 그 문장이다%s"
+                              % ((meta.get("age") or 0.0) / 3600.0, sha[:12], framing))
             return True, ("배달 원장 일치(sha256=%s… origin=daemon) — 데몬이 이 pane 에 주입한 "
-                          "바로 그 문장이다" % sha[:12])
+                          "바로 그 문장이다%s" % (sha[:12], framing))
         kind, detail = _composition(norm, delivery)
         if kind == "capped":
             # ★R6 ②: 탐색 예산 소진 = 판정 근거 불완전. 종전은 이상징후만 남기고 통과시켰다.
