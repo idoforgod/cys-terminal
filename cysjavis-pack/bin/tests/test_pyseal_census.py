@@ -40,7 +40,7 @@ census 정의(CEO 승인 · 표는 전부 grep 실측값으로 고정 — 추정
        변수로 바꾸면(변조 M6 실증) ⓒ(iii) 탐지 규약("py"/"python" 이름 휴리스틱)과 src/lib.rs 핀이 **둘 다** 못 보고
        census 가 초록(`PYSEAL-CENSUS-OK`/exit 0)이었다 → 그 줄을 강제점으로 등재하고 ⓒ(v) 를 신설했다.
      (표가 세는 것은 줄 번호가 아니라 **비주석 줄의 개수**다 — 주석의 행번호는 2026-09-04 grep 재실측.)
-  ⓑ 참조 파일 집합 — `PYTHONDONTWRITEBYTECODE`/`ENV_PY_NO_BYTECODE` 를 언급하는 파일 **38개 목록** 고정
+  ⓑ 참조 파일 집합 — `PYTHONDONTWRITEBYTECODE`/`ENV_PY_NO_BYTECODE` 를 언급하는 파일 **39개 목록** 고정
      (2026-09-04 W-A A2: 17→18 · 훅 런처/본체 분할 검체 등재 — 등재 사유는 목록 주석 참조)
      (확장자 13종 · target/node_modules/_worktrees/.git 제외 · 이 파일 자신 제외 · grep -rl 동형).
      신규/소멸 → FAIL: 그 파일의 봉인을 점검한 뒤 목록을 갱신하라(갱신 = "봉인을 확인했다"는 선언).
@@ -229,7 +229,7 @@ def check_enforcement():
 REF_EXTS = (".rs", ".sh", ".py", ".ts", ".js", ".md", ".toml", ".yml", ".yaml", ".json", ".plist", ".bat", ".ps1")
 REF_SKIP_DIRS = frozenset(("target", "node_modules", "_worktrees", ".git"))
 REF_NEEDLES = (b"PYTHONDONTWRITEBYTECODE", b"ENV_PY_NO_BYTECODE")
-# 2026-10-17 at merged 3af6a34a: 38 files under REF_EXTS, REF_SKIP_DIRS, SELF_REL
+# 2026-10-23 at cc93b458 (0.14.53 WP3): 39 files under REF_EXTS, REF_SKIP_DIRS, SELF_REL
 # and either REF_NEEDLES byte string (including comments); symlinks are not followed.
 REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와 동일) · 중복 없음
     # 0.14.52 seal audit: New C8 marker/name readers and consumer control set the seal on each Python command.
@@ -340,6 +340,23 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   `os.environ` 복사본 위에 봉인을 **상속 방향으로** 다시 건다(cysd 가 팩 python 을 띄워도 캐시를 쓰지 않게 ·
     #   test_lane_redirect·test_role_authority_shell 과 같은 계급). 벗기는 줄은 0이다.
     "scripts/tests/test_cysd_dispatch_storm_e2e.py",
+    # 2026-10-23 registration (0.14.53 WP3 B-437 R1-R3 added the G1/G6 specimens for the gate step 6-B SEAL-1
+    #   relaxation, which is how this file entered the set: f0ac3b0c holds 0 needles, cc93b458 holds 19
+    #   (19 occurrences on 19 lines, all PYTHONDONTWRITEBYTECODE; ENV_PY_NO_BYTECODE 0).
+    #   **Seal inspection result (registering IS that declaration)**: NOT a new python entry point and NOT a product
+    #   enforcement point. Its children are `bash` (the two gate scripts under test), `git`, `hdiutil`, `xattr`,
+    #   `sleep`, and ONE `sys.executable` call (:730, the host interpreter already running the specimen, for
+    #   `seal emit`) spawned with NO env= at all, so it strictly inherits and never strips - the same class this list
+    #   already decided for test_resource_gate_boot_anchor above ("env 는 os.environ 복사 + override 라 봉인이
+    #   상속된다 — 벗기지도 새로 걸지도 않음"), and strictly weaker than it;
+    #   every bundled-interpreter path it names is a FAKE python3 it writes under its own temp mountpoint, and the
+    #   file holds no /Applications path at all. Its needles are (a) assertion text mirroring the gate PASS/FAIL
+    #   lines, (b) a fake interpreter body branching on the variable, (c) one extra_env entry that SIMULATES an
+    #   inheriting caller for G6, and (d) an assertion that the production script still carries
+    #   `env -u PYTHONDONTWRITEBYTECODE "$PY"` for step 6-A (the intended judgement change locked by BAR-R2-AMEND-1).
+    #   No line strips the seal from a product path, so needle retention is correct; deleting the literal to keep this
+    #   census quiet would only hide the specimen from it (the M6 class of mutation this file exists to catch).
+    "scripts/tests/test_release_postprocess_gate.py",
     # 0.14.52 seal audit: Private sealed env reaches bash workflow bodies and their Python verifier children.
     "scripts/tests/test_unix_pty_results.py",
     "scripts/verify-gatekeeper-user-path.sh",
