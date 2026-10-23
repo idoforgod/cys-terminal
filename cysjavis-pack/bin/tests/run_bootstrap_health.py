@@ -4131,15 +4131,45 @@ def h_win_9():
          "detect_agent_binary 가 Windows 폴백을 통과하지 않는다(오라클 밖 판정)")
     need(body.count("fn apply_windows_agent_fallback(") == 2,
          "cfg 분기 2벌(windows/not) 형태가 아니다 — 다른 OS 에서 항등 보장 불가")
-    # ② 후보 집합: 확장자 4종 + npm prefix 2종(%APPDATA%·%LOCALAPPDATA%)
+    # ② 후보 집합: 확장자 4종 + npm prefix 2종(%APPDATA%·%LOCALAPPDATA%) + 실행권 판정
+    # ★핀 이사(R2-FIX B3 · 2026-10-23) — 0.14.53 WP8 이 감지 게이트를 **한 함수에서 세 조각으로**
+    #   갈랐다(INV-1: 게이트가 쓰는 폴더 목록 = pane PATH 목록). 그래서 종전처럼
+    #   `windows_agent_candidates` 본문 **하나만** 잘라 보면 두 축이 사라진 것처럼 보인다:
+    #     · `"APPDATA"`·`"LOCALAPPDATA"` → `fn windows_agent_search_dirs()` 로 이사
+    #     · `is_executable_file(` → 스캐너에 **함수 참조로 주입**(`is_executable_file as fn(...)`)
+    #   종전 핀은 그 둘을 못 찾아 `npm prefix 후보 누락: %APPDATA%` 로 빨개졌다(r1 gemini blocking).
+    #   축 보존: ⑴npm prefix 폴더가 후보에 **있다** ⑵후보 판정이 **실행권을 본다**. 둘을 새 구조에서
+    #   다시 박되, **조각 사이의 배선까지** 함께 박는다 — 조각이 갈리면 "각 조각은 멀쩡한데 서로
+    #   연결되지 않은" 고장이 새로 가능해지기 때문이다(종전 한 함수 시절에는 없던 고장 모양이다).
     seg = body[body.index("fn windows_agent_candidates("):]
     seg = seg[:seg.index("\n}\n") + 2]
     for ext in ("cmd", "exe", "bat", "ps1"):
         need('"%s"' % ext in seg, "확장자 후보 누락: %s" % ext)
+    # ⑵ 실행권 판정 — 이제 스캐너에 주입되는 **함수 참조**다(호출 리터럴 `(` 가 아니다).
+    need("is_executable_file as fn" in seg,
+         "후보 판정에 실행권 술어가 주입되지 않는다(실재만 보면 오탐)")
+    need("find_agent_in_windows_dirs" in seg,
+         "후보 스캔이 완전 수식 필터 판 스캐너를 쓰지 않는다(R2-FIX B2 — 상대 PATH 항목 재유입)")
+    # ⑴-a npm prefix 의 env 좌표는 공유 폴더 목록 래퍼에 있다.
+    dseg = body[body.index("fn windows_agent_search_dirs("):]
+    dseg = dseg[:dseg.index("\n}\n") + 2]
     for var in ("APPDATA", "LOCALAPPDATA"):
-        need('"%s"' % var in seg, "npm prefix 후보 누락: %%%s%%" % var)
-    need("npm" in seg, "npm 전역 prefix 경로 후보 부재(PATH 미갱신 셸 대응 불가)")
-    need("is_executable_file(" in seg, "후보 판정이 실행권을 안 본다(실재만 보면 오탐)")
+        need('"%s"' % var in dseg, "npm prefix 후보 누락: %%%s%%" % var)
+    need("windows_user_bin_dirs" in dseg,
+         "공유 폴더 목록이 pane PATH 합성과 같은 출처에서 오지 않는다(INV-1 위반)")
+    # ⑴-b 그 목록이 실제로 npm prefix 폴더를 담는다 — 정의는 lib.rs 로 이사했다.
+    libsrc = os.path.join(REPO_DIR, "src", "lib.rs")
+    if not os.path.isfile(libsrc):
+        _absent(os.path.join("src", "lib.rs"), "배포 팩 — Rust 소스 부재")
+    lib = _read(libsrc)
+    lseg = lib[lib.index("pub fn windows_user_bin_dirs("):]
+    lseg = lseg[:lseg.index("\n}\n") + 2]
+    need('join("npm")' in lseg, "npm 전역 prefix 경로 후보 부재(PATH 미갱신 셸 대응 불가)")
+    # ⑴-c 배선 — 호출자가 목록을 만들어 스캔에 넘긴다(세 조각이 한 줄로 이어진다).
+    need("let dirs = windows_agent_search_dirs();" in body,
+         "폴백이 공유 폴더 목록을 만들지 않는다(조각 배선 끊김)")
+    need("windows_agent_candidates(&d.bin, &dirs)" in body,
+         "폴백이 그 목록을 후보 스캔에 넘기지 않는다(조각 배선 끊김)")
     # ③ 후보 전부 미발견이면 **힌트가 경로수정 안내로 교체**된다(설치 안내 반복이 아니라 배선 교정)
     need("WINDOWS_AGENT_PATH_HINT" in body, "전탐색 실패 힌트 상수 부재")
     # ★핀 이사(MF-1 · 2026-08-26) — 치환 배선이 직접 대입(`d.hint = WINDOWS_AGENT_PATH_HINT`)
@@ -4167,7 +4197,8 @@ def h_win_9():
         need("windows_agent_candidates" not in old,
              "계측 타당성 실패: 구 코드에 이미 후보 순회가 있다면 B8 은 결함이 아니다")
         calib = "구 코드 후보 순회 부재 확인"
-    return "후보 확장자 4·npm prefix 2·실행권 판정 · 힌트 교체 · python 소비 · 계측검증=%s" % calib
+    return ("후보 확장자 4·npm prefix 2(공유 목록 경유)·실행권 주입·완전수식 스캐너 · 조각 배선 2 · "
+            "힌트 교체 · python 소비 · 계측검증=%s" % calib)
 
 
 @specimen("H-WIN-10", "W4", "Windows 1차 종료 단계 유효성(무효 명시 로그 후 강제 직행)", ["G24"])
