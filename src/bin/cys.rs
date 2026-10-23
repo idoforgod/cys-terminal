@@ -24891,18 +24891,22 @@ fn run_pack_reinject(new_version: &str) -> Result<ReinjectReport, String> {
                     unknown_entries.push(entry);
                     continue;
                 }
-                // 주입 성공 후에만 마커 기록(P3 단일 write path). 마커 기록 실패는 '이미 주입됨'을
-                // 의미하므로 다음 pack-update에서 같은 버전이 재주입(중복 주입)될 수 있다 — 그 창을
-                // 가시화하도록 명시 경고하되 루프는 계속한다(나머지 노드 reinject 보장).
+                // 주입 성공 후에만 마커 기록(P3 단일 write path). 마커 기록 실패는 '이미 주입됨'을 의미한다 — 루프는
+                // 계속한다(나머지 노드 reinject 보장).
+                // ★(B-428 · F1-1) 종전에는 마커 미기록 → 다음 pack-update(같은 지침의 다음 반영 판)에서 중복 주입이
+                //   가능했다. Now the intent stays and the seat is UNKNOWN: the next node loop skips it on its same-hash
+                //   entry and the pending pass presence-checks it (never a blind second copy) - the pending pass's rule (R1-1).
                 if let Err(e) = request(
                     "reinject.mark",
                     json!({"surface_id": sid, "pack_version": new_version,
                            "directive_hash": new_hash}),
                 ) {
-                    eprintln!("[pack-update] ⚠ reinject.mark 기록 실패(surface {sid}, role {role}): {e} — \
-                               주입은 됐으나 마커 미기록 → 다음 pack-update에서 중복 주입 가능");
-                    drop_intent();
-                    failed += 1;
+                    eprintln!(
+                        "[pack-update] ⚠ surface {sid} ({role}): injected but reinject.mark failed ({e}) — kept UNKNOWN so \
+                         the next pass checks it (no blind second copy)"
+                    );
+                    unknown_new += 1;
+                    unknown_entries.push(intent.clone());
                     continue;
                 }
                 drop_intent();
@@ -50180,6 +50184,42 @@ mod b360_tests {
         }
         if (second.unknown, second.unknown_new, second.kept) != (1, 0, 0) {
             failures.push(format!("pass 2 does not carry it UNKNOWN (undetermined, nothing new): {second:?}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// F1-1 (head ruling: fixed in WP6) · the node loop's sibling of R1-1: an inject that PASSES while `reinject.mark` fails
+    /// WAS typed; the node loop keeps its intent UNKNOWN (counted `unknown_new`, so the run is degraded and the seat named)
+    /// instead of dropping it, so the next APPLIED version whose directive text is unchanged (same hash, still no marker)
+    /// skips the seat instead of typing the same text again. Failure direction: a definite failure (REFUSED) is still
+    /// `failed` with no entry left (b428_p4 NodeLoop REFUSED row). RED on fb97391d: `failed 1`, no entry, version 2 types it.
+    #[cfg(unix)]
+    #[test]
+    fn b428_p8_a_node_loop_inject_that_passed_with_a_failed_mark_is_kept_unknown_and_never_retyped() {
+        let pack = R2cPack::new();
+        let ctl = r2p_ctl(r2c_ok(json!({})), R2pPing::NoTrace, false);
+        let daemon = r2p_daemon(ctl, r2p_session(&pack));
+        let (first, unknown_after_first, second) = r2c_in_env(&daemon, &pack, || {
+            let first = run_pack_reinject("9.9.9").expect("version 9.9.9");
+            let unknown = r2p_unknown_entries(&pack.dir);
+            (first, unknown, run_pack_reinject("9.9.10").expect("version 9.9.10, directive unchanged"))
+        });
+        let (directives, _pings) = r2p_pastes(&daemon.calls());
+        let mut failures = Vec::new();
+        if directives != 1 {
+            failures.push(format!("directive pastes over two applied versions = {directives}, want 1 (no blind second copy)"));
+        }
+        if (first.injected, first.failed, first.unknown, first.unknown_new) != (0, 0, 1, 1) {
+            failures.push(format!("version 1 does not keep the typed-but-unmarked seat as a NEW unknown: {first:?}"));
+        }
+        if reinject_exit_code(first.failed, first.unknown_new) != cys::pack::EXIT_REINJECT_DEGRADED {
+            failures.push(format!("version 1 is not degraded: {first:?}"));
+        }
+        if unknown_after_first.len() != 1 || unknown_after_first[0]["surface_id"] != 7 {
+            failures.push(format!("the seat is not UNKNOWN on disk after version 1: {unknown_after_first:?}"));
+        }
+        if (second.injected, second.unknown, second.unknown_new) != (0, 1, 0) {
+            failures.push(format!("version 2 does not skip the UNKNOWN seat (carried, nothing new): {second:?}"));
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
