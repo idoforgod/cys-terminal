@@ -3356,20 +3356,79 @@ fn is_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem) 
             || item.key.surface.is_some_and(|s| cso_seats_detail(daemon).0.contains(&s)))
 }
 
+/// Head of the sentence [`cso_self_threshold_text`] adds — also an anchor of the identity [`is_cso_self_notice_for`] reads.
+const CSO_SELF_MARK: &str = " | this is the CSO's OWN context threshold (";
+/// Tag before the bus seq inside that sentence (read back by [`cso_self_notice_bus_seq`]).
+const CSO_SELF_SEQ_TAG: &str = ", bus seq ";
+
 /// Text for the master seat: the same `[alert] …` line the CSO gets for other seats, plus one sentence on the same line
-/// (no newline inside a queued text) saying whose threshold it is and the command that clears it.
-pub fn cso_self_threshold_text(item: &AlertItem, role: &str, fire: Option<&str>) -> String {
+/// (no newline inside a queued text) saying whose threshold it is, which bus publication carried it and the command
+/// that clears it. The `surface:<cso>` head and the ` --fire <fire>` tail are the delivery identity read back by
+/// [`is_cso_self_notice_for`] — keep the hint last.
+pub fn cso_self_threshold_text(item: &AlertItem, role: &str, fire: Option<&str>, bus_seq: Option<u64>) -> String {
     let fire_arg = fire.map_or_else(String::new, |f| format!(" --fire {f}"));
+    let seq = bus_seq.map_or_else(|| "-".to_string(), |s| s.to_string());
     format!(
-        "{} | this is the CSO's OWN context threshold ({role}); the CSO cannot clear itself - master clears it: cys cycle-agent --role {role}{fire_arg}",
+        "{}{CSO_SELF_MARK}{role}{CSO_SELF_SEQ_TAG}{seq}); the CSO cannot clear itself - master clears it: cys cycle-agent --role {role}{fire_arg}",
         render_text(item, 1)
     )
+}
+
+/// Is `text` the master notice for this CSO seat's fire? Delivery identity = (CSO surface, fire id) (BAR-R2-AMEND-1
+/// C1a), read back from what [`cso_self_threshold_text`] renders: the [`alert_text_prefix`] head of `key` (built by the
+/// same function that wrote the entry — not a second copy of its format), the CSO-self sentence and the ` --fire <fire>` tail.
+fn is_cso_self_notice_for(text: &str, key: &AlertKey, fire: &str) -> bool {
+    text.starts_with(&format!("{} ", alert_text_prefix(key)))
+        && text.contains(CSO_SELF_MARK)
+        && text.ends_with(&format!(" --fire {fire}"))
+}
+
+/// The bus seq written into a CSO-self notice (`None` if it is absent or unreadable).
+fn cso_self_notice_bus_seq(text: &str) -> Option<u64> {
+    let rest = &text[text.find(CSO_SELF_MARK)? + CSO_SELF_MARK.len()..];
+    let rest = &rest[rest.find(CSO_SELF_SEQ_TAG)? + CSO_SELF_SEQ_TAG.len()..];
+    rest[..rest.find(')')?].parse().ok()
+}
+
+/// The master-queue entry for this CSO seat's fire that is still UNDELIVERED: `(entry id, the bus seq it carries)`.
+/// An entry leaves `pending_queue` only once it is written and submitted (removed by id) or when it expires (moved to
+/// `expired_queue`), so presence here means the master has not had it. [`handle_event`] runs on the single executor,
+/// so no other publication of this identity runs between this read and the enqueue.
+fn cso_self_pending_entry(daemon: &Arc<Daemon>, master: u64, key: &AlertKey, fire: &str) -> Option<(String, Option<u64>)> {
+    let surface = daemon.get_surface(master)?;
+    let q = surface.pending_queue.lock().unwrap();
+    q.iter()
+        .find(|e| {
+            e.origin == ALERT_ORIGIN
+                && e.from.as_deref() == Some(ALERT_FROM)
+                && is_cso_self_notice_for(&e.text, key, fire)
+        })
+        .map(|e| (e.id.clone(), cso_self_notice_bus_seq(&e.text)))
+}
+
+/// One overflow-ledger row for a CSO-self threshold that was not queued (cause in `kind`).
+fn cso_self_row(kind: &str, item: &AlertItem, bus_seq: Option<u64>, now: Now) -> Value {
+    let p = PendingAlert {
+        first_seen: now.epoch,
+        last_seen: now.epoch,
+        first_mono: now.mono,
+        count: 1,
+        summary: item.summary.clone(),
+        reason: "cso_self_threshold",
+        admitted_as: None,
+        admit_durable: false,
+    };
+    let mut row = refused_row(kind, &item.key, &p, now);
+    row["bus_seq"] = json!(bus_seq);
+    row
 }
 
 /// Deliver a CSO's own `context.threshold` to the master seat queue (B-439). When it cannot be delivered (no master
 /// seat, an empty master seat, a frozen or full queue) the fact goes to the existing overflow ledger
 /// ([`REFUSED_FILE`] via [`append_refused`], the same record the became-CSO path writes) and an event says so — it is
-/// never dropped silently. Thresholds, fire/resolved bookkeeping and the pending set are not touched.
+/// never dropped silently. A repeat of a fire whose notice still waits in the master queue adds no second entry and is
+/// recorded the same way (BAR-R2-AMEND-1 C1a); once that notice is delivered, a repeat (a redelivery) enqueues again
+/// (C1b). Thresholds, fire/resolved bookkeeping and the pending set are not touched.
 fn route_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertItem, now: Now) {
     let payload = event.get("payload").unwrap_or(&Value::Null);
     // The hint must name the seat's CSO role: a cso-bound seat can publish with another payload role, and
@@ -3386,9 +3445,31 @@ fn route_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertIte
             .unwrap_or_else(|| CSO_ROLE_PREFIX.to_string()),
     };
     let fire = payload.get("fire_id").and_then(Value::as_str).filter(|f| !f.is_empty());
-    let text = cso_self_threshold_text(item, &role, fire);
+    let bus_seq = event.get("seq").and_then(Value::as_u64);
+    let text = cso_self_threshold_text(item, &role, fire, bus_seq);
     // The roles guard is released at the end of this statement - enqueue_into_seat takes surfaces, then roles.
     let master = daemon.roles.lock().unwrap().get(CSO_SELF_THRESHOLD_TARGET_ROLE).copied();
+    // C1a: the same (CSO surface, fire) still waiting in the master queue -> no second entry; record the suppression.
+    if let (Some(sid), Some(_), Some(f)) = (master, item.key.surface, fire) {
+        if let Some((pending_id, pending_seq)) = cso_self_pending_entry(daemon, sid, &item.key, f) {
+            let mut row = cso_self_row("cso_self_threshold_duplicate_suppressed", item, bus_seq, now);
+            row["pending_bus_seq"] = json!(pending_seq);
+            row["pending_queue_entry_id"] = json!(pending_id);
+            row["master_surface"] = json!(sid);
+            let archived = append_refused(daemon, &[row]);
+            publish_route(
+                daemon,
+                "alert_route.cso_self_duplicate_suppressed",
+                json!({"name": item.key.name, "surface_id": item.key.surface, "role": role, "fire_id": fire,
+                       "bus_seq": bus_seq, "pending_bus_seq": pending_seq, "pending_queue_entry_id": pending_id,
+                       "master_surface": sid,
+                       "archived_to": if archived.is_ok() { json!(REFUSED_FILE) } else { Value::Null },
+                       "archive_error": match &archived { Err(e) => json!(e.to_string()), Ok(()) => Value::Null },
+                       "note": "the same fire's notice is still waiting in the master queue - not queued a second time"}),
+            );
+            return;
+        }
+    }
     let result = match master {
         None => Err("no_master"),
         Some(sid) => enqueue_into_seat(
@@ -3415,22 +3496,12 @@ fn route_cso_self_threshold(daemon: &Arc<Daemon>, event: &Value, item: &AlertIte
             daemon,
             "alert_route.cso_self_to_master",
             json!({"name": item.key.name, "surface_id": item.key.surface, "detail": item.key.detail,
-                   "role": role, "fire_id": fire, "master_surface": sid,
+                   "role": role, "fire_id": fire, "bus_seq": bus_seq, "master_surface": sid,
                    "queue_entry_id": entry_id, "depth": depth}),
         ),
         Err(cause) => {
             let kind = format!("cso_self_threshold_{cause}");
-            let p = PendingAlert {
-                first_seen: now.epoch,
-                last_seen: now.epoch,
-                first_mono: now.mono,
-                count: 1,
-                summary: item.summary.clone(),
-                reason: "cso_self_threshold",
-                admitted_as: None,
-                admit_durable: false,
-            };
-            let archived = append_refused(daemon, &[refused_row(&kind, &item.key, &p, now)]);
+            let archived = append_refused(daemon, &[cso_self_row(&kind, item, bus_seq, now)]);
             publish_route(
                 daemon,
                 "alert_route.cso_self_undelivered",
@@ -4321,6 +4392,83 @@ mod drills {
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[1]["kind"], "cso_self_threshold_empty_master_seat");
         assert_eq!((depth(&daemon, cso), pending_len(&daemon)), (0, 0));
+    }
+
+    /// A CSO-self threshold event with its own bus seq (two publications of one fire carry different seqs).
+    fn cso_self_ev(cso: u64, seq: u64, fire: &str, pct: u64) -> Value {
+        let mut e = ev("context.threshold", Some(cso), json!({"role": "cso", "context_pct": pct, "threshold": 60, "fire_id": fire}));
+        e["seq"] = json!(seq);
+        e
+    }
+
+    fn suppressed_rows(daemon: &Arc<Daemon>) -> Vec<Value> {
+        read_refused_rows(daemon).expect("overflow ledger readable").into_iter()
+            .filter(|r| r["kind"] == "cso_self_threshold_duplicate_suppressed").collect()
+    }
+
+    /// (B-439 · BAR-R2-AMEND-1 C1a) A second publication of the same CSO fire while the first notice is still undelivered
+    /// adds no second master entry; the suppression is recorded with both bus seqs and the waiting entry's id.
+    #[test]
+    fn drill_cso_own_repeated_fire_while_undelivered_is_suppressed_and_recorded() {
+        let daemon = drill_daemon("csoselfr");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        handle_event(&daemon, &cso_self_ev(cso, 11, "f-r", 63), now);
+        handle_event(&daemon, &cso_self_ev(cso, 12, "f-r", 70), now);
+        assert_eq!(depth(&daemon, master), 1, "one entry for one undelivered fire");
+        let first = daemon.get_surface(master).unwrap().pending_queue.lock().unwrap()[0].clone();
+        assert!(first.text.contains("bus seq 11)") && first.text.ends_with(" --fire f-r"), "{}", first.text);
+        let rows = suppressed_rows(&daemon);
+        assert_eq!(rows.len(), 1, "the suppression is recorded once: {rows:?}");
+        assert_eq!((rows[0]["bus_seq"].clone(), rows[0]["pending_bus_seq"].clone()), (json!(12), json!(11)));
+        assert_eq!(rows[0]["pending_queue_entry_id"], json!(first.id));
+        assert_eq!(rows[0]["surface_id"], json!(cso));
+        assert_eq!((depth(&daemon, cso), pending_len(&daemon)), (0, 0));
+    }
+
+    /// (C1b) Once the notice was delivered, a publication of the same fire (the daemon's redelivery after a cycle that did
+    /// not take) enqueues again - the master must see it to retry.
+    #[test]
+    fn drill_cso_own_repeated_fire_after_delivery_enqueues_again() {
+        let daemon = drill_daemon("csoselfd");
+        let cso = seat(&daemon, "cso");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        handle_event(&daemon, &cso_self_ev(cso, 21, "f-d", 63), now);
+        let id1 = daemon.get_surface(master).unwrap().pending_queue.lock().unwrap()[0].id.clone();
+        // Delivery removes the entry by id after it is written and submitted (governance pop_delivered_ids).
+        daemon.get_surface(master).unwrap().pending_queue.lock().unwrap().retain(|e| e.id != id1);
+        let mut redelivery = cso_self_ev(cso, 22, "f-d", 64);
+        redelivery["payload"]["redelivery"] = json!(true);
+        handle_event(&daemon, &redelivery, now);
+        assert_eq!(depth(&daemon, master), 1, "the redelivery is queued again");
+        let second = daemon.get_surface(master).unwrap().pending_queue.lock().unwrap()[0].clone();
+        assert_ne!(second.id, id1, "a new entry, not the delivered one");
+        assert!(second.text.contains("bus seq 22)"), "{}", second.text);
+        assert!(suppressed_rows(&daemon).is_empty(), "nothing suppressed after delivery");
+    }
+
+    /// (C1a identity) A new fire (after the old one resolved) is a new identity and enqueues even while the old notice
+    /// waits; the same fire string from another CSO seat is another identity too. Resolution itself is the publisher's
+    /// bookkeeping - no bus event (the only `context.*` publish is handlers.rs `context.threshold`) - so at this boundary
+    /// "resolved, then a new fire" is a new fire id.
+    #[test]
+    fn drill_cso_own_new_fire_or_other_cso_seat_is_not_suppressed() {
+        let daemon = drill_daemon("csoselfg");
+        let cso = seat(&daemon, "cso");
+        let cso2 = seat(&daemon, "cso-2");
+        let master = seat(&daemon, "master");
+        let now = after_grace(&daemon);
+        handle_event(&daemon, &cso_self_ev(cso, 31, "f-1", 63), now);
+        handle_event(&daemon, &cso_self_ev(cso, 32, "f-2", 61), now);
+        assert_eq!(depth(&daemon, master), 2, "a new fire id is a new notice");
+        let mut other = cso_self_ev(cso2, 33, "f-1", 62);
+        other["payload"]["role"] = json!("cso-2");
+        handle_event(&daemon, &other, now);
+        assert_eq!(depth(&daemon, master), 3, "the same fire string from another CSO seat is another identity");
+        assert!(suppressed_rows(&daemon).is_empty(), "{:?}", suppressed_rows(&daemon));
+        assert_eq!((depth(&daemon, cso), depth(&daemon, cso2), pending_len(&daemon)), (0, 0, 0));
     }
 
     /// ★CSO 좌석이 둘일 때(cso·cso-2) **양쪽 다** 자기제외 대상이다 — 아니면 A 의 적체를 B 에게,
