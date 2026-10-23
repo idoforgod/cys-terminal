@@ -9,6 +9,9 @@ What is pinned here (BAR WP7-B438-0.14.53 r1):
   B4  publication uses only os.link + os.unlink and os.rename (AST scan of the final bytes, with positive controls).
   B5  SIGKILL after every primitive call -> resume ends NEW and rollback ends OLD; SIGHUP mid-loop completes; rollback never
       writes over a live file.
+  F1  (codex r1) a planned file changed in place keeps its inode: a resume (forward or rollback), a repeated switch over a
+      finished one, and the rollback's old-assets-back step stop before any further public move; each with its control.
+The 42 tests of r1 only ever resumed over unchanged bytes, so inode identity alone passed them - see ContentRuleTests.
 The fixture is the real 14-asset layout shrunk to a few KB per file. Every path is a tempfile path (no personal paths).
 
 Use: python3 scripts/tests/test_homepage_switch.py
@@ -642,6 +645,209 @@ class KillResumeRollbackTests(Base):
         self.assertEqual(rc, 4)
         self.assertEqual(rd(os.path.join(s.docroot, dst)), b"FOREIGN", "a new name was overwritten")
         self.assertTrue(os.path.isfile(os.path.join(s.stage, dst)), "the staged file must stay")
+
+
+class ContentRuleTests(Base):
+    """F1 (codex r1): same-size one-byte corruption at offset 100 with the inode kept, after an interrupted forward run, an
+    interrupted rollback, a finished switch, and in the old-assets folder. Each test runs its untouched control first: the
+    same kill and the same call without the flip must still end rc 0."""
+
+    def flip(self, path, at=100):
+        ino = os.lstat(path).st_ino
+        with open(path, "r+b") as f:
+            f.seek(at)
+            b = f.read(1)
+            f.seek(at)
+            f.write(bytes([b[0] ^ 1]))
+        self.assertEqual(os.lstat(path).st_ino, ino, "the corruption must keep the inode - that is the F1 case")
+
+    def begins(self, site, folder=None):
+        return len([r for r in site.journal(folder) if r.get("ev") == "begin"])
+
+    def states(self, site, folder, *extra):
+        rc, out = run(["status", "--stage", folder, "--docroot", site.docroot] + list(extra))
+        self.assertEqual(rc, 0, out)
+        return json.loads(out)["states"]
+
+    def test_forward_resume_refuses_a_staged_file_changed_in_place(self):
+        for corrupt in (False, True):
+            s = self.fresh("fwd-%d" % corrupt)
+            self.assertEqual(run_wrapped(self.runner, "kill", 2, s.args("switch")), -signal.SIGKILL)
+            p = os.path.join(s.stage, "downloads", "cys_x64.app.tar.gz")
+            if corrupt:
+                self.flip(p)
+            before, begins = s.tree(), self.begins(s)
+            rc, out = run(s.args("switch"))
+            if not corrupt:
+                self.assertEqual(rc, 0, "control: " + out)
+                self.assertEqual(s.tree(), s.new_tree())
+                continue
+            self.assertEqual(rc, 5, out)             # one new installer is public already: not "before any public change"
+            self.assertIn("downloads/cys_x64.app.tar.gz", out)
+            self.assertEqual(s.tree(), before, "the resume made a public move")
+            self.assertEqual(self.begins(s), begins, "the resume opened a move loop")
+            self.assertEqual(fail_safe_problems(s), [])
+            self.assertEqual(self.states(s, s.stage)["downloads/cys_x64.app.tar.gz"], "changed")
+            rc, out = run(s.args("rollback"))        # the way back stays open
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(s.tree(), s.old_tree())
+
+    def test_rollback_resume_refuses_a_copy_changed_in_place(self):
+        for corrupt in (False, True):
+            s = self.fresh("rb-%d" % corrupt)
+            self.assertEqual(run(s.args("switch"))[0], 0)
+            self.assertEqual(run_wrapped(self.runner, "kill", 1, s.args("rollback")), -signal.SIGKILL)
+            p = os.path.join(s.rb, "downloads", "cys_x64.app.tar.gz")
+            if corrupt:
+                self.flip(p)
+            before, begins = s.tree(), self.begins(s, s.rb)
+            rc, out = run(s.args("rollback"))
+            if not corrupt:
+                self.assertEqual(rc, 0, "control: " + out)
+                self.assertEqual(s.tree(), s.old_tree())
+                continue
+            self.assertEqual(rc, 5, out)
+            self.assertIn("downloads/cys_x64.app.tar.gz", out)
+            self.assertEqual(s.tree(), before, "the rollback resume made a public move")
+            self.assertEqual(self.begins(s, s.rb), begins, "the rollback resume opened a move loop")
+            self.assertNotIn(fsha(p), s.tree().values(), "the corrupted copy is public")
+            self.assertEqual(self.states(s, s.rb, "--allow-already")["downloads/cys_x64.app.tar.gz"], "changed")
+            self.assertIn("at " + p, out, "the stop must say where the bytes were checked")
+            # the way out the template prints (R1-1): set the rollback plan aside -> copies are rebuilt from the backup
+            os.rename(os.path.join(s.rb, "plan.json"), os.path.join(s.rb, "plan.json.changed-copy"))
+            rc, out = run(s.args("rollback"))
+            self.assertEqual(rc, 0, out)
+            self.assertEqual(s.tree(), s.old_tree())
+
+    def test_link_without_unlink_and_changed_bytes_is_not_finished(self):
+        for corrupt in (False, True):
+            s = self.fresh("pending-%d" % corrupt)
+            self.assertEqual(run_wrapped(self.runner, "kill", 1, s.args("switch")), -signal.SIGKILL)   # linked, not unlinked
+            name = "cys_%s_aarch64.dmg" % NEW
+            p = os.path.join(s.stage, "downloads", name)
+            self.assertEqual(os.lstat(p).st_ino, os.lstat(os.path.join(s.docroot, "downloads", name)).st_ino)
+            if corrupt:
+                self.flip(p)                          # the same inode is the public name too
+            before, begins = s.tree(), self.begins(s)
+            rc, out = run(s.args("switch"))
+            if not corrupt:
+                self.assertEqual(rc, 0, "control: " + out)
+                self.assertEqual(s.tree(), s.new_tree())
+                continue
+            self.assertEqual(rc, 5, out)
+            self.assertEqual(s.tree(), before, "the resume made a public move")
+            self.assertEqual(self.begins(s), begins, "the resume opened a move loop")
+            self.assertTrue(os.path.exists(p), "the staged name was unlinked")
+            self.assertEqual(self.states(s, s.stage)["downloads/" + name], "changed")
+
+    def test_finished_switch_with_a_public_file_changed_in_place_is_not_done(self):
+        for corrupt in (False, True):
+            s = self.fresh("done-%d" % corrupt)
+            self.assertEqual(run(s.args("switch"))[0], 0)
+            p = os.path.join(s.docroot, "downloads", "cys_x64.app.tar.gz")
+            if corrupt:
+                self.flip(p)
+            before = s.tree()
+            rc, out = run(s.args("switch"))
+            if not corrupt:
+                self.assertEqual((rc, json.loads(out)["moved"]), (0, 0), "control: " + out)
+                continue
+            self.assertEqual(rc, 5, out)
+            self.assertEqual(s.tree(), before)
+            self.assertEqual(self.states(s, s.stage)["downloads/cys_x64.app.tar.gz"], "changed")
+
+    def test_a_planned_file_on_another_filesystem_is_not_published(self):
+        s = self.site
+        target = os.path.join(s.stage, "downloads", "pack.tar.gz")
+        real = hs._lstat
+
+        def other_dev(p):
+            st = real(p)
+            if st is not None and p == target:
+                v = list(st)
+                v[2] += 1                                # st_dev; the inode number stays the planned one
+                return os.stat_result(v)
+            return st
+
+        before = s.tree()
+        hs._lstat = other_dev
+        try:
+            rc = hs.main(s.args("switch"))
+        finally:
+            hs._lstat = real
+        self.assertEqual(rc, 3)
+        self.assertUntouched(s, before)
+        self.assertEqual(hs.main(s.args("switch")), 0, "control: the same call on the real filesystem")
+        self.assertEqual(s.tree(), s.new_tree())
+
+    def test_rollback_old_back_refuses_an_old_asset_changed_in_place(self):
+        for corrupt in (False, True):
+            s = self.fresh("oldback-%d" % corrupt)
+            self.assertEqual(run(s.args("switch"))[0], 0)
+            self.assertEqual(run(s.args("move-old"))[0], 0)
+            p = os.path.join(s.old_dir, "cys_%s_x64.dmg" % OLD)
+            if corrupt:
+                self.flip(p)
+            before = s.tree()
+            rc, out = run(s.args("rollback"))
+            if not corrupt:
+                self.assertEqual(rc, 0, "control: " + out)
+                self.assertEqual(s.tree(), s.old_tree())
+                continue
+            self.assertEqual(rc, 3, out)
+            self.assertIn("cys_%s_x64.dmg" % OLD, out)
+            self.assertEqual(s.tree(), before, "rollback moved something although an old asset was changed")
+            self.assertTrue(os.path.isfile(p))
+
+
+class FolderOutsideDocrootTests(Base):
+    """F3 (codex r1), helper side: the folders rollback and move-old write into are checked against the docroot before the
+    first mkdir. The template checks the whole remote layout read-only before its first write; these are the second line."""
+
+    def refused(self, site, args, made):
+        before = site.tree()
+        rc, out = run(args)
+        self.assertEqual(rc, 3, out)
+        self.assertIn("G-outside", out)
+        self.assertEqual(site.tree(), before, "public tree changed")
+        if made:
+            self.assertFalse(os.path.exists(made), "%s was created inside the docroot" % made)
+
+    def test_rollback_trash_inside_the_docroot(self):
+        s = self.site
+        self.assertEqual(run(s.args("switch"))[0], 0)
+        inside = os.path.join(s.docroot, "cys-site-trash-" + s.ts)
+        self.refused(s, [inside if x == s.trash else x for x in s.args("rollback")], inside)
+        self.assertEqual(run(s.args("rollback"))[0], 0, "control: the same rollback with the trash outside")
+
+    def test_rollback_backup_inside_the_docroot(self):
+        s = self.site
+        self.assertEqual(run(s.args("switch"))[0], 0)
+        inside = os.path.join(s.docroot, "cys-site-backup-" + s.ts)
+        shutil.copytree(s.backup, inside)
+        self.refused(s, [inside if x == s.backup else x for x in s.args("rollback")], None)
+        self.assertEqual(run(s.args("rollback"))[0], 0, "control: the same rollback with the backup outside")
+
+    def test_rollback_old_assets_folder_inside_the_docroot(self):
+        s = self.site
+        self.assertEqual(run(s.args("switch"))[0], 0)
+        self.assertEqual(run(s.args("move-old"))[0], 0)
+        inside = os.path.join(s.docroot, "cys-site-backup-old-assets-" + s.ts)
+        os.rename(s.old_dir, inside)
+        spec = "%s=%s" % (OLD, s.old_dir)
+        self.refused(s, ["%s=%s" % (OLD, inside) if x == spec else x for x in s.args("rollback")], None)
+        os.rename(inside, s.old_dir)
+        self.assertEqual(run(s.args("rollback"))[0], 0, "control: the same rollback with the folder outside")
+        self.assertEqual(s.tree(), s.old_tree())
+
+    def test_move_old_destination_inside_the_docroot(self):
+        s = self.site
+        self.assertEqual(run(s.args("switch"))[0], 0)
+        inside = os.path.join(s.docroot, "cys-site-backup-old-assets-" + s.ts)
+        spec = "%s=%s" % (OLD, s.old_dir)
+        self.refused(s, ["%s=%s" % (OLD, inside) if x == spec else x for x in s.args("move-old")], inside)
+        self.assertEqual(run(s.args("move-old"))[0], 0, "control: the same move with the folder outside")
+        self.assertEqual(s.tree(), s.new_tree(old_moved=True))
 
 
 class AssetSetCouplingTests(unittest.TestCase):

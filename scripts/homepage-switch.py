@@ -21,7 +21,12 @@ Publication uses only two primitives (BAR B4):
 Order rule (DESIGN s6): a file flips only after every file it names or vouches for is already in place.
 
 Exit codes: 0 ok | 2 usage | 3 stopped before any public change | 4 stopped after a journaled prefix of moves |
-            5 public state not recognised (nothing moved by this call; read `status`, then `resume` or `rollback`).
+            5 public state not recognised, or a planned file no longer holds its target bytes, after this run already made a
+              public change (nothing moved by this call; read `status`, then `resume` or `rollback`).
+
+Content rule (codex r1 F1): an inode number says which name holds the planned file, not that its bytes are still the planned
+ones - an in-place write keeps the inode. Before any public move, every planned file is checked at its CURRENT location (staged
+copy, or the public name it already holds): regular file, sha256 == the plan's target, on the filesystem this call verified.
 
 Commands (all take --docroot/--stage etc. explicitly; nothing is read from the environment):
   preflight      read-only guards + moves stale staging folders to trash (G-outside, G-ts, G-dev, G-stale, G-disk)
@@ -69,6 +74,7 @@ DISK_MARGIN = 1.10
 LOOP_SIGNALS = ("SIGHUP", "SIGPIPE", "SIGINT", "SIGTERM")
 
 DONE, PENDING_UNLINK, TODO, ALREADY, UNKNOWN = "done", "pending-unlink", "todo", "already", "unknown"
+CHANGED = "changed"                         # the planned inode is where the plan expects it, but not the target bytes/filesystem
 
 
 class Stop(Exception):
@@ -276,9 +282,9 @@ def load_expect(path, ts=None):
 
 
 # ---------------------------------------------------------------------------------------------------------------- guards
-def guard_outside(stage, docroot):
+def guard_outside(stage, docroot, what="staging"):
     if _under(stage, docroot) or _under(docroot, stage):
-        raise Stop(STOP_CLEAN, "G-outside: staging %s overlaps the docroot %s" % (stage, docroot))
+        raise Stop(STOP_CLEAN, "G-outside: %s %s overlaps the docroot %s" % (what, stage, docroot))
 
 
 def guard_ts(stage, ts):
@@ -374,20 +380,31 @@ def forward_items(stage, ex):
     return items
 
 
-def classify(it, docroot, allow_already=False):
+def _holds_target(path, st, it, dev):
+    """The content rule at one location: regular file, on the filesystem this call verified, sha256 == the plan's target."""
+    return _is_reg(st) and (dev is None or st.st_dev == dev) and sha256_file(path) == it["target_sha"]
+
+
+def _published(it, docroot):
+    """Structural: the planned inode holds the public name, i.e. this run already changed that name (whatever its bytes)."""
+    st = _lstat(os.path.join(docroot, it["dst"]))
+    return _is_reg(st) and st.st_ino == it["src_ino"]
+
+
+def classify(it, docroot, allow_already=False, dev=None):
     dst, src = os.path.join(docroot, it["dst"]), it["src"]
     dst_st, src_st = _lstat(dst), _lstat(src)
     if dst_st is not None and dst_st.st_ino == it["src_ino"] and _is_reg(dst_st):
         if src_st is None:
-            return DONE
+            return DONE if _holds_target(dst, dst_st, it, dev) else CHANGED
         if src_st.st_ino == it["src_ino"]:
-            return PENDING_UNLINK            # killed between link and unlink: both names are the same inode
+            # killed between link and unlink: both names are the same inode
+            return PENDING_UNLINK if _holds_target(dst, dst_st, it, dev) else CHANGED
     if _is_reg(src_st) and src_st.st_ino == it["src_ino"]:
-        if it["kind"] == "create" and dst_st is None:
-            return TODO
-        if it["kind"] == "replace" and _is_reg(dst_st) and sha256_file(dst) == it["before_sha"]:
-            return TODO
-    if allow_already and _is_reg(dst_st) and sha256_file(dst) == it["target_sha"]:
+        if (it["kind"] == "create" and dst_st is None) or \
+                (it["kind"] == "replace" and _is_reg(dst_st) and sha256_file(dst) == it["before_sha"]):
+            return TODO if _holds_target(src, src_st, it, dev) else CHANGED
+    if allow_already and _holds_target(dst, dst_st, it, dev):
         return ALREADY
     return UNKNOWN
 
@@ -406,13 +423,22 @@ def _restore_signals(saved):
         signal.signal(sig, old)
 
 
-def execute(items, docroot, journal, allow_already=False, label="switch"):
+def execute(items, docroot, journal, allow_already=False, label="switch", dev=None):
     """Run the planned moves in order. Idempotent: a second call after a kill finishes what is left (resume)."""
-    states = [classify(it, docroot, allow_already) for it in items]
-    ours = [s in (DONE, PENDING_UNLINK) for s in states]
-    if UNKNOWN in states:
-        bad = [items[i]["dst"] for i, s in enumerate(states) if s == UNKNOWN]
-        raise Stop(STOP_UNKNOWN if any(ours) else STOP_CLEAN, "%s: public state not recognised for %s" % (label, bad))
+    states = [classify(it, docroot, allow_already, dev) for it in items]
+    ours = [_published(it, docroot) for it in items]   # a published file changed in place later is still this run's change
+    unknown = [it["dst"] for it, s in zip(items, states) if s == UNKNOWN]
+    # where the bytes were checked: the public name when the planned inode holds it, else the staged (or rollback) copy
+    changed = ["%s at %s" % (it["dst"], os.path.join(docroot, it["dst"]) if o else it["src"])
+               for it, s, o in zip(items, states, ours) if s == CHANGED]
+    if unknown or changed:
+        why = []
+        if unknown:
+            why.append("public state not recognised for %s" % unknown)
+        if changed:
+            why.append("the planned file no longer holds its target sha256 (or not a regular file on this filesystem) for %s"
+                       % changed)
+        raise Stop(STOP_UNKNOWN if any(ours) else STOP_CLEAN, "%s: %s - nothing moved" % (label, "; ".join(why)))
     first_todo = next((i for i, s in enumerate(states) if s in (TODO, PENDING_UNLINK)), None)
     if first_todo is not None and any(states[j] == DONE for j in range(first_todo + 1, len(states))):
         raise Stop(STOP_UNKNOWN, "%s: moves done out of order - the journaled prefix is broken" % label)
@@ -451,7 +477,7 @@ def execute(items, docroot, journal, allow_already=False, label="switch"):
         journal.add(ev="end", label=label, moved=moved)
     finally:
         _restore_signals(saved)
-    final = [classify(it, docroot, allow_already) for it in items]
+    final = [classify(it, docroot, allow_already, dev) for it in items]
     if any(s not in (DONE, ALREADY) for s in final):
         raise Stop(STOP_PARTIAL, "%s: after the loop not every move is done: %s" % (label, final))
     return {"moved": moved, "states": final}
@@ -613,7 +639,8 @@ def cmd_switch(a):
     ex = load_expect(os.path.join(stage, "expect.json"), a.ts)
     guard_ts(stage, a.ts)
     guard_outside(stage, docroot)
-    guard_dev([os.path.join(stage, "downloads"), os.path.join(stage, "pages"), docroot, os.path.join(docroot, "downloads")])
+    dev = guard_dev([os.path.join(stage, "downloads"), os.path.join(stage, "pages"), docroot,
+                     os.path.join(docroot, "downloads")])
     plan_path = os.path.join(stage, "plan.json")
     if os.path.exists(plan_path):
         plan = _load_json(plan_path, "plan.json")
@@ -624,7 +651,7 @@ def cmd_switch(a):
         pages = _load_json(os.path.join(stage, "pages.json"), "pages.json")
         items = build_forward_plan(stage, docroot, a.backup, ex, pages)
         _write_json_atomic(plan_path, {"ts": a.ts, "items": items})
-    r = execute(items, docroot, Journal(os.path.join(stage, "journal.jsonl")), label="switch")
+    r = execute(items, docroot, Journal(os.path.join(stage, "journal.jsonl")), label="switch", dev=dev)
     return {"ok": True, "moved": r["moved"], "items": len(items)}
 
 
@@ -640,7 +667,11 @@ def cmd_status(a):
     out["plan"] = os.path.exists(plan_path)               # the template's --resume reads this to skip steps 2-4
     if os.path.exists(plan_path) and a.docroot:
         items = _load_json(plan_path, "plan.json")["items"]
-        out["states"] = dict((it["dst"], classify(it, a.docroot, a.allow_already)) for it in items)
+        try:
+            dev = _st_dev(os.path.join(a.docroot, "downloads"))
+        except OSError:
+            dev = None
+        out["states"] = dict((it["dst"], classify(it, a.docroot, a.allow_already, dev)) for it in items)
     return out
 
 
@@ -686,6 +717,7 @@ def cmd_move_old(a):
         ver, _, dest = spec.partition("=")
         if not ver or not dest:
             raise Stop(USAGE, "--move wants VER=DIR")
+        guard_outside(dest, a.docroot, "old-assets folder")       # moved out of public means out of the docroot
         if not os.path.isdir(dest):
             os.makedirs(dest)
         guard_dev([dl, dest])
@@ -723,27 +755,43 @@ def cmd_rollback(a):
     pages = _load_json(os.path.join(a.stage, "pages.json"), "pages.json")
     guard_ts(rb, a.ts)
     guard_outside(rb, docroot)
+    guard_outside(bk, docroot, "backup")
+    guard_outside(a.trash, docroot, "trash")                     # checked before the makedirs below writes anything
     for sub in ("downloads", "pages"):
         p = os.path.join(rb, sub)
         if not os.path.isdir(p):
             os.makedirs(p)
     if not os.path.isdir(a.trash):
         os.makedirs(a.trash)
-    guard_dev([os.path.join(rb, "downloads"), os.path.join(rb, "pages"), docroot, os.path.join(docroot, "downloads"),
-               bk, a.trash])
+    dev = guard_dev([os.path.join(rb, "downloads"), os.path.join(rb, "pages"), docroot, os.path.join(docroot, "downloads"),
+                     bk, a.trash])
     journal = Journal(os.path.join(rb, "journal.jsonl"))
     dl = os.path.join(docroot, "downloads")
-    # 1. old versioned files back first (the old pages that step 3 restores link them)
-    back = 0
+    # 1. old versioned files back first (the old pages that step 3 restores link them). Every folder is checked before the
+    #    first link: the old version's files must still be the bytes the old SUMS (the backup copy) lists - the same content
+    #    rule as the planned moves. A stale older version has no SUMS line to check against (limit: moved back as found).
+    pairs, old_tab = [], None
     for spec in a.old_back or []:
         ver, _, src_dir = spec.partition("=")
         if not ver or not src_dir:
             raise Stop(USAGE, "--old-back wants VER=DIR")
         if not os.path.isdir(src_dir):
             continue                                   # step 5 never ran for this version
+        guard_outside(src_dir, docroot, "old-assets folder")
         guard_dev([src_dir, dl])
         names = _versioned_in(src_dir, ver)
-        back += move_files([(os.path.join(src_dir, n), os.path.join(dl, n)) for n in names], journal, "rollback-old-back")
+        if ver == ex["old_ver"] and names:
+            if old_tab is None:
+                try:
+                    old_tab = sums_table(_read_text(os.path.join(bk, "downloads", SUMS_NAME)))
+                except OSError as e:
+                    raise Stop(STOP_CLEAN, "rollback-old-back: backup SUMS unreadable: %s" % e)
+            bad = [n for n in names if old_tab.get(n) != sha256_file(os.path.join(src_dir, n))]
+            if bad:
+                raise Stop(STOP_CLEAN, "rollback-old-back: %s in %s are not the bytes the old SUMS lists - nothing moved"
+                           % (bad, src_dir))
+        pairs += [(os.path.join(src_dir, n), os.path.join(dl, n)) for n in names]
+    back = move_files(pairs, journal, "rollback-old-back")
     # 2. rollback staging = verified copies of the backup
     plan_path = os.path.join(rb, "plan.json")
     if os.path.exists(plan_path):
@@ -776,7 +824,7 @@ def cmd_rollback(a):
             it["src_ino"] = os.lstat(it["src"]).st_ino
         _write_json_atomic(plan_path, {"ts": a.ts, "items": items})
     # 3. the version-less set, SUMS and the pages back to the old bytes, same order rule as forward
-    r = execute(items, docroot, journal, allow_already=True, label="rollback")
+    r = execute(items, docroot, journal, allow_already=True, label="rollback", dev=dev)
     # 4. the new versioned names out (no live page links them any more)
     out_dir = os.path.join(a.trash, "rolled-back-new-assets")
     if not os.path.isdir(out_dir):
