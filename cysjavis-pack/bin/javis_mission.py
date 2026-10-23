@@ -1443,8 +1443,15 @@ def _capped_recent(delivery):
 
 # 괄호 붙여넣기 봉투 표지 — 정의처는 `src/paste_fence.rs`(OPEN·CLOSE)이고 여기는 그 **사본**이다.
 # 7비트 형만 둔다: 주입기(`cys.rs::inject_text` → `paste_fence::wrap`)가 쓰는 것이 이 둘이다.
-_FENCE_OPEN = "\x1b[200~"
-_FENCE_CLOSE = "\x1b[201~"
+#
+# ★왜 공개 이름인가(사본의 조용한 분화 차단 · R2-1): 사본은 그냥 두면 `paste_fence::OPEN` 이 바뀐 날
+#   Rust 는 계속 맞고 python 만 틀리는데 **아무 검체도 적색이 되지 않는다**. 그래서 이 두 값을 공유
+#   코퍼스의 `$constants` 에 싣고 양쪽이 각자 자기 값과 대조한다 — Rust 는 코퍼스 값을
+#   `crate::paste_fence::{OPEN,CLOSE}` 와, python 은 코퍼스 값을 이 상수와 비교하므로, 두 대조가
+#   함께 통과할 때만 `python == paste_fence` 가 성립한다(기존 수치 상수들과 같은 기제).
+#   `$constants` 파리티는 이름으로 키를 잡으므로 밑줄 접두(비공개) 이름이면 실을 수 없다.
+FENCE_OPEN = "\x1b[200~"
+FENCE_CLOSE = "\x1b[201~"
 
 
 def _framed_candidates(norm):
@@ -1454,10 +1461,10 @@ def _framed_candidates(norm):
     양옆을 잡아 같은 공백이 **한 칸으로 접힌다**. (앞 0|1) × (뒤 0|1) = 4 가 전수다.
     """
     return (
-        _FENCE_OPEN + norm + _FENCE_CLOSE,
-        _FENCE_OPEN + norm + " " + _FENCE_CLOSE,
-        _FENCE_OPEN + " " + norm + _FENCE_CLOSE,
-        _FENCE_OPEN + " " + norm + " " + _FENCE_CLOSE,
+        FENCE_OPEN + norm + FENCE_CLOSE,
+        FENCE_OPEN + norm + " " + FENCE_CLOSE,
+        FENCE_OPEN + " " + norm + FENCE_CLOSE,
+        FENCE_OPEN + " " + norm + " " + FENCE_CLOSE,
     )
 
 
@@ -1488,7 +1495,7 @@ def _framed_match(norm, delivery):
     framed = False
     for meta in (delivery or {}).values():
         prev = meta.get("preview") if isinstance(meta, dict) else None
-        if isinstance(prev, str) and prev.startswith(_FENCE_OPEN):
+        if isinstance(prev, str) and prev.startswith(FENCE_OPEN):
             framed = True
             break
     if not framed:
@@ -2734,7 +2741,9 @@ def _selftest_mission_corpus(fails):
                 "DELIVERY_SPAN_OCC_BUDGET": DELIVERY_SPAN_OCC_BUDGET,
                 "DELIVERY_CAPPED_FOLD_S": DELIVERY_CAPPED_FOLD_S,
                 "DELIVERY_SCAN_LINES": DELIVERY_SCAN_LINES,
-                "LEDGER_MAX_READ_BYTES": LEDGER_MAX_READ_BYTES}
+                "LEDGER_MAX_READ_BYTES": LEDGER_MAX_READ_BYTES,
+                # 봉투 표지 — 값이 `src/paste_fence.rs` 와 갈리면 층1 ⓐ′ 가 조용히 죽는다(R2-1).
+                "FENCE_OPEN": FENCE_OPEN, "FENCE_CLOSE": FENCE_CLOSE}
         for k, v in sorted(live.items()):
             if k in consts and consts[k] != v:
                 fails.append("mission-origin-corpus $constants/%s 파리티 이탈: fixture=%r 코드=%r"

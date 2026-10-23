@@ -157,6 +157,9 @@ LIVE_CONSTS = {
     "LEDGER_MAX_READ_BYTES": jm.LEDGER_MAX_READ_BYTES,
     "DELIVERY_WINDOW_S_DEFAULT": jm.DELIVERY_WINDOW_S,
     "MISSION_TTL_S_DEFAULT": jm.MISSION_TTL_S,
+    # 봉투 표지(R2-1) — 이 두 줄이 빠지면 4b(미지 키 0)가 fixture 를 거부한다. 값의 정의처는
+    # src/paste_fence.rs 이고 Rust 쪽 대조는 mission_gate 의 상수 검체가 든다.
+    "FENCE_OPEN": jm.FENCE_OPEN, "FENCE_CLOSE": jm.FENCE_CLOSE,
 }
 bad = {k: (data["$constants"].get(k), v) for k, v in LIVE_CONSTS.items()
        if data["$constants"].get(k) != v}
