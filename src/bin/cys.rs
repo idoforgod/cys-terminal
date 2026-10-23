@@ -24961,7 +24961,8 @@ struct PendingConsumeReport {
 /// ★(B-428) Every inject here is preceded by a durable, non-retryable record of it: a deferred node's intent (an unknown
 ///   entry without a request id, which also takes the seat off `deferred`), or — for an unknown entry's one re-inject —
 ///   that entry written again. If it cannot be written the inject is refused, not attempted (`intent_refused`). A failed
-///   final rewrite no longer discards the report (`persist_error`): the result is always `Ok`.
+///   final rewrite no longer discards the report (`persist_error`): the result is always `Ok`. A deferred node typed
+///   (PASSED) whose mark fails keeps its intent as a NEW unknown (R1-1) - no longer the "마크 실패→pending 잔존" retry above.
 #[allow(clippy::too_many_arguments)]
 fn consume_reinject_pending_core(
     base: &std::path::Path,
@@ -25182,7 +25183,8 @@ fn consume_reinject_pending_core(
             ReinjectDecision::Inject => {
                 // ★(B-428) the durable, non-retryable intent BEFORE the write (it also takes the seat off `deferred` on
                 //   disk); if it cannot be written, nothing is typed: the node stays an ordinary deferred retry. Once the
-                //   outcome is known (PASSED, REFUSED), the final rewrite below leaves it out; an UNKNOWN keeps it.
+                //   outcome is known (PASSED and marked, REFUSED), the final rewrite below leaves it out; an UNKNOWN, or a
+                //   PASSED write whose mark fails (R1-1), keeps it.
                 let intent = ReinjectUnknownEntry::intent(*sid, role, &directive, here);
                 if let Err(w) = record_reinject_unknown(base, pending_ver, &intent) {
                     eprintln!(
@@ -25219,8 +25221,17 @@ fn consume_reinject_pending_core(
                     unknown_out.push(entry);
                     continue;
                 }
-                if mark(*sid, pending_ver, &new_hash).is_err() {
-                    kept.push((*sid, role.clone()));
+                if let Err(e) = mark(*sid, pending_ver, &new_hash) {
+                    // ★(B-428 · R1-1) typed (PASSED) but not marked: the ordinary retry list would type it a second time
+                    //   — the intent stays and the seat is UNKNOWN (a presence ping next pass), the Absent branch's rule
+                    eprintln!(
+                        "[pack-update] ⚠ pending surface {sid} ({role}): re-injected but reinject.mark failed ({e}) — kept \
+                         UNKNOWN so the next pass checks it (no blind second copy)"
+                    );
+                    rep.unknown += 1;
+                    rep.unknown_new += 1;
+                    rep.unknown_nodes.push((*sid, role.clone()));
+                    unknown_out.push(intent);
                     continue;
                 }
                 rep.resolved += 1;
@@ -50130,6 +50141,45 @@ mod b360_tests {
         }
         if (pass.unknown, pass.unknown_new, pass.kept) != (1, 0, 1) {
             failures.push(format!("the seat is not kept UNKNOWN and deferred as it was: {pass:?}"));
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// R1-1 (head ruling: fixed in WP6) · a deferred node whose inject PASSES while `reinject.mark` fails WAS typed: the
+    /// pass keeps it UNKNOWN (its intent stays on disk, as the `Absent` branch keeps a carried entry on a failed mark),
+    /// never back on the ordinary retry list. The next pass checks the seat with a presence ping and types nothing unless
+    /// the seat affirmatively lacks the directive. Failure direction: a node that was NOT typed still retries as before
+    /// (REFUSED: b428_p4; intent refused: b428_p3; busy: Defer). RED on 41fa0728: kept as deferred, typed again in pass 2.
+    #[cfg(unix)]
+    #[test]
+    fn b428_p7_a_deferred_inject_that_passed_with_a_failed_mark_is_kept_unknown_and_never_retyped() {
+        let pack = R2cPack::new();
+        let ctl = r2p_ctl(r2c_ok(json!({})), R2pPing::NoTrace, false);
+        let daemon = r2p_daemon(ctl, r2p_session(&pack));
+        let (first, unknown_after_first, deferred_after_first, second) = r2c_in_env(&daemon, &pack, || {
+            persist_reinject_pending(&pack.dir, "9.9.9", &[(7, "worker".to_string())]).unwrap();
+            let first = consume_reinject_pending(&pack.dir).expect("pass 1");
+            let (unknown, deferred) = (r2p_unknown_entries(&pack.dir), r2p_deferred_entries(&pack.dir));
+            (first, unknown, deferred, consume_reinject_pending(&pack.dir).expect("pass 2"))
+        });
+        let (directives, pings) = r2p_pastes(&daemon.calls());
+        let mut failures = Vec::new();
+        if (directives, pings) != (1, 1) {
+            failures.push(format!("directives {directives} pings {pings} over two passes, want 1 typed + 1 presence ping (no blind retype)"));
+        }
+        if (first.unknown, first.unknown_new, first.kept, first.resolved) != (1, 1, 0, 0)
+            || first.unknown_nodes != vec![(7, "worker".to_string())]
+        {
+            failures.push(format!("pass 1 does not keep the typed-but-unmarked node as a NEW unknown, named: {first:?}"));
+        }
+        if pending_pass_exit_code(&first) != cys::pack::EXIT_REINJECT_DEGRADED {
+            failures.push(format!("pass 1 exit {} (want degraded): {first:?}", pending_pass_exit_code(&first)));
+        }
+        if unknown_after_first.len() != 1 || unknown_after_first[0]["surface_id"] != 7 || !deferred_after_first.is_empty() {
+            failures.push(format!("file after pass 1: unknown {unknown_after_first:?} deferred {deferred_after_first:?} (want UNKNOWN only)"));
+        }
+        if (second.unknown, second.unknown_new, second.kept) != (1, 0, 0) {
+            failures.push(format!("pass 2 does not carry it UNKNOWN (undetermined, nothing new): {second:?}"));
         }
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
