@@ -1581,6 +1581,83 @@ fn capped_recent(delivery: &DeliveryMap) -> Option<String> {
     ))
 }
 
+/// 주입기가 씌운 **괄호 붙여넣기 봉투**(`ESC[200~ … ESC[201~`)를 되씌워 원장 키를 복원한다 —
+/// 일치하면 `(sha, 레코드)`.
+///
+/// ## 왜 필요한가 (B-443 실측 · 자기인가 경로)
+/// 훅이 보는 프롬프트는 봉투 **안쪽**이고(TUI 가 봉투를 벗겨 붙여넣기로 소비한다), 원장에 남은
+/// 본문은 **봉투째**다. CLI 주입 경로가 `paste_fence::wrap` 으로 감싼 뒤 `surface.send_text` 를
+/// 부르고(`bin/cys.rs::inject_text`), 데몬은 **받은 그 바이트**를 주입 전에 선기록하기 때문이다
+/// (`bin/cysd/handlers.rs` send_text 의 `record_audited*`). 그래서 ⓐ전문 해시가 **구조적으로**
+/// 어긋난다. 2026-10-23 06:54:30 +0700 dept-6 실측(살아 있는 원장 19593번째 줄):
+///   · 행 `surface=23 chars=122 units=1 from_label=cli:inject`
+///     `sha256=1abe408f75d167b833b88ae86251f699cb8f446aca7c1e6869dcea77059e1049`
+///     = `digest_normalized(normalize(OPEN + 각성핑 + CLOSE))`
+///   · 훅이 계산하는 `digest_text(각성핑)` = `503dccea…` 는 원장에 **없다**(차 12자 = 표지 2개)
+///   · 그래서 층1 전건 미스 → 핑은 `[` 로 시작하지 않아 층2 도 통과 → 1.3초 뒤 임무 대장에
+///     「잔여문 110자 — 오너 임무로 인정」으로 적혔다(기계 핑이 오너 임무가 되는 자기인가).
+/// 같은 아침 9개 레인 중 6개(base·dept-1·2·3·4·6)가 그 상태였다.
+///
+/// ★**왜 멀티라인 주입은 이 결함을 안 드러냈는가**(범위의 정의): 데몬은 제출 단위 조각도 같이
+/// 기록하고(delivery.rs R6), 봉투는 **첫 조각과 마지막 조각에만** 붙는다 — 가운데 조각은 평문
+/// 그대로라 ⓒ부분 포함([`composition`])이 잡는다. 즉 드러나는 모집단은 **봉투가 곧 전부인 배달**
+/// (단일 제출 단위 · 가운데 조각이 [`DELIVERY_PART_MIN_CHARS`] 미만인 짧은 행들)이다.
+///
+/// ## 증거 등급은 내려가지 않는다
+/// 이것은 문안 추정이 아니라 **해시 동등**이다. 봉투를 되씌운 문자열의 sha256 이 원장 키와 같다는
+/// 사실은 "데몬이 이 pane 에 주입한 바로 그 바이트"를 ⓐ와 **똑같은 등급으로** 증명한다(평문 근거
+/// 규칙인 [`prompt_within_delivery`] 와 달리 등급 하락이 없다).
+///
+/// ★`sanitize` 를 다시 걸지 않는 이유: 원장 본문은 `OPEN + sanitize(body) + CLOSE` 이고 TUI 가
+/// 받는 것은 그 `sanitize(body)` 다 — 즉 **프롬프트가 이미 살균 결과**이고 `sanitize` 는 멱등이라
+/// ([`crate::paste_fence`] 모듈 문서 '결과 성질') 되씌움은 표지 두 개를 붙이는 것으로 끝난다.
+///
+/// ## 공백 4변형이 **전수**인 이유
+/// [`normalize`] 는 앞뒤 공백을 버리지만, 봉투 안에서는 표지가 양옆을 잡고 있어 같은 공백이
+/// **한 칸으로 접힌다**. 그래서 본문 앞뒤에 공백이 있었거나(예: 끝의 개행) 수신 앱이 그 공백을
+/// 떼면 원장 키는 `OPEN·[한 칸]·본문·[한 칸]·CLOSE` 가 된다. 공백은 몇 개여도 한 칸으로 접히므로
+/// 변형은 (앞 0|1) × (뒤 0|1) = **4가지가 전부**다. 본문이 전부 공백인 경우는 프롬프트가 비어
+/// [`record_fold`] 가 먼저 접는다.
+///
+/// ## 비용
+/// 봉투로 시작하는 `preview` 가 **하나도 없으면 해시를 한 번도 계산하지 않는다**(평시 경로 0회).
+/// 있으면 최대 4회이며 각 회는 프롬프트 길이에 선형이다. 전제는 `preview` 를 싣는 v1 행이다 —
+/// preview 가 없는 미지 스키마 행은 어차피 `ledger_schema_skew` 로 판독이 접힌다.
+fn framed_match<'a>(norm_s: &str, delivery: &'a DeliveryMap) -> Option<(String, &'a DeliveryMeta)> {
+    let framed_present = delivery
+        .iter()
+        .any(|(_, m)| m.preview.as_deref().is_some_and(|p| p.starts_with(crate::paste_fence::OPEN)));
+    if !framed_present {
+        return None;
+    }
+    for cand in framed_candidates(norm_s) {
+        let sha = digest_normalized(&cand);
+        if let Some(meta) = delivery.get(&sha) {
+            return Some((sha, meta));
+        }
+    }
+    None
+}
+
+/// 봉투 복원 후보 4종(위 [`framed_match`] 의 '공백 4변형' — 흔한 것부터).
+///
+/// 입력은 **이미 정규화된** 프롬프트이며 표지·한 칸 공백은 정규화를 깨지 않으므로, 결과는 모두
+/// 이미 정규화된 문자열이다([`digest_normalized`] 의 전제).
+fn framed_candidates(norm_s: &str) -> [String; 4] {
+    use crate::paste_fence::{CLOSE, OPEN};
+    [
+        format!("{OPEN}{norm_s}{CLOSE}"),
+        format!("{OPEN}{norm_s} {CLOSE}"),
+        format!("{OPEN} {norm_s}{CLOSE}"),
+        format!("{OPEN} {norm_s} {CLOSE}"),
+    ]
+}
+
+/// 봉투 복원으로 잡았을 때 사유에 덧붙이는 고지(진단 전용 · 판정 입력 아님).
+const FRAMED_NOTE: &str =
+    " ★주입기 봉투(ESC[200~…ESC[201~)를 되씌워 복원한 키다 — 원장 본문은 봉투째이고 \
+     이 pane 이 제출한 것은 봉투 안쪽이다(해시 동등 · B-443)";
+
 /// [`machine_origin`] 의 결과.
 pub struct OriginVerdict {
     /// 기계 채널로 왔는가.
@@ -1602,8 +1679,9 @@ pub struct OriginVerdict {
 /// 판별은 2층이며 **층1이 정답**이다:
 ///   층1 배달 원장 대조 — 데몬이 주입 직전 남긴 해시와 일치하면 기계 유래가 **확정**된다.
 ///     라벨 유무·문안 규약과 무관하므로 **문안 규약을 우회하는 push** 도 잡는다.
-///     ⓐ전문 일치 ⓑ창 밖 전문 일치 ⓒ조각 연접·부분 포함 ⓓ제출 단위 조각과의 전문 일치
-///     ⓔ역포함(구 데몬 스큐 · 평문 근거) ⓕ탐색 예산 소진 ⓖ조각 상한 초과 배달 직후.
+///     ⓐ전문 일치 ⓐ′**주입기 봉투 복원 일치**([`framed_match`] · 원장 본문은 봉투째인데 제출된
+///     것은 봉투 안쪽인 경로 · B-443) ⓑ창 밖 전문 일치 ⓒ조각 연접·부분 포함 ⓓ제출 단위 조각과의
+///     전문 일치 ⓔ역포함(구 데몬 스큐 · 평문 근거) ⓕ탐색 예산 소진 ⓖ조각 상한 초과 배달 직후.
 ///   층2 push 규약 라벨 — 원장이 없거나 판독 불가일 때의 폴백. 여기서만 문자열에 의존한다.
 ///
 /// ★한 방향으로만 공격적이다: 어느 층이든 걸리면 기계로 접는다. 거짓 양성(기계→임무)은
@@ -1624,9 +1702,17 @@ pub fn machine_origin(
     let mut anomalies: Vec<(String, String)> = Vec::new();
     if ledger_status == LedgerStatus::Ok && !delivery.is_empty() {
         let norm_s = normalize(prompt);
-        let sha = digest_normalized(&norm_s);
-        if let Some(meta) = delivery.get(&sha) {
+        let plain = digest_normalized(&norm_s);
+        // ⓐ 전문 일치 → 미스면 ⓐ′ **주입기 봉투 복원** 일치([`framed_match`] · B-443). 둘은 같은
+        // 증거 등급(해시 동등)이라 아래 두 분기(창 안·창 밖)를 **그대로** 공유한다 — 분기를 복제하면
+        // 한쪽만 고쳐지는 날이 온다.
+        let hit = match delivery.get(&plain) {
+            Some(meta) => Some((plain, meta, false)),
+            None => framed_match(&norm_s, delivery).map(|(s, m)| (s, m, true)),
+        };
+        if let Some((sha, meta, framed)) = hit {
             let head: String = sha.chars().take(12).collect();
+            let framing = if framed { FRAMED_NOTE } else { "" };
             if meta.stale {
                 // ★R5 봉합 ①: 창 밖 일치는 **접되 반드시 흔적을 남긴다**. 접는 근거는 "sha 가
                 //   같다"는 기계 사실이고 창은 성능·회전 경계일 뿐이다. 다만 창을 넘겼다는 것은
@@ -1651,7 +1737,7 @@ pub fn machine_origin(
             layer: Some(1),
                     reason: format!(
                         "배달 원장 일치(**창 밖** · 지연 {:.1}h · sha256={head}…) — 창을 넘겼어도 \
-                         해시가 같으면 데몬이 이 pane 에 주입한 그 문장이다",
+                         해시가 같으면 데몬이 이 pane 에 주입한 그 문장이다{framing}",
                         meta.age / 3600.0
                     ),
                     anomalies,
@@ -1662,7 +1748,7 @@ pub fn machine_origin(
             layer: Some(1),
                 reason: format!(
                     "배달 원장 일치(sha256={head}… origin=daemon) — 데몬이 이 pane 에 주입한 \
-                     바로 그 문장이다"
+                     바로 그 문장이다{framing}"
                 ),
                 anomalies,
             };
@@ -3205,4 +3291,218 @@ mod tests {
         }
     }
 
+    // ══════════════════════════════════════════════════════════════════════════
+    // B-443 — 주입기 봉투(bracketed paste)가 씌워진 배달의 층1 대조
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /// ★B-443 실측 원장 행 — 살아 있는 dept-6 원장
+    /// `~/.cys/state/delivery-Users_cys_.local_state_cys-dept-dept-6_cys.sock.jsonl` 의 19593번째
+    /// 줄을 **바이트 그대로** 싣는다(읽기 전용 복사 · 손으로 지은 줄이 아니다). 사본은
+    /// `_evidence/dept5-0.14.53-wp9-missionping-20261023/fixtures/` 에 있다.
+    const REAL_PING_ROW: &str = r#"{"chars":122,"from":null,"from_label":"cli:inject","origin":"send","preview":"\u001b[200~지침 각성 확인 핑: 너의 절대지침(디렉티브)이 컨텍스트에 살아있다면, 다음 두 토큰을 공백 없이 이어붙","sha256":"1abe408f75d167b833b88ae86251f699cb8f446aca7c1e6869dcea77059e1049","surface":"23","ts":"2026-10-22T23:54:30Z","ts_epoch":1792713270.168418,"units":1,"v":1}"#;
+
+    /// 그 행이 가리키는 **실제 프롬프트** — 같은 레인의 임무 대장
+    /// `~/.cys/state/mission-…dept-6….json` 에 `mission` 으로 남은 문안(nonce 25494152 포함)이다.
+    /// 즉 "원장 행"과 "그때 제출된 프롬프트"가 같은 사건의 두 기록이다.
+    const REAL_PING_PROMPT: &str = "지침 각성 확인 핑: 너의 절대지침(디렉티브)이 컨텍스트에 살아있다면, 다음 두 토큰을 공백 없이 이어붙인 한 줄을 plain으로 출력하라: 'DIRECTIVE-ACK-' 그리고 '25494152'";
+
+    /// 원장 행의 배달 시각(epoch) — 임무 기록은 1.313초 뒤였다(`ts_epoch` 1792713271.481735).
+    const REAL_PING_TS: f64 = 1792713270.168418;
+
+    fn real_ping_read(now: f64) -> DeliveryRead {
+        read_delivery(&LedgerInput {
+            main: &LedgerFile::Content(format!("{REAL_PING_ROW}
+")),
+            rotated: &LedgerFile::Missing,
+            daemon_epoch: None,
+            me: "23",
+            now,
+            window_s: delivery_window_s(),
+            path_label: "(B-443 실측 행)",
+        })
+    }
+
+    /// ★H-MISSION-R4-b(B-443): **기계 각성 핑이 오너 임무로 기록되던 경로**가 닫혔는가.
+    ///
+    /// 검체는 추론이 아니라 두 실측 기록의 대조다 — 원장 행([`REAL_PING_ROW`])과 그 1.3초 뒤
+    /// 임무 대장에 적힌 프롬프트([`REAL_PING_PROMPT`]). 먼저 **기제**를 핀하고(훅이 계산하는 키는
+    /// 원장에 없고, 원장 키는 봉투째 본문의 해시다) 그 다음 판정을 단언한다 — 판정만 보면 다음
+    /// 사람이 "무엇이 왜 어긋났는지" 를 이 검체에서 읽을 수 없다.
+    #[test]
+    fn layer1_folds_the_real_bracketed_paste_ping_from_the_live_ledger_row() {
+        let row: serde_json::Value = serde_json::from_str(REAL_PING_ROW).expect("실측 행 판독");
+        let row_sha = row["sha256"].as_str().expect("sha256");
+
+        // ① 기제 — 훅이 계산하는 키(평문 해시)는 원장에 **없다**.
+        let plain = digest_text(REAL_PING_PROMPT);
+        assert_ne!(
+            plain, row_sha,
+            "전제 붕괴: 평문 해시가 원장 키와 같다 — 이 검체가 재는 결함이 아니다"
+        );
+        // ② 기제 — 원장 키는 **봉투째** 본문의 해시다(주입기가 씌운 그 봉투).
+        assert_eq!(
+            digest_text(&crate::paste_fence::wrap(REAL_PING_PROMPT)),
+            row_sha,
+            "원장 키가 봉투째 해시가 아니다 — 주입 경로의 전제가 바뀌었다"
+        );
+        // ③ 기제 — 글자 수 차이는 정확히 표지 두 개(6자 + 6자)다.
+        let n_plain = normalize(REAL_PING_PROMPT).chars().count();
+        assert_eq!(n_plain, 110, "실측 잔여문 110자와 다르다");
+        assert_eq!(row["chars"].as_i64(), Some(122), "실측 원장 122자와 다르다");
+        assert_eq!(122 - n_plain, crate::paste_fence::OPEN.len() + crate::paste_fence::CLOSE.len());
+
+        // ④ 판정 — 배달 1.3초 뒤(실제 간격)에 그 프롬프트가 제출됐다.
+        let read = real_ping_read(REAL_PING_TS + 1.313);
+        assert_eq!(read.status, LedgerStatus::Ok, "원장 판독 실패: {}", read.detail);
+        let v = machine_origin(REAL_PING_PROMPT, &read.map, read.status);
+        assert!(
+            v.machine,
+            "기계 각성 핑이 기계로 접히지 않았다(= 오너 임무로 기록된다) — reason={:?}",
+            v.reason
+        );
+        assert_eq!(v.layer, Some(1), "층1(원장)이 아니라 다른 층이 잡았다: {v:?}", v = v.layer);
+        assert!(v.reason.contains("봉투"), "사유가 봉투 복원을 밝히지 않는다: {:?}", v.reason);
+
+        // ⑤ 그래서 **대장에 아무것도 쓰이지 않는다** — 권한 발급(ⓐ)이 차단된다.
+        let d = record_fold_from_origin(REAL_PING_PROMPT, &v, &live_ledger("기존 오너 임무"), &read.anomalies);
+        assert!(
+            matches!(d.fold, RecordFold::MachineOrigin(_)),
+            "폴드가 기계 유래가 아니다: {:?}",
+            d.fold
+        );
+        assert!(
+            !matches!(d.plan, LedgerPlan::Write { .. }),
+            "기계 핑이 대장에 기록된다: {:?}",
+            d.plan
+        );
+    }
+
+    /// ★H-MISSION-R4-c(B-443 음성 대조): 봉투 행이 원장에 있어도 **오너가 친 줄은 임무로 남는다**.
+    ///
+    /// 이 검체가 지키는 값은 반대 방향이다 — 봉투 수리가 조금이라도 넓게 걸리면 오너 지시가
+    /// 기계로 접혀 부재중 자율 진행이 통째로 멈춘다(모듈 문서의 '후자가 훨씬 비싸다').
+    #[test]
+    fn an_owner_typed_line_stays_an_owner_mission_while_a_framed_row_sits_in_the_ledger() {
+        let read = real_ping_read(REAL_PING_TS + 1.313);
+        let owner = "0.14.53 릴리스까지 완주하고 결과만 보고하라";
+        let v = machine_origin(owner, &read.map, read.status);
+        assert!(!v.machine, "오너 문장이 기계로 접혔다 — reason={:?}", v.reason);
+        assert_eq!(v.layer, None, "접히지 않았는데 층이 붙었다: {:?}", v.layer);
+
+        let d = record_fold_from_origin(owner, &v, &LedgerRead::Absent, &read.anomalies);
+        match &d.plan {
+            LedgerPlan::Write { mission: Some(m), source, .. } => {
+                assert_eq!(*source, SOURCE_PROMPT);
+                assert!(m.contains("릴리스"), "임무 문안이 잘렸다: {m:?}");
+            }
+            other => panic!("오너 임무가 대장에 쓰이지 않는다: {other:?}"),
+        }
+    }
+
+    /// ★H-MISSION-R4-d(B-443): 봉투 복원 후보 **4종이 전수**임을 공백 변형으로 전부 돌려 확인한다.
+    ///
+    /// 왜 4종인가 — [`normalize`] 는 앞뒤 공백을 버리지만 봉투 안에서는 표지가 양옆을 잡아 같은
+    /// 공백이 한 칸으로 접힌다. 그래서 본문 앞뒤 공백(흔한 것은 **끝의 개행**)이나 수신 앱의
+    /// 공백 제거가 원장 키를 `OPEN·[한 칸]·본문·[한 칸]·CLOSE` 로 만든다.
+    ///
+    /// 원장 행은 **생산 산식으로** 만든다(`digest_text(wrap(body))` = delivery.rs 가 쓰는 그 값) —
+    /// 손으로 지은 해시를 넣으면 검체가 자기 가정을 재게 된다.
+    #[test]
+    fn framed_match_covers_every_whitespace_padding_the_envelope_can_produce() {
+        // (원장에 기록된 본문, 그 pane 이 제출한 프롬프트)
+        let cases: [(&str, &str); 6] = [
+            ("각성 핑 본문입니다", "각성 핑 본문입니다"),           // 공백 없음
+            ("각성 핑 본문입니다
+", "각성 핑 본문입니다"),         // 끝 개행 → 뒤 한 칸
+            (" 각성 핑 본문입니다", "각성 핑 본문입니다"),          // 앞 공백 → 앞 한 칸
+            (" 각성 핑 본문입니다 ", "각성 핑 본문입니다"),         // 양쪽
+            ("각성 핑 본문입니다
+
+	", "각성 핑 본문입니다"),     // 여러 공백도 한 칸으로 접힌다
+            ("각성 핑 본문입니다
+", "각성 핑 본문입니다
+"),       // 앱이 공백을 그대로 남긴 경우
+        ];
+        for (body, prompt) in cases {
+            let wrapped = crate::paste_fence::wrap(body);
+            let norm = normalize(&wrapped);
+            let row = serde_json::json!({
+                "v": SCHEMA_VERSION, "surface": "23", "ts_epoch": 1_700_000_000.0f64,
+                "sha256": digest_normalized(&norm), "chars": norm.chars().count(),
+                "preview": norm.chars().take(PREVIEW_CHARS).collect::<String>(),
+                "origin": "send", "units": 1,
+            });
+            let read = read_delivery(&LedgerInput {
+                main: &LedgerFile::Content(format!("{row}
+")),
+                rotated: &LedgerFile::Missing,
+                daemon_epoch: None,
+                me: "23",
+                now: 1_700_000_001.0,
+                window_s: delivery_window_s(),
+                path_label: "(padding)",
+            });
+            assert_eq!(read.status, LedgerStatus::Ok, "{body:?}: {}", read.detail);
+            let v = machine_origin(prompt, &read.map, read.status);
+            assert!(v.machine, "공백 변형이 접히지 않았다 body={body:?} prompt={prompt:?}");
+        }
+    }
+
+    /// ★H-MISSION-R4-e(B-443 실패 방향 — 명시): 봉투 행이 **없으면** 복원은 해시를 한 번도
+    /// 계산하지 않고 `None` 이며, 원장이 망가진 경우의 통과는 **조용하지 않다**(이상징후 동반).
+    ///
+    /// 이 검체가 박는 설계(REPORT §실패 방향):
+    ///   · 원장에 그 배달 행이 **있으면** → 접는다(ⓐ·ⓐ′ · 위 두 검체)
+    ///   · 원장이 부재·회전·미지 스키마라 **근거 자체가 없으면** → 종전대로 접지 않되
+    ///     `ledger_absent`·`ledger_rotated`·`ledger_schema_skew` 가 임무 레코드에 남는다
+    ///     (조각 상한 초과는 [`capped_recent`] 가 창 안에서 접는다 — 종전 그대로)
+    /// 근거 없음을 접는 쪽으로 바꾸지 않는 이유는 [`capped_recent`] 주석의 그 이유다 — 무기한
+    /// 규칙은 오너를 **영구 차단**한다.
+    #[test]
+    fn without_a_framed_row_the_restore_is_a_noop_and_a_degraded_ledger_is_never_silent() {
+        // ⓐ 봉투 없는 원장 — 복원은 아무 일도 하지 않는다(해시 0회).
+        let plain_row = serde_json::json!({
+            "v": SCHEMA_VERSION, "surface": "23", "ts_epoch": 1_700_000_000.0f64,
+            "sha256": digest_text("무관한 기계 배달"), "chars": 8, "preview": "무관한 기계 배달",
+            "origin": "send", "units": 1,
+        });
+        let read = read_delivery(&LedgerInput {
+            main: &LedgerFile::Content(format!("{plain_row}
+")),
+            rotated: &LedgerFile::Missing,
+            daemon_epoch: None,
+            me: "23",
+            now: 1_700_000_001.0,
+            window_s: delivery_window_s(),
+            path_label: "(no-fence)",
+        });
+        // 후보 집합 자체의 모양(개수·순서)도 박는다 — 바뀌면 위 공백 전수성이 깨진다.
+        let c = framed_candidates("x");
+        assert_eq!(c.len(), 4);
+        assert_eq!(c[0], format!("{}x{}", crate::paste_fence::OPEN, crate::paste_fence::CLOSE));
+        assert!(c[1].ends_with(&format!(" {}", crate::paste_fence::CLOSE)));
+        assert!(c[2].starts_with(&format!("{} ", crate::paste_fence::OPEN)));
+
+        assert!(framed_match(&normalize(REAL_PING_PROMPT), &read.map).is_none());
+        assert!(!machine_origin(REAL_PING_PROMPT, &read.map, read.status).machine);
+
+        // ⓑ 원장 부재 — 접지 않지만 `ledger_absent` 를 남긴다(조용한 통과 금지).
+        let gone = read_delivery(&LedgerInput {
+            main: &LedgerFile::Missing,
+            rotated: &LedgerFile::Missing,
+            daemon_epoch: None,
+            me: "23",
+            now: 1_700_000_001.0,
+            window_s: delivery_window_s(),
+            path_label: "(absent)",
+        });
+        let v = machine_origin(REAL_PING_PROMPT, &gone.map, gone.status);
+        assert!(!v.machine, "근거가 없는데 접었다 — 오너 영구 차단 경로다");
+        let d = record_fold_from_origin(REAL_PING_PROMPT, &v, &LedgerRead::Absent, &gone.anomalies);
+        assert!(
+            d.anomalies.iter().any(|(c, _)| c == "ledger_absent"),
+            "원장 부재 통과가 조용하다: {:?}",
+            d.anomalies
+        );
+    }
 }
