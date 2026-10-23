@@ -1619,16 +1619,38 @@ fn capped_recent(delivery: &DeliveryMap) -> Option<String> {
 /// 변형은 (앞 0|1) × (뒤 0|1) = **4가지가 전부**다. 본문이 전부 공백인 경우는 프롬프트가 비어
 /// [`record_fold`] 가 먼저 접는다.
 ///
-/// ## 비용
-/// 봉투로 시작하는 `preview` 가 **하나도 없으면 해시를 한 번도 계산하지 않는다**(평시 경로 0회).
-/// 있으면 최대 4회이며 각 회는 프롬프트 길이에 선형이다. 전제는 `preview` 를 싣는 v1 행이다 —
-/// preview 가 없는 미지 스키마 행은 어차피 `ledger_schema_skew` 로 판독이 접힌다.
+/// ## 비용 — 그리고 **왜 `preview` 로 선별하지 않는가**(R2 codex F1 · major)
+/// 처음 쓴 판은 "봉투로 시작하는 `preview` 가 하나도 없으면 해시를 한 번도 계산하지 않는다" 였고,
+/// 그 전제를 "preview 가 없는 행은 어차피 `ledger_schema_skew` 로 판독이 접힌다" 로 적었다.
+/// **그 전제는 거짓이다.** 판독자는 스키마를 `v` 하나로 판정하고(`read_delivery` 의 `v_is_schema`
+/// 분기 — `ledger_schema_skew` 는 **`v` 불일치에서만** 발행된다 · 이 파일 안), `preview` 는
+/// `Option` 으로 담긴다. 그래서 `preview` 가 없는 v1 행은 `good` 으로 세어지고 판독 상태는
+/// [`LedgerStatus::Ok`] 다 — 종전 선별 조건은 **그 행을 통째로 못 보고** 층1 을 미스로 떨어뜨렸다.
+/// 봉투 해시가 원장에 **있는데도** 핑이 오너 임무가 되는 경로가 거기서 하나 더 열려 있었다.
+///
+/// ★가설이 아니라 **생산 경로의 증인이 있다**: 큐 묘비 행(`bin/cysd/delivery.rs` 의
+/// `queue_tombstone_row` · 만료 drain·만료 상한 축출·운영자 폐기)은 `v`·`surface`·`ts_epoch`·
+/// `sha256`·`chars`·`units` 를 싣고 **`preview` 키를 아예 쓰지 않는다**(같은 파일 `QueueTombstone`
+/// 문서: "본문 조각(preview) 도 싣지 않는다"). preview 없는 v1 행은 내 pane 원장에 오늘도 들어온다.
+///
+/// 그래서 선별 조건은 `preview` 가 아니라 **지도가 비었는가**다. 비면 어떤 해시도 맞을 수 없으니
+/// 일찍 돌아오는 것이 **전역 등가**다(모든 입력에서 결과가 같다 · 원장 부재·회전·판독 불가 모집단이
+/// 평시 0회를 그대로 유지한다). 비어 있지 않으면 해시를 최대 4회 계산하며 각 회는 프롬프트 길이에
+/// 선형이다.
+///
+/// ★비용은 **프롬프트 길이**가 정한다(원장 크기가 아니다 — 조회는 색인이다). 실측 두 점:
+///   · 실측 핑(정규화 110자 · 330 B): 추가 4회 = **0.0012 ms**
+///   · [`LAYER1_PROMPT_MAX_BYTES`](1 MiB) 상한의 프롬프트: 추가 4회 = **1.25 ms**(상한 보증값)
+/// 2026-10-23 이 기계에서 sha256 만 분리 계측한 값이다. 종전 판의 "+0.02 ms" 는 원장 전체 경로를
+/// 핑 하나로 재며 얻은 수치였고 **프롬프트 크기를 밝히지 않아** 상한처럼 읽혔다 — 1 MiB 프롬프트를
+/// 쓰는 좌석은 preview 조건이 있던 시절 0 ms 였던 자리에서 이제 1.25 ms 를 낸다. 공개한다.
+///
+/// ★두 조건의 차이는 **등가를 증명할 수 있는가**다: 빈 지도 조건은 "조회가 전부 미스" 라는 증명이
+/// 딸려 오고, 종전 preview 조건에는 그런 증명이 없었다. 그래서 하나는 비용 최적화이고 다른 하나는
+/// 판정 누락이었다 — 돌연변이 M4 를 "비용뿐, 판정 불변" 으로 적은 것이 바로 그 혼동이었다.
 fn framed_match<'a>(norm_s: &str, delivery: &'a DeliveryMap) -> Option<(String, &'a DeliveryMeta)> {
-    let framed_present = delivery
-        .iter()
-        .any(|(_, m)| m.preview.as_deref().is_some_and(|p| p.starts_with(crate::paste_fence::OPEN)));
-    if !framed_present {
-        return None;
+    if delivery.is_empty() {
+        return None; // 빈 지도에서는 모든 조회가 미스다 — 전역 등가인 조기 반환(비용 전용)
     }
     for cand in framed_candidates(norm_s) {
         let sha = digest_normalized(&cand);
@@ -2595,6 +2617,18 @@ mod tests {
             "preview": norm.chars().take(pv).collect::<String>(),
             "origin": r["origin"],
         });
+        // ★`preview_mode`(R2 F1) — **값 사본이 아니라 모양 지정**이다. `preview` 는 선택 필드이고
+        //   판독자는 그 부재를 스키마 이탈로 보지 않으므로([`framed_match`] 문서), 판정이 그 선택
+        //   필드에 의존하지 않는다는 사실을 검체가 직접 재야 한다. 미지 값은 조용히 '유도' 로
+        //   떨어지면 안 된다 — fixture 오타가 초록으로 통과하는 것이 이 계약의 최악 실패다.
+        match r["preview_mode"].as_str() {
+            None => {}
+            Some("omit") => {
+                rec.as_object_mut().expect("레코드는 객체").remove("preview");
+            }
+            Some("null") => rec["preview"] = serde_json::Value::Null,
+            Some(other) => panic!("preview_mode 미지 값: {other:?} (omit|null 만)"),
+        }
         for k in ["units", "parts_capped", "part", "parent"] {
             if let Some(v) = r.get(k) {
                 rec[k] = v.clone();
@@ -3409,6 +3443,111 @@ mod tests {
         }
     }
 
+    /// ★H-MISSION-R4-f(B-443 · R2 codex F1 major): 봉투 행의 **선택 필드 `preview` 가 없어도** 접힌다.
+    ///
+    /// 【무엇이 틀렸었나】 첫 수리는 "봉투로 시작하는 `preview` 가 하나라도 있는가" 를 해시 대조의
+    /// **선행 조건**으로 두었고, 그 근거를 "preview 가 없는 행은 어차피 `ledger_schema_skew` 로
+    /// 판독이 접힌다" 로 적었다. 판독자는 그렇게 동작하지 않는다 — 스키마 판정은 `v` 하나이고
+    /// (`ledger_schema_skew` 는 **`v` 불일치에서만** 발행된다) `preview` 는 `Option` 으로 담긴다.
+    /// 그래서 **봉투 해시가 원장에 있는데도** 층1 이 미스로 떨어지고, 핑은 `[` 로 시작하지 않아
+    /// 층2 도 통과해 다시 오너 임무가 된다 — 이상징후조차 남지 않는 조용한 관통이다.
+    ///
+    /// 【가설이 아니다 · 생산 경로의 증인】 큐 묘비 행(`bin/cysd/delivery.rs` 의
+    /// `queue_tombstone_row` · 만료 drain·만료 상한 축출·운영자 폐기)은 `v`·`surface`·`ts_epoch`·
+    /// `sha256`·`chars`·`units` 를 싣고 **`preview` 키를 아예 쓰지 않는다**. 즉 preview 없는 v1 행은
+    /// 평시에도 내 pane 원장에 들어오며, 그것이 '미지 스키마' 였다는 전제는 거짓이다.
+    ///
+    /// 행은 **실측 행에서 유도**한다(필드를 지우거나 null 로 바꾼다) — 손으로 새 행을 지으면 검체가
+    /// 제품이 아니라 자기 가정을 재게 된다. 공유 코퍼스에도 같은 짝이 있고(`preview_mode`) 이
+    /// 검체는 그 코퍼스 **생성기 자체가 틀린 경우**를 가른다(둘은 보완재다).
+    #[test]
+    fn a_framed_row_folds_even_when_its_optional_preview_is_absent_or_null() {
+        for (label, null_it) in [("preview 키 삭제", false), ("preview = JSON null", true)] {
+            let mut row: serde_json::Value =
+                serde_json::from_str(REAL_PING_ROW).expect("실측 행 판독");
+            {
+                let obj = row.as_object_mut().expect("원장 행은 객체다");
+                if null_it {
+                    obj.insert("preview".to_string(), serde_json::Value::Null);
+                } else {
+                    assert!(obj.remove("preview").is_some(), "실측 행에 preview 가 없었다");
+                }
+            }
+            let now = REAL_PING_TS + 1.313;
+            let read = read_delivery(&LedgerInput {
+                main: &LedgerFile::Content(format!("{row}\n")),
+                rotated: &LedgerFile::Missing,
+                daemon_epoch: None,
+                me: "23",
+                now,
+                window_s: delivery_window_s(),
+                path_label: "(B-443 실측 행 · preview 변형)",
+            });
+
+            // ① 전제 — 판독자는 이 행을 **받아들인다**. 이것이 F1 의 핵심이다: 스키마 이탈이
+            //    아니므로 preview 부재를 근거로 판정을 생략할 자격이 없다.
+            assert_eq!(read.status, LedgerStatus::Ok, "{label}: 판독 상태가 ok 가 아니다 — {}", read.detail);
+            assert!(
+                read.anomalies.iter().all(|a| a.0 != "ledger_schema_skew"),
+                "{label}: preview 부재가 스키마 이탈로 발행됐다 — 이 검체의 전제가 바뀌었다: {:?}",
+                read.anomalies
+            );
+            let sha = row["sha256"].as_str().expect("sha256");
+            let meta = read.map.get(sha).expect("실측 행이 내 pane 지도에 없다");
+            assert!(meta.preview.is_none(), "{label}: preview 가 여전히 실려 있다 — 변형이 안 먹었다");
+
+            // ② 판정 — preview 가 없어도 봉투 복원은 **해시 동등**만으로 성립한다.
+            let v = machine_origin(REAL_PING_PROMPT, &read.map, read.status);
+            assert!(
+                v.machine,
+                "{label}: 봉투 해시가 원장에 있는데 기계로 접히지 않았다(= 오너 임무로 기록된다) — reason={:?}",
+                v.reason
+            );
+            assert_eq!(v.layer, Some(1), "{label}: 층1 이 아니라 다른 층이 잡았다: {:?}", v.layer);
+
+            // ③ 그래서 대장에 아무것도 쓰이지 않는다(권한 발급 차단).
+            let d = record_fold_from_origin(
+                REAL_PING_PROMPT,
+                &v,
+                &live_ledger("기존 오너 임무"),
+                &read.anomalies,
+            );
+            assert!(
+                !matches!(d.plan, LedgerPlan::Write { .. }),
+                "{label}: 기계 핑이 대장에 기록된다: {:?}",
+                d.plan
+            );
+
+            // ④ 반대 방향(음성 대조) — 같은 원장에서 오너가 친 줄은 그대로 임무로 남는다.
+            //    preview 조건을 떼어 **더 넓게** 걸게 됐으므로 이 방향을 같은 검체에서 재야 한다.
+            let owner = "0.14.53 릴리스까지 완주하고 결과만 보고하라";
+            let ov = machine_origin(owner, &read.map, read.status);
+            assert!(!ov.machine, "{label}: 오너 문장이 기계로 접혔다 — reason={:?}", ov.reason);
+            let od = record_fold_from_origin(owner, &ov, &LedgerRead::Absent, &read.anomalies);
+            match &od.plan {
+                LedgerPlan::Write { mission: Some(m), source, .. } => {
+                    assert_eq!(*source, SOURCE_PROMPT, "{label}");
+                    assert!(m.contains("릴리스"), "{label}: 임무 문안이 잘렸다: {m:?}");
+                }
+                other => panic!("{label}: 오너 임무가 대장에 쓰이지 않는다: {other:?}"),
+            }
+        }
+    }
+
+    /// ★H-MISSION-R4-g(R2 codex F1): F1 수리의 비용 조건이 **전역 등가**임을 가른다 — 빈 지도에서는
+    /// 조기 반환이 있으나 없으나 결과가 같다(모든 조회가 미스). 종전 preview 조건에는 이런 증명이
+    /// 없었고, 그래서 그것을 "비용뿐" 으로 적은 것이 F1 이 가리킨 혼동이었다. 돌연변이 '조기 반환 제거' 는 **설계된
+    /// 생존자**이며, 생존의 근거가 검체가 아니라 이 등가라는 사실을 여기에 남긴다.
+    #[test]
+    fn the_empty_map_shortcut_cannot_change_any_verdict() {
+        let empty = DeliveryMap::default(); // `new()` 는 없다 — Default 가 생성자다
+        assert!(framed_match(&normalize(REAL_PING_PROMPT), &empty).is_none());
+        // 조기 반환을 걷어낸 산식(후보 4종을 실제로 돌린다)도 같은 답이다.
+        for cand in framed_candidates(&normalize(REAL_PING_PROMPT)) {
+            assert!(empty.get(&digest_normalized(&cand)).is_none(), "빈 지도에서 조회가 맞았다");
+        }
+    }
+
     /// ★H-MISSION-R4-d(B-443): 봉투 복원 후보 **4종이 전수**임을 공백 변형으로 전부 돌려 확인한다.
     ///
     /// 왜 4종인가 — [`normalize`] 는 앞뒤 공백을 버리지만 봉투 안에서는 표지가 양옆을 잡아 같은
@@ -3458,8 +3597,13 @@ mod tests {
         }
     }
 
-    /// ★H-MISSION-R4-e(B-443 실패 방향 — 명시): 봉투 행이 **없으면** 복원은 해시를 한 번도
-    /// 계산하지 않고 `None` 이며, 원장이 망가진 경우의 통과는 **조용하지 않다**(이상징후 동반).
+    /// ★H-MISSION-R4-e(B-443 실패 방향 — 명시): 봉투 행이 **없으면** 복원은 `None` 이며, 원장이
+    /// 망가진 경우의 통과는 **조용하지 않다**(이상징후 동반).
+    ///
+    /// ★문안 정정(R2 codex F1): 종전에는 "해시를 한 번도 계산하지 않고 `None`" 이라고 적었다.
+    /// 그 선행 조건(봉투 preview 의 존재)은 preview 가 선택 필드라 판정을 누락시켰고 제거됐다
+    /// ([`framed_match`]). 지금 `None` 인 근거는 **해시 불일치**이며, 비용 조건은 "지도가 비었는가"
+    /// 하나다 — 그래서 이 검체(행이 하나 있는 원장)는 후보 4종을 실제로 계산하고 전부 미스한다.
     ///
     /// 이 검체가 박는 설계(REPORT §실패 방향):
     ///   · 원장에 그 배달 행이 **있으면** → 접는다(ⓐ·ⓐ′ · 위 두 검체)
@@ -3470,7 +3614,7 @@ mod tests {
     /// 규칙은 오너를 **영구 차단**한다.
     #[test]
     fn without_a_framed_row_the_restore_is_a_noop_and_a_degraded_ledger_is_never_silent() {
-        // ⓐ 봉투 없는 원장 — 복원은 아무 일도 하지 않는다(해시 0회).
+        // ⓐ 봉투 없는 원장 — 복원은 아무 일도 하지 않는다(해시 4회 전부 미스 · 위 정정 참조).
         let plain_row = serde_json::json!({
             "v": SCHEMA_VERSION, "surface": "23", "ts_epoch": 1_700_000_000.0f64,
             "sha256": digest_text("무관한 기계 배달"), "chars": 8, "preview": "무관한 기계 배달",

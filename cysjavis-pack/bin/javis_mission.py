@@ -1489,17 +1489,29 @@ def _framed_match(norm, delivery):
     바이트"를 증명한다. 원장 본문이 `OPEN + sanitize(body) + CLOSE` 이고 TUI 가 받는 것이 그
     `sanitize(body)` 이므로(살균은 멱등) 되씌움은 표지 두 개를 붙이는 것으로 끝난다.
 
-    ## 비용
-    봉투로 시작하는 preview 가 하나도 없으면 **해시를 한 번도 계산하지 않는다**(평시 0회).
+    ## 비용 — 그리고 **왜 preview 로 선별하지 않는가**(R2 codex F1 · major)
+    처음 쓴 판은 "봉투로 시작하는 preview 가 하나도 없으면 해시를 한 번도 계산하지 않는다" 였고 그
+    전제를 "preview 가 없는 행은 어차피 `ledger_schema_skew` 로 접힌다" 로 적었다. **그 전제는
+    거짓이다.** 판독자(`_read_delivery`)는 스키마를 `v` 하나로 판정하고 `ledger_schema_skew` 는
+    **`v` 불일치에서만** 발행된다 — `preview` 는 `rec.get("preview")` 로 담겨 없으면 그냥 None 이고,
+    그 행은 `good` 으로 세어져 상태는 LEDGER_OK 다. 즉 종전 선별 조건은 그 행을 통째로 못 보고
+    층1 을 미스로 떨어뜨렸다(봉투 해시가 원장에 **있는데도** 핑이 오너 임무가 되는 두 번째 경로).
+
+    ★가설이 아니라 **생산 경로의 증인이 있다**: 큐 묘비 행(`src/bin/cysd/delivery.rs` 의
+    `queue_tombstone_row` · 만료 drain·만료 상한 축출·운영자 폐기)은 v·surface·ts_epoch·sha256·
+    chars·units 를 싣고 **preview 키를 아예 쓰지 않는다**. preview 없는 v1 행은 오늘도 들어온다.
+
+    그래서 선별 조건은 preview 가 아니라 **지도가 비었는가**다 — 비면 어떤 해시도 맞을 수 없으니
+    조기 반환이 **전역 등가**이고(원장 부재·회전·판독 불가 모집단은 평시 0회 그대로), 비어 있지
+    않으면 해시를 최대 4회 계산한다. 두 조건의 차이는 등가를 증명할 수 있는가다.
+
+    ★비용은 **프롬프트 길이**가 정한다(원장 크기가 아니다 — 조회는 색인이다). 실측 두 점(2026-10-23
+    이 기계 · sha256 만 분리 계측): 실측 핑(정규화 110자·330 B) 추가 4회 = 0.0012 ms · 층1 프롬프트
+    상한 1 MiB 추가 4회 = 1.25 ms(상한 보증값). 종전 판의 "+0.02 ms" 는 프롬프트 크기를 밝히지 않아
+    상한처럼 읽혔다 — 1 MiB 프롬프트 좌석은 preview 조건 시절 0 ms 였던 자리에서 1.25 ms 를 낸다.
     """
-    framed = False
-    for meta in (delivery or {}).values():
-        prev = meta.get("preview") if isinstance(meta, dict) else None
-        if isinstance(prev, str) and prev.startswith(FENCE_OPEN):
-            framed = True
-            break
-    if not framed:
-        return None, None
+    if not delivery:
+        return None, None        # 빈 지도에서는 모든 조회가 미스 — 전역 등가인 조기 반환(비용 전용)
     for cand in _framed_candidates(norm):
         sha = _digest_norm(cand)
         hit = delivery.get(sha)
@@ -2704,6 +2716,17 @@ def _corpus_ledger_lines(case, gen):
                "ts_epoch": ts, "sha256": _digest_norm(norm),
                "origin": rec.get("origin", "send"),
                "chars": len(norm), "preview": norm[:PREVIEW_CHARS]}
+        # ★`preview_mode`(R2 F1) — **값 사본이 아니라 모양 지정**이다. `preview` 는 선택 필드이고
+        #   판독자는 그 부재를 스키마 이탈로 보지 않으므로(위 `_framed_match` 문서), 판정이 그
+        #   선택 필드에 의존하지 않는다는 사실을 검체가 직접 재야 한다. 미지 값은 조용히 '유도'로
+        #   떨어지면 안 된다 — fixture 오타가 초록으로 통과하는 것이 이 계약의 최악 실패다.
+        mode = rec.get("preview_mode")
+        if mode == "omit":
+            del row["preview"]
+        elif mode == "null":
+            row["preview"] = None
+        elif mode is not None:
+            raise ValueError("preview_mode 미지 값: %r (omit|null 만)" % (mode,))
         for k in ("units", "parts_capped", "part", "parent"):
             if k in rec:
                 row[k] = rec[k]
