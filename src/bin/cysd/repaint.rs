@@ -623,6 +623,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let daemon = Daemon::new(dir.join("cysd.sock"));
         let s = daemon.create_surface(None, Some("sleep 30".into()), None, None, 24, 80).expect("surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         (dir, daemon, s)
     }
 
@@ -685,6 +686,7 @@ mod tests {
         assert!(st.unreadable_since.is_none() && st.unrecovered == 0);
         drop(st);
         let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -731,6 +733,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -739,7 +742,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn nudge_respects_concurrent_resize_and_rejects_tiny() {
-        let (dir, _daemon, s) = seat("race");
+        let (dir, daemon, s) = seat("race");
         let s2 = Arc::clone(&s);
         let h = std::thread::spawn(move || nudge_resize(&s2, Duration::from_millis(400)));
         std::thread::sleep(Duration::from_millis(150));
@@ -768,6 +771,7 @@ mod tests {
         s.parser.lock().unwrap().set_size(24, 1);
         assert!(nudge_resize(&s, Duration::from_millis(1)).is_err());
         let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -776,7 +780,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn concurrent_resize_never_leaves_pty_and_parser_diverged() {
-        let (dir, _daemon, s) = seat("serial");
+        let (dir, daemon, s) = seat("serial");
         for i in 0..20u16 {
             let gui = (30 + i % 3, 100 + i % 5);
             let s2 = Arc::clone(&s);
@@ -793,6 +797,7 @@ mod tests {
             assert_eq!(parser, gui, "{i}: 끝 크기는 GUI 크기({out:?})");
         }
         let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -800,7 +805,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn in_flight_guard_resets_even_on_panic() {
-        let (dir, _daemon, s) = seat("guard");
+        let (dir, daemon, s) = seat("guard");
         s.repaint_in_flight.store(true, Ordering::Release);
         let s2 = Arc::clone(&s);
         open_echo_window(&s);
@@ -820,6 +825,7 @@ mod tests {
         assert!(set_parser_size(&s, 24, 80).is_ok());
         assert!(s.parser.lock().is_ok());
         let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

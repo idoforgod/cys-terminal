@@ -3693,6 +3693,7 @@ mod tests {
             }
             assert_eq!(b3_resolved(&d, seq0).len(), 1, "붙들린 키의 해소 알림이 되풀이됐다");
             assert_eq!(account_alerts(&d, seq0, KEY_A), 1);
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -3720,6 +3721,7 @@ mod tests {
             crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 7201.0);
             assert_eq!(account_alerts(&d, seq0, KEY_A), 3);
             assert_eq!(b3_resolved(&d, seq0), vec![(KEY_A.to_string(), "cleared".to_string())]);
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -3744,6 +3746,7 @@ mod tests {
             }
             assert_eq!(account_alerts(&d, seq0, KEY_A), 2, "신원 판독 불가인데 +1801초에 A 경보가 사라졌다(REMIND 도 나가야 한다)");
             assert!(b3_resolved(&d, seq0).is_empty(), "판정 불가 계정에 해소 알림이 나갔다");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -3760,6 +3763,7 @@ mod tests {
             {
                 let d1 = crate::state::Daemon::new(sock.clone());
                 assert!(note_rate_for_profile_at(&d1, Some(&home), &f, &[rw("5h", 97.0, Some(t0 + 7200.0))], "statusline", t0 - 7200.0));
+                crate::state::test_stop_daemon(&d1);
             }
             let d2 = crate::state::Daemon::new(sock);
             restore_from_snapshots(&d2, t0);
@@ -3773,6 +3777,7 @@ mod tests {
             assert_eq!(seat_identity_view_in(&d2, Some(&home), t0 + 30.0).current_for(_seat.id), Some("u-b3-a"), "전제: 좌석 폴더의 현재 신원이 캐시에 실렸다");
             crate::governance::check_alerts_with(&d2, &mut fired, &cfg, t0 + 31.0);
             assert_eq!(account_alerts(&d2, seq0, KEY_A), 1, "그 계정을 쓰는 좌석이 있는데 복원값이 발화하지 않았다");
+            crate::state::test_stop_daemon(&d2);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -3805,6 +3810,7 @@ mod tests {
             // REMIND(마지막 발행 + 1800 = +3590)가 지나면 종전처럼 한 번 낸다 — 음성 대조(리마인드가 영영 죽지 않았다)
             crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 3590.0);
             assert_eq!(account_alerts(&d, seq0, KEY_A), 1, "REMIND 뒤에도 재발행하지 않는다(붙들림이 리마인드를 죽였다)");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -3825,6 +3831,7 @@ mod tests {
             crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1940.0);
             assert_eq!(b3_resolved(&d, seq0), vec![(KEY_A.to_string(), "cleared".to_string())], "값이 내려가 풀린 키의 해소 알림이 1건이 아니거나 사유가 다르다");
             assert!(!fired.contains_key(KEY_A), "해소된 키가 fired 에 남았다(재무장 실패)");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -3995,6 +4002,7 @@ mod tests {
             assert_eq!(v.claude_folders, vec![(fs(&f2), Some("u-b3-b".to_string()))]);
             assert_eq!(account_in_use("claude", "u-b3-a", &v), Some(false), "종료된 좌석의 로그인이 '사용 중'으로 남았다");
             assert_eq!(v.current_for(s1.id), None);
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -4039,6 +4047,7 @@ mod tests {
             // 확인한 지 10분이 지난 항목은 걷는다(크기 유계)
             let _ = seat_identity_view_in(&d, Some(&home), t0 + 900.0);
             assert!(d.seat_ident_cache.lock().unwrap().entries.is_empty(), "낡은 폴더 항목이 캐시에 남았다");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -4078,6 +4087,7 @@ mod tests {
             assert_eq!(account_in_use("claude", "u-b3-a", &v), None);
             assert_eq!(rows_len, Some(1), "계정 조회가 행을 내지 못했다");
             assert_eq!((fired_a, account_alerts(&d, seq0, KEY_A)), (true, 1), "판정 불가인데 +1801초 A 경보가 발화하지 않았다");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -4130,6 +4140,7 @@ mod tests {
             let rows = local_json(&d, t0 + 3.0);
             assert!(rows.as_array().unwrap().iter().all(|r| r["in_use"].is_null()), "수집 실패인데 in_use 가 판정됐다: {rows}");
             drop(seat);
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -4163,11 +4174,14 @@ mod tests {
             {
                 let d1 = crate::state::Daemon::new(sock.clone());
                 assert!(note_rate_for_profile_at(&d1, Some(&home), &fa, &[rw("5h", 97.0, Some(t0 + 7200.0))], "statusline", t0 - 10.0));
+                crate::state::test_stop_daemon(&d1);
             }
             let d2 = crate::state::Daemon::new(sock);
             restore_from_snapshots(&d2, t0);
             let rr = alert_rates_with(&d2, &v0, t0 + 1.0, 1800.0);
             assert_eq!((rr.len(), rr[0].held_secs), (1, None), "복원분에 held 가 있다");
+            crate::state::test_stop_daemon(&d2);
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&rdir);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
@@ -4254,6 +4268,7 @@ mod tests {
                     crate::governance::check_alerts_with_stale(&d, &mut fired, &cfg, t0 + dt, stale);
                 }
                 let out = (account_alerts(&d, seq0, KEY_A), b3_resolved(&d, seq0));
+                crate::state::test_stop_daemon(&d);
                 let _ = std::fs::remove_dir_all(&dir);
                 let _ = std::fs::remove_dir_all(&home);
                 out
@@ -4285,6 +4300,7 @@ mod tests {
             assert_eq!(det["held_secs"], json!(1770));
             assert_eq!(evs[0]["key"], json!(KEY_A));
             assert_eq!(evs[0]["isolate"], json!(true));
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -4466,6 +4482,7 @@ mod tests {
             assert_eq!(got[0], (".claude".to_string(), FolderWho::NoLogin), "하한이 지났는데 지워진 신원이 그대로다(파일이 없어진 것은 신원 없음 확정 — 읽지 못함이 아니다)");
             // 홈 불명 → 빈 표(파일을 보지 않는다)
             assert!(known_profile_identities(&d, None, t0).is_none(), "홈 불명은 목록을 못 얻은 것(None) — R1F-US: 부른 쪽이 current_profiles 키를 내지 않는다");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -4806,6 +4823,7 @@ mod tests {
                 let one = a.to_value().to_string();
                 assert!(!one.contains("ZZ별칭"), "별명이 Alert(key·message·detail)에 새었다: {one}");
             }
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -5328,6 +5346,7 @@ mod tests {
             assert_eq!(seat_identity_view_in(&d, Some(&home), 2000.0).current_for(seat.id), None);
             assert_eq!(seat_identity_view_cached(&d).current_for(seat.id), None);
             assert_eq!(counters(&d).0, 2);
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -5359,6 +5378,7 @@ mod tests {
             crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 1810.0);
             assert_eq!(account_alerts(&d, seq0, KEY_A), 2, "소멸해야 할 A 가 다시 발행됐다");
             assert_eq!(b3_resolved(&d, seq0), vec![(KEY_A.to_string(), "stale".to_string())], "RPC 조회가 새 신원을 실은 뒤의 틱에서 A 가 붙들림 소멸(stale)해야 한다");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -5396,6 +5416,7 @@ mod tests {
             let before = counters(&d).2;
             assert_eq!(report_outside_at(&d, Some(&home), &o, &[rw("5h", 5.0, None)], t0 + 30.0), Ok(OutsideOutcome::Accepted));
             assert_eq!(counters(&d).2, before, "창 밖 보고가 좌석 신원 캐시를 채웠다");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -5545,6 +5566,7 @@ mod tests {
             assert_eq!(a.stale_suppressed, vec!["account_rate:b-b3@example.test:5h".to_string()], "B(사용 중 아님 · 관측 3000초)는 붙들 키여야 한다 — 두 진입점 모두");
             assert_eq!(a.account_rates, vec![("a-b3@example.test".to_string(), "5h".to_string(), 99.0)], "A 만 계정 축 입력이다");
             assert!(!a.rates.is_empty() && !a.account_rates.is_empty(), "전제: 두 축 모두 입력이 있어야 한다");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -5867,6 +5889,7 @@ mod tests {
             let st = seat_folder_states(&d, &view);
             assert_eq!(st[1].1, FolderWho::Unread, "캐시 항목이 없는 폴더를 신원 없음 확정으로 읽었다");
             assert_eq!(st[0].1, FolderWho::Known("u-b3-a".to_string()), "신원을 읽은 폴더는 캐시와 무관하다");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -5893,6 +5916,7 @@ mod tests {
             put_body(&work, "{\"oauthAccount\"", 5); // ③ 읽기 실패 첫 주기 — 직전 신원을 한 주기 더
             assert_eq!(cp(t0 + 183.0), Some(json!(["work/acct"])), "일시 실패 한 번에 이전 로그인(빈 배열)·키 부재를 단정했다");
             assert_eq!(cp(t0 + 244.0), None, "④ 유예 뒤에도 못 읽는 좌석 폴더가 낀 행이 키를 냈다(읽지 못함)");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -5923,6 +5947,7 @@ mod tests {
             let w = row(&rows, "u-r1-w");
             assert_eq!(w["in_use"], json!(false));
             assert_eq!(strs(&w["current_profiles"]), Vec::<String>::new(), "좌석이 떠났는데 열거 밖 폴더가 현재로 남았다");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -5979,6 +6004,7 @@ mod tests {
                 let ev: Vec<Value> = b3_events(&d, seq0, "alert.rate_limit").into_iter().filter(|p| p["key"] == "rate_limit:worker-r1:5h").collect();
                 assert_eq!(ev.len(), 1, "swap={swap}");
                 assert_eq!((ev[0]["detail"]["used_pct"].clone(), ev[0]["detail"]["age_secs"].clone()), (json!(99.0), json!(10_800)), "swap={swap}: 발행된 경보의 값과 age 가 다른 입력의 것이다: {}", ev[0]);
+                crate::state::test_stop_daemon(&d);
                 let _ = std::fs::remove_dir_all(&dir);
                 let _ = std::fs::remove_dir_all(&home);
             }
@@ -6002,6 +6028,7 @@ mod tests {
             let ev: Vec<Value> = b3_events(&d, seq0, "alert.account_rate").into_iter().filter(|p| p["key"] == "account_rate:dup-r1@example.test:5h").collect();
             assert_eq!(ev.len(), 1);
             assert_eq!((ev[0]["detail"]["used_pct"].clone(), ev[0]["detail"]["age_secs"].clone()), (json!(99.0), json!(10_800)), "발행된 계정 경보의 값과 age 가 다른 입력의 것이다: {}", ev[0]);
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -6033,6 +6060,7 @@ mod tests {
             put_usage(&s3, 95.0, t0 + 20_000.0, t0 + 50.0, Some("u-b3-c")); // 다른 좌석의 새 교차(같은 키)
             crate::governance::check_alerts_with(&d, &mut fired, &cfg, t0 + 61.0);
             let published = b3_events(&d, seq0, "alert.rate_limit").iter().filter(|p| p["key"] == key).count();
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
             (held, resolved, published)
@@ -6176,6 +6204,7 @@ mod tests {
                 assert!(profiles.iter().any(|(p, w)| p == ".claude-4" && w == &FolderWho::Known(uuid.into())), "{case}: enumeration lost its own read");
                 assert!(d.seat_ident_cache.lock().unwrap().entries.keys().any(|p| same_dir(&p.to_string_lossy(), &observed)), "{case}");
             }
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -6201,6 +6230,7 @@ mod tests {
             assert!(!same_dir(item.folder.as_deref().unwrap(), &observed), "fixture must need the second warm loop");
             assert_eq!(seat_account_map(&d, &view)[&seat.id]["account_id"], json!("u-team"));
             assert_eq!(peek_folder_state(&d, &observed), FolderWho::Known("u-team".into()));
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -6399,6 +6429,7 @@ mod tests {
             assert_eq!(m[&master.id]["account_id"], json!("u-c"), "계정 전환이 좌석 계정에 반영되지 않았다");
             // 수집 실패(기본값) — 표가 비어 전부 null
             assert!(seat_account_map(&d, &SeatIdentityView::default()).is_empty());
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }
@@ -6548,6 +6579,7 @@ mod tests {
             assert!(!view.claude_folder_unknown);
             assert_eq!(view.claude_folders.len(), 1, "관측 폴더는 신원 표(in_use)에 들어가지 않는다");
             assert_eq!(account_in_use("claude", "u-act", &view), Some(false), "관측 폴더의 계정을 '사용 중' 으로 올리지 않는다(경보 귀속 불변)");
+            crate::state::test_stop_daemon(&d);
             let _ = std::fs::remove_dir_all(&dir);
             let _ = std::fs::remove_dir_all(&home);
         }

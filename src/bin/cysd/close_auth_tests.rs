@@ -370,6 +370,7 @@ impl Drop for DaemonFx {
             let _ = c.kill();
             let _ = c.wait();
         }
+        crate::state::test_stop_daemon(&self.daemon);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }

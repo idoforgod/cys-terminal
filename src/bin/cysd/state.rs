@@ -5339,25 +5339,30 @@ pub(crate) fn test_done_or_quiet_window(
     false
 }
 
-/// ★(0.14.53 · WP2 · B-433) **검체 끝정리 전용** — 상태 디렉터리를 지우기 전에 데몬이 소유한 배경 스레드
-/// (좌석 PTY reader 스레드 — EOF 후 `park_active_to_restored`/`park_expired_to_restored` → `persist_queue_state`
-/// 수행 후 `surface.exited` 발행 및 `Arc<Daemon>` 반납 — 와 `recall::spawn_writer` 스레드)를 멈추고 종료를
-/// 결정론적으로 확인한다.
+/// ★(0.14.53 · WP2 · B-433) **검체 끝정리 전용** — 상태 디렉터리를 지우기 전에 데몬의 좌석 PTY reader 배경 스레드를
+/// 멈추고 그 EOF 후처리(`park_active_to_restored`/`park_expired_to_restored` → `persist_queue_state` 및
+/// `surface.exited` 발행 · `Arc<Daemon>` 반납) 완료를 결정론적으로 증명하며, `recall_tx` 송신단을 교체해
+/// `recall::spawn_writer` 수신 채널을 끊는다(채널 송신단 교체는 OS 스레드 join/완결 ack 가 아니므로 결정론 증명 범위는
+/// PTY reader EOF·WAL 영속 완결이다).
 ///
 /// 【불변식】
 /// 1. 모든 생성된 좌석(`surface.created`)의 자식을 종료·회수하고, 각 reader 스레드가 EOF 후처리(`persist_queue_state`)의
-///    마지막 문장인 `surface.exited` 를 버스에 발행하고 클로저를 빠져나가 `Arc<Daemon>` 강한 참조를 놓을 때까지 기다린다.
-/// 2. `recall_tx` 를 새 채널 송신단으로 교체해 `recall::spawn_writer` 의 수신 루프를 즉시 끊는다.
-/// 3. 비패닉 문맥에서는 ① 상태 디렉터리가 정리 전에 미리 삭제되지 않았음(`dir_existed_at_entry && sdir.exists()`)
-///    ② 모든 생성 좌석의 `surface.exited` 발행 및 `s.exited` 도달 ③ 배경 스레드의 `Arc<Daemon>` 반납
+///    마지막 문장인 `surface.exited` 를 버스에 발행하고(`s.exited && s.exited_at.is_some()`) 클로저를 빠져나가
+///    `Arc<Daemon>` 강한 참조를 놓을 때까지 기다린다.
+/// 2. `recall_tx` 를 새 채널 송신단으로 교체해 `recall::spawn_writer` 의 수신 루프에 채널 해제를 알린다(최선 대기 후 분리).
+/// 3. 비패닉 문맥에서는 ① 상태 디렉터리가 정리 전에 미리 삭제되지 않았음(`intact_at_entry && intact_at_exit`)
+///    ② 모든 생성 좌석의 `surface.exited` 발행 및 `s.exited && s.exited_at.is_some()` 도달
+///    ③ PTY reader 스레드의 `Arc<Daemon>` 반납(`strong_count == expected_strong`)
 ///    ④ (실패 주입 검체가 아닌 한) `queue.persist_failed` 0건 및 `queue_wal_durable()` 참을 단언한다.
 #[cfg(test)]
 pub(crate) fn test_stop_daemon(daemon: &Arc<Daemon>) {
     let sdir = state_dir(&daemon.socket_path);
     let intact_at_entry = sdir.exists() && sdir.join("operator.token").exists();
-    let fault_injected = sdir.join("queue-expired.json").is_dir()
+    let fault_injected = should_quiet_expected_persist_fail()
+        || sdir.join("queue-expired.json").is_dir()
         || sdir.join("queue-state.json").is_dir()
         || crate::delivery::ledger_path(&daemon.socket_path).is_dir();
+    let expected_strong = 1 + usize::from(daemon.activity.running.load(Ordering::Acquire));
 
     let surfaces: Vec<Arc<Surface>> = daemon
         .surfaces
@@ -5420,8 +5425,11 @@ pub(crate) fn test_stop_daemon(daemon: &Arc<Daemon>) {
             .filter_map(|e| e.get("surface_id").and_then(|v| v.as_u64()))
             .collect();
         let all_bus_exited = created.iter().all(|(sid, _)| exited_ids.contains(sid));
-        let all_surf_exited = surfaces.iter().all(|s| s.exited.load(Ordering::Acquire));
-        if all_bus_exited && all_surf_exited && Arc::strong_count(daemon) == 1 {
+        let all_surf_exited = surfaces.iter().all(|s| {
+            s.exited.load(Ordering::Acquire)
+                && s.exited_at.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        });
+        if all_bus_exited && all_surf_exited && Arc::strong_count(daemon) == expected_strong {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
@@ -5454,15 +5462,16 @@ pub(crate) fn test_stop_daemon(daemon: &Arc<Daemon>) {
     }
     for s in &surfaces {
         assert!(
-            s.exited.load(Ordering::Acquire),
-            "test_stop_daemon: surface {} exited 표식이 서지 않았다",
+            s.exited.load(Ordering::Acquire)
+                && s.exited_at.lock().unwrap_or_else(|e| e.into_inner()).is_some(),
+            "test_stop_daemon: surface {} exited/exited_at 표식이 서지 않았다",
             s.id
         );
     }
     assert_eq!(
         Arc::strong_count(daemon),
-        1,
-        "test_stop_daemon: 데몬 Arc 강한 참조가 1 이 아니다 — 배경 스레드가 아직 살아 있다"
+        expected_strong,
+        "test_stop_daemon: 데몬 Arc 강한 참조가 {expected_strong} 이 아니다 — 배경 스레드가 아직 살아 있다"
     );
     let persist_failures: Vec<Value> = daemon
         .bus
