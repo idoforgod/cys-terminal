@@ -131,6 +131,13 @@ function Read-State([string]$Version,[string]$Tag) {
     # Keep raw evidence alongside the actual reducer output in RUN.
     return $o
 }
+function Observe-ProcessOutput($Record,[string]$Tag) {
+    Save-Json ($Tag+'-process.json') $Record 30
+    $out=Join-Path $global:DiagOut ($Tag+'-process-observation.json')
+    & $CTX.driver_node (Join-Path $PSScriptRoot 'driver-observation.mjs') process (Join-Path $global:DiagOut ($Tag+'-process.json')) $out
+    if($LASTEXITCODE -ne 0){throw 'process-output observer reducer failed'}
+    return (Get-Content -LiteralPath $out -Raw | ConvertFrom-Json -ErrorAction Stop)
+}
 function Seat-Check([string]$Tag) {
     $nonce='wm-'+[Guid]::NewGuid().ToString('N');$cli=Join-Path $script:Install 'cys.exe'
     $o=[ordered]@{known=$false;value=$null;error=$null;nonce=$nonce;create=$null;screen=$null;list=$null;exit_list=$null;exit_status=$null;audit=@()}
@@ -139,17 +146,19 @@ function Seat-Check([string]$Tag) {
         if($running.Count -eq 0){$o.known=$true;$o.value=$false;$o.reason='no daemon';return $o}
         $command='cmd.exe /d /q /c "echo '+$nonce+' & ping -n 6 127.0.0.1 >nul & exit /b 0"'
         $seatStart=(Get-Date).ToUniversalTime();$o.create=Invoke-Cli $cli ('new-surface --title win-measure --cmd '+(ConvertTo-CmdArg $command)) 20
+        $creation=Observe-ProcessOutput $o.create ($Tag+'-create')
+        if(-not $creation.known){$o.error=$creation.error;return $o}
+        if(-not $creation.value){$o.known=$true;$o.value=$false;$o.reason='observed nonzero new-surface exit';return $o}
         $sid=$o.create.out.Trim()
-        if($o.create.rc -ne 0 -or $sid -notmatch '^surface:\d+$'){
-            $o.cli_probe=Invoke-ProbeCreate $cli
-            if($o.cli_probe.completed -eq $true){$o.known=$true;$o.value=$false;$o.reason='new-surface failed with measured CLI launchability'}
-            else{$o.error='CLI observer unavailable'}
-            return $o
-        }
+        if($sid -notmatch '^surface:\d+$'){$o.known=$true;$o.value=$false;$o.reason='complete new-surface response has no surface ref';return $o}
         $o.surface=$sid;Start-Sleep 1
         $o.screen=Invoke-Cli $cli ('read-screen --surface '+$sid+' --lines 100') 15;$o.list=Invoke-Cli $cli 'list' 15
         Start-Sleep 6;$o.exit_list=Invoke-Cli $cli 'list' 15
-        if($o.list.rc -ne 0 -or $o.exit_list.rc -ne 0 -or $o.screen.rc -ne 0){$o.error='list/screen observer unavailable';return $o}
+        foreach($name in @('screen','list','exit_list')){
+            $stream=Observe-ProcessOutput $o[$name] ($Tag+'-'+$name)
+            if(-not $stream.known){$o.error=$name+': '+$stream.error;return $o}
+            if(-not $stream.value){$o.known=$true;$o.value=$false;$o.reason='observed nonzero '+$name+' exit';return $o}
+        }
         $line=@($o.list.out -split "`n" | Where-Object {$_ -match ('^'+[regex]::Escape($sid)+'\s')})
         $end=@($o.exit_list.out -split "`n" | Where-Object {$_ -match ('^'+[regex]::Escape($sid)+'\s')})
         if($line.Count -ne 1 -or $line[0] -notmatch 'pid=([1-9]\d*)' -or $end.Count -ne 1 -or $end[0] -notmatch 'exited=true'){$o.known=$true;$o.value=$false;$o.reason='healthy list observer: missing child or child not exited';return $o}

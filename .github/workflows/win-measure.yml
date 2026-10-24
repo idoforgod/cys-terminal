@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: '22'
       - name: Contract negative controls (no installers launched)
-        run: node --test diag/measure-contract.test.mjs diag/driver-observation.test.mjs diag/evidence-integrity.test.mjs
+        run: node --test diag/measure-contract.test.mjs diag/driver-observation.test.mjs diag/evidence-integrity.test.mjs diag/stream-observation.test.mjs
       - name: Lock exact build run and artifact identity
         id: lock
         env:

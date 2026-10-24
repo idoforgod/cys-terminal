@@ -229,8 +229,9 @@ function Stop-ProcessTree {
 # R2 adaptation: preserve exact pipe bytes while keeping the original BOM-aware text consumers.
 function ConvertFrom-DiagBytes([byte[]]$Bytes) {
     $stream=New-Object IO.MemoryStream(,$Bytes)
-    $reader=New-Object IO.StreamReader($stream,[Text.Encoding]::UTF8,$true)
-    try{return $reader.ReadToEnd()}finally{$reader.Dispose();$stream.Dispose()}
+    $encoding=New-Object Text.UTF8Encoding($false,$true)
+    $reader=New-Object IO.StreamReader($stream,$encoding,$true)
+    try{$text=$reader.ReadToEnd();if($text.IndexOf([char]0xfffd) -ge 0){throw 'decoding produced a replacement character'};return $text}finally{$reader.Dispose();$stream.Dispose()}
 }
 
 function Invoke-Proc {
@@ -240,7 +241,7 @@ function Invoke-Proc {
         [int]$TimeoutSec = 120,
         [string]$WorkDir = ''
     )
-    $r = [ordered]@{ file = $File; args = $Arguments; pid = $null; started_epoch = $null; ended_epoch = $null; stdout_complete = $false; stderr_complete = $false; stdout_bytes = $null; stderr_bytes = $null; rc = $null; timedOut = $false; startError = $null; out = ''; err = ''; ms = 0; pipes_not_drained = $false }
+    $r = [ordered]@{ file = $File; args = $Arguments; pid = $null; started_epoch = $null; ended_epoch = $null; stdout_complete = $false; stderr_complete = $false; stdout_error = $null; stderr_error = $null; stdout_truncated = $false; stderr_truncated = $false; stdout_bytes = $null; stderr_bytes = $null; rc = $null; timedOut = $false; startError = $null; out = ''; err = ''; ms = 0; pipes_not_drained = $false }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $p = $null
     try {
@@ -268,11 +269,11 @@ function Invoke-Proc {
         }
         try { $r['rc'] = $p.ExitCode } catch { $r['rc'] = $null }
         try {
-            if ($tOut.Wait(5000)) { $bytes = $memoryOut.ToArray(); $r['stdout_bytes'] = [Convert]::ToBase64String($bytes); $r['out'] = ConvertFrom-DiagBytes $bytes; $r['stdout_complete'] = $true } else { $r['pipes_not_drained'] = $true }
-        } catch { $r['out'] = '[stdout read failed: ' + $_.Exception.Message + ']' }
+            if ($tOut.Wait(5000)) { $bytes = $memoryOut.ToArray(); $r['stdout_bytes'] = [Convert]::ToBase64String($bytes); $r['out'] = ConvertFrom-DiagBytes $bytes; $r['stdout_complete'] = $true } else { $r['pipes_not_drained'] = $true; $r['stdout_error'] = 'stdout pipe did not drain' }
+        } catch { $r['stdout_complete'] = $false; $r['stdout_error'] = $_.Exception.Message; $r['out'] = '' }
         try {
-            if ($tErr.Wait(5000)) { $bytes = $memoryErr.ToArray(); $r['stderr_bytes'] = [Convert]::ToBase64String($bytes); $r['err'] = ConvertFrom-DiagBytes $bytes; $r['stderr_complete'] = $true } else { $r['pipes_not_drained'] = $true }
-        } catch { $r['err'] = '[stderr read failed: ' + $_.Exception.Message + ']' }
+            if ($tErr.Wait(5000)) { $bytes = $memoryErr.ToArray(); $r['stderr_bytes'] = [Convert]::ToBase64String($bytes); $r['err'] = ConvertFrom-DiagBytes $bytes; $r['stderr_complete'] = $true } else { $r['pipes_not_drained'] = $true; $r['stderr_error'] = 'stderr pipe did not drain' }
+        } catch { $r['stderr_complete'] = $false; $r['stderr_error'] = $_.Exception.Message; $r['err'] = '' }
     } catch {
         $r['startError'] = $_.Exception.Message
     } finally {
@@ -283,7 +284,7 @@ function Invoke-Proc {
     $r['ms'] = [int]$sw.ElapsedMilliseconds
     foreach ($k in @('out', 'err')) {
         $t = [string]$r[$k]
-        if ($t.Length -gt 4000000) { $r[$k] = $t.Substring(0, 4000000) + '...[truncated]'; if($k -eq 'out'){$r['stdout_complete']=$false}else{$r['stderr_complete']=$false} }
+        if ($t.Length -gt 4000000) { $r[$k] = $t.Substring(0, 4000000); if($k -eq 'out'){$r['stdout_complete']=$false;$r['stdout_truncated']=$true}else{$r['stderr_complete']=$false;$r['stderr_truncated']=$true} }
     }
     return $r
 }

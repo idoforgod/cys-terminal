@@ -3,22 +3,125 @@
   "reviewed_source_sha256": "",
   "note": "Review and bind every required producer/channel against the final product before claiming log completeness. Empty sinks are UNMEASURED, never inferred from filenames.",
   "channels": [
-    {"id":"daemon:file","source_ref":"","sink":""},
-    {"id":"daemon:stdout","source_ref":"","sink":""},
-    {"id":"daemon:stderr","source_ref":"","sink":""},
-    {"id":"pack:file","source_ref":"","sink":""},
-    {"id":"pack:stdout","source_ref":"","sink":""},
-    {"id":"pack:stderr","source_ref":"","sink":""},
-    {"id":"app:file","source_ref":"","sink":""},
-    {"id":"app-base:stdout","source_ref":"","sink":""},
-    {"id":"app-base:stderr","source_ref":"","sink":""},
-    {"id":"app-updated:stdout","source_ref":"","sink":""},
-    {"id":"app-updated:stderr","source_ref":"","sink":""},
-    {"id":"installer-base:stdout","source_ref":"","sink":""},
-    {"id":"installer-base:stderr","source_ref":"","sink":""},
-    {"id":"installer-candidate:stdout","source_ref":"","sink":""},
-    {"id":"installer-candidate:stderr","source_ref":"","sink":""},
-    {"id":"app-old-restart:stdout","source_ref":"","sink":""},
-    {"id":"app-old-restart:stderr","source_ref":"","sink":""}
-  ]
+    {
+      "id": "daemon:file",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "daemon:stdout",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "daemon:stderr",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "pack:file",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "pack:stdout",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "pack:stderr",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "app:file",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "app-base:stdout",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "app-base:stderr",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "app-updated:stdout",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "app-updated:stderr",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "installer-base:stdout",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector exists but final product source/sink binding is absent"
+    },
+    {
+      "id": "installer-base:stderr",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector exists but final product source/sink binding is absent"
+    },
+    {
+      "id": "installer-candidate:stdout",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "installer-candidate:stderr",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "app-old-restart:stdout",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    },
+    {
+      "id": "app-old-restart:stderr",
+      "source_ref": "",
+      "sink": "",
+      "status": "UNMEASURED",
+      "reason": "collector unimplemented; F3 completion OUT of 0.14.53 scope by head ruling"
+    }
+  ],
+  "scope_ruling": "R3FIX-WINMEASURE-w12.txt sha256-16 686d0cafb221b493: F3 channel completion OUT of 0.14.53; unbound channels remain UNMEASURED."
 }
