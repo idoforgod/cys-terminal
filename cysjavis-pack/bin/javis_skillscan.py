@@ -870,11 +870,27 @@ def cmd_all(roots, as_json):
     # (regex/AST/taint) and the GIL is enabled, so this must be processes, not threads.
     # ProcessPoolExecutor.map preserves INPUT order, so results[] ordering is unchanged.
     # Falls back to the original serial comprehension if a pool cannot be created.
+    # ★워커 수 상한의 근거 — 더 많은 워커가 더 빠르지 않다(실측 2건, 둘 다 반증):
+    #   · worker-2 census(2026-10-24, 이 호스트): ProcessPool(16) 9,098 ms(8보다 나쁨) ·
+    #     ThreadPool(16) 10,552 ms(직렬보다 느림 — GIL 켜짐 CPython 3.14.7, 이 일은 CPU 바운드).
+    #   · worker-9 sweep(2026-10-24, 같은 호스트 · 114 스킬 · 스캐너 1c23c26c + 규칙 5432b790):
+    #     4=2.284/2.289 s · 8=1.697/1.707 s · 12=1.703/1.677 s · 16=1.764/1.760 s ⇒ 무릎이 8.
+    #   ⇒ 상한을 올리는 변경은 이 두 수치를 다시 재서 뒤집은 다음에만 한다.
     try:
         import concurrent.futures as _cf
         with _cf.ProcessPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as _ex:
             results = list(_ex.map(scan_skill, skills))
-    except Exception:
+    except Exception as _pool_err:
+        # ★폴백은 worker-2 가 자기 티켓에서 벗어나 일부러 넣은 것이고(풀이 못 뜨는 환경에서
+        #   레인 전체의 부트를 깨뜨리지 않으려고) 그대로 유지한다. WP18 이 더한 것은 **한 줄의
+        #   고지**다: 종전엔 조용히 느린 경로로 내려가, 풀이 영영 못 뜨는 기계에서 아무도 그
+        #   사실을 모른 채 8초를 계속 쓰게 됐다(BAR S5 "serial fallback with a stderr note,
+        #   or a loud failure — say which" 의 앞쪽을 고른다). stdout 은 건드리지 않으므로
+        #   출력 동일성(S1)과 무관하다 — 고지는 stderr 로만 간다.
+        #   ★이 except 가 넓은 것은 안전하다: 폴백이 전수를 다시 계산하므로 scan_skill 자체의
+        #   진짜 버그는 삼켜지지 않고 직렬 재실행에서 그대로 올라온다.
+        print("[skillscan] 병렬 풀 기동 실패(%s: %s) — 직렬로 폴백한다(결과는 같고 느리다)."
+              % (type(_pool_err).__name__, _pool_err), file=sys.stderr)
         results = [scan_skill(s) for s in skills]
     worst = max((SEV_ORDER.get(r["severity"], 3) * -1 for r in results), default=0)
     summary = {"scanned": len(results),
