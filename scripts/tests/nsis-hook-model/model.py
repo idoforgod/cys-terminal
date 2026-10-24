@@ -109,11 +109,13 @@ EXPECTED_MACROS = {
     "CYS_PROBE_LEAF", "CYS_PROBE_RUN",
     # WP12 B1 r2 (codex r1 B1-F4): the refusal record is written and read back by these two
     "CYS_REC_CHECK", "CYS_REC_WRITE",
+    # WP12 B1 r3 (codex r2 B1r2-F1): the one runner of every P1 child, with a hard wall-clock bound
+    "CYS_RUN_BOUNDED",
 }
 # sha256 over the sorted census the mirrors depend on: anchors/tokens + the
 # normalized BODY hashes of the modeled macros/callbacks + POSTINSTALL order
 # (see hook_guard)
-GUARD_PIN = "24418d0df7117469da20ef95a2184ca1f5ca77a9aa14034d591f8544761d6e9d"  # re-pinned 2026-10-24 for WP12 B1 r2 (P1 bodies only: FIRSTLINE/PRIOR_SCAN/HANDOFF/PROBE_REFUSE, new REC_CHECK/REC_WRITE, PREINSTALL worker token lines removed; no mirrored body moved)
+GUARD_PIN = "cf8208161bb6b047dcb61ee545c2a7db5e92bcc2fb1d13756e8477c6a7fe9b45"  # re-pinned 2026-10-24 for WP12 B1 r3 (P1 bodies only: HANDOFF and PROBE_LEAF, new RUN_BOUNDED; PREINSTALL and every mirrored body unchanged)
 
 
 def hook_path():
@@ -170,7 +172,8 @@ def p1_structure_check(text):
     leaf = _body(text, "macro", "CYS_PROBE_LEAF")
     if page is None or pre is None or refuse is None or leaf is None:
         return bad + ["a P1 body is missing (cys_probe_page / PREINSTALL / CYS_PROBE_REFUSE / CYS_PROBE_LEAF)"]
-    for need in ('/CYSPROBE=', 'nsExec::ExecToStack /TIMEOUT=', '!insertmacro CYS_PROBE_REFUSE',
+    for need in ('/CYSPROBE=', '!insertmacro CYS_RUN_BOUNDED `"$EXEPATH" /S /UPDATE /CYSPROBE=',
+                 ' 120000 "ppw"', '!insertmacro CYS_PROBE_REFUSE',
                  'StrCpy $CysMutexHeld "1"'):
         if need not in page:
             bad.append("cys_probe_page lacks %r" % need)
@@ -198,9 +201,10 @@ def p1_structure_check(text):
         if forbidden in refuse:
             bad.append("CYS_PROBE_REFUSE touches a process or a canonical file: %r" % forbidden)
     # exact (case-sensitive StrCmpS) comparisons of the F3 grammar, and the build-ID character loop
-    for need in ("/TIMEOUT=30000", '"cysd ${VER} (build "', 'StrCmpS $R5 "cys ${VER}"',
+    for need in ('!insertmacro CYS_RUN_BOUNDED `"${DIR}\\${EXE}" ${ARGS}`', " 30000 ",
+                 '"cysd ${VER} (build "', 'StrCmpS $R5 "cys ${VER}"',
                  'StrCmpS $R5 "cys-app ${VER}"', "StrCmpS $R6 $R4 ", 'StrCmpS $R2 ")" ',
-                 "StrCmpS $R4 $R7 ", "CYS_DEL_RETRY"):
+                 "StrCmpS $R4 $R7 ", 'StrCmp $R7 "unconfirmed" cys_lf_unc_'):
         if need not in leaf:
             bad.append("CYS_PROBE_LEAF lacks %r (shared grammar / bounded termination)" % need)
     # R2-F4: the allowed build-ID set is exactly printable ASCII 0x21-0x7E without ')'
@@ -243,13 +247,36 @@ def p1_structure_check(text):
         bad.append("cys_probe_page worker-outcome classification broken (B1-F1): %r" % list(zip(cls, at)))
     # B1-F2: every process query of the hand-off is bounded, under one deadline, rc kept apart
     for need in ("System::Call 'kernel32::GetTickCount()i.R8'", "IntCmp $R7 60000 ",
-                 "IntCmp $R7 95000 ", 'StrCmp $R6 "0" 0 cys_ho_qfail_${TAG}',
+                 "IntCmp $R7 95000 ", 'StrCmp $CysRbRc "0" 0 cys_ho_qfail_${TAG}',
                  'StrCpy $CysHandoff "initiator-unknown"'):
         if need not in ho:
             bad.append("CYS_HANDOFF lacks %r (B1-F2 bound / query status)" % need)
-    n_exec = ho.count("nsExec::")
-    if n_exec != 1 or ho.count("nsExec::ExecToStack /TIMEOUT=5000 ") != 1:
-        bad.append("CYS_HANDOFF: every nsExec call must carry /TIMEOUT=5000 (%d calls)" % n_exec)
+    if ho.count("!insertmacro CYS_RUN_BOUNDED `tasklist ") != 1 or ' 5000 "${TAG}q"' not in ho:
+        bad.append("CYS_HANDOFF: the tasklist query must run once per loop under CYS_RUN_BOUNDED 5000 (B1r2-F1)")
+    # B1r2-F1: no P1 child is waited on by nsExec (its /TIMEOUT is a no-output timer and its wait
+    # does not return while the child lives) - everything between the P1 banner and the probe page,
+    # and PREINSTALL up to the GUI kill, is free of nsExec
+    def code(block):    # instruction lines only (comments may name nsExec)
+        return "\n".join(l for l in block.splitlines() if not l.strip().startswith(";"))
+    a, z = text.find("WP12-WINSAC-0.14.53 · P1"), text.find("Page custom cys_probe_page")
+    pre_p1 = pre[:pre.find("nsExec::Exec 'taskkill /F /IM cys-app.exe'")]     # up to the GUI kill line
+    if a < 0 or z < a or "nsExec::" in code(text[a:z]) or "nsExec::" in code(pre_p1):
+        bad.append("an nsExec call is back in P1 - every P1 child must run under CYS_RUN_BOUNDED (B1r2-F1)")
+    rb = _body(text, "macro", "CYS_RUN_BOUNDED") or ""
+    order = ["!error", "Push $R3", "kernel32::CreateFileW(", "kernel32::CreateProcessW(",
+             "kernel32::WaitForSingleObject(p R5, i ${MS})", 'StrCmp $R8 "0" cys_rb_exit_${TAG} 0',
+             'StrCpy $R9 "unconfirmed"', "kernel32::TerminateProcess(p R5, i 1)",
+             "kernel32::WaitForSingleObject(p R5, i 5000)", 'StrCmp $R8 "0" 0 cys_rb_close_${TAG}',
+             "kernel32::GetExitCodeProcess(", "StrCpy $CysRbRc $R9", "Pop $R3"]
+    at = [rb.find(x) for x in order]
+    if -1 in at or at != sorted(at) or rb.count("Push $R") != 7 or rb.count("Pop $R") != 7 or \
+            "nsExec" in rb or "INFINITE" in rb or "i -1)" in rb:
+        bad.append("CYS_RUN_BOUNDED: bounded wait -> TerminateProcess -> bounded confirm wait broken (B1r2-F1): %r"
+                   % list(zip(order, at)))
+    if 'StrCmp $R2 "unconfirmed" 0 cys_pp_c0' not in page or \
+            page.find('StrCmp $R2 "unconfirmed" 0 cys_pp_c0') > page.find("cys_pp_classified:") or \
+            "!insertmacro CYS_PROBE_CLEAN" in page[page.find('StrCmp $R2 "unconfirmed" 0 cys_pp_c0'):page.find("cys_pp_c0:")]:
+        bad.append("cys_probe_page must leave the folder of an unconfirmed worker untouched (B1r2-F1)")
     # B1-F3: CYS_FIRSTLINE refuses its scratch register as IN/OUT, and no caller passes it
     fl = _body(text, "macro", "CYS_FIRSTLINE") or ""
     for need in ('!if "${IN}" == "$R9"', '!if "${OUT}" == "$R9"'):

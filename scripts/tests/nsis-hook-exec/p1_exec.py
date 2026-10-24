@@ -23,11 +23,13 @@ What is real and what is simulated.
             rules, 32-bit IntOp, FileRead keeping CR/LF, FileWrite setting the error flag,
             FileClose reporting nothing, IfErrors clearing the flag).
   simulated the operating system: files and folders (read-only files, running images that cannot be
-            deleted, writes that fail after N bytes), processes started through nsExec (the
-            probe-only worker, tasklist) with nsExec's documented contract (Contrib/nsExec/nsexec.c,
-            identical loop in NSIS 3.11 and 3.13: /TIMEOUT = time without output, a call returns only
-            after the process ended), the clock (GetTickCount, Sleep), windows and processes for the
-            hand-off, the console.
+            deleted, writes that fail after N bytes); child processes (the probe-only worker, the three
+            leaves, tasklist) from ONE model - ends after N ms or never, may keep printing, may refuse
+            TerminateProcess, may fail WaitForSingleObject, may fail to start - reached through
+            CreateProcessW/WaitForSingleObject/TerminateProcess/GetExitCodeProcess (current hook) or
+            through nsExec as Contrib/nsExec/nsexec.c implements it (older bytes; NSIS 3.11 = 3.13:
+            /TIMEOUT = time without output, the call returns only after the child ended); the clock
+            (GetTickCount, Sleep), windows and processes for the hand-off, the console.
   so        a PASS here is evidence about the hook's LOGIC against those outcomes, not a Windows run.
             Windows behaviour (real SAC/App Control refusals, real nsExec timing, real dialogs) stays
             UNMEASURED until windows-build.yml win-update-probe runs.
@@ -278,9 +280,12 @@ class Machine:
         self.exitcode = None
         self.dialogs, self.console, self.details, self.execs, self.nsexec_log = [], [], [], [], []
         self.worker_end = None
-        self.handoff_start = None
+        self.worker_start = None
         self.gui_since = None
         self.tasklist_i = 0
+        self.procs = {}        # process handle -> simulated child
+        self.mem = {}          # System struct address -> list of field values
+        self.spawned = []      # (command line, clock) of every child started
 
     # ── strings ────────────────────────────────────────────────────────────
     def ex(self, s):
@@ -417,53 +422,95 @@ class Machine:
         self.handles[h] = dict(k=k, pos=pos, mode=mode)
         return h
 
-    # ── simulated processes ────────────────────────────────────────────────
-    def sim_nsexec(self, cmd, timeout):
-        self.nsexec_log.append((cmd, timeout))
+    # ── simulated processes: ONE model behind nsExec (old bytes) and CreateProcessW (new) ──
+    def behavior(self, cmd):
+        """What the simulated child does: ms (None = never ends by itself), exit, out, chatty (keeps
+        printing), term_fails (TerminateProcess fails), wait_fails (WaitForSingleObject fails),
+        start_fails (CreateProcess fails - e.g. blocked by code integrity)."""
         if "/CYSPROBE=" in cmd:
-            r = self.worker(cmd, timeout)
-            self.worker_end = self.clock
-            return r
+            w = dict(self.scen["worker"])
+            if w.get("exit") == "timeout":
+                w["ms"] = None
+            w.setdefault("ms", 9000)
+            w["kind"] = "worker"
+            return w
         if cmd.startswith("tasklist "):
             steps = self.scen["tasklist"]
             st = steps[min(self.tasklist_i, len(steps) - 1)]
             self.tasklist_i += 1
-            if st == "running":
-                self.clock += 200
-                return "0", '"cys-app.exe","4321","Console","1","61,440 K"\r\n'
-            if st == "gone":
-                self.clock += 200
-                return "0", "INFO: No tasks are running which match the specified criteria.\r\n"
-            if st == "fail":
-                self.clock += 200
-                return "1", "ERROR: Invalid query\r\n"
-            if st == "error":
-                return "error", ""
-            if st == "stall":
-                if not timeout:
-                    raise Unbounded("tasklist stalled with no output and the call has no /TIMEOUT")
-                self.clock += timeout
-                return "timeout", ""
-            raise ExecError("tasklist step %r" % st)
+            if st not in TASKLIST:
+                raise ExecError("tasklist step %r" % st)
+            return dict(TASKLIST[st], kind="tasklist")
+        m = re.match(r'^"(.+)\\(cysd|cys|cys-app)\.exe"(.*)$', cmd)
+        if m:
+            b = dict(DEFAULT_LEAF[m.group(2)])
+            b.update(self.scen.get("leaves", {}).get(m.group(2), {}))
+            b.update(kind="leaf", name=m.group(2), image=m.group(1) + "\\" + m.group(2) + ".exe", args=m.group(3))
+            return b
         raise ExecError("no simulated process for %r" % cmd)
 
-    def worker(self, cmd, timeout):
-        w = self.scen["worker"]
-        m = re.search(r"/D=(.+)$", cmd)
-        d = m.group(1)
-        self.fs.mkdirs(d)
-        for leaf in w.get("leaves", ("cysd.exe", "cys.exe", "cys-app.exe")):
-            self.fs.add(d + "\\" + leaf, "MZ", running=leaf in w.get("running", ()))
-        if w.get("result") is not None:
-            self.fs.add(d + "\\probe-result.txt", "".join(l + "\r\n" for l in w["result"]))
-        ex = w["exit"]
-        if ex == "timeout":
-            if not timeout:
-                raise Unbounded("worker never ends and the call has no /TIMEOUT")
-            self.clock += timeout
-            return "timeout", ""
-        self.clock += w.get("ms", 9000)
-        return ex, ""
+    def spawn(self, cmd, outk=None):
+        b = self.behavior(cmd)
+        self.spawned.append((cmd, self.clock))
+        if b.get("start_fails"):
+            return None
+        p = dict(b, start=self.clock, done=False, killed=False, outk=outk)
+        p["end"] = None if b.get("ms") is None else self.clock + b["ms"]
+        if p["kind"] == "worker":
+            self.worker_start = self.clock
+            d = re.search(r"/D=(.+)$", cmd).group(1)
+            self.fs.mkdirs(d)
+            for leaf in b.get("leaves", ("cysd.exe", "cys.exe", "cys-app.exe")):
+                self.fs.add(d + "\\" + leaf, "MZ", running=leaf in b.get("running", ()))
+            if b.get("result") is not None:
+                self.fs.add(d + "\\probe-result.txt", "".join(l + "\r\n" for l in b["result"]))
+        if p.get("image") and key(p["image"]) in self.fs.files:
+            self.fs.files[key(p["image"])]["running"] = True
+        if p.get("chatty") and outk in self.fs.files:
+            self.fs.files[outk]["data"] += "progress...\r\n" * 3
+        return p
+
+    def finish(self, p, killed):
+        if p["done"]:
+            return
+        p["done"], p["killed"] = True, killed
+        if p.get("image") and key(p["image"]) in self.fs.files:
+            self.fs.files[key(p["image"])]["running"] = False
+        if killed:
+            p["exit"] = "1"
+        else:
+            if p["outk"] in self.fs.files:
+                self.fs.files[p["outk"]]["data"] += p.get("out", "")
+            if p["kind"] == "leaf" and p["name"] == "cys-app":
+                m = re.search(r'--cys-probe "(.+)"', p["args"])
+                if m and p.get("writes", True):
+                    self.fs.add(m.group(1), "cys-app " + NEWV)
+        if p["kind"] == "worker":
+            self.worker_end = self.clock
+
+    def sim_nsexec(self, cmd, timeout):
+        """nsExec::ExecToStack as Contrib/nsExec/nsexec.c implements it (NSIS 3.11 = 3.13): the loop
+        ends only when WaitForSingleObject(hProcess, 0) signals and the pipe is empty; /TIMEOUT counts
+        time WITHOUT OUTPUT; on a timeout it calls TerminateProcess and keeps looping."""
+        self.nsexec_log.append((cmd, timeout))
+        p = self.spawn(cmd)
+        if p is None:
+            return "error", ""
+        if p.get("wait_fails"):
+            raise Unbounded("nsExec: WaitForSingleObject on the child keeps failing, its loop never ends")
+        if p["end"] is not None and (p.get("chatty") or not timeout or p["end"] - p["start"] <= timeout):
+            self.clock = p["end"]
+            self.finish(p, False)
+            return p.get("exit", "0"), p.get("out", "")
+        if p.get("chatty"):
+            raise Unbounded("nsExec: the child keeps printing, so the no-output timer never fires")
+        if not timeout:
+            raise Unbounded("nsExec without /TIMEOUT on a child that does not end")
+        self.clock = p["start"] + timeout
+        if p.get("term_fails"):
+            raise Unbounded("nsExec: TerminateProcess fails, the child lives, nsExec keeps waiting")
+        self.finish(p, True)
+        return "timeout", ""
 
     def gui_windows(self):
         if self.gui_since is None:
@@ -475,13 +522,31 @@ class Machine:
                      image=g.get("image", self.v["INSTDIR"] + "\\cys-app.exe"))]
 
     def system(self, spec):
+        def reg(name):
+            return ("R" + name[1:]) if name.startswith("R") else name[1:]
+
+        ms = re.match(r"^\*\((.*)\)\s*p\s*\.\s*([rR]\d)$", spec)
+        if ms:                                    # new struct: *(fields) p .Rx
+            vals = []
+            for f in [x.strip() for x in ms.group(1).split(",")]:
+                body = f.split(None, 1)[1].strip() if " " in f else ""
+                vals.append(self.v[reg(body)] if re.match(r"^[rR]\d$", body) else body)
+            addr = str(70000 + len(self.mem) * 64)
+            self.mem[addr] = vals
+            self.v[reg(ms.group(2))] = addr
+            return
+        ms = re.match(r"^\*(\d+)\((.*)\)$", spec)
+        if ms:                                    # read struct fields: *addr(p .R5, ...)
+            fields = self.mem[ms.group(1)]
+            for i, f in enumerate([x.strip() for x in ms.group(2).split(",")]):
+                mm = re.search(r"\.\s*([rR]\d)$", f)
+                if mm:
+                    self.v[reg(mm.group(1))] = fields[i]
+            return
         m = re.match(r"^(\w+)::(\w+)\((.*)\)\s*(.*)$", spec)
         if not m:
             raise ExecError("System::Call spec %r" % spec)
         fn, params, ret = m.group(2), [p.strip() for p in m.group(3).split(",")], m.group(4)
-
-        def reg(name):
-            return ("R" + name[1:]) if name.startswith("R") else name[1:]
 
         def val(p):
             body = p.split(None, 1)[1].strip() if " " in p else ""
@@ -503,9 +568,66 @@ class Machine:
             rv, lasterr = sc.get("CreateMutexW", ("500", 0))
         elif fn == "OpenMutexW":
             rv = sc.get("OpenMutexW", "0")
+        elif fn == "CreateFileW":
+            path = val(params[0])
+            if not self.fs.parent_exists(path):
+                rv = "-1"
+            else:
+                f = self.fs.files.get(key(path)) or self.fs.add(path, "")
+                f["data"] = ""
+                rv = str(self.next_handle)
+                self.next_handle += 4
+                self.handles[rv] = dict(k=key(path), pos=0, mode="w")
+        elif fn == "CreateProcessW":
+            cmd, si, pi = val(params[1]), self.mem[val(params[8])], val(params[9])
+            outk = None
+            if self.atoi(si[11]) & 0x100 and si[16] in self.handles:
+                outk = self.handles[si[16]]["k"]
+            p = self.spawn(cmd, outk)
+            if p is None:
+                rv = "0"
+            else:
+                h = str(self.next_handle)
+                self.next_handle += 4
+                self.procs[h] = p
+                self.mem[pi] = [h, str(self.next_handle), "4242", "4343"]
+                self.next_handle += 4
+                rv = "1"
         elif fn == "WaitForSingleObject":
-            rv = sc.get("WaitForSingleObject", "128")
+            h = val(params[0])
+            p = self.procs.get(h)
+            if p is None:
+                rv = sc.get("WaitForSingleObject", "128")       # the retired mutex of older bytes
+            elif p.get("wait_fails"):
+                rv = "-1"
+            elif p["done"]:
+                rv = "0"
+            elif self.atoi(val(params[1])) == -1:          # INFINITE (0xFFFFFFFF)
+                if p["end"] is None:
+                    raise Unbounded("WaitForSingleObject(INFINITE) on a child that never ends")
+                self.clock = max(self.clock, p["end"])
+                self.finish(p, False)
+                rv = "0"
+            elif p["end"] is not None and p["end"] <= self.clock + self.atoi(val(params[1])):
+                self.clock = max(self.clock, p["end"])
+                self.finish(p, False)
+                rv = "0"
+            else:
+                self.clock += self.atoi(val(params[1]))
+                rv = "258"
+        elif fn == "TerminateProcess":
+            p = self.procs[val(params[0])]
+            if p.get("term_fails"):
+                rv = "0"
+            else:
+                self.finish(p, True)
+                rv = "1"
+        elif fn == "GetExitCodeProcess":
+            p = self.procs[val(params[0])]
+            self.v[outs[1]] = p.get("exit", "0") if p["done"] else "259"
+            rv = "1"
         elif fn == "CloseHandle":
+            self.handles.pop(val(params[0]), None)
             rv = "1"
         elif fn == "AttachConsole":
             rv = "1"
@@ -583,9 +705,10 @@ class Machine:
         if name not in self.funcs:
             raise ExecError("no Function %s in the hook" % name)
         prog = []
-        defines = dict(NSIS_MAX_STRLEN=str(NSIS_MAX_STRLEN))
-        defines.update(self.scen.get("defines", {}))
-        expand(self.funcs[name][1], {}, defines, self.macros, prog, 0, name)
+        expand(self.funcs[name][1], {}, self.defines(), self.macros, prog, 0, name)
+        return self.run_prog(prog)
+
+    def run_prog(self, prog):
         self.prog = prog
         self.labels = {}
         for i, it in enumerate(prog):
@@ -766,6 +889,22 @@ class Machine:
             self.stack.insert(0, E(a[0]))
         elif op == "System::Call":
             self.system(E(a[0]))
+        elif op == "System::Free":
+            self.mem.pop(E(a[0]), None)
+        elif op == "InitPluginsDir":
+            self.fs.mkdirs(self.v["PLUGINSDIR"])
+        elif op == "nsExec::Exec":
+            if E(a[-1]).startswith("taskkill /F /IM cys-app.exe"):
+                raise Halt("proceed")      # PREINSTALL step 1: the probe passed; the install path starts
+            raise ExecError("nsExec::Exec outside the simulated path: %r" % E(a[-1]))
+        elif op == "File":
+            m = re.match(r"^/oname=(.+)$", E(a[0]))
+            if not m:
+                raise ExecError("File form %r" % a)
+            if self.scen.get("extract_fails"):
+                self.err = True
+            else:
+                self.fs.add(m.group(1), "MZ-new")
         elif op == "Exec":
             self.execs.append(E(a[0]))
             if self.gui_since is None:
@@ -810,6 +949,21 @@ class Machine:
     def nsexec_call(self, cmd, timeout):
         return self.sim_nsexec(cmd, timeout)
 
+    def run_macro(self, name):
+        """run a parameterless macro (NSIS_HOOK_PREINSTALL) as if inserted in Section Install"""
+        if name not in self.macros:
+            raise ExecError("no macro %s in the hook" % name)
+        prog = []
+        expand(self.macros[name][1], {}, self.defines(), self.macros, prog, 0, name)
+        return self.run_prog(prog)
+
+    def defines(self):
+        d = dict(NSIS_MAX_STRLEN=str(NSIS_MAX_STRLEN), NSIS_PTR_SIZE="4", VERSION=NEWV,
+                 CYS_SRC_CYS="binaries\\cys.exe", CYS_SRC_CYSD="binaries\\cysd.exe",
+                 MAINBINARYSRCPATH="binaries\\cys-app.exe")
+        d.update(self.scen.get("defines", {}))
+        return d
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # scenarios
@@ -820,9 +974,26 @@ TEMP = r"D:\cysroot\Local\Temp"
 NEWV = "0.14.53"
 OLDV = "0.14.52"
 
+# simulated children (see Machine.behavior)
+TASKLIST = {
+    "running": dict(ms=200, exit="0", out='"cys-app.exe","4321","Console","1","61,440 K"\r\n'),
+    "gone": dict(ms=200, exit="0", out="INFO: No tasks are running which match the specified criteria.\r\n"),
+    "fail": dict(ms=200, exit="1", out="ERROR: Invalid query\r\n"),
+    "error": dict(start_fails=True),
+    "stall": dict(ms=None),
+    "chatty": dict(ms=None, chatty=True),
+    "hang-term-fails": dict(ms=None, term_fails=True),
+    "wait-fails": dict(ms=None, wait_fails=True),
+}
+DEFAULT_LEAF = {
+    "cysd": dict(ms=300, exit="0", out="cysd %s (build a1b2c3d)\r\n" % NEWV),
+    "cys": dict(ms=300, exit="0", out="cys %s\r\n" % NEWV),
+    "cys-app": dict(ms=500, exit="0", out=""),
+}
+
 
 def base(marker=OLDV + "\r\n", update=False, prior=True, worker=None, tasklist=("gone",),
-         gui=None, write_limit=None, extra=None, silent=False, tick_base=1000000):
+         gui=None, write_limit=None, extra=None, silent=False, tick_base=1000000, entry="page", leaves=None):
     fs = FS()
     fs.mkdirs(INST)
     fs.mkdirs(TEMP)
@@ -831,11 +1002,11 @@ def base(marker=OLDV + "\r\n", update=False, prior=True, worker=None, tasklist=(
             fs.add(INST + "\\" + f, "MZ-old")
         if marker is not None:
             fs.add(INST + "\\cys-installed-version.txt", marker)
-    cmd = '"D:\\cysroot\\Downloads\\cys-setup.exe"' + (" /P /R /UPDATE" if update else "")
+    cmd = '"D:\\cysroot\\Downloads\\cys-setup.exe"' + (" /S" if silent else "") + (" /P /R /UPDATE" if update and not silent else "") + (" /UPDATE" if update and silent else "")
     s = dict(instdir=INST, temp=TEMP, exepath=r"D:\cysroot\Downloads\cys-setup.exe", cmdline=cmd,
              silent=silent, fs=fs, tasklist=list(tasklist), gui=gui, tick_base=tick_base,
              write_limit={key(k): v for k, v in (write_limit or {}).items()},
-             worker=worker or refused_worker())
+             worker=worker or refused_worker(), entry=entry, leaves=leaves or {})
     if extra:
         extra(fs)
     return s
@@ -1202,6 +1373,103 @@ def _(M):
     return p
 
 
+# ── B1r2-F1: every P1 child has a HARD wall-clock bound (round 3) ─────────────
+PAGE_BOUND_MS = 130000      # worker: 120 s + 5 s confirmed termination, then the refusal
+SILENT_BOUND_MS = 130000    # 3 leaves x (30 s + 5 s) + cleanup retries
+HANDOFF_BOUND_MS = 110000   # 60 s + one 10 s query, window search to 95 s, one 5 s re-check
+
+
+def old_untouched(m, p):
+    for f in ("cysd.exe", "cys.exe", "cys-app.exe"):
+        e = m.fs.files.get(key(INST + "\\" + f))
+        if e is None or e["data"] != "MZ-old":
+            p.append("the installed %s changed" % f)
+    mk = m.fs.files.get(key(INST + "\\cys-installed-version.txt"))
+    if mk is None or mk["data"] != OLDV + "\r\n":
+        p.append("the installed version marker changed")
+
+
+def _worker_case(cid, what, **w):
+    def fn(M):
+        m, h = M(base(worker=dict(dict(result=None), **w)))
+        p = []
+        expect_refused(m, h, p)
+        old_untouched(m, p)
+        took = m.clock - (m.worker_start or 0)
+        if took > PAGE_BOUND_MS:
+            p.append("refusal took %d ms after the worker started (bound %d)" % (took, PAGE_BOUND_MS))
+        if m.v["CysCleanup"] != w.get("want_cleanup", "cleanup-unconfirmed"):
+            p.append("cleanup %r, want %r" % (m.v["CysCleanup"], w.get("want_cleanup", "cleanup-unconfirmed")))
+        if w.get("want_cleanup", "cleanup-unconfirmed") == "cleanup-unconfirmed" and not probe_dirs(m):
+            p.append("the folder of a worker that may still run was removed")
+        return p
+    case(cid, "B1r2-F1", what)(fn)
+
+
+_worker_case("X-R3-worker-hang-terminate-fails", "worker never ends and TerminateProcess fails",
+             ms=None, term_fails=True)
+_worker_case("X-R3-worker-wait-fails", "WaitForSingleObject on the worker fails", ms=None, wait_fails=True)
+_worker_case("X-R3-worker-keeps-printing", "worker never ends and keeps printing (terminate works)",
+             ms=None, chatty=True, want_cleanup="ok")
+
+
+def _leaf_case(cid, what, finding, want_status, **leaf):
+    def fn(M):
+        m, h = M(base(entry="preinstall", silent=True, update=True, leaves=dict(cysd=leaf)))
+        p = []
+        expect_refused(m, h, p)
+        old_untouched(m, p)
+        if m.clock > SILENT_BOUND_MS:
+            p.append("silent refusal took %d ms (bound %d)" % (m.clock, SILENT_BOUND_MS))
+        if m.v["CysPrCysd"] != want_status:
+            p.append("probe:cysd=%r, want %r" % (m.v["CysPrCysd"], want_status))
+        if want_status == "cleanup-unconfirmed" and m.v["CysCleanup"] != "cleanup-unconfirmed":
+            p.append("cleanup %r, want cleanup-unconfirmed" % m.v["CysCleanup"])
+        return p
+    case(cid, finding, what)(fn)
+
+
+_leaf_case("X-R3-leaf-hang-terminate-fails", "cysd.exe never ends and TerminateProcess fails",
+           "B1r2-F1", "cleanup-unconfirmed", ms=None, term_fails=True)
+_leaf_case("X-R3-leaf-wait-fails", "WaitForSingleObject on cysd.exe fails", "B1r2-F1",
+           "cleanup-unconfirmed", ms=None, wait_fails=True)
+_leaf_case("X-R3-leaf-keeps-printing", "cysd.exe never ends and keeps printing", "B1r2-F1",
+           "timeout", ms=None, chatty=True)
+_leaf_case("X-R3-leaf-prints-past-the-bound", "cysd.exe prints for 200 s, then exits with the right line",
+           "B1r2-F1", "timeout", ms=200000, chatty=True)
+_leaf_case("X-R3-leaf-blocked", "cysd.exe cannot start (code integrity) -> error", "control", "error",
+           start_fails=True)
+
+
+@case("X-R3-inline-pass", "control", "silent install, all three leaves pass -> the install path starts")
+def _(M):
+    m, h = M(base(entry="preinstall", silent=True, update=True))
+    p = []
+    if h != "proceed":
+        p.append("halt %r, want proceed (exit %r, blocked %r)" % (h, m.exitcode, m.v["CysBlocked"]))
+    if probe_dirs(m) or m.v["CysCleanup"] != "ok":
+        p.append("probe folder %r cleanup %r" % (probe_dirs(m), m.v["CysCleanup"]))
+    return p
+
+
+def _query_case(cid, what, step):
+    def fn(M):
+        m, h = M(base(update=True, tasklist=(step,), gui=dict(after_ms=2000)))
+        p = []
+        expect_refused(m, h, p)
+        if _handoff_ms(m) > HANDOFF_BOUND_MS:
+            p.append("hand-off took %d ms (bound %d)" % (_handoff_ms(m), HANDOFF_BOUND_MS))
+        if m.execs or m.v["CysHandoff"] != "initiator-unknown":
+            p.append("execs %r handoff %r, want no relaunch + initiator-unknown" % (m.execs, m.v["CysHandoff"]))
+        return p
+    case(cid, "B1r2-F1", what)(fn)
+
+
+_query_case("X-R3-query-hang-terminate-fails", "tasklist never ends and TerminateProcess fails", "hang-term-fails")
+_query_case("X-R3-query-wait-fails", "WaitForSingleObject on tasklist fails", "wait-fails")
+_query_case("X-R3-query-keeps-printing", "tasklist never ends and keeps printing", "chatty")
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 
 def make_runner(macros, funcs, uservars):
@@ -1219,7 +1487,10 @@ def make_runner(macros, funcs, uservars):
                 m.fs.files[key(path)]["write_limit"] = lim_all
             return h
         m.fopen = fopen
-        halt = m.run_function("cys_probe_page")
+        if scen["entry"] == "page":
+            halt = m.run_function("cys_probe_page")
+        else:
+            halt = m.run_macro("NSIS_HOOK_PREINSTALL")
         return m, halt
     return M
 

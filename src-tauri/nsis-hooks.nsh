@@ -576,18 +576,19 @@ FunctionEnd
 ;              own .cys-probe-* folder); (b) silent mode (no pages run) probes inline, before the
 ;              GUI kill and before the template's File lines.
 ;  Probe = extract the three new binaries into $INSTDIR\.cys-probe-<tick> and run each with a
-;  30 s no-output bound: cysd.exe --version must print exactly "cysd V (build ID)" (ID non-empty, no space,
+;  30 s wall-clock bound: cysd.exe --version must print exactly "cysd V (build ID)" (ID non-empty, no space,
 ;  no ')'), cys.exe --version exactly "cys V", cys-app.exe --cys-probe <file> must write exactly
 ;  "cys-app V" (exit 0 alone never passes). V = this installer's version.
-;  Termination is confirmed, never assumed (R2-F2 + B1-F1). nsExec returns only after the process it
-;  started has ended: it waits on its own process handle, and after a timeout it calls
-;  TerminateProcess and keeps waiting (Contrib/nsExec/nsexec.c - the same loop in the shipped NSIS
-;  3.11 and in 3.13). /TIMEOUT there is time WITHOUT OUTPUT, not elapsed time: our leaves print one
-;  line and exit, the worker prints nothing. So the worker is gone whenever nsExec returns; a LEAF is
-;  proven ended only when the worker classified it (worker exit 0 with result=pass, or exit 6 with
-;  result=fail and all three statuses) or when its image could be deleted (a running image cannot
-;  be). Unconfirmed = "cleanup-unconfirmed" in the record, the folder stays, and the install never
-;  proceeds.
+;  Every child of P1 (the worker, each leaf, tasklist) runs under CYS_RUN_BOUNDED: a HARD wall-clock
+;  bound (B1r2-F1). nsExec is not used here: its /TIMEOUT counts time WITHOUT OUTPUT and its wait does
+;  not return while the child lives (Contrib/nsExec/nsexec.c, NSIS 3.11 = 3.13), so it cannot bound
+;  an installer. CYS_RUN_BOUNDED keeps the process handle, waits with WaitForSingleObject(ms), and on
+;  a timeout or a failed wait calls TerminateProcess and waits 5 s more on the same handle; only a
+;  signalled handle counts as ended. Termination is confirmed, never assumed (R2-F2 + B1-F1): a worker
+;  that could not be confirmed ended leaves its folder untouched; a LEAF is proven ended only when its
+;  prober classified it (worker exit 0 with result=pass, or exit 6 with result=fail and all three
+;  statuses) or when its image could be deleted (a running image cannot be). Unconfirmed =
+;  "cleanup-unconfirmed" in the record, and the install never proceeds.
 ;  Nothing here kills a process by name. Hand-off after a refused in-app update (R2-F1): wait
 ;  (bounded) for the old app to exit, relaunch it, and report relaunched-ok only when a visible
 ;  top-level window belongs to a process whose image path is $INSTDIR\cys-app.exe, twice 5 s apart.
@@ -612,6 +613,7 @@ Var CysHoN         ; hand-off iteration belt (B1-F2: the deadline is the bound, 
 Var CysRecErr      ; "" or record failures: open-failed:<p> write-failed:<p> not-persisted:<p>
                    ;   handoff-line-not-written:<p> (B1-F4)
 Var CysDetails     ; dialog "Details": the record path, or the complete diagnostic when none was saved
+Var CysRbRc        ; CYS_RUN_BOUNDED result: <exit code> | timeout | wait-failed | unconfirmed | error
 
 ; first line of IN (cut at CR or LF) -> OUT. Uses $R9 as scratch, so neither IN nor OUT may be $R9
 ; (B1-F3: with $R9 as IN and OUT the position overwrote the text and every marker read as empty).
@@ -649,6 +651,75 @@ cys_dr_done_${TAG}:
 cys_dr_fail_${TAG}:
   SetErrors
 cys_dr_end_${TAG}:
+!macroend
+
+; Run CMD with stdout and stderr in OUTFILE under a HARD wall-clock bound of MS milliseconds
+; (B1r2-F1). The handle from CreateProcessW is kept; WaitForSingleObject(MS) waits on it. On
+; WAIT_TIMEOUT or WAIT_FAILED: TerminateProcess, then a second WaitForSingleObject of 5000 ms. Only a
+; signalled handle counts as ended. $CysRbRc:
+;   <exit code>  it ended by itself within MS
+;   timeout      it ran past MS; the termination was confirmed by the second wait
+;   wait-failed  the first wait failed; the termination was confirmed by the second wait
+;   unconfirmed  the termination or the second wait could not be confirmed - it MAY STILL RUN
+;   error        it did not start (CreateFileW or CreateProcessW failed) or its exit code was unreadable
+; Every path returns within MS + 5000 ms plus the API calls. Struct layouts are x86 (STARTUPINFOW
+; 68 B, PROCESS_INFORMATION 16 B, SECURITY_ATTRIBUTES 12 B; lowercase System types are packed, which
+; equals the x86 layout): the Tauri installer stub is x86-unicode. $R3-$R9 are preserved.
+!macro CYS_RUN_BOUNDED CMD OUTFILE MS TAG
+  !if "${NSIS_PTR_SIZE}" != "4"
+    !error "cys: CYS_RUN_BOUNDED struct layouts are x86 only (NSIS_PTR_SIZE ${NSIS_PTR_SIZE})"
+  !endif
+  Push $R3
+  Push $R4
+  Push $R5
+  Push $R6
+  Push $R7
+  Push $R8
+  Push $R9
+  StrCpy $R9 "error"
+  StrCpy $R3 `${CMD}`
+  StrCpy $R4 "${OUTFILE}"
+  System::Call '*(i 12, p 0, i 1) p .R6'
+  System::Call 'kernel32::CreateFileW(w R4, i 0x40000000, i 3, p R6, i 2, i 0x80, p 0) p .R5'
+  System::Free $R6
+  StrCmp $R5 "-1" cys_rb_end_${TAG} 0
+  System::Call '*(i 68, p 0, p 0, p 0, i 0, i 0, i 0, i 0, i 0, i 0, i 0, i 0x101, h 0, h 0, p 0, p 0, p R5, p R5) p .R6'
+  System::Call '*(p 0, p 0, i 0, i 0) p .R7'
+  System::Call 'kernel32::CreateProcessW(p 0, w R3, p 0, p 0, i 1, i 0x08000000, p 0, p 0, p R6, p R7) i .R8'
+  System::Call 'kernel32::CloseHandle(p R5)'
+  System::Free $R6
+  StrCmp $R8 "0" cys_rb_free_${TAG} 0
+  System::Call '*$R7(p .R5, p .R6)'
+  System::Call 'kernel32::CloseHandle(p R6)'
+  System::Call 'kernel32::WaitForSingleObject(p R5, i ${MS}) i .R8'
+  StrCmp $R8 "0" cys_rb_exit_${TAG} 0
+  StrCpy $R4 "wait-failed"
+  StrCmp $R8 "258" 0 cys_rb_kill_${TAG}
+  StrCpy $R4 "timeout"
+cys_rb_kill_${TAG}:
+  StrCpy $R9 "unconfirmed"
+  System::Call 'kernel32::TerminateProcess(p R5, i 1) i .R8'
+  System::Call 'kernel32::WaitForSingleObject(p R5, i 5000) i .R8'
+  StrCmp $R8 "0" 0 cys_rb_close_${TAG}
+  StrCpy $R9 $R4
+  Goto cys_rb_close_${TAG}
+cys_rb_exit_${TAG}:
+  System::Call 'kernel32::GetExitCodeProcess(p R5, *i .R8) i .R6'
+  StrCmp $R6 "0" cys_rb_close_${TAG} 0
+  StrCpy $R9 $R8
+cys_rb_close_${TAG}:
+  System::Call 'kernel32::CloseHandle(p R5)'
+cys_rb_free_${TAG}:
+  System::Free $R7
+cys_rb_end_${TAG}:
+  StrCpy $CysRbRc $R9
+  Pop $R9
+  Pop $R8
+  Pop $R7
+  Pop $R6
+  Pop $R5
+  Pop $R4
+  Pop $R3
 !macroend
 
 ; $CysPrior / $CysKept / $CysKeptShow from the current $INSTDIR (G2-4). Uses $R7 $R8 $R9.
@@ -756,14 +827,14 @@ cys_fg_end_${TAG}:
 ; refused in-app update: bring the kept version back and prove it (F2 + R2-F1). Name-only
 ; observation of the initiator; nothing is killed. B1-F2: ONE monotonic deadline covers the whole
 ; hand-off - GetTickCount at the start, elapsed = now - start in 32-bit arithmetic (correct across
-; the 49.7-day wrap while elapsed < 24.8 days). Every tasklist call carries /TIMEOUT=5000 (nsExec
-; ends it after 5 s without output and returns only once it has ended). A query whose exit code is
-; not 0 is UNKNOWN, never "gone" - its status is kept apart from the text search. The initiator
-; wait stops at 60 s (last query unknown -> initiator-unknown, no relaunch), the window search at
-; 95 s, then one 5 s re-check: the hand-off ends within about 100 s plus one tasklist call (its
-; output time plus at most 5 s without output). $CysHoN only ends a loop whose clock never moves.
-; Uses $R0-$R8.
+; the 49.7-day wrap while elapsed < 24.8 days). Every tasklist call runs under CYS_RUN_BOUNDED with
+; 5000 ms (B1r2-F1: at most 10 s including the confirmed termination). A query whose result is not
+; exit code 0 is UNKNOWN, never "gone" - its status is kept apart from the text search. The
+; initiator wait starts no query after 60 s (last query unknown -> initiator-unknown, no relaunch),
+; the window search stops at 95 s, then one 5 s re-check: the hand-off ends within 101 s plus the
+; API calls. $CysHoN only ends a loop whose clock never moves. Uses $R0-$R8.
 !macro CYS_HANDOFF TAG
+  InitPluginsDir
   System::Call 'kernel32::GetTickCount()i.R8'
   StrCpy $R3 "none"
   StrCpy $CysHoN 0
@@ -773,11 +844,21 @@ cys_ho_wait_${TAG}:
   IntCmp $R7 60000 cys_ho_stuck_${TAG} 0 cys_ho_stuck_${TAG}
   IntOp $CysHoN $CysHoN + 1
   IntCmp $CysHoN 120 cys_ho_stuck_${TAG} 0 cys_ho_stuck_${TAG}
-  nsExec::ExecToStack /TIMEOUT=5000 'tasklist /FI "IMAGENAME eq cys-app.exe" /FO CSV /NH'
-  Pop $R6
-  Pop $R5
-  StrCmp $R6 "0" 0 cys_ho_qfail_${TAG}
+  !insertmacro CYS_RUN_BOUNDED `tasklist /FI "IMAGENAME eq cys-app.exe" /FO CSV /NH` "$PLUGINSDIR\cys-tasklist.out" 5000 "${TAG}q"
+  StrCmp $CysRbRc "0" 0 cys_ho_qfail_${TAG}
+  StrCpy $R4 ""
+  ClearErrors
+  FileOpen $R6 "$PLUGINSDIR\cys-tasklist.out" r
+  IfErrors cys_ho_qfail_${TAG}
+cys_ho_line_${TAG}:
+  ClearErrors
+  FileRead $R6 $R5
+  IfErrors cys_ho_lend_${TAG}
   ${StrLoc} $R4 $R5 "cys-app.exe" ">"
+  StrCmp $R4 "" cys_ho_line_${TAG} 0
+cys_ho_lend_${TAG}:
+  FileClose $R6
+  ClearErrors
   StrCmp $R4 "" cys_ho_gone_${TAG} 0
   StrCpy $R3 "running"
   Goto cys_ho_next_${TAG}
@@ -966,13 +1047,23 @@ cys_rf_quit_${TAG}:
   Quit
 !macroend
 
-; one leaf: run EXE with ARGS (30 s bound) and classify into OUT (KIND: cysd | cys | app).
-; Only inserted inside Section Install (VER is the template's ${VERSION} there). Uses $R2-$R9.
+; one leaf: run EXE with ARGS under CYS_RUN_BOUNDED (30 s wall clock + 5 s confirmed termination)
+; and classify into OUT (KIND: cysd | cys | app); its output is read back from DIR\EXE.out. Only
+; inserted inside Section Install (VER is the template's ${VERSION} there). Uses $R2-$R9.
 !macro CYS_PROBE_LEAF DIR EXE ARGS KIND VER OUT TAG
-  nsExec::ExecToStack /TIMEOUT=30000 '"${DIR}\${EXE}" ${ARGS}'
-  Pop $R7
-  Pop $R8
+  !insertmacro CYS_RUN_BOUNDED `"${DIR}\${EXE}" ${ARGS}` "${DIR}\${EXE}.out" 30000 "${TAG}r"
+  StrCpy $R7 $CysRbRc
+  StrCpy $R8 ""
+  ClearErrors
+  FileOpen $R6 "${DIR}\${EXE}.out" r
+  IfErrors cys_lf_noout_${TAG}
+  FileRead $R6 $R8
+  FileClose $R6
+cys_lf_noout_${TAG}:
+  ClearErrors
   StrCmp $R7 "timeout" cys_lf_to_${TAG} 0
+  StrCmp $R7 "unconfirmed" cys_lf_unc_${TAG} 0
+  StrCmp $R7 "wait-failed" cys_lf_err_${TAG} 0
   StrCmp $R7 "error" cys_lf_err_${TAG} 0
   StrCmp $R7 "0" cys_lf_rc0_${TAG} 0
   StrCpy ${OUT} "rc:$R7"
@@ -980,12 +1071,10 @@ cys_rf_quit_${TAG}:
 cys_lf_err_${TAG}:
   StrCpy ${OUT} "error"
   Goto cys_lf_done_${TAG}
-cys_lf_to_${TAG}:
-  !insertmacro CYS_DEL_RETRY "${DIR}\${EXE}" "${TAG}t"
-  IfErrors 0 cys_lf_togone_${TAG}
+cys_lf_unc_${TAG}:
   StrCpy ${OUT} "cleanup-unconfirmed"
   Goto cys_lf_done_${TAG}
-cys_lf_togone_${TAG}:
+cys_lf_to_${TAG}:
   StrCpy ${OUT} "timeout"
   Goto cys_lf_done_${TAG}
 cys_lf_rc0_${TAG}:
@@ -1117,10 +1206,11 @@ cys_pp_single:
   IntOp $R1 $R1 & 0x7FFFFFFF
   StrCpy $CysProbeTick $R1
   StrCpy $CysProbeDir "$INSTDIR\.cys-probe-$CysProbeTick"
-  ; the probe-only worker: no pages (/S), no WebView2 section (/UPDATE), its own folder (/D, last)
-  nsExec::ExecToStack /TIMEOUT=120000 '"$EXEPATH" /S /UPDATE /CYSPROBE=.cys-probe-$CysProbeTick /D=$CysProbeDir'
-  Pop $R2
-  Pop $R3
+  ; the probe-only worker: no pages (/S), no WebView2 section (/UPDATE), its own folder (/D, last),
+  ; under CYS_RUN_BOUNDED: 120 s wall clock + 5 s confirmed termination (B1r2-F1)
+  InitPluginsDir
+  !insertmacro CYS_RUN_BOUNDED `"$EXEPATH" /S /UPDATE /CYSPROBE=.cys-probe-$CysProbeTick /D=$CysProbeDir` "$PLUGINSDIR\cys-probe-worker.out" 120000 "ppw"
+  StrCpy $R2 $CysRbRc
   ; read the worker's result (result line is written last; a missing line is a failure)
   StrCpy $CysPrCysd "missing"
   StrCpy $CysPrCys "missing"
@@ -1163,10 +1253,17 @@ cys_pp_readclose:
   FileClose $R4
 cys_pp_readdone:
   ClearErrors
-  ; B1-F1: nsExec has returned, so the worker process has ended (see the header). Its leaves count
-  ; as ended only when the worker classified every one of them: exit 0 with result=pass, or exit 6
-  ; with result=fail and all three statuses read. Timeout, crash, any other exit code or an
-  ; incomplete result file -> CONFIRMED=0: each leaf image must be deletable before the folder goes.
+  ; B1r2-F1: "unconfirmed" = the worker may STILL run (its termination could not be confirmed): it
+  ; can still create files and leaves, so its folder is not touched at all.
+  StrCmp $R2 "unconfirmed" 0 cys_pp_c0
+  StrCpy $CysCleanup "cleanup-unconfirmed"
+  Goto cys_pp_refuse
+cys_pp_c0:
+  ; B1-F1: every other result means the worker has ended (exit code, or a confirmed termination).
+  ; Its leaves count as ended only when the worker classified every one of them: exit 0 with
+  ; result=pass, or exit 6 with result=fail and all three statuses read. Timeout, wait-failed,
+  ; error, crash, any other exit code or an incomplete result file -> CONFIRMED=0: each leaf image
+  ; must be deletable before the folder goes.
   StrCmp $R2 "0" 0 cys_pp_c6
   StrCmp $R5 "pass" cys_pp_classified cys_pp_unclassified
 cys_pp_c6:

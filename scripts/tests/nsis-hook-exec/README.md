@@ -28,17 +28,17 @@ termination taken as proven without proof (B1-F1), and record writes that were n
 | real (the hook's own text) | simulated (the operating system) |
 |---|---|
 | every P1 instruction as written: labels, jumps, registers, the error flag | files and folders: read-only files, running images that cannot be deleted, writes that fail after N bytes |
-| `!insertmacro` / `!if` expansion with parameters substituted as text | processes started through nsExec: the probe-only worker, `tasklist` |
-| instruction semantics from NSIS 3.13 `Source/exehead/exec.c` (StrCpy length/offset, 32-bit IntOp, FileRead keeping CR/LF, FileWrite setting the error flag, FileClose reporting nothing, IfErrors clearing the flag) | nsExec's contract from `Contrib/nsExec/nsexec.c` (same loop in the shipped NSIS 3.11 and in 3.13): `/TIMEOUT` = time without output, a call returns only after the process ended |
+| `!insertmacro` / `!if` expansion with parameters substituted as text | child processes the hook starts: the probe-only worker, the three leaves, `tasklist` |
+| instruction semantics from NSIS 3.13 `Source/exehead/exec.c` (StrCpy length/offset, 32-bit IntOp, FileRead keeping CR/LF, FileWrite setting the error flag, FileClose reporting nothing, IfErrors clearing the flag) | one model of every child process: it ends after N ms or never, may keep printing, may refuse TerminateProcess, may make WaitForSingleObject fail, may fail to start. The current hook reaches it through CreateProcessW / WaitForSingleObject(ms) / TerminateProcess / GetExitCodeProcess (System::Call, structs by address); older bytes reach it through nsExec, simulated as `Contrib/nsExec/nsexec.c` does it (same loop in NSIS 3.11 and 3.13): `/TIMEOUT` = time without output, the call returns only after the child ended - so a child that keeps printing, refuses termination or fails the wait makes such bytes run UNBOUNDED |
 | `${StrLoc}` and `${GetOptions}` ported from their NSIS 3.13 sources | the clock (GetTickCount, Sleep), windows and processes for the hand-off, the console |
 
 So a PASS is evidence about the hook's **logic** against those outcomes. It is not a Windows run:
-real Smart App Control / App Control refusals, real nsExec timing and real dialogs stay UNMEASURED
+real Smart App Control / App Control refusals, real process and termination timing and real dialogs stay UNMEASURED
 until the `win-update-probe` job (windows-build.yml) runs on windows-latest.
 
 ## Cases
 
-`X-F1-*` worker outcome and leaf termination · `X-F2-*` hand-off bound and query failure ·
+`X-R3-*` hard wall-clock bound of every child (worker, leaf, query) under hang / failed terminate / failed wait / endless output (codex r2 B1r2-F1) · `X-F1-*` worker outcome and leaf termination · `X-F2-*` hand-off bound and query failure ·
 `X-F3-*` kept version through CRLF / LF / no newline · `X-F4-*` record persistence and what the
 dialog and console name · `X-CTL-*` and the cases marked `control` must pass on old and new bytes
 (they prove the executor runs the ordinary paths, so a RED elsewhere is about the finding).
