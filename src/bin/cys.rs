@@ -2786,19 +2786,38 @@ mod queue_list_row_tests {
     /// (`cysjavis-pack/hooks/guard.sh` 가 이 문구로 조회 명령을 분류한 관측 기록이 있다).
     #[test]
     fn rqfix_f10_queue_list_long_help_documents_the_stderr_notice_line() {
-        use clap::CommandFactory;
-        let mut cmd = <Cli as CommandFactory>::command();
-        let queue = cmd.find_subcommand_mut("queue").expect("queue 서브커맨드");
-        let list = queue.find_subcommand_mut("list").expect("queue list");
-        let long = list.render_long_help().to_string();
-        assert!(long.contains("# surface:N blocked_by=… (이 사유로 Ns) → <조치 문장>"), "긴 도움말에 stderr 안내 줄 서식이 없다:\n{long}");
-        // ★(R2F-DM · A2 n-14) `(Ns)` 가 '막힌 지 N 초' 가 아니라 '지금 사유가 시작된 뒤' 라는 풀이와 머리 나이의 출처(`age_secs`)가 도움말에 있다.
-        assert!(long.contains("지금 사유가 시작된 뒤") && long.contains("age_secs"), "긴 도움말에 (이 사유로 Ns) 의 뜻 풀이가 없다:\n{long}");
-        assert!(!long.contains("(Ns)"), "옛 서식 `(Ns)` 가 도움말에 남았다:\n{long}");
-        assert!(long.contains("stderr") && long.contains("6열 행 계약"), "{long}");
-        assert!(long.contains("List undelivered queued messages (all surfaces or one)"), "첫 문단(짧은 도움말)은 종전 그대로:\n{long}");
-        let short = list.render_help().to_string();
-        assert!(short.contains("List undelivered queued messages (all surfaces or one)"), "{short}");
+        // ★WP13(0.14.53 · slot 13 · 헤드 결정 (D) 2026-10-24) 이 검체는 clap **루트 CLI 를 짓는다** — libtest 의
+        //   기본 스레드 스택 2 MiB 위에서 debug clap 생성 프레임이 넘쳐 검체 하나가 실패하는 것이 아니라 **하네스
+        //   전체가 SIGABRT 로 죽는다**(`--bin cys` 런 전멸). 실측(worker-9 · 2026-10-24 · 16 KiB 해상도 이분):
+        //   기준선 f0ac3b0c 의 최소 통과 스택이 **정확히 2.000 MiB**(2,097,152 B · 2,080,768 B 에서 넘침)였고
+        //   `set-title` 한 벌이 ~16 KiB 를 더해 2,113,536 B 가 됐다 ⇒ **기준선 여유가 16 KiB 미만**이었다(인자가
+        //   원인이고 문서 주석은 아니다 — 0 인자 변이·전문 주석 변이 모두 녹색이었다).
+        //   ⇒ 저장소 전역 `[env] RUST_MIN_STACK` 은 **쓰지 않는다**(모든 검체와 윈도우 CI 단계의 행동을 함께
+        //   바꾸고 앞으로의 프레임 증가를 가린다 · 2026-10-17 측정도 그것을 생산 수정으로 주장하지 말라고 적었다).
+        //   이 검체 **하나만** 8 MiB 스택 스레드에서 돌린다. 구조적 축소(clap Args 분리)는 백로그다.
+        //   ⚠`join()` 의 Err 는 `resume_unwind` 로 되살린다 — `expect` 로 받으면 패닉 payload 가 `Any { .. }` 로
+        //   찍혀 **단언 문장이 사라진다**(다음 사람이 적색의 이유를 못 읽는다).
+        let on_a_big_stack = std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                use clap::CommandFactory;
+                let mut cmd = <Cli as CommandFactory>::command();
+                let queue = cmd.find_subcommand_mut("queue").expect("queue 서브커맨드");
+                let list = queue.find_subcommand_mut("list").expect("queue list");
+                let long = list.render_long_help().to_string();
+                assert!(long.contains("# surface:N blocked_by=… (이 사유로 Ns) → <조치 문장>"), "긴 도움말에 stderr 안내 줄 서식이 없다:\n{long}");
+                // ★(R2F-DM · A2 n-14) `(Ns)` 가 '막힌 지 N 초' 가 아니라 '지금 사유가 시작된 뒤' 라는 풀이와 머리 나이의 출처(`age_secs`)가 도움말에 있다.
+                assert!(long.contains("지금 사유가 시작된 뒤") && long.contains("age_secs"), "긴 도움말에 (이 사유로 Ns) 의 뜻 풀이가 없다:\n{long}");
+                assert!(!long.contains("(Ns)"), "옛 서식 `(Ns)` 가 도움말에 남았다:\n{long}");
+                assert!(long.contains("stderr") && long.contains("6열 행 계약"), "{long}");
+                assert!(long.contains("List undelivered queued messages (all surfaces or one)"), "첫 문단(짧은 도움말)은 종전 그대로:\n{long}");
+                let short = list.render_help().to_string();
+                assert!(short.contains("List undelivered queued messages (all surfaces or one)"), "{short}");
+            })
+            .expect("8 MiB 스택 스레드를 띄울 수 없다");
+        if let Err(panic) = on_a_big_stack.join() {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// ★(R2F-DM · 성찰 2회차 A2 n-14) 안내 줄의 경과 표기는 **`(이 사유로 Ns)`** 다 — `(Ns)` 는 지금 − `blocked_since`(사유가 **바뀔 때마다** 새로 찍힌다)라 '막힌 지 N 초' 가 아니다.
@@ -44685,18 +44704,37 @@ mod aid_s5_cli_tests {
     use super::*;
     #[test]
     fn aid_s5_reap_due_is_explicit_and_json_is_validated() {
-        use clap::Parser;
-        assert!(Cli::try_parse_from(["cys", "reap-due"]).is_err());
-        assert!(Cli::try_parse_from(["cys", "reap-due", "surface:9", "--reap"]).is_err());
-        assert!(matches!(Cli::try_parse_from(["cys", "reap-due", "surface:9"]).unwrap().command, Command::ReapDue { .. }));
-        for outcome in ["reaped", "gone", "deferred"] {
-            let result = json!({"surface_id":9, "outcome":outcome, "reason":"grace_not_elapsed"});
-            assert_eq!(serde_json::from_str::<Value>(&reap_due_json(&result, 9).unwrap()).unwrap(), result);
-        }
-        for bad in [json!({"outcome":"reaped"}), json!({"surface_id":true,"outcome":"gone"}),
-                    json!({"surface_id":10,"outcome":"reaped"}), json!({"surface_id":9,"outcome":"bad"}),
-                    json!({"surface_id":9,"outcome":"deferred"})] {
-            assert!(reap_due_json(&bad, 9).is_err(), "S5-CLI-MALFORMED: {bad}");
+        // ★WP13(0.14.53 · slot 13 · 헤드 결정 (D) 2026-10-24) 이 검체는 clap **루트 CLI 를 짓는다** — libtest 의
+        //   기본 스레드 스택 2 MiB 위에서 debug clap 생성 프레임이 넘쳐 검체 하나가 실패하는 것이 아니라 **하네스
+        //   전체가 SIGABRT 로 죽는다**(`--bin cys` 런 전멸). 실측(worker-9 · 2026-10-24 · 16 KiB 해상도 이분):
+        //   기준선 f0ac3b0c 의 최소 통과 스택이 **정확히 2.000 MiB**(2,097,152 B · 2,080,768 B 에서 넘침)였고
+        //   `set-title` 한 벌이 ~16 KiB 를 더해 2,113,536 B 가 됐다 ⇒ **기준선 여유가 16 KiB 미만**이었다(인자가
+        //   원인이고 문서 주석은 아니다 — 0 인자 변이·전문 주석 변이 모두 녹색이었다).
+        //   ⇒ 저장소 전역 `[env] RUST_MIN_STACK` 은 **쓰지 않는다**(모든 검체와 윈도우 CI 단계의 행동을 함께
+        //   바꾸고 앞으로의 프레임 증가를 가린다 · 2026-10-17 측정도 그것을 생산 수정으로 주장하지 말라고 적었다).
+        //   이 검체 **하나만** 8 MiB 스택 스레드에서 돌린다. 구조적 축소(clap Args 분리)는 백로그다.
+        //   ⚠`join()` 의 Err 는 `resume_unwind` 로 되살린다 — `expect` 로 받으면 패닉 payload 가 `Any { .. }` 로
+        //   찍혀 **단언 문장이 사라진다**(다음 사람이 적색의 이유를 못 읽는다).
+        let on_a_big_stack = std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(|| {
+                use clap::Parser;
+                assert!(Cli::try_parse_from(["cys", "reap-due"]).is_err());
+                assert!(Cli::try_parse_from(["cys", "reap-due", "surface:9", "--reap"]).is_err());
+                assert!(matches!(Cli::try_parse_from(["cys", "reap-due", "surface:9"]).unwrap().command, Command::ReapDue { .. }));
+                for outcome in ["reaped", "gone", "deferred"] {
+                    let result = json!({"surface_id":9, "outcome":outcome, "reason":"grace_not_elapsed"});
+                    assert_eq!(serde_json::from_str::<Value>(&reap_due_json(&result, 9).unwrap()).unwrap(), result);
+                }
+                for bad in [json!({"outcome":"reaped"}), json!({"surface_id":true,"outcome":"gone"}),
+                            json!({"surface_id":10,"outcome":"reaped"}), json!({"surface_id":9,"outcome":"bad"}),
+                            json!({"surface_id":9,"outcome":"deferred"})] {
+                    assert!(reap_due_json(&bad, 9).is_err(), "S5-CLI-MALFORMED: {bad}");
+                }
+            })
+            .expect("8 MiB 스택 스레드를 띄울 수 없다");
+        if let Err(panic) = on_a_big_stack.join() {
+            std::panic::resume_unwind(panic);
         }
     }
 }

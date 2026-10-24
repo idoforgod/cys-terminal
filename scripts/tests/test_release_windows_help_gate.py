@@ -1,14 +1,15 @@
 """Pin for the W-GATE step (0.14.52 · CEO ruling 2026-10-22, release condition 2): the packaged Windows cys.exe --help gate.
 
 What it guards: before the Windows release leg uploads anything, release.yml runs the exact sidecar file the NSIS installer packed
-(src-tauri/binaries/cys-x86_64-pc-windows-msvc.exe) with --help, queue --help and queue list --help at the default stack, and fails
+(src-tauri/binaries/cys-x86_64-pc-windows-msvc.exe) with --help, queue --help, queue list --help and set-title --help at the default
+stack, and fails
 the leg on any non-zero native exit. windows-build.yml runs the SAME step body before any tag exists (the pre-tag dry run; a
 separate build instance, not a replacement). This file pins, from the workflow TEXT only:
   A1 release.yml job `build` has exactly one step with the gate name.
   A2 its `if` is exactly the Windows matrix condition.
   A3 no continue-on-error, on the step or on the job.
   A4 shell: pwsh.
-  A5 the body runs the exact file with the three argv sets, resets LASTEXITCODE before each call, reads $LASTEXITCODE, prints it
+  A5 the body runs the exact file with the four argv sets, resets LASTEXITCODE before each call, reads $LASTEXITCODE, prints it
      in hex, fails on non-zero or missing codes, removes RUST_MIN_STACK, and nothing in the step, job or workflow env sets it.
   A6 build step < gate < every upload step of the job (at least one upload step exists).
   A7 every other job holding an upload step has `build` in needs (so pack-artifacts stays behind the gate).
@@ -436,7 +437,7 @@ class HelpGatePin(unittest.TestCase):
         self.assertLess(at("$exe = '%s'" % SIDECAR), at("$full = (Resolve-Path -LiteralPath $exe).Path"),
                         "A5: the called path must be resolved from that file")
         loop = at("foreach ($argv in ")
-        for argv in ("@('--help')", "@('queue', '--help')", "@('queue', 'list', '--help')"):
+        for argv in ("@('--help')", "@('queue', '--help')", "@('queue', 'list', '--help')", "@('set-title', '--help')"):
             self.assertIn(argv, lines[loop], "A5: argv set %s missing" % argv)
         reset = at("$global:LASTEXITCODE = $null")
         call = at("& $full @argv 2>&1")
