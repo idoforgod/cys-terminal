@@ -1349,7 +1349,9 @@ fn claude_named_session_titles_classify_working_waiting_and_permission() {
     assert_eq!(prod(Family::Claude, &perm, 120), Sample::Decision(DecisionKind::Permission));
 }
 
-/// WP11: r2 widens only the title NAME, not the shape — glyph, exactly one space, a non-empty name. Everything else stays NoMatch.
+/// WP11: r2 widens only the title NAME, not the shape. `classify` trims the title, then `title_glyph` takes the first char as the
+/// glyph and requires the second char to be a space — so: a glyph, at least one space (more are accepted), and a non-empty name
+/// (trailing whitespace is trimmed first, so "◐ " and "◐    " have no second char). Everything else stays NoMatch.
 #[test]
 fn claude_title_without_the_glyph_space_name_shape_is_no_match() {
     let base = frame_of(&[(12, RULE), (13, "❯"), (14, RULE)], (13, 2), "");
