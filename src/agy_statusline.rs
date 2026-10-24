@@ -5,12 +5,12 @@
 //! agy 1.2 부터 쿼터 조회가 CSRF 토큰을 요구해 cys 는 agy 쿼터를 **agy 공식 상태줄(statusLine) 기능**으로만
 //! 받는다(usage.rs 머리 주석 · IMPL-values §1). 그 연결은 `~/.gemini/antigravity-cli/settings.json` 의
 //! `statusLine` 한 칸이고, 종전에는 사람이 직접 넣어야 했다(매뉴얼 절차). 이 모듈은 설치·팩 병합 때 그 칸이
-//! **비어 있거나 없을 때만** cys 연결을 넣는다.
+//! An empty/missing slot is linked; on Windows, owned legacy .sh commands migrate to the generated .cmd form.
 //!
 //! ## 계약 (실패 방향 = 언제나 '쓰지 않음')
 //!
 //! - 사용자가 넣은 statusLine 이 있으면 **덮지 않는다**(`Outcome::UserOwned` — 로그·doctor 안내만).
-//! - 이미 cys 연결(표지 유무 무관)이면 무동작(멱등). agy 안에서 `/statusline off` 로 꺼 둔 것도 그대로 둔다.
+//! - Existing links are unchanged except owned Windows legacy .sh commands; migration preserves disabled/custom fields.
 //! - 한 번 연결했던 칸이 나중에 비어 있으면 **다시 넣지 않는다**(`PreviouslyLinked`) — agy 의 `/statusline delete`
 //!   가 남기는 모양(`{"type":"","command":"","enabled":false}`)은 agy 기본 직렬화와 바이트까지 같아 '사용자가 지웠다'와
 //!   '처음부터 비었다'를 파일로는 구별할 수 없다(2026-09-24 이 맥 실측: 기본 파일이 바로 그 모양). 그래서 cys 쪽에
@@ -592,6 +592,19 @@ pub fn render_linked(text: &str, cmd: &str) -> Result<String, String> {
     }
 }
 
+// WP15: replace only the command value; keep disabled/custom fields and formatting.
+fn render_migrated_command(text: &str, cmd: &str) -> Result<String, String> {
+    let root = scan_root(text)?;
+    let slots: Vec<_> = root.members.iter().filter(|m| m.key == "statusLine").collect();
+    let [slot] = slots.as_slice() else { return Err("ambiguous statusLine".into()); };
+    let inner = scan_root(&text[slot.val_start..slot.val_end])?;
+    let commands: Vec<_> = inner.members.iter().filter(|m| m.key == "command").collect();
+    let [command] = commands.as_slice() else { return Err("ambiguous statusLine.command".into()); };
+    let start = slot.val_start + command.val_start;
+    let end = slot.val_start + command.val_end;
+    Ok(format!("{}{}{}", &text[..start], serde_json::to_string(cmd).map_err(|e| e.to_string())?, &text[end..]))
+}
+
 /// statusLine 칸을 통째로 뺀 새 텍스트(순수). 칸이 없으면 Err.
 pub fn render_unlinked(text: &str) -> Result<String, String> {
     let scan = scan_root(text)?;
@@ -910,7 +923,7 @@ fn write_record(record: &Path, settings: &Path) {
     let _ = crate::pack::write_atomic(record, format!("linked_at={now}\nsettings={}\n", settings.display()).as_bytes());
 }
 
-/// statusLine 칸이 비어 있거나 없을 때만 cys 연결을 넣는다. `force` = '연결한 적 있음' 기록을 무시한다
+/// Link empty slots or migrate owned Windows legacy commands. `force` bypasses the prior-link record for empty slots.
 /// (사람이 부른 `cys doctor --fix` 만 쓴다 — 설치 경로는 false).
 pub fn ensure_linked(ctx: &Ctx, force: bool) -> Outcome {
     ensure_linked_cmd(ctx, force, link_command_resolved(ctx.pack_dir, ctx.windows, true, ctx.home))
@@ -949,7 +962,12 @@ fn ensure_linked_cmd(ctx: &Ctx, force: bool, cmd: Option<String>) -> Outcome {
         Err(e) => return Outcome::Refused(e),
     };
     let slot = loaded.as_ref().and_then(|l| l.3.as_ref()).map_or(Slot::Absent, classify);
+    let migrate = ctx.windows && matches!(slot, Slot::OursAuto { .. })
+        && loaded.as_ref().and_then(|l| l.3.as_ref())
+            .and_then(|v| v["statusLine"]["command"].as_str())
+            .is_some_and(command_is_legacy_windows_sh);
     match slot {
+        Slot::OursAuto { .. } if migrate => {}
         Slot::OursAuto { .. } => {
             if !ctx.record.exists() {
                 write_record(ctx.record, ctx.settings); // 기록만 보충(설정 파일 무접촉)
@@ -960,7 +978,7 @@ fn ensure_linked_cmd(ctx: &Ctx, force: bool, cmd: Option<String>) -> Outcome {
         Slot::User => return Outcome::UserOwned,
         Slot::Absent | Slot::Empty => {}
     }
-    if !force && ctx.record.exists() {
+    if !force && !migrate && ctx.record.exists() {
         return Outcome::PreviouslyLinked;
     }
     // 연결 명령이 부를 래퍼가 팩에 실제로 있어야 한다 — 없는 파일을 부르는 상태줄은 agy 화면에 오류를 찍다가 스스로
@@ -984,7 +1002,11 @@ fn ensure_linked_cmd(ctx: &Ctx, force: bool, cmd: Option<String>) -> Outcome {
             return Outcome::WindowsProbeFailed { reason, command };
         }
     }
-    let want = desired_value(&cmd);
+    let want = if migrate {
+        let mut sl = loaded.as_ref().and_then(|l| l.3.as_ref()).unwrap()["statusLine"].clone();
+        sl["command"] = Value::String(cmd.clone());
+        sl
+    } else { desired_value(&cmd) };
     let (orig_raw, new_bytes, mode, created) = match &loaded {
         None => {
             let body = match render_linked("{}\n", &cmd) {
@@ -1004,7 +1026,7 @@ fn ensure_linked_cmd(ctx: &Ctx, force: bool, cmd: Option<String>) -> Outcome {
                 Some(v) => (text.as_str(), v.clone()),
                 None => ("{}\n", serde_json::json!({})), // 빈 파일 — 새 본문으로
             };
-            let body = match render_linked(src, &cmd) {
+            let body = match if migrate { render_migrated_command(src, &cmd) } else { render_linked(src, &cmd) } {
                 Ok(b) => b,
                 Err(e) => return Outcome::Refused(e),
             };
@@ -1210,6 +1232,38 @@ mod tests {
     const UNIX_DUMMY_CMD: &str = "sh /h/.cys/pack/hooks/cys-agy-statusline.sh --cys-autolink";
 
     // ───────── 순수 함수 ─────────
+
+    #[test]
+    fn wp15_migrates_only_owned_legacy_windows_commands() {
+        let sb = Sandbox::new("wp15-migrate");
+        let old = r#"bash "C:/rust/User Name/.cys/pack/hooks/cys-agy-statusline.sh" --cys-autolink"#;
+        let original = json!({"other": 42, "statusLine": {"type": "command", "command": old,
+            "enabled": false, "padding": 3}});
+        sb.put(serde_json::to_string(&original).unwrap().as_bytes());
+        std::fs::create_dir_all(sb.record().parent().unwrap()).unwrap();
+        std::fs::write(sb.record(), "previously linked").unwrap();
+        let fail = |_: &str| Err("probe refused".to_string());
+        assert!(matches!(sb.ensure_win(false, Some(&fail)), Outcome::WindowsProbeFailed { .. }));
+        assert_eq!(serde_json::from_str::<Value>(&sb.read()).unwrap(), original);
+        let ok = |_: &str| Ok(());
+        assert_eq!(sb.ensure_win(false, Some(&ok)), Outcome::Linked { created: false });
+        let mut expected = original;
+        expected["statusLine"]["command"] = json!(WIN_CMD);
+        assert_eq!(serde_json::from_str::<Value>(&sb.read()).unwrap(), expected);
+        let once = sb.read();
+        assert!(matches!(sb.ensure_win(false, Some(&fail)), Outcome::AlreadyLinked(_)));
+        assert_eq!(sb.read(), once);
+        for cmd in ["bash C:/rust/hooks/cys-agy-statusline.sh", "other.sh --cys-autolink", WIN_CMD] {
+            let body = json!({"statusLine": {"command": cmd}}).to_string();
+            sb.put(body.as_bytes());
+            sb.ensure_win(true, Some(&ok));
+            assert_eq!(sb.read(), body, "must leave {cmd} untouched");
+        }
+        let body = json!({"statusLine": {"command": old}}).to_string();
+        sb.put(body.as_bytes());
+        sb.ensure(true);
+        assert_eq!(sb.read(), body, "Unix must not migrate a Windows command");
+    }
 
     #[test]
     fn command_strings_follow_os_rules() {

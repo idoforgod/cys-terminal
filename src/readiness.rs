@@ -1904,6 +1904,13 @@ fn modal_on_screen(o: &Observed) -> Option<ModalSignature> {
 ///   밸브가 마커 분기 앞에 있었던 이유(마커 판정 실패로 루프가 끝나기 전에 발화해야 한다)를
 ///   그대로 옮긴 것이고, H-SAFE-2 의 순서 핀이 이 위치를 지킨다.
 fn positive_evidence(o: &Observed) -> Option<Evidence> {
+    // The OS-derived tail axis prevents Windows-looking prose on Unix from vetoing boot.
+    // Current shell evidence must beat every positive route, including stale marker delta.
+    if o.site == Site::Boot && o.tail_is_shell_prompt == Some(true)
+        && o.screen.lines().rev().find(|l| !l.trim().is_empty())
+            .is_some_and(crate::terminal_screen::windows_shell_prompt_shape) {
+        return None;
+    }
     // 화면 꼬리가 **관측되었고** 셸 프롬프트가 아니다. 미관측(None)은 참으로 접지 않는다.
     // ★이 축은 **정밀도**용이다 — 마커 화면 폴백·시간 폴백처럼 "ready 를 선언하지 않는 쪽"
     //   으로만 쓴다. 밸브는 아래 `bare_shell_ok` 를 쓴다(축의 비용 부호가 반대다 — P3-0).
@@ -2080,6 +2087,39 @@ mod tests {
             time_fallback_reached: false,
             idle_quiet: None,
             legacy_v1: false,
+        }
+    }
+
+    #[test]
+    fn wp15_windows_shell_veto_beats_stale_markers_and_frames() {
+        use crate::terminal_screen::{screen_is_bare_shell_on, screen_tail_is_shell_prompt_on};
+        for tail in [r"PS C:\rust>", r"   PS C:\rust>  ", ">>"] {
+            let screen = format!("────────────\nfor shortcuts\n❯\n{tail}");
+            let mut o = obs(&screen, "❯", &[]);
+            o.agent_alive = Some(true);
+            o.time_fallback_reached = true;
+            o.idle_quiet = Some(true);
+            o.tail_is_shell_prompt = Some(screen_tail_is_shell_prompt_on(&screen, true));
+            o.bare_shell = Some(screen_is_bare_shell_on(&screen, true));
+            assert_eq!(o.bare_shell, Some(true), "{tail}");
+            assert_eq!(judge(&o), Verdict::NotYet, "stale marker: {tail}");
+            o.marker = None;
+            assert_eq!(judge(&o), Verdict::NotYet, "markerless fallback: {tail}");
+            o.marker = Some("❯");
+            o.tail_is_shell_prompt = Some(screen_tail_is_shell_prompt_on(&screen, false));
+            o.bare_shell = Some(screen_is_bare_shell_on(&screen, false));
+            assert!(matches!(judge(&o), Verdict::Ready { .. }), "Unix control: {tail}");
+        }
+        for (agent, screen, marker) in [
+            ("claude", HEALTHY_BANNER, "❯"),
+            ("codex", "PS C:\\rust> codex\nCodex\n› ", "›"),
+            ("agy", "PS C:\\rust> agy\nAntigravity\n> ", ">"),
+        ] {
+            let mut o = obs(screen, marker, &[]);
+            o.marker = Some(marker);
+            o.tail_is_shell_prompt = Some(screen_tail_is_shell_prompt_on(screen, true));
+            o.bare_shell = Some(screen_is_bare_shell_on(screen, true));
+            assert!(matches!(judge(&o), Verdict::Ready { .. }), "{agent}");
         }
     }
 
