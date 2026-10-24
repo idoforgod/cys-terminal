@@ -13,6 +13,7 @@ import {
   STALE_WORKING_MS,
   activityExpiryMs,
 } from "./roleactivity";
+import * as RA from "./roleactivity"; // ★WP11: namespace access so this file still loads on a tree without deadReason (RED-on-base runs)
 import { SurfaceListTransport } from "./surfacelist";
 import { roleDotColor } from "./appearance";
 import { seatPriority, annotateRoles, tidyHoles } from "./seatlayout";
@@ -318,6 +319,8 @@ function harness() {
     // ── F-01
     listTransport, roleActivity: new RoleActivityStore(31_000), dotRoles: new WeakMap<object, string | null>(), T_ACTIVITY: 31_000,
     roleDotColor, projectActivity, applyDotPaint, HIDDEN_DOT,
+    // ── WP11 dead seat (grey X)
+    dotDead: new WeakMap<object, string | null>(), deadReason: (RA as unknown as Record<string, unknown>).deadReason,
     performance: { now: () => mono.t }, document: { visibilityState: "visible" },
   };
   const loaded = loadWith(FNS, deps);
@@ -432,6 +435,42 @@ describe("★F-01 U-F05/U-F06 — 실제 refreshPaneTitles 본문: 활동 패스
     }
   });
 
+  it("★WP11 a dead role seat (exited, or agent_alive=false) paints the grey X instead of hiding; agent_alive null/true is not dead", async () => {
+    const h = harness();
+    h.reply("/a.sock", [
+      { ...h.row(1, "worker", WORK(1)), exited: true },
+      { ...h.row(2, "master", WORK(1)), agent_alive: false },
+    ]);
+    h.reply("/b.sock", [{ ...h.row(3, "cso", WORK(1)), agent_alive: null }]);
+    await h.tick();
+    const dead1 = h.rt(1, "/a.sock").roleEl;
+    const dead2 = h.rt(2, "/a.sock").roleEl;
+    const live3 = h.rt(3, "/b.sock").roleEl;
+    expect({ state: dead1.state, display: dead1.style.display, title: dead1.title }).toEqual({
+      state: "act-dead", display: "", title: "역할: worker · 종료됨 · 창 종료(exited)",
+    });
+    // a fresh 'working' record for the same seat must not win over death (no blinking dead seat)
+    expect({ state: dead2.state, title: dead2.title }).toEqual({ state: "act-dead", title: "역할: master · 종료됨 · 에이전트 프로세스 없음" });
+    expect(live3.state).toBe("act-working");
+    // the local 3 s sweep keeps the X (it repaints from the stored dead reason, not from the activity record)
+    h.mono.t += 3_000;
+    h.fns.sweepRoleDots(h.mono.t);
+    expect(dead2.state).toBe("act-dead");
+    // the seat comes back (agent relaunched): the X goes and activity shows again
+    h.reply("/a.sock", [h.row(1, "worker", WORK(2)), h.row(2, "master", WORK(2))]);
+    await h.tick();
+    expect([h.rt(1, "/a.sock").roleEl.state, h.rt(2, "/a.sock").roleEl.state]).toEqual(["act-working", "act-working"]);
+  });
+
+  it("★WP11 a seat adopted while its agent is already gone (agent_alive=false) is painted with the grey X at adoption", async () => {
+    const h = harness();
+    h.reply("/a.sock", [h.row(1, "worker", WORK(1)), h.row(2, "master", WORK(1))]);
+    h.reply("/b.sock", [h.row(3, "cso", WORK(1)), { ...h.row(4, "worker", WORK(1)), agent_alive: false }]);
+    await h.tick();
+    const adopted = h.rt(4, "/b.sock").roleEl; // sid 4 was not in any tab: the adoption path created it this tick
+    expect({ state: adopted.state, title: adopted.title }).toEqual({ state: "act-dead", title: "역할: worker · 종료됨 · 에이전트 프로세스 없음" });
+  });
+
   it("dot updates never call render/setFocus, never replace a runtime or its terminal host, never touch scroll", async () => {
     const h = harness();
     h.reply("/a.sock", [h.row(1, "worker", WORK(1)), h.row(2, "master", WORK(1))]);
@@ -514,6 +553,10 @@ describe("F-01 wire cross-pin — daemon display_activity keys and enums == UI p
     expect(asStr("Effective")).toEqual(tsList("STATES"));
     expect(asStr("Raw")).toEqual(tsList("RAWS"));
     expect(asStr("Family")).toEqual(tsList("FAMILIES"));
+  });
+  it("★WP11 the UI's 'unobserved' trigger is the daemon's own reason token for a family without a grammar", () => {
+    const body = slice(RS, "impl Semantic {");
+    expect(body).toContain(`Semantic::UnsupportedFamily => "${String((RA as unknown as Record<string, unknown>).UNSUPPORTED_FAMILY_REASON)}"`);
   });
   it("an object built from the daemon's key spelling parses as an observation (not malformed)", () => {
     const vals: Record<string, unknown> = {

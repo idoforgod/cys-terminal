@@ -273,7 +273,7 @@ import {
 // ★U6(0.14.41) 피드백 보내기 — 모달 층 판정(setFocus·드롭 가드)과 작성 창(의존성 주입 · 최상위 부수효과 0).
 import { armDeferredPaneFocus, modalLayerOpen, feedbackOverlayOpen } from "./modalguard";
 import { mountFeedbackButton, openFeedbackModal, type FeedbackFacts } from "./feedbackmodal";
-import { activityExpiryMs, applyDotPaint, HIDDEN_DOT, projectActivity, RoleActivityStore } from "./roleactivity"; // ★F-01 역할 점 활동 표시(순수 판정·바뀐 것만 칠하기)
+import { activityExpiryMs, applyDotPaint, deadReason, HIDDEN_DOT, projectActivity, RoleActivityStore } from "./roleactivity"; // ★F-01 역할 점 활동 표시(순수 판정·바뀐 것만 칠하기)
 import { SurfaceListTransport, type ListArrival } from "./surfacelist"; // ★F-01 끝점별 소유 원 호출 · 응답별 독립 투영
 
 declare global {
@@ -2939,10 +2939,12 @@ const paneTitle = (title: string | null | undefined, liveCwd?: string | null) =>
 //   입력 = surface.list 각 줄의 display_activity(데몬이 자기 6초 리스를 직렬화 때 집행) · 판정 = roleactivity.ts(순수) · 운반 = surfacelist.ts.
 // ★쓰기 지점은 셋뿐이고 모두 paintRoleDot 하나를 지난다: 제목 갱신·입양(setRoleDot) · 응답 도착(projectListArrival) · 국소 만료 쓸기(sweepRoleDots).
 //   역할만 쓰는 옛 쓰기(배경색·title='역할: …')가 따로 남으면 3초마다 활동 표지·사유·나이를 덮는다(설계 §4 단일 렌더 경로).
-// ★바뀐 클래스·속성만 쓴다 — render()·호스트 교체·포커스·스크롤·SeatSig·알림과 무관하다. 무역할 셸·종료 pane 은 종전처럼 숨긴다.
+// ★바뀐 클래스·속성만 쓴다 — render()·호스트 교체·포커스·스크롤·SeatSig·알림과 무관하다. 무역할 셸은 종전처럼 숨긴다
+//   (★WP11: 종료된 역할 좌석 — exited 또는 agent_alive=false — 은 숨기지 않고 회색 X 로 보인다 · 역할은 종료로 지워지지 않는다).
 const T_ACTIVITY = activityExpiryMs(T_LIST); // T = 3P + 2D + E — 31 s(mac) / 47 s(Windows) · 요청 시작에 묶인 하드 만료
 const roleActivity = new RoleActivityStore(T_ACTIVITY); // 키 = paneKey(sid, socket) · 끝점 수명·표시 세대·순번으로 거부
-const dotRoles = new WeakMap<PaneRuntime, string | null>(); // 런타임 → 마지막으로 받은 역할(종료 = null)
+const dotRoles = new WeakMap<PaneRuntime, string | null>(); // 런타임 → 마지막으로 받은 역할(무역할 = null)
+const dotDead = new WeakMap<PaneRuntime, string | null>(); // ★WP11 런타임 → 종료 사유(deadReason · 살아 있음/미측정 = null) — 종료 좌석은 숨기지 않고 회색 X
 const listTransport = new SurfaceListTransport({
   now: () => performance.now(),
   deadlineMs: T_LIST,
@@ -2950,8 +2952,9 @@ const listTransport = new SurfaceListTransport({
   onArrival: (a) => projectListArrival(a),
 });
 
-function setRoleDot(rt: PaneRuntime, role: string | null) {
+function setRoleDot(rt: PaneRuntime, role: string | null, dead: string | null = null) {
   dotRoles.set(rt, role);
+  dotDead.set(rt, dead);
   paintRoleDot(rt, performance.now());
 }
 
@@ -2960,6 +2963,12 @@ function paintRoleDot(rt: PaneRuntime, nowMs: number) {
   const color = roleDotColor(role);
   if (!color) {
     applyDotPaint(rt.roleEl, HIDDEN_DOT);
+    return;
+  }
+  const dead = dotDead.get(rt) ?? null;
+  if (dead !== null) {
+    // ★WP11: a dead seat outranks any activity record (its last 'working' must not keep blinking).
+    applyDotPaint(rt.roleEl, { visible: true, color, view: "dead", label: `역할: ${role} · 종료됨 · ${dead}` });
     return;
   }
   const p = projectActivity(roleActivity.get(paneKey(rt.sid, rt.socket)), nowMs, T_ACTIVITY);
@@ -3120,6 +3129,7 @@ async function refreshPaneTitles() {
             role: string | null;
             live_cwd: string | null;
             exited: boolean;
+            agent_alive?: boolean | null; // ★WP11 deadReason — false = 관측된 사망만(null = 미측정)
             usage?: ObservedUsage | null;
             cwd_blocked?: unknown;
           }[];
@@ -3172,7 +3182,7 @@ async function refreshPaneTitles() {
           const rt = panes.get(paneKey(s.surface_id, sk));
           if (!rt) continue;
           renderUsage(rt.usageEl, s.exited ? null : s.usage); // 종료 pane은 배지 제거 (혼동 방지)
-          setRoleDot(rt, s.exited ? null : s.role); // 역할 점도 동일 주기 갱신(★F-01 단일 렌더러 — 활동 표지·사유·나이를 보존)
+          setRoleDot(rt, s.role, deadReason(s)); // 역할 점도 동일 주기 갱신(★F-01 단일 렌더러 — 활동 표지·사유·나이를 보존 · ★WP11 종료 = 회색 X)
           if (rt.titleEl.isContentEditable) continue; // 이름 편집 중에는 덮어쓰지 않음
           rt.titleEl.textContent = paneTitle(s.title, s.live_cwd) + (s.exited ? " [exited]" : "");
         }
@@ -3193,7 +3203,7 @@ async function refreshPaneTitles() {
             workspaces.filter((w) => !w.pending && !w.deleting && (w.socket ?? undefined) === (sk ?? undefined));
           const before = adoptable();
           if (!before.length || before.some((w) => collectSids(w.tree).includes(s.surface_id))) continue;
-          setRoleDot(await makePane(s.surface_id, s.title, sk), s.role); // 입양 즉시 역할 점 채색(다음 틱 대기 없이 · ★F-01 같은 렌더러 — 관측이 없으면 '모름')
+          setRoleDot(await makePane(s.surface_id, s.title, sk), s.role, deadReason(s)); // 입양 즉시 역할 점 채색(다음 틱 대기 없이 · ★F-01 같은 렌더러 — 관측이 없으면 '모름')
           // 계획은 makePane 의 await **뒤에** 짠다 — 그 사이 다른 경로(종료 이벤트·사용자)가 트리를 바꿨어도 옛 트리로
           // 덮지 않게(종전 코드도 await 뒤의 ws.tree 에 붙였다). adoptSeat 는 전역 함수 — 어떤 실패도 종전 오른쪽 부착.
           const cands = adoptable();

@@ -1321,6 +1321,65 @@ fn claude_working_title_over_a_half_painted_composer_is_incomplete() {
     assert_eq!(prod(Family::Claude, &torn, 80), Sample::Transient(Transient::Incomplete));
 }
 
+/// WP11 (claude 2.1.309): a named session's title is `<glyph> <session name>`, not `<glyph> Claude Code`. Frames below are the
+/// daemon window of the native capture (`_evidence/dept5-0.14.53-wp11-tabdot-20261023/capture`, active-stream-80x24 and
+/// permission-allow-120x40). r1 classified all three NoMatch = "incomplete frame" — the measured live cause of the hollow dot.
+#[test]
+fn claude_named_session_titles_classify_working_waiting_and_permission() {
+    let stream = frame_of(
+        &[(12, RULE), (13, "❯"), (14, RULE), (15, "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt")],
+        (13, 2),
+        "◑ Tab dot capture fixture",
+    );
+    assert!(matches!(prod(Family::Claude, &stream, 80), Sample::Active { .. }));
+    let mut other_phase = stream.clone();
+    other_phase.2 = "◐ Tab dot capture fixture".into();
+    assert!(matches!(prod(Family::Claude, &other_phase, 80), Sample::Active { .. }));
+    let idle = frame_of(
+        &[(17, "✻ Brewed for 27s · done 11:38 PM"), (19, RULE), (20, "❯"), (21, RULE), (22, "  ⏵⏵ bypass permissions on (shift+tab to cycle)")],
+        (20, 2),
+        "✳ Tab dot capture fixture",
+    );
+    assert_eq!(prod(Family::Claude, &idle, 80), Sample::Idle);
+    let perm = frame_of(
+        &[(22, " Do you want to proceed?"), (23, " ❯ 1. Yes"), (24, "   2. Yes, and don’t ask again for: touch *"), (26, "   4. No")],
+        (23, 1),
+        "✳ Tab dot capture fixture",
+    );
+    assert_eq!(prod(Family::Claude, &perm, 120), Sample::Decision(DecisionKind::Permission));
+}
+
+/// WP11: r2 widens only the title NAME, not the shape — glyph, exactly one space, a non-empty name. Everything else stays NoMatch.
+#[test]
+fn claude_title_without_the_glyph_space_name_shape_is_no_match() {
+    let base = frame_of(&[(12, RULE), (13, "❯"), (14, RULE)], (13, 2), "");
+    for title in ["◐Tab dot", "◐ ", "◐    ", "✳", "Claude Code", "x Claude Code", "⠋ ~/work", "✶ Tab dot", "· Tab dot"] {
+        let mut f = base.clone();
+        f.2 = title.into();
+        assert_eq!(prod(Family::Claude, &f, 80), Sample::Transient(Transient::Incomplete), "title {title:?}");
+    }
+}
+
+/// WP11 through the real parser and copy path: OSC 0 with a session name + a 2.1.309 composer → Active, and four such samples
+/// one second apart (H = 3 s of ≥ 4) make the reducer Working — the state the pane dot blinks for.
+#[test]
+fn named_title_bytes_reach_working_through_parser_copy_and_reducer() {
+    let mut p = vt100::Parser::new(24, 80, 0);
+    p.process("\x1b]0;\u{25d0} Tab dot capture fixture\x07".as_bytes());
+    p.process(format!("\x1b[13;1H{r}\x1b[14;1H\u{276f} \x1b[15;1H{r}\x1b[16;1H  \u{23f5}\u{23f5} bypass permissions on\x1b[14;3H", r = RULE).as_bytes());
+    let mut frame = Frame::new();
+    assert!(copy_window(p.screen(), &mut frame));
+    assert_eq!(frame.title, "\u{25d0} Tab dot capture fixture");
+    let (sample, rev) = sample_frame(Family::Claude, &frame, grammars());
+    assert!(matches!(sample, Sample::Active { .. }), "{sample:?}");
+    assert_eq!(rev, Some("claude-2.1.309-r2"));
+    let mut r = Reducer::new(0.0);
+    for t in 0..4 {
+        r.step(sample, f64::from(t), &P);
+    }
+    assert_eq!(r.effective_at(3.0, &P).0, Effective::Working);
+}
+
 fn codex_frame(title: &str, extra: &[(u16, &str)]) -> (Vec<(u16, String)>, (u16, u16), String) {
     let mut rows: Vec<(u16, &str)> = extra.to_vec();
     rows.extend_from_slice(&[(20, "› Ask Codex to do anything"), (22, "  GPT-6.1-Sol default · ~/work"), (23, "  ? for shortcuts")]);
