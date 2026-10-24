@@ -5285,6 +5285,10 @@ class Preflight:
             #   여유는 평균이 아니라 **실측 분포**로 잡는다 — 병렬 런의 바닥은
             #   max(최장 스킬, 총합/워커수)이고 이 호스트 실측에서 최장 스킬(insane-search)
             #   혼자 1.99s, 114 스킬 총합 11.5s ⇒ 바닥 ≈1.99s. 20s = 그 바닥의 약 10배.
+            #   ★바닥이 아니라 **부하 실측**과 대면 여유는 더 작다(정직하게 둘 다 적는다):
+            #     worker-2 가 부하 중(load 8.16/16 · fileproviderd 가 코어 하나 점유)에 잰
+            #     같은 병렬 스캔은 median 5,696 ms · max 6,077 ms 였다 ⇒ 20s 는 그 최악
+            #     관측의 3.3배다. 이 기계의 한가한 값(1.6~1.7s)만 보고 상한을 정하지 마라.
             #   풀 기동 실패로 직렬 폴백이면 0.069s/스킬 ⇒ 20s 는 약 288 스킬까지 든다.
             r = subprocess.run([sys.executable, scan_tool, "all", "--json"],
                                capture_output=True, text=True, timeout=20)

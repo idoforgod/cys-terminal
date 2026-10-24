@@ -134,7 +134,7 @@ check("A5b 범위 밖 동일 꼴을 **세어 기록**한다(고치지 않는다 
 
 
 # ─────────────────────────── B. 훅 ───────────────────────────
-def run_hook(chk_body, with_timeout_stub=None):
+def run_hook(chk_body, with_timeout_stub=None, tmpdir_override=None):
     """임시 팩·임시 홈으로 훅을 돌린다. chk_body = 스텁 javis_checklist.py 의 셸 본문.
     with_timeout_stub = None 이면 PATH 에 timeout 없음 / 숫자면 그 rc 를 즉시 내는 스텁을 놓는다."""
     tmp = _tmp("wp18-hook-")
@@ -157,7 +157,7 @@ def run_hook(chk_body, with_timeout_stub=None):
            if not k.startswith("CYS_") and k not in ("JAVIS_ROOT", "CLAUDE_CONFIG_DIR")}
     env["PATH"] = bindir + os.pathsep + "/usr/bin" + os.pathsep + "/bin"
     env["HOME"] = tmp
-    env["TMPDIR"] = tmp
+    env["TMPDIR"] = tmpdir_override or tmp
     env["CYS_PACK_DIR"] = pack
     env["CYS_ROOT"] = tmp
     env["CYS_ROLE"] = "master"
@@ -202,6 +202,19 @@ check("B3 stderr 꼬리가 경계 안(G4 · 5줄·1KB)",
 r, _ = run_hook(OK_CHK)
 check("B4 음성 대조 — 정상이면 고지 0줄, 본문 주입",
       LOUD not in r.stdout and "실측 체크리스트(배경)" in r.stdout, "exit=%d" % r.returncode)
+# ★B5(자기 적대검증 R1-1): stderr 캡처 경로를 만들 수 없는 기계에서 **체크리스트가 계속 돌아야**
+#   한다. 이 단언이 없으면 "stderr 를 사람이 읽는 자리로" 가 읽기전용 TMPDIR 기계에서 체크리스트를
+#   죽이는 변경이 된다(실측: 리다이렉션 실패 → 미실행). 고지도 뜨지 않아야 한다 — 정상 실행이니까.
+ro = _tmp("wp18-rotmp-")
+os.chmod(ro, 0o500)
+try:
+    r, _ = run_hook(OK_CHK, tmpdir_override=ro)
+    check("B5 stderr 경로를 못 만드는 TMPDIR 에서도 체크리스트는 돈다(R1-1 회귀 핀)",
+          "실측 체크리스트(배경)" in r.stdout and LOUD not in r.stdout and r.returncode == 0,
+          "본문=%s · 고지=%s · exit=%d" % ("실측 체크리스트(배경)" in r.stdout, LOUD in r.stdout,
+                                           r.returncode))
+finally:
+    os.chmod(ro, 0o700)
 
 
 # ─────────────────────────── C. 체크리스트 층 ───────────────────────────
@@ -353,9 +366,14 @@ check("F4 차단 대상이 있으면 blocked 비어있지 않다(C10 음성 대�
       d["blocked"] == ["a-slow-block"] and d["by_verdict"]["BLOCK"] == 1, json.dumps(d["by_verdict"]))
 check("F5 세 verdict 가 다 살아 있다(규칙 파일이 옆에 있었다는 증거)",
       d["by_verdict"] == {"ACCEPT": 1, "REVISE": 1, "BLOCK": 1}, json.dumps(d["by_verdict"]))
-check("F6 풀 자식이 스캐너 옆에 .pyc 를 쓰지 않는다(S6)",
-      not any(n == "__pycache__" or n.endswith(".pyc")
-              for t in _tmproot if os.path.isdir(t) for n in os.listdir(t)), "")
+# ★최상위만 보면 한 겹 아래의 __pycache__ 를 놓친다 — 전수 순회로 센다(자기 적대검증 R1-8).
+_pyc = []
+for t in _tmproot:
+    for dp, dn, fn in os.walk(t):
+        _pyc += [os.path.join(dp, n) for n in list(dn) + list(fn)
+                 if n == "__pycache__" or n.endswith(".pyc")]
+check("F6 풀 자식이 리그 어디에도 .pyc 를 쓰지 않는다(S6 · 전수 순회)",
+      not _pyc, "발견 %d건%s" % (len(_pyc), (": " + _pyc[0]) if _pyc else ""))
 
 for t in _tmproot:
     shutil.rmtree(t, ignore_errors=True)

@@ -346,14 +346,44 @@ if [ "$SOURCE" != "compact" ] && [ -n "$STATE" ]; then
   CHK="${CYS_PACK_DIR:-$HOME/.cys/pack}/bin/javis_checklist.py"
   command -v cygpath >/dev/null 2>&1 && CHK="$(cygpath -w "$CHK" 2>/dev/null || printf '%s' "$CHK")"
   if [ -f "$CHK" ]; then
+    # ★C8/G4(WP18 · 2026-10-24): 종전엔 stderr 를 2>/dev/null 로 버린 뒤 아래에서
+    #   `[ -n "$CHK_OUT" ]` 만 봤다 — 상한 초과·크래시로 출력이 비면 이 체크리스트가
+    #   **한 줄도 남기지 않고 사라졌다**(조용한 생략). 그러면 읽는 사람은 preflight 가
+    #   통과한 것과 아예 재지 못한 것을 구별할 수 없다. 이제 rc 를 잡고, 실패를 고지하고,
+    #   stderr 를 사람이 읽는 자리로 보낸다. ★단 경계를 둔다(G4): 이 훅은 모든 세션
+    #   컨텍스트에 주입되므로 무경계 stderr 는 컨텍스트 폭주다 — 마지막 5줄·1KB 로 자른다
+    #   (바이트 경계라 끝 글자 하나가 잘릴 수 있다 · 실패 갈래에서만 드는 비용).
+    #   훅은 여전히 exit 0 이고 나머지 주입은 그대로다.
+    # ★R1-1(자기 적대검증에서 실측): 이 경로를 만들 수 없으면(읽기전용 TMPDIR) 리다이렉션
+    #   자체가 실패해 **체크리스트가 아예 안 돈다** — 종전엔 돌던 기계다. 실측: TMPDIR 을
+    #   0500 으로 두면 `Permission denied` 뒤 체크리스트 미실행(고지는 떴다). 그래서 먼저
+    #   만들어 보고, 못 만들면 /dev/null 로 내려간다(그 기계는 stderr 꼬리를 잃을 뿐
+    #   체크리스트는 종전처럼 돈다 — rc 판정도 그대로다).
+    _CHK_ERR="${TMPDIR:-/tmp}/cys-inject-chk-err.$$"
+    : > "$_CHK_ERR" 2>/dev/null || _CHK_ERR=/dev/null
     if command -v timeout >/dev/null 2>&1; then
       # outer timeout 은 checklist 내부 PREFLIGHT_TIMEOUT(30s)보다 커야 한다 — 작으면 preflight가
       # 25~30s 걸릴 때 checklist 출력이 통째로 조용히 유실(G2 degrade). 40 = inner 30 + 여유.
-      CHK_OUT=$(timeout 40 "$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>/dev/null)
+      # ★C7 서열: 40(이 겹) > 30(checklist PREFLIGHT_TIMEOUT) > 20(preflight 안 skillscan)
+      #   = innermost-smallest. ★macOS 에는 timeout(1) 이 없다(이 호스트 실측: timeout·gtimeout
+      #   둘 다 부재) — 그런 기계는 아래 else 갈래로 가고 이 겹이 아예 없다. 그때의 상한은
+      #   체크리스트 자신의 30s 다.
+      CHK_OUT=$(timeout 40 "$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>"$_CHK_ERR")
+      CHK_RC=$?
     else
-      CHK_OUT=$("$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>/dev/null)
+      CHK_OUT=$("$CYS_PY" "$CHK" --state "$STATE" --round-dir "$(dirname "$STATE")" 2>"$_CHK_ERR")
+      CHK_RC=$?
     fi
     [ -n "$CHK_OUT" ] && OUT="${OUT}$(printf '%s' "$CHK_OUT" | sed 's/\\/\\\\/g')\n\n"
+    if [ "$CHK_RC" != 0 ] || [ -z "$CHK_OUT" ]; then
+      CHK_WHY="rc=$CHK_RC"
+      [ "$CHK_RC" = 124 ] && CHK_WHY="rc=124(상한 40s 초과)"
+      [ -z "$CHK_OUT" ] && CHK_WHY="$CHK_WHY · 출력 없음"
+      CHK_TAIL=""
+      [ -s "$_CHK_ERR" ] && CHK_TAIL=$(tail -n 5 "$_CHK_ERR" | tr -d '\r' | tr '\n' ' ' | head -c 1024 | sed 's/\\/\\\\/g')
+      OUT="${OUT}⚠ 실측 체크리스트 미수행($CHK_WHY) — preflight·SESSION_STATE·미완 TODO 실측이 이 컨텍스트에 없다(조용한 생략이 아니라 고지다). stderr 꼬리: ${CHK_TAIL:-(없음)}\n\n"
+    fi
+    rm -f "$_CHK_ERR" 2>/dev/null
   fi
 fi
 
