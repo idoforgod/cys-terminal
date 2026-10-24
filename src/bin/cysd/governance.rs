@@ -9386,6 +9386,31 @@ fn queue_digest_max_chars() -> usize {
         .max(1)
 }
 
+/// WP17: lexical classification only; preserve the original body, including whitespace and
+/// subsequent lines. A command word is ASCII letter + ASCII alphanumeric / '_' / '-', then
+/// Unicode whitespace or end. Paths such as /tmp/file are not command words; /tmp alone is.
+fn queued_slash_command(text: &str) -> bool {
+    let Some(rest) = text.trim_start().strip_prefix('/') else { return false };
+    let mut chars = rest.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic()) { return false; }
+    for c in chars {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' { continue; }
+        return c.is_whitespace();
+    }
+    true
+}
+
+/// A slash head is alone; a later slash is a FIFO barrier, never skipped. The existing planner
+/// still decides sender/origin and size limits within this prefix (ordinary burst damping stays).
+fn queue_digest_prefix<'a>(texts: impl Iterator<Item = &'a str>) -> usize {
+    let mut count = 0;
+    for text in texts {
+        if queued_slash_command(text) { return count.max(1); }
+        count += 1;
+    }
+    count
+}
+
 /// 병합 대상 선택(순수) — 큐 순서대로 훑어 **머리와 같은 발신자**인 항목의 인덱스를 모은다.
 /// 머리는 항상 포함하고(0번), 상한(건수·문자)에 닿으면 멈춘다. 반환은 큐 인덱스 오름차순이라
 /// 발신자 내부 순서가 보존된다.
@@ -10585,6 +10610,38 @@ pub(crate) struct ScreenRecheck {
     pub(crate) approval_pending: bool,
 }
 
+/// WP17 command admission. Unknown layouts/hints and markerless seats keep the ordinary gate
+/// (head ruling 1); they are NOT evidence of an empty composer. Return a diagnostic label for
+/// the pre-write ledger, never a new notice or retry. Known drafts still fail the ordinary gate.
+/// This runs before the body only: checking empty at submit time would reject our own paste.
+fn slash_command_admission(
+    daemon: &Arc<Daemon>,
+    s: &Arc<crate::state::Surface>,
+    marker: Option<&[String]>,
+    placeholder: Option<&str>,
+) -> Result<&'static str, &'static str> {
+    let Some(markers) = marker else {
+        return match no_marker_gate(daemon, s) {
+            Some(why) => Err(why),
+            None => Ok("fallback_markerless"),
+        };
+    };
+    let obs = observe_prompt(s, markers);
+    let input = prompt_gate_input(daemon, s, &obs.marker, placeholder, &obs);
+    if let PromptGate::Blocked(why) = prompt_gate_verdict(&input) { return Err(why); }
+    // A fresh full-region proof is stronger than a zero pending counter. Failure to recognise
+    // the region is not proof of a draft: use the approved ordinary-message fallback instead.
+    if obs.frame_consistent()
+        && cys::readiness::composer_edit_region_empty(&obs.screen, &obs.marker, placeholder)
+    {
+        Ok("measured_empty")
+    } else if obs.line.as_ref().is_some_and(|(_, after)| !after.trim().is_empty()) {
+        Ok("fallback_unrecognized_hint")
+    } else {
+        Ok("fallback_unrecognized_layout")
+    }
+}
+
 pub(crate) fn deliver_head_locked(
     daemon: &Arc<Daemon>,
     s: &Arc<crate::state::Surface>,
@@ -10679,11 +10736,21 @@ pub(crate) fn deliver_head_locked(
         // ★B1(0.14.30) C3: 같은 발신자 대기분을 **한 턴으로** 병합한다(버스트 봉인).
         //   강제 배달(queue.deliver RPC)과 조준 배달은 **병합하지 않는다** — 운영자가 지목한
         //   항목 1건만 나가는 것이 그 명령의 계약이다.
+        let slash_command = queued_slash_command(&entry.text);
+        let slash_admission = if slash_command {
+            match slash_command_admission(daemon, s,
+                recheck.and_then(|r| r.marker.as_deref()),
+                recheck.and_then(|r| r.placeholder.as_deref())) {
+                Ok(reason) => Some(reason),
+                Err(why) => { mark_queue_blocked(s, why); break 'tx None; }
+            }
+        } else { None };
         let merge_on = !forced && expect_head_id.is_none();
         let mut picked: Vec<usize> = if merge_on && q.len() > 1 {
-            let froms: Vec<Option<String>> = q.iter().map(|e| e.from.clone()).collect();
-            let origins: Vec<String> = q.iter().map(|e| e.origin.clone()).collect();
-            let chars: Vec<usize> = q.iter().map(|e| e.text.chars().count()).collect();
+            let prefix = queue_digest_prefix(q.iter().map(|e| e.text.as_str()));
+            let froms: Vec<Option<String>> = q.iter().take(prefix).map(|e| e.from.clone()).collect();
+            let origins: Vec<String> = q.iter().take(prefix).map(|e| e.origin.clone()).collect();
+            let chars: Vec<usize> = q.iter().take(prefix).map(|e| e.text.chars().count()).collect();
             plan_queue_merge(
                 &froms,
                 &origins,
@@ -10736,7 +10803,7 @@ pub(crate) fn deliver_head_locked(
         //   임의 문자열은 `from_label`(§8). `delivered_at` 은 선기록에선 아직 모른다(null) —
         //   writer 인계 성공 시각은 **영수증 줄**(origin `queue_receipt`)이 따로 남긴다(codex Q8).
         let (from_surface, from_label) = crate::delivery::split_queue_from(entry.from.as_deref());
-        let extra = json!({
+        let mut extra = json!({
             "queue_entry_id": entry.id,
             "queue_seq": entry.seq,
             "enqueued_at": entry.enqueued_at,
@@ -10746,6 +10813,9 @@ pub(crate) fn deliver_head_locked(
             "digest_items": merged.len(),
             "digest_parts": parts,
         });
+        if let Some(reason) = slash_admission {
+            extra["slash_command_admission"] = json!(reason);
+        }
         crate::delivery::record_audited_with(
             daemon,
             s.id,
@@ -10759,6 +10829,14 @@ pub(crate) fn deliver_head_locked(
         //   `record_audited_with` 의 원장 append·회전이 있고, 그것이 바로 ②를 넣은 이유다).
         if !handoff_gate_ok(daemon, s, expect_output_gen, recheck) {
             break 'tx None;
+        }
+        if slash_command {
+            if let Err(why) = slash_command_admission(daemon, s,
+                recheck.and_then(|r| r.marker.as_deref()),
+                recheck.and_then(|r| r.placeholder.as_deref())) {
+                mark_queue_blocked(s, why);
+                break 'tx None;
+            }
         }
         // ★(0.14.31 · triage 2026-09-08 · codex blocking) 마지막 게이트 **뒤에** 승인이 생겼으면
         //   그 사실을 가드의 '정상 기대값' 으로 채택하지 않는다 — 종전에는 그 값이 그대로
@@ -10796,6 +10874,21 @@ pub(crate) fn deliver_head_locked(
             recheck.and_then(|r| r.marker.clone()),
             recheck.and_then(|r| r.placeholder.clone()),
         );
+        let safety_probe = if slash_command {
+            let wd = Arc::downgrade(daemon);
+            let ws = Arc::downgrade(s);
+            let marker = recheck.and_then(|r| r.marker.clone());
+            let placeholder = recheck.and_then(|r| r.placeholder.clone());
+            let ordinary = safety_probe;
+            let probe: crate::state::SafetyProbe = Arc::new(move || {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if ordinary() { return true; }
+                    let (Some(d), Some(s)) = (wd.upgrade(), ws.upgrade()) else { return true };
+                    slash_command_admission(&d, &s, marker.as_deref(), placeholder.as_deref()).is_err()
+                })).unwrap_or(true)
+            });
+            probe
+        } else { safety_probe };
         let guard = Some(std::sync::Arc::new(crate::state::InjectGuard::new(
             expect_output_gen,
             s.output_gen.clone(),
@@ -23800,6 +23893,35 @@ mod tests {
     // ─────────── ★B1(0.14.30) C3: 발신자별 병합·다이제스트 상한 핀(b1_merge_*) ───────────
 
     use super::{plan_queue_merge, render_queue_digest};
+
+    #[test]
+    fn wp17_slash_predicate_boundaries_and_multiline_policy() {
+        for text in ["/model", "/model opus", " \t/remote-control 이름", "/m2-x_y a",
+            "\u{2003}/model\n/clear", "/model\r\nprose", "/tmp"] {
+            assert!(super::queued_slash_command(text), "command: {text:?}");
+        }
+        for text in ["", "/", "//note", "/ model", "/3abc", "/model.txt", "/tmp/file",
+            "text /model", "/모델 opus", "/model:opus", "report\n/model opus"] {
+            assert!(!super::queued_slash_command(text), "ordinary: {text:?}");
+        }
+    }
+
+    #[test]
+    fn wp17_digest_prefix_keeps_every_fifo_barrier_and_text_burst() {
+        for (texts, want) in [
+            (vec![], 0),
+            (vec!["/model opus", "/clear"], 1),
+            (vec!["/model opus", "text"], 1),
+            (vec!["one", "/model opus", "two"], 1),
+            (vec!["one", "two", "/model opus", "three"], 2),
+            (vec!["one", "two", "three"], 3),
+            (vec!["", "", ""], 3),
+            (vec!["/tmp/file", "text"], 2),
+            (vec![" \t/model opus\n/clear", "later"], 1),
+        ] {
+            assert_eq!(super::queue_digest_prefix(texts.into_iter()), want);
+        }
+    }
 
     /// 머리에서 **연속한** 같은 발신자만 모으고 상한(건수)에서 멈춘다.
     ///
