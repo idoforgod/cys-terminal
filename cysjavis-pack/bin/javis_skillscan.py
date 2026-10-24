@@ -866,7 +866,16 @@ def cmd_all(roots, as_json):
             d = os.path.join(root, entry)
             if os.path.isdir(d) and (os.path.exists(os.path.join(d, "SKILL.md")) or os.path.exists(os.path.join(d, "skill.md"))):
                 skills.append(d)
-    results = [scan_skill(s) for s in skills]
+    # [cys-parallel-skillscan] 2026-10-24 worker-2: scan_skill is independent CPU-bound work
+    # (regex/AST/taint) and the GIL is enabled, so this must be processes, not threads.
+    # ProcessPoolExecutor.map preserves INPUT order, so results[] ordering is unchanged.
+    # Falls back to the original serial comprehension if a pool cannot be created.
+    try:
+        import concurrent.futures as _cf
+        with _cf.ProcessPoolExecutor(max_workers=min(8, (os.cpu_count() or 4))) as _ex:
+            results = list(_ex.map(scan_skill, skills))
+    except Exception:
+        results = [scan_skill(s) for s in skills]
     worst = max((SEV_ORDER.get(r["severity"], 3) * -1 for r in results), default=0)
     summary = {"scanned": len(results),
                "by_verdict": {v: sum(1 for r in results if r["verdict"] == v) for v in ("ACCEPT", "REVISE", "BLOCK")},
