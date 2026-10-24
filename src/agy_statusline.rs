@@ -1118,7 +1118,8 @@ pub fn describe(o: &Outcome, settings: &Path) -> Option<String> {
              {p} 는 그대로입니다 · 다시 시도: `cys doctor --fix` · 직접 넣기: statusLine command = `{command}`(사용 설명서 agy 절)"
         ),
         Outcome::UnsafePath(pack) => format!(
-            "팩 경로({pack})에 공백·따옴표 등이 있어 안전한 연결 명령을 만들 수 없어 연결하지 않았습니다 — 사용 설명서 agy 절"
+            "팩 경로({pack})에 공백·따옴표 등이 있어 안전한 연결 명령을 만들 수 없어 연결하지 않았습니다 — 설정은 변경하지 않았습니다. \
+             수동 해결: cys를 공백 없는 경로에 설치하거나 {p}의 statusLine.command를 직접 설정하세요"
         ),
         Outcome::UserOwned => format!(
             "{p} 에 사용자가 설정한 statusLine 이 있어 덮지 않았습니다 — agy 쿼터 값은 들어오지 않습니다(사용 설명서 agy 절)"
@@ -1232,6 +1233,42 @@ mod tests {
     const UNIX_DUMMY_CMD: &str = "sh /h/.cys/pack/hooks/cys-agy-statusline.sh --cys-autolink";
 
     // ───────── 순수 함수 ─────────
+
+    #[test]
+    fn wp15_r2_spaced_windows_context_refuses_visibly_without_writing() {
+        let pack = Path::new("C:/rust/User Name/.cys/pack");
+        let home = Path::new("C:/rust/User Name");
+        assert_eq!(link_command_resolved(pack, true, true, Some(home)), None);
+        assert_eq!(link_command_resolved(Path::new("C:/rust/User/.cys/pack"), true, true, None).as_deref(),
+            Some(r"C:\rust\User\.cys\pack\hooks\cys-agy-statusline.cmd --cys-autolink"));
+        for old in [
+            Some(r#"{"statusLine":{"command":"bash \"C:/rust/User Name/.cys/pack/hooks/cys-agy-statusline.sh\" --cys-autolink","enabled":false}}"#),
+            Some(r#"{"statusLine":{"command":"user-custom-command"},"keep":1}"#),
+            Some(AGY_DEFAULT),
+            None,
+        ] {
+            let sb = Sandbox::new("wp15-r2-spaces");
+            sb.agy_dir();
+            if let Some(body) = old { sb.put(body.as_bytes()); }
+            let (settings, record) = (sb.settings(), sb.record());
+            let before = std::fs::read(&settings).ok();
+            assert_eq!(before.as_deref(), old.map(str::as_bytes), "fixture must be readable");
+            let calls = std::cell::Cell::new(0);
+            let probe = |_: &str| { calls.set(calls.get() + 1); Ok(()) };
+            let ctx = Ctx { settings: &settings, pack_dir: pack, record: &record,
+                windows: true, home: Some(home), probe: Some(&probe) };
+            let outcome = ensure_linked(&ctx, false); // Real resolver route, no replacement-command constant.
+            assert!(matches!(&outcome, Outcome::UnsafePath(p) if p == "C:/rust/User Name/.cys/pack"));
+            assert_eq!(std::fs::read(&settings).ok(), before, "existing entry must be byte-identical");
+            assert!(!record.exists());
+            assert!(!PathBuf::from(format!("{}{BACKUP_SUFFIX}", settings.display())).exists());
+            assert_eq!(calls.get(), 0, "unsupported commands must never be executed");
+            let line = describe(&outcome, &settings).expect("spaced-path refusal must be visible");
+            assert_eq!(line.lines().count(), 1);
+            assert!(line.contains("User Name") && line.contains("공백"), "reason/path missing: {line}");
+            assert!(line.contains("공백 없는 경로") && line.contains("statusLine.command"), "manual fix missing: {line}");
+        }
+    }
 
     #[test]
     fn wp15_migrates_only_owned_legacy_windows_commands() {
