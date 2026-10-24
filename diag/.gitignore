@@ -1,0 +1,3 @@
+# Local verification records only; never a CI input or shipped artifact.
+local-checks/
+__pycache__/

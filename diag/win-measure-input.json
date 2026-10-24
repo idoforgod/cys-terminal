@@ -1,0 +1,13 @@
+{
+  "reading": "R1",
+  "plan_sha256": "ddf2c693c7e93598593a3f06c7c2e77aa8dd8b538efe5baf64fec9bdc8c3ee44",
+  "base_url": "https://github.com/idoforgod/cys-terminal/releases/download/v0.14.52/cys_0.14.52_x64-setup.exe",
+  "base_sha256": "",
+  "candidate_name": "cys_0.14.53_x64-setup.exe",
+  "candidate_sha256": "",
+  "product_sha": "",
+  "run_id": 0,
+  "run_attempt": 0,
+  "artifact_id": 0,
+  "artifact_name": "cys-windows-x64-nsis"
+}

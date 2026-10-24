@@ -1,0 +1,18 @@
+{
+  "lib.ps1": {
+    "source": "a240cfbfbdf6705be2e75277f84c8b2682a32cca:diag/lib.ps1",
+    "sha256": "3779d3ba40b67e4a73e4363c351ecd30be7312fae10665b272e9c89a2fa63560"
+  },
+  "sac-lib.ps1": {
+    "source": "a240cfbfbdf6705be2e75277f84c8b2682a32cca:diag/sac-lib.ps1",
+    "sha256": "d09bbec895d51d196a35169fb7623e63830014d5aa4f46558cd74d7c1b4f2675"
+  },
+  "publish-results.mjs": {
+    "source": "a240cfbfbdf6705be2e75277f84c8b2682a32cca:diag/publish-results.mjs",
+    "sha256": "b55c9c36dfc45d04398984a5773bb05056a582be312124c1ae62e5f7e8296741"
+  },
+  "cdp-update.mjs": {
+    "source": "a240cfbfbdf6705be2e75277f84c8b2682a32cca:diag/cdp-update.mjs",
+    "sha256": "ce2ef59f259365d2fc5d510f6b4f99d6e21f6c83bc3ec7a13832fb0365a9ebd1"
+  }
+}

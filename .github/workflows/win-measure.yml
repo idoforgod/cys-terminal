@@ -1,0 +1,128 @@
+name: Windows update measurement (R1 or R2; no release publication)
+on:
+  push:
+    branches: ['work/0.14.53-win-measure']
+    paths: ['diag/**', '.github/workflows/win-measure.yml']
+permissions:
+  contents: read
+concurrency:
+  group: win-measure-0.14.53
+  cancel-in-progress: false
+jobs:
+  inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reading: ${{ steps.lock.outputs.reading }}
+      runner: ${{ steps.lock.outputs.runner }}
+      run_id: ${{ steps.lock.outputs.run_id }}
+      artifact_name: ${{ steps.lock.outputs.artifact_name }}
+      artifact_id: ${{ steps.lock.outputs.artifact_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Contract negative controls (no installers launched)
+        run: node --test diag/measure-contract.test.mjs
+      - name: Lock exact build run and artifact identity
+        id: lock
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node diag/measure-contract.mjs prepare diag/win-measure-input.json build-metadata.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: winmeasure-input-metadata
+          path: build-metadata.json
+          if-no-files-found: error
+  measure:
+    needs: inputs
+    runs-on: ${{ needs.inputs.outputs.runner }}
+    timeout-minutes: ${{ needs.inputs.outputs.reading == 'R1' && 45 || 60 }}
+    permissions:
+      contents: write
+      actions: read
+    env:
+      DIAG_MATRIX_OS: ${{ needs.inputs.outputs.runner }}
+      DIAG_JOB_LIMIT_MIN: '45'
+      READING: ${{ needs.inputs.outputs.reading }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Parse every PowerShell script before native work
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bad = @()
+          Get-ChildItem diag -Recurse -Filter *.ps1 | ForEach-Object {
+            $t = $null; $e = $null
+            [void][Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$t, [ref]$e)
+            if ($e) { $bad += @($e | ForEach-Object { $_.ToString() }) }
+          }
+          if ($bad.Count) { throw ($bad -join "`n") }
+      - uses: actions/download-artifact@v4
+        with:
+          name: winmeasure-input-metadata
+          path: ${{ runner.temp }}/diag-out
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.inputs.outputs.artifact_id }}
+          run-id: ${{ needs.inputs.outputs.run_id }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/candidate
+      - name: Download base and authorize exact installer bytes
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $x = Get-Content diag/win-measure-input.json -Raw | ConvertFrom-Json
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/diag-out" | Out-Null
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/diag-work" | Out-Null
+          Copy-Item diag/win-measure-input.json "$env:RUNNER_TEMP/diag-out/input-lock.json"
+          $base = "$env:RUNNER_TEMP/diag-work/base.exe"
+          Invoke-WebRequest -UseBasicParsing -Uri $x.base_url -OutFile $base
+          $files = @(Get-ChildItem "$env:RUNNER_TEMP/candidate" -Recurse -File -Filter *.exe)
+          if ($files.Count -ne 1 -or $files[0].Name -cne $x.candidate_name) { throw 'UNMEASURED_INPUT: candidate missing or ambiguous' }
+          & node diag/measure-contract.mjs authorize diag/win-measure-input.json $base $files[0].FullName "$env:RUNNER_TEMP/diag-out/permit.json"
+          if ($LASTEXITCODE -ne 0) { throw 'UNMEASURED_INPUT: installer authorization refused' }
+      - name: Observe requested update path (result is JSON, not this step color)
+        shell: powershell
+        timeout-minutes: ${{ needs.inputs.outputs.reading == 'R1' && 30 || 45 }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File diag/win-measure.ps1 -Permit "$env:RUNNER_TEMP/diag-out/permit.json"
+          if ($LASTEXITCODE -ne 0) { throw 'Measurement driver did not finish; retain partial evidence' }
+      - name: Always restore only SAC policy touched by this measurement
+        if: always()
+        shell: cmd
+        run: |
+          if not exist "%RUNNER_TEMP%\diag-out\sac-touched.json" exit /b 0
+          reg add "HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy" /v VerifiedAndReputablePolicyState /t REG_DWORD /d 0 /f > "%RUNNER_TEMP%\diag-out\restore-fallback.txt" 2>&1
+          "%WINDIR%\System32\CiTool.exe" -r < nul >> "%RUNNER_TEMP%\diag-out\restore-fallback.txt" 2>&1
+          reg query "HKLM\SYSTEM\CurrentControlSet\Control\CI\Policy" /v VerifiedAndReputablePolicyState >> "%RUNNER_TEMP%\diag-out\restore-fallback.txt" 2>&1
+      - name: Hash returned evidence and record missing result
+        if: always()
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/diag-out" | Out-Null
+          & node diag/seal-results.mjs "$env:RUNNER_TEMP/diag-out"
+          if ($LASTEXITCODE -ne 0) { throw 'Result seal failed' }
+      - name: Publish result ref for the assigned Claude reader
+        if: always()
+        shell: cmd
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node diag\vendor\publish-results.mjs --job winmeasure-%READING% --os %DIAG_MATRIX_OS% --out "%RUNNER_TEMP%\diag-out"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: winmeasure-${{ needs.inputs.outputs.reading }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/diag-out
+          if-no-files-found: error
+          retention-days: 30
