@@ -2087,7 +2087,7 @@ describe("★S4 B1 — 실제 3초 틱(refreshPaneTitles 실제 본문)으로: �
     const wsBase: Record<string, unknown> = { id: 0, name: "본부", tree: tree(1) };
     const wsDept: Record<string, unknown> = { id: 1, name: "dept-1", socket: SOCK, pending: false, createdAt: T0, tree: tree(3) };
     const workspaces = [wsBase, wsDept];
-    const rt = { usageEl: {}, roleEl: {}, titleEl: { isContentEditable: false, textContent: "" } };
+    const rt = { usageEl: {}, roleEl: {}, titleEl: { isContentEditable: false, textContent: "", dataset: {} } };
     const nothing = (): void => undefined;
     const deps: Record<string, unknown> = {
       // ── refreshPaneTitles 가 읽는 모듈 상태·도우미(실제 순수 함수는 실제 것을 쓴다)

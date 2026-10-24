@@ -7889,8 +7889,15 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
             let Some(sid) = resolve_surface_id(&params) else {
                 return Reply::Single(err_response(&id, "invalid_params", "missing surface_id"));
             };
-            let Some(title) = param_str(&params, "title") else {
+            let Some(raw_title) = param_str(&params, "title") else {
                 return Reply::Single(err_response(&id, "invalid_params", "missing title"));
+            };
+            // ★WP13(0.14.53 · 오너 fix F1) 입력 정화 — 제어문자는 버리고 길이는 거절한다(`cys::title` 한 벌을
+            //   CLI 와 데몬이 같이 쓴다). 저장되는 제목은 `cys list` 한 줄과 pane 헤더·recall 귀속 칸에 그대로
+            //   흐르므로 ESC·줄바꿈이 들어가면 그 출력들이 깨진다. 빈 제목은 종전대로 **정당**하다(자동 제목 복귀).
+            let title = match cys::title::sanitize_title(&raw_title) {
+                Ok(t) => t,
+                Err(e) => return Reply::Single(err_response(&id, "invalid_params", &e)),
             };
             let Some(surface) = daemon.get_surface(sid) else {
                 return Reply::Single(err_response(
@@ -7899,6 +7906,33 @@ fn dispatch_method(daemon: &Arc<Daemon>, req: Request, caller_pid: Option<u32>, 
                     &format!("surface {sid} not found"),
                 ));
             };
+            // ★WP13 신원·소유 게이트 — `surface.close` 의 게이트를 그대로 비춘다(헤드 결정 Q1 · 2026-10-24).
+            //   종전 이 RPC 에는 게이트가 **없었다**: 어느 pane 이든 임의 surface_id 로 남의 탭 이름을 바꿀 수
+            //   있었고, 그것은 오너가 끝내려는 혼동(어느 창이 누구인지 모른다)을 **만드는** 쪽이다.
+            //   발신 pane 은 커널 peer pid 로만 확정한다(client 자기신고 surface_id 불신 — close 와 같은 논증).
+            //   익명 발신(caller_pid None = GUI·pane 밖 오너 터미널·데몬 내부)은 종전대로 통과한다.
+            let caller_sid = caller_pid.and_then(|p| resolve_caller_surface(daemon, p));
+            let caller_role = caller_sid
+                .and_then(|cs| daemon.get_surface(cs))
+                .and_then(|cs| cs.role.lock().unwrap_or_else(|e| e.into_inner()).clone());
+            if !cys::title::rename_allowed(caller_sid, sid, caller_role.as_deref()) {
+                daemon.bus.publish(
+                    "surface.rename_denied",
+                    "surface",
+                    Some(sid),
+                    json!({"requested_surface": sid, "caller_surface": caller_sid,
+                           "caller_pid": caller_pid, "caller_role": caller_role}),
+                );
+                return Reply::Single(err_response(
+                    &id,
+                    "rename_denied",
+                    &format!(
+                        "surface.rename denied: caller (surface {}) may rename only its own surface, not surface {sid} \
+                         — master may rename any surface of this daemon",
+                        caller_sid.map(|c| c.to_string()).unwrap_or_else(|| "?".into())
+                    ),
+                ));
+            }
             *surface.title.lock().unwrap() = title.clone();
             Reply::Single(ok_response(&id, json!({"surface_id": sid, "title": title})))
         }

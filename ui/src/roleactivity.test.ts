@@ -19,6 +19,7 @@ import { roleDotColor } from "./appearance";
 import { seatPriority, annotateRoles, tidyHoles } from "./seatlayout";
 import { advanceGhostStrikes } from "./wsreconcile";
 import { deptLiveRoles } from "./deptprogress";
+import { dupRoleCounts, paneTitle } from "./panetitle"; // ★WP13 표시 함수(순수) — 대역 대신 진짜를 태운다
 
 declare const Bun: { Transpiler: new (o: { loader: "ts" }) => { transformSync(code: string): string } };
 
@@ -259,7 +260,7 @@ interface FakeRt {
   sid: number;
   socket?: string;
   roleEl: FakeDot;
-  titleEl: { isContentEditable: boolean; textContent: string };
+  titleEl: { isContentEditable: boolean; textContent: string; dataset: Record<string, string> };
   usageEl: Record<string, never>;
   termHost: { scrollTop: number };
   el: Record<string, never>;
@@ -274,7 +275,7 @@ function harness() {
   const focus: number[] = [];
   const paneKey = (sid: number, socket?: string): string => `${socket ?? ""}#${sid}`;
   const makeRt = (sid: number, socket?: string): FakeRt => ({
-    sid, socket, roleEl: new FakeDot(), titleEl: { isContentEditable: false, textContent: "" }, usageEl: {}, termHost: { scrollTop: 120 + sid }, el: {},
+    sid, socket, roleEl: new FakeDot(), titleEl: { isContentEditable: false, textContent: "", dataset: {} }, usageEl: {}, termHost: { scrollTop: 120 + sid }, el: {},
   });
   const panes = new Map<string, FakeRt>();
   for (const [sid, sk] of [[1, "/a.sock"], [2, "/a.sock"], [3, "/b.sock"]] as const) panes.set(paneKey(sid, sk), makeRt(sid, sk));
@@ -305,7 +306,10 @@ function harness() {
     collectCwdBlocked: () => [], annotateRoles, advanceGhostStrikes, seatPriority, tidyHoles, deptLiveRoles,
     ghostStrike: new Map<string, number>(), paneKey, ROLE_SLOT_GRACE: 240_000,
     holdRolePane: () => false, detachPane: nothing, forgetDaemonEpoch: nothing, reanchorAuto: nothing, destroyPaneRuntime: nothing,
-    panes, renderUsage: nothing, paneTitle: (t: string): string => String(t),
+    panes, renderUsage: nothing,
+    // ★WP13: refreshPaneTitles 가 쓰는 표시 함수는 이제 ./panetitle 의 순수 함수다(DOM 불필요) — 대역이 아니라
+    //   진짜를 넣는다. 서명이 바뀌면(번호 인자) 여기서 ReferenceError/형 오류로 드러난다(이 파일 머리말 ② 규약).
+    paneTitle, dupRoleCounts,
     makePane: async (sid: number, _title: string, sk?: string): Promise<FakeRt> => {
       const rt = makeRt(sid, sk);
       panes.set(paneKey(sid, sk), rt);
@@ -356,7 +360,7 @@ describe("★F-01 U-F05/U-F06 — 실제 refreshPaneTitles 본문: 활동 패스
     h.reply("/a.sock", [h.row(1, "worker", WORK(1)), h.row(2, "master", WORK(1))]);
     h.reply("/b.sock", [h.row(3, "cso", WORK(1))]);
     await h.tick();
-    expect([h.rt(3, "/b.sock").roleEl.state, h.rt(3, "/b.sock").titleEl.textContent]).toEqual(["act-working", "t3"]);
+    expect([h.rt(3, "/b.sock").roleEl.state, h.rt(3, "/b.sock").titleEl.textContent]).toEqual(["act-working", "[3] t3"]); // ★WP13 번호 접두
     h.reply("/b.sock", [{ ...h.row(3, "cso", WORK(2, { state: "waiting", raw: "idle", reason: "settled idle" })), title: "u3" }]);
     h.scope.refreshing = true; // 앞 틱의 입양·제목 소비가 아직 진행 중
     h.mono.t += 3_000;
@@ -364,7 +368,7 @@ describe("★F-01 U-F05/U-F06 — 실제 refreshPaneTitles 본문: 활동 패스
     await flush();
     expect(h.invokes).toEqual(["list_surfaces:/a.sock", "list_surfaces:/b.sock", "list_surfaces:/a.sock", "list_surfaces:/b.sock"]);
     expect(h.rt(3, "/b.sock").roleEl.state).toBe("act-waiting"); // 응답마다 독립 투영
-    expect(h.rt(3, "/b.sock").titleEl.textContent).toBe("t3"); // 소비자(제목·입양)는 겹쳐 돌지 않았다
+    expect(h.rt(3, "/b.sock").titleEl.textContent).toBe("[3] t3"); // 소비자(제목·입양)는 겹쳐 돌지 않았다 · ★WP13 번호 접두
     expect(h.scope.refreshing).toBe(true);
   });
 
@@ -377,7 +381,7 @@ describe("★F-01 U-F05/U-F06 — 실제 refreshPaneTitles 본문: 활동 패스
     };
     const threw = await h.tick();
     expect({ threw }).toEqual({ threw: false });
-    expect([h.rt(1, "/a.sock").titleEl.textContent, h.rt(3, "/b.sock").titleEl.textContent]).toEqual(["t1", "t3"]);
+    expect([h.rt(1, "/a.sock").titleEl.textContent, h.rt(3, "/b.sock").titleEl.textContent]).toEqual(["[1] t1", "[3] t3"]); // ★WP13 번호 접두
     expect(h.panes.has("/b.sock#4")).toBe(true); // 입양도 돌았다
     expect(h.renders.length).toBe(1);
   });
@@ -404,7 +408,7 @@ describe("★F-01 U-F05/U-F06 — 실제 refreshPaneTitles 본문: 활동 패스
     await h.tick();
     expect([1, 2].map((s) => h.rt(s, "/a.sock").roleEl.state).concat(h.rt(3, "/b.sock").roleEl.state)).toEqual(["act-working", "act-unknown", "act-working"]);
     expect(h.rt(2, "/a.sock").roleEl.title).toBe("역할: master · 상태 모름 · 활동 정보 형식 오류");
-    expect([1, 2].map((s) => h.rt(s, "/a.sock").titleEl.textContent)).toEqual(["t1", "t2"]);
+    expect([1, 2].map((s) => h.rt(s, "/a.sock").titleEl.textContent)).toEqual(["[1] t1", "[2] t2"]); // ★WP13 번호 접두
   });
 
   it("hung first endpoint: the healthy sibling's dot and title update; the hung endpoint gets no second original", async () => {
@@ -413,7 +417,7 @@ describe("★F-01 U-F05/U-F06 — 실제 refreshPaneTitles 본문: 활동 패스
     h.reply("/b.sock", [h.row(3, "cso", WORK(1))]);
     await h.tick();
     expect(h.rt(3, "/b.sock").roleEl.state).toBe("act-working");
-    expect(h.rt(3, "/b.sock").titleEl.textContent).toBe("t3");
+    expect(h.rt(3, "/b.sock").titleEl.textContent).toBe("[3] t3"); // ★WP13 번호 접두
     expect(h.rt(1, "/a.sock").titleEl.textContent).toBe("");
     h.mono.t += 3_000;
     h.reply("/b.sock", [h.row(3, "cso", WORK(2, { state: "waiting", raw: "idle", reason: "settled idle" }))]);

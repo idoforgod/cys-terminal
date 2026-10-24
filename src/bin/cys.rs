@@ -61,6 +61,25 @@ enum Command {
         #[arg(long, default_value_t = 120)]
         cols: u16,
     },
+    /// Rename a surface's tab title (owner fix F1). The UI shows "[<surface>] <title>", and a role that
+    /// has two or more live seats is marked " (n)" so two identical tabs can be told apart.
+    /// An empty title restores the automatic "{role}-{agent} · {folder}" title.
+    /// Control characters are dropped; a title longer than 120 characters is refused.
+    /// You may rename your own surface; master may rename any surface of this daemon.
+    /// With no --surface and no --to, renames the surface you are calling from (CYS_SURFACE_ID).
+    /// ★--to <role> resolves to ONE surface, so when a role has two or more seats (the very case this
+    /// fix is for) use --surface <n> to say which one.
+    /// ★NOT persisted (0.14.53): the title is lost when the app or daemon restarts and the automatic
+    /// title returns.
+    #[command(name = "set-title")]
+    SetTitle {
+        #[arg(long)]
+        surface: Option<String>,
+        #[arg(long)]
+        to: Option<String>,
+        /// The new title ("" = back to the automatic one)
+        title: String,
+    },
     /// List surfaces
     List,
     /// Inject text into a surface's stdin (no trailing newline; follow with send-key Return)
@@ -5886,6 +5905,23 @@ fn run(command: Command) -> i32 {
             )
             .map(|r| println!("{}", r["surface_ref"].as_str().unwrap_or("?")))
         }
+
+        // ★WP13(0.14.53 · 오너 fix F1): 좌석이 뜬 뒤 탭 제목을 바꾼다. RPC(`surface.rename`)는 이미 있었고
+        //   GUI 의 「이름 변경」 이 그것을 쓰는데 CLI 만 없었다(오너 실측: `cys --help` 에 title·rename 부재).
+        //   정화는 데몬과 **같은 순수 함수**로 먼저 여기서 — 틀린 입력은 왕복 없이 즉시 알려 준다.
+        Command::SetTitle { surface, to, title } => match cys::title::sanitize_title(&title) {
+            Err(e) => Err(e),
+            Ok(clean) => target_surface(&surface, &to).and_then(|sid| {
+                request("surface.rename", json!({"surface_id": sid, "title": clean})).map(|r| {
+                    let shown = r["title"].as_str().unwrap_or("");
+                    if shown.is_empty() {
+                        println!("surface:{sid} title reset to the automatic one");
+                    } else {
+                        println!("surface:{sid} title={shown}");
+                    }
+                })
+            }),
+        },
 
         Command::List => request("surface.list", json!({})).map(|r| {
             for s in r["surfaces"].as_array().cloned().unwrap_or_default() {

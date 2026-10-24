@@ -54,6 +54,7 @@ pub mod terminal_screen;
 pub mod agent_markers;
 pub mod packsig;
 pub mod overrides;
+pub mod title;
 pub mod todo_decl;
 pub mod todo_scan;
 /// ★U16(0.14.41) 말로 팀 만들기 — 팀 제안(feed kind `team-create-request`)의 스키마·검증·코덱·
