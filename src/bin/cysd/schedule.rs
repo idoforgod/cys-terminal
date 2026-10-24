@@ -5839,6 +5839,7 @@ mod h2_schedule_hold_tests {
         // 주기 잡은 대상이 아니다.
         requeue_oneshot_after_frozen_at(&d, &path, &periodic("p", 5));
         assert!(!root["jobs"].as_array().unwrap().iter().any(|j| j["id"] == "p"));
+        crate::state::test_stop_daemon(&d);
         let _ = std::fs::remove_dir_all(&dir);
         done(&s);
     }

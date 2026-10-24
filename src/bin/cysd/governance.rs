@@ -14889,6 +14889,7 @@ mod tests {
         daemon.resolve_feed_item(&rid, "allow");
         super::check_approval_stall(&daemon, &mut fired);
         assert!(fired.is_empty(), "해소 항목 키 회수");
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -14932,6 +14933,7 @@ mod tests {
             }
         }
         assert_eq!(stalled, 0, "exited 좌석의 승인 항목이 '승인 방치' 를 울렸다");
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -23264,6 +23266,7 @@ mod tests {
         let row = daemon.restored_expired.lock().unwrap()[0].clone();
         assert_eq!(row["surface_id"], serde_json::json!(sid), "출처 좌석을 잃었다");
         assert!(row.get("text").is_some(), "본문 없이 옮겼다(복원 불가)");
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&ledger);
     }
 
@@ -23319,6 +23322,7 @@ mod tests {
             has_entry(&active),
             "틱이 미영속 스냅샷을 다시 쓰지 않았다 — 승인된 메시지가 크래시 한 번에 사라진다"
         );
+        crate::state::test_stop_daemon(&daemon);
     }
 
 
@@ -23391,6 +23395,7 @@ mod tests {
                 .any(|x| x.origin == QUEUE_NOTICE_ORIGIN && x.text.contains(&id)),
             "통지 문면이 대상 항목 id 를 잃었다"
         );
+        crate::state::test_stop_daemon(&daemon);
     }
 
     // ─── ★(리뷰 R1) codex(gpt-6-astra) 위임 검체 — 초안 `impl/codex/R2-WP5-queue-r1fix-tests.md`

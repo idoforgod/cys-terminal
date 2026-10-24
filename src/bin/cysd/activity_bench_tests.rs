@@ -728,6 +728,7 @@ fn u43_lock_cost_arm() {
     }
     let f = std::fs::File::create(&out_path).expect("create result json");
     serde_json::to_writer(std::io::BufWriter::new(f), &result).expect("write result json");
+    crate::state::test_stop_daemon(&daemon);
     let _ = std::fs::remove_dir_all(&dir);
     eprintln!(
         "u43 arm={} secs={secs} window_s={:.3} hold={} tick={} reader={} attach={} delivery_ticks={} enq={} delivered={} children_left={} -> {}",

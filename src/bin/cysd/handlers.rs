@@ -13461,6 +13461,7 @@ mod tests {
                 );
             }
         }
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13510,6 +13511,7 @@ mod tests {
         lines2.push("DONE again".into());
         assert_eq!(crate::repaint::wait_for_match(&lines2, 0, &echo, &re), Some((6, "DONE again".to_string())));
         let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13602,6 +13604,7 @@ mod tests {
                 assert!(q < 3.0, "[{label}] 발행이 겹친 관측이 정적({q}s)으로 보고됐다 — 밸브 창이 열린다");
             }
         }
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -13754,6 +13757,7 @@ mod tests {
         };
         assert_eq!(resp2["error"]["code"], json!("acl_denied"));
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13911,6 +13915,7 @@ mod tests {
             "오너 GUI 입력이 여전히 부서 워커에 닿지 못한다 ({ok})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -13984,6 +13989,7 @@ mod tests {
             "마이그레이션 안 된 부서에서 오너가 여전히 잠겨 있다 — 업데이트만으로 안 고쳐진다 ({resp})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14124,6 +14130,7 @@ mod tests {
             assert_eq!(ev["payload"]["to_role"], json!("worker-1"), "[{label}] {ev}");
         }
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14171,6 +14178,7 @@ mod tests {
             ) else {
                 panic!("expected single reply");
             };
+            crate::state::test_stop_daemon(&daemon);
             std::env::remove_var(cys::pack::ENV_PACK_DIR);
             let _ = std::fs::remove_dir_all(&dir);
             resp
@@ -14244,6 +14252,7 @@ mod tests {
                 "acl denied: external → worker-1 (pack/acl.json)",
                 "`from:\"*\"` 가 비-오너에게 더는 글롭 매칭되지 않는다 — 일반 규칙 의미론 회귀 ({r})"
             );
+            crate::state::test_stop_daemon(&daemon);
             std::env::remove_var(cys::pack::ENV_PACK_DIR);
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -14296,6 +14305,7 @@ mod tests {
             json!("acl_denied"),
             "오너 기본 허용이 비-오너에게 새어 나갔다 ({r4})"
         );
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14467,6 +14477,7 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600, "감사 원장이 소유자 전용(0600)이 아니다");
         }
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14590,6 +14601,7 @@ mod tests {
             "해석된 pid 의 억제창이 동작하지 않는다 — 오너 타이핑이 버스를 덮는다"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -14795,6 +14807,7 @@ mod tests {
             "인계 ③ 불변식 파기: 오너 실키가 원장에 기록됐다 — 온보딩이 사망한다 (원장: {body})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15363,6 +15376,7 @@ mod tests {
             .arg("-9")
             .arg(pane.pid.to_string())
             .status();
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -15457,6 +15471,7 @@ mod tests {
         let errno = std::io::Error::last_os_error();
         drop(contender);
         unsafe { libc::kill(child as libc::pid_t, libc::SIGKILL) };
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
 
         assert_eq!(
@@ -15606,6 +15621,7 @@ mod tests {
         };
         assert_eq!(ok["ok"], json!(true), "정상 역할 등록까지 막혔다 ({ok})");
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15709,6 +15725,7 @@ mod tests {
             "주입은 됐는데 제출 Return 이 막혔다 — 워커는 여전히 각성하지 못한다 ({key})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15797,6 +15814,7 @@ mod tests {
             "거부 문면이 종전 등급 표기를 잃었다 ({denied})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -15948,6 +15966,7 @@ mod tests {
             "거부 문면이 판정 등급(creator)을 표기하지 않는다 ({denied})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16095,6 +16114,7 @@ mod tests {
             "판정을 뒤집지 않은 승격까지 감사했다 — 버스가 무가치 이벤트로 덮인다"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16179,6 +16199,7 @@ mod tests {
         };
         assert_eq!(ok["ok"], json!(true), "정상 역할 등록까지 막혔다 ({ok})");
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16229,6 +16250,7 @@ mod tests {
             "닫힌 좌석의 창작자 항목이 남았다 — 원장 위생이 깨졌다"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16412,6 +16434,7 @@ mod tests {
             "GUI 자동 주입이 일반 send 와 구별되지 않는다 — 감사에서 '사람이 친 문장'과 섞인다"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16529,6 +16552,7 @@ mod tests {
             "ACL 거부된 human:true 발신이 worker의 last_human_input을 갱신했다 (타이핑 가드 오염)"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16605,6 +16629,7 @@ mod tests {
             "일반 텍스트 human:true 는 종전대로 갱신해야 한다"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16706,6 +16731,7 @@ mod tests {
             "사람 타이핑 중 비-권위 Return 은 종전대로 거부돼야 한다 (응답: {resp})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16818,6 +16844,7 @@ mod tests {
             .collect();
         eprintln!("V7OBS handler.split three_calls={steps_a:?} one_call={one} boundary_in_body={steps_c:?}");
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -16837,6 +16864,7 @@ mod tests {
             pending = v7_send_human(&daemon, m.id, pid, "\u{1b}[O");
         }
         let guard_untouched = m.last_human_input.lock().unwrap().is_none();
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("V7OBS v7_d01_handler guard_untouched={guard_untouched} pending_input_bytes={pending}");
@@ -16860,6 +16888,7 @@ mod tests {
             .collect();
         let b = v7_pane(&daemon, "worker-2", pid + 1);
         let one = v7_send_human(&daemon, b.id, pid + 1, "\u{1b}[200~\u{1b}[24;80R\u{1b}[201~");
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!("V7OBS v7_split_paste_handler three_calls={steps:?} one_call={one}");
@@ -17069,6 +17098,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let daemon = Daemon::new(dir.join("cysd.sock"));
         let s = daemon.create_surface(None, Some("sleep 30".into()), None, None, 24, 80).expect("surface");
+        daemon.surfaces.lock().unwrap().insert(s.id, s.clone());
         let set = |agent: Option<&str>, seen: bool, notified: bool, seat: u8| {
             *s.agent_meta.lock().unwrap() = agent.map(|a| (a.to_string(), a.to_string()));
             s.agent_seen.store(seen, Ordering::Relaxed);
@@ -17093,6 +17123,7 @@ mod tests {
         s.exited.store(true, Ordering::Relaxed);
         assert!(!direct_fence_seat_ok(&s), "exited");
         let _ = s.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -19545,6 +19576,7 @@ mod tests {
             Some(v) => std::env::set_var("CYS_CR_MIN_GAP_MS", v),
             None => std::env::remove_var("CYS_CR_MIN_GAP_MS"),
         }
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -19679,6 +19711,7 @@ mod tests {
             "미해소 외부 caller(None)의 authoritative가 가드를 우회했다 (codex R2 신원 구멍): {respe}"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -19741,6 +19774,7 @@ mod tests {
             "허용된 reviewer→master 발신이 막혔다 (응답: {resp})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -20445,6 +20479,7 @@ mod tests {
             "agent 등록 pane의 clear_first는 통과해야 한다 (응답: {resp})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -20480,6 +20515,7 @@ mod tests {
             "clear_first + queued 결합은 거부돼야 한다 (응답: {resp})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -22560,6 +22596,7 @@ mod tests {
         *daemon.surfaces.lock().unwrap()[&own].repin_anchor.lock().unwrap() = Some(r3_1_path(R3_A));
         let _ = usage_register_src(&daemon, own, old.to_str().unwrap(), Some("clear"), Some(994_321));
         assert_eq!(r3_1_pin(&daemon, own).as_deref(), Some(R3_B), "방금 생긴 작은 transcript 를 거부했다");
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -22724,6 +22761,7 @@ mod tests {
                 }
             }
         }
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -23153,6 +23191,7 @@ mod tests {
             vec![("own@example.test".to_string(), "5h".to_string(), 97.0)],
             "좌석 자기 프로필 보고가 경보 입력이 되지 않았다(회귀)"
         );
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -23181,6 +23220,7 @@ mod tests {
             vec![("restored@example.test".to_string(), "5h".to_string(), 91.0)],
             "복원 좌석의 자기 프로필 보고가 경보 입력에서 빠졌다"
         );
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -23218,6 +23258,7 @@ mod tests {
             "남은 한계(좌석 자기 프로필 값은 pane 밖 호출자가 덮을 수 있다)가 바뀌었다 — 의도한 변경이면 이 검체와 \
              USER-MANUAL.md 사이드바 사용량 절의 '인증 경계가 아닙니다' 문단을 함께 고쳐라"
         );
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -25806,6 +25847,7 @@ mod tests {
             assert_eq!(pi["reason"], json!("점검"), "{method}: 사유가 비었다: {pi}");
             assert_eq!(pi["actor_surface"].as_u64(), Some(sid), "{method}");
         }
+        crate::state::test_stop_daemon(&daemon);
         drop(daemon);
         // ★(R2F-DM 2차 · B3-b) 끝정리 — 유닉스는 종전처럼 엄격(실패 = 패닉) · 윈도우는 공유 위반(os error 32)을 잠깐 다시 시도한 뒤 무시한다.
         crate::state::test_rm_rf(&dir);
@@ -26160,6 +26202,7 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -26200,6 +26243,7 @@ mod tests {
             let _ = child.kill();
             let _ = child.wait();
         }
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -27129,6 +27173,7 @@ mod tests {
             "쿨다운 거부가 아닌 다른 경로 (응답: {resp})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -27168,6 +27213,7 @@ mod tests {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -27194,6 +27240,7 @@ mod tests {
             "deadman 동결이 아닌 다른 경로 (응답: {resp})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -27225,6 +27272,7 @@ mod tests {
             "기존 caller=master 검증이 손상됨 (응답: {resp})"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -27708,6 +27756,7 @@ mod tests {
             .find(|r| r["origin"] == json!("feed"))
             .unwrap_or_else(|| panic!("feed 원장 레코드 부재: {led}"));
         assert_eq!(rec["sha256"], json!(crate::delivery::digest_text(&clean)), "원장 = 살균된 주입 본문");
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28033,6 +28082,7 @@ mod tests {
         let evil = bytes.windows(4).position(|w| w == b"EVIL").expect("EVIL 부재");
         assert!(evil < close_at, "EVIL 이 울타리 밖이다");
         let _ = ceo.child.lock().unwrap().kill();
+        crate::state::test_stop_daemon(&d);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -28075,6 +28125,7 @@ mod tests {
         assert_eq!(count_named(&evs, "approval.stalled"), 0, "배달됐는데 escalation도 발동");
         let p = created_payload(&evs, "d1").expect("created");
         assert_eq!(p["payload"]["auto_route"], json!(true));
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -28269,6 +28320,7 @@ mod tests {
             assert_eq!(it.status, "pending", "cycle-verify 항목은 사람 결재 대기로 남아야");
             assert!(!it.auto_route, "영속 스냅샷에 auto_route=true 각인됨");
         }
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -28834,6 +28886,7 @@ mod tests {
             "restore-root 자손의 send_key authoritative 가 막혔다 (P1b): {resp_k}"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -28888,6 +28941,7 @@ mod tests {
             "restore-root subtree 밖 발신자의 authoritative 가 복원 중 우회했다 (A3 누수): {resp}"
         );
 
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -29237,6 +29291,7 @@ mod tests {
             "★config 만 본 판정으로 좌석을 막았다 — 정상 api_key·oauth_token·bedrock 사용자가 \
              전멸하는 경로다 (응답: {resp})"
         );
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29274,6 +29329,7 @@ mod tests {
         );
         assert_eq!(again.pointer("/result/idempotent_reuse"), Some(&json!(true)));
         assert_eq!(again.pointer("/result/surface_id"), Some(&json!(sid)));
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29296,6 +29352,7 @@ mod tests {
             Some(&json!("claim_denied")),
             "★다섯 겹 게이트의 순서가 바뀌었다 — 인증 게이트가 특권 역할 게이트를 앞질렀다 (응답: {resp})"
         );
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -29331,6 +29388,7 @@ mod tests {
             allowed["ok"], json!(true),
             "★롤백 스위치를 눌렀는데 이 게이트만 엄격하게 남았다 (응답: {allowed})"
         );
+        crate::state::test_stop_daemon(&daemon);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -31027,6 +31085,8 @@ mod tests {
         assert_eq!(daemon2.roles.lock().unwrap().get("worker-3").copied(), Some(far));
         assert!(daemon2.get_surface(me2).unwrap().role.lock().unwrap().is_none());
 
+        crate::state::test_stop_daemon(&daemon);
+        crate::state::test_stop_daemon(&daemon2);
         let _ = std::fs::remove_file(&link);
         let _ = std::fs::remove_dir_all(&real);
         let _ = std::fs::remove_dir_all(&other);
@@ -31336,6 +31396,7 @@ mod tests {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -31407,6 +31468,7 @@ mod tests {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -31507,6 +31569,7 @@ mod tests {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -31559,6 +31622,7 @@ mod tests {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -31616,6 +31680,7 @@ mod tests {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+        crate::state::test_stop_daemon(&daemon);
         std::env::remove_var(cys::pack::ENV_PACK_DIR);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -31949,6 +32014,7 @@ mod tests {
             assert!(entry(seat_open)["cwd_blocked"].is_null(), "{method}: 읽히는 폴더가 막힘으로 기록됐다");
             assert!(entry(plain_blocked)["cwd_blocked"].is_null(), "{method}: 일반 pane 이 관측됐다");
         }
+        crate::state::test_stop_daemon(&daemon);
     }
 
 
@@ -32079,6 +32145,7 @@ mod tests {
             let ua = b3_observed(&daemon, agy);
             assert_eq!(ua.rate_account, None);
             assert!(ua.rate_observed_at >= t1, "agy 보고의 rate_observed_at 이 비었다");
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
         }
 
@@ -32109,6 +32176,7 @@ mod tests {
             let mut res = b3_resolved(&daemon, seq0);
             res.sort();
             assert_eq!(res, vec![(acct_key.to_string(), "stale".to_string()), (seat_key.to_string(), "stale".to_string())]);
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
             // ── 음성 대조: 로그인 그대로 ──
             let (daemon, _seat, home, _folder, t) = b3_reported_seat("h2", 995_102);
@@ -32125,6 +32193,7 @@ mod tests {
                 "사용 중인 좌석의 리마인드가 사라졌다(관측이 아무리 오래돼도 사용 중이면 유지)"
             );
             assert!(b3_resolved(&daemon, seq0).is_empty());
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
         }
 
@@ -32148,6 +32217,7 @@ mod tests {
             crate::governance::check_alerts_with(&daemon, &mut fired, &cfg, t + 1801.0);
             assert_eq!(b3_alert_count(&daemon, seq0, SEAT_ALERT, seat_key), 1, "이월 갱신(updated_at)이 +1801초에 옛 로그인의 좌석 경보를 되살렸다");
             assert!(b3_resolved(&daemon, seq0).iter().any(|(k, r)| k == seat_key && r == "stale"));
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
             // ── 판정 불가 ──
             let (daemon, _seat, home, folder, t) = b3_reported_seat("h4", 995_112);
@@ -32162,6 +32232,7 @@ mod tests {
             }
             assert_eq!(b3_alert_count(&daemon, seq0, SEAT_ALERT, seat_key), 2, "신원 판독 불가인데 +1801초에 좌석 경보가 사라졌다(REMIND 도 나가야 한다)");
             assert!(b3_resolved(&daemon, seq0).is_empty());
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
         }
 
@@ -32181,6 +32252,7 @@ mod tests {
                 assert!(a.get(k).is_some(), "기존 키 {k} 소실: {a}");
             }
             assert_eq!((a["rate"][0]["label"].clone(), a["rate"][0]["used_pct"].clone()), (json!("5h"), json!(99.0)));
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
         }
 
@@ -32214,6 +32286,7 @@ mod tests {
             for (what, u) in b3_usage_objs(&daemon, quiet) {
                 assert!(u.is_null(), "{what}: 관측 없는 좌석의 usage 가 null 이 아니다: {u}");
             }
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
         }
 
@@ -32234,6 +32307,7 @@ mod tests {
             for (what, u) in objs.iter().take(2) {
                 assert_eq!((u["rate_in_use"].clone(), u["rate"][0]["alert_eligible"].clone()), (json!(false), json!(false)), "{what}: 종료된 좌석");
             }
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
         }
     }
@@ -32289,6 +32363,7 @@ mod tests {
             for (what, u) in b3_usage_objs(&daemon, seat) {
                 assert_eq!((u["rate_in_use"].clone(), u["rate"][0]["alert_eligible"].clone()), (Value::Null, json!(true)), "{what}: 판독 불가는 null · 적격 유지");
             }
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
         }
 
@@ -32320,6 +32395,7 @@ mod tests {
             for (what, u) in b3_usage_objs(&daemon, seat) {
                 assert_eq!((u["rate_in_use"].clone(), u["rate"][0]["alert_eligible"].clone()), (json!(true), json!(true)), "{what}: 새 로그인으로 보고한 좌석은 사용 중");
             }
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
         }
 
@@ -32394,6 +32470,7 @@ mod tests {
             assert_eq!(b3_observed(&daemon, seat).rate_account.as_deref(), Some("u-b3-b"), "새 보고가 새 로그인에 귀속되지 않았다");
             assert_eq!(crate::accounts::seat_identity_view_cached(&daemon).current_for(seat), Some("u-b3-b"), "새 로그인으로 보고했는데 신원 캐시가 옛 신원이다(창을 닫아 둔 채로는 전환이 안 보인다)");
             assert_eq!(daemon.seat_ident_cache.lock().unwrap().reads, 0, "보고가 추가 판독을 했다(캐시를 채우는 길이 IO 를 늘렸다)");
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
         }
 
@@ -32445,6 +32522,7 @@ mod tests {
                 assert_eq!(pick(method, codex)["account_id"], json!("default"), "{method}: codex");
             }
             assert_eq!(pick("surface.list", seat), pick("org.status", seat), "두 RPC 의 좌석 계정이 다르다");
+            crate::state::test_stop_daemon(&daemon);
             let _ = std::fs::remove_dir_all(&home);
         }
     }
