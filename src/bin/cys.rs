@@ -18950,6 +18950,38 @@ fn sanitize_launch_cwd(cwd: String) -> String {
     cwd
 }
 
+// A failed log must not hide the captured screen or prevent the existing rollback close.
+fn failed_launch_diagnostic(path: &std::path::Path, sid: u64, reason: &str, screen: Result<String, String>) -> String {
+    let text = match screen {
+        Ok(text) => text,
+        Err(e) => return format!("[launch-agent] surface {sid} screen capture failed: {e}; launch error: {reason}"),
+    };
+    let body = format!("surface={sid}\nreason={reason}\n--- screen ---\n{text}\n");
+    let save = || -> std::io::Result<()> {
+        if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        let mut file = options.open(path)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()
+    };
+    match save() {
+        Ok(()) => format!("[launch-agent] failed surface {sid} screen log: {}", path.display()),
+        Err(e) => format!("[launch-agent] screen log write failed ({}): {e}\n{body}", path.display()),
+    }
+}
+
+fn log_failed_launch_screen(sid: u64, reason: &str) {
+    let screen = request("surface.read_text", json!({"surface_id": sid})).and_then(|v|
+        v["text"].as_str().map(str::to_owned).ok_or_else(|| "missing screen text".to_string()));
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let path = cys::home_dir().join(".cys/logs/launch-failures")
+        .join(format!("surface-{sid}-{}-{stamp}.log", std::process::id()));
+    eprintln!("{}", failed_launch_diagnostic(&path, sid, reason, screen));
+}
+
 fn run_launch_agent(role: &str, agent: &str, cwd: Option<String>) -> i32 {
     run_launch_agent_opts(role, agent, cwd, false, None, false, None)
 }
@@ -19158,6 +19190,7 @@ fn run_launch_agent_opts(
         Ok(BootVerdict::LaunchFailed { evidence: e }) | Err(e) => {
             eprintln!("error: {e}");
             if let Some(sid) = created {
+                log_failed_launch_screen(sid, &e);
                 // close 결과를 정직히 보고한다 — 실패를 'closed'로 거짓 보고하면 role이
                 // 좀비 surface에 점유된 채 남아 재기동이 claim_denied로 막힌다(이번 회귀의 근원).
                 // ★W2/P0-6: cause="reap" — launch 실패 롤백은 역할을 묘비화하지 않는다(부활 대상 유지). 과거
@@ -32156,9 +32189,9 @@ mod tests {
         assert!(!win("return <div>"));
         // 마크다운 autolink · HTML 조각
         assert!(!win("자세히는 <https://example.com/docs>"));
-        // 리다이렉션만 남은 조각 / 맨 꺾쇠 — 형태 요건(경로·PS 접두) 미충족
+        // A lone > remains ambiguous; >> is an explicit PowerShell continuation.
         assert!(!win(">"));
-        assert!(!win(">>"));
+        assert!(win(">>"), "PowerShell continuation must block injection");
         assert!(!win("cargo build 2>&1 >"));
         // 마크다운 인용문 — `>` 는 **선두**라 끝문자 규칙에 애초에 걸리지 않는다
         assert!(!win("> 인용문 한 줄"));
@@ -32199,8 +32232,6 @@ mod tests {
         // **의도적으로 미탐을 남긴다**. U-11 착지 후 재평가 대상.
         // ⓐ oh-my-posh 등 커스텀 테마: `PS` 접두도 드라이브 경로도 없이 `>` 로 끝난다
         assert!(!win("~\\dev\\cys [main] >"));
-        // ⓑ PowerShell 연속행 프롬프트가 단독 줄로 남은 경우
-        assert!(!win(">>"));
         // ⓒ cmd 연속행 프롬프트 `More? ` — `>` 로 끝나지도 않는다
         assert!(!win("More? "));
         // 이 미탐들은 '보류 실패' 가 아니라 '종전과 동일'(개정 전에도 전부 거짓)이라
@@ -44887,6 +44918,38 @@ mod b360_tests {
         assert!(folded.contains("journal:Is a directory"), "the reason survives the fold: {folded}");
         assert_eq!(recover_refusal_from_input_guard(folded.clone()), folded, "idempotent");
         assert_eq!(recover_refusal_from_input_guard("process_exited: gone".into()), "process_exited: gone");
+    }
+
+    #[test]
+    fn wp15_failed_screen_log_preserves_content_and_falls_back_on_failure() {
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("wp15-log-{}-{stamp}", std::process::id()));
+        let path = dir.join("screen.log");
+        let screen = "Statusline error: exit status 127\nPS C:\\rust>";
+        let report = failed_launch_diagnostic(&path, 123, "launch failed", Ok(screen.into()));
+        assert!(report.contains(path.to_str().unwrap()) && report.contains("screen log:"));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(screen) && saved.contains("surface=123"));
+        #[cfg(unix)]
+        { use std::os::unix::fs::PermissionsExt;
+          assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600); }
+        let fallback = failed_launch_diagnostic(&path, 123, "second failure", Ok(screen.into()));
+        assert!(fallback.contains("write failed") && fallback.contains(screen) && fallback.contains("second failure"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "exclusive create must not overwrite");
+        let missing = dir.join("unreadable.log");
+        let report = failed_launch_diagnostic(&missing, 123, "failed", Err("RPC offline".into()));
+        assert!(report.contains("capture failed") && report.contains("RPC offline"));
+        assert!(!missing.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn wp15_failed_screen_capture_precedes_close_source_pin() {
+        let source = include_str!("cys.rs");
+        let start = source.find("Ok(BootVerdict::LaunchFailed { evidence: e }) | Err(e) => {").unwrap();
+        let arm = &source[start..source[start..].find("// ----------").unwrap() + start];
+        let capture = arm.find("log_failed_launch_screen(sid, &e)").expect("capture before close");
+        assert!(capture < arm.find("request(\"surface.close\"").unwrap());
     }
 
     /// launch-agent: the journal-refusal arm sits BEFORE the closing arm (match order decides) and does not close.

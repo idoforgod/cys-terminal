@@ -19,6 +19,8 @@ pub fn screen_tail_lines(screen: &str, n: usize) -> String {
 }
 
 pub fn windows_shell_prompt_shape(t: &str) -> bool {
+    let t = t.trim();
+    if t == ">>" { return true; } // PowerShell continuation, not an agent prompt.
     let Some(body) = t.strip_suffix('>') else {
         return false;
     };
@@ -86,6 +88,9 @@ pub fn screen_is_bare_shell_on(text: &str, windows: bool) -> bool {
     if !screen_tail_is_shell_prompt_on(text, windows) {
         return false;
     }
+    // An explicit current Windows shell prompt outranks stale TUI render residue.
+    if windows && text.lines().rev().find(|l| !l.trim().is_empty())
+        .is_some_and(windows_shell_prompt_shape) { return true; }
     // ★사망 문면(다중 방어 ②) — 꼬리에 `command not found` 류가 보이면 렌더 잔상과 무관하게
     //   맨 셸이다. 판정 방향은 '주입 억제' 라 넓혀도 오살 위험이 없다.
     let tail = screen_tail_lines(text, BARE_SHELL_DEATH_TAIL_LINES);
