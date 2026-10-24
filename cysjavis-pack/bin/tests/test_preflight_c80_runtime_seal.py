@@ -204,7 +204,7 @@ class C80RuntimeSealTests(unittest.TestCase):
 
     # ── ④'' Windows·비번들 형상: 버전 판독처는 `cys-installed-version.txt` ──
     #
-    # NSIS 훅이 전 게이트 통과 후에만 쓰는 마커(src-tauri/nsis-hooks.nsh:784 `cys_post_ok`).
+    # NSIS 훅이 전 게이트 통과 후에만 쓰는 마커(src-tauri/nsis-hooks.nsh `cys_post_ok`).
     # `_find_app_bundle` 은 macOS 전용 폴백(/Applications/cys.app)을 갖고 있어 이 개발 기계에서
     # 라이브 번들을 집는다 — Windows 에는 그 경로가 아예 없으므로 None 으로 고정해 형상을 맞춘다
     # (라이브 무접촉 유지: 이 갈래에서 /Applications 를 읽지 않는다).

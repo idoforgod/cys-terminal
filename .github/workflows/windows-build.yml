@@ -1427,3 +1427,59 @@ jobs:
           if ($code -ne 0) { throw "T6: 형제 import 가드 회귀 실패 (exit=$code) — 배송 런타임에서 팩 스크립트의 형제 import 가 깨진다" }
           Write-Host "OK: T6 형제 import 가드 회귀 통과 (동봉 embeddable python312._pth 실런타임 · 음성 대조 확인)"
           exit 0
+
+  # ★(0.14.53 WP12 · P1 · DESIGN-R2 G4.1 / T) installer pre-swap run check, on its OWN runner (needs: build).
+  #   The probe-only worker calls, then an AllowAll + deny-by-hash App Control policy on the new cysd.exe
+  #   (stand-in for Smart App Control - windows-latest has none) proves the refusal paths: T2-F first install
+  #   refused, T2 silent /UPDATE refused over the previous public release with its daemon alive; without the
+  #   policy the same runs must install. A separate runner keeps the build job's install tree, its pinned marker
+  #   window and every later step free of any policy. All logic is in the script (the parity test counts strings
+  #   over this whole file). GUI/passive variants (T2-U, T2-D, T2-G, T2-P) need UI Automation - not run here.
+  win-update-probe:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download the new NSIS installer (build job artifact)
+        uses: actions/download-artifact@v4
+        with:
+          name: cys-windows-x64-nsis
+          path: ${{ runner.temp }}/wup/new
+
+      - name: Download the previous public release installer (checked against its SHA256SUMS.txt)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          PUB=idoforgod/cys-terminal
+          D="$RUNNER_TEMP/wup/prev"
+          mkdir -p "$D"
+          TAG=$(gh release list -R "$PUB" --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName')
+          [ -n "$TAG" ] || { echo "no published release in $PUB" >&2; exit 1; }
+          V="${TAG#v}"
+          gh release download "$TAG" -R "$PUB" --dir "$D" --pattern "cys_${V}_x64-setup.exe" --pattern SHA256SUMS.txt
+          ( cd "$D" && grep -E "^[0-9a-f]{64}  cys_${V//./\\.}_x64-setup\.exe\$" SHA256SUMS.txt > one.sum && [ "$(wc -l < one.sum)" -eq 1 ] && sha256sum -c one.sum )
+          echo "previous public release: $TAG"
+
+      - name: Pre-swap run check cases (worker calls, T2-F, T2, controls)
+        shell: powershell
+        run: |
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts\tests\win-update-probe\run-probe-cases.ps1'
+          $tokens = $null; $errs = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile($script, [ref]$tokens, [ref]$errs)
+          if ($errs.Count -gt 0) { $errs | ForEach-Object { Write-Host ('PARSE ERROR {0}:{1} {2}' -f $_.Extent.StartLineNumber, $_.Extent.StartColumnNumber, $_.Message) }; exit 1 }
+          & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script -NewDir "$env:RUNNER_TEMP\wup\new" -PrevDir "$env:RUNNER_TEMP\wup\prev" -Work "$env:RUNNER_TEMP\wup\work"
+          exit $LASTEXITCODE
+
+      - name: Upload pre-swap run check evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-update-probe-evidence
+          path: ${{ runner.temp }}/wup/work/evidence
+          if-no-files-found: warn

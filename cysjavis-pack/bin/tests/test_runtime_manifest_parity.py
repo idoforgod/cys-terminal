@@ -237,6 +237,40 @@ class ManifestSchemaParityTests(unittest.TestCase):
         self.assertIn("resources/%s" % rs.MANIFEST_BASENAME, res,
                       "Windows 번들이 매니페스트를 싣지 않는다 — 설치본에 파일이 없다")
 
+    # ── ⑧ (0.14.53 WP12 · DESIGN-R2 G4.1 / T7) the installer probe job is isolated ──
+    def test_win_update_probe_job_is_isolated_from_the_install_window(self):
+        """The pre-swap run check job installs, refuses and deploys an App Control policy. It must run on its
+        own runner after the build (needs: build), read-only, and carry none of the strings the two tests above
+        count over this whole file - otherwise it shifts their counts or shares the build job's install tree."""
+        src = read(os.path.join(REPO, ".github", "workflows", "windows-build.yml"))
+        start = src.find("\n  win-update-probe:\n")
+        self.assertGreater(start, 0, "the win-update-probe job is missing")
+        job = src[start:]
+        # the job is the last top-level job: no other 2-space-indented key follows it
+        tail_keys = [l for l in job.split("\n")[2:] if l.startswith("  ") and not l.startswith("   ") and l.strip()]
+        self.assertEqual([], tail_keys, "another job follows win-update-probe - the slice below would mix them")
+        self.assertGreater(start, src.find("- name: PTY 스모크"), "the probe job must come after the build job's steps")
+        for need in ("\n    needs: build\n", "\n    runs-on: windows-latest\n",
+                     "\n    permissions:\n      contents: read\n",
+                     "scripts\\tests\\win-update-probe\\run-probe-cases.ps1"):
+            self.assertIn(need, job, "win-update-probe lacks %r" % need)
+        for banned in ("CYS_INSTALL_DIR", "CYS_INSTALL_VER", "cys-installed-version.txt", "$markerVer",
+                       'Get-ChildItem "$env:LOCALAPPDATA" -Recurse', "contents: write"):
+            self.assertNotIn(banned, job, "win-update-probe carries a pinned or widening string: %r" % banned)
+        script = os.path.join(REPO, "scripts", "tests", "win-update-probe", "run-probe-cases.ps1")
+        self.assertTrue(os.path.isfile(script), "the probe case script is missing")
+        body = read(script)
+        # the policy is always removed, and a policy that cannot be shown effective is a red, never a pass
+        fin = body.find("} finally {")
+        self.assertGreater(fin, 0)
+        call = "Invoke-Exe $CiTool ('--remove-policy \"' + $policy + '\"')"   # the call, not a log line naming it
+        self.assertGreater(body.find(call, fin), fin, "the App Control policy is not removed in finally")
+        self.assertIn("if ($fails.Count -gt 0 -or $script:Unmeasured.Count -gt 0) { exit 1 }", body)
+        for case in ("'W1-worker-pass'", "'W2-worker-outside-probe-folder'", "'W3-worker-without-silent'",
+                     "'POL-deny-hash-effective'", "'T2F-exit-6'", "'T2-exit-6'", "'T2-installer-owned-state-unchanged'",
+                     "'T2-daemon-alive'", "'CTL-T2-update-installs'", "'CTL-T2F-first-install-installs'"):
+            self.assertIn(case, body, "probe case %s is missing" % case)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
