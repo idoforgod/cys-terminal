@@ -1133,7 +1133,10 @@ fn wp17_known_empty_command_records_proof_and_draft_then_empty_progresses() {
     // Same generation deliberately exercises the fresh slash observation, even when the
     // ordinary handoff recheck considers its saved generation unchanged.
     s.parser.lock().unwrap().process("\x1b[2J\x1b[H❯ draft".as_bytes());
+    let audit_before = crate::governance::h_ledger_count(&fx.daemon, "queue");
     assert!(deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck)).is_none());
+    assert_eq!(crate::governance::h_ledger_count(&fx.daemon, "queue"), audit_before,
+        "a later writer refusal cannot stand in for pre-publication admission");
     assert_eq!(queue_len(&s), 1);
     assert!(s.inject_track.last_body().is_none());
     s.parser.lock().unwrap().process("\x1b[2J\x1b[H❯ ".as_bytes());
@@ -1158,4 +1161,103 @@ fn wp17_markerless_pending_draft_keeps_ordinary_block_then_recovers() {
     let d = wp17_normal_handoff(&fx, &s);
     assert!(d.written_submitted());
     assert_eq!(queue_len(&s), 0);
+}
+
+/// R1 S1: the cursor row and counter can both be empty while the recognized editor box
+/// still contains a lower-row draft. Refuse before audit/body publication; clearing that
+/// same region must let the original command progress without a new queue hold type.
+#[test]
+fn wp17_r2_known_multiline_draft_zero_counter_blocks_then_empty_delivers() {
+    let fx = fx("wp17-r2-region");
+    let rule = "────────────────────────────────────────";
+    for forced in [false, true] {
+        let s = seat(&fx);
+        let id = enqueue(&fx, &s, "/model opus");
+        s.parser.lock().unwrap().process(format!(
+            "\x1b[2J\x1b[H{rule}\r\n❯ \r\n  real lower-row draft\r\n{rule}\r\n  ? for shortcuts\x1b[2;3H"
+        ).as_bytes());
+        assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0, "zero-counter premise");
+        let recheck = crate::governance::ScreenRecheck {
+            marker: Some(vec!["❯".into()]), placeholder: None,
+            gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
+        };
+        let before = crate::governance::h_ledger_count(&fx.daemon, "queue");
+        assert!(deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck)).is_none(),
+            "recognized occupied multiline region must refuse before publication, forced={forced}");
+        assert_eq!(crate::governance::h_ledger_count(&fx.daemon, "queue"), before);
+        assert!(s.inject_track.last_body().is_none());
+        assert_eq!(s.pending_queue.lock().unwrap().front().unwrap().id, id);
+        assert_eq!(s.queue_blocked.lock().unwrap().as_ref().unwrap().0, crate::governance::BLOCKED_INPUT_PENDING);
+        assert!(hold_kind(&s).is_none(), "no new writer hold/retry state");
+        s.parser.lock().unwrap().process(format!(
+            "\x1b[2J\x1b[H{rule}\r\n❯ \r\n{rule}\r\n  ? for shortcuts\x1b[2;3H"
+        ).as_bytes());
+        let d = deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck))
+            .expect("cleared recognized region must progress");
+        assert!(d.written_submitted());
+        assert_eq!(d.merged_ids, vec![id]);
+        assert_eq!(d.body, "/model opus");
+        assert_eq!(queue_len(&s), 0);
+    }
+}
+
+#[test]
+fn wp17_r2_unknown_lower_layout_and_framed_hint_keep_fallback() {
+    let fx = fx("wp17-r2-unknown");
+    let rule = "────────────────────────────────────────";
+    for (paint, reason) in [
+        ("\x1b[2J\x1b[H❯ \r\n  unfamiliar widget without editor bounds\x1b[1;3H".to_string(),
+            "fallback_unrecognized_layout"),
+        (format!("\x1b[2J\x1b[H{rule}\r\n❯ unfamiliar inline hint\r\n{rule}\r\n  ? for shortcuts\x1b[2;3H"),
+            "fallback_unrecognized_hint"),
+    ] {
+        let s = seat(&fx);
+        enqueue(&fx, &s, "/model opus");
+        s.parser.lock().unwrap().process(paint.as_bytes());
+        let recheck = crate::governance::ScreenRecheck {
+            marker: Some(vec!["❯".into()]), placeholder: None,
+            gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
+        };
+        let d = deliver_head_locked(&fx.daemon, &s, false, false, None, Some(0), None, Some(&recheck))
+            .expect("unknown layout/hint retains ordinary progress");
+        assert!(d.written_submitted());
+        assert_eq!(queue_len(&s), 0);
+        assert!(wp17_has_admission_record(&fx, reason));
+    }
+}
+
+/// Gemini R1 shape (b): the cursor is on a pasted marker row inside the editor, below
+/// an upper-row draft. The actual cursor anchor must not hide text above it in the box.
+#[test]
+fn wp17_r2_upper_draft_marker_row_zero_counter_blocks_before_ledger() {
+    let fx = fx("wp17-r2-upper");
+    let rule = "────────────────────────────────────────";
+    for forced in [false, true] {
+        let s = seat(&fx);
+        let id = enqueue(&fx, &s, "/model opus");
+        s.parser.lock().unwrap().process(format!(
+            "\x1b[2J\x1b[H{rule}\r\n❯ upper draft\r\n\r\n❯ \r\n{rule}\r\n  ? for shortcuts\x1b[4;3H"
+        ).as_bytes());
+        assert_eq!(s.pending_input_bytes.load(Ordering::Relaxed), 0);
+        let recheck = crate::governance::ScreenRecheck {
+            marker: Some(vec!["❯".into()]), placeholder: None,
+            gen_at_verdict: s.output_gen.load(Ordering::Acquire), approval_pending: false,
+        };
+        let audit_before = crate::governance::h_ledger_count(&fx.daemon, "queue");
+        assert!(deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck)).is_none(),
+            "upper-row draft inside recognized box must refuse before publication, forced={forced}");
+        assert_eq!(crate::governance::h_ledger_count(&fx.daemon, "queue"), audit_before);
+        assert!(s.inject_track.last_body().is_none());
+        assert_eq!(s.pending_queue.lock().unwrap().front().unwrap().id, id);
+        assert_eq!(s.queue_blocked.lock().unwrap().as_ref().unwrap().0, crate::governance::BLOCKED_INPUT_PENDING);
+        assert!(hold_kind(&s).is_none());
+        s.parser.lock().unwrap().process(format!(
+            "\x1b[2J\x1b[H{rule}\r\n❯ \r\n{rule}\r\n  ? for shortcuts\x1b[2;3H"
+        ).as_bytes());
+        let d = deliver_head_locked(&fx.daemon, &s, forced, false, None, Some(0), None, Some(&recheck))
+            .expect("empty box must release ordinary delivery eligibility");
+        assert!(d.written_submitted());
+        assert_eq!(d.merged_ids, vec![id]);
+        assert_eq!(queue_len(&s), 0);
+    }
 }

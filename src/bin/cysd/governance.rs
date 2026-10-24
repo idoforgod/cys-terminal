@@ -7826,7 +7826,8 @@ pub(crate) struct PromptObs {
     /// 읽어, alt-screen 시절 화면을 비-alt 분기로 고르는 합성이 가능했다 · codex R5).
     pub(crate) alt_screen: bool,
     /// ★(0.14.42 · 수정 3회차 FV2-1) 커서가 든 **입력 블록**([`ComposerBlock`]) — 요청한 관측([`observe_prompt_block`])만
-    /// 채운다(큐 틱 등 나머지 관측은 `None` · 비용 0). 커서가 입력 블록 안이 아니면 `None`.
+    /// Filled only on request (submit/resubmit and slash admission); other observations carry None.
+    /// A cursor outside a recognized input block also yields None.
     pub(crate) block: Option<ComposerBlock>,
 }
 
@@ -7868,7 +7869,8 @@ fn observe_prompt(s: &Arc<crate::state::Surface>, markers: &[String]) -> PromptO
 }
 
 /// ★(0.14.42 · 수정 3회차 FV2-1) [`observe_prompt`] + 커서가 든 입력 블록([`PromptObs::block`]) — 같은 파서 락 한 번(같은
-/// 프레임). 제출 CR 보류 탐침·재제출만 부른다(행 전량을 한 번 더 읽는 비용을 큐 틱에 얹지 않는다).
+/// 프레임). Used by submit withholding/resubmission and the slash-only complete-region admission.
+/// Ordinary queue messages retain the cheaper observation without block construction.
 fn observe_prompt_block(s: &Arc<crate::state::Surface>, markers: &[String]) -> PromptObs {
     observe_prompt_ext(s, markers, true)
 }
@@ -10610,6 +10612,35 @@ pub(crate) struct ScreenRecheck {
     pub(crate) approval_pending: bool,
 }
 
+/// R2: positive occupancy evidence, not the negation of an empty-region check. Anchor to the
+/// cursor's actual block; a marker-shaped line in a pasted draft cannot relocate this boundary.
+/// Recognize the framed composer only when a complete box rule opens it above the cursor block
+/// and another closes it below. Nonblank rows between either boundary and the cursor are editor content;
+/// arbitrary status/hint rows AFTER it are not. Unframed/unknown shapes retain the approved fallback.
+fn slash_known_occupied_region(obs: &PromptObs) -> bool {
+    if !obs.frame_consistent() { return false; }
+    let Some(block) = obs.block.as_ref() else { return false };
+    let Some(prefix) = block.as_empty_prompt.strip_suffix(block.below.as_str()) else { return false };
+    let mut above = prefix.trim_end_matches('\n').lines().rev();
+    above.next(); // the cursor-anchored marker row
+    let border = |line: &str| {
+        line.chars().all(|c| c.is_whitespace() || ('\u{2500}'..='\u{259f}').contains(&c))
+            && line.split_whitespace().any(|run| run.chars().count() >= cys::readiness::PROMPT_TRAILER_RULE_MIN_RUN)
+    };
+    let mut occupied = false;
+    let mut opening = false;
+    for line in above {
+        if border(line) { opening = true; break; }
+        occupied |= !line.trim().is_empty();
+    }
+    if !opening { return false; }
+    for line in block.below.lines() {
+        if border(line) { return occupied; }
+        occupied |= !line.trim().is_empty();
+    }
+    false // no observed closing boundary: unknown, not positively occupied
+}
+
 /// WP17 command admission. Unknown layouts/hints and markerless seats keep the ordinary gate
 /// (head ruling 1); they are NOT evidence of an empty composer. Return a diagnostic label for
 /// the pre-write ledger, never a new notice or retry. Known drafts still fail the ordinary gate.
@@ -10626,9 +10657,10 @@ fn slash_command_admission(
             None => Ok("fallback_markerless"),
         };
     };
-    let obs = observe_prompt(s, markers);
+    let obs = observe_prompt_block(s, markers);
     let input = prompt_gate_input(daemon, s, &obs.marker, placeholder, &obs);
     if let PromptGate::Blocked(why) = prompt_gate_verdict(&input) { return Err(why); }
+    if slash_known_occupied_region(&obs) { return Err(BLOCKED_INPUT_PENDING); }
     // A fresh full-region proof is stronger than a zero pending counter. Failure to recognise
     // the region is not proof of a draft: use the approved ordinary-message fallback instead.
     if obs.frame_consistent()
