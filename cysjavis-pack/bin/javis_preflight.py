@@ -5298,7 +5298,8 @@ class Preflight:
     def _run_skillscan_all(scan_tool, timeout_s):
         """`javis_skillscan.py all --json` 을 **자기 프로세스 그룹**에서 돌리고 자손을 남기지 않는다.
 
-        반환: (returncode, stdout, stderr, timed_out, survivors_cleaned)
+        반환: (returncode, stdout, stderr, timed_out, cleanup)
+        cleanup = {state: verified_empty | survivors | unknown, reason: 관측/오류}.
 
         ★WP18 R2 MAJOR 2(codex r1 · 이 좌석이 실측 재현): `subprocess.run(timeout=20)` 은 **직속
           자식만** 죽인다. 0.14.53 부터 스캐너가 ProcessPoolExecutor 를 쓰므로 그 워커들은 부모가
@@ -5310,8 +5311,8 @@ class Preflight:
           집 안의 선례를 그대로 따른다 — `javis_completion_guard._popen_group`(POSIX setsid+killpg /
           Windows CREATE_NEW_PROCESS_GROUP + `taskkill /T /F`). ★Windows 경로는 **UNMEASURED**다
           (이 호스트에 윈도우가 없다) — 수단만 선례와 동일하게 배선한다.
-          죽이는 범위: `start_new_session` 이라 pgid == 자식 pid 이므로 **이 스캔의 자손만** 죽는다
-          (남의 살아 있는 프로세스에 닿지 않는다).
+          R3: 파괴 신호는 자식을 reap 하기 전에만 보낸다. communicate 뒤의 숫자 pgid는
+          재사용될 수 있으므로 관측 권한만 있고 종료 권한은 없다. 관측 실패는 빈 그룹이 아니다.
         """
         kw = {}
         if os.name == "posix":
@@ -5323,41 +5324,55 @@ class Preflight:
                                 stdin=subprocess.DEVNULL, text=True, **kw)
         try:
             out, err = proc.communicate(timeout=timeout_s)
-            return proc.returncode, out, err, False, False
+            return proc.returncode, out, err, False, {"state": "unknown", "reason": "not requested"}
         except subprocess.TimeoutExpired:
             pass
-        # ── 트리 정리(고아 0) ──
+        # The timed-out child is still unreaped: retain this identity through ALL kills.
+        outcomes = []
         if os.name == "posix":
-            with contextlib.suppress(OSError):
+            try:
                 os.killpg(proc.pid, signal.SIGKILL)
+                outcomes.append("killpg SIGKILL sent")
+            except OSError as exc:
+                outcomes.append("killpg %s errno=%s" % (type(exc).__name__, exc.errno))
         else:
             try:
-                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
-            except Exception:
-                pass
+                killed = subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                                        capture_output=True, text=True, timeout=5)
+                outcomes.append("taskkill rc=%s stderr=%s" %
+                                (killed.returncode, (killed.stderr or "")[-200:]))
+            except Exception as exc:
+                outcomes.append("taskkill %s: %s" % (type(exc).__name__, str(exc)[:200]))
             try:
-                proc.kill()
-            except Exception:
-                pass
+                proc.kill()  # Windows Popen owns a process HANDLE; still before communicate/reap.
+                outcomes.append("parent kill requested")
+            except Exception as exc:
+                outcomes.append("parent kill %s: %s" % (type(exc).__name__, str(exc)[:200]))
+        # No destructive operation below this point: communicate may release the numeric identity.
         try:
             out, err = proc.communicate(timeout=5)
-        except Exception:
+        except Exception as exc:
             out, err = "", ""
-        # 정리 뒤 **다시 재서** 잔존을 확인한다(성공 종료는 상태가 바뀐 증거가 아니다).
-        survivors = False
+            outcomes.append("communicate %s: %s" % (type(exc).__name__, str(exc)[:200]))
+        state = "unknown"
         if os.name == "posix":
             try:
                 os.killpg(proc.pid, 0)
-                survivors = True
-            except OSError:
-                survivors = False
-            if survivors:
-                for sig in (signal.SIGTERM, signal.SIGKILL):
-                    with contextlib.suppress(OSError):
-                        os.killpg(proc.pid, sig)
-                    time.sleep(0.2)
-        return proc.returncode, out or "", err or "", True, survivors
+                if proc.returncode is None:
+                    state = "survivors"
+                    outcomes.append("owned group still present")
+                else:
+                    outcomes.append("numeric group present after identity release; ownership unknown")
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    state = "verified_empty"
+                    outcomes.append("killpg probe ESRCH")
+                else:
+                    outcomes.append("killpg probe %s errno=%s" % (type(exc).__name__, exc.errno))
+        else:
+            outcomes.append("Windows owned-tree observation UNMEASURED")
+        cleanup = {"state": state, "reason": "; ".join(outcomes)}
+        return proc.returncode, out or "", err or "", True, cleanup
 
     def c60_gate_wiring(self):
         cid = "C60.gate-wiring"
@@ -5412,7 +5427,7 @@ class Preflight:
             #     같은 병렬 스캔은 median 5,696 ms · max 6,077 ms 였다 ⇒ 20s 는 그 최악
             #     관측의 3.3배다. 이 기계의 한가한 값(1.6~1.7s)만 보고 상한을 정하지 마라.
             #   풀 기동 실패로 직렬 폴백이면 0.069s/스킬 ⇒ 20s 는 약 288 스킬까지 든다.
-            _rc, _out, _err, _timed_out, _survivors = self._run_skillscan_all(
+            _rc, _out, _err, _timed_out, _cleanup = self._run_skillscan_all(
                 scan_tool, self.SKILLSCAN_SCAN_TIMEOUT_S)
             if _timed_out:
                 # ★C6/C7/R2: 상한 안에 **끝나지 못한 것**이다 — 느린 호스트·고부하의 상한 초과이고,
@@ -5424,7 +5439,10 @@ class Preflight:
                              "한가할 때 재측정하라(--only C60.gate-wiring). 스캐너 프로세스 그룹 "
                              "정리: %s"
                              % (self.SKILLSCAN_SCAN_TIMEOUT_S,
-                                "잔존 감지 후 추가 종료" if _survivors else "잔존 0(재측정 확인)"))
+                                ({"verified_empty": "잔존 0(재측정 확인)",
+                                  "survivors": "잔존 감지(정리 미완료)",
+                                  "unknown": "잔존 여부 미확인(unknown)"}[_cleanup["state"]]
+                                 + " — " + _cleanup["reason"])))
                 raise _SkillscanUnusable()
             # ★C6(CEO 판정 2026-10-24 — 양보 불가): 종전 `json.loads(r.stdout or "{}")` 는
             #   **빈 출력을 '차단 0건'으로 읽었다** — 보안 게이트가 fail-open 했다.
