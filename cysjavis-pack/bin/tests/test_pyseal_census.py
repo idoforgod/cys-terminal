@@ -320,6 +320,17 @@ REFERENCING_FILES = (  # 정렬 key=str(코드포인트 순 · LC_ALL=C sort 와
     #   python 을 물었을 때 자식이 `__pycache__` 를 쓰지 않도록 상속시키는 것이라 봉인 방향이 옳다
     #   (빼면 검체가 팩 트리를 오염시킨다 = SEAL-1 과 같은 계급).
     "cysjavis-pack/bin/tests/test_role_authority_triage.py",
+    # ★2026-10-24 WP18 등재(skillscan fail-open 봉인 검체 신설). **봉인 점검 결과(등재 = 이 선언)**:
+    #   새 python 진입점도 **프로덕션 강제점도 아니다** — 이 파일은 검체다. 니들을 가진 이유는
+    #   이 검체가 **제품 모듈을 리그에서 자식으로 import 해 돌린다**는 점이다: ⓐ 실제
+    #   `Preflight.c60_gate_wiring()` 구동(드라이버가 `cysjavis-pack/bin` 을 sys.path 에 넣고
+    #   javis_preflight 를 import 한다) ⓑ 제품 스캐너 사본 실행. 그 자식이 봉인 없이 돌면
+    #   **저장소 트리의 `cysjavis-pack/bin/__pycache__` 에 .pyc 를 쓴다** — 검체가 자기가 재는
+    #   트리를 오염시키는 SEAL-1 과 같은 계급이다. 그래서 두 자식 env 에 `PYTHONDONTWRITEBYTECODE`
+    #   를 **상속 방향으로** 다시 건다(벗기지 않는다 · javis_cycle_autopilot.py 와 같은 계급).
+    #   훅 갈래(run_hook)는 제품 트리를 import 하지 않고 임시 팩의 스텁만 돌리므로 니들이 없다 —
+    #   그 사실도 검체가 스스로 재고 있다(F6 가 리그 전수를 순회해 .pyc 0 을 단언한다).
+    "cysjavis-pack/bin/tests/test_wp18_skillscan_failopen.py",
     "cysjavis-pack/hooks/_lib.sh",
     "docs/RELEASE.md",
     # ★2026-09-04 W-C 등재 — 사용자 대면 릴리스 노트. **봉인 점검 결과**: 진입점도 강제점도
