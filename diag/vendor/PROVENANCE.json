@@ -1,7 +1,9 @@
 {
   "lib.ps1": {
     "source": "a240cfbfbdf6705be2e75277f84c8b2682a32cca:diag/lib.ps1",
-    "sha256": "3779d3ba40b67e4a73e4363c351ecd30be7312fae10665b272e9c89a2fa63560"
+    "sha256": "3779d3ba40b67e4a73e4363c351ecd30be7312fae10665b272e9c89a2fa63560",
+    "adapted_sha256": "74ca3b98d922aed62d12f711f76f46dfad03558d969d1319d6cd28b3877faa19",
+    "adaptation": "Invoke-Proc + ConvertFrom-DiagBytes: preserve pipe bytes/base64, BOM-aware text, PID/lifetime/completeness; truncated/error output never complete. Original hash remains sha256."
   },
   "sac-lib.ps1": {
     "source": "a240cfbfbdf6705be2e75277f84c8b2682a32cca:diag/sac-lib.ps1",

@@ -27,6 +27,10 @@ export function verdict(x){
  const un=[];const bad=[];
  if(x.harness_error)un.push(x.harness_error);
  for(const k of ['input','logs_complete','evidence_complete'])if(x[k]!==true)un.push(k);
+ if(x.reading==='R1'&&x.input===true&&x.evidence_complete===true&&!x.harness_error){
+  if(x.baseline===false)return {status:'FAIL',reasons:['baseline']};
+  if(x.baseline===true&&x.launch_known===true&&x.launch_ok===false)return {status:'FAIL',reasons:['installer_launch']};
+ }
  if(x.reading==='R2'){
   if(x.baseline!==true)un.push('baseline');
   if(x.launch_blocked!==true&&!Number.isSafeInteger(x.installer_exit))un.push('installer_exit');
@@ -37,6 +41,7 @@ export function verdict(x){
   if(un.length)return {status:'UNMEASURED',reasons:un};
   if(x.files_changed&&(x.versions!==true||x.daemon!==true||x.pack!==true||x.seat!==true))return {status:'MEASURED_REPLACED_BROKEN_OR_MIXED',reasons:[]};
   if(x.launch_blocked===true)return {status:x.old_restart?'MEASURED_BLOCKED_OLD_USABLE':'MEASURED_BLOCKED_OLD_NOT_RESTARTABLE',reasons:[]};
+  if(x.files_changed!==true)return {status:'UNMEASURED',reasons:['updated outcome without changed files']};
   const normal=verdict({...x,reading:'R1'});
   return {status:normal.status==='PASS'?'MEASURED_UPDATED_USABLE':normal.status==='UNMEASURED'?'UNMEASURED':'MEASURED_OTHER_FAILURE',reasons:normal.reasons};
  }

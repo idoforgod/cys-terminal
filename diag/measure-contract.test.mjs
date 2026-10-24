@@ -48,3 +48,5 @@ test('a similarly prefixed workflow is not the Windows build',async()=>{
  assert.throws(()=>validateMetadata(x,{id:x.run_id,run_attempt:1,head_sha:x.product_sha,status:'completed',conclusion:'success',path:'.github/workflows/windows-build.yml.evil'},[{id:x.artifact_id,name:x.artifact_name,size_in_bytes:1,expired:false}]),/UNMEASURED_INPUT/);
 });
 test('R2 copied files with unknown pack or seat cannot be called measured mixed',()=>assert.equal(verdict({...r2(),files_changed:true,pack:null}).status,'UNMEASURED'));
+test('F5 updated usable requires changed files',()=>assert.notEqual(verdict({...r2(),launch_ok:true,launch_blocked:false,installer_exit:0,files_changed:false}).status,'MEASURED_UPDATED_USABLE'));
+test('F5 measured R1 launch refusal is FAIL without invented exit',()=>assert.equal(verdict({...good(),launch_known:true,launch_ok:false,installer_exit:null}).status,'FAIL'));

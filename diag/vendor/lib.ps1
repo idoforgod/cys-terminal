@@ -226,6 +226,13 @@ function Stop-ProcessTree {
 #  such as reg.exe and sc.exe; Process.Start keeps its own handle, so rc is reliable.)
 # The child gets an empty stdin (never waits for console input). We wait on the process itself with a timeout and
 # give the pipes 5 s more to drain (a grandchild that inherited a pipe cannot hang us). Returns an ordered hashtable.
+# R2 adaptation: preserve exact pipe bytes while keeping the original BOM-aware text consumers.
+function ConvertFrom-DiagBytes([byte[]]$Bytes) {
+    $stream=New-Object IO.MemoryStream(,$Bytes)
+    $reader=New-Object IO.StreamReader($stream,[Text.Encoding]::UTF8,$true)
+    try{return $reader.ReadToEnd()}finally{$reader.Dispose();$stream.Dispose()}
+}
+
 function Invoke-Proc {
     param(
         [string]$File,
@@ -233,7 +240,7 @@ function Invoke-Proc {
         [int]$TimeoutSec = 120,
         [string]$WorkDir = ''
     )
-    $r = [ordered]@{ file = $File; args = $Arguments; rc = $null; timedOut = $false; startError = $null; out = ''; err = ''; ms = 0; pipes_not_drained = $false }
+    $r = [ordered]@{ file = $File; args = $Arguments; pid = $null; started_epoch = $null; ended_epoch = $null; stdout_complete = $false; stderr_complete = $false; stdout_bytes = $null; stderr_bytes = $null; rc = $null; timedOut = $false; startError = $null; out = ''; err = ''; ms = 0; pipes_not_drained = $false }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $p = $null
     try {
@@ -246,10 +253,14 @@ function Invoke-Proc {
         $psi.RedirectStandardError = $true
         $psi.RedirectStandardInput = $true
         if ($WorkDir -ne '') { $psi.WorkingDirectory = $WorkDir }
+        $r['started_epoch'] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
         $p = [System.Diagnostics.Process]::Start($psi)
+        $r['pid'] = $p.Id
         try { $p.StandardInput.Close() } catch { }
-        $tOut = $p.StandardOutput.ReadToEndAsync()
-        $tErr = $p.StandardError.ReadToEndAsync()
+        $memoryOut = New-Object IO.MemoryStream
+        $memoryErr = New-Object IO.MemoryStream
+        $tOut = $p.StandardOutput.BaseStream.CopyToAsync($memoryOut)
+        $tErr = $p.StandardError.BaseStream.CopyToAsync($memoryErr)
         if (-not $p.WaitForExit($TimeoutSec * 1000)) {
             $r['timedOut'] = $true
             Stop-ProcessTree -ProcessId $p.Id
@@ -257,21 +268,22 @@ function Invoke-Proc {
         }
         try { $r['rc'] = $p.ExitCode } catch { $r['rc'] = $null }
         try {
-            if ($tOut.Wait(5000)) { $r['out'] = [string]$tOut.Result } else { $r['pipes_not_drained'] = $true }
+            if ($tOut.Wait(5000)) { $bytes = $memoryOut.ToArray(); $r['stdout_bytes'] = [Convert]::ToBase64String($bytes); $r['out'] = ConvertFrom-DiagBytes $bytes; $r['stdout_complete'] = $true } else { $r['pipes_not_drained'] = $true }
         } catch { $r['out'] = '[stdout read failed: ' + $_.Exception.Message + ']' }
         try {
-            if ($tErr.Wait(5000)) { $r['err'] = [string]$tErr.Result } else { $r['pipes_not_drained'] = $true }
+            if ($tErr.Wait(5000)) { $bytes = $memoryErr.ToArray(); $r['stderr_bytes'] = [Convert]::ToBase64String($bytes); $r['err'] = ConvertFrom-DiagBytes $bytes; $r['stderr_complete'] = $true } else { $r['pipes_not_drained'] = $true }
         } catch { $r['err'] = '[stderr read failed: ' + $_.Exception.Message + ']' }
     } catch {
         $r['startError'] = $_.Exception.Message
     } finally {
         if ($null -ne $p) { try { $p.Dispose() } catch { } }
     }
+    $r['ended_epoch'] = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
     $sw.Stop()
     $r['ms'] = [int]$sw.ElapsedMilliseconds
     foreach ($k in @('out', 'err')) {
         $t = [string]$r[$k]
-        if ($t.Length -gt 4000000) { $r[$k] = $t.Substring(0, 4000000) + '...[truncated]' }
+        if ($t.Length -gt 4000000) { $r[$k] = $t.Substring(0, 4000000) + '...[truncated]'; if($k -eq 'out'){$r['stdout_complete']=$false}else{$r['stderr_complete']=$false} }
     }
     return $r
 }

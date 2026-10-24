@@ -17,6 +17,14 @@ assert 'Invoke-Proc $cli ' not in s
 assert 'Invoke-Cli $cli ' in s
 assert "if($script:SacTouched){$RUN.restore=Restore-SacReal 'final'" in s
 assert "Save-Json 'sac-touched.json'" in s
-assert "$o.exit_status -eq 0" in s and "$null -ne $o.exit_status" in s
+assert "$o.exit_status -eq 0" in s and "if($null -eq $o.exit_status)" in s
 assert "return $x" in s[s.index('function Must-Permit'):s.index('function Invoke-Cli')]
 print('PASS: authorization order, immutable artifact ID, plugin exit semantics, observer no-autostart, SAC restore, seat status (source checks only)')
+
+assert "driver-observation.mjs" in s and "finish-measurement.mjs" in s
+assert "$RUN.old_restart_seat=$oldSeat" in s
+assert "$cells.evidence_complete=$true" not in s
+assert "function Save-Json" in s and "evidence read-back failed" in s
+assert "Capture-RequiredChannels" in s
+assert "filename" in s or "filenames" in s
+assert "versions=$false;daemon=$false" not in s

@@ -17,7 +17,30 @@ $RUN=[ordered]@{started=(Get-IsoNow);steps=[ordered]@{};states=[ordered]@{};chec
 $cells=[ordered]@{reading=$null;input=$false;baseline=$null;installer_exit=$null;versions=$null;daemon=$null;pack=$null;seat=$null;tracebacks=$null;logs_complete=$false;evidence_complete=$false;harness_error=$null;sac_before=$null;sac_after=$null;neg_blocked=$null;pos_allowed=$null;launch_known=$null;launch_blocked=$null;old_restart=$null;old_survives=$null;files_changed=$null;state_complete=$false;restored=$null}
 $script:Install=Join-Path $env:LOCALAPPDATA 'cys'; $script:Pack=Join-Path $env:USERPROFILE '.cys\pack'
 $script:ApplyStart=$null; $script:AuditStarted=$false
-function Save-Run { Save-Json 'measurement.json' $RUN 30; Save-Json 'cells.json' $cells 10 }
+# Required JSON writes are checked and registered; the vendored best-effort writer is overridden.
+$script:EvidenceReceipts=[ordered]@{}
+function Save-Json([string]$Name,$Object,[int]$Depth=30) {
+    if([IO.Path]::GetFileName($Name) -ne $Name){throw 'invalid evidence filename'}
+    $file=Join-Path $global:DiagOut $Name
+    $text=ConvertTo-Json -InputObject $Object -Depth $Depth
+    $encoding=New-Object Text.UTF8Encoding($false)
+    [IO.File]::WriteAllText($file,$text,$encoding)
+    $read=[IO.File]::ReadAllText($file,$encoding)
+    if($read -cne $text -or $read.Length -eq 0){throw ('evidence read-back failed: '+$Name)}
+    $null=ConvertFrom-Json -InputObject $read -ErrorAction Stop
+    $script:EvidenceReceipts[$Name]=[ordered]@{sha256=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant();bytes=(Get-Item -LiteralPath $file).Length;format='json'}
+}
+function Save-Run {
+    $RUN.seed_cells=$cells
+    Save-Json 'measurement.json' $RUN 60
+    Save-Json 'cells.json' $cells 10
+    $file=Join-Path $global:DiagOut 'evidence-receipts.json'
+    [IO.File]::WriteAllText($file,(ConvertTo-Json -InputObject $script:EvidenceReceipts -Depth 10),(New-Object Text.UTF8Encoding($false)))
+    $null=Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -ErrorAction Stop
+}
+function Known($Value,[string]$Reason='') { return [ordered]@{known=$true;value=[bool]$Value;error=$null;reason=$Reason} }
+function Unknown([string]$ErrorText) { return [ordered]@{known=$false;value=$null;error=$ErrorText} }
+function State-Ready($State) { return ($State.versions.known -and $State.versions.value -and $State.daemon.known -and $State.daemon.value -and $State.pack.known -and $State.pack.value) }
 function Must-Permit {
     $x=Get-Content -LiteralPath $Permit -Raw | ConvertFrom-Json
     if ($x.authorized -ne $true -or $x.plan_sha256 -ne 'ddf2c693c7e93598593a3f06c7c2e77aa8dd8b538efe5baf64fec9bdc8c3ee44' -or @('R1','R2') -notcontains $x.reading) { throw 'UNMEASURED_INPUT: invalid permit' }
@@ -46,90 +69,122 @@ function Image-Facts {
     return $o
 }
 function Pack-Facts([string]$Version) {
-    $o=[ordered]@{ok=$false;version=$null;state=$null;manifest=$null;files=@();error=$null}
+    $o=[ordered]@{known=$false;value=$null;error=$null;version=$null;state=$null;manifest=$null;files=@()}
     try {
-        $o.version=(Get-Content -LiteralPath (Join-Path $script:Pack '.pack-version') -Raw).Trim()
-        $o.state=Get-Content -LiteralPath (Join-Path $script:Pack '.pack-state.json') -Raw | ConvertFrom-Json
-        $manifestPath=Join-Path $script:Pack '.install-manifest.json'
-        $o.manifest=Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-        $bad=0; $count=0
-        foreach($kv in $o.manifest.PSObject.Properties) {
+        foreach($name in @('.pack-version','.pack-state.json','.install-manifest.json')){
+            if(-not(Test-Path -LiteralPath (Join-Path $script:Pack $name) -PathType Leaf -ErrorAction Stop)){$o.known=$true;$o.value=$false;$o.reason='missing metadata: '+$name;return $o}
+        }
+        $o.version=(Get-Content -LiteralPath (Join-Path $script:Pack '.pack-version') -Raw -ErrorAction Stop).Trim()
+        $stateText=Get-Content -LiteralPath (Join-Path $script:Pack '.pack-state.json') -Raw -ErrorAction Stop
+        $manifestText=Get-Content -LiteralPath (Join-Path $script:Pack '.install-manifest.json') -Raw -ErrorAction Stop
+        try{$o.state=ConvertFrom-Json $stateText -ErrorAction Stop;$o.manifest=ConvertFrom-Json $manifestText -ErrorAction Stop}
+        catch{$o.known=$true;$o.value=$false;$o.reason='corrupt JSON metadata';return $o}
+        if($o.state -isnot [pscustomobject] -or $o.manifest -isnot [pscustomobject]){$o.known=$true;$o.value=$false;$o.reason='metadata JSON shape invalid';return $o}
+        $bad=0;$count=0
+        foreach($kv in $o.manifest.PSObject.Properties){
             $f=[IO.Path]::GetFullPath((Join-Path $script:Pack $kv.Name))
-            if(-not $f.StartsWith(([IO.Path]::GetFullPath($script:Pack)+'\'),[StringComparison]::OrdinalIgnoreCase)){throw 'manifest outside pack'}
-            $exists=Test-Path -LiteralPath $f -PathType Leaf
-            $h=$null;if($exists){$h=(Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash.ToLowerInvariant()}
-            $ok=$exists -and ($h -eq [string]$kv.Value); if(-not $ok){$bad++};$count++
+            if(-not $f.StartsWith(([IO.Path]::GetFullPath($script:Pack)+'\'),[StringComparison]::OrdinalIgnoreCase)){$bad++;continue}
+            $exists=Test-Path -LiteralPath $f -PathType Leaf -ErrorAction Stop
+            $h=$null;if($exists){$h=(Get-FileHash -LiteralPath $f -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()}
+            $ok=$exists -and ($h -eq [string]$kv.Value);if(-not $ok){$bad++};$count++
             $o.files+=@([ordered]@{relative=$kv.Name;expected=$kv.Value;sha256=$h;ok=$ok})
         }
-        $o.ok=($o.version -eq $Version -and $count -gt 0 -and $bad -eq 0 -and $o.state.base_version -eq $Version)
-    }catch{$o.error=$_.Exception.Message}
+        $o.known=$true;$o.value=($o.version -eq $Version -and $count -gt 0 -and $bad -eq 0 -and $o.state.base_version -eq $Version)
+    }catch{$o.known=$false;$o.value=$null;$o.error=$_.Exception.Message}
     return $o
 }
 function App-Version([string]$Tag) {
-    $cdpArgs='"'+(Join-Path $PSScriptRoot 'vendor\cdp-update.mjs')+'" --mode uipre --ready-wait-sec 30 --port 9333 --out "'+$global:DiagOut+'" --prefix '+$Tag+' --max-wait-sec 30'
+    $unique=$Tag+'-'+[Guid]::NewGuid().ToString('N')
+    $cdpArgs='"'+(Join-Path $PSScriptRoot 'vendor\cdp-update.mjs')+'" --mode uipre --ready-wait-sec 30 --port 9333 --out "'+$global:DiagOut+'" --prefix '+$unique+' --max-wait-sec 30'
     $r=Invoke-Proc $CTX.driver_node $cdpArgs 65
-    $f=Join-Path $global:DiagOut ($Tag+'-cdp.json')
-    if(Test-Path $f){return (Get-Content $f -Raw | ConvertFrom-Json)}
-    return $null
+    $f=Join-Path $global:DiagOut ($unique+'-cdp.json')
+    if($r.startError -or $r.timedOut -or $r.rc -ne 0 -or -not(Test-Path $f)){return [ordered]@{known=$false;value=$null;error='CDP observer unavailable';process=$r}}
+    $j=Get-Content $f -Raw | ConvertFrom-Json -ErrorAction Stop
+    if(-not $j.attached -or $null -eq $j.app_version -or $null -eq $j.ui.ready.ok){return [ordered]@{known=$false;value=$null;error='CDP result incomplete';data=$j}}
+    return [ordered]@{known=$true;data=$j;process=$r}
 }
 function Read-State([string]$Version,[string]$Tag) {
-    $o=[ordered]@{images=(Image-Facts);marker=$null;cli=$null;daemon_binary=$null;ping=$null;identify=$null;daemon_process=$null;app=$null;pack=(Pack-Facts $Version);versions=$false;daemon=$false;error=$null}
+    $raw=[ordered]@{expected=$Version;images=$null;marker=$null;failure_file=$null;cli=$null;daemon_binary=$null;ping=$null;identify=$null;cim=$null;app=$null;pack=$null;error=$null}
     try {
-        $o.marker=(Get-Content -LiteralPath (Join-Path $script:Install 'cys-installed-version.txt') -Raw).Trim()
+        $raw.images=Image-Facts;$raw.pack=Pack-Facts $Version
+        $markerPath=Join-Path $script:Install 'cys-installed-version.txt'
+        if(Test-Path -LiteralPath $markerPath -PathType Leaf -ErrorAction Stop){$raw.marker=(Get-Content -LiteralPath $markerPath -Raw -ErrorAction Stop).Trim()}
+        $raw.failure_file=Test-Path -LiteralPath (Join-Path $script:Install 'cys-install-failure.txt') -ErrorAction Stop
         $cli=Join-Path $script:Install 'cys.exe';$daemon=Join-Path $script:Install 'cysd.exe'
-        $o.cli=Invoke-Cli $cli '--version' 15; $o.daemon_binary=Invoke-Proc $daemon '--version' 15
-        $running=@(Get-CimInstance Win32_Process -Filter "Name='cysd.exe'" | Where-Object {$_.ExecutablePath -ieq $daemon})
-        $o.daemon_processes_before_rpc=@($running | Select-Object ProcessId,ParentProcessId,ExecutablePath,CreationDate)
-        # cys request may autostart: no RPC/seat creation unless a product daemon is already present.
-        $id=$null
-        if($running.Count -gt 0){$o.ping=Invoke-Cli $cli 'ping' 15;$id=Invoke-Cli $cli 'identify' 15;$o.identify=$id}
-        if($id.rc -eq 0) {
-            $j=$id.out | ConvertFrom-Json
-            $dp=Get-CimInstance Win32_Process -Filter ('ProcessId='+[int]$j.daemon_pid)
-            $o.daemon_process=[ordered]@{pid=$j.daemon_pid;path=$dp.ExecutablePath;created=$dp.CreationDate;version=$j.version}
-            $o.daemon=($o.ping.rc -eq 0 -and $j.version -eq $Version -and $dp.ExecutablePath -ieq $daemon)
+        $raw.cli=Invoke-Cli $cli '--version' 15;$raw.daemon_binary=Invoke-Proc $daemon '--version' 15
+        $daemons=@(Get-CimInstance Win32_Process -Filter "Name='cysd.exe'" -ErrorAction Stop | Where-Object {$_.ExecutablePath -ieq $daemon} | Select-Object ProcessId,ExecutablePath,CreationDate)
+        $apps=@(Get-CimInstance Win32_Process -Filter "Name='cys-app.exe'" -ErrorAction Stop | Where-Object {$_.ExecutablePath -ieq (Join-Path $script:Install 'cys-app.exe')} | Select-Object ProcessId,ExecutablePath,CreationDate)
+        $raw.cim=[ordered]@{known=$true;daemons=$daemons;apps=$apps}
+        if($daemons.Count -gt 0){
+            $raw.ping=Invoke-Cli $cli 'ping' 15;$id=Invoke-Cli $cli 'identify' 15
+            $raw.identify=$id
+            if($id.rc -eq 0){$raw.identify.data=ConvertFrom-Json $id.out -ErrorAction Stop}
         }
-        $o.app=App-Version $Tag
-        $imageOK=$true;foreach($n in @('cys-app.exe','cys.exe','cysd.exe')){if($null -eq $o.images[$n] -or $o.images[$n].version -ne $Version){$imageOK=$false}}
-        $o.versions=($imageOK -and $o.marker -eq $Version -and $o.cli.rc -eq 0 -and $o.cli.out.Trim() -eq ('cys '+$Version) -and $o.daemon_binary.rc -eq 0 -and $o.daemon_binary.out.Trim() -eq ('cysd '+$Version) -and $o.app.attached -eq $true -and $o.app.ui.ready.ok -eq $true -and $o.app.app_version -eq $Version -and -not (Test-Path (Join-Path $script:Install 'cys-install-failure.txt')))
-    }catch{$o.error=$_.Exception.Message}
+        if($apps.Count -gt 0){$raw.app=App-Version $Tag}
+    }catch{$raw.error=$_.Exception.Message}
+    Save-Json ($Tag+'-raw-state.json') $raw 60
+    $out=Join-Path $global:DiagOut ($Tag+'-state-reduced.json')
+    & $CTX.driver_node (Join-Path $PSScriptRoot 'driver-observation.mjs') state (Join-Path $global:DiagOut ($Tag+'-raw-state.json')) $out
+    if($LASTEXITCODE -ne 0){throw 'state reducer failed'}
+    $o=Get-Content -LiteralPath $out -Raw | ConvertFrom-Json -ErrorAction Stop
     Save-Json ($Tag+'-state.json') $o 30
+    # Keep raw evidence alongside the actual reducer output in RUN.
     return $o
 }
 function Seat-Check([string]$Tag) {
     $nonce='wm-'+[Guid]::NewGuid().ToString('N');$cli=Join-Path $script:Install 'cys.exe'
-    # Normal product PTY, no agent credentials. Keep it alive while checking pid/output, then prove exit0.
-    $command='cmd.exe /d /q /c "echo '+$nonce+' & ping -n 6 127.0.0.1 >nul & exit /b 0"'
-    $running=@(Get-CimInstance Win32_Process -Filter "Name='cysd.exe'" | Where-Object {$_.ExecutablePath -ieq (Join-Path $script:Install 'cysd.exe')})
-    if($running.Count -eq 0){return [ordered]@{ok=$false;measured=$true;error='no pre-existing daemon; CLI autostart forbidden'}}
-    $seatStart=(Get-Date).ToUniversalTime()
-    $r=Invoke-Cli $cli ('new-surface --title win-measure --cmd '+(ConvertTo-CmdArg $command)) 20
-    $o=[ordered]@{ok=$false;measured=$false;cli_probe=$null;exit_status=$null;nonce=$nonce;create=$r;surface=$null;screen=$null;list=$null;exit_list=$null;error=$null}
+    $o=[ordered]@{known=$false;value=$null;error=$null;nonce=$nonce;create=$null;screen=$null;list=$null;exit_list=$null;exit_status=$null;audit=@()}
     try {
-        $sid=$r.out.Trim();if($r.rc -ne 0 -or $sid -notmatch '^surface:\d+$'){
+        $running=@(Get-CimInstance Win32_Process -Filter "Name='cysd.exe'" -ErrorAction Stop | Where-Object {$_.ExecutablePath -ieq (Join-Path $script:Install 'cysd.exe')})
+        if($running.Count -eq 0){$o.known=$true;$o.value=$false;$o.reason='no daemon';return $o}
+        $command='cmd.exe /d /q /c "echo '+$nonce+' & ping -n 6 127.0.0.1 >nul & exit /b 0"'
+        $seatStart=(Get-Date).ToUniversalTime();$o.create=Invoke-Cli $cli ('new-surface --title win-measure --cmd '+(ConvertTo-CmdArg $command)) 20
+        $sid=$o.create.out.Trim()
+        if($o.create.rc -ne 0 -or $sid -notmatch '^surface:\d+$'){
             $o.cli_probe=Invoke-ProbeCreate $cli
-            if($o.cli_probe.completed -eq $true -and $o.cli_probe.ok -eq $false){$o.measured=$true;Save-Json ($Tag+'-seat.json') $o 12;return $o}
-            throw 'surface not created or observer could not classify it'
-        };$o.surface=$sid
-        Start-Sleep -Seconds 1
-        $o.screen=Invoke-Cli $cli ('read-screen --surface '+$sid+' --lines 100') 15
-        $o.list=Invoke-Cli $cli 'list' 15
-        Start-Sleep -Seconds 6
-        $o.exit_list=Invoke-Cli $cli 'list' 15
+            if($o.cli_probe.completed -eq $true){$o.known=$true;$o.value=$false;$o.reason='new-surface failed with measured CLI launchability'}
+            else{$o.error='CLI observer unavailable'}
+            return $o
+        }
+        $o.surface=$sid;Start-Sleep 1
+        $o.screen=Invoke-Cli $cli ('read-screen --surface '+$sid+' --lines 100') 15;$o.list=Invoke-Cli $cli 'list' 15
+        Start-Sleep 6;$o.exit_list=Invoke-Cli $cli 'list' 15
+        if($o.list.rc -ne 0 -or $o.exit_list.rc -ne 0 -or $o.screen.rc -ne 0){$o.error='list/screen observer unavailable';return $o}
         $line=@($o.list.out -split "`n" | Where-Object {$_ -match ('^'+[regex]::Escape($sid)+'\s')})
         $end=@($o.exit_list.out -split "`n" | Where-Object {$_ -match ('^'+[regex]::Escape($sid)+'\s')})
-        # A visible nonce and exited=true alone do not prove exit0. Require the process's audit status.
-        if($line.Count -eq 1 -and $line[0] -match 'pid=([1-9]\d*)'){
-            $seatPid=[int64]$Matches[1]
-            $evs=@(Get-WinEvent -FilterHashtable @{LogName='Security';Id=4689;StartTime=$seatStart.ToLocalTime()} -ErrorAction Stop)
-            foreach($ev in $evs){[xml]$xml=$ev.ToXml();$data=@{};foreach($d in $xml.Event.EventData.Data){$data[[string]$d.Name]=[string]$d.'#text'}
-                if([Convert]::ToInt64($data.ProcessId,16) -eq $seatPid){$o.exit_status=[Convert]::ToInt64($data.Status,16)}
+        if($line.Count -ne 1 -or $line[0] -notmatch 'pid=([1-9]\d*)' -or $end.Count -ne 1 -or $end[0] -notmatch 'exited=true'){$o.known=$true;$o.value=$false;$o.reason='healthy list observer: missing child or child not exited';return $o}
+        $seatPid=[int64]([regex]::Match($line[0],'pid=([1-9]\d*)').Groups[1].Value)
+        $evs=@(Get-WinEvent -FilterHashtable @{LogName='Security';Id=4689;StartTime=$seatStart.ToLocalTime()} -ErrorAction Stop)
+        foreach($ev in $evs){[xml]$xml=$ev.ToXml();$data=@{};foreach($d in $xml.Event.EventData.Data){$data[[string]$d.Name]=[string]$d.'#text'}
+            if([Convert]::ToInt64($data.ProcessId,16) -eq $seatPid){$o.exit_status=[Convert]::ToInt64($data.Status,16);$o.audit+=@($ev.ToXml())}
+        }
+        if($null -eq $o.exit_status){$o.error='seat exit audit missing';return $o}
+        $o.known=$true;$o.value=($o.screen.out.Contains($nonce) -and $o.exit_status -eq 0)
+    }catch{$o.known=$false;$o.value=$null;$o.error=$_.Exception.Message}
+    finally{Save-Json ($Tag+'-seat.json') $o 30}
+    return $o
+}
+function Capture-RequiredChannels {
+    $inventory=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'log-inventory.json') -Raw | ConvertFrom-Json -ErrorAction Stop
+    Save-Json 'log-inventory.json' $inventory 30
+    $capture=[ordered]@{product_sha=$RUN.inputs.product_sha;reading=$cells.reading;interval=[ordered]@{start=([DateTimeOffset]::Parse($RUN.started).ToUnixTimeMilliseconds()/1000.0);end=([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()/1000.0)};channels=@()}
+    foreach($binding in $inventory.channels){
+        $row=[ordered]@{id=$binding.id;bound=$false;producer_pid=$null;sink=$binding.sink;collection_ok=$false;error='required producer/channel is not captured; filenames are not binding proof'}
+        # Only directly observed redirected streams can be bound here. Other product-created
+        # processes retain their real startup behavior; absent stdout/stderr stays UNMEASURED.
+        if($binding.id -in @('installer-base:stdout','installer-base:stderr')){
+            $proc=$RUN.base_install;$stream='out';$complete=$proc.stdout_complete
+            if($binding.id -eq 'installer-base:stderr'){$stream='err';$complete=$proc.stderr_complete}
+            if($binding.sink -eq ('capture:installer-base:'+ $stream) -and $binding.source_ref -and $inventory.product_sha -eq $RUN.inputs.product_sha -and $proc.pid -gt 0 -and $complete -eq $true){
+                $name='installer-base-'+$stream+'.stream';$file=Join-Path $global:DiagOut $name
+                $rawKey='stdout_bytes';if($stream -eq 'err'){$rawKey='stderr_bytes'}
+                [IO.File]::WriteAllBytes($file,[Convert]::FromBase64String([string]$proc[$rawKey]))
+                $row=[ordered]@{id=$binding.id;bound=$true;producer_pid=$proc.pid;sink=$binding.sink;producer_start=$proc.started_epoch;producer_end=$proc.ended_epoch;start=$proc.started_epoch;end=$proc.ended_epoch;collection_ok=$true;copy=$name;bytes=(Get-Item $file).Length;offset=0;end_offset=(Get-Item $file).Length;sha256=(Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant();error=$null}
             }
         }
-        $o.measured=($null -ne $o.exit_status)
-        $o.ok=($o.screen.rc -eq 0 -and $o.screen.out.Contains($nonce) -and $line.Count -eq 1 -and $line[0] -match 'pid=[1-9]\d*' -and $line[0] -match 'exited=false' -and $end.Count -eq 1 -and $end[0] -match 'exited=true' -and $null -ne $o.exit_status -and $o.exit_status -eq 0)
-    }catch{$o.error=$_.Exception.Message}
-    Save-Json ($Tag+'-seat.json') $o 12;return $o
+        $capture.channels+=@($row)
+    }
+    Save-Json 'channel-capture.json' $capture 30
 }
 function Capture-Logs([string]$Tag) {
     $out=Join-Path $global:DiagOut ('logs-'+$Tag);New-Item -ItemType Directory -Force -Path $out | Out-Null
@@ -160,9 +215,7 @@ function Capture-Logs([string]$Tag) {
             }
         }catch{$o.complete=$false;$o.errors+=@($_.Exception.Message)}
     }
-    $daemonLogs=@($o.files | Where-Object {$_.path -match '(cysd|daemon|phoenix-restore).*\.log'})
-    $packLogs=@($o.files | Where-Object {$_.path.StartsWith((Join-Path $env:USERPROFILE '.cys'),[StringComparison]::OrdinalIgnoreCase)})
-    if($daemonLogs.Count -eq 0 -or $packLogs.Count -eq 0){$o.complete=$false;$o.errors+=@('daemon/pack log coverage missing; no zero-count inference')}
+    $o.complete=$false;$o.errors+=@('supplemental file census only; required channel inventory decides completeness')
     if([regex]::Matches('positive Traceback sentinel','Traceback').Count -ne 1){throw 'Traceback counter failed'}
     Save-Json ($Tag+'-logs.json') $o 12;return $o
 }
@@ -184,6 +237,7 @@ function Installer-Exit([datetime]$Since,[string]$Path) {
 }
 try {
     $inputLock=Must-Permit; $cells.reading=$inputLock.reading;$cells.input=$true;$K_JOB='winmeasure-'+$inputLock.reading.ToLowerInvariant()
+    foreach($name in @('input-lock.json','permit.json','build-metadata.json')){Save-Json $name (Get-Content -LiteralPath (Join-Path $global:DiagOut $name) -Raw | ConvertFrom-Json) 60}
     $RUN.inputs=$inputLock;$RUN.harness_sha=$env:GITHUB_SHA;$RUN.run_id=$env:GITHUB_RUN_ID;$RUN.attempt=$env:GITHUB_RUN_ATTEMPT
     $RUN.environment=[ordered]@{os=(Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber);arch=$env:PROCESSOR_ARCHITECTURE;image=$env:ImageVersion}
     $initial=Get-SacRealState 'initial';$RUN.initial_sac=$initial
@@ -203,10 +257,10 @@ try {
     $baseApp=Start-Process -FilePath (Join-Path $script:Install 'cys-app.exe') -WorkingDirectory $script:Install -PassThru
     $RUN.base_app_pid=$baseApp.Id
     $until=(Get-Date).AddSeconds(300)
-    do{$baseline=Read-State '0.14.52' 'base';if($baseline.versions -and $baseline.daemon -and $baseline.pack.ok){break};Start-Sleep 5}while((Get-Date) -lt $until)
-    $cells.baseline=($baseline.versions -and $baseline.daemon -and $baseline.pack.ok)
-    $RUN.baseline=$baseline;$RUN.base_logs=Capture-Logs 'base'
-    if(-not $cells.baseline){throw 'baseline not ready; do not apply candidate'}
+    do{$baseline=Read-State '0.14.52' 'base';if(State-Ready $baseline){break};Start-Sleep 5}while((Get-Date) -lt $until)
+    $cells.baseline=$null;if($baseline.versions.known -and $baseline.daemon.known -and $baseline.pack.known){$cells.baseline=[bool](State-Ready $baseline)}
+    $RUN.base_images=Image-Facts;$RUN.baseline=$baseline;$RUN.base_logs=Capture-Logs 'base'
+    if($cells.baseline -ne $true){$RUN.baseline_timeout=$true;throw 'BASELINE_STOP'}
     # Product-root-only audit; do not kill or reset the old daemon.
     foreach($guid in @('{0CCE922B-69AE-11D9-BED3-505054503030}','{0CCE922C-69AE-11D9-BED3-505054503030}')){
         $a=Invoke-Proc 'auditpol.exe' ('/set /subcategory:'+ $guid +' /success:enable') 30
@@ -231,7 +285,7 @@ try {
     $RUN.candidate_copy=$dest;$RUN.candidate_authenticode=(Get-AuthenticodeSignature $dest).Status.ToString()
     $script:ApplyStart=(Get-Date).ToUniversalTime();$oldCwd=[Environment]::CurrentDirectory
     try{[Environment]::CurrentDirectory=$script:Install;$call=[DiagNative]::ShellExecStart($dest,'/P /R /UPDATE /ARGS',20000)}finally{[Environment]::CurrentDirectory=$oldCwd}
-    $RUN.launch=ConvertTo-CallRecord $call;$cells.launch_known=($call.Completed -and -not $call.TimedOut)
+    $RUN.launch=ConvertTo-CallRecord $call;Save-Json 'launch.json' $RUN.launch 10;$cells.launch_ok=[bool]$call.Ok;$cells.launch_known=($call.Completed -and -not $call.TimedOut)
     $cells.launch_blocked=($cells.launch_known -and -not $call.Ok -and $call.LastError -eq 4551)
     # Pinned tauri-plugin-updater2.10.1 updater.rs:855-865 ignores ShellExecuteW result then exits0.
     # A returned failure therefore ends the old app too; a still-pending call does not.
@@ -240,39 +294,38 @@ try {
     if(-not $cells.launch_known){throw 'UNMEASURED: ShellExecute still pending'}
     $until=(Get-Date).AddSeconds(600)
     if($call.Ok){do{$audit=Installer-Exit $script:ApplyStart $dest;if($audit.complete){break};Start-Sleep 3}while((Get-Date) -lt $until);$cells.installer_exit=$audit.exit}
-    else{$RUN.launch_refused=$true}
+    else{$RUN.launch_refused=$true;Save-Json 'installer-process-evidence.json' ([ordered]@{not_launched=$true;launch=$RUN.launch;exit=$null}) 20}
     $RUN.images_after=Image-Facts;$cells.files_changed=$false
-    foreach($n in @('cys-app.exe','cys.exe','cysd.exe')){if($RUN.images_after[$n].sha256 -ne $baseline.images[$n].sha256){$cells.files_changed=$true}}
+    foreach($n in @('cys-app.exe','cys.exe','cysd.exe')){if($RUN.images_after[$n].sha256 -ne $RUN.base_images[$n].sha256){$cells.files_changed=$true}}
     $until=(Get-Date).AddSeconds(300)
-    do{$after=Read-State '0.14.53' 'after';if($after.versions -and $after.daemon -and $after.pack.ok){break};if(-not $call.Ok){break};Start-Sleep 5}while((Get-Date) -lt $until)
-    $RUN.after=$after;$cells.versions=$after.versions;$cells.daemon=$after.daemon;$cells.pack=$after.pack.ok;if($after.pack.error){$cells.pack=$null}
-    $seat=Seat-Check 'after';$RUN.seat=$seat;$cells.seat=$seat.ok;if(-not $seat.measured){$cells.seat=$null}
+    do{$after=Read-State '0.14.53' 'after';if(State-Ready $after){break};if(-not $call.Ok){break};Start-Sleep 5}while((Get-Date) -lt $until)
+    $RUN.after=$after
+    $RUN.seat=Seat-Check 'after'
     Start-Sleep 60
     $RUN.final_state=Read-State '0.14.53' 'final'
-    $cells.versions=($cells.versions -and $RUN.final_state.versions);$cells.daemon=($cells.daemon -and $RUN.final_state.daemon);if($null -ne $cells.pack -and -not $RUN.final_state.pack.error){$cells.pack=($cells.pack -and $RUN.final_state.pack.ok)}else{$cells.pack=$null}
     if($cells.reading -eq 'R2'){
         $cells.old_survives=(-not $baseApp.HasExited)
-        $cells.old_restart=$false
         if(-not $cells.files_changed){
             # Explicit re-launch of the unchanged old image is different from surviving PID.
             $restart=Invoke-ProbeCreate (Join-Path $script:Install 'cys-app.exe');$RUN.old_restart_probe=$restart
-            if($restart.completed -ne $true){$cells.old_restart=$null}
+            if($restart.completed -ne $true){$RUN.old_restart_observer_error="probe incomplete"}
             if($restart.ok){
                 $oldProcess=Start-Process -FilePath (Join-Path $script:Install 'cys-app.exe') -WorkingDirectory $script:Install -PassThru
                 Start-Sleep 5;$oldState=Read-State '0.14.52' 'old-restart';$oldSeat=Seat-Check 'old-restart'
-                $RUN.old_restart_state=$oldState;$cells.old_restart=($oldState.versions -and $oldState.daemon -and $oldState.pack.ok -and $oldSeat.ok)
+                $RUN.old_restart_state=$oldState;$RUN.old_restart_seat=$oldSeat
             }
         }
         $st=Get-SacRealState 'after-observation';$RUN.sac_after=$st
         $cells.sac_after=($st.registry.value -eq 1 -and $st.signals.citool_desktop_enforced -and $st.signals.defender_on -eq $true -and $st.signals.umci_flag)
-        $cells.state_complete=($null -ne $cells.old_restart -and $null -ne $cells.files_changed -and $null -ne $RUN.after)
+        Save-Json 'r2-state.json' ([ordered]@{probe=$RUN.old_restart_probe;state=$RUN.old_restart_state;seat=$RUN.old_restart_seat;sac_before=$RUN.sac_before;sac_after=$RUN.sac_after;negative=$RUN.negative;positive=$RUN.positive;old_survives=$cells.old_survives}) 60
     }
-    $RUN.final_logs=Capture-Logs 'final';$cells.logs_complete=($RUN.base_logs.complete -and $RUN.final_logs.complete)
-    $cells.tracebacks=($RUN.base_logs.tracebacks + $RUN.final_logs.tracebacks)
+    Capture-RequiredChannels
+    $RUN.final_logs=Capture-Logs 'final'
+    $cells.logs_complete=$false;$cells.tracebacks=$null # required channel validator, not supplemental census, sets these
     $RUN.events=Get-CIEvents $script:ApplyStart;Save-Json 'codeintegrity.json' $RUN.events 20
-    $cells.evidence_complete=$true
+    $cells.evidence_complete=$false # finalizer verifies mandatory read-back/hash manifest
     Save-Run;Publish-Checkpoint 'after-observation'
-}catch{$cells.harness_error=$_.Exception.Message;$RUN.error=$_.Exception.ToString();Save-Run}
+}catch{if($_.Exception.Message -ne 'BASELINE_STOP'){$cells.harness_error=$_.Exception.Message};$RUN.error=$_.Exception.ToString();try{Save-Run}catch{Write-Error ('required evidence write failed: '+$_.Exception.Message) -ErrorAction Continue}}
 finally {
     if($script:SacTouched){$RUN.restore=Restore-SacReal 'final';$cells.restored=$RUN.restore.restored;if(-not $cells.restored){$RUN.restore_fallback=Invoke-CmdRestoreFallback}}
     elseif($cells.reading -eq 'R2'){$cells.restored=$false}
@@ -280,5 +333,5 @@ finally {
     # Preserve processes and files until observations are saved. Disposable runner teardown cleans them.
     $env:GITHUB_TOKEN=$script:GhToken
 }
-& $CTX.driver_node (Join-Path $PSScriptRoot 'measure-contract.mjs') verdict (Join-Path $global:DiagOut 'cells.json') (Join-Path $global:DiagOut 'verdict.json')
+& $CTX.driver_node (Join-Path $PSScriptRoot 'finish-measurement.mjs') $global:DiagOut
 exit $LASTEXITCODE

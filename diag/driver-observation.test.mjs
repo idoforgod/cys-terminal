@@ -1,0 +1,18 @@
+import { test } from 'node:test';import assert from 'node:assert/strict';
+import { stateObservation,driverCells,daemonVersion } from './driver-observation.mjs';
+import { verdict } from './measure-contract.mjs';
+const yes=()=>({known:true,value:true,error:null});const no=()=>({known:true,value:false,error:null});const unknown=()=>({known:false,value:null,error:'observer unavailable'});
+const raw=()=>({expected:'0.14.53',error:null,images:Object.fromEntries(['cys-app.exe','cys.exe','cysd.exe'].map(n=>[n,{version:'0.14.53'}])),marker:'0.14.53',failure_file:false,cli:{rc:0,out:'cys 0.14.53'},daemon_binary:{rc:0,out:'cysd 0.14.53 (build 2dda5a698c01)'},cim:{known:true,daemons:[{ProcessId:7,ExecutablePath:'C:\\cys\\cysd.exe'}],apps:[{ProcessId:8}]},identify:{rc:0,data:{version:'0.14.53',daemon_pid:7}},ping:{rc:0},app:{known:true,data:{attached:true,app_version:'0.14.53',ui:{ready:{ok:true}}}},pack:yes()});
+const state=()=>({...stateObservation(raw()),pack:yes()});
+const seed=()=>({reading:'R2',input:true,evidence_complete:true,logs_complete:true,tracebacks:0,installer_exit:null,launch_known:true,launch_ok:false,launch_blocked:true,sac_before:true,sac_after:true,neg_blocked:true,pos_allowed:true,restored:true,files_changed:false});
+const run=()=>({seed_cells:seed(),baseline:state(),after:state(),final_state:state(),seat:yes(),old_restart_state:state(),old_restart_seat:yes(),old_restart_probe:{completed:true,ok:true},baseline_timeout:false});
+test('F1 exact real cysd grammar',()=>{assert(daemonVersion('cysd 0.14.53 (build 2dda5a698c01)','0.14.53'));for(const s of ['cysd 0.14.53','cysd 0x14x53 (build ab)','x cysd 0.14.53 (build ab)','cysd 0.14.53 (build zz)','cysd 0.14.53 (build ab) suffix'])assert(!daemonVersion(s,'0.14.53'));});
+test('driver healthy state reaches measured classification',()=>assert.equal(verdict(driverCells(run())).status,'MEASURED_BLOCKED_OLD_USABLE'));
+test('old restart CDP unavailable stays UNMEASURED',()=>{const r=run(),x=raw();x.app={known:false,error:'CDP unavailable'};r.old_restart_state=stateObservation(x);assert.equal(verdict(driverCells(r)).status,'UNMEASURED');});
+for(const error of ['CIM failed','identify failed'])test(error+' through actual state reducer is UNMEASURED',()=>{const r=run(),x=raw();if(error.startsWith('CIM'))x.cim={known:false,error};else x.identify={rc:1,out:'',error};r.after=stateObservation(x);assert.equal(verdict(driverCells(r)).status,'UNMEASURED');});
+test('old seat exit unmeasured survives reducer',()=>{const r=run();r.old_restart_seat=unknown();assert.equal(verdict(driverCells(r)).status,'UNMEASURED');});
+test('measured missing daemon remains product false',()=>{const r=run(),x=raw();x.cim.daemons=[];r.old_restart_state=stateObservation(x);assert.equal(verdict(driverCells(r)).status,'MEASURED_BLOCKED_OLD_NOT_RESTARTABLE');});
+test('healthy observer baseline timeout is R1 FAIL',()=>{const r=run();r.seed_cells.reading='R1';r.baseline.versions=no();r.baseline_timeout=true;assert.equal(verdict(driverCells(r)).status,'FAIL');});
+test('unknown baseline timeout is UNMEASURED',()=>{const r=run();r.seed_cells.reading='R1';r.baseline.versions=unknown();r.baseline_timeout=true;assert.equal(verdict(driverCells(r)).status,'UNMEASURED');});
+for(const kind of ['pack','seat'])test('measured '+kind+' failure reaches FAIL',()=>{const r=run();r.seed_cells={...seed(),reading:'R1',installer_exit:0,launch_ok:true,launch_blocked:false};if(kind==='pack')r.after.pack=no();else r.seat=no();assert.equal(verdict(driverCells(r)).status,'FAIL');});
+test('Read-State catch error survives driver to classifier',()=>{const r=run(),x=raw();x.error='Get-CimInstance failed';r.after=stateObservation(x);assert.equal(verdict(driverCells(r)).status,'UNMEASURED');});
