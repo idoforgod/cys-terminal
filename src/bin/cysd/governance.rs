@@ -29298,6 +29298,102 @@ mod reflect_queue_tests {
         let _ = close_surface(&daemon, s2.id, CloseCause::OwnerClose);
     }
 
+    /// WP16 admission-only change: compare self and creator close effects, then
+    /// drive the ordinary watchdog delivery path on the surviving seat.
+    #[test]
+    fn wp16_creator_close_matches_self_queue_disposal_and_survivor_delivery() {
+        struct Cleanup(Arc<Daemon>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let ids: Vec<_> = self.0.surfaces.lock().unwrap().keys().copied().collect();
+                for id in ids { let _ = close_surface(&self.0, id, CloseCause::Reap); }
+            }
+        }
+        let _guard = REAP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for (self_close, reap) in [(true, false), (false, false), (true, true), (false, true)] {
+            crate::delivery::tests::isolate_state_dir_for_thread(if self_close { "wp16-self" } else { "wp16-creator" });
+            let dir = std::env::temp_dir().join(format!("wp16-queue-{}-{self_close}-{reap}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let daemon = Daemon::new(dir.join("cysd.sock"));
+            let _cleanup = Cleanup(daemon.clone());
+            let creator = role_seat(&daemon, "master", "sleep 30");
+            let received = dir.join("received.bin");
+            let cmd = if cfg!(unix) {
+                format!("stty raw -echo; exec cat > '{}'", received.display())
+            } else { "sleep 30".into() };
+            let survivor = daemon.create_surface(None, Some(cmd), None, None, 24, 80).unwrap();
+            if cfg!(unix) {
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !received.exists() && std::time::Instant::now() < until {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert!(received.exists(), "receiver did not initialize");
+            }
+            let pid = 993_319;
+            let bind = |sid| {
+                daemon.caller_cache.lock().unwrap().insert(pid,
+                    crate::state::CallerCacheEntry::new(Some(sid), now_epoch(), None,
+                        daemon.caller_gen.load(AtomicOrdering::Relaxed)));
+            };
+            bind(creator.id);
+            let req = cys::Request { id: json!(1), method: "surface.create".into(),
+                params: json!({"cmd":"sleep 30", "role":"worker-wp16"}) };
+            let crate::handlers::Reply::Single(created) = crate::handlers::dispatch(&daemon, req, Some(pid)) else { panic!("reply") };
+            assert_eq!(created["ok"], true, "{created}");
+            let child = daemon.get_surface(created["result"]["surface_id"].as_u64().unwrap()).unwrap();
+            let own = daemon.next_queue_entry("closed target message".into(), None, "send");
+            let surviving = daemon.next_queue_entry("surviving target message".into(), None, "send");
+            child.pending_queue.lock().unwrap().push_back(own.clone());
+            survivor.pending_queue.lock().unwrap().push_back(surviving.clone());
+            if self_close { bind(child.id); }
+            let req = cys::Request { id: json!(2), method: "surface.close".into(),
+                params: json!({"surface_id":child.id, "cause": if reap { "reap" } else { "owner_close" }}) };
+            let crate::handlers::Reply::Single(closed) = crate::handlers::dispatch(&daemon, req, Some(pid)) else { panic!("reply") };
+            assert_eq!(closed["ok"], true, "{closed}");
+            assert_eq!(daemon.tombstones.lock().unwrap().contains("worker-wp16"), !reap);
+            assert!(daemon.get_surface(child.id).is_none());
+            assert_eq!(survivor.pending_queue.lock().unwrap().front().unwrap().id, surviving.id);
+            let ledger = crate::delivery::ledger_path(&daemon.socket_path);
+            let rows: Vec<Value> = std::fs::read_to_string(&ledger).unwrap_or_default().lines()
+                .map(|l| serde_json::from_str(l).unwrap()).collect();
+            let tombs: Vec<_> = rows.iter().filter(|r| r["queue_entry_id"] == own.id && r["kind"] == "tombstone").collect();
+            assert_eq!(tombs.len(), if reap { 0 } else { 1 }, "target tombstone policy: {rows:?}");
+            if reap {
+                let parked = daemon.restored_queue.lock().unwrap();
+                assert_eq!(parked.len(), 1, "{parked:?}");
+                assert_eq!(parked[0]["role"], "worker-wp16");
+                assert_eq!(parked[0]["id"], own.id, "wrong queued item: {parked:?}");
+            } else {
+                assert_eq!(tombs[0]["reason"], "surface_closed");
+                assert!(daemon.restored_queue.lock().unwrap().is_empty());
+            }
+            assert!(!rows.iter().any(|r| r["queue_entry_id"] == surviving.id));
+            // Ordinary automatic delivery, no forced RPC and no manual Return.
+            std::thread::sleep(std::time::Duration::from_millis(700));
+            *survivor.last_output.lock().unwrap() = std::time::Instant::now() - std::time::Duration::from_secs(5);
+            *survivor.last_human_input.lock().unwrap() = None;
+            deliver_queued(&daemon, &mut HashMap::new(), &mut HashMap::new(), &mut HashMap::new());
+            assert!(survivor.pending_queue.lock().unwrap().is_empty(), "survivor delivery stopped");
+            let events = daemon.bus.tail(100);
+            let deliveries: Vec<_> = events.iter().filter(|e| e["name"] == "queue.delivered" && e["surface_id"] == survivor.id).collect();
+            assert_eq!(deliveries.len(), 1, "{events:?}");
+            assert_eq!(deliveries[0]["payload"]["forced"], false);
+            if cfg!(unix) {
+                let expected = b"\x1b[200~surviving target message\x1b[201~\r";
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while std::fs::read(&received).unwrap().len() < expected.len() && std::time::Instant::now() < until {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                assert_eq!(std::fs::read(&received).unwrap(), expected, "automatic submit bytes");
+            } else {
+                eprintln!("WP16_RECEIVER_BYTES_UNMEASURED: POSIX raw receiver unavailable; queue assertions still run");
+            }
+            for sid in [creator.id, survivor.id] {
+                let _ = close_surface(&daemon, sid, CloseCause::Reap);
+            }
+        }
+    }
+
     /// ★(0.14.31 · 성찰 Q7 · codex 설계 검토 #1) **자력 종료(EOF) 경로도 같은 park 정책이다** — reap
     /// 만 고치면 reader EOF 가 먼저 활성 큐를 비워 보존할 것이 없다.
     #[test]
