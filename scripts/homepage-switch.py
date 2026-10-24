@@ -380,9 +380,13 @@ def forward_items(stage, ex):
     return items
 
 
+def _holds_sha(path, st, want, dev):
+    """The content rule at one location: regular file, on the filesystem this call verified, sha256 == want."""
+    return _is_reg(st) and (dev is None or st.st_dev == dev) and sha256_file(path) == want
+
+
 def _holds_target(path, st, it, dev):
-    """The content rule at one location: regular file, on the filesystem this call verified, sha256 == the plan's target."""
-    return _is_reg(st) and (dev is None or st.st_dev == dev) and sha256_file(path) == it["target_sha"]
+    return _holds_sha(path, st, it["target_sha"], dev)
 
 
 def _published(it, docroot):
@@ -423,8 +427,9 @@ def _restore_signals(saved):
         signal.signal(sig, old)
 
 
-def execute(items, docroot, journal, allow_already=False, label="switch", dev=None):
-    """Run the planned moves in order. Idempotent: a second call after a kill finishes what is left (resume)."""
+def check_plan(items, docroot, allow_already=False, label="switch", dev=None):
+    """Read-only: classify every planned move and refuse unknown, changed or out-of-order states. Returns (states, ours).
+    execute() runs it right before its loop; rollback also runs it before its first public move (codex r2 R2-2)."""
     states = [classify(it, docroot, allow_already, dev) for it in items]
     ours = [_published(it, docroot) for it in items]   # a published file changed in place later is still this run's change
     unknown = [it["dst"] for it, s in zip(items, states) if s == UNKNOWN]
@@ -442,6 +447,13 @@ def execute(items, docroot, journal, allow_already=False, label="switch", dev=No
     first_todo = next((i for i, s in enumerate(states) if s in (TODO, PENDING_UNLINK)), None)
     if first_todo is not None and any(states[j] == DONE for j in range(first_todo + 1, len(states))):
         raise Stop(STOP_UNKNOWN, "%s: moves done out of order - the journaled prefix is broken" % label)
+    return states, ours
+
+
+def execute(items, docroot, journal, allow_already=False, label="switch", dev=None):
+    """Run the planned moves in order. Idempotent: a second call after a kill finishes what is left (resume)."""
+    states, ours = check_plan(items, docroot, allow_already, label, dev)
+    first_todo = next((i for i, s in enumerate(states) if s in (TODO, PENDING_UNLINK)), None)
     if first_todo is None:
         return {"moved": 0, "states": states}
     moved_before = any(ours)
@@ -542,8 +554,10 @@ def cmd_preflight(a):
     if open_runs:
         raise Stop(STOP_CLEAN, "G-stale: %s holds a switch or rollback that did not finish - run --status, then --resume or "
                    "--rollback with that folder's ts first" % ", ".join(open_runs))
-    for name in stale:
+    todo = []
+    for name in stale:                                 # every folder is checked before the first move (R3-FIX)
         p = os.path.join(home, name)
+        guard_outside(p, docroot, "stale staging folder")   # a folder that holds the docroot is never moved
         if not os.path.isdir(trash):
             os.makedirs(trash)
         guard_dev([p, trash])
@@ -551,6 +565,8 @@ def cmd_preflight(a):
         while os.path.lexists(target):                 # a move into trash never lands on an existing name
             k += 1
             target = os.path.join(trash, "%s.%d" % (name, k))
+        todo.append((p, name, target))
+    for p, name, target in todo:
         try:
             _do_rename(p, target)                      # G-stale: moved, never deleted, never reused
         except OSError as e:
@@ -675,17 +691,31 @@ def cmd_status(a):
     return out
 
 
-def move_files(pairs, journal, label):
-    """Create-moves (link+unlink) of whole files to new names; used by move-old and by rollback steps 1 and 5."""
+def check_pairs(pairs, label, code=STOP_CLEAN):
+    """Read-only: every pair is done (only dst), pending (src regular, dst absent) or half done (dst = the src inode)."""
+    for src, dst in pairs:
+        s, d = _lstat(src), _lstat(dst)
+        if s is None and _is_reg(d):
+            continue
+        if not _is_reg(s):
+            raise Stop(code, "%s: %s is not a regular file - nothing moved" % (label, src))
+        if d is not None and d.st_ino != s.st_ino:
+            raise Stop(code, "%s: %s already exists with other bytes - nothing moved" % (label, dst))
+
+
+def move_files(pairs, journal, label, prior=0):
+    """Create-moves (link+unlink) of whole files to new names; used by move-old and by rollback steps 1 and 4. Every pair is
+    checked before the first move (R3-FIX: no move before its check); `prior` = public moves this call already made."""
+    check_pairs(pairs, label, STOP_PARTIAL if prior else STOP_CLEAN)
     moved = 0
     for src, dst in pairs:
         s, d = _lstat(src), _lstat(dst)
         if s is None and _is_reg(d):
             continue                                   # done earlier
         if not _is_reg(s):
-            raise Stop(STOP_PARTIAL if moved else STOP_CLEAN, "%s: %s is not a regular file" % (label, src))
+            raise Stop(STOP_PARTIAL if (moved or prior) else STOP_CLEAN, "%s: %s is not a regular file" % (label, src))
         if d is not None and d.st_ino != s.st_ino:
-            raise Stop(STOP_PARTIAL if moved else STOP_CLEAN, "%s: %s already exists with other bytes" % (label, dst))
+            raise Stop(STOP_PARTIAL if (moved or prior) else STOP_CLEAN, "%s: %s already exists with other bytes" % (label, dst))
         journal.add(ev="move", phase="before", label=label, src=src, dst=dst, op="link+unlink")
         try:
             if d is None:
@@ -693,7 +723,7 @@ def move_files(pairs, journal, label):
             _do_unlink(src)
         except OSError as e:
             journal.add(ev="fail", label=label, dst=dst, errno=errno.errorcode.get(e.errno, str(e.errno)))
-            raise Stop(STOP_PARTIAL if moved else STOP_CLEAN, "%s: %s -> %s failed: %s" % (label, src, dst, e))
+            raise Stop(STOP_PARTIAL if (moved or prior) else STOP_CLEAN, "%s: %s -> %s failed: %s" % (label, src, dst, e))
         _fsync_dir(os.path.dirname(dst))
         moved += 1
         journal.add(ev="move", phase="after", label=label, dst=dst)
@@ -712,8 +742,8 @@ def _versioned_in(folder, ver):
 def cmd_move_old(a):
     dl = os.path.join(a.docroot, "downloads")
     journal = Journal(a.journal)
-    total = 0
-    for spec in a.move:
+    pairs, vers = [], []
+    for spec in a.move:                                # every folder and pair is checked before the first move (R3-FIX)
         ver, _, dest = spec.partition("=")
         if not ver or not dest:
             raise Stop(USAGE, "--move wants VER=DIR")
@@ -721,8 +751,10 @@ def cmd_move_old(a):
         if not os.path.isdir(dest):
             os.makedirs(dest)
         guard_dev([dl, dest])
-        names = _versioned_in(dl, ver)
-        total += move_files([(os.path.join(dl, n), os.path.join(dest, n)) for n in names], journal, "move-old")
+        vers.append(ver)
+        pairs += [(os.path.join(dl, n), os.path.join(dest, n)) for n in _versioned_in(dl, ver)]
+    total = move_files(pairs, journal, "move-old")
+    for ver in vers:
         left = _versioned_in(dl, ver)
         if left:
             raise Stop(STOP_PARTIAL, "move-old: %d cys_%s_* files remain" % (len(left), ver))
@@ -767,71 +799,117 @@ def cmd_rollback(a):
                      bk, a.trash])
     journal = Journal(os.path.join(rb, "journal.jsonl"))
     dl = os.path.join(docroot, "downloads")
-    # 1. old versioned files back first (the old pages that step 3 restores link them). Every folder is checked before the
-    #    first link: the old version's files must still be the bytes the old SUMS (the backup copy) lists - the same content
-    #    rule as the planned moves. A stale older version has no SUMS line to check against (limit: moved back as found).
-    pairs, old_tab = [], None
-    for spec in a.old_back or []:
-        ver, _, src_dir = spec.partition("=")
-        if not ver or not src_dir:
-            raise Stop(USAGE, "--old-back wants VER=DIR")
-        if not os.path.isdir(src_dir):
-            continue                                   # step 5 never ran for this version
-        guard_outside(src_dir, docroot, "old-assets folder")
-        guard_dev([src_dir, dl])
-        names = _versioned_in(src_dir, ver)
-        if ver == ex["old_ver"] and names:
-            if old_tab is None:
-                try:
-                    old_tab = sums_table(_read_text(os.path.join(bk, "downloads", SUMS_NAME)))
-                except OSError as e:
-                    raise Stop(STOP_CLEAN, "rollback-old-back: backup SUMS unreadable: %s" % e)
-            bad = [n for n in names if old_tab.get(n) != sha256_file(os.path.join(src_dir, n))]
-            if bad:
-                raise Stop(STOP_CLEAN, "rollback-old-back: %s in %s are not the bytes the old SUMS lists - nothing moved"
-                           % (bad, src_dir))
-        pairs += [(os.path.join(src_dir, n), os.path.join(dl, n)) for n in names]
-    back = move_files(pairs, journal, "rollback-old-back")
-    # 2. rollback staging = verified copies of the backup
+    # R3-FIX (codex r2 R2-2): every check of this call runs before its first public move, on every retry path - the rollback
+    # plan (ts, staged copies vs the backup and the old SUMS), the current bytes of every planned item, the old installers
+    # at their current location, the new names' way out. The publication order stays: old installers, then the version-less
+    # set + SUMS + pages, then the new names out.
+    items = _rollback_plan(a, ex, pages, bk, rb)                         # step 2 (staging writes only, never public)
+    check_plan(items, docroot, allow_already=True, label="rollback", dev=dev)
+    back_pairs = _old_back_pairs(a, ex, bk, dl, docroot, dev)
+    out_dir = os.path.join(a.trash, "rolled-back-new-assets")
+    if not os.path.isdir(out_dir):
+        os.makedirs(out_dir)
+    out_pairs = [(os.path.join(dl, n), os.path.join(out_dir, n)) for n in _versioned_in(dl, ex["new_ver"])]
+    check_pairs(back_pairs, "rollback-old-back")
+    check_pairs(out_pairs, "rollback-new-out")
+    # 1. old versioned files back first (the old pages that step 3 restores link them)
+    back = move_files(back_pairs, journal, "rollback-old-back")
+    # 3. the version-less set, SUMS and the pages back to the old bytes, same order rule as forward
+    r = execute(items, docroot, journal, allow_already=True, label="rollback", dev=dev)
+    # 4. the new versioned names out (no live page links them any more)
+    out = move_files(out_pairs, journal, "rollback-new-out", prior=back + r["moved"])
+    return {"ok": True, "old_back": back, "moved": r["moved"], "new_out": out}
+
+
+def _rollback_plan(a, ex, pages, bk, rb):
+    """Rollback step 2: load the plan of an earlier attempt (same ts) or stage verified copies of the backup and plan them."""
     plan_path = os.path.join(rb, "plan.json")
     if os.path.exists(plan_path):
         plan = _load_json(plan_path, "rollback plan.json")
         if plan.get("ts") != a.ts:
             raise Stop(STOP_CLEAN, "G-ts: rollback plan ts %s != %s" % (plan.get("ts"), a.ts))
-        items = plan["items"]
-    else:
-        old_tab = sums_table(_read_text(os.path.join(bk, "downloads", SUMS_NAME)))
-        new = dict((x["name"], x["sha256"]) for x in ex["assets"])
-        items = []
-        for n in VERSIONLESS_ORDER:
-            items.append({"dst": "downloads/" + n, "bk": os.path.join(bk, "downloads", n),
-                          "src": os.path.join(rb, "downloads", n), "before_sha": new[n]})
-        for rel, flat in PAGES_ORDER:
-            items.append({"dst": rel, "bk": os.path.join(bk, rel), "src": os.path.join(rb, "pages", flat),
-                          "before_sha": pages[rel]["want"]})
-        for i, it in enumerate(items, 1):
-            it["seq"], it["kind"] = i, "replace"
-            if not os.path.isfile(it["src"]) or sha256_file(it["src"]) != sha256_file(it["bk"]):
-                _copy_into_stage(it["bk"], it["src"], rb)
-            it["target_sha"] = sha256_file(it["src"])
-            if it["target_sha"] != sha256_file(it["bk"]):
-                raise Stop(STOP_CLEAN if not back else STOP_PARTIAL, "rollback copy of %s != backup" % it["dst"])
-            name = os.path.basename(it["dst"])
-            if it["dst"].startswith("downloads/") and name not in (SUMS_NAME, "index.html") and old_tab.get(name) != it["target_sha"]:
-                raise Stop(STOP_CLEAN if not back else STOP_PARTIAL, "backup %s != the old SUMS line" % name)
-            if it["dst"] in pages and it["target_sha"] != pages[it["dst"]]["pre"]:
-                raise Stop(STOP_CLEAN if not back else STOP_PARTIAL, "backup page %s != the page the run replaced" % it["dst"])
-            it["src_ino"] = os.lstat(it["src"]).st_ino
-        _write_json_atomic(plan_path, {"ts": a.ts, "items": items})
-    # 3. the version-less set, SUMS and the pages back to the old bytes, same order rule as forward
-    r = execute(items, docroot, journal, allow_already=True, label="rollback", dev=dev)
-    # 4. the new versioned names out (no live page links them any more)
-    out_dir = os.path.join(a.trash, "rolled-back-new-assets")
-    if not os.path.isdir(out_dir):
-        os.makedirs(out_dir)
-    names = _versioned_in(dl, ex["new_ver"])
-    out = move_files([(os.path.join(dl, n), os.path.join(out_dir, n)) for n in names], journal, "rollback-new-out")
-    return {"ok": True, "old_back": back, "moved": r["moved"], "new_out": out}
+        return plan["items"]
+    old_tab = _old_sums(bk)
+    new = dict((x["name"], x["sha256"]) for x in ex["assets"])
+    items = []
+    for n in VERSIONLESS_ORDER:
+        items.append({"dst": "downloads/" + n, "bk": os.path.join(bk, "downloads", n),
+                      "src": os.path.join(rb, "downloads", n), "before_sha": new[n]})
+    for rel, flat in PAGES_ORDER:
+        items.append({"dst": rel, "bk": os.path.join(bk, rel), "src": os.path.join(rb, "pages", flat),
+                      "before_sha": pages[rel]["want"]})
+    for i, it in enumerate(items, 1):
+        it["seq"], it["kind"] = i, "replace"
+        if not os.path.isfile(it["src"]) or sha256_file(it["src"]) != sha256_file(it["bk"]):
+            _copy_into_stage(it["bk"], it["src"], rb)
+        it["target_sha"] = sha256_file(it["src"])
+        if it["target_sha"] != sha256_file(it["bk"]):
+            raise Stop(STOP_CLEAN, "rollback copy of %s != backup" % it["dst"])
+        name = os.path.basename(it["dst"])
+        if it["dst"].startswith("downloads/") and name not in (SUMS_NAME, "index.html") and old_tab.get(name) != it["target_sha"]:
+            raise Stop(STOP_CLEAN, "backup %s != the old SUMS line" % name)
+        if it["dst"] in pages and it["target_sha"] != pages[it["dst"]]["pre"]:
+            raise Stop(STOP_CLEAN, "backup page %s != the page the run replaced" % it["dst"])
+        it["src_ino"] = os.lstat(it["src"]).st_ino
+    _write_json_atomic(plan_path, {"ts": a.ts, "items": items})
+    return items
+
+
+def _old_sums(bk):
+    try:
+        return sums_table(_read_text(os.path.join(bk, "downloads", SUMS_NAME)))
+    except OSError as e:
+        raise Stop(STOP_CLEAN, "rollback: backup SUMS unreadable: %s" % e)
+
+
+def _old_back_pairs(a, ex, bk, dl, docroot, dev):
+    """Rollback step 1, checked in full (codex r2 R2-1): the old version's installer set comes from the old SUMS (the backup
+    copy), and every one of them is checked where it is NOW - still in the old-assets folder, already public, or both after a
+    link without its unlink - so an installer an earlier attempt already put back is checked again. Missing, changed,
+    conflicting or unlisted installers stop the call before any public move. A stale older version has no SUMS line to check
+    against (limit: its files are moved back as found)."""
+    pairs, old_tab = [], None
+    for spec in a.old_back or []:
+        ver, _, src_dir = spec.partition("=")
+        if not ver or not src_dir:
+            raise Stop(USAGE, "--old-back wants VER=DIR")
+        guard_outside(src_dir, docroot, "old-assets folder")
+        have_dir = os.path.isdir(src_dir)                # absent: step 5 never ran, the old installers never left public
+        if have_dir:
+            guard_dev([src_dir, dl])
+        if ver != ex["old_ver"]:
+            pairs += [(os.path.join(src_dir, n), os.path.join(dl, n)) for n in (_versioned_in(src_dir, ver) if have_dir else [])]
+            continue
+        if old_tab is None:
+            old_tab = _old_sums(bk)
+        prefix = "cys_%s_" % ver
+        want = dict((n, h) for n, h in old_tab.items() if n.startswith(prefix))
+        bad, public = [], False
+        for n in sorted(want):
+            src, dst = os.path.join(src_dir, n), os.path.join(dl, n)
+            s, d = _lstat(src), _lstat(dst)
+            if _is_reg(s) and d is None:
+                at, st = src, s                          # still to move
+                pairs.append((src, dst))
+            elif _is_reg(s) and _is_reg(d) and d.st_ino == s.st_ino:
+                at, st = dst, d                          # linked, not yet unlinked: the public name is that inode
+                pairs.append((src, dst))
+            elif s is None and _is_reg(d):
+                at, st = dst, d                          # put back earlier, or never moved out
+            else:
+                bad.append("%s (%s)" % (n, "missing" if s is None and d is None else "conflict at " + dst))
+                public = public or d is not None
+                continue
+            if not _holds_sha(at, st, want[n], dev):
+                bad.append("%s at %s" % (n, at))
+                public = public or at == dst
+        if have_dir:
+            bad += ["%s at %s (no line in the old SUMS)" % (n, os.path.join(src_dir, n))
+                    for n in _versioned_in(src_dir, ver) if n not in want]
+        if bad:
+            raise Stop(STOP_UNKNOWN if public else STOP_CLEAN,
+                       "rollback-old-back: old installers do not match the old SUMS: %s - nothing moved" % bad)
+    return pairs
 
 
 def parser():

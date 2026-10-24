@@ -18,6 +18,7 @@ Use: python3 scripts/tests/test_homepage_switch.py
 """
 
 import ast
+import contextlib
 import hashlib
 import importlib.util
 import io
@@ -798,6 +799,176 @@ class ContentRuleTests(Base):
             self.assertIn("cys_%s_x64.dmg" % OLD, out)
             self.assertEqual(s.tree(), before, "rollback moved something although an old asset was changed")
             self.assertTrue(os.path.isfile(p))
+
+
+class RollbackPreflightTests(Base):
+    """R3-FIX (codex r2 R2-1, R2-2): every check of a rollback (and of move-old) runs before its first public move, on every
+    retry path. Each test runs its untouched control first, then the fault; the fault call must make zero publication calls
+    (_do_link / _do_unlink / _do_rename, counted in-process) and leave the public tree byte-identical."""
+
+    flip = ContentRuleTests.flip
+
+    def counted(self, args):
+        calls, real = [], (hs._do_link, hs._do_unlink, hs._do_rename)
+
+        def wrap(f):
+            def g(*a):
+                calls.append(a)
+                return f(*a)
+            return g
+
+        hs._do_link, hs._do_unlink, hs._do_rename = (wrap(f) for f in real)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = hs.main(args)
+        finally:
+            hs._do_link, hs._do_unlink, hs._do_rename = real
+        return rc, len(calls), buf.getvalue()
+
+    def switched_and_moved_old(self, name):
+        s = self.fresh(name)
+        self.assertEqual(run(s.args("switch"))[0], 0)
+        self.assertEqual(run(s.args("move-old"))[0], 0)
+        return s
+
+    def test_old_installer_put_back_then_changed_is_checked_on_retry(self):
+        # kill 2 = the first old installer linked AND its source unlinked (codex's case); kill 1 = linked, not yet unlinked
+        for kill in (2, 1):
+            for corrupt in (False, True):
+                s = self.switched_and_moved_old("oldback-retry-%d-%d" % (kill, corrupt))
+                self.assertEqual(run_wrapped(self.runner, "kill", kill, s.args("rollback")), -signal.SIGKILL)
+                p = os.path.join(s.docroot, "downloads", "cys_%s_aarch64.dmg" % OLD)
+                self.assertEqual(os.path.exists(os.path.join(s.old_dir, os.path.basename(p))), kill == 1)
+                if corrupt:
+                    self.flip(p)
+                before = s.tree()
+                rc, n, out = self.counted(s.args("rollback"))
+                if not corrupt:
+                    self.assertEqual(rc, 0, "control kill %d: %s" % (kill, out))
+                    self.assertEqual(s.tree(), s.old_tree())
+                    continue
+                self.assertEqual(rc, 5, "kill %d: %s" % (kill, out))
+                self.assertEqual(n, 0, "kill %d: publication calls before the check" % kill)
+                self.assertEqual(s.tree(), before)
+                self.assertIn("old installers do not match the old SUMS", out)
+                self.assertIn("at " + p, out)
+
+    def test_stale_rollback_plan_ts_stops_before_old_installers_move(self):
+        for bad in (False, True):
+            s = self.switched_and_moved_old("rb-ts-%d" % bad)
+            if bad:
+                put(os.path.join(s.rb, "plan.json"), json.dumps({"ts": "20990101-000000", "items": []}).encode())
+            before = s.tree()
+            rc, n, out = self.counted(s.args("rollback"))
+            if not bad:
+                self.assertEqual(rc, 0, "control: " + out)
+                self.assertEqual(s.tree(), s.old_tree())
+                continue
+            self.assertEqual((rc, n), (3, 0), out)
+            self.assertIn("G-ts", out)
+            self.assertEqual(s.tree(), before)
+            self.assertEqual(len(os.listdir(s.old_dir)), 5, "an old installer left the old-assets folder")
+
+    def test_changed_versionless_backup_stops_before_old_installers_move(self):
+        for bad in (False, True):
+            s = self.switched_and_moved_old("rb-bk-%d" % bad)
+            if bad:
+                self.flip(os.path.join(s.backup, "downloads", "latest.json"))
+            before = s.tree()
+            rc, n, out = self.counted(s.args("rollback"))
+            if not bad:
+                self.assertEqual(rc, 0, "control: " + out)
+                self.assertEqual(s.tree(), s.old_tree())
+                continue
+            self.assertEqual((rc, n), (3, 0), out)
+            self.assertIn("old SUMS line", out)
+            self.assertEqual(s.tree(), before)
+
+    def test_unknown_public_file_stops_before_old_installers_move(self):
+        for bad in (False, True):
+            s = self.switched_and_moved_old("rb-unknown-%d" % bad)
+            p = os.path.join(s.docroot, "downloads", "latest.json")
+            if bad:
+                os.unlink(p)
+                put(p, b"replaced by someone else")
+            before = s.tree()
+            rc, n, out = self.counted(s.args("rollback"))
+            if not bad:
+                self.assertEqual(rc, 0, "control: " + out)
+                self.assertEqual(s.tree(), s.old_tree())
+                continue
+            self.assertEqual((rc, n), (3, 0), out)
+            self.assertIn("public state not recognised", out)
+            self.assertEqual(s.tree(), before)
+
+    def test_new_names_way_out_is_checked_before_any_move(self):
+        for bad in (False, True):
+            s = self.switched_and_moved_old("rb-out-%d" % bad)
+            if bad:
+                put(os.path.join(s.trash, "rolled-back-new-assets", "cys_%s_x64.dmg" % NEW), b"other bytes already here")
+            before = s.tree()
+            rc, n, out = self.counted(s.args("rollback"))
+            if not bad:
+                self.assertEqual(rc, 0, "control: " + out)
+                self.assertEqual(s.tree(), s.old_tree())
+                continue
+            self.assertEqual((rc, n), (3, 0), out)
+            self.assertIn("already exists with other bytes", out)
+            self.assertEqual(s.tree(), before)
+
+    def test_move_old_checks_every_pair_before_the_first_move(self):
+        for bad in (False, True):
+            s = self.fresh("mvold-pre-%d" % bad)
+            self.assertEqual(run(s.args("switch"))[0], 0)
+            if bad:                                  # the 2nd pair in name order conflicts; the 1st would move first
+                put(os.path.join(s.old_dir, "cys_%s_x64-setup.exe" % OLD), b"other bytes already here")
+            before = s.tree()
+            rc, n, out = self.counted(s.args("move-old"))
+            if not bad:
+                self.assertEqual(rc, 0, "control: " + out)
+                self.assertEqual(s.tree(), s.new_tree(old_moved=True))
+                continue
+            self.assertEqual((rc, n), (3, 0), out)
+            self.assertEqual(s.tree(), before)
+
+
+class PreflightStaleCheckFirstTests(Base):
+    """R3-FIX census follow-up: G-stale checks every stale staging folder before it moves the first one to trash, and never
+    moves a folder that holds the docroot."""
+
+    def test_every_stale_folder_is_checked_before_the_first_move(self):
+        for bad in (False, True):
+            s = self.fresh("stale-pre-%d" % bad)
+            first = os.path.join(s.home, "cys-site-staging-%s-20990101-000000" % NEW)    # sorted first
+            second = os.path.join(s.home, "cys-site-staging-%s-20990102-000000" % NEW)
+            for d in (first, second):
+                put(os.path.join(d, "downloads", "x"), b"leftover")
+            real = hs._st_dev
+            if bad:                                  # the SECOND folder fails G-dev
+                hs._st_dev = lambda p: real(p) + (1 if os.path.realpath(p) == os.path.realpath(second) else 0)
+            try:
+                rc = hs.main(s.args("preflight"))
+            finally:
+                hs._st_dev = real
+            if not bad:
+                self.assertEqual(rc, 0)
+                self.assertFalse(os.path.exists(first) or os.path.exists(second), "control: both moved to trash")
+                continue
+            self.assertEqual(rc, 3)
+            self.assertTrue(os.path.isdir(first) and os.path.isdir(second), "a stale folder moved before every check")
+
+    def test_a_stale_folder_holding_the_docroot_is_never_moved(self):
+        s = self.site
+        holder = os.path.join(s.home, "cys-site-staging-%s-20990101-000000" % NEW)
+        inside = os.path.join(holder, "public_html")
+        shutil.copytree(s.docroot, inside)
+        args = [inside if x == s.docroot else x for x in s.args("preflight")]
+        rc, out = run(args)
+        self.assertEqual(rc, 3, out)
+        self.assertIn("G-outside", out)
+        self.assertTrue(os.path.isdir(inside), "the folder holding the docroot was moved")
+        self.assertEqual(run(s.args("preflight"))[0], 0, "control: the same preflight with the real docroot")
 
 
 class FolderOutsideDocrootTests(Base):
